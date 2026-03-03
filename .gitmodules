@@ -1,0 +1,6 @@
+[submodule "nr"]
+	path = nr
+	url = git@github.com:aaronhsueh0506/CVNR.git
+[submodule "aec"]
+	path = aec
+	url = git@github.com:aaronhsueh0506/AEC.git
