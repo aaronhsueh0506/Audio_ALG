@@ -4,12 +4,13 @@
 
 ## 項目結構
 
-- **[nr/](https://github.com/aaronhsueh0506/CVNR)**: 傳統降噪算法（獨立倉庫，Git Submodule）
-- **[aec/](https://github.com/aaronhsueh0506/AEC)**: 聲學回聲消除（獨立倉庫，Git Submodule）
+- **lib/** — 獨立算法模組（Git Submodules）
+  - **[aec/](https://github.com/aaronhsueh0506/AEC)**: 聲學回聲消除
+  - **[nr/](https://github.com/aaronhsueh0506/CVNR)**: 傳統降噪算法
 - **ainr/**: AI 降噪模型
   - **RNNoise-ERB/**: RNNoise v0.2 架構 + ERB bands（16kHz, DNS4 dataset, DeepFilterNet-style augmentation）
-- **shared/**: 共享工具和代碼
 - **pipelines/**: AEC + NR 串接處理鏈
+- **shared/**: 共享工具和代碼
 - **docs/**: 統一文檔
 - **scripts/**: 管理腳本
 
@@ -34,15 +35,15 @@ git submodule update --init --recursive
 ./scripts/update_submodules.sh
 
 # 或手動更新
-git submodule update --remote nr
-git submodule update --remote aec
+git submodule update --remote lib/nr
+git submodule update --remote lib/aec
 ```
 
 ## 開發工作流
 
 ### 獨立開發 NR
 ```bash
-cd nr/
+cd lib/nr/
 git checkout -b feature/xxx
 # ... 開發 ...
 git push origin feature/xxx
@@ -50,7 +51,7 @@ git push origin feature/xxx
 
 ### 獨立開發 AEC
 ```bash
-cd aec/
+cd lib/aec/
 git checkout -b feature/xxx
 # ... 開發 ...
 git push origin feature/xxx
@@ -59,8 +60,8 @@ git push origin feature/xxx
 ### 更新整合倉庫的 Submodule 引用
 ```bash
 # 在 Audio_ALG 根目錄
-git submodule update --remote nr   # 拉取 NR 最新
-git add nr
+git submodule update --remote lib/nr   # 拉取 NR 最新
+git add lib/nr
 git commit -m "update: NR submodule to latest"
 git push
 ```
