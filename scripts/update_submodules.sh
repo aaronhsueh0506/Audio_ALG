@@ -7,15 +7,15 @@ echo "=== Updating Audio_ALG Submodules ==="
 echo ""
 
 echo "Updating NR submodule..."
-git submodule update --remote nr
-echo "NR updated to: $(cd nr && git log --oneline -1)"
+git submodule update --remote lib/nr
+echo "NR updated to: $(cd lib/nr && git log --oneline -1)"
 echo ""
 
 echo "Updating AEC submodule..."
-git submodule update --remote aec
-echo "AEC updated to: $(cd aec && git log --oneline -1)"
+git submodule update --remote lib/aec
+echo "AEC updated to: $(cd lib/aec && git log --oneline -1)"
 echo ""
 
 echo "=== All submodules updated ==="
 echo ""
-echo "Run 'git add nr aec && git commit' to save the update."
+echo "Run 'git add lib/nr lib/aec && git commit' to save the update."
