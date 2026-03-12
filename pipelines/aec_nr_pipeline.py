@@ -23,8 +23,9 @@ from lib.nr.denoisers import MmseLsaDenoiser
 
 
 def parse_aec_mode(mode_str: str) -> AecMode:
-    modes = {'time': AecMode.TIME, 'freq': AecMode.FREQ, 'subband': AecMode.SUBBAND}
-    return modes.get(mode_str, AecMode.TIME)
+    modes = {'lms': AecMode.LMS, 'nlms': AecMode.NLMS,
+             'freq': AecMode.FREQ, 'subband': AecMode.SUBBAND}
+    return modes.get(mode_str, AecMode.SUBBAND)
 
 
 def run_aec(mic_signal: np.ndarray, ref_signal: np.ndarray,
@@ -76,8 +77,9 @@ def main():
     parser.add_argument('--mic', required=True, help='Microphone input WAV')
     parser.add_argument('--ref', required=True, help='Reference/loudspeaker WAV')
     parser.add_argument('--output', required=True, help='Output WAV')
-    parser.add_argument('--aec-mode', default='time', choices=['time', 'freq', 'subband'],
-                        help='AEC filter mode (default: time)')
+    parser.add_argument('--aec-mode', default='subband',
+                        choices=['lms', 'nlms', 'freq', 'subband'],
+                        help='AEC filter mode (default: subband)')
     parser.add_argument('--aec-mu', type=float, default=0.3, help='AEC step size')
     parser.add_argument('--nr-gain', type=float, default=-15.0, help='NR min gain (dB)')
     parser.add_argument('--aec-only', action='store_true', help='Run AEC only, skip NR')
