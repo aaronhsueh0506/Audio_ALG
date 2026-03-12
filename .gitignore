@@ -31,6 +31,12 @@ env/
 # Output
 output/
 
+# AINR training data & model checkpoints
+ainr/RNNoise-ERB/output/
+*.pth
+*.onnx
+*.npy
+
 # Logs
 *.log
 *.tmp

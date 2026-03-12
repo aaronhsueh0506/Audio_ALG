@@ -1,13 +1,13 @@
 # Audio_ALG - Audio Processing Algorithms Integration
 
-整合音頻處理算法，包含降噪 (NR) 和聲學回聲消除 (AEC) 模組。
+整合音頻處理算法，包含降噪 (NR)、AI 降噪 (AINR) 和聲學回聲消除 (AEC) 模組。
 
 ## 項目結構
 
-此項目使用 **Git Submodules** 管理：
-
-- **[nr/](https://github.com/aaronhsueh0506/CVNR)**: 降噪算法（獨立倉庫，Git Submodule）
+- **[nr/](https://github.com/aaronhsueh0506/CVNR)**: 傳統降噪算法（獨立倉庫，Git Submodule）
 - **[aec/](https://github.com/aaronhsueh0506/AEC)**: 聲學回聲消除（獨立倉庫，Git Submodule）
+- **ainr/**: AI 降噪模型
+  - **RNNoise-ERB/**: RNNoise v0.2 架構 + ERB bands（16kHz, DNS4 dataset, DeepFilterNet-style augmentation）
 - **shared/**: 共享工具和代碼
 - **pipelines/**: AEC + NR 串接處理鏈
 - **docs/**: 統一文檔
