@@ -17,15 +17,16 @@ extern "C" {
 #define RNNOISE_SR          16000
 #define RNNOISE_N_FFT       512
 #define RNNOISE_N_BINS      257   /* N_FFT/2 + 1 */
-#define RNNOISE_WIN_LEN     512   /* = N_FFT (32ms) */
-#define RNNOISE_HOP_LEN     256   /* = N_FFT/2 (16ms) */
+#define RNNOISE_WIN_LEN     512   /* 分析窗長度 (≤ N_FFT, 預設 = N_FFT) */
+#define RNNOISE_HOP_LEN     256   /* 幀移長度 (≤ WIN_LEN/2 for COLA) */
+#define RNNOISE_OVL_LEN     (RNNOISE_WIN_LEN - RNNOISE_HOP_LEN)  /* overlap 長度 */
 #define RNNOISE_N_BANDS     22
 #define RNNOISE_CONV_DELAY  2     /* conv1 kernel=3 valid → 需要緩衝 2 frame 歷史 */
 
 /* 處理狀態 (呼叫端分配，跨 frame 保持) */
 typedef struct {
-    /* overlap-add 緩衝 */
-    float synthesis_buf[RNNOISE_N_FFT];  /* ISTFT overlap buffer */
+    /* overlap-add 緩衝 (長度 = WIN_LEN, 只用前 OVL_LEN) */
+    float synthesis_buf[RNNOISE_WIN_LEN];
 
     /* 特徵歷史 (conv1 需要 3 frame) */
     float feat_buf[3][RNNOISE_N_BANDS];  /* ring buffer for 3 frames */
@@ -43,10 +44,11 @@ void rnnoise_state_init(RNNoiseState *st);
 
 /* --- 前處理 (每 frame 呼叫) --- */
 
-/* 對 HOP_LEN (256) 個 sample 做 analysis:
- *   1. 加 root Hann window (WIN_LEN = N_FFT, 無需 zero-pad)
- *   2. FFT → 得到 N_BINS 個 complex bin
- *   out_re, out_im: 長度 N_BINS */
+/* 對 WIN_LEN 個 sample 做 analysis:
+ *   1. 加 root Hann window (WIN_LEN samples)
+ *   2. Zero-pad 到 N_FFT (當 WIN_LEN < N_FFT)
+ *   3. FFT → 得到 N_BINS 個 complex bin
+ *   frame: 長度 WIN_LEN, out_re/out_im: 長度 N_BINS */
 void rnnoise_analysis(const float *frame, float *out_re, float *out_im);
 
 /* 從 FFT power spectrum 計算 ERB band features:
