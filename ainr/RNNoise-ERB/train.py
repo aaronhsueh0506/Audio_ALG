@@ -5,6 +5,8 @@ RNNoise v0.2 風格噪音抑制模型 — 訓練腳本
 用法:
     python train.py --config config.ini
     python train.py --config config.ini --device cpu
+    python train.py --config config.ini --resume output/rnnoise_epoch5.pth
+    python train.py --config config.ini --seed 123
 """
 
 import argparse
@@ -135,7 +137,21 @@ class RNNoiseModel(nn.Module):
 # 訓練
 # ============================================================
 
+def set_seed(seed):
+    """固定所有隨機種子以確保可重現性"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def train(args):
+    # Seed
+    if args.seed is not None:
+        set_seed(args.seed)
+        print(f"Random seed: {args.seed}")
+
     # Load config
     cfg = configparser.ConfigParser()
     cfg.read(args.config)
@@ -177,13 +193,27 @@ def train(args):
 
     os.makedirs(output_dir, exist_ok=True)
     best_val_loss = float('inf')
+    start_epoch = 1
+
+    # Resume from checkpoint
+    if args.resume:
+        print(f"Loading checkpoint: {args.resume}")
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt['state_dict'])
+        if 'optimizer' in ckpt:
+            optimizer.load_state_dict(ckpt['optimizer'])
+        if 'scheduler' in ckpt:
+            scheduler.load_state_dict(ckpt['scheduler'])
+        start_epoch = ckpt.get('epoch', 0) + 1
+        best_val_loss = ckpt.get('best_val_loss', ckpt.get('loss', float('inf')))
+        print(f"  Resumed from epoch {start_epoch - 1}, best_val_loss={best_val_loss:.5f}")
 
     print(f"Training: SR={SR}, N_FFT={N_FFT}, N_BANDS={N_BANDS}")
     print(f"  WIN_LEN={N_FFT}, HOP_LEN={N_FFT//2} (root Hann window)")
     print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
     print(f"  device={device}")
 
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         # 每 epoch 重新 shuffle dataset indices
         dataset._shuffle_indices()
 
@@ -230,7 +260,10 @@ def train(args):
         ckpt = {
             'epoch': epoch,
             'state_dict': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'loss': avg_val,
+            'best_val_loss': best_val_loss,
             'bin_edges': BIN_EDGES.tolist(),
             'config': {
                 'sr': SR, 'n_fft': N_FFT, 'n_bands': N_BANDS,
@@ -253,4 +286,11 @@ if __name__ == '__main__':
     parser.add_argument('--config', default='config.ini', help='Config 檔案路徑')
     parser.add_argument('--device', default=None,
                         help='覆蓋 config 中的 device 設定')
-    train(parser.parse_args())
+    parser.add_argument('--resume', default=None,
+                        help='Checkpoint 路徑，從斷點續訓')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='隨機種子 (預設: 42, 設 -1 關閉)')
+    args = parser.parse_args()
+    if args.seed == -1:
+        args.seed = None
+    train(args)
