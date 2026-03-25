@@ -81,8 +81,8 @@ def denoise(args):
 
     SR = cfg.getint('signal', 'sr')
     N_FFT = cfg.getint('signal', 'n_fft')
-    WIN_LEN = N_FFT
-    HOP_LEN = N_FFT // 2
+    WIN_LEN = cfg.getint('signal', 'win_len', fallback=N_FFT)
+    HOP_LEN = cfg.getint('signal', 'hop_len', fallback=WIN_LEN // 2)
     N_BANDS = cfg.getint('signal', 'n_bands')
 
     device = torch.device('cpu')

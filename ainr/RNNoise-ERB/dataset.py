@@ -398,8 +398,8 @@ class DNS4Dataset(Dataset):
         # signal params
         self.sr = cfg.getint('signal', 'sr')
         self.n_fft = cfg.getint('signal', 'n_fft')
-        self.win_len = self.n_fft
-        self.hop_len = self.n_fft // 2
+        self.win_len = cfg.getint('signal', 'win_len', fallback=self.n_fft)
+        self.hop_len = cfg.getint('signal', 'hop_len', fallback=self.win_len // 2)
         self.n_bands = cfg.getint('signal', 'n_bands')
 
         # audio

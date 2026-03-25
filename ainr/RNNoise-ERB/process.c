@@ -60,8 +60,9 @@ static void ensure_edges(void) {
 }
 
 /* ============================================================
- * Root Hann window (長度 WIN_LEN=N_FFT, 前算)
+ * Root Hann window (長度 WIN_LEN, 前算)
  * sqrt(hann) — analysis 與 synthesis 各乘一次，合計 = hann → COLA
+ * 當 WIN_LEN < N_FFT 時，analysis 會 zero-pad 到 N_FFT
  * ============================================================ */
 static float g_hann_win[RNNOISE_WIN_LEN];
 static int   g_win_ready = 0;
@@ -138,13 +139,17 @@ void rnnoise_state_init(RNNoiseState *st) {
 void rnnoise_analysis(const float *frame, float *out_re, float *out_im) {
     ensure_window();
 
-    /* Root Hann windowed frame (WIN_LEN = N_FFT, 無需 zero-pad) */
+    /* Root Hann windowed frame + zero-pad to N_FFT */
     float buf_re[RNNOISE_N_FFT];
     float buf_im[RNNOISE_N_FFT];
     memset(buf_im, 0, sizeof(buf_im));
 
     for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
         buf_re[i] = frame[i] * g_hann_win[i];
+    }
+    /* zero-pad (當 WIN_LEN == N_FFT 時此 loop 不執行) */
+    for (int i = RNNOISE_WIN_LEN; i < RNNOISE_N_FFT; i++) {
+        buf_re[i] = 0.0f;
     }
 
     fft_radix2(buf_re, buf_im, RNNOISE_N_FFT, 0);
@@ -250,28 +255,24 @@ void rnnoise_synthesis(RNNoiseState *st,
     /* IFFT */
     fft_radix2(full_re, full_im, RNNOISE_N_FFT, 1);
 
-    /* Root Hann window (synthesis side) */
+    /* Root Hann window (synthesis side) — 只取 WIN_LEN 點，丟棄 zero-pad 部分 */
     ensure_window();
     for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
         full_re[i] *= g_hann_win[i];
     }
+    /* full_re[WIN_LEN..N_FFT-1] 為 zero-pad 產生的殘留，不使用 */
 
-    /* Overlap-add: 取前 HOP_LEN 個 sample = synthesis_buf 前段 + 新的前段 */
+    /* Overlap-add: 輸出 HOP_LEN 個 sample */
     for (int i = 0; i < RNNOISE_HOP_LEN; i++) {
         out_samples[i] = st->synthesis_buf[i] + full_re[i];
     }
 
-    /* 更新 synthesis_buf: shift + 加入新的後半段 */
-    /* synthesis_buf[0..HOP-1] = synthesis_buf[HOP..2*HOP-1] + full_re[HOP..WIN-1] 的重疊 */
-    for (int i = 0; i < RNNOISE_HOP_LEN; i++) {
-        if (i + RNNOISE_HOP_LEN < RNNOISE_WIN_LEN) {
-            st->synthesis_buf[i] = full_re[i + RNNOISE_HOP_LEN];
-        } else {
-            st->synthesis_buf[i] = 0.0f;
-        }
+    /* 更新 synthesis_buf: 存 overlap 部分 (OVL_LEN = WIN_LEN - HOP_LEN) */
+    for (int i = 0; i < RNNOISE_OVL_LEN; i++) {
+        st->synthesis_buf[i] = full_re[i + RNNOISE_HOP_LEN];
     }
     /* 清除剩餘 */
-    for (int i = RNNOISE_HOP_LEN; i < RNNOISE_N_FFT; i++) {
+    for (int i = RNNOISE_OVL_LEN; i < RNNOISE_WIN_LEN; i++) {
         st->synthesis_buf[i] = 0.0f;
     }
 }

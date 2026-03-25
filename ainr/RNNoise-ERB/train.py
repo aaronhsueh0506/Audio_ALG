@@ -159,6 +159,8 @@ def train(args):
     # Signal params
     SR = cfg.getint('signal', 'sr')
     N_FFT = cfg.getint('signal', 'n_fft')
+    WIN_LEN = cfg.getint('signal', 'win_len', fallback=N_FFT)
+    HOP_LEN = cfg.getint('signal', 'hop_len', fallback=WIN_LEN // 2)
     N_BANDS = cfg.getint('signal', 'n_bands')
 
     # Training params
@@ -209,7 +211,7 @@ def train(args):
         print(f"  Resumed from epoch {start_epoch - 1}, best_val_loss={best_val_loss:.5f}")
 
     print(f"Training: SR={SR}, N_FFT={N_FFT}, N_BANDS={N_BANDS}")
-    print(f"  WIN_LEN={N_FFT}, HOP_LEN={N_FFT//2} (root Hann window)")
+    print(f"  WIN_LEN={WIN_LEN}, HOP_LEN={HOP_LEN} (root Hann window)")
     print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
     print(f"  device={device}")
 
@@ -266,7 +268,8 @@ def train(args):
             'best_val_loss': best_val_loss,
             'bin_edges': BIN_EDGES.tolist(),
             'config': {
-                'sr': SR, 'n_fft': N_FFT, 'n_bands': N_BANDS,
+                'sr': SR, 'n_fft': N_FFT, 'win_len': WIN_LEN,
+                'hop_len': HOP_LEN, 'n_bands': N_BANDS,
             },
         }
         torch.save(ckpt, os.path.join(output_dir, f'rnnoise_epoch{epoch}.pth'))
