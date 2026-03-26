@@ -21,7 +21,7 @@ extern "C" {
 #define RNNOISE_HOP_LEN     256   /* 幀移長度 (≤ WIN_LEN/2 for COLA) */
 #define RNNOISE_OVL_LEN     (RNNOISE_WIN_LEN - RNNOISE_HOP_LEN)  /* overlap 長度 */
 #define RNNOISE_N_BANDS     22
-#define RNNOISE_CONV_DELAY  2     /* conv1 kernel=3 valid → 需要緩衝 2 frame 歷史 */
+#define RNNOISE_CONV_DELAY  2     /* conv1 kernel=3 causal → 需要緩衝 2 frame 歷史, 0 lookahead */
 
 /* 處理狀態 (呼叫端分配，跨 frame 保持) */
 typedef struct {
