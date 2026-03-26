@@ -127,7 +127,8 @@ def denoise(args):
 
     for b in range(N_BANDS):
         lo, hi = int(bin_edges[b]), int(bin_edges[b + 1])
-        bin_gains[lo:hi, 1:1 + n_frames_out] = gains[:, b].unsqueeze(0)
+        # Causal: gain 從 frame 2 開始 (前 2 frame 無 gain → 保持 1.0)
+        bin_gains[lo:hi, 2:2 + n_frames_out] = gains[:, b].unsqueeze(0)
 
     # 套用 gain 到 complex spectrum
     filtered = spec * bin_gains

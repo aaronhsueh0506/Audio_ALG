@@ -229,7 +229,8 @@ def train(args):
 
                 pred_gains, _ = model(features)
                 # Conv1d valid padding 會減少 2 個 frame
-                targets = targets[:, 1:-1, :]
+                # Causal: output[i] 對應 input[i+2] (最新 frame, 0 lookahead)
+                targets = targets[:, 2:, :]
 
                 loss = F.mse_loss(pred_gains ** gamma, targets ** gamma)
 
@@ -252,7 +253,7 @@ def train(args):
                 features = features.to(device)
                 targets = targets.to(device)
                 pred_gains, _ = model(features)
-                targets = targets[:, 1:-1, :]
+                targets = targets[:, 2:, :]
                 val_loss_sum += F.mse_loss(pred_gains ** gamma, targets ** gamma).item()
 
         avg_val = val_loss_sum / max(len(val_loader), 1)
