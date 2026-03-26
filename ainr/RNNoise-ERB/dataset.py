@@ -15,6 +15,8 @@ DNS4 Dataset + DeepFilterNet v2 風格 augmentation
 
 import configparser
 import glob
+import hashlib
+import json
 import math
 import os
 import random
@@ -454,27 +456,10 @@ class DNS4Dataset(Dataset):
         if not self.noise_files:
             raise FileNotFoundError(f"No .wav files found in {noise_dir}")
 
-        # RIR: load paths + filter by RT60
+        # RIR: load paths + filter by RT60 (with cache)
         self.rir_files = []
         if rir_dir and os.path.isdir(rir_dir):
-            all_rir_paths = sorted(
-                glob.glob(os.path.join(rir_dir, '**', '*.wav'), recursive=True)
-            )
-            print(f"Scanning {len(all_rir_paths)} RIR files for RT60 filtering "
-                  f"[{self.rt60_min:.1f}s, {self.rt60_max:.1f}s]...")
-            for rp in all_rir_paths:
-                try:
-                    rir_audio, rir_sr = torchaudio.load(rp)
-                    rir_audio = rir_audio[0]
-                    if rir_sr != self.sr:
-                        rir_audio = torchaudio.functional.resample(
-                            rir_audio, rir_sr, self.sr)
-                    rt60 = estimate_rt60(rir_audio, self.sr)
-                    if self.rt60_min <= rt60 <= self.rt60_max:
-                        self.rir_files.append(rp)
-                except Exception:
-                    continue
-            print(f"  → {len(self.rir_files)} RIRs passed RT60 filter")
+            self.rir_files = self._load_rir_paths_cached(rir_dir)
 
         # ERB bands
         self.bin_edges = self._compute_erb_bands()
@@ -485,6 +470,72 @@ class DNS4Dataset(Dataset):
 
         # epoch shuffle indices
         self._shuffle_indices()
+
+    def _load_rir_paths_cached(self, rir_dir: str) -> List[str]:
+        """
+        掃描 RIR 目錄並用 RT60 過濾，結果 cache 到 JSON 檔。
+        Cache key = hash(檔案清單 + sr + rt60 range)，設定或檔案變動時自動重算。
+        """
+        all_rir_paths = sorted(
+            glob.glob(os.path.join(rir_dir, '**', '*.wav'), recursive=True)
+        )
+        if not all_rir_paths:
+            return []
+
+        # 計算 cache key: 檔案清單 + 設定
+        key_str = json.dumps({
+            'paths': all_rir_paths,
+            'sr': self.sr,
+            'rt60_min': self.rt60_min,
+            'rt60_max': self.rt60_max,
+        }, sort_keys=True)
+        cache_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
+        cache_path = os.path.join(rir_dir, f'.rir_rt60_cache_{cache_hash}.json')
+
+        # 嘗試讀 cache
+        if os.path.isfile(cache_path):
+            with open(cache_path, 'r') as f:
+                cached = json.load(f)
+            # 驗證 cache 內的檔案仍存在
+            valid = [p for p in cached['rir_files'] if os.path.isfile(p)]
+            if len(valid) == len(cached['rir_files']):
+                print(f"RIR cache hit: {cache_path} ({len(valid)} files)")
+                return valid
+            print(f"RIR cache stale (missing files), rescanning...")
+
+        # Cache miss: 逐檔計算 RT60
+        print(f"Scanning {len(all_rir_paths)} RIR files for RT60 filtering "
+              f"[{self.rt60_min:.1f}s, {self.rt60_max:.1f}s]...")
+        passed = []
+        rt60_map = {}
+        for rp in all_rir_paths:
+            try:
+                rir_audio, rir_sr = torchaudio.load(rp)
+                rir_audio = rir_audio[0]
+                if rir_sr != self.sr:
+                    rir_audio = torchaudio.functional.resample(
+                        rir_audio, rir_sr, self.sr)
+                rt60 = estimate_rt60(rir_audio, self.sr)
+                rt60_map[rp] = rt60
+                if self.rt60_min <= rt60 <= self.rt60_max:
+                    passed.append(rp)
+            except Exception:
+                continue
+        print(f"  → {len(passed)} / {len(all_rir_paths)} RIRs passed RT60 filter")
+
+        # 寫入 cache
+        cache_data = {
+            'rir_files': passed,
+            'rt60_map': rt60_map,
+        }
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump(cache_data, f)
+            print(f"  → Cache saved: {cache_path}")
+        except OSError:
+            pass  # 寫不了就算了，下次重算
+
+        return passed
 
     def _shuffle_indices(self):
         """每 epoch 開始時 shuffle，取 epoch_size 個"""
@@ -691,3 +742,46 @@ class DNS4Dataset(Dataset):
         target_gains = self._compute_gain_target(clean_power, noisy_power)
 
         return features, target_gains
+
+
+# ============================================================
+# Precomputed Dataset (讀取 gen_dataset.py 產生的 .pt shard)
+# ============================================================
+
+class PrecomputedDataset(Dataset):
+    """
+    讀取離線預生成的 .pt shard 檔，跳過所有即時 augmentation。
+
+    用法:
+        dataset = PrecomputedDataset('data/')
+    """
+
+    def __init__(self, data_dir: str):
+        self.data_dir = data_dir
+        meta_path = os.path.join(data_dir, 'meta.pt')
+        if not os.path.isfile(meta_path):
+            raise FileNotFoundError(f"meta.pt not found in {data_dir}")
+
+        meta = torch.load(meta_path, weights_only=False)
+        self.n_shards = meta['n_shards']
+        self.n_total = meta['n_total']
+        self.shard_size = meta['shard_size']
+
+        # 載入所有 shard 到記憶體 (concat 成一個大 tensor)
+        all_features = []
+        all_targets = []
+        for i in range(self.n_shards):
+            shard_path = os.path.join(data_dir, f'shard_{i:04d}.pt')
+            shard = torch.load(shard_path, weights_only=False)
+            all_features.append(shard['features'])
+            all_targets.append(shard['targets'])
+
+        self.features = torch.cat(all_features, dim=0)  # (N, seq_len, n_bands)
+        self.targets = torch.cat(all_targets, dim=0)     # (N, seq_len, n_bands)
+        print(f"PrecomputedDataset: {len(self)} samples loaded from {data_dir}")
+
+    def __len__(self):
+        return self.features.shape[0]
+
+    def __getitem__(self, idx):
+        return self.features[idx], self.targets[idx]
