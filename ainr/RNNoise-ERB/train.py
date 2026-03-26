@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, random_split
 import tqdm
 
-from dataset import DNS4Dataset
+from dataset import DNS4Dataset, PrecomputedDataset
 
 # ============================================================
 # ERB Band 工具
@@ -167,22 +167,33 @@ def train(args):
     epochs = cfg.getint('training', 'epochs')
     batch_size = cfg.getint('training', 'batch_size')
     lr = cfg.getfloat('training', 'lr')
-    device_str = args.device or cfg.get('training', 'device', fallback='cpu')
-    device = torch.device(device_str)
+    if args.gpu is not None:
+        device = torch.device(f'cuda:{args.gpu}')
+    else:
+        device_str = args.device or cfg.get('training', 'device', fallback='cpu')
+        device = torch.device(device_str)
     output_dir = cfg.get('paths', 'output_dir')
 
     # ERB
     BIN_EDGES = compute_erb_bands(N_FFT, SR, N_BANDS)
 
     # Dataset
-    dataset = DNS4Dataset(cfg)
+    if args.precomputed:
+        dataset = PrecomputedDataset(args.precomputed)
+        use_online = False
+    else:
+        dataset = DNS4Dataset(cfg)
+        use_online = True
+
     n_val = max(1, int(len(dataset) * 0.1))
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val])
 
+    # Precomputed: 資料已在記憶體，不需多 worker；Online: 需要多 worker 做 augmentation
+    n_workers = 0 if not use_online else 4
     train_loader = DataLoader(train_set, batch_size=batch_size,
-                              shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=2)
+                              shuffle=True, num_workers=n_workers, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=min(n_workers, 2))
 
     # 模型
     model = RNNoiseModel(n_bands=N_BANDS, cond_size=64, gru_size=128).to(device)
@@ -216,8 +227,9 @@ def train(args):
     print(f"  device={device}")
 
     for epoch in range(start_epoch, epochs + 1):
-        # 每 epoch 重新 shuffle dataset indices
-        dataset._shuffle_indices()
+        # 每 epoch 重新 shuffle dataset indices (僅 online 模式)
+        if use_online:
+            dataset._shuffle_indices()
 
         # --- Train ---
         model.train()
@@ -290,6 +302,10 @@ if __name__ == '__main__':
     parser.add_argument('--config', default='config.ini', help='Config 檔案路徑')
     parser.add_argument('--device', default=None,
                         help='覆蓋 config 中的 device 設定')
+    parser.add_argument('--gpu', type=int, default=None,
+                        help='指定 GPU ID (例: --gpu 0)')
+    parser.add_argument('--precomputed', default=None,
+                        help='預生成資料目錄 (gen_dataset.py 產生)')
     parser.add_argument('--resume', default=None,
                         help='Checkpoint 路徑，從斷點續訓')
     parser.add_argument('--seed', type=int, default=42,
