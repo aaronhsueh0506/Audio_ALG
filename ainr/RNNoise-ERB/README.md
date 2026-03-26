@@ -112,11 +112,8 @@ python3 train.py --config config.ini --seed 123
 先用 `gen_dataset.py` 跑一次 augmentation pipeline，存成 `.pt` shard 檔，後續訓練直接讀取：
 
 ```bash
-# Step 1: 預生成資料（會顯示預估時間和磁碟空間）
-python3 gen_dataset.py --config config.ini --output data/ --n-shards 10
-
-# 生成 3 倍資料（每倍不同 augmentation 組合）
-python3 gen_dataset.py --config config.ini --output data/ --n-shards 10 --multiply 3
+# Step 1: 預生成 25 小時資料（自動取最近整數倍 epoch，不會有殘餘筆數）
+python3 gen_dataset.py --config config.ini --output data/ --hours 25
 
 # Step 2: 用預生成資料訓練（無即時 I/O + DSP，速度大幅提升）
 python3 train.py --config config.ini --precomputed data/
@@ -126,8 +123,8 @@ python3 train.py --config config.ini --precomputed data/
 
 | 參數 | 預設值 | 說明 |
 |------|--------|------|
+| `--hours` | 8.3 | 目標音檔總時數（自動 round 到最近整數倍 epoch） |
 | `--output` | `data` | 輸出目錄 |
-| `--multiply` | 1 | 生成幾倍資料（每倍不同 augmentation） |
 | `--n-shards` | 10 | 分成幾個 shard 檔 |
 | `--seed` | 42 | 隨機種子（-1 關閉） |
 

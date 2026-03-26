@@ -3,8 +3,8 @@
 後續訓練直接讀取，不需要即時做 I/O + DSP
 
 用法:
-    python gen_dataset.py --config config.ini --output data/ --n-shards 10
-    python gen_dataset.py --config config.ini --output data/ --n-shards 10 --seed 42
+    python gen_dataset.py --config config.ini --output data/ --hours 25
+    python gen_dataset.py --config config.ini --output data/ --hours 50 --n-shards 20
 
 訓練時:
     python train.py --config config.ini --precomputed data/
@@ -36,8 +36,13 @@ def gen_dataset(args):
 
     dataset = DNS4Dataset(cfg)
     epoch_size = len(dataset)
-    n_rounds = args.multiply
+    segment_sec = cfg.getfloat('audio', 'segment_sec', fallback=3.0)
+    epoch_hours = epoch_size * segment_sec / 3600
+
+    # 從 --hours 換算成最接近的整數倍 epoch
+    n_rounds = max(1, round(args.hours / epoch_hours))
     n_total = epoch_size * n_rounds
+    actual_hours = n_total * segment_sec / 3600
     n_shards = args.n_shards
 
     os.makedirs(args.output, exist_ok=True)
@@ -61,10 +66,11 @@ def gen_dataset(args):
     else:
         disk_str = f"{disk_bytes / 1024**2:.0f} MB"
 
-    print(f"\nGenerating {n_total} samples ({epoch_size} x {n_rounds} rounds) "
-          f"into {n_shards} shards (~{shard_size} per shard)")
-    print(f"  Estimated time : {est_hours:.1f} hours ({t_sample:.3f}s/sample)")
-    print(f"  Estimated disk : {disk_str}")
+    print(f"\nRequested {args.hours:.1f} hours → {n_rounds}x epoch "
+          f"({actual_hours:.1f} hours, {n_total} samples)")
+    print(f"  {n_shards} shards (~{shard_size} per shard)")
+    print(f"  Estimated gen time : {est_hours:.1f} hours ({t_sample:.3f}s/sample)")
+    print(f"  Estimated disk     : {disk_str}")
     print(f"  Output: {args.output}/\n")
 
     # 收集所有 samples（每 round 重新 shuffle → 不同 augmentation）
@@ -103,7 +109,8 @@ def gen_dataset(args):
         'n_shards': n_shards,
         'n_total': n_total,
         'shard_size': shard_size,
-        'multiply': n_rounds,
+        'n_rounds': n_rounds,
+        'hours': actual_hours,
         'seq_len': all_features[0].shape[0],
         'n_bands': all_features[0].shape[1],
         'config': args.config,
@@ -117,8 +124,8 @@ if __name__ == '__main__':
         description='離線預生成 RNNoise-ERB 訓練資料')
     parser.add_argument('--config', default='config.ini', help='Config 檔案路徑')
     parser.add_argument('--output', default='data', help='輸出目錄')
-    parser.add_argument('--multiply', type=int, default=1,
-                        help='生成幾倍資料 (預設: 1, 每倍不同 augmentation)')
+    parser.add_argument('--hours', type=float, default=8.3,
+                        help='目標音檔總時數 (自動取最近整數倍 epoch, 預設: 8.3)')
     parser.add_argument('--n-shards', type=int, default=10,
                         help='分成幾個 shard 檔 (預設: 10)')
     parser.add_argument('--seed', type=int, default=42,
