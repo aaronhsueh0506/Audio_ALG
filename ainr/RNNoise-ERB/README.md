@@ -5,9 +5,10 @@
 ## 架構
 
 - **輸入**: 22 個 ERB band 的 normalized log energy (每 frame 16ms)
-- **模型**: Conv1d(k=3) + Conv1d(k=1) → 3 層 GRU(128) → concat → Dense → sigmoid
+- **模型**: Conv1d(k=3, causal) + Conv1d(k=1) → 3 層 GRU(128) → concat → Dense → sigmoid
 - **輸出**: 22 個 band 的 gain mask [0, 1]
 - **參數量**: ~350K
+- **Latency**: 16ms (1 hop, 0 lookahead — causal Conv1d)
 
 ## 環境安裝
 
@@ -59,6 +60,7 @@ datasets_fullband/
 - 音檔可以是任意 sample rate，程式會自動 resample 到 16kHz
 - **RIR 為 optional**：若不使用，可將 `rir_dir` 設為空字串或刪除該行。建議使用以提升 dereverberation 效果
 - RIR 會自動用 Schroeder 積分法估算 RT60，只保留 `rt60_min` ~ `rt60_max` (預設 0.1s ~ 1.3s) 範圍內的 RIR
+- **RIR RT60 快取**：首次掃描後會自動存成 `.rir_cache_*.json`，後續相同設定直接讀取，大幅加速初始化
 - 不一定要用 DNS4，**任何符合上述結構的語音/噪音資料集都可以**（只要是 wav 檔放在對應目錄下）
 
 ## 設定 config.ini
@@ -87,11 +89,16 @@ output_dir = ./output
 
 ## 訓練
 
-### 基本訓練
+### 基本訓練（Online 模式）
+
+即時做 augmentation + 訓練，不需預生成資料：
 
 ```bash
 # GPU 訓練
 python3 train.py --config config.ini
+
+# 指定 GPU ID
+python3 train.py --config config.ini --gpu 0
 
 # CPU 訓練
 python3 train.py --config config.ini --device cpu
@@ -99,6 +106,30 @@ python3 train.py --config config.ini --device cpu
 # 指定隨機種子
 python3 train.py --config config.ini --seed 123
 ```
+
+### 離線預生成資料 + 快速訓練（Precomputed 模式）
+
+先用 `gen_dataset.py` 跑一次 augmentation pipeline，存成 `.pt` shard 檔，後續訓練直接讀取：
+
+```bash
+# Step 1: 預生成資料（會顯示預估時間和磁碟空間）
+python3 gen_dataset.py --config config.ini --output data/ --n-shards 10
+
+# 生成 3 倍資料（每倍不同 augmentation 組合）
+python3 gen_dataset.py --config config.ini --output data/ --n-shards 10 --multiply 3
+
+# Step 2: 用預生成資料訓練（無即時 I/O + DSP，速度大幅提升）
+python3 train.py --config config.ini --precomputed data/
+```
+
+`gen_dataset.py` 參數：
+
+| 參數 | 預設值 | 說明 |
+|------|--------|------|
+| `--output` | `data` | 輸出目錄 |
+| `--multiply` | 1 | 生成幾倍資料（每倍不同 augmentation） |
+| `--n-shards` | 10 | 分成幾個 shard 檔 |
+| `--seed` | 42 | 隨機種子（-1 關閉） |
 
 ### 從斷點續訓
 
@@ -158,8 +189,9 @@ python3 export_erb_matrix.py --config config.ini --format all
 
 | 檔案 | 說明 |
 |------|------|
-| `train.py` | 訓練腳本（模型定義 + 訓練迴圈） |
-| `dataset.py` | DNS4 資料集 + augmentation pipeline |
+| `train.py` | 訓練腳本（模型定義 + 訓練迴圈，支援 online / precomputed 兩種模式） |
+| `gen_dataset.py` | 離線預生成訓練資料（存成 .pt shard 檔） |
+| `dataset.py` | DNS4 資料集 + augmentation pipeline + PrecomputedDataset |
 | `denoise.py` | 推論腳本（單檔降噪） |
 | `export_onnx.py` | ONNX 匯出（streaming 推論格式） |
 | `export_erb_matrix.py` | ERB 矩陣匯出（npy / C header） |
