@@ -1,13 +1,14 @@
+# -*- coding: utf-8 -*-
 """
-離線預生成訓練資料 — 跑一次 augmentation pipeline，存成 .pt shard 檔
-後續訓練直接讀取，不需要即時做 I/O + DSP
+Offline pre-generation of training data -- run augmentation pipeline once,
+save as .pt shard files. Training then loads directly without real-time I/O + DSP.
 
-用法:
-    python gen_dataset.py --config config.ini --output data/ --hours 25
-    python gen_dataset.py --config config.ini --output data/ --hours 50 --n-shards 20
+Usage:
+    python3 gen_dataset.py --config config.ini --output data/ --hours 25
+    python3 gen_dataset.py --config config.ini --output data/ --hours 50 --workers 8
 
-訓練時:
-    python train.py --config config.ini --precomputed data/
+Training:
+    python3 train.py --config config.ini --precomputed data/
 """
 
 import argparse
@@ -18,6 +19,7 @@ import time
 
 import numpy as np
 import torch
+import torch.utils.data as data
 import tqdm
 
 from dataset import DNS4Dataset
@@ -39,7 +41,6 @@ def gen_dataset(args):
     segment_sec = cfg.getfloat('audio', 'segment_sec', fallback=3.0)
     epoch_hours = epoch_size * segment_sec / 3600
 
-    # 從 --hours 換算成最接近的整數倍 epoch
     n_rounds = max(1, round(args.hours / epoch_hours))
     n_total = epoch_size * n_rounds
     actual_hours = n_total * segment_sec / 3600
@@ -47,49 +48,64 @@ def gen_dataset(args):
 
     os.makedirs(args.output, exist_ok=True)
 
-    # 計算每個 shard 的大小
     shard_size = (n_total + n_shards - 1) // n_shards
 
-    # 先跑一個 sample 來估算時間和空間
+    # Profile 1 sample for time/disk estimation
     print("Profiling 1 sample...")
     t0 = time.time()
     sample_feat, sample_tgt = dataset[0]
     t_sample = time.time() - t0
-    # 每個 sample 的 bytes: features + targets, float32
     sample_bytes = (sample_feat.numel() + sample_tgt.numel()) * 4
-    # torch.save overhead ~1.3x (pickle + header)
     disk_bytes = int(sample_bytes * n_total * 1.3)
 
-    est_hours = t_sample * n_total / 3600
+    # Adjust estimate for workers (rough speedup factor)
+    n_workers = args.workers
+    speedup = max(1, n_workers) if n_workers > 0 else 1
+    est_hours = t_sample * n_total / 3600 / speedup
+
     if disk_bytes >= 1024 ** 3:
         disk_str = f"{disk_bytes / 1024**3:.1f} GB"
     else:
         disk_str = f"{disk_bytes / 1024**2:.0f} MB"
 
-    print(f"\nRequested {args.hours:.1f} hours → {n_rounds}x epoch "
+    print(f"\nRequested {args.hours:.1f} hours -> {n_rounds}x epoch "
           f"({actual_hours:.1f} hours, {n_total} samples)")
     print(f"  {n_shards} shards (~{shard_size} per shard)")
+    print(f"  Workers          : {n_workers}")
     print(f"  Estimated gen time : {est_hours:.1f} hours ({t_sample:.3f}s/sample)")
     print(f"  Estimated disk     : {disk_str}")
     print(f"  Output: {args.output}/\n")
 
-    # 收集所有 samples（每 round 重新 shuffle → 不同 augmentation）
+    # Generate all samples using DataLoader for parallel workers
     all_features = []
     all_targets = []
     gen_start = time.time()
+
     for r in range(n_rounds):
         if n_rounds > 1:
             dataset._shuffle_indices()
             print(f"\n--- Round {r + 1}/{n_rounds} ---")
-        for i in tqdm.tqdm(range(epoch_size), desc=f"Round {r + 1}/{n_rounds}"):
-            feat, tgt = dataset[i]
-            all_features.append(feat)
-            all_targets.append(tgt)
+
+        if n_workers > 0:
+            loader = data.DataLoader(
+                dataset, batch_size=1, shuffle=False,
+                num_workers=n_workers, prefetch_factor=2,
+                persistent_workers=False,
+            )
+            for feat, tgt in tqdm.tqdm(loader, desc=f"Round {r+1}/{n_rounds}",
+                                       total=epoch_size):
+                all_features.append(feat.squeeze(0))
+                all_targets.append(tgt.squeeze(0))
+        else:
+            for i in tqdm.tqdm(range(epoch_size), desc=f"Round {r+1}/{n_rounds}"):
+                feat, tgt = dataset[i]
+                all_features.append(feat)
+                all_targets.append(tgt)
 
     gen_elapsed = time.time() - gen_start
     print(f"\nGeneration done in {gen_elapsed / 3600:.2f} hours")
 
-    # 分 shard 存檔
+    # Save shards
     for shard_id in range(n_shards):
         start = shard_id * shard_size
         end = min(start + shard_size, n_total)
@@ -104,7 +120,7 @@ def gen_dataset(args):
         print(f"  {shard_path}: {end - start} samples, "
               f"features={shard_data['features'].shape}")
 
-    # 存 metadata
+    # Save metadata
     meta = {
         'n_shards': n_shards,
         'n_total': n_total,
@@ -121,15 +137,19 @@ def gen_dataset(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='離線預生成 RNNoise-ERB 訓練資料')
-    parser.add_argument('--config', default='config.ini', help='Config 檔案路徑')
-    parser.add_argument('--output', default='data', help='輸出目錄')
+        description='Offline pre-generation of RNNoise-ERB training data')
+    parser.add_argument('--config', default='config.ini',
+                        help='Config file path')
+    parser.add_argument('--output', default='data',
+                        help='Output directory')
     parser.add_argument('--hours', type=float, default=8.3,
-                        help='目標音檔總時數 (自動取最近整數倍 epoch, 預設: 8.3)')
+                        help='Target audio hours (auto-rounds to nearest epoch, default: 8.3)')
     parser.add_argument('--n-shards', type=int, default=10,
-                        help='分成幾個 shard 檔 (預設: 10)')
+                        help='Number of shard files (default: 10)')
+    parser.add_argument('--workers', type=int, default=4,
+                        help='Number of DataLoader workers (default: 4, 0=single process)')
     parser.add_argument('--seed', type=int, default=42,
-                        help='隨機種子 (預設: 42, 設 -1 關閉)')
+                        help='Random seed (default: 42, -1 to disable)')
     args = parser.parse_args()
     if args.seed == -1:
         args.seed = None
