@@ -120,6 +120,11 @@ def denoise(args):
         gains, _ = model(features.unsqueeze(0))  # (1, n_frames-2, n_bands)
     gains = gains.squeeze(0)  # (n_frames-2, n_bands)
 
+    # Temporal gain smoothing — 降低 speech/silence 邊界的 pumping artifact
+    smooth_alpha = 0.3
+    for t in range(1, gains.size(0)):
+        gains[t] = smooth_alpha * gains[t] + (1 - smooth_alpha) * gains[t - 1]
+
     # 將 band gains 展開到每個 FFT bin
     n_bins = spec.size(0)
     n_frames_out = gains.size(0)

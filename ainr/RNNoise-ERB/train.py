@@ -202,7 +202,7 @@ def train(args):
         optimizer, lr_lambda=lambda step: 1.0 / (1.0 + 5e-5 * step)
     )
 
-    gamma = 0.5  # perceptual exponent
+    gamma = 1.0  # perceptual exponent (0.5→1.0: 恢復 gain~1.0 附近梯度敏感度)
 
     os.makedirs(output_dir, exist_ok=True)
     best_val_loss = float('inf')
@@ -244,7 +244,18 @@ def train(args):
                 # Causal: output[i] 對應 input[i+2] (最新 frame, 0 lookahead)
                 targets = targets[:, 2:, :]
 
-                loss = F.mse_loss(pred_gains ** gamma, targets ** gamma)
+                # Speech-weighted asymmetric loss
+                # (A) 語音段加重: target gain 高 → 語音段, penalty 3x
+                speech_weight = targets.mean(dim=-1, keepdim=True)
+                frame_weight = 1.0 + 2.0 * speech_weight
+
+                # (B) Asymmetric: over-estimation (noise leak) 罰更重
+                pred_g = pred_gains ** gamma
+                targ_g = targets ** gamma
+                error = pred_g - targ_g
+                asym_weight = torch.where(error > 0, 1.5, 1.0)
+
+                loss = (frame_weight * asym_weight * error.pow(2)).mean()
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -266,7 +277,14 @@ def train(args):
                 targets = targets.to(device)
                 pred_gains, _ = model(features)
                 targets = targets[:, 2:, :]
-                val_loss_sum += F.mse_loss(pred_gains ** gamma, targets ** gamma).item()
+                # 同 training: speech-weighted asymmetric loss
+                sw = targets.mean(dim=-1, keepdim=True)
+                fw = 1.0 + 2.0 * sw
+                pg = pred_gains ** gamma
+                tg = targets ** gamma
+                err = pg - tg
+                aw = torch.where(err > 0, 1.5, 1.0)
+                val_loss_sum += (fw * aw * err.pow(2)).mean().item()
 
         avg_val = val_loss_sum / max(len(val_loader), 1)
         print(f"  train_loss={avg_train:.5f}  val_loss={avg_val:.5f}")
