@@ -19,7 +19,7 @@ import torch
 import torchaudio
 
 from train import (
-    compute_erb_bands, RNNoiseModel,
+    compute_erb_bands, compute_hybrid_bands, RNNoiseModel,
 )
 
 
@@ -83,7 +83,13 @@ def denoise(args):
     N_FFT = cfg.getint('signal', 'n_fft')
     WIN_LEN = cfg.getint('signal', 'win_len', fallback=N_FFT)
     HOP_LEN = cfg.getint('signal', 'hop_len', fallback=WIN_LEN // 2)
-    N_BANDS = cfg.getint('signal', 'n_bands')
+    HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
+    N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
+
+    if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
+        _, N_BANDS = compute_hybrid_bands(N_FFT, SR, N_ERB_HIGH, HYBRID_CUTOFF)
+    else:
+        N_BANDS = cfg.getint('signal', 'n_bands')
 
     device = torch.device('cpu')
 
@@ -93,8 +99,12 @@ def denoise(args):
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
 
-    bin_edges = np.array(ckpt.get('bin_edges',
-                                  compute_erb_bands(N_FFT, SR, N_BANDS).tolist()))
+    if 'bin_edges' in ckpt:
+        bin_edges = np.array(ckpt['bin_edges'])
+    elif HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
+        bin_edges, _ = compute_hybrid_bands(N_FFT, SR, N_ERB_HIGH, HYBRID_CUTOFF)
+    else:
+        bin_edges = compute_erb_bands(N_FFT, SR, N_BANDS)
 
     # 載入音檔
     audio, orig_sr = torchaudio.load(args.input)

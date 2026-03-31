@@ -51,6 +51,39 @@ def compute_erb_bands(n_fft, sr, n_bands):
     return bin_edges
 
 
+def compute_hybrid_bands(n_fft, sr, n_erb_high, cutoff_hz):
+    """
+    Hybrid frequency bands (ref: GTCRN):
+      - 0 ~ cutoff_hz: 每個 FFT bin 一個 band (原始解析度)
+      - cutoff_hz ~ Nyquist: n_erb_high 個 ERB bands
+    回傳: bin_edges (n_bands+1,), n_bands
+    """
+    n_bins = n_fft // 2 + 1
+    bin_res = sr / n_fft
+    cutoff_bin = int(round(cutoff_hz / bin_res))
+    cutoff_bin = min(cutoff_bin, n_bins - 1)
+
+    # Part 1: individual bins [0, 1, 2, ..., cutoff_bin]
+    low_edges = list(range(cutoff_bin + 1))
+
+    # Part 2: ERB bands above cutoff
+    e_cut = erb_rate(cutoff_hz)
+    e_high = erb_rate(sr / 2)
+    erb_edges = np.linspace(e_cut, e_high, n_erb_high + 1)
+    freq_edges = erb_inv(erb_edges)
+    high_edges = np.round(freq_edges / bin_res).astype(int)
+    high_edges = np.clip(high_edges, cutoff_bin, n_bins)
+    for i in range(1, len(high_edges)):
+        if high_edges[i] <= high_edges[i - 1]:
+            high_edges[i] = high_edges[i - 1] + 1
+    high_edges[-1] = min(high_edges[-1], n_bins)
+
+    # 合併: low_edges[-1] == high_edges[0] == cutoff_bin
+    all_edges = np.array(low_edges + list(high_edges[1:]), dtype=int)
+    n_bands = len(all_edges) - 1
+    return all_edges, n_bands
+
+
 def compute_erb_matrix(bin_edges, n_fft, n_bands):
     """
     建構 ERB 轉換矩陣 W, shape = (n_bins, n_bands)
@@ -161,7 +194,14 @@ def train(args):
     N_FFT = cfg.getint('signal', 'n_fft')
     WIN_LEN = cfg.getint('signal', 'win_len', fallback=N_FFT)
     HOP_LEN = cfg.getint('signal', 'hop_len', fallback=WIN_LEN // 2)
-    N_BANDS = cfg.getint('signal', 'n_bands')
+    HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
+    N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
+
+    if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
+        # Hybrid mode: raw bins below cutoff + ERB above
+        _, N_BANDS = compute_hybrid_bands(N_FFT, SR, N_ERB_HIGH, HYBRID_CUTOFF)
+    else:
+        N_BANDS = cfg.getint('signal', 'n_bands')
 
     # Training params
     epochs = cfg.getint('training', 'epochs')
@@ -174,8 +214,14 @@ def train(args):
         device = torch.device(device_str)
     output_dir = cfg.get('paths', 'output_dir')
 
-    # ERB
-    BIN_EDGES = compute_erb_bands(N_FFT, SR, N_BANDS)
+    # Band edges
+    if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
+        BIN_EDGES, N_BANDS = compute_hybrid_bands(N_FFT, SR, N_ERB_HIGH, HYBRID_CUTOFF)
+        print(f"  Hybrid bands: {HYBRID_CUTOFF}Hz cutoff, "
+              f"{BIN_EDGES[0]}..{int(round(HYBRID_CUTOFF/(SR/N_FFT)))} raw bins + "
+              f"{N_ERB_HIGH} ERB = {N_BANDS} total")
+    else:
+        BIN_EDGES = compute_erb_bands(N_FFT, SR, N_BANDS)
 
     # Dataset
     if args.precomputed:
