@@ -403,6 +403,8 @@ class DNS4Dataset(Dataset):
         self.win_len = cfg.getint('signal', 'win_len', fallback=self.n_fft)
         self.hop_len = cfg.getint('signal', 'hop_len', fallback=self.win_len // 2)
         self.n_bands = cfg.getint('signal', 'n_bands')
+        self.hybrid_cutoff_hz = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
+        self.n_erb_high_bands = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
 
         # audio
         self.segment_sec = cfg.getfloat('audio', 'segment_sec')
@@ -554,27 +556,13 @@ class DNS4Dataset(Dataset):
     # --------------------------------------------------------
 
     def _compute_erb_bands(self):
-        n_fft = self.n_fft
-        sr = self.sr
-        n_bands = self.n_bands
-        n_bins = n_fft // 2 + 1
-
-        def erb_rate(f):
-            return 21.4 * np.log10(0.00437 * f + 1)
-        def erb_inv(e):
-            return (10 ** (e / 21.4) - 1) / 0.00437
-
-        e_low = erb_rate(0)
-        e_high = erb_rate(sr / 2)
-        erb_edges = np.linspace(e_low, e_high, n_bands + 1)
-        freq_edges = erb_inv(erb_edges)
-        bin_edges = np.round(freq_edges / (sr / n_fft)).astype(int)
-        bin_edges = np.clip(bin_edges, 0, n_bins - 1)
-        for i in range(1, len(bin_edges)):
-            if bin_edges[i] <= bin_edges[i - 1]:
-                bin_edges[i] = bin_edges[i - 1] + 1
-        bin_edges[-1] = min(bin_edges[-1], n_bins)
-        return bin_edges
+        from train import compute_hybrid_bands, compute_erb_bands
+        if self.hybrid_cutoff_hz > 0 and self.n_erb_high_bands > 0:
+            bin_edges, self.n_bands = compute_hybrid_bands(
+                self.n_fft, self.sr, self.n_erb_high_bands, self.hybrid_cutoff_hz)
+            return bin_edges
+        else:
+            return compute_erb_bands(self.n_fft, self.sr, self.n_bands)
 
     # --------------------------------------------------------
     # Audio loading helpers

@@ -113,14 +113,21 @@ def main():
 
     SR = cfg.getint('signal', 'sr')
     N_FFT = cfg.getint('signal', 'n_fft')
-    N_BANDS = cfg.getint('signal', 'n_bands')
+    HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
+    N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
 
     output_dir = args.output_dir or cfg.get('paths', 'output_dir', fallback='output')
 
     import os
     os.makedirs(output_dir, exist_ok=True)
 
-    bin_edges = compute_erb_bands(N_FFT, SR, N_BANDS)
+    if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
+        from train import compute_hybrid_bands as _compute_hybrid
+        bin_edges, N_BANDS = _compute_hybrid(N_FFT, SR, N_ERB_HIGH, HYBRID_CUTOFF)
+        print(f"Hybrid mode: {HYBRID_CUTOFF}Hz cutoff, {N_BANDS} total bands")
+    else:
+        N_BANDS = cfg.getint('signal', 'n_bands')
+        bin_edges = compute_erb_bands(N_FFT, SR, N_BANDS)
     W = compute_erb_matrix(N_FFT, N_BANDS, bin_edges)
     n_bins, n_bands = W.shape
 
