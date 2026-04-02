@@ -26,6 +26,28 @@ All modules use unified 20ms frame / 10ms hop, auto-configured by sample rate:
 | hop_size | 80 | 160 | 480 | frame / 2 |
 | fft_size | 256 | 512 | 1024 | next pow2 ≥ frame |
 | n_freqs | 129 | 257 | 513 | fft/2 + 1 |
+| filter_length | 256 | 512 | 1536 | sr × 32ms |
+| n_partitions | 4 | 4 | 4 | ceil(filter_length / hop) |
+
+## Latency & Performance
+
+| 項目 | 數值 | 說明 |
+|------|------|------|
+| **Algorithmic latency** | 10 ms | 1 hop（所有 sample rate 一致） |
+| **NR OLA delay** | +10 ms | NR frame 處理引入額外 1 hop 延遲 |
+| **Pipeline total latency** | **20 ms** | AEC hop + NR OLA delay |
+| **Processing (per hop)** | < 0.5 ms | AEC + NR + RES 合計（ARM Cortex-A53 @ 1GHz 估計） |
+| **RTF** | < 0.05 | 遠低於即時要求 |
+
+### Memory Budget
+
+| Sample Rate | AEC | Context×2 | NR | RES | Buffers | **Total** |
+|-------------|-----|-----------|-----|-----|---------|-----------|
+| **8 kHz** | 61.7 KB | 6.3 KB | 49.0 KB | 21.5 KB | 4.6 KB | **143.1 KB** |
+| **16 kHz** | 120.7 KB | 12.3 KB | 96.3 KB | 41.8 KB | 9.2 KB | **280.4 KB** |
+| **48 kHz** | 240.4 KB | 24.3 KB | 194.8 KB | 86.3 KB | 21.4 KB | **567.4 KB** |
+
+> `filter_length=sr×32ms`。若需更長 echo path，增加 `filter_length` 會等比增加 AEC 記憶體。
 
 ## Integration Flow
 
@@ -78,7 +100,7 @@ make
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `sample_rate` | 16000 | 8000 / 16000 / 48000，自動計算 frame/fft/hop |
-| `filter_length` | 1024 | 自適應濾波器長度（samples）。16kHz: 512=32ms, 1024=64ms |
+| `filter_length` | sr×32ms | 自適應濾波器長度（256@8k, 512@16k, 1536@48k） |
 | `enable_highpass` | 1 | 高通濾波器（移除 DC + 低頻） |
 | `highpass_cutoff_hz` | 80.0 | HPF 截止頻率 (Hz) |
 
