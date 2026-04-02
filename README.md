@@ -68,7 +68,27 @@ git push
 
 ## 處理鏈 (Pipeline)
 
-AEC 輸出接 NR 輸入的串接處理：
+AEC(linear) → NR(MMSE-LSA) → RES 串接處理：
 ```bash
-python pipelines/aec_nr_pipeline.py --input input.wav --ref ref.wav --output output.wav
+cd Audio_ALG
+python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav --preset balanced
 ```
+
+### Blind Test 成績（AEC Challenge Interspeech 2021, 800 cases, balanced）
+
+| 指標 | AEC-only | AEC+NR+RES | 變化 |
+|------|---------|------------|------|
+| **AECMOS** | | | |
+| FS echo↑ | 3.615 | 3.568 | -0.047 |
+| DT echo↑ | 4.232 | 4.339 | **+0.107** |
+| DT deg↑ | 2.095 | 2.314 | **+0.219** |
+| NE deg↑ | 3.975 | 3.488 | -0.487 |
+| **DNSMOS** | | | |
+| FS SIG↑ | 2.007 | 2.118 | +0.111 |
+| FS BAK↑ | 3.217 | 3.730 | **+0.513** |
+| DT SIG↑ | 2.461 | 2.510 | +0.049 |
+| DT BAK↑ | 3.380 | 3.738 | **+0.358** |
+| NE SIG↑ | 3.430 | 3.228 | -0.202 |
+| NE BAK↑ | 3.892 | 3.926 | +0.034 |
+
+> NR 主要貢獻：BAK +0.5（背景噪音品質）、DT deg +0.2（語音保護）。
