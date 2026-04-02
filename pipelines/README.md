@@ -165,7 +165,7 @@ nvt_mem_free(pool, pa);
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `sample_rate` | 16000 | 8000 / 16000 / 48000，自動計算 frame/fft/hop |
-| `filter_length` | 1024 | 自適應濾波器長度（samples）。16kHz: 512=32ms, 1024=64ms |
+| `filter_length` | sr×32ms | 自適應濾波器長度（256@8k, 512@16k, 1536@48k） |
 | `enable_highpass` | 1 | 高通濾波器（移除 DC + 低頻） |
 | `highpass_cutoff_hz` | 80.0 | HPF 截止頻率 (Hz) |
 
