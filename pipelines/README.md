@@ -142,9 +142,9 @@ nvt_mem_free(pool, pa);
 
 | Sample Rate | Frame | FFT | n_freqs | AEC | Context×2 | NR | RES | Buffers | **Total** |
 |-------------|-------|-----|---------|-----|-----------|-----|-----|---------|-----------|
-| **8 kHz** | 160 | 256 | 129 | 92.6 KB | 6.3 KB | 49.0 KB | 21.5 KB | 4.6 KB | **174.0 KB** |
-| **16 kHz** | 320 | 512 | 257 | 181.5 KB | 12.3 KB | 96.3 KB | 41.8 KB | 9.2 KB | **341.2 KB** |
-| **48 kHz** | 960 | 1024 | 513 | 361.3 KB | 24.3 KB | 194.8 KB | 86.3 KB | 21.4 KB | **688.2 KB** |
+| **8 kHz** | 160 | 256 | 129 | 77.2 KB | 6.3 KB | 49.0 KB | 21.5 KB | 4.6 KB | **158.6 KB** |
+| **16 kHz** | 320 | 512 | 257 | 151.1 KB | 12.3 KB | 96.3 KB | 41.8 KB | 9.2 KB | **310.8 KB** |
+| **48 kHz** | 960 | 1024 | 513 | 300.9 KB | 24.3 KB | 194.8 KB | 86.3 KB | 21.4 KB | **627.8 KB** |
 
 **主要記憶體佔用：**
 - **AEC**: PBFDKF×2 filter weights（n_partitions × n_freqs × sizeof(float)）
@@ -162,7 +162,7 @@ Run `./aec_nr_pipeline_static --print-mem-size [--sample-rate 8000|16000|48000]`
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
 | `sample_rate` | 16000 | 8000, 16000, 48000 | 自動計算 frame/fft/hop size |
-| `filter_length` | sr/10 | — | 自適應濾波器長度（100ms），影響最大可消回聲延遲 |
+| `filter_length` | sr×64ms | — | 自適應濾波器長度（預設 64ms），影響最大可消回聲延遲 |
 | `enable_highpass` | 1 | 0, 1 | 高通濾波器開關 |
 | `highpass_cutoff_hz` | 80.0 | 50–200 | HPF 截止頻率 |
 | `enable_res` | 0 (pipeline) | 0, 1 | 殘留回聲抑制（pipeline 中由外部 RES 處理） |
