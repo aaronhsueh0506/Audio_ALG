@@ -120,6 +120,7 @@ int main(int argc, char* argv[]) {
     int aec_only = 0;
     float nr_g_min_db = -15.0f;
     int print_mem_only = 0;
+    int sample_rate = 16000;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--print-mem-size") == 0) {
@@ -128,6 +129,8 @@ int main(int argc, char* argv[]) {
             aec_only = 1;
         } else if (strcmp(argv[i], "--nr-gain") == 0 && i + 1 < argc) {
             nr_g_min_db = (float)atof(argv[++i]);
+        } else if (strcmp(argv[i], "--sample-rate") == 0 && i + 1 < argc) {
+            sample_rate = atoi(argv[++i]);
         } else if (argv[i][0] != '-' && !print_mem_only) {
             /* positional args handled below */
         } else if (argv[i][0] != '-') {
@@ -136,7 +139,6 @@ int main(int argc, char* argv[]) {
     }
 
     /* Build configs */
-    int sample_rate = 16000;
     AecConfig aec_cfg = aec_config_from_preset(preset, sample_rate);
     aec_cfg.enable_res = 0;  /* Linear mode — RES handled externally */
 
