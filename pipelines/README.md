@@ -69,24 +69,3 @@ make
 ./aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-gain -20
 ```
 
-## Two Versions
-
-### Version A: malloc (this file)
-Each module uses `_create()` / `_destroy()` and manages its own memory.
-Suitable for desktop testing and Linux servers.
-
-### Version B: static memory (Novatek embedded)
-- `_get_mem_size()` pre-calculates memory needed per module
-- Pipeline allocates total once via PA/VA
-- `_init()` assigns pre-allocated buffer, no internal malloc
-- On separate branch: `feature/static-memory`
-
-### Memory Budget (Version B, 16kHz)
-
-| Module | Size |
-|--------|------|
-| AEC (linear, no RES) | ~185 KB |
-| NR (MMSE-LSA + MCRA) | ~218 KB |
-| RES (standalone) | ~42 KB |
-| Pipeline buffers | ~10 KB |
-| **Total** | **~455 KB** |
