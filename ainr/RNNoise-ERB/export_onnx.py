@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from train import RNNoiseModel
+from train import RNNoiseModel, compute_hybrid_bands
 
 
 class RNNoiseStreaming(nn.Module):
@@ -111,7 +111,14 @@ def export(args):
     cfg = configparser.ConfigParser()
     cfg.read(args.config)
 
-    N_BANDS = cfg.getint('signal', 'n_bands')
+    HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
+    N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
+    if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
+        N_FFT = cfg.getint('signal', 'n_fft')
+        SR = cfg.getint('signal', 'sr')
+        _, N_BANDS = compute_hybrid_bands(N_FFT, SR, N_ERB_HIGH, HYBRID_CUTOFF)
+    else:
+        N_BANDS = cfg.getint('signal', 'n_bands')
 
     ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
     model = RNNoiseModel(n_bands=N_BANDS, cond_size=64, gru_size=128)
