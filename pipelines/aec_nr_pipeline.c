@@ -1,5 +1,5 @@
 /**
- * aec_nr_pipeline.c - Linear AEC -> NR -> RES Pipeline (Version A: malloc)
+ * aec_nr_pipeline.c - Linear AEC -> NR -> RES Pipeline
  *
  * Three-stage speech enhancement:
  *   Stage 1: Linear AEC (PBFDKF + shadow, no RES) -> error signal + context
