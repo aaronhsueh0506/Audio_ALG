@@ -78,7 +78,7 @@ make
 | Parameter | Default | Range | Description |
 |-----------|---------|-------|-------------|
 | `sample_rate` | 16000 | 8000, 16000, 48000 | 自動計算 frame/fft/hop size |
-| `filter_length` | sr/10 | — | 自適應濾波器長度（100ms），影響最大可消回聲延遲 |
+| `filter_length` | sr×64ms | — | 自適應濾波器長度（預設 64ms），影響最大可消回聲延遲 |
 | `enable_highpass` | 1 | 0, 1 | 高通濾波器開關 |
 | `highpass_cutoff_hz` | 80.0 | 50–200 | HPF 截止頻率 |
 | `enable_res` | 0 (pipeline) | 0, 1 | 殘留回聲抑制（pipeline 中由外部 RES 處理） |
