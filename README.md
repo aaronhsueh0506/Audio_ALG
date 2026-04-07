@@ -19,11 +19,15 @@
 ### 克隆項目（包含 submodules）
 
 ```bash
-# 方法 1: 克隆時同時初始化 submodules
-git clone --recursive git@github.com:aaronhsueh0506/Audio_ALG.git
+# HTTPS（推薦，不需要 SSH key）
+git clone --recursive https://github.com/aaronhsueh0506/Audio_ALG.git
 
-# 方法 2: 先克隆，再初始化 submodules
-git clone git@github.com:aaronhsueh0506/Audio_ALG.git
+# SSH（需要設定 GitHub SSH key）
+git clone --recursive git@github.com:aaronhsueh0506/Audio_ALG.git
+```
+
+如果已經 clone 但還沒初始化 submodules：
+```bash
 cd Audio_ALG
 git submodule update --init --recursive
 ```
