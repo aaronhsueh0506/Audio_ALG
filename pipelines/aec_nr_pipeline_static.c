@@ -374,6 +374,7 @@ int main(int argc, char* argv[]) {
                                 prev_ctx->erle_factor,
                                 prev_ctx->dt_indicator,
                                 prev_ctx->over_sub,
+                                prev_ctx->divergence,
                                 res_out);
 
                     wav_write_float(writer, res_out, hop);
