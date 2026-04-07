@@ -40,6 +40,9 @@
 #include "mmse_lsa_denoiser.h"
 #include "mmse_lsa_types.h"
 
+/* HPF */
+#include "hpf.h"
+
 /* WAV I/O (from AEC example) */
 #include "wav_io.h"
 
@@ -72,6 +75,7 @@ static size_t compute_memory_budget(const AecConfig* aec_cfg,
                                     int aec_only,
                                     int print)
 {
+    size_t hpf_size = hpf_get_mem_size() * 2;  /* mic + ref HPF */
     size_t aec_size = aec_get_mem_size(aec_cfg);
     size_t ctx_size = aec_context_get_mem_size(n_freqs);
     size_t ctx2_size = ctx_size;  /* prev_ctx for NR delay */
@@ -89,7 +93,8 @@ static size_t compute_memory_budget(const AecConfig* aec_cfg,
     pipe_size += ALIGN16(n_freqs * sizeof(Complex)); /* far_spec_c */
     pipe_size += ALIGN16(n_freqs * sizeof(Complex)); /* near_spec_c */
 
-    size_t total = ALIGN16(aec_size)
+    size_t total = ALIGN16(hpf_size)
+                 + ALIGN16(aec_size)
                  + ALIGN16(ctx_size)
                  + ALIGN16(ctx2_size)
                  + ALIGN16(nr_size)
@@ -99,6 +104,7 @@ static size_t compute_memory_budget(const AecConfig* aec_cfg,
     if (print) {
         printf("Memory Budget (Static Memory Version B)\n");
         printf("========================================\n");
+        printf("  HPF (mic + ref):  %6zu bytes (%5.1f KB)\n", hpf_size, hpf_size / 1024.0);
         printf("  AEC (linear):     %6zu bytes (%5.1f KB)\n", aec_size, aec_size / 1024.0);
         printf("  AEC Context x2:   %6zu bytes (%5.1f KB)\n", ctx_size + ctx2_size, (ctx_size + ctx2_size) / 1024.0);
         if (!aec_only) {
@@ -249,6 +255,18 @@ int main(int argc, char* argv[]) {
     /* === Slice pool into modules === */
     uint8_t* ptr = (uint8_t*)pool;
 
+    /* HPF (mic + ref, applied before AEC) */
+    size_t hpf_sz = hpf_get_mem_size();
+    Hpf* hp_mic = hpf_init(ptr, hpf_sz, 80.0f, sample_rate);
+    ptr += hpf_sz;
+    Hpf* hp_ref = hpf_init(ptr, hpf_sz, 80.0f, sample_rate);
+    ptr += hpf_sz;
+    if (!hp_mic || !hp_ref) {
+        fprintf(stderr, "Error: Failed to init HPF in pool\n");
+        free(pool);
+        return 1;
+    }
+
     /* AEC */
     size_t aec_size = aec_get_mem_size(&aec_cfg);
     Aec* aec = aec_init(ptr, aec_size, &aec_cfg);
@@ -332,6 +350,10 @@ int main(int argc, char* argv[]) {
         /* Read input */
         wav_read_float(mic_reader, mic_buf, hop);
         wav_read_float(ref_reader, ref_buf, hop);
+
+        /* Stage 0: HPF (remove DC/hum before AEC) */
+        hpf_process(hp_mic, mic_buf, hop);
+        hpf_process(hp_ref, ref_buf, hop);
 
         /* Stage 1: Linear AEC (with context output) */
         aec_process_ex(aec, mic_buf, ref_buf, aec_out, ctx);
