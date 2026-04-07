@@ -1,7 +1,8 @@
 /**
  * aec_nr_pipeline.c - Linear AEC -> NR -> RES Pipeline
  *
- * Three-stage speech enhancement:
+ * Four-stage speech enhancement:
+ *   Stage 0: HPF (80Hz Butterworth) -> remove DC/hum
  *   Stage 1: Linear AEC (PBFDKF + shadow, no RES) -> error signal + context
  *   Stage 2: NR (MMSE-LSA + MCRA + SPP) -> denoised + per-bin gain
  *   Stage 3: RES (NR-gain-corrected echo PSD) -> final output
@@ -31,6 +32,9 @@
 /* NR */
 #include "mmse_lsa_denoiser.h"
 #include "mmse_lsa_types.h"
+
+/* HPF */
+#include "hpf.h"
 
 /* WAV I/O (from AEC example) */
 #include "wav_io.h"
@@ -158,6 +162,10 @@ int main(int argc, char* argv[]) {
     int hop = aec_get_hop_size(aec);
     int nf = aec_cfg.n_freqs;
 
+    /* === Create HPF (80Hz, applied before AEC) === */
+    Hpf* hp_mic = hpf_create(80.0f, sample_rate);
+    Hpf* hp_ref = hpf_create(80.0f, sample_rate);
+
     /* Open output WAV */
     WavWriter* writer = wav_open_write(out_path, sample_rate, 1);
     if (!writer) {
@@ -192,6 +200,10 @@ int main(int argc, char* argv[]) {
         /* Read input */
         wav_read_float(mic_reader, mic_buf, hop);
         wav_read_float(ref_reader, ref_buf, hop);
+
+        /* Stage 0: HPF (remove DC/hum before AEC) */
+        hpf_process(hp_mic, mic_buf, hop);
+        hpf_process(hp_ref, ref_buf, hop);
 
         /* Stage 1: Linear AEC (with context output) */
         aec_process_ex(aec, mic_buf, ref_buf, aec_out, ctx);
@@ -284,6 +296,8 @@ int main(int argc, char* argv[]) {
     free(nr_out);
     free(res_out);
 
+    hpf_destroy(hp_mic);
+    hpf_destroy(hp_ref);
     aec_context_destroy(prev_ctx);
     aec_context_destroy(ctx);
     if (res) res_destroy(res);
