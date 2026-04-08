@@ -651,30 +651,34 @@ class DNS4Dataset(Dataset):
         real_idx = self._indices[idx]
         target_len = self.segment_samples
 
-        # 1. Load clean speech
-        speech = self._load_and_crop(self.speech_files[real_idx], target_len)
+        # Noise-only sample (10%): 讓模型學會「純噪音 → gain 全 0」
+        noise_only = random.random() < 0.1
 
-        # 2. Speech augmentation: RandBiquadFilter (混合前)
-        if random.random() < self.p_biquad:
-            speech = rand_biquad_filter(
-                speech, self.sr,
-                n_filters=self.n_biquad_filters,
-                gain_db=self.biquad_gain_db,
-                q_min=self.biquad_q_min,
-                q_max=self.biquad_q_max)
+        if not noise_only:
+            # 1. Load clean speech
+            speech = self._load_and_crop(self.speech_files[real_idx], target_len)
 
-        # 3. RIR convolution
-        if self.rir_files and random.random() < self.p_rir:
-            rir = self._load_rir()
-            early_rir, full_rir = prepare_rir(
-                rir, self.sr,
-                early_ms=self.early_rir_ms,
-                pre_delay_keep_ms=self.pre_delay_keep_ms)
-            target = fftconvolve(speech, early_rir)
-            reverbed = fftconvolve(speech, full_rir)
-        else:
-            target = speech.clone()
-            reverbed = speech.clone()
+            # 2. Speech augmentation: RandBiquadFilter (混合前)
+            if random.random() < self.p_biquad:
+                speech = rand_biquad_filter(
+                    speech, self.sr,
+                    n_filters=self.n_biquad_filters,
+                    gain_db=self.biquad_gain_db,
+                    q_min=self.biquad_q_min,
+                    q_max=self.biquad_q_max)
+
+            # 3. RIR convolution
+            if self.rir_files and random.random() < self.p_rir:
+                rir = self._load_rir()
+                early_rir, full_rir = prepare_rir(
+                    rir, self.sr,
+                    early_ms=self.early_rir_ms,
+                    pre_delay_keep_ms=self.pre_delay_keep_ms)
+                target = fftconvolve(speech, early_rir)
+                reverbed = fftconvolve(speech, full_rir)
+            else:
+                target = speech.clone()
+                reverbed = speech.clone()
 
         # 4. Load noise (multi-source)
         n_noises = random.randint(1, self.max_noise_mix)
@@ -691,17 +695,25 @@ class DNS4Dataset(Dataset):
                 q_min=self.biquad_q_min,
                 q_max=self.biquad_q_max)
 
-        # 6. Segmental SNR mixing
-        snr_db = sample_snr(self.snr_ranges)
-        speech_rms = active_rms(reverbed, self.sr)
-        noise_rms = active_rms(noise, self.sr)
-        noise_scaled = noise * (speech_rms / noise_rms) * (10 ** (-snr_db / 20))
-        noisy = reverbed + noise_scaled
+        if noise_only:
+            # Noise-only: noisy = noise, target = silence
+            noisy = noise.clone()
+            target = torch.zeros(target_len)
+        else:
+            # 6. Segmental SNR mixing
+            snr_db = sample_snr(self.snr_ranges)
+            speech_rms = active_rms(reverbed, self.sr)
+            noise_rms = active_rms(noise, self.sr)
+            noise_scaled = noise * (speech_rms / noise_rms) * (10 ** (-snr_db / 20))
+            noisy = reverbed + noise_scaled
 
         # 7. Gain randomization
         target_rms_db = random.uniform(self.target_rms_min, self.target_rms_max)
         target_rms_linear = 10 ** (target_rms_db / 20)
-        current_rms = active_rms(target, self.sr)
+        if noise_only:
+            current_rms = active_rms(noisy, self.sr)
+        else:
+            current_rms = active_rms(target, self.sr)
         scale = target_rms_linear / current_rms
         target = target * scale
         noisy = noisy * scale
