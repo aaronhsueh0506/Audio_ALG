@@ -249,6 +249,7 @@ int main(int argc, char* argv[]) {
                                 prev_ctx->dt_indicator,
                                 prev_ctx->over_sub,
                                 0.0f,  /* divergence */
+                                prev_ctx->is_stationary_dt,
                                 res_out);
 
                     free(far_spec_c);
