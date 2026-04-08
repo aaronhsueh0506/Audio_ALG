@@ -130,10 +130,16 @@ def denoise(args):
         gains, _ = model(features.unsqueeze(0))  # (1, n_frames-2, n_bands)
     gains = gains.squeeze(0)  # (n_frames-2, n_bands)
 
-    # Temporal gain smoothing — 降低 speech/silence 邊界的 pumping artifact
-    smooth_alpha = 0.3
+    # Asymmetric temporal gain smoothing — fast attack / slow release
+    # 語音開始 → gain 快速升; 語音結束 → gain 慢降 (避免 reverb tail 忽隱忽現)
+    attack_alpha = 0.5    # gain 上升時用 (快)
+    release_alpha = 0.15  # gain 下降時用 (慢)
     for t in range(1, gains.size(0)):
-        gains[t] = smooth_alpha * gains[t] + (1 - smooth_alpha) * gains[t - 1]
+        alpha = torch.where(gains[t] > gains[t - 1], attack_alpha, release_alpha)
+        gains[t] = alpha * gains[t] + (1 - alpha) * gains[t - 1]
+
+    # Gain floor — 防止接近 0 的 gain 造成 musical noise
+    gains = torch.clamp(gains, min=0.02)
 
     # 將 band gains 展開到每個 FFT bin
     n_bins = spec.size(0)
