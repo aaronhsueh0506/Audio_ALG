@@ -397,6 +397,7 @@ int main(int argc, char* argv[]) {
                                 prev_ctx->dt_indicator,
                                 prev_ctx->over_sub,
                                 prev_ctx->divergence,
+                                prev_ctx->is_stationary_dt,
                                 res_out);
 
                     wav_write_float(writer, res_out, hop);
