@@ -1,0 +1,1024 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Audio_ALG 架構說明 — AEC + NR + Post-filter</title>
+<style>
+  :root {
+    --bg: #fafafa;
+    --panel: #ffffff;
+    --border: #d8d8d8;
+    --accent: #2563eb;
+    --accent-soft: #dbeafe;
+    --aec: #f97316;
+    --nr: #10b981;
+    --res: #8b5cf6;
+    --hpf: #94a3b8;
+    --text: #1f2937;
+    --muted: #64748b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC",
+                 "Microsoft JhengHei", sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.7;
+  }
+  .container { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+  header {
+    background: linear-gradient(135deg, #1e40af 0%, #2563eb 100%);
+    color: white;
+    padding: 48px 24px;
+    margin-bottom: 32px;
+  }
+  header h1 { margin: 0 0 8px; font-size: 32px; }
+  header p { margin: 0; opacity: 0.9; font-size: 16px; }
+  h2 {
+    margin-top: 56px;
+    padding-bottom: 8px;
+    border-bottom: 2px solid var(--accent);
+    color: #1e40af;
+  }
+  h3 { color: #334155; margin-top: 32px; }
+  h4 { color: #475569; margin-top: 24px; margin-bottom: 8px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px 24px;
+    margin: 16px 0;
+  }
+  .figure {
+    text-align: center;
+    margin: 24px 0;
+  }
+  .figure svg {
+    max-width: 100%;
+    height: auto;
+  }
+  .caption {
+    color: var(--muted);
+    font-size: 13px;
+    margin-top: 8px;
+    font-style: italic;
+  }
+  .formula {
+    background: #f8fafc;
+    border-left: 4px solid var(--accent);
+    padding: 12px 18px;
+    margin: 12px 0;
+    font-family: "STIX Two Math", "Latin Modern Math", "Cambria Math", serif;
+    font-size: 17px;
+    text-align: center;
+  }
+  .formula em { font-style: italic; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 16px 0;
+    font-size: 14px;
+  }
+  th, td {
+    text-align: left;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th { background: var(--accent-soft); color: #1e3a8a; font-weight: 600; }
+  tr:hover td { background: #f8fafc; }
+  code {
+    background: #f1f5f9;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-family: "SF Mono", Monaco, "Cascadia Code", monospace;
+    font-size: 0.9em;
+    color: #334155;
+  }
+  .key-point {
+    background: #ecfdf5;
+    border-left: 4px solid #10b981;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .key-point strong { color: #047857; }
+  .note {
+    background: #fffbeb;
+    border-left: 4px solid #f59e0b;
+    padding: 12px 16px;
+    margin: 12px 0;
+    border-radius: 4px;
+  }
+  .note strong { color: #92400e; }
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+  }
+  .toc {
+    background: var(--panel);
+    border-left: 4px solid var(--accent);
+    padding: 16px 24px;
+    margin: 24px 0;
+  }
+  .toc ul { margin: 8px 0; padding-left: 20px; }
+  .toc li { margin: 4px 0; }
+  .toc a { color: var(--accent); text-decoration: none; }
+  .toc a:hover { text-decoration: underline; }
+  @media (max-width: 768px) {
+    .grid-2 { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="container">
+    <h1>Audio_ALG 架構說明</h1>
+    <p>單通道全雙工語音增強 Pipeline — AEC + NR + Post-filter</p>
+    <p style="font-size: 13px; opacity: 0.75; margin-top: 12px;">
+      AEC v2.0.0 (PBFDKF + Shadow + Stationary DT v13)
+      &nbsp;·&nbsp; NR v3 (MMSE-LSA + MCRA + SPP)
+      &nbsp;·&nbsp; 16kHz / 10ms hop / float32
+    </p>
+  </div>
+</header>
+
+<div class="container">
+
+<div class="toc">
+  <strong>目錄</strong>
+  <ul>
+    <li><a href="#overview">1. 整體架構與訊號流</a></li>
+    <li><a href="#hpf">2. HPF 高通濾波器</a></li>
+    <li><a href="#aec">3. AEC — PBFDKF + Shadow Filter</a></li>
+    <li><a href="#nr">4. NR — SPP + OMLSA</a></li>
+    <li><a href="#res">5. Post-filter — RES + CNG</a></li>
+    <li><a href="#perf">6. 效能、資源消耗與分數</a></li>
+    <li><a href="#limits">7. 已知限制</a></li>
+  </ul>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="overview">1. 整體架構與訊號流</h2>
+
+<div class="panel">
+<p>Pipeline 共四個處理階段，每 frame 處理 10 ms（160 samples @ 16 kHz）：</p>
+
+<div class="figure">
+<svg viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
+  <!-- background -->
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- mic input -->
+  <text x="40" y="60" font-size="14" font-weight="600" fill="#1e40af">mic[n]</text>
+  <line x1="80" y1="55" x2="140" y2="55" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- ref input -->
+  <text x="40" y="200" font-size="14" font-weight="600" fill="#1e40af">ref[n]</text>
+  <line x1="80" y1="195" x2="140" y2="195" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- HPF mic -->
+  <rect x="145" y="35" width="80" height="40" rx="6" fill="#94a3b8"/>
+  <text x="185" y="60" font-size="13" fill="white" text-anchor="middle" font-weight="600">HPF</text>
+  <!-- HPF ref -->
+  <rect x="145" y="175" width="80" height="40" rx="6" fill="#94a3b8"/>
+  <text x="185" y="200" font-size="13" fill="white" text-anchor="middle" font-weight="600">HPF</text>
+
+  <!-- arrows to AEC -->
+  <line x1="225" y1="55" x2="290" y2="100" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="225" y1="195" x2="290" y2="160" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+
+  <!-- AEC block -->
+  <rect x="295" y="80" width="160" height="100" rx="8" fill="#f97316"/>
+  <text x="375" y="115" font-size="15" fill="white" text-anchor="middle" font-weight="700">Linear AEC</text>
+  <text x="375" y="135" font-size="11" fill="white" text-anchor="middle">PBFDKF + Shadow</text>
+  <text x="375" y="152" font-size="11" fill="white" text-anchor="middle">EPC detector</text>
+  <text x="375" y="169" font-size="11" fill="white" text-anchor="middle">Stationary DT v13</text>
+
+  <!-- arrow to NR -->
+  <line x1="455" y1="130" x2="520" y2="130" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="488" y="120" font-size="11" fill="#475569" text-anchor="middle">error[n]</text>
+  <text x="488" y="148" font-size="10" fill="#475569" text-anchor="middle">+ AecResContext</text>
+
+  <!-- NR block -->
+  <rect x="525" y="80" width="160" height="100" rx="8" fill="#10b981"/>
+  <text x="605" y="115" font-size="15" fill="white" text-anchor="middle" font-weight="700">NR</text>
+  <text x="605" y="135" font-size="11" fill="white" text-anchor="middle">MMSE-LSA</text>
+  <text x="605" y="152" font-size="11" fill="white" text-anchor="middle">MCRA noise est.</text>
+  <text x="605" y="169" font-size="11" fill="white" text-anchor="middle">SPP gating</text>
+
+  <!-- arrow to RES -->
+  <line x1="685" y1="130" x2="750" y2="130" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="717" y="120" font-size="11" fill="#475569" text-anchor="middle">ŝ[n]</text>
+  <text x="717" y="148" font-size="10" fill="#475569" text-anchor="middle">+ G_NR[k]</text>
+
+  <!-- RES block -->
+  <rect x="755" y="80" width="120" height="100" rx="8" fill="#8b5cf6"/>
+  <text x="815" y="115" font-size="15" fill="white" text-anchor="middle" font-weight="700">RES</text>
+  <text x="815" y="135" font-size="11" fill="white" text-anchor="middle">+ CNG</text>
+  <text x="815" y="152" font-size="11" fill="white" text-anchor="middle">soft gate</text>
+  <text x="815" y="169" font-size="11" fill="white" text-anchor="middle">post-filter</text>
+
+  <!-- output -->
+  <line x1="875" y1="130" x2="900" y2="130" stroke="#64748b" stroke-width="2"/>
+  <text x="850" y="240" font-size="14" font-weight="600" fill="#16a34a">→ output[n]</text>
+
+  <!-- annotations -->
+  <text x="40" y="280" font-size="11" fill="#64748b">時域訊號</text>
+  <text x="540" y="280" font-size="11" fill="#64748b">頻域處理 (STFT, n_freq=257)</text>
+</svg>
+<div class="caption">圖 1：整體 pipeline 概觀</div>
+</div>
+
+<div class="key-point">
+  <strong>關鍵點：</strong>
+  <ol style="margin: 4px 0 0 20px;">
+    <li>HPF 同時對 mic 和 ref 做（保持相位一致）</li>
+    <li>AEC 只做線性消除，輸出 error + context（不含 RES）</li>
+    <li>NR 處理 error 訊號，輸出去噪結果與 per-bin gain</li>
+    <li>RES 用 NR 的 gain 修正 echo PSD，做最後一層 residual 抑制</li>
+  </ol>
+</div>
+
+</div>
+
+<!-- ============================================================ -->
+<h2 id="hpf">2. HPF 高通濾波器</h2>
+
+<div class="panel">
+<p><strong>目的</strong>：移除 DC offset、低頻 rumble、50/60 Hz 電源 hum，避免污染 AEC 自適應演算法。</p>
+
+<div class="figure">
+<svg viewBox="0 0 700 220" xmlns="http://www.w3.org/2000/svg">
+  <!-- axes -->
+  <line x1="60" y1="180" x2="650" y2="180" stroke="#334155" stroke-width="1.5"/>
+  <line x1="60" y1="180" x2="60" y2="20" stroke="#334155" stroke-width="1.5"/>
+
+  <!-- y-axis labels -->
+  <text x="40" y="35" font-size="11" fill="#475569" text-anchor="end">0 dB</text>
+  <text x="40" y="100" font-size="11" fill="#475569" text-anchor="end">−20</text>
+  <text x="40" y="165" font-size="11" fill="#475569" text-anchor="end">−40</text>
+
+  <!-- x-axis labels -->
+  <text x="60" y="200" font-size="11" fill="#475569" text-anchor="middle">10</text>
+  <text x="180" y="200" font-size="11" fill="#475569" text-anchor="middle">80</text>
+  <text x="320" y="200" font-size="11" fill="#475569" text-anchor="middle">200</text>
+  <text x="460" y="200" font-size="11" fill="#475569" text-anchor="middle">1k</text>
+  <text x="600" y="200" font-size="11" fill="#475569" text-anchor="middle">8k</text>
+  <text x="650" y="200" font-size="11" fill="#475569" text-anchor="middle">Hz</text>
+
+  <!-- response curve (Butterworth 2nd order, 80Hz cutoff) -->
+  <path d="M 60,165 Q 130,160 180,100 Q 230,40 320,32 L 600,32" fill="none" stroke="#2563eb" stroke-width="2.5"/>
+
+  <!-- 80Hz cutoff marker -->
+  <line x1="180" y1="180" x2="180" y2="100" stroke="#dc2626" stroke-width="1" stroke-dasharray="3,3"/>
+  <line x1="60" y1="100" x2="180" y2="100" stroke="#dc2626" stroke-width="1" stroke-dasharray="3,3"/>
+  <text x="180" y="92" font-size="11" fill="#dc2626" text-anchor="middle">−3 dB @ 80 Hz</text>
+
+  <!-- title -->
+  <text x="350" y="15" font-size="13" font-weight="600" fill="#1e40af" text-anchor="middle">2nd-order Butterworth, fc=80Hz</text>
+
+  <!-- annotations -->
+  <text x="120" y="155" font-size="10" fill="#dc2626">DC / hum 區域</text>
+  <text x="450" y="22" font-size="10" fill="#16a34a">語音頻段 (透通)</text>
+</svg>
+<div class="caption">圖 2：HPF 頻率響應 — 80Hz 以下大幅衰減，語音頻段透通</div>
+</div>
+
+<table>
+  <tr><th>項目</th><th>規格</th></tr>
+  <tr><td>類型</td><td>2nd-order Butterworth (IIR)</td></tr>
+  <tr><td>截止頻率</td><td>80 Hz (−3 dB)</td></tr>
+  <tr><td>實作</td><td>Direct Form II Transposed</td></tr>
+  <tr><td>位置</td><td>應用層 (Audio_ALG/lib/hpf)，AEC module 不含</td></tr>
+</table>
+
+<div class="note">
+<strong>注意：</strong>v2.0.0 之後 HPF 從 AEC module 移到應用層，由 pipeline 對 mic / ref 各自呼叫一次。
+</div>
+</div>
+
+<!-- ============================================================ -->
+<h2 id="aec">3. AEC — PBFDKF + Shadow Filter</h2>
+
+<div class="panel">
+<p>核心是 <strong>PBFDKF (Partitioned Block Frequency-Domain Kalman Filter)</strong>，搭配 shadow filter 做雙濾波器策略。</p>
+
+<h3>3.1 PBFDKF 架構</h3>
+
+<div class="figure">
+<svg viewBox="0 0 880 380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr2" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- ============ ref path (top row, y=60) ============ -->
+  <text x="50" y="65" font-size="13" font-weight="600" fill="#1e40af">ref[n]</text>
+  <line x1="95" y1="60" x2="155" y2="60" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- FFT ref -->
+  <rect x="160" y="40" width="70" height="40" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="195" y="65" font-size="13" fill="#1e40af" text-anchor="middle" font-weight="600">FFT</text>
+  <line x1="230" y1="60" x2="290" y2="60" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- partitioned weights -->
+  <rect x="295" y="35" width="180" height="50" rx="4" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  <text x="385" y="55" font-size="13" fill="#92400e" text-anchor="middle" font-weight="700">W₀ W₁ W₂ W₃</text>
+  <text x="385" y="73" font-size="10" fill="#92400e" text-anchor="middle">(per-partition weights)</text>
+
+  <!-- arrow to Σ -->
+  <line x1="475" y1="60" x2="510" y2="60" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- Σ accumulator -->
+  <circle cx="530" cy="60" r="16" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  <text x="530" y="66" font-size="16" text-anchor="middle" font-weight="700" fill="#92400e">Σ</text>
+
+  <!-- Σ → Ŷ → bend down to minus -->
+  <line x1="546" y1="60" x2="660" y2="60" stroke="#64748b" stroke-width="2"/>
+  <text x="595" y="52" font-size="13" font-weight="700" fill="#92400e">Ŷ[k]</text>
+
+  <!-- ============ mic path (middle row, y=180) ============ -->
+  <text x="50" y="185" font-size="13" font-weight="600" fill="#1e40af">mic[n]</text>
+  <line x1="95" y1="180" x2="155" y2="180" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- FFT mic -->
+  <rect x="160" y="160" width="70" height="40" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="195" y="185" font-size="13" fill="#1e40af" text-anchor="middle" font-weight="600">FFT</text>
+
+  <!-- D[k] label -->
+  <line x1="230" y1="180" x2="280" y2="180" stroke="#64748b" stroke-width="2"/>
+  <text x="290" y="185" font-size="13" font-weight="700" fill="#1e40af">D[k]</text>
+  <line x1="320" y1="180" x2="642" y2="180" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- subtract circle (D - Ŷ = e) — aligned with mic horizontal line -->
+  <circle cx="660" cy="180" r="18" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+  <text x="660" y="186" font-size="18" font-weight="700" text-anchor="middle" fill="#991b1b">−</text>
+
+  <!-- Ŷ[k] vertical drop into subtract from above -->
+  <line x1="660" y1="60" x2="660" y2="162" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+
+  <!-- e[k] output -->
+  <line x1="678" y1="180" x2="720" y2="180" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+  <text x="735" y="185" font-size="13" font-weight="700" fill="#dc2626">e[k]</text>
+
+  <!-- IFFT -->
+  <line x1="770" y1="180" x2="780" y2="180" stroke="#64748b" stroke-width="2"/>
+  <rect x="785" y="160" width="60" height="40" rx="4" fill="#dbeafe" stroke="#2563eb"/>
+  <text x="815" y="185" font-size="12" fill="#1e40af" text-anchor="middle" font-weight="600">IFFT</text>
+  <line x1="845" y1="180" x2="868" y2="180" stroke="#64748b" stroke-width="2" marker-end="url(#arr2)"/>
+  <text x="800" y="220" font-size="11" font-weight="600" fill="#16a34a" text-anchor="middle">error[n]</text>
+
+  <!-- ============ Kalman update box (bottom) ============ -->
+  <rect x="280" y="290" width="320" height="80" rx="6" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="440" y="315" font-size="14" fill="#6b21a8" text-anchor="middle" font-weight="700">Kalman update</text>
+  <text x="440" y="335" font-size="11" fill="#6b21a8" text-anchor="middle">Kₚ = Pₚ · Xₚ* / (Σ |X|²·P + R)</text>
+  <text x="440" y="352" font-size="11" fill="#6b21a8" text-anchor="middle">Wₚ ← Wₚ + Kₚ · e[k]</text>
+
+  <!-- e[k] feedback to Kalman -->
+  <line x1="660" y1="198" x2="660" y2="330" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <line x1="660" y1="330" x2="603" y2="330" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
+  <text x="668" y="265" font-size="10" fill="#8b5cf6">e[k] feedback</text>
+
+  <!-- Kalman update → W -->
+  <line x1="385" y1="290" x2="385" y2="90" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4,3"/>
+  <line x1="385" y1="90" x2="385" y2="86" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="4,3" marker-end="url(#arr2)"/>
+  <text x="393" y="180" font-size="10" fill="#8b5cf6">W update</text>
+</svg>
+<div class="caption">圖 3：PBFDKF 結構 — 頻域 partition 卷積 + Kalman 權重更新</div>
+</div>
+
+<div class="key-point">
+  <strong>為什麼用 PBFDKF？</strong>
+  <ul style="margin: 4px 0 0 20px;">
+    <li><strong>頻域處理</strong>：FFT 加速卷積，降低複雜度</li>
+    <li><strong>Partition</strong>：把長 filter 切成多個短 partition，減少 latency</li>
+    <li><strong>Kalman</strong>：動態調整 step size（Q/R），比固定 mu 的 NLMS 收斂更快、追蹤更穩</li>
+  </ul>
+</div>
+
+<table>
+  <tr><th>項目</th><th>值</th></tr>
+  <tr><td>block_size</td><td>320 samples (= 2 × hop)</td></tr>
+  <tr><td>fft_size</td><td>512 (next pow2)</td></tr>
+  <tr><td>n_partitions</td><td>filter_length ÷ hop ≈ 4 (預設 FL=512)</td></tr>
+  <tr><td>Kalman Q (process noise)</td><td>1e−3 (high), 1e−5 (low)</td></tr>
+  <tr><td>P_MAX</td><td>0.5 (state covariance ceiling)</td></tr>
+</table>
+
+<h3>3.2 Shadow Filter 雙濾波器策略</h3>
+
+<div class="figure">
+<svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr3" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- mic + ref input -->
+  <text x="40" y="140" font-size="13" font-weight="600" fill="#1e40af">mic[n]</text>
+  <text x="40" y="160" font-size="13" font-weight="600" fill="#1e40af">ref[n]</text>
+  <line x1="100" y1="145" x2="180" y2="80" stroke="#64748b" stroke-width="2" marker-end="url(#arr3)"/>
+  <line x1="100" y1="145" x2="180" y2="200" stroke="#64748b" stroke-width="2" marker-end="url(#arr3)"/>
+
+  <!-- Main filter -->
+  <rect x="185" y="50" width="200" height="80" rx="8" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  <text x="285" y="78" font-size="14" fill="#92400e" text-anchor="middle" font-weight="700">Main Filter (保守)</text>
+  <text x="285" y="98" font-size="11" fill="#92400e" text-anchor="middle">小 Q · 小 mu · 慢追蹤</text>
+  <text x="285" y="115" font-size="11" fill="#92400e" text-anchor="middle">DT 段不被污染</text>
+
+  <!-- Shadow filter -->
+  <rect x="185" y="170" width="200" height="80" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="285" y="198" font-size="14" fill="#1e40af" text-anchor="middle" font-weight="700">Shadow Filter (激進)</text>
+  <text x="285" y="218" font-size="11" fill="#1e40af" text-anchor="middle">大 Q · 大 mu · 快追蹤</text>
+  <text x="285" y="235" font-size="11" fill="#1e40af" text-anchor="middle">FS 收斂快、能追 EPC</text>
+
+  <!-- comparator -->
+  <line x1="385" y1="90" x2="430" y2="120" stroke="#64748b" stroke-width="2"/>
+  <line x1="385" y1="210" x2="430" y2="180" stroke="#64748b" stroke-width="2"/>
+  <rect x="430" y="110" width="120" height="80" rx="8" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="490" y="138" font-size="13" fill="#6b21a8" text-anchor="middle" font-weight="700">comparator</text>
+  <text x="490" y="158" font-size="10" fill="#6b21a8" text-anchor="middle">err_main vs</text>
+  <text x="490" y="172" font-size="10" fill="#6b21a8" text-anchor="middle">err_shadow</text>
+
+  <!-- copy arrows -->
+  <path d="M 490 110 Q 490 70 360 60" fill="none" stroke="#16a34a" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#arr3)"/>
+  <text x="430" y="50" font-size="10" fill="#16a34a">if shadow 持續較好</text>
+  <text x="430" y="65" font-size="10" fill="#16a34a">→ copy to main</text>
+
+  <path d="M 490 190 Q 490 230 360 240" fill="none" stroke="#16a34a" stroke-width="2" stroke-dasharray="5,3" marker-end="url(#arr3)"/>
+  <text x="395" y="262" font-size="10" fill="#16a34a">↓ 反向亦然 (main → shadow)</text>
+
+  <!-- main output -->
+  <line x1="385" y1="90" x2="600" y2="90" stroke="#64748b" stroke-width="2" marker-end="url(#arr3)"/>
+  <text x="610" y="95" font-size="13" font-weight="600" fill="#16a34a">error[n]</text>
+  <text x="610" y="112" font-size="10" fill="#64748b">(輸出給後段)</text>
+</svg>
+<div class="caption">圖 4：Shadow Filter 雙濾波器策略 — main 穩定輸出, shadow 快速追蹤</div>
+</div>
+
+<div class="key-point">
+  <strong>為什麼要兩個 filter？</strong>
+  <p style="margin: 4px 0 0;">單一 filter 必須在「快速追蹤 echo path 變化」和「DT 段抗污染」之間取捨。雙 filter 各司其職，再用 bidirectional copy 自動把較好的權重複製過去，兩全其美。</p>
+</div>
+
+<h3>3.3 Echo Path Change (EPC) 偵測</h3>
+
+<p>當 main + shadow 兩者誤差<strong>同時</strong>上升、且差距<strong>變小</strong>時，視為 echo path 變化（移動、新的反射路徑等）：</p>
+
+<div class="formula">
+errors_rising = (total_err &gt; prev_total_err × 1.5) &nbsp;&amp;&nbsp;
+delta_ratio &lt; 0.3
+</div>
+
+<p>偵測到 EPC 後：</p>
+<ul>
+  <li>Q 暫時拉高 (Q_high) 加速 re-convergence</li>
+  <li>P_MAX 暫時放寬</li>
+  <li>filter_converged 設為 False</li>
+  <li>20 frame hangover 期間 RES 進入保守模式</li>
+</ul>
+
+<h3>3.4 Stationary far-end DT 保護 (v13)</h3>
+
+<p><strong>問題場景</strong>：白噪音、風扇、冷氣等穩態 far-end + 近端有人講話 → 傳統 DT 偵測全部失效（dt_indicator → 0, coh² → 1），RES 把語音當 echo 壓掉。</p>
+
+<div class="figure">
+<svg viewBox="0 0 800 320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr4" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- Stage 1: CV² gate -->
+  <rect x="40" y="30" width="240" height="100" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="160" y="55" font-size="14" fill="#1e40af" text-anchor="middle" font-weight="700">Stage 1: 穩態偵測</text>
+  <text x="160" y="78" font-size="11" fill="#1e40af" text-anchor="middle">far_pwr EMA (α=0.99, TC≈1s)</text>
+  <text x="160" y="95" font-size="11" fill="#1e40af" text-anchor="middle">CV² = var / mean²</text>
+  <text x="160" y="115" font-size="12" fill="#dc2626" text-anchor="middle" font-weight="600">CV² &lt; 0.02 → _is_stationary_far ✓</text>
+
+  <!-- arrow -->
+  <line x1="280" y1="80" x2="340" y2="80" stroke="#64748b" stroke-width="2" marker-end="url(#arr4)"/>
+
+  <!-- Stage 2: jump_ratio -->
+  <rect x="345" y="30" width="240" height="100" rx="8" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  <text x="465" y="55" font-size="14" fill="#92400e" text-anchor="middle" font-weight="700">Stage 2: 語音突波偵測</text>
+  <text x="465" y="78" font-size="11" fill="#92400e" text-anchor="middle">voice-band (100-3kHz) error</text>
+  <text x="465" y="95" font-size="11" fill="#92400e" text-anchor="middle">jump_ratio = err / baseline</text>
+  <text x="465" y="115" font-size="12" fill="#dc2626" text-anchor="middle" font-weight="600">jump &gt; 1.5 → 800ms hangover</text>
+
+  <!-- arrow -->
+  <line x1="585" y1="80" x2="645" y2="80" stroke="#64748b" stroke-width="2" marker-end="url(#arr4)"/>
+  <text x="615" y="70" font-size="11" fill="#64748b" text-anchor="middle">is_stationary_dt</text>
+
+  <!-- output flag -->
+  <rect x="650" y="55" width="120" height="50" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="710" y="78" font-size="13" fill="#166534" text-anchor="middle" font-weight="700">啟用保護</text>
+  <text x="710" y="95" font-size="10" fill="#166534" text-anchor="middle">v3 mask + skip reverb</text>
+
+  <!-- protection mechanisms -->
+  <text x="40" y="170" font-size="13" font-weight="700" fill="#1e40af">保護機制 (僅 is_stationary_dt = True 時觸發)：</text>
+
+  <!-- v3 mask -->
+  <rect x="40" y="185" width="350" height="120" rx="6" fill="#f0fdf4" stroke="#16a34a"/>
+  <text x="50" y="205" font-size="12" font-weight="700" fill="#166534">① v3 頻帶成型遮罩</text>
+
+  <!-- mask shape mini-plot -->
+  <line x1="60" y1="280" x2="380" y2="280" stroke="#475569" stroke-width="1.5"/>
+  <line x1="60" y1="280" x2="60" y2="220" stroke="#475569" stroke-width="1.5"/>
+  <text x="55" y="225" font-size="9" fill="#475569" text-anchor="end">0.8</text>
+  <text x="55" y="285" font-size="9" fill="#475569" text-anchor="end">0</text>
+
+  <!-- mask trapezoid -->
+  <polygon points="60,280 100,280 130,225 250,225 280,280 380,280" fill="#bbf7d0" stroke="#16a34a" stroke-width="2"/>
+
+  <text x="100" y="298" font-size="9" fill="#475569" text-anchor="middle">100Hz</text>
+  <text x="135" y="298" font-size="9" fill="#475569" text-anchor="middle">300</text>
+  <text x="245" y="298" font-size="9" fill="#475569" text-anchor="middle">3kHz</text>
+  <text x="285" y="298" font-size="9" fill="#475569" text-anchor="middle">4kHz</text>
+  <text x="195" y="220" font-size="10" fill="#166534" text-anchor="middle">語音黃金頻段 dt=0.8</text>
+
+  <!-- other mechanisms -->
+  <rect x="410" y="185" width="360" height="120" rx="6" fill="#fef3c7" stroke="#f59e0b"/>
+  <text x="425" y="207" font-size="12" font-weight="700" fill="#92400e">② Reverb tail 跳過</text>
+  <text x="430" y="223" font-size="11" fill="#78350f">穩態 far-end 下 reverb_psd 會累積巨量噪音能量</text>
+
+  <text x="425" y="245" font-size="12" font-weight="700" fill="#92400e">③ Mu_scale freeze</text>
+  <text x="430" y="261" font-size="11" fill="#78350f">凍結 filter 學習，避免吸收近端語音</text>
+
+  <text x="425" y="283" font-size="12" font-weight="700" fill="#92400e">④ Temporal gating</text>
+  <text x="430" y="299" font-size="11" fill="#78350f">HF cap / release / rise boost 用虛擬 dt_for_fs</text>
+</svg>
+<div class="caption">圖 5：Stationary DT 兩階段偵測 + 四重保護</div>
+</div>
+
+<div class="key-point">
+<strong>效果</strong>：合成 WN DT 測試，語音保留率從 5% → 48%（接近 NoRES baseline 50%）。<br>
+800-case blind test 一般語音場景<strong>零退步</strong>（所有改動被 <code>is_stationary_dt</code> 守門）。
+</div>
+
+</div>
+
+<!-- ============================================================ -->
+<h2 id="nr">4. NR — SPP + OMLSA</h2>
+
+<div class="panel">
+<p>NR 處理 AEC 輸出的 error 訊號，移除背景噪音同時保留近端語音。三大組件：MCRA + SPP + MMSE-LSA。</p>
+
+<div class="figure">
+<svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr5" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- input -->
+  <text x="20" y="125" font-size="13" font-weight="600" fill="#1e40af">|Y[k]|²</text>
+  <line x1="70" y1="120" x2="130" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#arr5)"/>
+
+  <!-- MCRA -->
+  <rect x="135" y="80" width="180" height="80" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="225" y="105" font-size="13" fill="#1e40af" text-anchor="middle" font-weight="700">MCRA</text>
+  <text x="225" y="123" font-size="10" fill="#1e40af" text-anchor="middle">minimum tracking</text>
+  <text x="225" y="138" font-size="10" fill="#1e40af" text-anchor="middle">L=32 frames (320ms)</text>
+  <text x="225" y="153" font-size="10" fill="#1e40af" text-anchor="middle">→ noise_psd[k]</text>
+
+  <!-- to SPP -->
+  <line x1="315" y1="120" x2="370" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#arr5)"/>
+
+  <!-- SPP -->
+  <rect x="375" y="80" width="180" height="80" rx="8" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  <text x="465" y="105" font-size="13" fill="#92400e" text-anchor="middle" font-weight="700">SPP</text>
+  <text x="465" y="123" font-size="10" fill="#92400e" text-anchor="middle">a posteriori SNR γ</text>
+  <text x="465" y="138" font-size="10" fill="#92400e" text-anchor="middle">a priori SNR ξ (DD)</text>
+  <text x="465" y="153" font-size="10" fill="#92400e" text-anchor="middle">→ p[k] (語音機率)</text>
+
+  <!-- to LSA -->
+  <line x1="555" y1="120" x2="610" y2="120" stroke="#64748b" stroke-width="2" marker-end="url(#arr5)"/>
+
+  <!-- MMSE-LSA -->
+  <rect x="615" y="80" width="170" height="80" rx="8" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="700" y="105" font-size="13" fill="#166534" text-anchor="middle" font-weight="700">MMSE-LSA</text>
+  <text x="700" y="123" font-size="10" fill="#166534" text-anchor="middle">log-spectral gain</text>
+  <text x="700" y="138" font-size="10" fill="#166534" text-anchor="middle">G_LSA[k]</text>
+  <text x="700" y="153" font-size="10" fill="#166534" text-anchor="middle">→ G[k] = G_LSA^p · g_min^(1-p)</text>
+
+  <!-- output -->
+  <line x1="700" y1="160" x2="700" y2="200" stroke="#64748b" stroke-width="2" marker-end="url(#arr5)"/>
+  <text x="700" y="220" font-size="12" font-weight="600" fill="#16a34a" text-anchor="middle">G[k] · Y[k] = ŝ[k]</text>
+
+  <!-- noise back to SPP feedback -->
+  <line x1="225" y1="160" x2="225" y2="195" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="3,3"/>
+  <line x1="225" y1="195" x2="465" y2="195" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="3,3"/>
+  <line x1="465" y1="195" x2="465" y2="160" stroke="#8b5cf6" stroke-width="1.5" stroke-dasharray="3,3" marker-end="url(#arr5)"/>
+  <text x="345" y="190" font-size="10" fill="#8b5cf6" text-anchor="middle">noise_psd</text>
+
+  <!-- title -->
+  <text x="400" y="260" font-size="11" fill="#64748b" text-anchor="middle">三組件協作：MCRA 估底噪 → SPP 估語音機率 → MMSE-LSA 計算最佳增益</text>
+</svg>
+<div class="caption">圖 6：NR 三組件協作流程</div>
+</div>
+
+<h3>4.1 MCRA — 噪音追蹤</h3>
+
+<p>用 minimum tracking 估計噪音 PSD，假設噪音在約 320 ms 視窗內統計穩定：</p>
+
+<div class="formula">
+P[k,n] = α<sub>p</sub> · P[k,n−1] + (1−α<sub>p</sub>) · |Y[k,n]|²<br>
+P<sub>min</sub>[k] = min over L=32 frames<br>
+S<sub>r</sub> = P / P<sub>min</sub> &lt; δ → 更新 noise_psd
+</div>
+
+<h3>4.2 SPP — 語音存在機率</h3>
+
+<p>對每個 frequency bin 估計「該 bin 是語音」的後驗機率：</p>
+
+<div class="formula">
+γ[k] = |Y[k]|² / noise_psd[k] &nbsp;&nbsp;(a posteriori SNR)<br>
+ξ[k] = α · ξ<sub>prev</sub> + (1−α) · max(γ−1, 0) &nbsp;&nbsp;(decision-directed)<br>
+p[k] = 1 / (1 + (1+ξ) · e<sup>−v</sup> · q/(1−q))
+</div>
+
+<h3>4.3 MMSE-LSA — 對數頻譜 MMSE 增益</h3>
+
+<p>Ephraim &amp; Malah 1985 的對數頻域 MMSE 估計，加上 SPP 加權（OMLSA）：</p>
+
+<div class="formula">
+G<sub>LSA</sub>[k] = (ξ / (1+ξ)) · exp(½ ∫<sub>v</sub><sup>∞</sup> e<sup>−t</sup>/t dt)<br>
+G[k] = G<sub>LSA</sub><sup>p[k]</sup> · g<sub>min</sub><sup>1−p[k]</sup>
+</div>
+
+</div>
+
+<!-- ============================================================ -->
+<h2 id="res">5. Post-filter — RES + CNG</h2>
+
+<div class="panel">
+<p>RES 處理 NR 後的訊號，把 linear AEC 漏的 residual echo 進一步壓掉。CNG 在純 FS 段補上舒適噪音避免突然安靜。</p>
+
+<h3>5.1 ENR (Echo-to-Nearend Ratio) 計算</h3>
+
+<div class="figure">
+<svg viewBox="0 0 880 400" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arr6" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <!-- ============ Row 1: residual_echo_psd 計算 ============ -->
+  <!-- echo_psd input -->
+  <rect x="20" y="40" width="120" height="40" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="80" y="65" font-size="12" fill="#1e40af" text-anchor="middle" font-weight="700">echo_psd[k]</text>
+
+  <!-- G_NR² input -->
+  <rect x="20" y="100" width="120" height="40" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="80" y="120" font-size="12" fill="#166534" text-anchor="middle" font-weight="700">G_NR²[k]</text>
+  <text x="80" y="134" font-size="9" fill="#166534" text-anchor="middle">(來自 NR)</text>
+
+  <!-- arrows to multiply -->
+  <line x1="140" y1="60" x2="200" y2="82" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+  <line x1="140" y1="120" x2="200" y2="98" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <!-- multiply circle -->
+  <circle cx="220" cy="90" r="18" fill="#fef3c7" stroke="#f59e0b" stroke-width="2"/>
+  <text x="220" y="96" font-size="18" font-weight="700" text-anchor="middle" fill="#92400e">×</text>
+
+  <!-- arrow to residual -->
+  <line x1="238" y1="90" x2="290" y2="90" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <!-- residual_echo_psd box -->
+  <rect x="295" y="65" width="200" height="50" rx="6" fill="#fee2e2" stroke="#dc2626" stroke-width="2"/>
+  <text x="395" y="87" font-size="13" fill="#991b1b" text-anchor="middle" font-weight="700">residual_echo_psd[k]</text>
+  <text x="395" y="105" font-size="10" fill="#991b1b" text-anchor="middle">echo · G_NR² · over_sub</text>
+
+  <!-- ============ Row 2: nearend_est 計算 ============ -->
+  <!-- error_psd input -->
+  <rect x="20" y="220" width="120" height="40" rx="6" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
+  <text x="80" y="245" font-size="12" fill="#1e40af" text-anchor="middle" font-weight="700">error_psd[k]</text>
+
+  <!-- arrow to subtract -->
+  <line x1="140" y1="240" x2="200" y2="240" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <!-- subtract circle -->
+  <circle cx="220" cy="240" r="18" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="220" y="246" font-size="18" font-weight="700" text-anchor="middle" fill="#166534">−</text>
+
+  <!-- residual feeds into subtract (vertical line) -->
+  <line x1="395" y1="115" x2="395" y2="170" stroke="#64748b" stroke-width="2"/>
+  <line x1="395" y1="170" x2="220" y2="170" stroke="#64748b" stroke-width="2"/>
+  <line x1="220" y1="170" x2="220" y2="220" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+  <text x="305" y="165" font-size="10" fill="#64748b">residual_echo</text>
+
+  <!-- arrow to nearend_est box -->
+  <line x1="238" y1="240" x2="290" y2="240" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <!-- nearend_est box -->
+  <rect x="295" y="215" width="200" height="50" rx="6" fill="#dcfce7" stroke="#16a34a" stroke-width="2"/>
+  <text x="395" y="237" font-size="13" fill="#166534" text-anchor="middle" font-weight="700">nearend_est[k]</text>
+  <text x="395" y="255" font-size="10" fill="#166534" text-anchor="middle">error − residual</text>
+
+  <!-- ============ Row 3: ENR ratio (right side) ============ -->
+  <!-- residual → divide -->
+  <line x1="495" y1="90" x2="555" y2="90" stroke="#64748b" stroke-width="2"/>
+  <line x1="555" y1="90" x2="555" y2="145" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <!-- nearend → divide -->
+  <line x1="495" y1="240" x2="555" y2="240" stroke="#64748b" stroke-width="2"/>
+  <line x1="555" y1="240" x2="555" y2="195" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <!-- divide box -->
+  <rect x="525" y="150" width="60" height="40" rx="6" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="555" y="178" font-size="18" font-weight="700" text-anchor="middle" fill="#6b21a8">÷</text>
+
+  <!-- arrow to ENR -->
+  <line x1="585" y1="170" x2="650" y2="170" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <!-- ENR box -->
+  <rect x="655" y="145" width="170" height="50" rx="6" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="740" y="167" font-size="13" fill="#6b21a8" text-anchor="middle" font-weight="700">ENR[k]</text>
+  <text x="740" y="185" font-size="10" fill="#6b21a8" text-anchor="middle">residual / nearend</text>
+
+  <!-- arrow to soft gate -->
+  <line x1="740" y1="195" x2="740" y2="305" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+
+  <!-- soft gate box -->
+  <rect x="190" y="310" width="660" height="60" rx="6" fill="#f3e8ff" stroke="#8b5cf6" stroke-width="2"/>
+  <text x="520" y="333" font-size="13" fill="#6b21a8" text-anchor="middle" font-weight="700">Soft gate</text>
+  <text x="520" y="353" font-size="11" fill="#6b21a8" text-anchor="middle">G_RES[k] = clamp((enr_s − ENR) / (enr_s − enr_t), g_min, 1.0)</text>
+
+  <!-- arrow to G_RES output -->
+  <line x1="190" y1="340" x2="130" y2="340" stroke="#64748b" stroke-width="2" marker-end="url(#arr6)"/>
+  <text x="115" y="345" font-size="13" font-weight="700" fill="#16a34a" text-anchor="end">G_RES</text>
+</svg>
+<div class="caption">圖 7：RES 內 ENR 計算流程 — 用 NR 的 G_NR² 修正 echo PSD，再除以 nearend_est 得 ENR</div>
+</div>
+
+<div class="formula">
+G<sub>RES</sub>[k] = clamp((enr<sub>s</sub> − ENR) / (enr<sub>s</sub> − enr<sub>t</sub>), &nbsp; g<sub>min</sub>, &nbsp; 1.0)
+</div>
+
+<p>FS 段（dt 低）用較嚴格的 enr_t，DT 段（dt 高）用較寬鬆的 enr_t（two-tuning）。</p>
+
+<h3>5.2 多重保護機制</h3>
+
+<table>
+  <tr><th>機制</th><th>用途</th></tr>
+  <tr><td>Spectral floor</td><td>頻譜形狀保留，避免 musical noise</td></tr>
+  <tr><td>NE protection</td><td>per-bin near-end gate (1−coh²)</td></tr>
+  <tr><td>EMR (Echo-to-Masker Ratio)</td><td>echo 低於噪音底時不壓抑（聽不見）</td></tr>
+  <tr><td>HF cap</td><td>500 Hz 以上的 gain 不超過 500 Hz 的（避免高頻彈跳）</td></tr>
+  <tr><td>Cross-frequency smoothing</td><td>3-bin 卷積平滑，去掉孤立 peak/valley</td></tr>
+  <tr><td>Temporal smoothing</td><td>release α 與 attack α，DT-aware</td></tr>
+  <tr><td>Rate limiting</td><td>每 frame 最多 6 dB drop / 6 dB rise</td></tr>
+  <tr><td>Stationary DT bypass (v13)</td><td>穩態 far-end 下啟動 v3 頻帶遮罩</td></tr>
+</table>
+
+<h3>5.3 CNG (Comfort Noise Generation)</h3>
+
+<p>純 FS 段把 mic 訊號完全壓掉會聽起來不自然（突然安靜）。CNG 在這些段補上低位舒適噪音：</p>
+
+<div class="figure">
+<svg viewBox="0 0 700 200" xmlns="http://www.w3.org/2000/svg">
+  <!-- timeline base -->
+  <line x1="40" y1="160" x2="660" y2="160" stroke="#475569" stroke-width="1.5"/>
+
+  <!-- segments -->
+  <rect x="40" y="100" width="180" height="60" fill="#fef3c7" stroke="#f59e0b"/>
+  <text x="130" y="125" font-size="11" font-weight="600" fill="#92400e" text-anchor="middle">FS (純遠端)</text>
+  <text x="130" y="142" font-size="10" fill="#92400e" text-anchor="middle">RES 全壓 → CNG fill</text>
+
+  <rect x="220" y="60" width="200" height="100" fill="#dcfce7" stroke="#16a34a"/>
+  <text x="320" y="100" font-size="11" font-weight="600" fill="#166534" text-anchor="middle">DT (雙講)</text>
+  <text x="320" y="118" font-size="10" fill="#166534" text-anchor="middle">RES 保護語音</text>
+  <text x="320" y="135" font-size="10" fill="#166534" text-anchor="middle">CNG off</text>
+
+  <rect x="420" y="100" width="240" height="60" fill="#fef3c7" stroke="#f59e0b"/>
+  <text x="540" y="125" font-size="11" font-weight="600" fill="#92400e" text-anchor="middle">FS (純遠端)</text>
+  <text x="540" y="142" font-size="10" fill="#92400e" text-anchor="middle">RES 全壓 → CNG fill</text>
+
+  <text x="350" y="50" font-size="13" font-weight="700" fill="#1e40af" text-anchor="middle">CNG 觸發時機</text>
+
+  <text x="40" y="180" font-size="10" fill="#64748b">time →</text>
+</svg>
+<div class="caption">圖 8：CNG 在 FS 段補舒適噪音，DT 段不啟動</div>
+</div>
+
+<table>
+  <tr><th>機制</th><th>說明</th></tr>
+  <tr><td>Frozen noise tracking</td><td>NR 安全段（純噪音）凍結 noise PSD 模板</td></tr>
+  <tr><td>0.3 × attenuation</td><td>補回時降 −10 dB 避免太明顯</td></tr>
+  <tr><td>啟用條件</td><td>filter converged + far_active + dt_low + gain &lt; threshold</td></tr>
+</table>
+
+<div class="note">
+<strong>預設關閉</strong>：CNG 預設 <code>enable_cng=False</code>。需要的場景手動開啟。
+</div>
+
+</div>
+
+<!-- ============================================================ -->
+<h2 id="perf">6. 效能、資源消耗與分數</h2>
+
+<div class="panel">
+
+<h3>6.1 系統規格與資源消耗 (C 實作 @16kHz)</h3>
+
+<table>
+  <tr><th>項目</th><th>AEC</th><th>NR</th><th>備註</th></tr>
+  <tr><td>取樣率</td><td>8 / 16 / 48 kHz</td><td>8 / 16 / 48 kHz</td><td>單通道</td></tr>
+  <tr><td>Frame / Hop</td><td>20 ms / 10 ms</td><td>20 ms / 10 ms</td><td>同步</td></tr>
+  <tr><td>FFT size</td><td>512 (PBFDKF)</td><td>512</td><td>kiss_fft single precision</td></tr>
+  <tr><td>Algorithmic delay</td><td>10 ms (1 hop)</td><td>10 ms (1 hop)</td><td>合計 20 ms</td></tr>
+  <tr><td>記憶體 (核心)</td><td>~200 KB (main+shadow)</td><td>~50 KB</td><td>FFT + 權重 + 緩衝</td></tr>
+  <tr><td>記憶體 (含後處理)</td><td>~280 KB (含 RES + delay est)</td><td>+64 KB (MCRA min buffer)</td><td>L=32, n_freqs=257</td></tr>
+  <tr><td>每 frame 計算量</td><td>2 × 512-FFT + Kalman update<br>(257 bins × 4 partitions)</td><td>2 × 512-FFT<br>+ MCRA + SPP + LSA</td><td></td></tr>
+</table>
+
+<h3>6.2 AEC 收斂時間 (PBFDKF + Shadow, FL=512)</h3>
+
+<table>
+  <tr><th>階段</th><th>時間</th><th>條件</th></tr>
+  <tr><td>Warmup (不更新收斂判定)</td><td>80 frames (800 ms)</td><td>cold start 後固定</td></tr>
+  <tr><td>Cold start → ERLE &gt; 10 dB</td><td>0.3-0.5 s</td><td>寬頻 far-end + 含 echo</td></tr>
+  <tr><td>Cold start → ERLE &gt; 20 dB</td><td>0.5-1.0 s</td><td></td></tr>
+  <tr><td>Cold start → ERLE &gt; 30 dB</td><td>1.5-3.0 s</td><td></td></tr>
+  <tr><td>EPC 後 re-convergence</td><td>0.3-0.8 s</td><td>P_MAX 暫時放寬 30 frames</td></tr>
+  <tr><td>Stationary far-end CV² 收斂</td><td>~1.0 s</td><td>α=0.99 EMA TC≈1s</td></tr>
+  <tr><td>Stationary DT hangover</td><td>800 ms</td><td>jump_ratio &gt; 1.5 後維持</td></tr>
+</table>
+
+<h3>6.3 整路 Pipeline Blind Test 成績</h3>
+
+<p style="margin: 8px 0 4px;">測試集：AEC Challenge Interspeech 2021 blind test (800 cases, balanced preset, FL=512)</p>
+
+<table>
+  <tr><th rowspan="2">指標</th><th colspan="2">AECMOS (本地 ONNX)</th><th colspan="2">DNSMOS (整路品質)</th></tr>
+  <tr><th>AEC-only</th><th>AEC + NR + RES</th><th>AEC-only</th><th>AEC + NR + RES</th></tr>
+  <tr>
+    <td>FS echo↑</td>
+    <td style="text-align:center">3.615</td>
+    <td style="text-align:center">3.568</td>
+    <td style="text-align:center">SIG 2.007 / BAK 3.217</td>
+    <td style="text-align:center">SIG 2.118 / BAK <strong>3.730</strong></td>
+  </tr>
+  <tr>
+    <td>DT echo↑</td>
+    <td style="text-align:center">4.232</td>
+    <td style="text-align:center"><strong>4.339</strong></td>
+    <td style="text-align:center">SIG 2.461 / BAK 3.380</td>
+    <td style="text-align:center">SIG 2.510 / BAK <strong>3.738</strong></td>
+  </tr>
+  <tr>
+    <td>DT deg↑</td>
+    <td style="text-align:center">2.095</td>
+    <td style="text-align:center"><strong>2.314</strong></td>
+    <td style="text-align:center" colspan="2">—</td>
+  </tr>
+  <tr>
+    <td>NE deg↑</td>
+    <td style="text-align:center">3.975</td>
+    <td style="text-align:center">3.488</td>
+    <td style="text-align:center">SIG 3.430 / BAK 3.892</td>
+    <td style="text-align:center">SIG 3.228 / BAK 3.926</td>
+  </tr>
+</table>
+
+<div class="key-point">
+<strong>NR 對整路的貢獻：</strong>
+<ul style="margin: 6px 0 0 20px;">
+  <li><strong>BAK +0.5</strong>（背景噪音品質大幅改善）</li>
+  <li><strong>DT deg +0.22</strong>（雙講語音保護）</li>
+  <li><strong>DT echo +0.11</strong>（NR 順帶幫忙壓 echo）</li>
+  <li>Trade-off: NE deg / NE SIG 略降（NR 在純近端有微量處理痕跡）</li>
+</ul>
+</div>
+
+<h3>6.4 AEC 各 Preset 收斂後 ERLE 與分數</h3>
+
+<table>
+  <tr><th>Preset</th><th>平均 ERLE</th><th>FS echo↑</th><th>DT echo↑</th><th>DT deg↑</th><th>推薦場景</th></tr>
+  <tr><td><strong>mild</strong></td><td>16-18 dB</td><td>3.236</td><td>3.923</td><td>2.338</td><td>會議、近端品質優先</td></tr>
+  <tr><td><strong>balanced</strong></td><td>18-22 dB</td><td>3.577</td><td>4.230</td><td>2.134</td><td><strong>預設、通用場景</strong></td></tr>
+  <tr><td><strong>aggressive</strong></td><td>19-23 dB</td><td>3.687</td><td>4.357</td><td>2.070</td><td>高 echo 環境</td></tr>
+  <tr><td><strong>maximum</strong></td><td>20-25 dB</td><td>3.783</td><td>4.473</td><td>2.014</td><td>極端 echo / demo</td></tr>
+</table>
+
+<p style="font-size: 12px; color: var(--muted); margin-top: 8px;">
+  數據：800-case AEC Challenge blind test，本地 AECMOS ONNX (Run_1663915512_Stage_0)，FL=512。
+</p>
+
+<h3>6.5 NR 降噪等級</h3>
+
+<p>NR 透過 <code>g_min_db</code> 控制最大抑制量（語音/噪音比值的下限），搭配 <code>alpha_g</code> 控制時域平滑：</p>
+
+<table>
+  <tr><th>等級</th><th>g_min_db</th><th>最大抑制量</th><th>alpha_g</th><th>推薦場景</th></tr>
+  <tr>
+    <td><strong>Light</strong></td>
+    <td>−15 dB</td>
+    <td>15 dB</td>
+    <td>0.70</td>
+    <td>高 SNR (&gt;10 dB)、近端品質優先、保留細節</td>
+  </tr>
+  <tr>
+    <td><strong>Balanced</strong></td>
+    <td>−20 dB</td>
+    <td>20 dB</td>
+    <td>0.85</td>
+    <td><strong>預設</strong>、一般場景</td>
+  </tr>
+  <tr>
+    <td><strong>Aggressive</strong></td>
+    <td>−25 dB</td>
+    <td>25 dB</td>
+    <td>0.90</td>
+    <td>低 SNR (&lt;5 dB)、需要安靜背景</td>
+  </tr>
+</table>
+
+<div class="key-point">
+<strong>等級選擇 trade-off：</strong>
+<ul style="margin: 6px 0 0 20px;">
+  <li><strong>Light</strong>：語音失真最小，但靜音段仍聽得到底噪</li>
+  <li><strong>Balanced</strong>：echo/quality 平衡，適合通用語音場景</li>
+  <li><strong>Aggressive</strong>：背景幾乎靜音，但低 SNR 下語音可能有 musical noise / 鈍化</li>
+</ul>
+</div>
+
+<p style="font-size: 12px; color: var(--muted); margin-top: 8px;">
+  詳細參數調整指南見 <a href="../../NR/parameter_adjust_guide.md">NR/parameter_adjust_guide.md</a>。
+</p>
+
+</div>
+
+<!-- ============================================================ -->
+<h2 id="limits">7. 已知限制</h2>
+
+<div class="panel">
+<table>
+  <tr><th>類別</th><th>限制</th></tr>
+  <tr>
+    <td><strong>輸入</strong></td>
+    <td>單通道、8 / 16 / 48 kHz，無 spatial filtering</td>
+  </tr>
+  <tr>
+    <td><strong>AEC 線性模型</strong></td>
+    <td>非線性 echo（speaker 飽和）靠 RES 壓制，無獨立非線性模型</td>
+  </tr>
+  <tr>
+    <td><strong>AEC 穩態 far-end 弱信號段</strong></td>
+    <td>linear AEC 仍可能在弱信號段把語音吸收（合成測試 ~10% 段）</td>
+  </tr>
+  <tr>
+    <td><strong>AEC delay estimation</strong></td>
+    <td>GCC-PHAT 在低 SNR 或強非線性場景可能不準</td>
+  </tr>
+  <tr>
+    <td><strong>NR 突發噪音</strong></td>
+    <td>impulse / crackle / 敲擊 — MCRA TC 跟不上</td>
+  </tr>
+  <tr>
+    <td><strong>NR 噪音突升 / 突降</strong></td>
+    <td>0.3-0.6 s 內噪音漏抑制（minimum tracking 需收斂）</td>
+  </tr>
+  <tr>
+    <td><strong>NR 音樂背景</strong></td>
+    <td>SPP 二元假設（語音 vs 噪音），音樂被誤判為語音保留</td>
+  </tr>
+  <tr>
+    <td><strong>NR 強迴響</strong></td>
+    <td>reverb tail 與穩態噪音相近，可能被誤抑制</td>
+  </tr>
+  <tr>
+    <td><strong>RES musical noise</strong></td>
+    <td>低 SNR 下仍可能殘留</td>
+  </tr>
+</table>
+
+<p style="margin-top: 16px;">完整限制詳見：</p>
+<ul>
+  <li><a href="../../AEC/README.md">AEC README — 已知限制</a></li>
+  <li><a href="../../AEC/docs/aec_improve_v13.md">AEC v13 — Stationary DT 修正紀錄</a></li>
+  <li><a href="../../NR/README.md">NR README — SPP+OMLSA 限制</a></li>
+</ul>
+</div>
+
+<footer style="text-align: center; color: var(--muted); padding: 32px 0; border-top: 1px solid var(--border); margin-top: 48px;">
+  Audio_ALG 架構說明 · 對應 AEC v2.0.0 + v13 · NR v3 · 2026-04
+</footer>
+
+</div>
+</body>
+</html>
