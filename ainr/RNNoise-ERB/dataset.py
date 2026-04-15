@@ -569,9 +569,11 @@ class DNS4Dataset(Dataset):
     # --------------------------------------------------------
 
     def _load_and_crop(self, path: str, target_len: int) -> torch.Tensor:
-        """載入音檔 → resample → 隨機裁切"""
+        """載入音檔 → resample → 隨機裁切。空檔或損壞檔會 raise RuntimeError。"""
         audio, orig_sr = torchaudio.load(path)
         audio = audio[0]  # mono
+        if audio.numel() == 0:
+            raise RuntimeError(f"Empty audio: {path}")
         if orig_sr != self.sr:
             audio = torchaudio.functional.resample(audio, orig_sr, self.sr)
         if len(audio) >= target_len:
@@ -648,6 +650,15 @@ class DNS4Dataset(Dataset):
     # --------------------------------------------------------
 
     def __getitem__(self, idx):
+        # Retry: 遇到空檔/損壞檔時隨機換一個 sample，最多重試 5 次
+        for _retry in range(5):
+            try:
+                return self._getitem_impl(idx)
+            except (RuntimeError, Exception) as e:
+                idx = random.randint(0, len(self._indices) - 1)
+        return self._getitem_impl(idx)
+
+    def _getitem_impl(self, idx):
         real_idx = self._indices[idx]
         target_len = self.segment_samples
 
