@@ -76,10 +76,29 @@ def gen_dataset(args):
     print(f"  Estimated disk     : {disk_str}")
     print(f"  Output: {args.output}/\n")
 
-    # Generate all samples using DataLoader for parallel workers
-    all_features = []
-    all_targets = []
+    # Generate samples and save shards incrementally (省記憶體)
     gen_start = time.time()
+    shard_features = []
+    shard_targets = []
+    shard_id = 0
+    sample_count = 0
+    first_feat = None
+
+    def _save_shard():
+        nonlocal shard_id, shard_features, shard_targets
+        if not shard_features:
+            return
+        shard_data = {
+            'features': torch.stack(shard_features),
+            'targets': torch.stack(shard_targets),
+        }
+        shard_path = os.path.join(args.output, f'shard_{shard_id:04d}.pt')
+        torch.save(shard_data, shard_path)
+        print(f"  {shard_path}: {len(shard_features)} samples, "
+              f"features={shard_data['features'].shape}")
+        shard_id += 1
+        shard_features.clear()
+        shard_targets.clear()
 
     for r in range(n_rounds):
         if n_rounds > 1:
@@ -94,45 +113,44 @@ def gen_dataset(args):
             )
             for feat, tgt in tqdm.tqdm(loader, desc=f"Round {r+1}/{n_rounds}",
                                        total=epoch_size):
-                all_features.append(feat.squeeze(0))
-                all_targets.append(tgt.squeeze(0))
+                feat, tgt = feat.squeeze(0), tgt.squeeze(0)
+                shard_features.append(feat)
+                shard_targets.append(tgt)
+                if first_feat is None:
+                    first_feat = feat
+                sample_count += 1
+                if len(shard_features) >= shard_size:
+                    _save_shard()
         else:
             for i in tqdm.tqdm(range(epoch_size), desc=f"Round {r+1}/{n_rounds}"):
                 feat, tgt = dataset[i]
-                all_features.append(feat)
-                all_targets.append(tgt)
+                shard_features.append(feat)
+                shard_targets.append(tgt)
+                if first_feat is None:
+                    first_feat = feat
+                sample_count += 1
+                if len(shard_features) >= shard_size:
+                    _save_shard()
+
+    # 存最後不滿一個 shard 的剩餘資料
+    _save_shard()
 
     gen_elapsed = time.time() - gen_start
     print(f"\nGeneration done in {gen_elapsed / 3600:.2f} hours")
 
-    # Save shards
-    for shard_id in range(n_shards):
-        start = shard_id * shard_size
-        end = min(start + shard_size, n_total)
-
-        shard_data = {
-            'features': torch.stack(all_features[start:end]),
-            'targets': torch.stack(all_targets[start:end]),
-        }
-
-        shard_path = os.path.join(args.output, f'shard_{shard_id:04d}.pt')
-        torch.save(shard_data, shard_path)
-        print(f"  {shard_path}: {end - start} samples, "
-              f"features={shard_data['features'].shape}")
-
     # Save metadata
     meta = {
-        'n_shards': n_shards,
-        'n_total': n_total,
+        'n_shards': shard_id,
+        'n_total': sample_count,
         'shard_size': shard_size,
         'n_rounds': n_rounds,
-        'hours': actual_hours,
-        'seq_len': all_features[0].shape[0],
-        'n_bands': all_features[0].shape[1],
+        'hours': sample_count * segment_sec / 3600,
+        'seq_len': first_feat.shape[0],
+        'n_bands': first_feat.shape[1],
         'config': args.config,
     }
     torch.save(meta, os.path.join(args.output, 'meta.pt'))
-    print(f"\nDone. {n_total} samples saved to {args.output}/")
+    print(f"\nDone. {sample_count} samples saved to {args.output}/")
 
 
 if __name__ == '__main__':
