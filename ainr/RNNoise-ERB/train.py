@@ -106,7 +106,7 @@ class RNNoiseModel(nn.Module):
     架構沿用官方 v0.2: Conv1d 前處理 + 3 層 GRU + concat 全層輸出
     差異: 輸入改為 ERB band log energy, 無 VAD, 無 sparsification
     """
-    def __init__(self, n_bands, cond_size=64, gru_size=128):
+    def __init__(self, n_bands, cond_size=64, gru_size=128, dropout=0.0):
         super().__init__()
         self.n_bands = n_bands
         self.gru_size = gru_size
@@ -114,6 +114,9 @@ class RNNoiseModel(nn.Module):
         # Conv1d 前處理 (k=3 + k=1, 減少 latency)
         self.conv1 = nn.Conv1d(n_bands, cond_size, kernel_size=3, padding=0)
         self.conv2 = nn.Conv1d(cond_size, gru_size, kernel_size=1)
+
+        # Dropout (GRU 層間)
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         # 3 層 GRU
         self.gru1 = nn.GRU(gru_size, gru_size, batch_first=True)
@@ -130,7 +133,7 @@ class RNNoiseModel(nn.Module):
                     nn.init.orthogonal_(param)
 
         n_params = sum(p.numel() for p in self.parameters())
-        print(f"Model: {n_params:,} parameters")
+        print(f"Model: {n_params:,} parameters (dropout={dropout})")
 
     def forward(self, x, states=None):
         """
@@ -155,9 +158,11 @@ class RNNoiseModel(nn.Module):
         tmp = torch.tanh(self.conv2(tmp))
         conv_out = tmp.permute(0, 2, 1)  # (B, T-2, gru_size)
 
-        # 3 層 GRU
+        # 3 層 GRU + dropout
         gru1_out, h1 = self.gru1(conv_out, h1)
+        gru1_out = self.dropout(gru1_out)
         gru2_out, h2 = self.gru2(gru1_out, h2)
+        gru2_out = self.dropout(gru2_out)
         gru3_out, h3 = self.gru3(gru2_out, h3)
 
         # Concat 全層輸出 (同官方 v0.2)
@@ -241,9 +246,16 @@ def train(args):
                               shuffle=True, num_workers=n_workers, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=min(n_workers, 2))
 
+    # Regularization
+    dropout = cfg.getfloat('training', 'dropout', fallback=0.0)
+    weight_decay = cfg.getfloat('training', 'weight_decay', fallback=0.01)
+    patience = cfg.getint('training', 'early_stop_patience', fallback=0)
+
     # 模型
-    model = RNNoiseModel(n_bands=N_BANDS, cond_size=64, gru_size=128).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.8, 0.98))
+    model = RNNoiseModel(n_bands=N_BANDS, cond_size=64, gru_size=128,
+                         dropout=dropout).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.8, 0.98),
+                                  weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda step: 1.0 / (1.0 + 5e-5 * step)
     )
@@ -253,6 +265,7 @@ def train(args):
     os.makedirs(output_dir, exist_ok=True)
     best_val_loss = float('inf')
     start_epoch = 1
+    no_improve_count = 0  # early stopping 計數器
 
     # Resume from checkpoint
     if args.resume:
@@ -270,6 +283,9 @@ def train(args):
     print(f"Training: SR={SR}, N_FFT={N_FFT}, N_BANDS={N_BANDS}")
     print(f"  WIN_LEN={WIN_LEN}, HOP_LEN={HOP_LEN} (root Hann window)")
     print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
+    print(f"  dropout={dropout}, weight_decay={weight_decay}")
+    if patience > 0:
+        print(f"  early stopping: patience={patience}")
     print(f"  device={device}")
 
     for epoch in range(start_epoch, epochs + 1):
@@ -355,8 +371,16 @@ def train(args):
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
+            no_improve_count = 0
             torch.save(ckpt, os.path.join(output_dir, 'rnnoise_best.pth'))
             print(f"  ✓ best model saved (val_loss={avg_val:.5f})")
+        else:
+            no_improve_count += 1
+            if patience > 0:
+                print(f"  no improvement {no_improve_count}/{patience}")
+                if no_improve_count >= patience:
+                    print(f"  Early stopping at epoch {epoch}")
+                    break
 
 # ============================================================
 # CLI

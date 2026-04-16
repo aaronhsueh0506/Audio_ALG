@@ -85,7 +85,7 @@ def gen_dataset(args):
     first_feat = None
 
     def _save_shard():
-        nonlocal shard_id, shard_features, shard_targets
+        nonlocal shard_id, shard_features, shard_targets, sample_count
         if not shard_features:
             return
         shard_data = {
@@ -99,6 +99,19 @@ def gen_dataset(args):
         shard_id += 1
         shard_features.clear()
         shard_targets.clear()
+
+        # 每存完一個 shard 就更新 meta.pt，中斷後已存的 shard 仍可用
+        meta = {
+            'n_shards': shard_id,
+            'n_total': sample_count,
+            'shard_size': shard_size,
+            'n_rounds': n_rounds,
+            'hours': sample_count * segment_sec / 3600,
+            'seq_len': first_feat.shape[0],
+            'n_bands': first_feat.shape[1],
+            'config': args.config,
+        }
+        torch.save(meta, os.path.join(args.output, 'meta.pt'))
 
     for r in range(n_rounds):
         if n_rounds > 1:
@@ -136,21 +149,8 @@ def gen_dataset(args):
     _save_shard()
 
     gen_elapsed = time.time() - gen_start
-    print(f"\nGeneration done in {gen_elapsed / 3600:.2f} hours")
-
-    # Save metadata
-    meta = {
-        'n_shards': shard_id,
-        'n_total': sample_count,
-        'shard_size': shard_size,
-        'n_rounds': n_rounds,
-        'hours': sample_count * segment_sec / 3600,
-        'seq_len': first_feat.shape[0],
-        'n_bands': first_feat.shape[1],
-        'config': args.config,
-    }
-    torch.save(meta, os.path.join(args.output, 'meta.pt'))
-    print(f"\nDone. {sample_count} samples saved to {args.output}/")
+    print(f"\nDone. {sample_count} samples, {shard_id} shards "
+          f"in {gen_elapsed / 3600:.2f} hours → {args.output}/")
 
 
 if __name__ == '__main__':
