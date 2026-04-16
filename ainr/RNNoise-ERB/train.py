@@ -167,7 +167,8 @@ class RNNoiseModel(nn.Module):
 
         # Concat 全層輸出 (同官方 v0.2)
         cat = torch.cat([conv_out, gru1_out, gru2_out, gru3_out], dim=-1)
-        gains = torch.sigmoid(self.dense_out(cat))
+        # sin²(π/2 · σ(x)): 低 gain 壓更低、高 gain 不變、過渡更平滑 (ref: RNNoise)
+        gains = torch.sin(torch.sigmoid(self.dense_out(cat)) * (3.14159265 / 2)).pow(2)
 
         return gains, [h1, h2, h3]
 
