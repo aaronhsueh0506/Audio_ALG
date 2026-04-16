@@ -76,13 +76,28 @@ def gen_dataset(args):
     print(f"  Estimated disk     : {disk_str}")
     print(f"  Output: {args.output}/\n")
 
-    # Generate samples and save shards incrementally (省記憶體)
-    gen_start = time.time()
+    # Resume: 偵測已存的 shard，從中斷處繼續
     shard_features = []
     shard_targets = []
     shard_id = 0
     sample_count = 0
     first_feat = None
+    skip_samples = 0
+
+    meta_path = os.path.join(args.output, 'meta.pt')
+    if args.resume and os.path.isfile(meta_path):
+        prev_meta = torch.load(meta_path, weights_only=False)
+        shard_id = prev_meta['n_shards']
+        sample_count = prev_meta['n_total']
+        skip_samples = sample_count
+        first_feat = torch.zeros(prev_meta['seq_len'], prev_meta['n_bands'])
+        print(f"Resuming: found {shard_id} shards, {sample_count} samples "
+              f"({prev_meta.get('hours', 0):.1f} hours). "
+              f"Skipping first {skip_samples} samples...")
+
+    # Generate samples and save shards incrementally (省記憶體)
+    gen_start = time.time()
+    global_idx = 0
 
     def _save_shard():
         nonlocal shard_id, shard_features, shard_targets, sample_count
@@ -126,6 +141,9 @@ def gen_dataset(args):
             )
             for feat, tgt in tqdm.tqdm(loader, desc=f"Round {r+1}/{n_rounds}",
                                        total=epoch_size):
+                global_idx += 1
+                if global_idx <= skip_samples:
+                    continue
                 feat, tgt = feat.squeeze(0), tgt.squeeze(0)
                 shard_features.append(feat)
                 shard_targets.append(tgt)
@@ -136,6 +154,9 @@ def gen_dataset(args):
                     _save_shard()
         else:
             for i in tqdm.tqdm(range(epoch_size), desc=f"Round {r+1}/{n_rounds}"):
+                global_idx += 1
+                if global_idx <= skip_samples:
+                    continue
                 feat, tgt = dataset[i]
                 shard_features.append(feat)
                 shard_targets.append(tgt)
@@ -166,6 +187,8 @@ if __name__ == '__main__':
                         help='Number of shard files (default: 10)')
     parser.add_argument('--workers', type=int, default=4,
                         help='Number of DataLoader workers (default: 4, 0=single process)')
+    parser.add_argument('--resume', action='store_true',
+                        help='Resume from existing shards (read meta.pt to skip)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed (default: 42, -1 to disable)')
     args = parser.parse_args()
