@@ -76,28 +76,29 @@ def gen_dataset(args):
     print(f"  Estimated disk     : {disk_str}")
     print(f"  Output: {args.output}/\n")
 
-    # Resume: 偵測已存的 shard，從中斷處繼續
+    # Resume: 偵測已存的 shard，計算從哪個 round / index 繼續
     shard_features = []
     shard_targets = []
     shard_id = 0
     sample_count = 0
     first_feat = None
-    skip_samples = 0
+    start_round = 0
+    start_idx = 0  # 第一個 resume round 要從哪個 index 開始
 
     meta_path = os.path.join(args.output, 'meta.pt')
     if args.resume and os.path.isfile(meta_path):
         prev_meta = torch.load(meta_path, weights_only=False)
         shard_id = prev_meta['n_shards']
         sample_count = prev_meta['n_total']
-        skip_samples = sample_count
         first_feat = torch.zeros(prev_meta['seq_len'], prev_meta['n_bands'])
-        print(f"Resuming: found {shard_id} shards, {sample_count} samples "
-              f"({prev_meta.get('hours', 0):.1f} hours). "
-              f"Skipping first {skip_samples} samples...")
+        start_round = sample_count // epoch_size
+        start_idx = sample_count % epoch_size
+        print(f"Resuming: {shard_id} shards, {sample_count} samples "
+              f"({prev_meta.get('hours', 0):.1f} hrs). "
+              f"Continuing from round {start_round + 1}, sample {start_idx}...")
 
     # Generate samples and save shards incrementally (省記憶體)
     gen_start = time.time()
-    global_idx = 0
 
     def _save_shard():
         nonlocal shard_id, shard_features, shard_targets, sample_count
@@ -129,21 +130,28 @@ def gen_dataset(args):
         torch.save(meta, os.path.join(args.output, 'meta.pt'))
 
     for r in range(n_rounds):
+        if r < start_round:
+            # 完整跳過已完成的 round，不跑 augmentation
+            continue
+
         if n_rounds > 1:
             dataset._shuffle_indices()
             print(f"\n--- Round {r + 1}/{n_rounds} ---")
 
+        # resume 時第一個 round 從 start_idx 開始，之後正常從 0 開始
+        idx_start = start_idx if r == start_round else 0
+
         if n_workers > 0:
+            # 用 Subset 讓 DataLoader 只跑剩餘的 index
+            indices = list(range(idx_start, epoch_size))
+            subset = data.Subset(dataset, indices)
             loader = data.DataLoader(
-                dataset, batch_size=1, shuffle=False,
+                subset, batch_size=1, shuffle=False,
                 num_workers=n_workers, prefetch_factor=2,
                 persistent_workers=False,
             )
             for feat, tgt in tqdm.tqdm(loader, desc=f"Round {r+1}/{n_rounds}",
-                                       total=epoch_size):
-                global_idx += 1
-                if global_idx <= skip_samples:
-                    continue
+                                       total=len(indices)):
                 feat, tgt = feat.squeeze(0), tgt.squeeze(0)
                 shard_features.append(feat)
                 shard_targets.append(tgt)
@@ -153,10 +161,8 @@ def gen_dataset(args):
                 if len(shard_features) >= shard_size:
                     _save_shard()
         else:
-            for i in tqdm.tqdm(range(epoch_size), desc=f"Round {r+1}/{n_rounds}"):
-                global_idx += 1
-                if global_idx <= skip_samples:
-                    continue
+            for i in tqdm.tqdm(range(idx_start, epoch_size),
+                                desc=f"Round {r+1}/{n_rounds}"):
                 feat, tgt = dataset[i]
                 shard_features.append(feat)
                 shard_targets.append(tgt)
