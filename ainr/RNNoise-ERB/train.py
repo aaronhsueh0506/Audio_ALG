@@ -209,6 +209,9 @@ def train(args):
     else:
         N_BANDS = cfg.getint('signal', 'n_bands')
 
+    LOOKAHEAD = cfg.getint('signal', 'lookahead_frames', fallback=0)
+    assert 0 <= LOOKAHEAD <= 2, "lookahead_frames 只支援 0~2"
+
     # Training params
     epochs = cfg.getint('training', 'epochs')
     batch_size = cfg.getint('training', 'batch_size')
@@ -283,6 +286,7 @@ def train(args):
 
     print(f"Training: SR={SR}, N_FFT={N_FFT}, N_BANDS={N_BANDS}")
     print(f"  WIN_LEN={WIN_LEN}, HOP_LEN={HOP_LEN} (root Hann window)")
+    print(f"  lookahead_frames={LOOKAHEAD} ({LOOKAHEAD * HOP_LEN / SR * 1000:.1f} ms extra latency)")
     print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
     print(f"  dropout={dropout}, weight_decay={weight_decay}")
     if patience > 0:
@@ -303,9 +307,11 @@ def train(args):
                 targets = targets.to(device)
 
                 pred_gains, _ = model(features)
-                # Conv1d valid padding 會減少 2 個 frame
-                # Causal: output[i] 對應 input[i+2] (最新 frame, 0 lookahead)
-                targets = targets[:, 2:, :]
+                # Conv1d valid padding 減少 2 個 frame; lookahead 決定 target 對齊位置
+                # lookahead=0: output[i] 對應 input[i+2] → targets[:, 2:   ]
+                # lookahead=1: output[i] 對應 input[i+1] → targets[:, 1:-1 ]
+                t_end = -LOOKAHEAD if LOOKAHEAD > 0 else None
+                targets = targets[:, 2 - LOOKAHEAD : t_end, :]
 
                 # Speech-weighted asymmetric loss
                 # (A) 語音段加重 + 靜音段加重 (noise suppression)
@@ -340,7 +346,8 @@ def train(args):
                 features = features.to(device)
                 targets = targets.to(device)
                 pred_gains, _ = model(features)
-                targets = targets[:, 2:, :]
+                t_end = -LOOKAHEAD if LOOKAHEAD > 0 else None
+                targets = targets[:, 2 - LOOKAHEAD : t_end, :]
                 # 同 training: speech-weighted asymmetric loss
                 sw = targets.mean(dim=-1, keepdim=True)
                 nb = torch.where(sw < 0.1, 3.0, 1.0)
@@ -366,6 +373,7 @@ def train(args):
             'config': {
                 'sr': SR, 'n_fft': N_FFT, 'win_len': WIN_LEN,
                 'hop_len': HOP_LEN, 'n_bands': N_BANDS,
+                'lookahead_frames': LOOKAHEAD,
             },
         }
         torch.save(ckpt, os.path.join(output_dir, f'rnnoise_epoch{epoch}.pth'))

@@ -85,6 +85,7 @@ def denoise(args):
     HOP_LEN = cfg.getint('signal', 'hop_len', fallback=WIN_LEN // 2)
     HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
     N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
+    LOOKAHEAD = cfg.getint('signal', 'lookahead_frames', fallback=0)
 
     if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
         _, N_BANDS = compute_hybrid_bands(N_FFT, SR, N_ERB_HIGH, HYBRID_CUTOFF)
@@ -146,10 +147,10 @@ def denoise(args):
     n_frames_out = gains.size(0)
     bin_gains = torch.ones(n_bins, spec.size(1))  # 預設 gain=1
 
+    gain_offset = 2 - LOOKAHEAD  # lookahead=0 → 2, lookahead=1 → 1
     for b in range(N_BANDS):
         lo, hi = int(bin_edges[b]), int(bin_edges[b + 1])
-        # Causal: gain 從 frame 2 開始 (前 2 frame 無 gain → 保持 1.0)
-        bin_gains[lo:hi, 2:2 + n_frames_out] = gains[:, b].unsqueeze(0)
+        bin_gains[lo:hi, gain_offset:gain_offset + n_frames_out] = gains[:, b].unsqueeze(0)
 
     # 套用 gain 到 complex spectrum
     filtered = spec * bin_gains
