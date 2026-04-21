@@ -18,7 +18,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, random_split
+from torch.utils.data import DataLoader, RandomSampler, random_split
 import tqdm
 
 from dataset import DNS4Dataset, PrecomputedDataset
@@ -244,10 +244,17 @@ def train(args):
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val])
 
-    # Precomputed: 資料已在記憶體，不需多 worker；Online: 需要多 worker 做 augmentation
+    # epoch_size: precomputed 模式下用 RandomSampler 限制每 epoch 的 sample 數
+    # online 模式由 DNS4Dataset._shuffle_indices() 處理
+    epoch_size = cfg.getint('training', 'epoch_size', fallback=0)
     n_workers = 0 if not use_online else 4
-    train_loader = DataLoader(train_set, batch_size=batch_size,
-                              shuffle=True, num_workers=n_workers, pin_memory=True)
+    if not use_online and epoch_size > 0 and epoch_size < len(train_set):
+        train_sampler = RandomSampler(train_set, replacement=False, num_samples=epoch_size)
+        train_loader = DataLoader(train_set, batch_size=batch_size,
+                                  sampler=train_sampler, num_workers=n_workers, pin_memory=True)
+    else:
+        train_loader = DataLoader(train_set, batch_size=batch_size,
+                                  shuffle=True, num_workers=n_workers, pin_memory=True)
     val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=min(n_workers, 2))
 
     # Regularization
