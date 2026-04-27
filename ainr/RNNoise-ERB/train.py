@@ -271,7 +271,11 @@ def train(args):
         optimizer, lr_lambda=lambda step: 1.0 / (1.0 + 5e-5 * step)
     )
 
-    gamma = 0.5  # perceptual exponent (PercepNet 風格: 壓縮 gain space, 低 gain 得到更多梯度)
+    gamma             = cfg.getfloat('training', 'gamma',             fallback=0.5)
+    loss_over_weight  = cfg.getfloat('training', 'loss_over_weight',  fallback=2.5)
+    loss_under_weight = cfg.getfloat('training', 'loss_under_weight', fallback=1.0)
+    noise_frame_boost = cfg.getfloat('training', 'noise_frame_boost', fallback=3.0)
+    speech_frame_scale = cfg.getfloat('training', 'speech_frame_scale', fallback=2.0)
 
     os.makedirs(output_dir, exist_ok=True)
     best_val_loss = float('inf')
@@ -296,6 +300,8 @@ def train(args):
     print(f"  lookahead_frames={LOOKAHEAD} ({LOOKAHEAD * HOP_LEN / SR * 1000:.1f} ms extra latency)")
     print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
     print(f"  dropout={dropout}, weight_decay={weight_decay}")
+    print(f"  loss: gamma={gamma}, over={loss_over_weight}, under={loss_under_weight}, "
+          f"noise_boost={noise_frame_boost}, speech_scale={speech_frame_scale}")
     if patience > 0:
         print(f"  early stopping: patience={patience}")
     print(f"  device={device}")
@@ -321,16 +327,16 @@ def train(args):
                 targets = targets[:, 2 - LOOKAHEAD : t_end, :]
 
                 # Speech-weighted asymmetric loss
-                # (A) 語音段加重 + 靜音段加重 (noise suppression)
                 speech_weight = targets.mean(dim=-1, keepdim=True)
-                noise_boost = torch.where(speech_weight < 0.1, 3.0, 1.0)
-                frame_weight = noise_boost + 2.0 * speech_weight
+                nb = torch.where(speech_weight < 0.1,
+                                 torch.tensor(noise_frame_boost), torch.ones(1))
+                frame_weight = nb + speech_frame_scale * speech_weight
 
-                # (B) Asymmetric: over-estimation (noise leak) 罰更重
                 pred_g = pred_gains ** gamma
                 targ_g = targets ** gamma
                 error = pred_g - targ_g
-                asym_weight = torch.where(error > 0, 2.5, 1.0)
+                # error > 0: noise leak (over-estimation); error < 0: over-suppression
+                asym_weight = torch.where(error > 0, loss_over_weight, loss_under_weight)
 
                 loss = (frame_weight * asym_weight * error.pow(2)).mean()
 
@@ -355,14 +361,14 @@ def train(args):
                 pred_gains, _ = model(features)
                 t_end = -LOOKAHEAD if LOOKAHEAD > 0 else None
                 targets = targets[:, 2 - LOOKAHEAD : t_end, :]
-                # 同 training: speech-weighted asymmetric loss
                 sw = targets.mean(dim=-1, keepdim=True)
-                nb = torch.where(sw < 0.1, 3.0, 1.0)
-                fw = nb + 2.0 * sw
+                nb = torch.where(sw < 0.1,
+                                 torch.tensor(noise_frame_boost), torch.ones(1))
+                fw = nb + speech_frame_scale * sw
                 pg = pred_gains ** gamma
                 tg = targets ** gamma
                 err = pg - tg
-                aw = torch.where(err > 0, 2.5, 1.0)
+                aw = torch.where(err > 0, loss_over_weight, loss_under_weight)
                 val_loss_sum += (fw * aw * err.pow(2)).mean().item()
 
         avg_val = val_loss_sum / max(len(val_loader), 1)
@@ -381,6 +387,8 @@ def train(args):
                 'sr': SR, 'n_fft': N_FFT, 'win_len': WIN_LEN,
                 'hop_len': HOP_LEN, 'n_bands': N_BANDS,
                 'lookahead_frames': LOOKAHEAD,
+                'gamma': gamma, 'loss_over_weight': loss_over_weight,
+                'loss_under_weight': loss_under_weight,
             },
         }
         torch.save(ckpt, os.path.join(output_dir, f'rnnoise_epoch{epoch}.pth'))
