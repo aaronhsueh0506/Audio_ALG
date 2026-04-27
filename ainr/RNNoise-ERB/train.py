@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, random_split
 import tqdm
 
-from dataset import DNS4Dataset, PrecomputedDataset
+from dataset import DNS4Dataset, PrecomputedDataset, WavPairDataset
 
 # ============================================================
 # ERB Band 工具
@@ -173,6 +173,70 @@ class RNNoiseModel(nn.Module):
         return gains, [h1, h2, h3]
 
 # ============================================================
+# Perceptual loss helpers (WAV-data mode)
+# ============================================================
+
+def extract_erb_features(power_spec, bin_edges):
+    """
+    power_spec: (..., n_frames, n_bins)  — works for both (T, F) and (B, T, F)
+    Returns: (..., n_frames, n_bands)  normalized log ERB energy
+    """
+    bands = []
+    for b in range(len(bin_edges) - 1):
+        lo, hi = int(bin_edges[b]), int(bin_edges[b + 1])
+        bands.append(power_spec[..., lo:hi].sum(dim=-1))
+    energy = torch.stack(bands, dim=-1)
+    log_energy = torch.log(energy + 1e-10)
+    mean = log_energy.mean(dim=-2, keepdim=True)
+    std = log_energy.std(dim=-2, keepdim=True) + 1e-8
+    return (log_energy - mean) / std
+
+
+def apply_erb_gains_batch(noisy_spec, gains, bin_edges, lookahead=0):
+    """
+    noisy_spec : (B, n_bins, n_frames) complex
+    gains      : (B, n_frames_out, n_bands)
+    Returns    : enhanced_spec (B, n_bins, n_frames) complex
+    """
+    B, n_bins, n_frames = noisy_spec.shape
+    n_frames_out = gains.shape[1]
+    bin_gains = torch.ones(B, n_bins, n_frames,
+                           device=gains.device, dtype=gains.dtype)
+    gain_offset = 2 - lookahead
+    for b in range(len(bin_edges) - 1):
+        lo, hi = int(bin_edges[b]), int(bin_edges[b + 1])
+        # gains[:, :, b]: (B, n_frames_out) → unsqueeze → (B, 1, n_frames_out)
+        bin_gains[:, lo:hi, gain_offset:gain_offset + n_frames_out] = \
+            gains[:, :, b].unsqueeze(1)
+    return noisy_spec * bin_gains
+
+
+def multi_res_stft_loss(enhanced, clean, fft_sizes=(512, 256, 1024)):
+    """
+    DeepFilterNet 風格 multi-resolution STFT loss.
+    enhanced, clean: (B, T)
+    組合 spectral convergence loss + log magnitude loss。
+    """
+    total = 0.0
+    for n_fft in fft_sizes:
+        hop = n_fft // 4
+        win = torch.hann_window(n_fft, device=enhanced.device)
+        E = torch.stft(enhanced, n_fft, hop, window=win,
+                       return_complex=True).abs()   # (B, F, T')
+        C = torch.stft(clean,    n_fft, hop, window=win,
+                       return_complex=True).abs()
+
+        # spectral convergence
+        sc = (E - C).norm(dim=(-2, -1)) / (C.norm(dim=(-2, -1)) + 1e-8)
+        # log magnitude
+        log_mag = (torch.log(E + 1e-8) - torch.log(C + 1e-8)).abs().mean(dim=(-2, -1))
+
+        total = total + sc.mean() + log_mag.mean()
+
+    return total / len(fft_sizes)
+
+
+# ============================================================
 # 訓練
 # ============================================================
 
@@ -233,9 +297,13 @@ def train(args):
         BIN_EDGES = compute_erb_bands(N_FFT, SR, N_BANDS)
 
     # Dataset
-    if args.precomputed:
+    use_online = False
+    use_wav = False
+    if args.wav_data:
+        dataset = WavPairDataset(args.wav_data)
+        use_wav = True
+    elif args.precomputed:
         dataset = PrecomputedDataset(args.precomputed)
-        use_online = False
     else:
         dataset = DNS4Dataset(cfg)
         use_online = True
@@ -244,10 +312,10 @@ def train(args):
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val])
 
-    # epoch_size: precomputed 模式下用 RandomSampler 限制每 epoch 的 sample 數
+    # epoch_size: precomputed/wav-data 模式下用 RandomSampler 限制每 epoch 的 sample 數
     # online 模式由 DNS4Dataset._shuffle_indices() 處理
     epoch_size = cfg.getint('training', 'epoch_size', fallback=0)
-    n_workers = 0 if not use_online else 4
+    n_workers = 4 if (use_online or use_wav) else 0
     if not use_online and epoch_size > 0 and epoch_size < len(train_set):
         train_sampler = RandomSampler(train_set, replacement=False, num_samples=epoch_size)
         train_loader = DataLoader(train_set, batch_size=batch_size,
@@ -277,6 +345,13 @@ def train(args):
     noise_frame_boost = cfg.getfloat('training', 'noise_frame_boost', fallback=3.0)
     speech_frame_scale = cfg.getfloat('training', 'speech_frame_scale', fallback=2.0)
 
+    # Perceptual loss FFT sizes (wav-data mode)
+    fft_sizes_str = cfg.get('perceptual_loss', 'fft_sizes', fallback='512,256,1024')
+    fft_sizes = tuple(int(x.strip()) for x in fft_sizes_str.split(','))
+
+    # Window for on-the-fly STFT (wav-data mode) — created once, moved to device
+    stft_window = torch.sqrt(torch.hann_window(WIN_LEN)).to(device)
+
     os.makedirs(output_dir, exist_ok=True)
     best_val_loss = float('inf')
     start_epoch = 1
@@ -300,8 +375,11 @@ def train(args):
     print(f"  lookahead_frames={LOOKAHEAD} ({LOOKAHEAD * HOP_LEN / SR * 1000:.1f} ms extra latency)")
     print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
     print(f"  dropout={dropout}, weight_decay={weight_decay}")
-    print(f"  loss: gamma={gamma}, over={loss_over_weight}, under={loss_under_weight}, "
-          f"noise_boost={noise_frame_boost}, speech_scale={speech_frame_scale}")
+    if use_wav:
+        print(f"  loss: multi-res STFT (perceptual), fft_sizes={fft_sizes}")
+    else:
+        print(f"  loss: gamma={gamma}, over={loss_over_weight}, under={loss_under_weight}, "
+              f"noise_boost={noise_frame_boost}, speech_scale={speech_frame_scale}")
     if patience > 0:
         print(f"  early stopping: patience={patience}")
     print(f"  device={device}")
@@ -315,39 +393,74 @@ def train(args):
         model.train()
         train_loss_sum = 0
         with tqdm.tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") as pbar:
-            for features, targets in pbar:
-                features = features.to(device)
-                targets = targets.to(device)
+            if use_wav:
+                for noisy_wav, clean_wav in pbar:
+                    noisy_wav = noisy_wav.to(device)
+                    clean_wav = clean_wav.to(device)
 
-                pred_gains, _ = model(features)
-                # Conv1d valid padding 減少 2 個 frame; lookahead 決定 target 對齊位置
-                # lookahead=0: output[i] 對應 input[i+2] → targets[:, 2:   ]
-                # lookahead=1: output[i] 對應 input[i+1] → targets[:, 1:-1 ]
-                t_end = -LOOKAHEAD if LOOKAHEAD > 0 else None
-                targets = targets[:, 2 - LOOKAHEAD : t_end, :]
+                    # On-the-fly STFT
+                    noisy_spec = torch.stft(
+                        noisy_wav, N_FFT, HOP_LEN, WIN_LEN,
+                        window=stft_window, return_complex=True, center=True)
+                    # (B, n_bins, n_frames)
 
-                # Speech-weighted asymmetric loss
-                speech_weight = targets.mean(dim=-1, keepdim=True)
-                nb = torch.where(speech_weight < 0.1,
-                                 torch.tensor(noise_frame_boost), torch.ones(1))
-                frame_weight = nb + speech_frame_scale * speech_weight
+                    # ERB features
+                    power = noisy_spec.abs().pow(2).permute(0, 2, 1)  # (B, T, F)
+                    features = extract_erb_features(power, BIN_EDGES)  # (B, T, n_bands)
 
-                pred_g = pred_gains ** gamma
-                targ_g = targets ** gamma
-                error = pred_g - targ_g
-                # error > 0: noise leak (over-estimation); error < 0: over-suppression
-                asym_weight = torch.where(error > 0, loss_over_weight, loss_under_weight)
+                    pred_gains, _ = model(features)  # (B, T-2, n_bands)
 
-                loss = (frame_weight * asym_weight * error.pow(2)).mean()
+                    # Apply ERB gains → enhanced STFT → ISTFT
+                    enhanced_spec = apply_erb_gains_batch(
+                        noisy_spec, pred_gains, BIN_EDGES, LOOKAHEAD)
+                    enhanced_wav = torch.istft(
+                        enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
+                        window=stft_window, length=noisy_wav.size(-1))
 
-                optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
+                    loss = multi_res_stft_loss(enhanced_wav, clean_wav, fft_sizes)
 
-                train_loss_sum += loss.item()
-                pbar.set_postfix(loss=f"{loss.item():.5f}")
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    scheduler.step()
+
+                    train_loss_sum += loss.item()
+                    pbar.set_postfix(loss=f"{loss.item():.5f}")
+            else:
+                for features, targets in pbar:
+                    features = features.to(device)
+                    targets = targets.to(device)
+
+                    pred_gains, _ = model(features)
+                    # Conv1d valid padding 減少 2 個 frame; lookahead 決定 target 對齊位置
+                    # lookahead=0: output[i] 對應 input[i+2] → targets[:, 2:   ]
+                    # lookahead=1: output[i] 對應 input[i+1] → targets[:, 1:-1 ]
+                    t_end = -LOOKAHEAD if LOOKAHEAD > 0 else None
+                    targets = targets[:, 2 - LOOKAHEAD : t_end, :]
+
+                    # Speech-weighted asymmetric loss
+                    speech_weight = targets.mean(dim=-1, keepdim=True)
+                    nb = torch.where(speech_weight < 0.1,
+                                     torch.tensor(noise_frame_boost), torch.ones(1))
+                    frame_weight = nb + speech_frame_scale * speech_weight
+
+                    pred_g = pred_gains ** gamma
+                    targ_g = targets ** gamma
+                    error = pred_g - targ_g
+                    # error > 0: noise leak (over-estimation); error < 0: over-suppression
+                    asym_weight = torch.where(error > 0, loss_over_weight, loss_under_weight)
+
+                    loss = (frame_weight * asym_weight * error.pow(2)).mean()
+
+                    optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    optimizer.step()
+                    scheduler.step()
+
+                    train_loss_sum += loss.item()
+                    pbar.set_postfix(loss=f"{loss.item():.5f}")
 
         avg_train = train_loss_sum / len(train_loader)
 
@@ -355,21 +468,40 @@ def train(args):
         model.eval()
         val_loss_sum = 0
         with torch.no_grad():
-            for features, targets in val_loader:
-                features = features.to(device)
-                targets = targets.to(device)
-                pred_gains, _ = model(features)
-                t_end = -LOOKAHEAD if LOOKAHEAD > 0 else None
-                targets = targets[:, 2 - LOOKAHEAD : t_end, :]
-                sw = targets.mean(dim=-1, keepdim=True)
-                nb = torch.where(sw < 0.1,
-                                 torch.tensor(noise_frame_boost), torch.ones(1))
-                fw = nb + speech_frame_scale * sw
-                pg = pred_gains ** gamma
-                tg = targets ** gamma
-                err = pg - tg
-                aw = torch.where(err > 0, loss_over_weight, loss_under_weight)
-                val_loss_sum += (fw * aw * err.pow(2)).mean().item()
+            if use_wav:
+                for noisy_wav, clean_wav in val_loader:
+                    noisy_wav = noisy_wav.to(device)
+                    clean_wav = clean_wav.to(device)
+
+                    noisy_spec = torch.stft(
+                        noisy_wav, N_FFT, HOP_LEN, WIN_LEN,
+                        window=stft_window, return_complex=True, center=True)
+                    power = noisy_spec.abs().pow(2).permute(0, 2, 1)
+                    features = extract_erb_features(power, BIN_EDGES)
+                    pred_gains, _ = model(features)
+                    enhanced_spec = apply_erb_gains_batch(
+                        noisy_spec, pred_gains, BIN_EDGES, LOOKAHEAD)
+                    enhanced_wav = torch.istft(
+                        enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
+                        window=stft_window, length=noisy_wav.size(-1))
+                    val_loss_sum += multi_res_stft_loss(
+                        enhanced_wav, clean_wav, fft_sizes).item()
+            else:
+                for features, targets in val_loader:
+                    features = features.to(device)
+                    targets = targets.to(device)
+                    pred_gains, _ = model(features)
+                    t_end = -LOOKAHEAD if LOOKAHEAD > 0 else None
+                    targets = targets[:, 2 - LOOKAHEAD : t_end, :]
+                    sw = targets.mean(dim=-1, keepdim=True)
+                    nb = torch.where(sw < 0.1,
+                                     torch.tensor(noise_frame_boost), torch.ones(1))
+                    fw = nb + speech_frame_scale * sw
+                    pg = pred_gains ** gamma
+                    tg = targets ** gamma
+                    err = pg - tg
+                    aw = torch.where(err > 0, loss_over_weight, loss_under_weight)
+                    val_loss_sum += (fw * aw * err.pow(2)).mean().item()
 
         avg_val = val_loss_sum / max(len(val_loader), 1)
         print(f"  train_loss={avg_train:.5f}  val_loss={avg_val:.5f}")
@@ -419,7 +551,9 @@ if __name__ == '__main__':
     parser.add_argument('--gpu', type=int, default=None,
                         help='指定 GPU ID (例: --gpu 0)')
     parser.add_argument('--precomputed', default=None,
-                        help='預生成資料目錄 (gen_dataset.py 產生)')
+                        help='預生成資料目錄 (.pt shard 格式, 舊版)')
+    parser.add_argument('--wav-data', default=None,
+                        help='WAV pair 資料目錄 (gen_dataset.py WAV 模式產生, 使用 perceptual loss)')
     parser.add_argument('--resume', default=None,
                         help='Checkpoint 路徑，從斷點續訓')
     parser.add_argument('--seed', type=int, default=42,

@@ -393,10 +393,11 @@ class DNS4Dataset(Dataset):
     7. Bandwidth limitation (noisy + target)
     8. Clipping distortion (noisy only)
     9. Clipping prevention
-    10. STFT → features + target gains
+    10. STFT → features + target gains  (return_raw=False)
+        OR return (noisy, clean) raw audio tensors (return_raw=True)
     """
 
-    def __init__(self, cfg: configparser.ConfigParser):
+    def __init__(self, cfg: configparser.ConfigParser, return_raw: bool = False):
         # signal params
         self.sr = cfg.getint('signal', 'sr')
         self.n_fft = cfg.getint('signal', 'n_fft')
@@ -437,6 +438,8 @@ class DNS4Dataset(Dataset):
         self.p_clipping = cfg.getfloat('augmentation', 'p_clipping')
         self.clip_snr_min = cfg.getfloat('augmentation', 'clip_snr_min')
         self.clip_snr_max = cfg.getfloat('augmentation', 'clip_snr_max')
+
+        self.return_raw = return_raw
 
         # epoch size
         self.epoch_size = cfg.getint('training', 'epoch_size')
@@ -742,6 +745,9 @@ class DNS4Dataset(Dataset):
         # 10. Clipping prevention
         target, noisy = prevent_clipping(target, noisy)
 
+        if self.return_raw:
+            return noisy, target
+
         # 11. STFT → features + target gains
         clean_spec = self._stft(target)
         noisy_spec = self._stft(noisy)
@@ -758,6 +764,49 @@ class DNS4Dataset(Dataset):
 # ============================================================
 # Precomputed Dataset (讀取 gen_dataset.py 產生的 .pt shard)
 # ============================================================
+
+class WavPairDataset(Dataset):
+    """
+    讀取 gen_dataset.py (WAV 模式) 產生的 noisy/clean WAV 對。
+
+    目錄結構:
+        data_dir/
+            noisy/000000.wav, 000001.wav, ...
+            clean/000000.wav, 000001.wav, ...
+            meta.json
+
+    用法:
+        dataset = WavPairDataset('data/')
+        noisy_wav, clean_wav = dataset[0]  # shape: (T,)
+    """
+
+    def __init__(self, data_dir: str):
+        import json
+        self.noisy_dir = os.path.join(data_dir, 'noisy')
+        self.clean_dir = os.path.join(data_dir, 'clean')
+
+        if not os.path.isdir(self.noisy_dir):
+            raise FileNotFoundError(f"noisy/ not found in {data_dir}")
+
+        meta_path = os.path.join(data_dir, 'meta.json')
+        if os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                self.meta = json.load(f)
+        else:
+            self.meta = {}
+
+        self.files = sorted(f for f in os.listdir(self.noisy_dir) if f.endswith('.wav'))
+        print(f"WavPairDataset: {len(self.files)} pairs from {data_dir}")
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        name = self.files[idx]
+        noisy, _ = torchaudio.load(os.path.join(self.noisy_dir, name))
+        clean, _ = torchaudio.load(os.path.join(self.clean_dir, name))
+        return noisy.squeeze(0), clean.squeeze(0)
+
 
 class PrecomputedDataset(Dataset):
     """
