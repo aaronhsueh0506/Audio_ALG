@@ -111,8 +111,14 @@ def load_model(args):
     else:
         bin_edges = compute_erb_bands(N_FFT, SR, N_BANDS)
 
+    GAIN_FLOOR    = cfg.getfloat('inference', 'gain_floor',    fallback=0.02)
+    ATTACK_ALPHA  = cfg.getfloat('inference', 'attack_alpha',  fallback=0.5)
+    RELEASE_ALPHA = cfg.getfloat('inference', 'release_alpha', fallback=0.15)
+
     params = dict(SR=SR, N_FFT=N_FFT, WIN_LEN=WIN_LEN, HOP_LEN=HOP_LEN,
-                  N_BANDS=N_BANDS, LOOKAHEAD=LOOKAHEAD, bin_edges=bin_edges)
+                  N_BANDS=N_BANDS, LOOKAHEAD=LOOKAHEAD, bin_edges=bin_edges,
+                  GAIN_FLOOR=GAIN_FLOOR, ATTACK_ALPHA=ATTACK_ALPHA,
+                  RELEASE_ALPHA=RELEASE_ALPHA)
     return model, params
 
 
@@ -122,9 +128,12 @@ def process_file(input_path, output_path, model, params, dump_calib=None, max_fr
     N_FFT = params['N_FFT']
     WIN_LEN = params['WIN_LEN']
     HOP_LEN = params['HOP_LEN']
-    N_BANDS = params['N_BANDS']
-    LOOKAHEAD = params['LOOKAHEAD']
-    bin_edges = params['bin_edges']
+    N_BANDS       = params['N_BANDS']
+    LOOKAHEAD     = params['LOOKAHEAD']
+    bin_edges     = params['bin_edges']
+    GAIN_FLOOR    = params['GAIN_FLOOR']
+    ATTACK_ALPHA  = params['ATTACK_ALPHA']
+    RELEASE_ALPHA = params['RELEASE_ALPHA']
 
     audio, orig_sr = torchaudio.load(input_path)
     audio = audio[0]  # mono
@@ -146,13 +155,11 @@ def process_file(input_path, output_path, model, params, dump_calib=None, max_fr
     gains = gains.squeeze(0)
 
     # Asymmetric temporal gain smoothing
-    attack_alpha = 0.5
-    release_alpha = 0.15
     for t in range(1, gains.size(0)):
-        alpha = torch.where(gains[t] > gains[t - 1], attack_alpha, release_alpha)
+        alpha = torch.where(gains[t] > gains[t - 1], ATTACK_ALPHA, RELEASE_ALPHA)
         gains[t] = alpha * gains[t] + (1 - alpha) * gains[t - 1]
 
-    gains = torch.clamp(gains, min=0.02)
+    gains = torch.clamp(gains, min=GAIN_FLOOR)
 
     n_bins = spec.size(0)
     n_frames_out = gains.size(0)
