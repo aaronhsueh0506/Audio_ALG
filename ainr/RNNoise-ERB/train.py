@@ -1,3 +1,6 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 """
 RNNoise v0.2 風格噪音抑制模型 — 訓練腳本
 基於官方 xiph/rnnoise torch 版本架構，適配 config-driven / ERB bands / 無 pitch

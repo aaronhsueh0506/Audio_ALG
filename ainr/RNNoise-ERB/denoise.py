@@ -1,3 +1,6 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 """
 RNNoise v0.2 風格噪音抑制 — 推論腳本
 

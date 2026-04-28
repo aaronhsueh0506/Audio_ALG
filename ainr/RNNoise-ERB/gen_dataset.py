@@ -1,4 +1,7 @@
 # -*- coding: utf-8 -*-
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 """
 Offline pre-generation of training data (WAV pair mode).
 Saves augmented (noisy, clean) WAV pairs for flexible downstream use.
