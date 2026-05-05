@@ -345,9 +345,10 @@ def train(args):
     noise_frame_boost = cfg.getfloat('training', 'noise_frame_boost', fallback=3.0)
     speech_frame_scale = cfg.getfloat('training', 'speech_frame_scale', fallback=2.0)
 
-    # Perceptual loss FFT sizes (wav-data mode)
+    # Perceptual loss params (wav-data mode)
     fft_sizes_str = cfg.get('perceptual_loss', 'fft_sizes', fallback='512,256,1024')
     fft_sizes = tuple(int(x.strip()) for x in fft_sizes_str.split(','))
+    perc_gamma = cfg.getfloat('perceptual_loss', 'gamma', fallback=0.3)
 
     # Window for on-the-fly STFT (wav-data mode) — created once, moved to device
     stft_window = torch.sqrt(torch.hann_window(WIN_LEN)).to(device)
@@ -417,7 +418,7 @@ def train(args):
                         enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
                         window=stft_window, length=noisy_wav.size(-1))
 
-                    loss = multi_res_stft_loss(enhanced_wav, clean_wav, fft_sizes)
+                    loss = multi_res_stft_loss(enhanced_wav, clean_wav, fft_sizes, perc_gamma)
 
                     optimizer.zero_grad()
                     loss.backward()
