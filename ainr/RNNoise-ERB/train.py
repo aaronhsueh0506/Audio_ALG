@@ -217,7 +217,7 @@ def apply_erb_gains_batch(noisy_spec, gains, bin_edges, lookahead=0):
 def multi_res_stft_loss(enhanced, clean, fft_sizes=(512, 256, 1024), gamma=0.3):
     """
     DeepFilterNet 風格 multi-resolution compressed magnitude loss.
-    對 magnitude 做 γ-power compression 再算 L1 距離。
+    對 magnitude 做 γ-power compression 再算 MSE 距離 (對齊 DFN3 production)。
     無除法 → 對 silence target (noise-only sample, target=0) 也穩定有界。
     """
     total = 0.0
@@ -231,7 +231,7 @@ def multi_res_stft_loss(enhanced, clean, fft_sizes=(512, 256, 1024), gamma=0.3):
 
         E_c = (E + 1e-8).pow(gamma)
         C_c = (C + 1e-8).pow(gamma)
-        total = total + F.l1_loss(E_c, C_c)
+        total = total + F.mse_loss(E_c, C_c)
 
     return total / len(fft_sizes)
 
