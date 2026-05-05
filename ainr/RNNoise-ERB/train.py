@@ -214,11 +214,11 @@ def apply_erb_gains_batch(noisy_spec, gains, bin_edges, lookahead=0):
     return noisy_spec * bin_gains
 
 
-def multi_res_stft_loss(enhanced, clean, fft_sizes=(512, 256, 1024)):
+def multi_res_stft_loss(enhanced, clean, fft_sizes=(512, 256, 1024), gamma=0.3):
     """
-    DeepFilterNet 風格 multi-resolution STFT loss.
-    enhanced, clean: (B, T)
-    組合 spectral convergence loss + log magnitude loss。
+    DeepFilterNet 風格 multi-resolution compressed magnitude loss.
+    對 magnitude 做 γ-power compression 再算 L1 距離。
+    無除法 → 對 silence target (noise-only sample, target=0) 也穩定有界。
     """
     total = 0.0
     for n_fft in fft_sizes:
@@ -229,12 +229,9 @@ def multi_res_stft_loss(enhanced, clean, fft_sizes=(512, 256, 1024)):
         C = torch.stft(clean,    n_fft, hop, window=win,
                        return_complex=True).abs()
 
-        # spectral convergence
-        sc = (E - C).norm(dim=(-2, -1)) / (C.norm(dim=(-2, -1)) + 1e-8)
-        # log magnitude
-        log_mag = (torch.log(E + 1e-8) - torch.log(C + 1e-8)).abs().mean(dim=(-2, -1))
-
-        total = total + sc.mean() + log_mag.mean()
+        E_c = (E + 1e-8).pow(gamma)
+        C_c = (C + 1e-8).pow(gamma)
+        total = total + F.l1_loss(E_c, C_c)
 
     return total / len(fft_sizes)
 
