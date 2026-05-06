@@ -333,7 +333,7 @@ def train(args):
     # 模型
     model = RNNoiseModel(n_bands=N_BANDS, cond_size=64, gru_size=128,
                          dropout=dropout).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.8, 0.98),
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999),
                                   weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lr_lambda=lambda step: 1.0 / (1.0 + 5e-5 * step)
