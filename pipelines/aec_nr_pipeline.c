@@ -1,5 +1,5 @@
 /**
- * aec_nr_pipeline.c — Linear AEC -> NR -> RES pipeline (AEC v3.8.2 API).
+ * aec_nr_pipeline.c — Linear AEC -> NR -> RES pipeline (AEC v3.10.4 API).
  *
  * Three-stage speech enhancement (HPF is internal to AEC):
  *   Stage 1: Linear AEC (PBFDKF + shadow, internal HPF, RES skipped)
@@ -22,7 +22,7 @@
 #include <string.h>
 #include <math.h>
 
-/* AEC v3.8.2 — single header for both Aec + ResFilter + Complex types.
+/* AEC v3.10.4 — single header for both Aec + ResFilter + Complex types.
  * HPF is built into AEC (enable_highpass=1 default), so no external HPF. */
 #include "aec.h"
 #include "res_filter.h"
@@ -81,7 +81,7 @@ static void build_res_cfg(const AecConfig* cfg, int hop, int blk, int K,
 }
 
 static void print_usage(const char* prog) {
-    printf("Linear AEC -> NR -> RES Pipeline (AEC v3.8.2)\n");
+    printf("Linear AEC -> NR -> RES Pipeline (AEC v3.10.4)\n");
     printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [preset] [options]\n\n", prog);
     printf("Presets: mild, balanced (default), aggressive, maximum\n");
     printf("Options:\n");
@@ -127,7 +127,7 @@ int main(int argc, char* argv[]) {
     int n  = (mr->info.num_samples < rr->info.num_samples)
               ? mr->info.num_samples : rr->info.num_samples;
 
-    printf("Linear AEC -> NR -> RES Pipeline (AEC v3.8.2)\n");
+    printf("Linear AEC -> NR -> RES Pipeline (AEC v3.10.4)\n");
     printf("=============================================\n");
     printf("Input:  %s (%d samples, %.2fs)\n", mic_path, n, (float)n / sr);
     printf("Ref:    %s\n", ref_path);
