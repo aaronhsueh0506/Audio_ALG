@@ -335,8 +335,10 @@ def train(args):
                          dropout=dropout).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999),
                                   weight_decay=weight_decay)
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimizer, lr_lambda=lambda step: 1.0 / (1.0 + 5e-5 * step)
+    # Cosine annealing: lr 從 lr 衰到 lr*0.01, 跨整個訓練 (epochs × steps_per_epoch)
+    total_steps = epochs * len(train_loader)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=total_steps, eta_min=lr * 0.01
     )
 
     gamma             = cfg.getfloat('training', 'gamma',             fallback=0.5)
