@@ -36,8 +36,8 @@ def read_words(path):
     return list(struct.unpack_from(f"<{len(data)//2}H", data))
 
 
-def decode_16bit(words, zn_order="z_hi"):
-    """zn_order: 'z_hi' (我們的格式: z 在高 byte) 或 'z_lo' (z 在低 byte)"""
+def decode_16bit(words, zn_order="z_lo"):
+    """zn_order: 'z_lo' (我們的格式: z 在低 byte, nz 在高 byte) 或 'z_hi' (相反)"""
     runs = []
     i = 0
     while i < len(words):
@@ -54,9 +54,9 @@ def decode_16bit(words, zn_order="z_hi"):
     return runs
 
 
-def decode_32bit(words, zn_order="z_hi", word_order="lo_first"):
-    """zn_order: 'z_hi' (z 在高 16-bit) 或 'z_lo' (z 在低 16-bit)
-    word_order: 'lo_first' (我們的格式: lo word 先) 或 'hi_first'"""
+def decode_32bit(words, zn_order="z_lo", word_order="lo_first"):
+    """zn_order: 'z_lo' (我們的格式: z 在低 16-bit) 或 'z_hi' (相反)
+    word_order: 'lo_first' (lo word 先讀) 或 'hi_first'"""
     runs = []
     i = 0
     while i + 1 < len(words):
@@ -249,8 +249,8 @@ def main():
             else:
                 print(f"[PASS] 找到 {len(matches)} 個能正確 decode 的格式：")
                 for zn, wo, n_runs in matches:
-                    our_fmt = (args.bit == 16 and zn == "z_hi") or \
-                              (args.bit == 32 and zn == "z_hi" and wo == "lo_first")
+                    our_fmt = (args.bit == 16 and zn == "z_lo") or \
+                              (args.bit == 32 and zn == "z_lo" and wo == "lo_first")
                     flag = "  ← 我們的格式" if our_fmt else ""
                     if args.bit == 16:
                         print(f"  zn_order={zn}{flag} ({n_runs} headers)")

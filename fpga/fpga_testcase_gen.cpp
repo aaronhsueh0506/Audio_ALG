@@ -28,15 +28,25 @@ static void distribute(int* out, int bins, int total, int minv, int cap) {
 // =====================================================
 // gen() — canonical zero-RLE testcase generator
 //
+// Header layout (16-bit, uint16 LE):
+//   byte[0] = z  (low byte)
+//   byte[1] = nz (high byte)
+//   uint16 value = (nz << 8) | z       e.g. z=27,nz=0 → V=0x001B → 檔案 "1b 00"
+//
+// Header layout (32-bit, two uint16 LE words):
+//   word[0] = z  (low 16 bits)
+//   word[1] = nz (high 16 bits)
+//   uint32 value = (nz << 16) | z
+//
 // 支援 4 種 case：
-//   Case 1 (start=0, end=N): 0xZZNN N...  (一般 run)
-//   Case 2 (start=N, end=N): 0x00NN N...  (z=0 first header)
-//   Case 3 (start=0, end=0): ...0xZZ00    (trailing zeros，可含 split)
-//   Case 4 (start=N, end=0): 0x00NN ... 0xZZ00
+//   Case 1 (start=0, end=N): 0xNNZZ N...  (一般 run)
+//   Case 2 (start=N, end=N): 0xNN00 N...  (z=0 first header)
+//   Case 3 (start=0, end=0): ...0x00ZZ    (trailing zeros，可含 split)
+//   Case 4 (start=N, end=0): 0xNN00 ... 0x00ZZ
 //
 // 規則：
 //   - 非 trailing 的 split (z=zmax, nz=0) 後面必須有 nz>0 的 final。
-//   - 只有第一個 header 可以 z=0 (0x00NN)，不允許 0x0000。
+//   - 只有第一個 header 可以 z=0 (0xNN00)，不允許 0x0000。
 //   - Trailing zeros: S_trail 個 split (z=zmax,nz=0) + 1 個 final (z=r_trail,nz=0)，
 //     其中 r_trail in [1, zmax-1] (確保不是 zmax，避免混淆 split)。
 //
@@ -239,13 +249,15 @@ int gen(int raw_size, int encode_size, int bit, FILE* raw_fp, FILE* enc_fp) {
     uint16_t* raw_buf = (uint16_t*)malloc((raw_size  + 1) * sizeof(uint16_t));
     uint16_t* enc_buf = (uint16_t*)malloc((encode_size + 1) * sizeof(uint16_t));
 
-    // Step 1: zero_start header (z=0, nz=nz_first) — 0x00NN
+    // Step 1: zero_start header (z=0, nz=nz_first) — 0xNN00
+    // 16-bit: V = (nz<<8) | z  → 高 byte=nz, 低 byte=z
+    // 32-bit: lo word=z, hi word=nz
     if (nz_first > 0) {
         if (bit == 16) {
-            enc_buf[enc_len++] = (uint16_t)(nz_first);   // hi=0x00, lo=NN
+            enc_buf[enc_len++] = (uint16_t)(nz_first << 8);  // z=0 in lo byte, nz in hi byte
         } else {
-            enc_buf[enc_len++] = (uint16_t)(nz_first);   // lo word: nz
-            enc_buf[enc_len++] = 0;                       // hi word: z=0
+            enc_buf[enc_len++] = 0;                          // lo word: z=0
+            enc_buf[enc_len++] = (uint16_t)(nz_first);       // hi word: nz
         }
         for (int j = 0; j < nz_first; j++) {
             uint16_t v = (uint16_t)(rand() % 0xFFFE + 1);
@@ -261,22 +273,20 @@ int gen(int raw_size, int encode_size, int bit, FILE* raw_fp, FILE* enc_fp) {
             for (int j = 0; j < zmax; j++)
                 raw_buf[raw_len++] = 0;
             if (bit == 16) {
-                enc_buf[enc_len++] = (uint16_t)(zmax << 8);
+                enc_buf[enc_len++] = (uint16_t)(zmax);       // z in lo byte, nz=0 in hi byte
             } else {
-                uint32_t w = (uint32_t)zmax << 16;
-                enc_buf[enc_len++] = (uint16_t)(w & 0xFFFF);
-                enc_buf[enc_len++] = (uint16_t)(w >> 16);
+                enc_buf[enc_len++] = (uint16_t)(zmax);       // lo word: z=zmax
+                enc_buf[enc_len++] = 0;                       // hi word: nz=0
             }
         }
         // 1 final header: z=ri[i], nz=nzh[i]
         for (int j = 0; j < ri[i]; j++)
             raw_buf[raw_len++] = 0;
         if (bit == 16) {
-            enc_buf[enc_len++] = (uint16_t)((ri[i] << 8) | nzh[i]);
+            enc_buf[enc_len++] = (uint16_t)(((uint16_t)nzh[i] << 8) | (uint16_t)ri[i]);
         } else {
-            uint32_t w = ((uint32_t)ri[i] << 16) | (uint32_t)nzh[i];
-            enc_buf[enc_len++] = (uint16_t)(w & 0xFFFF);
-            enc_buf[enc_len++] = (uint16_t)(w >> 16);
+            enc_buf[enc_len++] = (uint16_t)(ri[i]);          // lo word: z
+            enc_buf[enc_len++] = (uint16_t)(nzh[i]);         // hi word: nz
         }
         // nzh[i] nonzero payload
         for (int j = 0; j < nzh[i]; j++) {
@@ -291,20 +301,18 @@ int gen(int raw_size, int encode_size, int bit, FILE* raw_fp, FILE* enc_fp) {
         for (int k = 0; k < S_trail; k++) {
             for (int j = 0; j < zmax; j++) raw_buf[raw_len++] = 0;
             if (bit == 16) {
-                enc_buf[enc_len++] = (uint16_t)(zmax << 8);
+                enc_buf[enc_len++] = (uint16_t)(zmax);       // z in lo byte, nz=0 in hi byte
             } else {
-                uint32_t w = (uint32_t)zmax << 16;
-                enc_buf[enc_len++] = (uint16_t)(w & 0xFFFF);
-                enc_buf[enc_len++] = (uint16_t)(w >> 16);
+                enc_buf[enc_len++] = (uint16_t)(zmax);       // lo word: z=zmax
+                enc_buf[enc_len++] = 0;                       // hi word: nz=0
             }
         }
         for (int j = 0; j < r_trail; j++) raw_buf[raw_len++] = 0;
         if (bit == 16) {
-            enc_buf[enc_len++] = (uint16_t)(r_trail << 8);  // nz=0
+            enc_buf[enc_len++] = (uint16_t)(r_trail);        // z in lo byte, nz=0 in hi byte
         } else {
-            uint32_t w = (uint32_t)r_trail << 16;
-            enc_buf[enc_len++] = (uint16_t)(w & 0xFFFF);
-            enc_buf[enc_len++] = (uint16_t)(w >> 16);
+            enc_buf[enc_len++] = (uint16_t)(r_trail);        // lo word: z
+            enc_buf[enc_len++] = 0;                           // hi word: nz=0
         }
     }
 
@@ -322,13 +330,12 @@ int gen(int raw_size, int encode_size, int bit, FILE* raw_fp, FILE* enc_fp) {
             int z, nz;
             if (bit == 16) {
                 uint16_t w = enc_buf[ei++];
-                z = (w >> 8) & 0xFF;
-                nz = w & 0xFF;
+                z  = w & 0xFF;            // z 在低 byte
+                nz = (w >> 8) & 0xFF;     // nz 在高 byte
             } else {
                 uint32_t lo = enc_buf[ei++], hi = enc_buf[ei++];
-                uint32_t w  = (hi << 16) | lo;
-                z  = (int)((w >> 16) & 0xFFFF);
-                nz = (int)(w & 0xFFFF);
+                z  = (int)(lo & 0xFFFF);  // lo word = z
+                nz = (int)(hi & 0xFFFF);  // hi word = nz
             }
             for (int j = 0; j < z;  j++) dec[dec_len++] = 0;
             for (int j = 0; j < nz; j++) dec[dec_len++] = enc_buf[ei++];
