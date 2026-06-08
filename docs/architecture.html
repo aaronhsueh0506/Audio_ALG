@@ -180,20 +180,18 @@
   <text x="40" y="60" font-size="14" font-weight="600" fill="#1e40af">mic[n]</text>
   <line x1="80" y1="55" x2="140" y2="55" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
 
-  <!-- ref input -->
+  <!-- ref input (no HPF — far-end HPF is OFF; only the mic path is high-passed) -->
   <text x="40" y="200" font-size="14" font-weight="600" fill="#1e40af">ref[n]</text>
-  <line x1="80" y1="195" x2="140" y2="195" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
 
-  <!-- HPF mic -->
+  <!-- HPF mic only -->
   <rect x="145" y="35" width="80" height="40" rx="6" fill="#94a3b8"/>
-  <text x="185" y="60" font-size="13" fill="white" text-anchor="middle" font-weight="600">HPF</text>
-  <!-- HPF ref -->
-  <rect x="145" y="175" width="80" height="40" rx="6" fill="#94a3b8"/>
-  <text x="185" y="200" font-size="13" fill="white" text-anchor="middle" font-weight="600">HPF</text>
+  <text x="185" y="53" font-size="13" fill="white" text-anchor="middle" font-weight="600">HPF</text>
+  <text x="185" y="68" font-size="9" fill="white" text-anchor="middle">mic only</text>
 
-  <!-- arrows to AEC -->
+  <!-- arrows to AEC: mic via HPF, ref direct (no HPF) -->
   <line x1="225" y1="55" x2="290" y2="100" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
-  <line x1="225" y1="195" x2="290" y2="160" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <line x1="80" y1="195" x2="290" y2="160" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
+  <text x="120" y="188" font-size="9" fill="#94a3b8">ref 不經 HPF</text>
 
   <!-- AEC block -->
   <rect x="295" y="80" width="160" height="100" rx="8" fill="#f97316"/>
@@ -240,7 +238,7 @@
 <div class="key-point">
   <strong>關鍵點（echo-aware joint 設計）：</strong>
   <ol style="margin: 4px 0 0 20px;">
-    <li>HPF 同時對 mic 和 ref 做（保持相位一致）</li>
+    <li>HPF <strong>只對 mic path</strong> 做；ref（far-end）<strong>不經 HPF</strong>（far-end HPF 預設 OFF，downstream Saturation / DelayEst 吃原始 ref）</li>
     <li>AEC 只做線性消除，輸出 <code>E(f)</code> + <code>AecResContext</code>（殘響回音功率 R²、res_gain、CNG、ERLE、DT 指標）</li>
     <li>NR 把 R² 折進雜訊地板：<code>ξ = S²/(N²+R²)</code>，用<strong>一個</strong> MMSE-LSA gain 同時壓雜訊＋殘響回音（無 re-FFT）</li>
     <li>per-bin 近端保留 floor（<code>ne_floor=0.4</code>，gate <code>= res_gain·(1−R²/|E|²)</code>）在「沒有回音」的頻段把 gain 抬回 1.0 → 保住近端語音</li>
@@ -298,11 +296,11 @@
   <tr><td>類型</td><td>2nd-order Butterworth (IIR)</td></tr>
   <tr><td>截止頻率</td><td>80 Hz (−3 dB)</td></tr>
   <tr><td>實作</td><td>Direct Form II Transposed</td></tr>
-  <tr><td>位置</td><td>應用層 (Audio_ALG/lib/hpf)，AEC module 不含</td></tr>
+  <tr><td>位置</td><td>mic-path HPF 在 AEC module（<code>lib/aec</code> config 預設 ON）；另有獨立 C 元件 <code>lib/hpf</code> 供嵌入式應用層使用</td></tr>
 </table>
 
 <div class="note">
-<strong>注意：</strong>v2.0.0 之後 HPF 從 AEC module 移到應用層，由 pipeline 對 mic / ref 各自呼叫一次。
+<strong>注意：</strong>HPF <strong>只對 mic path</strong> 做一次；<strong>ref（far-end）不經 HPF</strong>（ref-path HPF 在 v3.19 retired，<code>lib/aec</code> config 預設 mic-path HPF=ON / ref HPF=OFF）。downstream Saturation / DelayEst 吃原始 ref。
 </div>
 </div>
 
