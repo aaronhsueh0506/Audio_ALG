@@ -80,20 +80,40 @@ instead of the DSP function — no change to the front-end transform or back-end
 The separated RES-after-NR topology is rebuilt on the AEC3 freq seam (the standalone `ResFilter` retired in
 v3.21 is **not** revived). What shipped:
 
-- **AEC seam (`AecResContext`)**: 3 additive fields — `error_spec` (windowed linear E(f)), `res_gain`
-  (the per-frame AEC3 `SuppressionGain` G_res), `comfort_noise` (N²). `_aec3_post` stashes them when
-  `return_res_context=True`, and now returns the **true linear** residual when `enable_res=False` (it used to
-  apply suppression even in context mode → the old separated pipeline was silently double-suppressing). The
-  default production path (`enable_res=True`, no context) is **byte-equal** — verified peak|Δ|=0.0.
-- **Pipeline (`aec_nr_pipeline.py`)**: `run_res` rewritten as one freq multiply `S(f)=E(f)·G_nr(f)·G_res(f)`
-  (+CNG) → single sqrt-Hann OLA, reusing the AEC's tuned gain (no ResFilter). Two new modes:
+- **AEC seam (`AecResContext`)**: 4 additive fields — `error_spec` (windowed linear E(f)), `res_gain`
+  (the per-frame AEC3 `SuppressionGain` G_res), `comfort_noise` (N²), `r2` (the residual-echo PSD R²,
+  int16²-scaled). `_aec3_post` stashes them when `return_res_context=True`, and now returns the **true
+  linear** residual when `enable_res=False` (it used to apply suppression even in context mode → the old
+  separated pipeline was silently double-suppressing). The default production path (`enable_res=True`, no
+  context) is **byte-equal** — verified peak|Δ|=0.0.
+- **Pipeline (`aec_nr_pipeline.py`)**: `run_res` rewritten as one freq multiply
+  `S(f)=E(f)·G(f)` (+CNG) → single sqrt-Hann OLA, reusing the AEC's tuned gain (no ResFilter). Modes:
   - `linear` — NR on the time-domain linear output, then freq RES (reference for A/B).
-  - `freq` (**default**) — `run_nr_spectrum` feeds **E(f)** straight to `NR.denoise_spectrum` (no re-FFT),
-    then freq RES. This is the single-transform chain: AEC analysis FFT (internal) → NR + RES in freq →
-    one IFFT+OLA. No inter-stage round-trips.
+  - `freq` (**default**) — `run_nr_spectrum_echo_aware` feeds **E(f)** straight to `NR.denoise_spectrum`
+    (no re-FFT) with **R² folded into the noise floor** (see joint section below), then a per-bin near-end
+    floor. Single-transform chain: AEC analysis FFT (internal) → NR + RES in freq → one IFFT+OLA.
 - **A/B (3-case smoke)**: `freq ≈ linear` (RMS within 0.1 dB, waveform corr 0.985–0.994 — pure transform
   rounding, as predicted). Separated vs classic: echo −0.6 dB deeper (farend), near-end preservation
   identical (0.07 dB), doubletalk corr 0.991. 800-case AECMOS A/B: `pipelines/rebench_sep_vs_classic.py`.
+
+### Joint echo-aware gain + near-end floor (current shipped default, 2026-06-08)
+The naive cascade (`AEC → NR → RES` each suppressing in turn) cost **NE deg −0.49** on 800-case: in the
+pure near-end scenario (no echo) the NR still applies gain<1 and damages near-end speech, with nothing to
+gain. The fix folds the two suppressors into **one per-bin gain**:
+- **Echo-aware joint NR** (`run_nr_spectrum_echo_aware`): R²/`_PSD_SCALE` is added to NR's noise PSD so the
+  a-priori SNR becomes `ξ = S²/(N²+R²)`. One MMSE-LSA gain `G(f)` suppresses background noise **and**
+  residual echo together — no separate `G_res` multiply, so no double-pass leakage.
+- **Per-bin near-end floor** (`run_res`, `ne_floor=0.4`, `ne_gate='both'`): where there is no echo, lift
+  `G(f)` back toward 1.0 to preserve near-end. The gate is `no_echo = res_gain · (1 − R²/|E|²)` — it trusts
+  the AEC's own tuned suppression gain (`res_gain`) AND the echo fraction; using R² alone leaked FS echo
+  (R² under-estimates the true FS residual → echo_frac<1 → spurious lift), the `both` gate fixed it.
+  `lift = ne_floor · no_echo`, `G = (1−lift)·G + lift`.
+- **800-case (full, integrated harness) vs classic cascade**: NE deg **3.466 → 4.015 (+0.549)**,
+  FS_static/movement echo **+0.345 / +0.422**, DT deg **+0.266 / +0.297**; trade DT echo −0.23 / −0.17
+  (still >3.76). Renderer: `pipelines/rebench_joint.py`; CLI knobs `--ne-floor` (0.4) / `--ne-gate` (both).
+- **Rejected enhancement (b)**: freezing the MCRA noise update where R² is large (so it doesn't learn echo
+  as noise) was A/B'd at ne_floor=0.4/both — neutral-to-slightly-negative (DT echo flat, NE/DT deg −0.01),
+  discarded. The noise-floor fold already captures the useful part.
 
 ### Resolved risks (were open in the original design)
 - NR's `denoise_spectrum` is a **batch freq-in API** (magnitude/phase arrays) that does no windowing itself,

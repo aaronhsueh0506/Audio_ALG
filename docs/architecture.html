@@ -209,22 +209,22 @@
 
   <!-- NR block -->
   <rect x="525" y="80" width="160" height="100" rx="8" fill="#10b981"/>
-  <text x="605" y="115" font-size="15" fill="white" text-anchor="middle" font-weight="700">NR</text>
-  <text x="605" y="135" font-size="11" fill="white" text-anchor="middle">MMSE-LSA</text>
-  <text x="605" y="152" font-size="11" fill="white" text-anchor="middle">MCRA noise est.</text>
-  <text x="605" y="169" font-size="11" fill="white" text-anchor="middle">SPP gating</text>
+  <text x="605" y="112" font-size="15" fill="white" text-anchor="middle" font-weight="700">NR (joint)</text>
+  <text x="605" y="131" font-size="11" fill="white" text-anchor="middle">MMSE-LSA</text>
+  <text x="605" y="148" font-size="11" fill="white" text-anchor="middle">ξ=S²/(N²+R²)</text>
+  <text x="605" y="165" font-size="11" fill="white" text-anchor="middle">R² 折進雜訊</text>
 
   <!-- arrow to RES -->
   <line x1="685" y1="130" x2="750" y2="130" stroke="#64748b" stroke-width="2" marker-end="url(#arrow)"/>
-  <text x="717" y="120" font-size="11" fill="#475569" text-anchor="middle">ŝ[n]</text>
-  <text x="717" y="148" font-size="10" fill="#475569" text-anchor="middle">+ G_NR[k]</text>
+  <text x="717" y="122" font-size="11" fill="#475569" text-anchor="middle">G(f)</text>
+  <text x="717" y="148" font-size="10" fill="#475569" text-anchor="middle">joint gain</text>
 
   <!-- RES block -->
   <rect x="755" y="80" width="120" height="100" rx="8" fill="#8b5cf6"/>
-  <text x="815" y="115" font-size="15" fill="white" text-anchor="middle" font-weight="700">RES</text>
-  <text x="815" y="135" font-size="11" fill="white" text-anchor="middle">+ CNG</text>
-  <text x="815" y="152" font-size="11" fill="white" text-anchor="middle">soft gate</text>
-  <text x="815" y="169" font-size="11" fill="white" text-anchor="middle">post-filter</text>
+  <text x="815" y="112" font-size="15" fill="white" text-anchor="middle" font-weight="700">RES floor</text>
+  <text x="815" y="131" font-size="11" fill="white" text-anchor="middle">近端保留</text>
+  <text x="815" y="148" font-size="11" fill="white" text-anchor="middle">ne_floor=0.4</text>
+  <text x="815" y="165" font-size="11" fill="white" text-anchor="middle">+ CNG</text>
 
   <!-- output -->
   <line x1="875" y1="130" x2="900" y2="130" stroke="#64748b" stroke-width="2"/>
@@ -238,12 +238,13 @@
 </div>
 
 <div class="key-point">
-  <strong>關鍵點：</strong>
+  <strong>關鍵點（echo-aware joint 設計）：</strong>
   <ol style="margin: 4px 0 0 20px;">
     <li>HPF 同時對 mic 和 ref 做（保持相位一致）</li>
-    <li>AEC 只做線性消除，輸出 error + context（不含 RES）</li>
-    <li>NR 處理 error 訊號，輸出去噪結果與 per-bin gain</li>
-    <li>RES 用 NR 的 gain 修正 echo PSD，做最後一層 residual 抑制</li>
+    <li>AEC 只做線性消除，輸出 <code>E(f)</code> + <code>AecResContext</code>（殘響回音功率 R²、res_gain、CNG、ERLE、DT 指標）</li>
+    <li>NR 把 R² 折進雜訊地板：<code>ξ = S²/(N²+R²)</code>，用<strong>一個</strong> MMSE-LSA gain 同時壓雜訊＋殘響回音（無 re-FFT）</li>
+    <li>per-bin 近端保留 floor（<code>ne_floor=0.4</code>，gate <code>= res_gain·(1−R²/|E|²)</code>）在「沒有回音」的頻段把 gain 抬回 1.0 → 保住近端語音</li>
+    <li>整路共享一次 sqrt-Hann FFT/OLA，三階段都是可替換的 freq-in/freq-out block（NN seam）</li>
   </ol>
 </div>
 
@@ -574,6 +575,11 @@ delta_ratio &lt; 0.3
 
 <div class="panel">
 <p>NR 處理 AEC 輸出的 error 訊號，移除背景噪音同時保留近端語音。三大組件：MCRA + SPP + MMSE-LSA。</p>
+<div class="note" style="margin-top:0;">
+  <strong>整合 pipeline（joint echo-aware）：</strong>NR 直接吃 AEC 的頻域 <code>E(f)</code>（無 re-FFT），
+  並把 AEC 估的殘響回音功率 R² 折進先驗 SNR：<code>ξ = S²/(N²+R²)</code>，讓同一個 MMSE-LSA gain
+  一次壓掉雜訊＋殘響回音。底下的 MCRA/SPP/MMSE-LSA 是 NR 單獨運作時的演算法本體。
+</div>
 
 <div class="figure">
 <svg viewBox="0 0 800 280" xmlns="http://www.w3.org/2000/svg">
@@ -861,62 +867,54 @@ G<sub>RES</sub>[k] = clamp((enr<sub>s</sub> − ENR) / (enr<sub>s</sub> − enr<
 
 <h3>6.3 整路 Pipeline Blind Test 成績</h3>
 
-<p style="margin: 8px 0 4px;">測試集：AEC Challenge Interspeech 2021 blind test (800 cases, balanced preset, FL=512)</p>
+<p style="margin: 8px 0 4px;">測試集：AEC Challenge Interspeech 2021 blind test (800 cases, balanced)，本地 AECMOS
+ONNX，整合 pipeline harness（含 250 ms 全域 pre-align，echo↑ deg↑）。比較<strong>舊串接
+(classic：AEC 內建 RES → 時域 NR)</strong> 與<strong>現行 joint echo-aware</strong>：</p>
 
 <table>
-  <tr><th rowspan="2">指標</th><th colspan="2">AECMOS (本地 ONNX)</th><th colspan="2">DNSMOS (整路品質)</th></tr>
-  <tr><th>AEC-only</th><th>AEC + NR + RES</th><th>AEC-only</th><th>AEC + NR + RES</th></tr>
-  <tr>
-    <td>FS echo↑</td>
-    <td style="text-align:center">3.615</td>
-    <td style="text-align:center">3.568</td>
-    <td style="text-align:center">SIG 2.007 / BAK 3.217</td>
-    <td style="text-align:center">SIG 2.118 / BAK <strong>3.730</strong></td>
-  </tr>
-  <tr>
-    <td>DT echo↑</td>
-    <td style="text-align:center">4.232</td>
-    <td style="text-align:center"><strong>4.339</strong></td>
-    <td style="text-align:center">SIG 2.461 / BAK 3.380</td>
-    <td style="text-align:center">SIG 2.510 / BAK <strong>3.738</strong></td>
-  </tr>
-  <tr>
-    <td>DT deg↑</td>
-    <td style="text-align:center">2.095</td>
-    <td style="text-align:center"><strong>2.314</strong></td>
-    <td style="text-align:center" colspan="2">—</td>
-  </tr>
-  <tr>
-    <td>NE deg↑</td>
-    <td style="text-align:center">3.975</td>
-    <td style="text-align:center">3.488</td>
-    <td style="text-align:center">SIG 3.430 / BAK 3.892</td>
-    <td style="text-align:center">SIG 3.228 / BAK 3.926</td>
-  </tr>
+  <tr><th>指標 (AECMOS)</th><th>classic 串接</th><th>joint echo-aware</th><th>變化</th></tr>
+  <tr><td>FS_static echo↑</td><td style="text-align:center">2.739</td><td style="text-align:center"><strong>3.084</strong></td><td style="text-align:center"><strong>+0.345</strong></td></tr>
+  <tr><td>FS_movement echo↑</td><td style="text-align:center">2.686</td><td style="text-align:center"><strong>3.108</strong></td><td style="text-align:center"><strong>+0.422</strong></td></tr>
+  <tr><td>NE deg↑</td><td style="text-align:center">3.466</td><td style="text-align:center"><strong>4.015</strong></td><td style="text-align:center"><strong>+0.549</strong></td></tr>
+  <tr><td>DT_static deg↑</td><td style="text-align:center">2.420</td><td style="text-align:center"><strong>2.686</strong></td><td style="text-align:center"><strong>+0.266</strong></td></tr>
+  <tr><td>DT_movement deg↑</td><td style="text-align:center">2.448</td><td style="text-align:center"><strong>2.745</strong></td><td style="text-align:center"><strong>+0.297</strong></td></tr>
+  <tr><td>DT_static echo↑</td><td style="text-align:center">4.029</td><td style="text-align:center">3.799</td><td style="text-align:center">−0.230</td></tr>
+  <tr><td>DT_movement echo↑</td><td style="text-align:center">3.933</td><td style="text-align:center">3.763</td><td style="text-align:center">−0.170</td></tr>
 </table>
 
 <div class="key-point">
-<strong>NR 對整路的貢獻：</strong>
+<strong>joint echo-aware vs 舊串接：</strong>
 <ul style="margin: 6px 0 0 20px;">
-  <li><strong>BAK +0.5</strong>（背景噪音品質大幅改善）</li>
-  <li><strong>DT deg +0.22</strong>（雙講語音保護）</li>
-  <li><strong>DT echo +0.11</strong>（NR 順帶幫忙壓 echo）</li>
-  <li>Trade-off: NE deg / NE SIG 略降（NR 在純近端有微量處理痕跡）</li>
+  <li><strong>NE deg +0.549</strong>（3.47 → 4.015）：per-bin floor 在無回音處不壓近端，修好了串接版 NR 過度壓純近端的掉分</li>
+  <li><strong>FS echo +0.35 / +0.42</strong>：一個 joint gain 同時壓殘響回音＋雜訊，無 double-pass 漏音</li>
+  <li><strong>DT deg +0.27 / +0.30</strong>：雙講近端語音保護</li>
+  <li>Trade-off：DT echo 微降 0.17–0.23（Pareto，仍 &gt;3.76）</li>
 </ul>
 </div>
 
-<h3>6.4 AEC 各 Preset 收斂後 ERLE 與分數</h3>
+<div class="note">
+<strong>harness 注意：</strong>此為<strong>整合 pipeline</strong> 的相對 A/B。<strong>AEC 模組單獨</strong>的
+ship 數字（FS_movement 3.512 &gt; 3.5 硬門檻、NE deg 4.047、DT echo 4.08–4.20）用的是 AEC repo
+自己的 bench，pre-align 不同 → FS 絕對值不可與本表直接互比，見
+<a href="../../AEC/README.md">AEC/README.md</a>。
+</div>
+
+<h3>6.4 AEC Preset — 單一 Pareto 旋鈕</h3>
+
+<p style="margin: 8px 0 4px;">v3.22.5 三個 preset <strong>只差</strong>一個參數
+<code>min_gain_floor_far_active_db</code>（far-active 殘響 gain 地板，權衡回音消除 ↔ 近端保留）。
+數據為 AEC 模組單獨的 800-case bench（AECMOS ONNX，FL=832/52 ms）：</p>
 
 <table>
-  <tr><th>Preset</th><th>平均 ERLE</th><th>FS echo↑</th><th>DT echo↑</th><th>DT deg↑</th><th>推薦場景</th></tr>
-  <tr><td><strong>mild</strong></td><td>16-18 dB</td><td>3.236</td><td>3.923</td><td>2.338</td><td>會議、近端品質優先</td></tr>
-  <tr><td><strong>balanced</strong></td><td>18-22 dB</td><td>3.577</td><td>4.230</td><td>2.134</td><td><strong>預設、通用場景</strong></td></tr>
-  <tr><td><strong>aggressive</strong></td><td>19-23 dB</td><td>3.687</td><td>4.357</td><td>2.070</td><td>高 echo 環境</td></tr>
-  <tr><td><strong>maximum</strong></td><td>20-25 dB</td><td>3.783</td><td>4.473</td><td>2.014</td><td>極端 echo / demo</td></tr>
+  <tr><th>Preset</th><th>floor</th><th>FS_mv echo↑</th><th>NE deg↑</th><th>DT echo↑</th><th>DT deg↑</th><th>特性 / 場景</th></tr>
+  <tr><td><strong>gentle</strong></td><td>−20 dB</td><td colspan="4" style="text-align:center">近端優先 — 保留更多近端、回音漏更多（FS 刻意低於 3.5）</td><td>近端品質優先</td></tr>
+  <tr><td><strong>balanced ★</strong></td><td>−28 dB</td><td>3.512</td><td>4.047</td><td>4.20</td><td>2.16</td><td><strong>預設、通用，四項 ship bar 全過</strong></td></tr>
+  <tr><td><strong>aggressive</strong></td><td>−38 dB</td><td colspan="4" style="text-align:center">回音優先 — 壓更深、近端略損（deg 仍 &gt;2.0，高於 AEC3）</td><td>高 echo 環境</td></tr>
 </table>
 
 <p style="font-size: 12px; color: var(--muted); margin-top: 8px;">
-  數據：800-case AEC Challenge blind test，本地 AECMOS ONNX (Run_1663915512_Stage_0)，FL=512。
+  ship bar：FS_movement echo &gt; 3.5（primary）、DT echo &gt; 4、DT deg &gt; 2、NE deg ≥ 4。
+  完整 ours / AEC3 / Speex 三方對照見 <a href="../../AEC/README.md">AEC/README.md</a>。
 </p>
 
 <h3>6.5 NR 降噪等級</h3>

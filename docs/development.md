@@ -12,23 +12,23 @@
 
 ```bash
 # 更新 NR 到最新
-git submodule update --remote nr
-git add nr
+git submodule update --remote lib/nr
+git add lib/nr
 git commit -m "update: NR submodule"
 
 # 更新 AEC 到最新
-git submodule update --remote aec
-git add aec
+git submodule update --remote lib/aec
+git add lib/aec
 git commit -m "update: AEC submodule"
 ```
 
 ### 鎖定特定版本
 
 ```bash
-cd nr
+cd lib/nr
 git checkout <specific-commit-hash>
-cd ..
-git add nr
+cd ../..
+git add lib/nr
 git commit -m "pin: NR to version xxx"
 ```
 
@@ -36,9 +36,9 @@ git commit -m "pin: NR to version xxx"
 
 | 目錄 | 說明 |
 |------|------|
-| `nr/` | NR submodule (CVNR) |
-| `aec/` | AEC submodule |
-| `shared/` | 共享工具代碼 |
-| `pipelines/` | 串接處理鏈 |
+| `lib/nr/` | NR submodule (CVNR) |
+| `lib/aec/` | AEC submodule |
+| `pipelines/` | AEC + NR + RES 整合處理鏈（joint echo-aware）|
+| `ainr/` | AI 降噪模型 |
 | `docs/` | 文檔 |
 | `scripts/` | 管理腳本 |
