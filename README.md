@@ -79,9 +79,9 @@ ifft/fft 來回**。關鍵設計是 **echo-aware joint gain**：把 AEC 估的�
 近端保留 floor 在「沒有回音」的頻段把 gain 抬回 1.0。
 
 ```
-mic ─►HPF─┐
+mic ─►HPF─┐                                          (HPF 只在 mic path)
           ├─► Linear AEC (PBFDKF + Shadow) ─► E(f) + AecResContext{ R², res_gain, CNG }
-ref ─►HPF─┘            (時域進，頻域出)              │
+ref ──────┘   (ref 不經 HPF · 時域進，頻域出)         │
                                                     ▼
                               NR  (MMSE-LSA / MCRA noise est.)
                               ξ = S² / (N² + R²)   ◄── R² 折進雜訊地板
