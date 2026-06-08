@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Render the JOINT freq pipeline over the 800-case corpus (production default).
+"""Render the AEC-alone arm over the 800-case corpus, in the SAME integrated
+harness (estimate_delay pre-align, same cfg/seed/FL) as rebench_joint.py, so the
+two are directly comparable for an "AEC vs AEC+NR" table.
 
-  joint : AEC(linear) -> echo-aware NR(E, R² folded into noise) -> one gain
-          + per-bin echo-gated NE floor (ne_floor=0.4, gate='both')
+  aec_only : AEC(enable_res=True) full output  — its own AEC3 post-filter RES,
+             NO NR stage. The baseline for "what NR adds".
 
-Usage: python3 pipelines/rebench_joint.py <out_dir> [ne_floor] [ne_gate] [limit]
-Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir> --baseline <classic>/scores.json
+Usage: python3 pipelines/rebench_aec_only.py <out_dir> [limit]
+Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir>
 """
 import contextlib
 import io
@@ -20,21 +22,16 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 
 from aec import AecConfig, AecMode                              # noqa: E402
-from pipelines.aec_nr_pipeline import (                         # noqa: E402
-    run_aec_linear, run_nr_spectrum_echo_aware, run_res,
-)
+from pipelines.aec_nr_pipeline import run_aec_classic           # noqa: E402
 from pipelines.rebench_sep_vs_classic import (                  # noqa: E402
-    estimate_delay, CORPUS, SCENARIOS, SR, FL, NR_GAIN,
+    estimate_delay, CORPUS, SCENARIOS, SR, FL,
 )
 
-NE_FLOOR = float(os.environ.get('NE_FLOOR', '0.4'))
-NE_GATE = os.environ.get('NE_GATE', 'both')
 
-
-def _cfg(enable_res):
+def _cfg():
     return AecConfig.from_preset('balanced', sample_rate=SR, mode=AecMode.PBFDKF,
                                  filter_length=FL, enable_shadow=True,
-                                 enable_res=enable_res, enable_cng=True)
+                                 enable_res=True, enable_cng=True)
 
 
 def process(mic_path, lpb_path, out_path):
@@ -52,11 +49,8 @@ def process(mic_path, lpb_path, out_path):
             ref = np.concatenate([np.zeros(d, dtype=np.float32), ref[:n - d]])
     with contextlib.redirect_stdout(io.StringIO()):
         np.random.seed(0)
-        _, ctx = run_aec_linear(mic, ref, _cfg(True))
-        g = run_nr_spectrum_echo_aware(ctx, sr, g_min_db=NR_GAIN)
-        out = run_res(np.zeros(n, dtype=np.float32), g, ctx, _cfg(False),
-                      use_res=False, ne_floor=NE_FLOOR, ne_gate=NE_GATE)
-    sf.write(out_path, out[:n], sr, subtype='FLOAT')
+        out = run_aec_classic(mic, ref, _cfg())            # AEC full output, no NR
+    sf.write(out_path, out[:n].astype(np.float32), sr, subtype='FLOAT')
 
 
 def _job(a):
@@ -72,12 +66,8 @@ def _job(a):
 
 def main():
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    out_dir = sys.argv[1] if len(sys.argv) > 1 else '/tmp/joint800'
-    if len(sys.argv) > 2:
-        globals()['NE_FLOOR'] = float(sys.argv[2])
-    if len(sys.argv) > 3:
-        globals()['NE_GATE'] = sys.argv[3]
-    limit = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    out_dir = sys.argv[1] if len(sys.argv) > 1 else '/tmp/aec_only800'
+    limit = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     workers = int(os.environ.get('REBENCH_WORKERS', '8'))
     os.makedirs(out_dir, exist_ok=True)
     jobs = []
@@ -94,8 +84,7 @@ def main():
             if os.path.exists(lpb):
                 jobs.append((os.path.join(sc_dir, mf), lpb,
                              os.path.join(out_dir, stem + '_ours.wav'), stem))
-    print(f"joint render: {len(jobs)} cases, ne_floor={NE_FLOOR}, gate={NE_GATE}, "
-          f"{workers} workers", flush=True)
+    print(f"aec-only render: {len(jobs)} cases, {workers} workers", flush=True)
     ok = fail = done = 0
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_job, j): j[3] for j in jobs}

@@ -118,25 +118,29 @@ python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav
 
 ### Blind Test 成績（AEC Challenge Interspeech 2021, 800 cases, balanced）
 
-整路 **AECMOS**（本地 ONNX，整合 pipeline harness，含 250 ms 全域 pre-align，echo↑ deg↑）。
-比較**舊串接（classic：AEC 內建 RES → 時域 NR）**與**現行 joint echo-aware**：
+整路 **AECMOS**（本地 ONNX，echo↑ deg↑），**無 harness pre-align** —— 讓 AEC 自己的線上
+`EchoPathDelayEstimator` 對齊（真實情境；offline 全訊號 GCC-PHAT pre-align 是已退役的 crutch，
+會讓 movement 分數偏樂觀）。比較 **有無 NR**（AEC 單獨 vs AEC+NR 完整 pipeline）：
 
-| 指標 | classic 串接 | **joint echo-aware** | 變化 |
-|------|-------------|----------------------|------|
-| FS_static echo↑   | 2.739 | 3.084 | **+0.345** |
-| FS_movement echo↑ | 2.686 | 3.108 | **+0.422** |
-| NE deg↑           | 3.466 | **4.015** | **+0.549** |
-| DT_static deg↑    | 2.420 | 2.686 | **+0.266** |
-| DT_movement deg↑  | 2.448 | 2.745 | **+0.297** |
-| DT_static echo↑   | 4.029 | 3.799 | −0.230 |
-| DT_movement echo↑ | 3.933 | 3.763 | −0.170 |
+| 指標 | AEC（無 NR） | AEC+NR | 變化 |
+|------|-------------|--------|------|
+| FS_static echo↑   | 3.504 | 3.416 | −0.089 |
+| FS_movement echo↑ | 3.471 | 3.390 | −0.081 |
+| NE deg↑           | 4.052 | 4.014 | −0.039 |
+| DT_static echo↑   | 4.203 | 3.970 | −0.233 |
+| DT_static deg↑    | 2.080 | **2.381** | **+0.301** |
+| DT_movement echo↑ | 4.107 | 3.918 | −0.189 |
+| DT_movement deg↑  | 2.193 | **2.469** | **+0.277** |
 
-> **joint echo-aware 修好了舊串接的 NE deg 掉分**：串接版把 NR 排在 AEC 後，NR 在
-> 「沒有回音」的純近端場景仍套 gain 壓近端語音 → NE deg 只剩 3.466。joint 版把 R²
-> 折進雜訊地板＋per-bin floor，無回音處不壓近端 → **NE deg 救回 4.015（+0.549）**，
-> 同時 FS echo（一個 joint gain 壓得更乾淨）與 DT deg 一起提升；代價是 DT echo 微降
-> 0.17–0.23（Pareto，仍 >3.76）。
+> **NR 在 AECMOS 上的貢獻 = 雙講近端保護（DT deg +0.28～0.30）**，代價是 **DT echo −0.19～0.23**。
+> 這是**結構性的 Pareto trade,不是 bug**:在 DT,回音與近端落在同一個 bin —— 保住近端就會漏一點
+> 回音(root cause:joint 用 MMSE-LSA 的 `ξ=Ŝ²/(N²+R²)` gain,DT 回音 bin 的 g≈0.22 ≫ AEC 專用
+> echo gain 0.10,近端把 ξ 灌大壓不下去)。把專用 echo gain 加回去能救 DT echo,但 DT deg 立刻掉回
+> AEC-alone 水準 —— 同一條 Pareto 線。NE deg 幾乎持平(−0.04):AEC 單獨本來就有 4.05,NR 沒有
+> 「救回」什麼。
 >
-> 這是**整合 harness** 的相對 A/B。**AEC 模組單獨的 ship 數字**（FS_movement 3.512 > 3.5
-> 硬門檻、NE deg 4.047、DT echo 4.08–4.20）用的是 AEC repo 自己的 bench，見
-> [lib/aec/README.md](lib/aec/README.md)；兩套 harness 的 pre-align 不同，FS 絕對值不可直接互比。
+> ⚠️ **AECMOS 不量背景噪音抑制** —— 那才是 NR 的本職。本表只呈現 echo/近端的 trade,**看不到 NR
+> 真正的降噪價值**(背景品質 / musical-noise 等需 DNSMOS BAK 或聽感評估)。
+>
+> AEC 模組單獨的完整 ours / AEC3 / Speex 三方對照見 [lib/aec/README.md](lib/aec/README.md)。
+> 渲染器:`pipelines/rebench_aec_only.py`(AEC)、`pipelines/rebench_joint.py`(AEC+NR),皆 `NO_PREALIGN=1`。

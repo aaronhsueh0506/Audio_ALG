@@ -866,35 +866,34 @@ G<sub>RES</sub>[k] = clamp((enr<sub>s</sub> − ENR) / (enr<sub>s</sub> − enr<
 <h3>6.3 整路 Pipeline Blind Test 成績</h3>
 
 <p style="margin: 8px 0 4px;">測試集：AEC Challenge Interspeech 2021 blind test (800 cases, balanced)，本地 AECMOS
-ONNX，整合 pipeline harness（含 250 ms 全域 pre-align，echo↑ deg↑）。比較<strong>舊串接
-(classic：AEC 內建 RES → 時域 NR)</strong> 與<strong>現行 joint echo-aware</strong>：</p>
+ONNX，<strong>無 harness pre-align</strong>（讓 AEC 線上 <code>EchoPathDelayEstimator</code> 自己對齊，
+真實情境；echo↑ deg↑）。比較<strong>有無 NR</strong>（AEC 單獨 vs AEC+NR）：</p>
 
 <table>
-  <tr><th>指標 (AECMOS)</th><th>classic 串接</th><th>joint echo-aware</th><th>變化</th></tr>
-  <tr><td>FS_static echo↑</td><td style="text-align:center">2.739</td><td style="text-align:center"><strong>3.084</strong></td><td style="text-align:center"><strong>+0.345</strong></td></tr>
-  <tr><td>FS_movement echo↑</td><td style="text-align:center">2.686</td><td style="text-align:center"><strong>3.108</strong></td><td style="text-align:center"><strong>+0.422</strong></td></tr>
-  <tr><td>NE deg↑</td><td style="text-align:center">3.466</td><td style="text-align:center"><strong>4.015</strong></td><td style="text-align:center"><strong>+0.549</strong></td></tr>
-  <tr><td>DT_static deg↑</td><td style="text-align:center">2.420</td><td style="text-align:center"><strong>2.686</strong></td><td style="text-align:center"><strong>+0.266</strong></td></tr>
-  <tr><td>DT_movement deg↑</td><td style="text-align:center">2.448</td><td style="text-align:center"><strong>2.745</strong></td><td style="text-align:center"><strong>+0.297</strong></td></tr>
-  <tr><td>DT_static echo↑</td><td style="text-align:center">4.029</td><td style="text-align:center">3.799</td><td style="text-align:center">−0.230</td></tr>
-  <tr><td>DT_movement echo↑</td><td style="text-align:center">3.933</td><td style="text-align:center">3.763</td><td style="text-align:center">−0.170</td></tr>
+  <tr><th>指標 (AECMOS)</th><th>AEC（無 NR）</th><th>AEC+NR</th><th>變化</th></tr>
+  <tr><td>FS_static echo↑</td><td style="text-align:center">3.504</td><td style="text-align:center">3.416</td><td style="text-align:center">−0.089</td></tr>
+  <tr><td>FS_movement echo↑</td><td style="text-align:center">3.471</td><td style="text-align:center">3.390</td><td style="text-align:center">−0.081</td></tr>
+  <tr><td>NE deg↑</td><td style="text-align:center">4.052</td><td style="text-align:center">4.014</td><td style="text-align:center">−0.039</td></tr>
+  <tr><td>DT_static echo↑</td><td style="text-align:center">4.203</td><td style="text-align:center">3.970</td><td style="text-align:center">−0.233</td></tr>
+  <tr><td>DT_static deg↑</td><td style="text-align:center">2.080</td><td style="text-align:center"><strong>2.381</strong></td><td style="text-align:center"><strong>+0.301</strong></td></tr>
+  <tr><td>DT_movement echo↑</td><td style="text-align:center">4.107</td><td style="text-align:center">3.918</td><td style="text-align:center">−0.189</td></tr>
+  <tr><td>DT_movement deg↑</td><td style="text-align:center">2.193</td><td style="text-align:center"><strong>2.469</strong></td><td style="text-align:center"><strong>+0.277</strong></td></tr>
 </table>
 
 <div class="key-point">
-<strong>joint echo-aware vs 舊串接：</strong>
+<strong>NR 的貢獻 = 雙講近端保護（DT deg +0.28～0.30），代價 = DT echo −0.19～0.23：</strong>
 <ul style="margin: 6px 0 0 20px;">
-  <li><strong>NE deg +0.549</strong>（3.47 → 4.015）：per-bin floor 在無回音處不壓近端，修好了串接版 NR 過度壓純近端的掉分</li>
-  <li><strong>FS echo +0.35 / +0.42</strong>：一個 joint gain 同時壓殘響回音＋雜訊，無 double-pass 漏音</li>
-  <li><strong>DT deg +0.27 / +0.30</strong>：雙講近端語音保護</li>
-  <li>Trade-off：DT echo 微降 0.17–0.23（Pareto，仍 &gt;3.76）</li>
+  <li>這是<strong>結構性 Pareto trade,不是 bug</strong>:DT 的回音與近端落在同一 bin,保近端就會漏一點回音。</li>
+  <li>Root cause:joint 用 MMSE-LSA 的 <code>ξ=Ŝ²/(N²+R²)</code> gain,DT 回音 bin 的 g≈0.22 ≫ AEC 專用 echo gain 0.10(近端把 ξ 灌大壓不下去)。加回專用 echo gain 能救 DT echo,但 DT deg 立刻掉回 AEC-alone —— 同一條 Pareto 線。</li>
+  <li>NE deg 幾乎持平(−0.04):AEC 單獨本來就有 4.05,NR 沒有「救回」什麼。</li>
 </ul>
 </div>
 
 <div class="note">
-<strong>harness 注意：</strong>此為<strong>整合 pipeline</strong> 的相對 A/B。<strong>AEC 模組單獨</strong>的
-ship 數字（FS_movement 3.512 &gt; 3.5 硬門檻、NE deg 4.047、DT echo 4.08–4.20）用的是 AEC repo
-自己的 bench，pre-align 不同 → FS 絕對值不可與本表直接互比，見
-<a href="../../AEC/README.md">AEC/README.md</a>。
+<strong>注意：</strong>AECMOS <strong>不量背景噪音抑制</strong> —— 那才是 NR 的本職。本表只呈現 echo/近端 trade,
+看不到 NR 真正的降噪價值。AEC 模組單獨的 ours / AEC3 / Speex 三方對照見
+<a href="../../AEC/README.md">AEC/README.md</a>。渲染器 <code>rebench_aec_only.py</code> / <code>rebench_joint.py</code>
+(皆 <code>NO_PREALIGN=1</code>)。
 </div>
 
 <h3>6.4 AEC Preset — 單一 Pareto 旋鈕</h3>
