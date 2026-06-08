@@ -5,8 +5,10 @@ import numpy as np
 import soundfile as sf
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from lib.aec.python.aec import AEC, AecConfig, AecMode, AecPreset, ResFilter
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _ROOT)                                       # lib.* + pipelines.*
+sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python')) # aec + modules
+from lib.aec.python.aec import AEC, AecConfig, AecMode, AecPreset
 from pipelines.aec_nr_pipeline import run_aec_linear, run_nr, run_res
 
 
@@ -44,7 +46,7 @@ def process_case(mic_path, lpb_path, out_path, preset, fl, nr_gain_db):
     # AEC config
     config = AecConfig.from_preset(preset,
         sample_rate=sr, mode=AecMode.PBFDKF,
-        filter_length=fl, enable_dtd=False,
+        filter_length=fl,
         enable_shadow=True, enable_res=False,
         return_res_context=True, use_kalman=True)
 
@@ -94,7 +96,7 @@ def main():
     parser = argparse.ArgumentParser(description='AEC+NR+RES pipeline blind test')
     parser.add_argument('dataset_dir', help='aec_challenge_blind/ directory')
     parser.add_argument('--preset', default='balanced',
-                        choices=['mild', 'balanced', 'aggressive', 'maximum'])
+                        choices=['gentle', 'balanced', 'aggressive'])
     parser.add_argument('--filter', type=int, default=512)
     parser.add_argument('--nr-gain', type=float, default=-15.0)
     parser.add_argument('-o', '--output-dir', default=None)
