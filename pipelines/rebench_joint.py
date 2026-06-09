@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Render the JOINT freq pipeline over the 800-case corpus (production default).
+"""Render the A_min_pl freq pipeline over the 800-case corpus (production default).
 
-  joint : AEC(linear) -> echo-aware NR(E, R² folded into noise) -> one gain
-          + per-bin echo-gated NE floor (ne_floor=0.4, gate='both')
+  A_min_pl : AEC(linear) -> noise-only NR(E) -> g_total = min(G_nr, G_res)
+             + per-bin echo-gated NE floor (ne_floor=0.4, gate='both')
 
 Usage: python3 pipelines/rebench_joint.py <out_dir> [ne_floor] [ne_gate] [limit]
 Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir> --baseline <classic>/scores.json
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 
 from aec import AecConfig, AecMode                              # noqa: E402
 from pipelines.aec_nr_pipeline import (                         # noqa: E402
-    run_aec_linear, run_nr_spectrum_echo_aware, run_res,
+    run_aec_linear, run_nr_spectrum, run_res,
 )
 from pipelines.rebench_sep_vs_classic import (                  # noqa: E402
     estimate_delay, CORPUS, SCENARIOS, SR, FL, NR_GAIN,
@@ -53,9 +53,9 @@ def process(mic_path, lpb_path, out_path):
     with contextlib.redirect_stdout(io.StringIO()):
         np.random.seed(0)
         _, ctx = run_aec_linear(mic, ref, _cfg(True))
-        g = run_nr_spectrum_echo_aware(ctx, sr, g_min_db=NR_GAIN)
+        g = run_nr_spectrum(ctx, sr, g_min_db=NR_GAIN)
         out = run_res(np.zeros(n, dtype=np.float32), g, ctx, _cfg(False),
-                      use_res=False, ne_floor=NE_FLOOR, ne_gate=NE_GATE)
+                      use_res=True, combine='min', ne_floor=NE_FLOOR, ne_gate=NE_GATE)
     sf.write(out_path, out[:n], sr, subtype='FLOAT')
 
 

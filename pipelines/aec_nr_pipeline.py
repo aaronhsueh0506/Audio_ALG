@@ -173,7 +173,7 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
             config: AecConfig,
             use_nr: bool = True, use_res: bool = True,
             dt_relax: float = 0.0, ne_floor: float = 0.0,
-            ne_gate: str = 'r2') -> np.ndarray:
+            ne_gate: str = 'r2', combine: str = 'product') -> np.ndarray:
     """Residual-echo suppression AFTER NR, in the frequency domain.
 
     Reuses the linear AEC's own per-frame AEC3 SuppressionGain (``ctx.res_gain``)
@@ -215,8 +215,14 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
 
         g_nr = nr_gains[i].astype(np.float32) if use_nr else 1.0
         g_res = ctx.res_gain.astype(np.float32) if use_res else 1.0
-        g_total = (g_nr * g_res).astype(np.float32) if (use_nr or use_res) \
-            else np.ones(n_freqs, dtype=np.float32)
+        if use_nr and use_res and combine == 'min':
+            # A_min_pl: per-bin min recovers the AEC3 echo gain that v0 discarded
+            # — near-end bins (g_res≈1) keep g_nr; echo bins (g_res<g_nr) cut the
+            # leak — WITHOUT the product's double-cut on double-talk near-end.
+            g_total = np.minimum(g_nr, g_res).astype(np.float32)
+        else:
+            g_total = (g_nr * g_res).astype(np.float32) if (use_nr or use_res) \
+                else np.ones(n_freqs, dtype=np.float32)
         # Near-end-aware relax: in double-talk (ctx.dt_indicator high), the
         # G_nr·G_res product over-cuts near speech. Blend the total gain toward
         # 1.0 by dt_relax·dt_indicator so DT near-end is preserved (FS, where
@@ -308,6 +314,10 @@ def main():
     parser.add_argument('--ne-gate', default='both',
                         choices=['r2', 'resgain', 'both', 'both_sharp'],
                         help='freq mode: NE-floor echo gate (default: both)')
+    parser.add_argument('--combine', default='min', choices=['min', 'product'],
+                        help='freq mode: G_nr/G_res combine (default: min = A_min_pl)')
+    parser.add_argument('--legacy-v0', action='store_true',
+                        help='freq mode: restore v0 (echo-aware joint NR, use_res=False)')
     parser.add_argument('--aec-only', action='store_true', help='Run AEC only, skip NR/RES')
     args = parser.parse_args()
 
@@ -363,17 +373,30 @@ def main():
 
         if args.aec_only:
             final_output = aec_output
-        else:
-            print("Stage 2: echo-aware NR on E(f) (R² folded into noise floor)...")
+        elif args.legacy_v0:
+            # ---- v0 (legacy): echo-aware joint NR, g_total = g_nr only ----
+            print("Stage 2: echo-aware NR on E(f) (R² folded into noise floor) [legacy v0]...")
             nr_gains = run_nr_spectrum_echo_aware(contexts, sample_rate,
                                                   g_min_db=args.nr_gain)
-
             print(f"Stage 3: apply joint gain + NE floor "
                   f"(ne_floor={args.ne_floor}, gate={args.ne_gate})...")
             final_output = run_res(
                 np.zeros(len(mic_signal), dtype=np.float32),
                 nr_gains, contexts, aec_config, use_res=False,
                 ne_floor=args.ne_floor, ne_gate=args.ne_gate)
+        else:
+            # ---- A_min_pl (default): plain noise-only NR, g_total=min(G_nr,G_res) ----
+            # NR handles noise; the AEC's own near-end-aware AEC3 echo gain G_res
+            # handles echo; per-bin min keeps both without the product's DT double-cut.
+            print("Stage 2: noise-only NR on E(f)...")
+            nr_gains = run_nr_spectrum(contexts, sample_rate,
+                                       g_min_db=args.nr_gain)
+            print(f"Stage 3: g_total=min(G_nr,G_res) + NE floor "
+                  f"(combine={args.combine}, ne_floor={args.ne_floor}, gate={args.ne_gate})...")
+            final_output = run_res(
+                np.zeros(len(mic_signal), dtype=np.float32),
+                nr_gains, contexts, aec_config, use_res=True,
+                combine=args.combine, ne_floor=args.ne_floor, ne_gate=args.ne_gate)
 
     elif args.pipeline_mode == 'linear':
         # ---- Linear pipeline: AEC(linear) → NR(time) → RES ----
