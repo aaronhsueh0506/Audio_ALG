@@ -46,8 +46,8 @@ def process(mic_path, lpb_path, out_path):
         ref = ref[:, 0]
     n = min(len(mic), len(ref))
     mic, ref = mic[:n], ref[:n]
-    if not os.environ.get('NO_PREALIGN'):          # realistic mode: let the AEC's
-        d = estimate_delay(mic, ref, sr)           # online EchoPathDelayEstimator align
+    if os.environ.get('PREALIGN'):                 # opt-in: offline pre-align before AEC
+        d = estimate_delay(mic, ref, sr)
         if d > 0:
             ref = np.concatenate([np.zeros(d, dtype=np.float32), ref[:n - d]])
     with contextlib.redirect_stdout(io.StringIO()):
@@ -62,7 +62,7 @@ def process(mic_path, lpb_path, out_path):
 def _job(a):
     mic, lpb, out, stem = a
     if os.path.exists(out):
-        return (stem, 'skip')
+        return (stem, 'skip')  # WARNING: stale render may be from an older code version
     try:
         process(mic, lpb, out)
         return (stem, 'ok')
@@ -74,8 +74,10 @@ def main():
     from concurrent.futures import ProcessPoolExecutor, as_completed
     out_dir = sys.argv[1] if len(sys.argv) > 1 else '/tmp/joint800'
     if len(sys.argv) > 2:
+        os.environ['NE_FLOOR'] = sys.argv[2]      # must set env before spawning workers
         globals()['NE_FLOOR'] = float(sys.argv[2])
     if len(sys.argv) > 3:
+        os.environ['NE_GATE'] = sys.argv[3]
         globals()['NE_GATE'] = sys.argv[3]
     limit = int(sys.argv[4]) if len(sys.argv) > 4 else 0
     workers = int(os.environ.get('REBENCH_WORKERS', '8'))
@@ -96,19 +98,26 @@ def main():
                              os.path.join(out_dir, stem + '_ours.wav'), stem))
     print(f"joint render: {len(jobs)} cases, ne_floor={NE_FLOOR}, gate={NE_GATE}, "
           f"{workers} workers", flush=True)
-    ok = fail = done = 0
+    ok = fail = skip = done = 0
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_job, j): j[3] for j in jobs}
         for fut in as_completed(futs):
             _, st = fut.result()
             done += 1
-            ok += st in ('ok', 'skip')
-            if st.startswith('FAIL'):
+            if st == 'ok':
+                ok += 1
+            elif st == 'skip':
+                skip += 1
+            elif st.startswith('FAIL'):
                 fail += 1
                 print(' ', st, flush=True)
             if done % 100 == 0:
                 print(f"  {done}/{len(jobs)}", flush=True)
-    print(f"DONE ok={ok} fail={fail}", flush=True)
+    if skip:
+        print(f"WARNING: {skip} cases skipped (output already exists) — "
+              f"stale renders may be from an older code version; delete {out_dir} to re-render",
+              flush=True)
+    print(f"DONE ok={ok} skip={skip} fail={fail}", flush=True)
 
 
 if __name__ == '__main__':

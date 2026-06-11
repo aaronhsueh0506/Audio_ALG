@@ -90,7 +90,21 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
 
 
 def _build_denoiser(sample_rate: int, g_min_db: float) -> MmseLsaDenoiser:
-    """MMSE-LSA denoiser on the shared 10ms-hop grid (frame=320, shift=160)."""
+    """MMSE-LSA denoiser on the shared 10ms-hop grid (frame=320, shift=160).
+
+    INTENTIONAL divergence from SE/NR/config/v3_2_config.yaml (tuned for
+    frame=512/hop=256 at 16ms/frame):
+      - alpha_d not passed → falls back to alpha_noise=0.95 (yaml=0.7).
+        Slower noise-floor tracking is appropriate at 10ms hop (shorter
+        frames = noisier per-frame estimates).
+      - broadband_threshold not passed → default 0.8 (yaml=1.0, disabled).
+        The broadband scene-reset path is active here; on AEC residual
+        signals this provides faster adaptation after echo bursts.
+      - L=150 (1.5s window) vs yaml L=32 (320ms). Longer window improves
+        stationarity estimation against the AEC-residual echo pedestal.
+    The A_min_pl pipeline was benchmarked and shipped with these values.
+    DO NOT silently sync to the NR yaml without re-running 800-case bench.
+    """
     return MmseLsaDenoiser(
         sample_rate=sample_rate,
         frame_size=320,          # 20ms — matches AEC frame_size
@@ -184,9 +198,17 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
         S(f) = E(f) · G_nr(f) · G_res(f)   (+ comfort noise on the cut bins)
 
     then one sqrt-Hann OLA — no standalone ResFilter, no extra FFT round-trip.
-    All stages share hop=160 (10 ms) so frame i of AEC = frame i of NR. The
-    sqrt-Hann synthesis window matches the AEC's ``_aec3_synth_window`` exactly
+    The sqrt-Hann synthesis window matches the AEC's ``_aec3_synth_window`` exactly
     (periodic Hann, denom = block_size) for perfect reconstruction.
+
+    Frame alignment: ``ctx[i].error_spec`` spans [(i-1)*hop, (i+1)*hop) (AEC
+    analysis window ends at the current hop). In ``--pipeline-mode freq`` NR
+    is also computed from ``ctx.error_spec`` so frame i = frame i. In
+    ``--pipeline-mode linear`` NR is computed from the AEC time-domain output
+    whose frame i covers [i*hop, (i+2)*hop), so ``nr_gains[i]`` is one hop
+    AHEAD of ``ctx[i].error_spec`` — callers should pass ``nr_gains`` with a
+    one-frame shift (``np.concatenate([[nr_gains[0]], nr_gains[:-1]])``) or
+    use ``--pipeline-mode freq`` (the default).
     """
     bs = int(config.frame_size)      # 320 — analysis/synthesis block
     hop = int(config.hop_size)       # 160
@@ -215,6 +237,10 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
 
         g_nr = nr_gains[i].astype(np.float32) if use_nr else 1.0
         g_res = ctx.res_gain.astype(np.float32) if use_res else 1.0
+        # Save AEC-only gain before combining with G_nr, for CNG noise level.
+        # CNG must reflect AEC suppression only — using g_total would re-inject
+        # noise into NR-suppressed bins (BAK ceiling).
+        g_aec = g_res if isinstance(g_res, np.ndarray) else np.full(n_freqs, g_res, dtype=np.float32)
         if use_nr and use_res and combine == 'min':
             # A_min_pl: per-bin min recovers the AEC3 echo gain that v0 discarded
             # — near-end bins (g_res≈1) keep g_nr; echo bins (g_res<g_nr) cut the
@@ -260,7 +286,7 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
         # baseline, not bit-identical to the internal RES).
         if config.enable_cng and ctx.comfort_noise is not None:
             n_amp = np.sqrt(np.maximum(ctx.comfort_noise / psd_scale, 0.0)).astype(np.float32)
-            noise_gain = np.sqrt(np.maximum(1.0 - g_total ** 2, 0.0)).astype(np.float32)
+            noise_gain = np.sqrt(np.maximum(1.0 - g_aec ** 2, 0.0)).astype(np.float32)
             cn = np.zeros(n_freqs, dtype=np.complex64)
             cn[1:-1] = (n_amp[1:-1]
                         * (rng.randn(n_freqs - 2) + 1j * rng.randn(n_freqs - 2)))
@@ -302,8 +328,8 @@ def main():
                         choices=['classic', 'linear', 'freq'],
                         help='Pipeline mode (default: freq)')
     parser.add_argument('--aec-mode', default='pbfdkf',
-                        choices=['fdaf', 'pbfdaf', 'pbfdkf', 'subband'],
-                        help='AEC filter mode (default: pbfdkf)')
+                        choices=['pbfdaf', 'pbfdkf', 'subband'],
+                        help='AEC filter mode (default: pbfdkf); fdaf not supported in pipeline')
     parser.add_argument('--preset', default='balanced',
                         choices=['gentle', 'balanced', 'aggressive'],
                         help='AEC preset (default: balanced)')
@@ -380,9 +406,16 @@ def main():
                                                   g_min_db=args.nr_gain)
             print(f"Stage 3: apply joint gain + NE floor "
                   f"(ne_floor={args.ne_floor}, gate={args.ne_gate})...")
+            # C5-383: pass use_res=True so AEC echo gain (ctx.res_gain) covers the
+            # first num_init=20 NR-passthrough frames (otherwise g_nr=1.0 * g_res=1.0
+            # → zero echo suppression for the first 200 ms).
+            # C5-384: pass aec_output (zero-padded to mic length) as tail source so
+            # samples beyond the last full AEC frame are not silenced (mic>ref case).
+            _tail_src = np.zeros(len(mic_signal), dtype=np.float32)
+            _tail_src[:len(aec_output)] = aec_output
             final_output = run_res(
-                np.zeros(len(mic_signal), dtype=np.float32),
-                nr_gains, contexts, aec_config, use_res=False,
+                _tail_src,
+                nr_gains, contexts, aec_config, use_res=True,
                 ne_floor=args.ne_floor, ne_gate=args.ne_gate)
         else:
             # ---- A_min_pl (default): plain noise-only NR, g_total=min(G_nr,G_res) ----
@@ -393,8 +426,12 @@ def main():
                                        g_min_db=args.nr_gain)
             print(f"Stage 3: g_total=min(G_nr,G_res) + NE floor "
                   f"(combine={args.combine}, ne_floor={args.ne_floor}, gate={args.ne_gate})...")
+            # C5-384: pass aec_output as tail source to avoid silencing mic tail
+            # when mic is longer than ref (zeros placeholder would silence it).
+            _tail_src_a = np.zeros(len(mic_signal), dtype=np.float32)
+            _tail_src_a[:len(aec_output)] = aec_output
             final_output = run_res(
-                np.zeros(len(mic_signal), dtype=np.float32),
+                _tail_src_a,
                 nr_gains, contexts, aec_config, use_res=True,
                 combine=args.combine, ne_floor=args.ne_floor, ne_gate=args.ne_gate)
 

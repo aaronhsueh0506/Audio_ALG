@@ -30,6 +30,17 @@ from aec import AEC, AecConfig, AecMode                       # noqa: E402
 from pipelines.aec_nr_pipeline import (                       # noqa: E402
     run_aec_classic, run_nr, run_aec_linear, run_nr_spectrum, run_res,
 )
+# Use the AEC-repo standard delay estimator: 1024ms cap, GCC-PHAT primary,
+# confidence-fallback plain xcorr, AEC_MAX_DELAY_MS env override.
+AEC_EVAL_PY = os.path.join(ROOT, 'lib', 'aec', 'python', 'eval_aec_challenge.py')
+if os.path.isfile(AEC_EVAL_PY):
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location('_eval_aec', AEC_EVAL_PY)
+    _mod = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _estimate_delay_canonical = _mod.estimate_delay
+else:
+    _estimate_delay_canonical = None
 
 CORPUS = os.path.join(ROOT, 'lib', 'aec', 'wav', 'aec_challenge_blind')
 if not os.path.isdir(CORPUS) or not os.listdir(CORPUS):
@@ -40,7 +51,12 @@ FL = 832
 NR_GAIN = -15.0
 
 
-def estimate_delay(mic, ref, sr, max_delay_ms=250.0):
+def estimate_delay(mic, ref, sr, max_delay_ms=1024.0):
+    """Wrapper around the AEC-repo canonical estimator (GCC-PHAT, 1024ms, confidence gate).
+    Falls back to the legacy plain-xcorr if the canonical function is unavailable."""
+    if _estimate_delay_canonical is not None:
+        return _estimate_delay_canonical(mic, ref, sr, max_delay_ms=max_delay_ms)
+    # Legacy fallback (should not reach in normal operation).
     max_d = int(max_delay_ms * sr / 1000)
     n = min(len(mic), len(ref))
     if n < 2048:

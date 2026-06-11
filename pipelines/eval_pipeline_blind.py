@@ -48,7 +48,7 @@ def process_case(mic_path, lpb_path, out_path, preset, fl, nr_gain_db):
         sample_rate=sr, mode=AecMode.PBFDKF,
         filter_length=fl,
         enable_shadow=True, enable_res=False,
-        return_res_context=True, use_kalman=True)
+        return_res_context=True, enable_cng=True)
 
     # Stage 1: AEC (linear only)
     aec_out, contexts = run_aec_linear(mic, ref, config)
@@ -56,11 +56,12 @@ def process_case(mic_path, lpb_path, out_path, preset, fl, nr_gain_db):
     # Stage 2: NR
     nr_out, nr_gains = run_nr(aec_out, sr, g_min_db=nr_gain_db, return_gain=True)
 
-    # Stage 3: RES (with NR gain correction)
+    # Stage 3: RES (A_min_pl: g_total = min(G_nr, G_res))
     config_res = AecConfig.from_preset(preset,
         sample_rate=sr, mode=AecMode.PBFDKF,
-        filter_length=fl, enable_res=True)
-    final_out = run_res(nr_out, nr_gains, contexts, config_res)
+        filter_length=fl, enable_res=True, enable_cng=True)
+    final_out = run_res(nr_out, nr_gains, contexts, config_res,
+                        use_res=True, combine='min', ne_floor=0.4, ne_gate='both')
 
     sf.write(out_path, final_out, sr)
     return out_path
@@ -78,7 +79,7 @@ def run_scenario(base_dir, subdir, out_dir, preset, fl, nr_gain_db):
         out_suffix = mf.replace('_mic.wav', '')
         mic_path = os.path.join(sc_dir, mf)
         lpb_path = os.path.join(sc_dir, lpb_f)
-        out_path = os.path.join(out_dir, f"{out_suffix}_pipeline.wav")
+        out_path = os.path.join(out_dir, f"{out_suffix}_ours.wav")
 
         if not os.path.exists(lpb_path):
             continue
