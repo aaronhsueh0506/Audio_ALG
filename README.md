@@ -72,7 +72,27 @@ git push
 
 ## 處理鏈 (Pipeline)
 
-AEC 輸出接 NR 輸入的串接處理：
+三階段串接，mic 路徑共享一個 16 kHz / FFT-512 / hop=160 (10 ms) / sqrt-Hann 格點：
+
+```
+mic ─►HPF─┐
+          ├─► Linear AEC (PBFDKF + Shadow + EPC) ─► e[n]  +  AecResContext
+ref ──────┘   (ref 不經 HPF；時域進，頻域 context 出)          │
+                                                             ▼
+                              NR  (MMSE-LSA + MCRA / OM-LSA SPP)
+                              g_nr = MMSE-LSA gain per bin
+                                                             │
+                                                             ▼
+                              RES  (Residual Echo Suppression)
+                              g_total = min(g_nr, g_res)     ◄── g_res from AecResContext
+                              → S(f) = e[n] · g_total  +  CNG ─► iFFT + OLA ─► output[n]
+```
+
+| 階段 | 角色 | 輸出 |
+|------|------|------|
+| **Linear AEC** | PBFDKF + Shadow + EPC，純線性消除，不套 post-filter | `e[n]` 時域 + `AecResContext`（echo PSD、far power、dt_indicator、ERLE） |
+| **NR** | MMSE-LSA（MCRA noise est + OM-LSA SPP），壓背景噪聲 | 增強語音 + per-bin gain `g_nr` |
+| **RES** | `g_total = min(g_nr, g_res)`，逐 bin 取小值；無回音處 g_res≈1 → NR 正常發揮 | 最終輸出 + CNG |
 
 ```bash
 # malloc 版（標準用法）
@@ -80,7 +100,7 @@ make -C pipelines libs
 make -C pipelines aec_nr_pipeline
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav [preset]
 
-# 僅 AEC（不跑 NR）
+# 僅 AEC（不跑 NR/RES）
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --aec-only
 ```
 
@@ -153,3 +173,47 @@ NR 有三個 mode，透過 `MmseLsaNrMode` 或 `--nr-gain` 控制最低增益：
 | `L` | 32 frames | 320 ms min-stat 窗（MCRA） |
 | `delta_db` | 10 dB | MCRA 語音存在門限 |
 | `num_init_frames` | 20 | 噪聲估計初始化幀數（200 ms） |
+
+---
+
+### Blind Test 成績（AEC Challenge Interspeech 2021, 800 cases · no-prealign）
+
+**AEC(balanced) alone vs AEC(balanced) + NR + RES**，NR 兩個 strength preset：
+**balanced**（`--nr-gain -15`）與 **mild**（`--nr-gain -10`，近端優先）。RES 用 `min(G_nr, G_res)`。
+本地 ONNX AECMOS/DNSMOS，**無 harness pre-align** —— 讓 AEC 自己的線上 `EchoPathDelayEstimator`
+對齊（真實情境；offline 全訊號 GCC-PHAT pre-align 是已退役的 crutch，會讓 movement 分數偏樂觀）。
+
+**AECMOS**（echo↑ / deg↑）:
+
+| 指標 | AEC-alone | +NR(balanced) | +NR(mild) |
+|------|----------|---------------|-----------|
+| FS_static echo   | 3.504 | **3.559** | 3.552 |
+| FS_movement echo | 3.471 | **3.500** | 3.495 |
+| DT_static echo   | 4.203 | 4.201 | 4.199 |
+| DT_static deg    | 2.080 | **2.156** | 2.150 |
+| DT_movement deg  | 2.193 | **2.233** | **2.233** |
+| NE deg           | 4.052 | 4.007 | **4.029** |
+
+**DNSMOS**（SIG/BAK/OVRL↑；BAK = 背景品質，NR 本職，AECMOS 看不到）:
+
+| 指標 | AEC-alone | +NR(balanced) | +NR(mild) |
+|------|----------|---------------|-----------|
+| FS_static BAK   | 2.632 | **2.817** | 2.778 |
+| FS_movement BAK | 2.366 | **2.578** | 2.535 |
+| DT_static BAK   | 2.823 | **2.991** | 2.966 |
+| DT_movement BAK | 2.725 | **2.903** | 2.871 |
+| NE BAK          | 3.848 | 3.867 | **3.869** |
+| NE SIG          | 3.472 | 3.411 | **3.431** |
+| DT_static SIG   | 2.332 | **2.377** | **2.377** |
+| FS_static SIG   | 1.730 | **1.806** | 1.792 |
+| FS_movement SIG | 1.573 | **1.663** | 1.652 |
+| DT_movement SIG | 2.292 | **2.334** | 2.333 |
+
+> **NR pipeline 對 AEC-alone**：背景 **BAK +0.17~0.21**（降噪本職，AECMOS 量不到）、DT/FS echo & deg
+> 全贏，只賠純 NE SIG（−0.06）。`min(G_nr, G_res)` 撿回 AEC3 的近端感知回音 gain，修好 v0 的
+> DT echo <4.0（v0：DT echo 3.97 / DT deg +0.30，落在被支配的 Pareto 角落，`--legacy-v0` 可還原）。
+> **balanced vs mild**：mild（g_min −10）把 NE 救回（deg **+0.022** / SIG **+0.020**），代價是 FS/DT
+> 背景降噪 **−0.03~0.04 BAK**。**balanced = 降噪優先，mild = 近端優先**（Pareto trade，無全贏）。
+>
+> AEC 模組單獨的完整 ours / AEC3 / Speex 三方對照見 [lib/aec/README.md](lib/aec/README.md)。
+> 渲染器:`pipelines/rebench_aec_only.py`(AEC)、`pipelines/rebench_joint.py`(A_min_pl)，皆 `NO_PREALIGN=1`。
