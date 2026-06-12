@@ -150,6 +150,8 @@ python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav
 | NE SIG          | 3.472 | 3.411 | **3.431** |
 | DT_static SIG   | 2.332 | **2.377** | **2.377** |
 | FS_static SIG   | 1.730 | **1.806** | 1.792 |
+| FS_movement SIG | 1.573 | **1.663** | 1.652 |
+| DT_movement SIG | 2.292 | **2.334** | 2.333 |
 
 > **NR pipeline 對 AEC-alone**：背景 **BAK +0.17~0.21**（降噪本職，AECMOS 量不到）、DT/FS echo & deg
 > 全贏，只賠純 NE SIG（−0.06）。`min(G_nr, G_res)` 撿回 AEC3 的近端感知回音 gain，修好 v0 的
