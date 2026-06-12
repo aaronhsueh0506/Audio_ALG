@@ -134,6 +134,7 @@ python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav
 | FS_static echo   | 3.504 | **3.559** | 3.552 |
 | FS_movement echo | 3.471 | **3.500** | 3.495 |
 | DT_static echo   | 4.203 | 4.201 | 4.199 |
+| DT_movement echo | 4.107 | **4.121** | 4.117 |
 | DT_static deg    | 2.080 | **2.156** | 2.150 |
 | DT_movement deg  | 2.193 | **2.233** | **2.233** |
 | NE deg           | 4.052 | 4.007 | **4.029** |
