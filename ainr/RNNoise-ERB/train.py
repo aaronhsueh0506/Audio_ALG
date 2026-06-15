@@ -1,6 +1,3 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 """
 RNNoise v0.2 風格噪音抑制模型 — 訓練腳本
 基於官方 xiph/rnnoise torch 版本架構，適配 config-driven / ERB bands / 無 pitch
@@ -14,7 +11,6 @@ RNNoise v0.2 風格噪音抑制模型 — 訓練腳本
 
 import argparse
 import configparser
-import glob
 import os
 import random
 
@@ -22,10 +18,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler, random_split
+from torch.utils.data import DataLoader, random_split
 import tqdm
 
-from dataset import DNS4Dataset, PackedDataset, PrecomputedDataset
+from dataset import DNS4Dataset, PrecomputedDataset
 
 # ============================================================
 # ERB Band 工具
@@ -39,36 +35,27 @@ def erb_inv(e):
     """ERB-rate → 頻率 (Hz)"""
     return (10 ** (e / 21.4) - 1) / 0.00437
 
-def compute_erb_bands(n_fft, sr, n_bands, min_bins_per_band=2):
-    """
-    計算 ERB band 的 FFT bin 邊界，回傳 shape=(n_bands+1,) 的整數陣列。
-
-    min_bins_per_band: 每個 band 至少 N 個 FFT bins (DFN3 風格, 預設 2)。
-                       不夠寬的 band 向後 "借" bin (相當於整體往高頻擠壓)。
-    """
+def compute_erb_bands(n_fft, sr, n_bands):
+    """計算 ERB band 的 FFT bin 邊界，回傳 shape=(n_bands+1,) 的整數陣列"""
     n_bins = n_fft // 2 + 1
     e_low = erb_rate(0)
     e_high = erb_rate(sr / 2)
     erb_edges = np.linspace(e_low, e_high, n_bands + 1)
     freq_edges = erb_inv(erb_edges)
-    ideal = np.round(freq_edges / (sr / n_fft)).astype(int)
-
-    # Greedy forward: next_edge = max(ideal_edge, prev_edge + min_bins)
-    # 確保每 band 至少 min_bins, 不夠寬的向後借, 高頻原本寬的 band 自動緩衝
-    bin_edges = [0]
-    for i in range(n_bands):
-        next_edge = max(int(ideal[i + 1]), bin_edges[-1] + min_bins_per_band)
-        next_edge = min(next_edge, n_bins)
-        bin_edges.append(next_edge)
-    bin_edges[-1] = n_bins
-    return np.array(bin_edges, dtype=int)
+    bin_edges = np.round(freq_edges / (sr / n_fft)).astype(int)
+    bin_edges = np.clip(bin_edges, 0, n_bins - 1)
+    for i in range(1, len(bin_edges)):
+        if bin_edges[i] <= bin_edges[i - 1]:
+            bin_edges[i] = bin_edges[i - 1] + 1
+    bin_edges[-1] = min(bin_edges[-1], n_bins)
+    return bin_edges
 
 
-def compute_hybrid_bands(n_fft, sr, n_erb_high, cutoff_hz, min_bins_per_band=2):
+def compute_hybrid_bands(n_fft, sr, n_erb_high, cutoff_hz):
     """
     Hybrid frequency bands (ref: GTCRN):
-      - 0 ~ cutoff_hz: 每個 FFT bin 一個 band (原始解析度, 刻意 1 bin/band)
-      - cutoff_hz ~ Nyquist: n_erb_high 個 ERB bands (套 min_bins_per_band)
+      - 0 ~ cutoff_hz: 每個 FFT bin 一個 band (原始解析度)
+      - cutoff_hz ~ Nyquist: n_erb_high 個 ERB bands
     回傳: bin_edges (n_bands+1,), n_bands
     """
     n_bins = n_fft // 2 + 1
@@ -76,26 +63,23 @@ def compute_hybrid_bands(n_fft, sr, n_erb_high, cutoff_hz, min_bins_per_band=2):
     cutoff_bin = int(round(cutoff_hz / bin_res))
     cutoff_bin = min(cutoff_bin, n_bins - 1)
 
-    # Part 1: individual bins [0, 1, 2, ..., cutoff_bin] (high resolution, 故意)
+    # Part 1: individual bins [0, 1, 2, ..., cutoff_bin]
     low_edges = list(range(cutoff_bin + 1))
 
-    # Part 2: ERB bands above cutoff (greedy forward with min_bins)
+    # Part 2: ERB bands above cutoff
     e_cut = erb_rate(cutoff_hz)
     e_high = erb_rate(sr / 2)
     erb_edges = np.linspace(e_cut, e_high, n_erb_high + 1)
     freq_edges = erb_inv(erb_edges)
-    ideal = np.round(freq_edges / bin_res).astype(int)
-    ideal = np.clip(ideal, cutoff_bin, n_bins)
+    high_edges = np.round(freq_edges / bin_res).astype(int)
+    high_edges = np.clip(high_edges, cutoff_bin, n_bins)
+    for i in range(1, len(high_edges)):
+        if high_edges[i] <= high_edges[i - 1]:
+            high_edges[i] = high_edges[i - 1] + 1
+    high_edges[-1] = min(high_edges[-1], n_bins)
 
-    high = [cutoff_bin]
-    for i in range(n_erb_high):
-        next_edge = max(int(ideal[i + 1]), high[-1] + min_bins_per_band)
-        next_edge = min(next_edge, n_bins)
-        high.append(next_edge)
-    high[-1] = n_bins
-
-    # 合併: low_edges[-1] == high[0] == cutoff_bin
-    all_edges = np.array(low_edges + list(high[1:]), dtype=int)
+    # 合併: low_edges[-1] == high_edges[0] == cutoff_bin
+    all_edges = np.array(low_edges + list(high_edges[1:]), dtype=int)
     n_bands = len(all_edges) - 1
     return all_edges, n_bands
 
@@ -122,7 +106,7 @@ class RNNoiseModel(nn.Module):
     架構沿用官方 v0.2: Conv1d 前處理 + 3 層 GRU + concat 全層輸出
     差異: 輸入改為 ERB band log energy, 無 VAD, 無 sparsification
     """
-    def __init__(self, n_bands, cond_size=64, gru_size=128, dropout=0.0):
+    def __init__(self, n_bands, cond_size=64, gru_size=128):
         super().__init__()
         self.n_bands = n_bands
         self.gru_size = gru_size
@@ -130,9 +114,6 @@ class RNNoiseModel(nn.Module):
         # Conv1d 前處理 (k=3 + k=1, 減少 latency)
         self.conv1 = nn.Conv1d(n_bands, cond_size, kernel_size=3, padding=0)
         self.conv2 = nn.Conv1d(cond_size, gru_size, kernel_size=1)
-
-        # Dropout (GRU 層間)
-        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
 
         # 3 層 GRU
         self.gru1 = nn.GRU(gru_size, gru_size, batch_first=True)
@@ -149,7 +130,7 @@ class RNNoiseModel(nn.Module):
                     nn.init.orthogonal_(param)
 
         n_params = sum(p.numel() for p in self.parameters())
-        print(f"Model: {n_params:,} parameters (dropout={dropout})")
+        print(f"Model: {n_params:,} parameters")
 
     def forward(self, x, states=None):
         """
@@ -174,97 +155,16 @@ class RNNoiseModel(nn.Module):
         tmp = torch.tanh(self.conv2(tmp))
         conv_out = tmp.permute(0, 2, 1)  # (B, T-2, gru_size)
 
-        # 3 層 GRU + dropout
+        # 3 層 GRU
         gru1_out, h1 = self.gru1(conv_out, h1)
-        gru1_out = self.dropout(gru1_out)
         gru2_out, h2 = self.gru2(gru1_out, h2)
-        gru2_out = self.dropout(gru2_out)
         gru3_out, h3 = self.gru3(gru2_out, h3)
 
         # Concat 全層輸出 (同官方 v0.2)
         cat = torch.cat([conv_out, gru1_out, gru2_out, gru3_out], dim=-1)
-        # Plain sigmoid (DFN3 style): 軟輸出, sharpening 留給 inference-only post-filter
         gains = torch.sigmoid(self.dense_out(cat))
 
         return gains, [h1, h2, h3]
-
-# ============================================================
-# Perceptual loss helpers (WAV-data mode)
-# ============================================================
-
-def make_ema_alpha(sr: int, hop_len: int, tau: float = 1.0) -> float:
-    """DFN-style alpha: exp(-dt/tau), tau=1s decay window."""
-    import math
-    return math.exp(-(hop_len / sr) / tau)
-
-
-def extract_erb_features(power_spec, bin_edges, ema_alpha: float = 0.992):
-    """
-    power_spec: (..., n_frames, n_bins)
-    Returns: (..., n_frames, n_bands)  DFN-style causal EMA unit-norm ERB features
-    EMA state: energy / sqrt(EMA(energy)), causal (loop over T).
-    """
-    bands = []
-    for b in range(len(bin_edges) - 1):
-        lo, hi = int(bin_edges[b]), int(bin_edges[b + 1])
-        bands.append(power_spec[..., lo:hi].mean(dim=-1))  # mean not sum → scale-invariant
-    energy = torch.stack(bands, dim=-1).clamp_min(1e-14)   # (..., T, n_bands)
-
-    shape = energy.shape
-    x     = energy.view(-1, shape[-2], shape[-1])           # (B, T, C)
-    state = x[:, 0, :].clone()                             # init with first frame energy
-    out   = []
-    for t in range(x.size(1)):
-        e = x[:, t, :]
-        state = e * (1 - ema_alpha) + state * ema_alpha
-        out.append(e / state.sqrt())
-    return torch.stack(out, dim=1).view(shape)
-
-
-def apply_erb_gains_batch(noisy_spec, gains, bin_edges, lookahead=0):
-    """
-    noisy_spec : (B, n_bins, n_frames) complex
-    gains      : (B, n_frames_out, n_bands)
-    Returns    : enhanced_spec (B, n_bins, n_frames) complex
-
-    Mode 自動判定:
-    - n_frames_out == n_frames : padded 模式 (training), gains 與 spec frame 1:1 對齊
-    - 否則                      : streaming 模式 (inference), 邊界 frame 留 gain=1
-    """
-    B, n_bins, n_frames = noisy_spec.shape
-    n_frames_out = gains.shape[1]
-    bin_gains = torch.ones(B, n_bins, n_frames,
-                           device=gains.device, dtype=gains.dtype)
-    gain_offset = 0 if n_frames_out == n_frames else (2 - lookahead)
-    for b in range(len(bin_edges) - 1):
-        lo, hi = int(bin_edges[b]), int(bin_edges[b + 1])
-        # gains[:, :, b]: (B, n_frames_out) → unsqueeze → (B, 1, n_frames_out)
-        bin_gains[:, lo:hi, gain_offset:gain_offset + n_frames_out] = \
-            gains[:, :, b].unsqueeze(1)
-    return noisy_spec * bin_gains
-
-
-def multi_res_stft_loss(enhanced, clean, fft_sizes=(512, 256, 1024), gamma=0.3):
-    """
-    DeepFilterNet 風格 multi-resolution compressed magnitude loss.
-    對 magnitude 做 γ-power compression 再算 MSE 距離 (對齊 DFN3 production)。
-    無除法 → 對 silence target (noise-only sample, target=0) 也穩定有界。
-    """
-    total = 0.0
-    for n_fft in fft_sizes:
-        hop = n_fft // 4
-        win = torch.hann_window(n_fft, device=enhanced.device)
-        E = torch.stft(enhanced, n_fft, hop, window=win,
-                       return_complex=True).abs()   # (B, F, T')
-        C = torch.stft(clean,    n_fft, hop, window=win,
-                       return_complex=True).abs()
-
-        E_c = (E + 1e-8).pow(gamma)
-        C_c = (C + 1e-8).pow(gamma)
-        total = total + F.mse_loss(E_c, C_c)
-
-    return total / len(fft_sizes)
-
 
 # ============================================================
 # 訓練
@@ -303,9 +203,6 @@ def train(args):
     else:
         N_BANDS = cfg.getint('signal', 'n_bands')
 
-    LOOKAHEAD = cfg.getint('signal', 'lookahead_frames', fallback=0)
-    assert 0 <= LOOKAHEAD <= 2, "lookahead_frames 只支援 0~2"
-
     # Training params
     epochs = cfg.getint('training', 'epochs')
     batch_size = cfg.getint('training', 'batch_size')
@@ -327,22 +224,9 @@ def train(args):
         BIN_EDGES = compute_erb_bands(N_FFT, SR, N_BANDS)
 
     # Dataset
-    use_online = False
-    use_wav = False
-    if args.packed_dir or args.packed_data:
-        from torch.utils.data import ConcatDataset
-        pt_files = []
-        if args.packed_dir:
-            pt_files += sorted(glob.glob(os.path.join(args.packed_dir, '*.pt')))
-        if args.packed_data:
-            pt_files += args.packed_data
-        if not pt_files:
-            raise FileNotFoundError(f"在 {args.packed_dir} 找不到任何 .pt 檔案")
-        parts = [PackedDataset(p) for p in pt_files]
-        dataset = ConcatDataset(parts) if len(parts) > 1 else parts[0]
-        use_wav = True
-    elif args.precomputed:
+    if args.precomputed:
         dataset = PrecomputedDataset(args.precomputed)
+        use_online = False
     else:
         dataset = DNS4Dataset(cfg)
         use_online = True
@@ -351,76 +235,24 @@ def train(args):
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val])
 
-    # epoch_size: precomputed/wav-data 模式下用 RandomSampler 限制每 epoch 的 sample 數
-    # online 模式由 DNS4Dataset._shuffle_indices() 處理
-    epoch_size = cfg.getint('training', 'epoch_size', fallback=0)
-    # packed-data: 資料已在 RAM，不需要 worker；其他模式開 4 worker
-    use_packed = args.packed_data is not None
-    n_workers = 0 if (use_packed or not (use_online or use_wav)) else 4
-    common_kwargs = dict(num_workers=n_workers, pin_memory=True)
-    if n_workers > 0:
-        common_kwargs.update(prefetch_factor=4)
-
-    if not use_online and epoch_size > 0 and epoch_size < len(train_set):
-        train_sampler = RandomSampler(train_set, replacement=False, num_samples=epoch_size)
-        train_loader = DataLoader(train_set, batch_size=batch_size,
-                                  sampler=train_sampler, **common_kwargs)
-    else:
-        train_loader = DataLoader(train_set, batch_size=batch_size,
-                                  shuffle=True, **common_kwargs)
-
-    val_workers = min(n_workers, 2)
-    val_kwargs = dict(num_workers=val_workers, pin_memory=True)
-    if val_workers > 0:
-        val_kwargs.update(prefetch_factor=4)
-    val_loader = DataLoader(val_set, batch_size=batch_size, **val_kwargs)
-
-    # Regularization
-    dropout = cfg.getfloat('training', 'dropout', fallback=0.0)
-    weight_decay = cfg.getfloat('training', 'weight_decay', fallback=0.05)
-    min_lr = cfg.getfloat('training', 'min_lr', fallback=1e-6)
-    warmup_epochs = cfg.getint('training', 'warmup_epochs', fallback=3)
-    patience = cfg.getint('training', 'early_stop_patience', fallback=0)
+    # Precomputed: 資料已在記憶體，不需多 worker；Online: 需要多 worker 做 augmentation
+    n_workers = 0 if not use_online else 4
+    train_loader = DataLoader(train_set, batch_size=batch_size,
+                              shuffle=True, num_workers=n_workers, pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=min(n_workers, 2))
 
     # 模型
-    model = RNNoiseModel(n_bands=N_BANDS, cond_size=64, gru_size=128,
-                         dropout=dropout).to(device)
-    if hasattr(torch, 'compile') and device.type == 'cuda':
-        model = torch.compile(model)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999),
-                                  weight_decay=weight_decay, amsgrad=True)
-    # Linear warmup → cosine annealing (DFN2 style)
-    total_steps = epochs * len(train_loader)
-    warmup_steps = max(1, warmup_epochs * len(train_loader))
-    warmup_sch = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-    cosine_sch = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=min_lr)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_sch, cosine_sch], milestones=[warmup_steps])
+    model = RNNoiseModel(n_bands=N_BANDS, cond_size=64, gru_size=128).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.8, 0.98))
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer, lr_lambda=lambda step: 1.0 / (1.0 + 5e-5 * step)
+    )
 
-    gamma             = cfg.getfloat('training', 'gamma',             fallback=0.5)
-    loss_over_weight  = cfg.getfloat('training', 'loss_over_weight',  fallback=2.5)
-    loss_under_weight = cfg.getfloat('training', 'loss_under_weight', fallback=1.0)
-    noise_frame_boost = cfg.getfloat('training', 'noise_frame_boost', fallback=3.0)
-    speech_frame_scale = cfg.getfloat('training', 'speech_frame_scale', fallback=2.0)
-
-    # Perceptual loss params (wav-data mode)
-    fft_sizes_str = cfg.get('perceptual_loss', 'fft_sizes', fallback='512,256,1024')
-    fft_sizes = tuple(int(x.strip()) for x in fft_sizes_str.split(','))
-    perc_gamma = cfg.getfloat('perceptual_loss', 'gamma', fallback=0.3)
-
-    # DFN-style EMA alpha (tau=1s decay window)
-    EMA_ALPHA = make_ema_alpha(SR, HOP_LEN)
-    print(f"  EMA alpha = {EMA_ALPHA:.4f}  (tau=1s, dt={HOP_LEN/SR*1000:.1f}ms)")
-
-    # Window for on-the-fly STFT (wav-data mode) — created once, moved to device
-    stft_window = torch.sqrt(torch.hann_window(WIN_LEN)).to(device)
+    gamma = 1.0  # perceptual exponent (0.5→1.0: 恢復 gain~1.0 附近梯度敏感度)
 
     os.makedirs(output_dir, exist_ok=True)
     best_val_loss = float('inf')
     start_epoch = 1
-    no_improve_count = 0  # early stopping 計數器
 
     # Resume from checkpoint
     if args.resume:
@@ -437,16 +269,7 @@ def train(args):
 
     print(f"Training: SR={SR}, N_FFT={N_FFT}, N_BANDS={N_BANDS}")
     print(f"  WIN_LEN={WIN_LEN}, HOP_LEN={HOP_LEN} (root Hann window)")
-    print(f"  lookahead_frames={LOOKAHEAD} ({LOOKAHEAD * HOP_LEN / SR * 1000:.1f} ms extra latency)")
     print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
-    print(f"  dropout={dropout}, weight_decay={weight_decay}")
-    if use_wav:
-        print(f"  loss: multi-res STFT (perceptual), fft_sizes={fft_sizes}")
-    else:
-        print(f"  loss: gamma={gamma}, over={loss_over_weight}, under={loss_under_weight}, "
-              f"noise_boost={noise_frame_boost}, speech_scale={speech_frame_scale}")
-    if patience > 0:
-        print(f"  early stopping: patience={patience}")
     print(f"  device={device}")
 
     for epoch in range(start_epoch, epochs + 1):
@@ -458,76 +281,36 @@ def train(args):
         model.train()
         train_loss_sum = 0
         with tqdm.tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") as pbar:
-            if use_wav:
-                for noisy_wav, clean_wav in pbar:
-                    noisy_wav = noisy_wav.to(device)
-                    clean_wav = clean_wav.to(device)
+            for features, targets in pbar:
+                features = features.to(device)
+                targets = targets.to(device)
 
-                    # On-the-fly STFT
-                    noisy_spec = torch.stft(
-                        noisy_wav, N_FFT, HOP_LEN, WIN_LEN,
-                        window=stft_window, return_complex=True, center=True)
-                    # (B, n_bins, n_frames)
+                pred_gains, _ = model(features)
+                # Conv1d valid padding 會減少 2 個 frame
+                # Causal: output[i] 對應 input[i+2] (最新 frame, 0 lookahead)
+                targets = targets[:, 2:, :]
 
-                    # ERB features + zero-pad on T dim 讓 conv 輸出與 spec frame 1:1 對齊
-                    # pad_left = 2-LOOKAHEAD (補過去), pad_right = LOOKAHEAD (補未來)
-                    power = noisy_spec.abs().pow(2).permute(0, 2, 1)  # (B, T, F)
-                    features = extract_erb_features(power, BIN_EDGES, EMA_ALPHA)  # (B, T, n_bands)
-                    features = F.pad(features, (0, 0, 2 - LOOKAHEAD, LOOKAHEAD))
+                # Speech-weighted asymmetric loss
+                # (A) 語音段加重: target gain 高 → 語音段, penalty 3x
+                speech_weight = targets.mean(dim=-1, keepdim=True)
+                frame_weight = 1.0 + 2.0 * speech_weight
 
-                    pred_gains, _ = model(features)  # (B, T, n_bands)
+                # (B) Asymmetric: over-estimation (noise leak) 罰更重
+                pred_g = pred_gains ** gamma
+                targ_g = targets ** gamma
+                error = pred_g - targ_g
+                asym_weight = torch.where(error > 0, 1.5, 1.0)
 
-                    # Apply ERB gains → enhanced STFT → ISTFT
-                    enhanced_spec = apply_erb_gains_batch(
-                        noisy_spec, pred_gains, BIN_EDGES, LOOKAHEAD)
-                    enhanced_wav = torch.istft(
-                        enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
-                        window=stft_window, length=noisy_wav.size(-1))
+                loss = (frame_weight * asym_weight * error.pow(2)).mean()
 
-                    loss = multi_res_stft_loss(enhanced_wav, clean_wav, fft_sizes, perc_gamma)
+                optimizer.zero_grad()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                scheduler.step()
 
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    scheduler.step()
-
-                    train_loss_sum += loss.item()
-                    pbar.set_postfix(loss=f"{loss.item():.5f}")
-            else:
-                for features, targets in pbar:
-                    features = features.to(device)
-                    targets = targets.to(device)
-
-                    pred_gains, _ = model(features)
-                    # Conv1d valid padding 減少 2 個 frame; lookahead 決定 target 對齊位置
-                    # lookahead=0: output[i] 對應 input[i+2] → targets[:, 2:   ]
-                    # lookahead=1: output[i] 對應 input[i+1] → targets[:, 1:-1 ]
-                    t_end = -LOOKAHEAD if LOOKAHEAD > 0 else None
-                    targets = targets[:, 2 - LOOKAHEAD : t_end, :]
-
-                    # Speech-weighted asymmetric loss
-                    speech_weight = targets.mean(dim=-1, keepdim=True)
-                    nb = torch.where(speech_weight < 0.1,
-                                     torch.tensor(noise_frame_boost), torch.ones(1))
-                    frame_weight = nb + speech_frame_scale * speech_weight
-
-                    pred_g = pred_gains ** gamma
-                    targ_g = targets ** gamma
-                    error = pred_g - targ_g
-                    # error > 0: noise leak (over-estimation); error < 0: over-suppression
-                    asym_weight = torch.where(error > 0, loss_over_weight, loss_under_weight)
-
-                    loss = (frame_weight * asym_weight * error.pow(2)).mean()
-
-                    optimizer.zero_grad()
-                    loss.backward()
-                    nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    scheduler.step()
-
-                    train_loss_sum += loss.item()
-                    pbar.set_postfix(loss=f"{loss.item():.5f}")
+                train_loss_sum += loss.item()
+                pbar.set_postfix(loss=f"{loss.item():.5f}")
 
         avg_train = train_loss_sum / len(train_loader)
 
@@ -535,50 +318,27 @@ def train(args):
         model.eval()
         val_loss_sum = 0
         with torch.no_grad():
-            if use_wav:
-                for noisy_wav, clean_wav in val_loader:
-                    noisy_wav = noisy_wav.to(device)
-                    clean_wav = clean_wav.to(device)
-
-                    noisy_spec = torch.stft(
-                        noisy_wav, N_FFT, HOP_LEN, WIN_LEN,
-                        window=stft_window, return_complex=True, center=True)
-                    power = noisy_spec.abs().pow(2).permute(0, 2, 1)
-                    features = extract_erb_features(power, BIN_EDGES, EMA_ALPHA)
-                    features = F.pad(features, (0, 0, 2 - LOOKAHEAD, LOOKAHEAD))
-                    pred_gains, _ = model(features)
-                    enhanced_spec = apply_erb_gains_batch(
-                        noisy_spec, pred_gains, BIN_EDGES, LOOKAHEAD)
-                    enhanced_wav = torch.istft(
-                        enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
-                        window=stft_window, length=noisy_wav.size(-1))
-                    val_loss_sum += multi_res_stft_loss(
-                        enhanced_wav, clean_wav, fft_sizes, perc_gamma).item()
-            else:
-                for features, targets in val_loader:
-                    features = features.to(device)
-                    targets = targets.to(device)
-                    pred_gains, _ = model(features)
-                    t_end = -LOOKAHEAD if LOOKAHEAD > 0 else None
-                    targets = targets[:, 2 - LOOKAHEAD : t_end, :]
-                    sw = targets.mean(dim=-1, keepdim=True)
-                    nb = torch.where(sw < 0.1,
-                                     torch.tensor(noise_frame_boost), torch.ones(1))
-                    fw = nb + speech_frame_scale * sw
-                    pg = pred_gains ** gamma
-                    tg = targets ** gamma
-                    err = pg - tg
-                    aw = torch.where(err > 0, loss_over_weight, loss_under_weight)
-                    val_loss_sum += (fw * aw * err.pow(2)).mean().item()
+            for features, targets in val_loader:
+                features = features.to(device)
+                targets = targets.to(device)
+                pred_gains, _ = model(features)
+                targets = targets[:, 2:, :]
+                # 同 training: speech-weighted asymmetric loss
+                sw = targets.mean(dim=-1, keepdim=True)
+                fw = 1.0 + 2.0 * sw
+                pg = pred_gains ** gamma
+                tg = targets ** gamma
+                err = pg - tg
+                aw = torch.where(err > 0, 1.5, 1.0)
+                val_loss_sum += (fw * aw * err.pow(2)).mean().item()
 
         avg_val = val_loss_sum / max(len(val_loader), 1)
         print(f"  train_loss={avg_train:.5f}  val_loss={avg_val:.5f}")
 
-        # 儲存 checkpoint (compiled model 要取 _orig_mod 避免 key 有 _orig_mod. 前綴)
-        raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        # 儲存 checkpoint
         ckpt = {
             'epoch': epoch,
-            'state_dict': raw_model.state_dict(),
+            'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'loss': avg_val,
@@ -587,25 +347,14 @@ def train(args):
             'config': {
                 'sr': SR, 'n_fft': N_FFT, 'win_len': WIN_LEN,
                 'hop_len': HOP_LEN, 'n_bands': N_BANDS,
-                'lookahead_frames': LOOKAHEAD,
-                'gamma': gamma, 'loss_over_weight': loss_over_weight,
-                'loss_under_weight': loss_under_weight,
             },
         }
         torch.save(ckpt, os.path.join(output_dir, f'rnnoise_epoch{epoch}.pth'))
 
         if avg_val < best_val_loss:
             best_val_loss = avg_val
-            no_improve_count = 0
             torch.save(ckpt, os.path.join(output_dir, 'rnnoise_best.pth'))
             print(f"  ✓ best model saved (val_loss={avg_val:.5f})")
-        else:
-            no_improve_count += 1
-            if patience > 0:
-                print(f"  no improvement {no_improve_count}/{patience}")
-                if no_improve_count >= patience:
-                    print(f"  Early stopping at epoch {epoch}")
-                    break
 
 # ============================================================
 # CLI
@@ -620,11 +369,7 @@ if __name__ == '__main__':
     parser.add_argument('--gpu', type=int, default=None,
                         help='指定 GPU ID (例: --gpu 0)')
     parser.add_argument('--precomputed', default=None,
-                        help='預生成資料目錄 (.pt shard 格式, 舊版)')
-    parser.add_argument('--packed-dir', default=None,
-                        help='包含 .pt 檔的資料夾，自動掃描全部 (pack_dataset.py 產生)')
-    parser.add_argument('--packed-data', default=None, nargs='+',
-                        help='指定 .pt 檔，可多個；與 --packed-dir 可同時使用')
+                        help='預生成資料目錄 (gen_dataset.py 產生)')
     parser.add_argument('--resume', default=None,
                         help='Checkpoint 路徑，從斷點續訓')
     parser.add_argument('--seed', type=int, default=42,

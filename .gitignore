@@ -43,5 +43,3 @@ ainr/RNNoise-ERB/output/
 
 # Claude Code
 .claude/
-pipelines/aec_nr_pipeline
-pipelines/aec_nr_pipeline_static

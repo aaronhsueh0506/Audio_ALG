@@ -8,17 +8,40 @@
 
 #include "hpf.h"
 #include <stdlib.h>
+#include <string.h>
 #include <math.h>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
 
+/* 16-byte alignment for static memory placement */
+#ifndef ALIGN16
+#define ALIGN16(x) (((x) + 15) & ~(size_t)15)
+#endif
+
 struct Hpf {
     float b0, b1, b2;
     float a1, a2;
     float z1, z2;
+    int is_static;
 };
+
+/* Compute filter coefficients (shared by create and init) */
+static void hpf_compute_coeffs(Hpf* h, float cutoff_hz, int sample_rate) {
+    float wc = 2.0f * (float)M_PI * cutoff_hz / (float)sample_rate;
+    float wc_w = tanf(wc / 2.0f);
+    float k = wc_w * wc_w;
+    float sqrt2 = 1.41421356237f;
+    float norm = 1.0f / (1.0f + sqrt2 * wc_w + k);
+    h->b0 =  norm;
+    h->b1 = -2.0f * norm;
+    h->b2 =  norm;
+    h->a1 =  2.0f * (k - 1.0f) * norm;
+    h->a2 =  (1.0f - sqrt2 * wc_w + k) * norm;
+    h->z1 = 0.0f;
+    h->z2 = 0.0f;
+}
 
 Hpf* hpf_create(float cutoff_hz, int sample_rate) {
     if (cutoff_hz <= 0 || sample_rate <= 0) return NULL;
@@ -26,27 +49,29 @@ Hpf* hpf_create(float cutoff_hz, int sample_rate) {
     Hpf* h = (Hpf*)calloc(1, sizeof(Hpf));
     if (!h) return NULL;
 
-    /* Bilinear transform: pre-warp analog frequency */
-    float wc = 2.0f * (float)M_PI * cutoff_hz / (float)sample_rate;
-    float wc_w = tanf(wc / 2.0f);
-    float k = wc_w * wc_w;
-    float sqrt2 = 1.41421356237f;
-    float norm = 1.0f / (1.0f + sqrt2 * wc_w + k);
+    hpf_compute_coeffs(h, cutoff_hz, sample_rate);
+    return h;
+}
 
-    /* Transfer function coefficients */
-    h->b0 =  norm;
-    h->b1 = -2.0f * norm;
-    h->b2 =  norm;
-    h->a1 =  2.0f * (k - 1.0f) * norm;
-    h->a2 =  (1.0f - sqrt2 * wc_w + k) * norm;
+/* --- Static memory API --- */
 
-    h->z1 = 0.0f;
-    h->z2 = 0.0f;
+size_t hpf_get_mem_size(void) {
+    return ALIGN16(sizeof(Hpf));
+}
 
+Hpf* hpf_init(void* mem, size_t mem_size, float cutoff_hz, int sample_rate) {
+    if (!mem || cutoff_hz <= 0 || sample_rate <= 0) return NULL;
+    if (mem_size < hpf_get_mem_size()) return NULL;
+
+    Hpf* h = (Hpf*)mem;
+    memset(h, 0, sizeof(Hpf));
+    h->is_static = 1;
+    hpf_compute_coeffs(h, cutoff_hz, sample_rate);
     return h;
 }
 
 void hpf_destroy(Hpf* hpf) {
+    if (!hpf || hpf->is_static) return;
     free(hpf);
 }
 

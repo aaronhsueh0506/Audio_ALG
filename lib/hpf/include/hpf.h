@@ -16,18 +16,16 @@ extern "C" {
 
 typedef struct Hpf Hpf;
 
-/**
- * Create high-pass filter
- *
- * @param cutoff_hz  Cutoff frequency in Hz (e.g. 80.0)
- * @param sample_rate Sample rate in Hz (e.g. 16000)
- * @return Filter handle, or NULL on error
- */
+/** Create high-pass filter (malloc version) */
 Hpf* hpf_create(float cutoff_hz, int sample_rate);
 
-/**
- * Destroy high-pass filter
- */
+/** Initialize HPF in pre-allocated memory (static version) */
+Hpf* hpf_init(void* mem, size_t mem_size, float cutoff_hz, int sample_rate);
+
+/** Get memory required for hpf_init() */
+size_t hpf_get_mem_size(void);
+
+/** Destroy HPF (no-op if created via hpf_init) */
 void hpf_destroy(Hpf* hpf);
 
 /**

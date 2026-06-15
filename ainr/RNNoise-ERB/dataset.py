@@ -230,18 +230,15 @@ def estimate_rt60(rir: torch.Tensor, sr: int) -> float:
 # ============================================================
 
 def prepare_rir(rir: torch.Tensor, sr: int,
-                late_offset_ms: float = 20.0,
-                pre_delay_keep_ms: float = 1.0,
-                rt60: float = 0.5,
+                early_ms: float = 50.0,
+                pre_delay_keep_ms: float = 1.0
                 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    DFN3 風格 RIR 前處理:
+    RIR 前處理:
     1. 移除 pre-delay (peak 前只保留 pre_delay_keep_ms)
-    2. target_rir = peak + late_offset_ms 之內保留, 之後依 RT60 指數衰減
-       (amplitude -60dB at t=RT60 ⇒ tau = RT60 / 3)
-    3. full_rir = 去 pre-delay 後的完整 RIR (給 noisy 混合用)
+    2. 產生 early_rir (target 用) 和 full_rir (noisy 混合用)
 
-    回傳: (target_rir, full_rir)
+    回傳: (early_rir, full_rir)
     """
     # 移除 pre-delay
     peak_idx = torch.argmax(torch.abs(rir)).item()
@@ -249,22 +246,22 @@ def prepare_rir(rir: torch.Tensor, sr: int,
     start_idx = max(0, peak_idx - keep_samples)
     rir = rir[start_idx:]
 
-    # full_rir 給 noisy 混合用
+    # full_rir = 去 delay 後的完整 RIR
     full_rir = rir.clone()
 
-    # target_rir 對 late tail 指數衰減
+    # early_rir = peak 後保留 early_ms + fade-out
     new_peak = min(keep_samples, len(rir) - 1)
-    offset = new_peak + int(sr * late_offset_ms / 1000)
+    early_samples = int(sr * early_ms / 1000)
+    end_idx = min(new_peak + early_samples, len(rir))
+    early_rir = rir[:end_idx].clone()
 
-    target_rir = rir.clone()
-    if offset < len(target_rir):
-        tau = max(rt60, 0.05) / 3.0  # amplitude -60dB at t=RT60
-        n_decay = len(target_rir) - offset
-        t_idx = torch.arange(n_decay, dtype=torch.float32) / sr
-        decay = (10.0 ** (-t_idx / tau)).to(target_rir.dtype)
-        target_rir[offset:] = target_rir[offset:] * decay
+    # fade-out window (最後 5ms half-Hann)
+    fade_len = min(int(sr * 5 / 1000), early_samples // 4)
+    if fade_len > 0 and fade_len < len(early_rir):
+        fade = torch.hann_window(fade_len * 2)[fade_len:]
+        early_rir[-fade_len:] *= fade
 
-    return target_rir, full_rir
+    return early_rir, full_rir
 
 
 def fftconvolve(signal: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
@@ -396,11 +393,10 @@ class DNS4Dataset(Dataset):
     7. Bandwidth limitation (noisy + target)
     8. Clipping distortion (noisy only)
     9. Clipping prevention
-    10. STFT → features + target gains  (return_raw=False)
-        OR return (noisy, clean) raw audio tensors (return_raw=True)
+    10. STFT → features + target gains
     """
 
-    def __init__(self, cfg: configparser.ConfigParser, return_raw: bool = False):
+    def __init__(self, cfg: configparser.ConfigParser):
         # signal params
         self.sr = cfg.getint('signal', 'sr')
         self.n_fft = cfg.getint('signal', 'n_fft')
@@ -425,11 +421,9 @@ class DNS4Dataset(Dataset):
         self.rt60_max = cfg.getfloat('rir', 'rt60_max')
         self.early_rir_ms = cfg.getfloat('rir', 'early_rir_ms')
         self.pre_delay_keep_ms = cfg.getfloat('rir', 'pre_delay_keep_ms')
-        self.drr = cfg.getfloat('rir', 'drr', fallback=0.3)
 
         # noise
         self.max_noise_mix = cfg.getint('noise', 'max_noise_mix')
-        self.noise_only_p = cfg.getfloat('noise', 'noise_only_p', fallback=0.05)
 
         # augmentation
         self.p_biquad = cfg.getfloat('augmentation', 'p_biquad')
@@ -443,8 +437,6 @@ class DNS4Dataset(Dataset):
         self.p_clipping = cfg.getfloat('augmentation', 'p_clipping')
         self.clip_snr_min = cfg.getfloat('augmentation', 'clip_snr_min')
         self.clip_snr_max = cfg.getfloat('augmentation', 'clip_snr_max')
-
-        self.return_raw = return_raw
 
         # epoch size
         self.epoch_size = cfg.getint('training', 'epoch_size')
@@ -466,9 +458,8 @@ class DNS4Dataset(Dataset):
         if not self.noise_files:
             raise FileNotFoundError(f"No .wav files found in {noise_dir}")
 
-        # RIR: load paths + filter by RT60 (with cache). 也保留 rt60_map 給 prepare_rir 用
+        # RIR: load paths + filter by RT60 (with cache)
         self.rir_files = []
-        self.rt60_map = {}
         if rir_dir and os.path.isdir(rir_dir):
             self.rir_files = self._load_rir_paths_cached(rir_dir)
 
@@ -501,12 +492,7 @@ class DNS4Dataset(Dataset):
             'rt60_max': self.rt60_max,
         }, sort_keys=True)
         cache_hash = hashlib.sha256(key_str.encode()).hexdigest()[:16]
-        cache_name = f'.rir_rt60_cache_{cache_hash}.json'
-        primary_path = os.path.join(rir_dir, cache_name)
-        fallback_path = os.path.join(os.getcwd(), cache_name)
-
-        # 嘗試讀 cache: 先看 rir_dir 旁邊, 沒有才看 cwd
-        cache_path = primary_path if os.path.isfile(primary_path) else fallback_path
+        cache_path = os.path.join(rir_dir, f'.rir_rt60_cache_{cache_hash}.json')
 
         # 嘗試讀 cache
         if os.path.isfile(cache_path):
@@ -516,7 +502,6 @@ class DNS4Dataset(Dataset):
             valid = [p for p in cached['rir_files'] if os.path.isfile(p)]
             if len(valid) == len(cached['rir_files']):
                 print(f"RIR cache hit: {cache_path} ({len(valid)} files)")
-                self.rt60_map = cached.get('rt60_map', {})
                 return valid
             print(f"RIR cache stale (missing files), rescanning...")
 
@@ -545,21 +530,13 @@ class DNS4Dataset(Dataset):
             'rir_files': passed,
             'rt60_map': rt60_map,
         }
-        # 寫 cache: 優先 rir_dir 旁邊, 失敗則寫到當前工作目錄
-        saved = False
-        for candidate in (primary_path, fallback_path):
-            try:
-                with open(candidate, 'w') as f:
-                    json.dump(cache_data, f)
-                print(f"  → Cache saved: {candidate}")
-                saved = True
-                break
-            except OSError as e:
-                print(f"  ⚠ Cache write failed at {candidate}: {e}")
-        if not saved:
-            print(f"  ⚠ 兩個位置都寫不進去, 下次跑會重 scan")
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump(cache_data, f)
+            print(f"  → Cache saved: {cache_path}")
+        except OSError:
+            pass  # 寫不了就算了，下次重算
 
-        self.rt60_map = rt60_map
         return passed
 
     def _shuffle_indices(self):
@@ -592,11 +569,9 @@ class DNS4Dataset(Dataset):
     # --------------------------------------------------------
 
     def _load_and_crop(self, path: str, target_len: int) -> torch.Tensor:
-        """載入音檔 → resample → 隨機裁切。空檔或損壞檔會 raise RuntimeError。"""
+        """載入音檔 → resample → 隨機裁切"""
         audio, orig_sr = torchaudio.load(path)
         audio = audio[0]  # mono
-        if audio.numel() == 0:
-            raise RuntimeError(f"Empty audio: {path}")
         if orig_sr != self.sr:
             audio = torchaudio.functional.resample(audio, orig_sr, self.sr)
         if len(audio) >= target_len:
@@ -619,15 +594,14 @@ class DNS4Dataset(Dataset):
         start = random.randint(0, len(audio) - target_len)
         return audio[start:start + target_len]
 
-    def _load_rir(self) -> Tuple[torch.Tensor, float]:
-        """載入隨機 RIR → resample. 同時回傳 cached RT60 (給 prepare_rir 算指數衰減 tau)"""
+    def _load_rir(self) -> torch.Tensor:
+        """載入隨機 RIR → resample"""
         path = random.choice(self.rir_files)
         audio, orig_sr = torchaudio.load(path)
         audio = audio[0]
         if orig_sr != self.sr:
             audio = torchaudio.functional.resample(audio, orig_sr, self.sr)
-        rt60 = self.rt60_map.get(path, 0.5)  # fallback if cache miss
-        return audio, rt60
+        return audio
 
     # --------------------------------------------------------
     # Feature extraction
@@ -674,48 +648,33 @@ class DNS4Dataset(Dataset):
     # --------------------------------------------------------
 
     def __getitem__(self, idx):
-        # Retry: 遇到空檔/損壞檔時隨機換一個 sample，最多重試 5 次
-        for _retry in range(5):
-            try:
-                return self._getitem_impl(idx)
-            except (RuntimeError, Exception) as e:
-                idx = random.randint(0, len(self._indices) - 1)
-        return self._getitem_impl(idx)
-
-    def _getitem_impl(self, idx):
         real_idx = self._indices[idx]
         target_len = self.segment_samples
 
-        # Noise-only sample: 讓模型學會「純噪音 → gain 全 0」(DFN3 = 0.05)
-        noise_only = random.random() < self.noise_only_p
+        # 1. Load clean speech
+        speech = self._load_and_crop(self.speech_files[real_idx], target_len)
 
-        if not noise_only:
-            # 1. Load clean speech
-            speech = self._load_and_crop(self.speech_files[real_idx], target_len)
+        # 2. Speech augmentation: RandBiquadFilter (混合前)
+        if random.random() < self.p_biquad:
+            speech = rand_biquad_filter(
+                speech, self.sr,
+                n_filters=self.n_biquad_filters,
+                gain_db=self.biquad_gain_db,
+                q_min=self.biquad_q_min,
+                q_max=self.biquad_q_max)
 
-            # 2. Speech augmentation: RandBiquadFilter (混合前)
-            if random.random() < self.p_biquad:
-                speech = rand_biquad_filter(
-                    speech, self.sr,
-                    n_filters=self.n_biquad_filters,
-                    gain_db=self.biquad_gain_db,
-                    q_min=self.biquad_q_min,
-                    q_max=self.biquad_q_max)
-
-            # 3. RIR convolution (DFN3-style: target = drr·dry + (1-drr)·early_reverb)
-            if self.rir_files and random.random() < self.p_rir:
-                rir, rt60 = self._load_rir()
-                target_rir, full_rir = prepare_rir(
-                    rir, self.sr,
-                    late_offset_ms=self.early_rir_ms,
-                    pre_delay_keep_ms=self.pre_delay_keep_ms,
-                    rt60=rt60)
-                early_reverb = fftconvolve(speech, target_rir)
-                reverbed     = fftconvolve(speech, full_rir)
-                target = self.drr * speech + (1.0 - self.drr) * early_reverb
-            else:
-                target = speech.clone()
-                reverbed = speech.clone()
+        # 3. RIR convolution
+        if self.rir_files and random.random() < self.p_rir:
+            rir = self._load_rir()
+            early_rir, full_rir = prepare_rir(
+                rir, self.sr,
+                early_ms=self.early_rir_ms,
+                pre_delay_keep_ms=self.pre_delay_keep_ms)
+            target = fftconvolve(speech, early_rir)
+            reverbed = fftconvolve(speech, full_rir)
+        else:
+            target = speech.clone()
+            reverbed = speech.clone()
 
         # 4. Load noise (multi-source)
         n_noises = random.randint(1, self.max_noise_mix)
@@ -732,25 +691,17 @@ class DNS4Dataset(Dataset):
                 q_min=self.biquad_q_min,
                 q_max=self.biquad_q_max)
 
-        if noise_only:
-            # Noise-only: noisy = noise, target = silence
-            noisy = noise.clone()
-            target = torch.zeros(target_len)
-        else:
-            # 6. Segmental SNR mixing
-            snr_db = sample_snr(self.snr_ranges)
-            speech_rms = active_rms(reverbed, self.sr)
-            noise_rms = active_rms(noise, self.sr)
-            noise_scaled = noise * (speech_rms / noise_rms) * (10 ** (-snr_db / 20))
-            noisy = reverbed + noise_scaled
+        # 6. Segmental SNR mixing
+        snr_db = sample_snr(self.snr_ranges)
+        speech_rms = active_rms(reverbed, self.sr)
+        noise_rms = active_rms(noise, self.sr)
+        noise_scaled = noise * (speech_rms / noise_rms) * (10 ** (-snr_db / 20))
+        noisy = reverbed + noise_scaled
 
         # 7. Gain randomization
         target_rms_db = random.uniform(self.target_rms_min, self.target_rms_max)
         target_rms_linear = 10 ** (target_rms_db / 20)
-        if noise_only:
-            current_rms = active_rms(noisy, self.sr)
-        else:
-            current_rms = active_rms(target, self.sr)
+        current_rms = active_rms(target, self.sr)
         scale = target_rms_linear / current_rms
         target = target * scale
         noisy = noisy * scale
@@ -768,9 +719,6 @@ class DNS4Dataset(Dataset):
         # 10. Clipping prevention
         target, noisy = prevent_clipping(target, noisy)
 
-        if self.return_raw:
-            return noisy, target
-
         # 11. STFT → features + target gains
         clean_spec = self._stft(target)
         noisy_spec = self._stft(noisy)
@@ -787,91 +735,6 @@ class DNS4Dataset(Dataset):
 # ============================================================
 # Precomputed Dataset (讀取 gen_dataset.py 產生的 .pt shard)
 # ============================================================
-
-class WavPairDataset(Dataset):
-    """
-    讀取 2-channel WAV pair (ch0=noisy, ch1=clean). 遞迴掃描子資料夾。
-
-    目錄結構彈性, 例如:
-        data_dir/
-            pairs/000000.wav, 000001.wav, ...     # gen_dataset 預設輸出
-        或
-        data_dir/
-            batch_a/pairs/*.wav
-            batch_b/pairs/*.wav                    # 多批 gen 結果合併
-
-    用法:
-        dataset = WavPairDataset('data/')
-        noisy_wav, clean_wav = dataset[0]   # shape: (T,) each
-    """
-
-    def __init__(self, data_dir: str):
-        import json
-        self.data_dir = data_dir
-
-        if not os.path.isdir(data_dir):
-            raise FileNotFoundError(f"data_dir not found: {data_dir}")
-
-        # meta.json optional, 只當參考資訊
-        meta_path = os.path.join(data_dir, 'meta.json')
-        if os.path.isfile(meta_path):
-            with open(meta_path) as f:
-                self.meta = json.load(f)
-        else:
-            self.meta = {}
-
-        # 遞迴掃描所有 .wav (絕對路徑)
-        self.files = sorted(
-            glob.glob(os.path.join(data_dir, '**', '*.wav'), recursive=True)
-        )
-        if not self.files:
-            raise FileNotFoundError(f"No .wav files found under {data_dir}")
-
-        print(f"WavPairDataset: {len(self.files)} pairs from {data_dir} (recursive)")
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        audio, _ = torchaudio.load(self.files[idx])
-        # audio: (2, T) — ch0=noisy, ch1=clean
-        if audio.shape[0] < 2:
-            raise ValueError(
-                f"Expected 2-channel WAV, got {audio.shape[0]}-ch: {self.files[idx]}"
-            )
-        return audio[0], audio[1]
-
-
-class PackedDataset(Dataset):
-    """
-    讀取 pack_dataset.py 產生的單一 .pt 檔，所有資料已載入 RAM，
-    訓練時零 I/O 開銷，適合中小型 dataset (< 可用 RAM)。
-
-    用法:
-        dataset = PackedDataset('data/packed.pt')
-        noisy_wav, clean_wav = dataset[0]   # shape: (T,) each, float32
-    """
-
-    def __init__(self, pt_path: str):
-        if not os.path.isfile(pt_path):
-            raise FileNotFoundError(f"Packed dataset not found: {pt_path}")
-
-        print(f"PackedDataset: loading {pt_path} ...")
-        obj = torch.load(pt_path, map_location='cpu', weights_only=True)
-        self.data = obj['data']   # (N, 2, T)
-        self.sr = obj.get('sr', 16000)
-        N, _, T = self.data.shape
-        size_mb = self.data.nbytes / 1024 ** 2
-        print(f"PackedDataset: {N} pairs, T={T}, SR={self.sr}, "
-              f"dtype={self.data.dtype}, {size_mb:.0f} MB in RAM")
-
-    def __len__(self):
-        return self.data.shape[0]
-
-    def __getitem__(self, idx):
-        pair = self.data[idx]               # (2, T)
-        return pair[0].float(), pair[1].float()   # noisy, clean (always float32)
-
 
 class PrecomputedDataset(Dataset):
     """
