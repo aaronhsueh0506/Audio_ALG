@@ -24,11 +24,14 @@ from pipelines.aec_nr_pipeline import (                         # noqa: E402
     run_aec_linear, run_nr_spectrum, run_res,
 )
 from pipelines.rebench_sep_vs_classic import (                  # noqa: E402
-    estimate_delay, CORPUS, SCENARIOS, SR, FL, NR_GAIN,
+    estimate_delay, CORPUS, SCENARIOS, SR, FL, NR_PRESET,
 )
 
 NE_FLOOR = float(os.environ.get('NE_FLOOR', '0.4'))
 NE_GATE = os.environ.get('NE_GATE', 'both')
+# Env override lets one renderer cover any NR preset (mild/balanced/aggressive);
+# defaults to the shipped 'balanced' so the production render is unchanged.
+NR_PRESET = os.environ.get('NR_PRESET', NR_PRESET)
 
 
 def _cfg(enable_res):
@@ -53,7 +56,7 @@ def process(mic_path, lpb_path, out_path):
     with contextlib.redirect_stdout(io.StringIO()):
         np.random.seed(0)
         _, ctx = run_aec_linear(mic, ref, _cfg(True))
-        g = run_nr_spectrum(ctx, sr, g_min_db=NR_GAIN)
+        g = run_nr_spectrum(ctx, sr, nr_preset=NR_PRESET)
         out = run_res(np.zeros(n, dtype=np.float32), g, ctx, _cfg(False),
                       use_res=True, combine='min', ne_floor=NE_FLOOR, ne_gate=NE_GATE)
     sf.write(out_path, out[:n], sr, subtype='FLOAT')

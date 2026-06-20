@@ -30,7 +30,7 @@ def estimate_delay(mic, ref, sr, max_delay_ms=250.0):
     return int(np.argmax(xcorr[:max_search + 1]))
 
 
-def process_case(mic_path, lpb_path, out_path, preset, fl, nr_gain_db):
+def process_case(mic_path, lpb_path, out_path, preset, fl, nr_preset):
     mic, sr = sf.read(mic_path, dtype='float32')
     ref, _ = sf.read(lpb_path, dtype='float32')
     if mic.ndim > 1: mic = mic[:, 0]
@@ -54,7 +54,7 @@ def process_case(mic_path, lpb_path, out_path, preset, fl, nr_gain_db):
     aec_out, contexts = run_aec_linear(mic, ref, config)
 
     # Stage 2: NR
-    nr_out, nr_gains = run_nr(aec_out, sr, g_min_db=nr_gain_db, return_gain=True)
+    nr_out, nr_gains = run_nr(aec_out, sr, nr_preset=nr_preset, return_gain=True)
 
     # Stage 3: RES (A_min_pl: g_total = min(G_nr, G_res))
     config_res = AecConfig.from_preset(preset,
@@ -67,7 +67,7 @@ def process_case(mic_path, lpb_path, out_path, preset, fl, nr_gain_db):
     return out_path
 
 
-def run_scenario(base_dir, subdir, out_dir, preset, fl, nr_gain_db):
+def run_scenario(base_dir, subdir, out_dir, preset, fl, nr_preset):
     sc_dir = os.path.join(base_dir, subdir)
     if not os.path.isdir(sc_dir):
         return f"No {subdir} directory"
@@ -87,7 +87,7 @@ def run_scenario(base_dir, subdir, out_dir, preset, fl, nr_gain_db):
             results.append(out_path)
             continue
 
-        process_case(mic_path, lpb_path, out_path, preset, fl, nr_gain_db)
+        process_case(mic_path, lpb_path, out_path, preset, fl, nr_preset)
         results.append(out_path)
 
     return f"{subdir}: {len(results)} cases"
@@ -99,7 +99,8 @@ def main():
     parser.add_argument('--preset', default='balanced',
                         choices=['gentle', 'balanced', 'aggressive'])
     parser.add_argument('--filter', type=int, default=512)
-    parser.add_argument('--nr-gain', type=float, default=-15.0)
+    parser.add_argument('--nr-preset', default='balanced',
+                        choices=['mild', 'balanced', 'aggressive'])
     parser.add_argument('-o', '--output-dir', default=None)
     args = parser.parse_args()
 
@@ -111,7 +112,7 @@ def main():
 
     for subdir in ['farend_singletalk', 'nearend_singletalk', 'doubletalk']:
         print(f"\n=== {subdir} ===")
-        result = run_scenario(base_dir, subdir, out_dir, preset, args.filter, args.nr_gain)
+        result = run_scenario(base_dir, subdir, out_dir, preset, args.filter, args.nr_preset)
         print(result)
 
     print(f"\nOutput saved to {out_dir}")

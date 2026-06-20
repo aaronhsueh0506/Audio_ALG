@@ -98,11 +98,56 @@ ref ──────┘   (ref 不經 HPF；時域進，頻域 context 出)   
 # malloc 版（標準用法）
 make -C pipelines libs
 make -C pipelines aec_nr_pipeline
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav [preset]
+
+# AEC preset 為 positional（gentle/balanced/aggressive）；NR 用 --nr-preset（mild/balanced/aggressive）
+./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --nr-preset balanced
+./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav aggressive --nr-preset aggressive
 
 # 僅 AEC（不跑 NR/RES）
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --aec-only
 ```
+
+### Python 用法（演算法開發 / 驗證）
+
+Python 參考實作與上面的 C 版**同演算法**。先初始化 submodule（`git submodule update --init --recursive`），相依 `numpy` / `soundfile`（macOS 用 `python3`）。從 **Audio_ALG 根目錄**以 module 形式跑（腳本會自動把 `lib/aec/python` 與 `lib/nr` 加進 path）：
+
+```bash
+cd Audio_ALG
+
+# 單檔（freq A_min_pl：AEC 線性 → NR(E) → RES，單一 FFT；g_total=min(g_nr,g_res)）
+python3 -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav
+
+# 各自指定 AEC / NR preset
+python3 -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav --aec-preset balanced --nr-preset aggressive
+
+# 僅 AEC（跳過 NR/RES）
+python3 -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav --aec-only
+```
+
+**主要參數（CLI 只開放 preset + 開關）：**
+
+| 參數 | 預設 | 說明 |
+|------|------|------|
+| `--mic` `--ref` `--output` | (必填) | mic 輸入 / 參考(喇叭) / 輸出 WAV |
+| `--aec-preset` | `balanced` | `gentle` / `balanced` / `aggressive`（見下方 AEC Preset 表；差異只在 min-gain floor）|
+| `--nr-preset` | `balanced` | `mild` / `balanced` / `aggressive`（見下方 NR Preset 表）|
+| `--aec-only` | off | 只跑 AEC，跳過 NR/RES |
+
+> Pipeline 固定走生產的 **freq A_min_pl** 路徑（PBFDKF、`g_total=min(g_nr,g_res)`、per-bin 近端 floor）。低階旋鈕（mu / ne-floor / combine / pipeline-mode / aec-mode）與 legacy v0 已移除，改由 preset 決定。
+
+**800-case Blind Test（render + 本地 AECMOS/DNSMOS 評分）：**
+
+```bash
+cd Audio_ALG
+
+# A) 直接 render 三個 scenario（farend / nearend / doubletalk）
+python3 -m pipelines.eval_pipeline_blind <aec_challenge_blind/> --preset balanced --nr-preset balanced -o out_pipeline/
+
+# B) ship 基準的 A_min_pl 並行 renderer（上方成績表就是用這支）
+NE_FLOOR=0.4 NE_GATE=both REBENCH_WORKERS=8 python3 -m pipelines.rebench_joint <out_dir> [ne_floor] [ne_gate] [limit]
+# 評分：見 rebench_joint.py docstring（用 AEC repo 的 bench_aecmos.py 對照 echo/deg）
+```
+> ⚠ `rebench_joint` 預設 **skip-if-exists**：`<out_dir>` 有舊版 render 會被當 ok 跳過 → 換版本前先刪掉重 render。AECMOS/DNSMOS 評分需 `speechmos` + `onnxruntime≤1.16.3` + `numpy<2` 的 venv。
 
 架構圖：[Overview](docs/pipeline_overview.png) · [Detailed](docs/pipeline_detailed.png)
 
@@ -141,13 +186,15 @@ make -C pipelines aec_nr_pipeline
 
 ## NR Preset（Mode）設定
 
-NR 有三個 mode，透過 `MmseLsaNrMode` 或 `--nr-gain` 控制最低增益：
+NR 有三個 preset（pipeline `--nr-preset`；C 端 `MmseLsaNrMode` / `mmse_lsa_config_for_mode`）：
 
 | Mode | `g_min_db` | `q` (SPP) | `xi_min_db` | `alpha_d` | `alpha_g` | 特性 |
 |------|-----------|-----------|-------------|-----------|-----------|------|
 | `MILD` | **−10 dB** | 0.60 | −15 dB | 0.85 | 0.92 | 近端優先：最低壓制；適合近距離說話場景 |
 | `BALANCED` | **−15 dB** | 0.50 | −20 dB | 0.70 | 0.88 | 預設值：噪聲抑制與語音保留的平衡點 |
 | `AGGRESSIVE` | **−20 dB** | 0.35 | −25 dB | 0.50 | 0.75 | 噪聲優先：強力壓制；語音可能有些許洩漏感 |
+
+> **Python pipeline vs C**：Python `--nr-preset` 套用 strength 四元組 **{g_min, q, xi_min, alpha_g}**；`alpha_d` / `L` 維持 pipeline 自己的結構性 tuning（`alpha_d≈0.95` / `L=150`，為 AEC 殘餘信號調過，見 `_build_denoiser`），不隨 preset 變。C 的 `config_for_mode` 另含 `alpha_attack/alpha_decay/alpha_d`。`balanced` = 既有 shipped 值（pipeline byte-equal）。
 
 **參數說明：**
 
@@ -176,45 +223,57 @@ NR 有三個 mode，透過 `MmseLsaNrMode` 或 `--nr-gain` 控制最低增益：
 
 ---
 
-### Blind Test 成績（AEC Challenge Interspeech 2021, 800 cases · no-prealign）
+### Blind Test 成績（AEC Challenge Interspeech 2021, 800 cases · **真 no-prealign**）
 
-**AEC(balanced) alone vs AEC(balanced) + NR + RES**，NR 兩個 strength preset：
-**balanced**（`--nr-gain -15`）與 **mild**（`--nr-gain -10`，近端優先）。RES 用 `min(G_nr, G_res)`。
-本地 ONNX AECMOS/DNSMOS，**無 harness pre-align** —— 讓 AEC 自己的線上 `EchoPathDelayEstimator`
-對齊（真實情境；offline 全訊號 GCC-PHAT pre-align 是已退役的 crutch，會讓 movement 分數偏樂觀）。
+**AEC(balanced) alone vs AEC(balanced) + NR + RES**（RES 用 `min(G_nr, G_res)`）。四欄 =
+AEC 單獨、+NR 三個 preset（`--nr-preset balanced|mild|aggressive`，皆完整 strength 參數組）。
 
-**AECMOS**（echo↑ / deg↑）:
+> **本表 2026-06-20 以 AEC v3.23.0（no-PA matched-filter pre-echo fix + 預設 ON 的 DT-deg recovery stack）全部重跑、真 no-prealign 產生。**
+> AEC-alone = `AEC(balanced)` 含自身 AEC3 post-filter 的完整輸出（= AEC repo 標準產品，**非**純線性）；
+> 已與 AEC/ repo 交叉驗證一致（DT_static deg 2.075 ≈ AEC/ 2.074、DT echo 4.217 ≈ 4.218）。
 
-| 指標 | AEC-alone | +NR(balanced) | +NR(mild) |
-|------|----------|---------------|-----------|
-| FS_static echo   | 3.504 | **3.559** | 3.552 |
-| FS_movement echo | 3.471 | **3.500** | 3.495 |
-| DT_static echo   | 4.203 | 4.201 | 4.199 |
-| DT_movement echo | 4.107 | **4.121** | 4.117 |
-| DT_static deg    | 2.080 | **2.156** | 2.150 |
-| DT_movement deg  | 2.193 | **2.233** | **2.233** |
-| NE deg           | 4.052 | 4.007 | **4.029** |
+本地 ONNX AECMOS/DNSMOS，**完全無 pre-align** —— 純靠 AEC 線上的 matched-filter `EchoPathDelayEstimator`
+自對齊（與 AEC3 內部對齊機制同類，也是生產真實情境）。offline 全訊號 GCC-PHAT pre-align 是已退役的
+crutch：它不只灌高 echo 分數，跟線上 matched filter 併用還會 double-alignment、在部分 movement case
+反而鎖到 phantom peak 害 ERLE 崩掉（見 AEC `CHANGELOG [3.22.1]`）。
 
-**DNSMOS**（SIG/BAK/OVRL↑；BAK = 背景品質，NR 本職，AECMOS 看不到）:
+**AECMOS**（echo↑ / deg↑；echo 由 AEC+RES 決定，NR 近乎中性，故不標記）:
 
-| 指標 | AEC-alone | +NR(balanced) | +NR(mild) |
-|------|----------|---------------|-----------|
-| FS_static BAK   | 2.632 | **2.817** | 2.778 |
-| FS_movement BAK | 2.366 | **2.578** | 2.535 |
-| DT_static BAK   | 2.823 | **2.991** | 2.966 |
-| DT_movement BAK | 2.725 | **2.903** | 2.871 |
-| NE BAK          | 3.848 | 3.867 | **3.869** |
-| NE SIG          | 3.472 | 3.411 | **3.431** |
-| DT_static SIG   | 2.332 | **2.377** | **2.377** |
-| FS_static SIG   | 1.730 | **1.806** | 1.792 |
-| FS_movement SIG | 1.573 | **1.663** | 1.652 |
-| DT_movement SIG | 2.292 | **2.334** | 2.333 |
+| 指標 | AEC-alone | +NR(balanced) | +NR(mild) | +NR(aggressive) |
+|------|----------|---------------|-----------|-----------------|
+| FS_static echo   | 3.525 | 3.494 | 3.498 | 3.465 |
+| FS_movement echo | 3.508 | 3.469 | 3.477 | 3.424 |
+| DT_static echo   | 4.217 | 4.181 | 4.186 | 4.196 |
+| DT_movement echo | 4.112 | 4.095 | 4.098 | 4.107 |
+| DT_static deg    | 2.075 | **2.277** | 2.223 | 2.261 |
+| DT_movement deg  | 2.141 | **2.281** | 2.246 | 2.255 |
+| NE deg           | 4.024 | 4.033 | **4.053** | 3.952 |
 
-> **NR pipeline 對 AEC-alone**：背景 **BAK +0.17~0.21**（降噪本職，AECMOS 量不到）、DT/FS echo & deg
-> 全贏，只賠純 NE SIG（−0.06）。`min(G_nr, G_res)` 撿回 AEC3 的近端感知回音 gain，修好 v0 的
-> DT echo <4.0（v0：DT echo 3.97 / DT deg +0.30，落在被支配的 Pareto 角落，`--legacy-v0` 可還原）。
-> **balanced vs mild**：mild（g_min −10）把 NE 救回（deg **+0.022** / SIG **+0.020**），代價是 FS/DT
-> 背景降噪 **−0.03~0.04 BAK**。**balanced = 降噪優先，mild = 近端優先**（Pareto trade，無全贏）。
+**DNSMOS**（SIG/BAK↑；BAK = 背景品質 = NR 本職，AECMOS 量不到；每列粗體為最佳）:
+
+| 指標 | AEC-alone | +NR(balanced) | +NR(mild) | +NR(aggressive) |
+|------|----------|---------------|-----------|-----------------|
+| FS_static BAK   | 2.653 | 2.861 | 2.784 | **2.982** |
+| FS_movement BAK | 2.376 | 2.624 | 2.521 | **2.771** |
+| DT_static BAK   | 2.871 | 3.070 | 3.003 | **3.143** |
+| DT_movement BAK | 2.741 | 2.955 | 2.883 | **3.033** |
+| NE BAK          | 3.843 | **3.898** | 3.887 | **3.898** |
+| NE SIG          | **3.464** | 3.410 | 3.441 | 3.370 |
+| DT_static SIG   | 2.381 | **2.429** | 2.425 | 2.419 |
+| DT_movement SIG | 2.301 | **2.355** | 2.348 | 2.335 |
+| FS_static SIG   | 1.791 | 1.898 | 1.865 | **1.900** |
+| FS_movement SIG | 1.584 | 1.667 | 1.640 | **1.688** |
+
+> **NR vs AEC-alone**：背景 **BAK +0.20~0.25（FS/DT）**（降噪本職，AECMOS 量不到）、DT 近端 deg 也明顯
+> 改善（DT_static **+0.20** / DT_movement **+0.14**）；echo 由 AEC+RES 決定，NR 近乎中性（FS echo ±0.04 內）。
+> 唯一代價是純 NE SIG（balanced −0.05）。`min(G_nr, G_res)` 撿回 AEC3 的近端感知回音 gain。
+> **NR preset = 純噪聲抑制強度的 Pareto 軸**（不影響 echo/對齊）：
+> - **aggressive** — 背景最乾淨（BAK 全列最高），近端最受損（NE SIG 3.370 最低、NE deg 3.952）。
+> - **mild** — 近端最保留（NE SIG 3.441 / NE deg 4.053 最高），背景降噪最少。
+> - **balanced** — 折衷（預設）。
 >
-> AEC 模組單獨的完整 ours / AEC3 / Speex 三方對照見 [lib/aec/README.md](lib/aec/README.md)。
-> 渲染器:`pipelines/rebench_aec_only.py`(AEC)、`pipelines/rebench_joint.py`(A_min_pl)，皆 `NO_PREALIGN=1`。
+> ✓ **v3.23.0 no-PA matched-filter 修正後，真 no-prealign 的 echo 也達到 ship bar**（AEC-alone FS echo
+> 3.525 >3.5、DT echo 4.217 >4；+NR 近乎同值）—— 先前 no-prealign echo 偏低的落差已由 no-PA 延遲修正補上。
+> AEC 模組 ours / AEC3 / Speex 三方對照（目前仍 pre-align，待重生）見 [lib/aec/README.md](lib/aec/README.md)。
+> 渲染器:`pipelines/rebench_aec_only.py`(AEC-alone = AEC+RES，須 `NO_PREALIGN=1`)、`pipelines/rebench_joint.py`
+> (A_min_pl，預設即 no-prealign；`NR_PRESET=mild|aggressive` 切 preset)。

@@ -89,7 +89,7 @@ make                # Builds both versions
 # Run Version A (malloc)
 ./aec_nr_pipeline mic.wav ref.wav output.wav balanced
 ./aec_nr_pipeline mic.wav ref.wav output.wav --aec-only
-./aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-gain -20
+./aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-preset aggressive
 
 # Run Version B (static memory)
 ./aec_nr_pipeline_static mic.wav ref.wav output.wav balanced

@@ -48,7 +48,7 @@ if not os.path.isdir(CORPUS) or not os.listdir(CORPUS):
 SCENARIOS = ['doubletalk', 'farend_singletalk', 'nearend_singletalk']
 SR = 16000
 FL = 832
-NR_GAIN = -15.0
+NR_PRESET = 'balanced'
 
 
 def estimate_delay(mic, ref, sr, max_delay_ms=1024.0):
@@ -91,14 +91,14 @@ def process_case(mic_path, lpb_path, out_classic, out_sep):
     # ---- Arm A: classic (AEC internal RES -> NR) ----
     np.random.seed(0)
     aec_out = run_aec_classic(mic, ref, _cfg(enable_res=True))
-    nr_out = run_nr(aec_out, sr, g_min_db=NR_GAIN).astype(np.float32)
+    nr_out = run_nr(aec_out, sr, nr_preset=NR_PRESET).astype(np.float32)
     m = min(len(nr_out), n)
     sf.write(out_classic, nr_out[:m], sr, subtype='FLOAT')
 
     # ---- Arm B: separated freq (AEC-linear -> NR(E) -> RES) ----
     np.random.seed(0)
     _, contexts = run_aec_linear(mic, ref, _cfg(enable_res=True))  # run_aec_linear flips res off
-    nr_gains = run_nr_spectrum(contexts, sr, g_min_db=NR_GAIN)
+    nr_gains = run_nr_spectrum(contexts, sr, nr_preset=NR_PRESET)
     sep_out = run_res(np.zeros(n, dtype=np.float32), nr_gains, contexts,
                       _cfg(enable_res=False)).astype(np.float32)
     m = min(len(sep_out), n)

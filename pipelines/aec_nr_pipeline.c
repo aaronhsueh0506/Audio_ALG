@@ -11,9 +11,10 @@
  *   make aec_nr_pipeline
  *
  * Usage:
- *   ./aec_nr_pipeline <mic.wav> <ref.wav> <output.wav> [preset]
- *   preset: gentle, balanced (default), aggressive
- *   options: --aec-only   --nr-gain <dB>
+ *   ./aec_nr_pipeline <mic.wav> <ref.wav> <output.wav> [aec-preset] [--nr-preset <mode>] [--aec-only]
+ *   aec-preset:  gentle | balanced (default) | aggressive   (positional)
+ *   --nr-preset: mild | balanced (default) | aggressive
+ *   --aec-only:  run AEC only, skip NR/RES
  */
 
 #include <stdio.h>
@@ -42,6 +43,20 @@ static const char* preset_name(AecPreset p) {
     }
 }
 
+static MmseLsaNrMode parse_nr_mode(const char* s) {
+    if (strcmp(s, "mild") == 0)       return MMSE_LSA_NR_MILD;
+    if (strcmp(s, "aggressive") == 0) return MMSE_LSA_NR_AGGRESSIVE;
+    return MMSE_LSA_NR_BALANCED;
+}
+
+static const char* nr_mode_name(MmseLsaNrMode m) {
+    switch (m) {
+        case MMSE_LSA_NR_MILD:       return "mild";
+        case MMSE_LSA_NR_AGGRESSIVE: return "aggressive";
+        default:                     return "balanced";
+    }
+}
+
 /* sqrt-Hann window, length n. */
 static void make_sqrt_hann(float* w, int n) {
     for (int k = 0; k < n; k++) {
@@ -54,7 +69,7 @@ static void make_sqrt_hann(float* w, int n) {
 
 int main(int argc, char* argv[]) {
     if (argc < 4) {
-        printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [preset] [--aec-only] [--nr-gain dB]\n",
+        printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-preset] [--nr-preset mild|balanced|aggressive] [--aec-only]\n",
                argv[0]);
         return 1;
     }
@@ -63,14 +78,14 @@ int main(int argc, char* argv[]) {
     const char* ref_path = argv[2];
     const char* out_path = argv[3];
 
-    AecPreset preset  = AEC_PRESET_BALANCED;
-    int       aec_only    = 0;
-    float     nr_g_min_db = -15.0f;
+    AecPreset     preset   = AEC_PRESET_BALANCED;
+    MmseLsaNrMode nr_mode  = MMSE_LSA_NR_BALANCED;
+    int           aec_only = 0;
 
     for (int i = 4; i < argc; i++) {
-        if      (strcmp(argv[i], "--aec-only") == 0)           aec_only = 1;
-        else if (strcmp(argv[i], "--nr-gain") == 0 && i+1 < argc)
-            nr_g_min_db = (float)atof(argv[++i]);
+        if      (strcmp(argv[i], "--aec-only") == 0)            aec_only = 1;
+        else if (strcmp(argv[i], "--nr-preset") == 0 && i+1 < argc)
+            nr_mode = parse_nr_mode(argv[++i]);
         else if (argv[i][0] != '-')
             preset = parse_preset(argv[i]);
     }
@@ -93,9 +108,9 @@ int main(int argc, char* argv[]) {
     aec_config_from_preset(&aec_cfg, preset, sr);
     aec_cfg.enable_res = 1;   /* built-in AEC3 post-filter (suppression + CNG) */
 
-    /* NR config */
-    MmseLsaConfig nr_cfg = mmse_lsa_default_config(sr);
-    nr_cfg.g_min_db = nr_g_min_db;
+    /* NR config (preset selects the full strength param set;
+     * BALANCED == mmse_lsa_default_config) */
+    MmseLsaConfig nr_cfg = mmse_lsa_config_for_mode(sr, nr_mode);
 
     /* Frame dimensions */
     int hop      = (int)(0.01f * sr);         /* 160 @ 16 kHz */
@@ -106,7 +121,8 @@ int main(int argc, char* argv[]) {
 
     printf("AEC+NR Pipeline\n");
     printf("  Input:  %s (%.2fs)\n", mic_path, (float)n_samples / sr);
-    printf("  Preset: %s   NR: %.0f dB\n\n", preset_name(preset), (double)nr_g_min_db);
+    printf("  AEC preset: %s   NR preset: %s\n\n",
+           preset_name(preset), nr_mode_name(nr_mode));
 
     /* Create AEC (mic HPF @ 80 Hz applied internally via enable_highpass=1) */
     Aec* aec = (Aec*)calloc(1, sizeof(Aec));
