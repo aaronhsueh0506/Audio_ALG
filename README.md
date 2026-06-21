@@ -147,6 +147,7 @@ python3 -m pipelines.eval_pipeline_blind <aec_challenge_blind/> --preset balance
 NE_FLOOR=0.4 NE_GATE=both REBENCH_WORKERS=8 python3 -m pipelines.rebench_joint <out_dir> [ne_floor] [ne_gate] [limit]
 # 評分：見 rebench_joint.py docstring（用 AEC repo 的 bench_aecmos.py 對照 echo/deg）
 ```
+> ✓ 所有 renderer 皆 **真 no-prealign**（offline pre-align 已移除，靠 AEC 線上 matched-filter 對齊）。
 > ⚠ `rebench_joint` 預設 **skip-if-exists**：`<out_dir>` 有舊版 render 會被當 ok 跳過 → 換版本前先刪掉重 render。AECMOS/DNSMOS 評分需 `speechmos` + `onnxruntime≤1.16.3` + `numpy<2` 的 venv。
 
 架構圖：[Overview](docs/pipeline_overview.png) · [Detailed](docs/pipeline_detailed.png)
@@ -275,5 +276,7 @@ crutch：它不只灌高 echo 分數，跟線上 matched filter 併用還會 dou
 > ✓ **v3.23.0 no-PA matched-filter 修正後，真 no-prealign 的 echo 也達到 ship bar**（AEC-alone FS echo
 > 3.525 >3.5、DT echo 4.217 >4；+NR 近乎同值）—— 先前 no-prealign echo 偏低的落差已由 no-PA 延遲修正補上。
 > AEC 模組 ours / AEC3 / Speex 三方對照（目前仍 pre-align，待重生）見 [lib/aec/README.md](lib/aec/README.md)。
-> 渲染器:`pipelines/rebench_aec_only.py`(AEC-alone = AEC+RES，須 `NO_PREALIGN=1`)、`pipelines/rebench_joint.py`
-> (A_min_pl，預設即 no-prealign；`NR_PRESET=mild|aggressive` 切 preset)。
+> 渲染器:`pipelines/rebench_aec_only.py`(AEC-alone = AEC+RES)、`pipelines/rebench_joint.py`
+> (A_min_pl;`NR_PRESET=mild|aggressive` 切 preset)。**offline pre-align 已從所有 pipeline 腳本移除**
+> (含 `eval_pipeline_blind.py`),一律走 AEC 線上 matched-filter 對齊(=生產真實情境),不再有
+> `NO_PREALIGN` / `PREALIGN` 開關。

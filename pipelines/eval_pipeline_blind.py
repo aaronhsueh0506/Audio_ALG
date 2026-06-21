@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Run AEC+NR+RES pipeline on AEC Challenge blind test and score with AECMOS."""
 import sys, os, argparse
-import numpy as np
 import soundfile as sf
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
@@ -12,24 +11,6 @@ from lib.aec.python.aec import AEC, AecConfig, AecMode, AecPreset
 from pipelines.aec_nr_pipeline import run_aec_linear, run_nr, run_res
 
 
-def estimate_delay(mic, ref, sr, max_delay_ms=250.0):
-    max_d = int(max_delay_ms * sr / 1000)
-    n = min(len(mic), len(ref))
-    m = mic[:n].astype(np.float64)
-    r = ref[:n].astype(np.float64)
-    fft_size = 1
-    while fft_size < 2 * n:
-        fft_size *= 2
-    mic_spec = np.fft.rfft(m, n=fft_size)
-    ref_spec = np.fft.rfft(r, n=fft_size)
-    cross = mic_spec * np.conj(ref_spec)
-    magnitude = np.abs(cross) + 1e-10
-    cross = cross / magnitude
-    xcorr = np.fft.irfft(cross, n=fft_size)
-    max_search = min(max_d, fft_size // 2)
-    return int(np.argmax(xcorr[:max_search + 1]))
-
-
 def process_case(mic_path, lpb_path, out_path, preset, fl, nr_preset):
     mic, sr = sf.read(mic_path, dtype='float32')
     ref, _ = sf.read(lpb_path, dtype='float32')
@@ -37,11 +18,8 @@ def process_case(mic_path, lpb_path, out_path, preset, fl, nr_preset):
     if ref.ndim > 1: ref = ref[:, 0]
     n = min(len(mic), len(ref))
     mic, ref = mic[:n], ref[:n]
-
-    # Delay alignment
-    delay = estimate_delay(mic, ref, sr)
-    if delay > 0:
-        ref = np.concatenate([np.zeros(delay, dtype=np.float32), ref[:n - delay]])
+    # No offline pre-align: the AEC's online matched-filter delay estimator
+    # (enable_delay_est) handles alignment, matching production.
 
     # AEC config
     config = AecConfig.from_preset(preset,

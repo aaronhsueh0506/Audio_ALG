@@ -24,7 +24,7 @@ from pipelines.aec_nr_pipeline import (                         # noqa: E402
     run_aec_linear, run_nr_spectrum, run_res,
 )
 from pipelines.rebench_sep_vs_classic import (                  # noqa: E402
-    estimate_delay, CORPUS, SCENARIOS, SR, FL, NR_PRESET,
+    CORPUS, SCENARIOS, SR, FL, NR_PRESET,
 )
 
 NE_FLOOR = float(os.environ.get('NE_FLOOR', '0.4'))
@@ -49,10 +49,8 @@ def process(mic_path, lpb_path, out_path):
         ref = ref[:, 0]
     n = min(len(mic), len(ref))
     mic, ref = mic[:n], ref[:n]
-    if os.environ.get('PREALIGN'):                 # opt-in: offline pre-align before AEC
-        d = estimate_delay(mic, ref, sr)
-        if d > 0:
-            ref = np.concatenate([np.zeros(d, dtype=np.float32), ref[:n - d]])
+    # No offline pre-align: the AEC's online matched-filter delay estimator
+    # (enable_delay_est) handles alignment, matching production.
     with contextlib.redirect_stdout(io.StringIO()):
         np.random.seed(0)
         _, ctx = run_aec_linear(mic, ref, _cfg(True))
