@@ -27,7 +27,7 @@ Usage:
     cd Audio_ALG
     python3 pipelines/compare_res_vs_nr.py input_3ch.wav
     python3 pipelines/compare_res_vs_nr.py input.wav --out-prefix /tmp/cmp --preset balanced
-    python3 pipelines/compare_res_vs_nr.py input.wav --ne-floor 0.4 --ne-gate both --nr-gain -15
+    python3 pipelines/compare_res_vs_nr.py input.wav --ne-floor 0.4 --ne-gate both --nr-preset balanced
 
 Note: uses whatever AEC is checked out in lib/aec. To test the v3.24.0 round-robin
 AEC, make sure lib/aec is at the static-memory tip (495566d) / your merged branch.
@@ -76,8 +76,12 @@ def main():
     ap.add_argument('--out-prefix', default=None,
                     help='output path prefix (default: input path without extension)')
     ap.add_argument('--preset', default='balanced',
-                    choices=['gentle', 'balanced', 'aggressive'])
-    ap.add_argument('--nr-gain', type=float, default=-15.0, help='NR min gain (dB)')
+                    choices=['gentle', 'balanced', 'aggressive'],
+                    help='AEC residual-echo preset (gentle/balanced/aggressive)')
+    ap.add_argument('--nr-preset', default='balanced',
+                    choices=['mild', 'balanced', 'aggressive'],
+                    help='NR strength preset (mild/balanced/aggressive; '
+                         'g_min = -10/-15/-20 dB). Only affects the +NR path.')
     ap.add_argument('--ne-floor', type=float, default=0.4,
                     help='near-end preservation floor strength, applied to BOTH paths (0=off)')
     ap.add_argument('--ne-gate', default='both',
@@ -105,7 +109,8 @@ def main():
     print("AEC+RES vs AEC+NR+RES comparison")
     print("================================")
     print(f"Input:   {args.input}  ({len(mic)} samples, {len(mic)/sr:.2f}s, {sr} Hz, {n_ch}ch)")
-    print(f"Preset:  {args.preset}   ne_floor={args.ne_floor} gate={args.ne_gate} "
+    print(f"Preset:  aec={args.preset} nr={args.nr_preset}   "
+          f"ne_floor={args.ne_floor} gate={args.ne_gate} "
           f"combine={args.combine} cng={enable_cng}")
     print(f"near-clean ref: {'present (ch2)' if near_clean is not None else 'absent'}")
     print()
@@ -126,7 +131,7 @@ def main():
 
     # ---- Path B: AEC + NR + RES (production) ----
     print("Stage 2b: AEC+NR+RES  (g_total = min(G_nr, G_res))...")
-    nr_gains = run_nr_spectrum(contexts, sr, g_min_db=args.nr_gain)
+    nr_gains = run_nr_spectrum(contexts, sr, nr_preset=args.nr_preset)
     out_aec_nr_res = run_res(
         np.zeros(len(mic), dtype=np.float32), nr_gains, contexts, cfg_res,
         use_nr=True, use_res=True, combine=args.combine,
