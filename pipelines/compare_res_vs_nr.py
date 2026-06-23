@@ -18,14 +18,27 @@ Input WAV channels (2- or 3-channel, single file):
                    the AEC.
 
 Outputs (next to the input, or under --out-prefix):
-    <prefix>_aec.wav         — AEC linear only (no RES, no NR)  [reference]
-    <prefix>_aec_res.wav     — AEC + RES
-    <prefix>_aec_nr_res.wav  — AEC + NR + RES
-    <prefix>_near_clean.wav  — ch2 passthrough (only if 3-channel input)
+    <prefix>_aec.wav                  — AEC linear only (no RES, no NR)  [reference]
+    <prefix>_aec_res.wav              — AEC + RES
+    <prefix>_aec_nr_res.wav           — AEC + NR + RES  (production, ne_floor on)
+    <prefix>_aec_nr_res_unmasked.wav  — AEC + NR + RES with ne_floor=0 (NR at FULL
+                                        strength; skip with --no-unmasked)
+    <prefix>_near_clean.wav           — ch2 passthrough (only if 3-channel input)
+
+It also prints an NR-contribution diagnostic (how often / how hard G_nr cuts past
+G_res, and how many dB the ne_floor lift claws NR back). With --dnsmos it scores the
+outputs with DNSMOS (BAK = the NR noise-cleanup score AECMOS is blind to).
+
+Why NR can look weak: the production gain is min(G_nr, G_res) and a near-end floor
+(ne_floor=0.4) lifts the gain back toward 1.0 in low-echo bins — exactly where NR
+works — so NR's -15 dB floor becomes ~-6 dB. The _unmasked output (ne_floor=0) shows
+the unclawed NR. Both limits are the shipped A_min_pl operating point, not a bug:
+min hands echo bins to RES; ne_floor protects near-end speech (and, unavoidably,
+near-end noise too). Compare _aec_res vs _aec_nr_res vs _aec_nr_res_unmasked.
 
 Usage:
     cd Audio_ALG
-    python3 pipelines/compare_res_vs_nr.py input_3ch.wav
+    python3 pipelines/compare_res_vs_nr.py input_3ch.wav --dnsmos
     python3 pipelines/compare_res_vs_nr.py input.wav --out-prefix /tmp/cmp --preset balanced
     python3 pipelines/compare_res_vs_nr.py input.wav --ne-floor 0.4 --ne-gate both --nr-preset balanced
 
@@ -67,6 +80,83 @@ def _build_cfg(sample_rate, preset, enable_res, enable_cng):
     )
 
 
+def _nr_contribution(contexts, nr_gains):
+    """Gain-domain NR-vs-RES stats: where and how hard G_nr cuts past G_res.
+
+    Returns None if the AEC was built without the freq seam (no res_gain). The
+    final gain is min(G_nr, G_res), so NR only 'bites' where G_nr < G_res. We
+    also scope NR's territory to low-echo bins (echo_frac<0.1) — mirroring
+    run_res's echo_frac = (r2/psd) / |E|^2 — since that is where NR does its
+    stationary-noise reduction (echo bins are owned by G_res).
+    """
+    psd_scale = 32768.0 ** 2
+    res_list, e2_list, r2_list = [], [], []
+    for c in contexts:
+        if c.res_gain is None or c.error_spec is None:
+            break
+        res_list.append(np.asarray(c.res_gain, dtype=np.float32))
+        e2_list.append(np.abs(np.asarray(c.error_spec)).astype(np.float32) ** 2)
+        r2_list.append(np.asarray(c.r2, dtype=np.float32) if c.r2 is not None
+                       else np.zeros(_N_FREQS, dtype=np.float32))
+    n = len(res_list)
+    if n == 0:
+        return None
+    res_g = np.stack(res_list)
+    g_nr = np.asarray(nr_gains[:n], dtype=np.float32)
+    e2 = np.stack(e2_list)
+    r2 = np.stack(r2_list)
+    echo_frac = np.clip((r2 / psd_scale) / (e2 + 1e-12), 0.0, 1.0)
+
+    bite = g_nr < res_g
+    extra_db = 20.0 * np.log10((g_nr + 1e-12) / (res_g + 1e-12))   # <0 where bites
+    low = echo_frac < 0.1
+    bite_low = bite & low
+
+    def _mean(mask, vals):
+        return float(vals[mask].mean()) if mask.any() else 0.0
+
+    return dict(
+        n_frames=n,
+        frac_bite=float(bite.mean()),
+        extra_db=_mean(bite, extra_db),
+        frac_low=float(low.mean()),
+        frac_bite_low=(float(bite_low.sum()) / float(low.sum())) if low.any() else 0.0,
+        extra_db_low=_mean(bite_low, extra_db),
+    )
+
+
+def _run_dnsmos(named_signals, sr):
+    """Score each (label, signal) with DNSMOS, reusing bench_dnsmos's scorer.
+
+    DNSMOS is NOT level-invariant, so every signal is normalized to -26 dBFS RMS
+    first (same as bench_dnsmos). BAK is the background-noise score AECMOS can't
+    see — the NR's real metric. Degrades gracefully if speechmos is unavailable.
+    """
+    try:
+        import speechmos.dnsmos as dnsmos   # the library API; branch-independent
+    except Exception as e:  # noqa: BLE001
+        print(f"\n[DNSMOS skipped] {type(e).__name__}: {e}")
+        print("  (pip install speechmos / onnxruntime, or drop --dnsmos)")
+        return
+    print("\nDNSMOS (level-normalized to -26 dBFS; BAK = NR's AECMOS-blind score):")
+    print(f"  {'output':24s} {'SIG':>6} {'BAK':>6} {'OVRL':>6}")
+    scores = {}
+    for label, sig in named_signals:
+        a = np.clip(np.asarray(sig, dtype=np.float32), -1.0, 1.0)
+        rms = float(np.sqrt(np.mean(a ** 2)))
+        if rms > 1e-6:
+            a = np.clip(a * (10.0 ** (-26.0 / 20.0) / rms), -1.0, 1.0)
+        try:
+            r = dnsmos.run(a, sr, return_df=False)
+            scores[label] = r
+            print(f"  {label:24s} {r['sig_mos']:6.3f} {r['bak_mos']:6.3f} {r['ovrl_mos']:6.3f}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  {label:24s} FAIL: {e}")
+    if 'AEC+RES' in scores and 'AEC+NR+RES' in scores:
+        dbak = scores['AEC+NR+RES']['bak_mos'] - scores['AEC+RES']['bak_mos']
+        print(f"  ΔBAK (AEC+NR+RES − AEC+RES) = {dbak:+.3f}   (NR's noise-cleanup value)")
+
+
 def main():
     ap = argparse.ArgumentParser(
         description='Compare AEC+RES vs AEC+NR+RES on one 2/3-ch test file',
@@ -89,6 +179,11 @@ def main():
     ap.add_argument('--combine', default='min', choices=['min', 'product'],
                     help='G_nr/G_res combine for the +NR path (default: min = A_min_pl)')
     ap.add_argument('--no-cng', action='store_true', help='disable comfort noise')
+    ap.add_argument('--no-unmasked', action='store_true',
+                    help='skip the ne_floor=0 NR-unmasked output')
+    ap.add_argument('--dnsmos', action='store_true',
+                    help='score outputs with DNSMOS (BAK = NR noise-cleanup score '
+                         'AECMOS is blind to; needs speechmos+onnxruntime)')
     args = ap.parse_args()
 
     data, sr = sf.read(args.input, dtype='float32')
@@ -137,6 +232,15 @@ def main():
         use_nr=True, use_res=True, combine=args.combine,
         ne_floor=args.ne_floor, ne_gate=args.ne_gate)
 
+    # ---- Path B' : same, but ne_floor=0 → NR at full strength (unmasked) ----
+    out_unmasked = None
+    if not args.no_unmasked:
+        print("Stage 2c: AEC+NR+RES UNMASKED  (ne_floor=0 → NR at full strength)...")
+        out_unmasked = run_res(
+            np.zeros(len(mic), dtype=np.float32), nr_gains, contexts, cfg_res,
+            use_nr=True, use_res=True, combine=args.combine,
+            ne_floor=0.0, ne_gate=args.ne_gate)
+
     # ---- Write outputs ----
     def _rms(x):
         return float(np.sqrt(np.mean(np.square(x))) + 1e-20)
@@ -146,17 +250,45 @@ def main():
         ('_aec_res.wav', out_aec_res, 'AEC+RES'),
         ('_aec_nr_res.wav', out_aec_nr_res, 'AEC+NR+RES'),
     ]
+    if out_unmasked is not None:
+        outs.append(('_aec_nr_res_unmasked.wav', out_unmasked, 'AEC+NR+RES (ne_floor=0)'))
     if near_clean is not None:
         outs.append(('_near_clean.wav', near_clean[:len(mic)], 'near-clean (ref passthrough)'))
 
     print("\nResults (RMS levels for a quick sanity read; do AECMOS/PESQ for quality):")
-    print(f"  {'mic (input)':28s} rms={_rms(mic):.5f}")
+    print(f"  {'mic (input)':30s} rms={_rms(mic):.5f}")
     for suffix, sig, label in outs:
         path = prefix + suffix
         sf.write(path, sig[:len(mic)].astype(np.float32), sr, subtype='FLOAT')
-        print(f"  {label:28s} rms={_rms(sig):.5f}   -> {path}")
+        print(f"  {label:30s} rms={_rms(sig):.5f}   -> {path}")
 
-    print("\nDone. Compare _aec_res.wav vs _aec_nr_res.wav (only the NR stage differs).")
+    # ---- NR-contribution diagnostic (why NR may look weak) ----
+    diag = _nr_contribution(contexts, nr_gains)
+    print("\nNR contribution (why NR may look weak):")
+    if diag is None:
+        print("  (AEC built without the freq seam — no res_gain; cannot compute gain stats)")
+    else:
+        print(f"  G_nr bites (G_nr<G_res):      {diag['frac_bite']*100:5.1f}% of all (frame,bin), "
+              f"avg {diag['extra_db']:+.1f} dB extra cut where it bites")
+        print(f"  in NR's territory (low-echo): {diag['frac_bite_low']*100:5.1f}% of low-echo bins bitten, "
+              f"avg {diag['extra_db_low']:+.1f} dB  (low-echo = {diag['frac_low']*100:.0f}% of all bins)")
+    net_db = 20.0 * np.log10(_rms(out_aec_nr_res) / _rms(out_aec_res))
+    print(f"  net NR effect (full-signal):  {net_db:+.2f} dB   (AEC+NR+RES vs AEC+RES)")
+    if out_unmasked is not None:
+        claw_db = 20.0 * np.log10(_rms(out_aec_nr_res) / _rms(out_unmasked))
+        print(f"  ne_floor={args.ne_floor:g} claw-back:       {claw_db:+.2f} dB  "
+              f"(AEC+NR+RES louder than ne_floor=0 → NR suppression the floor lifted back)")
+
+    # ---- Optional DNSMOS BAK A/B ----
+    if args.dnsmos:
+        named = [('AEC linear', aec_linear), ('AEC+RES', out_aec_res),
+                 ('AEC+NR+RES', out_aec_nr_res)]
+        if out_unmasked is not None:
+            named.append(('AEC+NR+RES unmasked', out_unmasked))
+        _run_dnsmos(named, sr)
+
+    print("\nDone. Compare _aec_res.wav vs _aec_nr_res.wav (ne_floor) vs "
+          "_aec_nr_res_unmasked.wav (ne_floor=0).")
 
 
 if __name__ == '__main__':
