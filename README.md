@@ -72,27 +72,28 @@ git push
 
 ## 處理鏈 (Pipeline)
 
-三階段串接，mic 路徑共享一個 16 kHz / FFT-512 / hop=160 (10 ms) / sqrt-Hann 格點：
+AEC（線性）→ NR → 增益合併（min），mic 路徑共享一個 16 kHz / FFT-512 / hop=160 (10 ms) / sqrt-Hann 格點。
+注意 RES **不是** NR 之後另一個 filter：`g_res` 是線性 AEC **內部**算出的 AEC3 SuppressionGain，跟 `E(f)` 一起從
+seam 輸出，最後在頻域跟 `g_nr` 取 `min` 合併、**一次**套用到 `E(f)`：
 
 ```
 mic ─►HPF─┐
-          ├─► Linear AEC (PBFDKF + Shadow + EPC) ─► e[n]  +  AecResContext
-ref ──────┘   (ref 不經 HPF；時域進，頻域 context 出)          │
-                                                             ▼
-                              NR  (MMSE-LSA + MCRA / OM-LSA SPP)
-                              g_nr = MMSE-LSA gain per bin
-                                                             │
-                                                             ▼
-                              RES  (Residual Echo Suppression)
-                              g_total = min(g_nr, g_res)     ◄── g_res from AecResContext
-                              → S(f) = e[n] · g_total  +  CNG ─► iFFT + OLA ─► output[n]
+ref ──────┴─► Linear AEC (PBFDKF + Shadow + EPC，純線性、不套 post-filter)
+                 │
+                 ├─► E(f)            線性殘差（頻域 seam）
+                 └─► AecResContext ─► g_res（＝RES＝AEC3 SuppressionGain）、R²、CNG(N²)、far_power
+                        │
+   E(f), R² ─► NR (MMSE-LSA + MCRA/OM-LSA SPP，echo-aware ξ=S²/(N²+R²)) ─► g_nr
+                        │
+        g_nr ─┐
+        g_res ┴─► min ─► g_total ─(＋ far/near 雙閘 ne_floor)─► S(f)=E(f)·g_total ＋ CNG ─► iFFT+OLA ─► output[n]
 ```
 
 | 階段 | 角色 | 輸出 |
 |------|------|------|
-| **Linear AEC** | PBFDKF + Shadow + EPC，純線性消除，不套 post-filter | `e[n]` 時域 + `AecResContext`（echo PSD、far power、dt_indicator、ERLE） |
-| **NR** | MMSE-LSA（MCRA noise est + OM-LSA SPP），壓背景噪聲 | 增強語音 + per-bin gain `g_nr` |
-| **RES** | `g_total = min(g_nr, g_res)`，逐 bin 取小值；無回音處 g_res≈1 → NR 正常發揮 | 最終輸出 + CNG |
+| **Linear AEC** | PBFDKF + Shadow + EPC，純線性消除，不套 post-filter | `E(f)` 頻域殘差 + `AecResContext`（`g_res`=AEC3 SuppressionGain、R²、CNG N²、far_power） |
+| **NR** | MMSE-LSA（MCRA + OM-LSA SPP），壓背景噪聲；**echo-aware**（R² 折入 ξ=S²/(N²+R²)；`--legacy-amin`=純噪聲） | per-bin gain `g_nr` |
+| **RES** | `g_total = min(g_nr, g_res)`（`g_res`＝AEC 內 AEC3 SuppressionGain，非獨立 filter）；無回音處 g_res≈1 → NR 正常發揮 | 最終輸出 + CNG |
 
 ```bash
 # malloc 版（標準用法）
@@ -132,6 +133,7 @@ python3 -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wa
 | `--aec-preset` | `balanced` | `gentle` / `balanced` / `aggressive`（見下方 AEC Preset 表；差異只在 min-gain floor）|
 | `--nr-preset` | `balanced` | `mild` / `balanced` / `aggressive`（見下方 NR Preset 表）|
 | `--aec-only` | off | 只跑 AEC，跳過 NR/RES |
+| `--legacy-amin` | off | 還原 2026-06-23 前的 min-only A_min_pl（不注入 R²、scalar 近端 floor）|
 
 > Pipeline 固定走生產的 **freq A_min_pl** 路徑（PBFDKF、`g_total=min(g_nr,g_res)`、per-bin 近端 floor）。低階旋鈕（mu / ne-floor / combine / pipeline-mode / aec-mode）與 legacy v0 已移除，改由 preset 決定。
 
@@ -171,14 +173,14 @@ NE_FLOOR=0.4 NE_GATE=both REBENCH_WORKERS=8 python3 -m pipelines.rebench_joint <
 |------|----|------|
 | `sample_rate` | 16000 Hz | |
 | `filter_length` | 832 samples | 52 ms |
-| `n_partitions` | 5 | 832/160 ≈ 5 |
-| `mu` (Kalman init) | 0.3 | PBFDKF 初始步長 |
+| `n_partitions` | 6 | ceil(832/160) = 6（832/160 = 5.2，無條件進位）|
+| `mu` (step size) | 0.3 | PBFDKF 自適應步長（Kalman 初值是另一參數 `kalman_q_high`=1e-3）|
 | `max_delay_ms` | 1024 ms | 最大延遲搜尋範圍 |
 | `enable_highpass` | 1 | mic 路徑 80 Hz HPF（內建，不需外接） |
-| `enable_saturation` | 1 | ref 路徑 soft-clip |
-| `enable_delay_est` | 1 | GCC-PHAT 自動對齊 |
+| `enable_saturation_detect` | 1 | ref 路徑 soft-clip（`saturation_softclip_ref`）|
+| `enable_delay_est` | 1 | matched-filter (+ ring buffer) 自動對齊 |
 | `enable_shadow` | 1 | PBFDAF shadow filter（DT 偵測） |
-| `enable_res` | 1 | AEC3 post-filter（REE + SuppressionGain + CNG） |
+| `enable_res` | 1 | AEC3 post-filter（preset 預設；**+NR pipeline 覆寫為 0** + `return_res_context`=1，改外部 min 合併）|
 | `enable_cng` | 1 | Comfort Noise Generator |
 | `shadow_mu_min` | 0.5 | shadow filter 最小步長 |
 | `warmup_frames` | 100 | 10 ms × 100 = 1 s 暖機 |
@@ -201,7 +203,7 @@ NR 有三個 preset（pipeline `--nr-preset`；C 端 `MmseLsaNrMode` / `mmse_lsa
 
 | 參數 | 說明 |
 |------|------|
-| `g_min_db` | 最低增益下限（power domain：實際幅度下限 = 10^(g_min/20)） |
+| `g_min_db` | 最低增益下限（power domain：g_min = 10^(g_min_db/10)，例 −15 dB→0.0316、−20 dB→0.01）|
 | `q` | SPP 先驗語音存在機率（高 q → 偏向語音，壓制保守） |
 | `xi_min_db` | 先驗 SNR 最小值（低值 → 可在更低 SNR 下壓制） |
 | `alpha_d` | 噪聲追蹤 IIR 係數（高 α → 慢追蹤，穩態噪聲好；低 α → 快追蹤，突發噪聲好） |
@@ -218,7 +220,7 @@ NR 有三個 preset（pipeline `--nr-preset`；C 端 `MmseLsaNrMode` / `mmse_lsa
 | `alpha_xi` | 0.88 | 先驗 SNR decision-directed 平滑 |
 | `alpha_s` | 0.95 | MCRA 能量平滑 |
 | `alpha_p` | 0.20 | MCRA SPP 指示平滑 |
-| `L` | 32 frames | 320 ms min-stat 窗（MCRA） |
+| `L` | 32（standalone）→ **pipeline 150** | min-stat 窗：C/NR 預設 320 ms；production pipeline 覆寫為 1.5 s（`_build_denoiser`，與 `alpha_d→0.95` 同，不隨 preset 變）|
 | `delta_db` | 10 dB | MCRA 語音存在門限 |
 | `num_init_frames` | 20 | 噪聲估計初始化幀數（200 ms） |
 
@@ -274,7 +276,7 @@ crutch：它不只灌高 echo 分數，跟線上 matched filter 併用還會 dou
 | FS_static SIG   | 1.810 | **1.936** | 1.911 | 1.913 |
 | FS_movement SIG | 1.602 | 1.687 | 1.671 | **1.690** |
 
-> **NR vs AEC-alone**：背景 **BAK +0.25~0.27（balanced，FS/DT）**（降噪本職，AECMOS 量不到；aggressive 更達 +0.43~0.47）、
+> **NR vs AEC-alone**：背景 **BAK +0.24~0.27（balanced，FS/DT）**（降噪本職，AECMOS 量不到；aggressive 更達 FS +0.43~0.47、DT +0.39）、
 > DT 近端 deg 也明顯改善（DT_static **+0.18** / DT_movement **+0.10**）。**`far02_near` 統一 gain 把 R² 折入 ξ=S²/(N²+R²)
 > 後，NR 連 echo 也幫到了**（balanced FS echo **+0.07~0.10**、aggressive **+0.15~0.18**；DT echo aggressive 亦 +0.06~0.11），
 > 不再是先前的「echo 中性」。唯一代價是純 NE SIG（balanced −0.065）。`min(G_nr, G_res)` 撿回 AEC3 的近端感知回音 gain。
