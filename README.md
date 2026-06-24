@@ -229,52 +229,54 @@ NR 有三個 preset（pipeline `--nr-preset`；C 端 `MmseLsaNrMode` / `mmse_lsa
 **AEC(balanced) alone vs AEC(balanced) + NR + RES**（RES 用 `min(G_nr, G_res)`）。四欄 =
 AEC 單獨、+NR 三個 preset（`--nr-preset balanced|mild|aggressive`，皆完整 strength 參數組）。
 
-> **本表 2026-06-20 以 AEC v3.23.0（no-PA matched-filter pre-echo fix + 預設 ON 的 DT-deg recovery stack）全部重跑、真 no-prealign 產生。**
-> AEC-alone = `AEC(balanced)` 含自身 AEC3 post-filter 的完整輸出（= AEC repo 標準產品，**非**純線性）；
-> 已與 AEC/ repo 交叉驗證一致（DT_static deg 2.075 ≈ AEC/ 2.074、DT echo 4.217 ≈ 4.218）。
+> **本表 2026-06-23 以 AEC v3.24.0（round-robin TD constraint，每 hop 只約束 1 個 partition → 收斂更深、各 far-active
+> bucket echo↑）＋ `far02_near` 統一 NR gain re-tune（R² 折入 ξ=S²/(N²+R²)、far-activity＋near-VAD 雙閘 ne_floor）
+> 全部重跑、真 no-prealign 產生。**
+> AEC-alone = `AEC(balanced)` 含自身 AEC3 post-filter 的完整輸出（= AEC repo 標準產品，**非**純線性；DT_static deg 2.077、DT echo 4.231）。
 
 本地 ONNX AECMOS/DNSMOS，**完全無 pre-align** —— 純靠 AEC 線上的 matched-filter `EchoPathDelayEstimator`
 自對齊（與 AEC3 內部對齊機制同類，也是生產真實情境）。offline 全訊號 GCC-PHAT pre-align 是已退役的
 crutch：它不只灌高 echo 分數，跟線上 matched filter 併用還會 double-alignment、在部分 movement case
 反而鎖到 phantom peak 害 ERLE 崩掉（見 AEC `CHANGELOG [3.22.1]`）。
 
-**AECMOS**（echo↑ / deg↑；echo 由 AEC+RES 決定，NR 近乎中性，故不標記）:
+**AECMOS**（echo↑ / deg↑；deg 每列粗體為最佳。`far02_near` 統一 gain 後 NR 也**幫到 echo**，故 echo 不再標「中性」）:
 
 | 指標 | AEC-alone | +NR(balanced) | +NR(mild) | +NR(aggressive) |
 |------|----------|---------------|-----------|-----------------|
-| FS_static echo   | 3.525 | 3.494 | 3.498 | 3.465 |
-| FS_movement echo | 3.508 | 3.469 | 3.477 | 3.424 |
-| DT_static echo   | 4.217 | 4.181 | 4.186 | 4.196 |
-| DT_movement echo | 4.112 | 4.095 | 4.098 | 4.107 |
-| DT_static deg    | 2.075 | **2.277** | 2.223 | 2.261 |
-| DT_movement deg  | 2.141 | **2.281** | 2.246 | 2.255 |
-| NE deg           | 4.024 | 4.033 | **4.053** | 3.952 |
+| FS_static echo   | 3.557 | 3.626 | 3.578 | 3.705 |
+| FS_movement echo | 3.527 | 3.626 | 3.561 | 3.706 |
+| DT_static echo   | 4.231 | 4.220 | 4.206 | 4.291 |
+| DT_movement echo | 4.140 | 4.169 | 4.142 | 4.253 |
+| DT_static deg    | 2.077 | **2.259** | 2.220 | 2.193 |
+| DT_movement deg  | 2.138 | **2.234** | 2.215 | 2.164 |
+| NE deg           | 4.015 | 4.013 | **4.052** | 3.906 |
 
 **DNSMOS**（SIG/BAK↑；BAK = 背景品質 = NR 本職，AECMOS 量不到；每列粗體為最佳）:
 
 | 指標 | AEC-alone | +NR(balanced) | +NR(mild) | +NR(aggressive) |
 |------|----------|---------------|-----------|-----------------|
-| FS_static BAK   | 2.653 | 2.861 | 2.784 | **2.982** |
-| FS_movement BAK | 2.376 | 2.624 | 2.521 | **2.771** |
-| DT_static BAK   | 2.871 | 3.070 | 3.003 | **3.143** |
-| DT_movement BAK | 2.741 | 2.955 | 2.883 | **3.033** |
-| NE BAK          | 3.843 | **3.898** | 3.887 | **3.898** |
-| NE SIG          | **3.464** | 3.410 | 3.441 | 3.370 |
-| DT_static SIG   | 2.381 | **2.429** | 2.425 | 2.419 |
-| DT_movement SIG | 2.301 | **2.355** | 2.348 | 2.335 |
-| FS_static SIG   | 1.791 | 1.898 | 1.865 | **1.900** |
-| FS_movement SIG | 1.584 | 1.667 | 1.640 | **1.688** |
+| FS_static BAK   | 2.640 | 2.889 | 2.763 | **3.073** |
+| FS_movement BAK | 2.346 | 2.583 | 2.458 | **2.816** |
+| DT_static BAK   | 2.830 | 3.097 | 2.994 | **3.217** |
+| DT_movement BAK | 2.710 | 2.978 | 2.865 | **3.100** |
+| NE BAK          | 3.841 | **3.910** | 3.897 | 3.909 |
+| NE SIG          | **3.462** | 3.397 | 3.436 | 3.348 |
+| DT_static SIG   | 2.375 | **2.461** | 2.448 | 2.423 |
+| DT_movement SIG | 2.309 | 2.353 | **2.360** | 2.309 |
+| FS_static SIG   | 1.810 | **1.936** | 1.911 | 1.913 |
+| FS_movement SIG | 1.602 | 1.687 | 1.671 | **1.690** |
 
-> **NR vs AEC-alone**：背景 **BAK +0.20~0.25（FS/DT）**（降噪本職，AECMOS 量不到）、DT 近端 deg 也明顯
-> 改善（DT_static **+0.20** / DT_movement **+0.14**）；echo 由 AEC+RES 決定，NR 近乎中性（FS echo ±0.04 內）。
-> 唯一代價是純 NE SIG（balanced −0.05）。`min(G_nr, G_res)` 撿回 AEC3 的近端感知回音 gain。
-> **NR preset = 純噪聲抑制強度的 Pareto 軸**（不影響 echo/對齊）：
-> - **aggressive** — 背景最乾淨（BAK 全列最高），近端最受損（NE SIG 3.370 最低、NE deg 3.952）。
-> - **mild** — 近端最保留（NE SIG 3.441 / NE deg 4.053 最高），背景降噪最少。
-> - **balanced** — 折衷（預設）。
+> **NR vs AEC-alone**：背景 **BAK +0.25~0.27（balanced，FS/DT）**（降噪本職，AECMOS 量不到；aggressive 更達 +0.43~0.47）、
+> DT 近端 deg 也明顯改善（DT_static **+0.18** / DT_movement **+0.10**）。**`far02_near` 統一 gain 把 R² 折入 ξ=S²/(N²+R²)
+> 後，NR 連 echo 也幫到了**（balanced FS echo **+0.07~0.10**、aggressive **+0.15~0.18**；DT echo aggressive 亦 +0.06~0.11），
+> 不再是先前的「echo 中性」。唯一代價是純 NE SIG（balanced −0.065）。`min(G_nr, G_res)` 撿回 AEC3 的近端感知回音 gain。
+> **NR preset = 噪聲抑制強度的 Pareto 軸**：
+> - **aggressive** — 背景最乾淨（BAK 全列最高）、echo 撿最多，近端最受損（NE SIG 3.348 最低、NE deg 3.906）。
+> - **mild** — 近端最保留（NE SIG 3.436 / NE deg 4.052 最高），背景降噪與 echo 撿回最少。
+> - **balanced** — 折衷（預設），DT/FS SIG 反而最高。
 >
-> ✓ **v3.23.0 no-PA matched-filter 修正後，真 no-prealign 的 echo 也達到 ship bar**（AEC-alone FS echo
-> 3.525 >3.5、DT echo 4.217 >4；+NR 近乎同值）—— 先前 no-prealign echo 偏低的落差已由 no-PA 延遲修正補上。
+> ✓ **真 no-prealign 的 echo 全達 ship bar**（AEC-alone FS echo 3.557 >3.5、DT echo 4.231 >4；+NR 同值或更高，
+> 因 v3.24.0 round-robin 收斂更深、`far02_near` 統一 gain 再加碼）。
 > AEC 模組 ours / AEC3 / Speex 三方對照（目前仍 pre-align，待重生）見 [lib/aec/README.md](lib/aec/README.md)。
 > 渲染器:`pipelines/rebench_aec_only.py`(AEC-alone = AEC+RES)、`pipelines/rebench_joint.py`
 > (A_min_pl;`NR_PRESET=mild|aggressive` 切 preset)。**offline pre-align 已從所有 pipeline 腳本移除**
