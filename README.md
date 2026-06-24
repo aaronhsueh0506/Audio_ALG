@@ -226,8 +226,16 @@ NR 有三個 preset（pipeline `--nr-preset`；C 端 `MmseLsaNrMode` / `mmse_lsa
 
 ### Blind Test 成績（AEC Challenge Interspeech 2021, 800 cases · **真 no-prealign**）
 
-**AEC(balanced) alone vs AEC(balanced) + NR + RES**（RES 用 `min(G_nr, G_res)`）。四欄 =
-AEC 單獨、+NR 三個 preset（`--nr-preset balanced|mild|aggressive`，皆完整 strength 參數組）。
+**AEC(balanced) alone vs AEC(balanced) + NR + RES**。完整鏈路（freq A_min_pl，production）:
+
+> `AEC 線性殘差 E(f)` → `echo-aware NR → G_nr`（ξ=S²/(N²+R²)） → `g_total = min(G_nr, G_res)`
+> ＋ far/near 雙閘 ne_floor → `S = E·g_total` ＋ CNG（comfort noise，只填 echo-suppressed bin）
+
+**RES 在 `G_res` 這一項**：它就是線性 AEC **自己** per-frame 的 **AEC3 SuppressionGain**（由殘留回音
+PSD R² 算出，≈1 無回音、回音 bin <1）。在 `enable_res=0` 下這個 gain **不套用**到 AEC 輸出，只透過
+`return_res_context` seam 把 `G_res` / R² / comfort_noise 輸出，改在上面用 `min(G_nr, G_res)` **外部**合併
+回來。所以「RES」不是 NR 之後另一個獨立 filter，而是 AEC3 內部殘響抑制器的 gain 被 `min` 進這條鏈路。
+四欄 = AEC 單獨、+NR 三個 preset（`--nr-preset balanced|mild|aggressive`，皆完整 strength 參數組）。
 
 > **本表 2026-06-23 以 AEC v3.24.0（round-robin TD constraint，每 hop 只約束 1 個 partition → 收斂更深、各 far-active
 > bucket echo↑）＋ `far02_near` 統一 NR gain re-tune（R² 折入 ξ=S²/(N²+R²)、far-activity＋near-VAD 雙閘 ne_floor）
