@@ -33,13 +33,14 @@ LIBS_STATIC = -L$(AEC_SE_DIR)/bin -laec -L$(NR_SE_DIR)/bin -lmmse_lsa -lm
 
 .PHONY: all clean libs libs-static
 
-all: aec_nr_pipeline aec_nr_pipeline_static
+all: aec_nr_pipeline
 
 aec_nr_pipeline: aec_nr_pipeline.c
 	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
 
-aec_nr_pipeline_static: aec_nr_pipeline_static.c
-	$(CC) $(CFLAGS_STATIC) -o $@ $< $(LIBS_STATIC)
+# NOTE: the aec_nr_pipeline_static (static-memory pool) target has no source yet
+# (aec_nr_pipeline_static.c is unwritten), so it was removed from `all` to make
+# `make` work. Re-add the rule here + to `all` when the source is written.
 
 clean:
 	rm -f aec_nr_pipeline aec_nr_pipeline_static
