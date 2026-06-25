@@ -6,7 +6,8 @@ AEC-linear stage ONCE and then two suppression paths that differ ONLY in the NR
 stage, so the A/B is apples-to-apples:
 
     AEC+RES     : S(f) = E(f) · G_res             (AEC's own AEC3 residual-echo gain; no NR)
-    AEC+NR+RES  : S(f) = E(f) · min(G_nr, G_res)  (production A_min_pl freq pipeline)
+    AEC+NR+RES  : S(f) = E(f) · min(G_nr, G_res)  (production far02_near; G_nr is the
+                  echo-aware unified gain ξ=S²/(N²+R²) by default — see --no-inject-echo-psd)
 
 both with the same ne_floor / ne_gate, so adding NR is the only change.
 
@@ -59,6 +60,7 @@ sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python'))
 
 from pipelines.aec_nr_pipeline import (                       # noqa: E402
     run_aec_linear, run_nr_spectrum, run_res,
+    PROD_INJECT_ECHO_PSD, PROD_NE_FLOOR_FAR_ACTIVE,
 )
 from lib.aec.python.aec import AecConfig, AecMode, AecPreset  # noqa: E402
 
@@ -178,6 +180,16 @@ def main():
                     choices=['r2', 'resgain', 'both', 'both_sharp'])
     ap.add_argument('--combine', default='min', choices=['min', 'product'],
                     help='G_nr/G_res combine for the +NR path (default: min = A_min_pl)')
+    ap.add_argument('--ne-floor-far-active', type=float, default=PROD_NE_FLOOR_FAR_ACTIVE,
+                    help='near-end floor when the far end is ACTIVE (FS/DT); '
+                         'production far02_near = 0.2 (applied to the +NR path)')
+    inj = ap.add_mutually_exclusive_group()
+    inj.add_argument('--inject-echo-psd', dest='inject_echo_psd', action='store_true',
+                     default=PROD_INJECT_ECHO_PSD,
+                     help='echo-aware NR: fold residual-echo R² into the NR floor '
+                          '(ξ=S²/(N²+R²), production far02_near; default ON)')
+    inj.add_argument('--no-inject-echo-psd', dest='inject_echo_psd', action='store_false',
+                     help='plain noise-only NR (old A_min_pl) for A/B vs the unified gain')
     ap.add_argument('--no-cng', action='store_true', help='disable comfort noise')
     ap.add_argument('--no-unmasked', action='store_true',
                     help='skip the ne_floor=0 NR-unmasked output')
@@ -205,8 +217,8 @@ def main():
     print("================================")
     print(f"Input:   {args.input}  ({len(mic)} samples, {len(mic)/sr:.2f}s, {sr} Hz, {n_ch}ch)")
     print(f"Preset:  aec={args.preset} nr={args.nr_preset}   "
-          f"ne_floor={args.ne_floor} gate={args.ne_gate} "
-          f"combine={args.combine} cng={enable_cng}")
+          f"ne_floor={args.ne_floor}/{args.ne_floor_far_active}(far-active) gate={args.ne_gate} "
+          f"combine={args.combine} inject_echo_psd={args.inject_echo_psd} cng={enable_cng}")
     print(f"near-clean ref: {'present (ch2)' if near_clean is not None else 'absent'}")
     print()
 
@@ -225,12 +237,15 @@ def main():
         ne_floor=args.ne_floor, ne_gate=args.ne_gate)
 
     # ---- Path B: AEC + NR + RES (production) ----
-    print("Stage 2b: AEC+NR+RES  (g_total = min(G_nr, G_res))...")
-    nr_gains = run_nr_spectrum(contexts, sr, nr_preset=args.nr_preset)
+    tag = ' [echo-aware ξ=S²/(N²+R²)]' if args.inject_echo_psd else ' [plain noise-only NR]'
+    print(f"Stage 2b: AEC+NR+RES  (g_total = min(G_nr, G_res)){tag}...")
+    nr_gains = run_nr_spectrum(contexts, sr, nr_preset=args.nr_preset,
+                               inject_echo_psd=args.inject_echo_psd)
     out_aec_nr_res = run_res(
         np.zeros(len(mic), dtype=np.float32), nr_gains, contexts, cfg_res,
         use_nr=True, use_res=True, combine=args.combine,
-        ne_floor=args.ne_floor, ne_gate=args.ne_gate)
+        ne_floor=args.ne_floor, ne_gate=args.ne_gate,
+        ne_floor_far_active=args.ne_floor_far_active)
 
     # ---- Path B' : same, but ne_floor=0 → NR at full strength (unmasked) ----
     out_unmasked = None
@@ -239,7 +254,7 @@ def main():
         out_unmasked = run_res(
             np.zeros(len(mic), dtype=np.float32), nr_gains, contexts, cfg_res,
             use_nr=True, use_res=True, combine=args.combine,
-            ne_floor=0.0, ne_gate=args.ne_gate)
+            ne_floor=0.0, ne_gate=args.ne_gate, ne_floor_far_active=None)
 
     # ---- Write outputs ----
     def _rms(x):
