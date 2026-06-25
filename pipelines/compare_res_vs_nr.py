@@ -24,6 +24,9 @@ Outputs (next to the input, or under --out-prefix):
     <prefix>_aec_nr_res.wav           — AEC + NR + RES  (production, ne_floor on)
     <prefix>_aec_nr_res_unmasked.wav  — AEC + NR + RES with ne_floor=0 (NR at FULL
                                         strength; skip with --no-unmasked)
+    <prefix>_aec_nr_res_nocng.wav     — AEC + NR + RES with comfort noise OFF
+                                        (only with --cng-ab; A/B the CNG fill that
+                                        refills the echo-cancelled bins)
     <prefix>_near_clean.wav           — ch2 passthrough (only if 3-channel input)
 
 It also prints an NR-contribution diagnostic (how often / how hard G_nr cuts past
@@ -42,6 +45,7 @@ Usage:
     python3 pipelines/compare_res_vs_nr.py input_3ch.wav --dnsmos
     python3 pipelines/compare_res_vs_nr.py input.wav --out-prefix /tmp/cmp --preset balanced
     python3 pipelines/compare_res_vs_nr.py input.wav --ne-floor 0.4 --ne-gate both --nr-preset balanced
+    python3 pipelines/compare_res_vs_nr.py input.wav --cng-ab --dnsmos   # A/B comfort noise on vs off
 
 Note: uses whatever AEC is checked out in lib/aec. To test the v3.24.0 round-robin
 AEC, make sure lib/aec is at the static-memory tip (495566d) / your merged branch.
@@ -190,7 +194,13 @@ def main():
                           '(ξ=S²/(N²+R²), production far02_near; default ON)')
     inj.add_argument('--no-inject-echo-psd', dest='inject_echo_psd', action='store_false',
                      help='plain noise-only NR (old A_min_pl) for A/B vs the unified gain')
-    ap.add_argument('--no-cng', action='store_true', help='disable comfort noise')
+    ap.add_argument('--no-cng', action='store_true',
+                    help='disable comfort noise on ALL outputs (global)')
+    ap.add_argument('--cng-ab', action='store_true',
+                    help='also write _aec_nr_res_nocng.wav = the production output with '
+                         'comfort noise OFF, so you can A/B the CNG fill on the '
+                         'echo-cancelled bins (run WITHOUT --no-cng so the main output '
+                         'keeps CNG to compare against)')
     ap.add_argument('--no-unmasked', action='store_true',
                     help='skip the ne_floor=0 NR-unmasked output')
     ap.add_argument('--dnsmos', action='store_true',
@@ -212,20 +222,26 @@ def main():
 
     prefix = args.out_prefix or os.path.splitext(args.input)[0]
     enable_cng = not args.no_cng
+    # The CNG A/B needs comfort_noise present in the contexts even when the main
+    # output is CNG-off, so force the AEC stage to estimate it whenever --cng-ab is
+    # set (harmless: enable_res=False, so this only exposes ctx.comfort_noise and
+    # does not touch the linear output or any other context field).
+    aec_enable_cng = enable_cng or args.cng_ab
 
     print("AEC+RES vs AEC+NR+RES comparison")
     print("================================")
     print(f"Input:   {args.input}  ({len(mic)} samples, {len(mic)/sr:.2f}s, {sr} Hz, {n_ch}ch)")
     print(f"Preset:  aec={args.preset} nr={args.nr_preset}   "
           f"ne_floor={args.ne_floor}/{args.ne_floor_far_active}(far-active) gate={args.ne_gate} "
-          f"combine={args.combine} inject_echo_psd={args.inject_echo_psd} cng={enable_cng}")
+          f"combine={args.combine} inject_echo_psd={args.inject_echo_psd} cng={enable_cng}"
+          f"{' (+CNG A/B)' if args.cng_ab else ''}")
     print(f"near-clean ref: {'present (ch2)' if near_clean is not None else 'absent'}")
     print()
 
     # ---- Shared AEC linear stage (run once) ----
     print("Stage 1: AEC (linear, no RES)  — shared by both paths...")
     np.random.seed(0)
-    aec_linear, contexts = run_aec_linear(mic, ref, _build_cfg(sr, args.preset, True, enable_cng))
+    aec_linear, contexts = run_aec_linear(mic, ref, _build_cfg(sr, args.preset, True, aec_enable_cng))
     cfg_res = _build_cfg(sr, args.preset, False, enable_cng)
 
     # ---- Path A: AEC + RES (no NR) ----
@@ -256,6 +272,20 @@ def main():
             use_nr=True, use_res=True, combine=args.combine,
             ne_floor=0.0, ne_gate=args.ne_gate, ne_floor_far_active=None)
 
+    # ---- Path B'' : production B but comfort noise OFF (CNG A/B) ----
+    # Same gains/ne_floor as the main output — the ONLY difference is enable_cng,
+    # so _aec_nr_res.wav (CNG on) vs _aec_nr_res_nocng.wav isolates the comfort
+    # noise that refills the echo-cancelled bins (noise_gain = sqrt(1 - g_res²)).
+    out_nocng = None
+    if args.cng_ab:
+        print("Stage 2d: AEC+NR+RES, comfort noise OFF  (CNG A/B vs the main output)...")
+        cfg_res_nocng = _build_cfg(sr, args.preset, False, False)
+        out_nocng = run_res(
+            np.zeros(len(mic), dtype=np.float32), nr_gains, contexts, cfg_res_nocng,
+            use_nr=True, use_res=True, combine=args.combine,
+            ne_floor=args.ne_floor, ne_gate=args.ne_gate,
+            ne_floor_far_active=args.ne_floor_far_active)
+
     # ---- Write outputs ----
     def _rms(x):
         return float(np.sqrt(np.mean(np.square(x))) + 1e-20)
@@ -267,6 +297,8 @@ def main():
     ]
     if out_unmasked is not None:
         outs.append(('_aec_nr_res_unmasked.wav', out_unmasked, 'AEC+NR+RES (ne_floor=0)'))
+    if out_nocng is not None:
+        outs.append(('_aec_nr_res_nocng.wav', out_nocng, 'AEC+NR+RES (CNG off)'))
     if near_clean is not None:
         outs.append(('_near_clean.wav', near_clean[:len(mic)], 'near-clean (ref passthrough)'))
 
@@ -293,6 +325,21 @@ def main():
         claw_db = 20.0 * np.log10(_rms(out_aec_nr_res) / _rms(out_unmasked))
         print(f"  ne_floor={args.ne_floor:g} claw-back:       {claw_db:+.2f} dB  "
               f"(AEC+NR+RES louder than ne_floor=0 → NR suppression the floor lifted back)")
+    if out_nocng is not None:
+        if enable_cng:
+            n = min(len(out_aec_nr_res), len(out_nocng))
+            diff = out_aec_nr_res[:n] - out_nocng[:n]      # = the injected comfort noise
+            cng_rms = _rms(diff)
+            sig_rms = _rms(out_nocng[:n])
+            # CNG energy RELATIVE to the suppressed signal (the audible floor level).
+            rel_db = 20.0 * np.log10(cng_rms / sig_rms)
+            print(f"  CNG fill (comfort-noise energy): RMS={cng_rms:.5f} ({rel_db:+.1f} dB "
+                  f"vs signal), peak |diff|={float(np.max(np.abs(diff))):.5f}")
+            print(f"     → noise_gain=sqrt(1-g_res²) fills the echo-cancelled bins at the "
+                  f"AEC background level; near-end / NR-only bins (g_res≈1) get ~nothing")
+        else:
+            print("  CNG fill: main output has --no-cng (both files CNG-off) → "
+                  "drop --no-cng so _aec_nr_res.wav keeps CNG to compare against")
 
     # ---- Optional DNSMOS BAK A/B ----
     if args.dnsmos:
@@ -300,6 +347,8 @@ def main():
                  ('AEC+NR+RES', out_aec_nr_res)]
         if out_unmasked is not None:
             named.append(('AEC+NR+RES unmasked', out_unmasked))
+        if out_nocng is not None:
+            named.append(('AEC+NR+RES CNG off', out_nocng))
         _run_dnsmos(named, sr)
 
     print("\nDone. Compare _aec_res.wav vs _aec_nr_res.wav (ne_floor) vs "

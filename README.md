@@ -156,6 +156,80 @@ NE_FLOOR=0.4 NE_GATE=both REBENCH_WORKERS=8 python3 -m pipelines.rebench_joint <
 
 ---
 
+## 增益合併設計（echo-aware 統一增益 + far/near 雙閘 ne_floor + CNG）
+
+這節說明 NR 與 AEC「**怎麼結合**」——不是把 NR 當 AEC 後面另一個獨立 filter，而是讓
+NR 的 gain `G_nr` 和 AEC3 內部的 `G_res` 在頻域以 **`min`** 合併成一條 `g_total`，**一次**
+套用到線性殘差 `E(f)`。三個生產設計（2026-06-23 `far02_near` re-tune）依序如下。
+
+### 1. Echo-aware 統一增益（`inject_echo_psd`，生產預設 ON）
+
+普通 NR 的 a priori SNR 是 `ξ = S²/N²`（S=語音估計、N=噪聲底）。echo-aware 把線性 AEC
+算出的**殘留回音 PSD `R²(f)`** 折進噪聲底：
+
+```
+ξ = S² / (N² + R²)        ← Speex/Habets「回音視為額外噪聲」的統一增益
+```
+
+- `R²` 來自 `ctx.r2`（AEC seam 輸出的殘留回音 PSD），已在跟 NR 噪聲底**相同的 |E|² 尺度**上
+  （β_r=1），可直接相加。
+- 效果：**同一條 `G_nr` 現在連殘留回音也壓**。回音 bin 的 `R²` 大 → ξ 掉 → `G_nr` 掉 →
+  回音被 NR 一起壓掉；近端/穩態噪聲 bin 的 `R²≈0` → 退化回 `ξ=S²/N²`，行為不變。
+- **為什麼 `min(G_nr, G_res)` 不直接丟掉 `G_res`**：`G_res` 是 AEC3 用**收斂後 filter** 算出
+  的近端感知回音 gain，帶有 `G_nr` 看不到的資訊（線性 filter 收斂品質 / ERLE）；丟掉它
+  echo 會崩。echo-aware 是「讓 NR **也**幫忙壓回音」，不是「取代 RES」。
+- `--legacy-amin`（或 `LEGACY_AMIN=1`）還原成純噪聲 NR（不注入 R²）；default-OFF 時 byte-equal。
+- 成績（見上表）：balanced FS echo **+0.07~0.10**、DT BAK **+0.06~0.07**，打破先前「echo 中性」。
+
+### 2. far/near 雙閘 near-end floor（**0.4 / 0.2** 是什麼）
+
+`min(G_nr, G_res)` 在純近端（無回音）會把近端語音也壓掉（NR 的 `g_min` 下限）。**ne_floor**
+在「低回音 bin」把 `g_total` 拉回 1.0 保護近端：
+
+```
+echo_frac = R²/|E|²            ≈0 乾淨近端、≈1 回音主導
+lift      = nf_eff · no_echo   （no_echo 由 ne_gate 決定，預設 both = g_res·(1−echo_frac)）
+g_total   = (1 − lift)·g_total + lift·1.0
+```
+
+關鍵：`nf_eff` **不是固定值**，而是**依遠端是否活躍切換**——這就是 0.4 與 0.2：
+
+| 場景 | `ctx.far_power` | `nf_eff` | 為什麼 |
+|------|-----------------|----------|--------|
+| **NE**（純近端：遠端靜音 + 近端有語音）| ≈0（< `far_gate_thresh`）| **0.4** | 沒有回音要打，降 floor 只會傷近端語音 → 用**高 floor 全力保護近端** |
+| **FS / DT**（遠端活躍）| 有 burst | **0.2** | floor 原本在**過度保護背景噪聲**；v3.24.0 收斂更深後回音變少，**降 floor** 讓壓制把背景/殘響清乾淨 |
+
+- gate：`ctx.far_power > far_gate_thresh`（NE≈0、FS/DT 有 burst → 乾淨分離兩種場景）。
+- 再疊 near-VAD gate（`near_gate_thresh` + hangover）：只有「遠端靜音 **且** 近端真的有語音」
+  才保 0.4；遠端靜音但近端也靜音（FS/DT 的噪聲空檔）→ 沒語音可傷 → 也降到 0.2 清背景。
+- 0.4 / 0.2 是 800-case 調出的 operating point（`far02_near`）：NE 近端被保護、FS/DT 背景更乾淨、
+  ship bar 全過。常數在 `pipelines/aec_nr_pipeline.py`（`PROD_NE_FLOOR=0.4` /
+  `PROD_NE_FLOOR_FAR_ACTIVE=0.2`）；`--legacy-amin` 還原成單一 scalar floor（不分 far/near）。
+
+### 3. CNG（comfort noise）只填回音消掉的 bin
+
+最後 `S(f) = E(f)·g_total` 之後注入舒適噪聲，遮住「回音被消除留下的洞」：
+
+```
+noise_gain = sqrt(1 − g_res²)     ← 看 AEC 回音 gain g_res，不是 g_total
+n_amp      = sqrt(comfort_noise)  ← AEC 估的背景底噪水平
+S         += noise_gain · n_amp · gaussian
+```
+
+- 關鍵：`noise_gain` 用 **`g_res`（回音 gain）而非 `g_total`**。所以 CNG **只填回音被消掉的
+  bin**（`g_res<1`），**完全不碰 NR 壓噪音的 bin**（`g_res≈1` → `noise_gain≈0`）。若改用
+  `g_total` 會把 NR 剛清掉的噪聲又灌回去 → 傷 BAK。**串 NR 不改變 CNG**（它只看 `g_res`），
+  故 NR 串接後 CNG 標準不需調整。
+- 量測（`pipelines/compare_res_vs_nr.py --cng-ab`，A/B 開關 CNG）：FS 案 CNG 能量約在訊號
+  **−37 dB**（回音 bin 有填）、NE 案 **−72 dB**（近端無回音 → 幾乎不填）。
+
+```bash
+# A/B 串 NR 的開不開差異 + CNG 開不開差異（會多輸出 _aec_nr_res_nocng.wav）
+python3 pipelines/compare_res_vs_nr.py input.wav --cng-ab --dnsmos
+```
+
+---
+
 ## AEC Preset 設定
 
 三個 preset 的差異**只有一個參數**：`min_gain_floor_far_active_db`（遠端活躍時的最低增益下限）。
