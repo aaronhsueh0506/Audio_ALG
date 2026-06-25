@@ -152,6 +152,14 @@ int main(int argc, char* argv[]) {
      * stays from the preset. See pipelines/aec_nr_pipeline.py:_build_denoiser. */
     nr_cfg.L       = 150;
     nr_cfg.alpha_d = 0.95f;
+    /* Python _build_denoiser leaves gain-smoothing at the v3_2 defaults for ALL
+     * presets (does NOT pass the C-only per-mode alpha_attack/alpha_decay):
+     * alpha_attack=0.3 fixed, alpha_decay=None→alpha_g. config_for_mode's
+     * MILD/AGGRESSIVE values (0.4/0.92, 0.15/0.85) are C-standalone-only and
+     * diverge from the pipeline's Python reference — override them here so the
+     * pipeline C matches Python on every preset (BALANCED already equal). */
+    nr_cfg.alpha_attack = 0.3f;
+    nr_cfg.alpha_decay  = nr_cfg.alpha_g;
 
     /* Frame dimensions (shared 10ms-hop grid) */
     int hop      = (int)(0.01f * sr);   /* 160 @ 16k */
