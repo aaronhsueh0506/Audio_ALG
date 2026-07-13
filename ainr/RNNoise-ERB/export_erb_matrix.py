@@ -1,7 +1,7 @@
 """
 匯出 ERB 轉換矩陣 (三角版, 對齊 train.py / denoise.py)
 
-產出給 Novatek C runtime 的 ERB 前/後處理矩陣:
+產出給目標平台 C runtime 的 ERB 前/後處理矩陣:
     feature:  power @ W_fwd            (mode=0, edge x2)
     mask→bin: W_inv @ band_gains       (mode=1, partition of unity)
 兩者都在 NN 圖外的 C 端跑。矩陣用 train.compute_erb_matrix 建 (三角 DFN-Keras 版),

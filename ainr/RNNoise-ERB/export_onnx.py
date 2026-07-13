@@ -172,7 +172,7 @@ def export(args):
     if os.path.exists(raw_path) and raw_path != args.output:
         os.remove(raw_path)
 
-    # 4) 乾淨性驗證: 無 custom op / 無 unknown dim (Novatek NPU 佈署要求)
+    # 4) 乾淨性驗證: 無 custom op / 無 unknown dim (目標 NPU 佈署要求)
     validate_clean_onnx(args.output)
 
     if args.verify:
