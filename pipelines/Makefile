@@ -1,54 +1,90 @@
 # Audio_ALG/pipelines/Makefile
 #
-# Linear AEC -> NR -> RES Pipeline (with HPF pre-processing)
+# AEC(linear) -> echo-aware NR -> RES pipeline — two versions of the SAME
+# algorithm (see aec_nr_pipeline.c's header for the DSP chain):
 #
-# Version A (malloc): uses submodule libs (lib/aec, lib/nr)
-# Version B (static): uses SE/ repos on feature/static-memory branch
+#   aec_nr_pipeline         (Version A: malloc)         — heap-allocated modules
+#   aec_nr_pipeline_static  (Version B: static memory)  — one caller pool, no
+#                                                          malloc after init
+#
+# Both link against the submodule libs (lib/aec, lib/nr) + the shared
+# audio_common FFT/fast_math layer (../../audio_common relative to this dir).
 #
 # Usage:
-#   make libs          # Build libraries (submodule, for Version A)
-#   make libs-static   # Build libraries (SE/ repos, for Version B)
-#   make               # Build both versions
+#   make                       # builds libs (BACKEND=kiss) + both binaries
+#   make BACKEND=ne10          # NE10 backend (rebuild libs first: make clean-libs)
+#   make clean                 # remove the two pipeline binaries
+#   make clean-libs             # also clean lib/aec, lib/nr, audio_common build dirs
 
-# Version A: submodule paths
 AEC_DIR = ../lib/aec/c_impl
 NR_DIR  = ../lib/nr/c_impl
 
-# Version B: SE/ repo paths (feature/static-memory branch)
-AEC_SE_DIR = ../../AEC/c_impl
-NR_SE_DIR  = ../../NR/c_impl
+# audio_common sits two levels up from pipelines/ (SE/Audio_ALG/pipelines -> SE/audio_common).
+# lib/aec/c_impl and lib/nr/c_impl each resolve it themselves from their own
+# location (../../../../audio_common from c_impl/, verified to exist as a
+# submodule checkout); AC_DIR here is for OUR OWN CFLAGS/LDFLAGS and is passed
+# through explicitly to the sub-makes so all three always agree on the path.
+AC_DIR ?= ../../audio_common
+BACKEND ?= kiss
 
-CC ?= gcc
+CC  ?= gcc
+CXX ?= c++
 
-CFLAGS = -Wall -Wextra -O2 -std=c99 \
+CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
          -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
-         -I$(NR_DIR)/include
+         -I$(NR_DIR)/include \
+         -I$(AC_DIR)/include
 
-CFLAGS_STATIC = -Wall -Wextra -O2 -std=c99 \
-                -I$(AEC_SE_DIR)/include -I$(AEC_SE_DIR)/example \
-                -I$(NR_SE_DIR)/include
+# The NE10 archive carries one C++ TU (NE10's generic-radix FFT kernel); a
+# plain-C pipeline binary linking against it needs the C++ runtime driver.
+LINK = $(CC)
+LDFLAGS_EXTRA =
+ifeq ($(BACKEND),ne10)
+  LINK = $(CXX)
+  LDFLAGS_EXTRA = -lc++
+endif
 
-LIBS = -L$(AEC_DIR)/bin -laec -L$(NR_DIR)/bin -lmmse_lsa -lm
-LIBS_STATIC = -L$(AEC_SE_DIR)/bin -laec -L$(NR_SE_DIR)/bin -lmmse_lsa -lm
+# Link order matters: pipeline.o, libaec.a, libmmse_lsa.a, libaudio_common.a, -lm
+LIBS = $(AEC_DIR)/bin/libaec.a \
+       $(NR_DIR)/bin/libmmse_lsa.a \
+       $(AC_DIR)/bin/$(BACKEND)/libaudio_common.a
+LDFLAGS = $(LIBS) -lm $(LDFLAGS_EXTRA)
 
-.PHONY: all clean libs libs-static
+.PHONY: all clean clean-libs libs
 
-all: aec_nr_pipeline
+all: libs aec_nr_pipeline aec_nr_pipeline_static
 
-aec_nr_pipeline: aec_nr_pipeline.c
-	$(CC) $(CFLAGS) -o $@ $< $(LIBS)
+# Build the shared archive + both submodule libs for the selected BACKEND.
+# AC_DIR is passed through explicitly so lib/aec and lib/nr resolve the SAME
+# audio_common checkout this Makefile uses (their own AC_DIR fallback also
+# resolves correctly at the submodule depth: ../../../../audio_common from
+# c_impl/, but pass it anyway to be explicit/robust).
+libs:
+	$(MAKE) -C $(AC_DIR) BACKEND=$(BACKEND) lib
+	$(MAKE) -C $(AEC_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR))
+	$(MAKE) -C $(NR_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR))
 
-# NOTE: the aec_nr_pipeline_static (static-memory pool) target has no source yet
-# (aec_nr_pipeline_static.c is unwritten), so it was removed from `all` to make
-# `make` work. Re-add the rule here + to `all` when the source is written.
+# Compile with $(CC) (always a plain-C driver, -std=gnu99 valid) then link with
+# $(LINK) (c++ for BACKEND=ne10 — the NE10 archive's one C++ TU needs it). A
+# C++ driver invoked directly on a .c source rejects -std=gnu99 and treats the
+# file as C++, so the compile and link steps must stay separate here (mirrors
+# how lib/aec and lib/nr's own Makefiles split .o-compile from $(LINK)).
+aec_nr_pipeline.o: aec_nr_pipeline.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+aec_nr_pipeline_static.o: aec_nr_pipeline_static.c
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+aec_nr_pipeline: aec_nr_pipeline.o | libs
+	$(LINK) -o $@ $< $(LDFLAGS)
+
+aec_nr_pipeline_static: aec_nr_pipeline_static.o | libs
+	$(LINK) -o $@ $< $(LDFLAGS)
 
 clean:
-	rm -f aec_nr_pipeline aec_nr_pipeline_static
+	rm -f aec_nr_pipeline aec_nr_pipeline_static aec_nr_pipeline.o aec_nr_pipeline_static.o
 
-libs:
-	$(MAKE) -C $(AEC_DIR) lib
-	$(MAKE) -C $(NR_DIR) lib
-
-libs-static:
-	$(MAKE) -C $(AEC_SE_DIR) lib
-	$(MAKE) -C $(NR_SE_DIR) lib
+clean-libs: clean
+	$(MAKE) -C $(AEC_DIR) clean
+	$(MAKE) -C $(NR_DIR) clean
+	$(MAKE) -C $(AC_DIR) clean

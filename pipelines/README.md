@@ -127,7 +127,7 @@ that source file lands and the Makefile target is re-enabled.
 Single pre-allocated memory pool, no internal malloc:
 
 1. Query each module's memory requirement: `_get_mem_size()`
-2. Allocate one contiguous pool (malloc on desktop, PA/VA on Novatek)
+2. Allocate one contiguous pool (malloc on desktop, a platform memory block on the embedded target)
 3. Slice pool via pointer arithmetic, init each module: `_init()`
 4. Process frames (identical logic to Version A)
 5. Free the single pool at cleanup
@@ -163,7 +163,7 @@ void aec_destroy(Aec* aec);
 > on the `main` branch this repo currently vendors — NR's static-memory API lives only on NR's
 > own `feature/static-memory` branch, which is not what `.gitmodules` pins for `lib/nr`.
 
-**Novatek integration:**
+**Embedded-target integration:**
 
 ```c
 // Replace malloc with PA/VA allocation:
