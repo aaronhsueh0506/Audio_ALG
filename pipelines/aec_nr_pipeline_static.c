@@ -22,8 +22,13 @@
  * Usage:
  *   ./aec_nr_pipeline_static <mic.wav> <ref.wav> <out.wav> [aec-preset]
  *                     [--nr-preset mild|balanced|aggressive] [--aec-only] [--legacy-amin]
+ *                     [--debug] [--delay-duty]
  *   ./aec_nr_pipeline_static --print-mem-size [preset] [--nr-preset ...] [--aec-only]
  *                     [--sample-rate <hz>]
+ *
+ * --debug / --delay-duty: identical semantics to the malloc pipeline (see
+ *   aec_nr_pipeline.c's header) — --debug prints one combined AEC+NR status
+ *   line/sec to stderr; --delay-duty sets AecConfig.delay_est_duty_cycle=1.
  */
 
 #include <stdio.h>
@@ -78,6 +83,43 @@ static const char* nr_mode_name(MmseLsaNrMode m) {
         case MMSE_LSA_NR_AGGRESSIVE: return "aggressive";
         default:                     return "balanced";
     }
+}
+
+/* --debug: one compact status line/sec to stderr, combining both libraries'
+ * read-only diagnostic queries (aec_debug_status() / mmse_lsa_debug_status()) —
+ * byte-identical helper to the malloc pipeline's copy. Neither call mutates
+ * DSP state or fast_math-approximates anything, so this is safe to call every
+ * second regardless of preset/backend. aec_only (or nr==NULL) omits the NR
+ * half — no denoiser exists in that mode.
+ *
+ * CAVEAT: this pipeline always runs AEC in linear mode (enable_res=0,
+ * return_res_context=1 — the external NR/RES seam above), and aec.c only
+ * caches last_erle_windowed when cfg.enable_res is true. So the "erle="
+ * field below always reads 0.0dB here — expected given this pipeline's
+ * config, not a broken query (see pipelines/README.md "Debugging &
+ * Performance Flags"). */
+static void print_debug_status(const Aec* aec, const MmseLsaDenoiser* nr,
+                                int aec_only, double seconds) {
+    AecDebugStatus a;
+    aec_debug_status(aec, &a);
+    if (aec_only || !nr) {
+        fprintf(stderr,
+            "[dbg %5.1fs] aec: delay=%d conf=%.1f upd=%d erle=%.1fdB lin=%d conv=%d "
+            "near=%.2e out=%.2e | nr: n/a (--aec-only)\n",
+            seconds, a.delay_samples, a.delay_confidence, a.delay_updates,
+            a.erle_windowed_db, a.usable_linear, a.filter_converged,
+            a.near_power, a.out_power);
+        return;
+    }
+    MmseLsaDebugStatus n;
+    mmse_lsa_debug_status(nr, &n);
+    fprintf(stderr,
+        "[dbg %5.1fs] aec: delay=%d conf=%.1f upd=%d erle=%.1fdB lin=%d conv=%d "
+        "near=%.2e out=%.2e | nr: init=%d gain=%.1f/%.1fdB spp=%.2f noise=%.1fdB\n",
+        seconds, a.delay_samples, a.delay_confidence, a.delay_updates,
+        a.erle_windowed_db, a.usable_linear, a.filter_converged,
+        a.near_power, a.out_power,
+        n.initialized, n.mean_gain_db, n.min_gain_db, n.mean_spp, n.noise_floor_db);
 }
 
 /* Deterministic standard-normal source for comfort noise — same generator as
@@ -355,7 +397,8 @@ int main(int argc, char* argv[]) {
 
     if (argc < 4) {
         printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-preset] "
-               "[--nr-preset mild|balanced|aggressive] [--aec-only] [--legacy-amin]\n",
+               "[--nr-preset mild|balanced|aggressive] [--aec-only] [--legacy-amin] "
+               "[--debug] [--delay-duty]\n",
                argv[0]);
         printf("       %s --print-mem-size [preset] [--nr-preset ...] [--aec-only] "
                "[--sample-rate <hz>]\n", argv[0]);
@@ -371,11 +414,15 @@ int main(int argc, char* argv[]) {
     int           aec_only = 0;
     int           legacy   = 0;   /* --legacy-amin → prior min-only A_min_pl */
     int           no_cng   = 0;   /* --no-cng → disable comfort noise (parity) */
+    int           debug_status = 0; /* --debug → periodic aec+nr status line   */
+    int           delay_duty   = 0; /* --delay-duty → AecConfig.delay_est_duty_cycle=1 */
 
     for (int i = 4; i < argc; i++) {
         if      (strcmp(argv[i], "--aec-only") == 0)    aec_only = 1;
         else if (strcmp(argv[i], "--legacy-amin") == 0) legacy = 1;
         else if (strcmp(argv[i], "--no-cng") == 0)      no_cng = 1;
+        else if (strcmp(argv[i], "--debug") == 0)       debug_status = 1;
+        else if (strcmp(argv[i], "--delay-duty") == 0)  delay_duty = 1;
         else if (strcmp(argv[i], "--nr-preset") == 0 && i+1 < argc)
             nr_mode = parse_nr_mode(argv[++i]);
         else if (argv[i][0] != '-')
@@ -401,6 +448,7 @@ int main(int argc, char* argv[]) {
     aec_config_from_preset(&aec_cfg, preset, sr);
     aec_cfg.enable_res         = 0;
     aec_cfg.return_res_context = 1;
+    if (delay_duty) aec_cfg.delay_est_duty_cycle = 1;  /* --delay-duty (see aec.h doc) */
     int enable_cng = aec_cfg.enable_cng && !no_cng;   /* preset default (1) */
 
     MmseLsaConfig nr_cfg = mmse_lsa_config_for_mode(sr, nr_mode);
@@ -492,7 +540,10 @@ int main(int argc, char* argv[]) {
         if (aec_only) {
             wav_write_float(writer, aec_out, hop);
             processed += hop;
-            if (processed % sr == 0) { printf("."); fflush(stdout); }
+            if (processed % sr == 0) {
+                printf("."); fflush(stdout);
+                if (debug_status) print_debug_status(aec, NULL, 1, (double)processed / sr);
+            }
             continue;
         }
 
@@ -595,7 +646,10 @@ int main(int argc, char* argv[]) {
         }
 
         processed += hop;
-        if (processed % sr == 0) { printf("."); fflush(stdout); }
+        if (processed % sr == 0) {
+            printf("."); fflush(stdout);
+            if (debug_status) print_debug_status(aec, nr, aec_only, (double)processed / sr);
+        }
     }
     if (dctx) fclose(dctx);
 

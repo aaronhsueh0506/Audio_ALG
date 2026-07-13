@@ -13,6 +13,7 @@
 # Usage:
 #   make                       # builds libs (BACKEND=kiss) + both binaries
 #   make BACKEND=ne10          # NE10 backend (rebuild libs first: make clean-libs)
+#   make EXTRA_CFLAGS="-DAEC_FAST_MATH"   # see the EXTRA_CFLAGS block below
 #   make clean                 # remove the two pipeline binaries
 #   make clean-libs             # also clean lib/aec, lib/nr, audio_common build dirs
 
@@ -30,10 +31,38 @@ BACKEND ?= kiss
 CC  ?= gcc
 CXX ?= c++
 
+# EXTRA_CFLAGS — pass-through to the AEC/NR lib sub-builds AND this pipeline's
+# own compile (both submodule Makefiles already do `CFLAGS += $(EXTRA_CFLAGS)`,
+# so one EXTRA_CFLAGS on this top-level `make` reaches every .o for the build):
+#
+#   make EXTRA_CFLAGS="-DAEC_FAST_MATH"
+#     Opt-in fast matched-filter arithmetic in lib/aec's delay estimator
+#     (float32 NEON-style accumulation instead of the bit-exact reference
+#     dot products). Sampled-quality-verified: ~zero cost to output quality
+#     on the cases spot-checked so far. Diverges from the bit-exact Python
+#     reference — default build (no EXTRA_CFLAGS) stays byte-identical.
+#     See lib/aec/c_impl/src/delay_aec3.c.
+#
+#   make EXTRA_CFLAGS="-DAEC_DELAY_DS_FACTOR=8"
+#     Selects AEC3's own ds8 decimation for the delay estimator (matched-
+#     filter taps 512->256, sub-block rate 16->8), roughly halving that
+#     stage's cost. FS-REGRESSION RISK — coarsens delay resolution from 4 to
+#     8 samples; needs a full 800-case AECMOS gate before shipping. Default
+#     (4) stays byte-identical. See lib/aec/c_impl/include/delay_aec3.h.
+#
+#   Flags combine: make EXTRA_CFLAGS="-DAEC_FAST_MATH -DAEC_DELAY_DS_FACTOR=8"
+#
+# NOTE: switching EXTRA_CFLAGS on an already-built tree needs `make clean-libs`
+# first — object files aren't flag-tagged, so a stale non-flagged .o (or a
+# stale flagged one, if you're turning a flag back off) will silently persist
+# otherwise.
+EXTRA_CFLAGS ?=
+
 CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
          -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
          -I$(NR_DIR)/include \
          -I$(AC_DIR)/include
+CFLAGS += $(EXTRA_CFLAGS)
 
 # The NE10 archive carries one C++ TU (NE10's generic-radix FFT kernel); a
 # plain-C pipeline binary linking against it needs the C++ runtime driver.
@@ -61,8 +90,8 @@ all: libs aec_nr_pipeline aec_nr_pipeline_static
 # c_impl/, but pass it anyway to be explicit/robust).
 libs:
 	$(MAKE) -C $(AC_DIR) BACKEND=$(BACKEND) lib
-	$(MAKE) -C $(AEC_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR))
-	$(MAKE) -C $(NR_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR))
+	$(MAKE) -C $(AEC_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)"
+	$(MAKE) -C $(NR_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)"
 
 # Compile with $(CC) (always a plain-C driver, -std=gnu99 valid) then link with
 # $(LINK) (c++ for BACKEND=ne10 — the NE10 archive's one C++ TU needs it). A

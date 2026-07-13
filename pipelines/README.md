@@ -104,6 +104,81 @@ make                # Builds aec_nr_pipeline (Version A only — see note below)
 ./aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-preset aggressive
 ```
 
+## Debugging & Performance Flags
+
+Both `aec_nr_pipeline` and `aec_nr_pipeline_static` support the same two CLI options
+(mirrored, byte-for-byte identical wiring in both binaries) plus two opt-in
+compile-time flags. **None of these are on by default** — running either binary
+with no options/flags is byte-identical to before they existed.
+
+### `--debug`
+
+Once per second of processed audio, prints one compact status line to stderr
+combining `aec_debug_status()` (lib/aec) and `mmse_lsa_debug_status()` (lib/nr) —
+both are read-only snapshots of state the engines already maintain, so this adds
+no per-frame cost when the flag is off and doesn't perturb the DSP output when on
+(stdout/the output WAV are unaffected either way).
+
+```
+./aec_nr_pipeline mic.wav ref.wav out.wav --debug
+[dbg   1.0s] aec: delay=-1 conf=0.5 upd=6 erle=0.0dB lin=0 conv=0 near=8.74e-04 out=8.08e-04 | nr: init=1 gain=-18.2/-23.4dB spp=0.50 noise=-1.2dB
+[dbg   2.0s] aec: delay=320 conf=1.0 upd=18 erle=0.0dB lin=1 conv=0 near=4.79e-03 out=3.47e-03 | nr: init=1 gain=-18.8/-23.9dB spp=0.51 noise=-4.8dB
+...
+```
+
+`aec:` fields are `AecDebugStatus` (delay in samples, `-1` = not yet acquired;
+`conf`/`upd` = delay-estimator confidence/update count; `erle` = windowed ERLE dB;
+`lin`/`conv` = usable-linear-estimate / filter-converged gates; `near`/`out` = EMA
+power). `nr:` fields are `MmseLsaDebugStatus` (`init` = noise-floor initialized;
+`gain` = mean/min linear gain dB; `spp` = mean speech-presence probability;
+`noise` = mean noise-floor dB). With `--aec-only` the `nr:` half prints `n/a`
+(no denoiser exists in that mode).
+
+> **Caveat**: this pipeline always runs AEC in **linear mode**
+> (`enable_res=0`, `return_res_context=1` — the external NR/RES seam), and
+> `lib/aec/c_impl/src/aec.c` only caches `last_erle_windowed` when
+> `cfg.enable_res` is true. So `erle=` in this pipeline's `--debug` output
+> always reads `0.0dB` — that's expected here, not a broken query. (The field
+> does move if you drive `aec_debug_status()` from a caller running with
+> `enable_res=1`, e.g. `lib/aec/c_impl/example/aec_wav.c --debug`.)
+
+### `--delay-duty`
+
+Sets `AecConfig.delay_est_duty_cycle = 1` before `aec_create()`/`aec_init()`.
+This duty-cycles the AEC3 matched-filter delay estimator: once the delay
+estimate is solid (confidence 1.0) and unchanged for `delay_est_period_s`
+(default 0.5s), analysis drops to 1 hop in every K (K=10 by default) instead of
+every hop — full-rate analysis resumes immediately if the estimate changes,
+loses solidity, or ERLE drops >6dB off its running peak. **Sampled-quality-
+verified ~zero cost** (see `lib/aec/c_impl/include/aec.h` field doc for the
+exact schedule). On a stable-delay clip the decimated schedule never actually
+skips a *different* outcome, so output stays byte-identical to the default;
+verified here on `wav/aec_challenge_blind/doubletalk/0I0XMl3M0ECO0U1N0cJvpg_*`.
+
+```
+./aec_nr_pipeline mic.wav ref.wav out.wav --delay-duty
+```
+
+### Compile flags (`EXTRA_CFLAGS`, opt-in, off by default)
+
+`pipelines/Makefile` passes `EXTRA_CFLAGS` through to the `lib/aec` and
+`lib/nr` sub-builds *and* this pipeline's own compile, so one invocation
+reaches every `.o`:
+
+| Flag | Effect | Verdict |
+|------|--------|---------|
+| `-DAEC_FAST_MATH` | Float32 NEON-style matched-filter dot products + sliding `x2_sum` in the delay estimator (lib/aec `delay_aec3.c`) | Sampled-quality-verified: ~zero cost to output quality on the cases spot-checked so far. Diverges from the bit-exact Python reference on near-tie delay votes (default build stays byte-identical) |
+| `-DAEC_DELAY_DS_FACTOR=8` | AEC3's own ds8 delay-estimator decimation (matched-filter taps 512→256, sub-block rate 16→8), ~halves that stage's cost | **FS-regression risk** — coarsens delay resolution from 4 to 8 samples. Needs a full 800-case AECMOS gate before shipping. Default (4) stays byte-identical |
+
+```bash
+make clean-libs && make EXTRA_CFLAGS="-DAEC_FAST_MATH"
+make clean-libs && make EXTRA_CFLAGS="-DAEC_FAST_MATH -DAEC_DELAY_DS_FACTOR=8"
+```
+
+`make clean-libs` first is required when switching `EXTRA_CFLAGS` — object
+files aren't flag-tagged, so a stale non-flagged (or stale flagged) `.o` will
+otherwise silently persist across the flag change.
+
 > Version B (`aec_nr_pipeline_static`) is **not currently buildable**: `aec_nr_pipeline_static.c`
 > does not exist in this repo yet, so its Makefile target is commented out / excluded from
 > `all` (see `pipelines/Makefile`). There is no `./aec_nr_pipeline_static` binary and no
