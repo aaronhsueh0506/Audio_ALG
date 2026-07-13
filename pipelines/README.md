@@ -35,8 +35,8 @@ All modules use unified 20ms frame / 10ms hop, auto-configured by sample rate:
 | hop_size | 80 | 160 | 480 | frame / 2 |
 | fft_size | 256 | 512 | 1024 | next pow2 ≥ frame |
 | n_freqs | 129 | 257 | 513 | fft/2 + 1 |
-| filter_length | 256 | 512 | 1536 | sr × 32ms |
-| n_partitions | 4 | 4 | 4 | ceil(filter_length / hop) |
+| filter_length | 832 | 832 | 832 | preset default (52ms @16k), NOT sr-scaled |
+| n_partitions | 11 | 6 | 2 | ceil(filter_length / hop) |
 
 ## Latency & Performance
 
@@ -50,13 +50,19 @@ All modules use unified 20ms frame / 10ms hop, auto-configured by sample rate:
 
 ### Memory Budget
 
-| Sample Rate | AEC | Context×2 | NR | RES | Buffers | **Total** |
-|-------------|-----|-----------|-----|-----|---------|-----------|
-| **8 kHz** | 61.7 KB | 6.3 KB | 49.0 KB | 21.5 KB | 4.6 KB | **143.1 KB** |
-| **16 kHz** | 120.7 KB | 12.3 KB | 96.3 KB | 41.8 KB | 9.2 KB | **280.4 KB** |
-| **48 kHz** | 240.4 KB | 24.3 KB | 194.8 KB | 86.3 KB | 21.4 KB | **567.4 KB** |
+Measured figures from `./aec_nr_pipeline_static --print-mem-size --sample-rate <hz>`
+(balanced presets, KISS backend). The AEC row is the composite `aec_get_mem_size()`
+pool — it already contains HPF, PBFDKF ×2 (main+shadow), delay estimator, the
+RES/post context and the AEC-internal FFTs:
 
-> `filter_length=sr×32ms`。若需更長 echo path，增加 `filter_length` 會等比增加 AEC 記憶體。
+| Sample Rate | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
+|-------------|-----|-----------|-----|---------------|-----------|
+| **8 kHz** | 320.9 KB | 8.6 KB | 95.5 KB | 6.6 KB | **431.6 KB** |
+| **16 kHz** | 526.7 KB | 16.6 KB | 189.5 KB | 13.1 KB | **745.8 KB** |
+| **48 kHz** | 1063.2 KB | 32.6 KB | 377.5 KB | 31.1 KB | **1504.4 KB** |
+
+> 增加 `filter_length`（preset 預設 832 taps）會等比增加 AEC 記憶體；48 kHz 記憶體吃緊時
+> 先縮 `filter_length` 與 NR 的 `L`。
 
 ## Integration Flow
 
@@ -91,25 +97,25 @@ corresponding NR output becomes available.
 ## Build
 
 ```bash
-# Build libraries (from Audio_ALG/pipelines/)
-make libs           # Version A (submodule libs)
-make libs-static    # Version B (SE/ repo libs on feature/static-memory)
-
-# Build pipeline
-make                # Builds aec_nr_pipeline (Version A only — see note below)
+# From Audio_ALG/pipelines/ — builds the submodule libs + BOTH binaries
+make                # libs (BACKEND=kiss) + aec_nr_pipeline + aec_nr_pipeline_static
 
 # Run Version A (malloc)
 ./aec_nr_pipeline mic.wav ref.wav output.wav balanced
 ./aec_nr_pipeline mic.wav ref.wav output.wav --aec-only
 ./aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-preset aggressive
+
+# Run Version B (static memory) — same CLI, plus a mem-size query mode
+./aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
+./aec_nr_pipeline_static --print-mem-size --sample-rate 16000
 ```
 
 ## Debugging & Performance Flags
 
-Both `aec_nr_pipeline` and `aec_nr_pipeline_static` support the same two CLI options
-(mirrored, byte-for-byte identical wiring in both binaries) plus two opt-in
-compile-time flags. **None of these are on by default** — running either binary
-with no options/flags is byte-identical to before they existed.
+Both `aec_nr_pipeline` and `aec_nr_pipeline_static` support the same debug CLI
+option (mirrored, byte-for-byte identical wiring in both binaries). There are
+no optional performance compile flags — the fast matched-filter arithmetic and
+delay-estimator duty-cycling are built into `lib/aec` unconditionally.
 
 ### `--debug`
 
@@ -179,67 +185,41 @@ otherwise silently persist across the flag change.
 Each module uses `_create()` / `_destroy()` and manages its own memory internally.
 Suitable for desktop testing and Linux servers.
 
-### Version B: static memory (`aec_nr_pipeline_static.c`) — not yet built
+### Version B: static memory (`aec_nr_pipeline_static.c`)
 
-On branch: `feature/static-memory` (all three repos: AEC, NR, Audio_ALG). Note the submodules
-pinned by this repo's `.gitmodules` are `lib/aec` on `feature/static-memory` (so AEC's own
-static-memory API, e.g. `aec_get_mem_size()` / `aec_init()`, is real today) and `lib/nr` on
-`main` (which does **not** currently carry NR's static-memory API — see the NR row below).
-`aec_nr_pipeline_static.c` itself has not been written, so this design is aspirational until
-that source file lands and the Makefile target is re-enabled.
+Built by default alongside Version A (both submodules are pinned to their
+`feature/static-memory` branches, which export the unified static API). One
+caller-owned pool, no malloc after init, byte-identical output to Version A
+(see Verification below).
 
-Single pre-allocated memory pool, no internal malloc:
-
-1. Query each module's memory requirement: `_get_mem_size()`
-2. Allocate one contiguous pool (malloc on desktop, a platform memory block on the embedded target)
-3. Slice pool via pointer arithmetic, init each module: `_init()`
-4. Process frames (identical logic to Version A)
-5. Free the single pool at cleanup
-
-**Static memory API pattern** (every module follows this):
+The pipeline uses exactly THREE composite static APIs — there are no
+per-submodule `_get_mem_size()` entry points; each library slices its own
+internals (HPF, PBFDKF ×2, delay estimator, RES/post context, internal FFTs
+for AEC; MCRA + SPP for NR) inside its single pool segment:
 
 ```c
-// Query memory size needed
-size_t aec_get_mem_size(const AecConfig* config);
+size_t aec_sz = aec_get_mem_size(&aec_cfg);          /* lib/aec           */
+size_t nr_sz  = mmse_lsa_get_mem_size(&nr_cfg);      /* lib/nr            */
+size_t fft_sz = fft_get_mem_size(fft_size);          /* audio_common (OLA) */
+/* + pipeline buffers; every segment 16-byte aligned (ALIGN16)            */
 
-// Initialize in pre-allocated memory (no malloc inside)
-Aec* aec_init(void* mem, size_t mem_size, const AecConfig* config);
-
-// Destroy is no-op for static (is_static flag)
-void aec_destroy(Aec* aec);
+Aec*             aec = aec_init(mem_aec, aec_sz, &aec_cfg);
+MmseLsaDenoiser* nr  = mmse_lsa_init(mem_nr, nr_sz, &nr_cfg);
+FftHandle*       fft = fft_init(mem_fft, fft_sz, fft_size);
+/* destroy() on static instances frees no pool memory (runtime is_static); it
+ * still releases backend-owned handles (e.g. NE10 twiddle configs). */
 ```
 
-**Modules with static memory support:**
+Query the exact pool budget for any configuration without running audio:
 
-| Module | `_get_mem_size()` | `_init()` | Sub-modules |
-|--------|-------------------|-----------|-------------|
-| AEC | `aec_get_mem_size()` | `aec_init()` | HPF, PBFDKF x2, RES (optional), FFT |
-| NR | *(not on `main` — see note)* | *(not on `main` — see note)* | MCRA, SPP, FFT |
-| RES | `res_get_mem_size()` | `res_init()` | FFT |
-| Context | `aec_context_get_mem_size()` | `aec_context_init()` | — |
-| PBFDKF | `pbfdkf_get_mem_size()` | `pbfdkf_init()` | FFT |
-| HPF | `hpf_get_mem_size()` | `hpf_init()` | — |
-| MCRA | `mcra_get_mem_size()` | `mcra_init()` | — |
-| SPP | `spp_get_mem_size()` | `spp_init()` | — |
-| FFT | `fft_get_mem_size()` | `fft_init()` | kiss_fft |
-
-> `mmse_lsa_get_mem_size()` / `mmse_lsa_init()` are **not present** in `lib/nr/c_impl/include/mmse_lsa_denoiser.h`
-> on the `main` branch this repo currently vendors — NR's static-memory API lives only on NR's
-> own `feature/static-memory` branch, which is not what `.gitmodules` pins for `lib/nr`.
-
-**Embedded-target integration:**
-
-```c
-// Replace malloc with PA/VA allocation:
-// void* pool = malloc(total);
-uint32_t pa;
-void* pool = (void*)nvt_mem_alloc(total, &pa);
-// pa = physical address (for DMA), pool = virtual address (for CPU)
-
-// Cleanup:
-// free(pool);
-nvt_mem_free(pool, pa);
+```bash
+./aec_nr_pipeline_static --print-mem-size --sample-rate 16000
 ```
+
+**Embedded-target integration:** allocate one contiguous, 16-byte-aligned
+block of the reported total from the platform allocator, pass it in place of
+the desktop `malloc` — no other change. The pool base MUST be 16-byte
+aligned (both libraries assert this).
 
 ## Tunable Parameters
 
@@ -345,6 +325,8 @@ older power-dB (`/10`) convention:
 
 ### Verification
 
-Version A (`aec_nr_pipeline`) is the only version currently built and tested. Version B
-(`aec_nr_pipeline_static`) has no source yet (see the "not yet built" note above), so there is
-no bit-exact comparison to report until it exists.
+Both versions build from the default `make` and have been verified
+**byte-identical** to each other (`cmp` on the full rendered WAV) at 16 kHz on
+real doubletalk material (`aec_challenge_blind` case `0I0XMl3M`, balanced
+presets, CNG on), and the static build's init asserts the 8 kHz / 16 kHz FFT
+grids agree across AEC/NR/OLA (`n_freqs` cross-check at init).

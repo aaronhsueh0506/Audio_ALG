@@ -10,10 +10,13 @@
 
 - AEC static library：`lib/aec/c_impl/bin/libaec.a`
 - NR static library：`lib/nr/c_impl/bin/libmmse_lsa.a`
-- malloc reference executable：`pipelines/aec_nr_pipeline`
-- reference source：`pipelines/aec_nr_pipeline.c`
+- 共用層 library（FFT/fast_math/hpf）：`../audio_common/bin/<backend>/libaudio_common.a`
+- malloc reference executable：`pipelines/aec_nr_pipeline`（source：`aec_nr_pipeline.c`）
+- static-memory reference executable：`pipelines/aec_nr_pipeline_static`（source：
+  `aec_nr_pipeline_static.c`；單一 caller pool、init 後零 malloc、輸出與 malloc 版
+  byte-identical；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
 
-目前**沒有**已發布的 `audio_pipeline.h`／`AudioPipeline*` library API，也沒有 `aec_nr_pipeline_static.c` 或可執行的 `aec_nr_pipeline_static` target。`pipelines/PLAN_audio_pipeline_api.md` 是設計草案，不是使用者可依賴的介面。
+目前**沒有**已發布的 `audio_pipeline.h`／`AudioPipeline*` library API。`pipelines/PLAN_audio_pipeline_api.md` 是設計草案，不是使用者可依賴的介面。
 
 需要嵌入產品時，可先直接採用 reference executable；若要包進既有 audio service，請依本手冊第 5 節使用 AEC／NR 已存在的 API 組合 wrapper。
 
@@ -59,25 +62,23 @@ git submodule update --init --recursive
 建置目前的 C pipeline：
 
 ```bash
-# 從 Audio_ALG 根目錄執行
-make -C pipelines libs
-make -C pipelines aec_nr_pipeline
-
-# 等價：libs 完成後，make -C pipelines 會建預設 target
-make -C pipelines
+# 從 Audio_ALG 根目錄執行 — 預設 target 會建 libs + 兩個 binary
+make -C pipelines            # aec_nr_pipeline + aec_nr_pipeline_static
+make -C pipelines BACKEND=ne10   # NE10 FFT 後端（先 make -C pipelines clean-libs）
 ```
 
-`pipelines/Makefile` 目前只把 `aec_nr_pipeline` 放在 `all` target。`make -C pipelines libs-static` 只會嘗試建 SE 目錄的 standalone library，不代表 static-memory pipeline 已存在。
-
-若自行編譯 wrapper，沿用目前 Makefile 的 include／link layout：
+若自行編譯 wrapper，沿用目前 Makefile 的 include／link layout（注意：兩個 library 都依賴
+共用層 `libaudio_common.a`，缺它會 link error；NE10 標頭需要 GNU 擴充，用 `gnu99`）：
 
 ```bash
-cc -std=c99 -O2 -Wall -Wextra \
+cc -std=gnu99 -O2 -Wall -Wextra \
   -Ilib/aec/c_impl/include -Ilib/aec/c_impl/example \
   -Ilib/nr/c_impl/include \
+  -I../audio_common/include \
   app.c \
   -Llib/aec/c_impl/bin -laec \
-  -Llib/nr/c_impl/bin -lmmse_lsa -lm -o app
+  -Llib/nr/c_impl/bin -lmmse_lsa \
+  ../audio_common/bin/kiss/libaudio_common.a -lm -o app
 ```
 
 AEC library 本身使用 `-ffp-contract=off` 建置；若 application 內重做同類遞迴 DSP 運算，也建議保留此選項以維持數值一致性。
@@ -113,6 +114,7 @@ AEC library 本身使用 `-ffp-contract=off` 建置；若 application 內重做�
 | `--aec-only` | flag | off | 跳過 NR 與最終 gain combine |
 | `--legacy-amin` | flag | off | 還原舊版 min-only path |
 | `--no-cng` | flag | off | 關閉最終 CNG 注入 |
+| `--debug` | flag | off | 每秒一行 AEC+NR 狀態（read-only，不影響輸出） |
 
 目前 parser 對未知 positional preset 會退回 balanced，且不會為所有未知 dash option 報錯。產品或自動化腳本應只傳上表列出的值，不要依賴 silent fallback。
 
