@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Render the A_min_pl freq pipeline over the 800-case corpus (production default).
+"""Render the production freq pipeline over the 800-case corpus.
 
-  A_min_pl : AEC(linear) -> noise-only NR(E) -> g_total = min(G_nr, G_res)
-             + per-bin echo-gated NE floor (ne_floor=0.4, gate='both')
+  AEC(linear) -> echo-aware NR(E), ξ=S²/(N²+R²) -> g_total = min(G_nr, G_res)
+  + far-activity-gated near-end floor (0.4 far-silent+near-speech / 0.2 else).
+  This is the 2026-06-23 re-tune of A_min_pl; LEGACY_AMIN=1 renders the prior
+  min-only A_min_pl (noise-only NR, scalar ne_floor=0.4).
 
 Usage: python3 pipelines/rebench_joint.py <out_dir> [ne_floor] [ne_gate] [limit]
 Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir> --baseline <classic>/scores.json
@@ -22,13 +24,24 @@ sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 from aec import AecConfig, AecMode                              # noqa: E402
 from pipelines.aec_nr_pipeline import (                         # noqa: E402
     run_aec_linear, run_nr_spectrum, run_res,
+    PROD_INJECT_ECHO_PSD, PROD_NE_FLOOR_FAR_ACTIVE,
+    PROD_NEAR_GATE_THRESH, PROD_NEAR_HANGOVER,
 )
 from pipelines.rebench_sep_vs_classic import (                  # noqa: E402
-    estimate_delay, CORPUS, SCENARIOS, SR, FL, NR_GAIN,
+    CORPUS, SCENARIOS, SR, FL, NR_PRESET,
 )
 
 NE_FLOOR = float(os.environ.get('NE_FLOOR', '0.4'))
 NE_GATE = os.environ.get('NE_GATE', 'both')
+# Env override lets one renderer cover any NR preset (mild/balanced/aggressive);
+# defaults to the shipped 'balanced' so the production render is unchanged.
+NR_PRESET = os.environ.get('NR_PRESET', NR_PRESET)
+# 2026-06-23 re-tune (unified gain + far-gated near floor). LEGACY_AMIN=1 restores
+# the prior min-only A_min_pl.
+_LEGACY = os.environ.get('LEGACY_AMIN', '0') == '1'
+INJECT_ECHO_PSD = (not _LEGACY) and PROD_INJECT_ECHO_PSD
+NE_FLOOR_FAR_ACTIVE = None if _LEGACY else PROD_NE_FLOOR_FAR_ACTIVE
+NEAR_GATE_THRESH = None if _LEGACY else PROD_NEAR_GATE_THRESH
 
 
 def _cfg(enable_res):
@@ -46,16 +59,18 @@ def process(mic_path, lpb_path, out_path):
         ref = ref[:, 0]
     n = min(len(mic), len(ref))
     mic, ref = mic[:n], ref[:n]
-    if os.environ.get('PREALIGN'):                 # opt-in: offline pre-align before AEC
-        d = estimate_delay(mic, ref, sr)
-        if d > 0:
-            ref = np.concatenate([np.zeros(d, dtype=np.float32), ref[:n - d]])
+    # No offline pre-align: the AEC's online matched-filter delay estimator
+    # (enable_delay_est) handles alignment, matching production.
     with contextlib.redirect_stdout(io.StringIO()):
         np.random.seed(0)
         _, ctx = run_aec_linear(mic, ref, _cfg(True))
-        g = run_nr_spectrum(ctx, sr, g_min_db=NR_GAIN)
+        g = run_nr_spectrum(ctx, sr, nr_preset=NR_PRESET,
+                            inject_echo_psd=INJECT_ECHO_PSD)
         out = run_res(np.zeros(n, dtype=np.float32), g, ctx, _cfg(False),
-                      use_res=True, combine='min', ne_floor=NE_FLOOR, ne_gate=NE_GATE)
+                      use_res=True, combine='min', ne_floor=NE_FLOOR, ne_gate=NE_GATE,
+                      ne_floor_far_active=NE_FLOOR_FAR_ACTIVE,
+                      near_gate_thresh=NEAR_GATE_THRESH,
+                      near_hangover_frames=PROD_NEAR_HANGOVER)
     sf.write(out_path, out[:n], sr, subtype='FLOAT')
 
 

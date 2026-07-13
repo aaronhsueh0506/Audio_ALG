@@ -121,9 +121,20 @@ def export(args):
         N_BANDS = cfg.getint('signal', 'n_bands')
 
     ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
-    model = RNNoiseModel(n_bands=N_BANDS, cond_size=64, gru_size=128)
-    model.load_state_dict(ckpt['state_dict'])
+    # 架構直接從 state_dict 張量形狀推導 (唯一權威來源) — 避免硬寫 64/128 或
+    # config/ckpt-config 漂移導致 load_state_dict 失敗. 舊 ckpt 可能無 'config' key.
+    #   conv1.weight: [cond_size, n_bands, 3]   conv2.weight: [gru_size, cond_size, 1]
+    sd = ckpt['state_dict']
+    cond_size = sd['conv1.weight'].shape[0]
+    n_bands   = sd['conv1.weight'].shape[1]
+    gru_size  = sd['conv2.weight'].shape[0]
+    if n_bands != N_BANDS:
+        print(f"  ⚠ ckpt n_bands={n_bands} 與 config n_bands={N_BANDS} 不符 → 以 ckpt 為準")
+    N_BANDS = n_bands
+    model = RNNoiseModel(n_bands=N_BANDS, cond_size=cond_size, gru_size=gru_size)
+    model.load_state_dict(sd)
     model.eval()
+    print(f"Model: n_bands={N_BANDS}, cond_size={cond_size}, gru_size={gru_size}")
 
     streaming = RNNoiseStreaming(model)
     streaming.eval()
@@ -161,8 +172,53 @@ def export(args):
     if os.path.exists(raw_path) and raw_path != args.output:
         os.remove(raw_path)
 
+    # 4) 乾淨性驗證: 無 custom op / 無 unknown dim (Novatek NPU 佈署要求)
+    validate_clean_onnx(args.output)
+
     if args.verify:
         verify_output(model, N_BANDS, args.output)
+
+
+def validate_clean_onnx(path):
+    """強制驗證匯出的 ONNX 適合 NPU 佈署: (1) 無 custom op, (2) 無 unknown/dynamic dim.
+    任一不過就 raise — 讓匯出直接失敗, 而非產出不可佈署的模型."""
+    import onnx
+    m = onnx.load(path)
+    # shape inference 補齊中間 tensor 的 value_info 再檢查
+    m = onnx.shape_inference.infer_shapes(m)
+
+    # (1) 無 custom op: 所有 node domain 必須是標準 ONNX domain
+    STD_DOMAINS = {"", "ai.onnx", "ai.onnx.ml"}
+    custom = sorted({f"{n.op_type}[{n.domain}]" for n in m.graph.node
+                     if n.domain not in STD_DOMAINS})
+    op_types = sorted({n.op_type for n in m.graph.node})
+    print(f"[validate] op_types: {op_types}")
+    if custom:
+        raise RuntimeError(f"[validate] 發現 custom op (非標準 domain): {custom}")
+
+    # (2) 無 unknown dim: graph input/output/value_info 每個 tensor 每一維都要有具體 dim_value
+    def bad_dims(vi):
+        t = vi.type.tensor_type
+        out = []
+        for i, d in enumerate(t.shape.dim):
+            # dim_param 非空 = 符號維度; 兩者皆未設 = 未知
+            if d.dim_param or not d.HasField("dim_value"):
+                out.append((i, d.dim_param or "?"))
+        return out
+
+    symbolic = []
+    for group in (m.graph.input, m.graph.output, m.graph.value_info):
+        for vi in group:
+            bad = bad_dims(vi)
+            if bad:
+                symbolic.append((vi.name, bad))
+    if symbolic:
+        msg = "; ".join(f"{name}: dims {bad}" for name, bad in symbolic)
+        raise RuntimeError(
+            f"[validate] 發現 unknown/dynamic dim: {msg}\n"
+            f"  修法: 用 onnxsim 固化, 或 onnx.tools.update_model_dims 釘死後重跑 shape_inference")
+
+    print(f"[validate] ✓ 無 custom op / 無 unknown dim ({len(m.graph.node)} nodes)")
 
 
 def print_stats(stage, path):

@@ -2,16 +2,18 @@
 AEC + NR + RES Processing Pipeline
 聲學回聲消除 + 降噪 + 殘留回聲抑制串接管線
 
-Pipeline modes:
-  classic:  AEC(+RES) → NR         (legacy, RES inside AEC)
-  linear:   AEC(linear) → NR → RES (recommended, separated RES)
+Pipeline: AEC(linear) → echo-aware NR(E) → RES  (freq A_min_pl, production).
+The NR folds the AEC residual-echo PSD R²(f) into its noise floor (ξ=S²/(N²+R²))
+and the near-end floor is far-activity-gated (2026-06-23 re-tune); pass
+--legacy-amin for the prior min-only A_min_pl. AEC and NR are each selected by
+their own preset; the CLI exposes only presets + switches.
 
 Usage:
     cd Audio_ALG
     python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav
-    python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav --pipeline-mode linear
+    python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav --aec-preset balanced --nr-preset balanced
+    python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav --nr-preset aggressive
     python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav --aec-only
-    python -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wav --preset balanced
 """
 
 import sys
@@ -89,8 +91,43 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
     return output, contexts
 
 
-def _build_denoiser(sample_rate: int, g_min_db: float) -> MmseLsaDenoiser:
+# NR strength presets — mirror the C config_for_mode strength quartet
+# (lib/nr/c_impl/include/mmse_lsa_types.h). MmseLsaDenoiser takes the
+# {g_min, q, xi_min, alpha_g} strength set; the pipeline's structural tuning
+# (L=150, alpha_s, frame/hop, MCRA — see _build_denoiser) is preserved either
+# way. The C-only alpha_d / alpha_attack / alpha_decay are not part of Python's
+# NR param structure. BALANCED == the legacy fixed values, so a balanced
+# pipeline run is byte-equal to the pre-preset code.
+NR_PRESETS = {
+    'mild':       dict(g_min_db=-10.0, q=0.60, xi_min_db=-15.0, alpha_g=0.92),
+    'balanced':   dict(g_min_db=-15.0, q=0.50, xi_min_db=-20.0, alpha_g=0.88),
+    'aggressive': dict(g_min_db=-20.0, q=0.35, xi_min_db=-25.0, alpha_g=0.75),
+}
+
+# Production recipe (2026-06-23 AEC+NR re-review). On top of A_min_pl's
+# min(G_nr, G_res), two changes — validated 800-case (echo FS +0.12~0.15,
+# DT BAK +0.06~0.07, NE protected, all ship bars pass, default-OFF byte-equal):
+#   1. UNIFIED gain: fold the AEC residual-echo PSD R²(f) into the OM-LSA noise
+#      floor (ξ = S²/(N²+R²), the Speex/Habets canonical) so the NR ALSO
+#      suppresses residual echo. g_res stays in the min (dropping it kills echo).
+#   2. FAR-ACTIVITY-GATED near-end floor: 0.4 only when the far end is SILENT
+#      AND near-end SPEECH is present (true NE → protect); drop to 0.2 when far
+#      is active OR near is silent (FS/DT echo + noise gaps → clean background).
+# Set LEGACY_AMIN=1 (env / arg) to restore the prior min-only A_min_pl.
+PROD_INJECT_ECHO_PSD = True
+PROD_NE_FLOOR = 0.4
+PROD_NE_FLOOR_FAR_ACTIVE = 0.2
+PROD_NEAR_GATE_THRESH = 1e-3
+PROD_NEAR_HANGOVER = 8
+
+
+def _build_denoiser(sample_rate: int,
+                    nr_preset: str = 'balanced') -> MmseLsaDenoiser:
     """MMSE-LSA denoiser on the shared 10ms-hop grid (frame=320, shift=160).
+
+    ``nr_preset`` (mild/balanced/aggressive) selects the strength quartet
+    {g_min, q, xi_min, alpha_g} from NR_PRESETS. The pipeline structural tuning
+    below is preset-independent.
 
     INTENTIONAL divergence from SE/NR/config/v3_2_config.yaml (tuned for
     frame=512/hop=256 at 16ms/frame):
@@ -105,17 +142,18 @@ def _build_denoiser(sample_rate: int, g_min_db: float) -> MmseLsaDenoiser:
     The A_min_pl pipeline was benchmarked and shipped with these values.
     DO NOT silently sync to the NR yaml without re-running 800-case bench.
     """
+    p = NR_PRESETS[nr_preset]
     return MmseLsaDenoiser(
         sample_rate=sample_rate,
         frame_size=320,          # 20ms — matches AEC frame_size
         frame_shift=160,         # 10ms — matches AEC hop_size
         fft_size=512,
         noise_method='mcra',
-        g_min_db=g_min_db,
-        alpha_g=0.88,
+        g_min_db=p['g_min_db'],
+        alpha_g=p['alpha_g'],
         alpha_xi=0.88,
-        q=0.5,
-        xi_min_db=-20.0,
+        q=p['q'],
+        xi_min_db=p['xi_min_db'],
         alpha_s=0.95,
         L=150,                   # 150 × 10ms = 1.5s minima window
         delta_db=10.0,
@@ -127,10 +165,10 @@ def _build_denoiser(sample_rate: int, g_min_db: float) -> MmseLsaDenoiser:
 
 
 def run_nr(signal: np.ndarray, sample_rate: int,
-           g_min_db: float = -15.0, return_gain: bool = False,
+           return_gain: bool = False, nr_preset: str = 'balanced',
            ) -> np.ndarray:
     """Run NR (MMSE-LSA) on a time signal with 10ms hop (frame=320, shift=160)."""
-    denoiser = _build_denoiser(sample_rate, g_min_db)
+    denoiser = _build_denoiser(sample_rate, nr_preset)
     result = denoiser.denoise(signal, return_gain=return_gain)
     if return_gain:
         enhanced, gains = result
@@ -140,7 +178,8 @@ def run_nr(signal: np.ndarray, sample_rate: int,
 
 
 def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
-                    g_min_db: float = -15.0) -> np.ndarray:
+                    nr_preset: str = 'balanced',
+                    inject_echo_psd: bool = False) -> np.ndarray:
     """NR directly on the AEC linear error spectra E(f) — no re-FFT.
 
     Consumes ``ctx.error_spec`` (the AEC's sqrt-Hann-windowed linear error
@@ -148,37 +187,30 @@ def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
     ``denoise_spectrum``, and returns the per-frame gain G_nr(f) (n_frames, 257)
     for the freq-domain RES. This is the FFT-deduplicated path: the spectra the
     time-domain run_nr would re-derive are already in the context.
+
+    ``inject_echo_psd`` (default False = unchanged): fold the AEC residual-echo
+    PSD R²(f) into the OM-LSA noise floor (a priori SNR ξ = S²/(N²+R²), the
+    canonical Speex/Habets "echo-as-extra-noise" unified gain), so the single
+    NR gain ALSO suppresses residual echo. R²=ctx.r2/psd_scale is already on the
+    |E|² scale the denoiser's noise floor uses (β_r=1). Combine downstream with
+    ``min(g_nr, g_res)`` — g_res stays load-bearing (dropping it kills echo).
     """
     spectra = np.stack([np.asarray(c.error_spec, dtype=np.complex64)
                         for c in aec_contexts])          # (n_frames, 257)
     magnitude = np.abs(spectra).astype(np.float64)
     phase = np.angle(spectra).astype(np.float64)
-    denoiser = _build_denoiser(sample_rate, g_min_db)
-    _, _, gains = denoiser.denoise_spectrum(
-        magnitude, phase, return_gain=True)
-    print(f"  NR(freq): {gains.shape[0]} frames on E(f), gain shape {gains.shape}")
-    return gains.astype(np.float32)
-
-
-def run_nr_spectrum_echo_aware(aec_contexts: List[AecResContext], sample_rate: int,
-                               g_min_db: float = -15.0) -> np.ndarray:
-    """Echo-aware JOINT gain: NR with the AEC residual-echo PSD R²(f) folded into
-    its noise floor (a priori SNR ξ = S²/(N²+R²)). One MMSE-LSA gain suppresses
-    noise + residual echo per-bin — no separate G_res multiply, so apply with
-    run_res(..., use_res=False). R² is int16²-scaled in the context; /_PSD_SCALE
-    brings it to the |E(f)|² magnitude scale the denoiser works in.
-    """
-    _PSD_SCALE = 32768.0 ** 2
-    spectra = np.stack([np.asarray(c.error_spec, dtype=np.complex64)
-                        for c in aec_contexts])
-    magnitude = np.abs(spectra).astype(np.float64)
-    phase = np.angle(spectra).astype(np.float64)
-    extra = np.stack([np.asarray(c.r2, dtype=np.float64) / _PSD_SCALE
-                      for c in aec_contexts])          # (n_frames, 257)
-    denoiser = _build_denoiser(sample_rate, g_min_db)
+    extra = None
+    if inject_echo_psd:
+        psd_scale = 32768.0 ** 2   # ctx.r2 is int16²-scaled like comfort_noise
+        n_freqs = magnitude.shape[1]
+        extra = np.stack([
+            (np.asarray(c.r2, dtype=np.float64) / psd_scale) if c.r2 is not None
+            else np.zeros(n_freqs) for c in aec_contexts])
+    denoiser = _build_denoiser(sample_rate, nr_preset)
     _, _, gains = denoiser.denoise_spectrum(
         magnitude, phase, return_gain=True, extra_noise_psd=extra)
-    print(f"  NR(echo-aware joint): {gains.shape[0]} frames, gain shape {gains.shape}")
+    print(f"  NR(freq): {gains.shape[0]} frames on E(f), gain shape {gains.shape}"
+          f"{' [echo-aware ξ=S²/(N²+R²)]' if inject_echo_psd else ''}")
     return gains.astype(np.float32)
 
 
@@ -187,7 +219,11 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
             config: AecConfig,
             use_nr: bool = True, use_res: bool = True,
             dt_relax: float = 0.0, ne_floor: float = 0.0,
-            ne_gate: str = 'r2', combine: str = 'product') -> np.ndarray:
+            ne_gate: str = 'r2', combine: str = 'product',
+            ne_floor_far_active: float = None,
+            far_gate_thresh: float = 1e-4,
+            near_gate_thresh: float = None,
+            near_hangover_frames: int = 8) -> np.ndarray:
     """Residual-echo suppression AFTER NR, in the frequency domain.
 
     Reuses the linear AEC's own per-frame AEC3 SuppressionGain (``ctx.res_gain``)
@@ -223,6 +259,7 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
 
     n_frames = min(len(aec_contexts), nr_gains.shape[0])
     output = np.zeros(len(nr_output), dtype=np.float32)
+    near_hang = 0                    # near-activity hangover counter (gated floor)
 
     for i in range(n_frames):
         ctx = aec_contexts[i]
@@ -262,7 +299,33 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
         # R²/|E|² ≈ 0 in clean near-end (→ full lift, preserve speech) and ≈ 1 in
         # echo-dominated bins (→ no lift, stay suppressed). Unlike dt_relax this
         # keys off per-bin echo, not a frame scalar, so it never lifts in far-end.
-        if ne_floor > 0.0 and ctx.r2 is not None:
+        # Far-activity-gated floor strength (default off → scalar ne_floor):
+        # keep the high floor when the far end is SILENT (pure near-end — the only
+        # place lowering it just damages near speech, e.g. NE) and drop to
+        # ne_floor_far_active when the far end is ACTIVE (FS/DT — there the floor
+        # was over-protecting noise; less echo to guard now that the linear filter
+        # improved). ctx.far_power separates the two cleanly (NE≈0, FS/DT bursts).
+        nf_eff = ne_floor
+        if ne_floor_far_active is not None:
+            fp = float(ctx.far_power) if ctx.far_power is not None else 0.0
+            far_active = fp > far_gate_thresh
+            if near_gate_thresh is not None:
+                # Near-activity gate: protect the high floor ONLY when the far end
+                # is silent AND there is genuine near-end SPEECH (true NE). Far-
+                # silent + near-silent (FS/DT noise gaps) has no speech to damage →
+                # drop the floor and clean the background. near_energy = |E(f)|²
+                # (≈ near+noise when far-silent); hangover protects speech offsets.
+                near_energy = float(np.mean(np.abs(ctx.error_spec) ** 2))
+                if near_energy > near_gate_thresh:
+                    near_hang = int(near_hangover_frames)
+                near_active = near_hang > 0
+                if near_hang > 0:
+                    near_hang -= 1
+                protect = (not far_active) and near_active
+            else:
+                protect = not far_active
+            nf_eff = ne_floor if protect else ne_floor_far_active
+        if nf_eff > 0.0 and ctx.r2 is not None:
             r2_nr = np.asarray(ctx.r2, dtype=np.float32) / psd_scale
             e2 = np.abs(ctx.error_spec).astype(np.float32) ** 2
             echo_frac = np.clip(r2_nr / (e2 + 1e-12), 0.0, 1.0)
@@ -276,7 +339,7 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
                 no_echo = (g_res ** 2) * no_echo_r2
             else:  # 'both' — product gate: lift only where BOTH say no echo
                 no_echo = g_res * no_echo_r2
-            lift = float(ne_floor) * no_echo
+            lift = float(nf_eff) * no_echo
             g_total = (1.0 - lift) * g_total + lift * 1.0
         spec = ctx.error_spec.astype(np.complex64) * g_total
 
@@ -313,38 +376,32 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
 
 def main():
     parser = argparse.ArgumentParser(
-        description='AEC + NR + RES Pipeline',
+        description='AEC + NR + RES Pipeline (freq A_min_pl)',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Pipeline modes:
-  classic   AEC(+RES) -> NR              (RES inside AEC, legacy)
-  linear    AEC(linear) -> NR -> RES     (separated, time-domain NR)
-  freq      AEC(linear) -> NR(E) -> RES  (separated, single-transform: NR on E(f),
-                                          no inter-stage FFT round-trips)
+        epilog="""AEC(linear) -> noise-only NR(E) -> RES   (g_total = min(G_nr, G_res)).
+AEC and NR are each chosen by their own preset; the CLI exposes only
+presets + switches.
+
+Presets:
+  --aec-preset  gentle | balanced | aggressive   (echo-vs-near strength)
+  --nr-preset   mild   | balanced | aggressive   (noise-suppression strength)
+Switches:
+  --aec-only    run AEC only, skip NR/RES
 """)
     parser.add_argument('--mic', required=True, help='Microphone input WAV')
     parser.add_argument('--ref', required=True, help='Reference/loudspeaker WAV')
     parser.add_argument('--output', required=True, help='Output WAV')
-    parser.add_argument('--pipeline-mode', default='freq',
-                        choices=['classic', 'linear', 'freq'],
-                        help='Pipeline mode (default: freq)')
-    parser.add_argument('--aec-mode', default='pbfdkf',
-                        choices=['pbfdaf', 'pbfdkf', 'subband'],
-                        help='AEC filter mode (default: pbfdkf); fdaf not supported in pipeline')
-    parser.add_argument('--preset', default='balanced',
+    parser.add_argument('--aec-preset', default='balanced',
                         choices=['gentle', 'balanced', 'aggressive'],
                         help='AEC preset (default: balanced)')
-    parser.add_argument('--aec-mu', type=float, default=0.3, help='AEC step size')
-    parser.add_argument('--nr-gain', type=float, default=-15.0, help='NR min gain (dB)')
-    parser.add_argument('--ne-floor', type=float, default=0.4,
-                        help='freq mode: near-end preservation floor strength (0=off)')
-    parser.add_argument('--ne-gate', default='both',
-                        choices=['r2', 'resgain', 'both', 'both_sharp'],
-                        help='freq mode: NE-floor echo gate (default: both)')
-    parser.add_argument('--combine', default='min', choices=['min', 'product'],
-                        help='freq mode: G_nr/G_res combine (default: min = A_min_pl)')
-    parser.add_argument('--legacy-v0', action='store_true',
-                        help='freq mode: restore v0 (echo-aware joint NR, use_res=False)')
-    parser.add_argument('--aec-only', action='store_true', help='Run AEC only, skip NR/RES')
+    parser.add_argument('--nr-preset', default='balanced',
+                        choices=['mild', 'balanced', 'aggressive'],
+                        help='NR preset (default: balanced)')
+    parser.add_argument('--aec-only', action='store_true',
+                        help='Run AEC only, skip NR/RES')
+    parser.add_argument('--legacy-amin', action='store_true',
+                        help='Restore the prior min-only A_min_pl (no R² injection, '
+                             'scalar near-end floor) — disables the 2026-06-23 re-tune')
     args = parser.parse_args()
 
     # Load audio
@@ -358,12 +415,11 @@ def main():
     sample_rate = sr_mic
     duration = len(mic_signal) / sample_rate
 
-    # Parse preset
     preset_map = {
         'gentle': AecPreset.GENTLE, 'balanced': AecPreset.BALANCED,
         'aggressive': AecPreset.AGGRESSIVE,
     }
-    preset = preset_map[args.preset]
+    preset = preset_map[args.aec_preset]
 
     print("AEC + NR + RES Pipeline")
     print("=======================")
@@ -371,97 +427,50 @@ def main():
     print(f"Ref:      {args.ref}")
     print(f"Output:   {args.output}")
     print(f"Rate:     {sample_rate} Hz")
-    print(f"Pipeline: {args.pipeline_mode}")
-    print(f"AEC:      mode={args.aec_mode}, preset={args.preset}, mu={args.aec_mu}")
+    print(f"AEC:      preset={args.aec_preset}")
     if not args.aec_only:
-        print(f"NR:       g_min={args.nr_gain} dB")
+        print(f"NR:       preset={args.nr_preset}")
     else:
         print("NR/RES:   disabled (--aec-only)")
     print()
 
-    # Build AEC config from preset
+    # AEC config: production filter (PBFDKF); the preset sets the echo-vs-near
+    # min-gain floor (the only inter-preset difference).
     aec_config = AecConfig.from_preset(
         preset,
         sample_rate=sample_rate,
-        mode=parse_aec_mode(args.aec_mode),
-        mu=args.aec_mu,
-        enable_res=True,  # will be overridden for linear mode
+        mode=AecMode.PBFDKF,
+        mu=0.3,
+        enable_res=True,
     )
 
-    if args.pipeline_mode == 'freq':
-        # ---- Single-transform JOINT pipeline: AEC(linear) → echo-aware NR(E(f)) ----
-        # NR folds the AEC residual-echo PSD R² into its noise floor, so ONE
-        # per-bin gain suppresses noise + residual echo (ξ=S²/(N²+R²)); a per-bin
-        # echo-gated NE floor (gate=`both`, ne_floor) preserves near-end where
-        # there is no echo. One FFT/IFFT for the whole chain.
-        print("Stage 1: AEC (linear, no RES)...")
-        aec_output, contexts = run_aec_linear(mic_signal, ref_signal, aec_config)
+    # freq A_min_pl pipeline (production): AEC(linear) -> noise-only NR(E) ->
+    # g_total = min(G_nr, G_res) + per-bin echo-gated near-end floor. NR handles
+    # noise; the AEC's own near-end-aware AEC3 echo gain G_res handles echo; the
+    # per-bin min keeps both without the product's double-talk double-cut.
+    print("Stage 1: AEC (linear, no RES)...")
+    aec_output, contexts = run_aec_linear(mic_signal, ref_signal, aec_config)
 
-        if args.aec_only:
-            final_output = aec_output
-        elif args.legacy_v0:
-            # ---- v0 (legacy): echo-aware joint NR, g_total = g_nr only ----
-            print("Stage 2: echo-aware NR on E(f) (R² folded into noise floor) [legacy v0]...")
-            nr_gains = run_nr_spectrum_echo_aware(contexts, sample_rate,
-                                                  g_min_db=args.nr_gain)
-            print(f"Stage 3: apply joint gain + NE floor "
-                  f"(ne_floor={args.ne_floor}, gate={args.ne_gate})...")
-            # C5-383: pass use_res=True so AEC echo gain (ctx.res_gain) covers the
-            # first num_init=20 NR-passthrough frames (otherwise g_nr=1.0 * g_res=1.0
-            # → zero echo suppression for the first 200 ms).
-            # C5-384: pass aec_output (zero-padded to mic length) as tail source so
-            # samples beyond the last full AEC frame are not silenced (mic>ref case).
-            _tail_src = np.zeros(len(mic_signal), dtype=np.float32)
-            _tail_src[:len(aec_output)] = aec_output
-            final_output = run_res(
-                _tail_src,
-                nr_gains, contexts, aec_config, use_res=True,
-                ne_floor=args.ne_floor, ne_gate=args.ne_gate)
-        else:
-            # ---- A_min_pl (default): plain noise-only NR, g_total=min(G_nr,G_res) ----
-            # NR handles noise; the AEC's own near-end-aware AEC3 echo gain G_res
-            # handles echo; per-bin min keeps both without the product's DT double-cut.
-            print("Stage 2: noise-only NR on E(f)...")
-            nr_gains = run_nr_spectrum(contexts, sample_rate,
-                                       g_min_db=args.nr_gain)
-            print(f"Stage 3: g_total=min(G_nr,G_res) + NE floor "
-                  f"(combine={args.combine}, ne_floor={args.ne_floor}, gate={args.ne_gate})...")
-            # C5-384: pass aec_output as tail source to avoid silencing mic tail
-            # when mic is longer than ref (zeros placeholder would silence it).
-            _tail_src_a = np.zeros(len(mic_signal), dtype=np.float32)
-            _tail_src_a[:len(aec_output)] = aec_output
-            final_output = run_res(
-                _tail_src_a,
-                nr_gains, contexts, aec_config, use_res=True,
-                combine=args.combine, ne_floor=args.ne_floor, ne_gate=args.ne_gate)
-
-    elif args.pipeline_mode == 'linear':
-        # ---- Linear pipeline: AEC(linear) → NR(time) → RES ----
-        print("Stage 1: AEC (linear, no RES)...")
-        aec_output, contexts = run_aec_linear(mic_signal, ref_signal, aec_config)
-
-        if args.aec_only:
-            final_output = aec_output
-        else:
-            print("Stage 2: NR (MMSE-LSA, 10ms hop)...")
-            nr_output, nr_gains = run_nr(aec_output, sample_rate,
-                                         g_min_db=args.nr_gain,
-                                         return_gain=True)
-
-            print("Stage 3: RES (NR-gain corrected)...")
-            final_output = run_res(nr_output, nr_gains, contexts, aec_config)
-
+    if args.aec_only:
+        final_output = aec_output
     else:
-        # ---- Classic pipeline: AEC(+RES) → NR ----
-        print("Stage 1: AEC (+RES)...")
-        aec_output = run_aec_classic(mic_signal, ref_signal, aec_config)
-
-        if args.aec_only:
-            final_output = aec_output
-        else:
-            print("Stage 2: NR (MMSE-LSA, 10ms hop)...")
-            final_output = run_nr(aec_output, sample_rate,
-                                  g_min_db=args.nr_gain)
+        _legacy = getattr(args, 'legacy_amin', False)
+        print("Stage 2: NR on E(f)"
+              + ("" if _legacy else " [echo-aware ξ=S²/(N²+R²)]") + "...")
+        nr_gains = run_nr_spectrum(contexts, sample_rate, nr_preset=args.nr_preset,
+                                   inject_echo_psd=(not _legacy) and PROD_INJECT_ECHO_PSD)
+        print("Stage 3: g_total=min(G_nr,G_res)"
+              + (" + near-end floor" if _legacy else " + far-gated near-end floor") + "...")
+        # Pass aec_output (zero-padded to mic length) as the tail source so
+        # samples beyond the last full AEC frame are not silenced (mic>ref case).
+        _tail_src = np.zeros(len(mic_signal), dtype=np.float32)
+        _tail_src[:len(aec_output)] = aec_output
+        final_output = run_res(
+            _tail_src, nr_gains, contexts, aec_config,
+            use_res=True, combine='min', ne_floor=PROD_NE_FLOOR, ne_gate='both',
+            ne_floor_far_active=None if _legacy else PROD_NE_FLOOR_FAR_ACTIVE,
+            near_gate_thresh=None if _legacy else PROD_NEAR_GATE_THRESH,
+            near_hangover_frames=PROD_NEAR_HANGOVER)
 
     # Save
     sf.write(args.output, final_output, sample_rate)

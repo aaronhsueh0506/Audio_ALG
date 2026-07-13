@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Render the AEC-alone arm over the 800-case corpus, in the SAME integrated
-harness (estimate_delay pre-align, same cfg/seed/FL) as rebench_joint.py, so the
+harness (same cfg/seed/FL, no offline pre-align) as rebench_joint.py, so the
 two are directly comparable for an "AEC vs AEC+NR" table.
 
   aec_only : AEC(enable_res=True) full output  — its own AEC3 post-filter RES,
@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 from aec import AecConfig, AecMode                              # noqa: E402
 from pipelines.aec_nr_pipeline import run_aec_classic           # noqa: E402
 from pipelines.rebench_sep_vs_classic import (                  # noqa: E402
-    estimate_delay, CORPUS, SCENARIOS, SR, FL,
+    CORPUS, SCENARIOS, SR, FL,
 )
 
 
@@ -43,10 +43,8 @@ def process(mic_path, lpb_path, out_path):
         ref = ref[:, 0]
     n = min(len(mic), len(ref))
     mic, ref = mic[:n], ref[:n]
-    if not os.environ.get('NO_PREALIGN'):          # realistic mode: let the AEC's
-        d = estimate_delay(mic, ref, sr)           # online EchoPathDelayEstimator align
-        if d > 0:
-            ref = np.concatenate([np.zeros(d, dtype=np.float32), ref[:n - d]])
+    # No offline pre-align: the AEC's online matched-filter delay estimator
+    # (enable_delay_est) handles alignment, matching production.
     with contextlib.redirect_stdout(io.StringIO()):
         np.random.seed(0)
         out = run_aec_classic(mic, ref, _cfg())            # AEC full output, no NR

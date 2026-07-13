@@ -43,3 +43,12 @@ ainr/RNNoise-ERB/output/
 
 # Claude Code
 .claude/
+
+# machine-specific built binary (regenerable via make in pipelines/)
+pipelines/aec_nr_pipeline
+
+# build artifacts (extensionless pipeline binaries + objects)
+pipelines/aec_nr_pipeline
+pipelines/aec_nr_pipeline_static
+lib/hpf/obj/
+*.o
