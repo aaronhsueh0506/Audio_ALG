@@ -466,8 +466,12 @@ Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`
 - instance 不可由多個 thread 無同步同時 process。
 - 換獨立串流前 reset AEC、NR、OLA、near hangover 與 RNG；或直接 destroy/create。
 - create 失敗時必須釋放已成功建立的子模組與 buffer。
-- 目前 reference path 在初始化時使用 malloc/calloc；process loop 本身不應配置記憶體。
-- NR standalone 的 static-memory API（`USE_EXT_MEM`）目前只存在於它的 `feature/static-memory` branch，不在這條 pipeline 目前 vendor 的 `main` branch 上（`lib/nr` 走 `.gitmodules` 釘的 `main`）；未來若併回 `main`，也不要誤解為整條 Audio_ALG pipeline 已支援單一 caller-owned pool——AEC 與 wrapper buffer 仍需完整的 external-memory 設計後才能宣稱 static pipeline。
+- malloc reference path（`aec_nr_pipeline`）在初始化時使用 malloc/calloc；process loop 本身不應配置記憶體。
+- 單一 caller-owned pool 的 static-memory 版本已完整支援：`aec_nr_pipeline_static` 用三個複合 API
+  （`aec_get_mem_size`/`aec_init`、`mmse_lsa_get_mem_size`/`mmse_lsa_init`、`fft_get_mem_size`/`fft_init`）
+  從一塊 16-byte 對齊的 pool 切出全部記憶體，init 後零 malloc，輸出與 malloc 版 byte-identical。
+  NR 的 static API 已在其 `main` branch（runtime 選擇，同一份 `.a` 兩套 API 並存）；AEC 的
+  pool API 在其 `feature/static-memory` branch（`.gitmodules` 所釘）。
 
 ## 9. Troubleshooting
 

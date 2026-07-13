@@ -5,4 +5,4 @@
 [submodule "lib/nr"]
 	path = lib/nr
 	url = https://github.com/aaronhsueh0506/CVNR.git
-	branch = feature/static-memory
+	branch = main

@@ -187,8 +187,9 @@ Suitable for desktop testing and Linux servers.
 
 ### Version B: static memory (`aec_nr_pipeline_static.c`)
 
-Built by default alongside Version A (both submodules are pinned to their
-`feature/static-memory` branches, which export the unified static API). One
+Built by default alongside Version A (`lib/aec` is pinned to its
+`feature/static-memory` branch, `lib/nr` to `main` — both export the unified
+static API). One
 caller-owned pool, no malloc after init, byte-identical output to Version A
 (see Verification below).
 
