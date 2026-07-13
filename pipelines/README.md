@@ -142,47 +142,36 @@ power). `nr:` fields are `MmseLsaDebugStatus` (`init` = noise-floor initialized;
 > does move if you drive `aec_debug_status()` from a caller running with
 > `enable_res=1`, e.g. `lib/aec/c_impl/example/aec_wav.c --debug`.)
 
-### `--delay-duty`
+### Delay-estimator duty-cycling (built in, always on)
 
-Sets `AecConfig.delay_est_duty_cycle = 1` before `aec_create()`/`aec_init()`.
-This duty-cycles the AEC3 matched-filter delay estimator: once the delay
-estimate is solid (confidence 1.0) and unchanged for `delay_est_period_s`
-(default 0.5s), analysis drops to 1 hop in every K (K=10 by default) instead of
-every hop — full-rate analysis resumes immediately if the estimate changes,
-loses solidity, or ERLE drops >6dB off its running peak. **Sampled-quality-
-verified ~zero cost** (see `lib/aec/c_impl/include/aec.h` field doc for the
-exact schedule). On a stable-delay clip the decimated schedule never actually
-skips a *different* outcome, so output stays byte-identical to the default;
-verified here on `wav/aec_challenge_blind/doubletalk/0I0XMl3M0ECO0U1N0cJvpg_*`.
+The AEC3 matched-filter delay estimator duty-cycles itself — no flag or
+config field: once the delay estimate is solid (confidence 1.0) and unchanged
+for `delay_est_period_s` (default 0.5s), analysis drops to 1 hop in every K
+(K=10 by default) instead of every hop — full-rate analysis resumes
+immediately if the estimate changes, loses solidity, or ERLE drops >6dB off
+its running peak. **Sampled-quality-verified ~zero cost** (60-case AECMOS:
+≤+0.014 / worst −0.006). On a stable-delay clip the decimated schedule never
+actually skips a *different* outcome; verified here on
+`wav/aec_challenge_blind/doubletalk/0I0XMl3M0ECO0U1N0cJvpg_*`.
 
-```
-./aec_nr_pipeline mic.wav ref.wav out.wav --delay-duty
-```
+Note: in THIS pipeline the ERLE-watchdog resume leg is inert — the AEC runs
+linear-mode (`enable_res=0`) so `last_erle_windowed` is never updated (same
+root cause as the `--debug` `erle=0.0` caveat above). Full-rate analysis
+still resumes on estimate change or lost solidity, which are the primary
+resume paths.
 
-### Compile flags (`EXTRA_CFLAGS`, opt-in, off by default)
+### Compile flags (`EXTRA_CFLAGS`)
 
 `pipelines/Makefile` passes `EXTRA_CFLAGS` through to the `lib/aec` and
 `lib/nr` sub-builds *and* this pipeline's own compile, so one invocation
-reaches every `.o`:
-
-| Flag | Effect | Verdict |
-|------|--------|---------|
-| `-DAEC_FAST_MATH` | Float32 NEON-style matched-filter dot products + sliding `x2_sum` in the delay estimator (lib/aec `delay_aec3.c`) | Sampled-quality-verified: ~zero cost to output quality on the cases spot-checked so far. Diverges from the bit-exact Python reference on near-tie delay votes (default build stays byte-identical) |
-| `-DAEC_DELAY_DS_FACTOR=8` | AEC3's own ds8 delay-estimator decimation (matched-filter taps 512→256, sub-block rate 16→8), ~halves that stage's cost | **FS-regression risk** — coarsens delay resolution from 4 to 8 samples. Needs a full 800-case AECMOS gate before shipping. Default (4) stays byte-identical |
-
-```bash
-make clean-libs && make EXTRA_CFLAGS="-DAEC_FAST_MATH"
-make clean-libs && make EXTRA_CFLAGS="-DAEC_FAST_MATH -DAEC_DELAY_DS_FACTOR=8"
-```
+reaches every `.o`. The fast matched-filter arithmetic and delay-estimator
+duty-cycling are built in unconditionally — there are no optional
+performance flags at present.
 
 `make clean-libs` first is required when switching `EXTRA_CFLAGS` — object
 files aren't flag-tagged, so a stale non-flagged (or stale flagged) `.o` will
 otherwise silently persist across the flag change.
 
-> Version B (`aec_nr_pipeline_static`) is **not currently buildable**: `aec_nr_pipeline_static.c`
-> does not exist in this repo yet, so its Makefile target is commented out / excluded from
-> `all` (see `pipelines/Makefile`). There is no `./aec_nr_pipeline_static` binary and no
-> `--print-mem-size` flag to run today — the section below documents the intended design.
 
 ## Two Versions
 

@@ -22,15 +22,11 @@
  * Usage:
  *   ./aec_nr_pipeline <mic.wav> <ref.wav> <out.wav> [aec-preset]
  *                     [--nr-preset mild|balanced|aggressive] [--aec-only] [--legacy-amin]
- *                     [--debug] [--delay-duty]
+ *                     [--debug]
  *
  * --debug: once per second of processed audio, print one compact status line
  *   to stderr combining aec_debug_status() (lib/aec) + mmse_lsa_debug_status()
  *   (lib/nr) — read-only snapshots, no DSP-state or output changes.
- * --delay-duty: sets AecConfig.delay_est_duty_cycle=1 — duty-cycles the AEC3
- *   matched-filter delay estimator once the estimate is solid (sampled-
- *   quality-verified ~zero cost; see aec.h for the exact schedule). Off by
- *   default (byte-identical to the reference).
  */
 
 #include <stdio.h>
@@ -144,7 +140,7 @@ int main(int argc, char* argv[]) {
     if (argc < 4) {
         printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-preset] "
                "[--nr-preset mild|balanced|aggressive] [--aec-only] [--legacy-amin] "
-               "[--debug] [--delay-duty]\n",
+               "[--debug]\n",
                argv[0]);
         return 1;
     }
@@ -159,14 +155,12 @@ int main(int argc, char* argv[]) {
     int           legacy   = 0;   /* --legacy-amin → prior min-only A_min_pl */
     int           no_cng   = 0;   /* --no-cng → disable comfort noise (parity) */
     int           debug_status = 0; /* --debug → periodic aec+nr status line   */
-    int           delay_duty   = 0; /* --delay-duty → AecConfig.delay_est_duty_cycle=1 */
 
     for (int i = 4; i < argc; i++) {
         if      (strcmp(argv[i], "--aec-only") == 0)    aec_only = 1;
         else if (strcmp(argv[i], "--legacy-amin") == 0) legacy = 1;
         else if (strcmp(argv[i], "--no-cng") == 0)      no_cng = 1;
         else if (strcmp(argv[i], "--debug") == 0)       debug_status = 1;
-        else if (strcmp(argv[i], "--delay-duty") == 0)  delay_duty = 1;
         else if (strcmp(argv[i], "--nr-preset") == 0 && i+1 < argc)
             nr_mode = parse_nr_mode(argv[++i]);
         else if (argv[i][0] != '-')
@@ -193,7 +187,6 @@ int main(int argc, char* argv[]) {
     aec_config_from_preset(&aec_cfg, preset, sr);
     aec_cfg.enable_res         = 0;
     aec_cfg.return_res_context = 1;
-    if (delay_duty) aec_cfg.delay_est_duty_cycle = 1;  /* --delay-duty (see aec.h doc) */
     int enable_cng = aec_cfg.enable_cng && !no_cng;   /* preset default (1) */
 
     MmseLsaConfig nr_cfg = mmse_lsa_config_for_mode(sr, nr_mode);

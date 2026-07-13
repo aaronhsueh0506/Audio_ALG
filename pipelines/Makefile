@@ -13,7 +13,7 @@
 # Usage:
 #   make                       # builds libs (BACKEND=kiss) + both binaries
 #   make BACKEND=ne10          # NE10 backend (rebuild libs first: make clean-libs)
-#   make EXTRA_CFLAGS="-DAEC_FAST_MATH"   # see the EXTRA_CFLAGS block below
+#   make EXTRA_CFLAGS="..."    # see the EXTRA_CFLAGS block below
 #   make clean                 # remove the two pipeline binaries
 #   make clean-libs             # also clean lib/aec, lib/nr, audio_common build dirs
 
@@ -33,24 +33,9 @@ CXX ?= c++
 
 # EXTRA_CFLAGS — pass-through to the AEC/NR lib sub-builds AND this pipeline's
 # own compile (both submodule Makefiles already do `CFLAGS += $(EXTRA_CFLAGS)`,
-# so one EXTRA_CFLAGS on this top-level `make` reaches every .o for the build):
-#
-#   make EXTRA_CFLAGS="-DAEC_FAST_MATH"
-#     Opt-in fast matched-filter arithmetic in lib/aec's delay estimator
-#     (float32 NEON-style accumulation instead of the bit-exact reference
-#     dot products). Sampled-quality-verified: ~zero cost to output quality
-#     on the cases spot-checked so far. Diverges from the bit-exact Python
-#     reference — default build (no EXTRA_CFLAGS) stays byte-identical.
-#     See lib/aec/c_impl/src/delay_aec3.c.
-#
-#   make EXTRA_CFLAGS="-DAEC_DELAY_DS_FACTOR=8"
-#     Selects AEC3's own ds8 decimation for the delay estimator (matched-
-#     filter taps 512->256, sub-block rate 16->8), roughly halving that
-#     stage's cost. FS-REGRESSION RISK — coarsens delay resolution from 4 to
-#     8 samples; needs a full 800-case AECMOS gate before shipping. Default
-#     (4) stays byte-identical. See lib/aec/c_impl/include/delay_aec3.h.
-#
-#   Flags combine: make EXTRA_CFLAGS="-DAEC_FAST_MATH -DAEC_DELAY_DS_FACTOR=8"
+# so one EXTRA_CFLAGS on this top-level `make` reaches every .o for the build).
+# The fast matched-filter arithmetic and delay-estimator duty-cycling are
+# built in unconditionally (no flag) — see lib/aec/c_impl/src/delay_aec3.c.
 #
 # NOTE: switching EXTRA_CFLAGS on an already-built tree needs `make clean-libs`
 # first — object files aren't flag-tagged, so a stale non-flagged .o (or a
