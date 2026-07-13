@@ -1,5 +1,7 @@
 # Audio_ALG - Audio Processing Algorithms Integration
 
+> **C 使用與整合**：[Audio_ALG C User Manual（繁體中文）](docs/c_user_manual_zh_TW.md)
+
 整合音頻處理算法，包含降噪 (NR)、AI 降噪 (AINR) 和聲學回聲消除 (AEC) 模組。
 
 ## 項目結構
@@ -263,21 +265,24 @@ python3 pipelines/compare_res_vs_nr.py input.wav --cng-ab --dnsmos
 
 ## NR Preset（Mode）設定
 
-NR 有三個 preset（pipeline `--nr-preset`；C 端 `MmseLsaNrMode` / `mmse_lsa_config_for_mode`）：
+底層 NR library（C `MmseLsaNrMode` / `mmse_lsa_config_for_mode`，Python `core/nr_strength.py`）有四個 mode：
 
 | Mode | `g_min_db` | `q` (SPP) | `xi_min_db` | `alpha_d` | `alpha_g` | 特性 |
 |------|-----------|-----------|-------------|-----------|-----------|------|
-| `MILD` | **−10 dB** | 0.60 | −15 dB | 0.85 | 0.92 | 近端優先：最低壓制；適合近距離說話場景 |
-| `BALANCED` | **−15 dB** | 0.50 | −20 dB | 0.70 | 0.88 | 預設值：噪聲抑制與語音保留的平衡點 |
-| `AGGRESSIVE` | **−20 dB** | 0.35 | −25 dB | 0.50 | 0.75 | 噪聲優先：強力壓制；語音可能有些許洩漏感 |
+| `MILD` | **−20 dB** | 0.60 | −15 dB | 0.85 | 0.92 | 近端優先：最低壓制；適合近距離說話場景 |
+| `MODERATE` | **−25 dB** | 0.55 | −18 dB | 0.85 | 0.92 | 介於 mild 與 balanced 之間 |
+| `BALANCED` | **−30 dB** | 0.50 | −20 dB | 0.70 | 0.88 | 預設值：噪聲抑制與語音保留的平衡點 |
+| `AGGRESSIVE` | **−40 dB** | 0.35 | −25 dB | 0.50 | 0.85 | 噪聲優先：強力壓制；語音可能有些許洩漏感 |
 
+> **`--nr-preset` 只暴露三個**：`pipelines/aec_nr_pipeline.py` 的 `argparse` 用 `choices=['mild', 'balanced', 'aggressive']`；C 的 `pipelines/aec_nr_pipeline.c` `parse_nr_mode()` 只認得 `"mild"`／`"aggressive"` 字串，其餘（含 `"moderate"`）一律 silently 落回 balanced，不報錯。兩邊 pipeline CLI 都還沒接上 `MODERATE`；要用它必須直接呼叫 library API（C `mmse_lsa_config_for_mode(sr, MMSE_LSA_NR_MODERATE)`，Python 對應函式）。
+>
 > **Python pipeline vs C**：Python `--nr-preset` 套用 strength 四元組 **{g_min, q, xi_min, alpha_g}**；`alpha_d` / `L` 維持 pipeline 自己的結構性 tuning（`alpha_d≈0.95` / `L=150`，為 AEC 殘餘信號調過，見 `_build_denoiser`），不隨 preset 變。C 的 `config_for_mode` 另含 `alpha_attack/alpha_decay/alpha_d`。`balanced` = 既有 shipped 值（pipeline byte-equal）。
 
 **參數說明：**
 
 | 參數 | 說明 |
 |------|------|
-| `g_min_db` | 最低增益下限（power domain：g_min = 10^(g_min_db/10)，例 −15 dB→0.0316、−20 dB→0.01）|
+| `g_min_db` | 最低增益下限（amplitude domain，/20 convention：g_min = 10^(g_min_db/20)，例 −30 dB→0.0316（balanced）、−40 dB→0.01（aggressive））|
 | `q` | SPP 先驗語音存在機率（高 q → 偏向語音，壓制保守） |
 | `xi_min_db` | 先驗 SNR 最小值（低值 → 可在更低 SNR 下壓制） |
 | `alpha_d` | 噪聲追蹤 IIR 係數（高 α → 慢追蹤，穩態噪聲好；低 α → 快追蹤，突發噪聲好） |
