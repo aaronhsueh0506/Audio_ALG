@@ -40,8 +40,8 @@
 #include "mmse_lsa_denoiser.h" /* freq-domain NR + mmse_lsa_process_gain     */
 #include "wav_io.h"
 
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
+#ifndef M_PI_F
+#define M_PI_F 3.14159265358979323846f
 #endif
 
 /* Production recipe constants (mirror Python PROD_* in aec_nr_pipeline.py). */
@@ -131,7 +131,7 @@ static float rng_uniform(void) {                    /* (0,1) */
 static float rng_gauss(void) {                      /* Box-Muller */
     float u1 = rng_uniform(), u2 = rng_uniform();
     if (u1 < 1e-7f) u1 = 1e-7f;
-    return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * (float)M_PI * u2);
+    return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * M_PI_F * u2);
 }
 
 /* ------------------------------------------------------------------ */
@@ -253,7 +253,7 @@ int main(int argc, char* argv[]) {
         /* sqrt of periodic Hann (denom = block_size) — matches Python run_res
          * synth_win = sqrt(0.5·(1 - cos(2π k / block_size))). */
         for (int k = 0; k < frame_sz; k++)
-            synth_win[k] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * k / frame_sz)));
+            synth_win[k] = sqrtf(0.5f * (1.0f - cosf(2.0f * M_PI_F * k / frame_sz)));
     }
 
     float* mic_buf = (float*)malloc((size_t)hop * sizeof(float));
@@ -289,7 +289,7 @@ int main(int argc, char* argv[]) {
             processed += hop;
             if (processed % sr == 0) {
                 printf("."); fflush(stdout);
-                if (debug_status) print_debug_status(aec, NULL, 1, (float)processed / (float)sr);
+                if (debug_status) print_debug_status(aec, NULL, 1, (float)processed / sr);
             }
             continue;
         }
@@ -307,7 +307,7 @@ int main(int argc, char* argv[]) {
         const float* nr_extra = NULL;
         if (!legacy && ctx.r2) {
             for (int k = 0; k < n_freqs; k++)
-                extra[k] = (float)(ctx.r2[k] / PSD_SCALE);
+                extra[k] = ctx.r2[k] / PSD_SCALE;
             nr_extra = extra;
         }
         mmse_lsa_process_gain(nr, ctx.error_spec, nr_extra, g_nr);
@@ -343,7 +343,7 @@ int main(int argc, char* argv[]) {
             for (int k = 0; k < n_freqs; k++) {
                 float re = ctx.error_spec[k].r, im = ctx.error_spec[k].i;
                 float e2 = re * re + im * im;
-                float r2_nr = (float)(ctx.r2[k] / PSD_SCALE);
+                float r2_nr = ctx.r2[k] / PSD_SCALE;
                 float echo_frac = r2_nr / (e2 + 1e-12f);
                 if (echo_frac < 0.0f) echo_frac = 0.0f;
                 if (echo_frac > 1.0f) echo_frac = 1.0f;
@@ -363,7 +363,7 @@ int main(int argc, char* argv[]) {
          * sqrt(1 - g_aec²) so it fills only what the AEC suppressed (bins 1..N-2). */
         if (enable_cng && ctx.comfort_noise) {
             for (int k = 1; k < n_freqs - 1; k++) {
-                float n_amp = ctx.comfort_noise[k] / (float)PSD_SCALE;
+                float n_amp = ctx.comfort_noise[k] / PSD_SCALE;
                 n_amp = (n_amp > 0.0f) ? sqrtf(n_amp) : 0.0f;
                 float ng2 = 1.0f - g_aec[k] * g_aec[k];
                 float noise_gain = (ng2 > 0.0f) ? sqrtf(ng2) : 0.0f;
@@ -395,7 +395,7 @@ int main(int argc, char* argv[]) {
         processed += hop;
         if (processed % sr == 0) {
             printf("."); fflush(stdout);
-            if (debug_status) print_debug_status(aec, nr, aec_only, (float)processed / (float)sr);
+            if (debug_status) print_debug_status(aec, nr, aec_only, (float)processed / sr);
         }
     }
     if (dctx) fclose(dctx);
