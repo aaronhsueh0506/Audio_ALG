@@ -240,7 +240,10 @@ int rnnoise_compute_features(RNNoiseState *st,
         st->feat_buf[idx][b] = (erb_db[b] - st->ema_state[b]) / RNNOISE_MEAN_NORM_DIV;
     }
     st->feat_idx = (idx + 1) % 3;
-    st->feat_count++;
+    /* 飽和計數，不無限累加: feat_count 唯一用途是與 3 比較 (< 3 vs >= 3)，
+     * 無限遞增在長時間連續運行後會 overflow (signed int UB)，飽和在 3
+     * 對這個用途完全等價且消除該風險 */
+    if (st->feat_count < 3) ++st->feat_count;
 
     /* 需要至少 3 frame 才能送入 conv1 */
     if (st->feat_count < 3) return 0;
