@@ -485,6 +485,6 @@ Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`
 | 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`，不要以 NR gain 驅動 CNG |
 | 不同檔案結果互相影響 | state 未 reset | 每個獨立 stream reset 或重建全部 instance |
 | 尾端樣本變短 | CLI 只處理完整 hop | 上層先 padding，並在輸出後裁回原長度 |
-| 想使用 `AudioPipeline*` | 該 API 尚未實作 | 先採本手冊 wrapper，或另外立項實作並定義 ABI／測試 |
+| 想使用 `AudioPipeline*` | 已實作（review F20）| 見 `pipelines/audio_pipeline.h` + `pipelines/README.md`「Board Integration」；本手冊 wrapper 仍可用於未過渡的呼叫端 |
 
 定位問題時建議依序比較：`--aec-only`、完整 production、`--no-cng`、`--legacy-amin`，再用 `DUMP_CTX` 檢查 `E(f)`、`G_res`、`R²` 與 `G_nr`。

@@ -35,8 +35,8 @@ All modules use unified 20ms frame / 10ms hop, auto-configured by sample rate:
 | hop_size | 80 | 160 | 480 | frame / 2 |
 | fft_size | 256 | 512 | 1024 | next pow2 ≥ frame |
 | n_freqs | 129 | 257 | 513 | fft/2 + 1 |
-| filter_length | 832 | 832 | 832 | preset default (52ms @16k), NOT sr-scaled |
-| n_partitions | 11 | 6 | 2 | ceil(filter_length / hop) |
+| filter_length | 416 | 832 | 3072 | ms-derived: sr × 52ms (64ms ≥44.1 kHz) |
+| n_partitions | 6 | 6 | 7 | ceil(filter_length / hop) |
 
 ## Latency & Performance
 
@@ -116,7 +116,17 @@ make                # libs (BACKEND=kiss) + aec_nr_pipeline + aec_nr_pipeline_st
 # Run Version B (static memory) — same CLI, plus a mem-size query mode
 ./aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
 ./aec_nr_pipeline_static --print-mem-size --sample-rate 16000
+
+# Run the audio_pipeline.h library's own acceptance tests (F20) —
+# create-vs-init byte equality (incl. a poisoned pool), destroy idempotence,
+# misaligned/undersized pool rejection, sample-rate whitelist rejection
+make test
 ```
+
+`make` also builds `libaudio_pipeline.a` (the linkable pool-sizing/carving/
+processing library both CLIs above are now thin shells over) as a side
+effect of building either binary. See "Board Integration" below for the API
+this exposes to a firmware/board consumer.
 
 ## Debugging & Performance Flags
 
@@ -239,6 +249,113 @@ Query the exact pool budget for any configuration without running audio:
 block of the reported total from the platform allocator, pass it in place of
 the desktop `malloc` — no other change. The pool base MUST be 16-byte
 aligned (both libraries assert this).
+
+## Board Integration
+
+Review F20: the pool-sizing/carving/per-hop-processing logic both CLIs above
+embed is also available as a standalone, linkable library —
+[`audio_pipeline.h`](audio_pipeline.h) / [`audio_pipeline.c`](audio_pipeline.c),
+built into `libaudio_pipeline.a`. A board's own memory manager consumes this
+directly instead of copying `aec_nr_pipeline_static.c`'s file-local carve
+code into firmware. Both CLIs are now thin shells over it (arg parsing + WAV
+I/O + the `--print-mem-size`/`--debug`/`DUMP_CTX` diagnostics) — see
+`aec_nr_pipeline_static.c` for the caller-pool flavor of the sequence below,
+or `aec_nr_pipeline.c` for the heap-convenience flavor
+(`audio_pipeline_create()`).
+
+### Sequence
+
+```
+1. query    AudioPipelineConfig cfg = audio_pipeline_default_config(sample_rate);
+            cfg.aec_preset/nr_mode/aec_only/enable_cng/legacy_amin = ...;
+            AudioPipelineMemReq req;
+            audio_pipeline_get_mem_requirements(&cfg, &req);   // -> req.bytes/alignment/...
+
+2. allocate void* pool = platform_alloc(req.bytes, req.alignment);
+            // req.alignment is always 16 today; pool need NOT be zeroed —
+            // see "Dirty-pool contract" below. Pool must stay STABLE and
+            // EXCLUSIVE (nothing else reads/writes it, not shared with any
+            // other instance) for the entire lifetime of the handle below.
+
+3. init     AudioPipeline* p = audio_pipeline_init(pool, req.bytes, &cfg);
+            // NULL on misaligned/undersized pool, invalid cfg, or a
+            // sub-module init/grid-agreement failure (stderr has detail).
+
+4. process  float mic[hop], ref[hop], out[hop];   // hop = audio_pipeline_hop_size(p)
+            while (have_audio()) {
+                read_hop(mic, ref, hop);
+                audio_pipeline_process(p, mic, ref, out);
+                write_hop(out, hop);
+            }
+
+5. reset?   audio_pipeline_reset(p);   // optional: echo-path change, stream switch
+            // re-zeros pipeline/AEC/NR state in place; no re-validation, no
+            // pool re-touch beyond that.
+
+6. destroy  audio_pipeline_destroy(p);
+            // NR -> pipeline FFT -> AEC, reverse of the init carve order.
+            // NULL-safe; idempotent for THIS pool-resident instance (every
+            // sub-destroy is already a genuine no-op on the pool path — see
+            // "Two Versions" above). Call it exactly once if `p` came from
+            // audio_pipeline_create() instead (ordinary free() semantics).
+
+7. release  platform_free(pool);   // only after step 6 — the pool is dead once
+            //                        audio_pipeline_init/destroy have run on it.
+```
+
+### Descriptor semantics (`AudioPipelineMemReq`)
+
+| Field | Meaning |
+|-------|---------|
+| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the 13 pipeline scratch buffers, same carve `aec_nr_pipeline_static.c`'s old file-local `pipeline_pool_size()` produced). |
+| `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, both FFT backends, `mem_align.h`'s `ALIGN16` — carves to). |
+| `layout_version` | Bumped whenever `audio_pipeline.c`'s OWN carve order/buffer set/sizing formula changes — i.e. whenever a `bytes` figure computed by an older build would misdescribe a newer build's actual carve, or vice versa. Starts at 1. Does **not** need bumping for a change purely inside AEC's/NR's/an FFT backend's own internal `_get_mem_size` layout (each is consumed as one opaque composite blob here, same as the pre-F20 static CLI already treated them — a stale cached `bytes` from an old submodule build is still caught by the undersized-pool rejection at init). |
+| `backend` | Compile-time FFT backend identity this `audio_pipeline.o` was built with — `"kiss"` or `"ne10"` (matches this Makefile's `BACKEND=`). The two backends are not byte-identical to each other (pre-existing, expected — see `lib/aec/CLAUDE.md`); a descriptor from one is never valid for the other even at matching `bytes`. |
+| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 13 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
+
+A board integrator who caches a descriptor across a library upgrade should
+compare `layout_version` + `build_flags_hash` (and `backend`) before trusting
+an old `bytes` figure; if either changed, re-query
+`audio_pipeline_get_mem_requirements()` rather than reusing the stale value.
+
+### Dirty-pool contract
+
+`audio_pipeline_init()` does **not** require a zero-filled pool. Every
+pipeline-owned scratch buffer (the OLA accumulator, per-bin gain/spectrum
+scratch, the mic/ref/output hop copies) is explicitly zeroed at carve time,
+and AEC/NR/the FFT backend each zero their own sub-region during their own
+`_init()` — so a pool filled with poison bytes inits and processes
+identically to a freshly-zeroed one. `test_audio_pipeline.c`'s
+create-vs-init parity case exercises exactly this: a `memset(pool, 0xA5,
+bytes)`-poisoned pool run through `audio_pipeline_init()` produces
+byte-for-byte the same 1000-hop output as `audio_pipeline_create()`'s
+(unpoisoned) heap path. There is no need for a caller-side blanket
+`memset(pool, 0, bytes)` before `audio_pipeline_init()` — it was only ever a
+defensive habit carried over from the pre-F20 static CLI, not a requirement.
+
+### `USE_EXT_MEM` — not a thing here
+
+Both the heap path (`audio_pipeline_create`/`audio_pipeline_destroy`) and the
+pool path (`audio_pipeline_get_mem_requirements`/`audio_pipeline_init`/
+`audio_pipeline_destroy`) are always compiled into `libaudio_pipeline.a` —
+which one you use is selected purely by which entry point you call, at
+runtime, same as `lib/aec`'s and `lib/nr`'s own `_create` vs. `_get_mem_size`/
+`_init` pairs. There is no `-DUSE_EXT_MEM`-style compile-time switch (that
+pattern existed historically in `lib/nr` and was removed — see
+`lib/nr/c_impl/CHANGELOG.md` `[v1.11.0]`/later entries); do not look for one,
+and do not add one.
+
+### Teardown order
+
+`audio_pipeline_destroy()` tears down NR → pipeline FFT (the OLA irfft
+instance) → AEC — the reverse of `audio_pipeline_init()`'s carve order (AEC →
+FFT → NR → scratch). Every one of those three calls is a genuine no-op for a
+pool-resident instance today (matches the "Two Versions" section above); the
+order is kept anyway as forward-compat insurance — a future backend/module
+MAY hold something outside the pool that a destroy call needs to release
+(see the NE10-twiddle-config caveat earlier in this file), and it is exactly
+what the heap-convenience path needs for real (`free()` on the pool
+`audio_pipeline_create()` allocated).
 
 ## Tunable Parameters
 

@@ -50,6 +50,8 @@ pipelines/aec_nr_pipeline
 # build artifacts (extensionless pipeline binaries + objects)
 pipelines/aec_nr_pipeline
 pipelines/aec_nr_pipeline_static
+pipelines/test_audio_pipeline
+pipelines/libaudio_pipeline.a
 lib/hpf/obj/
 *.o
 
