@@ -52,3 +52,7 @@ pipelines/aec_nr_pipeline
 pipelines/aec_nr_pipeline_static
 lib/hpf/obj/
 *.o
+
+# F12 build-config stamp (pipelines/Makefile has no obj/ dir of its own to
+# fold this into -- see the CFG_SIG/CFG_STAMP_FILE block in that Makefile)
+pipelines/.cfg_stamp

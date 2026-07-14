@@ -12,10 +12,17 @@
 #
 # Usage:
 #   make                       # builds libs (BACKEND=kiss) + both binaries
-#   make BACKEND=ne10          # NE10 backend (rebuild libs first: make clean-libs)
+#   make BACKEND=ne10          # NE10 backend -- F12: no manual clean needed
+#                              # any more, a CFG_STAMP in each of this file's
+#                              # and the submodules' Makefiles now busts stale
+#                              # objects automatically on a BACKEND/EXTRA_CFLAGS
+#                              # change (make clean-all still works, just isn't
+#                              # required)
 #   make EXTRA_CFLAGS="..."    # see the EXTRA_CFLAGS block below
-#   make clean                 # remove the two pipeline binaries
-#   make clean-libs             # also clean lib/aec, lib/nr, audio_common build dirs
+#   make WERROR=1              # opt-in: -Werror for this file's own two TUs
+#   make clean                 # remove the two pipeline binaries (+ .o's)
+#   make clean-all             # also clean lib/aec, lib/nr, audio_common build
+#                              # dirs (clean-libs is a compatibility alias)
 
 AEC_DIR = ../lib/aec/c_impl
 NR_DIR  = ../lib/nr/c_impl
@@ -37,10 +44,14 @@ CXX ?= c++
 # The fast matched-filter arithmetic and delay-estimator duty-cycling are
 # built in unconditionally (no flag) — see lib/aec/c_impl/src/delay_aec3.c.
 #
-# NOTE: switching EXTRA_CFLAGS on an already-built tree needs `make clean-libs`
-# first — object files aren't flag-tagged, so a stale non-flagged .o (or a
-# stale flagged one, if you're turning a flag back off) will silently persist
-# otherwise.
+# F12 fix: switching EXTRA_CFLAGS (or BACKEND, or WERROR) on an already-built
+# tree used to need `make clean-libs` by hand first -- object files weren't
+# flag-tagged, so a stale non-flagged .o (or a stale flagged one, if you're
+# turning a flag back off) would silently persist otherwise. The CFG_STAMP
+# mechanism further down now detects the change and wipes the stale objects
+# automatically (both here and, independently, inside lib/aec's and lib/nr's
+# own Makefiles); `make clean-libs`/`clean-all` remains available but is no
+# longer required for correctness.
 EXTRA_CFLAGS ?=
 
 CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
@@ -48,6 +59,15 @@ CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
          -I$(NR_DIR)/include \
          -I$(AC_DIR)/include
 CFLAGS += $(EXTRA_CFLAGS)
+
+# -Werror opt-in for this Makefile's OWN two TUs (default off; CI can flip it
+# on with `make WERROR=1`). Vendor code (audio_common's NE10/KISS) is built by
+# audio_common's own Makefile (see `libs:` below), not by rules in this file,
+# so no separate warning isolation is needed on this side.
+WERROR ?= 0
+ifeq ($(WERROR),1)
+  CFLAGS += -Werror
+endif
 
 # The NE10 archive carries one C++ TU (NE10's generic-radix FFT kernel); a
 # plain-C pipeline binary linking against it needs the C++ runtime driver.
@@ -64,7 +84,42 @@ LIBS = $(AEC_DIR)/bin/libaec.a \
        $(AC_DIR)/bin/$(BACKEND)/libaudio_common.a
 LDFLAGS = $(LIBS) -lm $(LDFLAGS_EXTRA)
 
-.PHONY: all clean clean-libs libs
+# --- Build-configuration stamp (F12 build hygiene) --------------------------
+# This Makefile keeps fixed .o names (aec_nr_pipeline.o,
+# aec_nr_pipeline_static.o) directly in this directory -- there is no obj/
+# subdir to wipe wholesale (this dir also holds the Makefile, scripts, docs,
+# etc.). Until now, switching BACKEND or EXTRA_CFLAGS on an already-built
+# tree needed `make clean-libs` by hand first (documented above) or a
+# stale, differently-flagged .o would silently persist. CFG_SIG hashes the
+# exact compiler invocation that produces both of this Makefile's own
+# objects.
+#
+# This check runs at PARSE time (via $(shell ...), not as a build-rule
+# recipe): an order-only-prerequisite version (a stamp FILE that a rule
+# creates, referenced via `foo.o: foo.c | $(CFG_STAMP)`) is racy -- verified
+# empirically. When several objects share one order-only prerequisite whose
+# recipe deletes them, GNU Make can finalize "is this object out of date?"
+# for one of them using the prerequisite tree it already resolved, before
+# the shared prerequisite's recipe actually runs -- so that object silently
+# keeps its (about to be deleted) stale .o and is never recompiled. Doing
+# the compare-and-wipe unconditionally while the Makefile is being read
+# sidesteps the race entirely.
+PIPE_OBJS := aec_nr_pipeline.o aec_nr_pipeline_static.o
+
+CFG_SIG        := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR)" | shasum -a 256 | cut -c1-12)
+CFG_STAMP_FILE := .cfg_stamp
+CFG_LAST_SIG   := $(shell test -f $(CFG_STAMP_FILE) && cat $(CFG_STAMP_FILE))
+ifneq ($(CFG_SIG),$(CFG_LAST_SIG))
+$(info Audio_ALG/pipelines: build config changed -- removing stale .o's for a full rebuild)
+$(shell rm -f $(PIPE_OBJS))
+$(shell echo $(CFG_SIG) > $(CFG_STAMP_FILE))
+endif
+# (Note: this only re-tags THIS Makefile's own two objects -- the
+# submodule/shared libs pulled in by `libs:` below are independently
+# stamped by their own Makefiles, which now key off the same
+# BACKEND/EXTRA_CFLAGS/WERROR axes.)
+
+.PHONY: all clean clean-libs clean-all libs
 
 all: libs aec_nr_pipeline aec_nr_pipeline_static
 
@@ -74,9 +129,9 @@ all: libs aec_nr_pipeline aec_nr_pipeline_static
 # resolves correctly at the submodule depth: ../../../../audio_common from
 # c_impl/, but pass it anyway to be explicit/robust).
 libs:
-	$(MAKE) -C $(AC_DIR) BACKEND=$(BACKEND) lib
-	$(MAKE) -C $(AEC_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)"
-	$(MAKE) -C $(NR_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)"
+	$(MAKE) -C $(AC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) lib
+	$(MAKE) -C $(AEC_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" WERROR=$(WERROR)
+	$(MAKE) -C $(NR_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" WERROR=$(WERROR)
 
 # Compile with $(CC) (always a plain-C driver, -std=gnu99 valid) then link with
 # $(LINK) (c++ for BACKEND=ne10 — the NE10 archive's one C++ TU needs it). A
@@ -96,9 +151,15 @@ aec_nr_pipeline_static: aec_nr_pipeline_static.o | libs
 	$(LINK) -o $@ $< $(LDFLAGS)
 
 clean:
-	rm -f aec_nr_pipeline aec_nr_pipeline_static aec_nr_pipeline.o aec_nr_pipeline_static.o
+	rm -f aec_nr_pipeline aec_nr_pipeline_static aec_nr_pipeline.o aec_nr_pipeline_static.o .cfg_stamp
 
-clean-libs: clean
+# clean-all: full nuke -- this dir's own artifacts plus all three
+# submodule/shared build trees (lib/aec, lib/nr, audio_common). clean-libs is
+# kept as a backward-compatible alias (same effect) since existing
+# tooling/docs call it by that name.
+clean-all: clean
 	$(MAKE) -C $(AEC_DIR) clean
 	$(MAKE) -C $(NR_DIR) clean
 	$(MAKE) -C $(AC_DIR) clean
+
+clean-libs: clean-all
