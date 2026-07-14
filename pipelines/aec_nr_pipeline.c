@@ -50,7 +50,7 @@
 #define PROD_FAR_GATE_THRESH      1e-4f
 #define PROD_NEAR_GATE_THRESH     1e-3f
 #define PROD_NEAR_HANGOVER        8
-#define PSD_SCALE                 (32768.0 * 32768.0)  /* int16² (Python _PSD_SCALE) */
+#define PSD_SCALE                 (32768.0f * 32768.0f)  /* int16² (Python _PSD_SCALE) */
 
 /* ------------------------------------------------------------------ */
 
@@ -96,7 +96,7 @@ static const char* nr_mode_name(MmseLsaNrMode m) {
  * config, not a broken query (see pipelines/README.md "Debugging &
  * Performance Flags"). */
 static void print_debug_status(const Aec* aec, const MmseLsaDenoiser* nr,
-                                int aec_only, double seconds) {
+                                int aec_only, float seconds) {
     AecDebugStatus a;
     aec_debug_status(aec, &a);
     if (aec_only || !nr) {
@@ -289,7 +289,7 @@ int main(int argc, char* argv[]) {
             processed += hop;
             if (processed % sr == 0) {
                 printf("."); fflush(stdout);
-                if (debug_status) print_debug_status(aec, NULL, 1, (double)processed / sr);
+                if (debug_status) print_debug_status(aec, NULL, 1, (float)processed / (float)sr);
             }
             continue;
         }
@@ -325,12 +325,12 @@ int main(int argc, char* argv[]) {
         if (!legacy) {
             int far_active = ctx.far_power > PROD_FAR_GATE_THRESH;
             /* near_energy = mean |E(f)|² (≈ near+noise when far-silent). */
-            double ne = 0.0;
+            float ne = 0.0f;
             for (int k = 0; k < n_freqs; k++) {
                 float re = ctx.error_spec[k].r, im = ctx.error_spec[k].i;
-                ne += (double)(re * re + im * im);
+                ne += re * re + im * im;
             }
-            ne /= (double)n_freqs;
+            ne /= (float)n_freqs;
             if (ne > PROD_NEAR_GATE_THRESH) near_hang = PROD_NEAR_HANGOVER;
             int near_active = near_hang > 0;
             if (near_hang > 0) near_hang--;
@@ -395,7 +395,7 @@ int main(int argc, char* argv[]) {
         processed += hop;
         if (processed % sr == 0) {
             printf("."); fflush(stdout);
-            if (debug_status) print_debug_status(aec, nr, aec_only, (double)processed / sr);
+            if (debug_status) print_debug_status(aec, nr, aec_only, (float)processed / (float)sr);
         }
     }
     if (dctx) fclose(dctx);
