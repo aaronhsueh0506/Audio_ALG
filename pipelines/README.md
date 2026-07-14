@@ -57,9 +57,9 @@ RES/post context and the AEC-internal FFTs:
 
 | Sample Rate | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |-------------|-----|-----------|-----|---------------|-----------|
-| **8 kHz** | 332.7 KB | 8.6 KB | 95.5 KB | 6.6 KB | **443.3 KB** |
-| **16 kHz** | 544.6 KB | 16.6 KB | 189.5 KB | 13.1 KB | **763.8 KB** |
-| **48 kHz** | 1095.4 KB | 32.6 KB | 377.5 KB | 31.1 KB | **1536.6 KB** |
+| **8 kHz** | 310.5 KB | 8.6 KB | 95.5 KB | 7.1 KB | **421.6 KB** |
+| **16 kHz** | 520.5 KB | 16.6 KB | 189.5 KB | 14.1 KB | **740.7 KB** |
+| **48 kHz** | 1079.4 KB | 32.6 KB | 377.5 KB | 33.1 KB | **1522.5 KB** |
 
 > 增加 `filter_length`（preset 預設 832 taps）會等比增加 AEC 記憶體；48 kHz 記憶體吃緊時
 > 先縮 `filter_length` 與 NR 的 `L`。
