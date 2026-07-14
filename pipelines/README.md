@@ -191,7 +191,13 @@ Built by default alongside Version A (both `lib/aec` and `lib/nr` track
 `main` — each library ships the heap and static APIs side by side,
 selected at runtime). One
 caller-owned pool, no malloc after init, byte-identical output to Version A
-(see Verification below).
+(see Verification below). "No malloc after init" describes the per-hop audio
+path, not zero heap allocation ever: on the NE10 backend, `aec_init`/`fft_init`
+each trigger a one-time backend-internal twiddle-config allocation *during*
+init itself (outside the caller pool, not counted in the `*_get_mem_size`
+figures) — see the `destroy()` note in the code block below for how that
+memory is reclaimed. The KISS backend has no such exception; it is zero-heap
+end to end.
 
 The pipeline uses exactly THREE composite static APIs — there are no
 per-submodule `_get_mem_size()` entry points; each library slices its own
@@ -208,7 +214,11 @@ Aec*             aec = aec_init(mem_aec, aec_sz, &aec_cfg);
 MmseLsaDenoiser* nr  = mmse_lsa_init(mem_nr, nr_sz, &nr_cfg);
 FftHandle*       fft = fft_init(mem_fft, fft_sz, fft_size);
 /* destroy() on static instances frees no pool memory (runtime is_static); it
- * still releases backend-owned handles (e.g. NE10 twiddle configs). */
+ * still releases backend-owned handles (e.g. NE10 twiddle configs) — on
+ * NE10 each of aec_destroy/mmse_lsa_destroy/fft_destroy above must be
+ * called exactly once, before its pool segment is freed or reused: skipping
+ * it leaks the twiddle config, calling it twice double-frees it. KISS is a
+ * genuine no-op here (nothing to release), safe to call any number of times. */
 ```
 
 Query the exact pool budget for any configuration without running audio:
