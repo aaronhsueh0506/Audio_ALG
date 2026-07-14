@@ -57,15 +57,20 @@ context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
 twiddle configs are carved from these pools too, so both columns are the
 complete memory requirement (strict init→destroy zero-heap on both backends):
 
-| 16 kHz | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
+| Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |--------|-----|-----------|-----|---------------|-----------|
-| **KISS** | 533,008 B (520.5 KB) | 16,976 B (16.6 KB) | 194,048 B (189.5 KB) | 14,432 B (14.1 KB) | **758,464 B (740.7 KB)** |
-| **NE10** | 528,880 B (516.5 KB) | 15,600 B (15.2 KB) | 194,048 B (189.5 KB) | 14,432 B (14.1 KB) | **752,960 B (735.3 KB)** |
+| **8 kHz KISS** | 290,352 B | 8,784 B | 97,792 B | 7,264 B | **404,192 B (394.7 KB)** |
+| **8 kHz NE10** | 288,528 B | 8,176 B | 97,792 B | 7,264 B | **401,760 B (392.3 KB)** |
+| **16 kHz KISS** | 537,680 B | 16,976 B | 194,048 B | 14,432 B | **763,136 B (745.2 KB)** |
+| **16 kHz NE10** | 533,552 B | 15,600 B | 194,048 B | 14,432 B | **757,632 B (739.9 KB)** |
+| **48 kHz KISS** | 1,251,760 B | 33,360 B | 386,560 B | 33,888 B | **1,705,568 B (1,665.6 KB)** |
+| **48 kHz NE10** | 1,243,024 B | 30,448 B | 386,560 B | 33,888 B | **1,693,920 B (1,654.2 KB)** |
 
-> 增加 `filter_length`（preset 預設 832 taps）會等比增加 AEC 記憶體；記憶體吃緊時
-> 先縮 `filter_length` 與 NR 的 `L`。
-> 8/48 kHz 列暫時移除：AEC 目前在 config validation 階段僅接受 16 kHz（審查 F01
-> 的 per-rate 表尚未落地，落地後本表補回 8/48 kHz 實測值）。
+> filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072 taps、
+> 7 partitions），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮 `filter_length`
+> 與 NR 的 `L`（48 kHz 也可用 `n_partitions` override 換較短尾巴）。
+> 三個 rate 都由同一 hop=10 ms 規則自動推導（`pipeline_dims.h`），並在 init 以
+> grid assert 驗證 pipeline/AEC/FFT/NR 四方一致。
 
 ## Integration Flow
 
