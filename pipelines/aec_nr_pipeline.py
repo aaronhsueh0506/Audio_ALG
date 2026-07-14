@@ -383,7 +383,7 @@ AEC and NR are each chosen by their own preset; the CLI exposes only
 presets + switches.
 
 Presets:
-  --aec-preset  gentle | balanced | aggressive   (echo-vs-near strength)
+  --aec-preset  mild | balanced | aggressive   (echo-vs-near strength)
   --nr-preset   mild   | balanced | aggressive   (noise-suppression strength)
 Switches:
   --aec-only    run AEC only, skip NR/RES
@@ -392,7 +392,7 @@ Switches:
     parser.add_argument('--ref', required=True, help='Reference/loudspeaker WAV')
     parser.add_argument('--output', required=True, help='Output WAV')
     parser.add_argument('--aec-preset', default='balanced',
-                        choices=['gentle', 'balanced', 'aggressive'],
+                        choices=['mild', 'balanced', 'aggressive'],
                         help='AEC preset (default: balanced)')
     parser.add_argument('--nr-preset', default='balanced',
                         choices=['mild', 'balanced', 'aggressive'],
@@ -416,7 +416,7 @@ Switches:
     duration = len(mic_signal) / sample_rate
 
     preset_map = {
-        'gentle': AecPreset.GENTLE, 'balanced': AecPreset.BALANCED,
+        'mild': AecPreset.MILD, 'balanced': AecPreset.BALANCED,
         'aggressive': AecPreset.AGGRESSIVE,
     }
     preset = preset_map[args.aec_preset]

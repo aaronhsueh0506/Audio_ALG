@@ -75,7 +75,7 @@ def main():
     parser = argparse.ArgumentParser(description='AEC+NR+RES pipeline blind test')
     parser.add_argument('dataset_dir', help='aec_challenge_blind/ directory')
     parser.add_argument('--preset', default='balanced',
-                        choices=['gentle', 'balanced', 'aggressive'])
+                        choices=['mild', 'balanced', 'aggressive'])
     parser.add_argument('--filter', type=int, default=512)
     parser.add_argument('--nr-preset', default='balanced',
                         choices=['mild', 'balanced', 'aggressive'])

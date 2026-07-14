@@ -57,9 +57,9 @@ RES/post context and the AEC-internal FFTs:
 
 | Sample Rate | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |-------------|-----|-----------|-----|---------------|-----------|
-| **8 kHz** | 320.9 KB | 8.6 KB | 95.5 KB | 6.6 KB | **431.6 KB** |
-| **16 kHz** | 526.7 KB | 16.6 KB | 189.5 KB | 13.1 KB | **745.8 KB** |
-| **48 kHz** | 1063.2 KB | 32.6 KB | 377.5 KB | 31.1 KB | **1504.4 KB** |
+| **8 kHz** | 332.7 KB | 8.6 KB | 95.5 KB | 6.6 KB | **443.3 KB** |
+| **16 kHz** | 544.6 KB | 16.6 KB | 189.5 KB | 13.1 KB | **763.8 KB** |
+| **48 kHz** | 1095.4 KB | 32.6 KB | 377.5 KB | 31.1 KB | **1536.6 KB** |
 
 > 增加 `filter_length`（preset 預設 832 taps）會等比增加 AEC 記憶體；48 kHz 記憶體吃緊時
 > 先縮 `filter_length` 與 NR 的 `L`。
@@ -293,13 +293,13 @@ older power-dB (`/10`) convention:
 |------|------|----------|
 | **殘留回聲明顯** | RES 抑制不足 | 改用更 aggressive preset，或直接覆寫 `min_gain_floor_far_active_db`（如 -28→-38） |
 | **殘留回聲 + 遠端持續講話** | Filter 未完全收斂 | 增加 `filter_length`（如 832→1536），確認 mic-ref delay < filter_length |
-| **近端語音被壓制（DT degradation）** | RES 過度抑制 | 改用 gentle preset，或直接覆寫 `min_gain_floor_far_active_db`（如 -28→-20） |
+| **近端語音被壓制（DT degradation）** | RES 過度抑制 | 改用 mild preset，或直接覆寫 `min_gain_floor_far_active_db`（如 -28→-20） |
 | **輸出底噪不自然（突然靜音）** | CNG 未開啟 | 確認 `enable_cng=1`（preset 預設已開啟） |
 | **收斂太慢** | Kalman Q 太保守 | 提高 `kalman_q_high`（如 1e-3→2e-3），減少 `warmup_frames`（如 100→50） |
 | **Filter 發散（輸出爆音）** | Kalman Q 太激進或 echo path 劇變 | 降低 `kalman_q_high`（如 1e-3→5e-4） |
 | **Echo path 變化後適應慢** | Shadow filter 太保守 | 提高 `shadow_mu_nlms`（如 0.5→0.7），降低 `shadow_err_alpha`（如 0.8→0.6） |
 
-> `min_gain_floor_far_active_db` 是唯一在 gentle/balanced/aggressive 三個 preset 間變動的欄位；
+> `min_gain_floor_far_active_db` 是唯一在 mild/balanced/aggressive 三個 preset 間變動的欄位；
 > 沒有獨立的 `res_*` tunable struct（見上方 `AEC (AecConfig, see aec.h)`）。
 
 ### NR 相關

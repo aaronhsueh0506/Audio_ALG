@@ -58,14 +58,14 @@
 /* ------------------------------------------------------------------ */
 
 static AecPreset parse_preset(const char* s) {
-    if (strcmp(s, "gentle") == 0)     return AEC_PRESET_GENTLE;
+    if (strcmp(s, "mild") == 0)     return AEC_PRESET_MILD;
     if (strcmp(s, "aggressive") == 0) return AEC_PRESET_AGGRESSIVE;
     return AEC_PRESET_BALANCED;
 }
 
 static const char* preset_name(AecPreset p) {
     switch (p) {
-        case AEC_PRESET_GENTLE:     return "gentle";
+        case AEC_PRESET_MILD:     return "mild";
         case AEC_PRESET_AGGRESSIVE: return "aggressive";
         default:                     return "balanced";
     }

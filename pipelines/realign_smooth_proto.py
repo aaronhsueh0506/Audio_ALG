@@ -165,7 +165,7 @@ def main():
     ap.add_argument('lpb', nargs='?', default=None, help='lpb.wav if input is mono mic')
     ap.add_argument('--out-prefix', default=None)
     ap.add_argument('--preset', default='balanced',
-                    choices=['gentle', 'balanced', 'aggressive'])
+                    choices=['mild', 'balanced', 'aggressive'])
     ap.add_argument('--smooth', action='store_true',
                     help='apply the raised-cosine gain dip across delay-relock windows (default OFF)')
     ap.add_argument('--dip-pre', type=int, default=1)

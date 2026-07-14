@@ -102,7 +102,7 @@ ref ──────┴─► Linear AEC (PBFDKF + Shadow + EPC，純線性、
 make -C pipelines libs
 make -C pipelines aec_nr_pipeline
 
-# AEC preset 為 positional（gentle/balanced/aggressive）；NR 用 --nr-preset（mild/balanced/aggressive）
+# AEC preset 為 positional（mild/balanced/aggressive）；NR 用 --nr-preset（mild/balanced/aggressive）
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --nr-preset balanced
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav aggressive --nr-preset aggressive
 
@@ -132,7 +132,7 @@ python3 -m pipelines.aec_nr_pipeline --mic mic.wav --ref ref.wav --output out.wa
 | 參數 | 預設 | 說明 |
 |------|------|------|
 | `--mic` `--ref` `--output` | (必填) | mic 輸入 / 參考(喇叭) / 輸出 WAV |
-| `--aec-preset` | `balanced` | `gentle` / `balanced` / `aggressive`（見下方 AEC Preset 表；差異只在 min-gain floor）|
+| `--aec-preset` | `balanced` | `mild` / `balanced` / `aggressive`（見下方 AEC Preset 表；差異只在 min-gain floor）|
 | `--nr-preset` | `balanced` | `mild` / `balanced` / `aggressive`（見下方 NR Preset 表）|
 | `--aec-only` | off | 只跑 AEC，跳過 NR/RES |
 | `--legacy-amin` | off | 還原 2026-06-23 前的 min-only A_min_pl（不注入 R²、scalar 近端 floor）|
@@ -239,7 +239,7 @@ python3 pipelines/compare_res_vs_nr.py input.wav --cng-ab --dnsmos
 
 | Preset | `min_gain_floor_far_active_db` | 特性 |
 |--------|-------------------------------|------|
-| `gentle` | **−20 dB** | 近端優先：保留更多近端語音，允許較多殘留回聲；DT deg 接近 AEC2 |
+| `mild` | **−20 dB** | 近端優先：保留更多近端語音，允許較多殘留回聲；DT deg 接近 AEC2 |
 | `balanced` | **−28 dB** | 預設值（生產用）：四項 ship bar 全過；FS echo >3.5、DT echo >4、DT deg >2、NE deg ≥4 |
 | `aggressive` | **−38 dB** | 回聲優先：更深的回聲消除，近端損失較多；FS echo 超越 AEC3，deg 仍 >2 |
 

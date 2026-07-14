@@ -172,8 +172,8 @@ def main():
     ap.add_argument('--out-prefix', default=None,
                     help='output path prefix (default: input path without extension)')
     ap.add_argument('--preset', default='balanced',
-                    choices=['gentle', 'balanced', 'aggressive'],
-                    help='AEC residual-echo preset (gentle/balanced/aggressive)')
+                    choices=['mild', 'balanced', 'aggressive'],
+                    help='AEC residual-echo preset (mild/balanced/aggressive)')
     ap.add_argument('--nr-preset', default='balanced',
                     choices=['mild', 'balanced', 'aggressive'],
                     help='NR strength preset (mild/balanced/aggressive; '

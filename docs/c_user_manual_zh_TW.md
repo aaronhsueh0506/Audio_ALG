@@ -90,7 +90,7 @@ AEC library 本身使用 `-ffp-contract=off` 建置；若 application 內重做�
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced
 
 # 各自指定 preset
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav gentle \
+./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav mild \
   --nr-preset mild
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav aggressive \
   --nr-preset aggressive
@@ -109,7 +109,7 @@ AEC library 本身使用 `-ffp-contract=off` 建置；若 application 內重做�
 
 | 參數 | 值 | 預設 | 說明 |
 |---|---|---|---|
-| 第 4 個 positional argument | `gentle`／`balanced`／`aggressive` | `balanced` | AEC preset |
+| 第 4 個 positional argument | `mild`／`balanced`／`aggressive` | `balanced` | AEC preset |
 | `--nr-preset` | `mild`／`balanced`／`aggressive` | `balanced` | NR strength |
 | `--aec-only` | flag | off | 跳過 NR 與最終 gain combine |
 | `--legacy-amin` | flag | off | 還原舊版 min-only path |
@@ -442,7 +442,7 @@ AEC preset：
 
 | Preset | 方向 |
 |---|---|
-| gentle | 近端保留優先 |
+| mild | 近端保留優先 |
 | balanced | 預設 production operating point |
 | aggressive | 回聲抑制優先 |
 
