@@ -39,6 +39,7 @@
 #include "fft_wrapper.h"       /* fft_create/forward/inverse                 */
 #include "mmse_lsa_denoiser.h" /* freq-domain NR + mmse_lsa_process_gain     */
 #include "wav_io.h"
+#include "simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32             */
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -229,7 +230,7 @@ int main(int argc, char* argv[]) {
     FftHandle*       fft = NULL;
     MmseLsaDenoiser* nr  = NULL;
     float   *synth_win = NULL, *ola = NULL, *ifft_buf = NULL, *out_buf = NULL;
-    float   *g_nr = NULL, *g_total = NULL, *g_aec = NULL, *extra = NULL;
+    float   *g_nr = NULL, *g_total = NULL, *g_aec = NULL, *extra = NULL, *e2 = NULL;
     Complex *spec = NULL;
 
     if (!aec_only) {
@@ -245,9 +246,10 @@ int main(int argc, char* argv[]) {
         g_total   = (float*)malloc((size_t)n_freqs  * sizeof(float));
         g_aec     = (float*)malloc((size_t)n_freqs  * sizeof(float));
         extra     = (float*)malloc((size_t)n_freqs  * sizeof(float));
+        e2        = (float*)malloc((size_t)n_freqs  * sizeof(float)); /* |E(f)|² scratch */
         spec      = (Complex*)malloc((size_t)n_freqs * sizeof(Complex));
         if (!synth_win || !ola || !ifft_buf || !out_buf || !g_nr || !g_total
-            || !g_aec || !extra || !spec) {
+            || !g_aec || !extra || !e2 || !spec) {
             fprintf(stderr, "Error: pipeline buffer alloc failed\n"); return 1;
         }
         /* sqrt of periodic Hann (denom = block_size) — matches Python run_res
@@ -314,10 +316,16 @@ int main(int argc, char* argv[]) {
 
         /* Stage 3a: g_total = min(G_nr, G_res). g_aec (= G_res, pre-min) sets the
          * comfort-noise level so CNG reflects AEC suppression only. */
+        memcpy(g_aec, ctx.res_gain, (size_t)n_freqs * sizeof(float));
+        sk_min_f32(g_total, g_nr, g_aec, n_freqs);
+
+        /* |E(f)|² scratch hoist: both the near-energy mean below and the
+         * echo-gated lift loop need re*re+im*im per bin — compute it once
+         * here (exact same expression text as both original inline sites)
+         * instead of twice. */
         for (int k = 0; k < n_freqs; k++) {
-            float gr = ctx.res_gain[k];
-            g_aec[k]   = gr;
-            g_total[k] = (g_nr[k] < gr) ? g_nr[k] : gr;
+            float re = ctx.error_spec[k].r, im = ctx.error_spec[k].i;
+            e2[k] = re * re + im * im;
         }
 
         /* Stage 3b: far-activity + near-VAD gated near-end floor strength. */
@@ -327,8 +335,7 @@ int main(int argc, char* argv[]) {
             /* near_energy = mean |E(f)|² (≈ near+noise when far-silent). */
             float ne = 0.0f;
             for (int k = 0; k < n_freqs; k++) {
-                float re = ctx.error_spec[k].r, im = ctx.error_spec[k].i;
-                ne += re * re + im * im;
+                ne += e2[k];
             }
             ne /= (float)n_freqs;
             if (ne > PROD_NEAR_GATE_THRESH) near_hang = PROD_NEAR_HANGOVER;
@@ -341,10 +348,8 @@ int main(int argc, char* argv[]) {
         /* Per-bin echo-gated near-end lift (ne_gate='both': G_res·(1-echo_frac)). */
         if (nf_eff > 0.0f && ctx.r2) {
             for (int k = 0; k < n_freqs; k++) {
-                float re = ctx.error_spec[k].r, im = ctx.error_spec[k].i;
-                float e2 = re * re + im * im;
                 float r2_nr = ctx.r2[k] / PSD_SCALE;
-                float echo_frac = r2_nr / (e2 + 1e-12f);
+                float echo_frac = r2_nr / (e2[k] + 1e-12f);
                 if (echo_frac < 0.0f) echo_frac = 0.0f;
                 if (echo_frac > 1.0f) echo_frac = 1.0f;
                 float no_echo = ctx.res_gain[k] * (1.0f - echo_frac);
@@ -354,10 +359,7 @@ int main(int argc, char* argv[]) {
         }
 
         /* S(f) = E(f) · g_total */
-        for (int k = 0; k < n_freqs; k++) {
-            spec[k].r = ctx.error_spec[k].r * g_total[k];
-            spec[k].i = ctx.error_spec[k].i * g_total[k];
-        }
+        sk_capply_gain_f32(spec, ctx.error_spec, g_total, n_freqs);
 
         /* Comfort noise on the cut bins: level = sqrt(N²/PSD_SCALE), scaled by
          * sqrt(1 - g_aec²) so it fills only what the AEC suppressed (bins 1..N-2). */
@@ -410,7 +412,7 @@ int main(int argc, char* argv[]) {
     free(mic_buf); free(ref_buf); free(aec_out);
     if (!aec_only) {
         free(synth_win); free(ola); free(ifft_buf); free(out_buf);
-        free(g_nr); free(g_total); free(g_aec); free(extra); free(spec);
+        free(g_nr); free(g_total); free(g_aec); free(extra); free(e2); free(spec);
         mmse_lsa_destroy(nr);
         fft_destroy(fft);
     }
