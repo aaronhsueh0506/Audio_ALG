@@ -40,6 +40,7 @@
 #include "mmse_lsa_denoiser.h" /* freq-domain NR + mmse_lsa_process_gain     */
 #include "wav_io.h"
 #include "simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32             */
+#include "pipeline_dims.h"     /* compute_frame_dims() — shared with aec_nr_pipeline_static.c */
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -176,6 +177,14 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error: sample-rate mismatch\n");
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
+    /* CLI rate whitelist: the AEC would reject an unsupported rate anyway
+     * (aec_is_valid_sample_rate(), aec.h) — fail earlier and with a clearer
+     * message here, before any buffers are sized off it. */
+    if (!aec_is_valid_sample_rate(mic_r->info.sample_rate)) {
+        fprintf(stderr, "Error: unsupported sample rate %d Hz (supported: 8000, 16000, 48000)\n",
+                mic_r->info.sample_rate);
+        wav_close_read(mic_r); wav_close_read(ref_r); return 1;
+    }
 
     int sr        = mic_r->info.sample_rate;
     int n_samples = (mic_r->info.num_samples < ref_r->info.num_samples)
@@ -207,12 +216,15 @@ int main(int argc, char* argv[]) {
     nr_cfg.alpha_attack = 0.3f;
     nr_cfg.alpha_decay  = nr_cfg.alpha_g;
 
-    /* Frame dimensions (shared 10ms-hop grid) */
-    int hop      = (int)(0.01f * sr);   /* 160 @ 16k */
-    int frame_sz = 2 * hop;             /* 320       */
-    int fft_sz   = 512;
-    while (fft_sz < frame_sz) fft_sz *= 2;
-    int n_freqs  = fft_sz / 2 + 1;      /* 257       */
+    /* Frame dimensions (shared 10ms-hop grid) — compute_frame_dims()
+     * (pipeline_dims.h) is shared verbatim with aec_nr_pipeline_static.c so
+     * the two derivations can never diverge (the "8 kHz FFT mismatch": a
+     * hardcoded 512-seeded doubling loop stayed at 512/257 bins at 8 kHz
+     * while the AEC's own grid is 256/129 bins, so this pipeline's per-bin
+     * loops over the AEC seam arrays (ctx.error_spec/r2/res_gain, K=129)
+     * read/wrote out of bounds). */
+    int hop, frame_sz, fft_sz, n_freqs;
+    compute_frame_dims(sr, &hop, &frame_sz, &fft_sz, &n_freqs);
 
     printf("AEC(linear) -> echo-aware NR -> RES  (freq A_min_pl%s)\n",
            legacy ? ", legacy min-only" : "");
@@ -226,6 +238,24 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Error: AEC create failed\n"); return 1;
     }
 
+    /* Grid agreement guard (the "8 kHz FFT mismatch" fix — mirrors the static
+     * pipeline's post-init check). aec_get_res_context() is readable right
+     * after aec_create (n_freqs/hop_size are set at create time, before any
+     * frame is processed), so this runs before a single sample is read: a
+     * real mismatch aborts loudly instead of silently reading/writing past
+     * the AEC's seam arrays (ctx.error_spec/r2/res_gain, length K). */
+    {
+        AecResContext ctx0;
+        aec_get_res_context(aec, &ctx0);
+        if (ctx0.n_freqs != n_freqs || ctx0.hop_size != hop) {
+            fprintf(stderr, "FATAL: AEC/pipeline grid mismatch — pipeline n_freqs=%d hop=%d, "
+                            "AEC n_freqs=%d hop=%d\n", n_freqs, hop, ctx0.n_freqs, ctx0.hop_size);
+            aec_destroy(aec); free(aec);
+            wav_close_read(mic_r); wav_close_read(ref_r);
+            return 1;
+        }
+    }
+
     /* Create FFT (irfft bridge) + NR */
     FftHandle*       fft = NULL;
     MmseLsaDenoiser* nr  = NULL;
@@ -237,6 +267,16 @@ int main(int argc, char* argv[]) {
         fft = fft_create(fft_sz);
         nr  = mmse_lsa_create(&nr_cfg);
         if (!fft || !nr) { fprintf(stderr, "Error: NR/FFT create failed\n"); return 1; }
+
+        {
+            int fft_nf = fft_get_n_freqs(fft);
+            int nr_nf  = mmse_lsa_get_n_freqs(nr);
+            if (fft_nf != n_freqs || nr_nf != n_freqs) {
+                fprintf(stderr, "FATAL: FFT/NR grid mismatch — pipeline n_freqs=%d, "
+                                "fft n_freqs=%d, nr n_freqs=%d\n", n_freqs, fft_nf, nr_nf);
+                return 1;
+            }
+        }
 
         synth_win = (float*)malloc((size_t)frame_sz * sizeof(float));
         ola       = (float*)calloc((size_t)frame_sz, sizeof(float));

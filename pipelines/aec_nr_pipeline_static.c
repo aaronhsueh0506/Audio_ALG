@@ -42,6 +42,7 @@
 #include "mmse_lsa_denoiser.h" /* freq-domain NR + mmse_lsa_process_gain            */
 #include "wav_io.h"
 #include "simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32                    */
+#include "pipeline_dims.h"     /* compute_frame_dims() — shared with aec_nr_pipeline.c */
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -138,31 +139,10 @@ static float rng_gauss(void) {                      /* Box-Muller */
 }
 
 /* ------------------------------------------------------------------ */
-/* Frame dimensions (shared 10ms-hop grid). hop/frame_sz use the SAME literal
- * expressions as the malloc pipeline's inline computation (byte-for-byte the
- * same values at every sample rate the two binaries are compared at).
- *
- * fft_sz is the TRUE next-pow2(frame_sz) — starting the doubling from 1, not
- * from a hardcoded 512 (the malloc pipeline's `int fft_sz = 512; while
- * (fft_sz < frame_sz) fft_sz *= 2;` — a starting constant that happens to
- * equal next-pow2 for every frame_sz > 256, i.e. sr >= ~12.8 kHz, but
- * OVERSHOOTS below that: at 8 kHz frame_sz=160 so the hardcoded-512 loop
- * never doubles and stays at 512 (257 bins) while AEC's own internal grid
- * (aec.c next_pow2(block_size)) correctly lands on 256 (129 bins) — the "8
- * kHz FFT mismatch" this pipeline must not carry. Starting from 1 matches
- * AEC's derivation exactly at EVERY sample rate, and is IDENTICAL to the
- * malloc pipeline's result whenever frame_sz > 256 (512 @ 16 kHz, 1024 @
- * 48 kHz — verified byte-identical below), so this is a strict fix with zero
- * risk to the byte-identical requirement at the rates actually compared. */
-static void compute_frame_dims(int sr, int* o_hop, int* o_frame_sz,
-                                int* o_fft_sz, int* o_n_freqs) {
-    int hop      = (int)(0.01f * sr);
-    int frame_sz = 2 * hop;
-    int fft_sz   = 1;
-    while (fft_sz < frame_sz) fft_sz *= 2;
-    *o_hop = hop; *o_frame_sz = frame_sz; *o_fft_sz = fft_sz;
-    *o_n_freqs = fft_sz / 2 + 1;
-}
+/* Frame dimensions (shared 10ms-hop grid): compute_frame_dims() now lives in
+ * pipeline_dims.h, shared verbatim with the malloc pipeline (aec_nr_pipeline.c)
+ * so the two derivations can never diverge again — see that header for the
+ * "8 kHz FFT mismatch" history this fixed. */
 
 /* ------------------------------------------------------------------ */
 /* Static-memory pool — one module set (AEC / FFT / NR) + pipeline scratch.  */
@@ -437,6 +417,14 @@ int main(int argc, char* argv[]) {
     if (!mic_r || !ref_r) { fprintf(stderr, "Error: cannot open inputs\n"); return 1; }
     if (mic_r->info.sample_rate != ref_r->info.sample_rate) {
         fprintf(stderr, "Error: sample-rate mismatch\n");
+        wav_close_read(mic_r); wav_close_read(ref_r); return 1;
+    }
+    /* CLI rate whitelist: the AEC would reject an unsupported rate anyway
+     * (aec_is_valid_sample_rate(), aec.h) — fail earlier and with a clearer
+     * message here, before any buffers/pool are sized off it. */
+    if (!aec_is_valid_sample_rate(mic_r->info.sample_rate)) {
+        fprintf(stderr, "Error: unsupported sample rate %d Hz (supported: 8000, 16000, 48000)\n",
+                mic_r->info.sample_rate);
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
 
