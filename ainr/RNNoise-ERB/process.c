@@ -43,8 +43,15 @@ static double erb2freq(double e) {
     return 24.7 * 9.265 * (exp(e / 9.265) - 1.0);
 }
 
+/* F09: once-guard 改為 __atomic acquire/release (GCC/Clang 內建)。
+ * fast-path 用 acquire load 讀 ready flag: 若已就緒, acquire 語意保證
+ * 「看得到 flag==1」的執行緒也一定看得到下面對 g_nfftborder/g_erb_fwd/
+ * g_erb_inv 的完整寫入 (無 torn read)。多個執行緒可能「同時」通過
+ * fast-path 檢查、各自重算一次表格 — 這是良性的 (冪等、寫入相同常數),
+ * 只有最後的 release store 需要正確排序。建議呼叫端在啟用多執行緒之前
+ * 先呼叫一次 rnnoise_tables_init() (見 process.h), 避免這種重複運算。 */
 static void ensure_erb(void) {
-    if (g_erb_ready) return;
+    if (__atomic_load_n(&g_erb_ready, __ATOMIC_ACQUIRE)) return;
 
     const int    N  = RNNOISE_N_BANDS;
     const double sr = (double)RNNOISE_SR;
@@ -94,7 +101,9 @@ static void ensure_erb(void) {
         g_erb_fwd[k][N - 1] *= 2.0f;
     }
 
-    g_erb_ready = 1;
+    /* release store: 保證上面所有寫入在其他執行緒看到 g_erb_ready==1
+     * 之後才可見 (搭配 ensure_erb 開頭的 acquire load)。 */
+    __atomic_store_n(&g_erb_ready, 1, __ATOMIC_RELEASE);
 }
 
 /* ============================================================
@@ -105,12 +114,13 @@ static void ensure_erb(void) {
 static float g_hann_win[RNNOISE_WIN_LEN];
 static int   g_win_ready = 0;
 
+/* F09: 同 ensure_erb() 的 __atomic acquire/release once-guard。 */
 static void ensure_window(void) {
-    if (g_win_ready) return;
+    if (__atomic_load_n(&g_win_ready, __ATOMIC_ACQUIRE)) return;
     for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
         g_hann_win[i] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / RNNOISE_WIN_LEN)));
     }
-    g_win_ready = 1;
+    __atomic_store_n(&g_win_ready, 1, __ATOMIC_RELEASE);
 }
 
 /* normalized=True 的縮放常數 */
@@ -166,6 +176,13 @@ static void fft_radix2(float *re, float *im, int n, int inverse) {
  * 公開 API
  * ============================================================ */
 
+/* 全域查表 (ERB filterbank + root-Hann window) 的公開一次性初始化入口。
+ * 見 process.h 對 F09 thread-safety 語意的說明。 */
+void rnnoise_tables_init(void) {
+    ensure_erb();
+    ensure_window();
+}
+
 void rnnoise_state_init(RNNoiseState *st) {
     memset(st, 0, sizeof(RNNoiseState));
     /* band_mean_norm 初值: linspace(-60, -90, N_BANDS) dB
@@ -174,19 +191,19 @@ void rnnoise_state_init(RNNoiseState *st) {
         st->ema_state[b] = RNNOISE_MEAN_NORM_LO +
             (RNNOISE_MEAN_NORM_HI - RNNOISE_MEAN_NORM_LO) * (float)b / (RNNOISE_N_BANDS - 1);
     }
-    ensure_erb();
-    ensure_window();
+    rnnoise_tables_init();
 }
 
 /* --- 前處理: analysis --- */
 
-void rnnoise_analysis(const float *frame, float *out_re, float *out_im) {
+void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float *out_im) {
     ensure_window();
 
-    /* Root Hann windowed frame + zero-pad to N_FFT */
-    float buf_re[RNNOISE_N_FFT];
-    float buf_im[RNNOISE_N_FFT];
-    memset(buf_im, 0, sizeof(buf_im));
+    /* Root Hann windowed frame + zero-pad to N_FFT
+     * (F13: 暫存區搬到 st->scratch_buf_re/im, 不佔用呼叫端 stack) */
+    float *buf_re = st->scratch_buf_re;
+    float *buf_im = st->scratch_buf_im;
+    memset(buf_im, 0, sizeof(float) * RNNOISE_N_FFT);
 
     for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
         buf_re[i] = frame[i] * g_hann_win[i];
@@ -213,15 +230,17 @@ int rnnoise_compute_features(RNNoiseState *st,
                              float out_features[3][RNNOISE_N_BANDS]) {
     ensure_erb();
 
-    /* power spectrum (normalized 域) */
-    float power[RNNOISE_N_BINS];
+    /* power spectrum (normalized 域)
+     * (F13: 暫存區搬到 st->scratch_power, 不佔用呼叫端 stack) */
+    float *power = st->scratch_power;
     for (int i = 0; i < RNNOISE_N_BINS; i++) {
         power[i] = spec_re[i] * spec_re[i] + spec_im[i] * spec_im[i];
     }
 
     /* 三角 ERB band energy → dB
-     * energy = power @ erb_fwd; erb_db = 10*log10(energy + 1e-10) */
-    float erb_db[RNNOISE_N_BANDS];
+     * energy = power @ erb_fwd; erb_db = 10*log10(energy + 1e-10)
+     * (F13: 暫存區搬到 st->scratch_erb_db) */
+    float *erb_db = st->scratch_erb_db;
     for (int b = 0; b < RNNOISE_N_BANDS; b++) {
         float sum = 0.0f;
         for (int k = 0; k < RNNOISE_N_BINS; k++) {
@@ -284,9 +303,10 @@ void rnnoise_synthesis(RNNoiseState *st,
         spec_im[i] *= bin_gains[i] * STFT_NORM_INV;
     }
 
-    /* 還原負頻率 (共軛對稱) */
-    float full_re[RNNOISE_N_FFT];
-    float full_im[RNNOISE_N_FFT];
+    /* 還原負頻率 (共軛對稱)
+     * (F13: 暫存區搬到 st->scratch_full_re/im, 不佔用呼叫端 stack) */
+    float *full_re = st->scratch_full_re;
+    float *full_im = st->scratch_full_im;
     memcpy(full_re, spec_re, sizeof(float) * RNNOISE_N_BINS);
     memcpy(full_im, spec_im, sizeof(float) * RNNOISE_N_BINS);
     for (int i = 1; i < RNNOISE_N_FFT / 2; i++) {

@@ -50,10 +50,33 @@ typedef struct {
 
     /* band_mean_norm running mean (dB 域); 初值 linspace(-60,-90) */
     float ema_state[RNNOISE_N_BANDS];
+
+    /* --- 以下為每次呼叫用的暫存區 (scratch), 非跨 frame 狀態 ---
+     * 原本配置在各函式的 stack 上 (F13: embedded hot-path stack 偏高);
+     * 搬到 state 內以降低單次呼叫的 stack 佔用。呼叫間不需要清零,
+     * 每次使用前都會被完整覆寫。 */
+    float scratch_buf_re[RNNOISE_N_FFT];   /* rnnoise_analysis 用 */
+    float scratch_buf_im[RNNOISE_N_FFT];
+    float scratch_power[RNNOISE_N_BINS];   /* rnnoise_compute_features 用 */
+    float scratch_erb_db[RNNOISE_N_BANDS];
+    float scratch_full_re[RNNOISE_N_FFT];  /* rnnoise_synthesis 用 */
+    float scratch_full_im[RNNOISE_N_FFT];
 } RNNoiseState;
 
-/* 初始化狀態 (歸零 + ema_state 設 linspace 初值) */
+/* 初始化狀態 (歸零 + ema_state 設 linspace 初值; 內部亦會呼叫
+ * rnnoise_tables_init() 確保 ERB/window 表已就緒) */
 void rnnoise_state_init(RNNoiseState *st);
+
+/* 全域查表 (ERB filterbank + root-Hann window) 的一次性初始化。
+ *
+ * 建議在啟用多執行緒之前、程式啟動階段就呼叫一次 (單執行緒環境下呼叫即可
+ * 保證後續所有 rnnoise_* API 不會再觸發運算)。若省略呼叫, 各熱路徑 API
+ * 內部仍有 fast-path once-guard 會 lazy 觸發計算 —
+ * 該 guard 使用 __atomic acquire/release: 多個執行緒「同時」第一次呼叫時,
+ * 可能各自重複計算一次表格 (冪等、常數相同, 無害), 但 flag 的
+ * release-store / acquire-load 保證任何看到 flag=1 的執行緒都能看到
+ * 完整寫入的表格內容 (無 torn read)。 */
+void rnnoise_tables_init(void);
 
 /* --- 前處理 (每 frame 呼叫) --- */
 
@@ -61,8 +84,9 @@ void rnnoise_state_init(RNNoiseState *st);
  *   1. 加 root Hann window (WIN_LEN samples)
  *   2. Zero-pad 到 N_FFT (當 WIN_LEN < N_FFT)
  *   3. FFT → N_BINS 個 complex bin, 乘 N_FFT^-0.5 (= torch normalized=True)
+ *   st: 提供 scratch 空間 (scratch_buf_re/im), 不讀寫任何跨 frame 狀態
  *   frame: 長度 WIN_LEN, out_re/out_im: 長度 N_BINS */
-void rnnoise_analysis(const float *frame, float *out_re, float *out_im);
+void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float *out_im);
 
 /* 從 normalized FFT spectrum 計算 ERB band features:
  *   1. power = |X|^2 → 三角 ERB filterbank (mode=0) → 10*log10(·+1e-10)
