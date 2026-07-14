@@ -470,8 +470,8 @@ Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`
 - 單一 caller-owned pool 的 static-memory 版本已完整支援：`aec_nr_pipeline_static` 用三個複合 API
   （`aec_get_mem_size`/`aec_init`、`mmse_lsa_get_mem_size`/`mmse_lsa_init`、`fft_get_mem_size`/`fft_init`）
   從一塊 16-byte 對齊的 pool 切出全部記憶體，init 後零 malloc，輸出與 malloc 版 byte-identical。
-  NR 的 static API 已在其 `main` branch（runtime 選擇，同一份 `.a` 兩套 API 並存）；AEC 的
-  pool API 在其 `feature/static-memory` branch（`.gitmodules` 所釘）。
+  NR 與 AEC 的 static API 都在各自的 `main` branch（runtime 選擇，同一份 `.a` 兩套
+  API 並存；`.gitmodules` 兩個 submodule 均釘 `main`）。
 
 ## 9. Troubleshooting
 
