@@ -50,19 +50,22 @@ All modules use unified 20ms frame / 10ms hop, auto-configured by sample rate:
 
 ### Memory Budget
 
-Measured figures from `./aec_nr_pipeline_static --print-mem-size --sample-rate <hz>`
-(balanced presets, KISS backend). The AEC row is the composite `aec_get_mem_size()`
-pool — it already contains HPF, PBFDKF ×2 (main+shadow), delay estimator, the
-RES/post context and the AEC-internal FFTs:
+Measured figures from `./aec_nr_pipeline_static --print-mem-size --sample-rate 16000`
+(balanced presets). The AEC row is the composite `aec_get_mem_size()` pool — it
+already contains HPF, PBFDKF ×2 (main+shadow), delay estimator, the RES/post
+context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
+twiddle configs are carved from these pools too, so both columns are the
+complete memory requirement (strict init→destroy zero-heap on both backends):
 
-| Sample Rate | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
-|-------------|-----|-----------|-----|---------------|-----------|
-| **8 kHz** | 310.5 KB | 8.6 KB | 95.5 KB | 7.1 KB | **421.6 KB** |
-| **16 kHz** | 520.5 KB | 16.6 KB | 189.5 KB | 14.1 KB | **740.7 KB** |
-| **48 kHz** | 1079.4 KB | 32.6 KB | 377.5 KB | 33.1 KB | **1522.5 KB** |
+| 16 kHz | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
+|--------|-----|-----------|-----|---------------|-----------|
+| **KISS** | 533,008 B (520.5 KB) | 16,976 B (16.6 KB) | 194,048 B (189.5 KB) | 14,432 B (14.1 KB) | **758,464 B (740.7 KB)** |
+| **NE10** | 528,880 B (516.5 KB) | 15,600 B (15.2 KB) | 194,048 B (189.5 KB) | 14,432 B (14.1 KB) | **752,960 B (735.3 KB)** |
 
-> 增加 `filter_length`（preset 預設 832 taps）會等比增加 AEC 記憶體；48 kHz 記憶體吃緊時
+> 增加 `filter_length`（preset 預設 832 taps）會等比增加 AEC 記憶體；記憶體吃緊時
 > 先縮 `filter_length` 與 NR 的 `L`。
+> 8/48 kHz 列暫時移除：AEC 目前在 config validation 階段僅接受 16 kHz（審查 F01
+> 的 per-rate 表尚未落地，落地後本表補回 8/48 kHz 實測值）。
 
 ## Integration Flow
 
