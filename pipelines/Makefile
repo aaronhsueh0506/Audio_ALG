@@ -63,7 +63,14 @@ CXX ?= c++
 # longer required for correctness.
 EXTRA_CFLAGS ?=
 
-CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
+# -ffp-contract=off: same FMA-contraction policy as the AEC library TUs.
+# Deliberate BYTE-CHANGE when it landed (clang had been contracting a
+# handful of mul+add pairs in the pipeline glue, e.g. the |E|^2 hoist) —
+# the pipeline render baselines were regenerated at that commit. Keeping
+# the flag uniform means future SIMD/EMA-style code added to pipeline TUs
+# inherits the repo-wide bit-exactness discipline instead of silently
+# depending on the compiler's contraction mood (review F12).
+CFLAGS = -Wall -Wextra -O2 -std=gnu99 -ffp-contract=off \
          -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
          -I$(NR_DIR)/include \
          -I$(AC_DIR)/include
