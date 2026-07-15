@@ -343,15 +343,55 @@ The board deliverable is built with `make publish BACKEND=ne10` and consumed
 from the stable `dist/ne10/current/` path — immutable, content-addressed
 release dirs where `MANIFEST.txt` is the deterministic build-config record
 (flags, tool identities, per-file SHA-256; byte-verified on every
-republish) and the append-only `ATTEST/` directory records provenance (one
-`attest-<utc>-<commit>.txt` per publish event: this repo's and all three
-producers' git commits, dirty flag, timestamp — round-5 review). The
-`current` symlink is swapped via a rename(2)-atomic helper
+republish, and it deliberately carries no commit/date so the same release
+id always has the same MANIFEST bytes) and the append-only `ATTEST/`
+directory records provenance.
+
+`ATTEST/` is **one-event-one-file** (round-6 review): exactly one new
+`attest-<utc>-<commit>[-dirty]-<seq>.txt` per publish event, including
+idempotent republishes of an already-published release. The file is
+installed atomically with a write-temp + `link(2)` no-clobber step (the
+kernel-level equivalent of `O_CREAT|O_EXCL`) — a same-second name collision
+(same UTC second, same commit) regenerates the event id with the next
+`<seq>` and retries, so an existing attestation is **never** overwritten.
+Each attestation's `event_id` is embedded inside the file, and it records a
+**full 40-hex git commit OID** plus a dirty flag for **this repo AND all
+three producers** (audio_common, lib/aec, lib/nr) — "which exact checkout
+of the whole stack published this" lives here, not in MANIFEST.
+
+`publish` **refuses dirty or unknown checkouts by default** (round-6
+review): if this repo or any of the three producers has uncommitted
+changes, or isn't a git checkout at all (commit unknown), `make publish`
+FATALs and names exactly the offending repo(s). `ALLOW_DIRTY_PUBLISH=1` is
+the explicit dev escape hatch — pass it to publish anyway; the deviation is
+then recorded in the attestation (`allow_dirty_publish=1`) together with a
+`dirty_diff_sha256` per dirty repo (sha256 of that repo's
+`git diff --binary HEAD`), so it stays traceable. This repo's own dirty
+check excludes untracked files (`git status --porcelain -uno` — this
+working tree permanently carries user-owned untracked directories that
+must never make an otherwise-clean checkout look dirty); the three
+producers' checks do NOT exclude untracked files (an untracked source file
+there is a legitimate dirtiness signal).
+
+**Attestations are UNSIGNED**: they provide traceability, not authenticity
+— anyone with filesystem access could forge one, so do not treat `ATTEST/`
+as tamper-proof under an attacker model. `MANIFEST.txt` byte-verification
+(performed automatically on every republish) is the actual integrity
+check; `ATTEST/` is the provenance log.
+
+`make -n|-q|-t ... publish` (dry-run / question / touch mode) is now fully
+side-effect-free (round-6 review): no `dist/` directory is created, no
+publish lock is taken, and nothing is staged/attested. `OBJ_ROOT=`/
+`BIN_ROOT=` relocate this repo's own keyed obj/bin build trees (default:
+`obj/`/`bin/` here, byte-identical to the previous hardcoded paths) — like
+`DIST_ROOT=`, these are isolation-test knobs for running scratch-directory
+builds, not part of the build's config identity (CFG_SIG).
+
+The `current` symlink is swapped via a rename(2)-atomic helper
 (`audio_common/tools/atomic_symlink_swap.c`, built at publish time with the
 host compiler `HOSTCC`), and `publish` takes its per-backend lock BEFORE
-building anything, so concurrent publishes serialize fully. `DIST_ROOT=`
-redirects the whole release tree (used by the isolation tests so they never
-touch real releases). When cross-compiling, pass
+building anything, so concurrent publishes serialize fully. When
+cross-compiling, pass
 the **full toolchain, not just CC** — BACKEND=ne10 compiles one C++ TU
 (NE10's generic-radix kernel), so a partial override would mix host-built
 C++ objects into a cross build and then try to link ARM objects with the
