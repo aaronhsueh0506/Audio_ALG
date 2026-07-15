@@ -195,3 +195,20 @@ python3 export_erb_matrix.py --config config.ini --format all
 | `config.ini` | 所有超參數設定 |
 | `process.c` / `process.h` | C 前後處理實作（嵌入式部署用） |
 | `requirements.txt` | Python 依賴套件 |
+
+## 表格 drift-guard(C 部署表格的兩層契約)
+
+`rnnoise_tables_gen.h` 的編譯期常數表(ERB fwd/inv、nfftborder、Hann window)
+有兩層 drift 契約(round-3 審查 B09;round-4 P2-4 接進 make):
+
+```bash
+make test-tables   # 兩層都建置+執行,任一 FAIL 即非零退出
+```
+
+- **Layer 1(canonical,預設)**:獨立重算 vs header 逐 byte `memcmp`——
+  本機/pinned CI 工具鏈的 bit-exact 契約。
+- **Layer 2(portable,`-DRNN_TABLES_PORTABLE`)**:數學性質檢查(有限值、
+  nfftborder 單調且端點釘死、erb_inv partition-of-unity、erb_fwd 端帶 2x
+  關係、Hann 落在 [0,1] 且滿足公式對稱)+ 實測定界的 ULP 門檻——
+  **recompute-vs-table 為 256 ULP、Hann 鏡像對稱為 4096 ULP(實測 434)**,
+  兩者是不同檢查的不同門檻,皆為 garbage-detector 而非位元契約。
