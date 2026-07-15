@@ -64,18 +64,20 @@ typedef struct {
 } RNNoiseState;
 
 /* 初始化狀態 (歸零 + ema_state 設 linspace 初值; 內部亦會呼叫
- * rnnoise_tables_init() 確保 ERB/window 表已就緒) */
+ * rnnoise_tables_init() — 見下方說明, 現為 no-op) */
 void rnnoise_state_init(RNNoiseState *st);
 
-/* 全域查表 (ERB filterbank + root-Hann window) 的一次性初始化。
+/* F09 修正 (2026-07): ERB filterbank + root-Hann window 表格已改為編譯期
+ * `static const` (由 gen_rnnoise_tables.c 產生 rnnoise_tables_gen.h,
+ * process.c 直接 #include), 不再有任何執行期查表初始化。舊版用「ready
+ * flag + __atomic acquire/release」的 lazy once-guard, 但外部審查指出:
+ * 即使 flag 是 atomic, 兩個執行緒仍可能同時看到 flag==0、並行寫入同一組
+ * non-atomic 表格陣列 — 依 C memory model 仍是 data race (即使寫入相同
+ * 常數值, 也是未定義行為)。編譯期常數表格從根本上移除了這個共享可變
+ * 狀態, 因此執行緒安全是「設計上就沒有可競爭的寫入」, 不是靠同步保證。
  *
- * 建議在啟用多執行緒之前、程式啟動階段就呼叫一次 (單執行緒環境下呼叫即可
- * 保證後續所有 rnnoise_* API 不會再觸發運算)。若省略呼叫, 各熱路徑 API
- * 內部仍有 fast-path once-guard 會 lazy 觸發計算 —
- * 該 guard 使用 __atomic acquire/release: 多個執行緒「同時」第一次呼叫時,
- * 可能各自重複計算一次表格 (冪等、常數相同, 無害), 但 flag 的
- * release-store / acquire-load 保證任何看到 flag=1 的執行緒都能看到
- * 完整寫入的表格內容 (無 torn read)。 */
+ * 這個函式本體現在是刻意留空的 no-op, 純粹保留 API 相容 (舊呼叫端不需要
+ * 修改), 呼叫與否都不影響任何 rnnoise_* API 的行為或正確性。 */
 void rnnoise_tables_init(void);
 
 /* --- 前處理 (每 frame 呼叫) --- */

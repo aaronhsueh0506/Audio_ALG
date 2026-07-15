@@ -22,106 +22,35 @@
 #define LOG_FLOOR 1e-10f
 
 /* ============================================================
- * Glasberg-Moore ERB band borders + 三角 filterbank
+ * Glasberg-Moore ERB band borders + 三角 filterbank + root-Hann window
  * 忠實移植 train.py erb_bandborder() / compute_erb_matrix()
  * (DeepFilterNet(-Keras) 常數: 24.7 * 9.265)
+ *
+ * F09 修正: 這四張表格 (rnn_nfftborder/rnn_erb_fwd/rnn_erb_inv/
+ * rnn_hann_win) 原本是執行期 lazy-init 的全域可變狀態 (ensure_erb()/
+ * ensure_window(), 見 git history)。外部審查指出即使 ready flag 用
+ * __atomic acquire/release, 多個執行緒仍可能同時看到 ready==0、
+ * 並行寫入同一組 non-atomic 陣列 — 依 C memory model 仍是 data race
+ * (即使寫入的是相同常數值, 也是未定義行為)。
+ *
+ * 這些表格的輸入 (RNNOISE_SR/N_BANDS/N_BINS/N_FFT/WIN_LEN) 全部是編譯期
+ * 常數, 因此改為編譯期 `static const` 表格: 由 gen_rnnoise_tables.c
+ * (host-only 工具, 逐字複製原本 ensure_erb()/ensure_window() 的算式)
+ * 產生 rnnoise_tables_gen.h 並直接 #include。從此表格在編譯期就固定,
+ * 沒有共享可變狀態, 執行期不再有任何 race 可言, 也不需要 once-guard。
+ * test_rnnoise_tables.c 用獨立複製的原始演算法在執行期重算並逐 byte
+ * 比對這份表格, 當作 drift-guard。
  *
  * nfftborder: N_BANDS 個邊界 → N_BANDS-1 個 block, N_BANDS 個矩陣欄
  *   border[0]=0 (DC), border[N-1]=N_BINS (Nyquist+1)
  * forward (mode=0, 特徵用): 兩端單邊欄 ×2
  * inverse (mode=1, gain 展開用): 無 ×2, partition of unity
+ *
+ * root-Hann window (長度 WIN_LEN): sqrt(hann) — analysis 與 synthesis
+ * 各乘一次，合計 = hann → COLA (torch.hann_window 預設 periodic=True,
+ * 與此處分母 WIN_LEN 一致)
  * ============================================================ */
-static int   g_nfftborder[RNNOISE_N_BANDS];
-static float g_erb_fwd[RNNOISE_N_BINS][RNNOISE_N_BANDS];
-static float g_erb_inv[RNNOISE_N_BINS][RNNOISE_N_BANDS];
-static int   g_erb_ready = 0;
-
-static double freq2erb(double f) {
-    return 9.265 * log(1.0 + f / (24.7 * 9.265));
-}
-static double erb2freq(double e) {
-    return 24.7 * 9.265 * (exp(e / 9.265) - 1.0);
-}
-
-/* F09: once-guard 改為 __atomic acquire/release (GCC/Clang 內建)。
- * fast-path 用 acquire load 讀 ready flag: 若已就緒, acquire 語意保證
- * 「看得到 flag==1」的執行緒也一定看得到下面對 g_nfftborder/g_erb_fwd/
- * g_erb_inv 的完整寫入 (無 torn read)。多個執行緒可能「同時」通過
- * fast-path 檢查、各自重算一次表格 — 這是良性的 (冪等、寫入相同常數),
- * 只有最後的 release store 需要正確排序。建議呼叫端在啟用多執行緒之前
- * 先呼叫一次 rnnoise_tables_init() (見 process.h), 避免這種重複運算。 */
-static void ensure_erb(void) {
-    if (__atomic_load_n(&g_erb_ready, __ATOMIC_ACQUIRE)) return;
-
-    const int    N  = RNNOISE_N_BANDS;
-    const double sr = (double)RNNOISE_SR;
-    const double high_lim = sr / 2.0;
-    const double bw = high_lim / ((double)RNNOISE_N_FFT / 2.0);  /* = sr/n_fft */
-
-    /* erb_bandborder: cutoffs = erb2freq(linspace(freq2erb(0), freq2erb(sr/2), N))
-     * border = round((cutoff + bw/2) / bw), 再套 Keras 的
-     * 「每隔一個 band 至少跨 2 bin」修正, 端點釘在 DC / Nyquist+1。 */
-    {
-        double e_lo = freq2erb(0.0), e_hi = freq2erb(high_lim);
-        double nb[RNNOISE_N_BANDS];
-        for (int i = 0; i < N; i++) {
-            double e = e_lo + (e_hi - e_lo) * i / (N - 1);   /* linspace 含端點 */
-            double cutoff = erb2freq(e);
-            nb[i] = floor((cutoff + bw / 2.0) / bw + 0.5);   /* np.round (半數進位) */
-        }
-        for (int i = 0; i < N - 2; i++) {
-            if (nb[i + 2] - nb[i] < 2.0)
-                nb[i + 2] += 2.0 - (nb[i + 2] - nb[i]);
-        }
-        nb[0] = 0.0;
-        nb[N - 1] = (double)(RNNOISE_N_FFT / 2 + 1);
-        for (int i = 0; i < N; i++) g_nfftborder[i] = (int)nb[i];
-    }
-
-    /* compute_erb_matrix: block i 介於 border[i]..border[i+1], 欄 i 放下降斜坡、
-     * 欄 i+1 放上升斜坡; forward 版兩端單邊欄 ×2。 (double 計算, float 儲存 —
-     * 對應 numpy 以 double 算、float32 存的行為) */
-    memset(g_erb_fwd, 0, sizeof(g_erb_fwd));
-    memset(g_erb_inv, 0, sizeof(g_erb_inv));
-    for (int i = 0; i < N - 1; i++) {
-        int lo = g_nfftborder[i];
-        int hi = g_nfftborder[i + 1];
-        int bs = hi - lo;
-        for (int j = 0; j < bs; j++) {
-            float down = (float)(1.0 - (double)j / (double)bs);
-            float up   = (float)((double)j / (double)bs);
-            g_erb_inv[lo + j][i]     = down;
-            g_erb_inv[lo + j][i + 1] = up;
-            g_erb_fwd[lo + j][i]     = down;
-            g_erb_fwd[lo + j][i + 1] = up;
-        }
-    }
-    for (int k = 0; k < RNNOISE_N_BINS; k++) {
-        g_erb_fwd[k][0]     *= 2.0f;
-        g_erb_fwd[k][N - 1] *= 2.0f;
-    }
-
-    /* release store: 保證上面所有寫入在其他執行緒看到 g_erb_ready==1
-     * 之後才可見 (搭配 ensure_erb 開頭的 acquire load)。 */
-    __atomic_store_n(&g_erb_ready, 1, __ATOMIC_RELEASE);
-}
-
-/* ============================================================
- * Root Hann window (長度 WIN_LEN, 前算)
- * sqrt(hann) — analysis 與 synthesis 各乘一次，合計 = hann → COLA
- * (torch.hann_window 預設 periodic=True, 與此處分母 WIN_LEN 一致)
- * ============================================================ */
-static float g_hann_win[RNNOISE_WIN_LEN];
-static int   g_win_ready = 0;
-
-/* F09: 同 ensure_erb() 的 __atomic acquire/release once-guard。 */
-static void ensure_window(void) {
-    if (__atomic_load_n(&g_win_ready, __ATOMIC_ACQUIRE)) return;
-    for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
-        g_hann_win[i] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / RNNOISE_WIN_LEN)));
-    }
-    __atomic_store_n(&g_win_ready, 1, __ATOMIC_RELEASE);
-}
+#include "rnnoise_tables_gen.h"
 
 /* normalized=True 的縮放常數 */
 #define STFT_NORM_FWD (1.0f / 22.62741699796952f)   /* N_FFT^-0.5, N=512 */
@@ -176,11 +105,12 @@ static void fft_radix2(float *re, float *im, int n, int inverse) {
  * 公開 API
  * ============================================================ */
 
-/* 全域查表 (ERB filterbank + root-Hann window) 的公開一次性初始化入口。
- * 見 process.h 對 F09 thread-safety 語意的說明。 */
+/* F09 修正後: ERB filterbank + root-Hann window 已是編譯期 `static const`
+ * 表格 (rnnoise_tables_gen.h), 沒有執行期初始化可做。這個函式保留下來
+ * 純粹是為了 API 相容 (呼叫端不必刪掉既有的 rnnoise_tables_init() 呼叫),
+ * 本體是刻意留空的 no-op。見 process.h 對這個變更的說明。 */
 void rnnoise_tables_init(void) {
-    ensure_erb();
-    ensure_window();
+    /* no-op: 表格在編譯期已就緒, 見上方 #include "rnnoise_tables_gen.h" */
 }
 
 void rnnoise_state_init(RNNoiseState *st) {
@@ -191,14 +121,12 @@ void rnnoise_state_init(RNNoiseState *st) {
         st->ema_state[b] = RNNOISE_MEAN_NORM_LO +
             (RNNOISE_MEAN_NORM_HI - RNNOISE_MEAN_NORM_LO) * (float)b / (RNNOISE_N_BANDS - 1);
     }
-    rnnoise_tables_init();
+    rnnoise_tables_init();  /* no-op (表格編譯期已就緒); 保留呼叫只為相容 */
 }
 
 /* --- 前處理: analysis --- */
 
 void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float *out_im) {
-    ensure_window();
-
     /* Root Hann windowed frame + zero-pad to N_FFT
      * (F13: 暫存區搬到 st->scratch_buf_re/im, 不佔用呼叫端 stack) */
     float *buf_re = st->scratch_buf_re;
@@ -206,7 +134,7 @@ void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float
     memset(buf_im, 0, sizeof(float) * RNNOISE_N_FFT);
 
     for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
-        buf_re[i] = frame[i] * g_hann_win[i];
+        buf_re[i] = frame[i] * rnn_hann_win[i];
     }
     /* zero-pad (當 WIN_LEN == N_FFT 時此 loop 不執行) */
     for (int i = RNNOISE_WIN_LEN; i < RNNOISE_N_FFT; i++) {
@@ -228,8 +156,6 @@ void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float
 int rnnoise_compute_features(RNNoiseState *st,
                              const float *spec_re, const float *spec_im,
                              float out_features[3][RNNOISE_N_BANDS]) {
-    ensure_erb();
-
     /* power spectrum (normalized 域)
      * (F13: 暫存區搬到 st->scratch_power, 不佔用呼叫端 stack) */
     float *power = st->scratch_power;
@@ -244,7 +170,7 @@ int rnnoise_compute_features(RNNoiseState *st,
     for (int b = 0; b < RNNOISE_N_BANDS; b++) {
         float sum = 0.0f;
         for (int k = 0; k < RNNOISE_N_BINS; k++) {
-            sum += power[k] * g_erb_fwd[k][b];
+            sum += power[k] * rnn_erb_fwd[k][b];
         }
         erb_db[b] = 10.0f * log10f(sum + LOG_FLOOR);
     }
@@ -279,13 +205,12 @@ int rnnoise_compute_features(RNNoiseState *st,
 /* --- 後處理: expand gains --- */
 
 void rnnoise_expand_gains(const float *band_gains, float *bin_gains) {
-    ensure_erb();
     /* bin_gains = gains @ erb_inv^T (denoise.py apply gains; mode=1 為
      * partition of unity → gains=1 對應 bin_gains=1, 無需列正規化) */
     for (int k = 0; k < RNNOISE_N_BINS; k++) {
         float g = 0.0f;
         for (int b = 0; b < RNNOISE_N_BANDS; b++) {
-            g += band_gains[b] * g_erb_inv[k][b];
+            g += band_gains[b] * rnn_erb_inv[k][b];
         }
         bin_gains[k] = g;
     }
@@ -320,9 +245,8 @@ void rnnoise_synthesis(RNNoiseState *st,
     /* Root Hann window (synthesis side) — 只取 WIN_LEN 點，丟棄 zero-pad 部分
      * (sqrt-hann × sqrt-hann = hann, 50% overlap COLA 和 = 1 → 免除 torch.istft
      * 的 window-envelope 除法, 穩態等價) */
-    ensure_window();
     for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
-        full_re[i] *= g_hann_win[i];
+        full_re[i] *= rnn_hann_win[i];
     }
     /* full_re[WIN_LEN..N_FFT-1] 為 zero-pad 產生的殘留，不使用 */
 
