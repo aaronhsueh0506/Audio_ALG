@@ -175,9 +175,15 @@ typedef struct AudioPipeline AudioPipeline;
  * audio state. Validates `cfg` via the same module validators
  * aec_get_mem_size()/mmse_lsa_get_mem_size() already gate on internally
  * (aec_validate_config / mmse_lsa_validate_config, both invalid-config ->
- * return 0) PLUS an explicit sample-rate whitelist check up front
- * (aec_is_valid_sample_rate) — e.g. sample_rate=44100 is rejected here
- * before any size arithmetic runs, not just left to a downstream 0.
+ * return 0) PLUS an explicit reject-first check up front, in
+ * derive_dims_and_configs() (the one place every entry point in this file
+ * funnels through): sample_rate against the {8000,16000,48000} whitelist
+ * (aec_is_valid_sample_rate — e.g. sample_rate=44100 is rejected before any
+ * size arithmetic runs, not just left to a downstream 0), aec_preset/nr_mode
+ * against their defined enum values (rather than silently falling through
+ * aec_config_from_preset's/mmse_lsa_config_for_mode's own balanced-default
+ * fallback), and aec_only/enable_cng/legacy_amin against {0,1} (rather than
+ * being treated as truthy by a stray nonzero value downstream).
  *
  * @return 0 on success (*out filled), -1 on NULL args or invalid cfg.
  */

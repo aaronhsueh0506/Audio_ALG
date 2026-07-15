@@ -124,16 +124,54 @@ struct AudioPipeline {
  * needs to know the carve/process shape for a given AudioPipelineConfig)
  * ========================================================================== */
 
-/* Returns 0 and fills every out-param, or -1 (NULL cfg, or sample_rate
- * outside the {8000,16000,48000} whitelist -- checked HERE, up front, same
- * as both CLIs' own early rate check, so an invalid rate never reaches
- * aec_config_from_preset/mmse_lsa_config_for_mode). Mirrors the derivation
- * both CLIs' main() used to do inline. */
+/* Returns 0 and fills every out-param, or -1 (NULL cfg; sample_rate outside
+ * the {8000,16000,48000} whitelist; aec_preset/nr_mode outside their defined
+ * enum values; or aec_only/enable_cng/legacy_amin holding anything but 0/1)
+ * -- ALL checked HERE, up front, before a single module config is derived,
+ * so an invalid AudioPipelineConfig never reaches aec_config_from_preset/
+ * mmse_lsa_config_for_mode. This is the one reject-first gate every entry
+ * point (get_mem_requirements, init, get_mem_breakdown, and create() via
+ * get_mem_requirements+init) already funnels through.
+ *
+ * Without this, an out-of-enum aec_preset/nr_mode would silently fall
+ * through aec_config_from_preset's/mmse_lsa_config_for_mode's own internal
+ * `default:` case (a documented fallback to balanced, not an error -- see
+ * aec.c/mmse_lsa_types.h), and an out-of-{0,1} bool would just be treated as
+ * truthy by every `if (cfg->x)` downstream in audio_pipeline_process --
+ * neither is a loud failure on its own, so a caller passing a garbage/
+ * adversarial config would never find out short of this explicit check.
+ * Mirrors the derivation both CLIs' main() used to do inline. */
 static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
                                     AecConfig* aec_cfg, MmseLsaConfig* nr_cfg,
                                     int* hop, int* frame_sz, int* fft_sz, int* n_freqs) {
     if (!cfg) return -1;
     if (!aec_is_valid_sample_rate(cfg->sample_rate)) return -1;
+
+#define AP_CK_BOOL(field) \
+    do { if (cfg->field != 0 && cfg->field != 1) return -1; } while (0)
+
+    switch (cfg->aec_preset) {
+        case AEC_PRESET_MILD:
+        case AEC_PRESET_BALANCED:
+        case AEC_PRESET_AGGRESSIVE:
+            break;
+        default:
+            return -1;
+    }
+    switch (cfg->nr_mode) {
+        case MMSE_LSA_NR_MILD:
+        case MMSE_LSA_NR_MODERATE:
+        case MMSE_LSA_NR_BALANCED:
+        case MMSE_LSA_NR_AGGRESSIVE:
+            break;
+        default:
+            return -1;
+    }
+    AP_CK_BOOL(aec_only);
+    AP_CK_BOOL(enable_cng);
+    AP_CK_BOOL(legacy_amin);
+
+#undef AP_CK_BOOL
 
     aec_config_from_preset(aec_cfg, cfg->aec_preset, cfg->sample_rate);
     aec_cfg->enable_res         = 0;   /* linear AEC + external NR/RES seam */

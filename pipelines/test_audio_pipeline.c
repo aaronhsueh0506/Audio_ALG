@@ -1,5 +1,6 @@
 /**
- * test_audio_pipeline.c — F20 acceptance tests for pipelines/audio_pipeline.h.
+ * test_audio_pipeline.c — F20/R08/§7.3 acceptance tests for
+ * pipelines/audio_pipeline.h.
  *
  * Not a DSP-quality test (no AECMOS, no reference WAVs) — a contract test
  * for the library API surface itself: does the pool-first path behave
@@ -8,6 +9,34 @@
  * lib/aec/c_impl/test/test_zero_heap_aec.c (LCG synthetic input, a
  * 0xA5-poisoned pool to prove the "no blanket memset needed" claim,
  * PASS/FAIL prints, nonzero exit on any failure).
+ *
+ * §7.3 per-rate coverage: every case below (validation, pool rejection,
+ * create-vs-init byte-equal parity, destroy idempotence) runs once per
+ * supported sample rate — 8000 / 16000 / 48000 — not just 16000. The
+ * create-vs-init byte-equality (heap vs. an 0xA5-poisoned pool) at every
+ * rate, on whichever BACKEND this binary was built with, is the load-bearing
+ * §7.3 closure: it is the only place that proves the pool-carve arithmetic
+ * (pipeline_pool_size/pipeline_build in audio_pipeline.c) agrees with itself
+ * across the full 8k/16k/48k FFT-grid range, not just the 16 kHz case F20
+ * originally shipped with.
+ *
+ * 48 kHz runs a REDUCED hop count (HOP_COUNT_48K, see below) — AEC's
+ * filter_length (and therefore n_partitions/convolution cost) and the
+ * pipeline's own hop/n_freqs all scale up substantially above 16 kHz
+ * (pipeline_dims.h), so 1000 hops there is materially slower for no added
+ * coverage value versus 8k/16k's 1000; the byte-equal parity check is
+ * exactly as conclusive at 300 hops (same LCG-seeded stream, same
+ * poisoned-pool-vs-heap comparison, just fewer of them).
+ *
+ * The sample_rate=44100 rate-whitelist rejection is checked exactly ONCE
+ * (independent of the per-rate loop below) — it is a property of the
+ * validator, not of any one supported rate.
+ *
+ * Also covers the R08 reject-first AudioPipelineConfig validation added to
+ * derive_dims_and_configs() (audio_pipeline.c): an out-of-enum aec_preset/
+ * nr_mode and an out-of-{0,1} bool-typed field must all be rejected by both
+ * audio_pipeline_get_mem_requirements() and audio_pipeline_init() — see
+ * test_config_validation_rejects().
  *
  * Build (from pipelines/, after `make libs` for the selected BACKEND):
  *   make test                     # kiss backend (default)
@@ -21,18 +50,21 @@
  *      ../lib/aec/c_impl/bin/libaec.a ../lib/nr/c_impl/bin/libmmse_lsa.a \
  *      ../../audio_common/bin/kiss/libaudio_common.a -lm -o /tmp/tap && /tmp/tap
  *
- * Cases:
+ * Cases (each run once per rate in RATES[] below, unless noted "once"):
  *   1. audio_pipeline_get_mem_requirements: NULL cfg/out rejected,
- *      sample_rate=44100 rejected, sample_rate=16000 accepted.
+ *      sample_rate=44100 rejected (once), sample_rate=<rate> accepted.
  *   2. audio_pipeline_init: a misaligned pool rejected, an undersized pool
  *      rejected.
  *   3. audio_pipeline_create() (heap) vs audio_pipeline_init() (caller pool,
  *      deliberately poisoned with 0xA5 before init) produce BYTE-IDENTICAL
- *      output over 1000 hops of LCG synthetic mic/ref input — the direct
- *      proof of audio_pipeline_init's "a dirty pool is safe without the
- *      caller's blanket memset" claim.
+ *      output over HOP_COUNT (or HOP_COUNT_48K) hops of LCG synthetic
+ *      mic/ref input — the direct proof of audio_pipeline_init's "a dirty
+ *      pool is safe without the caller's blanket memset" claim.
  *   4. audio_pipeline_destroy() idempotence + NULL-safety on a pool-resident
  *      instance, and that the pool itself is untouched/reusable afterward.
+ *   5. (once) reject-first AudioPipelineConfig validation (R08): an
+ *      out-of-enum aec_preset/nr_mode and a bool field holding 2 (or -1)
+ *      are all rejected by get_mem_requirements() AND init().
  */
 #include "audio_pipeline.h"
 
@@ -40,14 +72,37 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <stdarg.h>
 
-#define HOP_COUNT 1000
+#define HOP_COUNT      1000   /* 8 kHz / 16 kHz */
+#define HOP_COUNT_48K   300   /* 48 kHz: filter_length/hop/n_freqs all scale up
+                                * substantially (pipeline_dims.h) -- 300 hops
+                                * keeps runtime sane without weakening the
+                                * byte-equal parity proof (see file header). */
+
+static const int RATES[] = { 8000, 16000, 48000 };
+#define N_RATES ((int)(sizeof(RATES) / sizeof(RATES[0])))
+
+static int hop_count_for_rate(int sr) { return (sr >= 48000) ? HOP_COUNT_48K : HOP_COUNT; }
 
 static int g_failures = 0;
 #define CHECK(cond, msg) do { \
         if (cond) { printf("PASS: %s\n", (msg)); } \
         else      { fprintf(stderr, "FAIL: %s\n", (msg)); g_failures++; } \
     } while (0)
+
+/* snprintf-into-scratch helper so per-rate CHECK messages can embed the rate
+ * without every call site hand-rolling its own buffer. Single static buffer
+ * is safe here: CHECK's cond/msg are evaluated synchronously, one CHECK at a
+ * time, never nested. */
+static char g_msgbuf[256];
+static const char* fmt_msg(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_msgbuf, sizeof(g_msgbuf), fmt, ap);
+    va_end(ap);
+    return g_msgbuf;
+}
 
 /* ---- LCG synthetic mic/ref generator (mirrors test_zero_heap_aec.c) ---- */
 static uint32_t lcg_state;
@@ -56,32 +111,35 @@ static float lcg_sample(void) {
     return ((float)(int)(lcg_state >> 9) / 4194304.0f - 1.0f) * 0.25f;
 }
 
-static void test_validation(void) {
+/* sr < 0 disables the (once-only) 44100 rate-whitelist check. */
+static void test_validation(int sr, int check_rate_whitelist) {
     AudioPipelineMemReq req;
 
     CHECK(audio_pipeline_get_mem_requirements(NULL, &req) == -1,
           "get_mem_requirements rejects a NULL config");
 
-    AudioPipelineConfig cfg16k = audio_pipeline_default_config(16000);
-    CHECK(audio_pipeline_get_mem_requirements(&cfg16k, NULL) == -1,
+    AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
+    CHECK(audio_pipeline_get_mem_requirements(&cfg, NULL) == -1,
           "get_mem_requirements rejects a NULL out-param");
 
-    AudioPipelineConfig bad_rate = audio_pipeline_default_config(44100);
-    CHECK(audio_pipeline_get_mem_requirements(&bad_rate, &req) == -1,
-          "get_mem_requirements rejects sample_rate=44100 (rate whitelist)");
+    if (check_rate_whitelist) {
+        AudioPipelineConfig bad_rate = audio_pipeline_default_config(44100);
+        CHECK(audio_pipeline_get_mem_requirements(&bad_rate, &req) == -1,
+              "get_mem_requirements rejects sample_rate=44100 (rate whitelist)");
+    }
 
-    CHECK(audio_pipeline_get_mem_requirements(&cfg16k, &req) == 0 && req.bytes > 0,
-          "get_mem_requirements accepts sample_rate=16000");
-    printf("       (16 kHz descriptor: bytes=%zu alignment=%zu layout_version=%u "
+    CHECK(audio_pipeline_get_mem_requirements(&cfg, &req) == 0 && req.bytes > 0,
+          fmt_msg("get_mem_requirements accepts sample_rate=%d", sr));
+    printf("       (%d Hz descriptor: bytes=%zu alignment=%zu layout_version=%u "
            "backend=%s build_flags_hash=0x%08x)\n",
-           req.bytes, req.alignment, req.layout_version, req.backend, req.build_flags_hash);
+           sr, req.bytes, req.alignment, req.layout_version, req.backend, req.build_flags_hash);
 }
 
-static void test_pool_rejection(void) {
-    AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
+static void test_pool_rejection(int sr) {
+    AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
     AudioPipelineMemReq req;
     if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
-        fprintf(stderr, "FAIL: setup (get_mem_requirements) for pool-rejection test\n");
+        fprintf(stderr, "FAIL: setup (get_mem_requirements) for pool-rejection test @ %d Hz\n", sr);
         g_failures++;
         return;
     }
@@ -92,19 +150,22 @@ static void test_pool_rejection(void) {
      * allocation itself must not be an OOB setup). */
     void* pool = NULL;
     if (posix_memalign(&pool, 16, req.bytes + 16) != 0 || !pool) {
-        fprintf(stderr, "FAIL: pool alloc for pool-rejection test\n");
+        fprintf(stderr, "FAIL: pool alloc for pool-rejection test @ %d Hz\n", sr);
         g_failures++;
         return;
     }
 
     AudioPipeline* p_misaligned = audio_pipeline_init((uint8_t*)pool + 1, req.bytes, &cfg);
-    CHECK(p_misaligned == NULL, "audio_pipeline_init rejects a misaligned (base+1) pool");
+    CHECK(p_misaligned == NULL,
+          fmt_msg("audio_pipeline_init rejects a misaligned (base+1) pool @ %d Hz", sr));
 
     AudioPipeline* p_short = audio_pipeline_init(pool, req.bytes - 1, &cfg);
-    CHECK(p_short == NULL, "audio_pipeline_init rejects an undersized (bytes-1) pool");
+    CHECK(p_short == NULL,
+          fmt_msg("audio_pipeline_init rejects an undersized (bytes-1) pool @ %d Hz", sr));
 
     AudioPipeline* p_ok = audio_pipeline_init(pool, req.bytes, &cfg);
-    CHECK(p_ok != NULL, "audio_pipeline_init accepts a correctly aligned/sized pool");
+    CHECK(p_ok != NULL,
+          fmt_msg("audio_pipeline_init accepts a correctly aligned/sized pool @ %d Hz", sr));
     if (p_ok) audio_pipeline_destroy(p_ok);
 
     free(pool);
@@ -129,26 +190,26 @@ static void run_hops(AudioPipeline* p, int hop, int hops, float* out_all) {
     free(ref);
 }
 
-static void test_create_vs_init_parity(void) {
-    AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
+static void test_create_vs_init_parity(int sr, int hop_count) {
+    AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
 
     AudioPipelineMemReq req;
     if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
-        fprintf(stderr, "FAIL: setup (get_mem_requirements) for create-vs-init parity test\n");
+        fprintf(stderr, "FAIL: setup (get_mem_requirements) for create-vs-init parity test @ %d Hz\n", sr);
         g_failures++;
         return;
     }
 
     AudioPipeline* p_heap = audio_pipeline_create(&cfg);
     if (!p_heap) {
-        fprintf(stderr, "FAIL: audio_pipeline_create\n");
+        fprintf(stderr, "FAIL: audio_pipeline_create @ %d Hz\n", sr);
         g_failures++;
         return;
     }
 
     void* pool = NULL;
     if (posix_memalign(&pool, req.alignment, req.bytes) != 0 || !pool) {
-        fprintf(stderr, "FAIL: pool alloc for create-vs-init parity test\n");
+        fprintf(stderr, "FAIL: pool alloc for create-vs-init parity test @ %d Hz\n", sr);
         g_failures++;
         audio_pipeline_destroy(p_heap);
         return;
@@ -157,7 +218,7 @@ static void test_create_vs_init_parity(void) {
 
     AudioPipeline* p_pool = audio_pipeline_init(pool, req.bytes, &cfg);
     if (!p_pool) {
-        fprintf(stderr, "FAIL: audio_pipeline_init on a poisoned (0xA5) pool\n");
+        fprintf(stderr, "FAIL: audio_pipeline_init on a poisoned (0xA5) pool @ %d Hz\n", sr);
         g_failures++;
         audio_pipeline_destroy(p_heap);
         free(pool);
@@ -166,24 +227,24 @@ static void test_create_vs_init_parity(void) {
 
     int hop = audio_pipeline_hop_size(p_heap);
     CHECK(hop > 0 && hop == audio_pipeline_hop_size(p_pool),
-          "heap and pool instances agree on hop_size");
+          fmt_msg("heap and pool instances agree on hop_size @ %d Hz", sr));
 
-    float* out_heap = (float*)malloc((size_t)HOP_COUNT * (size_t)hop * sizeof(float));
-    float* out_pool = (float*)malloc((size_t)HOP_COUNT * (size_t)hop * sizeof(float));
+    float* out_heap = (float*)malloc((size_t)hop_count * (size_t)hop * sizeof(float));
+    float* out_pool = (float*)malloc((size_t)hop_count * (size_t)hop * sizeof(float));
 
-    run_hops(p_heap, hop, HOP_COUNT, out_heap);
-    run_hops(p_pool, hop, HOP_COUNT, out_pool);
+    run_hops(p_heap, hop, hop_count, out_heap);
+    run_hops(p_pool, hop, hop_count, out_pool);
 
-    int byte_equal = memcmp(out_heap, out_pool, (size_t)HOP_COUNT * (size_t)hop * sizeof(float)) == 0;
+    int byte_equal = memcmp(out_heap, out_pool, (size_t)hop_count * (size_t)hop * sizeof(float)) == 0;
     CHECK(byte_equal,
-          "audio_pipeline_create (heap) == audio_pipeline_init (0xA5-poisoned pool), "
-          "1000 hops, byte-for-byte");
+          fmt_msg("audio_pipeline_create (heap) == audio_pipeline_init (0xA5-poisoned pool) @ %d Hz, "
+                  "%d hops, byte-for-byte", sr, hop_count));
 
     int finite = 1;
-    for (int i = 0; i < HOP_COUNT * hop; i++) {
+    for (int i = 0; i < hop_count * hop; i++) {
         if (out_heap[i] != out_heap[i]) { finite = 0; break; }   /* NaN check */
     }
-    CHECK(finite, "1000-hop synthetic run produces no NaN in the output");
+    CHECK(finite, fmt_msg("%d-hop synthetic run @ %d Hz produces no NaN in the output", hop_count, sr));
 
     free(out_heap);
     free(out_pool);
@@ -192,25 +253,25 @@ static void test_create_vs_init_parity(void) {
     free(pool);
 }
 
-static void test_destroy_idempotence(void) {
-    AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
+static void test_destroy_idempotence(int sr) {
+    AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
     AudioPipelineMemReq req;
     if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
-        fprintf(stderr, "FAIL: setup (get_mem_requirements) for destroy-idempotence test\n");
+        fprintf(stderr, "FAIL: setup (get_mem_requirements) for destroy-idempotence test @ %d Hz\n", sr);
         g_failures++;
         return;
     }
 
     void* pool = NULL;
     if (posix_memalign(&pool, req.alignment, req.bytes) != 0 || !pool) {
-        fprintf(stderr, "FAIL: pool alloc for destroy-idempotence test\n");
+        fprintf(stderr, "FAIL: pool alloc for destroy-idempotence test @ %d Hz\n", sr);
         g_failures++;
         return;
     }
 
     AudioPipeline* p = audio_pipeline_init(pool, req.bytes, &cfg);
     if (!p) {
-        fprintf(stderr, "FAIL: audio_pipeline_init for destroy-idempotence test\n");
+        fprintf(stderr, "FAIL: audio_pipeline_init for destroy-idempotence test @ %d Hz\n", sr);
         g_failures++;
         free(pool);
         return;
@@ -220,22 +281,104 @@ static void test_destroy_idempotence(void) {
     audio_pipeline_destroy(p);      /* second call on the same pool-resident instance */
     audio_pipeline_destroy(NULL);   /* NULL-safe */
     printf("PASS: audio_pipeline_destroy is idempotent (2x) and NULL-safe on a "
-           "pool-resident instance\n");
+           "pool-resident instance @ %d Hz\n", sr);
 
     /* The pool itself must be untouched/reusable: destroy() on a
      * pool-resident instance never frees `pool` (the caller owns it). */
     AudioPipeline* p2 = audio_pipeline_init(pool, req.bytes, &cfg);
-    CHECK(p2 != NULL, "pool is reusable via a fresh audio_pipeline_init after destroy");
+    CHECK(p2 != NULL, fmt_msg("pool is reusable via a fresh audio_pipeline_init after destroy @ %d Hz", sr));
     if (p2) audio_pipeline_destroy(p2);
 
     free(pool);
 }
 
+/* R08: derive_dims_and_configs()'s reject-first AudioPipelineConfig
+ * validation (audio_pipeline.c) -- an out-of-enum aec_preset/nr_mode and a
+ * bool-typed field outside {0,1} must be rejected by BOTH
+ * audio_pipeline_get_mem_requirements() and audio_pipeline_init(), not just
+ * silently fall through to a module's own internal enum-default fallback
+ * or be treated as truthy. Run once (config-validation is not a per-rate
+ * property); 16000 is an arbitrary representative rate. */
+static void test_config_validation_rejects(void) {
+    AudioPipelineMemReq req;
+
+    AudioPipelineConfig bad_preset = audio_pipeline_default_config(16000);
+    bad_preset.aec_preset = (AecPreset)99;
+    CHECK(audio_pipeline_get_mem_requirements(&bad_preset, &req) == -1,
+          "get_mem_requirements rejects an out-of-enum aec_preset");
+
+    AudioPipelineConfig bad_nr_mode = audio_pipeline_default_config(16000);
+    bad_nr_mode.nr_mode = (MmseLsaNrMode)99;
+    CHECK(audio_pipeline_get_mem_requirements(&bad_nr_mode, &req) == -1,
+          "get_mem_requirements rejects an out-of-enum nr_mode");
+
+    AudioPipelineConfig bad_aec_only = audio_pipeline_default_config(16000);
+    bad_aec_only.aec_only = 2;
+    CHECK(audio_pipeline_get_mem_requirements(&bad_aec_only, &req) == -1,
+          "get_mem_requirements rejects aec_only=2 (bool must be 0/1)");
+
+    AudioPipelineConfig bad_cng = audio_pipeline_default_config(16000);
+    bad_cng.enable_cng = 2;
+    CHECK(audio_pipeline_get_mem_requirements(&bad_cng, &req) == -1,
+          "get_mem_requirements rejects enable_cng=2 (bool must be 0/1)");
+
+    AudioPipelineConfig bad_legacy = audio_pipeline_default_config(16000);
+    bad_legacy.legacy_amin = -1;
+    CHECK(audio_pipeline_get_mem_requirements(&bad_legacy, &req) == -1,
+          "get_mem_requirements rejects legacy_amin=-1 (bool must be 0/1)");
+
+    /* Same rejections must hold on the audio_pipeline_init() entry point too
+     * (derive_dims_and_configs is the ONE gate both funnel through) -- build
+     * a correctly-sized/aligned pool off a KNOWN-GOOD config, then hand
+     * init() a bad config against that same pool. */
+    AudioPipelineConfig good = audio_pipeline_default_config(16000);
+    AudioPipelineMemReq good_req;
+    if (audio_pipeline_get_mem_requirements(&good, &good_req) != 0) {
+        fprintf(stderr, "FAIL: setup (get_mem_requirements) for config-validation init test\n");
+        g_failures++;
+        return;
+    }
+    void* pool = NULL;
+    if (posix_memalign(&pool, good_req.alignment, good_req.bytes) != 0 || !pool) {
+        fprintf(stderr, "FAIL: pool alloc for config-validation init test\n");
+        g_failures++;
+        return;
+    }
+
+    AudioPipelineConfig bad_init_enum = good;
+    bad_init_enum.nr_mode = (MmseLsaNrMode)99;
+    AudioPipeline* p1 = audio_pipeline_init(pool, good_req.bytes, &bad_init_enum);
+    CHECK(p1 == NULL, "audio_pipeline_init rejects an out-of-enum nr_mode");
+    if (p1) audio_pipeline_destroy(p1);
+
+    AudioPipelineConfig bad_init_bool = good;
+    bad_init_bool.enable_cng = 2;
+    AudioPipeline* p2 = audio_pipeline_init(pool, good_req.bytes, &bad_init_bool);
+    CHECK(p2 == NULL, "audio_pipeline_init rejects enable_cng=2 (bool must be 0/1)");
+    if (p2) audio_pipeline_destroy(p2);
+
+    /* The pool must still be usable afterward -- a rejected init() must not
+     * have partially carved/corrupted it. */
+    AudioPipeline* p_ok = audio_pipeline_init(pool, good_req.bytes, &good);
+    CHECK(p_ok != NULL, "pool is still usable via a valid config after rejected init() attempts");
+    if (p_ok) audio_pipeline_destroy(p_ok);
+
+    free(pool);
+}
+
 int main(void) {
-    test_validation();
-    test_pool_rejection();
-    test_create_vs_init_parity();
-    test_destroy_idempotence();
+    for (int r = 0; r < N_RATES; r++) {
+        int sr = RATES[r];
+        int hop_count = hop_count_for_rate(sr);
+        printf("\n=== sample_rate = %d Hz (hop_count=%d) ===\n", sr, hop_count);
+        test_validation(sr, r == 0);   /* 44100 rejection checked once, at r==0 */
+        test_pool_rejection(sr);
+        test_create_vs_init_parity(sr, hop_count);
+        test_destroy_idempotence(sr);
+    }
+
+    printf("\n=== AudioPipelineConfig reject-first validation (R08) ===\n");
+    test_config_validation_rejects();
 
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);

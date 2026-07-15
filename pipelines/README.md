@@ -117,9 +117,12 @@ make                # libs (BACKEND=kiss) + aec_nr_pipeline + aec_nr_pipeline_st
 ./aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
 ./aec_nr_pipeline_static --print-mem-size --sample-rate 16000
 
-# Run the audio_pipeline.h library's own acceptance tests (F20) —
+# Run the audio_pipeline.h library's own acceptance tests (F20/R08/§7.3) —
 # create-vs-init byte equality (incl. a poisoned pool), destroy idempotence,
-# misaligned/undersized pool rejection, sample-rate whitelist rejection
+# misaligned/undersized pool rejection, sample-rate whitelist rejection,
+# AudioPipelineConfig reject-first validation (bad enum/bool fields) — each
+# run once per supported rate (8000/16000/48000; 48 kHz uses a reduced hop
+# count, see test_audio_pipeline.c)
 make test
 ```
 
