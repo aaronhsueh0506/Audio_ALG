@@ -340,8 +340,18 @@ real platform code belongs instead.
 ### Cross-compile / board build (round-4 review P1-2)
 
 The board deliverable is built with `make publish BACKEND=ne10` and consumed
-from the stable `dist/ne10/current/` path (immutable, content-addressed
-release dirs + MANIFEST with per-file SHA-256). When cross-compiling, pass
+from the stable `dist/ne10/current/` path — immutable, content-addressed
+release dirs where `MANIFEST.txt` is the deterministic build-config record
+(flags, tool identities, per-file SHA-256; byte-verified on every
+republish) and the append-only `ATTEST/` directory records provenance (one
+`attest-<utc>-<commit>.txt` per publish event: this repo's and all three
+producers' git commits, dirty flag, timestamp — round-5 review). The
+`current` symlink is swapped via a rename(2)-atomic helper
+(`audio_common/tools/atomic_symlink_swap.c`, built at publish time with the
+host compiler `HOSTCC`), and `publish` takes its per-backend lock BEFORE
+building anything, so concurrent publishes serialize fully. `DIST_ROOT=`
+redirects the whole release tree (used by the isolation tests so they never
+touch real releases). When cross-compiling, pass
 the **full toolchain, not just CC** — BACKEND=ne10 compiles one C++ TU
 (NE10's generic-radix kernel), so a partial override would mix host-built
 C++ objects into a cross build and then try to link ARM objects with the

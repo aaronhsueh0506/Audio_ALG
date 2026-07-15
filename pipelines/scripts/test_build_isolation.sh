@@ -10,18 +10,19 @@
 # resolved via the two-phase recursive-make dispatch described in that
 # Makefile's own header comment. This script exercises the scenarios specific
 # to that three-producer design plus this repo's own audit-no-stdio/publish
-# gates:
+# gates, PLUS (round-5 review) the RNNoise-ERB table drift-gate hardening:
 #
 #   S6:  audit-no-stdio false-pass regression -- the delivered NO_STDIO=1
 #        archive really has no stdio refs, its path really differs from the
 #        default config's, and running the audit never mutates the default
 #        (stdio) archive.
-#   S7:  publish v3 -- MANIFEST sha self-consistency, the `current` symlink
-#        resolves to a complete release dir, concurrent same-backend
-#        publishes serialise via the mkdir lock. (Layout-agnostic: resolves
-#        the release dir only via `readlink dist/<backend>/current`, so it
-#        did not need updating when publish moved v2->v3 -- see SP-S11 for
-#        the round-4-specific new MANIFEST fields/idempotency semantics.)
+#   S7:  publish v4 -- lock-FIRST driver + concurrent-publish semantics (the
+#        loser of a race fails fast with "already held"), MANIFEST sha
+#        self-consistency, the `current` symlink resolves to a complete
+#        release dir, ATTEST/ carries the git provenance. Uses a throwaway
+#        DIST_ROOT (mktemp -d) -- never the real dist/. See SP-S11 for the
+#        content-addressed layout / idempotent-republish / ATTEST-growth
+#        assertions specific to v4.
 #   SP1: pipeline-level A->B->A (kiss -> ne10 -> kiss) -- each build's
 #        delivered aec_nr_pipeline links backend-correct FFT symbols, and the
 #        third (kiss) build is NOT relinked (mtime stable).
@@ -42,22 +43,45 @@
 #           rebuild triggered by touching one small source file (the real
 #           discipline is $@.tmp then `mv -f`, never `ar r` onto the
 #           existing archive); its obj-dir config.manifest records SRCS=.
-#   SP-S11: pipelines publish v3 release layout (round-4 review P2-2) --
-#           content-addressed dist/<backend>/<cfg_sig>-<content12>/ release
-#           dirs, resolved ONLY via `readlink dist/<backend>/current` (never
-#           a hardcoded id); MANIFEST.txt's new release_id=/git_dirty=/ar=/
-#           ranlib=/link= fields; idempotent republish prints "already
-#           published" and leaves the release dir byte- and mtime-untouched,
-#           only repointing `current`.
+#   SP-S11: pipelines publish v4 -- content-addressed
+#           <DIST_ROOT>/<backend>/<cfg_sig>-<content12>/ release dirs,
+#           resolved ONLY via `readlink <DIST_ROOT>/<backend>/current` (never
+#           a hardcoded id). MANIFEST.txt is fully DETERMINISTIC (release_id=/
+#           ac_producer_cfg_sig=/ar=/ranlib=/link=/etc, but NEVER git_commit=
+#           or date_utc=); per-publish-event provenance (git_commit=/
+#           aec_git_commit=/nr_git_commit=/date_utc=) lives ONLY in
+#           append-only ATTEST/attest-<stamp>-<commit>[-dirty].txt files.
+#           Idempotent republish byte-verifies artifacts+MANIFEST, prints
+#           "already published (byte-verified, incl. MANIFEST)", leaves the
+#           release dir and its files (excl. ATTEST/) mtime-untouched, and
+#           appends a SECOND attest file -- after a `sleep 1`, since a
+#           same-second republish would reuse the same attest filename.
 #   SP-S12: BACKEND=ne10 CC/CXX toolchain-coherence guard fires through the
 #           dispatch (round-4 review P1-2) -- a CXX shim that deliberately
 #           answers `-dumpmachine` with a bogus triple fails a BACKEND=ne10
 #           build (mentioning "different targets") but not a BACKEND=kiss
 #           one (the guard is ne10-only, since only ne10 links a C++ TU).
 #
+#   -- round-5 review scenario (RNNoise-ERB, a lightweight sibling of the
+#      four big Makefiles, sharing the same override-rejection/keyed-dir
+#      discipline) --
+#   SP-S13: RNNoise-ERB table drift-gate hardening (round-5 review P2) --
+#           `make test-tables` builds+runs both drift-guard layers (2 PASS
+#           lines: canonical byte-exact + portable math-contract);
+#           `make CC=false test-tables` FAILS outright (the old flat build/
+#           had no compiler/flags identity, so this used to silently re-run a
+#           STALE binary from an earlier config and report PASS without ever
+#           invoking CC=false -- the keyed build/<cfg-sig>/ dir forces a real
+#           compile attempt every time, so that false-pass repro stays
+#           closed); `make CFLAGS=-O0 test-tables` is rejected at PARSE time
+#           ("cannot be overridden"), the same origin-gate discipline as the
+#           four big Makefiles' SP-S9.
+#
 # Design rules (same as audio_common's script -- do not violate when editing):
-#   - No `make clean` inside any scenario body: distinct configs must coexist
-#     WITHOUT ever needing a clean between them.
+#   - No `make clean` inside any scenario body (except SP-S13's own trailing
+#     `make -C RNNoise-ERB clean`, which only ever removes THAT repo's own
+#     gitignored build/ -- never this repo's bin/obj): distinct configs must
+#     coexist WITHOUT ever needing a clean between them.
 #   - Every path is resolved via `make -s ... print-bin-dir` / `print-obj-dir`
 #     / `print-lib-path`, using the EXACT flag set under test for that call --
 #     never a hand-reconstructed path guess. Because this Makefile's three
@@ -71,6 +95,29 @@
 #   - "Is this the SAME delivered artifact as its own keyed object?" IS a sha
 #     comparison, via file_sha() below.
 #
+# Safety / footprint (round-5 review P1 -- this script runs alongside other
+# work in these trees, so it must be inert outside its own throwaway state):
+#   - Writes ONLY: this script's own mktemp/mktemp -d scratch dirs (every
+#     mktemp -d this script creates is registered in CLEANUP_DIRS and removed
+#     by the single EXIT/INT/TERM trap below, even on failure or Ctrl-C) plus
+#     the normal CFG_SIG-keyed obj/bin build dirs that `make` itself creates
+#     in this repo, lib/aec, lib/nr, audio_common, and (SP-S13) RNNoise-ERB --
+#     all gitignored build products, never tracked files.
+#   - NEVER reads, writes, or removes the real `dist/`. Every publish
+#     scenario passes an explicit DIST_ROOT that lives under a throwaway
+#     mktemp -d dir -- never the Makefile's own `DIST_ROOT ?= dist` default.
+#   - NEVER modifies any tracked file's CONTENT. SP-S10's
+#     `touch lib/aec/c_impl/src/aec_debug.c` and SP2's touches of
+#     audio_common's hpf.c/fast_math.h only advance mtimes (to force a
+#     rebuild) -- file bytes/git-status are unaffected.
+#   - Optional integrity check (enabled whenever `git` resolves a toplevel
+#     from this script's own directory): hashes `git status --porcelain` at
+#     start-of-run and again at the summary, and FAILs the run if it
+#     changed -- a cheap trip-wire for "this script accidentally touched
+#     tracked-file state." (Can false-positive if something ELSE concurrently
+#     mutates the same repo while this script runs -- a shared-tree hazard,
+#     not a bug in the check itself.)
+#
 # Usage: ./scripts/test_build_isolation.sh   (run from pipelines/, or
 # anywhere -- paths are resolved relative to this script's own location).
 
@@ -81,6 +128,16 @@ PIPE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 AC_DIR="$(cd "$PIPE_DIR/../../audio_common" && pwd)"
 AEC_DIR="$(cd "$PIPE_DIR/../lib/aec/c_impl" && pwd)"
 NR_DIR="$(cd "$PIPE_DIR/../lib/nr/c_impl" && pwd)"
+RNN_DIR="$(cd "$PIPE_DIR/../ainr/RNNoise-ERB" && pwd)"
+
+# Single global cleanup trap (round-5 P1): every `mktemp -d` this script
+# creates appends its path here, and this is the ONLY place anything gets
+# rm -rf'd on exit -- no scenario removes a real tracked directory itself.
+# `${CLEANUP_DIRS[@]:-}` (not `${CLEANUP_DIRS[@]}`) is deliberate: under
+# `set -u`, bash 3.2 (macOS's default /bin/bash) throws "unbound variable"
+# expanding an EMPTY array's `[@]` without the `:-` fallback.
+CLEANUP_DIRS=()
+trap 'rm -rf "${CLEANUP_DIRS[@]:-}"' EXIT INT TERM
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -91,6 +148,19 @@ fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); FAILURES+=("$*"); echo "  FAIL: $*" >&2
 
 file_sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 mtime()    { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+
+# release_mtime_snapshot <release-dir> -- prints "basename mtime" for every
+# regular file directly under <release-dir> (the published artifacts +
+# MANIFEST.txt), EXCLUDING the ATTEST/ subdirectory (which is expected to
+# gain files across idempotent republishes). Used by SP-S11 to assert an
+# idempotent republish leaves the release dir's own files byte/mtime-stable.
+release_mtime_snapshot() {
+  local dir="$1" f
+  for f in "$dir"/*; do
+    [ -f "$f" ] || continue
+    echo "$(basename "$f") $(mtime "$f")"
+  done | sort
+}
 
 # assert_cmd_fails_with <description> <expected-substring> <cmd...> (round-4
 # review scenarios SP-S9/SP-S12) -- runs <cmd...> with stdout+stderr merged;
@@ -128,6 +198,15 @@ resolve_producers() {
 
 cd "$PIPE_DIR"
 
+# Optional integrity trip-wire (round-5 P1) -- see the "Safety / footprint"
+# header block above. Scoped to this script's own repo toplevel (Audio_ALG);
+# a no-op (never asserted) if `git` isn't available.
+INTEGRITY_ROOT=""
+INTEGRITY_BEFORE=""
+if command -v git >/dev/null 2>&1 && INTEGRITY_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  INTEGRITY_BEFORE="$(git -C "$INTEGRITY_ROOT" status --porcelain | shasum -a 256)"
+fi
+
 echo "############################################################"
 echo "# S6: audit-no-stdio false-pass regression"
 echo "############################################################"
@@ -159,37 +238,50 @@ nm "$default_lib" 2>/dev/null | grep -Eq '_?fprintf' && pass "S6: default archiv
   || fail "S6: default archive unexpectedly has NO fprintf refs"
 
 echo "############################################################"
-echo "# S7: publish"
+echo "# S7: publish (v4 -- lock-first driver + concurrent semantics)"
 echo "############################################################"
+S7_TMP="$(mktemp -d)"; CLEANUP_DIRS+=("$S7_TMP")
+S7_DIST_ROOT="$S7_TMP/dist"
 resolve_producers kiss
-make -s BACKEND=kiss publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+make -s BACKEND=kiss DIST_ROOT="$S7_DIST_ROOT" publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
 
-kiss_current_target="$(readlink dist/kiss/current || true)"
-[ -n "$kiss_current_target" ] && [ -d "dist/kiss/$kiss_current_target" ] && \
+kiss_current_target="$(readlink "$S7_DIST_ROOT/kiss/current" || true)"
+[ -n "$kiss_current_target" ] && [ -d "$S7_DIST_ROOT/kiss/$kiss_current_target" ] && \
   pass "S7: publish -- current symlink resolves to a real release dir" \
   || fail "S7: publish -- current symlink broken or missing"
 
 manifest_ok=1
 while read -r sha fname; do
   [ "$fname" = "MANIFEST.txt" ] && continue
-  actual="$(file_sha "dist/kiss/current/$fname")"
+  actual="$(file_sha "$S7_DIST_ROOT/kiss/current/$fname")"
   [ "$actual" = "$sha" ] || manifest_ok=0
-done < <(grep -E '^[0-9a-f]{64}  ' "dist/kiss/current/MANIFEST.txt")
+done < <(grep -E '^[0-9a-f]{64}  ' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt")
 [ "$manifest_ok" -eq 1 ] && pass "S7: MANIFEST sha self-consistency" \
   || fail "S7: MANIFEST sha mismatch against files on disk"
 
-grep -q '^ac_producer_cfg_sig=kiss-' dist/kiss/current/MANIFEST.txt && \
-  grep -q '^aec_producer_cfg_sig=kiss-' dist/kiss/current/MANIFEST.txt && \
-  grep -q '^nr_producer_cfg_sig=kiss-' dist/kiss/current/MANIFEST.txt && \
+grep -q '^ac_producer_cfg_sig=kiss-' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt" && \
+  grep -q '^aec_producer_cfg_sig=kiss-' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt" && \
+  grep -q '^nr_producer_cfg_sig=kiss-' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt" && \
   pass "S7: MANIFEST records all three producer cfg_sig identities" \
   || fail "S7: MANIFEST missing one or more producer cfg_sig identities"
 
-# Concurrent same-backend publish: lock must serialise. Either one caller
-# fails with the lock message (acceptable) or both succeed; either way
-# `current` must end up pointing at a COMPLETE, self-consistent release.
+grep -q '^git_commit=' "$S7_DIST_ROOT/kiss/current/MANIFEST.txt" && \
+  fail "S7: MANIFEST.txt unexpectedly contains a git_commit= line (v4 keeps provenance in ATTEST/ only)" \
+  || pass "S7: MANIFEST.txt has no git_commit= line (deterministic MANIFEST)"
+
+s7_attest="$(find "$S7_DIST_ROOT/kiss/current/ATTEST" -type f -name 'attest-*.txt' 2>/dev/null | head -n1)"
+[ -n "$s7_attest" ] && grep -q '^git_commit=' "$s7_attest" && grep -q '^aec_git_commit=' "$s7_attest" && \
+  pass "S7: ATTEST file carries git_commit=/aec_git_commit= provenance" \
+  || fail "S7: ATTEST file missing, or missing git_commit=/aec_git_commit="
+
+# Concurrent same-backend publish: the lock-FIRST driver means the loser can
+# fail fast with "already held" rather than waiting -- but depending on
+# scheduling, both invocations can also land in disjoint (non-overlapping)
+# lock windows and both succeed. Either outcome is fine as long as `current`
+# ends up pointing at a COMPLETE, self-consistent release.
 S7_LOG_A="$(mktemp)"; S7_LOG_B="$(mktemp)"
-( make -s BACKEND=kiss publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_A" 2>&1 ) & cp1=$!
-( make -s BACKEND=kiss publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_B" 2>&1 ) & cp2=$!
+( make -s BACKEND=kiss DIST_ROOT="$S7_DIST_ROOT" publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_A" 2>&1 ) & cp1=$!
+( make -s BACKEND=kiss DIST_ROOT="$S7_DIST_ROOT" publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S7_LOG_B" 2>&1 ) & cp2=$!
 cr1=0; cr2=0
 wait "$cp1" || cr1=$?
 wait "$cp2" || cr2=$?
@@ -199,15 +291,15 @@ else
   fail "S7: concurrent same-backend publish -- BOTH callers failed"
   cat "$S7_LOG_A" "$S7_LOG_B" >&2
 fi
-if grep -q "publish lock" "$S7_LOG_A" "$S7_LOG_B" 2>/dev/null || { [ "$cr1" -eq 0 ] && [ "$cr2" -eq 0 ]; }; then
-  pass "S7: concurrent same-backend publish -- lock serialised (one waited/failed cleanly, or both completed in turn)"
+if grep -q "already held" "$S7_LOG_A" "$S7_LOG_B" 2>/dev/null || { [ "$cr1" -eq 0 ] && [ "$cr2" -eq 0 ]; }; then
+  pass "S7: concurrent same-backend publish -- lock-first driver enforced (loser failed fast with 'already held', or both landed in disjoint windows)"
 else
-  fail "S7: concurrent same-backend publish -- no evidence of serialisation"
+  fail "S7: concurrent same-backend publish -- no evidence of lock enforcement"
 fi
 rm -f "$S7_LOG_A" "$S7_LOG_B"
 
-final_target="$(readlink dist/kiss/current || true)"
-[ -n "$final_target" ] && [ -f "dist/kiss/$final_target/MANIFEST.txt" ] && [ -f "dist/kiss/$final_target/aec_nr_pipeline" ] && \
+final_target="$(readlink "$S7_DIST_ROOT/kiss/current" || true)"
+[ -n "$final_target" ] && [ -f "$S7_DIST_ROOT/kiss/$final_target/MANIFEST.txt" ] && [ -f "$S7_DIST_ROOT/kiss/$final_target/aec_nr_pipeline" ] && \
   pass "S7: after concurrent publish, current points at a complete release dir" \
   || fail "S7: after concurrent publish, current points at an incomplete/missing release dir"
 
@@ -253,6 +345,8 @@ bd_k="$(make -s BACKEND=kiss WERROR=0 print-bin-dir AC_LIB="$ac_k" AEC_LIB="$aec
 # touch audio_common/src/hpf.c -> hpf.o recompiles AND aec_nr_pipeline relinks
 # (audio_common's own CFG_SIG is a hash of its COMPILER INVOCATION, not file
 # content, so its archive path is unaffected -- only its mtime advances).
+# mtime-only touch: content is never edited, so this never dirties audio_common's
+# own git status.
 m_before="$(mtime "$bd_k/aec_nr_pipeline")"
 sleep 1
 touch "$AC_DIR/src/hpf.c"
@@ -264,7 +358,8 @@ m_after="$(mtime "$bd_k/aec_nr_pipeline")"
 # touch audio_common/include/fast_math.h -> NR/AEC objects that include it
 # (aec3_post.c/suppression_gain.c in lib/aec, mcra_noise_estimator.c/
 # spp_estimator.c/mmse_lsa_denoiser.c in lib/nr) recompile, AND the pipeline
-# binary relinks -- the full transitive header chain.
+# binary relinks -- the full transitive header chain. Again mtime-only: no
+# tracked file's content changes.
 aec_objdir="$(make -s -C "$AEC_DIR" BACKEND=kiss WERROR=0 CC='cc' CXX='c++' EXTRA_CFLAGS='' NO_STDIO=0 AC_DIR="$AC_DIR" AC_LIB="$ac_k" print-obj-dir)"
 nr_objdir="$(make -s -C "$NR_DIR" BACKEND=kiss WERROR=0 CC='cc' CXX='c++' EXTRA_CFLAGS='' NO_STDIO=0 AC_DIR="$AC_DIR" AC_LIB="$ac_k" print-obj-dir)"
 t_aec_before="$(mtime "$aec_objdir/aec3_post.o")"
@@ -315,7 +410,7 @@ aec_lib_path="$(make -s -C "$AEC_DIR" BACKEND=kiss print-lib-path)"
 [ -f "$aec_lib_path" ] && pass "SP-S10: lib/aec archive built ($aec_lib_path)" \
   || fail "SP-S10: lib/aec archive missing after 'make lib'"
 
-SP10_TMPDIR="$(mktemp -d)"
+SP10_TMPDIR="$(mktemp -d)"; CLEANUP_DIRS+=("$SP10_TMPDIR")
 cat > "$SP10_TMPDIR/sp10_foreign.c" <<'EOF'
 int sp10_foreign_symbol(void) { return 0; }
 EOF
@@ -325,6 +420,8 @@ ar -t "$aec_lib_path" | grep -qx 'sp10_foreign.o' && pass "SP-S10: foreign membe
   || fail "SP-S10: foreign member injection FAILED (setup problem, not the thing under test)"
 
 sleep 1
+# mtime-only touch (content unchanged) -- exercises the fresh-archive rebuild
+# discipline without ever editing this tracked file's bytes.
 touch "$AEC_DIR/src/aec_debug.c"
 make -s -C "$AEC_DIR" BACKEND=kiss lib >/dev/null
 
@@ -342,54 +439,75 @@ grep -q 'SRCS=' "$aec_objdir/config.manifest" && pass "SP-S10: lib/aec's obj-dir
   || fail "SP-S10: lib/aec's obj-dir config.manifest missing a SRCS= entry"
 
 echo "############################################################"
-echo "# SP-S11: pipelines publish v3 (content-addressed release dirs)"
+echo "# SP-S11: pipelines publish v4 (content-addressed release + ATTEST)"
 echo "############################################################"
-rm -rf dist
+SP11_TMP="$(mktemp -d)"; CLEANUP_DIRS+=("$SP11_TMP")
+SP11_DIST_ROOT="$SP11_TMP/dist"
 resolve_producers kiss
-make -s BACKEND=kiss publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+make -s BACKEND=kiss DIST_ROOT="$SP11_DIST_ROOT" publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
 
-id1="$(readlink dist/kiss/current || true)"
-[ -n "$id1" ] && [ -d "dist/kiss/$id1" ] && pass "SP-S11: publish v3 -- current symlink resolves to release dir '$id1'" \
-  || fail "SP-S11: publish v3 -- current symlink broken or missing after the first publish"
+id1="$(readlink "$SP11_DIST_ROOT/kiss/current" || true)"
+[ -n "$id1" ] && [ -d "$SP11_DIST_ROOT/kiss/$id1" ] && pass "SP-S11: publish v4 -- current symlink resolves to release dir '$id1'" \
+  || fail "SP-S11: publish v4 -- current symlink broken or missing after the first publish"
 
-grep -q "^release_id=$id1\$" "dist/kiss/$id1/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt release_id= matches the release dir name" \
+rel_dir="$SP11_DIST_ROOT/kiss/$id1"
+
+grep -q "^release_id=$id1\$" "$rel_dir/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt release_id= matches the release dir name" \
   || fail "SP-S11: MANIFEST.txt release_id= missing or does not match '$id1'"
-grep -q '^git_dirty=' "dist/kiss/$id1/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt has a git_dirty= line" \
-  || fail "SP-S11: MANIFEST.txt missing a git_dirty= line"
-grep -q '^ac_producer_cfg_sig=' "dist/kiss/$id1/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt has an ac_producer_cfg_sig= line" \
+grep -q '^ac_producer_cfg_sig=' "$rel_dir/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt has an ac_producer_cfg_sig= line" \
   || fail "SP-S11: MANIFEST.txt missing an ac_producer_cfg_sig= line"
-grep -q '^aec_git_commit=' "dist/kiss/$id1/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt has an aec_git_commit= line" \
-  || fail "SP-S11: MANIFEST.txt missing an aec_git_commit= line"
-grep -q '^ar=' "dist/kiss/$id1/MANIFEST.txt" && grep -q '^ranlib=' "dist/kiss/$id1/MANIFEST.txt" && grep -q '^link=' "dist/kiss/$id1/MANIFEST.txt" && \
+grep -q '^ar=' "$rel_dir/MANIFEST.txt" && grep -q '^ranlib=' "$rel_dir/MANIFEST.txt" && grep -q '^link=' "$rel_dir/MANIFEST.txt" && \
   pass "SP-S11: MANIFEST.txt has ar=/ranlib=/link= lines" \
   || fail "SP-S11: MANIFEST.txt missing one or more of ar=/ranlib=/link="
+grep -q '^git_commit=' "$rel_dir/MANIFEST.txt" && \
+  fail "SP-S11: MANIFEST.txt unexpectedly has a git_commit= line (moved to ATTEST/ in v4)" \
+  || pass "SP-S11: MANIFEST.txt has NO git_commit= line (deterministic MANIFEST)"
 
-release_dir_mtime_before="$(mtime "dist/kiss/$id1")"
+attest_count_before="$(find "$rel_dir/ATTEST" -type f -name 'attest-*.txt' | wc -l | tr -d ' ')"
+[ "$attest_count_before" -eq 1 ] && pass "SP-S11: exactly one ATTEST file after the first publish" \
+  || fail "SP-S11: expected exactly 1 ATTEST file after the first publish, found $attest_count_before"
 
+first_attest="$(find "$rel_dir/ATTEST" -type f -name 'attest-*.txt' | head -n1)"
+[ -n "$first_attest" ] && grep -q '^git_commit=' "$first_attest" && grep -q '^aec_git_commit=' "$first_attest" && \
+  pass "SP-S11: ATTEST file carries git_commit=/aec_git_commit= provenance" \
+  || fail "SP-S11: ATTEST file missing, or missing git_commit=/aec_git_commit="
+
+release_dir_mtime_before="$(mtime "$rel_dir")"
+snap_before="$(release_mtime_snapshot "$rel_dir")"
+
+sleep 1
 S11_LOG="$(mktemp)"
-make -s BACKEND=kiss publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S11_LOG" 2>&1
-if grep -q "already published" "$S11_LOG"; then
-  pass "SP-S11: idempotent republish printed 'already published (identical content)'"
+make -s BACKEND=kiss DIST_ROOT="$SP11_DIST_ROOT" publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S11_LOG" 2>&1
+if grep -q "already published (byte-verified" "$S11_LOG"; then
+  pass "SP-S11: idempotent republish printed 'already published (byte-verified, incl. MANIFEST)'"
 else
-  fail "SP-S11: idempotent republish did NOT print 'already published'"
+  fail "SP-S11: idempotent republish did NOT print the byte-verified message"
   cat "$S11_LOG" >&2
 fi
+grep -Eq '\(attested: attest-[^)]+\)[[:space:]]*$' "$S11_LOG" && pass "SP-S11: republish success line ends '(attested: <name>)'" \
+  || fail "SP-S11: republish success line missing the '(attested: <name>)' suffix"
 rm -f "$S11_LOG"
 
-id2="$(readlink dist/kiss/current || true)"
+id2="$(readlink "$SP11_DIST_ROOT/kiss/current" || true)"
 [ "$id2" = "$id1" ] && pass "SP-S11: current still points at the same release id after idempotent republish" \
   || fail "SP-S11: current MOVED after idempotent republish ('$id1' -> '$id2')"
 
-release_dir_mtime_after="$(mtime "dist/kiss/$id1")"
-[ "$release_dir_mtime_before" = "$release_dir_mtime_after" ] && pass "SP-S11: release dir left untouched by idempotent republish (mtime stable)" \
+release_dir_mtime_after="$(mtime "$rel_dir")"
+[ "$release_dir_mtime_before" = "$release_dir_mtime_after" ] && pass "SP-S11: release dir's own mtime unchanged by idempotent republish" \
   || fail "SP-S11: release dir mtime CHANGED by idempotent republish ($release_dir_mtime_before -> $release_dir_mtime_after)"
 
-rm -rf dist
+snap_after="$(release_mtime_snapshot "$rel_dir")"
+[ "$snap_before" = "$snap_after" ] && pass "SP-S11: release-dir files (MANIFEST.txt + artifacts, excl. ATTEST/) left mtime-untouched by idempotent republish" \
+  || fail "SP-S11: one or more release-dir files' mtime CHANGED by idempotent republish"
+
+attest_count_after="$(find "$rel_dir/ATTEST" -type f -name 'attest-*.txt' | wc -l | tr -d ' ')"
+[ "$attest_count_after" -eq 2 ] && pass "SP-S11: ATTEST/ grew to 2 files after the (sleep-1'd) republish" \
+  || fail "SP-S11: expected 2 ATTEST files after the republish, found $attest_count_after"
 
 echo "############################################################"
 echo "# SP-S12: BACKEND=ne10 toolchain guard fires through the dispatch"
 echo "############################################################"
-SP12_DIR="$(mktemp -d)"
+SP12_DIR="$(mktemp -d)"; CLEANUP_DIRS+=("$SP12_DIR")
 SP12_SHIM="$SP12_DIR/sp12-cxx-shim"
 cat > "$SP12_SHIM" <<'SHIM_EOF'
 #!/usr/bin/env bash
@@ -413,6 +531,42 @@ else
 fi
 rm -f "$S12_LOG"
 rm -rf "$SP12_DIR"
+
+echo "############################################################"
+echo "# SP-S13: RNNoise-ERB drift-gate hardening (round-5 P2)"
+echo "############################################################"
+SP13_LOG="$(mktemp)"
+if make -C "$RNN_DIR" test-tables >"$SP13_LOG" 2>&1; then
+  pass "SP-S13: 'make test-tables' succeeds"
+else
+  fail "SP-S13: 'make test-tables' FAILED"
+  cat "$SP13_LOG" >&2
+fi
+sp13_pass_count="$(grep -c '^PASS' "$SP13_LOG" || true)"
+[ "${sp13_pass_count:-0}" -eq 2 ] && pass "SP-S13: 'make test-tables' output has both PASS layers (canonical + portable)" \
+  || fail "SP-S13: expected 2 PASS lines from 'make test-tables', found ${sp13_pass_count:-0}"
+rm -f "$SP13_LOG"
+
+SP13_LOG2="$(mktemp)"
+if make -C "$RNN_DIR" CC=false test-tables >"$SP13_LOG2" 2>&1; then
+  fail "SP-S13: 'make CC=false test-tables' unexpectedly SUCCEEDED (stale-binary false-pass would be back)"
+  cat "$SP13_LOG2" >&2
+else
+  pass "SP-S13: 'make CC=false test-tables' FAILS (fresh keyed build dir forces a real compile attempt; stale-binary false-pass repro stays closed)"
+fi
+rm -f "$SP13_LOG2"
+
+assert_cmd_fails_with "SP-S13: 'make CFLAGS=-O0 test-tables' rejected at parse time" "cannot be overridden" \
+  make -C "$RNN_DIR" CFLAGS=-O0 test-tables
+
+make -s -C "$RNN_DIR" clean >/dev/null
+
+if [ -n "$INTEGRITY_BEFORE" ]; then
+  INTEGRITY_AFTER="$(git -C "$INTEGRITY_ROOT" status --porcelain | shasum -a 256)"
+  [ "$INTEGRITY_BEFORE" = "$INTEGRITY_AFTER" ] && \
+    pass "INTEGRITY: git status --porcelain for $INTEGRITY_ROOT unchanged across the full run" \
+    || fail "INTEGRITY: git status --porcelain for $INTEGRITY_ROOT CHANGED across the run (this script, or something concurrent, mutated tracked-file state)"
+fi
 
 echo "############################################################"
 echo "SUMMARY: $PASS_COUNT passed, $FAIL_COUNT failed"
