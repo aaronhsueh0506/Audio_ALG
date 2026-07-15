@@ -337,6 +337,41 @@ still be authored and submitted for sign-off; every `board_mem_*` function
 in that file is a plain host-array stand-in, marked `// BOARD:` wherever
 real platform code belongs instead.
 
+### Cross-compile / board build (round-4 review P1-2)
+
+The board deliverable is built with `make publish BACKEND=ne10` and consumed
+from the stable `dist/ne10/current/` path (immutable, content-addressed
+release dirs + MANIFEST with per-file SHA-256). When cross-compiling, pass
+the **full toolchain, not just CC** — BACKEND=ne10 compiles one C++ TU
+(NE10's generic-radix kernel), so a partial override would mix host-built
+C++ objects into a cross build and then try to link ARM objects with the
+host driver:
+
+```bash
+make publish BACKEND=ne10 \
+     CC=aarch64-linux-gnu-gcc \
+     CXX=aarch64-linux-gnu-g++ \
+     AR=aarch64-linux-gnu-ar \
+     RANLIB=aarch64-linux-gnu-ranlib \
+     EXTRA_CFLAGS='-mcpu=cortex-a53'      # or -mcpu=cortex-a73
+```
+
+Guard rails (all four repos, round-4 review):
+
+- **CC/CXX target-coherence check**: every BACKEND=ne10 build compares
+  `$(CC) -dumpmachine` against `$(CXX) -dumpmachine` and hard-fails on
+  mismatch (exactly the partial-toolchain mistake above). `TOOLCHAIN_CHECK=0`
+  skips it (participates in the config signature).
+- **`CFLAGS=`/`CXXFLAGS=`/`LDFLAGS=`/`CPPFLAGS=`/`FP_POLICY=` cannot be
+  overridden on the make command line** — doing so would silently drop the
+  repo-pinned flags (`-ffp-contract=off`, backend defines, `NO_STDIO`); the
+  build errors out and points at `EXTRA_CFLAGS`/`EXTRA_LDFLAGS`, the two
+  supported hooks. `EXTRA_CFLAGS` containing `-Ofast`/`-ffast-math`/
+  `-ffp-contract=` is likewise rejected (FP-policy conflict, round-3 B04).
+- **C++ runtime comes from the C++ driver** (`libstdc++` on GNU/Linux gcc,
+  `libc++` on macOS/clang) — there is no hardcoded `-lc++` anywhere any
+  more, so GNU toolchains link cleanly.
+
 ### Sequence
 
 ```

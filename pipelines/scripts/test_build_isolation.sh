@@ -16,9 +16,12 @@
 #        archive really has no stdio refs, its path really differs from the
 #        default config's, and running the audit never mutates the default
 #        (stdio) archive.
-#   S7:  publish v2 -- MANIFEST sha self-consistency, the `current` symlink
+#   S7:  publish v3 -- MANIFEST sha self-consistency, the `current` symlink
 #        resolves to a complete release dir, concurrent same-backend
-#        publishes serialise via the mkdir lock.
+#        publishes serialise via the mkdir lock. (Layout-agnostic: resolves
+#        the release dir only via `readlink dist/<backend>/current`, so it
+#        did not need updating when publish moved v2->v3 -- see SP-S11 for
+#        the round-4-specific new MANIFEST fields/idempotency semantics.)
 #   SP1: pipeline-level A->B->A (kiss -> ne10 -> kiss) -- each build's
 #        delivered aec_nr_pipeline links backend-correct FFT symbols, and the
 #        third (kiss) build is NOT relinked (mtime stable).
@@ -26,6 +29,31 @@
 #        relinks the pipeline binary; touching audio_common/include/
 #        fast_math.h recompiles the AEC/NR objects that include it AND
 #        relinks the pipeline binary (the full transitive header chain).
+#
+#   -- round-4 review scenarios (cross-repo: this Makefile + lib/aec's +
+#      lib/nr's, all three upgraded together) --
+#   SP-S9:  command-line override rejection (round-4 review P1-1) --
+#           CFLAGS=/CXXFLAGS=/CPPFLAGS=/LDFLAGS=/FP_POLICY= on the command
+#           line fail at PARSE time (mentioning "cannot be overridden") in
+#           this Makefile, lib/aec's, and lib/nr's alike; EXTRA_CFLAGS is
+#           unaffected and still keys to its own obj dir.
+#   SP-S10: lib/aec fresh-archive discipline (round-4 review P1-4) -- a
+#           foreign member `ar r`'d into a built libaec.a does not survive a
+#           rebuild triggered by touching one small source file (the real
+#           discipline is $@.tmp then `mv -f`, never `ar r` onto the
+#           existing archive); its obj-dir config.manifest records SRCS=.
+#   SP-S11: pipelines publish v3 release layout (round-4 review P2-2) --
+#           content-addressed dist/<backend>/<cfg_sig>-<content12>/ release
+#           dirs, resolved ONLY via `readlink dist/<backend>/current` (never
+#           a hardcoded id); MANIFEST.txt's new release_id=/git_dirty=/ar=/
+#           ranlib=/link= fields; idempotent republish prints "already
+#           published" and leaves the release dir byte- and mtime-untouched,
+#           only repointing `current`.
+#   SP-S12: BACKEND=ne10 CC/CXX toolchain-coherence guard fires through the
+#           dispatch (round-4 review P1-2) -- a CXX shim that deliberately
+#           answers `-dumpmachine` with a bogus triple fails a BACKEND=ne10
+#           build (mentioning "different targets") but not a BACKEND=kiss
+#           one (the guard is ne10-only, since only ne10 links a C++ TU).
 #
 # Design rules (same as audio_common's script -- do not violate when editing):
 #   - No `make clean` inside any scenario body: distinct configs must coexist
@@ -63,6 +91,27 @@ fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); FAILURES+=("$*"); echo "  FAIL: $*" >&2
 
 file_sha() { shasum -a 256 "$1" | awk '{print $1}'; }
 mtime()    { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1"; }
+
+# assert_cmd_fails_with <description> <expected-substring> <cmd...> (round-4
+# review scenarios SP-S9/SP-S12) -- runs <cmd...> with stdout+stderr merged;
+# PASS iff it exits non-zero AND the combined output contains
+# <expected-substring>; FAIL (dumping the log) otherwise -- either because it
+# unexpectedly succeeded, or failed without the expected message.
+assert_cmd_fails_with() {
+  local desc="$1" needle="$2" log
+  shift 2
+  log="$(mktemp)"
+  if "$@" >"$log" 2>&1; then
+    fail "$desc -- command unexpectedly SUCCEEDED"
+    cat "$log" >&2
+  elif grep -q -- "$needle" "$log"; then
+    pass "$desc"
+  else
+    fail "$desc -- failed, but without the expected message ('$needle')"
+    cat "$log" >&2
+  fi
+  rm -f "$log"
+}
 
 # resolve_producers <backend> -- resolves audio_common's/lib-aec's/lib-nr's
 # archive paths for <backend> (default flags otherwise), exactly the way
@@ -235,6 +284,135 @@ m_after="$(mtime "$bd_k/aec_nr_pipeline")"
   || fail "SP2: mcra_noise_estimator.o did NOT recompile after touching fast_math.h"
 [ "$m_after" != "$m_before" ] && pass "SP2: touching audio_common/include/fast_math.h relinked aec_nr_pipeline (full transitive chain)" \
   || fail "SP2: aec_nr_pipeline NOT relinked after fast_math.h touch"
+
+echo "############################################################"
+echo "# SP-S9: command-line override rejection across the stack"
+echo "############################################################"
+assert_cmd_fails_with "SP-S9: pipelines 'make CFLAGS=-O3' rejected at parse time" "cannot be overridden" \
+  make BACKEND=kiss CFLAGS=-O3 print-obj-dir
+
+assert_cmd_fails_with "SP-S9: pipelines 'make FP_POLICY=-ffp-contract=fast' rejected at parse time" "cannot be overridden" \
+  make BACKEND=kiss FP_POLICY=-ffp-contract=fast print-obj-dir
+
+assert_cmd_fails_with "SP-S9: lib/aec 'make CFLAGS=-O3' rejected at parse time" "cannot be overridden" \
+  make -C "$AEC_DIR" BACKEND=kiss CFLAGS=-O3 print-obj-dir
+
+assert_cmd_fails_with "SP-S9: lib/nr 'make LDFLAGS=-lfoo' rejected at parse time" "cannot be overridden" \
+  make -C "$NR_DIR" BACKEND=kiss LDFLAGS=-lfoo print-obj-dir
+
+sp9_plain_objdir="$(make -s BACKEND=kiss print-obj-dir)"
+sp9_probe_objdir="$(make -s BACKEND=kiss EXTRA_CFLAGS=-DSP9_PROBE print-obj-dir)"
+[ -n "$sp9_probe_objdir" ] && pass "SP-S9: pipelines EXTRA_CFLAGS=-DSP9_PROBE print-obj-dir SUCCEEDED" \
+  || fail "SP-S9: pipelines EXTRA_CFLAGS=-DSP9_PROBE print-obj-dir produced no output"
+[ "$sp9_probe_objdir" != "$sp9_plain_objdir" ] && pass "SP-S9: EXTRA_CFLAGS=-DSP9_PROBE obj dir differs from the plain-query obj dir" \
+  || fail "SP-S9: EXTRA_CFLAGS=-DSP9_PROBE obj dir COLLIDES with the plain-query obj dir ($sp9_plain_objdir)"
+
+echo "############################################################"
+echo "# SP-S10: lib/aec archive freshness (fresh-archive discipline)"
+echo "############################################################"
+make -s -C "$AEC_DIR" BACKEND=kiss lib >/dev/null
+aec_lib_path="$(make -s -C "$AEC_DIR" BACKEND=kiss print-lib-path)"
+[ -f "$aec_lib_path" ] && pass "SP-S10: lib/aec archive built ($aec_lib_path)" \
+  || fail "SP-S10: lib/aec archive missing after 'make lib'"
+
+SP10_TMPDIR="$(mktemp -d)"
+cat > "$SP10_TMPDIR/sp10_foreign.c" <<'EOF'
+int sp10_foreign_symbol(void) { return 0; }
+EOF
+cc -c -o "$SP10_TMPDIR/sp10_foreign.o" "$SP10_TMPDIR/sp10_foreign.c"
+ar r "$aec_lib_path" "$SP10_TMPDIR/sp10_foreign.o"
+ar -t "$aec_lib_path" | grep -qx 'sp10_foreign.o' && pass "SP-S10: foreign member injected into libaec.a (setup)" \
+  || fail "SP-S10: foreign member injection FAILED (setup problem, not the thing under test)"
+
+sleep 1
+touch "$AEC_DIR/src/aec_debug.c"
+make -s -C "$AEC_DIR" BACKEND=kiss lib >/dev/null
+
+if ar -t "$aec_lib_path" | grep -qx 'sp10_foreign.o'; then
+  fail "SP-S10: foreign member SURVIVED a rebuild (archive was NOT rebuilt fresh -- looks like 'ar r' onto the existing .a rather than \$@.tmp + mv -f)"
+else
+  pass "SP-S10: foreign member is GONE after rebuild (fresh-archive discipline: \$@.tmp + mv -f)"
+fi
+ar -t "$aec_lib_path" | grep -qx 'aec_debug.o' && pass "SP-S10: aec_debug.o present in the freshly-rebuilt archive" \
+  || fail "SP-S10: aec_debug.o missing from the freshly-rebuilt archive"
+rm -rf "$SP10_TMPDIR"
+
+aec_objdir="$(make -s -C "$AEC_DIR" BACKEND=kiss print-obj-dir)"
+grep -q 'SRCS=' "$aec_objdir/config.manifest" && pass "SP-S10: lib/aec's obj-dir config.manifest records a SRCS= entry" \
+  || fail "SP-S10: lib/aec's obj-dir config.manifest missing a SRCS= entry"
+
+echo "############################################################"
+echo "# SP-S11: pipelines publish v3 (content-addressed release dirs)"
+echo "############################################################"
+rm -rf dist
+resolve_producers kiss
+make -s BACKEND=kiss publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
+
+id1="$(readlink dist/kiss/current || true)"
+[ -n "$id1" ] && [ -d "dist/kiss/$id1" ] && pass "SP-S11: publish v3 -- current symlink resolves to release dir '$id1'" \
+  || fail "SP-S11: publish v3 -- current symlink broken or missing after the first publish"
+
+grep -q "^release_id=$id1\$" "dist/kiss/$id1/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt release_id= matches the release dir name" \
+  || fail "SP-S11: MANIFEST.txt release_id= missing or does not match '$id1'"
+grep -q '^git_dirty=' "dist/kiss/$id1/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt has a git_dirty= line" \
+  || fail "SP-S11: MANIFEST.txt missing a git_dirty= line"
+grep -q '^ac_producer_cfg_sig=' "dist/kiss/$id1/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt has an ac_producer_cfg_sig= line" \
+  || fail "SP-S11: MANIFEST.txt missing an ac_producer_cfg_sig= line"
+grep -q '^aec_git_commit=' "dist/kiss/$id1/MANIFEST.txt" && pass "SP-S11: MANIFEST.txt has an aec_git_commit= line" \
+  || fail "SP-S11: MANIFEST.txt missing an aec_git_commit= line"
+grep -q '^ar=' "dist/kiss/$id1/MANIFEST.txt" && grep -q '^ranlib=' "dist/kiss/$id1/MANIFEST.txt" && grep -q '^link=' "dist/kiss/$id1/MANIFEST.txt" && \
+  pass "SP-S11: MANIFEST.txt has ar=/ranlib=/link= lines" \
+  || fail "SP-S11: MANIFEST.txt missing one or more of ar=/ranlib=/link="
+
+release_dir_mtime_before="$(mtime "dist/kiss/$id1")"
+
+S11_LOG="$(mktemp)"
+make -s BACKEND=kiss publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S11_LOG" 2>&1
+if grep -q "already published" "$S11_LOG"; then
+  pass "SP-S11: idempotent republish printed 'already published (identical content)'"
+else
+  fail "SP-S11: idempotent republish did NOT print 'already published'"
+  cat "$S11_LOG" >&2
+fi
+rm -f "$S11_LOG"
+
+id2="$(readlink dist/kiss/current || true)"
+[ "$id2" = "$id1" ] && pass "SP-S11: current still points at the same release id after idempotent republish" \
+  || fail "SP-S11: current MOVED after idempotent republish ('$id1' -> '$id2')"
+
+release_dir_mtime_after="$(mtime "dist/kiss/$id1")"
+[ "$release_dir_mtime_before" = "$release_dir_mtime_after" ] && pass "SP-S11: release dir left untouched by idempotent republish (mtime stable)" \
+  || fail "SP-S11: release dir mtime CHANGED by idempotent republish ($release_dir_mtime_before -> $release_dir_mtime_after)"
+
+rm -rf dist
+
+echo "############################################################"
+echo "# SP-S12: BACKEND=ne10 toolchain guard fires through the dispatch"
+echo "############################################################"
+SP12_DIR="$(mktemp -d)"
+SP12_SHIM="$SP12_DIR/sp12-cxx-shim"
+cat > "$SP12_SHIM" <<'SHIM_EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-dumpmachine" ]; then
+  echo "sp12-wrong-triple"
+else
+  exec c++ "$@"
+fi
+SHIM_EOF
+chmod +x "$SP12_SHIM"
+
+assert_cmd_fails_with "SP-S12: BACKEND=ne10 with a CXX whose -dumpmachine disagrees with CC's is rejected" "different targets" \
+  make BACKEND=ne10 CXX="$SP12_SHIM" libaudio_pipeline.a
+
+S12_LOG="$(mktemp)"
+if make BACKEND=kiss CXX="$SP12_SHIM" libaudio_pipeline.a >"$S12_LOG" 2>&1; then
+  pass "SP-S12: BACKEND=kiss with the same mismatched-triple CXX shim still SUCCEEDS (guard is ne10-only)"
+else
+  fail "SP-S12: BACKEND=kiss build unexpectedly FAILED with the CXX shim in place"
+  cat "$S12_LOG" >&2
+fi
+rm -f "$S12_LOG"
+rm -rf "$SP12_DIR"
 
 echo "############################################################"
 echo "SUMMARY: $PASS_COUNT passed, $FAIL_COUNT failed"
