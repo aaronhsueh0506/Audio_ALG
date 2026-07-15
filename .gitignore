@@ -55,7 +55,10 @@ pipelines/libaudio_pipeline.a
 lib/hpf/obj/
 *.o
 
-# pipelines/Makefile's own hash-keyed object dir (obj/<backend>-<config-hash>/,
-# one subdirectory per distinct BACKEND/EXTRA_CFLAGS/WERROR combination --
-# see the OBJ_DIR/CFG_SIG comment in that Makefile)
+# pipelines/Makefile's own hash-keyed object AND binary dirs (obj|bin/
+# <backend>-<config-hash>/, one subdirectory per distinct BACKEND/WERROR/
+# NO_STDIO/... combination -- see the OBJ_DIR/BIN_DIR/CFG_SIG comment in that
+# Makefile; round-3 review B01). pipelines/dist/ (publish's immutable release
+# dir) is already covered by the generic `dist/` entry above.
 pipelines/obj/
+pipelines/bin/

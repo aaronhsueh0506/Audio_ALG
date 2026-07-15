@@ -16,21 +16,75 @@
 # All three link against the submodule libs (lib/aec, lib/nr) + the shared
 # audio_common FFT/fast_math layer (../../audio_common relative to this dir).
 #
+# =============================================================================
+# Build isolation (round-3 review B01) — the fourth and last of four repos
+# =============================================================================
+# This repo is a CONSUMER of THREE producer archives (audio_common's
+# libaudio_common.a, lib/aec's libaec.a, lib/nr's libmmse_lsa.a), each of
+# which is itself CFG_SIG-keyed (see those repos' own Makefiles). The design
+# here is the same two-phase recursive-make dispatch AEC/NR already use for
+# their ONE producer (audio_common), extended to resolve THREE:
+#
+#   Phase 1 (AC_LIB unset — the normal case for any top-level `make ...`):
+#   a goal that needs any producer archive gets a recipe that queries, IN
+#   ORDER, audio_common's, then lib/aec's, then lib/nr's own `print-lib-path`
+#   (forwarding this invocation's exact BACKEND/WERROR/CC/CXX/EXTRA_CFLAGS/
+#   NO_STDIO — and, for the lib/aec and lib/nr queries, ALSO the just-resolved
+#   AC_DIR/AC_LIB, so THEIR OWN two-phase dispatch resolves directly instead
+#   of re-deriving it) and re-invokes itself with AC_LIB/AEC_LIB/NR_LIB set.
+#
+#   Phase 2 (AC_LIB known): the REAL rules are defined. Each producer archive
+#   is a FORCE-recipe target (always re-invokes that producer's own build,
+#   which is a no-op if already up to date, then asserts the archive exists)
+#   and a NORMAL (not order-only) prerequisite of every rule that links
+#   against it — so relinking happens iff a producer's archive mtime actually
+#   advanced.
+#
+# This repo's own objects/binaries are ALSO hash-keyed the same way
+# (obj|bin/<backend>-<cfg_sig>/) — CFG_SIG folds in this Makefile's own full
+# flag coverage (CC/CXX/AR/RANLIB/CFLAGS/CXXFLAGS/CPPFLAGS/LDFLAGS/
+# EXTRA_CFLAGS/EXTRA_LDFLAGS/BACKEND/WERROR/NO_STDIO/DEBUG) PLUS the three
+# resolved producers' own config identities (AC_PRODUCER_SIG/AEC_PRODUCER_SIG/
+# NR_PRODUCER_SIG — each just the last path component of that producer's
+# resolved archive dir, e.g. "kiss-1234567890", never the full path) — so a
+# pipeline build against a differently-configured producer keys to its own
+# separate directory too, instead of risking silent config skew.
+#
 # Usage:
-#   make                       # builds libs (BACKEND=kiss) + both binaries
-#                              # (+ libaudio_pipeline.a as a side effect)
-#   make BACKEND=ne10          # NE10 backend -- objects are hash-keyed per
-#                              # (BACKEND, EXTRA_CFLAGS, WERROR) in each of
-#                              # this file's and the submodules' Makefiles,
-#                              # so switching any of them always lands in a
-#                              # fresh object directory automatically; no
-#                              # manual clean needed, ever (make clean-all
-#                              # still works, just isn't required)
-#   make EXTRA_CFLAGS="..."    # see the EXTRA_CFLAGS block below
+#   make                       # resolves+builds all three producer archives
+#                              # (BACKEND=kiss) + both pipeline binaries
+#   make BACKEND=ne10          # NE10 backend -- every axis this file and the
+#                              # three producers' own Makefiles key on
+#                              # (BACKEND, EXTRA_CFLAGS, WERROR, NO_STDIO, ...)
+#                              # lands in a fresh, separate obj|bin directory
+#                              # automatically; no manual clean needed, ever
+#   make EXTRA_CFLAGS="..."    # forwarded to all three producers AND this
+#                              # pipeline's own compile
 #   make WERROR=1              # opt-in: -Werror for this file's own TUs
 #   make test                  # build + run test_audio_pipeline (audio_pipeline.h
 #                              # acceptance tests -- see that file's header)
-#   make clean                 # remove the pipeline binaries/objects/archive
+#   make NO_STDIO=1 libaudio_pipeline.a   # board-firmware stdio-less build of
+#                              # JUST the library object (see the NO_STDIO
+#                              # comment further down) -- does not link, so it
+#                              # needs none of the three producer archives
+#   make audit-no-stdio        # PASS/FAIL gate: proves the delivered
+#                              # NO_STDIO=1 libaudio_pipeline.a really has no
+#                              # fprintf/printf/puts/fputs/stderr refs, and
+#                              # that its keyed path differs from the default
+#                              # (stdio) config's path
+#   make print-bin-dir | print-obj-dir | print-lib-path
+#                              # report THIS invocation's own keyed paths (see
+#                              # the query-targets comment further down for
+#                              # how to get the exact path `make all` itself
+#                              # would produce)
+#   make publish               # copy this build's artifacts to
+#                              # dist/<backend>/<cfg_sig>/ + update
+#                              # dist/<backend>/current (see that section)
+#   make libs                  # compat alias: builds just the three producer
+#                              # archives (no pipeline objects/binaries)
+#   make clean                 # remove this dir's own obj/bin trees + any
+#                              # legacy flat binaries/archive left over from
+#                              # before this directory layout existed
 #   make clean-all             # also clean lib/aec, lib/nr, audio_common build
 #                              # dirs (clean-libs is a compatibility alias)
 
@@ -40,27 +94,46 @@ NR_DIR  = ../lib/nr/c_impl
 # audio_common sits two levels up from pipelines/ (SE/Audio_ALG/pipelines -> SE/audio_common).
 # lib/aec/c_impl and lib/nr/c_impl each resolve it themselves from their own
 # location (../../../../audio_common from c_impl/, verified to exist as a
-# submodule checkout); AC_DIR here is for OUR OWN CFLAGS/LDFLAGS and is passed
-# through explicitly to the sub-makes so all three always agree on the path.
+# submodule checkout); AC_DIR here is for OUR OWN CFLAGS/-I path and is passed
+# through explicitly (as AC_DIR=$(abspath $(AC_DIR))) to the lib/aec and
+# lib/nr sub-makes so all three always agree on the exact same audio_common
+# checkout.
 AC_DIR ?= ../../audio_common
 BACKEND ?= kiss
 
 CC  ?= gcc
 CXX ?= c++
+AR      ?= ar
+RANLIB  ?= ranlib
 
-# EXTRA_CFLAGS — pass-through to the AEC/NR lib sub-builds AND this pipeline's
-# own compile (both submodule Makefiles already do `CFLAGS += $(EXTRA_CFLAGS)`,
-# so one EXTRA_CFLAGS on this top-level `make` reaches every .o for the build).
-# The fast matched-filter arithmetic and delay-estimator duty-cycling are
-# built in unconditionally (no flag) — see lib/aec/c_impl/src/delay_aec3.c.
+# CFG_SIG payload-coverage placeholders (round-3 review B01): CXXFLAGS/
+# CPPFLAGS/DEBUG are not consumed by this Makefile today (no C++ TU of its
+# own, no DEBUG-gated code path here), but the CFG_SIG payload below
+# unconditionally includes them so the payload string has the same stable
+# shape as audio_common's/AEC's/NR's, and so a future use of any of them here
+# keys builds correctly instead of silently aliasing with a build that didn't
+# set it. EXTRA_LDFLAGS/NO_STDIO are real here (see LDFLAGS/LIB_CFLAGS below).
+CXXFLAGS      ?=
+CPPFLAGS      ?=
+EXTRA_LDFLAGS ?=
+NO_STDIO      ?= 0
+DEBUG         ?= 0
+
+# EXTRA_CFLAGS — pass-through to the AEC/NR/audio_common producer builds AND
+# this pipeline's own compile (all three producers' own Makefiles already do
+# `CFLAGS += $(EXTRA_CFLAGS)`, so one EXTRA_CFLAGS on this top-level `make`
+# reaches every .o for the whole build). The fast matched-filter arithmetic
+# and delay-estimator duty-cycling are built in unconditionally (no flag) —
+# see lib/aec/c_impl/src/delay_aec3.c.
 #
-# Switching EXTRA_CFLAGS (or BACKEND, or WERROR) never needs a manual
-# `make clean-libs` first: this Makefile's own objects are hash-keyed by
-# config (see the OBJ_DIR/CFG_SIG comment further down), and lib/aec's and
-# lib/nr's own Makefiles independently key their objects off the same
-# BACKEND/EXTRA_CFLAGS/WERROR axes -- a stale, differently-flagged .o simply
-# can't exist under the new path a config produces. `make clean-libs`/
-# `clean-all` remain available but are no longer required for correctness.
+# Switching EXTRA_CFLAGS (or BACKEND, or WERROR, or NO_STDIO) never needs a
+# manual `make clean-libs` first: this Makefile's own objects/binaries are
+# hash-keyed by config (see the OBJ_DIR/BIN_DIR/CFG_SIG section below), and
+# lib/aec's, lib/nr's, and audio_common's own Makefiles independently key
+# their objects/archives off the same axes -- a stale, differently-flagged
+# .o/.a simply can't exist under the new path a config produces.
+# `make clean-libs`/`clean-all` remain available but are no longer required
+# for correctness.
 EXTRA_CFLAGS ?=
 
 # -ffp-contract=off: same FMA-contraction policy as the AEC library TUs.
@@ -83,8 +156,8 @@ CFLAGS += $(EXTRA_CFLAGS)
 
 # -Werror opt-in for this Makefile's OWN TUs (default off; CI can flip it
 # on with `make WERROR=1`). Vendor code (audio_common's NE10/KISS) is built by
-# audio_common's own Makefile (see `libs:` below), not by rules in this file,
-# so no separate warning isolation is needed on this side.
+# audio_common's own Makefile, not by rules in this file, so no separate
+# warning isolation is needed on this side.
 WERROR ?= 0
 ifeq ($(WERROR),1)
   CFLAGS += -Werror
@@ -102,7 +175,6 @@ endif
 # its own PASS/FAIL via stdio unconditionally -- neither references
 # AUDIO_PIPELINE_NO_STDIO, so there is nothing to gain (and a real loss of
 # CLI diagnostics) from adding the define to their compiles.
-NO_STDIO ?= 0
 LIB_CFLAGS = $(CFLAGS)
 ifeq ($(NO_STDIO),1)
   LIB_CFLAGS += -DAUDIO_PIPELINE_NO_STDIO
@@ -117,111 +189,161 @@ ifeq ($(BACKEND),ne10)
   LDFLAGS_EXTRA = -lc++
 endif
 
-# Link order matters: pipeline.o, libaudio_pipeline.a, libaec.a, libmmse_lsa.a,
-# libaudio_common.a, -lm. libaudio_pipeline.a (review F20) holds ONLY the
-# pipeline TU (audio_pipeline.o) -- it is not a bundled/fat archive, so it
-# still needs libaec.a/libmmse_lsa.a/libaudio_common.a linked after it, same
-# as when audio_pipeline.c's logic was file-local code inside each CLI's own
-# .o.
-LIBS = ./libaudio_pipeline.a \
-       $(AEC_DIR)/bin/libaec.a \
-       $(NR_DIR)/bin/libmmse_lsa.a \
-       $(AC_DIR)/bin/$(BACKEND)/libaudio_common.a
-LDFLAGS = $(LIBS) -lm $(LDFLAGS_EXTRA)
+# LDFLAGS is now just link FLAGS (-lm plus whatever EXTRA_LDFLAGS adds) --
+# NOT the three producer archive paths. Those are resolved dynamically (see
+# the two-phase dispatch below) and appended directly to each link recipe's
+# own prerequisite list / command line, in the fixed order the old
+# hardcoded LIBS variable used: pipeline.o, libaudio_pipeline.a, libaec.a,
+# libmmse_lsa.a, libaudio_common.a, -lm. libaudio_pipeline.a (review F20)
+# holds ONLY the pipeline TU (audio_pipeline.o) -- it is not a bundled/fat
+# archive, so it still needs libaec.a/libmmse_lsa.a/libaudio_common.a linked
+# after it, same as when audio_pipeline.c's logic was file-local code inside
+# each CLI's own .o.
+LDFLAGS = -lm $(LDFLAGS_EXTRA)
+LDFLAGS += $(EXTRA_LDFLAGS)
 
-# --- Hash-keyed object directory (build hygiene) ----------------------------
-# This Makefile used to keep fixed .o names (aec_nr_pipeline.o,
-# aec_nr_pipeline_static.o, audio_pipeline.o, test_audio_pipeline.o) directly
-# in this directory (which also holds the Makefile, scripts, docs, etc.), so
-# switching BACKEND or EXTRA_CFLAGS on an already-built tree needed
-# `make clean-libs` by hand first or a stale, differently-flagged .o would
-# silently persist. CFG_SIG hashes the exact compiler invocation that
-# produces every one of this Makefile's own objects, and OBJ_DIR (below)
-# embeds it directly: every distinct (BACKEND, CFLAGS, EXTRA_CFLAGS, WERROR)
-# combination gets its own directory, automatically -- no manual clean ever
-# required, and two differently-configured builds can run concurrently in
-# this same tree without stomping each other's objects. OBJ_ROOT is the
-# whole obj/ tree (every config) -- used by `clean` to nuke everything, not
-# just the current config's subdirectory. The final binaries/archive
-# (aec_nr_pipeline, aec_nr_pipeline_static, libaudio_pipeline.a,
-# test_audio_pipeline) stay flat at the top of this directory, same as
-# before: last-write-wins wholes, not config-keyed.
+.DEFAULT_GOAL := all
+
+# =============================================================================
+# Consumer two-phase, THREE-producer resolution (round-3 review B01)
+# =============================================================================
+# Problem this replaces: the old Makefile hardcoded
+#   LIBS = ./libaudio_pipeline.a $(AEC_DIR)/bin/libaec.a \
+#          $(NR_DIR)/bin/libmmse_lsa.a $(AC_DIR)/bin/$(BACKEND)/libaudio_common.a
+# and a `libs:` phony that unconditionally ran three sub-makes with only
+# BACKEND/EXTRA_CFLAGS/WERROR forwarded. Two problems: (1) all three
+# producers' own bin/ dirs are now CFG_SIG-keyed, so there is no fixed path
+# to hardcode any more; (2) config skew -- a producer built with a different
+# CC/CXX/NO_STDIO than THIS invocation's own could be silently linked in
+# without that showing up in this repo's own build identity.
 #
-# CFG_SIG MUST be defined here, before any rule below mentions $(OBJ_DIR) (or
-# a path under it, e.g. `libaudio_pipeline.a: $(OBJ_DIR)/audio_pipeline.o`):
-# GNU Make expands a rule's target/prerequisite list IMMEDIATELY when that
-# line is parsed, not deferred like a recipe body, so a forward reference
-# would silently resolve using CFG_SIG's value at THAT point in the file
-# (empty, if this line hadn't run yet) -- verified empirically with a
-# minimal reproduction.
+# The fix is the same two-phase recursive-make dispatch AEC/NR use for their
+# ONE producer, extended to THREE, driven by whether AC_LIB is already known:
 #
-# There is no parse-time comparison and nothing is ever deleted to "detect"
-# a config change (the previous scheme did a $(shell rm -f ...)/$(shell
-# echo ...) unconditionally while the Makefile was being read, which
-# mutated the filesystem even under `make -n` and raced two concurrent
-# builds with different flags against each other's shared, un-keyed .o
-# names). Under this scheme `make -n` touches nothing on disk (CFG_SIG is a
-# pure string hash) and two differently-configured builds (e.g.
-# `make BACKEND=kiss -j4 & make BACKEND=ne10 -j4 & wait`) can run
-# concurrently in this same tree: each lands in its own obj/<backend>-<sig>/
-# directory and never touches the other's objects. OBJ_DIR's own creation
-# happens lazily via the order-only prerequisite on the compile rules below
-# ($(OBJ_DIR)/%.o: ... | $(OBJ_DIR)), not at Makefile-parse time.
+#   Phase 1 (AC_LIB unset): a goal that needs any producer archive gets a
+#   recipe that resolves audio_common's archive path first (needed by both
+#   lib/aec's and lib/nr's OWN two-phase dispatch -- see the AC_DIR=/AC_LIB=
+#   forwarding below), then lib/aec's, then lib/nr's, and re-invokes itself
+#   with all three set.
 #
-# cksum (POSIX -- present on macOS/BSD/GNU/busybox, unlike shasum which is a
-# GNU coreutils extension and may be absent from slim embedded build images)
-# computes the hash. On stdin it prints "<checksum> <byte-count>" with no
-# filename field (verified on macOS's BSD cksum), so `cut -d' ' -f1` isolates
-# just the checksum.
-# NO_STDIO is folded in here (even though it only ever changes LIB_CFLAGS,
-# i.e. only audio_pipeline.o's own compile) so that flipping it still lands
-# in a fresh OBJ_DIR like every other axis this Makefile keys on -- without
-# this, a NO_STDIO=1 build and a NO_STDIO=0 (default) build of the OTHER
-# three objects (both CLIs' .o + test_audio_pipeline.o, which never see
-# LIB_CFLAGS) would otherwise share one directory, which is harmless for
-# THOSE objects (their recipe never varies with NO_STDIO) but breaks the
-# "OBJ_DIR uniquely names a config" invariant `make audit-no-stdio` (below)
-# relies on to find audio_pipeline.o's own NO_STDIO=1 build deterministically.
-CFG_SIG := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO)" | cksum | cut -d' ' -f1)
+#   Phase 2 (AC_LIB known): the REAL rules are defined, with $(AC_LIB)/
+#   $(AEC_LIB)/$(NR_LIB) as NORMAL (not order-only) prerequisites of the
+#   binaries that link against them -- so relinking happens iff a producer's
+#   archive mtime actually advanced.
+#
+# Goals that never need any producer archive (`libaudio_pipeline.a` -- this
+# repo's OWN library TU never links anything; `audit-no-stdio` -- builds only
+# that same library object; `clean`/`clean-all`; the print-*/help query
+# targets) get their real rules OUTSIDE this dispatch entirely, further down
+# this file -- invoking any of them never shells out to any of the three
+# producers.
+#
+# `make -n`: see AEC's/NR's Makefile comments for why the dispatch recipe's
+# sub-`make` calls are genuinely spawned even under `make -n` (GNU Make
+# always executes, never merely prints, a recipe line that textually
+# mentions $(MAKE)) yet still create zero files (verified empirically): -n
+# propagates to every child `make` via MAKEFLAGS regardless of how it was
+# invoked, so each child's own recipes are themselves just printed.
+#
+# lib/aec's and lib/nr's own Makefiles fold AC_LIB into THEIR OWN CFG_SIG
+# (as AC_PRODUCER_SIG) REGARDLESS of which of their targets is being built --
+# even their `lib` target, which itself never links audio_common's archive
+# (see those Makefiles: AC_PRODUCER_SIG is computed unconditionally whenever
+# AC_LIB is non-empty, before their own CFG_SIG_PAYLOAD is assembled). So
+# AC_DIR=$(abspath $(AC_DIR)) AC_LIB=<resolved path> MUST be forwarded to
+# every lib/aec / lib/nr sub-make below (both the query calls and the real
+# `lib` build calls in the FORCE rules further down) -- otherwise a `lib`
+# build invoked without AC_LIB would land in a DIFFERENT (AC_PRODUCER_SIG-less)
+# keyed directory than the one this Makefile's query call resolved, and the
+# "does $(AEC_LIB) exist" assertion in that FORCE rule would fail.
+FWD = BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO)
+
+ifeq ($(AC_LIB),)
+.PHONY: all test libs publish aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline
+all test libs publish aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline:
+	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
+	 test -n "$$ac" || { echo "FATAL: could not resolve audio_common archive path (AC_DIR=$(AC_DIR) -- is audio_common present as a sibling of Audio_ALG?)" >&2; exit 1; }; \
+	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+	 test -n "$$aec" || { echo "FATAL: could not resolve lib/aec archive path (AEC_DIR=$(AEC_DIR))" >&2; exit 1; }; \
+	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+	 test -n "$$nr" || { echo "FATAL: could not resolve lib/nr archive path (NR_DIR=$(NR_DIR))" >&2; exit 1; }; \
+	 $(MAKE) --no-print-directory $@ AC_LIB="$$ac" AEC_LIB="$$aec" NR_LIB="$$nr"
+else
+# Producer-identity components of this consumer's own CFG_SIG (see AEC's/
+# NR's Makefiles for the full rationale): the LAST path component of each
+# resolved archive's directory (e.g. "kiss-2139547423"), NEVER the full
+# (absolute) path -- so a pipeline build against a DIFFERENTLY-configured
+# producer keys to its own separate obj/bin directory here too, instead of
+# risking silent config skew. AC_DIR/AEC_DIR/NR_DIR themselves (abspaths,
+# used only as -C arguments to the sub-makes) never appear in any payload or
+# manifest -- only these short backend-sig components do.
+AC_PRODUCER_SIG  := $(notdir $(patsubst %/,%,$(dir $(AC_LIB))))
+AEC_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(AEC_LIB))))
+NR_PRODUCER_SIG  := $(notdir $(patsubst %/,%,$(dir $(NR_LIB))))
+endif
+
+# --- Hash-keyed object/binary directory + full-coverage CFG_SIG ------------
+# obj/<backend>-<sig> AND bin/<backend>-<sig> -- see audio_common's Makefile
+# for the full design rationale (identical mechanism, applied here). Payload
+# coverage (USER-MANDATED): CC CXX AR RANLIB CFLAGS CXXFLAGS CPPFLAGS LDFLAGS
+# EXTRA_CFLAGS EXTRA_LDFLAGS BACKEND WERROR NO_STDIO DEBUG, PLUS (consumer-
+# specific, THREE producers) AC_PRODUCER_SIG/AEC_PRODUCER_SIG/NR_PRODUCER_SIG
+# -- each empty when its _LIB var isn't resolved yet (e.g. for goals like
+# `libaudio_pipeline.a`/`audit-no-stdio` that never touch any producer).
+#
+# This MUST be defined after CFLAGS/LDFLAGS are fully assembled and after the
+# AC_LIB ifeq/else above resolves the three PRODUCER_SIGs, but before the
+# first rule below that mentions $(OBJ_DIR)/$(BIN_DIR)/anything derived from
+# them -- GNU Make expands a rule's target/prerequisite list immediately
+# when parsed, not deferred like a recipe body, so a forward reference here
+# would silently resolve using CFG_SIG's value at parse time (empty),
+# landing objects in a hash-less directory instead of the real one.
+#
+# Deliberately NOT $(strip)'d (false-miss OK, false-hit never -- see
+# audio_common's Makefile for the full rationale). cksum (POSIX) computes
+# the hash; `cut -d' ' -f1` isolates the checksum from cksum's
+# "<checksum> <byte-count>" stdout.
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG)
+CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 OBJ_ROOT = obj
 OBJ_DIR  = $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
-# (Note: OBJ_DIR only affects THIS Makefile's own objects -- the
-# submodule/shared libs pulled in by `libs:` below are independently
-# hash-keyed by their own Makefiles, which now key off the same
-# BACKEND/EXTRA_CFLAGS/WERROR axes.)
+BIN_DIR  = bin/$(BACKEND)-$(CFG_SIG)
 
-.PHONY: all clean clean-libs clean-all libs test audit-no-stdio print-obj-dir
+# --- CFG_SIG collision guard + directory creation (round-3 review B01) -----
+# Single order-only prerequisite for every compile/link/archive rule below.
+# See audio_common's Makefile for the full design writeup (identical
+# mechanism, applied here) -- write config.manifest first time, verify (hard
+# error on mismatch = CFG_SIG collision or payload coverage gap) every time
+# after, atomically (temp file + mv).
+.PHONY: _cfg_guard
+_cfg_guard:
+	@mkdir -p $(OBJ_DIR) $(BIN_DIR)
+	@for d in $(OBJ_DIR) $(BIN_DIR); do \
+	  m="$$d/config.manifest"; \
+	  if [ -f "$$m" ]; then \
+	    old="$$(cat "$$m")"; \
+	    if [ "$$old" != "$(CFG_SIG_PAYLOAD)" ]; then \
+	      echo "FATAL: CFG_SIG collision or coverage gap in $$m" >&2; \
+	      echo "  CFG_SIG=$(CFG_SIG)" >&2; \
+	      echo "  stored : $$old" >&2; \
+	      echo "  current: $(CFG_SIG_PAYLOAD)" >&2; \
+	      exit 1; \
+	    fi; \
+	  else \
+	    tmp="$$d/.config.manifest.tmp.$$$$"; \
+	    printf '%s\n' "$(CFG_SIG_PAYLOAD)" > "$$tmp"; \
+	    mv -f "$$tmp" "$$m"; \
+	  fi; \
+	done
 
-all: libs aec_nr_pipeline aec_nr_pipeline_static
+# -MD -MP: emits $(OBJ_DIR)/<name>.d per object (header dependency tracking)
+# -- included near the bottom of this file via `-include $(wildcard $(OBJ_DIR)/*.d)`.
+$(OBJ_DIR)/aec_nr_pipeline.o: aec_nr_pipeline.c audio_pipeline.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-# Build the shared archive + both submodule libs for the selected BACKEND.
-# AC_DIR is passed through explicitly so lib/aec and lib/nr resolve the SAME
-# audio_common checkout this Makefile uses (their own AC_DIR fallback also
-# resolves correctly at the submodule depth: ../../../../audio_common from
-# c_impl/, but pass it anyway to be explicit/robust).
-libs:
-	$(MAKE) -C $(AC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) lib
-	$(MAKE) -C $(AEC_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" WERROR=$(WERROR)
-	$(MAKE) -C $(NR_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" WERROR=$(WERROR)
-
-# $(OBJ_DIR) creation is an order-only prerequisite on the compile rules
-# below (not a $(shell mkdir) at parse time, and not a plain prerequisite
-# that could race a parallel compile under `make -j`) -- every rule that
-# writes into it depends on it existing first.
-$(OBJ_DIR):
-	@mkdir -p $@
-
-# Compile with $(CC) (always a plain-C driver, -std=gnu99 valid) then link with
-# $(LINK) (c++ for BACKEND=ne10 — the NE10 archive's one C++ TU needs it). A
-# C++ driver invoked directly on a .c source rejects -std=gnu99 and treats the
-# file as C++, so the compile and link steps must stay separate here (mirrors
-# how lib/aec and lib/nr's own Makefiles split .o-compile from $(LINK)).
-$(OBJ_DIR)/aec_nr_pipeline.o: aec_nr_pipeline.c audio_pipeline.h | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
-
-$(OBJ_DIR)/aec_nr_pipeline_static.o: aec_nr_pipeline_static.c audio_pipeline.h | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+$(OBJ_DIR)/aec_nr_pipeline_static.o: aec_nr_pipeline_static.c audio_pipeline.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # audio_pipeline.o / libaudio_pipeline.a (review F20): the pool-sizing/
 # carving/per-hop-processing library TU, linkable independently of either
@@ -230,71 +352,237 @@ $(OBJ_DIR)/aec_nr_pipeline_static.o: aec_nr_pipeline_static.c audio_pipeline.h |
 # separate libraries a consumer links alongside it, same as both CLIs do.
 # Compiled with $(LIB_CFLAGS) (not the shared $(CFLAGS)) so NO_STDIO=1 only
 # ever affects THIS object -- see the NO_STDIO comment near CFLAGS above.
-$(OBJ_DIR)/audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h | $(OBJ_DIR)
-	$(CC) $(LIB_CFLAGS) -c -o $@ $<
-
-libaudio_pipeline.a: $(OBJ_DIR)/audio_pipeline.o
-	ar rcs $@ $^
-
-aec_nr_pipeline: $(OBJ_DIR)/aec_nr_pipeline.o libaudio_pipeline.a | libs
-	$(LINK) -o $@ $< $(LDFLAGS)
-
-aec_nr_pipeline_static: $(OBJ_DIR)/aec_nr_pipeline_static.o libaudio_pipeline.a | libs
-	$(LINK) -o $@ $< $(LDFLAGS)
+$(OBJ_DIR)/audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
 # test_audio_pipeline: standalone acceptance test for audio_pipeline.h itself
 # (create-vs-init byte equality incl. a dirty/poisoned pool, destroy
 # idempotence, misaligned/undersized pool rejection, sample-rate whitelist
 # rejection) -- see test_audio_pipeline.c's own header for detail.
-$(OBJ_DIR)/test_audio_pipeline.o: test_audio_pipeline.c audio_pipeline.h | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+$(OBJ_DIR)/test_audio_pipeline.o: test_audio_pipeline.c audio_pipeline.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o libaudio_pipeline.a | libs
-	$(LINK) -o $@ $< $(LDFLAGS)
+LIB_TARGET = $(BIN_DIR)/libaudio_pipeline.a
 
-test: test_audio_pipeline
-	./test_audio_pipeline
+# `libaudio_pipeline.a` needs only THIS repo's own object (audio_pipeline.o)
+# -- no producer archive is linked into it -- so, per the dispatch design
+# above, it's a real rule living entirely outside the AC_LIB dispatch (never
+# shells out to any of the three producers, works even if none of them are
+# buildable). The phony alias keeps the pre-B01 flat-filename invocation
+# (`make libaudio_pipeline.a`) working.
+.PHONY: libaudio_pipeline.a
+libaudio_pipeline.a: $(LIB_TARGET)
 
-# print-obj-dir: prints THIS invocation's $(OBJ_DIR) and nothing else --
-# a plumbing helper `audit-no-stdio` below uses (via a `$(MAKE) -s ...
-# print-obj-dir` sub-call) to learn the hash-keyed directory a NO_STDIO=1
-# build lands in, without duplicating CFG_SIG's cksum computation in shell.
+$(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o | _cfg_guard
+	$(AR) rcs $@ $^
+	$(RANLIB) $@
+	@echo "libaudio_pipeline.a [$(BACKEND)] -> $@"
+
+# =============================================================================
+# Phase 2 real rules: only defined once AC_LIB (and, transitively, AEC_LIB/
+# NR_LIB, always set together by phase 1's re-invoke) is known.
+# =============================================================================
+ifneq ($(AC_LIB),)
+.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline FORCE
+all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static
+
+test: $(BIN_DIR)/test_audio_pipeline
+	./$(BIN_DIR)/test_audio_pipeline
+
+# libs: compat alias for the old `libs:` phony (which used to build the
+# three producer archives directly with hardcoded paths/flags). Building the
+# archives is now an automatic side effect of the FORCE rules below, so this
+# just asserts all three exist for whoever's tooling still invokes `make libs`.
+libs: $(AC_LIB) $(AEC_LIB) $(NR_LIB)
+
+# Root-name phony aliases (round-3 review B01): keep the pre-keyed-directory
+# invocation (`make aec_nr_pipeline`, etc.) working -- the real artifact now
+# lives at $(BIN_DIR)/<name>, not flat in this directory.
+aec_nr_pipeline: $(BIN_DIR)/aec_nr_pipeline
+aec_nr_pipeline_static: $(BIN_DIR)/aec_nr_pipeline_static
+test_audio_pipeline: $(BIN_DIR)/test_audio_pipeline
+
+FORCE:
+
+# Each producer archive is a FORCE-recipe target: always re-invokes that
+# producer's own build (a no-op if it's already up to date -- that
+# producer's own Makefile decides that), but only actually touches the
+# archive's mtime if it really rebuilt something, so the binaries below
+# only relink when it did. AC_DIR=$(abspath $(AC_DIR)) AC_LIB=$(AC_LIB) is
+# forwarded to the lib/aec/lib/nr sub-makes even though `lib` itself never
+# links audio_common's archive -- see the two-phase dispatch comment above
+# for why this is required for their CFG_SIG (hence output path) to match
+# what the query call above already resolved.
+$(AC_LIB): FORCE
+	+$(MAKE) -C $(AC_DIR) $(FWD) lib
+	@test -f '$@' || { echo "ERROR: audio_common did not produce $@ (query/build divergence -- only BACKEND/WERROR/CC/CXX/EXTRA_CFLAGS/NO_STDIO overrides are supported)"; exit 1; }
+
+$(AEC_LIB): FORCE
+	+$(MAKE) -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB=$(AC_LIB) lib
+	@test -f '$@' || { echo "ERROR: lib/aec did not produce $@ (query/build divergence)"; exit 1; }
+
+$(NR_LIB): FORCE
+	+$(MAKE) -C $(NR_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB=$(AC_LIB) lib
+	@test -f '$@' || { echo "ERROR: lib/nr did not produce $@ (query/build divergence)"; exit 1; }
+
+# Compile with $(CC) (always a plain-C driver, -std=gnu99 valid) then link
+# with $(LINK) (c++ for BACKEND=ne10 -- the NE10 archive's one C++ TU needs
+# it). Link order matters (see the LDFLAGS comment above): pipeline.o,
+# libaudio_pipeline.a, libaec.a, libmmse_lsa.a, libaudio_common.a, -lm.
+$(BIN_DIR)/aec_nr_pipeline: $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+	@echo "aec_nr_pipeline [$(BACKEND)] -> $@"
+
+$(BIN_DIR)/aec_nr_pipeline_static: $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+	@echo "aec_nr_pipeline_static [$(BACKEND)] -> $@"
+
+$(BIN_DIR)/test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+	@echo "test_audio_pipeline [$(BACKEND)] -> $@"
+endif
+
+# --- Query targets (round-3 review B01) -------------------------------------
+# Report THIS invocation's own build identity (empty AC_PRODUCER_SIG/
+# AEC_PRODUCER_SIG/NR_PRODUCER_SIG unless AC_LIB/AEC_LIB/NR_LIB were
+# explicitly passed in). Parse-time stdout purity: nothing above this point
+# ever unconditionally $(info)/$(warning)s, so these targets' stdout is
+# exactly their one recipe-time @echo line -- safe to capture with
+# `$(MAKE) -s ... print-lib-path` the way the dispatch recipe above (and
+# lib/aec's/lib/nr's own Makefiles, and this file's audit-no-stdio/publish
+# recipes) all do. To get the exact path `make all` itself would produce
+# (which DOES fold in the three resolved producers' identities), resolve
+# AC_LIB/AEC_LIB/NR_LIB the same way phase 1 does and pass them explicitly.
+.PHONY: print-bin-dir print-obj-dir print-lib-path
+# print-bin-dir / print-lib-path dispatch through the same three-producer
+# phase-1 resolution as the build goals, so bare `make -s print-bin-dir` /
+# `make -s print-lib-path` print the exact delivery locations (this repo's
+# archive AND binaries only exist in the resolved-producer directory).
+# Passing AC_LIB/AEC_LIB/NR_LIB explicitly skips the query sub-makes.
+ifeq ($(AC_LIB),)
+print-bin-dir print-lib-path:
+	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
+	 test -n "$$ac" || { echo "FATAL: could not resolve audio_common archive path (AC_DIR=$(AC_DIR))" >&2; exit 1; }; \
+	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+	 $(MAKE) -s --no-print-directory $@ AC_LIB="$$ac" AEC_LIB="$$aec" NR_LIB="$$nr"
+else
+print-bin-dir:
+	@echo $(abspath $(BIN_DIR))
+print-lib-path:
+	@echo $(abspath $(LIB_TARGET))
+endif
 print-obj-dir:
-	@echo $(OBJ_DIR)
+	@echo $(abspath $(OBJ_DIR))
 
-# audit-no-stdio (re-review R09): builds libaudio_pipeline.a with NO_STDIO=1
-# (current BACKEND=$(BACKEND)) and asserts, via `nm` over audio_pipeline.o
-# ITSELF (not the CLIs, not test_audio_pipeline.o -- neither is built by
-# this target, and neither is gated by AUDIO_PIPELINE_NO_STDIO to begin
-# with), that none of fprintf/printf/puts/fputs/stderr/__stderrp made it
-# into the object. Pattern/style mirrors
+# audit-no-stdio (re-review R09, adapted to the keyed-directory layout):
+# builds libaudio_pipeline.a with NO_STDIO=1 (current BACKEND=$(BACKEND))
+# and asserts, via `nm` over the DELIVERED keyed archive itself (not an
+# intermediate object file), that none of fprintf/printf/puts/fputs/stderr/
+# __stderrp made it into it -- plus (round-3 review B01) that the NO_STDIO=1
+# archive's resolved path actually differs from the default (NO_STDIO=0)
+# config's path, i.e. the two configs cannot silently collide/alias. `ar -t`
+# confirms the archive still holds exactly the one member (audio_pipeline.o)
+# nm's hits are attributed to. Pattern/style mirrors
 # ../../audio_common/scripts/audit_alloc_symbols.sh (leading-underscore-
 # tolerant regex, last-whitespace-field match against nm's NAME column, so
-# it works the same under macOS/BSD nm and GNU nm). Unlike that script this
-# IS a pass/fail gate (prints PASS/FAIL, non-zero exit on FAIL) -- it is the
-# audit_alloc_symbols.sh idea applied to prove a NEGATIVE build property
-# (these symbols are ABSENT) rather than report positive allocator-call
-# provenance.
+# it works the same under macOS/BSD nm and GNU nm). This IS a pass/fail gate
+# (prints PASS/FAIL, non-zero exit on FAIL).
+.PHONY: audit-no-stdio
 audit-no-stdio:
 	@echo "audit-no-stdio: building libaudio_pipeline.a (BACKEND=$(BACKEND), NO_STDIO=1)"
-	@$(MAKE) --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 libaudio_pipeline.a
-	@objdir=$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-obj-dir); \
-	obj="$$objdir/audio_pipeline.o"; \
-	if [ ! -f "$$obj" ]; then \
-	  echo "FAIL: $$obj not found after building libaudio_pipeline.a with NO_STDIO=1"; \
-	  exit 1; \
-	fi; \
-	echo "audit-no-stdio: nm -A $$obj | grep -E '^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$' (NAME column)"; \
-	hits=$$(nm -A "$$obj" | awk '{ name = $$NF; if (name ~ /^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$/) print }'); \
-	if [ -n "$$hits" ]; then \
-	  echo "FAIL: forbidden stdio symbol(s) found in $$obj (NO_STDIO=1 build):"; \
-	  echo "$$hits"; \
-	  exit 1; \
-	fi; \
-	echo "PASS: no fprintf/printf/puts/fputs/stderr/__stderrp symbols in $$obj (NO_STDIO=1)"
+	@$(MAKE) --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 libaudio_pipeline.a >/dev/null
+	@lib_nostdio="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-lib-path)"; \
+	 lib_default="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=0 print-lib-path)"; \
+	 if [ "$$lib_nostdio" = "$$lib_default" ]; then \
+	   echo "FATAL: NO_STDIO=1 archive path COLLIDES with the default (NO_STDIO=0) archive path ($$lib_nostdio)" >&2; \
+	   exit 1; \
+	 fi; \
+	 if [ ! -f "$$lib_nostdio" ]; then \
+	   echo "FAIL: $$lib_nostdio not found after building libaudio_pipeline.a with NO_STDIO=1"; \
+	   exit 1; \
+	 fi; \
+	 ar -t "$$lib_nostdio" | grep -q '^audio_pipeline\.o$$' || { echo "FAIL: $$lib_nostdio missing audio_pipeline.o member"; exit 1; }; \
+	 echo "audit-no-stdio: nm -A $$lib_nostdio | grep -E '^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$' (NAME column)"; \
+	 hits=$$(nm -A "$$lib_nostdio" | awk '{ name = $$NF; if (name ~ /^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$/) print }'); \
+	 if [ -n "$$hits" ]; then \
+	   echo "FAIL: forbidden stdio symbol(s) found in $$lib_nostdio (NO_STDIO=1 build):"; \
+	   echo "$$hits"; \
+	   exit 1; \
+	 fi; \
+	 echo "PASS: no fprintf/printf/puts/fputs/stderr/__stderrp symbols in $$lib_nostdio (NO_STDIO=1); path differs from default-config path $$lib_default"
 
+# =============================================================================
+# publish v2: immutable per-config release under dist/ (round-3 review B01)
+# -- same design as audio_common's/AEC's/NR's publish (see audio_common's
+# Makefile for the full writeup): dist/<backend>/<cfg_sig>/ + atomic
+# dist/<backend>/current symlink, a per-backend mkdir-lock serialising
+# concurrent publishes, MANIFEST.txt with relative paths + per-file sha256 +
+# this build's three resolved producer identities (AC_PRODUCER_SIG/
+# AEC_PRODUCER_SIG/NR_PRODUCER_SIG) + the git commit of each of the three
+# sibling/submodule repos (audio_common, lib/aec, lib/nr) via `git -C`, on
+# top of this repo's (Audio_ALG's) own commit. PUBLISH_ARTIFACTS needs
+# $(AC_LIB)/$(AEC_LIB)/$(NR_LIB) to exist, so `publish` goes through the same
+# two-phase, three-producer dispatch as `all`/`test`/`libs` above when they
+# aren't already known (see the ifeq($(AC_LIB),) block near the top of this
+# file, which lists `publish` alongside all/test/libs).
+# =============================================================================
+PUBLISH_ARTIFACTS = $(LIB_TARGET) $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static
+DIST_BACKEND_DIR  = dist/$(BACKEND)
+DIST_REL_DIR      = $(DIST_BACKEND_DIR)/$(CFG_SIG)
+DIST_LOCK         = dist/.lock.$(BACKEND)
+
+ifneq ($(AC_LIB),)
+.PHONY: publish
+publish: $(PUBLISH_ARTIFACTS)
+	@mkdir -p dist; \
+	if ! mkdir "$(DIST_LOCK)" 2>/dev/null; then \
+	  echo "FATAL: publish lock $(DIST_LOCK) already held (concurrent 'make publish BACKEND=$(BACKEND)'?)" >&2; \
+	  exit 1; \
+	fi; \
+	trap 'rmdir "$(DIST_LOCK)" 2>/dev/null' EXIT INT TERM; \
+	set -e; \
+	commit="$$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+	ac_commit="$$(git -C $(AC_DIR) rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+	aec_commit="$$(git -C $(AEC_DIR) rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+	nr_commit="$$(git -C $(NR_DIR) rev-parse --short HEAD 2>/dev/null || echo unknown)"; \
+	dateutc="$$(date -u +%Y-%m-%dT%H:%M:%SZ)"; \
+	mkdir -p "$(DIST_BACKEND_DIR)"; \
+	tmp="$(DIST_BACKEND_DIR)/$(CFG_SIG).tmp"; \
+	rm -rf "$$tmp"; mkdir -p "$$tmp"; \
+	cp $(PUBLISH_ARTIFACTS) "$$tmp/"; \
+	shas="$$( cd "$$tmp" && for f in *; do shasum -a 256 "$$f"; done )"; \
+	{ echo "repo=pipelines"; \
+	  echo "backend=$(BACKEND)"; \
+	  echo "cfg_sig=$(CFG_SIG)"; \
+	  echo "ac_producer_cfg_sig=$(AC_PRODUCER_SIG)"; \
+	  echo "aec_producer_cfg_sig=$(AEC_PRODUCER_SIG)"; \
+	  echo "nr_producer_cfg_sig=$(NR_PRODUCER_SIG)"; \
+	  echo "cc=$(CC)"; echo "cxx=$(CXX)"; \
+	  echo "cflags=$(CFLAGS)"; \
+	  echo "extra_cflags=$(EXTRA_CFLAGS)"; \
+	  echo "werror=$(WERROR)"; echo "no_stdio=$(NO_STDIO)"; echo "debug=$(DEBUG)"; \
+	  echo "git_commit=$$commit"; \
+	  echo "audio_common_git_commit=$$ac_commit"; \
+	  echo "aec_git_commit=$$aec_commit"; \
+	  echo "nr_git_commit=$$nr_commit"; \
+	  echo "date_utc=$$dateutc"; \
+	  echo "$$shas"; \
+	} > "$$tmp/MANIFEST.txt"; \
+	rm -rf "$(DIST_REL_DIR)"; \
+	mv "$$tmp" "$(DIST_REL_DIR)"; \
+	ln -s "$(CFG_SIG)" "$(DIST_BACKEND_DIR)/.current.tmp"; \
+	mv -f "$(DIST_BACKEND_DIR)/.current.tmp" "$(DIST_BACKEND_DIR)/current"; \
+	echo "pipelines: published $(BACKEND)/$(CFG_SIG) -> $(DIST_BACKEND_DIR)/current"
+endif
+
+# clean: this dir's own hash-keyed obj/bin trees (every config, not just the
+# one BACKEND/flags this invocation resolves to) PLUS any legacy flat
+# binaries/archive left over from before this directory layout existed (a
+# pre-B01 checkout, or a manual build from an older revision of this file).
+# dist/ is NOT removed (publish is a deliberate release, not a build cache).
 clean:
-	rm -rf $(OBJ_ROOT)
+	rm -rf $(OBJ_ROOT) bin
 	rm -f aec_nr_pipeline aec_nr_pipeline_static libaudio_pipeline.a test_audio_pipeline
 
 # clean-all: full nuke -- this dir's own artifacts plus all three
@@ -307,3 +595,12 @@ clean-all: clean
 	$(MAKE) -C $(AC_DIR) clean
 
 clean-libs: clean-all
+
+.PHONY: clean clean-all clean-libs
+
+# --- Header dependency tracking (round-3 review B01) ------------------------
+# See audio_common's Makefile for the full rationale (-MD not -MMD, -MP
+# guards against deleted-header stale-.d errors). $(wildcard ...) makes this
+# evaluate to nothing (not an error) before any objects exist yet for this
+# CFG_SIG.
+-include $(wildcard $(OBJ_DIR)/*.d)

@@ -108,14 +108,20 @@ corresponding NR output becomes available.
 # From Audio_ALG/pipelines/ — builds the submodule libs + BOTH binaries
 make                # libs (BACKEND=kiss) + aec_nr_pipeline + aec_nr_pipeline_static
 
+# Binaries land in a config-keyed dir (round-3 review B01):
+#   bin/<backend>-<config-hash>/  — resolve it with `make print-bin-dir`
+# (same flags as your build), or use `make publish` for the stable
+# dist/<backend>/current/ handoff path.
+BIN="$(make -s print-bin-dir)"
+
 # Run Version A (malloc)
-./aec_nr_pipeline mic.wav ref.wav output.wav balanced
-./aec_nr_pipeline mic.wav ref.wav output.wav --aec-only
-./aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-preset aggressive
+"$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav balanced
+"$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav --aec-only
+"$BIN"/aec_nr_pipeline mic.wav ref.wav output.wav aggressive --nr-preset aggressive
 
 # Run Version B (static memory) — same CLI, plus a mem-size query mode
-./aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
-./aec_nr_pipeline_static --print-mem-size --sample-rate 16000
+"$BIN"/aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
+"$BIN"/aec_nr_pipeline_static --print-mem-size --sample-rate 16000
 
 # Run the audio_pipeline.h library's own acceptance tests (F20/R08/R09/§7.3) —
 # create-vs-init byte equality (incl. a poisoned pool), destroy idempotence,
