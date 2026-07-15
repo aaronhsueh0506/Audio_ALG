@@ -461,7 +461,7 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
 /* ============================================================================
  * audio_pipeline_init_ex (re-review R09; descriptor V2 review B06) —
  * audio_pipeline_init() PLUS an optional `expected` descriptor gate. See
- * audio_pipeline.h for the full contract; the seven-condition check below
+ * audio_pipeline.h for the full contract; the eight-condition check below
  * (run only when `expected` is non-NULL) is the literal implementation of
  * that doc's numbered list, in the SAME order, each on its own named
  * diagnostic. Every comparison below is a plain integer `==`/`<` over
@@ -509,6 +509,15 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
             AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- alignment mismatch "
                        "(expected=%u, current build=%u)\n",
                        expected->alignment, cur.alignment);
+            return NULL;
+        }
+        if (expected->reserved != 0u) {
+            /* Round-4 review: the header doc claims reserved is always 0 in
+             * any descriptor this library produced -- validated here, not
+             * assumed, because `expected` may arrive from persisted/
+             * transmitted bytes this library never wrote. */
+            AP_LOG_ERR("audio_pipeline_init_ex: corrupt descriptor -- reserved must be 0 "
+                       "(got %u)\n", expected->reserved);
             return NULL;
         }
         if (expected->bytes < cur.bytes) {

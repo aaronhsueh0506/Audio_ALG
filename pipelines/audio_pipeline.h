@@ -205,12 +205,17 @@ extern "C" {
  *                        to); kept as a field rather than a hardcoded "16"
  *                        so a caller's code doesn't have to. `uint32_t`, not
  *                        `size_t` — see the fixed-width rationale above.
- *   - reserved:          always 0 today; exists ONLY so `bytes` (a
- *                        uint64_t) falls on an 8-byte-aligned offset within
- *                        the struct without any compiler-inserted padding —
- *                        part of the fixed 32-byte layout the
- *                        `_Static_assert`s below pin, not a field a caller
- *                        should read or write.
+ *   - reserved:          MUST be 0. Exists so `bytes` (a uint64_t) falls on
+ *                        an 8-byte-aligned offset within the struct without
+ *                        any compiler-inserted padding — part of the fixed
+ *                        32-byte layout the `_Static_assert`s below pin, not
+ *                        a field a caller should read or write. Because an
+ *                        `expected` descriptor may arrive from persisted/
+ *                        transmitted bytes, audio_pipeline_init_ex()
+ *                        VALIDATES this (rejects nonzero) rather than
+ *                        assuming it (round-4 review) — a nonzero value
+ *                        means the bytes are not a faithful descriptor this
+ *                        library produced.
  *   - bytes:             total pool size (>= this many bytes, 16-aligned).
  *                        `uint64_t`, not `size_t` — see the fixed-width
  *                        rationale above; placed last so its natural 8-byte
@@ -378,14 +383,19 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes,
  *      `strcmp`; see AudioPipelineMemReq.backend_id's doc for why)
  *   4. expected->build_flags_hash == cur.build_flags_hash
  *   5. expected->alignment == cur.alignment
- *   6. expected->bytes >= cur.bytes (the CACHED descriptor's own bytes
+ *   6. expected->reserved == 0 (round-4 review: the struct doc above claims
+ *      this field is always 0 in any descriptor this library produced, and
+ *      `expected` may originate from persisted/transmitted bytes — so the
+ *      claim is VALIDATED, not assumed; a nonzero value means the bytes are
+ *      not a faithful descriptor from this library)
+ *   7. expected->bytes >= cur.bytes (the CACHED descriptor's own bytes
  *      figure must already have covered what the CURRENT build needs)
- *   7. bytes >= cur.bytes (the POOL ACTUALLY HANDED IN this call must also
- *      cover it — distinct from #6: a caller could pass a stale `expected`
+ *   8. bytes >= cur.bytes (the POOL ACTUALLY HANDED IN this call must also
+ *      cover it — distinct from #7: a caller could pass a stale `expected`
  *      with a big enough `bytes` field but then allocate/pass in a smaller
  *      block than that)
  *
- * Only once all seven hold does this proceed exactly as audio_pipeline_init()
+ * Only once all eight hold does this proceed exactly as audio_pipeline_init()
  * would (same alignment/undersized-pool checks, same carve, same return
  * semantics). This function does not itself require `bytes == expected->
  * bytes`, or `mem`/pool size to match `expected->bytes` beyond the >=
@@ -393,7 +403,7 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes,
  * replacement for the normal bytes-sufficiency check already inside the
  * carve path.
  *
- * @return a valid handle, or NULL (any of the seven checks above fails when
+ * @return a valid handle, or NULL (any of the eight checks above fails when
  *         `expected` is non-NULL, or any audio_pipeline_init() rejection
  *         reason — misaligned/undersized pool, invalid cfg, sub-module
  *         init/grid-agreement failure).

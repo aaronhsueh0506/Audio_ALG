@@ -439,6 +439,15 @@ static void test_init_ex_descriptor(void) {
     CHECK(p_align == NULL, "audio_pipeline_init_ex rejects a tampered alignment");
     if (p_align) audio_pipeline_destroy(p_align);
 
+    /* Round-4 review: `reserved` is documented as always-0 in any descriptor
+     * this library produced, and `expected` may arrive from persisted bytes
+     * -- init_ex must VALIDATE the claim, not assume it. */
+    AudioPipelineMemReq bad_reserved = req;
+    bad_reserved.reserved = 1u;
+    AudioPipeline* p_res = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_reserved);
+    CHECK(p_res == NULL, "audio_pipeline_init_ex rejects a nonzero reserved field");
+    if (p_res) audio_pipeline_destroy(p_res);
+
     AudioPipelineMemReq bad_bytes = req;
     bad_bytes.bytes = req.bytes - 1;
     AudioPipeline* p_bytes = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_bytes);
