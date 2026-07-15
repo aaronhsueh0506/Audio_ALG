@@ -19,12 +19,13 @@
 # Usage:
 #   make                       # builds libs (BACKEND=kiss) + both binaries
 #                              # (+ libaudio_pipeline.a as a side effect)
-#   make BACKEND=ne10          # NE10 backend -- F12: no manual clean needed
-#                              # any more, a CFG_STAMP in each of this file's
-#                              # and the submodules' Makefiles now busts stale
-#                              # objects automatically on a BACKEND/EXTRA_CFLAGS
-#                              # change (make clean-all still works, just isn't
-#                              # required)
+#   make BACKEND=ne10          # NE10 backend -- objects are hash-keyed per
+#                              # (BACKEND, EXTRA_CFLAGS, WERROR) in each of
+#                              # this file's and the submodules' Makefiles,
+#                              # so switching any of them always lands in a
+#                              # fresh object directory automatically; no
+#                              # manual clean needed, ever (make clean-all
+#                              # still works, just isn't required)
 #   make EXTRA_CFLAGS="..."    # see the EXTRA_CFLAGS block below
 #   make WERROR=1              # opt-in: -Werror for this file's own TUs
 #   make test                  # build + run test_audio_pipeline (audio_pipeline.h
@@ -53,14 +54,13 @@ CXX ?= c++
 # The fast matched-filter arithmetic and delay-estimator duty-cycling are
 # built in unconditionally (no flag) — see lib/aec/c_impl/src/delay_aec3.c.
 #
-# F12 fix: switching EXTRA_CFLAGS (or BACKEND, or WERROR) on an already-built
-# tree used to need `make clean-libs` by hand first -- object files weren't
-# flag-tagged, so a stale non-flagged .o (or a stale flagged one, if you're
-# turning a flag back off) would silently persist otherwise. The CFG_STAMP
-# mechanism further down now detects the change and wipes the stale objects
-# automatically (both here and, independently, inside lib/aec's and lib/nr's
-# own Makefiles); `make clean-libs`/`clean-all` remains available but is no
-# longer required for correctness.
+# Switching EXTRA_CFLAGS (or BACKEND, or WERROR) never needs a manual
+# `make clean-libs` first: this Makefile's own objects are hash-keyed by
+# config (see the OBJ_DIR/CFG_SIG comment further down), and lib/aec's and
+# lib/nr's own Makefiles independently key their objects off the same
+# BACKEND/EXTRA_CFLAGS/WERROR axes -- a stale, differently-flagged .o simply
+# can't exist under the new path a config produces. `make clean-libs`/
+# `clean-all` remain available but are no longer required for correctness.
 EXTRA_CFLAGS ?=
 
 # -ffp-contract=off: same FMA-contraction policy as the AEC library TUs.
@@ -111,39 +111,57 @@ LIBS = ./libaudio_pipeline.a \
        $(AC_DIR)/bin/$(BACKEND)/libaudio_common.a
 LDFLAGS = $(LIBS) -lm $(LDFLAGS_EXTRA)
 
-# --- Build-configuration stamp (F12 build hygiene) --------------------------
-# This Makefile keeps fixed .o names (aec_nr_pipeline.o,
+# --- Hash-keyed object directory (build hygiene) ----------------------------
+# This Makefile used to keep fixed .o names (aec_nr_pipeline.o,
 # aec_nr_pipeline_static.o, audio_pipeline.o, test_audio_pipeline.o) directly
-# in this directory -- there is no obj/ subdir to wipe wholesale (this dir
-# also holds the Makefile, scripts, docs, etc.). Until now, switching BACKEND
-# or EXTRA_CFLAGS on an already-built tree needed `make clean-libs` by hand
-# first (documented above) or a stale, differently-flagged .o would silently
-# persist. CFG_SIG hashes the exact compiler invocation that produces every
-# one of this Makefile's own objects.
+# in this directory (which also holds the Makefile, scripts, docs, etc.), so
+# switching BACKEND or EXTRA_CFLAGS on an already-built tree needed
+# `make clean-libs` by hand first or a stale, differently-flagged .o would
+# silently persist. CFG_SIG hashes the exact compiler invocation that
+# produces every one of this Makefile's own objects, and OBJ_DIR (below)
+# embeds it directly: every distinct (BACKEND, CFLAGS, EXTRA_CFLAGS, WERROR)
+# combination gets its own directory, automatically -- no manual clean ever
+# required, and two differently-configured builds can run concurrently in
+# this same tree without stomping each other's objects. OBJ_ROOT is the
+# whole obj/ tree (every config) -- used by `clean` to nuke everything, not
+# just the current config's subdirectory. The final binaries/archive
+# (aec_nr_pipeline, aec_nr_pipeline_static, libaudio_pipeline.a,
+# test_audio_pipeline) stay flat at the top of this directory, same as
+# before: last-write-wins wholes, not config-keyed.
 #
-# This check runs at PARSE time (via $(shell ...), not as a build-rule
-# recipe): an order-only-prerequisite version (a stamp FILE that a rule
-# creates, referenced via `foo.o: foo.c | $(CFG_STAMP)`) is racy -- verified
-# empirically. When several objects share one order-only prerequisite whose
-# recipe deletes them, GNU Make can finalize "is this object out of date?"
-# for one of them using the prerequisite tree it already resolved, before
-# the shared prerequisite's recipe actually runs -- so that object silently
-# keeps its (about to be deleted) stale .o and is never recompiled. Doing
-# the compare-and-wipe unconditionally while the Makefile is being read
-# sidesteps the race entirely.
-PIPE_OBJS := aec_nr_pipeline.o aec_nr_pipeline_static.o audio_pipeline.o test_audio_pipeline.o
+# CFG_SIG MUST be defined here, before any rule below mentions $(OBJ_DIR) (or
+# a path under it, e.g. `libaudio_pipeline.a: $(OBJ_DIR)/audio_pipeline.o`):
+# GNU Make expands a rule's target/prerequisite list IMMEDIATELY when that
+# line is parsed, not deferred like a recipe body, so a forward reference
+# would silently resolve using CFG_SIG's value at THAT point in the file
+# (empty, if this line hadn't run yet) -- verified empirically with a
+# minimal reproduction.
+#
+# There is no parse-time comparison and nothing is ever deleted to "detect"
+# a config change (the previous scheme did a $(shell rm -f ...)/$(shell
+# echo ...) unconditionally while the Makefile was being read, which
+# mutated the filesystem even under `make -n` and raced two concurrent
+# builds with different flags against each other's shared, un-keyed .o
+# names). Under this scheme `make -n` touches nothing on disk (CFG_SIG is a
+# pure string hash) and two differently-configured builds (e.g.
+# `make BACKEND=kiss -j4 & make BACKEND=ne10 -j4 & wait`) can run
+# concurrently in this same tree: each lands in its own obj/<backend>-<sig>/
+# directory and never touches the other's objects. OBJ_DIR's own creation
+# happens lazily via the order-only prerequisite on the compile rules below
+# ($(OBJ_DIR)/%.o: ... | $(OBJ_DIR)), not at Makefile-parse time.
+#
+# cksum (POSIX -- present on macOS/BSD/GNU/busybox, unlike shasum which is a
+# GNU coreutils extension and may be absent from slim embedded build images)
+# computes the hash. On stdin it prints "<checksum> <byte-count>" with no
+# filename field (verified on macOS's BSD cksum), so `cut -d' ' -f1` isolates
+# just the checksum.
+CFG_SIG := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR)" | cksum | cut -d' ' -f1)
 
-CFG_SIG        := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR)" | shasum -a 256 | cut -c1-12)
-CFG_STAMP_FILE := .cfg_stamp
-CFG_LAST_SIG   := $(shell test -f $(CFG_STAMP_FILE) && cat $(CFG_STAMP_FILE))
-ifneq ($(CFG_SIG),$(CFG_LAST_SIG))
-$(info Audio_ALG/pipelines: build config changed -- removing stale .o's for a full rebuild)
-$(shell rm -f $(PIPE_OBJS))
-$(shell echo $(CFG_SIG) > $(CFG_STAMP_FILE))
-endif
-# (Note: this only re-tags THIS Makefile's own two objects -- the
+OBJ_ROOT = obj
+OBJ_DIR  = $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
+# (Note: OBJ_DIR only affects THIS Makefile's own objects -- the
 # submodule/shared libs pulled in by `libs:` below are independently
-# stamped by their own Makefiles, which now key off the same
+# hash-keyed by their own Makefiles, which now key off the same
 # BACKEND/EXTRA_CFLAGS/WERROR axes.)
 
 .PHONY: all clean clean-libs clean-all libs test
@@ -160,15 +178,22 @@ libs:
 	$(MAKE) -C $(AEC_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" WERROR=$(WERROR)
 	$(MAKE) -C $(NR_DIR) lib BACKEND=$(BACKEND) AC_DIR=$(abspath $(AC_DIR)) EXTRA_CFLAGS="$(EXTRA_CFLAGS)" WERROR=$(WERROR)
 
+# $(OBJ_DIR) creation is an order-only prerequisite on the compile rules
+# below (not a $(shell mkdir) at parse time, and not a plain prerequisite
+# that could race a parallel compile under `make -j`) -- every rule that
+# writes into it depends on it existing first.
+$(OBJ_DIR):
+	@mkdir -p $@
+
 # Compile with $(CC) (always a plain-C driver, -std=gnu99 valid) then link with
 # $(LINK) (c++ for BACKEND=ne10 — the NE10 archive's one C++ TU needs it). A
 # C++ driver invoked directly on a .c source rejects -std=gnu99 and treats the
 # file as C++, so the compile and link steps must stay separate here (mirrors
 # how lib/aec and lib/nr's own Makefiles split .o-compile from $(LINK)).
-aec_nr_pipeline.o: aec_nr_pipeline.c audio_pipeline.h
+$(OBJ_DIR)/aec_nr_pipeline.o: aec_nr_pipeline.c audio_pipeline.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-aec_nr_pipeline_static.o: aec_nr_pipeline_static.c audio_pipeline.h
+$(OBJ_DIR)/aec_nr_pipeline_static.o: aec_nr_pipeline_static.c audio_pipeline.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 # audio_pipeline.o / libaudio_pipeline.a (review F20): the pool-sizing/
@@ -176,34 +201,34 @@ aec_nr_pipeline_static.o: aec_nr_pipeline_static.c audio_pipeline.h
 # CLI -- see audio_pipeline.h. The archive holds ONLY this one object (not a
 # fat archive bundling libaec/libmmse_lsa/libaudio_common); those stay
 # separate libraries a consumer links alongside it, same as both CLIs do.
-audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h
+$(OBJ_DIR)/audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-libaudio_pipeline.a: audio_pipeline.o
+libaudio_pipeline.a: $(OBJ_DIR)/audio_pipeline.o
 	ar rcs $@ $^
 
-aec_nr_pipeline: aec_nr_pipeline.o libaudio_pipeline.a | libs
+aec_nr_pipeline: $(OBJ_DIR)/aec_nr_pipeline.o libaudio_pipeline.a | libs
 	$(LINK) -o $@ $< $(LDFLAGS)
 
-aec_nr_pipeline_static: aec_nr_pipeline_static.o libaudio_pipeline.a | libs
+aec_nr_pipeline_static: $(OBJ_DIR)/aec_nr_pipeline_static.o libaudio_pipeline.a | libs
 	$(LINK) -o $@ $< $(LDFLAGS)
 
 # test_audio_pipeline: standalone acceptance test for audio_pipeline.h itself
 # (create-vs-init byte equality incl. a dirty/poisoned pool, destroy
 # idempotence, misaligned/undersized pool rejection, sample-rate whitelist
 # rejection) -- see test_audio_pipeline.c's own header for detail.
-test_audio_pipeline.o: test_audio_pipeline.c audio_pipeline.h
+$(OBJ_DIR)/test_audio_pipeline.o: test_audio_pipeline.c audio_pipeline.h | $(OBJ_DIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-test_audio_pipeline: test_audio_pipeline.o libaudio_pipeline.a | libs
+test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o libaudio_pipeline.a | libs
 	$(LINK) -o $@ $< $(LDFLAGS)
 
 test: test_audio_pipeline
 	./test_audio_pipeline
 
 clean:
-	rm -f aec_nr_pipeline aec_nr_pipeline_static aec_nr_pipeline.o aec_nr_pipeline_static.o \
-	      audio_pipeline.o libaudio_pipeline.a test_audio_pipeline test_audio_pipeline.o .cfg_stamp
+	rm -rf $(OBJ_ROOT)
+	rm -f aec_nr_pipeline aec_nr_pipeline_static libaudio_pipeline.a test_audio_pipeline
 
 # clean-all: full nuke -- this dir's own artifacts plus all three
 # submodule/shared build trees (lib/aec, lib/nr, audio_common). clean-libs is

@@ -55,6 +55,7 @@ pipelines/libaudio_pipeline.a
 lib/hpf/obj/
 *.o
 
-# F12 build-config stamp (pipelines/Makefile has no obj/ dir of its own to
-# fold this into -- see the CFG_SIG/CFG_STAMP_FILE block in that Makefile)
-pipelines/.cfg_stamp
+# pipelines/Makefile's own hash-keyed object dir (obj/<backend>-<config-hash>/,
+# one subdirectory per distinct BACKEND/EXTRA_CFLAGS/WERROR combination --
+# see the OBJ_DIR/CFG_SIG comment in that Makefile)
+pipelines/obj/

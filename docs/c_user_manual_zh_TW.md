@@ -64,7 +64,7 @@ git submodule update --init --recursive
 ```bash
 # 從 Audio_ALG 根目錄執行 — 預設 target 會建 libs + 兩個 binary
 make -C pipelines            # aec_nr_pipeline + aec_nr_pipeline_static
-make -C pipelines BACKEND=ne10   # NE10 FFT 後端（先 make -C pipelines clean-libs）
+make -C pipelines BACKEND=ne10   # NE10 FFT 後端（obj/ 依 backend+參數雜湊分開目錄，免手動 clean-libs）
 ```
 
 若自行編譯 wrapper，沿用目前 Makefile 的 include／link layout（注意：兩個 library 都依賴

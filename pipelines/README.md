@@ -195,9 +195,14 @@ reaches every `.o`. The fast matched-filter arithmetic and delay-estimator
 duty-cycling are built in unconditionally — there are no optional
 performance flags at present.
 
-`make clean-libs` first is required when switching `EXTRA_CFLAGS` — object
-files aren't flag-tagged, so a stale non-flagged (or stale flagged) `.o` will
-otherwise silently persist across the flag change.
+No manual `make clean-libs` is needed when switching `EXTRA_CFLAGS` (or
+`BACKEND`/`WERROR`): objects are now flag-keyed — each distinct combination
+of `BACKEND`/`CFLAGS`/`EXTRA_CFLAGS`/`WERROR` lands in its own hash-named
+object directory (`obj/<backend>-<config-hash>/`, both here and
+independently in `lib/aec`'s and `lib/nr`'s own Makefiles), so a flag change
+always compiles fresh objects into a fresh directory instead of reusing a
+stale `.o`. Two builds with different flags/backends can even coexist or run
+concurrently in the same worktree without stomping each other's objects.
 
 
 ## Two Versions
