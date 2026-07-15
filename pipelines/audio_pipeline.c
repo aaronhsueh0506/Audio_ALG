@@ -29,7 +29,6 @@
  * order, same constants (PROD_NE_FLOOR/PROD_FAR_GATE_THRESH/PSD_SCALE/...).
  */
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -44,6 +43,34 @@
  * buffers only (audio_pipeline_process) -- no WAV path, no stdio-based I/O.
  * WAV reading/writing stays entirely in the CLIs (aec_nr_pipeline.c /
  * aec_nr_pipeline_static.c), which are now thin shells over this API. */
+
+/* ============================================================================
+ * No-stdio build gate (re-review R09)
+ * ========================================================================== */
+
+/**
+ * This TU's diagnostics (init/build-time reject reasons only -- nothing on
+ * the per-hop audio_pipeline_process() path ever logs) are advisory: every
+ * failure this file can hit is ALSO signalled through its return value
+ * (NULL / -1), so a caller that cannot or will not link libc's stdio (a
+ * board/firmware image with no console, or one that forbids the stdio
+ * symbol set outright) must still get a fully-functional library -- it
+ * simply loses the human-readable "why" that would otherwise go to stderr.
+ *
+ * -DAUDIO_PIPELINE_NO_STDIO (pipelines/Makefile's `NO_STDIO=1`) compiles
+ * every AP_LOG_ERR() call below to a no-op and drops the <stdio.h> include
+ * entirely, so a NO_STDIO build of audio_pipeline.o pulls in none of
+ * fprintf/printf/puts/fputs/stderr (see `make audit-no-stdio`, which
+ * verifies exactly this with `nm` over the archive). Default (unset)
+ * behaviour is unchanged: AP_LOG_ERR() is fprintf(stderr, ...), same
+ * wording as before this gate existed.
+ */
+#ifndef AUDIO_PIPELINE_NO_STDIO
+#include <stdio.h>
+#define AP_LOG_ERR(...) fprintf(stderr, __VA_ARGS__)
+#else
+#define AP_LOG_ERR(...) ((void)0)
+#endif
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -241,7 +268,7 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
                            int aec_only) {
     size_t needed = pipeline_pool_size(aec_cfg, nr_cfg, hop, frame_sz, fft_sz, n_freqs, aec_only);
     if (!pool || pool_size < needed) {
-        fprintf(stderr, "audio_pipeline: sub-pool too small (%zu < %zu)\n", pool_size, needed);
+        AP_LOG_ERR("audio_pipeline: sub-pool too small (%zu < %zu)\n", pool_size, needed);
         return -1;
     }
     uint8_t* ptr = (uint8_t*)pool;
@@ -251,7 +278,7 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
     size_t aec_sz = aec_get_mem_size(aec_cfg);
     p->aec = aec_init(ptr, aec_sz, aec_cfg);
     ptr += ALIGN16(aec_sz);
-    if (!p->aec) { fprintf(stderr, "audio_pipeline: aec_init failed\n"); return -1; }
+    if (!p->aec) { AP_LOG_ERR("audio_pipeline: aec_init failed\n"); return -1; }
 
     if (!aec_only) {
         size_t fft_mem = fft_get_mem_size(fft_sz);
@@ -262,7 +289,7 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
         p->nr = mmse_lsa_init(ptr, nr_sz, nr_cfg);
         ptr += ALIGN16(nr_sz);
 
-        if (!p->fft || !p->nr) { fprintf(stderr, "audio_pipeline: NR/FFT init failed\n"); return -1; }
+        if (!p->fft || !p->nr) { AP_LOG_ERR("audio_pipeline: NR/FFT init failed\n"); return -1; }
     }
 
     p->mic_buf = (float*)ptr; ptr += ALIGN16((size_t)hop * sizeof(float));
@@ -316,7 +343,7 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
     AecResContext ctx0;
     aec_get_res_context(p->aec, &ctx0);
     if (ctx0.n_freqs != n_freqs || ctx0.hop_size != hop) {
-        fprintf(stderr, "audio_pipeline: FATAL grid mismatch -- pipeline n_freqs=%d hop=%d, "
+        AP_LOG_ERR("audio_pipeline: FATAL grid mismatch -- pipeline n_freqs=%d hop=%d, "
                         "AEC n_freqs=%d hop=%d\n", n_freqs, hop, ctx0.n_freqs, ctx0.hop_size);
         return -1;
     }
@@ -324,7 +351,7 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
         int fft_nf = fft_get_n_freqs(p->fft);
         int nr_nf  = mmse_lsa_get_n_freqs(p->nr);
         if (fft_nf != n_freqs || nr_nf != n_freqs) {
-            fprintf(stderr, "audio_pipeline: FATAL grid mismatch -- pipeline n_freqs=%d, "
+            AP_LOG_ERR("audio_pipeline: FATAL grid mismatch -- pipeline n_freqs=%d, "
                             "fft n_freqs=%d, nr n_freqs=%d\n", n_freqs, fft_nf, nr_nf);
             return -1;
         }
@@ -403,10 +430,65 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
     return 0;
 }
 
-AudioPipeline* audio_pipeline_init(void* mem, size_t bytes, const AudioPipelineConfig* cfg) {
+/* ============================================================================
+ * audio_pipeline_init_ex (re-review R09) — audio_pipeline_init() PLUS an
+ * optional `expected` descriptor gate. See audio_pipeline.h for the full
+ * contract; the six-condition check below (run only when `expected` is
+ * non-NULL) is the literal implementation of that doc's numbered list, in
+ * the SAME order, each on its own named diagnostic.
+ * ========================================================================== */
+
+AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipelineConfig* cfg,
+                                       const AudioPipelineMemReq* expected) {
     if (!mem || !cfg) return NULL;
+
+    if (expected) {
+        AudioPipelineMemReq cur;
+        if (audio_pipeline_get_mem_requirements(cfg, &cur) != 0) {
+            AP_LOG_ERR("audio_pipeline_init_ex: cfg rejected while recomputing the current "
+                       "descriptor to validate `expected` against\n");
+            return NULL;
+        }
+        if (expected->layout_version != cur.layout_version) {
+            AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- layout_version mismatch "
+                       "(expected=%u, current build=%u)\n",
+                       expected->layout_version, cur.layout_version);
+            return NULL;
+        }
+        if (!expected->backend || strcmp(expected->backend, cur.backend) != 0) {
+            AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- backend mismatch "
+                       "(expected=\"%s\", current build=\"%s\")\n",
+                       expected->backend ? expected->backend : "(null)", cur.backend);
+            return NULL;
+        }
+        if (expected->build_flags_hash != cur.build_flags_hash) {
+            AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- build_flags_hash mismatch "
+                       "(expected=0x%08x, current build=0x%08x)\n",
+                       expected->build_flags_hash, cur.build_flags_hash);
+            return NULL;
+        }
+        if (expected->alignment != cur.alignment) {
+            AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- alignment mismatch "
+                       "(expected=%zu, current build=%zu)\n",
+                       expected->alignment, cur.alignment);
+            return NULL;
+        }
+        if (expected->bytes < cur.bytes) {
+            AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- expected->bytes too small "
+                       "for the current build (expected->bytes=%zu < current requirement=%zu)\n",
+                       expected->bytes, cur.bytes);
+            return NULL;
+        }
+        if (bytes < cur.bytes) {
+            AP_LOG_ERR("audio_pipeline_init_ex: pool too small for the current build's "
+                       "requirement (bytes=%zu < current requirement=%zu)\n",
+                       bytes, cur.bytes);
+            return NULL;
+        }
+    }
+
     if (!MEM_IS_ALIGNED16(mem)) {
-        fprintf(stderr, "audio_pipeline_init: pool not 16-byte aligned (%p)\n", mem);
+        AP_LOG_ERR("audio_pipeline_init: pool not 16-byte aligned (%p)\n", mem);
         return NULL;
     }
 
@@ -417,7 +499,7 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes, const AudioPipelineC
 
     size_t self_sz = ALIGN16(sizeof(AudioPipeline));
     if (bytes < self_sz) {
-        fprintf(stderr, "audio_pipeline_init: pool too small for the control block (%zu < %zu)\n",
+        AP_LOG_ERR("audio_pipeline_init: pool too small for the control block (%zu < %zu)\n",
                 bytes, self_sz);
         return NULL;
     }
@@ -425,7 +507,7 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes, const AudioPipelineC
     size_t sub_needed = pipeline_pool_size(&aec_cfg, &nr_cfg, hop, frame_sz, fft_sz, n_freqs,
                                             cfg->aec_only);
     if (sub_needed == 0 || sub_bytes < sub_needed) {
-        fprintf(stderr, "audio_pipeline_init: pool too small (%zu available < %zu needed)\n",
+        AP_LOG_ERR("audio_pipeline_init: pool too small (%zu available < %zu needed)\n",
                 sub_bytes, sub_needed);
         return NULL;
     }
@@ -450,6 +532,10 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes, const AudioPipelineC
     p->pool_size  = sub_bytes;
     p->owned_heap = NULL;
     return p;
+}
+
+AudioPipeline* audio_pipeline_init(void* mem, size_t bytes, const AudioPipelineConfig* cfg) {
+    return audio_pipeline_init_ex(mem, bytes, cfg, NULL);
 }
 
 AudioPipeline* audio_pipeline_create(const AudioPipelineConfig* cfg) {

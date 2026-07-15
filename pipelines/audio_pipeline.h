@@ -26,12 +26,25 @@
  *
  *     AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
  *     AudioPipelineMemReq req;
- *     audio_pipeline_get_mem_requirements(&cfg, &req);
+ *     audio_pipeline_get_mem_requirements(&cfg, &req);      // query, EVERY time
  *     void* pool = platform_alloc(req.bytes, req.alignment);  // 16-byte aligned
- *     AudioPipeline* p = audio_pipeline_init(pool, req.bytes, &cfg);
+ *     AudioPipeline* p = audio_pipeline_init_ex(pool, req.bytes, &cfg, &req);
  *     ...
  *     audio_pipeline_destroy(p);       // no-op on the pool path (see below)
  *     platform_free(pool);
+ *
+ *   The board flow above queries `req` at INIT TIME and hands it straight
+ *   to audio_pipeline_init_ex() in the same breath — never cache `req` (or
+ *   just its `bytes` field) across a build, backend, or config change and
+ *   replay it later: a firmware image built against an OLDER layout_version/
+ *   backend/build_flags_hash than the library it now links would otherwise
+ *   silently carve into a pool sized/shaped for the wrong build.
+ *   audio_pipeline_init_ex() exists to catch exactly that mistake at
+ *   board-bring-up time instead of a silent memory-corruption bug in the
+ *   field — see its own doc below. Plain audio_pipeline_init() (no
+ *   descriptor) remains available for callers that re-derive `req` fresh on
+ *   every call anyway (the pool path above) or that don't need the extra
+ *   check (the heap path below already re-derives it internally).
  *
  *   Heap convenience (desktop CLIs, quick prototyping):
  *
@@ -49,7 +62,7 @@
  *     }
  *
  * See pipelines/README.md ("Board Integration") for the full sequence
- * (query -> allocate -> init -> process* -> reset? -> destroy -> release),
+ * (query -> allocate -> init_ex -> process* -> reset? -> destroy -> release),
  * teardown-order rationale, and the layout_version/build_flags_hash contract.
  */
 #ifndef AUDIO_PIPELINE_H
@@ -212,11 +225,78 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
  * entire lifetime of the returned handle — every sub-module and pipeline
  * buffer is a raw pointer into it, not a copy.
  *
+ * Equivalent to `audio_pipeline_init_ex(mem, bytes, cfg, NULL)` — this call
+ * does NOT verify a caller-supplied `AudioPipelineMemReq` against the
+ * current build (there is none to verify here), so a stale cached
+ * descriptor from a caller that skips straight to this entry point is not
+ * caught. A board integrator holding an `AudioPipelineMemReq` from its own
+ * `audio_pipeline_get_mem_requirements()` call should use
+ * audio_pipeline_init_ex() instead, passing that descriptor, so a
+ * build/backend/config mismatch is rejected instead of silently carving
+ * into a pool sized for a different build.
+ *
  * @return a valid handle, or NULL (misaligned/undersized pool, invalid cfg,
- *         or a sub-module init/grid-agreement failure — see stderr).
+ *         or a sub-module init/grid-agreement failure — see stderr, or
+ *         nothing at all in a NO_STDIO build, see audio_pipeline.c).
  */
 AudioPipeline* audio_pipeline_init(void* mem, size_t bytes,
                                     const AudioPipelineConfig* cfg);
+
+/**
+ * Like audio_pipeline_init(), but additionally verifies a caller-supplied
+ * `expected` memory descriptor against what THIS build/config would compute
+ * right now — the board-bring-up safety net review R09 asked for.
+ *
+ * Intended flow: a board integrator queries `AudioPipelineMemReq` via
+ * audio_pipeline_get_mem_requirements() AT INIT TIME (never earlier, never
+ * cached across a firmware rebuild / backend switch / config change) and
+ * passes that SAME descriptor straight into this call as `expected`. If the
+ * library this binary actually links against no longer agrees with that
+ * descriptor — a different layout_version, a different backend, a
+ * different build_flags_hash, or fewer bytes than the CURRENT build now
+ * needs — the mismatch is rejected here (NULL, with a diagnostic naming the
+ * mismatched field) instead of silently carving a pool laid out for a
+ * build that no longer exists.
+ *
+ * `expected == NULL`: behaves EXACTLY like audio_pipeline_init(mem, bytes,
+ * cfg) — no descriptor to check, so none is checked. This is the mode
+ * audio_pipeline_init() itself uses (a thin wrapper over this function).
+ *
+ * `expected != NULL`: audio_pipeline_get_mem_requirements(cfg, &cur) is
+ * recomputed internally (this is cheap — no allocation, no audio state
+ * touched) and EVERY one of the following must hold, checked in this order,
+ * each on its own AP_LOG_ERR diagnostic naming the field and both values so
+ * a board bring-up log pinpoints exactly what went stale — or this call
+ * returns NULL without carving anything:
+ *
+ *   1. expected->layout_version == cur.layout_version
+ *   2. expected->backend and cur.backend compare equal (strcmp) — a
+ *      NULL expected->backend is treated as a mismatch, not a crash
+ *   3. expected->build_flags_hash == cur.build_flags_hash
+ *   4. expected->alignment == cur.alignment
+ *   5. expected->bytes >= cur.bytes (the CACHED descriptor's own bytes
+ *      figure must already have covered what the CURRENT build needs)
+ *   6. bytes >= cur.bytes (the POOL ACTUALLY HANDED IN this call must also
+ *      cover it — distinct from #5: a caller could pass a stale `expected`
+ *      with a big enough `bytes` field but then allocate/pass in a smaller
+ *      block than that)
+ *
+ * Only once all six hold does this proceed exactly as audio_pipeline_init()
+ * would (same alignment/undersized-pool checks, same carve, same return
+ * semantics). This function does not itself require `bytes == expected->
+ * bytes`, or `mem`/pool size to match `expected->bytes` beyond the >=
+ * relations above — `expected` is a provenance check on the BUILD, not a
+ * replacement for the normal bytes-sufficiency check already inside the
+ * carve path.
+ *
+ * @return a valid handle, or NULL (any of the six checks above fails when
+ *         `expected` is non-NULL, or any audio_pipeline_init() rejection
+ *         reason — misaligned/undersized pool, invalid cfg, sub-module
+ *         init/grid-agreement failure).
+ */
+AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes,
+                                       const AudioPipelineConfig* cfg,
+                                       const AudioPipelineMemReq* expected);
 
 /**
  * Process exactly one hop (audio_pipeline_hop_size(p) samples) of mic/ref

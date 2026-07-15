@@ -90,6 +90,24 @@ ifeq ($(WERROR),1)
   CFLAGS += -Werror
 endif
 
+# NO_STDIO=1 (re-review R09): compiles audio_pipeline.o with
+# -DAUDIO_PIPELINE_NO_STDIO, which turns every AP_LOG_ERR() diagnostic in
+# audio_pipeline.c into a no-op and drops its <stdio.h> include entirely --
+# see that file's "No-stdio build gate" section. This is a board-firmware
+# concern (a stdio-less image, or one that forbids the stdio symbol set
+# outright), so it is scoped to LIB_CFLAGS (used ONLY by the
+# libaudio_pipeline.a object below) rather than the shared CFLAGS: the two
+# CLIs (aec_nr_pipeline / aec_nr_pipeline_static) are host tools that always
+# do their own WAV-I/O stdio regardless, and test_audio_pipeline.c prints
+# its own PASS/FAIL via stdio unconditionally -- neither references
+# AUDIO_PIPELINE_NO_STDIO, so there is nothing to gain (and a real loss of
+# CLI diagnostics) from adding the define to their compiles.
+NO_STDIO ?= 0
+LIB_CFLAGS = $(CFLAGS)
+ifeq ($(NO_STDIO),1)
+  LIB_CFLAGS += -DAUDIO_PIPELINE_NO_STDIO
+endif
+
 # The NE10 archive carries one C++ TU (NE10's generic-radix FFT kernel); a
 # plain-C pipeline binary linking against it needs the C++ runtime driver.
 LINK = $(CC)
@@ -155,7 +173,16 @@ LDFLAGS = $(LIBS) -lm $(LDFLAGS_EXTRA)
 # computes the hash. On stdin it prints "<checksum> <byte-count>" with no
 # filename field (verified on macOS's BSD cksum), so `cut -d' ' -f1` isolates
 # just the checksum.
-CFG_SIG := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR)" | cksum | cut -d' ' -f1)
+# NO_STDIO is folded in here (even though it only ever changes LIB_CFLAGS,
+# i.e. only audio_pipeline.o's own compile) so that flipping it still lands
+# in a fresh OBJ_DIR like every other axis this Makefile keys on -- without
+# this, a NO_STDIO=1 build and a NO_STDIO=0 (default) build of the OTHER
+# three objects (both CLIs' .o + test_audio_pipeline.o, which never see
+# LIB_CFLAGS) would otherwise share one directory, which is harmless for
+# THOSE objects (their recipe never varies with NO_STDIO) but breaks the
+# "OBJ_DIR uniquely names a config" invariant `make audit-no-stdio` (below)
+# relies on to find audio_pipeline.o's own NO_STDIO=1 build deterministically.
+CFG_SIG := $(shell printf '%s' "$(CC) $(CFLAGS) $(EXTRA_CFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO)" | cksum | cut -d' ' -f1)
 
 OBJ_ROOT = obj
 OBJ_DIR  = $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
@@ -164,7 +191,7 @@ OBJ_DIR  = $(OBJ_ROOT)/$(BACKEND)-$(CFG_SIG)
 # hash-keyed by their own Makefiles, which now key off the same
 # BACKEND/EXTRA_CFLAGS/WERROR axes.)
 
-.PHONY: all clean clean-libs clean-all libs test
+.PHONY: all clean clean-libs clean-all libs test audit-no-stdio print-obj-dir
 
 all: libs aec_nr_pipeline aec_nr_pipeline_static
 
@@ -201,8 +228,10 @@ $(OBJ_DIR)/aec_nr_pipeline_static.o: aec_nr_pipeline_static.c audio_pipeline.h |
 # CLI -- see audio_pipeline.h. The archive holds ONLY this one object (not a
 # fat archive bundling libaec/libmmse_lsa/libaudio_common); those stay
 # separate libraries a consumer links alongside it, same as both CLIs do.
+# Compiled with $(LIB_CFLAGS) (not the shared $(CFLAGS)) so NO_STDIO=1 only
+# ever affects THIS object -- see the NO_STDIO comment near CFLAGS above.
 $(OBJ_DIR)/audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h | $(OBJ_DIR)
-	$(CC) $(CFLAGS) -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -c -o $@ $<
 
 libaudio_pipeline.a: $(OBJ_DIR)/audio_pipeline.o
 	ar rcs $@ $^
@@ -225,6 +254,44 @@ test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o libaudio_pipeline.a | libs
 
 test: test_audio_pipeline
 	./test_audio_pipeline
+
+# print-obj-dir: prints THIS invocation's $(OBJ_DIR) and nothing else --
+# a plumbing helper `audit-no-stdio` below uses (via a `$(MAKE) -s ...
+# print-obj-dir` sub-call) to learn the hash-keyed directory a NO_STDIO=1
+# build lands in, without duplicating CFG_SIG's cksum computation in shell.
+print-obj-dir:
+	@echo $(OBJ_DIR)
+
+# audit-no-stdio (re-review R09): builds libaudio_pipeline.a with NO_STDIO=1
+# (current BACKEND=$(BACKEND)) and asserts, via `nm` over audio_pipeline.o
+# ITSELF (not the CLIs, not test_audio_pipeline.o -- neither is built by
+# this target, and neither is gated by AUDIO_PIPELINE_NO_STDIO to begin
+# with), that none of fprintf/printf/puts/fputs/stderr/__stderrp made it
+# into the object. Pattern/style mirrors
+# ../../audio_common/scripts/audit_alloc_symbols.sh (leading-underscore-
+# tolerant regex, last-whitespace-field match against nm's NAME column, so
+# it works the same under macOS/BSD nm and GNU nm). Unlike that script this
+# IS a pass/fail gate (prints PASS/FAIL, non-zero exit on FAIL) -- it is the
+# audit_alloc_symbols.sh idea applied to prove a NEGATIVE build property
+# (these symbols are ABSENT) rather than report positive allocator-call
+# provenance.
+audit-no-stdio:
+	@echo "audit-no-stdio: building libaudio_pipeline.a (BACKEND=$(BACKEND), NO_STDIO=1)"
+	@$(MAKE) --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 libaudio_pipeline.a
+	@objdir=$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-obj-dir); \
+	obj="$$objdir/audio_pipeline.o"; \
+	if [ ! -f "$$obj" ]; then \
+	  echo "FAIL: $$obj not found after building libaudio_pipeline.a with NO_STDIO=1"; \
+	  exit 1; \
+	fi; \
+	echo "audit-no-stdio: nm -A $$obj | grep -E '^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$' (NAME column)"; \
+	hits=$$(nm -A "$$obj" | awk '{ name = $$NF; if (name ~ /^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$/) print }'); \
+	if [ -n "$$hits" ]; then \
+	  echo "FAIL: forbidden stdio symbol(s) found in $$obj (NO_STDIO=1 build):"; \
+	  echo "$$hits"; \
+	  exit 1; \
+	fi; \
+	echo "PASS: no fprintf/printf/puts/fputs/stderr/__stderrp symbols in $$obj (NO_STDIO=1)"
 
 clean:
 	rm -rf $(OBJ_ROOT)
