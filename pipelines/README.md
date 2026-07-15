@@ -224,6 +224,30 @@ always compiles fresh objects into a fresh directory instead of reusing a
 stale `.o`. Two builds with different flags/backends can even coexist or run
 concurrently in the same worktree without stomping each other's objects.
 
+### Unified FP-contraction policy (round-3 review B04)
+
+`-ffp-contract=off` is a **unified policy spanning all four repos**
+(`audio_common`, `lib/nr`, `lib/aec`, this `pipelines/` Makefile): every TU
+each Makefile compiles — own sources and vendored KISS/NE10 alike — builds
+with the flag, appended LAST in the `CFLAGS`/`LIB_CFLAGS` assembly (after
+`-DAUDIO_PIPELINE_BACKEND_STR`, `EXTRA_CFLAGS`, `WERROR`) so nothing can
+override it — this Makefile used to carry the flag as the *fourth* token of
+the base `CFLAGS` assignment (before `EXTRA_CFLAGS` was folded in), which
+this review moved to its current trailing position. `EXTRA_CFLAGS` (or a
+`CFLAGS=` override) containing `-Ofast`/`-ffast-math`/`-ffp-contract=<any>`
+is rejected at parse time:
+
+```
+$ make EXTRA_CFLAGS=-ffast-math
+Makefile:217: *** FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from EXTRA_CFLAGS.  Stop.
+```
+
+`../../audio_common/scripts/audit_fp_contract.sh` is the disassembly-level
+proof the flag actually bites (audio_common's and NR's TUs — this
+directory's own three TUs, being pure CLI/glue code with no per-sample math
+loops of their own, are outside that script's audit list). See
+`audio_common/README.md`'s "FP-contraction policy" section for the full
+cross-repo writeup.
 
 ## Two Versions
 

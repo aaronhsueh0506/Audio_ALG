@@ -136,14 +136,18 @@ DEBUG         ?= 0
 # for correctness.
 EXTRA_CFLAGS ?=
 
-# -ffp-contract=off: same FMA-contraction policy as the AEC library TUs.
-# Deliberate BYTE-CHANGE when it landed (clang had been contracting a
-# handful of mul+add pairs in the pipeline glue, e.g. the |E|^2 hoist) —
-# the pipeline render baselines were regenerated at that commit. Keeping
-# the flag uniform means future SIMD/EMA-style code added to pipeline TUs
-# inherits the repo-wide bit-exactness discipline instead of silently
-# depending on the compiler's contraction mood (review F12).
-CFLAGS = -Wall -Wextra -O2 -std=gnu99 -ffp-contract=off \
+# Deliberate BYTE-CHANGE when -ffp-contract=off first landed here (clang had
+# been contracting a handful of mul+add pairs in the pipeline glue, e.g. the
+# |E|^2 hoist) — the pipeline render baselines were regenerated at that
+# commit. Keeping the flag uniform means future SIMD/EMA-style code added to
+# pipeline TUs inherits the repo-wide bit-exactness discipline instead of
+# silently depending on the compiler's contraction mood (review F12). The
+# flag itself is appended further down (see the "FP-contraction policy"
+# section below, after EXTRA_CFLAGS/WERROR are folded in) rather than here —
+# round-3 review B04 moved it from this early position (BEFORE EXTRA_CFLAGS)
+# to the true end of the CFLAGS assembly, so a caller's EXTRA_CFLAGS can
+# never land after it and override it.
+CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
          -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
          -I$(NR_DIR)/include \
          -I$(AC_DIR)/include
@@ -179,6 +183,45 @@ LIB_CFLAGS = $(CFLAGS)
 ifeq ($(NO_STDIO),1)
   LIB_CFLAGS += -DAUDIO_PIPELINE_NO_STDIO
 endif
+
+# --- FP-contraction policy: unified across all four repos (round-3 review
+# B04). This flag USED TO be the fourth token of the base CFLAGS assignment
+# above (before -I$(AEC_DIR)/include etc., and well before EXTRA_CFLAGS/
+# WERROR were folded in) -- so a caller passing EXTRA_CFLAGS=-ffp-contract=fast
+# (or -Ofast/-ffast-math, which imply contraction) would land LATER on the
+# compile line and silently win. Moved here -- appended LAST, after every
+# other CFLAGS append in this file (the base -I flags, -DAUDIO_PIPELINE_
+# BACKEND_STR, EXTRA_CFLAGS, WERROR), and BEFORE CFG_SIG_PAYLOAD is computed
+# below -- so nothing can override it any more. LIB_CFLAGS = $(CFLAGS) above
+# is a recursive (lazily-expanded) variable: its own definition is the
+# literal text "$(CFLAGS)" (plus the conditional -DAUDIO_PIPELINE_NO_STDIO
+# token), re-expanded against CFLAGS's CURRENT value every time LIB_CFLAGS
+# is used in a recipe -- so appending FP_POLICY to CFLAGS alone (below)
+# already reaches LIB_CFLAGS automatically; appending it to LIB_CFLAGS a
+# second time here would duplicate the flag on every libaudio_pipeline.a
+# compile line (harmless in effect, since both instances say "off", but
+# noisy and worth avoiding). See audio_common's Makefile for the full
+# cross-repo design writeup and scripts/audit_fp_contract.sh (in
+# audio_common) for the disassembly-level verification.
+#
+# Conflict detection (round-3 review B04): reject outright rather than let
+# a caller silently re-enable contraction. Checked against the
+# fully-assembled $(CFLAGS) (already includes EXTRA_CFLAGS and any CFLAGS=
+# command-line override) BEFORE FP_POLICY is appended below and BEFORE
+# CFG_SIG is computed, so a rejected build never creates an obj/bin
+# directory.
+ifneq ($(findstring -Ofast,$(CFLAGS)),)
+$(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -Ofast; this repo pins -ffp-contract=off; remove -Ofast from EXTRA_CFLAGS)
+endif
+ifneq ($(findstring -ffast-math,$(CFLAGS)),)
+$(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from EXTRA_CFLAGS)
+endif
+ifneq ($(findstring -ffp-contract=,$(CFLAGS)),)
+$(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffp-contract=; this repo pins -ffp-contract=off; remove -ffp-contract= from EXTRA_CFLAGS)
+endif
+
+FP_POLICY := -ffp-contract=off
+CFLAGS     += $(FP_POLICY)
 
 # The NE10 archive carries one C++ TU (NE10's generic-radix FFT kernel); a
 # plain-C pipeline binary linking against it needs the C++ runtime driver.
