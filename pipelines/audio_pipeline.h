@@ -36,9 +36,10 @@
  *   The board flow above queries `req` at INIT TIME and hands it straight
  *   to audio_pipeline_init_ex() in the same breath — never cache `req` (or
  *   just its `bytes` field) across a build, backend, or config change and
- *   replay it later: a firmware image built against an OLDER layout_version/
- *   backend/build_flags_hash than the library it now links would otherwise
- *   silently carve into a pool sized/shaped for the wrong build.
+ *   replay it later: a firmware image built against an OLDER descriptor_
+ *   version/layout_version/backend_id/build_flags_hash than the library it
+ *   now links would otherwise silently carve into a pool sized/shaped for
+ *   the wrong build.
  *   audio_pipeline_init_ex() exists to catch exactly that mistake at
  *   board-bring-up time instead of a silent memory-corruption bug in the
  *   field — see its own doc below. Plain audio_pipeline_init() (no
@@ -63,7 +64,8 @@
  *
  * See pipelines/README.md ("Board Integration") for the full sequence
  * (query -> allocate -> init_ex -> process* -> reset? -> destroy -> release),
- * teardown-order rationale, and the layout_version/build_flags_hash contract.
+ * teardown-order rationale, and the descriptor_version/layout_version/
+ * backend_id/build_flags_hash contract.
  */
 #ifndef AUDIO_PIPELINE_H
 #define AUDIO_PIPELINE_H
@@ -83,19 +85,69 @@ extern "C" {
  * ========================================================================== */
 
 /**
- * Richer-than-a-bare-size_t memory descriptor (review F20). A board memory
- * manager consuming ONLY `bytes` (the way the old CLI's bare
- * `pipeline_pool_size() -> size_t` did) has no way to tell whether a
- * previously-recorded byte count still describes today's library build, or
- * whether the block it's about to hand back is even legal to carve into.
- * The extra fields close that gap:
+ * This struct's own ABI version (review B06). Bumped ONLY when
+ * AudioPipelineMemReq's field set/order/width changes — independent of
+ * layout_version below, which tracks THIS FILE's carve layout, not the
+ * descriptor struct's own shape. audio_pipeline_init_ex() checks this FIRST,
+ * before interpreting any other field, so a descriptor produced against an
+ * ABI-incompatible header is rejected before this build tries to read its
+ * other fields under a (possibly different) struct layout.
+ */
+#define AUDIO_PIPELINE_DESCRIPTOR_VERSION 2u
+
+/**
+ * Compile-time FFT backend identity as small stable integers — never a
+ * string (see AudioPipelineMemReq.backend_id doc below for why). 0 is
+ * reserved for "unknown backend" and never appears in a descriptor
+ * audio_pipeline_get_mem_requirements() actually returns: that function
+ * rejects an AUDIO_PIPELINE_BACKEND_STR it doesn't recognize outright.
+ */
+#define AUDIO_PIPELINE_BACKEND_KISS 1u
+#define AUDIO_PIPELINE_BACKEND_NE10 2u
+
+/**
+ * Fixed-width, serializable memory descriptor (review B06 — supersedes the
+ * F20 struct, a BREAKING pre-release change; every caller is in-repo). The
+ * F20 shape — {size_t bytes; size_t alignment; uint32_t layout_version;
+ * const char* backend; uint32_t build_flags_hash;} — had four problems that
+ * only matter once a caller wants to persist or transmit this descriptor
+ * (a board's own bring-up log, an NVRAM cache, a wire message to another
+ * process) rather than just consume it same-process, same-call:
  *
- *   - alignment:        required base alignment of the `mem` pointer passed
- *                        to audio_pipeline_init(). Always 16 today (the one
- *                        alignment every module in this stack — AEC, NR,
- *                        the FFT backends, mem_align.h's ALIGN16 — carves
- *                        to); kept as a field rather than a hardcoded "16"
- *                        so a caller's code doesn't have to.
+ *   - `backend` was a `const char*` — a process-local rodata pointer. It is
+ *     not meaningful outside the address space (and binary) that produced
+ *     it, so it cannot be written to a file/flash region and read back by
+ *     ANY other process, nor even by a later run of this same program after
+ *     ASLR/relocation moves that literal.
+ *   - `size_t` is not a fixed width (4 bytes on a 32-bit target, 8 on a
+ *     64-bit one), so the struct's total size — and therefore any persisted
+ *     byte image of it — silently differed by build target, defeating the
+ *     entire point of a descriptor meant to be compared/cached across builds.
+ *   - Compiler/ABI-dependent padding between a `size_t`/`uint32_t`/pointer
+ *     run of fields meant even two builds agreeing on every field's VALUE
+ *     could still disagree on the struct's total byte layout.
+ *   - `strcmp`/`%s` against `expected->backend` — even though today it is
+ *     always our own literal, never caller-supplied text — is exactly the
+ *     shape of hazard (unbounded string handling at a trust boundary) this
+ *     file otherwise avoids: a board's `expected` descriptor may originate
+ *     from persisted/transmitted bytes this library never validated.
+ *
+ * V2 fixes all four by making every field a fixed-width integer (uint32_t or
+ * uint64_t, never `size_t` or a pointer), in the EXACT layout the
+ * `_Static_assert`s immediately below the typedef pin: sizeof(
+ * AudioPipelineMemReq) is exactly 32 bytes, every field at a fixed byte
+ * offset, on every target this header compiles for. That makes the struct
+ * meaningfully serializable — copied byte-for-byte to a file, a flash
+ * region, or a wire message, and read back later, even by a different
+ * process, even after a restart — WITHIN A SAME-ENDIANNESS SCOPE: this
+ * descriptor is exchanged between the board firmware and this same library
+ * build on the SAME CPU. Cross-endian interchange (a big-endian producer
+ * read by a little-endian consumer, or vice versa) is explicitly OUT OF
+ * SCOPE — this struct provides no byte-swap helpers; add your own at the
+ * serialization boundary if you ever need one.
+ *
+ *   - descriptor_version: this STRUCT's own ABI version — see the
+ *                        AUDIO_PIPELINE_DESCRIPTOR_VERSION doc above.
  *   - layout_version:   bumped whenever this file's OWN carve order, buffer
  *                        set, or per-buffer sizing formula changes (i.e.
  *                        whenever a `bytes` figure computed by an OLDER
@@ -113,14 +165,22 @@ extern "C" {
  *                        bump on ITS OWN axis. layout_version is specifically
  *                        this file's contract with a caller who might cache
  *                        the descriptor across a library upgrade.
- *   - backend:           compile-time FFT backend identity, "kiss" or
- *                        "ne10" (the `BACKEND=` a caller built THIS TU
- *                        with — see pipelines/Makefile). Informational: the
- *                        two backends are not byte-identical to each other
- *                        (pre-existing, expected — see lib/aec/CLAUDE.md),
- *                        so a descriptor computed against one is never a
- *                        valid stand-in for the other even at matching
- *                        `bytes`.
+ *   - backend_id:        compile-time FFT backend identity as a small
+ *                        integer — AUDIO_PIPELINE_BACKEND_KISS (1) or
+ *                        AUDIO_PIPELINE_BACKEND_NE10 (2); never 0 in a
+ *                        descriptor this library actually returns (see
+ *                        above). Replaces F20's `const char* backend`
+ *                        ("kiss"/"ne10") for the serializability reason
+ *                        above; audio_pipeline_init_ex() compares this field
+ *                        with a plain integer `==`, never `strcmp`, so an
+ *                        `expected` descriptor sourced from persisted/
+ *                        transmitted bytes can never trigger a string
+ *                        operation over data this library didn't itself
+ *                        produce. The two backends are still not
+ *                        byte-identical to each other (pre-existing,
+ *                        expected — see lib/aec/CLAUDE.md), so a descriptor
+ *                        computed against one is never a valid stand-in for
+ *                        the other even at matching `bytes`.
  *   - build_flags_hash:  FNV-1a-32 hash of a small, fixed set of compile-time
  *                        strings that affect this file's carve STRUCTURE:
  *                        the backend identity (above) plus a literal token
@@ -138,14 +198,56 @@ extern "C" {
  *                        `bytes`); AEC's/NR's/the FFT backend's internal
  *                        struct layouts (opaque composite blobs, as above);
  *                        the compiler/ABI/toolchain.
+ *   - alignment:         required base alignment of the `mem` pointer passed
+ *                        to audio_pipeline_init(). Always 16 today (the one
+ *                        alignment every module in this stack — AEC, NR,
+ *                        the FFT backends, mem_align.h's ALIGN16 — carves
+ *                        to); kept as a field rather than a hardcoded "16"
+ *                        so a caller's code doesn't have to. `uint32_t`, not
+ *                        `size_t` — see the fixed-width rationale above.
+ *   - reserved:          always 0 today; exists ONLY so `bytes` (a
+ *                        uint64_t) falls on an 8-byte-aligned offset within
+ *                        the struct without any compiler-inserted padding —
+ *                        part of the fixed 32-byte layout the
+ *                        `_Static_assert`s below pin, not a field a caller
+ *                        should read or write.
+ *   - bytes:             total pool size (>= this many bytes, 16-aligned).
+ *                        `uint64_t`, not `size_t` — see the fixed-width
+ *                        rationale above; placed last so its natural 8-byte
+ *                        alignment falls out of the preceding six uint32_t
+ *                        fields (24 bytes) with no compiler-inserted padding.
  */
 typedef struct {
-    size_t      bytes;             /* total pool size (>= this many bytes, 16-aligned) */
-    size_t      alignment;         /* required base alignment of `mem`, bytes (16)     */
-    uint32_t    layout_version;    /* this file's own carve-layout version (see above) */
-    const char* backend;           /* "kiss" | "ne10" (compile-time)                   */
-    uint32_t    build_flags_hash;  /* FNV-1a-32 of the layout-affecting compile flags   */
+    uint32_t descriptor_version;  /* = AUDIO_PIPELINE_DESCRIPTOR_VERSION (2) */
+    uint32_t layout_version;      /* carve-layout version (unchanged meaning) */
+    uint32_t backend_id;          /* AUDIO_PIPELINE_BACKEND_KISS=1 / _NE10=2 */
+    uint32_t build_flags_hash;    /* FNV-1a-32, unchanged meaning */
+    uint32_t alignment;           /* 16 */
+    uint32_t reserved;            /* 0; keeps 8-byte alignment for bytes */
+    uint64_t bytes;               /* total pool size */
 } AudioPipelineMemReq;
+
+/* Fixed 32-byte ABI, pinned field-by-field (review B06) — this must never
+ * again vary by target/compiler/ABI; see the struct's own doc above. A
+ * caller may serialize this struct verbatim (memcpy to/from a file, flash
+ * region, or wire buffer) WITHIN A SAME-ENDIANNESS SCOPE only — no
+ * cross-endian byte-swap support is provided (see above). */
+_Static_assert(sizeof(AudioPipelineMemReq) == 32,
+               "AudioPipelineMemReq must be exactly 32 bytes (fixed-width serializable ABI)");
+_Static_assert(offsetof(AudioPipelineMemReq, descriptor_version) == 0,
+               "AudioPipelineMemReq.descriptor_version must be at offset 0");
+_Static_assert(offsetof(AudioPipelineMemReq, layout_version) == 4,
+               "AudioPipelineMemReq.layout_version must be at offset 4");
+_Static_assert(offsetof(AudioPipelineMemReq, backend_id) == 8,
+               "AudioPipelineMemReq.backend_id must be at offset 8");
+_Static_assert(offsetof(AudioPipelineMemReq, build_flags_hash) == 12,
+               "AudioPipelineMemReq.build_flags_hash must be at offset 12");
+_Static_assert(offsetof(AudioPipelineMemReq, alignment) == 16,
+               "AudioPipelineMemReq.alignment must be at offset 16");
+_Static_assert(offsetof(AudioPipelineMemReq, reserved) == 20,
+               "AudioPipelineMemReq.reserved must be at offset 20");
+_Static_assert(offsetof(AudioPipelineMemReq, bytes) == 24,
+               "AudioPipelineMemReq.bytes must be at offset 24");
 
 /* ============================================================================
  * Config
@@ -252,11 +354,11 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes,
  * cached across a firmware rebuild / backend switch / config change) and
  * passes that SAME descriptor straight into this call as `expected`. If the
  * library this binary actually links against no longer agrees with that
- * descriptor — a different layout_version, a different backend, a
- * different build_flags_hash, or fewer bytes than the CURRENT build now
- * needs — the mismatch is rejected here (NULL, with a diagnostic naming the
- * mismatched field) instead of silently carving a pool laid out for a
- * build that no longer exists.
+ * descriptor — a different descriptor_version, layout_version, backend_id,
+ * or build_flags_hash, or fewer bytes than the CURRENT build now needs — the
+ * mismatch is rejected here (NULL, with a diagnostic naming the mismatched
+ * field) instead of silently carving a pool laid out for a build that no
+ * longer exists.
  *
  * `expected == NULL`: behaves EXACTLY like audio_pipeline_init(mem, bytes,
  * cfg) — no descriptor to check, so none is checked. This is the mode
@@ -265,23 +367,25 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes,
  * `expected != NULL`: audio_pipeline_get_mem_requirements(cfg, &cur) is
  * recomputed internally (this is cheap — no allocation, no audio state
  * touched) and EVERY one of the following must hold, checked in this order,
- * each on its own AP_LOG_ERR diagnostic naming the field and both values so
- * a board bring-up log pinpoints exactly what went stale — or this call
- * returns NULL without carving anything:
+ * each on its own AP_LOG_ERR diagnostic naming the field and both (integer)
+ * values so a board bring-up log pinpoints exactly what went stale — or this
+ * call returns NULL without carving anything:
  *
- *   1. expected->layout_version == cur.layout_version
- *   2. expected->backend and cur.backend compare equal (strcmp) — a
- *      NULL expected->backend is treated as a mismatch, not a crash
- *   3. expected->build_flags_hash == cur.build_flags_hash
- *   4. expected->alignment == cur.alignment
- *   5. expected->bytes >= cur.bytes (the CACHED descriptor's own bytes
+ *   1. expected->descriptor_version == cur.descriptor_version (checked
+ *      FIRST — a struct-ABI mismatch makes every other field meaningless)
+ *   2. expected->layout_version == cur.layout_version
+ *   3. expected->backend_id == cur.backend_id (plain integer `==` — never
+ *      `strcmp`; see AudioPipelineMemReq.backend_id's doc for why)
+ *   4. expected->build_flags_hash == cur.build_flags_hash
+ *   5. expected->alignment == cur.alignment
+ *   6. expected->bytes >= cur.bytes (the CACHED descriptor's own bytes
  *      figure must already have covered what the CURRENT build needs)
- *   6. bytes >= cur.bytes (the POOL ACTUALLY HANDED IN this call must also
- *      cover it — distinct from #5: a caller could pass a stale `expected`
+ *   7. bytes >= cur.bytes (the POOL ACTUALLY HANDED IN this call must also
+ *      cover it — distinct from #6: a caller could pass a stale `expected`
  *      with a big enough `bytes` field but then allocate/pass in a smaller
  *      block than that)
  *
- * Only once all six hold does this proceed exactly as audio_pipeline_init()
+ * Only once all seven hold does this proceed exactly as audio_pipeline_init()
  * would (same alignment/undersized-pool checks, same carve, same return
  * semantics). This function does not itself require `bytes == expected->
  * bytes`, or `mem`/pool size to match `expected->bytes` beyond the >=
@@ -289,7 +393,7 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes,
  * replacement for the normal bytes-sufficiency check already inside the
  * carve path.
  *
- * @return a valid handle, or NULL (any of the six checks above fails when
+ * @return a valid handle, or NULL (any of the seven checks above fails when
  *         `expected` is non-NULL, or any audio_pipeline_init() rejection
  *         reason — misaligned/undersized pool, invalid cfg, sub-module
  *         init/grid-agreement failure).

@@ -104,11 +104,25 @@ static void print_debug_status(const AudioPipeline* pipe, int aec_only, float se
         n.initialized, n.mean_gain_db, n.min_gain_db, n.mean_spp, n.noise_floor_db);
 }
 
+/* Human-readable name for a descriptor backend_id -- CLI-side convenience
+ * only (this is trusted local code turning OUR OWN integer back into a
+ * string for a diagnostic table; not the caller-data %s/strcmp hazard the
+ * library itself now avoids -- see audio_pipeline.h's AudioPipelineMemReq.
+ * backend_id doc). */
+static const char* backend_id_name(uint32_t backend_id) {
+    switch (backend_id) {
+        case AUDIO_PIPELINE_BACKEND_KISS: return "kiss";
+        case AUDIO_PIPELINE_BACKEND_NE10: return "ne10";
+        default:                          return "unknown";
+    }
+}
+
 /* --print-mem-size diagnostic table. Backed by audio_pipeline_get_mem_breakdown
  * (per-module AEC/FFT/NR/pipeline-buffer split) + audio_pipeline_get_mem_requirements
- * (the F20 descriptor: total bytes incl. the AudioPipeline control block itself,
- * alignment, layout_version, backend, build_flags_hash). Same table shape as the
- * pre-F20 static CLI, plus the descriptor fields the old bare size_t couldn't carry. */
+ * (the descriptor V2 struct, review B06: total bytes incl. the AudioPipeline
+ * control block itself, descriptor_version, layout_version, backend_id,
+ * build_flags_hash, alignment). Same table shape as the pre-F20 static CLI,
+ * plus the descriptor fields the old bare size_t couldn't carry. */
 static void print_mem_budget(const AudioPipelineConfig* cfg) {
     AudioPipelineMemBreakdown b;
     AudioPipelineMemReq req;
@@ -129,11 +143,13 @@ static void print_mem_budget(const AudioPipelineConfig* cfg) {
     }
     printf("  Pipeline bufs:  %7zu bytes (%6.1f KB)\n", b.pipeline_bytes, (float)b.pipeline_bytes / 1024.0f);
     printf("  --------------------------------\n");
-    printf("  Total:          %7zu bytes (%6.1f KB)  [incl. %zu B AudioPipeline control block]\n",
-           req.bytes, (float)req.bytes / 1024.0f,
-           req.bytes - b.aec_bytes - b.fft_bytes - b.nr_bytes - b.pipeline_bytes);
-    printf("  Descriptor:     alignment=%zu layout_version=%u backend=%s build_flags_hash=0x%08x\n",
-           req.alignment, req.layout_version, req.backend, req.build_flags_hash);
+    printf("  Total:          %7llu bytes (%6.1f KB)  [incl. %llu B AudioPipeline control block]\n",
+           (unsigned long long)req.bytes, (float)req.bytes / 1024.0f,
+           (unsigned long long)req.bytes - b.aec_bytes - b.fft_bytes - b.nr_bytes - b.pipeline_bytes);
+    printf("  Descriptor:     descriptor_version=%u alignment=%u layout_version=%u "
+           "backend_id=%u (%s) build_flags_hash=0x%08x\n",
+           req.descriptor_version, req.alignment, req.layout_version,
+           req.backend_id, backend_id_name(req.backend_id), req.build_flags_hash);
     printf("\n");
 }
 
@@ -171,14 +187,14 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "Error: invalid config (sample_rate=%d?)\n", sample_rate);
             return 1;
         }
-        void* pool = malloc(req.bytes);   /* host stand-in for a platform memory block */
-        if (!pool) { fprintf(stderr, "Error: malloc failed (%zu bytes)\n", req.bytes); return 1; }
+        void* pool = malloc((size_t)req.bytes);   /* host stand-in for a platform memory block */
+        if (!pool) { fprintf(stderr, "Error: malloc failed (%llu bytes)\n", (unsigned long long)req.bytes); return 1; }
         if (((uintptr_t)pool) % req.alignment != 0) {
-            fprintf(stderr, "Error: pool not %zu-byte aligned (%p)\n", req.alignment, pool);
+            fprintf(stderr, "Error: pool not %u-byte aligned (%p)\n", req.alignment, pool);
             free(pool); return 1;
         }
 
-        AudioPipeline* pipe = audio_pipeline_init(pool, req.bytes, &cfg);
+        AudioPipeline* pipe = audio_pipeline_init(pool, (size_t)req.bytes, &cfg);
         if (!pipe) { free(pool); return 1; }
         printf("n_freqs agreement OK (n_freqs=%d, hop=%d) at %d Hz\n",
                audio_pipeline_n_freqs(pipe), audio_pipeline_hop_size(pipe), sample_rate);
@@ -267,15 +283,15 @@ int main(int argc, char* argv[]) {
         wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
 
-    void* pool = malloc(req.bytes);
-    if (!pool) { fprintf(stderr, "Error: malloc failed (%zu bytes)\n", req.bytes); return 1; }
+    void* pool = malloc((size_t)req.bytes);
+    if (!pool) { fprintf(stderr, "Error: malloc failed (%llu bytes)\n", (unsigned long long)req.bytes); return 1; }
     if (((uintptr_t)pool) % req.alignment != 0) {
         /* ALIGN16 contract (mem_align.h): don't rely on allocator luck. */
-        fprintf(stderr, "Error: pool not %zu-byte aligned (%p)\n", req.alignment, pool);
+        fprintf(stderr, "Error: pool not %u-byte aligned (%p)\n", req.alignment, pool);
         free(pool); wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }
 
-    AudioPipeline* pipe = audio_pipeline_init(pool, req.bytes, &cfg);
+    AudioPipeline* pipe = audio_pipeline_init(pool, (size_t)req.bytes, &cfg);
     if (!pipe) {
         free(pool); wav_close_read(mic_r); wav_close_read(ref_r); return 1;
     }

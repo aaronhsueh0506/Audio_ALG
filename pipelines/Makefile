@@ -232,11 +232,13 @@ LDFLAGS += $(EXTRA_LDFLAGS)
 #   archive mtime actually advanced.
 #
 # Goals that never need any producer archive (`libaudio_pipeline.a` -- this
-# repo's OWN library TU never links anything; `audit-no-stdio` -- builds only
-# that same library object; `clean`/`clean-all`; the print-*/help query
-# targets) get their real rules OUTSIDE this dispatch entirely, further down
-# this file -- invoking any of them never shells out to any of the three
-# producers.
+# `clean`/`clean-all` and the help target get their real rules OUTSIDE this
+# dispatch entirely, further down this file. `libaudio_pipeline.a` (and the
+# audit targets that build+inspect it) DO go through the dispatch: the
+# delivered archive is the one a consumer links, and consumers always
+# resolve the producer identities -- so the archive's keyed path must fold
+# them in too (a bare no-producer build would land in a different directory
+# than every query reports).
 #
 # `make -n`: see AEC's/NR's Makefile comments for why the dispatch recipe's
 # sub-`make` calls are genuinely spawned even under `make -n` (GNU Make
@@ -259,8 +261,8 @@ LDFLAGS += $(EXTRA_LDFLAGS)
 FWD = BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO)
 
 ifeq ($(AC_LIB),)
-.PHONY: all test libs publish aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline
-all test libs publish aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline:
+.PHONY: all test libs publish aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline example-adapter libaudio_pipeline.a
+all test libs publish aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline example-adapter libaudio_pipeline.a:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: could not resolve audio_common archive path (AC_DIR=$(AC_DIR) -- is audio_common present as a sibling of Audio_ALG?)" >&2; exit 1; }; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
@@ -362,6 +364,13 @@ $(OBJ_DIR)/audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h |
 $(OBJ_DIR)/test_audio_pipeline.o: test_audio_pipeline.c audio_pipeline.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
+# example_board_adapter: REFERENCE ONLY host simulation of a board-side
+# common-memory-manager integration (round-3 review B02/R04) -- see that
+# file's own header. Not the real board adapter; demonstrates the calling
+# sequence/error handling/descriptor contract only.
+$(OBJ_DIR)/example_board_adapter.o: example_board_adapter.c audio_pipeline.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
 LIB_TARGET = $(BIN_DIR)/libaudio_pipeline.a
 
 # `libaudio_pipeline.a` needs only THIS repo's own object (audio_pipeline.o)
@@ -383,11 +392,32 @@ $(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o | _cfg_guard
 # NR_LIB, always set together by phase 1's re-invoke) is known.
 # =============================================================================
 ifneq ($(AC_LIB),)
-.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline FORCE
+.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline example-adapter example_board_adapter FORCE
 all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static
 
-test: $(BIN_DIR)/test_audio_pipeline
+# test: also builds + runs example_board_adapter (round-3 review B02/R04) --
+# wired into the SAME gate as test_audio_pipeline (not left standalone-only)
+# because it is clean: green on both backends, exits 0 on full success, and
+# its own failure modes (a positive-flow step or negative-demonstration
+# check failing) are exactly the kind of regression this gate exists to
+# catch. `make example-adapter` (below) remains available standalone too.
+test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter
 	./$(BIN_DIR)/test_audio_pipeline
+	./$(BIN_DIR)/example_board_adapter
+
+# example-adapter (round-3 review B02/R04): build + RUN the REFERENCE ONLY
+# board-adapter host simulation (example_board_adapter.c) standalone -- same
+# build-then-run shape as `test:` above. Its own exit code is the smoke-test
+# signal: nonzero if any positive-flow step or negative-demonstration check
+# failed, so a red `make example-adapter` fails the build the same way a red
+# `make test` does.
+example-adapter: $(BIN_DIR)/example_board_adapter
+	./$(BIN_DIR)/example_board_adapter
+
+# Root-name alias for the binary itself (mirrors test_audio_pipeline: below)
+# -- `example-adapter` (above) is the build-AND-run entry point; this is just
+# "build the binary" for whoever wants that split.
+example_board_adapter: $(BIN_DIR)/example_board_adapter
 
 # libs: compat alias for the old `libs:` phony (which used to build the
 # three producer archives directly with hardcoded paths/flags). Building the
@@ -440,6 +470,10 @@ $(BIN_DIR)/aec_nr_pipeline_static: $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TAR
 $(BIN_DIR)/test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
 	@echo "test_audio_pipeline [$(BACKEND)] -> $@"
+
+$(BIN_DIR)/example_board_adapter: $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+	@echo "example_board_adapter [$(BACKEND)] -> $@"
 endif
 
 # --- Query targets (round-3 review B01) -------------------------------------
@@ -511,6 +545,50 @@ audit-no-stdio:
 	   exit 1; \
 	 fi; \
 	 echo "PASS: no fprintf/printf/puts/fputs/stderr/__stderrp symbols in $$lib_nostdio (NO_STDIO=1); path differs from default-config path $$lib_default"
+
+# audit-no-stdio-stack (round-3 review B03, full-image gate): builds ALL FOUR
+# delivered archives with NO_STDIO=1 (the dispatch forwards NO_STDIO to
+# audio_common / lib/aec / lib/nr -- lib/aec compiles its trace/debug TU out
+# entirely under this knob), nm-gates EACH delivered archive, then links
+# test_no_stdio_stack.c (a minimal main that runs the whole
+# query->init_ex->process->reset->destroy flow and uses no stdio itself --
+# exit code is its only output) and nm-gates the EXECUTABLE, so a stdio
+# symbol contributed by any archive fails the audit at the image level.
+# Strictness tiers (calibrated, same as lib/aec's audit): the S1 set
+# (fprintf/vfprintf/printf/puts/fputs) must be absent on BOTH backends at
+# every level; the extended S2 set (+stderr/__stderrp/fputc/fwrite) is
+# additionally enforced for BACKEND=ne10 -- the board deliverable -- end to
+# end. BACKEND=kiss retains __stderrp/fputc/fwrite refs from the VENDORED
+# KISS FFT's malloc-failure error macro (kiss_fft_log.h); that path is
+# unreachable on the pool path (allocator-hook-proven zero-heap) and kiss is
+# the host/reference backend, so it is a documented calibration, not a pass.
+.PHONY: audit-no-stdio-stack
+audit-no-stdio-stack:
+	@echo "audit-no-stdio-stack: building the full stack (BACKEND=$(BACKEND), NO_STDIO=1)"
+	@$(MAKE) --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 libaudio_pipeline.a >/dev/null
+	@pl="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-lib-path)"; \
+	 ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 print-lib-path)"; \
+	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+	 $(MAKE) --no-print-directory -C $(AC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 lib >/dev/null; \
+	 $(MAKE) --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" lib >/dev/null; \
+	 $(MAKE) --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" lib >/dev/null; \
+	 s1='^_?(fprintf|vfprintf|printf|puts|fputs)$$'; \
+	 s2='^_?(fprintf|vfprintf|printf|puts|fputs|stderr|__stderrp|fputc|fwrite)$$'; \
+	 pat="$$s1"; [ "$(BACKEND)" = ne10 ] && pat="$$s2"; \
+	 for lib in "$$pl" "$$aec" "$$nr" "$$ac"; do \
+	   test -f "$$lib" || { echo "FAIL: archive not found: $$lib"; exit 1; }; \
+	   hits=$$(nm -A "$$lib" | awk -v re="$$pat" '{ n=$$NF; if (n ~ re) print }'); \
+	   if [ -n "$$hits" ]; then echo "FAIL: stdio symbol(s) in delivered archive $$lib:"; echo "$$hits"; exit 1; fi; \
+	   echo "  archive clean: $$lib"; \
+	 done; \
+	 bd="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-bin-dir)"; \
+	 mkdir -p "$$bd"; \
+	 $(CC) $(CFLAGS) -DAUDIO_PIPELINE_NO_STDIO -o "$$bd/test_no_stdio_stack" test_no_stdio_stack.c "$$pl" "$$aec" "$$nr" "$$ac" -lm $(LDFLAGS_EXTRA); \
+	 hits=$$(nm "$$bd/test_no_stdio_stack" | awk -v re="$$pat" '{ n=$$NF; if (n ~ re) print }'); \
+	 if [ -n "$$hits" ]; then echo "FAIL: stdio symbol(s) in the linked EXECUTABLE:"; echo "$$hits"; exit 1; fi; \
+	 "$$bd/test_no_stdio_stack" || { rc=$$?; echo "FAIL: test_no_stdio_stack exit $$rc"; exit 1; }; \
+	 echo "PASS: full NO_STDIO=1 stack -- 4 delivered archives + linked executable clean ($$pat tier), runtime exit 0"
 
 # =============================================================================
 # publish v2: immutable per-config release under dist/ (round-3 review B01)

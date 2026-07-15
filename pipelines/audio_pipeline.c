@@ -103,6 +103,22 @@
 #define AUDIO_PIPELINE_BACKEND_STR "unknown"
 #endif
 
+/* Maps AUDIO_PIPELINE_BACKEND_STR -- THIS TU's OWN compile-time literal,
+ * never caller-supplied data -- to the small stable integer a serializable
+ * descriptor can carry (review B06; see audio_pipeline.h's
+ * AudioPipelineMemReq.backend_id doc). One strcmp per
+ * audio_pipeline_get_mem_requirements() call against a compiled-in literal
+ * is not the caller-facing string hazard the header doc warns about (that
+ * hazard was `strcmp` against a CALLER-supplied `expected->backend`, which
+ * this file no longer does at all -- audio_pipeline_init_ex() below compares
+ * backend_id with plain integer `==`). Returns 0 ("unknown") for anything
+ * else; get_mem_requirements() rejects that -- see its own comment. */
+static uint32_t audio_pipeline_backend_id(void) {
+    if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "kiss") == 0) return AUDIO_PIPELINE_BACKEND_KISS;
+    if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "ne10") == 0) return AUDIO_PIPELINE_BACKEND_NE10;
+    return 0u;
+}
+
 /* ============================================================================
  * Instance
  * ========================================================================== */
@@ -415,6 +431,16 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
         if (fft_mem == 0 || nr_sz == 0) return -1;
     }
 
+    /* backend_id (review B06): reject up front (same reject-first shape as
+     * the module validators above) if this TU's own AUDIO_PIPELINE_BACKEND_STR
+     * doesn't map to a known backend -- e.g. a build outside pipelines/
+     * Makefile that never set -DAUDIO_PIPELINE_BACKEND_STR at all (falls
+     * back to "unknown" above). A descriptor with backend_id==0 would be
+     * meaningless to a board's `expected` comparison (0 means "no backend"),
+     * so this library never actually returns one. */
+    uint32_t backend_id = audio_pipeline_backend_id();
+    if (backend_id == 0u) return -1;
+
     size_t sub_total = pipeline_pool_size(&aec_cfg, &nr_cfg, hop, frame_sz, fft_sz, n_freqs,
                                            cfg->aec_only);
     size_t self_sz   = ALIGN16(sizeof(AudioPipeline));
@@ -422,20 +448,26 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
      * any realistic config (sub_total already went through mem_align.h's
      * saturating ck_* helpers inside each _get_mem_size call), so a plain
      * add is safe here. */
-    out->bytes            = self_sz + sub_total;
-    out->alignment        = 16;
-    out->layout_version   = AUDIO_PIPELINE_LAYOUT_VERSION;
-    out->backend          = AUDIO_PIPELINE_BACKEND_STR;
-    out->build_flags_hash = audio_pipeline_build_flags_hash();
+    out->descriptor_version = AUDIO_PIPELINE_DESCRIPTOR_VERSION;
+    out->layout_version     = AUDIO_PIPELINE_LAYOUT_VERSION;
+    out->backend_id         = backend_id;
+    out->build_flags_hash   = audio_pipeline_build_flags_hash();
+    out->alignment          = 16u;
+    out->reserved           = 0u;
+    out->bytes              = (uint64_t)(self_sz + sub_total);
     return 0;
 }
 
 /* ============================================================================
- * audio_pipeline_init_ex (re-review R09) — audio_pipeline_init() PLUS an
- * optional `expected` descriptor gate. See audio_pipeline.h for the full
- * contract; the six-condition check below (run only when `expected` is
- * non-NULL) is the literal implementation of that doc's numbered list, in
- * the SAME order, each on its own named diagnostic.
+ * audio_pipeline_init_ex (re-review R09; descriptor V2 review B06) —
+ * audio_pipeline_init() PLUS an optional `expected` descriptor gate. See
+ * audio_pipeline.h for the full contract; the seven-condition check below
+ * (run only when `expected` is non-NULL) is the literal implementation of
+ * that doc's numbered list, in the SAME order, each on its own named
+ * diagnostic. Every comparison below is a plain integer `==`/`<` over
+ * fixed-width fields — no strings, no %s of caller data (see
+ * AudioPipelineMemReq.backend_id's doc for why that matters: `expected` may
+ * originate from persisted/transmitted bytes this library never validated).
  * ========================================================================== */
 
 AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipelineConfig* cfg,
@@ -449,16 +481,22 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
                        "descriptor to validate `expected` against\n");
             return NULL;
         }
+        if (expected->descriptor_version != cur.descriptor_version) {
+            AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- descriptor_version mismatch "
+                       "(expected=%u, current build=%u)\n",
+                       expected->descriptor_version, cur.descriptor_version);
+            return NULL;
+        }
         if (expected->layout_version != cur.layout_version) {
             AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- layout_version mismatch "
                        "(expected=%u, current build=%u)\n",
                        expected->layout_version, cur.layout_version);
             return NULL;
         }
-        if (!expected->backend || strcmp(expected->backend, cur.backend) != 0) {
-            AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- backend mismatch "
-                       "(expected=\"%s\", current build=\"%s\")\n",
-                       expected->backend ? expected->backend : "(null)", cur.backend);
+        if (expected->backend_id != cur.backend_id) {
+            AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- backend_id mismatch "
+                       "(expected=%u, current build=%u)\n",
+                       expected->backend_id, cur.backend_id);
             return NULL;
         }
         if (expected->build_flags_hash != cur.build_flags_hash) {
@@ -469,20 +507,20 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
         }
         if (expected->alignment != cur.alignment) {
             AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- alignment mismatch "
-                       "(expected=%zu, current build=%zu)\n",
+                       "(expected=%u, current build=%u)\n",
                        expected->alignment, cur.alignment);
             return NULL;
         }
         if (expected->bytes < cur.bytes) {
             AP_LOG_ERR("audio_pipeline_init_ex: stale descriptor -- expected->bytes too small "
-                       "for the current build (expected->bytes=%zu < current requirement=%zu)\n",
-                       expected->bytes, cur.bytes);
+                       "for the current build (expected->bytes=%llu < current requirement=%llu)\n",
+                       (unsigned long long)expected->bytes, (unsigned long long)cur.bytes);
             return NULL;
         }
-        if (bytes < cur.bytes) {
+        if ((uint64_t)bytes < cur.bytes) {
             AP_LOG_ERR("audio_pipeline_init_ex: pool too small for the current build's "
-                       "requirement (bytes=%zu < current requirement=%zu)\n",
-                       bytes, cur.bytes);
+                       "requirement (bytes=%zu < current requirement=%llu)\n",
+                       bytes, (unsigned long long)cur.bytes);
             return NULL;
         }
     }
@@ -545,11 +583,11 @@ AudioPipeline* audio_pipeline_create(const AudioPipelineConfig* cfg) {
     if (audio_pipeline_get_mem_requirements(cfg, &req) != 0) return NULL;
 
     void* mem = NULL;
-    if (posix_memalign(&mem, req.alignment, req.bytes) != 0 || !mem) {
+    if (posix_memalign(&mem, (size_t)req.alignment, (size_t)req.bytes) != 0 || !mem) {
         return NULL;
     }
 
-    AudioPipeline* p = audio_pipeline_init(mem, req.bytes, cfg);
+    AudioPipeline* p = audio_pipeline_init(mem, (size_t)req.bytes, cfg);
     if (!p) { free(mem); return NULL; }
 
     p->owned_heap = mem;

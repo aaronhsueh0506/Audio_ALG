@@ -65,13 +65,13 @@
  *   5. (once) reject-first AudioPipelineConfig validation (R08): an
  *      out-of-enum aec_preset/nr_mode and a bool field holding 2 (or -1)
  *      are all rejected by get_mem_requirements() AND init().
- *   6. (once) audio_pipeline_init_ex()'s `expected` descriptor gate (R09): a
- *      correct/current descriptor is accepted; a NULL descriptor behaves
- *      exactly like audio_pipeline_init(); a descriptor with a tampered
- *      layout_version, backend, build_flags_hash, alignment, or bytes (or
- *      an undersized `bytes` pool argument alongside an otherwise-correct
- *      descriptor) is each independently rejected; the pool remains usable
- *      afterward.
+ *   6. (once) audio_pipeline_init_ex()'s `expected` descriptor gate (R09,
+ *      descriptor V2 review B06): a correct/current descriptor is accepted;
+ *      a NULL descriptor behaves exactly like audio_pipeline_init(); a
+ *      descriptor with a tampered descriptor_version, layout_version,
+ *      backend_id, build_flags_hash, alignment, or bytes (or an undersized
+ *      `bytes` pool argument alongside an otherwise-correct descriptor) is
+ *      each independently rejected; the pool remains usable afterward.
  */
 #include "audio_pipeline.h"
 
@@ -137,9 +137,10 @@ static void test_validation(int sr, int check_rate_whitelist) {
 
     CHECK(audio_pipeline_get_mem_requirements(&cfg, &req) == 0 && req.bytes > 0,
           fmt_msg("get_mem_requirements accepts sample_rate=%d", sr));
-    printf("       (%d Hz descriptor: bytes=%zu alignment=%zu layout_version=%u "
-           "backend=%s build_flags_hash=0x%08x)\n",
-           sr, req.bytes, req.alignment, req.layout_version, req.backend, req.build_flags_hash);
+    printf("       (%d Hz descriptor: descriptor_version=%u bytes=%llu alignment=%u "
+           "layout_version=%u backend_id=%u build_flags_hash=0x%08x)\n",
+           sr, req.descriptor_version, (unsigned long long)req.bytes, req.alignment,
+           req.layout_version, req.backend_id, req.build_flags_hash);
 }
 
 static void test_pool_rejection(int sr) {
@@ -373,12 +374,12 @@ static void test_config_validation_rejects(void) {
     free(pool);
 }
 
-/* R09: audio_pipeline_init_ex()'s `expected` descriptor gate. Run once
- * (16000 Hz, an arbitrary representative rate) -- like R08's config
- * validation above, this exercises a comparison the function does against
- * a freshly-recomputed AudioPipelineMemReq, not a per-rate carve property;
- * see audio_pipeline.h's audio_pipeline_init_ex() doc for the exact
- * six-condition contract this drills. */
+/* R09/descriptor-V2 (review B06): audio_pipeline_init_ex()'s `expected`
+ * descriptor gate. Run once (16000 Hz, an arbitrary representative rate) --
+ * like R08's config validation above, this exercises a comparison the
+ * function does against a freshly-recomputed AudioPipelineMemReq, not a
+ * per-rate carve property; see audio_pipeline.h's audio_pipeline_init_ex()
+ * doc for the exact seven-condition contract this drills. */
 static void test_init_ex_descriptor(void) {
     AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
     AudioPipelineMemReq req;
@@ -389,58 +390,68 @@ static void test_init_ex_descriptor(void) {
     }
 
     void* pool = NULL;
-    if (posix_memalign(&pool, req.alignment, req.bytes) != 0 || !pool) {
+    if (posix_memalign(&pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool) {
         fprintf(stderr, "FAIL: pool alloc for init_ex descriptor test\n");
         g_failures++;
         return;
     }
 
-    AudioPipeline* p_ok = audio_pipeline_init_ex(pool, req.bytes, &cfg, &req);
+    AudioPipeline* p_ok = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &req);
     CHECK(p_ok != NULL, "audio_pipeline_init_ex accepts a correct/current descriptor");
     if (p_ok) audio_pipeline_destroy(p_ok);
 
-    AudioPipeline* p_null = audio_pipeline_init_ex(pool, req.bytes, &cfg, NULL);
+    AudioPipeline* p_null = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, NULL);
     CHECK(p_null != NULL,
           "audio_pipeline_init_ex(expected=NULL) accepts, same as audio_pipeline_init");
     if (p_null) audio_pipeline_destroy(p_null);
 
+    AudioPipelineMemReq bad_dv = req;
+    bad_dv.descriptor_version = req.descriptor_version + 1;
+    AudioPipeline* p_dv = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_dv);
+    CHECK(p_dv == NULL, "audio_pipeline_init_ex rejects a tampered descriptor_version");
+    if (p_dv) audio_pipeline_destroy(p_dv);
+
     AudioPipelineMemReq bad_lv = req;
     bad_lv.layout_version = req.layout_version + 1;
-    AudioPipeline* p_lv = audio_pipeline_init_ex(pool, req.bytes, &cfg, &bad_lv);
+    AudioPipeline* p_lv = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_lv);
     CHECK(p_lv == NULL, "audio_pipeline_init_ex rejects a tampered layout_version");
     if (p_lv) audio_pipeline_destroy(p_lv);
 
-    AudioPipelineMemReq bad_be = req;
-    bad_be.backend = "not-a-real-backend";
-    AudioPipeline* p_be = audio_pipeline_init_ex(pool, req.bytes, &cfg, &bad_be);
-    CHECK(p_be == NULL, "audio_pipeline_init_ex rejects a tampered backend");
+    /* Tampered backend_id: a plain wrong integer (99), never a string --
+     * V2 dropped the F20 `const char* backend` field entirely, so there is
+     * no string to tamper any more (see AudioPipelineMemReq.backend_id's
+     * doc for why that hazard is gone). */
+    AudioPipelineMemReq bad_backend_id = req;
+    bad_backend_id.backend_id = 99;
+    AudioPipeline* p_be = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_backend_id);
+    CHECK(p_be == NULL, "audio_pipeline_init_ex rejects a tampered backend_id");
     if (p_be) audio_pipeline_destroy(p_be);
 
     AudioPipelineMemReq bad_hash = req;
     bad_hash.build_flags_hash = req.build_flags_hash ^ 0xFFFFFFFFu;
-    AudioPipeline* p_hash = audio_pipeline_init_ex(pool, req.bytes, &cfg, &bad_hash);
+    AudioPipeline* p_hash = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_hash);
     CHECK(p_hash == NULL, "audio_pipeline_init_ex rejects a tampered build_flags_hash");
     if (p_hash) audio_pipeline_destroy(p_hash);
 
     AudioPipelineMemReq bad_align = req;
     bad_align.alignment = req.alignment * 2;
-    AudioPipeline* p_align = audio_pipeline_init_ex(pool, req.bytes, &cfg, &bad_align);
+    AudioPipeline* p_align = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_align);
     CHECK(p_align == NULL, "audio_pipeline_init_ex rejects a tampered alignment");
     if (p_align) audio_pipeline_destroy(p_align);
 
     AudioPipelineMemReq bad_bytes = req;
     bad_bytes.bytes = req.bytes - 1;
-    AudioPipeline* p_bytes = audio_pipeline_init_ex(pool, req.bytes, &cfg, &bad_bytes);
+    AudioPipeline* p_bytes = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_bytes);
     CHECK(p_bytes == NULL,
           "audio_pipeline_init_ex rejects expected->bytes smaller than the current requirement");
     if (p_bytes) audio_pipeline_destroy(p_bytes);
 
-    AudioPipeline* p_short = audio_pipeline_init_ex(pool, req.bytes - 1, &cfg, &req);
+    AudioPipeline* p_short = audio_pipeline_init_ex(pool, (size_t)(req.bytes - 1), &cfg, &req);
     CHECK(p_short == NULL,
           "audio_pipeline_init_ex rejects an undersized pool even with a correct descriptor");
     if (p_short) audio_pipeline_destroy(p_short);
 
-    AudioPipeline* p_final = audio_pipeline_init_ex(pool, req.bytes, &cfg, &req);
+    AudioPipeline* p_final = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &req);
     CHECK(p_final != NULL, "pool is still usable via audio_pipeline_init_ex after rejected attempts");
     if (p_final) audio_pipeline_destroy(p_final);
 

@@ -123,15 +123,21 @@ BIN="$(make -s print-bin-dir)"
 "$BIN"/aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
 "$BIN"/aec_nr_pipeline_static --print-mem-size --sample-rate 16000
 
-# Run the audio_pipeline.h library's own acceptance tests (F20/R08/R09/§7.3) —
+# Run the audio_pipeline.h library's own acceptance tests (F20/R08/R09/B06/§7.3) —
 # create-vs-init byte equality (incl. a poisoned pool), destroy idempotence,
 # misaligned/undersized pool rejection, sample-rate whitelist rejection,
 # AudioPipelineConfig reject-first validation (bad enum/bool fields),
 # audio_pipeline_init_ex()'s `expected` descriptor gate (tampered
-# layout_version/backend/build_flags_hash/alignment/bytes each rejected) —
-# each per-rate case runs once per supported rate (8000/16000/48000; 48 kHz
-# uses a reduced hop count, see test_audio_pipeline.c)
+# descriptor_version/layout_version/backend_id/build_flags_hash/alignment/
+# bytes each rejected) — each per-rate case runs once per supported rate
+# (8000/16000/48000; 48 kHz uses a reduced hop count, see test_audio_pipeline.c)
+# — AND builds + runs the example_board_adapter smoke test (see "Board
+# Integration" below)
 make test
+
+# Build + run JUST the REFERENCE ONLY board-adapter example standalone
+# (also runs as part of `make test` above):
+make example-adapter
 
 # Build libaudio_pipeline.a with no stdio linked in at all (board images that
 # forbid the stdio symbol set), and audit that it holds:
@@ -292,6 +298,21 @@ I/O + the `--print-mem-size`/`--debug`/`DUMP_CTX` diagnostics) — see
 or `aec_nr_pipeline.c` for the heap-convenience flavor
 (`audio_pipeline_create()`).
 
+**Reference example** (round-3 review B02/R04):
+[`example_board_adapter.c`](example_board_adapter.c) is a compilable,
+runnable HOST SIMULATION of the sequence below — a `board_mem` module
+standing in for a platform memory manager, the query→alloc→init_ex→
+process→reset→process→destroy→free flow (run twice on the same static
+arena, proving pool reusability), and the negative demonstrations
+(undersized/misaligned pool, tampered descriptor, double-destroy, pool
+usable after a rejected init). Build + run it with `make example-adapter`
+(also wired into `make test`). **This example does NOT replace the real
+board adapter review** — the actual platform adapter source, memory-manager
+implementation, build command, and final link map for the real target must
+still be authored and submitted for sign-off; every `board_mem_*` function
+in that file is a plain host-array stand-in, marked `// BOARD:` wherever
+real platform code belongs instead.
+
 ### Sequence
 
 ```
@@ -314,14 +335,14 @@ or `aec_nr_pipeline.c` for the heap-convenience flavor
             // Passing `req` back in as `expected` is what makes this call
             // reject a STALE pool/descriptor instead of silently carving
             // into one sized/shaped for a different build — see
-            // "Descriptor semantics" below for the six-condition check
+            // "Descriptor semantics" below for the seven-condition check
             // this performs. NULL on: any expected-descriptor mismatch
-            // (layout_version / backend / build_flags_hash / alignment /
-            // bytes), a misaligned/undersized pool, an invalid cfg, or a
-            // sub-module init/grid-agreement failure (stderr has detail,
-            // UNLESS this library was built with NO_STDIO=1 — see
-            // "NO_STDIO=1" below). `audio_pipeline_init(pool, req.bytes,
-            // &cfg)` remains available and is EXACTLY
+            // (descriptor_version / layout_version / backend_id /
+            // build_flags_hash / alignment / bytes), a misaligned/undersized
+            // pool, an invalid cfg, or a sub-module init/grid-agreement
+            // failure (stderr has detail, UNLESS this library was built with
+            // NO_STDIO=1 — see "NO_STDIO=1" below). `audio_pipeline_init(pool,
+            // req.bytes, &cfg)` remains available and is EXACTLY
             // `audio_pipeline_init_ex(pool, req.bytes, &cfg, NULL)` — it
             // skips the descriptor check entirely (nothing to compare
             // against); prefer `_ex` whenever a descriptor was already
@@ -370,10 +391,18 @@ or `aec_nr_pipeline.c` for the heap-convenience flavor
   bare byte count (or a whole `AudioPipelineMemReq`) across one of those
   changes and replay it into a later build's `audio_pipeline_init_ex()` —
   that mismatch is exactly what the `expected` argument exists to catch
-  (see "Descriptor semantics" below). If a descriptor must be persisted
-  across a restart, re-derive it fresh at the next boot from THAT boot's
-  `audio_pipeline_get_mem_requirements()` — never reuse a value saved from
-  a previous firmware image.
+  (see "Descriptor semantics" below). This still holds even though V2's
+  fixed 32-byte layout (below) makes the struct meaningfully
+  serializable now — "can be persisted byte-for-byte" is not the same
+  claim as "is still valid after a rebuild/backend/config change": a
+  persisted descriptor from a PREVIOUS build is exactly the stale-cache
+  case `audio_pipeline_init_ex()` exists to catch. If a descriptor must be
+  persisted across a restart (same board, same binary, same CPU — see
+  "Descriptor semantics" for the same-endianness scope this is limited
+  to), re-derive it fresh at the next boot from THAT boot's
+  `audio_pipeline_get_mem_requirements()` and treat any persisted copy as
+  advisory at best — never trust a persisted value as `expected` without
+  also having a freshly-queried one to fall back to.
 - **Mixing `_create()` and pool APIs per submodule is not supported.**
   Don't hand-carve one of AEC/NR/the FFT backend into a pool segment
   yourself while letting `audio_pipeline_create()` heap-allocate another,
@@ -386,26 +415,60 @@ or `aec_nr_pipeline.c` for the heap-convenience flavor
 
 ### Descriptor semantics (`AudioPipelineMemReq`)
 
+Descriptor V2 (review B06): every field is a fixed-width integer
+(`uint32_t`/`uint64_t`, never `size_t` or a pointer), and the struct is
+pinned to a stable, `_Static_assert`-enforced **32-byte** layout — see
+"Serializing the descriptor" below for what that does (and does not) buy
+you. This is a **BREAKING** change from the original (F20) descriptor shape
+(`{size_t bytes; size_t alignment; uint32_t layout_version; const char*
+backend; uint32_t build_flags_hash;}`); every caller in this repo has been
+updated, there is no compatibility shim.
+
 | Field | Meaning |
 |-------|---------|
-| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the 13 pipeline scratch buffers, same carve `aec_nr_pipeline_static.c`'s old file-local `pipeline_pool_size()` produced). |
-| `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, both FFT backends, `mem_align.h`'s `ALIGN16` — carves to). |
+| `descriptor_version` | This STRUCT's own ABI version — `AUDIO_PIPELINE_DESCRIPTOR_VERSION` (currently `2`). Bumped only when `AudioPipelineMemReq`'s field set/order/width changes, independent of `layout_version` below (which tracks THIS FILE's carve layout, not the descriptor struct's own shape). `audio_pipeline_init_ex()` checks this FIRST, before interpreting any other field. |
 | `layout_version` | Bumped whenever `audio_pipeline.c`'s OWN carve order/buffer set/sizing formula changes — i.e. whenever a `bytes` figure computed by an older build would misdescribe a newer build's actual carve, or vice versa. Starts at 1. Does **not** need bumping for a change purely inside AEC's/NR's/an FFT backend's own internal `_get_mem_size` layout (each is consumed as one opaque composite blob here, same as the pre-F20 static CLI already treated them — a stale cached `bytes` from an old submodule build is still caught by the undersized-pool rejection at init). |
-| `backend` | Compile-time FFT backend identity this `audio_pipeline.o` was built with — `"kiss"` or `"ne10"` (matches this Makefile's `BACKEND=`). The two backends are not byte-identical to each other (pre-existing, expected — see `lib/aec/CLAUDE.md`); a descriptor from one is never valid for the other even at matching `bytes`. |
+| `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_KISS` (1) or `AUDIO_PIPELINE_BACKEND_NE10` (2) (matches this Makefile's `BACKEND=`). Replaces the F20 `const char* backend` field — a process-local rodata pointer can't be serialized, and comparing it required `strcmp` against caller-supplied data at a trust boundary; `backend_id` is compared with a plain integer `==` instead. The two backends are still not byte-identical to each other (pre-existing, expected — see `lib/aec/CLAUDE.md`); a descriptor from one is never valid for the other even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
 | `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 13 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
+| `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, both FFT backends, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
+| `reserved` | Always 0. Exists only so `bytes` (a `uint64_t`) lands on an 8-byte-aligned offset within the struct with no compiler-inserted padding — part of the fixed 32-byte layout, not a field to read or write. |
+| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the 13 pipeline scratch buffers, same carve `aec_nr_pipeline_static.c`'s old file-local `pipeline_pool_size()` produced). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_init*()` on a target where the two widths differ. |
 
 `audio_pipeline_init_ex(mem, bytes, cfg, expected)` (see "Sequence" above)
 automates exactly this comparison: passing the descriptor straight back in
 as `expected` makes the library itself recompute the CURRENT
-`layout_version`/`backend`/`build_flags_hash`/`alignment`/`bytes` and reject
-(`NULL`, with a diagnostic naming the mismatched field) unless every one
-still agrees with `expected` — a board integrator no longer has to
-hand-write this comparison. The one discipline this does NOT relieve you
-of: `expected` must itself have been queried freshly (see "Warnings"
-above) — `audio_pipeline_init_ex()` can only compare what it's given
-against what the CURRENT build computes; it has no way to know whether the
-`expected` you passed in was itself stale relative to some THIRD, even
-older, build.
+`descriptor_version`/`layout_version`/`backend_id`/`build_flags_hash`/
+`alignment`/`bytes` and reject (`NULL`, with a diagnostic naming the
+mismatched field) unless every one still agrees with `expected` — a board
+integrator no longer has to hand-write this comparison. The one discipline
+this does NOT relieve you of: `expected` must itself have been queried
+freshly (see "Warnings" above) — `audio_pipeline_init_ex()` can only compare
+what it's given against what the CURRENT build computes; it has no way to
+know whether the `expected` you passed in was itself stale relative to some
+THIRD, even older, build.
+
+### Serializing the descriptor
+
+`AudioPipelineMemReq` is a fixed-width, 32-byte POD (`_Static_assert`-pinned
+in `audio_pipeline.h`, sizeof and every field's offset) — unlike the F20
+shape, it can be copied byte-for-byte (`memcpy`) to a file, a flash region,
+or a wire message, and read back later, even by a different process, even
+after a restart. This is deliberately scoped narrower than "fully portable
+serialization":
+
+- **Same-endianness only.** The board firmware and this library build run
+  on the SAME CPU, so this struct provides no byte-swap helpers and makes
+  no attempt to support a big-endian producer read by a little-endian
+  consumer (or vice versa). If you ever need cross-endian interchange, add
+  your own swap routine at the serialization boundary — it does not exist
+  here today.
+- **Not a substitute for re-querying.** A persisted/transmitted descriptor
+  is still exactly the "stale cache" risk "Warnings" above describes — the
+  fixed layout only means the BYTES survive the round trip intact, not that
+  they still describe the CURRENT build. Always pass a freshly-queried
+  descriptor as `expected` to `audio_pipeline_init_ex()`; treat a persisted
+  copy as informational at best (e.g. a board bring-up log recording what
+  the PREVIOUS boot's build looked like).
 
 ### Dirty-pool contract
 
