@@ -359,19 +359,51 @@ Each attestation's `event_id` is embedded inside the file, and it records a
 three producers** (audio_common, lib/aec, lib/nr) — "which exact checkout
 of the whole stack published this" lives here, not in MANIFEST.
 
-`publish` **refuses dirty or unknown checkouts by default** (round-6
-review): if this repo or any of the three producers has uncommitted
-changes, or isn't a git checkout at all (commit unknown), `make publish`
-FATALs and names exactly the offending repo(s). `ALLOW_DIRTY_PUBLISH=1` is
-the explicit dev escape hatch — pass it to publish anyway; the deviation is
-then recorded in the attestation (`allow_dirty_publish=1`) together with a
-`dirty_diff_sha256` per dirty repo (sha256 of that repo's
-`git diff --binary HEAD`), so it stays traceable. This repo's own dirty
-check excludes untracked files (`git status --porcelain -uno` — this
-working tree permanently carries user-owned untracked directories that
-must never make an otherwise-clean checkout look dirty); the three
-producers' checks do NOT exclude untracked files (an untracked source file
-there is a legitimate dirtiness signal).
+`publish` **refuses by default** (round-6 review, split into two
+independent dimensions by round-7) when this repo or any of the three
+producers (a) has uncommitted **tracked** changes, (b) contains **any
+untracked, non-ignored file** (gitignored build output is excluded by
+design and is never part of this provenance), or (c) isn't a git checkout
+at all (commit unknown) — `make publish` FATALs and names exactly the
+offending repo(s) *and* dimension. Case (c) is refused
+**unconditionally**: no combination of `ALLOW_DIRTY_PUBLISH`/
+`ALLOW_UNTRACKED_PUBLISH` admits an identity-less checkout, for this repo
+or any producer — without a commit OID neither the tracked diff nor the
+untracked enumeration can be named for it, so there is no escape hatch to
+offer. `ALLOW_DIRTY_PUBLISH=1` admits tracked changes on an
+otherwise-identified checkout — pass it to publish anyway; the deviation
+is then recorded in the attestation (`allow_dirty_publish=1`) together
+with a `dirty_diff_sha256` per dirty repo (sha256 of that repo's `git diff
+--binary HEAD`). `ALLOW_UNTRACKED_PUBLISH=1` separately admits untracked
+files, recording `allow_untracked_publish=1` plus an
+`untracked_tree_sha256` per repo that had one — sha256 over sorted,
+FIXED-FIELD per-file records (the `hash_untracked()` helper in the
+Makefile) in which every variable-length value — path, symlink target,
+file content — is itself hashed before being placed in the record, so two
+records can never be confused by naive concatenation (a raw "path target"
+join is collision-prone: `"a b"->"c"` vs `"a"->"b c"` would otherwise
+encode identically). Any `stat`/`readlink`/`shasum` failure, or a path
+that is neither a regular file nor a symlink (an embedded git checkout, a
+fifo, ...), downgrades that entry to an unhashable record, which is
+**always** a hard FATAL naming the path rather than an empty or
+best-effort hash (fail-closed) — a publish never proceeds as though it
+could account for a source it can't. The two flags are orthogonal —
+either, both, or neither may be needed for a given publish.
+
+This repo's own untracked check is **whitelisted by prefix**: any path
+starting `ainr/GTCRN/` or `ainr/gtcrn_github/` never counts against a
+publish here (neither the refusal nor the provenance hash) — this working
+tree permanently carries those two directories as user-owned content that
+is never staged for a release. The three producers get **no such
+whitelist**: an untracked file there is always a violation. (Splitting
+tracked/untracked into two independent dimensions also fixed a round-6
+asymmetry: the three producers used to fold untracked files into the
+SAME dirty check as tracked changes — `git status --porcelain`, no `-uno`
+— so an untracked producer file made `ALLOW_DIRTY_PUBLISH=1` the only
+override, with no separate provenance trail for it. Round-7 gives every
+one of the four repos the identical tracked-only `-uno` check plus its own
+untracked check, so the two kinds of deviation are never conflated for
+anyone, and only this repo's untracked dimension carries the whitelist.)
 
 **Attestations are UNSIGNED**: they provide traceability, not authenticity
 — anyone with filesystem access could forge one, so do not treat `ATTEST/`
@@ -379,13 +411,28 @@ as tamper-proof under an attacker model. `MANIFEST.txt` byte-verification
 (performed automatically on every republish) is the actual integrity
 check; `ATTEST/` is the provenance log.
 
-`make -n|-q|-t ... publish` (dry-run / question / touch mode) is now fully
-side-effect-free (round-6 review): no `dist/` directory is created, no
-publish lock is taken, and nothing is staged/attested. `OBJ_ROOT=`/
-`BIN_ROOT=` relocate this repo's own keyed obj/bin build trees (default:
-`obj/`/`bin/` here, byte-identical to the previous hardcoded paths) — like
-`DIST_ROOT=`, these are isolation-test knobs for running scratch-directory
-builds, not part of the build's config identity (CFG_SIG).
+`make -n|-q|-t ... publish` (dry-run / question / touch mode) is fully
+zero-write (round-6 review, `-t` tightened by round-7) — each flag takes a
+different path, but none of the three ever create `dist/`, take the
+publish lock, stage/attest anything, or change an artifact's mtime. This
+also holds for **combined** flags (e.g. `-nt`, `-tq`, `-nqt`): `-t` is
+checked **first**, so any invocation that includes it takes the touch
+no-op path regardless of what else is set — recursing for `-n` first
+would hand a child `make` both flags together, and GNU make then really
+applies touch semantics to the child's own targets, which is exactly the
+real write this ordering exists to prevent. `-n` **prints** what a real
+publish would run (recurses into a print-only child, same as any other
+target, when `-t` is not also set); `-q` **answers via its exit status
+alone** (question mode's documented "needs updating" reply — `publish` is
+phony, so it always would run — with no output and no recursion); `-t`
+(alone or combined) is an **explicit no-op**: one note printed to stdout
+and exit 0, with no recursion (recursing here used to let plain `touch`
+semantics bump this repo's own build-artifact mtimes — a real write —
+before round-7 special-cased it). `OBJ_ROOT=`/`BIN_ROOT=` relocate this
+repo's own keyed obj/bin build trees (default: `obj/`/`bin/` here,
+byte-identical to the previous hardcoded paths) — like `DIST_ROOT=`, these
+are isolation-test knobs for running scratch-directory builds, not part of
+the build's config identity (CFG_SIG).
 
 The `current` symlink is swapped via a rename(2)-atomic helper
 (`audio_common/tools/atomic_symlink_swap.c`, built at publish time with the
