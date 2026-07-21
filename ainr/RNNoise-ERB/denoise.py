@@ -31,37 +31,21 @@ import tqdm
 
 from train import (
     erb_bandborder, compute_hybrid_bands, compute_erb_matrix, RNNoiseModel,
-    make_ema_alpha, stft, istft,
+    extract_erb_features, read_feature_config,
+    require_checkpoint_feature_config, stft, istft,
 )
 
 
-def extract_features(power_spec, erb_matrix, ema_alpha: float = 0.99,
-                     ema_state=None, mean_norm_init=(-60.0, -90.0)):
+def extract_features(power_spec, erb_matrix, norm_state=None, **norm_kwargs):
     """
-    power spectrum → DeepFilterNet feat_erb (faithful port). MUST mirror
-    train.extract_erb_features (same recurrence) so the model sees the feature
-    distribution it trained on:
-        erb_db = 10*log10(power @ erb_matrix + 1e-10)      # triangular ERB band energy
-        band_mean_norm_erb: state=x*(1-a)+state*a ; out=(x-state)/40
-        state init = linspace(-60, -90)  (MEAN_NORM_INIT)
-    erb_matrix: (n_bins, n_bands) triangular ERB FB. STFT must be normalized=True (fft^-0.5).
-    ema_state: running-mean tensor (n_bands,) to continue across streaming chunks; None = fresh.
-    Returns: features (T, n_bands), new_ema_state (n_bands,)
-    """
-    energy = power_spec @ erb_matrix                      # (T, n_bands)
-    erb_db = 10.0 * torch.log10(energy + 1e-10)           # → dB
+    power spectrum → log ERB → shared broadband online mean/variance.
 
-    if ema_state is not None:
-        state = ema_state
-    else:
-        lo_i, hi_i = mean_norm_init
-        state = torch.linspace(lo_i, hi_i, erb_db.shape[-1],
-                               device=erb_db.device, dtype=erb_db.dtype)
-    out = []
-    for t in range(erb_db.size(0)):
-        state = erb_db[t] * (1.0 - ema_alpha) + state * ema_alpha
-        out.append((erb_db[t] - state) / 40.0)
-    return torch.stack(out, dim=0), state
+    This is a thin alias of train.extract_erb_features so training and Python
+    inference cannot silently drift.  State is one scalar mean and variance per
+    stream, not one temporal mean per ERB band.
+    """
+    return extract_erb_features(power_spec, erb_matrix,
+                                norm_state=norm_state, **norm_kwargs)
 
 
 def valin_post_filter(mask, beta=0.02):
@@ -118,6 +102,7 @@ def load_model(args):
     HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz',  fallback=0)
     N_ERB_HIGH    = cfg.getint('signal', 'n_erb_high_bands',  fallback=0)
     LOOKAHEAD     = cfg.getint('signal', 'lookahead_frames',  fallback=0)
+    feature_cfg   = read_feature_config(cfg, SR, HOP_LEN)
 
     if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
         raise NotImplementedError(
@@ -127,6 +112,7 @@ def load_model(args):
 
     device = torch.device('cpu')
     ckpt = torch.load(args.model, map_location=device, weights_only=False)
+    require_checkpoint_feature_config(ckpt, feature_cfg, context=args.model)
     # 容量優先讀 ckpt (避免 train/denoise 漂移), 退回 config, 再退回舊預設
     ck_cfg = ckpt.get('config', {})
     cond_size = ck_cfg.get('cond_size', cfg.getint('model', 'cond_size', fallback=64))
@@ -145,10 +131,9 @@ def load_model(args):
     erb_fwd = torch.from_numpy(compute_erb_matrix(nfftborder, N_FFT, mode=0))
     erb_inv = torch.from_numpy(compute_erb_matrix(nfftborder, N_FFT, mode=1))
 
-    EMA_ALPHA = make_ema_alpha(SR, HOP_LEN)
     params = dict(SR=SR, N_FFT=N_FFT, WIN_LEN=WIN_LEN, HOP_LEN=HOP_LEN,
                   N_BANDS=N_BANDS, LOOKAHEAD=LOOKAHEAD, nfftborder=nfftborder,
-                  erb_fwd=erb_fwd, erb_inv=erb_inv, EMA_ALPHA=EMA_ALPHA)
+                  erb_fwd=erb_fwd, erb_inv=erb_inv, FEATURE_CFG=feature_cfg)
     return model, params
 
 
@@ -161,7 +146,7 @@ def process_file(input_path, output_path, model, params,
     LOOKAHEAD  = params['LOOKAHEAD']
     erb_fwd    = params['erb_fwd']      # (n_bins, n_bands) mode=0, features
     erb_inv    = params['erb_inv']      # (n_bins, n_bands) mode=1, mask→bin
-    EMA_ALPHA  = params['EMA_ALPHA']
+    feature_cfg = params['FEATURE_CFG']
 
     audio, orig_sr = torchaudio.load(input_path)
     audio = audio[0]  # mono
@@ -173,7 +158,13 @@ def process_file(input_path, output_path, model, params,
     # spec: (n_bins, n_frames), normalized=True (fft^-0.5)
 
     power = spec.abs().pow(2).T  # (n_frames, n_bins)
-    features, _ = extract_features(power, erb_fwd, EMA_ALPHA)  # (n_frames, n_bands)
+    features, _ = extract_features(
+        power, erb_fwd,
+        norm_alpha=feature_cfg['alpha'],
+        mean_init_db=feature_cfg['mean_init_db'],
+        var_init_db2=feature_cfg['var_init_db2'],
+        var_floor_db2=feature_cfg['var_floor_db2'],
+        clip=feature_cfg['clip'])  # (n_frames, n_bands)
 
     if dump_calib:
         streaming_forward_with_dump(model, features, dump_calib, max_frames)

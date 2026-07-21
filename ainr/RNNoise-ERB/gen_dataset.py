@@ -11,7 +11,8 @@ Usage:
     python3 gen_dataset.py --config config.ini --output data/ --hours 50 --workers 4
 
 Training:
-    python3 train.py --config config.ini --wav-data data/
+    python3 pack_dataset.py --input data/pairs --output data/packed.pt
+    python3 train.py --config config.ini --packed-data data/packed.pt
 """
 
 import argparse

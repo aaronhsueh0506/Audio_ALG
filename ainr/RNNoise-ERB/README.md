@@ -1,14 +1,39 @@
 # RNNoise-ERB
 
-基於 RNNoise v0.2 架構的噪音抑制模型，使用 ERB (Equivalent Rectangular Bandwidth) 頻帶作為特徵。
+以 RNNoise v0.2 的 Conv+GRU 方向為基礎的本地噪音抑制模型，使用 ERB
+(Equivalent Rectangular Bandwidth) 頻帶作為特徵；並非官方 v0.2 的逐層相容移植。
 
 ## 架構
 
-- **輸入**: 22 個 ERB band 的 normalized log energy (每 frame 16ms)
-- **模型**: Conv1d(k=3, causal) + Conv1d(k=1) → 3 層 GRU(128) → concat → Dense → sigmoid
+- **輸入**: 22 個 log-ERB bands，使用共享 broadband runtime mean/variance
+- **模型**: Conv1d(k=3, valid) + Conv1d(k=1) → 3 層 GRU(256) → concat → Dense → sigmoid
 - **輸出**: 22 個 band 的 gain mask [0, 1]
-- **參數量**: ~350K
-- **Latency**: 16ms (1 hop, 0 lookahead — causal Conv1d)
+- **參數量**: 預設設定約 1.23M
+- **Latency**: 16ms lookahead（`lookahead_frames=1`，gain 對應 3-frame window 中間幀）
+
+### Feature preprocessing
+
+目前 feature contract 為 `log_erb_shared_online_cmvn_v1`：
+
+```text
+normalized STFT power
+→ triangular ERB forward matrix
+→ 10*log10(energy + 1e-10)
+→ 使用更新前的 shared broadband mean/variance 正規化 22 bands
+→ clip [-5, 5]
+→ 用當前 frame 的 22-band average 更新 shared mean/variance
+```
+
+mean/variance 是每個 audio stream 一組 scalar，不是每個 ERB band 各一組。
+因此 microphone gain／整體 level 可以在 runtime 自適應，同時保留穩態訊號的
+跨 band spectral envelope。舊版的 per-band temporal EMA 會讓唯一 ERB input
+在穩態時趨近全零，已不再支援。
+此 22 維方案會正規化掉慢變的 absolute broadband level；若未來模型也必須直接
+看到該絕對值，應額外增加 level feature 或 absolute/adaptive dual input。
+
+Feature state 預設值及時間常數在 `config.ini [feature]`；C 部署常數固定於
+`process.h`，兩邊必須同步。Feature 先用舊 state 計算再更新，確保 strictly
+causal，且同一段音訊分 chunk 處理與一次處理的結果一致。
 
 ## 環境安裝
 
@@ -80,52 +105,50 @@ output_dir = ./output
 | 參數 | 預設值 | 說明 |
 |------|--------|------|
 | `[training] epochs` | 100 | 訓練 epoch 數 |
-| `[training] batch_size` | 32 | Batch size |
-| `[training] lr` | 1e-3 | Learning rate |
+| `[training] batch_size` | 128 | Batch size |
+| `[training] lr` | 3e-4 | Learning rate |
 | `[training] device` | cuda | 訓練裝置 (`cuda` 或 `cpu`) |
-| `[training] epoch_size` | 10000 | 每 epoch 隨機抽取的 sample 數 (10000 × 3s = 8.3hr/epoch) |
+| `[training] epoch_size` | 0 | 每 epoch sample 上限；0 表示使用全部資料 |
 | `[audio] segment_sec` | 3.0 | 每筆訓練音檔長度 (秒) |
-| `[rir] p_rir` | 0.8 | 套用 RIR 的機率 |
+| `[rir] p_rir` | 0.1 | 套用 RIR 的機率 |
+| `[feature] norm_tau_sec` | 10.0 | runtime broadband mean/variance 時間常數 |
+| `[feature] mean_init_db` | -75.0 | shared mean 初值 |
+| `[feature] std_init_db` | 20.0 | runtime variance 對應的初始標準差 |
+| `[feature] std_floor_db` | 6.0 | denominator 的固定 variance floor |
+| `[feature] clip` | 5.0 | feature 絕對值上限 |
+
+改動任何 feature 常數都需要同步修改 `process.h` 並重新訓練。Checkpoint 會保存
+`feature_version` 與所有 normalization 常數；train resume、denoise 和 ONNX export
+都會拒絕缺少版本的舊 checkpoint，或拒絕與 runtime config 不一致的 checkpoint。
+匯出的 ONNX model metadata 也會帶上相同 feature contract，供部署端檢查。
 
 ## 訓練
 
-### 基本訓練（Online 模式）
-
-即時做 augmentation + 訓練，不需預生成資料：
-
-```bash
-# GPU 訓練
-python3 train.py --config config.ini
-
-# 指定 GPU ID
-python3 train.py --config config.ini --gpu 0
-
-# CPU 訓練
-python3 train.py --config config.ini --device cpu
-
-# 指定隨機種子
-python3 train.py --config config.ini --seed 123
-```
-
-### 離線預生成資料 + 快速訓練（Precomputed 模式）
-
-先用 `gen_dataset.py` 跑一次 augmentation pipeline，存成 `.pt` shard 檔，後續訓練直接讀取：
+目前訓練只接受 `pack_dataset.py` 產生的 raw noisy/clean WAV tensor；STFT、
+log-ERB 與 runtime normalization 會在訓練時即時計算。完整流程：
 
 ```bash
-# Step 1: 預生成 25 小時資料（自動取最近整數倍 epoch，不會有殘餘筆數）
-python3 gen_dataset.py --config config.ini --output data/ --hours 25
+# Step 1: 產生 2-channel WAV pairs（ch0=noisy, ch1=clean）
+python3 gen_dataset.py --config config.ini --output data --hours 25 --workers 4
 
-# Step 2: 用預生成資料訓練（無即時 I/O + DSP，速度大幅提升）
-python3 train.py --config config.ini --precomputed data/
+# Step 2: 打包，避免訓練時逐 WAV I/O
+python3 pack_dataset.py --input data/pairs --output data/packed.pt --dtype float32
+
+# Step 3: 訓練
+python3 train.py --config config.ini --packed-data data/packed.pt
+
+# 可選：指定 GPU、降低 RAM、或載入同一目錄下多個 packed files
+python3 train.py --config config.ini --packed-dir data/packed_shards --gpu 0 --mmap
 ```
 
-`gen_dataset.py` 參數：
+`gen_dataset.py` 常用參數：
 
 | 參數 | 預設值 | 說明 |
 |------|--------|------|
 | `--hours` | 8.3 | 目標音檔總時數（自動 round 到最近整數倍 epoch） |
 | `--output` | `data` | 輸出目錄 |
-| `--n-shards` | 10 | 分成幾個 shard 檔 |
+| `--workers` | 4 | DataLoader workers；0 表示單程序 |
+| `--resume` | false | 從 `pairs/` 最大編號後繼續寫入 |
 | `--seed` | 42 | 隨機種子（-1 關閉） |
 
 ### 從斷點續訓
@@ -133,7 +156,8 @@ python3 train.py --config config.ini --precomputed data/
 訓練中途中斷後，可以從最後的 checkpoint 繼續：
 
 ```bash
-python3 train.py --config config.ini --resume output/rnnoise_epoch5.pth
+python3 train.py --config config.ini --packed-data data/packed.pt \
+    --resume output/rnnoise_epoch5.pth
 ```
 
 續訓會恢復：model weights、optimizer 狀態、scheduler 狀態、epoch 計數、best_val_loss。
@@ -186,9 +210,10 @@ python3 export_erb_matrix.py --config config.ini --format all
 
 | 檔案 | 說明 |
 |------|------|
-| `train.py` | 訓練腳本（模型定義 + 訓練迴圈，支援 online / precomputed 兩種模式） |
-| `gen_dataset.py` | 離線預生成訓練資料（存成 .pt shard 檔） |
-| `dataset.py` | DNS4 資料集 + augmentation pipeline + PrecomputedDataset |
+| `train.py` | 模型定義與 packed raw-WAV tensor 訓練迴圈 |
+| `gen_dataset.py` | 離線產生 2-channel noisy/clean WAV pairs |
+| `pack_dataset.py` | 將 WAV pairs 打包成訓練用 `.pt` tensor |
+| `dataset.py` | DNS4 augmentation 與 packed/WAV dataset readers |
 | `denoise.py` | 推論腳本（單檔降噪） |
 | `export_onnx.py` | ONNX 匯出（streaming 推論格式） |
 | `export_erb_matrix.py` | ERB 矩陣匯出（npy / C header） |
@@ -212,3 +237,15 @@ make test-tables   # 兩層都建置+執行,任一 FAIL 即非零退出
   關係、Hann 落在 [0,1] 且滿足公式對稱)+ 實測定界的 ULP 門檻——
   **recompute-vs-table 為 256 ULP、Hann 鏡像對稱為 4096 ULP(實測 434)**,
   兩者是不同檢查的不同門檻,皆為 garbage-detector 而非位元契約。
+
+## Feature tests
+
+```bash
+make test                 # tables + config/Python/C constants + C feature-state contract
+make test-feature-python  # 需 torch training environment
+```
+
+C test 會以獨立 recurrence 對照 `rnnoise_compute_features()`，並讓固定非平坦
+spectrum 運行 4096 frames，確認 runtime state 收斂後 spectral envelope 仍非零。
+Python test另外驗證 state shape、使用更新前 state、whole-vs-chunk equivalence，
+以及相同的穩態 regression。

@@ -13,8 +13,9 @@ extern "C" {
  *   - ERB: Glasberg-Moore band borders (erb_bandborder) +
  *     三角 filterbank (compute_erb_matrix mode=0 forward / mode=1 inverse)
  *   - 特徵: erb_db = 10*log10(power @ ERB + 1e-10);
- *     band_mean_norm: state = x*(1-a) + state*a; feat = (x-state)/40,
- *     state 初值 = linspace(-60, -90) dB, a = exp(-(hop/sr)/1.0)
+ *     所有 ERB band 共用一組 broadband runtime mean/variance，先用舊 state
+ *     產生 feat=(erb_db-mean)/sqrt(var+floor)，再用該 frame 的 band-average
+ *     更新 state。共享 scalar state 會保留穩態訊號的跨 band 頻譜形狀。
  *   - Band gain → bin gain: gains @ ERB_inv^T (mode=1, partition of unity)
  *   - ISTFT: normalized=True (× N_FFT^+0.5) + root-Hann + 50% OLA (COLA)
  *
@@ -31,12 +32,17 @@ extern "C" {
 #define RNNOISE_HOP_LEN     256   /* 幀移長度 (≤ WIN_LEN/2 for COLA) */
 #define RNNOISE_OVL_LEN     (RNNOISE_WIN_LEN - RNNOISE_HOP_LEN)  /* overlap 長度 */
 #define RNNOISE_N_BANDS     22    /* = config.ini [signal] n_bands (純 ERB 模式) */
-#define RNNOISE_CONV_DELAY  2     /* conv1 kernel=3 causal → 需要緩衝 2 frame 歷史, 0 lookahead */
+#define RNNOISE_LOOKAHEAD     1     /* = config.ini lookahead_frames */
+#define RNNOISE_CONV_DELAY    (2 - RNNOISE_LOOKAHEAD)
 
-/* band_mean_norm 常數 (train.py extract_erb_features / denoise.py extract_features) */
-#define RNNOISE_MEAN_NORM_LO   (-60.0f)  /* linspace 初值: 低頻端 */
-#define RNNOISE_MEAN_NORM_HI   (-90.0f)  /* linspace 初值: 高頻端 */
-#define RNNOISE_MEAN_NORM_DIV  40.0f     /* feat = (x - state) / 40 */
+/* log_erb_shared_online_cmvn_v1 constants.  Keep byte-for-byte aligned with
+ * config.ini [feature] and checkpoint validation in train.py. */
+#define RNNOISE_FEATURE_VERSION       "log_erb_shared_online_cmvn_v1"
+#define RNNOISE_NORM_TAU_SEC          10.0f
+#define RNNOISE_NORM_MEAN_INIT_DB    (-75.0f)
+#define RNNOISE_NORM_VAR_INIT_DB2     400.0f  /* std_init_db = 20 */
+#define RNNOISE_NORM_VAR_FLOOR_DB2     36.0f  /* std_floor_db = 6 */
+#define RNNOISE_NORM_CLIP               5.0f
 
 /* 處理狀態 (呼叫端分配，跨 frame 保持) */
 typedef struct {
@@ -48,8 +54,9 @@ typedef struct {
     int   feat_idx;                      /* 下一個寫入位置 (0,1,2) */
     int   feat_count;                    /* 已累積的 frame 數 */
 
-    /* band_mean_norm running mean (dB 域); 初值 linspace(-60,-90) */
-    float ema_state[RNNOISE_N_BANDS];
+    /* Shared broadband online normalisation state (dB / dB^2). */
+    float norm_mean;
+    float norm_var;
 
     /* --- 以下為每次呼叫用的暫存區 (scratch), 非跨 frame 狀態 ---
      * 原本配置在各函式的 stack 上 (F13: embedded hot-path stack 偏高);
@@ -63,7 +70,7 @@ typedef struct {
     float scratch_full_im[RNNOISE_N_FFT];
 } RNNoiseState;
 
-/* 初始化狀態 (歸零 + ema_state 設 linspace 初值; 內部亦會呼叫
+/* 初始化狀態 (歸零 + shared norm mean/variance 初值; 內部亦會呼叫
  * rnnoise_tables_init() — 見下方說明, 現為 no-op) */
 void rnnoise_state_init(RNNoiseState *st);
 
@@ -92,9 +99,12 @@ void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float
 
 /* 從 normalized FFT spectrum 計算 ERB band features:
  *   1. power = |X|^2 → 三角 ERB filterbank (mode=0) → 10*log10(·+1e-10)
- *   2. band_mean_norm: state=x*(1-a)+state*a; feat=(x-state)/40
+ *   2. 用更新前的 shared broadband mean/variance 正規化全部 bands
+ *   3. 用當前 frame 的 band-average 更新 shared mean/variance
  *   spec_re, spec_im: 長度 N_BINS
  *   out_features: [3][N_BANDS] (oldest→newest, 供 conv1 k=3)
+ *   lookahead=1 時，最新 window [t-2,t-1,t] 的 gain 對應 spectrum t-1；
+ *   呼叫端必須保存/延遲正確的 spectrum，不能直接套到 t。
  *   回傳: 1 = 特徵可用 (已累積 3 frame), 0 = 尚需累積 */
 int rnnoise_compute_features(RNNoiseState *st,
                              const float *spec_re, const float *spec_im,

@@ -14,7 +14,10 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from train import RNNoiseModel, compute_hybrid_bands
+from train import (
+    RNNoiseModel, compute_hybrid_bands, read_feature_config,
+    require_checkpoint_feature_config,
+)
 
 
 class RNNoiseStreaming(nn.Module):
@@ -110,6 +113,10 @@ def export(args):
     # Load config
     cfg = configparser.ConfigParser()
     cfg.read(args.config)
+    sr = cfg.getint('signal', 'sr')
+    win_len = cfg.getint('signal', 'win_len', fallback=cfg.getint('signal', 'n_fft'))
+    hop_len = cfg.getint('signal', 'hop_len', fallback=win_len // 2)
+    feature_cfg = read_feature_config(cfg, sr, hop_len)
 
     HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
     N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
@@ -121,6 +128,7 @@ def export(args):
         N_BANDS = cfg.getint('signal', 'n_bands')
 
     ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
+    require_checkpoint_feature_config(ckpt, feature_cfg, context=args.model)
     # 架構直接從 state_dict 張量形狀推導 (唯一權威來源) — 避免硬寫 64/128 或
     # config/ckpt-config 漂移導致 load_state_dict 失敗. 舊 ckpt 可能無 'config' key.
     #   conv1.weight: [cond_size, n_bands, 3]   conv2.weight: [gru_size, cond_size, 1]
@@ -164,8 +172,16 @@ def export(args):
     # 3) shape inference
     m = onnx.load(args.output)
     m = onnx.shape_inference.infer_shapes(m)
+    onnx.helper.set_model_props(m, {
+        'feature_version': feature_cfg['version'],
+        'feature_norm_tau_sec': str(feature_cfg['tau_sec']),
+        'feature_mean_init_db': str(feature_cfg['mean_init_db']),
+        'feature_std_init_db': str(feature_cfg['var_init_db2'] ** 0.5),
+        'feature_std_floor_db': str(feature_cfg['var_floor_db2'] ** 0.5),
+        'feature_clip': str(feature_cfg['clip']),
+    })
     onnx.save(m, args.output)
-    print_stats("shape inference (final)", args.output)
+    print_stats("shape inference + feature metadata (final)", args.output)
 
     # 清理中間檔
     import os

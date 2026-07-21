@@ -1,5 +1,28 @@
 # RNNoise-ERB 開發紀錄
 
+## 2026-07 — shared broadband runtime normalization
+
+### 問題
+- 單一 ERB input 沿用 DeepFilterNet per-band temporal EMA 時，每個 band 都會被
+  自己的 running mean 扣除；穩態訊號的平均頻譜與絕對 level 因此趨近全零。
+- DeepFilterNet 尚有 complex spectrum branch 保留資訊，本模型沒有，兩者不能
+  假設等價。
+- 舊訓練每個 3 秒 clip 重設 feature state，但 runtime stream 長時間持續更新，
+  造成 feature distribution mismatch。
+
+### 決策
+- Feature version 改為 `log_erb_shared_online_cmvn_v1`。
+- 保持 22 維輸入；所有 ERB bands 共用一組 broadband scalar mean/variance。
+- Feature 使用更新前 state，之後才用當前 frame 的 band-average 更新 state。
+- 訓練讓 normalizer state 跨 batch 中的 3 秒 clips 延續，每個 epoch 才重設。
+- Checkpoint 保存並驗證 feature version/tau/init/floor/clip；舊 checkpoint 必須重訓。
+- Python/C 預設：tau=10s、mean=-75dB、std init=20dB、std floor=6dB、clip=5。
+
+### 驗證
+- `make test-features`：C recurrence reference + 4096-frame stationary regression。
+- `make test-feature-python`：previous-state、chunk equivalence、stationary envelope、
+  scalar-state shape。
+
 ## 2026-04 — feature/wav-perceptual-loss branch
 
 ### 動機

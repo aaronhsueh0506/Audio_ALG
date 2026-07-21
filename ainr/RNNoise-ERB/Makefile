@@ -53,7 +53,7 @@ CFG_SIG_PAYLOAD := CC=$(CC) CFLAGS=$(CFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 BUILD_DIR = build/$(CFG_SIG)
 
-.PHONY: test-tables clean _cfg_guard
+.PHONY: test test-tables test-features test-feature-contract test-feature-python clean _cfg_guard
 _cfg_guard:
 	@mkdir -p $(BUILD_DIR)
 	@m="$(BUILD_DIR)/config.manifest"; \
@@ -75,11 +75,30 @@ test-tables: $(BUILD_DIR)/test_rnnoise_tables $(BUILD_DIR)/test_rnnoise_tables_p
 	@echo "== rnnoise tables drift-guard: layer 2 (portable, math contracts) =="
 	./$(BUILD_DIR)/test_rnnoise_tables_portable
 
+test: test-tables test-feature-contract test-features
+
+test-feature-contract:
+	@echo "== rnnoise config/Python/C feature contract =="
+	python3 test_feature_contract.py
+
+test-features: $(BUILD_DIR)/test_rnnoise_features
+	@echo "== rnnoise feature-state contract =="
+	./$(BUILD_DIR)/test_rnnoise_features
+
+# Requires the training Python environment (torch + numpy).  Kept separate from
+# `make test` so the dependency-free embedded C checks remain runnable on hosts
+# that intentionally do not install PyTorch.
+test-feature-python:
+	python3 test_feature_norm.py
+
 $(BUILD_DIR)/test_rnnoise_tables: test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ test_rnnoise_tables.c -lm
 
 $(BUILD_DIR)/test_rnnoise_tables_portable: test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
 	$(CC) $(CFLAGS) -DRNN_TABLES_PORTABLE -o $@ test_rnnoise_tables.c -lm
+
+$(BUILD_DIR)/test_rnnoise_features: test_rnnoise_features.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ test_rnnoise_features.c process.c -lm
 
 clean:
 	rm -rf build

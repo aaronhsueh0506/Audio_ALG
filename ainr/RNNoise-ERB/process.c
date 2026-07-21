@@ -6,7 +6,7 @@
  *   - Root Hann window (sqrt(hann), analysis+synthesis 各乘一次 → COLA)
  *   - normalized STFT/ISTFT (× N^∓0.5, = torch.stft/istft normalized=True)
  *   - Glasberg-Moore ERB band borders + 三角 filterbank (forward/inverse)
- *   - erb_db = 10*log10(energy+1e-10) + band_mean_norm ((x-state)/40)
+ *   - erb_db = 10*log10(energy+1e-10) + shared broadband online mean/variance
  *   - Band gain → bin gain (mode=1 inverse matrix, partition of unity)
  *   - Overlap-add synthesis
  * ============================================================ */
@@ -115,12 +115,8 @@ void rnnoise_tables_init(void) {
 
 void rnnoise_state_init(RNNoiseState *st) {
     memset(st, 0, sizeof(RNNoiseState));
-    /* band_mean_norm 初值: linspace(-60, -90, N_BANDS) dB
-     * (train.py/denoise.py mean_norm_init=(-60.0, -90.0)) */
-    for (int b = 0; b < RNNOISE_N_BANDS; b++) {
-        st->ema_state[b] = RNNOISE_MEAN_NORM_LO +
-            (RNNOISE_MEAN_NORM_HI - RNNOISE_MEAN_NORM_LO) * (float)b / (RNNOISE_N_BANDS - 1);
-    }
+    st->norm_mean = RNNOISE_NORM_MEAN_INIT_DB;
+    st->norm_var = RNNOISE_NORM_VAR_INIT_DB2;
     rnnoise_tables_init();  /* no-op (表格編譯期已就緒); 保留呼叫只為相容 */
 }
 
@@ -175,14 +171,34 @@ int rnnoise_compute_features(RNNoiseState *st,
         erb_db[b] = 10.0f * log10f(sum + LOG_FLOOR);
     }
 
-    /* band_mean_norm (train.py extract_erb_features / denoise.py):
-     *   state = x*(1-a) + state*a;  feat = (x - state) / 40
-     *   a = exp(-(hop/sr)/tau), tau = 1s (make_ema_alpha) */
-    const float ema_a = (float)exp(-((double)RNNOISE_HOP_LEN / (double)RNNOISE_SR) / 1.0);
+    /* log_erb_shared_online_cmvn_v1:
+     *   - ONE scalar mean/variance is shared by all bands.
+     *   - Features use the previous state (strictly causal).
+     *   - State then observes the current frame's band-average log level.
+     * Per-band temporal centering is intentionally forbidden because it erases
+     * the stationary spectral envelope when ERB is the model's only input. */
+    const float norm_a = (float)exp(
+        -((double)RNNOISE_HOP_LEN / (double)RNNOISE_SR) /
+        (double)RNNOISE_NORM_TAU_SEC);
     int idx = st->feat_idx;
+    float denom = sqrtf(st->norm_var + RNNOISE_NORM_VAR_FLOOR_DB2);
+    float level = 0.0f;
     for (int b = 0; b < RNNOISE_N_BANDS; b++) {
-        st->ema_state[b] = erb_db[b] * (1.0f - ema_a) + st->ema_state[b] * ema_a;
-        st->feat_buf[idx][b] = (erb_db[b] - st->ema_state[b]) / RNNOISE_MEAN_NORM_DIV;
+        float feat = (erb_db[b] - st->norm_mean) / denom;
+        if (feat > RNNOISE_NORM_CLIP) feat = RNNOISE_NORM_CLIP;
+        if (feat < -RNNOISE_NORM_CLIP) feat = -RNNOISE_NORM_CLIP;
+        st->feat_buf[idx][b] = feat;
+        level += erb_db[b];
+    }
+    level /= RNNOISE_N_BANDS;
+
+    {
+        float delta = level - st->norm_mean;
+        float new_mean = st->norm_mean + (1.0f - norm_a) * delta;
+        float new_var = norm_a * st->norm_var +
+            (1.0f - norm_a) * delta * (level - new_mean);
+        st->norm_mean = new_mean;
+        st->norm_var = new_var > 0.0f ? new_var : 0.0f;
     }
     st->feat_idx = (idx + 1) % 3;
     /* 飽和計數，不無限累加: feat_count 唯一用途是與 3 比較 (< 3 vs >= 3)，

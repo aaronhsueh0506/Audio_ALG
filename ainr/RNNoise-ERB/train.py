@@ -2,8 +2,8 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 """
-RNNoise v0.2 風格噪音抑制模型 — 訓練腳本
-基於官方 xiph/rnnoise torch 版本架構，適配 config-driven / ERB bands / 無 pitch
+RNNoise v0.2-inspired 噪音抑制模型 — 訓練腳本
+採用 Conv+GRU 骨架，並改為 config-driven / ERB-only / 無 pitch 的本地架構
 
 用法:
     python train.py --config config.ini
@@ -26,6 +26,71 @@ from torch.utils.data import DataLoader, RandomSampler, random_split
 import tqdm
 
 from dataset import PackedDataset
+
+
+# Feature semantics are intentionally versioned because old and new models both use
+# 22 inputs while assigning completely different meanings to those 22 values.  Never
+# silently load a checkpoint trained with the former per-band temporal EMA.
+FEATURE_VERSION = 'log_erb_shared_online_cmvn_v1'
+
+
+def require_checkpoint_feature_version(ckpt, context='checkpoint'):
+    """Reject checkpoints whose 22-D input semantics do not match this code."""
+    version = ckpt.get('feature_version', ckpt.get('config', {}).get('feature_version'))
+    if version != FEATURE_VERSION:
+        shown = repr(version) if version is not None else 'missing (legacy per-band EMA)'
+        raise ValueError(
+            f"{context} feature_version={shown}, expected {FEATURE_VERSION!r}. "
+            "Feature dimensions match but semantics do not; retrain this model."
+        )
+
+
+def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
+    """Require the checkpoint and runtime to use identical normaliser constants."""
+    require_checkpoint_feature_version(ckpt, context=context)
+    saved = ckpt.get('config', {})
+    expected = {
+        'feature_norm_tau_sec': feature_cfg['tau_sec'],
+        'feature_mean_init_db': feature_cfg['mean_init_db'],
+        'feature_std_init_db': feature_cfg['var_init_db2'] ** 0.5,
+        'feature_std_floor_db': feature_cfg['var_floor_db2'] ** 0.5,
+        'feature_clip': feature_cfg['clip'],
+    }
+    import math
+    for key, want in expected.items():
+        if key not in saved or not math.isclose(float(saved[key]), float(want),
+                                                 rel_tol=1e-7, abs_tol=1e-7):
+            got = saved.get(key, 'missing')
+            raise ValueError(
+                f"{context} {key}={got!r}, but runtime config requires {want!r}; "
+                "use the training config or retrain before inference/export."
+            )
+
+
+def read_feature_config(cfg, sr, hop_len):
+    """Read the runtime-normalisation contract shared by train/denoise/C."""
+    version = cfg.get('feature', 'version', fallback=FEATURE_VERSION)
+    if version != FEATURE_VERSION:
+        raise ValueError(
+            f"config feature version {version!r} is unsupported; expected {FEATURE_VERSION!r}"
+        )
+    tau_sec = cfg.getfloat('feature', 'norm_tau_sec', fallback=10.0)
+    mean_init_db = cfg.getfloat('feature', 'mean_init_db', fallback=-75.0)
+    std_init_db = cfg.getfloat('feature', 'std_init_db', fallback=20.0)
+    std_floor_db = cfg.getfloat('feature', 'std_floor_db', fallback=6.0)
+    clip = cfg.getfloat('feature', 'clip', fallback=5.0)
+    if tau_sec <= 0 or std_init_db <= 0 or std_floor_db <= 0 or clip <= 0:
+        raise ValueError('feature tau/std/clip values must all be positive')
+    alpha = make_norm_alpha(sr, hop_len, tau_sec)
+    return dict(
+        version=version,
+        tau_sec=tau_sec,
+        alpha=alpha,
+        mean_init_db=mean_init_db,
+        var_init_db2=std_init_db * std_init_db,
+        var_floor_db2=std_floor_db * std_floor_db,
+        clip=clip,
+    )
 
 # ============================================================
 # ERB Band 工具
@@ -161,13 +226,13 @@ def compute_erb_matrix(nfftborder, n_fft, mode=0):
 
 
 # ============================================================
-# 模型 (基於 RNNoise v0.2 官方 PyTorch 架構)
+# 模型 (RNNoise v0.2-inspired 本地架構)
 # ============================================================
 
 class RNNoiseModel(nn.Module):
     """
-    架構沿用官方 v0.2: Conv1d 前處理 + 3 層 GRU + concat 全層輸出
-    差異: 輸入改為 ERB band log energy, 無 VAD, 無 sparsification
+    RNNoise v0.2-inspired: Conv1d 前處理 + 3 層 GRU。
+    本地差異包含 ERB-only input、conv2 k=1、concat 各層輸出、無 VAD/稀疏化。
     """
     def __init__(self, n_bands, cond_size=64, gru_size=128, dropout=0.0):
         super().__init__()
@@ -228,7 +293,7 @@ class RNNoiseModel(nn.Module):
         gru2_out = self.dropout(gru2_out)
         gru3_out, h3 = self.gru3(gru2_out, h3)
 
-        # Concat 全層輸出 (同官方 v0.2)
+        # 本地 multi-layer skip: concat conv 與三層 GRU 輸出
         cat = torch.cat([conv_out, gru1_out, gru2_out, gru3_out], dim=-1)
         # Plain sigmoid (DFN3 style): 軟輸出, sharpening 留給 inference-only post-filter
         gains = torch.sigmoid(self.dense_out(cat))
@@ -239,8 +304,8 @@ class RNNoiseModel(nn.Module):
 # Perceptual loss helpers (WAV-data mode)
 # ============================================================
 
-def make_ema_alpha(sr: int, hop_len: int, tau: float = 1.0) -> float:
-    """DFN-style alpha: exp(-dt/tau), tau=1s decay window."""
+def make_norm_alpha(sr: int, hop_len: int, tau: float = 10.0) -> float:
+    """Causal runtime-statistics decay: alpha = exp(-frame_period/tau)."""
     import math
     return math.exp(-(hop_len / sr) / tau)
 
@@ -258,30 +323,63 @@ def istft(spec, n_fft, hop_len, win_len, window, length):
                        window=window, length=length, normalized=True)
 
 
-def extract_erb_features(power_spec, erb_matrix, ema_alpha: float = 0.99,
-                         mean_norm_init=(-60.0, -90.0)):
+def normalize_log_erb(erb_db, norm_state=None, norm_alpha: float = 0.9984,
+                      mean_init_db: float = -75.0,
+                      var_init_db2: float = 400.0,
+                      var_floor_db2: float = 36.0,
+                      clip: float = 5.0):
     """
-    power_spec: (..., n_frames, n_bins) — |X|^2 of the STFT (torch.stft normalized=True =
-    fft_size^-0.5, matching DeepFilterNet-Keras). erb_matrix: (n_bins, n_bands) triangular ERB FB.
-    Returns: (..., n_frames, n_bands) — DFN `feat_erb`:
-        energy = power @ erb_matrix                       # triangular ERB band energy
-        erb_db = 10*log10(energy + 1e-10)
-        band_mean_norm_erb: state=x*(1-a)+state*a ; x=(x-state)/40
-        state init = linspace(MEAN_NORM_INIT) = -60 (low) .. -90 (high) dB
-    """
-    energy = power_spec @ erb_matrix                       # (..., T, n_bands)
-    erb_db = 10.0 * torch.log10(energy + 1e-10)            # → dB
+    Normalise log-ERB values with ONE broadband runtime mean/variance per stream.
 
+    The same scalar statistics are shared by every ERB band, so runtime gain drift is
+    removed while a stationary signal's cross-band spectral envelope remains visible.
+    Features are computed from the previous state, then the state is updated causally.
+
+    erb_db: (..., T, C), norm_state: {'mean': (B, 1), 'var': (B, 1)} or None.
+    """
     shape = erb_db.shape
-    x     = erb_db.reshape(-1, shape[-2], shape[-1])        # (B, T, C)
-    lo_i, hi_i = mean_norm_init                            # MEAN_NORM_INIT = (-60, -90)
-    state = torch.linspace(lo_i, hi_i, shape[-1], device=x.device,
-                           dtype=x.dtype).expand(x.size(0), -1).clone()  # (B, C)
-    out   = []
+    x = erb_db.reshape(-1, shape[-2], shape[-1])            # (B, T, C)
+    batch = x.size(0)
+
+    state_ok = (
+        norm_state is not None and
+        'mean' in norm_state and 'var' in norm_state and
+        norm_state['mean'].shape == (batch, 1) and
+        norm_state['var'].shape == (batch, 1)
+    )
+    if state_ok:
+        mean = norm_state['mean'].to(device=x.device, dtype=x.dtype)
+        var = norm_state['var'].to(device=x.device, dtype=x.dtype)
+    else:
+        mean = torch.full((batch, 1), mean_init_db, device=x.device, dtype=x.dtype)
+        var = torch.full((batch, 1), var_init_db2, device=x.device, dtype=x.dtype)
+
+    out = []
     for t in range(x.size(1)):
-        state = x[:, t, :] * (1.0 - ema_alpha) + state * ema_alpha
-        out.append((x[:, t, :] - state) / 40.0)
-    return torch.stack(out, dim=1).reshape(shape)
+        frame = x[:, t, :]
+        denom = torch.sqrt(var + var_floor_db2)
+        out.append(torch.clamp((frame - mean) / denom, -clip, clip))
+
+        level = frame.mean(dim=-1, keepdim=True)
+        delta = level - mean
+        new_mean = mean + (1.0 - norm_alpha) * delta
+        var = norm_alpha * var + (1.0 - norm_alpha) * delta * (level - new_mean)
+        mean = new_mean
+        var = var.clamp_min(0.0)
+
+    features = torch.stack(out, dim=1).reshape(shape)
+    return features, {'mean': mean.detach(), 'var': var.detach()}
+
+
+def extract_erb_features(power_spec, erb_matrix, norm_state=None, **norm_kwargs):
+    """
+    power_spec: (..., T, n_bins), from normalized=True STFT.
+    erb_matrix: (n_bins, n_bands) triangular forward ERB filterbank.
+    Returns (features, updated_state), with features shape (..., T, n_bands).
+    """
+    energy = power_spec @ erb_matrix
+    erb_db = 10.0 * torch.log10(energy + 1e-10)
+    return normalize_log_erb(erb_db, norm_state=norm_state, **norm_kwargs)
 
 
 def apply_erb_gains_batch(noisy_spec, gains, erb_inv, lookahead=0):
@@ -383,6 +481,7 @@ def train(args):
 
     LOOKAHEAD = cfg.getint('signal', 'lookahead_frames', fallback=0)
     assert 0 <= LOOKAHEAD <= 2, "lookahead_frames 只支援 0~2"
+    FEATURE_CFG = read_feature_config(cfg, SR, HOP_LEN)
 
     # Training params
     epochs = cfg.getint('training', 'epochs')
@@ -487,15 +586,18 @@ def train(args):
     perc_factor = cfg.getfloat('perceptual_loss', 'factor', fallback=1.0)
     perc_f_under = cfg.getfloat('perceptual_loss', 'f_under', fallback=1.0)
 
-    # DFN-style EMA alpha (tau=1s decay window)
-    EMA_ALPHA = make_ema_alpha(SR, HOP_LEN)
     # Forward ERBB (mode=0, edge x2) for features; inverse (mode=1, partition of unity)
     # for mask→bin expansion — exactly the DFN/Keras forward/inverse split.
     ERB_FWD = torch.from_numpy(
         compute_erb_matrix(NFFTBORDER, N_FFT, mode=0)).to(device)  # (n_bins, n_bands)
     ERB_INV = torch.from_numpy(
         compute_erb_matrix(NFFTBORDER, N_FFT, mode=1)).to(device)  # (n_bins, n_bands)
-    print(f"  EMA alpha = {EMA_ALPHA:.4f}  (tau=1s, dt={HOP_LEN/SR*1000:.1f}ms)")
+    print(f"  feature={FEATURE_CFG['version']}")
+    print(f"  shared norm alpha={FEATURE_CFG['alpha']:.6f} "
+          f"(tau={FEATURE_CFG['tau_sec']:g}s, dt={HOP_LEN/SR*1000:.1f}ms, "
+          f"mean_init={FEATURE_CFG['mean_init_db']:g}dB, "
+          f"std_init={FEATURE_CFG['var_init_db2'] ** 0.5:g}dB, "
+          f"std_floor={FEATURE_CFG['var_floor_db2'] ** 0.5:g}dB)")
 
     # Window for on-the-fly STFT (wav-data mode) — created once, moved to device
     stft_window = torch.sqrt(torch.hann_window(WIN_LEN)).to(device)
@@ -509,6 +611,7 @@ def train(args):
     if args.resume:
         print(f"Loading checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        require_checkpoint_feature_config(ckpt, FEATURE_CFG, context=args.resume)
         model.load_state_dict(ckpt['state_dict'])
         if 'optimizer' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer'])
@@ -547,6 +650,10 @@ def train(args):
         # --- Train ---
         model.train()
         train_loss_sum = 0
+        # Each batch lane behaves like a long-running stream.  Carrying the
+        # normaliser across independent 3-s clips exposes the model to mature
+        # statistics and abrupt source changes instead of restarting every clip.
+        train_norm_state = None
         with tqdm.tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") as pbar:
             if use_wav:
                 for noisy_wav, clean_wav in pbar:
@@ -560,7 +667,13 @@ def train(args):
                     # ERB features + zero-pad on T dim 讓 conv 輸出與 spec frame 1:1 對齊
                     # pad_left = 2-LOOKAHEAD (補過去), pad_right = LOOKAHEAD (補未來)
                     power = noisy_spec.abs().pow(2).permute(0, 2, 1)  # (B, T, F)
-                    features = extract_erb_features(power, ERB_FWD, EMA_ALPHA)  # (B, T, n_bands)
+                    features, train_norm_state = extract_erb_features(
+                        power, ERB_FWD, norm_state=train_norm_state,
+                        norm_alpha=FEATURE_CFG['alpha'],
+                        mean_init_db=FEATURE_CFG['mean_init_db'],
+                        var_init_db2=FEATURE_CFG['var_init_db2'],
+                        var_floor_db2=FEATURE_CFG['var_floor_db2'],
+                        clip=FEATURE_CFG['clip'])  # (B, T, n_bands)
                     features = F.pad(features, (0, 0, 2 - LOOKAHEAD, LOOKAHEAD))
 
                     pred_gains, _ = model(features)  # (B, T, n_bands)
@@ -597,6 +710,7 @@ def train(args):
         # --- Validation ---
         model.eval()
         val_loss_sum = 0
+        val_norm_state = None
         with torch.no_grad():
             if use_wav:
                 for noisy_wav, clean_wav in val_loader:
@@ -605,7 +719,13 @@ def train(args):
 
                     noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
                     power = noisy_spec.abs().pow(2).permute(0, 2, 1)
-                    features = extract_erb_features(power, ERB_FWD, EMA_ALPHA)
+                    features, val_norm_state = extract_erb_features(
+                        power, ERB_FWD, norm_state=val_norm_state,
+                        norm_alpha=FEATURE_CFG['alpha'],
+                        mean_init_db=FEATURE_CFG['mean_init_db'],
+                        var_init_db2=FEATURE_CFG['var_init_db2'],
+                        var_floor_db2=FEATURE_CFG['var_floor_db2'],
+                        clip=FEATURE_CFG['clip'])
                     features = F.pad(features, (0, 0, 2 - LOOKAHEAD, LOOKAHEAD))
                     pred_gains, _ = model(features)
                     enhanced_spec = apply_erb_gains_batch(
@@ -633,11 +753,18 @@ def train(args):
             'loss': avg_val,
             'best_val_loss': best_val_loss,
             'nfftborder': NFFTBORDER.tolist(),
+            'feature_version': FEATURE_VERSION,
             'config': {
                 'sr': SR, 'n_fft': N_FFT, 'win_len': WIN_LEN,
                 'hop_len': HOP_LEN, 'n_bands': N_BANDS,
                 'lookahead_frames': LOOKAHEAD,
                 'cond_size': COND_SIZE, 'gru_size': GRU_SIZE,
+                'feature_version': FEATURE_VERSION,
+                'feature_norm_tau_sec': FEATURE_CFG['tau_sec'],
+                'feature_mean_init_db': FEATURE_CFG['mean_init_db'],
+                'feature_std_init_db': FEATURE_CFG['var_init_db2'] ** 0.5,
+                'feature_std_floor_db': FEATURE_CFG['var_floor_db2'] ** 0.5,
+                'feature_clip': FEATURE_CFG['clip'],
             },
         }
         torch.save(ckpt, os.path.join(output_dir, f'rnnoise_epoch{epoch}.pth'))
@@ -661,7 +788,7 @@ def train(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='RNNoise v0.2 訓練 (config-driven, ERB bands)')
+        description='RNNoise v0.2-inspired 訓練 (config-driven, ERB bands)')
     parser.add_argument('--config', default='config.ini', help='Config 檔案路徑')
     parser.add_argument('--device', default=None,
                         help='覆蓋 config 中的 device 設定')
