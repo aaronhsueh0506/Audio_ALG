@@ -1,39 +1,37 @@
 # RNNoise-ERB
 
-以 RNNoise v0.2 的 Conv+GRU 方向為基礎的本地噪音抑制模型，使用 ERB
-(Equivalent Rectangular Bandwidth) 頻帶作為特徵；並非官方 v0.2 的逐層相容移植。
+以 RNNoise v0.2 的 Conv+GRU 方向為基礎的本地噪音抑制模型，使用
+absolute log-ERB 與低頻 complex spectrum 雙路特徵；並非官方 v0.2
+或 DeepFilterNet 的逐層相容移植。
 
 ## 架構
 
-- **輸入**: 22 個 log-ERB bands，使用共享 broadband runtime mean/variance
-- **模型**: Conv1d(k=3, valid) + Conv1d(k=1) → 3 層 GRU(256) → concat → Dense → sigmoid
-- **輸出**: 22 個 band 的 gain mask [0, 1]
-- **參數量**: 預設設定約 1.23M
+- **ERB 輸入**: 22 個 absolute log-energy bands，只做固定 affine scaling
+- **Complex 輸入**: 0–4 kHz 的 129 個 real/imag bins，做每-bin magnitude EMA unit norm
+- **模型**: ERB temporal conv + complex frequency encoder/temporal conv → fusion → 3 層 GRU(128)
+- **輸出**: 22 個 gain masks [0, 1]
+- **參數量**: 376,254（無 VAD head）
 - **Latency**: 16ms lookahead（`lookahead_frames=1`，gain 對應 3-frame window 中間幀）
 
 ### Feature preprocessing
 
-目前 feature contract 為 `log_erb_shared_online_cmvn_v1`：
+目前 feature contract 為 `log_erb_abs_cplx_0_4k_v2`：
 
 ```text
-normalized STFT power
-→ triangular ERB forward matrix
-→ 10*log10(energy + 1e-10)
-→ 使用更新前的 shared broadband mean/variance 正規化 22 bands
-→ clip [-5, 5]
-→ 用當前 frame 的 22-band average 更新 shared mean/variance
+normalized complex STFT
+├─ power → triangular ERB → 10*log10(E+1e-10)
+│          → (dB - center_db) / scale_db → clip
+└─ bins 0..4 kHz → per-bin magnitude EMA
+                    → real/imag / sqrt(EMA+eps) → clip
 ```
 
-mean/variance 是每個 audio stream 一組 scalar，不是每個 ERB band 各一組。
-因此 microphone gain／整體 level 可以在 runtime 自適應，同時保留穩態訊號的
-跨 band spectral envelope。舊版的 per-band temporal EMA 會讓唯一 ERB input
-在穩態時趨近全零，已不再支援。
-此 22 維方案會正規化掉慢變的 absolute broadband level；若未來模型也必須直接
-看到該絕對值，應額外增加 level feature 或 absolute/adaptive dual input。
+ERB 路徑不扣時間均值，所以穩態訊號的絕對 level 與 spectral envelope
+不會被 EMA 消掉。Complex EMA 僅用於數值尺度穩定；real/imag 與細頻率
+結構仍在，穩態輸入也不會趨近 0。同一 stream 分 chunk 處理時必須傳遞
+complex EMA 與 GRU state；不同 WAV 之間必須重置。
 
-Feature state 預設值及時間常數在 `config.ini [feature]`；C 部署常數固定於
-`process.h`，兩邊必須同步。Feature 先用舊 state 計算再更新，確保 strictly
-causal，且同一段音訊分 chunk 處理與一次處理的結果一致。
+Feature 常數在 `config.ini [feature]`，C 部署常數固定於 `process.h`。
+修改後需同步兩邊並重訓。
 
 ## 環境安裝
 
@@ -111,16 +109,18 @@ output_dir = ./output
 | `[training] epoch_size` | 0 | 每 epoch sample 上限；0 表示使用全部資料 |
 | `[audio] segment_sec` | 3.0 | 每筆訓練音檔長度 (秒) |
 | `[rir] p_rir` | 0.1 | 套用 RIR 的機率 |
-| `[feature] norm_tau_sec` | 10.0 | runtime broadband mean/variance 時間常數 |
-| `[feature] mean_init_db` | -75.0 | shared mean 初值 |
-| `[feature] std_init_db` | 20.0 | runtime variance 對應的初始標準差 |
-| `[feature] std_floor_db` | 6.0 | denominator 的固定 variance floor |
-| `[feature] clip` | 5.0 | feature 絕對值上限 |
+| `[feature] erb_center_db` | -75.0 | absolute ERB 固定中心 |
+| `[feature] erb_scale_db` | 20.0 | absolute ERB 縮放尺度 |
+| `[feature] spec_max_hz` | 4000 | complex branch 頻率上限 |
+| `[feature] spec_norm_tau_sec` | 1.0 | complex per-bin magnitude EMA 時間常數 |
 
 改動任何 feature 常數都需要同步修改 `process.h` 並重新訓練。Checkpoint 會保存
 `feature_version` 與所有 normalization 常數；train resume、denoise 和 ONNX export
 都會拒絕缺少版本的舊 checkpoint，或拒絕與 runtime config 不一致的 checkpoint。
 匯出的 ONNX model metadata 也會帶上相同 feature contract，供部署端檢查。
+
+> v1/legacy ERB-only checkpoint 與 ONNX 無法沿用；新架構增加 complex input
+> 輸入，必須重訓後重新匯出。
 
 ## 訓練
 
@@ -183,6 +183,17 @@ python3 denoise.py --config config.ini --model output/rnnoise_best.pth \
                    --input noisy.wav --output clean.wav
 ```
 
+`--pf-beta` 預設為 0（關閉），避免在還沒驗證 raw gain 前再加劇抑制。
+若要定位「全壓成 0」是 feature、model 或 post-filter 造成：
+
+```bash
+python3 denoise.py --config config.ini --model output/rnnoise_best.pth \
+  --input failing.wav --output debug.wav --dump-debug debug/failing.npz
+```
+
+dump 含 `erb_db`、兩路 features、`raw_gains`、`post_gains`
+與輸入/輸出 waveform。這是 debug 用；checkpoint version gate 則是部署防呆。
+
 ## ONNX 匯出
 
 將訓練好的模型匯出為 ONNX 格式（用於部署）：
@@ -196,6 +207,9 @@ python3 export_onnx.py --config config.ini --model output/rnnoise_best.pth \
 python3 export_onnx.py --config config.ini --model output/rnnoise_best.pth \
                        --output output/rnnoise.onnx --verify
 ```
+
+Streaming ONNX 輸入為 `erb_input[1,3,22]`、`spec_input[1,3,2,129]`
+與三組 GRU hidden state；輸出 gains 與更新後 hidden state。
 
 ## ERB 矩陣匯出
 
@@ -246,6 +260,6 @@ make test-feature-python  # 需 torch training environment
 ```
 
 C test 會以獨立 recurrence 對照 `rnnoise_compute_features()`，並讓固定非平坦
-spectrum 運行 4096 frames，確認 runtime state 收斂後 spectral envelope 仍非零。
-Python test另外驗證 state shape、使用更新前 state、whole-vs-chunk equivalence，
-以及相同的穩態 regression。
+spectrum 運行 4096 frames，確認 ERB 與 complex 兩路都仍非零。
+Python test 另驗證 complex state/chunk equivalence、absolute ERB level、雙路 shape
+與 model forward contract。

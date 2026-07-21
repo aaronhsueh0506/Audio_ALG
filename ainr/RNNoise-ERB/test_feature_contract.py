@@ -34,19 +34,31 @@ def main():
     assert py_version and py_version.group(1) == version
 
     pairs = [
-        ('norm_tau_sec', 'RNNOISE_NORM_TAU_SEC'),
-        ('mean_init_db', 'RNNOISE_NORM_MEAN_INIT_DB'),
-        ('clip', 'RNNOISE_NORM_CLIP'),
+        ('erb_center_db', 'RNNOISE_ERB_CENTER_DB'),
+        ('erb_scale_db', 'RNNOISE_ERB_SCALE_DB'),
+        ('erb_clip', 'RNNOISE_ERB_CLIP'),
+        ('spec_norm_tau_sec', 'RNNOISE_SPEC_NORM_TAU_SEC'),
+        ('spec_norm_init_lo', 'RNNOISE_SPEC_NORM_INIT_LO'),
+        ('spec_norm_init_hi', 'RNNOISE_SPEC_NORM_INIT_HI'),
+        ('spec_norm_eps', 'RNNOISE_SPEC_NORM_EPS'),
+        ('spec_clip', 'RNNOISE_SPEC_CLIP'),
     ]
     for key, name in pairs:
         got = c_float(macro(header, name))
         want = cfg.getfloat('feature', key)
         assert math.isclose(got, want, rel_tol=0.0, abs_tol=1e-7), (name, got, want)
 
-    var_init = c_float(macro(header, 'RNNOISE_NORM_VAR_INIT_DB2'))
-    var_floor = c_float(macro(header, 'RNNOISE_NORM_VAR_FLOOR_DB2'))
-    assert math.isclose(var_init, cfg.getfloat('feature', 'std_init_db') ** 2)
-    assert math.isclose(var_floor, cfg.getfloat('feature', 'std_floor_db') ** 2)
+    spec_max_hz = int(macro(header, 'RNNOISE_SPEC_MAX_HZ').split()[0])
+    spec_bins = int(macro(header, 'RNNOISE_SPEC_BINS').split()[0])
+    sr = cfg.getint('signal', 'sr')
+    n_fft = cfg.getint('signal', 'n_fft')
+    hop_len = cfg.getint(
+        'signal', 'hop_len', fallback=cfg.getint('signal', 'win_len', fallback=n_fft) // 2)
+    assert int(macro(header, 'RNNOISE_SR').split()[0]) == sr
+    assert int(macro(header, 'RNNOISE_N_FFT').split()[0]) == n_fft
+    assert int(macro(header, 'RNNOISE_HOP_LEN').split()[0]) == hop_len
+    assert spec_max_hz == cfg.getint('feature', 'spec_max_hz')
+    assert spec_bins == spec_max_hz * n_fft // sr + 1
     assert int(macro(header, 'RNNOISE_N_BANDS').split()[0]) == cfg.getint('signal', 'n_bands')
     assert int(macro(header, 'RNNOISE_LOOKAHEAD').split()[0]) == cfg.getint(
         'signal', 'lookahead_frames')

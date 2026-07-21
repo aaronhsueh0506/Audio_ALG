@@ -1,6 +1,33 @@
 # RNNoise-ERB 開發紀錄
 
-## 2026-07 — shared broadband runtime normalization
+## 2026-07 — dual absolute-ERB + complex spectrum v2
+
+### 問題
+- `log_erb_shared_online_cmvn_v1` 在實際穩態 noise + 約 0 dB SNR 仍出現
+  speech 被全壓到 0，單靠 22 個 coarse ERB 不足以區分語音細頻率/週期性。
+- DeepFilterNet 的 ERB normalization 並不是單獨使用；它還有 complex
+  spectrogram branch。只複製 ERB norm 會遺失主要訊息。
+- 舊 waveform-only loss 沒有直接約束 gain，容易走向過度抑制。
+
+### 決策
+- Feature version 改為 `log_erb_abs_cplx_0_4k_v2`，舊 checkpoint 強制拒絕。
+- ERB branch 改為 absolute log-energy 固定 affine scaling，完全不做 temporal EMA。
+- 新增 0–4 kHz、129-bin complex branch；只對 magnitude 做 per-bin causal EMA
+  unit norm，real/imag 保留細頻率與相位資訊。
+- 模型新增 complex frequency encoder/fusion，但 runtime 仍只輸出 ERB gains。
+- 依實際既有 checkpoint 容量使用 3 層 GRU(128)，不增加 VAD head。
+- Loss 改為 waveform multi-resolution STFT + direct ERB IRM，並提高
+  speech-active frame 的 gain loss 權重。
+- 不同 shuffled WAV 間重置 EMA/GRU state；單一 WAV 內仍依 frame causal 更新。
+- `denoise.py --dump-debug` 可輸出 feature/raw gain/post gain；
+  `--pf-beta` 預設關閉。
+
+### 驗證
+- C/Python contract 固定 v2 常數與 shape。
+- 4096-frame stationary regression 要求 ERB/complex 兩路皆不得歸零。
+- 這是 checkpoint-incompatible architecture change，需重訓與重新匯出 ONNX。
+
+## 2026-07 — shared broadband runtime normalization（v1，已被 v2 取代）
 
 ### 問題
 - 單一 ERB input 沿用 DeepFilterNet per-band temporal EMA 時，每個 band 都會被
@@ -14,7 +41,7 @@
 - Feature version 改為 `log_erb_shared_online_cmvn_v1`。
 - 保持 22 維輸入；所有 ERB bands 共用一組 broadband scalar mean/variance。
 - Feature 使用更新前 state，之後才用當前 frame 的 band-average 更新 state。
-- 訓練讓 normalizer state 跨 batch 中的 3 秒 clips 延續，每個 epoch 才重設。
+- 當時訓練讓 normalizer state 跨 batch clips 延續；v2 已修正為不同 WAV 必須重置。
 - Checkpoint 保存並驗證 feature version/tau/init/floor/clip；舊 checkpoint 必須重訓。
 - Python/C 預設：tau=10s、mean=-75dB、std init=20dB、std floor=6dB、clip=5。
 

@@ -28,10 +28,10 @@ import tqdm
 from dataset import PackedDataset
 
 
-# Feature semantics are intentionally versioned because old and new models both use
-# 22 inputs while assigning completely different meanings to those 22 values.  Never
-# silently load a checkpoint trained with the former per-band temporal EMA.
-FEATURE_VERSION = 'log_erb_shared_online_cmvn_v1'
+# Feature semantics are intentionally versioned.  v2 has two inputs: absolute
+# log-ERB and a low-frequency complex spectrogram.  It is incompatible with all
+# ERB-only checkpoints even when the gain output still has 22 bands.
+FEATURE_VERSION = 'log_erb_abs_cplx_0_4k_v2'
 
 
 def require_checkpoint_feature_version(ckpt, context='checkpoint'):
@@ -50,11 +50,22 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
     require_checkpoint_feature_version(ckpt, context=context)
     saved = ckpt.get('config', {})
     expected = {
-        'feature_norm_tau_sec': feature_cfg['tau_sec'],
-        'feature_mean_init_db': feature_cfg['mean_init_db'],
-        'feature_std_init_db': feature_cfg['var_init_db2'] ** 0.5,
-        'feature_std_floor_db': feature_cfg['var_floor_db2'] ** 0.5,
-        'feature_clip': feature_cfg['clip'],
+        'sr': feature_cfg['sr'],
+        'n_fft': feature_cfg['n_fft'],
+        'hop_len': feature_cfg['hop_len'],
+        'lookahead_frames': feature_cfg['lookahead_frames'],
+        'n_bands': feature_cfg['n_bands'],
+        'feature_erb_center_db': feature_cfg['erb_center_db'],
+        'feature_erb_scale_db': feature_cfg['erb_scale_db'],
+        'feature_erb_clip': feature_cfg['erb_clip'],
+        'feature_spec_max_hz': feature_cfg['spec_max_hz'],
+        'feature_spec_bins': feature_cfg['spec_bins'],
+        'feature_spec_norm_tau_sec': feature_cfg['spec_tau_sec'],
+        'feature_spec_norm_alpha': feature_cfg['spec_alpha'],
+        'feature_spec_norm_init_lo': feature_cfg['spec_norm_init_lo'],
+        'feature_spec_norm_init_hi': feature_cfg['spec_norm_init_hi'],
+        'feature_spec_norm_eps': feature_cfg['spec_norm_eps'],
+        'feature_spec_clip': feature_cfg['spec_clip'],
     }
     import math
     for key, want in expected.items():
@@ -67,29 +78,47 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
             )
 
 
-def read_feature_config(cfg, sr, hop_len):
-    """Read the runtime-normalisation contract shared by train/denoise/C."""
+def read_feature_config(cfg, sr, hop_len, n_fft):
+    """Read the dual-input feature contract shared by train/denoise/C."""
     version = cfg.get('feature', 'version', fallback=FEATURE_VERSION)
     if version != FEATURE_VERSION:
         raise ValueError(
             f"config feature version {version!r} is unsupported; expected {FEATURE_VERSION!r}"
         )
-    tau_sec = cfg.getfloat('feature', 'norm_tau_sec', fallback=10.0)
-    mean_init_db = cfg.getfloat('feature', 'mean_init_db', fallback=-75.0)
-    std_init_db = cfg.getfloat('feature', 'std_init_db', fallback=20.0)
-    std_floor_db = cfg.getfloat('feature', 'std_floor_db', fallback=6.0)
-    clip = cfg.getfloat('feature', 'clip', fallback=5.0)
-    if tau_sec <= 0 or std_init_db <= 0 or std_floor_db <= 0 or clip <= 0:
-        raise ValueError('feature tau/std/clip values must all be positive')
-    alpha = make_norm_alpha(sr, hop_len, tau_sec)
+    erb_center_db = cfg.getfloat('feature', 'erb_center_db', fallback=-75.0)
+    erb_scale_db = cfg.getfloat('feature', 'erb_scale_db', fallback=20.0)
+    erb_clip = cfg.getfloat('feature', 'erb_clip', fallback=5.0)
+    spec_max_hz = cfg.getint('feature', 'spec_max_hz', fallback=4000)
+    spec_tau_sec = cfg.getfloat('feature', 'spec_norm_tau_sec', fallback=1.0)
+    spec_norm_init_lo = cfg.getfloat('feature', 'spec_norm_init_lo', fallback=0.001)
+    spec_norm_init_hi = cfg.getfloat('feature', 'spec_norm_init_hi', fallback=0.0001)
+    spec_norm_eps = cfg.getfloat('feature', 'spec_norm_eps', fallback=1e-12)
+    spec_clip = cfg.getfloat('feature', 'spec_clip', fallback=10.0)
+    if (erb_scale_db <= 0 or erb_clip <= 0 or spec_max_hz <= 0 or
+            spec_max_hz > sr // 2 or spec_tau_sec <= 0 or
+            spec_norm_init_lo <= 0 or spec_norm_init_hi <= 0 or
+            spec_norm_eps <= 0 or spec_clip <= 0):
+        raise ValueError('invalid absolute-ERB/complex feature configuration')
+    spec_bins = spec_max_hz * n_fft // sr + 1
+    spec_alpha = make_norm_alpha(sr, hop_len, spec_tau_sec)
     return dict(
         version=version,
-        tau_sec=tau_sec,
-        alpha=alpha,
-        mean_init_db=mean_init_db,
-        var_init_db2=std_init_db * std_init_db,
-        var_floor_db2=std_floor_db * std_floor_db,
-        clip=clip,
+        sr=sr,
+        n_fft=n_fft,
+        hop_len=hop_len,
+        lookahead_frames=cfg.getint('signal', 'lookahead_frames', fallback=0),
+        n_bands=cfg.getint('signal', 'n_bands'),
+        erb_center_db=erb_center_db,
+        erb_scale_db=erb_scale_db,
+        erb_clip=erb_clip,
+        spec_max_hz=spec_max_hz,
+        spec_bins=spec_bins,
+        spec_tau_sec=spec_tau_sec,
+        spec_alpha=spec_alpha,
+        spec_norm_init_lo=spec_norm_init_lo,
+        spec_norm_init_hi=spec_norm_init_hi,
+        spec_norm_eps=spec_norm_eps,
+        spec_clip=spec_clip,
     )
 
 # ============================================================
@@ -231,17 +260,37 @@ def compute_erb_matrix(nfftborder, n_fft, mode=0):
 
 class RNNoiseModel(nn.Module):
     """
-    RNNoise v0.2-inspired: Conv1d 前處理 + 3 層 GRU。
-    本地差異包含 ERB-only input、conv2 k=1、concat 各層輸出、無 VAD/稀疏化。
+    RNNoise/DeepFilterNet-inspired dual-input model.
+
+    The ERB path retains absolute spectral-envelope level.  The complex path
+    observes fine low-frequency magnitude/phase structure so speech periodicity
+    is not forced through 22 coarse bands.  Both paths are causal apart from the
+    caller-controlled lookahead padding.
     """
-    def __init__(self, n_bands, cond_size=64, gru_size=128, dropout=0.0):
+    def __init__(self, n_bands, spec_bins, cond_size=64, gru_size=128,
+                 spec_conv_channels=8, spec_embed_size=64, dropout=0.0):
         super().__init__()
         self.n_bands = n_bands
+        self.spec_bins = spec_bins
         self.gru_size = gru_size
+        self.spec_conv_channels = spec_conv_channels
+        self.spec_embed_size = spec_embed_size
 
-        # Conv1d 前處理 (k=3 + k=1, 減少 latency)
-        self.conv1 = nn.Conv1d(n_bands, cond_size, kernel_size=3, padding=0)
-        self.conv2 = nn.Conv1d(cond_size, gru_size, kernel_size=1)
+        # Three-frame absolute log-ERB envelope path.
+        self.erb_conv = nn.Conv1d(n_bands, cond_size, kernel_size=3, padding=0)
+
+        # Per-frame complex spectrum encoder.  Frequency is reduced by 4x;
+        # temporal context is applied only after each frame has been embedded.
+        self.spec_conv1 = nn.Conv1d(2, spec_conv_channels, kernel_size=5,
+                                    stride=2, padding=2)
+        self.spec_conv2 = nn.Conv1d(spec_conv_channels, 2 * spec_conv_channels,
+                                    kernel_size=5, stride=2, padding=2)
+        reduced_bins = (spec_bins + 3) // 4
+        self.spec_proj = nn.Linear(2 * spec_conv_channels * reduced_bins,
+                                   spec_embed_size)
+        self.spec_temporal = nn.Conv1d(spec_embed_size, spec_embed_size,
+                                       kernel_size=3, padding=0)
+        self.fuse = nn.Linear(cond_size + spec_embed_size, gru_size)
 
         # Dropout (GRU 層間)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -251,7 +300,8 @@ class RNNoiseModel(nn.Module):
         self.gru2 = nn.GRU(gru_size, gru_size, batch_first=True)
         self.gru3 = nn.GRU(gru_size, gru_size, batch_first=True)
 
-        # 輸出: concat(conv_out, gru1, gru2, gru3) → gains
+        # Output: ERB-band gains only.  Speech activity is used solely as a
+        # training loss weight and is not part of the runtime model contract.
         self.dense_out = nn.Linear(4 * gru_size, n_bands)
 
         # 初始化 GRU hidden weights 為 orthogonal
@@ -263,15 +313,24 @@ class RNNoiseModel(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         print(f"Model: {n_params:,} parameters (dropout={dropout})")
 
-    def forward(self, x, states=None):
+    def forward(self, erb_features, spec_features, states=None):
         """
-        x: (batch, seq_len, n_bands)
+        erb_features:  (batch, seq_len, n_bands)
+        spec_features: (batch, seq_len, 2, spec_bins)
         states: [h1, h2, h3] 或 None
-        回傳: gains (batch, seq_len', n_bands), new_states
+        回傳: gains, new_states
               seq_len' = seq_len - 2 (conv1 kernel=3 valid 減 2 frame)
         """
-        device = x.device
-        batch = x.size(0)
+        if not torch.jit.is_tracing():
+            if erb_features.ndim != 3 or spec_features.ndim != 4:
+                raise ValueError('expected ERB [B,T,E] and complex spectrum [B,T,2,F]')
+            if spec_features.shape[2:] != (2, self.spec_bins):
+                raise ValueError(
+                    f'complex feature shape {tuple(spec_features.shape[2:])}, '
+                    f'expected (2, {self.spec_bins})')
+
+        device = erb_features.device
+        batch, seq_len, _ = erb_features.shape
 
         if states is None:
             h1 = torch.zeros(1, batch, self.gru_size, device=device)
@@ -280,22 +339,29 @@ class RNNoiseModel(nn.Module):
         else:
             h1, h2, h3 = states
 
-        # Conv1d 前處理: (B, T, C) → (B, C, T) → conv → (B, C, T') → (B, T', C)
-        tmp = x.permute(0, 2, 1)
-        tmp = torch.tanh(self.conv1(tmp))
-        tmp = torch.tanh(self.conv2(tmp))
-        conv_out = tmp.permute(0, 2, 1)  # (B, T-2, gru_size)
+        erb = torch.tanh(self.erb_conv(erb_features.permute(0, 2, 1)))
+        erb = erb.permute(0, 2, 1)  # (B, T-2, cond_size)
+
+        spec = spec_features.reshape(batch * seq_len, 2, self.spec_bins)
+        spec = torch.tanh(self.spec_conv1(spec))
+        spec = torch.tanh(self.spec_conv2(spec))
+        spec = spec.flatten(1)
+        spec = torch.tanh(self.spec_proj(spec))
+        spec = spec.reshape(batch, seq_len, self.spec_embed_size)
+        spec = torch.tanh(self.spec_temporal(spec.permute(0, 2, 1)))
+        spec = spec.permute(0, 2, 1)  # (B, T-2, spec_embed_size)
+
+        fused = torch.tanh(self.fuse(torch.cat([erb, spec], dim=-1)))
 
         # 3 層 GRU + dropout
-        gru1_out, h1 = self.gru1(conv_out, h1)
+        gru1_out, h1 = self.gru1(fused, h1)
         gru1_out = self.dropout(gru1_out)
         gru2_out, h2 = self.gru2(gru1_out, h2)
         gru2_out = self.dropout(gru2_out)
         gru3_out, h3 = self.gru3(gru2_out, h3)
 
         # 本地 multi-layer skip: concat conv 與三層 GRU 輸出
-        cat = torch.cat([conv_out, gru1_out, gru2_out, gru3_out], dim=-1)
-        # Plain sigmoid (DFN3 style): 軟輸出, sharpening 留給 inference-only post-filter
+        cat = torch.cat([fused, gru1_out, gru2_out, gru3_out], dim=-1)
         gains = torch.sigmoid(self.dense_out(cat))
 
         return gains, [h1, h2, h3]
@@ -323,63 +389,77 @@ def istft(spec, n_fft, hop_len, win_len, window, length):
                        window=window, length=length, normalized=True)
 
 
-def normalize_log_erb(erb_db, norm_state=None, norm_alpha: float = 0.9984,
-                      mean_init_db: float = -75.0,
-                      var_init_db2: float = 400.0,
-                      var_floor_db2: float = 36.0,
-                      clip: float = 5.0):
+def normalize_absolute_log_erb(erb_db, center_db: float = -75.0,
+                               scale_db: float = 20.0, clip: float = 5.0):
     """
-    Normalise log-ERB values with ONE broadband runtime mean/variance per stream.
-
-    The same scalar statistics are shared by every ERB band, so runtime gain drift is
-    removed while a stationary signal's cross-band spectral envelope remains visible.
-    Features are computed from the previous state, then the state is updated causally.
-
-    erb_db: (..., T, C), norm_state: {'mean': (B, 1), 'var': (B, 1)} or None.
+    Fixed affine scaling only.  No temporal centering is allowed on this path:
+    absolute level and stationary spectral envelopes must remain observable.
     """
-    shape = erb_db.shape
-    x = erb_db.reshape(-1, shape[-2], shape[-1])            # (B, T, C)
-    batch = x.size(0)
+    return torch.clamp((erb_db - center_db) / scale_db, -clip, clip)
 
-    state_ok = (
-        norm_state is not None and
-        'mean' in norm_state and 'var' in norm_state and
-        norm_state['mean'].shape == (batch, 1) and
-        norm_state['var'].shape == (batch, 1)
-    )
+
+def normalize_complex_spectrum(spec_low, norm_state=None, norm_alpha: float = 0.984,
+                               init_lo: float = 0.001, init_hi: float = 0.0001,
+                               eps: float = 1e-12, clip: float = 10.0):
+    """DeepFilterNet-style per-bin magnitude EMA while preserving complex phase."""
+    if spec_low.ndim != 3:
+        raise ValueError('spec_low must have shape [B,T,F]')
+    batch, n_frames, n_bins = spec_low.shape
+    state_ok = norm_state is not None and norm_state.shape == (batch, 1, n_bins)
     if state_ok:
-        mean = norm_state['mean'].to(device=x.device, dtype=x.dtype)
-        var = norm_state['var'].to(device=x.device, dtype=x.dtype)
+        mag_mean = norm_state.to(device=spec_low.device, dtype=spec_low.real.dtype)
     else:
-        mean = torch.full((batch, 1), mean_init_db, device=x.device, dtype=x.dtype)
-        var = torch.full((batch, 1), var_init_db2, device=x.device, dtype=x.dtype)
+        mag_mean = torch.linspace(init_lo, init_hi, n_bins, device=spec_low.device,
+                                  dtype=spec_low.real.dtype).view(1, 1, n_bins)
+        mag_mean = mag_mean.expand(batch, 1, n_bins).clone()
 
-    out = []
-    for t in range(x.size(1)):
-        frame = x[:, t, :]
-        denom = torch.sqrt(var + var_floor_db2)
-        out.append(torch.clamp((frame - mean) / denom, -clip, clip))
-
-        level = frame.mean(dim=-1, keepdim=True)
-        delta = level - mean
-        new_mean = mean + (1.0 - norm_alpha) * delta
-        var = norm_alpha * var + (1.0 - norm_alpha) * delta * (level - new_mean)
-        mean = new_mean
-        var = var.clamp_min(0.0)
-
-    features = torch.stack(out, dim=1).reshape(shape)
-    return features, {'mean': mean.detach(), 'var': var.detach()}
+    frames = []
+    for t in range(n_frames):
+        frame = spec_low[:, t:t + 1, :]
+        mag_mean = norm_alpha * mag_mean + (1.0 - norm_alpha) * frame.abs()
+        normed = frame / torch.sqrt(mag_mean + eps)
+        frames.append(torch.view_as_real(normed).clamp(-clip, clip))
+    features = torch.cat(frames, dim=1).permute(0, 1, 3, 2)  # [B,T,2,F]
+    return features, mag_mean.detach()
 
 
-def extract_erb_features(power_spec, erb_matrix, norm_state=None, **norm_kwargs):
+def extract_model_features(spec, erb_matrix, feature_cfg, norm_state=None,
+                           return_debug=False):
     """
-    power_spec: (..., T, n_bins), from normalized=True STFT.
+    spec: (B, n_bins, T) complex, from normalized=True STFT.
     erb_matrix: (n_bins, n_bands) triangular forward ERB filterbank.
-    Returns (features, updated_state), with features shape (..., T, n_bands).
+    Returns absolute ERB features, complex low-bin features and updated state.
     """
-    energy = power_spec @ erb_matrix
+    spec_btf = spec.permute(0, 2, 1)
+    energy = spec_btf.abs().pow(2) @ erb_matrix
     erb_db = 10.0 * torch.log10(energy + 1e-10)
-    return normalize_log_erb(erb_db, norm_state=norm_state, **norm_kwargs)
+    erb_features = normalize_absolute_log_erb(
+        erb_db, center_db=feature_cfg['erb_center_db'],
+        scale_db=feature_cfg['erb_scale_db'], clip=feature_cfg['erb_clip'])
+    spec_low = spec_btf[..., :feature_cfg['spec_bins']]
+    spec_features, norm_state = normalize_complex_spectrum(
+        spec_low, norm_state=norm_state, norm_alpha=feature_cfg['spec_alpha'],
+        init_lo=feature_cfg['spec_norm_init_lo'],
+        init_hi=feature_cfg['spec_norm_init_hi'], eps=feature_cfg['spec_norm_eps'],
+        clip=feature_cfg['spec_clip'])
+    debug = None
+    if return_debug:
+        debug = {'erb_db': erb_db.detach(), 'spec_magnitude': spec_low.abs().detach()}
+    return erb_features, spec_features, norm_state, debug
+
+
+def compute_ideal_erb_gains(clean_spec, noisy_spec, erb_matrix):
+    """Amplitude-domain ideal ratio mask in the same ERB bands as the output."""
+    clean_power = clean_spec.abs().pow(2).permute(0, 2, 1) @ erb_matrix
+    noisy_power = noisy_spec.abs().pow(2).permute(0, 2, 1) @ erb_matrix
+    return torch.sqrt(torch.clamp(clean_power / (noisy_power + 1e-10), 0.0, 1.0))
+
+
+def compute_speech_activity(clean_spec):
+    """Clean-energy activity used only to weight the direct gain loss."""
+    power = clean_spec.abs().pow(2).mean(dim=1)
+    peak = power.amax(dim=1, keepdim=True)
+    return (power > torch.clamp(peak * 1e-4, min=1e-10)).to(power.dtype).unsqueeze(-1)
 
 
 def apply_erb_gains_batch(noisy_spec, gains, erb_inv, lookahead=0):
@@ -481,7 +561,7 @@ def train(args):
 
     LOOKAHEAD = cfg.getint('signal', 'lookahead_frames', fallback=0)
     assert 0 <= LOOKAHEAD <= 2, "lookahead_frames 只支援 0~2"
-    FEATURE_CFG = read_feature_config(cfg, SR, HOP_LEN)
+    FEATURE_CFG = read_feature_config(cfg, SR, HOP_LEN, N_FFT)
 
     # Training params
     epochs = cfg.getint('training', 'epochs')
@@ -563,8 +643,13 @@ def train(args):
     # 模型 (容量 config-driven; 官方 v0.2 = 128/256)
     COND_SIZE = cfg.getint('model', 'cond_size', fallback=64)
     GRU_SIZE = cfg.getint('model', 'gru_size', fallback=128)
-    model = RNNoiseModel(n_bands=N_BANDS, cond_size=COND_SIZE, gru_size=GRU_SIZE,
-                         dropout=dropout).to(device)
+    SPEC_CONV_CHANNELS = cfg.getint('model', 'spec_conv_channels', fallback=8)
+    SPEC_EMBED_SIZE = cfg.getint('model', 'spec_embed_size', fallback=64)
+    model = RNNoiseModel(
+        n_bands=N_BANDS, spec_bins=FEATURE_CFG['spec_bins'],
+        cond_size=COND_SIZE, gru_size=GRU_SIZE,
+        spec_conv_channels=SPEC_CONV_CHANNELS,
+        spec_embed_size=SPEC_EMBED_SIZE, dropout=dropout).to(device)
     if hasattr(torch, 'compile') and device.type == 'cuda':
         model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999),
@@ -585,6 +670,10 @@ def train(args):
     perc_gamma = cfg.getfloat('perceptual_loss', 'gamma', fallback=0.3)
     perc_factor = cfg.getfloat('perceptual_loss', 'factor', fallback=1.0)
     perc_f_under = cfg.getfloat('perceptual_loss', 'f_under', fallback=1.0)
+    gain_factor = cfg.getfloat('perceptual_loss', 'gain_factor', fallback=10.0)
+    gain_gamma = cfg.getfloat('perceptual_loss', 'gain_gamma', fallback=0.5)
+    active_frame_weight = cfg.getfloat(
+        'perceptual_loss', 'active_frame_weight', fallback=2.0)
 
     # Forward ERBB (mode=0, edge x2) for features; inverse (mode=1, partition of unity)
     # for mask→bin expansion — exactly the DFN/Keras forward/inverse split.
@@ -593,11 +682,12 @@ def train(args):
     ERB_INV = torch.from_numpy(
         compute_erb_matrix(NFFTBORDER, N_FFT, mode=1)).to(device)  # (n_bins, n_bands)
     print(f"  feature={FEATURE_CFG['version']}")
-    print(f"  shared norm alpha={FEATURE_CFG['alpha']:.6f} "
-          f"(tau={FEATURE_CFG['tau_sec']:g}s, dt={HOP_LEN/SR*1000:.1f}ms, "
-          f"mean_init={FEATURE_CFG['mean_init_db']:g}dB, "
-          f"std_init={FEATURE_CFG['var_init_db2'] ** 0.5:g}dB, "
-          f"std_floor={FEATURE_CFG['var_floor_db2'] ** 0.5:g}dB)")
+    print(f"  ERB absolute: center={FEATURE_CFG['erb_center_db']:g}dB, "
+          f"scale={FEATURE_CFG['erb_scale_db']:g}dB, "
+          f"clip=±{FEATURE_CFG['erb_clip']:g}")
+    print(f"  complex: 0..{FEATURE_CFG['spec_max_hz']}Hz "
+          f"({FEATURE_CFG['spec_bins']} bins), unit-norm alpha="
+          f"{FEATURE_CFG['spec_alpha']:.6f} (tau={FEATURE_CFG['spec_tau_sec']:g}s)")
 
     # Window for on-the-fly STFT (wav-data mode) — created once, moved to device
     stft_window = torch.sqrt(torch.hann_window(WIN_LEN)).to(device)
@@ -612,7 +702,8 @@ def train(args):
         print(f"Loading checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         require_checkpoint_feature_config(ckpt, FEATURE_CFG, context=args.resume)
-        model.load_state_dict(ckpt['state_dict'])
+        resume_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        resume_model.load_state_dict(ckpt['state_dict'])
         if 'optimizer' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer'])
         if 'scheduler' in ckpt:
@@ -628,7 +719,8 @@ def train(args):
     wd_note = f"{weight_decay}→{weight_decay_end} (cosine)" if wd_scheduled else f"{weight_decay} (const)"
     print(f"  dropout={dropout}, weight_decay={wd_note}")
     print(f"  loss: multi-res STFT (perceptual), fft_sizes={fft_sizes}, "
-          f"factor={perc_factor}, f_under={perc_f_under}")
+          f"factor={perc_factor}, f_under={perc_f_under}; "
+          f"gain={gain_factor}, active_frame_weight={active_frame_weight}")
     if patience > 0:
         print(f"  early stopping: patience={patience}")
     print(f"  device={device}")
@@ -650,10 +742,6 @@ def train(args):
         # --- Train ---
         model.train()
         train_loss_sum = 0
-        # Each batch lane behaves like a long-running stream.  Carrying the
-        # normaliser across independent 3-s clips exposes the model to mature
-        # statistics and abrupt source changes instead of restarting every clip.
-        train_norm_state = None
         with tqdm.tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") as pbar:
             if use_wav:
                 for noisy_wav, clean_wav in pbar:
@@ -662,21 +750,23 @@ def train(args):
 
                     # On-the-fly STFT
                     noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
+                    clean_spec = stft(clean_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
                     # (B, n_bins, n_frames)
 
-                    # ERB features + zero-pad on T dim 讓 conv 輸出與 spec frame 1:1 對齊
+                    # Dual features + zero-pad time so both k=3 branches emit
+                    # one gain per original spectrum frame.
                     # pad_left = 2-LOOKAHEAD (補過去), pad_right = LOOKAHEAD (補未來)
-                    power = noisy_spec.abs().pow(2).permute(0, 2, 1)  # (B, T, F)
-                    features, train_norm_state = extract_erb_features(
-                        power, ERB_FWD, norm_state=train_norm_state,
-                        norm_alpha=FEATURE_CFG['alpha'],
-                        mean_init_db=FEATURE_CFG['mean_init_db'],
-                        var_init_db2=FEATURE_CFG['var_init_db2'],
-                        var_floor_db2=FEATURE_CFG['var_floor_db2'],
-                        clip=FEATURE_CFG['clip'])  # (B, T, n_bands)
-                    features = F.pad(features, (0, 0, 2 - LOOKAHEAD, LOOKAHEAD))
+                    erb_features, spec_features, _, _ = extract_model_features(
+                        noisy_spec, ERB_FWD, FEATURE_CFG)
+                    pad_left, pad_right = 2 - LOOKAHEAD, LOOKAHEAD
+                    erb_features = F.pad(erb_features, (0, 0, pad_left, pad_right))
+                    spec_features = F.pad(
+                        spec_features, (0, 0, 0, 0, pad_left, pad_right))
 
-                    pred_gains, _ = model(features)  # (B, T, n_bands)
+                    # Dataset clips are independent and shuffled.  Never carry
+                    # normalisation/GRU state across unrelated files; each call
+                    # still evolves causally across every frame in the clip.
+                    pred_gains, _ = model(erb_features, spec_features)
 
                     # Apply ERB gains → enhanced STFT → ISTFT
                     enhanced_spec = apply_erb_gains_batch(
@@ -684,8 +774,16 @@ def train(args):
                     enhanced_wav = istft(enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
                                          stft_window, noisy_wav.size(-1))
 
-                    loss = multi_res_stft_loss(enhanced_wav, clean_wav, fft_sizes, perc_gamma,
-                                               factor=perc_factor, f_under=perc_f_under)
+                    wave_loss = multi_res_stft_loss(
+                        enhanced_wav, clean_wav, fft_sizes, perc_gamma,
+                        factor=perc_factor, f_under=perc_f_under)
+                    target_gains = compute_ideal_erb_gains(
+                        clean_spec, noisy_spec, ERB_FWD)
+                    speech_activity = compute_speech_activity(clean_spec)
+                    gain_error = pred_gains.pow(gain_gamma) - target_gains.pow(gain_gamma)
+                    gain_weight = 1.0 + (active_frame_weight - 1.0) * speech_activity
+                    gain_loss = (gain_weight * gain_error.square()).mean()
+                    loss = wave_loss + gain_factor * gain_loss
 
                     # weight-decay 排程 (DFN-style cosine, 套在這步 optimizer.step 前)
                     if wd_scheduled:
@@ -703,14 +801,14 @@ def train(args):
                     global_step += 1
 
                     train_loss_sum += loss.item()
-                    pbar.set_postfix(loss=f"{loss.item():.5f}")
+                    pbar.set_postfix(loss=f"{loss.item():.5f}",
+                                     gain=f"{gain_loss.item():.4f}")
 
         avg_train = train_loss_sum / len(train_loader)
 
         # --- Validation ---
         model.eval()
         val_loss_sum = 0
-        val_norm_state = None
         with torch.no_grad():
             if use_wav:
                 for noisy_wav, clean_wav in val_loader:
@@ -718,23 +816,28 @@ def train(args):
                     clean_wav = clean_wav.to(device)
 
                     noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
-                    power = noisy_spec.abs().pow(2).permute(0, 2, 1)
-                    features, val_norm_state = extract_erb_features(
-                        power, ERB_FWD, norm_state=val_norm_state,
-                        norm_alpha=FEATURE_CFG['alpha'],
-                        mean_init_db=FEATURE_CFG['mean_init_db'],
-                        var_init_db2=FEATURE_CFG['var_init_db2'],
-                        var_floor_db2=FEATURE_CFG['var_floor_db2'],
-                        clip=FEATURE_CFG['clip'])
-                    features = F.pad(features, (0, 0, 2 - LOOKAHEAD, LOOKAHEAD))
-                    pred_gains, _ = model(features)
+                    clean_spec = stft(clean_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
+                    erb_features, spec_features, _, _ = extract_model_features(
+                        noisy_spec, ERB_FWD, FEATURE_CFG)
+                    pad_left, pad_right = 2 - LOOKAHEAD, LOOKAHEAD
+                    erb_features = F.pad(erb_features, (0, 0, pad_left, pad_right))
+                    spec_features = F.pad(
+                        spec_features, (0, 0, 0, 0, pad_left, pad_right))
+                    pred_gains, _ = model(erb_features, spec_features)
                     enhanced_spec = apply_erb_gains_batch(
                         noisy_spec, pred_gains, ERB_INV, LOOKAHEAD)
                     enhanced_wav = istft(enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
                                          stft_window, noisy_wav.size(-1))
-                    val_loss_sum += multi_res_stft_loss(
+                    wave_loss = multi_res_stft_loss(
                         enhanced_wav, clean_wav, fft_sizes, perc_gamma,
-                        factor=perc_factor, f_under=perc_f_under).item()
+                        factor=perc_factor, f_under=perc_f_under)
+                    target_gains = compute_ideal_erb_gains(
+                        clean_spec, noisy_spec, ERB_FWD)
+                    speech_activity = compute_speech_activity(clean_spec)
+                    gain_error = pred_gains.pow(gain_gamma) - target_gains.pow(gain_gamma)
+                    gain_weight = 1.0 + (active_frame_weight - 1.0) * speech_activity
+                    gain_loss = (gain_weight * gain_error.square()).mean()
+                    val_loss_sum += (wave_loss + gain_factor * gain_loss).item()
 
         avg_val = val_loss_sum / max(len(val_loader), 1)
         cur_lr = scheduler.get_last_lr()[0]
@@ -745,13 +848,15 @@ def train(args):
 
         # 儲存 checkpoint (compiled model 要取 _orig_mod 避免 key 有 _orig_mod. 前綴)
         raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
+        is_best = avg_val < best_val_loss
+        checkpoint_best = min(best_val_loss, avg_val)
         ckpt = {
             'epoch': epoch,
             'state_dict': raw_model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'loss': avg_val,
-            'best_val_loss': best_val_loss,
+            'best_val_loss': checkpoint_best,
             'nfftborder': NFFTBORDER.tolist(),
             'feature_version': FEATURE_VERSION,
             'config': {
@@ -759,17 +864,25 @@ def train(args):
                 'hop_len': HOP_LEN, 'n_bands': N_BANDS,
                 'lookahead_frames': LOOKAHEAD,
                 'cond_size': COND_SIZE, 'gru_size': GRU_SIZE,
+                'spec_conv_channels': SPEC_CONV_CHANNELS,
+                'spec_embed_size': SPEC_EMBED_SIZE,
                 'feature_version': FEATURE_VERSION,
-                'feature_norm_tau_sec': FEATURE_CFG['tau_sec'],
-                'feature_mean_init_db': FEATURE_CFG['mean_init_db'],
-                'feature_std_init_db': FEATURE_CFG['var_init_db2'] ** 0.5,
-                'feature_std_floor_db': FEATURE_CFG['var_floor_db2'] ** 0.5,
-                'feature_clip': FEATURE_CFG['clip'],
+                'feature_erb_center_db': FEATURE_CFG['erb_center_db'],
+                'feature_erb_scale_db': FEATURE_CFG['erb_scale_db'],
+                'feature_erb_clip': FEATURE_CFG['erb_clip'],
+                'feature_spec_max_hz': FEATURE_CFG['spec_max_hz'],
+                'feature_spec_bins': FEATURE_CFG['spec_bins'],
+                'feature_spec_norm_tau_sec': FEATURE_CFG['spec_tau_sec'],
+                'feature_spec_norm_alpha': FEATURE_CFG['spec_alpha'],
+                'feature_spec_norm_init_lo': FEATURE_CFG['spec_norm_init_lo'],
+                'feature_spec_norm_init_hi': FEATURE_CFG['spec_norm_init_hi'],
+                'feature_spec_norm_eps': FEATURE_CFG['spec_norm_eps'],
+                'feature_spec_clip': FEATURE_CFG['spec_clip'],
             },
         }
         torch.save(ckpt, os.path.join(output_dir, f'rnnoise_epoch{epoch}.pth'))
 
-        if avg_val < best_val_loss:
+        if is_best:
             best_val_loss = avg_val
             no_improve_count = 0
             torch.save(ckpt, os.path.join(output_dir, 'rnnoise_best.pth'))

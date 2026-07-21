@@ -10,6 +10,7 @@ RNNoise ONNX 匯出 — 逐幀串流推論
 
 import argparse
 import configparser
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,37 +22,22 @@ from train import (
 
 
 class RNNoiseStreaming(nn.Module):
-    """單幀串流推論 wrapper，輸入 3 frame 特徵，輸出 1 frame gains"""
+    """單幀串流推論 wrapper，輸入 3 frame 雙路特徵。"""
 
     def __init__(self, model: RNNoiseModel):
         super().__init__()
-        self.conv1 = model.conv1
-        self.conv2 = model.conv2
-        self.gru1 = model.gru1
-        self.gru2 = model.gru2
-        self.gru3 = model.gru3
-        self.dense_out = model.dense_out
-        self.gru_size = model.gru_size
+        self.model = model
 
-    def forward(self, x, h1, h2, h3):
+    def forward(self, erb_input, spec_input, h1, h2, h3):
         """
-        x:  (1, 3, n_bands) — 3 frame 特徵
+        erb_input:  (1, 3, n_bands)
+        spec_input: (1, 3, 2, spec_bins)
         h1, h2, h3: (1, 1, gru_size) — GRU hidden states
-        回傳: gains (1, 1, n_bands), h1_out, h2_out, h3_out
+        回傳: gains, h1_out, h2_out, h3_out
         """
-        tmp = x.permute(0, 2, 1)
-        tmp = torch.tanh(self.conv1(tmp))
-        tmp = torch.tanh(self.conv2(tmp))
-        conv_out = tmp.permute(0, 2, 1)  # (1, 1, 128)
-
-        g1, h1_out = self.gru1(conv_out, h1)
-        g2, h2_out = self.gru2(g1, h2)
-        g3, h3_out = self.gru3(g2, h3)
-
-        cat = torch.cat([conv_out, g1, g2, g3], dim=-1)
-        gains = torch.sigmoid(self.dense_out(cat))
-
-        return gains, h1_out, h2_out, h3_out
+        gains, states = self.model(
+            erb_input, spec_input, [h1, h2, h3])
+        return gains, states[0], states[1], states[2]
 
 
 # ============================================================
@@ -114,9 +100,10 @@ def export(args):
     cfg = configparser.ConfigParser()
     cfg.read(args.config)
     sr = cfg.getint('signal', 'sr')
+    n_fft = cfg.getint('signal', 'n_fft')
     win_len = cfg.getint('signal', 'win_len', fallback=cfg.getint('signal', 'n_fft'))
     hop_len = cfg.getint('signal', 'hop_len', fallback=win_len // 2)
-    feature_cfg = read_feature_config(cfg, sr, hop_len)
+    feature_cfg = read_feature_config(cfg, sr, hop_len, n_fft)
 
     HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
     N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
@@ -129,36 +116,44 @@ def export(args):
 
     ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
     require_checkpoint_feature_config(ckpt, feature_cfg, context=args.model)
-    # 架構直接從 state_dict 張量形狀推導 (唯一權威來源) — 避免硬寫 64/128 或
-    # config/ckpt-config 漂移導致 load_state_dict 失敗. 舊 ckpt 可能無 'config' key.
-    #   conv1.weight: [cond_size, n_bands, 3]   conv2.weight: [gru_size, cond_size, 1]
+    # 架構容量從 state_dict 形狀推導；feature contract 則由
+    # require_checkpoint_feature_config 嚴格限定。
     sd = ckpt['state_dict']
-    cond_size = sd['conv1.weight'].shape[0]
-    n_bands   = sd['conv1.weight'].shape[1]
-    gru_size  = sd['conv2.weight'].shape[0]
+    cond_size = sd['erb_conv.weight'].shape[0]
+    n_bands = sd['erb_conv.weight'].shape[1]
+    spec_conv_channels = sd['spec_conv1.weight'].shape[0]
+    spec_embed_size = sd['spec_proj.weight'].shape[0]
+    gru_size = sd['gru1.weight_ih_l0'].shape[0] // 3
     if n_bands != N_BANDS:
         print(f"  ⚠ ckpt n_bands={n_bands} 與 config n_bands={N_BANDS} 不符 → 以 ckpt 為準")
     N_BANDS = n_bands
-    model = RNNoiseModel(n_bands=N_BANDS, cond_size=cond_size, gru_size=gru_size)
+    model = RNNoiseModel(
+        n_bands=N_BANDS, spec_bins=feature_cfg['spec_bins'],
+        cond_size=cond_size, gru_size=gru_size,
+        spec_conv_channels=spec_conv_channels,
+        spec_embed_size=spec_embed_size)
     model.load_state_dict(sd)
     model.eval()
-    print(f"Model: n_bands={N_BANDS}, cond_size={cond_size}, gru_size={gru_size}")
+    print(f"Model: n_bands={N_BANDS}, spec_bins={feature_cfg['spec_bins']}, "
+          f"cond_size={cond_size}, gru_size={gru_size}")
 
     streaming = RNNoiseStreaming(model)
     streaming.eval()
 
     gru_size = model.gru_size
-    x = torch.randn(1, 3, N_BANDS)
+    erb_input = torch.randn(1, 3, N_BANDS)
+    spec_input = torch.randn(1, 3, 2, feature_cfg['spec_bins'])
     h = torch.zeros(1, 1, gru_size)
 
-    raw_path = args.output.replace('.onnx', '_raw.onnx')
+    output_root, output_ext = os.path.splitext(args.output)
+    raw_path = output_root + '_raw' + (output_ext or '.onnx')
 
     # 1) torch.onnx.export
     torch.onnx.export(
         streaming,
-        (x, h, h, h),
+        (erb_input, spec_input, h, h, h),
         raw_path,
-        input_names=['input', 'h1_in', 'h2_in', 'h3_in'],
+        input_names=['erb_input', 'spec_input', 'h1_in', 'h2_in', 'h3_in'],
         output_names=['gains', 'h1_out', 'h2_out', 'h3_out'],
         opset_version=17,
         do_constant_folding=True,
@@ -174,17 +169,24 @@ def export(args):
     m = onnx.shape_inference.infer_shapes(m)
     onnx.helper.set_model_props(m, {
         'feature_version': feature_cfg['version'],
-        'feature_norm_tau_sec': str(feature_cfg['tau_sec']),
-        'feature_mean_init_db': str(feature_cfg['mean_init_db']),
-        'feature_std_init_db': str(feature_cfg['var_init_db2'] ** 0.5),
-        'feature_std_floor_db': str(feature_cfg['var_floor_db2'] ** 0.5),
-        'feature_clip': str(feature_cfg['clip']),
+        'feature_erb_center_db': str(feature_cfg['erb_center_db']),
+        'feature_erb_scale_db': str(feature_cfg['erb_scale_db']),
+        'feature_erb_clip': str(feature_cfg['erb_clip']),
+        'feature_spec_max_hz': str(feature_cfg['spec_max_hz']),
+        'feature_spec_bins': str(feature_cfg['spec_bins']),
+        'feature_spec_norm_tau_sec': str(feature_cfg['spec_tau_sec']),
+        'feature_spec_norm_alpha': str(feature_cfg['spec_alpha']),
+        'feature_spec_norm_init_lo': str(feature_cfg['spec_norm_init_lo']),
+        'feature_spec_norm_init_hi': str(feature_cfg['spec_norm_init_hi']),
+        'feature_spec_norm_eps': str(feature_cfg['spec_norm_eps']),
+        'feature_spec_clip': str(feature_cfg['spec_clip']),
+        'input_schema': (f'erb_input[1,3,{N_BANDS}];'
+                         f'spec_input[1,3,2,{feature_cfg["spec_bins"]}]'),
     })
     onnx.save(m, args.output)
     print_stats("shape inference + feature metadata (final)", args.output)
 
     # 清理中間檔
-    import os
     if os.path.exists(raw_path) and raw_path != args.output:
         os.remove(raw_path)
 
@@ -192,7 +194,8 @@ def export(args):
     validate_clean_onnx(args.output)
 
     if args.verify:
-        verify_output(model, N_BANDS, args.output)
+        verify_output(streaming, N_BANDS, feature_cfg['spec_bins'],
+                      model.gru_size, args.output)
 
 
 def validate_clean_onnx(path):
@@ -245,34 +248,29 @@ def print_stats(stage, path):
     print(f"[{stage}] 節點數: {len(m.graph.node)}, Op: {dict(ops)}")
 
 
-def verify_output(model, n_bands, onnx_path):
+def verify_output(streaming, n_bands, spec_bins, gru_size, onnx_path):
     """用 PyTorch streaming forward 比較 ONNX 輸出"""
     try:
         import onnxruntime as ort
 
-        x = torch.randn(1, 3, n_bands)
-        h = torch.zeros(1, 1, model.gru_size)
+        erb_input = torch.randn(1, 3, n_bands)
+        spec_input = torch.randn(1, 3, 2, spec_bins)
+        h = torch.zeros(1, 1, gru_size)
 
         with torch.no_grad():
-            tmp = x.permute(0, 2, 1)
-            tmp = torch.tanh(model.conv1(tmp))
-            tmp = torch.tanh(model.conv2(tmp))
-            conv_out = tmp.permute(0, 2, 1)
-            g1, h1 = model.gru1(conv_out, h)
-            g2, h2 = model.gru2(g1, h)
-            g3, h3 = model.gru3(g2, h)
-            cat = torch.cat([conv_out, g1, g2, g3], dim=-1)
-            pt_gains = torch.sigmoid(model.dense_out(cat))
+            pt_out = streaming(erb_input, spec_input, h, h, h)
 
         sess = ort.InferenceSession(onnx_path)
         ort_out = sess.run(None, {
-            'input': x.numpy(),
+            'erb_input': erb_input.numpy(),
+            'spec_input': spec_input.numpy(),
             'h1_in': h.numpy(),
             'h2_in': h.numpy(),
             'h3_in': h.numpy(),
         })
 
-        diff = np.abs(pt_gains.numpy() - ort_out[0]).max()
+        diff = max(np.abs(pt.detach().numpy() - ort).max()
+                   for pt, ort in zip(pt_out, ort_out))
         print(f"  PyTorch vs ONNX 最大誤差: {diff:.8f}")
         if diff < 1e-5:
             print("  ✓ 驗證通過")

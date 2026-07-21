@@ -12,10 +12,8 @@ extern "C" {
  *   - STFT: root-Hann window, normalized=True (× N_FFT^-0.5)
  *   - ERB: Glasberg-Moore band borders (erb_bandborder) +
  *     三角 filterbank (compute_erb_matrix mode=0 forward / mode=1 inverse)
- *   - 特徵: erb_db = 10*log10(power @ ERB + 1e-10);
- *     所有 ERB band 共用一組 broadband runtime mean/variance，先用舊 state
- *     產生 feat=(erb_db-mean)/sqrt(var+floor)，再用該 frame 的 band-average
- *     更新 state。共享 scalar state 會保留穩態訊號的跨 band 頻譜形狀。
+ *   - ERB 特徵: absolute log energy 的固定 affine scaling，不做時間均值扣除。
+ *   - Complex 特徵: 0..4 kHz real/imag，用每 bin magnitude EMA unit norm。
  *   - Band gain → bin gain: gains @ ERB_inv^T (mode=1, partition of unity)
  *   - ISTFT: normalized=True (× N_FFT^+0.5) + root-Hann + 50% OLA (COLA)
  *
@@ -35,14 +33,19 @@ extern "C" {
 #define RNNOISE_LOOKAHEAD     1     /* = config.ini lookahead_frames */
 #define RNNOISE_CONV_DELAY    (2 - RNNOISE_LOOKAHEAD)
 
-/* log_erb_shared_online_cmvn_v1 constants.  Keep byte-for-byte aligned with
+/* log_erb_abs_cplx_0_4k_v2 constants.  Keep byte-for-byte aligned with
  * config.ini [feature] and checkpoint validation in train.py. */
-#define RNNOISE_FEATURE_VERSION       "log_erb_shared_online_cmvn_v1"
-#define RNNOISE_NORM_TAU_SEC          10.0f
-#define RNNOISE_NORM_MEAN_INIT_DB    (-75.0f)
-#define RNNOISE_NORM_VAR_INIT_DB2     400.0f  /* std_init_db = 20 */
-#define RNNOISE_NORM_VAR_FLOOR_DB2     36.0f  /* std_floor_db = 6 */
-#define RNNOISE_NORM_CLIP               5.0f
+#define RNNOISE_FEATURE_VERSION       "log_erb_abs_cplx_0_4k_v2"
+#define RNNOISE_ERB_CENTER_DB         (-75.0f)
+#define RNNOISE_ERB_SCALE_DB            20.0f
+#define RNNOISE_ERB_CLIP                 5.0f
+#define RNNOISE_SPEC_MAX_HZ            4000
+#define RNNOISE_SPEC_BINS               129
+#define RNNOISE_SPEC_NORM_TAU_SEC         1.0f
+#define RNNOISE_SPEC_NORM_INIT_LO          0.001f
+#define RNNOISE_SPEC_NORM_INIT_HI          0.0001f
+#define RNNOISE_SPEC_NORM_EPS              1e-12f
+#define RNNOISE_SPEC_CLIP                  10.0f
 
 /* 處理狀態 (呼叫端分配，跨 frame 保持) */
 typedef struct {
@@ -50,13 +53,13 @@ typedef struct {
     float synthesis_buf[RNNOISE_WIN_LEN];
 
     /* 特徵歷史 (conv1 需要 3 frame) */
-    float feat_buf[3][RNNOISE_N_BANDS];  /* ring buffer for 3 frames */
+    float erb_feat_buf[3][RNNOISE_N_BANDS];  /* ring buffer for 3 frames */
+    float spec_feat_buf[3][2][RNNOISE_SPEC_BINS];
     int   feat_idx;                      /* 下一個寫入位置 (0,1,2) */
     int   feat_count;                    /* 已累積的 frame 數 */
 
-    /* Shared broadband online normalisation state (dB / dB^2). */
-    float norm_mean;
-    float norm_var;
+    /* Per-bin causal complex-spectrum magnitude EMA. */
+    float spec_norm_state[RNNOISE_SPEC_BINS];
 
     /* --- 以下為每次呼叫用的暫存區 (scratch), 非跨 frame 狀態 ---
      * 原本配置在各函式的 stack 上 (F13: embedded hot-path stack 偏高);
@@ -70,7 +73,7 @@ typedef struct {
     float scratch_full_im[RNNOISE_N_FFT];
 } RNNoiseState;
 
-/* 初始化狀態 (歸零 + shared norm mean/variance 初值; 內部亦會呼叫
+/* 初始化狀態 (歸零 + complex norm 初值; 內部亦會呼叫
  * rnnoise_tables_init() — 見下方說明, 現為 no-op) */
 void rnnoise_state_init(RNNoiseState *st);
 
@@ -97,18 +100,20 @@ void rnnoise_tables_init(void);
  *   frame: 長度 WIN_LEN, out_re/out_im: 長度 N_BINS */
 void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float *out_im);
 
-/* 從 normalized FFT spectrum 計算 ERB band features:
+/* 從 normalized FFT spectrum 計算雙路 features:
  *   1. power = |X|^2 → 三角 ERB filterbank (mode=0) → 10*log10(·+1e-10)
- *   2. 用更新前的 shared broadband mean/variance 正規化全部 bands
- *   3. 用當前 frame 的 band-average 更新 shared mean/variance
+ *   2. ERB 用固定 center/scale，不做 temporal EMA
+ *   3. 0..4 kHz complex bins 先更新 magnitude EMA，再輸出 real/imag / sqrt(EMA)
  *   spec_re, spec_im: 長度 N_BINS
- *   out_features: [3][N_BANDS] (oldest→newest, 供 conv1 k=3)
+ *   out_erb: [3][N_BANDS]，out_spec: [3][2][SPEC_BINS]
+ *   兩者皆 oldest→newest，供 k=3 temporal convolution
  *   lookahead=1 時，最新 window [t-2,t-1,t] 的 gain 對應 spectrum t-1；
  *   呼叫端必須保存/延遲正確的 spectrum，不能直接套到 t。
  *   回傳: 1 = 特徵可用 (已累積 3 frame), 0 = 尚需累積 */
 int rnnoise_compute_features(RNNoiseState *st,
                              const float *spec_re, const float *spec_im,
-                             float out_features[3][RNNOISE_N_BANDS]);
+                             float out_erb[3][RNNOISE_N_BANDS],
+                             float out_spec[3][2][RNNOISE_SPEC_BINS]);
 
 /* --- 後處理 --- */
 

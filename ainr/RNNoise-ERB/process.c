@@ -6,7 +6,7 @@
  *   - Root Hann window (sqrt(hann), analysis+synthesis 各乘一次 → COLA)
  *   - normalized STFT/ISTFT (× N^∓0.5, = torch.stft/istft normalized=True)
  *   - Glasberg-Moore ERB band borders + 三角 filterbank (forward/inverse)
- *   - erb_db = 10*log10(energy+1e-10) + shared broadband online mean/variance
+ *   - absolute log-ERB + 0..4 kHz complex-spectrum unit norm features
  *   - Band gain → bin gain (mode=1 inverse matrix, partition of unity)
  *   - Overlap-add synthesis
  * ============================================================ */
@@ -115,8 +115,12 @@ void rnnoise_tables_init(void) {
 
 void rnnoise_state_init(RNNoiseState *st) {
     memset(st, 0, sizeof(RNNoiseState));
-    st->norm_mean = RNNOISE_NORM_MEAN_INIT_DB;
-    st->norm_var = RNNOISE_NORM_VAR_INIT_DB2;
+    for (int k = 0; k < RNNOISE_SPEC_BINS; k++) {
+        float pos = RNNOISE_SPEC_BINS > 1
+            ? (float)k / (float)(RNNOISE_SPEC_BINS - 1) : 0.0f;
+        st->spec_norm_state[k] = RNNOISE_SPEC_NORM_INIT_LO +
+            pos * (RNNOISE_SPEC_NORM_INIT_HI - RNNOISE_SPEC_NORM_INIT_LO);
+    }
     rnnoise_tables_init();  /* no-op (表格編譯期已就緒); 保留呼叫只為相容 */
 }
 
@@ -151,7 +155,8 @@ void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float
 
 int rnnoise_compute_features(RNNoiseState *st,
                              const float *spec_re, const float *spec_im,
-                             float out_features[3][RNNOISE_N_BANDS]) {
+                             float out_erb[3][RNNOISE_N_BANDS],
+                             float out_spec[3][2][RNNOISE_SPEC_BINS]) {
     /* power spectrum (normalized 域)
      * (F13: 暫存區搬到 st->scratch_power, 不佔用呼叫端 stack) */
     float *power = st->scratch_power;
@@ -171,34 +176,35 @@ int rnnoise_compute_features(RNNoiseState *st,
         erb_db[b] = 10.0f * log10f(sum + LOG_FLOOR);
     }
 
-    /* log_erb_shared_online_cmvn_v1:
-     *   - ONE scalar mean/variance is shared by all bands.
-     *   - Features use the previous state (strictly causal).
-     *   - State then observes the current frame's band-average log level.
-     * Per-band temporal centering is intentionally forbidden because it erases
-     * the stationary spectral envelope when ERB is the model's only input. */
+    /* Absolute ERB branch: fixed affine scaling preserves stationary level and
+     * spectral shape.  There is deliberately no temporal mean subtraction. */
+    int idx = st->feat_idx;
+    for (int b = 0; b < RNNOISE_N_BANDS; b++) {
+        float feat = (erb_db[b] - RNNOISE_ERB_CENTER_DB) / RNNOISE_ERB_SCALE_DB;
+        if (feat > RNNOISE_ERB_CLIP) feat = RNNOISE_ERB_CLIP;
+        if (feat < -RNNOISE_ERB_CLIP) feat = -RNNOISE_ERB_CLIP;
+        st->erb_feat_buf[idx][b] = feat;
+    }
+
+    /* Complex branch: DeepFilterNet-style causal per-bin magnitude EMA.
+     * Update the state with this frame first, then normalise real and imaginary
+     * components by sqrt(state + eps), exactly matching train.py. */
     const float norm_a = (float)exp(
         -((double)RNNOISE_HOP_LEN / (double)RNNOISE_SR) /
-        (double)RNNOISE_NORM_TAU_SEC);
-    int idx = st->feat_idx;
-    float denom = sqrtf(st->norm_var + RNNOISE_NORM_VAR_FLOOR_DB2);
-    float level = 0.0f;
-    for (int b = 0; b < RNNOISE_N_BANDS; b++) {
-        float feat = (erb_db[b] - st->norm_mean) / denom;
-        if (feat > RNNOISE_NORM_CLIP) feat = RNNOISE_NORM_CLIP;
-        if (feat < -RNNOISE_NORM_CLIP) feat = -RNNOISE_NORM_CLIP;
-        st->feat_buf[idx][b] = feat;
-        level += erb_db[b];
-    }
-    level /= RNNOISE_N_BANDS;
-
-    {
-        float delta = level - st->norm_mean;
-        float new_mean = st->norm_mean + (1.0f - norm_a) * delta;
-        float new_var = norm_a * st->norm_var +
-            (1.0f - norm_a) * delta * (level - new_mean);
-        st->norm_mean = new_mean;
-        st->norm_var = new_var > 0.0f ? new_var : 0.0f;
+        (double)RNNOISE_SPEC_NORM_TAU_SEC);
+    for (int k = 0; k < RNNOISE_SPEC_BINS; k++) {
+        float mag = sqrtf(power[k]);
+        float state = norm_a * st->spec_norm_state[k] + (1.0f - norm_a) * mag;
+        float denom = sqrtf(state + RNNOISE_SPEC_NORM_EPS);
+        float re = spec_re[k] / denom;
+        float im = spec_im[k] / denom;
+        if (re > RNNOISE_SPEC_CLIP) re = RNNOISE_SPEC_CLIP;
+        if (re < -RNNOISE_SPEC_CLIP) re = -RNNOISE_SPEC_CLIP;
+        if (im > RNNOISE_SPEC_CLIP) im = RNNOISE_SPEC_CLIP;
+        if (im < -RNNOISE_SPEC_CLIP) im = -RNNOISE_SPEC_CLIP;
+        st->spec_norm_state[k] = state;
+        st->spec_feat_buf[idx][0][k] = re;
+        st->spec_feat_buf[idx][1][k] = im;
     }
     st->feat_idx = (idx + 1) % 3;
     /* 飽和計數，不無限累加: feat_count 唯一用途是與 3 比較 (< 3 vs >= 3)，
@@ -213,7 +219,10 @@ int rnnoise_compute_features(RNNoiseState *st,
     int oldest = st->feat_idx;  /* feat_idx 指向下一個寫入位置 = 最舊的那格 */
     for (int f = 0; f < 3; f++) {
         int src = (oldest + f) % 3;
-        memcpy(out_features[f], st->feat_buf[src], sizeof(float) * RNNOISE_N_BANDS);
+        memcpy(out_erb[f], st->erb_feat_buf[src],
+               sizeof(float) * RNNOISE_N_BANDS);
+        memcpy(out_spec[f], st->spec_feat_buf[src],
+               sizeof(float) * 2 * RNNOISE_SPEC_BINS);
     }
     return 1;
 }
