@@ -90,6 +90,7 @@ test-features: $(BUILD_DIR)/test_rnnoise_features
 # that intentionally do not install PyTorch.
 test-feature-python:
 	python3 test_feature_norm.py
+	python3 test_python_c_features.py
 
 $(BUILD_DIR)/test_rnnoise_tables: test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ test_rnnoise_tables.c -lm

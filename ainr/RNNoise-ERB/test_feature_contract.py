@@ -21,6 +21,16 @@ def c_float(text):
     return float(text.strip('()').rstrip('fF'))
 
 
+def norm_alpha(sr, hop_len, tau):
+    exact = math.exp(-(hop_len / sr) / tau)
+    precision = 3
+    alpha = 1.0
+    while alpha >= 1.0:
+        alpha = round(exact, precision)
+        precision += 1
+    return alpha
+
+
 def main():
     cfg = configparser.ConfigParser()
     cfg.read(ROOT / 'config.ini')
@@ -34,9 +44,11 @@ def main():
     assert py_version and py_version.group(1) == version
 
     pairs = [
-        ('erb_center_db', 'RNNOISE_ERB_CENTER_DB'),
-        ('erb_scale_db', 'RNNOISE_ERB_SCALE_DB'),
-        ('erb_clip', 'RNNOISE_ERB_CLIP'),
+        ('erb_norm_tau_sec', 'RNNOISE_ERB_NORM_TAU_SEC'),
+        ('erb_norm_init_lo_db', 'RNNOISE_ERB_NORM_INIT_LO_DB'),
+        ('erb_norm_init_hi_db', 'RNNOISE_ERB_NORM_INIT_HI_DB'),
+        ('erb_norm_scale_db', 'RNNOISE_ERB_NORM_SCALE_DB'),
+        ('erb_norm_clip', 'RNNOISE_ERB_NORM_CLIP'),
         ('spec_norm_tau_sec', 'RNNOISE_SPEC_NORM_TAU_SEC'),
         ('spec_norm_init_lo', 'RNNOISE_SPEC_NORM_INIT_LO'),
         ('spec_norm_init_hi', 'RNNOISE_SPEC_NORM_INIT_HI'),
@@ -52,11 +64,21 @@ def main():
     spec_bins = int(macro(header, 'RNNOISE_SPEC_BINS').split()[0])
     sr = cfg.getint('signal', 'sr')
     n_fft = cfg.getint('signal', 'n_fft')
+    win_len = cfg.getint('signal', 'win_len', fallback=n_fft)
     hop_len = cfg.getint(
-        'signal', 'hop_len', fallback=cfg.getint('signal', 'win_len', fallback=n_fft) // 2)
+        'signal', 'hop_len', fallback=win_len // 2)
     assert int(macro(header, 'RNNOISE_SR').split()[0]) == sr
     assert int(macro(header, 'RNNOISE_N_FFT').split()[0]) == n_fft
+    assert int(macro(header, 'RNNOISE_WIN_LEN').split()[0]) == win_len
     assert int(macro(header, 'RNNOISE_HOP_LEN').split()[0]) == hop_len
+    erb_alpha = c_float(macro(header, 'RNNOISE_ERB_NORM_ALPHA'))
+    spec_alpha = c_float(macro(header, 'RNNOISE_SPEC_NORM_ALPHA'))
+    assert math.isclose(
+        erb_alpha, norm_alpha(sr, hop_len, cfg.getfloat('feature', 'erb_norm_tau_sec')),
+        rel_tol=0.0, abs_tol=1e-7)
+    assert math.isclose(
+        spec_alpha, norm_alpha(sr, hop_len, cfg.getfloat('feature', 'spec_norm_tau_sec')),
+        rel_tol=0.0, abs_tol=1e-7)
     assert spec_max_hz == cfg.getint('feature', 'spec_max_hz')
     assert spec_bins == spec_max_hz * n_fft // sr + 1
     assert int(macro(header, 'RNNOISE_N_BANDS').split()[0]) == cfg.getint('signal', 'n_bands')

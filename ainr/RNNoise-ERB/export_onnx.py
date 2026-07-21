@@ -103,7 +103,7 @@ def export(args):
     n_fft = cfg.getint('signal', 'n_fft')
     win_len = cfg.getint('signal', 'win_len', fallback=cfg.getint('signal', 'n_fft'))
     hop_len = cfg.getint('signal', 'hop_len', fallback=win_len // 2)
-    feature_cfg = read_feature_config(cfg, sr, hop_len, n_fft)
+    feature_cfg = read_feature_config(cfg, sr, hop_len, n_fft, win_len)
 
     HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
     N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
@@ -169,9 +169,17 @@ def export(args):
     m = onnx.shape_inference.infer_shapes(m)
     onnx.helper.set_model_props(m, {
         'feature_version': feature_cfg['version'],
-        'feature_erb_center_db': str(feature_cfg['erb_center_db']),
-        'feature_erb_scale_db': str(feature_cfg['erb_scale_db']),
-        'feature_erb_clip': str(feature_cfg['erb_clip']),
+        'sr': str(feature_cfg['sr']),
+        'n_fft': str(feature_cfg['n_fft']),
+        'win_len': str(feature_cfg['win_len']),
+        'hop_len': str(feature_cfg['hop_len']),
+        'lookahead_frames': str(feature_cfg['lookahead_frames']),
+        'feature_erb_norm_tau_sec': str(feature_cfg['erb_tau_sec']),
+        'feature_erb_norm_alpha': str(feature_cfg['erb_alpha']),
+        'feature_erb_norm_init_lo_db': str(feature_cfg['erb_norm_init_lo_db']),
+        'feature_erb_norm_init_hi_db': str(feature_cfg['erb_norm_init_hi_db']),
+        'feature_erb_norm_scale_db': str(feature_cfg['erb_norm_scale_db']),
+        'feature_erb_norm_clip': str(feature_cfg['erb_norm_clip']),
         'feature_spec_max_hz': str(feature_cfg['spec_max_hz']),
         'feature_spec_bins': str(feature_cfg['spec_bins']),
         'feature_spec_norm_tau_sec': str(feature_cfg['spec_tau_sec']),

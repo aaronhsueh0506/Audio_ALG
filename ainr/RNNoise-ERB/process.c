@@ -6,7 +6,7 @@
  *   - Root Hann window (sqrt(hann), analysis+synthesis 各乘一次 → COLA)
  *   - normalized STFT/ISTFT (× N^∓0.5, = torch.stft/istft normalized=True)
  *   - Glasberg-Moore ERB band borders + 三角 filterbank (forward/inverse)
- *   - absolute log-ERB + 0..4 kHz complex-spectrum unit norm features
+ *   - DF-style mean-normalised log-ERB + per-bin-normalised complex features
  *   - Band gain → bin gain (mode=1 inverse matrix, partition of unity)
  *   - Overlap-add synthesis
  * ============================================================ */
@@ -115,6 +115,12 @@ void rnnoise_tables_init(void) {
 
 void rnnoise_state_init(RNNoiseState *st) {
     memset(st, 0, sizeof(RNNoiseState));
+    for (int b = 0; b < RNNOISE_N_BANDS; b++) {
+        float pos = RNNOISE_N_BANDS > 1
+            ? (float)b / (float)(RNNOISE_N_BANDS - 1) : 0.0f;
+        st->erb_norm_state[b] = RNNOISE_ERB_NORM_INIT_LO_DB +
+            pos * (RNNOISE_ERB_NORM_INIT_HI_DB - RNNOISE_ERB_NORM_INIT_LO_DB);
+    }
     for (int k = 0; k < RNNOISE_SPEC_BINS; k++) {
         float pos = RNNOISE_SPEC_BINS > 1
             ? (float)k / (float)(RNNOISE_SPEC_BINS - 1) : 0.0f;
@@ -176,25 +182,26 @@ int rnnoise_compute_features(RNNoiseState *st,
         erb_db[b] = 10.0f * log10f(sum + LOG_FLOOR);
     }
 
-    /* Absolute ERB branch: fixed affine scaling preserves stationary level and
-     * spectral shape.  There is deliberately no temporal mean subtraction. */
+    /* ERB branch: update the causal per-band dB mean with this frame first,
+     * then subtract and scale, matching original DeepFilterNet band_mean_norm_erb. */
     int idx = st->feat_idx;
+    const float erb_a = RNNOISE_ERB_NORM_ALPHA;
     for (int b = 0; b < RNNOISE_N_BANDS; b++) {
-        float feat = (erb_db[b] - RNNOISE_ERB_CENTER_DB) / RNNOISE_ERB_SCALE_DB;
-        if (feat > RNNOISE_ERB_CLIP) feat = RNNOISE_ERB_CLIP;
-        if (feat < -RNNOISE_ERB_CLIP) feat = -RNNOISE_ERB_CLIP;
+        float mean = erb_a * st->erb_norm_state[b] + (1.0f - erb_a) * erb_db[b];
+        float feat = (erb_db[b] - mean) / RNNOISE_ERB_NORM_SCALE_DB;
+        if (feat > RNNOISE_ERB_NORM_CLIP) feat = RNNOISE_ERB_NORM_CLIP;
+        if (feat < -RNNOISE_ERB_NORM_CLIP) feat = -RNNOISE_ERB_NORM_CLIP;
+        st->erb_norm_state[b] = mean;
         st->erb_feat_buf[idx][b] = feat;
     }
 
-    /* Complex branch: DeepFilterNet-style causal per-bin magnitude EMA.
-     * Update the state with this frame first, then normalise real and imaginary
-     * components by sqrt(state + eps), exactly matching train.py. */
-    const float norm_a = (float)exp(
-        -((double)RNNOISE_HOP_LEN / (double)RNNOISE_SR) /
-        (double)RNNOISE_SPEC_NORM_TAU_SEC);
+    /* Complex branch: original DeepFilterNet libDF band_unit_norm.  Each bin
+     * updates its own magnitude EMA before real/imag are normalised. */
+    const float norm_a = RNNOISE_SPEC_NORM_ALPHA;
     for (int k = 0; k < RNNOISE_SPEC_BINS; k++) {
-        float mag = sqrtf(power[k]);
-        float state = norm_a * st->spec_norm_state[k] + (1.0f - norm_a) * mag;
+        float magnitude = sqrtf(power[k]);
+        float state = norm_a * st->spec_norm_state[k] +
+            (1.0f - norm_a) * magnitude;
         float denom = sqrtf(state + RNNOISE_SPEC_NORM_EPS);
         float re = spec_re[k] / denom;
         float im = spec_im[k] / denom;

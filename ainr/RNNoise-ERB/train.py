@@ -28,17 +28,19 @@ import tqdm
 from dataset import PackedDataset
 
 
-# Feature semantics are intentionally versioned.  v2 has two inputs: absolute
-# log-ERB and a low-frequency complex spectrogram.  It is incompatible with all
-# ERB-only checkpoints even when the gain output still has 22 bands.
-FEATURE_VERSION = 'log_erb_abs_cplx_0_4k_v2'
+# Feature semantics are intentionally versioned.  v3 keeps the two input shapes
+# from v2, but aligns their causal normalisation with the original DeepFilterNet:
+# per-band EMA mean-normalised log-ERB and per-bin EMA-normalised complex bins.
+# It is incompatible with all earlier checkpoints even though both input/output
+# dimensions are unchanged.
+FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v3'
 
 
 def require_checkpoint_feature_version(ckpt, context='checkpoint'):
-    """Reject checkpoints whose 22-D input semantics do not match this code."""
+    """Reject checkpoints whose input semantics do not match this code."""
     version = ckpt.get('feature_version', ckpt.get('config', {}).get('feature_version'))
     if version != FEATURE_VERSION:
-        shown = repr(version) if version is not None else 'missing (legacy per-band EMA)'
+        shown = repr(version) if version is not None else 'missing (legacy feature contract)'
         raise ValueError(
             f"{context} feature_version={shown}, expected {FEATURE_VERSION!r}. "
             "Feature dimensions match but semantics do not; retrain this model."
@@ -52,12 +54,16 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
     expected = {
         'sr': feature_cfg['sr'],
         'n_fft': feature_cfg['n_fft'],
+        'win_len': feature_cfg['win_len'],
         'hop_len': feature_cfg['hop_len'],
         'lookahead_frames': feature_cfg['lookahead_frames'],
         'n_bands': feature_cfg['n_bands'],
-        'feature_erb_center_db': feature_cfg['erb_center_db'],
-        'feature_erb_scale_db': feature_cfg['erb_scale_db'],
-        'feature_erb_clip': feature_cfg['erb_clip'],
+        'feature_erb_norm_tau_sec': feature_cfg['erb_tau_sec'],
+        'feature_erb_norm_alpha': feature_cfg['erb_alpha'],
+        'feature_erb_norm_init_lo_db': feature_cfg['erb_norm_init_lo_db'],
+        'feature_erb_norm_init_hi_db': feature_cfg['erb_norm_init_hi_db'],
+        'feature_erb_norm_scale_db': feature_cfg['erb_norm_scale_db'],
+        'feature_erb_norm_clip': feature_cfg['erb_norm_clip'],
         'feature_spec_max_hz': feature_cfg['spec_max_hz'],
         'feature_spec_bins': feature_cfg['spec_bins'],
         'feature_spec_norm_tau_sec': feature_cfg['spec_tau_sec'],
@@ -78,39 +84,53 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
             )
 
 
-def read_feature_config(cfg, sr, hop_len, n_fft):
+def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
     """Read the dual-input feature contract shared by train/denoise/C."""
     version = cfg.get('feature', 'version', fallback=FEATURE_VERSION)
     if version != FEATURE_VERSION:
         raise ValueError(
             f"config feature version {version!r} is unsupported; expected {FEATURE_VERSION!r}"
         )
-    erb_center_db = cfg.getfloat('feature', 'erb_center_db', fallback=-75.0)
-    erb_scale_db = cfg.getfloat('feature', 'erb_scale_db', fallback=20.0)
-    erb_clip = cfg.getfloat('feature', 'erb_clip', fallback=5.0)
+    if win_len is None:
+        win_len = n_fft
+    erb_tau_sec = cfg.getfloat('feature', 'erb_norm_tau_sec', fallback=1.0)
+    erb_norm_init_lo_db = cfg.getfloat(
+        'feature', 'erb_norm_init_lo_db', fallback=-60.0)
+    erb_norm_init_hi_db = cfg.getfloat(
+        'feature', 'erb_norm_init_hi_db', fallback=-90.0)
+    erb_norm_scale_db = cfg.getfloat(
+        'feature', 'erb_norm_scale_db', fallback=40.0)
+    erb_norm_clip = cfg.getfloat('feature', 'erb_norm_clip', fallback=5.0)
     spec_max_hz = cfg.getint('feature', 'spec_max_hz', fallback=4000)
     spec_tau_sec = cfg.getfloat('feature', 'spec_norm_tau_sec', fallback=1.0)
     spec_norm_init_lo = cfg.getfloat('feature', 'spec_norm_init_lo', fallback=0.001)
     spec_norm_init_hi = cfg.getfloat('feature', 'spec_norm_init_hi', fallback=0.0001)
     spec_norm_eps = cfg.getfloat('feature', 'spec_norm_eps', fallback=1e-12)
     spec_clip = cfg.getfloat('feature', 'spec_clip', fallback=10.0)
-    if (erb_scale_db <= 0 or erb_clip <= 0 or spec_max_hz <= 0 or
+    if (win_len <= 0 or win_len > n_fft or hop_len <= 0 or
+            erb_tau_sec <= 0 or erb_norm_scale_db <= 0 or erb_norm_clip <= 0 or
+            spec_max_hz <= 0 or
             spec_max_hz > sr // 2 or spec_tau_sec <= 0 or
             spec_norm_init_lo <= 0 or spec_norm_init_hi <= 0 or
             spec_norm_eps <= 0 or spec_clip <= 0):
-        raise ValueError('invalid absolute-ERB/complex feature configuration')
+        raise ValueError('invalid DeepFilterNet-style ERB/complex feature configuration')
     spec_bins = spec_max_hz * n_fft // sr + 1
+    erb_alpha = make_norm_alpha(sr, hop_len, erb_tau_sec)
     spec_alpha = make_norm_alpha(sr, hop_len, spec_tau_sec)
     return dict(
         version=version,
         sr=sr,
         n_fft=n_fft,
+        win_len=win_len,
         hop_len=hop_len,
         lookahead_frames=cfg.getint('signal', 'lookahead_frames', fallback=0),
         n_bands=cfg.getint('signal', 'n_bands'),
-        erb_center_db=erb_center_db,
-        erb_scale_db=erb_scale_db,
-        erb_clip=erb_clip,
+        erb_tau_sec=erb_tau_sec,
+        erb_alpha=erb_alpha,
+        erb_norm_init_lo_db=erb_norm_init_lo_db,
+        erb_norm_init_hi_db=erb_norm_init_hi_db,
+        erb_norm_scale_db=erb_norm_scale_db,
+        erb_norm_clip=erb_norm_clip,
         spec_max_hz=spec_max_hz,
         spec_bins=spec_bins,
         spec_tau_sec=spec_tau_sec,
@@ -262,10 +282,10 @@ class RNNoiseModel(nn.Module):
     """
     RNNoise/DeepFilterNet-inspired dual-input model.
 
-    The ERB path retains absolute spectral-envelope level.  The complex path
-    observes fine low-frequency magnitude/phase structure so speech periodicity
-    is not forced through 22 coarse bands.  Both paths are causal apart from the
-    caller-controlled lookahead padding.
+    The ERB path observes short-term deviations from a causal per-band mean.
+    The complex path preserves fine low-frequency magnitude/phase structure and
+    retains partial level information under DF-style per-bin normalisation.
+    Both paths are causal apart from caller-controlled lookahead padding.
     """
     def __init__(self, n_bands, spec_bins, cond_size=64, gru_size=128,
                  spec_conv_channels=8, spec_embed_size=64, dropout=0.0):
@@ -276,7 +296,7 @@ class RNNoiseModel(nn.Module):
         self.spec_conv_channels = spec_conv_channels
         self.spec_embed_size = spec_embed_size
 
-        # Three-frame absolute log-ERB envelope path.
+        # Three-frame mean-normalised log-ERB path.
         self.erb_conv = nn.Conv1d(n_bands, cond_size, kernel_size=3, padding=0)
 
         # Per-frame complex spectrum encoder.  Frequency is reduced by 4x;
@@ -371,9 +391,20 @@ class RNNoiseModel(nn.Module):
 # ============================================================
 
 def make_norm_alpha(sr: int, hop_len: int, tau: float = 10.0) -> float:
-    """Causal runtime-statistics decay: alpha = exp(-frame_period/tau)."""
+    """Original DeepFilterNet decay calculation, including stable rounding.
+
+    DeepFilterNet rounds from three decimal places upward until alpha is below
+    one.  Besides matching its train/runtime contract, this makes alpha a fixed
+    C constant instead of requiring exp() in the per-frame embedded hot path.
+    """
     import math
-    return math.exp(-(hop_len / sr) / tau)
+    exact = math.exp(-(hop_len / sr) / tau)
+    precision = 3
+    alpha = 1.0
+    while alpha >= 1.0:
+        alpha = round(exact, precision)
+        precision += 1
+    return alpha
 
 
 def stft(wav, n_fft, hop_len, win_len, window):
@@ -389,19 +420,45 @@ def istft(spec, n_fft, hop_len, win_len, window, length):
                        window=window, length=length, normalized=True)
 
 
-def normalize_absolute_log_erb(erb_db, center_db: float = -75.0,
-                               scale_db: float = 20.0, clip: float = 5.0):
+def normalize_log_erb(erb_db, norm_state=None, norm_alpha: float = 0.984,
+                      init_lo_db: float = -60.0, init_hi_db: float = -90.0,
+                      scale_db: float = 40.0, clip: float = 5.0):
+    """Original DeepFilterNet causal per-band mean normalisation.
+
+    The EMA is updated with the current frame before subtraction, matching
+    Rikorose/DeepFilterNet ``libDF::band_mean_norm_erb``.  No variance or absolute-level
+    side channel is used; the complex branch remains observable for stationary
+    inputs and retains partial level information.
     """
-    Fixed affine scaling only.  No temporal centering is allowed on this path:
-    absolute level and stationary spectral envelopes must remain observable.
-    """
-    return torch.clamp((erb_db - center_db) / scale_db, -clip, clip)
+    if erb_db.ndim != 3:
+        raise ValueError('erb_db must have shape [B,T,E]')
+    batch, n_frames, n_bands = erb_db.shape
+    state_ok = norm_state is not None and norm_state.shape == (batch, 1, n_bands)
+    if state_ok:
+        mean = norm_state.to(device=erb_db.device, dtype=erb_db.dtype)
+    else:
+        mean = torch.linspace(init_lo_db, init_hi_db, n_bands,
+                              device=erb_db.device, dtype=erb_db.dtype).view(1, 1, n_bands)
+        mean = mean.expand(batch, 1, n_bands).clone()
+
+    frames = []
+    for t in range(n_frames):
+        frame = erb_db[:, t:t + 1, :]
+        mean = norm_alpha * mean + (1.0 - norm_alpha) * frame
+        frames.append(((frame - mean) / scale_db).clamp(-clip, clip))
+    return torch.cat(frames, dim=1), mean.detach()
 
 
 def normalize_complex_spectrum(spec_low, norm_state=None, norm_alpha: float = 0.984,
                                init_lo: float = 0.001, init_hi: float = 0.0001,
                                eps: float = 1e-12, clip: float = 10.0):
-    """DeepFilterNet-style per-bin magnitude EMA while preserving complex phase."""
+    """Original DeepFilterNet per-bin magnitude EMA norm.
+
+    This matches ``libDF::band_unit_norm``: each bin updates its own state from
+    ``abs(X[k])`` and divides the complex value by ``sqrt(state[k])``.  It is
+    deliberately not fully gain-invariant: at steady state, scaling X by ``a``
+    scales this feature by approximately ``sqrt(a)``.
+    """
     if spec_low.ndim != 3:
         raise ValueError('spec_low must have shape [B,T,F]')
     batch, n_frames, n_bins = spec_low.shape
@@ -428,24 +485,32 @@ def extract_model_features(spec, erb_matrix, feature_cfg, norm_state=None,
     """
     spec: (B, n_bins, T) complex, from normalized=True STFT.
     erb_matrix: (n_bins, n_bands) triangular forward ERB filterbank.
-    Returns absolute ERB features, complex low-bin features and updated state.
+    Returns mean-normalised ERB features, complex low-bin features and both
+    updated causal normalisation states.
     """
     spec_btf = spec.permute(0, 2, 1)
     energy = spec_btf.abs().pow(2) @ erb_matrix
     erb_db = 10.0 * torch.log10(energy + 1e-10)
-    erb_features = normalize_absolute_log_erb(
-        erb_db, center_db=feature_cfg['erb_center_db'],
-        scale_db=feature_cfg['erb_scale_db'], clip=feature_cfg['erb_clip'])
+    if norm_state is not None and not isinstance(norm_state, dict):
+        raise ValueError('norm_state must be None or a dict with erb/spec entries')
+    erb_state_in = None if norm_state is None else norm_state.get('erb')
+    spec_state_in = None if norm_state is None else norm_state.get('spec')
+    erb_features, erb_state = normalize_log_erb(
+        erb_db, norm_state=erb_state_in, norm_alpha=feature_cfg['erb_alpha'],
+        init_lo_db=feature_cfg['erb_norm_init_lo_db'],
+        init_hi_db=feature_cfg['erb_norm_init_hi_db'],
+        scale_db=feature_cfg['erb_norm_scale_db'],
+        clip=feature_cfg['erb_norm_clip'])
     spec_low = spec_btf[..., :feature_cfg['spec_bins']]
     spec_features, norm_state = normalize_complex_spectrum(
-        spec_low, norm_state=norm_state, norm_alpha=feature_cfg['spec_alpha'],
+        spec_low, norm_state=spec_state_in, norm_alpha=feature_cfg['spec_alpha'],
         init_lo=feature_cfg['spec_norm_init_lo'],
         init_hi=feature_cfg['spec_norm_init_hi'], eps=feature_cfg['spec_norm_eps'],
         clip=feature_cfg['spec_clip'])
     debug = None
     if return_debug:
         debug = {'erb_db': erb_db.detach(), 'spec_magnitude': spec_low.abs().detach()}
-    return erb_features, spec_features, norm_state, debug
+    return erb_features, spec_features, {'erb': erb_state, 'spec': norm_state}, debug
 
 
 def compute_ideal_erb_gains(clean_spec, noisy_spec, erb_matrix):
@@ -561,7 +626,7 @@ def train(args):
 
     LOOKAHEAD = cfg.getint('signal', 'lookahead_frames', fallback=0)
     assert 0 <= LOOKAHEAD <= 2, "lookahead_frames 只支援 0~2"
-    FEATURE_CFG = read_feature_config(cfg, SR, HOP_LEN, N_FFT)
+    FEATURE_CFG = read_feature_config(cfg, SR, HOP_LEN, N_FFT, WIN_LEN)
 
     # Training params
     epochs = cfg.getint('training', 'epochs')
@@ -682,11 +747,14 @@ def train(args):
     ERB_INV = torch.from_numpy(
         compute_erb_matrix(NFFTBORDER, N_FFT, mode=1)).to(device)  # (n_bins, n_bands)
     print(f"  feature={FEATURE_CFG['version']}")
-    print(f"  ERB absolute: center={FEATURE_CFG['erb_center_db']:g}dB, "
-          f"scale={FEATURE_CFG['erb_scale_db']:g}dB, "
-          f"clip=±{FEATURE_CFG['erb_clip']:g}")
+    print(f"  ERB mean norm: alpha={FEATURE_CFG['erb_alpha']:.6f} "
+          f"(tau={FEATURE_CFG['erb_tau_sec']:g}s), "
+          f"init={FEATURE_CFG['erb_norm_init_lo_db']:g}.."
+          f"{FEATURE_CFG['erb_norm_init_hi_db']:g}dB, "
+          f"scale={FEATURE_CFG['erb_norm_scale_db']:g}dB, "
+          f"clip=±{FEATURE_CFG['erb_norm_clip']:g}")
     print(f"  complex: 0..{FEATURE_CFG['spec_max_hz']}Hz "
-          f"({FEATURE_CFG['spec_bins']} bins), unit-norm alpha="
+          f"({FEATURE_CFG['spec_bins']} bins), per-bin unit-norm alpha="
           f"{FEATURE_CFG['spec_alpha']:.6f} (tau={FEATURE_CFG['spec_tau_sec']:g}s)")
 
     # Window for on-the-fly STFT (wav-data mode) — created once, moved to device
@@ -867,9 +935,12 @@ def train(args):
                 'spec_conv_channels': SPEC_CONV_CHANNELS,
                 'spec_embed_size': SPEC_EMBED_SIZE,
                 'feature_version': FEATURE_VERSION,
-                'feature_erb_center_db': FEATURE_CFG['erb_center_db'],
-                'feature_erb_scale_db': FEATURE_CFG['erb_scale_db'],
-                'feature_erb_clip': FEATURE_CFG['erb_clip'],
+                'feature_erb_norm_tau_sec': FEATURE_CFG['erb_tau_sec'],
+                'feature_erb_norm_alpha': FEATURE_CFG['erb_alpha'],
+                'feature_erb_norm_init_lo_db': FEATURE_CFG['erb_norm_init_lo_db'],
+                'feature_erb_norm_init_hi_db': FEATURE_CFG['erb_norm_init_hi_db'],
+                'feature_erb_norm_scale_db': FEATURE_CFG['erb_norm_scale_db'],
+                'feature_erb_norm_clip': FEATURE_CFG['erb_norm_clip'],
                 'feature_spec_max_hz': FEATURE_CFG['spec_max_hz'],
                 'feature_spec_bins': FEATURE_CFG['spec_bins'],
                 'feature_spec_norm_tau_sec': FEATURE_CFG['spec_tau_sec'],

@@ -1,12 +1,12 @@
 # RNNoise-ERB
 
 以 RNNoise v0.2 的 Conv+GRU 方向為基礎的本地噪音抑制模型，使用
-absolute log-ERB 與低頻 complex spectrum 雙路特徵；並非官方 v0.2
+mean-normalized log-ERB 與低頻 complex spectrum 雙路特徵；並非官方 v0.2
 或 DeepFilterNet 的逐層相容移植。
 
 ## 架構
 
-- **ERB 輸入**: 22 個 absolute log-energy bands，只做固定 affine scaling
+- **ERB 輸入**: 22 個 log-energy bands，做每-band causal EMA mean norm
 - **Complex 輸入**: 0–4 kHz 的 129 個 real/imag bins，做每-bin magnitude EMA unit norm
 - **模型**: ERB temporal conv + complex frequency encoder/temporal conv → fusion → 3 層 GRU(128)
 - **輸出**: 22 個 gain masks [0, 1]
@@ -15,20 +15,25 @@ absolute log-ERB 與低頻 complex spectrum 雙路特徵；並非官方 v0.2
 
 ### Feature preprocessing
 
-目前 feature contract 為 `log_erb_abs_cplx_0_4k_v2`：
+目前 feature contract 為 `log_erb_dfn_mean_cplx_unit_0_4k_v3`：
 
 ```text
 normalized complex STFT
 ├─ power → triangular ERB → 10*log10(E+1e-10)
-│          → (dB - center_db) / scale_db → clip
-└─ bins 0..4 kHz → per-bin magnitude EMA
+│          → per-band EMA mean → (dB - mean) / 40 → clip
+└─ bins 0..4 kHz → per-bin |X[k]| EMA
                     → real/imag / sqrt(EMA+eps) → clip
 ```
 
-ERB 路徑不扣時間均值，所以穩態訊號的絕對 level 與 spectral envelope
-不會被 EMA 消掉。Complex EMA 僅用於數值尺度穩定；real/imag 與細頻率
-結構仍在，穩態輸入也不會趨近 0。同一 stream 分 chunk 處理時必須傳遞
-complex EMA 與 GRU state；不同 WAV 之間必須重置。
+ERB 路徑對穩態訊號會逐步趨近 0，這是原作 DeepFilterNet 的預期行為；
+辨識穩態噪音的細頻率結構、相位及部分 level 資訊由 complex 路徑保留。
+`X[k] / sqrt(EMA(|X[k]|))` 不是完全 gain-invariant；穩態下輸入振幅放大 `a` 倍，
+complex feature 約放大 `sqrt(a)` 倍，因此不需要額外 absolute-level input。
+同一 stream 分 chunk 處理時必須同時傳遞 ERB EMA、complex EMA 與 GRU state；
+不同 WAV 之間必須重置。
+兩路主公式、state 初始值與先更新再輸出的順序對齊原作 `libDF`；
+本專案額外保留 ERB `±5` 與 complex `±10` clip 作為部署數值安全界線。
+公式來源：[Rikorose/DeepFilterNet `libDF/src/lib.rs`](https://github.com/Rikorose/DeepFilterNet/blob/main/libDF/src/lib.rs)。
 
 Feature 常數在 `config.ini [feature]`，C 部署常數固定於 `process.h`。
 修改後需同步兩邊並重訓。
@@ -109,8 +114,10 @@ output_dir = ./output
 | `[training] epoch_size` | 0 | 每 epoch sample 上限；0 表示使用全部資料 |
 | `[audio] segment_sec` | 3.0 | 每筆訓練音檔長度 (秒) |
 | `[rir] p_rir` | 0.1 | 套用 RIR 的機率 |
-| `[feature] erb_center_db` | -75.0 | absolute ERB 固定中心 |
-| `[feature] erb_scale_db` | 20.0 | absolute ERB 縮放尺度 |
+| `[feature] erb_norm_tau_sec` | 1.0 | ERB per-band mean EMA 時間常數 |
+| `[feature] erb_norm_init_lo_db` | -60.0 | 最低 ERB band EMA 初值 |
+| `[feature] erb_norm_init_hi_db` | -90.0 | 最高 ERB band EMA 初值 |
+| `[feature] erb_norm_scale_db` | 40.0 | mean-subtracted ERB 縮放尺度 |
 | `[feature] spec_max_hz` | 4000 | complex branch 頻率上限 |
 | `[feature] spec_norm_tau_sec` | 1.0 | complex per-bin magnitude EMA 時間常數 |
 
@@ -119,8 +126,8 @@ output_dir = ./output
 都會拒絕缺少版本的舊 checkpoint，或拒絕與 runtime config 不一致的 checkpoint。
 匯出的 ONNX model metadata 也會帶上相同 feature contract，供部署端檢查。
 
-> v1/legacy ERB-only checkpoint 與 ONNX 無法沿用；新架構增加 complex input
-> 輸入，必須重訓後重新匯出。
+> v1/legacy ERB-only 與 v2 absolute-ERB checkpoint/ONNX 都無法沿用。v3 雖然
+> input shape 不變，normalization semantics 已改變，必須重訓後重新匯出。
 
 ## 訓練
 
@@ -260,6 +267,7 @@ make test-feature-python  # 需 torch training environment
 ```
 
 C test 會以獨立 recurrence 對照 `rnnoise_compute_features()`，並讓固定非平坦
-spectrum 運行 4096 frames，確認 ERB 與 complex 兩路都仍非零。
-Python test 另驗證 complex state/chunk equivalence、absolute ERB level、雙路 shape
-與 model forward contract。
+spectrum 運行 4096 frames，確認 ERB mean norm 收旂為 0，complex 路徑仍非零。
+Python test 另驗證兩路 state/chunk equivalence、ERB 穩態收旂、complex 穩態可觀測性、
+雙路 shape 與 model forward contract；`test_python_c_features.py` 以 golden vectors 對照
+Python/C 的 STFT、雙路特徵與最終 normalization state。

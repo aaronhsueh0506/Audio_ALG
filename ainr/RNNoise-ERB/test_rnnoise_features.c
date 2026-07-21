@@ -1,4 +1,4 @@
-/* Independent C reference test for log_erb_abs_cplx_0_4k_v2. */
+/* Independent C reference test for log_erb_dfn_mean_cplx_unit_0_4k_v3. */
 
 #include "process.h"
 #include "rnnoise_tables_gen.h"
@@ -11,6 +11,7 @@
 #define TOL 2e-5f
 
 typedef struct {
+    float erb_norm[RNNOISE_N_BANDS];
     float spec_norm[RNNOISE_SPEC_BINS];
     float erb_history[3][RNNOISE_N_BANDS];
     float spec_history[3][2][RNNOISE_SPEC_BINS];
@@ -38,6 +39,11 @@ static int close_enough(float got, float want, const char *what,
 
 static void ref_init(RefState *st) {
     memset(st, 0, sizeof(*st));
+    for (int b = 0; b < RNNOISE_N_BANDS; ++b) {
+        float pos = (float)b / (float)(RNNOISE_N_BANDS - 1);
+        st->erb_norm[b] = RNNOISE_ERB_NORM_INIT_LO_DB +
+            pos * (RNNOISE_ERB_NORM_INIT_HI_DB - RNNOISE_ERB_NORM_INIT_LO_DB);
+    }
     for (int k = 0; k < RNNOISE_SPEC_BINS; ++k) {
         float pos = (float)k / (float)(RNNOISE_SPEC_BINS - 1);
         st->spec_norm[k] = RNNOISE_SPEC_NORM_INIT_LO +
@@ -48,9 +54,8 @@ static void ref_init(RefState *st) {
 static int ref_step(RefState *st, const float *re, const float *im,
                     float out_erb[3][RNNOISE_N_BANDS],
                     float out_spec[3][2][RNNOISE_SPEC_BINS]) {
-    const float alpha = (float)exp(
-        -((double)RNNOISE_HOP_LEN / (double)RNNOISE_SR) /
-        (double)RNNOISE_SPEC_NORM_TAU_SEC);
+    const float erb_alpha = RNNOISE_ERB_NORM_ALPHA;
+    const float spec_alpha = RNNOISE_SPEC_NORM_ALPHA;
     const int idx = st->index;
 
     for (int b = 0; b < RNNOISE_N_BANDS; ++b) {
@@ -60,15 +65,19 @@ static int ref_step(RefState *st, const float *re, const float *im,
             energy += power * rnn_erb_fwd[k][b];
         }
         float erb_db = 10.0f * log10f(energy + 1e-10f);
-        float feat = (erb_db - RNNOISE_ERB_CENTER_DB) / RNNOISE_ERB_SCALE_DB;
-        if (feat > RNNOISE_ERB_CLIP) feat = RNNOISE_ERB_CLIP;
-        if (feat < -RNNOISE_ERB_CLIP) feat = -RNNOISE_ERB_CLIP;
+        float mean = erb_alpha * st->erb_norm[b] +
+            (1.0f - erb_alpha) * erb_db;
+        float feat = (erb_db - mean) / RNNOISE_ERB_NORM_SCALE_DB;
+        if (feat > RNNOISE_ERB_NORM_CLIP) feat = RNNOISE_ERB_NORM_CLIP;
+        if (feat < -RNNOISE_ERB_NORM_CLIP) feat = -RNNOISE_ERB_NORM_CLIP;
+        st->erb_norm[b] = mean;
         st->erb_history[idx][b] = feat;
     }
 
     for (int k = 0; k < RNNOISE_SPEC_BINS; ++k) {
         float magnitude = sqrtf(re[k] * re[k] + im[k] * im[k]);
-        float state = alpha * st->spec_norm[k] + (1.0f - alpha) * magnitude;
+        float state = spec_alpha * st->spec_norm[k] +
+            (1.0f - spec_alpha) * magnitude;
         float denom = sqrtf(state + RNNOISE_SPEC_NORM_EPS);
         float re_norm = re[k] / denom;
         float im_norm = im[k] / denom;
@@ -134,23 +143,29 @@ int main(void) {
             if (!close_enough(actual.spec_norm_state[k], ref.spec_norm[k],
                               "spec_norm_state", t, k)) ok = 0;
         }
+        for (int b = 0; b < RNNOISE_N_BANDS; ++b) {
+            if (!close_enough(actual.erb_norm_state[b], ref.erb_norm[b],
+                              "erb_norm_state", t, b)) ok = 0;
+        }
         if (!ok) break;
     }
 
     if (ok) {
-        float min_erb = got_erb[2][0], max_erb = got_erb[2][0];
+        float erb_abs_max = fabsf(got_erb[2][0]);
         float complex_abs_sum = 0.0f;
         for (int b = 1; b < RNNOISE_N_BANDS; ++b) {
-            if (got_erb[2][b] < min_erb) min_erb = got_erb[2][b];
-            if (got_erb[2][b] > max_erb) max_erb = got_erb[2][b];
+            if (fabsf(got_erb[2][b]) > erb_abs_max) {
+                erb_abs_max = fabsf(got_erb[2][b]);
+            }
         }
         for (int c = 0; c < 2; ++c) {
             for (int k = 0; k < RNNOISE_SPEC_BINS; ++k) {
                 complex_abs_sum += fabsf(got_spec[2][c][k]);
             }
         }
-        if (!(max_erb - min_erb > 0.25f)) {
-            printf("FAIL: stationary ERB envelope collapsed\n");
+        if (!(erb_abs_max < 2e-5f)) {
+            printf("FAIL: stationary ERB mean norm did not converge to zero: %.9g\n",
+                   (double)erb_abs_max);
             ok = 0;
         }
         if (!(complex_abs_sum / (2.0f * RNNOISE_SPEC_BINS) > 0.01f)) {
@@ -160,8 +175,8 @@ int main(void) {
     }
 
     if (ok) {
-        printf("PASS: %s matches independent reference; stationary ERB and "
-               "complex features remain observable after %d frames\n",
+        printf("PASS: %s matches independent reference; stationary ERB mean "
+               "converges to zero while complex features remain observable after %d frames\n",
                RNNOISE_FEATURE_VERSION, TEST_FRAMES);
     }
     return ok ? 0 : 1;

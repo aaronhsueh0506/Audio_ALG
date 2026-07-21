@@ -88,7 +88,7 @@ def load_model(args):
     HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz',  fallback=0)
     N_ERB_HIGH    = cfg.getint('signal', 'n_erb_high_bands',  fallback=0)
     LOOKAHEAD     = cfg.getint('signal', 'lookahead_frames',  fallback=0)
-    feature_cfg   = read_feature_config(cfg, SR, HOP_LEN, N_FFT)
+    feature_cfg   = read_feature_config(cfg, SR, HOP_LEN, N_FFT, WIN_LEN)
 
     if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
         raise NotImplementedError(

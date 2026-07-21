@@ -12,8 +12,8 @@ extern "C" {
  *   - STFT: root-Hann window, normalized=True (× N_FFT^-0.5)
  *   - ERB: Glasberg-Moore band borders (erb_bandborder) +
  *     三角 filterbank (compute_erb_matrix mode=0 forward / mode=1 inverse)
- *   - ERB 特徵: absolute log energy 的固定 affine scaling，不做時間均值扣除。
- *   - Complex 特徵: 0..4 kHz real/imag，用每 bin magnitude EMA unit norm。
+ *   - ERB 特徵: log energy 的每-band causal EMA mean norm。
+ *   - Complex 特徵: 0..4 kHz real/imag，用每-bin magnitude EMA unit norm。
  *   - Band gain → bin gain: gains @ ERB_inv^T (mode=1, partition of unity)
  *   - ISTFT: normalized=True (× N_FFT^+0.5) + root-Hann + 50% OLA (COLA)
  *
@@ -33,15 +33,19 @@ extern "C" {
 #define RNNOISE_LOOKAHEAD     1     /* = config.ini lookahead_frames */
 #define RNNOISE_CONV_DELAY    (2 - RNNOISE_LOOKAHEAD)
 
-/* log_erb_abs_cplx_0_4k_v2 constants.  Keep byte-for-byte aligned with
+/* log_erb_dfn_mean_cplx_unit_0_4k_v3 constants.  Keep byte-for-byte aligned with
  * config.ini [feature] and checkpoint validation in train.py. */
-#define RNNOISE_FEATURE_VERSION       "log_erb_abs_cplx_0_4k_v2"
-#define RNNOISE_ERB_CENTER_DB         (-75.0f)
-#define RNNOISE_ERB_SCALE_DB            20.0f
-#define RNNOISE_ERB_CLIP                 5.0f
+#define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v3"
+#define RNNOISE_ERB_NORM_TAU_SEC          1.0f
+#define RNNOISE_ERB_NORM_ALPHA             0.984f
+#define RNNOISE_ERB_NORM_INIT_LO_DB     (-60.0f)
+#define RNNOISE_ERB_NORM_INIT_HI_DB     (-90.0f)
+#define RNNOISE_ERB_NORM_SCALE_DB        40.0f
+#define RNNOISE_ERB_NORM_CLIP              5.0f
 #define RNNOISE_SPEC_MAX_HZ            4000
 #define RNNOISE_SPEC_BINS               129
 #define RNNOISE_SPEC_NORM_TAU_SEC         1.0f
+#define RNNOISE_SPEC_NORM_ALPHA            0.984f
 #define RNNOISE_SPEC_NORM_INIT_LO          0.001f
 #define RNNOISE_SPEC_NORM_INIT_HI          0.0001f
 #define RNNOISE_SPEC_NORM_EPS              1e-12f
@@ -58,7 +62,10 @@ typedef struct {
     int   feat_idx;                      /* 下一個寫入位置 (0,1,2) */
     int   feat_count;                    /* 已累積的 frame 數 */
 
-    /* Per-bin causal complex-spectrum magnitude EMA. */
+    /* Per-band causal log-ERB mean EMA. */
+    float erb_norm_state[RNNOISE_N_BANDS];
+
+    /* Original DeepFilterNet per-bin complex-magnitude EMA. */
     float spec_norm_state[RNNOISE_SPEC_BINS];
 
     /* --- 以下為每次呼叫用的暫存區 (scratch), 非跨 frame 狀態 ---
@@ -73,7 +80,7 @@ typedef struct {
     float scratch_full_im[RNNOISE_N_FFT];
 } RNNoiseState;
 
-/* 初始化狀態 (歸零 + complex norm 初值; 內部亦會呼叫
+/* 初始化狀態 (歸零 + ERB/complex norm 初值; 內部亦會呼叫
  * rnnoise_tables_init() — 見下方說明, 現為 no-op) */
 void rnnoise_state_init(RNNoiseState *st);
 
@@ -102,8 +109,9 @@ void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float
 
 /* 從 normalized FFT spectrum 計算雙路 features:
  *   1. power = |X|^2 → 三角 ERB filterbank (mode=0) → 10*log10(·+1e-10)
- *   2. ERB 用固定 center/scale，不做 temporal EMA
- *   3. 0..4 kHz complex bins 先更新 magnitude EMA，再輸出 real/imag / sqrt(EMA)
+ *   2. ERB 先更新每-band dB EMA，再輸出 (erb_db - EMA) / 40
+ *   3. 0..4 kHz complex bins 各自用 magnitude 更新 EMA，再輸出
+ *      real/imag / sqrt(EMA)
  *   spec_re, spec_im: 長度 N_BINS
  *   out_erb: [3][N_BANDS]，out_spec: [3][2][SPEC_BINS]
  *   兩者皆 oldest→newest，供 k=3 temporal convolution

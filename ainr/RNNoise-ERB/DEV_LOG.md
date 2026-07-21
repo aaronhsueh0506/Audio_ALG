@@ -1,5 +1,18 @@
 # RNNoise-ERB 開發紀錄
 
+## 2026-07 — DeepFilterNet-aligned dual preprocessing v3
+
+- Feature version 改為 `log_erb_dfn_mean_cplx_unit_0_4k_v3`；雙路 input shape
+  仍為 ERB `[B,T,22]` 與 complex `[B,T,2,129]`，不增加 absolute-level 維度。
+- ERB 依 DeepFilterNet/Keras 公式改為每-band causal EMA mean norm：先更新
+  mean，再輸出 `(erb_db - mean) / 40`。
+- Complex 以原作者 Rikorose/DeepFilterNet `libDF::band_unit_norm` 為權威：
+  每個 bin 以自己的 magnitude 更新 EMA，再做 `X[k] / sqrt(state[k])`。
+  不採用 DeepFilterNet-Keras notebook 的 frame-level `np.linalg.norm()` 寫法。
+- Checkpoint/config gate 新增 `win_len` 與兩路 v3 normalization 常數。
+- 新增 Python/C golden-vector parity test，比對 STFT、兩路 feature 與
+  normalization state。
+
 ## 2026-07 — dual absolute-ERB + complex spectrum v2
 
 ### 問題
