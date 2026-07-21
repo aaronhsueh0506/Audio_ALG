@@ -57,14 +57,21 @@ context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
 twiddle configs are carved from these pools too, so both columns are the
 complete memory requirement (strict init→destroy zero-heap on both backends):
 
+Pipeline bufs is now 12 scratch buffers, not 13 — the `g_aec` buffer (a
+per-hop memcpy'd duplicate of `AecResContext.res_gain`) was removed; both
+its former readers now read `ctx.res_gain` directly (stable for the whole
+hop per `aec.h`'s own doc), shrinking each row's `Pipeline bufs`/`Total` by
+`ALIGN16(n_freqs*4)` B — 528 B @ 8 kHz, 1,040 B @ 16 kHz, 2,064 B @ 48 kHz
+(`AUDIO_PIPELINE_LAYOUT_VERSION` bumped 1→2 accordingly):
+
 | Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |--------|-----|-----------|-----|---------------|-----------|
-| **8 kHz KISS** | 290,352 B | 8,784 B | 97,792 B | 7,264 B | **404,192 B (394.7 KB)** |
-| **8 kHz NE10** | 288,528 B | 8,176 B | 97,792 B | 7,264 B | **401,760 B (392.3 KB)** |
-| **16 kHz KISS** | 537,680 B | 16,976 B | 194,048 B | 14,432 B | **763,136 B (745.2 KB)** |
-| **16 kHz NE10** | 533,552 B | 15,600 B | 194,048 B | 14,432 B | **757,632 B (739.9 KB)** |
-| **48 kHz KISS** | 1,251,760 B | 33,360 B | 386,560 B | 33,888 B | **1,705,568 B (1,665.6 KB)** |
-| **48 kHz NE10** | 1,243,024 B | 30,448 B | 386,560 B | 33,888 B | **1,693,920 B (1,654.2 KB)** |
+| **8 kHz KISS** | 290,672 B | 8,784 B | 97,792 B | 6,736 B | **404,176 B (394.7 KB)** |
+| **8 kHz NE10** | 288,848 B | 8,176 B | 97,792 B | 6,736 B | **401,744 B (392.3 KB)** |
+| **16 kHz KISS** | 538,320 B | 16,976 B | 194,048 B | 13,392 B | **762,928 B (745.0 KB)** |
+| **16 kHz NE10** | 534,192 B | 15,600 B | 194,048 B | 13,392 B | **757,424 B (739.7 KB)** |
+| **48 kHz KISS** | 1,253,680 B | 33,360 B | 386,560 B | 31,824 B | **1,705,616 B (1,665.6 KB)** |
+| **48 kHz NE10** | 1,244,944 B | 30,448 B | 386,560 B | 31,824 B | **1,693,968 B (1,654.3 KB)** |
 
 > filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072 taps、
 > 7 partitions），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮 `filter_length`
@@ -564,7 +571,7 @@ Guard rails (all four repos, round-4 review):
   yourself while letting `audio_pipeline_create()` heap-allocate another,
   and don't call `aec_create()`/`mmse_lsa_create()`/`fft_create()` directly
   alongside this library's own carve. `audio_pipeline_init()`/`_init_ex()`
-  own the ENTIRE pool layout (control block + AEC + FFT + NR + the 13
+  own the ENTIRE pool layout (control block + AEC + FFT + NR + the 12
   pipeline buffers) as one unit — there is no supported way to substitute
   a heap-obtained sub-module handle into a pool-resident `AudioPipeline`,
   or vice versa.
@@ -585,10 +592,10 @@ updated, there is no compatibility shim.
 | `descriptor_version` | This STRUCT's own ABI version — `AUDIO_PIPELINE_DESCRIPTOR_VERSION` (currently `2`). Bumped only when `AudioPipelineMemReq`'s field set/order/width changes, independent of `layout_version` below (which tracks THIS FILE's carve layout, not the descriptor struct's own shape). `audio_pipeline_init_ex()` checks this FIRST, before interpreting any other field. |
 | `layout_version` | Bumped whenever `audio_pipeline.c`'s OWN carve order/buffer set/sizing formula changes — i.e. whenever a `bytes` figure computed by an older build would misdescribe a newer build's actual carve, or vice versa. Starts at 1. Does **not** need bumping for a change purely inside AEC's/NR's/an FFT backend's own internal `_get_mem_size` layout (each is consumed as one opaque composite blob here, same as the pre-F20 static CLI already treated them — a stale cached `bytes` from an old submodule build is still caught by the undersized-pool rejection at init). |
 | `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_KISS` (1) or `AUDIO_PIPELINE_BACKEND_NE10` (2) (matches this Makefile's `BACKEND=`). Replaces the F20 `const char* backend` field — a process-local rodata pointer can't be serialized, and comparing it required `strcmp` against caller-supplied data at a trust boundary; `backend_id` is compared with a plain integer `==` instead. The two backends are still not byte-identical to each other (pre-existing, expected — see `lib/aec/CLAUDE.md`); a descriptor from one is never valid for the other even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
-| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 13 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
+| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 12 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
 | `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, both FFT backends, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
 | `reserved` | Always 0. Exists only so `bytes` (a `uint64_t`) lands on an 8-byte-aligned offset within the struct with no compiler-inserted padding — part of the fixed 32-byte layout, not a field to read or write. |
-| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the 13 pipeline scratch buffers, same carve `aec_nr_pipeline_static.c`'s old file-local `pipeline_pool_size()` produced). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_init*()` on a target where the two widths differ. |
+| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the 12 pipeline scratch buffers, same carve `aec_nr_pipeline_static.c`'s old file-local `pipeline_pool_size()` produced). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_init*()` on a target where the two widths differ. |
 
 `audio_pipeline_init_ex(mem, bytes, cfg, expected)` (see "Sequence" above)
 automates exactly this comparison: passing the descriptor straight back in

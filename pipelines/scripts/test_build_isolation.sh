@@ -144,6 +144,42 @@
 #            SP-S17a/b: the untracked-file dimension (untracked producer
 #            probe naming audio_common; unknown-producer AEC_DIR refused
 #            unconditionally naming lib/aec)
+#   SP-S18:  `make -e` environment-override bypass rejection (Codex review,
+#            this task) -- the SP-S9 complement: SP-S9 covers COMMAND-LINE
+#            overrides (`make VAR=...`, origin flips the instant it's
+#            parsed); this covers ENVIRONMENT overrides (`env VAR=... make
+#            -e ...`, origin only flips once the makefile's OWN bare
+#            assignment/append to VAR has been parsed -- a gap when that
+#            assignment sits textually after the rejection foreach, exactly
+#            pipelines/Makefile's pre-fix shape). FP_POLICY=(empty)/
+#            FP_POLICY=-ffp-contract=fast/CPPFLAGS=<poison>/CXXFLAGS=<poison>
+#            against pipelines + BOTH primary producers ($AEC_R6_DIR/
+#            $NR_R6_DIR -- NOT the submodule, which still carries the
+#            pre-fix Makefile), plus LDFLAGS=<poison> against pipelines only
+#            (the one Makefile of the three whose LDFLAGS composition itself
+#            needed relocating). Every case is a true `-n` dry run against
+#            scratch OBJ_ROOT=/BIN_ROOT=, and (P2 fix, this task) the ONLY
+#            passing outcome is parse-time rejection ("cannot be
+#            overridden") with a NONZERO exit -- a prior version of this
+#            scenario also accepted "make succeeded, but the poison string
+#            never reached the printed output" as a PASS, which a review
+#            correctly flagged as false assurance (that absence can mean
+#            nothing more than "this target/backend never prints a
+#            compile line referencing the poisoned variable at all" --
+#            confirmed live for pipelines' own CPPFLAGS/CXXFLAGS, which
+#            are placeholder-only in that Makefile). See
+#            assert_make_e_rejected()'s own comment for the full fix and
+#            the broken-gate rehearsal that verified it (every case here
+#            FAILs against a deliberately-disabled gate, in a scratch
+#            clone, for all three Makefiles, including CXXFLAGS/CPPFLAGS).
+#            The pipelines-specific cases target `libaudio_pipeline.a`
+#            (not `all`) with AC_LIB=/AEC_LIB=/NR_LIB= forced -- a
+#            producer-dispatch-free target, so a PASS can only ever come
+#            from pipelines/Makefile's OWN gate, never from audio_common's
+#            or the lib/aec|lib/nr submodules' gates reached through `all`'s
+#            three-producer dispatch (which a real child `make` process
+#            invoked even under `-n`, and which inherits this scenario's
+#            `env VAR=...` the same way pipelines' own process does).
 #
 # Design rules (same as audio_common's script -- do not violate when editing):
 #   - No `make clean` inside any scenario body (except SP-S13's own trailing
@@ -1632,6 +1668,200 @@ else
     cat "$SP17_LOG_B" >&2
   fi
 fi
+
+echo "############################################################"
+echo "# SP-S18: 'make -e' environment-override bypass rejection, cross-repo"
+echo "############################################################"
+# Codex review finding (this task): distinct from SP-S9 above. SP-S9 exercises
+# a COMMAND-LINE override (\`make CFLAGS=-O3 ...\`) -- origin flips to
+# "command line" the instant the argument is parsed, so the "Command-line
+# override rejection" foreach has always caught it regardless of where in
+# the file the corresponding bare assignment/append sits. This scenario
+# exercises the OTHER origin the SAME foreach is supposed to catch:
+# \`env VAR=... make -e ...\` (ENVIRONMENT-override). \`$(origin VAR)\` only
+# flips from plain "environment" to "environment override" once a makefile
+# assignment/append to VAR has actually been PARSED -- so under \`-e\`, a
+# bare env var whose file-side assignment sits AFTER the foreach (in file
+# order) used to sail straight through unrejected, silently dropping that
+# Makefile's own flag appends (confirmed, pre-fix: \`env
+# FP_POLICY=-ffp-contract=fast make -e -n BACKEND=kiss lib\` against
+# pipelines/Makefile succeeded (rc=0) with -ffp-contract=fast on the
+# audio_pipeline.o dry-run compile line instead of the pinned
+# -ffp-contract=off). The fix -- relocating each bare FP_POLICY/LDFLAGS
+# literal/composition ahead of the foreach, and turning the CXXFLAGS/
+# CPPFLAGS \`?=\` into \`+=\` so the assignment ATTEMPT always happens -- is
+# covered here for all three consumer Makefiles.
+#
+# AEC/NR here are the PRIMARY repos ($AEC_R6_DIR/$NR_R6_DIR), NOT the
+# submodule ($AEC_DIR/$NR_DIR) -- same "round-6 submodule caveat" this
+# script's header documents for SP-S10/SP-S12/SP-S14 above: the submodule
+# pin still carries the PRE-fix Makefile (confirmed directly: the exact
+# \`env FP_POLICY=-ffp-contract=fast make -e -n BACKEND=kiss lib\` repro still
+# sails through unrejected against $AEC_DIR/$NR_DIR today, rc=0, with
+# -ffp-contract=fast on the dry-run compile line), so a scenario asserting
+# the FIX must target the primary repos, where it landed -- exactly like
+# this script's existing round-6-only scenarios already do. pipelines
+# itself is exercised in place ($PIPE_DIR, the real checkout this task's fix
+# landed in directly).
+#
+# Every case runs as a true `-n` dry run with scratch OBJ_ROOT=/BIN_ROOT=
+# (never the real obj/bin of any of the three trees) -- belt-and-braces:
+# the parse-time $(error) fires while GNU Make is still reading the
+# makefile, before any target/recipe is even looked up, so no recipe from
+# any of these invocations ever runs regardless; OBJ_ROOT=/BIN_ROOT= just
+# keeps that invariant true even if some future edit moved the check later.
+SP18_OBJ_ROOT="$SCRATCH_ROOT/sp18/obj"
+SP18_BIN_ROOT="$SCRATCH_ROOT/sp18/bin"
+mkscratch sp18
+
+# assert_make_e_rejected <description> <dir> <target> <mode> <needle> <VAR=value>...
+# Runs `env <VAR=value>... make -C <dir> -e -n BACKEND=kiss OBJ_ROOT=/
+# BIN_ROOT= (fresh scratch dirs, one pair per case) <target>`.
+#
+# P2 FIX (this task -- tightened from the prior round's version): the ONLY
+# passing condition is make exiting NONZERO with the captured log containing
+# the literal string "cannot be overridden" -- i.e. the origin-override
+# rejection gate itself actually fired. Every other outcome is a FAIL:
+#
+#   - make exits 0 -- ALWAYS a FAIL now, regardless of whether <needle>
+#     happens to appear in the printed dry-run output. The PRIOR version of
+#     this helper treated "make succeeded, but <needle> is absent from the
+#     printed output" as an accepted PASS ("no bypass observed") -- a review
+#     correctly flagged that as a false-assurance mechanism: absence of the
+#     poison string from ONE PARTICULAR dry run's output is not proof the
+#     override was rejected. It can be legitimately absent for a reason that
+#     has NOTHING to do with the origin-rejection gate -- e.g. the
+#     target/backend combination this case dry-runs never prints a compile
+#     recipe line that references the poisoned variable at all. CONFIRMED
+#     live for pipelines specifically: neither CPPFLAGS nor CXXFLAGS is ever
+#     consumed by an actual compile recipe in pipelines/Makefile (CXXFLAGS
+#     because this repo has no C++ TU of its own; CPPFLAGS because every
+#     compile recipe references $(CFLAGS)/$(LIB_CFLAGS) only -- both
+#     variables are folded ONLY into the internal FP_INPUT_FLAGS conflict
+#     check, never appended to a line this Makefile ever prints) -- meaning
+#     a `make -n all` dry run against a Makefile whose origin-rejection gate
+#     had been entirely REMOVED would still never print
+#     "-DSP18_POISON" anywhere for the CXXFLAGS/CPPFLAGS cases, and the prior
+#     mode=absent path would have rubber-stamped a PASS purely from that
+#     absence -- with the gate doing nothing at all. Because the
+#     origin-rejection foreach is a PARSE-TIME check (runs unconditionally
+#     while GNU Make reads the makefile, before any target is even looked
+#     up -- see that foreach's own comment in each Makefile), it fires (or
+#     doesn't) completely independently of whether the poisoned variable
+#     ever reaches a printed recipe line for the target under test. Gating
+#     PASS/FAIL on that parse-time outcome alone, rather than on a
+#     downstream grep, is therefore both necessary AND sufficient: it is
+#     meaningful for EVERY case below, including the CXXFLAGS/CPPFLAGS ones,
+#     purely from this helper's own fix -- no CASE needs to be retargeted at
+#     a TU that actually consumes CXXFLAGS/CPPFLAGS on a compile line.
+#   - make exits nonzero WITHOUT "cannot be overridden" in the log (e.g. some
+#     other, unrelated fresh error) -- FAIL: the expected rejection message
+#     never appeared, so a nonzero exit alone is not evidence the
+#     origin-rejection gate is what stopped it.
+#
+# The dry-run grep-for-poison / grep-for-pinned-flag check is KEPT, but ONLY
+# ever as an EXTRA, non-authoritative diagnostic line printed alongside a
+# FAIL -- it can no longer turn a non-rejection into a PASS.
+#
+# SEPARATE finding from proving the above (broken-gate rehearsal, this task):
+# pipelines' own three-producer dispatch means `target=all` genuinely
+# SHELLS OUT to audio_common + the lib/aec/lib/nr SUBMODULES via a
+# "+@...$(MAKE)..." recipe line that runs for real even under `-n` (by
+# design -- see pipelines/Makefile's own dispatch comment). `env VAR=...`
+# is inherited by every one of those child `make` processes, so if ONLY
+# pipelines' own origin-rejection gate were disabled (audio_common's/the
+# submodules' own gates left intact), a pipelines case run with
+# `target=all` would still print "cannot be overridden" -- from a
+# DIFFERENT Makefile's still-working gate reached via that dispatch, not
+# from pipelines' own (broken) one -- and this helper would report a PASS
+# that is not actually attributable to pipelines/Makefile at all
+# (confirmed empirically against a scratch clone with ONLY pipelines'
+# gate disabled: `target=all` cases kept reporting "cannot be overridden",
+# sourced from audio_common's Makefile, even though pipelines' own gate
+# was doing nothing). AC_LIB=/AEC_LIB=/NR_LIB= below, forced to dummy
+# non-empty values on every call (harmless for the lib/aec (primary)/
+# lib/nr (primary) cases too -- those Makefiles have no AEC_LIB/NR_LIB
+# variables of their own, and their own `lib` target already needs no
+# producer archive), make every SP-S18 case here skip the two-phase
+# producer-resolution dispatch entirely (see pipelines/Makefile's own
+# query-target comment: passing AC_LIB/AEC_LIB/NR_LIB "skips the query
+# sub-makes") -- so no case below ever shells out to a DIFFERENT
+# Makefile, and a PASS can only ever come from the ONE Makefile named by
+# `<dir>`'s own origin-rejection gate. This is also why the pipelines-
+# specific cases further below target `libaudio_pipeline.a` (a real rule
+# that "needs only THIS repo's own object... never shells out to any of
+# the three producers" per that target's own comment) rather than `all`.
+SP18_COUNTER=0
+assert_make_e_rejected() {
+  local desc="$1" dir="$2" target="$3" mode="$4" needle="$5" log
+  shift 5
+  SP18_COUNTER=$((SP18_COUNTER + 1))
+  log="$SCRATCH_ROOT/sp18/case-$SP18_COUNTER.log"
+  if env "$@" make -C "$dir" -e -n BACKEND=kiss AC_LIB=x AEC_LIB=y NR_LIB=z \
+       OBJ_ROOT="$SP18_OBJ_ROOT/$SP18_COUNTER" BIN_ROOT="$SP18_BIN_ROOT/$SP18_COUNTER" \
+       "$target" >"$log" 2>&1; then
+    fail "$desc -- make exited 0 (NOT rejected): the origin-override gate did not fire"
+    if [ "$mode" = present ]; then
+      if grep -qF -- "$needle" "$log"; then
+        echo "  [diagnostic, non-authoritative] the pinned flag ('$needle') is still present in the dry-run output" >&2
+      else
+        echo "  [diagnostic, non-authoritative] the pinned flag ('$needle') is ALSO missing from the dry-run output" >&2
+      fi
+    else
+      if grep -qF -- "$needle" "$log"; then
+        echo "  [diagnostic, non-authoritative] the poisoned value ('$needle') DOES appear in the dry-run output" >&2
+      else
+        echo "  [diagnostic, non-authoritative] the poisoned value ('$needle') does not appear in the dry-run output -- absence here is NOT proof of rejection (it may simply never reach a printed recipe line for this target/variable combination)" >&2
+      fi
+    fi
+    cat "$log" >&2
+  else
+    if grep -q "cannot be overridden" "$log"; then
+      pass "$desc -- rejected at parse time ('cannot be overridden')"
+    else
+      fail "$desc -- failed, but NOT with the expected 'cannot be overridden' message"
+      cat "$log" >&2
+    fi
+  fi
+}
+
+echo "--- FP_POLICY= (empty) via make -e -----------------------------------"
+assert_make_e_rejected "SP-S18: pipelines env FP_POLICY= (empty) make -e -n rejected" \
+  "$PIPE_DIR" libaudio_pipeline.a present "-ffp-contract=off" FP_POLICY=
+assert_make_e_rejected "SP-S18: lib/aec (primary) env FP_POLICY= (empty) make -e -n rejected" \
+  "$AEC_R6_DIR" lib present "-ffp-contract=off" FP_POLICY=
+assert_make_e_rejected "SP-S18: lib/nr (primary) env FP_POLICY= (empty) make -e -n rejected" \
+  "$NR_R6_DIR" lib present "-ffp-contract=off" FP_POLICY=
+
+echo "--- FP_POLICY=-ffp-contract=fast via make -e (Codex's exact repro) ---"
+assert_make_e_rejected "SP-S18: pipelines env FP_POLICY=-ffp-contract=fast make -e -n rejected" \
+  "$PIPE_DIR" libaudio_pipeline.a absent "-ffp-contract=fast" FP_POLICY=-ffp-contract=fast
+assert_make_e_rejected "SP-S18: lib/aec (primary) env FP_POLICY=-ffp-contract=fast make -e -n rejected" \
+  "$AEC_R6_DIR" lib absent "-ffp-contract=fast" FP_POLICY=-ffp-contract=fast
+assert_make_e_rejected "SP-S18: lib/nr (primary) env FP_POLICY=-ffp-contract=fast make -e -n rejected" \
+  "$NR_R6_DIR" lib absent "-ffp-contract=fast" FP_POLICY=-ffp-contract=fast
+
+echo "--- CPPFLAGS=<poison> via make -e -------------------------------------"
+assert_make_e_rejected "SP-S18: pipelines env CPPFLAGS=-DSP18_POISON make -e -n rejected" \
+  "$PIPE_DIR" libaudio_pipeline.a absent "-DSP18_POISON" CPPFLAGS=-DSP18_POISON
+assert_make_e_rejected "SP-S18: lib/aec (primary) env CPPFLAGS=-DSP18_POISON make -e -n rejected" \
+  "$AEC_R6_DIR" lib absent "-DSP18_POISON" CPPFLAGS=-DSP18_POISON
+assert_make_e_rejected "SP-S18: lib/nr (primary) env CPPFLAGS=-DSP18_POISON make -e -n rejected" \
+  "$NR_R6_DIR" lib absent "-DSP18_POISON" CPPFLAGS=-DSP18_POISON
+
+echo "--- CXXFLAGS=<poison> via make -e -------------------------------------"
+assert_make_e_rejected "SP-S18: pipelines env CXXFLAGS=-DSP18_POISON make -e -n rejected" \
+  "$PIPE_DIR" libaudio_pipeline.a absent "-DSP18_POISON" CXXFLAGS=-DSP18_POISON
+assert_make_e_rejected "SP-S18: lib/aec (primary) env CXXFLAGS=-DSP18_POISON make -e -n rejected" \
+  "$AEC_R6_DIR" lib absent "-DSP18_POISON" CXXFLAGS=-DSP18_POISON
+assert_make_e_rejected "SP-S18: lib/nr (primary) env CXXFLAGS=-DSP18_POISON make -e -n rejected" \
+  "$NR_R6_DIR" lib absent "-DSP18_POISON" CXXFLAGS=-DSP18_POISON
+
+echo "--- LDFLAGS=<poison> via make -e -- pipelines-specific (the one repo"
+echo "    whose LDFLAGS composition itself needed relocating; AEC's/NR's"
+echo "    LDFLAGS already precede their own foreach and never needed it) ---"
+assert_make_e_rejected "SP-S18: pipelines env LDFLAGS=-lSP18POISON make -e -n rejected" \
+  "$PIPE_DIR" libaudio_pipeline.a absent "-lSP18POISON" LDFLAGS=-lSP18POISON
 
 echo "############################################################"
 echo "# Final integrity guards"
