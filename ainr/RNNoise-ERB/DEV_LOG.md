@@ -1,5 +1,19 @@
 # RNNoise-ERB 開發紀錄
 
+## 2026-07 — DeepFilterNet 3 MultiResSpecLoss-only
+
+- 移除 direct ERB IRM、speech-active frame weight 與 `f_under`；訓練 total loss
+  只剩單一 `MultiResSpecLoss`。
+- 對齊 DeepFilterNet 3 production 設定：FFT 256/512/1024/2048、γ=0.3，
+  compressed magnitude/complex MSE factor 各 500，各 resolution 加總不平均。
+- 不移植 local-SNR loss：RNNoise-ERB 沒有 local-SNR/VAD output head。
+- pure-noise 使用 clean waveform=0 的正常 MRSL target，沒有額外權重或
+  clean-energy 除法；新增 finite loss/gradient regression test。
+- Checkpoint 新增 `loss_version` 與 loss config gate，防止續訓舊 objective
+  的 optimizer/scheduler state。
+- 上游對齊來源：[Rikorose/DeepFilterNet `df/loss.py`](https://github.com/Rikorose/DeepFilterNet/blob/main/DeepFilterNet/df/loss.py)
+  與 repository 內的 `models/DeepFilterNet3.zip/config.ini`。
+
 ## 2026-07 — DeepFilterNet-aligned dual preprocessing v3
 
 - Feature version 改為 `log_erb_dfn_mean_cplx_unit_0_4k_v3`；雙路 input shape

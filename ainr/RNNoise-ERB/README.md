@@ -134,6 +134,10 @@ output_dir = ./output
 目前訓練只接受 `pack_dataset.py` 產生的 raw noisy/clean WAV tensor；STFT、
 log-ERB 與 runtime normalization 會在訓練時即時計算。完整流程：
 
+訓練 objective 僅使用 DeepFilterNet 3 的 `MultiResSpecLoss`：FFT sizes
+256/512/1024/2048、γ=0.3，compressed magnitude 與 complex MSE 的 factor
+都是 500。沒有 ERB IRM、speech-activity/VAD 加權或 pure-noise 特別分支。
+
 ```bash
 # Step 1: 產生 2-channel WAV pairs（ch0=noisy, ch1=clean）
 python3 gen_dataset.py --config config.ini --output data --hours 25 --workers 4
@@ -168,6 +172,8 @@ python3 train.py --config config.ini --packed-data data/packed.pt \
 ```
 
 續訓會恢復：model weights、optimizer 狀態、scheduler 狀態、epoch 計數、best_val_loss。
+Checkpoint 同時檢查 loss contract；舊的 MRSL+IRM checkpoint 不能直接 resume，
+必須從新初始化的訓練開始。
 
 ### 訓練輸出
 

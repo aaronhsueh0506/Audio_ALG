@@ -53,7 +53,7 @@ CFG_SIG_PAYLOAD := CC=$(CC) CFLAGS=$(CFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 BUILD_DIR = build/$(CFG_SIG)
 
-.PHONY: test test-tables test-features test-feature-contract test-feature-python clean _cfg_guard
+.PHONY: test test-tables test-features test-feature-contract test-feature-python test-loss-python clean _cfg_guard
 _cfg_guard:
 	@mkdir -p $(BUILD_DIR)
 	@m="$(BUILD_DIR)/config.manifest"; \
@@ -91,6 +91,9 @@ test-features: $(BUILD_DIR)/test_rnnoise_features
 test-feature-python:
 	python3 test_feature_norm.py
 	python3 test_python_c_features.py
+
+test-loss-python:
+	python3 test_loss.py
 
 $(BUILD_DIR)/test_rnnoise_tables: test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ test_rnnoise_tables.c -lm

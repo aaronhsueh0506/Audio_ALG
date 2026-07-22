@@ -3,7 +3,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 """
 RNNoise v0.2-inspired 噪音抑制模型 — 訓練腳本
-採用 Conv+GRU 骨架，並改為 config-driven / ERB-only / 無 pitch 的本地架構
+採用 Conv+GRU 骨架，並改為 config-driven / ERB+complex dual-input /
+無 pitch 的本地架構
 
 用法:
     python train.py --config config.ini
@@ -34,6 +35,7 @@ from dataset import PackedDataset
 # It is incompatible with all earlier checkpoints even though both input/output
 # dimensions are unchanged.
 FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v3'
+LOSS_VERSION = 'df3_multi_res_spec_only_gamma_0.3_v1'
 
 
 def require_checkpoint_feature_version(ckpt, context='checkpoint'):
@@ -82,6 +84,58 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
                 f"{context} {key}={got!r}, but runtime config requires {want!r}; "
                 "use the training config or retrain before inference/export."
             )
+
+
+def require_checkpoint_loss_config(ckpt, loss_cfg, context='checkpoint'):
+    """Do not resume optimizer state trained with the previous IRM-mixed objective."""
+    version = ckpt.get('loss_version', ckpt.get('config', {}).get('loss_version'))
+    if version != LOSS_VERSION:
+        shown = repr(version) if version is not None else 'missing (legacy loss contract)'
+        raise ValueError(
+            f"{context} loss_version={shown}, expected {LOSS_VERSION!r}. "
+            "The training objective changed from MRSL+ERB-IRM to DF3 MRSL-only; "
+            "start a fresh training run instead of resuming this optimizer state."
+        )
+    saved = ckpt.get('config', {})
+    expected = {
+        'loss_fft_sizes': ','.join(str(n) for n in loss_cfg['fft_sizes']),
+        'loss_gamma': loss_cfg['gamma'],
+        'loss_factor': loss_cfg['factor'],
+        'loss_factor_complex': loss_cfg['factor_complex'],
+    }
+    import math
+    for key, want in expected.items():
+        got = saved.get(key)
+        matches = (str(got) == want if isinstance(want, str) else
+                   got is not None and math.isclose(float(got), float(want),
+                                                    rel_tol=1e-7, abs_tol=1e-7))
+        if not matches:
+            raise ValueError(
+                f"{context} {key}={got!r}, but runtime loss config requires {want!r}; "
+                "start a fresh training run or use the checkpoint's original config."
+            )
+
+
+def read_loss_config(cfg):
+    """Read the DeepFilterNet 3 production MultiResSpecLoss subset used here."""
+    section = 'multi_res_spec_loss'
+    fft_sizes = tuple(
+        int(x.strip()) for x in
+        cfg.get(section, 'fft_sizes', fallback='256,512,1024,2048').split(',')
+        if x.strip()
+    )
+    loss_cfg = {
+        'fft_sizes': fft_sizes,
+        'gamma': cfg.getfloat(section, 'gamma', fallback=0.3),
+        'factor': cfg.getfloat(section, 'factor', fallback=500.0),
+        'factor_complex': cfg.getfloat(section, 'factor_complex', fallback=500.0),
+    }
+    if (not fft_sizes or any(n <= 0 or n % 2 for n in fft_sizes) or
+            not 0 < loss_cfg['gamma'] <= 1 or loss_cfg['factor'] < 0 or
+            loss_cfg['factor_complex'] < 0 or
+            loss_cfg['factor'] + loss_cfg['factor_complex'] == 0):
+        raise ValueError('invalid DeepFilterNet MultiResSpecLoss configuration')
+    return loss_cfg
 
 
 def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
@@ -513,20 +567,6 @@ def extract_model_features(spec, erb_matrix, feature_cfg, norm_state=None,
     return erb_features, spec_features, {'erb': erb_state, 'spec': norm_state}, debug
 
 
-def compute_ideal_erb_gains(clean_spec, noisy_spec, erb_matrix):
-    """Amplitude-domain ideal ratio mask in the same ERB bands as the output."""
-    clean_power = clean_spec.abs().pow(2).permute(0, 2, 1) @ erb_matrix
-    noisy_power = noisy_spec.abs().pow(2).permute(0, 2, 1) @ erb_matrix
-    return torch.sqrt(torch.clamp(clean_power / (noisy_power + 1e-10), 0.0, 1.0))
-
-
-def compute_speech_activity(clean_spec):
-    """Clean-energy activity used only to weight the direct gain loss."""
-    power = clean_spec.abs().pow(2).mean(dim=1)
-    peak = power.amax(dim=1, keepdim=True)
-    return (power > torch.clamp(peak * 1e-4, min=1e-10)).to(power.dtype).unsqueeze(-1)
-
-
 def apply_erb_gains_batch(noisy_spec, gains, erb_inv, lookahead=0):
     """
     noisy_spec : (B, n_bins, n_frames) complex
@@ -551,40 +591,75 @@ def apply_erb_gains_batch(noisy_spec, gains, erb_inv, lookahead=0):
     return noisy_spec * bin_gains
 
 
-def multi_res_stft_loss(enhanced, clean, fft_sizes=(512, 256, 1024), gamma=0.3,
-                        factor=1.0, f_under=1.0):
+class _SafeAngle(torch.autograd.Function):
+    """DeepFilterNet's angle op with finite gradients at zero magnitude."""
+
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return torch.atan2(x.imag, x.real)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (x,) = ctx.saved_tensors
+        inv_power = grad / (x.real.square() + x.imag.square()).clamp_min(1e-10)
+        return torch.complex(-x.imag * inv_power, x.real * inv_power)
+
+
+class _LossStft(nn.Module):
+    """STFT module used by DeepFilterNet's loss, including its cached window."""
+
+    def __init__(self, n_fft):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop = n_fft // 4
+        self.register_buffer('window', torch.hann_window(n_fft))
+
+    def forward(self, waveform):
+        return torch.stft(
+            waveform, self.n_fft, self.hop, window=self.window,
+            normalized=True, return_complex=True)
+
+
+class MultiResSpecLoss(nn.Module):
     """
-    DeepFilterNet MultiResSpecLoss 忠實 port (df/loss.py)。每個 resolution 用獨立
-    Stft = plain Hann window + hop n_fft//4 (75% overlap) + normalized=True;magnitude
-    做 γ-power compression (clamp_min(1e-12)) 再算 MSE。magnitude-only:real-gain mask
-    的 ∠enhanced≡∠noisy,相位無梯度 → 不加 complex 項 (那是 DFN deep-filter stage 用的)。
-    無除法 → 對 silence target (noise-only sample, target=0) 也穩定有界。
+    DeepFilterNet 3 MultiResSpecLoss port. Each resolution uses a plain Hann
+    window, hop=n_fft//4 and normalized STFT. Both magnitude and complex spectra
+    are gamma-compressed before MSE, and resolution losses are summed (not
+    averaged), exactly like the upstream implementation.
 
-    factor : 全域縮放 (DFN MultiResSpecLoss factor=500)。⚠ 單一 loss 項 + AdamW 下
-             ≈ no-op (m̂/√v̂ 約掉常數);唯一耦合 = grad_clip_norm(1.0) 會更常觸發。
-    f_under: under-suppression 非對稱權重。E_c>C_c (enhanced 比 clean 大 = 殘留噪音沒壓掉)
-             的誤差乘 f_under。f_under=1 → 對稱 (= F.mse_loss,行為與舊版逐位元相同);
-             f_under>1 → 把「留噪音」罰更重,直接逼模型壓 (改 incentive,非全域縮放)。
+    There is no division by clean energy, activity weighting, or IRM target, so
+    clean=0 (pure-noise samples) is a normal finite target.
     """
-    total = 0.0
-    for n_fft in fft_sizes:
-        hop = n_fft // 4          # DFN Stft default = n_fft//4 (75% overlap)
-        win = torch.hann_window(n_fft, device=enhanced.device)   # DFN: plain Hann
-        E = torch.stft(enhanced, n_fft, hop, window=win,
-                       return_complex=True, normalized=True).abs()   # (B, F, T')
-        C = torch.stft(clean,    n_fft, hop, window=win,
-                       return_complex=True, normalized=True).abs()
 
-        E_c = E.clamp_min(1e-12).pow(gamma)   # DFN compression (clamp_min, 非 additive eps)
-        C_c = C.clamp_min(1e-12).pow(gamma)
-        diff = E_c - C_c
-        if f_under == 1.0:
-            total = total + diff.pow(2).mean()                 # == F.mse_loss(E_c, C_c)
-        else:
-            w = 1.0 + (f_under - 1.0) * (diff > 0).to(diff.dtype)   # 留噪音 (diff>0) 罰 f_under 倍
-            total = total + (w * diff.pow(2)).mean()
+    def __init__(self, fft_sizes=(256, 512, 1024, 2048), gamma=0.3,
+                 factor=500.0, factor_complex=500.0):
+        super().__init__()
+        self.gamma = gamma
+        self.factor = factor
+        self.factor_complex = factor_complex
+        self.stfts = nn.ModuleDict({str(n): _LossStft(n) for n in fft_sizes})
 
-    return factor * total / len(fft_sizes)
+    def forward(self, enhanced, clean):
+        total = torch.zeros((), device=enhanced.device, dtype=enhanced.dtype)
+        for stft_fn in self.stfts.values():
+            Y = stft_fn(enhanced)
+            S = stft_fn(clean)
+            Y_abs = Y.abs()
+            S_abs = S.abs()
+            if self.gamma != 1:
+                Y_abs = Y_abs.clamp_min(1e-12).pow(self.gamma)
+                S_abs = S_abs.clamp_min(1e-12).pow(self.gamma)
+            total = total + F.mse_loss(Y_abs, S_abs) * self.factor
+            if self.factor_complex != 0:
+                if self.gamma != 1:
+                    Y = Y_abs * torch.exp(1j * _SafeAngle.apply(Y))
+                    S = S_abs * torch.exp(1j * _SafeAngle.apply(S))
+                total = total + F.mse_loss(
+                    torch.view_as_real(Y),
+                    torch.view_as_real(S),
+                ) * self.factor_complex
+        return total
 
 
 # ============================================================
@@ -729,16 +804,8 @@ def train(args):
     scheduler = torch.optim.lr_scheduler.SequentialLR(
         optimizer, schedulers=[warmup_sch, cosine_sch], milestones=[warmup_steps])
 
-    # Perceptual loss params
-    fft_sizes_str = cfg.get('perceptual_loss', 'fft_sizes', fallback='512,256,1024')
-    fft_sizes = tuple(int(x.strip()) for x in fft_sizes_str.split(','))
-    perc_gamma = cfg.getfloat('perceptual_loss', 'gamma', fallback=0.3)
-    perc_factor = cfg.getfloat('perceptual_loss', 'factor', fallback=1.0)
-    perc_f_under = cfg.getfloat('perceptual_loss', 'f_under', fallback=1.0)
-    gain_factor = cfg.getfloat('perceptual_loss', 'gain_factor', fallback=10.0)
-    gain_gamma = cfg.getfloat('perceptual_loss', 'gain_gamma', fallback=0.5)
-    active_frame_weight = cfg.getfloat(
-        'perceptual_loss', 'active_frame_weight', fallback=2.0)
+    loss_cfg = read_loss_config(cfg)
+    loss_fn = MultiResSpecLoss(**loss_cfg).to(device)
 
     # Forward ERBB (mode=0, edge x2) for features; inverse (mode=1, partition of unity)
     # for mask→bin expansion — exactly the DFN/Keras forward/inverse split.
@@ -770,6 +837,7 @@ def train(args):
         print(f"Loading checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         require_checkpoint_feature_config(ckpt, FEATURE_CFG, context=args.resume)
+        require_checkpoint_loss_config(ckpt, loss_cfg, context=args.resume)
         resume_model = model._orig_mod if hasattr(model, '_orig_mod') else model
         resume_model.load_state_dict(ckpt['state_dict'])
         if 'optimizer' in ckpt:
@@ -786,9 +854,9 @@ def train(args):
     print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
     wd_note = f"{weight_decay}→{weight_decay_end} (cosine)" if wd_scheduled else f"{weight_decay} (const)"
     print(f"  dropout={dropout}, weight_decay={wd_note}")
-    print(f"  loss: multi-res STFT (perceptual), fft_sizes={fft_sizes}, "
-          f"factor={perc_factor}, f_under={perc_f_under}; "
-          f"gain={gain_factor}, active_frame_weight={active_frame_weight}")
+    print(f"  loss={LOSS_VERSION}: fft_sizes={loss_cfg['fft_sizes']}, "
+          f"gamma={loss_cfg['gamma']}, magnitude_factor={loss_cfg['factor']}, "
+          f"complex_factor={loss_cfg['factor_complex']}")
     if patience > 0:
         print(f"  early stopping: patience={patience}")
     print(f"  device={device}")
@@ -842,16 +910,7 @@ def train(args):
                     enhanced_wav = istft(enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
                                          stft_window, noisy_wav.size(-1))
 
-                    wave_loss = multi_res_stft_loss(
-                        enhanced_wav, clean_wav, fft_sizes, perc_gamma,
-                        factor=perc_factor, f_under=perc_f_under)
-                    target_gains = compute_ideal_erb_gains(
-                        clean_spec, noisy_spec, ERB_FWD)
-                    speech_activity = compute_speech_activity(clean_spec)
-                    gain_error = pred_gains.pow(gain_gamma) - target_gains.pow(gain_gamma)
-                    gain_weight = 1.0 + (active_frame_weight - 1.0) * speech_activity
-                    gain_loss = (gain_weight * gain_error.square()).mean()
-                    loss = wave_loss + gain_factor * gain_loss
+                    loss = loss_fn(enhanced_wav, clean_wav)
 
                     # weight-decay 排程 (DFN-style cosine, 套在這步 optimizer.step 前)
                     if wd_scheduled:
@@ -869,8 +928,7 @@ def train(args):
                     global_step += 1
 
                     train_loss_sum += loss.item()
-                    pbar.set_postfix(loss=f"{loss.item():.5f}",
-                                     gain=f"{gain_loss.item():.4f}")
+                    pbar.set_postfix(loss=f"{loss.item():.5f}")
 
         avg_train = train_loss_sum / len(train_loader)
 
@@ -896,16 +954,8 @@ def train(args):
                         noisy_spec, pred_gains, ERB_INV, LOOKAHEAD)
                     enhanced_wav = istft(enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
                                          stft_window, noisy_wav.size(-1))
-                    wave_loss = multi_res_stft_loss(
-                        enhanced_wav, clean_wav, fft_sizes, perc_gamma,
-                        factor=perc_factor, f_under=perc_f_under)
-                    target_gains = compute_ideal_erb_gains(
-                        clean_spec, noisy_spec, ERB_FWD)
-                    speech_activity = compute_speech_activity(clean_spec)
-                    gain_error = pred_gains.pow(gain_gamma) - target_gains.pow(gain_gamma)
-                    gain_weight = 1.0 + (active_frame_weight - 1.0) * speech_activity
-                    gain_loss = (gain_weight * gain_error.square()).mean()
-                    val_loss_sum += (wave_loss + gain_factor * gain_loss).item()
+                    loss = loss_fn(enhanced_wav, clean_wav)
+                    val_loss_sum += loss.item()
 
         avg_val = val_loss_sum / max(len(val_loader), 1)
         cur_lr = scheduler.get_last_lr()[0]
@@ -927,6 +977,7 @@ def train(args):
             'best_val_loss': checkpoint_best,
             'nfftborder': NFFTBORDER.tolist(),
             'feature_version': FEATURE_VERSION,
+            'loss_version': LOSS_VERSION,
             'config': {
                 'sr': SR, 'n_fft': N_FFT, 'win_len': WIN_LEN,
                 'hop_len': HOP_LEN, 'n_bands': N_BANDS,
@@ -935,6 +986,11 @@ def train(args):
                 'spec_conv_channels': SPEC_CONV_CHANNELS,
                 'spec_embed_size': SPEC_EMBED_SIZE,
                 'feature_version': FEATURE_VERSION,
+                'loss_version': LOSS_VERSION,
+                'loss_fft_sizes': ','.join(str(n) for n in loss_cfg['fft_sizes']),
+                'loss_gamma': loss_cfg['gamma'],
+                'loss_factor': loss_cfg['factor'],
+                'loss_factor_complex': loss_cfg['factor_complex'],
                 'feature_erb_norm_tau_sec': FEATURE_CFG['erb_tau_sec'],
                 'feature_erb_norm_alpha': FEATURE_CFG['erb_alpha'],
                 'feature_erb_norm_init_lo_db': FEATURE_CFG['erb_norm_init_lo_db'],
