@@ -1,5 +1,5 @@
 """
-DeepFilterNet2 adaptation for 16kHz / n_fft=512.
+DeepFilterNet2 adaptation with config-driven sample rate and FFT size.
 
 Architecture overview (aligned with DeepFilterNet2 paper):
   - Encoder: ERB path (4 levels, freq stride-2 ×2) + DF path (2 levels)
@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 def _build_erb_fb(n_fft: int, sr: int, n_erb: int):
     """
-    Build ERB band-assignment matrices for 16kHz.
+    Build ERB band-assignment matrices for the configured sample rate and FFT.
 
     Returns:
         erb_fb   : (n_erb, n_bins) — forward transform (normalised, sums to 1 per band)
@@ -377,7 +377,7 @@ def deep_filter_apply(spec, coefs, alpha, df_bins, df_order):
 
 class DeepFilterNet2(nn.Module):
     """
-    DeepFilterNet2 adapted for 16kHz / n_fft=512.
+    DeepFilterNet2 with config-driven sample rate and FFT size.
 
     Inputs (from extract_dfn2_features):
         spec      : (B, n_bins, T) complex

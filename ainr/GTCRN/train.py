@@ -33,15 +33,26 @@ class PackedDataset(Dataset):
     Pass mmap=True on shared servers to keep data on disk (OS page cache)
     instead of loading the full tensor into RAM.
     """
-    def __init__(self, pt_path: str, mmap: bool = False):
+    def __init__(self, pt_path: str, mmap: bool = False, expected_sr: int = None):
         if not os.path.isfile(pt_path):
             raise FileNotFoundError(f"Packed dataset not found: {pt_path}")
         print(f"PackedDataset: loading {pt_path} (mmap={mmap}) ...")
         obj = torch.load(pt_path, map_location='cpu', mmap=mmap, weights_only=True)
+        if 'sr' not in obj:
+            raise ValueError(f"Packed dataset has no sample-rate metadata: {pt_path}")
+        self.sr = int(obj['sr'])
+        if expected_sr is not None and self.sr != expected_sr:
+            raise ValueError(
+                f"Packed dataset SR={self.sr}, but config requires SR={expected_sr}: {pt_path}"
+            )
         self.data = obj['data']   # (N, 2, T)
+        if self.data.ndim != 3 or self.data.shape[1] != 2:
+            raise ValueError(
+                f"Packed dataset must have shape (N, 2, T), got {tuple(self.data.shape)}"
+            )
         N, _, T = self.data.shape
         size_mb = self.data.nbytes / 1024 ** 2
-        print(f"PackedDataset: {N} pairs, T={T}, {size_mb:.0f} MB")
+        print(f"PackedDataset: {N} pairs, T={T}, SR={self.sr}, {size_mb:.0f} MB")
 
     def __len__(self):
         return self.data.shape[0]
@@ -56,16 +67,14 @@ class PackedDataset(Dataset):
 # ============================================================
 
 def si_snr(pred, target, eps=1e-8):
-    """Scale-Invariant SNR. Input: (B, T). Returns (B,)."""
-    pred = pred - pred.mean(dim=-1, keepdim=True)
-    target = target - target.mean(dim=-1, keepdim=True)
+    """GTCRN paper/GitHub scale-invariant SNR. Input/return shape: (B, T)/(B,)."""
     s_target = (
         (pred * target).sum(dim=-1, keepdim=True)
         / (target.pow(2).sum(dim=-1, keepdim=True) + eps)
         * target
     )
     e_noise = pred - s_target
-    return 10 * torch.log10(
+    return torch.log10(
         s_target.pow(2).sum(dim=-1) / (e_noise.pow(2).sum(dim=-1) + eps) + eps
     )
 
@@ -80,10 +89,11 @@ class HybridLoss(nn.Module):
         pred_mag = torch.sqrt(pred_spec[..., 0] ** 2 + pred_spec[..., 1] ** 2 + 1e-12)
         true_mag = torch.sqrt(true_spec[..., 0] ** 2 + true_spec[..., 1] ** 2 + 1e-12)
 
-        pred_real_n = pred_spec[..., 0] / (pred_mag + 1e-12)
-        true_real_n = true_spec[..., 0] / (true_mag + 1e-12)
-        pred_imag_n = pred_spec[..., 1] / (pred_mag + 1e-12)
-        true_imag_n = true_spec[..., 1] / (true_mag + 1e-12)
+        # Official GTCRN complex compression: S / |S|^0.7.
+        pred_real_n = pred_spec[..., 0] / pred_mag.pow(0.7)
+        true_real_n = true_spec[..., 0] / true_mag.pow(0.7)
+        pred_imag_n = pred_spec[..., 1] / pred_mag.pow(0.7)
+        true_imag_n = true_spec[..., 1] / true_mag.pow(0.7)
 
         spec_loss = (
             F.mse_loss(pred_real_n, true_real_n)
@@ -152,11 +162,13 @@ def train(args):
             raise FileNotFoundError(f"No .pt files found in {packed_dir}")
         if len(pt_files) > 1:
             from torch.utils.data import ConcatDataset
-            dataset = ConcatDataset([PackedDataset(p, mmap=args.mmap) for p in pt_files])
+            dataset = ConcatDataset([
+                PackedDataset(p, mmap=args.mmap, expected_sr=SR) for p in pt_files
+            ])
         else:
-            dataset = PackedDataset(pt_files[0], mmap=args.mmap)
+            dataset = PackedDataset(pt_files[0], mmap=args.mmap, expected_sr=SR)
     else:
-        dataset = PackedDataset(packed_dir, mmap=args.mmap)
+        dataset = PackedDataset(packed_dir, mmap=args.mmap, expected_sr=SR)
     n_val = max(2, int(len(dataset) * 0.05))
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val])
@@ -211,14 +223,14 @@ def train(args):
                 clean = clean.to(device)
                 T = noisy.shape[-1]
 
-                noisy_spec = torch.stft(
+                noisy_spec = torch.view_as_real(torch.stft(
                     noisy, N_FFT, HOP_LEN, WIN_LEN,
-                    window=stft_window, return_complex=False,
-                )  # (B, F, T_f, 2)
-                clean_spec = torch.stft(
+                    window=stft_window, return_complex=True,
+                ))  # (B, F, T_f, 2)
+                clean_spec = torch.view_as_real(torch.stft(
                     clean, N_FFT, HOP_LEN, WIN_LEN,
-                    window=stft_window, return_complex=False,
-                )
+                    window=stft_window, return_complex=True,
+                ))
 
                 enhanced_spec = model(noisy_spec)   # (B, F, T_f, 2)
 
@@ -254,14 +266,14 @@ def train(args):
                 clean = clean.to(device)
                 T = noisy.shape[-1]
 
-                noisy_spec = torch.stft(
+                noisy_spec = torch.view_as_real(torch.stft(
                     noisy, N_FFT, HOP_LEN, WIN_LEN,
-                    window=stft_window, return_complex=False,
-                )
-                clean_spec = torch.stft(
+                    window=stft_window, return_complex=True,
+                ))
+                clean_spec = torch.view_as_real(torch.stft(
                     clean, N_FFT, HOP_LEN, WIN_LEN,
-                    window=stft_window, return_complex=False,
-                )
+                    window=stft_window, return_complex=True,
+                ))
                 enhanced_spec = model(noisy_spec)
 
                 enh_c = torch.view_as_complex(
@@ -279,17 +291,19 @@ def train(args):
         print(f"Epoch {epoch}: train={train_loss:.4f}  val={val_loss:.4f}  lr={lr_now:.2e}")
 
         # Save checkpoint
+        is_best = val_loss < best_val_loss
+        checkpoint_best = min(best_val_loss, val_loss)
         ckpt = {
             'epoch': epoch,
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
-            'best_val_loss': best_val_loss,
+            'best_val_loss': checkpoint_best,
             'config': dict(cfg['signal']),
         }
         torch.save(ckpt, os.path.join(output_dir, 'gtcrn_last.pth'))
 
-        if val_loss < best_val_loss:
+        if is_best:
             best_val_loss = val_loss
             no_improve = 0
             torch.save(ckpt, os.path.join(output_dir, 'gtcrn_best.pth'))

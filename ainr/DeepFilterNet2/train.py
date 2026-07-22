@@ -30,11 +30,13 @@ def _stft_loss_single(pred, target, n_fft, hop_size, win_size, gamma=0.3):
     window = torch.hann_window(win_size, device=pred.device)
     P = torch.stft(pred,   n_fft, hop_size, win_size, window, return_complex=True).abs()
     T = torch.stft(target, n_fft, hop_size, win_size, window, return_complex=True).abs()
-    # Compressed magnitude MSE
-    return F.mse_loss(P ** gamma, T ** gamma)
+    # Clamp before fractional power: d(x**gamma)/dx is singular at x=0 for gamma<1.
+    P = P.clamp_min(1e-12).pow(gamma)
+    T = T.clamp_min(1e-12).pow(gamma)
+    return F.mse_loss(P, T)
 
 
-def multi_res_stft_loss(pred, target, fft_sizes=(512, 256, 1024),
+def multi_res_stft_loss(pred, target, fft_sizes=(256, 512, 1024, 2048),
                         hop_sizes=None, win_sizes=None, gamma=0.3):
     if hop_sizes is None:
         hop_sizes = [s // 4 for s in fft_sizes]
@@ -59,15 +61,26 @@ class PackedDataset(Dataset):
     Pass mmap=True on shared servers to keep data on disk (OS page cache)
     instead of loading the full tensor into RAM.
     """
-    def __init__(self, pt_path: str, mmap: bool = False):
+    def __init__(self, pt_path: str, mmap: bool = False, expected_sr: int = None):
         if not os.path.isfile(pt_path):
             raise FileNotFoundError(f"Packed dataset not found: {pt_path}")
         print(f"PackedDataset: loading {pt_path} (mmap={mmap}) ...")
         obj = torch.load(pt_path, map_location='cpu', mmap=mmap, weights_only=True)
+        if 'sr' not in obj:
+            raise ValueError(f"Packed dataset has no sample-rate metadata: {pt_path}")
+        self.sr = int(obj['sr'])
+        if expected_sr is not None and self.sr != expected_sr:
+            raise ValueError(
+                f"Packed dataset SR={self.sr}, but config requires SR={expected_sr}: {pt_path}"
+            )
         self.data = obj['data']   # (N, 2, T)
+        if self.data.ndim != 3 or self.data.shape[1] != 2:
+            raise ValueError(
+                f"Packed dataset must have shape (N, 2, T), got {tuple(self.data.shape)}"
+            )
         N, _, T = self.data.shape
         size_mb = self.data.nbytes / 1024 ** 2
-        print(f"PackedDataset: {N} pairs, T={T}, {size_mb:.0f} MB")
+        print(f"PackedDataset: {N} pairs, T={T}, SR={self.sr}, {size_mb:.0f} MB")
 
     def __len__(self):
         return self.data.shape[0]
@@ -218,7 +231,7 @@ def train(args):
 
     # Multi-res STFT loss params
     fft_sizes = [int(s) for s in cfg.get('perceptual_loss', 'fft_sizes',
-                                          fallback='512,256,1024').split(',')]
+                                          fallback='256,512,1024,2048').split(',')]
     gamma     = cfg.getfloat('perceptual_loss', 'gamma', fallback=0.3)
 
     if args.gpu is not None:
@@ -238,11 +251,13 @@ def train(args):
             raise FileNotFoundError(f"No .pt files found in {packed_dir}")
         if len(pt_files) > 1:
             from torch.utils.data import ConcatDataset
-            dataset = ConcatDataset([PackedDataset(p, mmap=args.mmap) for p in pt_files])
+            dataset = ConcatDataset([
+                PackedDataset(p, mmap=args.mmap, expected_sr=SR) for p in pt_files
+            ])
         else:
-            dataset = PackedDataset(pt_files[0], mmap=args.mmap)
+            dataset = PackedDataset(pt_files[0], mmap=args.mmap, expected_sr=SR)
     else:
-        dataset = PackedDataset(packed_dir, mmap=args.mmap)
+        dataset = PackedDataset(packed_dir, mmap=args.mmap, expected_sr=SR)
     n_val = max(2, int(len(dataset) * 0.05))
     n_train = len(dataset) - n_val
     train_set, val_set = random_split(dataset, [n_train, n_val])
@@ -367,17 +382,19 @@ def train(args):
         lr_now = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch}: train={train_loss:.4f}  val={val_loss:.4f}  lr={lr_now:.2e}")
 
+        is_best = val_loss < best_val_loss
+        checkpoint_best = min(best_val_loss, val_loss)
         ckpt = {
             'epoch': epoch,
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
-            'best_val_loss': best_val_loss,
+            'best_val_loss': checkpoint_best,
             'config': {k: dict(v) for k, v in cfg.items() if k != 'DEFAULT'},
         }
         torch.save(ckpt, os.path.join(output_dir, 'dfn2_last.pth'))
 
-        if val_loss < best_val_loss:
+        if is_best:
             best_val_loss = val_loss
             no_improve = 0
             torch.save(ckpt, os.path.join(output_dir, 'dfn2_best.pth'))

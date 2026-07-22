@@ -58,10 +58,10 @@ def process_file(input_path, output_path, model, params):
     T = audio.shape[-1]
 
     window = torch.hann_window(WIN_LEN).pow(0.5)
-    noisy_spec = torch.stft(
+    noisy_spec = torch.view_as_real(torch.stft(
         audio.unsqueeze(0), N_FFT, HOP_LEN, WIN_LEN,
-        window=window, return_complex=False,
-    )  # (1, F, T_f, 2)
+        window=window, return_complex=True,
+    ))  # (1, F, T_f, 2)
 
     with torch.no_grad():
         enhanced_spec = model(noisy_spec)   # (1, F, T_f, 2)
