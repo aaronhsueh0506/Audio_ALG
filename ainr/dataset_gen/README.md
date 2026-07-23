@@ -2,9 +2,8 @@
 
 Model-independent generator for (noisy, clean) speech-enhancement training
 pairs, living at `ainr/dataset_gen/`. Extracted from the RNNoise-ERB
-dataset-generation chain so the same augmented corpus can be reused across
-multiple models (RNNoise-ERB today, GTCRN next, others later) without
-re-running the whole augmentation pipeline per model.
+dataset-generation chain so one generator can serve multiple models:
+RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2 at 48 kHz.
 
 ## Purpose
 
@@ -16,16 +15,29 @@ particular model's architecture, feature extraction, or training loop. Model
 training scripts (e.g. RNNoise-ERB's `train.py`) live in their own model repo
 and consume the output of this package.
 
-## Design: 48k master + model-side resample
+## Design: one selected sample rate per run
 
-**Decision:** generate the augmented dataset **once**, at a canonical high
-sample rate (48 kHz "master"), independent of any model's target rate. Each
-model then resamples its own copy at pack-time (`resample_dataset.py`) to
-whatever rate it actually trains at (e.g. 16 kHz for RNNoise-ERB). This
-makes dataset generation model-independent and reusable: regenerating the
-whole augmented corpus (RIR convolution, SNR mixing, etc. — the expensive
-part) is no longer needed every time a new model with a different input rate
-comes along; only a cheap resample pass is.
+Each invocation generates exactly one dataset at the requested working rate.
+Use config.ini's `[signal] sr` or override it with `--sample-rate`:
+
+```text
+16000 Hz → RNNoise-ERB / GTCRN
+48000 Hz → DeepFilterNet2
+```
+
+Run the command separately with different output directories when both are
+needed. These are independent augmentation runs, not synchronized copies.
+`resample_dataset.py` remains available when a downsampled copy of an existing
+dataset is explicitly preferred.
+
+### RIR / DRR contract
+
+The RIR path follows DeepFilterNet's `RandReverbSim` conventions: full and
+late-suppressed target RIRs are independently L2-normalized, and SNR is
+measured against the clean target while the mixture contains the full-RIR
+speech. `drr = 0.3` is a linear dry/reverberant blend factor in `[0, 1]`, not
+a dB value. The dry target is delayed to the trimmed RIR's direct-path peak so
+target and reverberant mixture do not acquire a pre-delay mismatch.
 
 ### Where the working rate actually comes from (honest finding)
 
@@ -51,13 +63,10 @@ RNNoise-ERB-shaped (16 kHz) even though nothing about the augmentation logic
 requires that.
 
 This extraction makes that contract **explicit** instead of implicit:
-- `gen_dataset.py` gained a `--sample-rate` CLI flag (default **48000**) that
-  overrides `config.ini`'s `[signal] sr` at runtime, so the canonical rate is
-  a first-class, visible generation parameter instead of a config file value
-  you have to go read `dataset.py` to understand the significance of.
-- `config.example.ini`'s `[signal] sr` default was changed to `48000` to
-  match (it's overridden by `--sample-rate` regardless, but should not lie
-  about the intended default when read standalone).
+- `gen_dataset.py --sample-rate` overrides config.ini's `[signal] sr`.
+- Omitting the CLI flag genuinely uses the config value.
+- `config.example.ini` uses 48000 as its example; change it to 16000 or pass
+  `--sample-rate 16000` for RNNoise-ERB/GTCRN.
 
 One additional coupling was found and removed: `DNS4Dataset._compute_erb_bands`
 used to lazily `from train import compute_hybrid_bands, compute_erb_bands` —
@@ -78,8 +87,10 @@ augmentation logic itself).
 | `gen_dataset.py` | CLI entry point — offline pre-generation of `(noisy, clean)` WAV pairs |
 | `dataset.py` | `DNS4Dataset` — the augmentation engine (biquad filters, RIR/RT60, SNR mixing, bandwidth limiting, clipping) |
 | `pack_dataset.py` | Packs a WAV-pair directory into a single `.pt` tensor file (removes per-file I/O overhead for small/medium datasets) |
-| `resample_dataset.py` | **New.** Model-side pack-stage resample: 48k master → any target rate, once, offline |
+| `packed_dataset.py` | Shared mmap-capable loader for packed `(N, 2, T)` tensors |
+| `resample_dataset.py` | Optional standalone resample of an existing dataset |
 | `config.example.ini` | Example config (copy to `config.ini` and edit `[paths]` for your corpus) |
+| `tests/` | Hours, worker seed, RIR delay and resample-length regression tests |
 
 `train.py` is **not** part of this package — it stays in the model repo
 (RNNoise-ERB) since it's model-specific (architecture, loss, optimizer). It
@@ -88,42 +99,55 @@ currently reads the same `config.ini` format and consumes WAV pairs / packed
 
 ## CLI usage
 
-### 1. Generate the 48k master dataset
+### 1. Generate the selected model dataset
 
 ```bash
 cp config.example.ini config.ini
 # edit [paths] speech_dir / noise_dir / rir_dir to point at your corpus (e.g. DNS4)
 
-python3 gen_dataset.py --config config.ini --output data/ --hours 25
-python3 gen_dataset.py --config config.ini --output data/ --hours 50 --workers 4
-python3 gen_dataset.py --config config.ini --output data/ --hours 25 --sample-rate 48000
+# RNNoise-ERB / GTCRN
+python3 gen_dataset.py --config config.ini --output data_16k --hours 25 \
+    --sample-rate 16000
+
+# DeepFilterNet2
+python3 gen_dataset.py --config config.ini --output data_48k --hours 25 \
+    --sample-rate 48000
 ```
 
-Output layout:
+Each command creates:
 ```
-data/
-  pairs/000000.wav, 000001.wav, ...   # 2-channel WAV: ch0=noisy, ch1=clean
-  meta.json                            # n_samples, sr, segment_sec, ...
+data_16k/ or data_48k/
+  meta.json
+  pairs/000000.wav, 000001.wav, ...
 ```
+
+Each WAV is 2-channel: ch0=noisy, ch1=clean.
 
 Useful flags: `--resume` (continue an interrupted batch), `--start-idx` /
 `[gen] start_idx` (extend an existing dataset without overwriting or
-re-sampling old data — `effective_seed = --seed + start_idx`), `--seed`
-(default 42, `-1` to disable).
+re-sampling old data — `effective_seed = seed + start_idx`), and `--seed`.
+The default `[gen] seed = -1` requests a fresh OS-generated seed every run;
+the actual seed is printed and stored in `meta.json`. Pass a non-negative
+seed such as `--seed 42` for reproducibility. DataLoader workers are seeded
+independently from that run seed, so workers do not repeat the same Python or
+NumPy random stream.
 
-### 2. Resample for a specific model (pack-stage, once)
+`--hours` is converted directly to a whole-segment count:
+`ceil(hours × 3600 / segment_sec)`. It therefore exceeds the requested
+duration by less than one segment. It is not rounded to a complete
+`DNS4Dataset` epoch; when necessary, the final dataset pass is partial.
+
+### 2. Optional: resample an existing dataset
 
 ```bash
-python3 resample_dataset.py --input data/ --output data_16k/ --target-sr 16000
-python3 resample_dataset.py --input data/ --output data_16k/ --target-sr 16000 --workers 4
+python3 resample_dataset.py \
+    --input data_48k --output data_16k --target-sr 16000 --workers 4
 ```
 
-This produces a byte-for-byte independent copy of the dataset at the target
+This produces an independent copy of the dataset at the target
 rate, preserving directory structure, filenames, and the 2-channel
 noisy/clean pair layout, plus an updated `meta.json` (`sr` set to the target
-rate, original rate recorded as `source_sr`). Point the model's training
-loader at `data_16k/` instead of `data/` — **zero resample cost at train
-time**, for every epoch, forever.
+rate and records the original rate as `source_sr`.
 
 ### Resample guidance (anti-aliasing parameters)
 
@@ -154,11 +178,22 @@ near-full-scale content). If a resampled pair's peak exceeds `0.999`,
 `torchaudio.save`'s int16 write clip silently. The final run summary reports
 how many files needed this and the overall peak level observed.
 
-### 3. (Optional) Pack into a single tensor file
+### 3. Pack the generated datasets
 
 ```bash
-python3 pack_dataset.py --input data_16k/pairs/ --output data_16k/packed.pt
-python3 pack_dataset.py --input data_16k/pairs/ --output data_16k/packed.pt --dtype float16
+python3 pack_dataset.py \
+    --input data_16k/pairs --output data_16k/packed.pt --dtype float16
+python3 pack_dataset.py \
+    --input data_48k/pairs --output data_48k/packed.pt --dtype float16
+```
+
+Use `data_16k/packed.pt` for RNNoise-ERB and `data_48k/packed.pt` for
+DeepFilterNet2.
+
+### Tests
+
+```bash
+make test
 ```
 
 ## Requirements
@@ -170,11 +205,8 @@ numpy
 tqdm
 ```
 
-## Status / later arc
+## Consumers
 
-The sibling model repo `../RNNoise-ERB/` still has its own copies of
-`gen_dataset.py`, `dataset.py`, `pack_dataset.py`, `config.ini` — this
-extraction copied them out without touching or deleting the originals. A
-later arc will switch `../RNNoise-ERB/train.py` (and any operator docs /
-scripts) to point at this package instead of its local copies; that
-switchover is out of scope here.
+`../RNNoise-ERB/train.py` imports the shared `PackedDataset` from this package;
+DeepFilterNet2 consumes the corresponding 48 kHz packed copy. Model
+directories do not keep private copies of the augmentation engine.

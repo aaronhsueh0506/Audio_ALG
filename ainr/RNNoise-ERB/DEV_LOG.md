@@ -1,5 +1,25 @@
 # RNNoise-ERB 開發紀錄
 
+## 2026-07 — dataset_gen 單一來源與目錄清理
+
+- `dataset_gen/gen_dataset.py` 每次產生一種指定 sample rate；
+  `[signal] sr` 可由 `--sample-rate` 覆寫。16 kHz 供 RNNoise-ERB/GTCRN，
+  48 kHz 供 DeepFilterNet2。
+- generator 預設使用 OS 產生的新 seed；指定非負 `--seed` 時才固定可重現。
+- 修正 RIR pre-delay：DRR target 的 dry path 會對齊 trimmed RIR direct peak。
+- RIR full/target kernel 分別做 L2 normalization；noise SNR 改以 clean target
+  RMS 為基準，與 DeepFilterNet `RandReverbSim` / `mix_audio_signal` 對齊。
+- 刪除 RNNoise-ERB 內重複的 `dataset.py`、`gen_dataset.py`、
+  `pack_dataset.py`；augmentation、指定-rate generation、resample 與
+  packing 統一由 `../dataset_gen/` 維護。
+- packed tensor loader 移到共用 `dataset_gen.packed_dataset`；RNNoise
+  training 只保留模型與訓練責任。
+- generation-only config sections 從模型 `config.ini` 移除，改用
+  `../dataset_gen/config.ini`。
+- 仍有效的 Python regression tests 收進 `tests/`；四個測試分別保護
+  feature constants、normalization/model shapes、DF3 loss/pure-noise 與
+  Python/C golden-vector parity，沒有可安全刪除的重複測試。
+
 ## 2026-07 — DeepFilterNet 3 MultiResSpecLoss-only
 
 - 移除 direct ERB IRM、speech-active frame weight 與 `f_under`；訓練 total loss

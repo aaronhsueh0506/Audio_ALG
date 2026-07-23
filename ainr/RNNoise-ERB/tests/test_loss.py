@@ -2,12 +2,16 @@
 """Regression tests for the DeepFilterNet 3 MultiResSpecLoss training objective."""
 
 import configparser
-import os
+import pathlib
+import sys
 
 import torch
 import torch.nn.functional as F
 
-from train import (
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from train import (  # noqa: E402
     LOSS_VERSION,
     MultiResSpecLoss,
     RNNoiseModel,
@@ -21,9 +25,6 @@ from train import (
     require_checkpoint_loss_config,
     stft,
 )
-
-
-ROOT = os.path.dirname(os.path.abspath(__file__))
 
 
 def reference_df3_mrsl(enhanced, clean, fft_sizes, gamma, factor, factor_complex):
@@ -48,7 +49,7 @@ def reference_df3_mrsl(enhanced, clean, fft_sizes, gamma, factor, factor_complex
 
 def test_config_is_df3_production_mrsl():
     cfg = configparser.ConfigParser()
-    assert cfg.read(os.path.join(ROOT, 'config.ini'))
+    assert cfg.read(ROOT / 'config.ini')
     loss_cfg = read_loss_config(cfg)
     assert LOSS_VERSION == 'df3_multi_res_spec_only_gamma_0.3_v1'
     assert loss_cfg == {
@@ -73,7 +74,7 @@ def test_matches_upstream_formula():
 
 def test_checkpoint_gate_rejects_legacy_objective():
     cfg = configparser.ConfigParser()
-    assert cfg.read(os.path.join(ROOT, 'config.ini'))
+    assert cfg.read(ROOT / 'config.ini')
     loss_cfg = read_loss_config(cfg)
     saved = {
         'loss_version': LOSS_VERSION,
@@ -117,7 +118,7 @@ def test_silent_pair_is_zero_and_backward_safe():
 
 def test_pure_noise_end_to_end_model_backward():
     cfg = configparser.ConfigParser()
-    assert cfg.read(os.path.join(ROOT, 'config.ini'))
+    assert cfg.read(ROOT / 'config.ini')
     sr = cfg.getint('signal', 'sr')
     n_fft = cfg.getint('signal', 'n_fft')
     win_len = cfg.getint('signal', 'win_len', fallback=n_fft)

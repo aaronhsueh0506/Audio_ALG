@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 """
-Model-side resample: "pack-stage resample once" from a canonical-rate dataset
-(as produced by gen_dataset.py, default 48 kHz master) down/up to a specific
-model's target sample rate, so per-epoch training dataloaders never pay a
-resample cost. See README.md for the overall 48k-master design.
+Model-side resample: "pack-stage resample once" from a dataset produced by
+gen_dataset.py down/up to a specific model's target sample rate, so per-epoch
+training dataloaders never pay a resample cost. See README.md for the overall
+generation-rate design.
 
 Anti-aliasing: uses torchaudio.functional.resample with the Kaiser-windowed
 sinc-interpolation kernel ("sinc_interp_kaiser") — the "kaiser_best" preset
@@ -23,8 +20,8 @@ prioritized over speed. --quality fast (kaiser_fast) is offered only for
 quick smoke tests.
 
 Usage:
-    python3 resample_dataset.py --input data/ --output data_16k/ --target-sr 16000
-    python3 resample_dataset.py --input data/ --output data_16k/ --target-sr 16000 --workers 4
+    python3 resample_dataset.py --input data_48k/ --output data_16k/ \
+        --target-sr 16000 --workers 4
 
 Preserves:
     - directory structure (relative to --input) and filenames
@@ -57,6 +54,12 @@ KAISER_FAST = dict(
     resampling_method="sinc_interp_kaiser",
     beta=8.555504641634386,
 )
+CLIP_GUARD = 0.999
+
+
+def resampled_num_frames(num_frames: int, source_sr: int, target_sr: int) -> int:
+    """Match torchaudio resampling's ceil-based output-length contract."""
+    return (num_frames * target_sr + source_sr - 1) // source_sr
 
 
 class _ResampleJob(data.Dataset):
@@ -71,7 +74,7 @@ class _ResampleJob(data.Dataset):
     """
 
     def __init__(self, in_paths, out_paths, target_sr, resample_kwargs,
-                clip_guard: float = 0.999):
+                clip_guard: float = CLIP_GUARD):
         self.in_paths = in_paths
         self.out_paths = out_paths
         self.target_sr = target_sr
@@ -117,8 +120,7 @@ class _ResampleJob(data.Dataset):
 
 
 def _scan_wavs(input_dir):
-    """Recursively find *.wav under input_dir (mirrors gen_dataset.py's pairs/
-    layout and dataset.py's WavPairDataset scan pattern)."""
+    """Recursively find WAV pairs under a generated dataset directory."""
     return sorted(glob.glob(os.path.join(input_dir, '**', '*.wav'), recursive=True))
 
 
@@ -172,6 +174,16 @@ def resample_dataset(args):
             meta = json.load(f)
         meta['source_sr'] = meta.get('sr')
         meta['sr'] = args.target_sr
+        if meta.get('segment_samples') is not None and meta['source_sr']:
+            meta['segment_samples'] = resampled_num_frames(
+                int(meta['segment_samples']),
+                int(meta['source_sr']),
+                args.target_sr,
+            )
+        elif meta.get('segment_sec') is not None:
+            meta['segment_samples'] = int(
+                round(float(meta['segment_sec']) * args.target_sr)
+            )
         meta['resampled_from'] = os.path.abspath(args.input)
         meta['resample_quality'] = args.quality
         with open(os.path.join(args.output, 'meta.json'), 'w') as f:
@@ -188,8 +200,8 @@ if __name__ == '__main__':
         description='Resample a generated (noisy, clean) WAV-pair dataset to a '
                     'model-specific target sample rate (pack-stage, resample-once)')
     parser.add_argument('--input', required=True,
-                        help='Input dataset dir (gen_dataset.py output, e.g. data/ '
-                            'or data/pairs/; scanned recursively for *.wav)')
+                        help='Input dataset root (e.g. data_48k); scanned '
+                             'recursively for *.wav')
     parser.add_argument('--output', required=True,
                         help='Output directory for the resampled copy (mirrors input '
                             'directory structure and filenames)')

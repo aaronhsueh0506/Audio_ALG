@@ -1,6 +1,3 @@
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 """
 RNNoise v0.2-inspired 噪音抑制模型 — 訓練腳本
 採用 Conv+GRU 骨架，並改為 config-driven / ERB+complex dual-input /
@@ -18,6 +15,7 @@ import configparser
 import glob
 import os
 import random
+import sys
 
 import numpy as np
 import torch
@@ -26,7 +24,11 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler, Sampler, Subset
 import tqdm
 
-from dataset import PackedDataset
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+_AINR_ROOT = os.path.dirname(_THIS_DIR)
+sys.path.insert(0, _AINR_ROOT)
+
+from dataset_gen import PackedDataset  # noqa: E402
 
 
 # Feature semantics are intentionally versioned.  v3 keeps the two input shapes
@@ -951,7 +953,6 @@ def train(args):
 
                     # On-the-fly STFT
                     noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
-                    clean_spec = stft(clean_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
                     # (B, n_bins, n_frames)
 
                     # Dual features + zero-pad time so both k=3 branches emit
@@ -1009,7 +1010,6 @@ def train(args):
                         device=device, dtype=torch.float32, non_blocking=pin_memory)
 
                     noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
-                    clean_spec = stft(clean_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
                     erb_features, spec_features, _, _ = extract_model_features(
                         noisy_spec, ERB_FWD, FEATURE_CFG)
                     pad_left, pad_right = 2 - LOOKAHEAD, LOOKAHEAD
@@ -1101,10 +1101,9 @@ if __name__ == '__main__':
                         help='覆蓋 config 中的 device 設定')
     parser.add_argument('--gpu', type=int, default=None,
                         help='指定 GPU ID (例: --gpu 0)')
-    parser.add_argument('--precomputed', default=None,
-                        help='預生成資料目錄 (.pt shard 格式, 舊版)')
     parser.add_argument('--packed-dir', default=None,
-                        help='包含 .pt 檔的資料夾，自動掃描全部 (pack_dataset.py 產生)')
+                        help='包含 .pt 檔的資料夾，自動掃描全部 '
+                             '(../dataset_gen/pack_dataset.py 產生)')
     parser.add_argument('--packed-data', default=None, nargs='+',
                         help='指定 .pt 檔，可多個；與 --packed-dir 可同時使用')
     parser.add_argument('--resume', default=None,

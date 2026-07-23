@@ -1,7 +1,4 @@
 # -*- coding: utf-8 -*-
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
 """
 把 WAV pair 目錄打包成單一 .pt 檔，消除訓練時的逐檔 I/O 開銷。
 

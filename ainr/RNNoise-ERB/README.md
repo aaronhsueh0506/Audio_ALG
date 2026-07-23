@@ -131,25 +131,34 @@ output_dir = ./output
 
 ## 訓練
 
-目前訓練只接受 `pack_dataset.py` 產生的 raw noisy/clean WAV tensor；STFT、
-log-ERB 與 runtime normalization 會在訓練時即時計算。完整流程：
+目前訓練只接受共用 `../dataset_gen/pack_dataset.py` 產生的 raw
+noisy/clean WAV tensor；STFT、log-ERB 與 runtime normalization 會在訓練時
+即時計算。資料增強、指定 sample-rate 的 WAV generation、resample 與
+packing 全部由 `../dataset_gen/` 維護，RNNoise-ERB 不再保存重複版本。
 
 訓練 objective 僅使用 DeepFilterNet 3 的 `MultiResSpecLoss`：FFT sizes
 256/512/1024/2048、γ=0.3，compressed magnitude 與 complex MSE 的 factor
 都是 500。沒有 ERB IRM、speech-activity/VAD 加權或 pure-noise 特別分支。
 
 ```bash
-# Step 1: 產生 2-channel WAV pairs（ch0=noisy, ch1=clean）
-python3 gen_dataset.py --config config.ini --output data --hours 25 --workers 4
+# Step 0: 建立 dataset_gen 專用設定並填入 speech/noise/RIR paths
+cp ../dataset_gen/config.example.ini ../dataset_gen/config.ini
 
-# Step 2: 打包，避免訓練時逐 WAV I/O；大型資料建議保留 float16
-python3 pack_dataset.py --input data/pairs --output data/packed.pt --dtype float16
+# Step 1: 產生 RNNoise-ERB 專用的 16 kHz dataset
+python3 ../dataset_gen/gen_dataset.py \
+    --config ../dataset_gen/config.ini --output data_16k --hours 25 \
+    --sample-rate 16000 --workers 4
+
+# Step 2: 打包
+python3 ../dataset_gen/pack_dataset.py \
+    --input data_16k/pairs --output data_16k/packed.pt --dtype float16
 
 # Step 3: 訓練
-python3 train.py --config config.ini --packed-data data/packed.pt
+python3 train.py --config config.ini --packed-data data_16k/packed.pt
 
 # 可選：指定 GPU、降低 RAM、或載入同一目錄下多個 packed files
-python3 train.py --config config.ini --packed-dir data/packed_shards --gpu 0 --mmap
+python3 train.py --config config.ini \
+    --packed-dir data_16k/packed_shards --gpu 0 --mmap
 ```
 
 `--mmap` 模式不會在 `__getitem__` 逐筆展開成 float32；FP16 batch 送到 GPU
@@ -158,22 +167,23 @@ random access page fault。`config.ini` 的 `mmap_block_size`、
 `mmap_num_workers`、`prefetch_factor` 可依磁碟速度與共用 RAM 調整；預設
 256 / 2 / 2 是偏向低 RAM 的起點。
 
-`gen_dataset.py` 常用參數：
+`../dataset_gen/gen_dataset.py` 常用參數：
 
 | 參數 | 預設值 | 說明 |
 |------|--------|------|
-| `--hours` | 8.3 | 目標音檔總時數（自動 round 到最近整數倍 epoch） |
+| `--hours` | 8.3 | 目標音檔總時數；最多只向上補一個完整 segment |
 | `--output` | `data` | 輸出目錄 |
+| `--sample-rate` | config | 此次 generation rate；RNNoise 使用 16000 |
 | `--workers` | 4 | DataLoader workers；0 表示單程序 |
 | `--resume` | false | 從 `pairs/` 最大編號後繼續寫入 |
-| `--seed` | 42 | 隨機種子（-1 關閉） |
+| `--seed` | config | 負數為每次 OS-random；非負數可重現 |
 
 ### 從斷點續訓
 
 訓練中途中斷後，可以從最後的 checkpoint 繼續：
 
 ```bash
-python3 train.py --config config.ini --packed-data data/packed.pt \
+python3 train.py --config config.ini --packed-data data_16k/packed.pt \
     --resume output/rnnoise_epoch5.pth
 ```
 
@@ -244,14 +254,13 @@ python3 export_erb_matrix.py --config config.ini --format all
 | 檔案 | 說明 |
 |------|------|
 | `train.py` | 模型定義與 packed raw-WAV tensor 訓練迴圈 |
-| `gen_dataset.py` | 離線產生 2-channel noisy/clean WAV pairs |
-| `pack_dataset.py` | 將 WAV pairs 打包成訓練用 `.pt` tensor |
-| `dataset.py` | DNS4 augmentation 與 packed/WAV dataset readers |
 | `denoise.py` | 推論腳本（單檔降噪） |
 | `export_onnx.py` | ONNX 匯出（streaming 推論格式） |
 | `export_erb_matrix.py` | ERB 矩陣匯出（npy / C header） |
 | `config.ini` | 所有超參數設定 |
 | `process.c` / `process.h` | C 前後處理實作（嵌入式部署用） |
+| `tests/` | Python feature、loss、checkpoint 與 Python/C parity tests |
+| `../dataset_gen/` | 共用 augmentation、WAV generation、resample、packing 與 packed loader |
 | `requirements.txt` | Python 依賴套件 |
 
 ## 表格 drift-guard(C 部署表格的兩層契約)
@@ -281,5 +290,5 @@ make test-feature-python  # 需 torch training environment
 C test 會以獨立 recurrence 對照 `rnnoise_compute_features()`，並讓固定非平坦
 spectrum 運行 4096 frames，確認 ERB mean norm 收旂為 0，complex 路徑仍非零。
 Python test 另驗證兩路 state/chunk equivalence、ERB 穩態收旂、complex 穩態可觀測性、
-雙路 shape 與 model forward contract；`test_python_c_features.py` 以 golden vectors 對照
-Python/C 的 STFT、雙路特徵與最終 normalization state。
+雙路 shape 與 model forward contract；`tests/test_python_c_features.py` 以
+golden vectors 對照 Python/C 的 STFT、雙路特徵與最終 normalization state。

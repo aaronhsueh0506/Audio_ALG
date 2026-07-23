@@ -52,6 +52,7 @@ CFLAGS    += $(FP_POLICY)
 CFG_SIG_PAYLOAD := CC=$(CC) CFLAGS=$(CFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 BUILD_DIR = build/$(CFG_SIG)
+PY_TEST_DIR = tests
 
 .PHONY: test test-tables test-features test-feature-contract test-feature-python test-loss-python clean _cfg_guard
 _cfg_guard:
@@ -79,7 +80,7 @@ test: test-tables test-feature-contract test-features
 
 test-feature-contract:
 	@echo "== rnnoise config/Python/C feature contract =="
-	python3 test_feature_contract.py
+	python3 $(PY_TEST_DIR)/test_feature_contract.py
 
 test-features: $(BUILD_DIR)/test_rnnoise_features
 	@echo "== rnnoise feature-state contract =="
@@ -89,11 +90,11 @@ test-features: $(BUILD_DIR)/test_rnnoise_features
 # `make test` so the dependency-free embedded C checks remain runnable on hosts
 # that intentionally do not install PyTorch.
 test-feature-python:
-	python3 test_feature_norm.py
-	python3 test_python_c_features.py
+	python3 $(PY_TEST_DIR)/test_feature_norm.py
+	python3 $(PY_TEST_DIR)/test_python_c_features.py
 
 test-loss-python:
-	python3 test_loss.py
+	python3 $(PY_TEST_DIR)/test_loss.py
 
 $(BUILD_DIR)/test_rnnoise_tables: test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ test_rnnoise_tables.c -lm

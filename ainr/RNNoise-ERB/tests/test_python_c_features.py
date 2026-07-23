@@ -11,7 +11,10 @@ import tempfile
 import numpy as np
 import torch
 
-from train import (
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from train import (  # noqa: E402
     compute_erb_matrix,
     erb_bandborder,
     extract_model_features,
@@ -19,7 +22,6 @@ from train import (
 )
 
 
-ROOT = pathlib.Path(__file__).resolve().parent
 N_BINS = 257
 N_BANDS = 22
 SPEC_BINS = 129

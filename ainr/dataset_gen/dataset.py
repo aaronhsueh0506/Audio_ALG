@@ -30,7 +30,7 @@ import json
 import math
 import os
 import random
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import torch
@@ -334,20 +334,28 @@ def prepare_rir(rir: torch.Tensor, sr: int,
     start_idx = max(0, peak_idx - keep_samples)
     rir = rir[start_idx:]
 
-    # full_rir 給 noisy 混合用
-    full_rir = rir.clone()
+    # DeepFilterNet RandReverbSim normalizes the full and suppressed RIRs
+    # separately by L2 energy. This prevents arbitrary RIR recording gain or
+    # tail length from changing the speech/noise level contract.
+    full_rir = rir / (rir.square().sum().sqrt() + 1e-10)
 
     # target_rir 對 late tail 指數衰減
-    new_peak = min(keep_samples, len(rir) - 1)
+    # Actual direct-path position after trimming. This is not always
+    # keep_samples: when the original peak is earlier than the requested
+    # pre-delay window, start_idx is zero and the peak stays at peak_idx.
+    new_peak = peak_idx - start_idx
     offset = new_peak + int(sr * late_offset_ms / 1000)
 
-    target_rir = rir.clone()
+    target_rir = full_rir.clone()
     if offset < len(target_rir):
         tau = max(rt60, 0.05) / 3.0  # amplitude -60dB at t=RT60
         n_decay = len(target_rir) - offset
         t_idx = torch.arange(n_decay, dtype=torch.float32) / sr
         decay = (10.0 ** (-t_idx / tau)).to(target_rir.dtype)
         target_rir[offset:] = target_rir[offset:] * decay
+    target_rir = target_rir / (
+        target_rir.square().sum().sqrt() + 1e-10
+    )
 
     return target_rir, full_rir
 
@@ -364,6 +372,15 @@ def fftconvolve(signal: torch.Tensor, kernel: torch.Tensor) -> torch.Tensor:
     ker_fd = torch.fft.rfft(kernel, n=fft_size)
     out = torch.fft.irfft(sig_fd * ker_fd, n=fft_size)
     return out[:signal.shape[-1]]
+
+
+def delay_signal(signal: torch.Tensor, delay_samples: int) -> torch.Tensor:
+    """Delay a signal with zero padding while preserving its original length."""
+    if delay_samples <= 0:
+        return signal
+    if delay_samples >= signal.shape[-1]:
+        return torch.zeros_like(signal)
+    return F.pad(signal, (delay_samples, 0))[..., :signal.shape[-1]]
 
 
 # ============================================================
@@ -433,8 +450,6 @@ def apply_clipping(audio: torch.Tensor,
     # 目標 clipping level: 越低越嚴重
     # 簡化做法: 用 gain 放大再 clamp
     rms = audio.pow(2).mean().sqrt() + 1e-10
-    # gain 使 peak 超過 1.0
-    peak = audio.abs().max() + 1e-10
     # clip_factor: 1.0 = no clip, >1 = more clip
     clip_factor = 10 ** ((20 - clip_snr) / 20.0)
     clip_factor = max(clip_factor, 1.01)
@@ -603,7 +618,7 @@ class DNS4Dataset(Dataset):
                 print(f"RIR cache hit: {cache_path} ({len(valid)} files)")
                 self.rt60_map = cached.get('rt60_map', {})
                 return valid
-            print(f"RIR cache stale (missing files), rescanning...")
+            print("RIR cache stale (missing files), rescanning...")
 
         # Cache miss: 逐檔計算 RT60
         print(f"Scanning {len(all_rir_paths)} RIR files for RT60 filtering "
@@ -642,7 +657,7 @@ class DNS4Dataset(Dataset):
             except OSError as e:
                 print(f"  ⚠ Cache write failed at {candidate}: {e}")
         if not saved:
-            print(f"  ⚠ 兩個位置都寫不進去, 下次跑會重 scan")
+            print("  ⚠ 兩個位置都寫不進去, 下次跑會重 scan")
 
         self.rt60_map = rt60_map
         return passed
@@ -713,11 +728,7 @@ class DNS4Dataset(Dataset):
         audio = audio[0]
         if orig_sr != self.sr:
             audio = torchaudio.functional.resample(audio, orig_sr, self.sr)
-        # Peak-normalize: direct-path gain → 1.0 (DNS/DFN 慣例)。
-        # 否則 RIR 的任意絕對增益會流進 noisy(整段過 RIR), 但 target 的乾聲項
-        # drr*speech 沒過 RIR → 低 peak RIR 時 target 反而比 noisy 大聲, 且 IRM
-        # gain target clamp 到 1 → 學不到 dereverb/denoise。音量由 step 7 random gain 決定。
-        audio = audio / (audio.abs().max() + 1e-8)
+        # Full and target RIR energy normalization happens in prepare_rir().
         rt60 = self.rt60_map.get(path, 0.5)  # fallback if cache miss
         return audio, rt60
 
@@ -770,7 +781,7 @@ class DNS4Dataset(Dataset):
         for _retry in range(5):
             try:
                 return self._getitem_impl(idx)
-            except (RuntimeError, Exception) as e:
+            except Exception:
                 idx = random.randint(0, len(self._indices) - 1)
         return self._getitem_impl(idx)
 
@@ -804,7 +815,12 @@ class DNS4Dataset(Dataset):
                     rt60=rt60)
                 early_reverb = fftconvolve(speech, target_rir)
                 reverbed     = fftconvolve(speech, full_rir)
-                target = self.drr * speech + (1.0 - self.drr) * early_reverb
+                direct_delay = int(torch.argmax(full_rir.abs()).item())
+                aligned_dry = delay_signal(speech, direct_delay)
+                target = (
+                    self.drr * aligned_dry
+                    + (1.0 - self.drr) * early_reverb
+                )
             else:
                 target = speech.clone()
                 reverbed = speech.clone()
@@ -831,7 +847,10 @@ class DNS4Dataset(Dataset):
         else:
             # 6. Segmental SNR mixing
             snr_db = sample_snr(self.snr_ranges)
-            speech_rms = active_rms(reverbed, self.sr)
+            # Match DeepFilterNet mix_audio_signal(): define the sampled SNR
+            # against the clean target, while the mixture contains the more
+            # reverberant speech.
+            speech_rms = active_rms(target, self.sr)
             noise_rms = active_rms(noise, self.sr)
             noise_scaled = noise * (speech_rms / noise_rms) * (10 ** (-snr_db / 20))
             noisy = reverbed + noise_scaled
@@ -874,132 +893,3 @@ class DNS4Dataset(Dataset):
         target_gains = self._compute_gain_target(clean_power, noisy_power)
 
         return features, target_gains
-
-
-# ============================================================
-# Precomputed Dataset (讀取 gen_dataset.py 產生的 .pt shard)
-# ============================================================
-
-class WavPairDataset(Dataset):
-    """
-    讀取 2-channel WAV pair (ch0=noisy, ch1=clean). 遞迴掃描子資料夾。
-
-    目錄結構彈性, 例如:
-        data_dir/
-            pairs/000000.wav, 000001.wav, ...     # gen_dataset 預設輸出
-        或
-        data_dir/
-            batch_a/pairs/*.wav
-            batch_b/pairs/*.wav                    # 多批 gen 結果合併
-
-    用法:
-        dataset = WavPairDataset('data/')
-        noisy_wav, clean_wav = dataset[0]   # shape: (T,) each
-    """
-
-    def __init__(self, data_dir: str):
-        import json
-        self.data_dir = data_dir
-
-        if not os.path.isdir(data_dir):
-            raise FileNotFoundError(f"data_dir not found: {data_dir}")
-
-        # meta.json optional, 只當參考資訊
-        meta_path = os.path.join(data_dir, 'meta.json')
-        if os.path.isfile(meta_path):
-            with open(meta_path) as f:
-                self.meta = json.load(f)
-        else:
-            self.meta = {}
-
-        # 遞迴掃描所有 .wav (絕對路徑)
-        self.files = sorted(
-            glob.glob(os.path.join(data_dir, '**', '*.wav'), recursive=True)
-        )
-        if not self.files:
-            raise FileNotFoundError(f"No .wav files found under {data_dir}")
-
-        print(f"WavPairDataset: {len(self.files)} pairs from {data_dir} (recursive)")
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        audio, _ = torchaudio.load(self.files[idx])
-        # audio: (2, T) — ch0=noisy, ch1=clean
-        if audio.shape[0] < 2:
-            raise ValueError(
-                f"Expected 2-channel WAV, got {audio.shape[0]}-ch: {self.files[idx]}"
-            )
-        return audio[0], audio[1]
-
-
-class PackedDataset(Dataset):
-    """
-    讀取 pack_dataset.py 產生的單一 .pt 檔，所有資料已載入 RAM，
-    訓練時零 I/O 開銷，適合中小型 dataset (< 可用 RAM)。
-
-    用法:
-        dataset = PackedDataset('data/packed.pt')
-        noisy_wav, clean_wav = dataset[0]   # shape: (T,) each, float32
-    """
-
-    def __init__(self, pt_path: str, mmap: bool = False):
-        if not os.path.isfile(pt_path):
-            raise FileNotFoundError(f"Packed dataset not found: {pt_path}")
-
-        print(f"PackedDataset: loading {pt_path} (mmap={mmap}) ...")
-        obj = torch.load(pt_path, map_location='cpu', mmap=mmap, weights_only=True)
-        self.data = obj['data']   # (N, 2, T)
-        self.sr = obj.get('sr', 16000)
-        N, _, T = self.data.shape
-        size_mb = self.data.nbytes / 1024 ** 2
-        ram_note = "disk-backed" if mmap else "in RAM"
-        print(f"PackedDataset: {N} pairs, T={T}, SR={self.sr}, "
-              f"dtype={self.data.dtype}, {size_mb:.0f} MB ({ram_note})")
-
-    def __len__(self):
-        return self.data.shape[0]
-
-    def __getitem__(self, idx):
-        pair = self.data[idx]               # (2, T)
-        return pair[0].float(), pair[1].float()   # noisy, clean (always float32)
-
-
-class PrecomputedDataset(Dataset):
-    """
-    讀取離線預生成的 .pt shard 檔，跳過所有即時 augmentation。
-
-    用法:
-        dataset = PrecomputedDataset('data/')
-    """
-
-    def __init__(self, data_dir: str):
-        self.data_dir = data_dir
-        meta_path = os.path.join(data_dir, 'meta.pt')
-        if not os.path.isfile(meta_path):
-            raise FileNotFoundError(f"meta.pt not found in {data_dir}")
-
-        meta = torch.load(meta_path, weights_only=False)
-        self.n_shards = meta['n_shards']
-        self.n_total = meta['n_total']
-        self.shard_size = meta['shard_size']
-
-        # 載入所有 shard 到記憶體 (concat 成一個大 tensor)
-        all_features = []
-        all_targets = []
-        for i in range(self.n_shards):
-            shard_path = os.path.join(data_dir, f'shard_{i:04d}.pt')
-            shard = torch.load(shard_path, weights_only=False)
-            all_features.append(shard['features'])
-            all_targets.append(shard['targets'])
-
-        self.features = torch.cat(all_features, dim=0)  # (N, seq_len, n_bands)
-        self.targets = torch.cat(all_targets, dim=0)     # (N, seq_len, n_bands)
-        print(f"PrecomputedDataset: {len(self)} samples loaded from {data_dir}")
-
-    def __len__(self):
-        return self.features.shape[0]
-
-    def __getitem__(self, idx):
-        return self.features[idx], self.targets[idx]

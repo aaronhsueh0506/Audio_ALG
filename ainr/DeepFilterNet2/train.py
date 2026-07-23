@@ -2,10 +2,12 @@
 DeepFilterNet2 訓練腳本
 
 用法:
-    python train.py --config config.ini --packed-dir data/ --gpu 0
-    python train.py --config config.ini --packed-dir data/ --resume output/dfn2_best.pth
+    python train.py --config config.ini --packed-dir data_48k/packed.pt --gpu 0
+    python train.py --config config.ini --packed-dir data_48k/packed.pt \
+        --resume output/dfn2_best.pth
 
-Dataset format: shard_*.pt files containing {'noisy': (N, T), 'clean': (N, T)}.
+Dataset format: dataset_gen/pack_dataset.py output containing
+{'data': (N, 2, T), 'sr': 48000}.
 """
 
 import argparse

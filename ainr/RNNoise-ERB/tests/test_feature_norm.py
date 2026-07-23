@@ -1,11 +1,16 @@
 """Python contract tests for log_erb_dfn_mean_cplx_unit_0_4k_v3."""
 
 import unittest
+import pathlib
+import sys
 
 import numpy as np
 import torch
 
-from train import (
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from train import (  # noqa: E402
     FEATURE_VERSION,
     RNNoiseModel,
     compute_erb_matrix,
