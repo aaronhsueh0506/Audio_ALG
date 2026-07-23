@@ -74,7 +74,9 @@ def process_file(input_path, output_path, model, params):
     )
 
     os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
-    torchaudio.save(output_path, enhanced_wav.unsqueeze(0), SR)
+    # istft keeps the batch dimension: (1, T), already the 2-D
+    # (channels, time) layout required by torchaudio.save.
+    torchaudio.save(output_path, enhanced_wav, SR)
 
 
 def denoise_single(args):

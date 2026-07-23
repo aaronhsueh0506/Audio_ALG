@@ -142,8 +142,8 @@ log-ERB 與 runtime normalization 會在訓練時即時計算。完整流程：
 # Step 1: 產生 2-channel WAV pairs（ch0=noisy, ch1=clean）
 python3 gen_dataset.py --config config.ini --output data --hours 25 --workers 4
 
-# Step 2: 打包，避免訓練時逐 WAV I/O
-python3 pack_dataset.py --input data/pairs --output data/packed.pt --dtype float32
+# Step 2: 打包，避免訓練時逐 WAV I/O；大型資料建議保留 float16
+python3 pack_dataset.py --input data/pairs --output data/packed.pt --dtype float16
 
 # Step 3: 訓練
 python3 train.py --config config.ini --packed-data data/packed.pt
@@ -151,6 +151,12 @@ python3 train.py --config config.ini --packed-data data/packed.pt
 # 可選：指定 GPU、降低 RAM、或載入同一目錄下多個 packed files
 python3 train.py --config config.ini --packed-dir data/packed_shards --gpu 0 --mmap
 ```
+
+`--mmap` 模式不會在 `__getitem__` 逐筆展開成 float32；FP16 batch 送到 GPU
+後才轉 float32。訓練會隨機化資料區塊與區塊內順序，避免大型 shard 的全域
+random access page fault。`config.ini` 的 `mmap_block_size`、
+`mmap_num_workers`、`prefetch_factor` 可依磁碟速度與共用 RAM 調整；預設
+256 / 2 / 2 是偏向低 RAM 的起點。
 
 `gen_dataset.py` 常用參數：
 

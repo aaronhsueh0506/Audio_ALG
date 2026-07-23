@@ -15,7 +15,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader, random_split, RandomSampler
+from torch.utils.data import DataLoader, Dataset, RandomSampler, Sampler, Subset
 import tqdm
 
 from model import GTCRN
@@ -59,7 +59,55 @@ class PackedDataset(Dataset):
 
     def __getitem__(self, idx):
         pair = self.data[idx]   # (2, T)
-        return pair[0].float(), pair[1].float()   # noisy, clean
+        # Keep packed float16 samples compact while mmap/DataLoader prefetches.
+        # The complete batch is converted to float32 after transfer to device.
+        return pair[0], pair[1]   # noisy, clean
+
+
+class BlockShuffleSampler(Sampler):
+    """Shuffle mmap data in local blocks instead of causing random page faults."""
+
+    def __init__(self, data_source, block_size=256, num_samples=None):
+        self.data_source = data_source
+        self.block_size = int(block_size)
+        if self.block_size <= 0:
+            raise ValueError("mmap_block_size must be greater than zero")
+        size = len(data_source)
+        self.num_samples = size if num_samples is None else min(int(num_samples), size)
+
+    def __iter__(self):
+        size = len(self.data_source)
+        block_starts = list(range(0, size, self.block_size))
+        emitted = 0
+        for block_idx in torch.randperm(len(block_starts)).tolist():
+            start = block_starts[block_idx]
+            end = min(start + self.block_size, size)
+            for offset in torch.randperm(end - start).tolist():
+                if emitted >= self.num_samples:
+                    return
+                yield start + offset
+                emitted += 1
+
+    def __len__(self):
+        return self.num_samples
+
+
+def locality_preserving_random_split(dataset, n_train, n_val):
+    """Randomly assign samples, then sort each subset for mmap-local indexing."""
+    indices = torch.randperm(len(dataset)).tolist()
+    val_indices = sorted(indices[:n_val])
+    train_indices = sorted(indices[n_val:n_val + n_train])
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
+def dataloader_worker_kwargs(num_workers, pin_memory, prefetch_factor):
+    kwargs = {'num_workers': num_workers, 'pin_memory': pin_memory}
+    if num_workers > 0:
+        kwargs.update(
+            prefetch_factor=prefetch_factor,
+            persistent_workers=True,
+        )
+    return kwargs
 
 
 # ============================================================
@@ -143,7 +191,15 @@ def train(args):
     weight_decay = cfg.getfloat('training', 'weight_decay', fallback=0.05)
     patience     = cfg.getint('training', 'early_stop_patience', fallback=20)
     epoch_size   = cfg.getint('training', 'epoch_size', fallback=0)
+    mmap_block_size = cfg.getint('training', 'mmap_block_size', fallback=256)
+    mmap_workers = cfg.getint('training', 'mmap_num_workers', fallback=2)
+    prefetch_factor = cfg.getint('training', 'prefetch_factor', fallback=2)
     output_dir   = cfg.get('paths', 'output_dir', fallback='output')
+
+    if mmap_workers < 0:
+        raise ValueError("mmap_num_workers cannot be negative")
+    if prefetch_factor <= 0:
+        raise ValueError("prefetch_factor must be greater than zero")
 
     if args.gpu is not None:
         device = torch.device(f'cuda:{args.gpu}')
@@ -171,16 +227,39 @@ def train(args):
         dataset = PackedDataset(packed_dir, mmap=args.mmap, expected_sr=SR)
     n_val = max(2, int(len(dataset) * 0.05))
     n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val])
+    train_set, val_set = locality_preserving_random_split(dataset, n_train, n_val)
 
-    if epoch_size > 0 and epoch_size < len(train_set):
-        sampler = RandomSampler(train_set, replacement=False, num_samples=epoch_size)
-        train_loader = DataLoader(train_set, batch_size=batch_size,
-                                  sampler=sampler, num_workers=4, pin_memory=True)
+    pin_memory = device.type == 'cuda'
+    train_workers = mmap_workers if args.mmap else 4
+    train_kwargs = dataloader_worker_kwargs(
+        train_workers, pin_memory, prefetch_factor
+    )
+    sample_count = epoch_size if 0 < epoch_size < len(train_set) else None
+    if args.mmap:
+        sampler = BlockShuffleSampler(
+            train_set, block_size=mmap_block_size, num_samples=sample_count
+        )
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, sampler=sampler, **train_kwargs
+        )
+    elif sample_count is not None:
+        sampler = RandomSampler(
+            train_set, replacement=False, num_samples=sample_count
+        )
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, sampler=sampler, **train_kwargs
+        )
     else:
-        train_loader = DataLoader(train_set, batch_size=batch_size,
-                                  shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_set, batch_size=batch_size, num_workers=2)
+        train_loader = DataLoader(
+            train_set, batch_size=batch_size, shuffle=True, **train_kwargs
+        )
+
+    val_workers = min(train_workers, 2)
+    val_loader = DataLoader(
+        val_set,
+        batch_size=batch_size,
+        **dataloader_worker_kwargs(val_workers, pin_memory, prefetch_factor),
+    )
 
     model = GTCRN(erb_subband_1=ERB_SUB1, erb_subband_2=ERB_SUB2,
                   nfft=N_FFT, fs=SR).to(device)
@@ -188,6 +267,9 @@ def train(args):
     print(f"GTCRN: {n_params:,} parameters")
     print(f"  SR={SR}, N_FFT={N_FFT}, WIN={WIN_LEN}, HOP={HOP_LEN}")
     print(f"  batch={batch_size}, lr={lr}, device={device}")
+    if args.mmap:
+        print(f"  mmap: block={mmap_block_size}, workers={train_workers}, "
+              f"prefetch={prefetch_factor}, packed_dtype_preserved=True")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
                                   betas=(0.9, 0.999), weight_decay=weight_decay)
@@ -219,8 +301,10 @@ def train(args):
         train_loss = 0.0
         with tqdm.tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") as pbar:
             for noisy, clean in pbar:
-                noisy = noisy.to(device)   # (B, T)
-                clean = clean.to(device)
+                noisy = noisy.to(device=device, dtype=torch.float32,
+                                 non_blocking=pin_memory)   # (B, T)
+                clean = clean.to(device=device, dtype=torch.float32,
+                                 non_blocking=pin_memory)
                 T = noisy.shape[-1]
 
                 noisy_spec = torch.view_as_real(torch.stft(
@@ -262,8 +346,10 @@ def train(args):
         val_loss = 0.0
         with torch.no_grad():
             for noisy, clean in val_loader:
-                noisy = noisy.to(device)
-                clean = clean.to(device)
+                noisy = noisy.to(device=device, dtype=torch.float32,
+                                 non_blocking=pin_memory)
+                clean = clean.to(device=device, dtype=torch.float32,
+                                 non_blocking=pin_memory)
                 T = noisy.shape[-1]
 
                 noisy_spec = torch.view_as_real(torch.stft(

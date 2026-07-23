@@ -23,7 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler, random_split
+from torch.utils.data import DataLoader, RandomSampler, Sampler, Subset
 import tqdm
 
 from dataset import PackedDataset
@@ -36,6 +36,52 @@ from dataset import PackedDataset
 # dimensions are unchanged.
 FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v3'
 LOSS_VERSION = 'df3_multi_res_spec_only_gamma_0.3_v1'
+
+
+class BlockShuffleSampler(Sampler):
+    """Shuffle mmap data in local blocks instead of causing random page faults."""
+
+    def __init__(self, data_source, block_size=256, num_samples=None):
+        self.data_source = data_source
+        self.block_size = int(block_size)
+        if self.block_size <= 0:
+            raise ValueError("mmap_block_size must be greater than zero")
+        size = len(data_source)
+        self.num_samples = size if num_samples is None else min(int(num_samples), size)
+
+    def __iter__(self):
+        size = len(self.data_source)
+        block_starts = list(range(0, size, self.block_size))
+        emitted = 0
+        for block_idx in torch.randperm(len(block_starts)).tolist():
+            start = block_starts[block_idx]
+            end = min(start + self.block_size, size)
+            for offset in torch.randperm(end - start).tolist():
+                if emitted >= self.num_samples:
+                    return
+                yield start + offset
+                emitted += 1
+
+    def __len__(self):
+        return self.num_samples
+
+
+def locality_preserving_random_split(dataset, n_train, n_val):
+    """Randomly assign samples, then sort each subset for mmap-local indexing."""
+    indices = torch.randperm(len(dataset)).tolist()
+    val_indices = sorted(indices[:n_val])
+    train_indices = sorted(indices[n_val:n_val + n_train])
+    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
+def dataloader_worker_kwargs(num_workers, pin_memory, prefetch_factor):
+    kwargs = {'num_workers': num_workers, 'pin_memory': pin_memory}
+    if num_workers > 0:
+        kwargs.update(
+            prefetch_factor=prefetch_factor,
+            persistent_workers=True,
+        )
+    return kwargs
 
 
 def require_checkpoint_feature_version(ckpt, context='checkpoint'):
@@ -707,6 +753,13 @@ def train(args):
     epochs = cfg.getint('training', 'epochs')
     batch_size = cfg.getint('training', 'batch_size')
     lr = cfg.getfloat('training', 'lr')
+    mmap_block_size = cfg.getint('training', 'mmap_block_size', fallback=256)
+    mmap_workers = cfg.getint('training', 'mmap_num_workers', fallback=2)
+    prefetch_factor = cfg.getint('training', 'prefetch_factor', fallback=2)
+    if mmap_workers < 0:
+        raise ValueError("mmap_num_workers cannot be negative")
+    if prefetch_factor <= 0:
+        raise ValueError("prefetch_factor must be greater than zero")
     if args.gpu is not None:
         device = torch.device(f'cuda:{args.gpu}')
     else:
@@ -733,7 +786,9 @@ def train(args):
             pt_files += args.packed_data
         if not pt_files:
             raise FileNotFoundError(f"在 {args.packed_dir} 找不到任何 .pt 檔案")
-        parts = [PackedDataset(p, mmap=args.mmap) for p in pt_files]
+        parts = [
+            PackedDataset(p, mmap=args.mmap, expected_sr=SR) for p in pt_files
+        ]
         dataset = ConcatDataset(parts) if len(parts) > 1 else parts[0]
         use_wav = True
     else:
@@ -741,21 +796,26 @@ def train(args):
 
     n_val = max(1, int(len(dataset) * 0.1))
     n_train = len(dataset) - n_val
-    train_set, val_set = random_split(dataset, [n_train, n_val])
+    train_set, val_set = locality_preserving_random_split(dataset, n_train, n_val)
 
-    # epoch_size: precomputed/wav-data 模式下用 RandomSampler 限制每 epoch 的 sample 數
-    # online 模式由 DNS4Dataset._shuffle_indices() 處理
+    # epoch_size 可限制每 epoch 的 sample 數；mmap 模式仍以局部區塊取樣。
     epoch_size = cfg.getint('training', 'epoch_size', fallback=0)
-    # packed-data 整包進 RAM (mmap=False) 時 indexing 是 RAM，0 worker 最省；
-    # 但 --mmap 時資料在磁碟，需 worker 並行 IO 才不會卡主執行緒 (否則超慢)。
-    use_packed = args.packed_data is not None
-    packed_in_ram = use_packed and not args.mmap
-    n_workers = 0 if (packed_in_ram or not (use_online or use_wav)) else 4
-    common_kwargs = dict(num_workers=n_workers, pin_memory=True)
-    if n_workers > 0:
-        common_kwargs.update(prefetch_factor=4, persistent_workers=True)
+    # RAM-backed packed tensors do not need worker processes. mmap uses a small
+    # worker pool and shallow prefetch so it does not consume shared-server RAM.
+    n_workers = mmap_workers if args.mmap else 0
+    pin_memory = device.type == 'cuda'
+    common_kwargs = dataloader_worker_kwargs(
+        n_workers, pin_memory, prefetch_factor
+    )
+    sample_count = epoch_size if 0 < epoch_size < len(train_set) else None
 
-    if not use_online and epoch_size > 0 and epoch_size < len(train_set):
+    if args.mmap:
+        train_sampler = BlockShuffleSampler(
+            train_set, block_size=mmap_block_size, num_samples=sample_count
+        )
+        train_loader = DataLoader(train_set, batch_size=batch_size,
+                                  sampler=train_sampler, **common_kwargs)
+    elif sample_count is not None:
         train_sampler = RandomSampler(train_set, replacement=False, num_samples=epoch_size)
         train_loader = DataLoader(train_set, batch_size=batch_size,
                                   sampler=train_sampler, **common_kwargs)
@@ -764,9 +824,9 @@ def train(args):
                                   shuffle=True, **common_kwargs)
 
     val_workers = min(n_workers, 2)
-    val_kwargs = dict(num_workers=val_workers, pin_memory=True)
-    if val_workers > 0:
-        val_kwargs.update(prefetch_factor=4, persistent_workers=True)
+    val_kwargs = dataloader_worker_kwargs(
+        val_workers, pin_memory, prefetch_factor
+    )
     val_loader = DataLoader(val_set, batch_size=batch_size, **val_kwargs)
 
     # Regularization
@@ -852,6 +912,9 @@ def train(args):
     print(f"  WIN_LEN={WIN_LEN}, HOP_LEN={HOP_LEN} (root Hann window)")
     print(f"  lookahead_frames={LOOKAHEAD} ({LOOKAHEAD * HOP_LEN / SR * 1000:.1f} ms extra latency)")
     print(f"  epochs={epochs}, batch_size={batch_size}, lr={lr}")
+    if args.mmap:
+        print(f"  mmap: block={mmap_block_size}, workers={n_workers}, "
+              f"prefetch={prefetch_factor}, packed_dtype_preserved=True")
     wd_note = f"{weight_decay}→{weight_decay_end} (cosine)" if wd_scheduled else f"{weight_decay} (const)"
     print(f"  dropout={dropout}, weight_decay={wd_note}")
     print(f"  loss={LOSS_VERSION}: fft_sizes={loss_cfg['fft_sizes']}, "
@@ -881,8 +944,10 @@ def train(args):
         with tqdm.tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") as pbar:
             if use_wav:
                 for noisy_wav, clean_wav in pbar:
-                    noisy_wav = noisy_wav.to(device)
-                    clean_wav = clean_wav.to(device)
+                    noisy_wav = noisy_wav.to(
+                        device=device, dtype=torch.float32, non_blocking=pin_memory)
+                    clean_wav = clean_wav.to(
+                        device=device, dtype=torch.float32, non_blocking=pin_memory)
 
                     # On-the-fly STFT
                     noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
@@ -938,8 +1003,10 @@ def train(args):
         with torch.no_grad():
             if use_wav:
                 for noisy_wav, clean_wav in val_loader:
-                    noisy_wav = noisy_wav.to(device)
-                    clean_wav = clean_wav.to(device)
+                    noisy_wav = noisy_wav.to(
+                        device=device, dtype=torch.float32, non_blocking=pin_memory)
+                    clean_wav = clean_wav.to(
+                        device=device, dtype=torch.float32, non_blocking=pin_memory)
 
                     noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
                     clean_spec = stft(clean_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)

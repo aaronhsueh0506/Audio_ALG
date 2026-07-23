@@ -849,22 +849,32 @@ class WavPairDataset(Dataset):
 
 class PackedDataset(Dataset):
     """
-    讀取 pack_dataset.py 產生的單一 .pt 檔，所有資料已載入 RAM，
-    訓練時零 I/O 開銷，適合中小型 dataset (< 可用 RAM)。
+    讀取 pack_dataset.py 產生的單一 .pt 檔。mmap=False 時載入 RAM；
+    mmap=True 時由 OS page cache 按需讀取，適合 shared server 的大型資料集。
 
     用法:
         dataset = PackedDataset('data/packed.pt')
-        noisy_wav, clean_wav = dataset[0]   # shape: (T,) each, float32
+        noisy_wav, clean_wav = dataset[0]   # shape: (T,) each, packed dtype
     """
 
-    def __init__(self, pt_path: str, mmap: bool = False):
+    def __init__(self, pt_path: str, mmap: bool = False, expected_sr: int = None):
         if not os.path.isfile(pt_path):
             raise FileNotFoundError(f"Packed dataset not found: {pt_path}")
 
         print(f"PackedDataset: loading {pt_path} (mmap={mmap}) ...")
         obj = torch.load(pt_path, map_location='cpu', mmap=mmap, weights_only=True)
+        if 'sr' not in obj:
+            raise ValueError(f"Packed dataset has no sample-rate metadata: {pt_path}")
+        self.sr = int(obj['sr'])
+        if expected_sr is not None and self.sr != expected_sr:
+            raise ValueError(
+                f"Packed dataset SR={self.sr}, but config requires SR={expected_sr}: {pt_path}"
+            )
         self.data = obj['data']   # (N, 2, T)
-        self.sr = obj.get('sr', 16000)
+        if self.data.ndim != 3 or self.data.shape[1] != 2:
+            raise ValueError(
+                f"Packed dataset must have shape (N, 2, T), got {tuple(self.data.shape)}"
+            )
         N, _, T = self.data.shape
         size_mb = self.data.nbytes / 1024 ** 2
         ram_note = "disk-backed" if mmap else "in RAM"
@@ -876,7 +886,9 @@ class PackedDataset(Dataset):
 
     def __getitem__(self, idx):
         pair = self.data[idx]               # (2, T)
-        return pair[0].float(), pair[1].float()   # noisy, clean (always float32)
+        # Preserve float16 while mmap/DataLoader prefetches.  train.py converts
+        # the complete batch to float32 after copying it to the accelerator.
+        return pair[0], pair[1]             # noisy, clean
 
 
 class PrecomputedDataset(Dataset):
