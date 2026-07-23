@@ -124,32 +124,45 @@ def load_config(path: str) -> configparser.ConfigParser:
     return cfg
 
 
-def parse_snr_ranges(s: str) -> List[Tuple[float, float, float]]:
-    """
-    解析 SNR 分段取樣字串, 格式: "low:high:weight, ..."
-    回傳: [(low, high, weight), ...]
-    """
-    ranges = []
-    for part in s.split(','):
-        part = part.strip()
-        lo, hi, w = part.split(':')
-        ranges.append((float(lo), float(hi), float(w)))
-    # normalize weights
-    total = sum(r[2] for r in ranges)
-    return [(lo, hi, w / total) for lo, hi, w in ranges]
+def parse_snr_values(s: str) -> List[float]:
+    """Parse a comma-separated list of finite SNR values in dB."""
+    values = [float(part.strip()) for part in s.split(',') if part.strip()]
+    if not values:
+        raise ValueError("[mixing] snr_values must contain at least one value")
+    if not all(math.isfinite(value) for value in values):
+        raise ValueError("[mixing] snr_values must contain only finite values")
+    return values
 
 
-def sample_snr(ranges: List[Tuple[float, float, float]]) -> float:
-    """從分段 SNR 範圍中取樣"""
-    r = random.random()
-    cum = 0.0
-    for lo, hi, w in ranges:
-        cum += w
-        if r <= cum:
-            return random.uniform(lo, hi)
-    # fallback
-    lo, hi, _ = ranges[-1]
-    return random.uniform(lo, hi)
+def sample_snr(values: List[float]) -> float:
+    """Uniformly sample one of DeepFilterNet's discrete SNR values."""
+    return random.choice(values)
+
+
+def validate_mix_probabilities(noise_only_p: float,
+                               speech_only_p: float) -> None:
+    """Validate mutually exclusive noise-only / speech-only probabilities."""
+    for name, value in (
+        ("noise_only_p", noise_only_p),
+        ("speech_only_p", speech_only_p),
+    ):
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"[noise] {name} must be in [0, 1], got {value}")
+    if noise_only_p + speech_only_p > 1.0:
+        raise ValueError(
+            "[noise] noise_only_p + speech_only_p must be <= 1, got "
+            f"{noise_only_p + speech_only_p}"
+        )
+
+
+def sample_mix_mode(noise_only_p: float, speech_only_p: float) -> str:
+    """Sample one mutually exclusive mode: noise-only, speech-only, or mixed."""
+    draw = random.random()
+    if draw < noise_only_p:
+        return "noise_only"
+    if draw < noise_only_p + speech_only_p:
+        return "speech_only"
+    return "mixed"
 
 
 # ============================================================
@@ -487,14 +500,14 @@ class DNS4Dataset(Dataset):
     DNS4 Dataset + DeepFilterNet v2 風格 augmentation
 
     Pipeline:
-    1. Load speech (48kHz → resample) + random crop
-    2. Speech augmentation: RandBiquadFilter
+    1. Select mixed / noise-only / speech-only sample mode
+    2. Load and augment speech when required
     3. RIR convolution (early for target, full for noisy)
-    4. Load noise (multi-source) + noise augmentation
-    5. Segmental SNR mixing
+    4. Load and augment noise when required
+    5. Discrete-SNR mixing for mixed samples
     6. Gain randomization
     7. Bandwidth limitation (noisy + target)
-    8. Clipping distortion (noisy only)
+    8. Clipping distortion (mixed/noise-only input only)
     9. Clipping prevention
     10. STFT → features + target gains  (return_raw=False)
         OR return (noisy, clean) raw audio tensors (return_raw=True)
@@ -515,7 +528,7 @@ class DNS4Dataset(Dataset):
         self.segment_samples = int(self.segment_sec * self.sr)
 
         # mixing
-        self.snr_ranges = parse_snr_ranges(cfg.get('mixing', 'snr_ranges'))
+        self.snr_values = parse_snr_values(cfg.get('mixing', 'snr_values'))
         self.target_rms_min = cfg.getfloat('mixing', 'target_rms_min')
         self.target_rms_max = cfg.getfloat('mixing', 'target_rms_max')
 
@@ -530,6 +543,8 @@ class DNS4Dataset(Dataset):
         # noise
         self.max_noise_mix = cfg.getint('noise', 'max_noise_mix')
         self.noise_only_p = cfg.getfloat('noise', 'noise_only_p', fallback=0.05)
+        self.speech_only_p = cfg.getfloat('noise', 'speech_only_p', fallback=0.05)
+        validate_mix_probabilities(self.noise_only_p, self.speech_only_p)
 
         # augmentation
         self.p_biquad = cfg.getfloat('augmentation', 'p_biquad')
@@ -789,14 +804,19 @@ class DNS4Dataset(Dataset):
         real_idx = self._indices[idx]
         target_len = self.segment_samples
 
-        # Noise-only sample: 讓模型學會「純噪音 → gain 全 0」(DFN3 = 0.05)
-        noise_only = random.random() < self.noise_only_p
+        # Explicit special cases avoid magic ±100 dB SNR sentinels:
+        #   noise_only  -> target silence
+        #   speech_only -> noisy == target, so the model learns identity
+        # The remaining probability uses a normal noisy mixture.
+        mix_mode = sample_mix_mode(self.noise_only_p, self.speech_only_p)
+        noise_only = mix_mode == "noise_only"
+        speech_only = mix_mode == "speech_only"
 
         if not noise_only:
-            # 1. Load clean speech
+            # 2. Load clean speech
             speech = self._load_and_crop(self.speech_files[real_idx], target_len)
 
-            # 2. Speech augmentation: RandBiquadFilter (混合前)
+            # Speech augmentation: RandBiquadFilter (混合前)
             if random.random() < self.p_biquad:
                 speech = rand_biquad_filter(
                     speech, self.sr,
@@ -825,28 +845,32 @@ class DNS4Dataset(Dataset):
                 target = speech.clone()
                 reverbed = speech.clone()
 
-        # 4. Load noise (multi-source)
-        n_noises = random.randint(1, self.max_noise_mix)
-        noise = torch.zeros(target_len)
-        for _ in range(n_noises):
-            noise = noise + self._load_noise(target_len)
+        # 4. Load/augment noise only when the selected mode needs it.
+        if not speech_only:
+            n_noises = random.randint(1, self.max_noise_mix)
+            noise = torch.zeros(target_len)
+            for _ in range(n_noises):
+                noise = noise + self._load_noise(target_len)
 
-        # 5. Noise augmentation: RandBiquadFilter (混合前, 獨立隨機參數)
-        if random.random() < self.p_biquad:
-            noise = rand_biquad_filter(
-                noise, self.sr,
-                n_filters=self.n_biquad_filters,
-                gain_db=self.biquad_gain_db,
-                q_min=self.biquad_q_min,
-                q_max=self.biquad_q_max)
+            if random.random() < self.p_biquad:
+                noise = rand_biquad_filter(
+                    noise, self.sr,
+                    n_filters=self.n_biquad_filters,
+                    gain_db=self.biquad_gain_db,
+                    q_min=self.biquad_q_min,
+                    q_max=self.biquad_q_max)
 
         if noise_only:
-            # Noise-only: noisy = noise, target = silence
+            # Noise-only: learn pure noise -> silence.
             noisy = noise.clone()
             target = torch.zeros(target_len)
+        elif speech_only:
+            # Speech-only must be an exact identity pair. In particular, do
+            # not retain full-RIR late reverberation or input-only clipping.
+            noisy = target.clone()
         else:
-            # 6. Segmental SNR mixing
-            snr_db = sample_snr(self.snr_ranges)
+            # 5. DeepFilterNet-style discrete-SNR mixing.
+            snr_db = sample_snr(self.snr_values)
             # Match DeepFilterNet mix_audio_signal(): define the sampled SNR
             # against the clean target, while the mixture contains the more
             # reverberant speech.
@@ -855,7 +879,7 @@ class DNS4Dataset(Dataset):
             noise_scaled = noise * (speech_rms / noise_rms) * (10 ** (-snr_db / 20))
             noisy = reverbed + noise_scaled
 
-        # 7. Gain randomization
+        # 6. Gain randomization
         target_rms_db = random.uniform(self.target_rms_min, self.target_rms_max)
         target_rms_linear = 10 ** (target_rms_db / 20)
         if noise_only:
@@ -866,23 +890,23 @@ class DNS4Dataset(Dataset):
         target = target * scale
         noisy = noisy * scale
 
-        # 8. Bandwidth limitation (同時套用在 noisy 和 target, 相同 target SR)
+        # 7. Bandwidth limitation (同時套用在 noisy 和 target, 相同 target SR)
         if random.random() < self.p_resample:
             bw_sr = random.randint(self.resample_sr_min, self.resample_sr_max)
             noisy = bandwidth_limit(noisy, self.sr, bw_sr)
             target = bandwidth_limit(target, self.sr, bw_sr)
 
-        # 9. Clipping distortion (只影響 noisy)
-        if random.random() < self.p_clipping:
+        # 8. Clipping distortion (input only). Skip exact identity pairs.
+        if not speech_only and random.random() < self.p_clipping:
             noisy = apply_clipping(noisy, self.clip_snr_min, self.clip_snr_max)
 
-        # 10. Clipping prevention
+        # 9. Clipping prevention
         target, noisy = prevent_clipping(target, noisy)
 
         if self.return_raw:
             return noisy, target
 
-        # 11. STFT → features + target gains
+        # 10. STFT → features + target gains
         clean_spec = self._stft(target)
         noisy_spec = self._stft(noisy)
 

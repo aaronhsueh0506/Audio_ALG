@@ -2,10 +2,20 @@
 
 import random
 import unittest
+from unittest.mock import patch
 
 import torch
 
-from dataset_gen.dataset import delay_signal, fftconvolve, prepare_rir
+from dataset_gen.dataset import (
+    DNS4Dataset,
+    delay_signal,
+    fftconvolve,
+    parse_snr_values,
+    prepare_rir,
+    sample_mix_mode,
+    sample_snr,
+    validate_mix_probabilities,
+)
 from dataset_gen.gen_dataset import hours_to_sample_count, seed_worker
 from dataset_gen.resample_dataset import resampled_num_frames
 
@@ -37,6 +47,71 @@ class RandomSeedTest(unittest.TestCase):
         torch.manual_seed(124)
         seed_worker(0)
         self.assertNotEqual(random.random(), first)
+
+
+class MixingPolicyTest(unittest.TestCase):
+    def test_dfn_discrete_snr_values_are_parsed_and_sampled(self):
+        values = parse_snr_values("-5, 0, 5, 10, 20, 40")
+        self.assertEqual(values, [-5.0, 0.0, 5.0, 10.0, 20.0, 40.0])
+
+        random.seed(123)
+        self.assertTrue(all(sample_snr(values) in values for _ in range(100)))
+
+    def test_invalid_snr_values_are_rejected(self):
+        for value in ("", "nan", "0, inf"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_snr_values(value)
+
+    def test_special_modes_are_mutually_exclusive(self):
+        validate_mix_probabilities(0.05, 0.05)
+        with patch(
+            "dataset_gen.dataset.random.random",
+            side_effect=(0.049, 0.05, 0.099, 0.10),
+        ):
+            self.assertEqual(sample_mix_mode(0.05, 0.05), "noise_only")
+            self.assertEqual(sample_mix_mode(0.05, 0.05), "speech_only")
+            self.assertEqual(sample_mix_mode(0.05, 0.05), "speech_only")
+            self.assertEqual(sample_mix_mode(0.05, 0.05), "mixed")
+
+    def test_invalid_special_mode_probabilities_are_rejected(self):
+        for noise_p, speech_p in ((-0.1, 0.0), (0.0, 1.1), (0.6, 0.5)):
+            with (
+                self.subTest(noise_p=noise_p, speech_p=speech_p),
+                self.assertRaises(ValueError),
+            ):
+                validate_mix_probabilities(noise_p, speech_p)
+
+    def test_speech_only_pair_is_exact_identity_and_skips_clipping(self):
+        dataset = DNS4Dataset.__new__(DNS4Dataset)
+        dataset._indices = [0]
+        dataset.speech_files = ["speech.wav"]
+        dataset.segment_samples = 16
+        dataset.sr = 16000
+        dataset.noise_only_p = 0.05
+        dataset.speech_only_p = 0.05
+        dataset.p_biquad = 0.0
+        dataset.rir_files = []
+        dataset.target_rms_min = -20.0
+        dataset.target_rms_max = -20.0
+        dataset.p_resample = 0.0
+        dataset.resample_sr_min = 8000
+        dataset.resample_sr_max = 15000
+        dataset.p_clipping = 1.0
+        dataset.clip_snr_min = 0.0
+        dataset.clip_snr_max = 20.0
+        dataset.return_raw = True
+        dataset._load_and_crop = lambda _path, length: torch.linspace(
+            -0.2, 0.2, length
+        )
+
+        with (
+            patch("dataset_gen.dataset.sample_mix_mode", return_value="speech_only"),
+            patch("dataset_gen.dataset.apply_clipping") as clipping,
+        ):
+            noisy, target = dataset._getitem_impl(0)
+
+        self.assertTrue(torch.equal(noisy, target))
+        clipping.assert_not_called()
 
 
 class RirAlignmentTest(unittest.TestCase):

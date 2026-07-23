@@ -39,6 +39,30 @@ speech. `drr = 0.3` is a linear dry/reverberant blend factor in `[0, 1]`, not
 a dB value. The dry target is delayed to the trimmed RIR's direct-path peak so
 target and reverberant mixture do not acquire a pre-delay mismatch.
 
+### SNR and clean/noise edge cases
+
+Mixed samples uniformly draw from DeepFilterNet's discrete SNR set:
+`-5, 0, 5, 10, 20, 40 dB`. DeepFilterNet3 puts `-100` in that list as a
+sentinel for a noise-only sample; this generator represents the edge case
+explicitly instead:
+
+```ini
+[mixing]
+snr_values = -5, 0, 5, 10, 20, 40
+
+[noise]
+noise_only_p = 0.05
+speech_only_p = 0.05
+```
+
+The two special modes are mutually exclusive. With the defaults, 5% of pairs
+are pure noise (`target = silence`), 5% are exact speech identity pairs
+(`noisy = target`), and the remaining 90% are noisy mixtures. Speech-only
+pairs deliberately skip input-only clipping so they stay exact identity
+examples. Keeping a small speech-only share teaches the model not to alter an
+already-clean input; use a genuinely clean speech corpus, since any noise in a
+speech source file is necessarily treated as desired target content.
+
 ### Where the working rate actually comes from (honest finding)
 
 Before this extraction, there was **no explicit "generate at X Hz" contract**

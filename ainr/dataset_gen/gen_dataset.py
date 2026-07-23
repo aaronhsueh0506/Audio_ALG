@@ -209,6 +209,9 @@ def gen_dataset(args):
             'seed': run_seed,
             'effective_seed': effective_seed,
             'seed_source': seed_source,
+            'snr_values_db': dataset.snr_values,
+            'noise_only_p': dataset.noise_only_p,
+            'speech_only_p': dataset.speech_only_p,
             'config': args.config,
         }
         with open(meta_path, 'w') as f:
