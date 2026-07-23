@@ -12,10 +12,13 @@ from dataset_gen.dataset import (
     DNS4Dataset,
     delay_signal,
     fftconvolve,
+    parse_source_sr_values,
     parse_snr_values,
     prepare_rir,
     sample_mix_mode,
     sample_snr,
+    simulate_upsampled_source,
+    source_sr_candidates,
     validate_mix_probabilities,
 )
 from dataset_gen.gen_dataset import hours_to_sample_count, seed_worker
@@ -58,6 +61,11 @@ class DatasetConfigScopeTest(unittest.TestCase):
         self.assertFalse(hasattr(dataset, "n_fft"))
         self.assertFalse(hasattr(dataset, "bin_edges"))
         self.assertEqual(len(dataset), 1)
+        self.assertEqual(
+            dataset.source_sr_values,
+            [8000, 12000, 16000, 22050, 24000, 32000, 44100],
+        )
+        self.assertEqual(dataset.p_resample, 0.2)
 
 
 class HoursPlanningTest(unittest.TestCase):
@@ -87,6 +95,48 @@ class RandomSeedTest(unittest.TestCase):
         torch.manual_seed(124)
         seed_worker(0)
         self.assertNotEqual(random.random(), first)
+
+
+class UpsampledSourceTest(unittest.TestCase):
+    def test_source_rates_are_discrete_unique_and_sr_dependent(self):
+        values = parse_source_sr_values(
+            "8000, 12000, 16000, 22050, 24000, 32000, 44100, 16000"
+        )
+        self.assertEqual(
+            values,
+            [8000, 12000, 16000, 22050, 24000, 32000, 44100],
+        )
+        self.assertEqual(source_sr_candidates(values, 48000), values)
+        self.assertEqual(
+            source_sr_candidates(values, 16000),
+            [8000, 12000],
+        )
+
+    def test_invalid_source_rates_are_rejected(self):
+        for value in ("", "0", "-8000, 16000"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                parse_source_sr_values(value)
+        with self.assertRaises(ValueError):
+            source_sr_candidates([8000], 0)
+
+    def test_downsample_upsample_preserves_length_and_removes_high_band(self):
+        algorithm_sr = 48000
+        samples = torch.arange(algorithm_sr // 10) / algorithm_sr
+        high_band = torch.sin(2 * torch.pi * 12000 * samples)
+
+        output = simulate_upsampled_source(
+            high_band,
+            algorithm_sr=algorithm_sr,
+            source_sr=16000,
+        )
+
+        self.assertEqual(output.shape, high_band.shape)
+        self.assertLess(output.square().mean(), high_band.square().mean() * 0.01)
+
+    def test_native_or_higher_source_rate_is_a_no_op(self):
+        audio = torch.randn(100)
+        self.assertIs(simulate_upsampled_source(audio, 48000, 48000), audio)
+        self.assertIs(simulate_upsampled_source(audio, 48000, 96000), audio)
 
 
 class MixingPolicyTest(unittest.TestCase):
@@ -121,11 +171,11 @@ class MixingPolicyTest(unittest.TestCase):
             ):
                 validate_mix_probabilities(noise_p, speech_p)
 
-    def test_speech_only_pair_is_exact_identity_and_skips_clipping(self):
+    def test_speech_only_pair_stays_identity_through_resampling(self):
         dataset = DNS4Dataset.__new__(DNS4Dataset)
         dataset._indices = [0]
         dataset.speech_files = ["speech.wav"]
-        dataset.segment_samples = 16
+        dataset.segment_samples = 1600
         dataset.sr = 16000
         dataset.noise_only_p = 0.05
         dataset.speech_only_p = 0.05
@@ -133,9 +183,8 @@ class MixingPolicyTest(unittest.TestCase):
         dataset.rir_files = []
         dataset.target_rms_min = -20.0
         dataset.target_rms_max = -20.0
-        dataset.p_resample = 0.0
-        dataset.resample_sr_min = 8000
-        dataset.resample_sr_max = 15000
+        dataset.p_resample = 1.0
+        dataset.source_sr_values = [8000]
         dataset.p_clipping = 1.0
         dataset.clip_snr_min = 0.0
         dataset.clip_snr_max = 20.0

@@ -10,8 +10,9 @@ RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2 at 48 kHz.
 This package does exactly one job: take a raw speech / noise / RIR corpus
 (e.g. DNS Challenge 4) and produce augmented `(noisy, clean)` WAV pairs —
 biquad EQ, RIR/reverb, SNR mixing, gain randomization, optional bandwidth
-limiting and clipping distortion. It does **not** know anything about any
-particular model's architecture, feature extraction, or training loop. Model
+simulation for upsampled lower-rate sources, and clipping distortion. It does
+**not** know anything about any particular model's architecture, feature
+extraction, or training loop. Model
 training scripts (e.g. RNNoise-ERB's `train.py`) live in their own model repo
 and consume the output of this package.
 
@@ -41,6 +42,31 @@ Run the command separately with different output directories when both are
 needed. These are independent augmentation runs, not synchronized copies.
 `resample_dataset.py` remains available when a downsampled copy of an existing
 dataset is explicitly preferred.
+
+### Upsampled lower-rate source simulation
+
+Some deployments run a 16 or 48 kHz enhancement algorithm on audio that was
+captured at a lower sample rate and upsampled only to satisfy the algorithm's
+input contract. The generator models that path with discrete, realistic source
+rates:
+
+```ini
+[augmentation]
+p_resample = 0.2
+source_sr_values = 8000, 12000, 16000, 22050, 24000, 32000, 44100
+```
+
+For each selected pair, both `noisy` and `target` follow the identical
+`algorithm_sr -> source_sr -> algorithm_sr` resampling path. This keeps the
+task as denoising of upsampled audio; unlike DeepFilterNet bandwidth-extension
+training, the target does not retain frequencies that the simulated source
+could not capture.
+
+Rates greater than or equal to the selected algorithm rate are removed
+automatically. A 48 kHz run can use the complete list, while a 16 kHz run uses
+only 8 and 12 kHz. Samples outside `p_resample` remain at the native algorithm
+rate. The default probability is 20% and should be adjusted to the expected
+deployment mix.
 
 ### RIR / DRR contract
 

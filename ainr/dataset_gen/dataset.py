@@ -131,6 +131,27 @@ def parse_snr_values(s: str) -> List[float]:
     return values
 
 
+def parse_source_sr_values(s: str) -> List[int]:
+    """Parse unique positive source sample rates while preserving order."""
+    values = [int(part.strip()) for part in s.split(',') if part.strip()]
+    if not values:
+        raise ValueError(
+            "[augmentation] source_sr_values must contain at least one value"
+        )
+    if any(value <= 0 for value in values):
+        raise ValueError(
+            "[augmentation] source_sr_values must contain only positive values"
+        )
+    return list(dict.fromkeys(values))
+
+
+def source_sr_candidates(values: List[int], algorithm_sr: int) -> List[int]:
+    """Return rates that genuinely simulate upsampling into ``algorithm_sr``."""
+    if algorithm_sr <= 0:
+        raise ValueError(f"algorithm_sr must be positive, got {algorithm_sr}")
+    return [value for value in values if value < algorithm_sr]
+
+
 def sample_snr(values: List[float]) -> float:
     """Uniformly sample one of DeepFilterNet's discrete SNR values."""
     return random.choice(values)
@@ -426,16 +447,20 @@ def active_rms(audio: torch.Tensor, sr: int,
 
 
 # ============================================================
-# Bandwidth Limitation
+# Upsampled Lower-Rate Source Simulation
 # ============================================================
 
-def bandwidth_limit(audio: torch.Tensor, sr: int,
-                    target_sr: int) -> torch.Tensor:
-    """降頻到 target_sr 再升回 sr，模擬頻寬受限"""
-    if target_sr >= sr:
+def simulate_upsampled_source(audio: torch.Tensor, algorithm_sr: int,
+                              source_sr: int) -> torch.Tensor:
+    """Simulate lower-rate capture followed by upsampling to the algorithm rate."""
+    if source_sr <= 0:
+        raise ValueError(f"source_sr must be positive, got {source_sr}")
+    if algorithm_sr <= 0:
+        raise ValueError(f"algorithm_sr must be positive, got {algorithm_sr}")
+    if source_sr >= algorithm_sr:
         return audio
-    down = torchaudio.functional.resample(audio, sr, target_sr)
-    up = torchaudio.functional.resample(down, target_sr, sr)
+    down = torchaudio.functional.resample(audio, algorithm_sr, source_sr)
+    up = torchaudio.functional.resample(down, source_sr, algorithm_sr)
     # 長度可能有微小差異
     if len(up) > len(audio):
         up = up[:len(audio)]
@@ -503,7 +528,7 @@ class DNS4Dataset(Dataset):
     4. Load and augment noise when required
     5. Discrete-SNR mixing for mixed samples
     6. Gain randomization
-    7. Bandwidth limitation (noisy + target)
+    7. Optional lower-rate source simulation (noisy + target)
     8. Clipping distortion (mixed/noise-only input only)
     9. Clipping prevention
     10. STFT → features + target gains  (return_raw=False)
@@ -558,9 +583,25 @@ class DNS4Dataset(Dataset):
         self.biquad_gain_db = cfg.getfloat('augmentation', 'biquad_gain_db')
         self.biquad_q_min = cfg.getfloat('augmentation', 'biquad_q_min')
         self.biquad_q_max = cfg.getfloat('augmentation', 'biquad_q_max')
-        self.p_resample = cfg.getfloat('augmentation', 'p_resample')
-        self.resample_sr_min = cfg.getint('augmentation', 'resample_sr_min')
-        self.resample_sr_max = cfg.getint('augmentation', 'resample_sr_max')
+        self.p_resample = cfg.getfloat('augmentation', 'p_resample', fallback=0.0)
+        if not math.isfinite(self.p_resample) or not 0.0 <= self.p_resample <= 1.0:
+            raise ValueError(
+                "[augmentation] p_resample must be in [0, 1], got "
+                f"{self.p_resample}"
+            )
+        configured_source_srs = parse_source_sr_values(cfg.get(
+            'augmentation',
+            'source_sr_values',
+            fallback='8000, 12000, 16000, 22050, 24000, 32000, 44100',
+        ))
+        self.source_sr_values = source_sr_candidates(
+            configured_source_srs, self.sr
+        )
+        if self.p_resample > 0.0 and not self.source_sr_values:
+            raise ValueError(
+                "[augmentation] p_resample is enabled, but source_sr_values "
+                f"contains no rate below algorithm sr={self.sr}"
+            )
         self.p_clipping = cfg.getfloat('augmentation', 'p_clipping')
         self.clip_snr_min = cfg.getfloat('augmentation', 'clip_snr_min')
         self.clip_snr_max = cfg.getfloat('augmentation', 'clip_snr_max')
@@ -895,11 +936,13 @@ class DNS4Dataset(Dataset):
         target = target * scale
         noisy = noisy * scale
 
-        # 7. Bandwidth limitation (同時套用在 noisy 和 target, 相同 target SR)
+        # 7. Simulate a lower-rate source upsampled into the algorithm rate.
+        # Apply the identical path to noisy and target: this is denoising of
+        # upsampled audio, not DeepFilterNet-style bandwidth extension.
         if random.random() < self.p_resample:
-            bw_sr = random.randint(self.resample_sr_min, self.resample_sr_max)
-            noisy = bandwidth_limit(noisy, self.sr, bw_sr)
-            target = bandwidth_limit(target, self.sr, bw_sr)
+            source_sr = random.choice(self.source_sr_values)
+            noisy = simulate_upsampled_source(noisy, self.sr, source_sr)
+            target = simulate_upsampled_source(target, self.sr, source_sr)
 
         # 8. Clipping distortion (input only). Skip exact identity pairs.
         if not speech_only and random.random() < self.p_clipping:

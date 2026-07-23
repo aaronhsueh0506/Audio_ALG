@@ -159,6 +159,10 @@ def gen_dataset(args):
     print(f"  Estimated gen time : {est_hours:.1f} hours ({t_sample:.3f}s/sample)")
     print(f"  Estimated disk     : {disk_str}  (16-bit WAV)")
     print(f"  Sample rate        : {SR} Hz")
+    if dataset.p_resample > 0.0:
+        source_srs = ", ".join(str(value) for value in dataset.source_sr_values)
+        print(f"  Upsampled sources  : {dataset.p_resample:.0%} "
+              f"from [{source_srs}] Hz")
     print(f"  Output: {args.output}/")
     print()
 
@@ -212,6 +216,8 @@ def gen_dataset(args):
             'snr_values_db': dataset.snr_values,
             'noise_only_p': dataset.noise_only_p,
             'speech_only_p': dataset.speech_only_p,
+            'p_resample': dataset.p_resample,
+            'source_sr_values': dataset.source_sr_values,
             'config': args.config,
         }
         with open(meta_path, 'w') as f:
