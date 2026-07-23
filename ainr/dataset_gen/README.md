@@ -52,7 +52,7 @@ rates:
 
 ```ini
 [augmentation]
-p_resample = 0.2
+p_resample = 0.1
 source_sr_values = 8000, 12000, 16000, 22050, 24000, 32000, 44100
 ```
 
@@ -65,7 +65,7 @@ could not capture.
 Rates greater than or equal to the selected algorithm rate are removed
 automatically. A 48 kHz run can use the complete list, while a 16 kHz run uses
 only 8 and 12 kHz. Samples outside `p_resample` remain at the native algorithm
-rate. The default probability is 20% and should be adjusted to the expected
+rate. The default probability is 10% and should be adjusted to the expected
 deployment mix.
 
 ### RIR / DRR contract

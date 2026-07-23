@@ -65,7 +65,7 @@ class DatasetConfigScopeTest(unittest.TestCase):
             dataset.source_sr_values,
             [8000, 12000, 16000, 22050, 24000, 32000, 44100],
         )
-        self.assertEqual(dataset.p_resample, 0.2)
+        self.assertEqual(dataset.p_resample, 0.1)
 
 
 class HoursPlanningTest(unittest.TestCase):
