@@ -124,14 +124,14 @@ def gen_dataset(args):
 
     dataset = DNS4Dataset(cfg, return_raw=True)
     SR = dataset.sr
-    epoch_size = len(dataset)
-    if epoch_size <= 0:
+    pass_size = len(dataset)
+    if pass_size <= 0:
         raise ValueError("DNS4Dataset contains no samples")
 
     pairs_dir = os.path.join(args.output, 'pairs')
     os.makedirs(pairs_dir, exist_ok=True)
 
-    n_rounds = (n_total + epoch_size - 1) // epoch_size
+    n_rounds = (n_total + pass_size - 1) // pass_size
     actual_hours = n_total * segment_sec / 3600
 
     # Profile 1 sample
@@ -147,9 +147,9 @@ def gen_dataset(args):
 
     disk_str = (f"{disk_bytes / 1024**3:.1f} GB" if disk_bytes >= 1024**3
                 else f"{disk_bytes / 1024**2:.0f} MB")
-    partial = n_total % epoch_size
+    partial = n_total % pass_size
     pass_note = (
-        f"{n_rounds} dataset pass(es), final pass {partial}/{epoch_size}"
+        f"{n_rounds} dataset pass(es), final pass {partial}/{pass_size}"
         if partial
         else f"{n_rounds} complete dataset pass(es)"
     )
@@ -167,7 +167,7 @@ def gen_dataset(args):
     #   無 --resume: 直接從 base_idx 起 (擴增, 不掃碟; start_idx 已保證不洗舊檔)。
     sample_count = base_idx
     start_round = 0
-    epoch_start = 0
+    pass_start = 0
     meta_path = os.path.join(args.output, 'meta.json')
 
     if args.resume:
@@ -180,12 +180,12 @@ def gen_dataset(args):
         sample_count = max(max_idx + 1, base_idx)
         done = sample_count - base_idx
         if done > 0:
-            start_round = done // epoch_size
-            epoch_start = done % epoch_size
+            start_round = done // pass_size
+            pass_start = done % pass_size
             print(f"Resuming: 本批已完成 {done} 筆 "
                   f"(max={max_idx:06d}.wav), "
                   f"從 {sample_count:06d}.wav 接續 "
-                  f"(round {start_round + 1}, epoch idx {epoch_start})...")
+                  f"(round {start_round + 1}, pass idx {pass_start})...")
         else:
             print(f"Resume: pairs/ 無 >= {base_idx:06d} 的檔 "
                   f"→ 從 {base_idx:06d}.wav 開始")
@@ -239,9 +239,9 @@ def gen_dataset(args):
             dataset._shuffle_indices()
             print(f"\n--- Round {r + 1}/{n_rounds} ---")
 
-        idx_start = epoch_start if r == start_round else 0
+        idx_start = pass_start if r == start_round else 0
         remaining = n_total - (sample_count - base_idx)
-        idx_stop = min(epoch_size, idx_start + remaining)
+        idx_stop = min(pass_size, idx_start + remaining)
 
         if n_workers > 0:
             indices = list(range(idx_start, idx_stop))
@@ -270,7 +270,7 @@ def gen_dataset(args):
     gen_elapsed = time.time() - gen_start
     batch_samples = sample_count - base_idx
     if batch_samples >= n_total:
-        completed_rounds = (batch_samples + epoch_size - 1) // epoch_size
+        completed_rounds = (batch_samples + pass_size - 1) // pass_size
         _save_meta(min(n_rounds, completed_rounds))
     print(f"\nDone. Batch has {batch_samples}/{n_total} pairs "
           f"({batch_samples * segment_sec / 3600:.3f} audio hours); "

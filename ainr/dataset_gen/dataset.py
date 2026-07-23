@@ -14,13 +14,10 @@ DNS4 Dataset + DeepFilterNet v2 風格 augmentation
 
 Standalone note (AINR extraction):
     This module is self-contained on purpose — dataset generation is model-
-    independent. The ERB-band helpers below (erb_rate/erb_inv/compute_erb_bands/
-    compute_hybrid_bands) are inlined copies of the same functions that also live
-    in the RNNoise-ERB model repo's train.py (used there for the model's feature
-    extractor). They are duplicated here — not imported from a model repo —
-    specifically so this package never depends on any downstream model's training
-    code. They are only exercised when DNS4Dataset(..., return_raw=False) is used
-    to compute STFT features directly (not the path gen_dataset.py takes).
+    independent. The ERB-band helpers below are retained only for the legacy
+    DNS4Dataset(..., return_raw=False) feature path. gen_dataset.py always uses
+    return_raw=True, so its config needs no FFT, ERB, model, training, or loss
+    parameters.
 """
 
 import configparser
@@ -514,14 +511,23 @@ class DNS4Dataset(Dataset):
     """
 
     def __init__(self, cfg: configparser.ConfigParser, return_raw: bool = False):
+        self.return_raw = return_raw
+
         # signal params
         self.sr = cfg.getint('signal', 'sr')
-        self.n_fft = cfg.getint('signal', 'n_fft')
-        self.win_len = cfg.getint('signal', 'win_len', fallback=self.n_fft)
-        self.hop_len = cfg.getint('signal', 'hop_len', fallback=self.win_len // 2)
-        self.n_bands = cfg.getint('signal', 'n_bands')
-        self.hybrid_cutoff_hz = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
-        self.n_erb_high_bands = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
+        if not return_raw:
+            self.n_fft = cfg.getint('signal', 'n_fft', fallback=512)
+            self.win_len = cfg.getint('signal', 'win_len', fallback=self.n_fft)
+            self.hop_len = cfg.getint(
+                'signal', 'hop_len', fallback=self.win_len // 2
+            )
+            self.n_bands = cfg.getint('signal', 'n_bands', fallback=22)
+            self.hybrid_cutoff_hz = cfg.getint(
+                'signal', 'hybrid_cutoff_hz', fallback=0
+            )
+            self.n_erb_high_bands = cfg.getint(
+                'signal', 'n_erb_high_bands', fallback=0
+            )
 
         # audio
         self.segment_sec = cfg.getfloat('audio', 'segment_sec')
@@ -559,10 +565,8 @@ class DNS4Dataset(Dataset):
         self.clip_snr_min = cfg.getfloat('augmentation', 'clip_snr_min')
         self.clip_snr_max = cfg.getfloat('augmentation', 'clip_snr_max')
 
-        self.return_raw = return_raw
-
-        # epoch size
-        self.epoch_size = cfg.getint('training', 'epoch_size')
+        # Optional generation-pass cap. This is not a training epoch setting.
+        self.pass_size = cfg.getint('gen', 'pass_size', fallback=0)
 
         # scan files (遞迴掃描所有子資料夾)
         speech_dir = cfg.get('paths', 'speech_dir')
@@ -587,8 +591,9 @@ class DNS4Dataset(Dataset):
         if rir_dir and os.path.isdir(rir_dir):
             self.rir_files = self._load_rir_paths_cached(rir_dir)
 
-        # ERB bands
-        self.bin_edges = self._compute_erb_bands()
+        # The WAV-pair generator does not compute model features.
+        if not return_raw:
+            self.bin_edges = self._compute_erb_bands()
 
         print(f"DNS4Dataset: {len(self.speech_files)} speech, "
               f"{len(self.noise_files)} noise, "
@@ -678,11 +683,11 @@ class DNS4Dataset(Dataset):
         return passed
 
     def _shuffle_indices(self):
-        """每 epoch 開始時 shuffle，取 epoch_size 個"""
+        """Shuffle source speech files for the next generation pass."""
         indices = list(range(len(self.speech_files)))
         random.shuffle(indices)
-        if self.epoch_size > 0:
-            self._indices = indices[:self.epoch_size]
+        if self.pass_size > 0:
+            self._indices = indices[:self.pass_size]
         else:
             self._indices = indices
 

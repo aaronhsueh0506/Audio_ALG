@@ -1,7 +1,9 @@
 """Regression tests for dataset generation planning and RIR alignment."""
 
+import configparser
 import random
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import torch
@@ -18,6 +20,44 @@ from dataset_gen.dataset import (
 )
 from dataset_gen.gen_dataset import hours_to_sample_count, seed_worker
 from dataset_gen.resample_dataset import resampled_num_frames
+
+
+class DatasetConfigScopeTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.cfg = configparser.ConfigParser()
+        cls.cfg.read(Path(__file__).parents[1] / "config.example.ini")
+
+    def test_example_contains_generation_sections_only(self):
+        self.assertEqual(
+            set(self.cfg.sections()),
+            {
+                "signal",
+                "paths",
+                "audio",
+                "gen",
+                "mixing",
+                "rir",
+                "noise",
+                "augmentation",
+            },
+        )
+        for section in ("model", "training", "perceptual_loss"):
+            self.assertFalse(self.cfg.has_section(section))
+
+    def test_raw_generator_needs_no_model_feature_or_training_keys(self):
+        with (
+            patch(
+                "dataset_gen.dataset.glob.glob",
+                side_effect=(["speech.wav"], ["noise.wav"]),
+            ),
+            patch("dataset_gen.dataset.os.path.isdir", return_value=False),
+        ):
+            dataset = DNS4Dataset(self.cfg, return_raw=True)
+
+        self.assertFalse(hasattr(dataset, "n_fft"))
+        self.assertFalse(hasattr(dataset, "bin_edges"))
+        self.assertEqual(len(dataset), 1)
 
 
 class HoursPlanningTest(unittest.TestCase):

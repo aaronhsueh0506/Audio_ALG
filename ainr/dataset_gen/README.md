@@ -15,6 +15,18 @@ particular model's architecture, feature extraction, or training loop. Model
 training scripts (e.g. RNNoise-ERB's `train.py`) live in their own model repo
 and consume the output of this package.
 
+### Config scope
+
+`config.example.ini` contains generation settings only: working sample rate,
+source paths, segment length, generation/resume controls, mixing, RIR, noise,
+and waveform augmentations. Model architecture, FFT/ERB feature parameters,
+optimizer, training schedule, and loss settings stay in the RNNoise-ERB,
+GTCRN, or DeepFilterNet2 model config that consumes the generated pairs.
+
+The optional `[gen] pass_size` limits how many shuffled speech files form one
+generation pass; it is not a training epoch. Omitting it or setting it to `0`
+uses all speech files.
+
 ## Design: one selected sample rate per run
 
 Each invocation generates exactly one dataset at the requested working rate.
