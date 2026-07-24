@@ -117,6 +117,33 @@
 #   SP-S9:   command-line override rejection (round-4 P1-1), all three
 #            Makefiles (pipelines/lib-aec/lib-nr, submodule paths -- stable
 #            since round-4, no round-6-only feature needed)
+#   SP-S9b:  FP-policy allow-list redesign (replicated from audio_common's/
+#            AEC's identical fix): bypass shapes the OLD 9-item deny-list
+#            never caught (bare glob */?/[]/, tilde, real shell redirection
+#            >/<, process substitution <(...)), the exact-token $(filter)
+#            check's own distinct code path, the FP-policy check's OWN
+#            internal variables (FP_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/
+#            FP_CONFLICT_FLAGS/FP_ALLOWED_CHARS_RE -- SHELL_SAFE_ALLOWLIST_RC
+#            is this round's rename of what was FP_ALLOWLIST_RC when this
+#            test was first written, broadened by the SP-S9c fix below to
+#            also gate LDFLAGS content) command-line/`-e` override rejection,
+#            and the positive control (a plain override-free build succeeds,
+#            including the internal -DAUDIO_PIPELINE_BACKEND_STR define
+#            reaching the compile line)
+#   SP-S9c:  link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage
+#            (this task, replicated from audio_common's identical S25 fix):
+#            SP-S9b's allow-list originally validated FP_INPUT_FLAGS only
+#            (CFLAGS/CXXFLAGS/CPPFLAGS) -- LDFLAGS/EXTRA_LDFLAGS were never
+#            inspected at all, even though LDFLAGS is embedded in every real
+#            link recipe ($(LINK) ... $(LDFLAGS)) the same way CFLAGS is
+#            embedded in every compile recipe; reproduced live via
+#            `make aec_nr_pipeline EXTRA_LDFLAGS=';id'`. Covers the
+#            injection repro, the same glob/tilde/redirect/process-
+#            substitution matrix SP-S9b runs for EXTRA_CFLAGS, a positive
+#            control (a real `-Wl,-rpath,... -L...` link flag still builds
+#            AND runs test_audio_pipeline to ALL PASS), and command-line/`-e`
+#            override rejection of SHELL_SAFE_INPUT_FLAGS/
+#            SHELL_SAFE_ALLOWLIST_RC via an EXTRA_LDFLAGS payload specifically
 #   SP-S10:  lib/aec fresh-archive discipline (round-4 P1-4) -- round-6:
 #            rewritten against the PRIMARY AEC repo ($AEC_R6_DIR) with
 #            scratch OBJ_ROOT/BIN_ROOT (the round-5 version of this scenario
@@ -977,6 +1004,276 @@ sp9_probe_objdir="$(make -s BACKEND=kiss EXTRA_CFLAGS=-DSP9_PROBE print-obj-dir)
   || fail "SP-S9: pipelines EXTRA_CFLAGS=-DSP9_PROBE print-obj-dir produced no output"
 [ "$sp9_probe_objdir" != "$sp9_plain_objdir" ] && pass "SP-S9: EXTRA_CFLAGS=-DSP9_PROBE obj dir differs from the plain-query obj dir" \
   || fail "SP-S9: EXTRA_CFLAGS=-DSP9_PROBE obj dir COLLIDES with the plain-query obj dir ($sp9_plain_objdir)"
+
+echo "############################################################"
+echo "# SP-S9b: FP-policy allow-list redesign (this task) -- bypass shapes"
+echo "# the OLD 9-item deny-list never caught, the exact-token filter's own"
+echo "# distinct code path, the FP-policy check's OWN internal variables,"
+echo "# and the legitimate positive control"
+echo "############################################################"
+# See the header comment (search "SP-S9b") and pipelines/Makefile's own
+# "REDESIGN" comment for the full writeup -- replicated verbatim from
+# audio_common's/AEC's identical S24-style additions, scoped to this
+# repo's own print-obj-dir gate. Every negative case below is a real, live
+# bypass of the OLD deny-list this repo used to have (single quote, double
+# quote, backslash, backtick, a literal "$(" sequence, semicolon, pipe,
+# ampersand, @-response-file -- none of bare glob characters, tilde, or
+# real shell redirection/process substitution), each now REJECTED by the
+# character-class allow-list. These are all pure parse-time rejections (the
+# FP-policy checks run unconditionally before any recipe, including
+# print-obj-dir's own, ever executes), so -- exactly like SP-S9 above --
+# no scratch OBJ_ROOT/BIN_ROOT is needed: a rejected build never creates a
+# directory at all.
+sp9b_check_rejected() {
+  local label="$1" flag_value="$2" expect_chars="$3" log
+  log="$SCRATCH_ROOT/tmp/sp9b_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_').log"
+  if env EXTRA_CFLAGS="$flag_value" make BACKEND=kiss print-obj-dir >"$log" 2>&1; then
+    fail "SP-S9b: EXTRA_CFLAGS='$flag_value' ($label) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+  elif grep -q "FP policy conflict" "$log" && grep -q "outside the allowed set" "$log" && grep -qF "found: \"$expect_chars\"" "$log"; then
+    pass "SP-S9b: EXTRA_CFLAGS='$flag_value' ($label) print-obj-dir correctly FAILS, identifying \"$expect_chars\""
+  else
+    fail "SP-S9b: EXTRA_CFLAGS='$flag_value' ($label) print-obj-dir failed but did NOT identify \"$expect_chars\" specifically"
+    cat "$log" >&2
+  fi
+}
+
+sp9b_check_rejected "glob-star"     '-O*t'            '*'
+sp9b_check_rejected "glob-question" '-Ofas?'          '?'
+sp9b_check_rejected "glob-brackets" '-Ofas[t]'        '[]'
+sp9b_check_rejected "tilde"         '~/pwned'         '~'
+sp9b_check_rejected "redirect-out"  '-I>/tmp/evil'    '>'
+sp9b_check_rejected "redirect-in"   '-I</etc/passwd'  '<'
+sp9b_check_rejected "process-subst" '<(echo hi)'      '()<'
+
+# Single-quote -- still caught by the ONE surviving pure-Make $(findstring)
+# check (the allow-list's own $(shell) call needs it excluded first to
+# safely single-quote-embed the rest of the text), so this message still
+# says "single-quote character" verbatim, unlike the allow-list cases above.
+SP9B_LOG_SQ="$SCRATCH_ROOT/tmp/sp9b_single_quote.log"
+if env EXTRA_CFLAGS="-O'f'ast" make BACKEND=kiss print-obj-dir >"$SP9B_LOG_SQ" 2>&1; then
+  fail "SP-S9b: EXTRA_CFLAGS=\"-O'f'ast\" (quote-split) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+elif grep -q "FP policy conflict" "$SP9B_LOG_SQ" && grep -q "single-quote" "$SP9B_LOG_SQ"; then
+  pass "SP-S9b: EXTRA_CFLAGS=\"-O'f'ast\" (quote-split) print-obj-dir correctly FAILS, identifying the single-quote character"
+else
+  fail "SP-S9b: EXTRA_CFLAGS=\"-O'f'ast\" (quote-split) print-obj-dir failed but did NOT identify the single-quote character"
+  cat "$SP9B_LOG_SQ" >&2
+fi
+
+# Positive control (distinct code path): a Make-native ${VAR}-style
+# expansion still must be rejected via the EXACT-TOKEN $(filter) check, not
+# the character allow-list -- GNU Make resolves ${...} identically to
+# $(...) before either FP-policy check ever runs, landing the plain,
+# ALL-ALLOWED-CHARACTERS token "-Ofast" in FP_INPUT_FLAGS, which only the
+# unchanged FP_CONFLICT_FLAGS $(filter) check can still reject.
+export SP9B_R11_FLAG=-Ofast
+SP9B_LOG_R11="$SCRATCH_ROOT/tmp/sp9b_r11_dollar_brace.log"
+if make -n BACKEND=kiss 'EXTRA_CFLAGS=${SP9B_R11_FLAG}' lib >"$SP9B_LOG_R11" 2>&1; then
+  fail "SP-S9b: SP9B_R11_FLAG=-Ofast (exported) make -n EXTRA_CFLAGS=\${SP9B_R11_FLAG} lib unexpectedly SUCCEEDED (must be rejected via the exact-token filter)"
+elif grep -q "FP policy conflict" "$SP9B_LOG_R11" && grep -q -- "-Ofast" "$SP9B_LOG_R11" && ! grep -q "outside the allowed set" "$SP9B_LOG_R11"; then
+  pass "SP-S9b: SP9B_R11_FLAG=-Ofast (exported) make -n EXTRA_CFLAGS=\${SP9B_R11_FLAG} lib correctly FAILS via the exact-token \$(filter) check (not the character allow-list)"
+else
+  fail "SP-S9b: SP9B_R11_FLAG=-Ofast (exported) make -n EXTRA_CFLAGS=\${SP9B_R11_FLAG} lib failed but not via the expected exact-token filter path"
+  cat "$SP9B_LOG_R11" >&2
+fi
+unset SP9B_R11_FLAG
+
+# The FP-policy check's OWN internal variables (FP_INPUT_FLAGS/
+# SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS/FP_ALLOWED_CHARS_RE --
+# SHELL_SAFE_ALLOWLIST_RC is this round's rename of what was FP_ALLOWLIST_RC
+# when this test was first written, broadened by the SP-S9c fix below to
+# also gate LDFLAGS content) must themselves be rejected as command-line/`-e`
+# overrides -- otherwise a caller could silently defeat every check above
+# while the REAL CFLAGS/CXXFLAGS/CPPFLAGS used in actual compile recipes
+# still carry the dangerous content. Both plain command-line and
+# `-e`-environment forms are checked, same as SP-S9 above does for
+# CFLAGS/FP_POLICY. (SP-S9c below repeats the SHELL_SAFE_INPUT_FLAGS/
+# SHELL_SAFE_ALLOWLIST_RC pair of this same matrix once more via an
+# EXTRA_LDFLAGS payload, since that is the specific vector SP-S9c exists to
+# close.)
+sp9b_check_override_rejected() {
+  local varname="$1" varvalue="$2" payload="$3" use_dash_e="$4" log
+  log="$SCRATCH_ROOT/tmp/sp9b_override_$(printf '%s' "$varname" | tr -c 'A-Za-z0-9' '_')_$use_dash_e.log"
+  if [ "$use_dash_e" = "dashe" ]; then
+    if env "$varname=$varvalue" make -e BACKEND=kiss EXTRA_CFLAGS="$payload" print-obj-dir >"$log" 2>&1; then
+      fail "SP-S9b: env $varname=$varvalue make -e print-obj-dir unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the FP-policy checks)"
+    elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
+      pass "SP-S9b: env $varname=$varvalue make -e print-obj-dir correctly FAILS, mentioning '$varname cannot be overridden'"
+    else
+      fail "SP-S9b: env $varname=$varvalue make -e print-obj-dir failed but did NOT mention '$varname cannot be overridden'"
+      cat "$log" >&2
+    fi
+  else
+    if make BACKEND=kiss EXTRA_CFLAGS="$payload" "$varname=$varvalue" print-obj-dir >"$log" 2>&1; then
+      fail "SP-S9b: make $varname=$varvalue print-obj-dir unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the FP-policy checks)"
+    elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
+      pass "SP-S9b: make $varname=$varvalue print-obj-dir correctly FAILS, mentioning '$varname cannot be overridden'"
+    else
+      fail "SP-S9b: make $varname=$varvalue print-obj-dir failed but did NOT mention '$varname cannot be overridden'"
+      cat "$log" >&2
+    fi
+  fi
+}
+sp9b_check_override_rejected "FP_INPUT_FLAGS"         "clean" '-O2;rm' cmdline
+sp9b_check_override_rejected "SHELL_SAFE_ALLOWLIST_RC" "0"     '-O2;rm' cmdline
+sp9b_check_override_rejected "FP_ALLOWED_CHARS_RE"    ".*"    '-O2;rm' cmdline
+sp9b_check_override_rejected "FP_CONFLICT_FLAGS"      ""      '-Ofast' cmdline
+sp9b_check_override_rejected "FP_INPUT_FLAGS"         "clean" '-O2;rm' dashe
+sp9b_check_override_rejected "SHELL_SAFE_ALLOWLIST_RC" "0"     '-O2;rm' dashe
+sp9b_check_override_rejected "FP_ALLOWED_CHARS_RE"    ".*"    '-O2;rm' dashe
+sp9b_check_override_rejected "FP_CONFLICT_FLAGS"      ""      '-Ofast' dashe
+
+# Positive control: a plain, override-free build must still succeed, AND
+# the internal -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" define (this repo's own
+# wrinkle -- a legitimate Makefile-generated token containing a backslash
+# and a double quote, neither of which is in the allow-list's character
+# set) must still reach the actual compile line, protected by the
+# `-DAUDIO_PIPELINE_BACKEND_STR=%` filter-out exclusion. Uses scratch
+# OBJ_ROOT/BIN_ROOT (this one actually builds, unlike every case above).
+mkscratch sp9b_pos
+SP9B_POS_OBJ_ROOT="$SCRATCH_ROOT/sp9b_pos/obj"
+SP9B_POS_BIN_ROOT="$SCRATCH_ROOT/sp9b_pos/bin"
+SP9B_POS_LOG="$SCRATCH_ROOT/tmp/sp9b_positive_build.log"
+if make BACKEND=kiss OBJ_ROOT="$SP9B_POS_OBJ_ROOT" BIN_ROOT="$SP9B_POS_BIN_ROOT" libaudio_pipeline.a >"$SP9B_POS_LOG" 2>&1; then
+  pass "SP-S9b: plain override-free 'make libaudio_pipeline.a' SUCCEEDS under the new allow-list"
+else
+  fail "SP-S9b: plain override-free 'make libaudio_pipeline.a' unexpectedly FAILED under the new allow-list"
+  cat "$SP9B_POS_LOG" >&2
+fi
+if grep -qF -- '-DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"' "$SP9B_POS_LOG"; then
+  pass "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR=\\\"kiss\\\" still reaches the audio_pipeline.c compile line"
+else
+  fail "SP-S9b: -DAUDIO_PIPELINE_BACKEND_STR define did NOT appear on the compile line"
+  cat "$SP9B_POS_LOG" >&2
+fi
+
+echo "############################################################"
+echo "# SP-S9c: link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage"
+echo "############################################################"
+# See the header comment (search "SP-S9c") and pipelines/Makefile's own
+# "link-flags character-safety coverage" comment for the full writeup --
+# replicated from audio_common's identical S25 fix. Before this task's fix,
+# SP-S9b's allow-list validated FP_INPUT_FLAGS only (CFLAGS/CXXFLAGS/
+# CPPFLAGS) -- LDFLAGS/EXTRA_LDFLAGS were never inspected at all, even
+# though LDFLAGS is embedded in every real link recipe ($(LINK) ...
+# $(LDFLAGS)) the exact same way CFLAGS is embedded in every compile
+# recipe. Same discipline as SP-S9b: the negative cases below are all pure
+# parse-time rejections (the FP-policy checks run unconditionally before
+# any recipe, including print-obj-dir's own, ever executes), so no scratch
+# OBJ_ROOT/BIN_ROOT is needed there -- a rejected build never creates a
+# directory at all.
+sp9c_check_rejected() {
+  local label="$1" flag_value="$2" expect_chars="$3" log
+  log="$SCRATCH_ROOT/tmp/sp9c_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_').log"
+  if env EXTRA_LDFLAGS="$flag_value" make BACKEND=kiss print-obj-dir >"$log" 2>&1; then
+    fail "SP-S9c: EXTRA_LDFLAGS='$flag_value' ($label) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+  elif grep -q "FP policy conflict" "$log" && grep -q "outside the allowed set" "$log" && grep -qF "found: \"$expect_chars\"" "$log"; then
+    pass "SP-S9c: EXTRA_LDFLAGS='$flag_value' ($label) print-obj-dir correctly FAILS, identifying \"$expect_chars\""
+  else
+    fail "SP-S9c: EXTRA_LDFLAGS='$flag_value' ($label) print-obj-dir failed but did NOT identify \"$expect_chars\" specifically"
+    cat "$log" >&2
+  fi
+}
+
+# The literal reported repro (Codex review): a semicolon payload via
+# EXTRA_LDFLAGS, dry-run-confirmed (via `make -n`, zero files touched)
+# BEFORE this task's fix to sail through untouched and land live in a real
+# link recipe -- `make aec_nr_pipeline EXTRA_LDFLAGS=';id'` (with AC_LIB/
+# AEC_LIB/NR_LIB pre-resolved so the dispatch lands directly on this repo's
+# OWN link recipe instead of recursing into audio_common's already-fixed
+# sub-make first) showed a real `cc -o ... $(LDFLAGS)` recipe line with the
+# `;id` payload sitting live and unfiltered after the `-lm`.
+sp9c_check_rejected "injection-semicolon" ';id' ';'
+
+# Same glob/tilde/redirect/process-substitution matrix SP-S9b runs for
+# EXTRA_CFLAGS, replicated verbatim for EXTRA_LDFLAGS.
+sp9c_check_rejected "glob-star"     '-L*t'            '*'
+sp9c_check_rejected "glob-question" '-Lfas?'          '?'
+sp9c_check_rejected "glob-brackets" '-Lfas[t]'        '[]'
+sp9c_check_rejected "tilde"         '~/pwned'         '~'
+sp9c_check_rejected "redirect-out"  '-lm>/tmp/evil'   '>'
+sp9c_check_rejected "redirect-in"   '-lm</etc/passwd' '<'
+sp9c_check_rejected "process-subst" '<(echo hi)'      '()<'
+
+# Single-quote -- still caught by the ONE surviving pure-Make $(findstring)
+# check, same as SP-S9b's own single-quote case.
+SP9C_LOG_SQ="$SCRATCH_ROOT/tmp/sp9c_single_quote.log"
+if env EXTRA_LDFLAGS="-l'p'thread" make BACKEND=kiss print-obj-dir >"$SP9C_LOG_SQ" 2>&1; then
+  fail "SP-S9c: EXTRA_LDFLAGS=\"-l'p'thread\" (quote-split) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
+elif grep -q "FP policy conflict" "$SP9C_LOG_SQ" && grep -q "single-quote" "$SP9C_LOG_SQ"; then
+  pass "SP-S9c: EXTRA_LDFLAGS=\"-l'p'thread\" (quote-split) print-obj-dir correctly FAILS, identifying the single-quote character"
+else
+  fail "SP-S9c: EXTRA_LDFLAGS=\"-l'p'thread\" (quote-split) print-obj-dir failed but did NOT identify the single-quote character"
+  cat "$SP9C_LOG_SQ" >&2
+fi
+
+# Positive control: a real link flag this project's own Makefile comment
+# anticipates a consumer needing (the "-Wl,-rpath,dir / -Wa,--option
+# pass-through flags" example the allow-list's own char-set comment gives)
+# must still pass the character check AND actually build AND run --
+# building the ONE real, non-archive-only binary target this suite's
+# SP-S9b positive control (libaudio_pipeline.a, an `ar` recipe that never
+# touches $(LDFLAGS) at all) does not exercise: test_audio_pipeline is a
+# self-contained unit-test binary that prints "ALL PASS" and exits 0 when
+# every internal check passes, so it doubles as this control's own
+# link-succeeded-AND-still-correct assertion. Uses scratch OBJ_ROOT/BIN_ROOT
+# (this one actually builds and links, unlike every negative case above).
+mkscratch sp9c_pos
+SP9C_POS_OBJ_ROOT="$SCRATCH_ROOT/sp9c_pos/obj"
+SP9C_POS_BIN_ROOT="$SCRATCH_ROOT/sp9c_pos/bin"
+SP9C_POS_BUILD_LOG="$SCRATCH_ROOT/tmp/sp9c_positive_build.log"
+if env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make BACKEND=kiss OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" test_audio_pipeline >"$SP9C_POS_BUILD_LOG" 2>&1; then
+  pass "SP-S9c: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, real rpath/library-path link flag) builds test_audio_pipeline"
+  if grep -qF -- '-Wl,-rpath,/usr/lib -L/usr/lib' "$SP9C_POS_BUILD_LOG"; then
+    pass "SP-S9c: the real link flag reaches the actual \$(LINK) recipe line for test_audio_pipeline"
+  else
+    fail "SP-S9c: the real link flag did NOT appear on the test_audio_pipeline link recipe line"
+    cat "$SP9C_POS_BUILD_LOG" >&2
+  fi
+  SP9C_POS_BINDIR="$(env EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' make -s BACKEND=kiss OBJ_ROOT="$SP9C_POS_OBJ_ROOT" BIN_ROOT="$SP9C_POS_BIN_ROOT" print-bin-dir)"
+  SP9C_POS_RUN_LOG="$SCRATCH_ROOT/tmp/sp9c_positive_run.log"
+  if "$SP9C_POS_BINDIR/test_audio_pipeline" >"$SP9C_POS_RUN_LOG" 2>&1 && grep -q "^ALL PASS$" "$SP9C_POS_RUN_LOG"; then
+    pass "SP-S9c: test_audio_pipeline (built with the real rpath/library-path link flag) RUNS to ALL PASS"
+  else
+    fail "SP-S9c: test_audio_pipeline (built with the real rpath/library-path link flag) did not run to ALL PASS"
+    cat "$SP9C_POS_RUN_LOG" >&2
+  fi
+else
+  fail "SP-S9c: EXTRA_LDFLAGS='-Wl,-rpath,/usr/lib -L/usr/lib' (positive control, legitimate link flag) unexpectedly FAILED to build"
+  cat "$SP9C_POS_BUILD_LOG" >&2
+fi
+
+# Command-line/`-e` override-rejection for SHELL_SAFE_INPUT_FLAGS/
+# SHELL_SAFE_ALLOWLIST_RC (SP-S9b already covers both via an EXTRA_CFLAGS
+# payload; this repeats it via EXTRA_LDFLAGS specifically, since that is the
+# exact vector this task's fix exists to close -- an override here must not
+# be able to let an EXTRA_LDFLAGS injection payload back through).
+sp9c_check_override_rejected() {
+  local varname="$1" varvalue="$2" payload="$3" use_dash_e="$4" log
+  log="$SCRATCH_ROOT/tmp/sp9c_override_$(printf '%s' "$varname" | tr -c 'A-Za-z0-9' '_')_$use_dash_e.log"
+  if [ "$use_dash_e" = "dashe" ]; then
+    if env "$varname=$varvalue" make -e BACKEND=kiss EXTRA_LDFLAGS="$payload" print-obj-dir >"$log" 2>&1; then
+      fail "SP-S9c: env $varname=$varvalue make -e print-obj-dir (EXTRA_LDFLAGS payload) unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the link-flags character-safety check)"
+    elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
+      pass "SP-S9c: env $varname=$varvalue make -e print-obj-dir (EXTRA_LDFLAGS payload) correctly FAILS, mentioning '$varname cannot be overridden'"
+    else
+      fail "SP-S9c: env $varname=$varvalue make -e print-obj-dir (EXTRA_LDFLAGS payload) failed but did NOT mention '$varname cannot be overridden'"
+      cat "$log" >&2
+    fi
+  else
+    if make BACKEND=kiss EXTRA_LDFLAGS="$payload" "$varname=$varvalue" print-obj-dir >"$log" 2>&1; then
+      fail "SP-S9c: make $varname=$varvalue print-obj-dir (EXTRA_LDFLAGS payload) unexpectedly SUCCEEDED (must be rejected: overriding $varname must not defeat the link-flags character-safety check)"
+    elif grep -q "cannot be overridden" "$log" && grep -q "$varname" "$log"; then
+      pass "SP-S9c: make $varname=$varvalue print-obj-dir (EXTRA_LDFLAGS payload) correctly FAILS, mentioning '$varname cannot be overridden'"
+    else
+      fail "SP-S9c: make $varname=$varvalue print-obj-dir (EXTRA_LDFLAGS payload) failed but did NOT mention '$varname cannot be overridden'"
+      cat "$log" >&2
+    fi
+  fi
+}
+sp9c_check_override_rejected "SHELL_SAFE_INPUT_FLAGS"  "clean" ';rm' cmdline
+sp9c_check_override_rejected "SHELL_SAFE_ALLOWLIST_RC" "0"     ';rm' cmdline
+sp9c_check_override_rejected "SHELL_SAFE_INPUT_FLAGS"  "clean" ';rm' dashe
+sp9c_check_override_rejected "SHELL_SAFE_ALLOWLIST_RC" "0"     ';rm' dashe
 
 echo "############################################################"
 echo "# SP-S10: lib/aec archive freshness (round-6: scratch-side against the"
