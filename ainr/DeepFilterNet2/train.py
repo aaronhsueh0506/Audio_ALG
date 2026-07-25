@@ -15,8 +15,11 @@ import configparser
 import glob
 import math
 import os
+import random
 
+import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, RandomSampler, Sampler, Subset
 import tqdm
@@ -24,31 +27,113 @@ import tqdm
 from model import DeepFilterNet2
 
 
+MODEL_VERSION = 'dfn2_mask_lookahead_explicit_df_fir_v2'
+FEATURE_VERSION = 'dfn2_dual_ema_state_v2'
+LOSS_VERSION = 'dfn_mrsl_mag_complex_gamma_v2'
+
+
 # ============================================================
 # Multi-resolution STFT loss
 # ============================================================
 
-def _stft_loss_single(pred, target, n_fft, hop_size, win_size, gamma=0.3):
-    window = torch.hann_window(win_size, device=pred.device)
-    P = torch.stft(pred,   n_fft, hop_size, win_size, window, return_complex=True).abs()
-    T = torch.stft(target, n_fft, hop_size, win_size, window, return_complex=True).abs()
-    # Clamp before fractional power: d(x**gamma)/dx is singular at x=0 for gamma<1.
-    P = P.clamp_min(1e-12).pow(gamma)
-    T = T.clamp_min(1e-12).pow(gamma)
-    return F.mse_loss(P, T)
+class _SafeAngle(torch.autograd.Function):
+    """DeepFilterNet-compatible complex angle with a finite zero gradient."""
+
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return torch.angle(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        (x,) = ctx.saved_tensors
+        inv_power = grad / (x.real.square() + x.imag.square()).clamp_min(1e-10)
+        return torch.complex(-x.imag * inv_power, x.real * inv_power)
 
 
-def multi_res_stft_loss(pred, target, fft_sizes=(256, 512, 1024, 2048),
-                        hop_sizes=None, win_sizes=None, gamma=0.3):
-    if hop_sizes is None:
-        hop_sizes = [s // 4 for s in fft_sizes]
-    if win_sizes is None:
-        win_sizes = list(fft_sizes)
-    total = sum(
-        _stft_loss_single(pred, target, n, h, w, gamma)
-        for n, h, w in zip(fft_sizes, hop_sizes, win_sizes)
+class _LossStft(nn.Module):
+    def __init__(self, n_fft):
+        super().__init__()
+        self.n_fft = n_fft
+        self.hop = n_fft // 4
+        self.register_buffer('window', torch.hann_window(n_fft))
+
+    def forward(self, waveform):
+        return torch.stft(
+            waveform,
+            self.n_fft,
+            self.hop,
+            window=self.window,
+            normalized=True,
+            return_complex=True,
+        )
+
+
+class MultiResSpecLoss(nn.Module):
+    """DeepFilterNet phase-aware multi-resolution spectrogram objective.
+
+    Every resolution contributes both gamma-compressed magnitude MSE and
+    gamma-compressed complex MSE.  Resolution losses are summed, matching the
+    upstream implementation.  ``clean=0`` remains a finite pure-noise target.
+    """
+
+    def __init__(self, fft_sizes=(256, 512, 1024, 2048), gamma=0.3,
+                 factor=500.0, factor_complex=500.0):
+        super().__init__()
+        self.gamma = gamma
+        self.factor = factor
+        self.factor_complex = factor_complex
+        self.stfts = nn.ModuleDict({str(n): _LossStft(n) for n in fft_sizes})
+
+    def forward(self, enhanced, clean):
+        total = torch.zeros((), device=enhanced.device, dtype=enhanced.dtype)
+        for stft_fn in self.stfts.values():
+            y = stft_fn(enhanced)
+            s = stft_fn(clean)
+            y_abs = y.abs()
+            s_abs = s.abs()
+            if self.gamma != 1:
+                y_abs = y_abs.clamp_min(1e-12).pow(self.gamma)
+                s_abs = s_abs.clamp_min(1e-12).pow(self.gamma)
+            total = total + F.mse_loss(y_abs, s_abs) * self.factor
+            if self.factor_complex != 0:
+                if self.gamma != 1:
+                    y = y_abs * torch.exp(1j * _SafeAngle.apply(y))
+                    s = s_abs * torch.exp(1j * _SafeAngle.apply(s))
+                total = total + F.mse_loss(
+                    torch.view_as_real(y),
+                    torch.view_as_real(s),
+                ) * self.factor_complex
+        return total
+
+
+def read_loss_config(cfg):
+    section = 'multi_res_spec_loss'
+    fft_sizes = tuple(
+        int(value.strip())
+        for value in cfg.get(
+            section, 'fft_sizes', fallback='256,512,1024,2048'
+        ).split(',')
+        if value.strip()
     )
-    return total / len(fft_sizes)
+    loss_cfg = {
+        'fft_sizes': fft_sizes,
+        'gamma': cfg.getfloat(section, 'gamma', fallback=0.3),
+        'factor': cfg.getfloat(section, 'factor', fallback=500.0),
+        'factor_complex': cfg.getfloat(
+            section, 'factor_complex', fallback=500.0
+        ),
+    }
+    if (
+        not fft_sizes
+        or any(n <= 0 or n % 2 for n in fft_sizes)
+        or not 0 < loss_cfg['gamma'] <= 1
+        or loss_cfg['factor'] < 0
+        or loss_cfg['factor_complex'] < 0
+        or loss_cfg['factor'] + loss_cfg['factor_complex'] == 0
+    ):
+        raise ValueError('invalid DeepFilterNet MultiResSpecLoss configuration')
+    return loss_cfg
 
 
 # ============================================================
@@ -141,11 +226,151 @@ def dataloader_worker_kwargs(num_workers, pin_memory, prefetch_factor):
     return kwargs
 
 
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def make_norm_alpha(sr, hop_len, tau):
+    """Match DeepFilterNet's stable rounded EMA coefficient."""
+    exact = math.exp(-(hop_len / sr) / tau)
+    precision = 3
+    alpha = 1.0
+    while alpha >= 1.0:
+        alpha = round(exact, precision)
+        precision += 1
+    return alpha
+
+
+def read_feature_config(cfg, sr, hop_len):
+    section = 'feature'
+    erb_tau = cfg.getfloat(section, 'erb_norm_tau_sec', fallback=1.0)
+    spec_tau = cfg.getfloat(section, 'spec_norm_tau_sec', fallback=1.0)
+    feature_cfg = {
+        'erb_tau_sec': erb_tau,
+        'erb_alpha': make_norm_alpha(sr, hop_len, erb_tau),
+        'erb_init_lo_db': cfg.getfloat(
+            section, 'erb_norm_init_lo_db', fallback=-60.0
+        ),
+        'erb_init_hi_db': cfg.getfloat(
+            section, 'erb_norm_init_hi_db', fallback=-90.0
+        ),
+        'erb_scale_db': cfg.getfloat(
+            section, 'erb_norm_scale_db', fallback=40.0
+        ),
+        'spec_tau_sec': spec_tau,
+        'spec_alpha': make_norm_alpha(sr, hop_len, spec_tau),
+        'spec_init_lo': cfg.getfloat(
+            section, 'spec_norm_init_lo', fallback=0.001
+        ),
+        'spec_init_hi': cfg.getfloat(
+            section, 'spec_norm_init_hi', fallback=0.0001
+        ),
+        'spec_eps': cfg.getfloat(section, 'spec_norm_eps', fallback=1e-12),
+    }
+    if (
+        erb_tau <= 0
+        or spec_tau <= 0
+        or feature_cfg['erb_scale_db'] <= 0
+        or feature_cfg['spec_eps'] <= 0
+    ):
+        raise ValueError('invalid DeepFilterNet feature-normalization configuration')
+    return feature_cfg
+
+
+def make_checkpoint_contract(
+    sr,
+    n_fft,
+    win_len,
+    hop_len,
+    n_erb,
+    df_bins,
+    df_order,
+    mask_lookahead,
+    df_lookahead,
+    feature_cfg,
+    loss_cfg,
+):
+    return {
+        'sr': sr,
+        'n_fft': n_fft,
+        'win_len': win_len,
+        'hop_len': hop_len,
+        'n_erb': n_erb,
+        'df_bins': df_bins,
+        'df_order': df_order,
+        'mask_lookahead': mask_lookahead,
+        'df_lookahead': df_lookahead,
+        'erb_norm_tau_sec': feature_cfg['erb_tau_sec'],
+        'erb_norm_alpha': feature_cfg['erb_alpha'],
+        'erb_norm_init_lo_db': feature_cfg['erb_init_lo_db'],
+        'erb_norm_init_hi_db': feature_cfg['erb_init_hi_db'],
+        'erb_norm_scale_db': feature_cfg['erb_scale_db'],
+        'spec_norm_tau_sec': feature_cfg['spec_tau_sec'],
+        'spec_norm_alpha': feature_cfg['spec_alpha'],
+        'spec_norm_init_lo': feature_cfg['spec_init_lo'],
+        'spec_norm_init_hi': feature_cfg['spec_init_hi'],
+        'spec_norm_eps': feature_cfg['spec_eps'],
+        'loss_fft_sizes': ','.join(str(n) for n in loss_cfg['fft_sizes']),
+        'loss_gamma': loss_cfg['gamma'],
+        'loss_factor': loss_cfg['factor'],
+        'loss_factor_complex': loss_cfg['factor_complex'],
+    }
+
+
+def require_checkpoint_contract(
+    ckpt,
+    expected,
+    context='checkpoint',
+    require_loss=True,
+):
+    versions = {
+        'model_version': MODEL_VERSION,
+        'feature_version': FEATURE_VERSION,
+    }
+    if require_loss:
+        versions['loss_version'] = LOSS_VERSION
+    for key, want in versions.items():
+        got = ckpt.get(key)
+        if got != want:
+            shown = repr(got) if got is not None else 'missing (legacy contract)'
+            raise ValueError(
+                f"{context} {key}={shown}, expected {want!r}; "
+                "this change requires a fresh training run."
+            )
+
+    saved = ckpt.get('contract', {})
+    for key, want in expected.items():
+        if not require_loss and key.startswith('loss_'):
+            continue
+        got = saved.get(key)
+        if isinstance(want, str):
+            matches = str(got) == want
+        else:
+            matches = got is not None and math.isclose(
+                float(got), float(want), rel_tol=1e-7, abs_tol=1e-7
+            )
+        if not matches:
+            raise ValueError(
+                f"{context} {key}={got!r}, runtime requires {want!r}; "
+                "use the training config that belongs to this checkpoint."
+            )
+
+
 # ============================================================
 # Feature extraction
 # ============================================================
 
-def causal_ema_db_norm(erb_db, ema_state, alpha=0.99, mean_norm_init=(-60.0, -90.0)):
+def causal_ema_db_norm(
+    erb_db,
+    norm_state=None,
+    alpha=0.989,
+    mean_norm_init=(-60.0, -90.0),
+    scale_db=40.0,
+):
     """
     DeepFilterNet band_mean_norm_erb: per-band causal EMA of dB, subtract running mean, /40.
     State init = linspace(MEAN_NORM_INIT) = -60..-90 dB (NOT first-frame). Requires the STFT
@@ -153,57 +378,71 @@ def causal_ema_db_norm(erb_db, ema_state, alpha=0.99, mean_norm_init=(-60.0, -90
     erb_db    : (B, T, n_erb)
     Returns:
         normed   : (B, T, n_erb)
-        ema_state: updated state dict {'erb_mean': (B, 1, n_erb)}
+        norm_state: updated tensor (B, 1, n_erb)
     """
     B, T, n_erb = erb_db.shape
     device = erb_db.device
 
-    if ema_state is None or 'erb_mean' not in ema_state:
+    state_ok = (
+        norm_state is not None
+        and tuple(norm_state.shape) == (B, 1, n_erb)
+    )
+    if not state_ok:
         lo_i, hi_i = mean_norm_init
         mu = torch.linspace(lo_i, hi_i, n_erb, device=device, dtype=erb_db.dtype
                             ).view(1, 1, n_erb).expand(B, 1, n_erb).clone()
     else:
-        mu = ema_state['erb_mean'].to(device)
+        mu = norm_state.to(device=device, dtype=erb_db.dtype)
 
     frames = []
     for t in range(T):
         mu = alpha * mu + (1 - alpha) * erb_db[:, t:t + 1, :]
-        frames.append((erb_db[:, t:t + 1, :] - mu) / 40.0)
+        frames.append((erb_db[:, t:t + 1, :] - mu) / scale_db)
     normed = torch.cat(frames, dim=1)
 
-    return normed, {'erb_mean': mu.detach()}
+    return normed, mu.detach()
 
 
-def causal_ema_mag_norm(spec_low, ema_state, alpha=0.99, eps=1e-12,
+def causal_ema_mag_norm(spec_low, norm_state=None, alpha=0.989, eps=1e-12,
                         unit_norm_init=(0.001, 0.0001)):
     """
     DeepFilterNet band_unit_norm (libDF lib.rs): per-bin EMA of |x|, divide by SQRT(EMA).
-        s = |x|*(1-a) + s*a ;  x = x / (sqrt(s) + eps)
+        s = |x|*(1-a) + s*a ;  x = x / sqrt(s + eps)
     State init = linspace(UNIT_NORM_INIT) = 0.001..0.0001 across bins (NOT first-frame).
     spec_low  : (B, T, df_bins) complex
-    Returns: normed (B, T, df_bins) complex, ema_state {'mag_mean': (B, 1, df_bins)}
+    Returns: normed (B, T, df_bins) complex and state (B, 1, df_bins)
     """
     B, T, df_bins = spec_low.shape
     device = spec_low.device
 
-    if ema_state is None or 'mag_mean' not in ema_state:
+    state_ok = (
+        norm_state is not None
+        and tuple(norm_state.shape) == (B, 1, df_bins)
+    )
+    if not state_ok:
         lo_i, hi_i = unit_norm_init
         mu = torch.linspace(lo_i, hi_i, df_bins, device=device, dtype=spec_low.real.dtype
                             ).view(1, 1, df_bins).expand(B, 1, df_bins).clone()
     else:
-        mu = ema_state['mag_mean'].to(device)
+        mu = norm_state.to(device=device, dtype=spec_low.real.dtype)
 
     frames = []
     for t in range(T):
         mag = spec_low[:, t:t + 1, :].abs()
         mu = alpha * mu + (1 - alpha) * mag
-        frames.append(spec_low[:, t:t + 1, :] / (mu.sqrt() + eps))
+        frames.append(spec_low[:, t:t + 1, :] / torch.sqrt(mu + eps))
     normed = torch.cat(frames, dim=1)
 
-    return normed, {'mag_mean': mu.detach()}
+    return normed, mu.detach()
 
 
-def extract_dfn2_features(spec_c, erb_fb, df_bins, ema_state=None):
+def extract_dfn2_features(
+    spec_c,
+    erb_fb,
+    df_bins,
+    feature_cfg=None,
+    ema_state=None,
+):
     """
     Extract DFN2 input features from complex spectrum.
 
@@ -211,7 +450,9 @@ def extract_dfn2_features(spec_c, erb_fb, df_bins, ema_state=None):
         spec_c   : (B, n_bins, T) complex  (return_complex=True convention)
         erb_fb   : (n_erb, n_bins) tensor on same device
         df_bins  : int
-        ema_state: dict or None (stateful EMA across calls, reset per segment during training)
+        feature_cfg: normalization constants returned by ``read_feature_config``
+        ema_state: ``{'erb': ..., 'spec': ...}`` or None.  The two paths must
+            remain independent across streaming chunks.
 
     Returns:
         spec_c   : unchanged, (B, n_bins, T) complex
@@ -219,35 +460,91 @@ def extract_dfn2_features(spec_c, erb_fb, df_bins, ema_state=None):
         feat_spec: (B, 2, T, df_bins) DFN2 encoder expects [B, 2, T, Fc]
         ema_state: updated state
     """
+    if feature_cfg is None:
+        feature_cfg = {
+            'erb_alpha': 0.989,
+            'erb_init_lo_db': -60.0,
+            'erb_init_hi_db': -90.0,
+            'erb_scale_db': 40.0,
+            'spec_alpha': 0.989,
+            'spec_init_lo': 0.001,
+            'spec_init_hi': 0.0001,
+            'spec_eps': 1e-12,
+        }
+    if ema_state is not None and not isinstance(ema_state, dict):
+        raise ValueError("ema_state must be None or a dict with 'erb'/'spec'")
+    erb_state_in = None if ema_state is None else ema_state.get('erb')
+    spec_state_in = None if ema_state is None else ema_state.get('spec')
+
     spec_BTC = spec_c.permute(0, 2, 1)                         # (B, T, n_bins)
 
     # ERB features: dB + causal EMA normalisation
     erb_power = spec_BTC.abs().pow(2).matmul(erb_fb.T)         # (B, T, n_erb)
     erb_db = (erb_power + 1e-10).log10() * 10
-    feat_erb_BTE, ema_state = causal_ema_db_norm(erb_db, ema_state)
+    feat_erb_BTE, erb_state = causal_ema_db_norm(
+        erb_db,
+        norm_state=erb_state_in,
+        alpha=feature_cfg['erb_alpha'],
+        mean_norm_init=(
+            feature_cfg['erb_init_lo_db'],
+            feature_cfg['erb_init_hi_db'],
+        ),
+        scale_db=feature_cfg['erb_scale_db'],
+    )
     feat_erb = feat_erb_BTE.unsqueeze(1)                        # (B, 1, T, n_erb)
 
     # DF features: unit-norm magnitude + view_as_real
     spec_low = spec_BTC[:, :, :df_bins]                        # (B, T, df_bins) complex
-    unit_s, ema_state = causal_ema_mag_norm(spec_low, ema_state)
+    unit_s, spec_state = causal_ema_mag_norm(
+        spec_low,
+        norm_state=spec_state_in,
+        alpha=feature_cfg['spec_alpha'],
+        eps=feature_cfg['spec_eps'],
+        unit_norm_init=(
+            feature_cfg['spec_init_lo'],
+            feature_cfg['spec_init_hi'],
+        ),
+    )
     feat_spec = torch.view_as_real(unit_s)                     # (B, T, df_bins, 2)
     feat_spec = feat_spec.permute(0, 3, 1, 2)                  # (B, 2, T, df_bins)
 
-    return spec_c, feat_erb, feat_spec, ema_state
+    return spec_c, feat_erb, feat_spec, {
+        'erb': erb_state,
+        'spec': spec_state,
+    }
 
 
 # ============================================================
 # Scheduler
 # ============================================================
 
-def make_scheduler(optimizer, warmup_epochs, total_epochs, base_lr, min_lr):
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / max(1, warmup_epochs)
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        cosine = 0.5 * (1 + math.cos(math.pi * progress))
-        return min_lr / base_lr + (1 - min_lr / base_lr) * cosine
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+def make_scheduler(
+    optimizer,
+    warmup_steps,
+    total_steps,
+    base_lr,
+    min_lr,
+    warmup_lr,
+):
+    start_factor = warmup_lr / base_lr
+    if not 0 < start_factor <= 1:
+        raise ValueError('lr_warmup must be in (0, lr]')
+    warmup = torch.optim.lr_scheduler.LinearLR(
+        optimizer,
+        start_factor=start_factor,
+        end_factor=1.0,
+        total_iters=max(1, warmup_steps),
+    )
+    cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=max(1, total_steps - warmup_steps),
+        eta_min=min_lr,
+    )
+    return torch.optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[max(1, warmup_steps)],
+    )
 
 
 # ============================================================
@@ -255,6 +552,10 @@ def make_scheduler(optimizer, warmup_epochs, total_epochs, base_lr, min_lr):
 # ============================================================
 
 def train(args):
+    if args.seed is not None:
+        set_seed(args.seed)
+        print(f"Random seed: {args.seed}")
+
     cfg = configparser.ConfigParser()
     cfg.read(args.config)
 
@@ -266,6 +567,8 @@ def train(args):
     N_ERB      = cfg.getint('model', 'n_erb',       fallback=32)
     DF_BINS    = cfg.getint('model', 'df_bins',     fallback=64)
     DF_ORDER   = cfg.getint('model', 'df_order',    fallback=5)
+    MASK_LOOKAHEAD = cfg.getint('model', 'mask_lookahead', fallback=1)
+    DF_LOOKAHEAD = cfg.getint('model', 'df_lookahead', fallback=0)
     EMB_SIZE   = cfg.getint('model', 'emb_size',    fallback=256)
     ENC_CH     = cfg.getint('model', 'enc_channels', fallback=16)
     GRU_GROUPS = cfg.getint('model', 'gru_groups',  fallback=1)
@@ -274,8 +577,13 @@ def train(args):
     batch_size   = cfg.getint('training', 'batch_size')
     lr           = cfg.getfloat('training', 'lr')
     min_lr       = cfg.getfloat('training', 'min_lr', fallback=1e-6)
+    warmup_lr    = cfg.getfloat('training', 'lr_warmup', fallback=1e-4)
     warmup_ep    = cfg.getint('training', 'warmup_epochs', fallback=3)
-    weight_decay = cfg.getfloat('training', 'weight_decay', fallback=0.05)
+    weight_decay = cfg.getfloat('training', 'weight_decay', fallback=1e-12)
+    weight_decay_end = cfg.getfloat(
+        'training', 'weight_decay_end', fallback=0.05
+    )
+    grad_clip    = cfg.getfloat('training', 'grad_clip', fallback=1.0)
     patience     = cfg.getint('training', 'early_stop_patience', fallback=20)
     epoch_size   = cfg.getint('training', 'epoch_size', fallback=0)
     mmap_block_size = cfg.getint('training', 'mmap_block_size', fallback=256)
@@ -287,11 +595,38 @@ def train(args):
         raise ValueError("mmap_num_workers cannot be negative")
     if prefetch_factor <= 0:
         raise ValueError("prefetch_factor must be greater than zero")
+    if not 0 < WIN_LEN <= N_FFT:
+        raise ValueError('win_len must be in (0, n_fft]')
+    if not 0 < HOP_LEN <= WIN_LEN:
+        raise ValueError('hop_len must be in (0, win_len]')
+    if not 0 < DF_BINS <= N_FFT // 2 + 1:
+        raise ValueError('df_bins exceeds the available STFT bins')
+    if N_ERB <= 0 or N_ERB % 4:
+        raise ValueError('n_erb must be positive and divisible by four')
+    if not 0 <= MASK_LOOKAHEAD <= 2:
+        raise ValueError('mask_lookahead must be in [0, 2]')
+    if not 0 <= DF_LOOKAHEAD < DF_ORDER:
+        raise ValueError('df_lookahead must be in [0, df_order)')
+    if weight_decay < 0 or weight_decay_end < 0:
+        raise ValueError('weight decay values must be non-negative')
+    if grad_clip <= 0:
+        raise ValueError('grad_clip must be positive')
 
-    # Multi-res STFT loss params
-    fft_sizes = [int(s) for s in cfg.get('perceptual_loss', 'fft_sizes',
-                                          fallback='256,512,1024,2048').split(',')]
-    gamma     = cfg.getfloat('perceptual_loss', 'gamma', fallback=0.3)
+    feature_cfg = read_feature_config(cfg, SR, HOP_LEN)
+    loss_cfg = read_loss_config(cfg)
+    contract = make_checkpoint_contract(
+        SR,
+        N_FFT,
+        WIN_LEN,
+        HOP_LEN,
+        N_ERB,
+        DF_BINS,
+        DF_ORDER,
+        MASK_LOOKAHEAD,
+        DF_LOOKAHEAD,
+        feature_cfg,
+        loss_cfg,
+    )
 
     if args.gpu is not None:
         device = torch.device(f'cuda:{args.gpu}')
@@ -356,17 +691,42 @@ def train(args):
     model = DeepFilterNet2(
         n_fft=N_FFT, sr=SR, n_erb=N_ERB, df_bins=DF_BINS, df_order=DF_ORDER,
         enc_ch=ENC_CH, emb_size=EMB_SIZE, gru_groups=GRU_GROUPS,
+        mask_lookahead=MASK_LOOKAHEAD, df_lookahead=DF_LOOKAHEAD,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
                                   betas=(0.9, 0.999), weight_decay=weight_decay)
-    scheduler = make_scheduler(optimizer, warmup_ep, epochs, lr, min_lr)
+    total_steps = epochs * len(train_loader)
+    warmup_steps = min(warmup_ep * len(train_loader), total_steps - 1)
+    scheduler = make_scheduler(
+        optimizer,
+        warmup_steps,
+        total_steps,
+        lr,
+        min_lr,
+        warmup_lr,
+    )
+    loss_fn = MultiResSpecLoss(**loss_cfg).to(device)
 
     stft_window = torch.hann_window(WIN_LEN).pow(0.5).to(device)
 
     print(f"DeepFilterNet2 training: SR={SR}, N_FFT={N_FFT}, WIN={WIN_LEN}, HOP={HOP_LEN}")
     print(f"  n_erb={N_ERB}, df_bins={DF_BINS}, df_order={DF_ORDER}")
+    print(f"  mask_lookahead={MASK_LOOKAHEAD}, df_lookahead={DF_LOOKAHEAD}")
     print(f"  batch={batch_size}, lr={lr}, device={device}")
+    print(
+        f"  EMA: erb_alpha={feature_cfg['erb_alpha']:.6f}, "
+        f"spec_alpha={feature_cfg['spec_alpha']:.6f}, independent states"
+    )
+    print(
+        f"  loss={LOSS_VERSION}: fft_sizes={loss_cfg['fft_sizes']}, "
+        f"gamma={loss_cfg['gamma']}, magnitude_factor={loss_cfg['factor']}, "
+        f"complex_factor={loss_cfg['factor_complex']}"
+    )
+    print(
+        f"  weight_decay={weight_decay:g}->{weight_decay_end:g}, "
+        f"per-step LR/WD schedule, grad_clip={grad_clip:g}"
+    )
     if args.mmap:
         print(f"  mmap: block={mmap_block_size}, workers={train_workers}, "
               f"prefetch={prefetch_factor}, packed_dtype_preserved=True")
@@ -375,16 +735,23 @@ def train(args):
     best_val_loss = float('inf')
     start_epoch = 1
     no_improve = 0
+    global_step = 0
 
     if args.resume:
         print(f"Resuming: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        require_checkpoint_contract(
+            ckpt, contract, context=args.resume, require_loss=True
+        )
         model.load_state_dict(ckpt['state_dict'])
         if 'optimizer' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer'])
         if 'scheduler' in ckpt:
             scheduler.load_state_dict(ckpt['scheduler'])
         start_epoch = ckpt.get('epoch', 0) + 1
+        global_step = ckpt.get(
+            'global_step', (start_epoch - 1) * len(train_loader)
+        )
         best_val_loss = ckpt.get('best_val_loss', float('inf'))
         print(f"  Resumed epoch {start_epoch - 1}, best_val_loss={best_val_loss:.5f}")
 
@@ -406,7 +773,8 @@ def train(args):
                 )  # (B, n_bins, T_f)
 
                 spec_c, feat_erb, feat_spec, _ = extract_dfn2_features(
-                    spec_c, model.erb_fb, DF_BINS
+                    spec_c, model.erb_fb, DF_BINS,
+                    feature_cfg=feature_cfg,
                 )
 
                 enhanced_spec, _ = model(spec_c, feat_erb, feat_spec)
@@ -417,25 +785,30 @@ def train(args):
                     window=stft_window, length=T, normalized=True,
                 )
 
-                loss = multi_res_stft_loss(
-                    enhanced_wav, clean,
-                    fft_sizes=fft_sizes,
-                    hop_sizes=[s // 4 for s in fft_sizes],
-                    win_sizes=fft_sizes,
-                    gamma=gamma,
-                )
+                loss = loss_fn(enhanced_wav, clean)
 
+                progress = min(global_step, total_steps - 1) / max(
+                    total_steps - 1, 1
+                )
+                current_wd = float(
+                    weight_decay_end
+                    + 0.5
+                    * (weight_decay - weight_decay_end)
+                    * (1.0 + math.cos(math.pi * progress))
+                )
+                for group in optimizer.param_groups:
+                    group['weight_decay'] = current_wd
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 optimizer.step()
+                scheduler.step()
+                global_step += 1
 
                 train_loss += loss.item()
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         train_loss /= len(train_loader)
-        scheduler.step()
-
         # --- Validate ---
         model.eval()
         val_loss = 0.0
@@ -452,20 +825,15 @@ def train(args):
                     window=stft_window, return_complex=True, normalized=True,
                 )
                 spec_c, feat_erb, feat_spec, _ = extract_dfn2_features(
-                    spec_c, model.erb_fb, DF_BINS
+                    spec_c, model.erb_fb, DF_BINS,
+                    feature_cfg=feature_cfg,
                 )
                 enhanced_spec, _ = model(spec_c, feat_erb, feat_spec)
                 enhanced_wav = torch.istft(
                     enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
                     window=stft_window, length=T, normalized=True,
                 )
-                val_loss += multi_res_stft_loss(
-                    enhanced_wav, clean,
-                    fft_sizes=fft_sizes,
-                    hop_sizes=[s // 4 for s in fft_sizes],
-                    win_sizes=fft_sizes,
-                    gamma=gamma,
-                ).item()
+                val_loss += loss_fn(enhanced_wav, clean).item()
 
         val_loss /= len(val_loader)
         lr_now = optimizer.param_groups[0]['lr']
@@ -475,10 +843,15 @@ def train(args):
         checkpoint_best = min(best_val_loss, val_loss)
         ckpt = {
             'epoch': epoch,
+            'global_step': global_step,
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
             'best_val_loss': checkpoint_best,
+            'model_version': MODEL_VERSION,
+            'feature_version': FEATURE_VERSION,
+            'loss_version': LOSS_VERSION,
+            'contract': contract,
             'config': {k: dict(v) for k, v in cfg.items() if k != 'DEFAULT'},
         }
         torch.save(ckpt, os.path.join(output_dir, 'dfn2_last.pth'))
@@ -507,5 +880,9 @@ if __name__ == '__main__':
     parser.add_argument('--resume', default=None)
     parser.add_argument('--gpu', type=int, default=None)
     parser.add_argument('--device', default=None)
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed (default: 42; use -1 to disable)')
     args = parser.parse_args()
+    if args.seed == -1:
+        args.seed = None
     train(args)

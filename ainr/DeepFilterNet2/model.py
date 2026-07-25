@@ -101,6 +101,32 @@ class SeparableConvTranspose2d(nn.Module):
         return self.act(self.bn(self.dw(self.pw(x))))
 
 
+class LookaheadConv2d(nn.Sequential):
+    """Conv2d with an explicit, streaming-compatible temporal lookahead.
+
+    For a temporal kernel of size ``K`` and lookahead ``L``, output frame ``t``
+    consumes input frames ``[t-(K-L-1), ..., t+L]``.  Frequency padding remains
+    symmetric.  This makes the frame alignment explicit instead of relying on
+    Conv2d's symmetric time padding.
+    """
+
+    def __init__(self, in_ch, out_ch, kernel=(3, 3), lookahead=0):
+        kt, kf = kernel
+        if not 0 <= lookahead < kt:
+            raise ValueError(
+                f"lookahead must be in [0, {kt - 1}] for kernel={kernel}, "
+                f"got {lookahead}"
+            )
+        time_left = kt - lookahead - 1
+        freq_pad = kf // 2
+        super().__init__(
+            nn.ConstantPad2d((freq_pad, freq_pad, time_left, lookahead), 0.0),
+            nn.Conv2d(in_ch, out_ch, kernel, padding=0, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.PReLU(),
+        )
+
+
 class GroupedGRU(nn.Module):
     """
     Simple GRU wrapper that supports groups=1 (standard) or groups>1 (split-concat).
@@ -143,13 +169,12 @@ class GroupedGRU(nn.Module):
 
 class DFN2Encoder(nn.Module):
     def __init__(self, n_erb, df_bins, enc_ch=16, emb_size=256,
-                 gru_groups=1, conv_kernel=(1, 3), conv_kernel_inp=(3, 3)):
+                 gru_groups=1, conv_kernel=(1, 3), conv_kernel_inp=(3, 3),
+                 mask_lookahead=1):
         super().__init__()
-        # ERB path
-        self.erb_conv0 = nn.Sequential(
-            nn.Conv2d(1, enc_ch, conv_kernel_inp,
-                      padding=(conv_kernel_inp[0] // 2, conv_kernel_inp[1] // 2), bias=False),
-            nn.BatchNorm2d(enc_ch), nn.PReLU(),
+        # ERB path.  Only this input convolution uses temporal context.
+        self.erb_conv0 = LookaheadConv2d(
+            1, enc_ch, conv_kernel_inp, lookahead=mask_lookahead,
         )
         self.erb_conv1 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 2),
                                           padding=(0, conv_kernel[1] // 2))
@@ -159,10 +184,8 @@ class DFN2Encoder(nn.Module):
                                           padding=(0, conv_kernel[1] // 2))
 
         # DF path
-        self.df_conv0 = nn.Sequential(
-            nn.Conv2d(2, enc_ch, conv_kernel_inp,
-                      padding=(conv_kernel_inp[0] // 2, conv_kernel_inp[1] // 2), bias=False),
-            nn.BatchNorm2d(enc_ch), nn.PReLU(),
+        self.df_conv0 = LookaheadConv2d(
+            2, enc_ch, conv_kernel_inp, lookahead=mask_lookahead,
         )
         self.df_conv1 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 2),
                                          padding=(0, conv_kernel[1] // 2))
@@ -327,9 +350,14 @@ class DFDecoder(nn.Module):
 # Deep Filter Apply
 # ============================================================
 
-def deep_filter_apply(spec, coefs, alpha, df_bins, df_order):
+def deep_filter_apply(spec, coefs, alpha, df_bins, df_order, df_lookahead=0):
     """
-    Apply per-bin causal FIR filter to the lowest df_bins of spec.
+    Apply a per-bin FIR filter to the lowest df_bins of spec.
+
+    The deployed configuration uses ``df_lookahead=0``: order 5 therefore
+    consumes masked spectra ``[t-4, ..., t]`` and only requires four history
+    frames in a streaming ring buffer.  Mask lookahead is an independent model
+    delay and must not be folded into this FIR window.
 
     Args:
         spec   : (B, n_bins, T) complex
@@ -337,9 +365,15 @@ def deep_filter_apply(spec, coefs, alpha, df_bins, df_order):
         alpha  : (B, T, 1) blend weight
         df_bins: int
         df_order: int
+        df_lookahead: number of future masked-spectrum frames used by the FIR
     Returns:
         out    : (B, n_bins, T) complex (only first df_bins modified)
     """
+    if not 0 <= df_lookahead < df_order:
+        raise ValueError(
+            f"df_lookahead must be in [0, {df_order - 1}], got {df_lookahead}"
+        )
+
     # Reshape coefs: (B, T, df_bins, df_order, 2)
     coefs = coefs.view(coefs.shape[0], coefs.shape[1], df_bins, df_order, 2)
 
@@ -347,8 +381,8 @@ def deep_filter_apply(spec, coefs, alpha, df_bins, df_order):
     spec_ri = torch.view_as_real(spec[:, :df_bins])   # (B, df_bins, T, 2)
     spec_ri = spec_ri.permute(0, 1, 3, 2)             # (B, df_bins, 2, T)
 
-    # Causal padding: df_order-1 zeros prepended on time axis
-    spec_padded = F.pad(spec_ri, (df_order - 1, 0))   # (B, df_bins, 2, T + df_order - 1)
+    history = df_order - df_lookahead - 1
+    spec_padded = F.pad(spec_ri, (history, df_lookahead))
 
     # Sliding window: (B, df_bins, 2, T, df_order)
     spec_unfolded = spec_padded.unfold(-1, df_order, 1)
@@ -390,21 +424,36 @@ class DeepFilterNet2(nn.Module):
     """
     def __init__(self, n_fft=512, sr=16000, n_erb=32, df_bins=64, df_order=5,
                  enc_ch=16, emb_size=256, df_hidden=256, df_num_layers=3,
-                 gru_groups=1):
+                 gru_groups=1, mask_lookahead=1, df_lookahead=0):
         super().__init__()
         n_bins = n_fft // 2 + 1
 
         self.n_erb     = n_erb
         self.df_bins   = df_bins
         self.df_order  = df_order
+        self.mask_lookahead = mask_lookahead
+        self.df_lookahead = df_lookahead
         self.n_bins    = n_bins
+
+        if not 0 <= mask_lookahead <= 2:
+            raise ValueError(
+                f"mask_lookahead must be in [0, 2], got {mask_lookahead}"
+            )
+        if not 0 <= df_lookahead < df_order:
+            raise ValueError(
+                f"df_lookahead must be in [0, {df_order - 1}], "
+                f"got {df_lookahead}"
+            )
 
         # ERB filterbank — non-trainable buffers
         erb_fb, erb_inv = _build_erb_fb(n_fft, sr, n_erb)
         self.register_buffer('erb_fb',  erb_fb)   # (n_erb, n_bins)
         self.register_buffer('erb_inv', erb_inv)  # (n_erb, n_bins) indicator
 
-        self.encoder = DFN2Encoder(n_erb, df_bins, enc_ch, emb_size, gru_groups)
+        self.encoder = DFN2Encoder(
+            n_erb, df_bins, enc_ch, emb_size, gru_groups,
+            mask_lookahead=mask_lookahead,
+        )
         self.erb_dec  = ERBDecoder(n_erb, enc_ch, emb_size)
         self.df_dec   = DFDecoder(df_bins, df_order, df_hidden, emb_size,
                                    enc_ch, num_layers=df_num_layers,
@@ -429,6 +478,9 @@ class DeepFilterNet2(nn.Module):
 
         # DF filter on low-freq bins
         coefs, alpha = self.df_dec(emb, c0)
-        spec = deep_filter_apply(spec, coefs, alpha, self.df_bins, self.df_order)
+        spec = deep_filter_apply(
+            spec, coefs, alpha, self.df_bins, self.df_order,
+            self.df_lookahead,
+        )
 
         return spec, erb_mask

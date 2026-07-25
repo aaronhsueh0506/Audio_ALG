@@ -20,7 +20,13 @@ import torchaudio
 import tqdm
 
 from model import DeepFilterNet2
-from train import extract_dfn2_features
+from train import (
+    extract_dfn2_features,
+    make_checkpoint_contract,
+    read_feature_config,
+    read_loss_config,
+    require_checkpoint_contract,
+)
 
 
 def load_model(args):
@@ -35,22 +41,51 @@ def load_model(args):
     N_ERB      = cfg.getint('model', 'n_erb',       fallback=32)
     DF_BINS    = cfg.getint('model', 'df_bins',     fallback=64)
     DF_ORDER   = cfg.getint('model', 'df_order',    fallback=5)
+    MASK_LOOKAHEAD = cfg.getint('model', 'mask_lookahead', fallback=1)
+    DF_LOOKAHEAD = cfg.getint('model', 'df_lookahead', fallback=0)
     EMB_SIZE   = cfg.getint('model', 'emb_size',    fallback=256)
     ENC_CH     = cfg.getint('model', 'enc_channels', fallback=16)
     GRU_GROUPS = cfg.getint('model', 'gru_groups',  fallback=1)
+    if not 0 < WIN_LEN <= N_FFT:
+        raise ValueError('win_len must be in (0, n_fft]')
+    if not 0 < HOP_LEN <= WIN_LEN:
+        raise ValueError('hop_len must be in (0, win_len]')
+    if not 0 <= MASK_LOOKAHEAD <= 2:
+        raise ValueError('mask_lookahead must be in [0, 2]')
+    if not 0 <= DF_LOOKAHEAD < DF_ORDER:
+        raise ValueError('df_lookahead must be in [0, df_order)')
 
     device = torch.device('cpu')
     ckpt = torch.load(args.model, map_location=device, weights_only=False)
+    feature_cfg = read_feature_config(cfg, SR, HOP_LEN)
+    loss_cfg = read_loss_config(cfg)
+    contract = make_checkpoint_contract(
+        SR,
+        N_FFT,
+        WIN_LEN,
+        HOP_LEN,
+        N_ERB,
+        DF_BINS,
+        DF_ORDER,
+        MASK_LOOKAHEAD,
+        DF_LOOKAHEAD,
+        feature_cfg,
+        loss_cfg,
+    )
+    require_checkpoint_contract(
+        ckpt, contract, context=args.model, require_loss=False
+    )
 
     model = DeepFilterNet2(
         n_fft=N_FFT, sr=SR, n_erb=N_ERB, df_bins=DF_BINS, df_order=DF_ORDER,
         enc_ch=ENC_CH, emb_size=EMB_SIZE, gru_groups=GRU_GROUPS,
+        mask_lookahead=MASK_LOOKAHEAD, df_lookahead=DF_LOOKAHEAD,
     )
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
 
     params = dict(SR=SR, N_FFT=N_FFT, WIN_LEN=WIN_LEN, HOP_LEN=HOP_LEN,
-                  DF_BINS=DF_BINS)
+                  DF_BINS=DF_BINS, FEATURE_CFG=feature_cfg)
     return model, params
 
 
@@ -60,6 +95,7 @@ def process_file(input_path, output_path, model, params):
     WIN_LEN = params['WIN_LEN']
     HOP_LEN = params['HOP_LEN']
     DF_BINS = params['DF_BINS']
+    feature_cfg = params['FEATURE_CFG']
 
     audio, orig_sr = torchaudio.load(input_path)
     audio = audio[0]   # mono
@@ -75,7 +111,8 @@ def process_file(input_path, output_path, model, params):
 
     with torch.no_grad():
         spec_c, feat_erb, feat_spec, _ = extract_dfn2_features(
-            spec_c, model.erb_fb, DF_BINS
+            spec_c, model.erb_fb, DF_BINS,
+            feature_cfg=feature_cfg,
         )
         enhanced_spec, _ = model(spec_c, feat_erb, feat_spec)
 
