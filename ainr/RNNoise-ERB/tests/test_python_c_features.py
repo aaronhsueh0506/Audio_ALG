@@ -99,13 +99,11 @@ def main():
         erb_norm_init_lo_db=-60.0,
         erb_norm_init_hi_db=-90.0,
         erb_norm_scale_db=40.0,
-        erb_norm_clip=5.0,
         spec_bins=SPEC_BINS,
         spec_alpha=alpha,
         spec_norm_init_lo=0.001,
         spec_norm_init_hi=0.0001,
         spec_norm_eps=1e-12,
-        spec_clip=10.0,
     )
     spectra = deterministic_spectra()
     borders = erb_bandborder(N_BANDS, 16000, 512)

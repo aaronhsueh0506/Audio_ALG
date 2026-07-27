@@ -48,12 +48,10 @@ def main():
         ('erb_norm_init_lo_db', 'RNNOISE_ERB_NORM_INIT_LO_DB'),
         ('erb_norm_init_hi_db', 'RNNOISE_ERB_NORM_INIT_HI_DB'),
         ('erb_norm_scale_db', 'RNNOISE_ERB_NORM_SCALE_DB'),
-        ('erb_norm_clip', 'RNNOISE_ERB_NORM_CLIP'),
         ('spec_norm_tau_sec', 'RNNOISE_SPEC_NORM_TAU_SEC'),
         ('spec_norm_init_lo', 'RNNOISE_SPEC_NORM_INIT_LO'),
         ('spec_norm_init_hi', 'RNNOISE_SPEC_NORM_INIT_HI'),
         ('spec_norm_eps', 'RNNOISE_SPEC_NORM_EPS'),
-        ('spec_clip', 'RNNOISE_SPEC_CLIP'),
     ]
     for key, name in pairs:
         got = c_float(macro(header, name))

@@ -179,7 +179,6 @@ def export(args):
         'feature_erb_norm_init_lo_db': str(feature_cfg['erb_norm_init_lo_db']),
         'feature_erb_norm_init_hi_db': str(feature_cfg['erb_norm_init_hi_db']),
         'feature_erb_norm_scale_db': str(feature_cfg['erb_norm_scale_db']),
-        'feature_erb_norm_clip': str(feature_cfg['erb_norm_clip']),
         'feature_spec_max_hz': str(feature_cfg['spec_max_hz']),
         'feature_spec_bins': str(feature_cfg['spec_bins']),
         'feature_spec_norm_tau_sec': str(feature_cfg['spec_tau_sec']),
@@ -187,7 +186,6 @@ def export(args):
         'feature_spec_norm_init_lo': str(feature_cfg['spec_norm_init_lo']),
         'feature_spec_norm_init_hi': str(feature_cfg['spec_norm_init_hi']),
         'feature_spec_norm_eps': str(feature_cfg['spec_norm_eps']),
-        'feature_spec_clip': str(feature_cfg['spec_clip']),
         'input_schema': (f'erb_input[1,3,{N_BANDS}];'
                          f'spec_input[1,3,2,{feature_cfg["spec_bins"]}]'),
     })

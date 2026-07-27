@@ -36,7 +36,12 @@ from dataset_gen import PackedDataset  # noqa: E402
 # per-band EMA mean-normalised log-ERB and per-bin EMA-normalised complex bins.
 # It is incompatible with all earlier checkpoints even though both input/output
 # dimensions are unchanged.
-FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v3'
+# v4 removes the erb_norm_clip/spec_clip deployment safety clamp that v3 kept
+# on top of the DeepFilterNet formula: verified against both the upstream
+# Rikorose/DeepFilterNet libDF/src/lib.rs (band_mean_norm_erb/band_unit_norm,
+# neither clips) and this repo's own ainr/DeepFilterNet2 port (same formulas,
+# no clip either) that no clip is part of the original algorithm at all.
+FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v4'
 LOSS_VERSION = 'df3_multi_res_spec_only_gamma_0.3_v1'
 
 
@@ -113,7 +118,6 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
         'feature_erb_norm_init_lo_db': feature_cfg['erb_norm_init_lo_db'],
         'feature_erb_norm_init_hi_db': feature_cfg['erb_norm_init_hi_db'],
         'feature_erb_norm_scale_db': feature_cfg['erb_norm_scale_db'],
-        'feature_erb_norm_clip': feature_cfg['erb_norm_clip'],
         'feature_spec_max_hz': feature_cfg['spec_max_hz'],
         'feature_spec_bins': feature_cfg['spec_bins'],
         'feature_spec_norm_tau_sec': feature_cfg['spec_tau_sec'],
@@ -121,7 +125,6 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
         'feature_spec_norm_init_lo': feature_cfg['spec_norm_init_lo'],
         'feature_spec_norm_init_hi': feature_cfg['spec_norm_init_hi'],
         'feature_spec_norm_eps': feature_cfg['spec_norm_eps'],
-        'feature_spec_clip': feature_cfg['spec_clip'],
     }
     import math
     for key, want in expected.items():
@@ -202,19 +205,17 @@ def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
         'feature', 'erb_norm_init_hi_db', fallback=-90.0)
     erb_norm_scale_db = cfg.getfloat(
         'feature', 'erb_norm_scale_db', fallback=40.0)
-    erb_norm_clip = cfg.getfloat('feature', 'erb_norm_clip', fallback=5.0)
     spec_max_hz = cfg.getint('feature', 'spec_max_hz', fallback=4000)
     spec_tau_sec = cfg.getfloat('feature', 'spec_norm_tau_sec', fallback=1.0)
     spec_norm_init_lo = cfg.getfloat('feature', 'spec_norm_init_lo', fallback=0.001)
     spec_norm_init_hi = cfg.getfloat('feature', 'spec_norm_init_hi', fallback=0.0001)
     spec_norm_eps = cfg.getfloat('feature', 'spec_norm_eps', fallback=1e-12)
-    spec_clip = cfg.getfloat('feature', 'spec_clip', fallback=10.0)
     if (win_len <= 0 or win_len > n_fft or hop_len <= 0 or
-            erb_tau_sec <= 0 or erb_norm_scale_db <= 0 or erb_norm_clip <= 0 or
+            erb_tau_sec <= 0 or erb_norm_scale_db <= 0 or
             spec_max_hz <= 0 or
             spec_max_hz > sr // 2 or spec_tau_sec <= 0 or
             spec_norm_init_lo <= 0 or spec_norm_init_hi <= 0 or
-            spec_norm_eps <= 0 or spec_clip <= 0):
+            spec_norm_eps <= 0):
         raise ValueError('invalid DeepFilterNet-style ERB/complex feature configuration')
     spec_bins = spec_max_hz * n_fft // sr + 1
     erb_alpha = make_norm_alpha(sr, hop_len, erb_tau_sec)
@@ -232,7 +233,6 @@ def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
         erb_norm_init_lo_db=erb_norm_init_lo_db,
         erb_norm_init_hi_db=erb_norm_init_hi_db,
         erb_norm_scale_db=erb_norm_scale_db,
-        erb_norm_clip=erb_norm_clip,
         spec_max_hz=spec_max_hz,
         spec_bins=spec_bins,
         spec_tau_sec=spec_tau_sec,
@@ -240,7 +240,6 @@ def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
         spec_norm_init_lo=spec_norm_init_lo,
         spec_norm_init_hi=spec_norm_init_hi,
         spec_norm_eps=spec_norm_eps,
-        spec_clip=spec_clip,
     )
 
 # ============================================================
@@ -524,11 +523,13 @@ def istft(spec, n_fft, hop_len, win_len, window, length):
 
 def normalize_log_erb(erb_db, norm_state=None, norm_alpha: float = 0.984,
                       init_lo_db: float = -60.0, init_hi_db: float = -90.0,
-                      scale_db: float = 40.0, clip: float = 5.0):
+                      scale_db: float = 40.0):
     """Original DeepFilterNet causal per-band mean normalisation.
 
     The EMA is updated with the current frame before subtraction, matching
-    Rikorose/DeepFilterNet ``libDF::band_mean_norm_erb``.  No variance or absolute-level
+    Rikorose/DeepFilterNet ``libDF::band_mean_norm_erb`` exactly (verified
+    against libDF/src/lib.rs and this repo's own ainr/DeepFilterNet2 port,
+    neither of which clips the output). No variance or absolute-level
     side channel is used; the complex branch remains observable for stationary
     inputs and retains partial level information.
     """
@@ -547,16 +548,18 @@ def normalize_log_erb(erb_db, norm_state=None, norm_alpha: float = 0.984,
     for t in range(n_frames):
         frame = erb_db[:, t:t + 1, :]
         mean = norm_alpha * mean + (1.0 - norm_alpha) * frame
-        frames.append(((frame - mean) / scale_db).clamp(-clip, clip))
+        frames.append((frame - mean) / scale_db)
     return torch.cat(frames, dim=1), mean.detach()
 
 
 def normalize_complex_spectrum(spec_low, norm_state=None, norm_alpha: float = 0.984,
                                init_lo: float = 0.001, init_hi: float = 0.0001,
-                               eps: float = 1e-12, clip: float = 10.0):
+                               eps: float = 1e-12):
     """Original DeepFilterNet per-bin magnitude EMA norm.
 
-    This matches ``libDF::band_unit_norm``: each bin updates its own state from
+    This matches ``libDF::band_unit_norm`` exactly (verified against
+    libDF/src/lib.rs and this repo's own ainr/DeepFilterNet2 port, neither of
+    which clips the output): each bin updates its own state from
     ``abs(X[k])`` and divides the complex value by ``sqrt(state[k])``.  It is
     deliberately not fully gain-invariant: at steady state, scaling X by ``a``
     scales this feature by approximately ``sqrt(a)``.
@@ -577,7 +580,7 @@ def normalize_complex_spectrum(spec_low, norm_state=None, norm_alpha: float = 0.
         frame = spec_low[:, t:t + 1, :]
         mag_mean = norm_alpha * mag_mean + (1.0 - norm_alpha) * frame.abs()
         normed = frame / torch.sqrt(mag_mean + eps)
-        frames.append(torch.view_as_real(normed).clamp(-clip, clip))
+        frames.append(torch.view_as_real(normed))
     features = torch.cat(frames, dim=1).permute(0, 1, 3, 2)  # [B,T,2,F]
     return features, mag_mean.detach()
 
@@ -601,14 +604,12 @@ def extract_model_features(spec, erb_matrix, feature_cfg, norm_state=None,
         erb_db, norm_state=erb_state_in, norm_alpha=feature_cfg['erb_alpha'],
         init_lo_db=feature_cfg['erb_norm_init_lo_db'],
         init_hi_db=feature_cfg['erb_norm_init_hi_db'],
-        scale_db=feature_cfg['erb_norm_scale_db'],
-        clip=feature_cfg['erb_norm_clip'])
+        scale_db=feature_cfg['erb_norm_scale_db'])
     spec_low = spec_btf[..., :feature_cfg['spec_bins']]
     spec_features, norm_state = normalize_complex_spectrum(
         spec_low, norm_state=spec_state_in, norm_alpha=feature_cfg['spec_alpha'],
         init_lo=feature_cfg['spec_norm_init_lo'],
-        init_hi=feature_cfg['spec_norm_init_hi'], eps=feature_cfg['spec_norm_eps'],
-        clip=feature_cfg['spec_clip'])
+        init_hi=feature_cfg['spec_norm_init_hi'], eps=feature_cfg['spec_norm_eps'])
     debug = None
     if return_debug:
         debug = {'erb_db': erb_db.detach(), 'spec_magnitude': spec_low.abs().detach()}
@@ -880,8 +881,7 @@ def train(args):
           f"(tau={FEATURE_CFG['erb_tau_sec']:g}s), "
           f"init={FEATURE_CFG['erb_norm_init_lo_db']:g}.."
           f"{FEATURE_CFG['erb_norm_init_hi_db']:g}dB, "
-          f"scale={FEATURE_CFG['erb_norm_scale_db']:g}dB, "
-          f"clip=±{FEATURE_CFG['erb_norm_clip']:g}")
+          f"scale={FEATURE_CFG['erb_norm_scale_db']:g}dB")
     print(f"  complex: 0..{FEATURE_CFG['spec_max_hz']}Hz "
           f"({FEATURE_CFG['spec_bins']} bins), per-bin unit-norm alpha="
           f"{FEATURE_CFG['spec_alpha']:.6f} (tau={FEATURE_CFG['spec_tau_sec']:g}s)")
@@ -1063,7 +1063,6 @@ def train(args):
                 'feature_erb_norm_init_lo_db': FEATURE_CFG['erb_norm_init_lo_db'],
                 'feature_erb_norm_init_hi_db': FEATURE_CFG['erb_norm_init_hi_db'],
                 'feature_erb_norm_scale_db': FEATURE_CFG['erb_norm_scale_db'],
-                'feature_erb_norm_clip': FEATURE_CFG['erb_norm_clip'],
                 'feature_spec_max_hz': FEATURE_CFG['spec_max_hz'],
                 'feature_spec_bins': FEATURE_CFG['spec_bins'],
                 'feature_spec_norm_tau_sec': FEATURE_CFG['spec_tau_sec'],
@@ -1071,7 +1070,6 @@ def train(args):
                 'feature_spec_norm_init_lo': FEATURE_CFG['spec_norm_init_lo'],
                 'feature_spec_norm_init_hi': FEATURE_CFG['spec_norm_init_hi'],
                 'feature_spec_norm_eps': FEATURE_CFG['spec_norm_eps'],
-                'feature_spec_clip': FEATURE_CFG['spec_clip'],
             },
         }
         torch.save(ckpt, os.path.join(output_dir, f'rnnoise_epoch{epoch}.pth'))

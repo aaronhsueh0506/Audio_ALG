@@ -189,8 +189,6 @@ int rnnoise_compute_features(RNNoiseState *st,
     for (int b = 0; b < RNNOISE_N_BANDS; b++) {
         float mean = erb_a * st->erb_norm_state[b] + (1.0f - erb_a) * erb_db[b];
         float feat = (erb_db[b] - mean) / RNNOISE_ERB_NORM_SCALE_DB;
-        if (feat > RNNOISE_ERB_NORM_CLIP) feat = RNNOISE_ERB_NORM_CLIP;
-        if (feat < -RNNOISE_ERB_NORM_CLIP) feat = -RNNOISE_ERB_NORM_CLIP;
         st->erb_norm_state[b] = mean;
         st->erb_feat_buf[idx][b] = feat;
     }
@@ -205,10 +203,6 @@ int rnnoise_compute_features(RNNoiseState *st,
         float denom = sqrtf(state + RNNOISE_SPEC_NORM_EPS);
         float re = spec_re[k] / denom;
         float im = spec_im[k] / denom;
-        if (re > RNNOISE_SPEC_CLIP) re = RNNOISE_SPEC_CLIP;
-        if (re < -RNNOISE_SPEC_CLIP) re = -RNNOISE_SPEC_CLIP;
-        if (im > RNNOISE_SPEC_CLIP) im = RNNOISE_SPEC_CLIP;
-        if (im < -RNNOISE_SPEC_CLIP) im = -RNNOISE_SPEC_CLIP;
         st->spec_norm_state[k] = state;
         st->spec_feat_buf[idx][0][k] = re;
         st->spec_feat_buf[idx][1][k] = im;

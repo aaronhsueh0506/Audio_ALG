@@ -68,8 +68,6 @@ static int ref_step(RefState *st, const float *re, const float *im,
         float mean = erb_alpha * st->erb_norm[b] +
             (1.0f - erb_alpha) * erb_db;
         float feat = (erb_db - mean) / RNNOISE_ERB_NORM_SCALE_DB;
-        if (feat > RNNOISE_ERB_NORM_CLIP) feat = RNNOISE_ERB_NORM_CLIP;
-        if (feat < -RNNOISE_ERB_NORM_CLIP) feat = -RNNOISE_ERB_NORM_CLIP;
         st->erb_norm[b] = mean;
         st->erb_history[idx][b] = feat;
     }
@@ -81,10 +79,6 @@ static int ref_step(RefState *st, const float *re, const float *im,
         float denom = sqrtf(state + RNNOISE_SPEC_NORM_EPS);
         float re_norm = re[k] / denom;
         float im_norm = im[k] / denom;
-        if (re_norm > RNNOISE_SPEC_CLIP) re_norm = RNNOISE_SPEC_CLIP;
-        if (re_norm < -RNNOISE_SPEC_CLIP) re_norm = -RNNOISE_SPEC_CLIP;
-        if (im_norm > RNNOISE_SPEC_CLIP) im_norm = RNNOISE_SPEC_CLIP;
-        if (im_norm < -RNNOISE_SPEC_CLIP) im_norm = -RNNOISE_SPEC_CLIP;
         st->spec_norm[k] = state;
         st->spec_history[idx][0][k] = re_norm;
         st->spec_history[idx][1][k] = im_norm;

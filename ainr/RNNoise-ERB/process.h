@@ -33,15 +33,18 @@ extern "C" {
 #define RNNOISE_LOOKAHEAD     1     /* = config.ini lookahead_frames */
 #define RNNOISE_CONV_DELAY    (2 - RNNOISE_LOOKAHEAD)
 
-/* log_erb_dfn_mean_cplx_unit_0_4k_v3 constants.  Keep byte-for-byte aligned with
- * config.ini [feature] and checkpoint validation in train.py. */
-#define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v3"
+/* log_erb_dfn_mean_cplx_unit_0_4k_v4 constants.  Keep byte-for-byte aligned with
+ * config.ini [feature] and checkpoint validation in train.py.
+ * v4 removes the erb_norm_clip/spec_clip deployment safety clamp v3 kept on
+ * top of the DeepFilterNet formula -- verified against upstream
+ * Rikorose/DeepFilterNet libDF/src/lib.rs (band_mean_norm_erb/band_unit_norm)
+ * and this repo's own ainr/DeepFilterNet2 port that neither clips. */
+#define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v4"
 #define RNNOISE_ERB_NORM_TAU_SEC          1.0f
 #define RNNOISE_ERB_NORM_ALPHA             0.984f
 #define RNNOISE_ERB_NORM_INIT_LO_DB     (-60.0f)
 #define RNNOISE_ERB_NORM_INIT_HI_DB     (-90.0f)
 #define RNNOISE_ERB_NORM_SCALE_DB        40.0f
-#define RNNOISE_ERB_NORM_CLIP              5.0f
 #define RNNOISE_SPEC_MAX_HZ            4000
 #define RNNOISE_SPEC_BINS               129
 #define RNNOISE_SPEC_NORM_TAU_SEC         1.0f
@@ -49,7 +52,6 @@ extern "C" {
 #define RNNOISE_SPEC_NORM_INIT_LO          0.001f
 #define RNNOISE_SPEC_NORM_INIT_HI          0.0001f
 #define RNNOISE_SPEC_NORM_EPS              1e-12f
-#define RNNOISE_SPEC_CLIP                  10.0f
 
 /* 處理狀態 (呼叫端分配，跨 frame 保持) */
 typedef struct {

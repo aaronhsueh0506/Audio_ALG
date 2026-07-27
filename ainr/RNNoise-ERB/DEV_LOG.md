@@ -1,5 +1,44 @@
 # RNNoise-ERB 開發紀錄
 
+## 2026-07 — 拿掉 v3 的 erb_norm_clip/spec_clip，精確對齊 DeepFilterNet（v4）
+
+### 問題
+- v3 的雙路 normalization 公式已對齊原作 DeepFilterNet libDF
+  (`band_mean_norm_erb`/`band_unit_norm`)，但額外保留了 v1 舊 broadband
+  CMVN 沿用下來的 `erb_norm_clip=±5`/`spec_clip=±10`，README 明載為「部署
+  數值安全界線」。
+- 直接讀 upstream [Rikorose/DeepFilterNet `libDF/src/lib.rs`](https://github.com/Rikorose/DeepFilterNet/blob/main/libDF/src/lib.rs)
+  確認 `band_mean_norm_erb`/`band_unit_norm` 兩個函式完全沒有 clip/clamp；
+  DeepFilterNet 3 Python 訓練碼（`df/modules.py`、`deepfilternet3.py`）裡
+  所有 `clamp`/`clip` 呼叫也都是 gain/mask/SNR 用途，沒有一處作用在這兩條
+  feature 分支的輸出上。
+- 本 repo 自己的 `ainr/DeepFilterNet2` port（`causal_ema_db_norm`/
+  `causal_ema_mag_norm`/`extract_dfn2_features`）逐行比對後，`[feature]`
+  的每個常數（tau/alpha/init/scale/eps）都跟 RNNoise-ERB 完全一致，**唯一
+  差異就是這兩個 clip**——DFN2 這邊完全沒有它們。
+
+### 決策
+- Feature version 改為 `log_erb_dfn_mean_cplx_unit_0_4k_v4`；輸入 shape
+  不變（ERB `[B,T,22]`、complex `[B,T,2,129]`），純粹是 normalization
+  semantics 改變，checkpoint-incompatible。
+- `train.py` 的 `normalize_log_erb`/`normalize_complex_spectrum` 拿掉
+  `clip` 參數與 `.clamp(-clip, clip)`；`process.h`/`process.c` 同步拿掉
+  `RNNOISE_ERB_NORM_CLIP`/`RNNOISE_SPEC_CLIP` 及對應的飽和判斷；
+  `config.ini`、`export_onnx.py`、checkpoint contract
+  (`require_checkpoint_feature_config`)、四個 Python 測試與
+  `test_rnnoise_features.c` 全部同步移除。
+- 這是刻意推翻 v3 當初的工程判斷（不是修 bug）：好處是兩路公式現在對
+  upstream 是逐行忠實移植，沒有任何本專案自行加上的偏離；代價是拿掉了
+  「冷啟動 EMA 未收斂或極端 transient 把 feature 值打到離譜範圍」這個
+  安全網，需要重訓後實際觀察是否會出現數值不穩定。
+
+### 驗證
+- `grep` 確認整個元件 Python/C/config/測試裡不再有任何 `erb_norm_clip`/
+  `spec_clip`/`RNNOISE_ERB_NORM_CLIP`/`RNNOISE_SPEC_CLIP` 的功能性引用
+  （只剩解釋這個改動本身的註解）。
+- **這是 checkpoint-incompatible 的架構/語意改動，需要重訓與重新匯出
+  ONNX**；本輪只更新程式碼與測試，尚未重訓。
+
 ## 2026-07 — dataset_gen 單一來源與目錄清理
 
 - `dataset_gen/gen_dataset.py` 每次產生一種指定 sample rate；

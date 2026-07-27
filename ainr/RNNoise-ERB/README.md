@@ -15,14 +15,14 @@ mean-normalized log-ERB 與低頻 complex spectrum 雙路特徵；並非官方 v
 
 ### Feature preprocessing
 
-目前 feature contract 為 `log_erb_dfn_mean_cplx_unit_0_4k_v3`：
+目前 feature contract 為 `log_erb_dfn_mean_cplx_unit_0_4k_v4`：
 
 ```text
 normalized complex STFT
 ├─ power → triangular ERB → 10*log10(E+1e-10)
-│          → per-band EMA mean → (dB - mean) / 40 → clip
+│          → per-band EMA mean → (dB - mean) / 40
 └─ bins 0..4 kHz → per-bin |X[k]| EMA
-                    → real/imag / sqrt(EMA+eps) → clip
+                    → real/imag / sqrt(EMA+eps)
 ```
 
 ERB 路徑對穩態訊號會逐步趨近 0，這是原作 DeepFilterNet 的預期行為；
@@ -31,8 +31,11 @@ ERB 路徑對穩態訊號會逐步趨近 0，這是原作 DeepFilterNet 的預�
 complex feature 約放大 `sqrt(a)` 倍，因此不需要額外 absolute-level input。
 同一 stream 分 chunk 處理時必須同時傳遞 ERB EMA、complex EMA 與 GRU state；
 不同 WAV 之間必須重置。
-兩路主公式、state 初始值與先更新再輸出的順序對齊原作 `libDF`；
-本專案額外保留 ERB `±5` 與 complex `±10` clip 作為部署數值安全界線。
+兩路公式、state 初始值與先更新再輸出的順序精確對齊原作 `libDF`——
+v3 曾額外保留 ERB `±5` 與 complex `±10` clip 作為部署數值安全界線，v4 拿掉了
+這個 clip：對照 upstream `libDF::band_mean_norm_erb`/`band_unit_norm` 與本
+repo 自己的 `ainr/DeepFilterNet2` port 皆確認兩者都不 clip，v4 起兩路皆是
+byte-for-byte 忠實移植，沒有額外的安全界線。
 公式來源：[Rikorose/DeepFilterNet `libDF/src/lib.rs`](https://github.com/Rikorose/DeepFilterNet/blob/main/libDF/src/lib.rs)。
 
 Feature 常數在 `config.ini [feature]`，C 部署常數固定於 `process.h`。
@@ -126,8 +129,9 @@ output_dir = ./output
 都會拒絕缺少版本的舊 checkpoint，或拒絕與 runtime config 不一致的 checkpoint。
 匯出的 ONNX model metadata 也會帶上相同 feature contract，供部署端檢查。
 
-> v1/legacy ERB-only 與 v2 absolute-ERB checkpoint/ONNX 都無法沿用。v3 雖然
-> input shape 不變，normalization semantics 已改變，必須重訓後重新匯出。
+> v1/legacy ERB-only 與 v2 absolute-ERB checkpoint/ONNX 都無法沿用。v3、v4 雖然
+> input shape 不變，normalization semantics 已改變，必須重訓後重新匯出
+> (v4 拿掉了 v3 的 erb_norm_clip/spec_clip，同樣是 semantics 改變)。
 
 ## 訓練
 

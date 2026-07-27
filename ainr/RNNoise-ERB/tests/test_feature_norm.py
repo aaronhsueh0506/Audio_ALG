@@ -1,4 +1,4 @@
-"""Python contract tests for log_erb_dfn_mean_cplx_unit_0_4k_v3."""
+"""Python contract tests for log_erb_dfn_mean_cplx_unit_0_4k_v4."""
 
 import unittest
 import pathlib
@@ -31,14 +31,12 @@ class DualFeatureTest(unittest.TestCase):
             init_lo_db=-60.0,
             init_hi_db=-90.0,
             scale_db=40.0,
-            clip=5.0,
         )
         self.spec_kwargs = dict(
             norm_alpha=self.alpha,
             init_lo=0.001,
             init_hi=0.0001,
             eps=1e-12,
-            clip=10.0,
         )
 
     def feature_cfg(self):
@@ -47,13 +45,11 @@ class DualFeatureTest(unittest.TestCase):
             erb_norm_init_lo_db=-60.0,
             erb_norm_init_hi_db=-90.0,
             erb_norm_scale_db=40.0,
-            erb_norm_clip=5.0,
             spec_bins=129,
             spec_alpha=self.alpha,
             spec_norm_init_lo=0.001,
             spec_norm_init_hi=0.0001,
             spec_norm_eps=1e-12,
-            spec_clip=10.0,
         )
 
     def checkpoint_cfg(self):
@@ -69,7 +65,6 @@ class DualFeatureTest(unittest.TestCase):
             erb_norm_init_lo_db=-60.0,
             erb_norm_init_hi_db=-90.0,
             erb_norm_scale_db=40.0,
-            erb_norm_clip=5.0,
             spec_max_hz=4000,
             spec_bins=129,
             spec_tau_sec=1.0,
@@ -77,7 +72,6 @@ class DualFeatureTest(unittest.TestCase):
             spec_norm_init_lo=0.001,
             spec_norm_init_hi=0.0001,
             spec_norm_eps=1e-12,
-            spec_clip=10.0,
         )
 
     def test_erb_first_frame_updates_then_subtracts(self):
@@ -205,7 +199,6 @@ class DualFeatureTest(unittest.TestCase):
                 'feature_erb_norm_init_lo_db': -60.0,
                 'feature_erb_norm_init_hi_db': -90.0,
                 'feature_erb_norm_scale_db': 40.0,
-                'feature_erb_norm_clip': 5.0,
                 'feature_spec_max_hz': 4000,
                 'feature_spec_bins': 129,
                 'feature_spec_norm_tau_sec': 1.0,
@@ -213,7 +206,6 @@ class DualFeatureTest(unittest.TestCase):
                 'feature_spec_norm_init_lo': 0.001,
                 'feature_spec_norm_init_hi': 0.0001,
                 'feature_spec_norm_eps': 1e-12,
-                'feature_spec_clip': 10.0,
             },
         }
         with self.assertRaisesRegex(ValueError, 'win_len'):
