@@ -66,20 +66,25 @@ static void ref_compute_erb_tables(void) {
     const double bw = high_lim / ((double)RNNOISE_N_FFT / 2.0);
 
     {
+#define MIN_BINS_PER_BAND 2
         double e_lo = freq2erb(0.0), e_hi = freq2erb(high_lim);
-        double nb[RNNOISE_N_BANDS];
+        double ideal[RNNOISE_N_BANDS];
         for (int i = 0; i < N; i++) {
             double e = e_lo + (e_hi - e_lo) * i / (N - 1);
             double cutoff = erb2freq(e);
-            nb[i] = floor((cutoff + bw / 2.0) / bw + 0.5);
+            ideal[i] = floor((cutoff + bw / 2.0) / bw + 0.5);
         }
-        for (int i = 0; i < N - 2; i++) {
-            if (nb[i + 2] - nb[i] < 2.0)
-                nb[i + 2] += 2.0 - (nb[i + 2] - nb[i]);
+        double nb0 = 0.0;
+        ref_nfftborder[0] = 0;
+        for (int i = 1; i < N; i++) {
+            double nxt = ideal[i];
+            if (nxt < nb0 + MIN_BINS_PER_BAND) nxt = nb0 + MIN_BINS_PER_BAND;
+            if (nxt > (double)(RNNOISE_N_FFT / 2 + 1)) nxt = (double)(RNNOISE_N_FFT / 2 + 1);
+            ref_nfftborder[i] = (int)nxt;
+            nb0 = nxt;
         }
-        nb[0] = 0.0;
-        nb[N - 1] = (double)(RNNOISE_N_FFT / 2 + 1);
-        for (int i = 0; i < N; i++) ref_nfftborder[i] = (int)nb[i];
+        ref_nfftborder[N - 1] = RNNOISE_N_FFT / 2 + 1;
+#undef MIN_BINS_PER_BAND
     }
 
     memset(ref_erb_fwd, 0, sizeof(ref_erb_fwd));

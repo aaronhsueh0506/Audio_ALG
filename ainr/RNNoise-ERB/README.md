@@ -15,7 +15,7 @@ mean-normalized log-ERB 與低頻 complex spectrum 雙路特徵；並非官方 v
 
 ### Feature preprocessing
 
-目前 feature contract 為 `log_erb_dfn_mean_cplx_unit_0_4k_v4`：
+目前 feature contract 為 `log_erb_dfn_mean_cplx_unit_0_4k_v5`：
 
 ```text
 normalized complex STFT
@@ -129,9 +129,10 @@ output_dir = ./output
 都會拒絕缺少版本的舊 checkpoint，或拒絕與 runtime config 不一致的 checkpoint。
 匯出的 ONNX model metadata 也會帶上相同 feature contract，供部署端檢查。
 
-> v1/legacy ERB-only 與 v2 absolute-ERB checkpoint/ONNX 都無法沿用。v3、v4 雖然
-> input shape 不變，normalization semantics 已改變，必須重訓後重新匯出
-> (v4 拿掉了 v3 的 erb_norm_clip/spec_clip，同樣是 semantics 改變)。
+> v1/legacy ERB-only 與 v2 absolute-ERB checkpoint/ONNX 都無法沿用。v3、v4、v5
+> 雖然 input shape 不變，normalization semantics 已改變，必須重訓後重新匯出
+> (v4 拿掉了 v3 的 erb_norm_clip/spec_clip；v5 修正 erb_bandborder() 的最小
+> band 寬度保證，改變 erb_fwd/erb_inv 矩陣本身，同樣是 semantics 改變)。
 
 ## 訓練
 

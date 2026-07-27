@@ -33,13 +33,17 @@ extern "C" {
 #define RNNOISE_LOOKAHEAD     1     /* = config.ini lookahead_frames */
 #define RNNOISE_CONV_DELAY    (2 - RNNOISE_LOOKAHEAD)
 
-/* log_erb_dfn_mean_cplx_unit_0_4k_v4 constants.  Keep byte-for-byte aligned with
+/* log_erb_dfn_mean_cplx_unit_0_4k_v5 constants.  Keep byte-for-byte aligned with
  * config.ini [feature] and checkpoint validation in train.py.
  * v4 removes the erb_norm_clip/spec_clip deployment safety clamp v3 kept on
  * top of the DeepFilterNet formula -- verified against upstream
  * Rikorose/DeepFilterNet libDF/src/lib.rs (band_mean_norm_erb/band_unit_norm)
- * and this repo's own ainr/DeepFilterNet2 port that neither clips. */
-#define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v4"
+ * and this repo's own ainr/DeepFilterNet2 port that neither clips.
+ * v5 fixes the ERB band-border minimum-width enforcement in
+ * gen_rnnoise_tables.c (see that file for the algorithm; train.py's
+ * erb_bandborder() is the Python side of the same fix) -- changes the
+ * erb_fwd/erb_inv tables below. */
+#define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v5"
 #define RNNOISE_ERB_NORM_TAU_SEC          1.0f
 #define RNNOISE_ERB_NORM_ALPHA             0.984f
 #define RNNOISE_ERB_NORM_INIT_LO_DB     (-60.0f)

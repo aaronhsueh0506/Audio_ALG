@@ -41,7 +41,16 @@ from dataset_gen import PackedDataset  # noqa: E402
 # Rikorose/DeepFilterNet libDF/src/lib.rs (band_mean_norm_erb/band_unit_norm,
 # neither clips) and this repo's own ainr/DeepFilterNet2 port (same formulas,
 # no clip either) that no clip is part of the original algorithm at all.
-FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v4'
+# v5 fixes erb_bandborder()'s minimum-band-width enforcement: the previous
+# "every-OTHER-band-pair >= 2 bins" rule (ported verbatim from
+# aaronhsueh0506/DeepFilterNet-Keras's ERBBand() notebook) did not actually
+# guarantee every individual band is >= 2 bins wide (a genuine 1-bin band
+# was verified to occur at this file's own sr/n_fft/n_bands). Replaced with
+# a strict greedy-forward minimum, same style as this file's own
+# compute_erb_bands(). This changes the ERB filterbank matrices
+# (erb_fwd/erb_inv / nfftborder), hence the resulting features, even though
+# input/output dimensions are unchanged.
+FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v5'
 LOSS_VERSION = 'df3_multi_res_spec_only_gamma_0.3_v1'
 
 
@@ -325,29 +334,44 @@ def erb2freq(n_erb):
     return 24.7 * 9.265 * (np.exp(n_erb / 9.265) - 1.0)
 
 
-def erb_bandborder(n_bands, sr, n_fft):
-    """Faithful port of DeepFilterNet(-Keras) ERBBand(): returns nfftborder, a length-N
+def erb_bandborder(n_bands, sr, n_fft, min_bins_per_band=2):
+    """Port of DeepFilterNet(-Keras) ERBBand(): returns nfftborder, a length-N
     (N = n_bands) int array of FFT-bin band borders on the Glasberg-Moore ERB scale.
     nfftborder[0]=0 (DC), nfftborder[-1]=n_fft//2+1 (Nyquist+1). N borders → N ERB bands
     (one matrix column each):
         cutoffs = erb2freq(linspace(freq2erb(0), freq2erb(sr/2), N))
         border  = round((cutoff + bw/2) / bw),   bw = (sr/2)/(n_fft/2) = sr/n_fft
-    then Keras's 'every-other-band span >= 2 bins' enforcement.
+
+    Band-width enforcement: strict greedy-forward minimum -- every consecutive
+    border pair is nudged to be at least `min_bins_per_band` bins apart (never
+    below the ideal position, so we only ever borrow forward, never move a
+    border backward). This replaces the original aaronhsueh0506/
+    DeepFilterNet-Keras `ERBBand()` notebook's "every-OTHER-band-pair >= 2"
+    rule (`nb[i+2]-nb[i] >= 2`, checked only for i, i+2 -- not i, i+1), which
+    does NOT actually guarantee every individual band is >= 2 bins wide:
+    verified empirically to produce a genuine 1-bin-wide band at
+    sr=16000/n_fft=512/n_bands=22. The greedy-forward style itself mirrors
+    this file's own compute_erb_bands() (used by the disabled hybrid-band
+    path), just applied to this function's N-border/edge-doubled convention
+    instead of that function's N+1-border one.
     """
+    n_bins = n_fft // 2 + 1
     high_lim = sr / 2.0
     bw = high_lim / (n_fft / 2.0)                       # freqRangePerBin = sr / n_fft
     erb_lims = np.linspace(freq2erb(0.0), freq2erb(high_lim), n_bands)
     cutoffs = erb2freq(erb_lims)
-    nb = np.round((cutoffs + bw / 2.0) / bw)
-    for i in range(n_bands - 2):
-        if (nb[i + 2] - nb[i]) < 2:
-            nb[i + 2] += (2 - (nb[i + 2] - nb[i]))
-    # Pin endpoints to DC and Nyquist+1 = n_bins (Keras's intent; at 48k the rounding
-    # lands on n_bins exactly, but at other sr/n_fft it can fall a bin short and leave
+    ideal = np.round((cutoffs + bw / 2.0) / bw).astype(int)
+    nb = [0]
+    for i in range(1, n_bands):
+        nxt = max(int(ideal[i]), nb[-1] + min_bins_per_band)
+        nxt = min(nxt, n_bins)
+        nb.append(nxt)
+    nb = np.array(nb, dtype=int)
+    # Pin the last border to Nyquist+1 = n_bins (at 48k the rounding lands on
+    # n_bins exactly, but at other sr/n_fft it can fall a bin short and leave
     # the Nyquist bin uncovered → mode1 partition of unity would break).
-    nb[0] = 0
-    nb[-1] = n_fft // 2 + 1
-    return nb.astype(int)
+    nb[-1] = n_bins
+    return nb
 
 
 def compute_erb_matrix(nfftborder, n_fft, mode=0):

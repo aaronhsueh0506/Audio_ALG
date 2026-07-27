@@ -1,4 +1,4 @@
-"""Python contract tests for log_erb_dfn_mean_cplx_unit_0_4k_v4."""
+"""Python contract tests for log_erb_dfn_mean_cplx_unit_0_4k_v5."""
 
 import unittest
 import pathlib
@@ -181,6 +181,21 @@ class DualFeatureTest(unittest.TestCase):
     def test_legacy_checkpoint_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'retrain'):
             require_checkpoint_feature_config({'state_dict': {}}, self.checkpoint_cfg())
+
+    def test_erb_bandborder_guarantees_min_bins_per_band(self):
+        # v5 regression: the previous "every-OTHER-band-pair >= 2" rule did
+        # not actually guarantee every individual band was >= 2 bins wide
+        # (a genuine 1-bin band existed at this exact config). Check every
+        # consecutive border gap directly, not just every-other one.
+        for n_bands, sr, n_fft in [(22, 16000, 512), (32, 48000, 1024),
+                                   (10, 8000, 256), (7, 16000, 512)]:
+            border = erb_bandborder(n_bands, sr, n_fft)
+            widths = np.diff(border)
+            self.assertTrue((widths >= 2).all(),
+                            f'{n_bands}/{sr}/{n_fft}: widths={widths.tolist()}')
+            self.assertEqual(border[0], 0)
+            self.assertEqual(border[-1], n_fft // 2 + 1)
+            self.assertEqual(len(border), n_bands)
 
     def test_win_len_mismatch_is_rejected(self):
         feature_cfg = self.checkpoint_cfg()

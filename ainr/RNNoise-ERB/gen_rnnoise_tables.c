@@ -53,24 +53,32 @@ static void compute_erb_tables(void) {
     const double high_lim = sr / 2.0;
     const double bw = high_lim / ((double)RNNOISE_N_FFT / 2.0);  /* = sr/n_fft */
 
-    /* erb_bandborder: cutoffs = erb2freq(linspace(freq2erb(0), freq2erb(sr/2), N))
-     * border = round((cutoff + bw/2) / bw), 再套 Keras 的
-     * 「每隔一個 band 至少跨 2 bin」修正, 端點釘在 DC / Nyquist+1。 */
+    /* erb_bandborder (v5): cutoffs = erb2freq(linspace(freq2erb(0), freq2erb(sr/2), N)),
+     * ideal border = round((cutoff + bw/2) / bw), 再用嚴格 greedy-forward
+     * 「每個 band 至少 MIN_BINS_PER_BAND bin」保證 (逐一往前推進, 從不後退),
+     * 端點釘在 DC / Nyquist+1。取代舊版「每隔一個 band 補 2」規則
+     * (nb[i+2]-nb[i]>=2, 只檢查 i, i+2, 不檢查 i, i+1) —— 該規則實測在
+     * sr=16000/n_fft=512/N=22 時仍會產生寬度僅 1 bin 的 band。 */
     {
+#define MIN_BINS_PER_BAND 2
         double e_lo = freq2erb(0.0), e_hi = freq2erb(high_lim);
-        double nb[RNNOISE_N_BANDS];
+        double ideal[RNNOISE_N_BANDS];
         for (int i = 0; i < N; i++) {
             double e = e_lo + (e_hi - e_lo) * i / (N - 1);   /* linspace 含端點 */
             double cutoff = erb2freq(e);
-            nb[i] = floor((cutoff + bw / 2.0) / bw + 0.5);   /* np.round (半數進位) */
+            ideal[i] = floor((cutoff + bw / 2.0) / bw + 0.5); /* np.round (半數進位) */
         }
-        for (int i = 0; i < N - 2; i++) {
-            if (nb[i + 2] - nb[i] < 2.0)
-                nb[i + 2] += 2.0 - (nb[i + 2] - nb[i]);
+        double nb0 = 0.0;
+        nfftborder[0] = 0;
+        for (int i = 1; i < N; i++) {
+            double nxt = ideal[i];
+            if (nxt < nb0 + MIN_BINS_PER_BAND) nxt = nb0 + MIN_BINS_PER_BAND;
+            if (nxt > (double)(RNNOISE_N_FFT / 2 + 1)) nxt = (double)(RNNOISE_N_FFT / 2 + 1);
+            nfftborder[i] = (int)nxt;
+            nb0 = nxt;
         }
-        nb[0] = 0.0;
-        nb[N - 1] = (double)(RNNOISE_N_FFT / 2 + 1);
-        for (int i = 0; i < N; i++) nfftborder[i] = (int)nb[i];
+        nfftborder[N - 1] = RNNOISE_N_FFT / 2 + 1;
+#undef MIN_BINS_PER_BAND
     }
 
     /* compute_erb_matrix: block i 介於 border[i]..border[i+1], 欄 i 放下降斜坡、

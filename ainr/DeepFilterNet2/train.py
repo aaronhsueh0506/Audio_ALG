@@ -27,7 +27,15 @@ import tqdm
 from model import DeepFilterNet2
 
 
-MODEL_VERSION = 'dfn2_mask_lookahead_explicit_df_fir_v2'
+# v3: _build_erb_fb() (model.py) rewritten to the exact triangular
+# construction from this project's own aaronhsueh0506/DeepFilterNet-Keras
+# bandERB.ipynb (ERBBand()/ERB_pro_matrix()) -- same as RNNoise-ERB's
+# train.py -- replacing a different ERB-rate formula (21.4/0.00437 instead
+# of the correct 9.265/24.7), a different band-width enforcement, and a
+# non-doubled forward matrix. erb_fb/erb_inv are registered buffers (part of
+# state_dict), so old checkpoints carry stale values that load_state_dict
+# would silently restore; bump forces a fresh training run instead.
+MODEL_VERSION = 'dfn2_mask_lookahead_explicit_df_fir_v3'
 FEATURE_VERSION = 'dfn2_dual_ema_state_v2'
 LOSS_VERSION = 'dfn_mrsl_mag_complex_gamma_v2'
 

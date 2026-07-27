@@ -1,5 +1,49 @@
 # RNNoise-ERB 開發紀錄
 
+## 2026-07 — 修正 erb_bandborder() 最小 band 寬度保證（v5）
+
+### 問題
+- 追查「RNNoise-ERB vs DeepFilterNet2 兩套 ERB 公式是否相同」時,直接
+  對照原作者 [Rikorose/DeepFilterNet `libDF/src/lib.rs`](https://github.com/Rikorose/DeepFilterNet/blob/main/libDF/src/lib.rs)
+  的 `freq2erb`/`erb2freq`,確認跟本專案(以及 `aaronhsueh0506/
+  DeepFilterNet-Keras` 的 `bandERB.ipynb`)完全一致 —— 這部分本來就對。
+- 但原作者的 band-寬度演算法(`erb_fb()`,序列式逐一往後借)跟
+  `bandERB.ipynb` 的 `ERBBand()`(「每隔一個 band 補 2」規則,只檢查
+  `nb[i+2]-nb[i]>=2`,不檢查 `nb[i+1]-nb[i]`)不是同一套,兩者算出的 band
+  寬度分佈不同。且原作者的 filterbank 本身是矩形不重疊(`df/modules.py`
+  的 `erb_fb()`),跟本專案與 `bandERB.ipynb` 的三角重疊 filterbank 也不同
+  ——這是設計選擇差異,决定保持三角形。
+- 但覆盤 `ERBBand()` 的「每隔一個 band 補 2」規則時,發現它**不保證每個
+  band 都 ≥2 bin**:在 sr=16000/n_fft=512/n_bands=22(本專案實際設定)下
+  實測算出一個寬度僅 1 bin 的 band(`nfftborder` 相鄰兩個值只差 1)。
+
+### 決策
+- `erb_bandborder()`(`train.py`)、`gen_rnnoise_tables.c`、
+  `test_rnnoise_tables.c`(獨立 drift-guard 複製)三邊同步改成嚴格
+  greedy-forward 演算法:從 `ideal[i]`(跟原本一樣,ERB-rate linspace +
+  `round((cutoff+bw/2)/bw)`)開始,若 `ideal[i] < prev_border +
+  min_bins_per_band` 就往前推進到 `prev_border + min_bins_per_band`,從不
+  後退。這個風格跟本檔案自己 `compute_erb_bands()`(停用中的 hybrid-band
+  路徑用)一致,只是套用到 `erb_bandborder()` 的「N borders → N bands,
+  頭尾兩欄 edge-doubling」慣例上。
+- ERB-rate 公式(`freq2erb`/`erb2freq`,9.265/24.7 常數)、三角 filterbank
+  構造(`compute_erb_matrix`,mode=0 forward 頭尾×2 / mode=1 inverse 乾淨
+  partition-of-unity)維持不變——這兩者已經跟原作者/`bandERB.ipynb` 一致
+  或是刻意的設計選擇,不在這次修正範圍。
+- Feature version 改為 `log_erb_dfn_mean_cplx_unit_0_4k_v5`;input/output
+  shape 不變,但 `erb_fwd`/`erb_inv` 矩陣數值改變,checkpoint-incompatible。
+
+### 驗證
+- 新增 regression test(`tests/test_feature_norm.py`
+  `test_erb_bandborder_guarantees_min_bins_per_band`):對 4 組不同
+  sr/n_fft/n_bands 組合逐一檢查每個 band 寬度 `>=2`,而非只抽查「每隔一
+  個」。
+- `make test`(tables drift-guard 兩層 + feature contract + 4096-frame C
+  獨立參考 regression)、`make test-feature-python`(11 個 unittest + `Python`/`C`
+  golden-vector parity)、`make test-loss-python` 全部重跑,PASS。
+- `export_erb_matrix.py` 重跑確認 mode=1 partition-of-unity 仍是
+  `max|rowsum-1|=0`、mode=0/mode=1 仍是頭尾 ×2 關係。
+
 ## 2026-07 — 拿掉 v3 的 erb_norm_clip/spec_clip，精確對齊 DeepFilterNet（v4）
 
 ### 問題

@@ -4,6 +4,7 @@ import configparser
 import os
 import sys
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -11,7 +12,7 @@ import torch.nn.functional as F
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from model import _build_erb_fb, deep_filter_apply  # noqa: E402
+from model import _build_erb_fb, deep_filter_apply, erb_bandborder  # noqa: E402
 from train import (  # noqa: E402
     FEATURE_VERSION,
     LOSS_VERSION,
@@ -125,6 +126,33 @@ def test_phase_aware_loss_matches_reference_and_accepts_pure_noise():
     assert torch.isfinite(pure_noise_out.grad).all()
 
 
+def test_erb_fb_matches_banderb_notebook_construction():
+    # erb_bandborder(): every band >= 2 bins (the v3 fix -- the original
+    # notebook's "every-OTHER-band-pair >= 2" rule did not actually
+    # guarantee this), endpoints pinned, right band count.
+    for n_bands, sr, n_fft in [(32, 48000, 1024), (22, 16000, 512),
+                               (10, 8000, 256)]:
+        border = erb_bandborder(n_bands, sr, n_fft)
+        widths = np.diff(border)
+        assert (widths >= 2).all(), (n_bands, sr, n_fft, widths.tolist())
+        assert border[0] == 0
+        assert border[-1] == n_fft // 2 + 1
+        assert len(border) == n_bands
+
+    # _build_erb_fb(): erb_inv is an exact partition of unity (no row
+    # normalisation needed, unlike the old construction); erb_fb's two edge
+    # columns are exactly 2x erb_inv's (mode=0 vs mode=1), interior columns
+    # match exactly.
+    fb, inv = _build_erb_fb(1024, 48000, 32)
+    assert fb.shape == (32, 513)
+    assert inv.shape == (32, 513)
+    colsum = inv.sum(dim=0)
+    torch.testing.assert_close(colsum, torch.ones_like(colsum), rtol=0, atol=1e-6)
+    torch.testing.assert_close(fb[0], 2.0 * inv[0])
+    torch.testing.assert_close(fb[-1], 2.0 * inv[-1])
+    torch.testing.assert_close(fb[15], inv[15])
+
+
 def test_checkpoint_contract_rejects_legacy_and_accepts_current():
     cfg = load_config()
     feature_cfg = read_feature_config(cfg, 48000, 512)
@@ -154,6 +182,7 @@ if __name__ == '__main__':
         test_feature_chunk_equivalence_and_independent_states,
         test_causal_order_five_uses_current_tap_without_extra_delay,
         test_phase_aware_loss_matches_reference_and_accepts_pure_noise,
+        test_erb_fb_matches_banderb_notebook_construction,
         test_checkpoint_contract_rejects_legacy_and_accepts_current,
     ]
     for test in tests:

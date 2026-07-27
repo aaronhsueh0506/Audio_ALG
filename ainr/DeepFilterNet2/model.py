@@ -22,49 +22,96 @@ import torch.nn.functional as F
 # ERB filterbank helpers
 # ============================================================
 
-def _build_erb_fb(n_fft: int, sr: int, n_erb: int):
-    """
-    Build ERB band-assignment matrices for the configured sample rate and FFT.
+def freq2erb(freq_hz):
+    """Hz -> ERB-number (Glasberg-Moore). Verified bit-for-bit against
+    upstream Rikorose/DeepFilterNet's libDF/src/lib.rs freq2erb (9.265/24.7
+    constants) and this project's own aaronhsueh0506/DeepFilterNet-Keras
+    bandERB.ipynb -- also the exact formula RNNoise-ERB's train.py uses."""
+    return 9.265 * np.log(1.0 + freq_hz / (24.7 * 9.265))
 
-    Returns:
-        erb_fb   : (n_erb, n_bins) — forward transform (normalised, sums to 1 per band)
-        erb_inv  : (n_erb, n_bins) — inverse transform (indicator, 0/1 per bin)
+
+def erb2freq(n_erb):
+    """ERB-number -> Hz (inverse of freq2erb)."""
+    return 24.7 * 9.265 * (np.exp(n_erb / 9.265) - 1.0)
+
+
+def erb_bandborder(n_bands, sr, n_fft, min_bins_per_band=2):
+    """Port of aaronhsueh0506/DeepFilterNet-Keras bandERB.ipynb's ERBBand():
+    returns nfftborder, a length-N (N = n_bands) int array of FFT-bin band
+    borders on the Glasberg-Moore ERB scale. nfftborder[0]=0 (DC),
+    nfftborder[-1]=n_fft//2+1 (Nyquist+1). N borders -> N ERB bands (one
+    matrix column each, see compute_erb_matrix):
+        cutoffs = erb2freq(linspace(freq2erb(0), freq2erb(sr/2), N))
+        ideal border = round((cutoff + bw/2) / bw), bw = sr/n_fft
+
+    Band-width enforcement: strict greedy-forward minimum (every consecutive
+    border pair is >= min_bins_per_band bins apart, only ever borrowing
+    forward). This is RNNoise-ERB train.py's own v5 fix, applied here from
+    the start: the original notebook's "every-OTHER-band-pair >= 2" rule
+    (checked only i, i+2) does not actually guarantee every individual band
+    is >= 2 bins wide.
     """
     n_bins = n_fft // 2 + 1
-    fft_freqs = np.linspace(0, sr / 2, n_bins)
+    high_lim = sr / 2.0
+    bw = high_lim / (n_fft / 2.0)
+    erb_lims = np.linspace(freq2erb(0.0), freq2erb(high_lim), n_bands)
+    cutoffs = erb2freq(erb_lims)
+    ideal = np.round((cutoffs + bw / 2.0) / bw).astype(int)
+    nb = [0]
+    for i in range(1, n_bands):
+        nxt = max(int(ideal[i]), nb[-1] + min_bins_per_band)
+        nxt = min(nxt, n_bins)
+        nb.append(nxt)
+    nb = np.array(nb, dtype=int)
+    nb[-1] = n_bins
+    return nb
 
-    def hz_to_erb(f):
-        return 21.4 * np.log10(np.clip(0.00437 * f + 1, 1e-12, None))
 
-    def erb_to_hz(e):
-        return (10 ** (e / 21.4) - 1) / 0.00437
-
-    erb_lo = hz_to_erb(0.0)
-    erb_hi = hz_to_erb(sr / 2.0)
-    erb_edges = np.linspace(erb_lo, erb_hi, n_erb + 1)
-    hz_edges = erb_to_hz(erb_edges)
-    bin_edges = np.round(hz_edges / (sr / n_fft)).astype(int)
-    bin_edges = np.clip(bin_edges, 0, n_bins)
-    # Ensure strictly increasing
-    for i in range(1, len(bin_edges)):
-        if bin_edges[i] <= bin_edges[i - 1]:
-            bin_edges[i] = bin_edges[i - 1] + 1
-
-    # Triangular overlapping ERB filterbank (matches DeepFilterNet-Keras ERBB):
-    # bin j in band i's block → weight (1-j/bs) to band i, (j/bs) to band i+1.
-    W = np.zeros((n_bins, n_erb), dtype=np.float32)        # (n_bins, n_erb)
-    for i in range(n_erb):
-        lo = int(bin_edges[i])
-        hi = min(int(bin_edges[i + 1]), n_bins)
+def compute_erb_matrix(nfftborder, n_fft, mode=0):
+    """Port of bandERB.ipynb's ERB_pro_matrix(nfftborder, NFFT, mode) --
+    identical to RNNoise-ERB train.py's compute_erb_matrix(). Triangular ERB
+    filterbank, shape (n_bins, N) with N = len(nfftborder) bands. The
+    range(N-1) blocks lie BETWEEN consecutive borders, so column 0 (falling
+    ramp only) and column N-1 (rising ramp only) are ONE-SIDED; interior
+    columns are full triangles.
+        mode=0 (forward / feature ERBB): x2 on the two one-sided edge
+               columns so their band energy is comparable to interior bands.
+        mode=1 (inverse / mask expansion): no x2 -- a clean partition of
+               unity, so gain=1 maps to bin_gain=1 with NO row normalisation.
+    """
+    n_bins = n_fft // 2 + 1
+    N = len(nfftborder)
+    W = np.zeros((n_bins, N), dtype=np.float32)
+    for i in range(N - 1):
+        lo, hi = int(nfftborder[i]), int(nfftborder[i + 1])
         bs = hi - lo
         for j in range(bs):
             W[lo + j, i] = 1.0 - j / bs
-            if i + 1 < n_erb:
-                W[lo + j, i + 1] = j / bs
-    fb = W.T.copy()                                        # (n_erb, n_bins) forward
-    row_sum = np.maximum(W.sum(axis=1, keepdims=True), 1e-8)
-    inv = (W / row_sum).T.copy()                          # (n_erb, n_bins) col-normalized inverse
+            W[lo + j, i + 1] = j / bs
+    if mode == 0:
+        W[:, 0] *= 2.0
+        W[:, N - 1] *= 2.0
+    return W
 
+
+def _build_erb_fb(n_fft: int, sr: int, n_erb: int):
+    """
+    Build ERB band-assignment matrices for the configured sample rate and FFT.
+    Ported from this project's own aaronhsueh0506/DeepFilterNet-Keras
+    bandERB.ipynb (ERBBand()/ERB_pro_matrix()) -- the same triangular
+    construction RNNoise-ERB's train.py uses (erb_bandborder()/
+    compute_erb_matrix()), including the v5 strict-minimum-band-width fix.
+
+    Returns:
+        erb_fb   : (n_erb, n_bins) — forward transform (mode=0: edge columns
+                   doubled so their band energy is comparable to interior
+                   bands, matching bandERB.ipynb -- NOT normalised to sum 1)
+        erb_inv  : (n_erb, n_bins) — inverse transform (mode=1: clean
+                   partition-of-unity by construction, no row normalisation)
+    """
+    borders = erb_bandborder(n_erb, sr, n_fft)
+    fb = compute_erb_matrix(borders, n_fft, mode=0).T.copy()   # (n_erb, n_bins)
+    inv = compute_erb_matrix(borders, n_fft, mode=1).T.copy()  # (n_erb, n_bins)
     return torch.from_numpy(fb), torch.from_numpy(inv)
 
 
