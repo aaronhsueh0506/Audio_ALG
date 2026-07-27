@@ -137,8 +137,24 @@ def load_model(args):
     return model, params
 
 
+def apply_atten_lim(gains, atten_lim_db):
+    """Attenuation limit: mixes the enhanced gain toward 1.0 (bypass) so the
+    output never suppresses more than ``atten_lim_db`` dB, matching
+    Rikorose/DeepFilterNet's ``enhance.py`` ``atten_lim_db`` mixing exactly
+    (``enhanced = noisy*lim + enhanced*(1-lim)``, applied here at the ERB
+    gain level rather than on the full spectrum -- equivalent because the
+    mode=1 inverse ERB matrix is partition-of-unity, but O(n_bands) instead
+    of O(n_bins)). Not the same as the Valin post-filter or DFN's separate
+    ``Mask.forward`` clamp/floor mechanism (a different, non-linear op).
+    """
+    if atten_lim_db is None or atten_lim_db <= 0:
+        return gains
+    lim = 10 ** (-abs(atten_lim_db) / 20)
+    return lim + gains * (1 - lim)
+
+
 def process_file(input_path, output_path, model, params,
-                 pf_beta=0.0, dump_calib=None, max_frames=200,
+                 pf_beta=0.0, atten_lim_db=None, dump_calib=None, max_frames=200,
                  dump_debug=None):
     SR         = params['SR']
     N_FFT      = params['N_FFT']
@@ -175,9 +191,13 @@ def process_file(input_path, output_path, model, params,
     raw_gains = gains.squeeze(0)
     gains = raw_gains
 
-    # DFN-style: optional Valin post-filter, then mask→bin via mode=1 inverse ERB
+    # DFN-style: optional Valin post-filter, then attenuation limit, then
+    # mask→bin via mode=1 inverse ERB (matches df/modules.py Mask.forward's
+    # pf-then-atten_lim order, though DFN's own atten_lim is a clamp/floor,
+    # not this linear mix -- see apply_atten_lim() docstring).
     if pf_beta > 0:
         gains = valin_post_filter(gains, beta=pf_beta)
+    gains = apply_atten_lim(gains, atten_lim_db)
 
     bin_gains = (gains @ erb_inv.t()).T                  # (n_bins, n_frames), no row-norm
 
@@ -205,7 +225,7 @@ def process_file(input_path, output_path, model, params,
 def denoise_single(args):
     model, params = load_model(args)
     process_file(args.input, args.output, model, params,
-                 pf_beta=args.pf_beta,
+                 pf_beta=args.pf_beta, atten_lim_db=args.atten_lim,
                  dump_calib=args.dump_calib, max_frames=args.max_frames,
                  dump_debug=args.dump_debug)
     print(f"降噪完成: {args.output}")
@@ -224,7 +244,8 @@ def denoise_batch(args):
         rel = os.path.relpath(input_path, args.input_dir)
         output_path = os.path.join(args.output_dir, rel)
         try:
-            process_file(input_path, output_path, model, params, pf_beta=args.pf_beta)
+            process_file(input_path, output_path, model, params,
+                        pf_beta=args.pf_beta, atten_lim_db=args.atten_lim)
         except Exception as e:
             failed.append((rel, str(e)))
 
@@ -254,6 +275,12 @@ if __name__ == '__main__':
     parser.add_argument('--pf-beta', type=float, default=0.0,
                         help='Valin post-filter beta (0=off, DFN default=0.02). '
                              'Sharpens low gains toward 0 → deeper steady-state suppression.')
+    parser.add_argument('--atten-lim', type=float, default=None,
+                        help='Attenuation limit in dB by mixing the enhanced gain '
+                             'with the noisy (unity-gain) signal, matching '
+                             "Rikorose/DeepFilterNet enhance.py's --atten-lim: e.g. "
+                             '12 only suppresses noise by up to 12dB and keeps the '
+                             'rest. None/<=0 disables it (default, max suppression).')
 
     args = parser.parse_args()
 

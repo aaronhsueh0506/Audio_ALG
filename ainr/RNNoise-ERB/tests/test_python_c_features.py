@@ -20,6 +20,7 @@ from train import (  # noqa: E402
     extract_model_features,
     make_norm_alpha,
 )
+from denoise import apply_atten_lim  # noqa: E402
 
 
 N_BINS = 257
@@ -58,6 +59,10 @@ void test_copy_erb_state(void *memory, float *out) {
 void test_copy_spec_state(void *memory, float *out) {
     RNNoiseState *state = (RNNoiseState *)memory;
     memcpy(out, state->spec_norm_state, sizeof(state->spec_norm_state));
+}
+
+void test_apply_atten_lim(float *band_gains, float atten_lim_db) {
+    rnnoise_apply_atten_lim(band_gains, atten_lim_db);
 }
 """
 
@@ -122,6 +127,7 @@ def main():
         lib.test_step.restype = ctypes.c_int
         lib.test_copy_erb_state.argtypes = [ctypes.c_void_p, float_p]
         lib.test_copy_spec_state.argtypes = [ctypes.c_void_p, float_p]
+        lib.test_apply_atten_lim.argtypes = [float_p, ctypes.c_float]
 
         memory = ctypes.create_string_buffer(lib.test_state_size())
         lib.test_state_init(memory)
@@ -169,7 +175,20 @@ def main():
         np.testing.assert_allclose(
             c_spec_state, py_state['spec'][0, 0].numpy(), rtol=3e-5, atol=3e-5)
 
+        # rnnoise_apply_atten_lim must agree with denoise.py's apply_atten_lim
+        # (attenuation-limit gain mix, ported from Rikorose/DeepFilterNet
+        # enhance.py) bit-for-bit-equivalent within float32 tolerance, both
+        # for the disabled (<=0) no-op path and the active-mixing path.
+        py_gains = torch.tensor([0.0, 0.25, 0.5, 0.75, 1.0], dtype=torch.float32)
+        for atten_lim_db in (0.0, -3.0, 6.0, 12.0, 40.0):
+            c_gains = py_gains.numpy().copy().astype(np.float32)
+            lib.test_apply_atten_lim(c_gains.ctypes.data_as(float_p),
+                                     ctypes.c_float(atten_lim_db))
+            py_out = apply_atten_lim(py_gains.clone(), atten_lim_db).numpy()
+            np.testing.assert_allclose(c_gains, py_out, rtol=1e-6, atol=1e-6)
+
     print('PASS: train.py and process.c STFT/features/states agree')
+    print('PASS: rnnoise_apply_atten_lim matches denoise.py apply_atten_lim')
 
 
 if __name__ == '__main__':

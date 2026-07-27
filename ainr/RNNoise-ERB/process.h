@@ -127,6 +127,21 @@ int rnnoise_compute_features(RNNoiseState *st,
 
 /* --- 後處理 --- */
 
+/* Attenuation limit: 對齊 Rikorose/DeepFilterNet enhance.py 的 atten_lim_db
+ * 機制 (df/enhance.py `enhanced = noisy*lim + enhanced*(1-lim)`,
+ * lim = 10^(-|atten_lim_db|/20))。不是 mask clamp/floor (df/modules.py 的
+ * Mask.forward 另一種、數學上不同的機制) ——這裡是線性內插:
+ *   band_gains[b] = lim + band_gains[b] * (1 - lim)
+ * 在 band 層級套用即可 (不需另外在 bin 層級重做一次)：因為 erb_inv 是
+ * partition of unity (每一列元素和為 1)，這個仿射變換跟 rnnoise_expand_gains
+ * 的矩陣乘法可交換 —— band 層級套用後再展開, 等價於展開後在 bin 層級套用,
+ * 也等價於直接對 spectrum 做同樣的線性混合, 但成本只需 N_BANDS(22) 次而非
+ * N_BINS(257) 次。
+ * atten_lim_db <= 0 (或呼叫端選擇不呼叫這個函式) 為 no-op/停用, 行為與
+ * 拿掉這個功能前完全相同。
+ * band_gains: 長度 RNNOISE_N_BANDS, 就地修改。 */
+void rnnoise_apply_atten_lim(float *band_gains, float atten_lim_db);
+
 /* 將 N_BANDS 個 band gain 經 mode=1 反向三角矩陣展開到 N_BINS 個 bin gain
  * (partition of unity: gains=1 → bin_gains=1, 無需列正規化) */
 void rnnoise_expand_gains(const float *band_gains, float *bin_gains);

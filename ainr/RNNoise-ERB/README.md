@@ -217,6 +217,15 @@ python3 denoise.py --config config.ini --model output/rnnoise_best.pth \
 ```
 
 `--pf-beta` 預設為 0（關閉），避免在還沒驗證 raw gain 前再加劇抑制。
+
+`--atten-lim <dB>` 限制最大抑制量，做法對齊 Rikorose/DeepFilterNet
+`enhance.py` 的 `--atten-lim`/`-a`：把 gain 往 1.0（不抑制）方向線性混合，
+`lim = 10^(-|atten_lim_db|/20)`，`gain' = lim + gain*(1-lim)`——例如
+`--atten-lim 12` 保證輸出最多只壓 12dB，其餘 noise floor 會保留。這在 ERB
+band 層級套用（`rnnoise_apply_atten_lim`，C 端同名函式對應),
+數學上等價於直接對 spectrum 做同樣的線性混合(因為 mode=1 反向矩陣是
+partition of unity),但成本只需 22 次而非 257 次。預設不啟用(`None`,
+維持目前最大抑制行為);純推論後處理,不影響 checkpoint/feature contract。
 若要定位「全壓成 0」是 feature、model 或 post-filter 造成：
 
 ```bash

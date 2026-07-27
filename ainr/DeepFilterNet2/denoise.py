@@ -89,7 +89,23 @@ def load_model(args):
     return model, params
 
 
-def process_file(input_path, output_path, model, params):
+def apply_atten_lim(noisy_spec, enhanced_spec, atten_lim_db):
+    """Attenuation limit, ported verbatim from Rikorose/DeepFilterNet's
+    ``enhance.py``: ``enhanced = noisy*lim + enhanced*(1-lim)``,
+    ``lim = 10**(-|atten_lim_db|/20)``. Unlike RNNoise-ERB (a real-valued
+    per-band gain), DFN2's deep-filter output is a genuinely different
+    complex spectrum (multi-tap complex combination, not just noisy times a
+    real mask), so the mix has to happen on the complex spectra directly
+    rather than on some intermediate gain -- this is the exact mechanism the
+    upstream CLI's ``--atten-lim``/``-a`` flag uses.
+    """
+    if atten_lim_db is None or abs(atten_lim_db) == 0:
+        return enhanced_spec
+    lim = 10 ** (-abs(atten_lim_db) / 20)
+    return noisy_spec * lim + enhanced_spec * (1 - lim)
+
+
+def process_file(input_path, output_path, model, params, atten_lim_db=None):
     SR      = params['SR']
     N_FFT   = params['N_FFT']
     WIN_LEN = params['WIN_LEN']
@@ -115,6 +131,7 @@ def process_file(input_path, output_path, model, params):
             feature_cfg=feature_cfg,
         )
         enhanced_spec, _ = model(spec_c, feat_erb, feat_spec)
+        enhanced_spec = apply_atten_lim(spec_c, enhanced_spec, atten_lim_db)
 
     enhanced_wav = torch.istft(
         enhanced_spec, N_FFT, HOP_LEN, WIN_LEN, window=window, length=T, normalized=True,
@@ -128,7 +145,7 @@ def process_file(input_path, output_path, model, params):
 
 def denoise_single(args):
     model, params = load_model(args)
-    process_file(args.input, args.output, model, params)
+    process_file(args.input, args.output, model, params, atten_lim_db=args.atten_lim)
     print(f"降噪完成: {args.output}")
 
 
@@ -146,7 +163,8 @@ def denoise_batch(args):
         rel = os.path.relpath(input_path, args.input_dir)
         output_path = os.path.join(args.output_dir, rel)
         try:
-            process_file(input_path, output_path, model, params)
+            process_file(input_path, output_path, model, params,
+                        atten_lim_db=args.atten_lim)
         except Exception as e:
             failed.append((rel, str(e)))
 
@@ -165,6 +183,12 @@ if __name__ == '__main__':
     parser.add_argument('--output', default=None)
     parser.add_argument('--input-dir', default=None)
     parser.add_argument('--output-dir', default=None)
+    parser.add_argument('--atten-lim', type=float, default=None,
+                        help='Attenuation limit in dB by mixing the enhanced spectrum '
+                             'with the noisy spectrum, matching '
+                             "Rikorose/DeepFilterNet enhance.py's --atten-lim: e.g. "
+                             '12 only suppresses noise by up to 12dB and keeps the '
+                             'rest. None/0 disables it (default, max suppression).')
     args = parser.parse_args()
 
     if args.input_dir and args.output_dir:
