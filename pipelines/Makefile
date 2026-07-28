@@ -409,6 +409,12 @@ endif
 # already applied to their own Makefiles.
 FP_POLICY := -ffp-contract=off
 
+# audio_pipeline.c instantiates sk__cquad_load/store, whose native
+# vld2q_f32/vst2q_f32 access to interleaved Complex storage requires this
+# TU-scoped aliasing policy. Keep the flag named, override-protected, and in
+# CFG_SIG so no stale object can cross the policy boundary.
+PIPELINE_COMPLEX_ALIAS_CFLAGS := -fno-strict-aliasing
+
 # FP_ALLOWED_CHARS_RE (added alongside the FP-policy allow-list redesign
 # below -- replicated from audio_common's/AEC's/NR's identical fix, see the
 # "REDESIGN" comment further down for the full writeup) is a SECOND bare,
@@ -457,7 +463,7 @@ LDFLAGS += $(EXTRA_LDFLAGS)
 # `-e` override of FP_ALLOWED_CHARS_RE specifically could widen the allowed
 # character set (e.g. to `.*`, matching anything) and silently neuter the
 # allow-list below. EXTRA_CFLAGS / EXTRA_LDFLAGS are the supported hooks.
-$(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
+$(foreach v,CFLAGS CXXFLAGS CPPFLAGS LDFLAGS FP_POLICY PIPELINE_COMPLEX_ALIAS_CFLAGS FP_ALLOWED_CHARS_RE,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy, backend define, include paths); use EXTRA_CFLAGS / EXTRA_LDFLAGS instead)))
 
@@ -888,7 +894,7 @@ endif
 # guard-skip knob must not alias a guarded build), SRCS (P1-4: this
 # Makefile's own compiled sources -- the archive's one member TU plus the
 # CLI/test TUs -- so a source-set change keys to a fresh directory).
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort audio_pipeline.c aec_nr_pipeline.c aec_nr_pipeline_static.c test_audio_pipeline.c example_board_adapter.c)
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort audio_pipeline.c aec_nr_pipeline.c aec_nr_pipeline_static.c test_audio_pipeline.c example_board_adapter.c) PIPELINE_COMPLEX_ALIAS_CFLAGS=$(PIPELINE_COMPLEX_ALIAS_CFLAGS)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT (round-6 review P1): where THIS repo's own keyed
@@ -959,7 +965,7 @@ $(OBJ_DIR)/aec_nr_pipeline_static.o: aec_nr_pipeline_static.c audio_pipeline.h |
 # Compiled with $(LIB_CFLAGS) (not the shared $(CFLAGS)) so NO_STDIO=1 only
 # ever affects THIS object -- see the NO_STDIO comment near CFLAGS above.
 $(OBJ_DIR)/audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) $(PIPELINE_COMPLEX_ALIAS_CFLAGS) -MD -MP -c -o $@ $<
 
 # test_audio_pipeline: standalone acceptance test for audio_pipeline.h itself
 # (create-vs-init byte equality incl. a dirty/poisoned pool, destroy
