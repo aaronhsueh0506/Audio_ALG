@@ -25,7 +25,7 @@ from train import (
     make_checkpoint_contract,
     read_feature_config,
     read_loss_config,
-    require_checkpoint_contract,
+    require_checkpoint_contract, read_model_config,
 )
 
 
@@ -38,14 +38,12 @@ def load_model(args):
     WIN_LEN = cfg.getint('signal', 'win_len', fallback=N_FFT)
     HOP_LEN = cfg.getint('signal', 'hop_len', fallback=WIN_LEN // 2)
 
-    N_ERB      = cfg.getint('model', 'n_erb',       fallback=32)
-    DF_BINS    = cfg.getint('model', 'df_bins',     fallback=64)
-    DF_ORDER   = cfg.getint('model', 'df_order',    fallback=5)
-    MASK_LOOKAHEAD = cfg.getint('model', 'mask_lookahead', fallback=1)
-    DF_LOOKAHEAD = cfg.getint('model', 'df_lookahead', fallback=0)
-    EMB_SIZE   = cfg.getint('model', 'emb_size',    fallback=256)
-    ENC_CH     = cfg.getint('model', 'enc_channels', fallback=16)
-    GRU_GROUPS = cfg.getint('model', 'gru_groups',  fallback=1)
+    model_cfg = read_model_config(cfg)
+    N_ERB          = model_cfg['n_erb']
+    DF_BINS        = model_cfg['df_bins']
+    DF_ORDER       = model_cfg['df_order']
+    MASK_LOOKAHEAD = model_cfg['mask_lookahead']
+    DF_LOOKAHEAD   = model_cfg['df_lookahead']
     if not 0 < WIN_LEN <= N_FFT:
         raise ValueError('win_len must be in (0, n_fft]')
     if not 0 < HOP_LEN <= WIN_LEN:
@@ -76,11 +74,7 @@ def load_model(args):
         ckpt, contract, context=args.model, require_loss=False
     )
 
-    model = DeepFilterNet2(
-        n_fft=N_FFT, sr=SR, n_erb=N_ERB, df_bins=DF_BINS, df_order=DF_ORDER,
-        enc_ch=ENC_CH, emb_size=EMB_SIZE, gru_groups=GRU_GROUPS,
-        mask_lookahead=MASK_LOOKAHEAD, df_lookahead=DF_LOOKAHEAD,
-    )
+    model = DeepFilterNet2(**model_cfg)
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
 

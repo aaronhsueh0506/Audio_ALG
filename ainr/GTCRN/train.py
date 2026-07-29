@@ -8,106 +8,112 @@ GTCRN 訓練腳本
 
 import argparse
 import configparser
-import glob
-import math
 import os
+import sys
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, RandomSampler, Sampler, Subset
+from torch.utils.data import DataLoader, RandomSampler
 import tqdm
 
+from checkpoint_utils import extract_state_dict
 from model import GTCRN
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from dataset_gen import (  # noqa: E402
+    BlockShuffleSampler,
+    dataloader_worker_kwargs,
+    load_packed_dataset,
+    locality_preserving_random_split,
+    set_seed,
+    split_sizes,
+    subsets_from_indices,
+)
+
+
+# ``PackedDataset``, the sampler, the seeder and the train/val split all live
+# in ``dataset_gen`` and are shared by all three models.  They used to be
+# copied into each trainer, and they drifted: GTCRN held out 5% while
+# RNNoise-ERB held out 10%, so the two models being compared were trained on
+# different corpora.  Which samples each model gets is part of the comparison
+# protocol, so there is exactly one definition of it.
+
 
 # ============================================================
-# Dataset
+# Checkpoint contract
 # ============================================================
+#
+# Bumped whenever a change makes previously-trained weights invalid or
+# meaningless to resume.  Mirrors the gates in RNNoise-ERB/train.py:53-54 and
+# DeepFilterNet2/train.py:39-40, which GTCRN previously lacked entirely.
+MODEL_VERSION = 'gtcrn_upstream_bitexact_v1'
+LOSS_VERSION = 'gtcrn_hybrid_30spec_70mag_sisnr_istft_both_v1'
 
-class PackedDataset(Dataset):
+# Every non-version key in build_contract() is a field that changes the meaning
+# of the weights (``erb_subband_1/2`` included -- they alter the model's input
+# width yet live in [model], which pre-contract checkpoints never recorded).
+# Derived rather than restated so adding a field to build_contract() cannot
+# silently leave it unvalidated.
+_VERSION_FIELDS = ('model_version', 'loss_version')
+
+
+def build_contract(cfg, win_len, hop_len):
+    return {
+        'model_version': MODEL_VERSION,
+        'loss_version': LOSS_VERSION,
+        'sr': cfg.getint('signal', 'sr'),
+        'n_fft': cfg.getint('signal', 'n_fft'),
+        'win_len': win_len,
+        'hop_len': hop_len,
+        'erb_subband_1': cfg.getint('model', 'erb_subband_1', fallback=65),
+        'erb_subband_2': cfg.getint('model', 'erb_subband_2', fallback=64),
+    }
+
+
+def require_checkpoint_contract(ckpt, contract, context='checkpoint',
+                                allow_missing=False):
+    """Refuse to resume across a semantic change.
+
+    Upstream ships no trainer, so this is our own hygiene — but without it a
+    resume across an n_fft or erb_subband change silently succeeds and trains
+    garbage, which is exactly what the old code did.
+
+    ``allow_missing=True`` skips the version gate for checkpoints that predate
+    it -- the vendored upstream tars carry no contract at all, so inference
+    must still accept them while enforcing the contract on anything that does
+    record one.
     """
-    Loads a packed .pt file produced by pack_dataset.py.
-    Format: {'data': Tensor(N, 2, T)}  ch0=noisy, ch1=clean.
-
-    Pass mmap=True on shared servers to keep data on disk (OS page cache)
-    instead of loading the full tensor into RAM.
-    """
-    def __init__(self, pt_path: str, mmap: bool = False, expected_sr: int = None):
-        if not os.path.isfile(pt_path):
-            raise FileNotFoundError(f"Packed dataset not found: {pt_path}")
-        print(f"PackedDataset: loading {pt_path} (mmap={mmap}) ...")
-        obj = torch.load(pt_path, map_location='cpu', mmap=mmap, weights_only=True)
-        if 'sr' not in obj:
-            raise ValueError(f"Packed dataset has no sample-rate metadata: {pt_path}")
-        self.sr = int(obj['sr'])
-        if expected_sr is not None and self.sr != expected_sr:
+    if allow_missing and not any(key in ckpt for key in _VERSION_FIELDS):
+        return
+    for key in _VERSION_FIELDS:
+        got = ckpt.get(key)
+        if got != contract[key]:
+            shown = repr(got) if got is not None else 'missing (pre-contract checkpoint)'
             raise ValueError(
-                f"Packed dataset SR={self.sr}, but config requires SR={expected_sr}: {pt_path}"
+                f"{context} {key}={shown}, expected {contract[key]!r}. "
+                f"Resuming across this change would train on incompatible weights; "
+                f"start a fresh run instead."
             )
-        self.data = obj['data']   # (N, 2, T)
-        if self.data.ndim != 3 or self.data.shape[1] != 2:
+    # Beyond this point the checkpoint is known to carry a contract, so every
+    # field must be present AND match.  "compare only if present" let a
+    # checkpoint that recorded nothing but the two version strings satisfy the
+    # whole gate; vendored upstream tars are already handled above by
+    # allow_missing, so nothing needs that leniency.
+    for key in contract:
+        if key in _VERSION_FIELDS:
+            continue
+        if key not in ckpt:
             raise ValueError(
-                f"Packed dataset must have shape (N, 2, T), got {tuple(self.data.shape)}"
+                f"{context} is missing contract field {key!r} (expected "
+                f"{contract[key]!r}); it predates this field being recorded, "
+                f"so its value cannot be verified -- start a fresh run."
             )
-        N, _, T = self.data.shape
-        size_mb = self.data.nbytes / 1024 ** 2
-        print(f"PackedDataset: {N} pairs, T={T}, SR={self.sr}, {size_mb:.0f} MB")
-
-    def __len__(self):
-        return self.data.shape[0]
-
-    def __getitem__(self, idx):
-        pair = self.data[idx]   # (2, T)
-        # Keep packed float16 samples compact while mmap/DataLoader prefetches.
-        # The complete batch is converted to float32 after transfer to device.
-        return pair[0], pair[1]   # noisy, clean
-
-
-class BlockShuffleSampler(Sampler):
-    """Shuffle mmap data in local blocks instead of causing random page faults."""
-
-    def __init__(self, data_source, block_size=256, num_samples=None):
-        self.data_source = data_source
-        self.block_size = int(block_size)
-        if self.block_size <= 0:
-            raise ValueError("mmap_block_size must be greater than zero")
-        size = len(data_source)
-        self.num_samples = size if num_samples is None else min(int(num_samples), size)
-
-    def __iter__(self):
-        size = len(self.data_source)
-        block_starts = list(range(0, size, self.block_size))
-        emitted = 0
-        for block_idx in torch.randperm(len(block_starts)).tolist():
-            start = block_starts[block_idx]
-            end = min(start + self.block_size, size)
-            for offset in torch.randperm(end - start).tolist():
-                if emitted >= self.num_samples:
-                    return
-                yield start + offset
-                emitted += 1
-
-    def __len__(self):
-        return self.num_samples
-
-
-def locality_preserving_random_split(dataset, n_train, n_val):
-    """Randomly assign samples, then sort each subset for mmap-local indexing."""
-    indices = torch.randperm(len(dataset)).tolist()
-    val_indices = sorted(indices[:n_val])
-    train_indices = sorted(indices[n_val:n_val + n_train])
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
-
-
-def dataloader_worker_kwargs(num_workers, pin_memory, prefetch_factor):
-    kwargs = {'num_workers': num_workers, 'pin_memory': pin_memory}
-    if num_workers > 0:
-        kwargs.update(
-            prefetch_factor=prefetch_factor,
-            persistent_workers=True,
-        )
-    return kwargs
+        if ckpt[key] != contract[key]:
+            raise ValueError(
+                f"{context} {key}={ckpt[key]!r}, but config requires "
+                f"{contract[key]!r}."
+            )
 
 
 # ============================================================
@@ -129,10 +135,30 @@ def si_snr(pred, target, eps=1e-8):
 
 class HybridLoss(nn.Module):
     """
-    Paper-faithful GTCRN loss:
+    Paper-faithful GTCRN loss (paper Eq. 1 with alpha=0.01, beta=0.3, scaled
+    x100 exactly as gtcrn_github/loss.py does):
         30 * (mag_norm_re_mse + mag_norm_im_mse) + 70 * mag^0.3_mse + SI-SNR
+
+    Both waveforms are obtained by ISTFT of the two spectra, matching upstream
+    gtcrn_github/loss.py:24-25.  This repo previously compared an ISTFT'd
+    prediction against the RAW clean waveform; because sqrt-Hann WOLA does not
+    reconstruct the first/last half-frame exactly, that put a floor on the
+    SI-SNR term that the model could never reach.
     """
-    def forward(self, pred_spec, true_spec, pred_wav, true_wav):
+
+    def __init__(self, n_fft=512, hop_len=256, win_len=512):
+        super().__init__()
+        self.n_fft, self.hop_len, self.win_len = n_fft, hop_len, win_len
+        self.register_buffer('window', torch.hann_window(win_len).pow(0.5))
+
+    def _istft(self, spec):
+        # spec: (B, F, T, 2) real-valued -> (B, T_samples)
+        return torch.istft(
+            torch.view_as_complex(spec.contiguous()),
+            self.n_fft, self.hop_len, self.win_len, window=self.window,
+        )
+
+    def forward(self, pred_spec, true_spec):
         # pred_spec, true_spec: (B, F, T, 2)
         pred_mag = torch.sqrt(pred_spec[..., 0] ** 2 + pred_spec[..., 1] ** 2 + 1e-12)
         true_mag = torch.sqrt(true_spec[..., 0] ** 2 + true_spec[..., 1] ** 2 + 1e-12)
@@ -148,23 +174,9 @@ class HybridLoss(nn.Module):
             + F.mse_loss(pred_imag_n, true_imag_n)
         )
         mag_loss = F.mse_loss(pred_mag ** 0.3, true_mag ** 0.3)
-        sisnr_loss = -si_snr(pred_wav, true_wav).mean()
+        sisnr_loss = -si_snr(self._istft(pred_spec), self._istft(true_spec)).mean()
 
         return 30 * spec_loss + 70 * mag_loss + sisnr_loss
-
-
-# ============================================================
-# Scheduler
-# ============================================================
-
-def make_scheduler(optimizer, warmup_epochs, total_epochs, base_lr, min_lr):
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return (epoch + 1) / max(1, warmup_epochs)
-        progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-        cosine = 0.5 * (1 + math.cos(math.pi * progress))
-        return min_lr / base_lr + (1 - min_lr / base_lr) * cosine
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
 # ============================================================
@@ -174,6 +186,11 @@ def make_scheduler(optimizer, warmup_epochs, total_epochs, base_lr, min_lr):
 def train(args):
     cfg = configparser.ConfigParser()
     cfg.read(args.config)
+
+    # Seed before anything that draws randomness.  Without this the train/val
+    # split was redrawn every run, so two runs of the same config were not
+    # comparable and --resume leaked training data into validation.
+    set_seed(args.seed)
 
     SR      = cfg.getint('signal', 'sr')
     N_FFT   = cfg.getint('signal', 'n_fft')
@@ -187,8 +204,7 @@ def train(args):
     batch_size   = cfg.getint('training', 'batch_size')
     lr           = cfg.getfloat('training', 'lr')
     min_lr       = cfg.getfloat('training', 'min_lr', fallback=1e-6)
-    warmup_ep    = cfg.getint('training', 'warmup_epochs', fallback=3)
-    weight_decay = cfg.getfloat('training', 'weight_decay', fallback=0.05)
+    lr_patience  = cfg.getint('training', 'lr_patience', fallback=5)
     patience     = cfg.getint('training', 'early_stop_patience', fallback=20)
     epoch_size   = cfg.getint('training', 'epoch_size', fallback=0)
     mmap_block_size = cfg.getint('training', 'mmap_block_size', fallback=256)
@@ -211,23 +227,33 @@ def train(args):
     if not packed_dir:
         raise ValueError("--packed-dir or [paths] packed_dir required")
 
-    # Accept either a directory (scans for *.pt) or a direct .pt path
-    if os.path.isdir(packed_dir):
-        pt_files = sorted(glob.glob(os.path.join(packed_dir, '*.pt')))
-        if not pt_files:
-            raise FileNotFoundError(f"No .pt files found in {packed_dir}")
-        if len(pt_files) > 1:
-            from torch.utils.data import ConcatDataset
-            dataset = ConcatDataset([
-                PackedDataset(p, mmap=args.mmap, expected_sr=SR) for p in pt_files
-            ])
-        else:
-            dataset = PackedDataset(pt_files[0], mmap=args.mmap, expected_sr=SR)
+    # Accepts either a directory (scans for *.pt) or a direct .pt path.
+    dataset = load_packed_dataset(packed_dir, expected_sr=SR, mmap=args.mmap)
+    n_train, n_val = split_sizes(dataset)
+
+    # The contract must be built before the resume checkpoint is read, and the
+    # split must come from the checkpoint when resuming — redrawing it would
+    # put previously-trained samples into validation.
+    contract = build_contract(cfg, WIN_LEN, HOP_LEN)
+    resume_ckpt = None
+    if args.resume:
+        print(f"Resuming: {args.resume}")
+        resume_ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        require_checkpoint_contract(resume_ckpt, contract, context=args.resume)
+
+    if resume_ckpt is not None and 'train_indices' in resume_ckpt:
+        train_set, val_set = subsets_from_indices(
+            dataset, resume_ckpt['train_indices'], resume_ckpt['val_indices']
+        )
+        print(f"  restored split from checkpoint: "
+              f"{len(train_set)} train / {len(val_set)} val")
     else:
-        dataset = PackedDataset(packed_dir, mmap=args.mmap, expected_sr=SR)
-    n_val = max(2, int(len(dataset) * 0.05))
-    n_train = len(dataset) - n_val
-    train_set, val_set = locality_preserving_random_split(dataset, n_train, n_val)
+        train_set, val_set = locality_preserving_random_split(
+            dataset, n_train, n_val, args.seed
+        )
+        if resume_ckpt is not None:
+            print("  ⚠ checkpoint has no stored split; redrawing from --seed "
+                  f"{args.seed} (validation may be contaminated)")
 
     pin_memory = device.type == 'cuda'
     train_workers = mmap_workers if args.mmap else 4
@@ -271,29 +297,37 @@ def train(args):
         print(f"  mmap: block={mmap_block_size}, workers={train_workers}, "
               f"prefetch={prefetch_factor}, packed_dtype_preserved=True")
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
-                                  betas=(0.9, 0.999), weight_decay=weight_decay)
-    scheduler = make_scheduler(optimizer, warmup_ep, epochs, lr, min_lr)
-    criterion = HybridLoss()
+    # GTCRN paper §3.2: "The models are trained by Adam Optimizer with an
+    # initial learning rate of 0.001.  The learning rate will be halved if the
+    # validation loss does not decrease for 5 consecutive epochs."
+    # This repo previously used AdamW(wd=0.05) + cosine-with-warmup, which is
+    # neither the paper's optimizer nor its schedule.
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999))
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=lr_patience, min_lr=min_lr,
+    )
+    criterion = HybridLoss(n_fft=N_FFT, hop_len=HOP_LEN, win_len=WIN_LEN).to(device)
 
-    stft_window = torch.hann_window(WIN_LEN).pow(0.5).to(device)
+    stft_window = criterion.window   # same sqrt-Hann, already on device
 
     os.makedirs(output_dir, exist_ok=True)
     best_val_loss = float('inf')
     start_epoch = 1
     no_improve = 0
 
-    if args.resume:
-        print(f"Resuming: {args.resume}")
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
-        model.load_state_dict(ckpt['state_dict'])
-        if 'optimizer' in ckpt:
-            optimizer.load_state_dict(ckpt['optimizer'])
-        if 'scheduler' in ckpt:
-            scheduler.load_state_dict(ckpt['scheduler'])
-        start_epoch = ckpt.get('epoch', 0) + 1
-        best_val_loss = ckpt.get('best_val_loss', float('inf'))
-        print(f"  Resumed epoch {start_epoch - 1}, best_val_loss={best_val_loss:.5f}")
+    if resume_ckpt is not None:
+        model.load_state_dict(extract_state_dict(resume_ckpt, args.resume))
+        if 'optimizer' in resume_ckpt:
+            optimizer.load_state_dict(resume_ckpt['optimizer'])
+        if 'scheduler' in resume_ckpt:
+            scheduler.load_state_dict(resume_ckpt['scheduler'])
+        start_epoch = resume_ckpt.get('epoch', 0) + 1
+        best_val_loss = resume_ckpt.get('best_val_loss', float('inf'))
+        # Without this, early stopping restarts its patience window on every
+        # resume and can never fire.
+        no_improve = resume_ckpt.get('no_improve', 0)
+        print(f"  Resumed epoch {start_epoch - 1}, best_val_loss={best_val_loss:.5f}, "
+              f"no_improve={no_improve}")
 
     for epoch in range(start_epoch, epochs + 1):
         # --- Train ---
@@ -305,7 +339,6 @@ def train(args):
                                  non_blocking=pin_memory)   # (B, T)
                 clean = clean.to(device=device, dtype=torch.float32,
                                  non_blocking=pin_memory)
-                T = noisy.shape[-1]
 
                 noisy_spec = torch.view_as_real(torch.stft(
                     noisy, N_FFT, HOP_LEN, WIN_LEN,
@@ -318,17 +351,8 @@ def train(args):
 
                 enhanced_spec = model(noisy_spec)   # (B, F, T_f, 2)
 
-                # ISTFT for SI-SNR: permute → view_as_complex → permute → istft
-                enh_c = torch.view_as_complex(
-                    enhanced_spec.permute(0, 2, 1, 3).contiguous()
-                )                                   # (B, T_f, F)
-                enh_c = enh_c.permute(0, 2, 1)     # (B, F, T_f)
-                enhanced_wav = torch.istft(
-                    enh_c, N_FFT, HOP_LEN, WIN_LEN,
-                    window=stft_window, length=T,
-                )
-
-                loss = criterion(enhanced_spec, clean_spec, enhanced_wav, clean)
+                # The loss ISTFTs both spectra itself (upstream loss.py:24-25).
+                loss = criterion(enhanced_spec, clean_spec)
 
                 optimizer.zero_grad()
                 loss.backward()
@@ -339,7 +363,8 @@ def train(args):
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
 
         train_loss /= len(train_loader)
-        scheduler.step()
+        # ReduceLROnPlateau steps on the VALIDATION loss, so it is advanced
+        # after the validation pass below, not here.
 
         # --- Validate ---
         model.eval()
@@ -350,7 +375,6 @@ def train(args):
                                  non_blocking=pin_memory)
                 clean = clean.to(device=device, dtype=torch.float32,
                                  non_blocking=pin_memory)
-                T = noisy.shape[-1]
 
                 noisy_spec = torch.view_as_real(torch.stft(
                     noisy, N_FFT, HOP_LEN, WIN_LEN,
@@ -362,43 +386,44 @@ def train(args):
                 ))
                 enhanced_spec = model(noisy_spec)
 
-                enh_c = torch.view_as_complex(
-                    enhanced_spec.permute(0, 2, 1, 3).contiguous()
-                ).permute(0, 2, 1)
-                enhanced_wav = torch.istft(
-                    enh_c, N_FFT, HOP_LEN, WIN_LEN,
-                    window=stft_window, length=T,
-                )
-
-                val_loss += criterion(enhanced_spec, clean_spec, enhanced_wav, clean).item()
+                val_loss += criterion(enhanced_spec, clean_spec).item()
 
         val_loss /= len(val_loader)
         lr_now = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch}: train={train_loss:.4f}  val={val_loss:.4f}  lr={lr_now:.2e}")
+        scheduler.step(val_loss)
 
-        # Save checkpoint
+        # Update the early-stopping counter BEFORE writing the checkpoint, so
+        # the saved no_improve matches the state a resume needs to restore.
         is_best = val_loss < best_val_loss
-        checkpoint_best = min(best_val_loss, val_loss)
+        if is_best:
+            best_val_loss = val_loss
+            no_improve = 0
+        else:
+            no_improve += 1
+
         ckpt = {
             'epoch': epoch,
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
             'scheduler': scheduler.state_dict(),
-            'best_val_loss': checkpoint_best,
+            'best_val_loss': best_val_loss,
+            'no_improve': no_improve,
             'config': dict(cfg['signal']),
+            # Exact split, so a resume cannot leak trained samples into val.
+            'train_indices': train_set.indices,
+            'val_indices': val_set.indices,
+            'seed': args.seed,
+            **contract,
         }
         torch.save(ckpt, os.path.join(output_dir, 'gtcrn_last.pth'))
 
         if is_best:
-            best_val_loss = val_loss
-            no_improve = 0
             torch.save(ckpt, os.path.join(output_dir, 'gtcrn_best.pth'))
             print(f"  ✓ New best: {best_val_loss:.5f}")
-        else:
-            no_improve += 1
-            if patience > 0 and no_improve >= patience:
-                print(f"Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
-                break
+        elif patience > 0 and no_improve >= patience:
+            print(f"Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
+            break
 
     print(f"Training done. Best val loss: {best_val_loss:.5f}")
 
@@ -411,6 +436,9 @@ if __name__ == '__main__':
     parser.add_argument('--mmap', action='store_true',
                         help='Memory-map .pt tensors (low RAM, disk-backed; needs PyTorch>=2.0)')
     parser.add_argument('--resume', default=None)
+    parser.add_argument('--seed', type=int, default=42,
+                        help='RNG seed; also fixes the train/val split. '
+                             'Must match RNNoise-ERB for a comparable run.')
     parser.add_argument('--gpu', type=int, default=None)
     parser.add_argument('--device', default=None)
     args = parser.parse_args()

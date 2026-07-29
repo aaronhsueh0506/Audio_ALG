@@ -230,7 +230,8 @@ int rnnoise_compute_features(RNNoiseState *st,
 
 /* --- 後處理: attenuation limit --- */
 
-void rnnoise_apply_atten_lim(float *band_gains, float atten_lim_db) {
+void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],
+                             float atten_lim_db) {
     if (atten_lim_db <= 0.0f) return;
     float lim = powf(10.0f, -atten_lim_db / 20.0f);
     for (int b = 0; b < RNNOISE_N_BANDS; b++) {

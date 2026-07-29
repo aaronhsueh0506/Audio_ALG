@@ -33,6 +33,7 @@ from train import (
     erb_bandborder, compute_erb_matrix, RNNoiseModel,
     extract_model_features, read_feature_config,
     require_checkpoint_feature_config, stft, istft,
+    model_capacity_from_checkpoint,
 )
 
 
@@ -99,22 +100,14 @@ def load_model(args):
     device = torch.device('cpu')
     ckpt = torch.load(args.model, map_location=device, weights_only=False)
     require_checkpoint_feature_config(ckpt, feature_cfg, context=args.model)
-    # state_dict 是架構容量的權威來源；feature/signal contract
+    # 架構容量的權威來源是 checkpoint；feature/signal contract
     # 則已在上方與 runtime config 逐項比對。
     sd = ckpt['state_dict']
-    trained_n_bands = sd['erb_conv.weight'].shape[1]
-    if trained_n_bands != N_BANDS:
+    capacity = model_capacity_from_checkpoint(ckpt)
+    if capacity['n_bands'] != N_BANDS:
         raise ValueError(
-            f"{args.model} n_bands={trained_n_bands}, runtime config={N_BANDS}")
-    cond_size = sd['erb_conv.weight'].shape[0]
-    gru_size = sd['gru1.weight_ih_l0'].shape[0] // 3
-    spec_conv_channels = sd['spec_conv1.weight'].shape[0]
-    spec_embed_size = sd['spec_proj.weight'].shape[0]
-    model = RNNoiseModel(
-        n_bands=N_BANDS, spec_bins=feature_cfg['spec_bins'],
-        cond_size=cond_size, gru_size=gru_size,
-        spec_conv_channels=spec_conv_channels,
-        spec_embed_size=spec_embed_size)
+            f"{args.model} n_bands={capacity['n_bands']}, runtime config={N_BANDS}")
+    model = RNNoiseModel(spec_bins=feature_cfg['spec_bins'], **capacity)
     model.load_state_dict(sd)
     model.eval()
 
@@ -122,7 +115,9 @@ def load_model(args):
     if 'nfftborder' in ckpt:
         nfftborder = np.array(ckpt['nfftborder'])
     else:
-        nfftborder = erb_bandborder(N_BANDS, SR, N_FFT)
+        nfftborder = erb_bandborder(
+            N_BANDS, SR, N_FFT,
+            cfg.getint('signal', 'min_bins_per_band', fallback=2))
     if (nfftborder.shape != (N_BANDS,) or nfftborder[0] != 0 or
             nfftborder[-1] != N_FFT // 2 + 1):
         raise ValueError(f"{args.model} contains an invalid ERB band-border table")

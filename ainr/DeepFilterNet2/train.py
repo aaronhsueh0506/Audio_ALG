@@ -12,19 +12,32 @@ Dataset format: dataset_gen/pack_dataset.py output containing
 
 import argparse
 import configparser
-import glob
+import inspect
 import math
 import os
-import random
+import sys
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset, RandomSampler, Sampler, Subset
+from torch.utils.data import DataLoader, RandomSampler
 import tqdm
 
 from model import DeepFilterNet2
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# PackedDataset, the sampler, the seeder and the train/val split are shared by
+# all three models -- see dataset_gen/loader.py for why the split in particular
+# must not be re-implemented per trainer.
+from dataset_gen import (  # noqa: E402
+    BlockShuffleSampler,
+    PackedDataset,
+    dataloader_worker_kwargs,
+    load_packed_dataset,
+    locality_preserving_random_split,
+    set_seed,
+    split_sizes,
+)
 
 
 # v3: _build_erb_fb() (model.py) rewritten to the exact triangular
@@ -35,7 +48,21 @@ from model import DeepFilterNet2
 # non-doubled forward matrix. erb_fb/erb_inv are registered buffers (part of
 # state_dict), so old checkpoints carry stale values that load_state_dict
 # would silently restore; bump forces a fresh training run instead.
-MODEL_VERSION = 'dfn2_mask_lookahead_explicit_df_fir_v3'
+#
+# v4: the architecture was realigned to released DeepFilterNet3 (minus lsnr) --
+# PReLU->ReLU, dense->GroupedLinearEinsum, GRU layers moved from the encoder to
+# the ERB decoder, and the mask/DF cascade replaced by DFN3's parallel band
+# split.  That last change costs ZERO parameters, so neither load_state_dict
+# nor a parameter count can reject a v3 checkpoint; only this string can.
+#
+# v5 completes the realignment with two more parameter-count-invisible fixes:
+# the encoder now flattens frequency-major (B,T,F,C) like upstream instead of
+# channel-major, which changes which elements GroupedLinearEinsum groups
+# together; and the ERB decoder takes encoder skips through 1x1 pathway convs
+# and ADDS them, instead of concatenating.  The concat form and the pathway
+# form both total 14,210 conv parameters here -- identical numbers, different
+# functions, which is precisely why the version string has to carry it.
+MODEL_VERSION = 'dfn3_fmajor_flatten_pathway_add_no_lsnr_v5'
 FEATURE_VERSION = 'dfn2_dual_ema_state_v2'
 LOSS_VERSION = 'dfn_mrsl_mag_complex_gamma_v2'
 
@@ -144,103 +171,6 @@ def read_loss_config(cfg):
     return loss_cfg
 
 
-# ============================================================
-# Dataset
-# ============================================================
-
-class PackedDataset(Dataset):
-    """
-    Loads a packed .pt file produced by pack_dataset.py.
-    Format: {'data': Tensor(N, 2, T)}  ch0=noisy, ch1=clean.
-
-    Pass mmap=True on shared servers to keep data on disk (OS page cache)
-    instead of loading the full tensor into RAM.
-    """
-    def __init__(self, pt_path: str, mmap: bool = False, expected_sr: int = None):
-        if not os.path.isfile(pt_path):
-            raise FileNotFoundError(f"Packed dataset not found: {pt_path}")
-        print(f"PackedDataset: loading {pt_path} (mmap={mmap}) ...")
-        obj = torch.load(pt_path, map_location='cpu', mmap=mmap, weights_only=True)
-        if 'sr' not in obj:
-            raise ValueError(f"Packed dataset has no sample-rate metadata: {pt_path}")
-        self.sr = int(obj['sr'])
-        if expected_sr is not None and self.sr != expected_sr:
-            raise ValueError(
-                f"Packed dataset SR={self.sr}, but config requires SR={expected_sr}: {pt_path}"
-            )
-        self.data = obj['data']   # (N, 2, T)
-        if self.data.ndim != 3 or self.data.shape[1] != 2:
-            raise ValueError(
-                f"Packed dataset must have shape (N, 2, T), got {tuple(self.data.shape)}"
-            )
-        N, _, T = self.data.shape
-        size_mb = self.data.nbytes / 1024 ** 2
-        print(f"PackedDataset: {N} pairs, T={T}, SR={self.sr}, {size_mb:.0f} MB")
-
-    def __len__(self):
-        return self.data.shape[0]
-
-    def __getitem__(self, idx):
-        pair = self.data[idx]   # (2, T)
-        # Preserve packed dtype (normally float16) until the complete batch is
-        # copied to the accelerator.  Per-sample float32 conversion defeats
-        # mmap's low-RAM benefit and doubles DataLoader prefetch memory.
-        return pair[0], pair[1]   # noisy, clean
-
-
-class BlockShuffleSampler(Sampler):
-    """Shuffle mmap data in local blocks instead of causing random page faults."""
-
-    def __init__(self, data_source, block_size=256, num_samples=None):
-        self.data_source = data_source
-        self.block_size = int(block_size)
-        if self.block_size <= 0:
-            raise ValueError("mmap_block_size must be greater than zero")
-        size = len(data_source)
-        self.num_samples = size if num_samples is None else min(int(num_samples), size)
-
-    def __iter__(self):
-        size = len(self.data_source)
-        block_starts = list(range(0, size, self.block_size))
-        emitted = 0
-        for block_idx in torch.randperm(len(block_starts)).tolist():
-            start = block_starts[block_idx]
-            end = min(start + self.block_size, size)
-            for offset in torch.randperm(end - start).tolist():
-                if emitted >= self.num_samples:
-                    return
-                yield start + offset
-                emitted += 1
-
-    def __len__(self):
-        return self.num_samples
-
-
-def locality_preserving_random_split(dataset, n_train, n_val):
-    """Randomly assign samples, then sort each subset for mmap-local indexing."""
-    indices = torch.randperm(len(dataset)).tolist()
-    val_indices = sorted(indices[:n_val])
-    train_indices = sorted(indices[n_val:n_val + n_train])
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
-
-
-def dataloader_worker_kwargs(num_workers, pin_memory, prefetch_factor):
-    kwargs = {'num_workers': num_workers, 'pin_memory': pin_memory}
-    if num_workers > 0:
-        kwargs.update(
-            prefetch_factor=prefetch_factor,
-            persistent_workers=True,
-        )
-    return kwargs
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
 
 def make_norm_alpha(sr, hop_len, tau):
     """Match DeepFilterNet's stable rounded EMA coefficient."""
@@ -251,6 +181,51 @@ def make_norm_alpha(sr, hop_len, tau):
         alpha = round(exact, precision)
         precision += 1
     return alpha
+
+
+# ``[model] enc_channels`` predates the constructor's ``enc_ch``; every other
+# key already matches its keyword argument by name.
+_MODEL_KWARG_ALIASES = {'enc_channels': 'enc_ch'}
+
+
+def read_model_config(cfg):
+    """Every DeepFilterNet2 constructor argument, defaults overlaid with [model].
+
+    Defaults come from ``DeepFilterNet2.__init__``'s own signature rather than
+    from a ``fallback=`` on each read.  They used to be restated in train.py
+    *and* denoise.py, so a knob whose fallback was updated in one place built a
+    differently-shaped model in the other -- which surfaces only as a
+    load_state_dict failure at inference time, long after the training run.
+
+    Unknown ``[model]`` keys raise rather than being silently ignored, and the
+    parsed type follows the signature default, so a new constructor argument
+    becomes configurable without touching this function.
+    """
+    kwargs = {
+        name: param.default
+        for name, param in inspect.signature(DeepFilterNet2.__init__).parameters.items()
+        if param.default is not inspect.Parameter.empty
+    }
+    kwargs['sr'] = cfg.getint('signal', 'sr')
+    kwargs['n_fft'] = cfg.getint('signal', 'n_fft')
+    for name in cfg.options('model'):
+        kwarg = _MODEL_KWARG_ALIASES.get(name, name)
+        if kwarg not in kwargs:
+            raise ValueError(
+                f"[model] {name!r} is not a DeepFilterNet2 constructor argument "
+                f"(known: {', '.join(sorted(kwargs))})")
+        default = kwargs[kwarg]
+        if isinstance(default, bool):          # before int -- bool subclasses int
+            kwargs[kwarg] = cfg.getboolean('model', name)
+        elif isinstance(default, int):
+            kwargs[kwarg] = cfg.getint('model', name)
+        elif isinstance(default, float):
+            kwargs[kwarg] = cfg.getfloat('model', name)
+        elif isinstance(default, tuple):
+            kwargs[kwarg] = tuple(int(v) for v in cfg.get('model', name).split(','))
+        else:
+            kwargs[kwarg] = cfg.get('model', name)
+    return kwargs
 
 
 def read_feature_config(cfg, sr, hop_len):
@@ -572,14 +547,12 @@ def train(args):
     WIN_LEN = cfg.getint('signal', 'win_len', fallback=N_FFT)
     HOP_LEN = cfg.getint('signal', 'hop_len', fallback=WIN_LEN // 2)
 
-    N_ERB      = cfg.getint('model', 'n_erb',       fallback=32)
-    DF_BINS    = cfg.getint('model', 'df_bins',     fallback=64)
-    DF_ORDER   = cfg.getint('model', 'df_order',    fallback=5)
-    MASK_LOOKAHEAD = cfg.getint('model', 'mask_lookahead', fallback=1)
-    DF_LOOKAHEAD = cfg.getint('model', 'df_lookahead', fallback=0)
-    EMB_SIZE   = cfg.getint('model', 'emb_size',    fallback=256)
-    ENC_CH     = cfg.getint('model', 'enc_channels', fallback=16)
-    GRU_GROUPS = cfg.getint('model', 'gru_groups',  fallback=1)
+    model_cfg = read_model_config(cfg)
+    N_ERB          = model_cfg['n_erb']
+    DF_BINS        = model_cfg['df_bins']
+    DF_ORDER       = model_cfg['df_order']
+    MASK_LOOKAHEAD = model_cfg['mask_lookahead']
+    DF_LOOKAHEAD   = model_cfg['df_lookahead']
 
     epochs       = cfg.getint('training', 'epochs')
     batch_size   = cfg.getint('training', 'batch_size')
@@ -646,23 +619,11 @@ def train(args):
     if not packed_dir:
         raise ValueError("--packed-dir or [paths] packed_dir required")
 
-    # Accept either a directory (scans for *.pt) or a direct .pt path
-    if os.path.isdir(packed_dir):
-        pt_files = sorted(glob.glob(os.path.join(packed_dir, '*.pt')))
-        if not pt_files:
-            raise FileNotFoundError(f"No .pt files found in {packed_dir}")
-        if len(pt_files) > 1:
-            from torch.utils.data import ConcatDataset
-            dataset = ConcatDataset([
-                PackedDataset(p, mmap=args.mmap, expected_sr=SR) for p in pt_files
-            ])
-        else:
-            dataset = PackedDataset(pt_files[0], mmap=args.mmap, expected_sr=SR)
-    else:
-        dataset = PackedDataset(packed_dir, mmap=args.mmap, expected_sr=SR)
-    n_val = max(2, int(len(dataset) * 0.05))
-    n_train = len(dataset) - n_val
-    train_set, val_set = locality_preserving_random_split(dataset, n_train, n_val)
+    # Accepts either a directory (scans for *.pt) or a direct .pt path.
+    dataset = load_packed_dataset(packed_dir, expected_sr=SR, mmap=args.mmap)
+    n_train, n_val = split_sizes(dataset)
+    train_set, val_set = locality_preserving_random_split(
+        dataset, n_train, n_val, args.seed)
 
     pin_memory = device.type == 'cuda'
     train_workers = mmap_workers if args.mmap else 4
@@ -696,11 +657,7 @@ def train(args):
         **dataloader_worker_kwargs(val_workers, pin_memory, prefetch_factor),
     )
 
-    model = DeepFilterNet2(
-        n_fft=N_FFT, sr=SR, n_erb=N_ERB, df_bins=DF_BINS, df_order=DF_ORDER,
-        enc_ch=ENC_CH, emb_size=EMB_SIZE, gru_groups=GRU_GROUPS,
-        mask_lookahead=MASK_LOOKAHEAD, df_lookahead=DF_LOOKAHEAD,
-    ).to(device)
+    model = DeepFilterNet2(**model_cfg).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr,
                                   betas=(0.9, 0.999), weight_decay=weight_decay)

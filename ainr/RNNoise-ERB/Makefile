@@ -218,7 +218,7 @@ test: test-tables test-feature-contract test-features
 
 test-feature-contract:
 	@echo "== rnnoise config/Python/C feature contract =="
-	python3 $(PY_TEST_DIR)/test_feature_contract.py
+	$(PYTHON) $(PY_TEST_DIR)/test_feature_contract.py
 
 test-features: $(BUILD_DIR)/test_rnnoise_features
 	@echo "== rnnoise feature-state contract =="
@@ -226,13 +226,27 @@ test-features: $(BUILD_DIR)/test_rnnoise_features
 
 # Requires the training Python environment (torch + numpy).  Kept separate from
 # `make test` so the dependency-free embedded C checks remain runnable on hosts
-# that intentionally do not install PyTorch.
+# that intentionally do not install PyTorch.  `test-calibration` belongs here
+# for the same reason -- it was briefly wired into `test`, which silently gave
+# the default target a torch dependency it is specifically designed not to have.
+#
+# PYTHON is overridable because a bare `python3` resolves to whatever is on
+# PATH (often /usr/bin/python3, which has no torch) rather than the project's
+# virtualenv:  make test-python PYTHON=../../.venv/bin/python3
+PYTHON ?= python3
+
+test-python: test-feature-python test-loss-python test-calibration
+
 test-feature-python:
-	python3 $(PY_TEST_DIR)/test_feature_norm.py
-	python3 $(PY_TEST_DIR)/test_python_c_features.py
+	$(PYTHON) $(PY_TEST_DIR)/test_feature_norm.py
+	$(PYTHON) $(PY_TEST_DIR)/test_python_c_features.py
 
 test-loss-python:
-	python3 $(PY_TEST_DIR)/test_loss.py
+	$(PYTHON) $(PY_TEST_DIR)/test_loss.py
+
+test-calibration:
+	@echo "== normaliser-init calibration method =="
+	$(PYTHON) $(PY_TEST_DIR)/test_norm_init_calibration.py
 
 $(BUILD_DIR)/test_rnnoise_tables: test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ test_rnnoise_tables.c -lm

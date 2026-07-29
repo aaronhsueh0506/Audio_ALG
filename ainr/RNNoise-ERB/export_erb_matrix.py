@@ -49,7 +49,8 @@ def resolve_nfftborder(cfg, model_path):
         else:
             print("  ⚠ ckpt 無 nfftborder → 改用 config 重算")
 
-    nfftborder = erb_bandborder(N_BANDS, SR, N_FFT)
+    MIN_BINS = cfg.getint('signal', 'min_bins_per_band', fallback=2)
+    nfftborder = erb_bandborder(N_BANDS, SR, N_FFT, MIN_BINS)
     print(f"nfftborder: erb_bandborder({N_BANDS}, {SR}, {N_FFT}) (len={len(nfftborder)})")
     return nfftborder, SR, N_FFT
 

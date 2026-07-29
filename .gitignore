@@ -62,3 +62,12 @@ lib/hpf/obj/
 # dir) is already covered by the generic `dist/` entry above.
 pipelines/obj/
 pipelines/bin/
+
+# pytest's own cache (it writes a .gitignore inside, but be explicit)
+.pytest_cache/
+
+# Upstream GTCRN reference clone: 18 MB, carries its own .git, and holds the
+# published .tar checkpoints.  Kept locally for source comparison only.
+# Vendoring it properly (submodule, or a copy with .git removed) is a separate
+# decision -- see GTCRN/GTCRN_Analysis.md for what was read out of it.
+ainr/gtcrn_github/

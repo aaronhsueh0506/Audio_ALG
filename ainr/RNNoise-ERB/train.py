@@ -13,22 +13,33 @@ RNNoise v0.2-inspired 噪音抑制模型 — 訓練腳本
 import argparse
 import configparser
 import glob
+import math
 import os
-import random
 import sys
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, RandomSampler, Sampler, Subset
+from torch.utils.data import ConcatDataset, DataLoader, RandomSampler
 import tqdm
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AINR_ROOT = os.path.dirname(_THIS_DIR)
 sys.path.insert(0, _AINR_ROOT)
 
-from dataset_gen import PackedDataset  # noqa: E402
+# The sampler, seeder and train/val split live in dataset_gen because GTCRN
+# trains on the same packed corpus and the two are compared directly -- which
+# samples each model gets is part of that protocol.  The copies that used to
+# live here had already drifted to a 10% held-out fraction against GTCRN's 5%.
+from dataset_gen import (  # noqa: E402
+    BlockShuffleSampler,
+    PackedDataset,
+    dataloader_worker_kwargs,
+    locality_preserving_random_split,
+    set_seed,
+    split_sizes,
+)
 
 
 # Feature semantics are intentionally versioned.  v3 keeps the two input shapes
@@ -50,54 +61,18 @@ from dataset_gen import PackedDataset  # noqa: E402
 # compute_erb_bands(). This changes the ERB filterbank matrices
 # (erb_fwd/erb_inv / nfftborder), hence the resulting features, even though
 # input/output dimensions are unchanged.
-FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v5'
-LOSS_VERSION = 'df3_multi_res_spec_only_gamma_0.3_v1'
+FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v7'
+LOSS_VERSION = 'erb_irm_only_v4'
+# v2 (2026-07-29), three changes that together invalidate v1 checkpoints:
+#   * fft_sizes 256,512,1024,2048 -> 128,256,512,1024, i.e. {n_fft/4, n_fft/2,
+#     n_fft, n_fft*2} for THIS model's 512-point FFT.  The old integers were
+#     upstream's, chosen against its own 960-point FFT, and applying them here
+#     shifted every resolution one octave up (16/32/64/128 ms).
+#   * direct ERB IRM term restored alongside MRSL, with the undefined-band mask
+#     and (1 + 5*vad) activity weighting that xiph/rnnoise has and this port
+#     never had.
+#   * training STFT moved to center=False so framing matches deployment.
 
-
-class BlockShuffleSampler(Sampler):
-    """Shuffle mmap data in local blocks instead of causing random page faults."""
-
-    def __init__(self, data_source, block_size=256, num_samples=None):
-        self.data_source = data_source
-        self.block_size = int(block_size)
-        if self.block_size <= 0:
-            raise ValueError("mmap_block_size must be greater than zero")
-        size = len(data_source)
-        self.num_samples = size if num_samples is None else min(int(num_samples), size)
-
-    def __iter__(self):
-        size = len(self.data_source)
-        block_starts = list(range(0, size, self.block_size))
-        emitted = 0
-        for block_idx in torch.randperm(len(block_starts)).tolist():
-            start = block_starts[block_idx]
-            end = min(start + self.block_size, size)
-            for offset in torch.randperm(end - start).tolist():
-                if emitted >= self.num_samples:
-                    return
-                yield start + offset
-                emitted += 1
-
-    def __len__(self):
-        return self.num_samples
-
-
-def locality_preserving_random_split(dataset, n_train, n_val):
-    """Randomly assign samples, then sort each subset for mmap-local indexing."""
-    indices = torch.randperm(len(dataset)).tolist()
-    val_indices = sorted(indices[:n_val])
-    train_indices = sorted(indices[n_val:n_val + n_train])
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
-
-
-def dataloader_worker_kwargs(num_workers, pin_memory, prefetch_factor):
-    kwargs = {'num_workers': num_workers, 'pin_memory': pin_memory}
-    if num_workers > 0:
-        kwargs.update(
-            prefetch_factor=prefetch_factor,
-            persistent_workers=True,
-        )
-    return kwargs
 
 
 def require_checkpoint_feature_version(ckpt, context='checkpoint'):
@@ -122,6 +97,12 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
         'hop_len': feature_cfg['hop_len'],
         'lookahead_frames': feature_cfg['lookahead_frames'],
         'n_bands': feature_cfg['n_bands'],
+        # min_bins_per_band moves the ERB band borders, hence the whole
+        # filterbank and the generated C tables.  config.ini and process.h were
+        # guarded against each other but nothing tied a CHECKPOINT to the
+        # borders it was trained on, so old weights could be paired with new
+        # tables silently.
+        'min_bins_per_band': feature_cfg['min_bins_per_band'],
         'feature_erb_norm_tau_sec': feature_cfg['erb_tau_sec'],
         'feature_erb_norm_alpha': feature_cfg['erb_alpha'],
         'feature_erb_norm_init_lo_db': feature_cfg['erb_norm_init_lo_db'],
@@ -135,7 +116,6 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
         'feature_spec_norm_init_hi': feature_cfg['spec_norm_init_hi'],
         'feature_spec_norm_eps': feature_cfg['spec_norm_eps'],
     }
-    import math
     for key, want in expected.items():
         if key not in saved or not math.isclose(float(saved[key]), float(want),
                                                  rel_tol=1e-7, abs_tol=1e-7):
@@ -146,14 +126,46 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
             )
 
 
-def require_checkpoint_loss_config(ckpt, loss_cfg, context='checkpoint'):
+def model_capacity_from_checkpoint(ckpt):
+    """RNNoiseModel shape kwargs, taken from the checkpoint rather than config.
+
+    Capacity is a property of the weights.  A config.ini that disagrees would
+    build a model that either fails to load or -- worse -- loads and means
+    something else, so both denoise.py and export_onnx.py construct from here.
+    (Feature/signal constants are the opposite case: those must match the
+    runtime config exactly, which is require_checkpoint_feature_config's job.)
+
+    ``use_complex_input`` is read from the recorded config, falling back to
+    probing the weights for checkpoints written before the flag existed.  The
+    spec_* shapes are only read once that is known to be true -- they do not
+    exist in a pure-ERB checkpoint, and reading them unconditionally is a
+    KeyError, not a graceful degradation.
+    """
+    sd = ckpt['state_dict']
+    saved = ckpt.get('config', {})
+    use_complex_input = bool(saved.get(
+        'use_complex_input', any(k.startswith('spec_conv1.') for k in sd)))
+    kwargs = {
+        'n_bands': sd['erb_conv.weight'].shape[1],
+        'cond_size': sd['erb_conv.weight'].shape[0],
+        'gru_size': sd['gru1.weight_ih_l0'].shape[0] // 3,
+        'use_complex_input': use_complex_input,
+    }
+    if use_complex_input:
+        kwargs['spec_conv_channels'] = sd['spec_conv1.weight'].shape[0]
+        kwargs['spec_embed_size'] = sd['spec_proj.weight'].shape[0]
+    return kwargs
+
+
+def require_checkpoint_loss_config(ckpt, loss_cfg, irm_cfg, context='checkpoint'):
     """Do not resume optimizer state trained with the previous IRM-mixed objective."""
     version = ckpt.get('loss_version', ckpt.get('config', {}).get('loss_version'))
     if version != LOSS_VERSION:
         shown = repr(version) if version is not None else 'missing (legacy loss contract)'
         raise ValueError(
             f"{context} loss_version={shown}, expected {LOSS_VERSION!r}. "
-            "The training objective changed from MRSL+ERB-IRM to DF3 MRSL-only; "
+            "The training objective is MRSL + direct ERB-IRM supervision, and "
+            "the MRSL resolutions moved to {n_fft/4..n_fft*2}; "
             "start a fresh training run instead of resuming this optimizer state."
         )
     saved = ckpt.get('config', {})
@@ -162,8 +174,13 @@ def require_checkpoint_loss_config(ckpt, loss_cfg, context='checkpoint'):
         'loss_gamma': loss_cfg['gamma'],
         'loss_factor': loss_cfg['factor'],
         'loss_factor_complex': loss_cfg['factor_complex'],
+        # The IRM term is the whole objective now, so its settings are at
+        # least as load-bearing as MRSL's.  They were absent entirely: a
+        # checkpoint trained at gamma=0.25 resumed happily at gamma=0.5.
+        'irm_factor': irm_cfg['factor'],
+        'irm_gamma': irm_cfg['gamma'],
+        'irm_energy_floor': irm_cfg['energy_floor'],
     }
-    import math
     for key, want in expected.items():
         got = saved.get(key)
         matches = (str(got) == want if isinstance(want, str) else
@@ -192,10 +209,33 @@ def read_loss_config(cfg):
     }
     if (not fft_sizes or any(n <= 0 or n % 2 for n in fft_sizes) or
             not 0 < loss_cfg['gamma'] <= 1 or loss_cfg['factor'] < 0 or
-            loss_cfg['factor_complex'] < 0 or
-            loss_cfg['factor'] + loss_cfg['factor_complex'] == 0):
+            loss_cfg['factor_complex'] < 0):
         raise ValueError('invalid DeepFilterNet MultiResSpecLoss configuration')
+    # factor == factor_complex == 0 is legal and means "MRSL off": the ERB-IRM
+    # term is then the whole objective.  It used to raise, which is why the
+    # imbalanced MRSL+IRM mix was the only reachable configuration.
+    # (The dict stays exactly MultiResSpecLoss's kwargs -- callers ask
+    # mrsl_is_enabled() rather than reading a non-kwarg flag out of it.)
     return loss_cfg
+
+
+def mrsl_is_enabled(loss_cfg):
+    """False when both MRSL factors are zero, i.e. IRM is the whole objective."""
+    return loss_cfg['factor'] + loss_cfg['factor_complex'] > 0
+
+
+def read_irm_loss_config(cfg):
+    """Read the direct ERB-gain (IRM) loss settings."""
+    section = 'erb_irm_loss'
+    irm_cfg = {
+        'factor': cfg.getfloat(section, 'factor', fallback=1.0),
+        'gamma': cfg.getfloat(section, 'gamma', fallback=0.25),
+        'energy_floor': cfg.getfloat(section, 'energy_floor', fallback=1e-9),
+    }
+    if (irm_cfg['factor'] < 0 or not 0 < irm_cfg['gamma'] <= 1 or
+            irm_cfg['energy_floor'] <= 0):
+        raise ValueError('invalid ERB IRM loss configuration')
+    return irm_cfg
 
 
 def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
@@ -227,8 +267,28 @@ def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
             spec_norm_eps <= 0):
         raise ValueError('invalid DeepFilterNet-style ERB/complex feature configuration')
     spec_bins = spec_max_hz * n_fft // sr + 1
-    erb_alpha = make_norm_alpha(sr, hop_len, erb_tau_sec)
-    spec_alpha = make_norm_alpha(sr, hop_len, spec_tau_sec)
+    # An explicit alpha, when given, wins over the tau-derived one.
+    #
+    # alpha is the per-FRAME decay, so pinning it keeps the normaliser's memory
+    # fixed at 1/(1-alpha) frames no matter what sr/hop become.  That is the
+    # invariant the GRU actually cares about: its learned time constants are in
+    # frames, so a fixed alpha keeps "normaliser adaptation speed vs state
+    # update rate" constant across grid changes and the learned dynamics stay
+    # valid.  Deriving alpha from tau instead pins the memory in SECONDS, which
+    # is the signal-processing invariant but lets the frame-domain relationship
+    # drift (63 frames at hop 256 vs 126 at hop 128).
+    #
+    # The cost of a longer alpha is a longer warm-up, and that only hurts while
+    # the init values are wrong; once they are calibrated to the steady state
+    # (calibrate_norm_init.py) there is no transient to sit through.
+    erb_alpha = cfg.getfloat('feature', 'erb_norm_alpha', fallback=0.0)
+    spec_alpha = cfg.getfloat('feature', 'spec_norm_alpha', fallback=0.0)
+    if not 0.0 <= erb_alpha < 1.0 or not 0.0 <= spec_alpha < 1.0:
+        raise ValueError('norm alpha must be in [0, 1); 0 means "derive from tau"')
+    if erb_alpha == 0.0:
+        erb_alpha = make_norm_alpha(sr, hop_len, erb_tau_sec)
+    if spec_alpha == 0.0:
+        spec_alpha = make_norm_alpha(sr, hop_len, spec_tau_sec)
     return dict(
         version=version,
         sr=sr,
@@ -237,6 +297,7 @@ def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
         hop_len=hop_len,
         lookahead_frames=cfg.getint('signal', 'lookahead_frames', fallback=0),
         n_bands=cfg.getint('signal', 'n_bands'),
+        min_bins_per_band=cfg.getint('signal', 'min_bins_per_band', fallback=2),
         erb_tau_sec=erb_tau_sec,
         erb_alpha=erb_alpha,
         erb_norm_init_lo_db=erb_norm_init_lo_db,
@@ -263,7 +324,7 @@ def erb_inv(e):
     """ERB-rate → 頻率 (Hz)"""
     return (10 ** (e / 21.4) - 1) / 0.00437
 
-def compute_erb_bands(n_fft, sr, n_bands, min_bins_per_band=2):
+def compute_erb_bands(n_fft, sr, n_bands, min_bins_per_band):
     """
     計算 ERB band 的 FFT bin 邊界，回傳 shape=(n_bands+1,) 的整數陣列。
 
@@ -288,41 +349,6 @@ def compute_erb_bands(n_fft, sr, n_bands, min_bins_per_band=2):
     return np.array(bin_edges, dtype=int)
 
 
-def compute_hybrid_bands(n_fft, sr, n_erb_high, cutoff_hz, min_bins_per_band=2):
-    """
-    Hybrid frequency bands (ref: GTCRN):
-      - 0 ~ cutoff_hz: 每個 FFT bin 一個 band (原始解析度, 刻意 1 bin/band)
-      - cutoff_hz ~ Nyquist: n_erb_high 個 ERB bands (套 min_bins_per_band)
-    回傳: bin_edges (n_bands+1,), n_bands
-    """
-    n_bins = n_fft // 2 + 1
-    bin_res = sr / n_fft
-    cutoff_bin = int(round(cutoff_hz / bin_res))
-    cutoff_bin = min(cutoff_bin, n_bins - 1)
-
-    # Part 1: individual bins [0, 1, 2, ..., cutoff_bin] (high resolution, 故意)
-    low_edges = list(range(cutoff_bin + 1))
-
-    # Part 2: ERB bands above cutoff (greedy forward with min_bins)
-    e_cut = erb_rate(cutoff_hz)
-    e_high = erb_rate(sr / 2)
-    erb_edges = np.linspace(e_cut, e_high, n_erb_high + 1)
-    freq_edges = erb_inv(erb_edges)
-    ideal = np.round(freq_edges / bin_res).astype(int)
-    ideal = np.clip(ideal, cutoff_bin, n_bins)
-
-    high = [cutoff_bin]
-    for i in range(n_erb_high):
-        next_edge = max(int(ideal[i + 1]), high[-1] + min_bins_per_band)
-        next_edge = min(next_edge, n_bins)
-        high.append(next_edge)
-    high[-1] = n_bins
-
-    # 合併: low_edges[-1] == high[0] == cutoff_bin
-    all_edges = np.array(low_edges + list(high[1:]), dtype=int)
-    n_bands = len(all_edges) - 1
-    return all_edges, n_bands
-
 
 def freq2erb(freq_hz):
     """Hz → ERB-number (Glasberg-Moore; DeepFilterNet / DeepFilterNet-Keras constants)."""
@@ -334,7 +360,7 @@ def erb2freq(n_erb):
     return 24.7 * 9.265 * (np.exp(n_erb / 9.265) - 1.0)
 
 
-def erb_bandborder(n_bands, sr, n_fft, min_bins_per_band=2):
+def erb_bandborder(n_bands, sr, n_fft, min_bins_per_band):
     """Port of DeepFilterNet(-Keras) ERBBand(): returns nfftborder, a length-N
     (N = n_bands) int array of FFT-bin band borders on the Glasberg-Moore ERB scale.
     nfftborder[0]=0 (DC), nfftborder[-1]=n_fft//2+1 (Nyquist+1). N borders → N ERB bands
@@ -405,15 +431,20 @@ def compute_erb_matrix(nfftborder, n_fft, mode=0):
 
 class RNNoiseModel(nn.Module):
     """
-    RNNoise/DeepFilterNet-inspired dual-input model.
+    RNNoise/DeepFilterNet-inspired ERB-gain model.
 
     The ERB path observes short-term deviations from a causal per-band mean.
-    The complex path preserves fine low-frequency magnitude/phase structure and
-    retains partial level information under DF-style per-bin normalisation.
-    Both paths are causal apart from caller-controlled lookahead padding.
+    An optional complex path (``use_complex_input``, OFF by default) preserves
+    fine low-frequency magnitude/phase structure; see __init__ for why it is
+    off.  Both paths are causal apart from caller-controlled lookahead padding.
+
+    ``forward`` always accepts ``spec_features`` so the ONNX signature, the C
+    feature contract and every call site stay stable; with the complex path
+    disabled the argument is simply unused.
     """
     def __init__(self, n_bands, spec_bins, cond_size=64, gru_size=128,
-                 spec_conv_channels=8, spec_embed_size=64, dropout=0.0):
+                 spec_conv_channels=8, spec_embed_size=64, dropout=0.0,
+                 use_complex_input=False):
         super().__init__()
         self.n_bands = n_bands
         self.spec_bins = spec_bins
@@ -426,16 +457,30 @@ class RNNoiseModel(nn.Module):
 
         # Per-frame complex spectrum encoder.  Frequency is reduced by 4x;
         # temporal context is applied only after each frame has been embedded.
-        self.spec_conv1 = nn.Conv1d(2, spec_conv_channels, kernel_size=5,
-                                    stride=2, padding=2)
-        self.spec_conv2 = nn.Conv1d(spec_conv_channels, 2 * spec_conv_channels,
-                                    kernel_size=5, stride=2, padding=2)
-        reduced_bins = (spec_bins + 3) // 4
-        self.spec_proj = nn.Linear(2 * spec_conv_channels * reduced_bins,
-                                   spec_embed_size)
-        self.spec_temporal = nn.Conv1d(spec_embed_size, spec_embed_size,
-                                       kernel_size=3, padding=0)
-        self.fuse = nn.Linear(cond_size + spec_embed_size, gru_size)
+        #
+        # Disabled by default: the model's OUTPUT is 22 real ERB band gains, so
+        # everything this branch learns about within-band structure is discarded
+        # at the output anyway.  It cost 46,952 params (12.5% of the model) to
+        # extract fine-grained 0-4 kHz detail that the coarse output cannot
+        # express.  Turning it off makes the model pure-ERB on both ends, which
+        # is what the RNNoise-ERB vs GTCRN comparison is meant to isolate:
+        # GTCRN has hybrid-resolution input AND a complex mask, so the two
+        # models become clean opposite ends rather than a muddled middle.
+        self.use_complex_input = use_complex_input
+        if use_complex_input:
+            self.spec_conv1 = nn.Conv1d(2, spec_conv_channels, kernel_size=5,
+                                        stride=2, padding=2)
+            self.spec_conv2 = nn.Conv1d(spec_conv_channels, 2 * spec_conv_channels,
+                                        kernel_size=5, stride=2, padding=2)
+            reduced_bins = (spec_bins + 3) // 4
+            self.spec_proj = nn.Linear(2 * spec_conv_channels * reduced_bins,
+                                       spec_embed_size)
+            self.spec_temporal = nn.Conv1d(spec_embed_size, spec_embed_size,
+                                           kernel_size=3, padding=0)
+            fuse_in = cond_size + spec_embed_size
+        else:
+            fuse_in = cond_size
+        self.fuse = nn.Linear(fuse_in, gru_size)
 
         # Dropout (GRU 層間)
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
@@ -461,18 +506,26 @@ class RNNoiseModel(nn.Module):
     def forward(self, erb_features, spec_features, states=None):
         """
         erb_features:  (batch, seq_len, n_bands)
-        spec_features: (batch, seq_len, 2, spec_bins)
+        spec_features: (batch, seq_len, 2, spec_bins), or None when the complex
+              branch is disabled.  The argument stays in the signature either
+              way so the ONNX graph and the C contract do not change shape with
+              a training-time flag; when unused it is simply not read.
         states: [h1, h2, h3] 或 None
         回傳: gains, new_states
               seq_len' = seq_len - 2 (conv1 kernel=3 valid 減 2 frame)
         """
         if not torch.jit.is_tracing():
-            if erb_features.ndim != 3 or spec_features.ndim != 4:
-                raise ValueError('expected ERB [B,T,E] and complex spectrum [B,T,2,F]')
-            if spec_features.shape[2:] != (2, self.spec_bins):
-                raise ValueError(
-                    f'complex feature shape {tuple(spec_features.shape[2:])}, '
-                    f'expected (2, {self.spec_bins})')
+            if erb_features.ndim != 3:
+                raise ValueError('expected ERB features [B,T,E]')
+            if self.use_complex_input:
+                if spec_features is None or spec_features.ndim != 4:
+                    raise ValueError(
+                        'use_complex_input=True requires a complex spectrum '
+                        '[B,T,2,F]')
+                if spec_features.shape[2:] != (2, self.spec_bins):
+                    raise ValueError(
+                        f'complex feature shape {tuple(spec_features.shape[2:])}, '
+                        f'expected (2, {self.spec_bins})')
 
         device = erb_features.device
         batch, seq_len, _ = erb_features.shape
@@ -487,16 +540,18 @@ class RNNoiseModel(nn.Module):
         erb = torch.tanh(self.erb_conv(erb_features.permute(0, 2, 1)))
         erb = erb.permute(0, 2, 1)  # (B, T-2, cond_size)
 
-        spec = spec_features.reshape(batch * seq_len, 2, self.spec_bins)
-        spec = torch.tanh(self.spec_conv1(spec))
-        spec = torch.tanh(self.spec_conv2(spec))
-        spec = spec.flatten(1)
-        spec = torch.tanh(self.spec_proj(spec))
-        spec = spec.reshape(batch, seq_len, self.spec_embed_size)
-        spec = torch.tanh(self.spec_temporal(spec.permute(0, 2, 1)))
-        spec = spec.permute(0, 2, 1)  # (B, T-2, spec_embed_size)
-
-        fused = torch.tanh(self.fuse(torch.cat([erb, spec], dim=-1)))
+        if self.use_complex_input:
+            spec = spec_features.reshape(batch * seq_len, 2, self.spec_bins)
+            spec = torch.tanh(self.spec_conv1(spec))
+            spec = torch.tanh(self.spec_conv2(spec))
+            spec = spec.flatten(1)
+            spec = torch.tanh(self.spec_proj(spec))
+            spec = spec.reshape(batch, seq_len, self.spec_embed_size)
+            spec = torch.tanh(self.spec_temporal(spec.permute(0, 2, 1)))
+            spec = spec.permute(0, 2, 1)  # (B, T-2, spec_embed_size)
+            fused = torch.tanh(self.fuse(torch.cat([erb, spec], dim=-1)))
+        else:
+            fused = torch.tanh(self.fuse(erb))
 
         # 3 層 GRU + dropout
         gru1_out, h1 = self.gru1(fused, h1)
@@ -522,7 +577,6 @@ def make_norm_alpha(sr: int, hop_len: int, tau: float = 10.0) -> float:
     one.  Besides matching its train/runtime contract, this makes alpha a fixed
     C constant instead of requiring exp() in the per-frame embedded hot path.
     """
-    import math
     exact = math.exp(-(hop_len / sr) / tau)
     precision = 3
     alpha = 1.0
@@ -534,15 +588,59 @@ def make_norm_alpha(sr: int, hop_len: int, tau: float = 10.0) -> float:
 
 def stft(wav, n_fft, hop_len, win_len, window):
     """STFT with normalized=True (= fft_size^-0.5, matching DeepFilterNet-Keras
-    stft(normalize=True)). Pairs with istft() for perfect reconstruction."""
+    stft(normalize=True)). Pairs with istft() for perfect reconstruction.
+
+    center=False so that training framing equals the deployed framing.  The C
+    streaming path is center=False-equivalent by construction (process.h:20-23),
+    and with center=True every frame differed from deployment by n_fft/2 = 256
+    samples.  That header calls it a boundary-only effect, which holds for the
+    spectrum but NOT for the causal EMA normaliser: its state starts fresh at
+    frame 0 and, because tau=1 s against 3 s segments means the whole segment is
+    still warming up, a frame-0 difference propagates through the entire example.
+    """
     return torch.stft(wav, n_fft, hop_len, win_len, window=window,
-                      return_complex=True, center=True, normalized=True)
+                      return_complex=True, center=False, normalized=True)
 
 
-def istft(spec, n_fft, hop_len, win_len, window, length):
-    """Inverse of stft() (normalized=True → istft normalized=True inverts it exactly)."""
-    return torch.istft(spec, n_fft, hop_len, win_len,
-                       window=window, length=length, normalized=True)
+def istft(spec, n_fft, hop_len, win_len, window, length=None):
+    """Weighted overlap-add synthesis, matching the C streaming path.
+
+    Deliberately NOT torch.istft: that divides by the window envelope, which is
+    exactly zero at the first and last sample once center=False (sqrt-Hann
+    starts at 0 and only one frame covers the edge), so it refuses to run.  The
+    deployed path has no such division -- sqrt-Hann analysis times sqrt-Hann
+    synthesis is Hann, which sums to 1 at 50% overlap (COLA), so plain
+    overlap-add reconstructs exactly in the interior.  The edges are genuinely
+    attenuated in deployment too; ``valid_region`` below reports the span where
+    that is not the case, and the loss trims to it.
+
+    normalized=True in the analysis scales by n_fft^-0.5, so undo it here.
+    """
+    n_frames = spec.shape[-1]
+    # normalized=True in the analysis scales by n_fft^-0.5; undo it by scaling
+    # the window rather than the (n_fft, T) frame tensor -- same product, but a
+    # win_len-element multiply instead of a full-size one on the gradient path.
+    frames = torch.fft.irfft(spec, n=n_fft, dim=-2)          # (..., n_fft, T)
+    frames = frames[..., :win_len, :] * (window * math.sqrt(n_fft)).view(-1, 1)
+    out_len = (n_frames - 1) * hop_len + win_len
+    wav = torch.nn.functional.fold(
+        frames, output_size=(1, out_len), kernel_size=(1, win_len),
+        stride=(1, hop_len),
+    ).reshape(*spec.shape[:-2], out_len)
+    if length is not None:
+        wav = wav[..., :length] if wav.shape[-1] >= length else F.pad(
+            wav, (0, length - wav.shape[-1]))
+    return wav
+
+
+def valid_region(win_len, hop_len):
+    """Samples to trim from each end before computing a waveform loss.
+
+    Only the first/last (win_len - hop_len) samples see fewer than the full set
+    of overlapping frames, so their amplitude is a framing artefact rather than
+    something the model can fix.
+    """
+    return win_len - hop_len
 
 
 def normalize_log_erb(erb_db, norm_state=None, norm_alpha: float = 0.984,
@@ -610,12 +708,19 @@ def normalize_complex_spectrum(spec_low, norm_state=None, norm_alpha: float = 0.
 
 
 def extract_model_features(spec, erb_matrix, feature_cfg, norm_state=None,
-                           return_debug=False):
+                           return_debug=False, need_spec=True):
     """
     spec: (B, n_bins, T) complex, from normalized=True STFT.
     erb_matrix: (n_bins, n_bands) triangular forward ERB filterbank.
     Returns mean-normalised ERB features, complex low-bin features and both
     updated causal normalisation states.
+
+    ``need_spec=False`` skips the complex branch entirely and returns ``None``
+    in its place.  A pure-ERB model discards that tensor, but producing it
+    costs a Python loop over every frame (the EMA is causal), so the training
+    loop must not pay for it.  The C path and the ONNX signature are unaffected
+    -- they are separate code, and the default stays True so every other caller
+    (parity tests, denoise) is unchanged.
     """
     spec_btf = spec.permute(0, 2, 1)
     energy = spec_btf.abs().pow(2) @ erb_matrix
@@ -630,10 +735,15 @@ def extract_model_features(spec, erb_matrix, feature_cfg, norm_state=None,
         init_hi_db=feature_cfg['erb_norm_init_hi_db'],
         scale_db=feature_cfg['erb_norm_scale_db'])
     spec_low = spec_btf[..., :feature_cfg['spec_bins']]
-    spec_features, norm_state = normalize_complex_spectrum(
-        spec_low, norm_state=spec_state_in, norm_alpha=feature_cfg['spec_alpha'],
-        init_lo=feature_cfg['spec_norm_init_lo'],
-        init_hi=feature_cfg['spec_norm_init_hi'], eps=feature_cfg['spec_norm_eps'])
+    if need_spec or return_debug:
+        spec_features, norm_state = normalize_complex_spectrum(
+            spec_low, norm_state=spec_state_in, norm_alpha=feature_cfg['spec_alpha'],
+            init_lo=feature_cfg['spec_norm_init_lo'],
+            init_hi=feature_cfg['spec_norm_init_hi'], eps=feature_cfg['spec_norm_eps'])
+        if not need_spec:
+            spec_features = None
+    else:
+        spec_features, norm_state = None, spec_state_in
     debug = None
     if return_debug:
         debug = {'erb_db': erb_db.detach(), 'spec_magnitude': spec_low.abs().detach()}
@@ -694,6 +804,74 @@ class _LossStft(nn.Module):
             normalized=True, return_complex=True)
 
 
+class ErbIrmLoss(nn.Module):
+    """Direct supervision of the 22 ERB band gains against the ideal ratio mask.
+
+    Why this exists: with MultiResSpecLoss alone the gains are only supervised
+    *through* the synthesis, so nothing pushes a specific gain value in a band
+    the waveform loss barely notices.  This trains them directly.
+
+    target  g* = sqrt(clamp(E_clean / E_noisy, 0, 1))   per band, amplitude domain
+    loss    mean( (g^gamma - g*^gamma)^2 )  over DEFINED bands only
+
+    NO speech-activity weighting.  A ``(1 + 5*vad)`` term used to sit here by
+    analogy with xiph/rnnoise, but xiph computes it from a real VAD *output
+    head* trained against a VAD target; this model has no such head and emits
+    nothing but 22 band gains, so the term was weighting a loss for a quantity
+    the network never predicts.  It was also inverted in the case that matters
+    most: for a noise-only example ``clean_frame_e`` is 0 and the peak
+    reference clamps to 1e-12, so ``10*log10(0/1e-12)`` evaluated to 0 dB --
+    above any sane threshold -- and every pure-noise frame was scored as
+    speech-active and up-weighted 6x.
+
+    The undefined-band mask is kept: a band with essentially no energy in the
+    MIXTURE has no defined ratio at all, so its gradient is pure noise rather
+    than a weighting choice.
+    """
+
+    def __init__(self, factor=1.0, gamma=0.25, energy_floor=1e-9):
+        super().__init__()
+        self.factor = factor
+        self.gamma = gamma
+        self.energy_floor = energy_floor
+
+    @staticmethod
+    def _band_energy(spec, erb_fwd):
+        """spec: (B, n_bins, T) complex; erb_fwd: (n_bins, n_bands)
+        -> (B, T, n_bands)"""
+        power = spec.real.pow(2) + spec.imag.pow(2)      # (B, n_bins, T)
+        return power.transpose(1, 2).matmul(erb_fwd)     # (B, T, n_bands)
+
+    def forward(self, pred_gains, noisy_spec, clean_spec, erb_fwd):
+        if self.factor == 0:
+            return torch.zeros((), device=pred_gains.device, dtype=pred_gains.dtype)
+
+        e_noisy = self._band_energy(noisy_spec, erb_fwd)
+        e_clean = self._band_energy(clean_spec, erb_fwd)
+
+        # Align the gain's frame axis with the spectra (the model may emit
+        # fewer frames than the STFT produced, depending on lookahead padding).
+        n = min(pred_gains.shape[1], e_noisy.shape[1])
+        pred_gains = pred_gains[:, :n]
+        e_noisy, e_clean = e_noisy[:, :n], e_clean[:, :n]
+
+        target = torch.sqrt(torch.clamp(e_clean / (e_noisy + 1e-10), 0.0, 1.0))
+
+        # Undefined-band mask: where the band carries essentially no energy in
+        # the mixture, the ratio is numerically meaningless and its gradient is
+        # pure noise.  The original RNNoise masks these out rather than letting
+        # them dominate (most bands are near-silent at low SNR).
+        defined = (e_noisy > self.energy_floor).to(pred_gains.dtype)
+
+        weight = defined
+
+        g = pred_gains.clamp_min(1e-12).pow(self.gamma)
+        t = target.clamp_min(1e-12).pow(self.gamma)
+        num = (weight * (g - t).pow(2)).sum()
+        den = weight.sum().clamp_min(1.0)
+        return self.factor * num / den
+
+
 class MultiResSpecLoss(nn.Module):
     """
     DeepFilterNet 3 MultiResSpecLoss port. Each resolution uses a plain Hann
@@ -739,14 +917,6 @@ class MultiResSpecLoss(nn.Module):
 # 訓練
 # ============================================================
 
-def set_seed(seed):
-    """固定所有隨機種子以確保可重現性"""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
 
 def train(args):
     # Seed
@@ -765,12 +935,13 @@ def train(args):
     HOP_LEN = cfg.getint('signal', 'hop_len', fallback=WIN_LEN // 2)
     HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
     N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
+    MIN_BINS_PER_BAND = cfg.getint('signal', 'min_bins_per_band', fallback=2)
 
     if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
-        # Hybrid mode: raw bins below cutoff + ERB above
-        _, N_BANDS = compute_hybrid_bands(N_FFT, SR, N_ERB_HIGH, HYBRID_CUTOFF)
-    else:
-        N_BANDS = cfg.getint('signal', 'n_bands')
+        raise NotImplementedError(
+            "hybrid bands are not supported with the faithful DFN/Keras ERB "
+            "filterbank; set hybrid_cutoff_hz=0 to use pure ERB")
+    N_BANDS = cfg.getint('signal', 'n_bands')
 
     LOOKAHEAD = cfg.getint('signal', 'lookahead_frames', fallback=0)
     assert 0 <= LOOKAHEAD <= 2, "lookahead_frames 只支援 0~2"
@@ -795,17 +966,12 @@ def train(args):
     output_dir = cfg.get('paths', 'output_dir')
 
     # ERB band borders (faithful DeepFilterNet/Keras ERBBand, config-driven)
-    if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
-        raise NotImplementedError(
-            "hybrid bands are not supported with the faithful DFN/Keras ERB filterbank; "
-            "set hybrid_cutoff_hz=0 to use pure ERB")
-    NFFTBORDER = erb_bandborder(N_BANDS, SR, N_FFT)   # (N_BANDS,) ints, [0 .. n_fft//2+1]
+    NFFTBORDER = erb_bandborder(N_BANDS, SR, N_FFT, MIN_BINS_PER_BAND)  # (N_BANDS,) ints, [0 .. n_fft//2+1]
 
     # Dataset
     use_online = False
     use_wav = False
     if args.packed_dir or args.packed_data:
-        from torch.utils.data import ConcatDataset
         pt_files = []
         if args.packed_dir:
             pt_files += sorted(glob.glob(os.path.join(args.packed_dir, '*.pt')))
@@ -821,9 +987,11 @@ def train(args):
     else:
         raise ValueError("RNNoise-ERB 訓練僅支援 wav-data：請用 --packed-dir 或 --packed-data")
 
-    n_val = max(1, int(len(dataset) * 0.1))
-    n_train = len(dataset) - n_val
-    train_set, val_set = locality_preserving_random_split(dataset, n_train, n_val)
+    n_train, n_val = split_sizes(dataset)
+    train_set, val_set = locality_preserving_random_split(
+        dataset, n_train, n_val, args.seed)
+    print(f"  split: {n_train} train / {n_val} val "
+          f"(shared fraction, split seed {args.seed})")
 
     # epoch_size 可限制每 epoch 的 sample 數；mmap 模式仍以局部區塊取樣。
     epoch_size = cfg.getint('training', 'epoch_size', fallback=0)
@@ -869,6 +1037,7 @@ def train(args):
 
     # 模型 (容量 config-driven; 官方 v0.2 = 128/256)
     COND_SIZE = cfg.getint('model', 'cond_size', fallback=64)
+    USE_COMPLEX_INPUT = cfg.getboolean('model', 'use_complex_input', fallback=False)
     GRU_SIZE = cfg.getint('model', 'gru_size', fallback=128)
     SPEC_CONV_CHANNELS = cfg.getint('model', 'spec_conv_channels', fallback=8)
     SPEC_EMBED_SIZE = cfg.getint('model', 'spec_embed_size', fallback=64)
@@ -876,7 +1045,8 @@ def train(args):
         n_bands=N_BANDS, spec_bins=FEATURE_CFG['spec_bins'],
         cond_size=COND_SIZE, gru_size=GRU_SIZE,
         spec_conv_channels=SPEC_CONV_CHANNELS,
-        spec_embed_size=SPEC_EMBED_SIZE, dropout=dropout).to(device)
+        spec_embed_size=SPEC_EMBED_SIZE, dropout=dropout,
+        use_complex_input=USE_COMPLEX_INPUT).to(device)
     if hasattr(torch, 'compile') and device.type == 'cuda':
         model = torch.compile(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999),
@@ -893,6 +1063,8 @@ def train(args):
 
     loss_cfg = read_loss_config(cfg)
     loss_fn = MultiResSpecLoss(**loss_cfg).to(device)
+    irm_cfg = read_irm_loss_config(cfg)
+    irm_loss_fn = ErbIrmLoss(**irm_cfg).to(device)
 
     # Forward ERBB (mode=0, edge x2) for features; inverse (mode=1, partition of unity)
     # for mask→bin expansion — exactly the DFN/Keras forward/inverse split.
@@ -923,7 +1095,7 @@ def train(args):
         print(f"Loading checkpoint: {args.resume}")
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         require_checkpoint_feature_config(ckpt, FEATURE_CFG, context=args.resume)
-        require_checkpoint_loss_config(ckpt, loss_cfg, context=args.resume)
+        require_checkpoint_loss_config(ckpt, loss_cfg, irm_cfg, context=args.resume)
         resume_model = model._orig_mod if hasattr(model, '_orig_mod') else model
         resume_model.load_state_dict(ckpt['state_dict'])
         if 'optimizer' in ckpt:
@@ -957,6 +1129,51 @@ def train(args):
         with open(log_csv, 'w') as f:
             f.write('epoch,train_loss,val_loss,lr\n')
 
+    mrsl_enabled = mrsl_is_enabled(loss_cfg)
+
+    def batch_loss(noisy_wav, clean_wav):
+        """One forward pass and its objective, shared by the train and val loops.
+
+        These were two verbatim copies sixty lines apart, so every change to the
+        objective had to be made twice.
+        """
+        noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
+
+        # Zero-pad time so both k=3 branches emit one gain per spectrum frame:
+        # pad_left = 2-LOOKAHEAD (過去), pad_right = LOOKAHEAD (未來).
+        # Dataset clips are independent and shuffled, so no normalisation/GRU
+        # state is carried across files; each call still evolves causally
+        # across every frame within the clip.
+        erb_features, spec_features, _, _ = extract_model_features(
+            noisy_spec, ERB_FWD, FEATURE_CFG, need_spec=model.use_complex_input)
+        pad_left, pad_right = 2 - LOOKAHEAD, LOOKAHEAD
+        erb_features = F.pad(erb_features, (0, 0, pad_left, pad_right))
+        if spec_features is not None:
+            spec_features = F.pad(
+                spec_features, (0, 0, 0, 0, pad_left, pad_right))
+        pred_gains, _ = model(erb_features, spec_features)
+
+        # Direct supervision of the band gains against the ideal ratio mask.
+        clean_spec = stft(clean_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
+        loss = irm_loss_fn(pred_gains, noisy_spec, clean_spec, ERB_FWD)
+        if not mrsl_enabled:
+            # With MRSL off the synthesis is not on the gradient path at all,
+            # so the gain application and the ISTFT are skipped rather than
+            # computed and discarded.
+            return loss
+
+        enhanced_spec = apply_erb_gains_batch(
+            noisy_spec, pred_gains, ERB_INV, LOOKAHEAD)
+        enhanced_wav = istft(enhanced_spec, N_FFT, HOP_LEN, WIN_LEN, stft_window)
+
+        # Trim the partial-overlap edges: with center=False only the interior
+        # sees the full set of overlapping frames, and the taper there is a
+        # framing artefact the model cannot fix (deployment has it too).
+        trim = valid_region(WIN_LEN, HOP_LEN)
+        n = min(enhanced_wav.size(-1), clean_wav.size(-1))
+        return loss + loss_fn(enhanced_wav[..., trim:n - trim],
+                              clean_wav[..., trim:n - trim])
+
     global_step = (start_epoch - 1) * len(train_loader)   # resume-safe (給 wd schedule)
     last_wd = weight_decay
     for epoch in range(start_epoch, epochs + 1):
@@ -975,32 +1192,7 @@ def train(args):
                     clean_wav = clean_wav.to(
                         device=device, dtype=torch.float32, non_blocking=pin_memory)
 
-                    # On-the-fly STFT
-                    noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
-                    # (B, n_bins, n_frames)
-
-                    # Dual features + zero-pad time so both k=3 branches emit
-                    # one gain per original spectrum frame.
-                    # pad_left = 2-LOOKAHEAD (補過去), pad_right = LOOKAHEAD (補未來)
-                    erb_features, spec_features, _, _ = extract_model_features(
-                        noisy_spec, ERB_FWD, FEATURE_CFG)
-                    pad_left, pad_right = 2 - LOOKAHEAD, LOOKAHEAD
-                    erb_features = F.pad(erb_features, (0, 0, pad_left, pad_right))
-                    spec_features = F.pad(
-                        spec_features, (0, 0, 0, 0, pad_left, pad_right))
-
-                    # Dataset clips are independent and shuffled.  Never carry
-                    # normalisation/GRU state across unrelated files; each call
-                    # still evolves causally across every frame in the clip.
-                    pred_gains, _ = model(erb_features, spec_features)
-
-                    # Apply ERB gains → enhanced STFT → ISTFT
-                    enhanced_spec = apply_erb_gains_batch(
-                        noisy_spec, pred_gains, ERB_INV, LOOKAHEAD)
-                    enhanced_wav = istft(enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
-                                         stft_window, noisy_wav.size(-1))
-
-                    loss = loss_fn(enhanced_wav, clean_wav)
+                    loss = batch_loss(noisy_wav, clean_wav)
 
                     # weight-decay 排程 (DFN-style cosine, 套在這步 optimizer.step 前)
                     if wd_scheduled:
@@ -1033,19 +1225,7 @@ def train(args):
                     clean_wav = clean_wav.to(
                         device=device, dtype=torch.float32, non_blocking=pin_memory)
 
-                    noisy_spec = stft(noisy_wav, N_FFT, HOP_LEN, WIN_LEN, stft_window)
-                    erb_features, spec_features, _, _ = extract_model_features(
-                        noisy_spec, ERB_FWD, FEATURE_CFG)
-                    pad_left, pad_right = 2 - LOOKAHEAD, LOOKAHEAD
-                    erb_features = F.pad(erb_features, (0, 0, pad_left, pad_right))
-                    spec_features = F.pad(
-                        spec_features, (0, 0, 0, 0, pad_left, pad_right))
-                    pred_gains, _ = model(erb_features, spec_features)
-                    enhanced_spec = apply_erb_gains_batch(
-                        noisy_spec, pred_gains, ERB_INV, LOOKAHEAD)
-                    enhanced_wav = istft(enhanced_spec, N_FFT, HOP_LEN, WIN_LEN,
-                                         stft_window, noisy_wav.size(-1))
-                    loss = loss_fn(enhanced_wav, clean_wav)
+                    loss = batch_loss(noisy_wav, clean_wav)
                     val_loss_sum += loss.item()
 
         avg_val = val_loss_sum / max(len(val_loader), 1)
@@ -1074,6 +1254,7 @@ def train(args):
                 'hop_len': HOP_LEN, 'n_bands': N_BANDS,
                 'lookahead_frames': LOOKAHEAD,
                 'cond_size': COND_SIZE, 'gru_size': GRU_SIZE,
+                'use_complex_input': USE_COMPLEX_INPUT,
                 'spec_conv_channels': SPEC_CONV_CHANNELS,
                 'spec_embed_size': SPEC_EMBED_SIZE,
                 'feature_version': FEATURE_VERSION,
@@ -1082,6 +1263,10 @@ def train(args):
                 'loss_gamma': loss_cfg['gamma'],
                 'loss_factor': loss_cfg['factor'],
                 'loss_factor_complex': loss_cfg['factor_complex'],
+                'irm_factor': irm_cfg['factor'],
+                'irm_gamma': irm_cfg['gamma'],
+                'irm_energy_floor': irm_cfg['energy_floor'],
+                'min_bins_per_band': MIN_BINS_PER_BAND,
                 'feature_erb_norm_tau_sec': FEATURE_CFG['erb_tau_sec'],
                 'feature_erb_norm_alpha': FEATURE_CFG['erb_alpha'],
                 'feature_erb_norm_init_lo_db': FEATURE_CFG['erb_norm_init_lo_db'],

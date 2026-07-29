@@ -17,10 +17,15 @@ extern "C" {
  *   - Band gain → bin gain: gains @ ERB_inv^T (mode=1, partition of unity)
  *   - ISTFT: normalized=True (× N_FFT^+0.5) + root-Hann + 50% OLA (COLA)
  *
- * 注意: torch.stft(center=True) 的 reflect padding 是離線批次行為;
- * 本 streaming 實作等價於 center=False 的框對齊 (差 N_FFT/2 的時間偏移,
- * 僅影響首尾邊界 frame)。特徵/增益的數學與 Python 逐式對齊, 但 matmul
- * 的累加順序依實作而異 → 與 torch 為 float32 ULP 級近似, 非 bit-exact。
+ * 框對齊: train.py 已改用 center=False, 與這個 streaming 實作一致。
+ * (先前訓練用 center=True, 兩邊差 N_FFT/2 = 256 sample 的框偏移。舊註解稱
+ *  該偏移「僅影響首尾邊界 frame」—— 對頻譜成立, 但對 causal EMA 正規化器
+ *  不成立: 它的狀態從 frame 0 起累積, 而 3 秒 segment 全程都在暖機, 所以
+ *  frame 0 的差異會一路傳播到整段。)
+ * 合成端同樣不做 window-envelope 除法: root-Hann 分析 × root-Hann 合成
+ * = Hann, 50% overlap 下 COLA 自動成立。train.py 的 istft() 亦然。
+ * 特徵/增益的數學與 Python 逐式對齊, 但 matmul 的累加順序依實作而異
+ * → 與 torch 為 float32 ULP 級近似, 非 bit-exact。
  * ============================================================ */
 
 #define RNNOISE_SR          16000
@@ -30,10 +35,11 @@ extern "C" {
 #define RNNOISE_HOP_LEN     256   /* 幀移長度 (≤ WIN_LEN/2 for COLA) */
 #define RNNOISE_OVL_LEN     (RNNOISE_WIN_LEN - RNNOISE_HOP_LEN)  /* overlap 長度 */
 #define RNNOISE_N_BANDS     22    /* = config.ini [signal] n_bands (純 ERB 模式) */
+#define RNNOISE_MIN_BINS_PER_BAND 2  /* = config.ini [signal] min_bins_per_band */
 #define RNNOISE_LOOKAHEAD     1     /* = config.ini lookahead_frames */
 #define RNNOISE_CONV_DELAY    (2 - RNNOISE_LOOKAHEAD)
 
-/* log_erb_dfn_mean_cplx_unit_0_4k_v5 constants.  Keep byte-for-byte aligned with
+/* log_erb_dfn_mean_cplx_unit_0_4k_v6 constants.  Keep byte-for-byte aligned with
  * config.ini [feature] and checkpoint validation in train.py.
  * v4 removes the erb_norm_clip/spec_clip deployment safety clamp v3 kept on
  * top of the DeepFilterNet formula -- verified against upstream
@@ -42,17 +48,31 @@ extern "C" {
  * v5 fixes the ERB band-border minimum-width enforcement in
  * gen_rnnoise_tables.c (see that file for the algorithm; train.py's
  * erb_bandborder() is the Python side of the same fix) -- changes the
- * erb_fwd/erb_inv tables below. */
-#define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v5"
+ * erb_fwd/erb_inv tables below.
+ * v7 reverts to deriving the decay from tau (1 s), matching upstream libDF's
+ *     _calculate_norm_alpha(sr, hop, tau): 16k/hop256 -> 0.984.  Pinning alpha
+ *     at 0.99 gave a 1.59 s memory, so a 3 s training segment ended with ~15%
+ *     of the init value still present -- every frame the model saw was in the
+ *     init-dominated transient.
+ * v6 pinned the normaliser decay directly (RNNOISE_*_NORM_ALPHA = 0.99) instead
+ * of deriving it from tau.  alpha is the per-FRAME decay, so pinning it keeps
+ * the normaliser's memory at 1/(1-alpha) = 100 frames under any sr/hop, which
+ * is the invariant the GRU's learned time constants actually depend on;
+ * deriving from tau pins it in seconds and lets the frame count drift.
+ * ⚠ The longer decay stays harmless only while the INIT values match the
+ * steady-state distribution -- see calibrate_norm_init.py.  Changing alpha
+ * without recalibrating the init reintroduces a warm-up transient that now
+ * spans 1.6x the training segment. */
+#define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v7"
 #define RNNOISE_ERB_NORM_TAU_SEC          1.0f
-#define RNNOISE_ERB_NORM_ALPHA             0.984f
+#define RNNOISE_ERB_NORM_ALPHA            0.984f
 #define RNNOISE_ERB_NORM_INIT_LO_DB     (-60.0f)
 #define RNNOISE_ERB_NORM_INIT_HI_DB     (-90.0f)
 #define RNNOISE_ERB_NORM_SCALE_DB        40.0f
 #define RNNOISE_SPEC_MAX_HZ            4000
 #define RNNOISE_SPEC_BINS               129
 #define RNNOISE_SPEC_NORM_TAU_SEC         1.0f
-#define RNNOISE_SPEC_NORM_ALPHA            0.984f
+#define RNNOISE_SPEC_NORM_ALPHA           0.984f
 #define RNNOISE_SPEC_NORM_INIT_LO          0.001f
 #define RNNOISE_SPEC_NORM_INIT_HI          0.0001f
 #define RNNOISE_SPEC_NORM_EPS              1e-12f
@@ -144,7 +164,9 @@ int rnnoise_compute_features(RNNoiseState *st,
  * atten_lim_db <= 0 (或呼叫端選擇不呼叫這個函式) 為 no-op/停用, 行為與
  * 拿掉這個功能前完全相同。
  * band_gains: 長度 RNNOISE_N_BANDS, 就地修改。 */
-void rnnoise_apply_atten_lim(float *band_gains, float atten_lim_db);
+/* band_gains 必須有 RNNOISE_N_BANDS 個元素：本函式無條件寫滿整段。 */
+void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],
+                             float atten_lim_db);
 
 /* 將 N_BANDS 個 band gain 經 mode=1 反向三角矩陣展開到 N_BINS 個 bin gain
  * (partition of unity: gains=1 → bin_gains=1, 無需列正規化) */

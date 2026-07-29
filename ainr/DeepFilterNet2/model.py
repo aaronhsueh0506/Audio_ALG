@@ -3,15 +3,17 @@ DeepFilterNet2 adaptation with config-driven sample rate and FFT size.
 
 Architecture overview (aligned with DeepFilterNet2 paper):
   - Encoder: ERB path (4 levels, freq stride-2 ×2) + DF path (2 levels)
-             → joint embedding GRU → lsnr
+             → joint embedding GRU
   - ERBDecoder: U-Net transposed conv × 4 → sigmoid ERB mask
-  - DFDecoder: GRU → per-bin FIR coefficients + alpha blend
+  - DFDecoder: GRU → per-bin FIR coefficients
   - deep_filter_apply: causal real/imag FIR filtering on low-freq bins
 
 Convention: (B, C, T, F) throughout (time = H dim 2, freq = W dim 3).
 """
 
 import math
+from functools import partial
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -120,32 +122,74 @@ def _build_erb_fb(n_fft: int, sr: int, n_erb: int):
 # ============================================================
 
 class SeparableConv2d(nn.Module):
-    """Depthwise-separable Conv2d with BN + PReLU."""
-    def __init__(self, in_ch, out_ch, kernel=(1, 3), stride=(1, 1), padding=(0, 1)):
+    """Separable Conv2d + BN + ReLU, causal on the time axis.
+
+    Matches upstream ``Conv2dNormAct`` (df/modules.py):
+      * grouping is ``gcd(in_ch, out_ch)`` and the *first* conv already changes
+        the channel count, followed by a 1x1 pointwise.  When in_ch == out_ch
+        this is the usual depthwise+pointwise pair; when they differ (the input
+        convs) it is NOT, which is why this used to diverge.
+      * activation is ReLU, not PReLU.
+      * the time axis is padded ``kernel[0] - 1`` on the LEFT ONLY, so the conv
+        is strictly causal.  The previous version always passed
+        ``padding=(0, kf//2)``, i.e. zero time padding — correct only for
+        kt == 1, and silently wrong (output shrinks in time, no causal pad) for
+        any larger temporal kernel such as DeepFilterNet3-ll's (2, 3).
+    """
+
+    def __init__(self, in_ch, out_ch, kernel=(1, 3), stride=(1, 1), padding=None,
+                 separable=True, act_layer=partial(nn.ReLU, inplace=True)):
         super().__init__()
-        self.dw = nn.Conv2d(in_ch, in_ch, kernel, stride, padding, groups=in_ch, bias=False)
-        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
+        kt, kf = kernel
+        fpad = kf // 2 if padding is None else padding[1]
+        groups = math.gcd(in_ch, out_ch) if separable else 1
+        if groups == 1 or max(kernel) == 1:
+            separable = False
+
+        self.pad = nn.ConstantPad2d((0, 0, kt - 1, 0), 0.0) if kt > 1 else nn.Identity()
+        self.conv = nn.Conv2d(in_ch, out_ch, kernel, stride, (0, fpad),
+                              groups=groups, bias=False)
+        self.pw = nn.Conv2d(out_ch, out_ch, 1, bias=False) if separable else nn.Identity()
         self.bn = nn.BatchNorm2d(out_ch)
-        self.act = nn.PReLU()
+        self.act = act_layer() if act_layer is not None else nn.Identity()
 
     def forward(self, x):
-        return self.act(self.bn(self.pw(self.dw(x))))
+        return self.act(self.bn(self.pw(self.conv(self.pad(x)))))
 
 
 class SeparableConvTranspose2d(nn.Module):
-    """Pointwise → Depthwise-transpose Conv2d with BN + PReLU."""
-    def __init__(self, in_ch, out_ch, kernel=(1, 3), stride=(1, 1), padding=(0, 1),
-                 output_padding=(0, 0), act=True):
+    """Separable ConvTranspose2d + BN + ReLU, causal on the time axis.
+
+    Matches upstream ``ConvTranspose2dNormAct``: the *transpose* runs first
+    (with ``groups = gcd``), then the 1x1 pointwise.  The previous version had
+    the order reversed (pointwise first, then a depthwise transpose).
+    """
+
+    def __init__(self, in_ch, out_ch, kernel=(1, 3), stride=(1, 1), padding=None,
+                 output_padding=None, act=True, separable=True):
         super().__init__()
-        self.pw = nn.Conv2d(in_ch, out_ch, 1, bias=False)
-        self.dw = nn.ConvTranspose2d(out_ch, out_ch, kernel, stride, padding,
-                                     output_padding=output_padding,
-                                     groups=out_ch, bias=False)
+        kt, kf = kernel
+        fpad = kf // 2 if padding is None else padding[1]
+        # Upstream ConvTranspose2dNormAct hardcodes output_padding=(0, kf//2);
+        # with padding=(kt-1, kf//2) that makes F_out exactly stride*F_in, so
+        # the shape-matching heuristic the decoder used to carry is unnecessary.
+        if output_padding is None:
+            output_padding = (0, fpad)
+        groups = math.gcd(in_ch, out_ch) if separable else 1
+        if groups == 1:
+            separable = False
+
+        self.pad = nn.ConstantPad2d((0, 0, kt - 1, 0), 0.0) if kt > 1 else nn.Identity()
+        self.convt = nn.ConvTranspose2d(in_ch, out_ch, kernel, stride,
+                                        (kt - 1, fpad),
+                                        output_padding=output_padding,
+                                        groups=groups, bias=False)
+        self.pw = nn.Conv2d(out_ch, out_ch, 1, bias=False) if separable else nn.Identity()
         self.bn = nn.BatchNorm2d(out_ch)
-        self.act = nn.PReLU() if act else nn.Identity()
+        self.act = nn.ReLU(inplace=True) if act else nn.Identity()
 
     def forward(self, x):
-        return self.act(self.bn(self.dw(self.pw(x))))
+        return self.act(self.bn(self.pw(self.convt(self.pad(x)))))
 
 
 class LookaheadConv2d(nn.Sequential):
@@ -155,9 +199,18 @@ class LookaheadConv2d(nn.Sequential):
     consumes input frames ``[t-(K-L-1), ..., t+L]``.  Frequency padding remains
     symmetric.  This makes the frame alignment explicit instead of relying on
     Conv2d's symmetric time padding.
+
+    Equivalent to upstream's scheme (strictly causal convs plus a whole-stream
+    feature shift ``ConstantPad2d((0, 0, -L, L))``): at L = 1 both give the
+    receptive field ``[t-1, t, t+1]``.  Doing it inside the conv keeps the
+    alignment explicit for the streaming port.
+
+    Separability follows upstream: ``groups = gcd(in_ch, out_ch)``, so the ERB
+    input conv (1 -> C, gcd = 1) is dense while the DF input conv (2 -> C,
+    gcd = 2) is grouped + pointwise.
     """
 
-    def __init__(self, in_ch, out_ch, kernel=(3, 3), lookahead=0):
+    def __init__(self, in_ch, out_ch, kernel=(3, 3), lookahead=0, separable=True):
         kt, kf = kernel
         if not 0 <= lookahead < kt:
             raise ValueError(
@@ -166,48 +219,91 @@ class LookaheadConv2d(nn.Sequential):
             )
         time_left = kt - lookahead - 1
         freq_pad = kf // 2
-        super().__init__(
+        groups = math.gcd(in_ch, out_ch) if separable else 1
+        if groups == 1 or max(kernel) == 1:
+            separable = False
+
+        layers = [
             nn.ConstantPad2d((freq_pad, freq_pad, time_left, lookahead), 0.0),
-            nn.Conv2d(in_ch, out_ch, kernel, padding=0, bias=False),
-            nn.BatchNorm2d(out_ch),
-            nn.PReLU(),
-        )
+            nn.Conv2d(in_ch, out_ch, kernel, padding=0, groups=groups, bias=False),
+        ]
+        if separable:
+            layers.append(nn.Conv2d(out_ch, out_ch, 1, bias=False))
+        layers += [nn.BatchNorm2d(out_ch), nn.ReLU(inplace=True)]
+        super().__init__(*layers)
 
 
-class GroupedGRU(nn.Module):
+class GroupedLinearEinsum(nn.Module):
+    """Grouped linear projection, no bias — upstream df/modules.py.
+
+    Weight is (G, I/G, H/G) and the input is reshaped to (B, T, G, I/G) before
+    an einsum, so each group only sees its own slice of the feature axis.  With
+    G groups this is G x fewer parameters than a dense Linear of the same
+    shape; upstream uses G=16 everywhere except the encoder's DF projection,
+    which uses G=32.
+
+    Note there is deliberately NO bias (upstream registers only 'weight'), and
+    kaiming init on the 3-D weight makes torch use fan_in = (I/G)*(H/G).
     """
-    Simple GRU wrapper that supports groups=1 (standard) or groups>1 (split-concat).
-    Default groups=1 matches DFN2's default gru_groups=1.
-    """
-    def __init__(self, input_size, hidden_size, num_layers=1, groups=1, batch_first=True):
+
+    def __init__(self, input_size, hidden_size, groups=1):
         super().__init__()
-        assert input_size % groups == 0 and hidden_size % groups == 0
-        self.groups = groups
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        chunk_in  = input_size  // groups
-        chunk_hid = hidden_size // groups
-        self.grus = nn.ModuleList([
-            nn.GRU(chunk_in, chunk_hid, num_layers, batch_first=batch_first)
-            for _ in range(groups)
-        ])
+        assert input_size % groups == 0, f"{input_size} not divisible by {groups}"
+        assert hidden_size % groups == 0, f"{hidden_size} not divisible by {groups}"
+        self.input_size, self.hidden_size, self.groups = input_size, hidden_size, groups
+        self.ws = input_size // groups
+        self.weight = nn.Parameter(
+            torch.zeros(groups, input_size // groups, hidden_size // groups)
+        )
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+
+    def forward(self, x):
+        b, t, _ = x.shape
+        x = x.view(b, t, self.groups, self.ws)
+        x = torch.einsum("btgi,gih->btgh", x, self.weight)
+        return x.flatten(2, 3)
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}(input_size={self.input_size}, "
+                f"hidden_size={self.hidden_size}, groups={self.groups})")
+
+
+class SqueezedGRU_S(nn.Module):
+    """Grouped-linear squeeze -> GRU -> optional grouped-linear expand.
+
+    Upstream df/modules.py.  The GRU itself is always hidden->hidden; the
+    512<->256 width change is done by the bias-free GroupedLinearEinsum pair,
+    which is why upstream's GRUs are all 256->256 while its embedding bus is
+    512 wide.  ``_S`` places the optional skip on the raw input AFTER
+    linear_out (DFN2's plain SqueezedGRU added it before).
+    """
+
+    def __init__(self, input_size, hidden_size, output_size=None, num_layers=1,
+                 linear_groups=8, batch_first=True, gru_skip_op=None,
+                 linear_act_layer=nn.Identity):
+        super().__init__()
+        self.linear_in = nn.Sequential(
+            GroupedLinearEinsum(input_size, hidden_size, linear_groups),
+            linear_act_layer(),
+        )
+        self.gru = nn.GRU(hidden_size, hidden_size, num_layers=num_layers,
+                          batch_first=batch_first)
+        self.gru_skip = gru_skip_op() if gru_skip_op is not None else None
+        if output_size is not None:
+            self.linear_out = nn.Sequential(
+                GroupedLinearEinsum(hidden_size, output_size, linear_groups),
+                linear_act_layer(),
+            )
+        else:
+            self.linear_out = nn.Identity()
 
     def forward(self, x, h=None):
-        """x: (B, T, input_size) → (B, T, hidden_size)"""
-        chunks = x.chunk(self.groups, dim=-1)
-        if h is None:
-            hs = [None] * self.groups
-        else:
-            hs = h.chunk(self.groups, dim=-1)
-
-        outs, new_hs = [], []
-        for i, (gru, xi) in enumerate(zip(self.grus, chunks)):
-            hi = hs[i].contiguous() if hs[i] is not None else None
-            yi, new_hi = gru(xi, hi)
-            outs.append(yi)
-            new_hs.append(new_hi)
-
-        return torch.cat(outs, dim=-1), torch.cat(new_hs, dim=-1)
+        x = self.linear_in(x)
+        y, h = self.gru(x, h)
+        y = self.linear_out(y)
+        if self.gru_skip is not None:
+            y = y + self.gru_skip(x)
+        return y, h
 
 
 # ============================================================
@@ -215,41 +311,57 @@ class GroupedGRU(nn.Module):
 # ============================================================
 
 class DFN2Encoder(nn.Module):
-    def __init__(self, n_erb, df_bins, enc_ch=16, emb_size=256,
-                 gru_groups=1, conv_kernel=(1, 3), conv_kernel_inp=(3, 3),
-                 mask_lookahead=1):
+    def __init__(self, n_erb, df_bins, enc_ch=64, emb_size=256,
+                 conv_kernel=(1, 3), conv_kernel_inp=(3, 3),
+                 mask_lookahead=1, lin_groups=16, enc_lin_groups=32,
+                 enc_concat=False):
         super().__init__()
         # ERB path.  Only this input convolution uses temporal context.
         self.erb_conv0 = LookaheadConv2d(
             1, enc_ch, conv_kernel_inp, lookahead=mask_lookahead,
         )
-        self.erb_conv1 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 2),
-                                          padding=(0, conv_kernel[1] // 2))
-        self.erb_conv2 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 2),
-                                          padding=(0, conv_kernel[1] // 2))
-        self.erb_conv3 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 1),
-                                          padding=(0, conv_kernel[1] // 2))
+        self.erb_conv1 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 2))
+        self.erb_conv2 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 2))
+        self.erb_conv3 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 1))
 
         # DF path
         self.df_conv0 = LookaheadConv2d(
             2, enc_ch, conv_kernel_inp, lookahead=mask_lookahead,
         )
-        self.df_conv1 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 2),
-                                         padding=(0, conv_kernel[1] // 2))
+        self.df_conv1 = SeparableConv2d(enc_ch, enc_ch, conv_kernel, stride=(1, 2))
 
-        # Embedding dimensions
-        # n_erb//4 because erb_conv1 and erb_conv2 each halve freq
-        erb_feat_dim = enc_ch * (n_erb // 4)
-        df_feat_dim  = enc_ch * (df_bins // 2)
+        # Embedding bus is enc_ch * n_erb//4 (n_erb//4 because erb_conv1 and
+        # erb_conv2 each halve the frequency axis).  At the upstream conv_ch=64
+        # this is 512, NOT emb_size.
+        self.emb_in_dim = enc_ch * (n_erb // 4)
+        df_feat_dim = enc_ch * (df_bins // 2)
 
-        self.erb_fc = nn.Linear(erb_feat_dim, emb_size, bias=False)
-        self.df_fc  = nn.Linear(df_feat_dim,  emb_size, bias=False)
-        self.emb_fc = nn.Sequential(
-            nn.Linear(2 * emb_size, emb_size, bias=False), nn.ReLU()
+        # Upstream has NO projection on the ERB branch: e3 is flattened and fed
+        # straight into `combine`.  Only the DF branch is projected, and with
+        # enc_lin_groups (32) rather than lin_groups.
+        self.df_fc_emb = nn.Sequential(
+            GroupedLinearEinsum(df_feat_dim, self.emb_in_dim, groups=enc_lin_groups),
+            nn.ReLU(inplace=True),
         )
-        self.gru_emb = GroupedGRU(emb_size, emb_size, num_layers=2,
-                                   groups=gru_groups, batch_first=True)
-        self.lsnr_fc = nn.Sequential(nn.Linear(emb_size, 1), nn.Sigmoid())
+        # enc_concat=False upstream -> the two branches are ADDED, so the bus
+        # stays emb_in_dim wide and there is no post-combine projection either.
+        self.enc_concat = enc_concat
+        if enc_concat:
+            self.emb_in_dim *= 2
+
+        # One GRU layer here; the remaining emb_num_layers-1 live in the ERB
+        # decoder.  Upstream hardcodes num_layers=1 at this site even though
+        # emb_num_layers defaults to 2 -- reading that config value as the
+        # encoder's depth is the trap this port previously fell into.
+        self.emb_gru = SqueezedGRU_S(
+            self.emb_in_dim, emb_size, output_size=self.emb_in_dim,
+            num_layers=1, linear_groups=lin_groups, gru_skip_op=None,
+            linear_act_layer=partial(nn.ReLU, inplace=True),
+        )
+        # No lsnr head: upstream trains one with [localsnrloss] factor = 1e-3,
+        # but this port deliberately omits that loss term, so the head would be
+        # untrained dead weight.  (Verified upstream: enc.lsnr_fc weights span
+        # -3.72..+1.35, far outside their +-0.0442 init bound, i.e. trained.)
 
     def forward(self, feat_erb, feat_spec):
         """
@@ -266,20 +378,29 @@ class DFN2Encoder(nn.Module):
         c0 = self.df_conv0(feat_spec)    # (B, enc_ch, T, df_bins)
         c1 = self.df_conv1(c0)           # (B, enc_ch, T, df_bins//2)
 
-        # Flatten and project to embedding
+        # Flatten.  The ERB branch goes into `combine` UNPROJECTED (upstream
+        # has no counterpart to the old erb_fc); only the DF branch is
+        # projected, down to the same width.
+        # Frequency-major: (B, C, T, F) -> (B, T, F, C) -> flatten.  Upstream
+        # does exactly this (`e3.permute(0, 2, 3, 1).flatten(2)`), and the ERB
+        # decoder's `emb.view(b, t, f8, -1)` only reconstitutes the spatial map
+        # correctly under this layout.  Channel-major flattening has the same
+        # parameter count but hands GroupedLinearEinsum a different partition:
+        # F-major makes each group a contiguous frequency span, C-major makes
+        # it a set of channels spanning all frequencies.
         B, _, T, _ = e3.shape
-        e3_flat = e3.permute(0, 2, 1, 3).reshape(B, T, -1)   # (B, T, enc_ch * n_erb//4)
-        c1_flat = c1.permute(0, 2, 1, 3).reshape(B, T, -1)   # (B, T, enc_ch * df_bins//2)
+        e3_flat = e3.permute(0, 2, 3, 1).reshape(B, T, -1)   # (B, T, n_erb//4 * enc_ch)
+        c1_flat = c1.permute(0, 2, 3, 1).reshape(B, T, -1)   # (B, T, df_bins//2 * enc_ch)
 
-        erb_emb = self.erb_fc(e3_flat)   # (B, T, emb_size)
-        df_emb  = self.df_fc(c1_flat)    # (B, T, emb_size)
+        df_emb = self.df_fc_emb(c1_flat)                     # (B, T, emb_in_dim)
+        if self.enc_concat:
+            emb = torch.cat([e3_flat, df_emb], dim=-1)
+        else:
+            emb = e3_flat + df_emb                           # upstream default
 
-        emb = torch.cat([erb_emb, df_emb], dim=-1)   # (B, T, 2*emb_size)
-        emb = self.emb_fc(emb)                        # (B, T, emb_size)
-        emb, _ = self.gru_emb(emb)                   # (B, T, emb_size)
-        lsnr = self.lsnr_fc(emb)                     # (B, T, 1)
+        emb, _ = self.emb_gru(emb)                           # (B, T, emb_in_dim)
 
-        return e0, e1, e2, e3, emb, c0, lsnr
+        return e0, e1, e2, e3, emb, c0
 
 
 # ============================================================
@@ -287,64 +408,67 @@ class DFN2Encoder(nn.Module):
 # ============================================================
 
 class ERBDecoder(nn.Module):
+    """4-level U-Net decoder: emb -> (B, 1, T, n_erb) sigmoid mask.
+
+    Encoder features enter through 1x1 *pathway* convolutions and are ADDED to
+    the running decoder state, which is upstream's structure (``conv3p`` ..
+    ``conv0p`` in ErbDecoder).  This port previously concatenated the skips and
+    fed 2*enc_ch into each transposed conv.  Concat and pathway+add can be made
+    to agree on parameter count, so nothing about the totals reveals which one
+    is in use -- but they are different functions.
+
+    Note ``convt3`` and ``conv0_out`` are ordinary convolutions, not transposed
+    ones: only the two stride-2 stages upsample the frequency axis.
     """
-    4-level U-Net decoder: emb → (B,1,T,n_erb) sigmoid mask.
-    Skip connections from encoder (e3, e2, e1, e0) concatenated at each level.
-    """
-    def __init__(self, n_erb, enc_ch=16, emb_size=256, conv_kernel=(1, 3)):
+
+    def __init__(self, n_erb, enc_ch=64, emb_size=256, conv_kernel=(1, 3),
+                 emb_num_layers=3, lin_groups=16, convt_kernel=None):
         super().__init__()
-        # Project embedding back to spatial representation
-        self.emb_fc = nn.Linear(emb_size, enc_ch * (n_erb // 4), bias=False)
+        emb_dim = enc_ch * (n_erb // 4)
 
-        # Derive output_padding for each stride-2 transposed conv so shapes match
-        # the skip connection tensors from the encoder.
-        # ConvTranspose2d(kernel=1,3; stride=1,2; padding=0,1) gives:
-        #   F_out = (F_in - 1)*2 - 2*1 + 3 + op = 2*F_in - 1 + op
-        # We need F_out to equal the corresponding encoder skip size.
-        n_erb_4   = n_erb // 4
-        n_erb_2   = n_erb // 2
-        # dc2: input F = n_erb_4 = 8, skip target = n_erb_2 = 16
-        op  = 1 if (2 * n_erb_4 - 1) < n_erb_2 else 0
-        # dc1: input F = n_erb_2 = 16, skip target = n_erb = 32
-        op2 = 1 if (2 * n_erb_2 - 1) < n_erb else 0
-
-        p = conv_kernel[1] // 2
-
-        # dc3: no freq upsampling, skip from e3
-        self.dc3 = SeparableConvTranspose2d(enc_ch * 2, enc_ch, conv_kernel,
-                                             padding=(0, p))
-        # dc2: freq × 2, skip from e2
-        self.dc2 = SeparableConvTranspose2d(enc_ch * 2, enc_ch, conv_kernel,
-                                             stride=(1, 2), padding=(0, p),
-                                             output_padding=(0, op))
-        # dc1: freq × 2, skip from e1
-        self.dc1 = SeparableConvTranspose2d(enc_ch * 2, enc_ch, conv_kernel,
-                                             stride=(1, 2), padding=(0, p),
-                                             output_padding=(0, op2))
-        # dc0: no freq upsampling, skip from e0 → single channel mask
-        self.dc0 = nn.Sequential(
-            nn.ConvTranspose2d(enc_ch * 2, 1, conv_kernel,
-                               padding=(0, p), bias=False),
-            nn.BatchNorm2d(1),
-            nn.Sigmoid(),
+        # THE decoder recurrence.  Upstream splits emb_num_layers between the
+        # encoder (a hardcoded 1) and here (emb_num_layers - 1); this port
+        # previously put both layers in the encoder and left the ERB decoder
+        # with no recurrence at all.
+        self.emb_gru = SqueezedGRU_S(
+            emb_dim, emb_size, output_size=emb_dim,
+            num_layers=max(1, emb_num_layers - 1), linear_groups=lin_groups,
+            gru_skip_op=None, linear_act_layer=partial(nn.ReLU, inplace=True),
         )
+        # DFN3 uses a separate convt_kernel; DFN2 reused conv_kernel.
+        convt_kernel = convt_kernel or conv_kernel
+
+        # Pathway convs are 1x1, so `max(kernel) == 1` disables the pointwise
+        # stage while groups stays gcd(C, C) = C: a depthwise per-channel
+        # scale, exactly as upstream builds it.
+        self.conv3p = SeparableConv2d(enc_ch, enc_ch, (1, 1))
+        self.convt3 = SeparableConv2d(enc_ch, enc_ch, conv_kernel)
+        self.conv2p = SeparableConv2d(enc_ch, enc_ch, (1, 1))
+        self.convt2 = SeparableConvTranspose2d(enc_ch, enc_ch, convt_kernel,
+                                               stride=(1, 2))
+        self.conv1p = SeparableConv2d(enc_ch, enc_ch, (1, 1))
+        self.convt1 = SeparableConvTranspose2d(enc_ch, enc_ch, convt_kernel,
+                                               stride=(1, 2))
+        self.conv0p = SeparableConv2d(enc_ch, enc_ch, (1, 1))
+        self.conv0_out = SeparableConv2d(enc_ch, 1, conv_kernel,
+                                         act_layer=nn.Sigmoid)
 
         self.enc_ch = enc_ch
-        self.n_erb_4 = n_erb_4
+        self.n_erb_4 = n_erb // 4
 
     def forward(self, emb, e3, e2, e1, e0):
-        """emb: (B, T, emb_size); e0..e3: (B, enc_ch, T, *)"""
+        """emb: (B, T, enc_ch*n_erb//4); e0..e3: (B, enc_ch, T, *)"""
         B, T, _ = emb.shape
-        # Reshape emb to spatial
-        x = self.emb_fc(emb)                           # (B, T, enc_ch*n_erb//4)
-        x = x.reshape(B, T, self.enc_ch, self.n_erb_4)
-        x = x.permute(0, 2, 1, 3)                      # (B, enc_ch, T, n_erb//4)
+        x, _ = self.emb_gru(emb)                       # (B, T, n_erb//4 * enc_ch)
+        # Frequency-major, matching the encoder's flatten and upstream's
+        # `emb.view(b, t, f8, -1).permute(0, 3, 1, 2)`.
+        x = x.reshape(B, T, self.n_erb_4, self.enc_ch)
+        x = x.permute(0, 3, 1, 2)                      # (B, enc_ch, T, n_erb//4)
 
-        x = self.dc3(torch.cat([x, e3], dim=1))        # (B, enc_ch, T, n_erb//4)
-        x = self.dc2(torch.cat([x, e2], dim=1))        # (B, enc_ch, T, n_erb//2)
-        x = self.dc1(torch.cat([x, e1], dim=1))        # (B, enc_ch, T, n_erb)
-        x = self.dc0(torch.cat([x, e0], dim=1))        # (B, 1, T, n_erb)
-        return x
+        x = self.convt3(self.conv3p(e3) + x)           # (B, enc_ch, T, n_erb//4)
+        x = self.convt2(self.conv2p(e2) + x)           # (B, enc_ch, T, n_erb//2)
+        x = self.convt1(self.conv1p(e1) + x)           # (B, enc_ch, T, n_erb)
+        return self.conv0_out(self.conv0p(e0) + x)     # (B, 1, T, n_erb)
 
 
 # ============================================================
@@ -353,51 +477,77 @@ class ERBDecoder(nn.Module):
 
 class DFDecoder(nn.Module):
     """
-    Per-frame, per-bin FIR filter coefficients + alpha blend weight.
-    Returns coefs: (B, T, df_bins, df_order*2) and alpha: (B, T, 1).
+    Per-frame, per-bin FIR filter coefficients.  DFN2's alpha blend weight is
+    gone: DFN3 splits the spectrum by band instead of blending, so there is
+    nothing for an alpha to weigh.
     """
-    def __init__(self, df_bins, df_order, df_hidden=256, emb_size=256,
-                 enc_ch=16, conv_kernel=(1, 3), num_layers=3, gru_groups=1):
+    def __init__(self, df_bins, df_order, df_hidden=256, emb_in_dim=512,
+                 enc_ch=64, conv_kernel=(1, 3), num_layers=2, lin_groups=16,
+                 df_gru_skip='groupedlinear', pathway_kernel_size_t=5):
         super().__init__()
         self.df_bins = df_bins
         self.df_order = df_order
         df_out_ch = df_order * 2   # real + imag
 
-        self.df_gru = GroupedGRU(emb_size, df_hidden, num_layers=num_layers,
-                                  groups=gru_groups, batch_first=True)
-        # Residual c0 path: (B, enc_ch, T, df_bins) → permute → (B, T, df_bins, enc_ch) → fc
-        self.df_convp = SeparableConv2d(enc_ch, df_out_ch, conv_kernel,
-                                         padding=(0, conv_kernel[1] // 2))
-        self.df_out  = nn.Sequential(
-            nn.Linear(df_hidden, df_bins * df_out_ch), nn.Tanh()
+        # ⚠ linear_groups is NOT passed here: upstream relies on
+        # SqueezedGRU_S's own default of 8 at this one site, while the encoder
+        # and ERB decoder use 16.  Checkpoint-confirmed
+        # (df_dec.df_gru.linear_in.0.weight has shape (8, 64, 32)).
+        # Do NOT "fix" this to lin_groups.
+        self.df_gru = SqueezedGRU_S(
+            emb_in_dim, df_hidden, num_layers=num_layers, gru_skip_op=None,
+            linear_act_layer=partial(nn.ReLU, inplace=True),
         )
+
+        # Residual path from the embedding into the DF decoder.
+        assert df_gru_skip in ('none', 'identity', 'groupedlinear')
+        if df_gru_skip == 'none':
+            self.df_skip = None
+        elif df_gru_skip == 'identity':
+            assert emb_in_dim == df_hidden, "identity skip needs matching dims"
+            self.df_skip = nn.Identity()
+        else:
+            self.df_skip = GroupedLinearEinsum(emb_in_dim, df_hidden, groups=lin_groups)
+
+        # Pathway conv over the DF encoder output, kernel (kt, 1) with causal pad.
+        kt = pathway_kernel_size_t
+        self.df_convp = SeparableConv2d(enc_ch, df_out_ch, (kt, 1))
+        self.df_out = nn.Sequential(
+            GroupedLinearEinsum(df_hidden, df_bins * df_out_ch, groups=lin_groups),
+            nn.Tanh(),
+        )
+        # Not used by forward -- but released DeepFilterNet3 still carries it,
+        # and its 257 parameters are inside the 2,135,484 this port reconciles
+        # against (ours = 2,135,484 - 513 for the removed lsnr head).  Deleting
+        # it would silently break that reconciliation, which is the only check
+        # that the architecture realignment is complete.
         self.df_fc_a = nn.Sequential(nn.Linear(df_hidden, 1), nn.Sigmoid())
 
     def forward(self, emb, c0):
         """
-        emb : (B, T, emb_size)
+        emb : (B, T, emb_in_dim)
         c0  : (B, enc_ch, T, df_bins)
         Returns:
             coefs : (B, T, df_bins, df_order*2)
-            alpha : (B, T, 1)
         """
         b, t, _ = emb.shape
         c, _ = self.df_gru(emb)                             # (B, T, df_hidden)
+        if self.df_skip is not None:
+            c = c + self.df_skip(emb)
 
         # c0 residual: conv → (B, df_out_ch, T, df_bins) → permute → (B, T, df_bins, df_out_ch)
         c0_res = self.df_convp(c0).permute(0, 2, 3, 1)     # (B, T, df_bins, df_order*2)
 
-        alpha = self.df_fc_a(c)                              # (B, T, 1)
         c_out = self.df_out(c)                               # (B, T, df_bins * df_order*2)
         coefs = c_out.view(b, t, self.df_bins, self.df_order * 2) + c0_res
-        return coefs, alpha
+        return coefs
 
 
 # ============================================================
 # Deep Filter Apply
 # ============================================================
 
-def deep_filter_apply(spec, coefs, alpha, df_bins, df_order, df_lookahead=0):
+def deep_filter_apply(spec, coefs, df_bins, df_order, df_lookahead=0):
     """
     Apply a per-bin FIR filter to the lowest df_bins of spec.
 
@@ -409,7 +559,6 @@ def deep_filter_apply(spec, coefs, alpha, df_bins, df_order, df_lookahead=0):
     Args:
         spec   : (B, n_bins, T) complex
         coefs  : (B, T, df_bins, df_order*2)
-        alpha  : (B, T, 1) blend weight
         df_bins: int
         df_order: int
         df_lookahead: number of future masked-spectrum frames used by the FIR
@@ -445,10 +594,8 @@ def deep_filter_apply(spec, coefs, alpha, df_bins, df_order, df_lookahead=0):
 
     df_out = torch.view_as_complex(torch.stack([df_re, df_im], dim=-1))  # (B, df_bins, T)
 
-    # Alpha blend: alpha is (B, T, 1) → permute to (B, 1, T) for broadcast over df_bins
-    alpha_t = alpha.permute(0, 2, 1)   # (B, 1, T)
     out = spec.clone()
-    out[:, :df_bins] = alpha_t * df_out + (1 - alpha_t) * spec[:, :df_bins]
+    out[:, :df_bins] = df_out
     return out
 
 
@@ -470,8 +617,12 @@ class DeepFilterNet2(nn.Module):
         erb_mask      : (B, 1, T, n_erb)
     """
     def __init__(self, n_fft=512, sr=16000, n_erb=32, df_bins=64, df_order=5,
-                 enc_ch=16, emb_size=256, df_hidden=256, df_num_layers=3,
-                 gru_groups=1, mask_lookahead=1, df_lookahead=0):
+                 enc_ch=64, emb_size=256, df_hidden=256, df_num_layers=2,
+                 mask_lookahead=1, df_lookahead=0,
+                 emb_num_layers=3, lin_groups=16, enc_lin_groups=32,
+                 enc_concat=False, df_gru_skip='groupedlinear',
+                 df_pathway_kernel_size_t=5, conv_kernel=(1, 3),
+                 conv_kernel_inp=(3, 3), convt_kernel=(1, 3)):
         super().__init__()
         n_bins = n_fft // 2 + 1
 
@@ -498,13 +649,24 @@ class DeepFilterNet2(nn.Module):
         self.register_buffer('erb_inv', erb_inv)  # (n_erb, n_bins) indicator
 
         self.encoder = DFN2Encoder(
-            n_erb, df_bins, enc_ch, emb_size, gru_groups,
-            mask_lookahead=mask_lookahead,
+            n_erb, df_bins, enc_ch, emb_size,
+            conv_kernel=conv_kernel, conv_kernel_inp=conv_kernel_inp,
+            mask_lookahead=mask_lookahead, lin_groups=lin_groups,
+            enc_lin_groups=enc_lin_groups, enc_concat=enc_concat,
         )
-        self.erb_dec  = ERBDecoder(n_erb, enc_ch, emb_size)
-        self.df_dec   = DFDecoder(df_bins, df_order, df_hidden, emb_size,
-                                   enc_ch, num_layers=df_num_layers,
-                                   gru_groups=gru_groups)
+        # The embedding bus is enc_ch * n_erb//4 wide (512 at the upstream
+        # conv_ch=64), NOT emb_size -- emb_size is only the GRU hidden width.
+        emb_in_dim = self.encoder.emb_in_dim
+        self.erb_dec = ERBDecoder(n_erb, enc_ch, emb_size, conv_kernel,
+                                  emb_num_layers=emb_num_layers,
+                                  lin_groups=lin_groups,
+                                  convt_kernel=convt_kernel)
+        self.df_dec  = DFDecoder(df_bins, df_order, df_hidden, emb_in_dim,
+                                 enc_ch, conv_kernel,
+                                 num_layers=df_num_layers,
+                                 lin_groups=lin_groups,
+                                 df_gru_skip=df_gru_skip,
+                                 pathway_kernel_size_t=df_pathway_kernel_size_t)
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"DeepFilterNet2: {n_params:,} trainable parameters")
@@ -515,19 +677,27 @@ class DeepFilterNet2(nn.Module):
         feat_erb  : (B, 1, T, n_erb)
         feat_spec : (B, 2, T, df_bins)
         """
-        e0, e1, e2, e3, emb, c0, lsnr = self.encoder(feat_erb, feat_spec)
+        e0, e1, e2, e3, emb, c0 = self.encoder(feat_erb, feat_spec)
 
-        # ERB mask → expand to per-bin
+        # ERB mask → expand to per-bin.  Only the bins at or above df_bins
+        # survive the band split below, so the mask is expanded over that slice
+        # alone; the lower bins would be computed and then overwritten.
         erb_mask = self.erb_dec(emb, e3, e2, e1, e0)   # (B, 1, T, n_erb)
-        bin_mask = erb_mask.squeeze(1).matmul(self.erb_inv)   # (B, T, n_bins)
-        bin_mask = bin_mask.permute(0, 2, 1)                  # (B, n_bins, T) — NOT .T
-        spec = spec * bin_mask
+        bin_mask = erb_mask.squeeze(1).matmul(self.erb_inv[:, self.df_bins:])
+        bin_mask = bin_mask.permute(0, 2, 1)           # (B, n_bins-df_bins, T) — NOT .T
+        spec_m = spec[:, self.df_bins:] * bin_mask
 
-        # DF filter on low-freq bins
-        coefs, alpha = self.df_dec(emb, c0)
-        spec = deep_filter_apply(
-            spec, coefs, alpha, self.df_bins, self.df_order,
-            self.df_lookahead,
+        # DFN3 composes the two stages as a PARALLEL BAND SPLIT, not a cascade:
+        # the deep filter runs on the *unmasked* spectrum and owns the lowest
+        # df_bins outright, while everything above comes from the ERB mask.
+        # DFN2 instead ran DF on the already-masked spectrum and blended with a
+        # learned alpha.  This costs zero parameters, so no parameter count can
+        # tell you which one you have -- and it is the most behaviourally
+        # significant DFN2->DFN3 change.
+        coefs = self.df_dec(emb, c0)
+        spec_e = deep_filter_apply(
+            spec, coefs, self.df_bins, self.df_order, self.df_lookahead,
         )
+        spec_e[:, self.df_bins:] = spec_m
 
-        return spec, erb_mask
+        return spec_e, erb_mask

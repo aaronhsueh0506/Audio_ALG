@@ -19,7 +19,9 @@ import torch
 import torchaudio
 import tqdm
 
+from checkpoint_utils import extract_state_dict
 from model import GTCRN
+from train import build_contract, require_checkpoint_contract
 
 
 def load_model(args):
@@ -35,10 +37,21 @@ def load_model(args):
 
     device = torch.device('cpu')
     ckpt = torch.load(args.model, map_location=device, weights_only=False)
+    # Enforce the same contract the resume path does.  Shape mismatches are
+    # caught by load_state_dict, but an n_fft or erb_subband change that keeps
+    # the shapes intact would otherwise run silently on the wrong grid.  The
+    # vendored upstream tars record no contract, so they are exempted rather
+    # than rejected.
+    require_checkpoint_contract(ckpt, build_contract(cfg, WIN_LEN, HOP_LEN),
+                                context=args.model, allow_missing=True)
 
     model = GTCRN(erb_subband_1=ERB_SUB1, erb_subband_2=ERB_SUB2,
                   nfft=N_FFT, fs=SR)
-    model.load_state_dict(ckpt['state_dict'])
+    # Local checkpoints (train.py) store weights under 'state_dict'; upstream
+    # gtcrn tars store them under 'model' (see gtcrn_github/infer.py:11, whose
+    # top-level keys are ['epoch', 'optimizer', 'model']).  Accept both so the
+    # vendored published checkpoints load without conversion.
+    model.load_state_dict(extract_state_dict(ckpt, args.model))
     model.eval()
 
     params = dict(SR=SR, N_FFT=N_FFT, WIN_LEN=WIN_LEN, HOP_LEN=HOP_LEN)

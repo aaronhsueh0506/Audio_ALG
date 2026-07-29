@@ -16,8 +16,8 @@ import torch
 import torch.nn as nn
 
 from train import (
-    RNNoiseModel, compute_hybrid_bands, read_feature_config,
-    require_checkpoint_feature_config,
+    RNNoiseModel, read_feature_config,
+    require_checkpoint_feature_config, model_capacity_from_checkpoint,
 )
 
 
@@ -108,39 +108,31 @@ def export(args):
     HYBRID_CUTOFF = cfg.getint('signal', 'hybrid_cutoff_hz', fallback=0)
     N_ERB_HIGH = cfg.getint('signal', 'n_erb_high_bands', fallback=0)
     if HYBRID_CUTOFF > 0 and N_ERB_HIGH > 0:
-        N_FFT = cfg.getint('signal', 'n_fft')
-        SR = cfg.getint('signal', 'sr')
-        _, N_BANDS = compute_hybrid_bands(N_FFT, SR, N_ERB_HIGH, HYBRID_CUTOFF)
-    else:
-        N_BANDS = cfg.getint('signal', 'n_bands')
+        raise NotImplementedError(
+            "hybrid bands are not supported with the faithful DFN/Keras ERB "
+            "filterbank; set hybrid_cutoff_hz=0 to use pure ERB")
+    N_BANDS = cfg.getint('signal', 'n_bands')
 
     ckpt = torch.load(args.model, map_location='cpu', weights_only=False)
     require_checkpoint_feature_config(ckpt, feature_cfg, context=args.model)
-    # 架構容量從 state_dict 形狀推導；feature contract 則由
+    # 架構容量從 checkpoint 取；feature contract 則由
     # require_checkpoint_feature_config 嚴格限定。
     sd = ckpt['state_dict']
-    cond_size = sd['erb_conv.weight'].shape[0]
-    n_bands = sd['erb_conv.weight'].shape[1]
-    spec_conv_channels = sd['spec_conv1.weight'].shape[0]
-    spec_embed_size = sd['spec_proj.weight'].shape[0]
-    gru_size = sd['gru1.weight_ih_l0'].shape[0] // 3
-    if n_bands != N_BANDS:
-        print(f"  ⚠ ckpt n_bands={n_bands} 與 config n_bands={N_BANDS} 不符 → 以 ckpt 為準")
-    N_BANDS = n_bands
-    model = RNNoiseModel(
-        n_bands=N_BANDS, spec_bins=feature_cfg['spec_bins'],
-        cond_size=cond_size, gru_size=gru_size,
-        spec_conv_channels=spec_conv_channels,
-        spec_embed_size=spec_embed_size)
+    capacity = model_capacity_from_checkpoint(ckpt)
+    if capacity['n_bands'] != N_BANDS:
+        print(f"  ⚠ ckpt n_bands={capacity['n_bands']} 與 config n_bands={N_BANDS}"
+              f" 不符 → 以 ckpt 為準")
+    N_BANDS = capacity['n_bands']
+    model = RNNoiseModel(spec_bins=feature_cfg['spec_bins'], **capacity)
     model.load_state_dict(sd)
     model.eval()
+    gru_size = model.gru_size
     print(f"Model: n_bands={N_BANDS}, spec_bins={feature_cfg['spec_bins']}, "
-          f"cond_size={cond_size}, gru_size={gru_size}")
+          f"cond_size={capacity['cond_size']}, gru_size={gru_size}, "
+          f"use_complex_input={capacity['use_complex_input']}")
 
     streaming = RNNoiseStreaming(model)
     streaming.eval()
-
-    gru_size = model.gru_size
     erb_input = torch.randn(1, 3, N_BANDS)
     spec_input = torch.randn(1, 3, 2, feature_cfg['spec_bins'])
     h = torch.zeros(1, 1, gru_size)
@@ -267,13 +259,22 @@ def verify_output(streaming, n_bands, spec_bins, gru_size, onnx_path):
             pt_out = streaming(erb_input, spec_input, h, h, h)
 
         sess = ort.InferenceSession(onnx_path)
-        ort_out = sess.run(None, {
-            'erb_input': erb_input.numpy(),
-            'spec_input': spec_input.numpy(),
-            'h1_in': h.numpy(),
-            'h2_in': h.numpy(),
-            'h3_in': h.numpy(),
-        })
+        # Feed whatever the graph actually declares, not a fixed name list.
+        # In a pure-ERB export `spec_input` is dead in the graph, and exporters
+        # are free to prune a dead input -- passing a name the session does not
+        # have is a hard error, so the verification would fail on a perfectly
+        # good model.  (Not reproducible here: `onnx` is not installed, so the
+        # export path itself cannot run in this environment.)
+        available = {i.name for i in sess.get_inputs()}
+        feed = {'erb_input': erb_input.numpy(), 'spec_input': spec_input.numpy(),
+                'h1_in': h.numpy(), 'h2_in': h.numpy(), 'h3_in': h.numpy()}
+        missing = available - set(feed)
+        if missing:
+            raise RuntimeError(f"ONNX graph expects unknown inputs: {sorted(missing)}")
+        dropped = set(feed) - available
+        if dropped:
+            print(f"  note: exporter pruned unused graph input(s): {sorted(dropped)}")
+        ort_out = sess.run(None, {k: v for k, v in feed.items() if k in available})
 
         diff = max(np.abs(pt.detach().numpy() - ort).max()
                    for pt, ort in zip(pt_out, ort_out))

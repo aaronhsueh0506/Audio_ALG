@@ -66,6 +66,11 @@ static void ref_compute_erb_tables(void) {
     const double bw = high_lim / ((double)RNNOISE_N_FFT / 2.0);
 
     {
+        /* DELIBERATE SECOND SOURCE — do not replace with
+         * RNNOISE_MIN_BINS_PER_BAND.  This file re-derives the tables
+         * independently so that a change to the shared constant shows up as a
+         * test failure rather than silently propagating.  Wiring it to the
+         * header would make the check compare the generator against itself. */
 #define MIN_BINS_PER_BAND 2
         double e_lo = freq2erb(0.0), e_hi = freq2erb(high_lim);
         double ideal[RNNOISE_N_BANDS];

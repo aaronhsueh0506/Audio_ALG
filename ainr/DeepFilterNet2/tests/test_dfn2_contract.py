@@ -12,6 +12,15 @@ import torch.nn.functional as F
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
+# Each of the three model projects has its own top-level ``train.py`` (and
+# ``denoise.py``/``model.py``).  Under a single pytest session the first one
+# imported wins ``sys.modules``, so a sibling project's tests would silently
+# exercise the wrong code.  Dropping the cached entries forces the re-import
+# to resolve against the ROOT just inserted above.
+for _stale in ('train', 'denoise', 'model', 'checkpoint_utils'):
+    sys.modules.pop(_stale, None)
+
+
 from model import _build_erb_fb, deep_filter_apply, erb_bandborder  # noqa: E402
 from train import (  # noqa: E402
     FEATURE_VERSION,
@@ -67,18 +76,36 @@ def test_feature_chunk_equivalence_and_independent_states():
 
 
 def test_causal_order_five_uses_current_tap_without_extra_delay():
+    """Tap ordering guard: with only the current-frame tap set, the filter is
+    an identity.  Catches a reversed tap order or a stray conjugation, neither
+    of which shows up in a parameter count.
+
+    (deep_filter_apply lost its `alpha` argument when the composition moved to
+    DFN3's parallel band split: the deep filter now owns the lowest df_bins
+    outright instead of being alpha-blended against the masked spectrum.)
+    """
     spec = torch.complex(
         torch.arange(1, 8, dtype=torch.float32).view(1, 1, 7),
         torch.zeros(1, 1, 7),
     )
     coefs = torch.zeros(1, 7, 1, 10)
-    # Coefficient index four is the current frame for order=5/lookahead=0.
+    # Coefficient index four is the current frame for order=5/lookahead=0;
+    # index 8 is its real part in the interleaved (order, re/im) layout.
     coefs[..., 8] = 1.0
-    alpha = torch.ones(1, 7, 1)
-    actual = deep_filter_apply(
-        spec, coefs, alpha, df_bins=1, df_order=5, df_lookahead=0
-    )
+    actual = deep_filter_apply(spec, coefs, df_bins=1, df_order=5, df_lookahead=0)
     torch.testing.assert_close(actual, spec)
+
+
+def test_deep_filter_leaves_bins_above_df_bins_untouched():
+    """The DF stage must only write the lowest df_bins; everything above is
+    supplied by the ERB mask in the parallel band split."""
+    torch.manual_seed(0)
+    n_bins, T, df_bins, df_order = 8, 5, 3, 5
+    spec = torch.complex(torch.randn(1, n_bins, T), torch.randn(1, n_bins, T))
+    coefs = torch.randn(1, T, df_bins, df_order * 2)
+    out = deep_filter_apply(spec.clone(), coefs, df_bins, df_order, 0)
+    torch.testing.assert_close(out[:, df_bins:], spec[:, df_bins:])
+    assert not torch.allclose(out[:, :df_bins], spec[:, :df_bins])
 
 
 def reference_mrsl(enhanced, clean, loss_cfg):

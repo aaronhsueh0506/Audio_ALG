@@ -71,19 +71,45 @@ def main():
     assert int(macro(header, 'RNNOISE_HOP_LEN').split()[0]) == hop_len
     erb_alpha = c_float(macro(header, 'RNNOISE_ERB_NORM_ALPHA'))
     spec_alpha = c_float(macro(header, 'RNNOISE_SPEC_NORM_ALPHA'))
+    # alpha may be pinned directly (frame-invariant: memory stays 1/(1-alpha)
+    # frames across any sr/hop) or derived from tau (seconds-invariant).  An
+    # explicit alpha wins; 0 or absent means "derive".
+    def expected_alpha(alpha_key, tau_key):
+        explicit = cfg.getfloat('feature', alpha_key, fallback=0.0)
+        if explicit > 0.0:
+            return explicit
+        return norm_alpha(sr, hop_len, cfg.getfloat('feature', tau_key))
+
     assert math.isclose(
-        erb_alpha, norm_alpha(sr, hop_len, cfg.getfloat('feature', 'erb_norm_tau_sec')),
+        erb_alpha, expected_alpha('erb_norm_alpha', 'erb_norm_tau_sec'),
         rel_tol=0.0, abs_tol=1e-7)
     assert math.isclose(
-        spec_alpha, norm_alpha(sr, hop_len, cfg.getfloat('feature', 'spec_norm_tau_sec')),
+        spec_alpha, expected_alpha('spec_norm_alpha', 'spec_norm_tau_sec'),
         rel_tol=0.0, abs_tol=1e-7)
     assert spec_max_hz == cfg.getint('feature', 'spec_max_hz')
     assert spec_bins == spec_max_hz * n_fft // sr + 1
     assert int(macro(header, 'RNNOISE_N_BANDS').split()[0]) == cfg.getint('signal', 'n_bands')
     assert int(macro(header, 'RNNOISE_LOOKAHEAD').split()[0]) == cfg.getint(
         'signal', 'lookahead_frames')
+    # Changing min_bins_per_band moves the ERB band borders, which changes the
+    # filterbank matrices and invalidates every checkpoint and generated table.
+    # It used to be a bare literal in train.py and gen_rnnoise_tables.c with no
+    # guard at all.
+    assert int(macro(header, 'RNNOISE_MIN_BINS_PER_BAND').split()[0]) == cfg.getint(
+        'signal', 'min_bins_per_band', fallback=2)
 
     print(f'PASS: config.ini, train.py and process.h agree on {version}')
+
+
+def test_main():
+    """Expose main() to pytest.
+
+    This file is script-shaped (Makefile runs it directly), so without a
+    ``test_``-prefixed entry point pytest collected ZERO items from it and
+    still reported the run green -- the C/Python parity and feature-contract
+    guards were simply absent from any `pytest` invocation.
+    """
+    main()
 
 
 if __name__ == '__main__':

@@ -10,6 +10,15 @@ import torch
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+# Each of the three model projects has its own top-level ``train.py`` (and
+# ``denoise.py``/``model.py``).  Under a single pytest session the first one
+# imported wins ``sys.modules``, so a sibling project's tests would silently
+# exercise the wrong code.  Dropping the cached entries forces the re-import
+# to resolve against the ROOT just inserted above.
+for _stale in ('train', 'denoise', 'model', 'checkpoint_utils'):
+    sys.modules.pop(_stale, None)
+
+
 from train import (  # noqa: E402
     FEATURE_VERSION,
     RNNoiseModel,
@@ -60,6 +69,10 @@ class DualFeatureTest(unittest.TestCase):
             hop_len=256,
             lookahead_frames=1,
             n_bands=22,
+            # Part of the feature contract: it sets the ERB band borders, so a
+            # checkpoint trained under a different value is incompatible with
+            # the generated C tables.
+            min_bins_per_band=2,
             erb_tau_sec=1.0,
             erb_alpha=self.alpha,
             erb_norm_init_lo_db=-60.0,
@@ -144,7 +157,7 @@ class DualFeatureTest(unittest.TestCase):
 
     def test_feature_state_chunking_and_model_shapes(self):
         feature_cfg = self.feature_cfg()
-        border = erb_bandborder(22, 16000, 512)
+        border = erb_bandborder(22, 16000, 512, 2)
         erb = torch.from_numpy(compute_erb_matrix(border, 512, mode=0))
         rng = np.random.default_rng(3)
         array = rng.normal(size=(2, 257, 17)) + 1j * rng.normal(size=(2, 257, 17))
@@ -189,7 +202,7 @@ class DualFeatureTest(unittest.TestCase):
         # consecutive border gap directly, not just every-other one.
         for n_bands, sr, n_fft in [(22, 16000, 512), (32, 48000, 1024),
                                    (10, 8000, 256), (7, 16000, 512)]:
-            border = erb_bandborder(n_bands, sr, n_fft)
+            border = erb_bandborder(n_bands, sr, n_fft, 2)
             widths = np.diff(border)
             self.assertTrue((widths >= 2).all(),
                             f'{n_bands}/{sr}/{n_fft}: widths={widths.tolist()}')

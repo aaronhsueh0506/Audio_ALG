@@ -60,7 +60,11 @@ static void compute_erb_tables(void) {
      * (nb[i+2]-nb[i]>=2, 只檢查 i, i+2, 不檢查 i, i+1) —— 該規則實測在
      * sr=16000/n_fft=512/N=22 時仍會產生寬度僅 1 bin 的 band。 */
     {
-#define MIN_BINS_PER_BAND 2
+        /* Single source of truth: process.h mirrors config.ini's
+         * [signal] min_bins_per_band, and tests/test_feature_contract.py
+         * asserts the two agree.  (test_rnnoise_tables.c deliberately keeps
+         * its own literal — it is the independent drift guard.) */
+#define MIN_BINS_PER_BAND RNNOISE_MIN_BINS_PER_BAND
         double e_lo = freq2erb(0.0), e_hi = freq2erb(high_lim);
         double ideal[RNNOISE_N_BANDS];
         for (int i = 0; i < N; i++) {
