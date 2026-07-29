@@ -17,8 +17,28 @@ def macro(text, name):
     return match.group(1).strip()
 
 
+_C_FLOAT = re.compile(r"""^[+-]?(
+      \d+\.\d*([eE][+-]?\d+)?    # 1.  1.5  1.5e3
+    | \.\d+([eE][+-]?\d+)?        # .5
+    | \d+[eE][+-]?\d+              # 1e5
+)[fF]?$""", re.VERBOSE)
+
+
 def c_float(text):
-    return float(text.strip('()').rstrip('fF'))
+    """Parse a C float macro, rejecting literals a C compiler would not accept.
+
+    The `f` suffix requires a FLOATING constant, so `-20f` is a syntax error
+    while `-20.0f` is fine.  This check used to just strip the suffix and call
+    float(), which accepts both -- so a header that could not compile still
+    passed the contract test.  Only the builds that #include process.h caught
+    it, and those are not what this file is guarding.
+    """
+    body = text.strip().strip('()').strip()
+    if not _C_FLOAT.match(body):
+        raise AssertionError(
+            f"{text!r} is not a valid C floating constant "
+            f"(an `f` suffix needs a decimal point or exponent)")
+    return float(body.rstrip('fF'))
 
 
 def norm_alpha(sr, hop_len, tau):

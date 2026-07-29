@@ -118,8 +118,8 @@ output_dir = ./output
 | `[audio] segment_sec` | 3.0 | 每筆訓練音檔長度 (秒) |
 | `[rir] p_rir` | 0.1 | 套用 RIR 的機率 |
 | `[feature] erb_norm_tau_sec` | 1.0 | ERB per-band mean EMA 時間常數 |
-| `[feature] erb_norm_init_lo_db` | -60.0 | 最低 ERB band EMA 初值 |
-| `[feature] erb_norm_init_hi_db` | -90.0 | 最高 ERB band EMA 初值 |
+| `[feature] erb_norm_init_lo_db` | -20 | 最低 ERB band EMA 初值 |
+| `[feature] erb_norm_init_hi_db` | -45 | 最高 ERB band EMA 初值 |
 | `[feature] erb_norm_scale_db` | 40.0 | mean-subtracted ERB 縮放尺度 |
 | `[feature] spec_max_hz` | 4000 | complex branch 頻率上限 |
 | `[feature] spec_norm_tau_sec` | 1.0 | complex per-bin magnitude EMA 時間常數 |

@@ -49,6 +49,15 @@ extern "C" {
  * gen_rnnoise_tables.c (see that file for the algorithm; train.py's
  * erb_bandborder() is the Python side of the same fix) -- changes the
  * erb_fwd/erb_inv tables below.
+ * v8 replaces libDF's imported normaliser init with values measured on this
+ *     project's own 16 kHz corpus.  -60/-90 dB and 0.001/0.0001 are calibrated
+ *     for libDF's rectangular, energy-MEAN filterbank; this port sums over a
+ *     triangular overlapping bank, so those constants started the EMA
+ *     +35..+48 dB away from where the features actually sit.  The ERB pair is
+ *     rounded (fit gave -24.5/-41.9, costing 0.67 dB RMS) because it is in dB;
+ *     the spec pair is NOT rounded past one significant figure because it is a
+ *     linear magnitude the model divides by as x/sqrt(state), where 0.001 vs
+ *     the measured 0.008161 would put features 2.86x out at the top bin.
  * v7 reverts to deriving the decay from tau (1 s), matching upstream libDF's
  *     _calculate_norm_alpha(sr, hop, tau): 16k/hop256 -> 0.984.  Pinning alpha
  *     at 0.99 gave a 1.59 s memory, so a 3 s training segment ended with ~15%
@@ -63,18 +72,18 @@ extern "C" {
  * steady-state distribution -- see calibrate_norm_init.py.  Changing alpha
  * without recalibrating the init reintroduces a warm-up transient that now
  * spans 1.6x the training segment. */
-#define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v7"
+#define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v8"
 #define RNNOISE_ERB_NORM_TAU_SEC          1.0f
 #define RNNOISE_ERB_NORM_ALPHA            0.984f
-#define RNNOISE_ERB_NORM_INIT_LO_DB     (-60.0f)
-#define RNNOISE_ERB_NORM_INIT_HI_DB     (-90.0f)
+#define RNNOISE_ERB_NORM_INIT_LO_DB     (-20.0f)
+#define RNNOISE_ERB_NORM_INIT_HI_DB     (-45.0f)
 #define RNNOISE_ERB_NORM_SCALE_DB        40.0f
 #define RNNOISE_SPEC_MAX_HZ            4000
 #define RNNOISE_SPEC_BINS               129
 #define RNNOISE_SPEC_NORM_TAU_SEC         1.0f
 #define RNNOISE_SPEC_NORM_ALPHA           0.984f
-#define RNNOISE_SPEC_NORM_INIT_LO          0.001f
-#define RNNOISE_SPEC_NORM_INIT_HI          0.0001f
+#define RNNOISE_SPEC_NORM_INIT_LO          0.04f
+#define RNNOISE_SPEC_NORM_INIT_HI          0.008f
 #define RNNOISE_SPEC_NORM_EPS              1e-12f
 
 /* 處理狀態 (呼叫端分配，跨 frame 保持) */

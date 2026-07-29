@@ -61,7 +61,7 @@ from dataset_gen import (  # noqa: E402
 # compute_erb_bands(). This changes the ERB filterbank matrices
 # (erb_fwd/erb_inv / nfftborder), hence the resulting features, even though
 # input/output dimensions are unchanged.
-FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v7'
+FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v8'
 LOSS_VERSION = 'erb_irm_only_v4'
 # v2 (2026-07-29), three changes that together invalidate v1 checkpoints:
 #   * fft_sizes 256,512,1024,2048 -> 128,256,512,1024, i.e. {n_fft/4, n_fft/2,
@@ -249,15 +249,15 @@ def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
         win_len = n_fft
     erb_tau_sec = cfg.getfloat('feature', 'erb_norm_tau_sec', fallback=1.0)
     erb_norm_init_lo_db = cfg.getfloat(
-        'feature', 'erb_norm_init_lo_db', fallback=-60.0)
+        'feature', 'erb_norm_init_lo_db', fallback=-20)
     erb_norm_init_hi_db = cfg.getfloat(
-        'feature', 'erb_norm_init_hi_db', fallback=-90.0)
+        'feature', 'erb_norm_init_hi_db', fallback=-45)
     erb_norm_scale_db = cfg.getfloat(
         'feature', 'erb_norm_scale_db', fallback=40.0)
     spec_max_hz = cfg.getint('feature', 'spec_max_hz', fallback=4000)
     spec_tau_sec = cfg.getfloat('feature', 'spec_norm_tau_sec', fallback=1.0)
-    spec_norm_init_lo = cfg.getfloat('feature', 'spec_norm_init_lo', fallback=0.001)
-    spec_norm_init_hi = cfg.getfloat('feature', 'spec_norm_init_hi', fallback=0.0001)
+    spec_norm_init_lo = cfg.getfloat('feature', 'spec_norm_init_lo', fallback=0.04)
+    spec_norm_init_hi = cfg.getfloat('feature', 'spec_norm_init_hi', fallback=0.008)
     spec_norm_eps = cfg.getfloat('feature', 'spec_norm_eps', fallback=1e-12)
     if (win_len <= 0 or win_len > n_fft or hop_len <= 0 or
             erb_tau_sec <= 0 or erb_norm_scale_db <= 0 or
@@ -644,7 +644,7 @@ def valid_region(win_len, hop_len):
 
 
 def normalize_log_erb(erb_db, norm_state=None, norm_alpha: float = 0.984,
-                      init_lo_db: float = -60.0, init_hi_db: float = -90.0,
+                      init_lo_db: float = -20, init_hi_db: float = -45,
                       scale_db: float = 40.0):
     """Original DeepFilterNet causal per-band mean normalisation.
 
@@ -675,7 +675,7 @@ def normalize_log_erb(erb_db, norm_state=None, norm_alpha: float = 0.984,
 
 
 def normalize_complex_spectrum(spec_low, norm_state=None, norm_alpha: float = 0.984,
-                               init_lo: float = 0.001, init_hi: float = 0.0001,
+                               init_lo: float = 0.04, init_hi: float = 0.008,
                                eps: float = 1e-12):
     """Original DeepFilterNet per-bin magnitude EMA norm.
 

@@ -63,7 +63,7 @@ from dataset_gen import (  # noqa: E402
 # form both total 14,210 conv parameters here -- identical numbers, different
 # functions, which is precisely why the version string has to carry it.
 MODEL_VERSION = 'dfn3_fmajor_flatten_pathway_add_no_lsnr_v5'
-FEATURE_VERSION = 'dfn2_dual_ema_state_v2'
+FEATURE_VERSION = 'dfn2_dual_ema_state_calibrated_v3'
 LOSS_VERSION = 'dfn_mrsl_mag_complex_gamma_v2'
 
 
@@ -236,10 +236,10 @@ def read_feature_config(cfg, sr, hop_len):
         'erb_tau_sec': erb_tau,
         'erb_alpha': make_norm_alpha(sr, hop_len, erb_tau),
         'erb_init_lo_db': cfg.getfloat(
-            section, 'erb_norm_init_lo_db', fallback=-60.0
+            section, 'erb_norm_init_lo_db', fallback=-15
         ),
         'erb_init_hi_db': cfg.getfloat(
-            section, 'erb_norm_init_hi_db', fallback=-90.0
+            section, 'erb_norm_init_hi_db', fallback=-60
         ),
         'erb_scale_db': cfg.getfloat(
             section, 'erb_norm_scale_db', fallback=40.0
@@ -247,10 +247,10 @@ def read_feature_config(cfg, sr, hop_len):
         'spec_tau_sec': spec_tau,
         'spec_alpha': make_norm_alpha(sr, hop_len, spec_tau),
         'spec_init_lo': cfg.getfloat(
-            section, 'spec_norm_init_lo', fallback=0.001
+            section, 'spec_norm_init_lo', fallback=0.06
         ),
         'spec_init_hi': cfg.getfloat(
-            section, 'spec_norm_init_hi', fallback=0.0001
+            section, 'spec_norm_init_hi', fallback=0.012
         ),
         'spec_eps': cfg.getfloat(section, 'spec_norm_eps', fallback=1e-12),
     }
@@ -360,7 +360,7 @@ def causal_ema_db_norm(
     erb_db,
     norm_state=None,
     alpha=0.989,
-    mean_norm_init=(-60.0, -90.0),
+    mean_norm_init=(-15, -60),
     scale_db=40.0,
 ):
     """
@@ -396,11 +396,13 @@ def causal_ema_db_norm(
 
 
 def causal_ema_mag_norm(spec_low, norm_state=None, alpha=0.989, eps=1e-12,
-                        unit_norm_init=(0.001, 0.0001)):
+                        unit_norm_init=(0.06, 0.012)):
     """
     DeepFilterNet band_unit_norm (libDF lib.rs): per-bin EMA of |x|, divide by SQRT(EMA).
         s = |x|*(1-a) + s*a ;  x = x / sqrt(s + eps)
-    State init = linspace(UNIT_NORM_INIT) = 0.001..0.0001 across bins (NOT first-frame).
+    State init = linspace across bins (NOT first-frame).  libDF ships
+    UNIT_NORM_INIT = 0.001..0.0001; this port measures its own, because the
+    two disagree on both the filterbank and the STFT scale.
     spec_low  : (B, T, df_bins) complex
     Returns: normed (B, T, df_bins) complex and state (B, 1, df_bins)
     """
@@ -455,12 +457,12 @@ def extract_dfn2_features(
     if feature_cfg is None:
         feature_cfg = {
             'erb_alpha': 0.989,
-            'erb_init_lo_db': -60.0,
-            'erb_init_hi_db': -90.0,
+            'erb_init_lo_db': -15,
+            'erb_init_hi_db': -60,
             'erb_scale_db': 40.0,
             'spec_alpha': 0.989,
-            'spec_init_lo': 0.001,
-            'spec_init_hi': 0.0001,
+            'spec_init_lo': 0.06,
+            'spec_init_hi': 0.012,
             'spec_eps': 1e-12,
         }
     if ema_state is not None and not isinstance(ema_state, dict):
