@@ -66,56 +66,12 @@ from train import (  # noqa: E402
     stft,
 )
 from dataset_gen import (  # noqa: E402
+    fit_ramp,
     load_packed_dataset,
     locality_preserving_random_split,
+    robust_quantile,
     split_sizes,
 )
-
-
-# torch.quantile rejects inputs larger than ~16.7M elements, and the default
-# --clips 2000 produces roughly 46M, so the flat quantiles have to be taken by
-# sorting instead.  (The per-band table below stays on torch.quantile: its
-# per-column inputs are 22x smaller and comfortably under the limit.)
-def _quantile(x, q):
-    flat = x.reshape(-1)
-    if flat.numel() <= 16_000_000:
-        return torch.quantile(flat, q).item()
-    return flat.sort().values[min(int(q * flat.numel()), flat.numel() - 1)].item()
-
-
-def _fit_ramp(x, axis_name, unit):
-    """Endpoints of the least-squares line through the per-column MEAN.
-
-    ``init_lo``/``init_hi`` are the two ends of a ``torch.linspace`` ramp ACROSS
-    FREQUENCY (train.py's normalize_log_erb / normalize_complex_spectrum), so
-    they have to be fitted along that axis.  This script used to pool every
-    band and every frame into one distribution and report its median and 5th
-    percentile -- which measures how levels vary over TIME and LEVEL, not over
-    frequency, and produces two numbers that describe no ramp at all.
-
-    The statistic is the mean because that is what the EMA converges to:
-    ``mean = alpha*mean + (1-alpha)*x`` has expectation E[x], not its median.
-
-    Returns (value_at_first_column, value_at_last_column, rms_residual).  The
-    residual is the part of the frequency profile a 2-parameter ramp cannot
-    represent; report it so the reader can judge whether the ramp is enough.
-    """
-    per_col = x.mean(dim=0).double()                  # (n_cols,)
-    n = per_col.numel()
-    i = torch.arange(n, dtype=torch.float64)
-    # least squares fit  per_col ~ a + b*i
-    i_mean, y_mean = i.mean(), per_col.mean()
-    b = ((i - i_mean) * (per_col - y_mean)).sum() / ((i - i_mean).pow(2).sum())
-    a = y_mean - b * i_mean
-    fitted = a + b * i
-    residual = (per_col - fitted).pow(2).mean().sqrt().item()
-    print(f"\n--- {axis_name} ramp fit ---")
-    print(f"  measured mean spans {per_col[0].item():.4g} .. {per_col[-1].item():.4g}{unit}"
-          f"  (min {per_col.min().item():.4g}, max {per_col.max().item():.4g})")
-    print(f"  fitted ramp          {fitted[0].item():.4g} .. {fitted[-1].item():.4g}{unit}")
-    print(f"  RMS residual vs the fitted line: {residual:.4g}{unit}"
-          f"   <- what the 2-parameter ramp cannot express")
-    return fitted[0].item(), fitted[-1].item(), residual
 
 
 def main():
@@ -210,8 +166,8 @@ def main():
     for b in range(erb_db.shape[1]):
         print(f"{b:>5}{means[b]:>9.1f}{q[0, b]:>9.1f}{q[1, b]:>9.1f}{q[2, b]:>9.1f}")
 
-    erb_lo, erb_hi, erb_res = _fit_ramp(erb_db, 'ERB band', 'dB')
-    sp_lo, sp_hi, sp_res = _fit_ramp(spec_mag, 'complex bin', '')
+    erb_lo, erb_hi, erb_res = fit_ramp(erb_db, 'ERB band', 'dB')
+    sp_lo, sp_hi, sp_res = fit_ramp(spec_mag, 'complex bin', '')
 
     print("\n--- current vs measured ---")
     print(f"{'key':<26}{'current':>12}{'measured':>12}{'delta':>12}")

@@ -244,9 +244,11 @@ test-feature-python:
 test-loss-python:
 	$(PYTHON) $(PY_TEST_DIR)/test_loss.py
 
+# The ramp fit is shared with DeepFilterNet2 (dataset_gen/calibration.py), so
+# its test lives at ainr/tests/ rather than under this project.
 test-calibration:
-	@echo "== normaliser-init calibration method =="
-	$(PYTHON) $(PY_TEST_DIR)/test_norm_init_calibration.py
+	@echo "== normaliser-init calibration method (shared) =="
+	$(PYTHON) ../tests/test_norm_init_calibration.py
 
 $(BUILD_DIR)/test_rnnoise_tables: test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ test_rnnoise_tables.c -lm

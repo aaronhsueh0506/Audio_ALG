@@ -1,5 +1,11 @@
 #!/usr/bin/env python3
-"""The normaliser-init calibration must recover a ramp it was given.
+"""The shared normaliser-init ramp fit must recover a ramp it was given.
+
+Lives here rather than under a model directory because both RNNoise-ERB and
+DeepFilterNet2 calibrate through ``dataset_gen.calibration``.  The two models
+need SEPARATE constants -- different sample rate, FFT size, band count and
+corpus -- but the same fitting procedure, and a per-project copy of that
+procedure is exactly the kind of duplicate that drifts.
 
 ``erb_norm_init_lo_db``/``hi_db`` are the two ends of a ``torch.linspace``
 across FREQUENCY (train.py ``normalize_log_erb``), so calibrating them means
@@ -21,20 +27,10 @@ import sys
 
 import torch
 
-ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
+AINR = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(AINR))
 
-# Each of the three model projects has its own top-level ``train.py``; drop any
-# cached copy so this resolves against the ROOT just inserted above.
-for _stale in ('train', 'denoise', 'model', 'checkpoint_utils'):
-    sys.modules.pop(_stale, None)
-
-import importlib.util  # noqa: E402
-
-_spec = importlib.util.spec_from_file_location(
-    'calibrate_norm_init', ROOT / 'calibrate_norm_init.py')
-calibrate = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(calibrate)
+from dataset_gen.calibration import fit_ramp, robust_quantile  # noqa: E402
 
 
 TRUE_LO, TRUE_HI = -58.0, -74.0
@@ -58,7 +54,7 @@ def _synthetic_bands(seed=0):
 def test_fit_recovers_the_ramp_it_was_given():
     x = _synthetic_bands()
     with contextlib.redirect_stdout(io.StringIO()):
-        lo, hi, residual = calibrate._fit_ramp(x, 'ERB band', 'dB')
+        lo, hi, residual = fit_ramp(x, 'ERB band', 'dB')
     assert abs(lo - TRUE_LO) < 0.5, (lo, TRUE_LO)
     assert abs(hi - TRUE_HI) < 0.5, (hi, TRUE_HI)
     # The ramp is exactly linear here, so almost nothing should be left over.
@@ -81,7 +77,7 @@ def test_frequency_flat_jitter_does_not_enter_the_ramp():
     for scale in (LEVEL_JITTER_DB, LEVEL_JITTER_DB * 3):
         x = ramp.unsqueeze(0) + base * scale + noise
         with contextlib.redirect_stdout(io.StringIO()):
-            out.append(calibrate._fit_ramp(x, 'ERB band', 'dB')[:2])
+            out.append(fit_ramp(x, 'ERB band', 'dB')[:2])
     (lo1, hi1), (lo2, hi2) = out
     assert abs(lo1 - lo2) < 0.5 and abs(hi1 - hi2) < 0.5, out
 
@@ -94,8 +90,8 @@ def test_pooled_quantiles_would_have_failed():
     the accepted one.
     """
     x = _synthetic_bands()
-    pooled_lo = calibrate._quantile(x, 0.5)
-    pooled_hi = calibrate._quantile(x, 0.05)
+    pooled_lo = robust_quantile(x, 0.5)
+    pooled_hi = robust_quantile(x, 0.05)
     assert abs(pooled_lo - TRUE_LO) > 3.0, pooled_lo
     assert abs(pooled_hi - TRUE_HI) > 3.0, pooled_hi
     true_span = abs(TRUE_HI - TRUE_LO)
@@ -105,7 +101,7 @@ def test_pooled_quantiles_would_have_failed():
 def test_quantile_helper_handles_oversized_input():
     """torch.quantile rejects >~16.7M elements; the default --clips exceeds it."""
     big = torch.arange(17_000_001, dtype=torch.float32)
-    got = calibrate._quantile(big, 0.5)
+    got = robust_quantile(big, 0.5)
     assert abs(got - 8_500_000) < 10_000, got
 
 
