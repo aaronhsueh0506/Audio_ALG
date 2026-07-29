@@ -20,7 +20,7 @@ per-project copies of shared logic drifted.
 import torch
 
 
-__all__ = ['fit_ramp', 'robust_quantile']
+__all__ = ['describe_bands', 'fit_ramp', 'robust_quantile']
 
 
 # torch.quantile refuses inputs beyond roughly this many elements.  A default
@@ -85,3 +85,54 @@ def fit_ramp(x, axis_name='band', unit='', verbose=True):
         print(f"  RMS residual vs the fitted line: {residual:.4g}{unit}"
               f"   <- what the 2-parameter ramp cannot express")
     return fitted[0].item(), fitted[-1].item(), residual
+
+
+def describe_bands(erb_db, band_weight_sums, scale_db):
+    """Per-band table that separates the filterbank artefact from the signal.
+
+    The measured level of a band is the signal's level in that frequency range
+    PLUS 10*log10(sum of the band's filter weights), because this filterbank
+    sums where libDF averages.  That second term is deterministic -- it depends
+    only on the band borders -- so printing it lets you subtract it and check
+    whether what remains looks like the corpus you actually fed in.  If the
+    corrected column does not resemble a plausible spectrum (for speech+noise,
+    falling with frequency), the measurement is wrong somewhere upstream of the
+    fit and the endpoints should not be trusted.
+
+    ``spread`` is p95-p5 WITHIN each band across time.  That is the quantity
+    ``scale_db`` (the /40 divisor) has to cover: after mean subtraction the
+    feature is (level - running_mean)/scale_db, so a band whose spread is far
+    below scale_db reaches the network compressed into a narrow range.  The
+    across-band span is irrelevant to that divisor -- the mean subtraction
+    removes it.
+    """
+    import torch
+
+    q = torch.quantile(erb_db, torch.tensor([0.05, 0.5, 0.95]), dim=0)
+    means = erb_db.mean(dim=0)
+    fb_db = 10.0 * torch.log10(torch.as_tensor(band_weight_sums).double()).float()
+
+    print(f"\n{'band':>5}{'mean':>9}{'p05':>9}{'p95':>9}{'spread':>9}"
+          f"{'fb_off':>9}{'corrected':>11}")
+    for b in range(erb_db.shape[1]):
+        spread = (q[2, b] - q[0, b]).item()
+        print(f"{b:>5}{means[b]:>9.1f}{q[0, b]:>9.1f}{q[2, b]:>9.1f}"
+              f"{spread:>9.1f}{fb_db[b]:>9.1f}{means[b] - fb_db[b]:>11.1f}")
+
+    spreads = (q[2] - q[0])
+    print(f"\n  fb_off    = 10*log10(band weight sum): the part of `mean` that is "
+          f"this filterbank, not the signal")
+    print(f"  corrected = mean - fb_off: should look like your corpus's spectrum")
+    print(f"  in-band spread over time: min {spreads.min().item():.1f} dB, "
+          f"median {spreads.median().item():.1f} dB, max {spreads.max().item():.1f} dB")
+    print(f"  vs erb_norm_scale_db = {scale_db:g} dB", end='')
+    med = spreads.median().item()
+    if med < scale_db * 0.5:
+        print(f"  <- median spread is under half the divisor; features reach the "
+              f"network in roughly +-{med / (2 * scale_db):.2f}, consider lowering it")
+    elif med > scale_db * 1.5:
+        print(f"  <- median spread exceeds the divisor; features will regularly "
+              f"leave +-0.5, consider raising it")
+    else:
+        print("  <- reasonable")
+    return spreads

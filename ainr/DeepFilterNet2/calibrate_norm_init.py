@@ -47,6 +47,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from model import DeepFilterNet2  # noqa: E402
 from train import read_feature_config, read_model_config  # noqa: E402
 from dataset_gen import (  # noqa: E402
+    describe_bands,
     fit_ramp,
     load_packed_dataset,
     locality_preserving_random_split,
@@ -138,11 +139,7 @@ def main():
               "EVERY frame, not just the first few.")
 
     print("\n--- per-band ERB level (dB) ---")
-    print(f"{'band':>5}{'mean':>9}{'p05':>9}{'median':>9}{'p95':>9}")
-    q = torch.quantile(erb_db, torch.tensor([0.05, 0.5, 0.95]), dim=0)
-    means = erb_db.mean(dim=0)
-    for b in range(n_erb):
-        print(f"{b:>5}{means[b]:>9.1f}{q[0, b]:>9.1f}{q[1, b]:>9.1f}{q[2, b]:>9.1f}")
+    describe_bands(erb_db, erb_fb.sum(dim=1), feat['erb_scale_db'])
 
     erb_lo, erb_hi, erb_res = fit_ramp(erb_db, 'ERB band', 'dB')
     sp_lo, sp_hi, sp_res = fit_ramp(spec_mag, 'complex bin', '')

@@ -1,6 +1,6 @@
 """Shared dataset generation and packed-pair loading utilities."""
 
-from .calibration import fit_ramp, robust_quantile
+from .calibration import describe_bands, fit_ramp, robust_quantile
 from .loader import (
     DEFAULT_SPLIT_SEED,
     DEFAULT_VAL_FRACTION,
@@ -20,6 +20,7 @@ __all__ = [
     'BlockShuffleSampler',
     'PackedDataset',
     'dataloader_worker_kwargs',
+    'describe_bands',
     'fit_ramp',
     'load_packed_dataset',
     'locality_preserving_random_split',
