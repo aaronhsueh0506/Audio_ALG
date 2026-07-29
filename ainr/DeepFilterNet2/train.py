@@ -259,6 +259,15 @@ def read_feature_config(cfg, sr, hop_len):
         or spec_tau <= 0
         or feature_cfg['erb_scale_db'] <= 0
         or feature_cfg['spec_eps'] <= 0
+        # The unit-norm state is a magnitude the model divides by as
+        # x / sqrt(state); a non-positive init makes the first frames NaN.
+        # Easy to paste in by accident: a least-squares ramp fitted to a convex
+        # magnitude profile extrapolates below zero at the far end, which is
+        # exactly what calibrate_norm_init.py produced on a real corpus before
+        # it grew a positivity guard.  RNNoise-ERB has always rejected this;
+        # this project silently accepted it.
+        or feature_cfg['spec_init_lo'] <= 0
+        or feature_cfg['spec_init_hi'] <= 0
     ):
         raise ValueError('invalid DeepFilterNet feature-normalization configuration')
     return feature_cfg
