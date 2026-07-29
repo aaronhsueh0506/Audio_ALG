@@ -150,10 +150,11 @@ def main():
     print("\n--- current vs measured ---")
     print(f"{'key':<26}{'current':>12}{'measured':>12}{'delta':>12}")
     rows = [
-        ('erb_norm_init_lo_db', feat['erb_norm_init_lo_db'], erb_lo, 'dB'),
-        ('erb_norm_init_hi_db', feat['erb_norm_init_hi_db'], erb_hi, 'dB'),
-        ('spec_norm_init_lo', feat['spec_norm_init_lo'], sp_lo, ''),
-        ('spec_norm_init_hi', feat['spec_norm_init_hi'], sp_hi, ''),
+        # config.ini spells these with "norm_"; read_feature_config does not.
+        ('erb_norm_init_lo_db', feat['erb_init_lo_db'], erb_lo, 'dB'),
+        ('erb_norm_init_hi_db', feat['erb_init_hi_db'], erb_hi, 'dB'),
+        ('spec_norm_init_lo', feat['spec_init_lo'], sp_lo, ''),
+        ('spec_norm_init_hi', feat['spec_init_hi'], sp_hi, ''),
     ]
     for key, cur, new, unit in rows:
         delta = f"{new - cur:+.4g}{unit}" if unit else f"{new / max(cur, 1e-30):.2f}x"
