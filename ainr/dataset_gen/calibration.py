@@ -37,7 +37,7 @@ def robust_quantile(x, q):
     return flat.sort().values[min(int(q * flat.numel()), flat.numel() - 1)].item()
 
 
-def fit_ramp(x, axis_name='band', unit='', verbose=True):
+def fit_ramp(x, axis_name='band', unit='', verbose=True, require_positive=False):
     """Endpoints of the least-squares line through the per-column MEAN.
 
     ``init_lo``/``init_hi`` are the two ends of a ramp ACROSS FREQUENCY, so they
@@ -51,6 +51,15 @@ def fit_ramp(x, axis_name='band', unit='', verbose=True):
 
     The statistic is the MEAN because that is what the EMA converges to:
     ``mean = alpha*mean + (1-alpha)*x`` has expectation E[x], not its median.
+
+    ``require_positive`` is for the unit-norm path, whose state is a MAGNITUDE
+    that the model divides by as ``x / sqrt(state)``.  A least-squares line
+    through a convex, non-monotonic magnitude profile extrapolates below zero
+    at the far end -- measured on real corpora it produced -0.0074 (16 kHz) and
+    -0.0146 (48 kHz) -- and a negative state makes that sqrt NaN on the first
+    frames.  When the fit would return a non-positive endpoint the measured
+    first/last column means are returned instead: real, positive numbers, and
+    no worse than a line that does not describe the data anyway.
 
     Args:
         x: (frames, columns) real tensor -- per-band dB, or per-bin magnitude.
@@ -75,6 +84,12 @@ def fit_ramp(x, axis_name='band', unit='', verbose=True):
     fitted = intercept + slope * i
     residual = (per_col - fitted).pow(2).mean().sqrt().item()
 
+    lo, hi = fitted[0].item(), fitted[-1].item()
+    fell_back = False
+    if require_positive and (lo <= 0.0 or hi <= 0.0):
+        lo, hi = per_col[0].item(), per_col[-1].item()
+        fell_back = True
+
     if verbose:
         print(f"\n--- {axis_name} ramp fit ---")
         print(f"  measured mean spans {per_col[0].item():.4g} .. "
@@ -84,7 +99,21 @@ def fit_ramp(x, axis_name='band', unit='', verbose=True):
               f"{fitted[-1].item():.4g}{unit}")
         print(f"  RMS residual vs the fitted line: {residual:.4g}{unit}"
               f"   <- what the 2-parameter ramp cannot express")
-    return fitted[0].item(), fitted[-1].item(), residual
+        if fell_back:
+            print(f"  !! the fitted line goes non-positive, which would make "
+                  f"x/sqrt(state) NaN.")
+            print(f"  !! reporting the MEASURED endpoints instead: "
+                  f"{lo:.4g} .. {hi:.4g}{unit}")
+            print(f"  !! a line that leaves the valid range is the wrong SHAPE "
+                  f"for this profile, not merely mis-placed -- treat these two "
+                  f"numbers as a starting point, not a good description.")
+        span = abs(fitted[-1].item() - fitted[0].item())
+        if span > 0 and residual / span > 0.10:
+            print(f"  !! residual is {100 * residual / span:.0f}% of the ramp span; "
+                  f"a straight line describes this profile poorly (check whether "
+                  f"the `corrected` column peaks in the middle rather than "
+                  f"falling monotonically)")
+    return lo, hi, residual
 
 
 def describe_bands(erb_db, band_weight_sums, scale_db):

@@ -142,7 +142,7 @@ def main():
     describe_bands(erb_db, erb_fb.sum(dim=1), feat['erb_scale_db'])
 
     erb_lo, erb_hi, erb_res = fit_ramp(erb_db, 'ERB band', 'dB')
-    sp_lo, sp_hi, sp_res = fit_ramp(spec_mag, 'complex bin', '')
+    sp_lo, sp_hi, sp_res = fit_ramp(spec_mag, 'complex bin', '', require_positive=True)
 
     print("\n--- current vs measured ---")
     print(f"{'key':<26}{'current':>12}{'measured':>12}{'delta':>12}")
