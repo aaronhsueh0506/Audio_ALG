@@ -27,12 +27,22 @@ import sys
 
 
 AINR = pathlib.Path(__file__).resolve().parents[1]
+#: The AEC models live in their own top-level tree.  ⚠ The invariants below still
+#: span BOTH trees: AIAEC/ imports the split, the seeder and the augmentation DSP
+#: from ainr/dataset_gen and must not fork them, so a guard that only looked at
+#: ainr/ would stop covering exactly the trainers most likely to drift.
+AIAEC = AINR.parent / 'AIAEC'
+
+
+def trainer_dir(name):
+    """Project directory for a trainer name, in whichever tree owns it."""
+    return (AIAEC if name in AEC_TRAINERS else AINR) / name
 sys.path.insert(0, str(AINR))
 
 
 def _load(name):
     cfg = configparser.ConfigParser()
-    if not cfg.read(AINR / name / 'config.ini'):
+    if not cfg.read(trainer_dir(name) / 'config.ini'):
         raise AssertionError(f'missing {name}/config.ini')
     return cfg
 
@@ -93,7 +103,7 @@ def test_split_comes_from_one_shared_implementation():
               'class BlockShuffleSampler',
               'def dataloader_worker_kwargs')
     for name in NR_TRAINERS + AEC_TRAINERS:
-        source = (AINR / name / 'train.py').read_text()
+        source = (trainer_dir(name) / 'train.py').read_text()
         for decl in banned:
             assert decl not in source, (
                 f'{name}/train.py re-declares "{decl}"; import it from '
@@ -121,16 +131,16 @@ def test_aec_models_share_the_signal_primitives():
               'def lane_reset_mask')
     for name in AEC_TRAINERS:
         for filename in ('train.py', 'model.py'):
-            path = AINR / name / filename
+            path = trainer_dir(name) / filename
             if not path.exists():
                 continue
             source = path.read_text()
             for decl in banned:
                 assert decl not in source, (
                     f'{name}/{filename} re-declares "{decl}"; import it from '
-                    f'dataset_gen.aec so all three AEC models share one grid')
-        assert 'from dataset_gen.aec import' in (
-            AINR / name / 'train.py').read_text(), (
+                    f'dataset_gen_aec so all three AEC models share one grid')
+        assert 'from dataset_gen_aec import' in (
+            trainer_dir(name) / 'train.py').read_text(), (
             f'{name}/train.py does not import the shared AEC primitives')
 
 
@@ -169,7 +179,7 @@ def test_seed_defaults_match():
     """
     seeds = {}
     for name in NR_TRAINERS + AEC_TRAINERS:
-        source = (AINR / name / 'train.py').read_text()
+        source = (trainer_dir(name) / 'train.py').read_text()
         marker = "'--seed', type=int, default="
         assert marker in source, f'{name}: no --seed default found'
         tail = source.split(marker, 1)[1]
