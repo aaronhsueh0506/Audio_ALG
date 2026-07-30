@@ -23,7 +23,25 @@ Why it matters at all: a constant offset would normally wash out, because
 initial value.  It does not wash out here.  At tau = 1 s, hop 512, 48 kHz,
 3*tau is 281 frames and a 3-second training segment is 281 frames, so the
 normaliser is still converging when the example ends and every frame the model
-sees lies in the init-dominated transient.
+sees lies in the init-dominated transient.  (Measured against the *realised*
+alpha of 0.989 rather than nominal tau, 3*tau is 273 frames -- 3-decimal
+rounding makes the effective tau 0.9644 s, see config.ini [feature].  The
+conclusion holds under either figure.)
+
+⚠ EXPECT A LARGE DELTA AGAINST config.ini, AND DO NOT "CORRECT" IT.
+config.ini ships libDF's literal ``-60/-90`` and ``0.001/0.0001``. This script
+will recommend something ~39 dB away, because those literals are calibrated for
+libDF's rectangular/energy-mean bank and 1/N analysis scale, not for this port's
+triangular/energy-sum bank and ``normalized=True``. That gap is the known scale
+shift, not a corpus problem.
+
+The corpus-fitted pair (-17.35/-57.81, rounded to -15/-60) WAS shipped, in
+37db9df, and was then reverted: training diverged under it and converges under the
+literals, on an identical corpus, both runs from scratch. So this script's output
+is a measurement, not a recommendation to paste. Read UPSTREAM_ALIGNMENT.md
+do-not-touch item 4 before acting on it -- and note that seven candidate
+mechanisms for that divergence were measured and none survived, so the reason the
+better-fitting init trains worse is still open.
 
 USAGE
 -----
@@ -45,7 +63,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from model import DeepFilterNet2  # noqa: E402
-from train import read_feature_config, read_model_config  # noqa: E402
+from train import (  # noqa: E402
+    erb_band_db,
+    read_feature_config,
+    read_model_config,
+)
 from dataset_gen import (  # noqa: E402
     describe_bands,
     fit_ramp,
@@ -116,10 +138,16 @@ def main():
                               window=window, return_complex=True, normalized=True)
             if seg_frames is None:
                 seg_frames = spec.shape[-1]
-            power = spec.real.pow(2) + spec.imag.pow(2)          # (1, n_bins, T)
-            band = power.transpose(1, 2).matmul(erb_fb.T)        # (1, T, n_erb)
-            erb_db.append(10.0 * torch.log10(band.clamp_min(1e-16))[0, skip:])
-            spec_mag.append(spec[0, :df_bins, skip:].abs().transpose(0, 1))
+            # The trainer's own band-dB step, called rather than transcribed --
+            # the floor, the power form and the wnorm cannot drift from it.
+            erb_db.append(
+                erb_band_db(spec.transpose(1, 2), erb_fb,
+                            feat['analysis_scale'])[0, skip:]
+            )
+            spec_mag.append(
+                (spec[0, :df_bins, skip:] * feat['analysis_scale'])
+                .abs().transpose(0, 1)
+            )
 
     if not erb_db or erb_db[0].numel() == 0:
         raise SystemExit(f"no frames left after skipping {skip} of {seg_frames}; "

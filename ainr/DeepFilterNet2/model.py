@@ -239,8 +239,17 @@ class GroupedLinearEinsum(nn.Module):
     Weight is (G, I/G, H/G) and the input is reshaped to (B, T, G, I/G) before
     an einsum, so each group only sees its own slice of the feature axis.  With
     G groups this is G x fewer parameters than a dense Linear of the same
-    shape; upstream uses G=16 everywhere except the encoder's DF projection,
-    which uses G=32.
+    shape.
+
+    ⚠ There are THREE group counts in play, not two.  Upstream's shipped config
+    sets linear_groups=16 and enc_linear_groups=32, but df_dec.df_gru gets
+    NEITHER: deepfilternet3.py:297-304 simply never passes linear_groups at that
+    one site, so SqueezedGRU_S's own module default of 8 applies.  The released
+    checkpoint proves it -- df_dec.df_gru.linear_in.0.weight is (8, 64, 32) --
+    and deepfilternet2.py:328-334 has the identical omission, so it is a
+    long-standing upstream pattern, not a DFN3 typo.  "Fixing" df_gru to 16
+    leaves the model 8,192 params short of the checkpoint.  See the matching
+    warning in DFN2DfDecoder and UPSTREAM_ALIGNMENT.md do-not-touch item 9.
 
     Note there is deliberately NO bias (upstream registers only 'weight'), and
     kaiming init on the 3-D weight makes torch use fan_in = (I/G)*(H/G).
@@ -298,11 +307,19 @@ class SqueezedGRU_S(nn.Module):
             self.linear_out = nn.Identity()
 
     def forward(self, x, h=None):
+        # ⚠ The skip is fed the RAW input, not linear_in's output -- upstream
+        # df/modules.py:732-738 closes over its `input` argument.  Dormant here
+        # (all three call sites pass gru_skip_op=None and the released checkpoint
+        # has no gru_skip keys), and enabling it with the squeezed activation
+        # would fail loudly on the width rather than silently, which is how the
+        # mis-wiring survived.  Fixed anyway: this is a reusable block and its
+        # docstring above describes the upstream behaviour.
+        skip_in = x
         x = self.linear_in(x)
         y, h = self.gru(x, h)
         y = self.linear_out(y)
         if self.gru_skip is not None:
-            y = y + self.gru_skip(x)
+            y = y + self.gru_skip(skip_in)
         return y, h
 
 
@@ -333,28 +350,29 @@ class DFN2Encoder(nn.Module):
         # Embedding bus is enc_ch * n_erb//4 (n_erb//4 because erb_conv1 and
         # erb_conv2 each halve the frequency axis).  At the upstream conv_ch=64
         # this is 512, NOT emb_size.
-        self.emb_in_dim = enc_ch * (n_erb // 4)
+        self.emb_dim = enc_ch * (n_erb // 4)          # the bus, in and out
         df_feat_dim = enc_ch * (df_bins // 2)
 
         # Upstream has NO projection on the ERB branch: e3 is flattened and fed
         # straight into `combine`.  Only the DF branch is projected, and with
         # enc_lin_groups (32) rather than lin_groups.
         self.df_fc_emb = nn.Sequential(
-            GroupedLinearEinsum(df_feat_dim, self.emb_in_dim, groups=enc_lin_groups),
+            GroupedLinearEinsum(df_feat_dim, self.emb_dim, groups=enc_lin_groups),
             nn.ReLU(inplace=True),
         )
-        # enc_concat=False upstream -> the two branches are ADDED, so the bus
-        # stays emb_in_dim wide and there is no post-combine projection either.
+        # enc_concat=False upstream -> the branches are ADDED and the bus stays one
+        # width.  ⚠ Concatenating doubles only what the GRU CONSUMES; what it
+        # EMITS stays one bus wide, because both decoders are built for that
+        # (deepfilternet3.py:125-136,152-155).
         self.enc_concat = enc_concat
-        if enc_concat:
-            self.emb_in_dim *= 2
+        gru_in_dim = self.emb_dim * 2 if enc_concat else self.emb_dim
 
         # One GRU layer here; the remaining emb_num_layers-1 live in the ERB
         # decoder.  Upstream hardcodes num_layers=1 at this site even though
         # emb_num_layers defaults to 2 -- reading that config value as the
         # encoder's depth is the trap this port previously fell into.
         self.emb_gru = SqueezedGRU_S(
-            self.emb_in_dim, emb_size, output_size=self.emb_in_dim,
+            gru_in_dim, emb_size, output_size=self.emb_dim,
             num_layers=1, linear_groups=lin_groups, gru_skip_op=None,
             linear_act_layer=partial(nn.ReLU, inplace=True),
         )
@@ -362,6 +380,17 @@ class DFN2Encoder(nn.Module):
         # but this port deliberately omits that loss term, so the head would be
         # untrained dead weight.  (Verified upstream: enc.lsnr_fc weights span
         # -3.72..+1.35, far outside their +-0.0442 init bound, i.e. trained.)
+        # Its measured contribution to upstream's total loss is 0.2-4%
+        # (0.001-0.228 vs MRSL 2.5-33), most of it landing on the head's own 513
+        # params, and the 2,135,484 - 513 reconciliation depends on its absence.
+        #
+        # ⚠ THE COST IS AT INFERENCE, NOT IN TRAINING.  Upstream's runtime
+        # (tract.rs:658-672) uses lsnr to SKIP the ERB stage on clean speech and
+        # the whole DF stage on lightly-noisy frames.  Without the head, a
+        # C/streaming port of this model cannot reproduce either the per-frame
+        # compute saving or the "don't touch clean speech" behaviour, and must
+        # run both stages on every frame.  Budget for that, not for the 513
+        # params.
 
     def forward(self, feat_erb, feat_spec):
         """
@@ -392,13 +421,13 @@ class DFN2Encoder(nn.Module):
         e3_flat = e3.permute(0, 2, 3, 1).reshape(B, T, -1)   # (B, T, n_erb//4 * enc_ch)
         c1_flat = c1.permute(0, 2, 3, 1).reshape(B, T, -1)   # (B, T, df_bins//2 * enc_ch)
 
-        df_emb = self.df_fc_emb(c1_flat)                     # (B, T, emb_in_dim)
+        df_emb = self.df_fc_emb(c1_flat)                     # (B, T, emb_dim)
         if self.enc_concat:
             emb = torch.cat([e3_flat, df_emb], dim=-1)
         else:
             emb = e3_flat + df_emb                           # upstream default
 
-        emb, _ = self.emb_gru(emb)                           # (B, T, emb_in_dim)
+        emb, _ = self.emb_gru(emb)                           # (B, T, emb_dim)
 
         return e0, e1, e2, e3, emb, c0
 
@@ -430,9 +459,16 @@ class ERBDecoder(nn.Module):
         # encoder (a hardcoded 1) and here (emb_num_layers - 1); this port
         # previously put both layers in the encoder and left the ERB decoder
         # with no recurrence at all.
+        #
+        # No max(1, ...) clamp: upstream is a bare subtraction
+        # (deepfilternet3.py:216) and nn.GRU rejects num_layers=0 loudly.  The
+        # clamp silently built 1 + 1 = 2 layers at emb_num_layers = 1 while the
+        # config said 1, quietly breaking the total-depth invariant documented in
+        # config.ini.  Failing is the correct response to a config that cannot be
+        # honoured.
         self.emb_gru = SqueezedGRU_S(
             emb_dim, emb_size, output_size=emb_dim,
-            num_layers=max(1, emb_num_layers - 1), linear_groups=lin_groups,
+            num_layers=emb_num_layers - 1, linear_groups=lin_groups,
             gru_skip_op=None, linear_act_layer=partial(nn.ReLU, inplace=True),
         )
         # DFN3 uses a separate convt_kernel; DFN2 reused conv_kernel.
@@ -504,6 +540,11 @@ class DFDecoder(nn.Module):
         if df_gru_skip == 'none':
             self.df_skip = None
         elif df_gru_skip == 'identity':
+            # ⚠ DELIBERATELY NOT upstream's guard.  Upstream asserts
+            # emb_hidden_dim == df_hidden_dim (256 == 256, which passes and then
+            # fails to broadcast); the tensor actually being added here is the
+            # emb_in_dim-wide bus, so emb_in_dim == df_hidden is the condition
+            # that matters.  This is a fix, not a slip -- do not "align" it.
             assert emb_in_dim == df_hidden, "identity skip needs matching dims"
             self.df_skip = nn.Identity()
         else:
@@ -522,6 +563,12 @@ class DFDecoder(nn.Module):
         # it would silently break that reconciliation, which is the only check
         # that the architecture realignment is complete.
         self.df_fc_a = nn.Sequential(nn.Linear(df_hidden, 1), nn.Sigmoid())
+        # ⚠ Related do-not-restore: released DeepFilterNet3's config declares
+        # convt_depthwise = False, but that key is never READ (deepfilternet3.py
+        # :34-39) -- DFN3 hardcodes separable=True and the checkpoint's transposed
+        # convs are depthwise.  Obeying the shipped key would build dense
+        # transposed convs (12,288 params each vs 192 + 4,096) and break the
+        # reconciliation above.  This port deliberately has no such key.
 
     def forward(self, emb, c0):
         """
@@ -547,14 +594,24 @@ class DFDecoder(nn.Module):
 # Deep Filter Apply
 # ============================================================
 
-def deep_filter_apply(spec, coefs, df_bins, df_order, df_lookahead=0):
+def deep_filter_apply(spec, coefs, df_bins, df_order, df_lookahead):
     """
     Apply a per-bin FIR filter to the lowest df_bins of spec.
 
-    The deployed configuration uses ``df_lookahead=0``: order 5 therefore
-    consumes masked spectra ``[t-4, ..., t]`` and only requires four history
-    frames in a streaming ring buffer.  Mask lookahead is an independent model
-    delay and must not be folded into this FIR window.
+    ⚠ Operates on the UNMASKED spectrum.  DFN3 composes DF and the ERB mask as a
+    parallel band split -- DF owns bins < df_bins outright -- so nothing masked
+    reaches this function.  (DFN2 did cascade DF onto the masked spectrum; that
+    is the older design.)  See the comment at the call site.
+
+    ⚠ ``df_lookahead`` is deliberately NOT defaulted: it is a latency decision,
+    it must agree with ``[model] df_lookahead`` in config.ini, and a silent
+    default here previously contradicted the shipped value.
+
+    Streaming ring buffer at the shipped ``df_order=5, df_lookahead=1``:
+    ``history = df_order - df_lookahead - 1 = 3``, so the window is
+    ``[t-3, ..., t+1]`` -- three history frames, the current frame, one future
+    frame, and therefore a one-frame output delay.  Mask lookahead is an
+    independent model delay and must not be folded into this FIR window.
 
     Args:
         spec   : (B, n_bins, T) complex
@@ -618,11 +675,17 @@ class DeepFilterNet2(nn.Module):
     """
     def __init__(self, n_fft=512, sr=16000, n_erb=32, df_bins=64, df_order=5,
                  enc_ch=64, emb_size=256, df_hidden=256, df_num_layers=2,
-                 mask_lookahead=1, df_lookahead=0,
+                 mask_lookahead=1, df_lookahead=1,
+                 # ⚠ 1, not 0.  read_model_config sources its defaults from this
+                 # signature, so an omitted [model] df_lookahead built the exact
+                 # 1/0 pairing config.ini documents as buying nothing -- silently,
+                 # and it passes the lookahead invariant.
+
                  emb_num_layers=3, lin_groups=16, enc_lin_groups=32,
                  enc_concat=False, df_gru_skip='groupedlinear',
                  df_pathway_kernel_size_t=5, conv_kernel=(1, 3),
-                 conv_kernel_inp=(3, 3), convt_kernel=(1, 3)):
+                 conv_kernel_inp=(3, 3), convt_kernel=(1, 3),
+                 mask_pf=False, pf_beta=0.02):
         super().__init__()
         n_bins = n_fft // 2 + 1
 
@@ -642,6 +705,19 @@ class DeepFilterNet2(nn.Module):
                 f"df_lookahead must be in [0, {df_order - 1}], "
                 f"got {df_lookahead}"
             )
+        # ⚠ THE single source of truth for the lookahead relation.  Upstream
+        # relates the two (deepfilternet3.py:357-358); the port validated them
+        # independently here, in train.py and in denoise.py, and stated the
+        # relation only in config.ini prose -- so a config upstream refuses to
+        # build was accepted by all three.  It belongs in the constructor,
+        # because every entry point goes through it.
+        if df_lookahead > mask_lookahead:
+            raise ValueError(
+                "df_lookahead must not exceed mask_lookahead: the DF window "
+                "cannot see further into the future than the model delay the "
+                f"mask path pays for (got df_lookahead={df_lookahead}, "
+                f"mask_lookahead={mask_lookahead})"
+            )
 
         # ERB filterbank — non-trainable buffers
         erb_fb, erb_inv = _build_erb_fb(n_fft, sr, n_erb)
@@ -656,17 +732,25 @@ class DeepFilterNet2(nn.Module):
         )
         # The embedding bus is enc_ch * n_erb//4 wide (512 at the upstream
         # conv_ch=64), NOT emb_size -- emb_size is only the GRU hidden width.
-        emb_in_dim = self.encoder.emb_in_dim
+        # The DF decoder consumes what the encoder EMITS; ERBDecoder recomputes the
+        # same width from enc_ch and n_erb.
+        emb_out_dim = self.encoder.emb_dim
         self.erb_dec = ERBDecoder(n_erb, enc_ch, emb_size, conv_kernel,
                                   emb_num_layers=emb_num_layers,
                                   lin_groups=lin_groups,
                                   convt_kernel=convt_kernel)
-        self.df_dec  = DFDecoder(df_bins, df_order, df_hidden, emb_in_dim,
+        self.df_dec  = DFDecoder(df_bins, df_order, df_hidden, emb_out_dim,
                                  enc_ch, conv_kernel,
                                  num_layers=df_num_layers,
                                  lin_groups=lin_groups,
                                  df_gru_skip=df_gru_skip,
                                  pathway_kernel_size_t=df_pathway_kernel_size_t)
+
+        # Valin post-filter, DFN3 form -- see self.post_filter.  Upstream ships
+        # mask_pf false and PF_BETA 0.02 (deepfilternet3.py:69), exposing beta via
+        # --pf, so BOTH are config-driven here.
+        self.mask_pf = mask_pf
+        self.pf_beta = pf_beta
 
         n_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"DeepFilterNet2: {n_params:,} trainable parameters")
@@ -700,4 +784,29 @@ class DeepFilterNet2(nn.Module):
         )
         spec_e[:, self.df_bins:] = spec_m
 
-        return spec_e, erb_mask
+        return self.post_filter(spec, spec_e), erb_mask
+
+    def post_filter(self, spec, spec_e):
+        """Valin post-filter, DeepFilterNet3 form (deepfilternet3.py:388-394).
+
+        ⚠ This is NOT DFN2's ``Mask.pf`` (df/modules.py:235-246), and the two are
+        not interchangeable:
+          * DFN3 works on the FINAL COMPLEX SPECTRUM, after both the ERB mask and
+            the deep filter; DFN2 worked on the real ERB mask before erb_inv.
+          * DFN3 DERIVES its mask as ``|spec_e| / |spec|`` -- the effective gain
+            actually realised -- rather than post-filtering the network's mask.
+          * DFN3's numerator has no ``mask`` factor: ``pf`` is a multiplicative
+            correction, because the gain is already present in ``spec_e``.
+          * DFN3 does NOT gate on ``self.training``.
+          * ``beta`` is config-driven upstream (``PF_BETA``, default 0.02, exposed
+            as ``--pf``), not a hardcoded constant.
+        """
+        if not self.mask_pf:
+            return spec_e
+        eps = 1e-12
+        mask = (spec_e.abs() / spec.abs().add(eps)).clamp(eps, 1)
+        mask_sin = mask * torch.sin(math.pi * mask / 2).clamp_min(eps)
+        pf = (1 + self.pf_beta) / (
+            1 + self.pf_beta * mask.div(mask_sin).pow(2)
+        )
+        return spec_e * pf

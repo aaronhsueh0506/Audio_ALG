@@ -26,6 +26,7 @@ from train import (
     read_feature_config,
     read_loss_config,
     require_checkpoint_contract, read_model_config,
+    validate_signal_config,
 )
 
 
@@ -44,14 +45,10 @@ def load_model(args):
     DF_ORDER       = model_cfg['df_order']
     MASK_LOOKAHEAD = model_cfg['mask_lookahead']
     DF_LOOKAHEAD   = model_cfg['df_lookahead']
-    if not 0 < WIN_LEN <= N_FFT:
-        raise ValueError('win_len must be in (0, n_fft]')
-    if not 0 < HOP_LEN <= WIN_LEN:
-        raise ValueError('hop_len must be in (0, win_len]')
-    if not 0 <= MASK_LOOKAHEAD <= 2:
-        raise ValueError('mask_lookahead must be in [0, 2]')
-    if not 0 <= DF_LOOKAHEAD < DF_ORDER:
-        raise ValueError('df_lookahead must be in [0, df_order)')
+    MASK_PF        = model_cfg['mask_pf']
+    PF_BETA        = model_cfg['pf_beta']
+    validate_signal_config(N_FFT, WIN_LEN, HOP_LEN, N_ERB, DF_BINS, DF_ORDER,
+                           MASK_LOOKAHEAD, DF_LOOKAHEAD)
 
     device = torch.device('cpu')
     ckpt = torch.load(args.model, map_location=device, weights_only=False)
@@ -67,11 +64,13 @@ def load_model(args):
         DF_ORDER,
         MASK_LOOKAHEAD,
         DF_LOOKAHEAD,
+        MASK_PF,
+        PF_BETA,
         feature_cfg,
         loss_cfg,
     )
     require_checkpoint_contract(
-        ckpt, contract, context=args.model, require_loss=False
+        ckpt, contract, context=args.model, for_training=False
     )
 
     model = DeepFilterNet2(**model_cfg)
