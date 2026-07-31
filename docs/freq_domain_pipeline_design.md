@@ -51,7 +51,7 @@ The mono pipeline uses a 20 ms frame, 10 ms hop, and the next power-of-two FFT:
 AEC, final OLA, NR gains, and `AecResContext` are validated against the same
 derived dimensions during initialization.
 
-The `pipelines/aec_4ch/` shell and AIAEC model candidates intentionally use
+The `pipelines/4ch_pipelines/` shell and AIAEC model candidates intentionally use
 zero-padding-free 50%-overlap grids. They are separate contracts and should
 not be inferred from this table.
 

@@ -84,7 +84,7 @@ python3 denoise.py output/align_cruse_best.pth mic.wav far.wav out.wav
   per-model views.
 - [`../docs/ai_aec_candidate_matrix.md`](../docs/ai_aec_candidate_matrix.md):
   current selection and deployment rules.
-- [`../pipelines/aec_4ch/README.md`](../pipelines/aec_4ch/README.md): separate
+- [`../pipelines/4ch_pipelines/README.md`](../pipelines/4ch_pipelines/README.md): separate
   conventional four-channel integration boundary.
 
 From the repository root:

@@ -25,8 +25,8 @@ inside the AEC3 suppression path, exported with the linear residual, fused with
 | NR | libmmse_lsa.a | mmse_lsa_denoiser.h | MMSE-LSA + MCRA noise est + SPP |
 | RES | libaec.a (included) | aec.h (`AecResContext`) | Residual echo suppression, folded into AEC's freq-domain seam |
 | Mono integration | libaudio_pipeline.a | audio_pipeline.h | One-mic AEC + NR/RES, heap or caller-owned pool |
-| 4-ch integration | lib4aec_nr_res.a | aec_4ch/4aec_nr_res.h | One shared matcher + four linear AECs + external beamformer weights + one mono NR/RES |
-| Complete 4-ch spatial | lib4aec_nr_res.a | aec_4ch/4aec_doa_gsc.h | Same 4-ch core + third-party SRP-PHAT/GSC on the selected shared grid |
+| 4-ch integration | 4ch_pipelines/libaudio_pipeline_4ch.a | 4ch_pipelines/4aec_nr_res.h | One shared matcher + four linear AECs + external beamformer weights + one mono NR/RES |
+| Complete 4-ch spatial | 4ch_pipelines/libaudio_pipeline_4ch.a | 4ch_pipelines/audio_pipeline_4ch.h | Same 4-ch core + reusable SRP-PHAT/GSC libraries on the selected shared grid |
 
 RES is not a standalone module/library — it is exposed as the `AecResContext` seam on
 the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process()`
@@ -38,8 +38,8 @@ can run AEC(linear) → NR → RES itself. See `lib/aec/c_impl/include/aec.h` (`
 `aec_get_res_context()`) for the full field list.
 
 The four-channel API is a separate zero-padding-free grid and does not use
-`AudioPipeline`. See [the 4-channel contract](aec_4ch/README.md) and
-[`aec_4ch/4aec_nr_res.h`](aec_4ch/4aec_nr_res.h) for its synchronous
+`AudioPipeline`. See [the 4-channel contract](4ch_pipelines/README.md) and
+[`4ch_pipelines/4aec_nr_res.h`](4ch_pipelines/4aec_nr_res.h) for its synchronous
 pre/post boundary.
 
 ## Parameter Alignment
@@ -131,7 +131,7 @@ corresponding NR output becomes available.
 ```bash
 # From Audio_ALG/pipelines/ — builds the submodule libs + BOTH binaries
 make                # libs (BACKEND=kiss) + aec_nr_pipeline + aec_nr_pipeline_static
-make SIMD=0         # one switch: pipeline + third_party + AEC + NR + audio_common all scalar
+make SIMD=0         # one switch: mono pipeline + AEC + NR + audio_common all scalar
 
 # Binaries land in a config-keyed dir (round-3 review B01):
 #   bin/<backend>-<config-hash>/  — resolve it with `make print-bin-dir`
@@ -157,17 +157,16 @@ BIN="$(make -s print-bin-dir)"
 # bytes each rejected) — each per-rate case runs once per supported rate
 # (8000/16000/48000; 48 kHz uses a reduced hop count, see test_audio_pipeline.c)
 # — AND builds + runs the example_board_adapter smoke test (see "Board
-# Integration" below). It also runs the core and complete spatial 4-channel
-# tests across 16k/256/128, 16k/512/256, and 48k/1024/512 grids.
+# Integration" below). Four-channel tests are intentionally isolated in
+# 4ch_pipelines/Makefile.
 make test
 
-# Build the separate 4-channel wrapper archive or its standalone structural
-# and lifecycle test binary. `make test` above executes that binary.
-make lib4aec_nr_res.a
-make 4aec_nr_res_static
-make 4aec_doa_gsc_raw
-make test_4aec_nr_res
-make test_4aec_doa_gsc
+# Build/test the independent four-channel producer.
+make -C 4ch_pipelines libaudio_pipeline_4ch.a
+make -C 4ch_pipelines SIMD=0 test  # includes DOA/GSC/spatial scalar fallback
+make -C 4ch_pipelines 4aec_nr_res_static
+make -C 4ch_pipelines audio_pipeline_4ch_raw
+make -C 4ch_pipelines test
 
 # Build + run JUST the REFERENCE ONLY board-adapter example standalone
 # (also runs as part of `make test` above):
@@ -179,16 +178,17 @@ make NO_STDIO=1 libaudio_pipeline.a
 make audit-no-stdio
 ```
 
-`make` builds both `libaudio_pipeline.a` and `lib4aec_nr_res.a`.
+`make` builds the mono executables and `libaudio_pipeline.a` only.
 `libaudio_pipeline.a` is the pool-sizing/carving/processing library that both
 mono CLIs wrap; see "Board Integration" below for its firmware API,
-`NO_STDIO=1` knob, and `audit-no-stdio` target. `lib4aec_nr_res.a` follows the
+`NO_STDIO=1` knob, and `audit-no-stdio` target. The independent
+`4ch_pipelines/libaudio_pipeline_4ch.a` follows the
 same pool-first pattern: `four_aec_nr_res_create()` is the heap convenience
 path, while `four_aec_nr_res_get_mem_requirements()` +
 `four_aec_nr_res_init_ex()` place the complete four-AEC/NR/FFT/shared-wrapper
 state in one caller-owned 16-byte-aligned pool. Both construction paths share
 the same allocation-free pre/post processing core and are byte-parity tested
-at 16 and 48 kHz. See [`aec_4ch/README.md`](aec_4ch/README.md) and
+at 16 and 48 kHz. See [`4ch_pipelines/README.md`](4ch_pipelines/README.md) and
 `4aec_nr_res_static` for the directly comparable board sequence.
 
 ## Debugging & Performance Flags

@@ -22,17 +22,18 @@
   byte-identical；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
 - reusable API：`pipelines/audio_pipeline.h` / `audio_pipeline.c`
 - linkable archive：config-keyed build directory 內的 `libaudio_pipeline.a`
-- 四麥克風 API：`pipelines/aec_4ch/4aec_nr_res.h` / `4aec_nr_res.c`
-- 完整四麥克風 spatial API：`pipelines/aec_4ch/4aec_doa_gsc.h` /
-  `4aec_doa_gsc.c`
-- 四麥克風 static 對照範例：`pipelines/aec_4ch/4aec_nr_res_static.c`
-- 完整 spatial 實錄 runner：`pipelines/aec_4ch/4aec_doa_gsc_raw.c`
-- 四麥克風 archive：config-keyed build directory 內的 `lib4aec_nr_res.a`
+- 四麥克風 API：`pipelines/4ch_pipelines/4aec_nr_res.h` / `4aec_nr_res.c`
+- 完整四麥克風 spatial API：`pipelines/4ch_pipelines/audio_pipeline_4ch.h` /
+  `audio_pipeline_4ch.c`
+- 四麥克風 static 對照範例：`pipelines/4ch_pipelines/4aec_nr_res_static.c`
+- 完整 spatial 實錄 runner：`pipelines/4ch_pipelines/audio_pipeline_4ch_raw.c`
+- 四麥克風 archive：`pipelines/4ch_pipelines` 的 config-keyed build directory
+  內的 `libaudio_pipeline_4ch.a`
 
 `pipelines/PLAN_audio_pipeline_api.md` 是 API 實作前的歷史設計草案，
 不是可依賴的介面。已實作的 function、descriptor version、ownership 與
 錯誤行為，mono 以 `audio_pipeline.h`、四麥克風以
-`aec_4ch/4aec_nr_res.h` 為準。
+`4ch_pipelines/4aec_nr_res.h` 為準。
 
 嵌入產品時優先使用 `AudioPipeline*`：桌面／服務端可用
 `audio_pipeline_create()`，firmware 則以
@@ -58,9 +59,9 @@ linear output 與 token，交由外部 SRP-PHAT/GSC 更新 channel-major
 NR、RES gain fusion 與 iFFT/OLA。
 
 `FourAecNrRes*` core 本身不實作 beamformer；若要直接包入現有的第三方
-SRP-PHAT/GSC，使用 `FourAecDoaGsc*`。完整 wrapper 的 AEC、DOA、GSC、
+SRP-PHAT/GSC，使用 `AudioPipeline4Ch*`。完整 wrapper 的 AEC、DOA、GSC、
 NR、RES 都繼承同一個格點，`frame == FFT`、`hop == frame/2`，不能分別
-指定互相矛盾的 frame/hop/FFT。`four_aec_doa_gsc_*_size()` accessors 可
+指定互相矛盾的 frame/hop/FFT。`audio_pipeline_4ch_*_size()` accessors 可
 分別查詢 main、DOA 與 GSC 實際格點；預設三組設定中三者必須一致。
 
 目前只允許一個 in-flight frame。建立方式比照 mono `AudioPipeline`：
@@ -75,10 +76,10 @@ NR、RES 都繼承同一個格點，`frame == FFT`、`hop == frame/2`，不能�
 `four_aec_nr_res_destroy()` 對 static handle 不釋放 caller 的 pool；caller
 應在 destroy 後自行交還平台 memory manager。可直接對照
 `pipelines/aec_nr_pipeline_static.c` 與
-`pipelines/aec_4ch/4aec_nr_res_static.c` 的
+`pipelines/4ch_pipelines/4aec_nr_res_static.c` 的
 query → allocate → init → process → destroy → release 順序。完整 contract、
 權重 convention 與 parity 限制見
-[`../pipelines/aec_4ch/README.md`](../pipelines/aec_4ch/README.md)。
+[`../pipelines/4ch_pipelines/README.md`](../pipelines/4ch_pipelines/README.md)。
 
 ## 2. Production path
 
@@ -122,14 +123,14 @@ git submodule update --init --recursive
 建置目前的 C pipeline：
 
 ```bash
-# 從 Audio_ALG 根目錄執行 — 預設 target 也會建 4ch archive/static example
-make -C pipelines            # mono heap/static + lib4aec_nr_res.a + 4ch static
+# 從 Audio_ALG 根目錄執行；mono 與 4ch 的 producer 完全分離
+make -C pipelines            # mono heap/static + libaudio_pipeline.a
 make -C pipelines BACKEND=ne10   # NE10 FFT 後端（obj/ 依 backend+參數雜湊分開目錄，免手動 clean-libs）
-make -C pipelines lib4aec_nr_res.a
-make -C pipelines 4aec_nr_res_static
-make -C pipelines 4aec_doa_gsc_raw
-make -C pipelines test_4aec_nr_res
-make -C pipelines test_4aec_doa_gsc
+make -C pipelines/4ch_pipelines BACKEND=kiss SIMD=1
+make -C pipelines/4ch_pipelines BACKEND=ne10 SIMD=1
+make -C pipelines/4ch_pipelines 4aec_nr_res_static
+make -C pipelines/4ch_pipelines audio_pipeline_4ch_raw
+make -C pipelines/4ch_pipelines test
 ```
 
 若自行編譯 wrapper，沿用目前 Makefile 的 include／link layout（注意：兩個 library 都依賴

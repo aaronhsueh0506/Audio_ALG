@@ -12,7 +12,7 @@ contracts.
 | `pipelines/` | Production-oriented linear AEC + echo-aware NR/RES | [`pipelines/README.md`](pipelines/README.md) |
 | `AINR/` | Standalone speech enhancement | [`AINR/README.md`](AINR/README.md) |
 | `AIAEC/` | Six neural AEC/AENR candidate architectures | [`AIAEC/README.md`](AIAEC/README.md) |
-| `pipelines/aec_4ch/` | Python reference and C API for four linear AEC lanes around an externally owned SRP-PHAT/GSC | [`pipelines/aec_4ch/README.md`](pipelines/aec_4ch/README.md) |
+| `pipelines/4ch_pipelines/` | Python reference and C API for four linear AEC lanes around an externally owned SRP-PHAT/GSC | [`pipelines/4ch_pipelines/README.md`](pipelines/4ch_pipelines/README.md) |
 | `lib/aec/`, `lib/nr/` | Conventional algorithm libraries | Git submodules |
 
 The conventional pipeline is the deployable reference path. `AINR/` and
@@ -54,7 +54,7 @@ model per microphone.
 | Conventional mono pipeline, 8 kHz | frame 160, hop 80, FFT 256 |
 | Conventional mono pipeline, 16 kHz | frame 320, hop 160, FFT 512 |
 | Conventional mono pipeline, 48 kHz | frame 960, hop 480, FFT 1024 |
-| Four-channel AEC shell, 16 / 48 kHz | 512/256 or 1024/512, no padding |
+| Four-channel AEC shell, 16 / 48 kHz | 16k: 256/128 or 512/256; 48k: 1024/512, no padding |
 | AIAEC, 16 kHz | frame/window/FFT 512, hop 256 |
 | AIAEC, 48 kHz | frame/window/FFT 1024, hop 512 |
 
@@ -72,11 +72,19 @@ cd Audio_ALG
 # If the repository was cloned without submodules:
 git submodule update --init --recursive
 
-# Build the conventional mono binaries plus the 4-channel archive/static example.
+# Build the conventional mono binaries and libaudio_pipeline.a.
 make -C pipelines
 
-# Or build only the four-channel C wrapper and caller-owned-pool example.
-make -C pipelines lib4aec_nr_res.a 4aec_nr_res_static
+# Build the independent four-channel pipeline and its reusable dependencies.
+make -C pipelines/4ch_pipelines
+make -C pipelines/4ch_pipelines 4aec_nr_res_static
+
+# The same switch is forwarded through every conventional/AI pre-post layer.
+# SIMD=1 is the default; SIMD=0 forces scalar fallback for A/B tests.
+make -C pipelines SIMD=0 test
+make -C pipelines/4ch_pipelines SIMD=0 test
+make -C AINR SIMD=0 test
+make -C AINR/RNNoise-ERB SIMD=0 test
 
 # Run the malloc reference executable.
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced \

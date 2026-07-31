@@ -80,4 +80,4 @@ one shared delay matcher
 ```
 
 It is not a six-candidate AIAEC bake-off surface. See
-[`../pipelines/aec_4ch/README.md`](../pipelines/aec_4ch/README.md).
+[`../pipelines/4ch_pipelines/README.md`](../pipelines/4ch_pipelines/README.md).

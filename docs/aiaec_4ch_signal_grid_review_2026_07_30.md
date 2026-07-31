@@ -14,7 +14,7 @@
 本輪要求的三個交付面已完成到下列邊界：
 
 1. `AIAEC/` 已由原先三個泛稱 prototype 重構為六個具名候選架構，並有一套 AEC 專用 dataset generator。模型 forward、shape、有限值、因果路徑、參數量級與 dataset-to-model contract 都有自動測試。這代表**架構可進入訓練**，不代表 paper-only reconstruction 可載入未公開的作者 checkpoint。
-2. `pipelines/aec_4ch/` 已完成「一個 shared matched/delay estimator、四個獨立 linear adaptive filters、外部 beamforming、一次 post-BF RES+NR」的結構，並通過兩組非同步真實錄音 acceptance。**RES 只跑一次，但必須吃 beamforming 後的 mono；不能任取其中一路。**
+2. `pipelines/4ch_pipelines/` 已完成「一個 shared matched/delay estimator、四個獨立 linear adaptive filters、外部 beamforming、一次 post-BF RES+NR」的結構，並通過兩組非同步真實錄音 acceptance。**RES 只跑一次，但必須吃 beamforming 後的 mono；不能任取其中一路。**
 3. 傳統 AEC、NR 與整合 pipeline 已支援 power-of-two、`frame == FFT`、`hop == frame/2`、無隱藏補零的格點。C 與 Python 的 structural tests 全過；NR 另有 Python/C numeric parity。這是 structural sign-off，48 kHz 與 16 kHz/256 的最終音質仍應另外做 cohort/主觀驗證。
 
 ## 1. AIAEC 模型
@@ -152,7 +152,7 @@ out-of-order、其他 pipeline instance 或 reset 前仍在 flight 的結果。
 
 ```bash
 cd Audio_ALG
-../.venv/bin/python -m pipelines.aec_4ch.evaluate_recordings \
+../.venv/bin/python -m pipelines.4ch_pipelines.evaluate_recordings \
   --datasets-root ../datasets
 ```
 
