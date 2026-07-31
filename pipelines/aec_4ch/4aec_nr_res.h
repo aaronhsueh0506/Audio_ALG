@@ -1,5 +1,5 @@
 /**
- * 4aec_nr_res.h
+ * aec_4ch/4aec_nr_res.h
  *
  * Four-microphone linear-AEC front end with one shared delay matcher and one
  * post-beam NR/RES path.

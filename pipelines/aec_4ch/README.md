@@ -43,12 +43,12 @@ The result passes through one mono NR+RES path without a fifth AEC.
 
 The deployable C seam is:
 
-- [`../4aec_nr_res.h`](../4aec_nr_res.h): public config, lifecycle, pre/post
+- [`4aec_nr_res.h`](4aec_nr_res.h): public config, lifecycle, pre/post
   calls, frame token, and structural audit accessors;
-- [`../4aec_nr_res.c`](../4aec_nr_res.c): one shared `DelayAec3`, four linear
+- [`4aec_nr_res.c`](4aec_nr_res.c): one shared `DelayAec3`, four linear
   `Aec` instances, coherent context projection, one `SuppressionGain`, one
   MMSE-LSA instance, and one final iFFT/OLA;
-- [`../test_4aec_nr_res.c`](../test_4aec_nr_res.c): 16/48 kHz grid, lifecycle,
+- [`test_4aec_nr_res.c`](test_4aec_nr_res.c): 16/48 kHz grid, lifecycle,
   ordering, token invalidation, invalid-config, weight, and finite-output
   acceptance tests.
 

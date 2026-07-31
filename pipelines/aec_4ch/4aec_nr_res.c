@@ -1,5 +1,5 @@
 /**
- * 4aec_nr_res.c
+ * aec_4ch/4aec_nr_res.c
  *
  * Synchronous C implementation of:
  *

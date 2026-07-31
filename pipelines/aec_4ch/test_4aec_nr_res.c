@@ -1,5 +1,5 @@
 /**
- * Structural and lifecycle tests for 4aec_nr_res.h.
+ * Structural and lifecycle tests for aec_4ch/4aec_nr_res.h.
  *
  * The test intentionally uses equal weights as an external-beamformer stand
  * in. The library itself must never choose those weights in production.

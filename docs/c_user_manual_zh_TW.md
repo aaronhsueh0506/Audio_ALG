@@ -22,7 +22,7 @@
   byte-identical；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
 - reusable API：`pipelines/audio_pipeline.h` / `audio_pipeline.c`
 - linkable archive：config-keyed build directory 內的 `libaudio_pipeline.a`
-- 四麥克風 API：`pipelines/4aec_nr_res.h` / `4aec_nr_res.c`
+- 四麥克風 API：`pipelines/aec_4ch/4aec_nr_res.h` / `4aec_nr_res.c`
 - 四麥克風 archive：config-keyed build directory 內的 `lib4aec_nr_res.a`
 
 `pipelines/PLAN_audio_pipeline_api.md` 是 API 實作前的歷史設計草案，

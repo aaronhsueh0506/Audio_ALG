@@ -12,7 +12,7 @@ contracts.
 | `pipelines/` | Production-oriented linear AEC + echo-aware NR/RES | [`pipelines/README.md`](pipelines/README.md) |
 | `AINR/` | Standalone speech enhancement | [`AINR/README.md`](AINR/README.md) |
 | `AIAEC/` | Six neural AEC/AENR candidate architectures | [`AIAEC/README.md`](AIAEC/README.md) |
-| `pipelines/aec_4ch/` + `pipelines/4aec_nr_res.{c,h}` | Python reference and C API for four linear AEC lanes around an externally owned SRP-PHAT/GSC | [`pipelines/aec_4ch/README.md`](pipelines/aec_4ch/README.md) |
+| `pipelines/aec_4ch/` | Python reference and C API for four linear AEC lanes around an externally owned SRP-PHAT/GSC | [`pipelines/aec_4ch/README.md`](pipelines/aec_4ch/README.md) |
 | `lib/aec/`, `lib/nr/` | Conventional algorithm libraries | Git submodules |
 
 The conventional pipeline is the deployable reference path. `AINR/` and

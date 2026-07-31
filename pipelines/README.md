@@ -25,7 +25,7 @@ inside the AEC3 suppression path, exported with the linear residual, fused with
 | NR | libmmse_lsa.a | mmse_lsa_denoiser.h | MMSE-LSA + MCRA noise est + SPP |
 | RES | libaec.a (included) | aec.h (`AecResContext`) | Residual echo suppression, folded into AEC's freq-domain seam |
 | Mono integration | libaudio_pipeline.a | audio_pipeline.h | One-mic AEC + NR/RES, heap or caller-owned pool |
-| 4-ch integration | lib4aec_nr_res.a | 4aec_nr_res.h | One shared matcher + four linear AECs + external beamformer weights + one mono NR/RES |
+| 4-ch integration | lib4aec_nr_res.a | aec_4ch/4aec_nr_res.h | One shared matcher + four linear AECs + external beamformer weights + one mono NR/RES |
 
 RES is not a standalone module/library — it is exposed as the `AecResContext` seam on
 the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process()`
@@ -38,7 +38,8 @@ can run AEC(linear) → NR → RES itself. See `lib/aec/c_impl/include/aec.h` (`
 
 The four-channel API is a separate zero-padding-free grid and does not use
 `AudioPipeline`. See [the 4-channel contract](aec_4ch/README.md) and
-[`4aec_nr_res.h`](4aec_nr_res.h) for its synchronous pre/post boundary.
+[`aec_4ch/4aec_nr_res.h`](aec_4ch/4aec_nr_res.h) for its synchronous
+pre/post boundary.
 
 ## Parameter Alignment
 
