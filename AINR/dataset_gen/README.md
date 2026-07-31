@@ -262,8 +262,9 @@ make test
 ## Requirements
 
 ```
-torch>=1.13
-torchaudio>=0.13
+torch>=1.13,<2.9
+torchaudio>=0.13,<2.9
+soundfile>=0.12
 numpy
 tqdm
 ```

@@ -4,6 +4,11 @@ Neural AEC/AENR research surface. Every directory names the paper/base model
 it represents; the removed generic `AECNet`, `PostFilter`, and `JointAECNR`
 prototype paths are not public APIs.
 
+Install `AIAEC/requirements.txt` before generating data or training.  Its
+TorchAudio `<2.9` upper bound is part of the dataset contract: TorchAudio 2.9
+moved WAV I/O to TorchCodec and ignores the requested `PCM_F`/32-bit save
+arguments.
+
 | Route | Model | Public inputs | Target | Status |
 |---|---|---|---|---|
 | direct AEC/RES, preserve noise | `Align_CRUSE` | mic + unaligned far | near + local noise | selected |
