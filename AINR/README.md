@@ -64,3 +64,29 @@ python3 denoise.py --config config.ini --model /path/to/checkpoint.pt \
 
 Use `--resume` only with a checkpoint accepted by that directory's serialized
 feature/model contract.
+
+## C pre/post-processing
+
+RNNoise-ERB, GTCRN, DeepFilterNet2, and DeepFilterNet3 provide streaming C
+analysis/synthesis code; the neural inference between those two boundaries is
+left to the target accelerator. The production default enables AArch64 NEON.
+Use the same switch as the conventional stack to build the scalar reference:
+
+```bash
+make test-simd          # NEON and forced-scalar digest must match
+make SIMD=0 test        # scalar-only build
+make -C RNNoise-ERB SIMD=0 test
+```
+
+The DFN C API also performs ERB/complex feature normalization, mask expansion,
+deep-filter composition, optional post-filter/attenuation limiting, and WOLA.
+`dfn*_compose()` is the aligned/offline arithmetic reference. Hardware
+integrations must use `dfn*_compose_stream()`: it explicitly pairs a delayed
+network head with the spectrum frame it describes and returns the output frame
+index. DFN3's parallel 1/1 branches cost one hop; DFN2's cascade costs two hops
+because the future DF source first needs its own lookahead mask. Both APIs
+return zero during warm-up; callers must not send an invalid warm-up frame to
+synthesis. GTCRN uses the configured unnormalised
+complex `[F,2]` network boundary. All three C implementations use
+zero-padded streaming warm-up (`center=False` semantics), while the offline
+PyTorch denoisers use centered STFT framing at clip boundaries.

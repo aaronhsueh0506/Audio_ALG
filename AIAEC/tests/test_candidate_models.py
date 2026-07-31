@@ -135,16 +135,24 @@ def test_cagcrn_soft_window_has_gradient():
     assert grad.abs() > 0
 
 
-def test_align_cruse_uses_paper_global_distribution_and_convt_decoder():
+def test_align_cruse_defaults_to_streaming_distribution_and_convt_decoder():
     model = AlignCRUSE(G16).eval()
     x = _spec(2, 8, G16.n_freqs)
     with torch.no_grad():
         out = model(x, x)
-    assert out.delay_distribution.shape == (2, model.max_delay_frames)
+    assert out.delay_distribution.shape == (2, 8, model.max_delay_frames)
     assert isinstance(model.up3.conv, torch.nn.ConvTranspose2d)
     assert isinstance(model.up2.conv, torch.nn.ConvTranspose2d)
     assert isinstance(model.up1.conv, torch.nn.ConvTranspose2d)
     assert isinstance(model.mask_up.conv, torch.nn.ConvTranspose2d)
+
+
+def test_align_cruse_paper_global_mode_is_explicitly_available():
+    model = AlignCRUSE(G16, alignment_mode="paper_global").eval()
+    x = _spec(2, 8, G16.n_freqs)
+    with torch.no_grad():
+        out = model(x, x)
+    assert out.delay_distribution.shape == (2, model.max_delay_frames)
 
 
 def test_csamfr_samples_two_bin_subbands_not_individual_bins():
@@ -190,7 +198,7 @@ def test_grid_adapted_models_accept_16k_low_latency_grid(factory):
 
 
 @pytest.mark.parametrize("factory", [
-    lambda: AlignCRUSE(G16, alignment_mode="causal_running"),
+    lambda: AlignCRUSE(G16),
     lambda: AlignULCNet(G16),
     lambda: GTCRNAENR(G16),
     lambda: DeepVQES(G16),

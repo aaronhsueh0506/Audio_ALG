@@ -31,6 +31,10 @@ from pipelines.aec_4ch import (
 from pipelines.aec_nr_pipeline import run_nr_spectrum, run_res
 
 
+# ---------------------------------------------------------------------------
+# Recording alignment and cohort helpers
+# ---------------------------------------------------------------------------
+
 def estimate_file_offset(capture: np.ndarray, source: np.ndarray) -> tuple[int, float]:
     """Return lag where ``source[0]`` belongs on the capture timeline."""
     capture = np.asarray(capture, dtype=np.float64)
@@ -72,6 +76,10 @@ def _attenuation_db(before: np.ndarray, after: np.ndarray, mask: np.ndarray) -> 
     after_power = float(np.mean(after[mask]))
     return float(10.0 * np.log10((before_power + 1e-20) / (after_power + 1e-20)))
 
+
+# ---------------------------------------------------------------------------
+# Evaluation and acceptance contract
+# ---------------------------------------------------------------------------
 
 def evaluate_case(case_dir: Path, output_dir: Optional[Path] = None) -> dict:
     microphones, sample_rate = sf.read(
@@ -293,6 +301,10 @@ def validate_recording_contract(result: dict) -> None:
             + "; ".join(failures)
         )
 
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser()

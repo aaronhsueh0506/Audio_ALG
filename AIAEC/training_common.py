@@ -27,10 +27,11 @@ Provided here:
   papers publish a loss (see ``docs/ai_aec_candidate_matrix.md`` and the
   DeepVQE_S/CAGCRN READMEs' "did not publish ... loss details"); this is the
   one loss every trainer uses, so scores stay comparable across candidates
-* ``LinearAecEngine``                         -- per-lane frozen production
-  linear AEC (``lib/aec``, RES+CNG disabled) for the three
-  "linear AEC -> RES+NR" candidates (Align_ULCNet, GTCRN_AENR,
-  DeepFilterNet_AENR)
+* ``LinearAecEngine``                         -- inference-only continuous-file
+  wrapper around the same frozen Python PBFDKF whose output is materialized as
+  dataset stem six. Trainers never execute it.
+* ``split_dataset_by_sample`` / ``build_plain_loaders`` -- deterministic
+  per-chunk train/val split plus epoch-level shuffle for the unified corpus.
 
 Do not add a seventh copy of any of this into a candidate's ``train.py``. If a
 candidate genuinely needs different behaviour, change the signature here so
@@ -50,6 +51,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from torch import Tensor
+from torch.utils.data import DataLoader
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUDIO_ALG_ROOT = os.path.dirname(_THIS_DIR)
@@ -58,7 +60,7 @@ for _path in (_AUDIO_ALG_ROOT, _LIB_AEC_PYTHON):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from AINR.dataset_gen import set_seed  # noqa: E402
+from AINR.dataset_gen import set_seed, subsets_from_indices  # noqa: E402
 from AINR.DeepFilterNet2.train import (  # noqa: E402
     GradNormLog,
     NonFiniteTraining,
@@ -71,10 +73,20 @@ from AINR.DeepFilterNet2.train import (  # noqa: E402
 # `from modules.xxx import ...`, which resolves only with lib/aec/python
 # itself (not lib/aec) on sys.path -- the same setup run_one_case.py and
 # eval_aec_challenge.py use.
-from aec import AEC, AecConfig, AecMode, AecPreset  # noqa: E402
+from aec import AEC  # noqa: E402
 
 from AIAEC.aiaec_common import SignalGrid, safe_abs  # noqa: E402
-from AIAEC.dataset_gen import AecGrid  # noqa: E402
+from AIAEC.dataset_gen import (  # noqa: E402
+    AecGrid,
+    PackedAecDataset,
+    aec_collate,
+)
+from AIAEC.dataset_gen.linear_aec import (  # noqa: E402
+    LinearAecContract,
+    make_linear_aec_config,
+    make_linear_aec_contract,
+    require_linear_aec_contract,
+)
 
 
 __all__ = [
@@ -82,9 +94,12 @@ __all__ = [
     'build_arg_parser',
     'auto_device',
     'read_grids',
+    'split_dataset_by_sample',
+    'build_plain_loaders',
     'read_model_kwargs',
     'make_checkpoint_contract',
     'require_checkpoint_contract',
+    'require_checkpoint_linear_aec',
     'scan_non_finite',
     'NonFiniteTraining',
     'GradNormLog',
@@ -148,6 +163,84 @@ def read_grids(cfg, section: str = 'signal') -> Tuple[AecGrid, 'SignalGrid']:
     aec_grid = AecGrid.from_config(cfg, section=section)
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)
     return aec_grid, model_grid
+
+
+# ============================================================
+# Train/val split at load time (paired with --split all / build_unified_manifest)
+# ============================================================
+
+def split_dataset_by_sample(dataset, val_fraction: float,
+                            seed: int = 42) -> Tuple[List[int], List[int]]:
+    """Deterministically random-split individual materialized chunks.
+
+    The frozen PBFDKF has already run over each complete parent sequence before
+    stem six was cut into chunks. Consequently each stored item is now a fixed
+    model sample: the trainer may place any chunk on either side and shuffle
+    train order without changing adaptive-filter state. Sharing a sequence,
+    speaker or RIR across train/validation is an explicit in-distribution
+    validation choice, matching the standalone NR loaders.
+
+    Returned indices are sorted only for shard/mmap locality. The assignment is
+    drawn from a dedicated RNG and depends exclusively on dataset length and
+    ``seed``.
+    """
+    if not 0.0 <= val_fraction < 1.0:
+        raise ValueError(f"val_fraction must be in [0, 1), got {val_fraction}")
+    size = len(dataset)
+    if val_fraction > 0.0 and size < 2:
+        raise ValueError(
+            f"only {size} sample(s) in this dataset; a held-out split needs "
+            "at least 2 so both sides are non-empty"
+        )
+    generator = torch.Generator().manual_seed(seed)
+    order = torch.randperm(size, generator=generator).tolist()
+    n_val = max(1, int(round(size * val_fraction))) if val_fraction > 0.0 else 0
+    if n_val >= size:
+        raise ValueError(
+            f"val split ({n_val}) would consume the whole dataset ({size} samples)"
+        )
+    return sorted(order[n_val:]), sorted(order[:n_val])
+
+
+def build_plain_loaders(cfg, aec_grid, seed: int = 42,
+                        section: str = 'data') -> Tuple[
+                            DataLoader, Optional[DataLoader], Dict]:
+    """Build the shared per-chunk split/loaders and its checkpoint contract.
+
+    Every candidate uses this exact path. Train samples reshuffle every epoch;
+    validation order stays stable. The returned JSON-serializable data
+    contract records the exact corpus and split used for resume checks.
+    """
+    dataset = PackedAecDataset(cfg.get(section, 'packed_dir'), expected_sr=aec_grid.sr)
+    val_fraction = cfg.getfloat(section, 'val_fraction', fallback=0.1)
+    train_indices, val_indices = split_dataset_by_sample(
+        dataset, val_fraction, seed=seed
+    )
+    train_subset, val_subset = subsets_from_indices(dataset, train_indices, val_indices)
+
+    batch_size = cfg.getint(section, 'batch_size')
+    num_workers = cfg.getint(section, 'num_workers', fallback=0)
+    train_loader = DataLoader(
+        train_subset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, collate_fn=aec_collate, drop_last=False,
+    )
+    val_loader = None
+    if val_indices:
+        val_loader = DataLoader(
+            val_subset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, collate_fn=aec_collate, drop_last=False,
+        )
+    data_contract = {
+        'dataset_fingerprint': dataset.fingerprint(),
+        'linear_aec': dataset.linear_aec_contract.as_dict(),
+        'linear_aec_contract_hash': dataset.linear_aec_contract_hash,
+        'split_kind': 'random_chunk',
+        'split_seed': int(seed),
+        'val_fraction': float(val_fraction),
+        'train_indices': train_indices,
+        'val_indices': val_indices,
+    }
+    return train_loader, val_loader, data_contract
 
 
 # ============================================================
@@ -223,7 +316,8 @@ def read_model_kwargs(cfg, model_cls, section: str = 'model',
 # ============================================================
 
 def make_checkpoint_contract(*, model_name: str, task: str, grid, model_kwargs: Dict,
-                             loss_version: str, feature_version: Optional[str] = None) -> Dict:
+                             loss_version: str, feature_version: Optional[str] = None,
+                             data_contract: Optional[Dict] = None) -> Dict:
     """The fields a checkpoint must match to be resumed or loaded for inference.
 
     ``model_kwargs`` should be exactly what ``read_model_kwargs`` returned
@@ -253,6 +347,12 @@ def make_checkpoint_contract(*, model_name: str, task: str, grid, model_kwargs: 
     }
     if feature_version is not None:
         contract['feature_version'] = feature_version
+    if data_contract is not None:
+        contract['data'] = data_contract
+        contract['linear_aec'] = data_contract['linear_aec']
+        contract['linear_aec_contract_hash'] = data_contract[
+            'linear_aec_contract_hash'
+        ]
     contract.update({f'ctor_{k}': v for k, v in sorted(model_kwargs.items())})
     return contract
 
@@ -260,18 +360,57 @@ def make_checkpoint_contract(*, model_name: str, task: str, grid, model_kwargs: 
 def require_checkpoint_contract(ckpt: Dict, expected: Dict, context: str = 'checkpoint') -> None:
     """Reject a checkpoint whose recorded contract disagrees with ``expected``."""
     saved = ckpt.get('contract', {})
-    for key, want in expected.items():
-        got = saved.get(key, '<missing>')
+    def compare(got, want, path):
+        if isinstance(want, dict):
+            if not isinstance(got, dict):
+                return path, got, want
+            for key, child_want in want.items():
+                if key not in got:
+                    return f"{path}.{key}", '<missing>', child_want
+                mismatch = compare(got[key], child_want, f"{path}.{key}")
+                if mismatch is not None:
+                    return mismatch
+            return None
         if isinstance(want, float) and isinstance(got, (int, float)):
             ok = math.isclose(float(got), want, rel_tol=1e-7, abs_tol=1e-7)
         else:
             ok = got == want
-        if not ok:
-            raise ValueError(
-                f"{context} contract {key}={got!r}, but the running config "
-                f"requires {want!r}. Retrain, or fix config.ini before resuming/"
-                f"loading for inference."
-            )
+        return None if ok else (path, got, want)
+
+    mismatch = compare(saved, expected, 'contract')
+    if mismatch is not None:
+        path, got, want = mismatch
+        if isinstance(got, list):
+            got = f"<list len={len(got)}>"
+        if isinstance(want, list):
+            want = f"<list len={len(want)}>"
+        raise ValueError(
+            f"{context} {path}={got!r}, but the running config requires "
+            f"{want!r}. Retrain, or fix config.ini before resuming/loading "
+            f"for inference."
+        )
+
+
+def require_checkpoint_linear_aec(contract: Dict, grid) -> Dict:
+    """Validate and return the materialized PBFDKF contract for inference."""
+    if 'linear_aec' not in contract:
+        raise ValueError("checkpoint has no materialized linear_aec contract")
+    if 'linear_aec_contract_hash' not in contract:
+        raise ValueError("checkpoint has no linear_aec_contract_hash")
+    linear = LinearAecContract.from_dict(contract['linear_aec'])
+    if contract['linear_aec_contract_hash'] != linear.fingerprint():
+        raise ValueError(
+            "checkpoint linear_aec_contract_hash does not match linear_aec"
+        )
+    sr = getattr(grid, 'sr', getattr(grid, 'sample_rate', None))
+    expected = (int(sr), int(grid.n_fft), int(grid.hop_len))
+    actual = (linear.sample_rate, linear.frame_size, linear.hop_size)
+    if actual != expected:
+        raise ValueError(
+            "checkpoint model/PBFDKF grid mismatch: "
+            f"model sr/frame/hop={expected}, linear_aec={actual}"
+        )
+    return linear.as_dict()
 
 
 # ============================================================
@@ -343,70 +482,60 @@ def halt_on_non_finite(reason: str, *, model, optimizer, mic: Tensor, target: Te
 
 
 # ============================================================
-# Frozen production linear AEC (for the three "-> RES+NR" candidates)
+# Frozen linear AEC for offline/file inference
 # ============================================================
 
 class LinearAecEngine:
-    """Per-lane frozen production linear AEC, RES and CNG disabled.
+    """Continuous Python-PBFDKF wrapper for RES+NR file inference.
 
-    Wraps the reference Python engine in ``lib/aec/python`` -- the same
-    engine the AEC repo 800-case-benches and treats as the fp64 algorithm
-    spec for the float32 C production port (``lib/aec/CLAUDE.md``).
-    ``enable_res=False, enable_cng=False`` makes ``AEC.process()`` return the
-    linear PBFDKF residual before any suppression gain -- documented in
-    ``lib/aec/CLAUDE.md``: "running with --enable-res 0 emits the linear
-    residual at PBFDKF output" -- i.e. exactly ``E = Y - D_hat``. The echo
-    estimate is recovered by subtraction, ``D_hat = Y - E``, never a second
-    read of internal filter state; this matches the signal model documented
-    in ``AIAEC/dataset_gen/aec_features.py`` and ``dataset_gen/README.md``.
+    Training reads the already-materialized sixth dataset stem and never calls
+    this class. Inference constructs it from the checkpoint's exact
+    ``linear_aec`` contract, processes the whole file as one stateful stream,
+    and recovers ``D_hat`` by subtraction.
 
-    One ``AEC`` instance per lane, because the filter's convergence state --
-    cold at a sequence's first chunk, progressively converged afterwards --
-    is exactly the thing the corpus's long stateful sequences and
-    ``SequenceChunkSampler`` exist to make realistic (see
-    ``dataset_gen/README.md``, "Why sequences are long"). A lane resets to a
-    brand new ``AEC`` object -- not a partial ``.reset()`` of unaudited scope
-    -- whenever the caller's ``reset_mask`` says that lane's sequence just
-    started, the same reset signal ``lane_reset_mask`` gives a model's own
-    recurrent state.
-
-    Usage (see a candidate's ``train.py`` for the full loop): the
-    ``model_views.build_model_view`` ``linear_aec`` callback has a fixed
-    ``(mic, far, sample_rate) -> (error, echo_estimate)`` signature with no
-    room for per-call reset information, so the reset mask is armed
-    separately and consumed by the next call:
-
-        engine.arm_reset(lane_reset_mask(meta_chunk_indices).tolist())
-        view = build_model_view(stems, model_name, grid.sr, linear_aec=engine)
-
-    ⚠ This is the reference PYTHON engine, not the shipped C build. It is
-    CPU-costly per step (a Python per-hop loop, times n_lanes, every training
-    step) and, being frozen and deterministic, repeats identical work every
-    epoch. The AI-AEC plan's Milestone 2 (docs/archive/
-    ai_aec_candidate_matrix_2026_07_30.md) calls for precomputing this once
-    with the shipped C build and caching it, stratified by filter state; that
-    caching layer does not exist yet, so today it runs live. Budget batch
-    size / lane count accordingly.
+    The multi-lane/reset surface is retained for diagnostics and parity tests,
+    not for trainer batching.
     """
 
     def __init__(self, n_lanes: int, sample_rate: int, preset: str = 'balanced',
-                 filter_length: Optional[int] = None):
+                 filter_length: Optional[int] = None,
+                 frame_size: Optional[int] = None,
+                 contract: Optional[Dict] = None):
         if n_lanes <= 0:
             raise ValueError(f"n_lanes must be positive, got {n_lanes}")
         self.n_lanes = int(n_lanes)
         self.sample_rate = int(sample_rate)
-        self._preset = AecPreset(preset)
-        self._filter_length = filter_length
+        self.contract = (
+            LinearAecContract.from_dict(contract)
+            if contract is not None else
+            make_linear_aec_contract(
+                self.sample_rate, preset=preset, frame_size=frame_size,
+                filter_length=filter_length,
+            )
+        )
+        if self.contract.sample_rate != self.sample_rate:
+            raise ValueError(
+                f"linear AEC contract sr={self.contract.sample_rate}, requested "
+                f"sample_rate={self.sample_rate}"
+            )
+        runtime_contract = make_linear_aec_contract(
+            self.contract.sample_rate,
+            preset=self.contract.preset,
+            frame_size=self.contract.frame_size,
+            filter_length=self.contract.filter_length,
+        )
+        require_linear_aec_contract(
+            runtime_contract.as_dict(), self.contract.as_dict(), "inference runtime"
+        )
         self._engines: List[AEC] = [self._new_engine() for _ in range(self.n_lanes)]
         self._pending_reset: Optional[List[bool]] = None
 
     def _new_engine(self) -> AEC:
-        overrides = {}
-        if self._filter_length is not None:
-            overrides['filter_length'] = self._filter_length
-        cfg = AecConfig.from_preset(
-            self._preset, sample_rate=self.sample_rate, mode=AecMode.PBFDKF,
-            enable_res=False, enable_cng=False, enable_shadow=True, **overrides,
+        cfg = make_linear_aec_config(
+            self.contract.sample_rate,
+            preset=self.contract.preset,
+            frame_size=self.contract.frame_size,
+            filter_length=self.contract.filter_length,
         )
         return AEC(cfg)
 
@@ -425,13 +554,10 @@ class LinearAecEngine:
                        reset_mask: Sequence[bool]) -> Tuple[np.ndarray, np.ndarray]:
         """Returns ``(error, echo_estimate)``, both EXACTLY ``mic.shape``.
 
-        ``model_views.build_model_view`` requires the linear-AEC error to be
-        the same shape as the microphone (it rejects a shorter one), so this
-        cannot truncate to a whole number of hops the way
-        ``process_wav_files`` does. A 3 s chunk at 16 kHz/hop 256 is 187.5
-        hops -- there is always a sub-hop remainder for SOME chunk length,
-        this project's included. The trailing remainder (< one hop, at most
-        ~16 ms at 16 kHz) is too short to feed ``AEC.process()`` at all, so it
+        The returned signal must stay the same shape as the microphone, so
+        this cannot truncate to a whole number of hops. A file may end with
+        a sub-hop remainder. That remainder is too short to feed
+        ``AEC.process()`` at all, so it
         passes through with no cancellation applied (``error = mic``,
         ``echo_estimate = 0`` there) -- the honest answer for a fragment the
         engine never got to see, not an invented one.

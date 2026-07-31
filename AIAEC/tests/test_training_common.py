@@ -1,4 +1,6 @@
 import configparser
+import copy
+import pathlib
 
 import pytest
 import torch
@@ -13,7 +15,10 @@ from AIAEC.training_common import (
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
+    require_checkpoint_linear_aec,
+    split_dataset_by_sample,
 )
+from AIAEC.dataset_gen import LinearAecProcessor, make_linear_aec_contract
 from AINR.DeepFilterNet2.model import DeepFilterNet2
 
 
@@ -33,7 +38,7 @@ def test_read_grids_builds_matching_aec_and_signal_grids():
 def test_read_model_kwargs_overlays_only_declared_keys():
     kwargs = read_model_kwargs(_cfg('[model]\ngru_hidden = 96\n'), AlignCRUSE)
     assert kwargs['gru_hidden'] == 96
-    assert kwargs['alignment_mode'] == 'paper_global'   # untouched constructor default
+    assert kwargs['alignment_mode'] == 'causal_running'  # deployment-safe default
 
 
 def test_read_model_kwargs_rejects_unknown_key():
@@ -64,8 +69,53 @@ def test_checkpoint_contract_roundtrip_and_mismatch():
         model_kwargs=kwargs, loss_version='v1',
     )
     require_checkpoint_contract({'contract': contract}, contract)   # must not raise
-    with pytest.raises(ValueError, match='contract sr'):
+    with pytest.raises(ValueError, match=r'contract\.sr'):
         require_checkpoint_contract({'contract': contract}, {**contract, 'sr': 48000})
+
+
+def test_checkpoint_contract_rejects_changed_data_split_indices():
+    grid = SignalGrid(16000, 512, 512, 256)
+    linear = make_linear_aec_contract(16000)
+    data_contract = {
+        'dataset_fingerprint': 'corpus-a',
+        'linear_aec': linear.as_dict(),
+        'linear_aec_contract_hash': linear.fingerprint(),
+        'split_kind': 'random_chunk',
+        'split_seed': 42,
+        'val_fraction': 0.1,
+        'train_indices': [0, 2, 3],
+        'val_indices': [1],
+    }
+    contract = make_checkpoint_contract(
+        model_name='Align_ULCNet', task='linear_aec_postfilter_res_nr',
+        grid=grid, model_kwargs={}, loss_version='v1',
+        data_contract=data_contract,
+    )
+    require_checkpoint_contract({'contract': contract}, contract)
+    changed = copy.deepcopy(contract)
+    changed['data']['val_indices'] = [2]
+    with pytest.raises(ValueError, match=r'contract\.data\.val_indices'):
+        require_checkpoint_contract({'contract': contract}, changed)
+
+
+def test_checkpoint_linear_aec_rejects_hash_and_model_grid_mismatch():
+    linear = make_linear_aec_contract(16000)
+    grid = SignalGrid(16000, 512, 512, 256)
+    checkpoint_contract = {
+        'linear_aec': linear.as_dict(),
+        'linear_aec_contract_hash': linear.fingerprint(),
+    }
+    assert require_checkpoint_linear_aec(
+        checkpoint_contract, grid
+    ) == linear.as_dict()
+
+    bad_hash = {**checkpoint_contract, 'linear_aec_contract_hash': 'bad'}
+    with pytest.raises(ValueError, match='contract_hash'):
+        require_checkpoint_linear_aec(bad_hash, grid)
+    with pytest.raises(ValueError, match='grid mismatch'):
+        require_checkpoint_linear_aec(
+            checkpoint_contract, SignalGrid(48000, 1024, 1024, 512)
+        )
 
 
 def test_checkpoint_contract_ctor_prefix_does_not_collide_with_model_name():
@@ -103,3 +153,103 @@ def test_linear_aec_engine_rejects_sample_rate_mismatch():
     mic = torch.randn(1, 16000) * 0.05
     with pytest.raises(ValueError, match='sample_rate'):
         engine(mic, mic, 48000)
+
+
+def test_inference_linear_aec_matches_offline_materializer_exactly():
+    contract = make_linear_aec_contract(16000)
+    generator = torch.Generator().manual_seed(19)
+    far = torch.randn(32768, generator=generator) * 0.05
+    mic = torch.randn(32768, generator=generator) * 0.02 + far * 0.3
+
+    offline, offline_echo = LinearAecProcessor(contract).process(mic, far)
+    inference = LinearAecEngine(
+        n_lanes=1, sample_rate=16000, contract=contract.as_dict()
+    )
+    online, online_echo = inference(
+        mic.unsqueeze(0), far.unsqueeze(0), sample_rate=16000
+    )
+    torch.testing.assert_close(online.squeeze(0), offline, rtol=0.0, atol=0.0)
+    torch.testing.assert_close(
+        online_echo.squeeze(0), offline_echo, rtol=0.0, atol=0.0
+    )
+
+
+def test_inference_rejects_drifted_linear_aec_source_contract():
+    contract = make_linear_aec_contract(16000).as_dict()
+    contract['aec_source_hash'] = '0' * 64
+    with pytest.raises(ValueError, match='aec_source_hash'):
+        LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
+
+
+def test_resnr_trainers_do_not_import_or_execute_live_linear_aec():
+    aiaec_root = pathlib.Path(__file__).parents[1]
+    for model_name in ('Align_ULCNet', 'GTCRN_AENR', 'DeepFilterNet_AENR'):
+        source = (aiaec_root / model_name / 'train.py').read_text()
+        assert 'LinearAecEngine' not in source
+        assert 'build_sequence_loaders' not in source
+        assert 'SequenceChunkSampler' not in source
+        assert 'lane_reset_mask' not in source
+
+
+class _FakeDataset:
+    """Minimal dataset for the deterministic per-sample split."""
+
+    def __init__(self, chunks_per_sequence):
+        self._sequence_ids = []
+        self._chunk_indices = []
+        for sequence_id, n_chunks in enumerate(chunks_per_sequence):
+            for chunk_index in range(n_chunks):
+                self._sequence_ids.append(sequence_id)
+                self._chunk_indices.append(chunk_index)
+
+    def sequence_ids(self):
+        return list(self._sequence_ids)
+
+    def chunk_indices(self):
+        return list(self._chunk_indices)
+
+    def meta(self, index):
+        return {'sequence_id': self._sequence_ids[index], 'chunk_index': self._chunk_indices[index]}
+
+    def __len__(self):
+        return len(self._sequence_ids)
+
+    def __getitem__(self, index):
+        return self._sequence_ids[index], self._chunk_indices[index]
+
+
+def test_split_dataset_by_sample_can_straddle_sequences_and_covers_everything():
+    dataset = _FakeDataset([3] * 20)
+    train_indices, val_indices = split_dataset_by_sample(
+        dataset, val_fraction=0.2, seed=42
+    )
+
+    assert sorted(train_indices + val_indices) == list(range(len(dataset)))
+    assert not (set(train_indices) & set(val_indices))
+    train_sequences = {dataset.sequence_ids()[i] for i in train_indices}
+    val_sequences = {dataset.sequence_ids()[i] for i in val_indices}
+    assert train_sequences & val_sequences, "per-chunk split should allow straddling"
+    assert len(val_indices) == 12
+
+
+def test_split_dataset_by_sample_is_deterministic_given_seed():
+    dataset = _FakeDataset([2] * 10)
+    a = split_dataset_by_sample(dataset, val_fraction=0.3, seed=7)
+    b = split_dataset_by_sample(dataset, val_fraction=0.3, seed=7)
+    assert a == b
+    assert a != split_dataset_by_sample(dataset, val_fraction=0.3, seed=8)
+
+
+def test_split_dataset_by_sample_zero_val_fraction_is_all_train():
+    dataset = _FakeDataset([2] * 5)
+    train_indices, val_indices = split_dataset_by_sample(
+        dataset, val_fraction=0.0, seed=1
+    )
+    assert val_indices == []
+    assert sorted(train_indices) == list(range(len(dataset)))
+
+
+def test_split_dataset_by_sample_rejects_out_of_range_fraction():
+    dataset = _FakeDataset([1] * 3)
+    with pytest.raises(ValueError, match='val_fraction'):
+        split_dataset_by_sample(dataset, val_fraction=1.0, seed=1)

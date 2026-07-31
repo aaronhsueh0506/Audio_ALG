@@ -26,8 +26,10 @@ Default signal contract:
 - mask/DF lookahead `1/1`;
 - optional post-filter disabled.
 
-The one-frame lookahead is a deliberate latency choice. Upstream releases use
-2/2; changing it requires retraining and a new checkpoint contract.
+Each one-frame lookahead is a deliberate model choice. Upstream releases use
+2/2; this port uses 1/1. In DFN2's cascade those two dependencies are serial,
+so the deployed total is two hops. Changing either value requires retraining
+and a new checkpoint contract.
 
 ## Checkpoints
 
@@ -55,6 +57,23 @@ python3 denoise.py --config config.ini \
 ```
 
 Use `AINR/dataset_gen` to produce or pack the 48 kHz noisy/clean pairs.
+
+## C deployment boundary
+
+`dfn2_process.h/.c` owns the streaming STFT, ERB/complex normalization,
+parameter-free cascade/alpha composition, attenuation limit, and WOLA. The
+accelerator only needs to emit `(erb_mask, coefs, alpha)`. Run
+`make -C .. test-simd` to compare the default NEON path against the scalar
+reference; `make -C .. SIMD=0 test` forces the latter.
+
+Use `dfn2_compose_stream()` for the accelerator boundary, not the aligned
+`dfn2_compose()` reference. At wall frame `n`, the returned head describes
+`n-mask_lookahead`; the cascade can emit only after that head has also masked
+the future DF source. Therefore the shipped `mask_lookahead=1` and
+`df_lookahead=1` have a total streaming delay of **two hops** (21.33 ms at
+48 kHz), even though each individual knob is one. The C test uses changing
+masks and nontrivial future taps so an off-by-one head/spectrum pairing cannot
+pass as a merely finite output.
 
 ## Debugging excessive low-frequency suppression
 

@@ -11,13 +11,17 @@ excellent, and a sequence packed out of order looks like slow convergence.
 import argparse
 import copy
 import configparser
+import dataclasses
+import json
 import math
 import pathlib
 
 import pytest
 import torch
+import torchaudio
 
 from AIAEC.dataset_gen import (
+    BASE_STEM_ORDER,
     STEM_ORDER,
     AecGrid,
     AecStems,
@@ -26,6 +30,9 @@ from AIAEC.dataset_gen import (
     assert_source_disjoint,
     istft,
     lane_reset_mask,
+    LinearAecContract,
+    LinearAecProcessor,
+    make_linear_aec_contract,
     stft,
 )
 from AIAEC.dataset_gen.aec_dataset import (
@@ -37,12 +44,15 @@ from AIAEC.dataset_gen.aec_dataset import (
 )
 from AIAEC.dataset_gen.gen_aec_dataset import gen_aec_dataset
 from AIAEC.dataset_gen.manifest import (
+    UNIFIED_SPLIT,
     build_manifest,
+    build_unified_manifest,
     load_manifest,
     pools_for_split,
 )
 from AIAEC.dataset_gen.pack_aec_dataset import pack
 from AIAEC.dataset_gen.packed_aec_dataset import PackedAecDataset
+from AIAEC.dataset_gen.rematerialize_linear_aec import rematerialize
 
 
 SR = 16000
@@ -79,6 +89,28 @@ def _rir(n_samples, rt60, generator):
     return out * 0.5
 
 
+def _base_cfg(root):
+    """config.example.ini pointed at ``root``'s sources, on a tiny but
+    PBFDKF-hop-exact grid: 1.024 s = 64 hops @16 kHz/256.
+
+    Shared by every fixture/helper in this file that builds a corpus under
+    its own ``root`` -- each caller layers its own extra ``cfg.set(...)`` on
+    top (e.g. ``corpus`` sets ``val_fraction``/``p_ref_dropout``).
+    """
+    cfg = configparser.ConfigParser()
+    cfg.read(pathlib.Path(__file__).parents[1] / 'config.example.ini')
+    cfg.set('signal', 'sr', str(SR))
+    cfg.set('paths', 'speech_dir', str(root / 'speech'))
+    cfg.set('paths', 'noise_dir', str(root / 'noise'))
+    cfg.set('paths', 'rir_dir', str(root / 'rir'))
+    cfg.set('sequence', 'seq_sec_min', '2.048')
+    cfg.set('sequence', 'seq_sec_max', '3.072')
+    cfg.set('sequence', 'chunk_sec', '1.024')
+    cfg.set('rir', 'rt60_min', '0.05')
+    cfg.set('rir', 'rt60_max', '2.0')
+    return cfg
+
+
 @pytest.fixture(scope='module')
 def corpus(tmp_path_factory):
     """Sources + config + manifest, built once for the whole module."""
@@ -97,18 +129,8 @@ def corpus(tmp_path_factory):
             _write(root / 'rir' / f'room_{room:02d}' / f'rir_{index}.wav',
                    _rir(int(0.35 * SR), 0.3 + 0.1 * room, generator))
 
-    cfg = configparser.ConfigParser()
-    cfg.read(pathlib.Path(__file__).parents[1] / 'config.example.ini')
-    cfg.set('signal', 'sr', str(SR))
-    cfg.set('paths', 'speech_dir', str(root / 'speech'))
-    cfg.set('paths', 'noise_dir', str(root / 'noise'))
-    cfg.set('paths', 'rir_dir', str(root / 'rir'))
+    cfg = _base_cfg(root)
     cfg.set('split', 'val_fraction', '0.25')
-    cfg.set('sequence', 'seq_sec_min', '2.0')
-    cfg.set('sequence', 'seq_sec_max', '3.0')
-    cfg.set('sequence', 'chunk_sec', '1.0')
-    cfg.set('rir', 'rt60_min', '0.05')
-    cfg.set('rir', 'rt60_max', '2.0')
     # Boosted so the small corpus reliably contains the load-bearing scenario.
     cfg.set('scenarios', 'p_ref_dropout', '0.30')
 
@@ -154,7 +176,7 @@ def test_stem_channel_order_matches_declared_list(packed):
     """The shard's declared order must be THE order, in every shard."""
     assert list(STEM_ORDER) == [
         'far_render', 'near_speech', 'near_target', 'local_noise',
-        'mic_postclip',
+        'mic_postclip', 'linear_error',
     ]
     for split in ('train', 'val'):
         dataset = packed[split]
@@ -196,6 +218,158 @@ def test_dereverb_target_is_stored_and_uses_the_same_near_gain(packed):
                     and not torch.allclose(view.near_target, view.near_speech)):
                 observed_difference = True
     assert observed_difference, "early/full near RIR targets were accidentally identical"
+
+
+def test_linear_error_is_finite_and_dhat_is_exactly_derivable(packed):
+    for split in ('train', 'val'):
+        dataset = packed[split]
+        for index in range(len(dataset)):
+            view = dataset.stems_of(index)
+            assert torch.isfinite(view.linear_error).all()
+            torch.testing.assert_close(
+                view.mic_postclip - view.linear_error,
+                view.D_hat,
+                rtol=0.0, atol=0.0,
+            )
+
+
+def test_linear_aec_state_is_continuous_across_future_chunk_boundaries():
+    contract = make_linear_aec_contract(16000, frame_size=512)
+    chunk_samples = 32768
+    generator = torch.Generator().manual_seed(123)
+    far = torch.randn(2 * chunk_samples, generator=generator) * 0.05
+    echo = torch.zeros_like(far)
+    echo[96:] = 0.7 * far[:-96]
+    mic = echo.clone()
+
+    full_error, _ = LinearAecProcessor(contract).process(mic, far)
+
+    continuous = LinearAecProcessor(contract)
+    first, _ = continuous.process(mic[:chunk_samples], far[:chunk_samples])
+    second, _ = continuous.process(mic[chunk_samples:], far[chunk_samples:])
+    torch.testing.assert_close(
+        torch.cat([first, second]), full_error, rtol=0.0, atol=0.0,
+    )
+
+    reset_second, _ = LinearAecProcessor(contract).process(
+        mic[chunk_samples:], far[chunk_samples:]
+    )
+    assert not torch.equal(second, reset_second)
+
+
+@pytest.mark.parametrize(
+    ('field', 'value'),
+    (('sample_rate', 44100), ('frame_size', 1024), ('hop_size', 128)),
+)
+def test_linear_aec_contract_rejects_wrong_sr_frame_or_hop(field, value):
+    contract = make_linear_aec_contract(16000).as_dict()
+    contract[field] = value
+    with pytest.raises(ValueError, match='linear AEC'):
+        LinearAecContract.from_dict(contract)
+
+
+def test_dataset_config_rejects_mismatched_model_and_pbfdkf_grid(corpus):
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('linear_aec', 'frame_size', '1024')
+    with pytest.raises(ValueError, match='frame/hop'):
+        AecSequenceRenderer(
+            cfg, pools_for_split(corpus['manifest'], 'train'), corpus_seed=SEED
+        )
+
+
+def test_packed_dataset_rejects_legacy_five_channel_shard(tmp_path):
+    contract = make_linear_aec_contract(16000, frame_size=512)
+    path = tmp_path / 'legacy.pt'
+    torch.save({
+        'stems': list(BASE_STEM_ORDER),
+        'data': torch.zeros(1, len(BASE_STEM_ORDER), 256),
+        'sr': 16000,
+        'meta': [{
+            'sequence_id': 0, 'chunk_index': 0,
+            'linear_aec_contract_hash': contract.fingerprint(),
+        }],
+        'linear_aec': contract.as_dict(),
+        'linear_aec_contract_hash': contract.fingerprint(),
+    }, path)
+    with pytest.raises(ValueError, match='stem order'):
+        PackedAecDataset(str(path), verbose=False)
+
+
+def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
+        packed, corpus, tmp_path):
+    source = packed['output'] / 'train'
+    destination = tmp_path / 'legacy_train'
+    seqs = destination / 'seqs'
+    seqs.mkdir(parents=True)
+
+    with open(source / 'meta.json', 'r') as handle:
+        run_meta = json.load(handle)
+    source_meta_path = sorted((source / 'seqs').glob('[0-9]*.json'))[0]
+    with open(source_meta_path, 'r') as handle:
+        chunk_meta = json.load(handle)
+    sequence_id = int(source_meta_path.stem)
+    expected_errors = []
+
+    for chunk_index in range(len(chunk_meta)):
+        source_wav = source / 'seqs' / f'{sequence_id:06d}_{chunk_index:03d}.wav'
+        audio, sr = torchaudio.load(source_wav)
+        expected_errors.append(audio[STEM_ORDER.index('linear_error')].clone())
+        # Simulate interruption: the first file was already rewritten to six
+        # channels, while the remaining files are still legacy five-channel.
+        write_audio = audio if chunk_index == 0 else audio[:len(BASE_STEM_ORDER)]
+        torchaudio.save(
+            str(seqs / source_wav.name), write_audio, sr,
+            encoding='PCM_F', bits_per_sample=32,
+        )
+
+    for meta in chunk_meta:
+        meta.pop('linear_aec_contract_hash', None)
+    with open(seqs / source_meta_path.name, 'w') as handle:
+        json.dump(chunk_meta, handle)
+
+    run_meta['stems'] = list(BASE_STEM_ORDER)
+    run_meta['n_sequences'] = 1
+    run_meta['n_chunks'] = len(chunk_meta)
+    run_meta.pop('linear_aec', None)
+    run_meta.pop('linear_aec_contract_hash', None)
+    with open(destination / 'meta.json', 'w') as handle:
+        json.dump(run_meta, handle)
+
+    args = argparse.Namespace(
+        input=str(destination), config=str(corpus['config_path']),
+        resume=True, wav_encoding='auto',
+    )
+    rematerialize(args)
+
+    with open(destination / 'meta.json', 'r') as handle:
+        upgraded_meta = json.load(handle)
+    assert tuple(upgraded_meta['stems']) == STEM_ORDER
+    assert upgraded_meta['linear_aec_contract_hash']
+    actual_errors = []
+    for chunk_index, meta in enumerate(chunk_meta):
+        wav_path = seqs / f'{sequence_id:06d}_{chunk_index:03d}.wav'
+        audio, sr = torchaudio.load(wav_path)
+        assert sr == SR and audio.shape[0] == len(STEM_ORDER)
+        actual_errors.append(audio[STEM_ORDER.index('linear_error')])
+    torch.testing.assert_close(
+        torch.cat(actual_errors), torch.cat(expected_errors),
+        rtol=0.0, atol=0.0,
+    )
+
+    # A second resume must verify all WAVs and markers, then skip the sequence.
+    rematerialize(args)
+    with open(destination / 'meta.json', 'r') as handle:
+        assert json.load(handle)['linear_aec_rematerialized_sequences'] == 0
+
+    packed_dir = tmp_path / 'repacked'
+    pack(argparse.Namespace(
+        input=str(destination), output=str(packed_dir),
+        shard_clips=8, dtype='float32',
+    ))
+    upgraded = PackedAecDataset(str(packed_dir), verbose=False)
+    assert tuple(upgraded.stems) == STEM_ORDER
+    assert upgraded.linear_aec_contract_hash == \
+        upgraded_meta['linear_aec_contract_hash']
 
 
 def test_stems_recombine(corpus):
@@ -342,6 +516,59 @@ def test_manifest_split_is_source_disjoint(corpus):
                  'rooms', 'rir_files', 'devices'):
         assert set(train[axis]) & set(val[axis]) == set(), f"leak on {axis}"
         assert train[axis] and val[axis], f"{axis} empty on one side"
+
+
+def test_unified_manifest_has_every_source_in_one_pool(corpus):
+    """build_unified_manifest -- the ESCAPE HATCH -- has no train/val axis."""
+    manifest = build_unified_manifest(corpus['cfg'], seed=SEED, progress=False)
+    assert manifest['split_mode'] == 'unified'
+    assert set(manifest['splits']) == {UNIFIED_SPLIT}
+
+    disjoint = corpus['manifest']
+    pool = manifest['splits'][UNIFIED_SPLIT]
+    all_disjoint_speakers = (
+        set(disjoint['splits']['train']['speakers'])
+        | set(disjoint['splits']['val']['speakers'])
+    )
+    # Same source directories as the disjoint manifest -> same total speaker
+    # set, just not partitioned.
+    assert set(pool['speakers']) == all_disjoint_speakers
+    # load_manifest skipping assert_source_disjoint for this shape (the actual
+    # contract) is exercised end to end by
+    # test_gen_aec_dataset_split_all_draws_from_one_unified_pool's own
+    # load_manifest() call -- not re-asserted here via a KeyError that would
+    # only be testing an accident of this dict's shape.
+
+
+def test_gen_aec_dataset_split_all_draws_from_one_unified_pool(corpus, tmp_path):
+    """--split all: one CLI run, one manifest, no train/val directories."""
+    output = tmp_path / 'aec_data_unified'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(corpus['config_path']), output=str(output), hours=0.012,
+        workers=0, resume=False, seed=SEED, sample_rate=None, split=UNIFIED_SPLIT,
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    ))
+    manifest = load_manifest(str(output / 'manifest.json'))
+    assert manifest['split_mode'] == 'unified'
+    assert (output / UNIFIED_SPLIT / 'meta.json').is_file()
+    assert not (output / 'train').exists()
+    assert not (output / 'val').exists()
+
+    pack(argparse.Namespace(
+        input=str(output / UNIFIED_SPLIT), output=str(output / 'packed' / UNIFIED_SPLIT),
+        shard_clips=8, dtype='float32'))
+    dataset = PackedAecDataset(str(output / 'packed' / UNIFIED_SPLIT), verbose=False)
+    assert len(dataset) > 0
+    assert dataset.n_sequences() > 0
+
+    # A --split train/val run against the SAME manifest must be rejected --
+    # the two manifest shapes are not interchangeable.
+    with pytest.raises(ValueError, match="needs a 'disjoint'-mode manifest"):
+        gen_aec_dataset(argparse.Namespace(
+            config=str(corpus['config_path']), output=str(output), hours=0.004,
+            workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+            manifest=None, rebuild_manifest=False, wav_encoding='float32',
+        ))
 
 
 def test_a_leaked_source_is_detected(corpus):
@@ -515,16 +742,16 @@ def test_grid_scales_to_48k_by_config_alone():
     assert (istft(stft(wave, grid), grid, length=4800) - wave).abs().max() < 1e-4
 
 
-def test_renderer_produces_finite_recombinable_three_second_48k_stems(corpus):
+def test_renderer_produces_finite_recombinable_eight_second_48k_stems(corpus):
     """Exercise the real renderer, not only STFT helpers, on the DFN grid."""
     cfg = copy.deepcopy(corpus['cfg'])
     cfg.set('signal', 'sr', '48000')
     cfg.set('signal', 'n_fft', '1024')
     cfg.set('signal', 'win_len', '1024')
     cfg.set('signal', 'hop_len', '512')
-    cfg.set('sequence', 'seq_sec_min', '3.0')
-    cfg.set('sequence', 'seq_sec_max', '3.0')
-    cfg.set('sequence', 'chunk_sec', '3.0')
+    cfg.set('sequence', 'seq_sec_min', '8.0')
+    cfg.set('sequence', 'seq_sec_max', '8.0')
+    cfg.set('sequence', 'chunk_sec', '8.0')
     renderer = AecSequenceRenderer(
         cfg, pools_for_split(corpus['manifest'], 'train'), corpus_seed=SEED,
     )
@@ -533,7 +760,7 @@ def test_renderer_produces_finite_recombinable_three_second_48k_stems(corpus):
         seed=stable_seed(SEED, 'test', '48k-render'),
     ))
     view = AecStems(rendered.stems)
-    assert rendered.stems.shape == (len(STEM_ORDER), 3 * 48000)
+    assert rendered.stems.shape == (len(STEM_ORDER), 8 * 48000)
     assert torch.isfinite(rendered.stems).all()
     torch.testing.assert_close(
         rendered.audit['mic_preclip'],
@@ -633,6 +860,7 @@ def test_metadata_covers_the_declared_contract(packed):
         'sequence_id', 'chunk_index', 'speaker_id', 'noise_id', 'rir_id',
         'ser_db', 'snr_db', 'erl_db', 'bulk_delay_samples', 'delay_jitter',
         'sro_ppm', 'nonlinear', 'clipped', 'scenario',
+        'linear_aec_contract_hash', 'config_hash',
     }
     from AIAEC.dataset_gen.aec_dataset import SCENARIOS
     dataset = packed['train']
@@ -641,6 +869,7 @@ def test_metadata_covers_the_declared_contract(packed):
         assert required <= set(meta), f"missing {required - set(meta)}"
         assert meta['scenario'] in SCENARIOS
         assert meta['sequence_scenario'] in SCENARIOS
+        assert isinstance(meta['sequence_seed'], int)
         assert isinstance(meta['delay_jitter'], bool)
         assert isinstance(meta['clipped'], bool)
         # ⚠ +-inf is deliberate: it marks a ratio that is undefined because one
@@ -652,10 +881,41 @@ def test_metadata_covers_the_declared_contract(packed):
 def test_shard_records_provenance(packed):
     dataset = packed['train']
     shard = torch.load(dataset.paths[0], map_location='cpu', weights_only=False)
-    assert set(shard) >= {'stems', 'data', 'sr', 'meta',
-                          'generator_commit', 'config_hash'}
+    assert set(shard) >= {
+        'stems', 'data', 'sr', 'meta', 'generator_commit', 'config_hash',
+        'manifest_seed', 'linear_aec', 'linear_aec_contract_hash',
+    }
     assert shard['sr'] == SR
     assert shard['data'].dtype == torch.float32
+    assert shard['manifest_seed'] == SEED
+
+
+def test_manifest_seed_is_part_of_packed_dataset_identity(packed, tmp_path):
+    """The corpus seed affects rendered audio and must affect resume identity."""
+    original = PackedAecDataset(packed['train'].paths[0], verbose=False)
+    shard = torch.load(original.paths[0], map_location='cpu', weights_only=False)
+    shard['manifest_seed'] += 1
+    changed_path = tmp_path / 'different_seed.pt'
+    torch.save(shard, changed_path)
+
+    changed = PackedAecDataset(str(changed_path), verbose=False)
+    assert changed.fingerprint() != original.fingerprint()
+
+
+def test_packed_dataset_rejects_mixed_generation_identity(packed, tmp_path):
+    """Two individually valid shards from different runs are not one corpus."""
+    first = torch.load(
+        packed['train'].paths[0], map_location='cpu', weights_only=False,
+    )
+    second = copy.deepcopy(first)
+    second['manifest_seed'] += 1
+    first_path = tmp_path / 'shard_00000.pt'
+    second_path = tmp_path / 'shard_00001.pt'
+    torch.save(first, first_path)
+    torch.save(second, second_path)
+
+    with pytest.raises(ValueError, match='packed-corpus identity'):
+        PackedAecDataset(str(tmp_path), verbose=False)
 
 
 def test_manifest_round_trips(corpus, tmp_path):
@@ -663,6 +923,405 @@ def test_manifest_round_trips(corpus, tmp_path):
     path = tmp_path / 'manifest.json'
     save_manifest(corpus['manifest'], str(path))
     assert load_manifest(str(path))['splits'] == corpus['manifest']['splits']
+
+
+# ============================================================
+# Independent far-end reference pool (far_speech_dir)
+# ============================================================
+
+def test_far_speech_pool_defaults_to_the_near_pool_when_unconfigured(corpus):
+    """Unset far_speech_dir must be a byte-for-byte no-op."""
+    pools = pools_for_split(corpus['manifest'], 'train')
+    assert pools.far_speech_files is pools.speech_files
+    assert pools.far_speaker_of is pools.speaker_of
+
+
+def test_far_speech_pool_never_overlaps_the_near_pool_when_configured(corpus, tmp_path):
+    generator = torch.Generator().manual_seed(23)
+    far_root = tmp_path / 'far_speech'
+    for index in range(4):
+        # One subdirectory per far speaker, matching the near pool's own
+        # directory-per-speaker convention, so _grouping_key's default
+        # 'parent_dir' fallback yields a distinct id per far speaker instead
+        # of collapsing every flat file into a single '.' group.
+        _write(far_root / f'far_{index:02d}' / 'clip.wav',
+              _speechlike(4 * SR, generator))
+
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('paths', 'far_speech_dir', str(far_root))
+    manifest = build_unified_manifest(cfg, seed=SEED, progress=False)
+    assert set(manifest['far_speech_files']) == {
+        f'far_{index:02d}/clip.wav' for index in range(4)
+    }
+
+    renderer = AecSequenceRenderer(
+        cfg, pools_for_split(manifest, UNIFIED_SPLIT), corpus_seed=SEED)
+    far_used, near_used = set(), set()
+    for sequence_id in range(10):
+        rendered = renderer.render(SequencePlan(
+            sequence_id=sequence_id, n_chunks=2, scenario='double_talk',
+            seed=stable_seed(SEED, 'test', f'far-pool-{sequence_id}')))
+        for meta in rendered.chunk_meta:
+            if meta['far_speaker_id']:
+                far_used.add(meta['far_speaker_id'])
+            if meta['speaker_id']:
+                near_used.add(meta['speaker_id'])
+    assert far_used, "no far-end speech was rendered to check"
+    assert near_used, "no near-end speech was rendered to check"
+    assert far_used <= {f'far_{index:02d}' for index in range(4)}
+    assert near_used.isdisjoint(far_used)
+
+
+# ============================================================
+# Resume identity, repack integrity, room invariants, load failures
+# ============================================================
+
+def test_resume_forces_a_rerender_when_config_hash_is_stale(corpus, tmp_path):
+    """chunk-count/contract-hash agreement alone is not enough to resume.
+
+    A --resume run must also recognise a sequence rendered under a DIFFERENT
+    config as incomplete, even if that sequence happens to have the right
+    chunk count and PBFDKF contract -- see gen_aec_dataset.py's
+    _sequence_is_complete.
+    """
+    from AIAEC.dataset_gen.gen_aec_dataset import _pending
+    from AIAEC.dataset_gen.linear_aec import linear_aec_contract_from_config
+    from AIAEC.dataset_gen.manifest import config_hash
+
+    output = tmp_path / 'aec_data_resume'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(corpus['config_path']), output=str(output), hours=0.012,
+        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    ))
+    cfg = corpus['cfg']
+    seqs_dir = output / 'train' / 'seqs'
+    chunk_samples = int(round(cfg.getfloat('sequence', 'chunk_sec') * SR))
+    contract_hash = linear_aec_contract_from_config(cfg).fingerprint()
+    plans = plan_sequences(cfg, 0.012, SEED, 'train')
+    assert plans, "fixture produced no sequences to check"
+
+    matching = _pending(
+        plans, str(seqs_dir), True, sample_rate=SR, chunk_samples=chunk_samples,
+        contract_hash=contract_hash, config_hash=config_hash(cfg),
+    )
+    assert matching == [], "the real config_hash must resume as fully complete"
+
+    stale = _pending(
+        plans, str(seqs_dir), True, sample_rate=SR, chunk_samples=chunk_samples,
+        contract_hash=contract_hash, config_hash='0' * 16,
+    )
+    assert len(stale) == len(plans), (
+        "a config_hash mismatch must force every sequence to re-render, even "
+        "though chunk count and PBFDKF contract still match"
+    )
+
+
+def test_resume_forces_a_rerender_when_the_plan_scenario_or_seed_drifts(corpus, tmp_path):
+    """config_hash agreement alone still is not enough: --seed lives outside
+    config.ini, so a --seed change reshuffles which scenario/seed
+    plan_sequences() assigns a sequence_id WITHOUT changing config_hash at
+    all. If that reshuffled plan happens to want the same chunk count (routine
+    at this corpus's small chunks_min/chunks_max spread), the old checks alone
+    would resume the OLD audio under the NEW plan's scenario label.
+    """
+    from AIAEC.dataset_gen.aec_dataset import SCENARIOS
+    from AIAEC.dataset_gen.gen_aec_dataset import _sequence_is_complete
+    from AIAEC.dataset_gen.linear_aec import linear_aec_contract_from_config
+    from AIAEC.dataset_gen.manifest import config_hash
+
+    output = tmp_path / 'aec_data_seed_drift'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(corpus['config_path']), output=str(output), hours=0.012,
+        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    ))
+    cfg = corpus['cfg']
+    seqs_dir = output / 'train' / 'seqs'
+    chunk_samples = int(round(cfg.getfloat('sequence', 'chunk_sec') * SR))
+    contract_hash = linear_aec_contract_from_config(cfg).fingerprint()
+    cfg_hash = config_hash(cfg)
+    plans = plan_sequences(cfg, 0.012, SEED, 'train')
+    assert plans, "fixture produced no sequences to check"
+    plan = plans[0]
+
+    assert _sequence_is_complete(
+        plan, str(seqs_dir), sample_rate=SR, chunk_samples=chunk_samples,
+        contract_hash=contract_hash, config_hash=cfg_hash,
+    ), "the real plan must resume as complete"
+
+    # Same config.ini and chunk count, but a --seed change would reassign this
+    # sequence_id a different scenario/seed -- exactly the coincidence
+    # config_hash/chunk-count agreement alone cannot see.
+    drifted = dataclasses.replace(
+        plan,
+        scenario=next(name for name in SCENARIOS if name != plan.scenario),
+        seed=plan.seed + 1,
+    )
+    assert not _sequence_is_complete(
+        drifted, str(seqs_dir), sample_rate=SR, chunk_samples=chunk_samples,
+        contract_hash=contract_hash, config_hash=cfg_hash,
+    ), (
+        "a --seed-driven scenario/seed change must force a re-render even "
+        "though chunk count, config_hash and contract_hash still agree"
+    )
+
+
+def test_resume_forces_a_rerender_when_wav_encoding_changes(corpus, tmp_path):
+    """A float32 corpus must not be accepted as an int16 resume (or vice versa)."""
+    from AIAEC.dataset_gen.gen_aec_dataset import _pending
+    from AIAEC.dataset_gen.linear_aec import linear_aec_contract_from_config
+    from AIAEC.dataset_gen.manifest import config_hash
+
+    output = tmp_path / 'aec_data_encoding_drift'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(corpus['config_path']), output=str(output), hours=0.012,
+        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    ))
+    cfg = corpus['cfg']
+    plans = plan_sequences(cfg, 0.012, SEED, 'train')
+    common = dict(
+        sample_rate=SR,
+        chunk_samples=int(round(cfg.getfloat('sequence', 'chunk_sec') * SR)),
+        contract_hash=linear_aec_contract_from_config(cfg).fingerprint(),
+        config_hash=config_hash(cfg),
+    )
+    assert _pending(plans, str(output / 'train' / 'seqs'), True,
+                    wav_encoding='float32', **common) == []
+    assert _pending(plans, str(output / 'train' / 'seqs'), True,
+                    wav_encoding='int16', **common) == plans
+
+
+def test_reusing_manifest_with_a_different_seed_is_rejected(corpus, tmp_path):
+    """The manifest seed owns the source split and the renderer corpus seed."""
+    output = tmp_path / 'aec_data_manifest_seed_drift'
+    kwargs = dict(
+        config=str(corpus['config_path']), output=str(output), hours=0.012,
+        workers=0, resume=False, sample_rate=None, split='train',
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    )
+    gen_aec_dataset(argparse.Namespace(seed=SEED, **kwargs))
+    with pytest.raises(ValueError, match='manifest seed'):
+        gen_aec_dataset(argparse.Namespace(seed=SEED + 1, **kwargs))
+
+
+def test_pack_ignores_sequences_beyond_this_runs_n_sequences(corpus, tmp_path):
+    """A leftover sequence from an earlier, larger generation must not leak in."""
+    from AIAEC.dataset_gen.pack_aec_dataset import _collect
+
+    output = tmp_path / 'aec_data_shrink'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(corpus['config_path']), output=str(output), hours=0.012,
+        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    ))
+    seqs_dir = output / 'train' / 'seqs'
+    run_meta = json.loads((output / 'train' / 'meta.json').read_text())
+    n_sequences = run_meta['n_sequences']
+
+    # Simulate a sequence left over from an earlier, larger run: sequence_id
+    # one past what THIS run's meta.json says it produced.
+    stale_id = n_sequences
+    chunk_meta = json.loads((seqs_dir / '000000.json').read_text())
+    stale_meta = copy.deepcopy(chunk_meta)
+    for chunk in stale_meta:
+        chunk['sequence_id'] = stale_id
+    (seqs_dir / f'{stale_id:06d}.json').write_text(json.dumps(stale_meta))
+    for index in range(len(chunk_meta)):
+        src = seqs_dir / f'000000_{index:03d}.wav'
+        dst = seqs_dir / f'{stale_id:06d}_{index:03d}.wav'
+        dst.write_bytes(src.read_bytes())
+
+    sequences = _collect(str(seqs_dir), n_sequences)
+    assert stale_id not in sequences
+    assert set(sequences) == set(range(n_sequences))
+
+
+def test_pack_fails_loudly_when_a_declared_sequence_has_no_sidecar_at_all(
+    corpus, tmp_path,
+):
+    """meta.json says n_sequences=N; a hole anywhere in 0..N-1 must fail pack,
+    not silently ship a shrunk corpus that still claims meta.json's full size.
+    """
+    from AIAEC.dataset_gen.pack_aec_dataset import _collect
+
+    output = tmp_path / 'aec_data_hole'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(corpus['config_path']), output=str(output), hours=0.02,
+        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    ))
+    seqs_dir = output / 'train' / 'seqs'
+    run_meta = json.loads((output / 'train' / 'meta.json').read_text())
+    n_sequences = run_meta['n_sequences']
+    assert n_sequences >= 2, "fixture must produce >= 2 sequences to leave a hole"
+
+    victim = n_sequences - 1
+    (seqs_dir / f'{victim:06d}.json').unlink()
+    for wav in seqs_dir.glob(f'{victim:06d}_*.wav'):
+        wav.unlink()
+
+    with pytest.raises(FileNotFoundError, match=f'{victim:06d}'):
+        _collect(str(seqs_dir), n_sequences)
+
+
+def test_pack_fails_loudly_when_a_sequence_is_missing_some_chunk_wavs(
+    corpus, tmp_path,
+):
+    """A sidecar that outlived its audio (interrupted run, partial copy) must
+    fail pack rather than be silently dropped."""
+    from AIAEC.dataset_gen.pack_aec_dataset import _collect
+
+    output = tmp_path / 'aec_data_partial'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(corpus['config_path']), output=str(output), hours=0.012,
+        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    ))
+    seqs_dir = output / 'train' / 'seqs'
+    run_meta = json.loads((output / 'train' / 'meta.json').read_text())
+    (seqs_dir / '000000_000.wav').unlink()
+
+    with pytest.raises(FileNotFoundError, match='000000'):
+        _collect(str(seqs_dir), run_meta['n_sequences'])
+
+
+def test_pack_fails_loudly_when_a_chunk_has_a_stale_config_hash(corpus, tmp_path):
+    """Corrupting one chunk's recorded config_hash after the fact (a hand
+    edit, a bad merge of two runs' seqs/ directories) must fail pack, since
+    the shard-level config_hash is what every downstream consumer trusts."""
+    output = tmp_path / 'aec_data_stale_chunk_hash'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(corpus['config_path']), output=str(output), hours=0.012,
+        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    ))
+    seqs_dir = output / 'train' / 'seqs'
+    meta_path = seqs_dir / '000000.json'
+    chunk_meta = json.loads(meta_path.read_text())
+    chunk_meta[0]['config_hash'] = '0' * 16
+    meta_path.write_text(json.dumps(chunk_meta))
+
+    with pytest.raises(ValueError, match='config_hash'):
+        pack(argparse.Namespace(
+            input=str(output / 'train'), output=str(output / 'packed' / 'train'),
+            shard_clips=8, dtype='float32'))
+
+
+def test_pack_rejects_non_finite_wav_samples(corpus, tmp_path):
+    """NaN/Inf audio must not be serialized into a training shard."""
+    output = tmp_path / 'aec_data_non_finite'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(corpus['config_path']), output=str(output), hours=0.012,
+        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        manifest=None, rebuild_manifest=False, wav_encoding='float32',
+    ))
+    wav_path = output / 'train' / 'seqs' / '000000_000.wav'
+    audio, sr = torchaudio.load(str(wav_path))
+    audio[0, 0] = float('nan')
+    torchaudio.save(str(wav_path), audio, sr, encoding='PCM_F', bits_per_sample=32)
+
+    with pytest.raises(ValueError, match='NaN or Inf'):
+        pack(argparse.Namespace(
+            input=str(output / 'train'), output=str(output / 'packed' / 'train'),
+            shard_clips=8, dtype='float32'))
+
+
+def test_packed_dataset_ignores_shards_absent_from_index(packed):
+    """A stray .pt file left in the packed directory must not silently load."""
+    packed_dir = packed['output'] / 'packed' / 'train'
+    index = json.loads((packed_dir / 'index.json').read_text())
+    real_shard = packed_dir / index['shards'][0]
+    stray_shard = packed_dir / 'shard_stray.pt'
+    stray_shard.write_bytes(real_shard.read_bytes())
+    try:
+        dataset = PackedAecDataset(str(packed_dir), verbose=False)
+        assert str(stray_shard) not in dataset.paths
+        assert len(dataset.paths) == len(index['shards'])
+    finally:
+        stray_shard.unlink()
+
+
+def _sparse_rir_manifest(tmp_path, rooms):
+    """A minimal corpus whose room -> RIR-file-count is fully controlled.
+
+    ``rooms`` maps a room name to how many RIR files it gets, e.g.
+    ``{'room_00': 1, 'room_01': 2}``.
+    """
+    generator = torch.Generator().manual_seed(29)
+    root = tmp_path / 'sparse_rir_corpus'
+    for speaker in range(3):
+        _write(root / 'speech' / f'reader_{speaker:03d}' / 'take_0.wav',
+              _speechlike(4 * SR, generator))
+    for index in range(3):
+        _write(root / 'noise' / f'noise_{index:02d}.wav',
+              torch.randn(3 * SR, generator=generator) * 0.05)
+    for room, count in rooms.items():
+        for index in range(count):
+            _write(root / 'rir' / room / f'rir_{index}.wav',
+                  _rir(int(0.35 * SR), 0.3, generator))
+
+    cfg = _base_cfg(root)
+    return cfg, build_unified_manifest(cfg, seed=SEED, progress=False)
+
+
+def test_echo_path_change_never_leaves_a_room_with_only_one_rir(tmp_path):
+    """The post-change RIR must stay in the SAME room as the near talker's.
+
+    room_00 has only 1 RIR file and must never be drawn for this scenario --
+    otherwise _pick_path_change_rir would have to cross into a different room,
+    reintroducing the acoustic "this is echo" leak the same-room invariant
+    exists to prevent.
+    """
+    cfg, manifest = _sparse_rir_manifest(tmp_path, {'room_00': 1, 'room_01': 2})
+    renderer = AecSequenceRenderer(
+        cfg, pools_for_split(manifest, UNIFIED_SPLIT), corpus_seed=SEED)
+
+    checked = 0
+    for sequence_id in range(20):
+        rendered = renderer.render(SequencePlan(
+            sequence_id=sequence_id, n_chunks=3, scenario='echo_path_change',
+            seed=stable_seed(SEED, 'test', f'epc-{sequence_id}')))
+        for meta in rendered.chunk_meta:
+            assert meta['room_id'] == 'room_01'
+            checked += 1
+    assert checked > 0
+
+
+def test_echo_path_change_fails_loudly_when_no_room_qualifies(tmp_path):
+    cfg, manifest = _sparse_rir_manifest(tmp_path, {'room_00': 1, 'room_01': 1})
+    renderer = AecSequenceRenderer(
+        cfg, pools_for_split(manifest, UNIFIED_SPLIT), corpus_seed=SEED)
+
+    with pytest.raises(RuntimeError, match='echo_path_change'):
+        renderer.render(SequencePlan(
+            sequence_id=0, n_chunks=3, scenario='echo_path_change',
+            seed=stable_seed(SEED, 'test', 'epc-none-eligible')))
+
+
+def test_render_fails_loudly_when_every_speech_file_is_unreadable(corpus):
+    """A silently-empty, still-labelled chunk is worse than a loud crash."""
+    renderer = AecSequenceRenderer(
+        corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
+        corpus_seed=SEED)
+    renderer.pools.speech_files = ['/nonexistent/reader/take.wav']
+    renderer.pools.far_speech_files = ['/nonexistent/reader/take.wav']
+    with pytest.raises(RuntimeError, match='talker run'):
+        renderer.render(SequencePlan(
+            sequence_id=0, n_chunks=3, scenario='double_talk',
+            seed=stable_seed(SEED, 'test', 'unreadable-speech')))
+
+
+def test_render_fails_loudly_when_every_noise_file_is_unreadable(corpus):
+    renderer = AecSequenceRenderer(
+        corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
+        corpus_seed=SEED)
+    renderer.pools.noise_files = ['/nonexistent/noise/file.wav']
+    with pytest.raises(RuntimeError, match='noise file'):
+        renderer.render(SequencePlan(
+            sequence_id=0, n_chunks=3, scenario='double_talk',
+            seed=stable_seed(SEED, 'test', 'unreadable-noise')))
 
 
 if __name__ == '__main__':

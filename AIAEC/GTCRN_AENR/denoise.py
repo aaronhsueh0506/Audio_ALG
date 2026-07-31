@@ -3,7 +3,7 @@
 
 用法:
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav
-    python3 denoise.py checkpoint.pth mic.wav far.wav out.wav --device cpu --preset balanced
+    python3 denoise.py checkpoint.pth mic.wav far.wav out.wav --device cpu
 
 mic.wav / far.wav must be mono and at the checkpoint's sample rate (16 kHz --
 this candidate is locked to the upstream grid; resample first if your
@@ -18,11 +18,8 @@ IS a cold start, matching the file's own beginning -- no cross-call state to
 carry, unlike training's per-lane persistence across chunks).
 
 config.ini is not read for model shape: every shape-relevant setting is
-recovered from the checkpoint's own contract (train.py's
-make_checkpoint_contract), so inference cannot silently drift from what the
-weights were trained with. ``--preset`` selects which linear-AEC preset runs
-in front, independent of the checkpoint (the preset is a deployment choice,
-not a trained parameter).
+recovered from the checkpoint's own contract, including the exact materialized
+Python-PBFDKF frontend. Inference refuses a missing or drifted AEC contract.
 """
 
 import argparse
@@ -40,7 +37,11 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.GTCRN_AENR import GTCRNAENR
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid, istft, stft
-from AIAEC.training_common import LinearAecEngine, auto_device
+from AIAEC.training_common import (
+    LinearAecEngine,
+    auto_device,
+    require_checkpoint_linear_aec,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -50,9 +51,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('far_wav')
     parser.add_argument('out_wav')
     parser.add_argument('--device', default=None, help='cuda / cpu / mps (default: auto-detect)')
-    parser.add_argument('--preset', default='balanced',
-                        choices=('mild', 'balanced', 'aggressive'),
-                        help='Frozen linear-AEC preset run in front of the model')
     return parser
 
 
@@ -60,6 +58,7 @@ def load_model(checkpoint_path: str, device: str):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     contract = ckpt['contract']
     aec_grid = AecGrid(contract['sr'], contract['n_fft'], contract['win_len'], contract['hop_len'])
+    linear_aec_contract = require_checkpoint_linear_aec(contract, aec_grid)
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)
     model_kwargs = {
         k[len('ctor_'):]: v for k, v in contract.items() if k.startswith('ctor_')
@@ -67,12 +66,12 @@ def load_model(checkpoint_path: str, device: str):
     model = GTCRNAENR(model_grid, **model_kwargs).to(device)
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
-    return model, aec_grid
+    return model, aec_grid, linear_aec_contract
 
 
 def main(args):
     device = auto_device(args.device)
-    model, grid = load_model(args.checkpoint, device)
+    model, grid, linear_contract = load_model(args.checkpoint, device)
 
     mic, mic_sr = sf.read(args.mic_wav, dtype='float32')
     far, far_sr = sf.read(args.far_wav, dtype='float32')
@@ -87,7 +86,9 @@ def main(args):
     far_t = torch.from_numpy(far).unsqueeze(0).to(device)
     length = mic_t.shape[-1]
 
-    linear_aec = LinearAecEngine(n_lanes=1, sample_rate=grid.sr, preset=args.preset)
+    linear_aec = LinearAecEngine(
+        n_lanes=1, sample_rate=grid.sr, contract=linear_contract
+    )
     error, _echo_estimate = linear_aec(mic_t, far_t, grid.sr)   # same length as mic_t
 
     error_spec = stft(error, grid).transpose(-2, -1)   # [B,T,F], the public model boundary

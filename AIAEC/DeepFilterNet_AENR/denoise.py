@@ -3,7 +3,7 @@
 
 用法:
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav
-    python3 denoise.py checkpoint.pth mic.wav far.wav out.wav --device cpu --preset balanced
+    python3 denoise.py checkpoint.pth mic.wav far.wav out.wav --device cpu
 
 mic.wav / far.wav must be mono and at the checkpoint's sample rate (the
 checkpoint's contract sr, 48 kHz or 16 kHz -- resample first if your capture
@@ -47,7 +47,11 @@ from AINR.DeepFilterNet2.train import FEATURE_VERSION, extract_dfn2_features, re
 from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid, istft
-from AIAEC.training_common import LinearAecEngine, auto_device
+from AIAEC.training_common import (
+    LinearAecEngine,
+    auto_device,
+    require_checkpoint_linear_aec,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,9 +63,6 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--config', default='config.ini',
                         help='Where to read [feature] from (must match training)')
     parser.add_argument('--device', default=None, help='cuda / cpu / mps (default: auto-detect)')
-    parser.add_argument('--preset', default='balanced',
-                        choices=('mild', 'balanced', 'aggressive'),
-                        help='Frozen linear-AEC preset run in front of the model')
     return parser
 
 
@@ -74,6 +75,7 @@ def load_model(checkpoint_path: str, device: str):
             f"this code expects {FEATURE_VERSION!r}; the normalisation "
             f"formula changed since this checkpoint was trained")
     aec_grid = AecGrid(contract['sr'], contract['n_fft'], contract['win_len'], contract['hop_len'])
+    linear_aec_contract = require_checkpoint_linear_aec(contract, aec_grid)
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)
     model_kwargs = {
         k[len('ctor_'):]: v for k, v in contract.items() if k.startswith('ctor_')
@@ -81,7 +83,7 @@ def load_model(checkpoint_path: str, device: str):
     model = DeepFilterNetAENR(model_grid, **model_kwargs).to(device)
     model.load_state_dict(ckpt['state_dict'])
     model.eval()
-    return model, aec_grid
+    return model, aec_grid, linear_aec_contract
 
 
 def _normalized_stft(waveform: torch.Tensor, grid: AecGrid) -> torch.Tensor:
@@ -100,7 +102,7 @@ def _normalized_stft(waveform: torch.Tensor, grid: AecGrid) -> torch.Tensor:
 
 def main(args):
     device = auto_device(args.device)
-    model, grid = load_model(args.checkpoint, device)
+    model, grid, linear_contract = load_model(args.checkpoint, device)
 
     feature_cfg_ini = configparser.ConfigParser()
     if not feature_cfg_ini.read(args.config):
@@ -120,7 +122,9 @@ def main(args):
     far_t = torch.from_numpy(far).unsqueeze(0).to(device)
     length = mic_t.shape[-1]
 
-    linear_aec = LinearAecEngine(n_lanes=1, sample_rate=grid.sr, preset=args.preset)
+    linear_aec = LinearAecEngine(
+        n_lanes=1, sample_rate=grid.sr, contract=linear_contract
+    )
     error, _echo_estimate = linear_aec(mic_t, far_t, grid.sr)
 
     error_spec = _normalized_stft(error, grid)

@@ -243,7 +243,7 @@ class GlobalDelayAttention(nn.Module):
     def __init__(self, mic_channels: int, far_channels: int,
                  mic_freq: int, far_freq: int, value_channels: int,
                  projection_size: int, max_delay_frames: int,
-                 mode: str = "paper_global"):
+                 mode: str = "causal_running"):
         super().__init__()
         if mode not in ("paper_global", "causal_running"):
             raise ValueError("mode must be 'paper_global' or 'causal_running'")

@@ -30,14 +30,14 @@ def _half(n: int) -> int:
 
 
 class AlignCRUSE(nn.Module):
-    """Paper-shaped causal CRUSE with a global soft delay distribution."""
+    """Paper-shaped CRUSE with configurable streaming/global alignment."""
 
     paper_reference = "arXiv:2208.11308"
     task = "direct_aec_preserve_noise"
 
     def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
                  projection_size: int = 64, gru_hidden: int = 192,
-                 alignment_mode: str = "paper_global"):
+                 alignment_mode: str = "causal_running"):
         super().__init__()
         self.grid = grid
         self.max_delay_frames = grid.delay_frames(max_delay_seconds)

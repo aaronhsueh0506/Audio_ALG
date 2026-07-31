@@ -81,8 +81,16 @@ def test_shared_far_reference_survives_zero_sum_beamformer_weights():
 def test_default_grids_are_no_padding_power_of_two():
     assert FourChannelAecConfig(sample_rate=16000).resolved_grid() == (512, 256)
     assert FourChannelAecConfig(sample_rate=48000).resolved_grid() == (1024, 512)
-    with pytest.raises(ValueError, match="power of two"):
+    with pytest.raises(ValueError, match="256, 512"):
         FourChannelAecConfig(sample_rate=16000, frame_size=320).resolved_grid()
+    # frame_size=128 is a power of two but outside the C core's exact
+    # whitelist (16 kHz only supports 256/512) -- must be rejected here too,
+    # so the Python reference can't silently diverge from the C acceptance
+    # gate (see 4aec_nr_res.c's derive_dims_and_configs).
+    with pytest.raises(ValueError, match="256, 512"):
+        FourChannelAecConfig(sample_rate=16000, frame_size=128).resolved_grid()
+    with pytest.raises(ValueError, match="1024"):
+        FourChannelAecConfig(sample_rate=48000, frame_size=512).resolved_grid()
 
 
 def test_48k_decimator_keeps_continuous_phase_across_512_sample_hops(monkeypatch):

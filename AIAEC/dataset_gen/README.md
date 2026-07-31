@@ -1,12 +1,12 @@
 # AEC dataset generation
 
-Renders acoustic-echo scenarios as **five separated stems** and packs them into
+Renders acoustic-echo scenarios as **six separated stems** and packs them into
 `.pt` shards. This is the only AIAEC dataset package. It reuses shared DSP from
 the separate `AINR/dataset_gen/` NR generator rather than forking that DSP.
 
-## The five stems
+## The six stems
 
-Every clip is a `(5, T)` tensor whose channel order is fixed and declared in
+Every clip is a `(6, T)` tensor whose channel order is fixed and declared in
 each shard:
 
 | # | stem | what it is |
@@ -16,32 +16,32 @@ each shard:
 | 2 | `near_target` | **S_early** — the same near talker and gain through the early/late-suppressed RIR; used only for DeepVQE's published dereverberation target. |
 | 3 | `local_noise` | **N** — ambient noise at the mic. |
 | 4 | `mic_postclip` | **Y** — what a model actually receives, after capture clipping/AGC. |
+| 5 | `linear_error` | **E** — frozen PBFDKF output, `Y - D_hat`. This is not oracle residual echo. |
 
 The signal model the corpus exists to serve:
 
 ```
 Y = S + N + D          microphone
 X                      far-end reference
-D_hat                  optional linear/model echo estimate
-E     = Y - D_hat      linear error, by subtraction
+D_hat = Y - E          frozen PBFDKF echo estimate, derived when needed
+E     = Y - D_hat      stored linear error
 R     = D - D_hat      residual echo — emerges, never a target
 ```
 
-`D_hat` exists only when a frozen linear front-end supplies it. The corpus does
-not bake a residual into storage: `model_views.py` maps the stems to the six
-candidate contracts. Align-CRUSE targets `S+N`; Align-ULCNet and the two AENR
-variants require the real frozen-linear error and target `S`; CAGCRN targets
-`S`; DeepVQE-S targets `S_early` because its published task includes
-dereverberation. The separated stems keep those task
-boundaries auditable instead of silently training every model on one target.
+The default config renders each complete 16–24 second parent sequence first, then
+runs one stateful Python PBFDKF instance over `mic_postclip + far_render`, and
+only then cuts all six stems into 8-second chunks. The PBFDKF resets between
+parent sequences and never at a chunk boundary. Its full engine/source/grid
+contract is stored in run, chunk, shard, and checkpoint metadata.
+
+`model_views.py` maps the six stems to the candidate contracts. Align-CRUSE
+targets `S+N`; Align-ULCNet and the two AENR variants read stored `E + X` and
+target `S`; CAGCRN targets `S`; DeepVQE-S targets `S_early`. `D_hat` is derived
+as `mic_postclip - linear_error` when required and is never stored separately.
 
 **⚠ `echo` (D) and `mic_preclip` (S+N+D, pre-clip/AGC) are NOT stored.** No
-model task reads either one — `model_views.py`'s `build_model_view` only ever
-touches `far_render`/`near_speech`/`near_target`/`local_noise`/`mic_postclip` —
-and no candidate is meant to see an oracle residual: a `D_hat` estimate is
-always computed live from `far_render`/`mic_postclip` through a `linear_aec`
-callback, never read off a stored "true" echo. Dropping them cuts the packed
-corpus's disk footprint by 2/7 with zero effect on any model. They are still
+model task reads either one, and no candidate sees oracle residual `R`.
+They are still
 **computed on every render** — `aec_dataset.AecSequenceRenderer.render()`
 returns them under `RenderedSequence.audit` — so the corpus's central
 invariants (`mic_preclip == S+N+D`, "echo really is a delayed copy of X") stay
@@ -49,6 +49,11 @@ verified at generation time; see `tests/test_aec_dataset.py`, which checks them
 directly against the renderer rather than a packed shard. If you need `echo`/
 `mic_preclip` for a one-off analysis, call `AecSequenceRenderer.render()`
 yourself — do not add them back to `STEM_ORDER` for that.
+
+Old five-channel WAVs/shards are rejected. To upgrade an existing five-channel
+render without repeating speech/noise/RIR mixing, run
+`rematerialize_linear_aec.py`; it reconstructs complete sequences in
+`(sequence_id, chunk_index)` order, rewrites channel six, and updates metadata.
 
 `AecStems` gives these names; nothing indexes the channel axis by number.
 
@@ -74,8 +79,10 @@ Each clip carries a dict. The contract fields:
 | field | meaning |
 |---|---|
 | `sequence_id`, `chunk_index` | which parent sequence, and where in it |
-| `speaker_id` | the **near** talker (`''` = none). `far_speaker_id` is the other one |
-| `noise_id`, `rir_id` | source ids; `rir_id` is `"a\|b"` for an echo-path change |
+| `speaker_id` | the **near** talker (`''` = none). `far_speaker_id` is the other one -- from an independent pool if `[paths] far_speech_dir` is set, otherwise the same pool |
+| `noise_id`, `rir_id` | source ids; `rir_id` is `"a\|b"` for an echo-path change (both `a` and `b` are always in the same room as `room_id`) |
+| `config_hash` | fingerprint of the config this chunk was rendered under; what `--resume` compares to reject a sequence rendered under different settings |
+| `sequence_seed` | the per-sequence RNG seed `plan_sequences()` derived from `--seed`; `--resume` also compares this (and `sequence_scenario`) since `--seed` lives outside config.ini and would otherwise not be seen at all |
 | `ser_db` | near-speech-to-echo ratio (`+inf` = no echo, `-inf` = no near talker) |
 | `snr_db` | near-speech-to-noise ratio (`-inf` = no near speech to define it against) |
 | `erl_db` | echo return loss, echo vs the stored reference |
@@ -95,7 +102,7 @@ itself is audit-only, see above — `tests/test_aec_dataset.py` checks this
 identity against the renderer directly).
 
 **⚠ `ser_db` / `snr_db` / `erl_db` are sequence-level.** They describe how the
-whole 20–60 s sequence was set up. A single chunk departs from them by a few dB
+whole configured parent sequence was set up. A single chunk departs from them by a few dB
 (ERL) or by anything at all (SER/SNR), because a chunk in which the near talker
 happens to be silent has no signal to define a ratio against. Build curricula
 on `scenario`, or measure the chunk yourself — which the separated stems make
@@ -133,73 +140,45 @@ share is far smaller. If the idle term needs more, lengthen the dropouts
 dropouts. `near_only` supplies idle chunks too, but only `ref_dropout`
 contains the *transition* into and out of idle, which is the hard part.
 
-## Why the split is source-disjoint
+## Train/validation split
 
-`AINR/dataset_gen/loader.py` splits the *generated* corpus — draw a permutation over
-finished clips, hold 5% out. That is correct when every clip is an independent
-draw, and wrong here.
+The selected training protocol generates one unified pool (`--split all`) and
+uses `training_common.split_dataset_by_sample` after packing. A dedicated
+seeded generator randomly assigns individual 8-second chunk indices, so the
+split is reproducible, disjoint, and covers the whole corpus. Different chunks
+from the same sequence, speaker, RIR, or device may intentionally straddle
+train and validation. The train loader reshuffles every epoch; validation does
+not shuffle.
 
-Two AEC clips rendered from the same speaker, the same echo RIR and the same
-loudspeaker are not independent: they share the exact voice, the exact room
-response and the exact nonlinearity. Split after generation and both halves of
-that pair land on opposite sides of the fence, so validation measures how well
-the model memorised a room. The resulting number is high, stable, reproducible
-and meaningless.
-
-So `manifest.py` decides the split **before** anything is rendered, over the
-source lists: **speaker**-disjoint (which makes speech files disjoint too),
-**noise**-disjoint, **room/RIR**-disjoint, **device**-disjoint. The decision is
-written to `manifest.json` so that the train run and the val run — separate
-invocations — provably use the same one, and `assert_source_disjoint` re-checks
-every axis on load.
-
-**⚠ Device disjointness is the aggressive one.** Validation is scored on
-loudspeaker nonlinearities the model has never heard, which is the honest
-question for a shipped product and materially harder than the usual AEC
-benchmark. `[split] device_split = shared` relaxes it — and then the val score
-answers a different, easier question, so say so wherever it is reported. The
-manifest records which was used.
+This validation score is useful for optimization progress, not a
+source-generalisation claim. Use a separately generated source-disjoint corpus
+(`--split train`/`val`) or held-out real recordings for that measurement.
+`manifest.py` retains the optional source-disjoint generator for this purpose.
+Every checkpoint stores the dataset fingerprint, split seed/fraction, complete
+train/validation indices, and PBFDKF contract so resume cannot silently change
+the comparison.
 
 ## Why sequences are long
 
-Parent sequences are 20–60 s, cut into consecutive fixed-length chunks that
+Parent sequences are 16–24 s by default, cut into consecutive fixed-length chunks that
 share a `sequence_id` and carry an increasing `chunk_index`.
 
-Adaptation from cold, recovery after an echo-path change, and long-term drift
-are all invisible inside a 3 s clip. **⚠ A trainer that resets recurrent state
-every chunk cannot be shown to fail at any of them** — it will look fine and
-ship broken. `SequenceChunkSampler` supplies the ordering needed to prevent
-that: each lane of a batch walks one sequence in order, so batch *b+1* holds
-the next chunk of the same sequence that batch *b* held. The sampler does
-**not** make a stateless model API stateful: the external trainer must either
-carry the model's per-lane recurrent/cache state or concatenate consecutive
-chunks before `forward`. When a lane starts a new sequence its `chunk_index`
-is 0 — that is the reset signal, and `lane_reset_mask` reports it.
-
-```python
-from torch.utils.data import DataLoader
-from AIAEC.dataset_gen import PackedAecDataset, SequenceChunkSampler, aec_collate
-
-ds = PackedAecDataset('data_aec/packed/train')
-sampler = SequenceChunkSampler.from_dataset(ds, n_lanes=8, seed=42)
-loader = DataLoader(ds, batch_sampler=sampler, collate_fn=aec_collate)
-for epoch in range(epochs):
-    sampler.set_epoch(epoch)      # reshuffles which sequence sits in which lane
-    for stems, meta in loader:
-        reset = [m['chunk_index'] == 0 for m in meta]
-        ...
-```
-
-The packer keeps a sequence's chunks adjacent and in order, and never splits a
-sequence across shards.
+Long sequences are still required because PBFDKF adaptation from cold,
+echo-path changes, and drift must happen before channel six is cut. The packer
+keeps `(sequence_id, chunk_index)` order for deterministic reconstruction and
+streaming evaluation. Training itself treats chunks as independent shuffled
+samples; `SequenceChunkSampler` remains only as an evaluation utility and is
+not used by any trainer.
 
 ## Files
 
 | File | Role |
 |---|---|
 | `aec_dataset.py` | the scenario simulator: nonlinearity, echo path, delay/jitter, SRO, dropout, AGC |
-| `manifest.py` | the source-disjoint split, decided before generation |
-| `gen_aec_dataset.py` | CLI — renders sequences to 7-channel WAV chunks |
+| `manifest.py` | unified/source-disjoint source manifest |
+| `gen_aec_dataset.py` | CLI — renders complete sequences to 6-channel WAV chunks |
+| `linear_aec.py` | frozen PBFDKF contract and full-sequence materializer |
+| `rematerialize_linear_aec.py` | rebuilds channel six from existing five/six-channel WAVs |
 | `pack_aec_dataset.py` | packs those WAVs into `.pt` shards |
 | `packed_aec_dataset.py` | `PackedAecDataset`, returning `(stems, meta)` |
 | `aec_features.py` | **the shared module the model projects import** |
@@ -229,34 +208,59 @@ so the 48 kHz variant would quietly become a different algorithm. Use
 
 ## Usage
 
+**Selected training protocol — unified pool and random chunk split:**
+
 ```bash
 cp AIAEC/dataset_gen/config.example.ini AIAEC/dataset_gen/config.ini
 # edit [paths] speech_dir / noise_dir / rir_dir, and [devices] device_ids
+# optionally also [paths] far_speech_dir, for an independent far-end
+# reference corpus that never shares a file/speaker with speech_dir
 
-# Both runs MUST share --seed and the manifest.
 python3 -m AIAEC.dataset_gen.gen_aec_dataset \
     --config AIAEC/dataset_gen/config.ini --output data_aec \
-    --hours 40 --split train --workers 4 --seed 42
-python3 -m AIAEC.dataset_gen.gen_aec_dataset \
-    --config AIAEC/dataset_gen/config.ini --output data_aec \
-    --hours 4  --split val   --workers 4 --seed 42
+    --hours 100 --split all --workers 4 --seed 42
 
 python3 -m AIAEC.dataset_gen.pack_aec_dataset \
-    --input data_aec/train --output data_aec/packed/train
-python3 -m AIAEC.dataset_gen.pack_aec_dataset \
-    --input data_aec/val --output data_aec/packed/val
+    --input data_aec/all --output data_aec/packed/all
 ```
+
+⚠ Five of the six trainers run at 16 kHz/512 and one (DeepFilterNet-AENR) runs
+at 48 kHz/1024 (`[signal] sr = 48000, n_fft = win_len = 1024, hop_len = 512`
+in a SEPARATE `config.ini` -- see config.example.ini's top comment). The two
+rates need their OWN `--output` (e.g. `data_aec_16k` / `data_aec_48k`, matching
+each trainer's `packed_dir`): generating the second rate into the same
+`--output` as the first silently overwrites its `seqs/`/`packed/` content,
+since neither directory is namespaced by sample rate.
 
 Layout:
 
 ```
 data_aec/
-  manifest.json                 the split decision, shared by both runs
-  train/meta.json               run summary + provenance
-  train/seqs/000000.json        chunk metadata for one parent sequence
-  train/seqs/000000_000.wav     7-channel chunk, channels = STEM_ORDER
-  packed/train/shard_00000.pt
+  manifest.json                 source-list provenance
+  all/meta.json                 run summary + PBFDKF contract
+  all/seqs/000000.json          chunk metadata for one parent sequence
+  all/seqs/000000_000.wav       6-channel chunk, channels = STEM_ORDER
+  packed/all/shard_00000.pt
 ```
+
+The six trainers read `packed/all` and create the deterministic random chunk
+split from `[data] val_fraction` and the training seed.
+
+To refresh PBFDKF channel six after changing its implementation, without
+repeating acoustic mixing:
+
+```bash
+python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
+    --input data_aec/all \
+    --config AIAEC/dataset_gen/config.ini \
+    --resume
+python3 -m AIAEC.dataset_gen.pack_aec_dataset \
+    --input data_aec/all --output data_aec/packed/all
+```
+
+`--resume` marks a sequence complete only after all six-channel WAVs and its
+matching metadata contract exist. Repacking is mandatory because old shards
+retain the old audio and contract.
 
 Generation is deterministic given `--seed`: each sequence is seeded from
 `(seed, split, sequence_id)`, so it renders identically regardless of worker
@@ -267,7 +271,7 @@ already had.
 **⚠ `--wav-encoding` defaults to `float32`** because the corpus's central
 invariant, `mic_preclip == near_speech + local_noise + echo`, is checked at
 generation time against the renderer's un-quantised audit tensors (`echo` and
-`mic_preclip` are not among the persisted stems — see "The five stems" above).
+`mic_preclip` are not among the persisted stems — see "The six stems" above).
 Quantising the PERSISTED stems to `int16` would still degrade any downstream
 arithmetic that combines them (e.g. an SER recomputed from the stored
 `near_speech`/`local_noise`) by ~1e-4. `int16` halves the disk cost and is fine

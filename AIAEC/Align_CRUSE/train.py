@@ -12,7 +12,8 @@ config.ini sections (see the shipped config.ini for every knob, documented):
     [signal]   sample rate + FFT grid. MUST equal the grid the packed corpus
                below was rendered with (AIAEC/dataset_gen/config.ini's
                [signal]); AecGrid/SignalGrid do not re-derive it from the data.
-    [data]     packed corpus paths + DataLoader batch size / workers
+    [data]     one packed corpus path + DataLoader batch size / workers +
+               val_fraction (held out at LOAD time, see below)
     [model]    every AlignCRUSE constructor keyword (see model.py's
                __init__); an unknown key raises rather than being silently
                ignored, so a typo cannot build a differently-shaped model
@@ -22,18 +23,17 @@ config.ini sections (see the shipped config.ini for every knob, documented):
 dataset:
     Data is rendered and packed by AIAEC/dataset_gen/ only -- see
     AIAEC/dataset_gen/README.md and its config.example.ini for the full
-    generation walkthrough:
+    generation walkthrough. This project generates ONE unified pool (no
+    source-disjoint split at generation time) and splits
+    train/val at LOAD time instead:
         cp AIAEC/dataset_gen/config.example.ini AIAEC/dataset_gen/config.ini
-        python3 -m AIAEC.dataset_gen.gen_aec_dataset --config ... --split train --hours 40
-        python3 -m AIAEC.dataset_gen.gen_aec_dataset --config ... --split val   --hours 4
-        python3 -m AIAEC.dataset_gen.pack_aec_dataset --input data_aec/train --output data_aec/packed/train
-        python3 -m AIAEC.dataset_gen.pack_aec_dataset --input data_aec/val   --output data_aec/packed/val
-    Align-CRUSE is the one candidate with no persistent external state to
-    preserve across chunks (no frozen linear AEC in front of it, and its own
-    GRU state resets every forward call regardless of chunk order), so
-    training here draws chunks with a plain SHUFFLED DataLoader. Contrast
-    with ../GTCRN_AENR/train.py, whose linear-AEC frontend genuinely needs
-    ``SequenceChunkSampler`` to see realistic cold/converged filter states.
+        python3 -m AIAEC.dataset_gen.gen_aec_dataset --config ... --split all --hours 100 --output data_aec_16k
+        python3 -m AIAEC.dataset_gen.pack_aec_dataset --input data_aec_16k/all --output data_aec_16k/packed/all
+    ``[data] val_fraction`` then holds out individual 8-second chunks via
+    ``training_common.split_dataset_by_sample``, deterministically from
+    ``--seed``. Chunks from the same sequence/speaker/RIR may intentionally
+    straddle the split, so generalisation requires a separate held-out set.
+    Training uses a plain shuffled DataLoader; validation does not shuffle.
 
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['Align_CRUSE']):
@@ -52,7 +52,6 @@ import time
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 # Run directly as `python3 train.py` from this directory, exactly like every
 # AINR trainer -- so the repo root (parent of AIAEC/) must go on sys.path
@@ -66,8 +65,6 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.dataset_gen import (
     AecStems,
-    PackedAecDataset,
-    aec_collate,
     build_model_view,
     build_spectral_model_view,
 )
@@ -75,6 +72,7 @@ from AIAEC.training_common import (
     GradNormLog,
     NonFiniteTraining,
     build_arg_parser,
+    build_plain_loaders,
     auto_device,
     compressed_spectral_loss,
     halt_on_non_finite,
@@ -94,16 +92,6 @@ LOSS_VERSION = 'aiaec_compressed_spectral_v1'
 
 def build_parser() -> argparse.ArgumentParser:
     return build_arg_parser('Train Align-CRUSE (direct AEC/RES, preserve noise)')
-
-
-def make_loader(cfg, section: str, aec_grid, shuffle: bool) -> DataLoader:
-    path = cfg.get(section, 'packed_dir')
-    dataset = PackedAecDataset(path, expected_sr=aec_grid.sr)
-    return DataLoader(
-        dataset, batch_size=cfg.getint('data', 'batch_size'),
-        shuffle=shuffle, num_workers=cfg.getint('data', 'num_workers', fallback=0),
-        collate_fn=aec_collate, drop_last=shuffle,
-    )
 
 
 def forward_batch(model, stems_batch, aec_grid, device):
@@ -187,9 +175,13 @@ def main(args):
     print(f"Align-CRUSE: {sum(p.numel() for p in model.parameters())} params, "
           f"grid={model_grid}")
 
+    train_loader, val_loader, data_contract = build_plain_loaders(
+        cfg, aec_grid, seed=args.seed
+    )
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
         model_kwargs=model_kwargs, loss_version=LOSS_VERSION,
+        data_contract=data_contract,
     )
 
     output_dir = cfg.get('training', 'output_dir', fallback='output')
@@ -215,10 +207,6 @@ def main(args):
             best_val = ckpt.get('best_val', best_val)
         print(f"Resumed from {args.resume} at epoch {start_epoch}"
               f"{' (fresh optimizer)' if args.reset_optimizer else ''}")
-
-    train_loader = make_loader(cfg, 'data', aec_grid, shuffle=True)
-    val_loader = make_loader(cfg, 'val_data', aec_grid, shuffle=False) \
-        if cfg.has_section('val_data') else None
 
     loss_cfg = cfg['loss'] if cfg.has_section('loss') else {
         'compression': '0.3', 'magnitude_weight': '1.0', 'complex_weight': '1.0'}

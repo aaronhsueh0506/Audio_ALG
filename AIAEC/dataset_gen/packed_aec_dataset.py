@@ -1,14 +1,14 @@
 """Torch Dataset over packed AEC shards, returning ``(stems, meta)``.
 
-Unlike ``AINR/dataset_gen/packed_dataset.py``, this does NOT hand a directory to
-``ConcatDataset``.  The sequence-aware sampler needs ``sequence_id`` and
-``chunk_index`` for every GLOBAL index up front, and ConcatDataset exposes no
-way to ask its members for metadata.  Concatenation therefore happens here, and
-the class owns the global index map.
+Unlike ``AINR/dataset_gen/packed_dataset.py``, this does not hand a directory to
+``ConcatDataset``. It owns the global index/metadata map so checkpoints can
+record exact random-chunk splits and evaluation can reconstruct
+``(sequence_id, chunk_index)`` order.
 """
 
 import bisect
 import glob
+import hashlib
 import json
 import os
 from typing import Dict, List, Optional, Tuple
@@ -17,6 +17,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .aec_features import STEM_ORDER, AecStems
+from .linear_aec import LinearAecContract
 
 
 __all__ = ['PackedAecDataset', 'aec_collate']
@@ -26,7 +27,7 @@ class PackedAecDataset(Dataset):
     """Open one ``.pt`` shard, or every shard in a directory, in order.
 
     ``__getitem__`` returns ``(stems, meta)`` where ``stems`` is the raw
-    ``(7, T)`` tensor in ``STEM_ORDER``.  Wrap it in
+    ``(6, T)`` tensor in ``STEM_ORDER``.  Wrap it in
     :class:`~AIAEC.dataset_gen.aec_features.AecStems` to read channels by name --
     :meth:`stems_of` does that for you.
     """
@@ -41,6 +42,8 @@ class PackedAecDataset(Dataset):
         self._meta: List[dict] = []
         total = 0
         chunk_samples = None
+        linear_aec_contract = None
+        shard_identity = None
 
         for shard_path in self.paths:
             # ⚠ weights_only=False, unlike AINR/dataset_gen/packed_dataset.py. The
@@ -50,7 +53,38 @@ class PackedAecDataset(Dataset):
             obj = torch.load(shard_path, map_location='cpu', mmap=mmap,
                              weights_only=False)
             self._validate(obj, shard_path, expected_sr)
+            shard_contract = LinearAecContract.from_dict(obj['linear_aec'])
+            if obj['linear_aec_contract_hash'] != shard_contract.fingerprint():
+                raise ValueError(
+                    f"{shard_path}: linear_aec_contract_hash does not match "
+                    "the recorded linear_aec contract"
+                )
+            if linear_aec_contract is None:
+                linear_aec_contract = shard_contract
+            elif shard_contract != linear_aec_contract:
+                raise ValueError(
+                    f"{shard_path}: linear_aec contract differs from an earlier shard"
+                )
             data = obj['data']
+            current_identity = {
+                'sr': int(obj['sr']),
+                'dtype': str(data.dtype),
+                'generator_commit': obj.get('generator_commit'),
+                'config_hash': obj.get('config_hash'),
+                'manifest_seed': obj.get('manifest_seed'),
+            }
+            if shard_identity is None:
+                shard_identity = current_identity
+            elif current_identity != shard_identity:
+                changed = [
+                    key for key in shard_identity
+                    if current_identity[key] != shard_identity[key]
+                ]
+                raise ValueError(
+                    f"{shard_path}: packed-corpus identity differs from an "
+                    f"earlier shard in {changed}; do not mix shards from "
+                    "different generation/packing runs"
+                )
             if chunk_samples is None:
                 chunk_samples = data.shape[2]
             elif data.shape[2] != chunk_samples:
@@ -69,6 +103,9 @@ class PackedAecDataset(Dataset):
         self.chunk_samples = int(chunk_samples)
         self.stems = tuple(self._shards[0]['stems'])
         self.dtype = self._shards[0]['data'].dtype
+        self.linear_aec_contract = linear_aec_contract
+        self.linear_aec_contract_hash = linear_aec_contract.fingerprint()
+        self.manifest_seed = self._shards[0].get('manifest_seed')
         self._total = total
 
         if verbose:
@@ -83,6 +120,23 @@ class PackedAecDataset(Dataset):
     @staticmethod
     def _resolve(path: str) -> List[str]:
         if os.path.isdir(path):
+            index_path = os.path.join(path, 'index.json')
+            if os.path.isfile(index_path):
+                # Authoritative: a directory can accumulate stray .pt files
+                # left over from an earlier, larger/differently-configured
+                # pack_aec_dataset.py run into the same --output. Globbing
+                # would silently include them; index.json is the one record
+                # of which shards THIS pack actually wrote.
+                with open(index_path, 'r') as handle:
+                    index = json.load(handle)
+                shards = [os.path.join(path, name) for name in index['shards']]
+                missing = [s for s in shards if not os.path.isfile(s)]
+                if missing:
+                    raise FileNotFoundError(
+                        f"{index_path} lists {len(missing)} shard(s) that do "
+                        f"not exist, e.g. {missing[0]}"
+                    )
+                return shards
             shards = sorted(glob.glob(os.path.join(path, '*.pt')))
             if not shards:
                 raise FileNotFoundError(f"no .pt shards under {path}")
@@ -93,7 +147,10 @@ class PackedAecDataset(Dataset):
 
     @staticmethod
     def _validate(obj: dict, path: str, expected_sr: Optional[int]) -> None:
-        for key in ('stems', 'data', 'sr', 'meta'):
+        for key in (
+            'stems', 'data', 'sr', 'meta', 'linear_aec',
+            'linear_aec_contract_hash',
+        ):
             if key not in obj:
                 raise ValueError(f"{path} is missing required key {key!r}")
         # ⚠ The channel order is the one property a consumer cannot notice being
@@ -112,6 +169,13 @@ class PackedAecDataset(Dataset):
             raise ValueError(
                 f"{path}: {len(obj['meta'])} metadata entries for "
                 f"{data.shape[0]} clips")
+        contract_hash = obj['linear_aec_contract_hash']
+        for index, meta in enumerate(obj['meta']):
+            if meta.get('linear_aec_contract_hash') != contract_hash:
+                raise ValueError(
+                    f"{path}: metadata entry {index} has a missing/different "
+                    "linear_aec_contract_hash"
+                )
         if expected_sr is not None and int(obj['sr']) != expected_sr:
             raise ValueError(
                 f"{path}: sr={obj['sr']}, but the config requires {expected_sr}")
@@ -180,7 +244,44 @@ class PackedAecDataset(Dataset):
             'scenarios': self.scenario_counts(),
             'generator_commit': self._shards[0].get('generator_commit'),
             'config_hash': self._shards[0].get('config_hash'),
+            'manifest_seed': self.manifest_seed,
+            'linear_aec_contract_hash': self.linear_aec_contract_hash,
+            'dataset_fingerprint': self.fingerprint(),
         }, indent=2, sort_keys=True)
+
+    def fingerprint(self) -> str:
+        """Stable corpus identity used by checkpoint/data-resume contracts."""
+        digest = hashlib.sha256()
+        header = {
+            'sr': self.sr,
+            'chunk_samples': self.chunk_samples,
+            'stems': list(self.stems),
+            'dtype': str(self.dtype),
+            'generator_commit': self._shards[0].get('generator_commit'),
+            'config_hash': self._shards[0].get('config_hash'),
+            # The manifest seed is part of the audio identity, not just split
+            # bookkeeping: the renderer derives device/EQ profiles and every
+            # sequence RNG from the corpus seed.  Omitting it could let two
+            # differently rendered corpora share a checkpoint data contract.
+            'manifest_seed': self.manifest_seed,
+            'linear_aec_contract_hash': self.linear_aec_contract_hash,
+        }
+        digest.update(json.dumps(
+            header, sort_keys=True, separators=(',', ':'),
+        ).encode('utf-8'))
+        for meta in self._meta:
+            identity = (
+                int(meta['sequence_id']),
+                int(meta['chunk_index']),
+                meta.get('scenario'),
+                meta.get('speaker_id'),
+                meta.get('noise_id'),
+                meta.get('rir_id'),
+                meta.get('device_id'),
+            )
+            digest.update(repr(identity).encode('utf-8'))
+            digest.update(b'\0')
+        return digest.hexdigest()
 
 
 def aec_collate(batch):

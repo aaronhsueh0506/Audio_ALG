@@ -28,6 +28,14 @@ score answers a different, easier question -- say so if you use it.
 
 The manifest is written to disk so that the train run and the val run, which
 are separate invocations, provably draw from the same decision.
+
+``build_unified_manifest`` / ``--split all`` deliberately skips all of the
+above. Every source goes in one pool and
+``AIAEC.training_common.split_dataset_by_sample`` performs the selected
+per-chunk random split at load time. Chunks from one source or parent sequence
+may therefore straddle train and validation. This is useful for optimization
+tracking, but generalisation must be measured with a separate source-disjoint
+or real-recording set.
 """
 
 import configparser
@@ -45,10 +53,12 @@ from AINR.dataset_gen.dataset import estimate_rt60
 
 
 __all__ = [
+    'ALL_SPLIT_NAMES',
     'MANIFEST_VERSION',
     'SourcePools',
     'assert_source_disjoint',
     'build_manifest',
+    'build_unified_manifest',
     'config_hash',
     'load_manifest',
     'pools_for_split',
@@ -62,6 +72,20 @@ __all__ = [
 MANIFEST_VERSION = 'aec_manifest_v1'
 
 SPLITS = ('train', 'val')
+
+# Unified-pool mode (build_unified_manifest / --split all): every source is
+# available to every clip, and AIAEC.training_common.split_dataset_by_sample
+# divides rendered chunks at load time. A manifest built this way has no
+# train/val axis to check, so
+# assert_source_disjoint must never be called on one; load_manifest tells
+# the two shapes apart via 'split_mode'.
+UNIFIED_SPLIT = 'all'
+
+# The one canonical list of valid `--split`/`gen_aec_dataset.py` values --
+# SourcePools' own validation and gen_aec_dataset.py's argparse `choices`
+# both read this instead of each re-deriving or re-typing 'train'/'val'/'all',
+# so a renamed or added split name cannot drift between the two call sites.
+ALL_SPLIT_NAMES = SPLITS + (UNIFIED_SPLIT,)
 
 # Every axis that must not straddle the split.  Kept as one tuple so the
 # builder, the checker and the test cannot disagree about what "disjoint" covers.
@@ -199,22 +223,19 @@ def _rir_rt60(root: str, rel_paths: Sequence[str], sr: int,
 # Manifest
 # ============================================================
 
-def build_manifest(cfg: configparser.ConfigParser, seed: int,
-                   progress: bool = True) -> dict:
-    """Decide the split over source lists.  Renders nothing."""
+def _scan_sources(cfg: configparser.ConfigParser, progress: bool):
+    """Everything build_manifest and build_unified_manifest both need:
+    scan speech/noise/rir, filter RIRs by RT60, and group each axis into ids.
+
+    Extracted so the two manifest shapes cannot drift on how a source turns
+    into a group id -- they call the exact same grouping call with the exact
+    same patterns.
+    """
     sr = cfg.getint('signal', 'sr')
     speech_dir = cfg.get('paths', 'speech_dir')
     noise_dir = cfg.get('paths', 'noise_dir')
     rir_dir = cfg.get('paths', 'rir_dir')
-
-    val_fraction = cfg.getfloat('split', 'val_fraction', fallback=0.1)
-    if not 0.0 < val_fraction < 1.0:
-        raise ValueError(f"[split] val_fraction must be in (0, 1), got {val_fraction}")
-    device_split = cfg.get('split', 'device_split', fallback='disjoint')
-    if device_split not in ('disjoint', 'shared'):
-        raise ValueError(
-            f"[split] device_split must be 'disjoint' or 'shared', got {device_split!r}"
-        )
+    far_speech_dir = cfg.get('paths', 'far_speech_dir', fallback='') or None
 
     speaker_pattern = cfg.get('split', 'speaker_id_regex', fallback='') or None
     noise_pattern = cfg.get('split', 'noise_id_regex', fallback='') or None
@@ -227,14 +248,13 @@ def build_manifest(cfg: configparser.ConfigParser, seed: int,
     if len(set(device_ids)) != len(device_ids):
         raise ValueError("[devices] device_ids contains duplicates")
 
-    # The split RNG is dedicated and seeded only from `seed`, so the manifest
-    # depends on (sources, seed) alone.  Re-running the generator with a
-    # different --hours must not move a single speaker across the fence.
-    rng = random.Random(seed)
-
     speech_rel = _scan_wavs(speech_dir)
     noise_rel = _scan_wavs(noise_dir)
     rir_rel_all = _scan_wavs(rir_dir)
+    # far_speech_dir is a plain file pool, not a grouped/disjoint-split source:
+    # nothing downstream needs a generalisation guarantee over it, so it gets
+    # no regex, no RT60 filter, and no train/val partitioning.
+    far_speech_rel = _scan_wavs(far_speech_dir) if far_speech_dir else None
 
     rt60_map = _rir_rt60(rir_dir, rir_rel_all, sr, rt60_min, rt60_max, progress)
     rir_rel = sorted(rt60_map)
@@ -242,6 +262,71 @@ def build_manifest(cfg: configparser.ConfigParser, seed: int,
     speakers = _group(speech_rel, speaker_pattern, 'parent_dir')
     noises = _group(noise_rel, noise_pattern, 'stem')
     rooms = _group(rir_rel, room_pattern, 'parent_dir')
+
+    return {
+        'sr': sr, 'speech_dir': speech_dir, 'noise_dir': noise_dir, 'rir_dir': rir_dir,
+        'far_speech_dir': far_speech_dir, 'far_speech_rel': far_speech_rel,
+        'device_ids': device_ids, 'rt60_map': rt60_map,
+        'speakers': speakers, 'noises': noises, 'rooms': rooms,
+    }
+
+
+def _split_entry(speaker_ids, speakers, noise_ids, noises, room_ids, rooms,
+                 device_ids) -> dict:
+    """One ``splits[...]`` entry -- the 8-key shape both a source-disjoint
+    HALF (``build_manifest``) and the WHOLE unified pool
+    (``build_unified_manifest``) produce, differing only in which id lists
+    are passed in. Factored out so a future manifest field is added in
+    exactly one place instead of two dict literals that would otherwise have
+    to be kept structurally parallel by hand.
+    """
+    return {
+        'speakers': sorted(speaker_ids),
+        'speech_files': sorted(f for spk in speaker_ids for f in speakers[spk]),
+        'noise_ids': sorted(noise_ids),
+        'noise_files': sorted(f for nid in noise_ids for f in noises[nid]),
+        'rooms': sorted(room_ids),
+        'rir_files': sorted(f for room in room_ids for f in rooms[room]),
+        'devices': sorted(device_ids),
+        'rooms_to_rirs': {room: sorted(rooms[room]) for room in room_ids},
+    }
+
+
+def _apply_far_speech(manifest: dict, scanned: dict) -> None:
+    """Add the optional independent far-end reference pool, if configured.
+
+    Deliberately NOT part of ``_split_entry``: this pool never participates in
+    a train/val decision (see ``[paths] far_speech_dir`` in
+    config.example.ini), so it lives once at the manifest's top level --
+    alongside ``roots``/``rt60`` -- rather than duplicated identically inside
+    every ``splits[...]`` entry. Absent entirely when unconfigured, so
+    ``SourcePools`` can tell "not set" apart from "empty".
+    """
+    if scanned['far_speech_rel'] is not None:
+        manifest['far_speech_files'] = scanned['far_speech_rel']
+        manifest['roots']['far_speech_dir'] = scanned['far_speech_dir']
+
+
+def build_manifest(cfg: configparser.ConfigParser, seed: int,
+                   progress: bool = True) -> dict:
+    """Decide the split over source lists.  Renders nothing."""
+    val_fraction = cfg.getfloat('split', 'val_fraction', fallback=0.1)
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError(f"[split] val_fraction must be in (0, 1), got {val_fraction}")
+    device_split = cfg.get('split', 'device_split', fallback='disjoint')
+    if device_split not in ('disjoint', 'shared'):
+        raise ValueError(
+            f"[split] device_split must be 'disjoint' or 'shared', got {device_split!r}"
+        )
+
+    scanned = _scan_sources(cfg, progress)
+    speakers, noises, rooms = scanned['speakers'], scanned['noises'], scanned['rooms']
+    device_ids = scanned['device_ids']
+
+    # The split RNG is dedicated and seeded only from `seed`, so the manifest
+    # depends on (sources, seed) alone.  Re-running the generator with a
+    # different --hours must not move a single speaker across the fence.
+    rng = random.Random(seed)
 
     speaker_split = _split_groups(speakers, val_fraction, rng, 'speaker')
     noise_split = _split_groups(noises, val_fraction, rng, 'noise')
@@ -259,42 +344,74 @@ def build_manifest(cfg: configparser.ConfigParser, seed: int,
 
     manifest = {
         'version': MANIFEST_VERSION,
+        'split_mode': 'disjoint',
         'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
         'seed': int(seed),
-        'sr': sr,
+        'sr': scanned['sr'],
         'val_fraction': val_fraction,
         'device_split': device_split,
         'config_hash': config_hash(cfg),
         'roots': {
             # Relative source lists plus the roots they were taken under, so a
             # corpus can move without invalidating the split decision.
-            'speech_dir': speech_dir,
-            'noise_dir': noise_dir,
-            'rir_dir': rir_dir,
+            'speech_dir': scanned['speech_dir'],
+            'noise_dir': scanned['noise_dir'],
+            'rir_dir': scanned['rir_dir'],
         },
-        'rt60': rt60_map,
+        'rt60': scanned['rt60_map'],
         'splits': {},
     }
 
     for split in SPLITS:
-        manifest['splits'][split] = {
-            'speakers': speaker_split[split],
-            'speech_files': sorted(
-                f for spk in speaker_split[split] for f in speakers[spk]
-            ),
-            'noise_ids': noise_split[split],
-            'noise_files': sorted(
-                f for nid in noise_split[split] for f in noises[nid]
-            ),
-            'rooms': room_split[split],
-            'rir_files': sorted(
-                f for room in room_split[split] for f in rooms[room]
-            ),
-            'devices': dev_split[split],
-            'rooms_to_rirs': {room: sorted(rooms[room]) for room in room_split[split]},
-        }
+        manifest['splits'][split] = _split_entry(
+            speaker_split[split], speakers, noise_split[split], noises,
+            room_split[split], rooms, dev_split[split],
+        )
 
+    _apply_far_speech(manifest, scanned)
     assert_source_disjoint(manifest)
+    return manifest
+
+
+def build_unified_manifest(cfg: configparser.ConfigParser, seed: int,
+                          progress: bool = True) -> dict:
+    """One undifferentiated pool -- every source available to every clip.
+
+    For the selected unified-corpus protocol. See
+    AIAEC/training_common.py's split_dataset_by_sample for the deterministic
+    per-chunk random split this pairs with. Generalisation must be evaluated
+    separately because sources and parent sequences may straddle the split.
+    There is no train/val axis here
+    to keep disjoint, so assert_source_disjoint is never called on this
+    shape; ``seed`` is still recorded for provenance even though nothing in
+    THIS function is randomised by it (kept so meta.json/manifest.json are
+    structurally comparable across both manifest shapes).
+    """
+    scanned = _scan_sources(cfg, progress)
+    speakers, noises, rooms = scanned['speakers'], scanned['noises'], scanned['rooms']
+    device_ids = scanned['device_ids']
+
+    manifest = {
+        'version': MANIFEST_VERSION,
+        'split_mode': 'unified',
+        'created_utc': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'seed': int(seed),
+        'sr': scanned['sr'],
+        'config_hash': config_hash(cfg),
+        'roots': {
+            'speech_dir': scanned['speech_dir'],
+            'noise_dir': scanned['noise_dir'],
+            'rir_dir': scanned['rir_dir'],
+        },
+        'rt60': scanned['rt60_map'],
+        'splits': {
+            UNIFIED_SPLIT: _split_entry(
+                speakers.keys(), speakers, noises.keys(), noises,
+                rooms.keys(), rooms, device_ids,
+            ),
+        },
+    }
+    _apply_far_speech(manifest, scanned)
     return manifest
 
 
@@ -338,6 +455,10 @@ def load_manifest(path: str) -> dict:
             f"writes {MANIFEST_VERSION!r}. Rebuild it rather than reinterpreting "
             f"a split whose meaning may have changed."
         )
+    # A unified manifest (build_unified_manifest) has no train/val axis to
+    # check -- every source is in the one 'all' pool by construction.
+    if manifest.get('split_mode') == 'unified':
+        return manifest
     assert_source_disjoint(manifest)
     return manifest
 
@@ -352,11 +473,11 @@ class SourcePools:
 
     __slots__ = ('split', 'speech_files', 'noise_files', 'devices',
                  'rooms', 'rirs_by_room', 'rt60', 'speaker_of', 'noise_of',
-                 'rir_id_of', 'room_of')
+                 'rir_id_of', 'room_of', 'far_speech_files', 'far_speaker_of')
 
     def __init__(self, split: str, manifest: dict):
-        if split not in SPLITS:
-            raise ValueError(f"split must be one of {SPLITS}, got {split!r}")
+        if split not in ALL_SPLIT_NAMES:
+            raise ValueError(f"split must be one of {ALL_SPLIT_NAMES}, got {split!r}")
         roots = manifest['roots']
         entry = manifest['splits'][split]
 
@@ -404,6 +525,27 @@ class SourcePools:
             if not pool:
                 raise ValueError(f"split {split!r} has an empty {name} pool")
 
+        # Optional independent far-end reference pool (`[paths] far_speech_dir`
+        # in config.example.ini). It is manifest-global, not per-split -- it
+        # never takes part in a train/val decision -- so it is read straight
+        # off `manifest`, not `entry`. Unconfigured means "reuse the near-end
+        # pool", exactly today's behaviour: the renderer then always reads
+        # `far_speech_files`/`far_speaker_of` without branching on whether
+        # this feature is on.
+        far_speech_rel = manifest.get('far_speech_files')
+        if far_speech_rel is not None:
+            far_speech_dir = manifest['roots']['far_speech_dir']
+            self.far_speech_files = [
+                os.path.join(far_speech_dir, rel) for rel in far_speech_rel
+            ]
+            self.far_speaker_of = {
+                absolute: _grouping_key(rel, None, 'parent_dir')
+                for rel, absolute in zip(far_speech_rel, self.far_speech_files)
+            }
+        else:
+            self.far_speech_files = self.speech_files
+            self.far_speaker_of = self.speaker_of
+
     def __repr__(self):
         return (f"SourcePools(split={self.split!r}, speech={len(self.speech_files)}, "
                 f"noise={len(self.noise_files)}, rooms={len(self.rooms)}, "
@@ -429,11 +571,13 @@ def pools_for_split(manifest: dict, split: str) -> SourcePools:
 
 
 def summarise(manifest: dict) -> str:
+    unified = manifest.get('split_mode') == 'unified'
+    device_split = 'n/a (unified)' if unified else manifest['device_split']
     lines = [
         f"manifest {manifest['version']} seed={manifest['seed']} "
-        f"config_hash={manifest['config_hash']} device_split={manifest['device_split']}"
+        f"config_hash={manifest['config_hash']} device_split={device_split}"
     ]
-    for split in SPLITS:
+    for split in (UNIFIED_SPLIT,) if unified else SPLITS:
         entry = manifest['splits'][split]
         lines.append(
             f"  {split:<5} speakers={len(entry['speakers'])} "

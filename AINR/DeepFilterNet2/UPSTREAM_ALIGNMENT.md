@@ -62,7 +62,7 @@ target constraints**.
 | | what | why |
 |---|---|---|
 | **ERB filterbank** | triangular, overlapping, energy-**SUM** (upstream: rectangular, non-overlapping, energy-MEAN) | confirmed correct for this project; shared with the RNNoise-ERB / `bandERB.ipynb` lineage |
-| **lookahead 1/1** | upstream ships 2/2 in all three releases | latency: 10.7 ms vs 21.3 ms at hop 512 / 48 kHz |
+| **lookahead 1/1** | upstream ships 2/2 in all three releases | DFN2 cascade latency: 21.3 ms (two hops); each individual stage is 10.7 ms |
 | **no lsnr head, no `[localsnrloss]`** | upstream trains both | removes an untrained head and its loss term |
 | **no batch-size ramp** | upstream ramps 16/24/32/64 per epoch | fixed batch; only LR and WD vary |
 
@@ -168,7 +168,7 @@ Within a tier, cheapest fix first.
 | 17 | `epochs = 100` vs upstream `max_epochs = 120` | compresses the LR and WD horizons 1.2× | — | keep. At epoch 10: LR 9.872e-4 vs 9.912e-4 (nil); WD 2.45e-4 vs 8.6e-5 (2.8×, but both ≪ the 0.01 endpoint) |
 | 18 | MRSL `factor = 500` | Upstream's MRSL sees signals at `1/sqrt(960)` = 0.0323× true amplitude (verified to 1e-16). The port's matched sqrt-Hann round trip is **unity gain** (1.0 to 8e-17) | same `factor` ⇒ nominal objective `960^0.3` = **7.85×** upstream's. ⚠ The *effect* is unestablished: AdamW is scale-invariant in the relevant regime and `clip_grad_norm_` rescales without changing direction | document only. Do **not** rescale as a "fix" — that is a tuning experiment with a `grad_clip` interaction |
 | 19 | `df_bins = 96` at n_fft 1024 | upstream 96 bins @ 50.0 Hz = 4800 Hz; port 96 bins @ 46.875 Hz = **4500 Hz** (exactly 300.0 Hz lower, 6 bins) | `config.ini:12` states the port's own coverage but not that it diverges. A reader cannot tell whether 96 was re-derived or copied | keep + document |
-| 20 | `mask_lookahead / df_lookahead = 1/1` | upstream ships `conv_lookahead = 2`, `df_lookahead = 2` | 1/1, with a 10-line rationale. Mask sees `t+1` not `t+2`; DF support `[t-3..t+1]` instead of `[t-2..t+2]` (same 5 taps). ~10.7 ms algorithmic latency vs upstream's ~20 ms — the stated goal. ⚠ Quality cost **unverified**: no DFN3 ablation at lookahead 1 exists | keep (by design) |
+| 20 | `mask_lookahead / df_lookahead = 1/1` | upstream ships `conv_lookahead = 2`, `df_lookahead = 2` | Mask sees `t+1` not `t+2`; DF support `[t-3..t+1]` instead of `[t-2..t+2]` (same 5 taps). Because DFN2 filters the masked spectrum, the streaming dependencies are serial: total delay is two hops (~21.3 ms), not one. `df_lookahead=0` is required for a one-hop product budget. ⚠ Quality cost **unverified** | keep pending operator latency decision |
 | 21 | `alpha = 0.989` | 0.989 appears in **no** upstream config. Upstream derives α from `norm_tau` with a rounding loop (`utils.py:111-128`) | `config.ini:74-75` asserts identity with "the original-DFN rounded alpha" — a false *aligned* marker, which is exactly what stops a reviewer looking. The mechanism itself is correct (`train.py:175-183`). Side effect: effective τ = 0.9644 s vs 0.9950 s (3% shorter), because 3-decimal rounding is coarser at hop 512 | fix comment |
 | 22 | `causal_ema_db_norm` docstring | code default is `(-15,-60)` (`train.py:363`) | the docstring three lines later still says `MEAN_NORM_INIT = [-60,-90]` and that `normalized=True` is what calibrates it (`train.py:368-369`). A reader trusting it concludes the port is upstream-aligned exactly where it deliberately is not. The unit-norm path's docstring gets this right (`train.py:403-405`) | fix comment |
 | 23 | `deep_filter_apply` docstring + default | shipped `df_lookahead = 1` (`config.ini:17`); DFN3 filters the **unmasked** spectrum | docstring says "the deployed configuration uses `df_lookahead=0` … four history frames" and "masked spectra"; signature default is `df_lookahead=0` (`model.py:553-556,621`). Wrong twice, and actively misleading for the C/streaming port that is its stated audience. At 1/1 the ring buffer needs 3 history + current + 1 future and a one-frame output delay | fix comment + default |
@@ -392,9 +392,9 @@ deliberate, verified divergence.
 1. **`n_fft = 1024`, `win_len = 1024`, `hop_len = 512`.** Do not restore
    960/480 — it is not radix-2. Everything downstream is derived from this grid:
    281 frames per 3 s segment, the 3τ = 273-frame transient argument, the
-   norm-init calibration, the 10.7 ms latency budget.
-2. **`mask_lookahead = 1`, `df_lookahead = 1`** (not upstream's 2/2). This *is*
-   the latency budget (`config.ini:15-27`). ⚠ Do not align the lookahead
+   norm-init calibration, and the corrected 21.3 ms DFN2 cascade latency.
+2. **`mask_lookahead = 1`, `df_lookahead = 1`** (not upstream's 2/2). This is a
+   two-hop DFN2 cascade budget (`config.ini:15-44`). ⚠ Do not align the lookahead
    **mechanism** either: the port's in-conv centred pad is provably equivalent to
    upstream's feature-shift scheme at equal L — verified identical except the
    first `kt-1 = 2` frames of a stream.

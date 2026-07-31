@@ -36,6 +36,7 @@ from torch.utils.data import Sampler
 
 
 __all__ = [
+    'BASE_STEM_ORDER',
     'STEM_ORDER',
     'AecGrid',
     'AecStems',
@@ -56,24 +57,19 @@ __all__ = [
 # under 'stems' so a shard that disagrees can be rejected instead of silently
 # feeding a stem into the wrong slot.
 #
-# ⚠ ``echo`` (D) and ``mic_preclip`` (S+N+D pre-clip/AGC) are DELIBERATELY NOT
-# HERE.  No model task reads either one (model_views.py's build_model_view
-# never touches them), and no candidate wants an oracle residual anyway --
-# an AEC estimate is always computed live from far_render/mic_postclip
-# through a linear_aec callback, never read off a stored "true" echo.  They
-# were dropped from storage to cut the packed corpus's disk footprint by
-# 2/7, keeping every stem a model actually consumes and near_target for
-# DeepVQE-S's dereverberation task. Both are still COMPUTED on every render
-# (aec_dataset.py's RenderedSequence.audit) so the corpus's central
-# invariants -- mic_preclip == S+N+D, echo really is a delayed copy of X --
-# stay verified at generation time; see tests/test_aec_dataset.py.
-STEM_ORDER = (
+# ``echo`` (D) and ``mic_preclip`` (S+N+D before clipping/AGC) remain audit
+# signals only. ``linear_error`` is different: it is the real frozen PBFDKF
+# output E=Y-D_hat consumed by the three RES+NR candidates. It is materialized
+# over the COMPLETE parent sequence before chunking, never manufactured from
+# oracle D and never recomputed inside a training epoch.
+BASE_STEM_ORDER = (
     'far_render',
     'near_speech',
     'near_target',
     'local_noise',
     'mic_postclip',
 )
+STEM_ORDER = BASE_STEM_ORDER + ('linear_error',)
 
 
 # ============================================================
@@ -256,7 +252,7 @@ def frames_from_seconds(seconds: float, frame_rate: float,
 # ============================================================
 
 class AecStems:
-    """Named access to the ``(..., 5, T)`` stem tensor.
+    """Named access to the ``(..., 6, T)`` stem tensor.
 
     Channel 0 is far_render and channel 1 is near_speech.  Getting those two
     the wrong way round produces a model that trains, converges, and cancels
@@ -312,6 +308,11 @@ class AecStems:
         """The mic signal a model actually receives."""
         return self.stem('mic_postclip')
 
+    @property
+    def linear_error(self) -> torch.Tensor:
+        """Frozen PBFDKF output E=Y-D_hat, materialized before chunking."""
+        return self.stem('linear_error')
+
     # -- signal-model aliases -------------------------------------------
     #
     #   Y = S + N + D        (mic)
@@ -320,12 +321,9 @@ class AecStems:
     #   E = Y - D_hat        by subtraction, never a mask on Y
     #   R = D - D_hat        residual echo; emerges, never a target
     #
-    # ⚠ There is deliberately no ``D``, ``E`` or ``R`` accessor here. ``D``
-    # (echo) is not stored at all -- see STEM_ORDER's docstring; it is only
-    # ever available at generation time via
-    # ``aec_dataset.RenderedSequence.audit``. ``E``/``R`` both need ``D_hat``
-    # from the frozen production linear front-end; model_views.py enforces
-    # that contract instead of manufacturing an oracle residual from D.
+    # ``D`` (true echo) and ``R`` (oracle residual echo) deliberately have no
+    # accessor. E is the materialized *linear error*, not R. D_hat is derived
+    # exactly from the two persisted waveforms rather than stored twice.
     @property
     def Y(self) -> torch.Tensor:
         return self.mic_postclip
@@ -341,6 +339,14 @@ class AecStems:
     @property
     def N(self) -> torch.Tensor:
         return self.local_noise
+
+    @property
+    def E(self) -> torch.Tensor:
+        return self.linear_error
+
+    @property
+    def D_hat(self) -> torch.Tensor:
+        return self.mic_postclip - self.linear_error
 
     def as_tensor(self) -> torch.Tensor:
         return self._data
@@ -376,7 +382,7 @@ class SequenceChunkSampler(Sampler):
 
     Batch *b* holds one chunk per lane; batch *b+1* holds the NEXT chunk of the
     same sequence in each lane.  A trainer that keeps a per-lane recurrent state
-    across batches therefore sees a whole 20-60 s sequence unbroken.
+    across batches therefore sees one whole configured parent sequence unbroken.
 
     ⚠ Resetting recurrent state every chunk is the default a naive DataLoader
     gives you, and it hides precisely the behaviours this corpus was built to

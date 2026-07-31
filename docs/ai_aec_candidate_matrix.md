@@ -36,9 +36,9 @@ record.
 - Model grids are `512/512/256 @ 16 kHz` and
   `1024/1024/512 @ 48 kHz`.
 - `GTCRN_AENR` stays locked to its original 16 kHz grid.
-- The public forwards are clip-level. Preserving dataset sequence order does
-  not create streaming cache/state I/O.
-- AIAEC data is generated only through `AIAEC/dataset_gen/`. Seven stored stems
+- The public forwards are clip-level; explicit per-model cache/state I/O is a
+  separate streaming deployment concern.
+- AIAEC data is generated only through `AIAEC/dataset_gen/`. Six stored stems
   are mapped to model inputs and targets by
   `dataset_gen.model_views.build_model_view`.
 
@@ -59,11 +59,16 @@ preserved DFN3 band-split checkpoint is not compatible.
 
 ## Dataset and deployment boundary
 
-The AIAEC generator renders 3-second chunks inside longer stateful scenario
-sequences. RES+NR views must execute the actual frozen production linear AEC.
-For 20–60 second training continuity, concatenate adjacent chunks before a
-clip-level forward or add explicit per-model streaming state; sampler ordering
-alone is insufficient.
+The AIAEC generator renders complete stateful scenario sequences, executes one
+frozen production Python PBFDKF over each sequence, appends its
+`linear_error = mic_postclip - D_hat` as dataset channel six, and then cuts
+8-second chunks. RES+NR trainers read this stored channel directly. File/stream
+inference restores the same PBFDKF contract from the checkpoint and runs the
+frontend continuously before the neural model.
+
+The selected train/validation protocol is a deterministic random split over
+individual packed chunks. Chunks from the same sequence, speaker, or RIR may
+straddle; source-generalisation must be evaluated on a separate held-out set.
 
 The conventional 4-channel path remains:
 

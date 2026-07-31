@@ -13,8 +13,8 @@ config.ini sections (see the shipped config.ini for every knob, documented):
                  AIAEC/dataset_gen/config.ini rendered with. 48 kHz uses
                  1024/1024/512 with df_bins=96; 16 kHz uses 512/512/256 with
                  df_bins=64 (model.py's own default -- see README.md).
-    [data]       packed corpus paths + batch size (= lane count, see below)
-    [linear_aec] which frozen preset the linear-AEC frontend runs
+    [data]       one packed six-stem corpus path + ordinary batch size +
+                 per-chunk val_fraction
     [feature]    the SAME normalisation constants as
                  AINR/DeepFilterNet2/config.ini's [feature] section -- this
                  candidate reuses extract_dfn2_features() verbatim, so a
@@ -31,29 +31,13 @@ config.ini sections (see the shipped config.ini for every knob, documented):
     [loss]       compressed_spectral_loss term weights
 
 dataset:
-    Data is rendered and packed by AIAEC/dataset_gen/ only -- see
-    AIAEC/dataset_gen/README.md and ../Align_CRUSE/train.py's docstring for
-    the full generation walkthrough (identical for every candidate).
-
-    Like ../GTCRN_AENR/train.py, this candidate's input includes the FROZEN
-    PRODUCTION LINEAR AEC's error signal, so training uses
-    ``SequenceChunkSampler`` (batch size IS lane count) and
-    ``AIAEC.training_common.LinearAecEngine`` so that filter's cold/converged
-    state stays realistic across a sequence's chunks -- see
-    GTCRN_AENR/train.py's docstring for the full reasoning, unchanged here.
-
-    ⚠ UNLIKE the linear-AEC engine, the DFN feature normalisers' own causal
-    EMA state (extract_dfn2_features's ema_state) is NOT threaded across
-    chunks here: every forward call passes ``ema_state=None``, i.e. a fresh
-    init every 3-second chunk. This matches AINR/DeepFilterNet2/train.py's
-    OWN convention exactly -- that trainer never carries EMA state across
-    training samples either, since NR training clips are independent, not
-    sequence-chunked. Threading it here would mean giving a BATCHED state
-    tensor a partial per-lane reset on a sequence boundary, which nothing in
-    the local DFN2 port exposes a way to do safely; carrying only the
-    linear-AEC's state (a whole-object swap, not a batched-tensor splice) is
-    the part of statefulness the AEC dataset's long sequences most need, and
-    is what this trainer actually does.
+    AIAEC/dataset_gen renders each complete parent sequence, runs one stateful
+    frozen Python PBFDKF over it, stores the resulting ``linear_error`` as
+    channel six, then cuts 8-second chunks. This trainer never executes
+    PBFDKF. It uses the common deterministic per-chunk random split and an
+    ordinary shuffled training DataLoader. DFN feature-normalizer EMA state
+    starts fresh for each independent training chunk, matching the standalone
+    DFN2 training convention.
 
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['DeepFilterNet_AENR']):
@@ -77,7 +61,6 @@ import time
 
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
@@ -89,18 +72,14 @@ from AINR.DeepFilterNet2.train import FEATURE_VERSION, read_feature_config
 from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.dataset_gen import (
     AecStems,
-    PackedAecDataset,
-    SequenceChunkSampler,
-    aec_collate,
     build_model_view,
     build_spectral_model_view,
-    lane_reset_mask,
 )
 from AIAEC.training_common import (
     GradNormLog,
-    LinearAecEngine,
     NonFiniteTraining,
     build_arg_parser,
+    build_plain_loaders,
     auto_device,
     compressed_spectral_loss,
     halt_on_non_finite,
@@ -128,24 +107,9 @@ def build_parser() -> argparse.ArgumentParser:
     return build_arg_parser('Train DeepFilterNet-AENR (linear AEC -> RES+NR)')
 
 
-def make_loader_and_sampler(cfg, section: str, aec_grid, n_lanes: int, seed: int,
-                            shuffle: bool):
-    path = cfg.get(section, 'packed_dir')
-    dataset = PackedAecDataset(path, expected_sr=aec_grid.sr)
-    sampler = SequenceChunkSampler.from_dataset(
-        dataset, n_lanes=n_lanes, seed=seed, shuffle=shuffle,
-    )
-    loader = DataLoader(dataset, batch_sampler=sampler, collate_fn=aec_collate,
-                        num_workers=cfg.getint('data', 'num_workers', fallback=0))
-    return loader, sampler
-
-
-def forward_batch(model, stems_batch, meta, aec_grid, device, linear_aec, feature_cfg):
-    reset_mask = lane_reset_mask([m['chunk_index'] for m in meta]).tolist()
-    linear_aec.arm_reset(reset_mask)
+def forward_batch(model, stems_batch, aec_grid, device, feature_cfg):
     stems = AecStems(stems_batch.to(device))
-    view = build_model_view(stems, MODEL_NAME, sample_rate=aec_grid.sr,
-                            linear_aec=linear_aec)
+    view = build_model_view(stems, MODEL_NAME, sample_rate=aec_grid.sr)
     # dfn_feature_state=None every call -- see this file's top-of-file
     # docstring for why cross-chunk EMA threading is out of scope here.
     spectral = build_spectral_model_view(
@@ -156,17 +120,18 @@ def forward_batch(model, stems_batch, meta, aec_grid, device, linear_aec, featur
     return output, spectral
 
 
-def run_epoch(model, loader, aec_grid, device, loss_cfg, linear_aec, feature_cfg,
+def run_epoch(model, loader, aec_grid, device, loss_cfg, feature_cfg,
              optimizer=None, *, epoch=0, global_step=0, output_dir=None, sr=None,
              grad_clip=1.0, checkpoint_for_halt=None, grad_log=None):
     training = optimizer is not None
     model.train(training)
     total_loss, n_batches = 0.0, 0
 
-    for batch_idx, (stems_batch, meta) in enumerate(loader):
+    for batch_idx, (stems_batch, _meta) in enumerate(loader):
         with torch.set_grad_enabled(training):
-            output, spectral = forward_batch(model, stems_batch, meta, aec_grid,
-                                             device, linear_aec, feature_cfg)
+            output, spectral = forward_batch(
+                model, stems_batch, aec_grid, device, feature_cfg
+            )
             loss = compressed_spectral_loss(
                 output.enhanced, spectral.target,
                 compression=loss_cfg.getfloat('compression'),
@@ -234,10 +199,14 @@ def main(args):
     print(f"DeepFilterNet-AENR: {sum(p.numel() for p in model.parameters())} params, "
           f"grid={model_grid}")
 
+    train_loader, val_loader, data_contract = build_plain_loaders(
+        cfg, aec_grid, seed=args.seed
+    )
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
         model_kwargs=model_kwargs, loss_version=LOSS_VERSION,
         feature_version=FEATURE_VERSION,
+        data_contract=data_contract,
     )
 
     output_dir = cfg.get('training', 'output_dir', fallback='output')
@@ -264,21 +233,6 @@ def main(args):
         print(f"Resumed from {args.resume} at epoch {start_epoch}"
               f"{' (fresh optimizer)' if args.reset_optimizer else ''}")
 
-    batch_size = cfg.getint('data', 'batch_size')
-    train_loader, train_sampler = make_loader_and_sampler(
-        cfg, 'data', aec_grid, n_lanes=batch_size, seed=args.seed, shuffle=True)
-    val_loader = None
-    if cfg.has_section('val_data'):
-        val_loader, _ = make_loader_and_sampler(
-            cfg, 'val_data', aec_grid, n_lanes=batch_size, seed=args.seed,
-            shuffle=False)
-
-    linear_aec_cfg = cfg['linear_aec'] if cfg.has_section('linear_aec') else {}
-    preset = linear_aec_cfg.get('preset', 'balanced')
-    train_linear_aec = LinearAecEngine(batch_size, aec_grid.sr, preset=preset)
-    val_linear_aec = LinearAecEngine(batch_size, aec_grid.sr, preset=preset) \
-        if val_loader is not None else None
-
     loss_cfg = cfg['loss'] if cfg.has_section('loss') else {
         'compression': '0.3', 'magnitude_weight': '1.0', 'complex_weight': '1.0'}
     max_epochs = cfg.getint('training', 'max_epochs', fallback=100)
@@ -288,15 +242,14 @@ def main(args):
 
     no_improve = 0
     for epoch in range(start_epoch, max_epochs):
-        train_sampler.set_epoch(epoch)   # reshuffles which sequence sits in which lane
         checkpoint_for_halt = {
             'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
             'epoch': epoch - 1, 'global_step': global_step, 'contract': contract,
         }
         started = time.time()
         train_loss, global_step = run_epoch(
-            model, train_loader, aec_grid, device, loss_cfg, train_linear_aec,
-            feature_cfg, optimizer, epoch=epoch, global_step=global_step,
+            model, train_loader, aec_grid, device, loss_cfg, feature_cfg,
+            optimizer, epoch=epoch, global_step=global_step,
             output_dir=output_dir, sr=aec_grid.sr, grad_clip=grad_clip,
             checkpoint_for_halt=checkpoint_for_halt, grad_log=grad_log,
         )
@@ -304,8 +257,9 @@ def main(args):
 
         val_loss = train_loss
         if val_loader is not None:
-            val_loss, _ = run_epoch(model, val_loader, aec_grid, device, loss_cfg,
-                                    val_linear_aec, feature_cfg)
+            val_loss, _ = run_epoch(
+                model, val_loader, aec_grid, device, loss_cfg, feature_cfg
+            )
             msg += f" val_loss={val_loss:.4f}"
         print(msg)
 

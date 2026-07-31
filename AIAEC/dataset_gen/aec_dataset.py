@@ -1,16 +1,17 @@
-"""AEC scenario simulator: renders parent sequences of 5 aligned stems.
+"""AEC scenario simulator: renders parent sequences of 6 aligned stems.
 
 THE SIGNAL MODEL THIS FILE EXISTS TO PRODUCE
 --------------------------------------------
     Y = S + N + D        microphone   (S near speech, N local noise, D echo)
     X                    far-end reference
-    D_hat                optional frozen-linear echo estimate
-    E     = Y - D_hat    linear error                       <-- RES+NR input
+    D_hat                frozen-linear echo estimate
+    E     = Y - D_hat    materialized linear error          <-- RES+NR input
     R     = D - D_hat    residual echo -- audit only, not target
 
-The five PERSISTED stems stay separated so direct AEC, end-to-end AEC+NR, and
-frozen-linear RES+NR routes can share one source corpus without changing task
-targets. ``model_views.py`` owns the authoritative per-model mapping.
+The five acoustic stems stay separated and the sixth persisted channel is the
+real Python-PBFDKF linear error. The filter runs once over the complete parent
+sequence before it is split into chunks, so its adaptation state remains
+continuous while every trainer can still randomize chunks freely.
 
 Everything a model may need is derivable from the persisted stems:
     Y = mic_postclip     X = far_render
@@ -19,9 +20,7 @@ Everything a model may need is derivable from the persisted stems:
 
 ``D`` (echo) and the pre-clip/AGC ``mic_preclip`` are NOT persisted -- no
 model task reads either one, and no candidate is meant to see an oracle
-residual (a linear AEC estimate is always computed live from
-far_render/mic_postclip, never read off a stored "true" echo). Dropping them
-from every stored chunk cuts the corpus's disk footprint by 2/7. Both are
+residual. Both are
 still COMPUTED on every render and returned as ``RenderedSequence.audit``, so
 the corpus's central invariants (``mic_preclip == S+N+D``, "echo really is a
 delayed copy of X") stay checked at generation time -- see
@@ -65,8 +64,13 @@ from AINR.dataset_gen.dataset import (
     sample_snr,
     simulate_upsampled_source,
 )
-from .aec_features import STEM_ORDER, alpha_from_tau
-from .manifest import SourcePools
+from .aec_features import BASE_STEM_ORDER, STEM_ORDER, alpha_from_tau
+from .linear_aec import (
+    LinearAecContract,
+    linear_aec_contract_from_config,
+    materialize_linear_error,
+)
+from .manifest import SourcePools, config_hash
 
 
 __all__ = [
@@ -463,9 +467,10 @@ class SequencePlan:
 
 @dataclasses.dataclass
 class RenderedSequence:
-    stems: torch.Tensor              # (5, T) float32, channel order = STEM_ORDER; PERSISTED
+    stems: torch.Tensor              # (6, T) float32, channel order = STEM_ORDER; PERSISTED
     chunk_meta: List[dict]
     chunk_samples: int
+    linear_aec_contract: Dict = dataclasses.field(default_factory=dict)
     audit: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
     # 'echo' and 'mic_preclip' -- computed on every render (see this module's
     # docstring), NEVER written to WAV/shard. gen_aec_dataset.py's WAV writer
@@ -553,6 +558,22 @@ class AecSequenceRenderer:
         if self.chunk_samples <= 0:
             raise ValueError("[sequence] chunk_sec is too small for this sample rate")
 
+        # Stamped into every chunk's metadata so --resume can tell "this
+        # sequence was rendered under the config this run is using" apart
+        # from "it merely has the right chunk count" -- see
+        # _sequence_is_complete in gen_aec_dataset.py.
+        self.config_hash = config_hash(cfg)
+
+        self.linear_aec_contract: LinearAecContract = (
+            linear_aec_contract_from_config(cfg)
+        )
+        if self.chunk_samples % self.linear_aec_contract.hop_size:
+            raise ValueError(
+                f"training chunk geometry must be divisible by the "
+                f"linear AEC hop: chunk_samples={self.chunk_samples}, "
+                f"hop={self.linear_aec_contract.hop_size}"
+            )
+
         self.snr_values = parse_snr_values(cfg.get('levels', 'snr_values'))
         self.devices = {
             device_id: device_for_id(device_id, cfg, self.corpus_seed, self.sr)
@@ -561,6 +582,11 @@ class AecSequenceRenderer:
         # Per-device mic cascades, built once: identical for every sequence that
         # uses the device, which is the entire point of a device identity.
         self._mic_chains: Dict[str, list] = {}
+        # Rooms eligible for 'echo_path_change' (>= 2 RIR files), fixed by the
+        # manifest's RIR pool and never affected by which sequence is
+        # rendering -- computed once here rather than re-filtered on every
+        # 'echo_path_change' sequence.
+        self._path_change_rooms = rooms_eligible_for_path_change(pools)
 
     # ---------------- source loading ----------------
 
@@ -599,14 +625,18 @@ class AecSequenceRenderer:
         return self._load_rir_pair(path)[1]
 
     def _render_talker(self, runs: Sequence[Tuple[int, int]], n_samples: int,
-                       rng: random.Random) -> Tuple[torch.Tensor, List[str]]:
-        """Place whole utterances inside the active runs.
+                       rng: random.Random, pool: Sequence[str]
+                       ) -> Tuple[torch.Tensor, List[str]]:
+        """Place whole utterances inside the active runs, drawn from ``pool``.
 
         Gating a continuous stream with a mask would cut words in half and leave
         a step discontinuity at every boundary; the model would then learn to
         treat that click as the cue for talk onset.
+
+        ``pool`` is which speech corpus to draw from -- ``self.pools.far_speech_files``
+        for the far-end talker, ``self.pools.speech_files`` for the near-end one.
+        They are the same list unless ``[paths] far_speech_dir`` is configured.
         """
-        pool = self.pools.speech_files
         out = torch.zeros(n_samples)
         used: List[str] = []
         fade = max(1, int(self.sr * self.cfg.getfloat('activity', 'talk_fade_sec')))
@@ -624,6 +654,15 @@ class AecSequenceRenderer:
             segment[-fade:] *= ramp.flip(0)
             out[start:end] = segment
             used.append(path)
+        if runs and not used:
+            # Every planned run failed to load (or was too short to use) --
+            # the chunk would otherwise render as silent while still carrying
+            # its planned scenario/level labels, an unlabelled-but-empty clip
+            # a consumer has no way to detect from the metadata alone.
+            raise RuntimeError(
+                f"{len(runs)} talker run(s) were planned but none produced "
+                f"usable audio; refusing to emit a silently-empty chunk"
+            )
         return out, used
 
     def _mic_chain(self, device: DeviceModel):
@@ -649,7 +688,16 @@ class AecSequenceRenderer:
             except Exception:
                 continue
             ids.append(self.pools.noise_of.get(path, os.path.basename(path)))
-        return noise, ids or ['none']
+        if not ids:
+            # count >= 1 always: noise is never optional the way far/near
+            # speech is. Every attempt failing would otherwise emit a chunk
+            # whose SNR was drawn against silence while still labelled with a
+            # real noise_id.
+            raise RuntimeError(
+                f"{count} noise file(s) were planned but every audio file "
+                f"load failed; refusing to emit a silently-empty chunk"
+            )
+        return noise, ids
 
     def _switch_point(self, n_chunks: int, rng: random.Random) -> int:
         # Away from the very edges, so the chunk labelled 'echo_path_change'
@@ -688,11 +736,29 @@ class AecSequenceRenderer:
             if distorting:
                 device = distorting[rng.randrange(len(distorting))]
 
-        room = self.pools.rooms[rng.randrange(len(self.pools.rooms))]
+        room_pool = self.pools.rooms
+        if scenario == 'echo_path_change':
+            # The post-change RIR (_pick_path_change_rir below) must stay in
+            # this same room -- see the invariant note just below -- so this
+            # scenario may only draw a room that actually has a second RIR
+            # file to switch to. gen_aec_dataset.py already validates this
+            # eligibility once, up front, before any sequence is rendered;
+            # this is the belt for direct AecSequenceRenderer callers (tests,
+            # rematerialize_linear_aec.py) that skip that preflight check.
+            room_pool = self._path_change_rooms
+            if not room_pool:
+                raise RuntimeError(
+                    "scenario 'echo_path_change' requires a room with >= 2 "
+                    f"RIR files; none of the {len(self.pools.rooms)} "
+                    "available room(s) qualify"
+                )
+        room = room_pool[rng.randrange(len(room_pool))]
         room_rirs = self.pools.rirs_by_room[room]
-        # ⚠ The loudspeaker and the near talker are in the SAME room.  RIRs from
-        # different rooms would hand the model an acoustic "this is echo" cue
-        # that no real device ever has.
+        # ⚠ The loudspeaker and the near talker are ALWAYS in the SAME room --
+        # RIRs from different rooms would hand the model an acoustic "this is
+        # echo" cue that no real device ever has. This holds for
+        # echo_path_change too: the room-eligibility filter above guarantees
+        # _pick_path_change_rir's post-change RIR never has to leave it.
         echo_rir_path = room_rirs[rng.randrange(len(room_rirs))]
         near_pool = [p for p in room_rirs if p != echo_rir_path] or room_rirs
         near_rir_path = near_pool[rng.randrange(len(near_pool))]
@@ -716,10 +782,12 @@ class AecSequenceRenderer:
         if scenario == 'double_talk' and far_runs:
             near_runs = _force_overlap(far_runs, near_runs, rng, sr, cfg)
 
-        far_speech, far_paths = (self._render_talker(far_runs, n_samples, rng)
-                                 if has_far else (torch.zeros(n_samples), []))
-        near_dry, near_paths = (self._render_talker(near_runs, n_samples, rng)
-                                if has_near else (torch.zeros(n_samples), []))
+        far_speech, far_paths = (
+            self._render_talker(far_runs, n_samples, rng, self.pools.far_speech_files)
+            if has_far else (torch.zeros(n_samples), []))
+        near_dry, near_paths = (
+            self._render_talker(near_runs, n_samples, rng, self.pools.speech_files)
+            if has_near else (torch.zeros(n_samples), []))
 
         # --- far-end reference X -------------------------------------------
         far_render = _scale_to_active_dbfs(
@@ -794,8 +862,7 @@ class AecSequenceRenderer:
         # --- echo path -----------------------------------------------------
         switch_chunk = -1
         if scenario == 'echo_path_change':
-            second_path = _pick_path_change_rir(room_rirs, echo_rir_path,
-                                                self.pools, rng)
+            second_path = _pick_path_change_rir(room_rirs, echo_rir_path, rng)
             switch = self._switch_point(n_chunks, rng)
             echo_raw = _crossfade(
                 fftconvolve(played, self._load_rir(echo_rir_path)),
@@ -881,7 +948,7 @@ class AecSequenceRenderer:
 
         mic_preclip = near_speech + noise + echo
 
-        # ⚠ ONE common scale across ALL SEVEN stems. Scaling only the mic would
+        # ⚠ ONE common scale across all acoustic stems. Scaling only the mic would
         # break mic_preclip == S + N + D; scaling everything except the
         # reference would silently change the ERL the metadata claims.
         (far_render, echo, near_speech, near_target,
@@ -916,11 +983,21 @@ class AecSequenceRenderer:
         # touched here, so the pre-clip sum identity survives untouched.
         mic_postclip = mic_postclip.clamp(-0.999, 0.999)
 
-        # far_render, echo, near_speech, near_target, noise and mic_preclip are
-        # already the SAME common scale (prevent_clipping above), so the audit
-        # copies below are exact, not an approximation of what got persisted.
-        stems = torch.stack([far_render, near_speech, near_target, noise,
-                             mic_postclip]).to(torch.float32).contiguous()
+        # Materialize the frozen linear error over the COMPLETE sequence before
+        # chunking. A fresh processor here means cold start at sequence start;
+        # the one call preserves PBFDKF adaptation across every future chunk.
+        linear_error, echo_estimate = materialize_linear_error(
+            mic_postclip.to(torch.float32).contiguous(),
+            far_render.to(torch.float32).contiguous(),
+            self.linear_aec_contract,
+        )
+
+        base_stems = torch.stack([
+            far_render, near_speech, near_target, noise, mic_postclip,
+        ]).to(torch.float32).contiguous()
+        if base_stems.shape[0] != len(BASE_STEM_ORDER):
+            raise AssertionError("acoustic stem stack does not match BASE_STEM_ORDER")
+        stems = torch.cat([base_stems, linear_error.unsqueeze(0)], dim=0).contiguous()
         if stems.shape[0] != len(STEM_ORDER):
             raise AssertionError("stem stack does not match STEM_ORDER")
 
@@ -929,12 +1006,14 @@ class AecSequenceRenderer:
             bulk_delay, delay_jitter, sro_ppm, clipped, agc, dropout_chunks,
             switch_chunk, noise_ids,
             near_speaker=self.pools.speaker_of.get(near_paths[0], '') if near_paths else '',
-            far_speaker=self.pools.speaker_of.get(far_paths[0], '') if far_paths else '',
+            far_speaker=self.pools.far_speaker_of.get(far_paths[0], '') if far_paths else '',
         )
         return RenderedSequence(
             stems=stems, chunk_meta=chunk_meta, chunk_samples=self.chunk_samples,
+            linear_aec_contract=self.linear_aec_contract.as_dict(),
             audit={'echo': echo.to(torch.float32).contiguous(),
-                  'mic_preclip': mic_preclip.to(torch.float32).contiguous()},
+                  'mic_preclip': mic_preclip.to(torch.float32).contiguous(),
+                  'echo_estimate': echo_estimate.contiguous()},
         )
 
     def _build_meta(self, plan, stems, device, room, rir_id, erl_db, ser_db,
@@ -942,7 +1021,7 @@ class AecSequenceRenderer:
                     dropout_chunks, switch_chunk, noise_ids,
                     near_speaker, far_speaker) -> List[dict]:
         # ⚠ ser_db / snr_db / erl_db are SEQUENCE-level: they describe how the
-        # 20-60 s sequence was set up, measured over its whole duration.  A
+        # parent sequence was set up, measured over its whole duration.  A
         # single 4 s chunk can depart from them by several dB (ERL) or by
         # anything at all (SER/SNR), because a chunk in which the near talker
         # happens to be silent has no signal to define a ratio against.  Do NOT
@@ -976,6 +1055,15 @@ class AecSequenceRenderer:
                 'nonlinear': device.nonlinear,
                 'clipped': bool(clipped),
                 'agc': bool(agc),
+                'linear_aec_contract_hash': self.linear_aec_contract.fingerprint(),
+                'config_hash': self.config_hash,
+                # config_hash alone does not identify a render: --seed lives
+                # outside config.ini, so a --seed change reshuffles which
+                # scenario/seed plan_sequences() hands each sequence_id
+                # without touching config_hash at all. gen_aec_dataset.py's
+                # _sequence_is_complete compares these against the CURRENT
+                # plan for this sequence_id to catch that case on --resume.
+                'sequence_seed': int(plan.seed),
                 'scenario': _chunk_scenario(
                     plan.scenario, chunk_index, dropout_chunks, switch_chunk,
                     far_active=float(far[window].pow(2).mean().sqrt()) > threshold,
@@ -1086,19 +1174,31 @@ def _crossfade(a: torch.Tensor, b: torch.Tensor, at: int, fade: int) -> torch.Te
     return a * weight + b * (1.0 - weight)
 
 
-def _pick_path_change_rir(room_rirs, current, pools, rng):
-    """The post-change RIR: same room if it has another, otherwise any room.
+def rooms_eligible_for_path_change(pools: SourcePools) -> List[str]:
+    """Rooms with >= 2 RIR files -- the only ones 'echo_path_change' may draw.
 
-    A same-room switch is a moved loudspeaker or an opened door; a cross-room
-    switch is what a device sees when it is picked up and carried.  Both are
-    real, so the fallback is not a compromise.
+    A pure function of the manifest's RIR pool, so it is safe to call once
+    per renderer (``AecSequenceRenderer.__init__``) and once more, before any
+    rendering starts, as a preflight check in ``gen_aec_dataset.py`` -- a
+    corpus too RIR-sparse to support the scenario then fails in under a
+    second instead of partway through a multi-hour run, whenever a worker
+    happens to draw the first 'echo_path_change' sequence.
+    """
+    return [r for r in pools.rooms if len(pools.rirs_by_room[r]) >= 2]
+
+
+def _pick_path_change_rir(room_rirs, current, rng):
+    """The post-change RIR: a different file in the SAME room.
+
+    A same-room switch (moved loudspeaker, opened door) is the only kind
+    modelled -- a cross-room switch would leave the near talker's RIR behind
+    in the old room, which is exactly the acoustic "this is echo" leak the
+    same-room invariant exists to prevent. The caller only reaches this
+    scenario with a room that has >= 2 RIR files, so ``others`` is guaranteed
+    non-empty; there is no fallback to fall back to.
     """
     others = [p for p in room_rirs if p != current]
-    if others:
-        return others[rng.randrange(len(others))]
-    every = sorted(p for paths in pools.rirs_by_room.values()
-                   for p in paths if p != current)
-    return every[rng.randrange(len(every))] if every else current
+    return others[rng.randrange(len(others))]
 
 
 def _scale_to_active_dbfs(x: torch.Tensor, sr: int, dbfs: float) -> torch.Tensor:

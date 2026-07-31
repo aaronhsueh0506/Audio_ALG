@@ -190,6 +190,9 @@ void rnnoise_synthesis(RNNoiseState *st,
                        const float *bin_gains,
                        float *out_samples);
 
+/* Compile-time dispatch selected by SIMD=1/0 in the Makefile. */
+const char *rnnoise_simd_backend(void);
+
 #ifdef __cplusplus
 }
 #endif

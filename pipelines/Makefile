@@ -149,6 +149,7 @@ NR_DIR  = ../lib/nr/c_impl
 # lib/nr sub-makes so all three always agree on the exact same audio_common
 # checkout.
 AC_DIR ?= ../../audio_common
+THIRD_PARTY_DIR ?= ../third_party
 BACKEND ?= kiss
 
 CC  ?= gcc
@@ -319,6 +320,19 @@ ATTEST_STAMP ?=
 # for correctness.
 EXTRA_CFLAGS ?=
 
+SIMD ?= 1
+ifneq ($(words $(SIMD)),1)
+$(error SIMD must be exactly 0 or 1, got '$(SIMD)')
+endif
+ifneq ($(filter-out 0 1,$(SIMD)),)
+$(error SIMD must be exactly 0 or 1, got '$(SIMD)')
+endif
+ifeq ($(SIMD),0)
+SIMD_CFLAGS := -DSIMD_KERNELS_FORCE_SCALAR
+else
+SIMD_CFLAGS :=
+endif
+
 # Deliberate BYTE-CHANGE when -ffp-contract=off first landed here (clang had
 # been contracting a handful of mul+add pairs in the pipeline glue, e.g. the
 # |E|^2 hoist) — the pipeline render baselines were regenerated at that
@@ -333,13 +347,17 @@ EXTRA_CFLAGS ?=
 CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
          -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
          -I$(NR_DIR)/include \
-         -I$(AC_DIR)/include
+         -I$(AC_DIR)/include -I$(AC_DIR)/lib/kiss_fft \
+         -I$(THIRD_PARTY_DIR)/utility \
+         -I$(THIRD_PARTY_DIR)/doa \
+         -I$(THIRD_PARTY_DIR)/GSC
 # AUDIO_PIPELINE_BACKEND_STR: compile-time FFT backend identity baked into
 # audio_pipeline.c's AudioPipelineMemReq.backend field (F20) -- matches
 # whichever libaudio_common.a variant this build links (BACKEND= above), so
 # the descriptor never has to be told separately which backend produced it.
 CFLAGS += -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\"
 CFLAGS += $(EXTRA_CFLAGS)
+CFLAGS += $(SIMD_CFLAGS)
 
 # -Werror opt-in for this Makefile's OWN TUs (default off; CI can flip it
 # on with `make WERROR=1`). Vendor code (audio_common's NE10/KISS) is built by
@@ -841,11 +859,11 @@ endif
 # build invoked without AC_LIB would land in a DIFFERENT (AC_PRODUCER_SIG-less)
 # keyed directory than the one this Makefile's query call resolved, and the
 # "does $(AEC_LIB) exist" assertion in that FORCE rule would fail.
-FWD = BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
+FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 
 ifeq ($(AC_LIB),)
-.PHONY: all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static 4aec_nr_res_static test_audio_pipeline test_4aec_nr_res example-adapter libaudio_pipeline.a lib4aec_nr_res.a
-all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static 4aec_nr_res_static test_audio_pipeline test_4aec_nr_res example-adapter libaudio_pipeline.a lib4aec_nr_res.a:
+.PHONY: all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static 4aec_nr_res_static 4aec_doa_gsc_raw test_audio_pipeline test_4aec_nr_res test_spatial_third_party test_4aec_doa_gsc example-adapter libaudio_pipeline.a lib4aec_nr_res.a
+all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static 4aec_nr_res_static 4aec_doa_gsc_raw test_audio_pipeline test_4aec_nr_res test_spatial_third_party test_4aec_doa_gsc example-adapter libaudio_pipeline.a lib4aec_nr_res.a:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: could not resolve audio_common archive path (AC_DIR=$(AC_DIR) -- is audio_common present as a sibling of Audio_ALG?)" >&2; exit 1; }; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
@@ -892,7 +910,7 @@ endif
 # guard-skip knob must not alias a guarded build), SRCS (P1-4: this
 # Makefile's own compiled sources -- the archive's one member TU plus the
 # CLI/test TUs -- so a source-set change keys to a fresh directory).
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort audio_pipeline.c aec_4ch/4aec_nr_res.c aec_4ch/4aec_nr_res_static.c aec_nr_pipeline.c aec_nr_pipeline_static.c test_audio_pipeline.c aec_4ch/test_4aec_nr_res.c example_board_adapter.c)
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort audio_pipeline.c aec_4ch/4aec_nr_res.c aec_4ch/4aec_doa_gsc.c aec_4ch/4aec_nr_res_static.c aec_4ch/4aec_doa_gsc_raw.c aec_nr_pipeline.c aec_nr_pipeline_static.c test_audio_pipeline.c aec_4ch/test_4aec_nr_res.c aec_4ch/test_spatial_third_party.c aec_4ch/test_4aec_doa_gsc.c $(THIRD_PARTY_DIR)/utility/complex.c $(THIRD_PARTY_DIR)/utility/spatial_simd.c $(THIRD_PARTY_DIR)/doa/doa_smoother.c $(THIRD_PARTY_DIR)/doa/steering.c $(THIRD_PARTY_DIR)/doa/srp.c $(THIRD_PARTY_DIR)/GSC/gsc.c example_board_adapter.c)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT (round-6 review P1): where THIS repo's own keyed
@@ -971,6 +989,27 @@ $(OBJ_DIR)/audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h |
 $(OBJ_DIR)/4aec_nr_res.o: aec_4ch/4aec_nr_res.c aec_4ch/4aec_nr_res.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
+$(OBJ_DIR)/4aec_doa_gsc.o: aec_4ch/4aec_doa_gsc.c aec_4ch/4aec_doa_gsc.h aec_4ch/4aec_nr_res.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/third_party_complex.o: $(THIRD_PARTY_DIR)/utility/complex.c $(THIRD_PARTY_DIR)/utility/complex.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/spatial_simd.o: $(THIRD_PARTY_DIR)/utility/spatial_simd.c $(THIRD_PARTY_DIR)/utility/spatial_simd.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/doa_smoother.o: $(THIRD_PARTY_DIR)/doa/doa_smoother.c $(THIRD_PARTY_DIR)/doa/doa_smoother.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/steering.o: $(THIRD_PARTY_DIR)/doa/steering.c $(THIRD_PARTY_DIR)/doa/steering.h $(THIRD_PARTY_DIR)/doa/srp.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/srp.o: $(THIRD_PARTY_DIR)/doa/srp.c $(THIRD_PARTY_DIR)/doa/srp.h $(THIRD_PARTY_DIR)/utility/complex.h $(THIRD_PARTY_DIR)/utility/spatial_simd.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/gsc.o: $(THIRD_PARTY_DIR)/GSC/gsc.c $(THIRD_PARTY_DIR)/GSC/gsc.h $(THIRD_PARTY_DIR)/utility/complex.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
 # test_audio_pipeline: standalone acceptance test for audio_pipeline.h itself
 # (create-vs-init byte equality incl. a dirty/poisoned pool, destroy
 # idempotence, misaligned/undersized pool rejection, sample-rate whitelist
@@ -981,7 +1020,16 @@ $(OBJ_DIR)/test_audio_pipeline.o: test_audio_pipeline.c audio_pipeline.h | _cfg_
 $(OBJ_DIR)/test_4aec_nr_res.o: aec_4ch/test_4aec_nr_res.c aec_4ch/4aec_nr_res.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
+$(OBJ_DIR)/test_spatial_third_party.o: aec_4ch/test_spatial_third_party.c | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/test_4aec_doa_gsc.o: aec_4ch/test_4aec_doa_gsc.c aec_4ch/4aec_doa_gsc.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
 $(OBJ_DIR)/4aec_nr_res_static.o: aec_4ch/4aec_nr_res_static.c aec_4ch/4aec_nr_res.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/4aec_doa_gsc_raw.o: aec_4ch/4aec_doa_gsc_raw.c aec_4ch/4aec_doa_gsc.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # example_board_adapter: REFERENCE ONLY host simulation of a board-side
@@ -1017,7 +1065,17 @@ $(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o | _cfg_guard
 .PHONY: lib4aec_nr_res.a
 lib4aec_nr_res.a: $(FOUR_LIB_TARGET)
 
-$(FOUR_LIB_TARGET): $(OBJ_DIR)/4aec_nr_res.o | _cfg_guard
+FOUR_SPATIAL_OBJS = \
+	$(OBJ_DIR)/4aec_nr_res.o \
+	$(OBJ_DIR)/4aec_doa_gsc.o \
+	$(OBJ_DIR)/third_party_complex.o \
+	$(OBJ_DIR)/spatial_simd.o \
+	$(OBJ_DIR)/doa_smoother.o \
+	$(OBJ_DIR)/steering.o \
+	$(OBJ_DIR)/srp.o \
+	$(OBJ_DIR)/gsc.o
+
+$(FOUR_LIB_TARGET): $(FOUR_SPATIAL_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
 	@echo "lib4aec_nr_res.a [$(BACKEND)] -> $@"
 
@@ -1026,8 +1084,8 @@ $(FOUR_LIB_TARGET): $(OBJ_DIR)/4aec_nr_res.o | _cfg_guard
 # NR_LIB, always set together by phase 1's re-invoke) is known.
 # =============================================================================
 ifneq ($(AC_LIB),)
-.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static 4aec_nr_res_static test_audio_pipeline test_4aec_nr_res example-adapter example_board_adapter FORCE
-all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(FOUR_LIB_TARGET) $(BIN_DIR)/4aec_nr_res_static
+.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static 4aec_nr_res_static 4aec_doa_gsc_raw test_audio_pipeline test_4aec_nr_res test_spatial_third_party test_4aec_doa_gsc example-adapter example_board_adapter FORCE
+all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(FOUR_LIB_TARGET) $(BIN_DIR)/4aec_nr_res_static $(BIN_DIR)/4aec_doa_gsc_raw
 
 # test: also builds + runs example_board_adapter (round-3 review B02/R04) --
 # wired into the SAME gate as test_audio_pipeline (not left standalone-only)
@@ -1035,9 +1093,11 @@ all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(FOUR_LIB_TAR
 # its own failure modes (a positive-flow step or negative-demonstration
 # check failing) are exactly the kind of regression this gate exists to
 # catch. `make example-adapter` (below) remains available standalone too.
-test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/test_4aec_nr_res $(BIN_DIR)/4aec_nr_res_static $(BIN_DIR)/example_board_adapter
+test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/test_4aec_nr_res $(BIN_DIR)/test_spatial_third_party $(BIN_DIR)/test_4aec_doa_gsc $(BIN_DIR)/4aec_nr_res_static $(BIN_DIR)/example_board_adapter
 	"$(abspath $(BIN_DIR))/test_audio_pipeline"
 	"$(abspath $(BIN_DIR))/test_4aec_nr_res"
+	"$(abspath $(BIN_DIR))/test_spatial_third_party"
+	"$(abspath $(BIN_DIR))/test_4aec_doa_gsc"
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 16000
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 48000
 	"$(abspath $(BIN_DIR))/example_board_adapter"
@@ -1068,8 +1128,11 @@ libs: $(AC_LIB) $(AEC_LIB) $(NR_LIB)
 aec_nr_pipeline: $(BIN_DIR)/aec_nr_pipeline
 aec_nr_pipeline_static: $(BIN_DIR)/aec_nr_pipeline_static
 4aec_nr_res_static: $(BIN_DIR)/4aec_nr_res_static
+4aec_doa_gsc_raw: $(BIN_DIR)/4aec_doa_gsc_raw
 test_audio_pipeline: $(BIN_DIR)/test_audio_pipeline
 test_4aec_nr_res: $(BIN_DIR)/test_4aec_nr_res
+test_spatial_third_party: $(BIN_DIR)/test_spatial_third_party
+test_4aec_doa_gsc: $(BIN_DIR)/test_4aec_doa_gsc
 
 FORCE:
 
@@ -1084,7 +1147,7 @@ FORCE:
 # what the query call above already resolved.
 $(AC_LIB): FORCE
 	+$(MAKE) -C $(AC_DIR) $(FWD) lib
-	@test -f '$@' || { echo "ERROR: audio_common did not produce $@ (query/build divergence -- only BACKEND/WERROR/CC/CXX/EXTRA_CFLAGS/NO_STDIO overrides are supported)"; exit 1; }
+	@test -f '$@' || { echo "ERROR: audio_common did not produce $@ (query/build divergence -- supported forwarded controls are BACKEND/SIMD/WERROR/CC/CXX/EXTRA_CFLAGS/NO_STDIO/TOOLCHAIN_CHECK)"; exit 1; }
 
 $(AEC_LIB): FORCE
 	+$(MAKE) -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB=$(AC_LIB) lib
@@ -1114,9 +1177,21 @@ $(BIN_DIR)/test_4aec_nr_res: $(OBJ_DIR)/test_4aec_nr_res.o $(FOUR_LIB_TARGET) $(
 	$(LINK) -o $@ $(OBJ_DIR)/test_4aec_nr_res.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
 	@echo "test_4aec_nr_res [$(BACKEND)] -> $@"
 
+$(BIN_DIR)/test_spatial_third_party: $(OBJ_DIR)/test_spatial_third_party.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_spatial_third_party.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+	@echo "test_spatial_third_party [$(BACKEND)] -> $@"
+
+$(BIN_DIR)/test_4aec_doa_gsc: $(OBJ_DIR)/test_4aec_doa_gsc.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_4aec_doa_gsc.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+	@echo "test_4aec_doa_gsc [$(BACKEND)] -> $@"
+
 $(BIN_DIR)/4aec_nr_res_static: $(OBJ_DIR)/4aec_nr_res_static.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4aec_nr_res_static.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
 	@echo "4aec_nr_res_static [$(BACKEND)] -> $@"
+
+$(BIN_DIR)/4aec_doa_gsc_raw: $(OBJ_DIR)/4aec_doa_gsc_raw.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4aec_doa_gsc_raw.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+	@echo "4aec_doa_gsc_raw [$(BACKEND)] -> $@"
 
 $(BIN_DIR)/example_board_adapter: $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
@@ -1214,12 +1289,12 @@ audit-no-stdio-stack:
 	@echo "audit-no-stdio-stack: building the full stack (BACKEND=$(BACKEND), NO_STDIO=1)"
 	@$(MAKE) --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 libaudio_pipeline.a >/dev/null
 	@pl="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-lib-path)"; \
-	 ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 print-lib-path)"; \
-	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
-	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
-	 $(MAKE) --no-print-directory -C $(AC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 lib >/dev/null; \
-	 $(MAKE) --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" lib >/dev/null; \
-	 $(MAKE) --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" lib >/dev/null; \
+	 ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 print-lib-path)"; \
+	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+	 nr="$$($(MAKE) -s --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
+	 $(MAKE) --no-print-directory -C $(AC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 lib >/dev/null; \
+	 $(MAKE) --no-print-directory -C $(AEC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" lib >/dev/null; \
+	 $(MAKE) --no-print-directory -C $(NR_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=1 AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" lib >/dev/null; \
 	 s1='^_?(fprintf|vfprintf|printf|puts|fputs)$$'; \
 	 s2='^_?(fprintf|vfprintf|printf|puts|fputs|stderr|__stderrp|fputc|fwrite)$$'; \
 	 pat="$$s1"; [ "$(BACKEND)" = ne10 ] && pat="$$s2"; \

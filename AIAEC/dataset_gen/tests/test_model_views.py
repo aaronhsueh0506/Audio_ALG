@@ -56,25 +56,11 @@ def test_cagcrn_target_is_clean_reverberant_near_speech():
     assert set(view.inputs) == {"microphone", "far_end"}
 
 
-@pytest.mark.parametrize("name", [
-    "Align_ULCNet", "GTCRN_AENR", "DeepFilterNet_AENR",
-])
-def test_residual_models_refuse_oracle_residual(name):
-    with pytest.raises(ValueError, match="frozen production linear AEC"):
-        build_model_view(_stems(), name, 16000)
-
-
-def test_residual_view_uses_frontend_result():
+def test_residual_view_uses_materialized_sixth_stem():
     stems = _stems()
-
-    def frontend(mic, far, sr):
-        assert sr == 16000
-        estimate = 0.25 * far
-        return mic - estimate, estimate
-
-    view = build_model_view(stems, "Align_ULCNet", 16000, frontend)
-    assert torch.equal(view.inputs["linear_error"],
-                       stems.mic_postclip - 0.25 * stems.far_render)
+    view = build_model_view(stems, "Align_ULCNet", 16000)
+    assert torch.equal(view.inputs["linear_error"], stems.linear_error)
+    assert torch.equal(view.echo_estimate, stems.mic_postclip - stems.linear_error)
     assert torch.equal(view.target, stems.near_speech)
 
 
@@ -98,13 +84,7 @@ def test_dfn_spectral_view_builds_independent_feature_states_and_runs():
     torch.manual_seed(3)
     stems = AecStems(torch.randn(len(STEM_ORDER), 4096), STEM_ORDER)
 
-    def frontend(mic, far, _sr):
-        estimate = 0.2 * far
-        return mic - estimate, estimate
-
-    waveform = build_model_view(
-        stems, "DeepFilterNet_AENR", 16000, frontend,
-    )
+    waveform = build_model_view(stems, "DeepFilterNet_AENR", 16000)
     grid = AecGrid(16000, 512, 512, 256)
     model = DeepFilterNetAENR(
         SignalGrid(16000, 512, 512, 256), enc_ch=8, emb_size=32,
@@ -129,10 +109,7 @@ def test_dfn_spectral_view_builds_independent_feature_states_and_runs():
 
 def test_dfn_spectral_view_rejects_shared_ema_state():
     stems = _stems()
-    view = build_model_view(
-        stems, "DeepFilterNet_AENR", 16000,
-        lambda mic, far, _sr: (mic, torch.zeros_like(far)),
-    )
+    view = build_model_view(stems, "DeepFilterNet_AENR", 16000)
     shared = {"erb": None, "spec": None}
     with pytest.raises(ValueError, match="must not be shared"):
         build_spectral_model_view(

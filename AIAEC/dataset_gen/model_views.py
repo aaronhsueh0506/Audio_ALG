@@ -9,15 +9,12 @@ silently changes the front-end contract.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import torch
 from torch import Tensor
 
 from .aec_features import AecGrid, AecStems, stft
-
-
-LinearAecFrontend = Callable[[Tensor, Tensor, int], Tuple[Tensor, Tensor]]
 
 
 @dataclass(frozen=True)
@@ -50,8 +47,8 @@ MODEL_TASKS = {
 }
 
 
-def build_model_view(stems: AecStems, model_name: str, sample_rate: int,
-                     linear_aec: Optional[LinearAecFrontend] = None) -> ModelView:
+def build_model_view(stems: AecStems, model_name: str,
+                     sample_rate: Optional[int] = None) -> ModelView:
     """Create waveform inputs/target without duplicating task logic in trainers."""
     try:
         task = MODEL_TASKS[model_name]
@@ -79,21 +76,14 @@ def build_model_view(stems: AecStems, model_name: str, sample_rate: int,
             target,
         )
 
-    if linear_aec is None:
-        raise ValueError(
-            f"{model_name} requires the frozen production linear AEC; pass "
-            "linear_aec(microphone, far_end, sample_rate)->(error, echo_estimate). "
-            "An oracle residual is intentionally not available."
-        )
-    linear_error, echo_estimate = linear_aec(
-        stems.mic_postclip, stems.far_render, sample_rate,
-    )
+    linear_error = stems.linear_error
+    echo_estimate = stems.D_hat
     if linear_error.shape != stems.mic_postclip.shape:
         raise ValueError("linear AEC error shape differs from microphone")
     if echo_estimate.shape != stems.mic_postclip.shape:
         raise ValueError("linear AEC echo-estimate shape differs from microphone")
     if not torch.isfinite(linear_error).all() or not torch.isfinite(echo_estimate).all():
-        raise ValueError("linear AEC frontend returned non-finite samples")
+        raise ValueError("materialized linear AEC stems contain non-finite samples")
     return ModelView(
         model_name, task,
         {"linear_error": linear_error, "far_end": stems.far_render},

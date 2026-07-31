@@ -141,9 +141,11 @@ noisy/clean WAV tensor；STFT、log-ERB 與 runtime normalization 會在訓練�
 即時計算。資料增強、指定 sample-rate 的 WAV generation、resample 與
 packing 全部由 `../dataset_gen/` 維護，RNNoise-ERB 不再保存重複版本。
 
-訓練 objective 僅使用 DeepFilterNet 3 的 `MultiResSpecLoss`：FFT sizes
-256/512/1024/2048、γ=0.3，compressed magnitude 與 complex MSE 的 factor
-都是 500。沒有 ERB IRM、speech-activity/VAD 加權或 pure-noise 特別分支。
+訓練 objective 已改回直接 ERB IRM：對 22 個 band gain 與 ideal ratio
+mask 在 `gamma=0.25` 的壓縮域做 MSE。目前 MRSL 的兩個 factor 都是 0；
+沒有假 VAD/activity 加權。低於 `energy_floor` 的 mixture band 無法定義
+ratio，會被 mask 掉而不產生梯度。若要重開 MRSL，必須先依實測 gradient
+norm 重新縮放 IRM；直接恢復 factor 500 會讓 MRSL 壓過 IRM。
 
 ```bash
 # Step 0: 建立 dataset_gen 專用設定並填入 speech/noise/RIR paths

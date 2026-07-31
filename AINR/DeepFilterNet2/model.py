@@ -609,8 +609,10 @@ def deep_filter_apply(spec, coefs, df_bins, df_order, df_lookahead):
     Streaming ring buffer at the shipped ``df_order=5, df_lookahead=1``:
     ``history = df_order - df_lookahead - 1 = 3``, so the window is
     ``[t-3, ..., t+1]`` -- three history frames, the current frame, one future
-    frame, and therefore a one-frame output delay.  Mask lookahead is an
-    independent model delay and must not be folded into this FIR window.
+    frame, and therefore a one-frame delay for THIS FIR primitive.  In DFN2's
+    cascade the future source is already ERB-masked, so mask lookahead is a
+    second serial dependency: shipped 1/1 is two hops at the streaming
+    accelerator boundary.  DFN3 reads raw future spectra and remains max(1,1).
 
     Args:
         spec   : (B, n_bins, T) complex

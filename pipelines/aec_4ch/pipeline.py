@@ -1,7 +1,7 @@
 """Shared-delay, four-linear-filter AEC front end for microphone arrays.
 
-This module deliberately does not implement SRP-PHAT or GSC.  The production
-API is split at that ownership boundary::
+This Python reference deliberately does not implement SRP-PHAT or GSC.  Its
+production API is split at that ownership boundary::
 
     pre = pipeline.process_pre_beamformer(mics, render)
     bf = external_srp_gsc(pre.linear_channels)
@@ -37,6 +37,10 @@ from lib.aec.python.modules.aec3_scale import fft_density_scale
 _SUPPORTED_SAMPLE_RATES = (16000, 48000)
 _N_CHANNELS = 4
 
+
+# ---------------------------------------------------------------------------
+# Shared delay and beamformer handoff types
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class SharedDelayState:
@@ -244,8 +248,21 @@ class FourChannelAecConfig:
         default_frame = 512 if self.sample_rate == 16000 else 1024
         frame = default_frame if self.frame_size is None else int(self.frame_size)
         hop = frame // 2 if self.hop_size is None else int(self.hop_size)
-        if frame <= 0 or frame & (frame - 1):
-            raise ValueError("frame_size/FFT must be a positive power of two")
+        # Mirrors the C core's exact whitelist (4aec_nr_res.c derive_dims_and_configs):
+        # 16 kHz supports frame/FFT in {256, 512}; 48 kHz supports only 1024. A
+        # frame value the C side would reject must be rejected here too, so an
+        # explicit override can't silently diverge between the Python reference
+        # and the C acceptance gate.
+        if self.sample_rate == 16000:
+            if frame not in (256, 512):
+                raise ValueError(
+                    "16 kHz four-channel grid supports frame/FFT in "
+                    f"(256, 512), got {frame}"
+                )
+        elif frame != 1024:
+            raise ValueError(
+                f"48 kHz four-channel grid supports only frame/FFT 1024, got {frame}"
+            )
         if frame != 2 * hop:
             raise ValueError("frame_size must equal 2 * hop_size")
         if not 0 <= self.capture_proxy_channel < _N_CHANNELS:
@@ -261,6 +278,10 @@ class FourChannelFrame:
     context: AecResContext
     delay: SharedDelayState
 
+
+# ---------------------------------------------------------------------------
+# Context projection
+# ---------------------------------------------------------------------------
 
 def _snapshot_context(context: AecResContext) -> AecResContext:
     """Detach a context from mutable per-lane AEC work buffers."""
@@ -506,6 +527,10 @@ class PostBeamResidualSuppressor:
         )
         return replace(context, res_gain=np.asarray(gain, dtype=np.float32).copy())
 
+
+# ---------------------------------------------------------------------------
+# Four-channel pipeline
+# ---------------------------------------------------------------------------
 
 class FourChannelAecPipeline:
     """Pre/post shell around an externally owned SRP-PHAT/GSC stage."""

@@ -1,11 +1,11 @@
 # 4-ch shared-delay AEC + post-beam NR/RES
 
-This is a separate zero-padding-free integration grid, not the conventional
-mono pipeline's 20 ms / 10 ms frame grid and not an AIAEC neural-model
-deployment path. The same boundary is available as a Python reference and as
-a synchronous C library.
+This shares the mono pipeline's zero-padding-free grid convention (frame ==
+FFT, hop == frame/2 -- see the supported-grids table below), not an AIAEC
+neural-model deployment path. The same boundary is available as a Python
+reference and as a synchronous C library.
 
-The production boundary is intentionally narrow:
+The core boundary is intentionally narrow:
 
 ```text
 raw far reference ──> one shared matched-filter/delay estimator
@@ -25,9 +25,9 @@ Hard invariants:
 - All four filters consume the same delay-aligned reference and reset together
   if that shared alignment changes.
 - No NR, RES, neural model, or delay estimator is replicated per microphone.
-- SRP-PHAT/GSC is externally owned and is not implemented here. The production
-  Python constructor leaves `beamformer=None`; the C API likewise requires
-  explicit pre/post calls.
+- The Python reference and the core C API leave SRP-PHAT/GSC at an explicit
+  pre/post ownership seam. The complete C wrapper in `4aec_doa_gsc.*` connects
+  that seam to the implementations under `SE/third_party`.
 - `EqualWeightBeamformer` exists only as a deterministic offline/test adapter;
   it is never selected by default.
 
@@ -49,17 +49,40 @@ The deployable C seam is:
   `Aec` instances, coherent context projection, one `SuppressionGain`, one
   MMSE-LSA instance, and one final iFFT/OLA;
 - [`4aec_nr_res_static.c`](4aec_nr_res_static.c): caller-owned-pool example
-  following the same query → allocate → `init_ex` → process → destroy →
+  following the same query → allocate → `init` → process → destroy →
   release sequence as the mono `aec_nr_pipeline_static.c`;
+- [`4aec_doa_gsc.h`](4aec_doa_gsc.h) and
+  [`4aec_doa_gsc.c`](4aec_doa_gsc.c): complete heap wrapper that inserts
+  third-party SRP-PHAT/DOA smoothing and GSC between `process_pre()` and
+  `process_post()`;
+- [`4aec_doa_gsc_raw.c`](4aec_doa_gsc_raw.c): raw-float host CLI for running
+  the complete wrapper on recorded four-channel fixtures;
 - [`test_4aec_nr_res.c`](test_4aec_nr_res.c): 16/48 kHz grid, lifecycle,
   ordering, token invalidation, invalid-config, pool-boundary, heap/static
-  byte-parity, weight, and finite-output acceptance tests.
+  byte-parity, weight, and finite-output acceptance tests;
+- [`test_4aec_doa_gsc.c`](test_4aec_doa_gsc.c): complete-wrapper lifecycle,
+  topology, reset, and finite-output tests;
+- [`test_spatial_third_party.c`](test_spatial_third_party.c): scalar/SIMD PHAT,
+  cached SRP, and exported-GSC-weight equivalence tests.
 
-The naming maps directly to the mono pool-first API:
+For side-by-side reading, the files and public calls map directly:
+
+| Original mono pipeline | Four-channel counterpart |
+|---|---|
+| `audio_pipeline.h` | `aec_4ch/4aec_nr_res.h` |
+| `audio_pipeline.c` | `aec_4ch/4aec_nr_res.c` |
+| `aec_nr_pipeline_static.c` | `aec_4ch/4aec_nr_res_static.c` |
+| `aec_nr_pipeline.c` host runner | `aec_4ch/4aec_doa_gsc_raw.c` raw host runner |
+| `test_audio_pipeline.c` | `aec_4ch/test_4aec_nr_res.c` |
+
+The spatial layer keeps the same order as `audio_pipeline.c`: instance,
+validation, default config/construction, per-hop processing, reset/teardown,
+then read-only accessors. The core layer retains caller-pool APIs; the complete
+spatial wrapper is a separate heap convenience layer.
 
 | Mono `audio_pipeline_*` | Four-channel `four_aec_nr_res_*` |
 |---|---|
-| `default_config` | `config_defaults` |
+| `default_config` | `default_config` |
 | `get_mem_requirements` | `get_mem_requirements` |
 | `init_ex` / `init` | `init_ex` / `init` |
 | `create` | `create` |
@@ -73,7 +96,7 @@ FourAecNrResConfig cfg;
 FourAecNrResPreFrame pre;
 FourAecNrRes *pipeline;
 
-four_aec_nr_res_config_defaults(&cfg, 16000);
+cfg = four_aec_nr_res_default_config(16000);
 pipeline = four_aec_nr_res_create(&cfg);
 
 /* microphones is interleaved [hop][4], reference is [hop]. */
@@ -95,7 +118,7 @@ FourAecNrResMemReq req;
 FourAecNrRes *pipeline;
 void *pool;
 
-four_aec_nr_res_config_defaults(&cfg, 16000);
+cfg = four_aec_nr_res_default_config(16000);
 four_aec_nr_res_get_mem_requirements(&cfg, &req);
 pool = platform_alloc(req.bytes, req.alignment);
 pipeline = four_aec_nr_res_init_ex(
@@ -120,17 +143,22 @@ Build the archive or run the complete C acceptance gate from
 ```bash
 make lib4aec_nr_res.a
 make 4aec_nr_res_static     # build caller-pool reference executable
-make test_4aec_nr_res      # build only the standalone 4-channel test binary
-make test                 # build and run it plus mono/board-adapter tests
+make 4aec_doa_gsc_raw      # build the complete recording-validation runner
+make test_4aec_nr_res      # build only the core 4-channel test binary
+make test_4aec_doa_gsc     # build only the complete spatial-wrapper test
+make test_spatial_third_party
+make test                  # run 4ch, mono, spatial, and board-adapter tests
 
 # Query the exact pool budget for the supported grids.
+"$(make -s print-bin-dir)/4aec_nr_res_static" --print-mem-size --sample-rate 16000 --fft-size 256
 "$(make -s print-bin-dir)/4aec_nr_res_static" --print-mem-size --sample-rate 16000
 "$(make -s print-bin-dir)/4aec_nr_res_static" --print-mem-size --sample-rate 48000
 ```
 
-The archive contains this repository's wrapper object. A consumer links it
-with `libaec.a`, `libmmse_lsa.a`, `libaudio_common.a`, and `-lm`, as the
-Makefile test target demonstrates.
+The archive contains the core wrapper, the complete spatial wrapper, and its
+third-party SRP/GSC support objects. A consumer also links `libaec.a`,
+`libmmse_lsa.a`, `libaudio_common.a`, and `-lm`, as the Makefile test targets
+demonstrate.
 
 ## Python reference seam
 
@@ -142,7 +170,8 @@ pipeline = FourChannelAecPipeline()      # no beamformer is created
 # 1. Our code: one matcher + four linear AEC lanes.
 pre = pipeline.process_pre_beamformer(microphones_hop, far_hop)
 
-# 2. Other owner's code: SRP-PHAT + GSC. This repository does not implement it.
+# 2. External Python owner: SRP-PHAT + GSC. The complete C wrapper supplies
+#    this stage, but the Python reference intentionally keeps the seam open.
 mono_hop, effective_weights = external_srp_gsc.process(pre.linear_channels)
 
 # 3. Our code again: project AEC context with those exact weights and calculate
@@ -183,34 +212,77 @@ therefore uses bounded R2 for both gain inputs and omits the stationary mask.
 This is structurally correct but **not bit-exact** to a future fully extracted
 AEC3 post-beam RES API; it must be cohort-tuned before production sign-off.
 
-The C wrapper does not expose an async multi-frame queue or a real
-SRP-PHAT/GSC implementation. Its automated tests prove caller-pool and heap
-lifecycle, byte-identical construction paths, topology, supported grids,
-sequencing, and finite DSP output; they do not replace real-array recordings,
-objective speech metrics, or subjective quality sign-off with the external
-beamformer.
+The core C API does not expose an async multi-frame queue. The complete C
+wrapper does execute SRP-PHAT/GSC, but it remains synchronous and heap-backed.
+Automated tests prove caller-pool and heap lifecycle, byte-identical core
+construction paths, topology, supported grids, spatial arithmetic equivalence,
+sequencing, and finite DSP output; they do not replace objective speech
+metrics or subjective quality sign-off on real array recordings.
 
-Default no-padding grids are `512/256 @ 16 kHz` and `1024/512 @ 48 kHz`, where
-the frame length is the FFT length and hop is half the frame.
+DOA and GSC now follow the same selected no-padding grid as AEC/NR/RES:
+
+| sample rate | frame | FFT | hop | bins | selection |
+|---:|---:|---:|---:|---:|---|
+| 16 kHz | 256 | 256 | 128 | 129 | `cfg.core.fft_size = 256` |
+| 16 kHz | 512 | 512 | 256 | 257 | default |
+| 48 kHz | 1024 | 1024 | 512 | 513 | default/only main grid |
+
+Frame and hop are derived from the selected FFT rather than independently
+configured: `frame == FFT`, `hop == frame/2`. SRP receives the matching
+sample rate, FFT and bin count for steering; GSC operates on the exact
+`FFT/2+1` spectra exported by the four linear AEC lanes. The raw runner
+selects the same tuple with `--fft-size 256|512|1024` and rejects cross-rate
+combinations.
+
+`doa_downsample_enable` remains an explicit, disabled-by-default 48 kHz
+compute-saving experiment: only SRP analysis becomes 16 kHz/512/256; GSC and
+the main AEC/NR/RES path remain 48 kHz/1024/512. It is not one of the three
+default production-grid configurations. The streaming resampler state and the
+512-sample DOA analysis window are preserved across 48 kHz main hops; when no
+new low-rate frame is ready, GSC uses the last smoothed DOA. Enable it in C
+with `cfg.doa_downsample_enable = 1`, or in the raw runner with
+`--doa-downsample`. The flag is rejected on a 16 kHz main grid.
 
 Reproduce the two checked-in recording tests from the `Audio_ALG` directory:
 
 ```bash
 ../.venv/bin/python -m pipelines.aec_4ch.evaluate_recordings
+
+# Complete C SRP-PHAT/GSC path:
+make -C pipelines 4aec_doa_gsc_raw
+../.venv/bin/python -m pipelines.aec_4ch.evaluate_external_recordings
+
+# Exercise both checked-in 16 kHz grids:
+../.venv/bin/python -m pipelines.aec_4ch.evaluate_external_recordings \
+  --fft-size 256
+../.venv/bin/python -m pipelines.aec_4ch.evaluate_external_recordings \
+  --fft-size 512
 ```
 
 The command is an acceptance test, not only a report generator. It exits
 nonzero unless both cases remain finite, preserve the `1 matcher / 4 linear /
 1 post-beam RES` resource boundary, acquire a solid nonzero shared delay, and
-finish within half a hop of the independent file-level delay measurement.
+finish within the declared delay tolerance of the independent file-level
+measurement (the C low-latency evaluator uses `max(half hop, 5 ms)`).
 Use `--no-contract-check` only when inspecting a deliberately changed fixture.
-The evaluator leaves the pipeline beamformer unconfigured and explicitly calls
-pre → `EqualWeightBeamformer` → post for every frame. It tests our two sides of
-the seam and does not claim to test the external SRP-PHAT/GSC.
+`evaluate_external_recordings` runs the complete C wrapper—shared matcher,
+four linear AEC lanes, SRP-PHAT, GSC, one NR and one post-beam RES—and verifies
+the reported DOA/GSC grids. The separate Python `evaluate_recordings` command
+uses `EqualWeightBeamformer` only to test the open Python pre/post seam.
+
+The wrapper default is a four-microphone UCA with 35 mm radius only so the API
+has a runnable example. Product integration must set the measured UCA radius,
+ULA spacing, or all four custom `(x, y)` coordinates and confirm channel order.
+The checked-in recordings do not carry array-geometry metadata, so their DOA
+angles and attenuation report are integration smoke evidence, not a beamformer
+quality sign-off.
 
 `woman(ref).wav` and `man.wav` are two stems on one source timeline, while that
 timeline and `unprocessed_4ch.wav` have different recording starts. The
 evaluator estimates the one fixture offset from the near stem and applies it to
 both. It deliberately does **not** align the far stem directly to its echo in
 the mic, because doing so would erase the acoustic/system delay that the one
-live shared matched filter is supposed to estimate.
+live shared matched filter is supposed to estimate. The C evaluator uses the
+same alignment rule, writes raw float hops for `4aec_doa_gsc_raw`, and checks
+the complete `1 matcher / 4 linear AEC / SRP-PHAT / GSC / 1 NR / 1 post-RES`
+resource and delay contract.

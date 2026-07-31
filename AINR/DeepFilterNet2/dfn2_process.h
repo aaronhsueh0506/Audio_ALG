@@ -77,9 +77,12 @@
 /* deep filter 的時間窗是 [t-(ORDER-LOOKAHEAD-1) .. t+LOOKAHEAD]。
  * 在出貨的 5/1 下是 [t-3 .. t+1]:
  *   - 需要 3 個歷史框 + 當前框 + 1 個未來框 = ring buffer 深度 5
- *   - 需要 1 框輸出延遲 (要等 t+1 才能發 t)
+ *   - 單看 DF FIR 需要 1 框輸出延 (要等 masked t+1 才能發 t)
  * ⚠ 上游出貨 2/2 (對稱 [t-2..t+2])。本 port 用 1/1 換延遲: hop 512 @ 48k
- *   一框 10.67 ms，1/1 是 ~10.7 ms 而 2/2 要 ~21.3 ms。刻意不對齊，別「修正」。 */
+ *   一框 10.67 ms。但 DFN2 是 cascade: masked(t+1) 自己還要等
+ *   mask head(t+1)，而 head 的 conv lookahead 又是 1。所以真正的
+ *   streaming head-to-audio 總延遲是 MASK_LOOKAHEAD + DF_LOOKAHEAD = 2 框，
+ *   不是 max(1,1)=1。見 dfn2_compose_stream()。 */
 #define DFN2_DF_HISTORY     (DFN2_DF_ORDER - DFN2_DF_LOOKAHEAD - 1)  /* 3 */
 #define DFN2_DF_RING        DFN2_DF_ORDER                            /* 5 */
 
@@ -128,6 +131,11 @@
  * 狀態 (呼叫端分配，跨 frame 保持)
  * ============================================================ */
 typedef struct {
+    /* Analysis overlap and instance-owned immutable-after-init tables. */
+    float analysis_buf[DFN2_WIN_LEN];
+    float window[DFN2_WIN_LEN];
+    int erb_borders[DFN2_N_ERB];
+
     /* OLA 緩衝 (長度 = WIN_LEN, 只用前 OVL_LEN) */
     float synthesis_buf[DFN2_WIN_LEN];
 
@@ -141,8 +149,18 @@ typedef struct {
      * ⚠ DFN2 是串聯 cascade，不能把原始未遮罩頻譜直接推進此 buffer。 */
     float df_ring_re[DFN2_DF_RING][DFN2_DF_BINS];
     float df_ring_im[DFN2_DF_RING][DFN2_DF_BINS];
+    float coef_ring[DFN2_DF_RING][DFN2_DF_BINS][DFN2_DF_ORDER][2];
+    float alpha_ring[DFN2_DF_RING];
+    float noisy_ring_re[DFN2_DF_RING][DFN2_N_BINS];
+    float noisy_ring_im[DFN2_DF_RING][DFN2_N_BINS];
     int   df_ring_idx;     /* 下一個寫入位置 */
     int   df_ring_count;   /* 已累積框數，用來判斷暖機是否結束 */
+
+    /* Streaming accelerator handoff.  dfn2_compose_stream() numbers each
+     * pushed spectrum monotonically; returned heads are expected to describe
+     * current_frame-MASK_LOOKAHEAD.  Do not mix the aligned and streaming
+     * compose APIs without dfn2_state_init(). */
+    long long stream_frame_index;
 
     /* 高頻段 (bin >= DF_BINS) 也要延遲同樣的框數，否則 band split 會把
      * 不同時刻的兩半拼在一起。⚠ 這是最容易漏的一步。 */
@@ -174,12 +192,11 @@ void dfn2_compute_features(DFN2State *st,
                            const float *spec_re, const float *spec_im,
                            float *feat_erb, float *feat_spec);
 
-/* atten_lim: 把 band gain 往上拉到 lim，限制最大衰減量。
- * lim = 10^(-|atten_lim_db|/20)。⚠ 不是 mask 的 clamp/floor，是仿射混合:
- *   band_gains[b] = lim + band_gains[b] * (1 - lim)
- * 因為 ERB_inv 是 partition of unity (逐 bin 欄和為 1)，這個仿射變換與先展開
- * 再混合是等價的，所以可以在 band 域先做，比較便宜。 */
-void dfn2_apply_atten_lim(float band_gains[DFN2_N_ERB], float atten_lim_db);
+/* DeepFilterNet atten_lim 必須對最終複數頻譜混合：DF 輸出不是 noisy
+ * spectrum 乘上實數 mask，因此不能像 RNNoise 那樣在 band gain 域做。 */
+void dfn2_apply_atten_lim(const float *noisy_re, const float *noisy_im,
+                          float *enh_re, float *enh_im,
+                          float atten_lim_db);
 
 /* 網路輸出 -> 增強頻譜。這是 model.py compose() 的 C 對應。
  *   erb_mask: 長度 N_ERB，sigmoid 後在 [0,1]
@@ -195,6 +212,33 @@ int dfn2_compose(DFN2State *st,
                  const float *erb_mask, const float *coefs, float alpha,
                  float *out_re, float *out_im);
 
+/* 真正的串流/硬體 handoff。每次呼叫推進一框 CURRENT spectrum；
+ * 當 heads_valid=1 時，erb_mask/coefs/alpha 必須是硬體在這一拍
+ * 回傳的 current_frame-MASK_LOOKAHEAD 那框 head。heads_valid=0 只用於
+ * 左邊暖機，此時三個 head pointer 可以是 NULL。
+ *
+ * DFN2 cascade 要先有每個 source frame 自己的 mask，所以有效輸出
+ * 對應 current_frame-MASK_LOOKAHEAD-DF_LOOKAHEAD。出貨 1/1 因此是
+ * 2 hops = 21.33 ms @48 kHz，再加 STFT framing 本身的算法時間。
+ * output_frame_index 可為 NULL；非 NULL 時回報 out 所屬的 frame id。
+ *
+ * 右邊 flush 必須由中間硬體用與訓練相同的 zero padding 產生剩餘
+ * heads，再以零 spectrum 繼續呼叫；C 不會臆測加速器的 flush。
+ * atten_lim_db=0 停用 attenuation limit；非零時會對正確的延遲
+ * noisy target 做 complex mix，呼叫端不需要另存一份 spectrum ring。
+ * 回傳 1 = 有效 out，0 = 還在暖機，-1 = pointer/時序合約錯誤。 */
+int dfn2_compose_stream(DFN2State *st,
+                        const float *current_spec_re,
+                        const float *current_spec_im,
+                        int heads_valid,
+                        const float *erb_mask,
+                        const float *coefs,
+                        float alpha,
+                        float atten_lim_db,
+                        float *out_re,
+                        float *out_im,
+                        long long *output_frame_index);
+
 /* Valin post-filter (上游 deepfilternet3.py:388-394 的形式)。
  * ⚠ 作用在最終複數頻譜，mask 是從 |spec_e|/|spec| 推導出來的實際增益，不是
  *   網路輸出的那個 mask。分子沒有 mask 因子。上游不用 training 閘門。
@@ -208,5 +252,7 @@ void dfn2_post_filter(const float *spec_re, const float *spec_im,
 void dfn2_synthesis(DFN2State *st,
                     const float *spec_re, const float *spec_im,
                     float *out_frame);
+
+const char *dfn2_simd_backend(void);
 
 #endif /* DFN2_PROCESS_H */

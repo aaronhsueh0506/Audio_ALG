@@ -15,6 +15,14 @@
 #include <math.h>
 #include <string.h>
 
+#if defined(__aarch64__) && defined(__ARM_NEON) && \
+    !defined(SIMD_KERNELS_FORCE_SCALAR)
+#include <arm_neon.h>
+#define RNNOISE_HAVE_NEON 1
+#else
+#define RNNOISE_HAVE_NEON 0
+#endif
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -80,7 +88,40 @@ static void fft_radix2(float *re, float *im, int n, int inverse) {
         float wim = sinf(ang);
         for (int i = 0; i < n; i += len) {
             float cur_re = 1.0f, cur_im = 0.0f;
-            for (int k = 0; k < len / 2; k++) {
+            int k = 0;
+#if RNNOISE_HAVE_NEON
+            for (; k + 4 <= len / 2; k += 4) {
+                float tw_re[4], tw_im[4];
+                for (int lane = 0; lane < 4; ++lane) {
+                    float new_re, new_im;
+                    tw_re[lane] = cur_re;
+                    tw_im[lane] = cur_im;
+                    new_re = cur_re * wre - cur_im * wim;
+                    new_im = cur_re * wim + cur_im * wre;
+                    cur_re = new_re;
+                    cur_im = new_im;
+                }
+                {
+                    int u = i + k;
+                    int v = u + len / 2;
+                    float32x4_t ur = vld1q_f32(re + u);
+                    float32x4_t ui = vld1q_f32(im + u);
+                    float32x4_t vr = vld1q_f32(re + v);
+                    float32x4_t vi = vld1q_f32(im + v);
+                    float32x4_t wr = vld1q_f32(tw_re);
+                    float32x4_t wi = vld1q_f32(tw_im);
+                    float32x4_t tre = vsubq_f32(
+                        vmulq_f32(vr, wr), vmulq_f32(vi, wi));
+                    float32x4_t tim = vaddq_f32(
+                        vmulq_f32(vr, wi), vmulq_f32(vi, wr));
+                    vst1q_f32(re + v, vsubq_f32(ur, tre));
+                    vst1q_f32(im + v, vsubq_f32(ui, tim));
+                    vst1q_f32(re + u, vaddq_f32(ur, tre));
+                    vst1q_f32(im + u, vaddq_f32(ui, tim));
+                }
+            }
+#endif
+            for (; k < len / 2; k++) {
                 int u = i + k;
                 int v = i + k + len / 2;
                 float tre = re[v] * cur_re - im[v] * cur_im;
@@ -97,7 +138,15 @@ static void fft_radix2(float *re, float *im, int n, int inverse) {
         }
     }
     if (inverse) {
-        for (int i = 0; i < n; i++) { re[i] /= n; im[i] /= n; }
+        int i = 0;
+#if RNNOISE_HAVE_NEON
+        const float32x4_t vn = vdupq_n_f32((float)n);
+        for (; i + 4 <= n; i += 4) {
+            vst1q_f32(re + i, vdivq_f32(vld1q_f32(re + i), vn));
+            vst1q_f32(im + i, vdivq_f32(vld1q_f32(im + i), vn));
+        }
+#endif
+        for (; i < n; i++) { re[i] /= n; im[i] /= n; }
     }
 }
 
@@ -139,7 +188,15 @@ void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float
     float *buf_im = st->scratch_buf_im;
     memset(buf_im, 0, sizeof(float) * RNNOISE_N_FFT);
 
-    for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
+    int i = 0;
+#if RNNOISE_HAVE_NEON
+    for (; i + 4 <= RNNOISE_WIN_LEN; i += 4) {
+        vst1q_f32(buf_re + i,
+                  vmulq_f32(vld1q_f32(frame + i),
+                            vld1q_f32(rnn_hann_win + i)));
+    }
+#endif
+    for (; i < RNNOISE_WIN_LEN; i++) {
         buf_re[i] = frame[i] * rnn_hann_win[i];
     }
     /* zero-pad (當 WIN_LEN == N_FFT 時此 loop 不執行) */
@@ -151,7 +208,19 @@ void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float
 
     /* 只取正頻率 (0 ~ N/2) 共 N_BINS 個, 並乘 N^-0.5
      * (= torch.stft normalized=True; 特徵的絕對 dB 尺度依賴此縮放) */
-    for (int i = 0; i < RNNOISE_N_BINS; i++) {
+    i = 0;
+#if RNNOISE_HAVE_NEON
+    {
+        const float32x4_t norm = vdupq_n_f32(STFT_NORM_FWD);
+        for (; i + 4 <= RNNOISE_N_BINS; i += 4) {
+            vst1q_f32(out_re + i,
+                      vmulq_f32(vld1q_f32(buf_re + i), norm));
+            vst1q_f32(out_im + i,
+                      vmulq_f32(vld1q_f32(buf_im + i), norm));
+        }
+    }
+#endif
+    for (; i < RNNOISE_N_BINS; i++) {
         out_re[i] = buf_re[i] * STFT_NORM_FWD;
         out_im[i] = buf_im[i] * STFT_NORM_FWD;
     }
@@ -166,7 +235,16 @@ int rnnoise_compute_features(RNNoiseState *st,
     /* power spectrum (normalized 域)
      * (F13: 暫存區搬到 st->scratch_power, 不佔用呼叫端 stack) */
     float *power = st->scratch_power;
-    for (int i = 0; i < RNNOISE_N_BINS; i++) {
+    int i = 0;
+#if RNNOISE_HAVE_NEON
+    for (; i + 4 <= RNNOISE_N_BINS; i += 4) {
+        float32x4_t re = vld1q_f32(spec_re + i);
+        float32x4_t im = vld1q_f32(spec_im + i);
+        vst1q_f32(power + i,
+                  vaddq_f32(vmulq_f32(re, re), vmulq_f32(im, im)));
+    }
+#endif
+    for (; i < RNNOISE_N_BINS; i++) {
         power[i] = spec_re[i] * spec_re[i] + spec_im[i] * spec_im[i];
     }
 
@@ -174,7 +252,25 @@ int rnnoise_compute_features(RNNoiseState *st,
      * energy = power @ erb_fwd; erb_db = 10*log10(energy + 1e-10)
      * (F13: 暫存區搬到 st->scratch_erb_db) */
     float *erb_db = st->scratch_erb_db;
-    for (int b = 0; b < RNNOISE_N_BANDS; b++) {
+    int b = 0;
+#if RNNOISE_HAVE_NEON
+    for (; b + 4 <= RNNOISE_N_BANDS; b += 4) {
+        float32x4_t sum = vdupq_n_f32(0.0f);
+        for (int k = 0; k < RNNOISE_N_BINS; ++k) {
+            sum = vaddq_f32(
+                sum, vmulq_n_f32(vld1q_f32(&rnn_erb_fwd[k][b]), power[k]));
+        }
+        {
+            float values[4];
+            vst1q_f32(values, sum);
+            for (int lane = 0; lane < 4; ++lane) {
+                erb_db[b + lane] =
+                    10.0f * log10f(values[lane] + LOG_FLOOR);
+            }
+        }
+    }
+#endif
+    for (; b < RNNOISE_N_BANDS; b++) {
         float sum = 0.0f;
         for (int k = 0; k < RNNOISE_N_BINS; k++) {
             sum += power[k] * rnn_erb_fwd[k][b];
@@ -186,7 +282,24 @@ int rnnoise_compute_features(RNNoiseState *st,
      * then subtract and scale, matching original DeepFilterNet band_mean_norm_erb. */
     int idx = st->feat_idx;
     const float erb_a = RNNOISE_ERB_NORM_ALPHA;
-    for (int b = 0; b < RNNOISE_N_BANDS; b++) {
+    b = 0;
+#if RNNOISE_HAVE_NEON
+    {
+        const float32x4_t va = vdupq_n_f32(erb_a);
+        const float32x4_t vb = vdupq_n_f32(1.0f - erb_a);
+        const float32x4_t scale = vdupq_n_f32(RNNOISE_ERB_NORM_SCALE_DB);
+        for (; b + 4 <= RNNOISE_N_BANDS; b += 4) {
+            float32x4_t db = vld1q_f32(erb_db + b);
+            float32x4_t mean = vaddq_f32(
+                vmulq_f32(va, vld1q_f32(st->erb_norm_state + b)),
+                vmulq_f32(vb, db));
+            vst1q_f32(st->erb_norm_state + b, mean);
+            vst1q_f32(st->erb_feat_buf[idx] + b,
+                      vdivq_f32(vsubq_f32(db, mean), scale));
+        }
+    }
+#endif
+    for (; b < RNNOISE_N_BANDS; b++) {
         float mean = erb_a * st->erb_norm_state[b] + (1.0f - erb_a) * erb_db[b];
         float feat = (erb_db[b] - mean) / RNNOISE_ERB_NORM_SCALE_DB;
         st->erb_norm_state[b] = mean;
@@ -196,7 +309,26 @@ int rnnoise_compute_features(RNNoiseState *st,
     /* Complex branch: original DeepFilterNet libDF band_unit_norm.  Each bin
      * updates its own magnitude EMA before real/imag are normalised. */
     const float norm_a = RNNOISE_SPEC_NORM_ALPHA;
-    for (int k = 0; k < RNNOISE_SPEC_BINS; k++) {
+    int k = 0;
+#if RNNOISE_HAVE_NEON
+    {
+        const float32x4_t va = vdupq_n_f32(norm_a);
+        const float32x4_t vb = vdupq_n_f32(1.0f - norm_a);
+        const float32x4_t eps = vdupq_n_f32(RNNOISE_SPEC_NORM_EPS);
+        for (; k + 4 <= RNNOISE_SPEC_BINS; k += 4) {
+            float32x4_t state = vaddq_f32(
+                vmulq_f32(va, vld1q_f32(st->spec_norm_state + k)),
+                vmulq_f32(vb, vsqrtq_f32(vld1q_f32(power + k))));
+            float32x4_t denom = vsqrtq_f32(vaddq_f32(state, eps));
+            vst1q_f32(st->spec_norm_state + k, state);
+            vst1q_f32(st->spec_feat_buf[idx][0] + k,
+                      vdivq_f32(vld1q_f32(spec_re + k), denom));
+            vst1q_f32(st->spec_feat_buf[idx][1] + k,
+                      vdivq_f32(vld1q_f32(spec_im + k), denom));
+        }
+    }
+#endif
+    for (; k < RNNOISE_SPEC_BINS; k++) {
         float magnitude = sqrtf(power[k]);
         float state = norm_a * st->spec_norm_state[k] +
             (1.0f - norm_a) * magnitude;
@@ -234,7 +366,19 @@ void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],
                              float atten_lim_db) {
     if (atten_lim_db <= 0.0f) return;
     float lim = powf(10.0f, -atten_lim_db / 20.0f);
-    for (int b = 0; b < RNNOISE_N_BANDS; b++) {
+    int b = 0;
+#if RNNOISE_HAVE_NEON
+    {
+        float32x4_t vlim = vdupq_n_f32(lim);
+        float32x4_t mix = vdupq_n_f32(1.0f - lim);
+        for (; b + 4 <= RNNOISE_N_BANDS; b += 4) {
+            vst1q_f32(band_gains + b,
+                      vaddq_f32(vlim,
+                                vmulq_f32(vld1q_f32(band_gains + b), mix)));
+        }
+    }
+#endif
+    for (; b < RNNOISE_N_BANDS; b++) {
         band_gains[b] = lim + band_gains[b] * (1.0f - lim);
     }
 }
@@ -244,7 +388,21 @@ void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],
 void rnnoise_expand_gains(const float *band_gains, float *bin_gains) {
     /* bin_gains = gains @ erb_inv^T (denoise.py apply gains; mode=1 為
      * partition of unity → gains=1 對應 bin_gains=1, 無需列正規化) */
-    for (int k = 0; k < RNNOISE_N_BINS; k++) {
+    int k = 0;
+#if RNNOISE_HAVE_NEON
+    for (; k + 4 <= RNNOISE_N_BINS; k += 4) {
+        float32x4_t g = vdupq_n_f32(0.0f);
+        for (int b = 0; b < RNNOISE_N_BANDS; ++b) {
+            float32x4_t w = {
+                rnn_erb_inv[k][b], rnn_erb_inv[k + 1][b],
+                rnn_erb_inv[k + 2][b], rnn_erb_inv[k + 3][b]
+            };
+            g = vaddq_f32(g, vmulq_n_f32(w, band_gains[b]));
+        }
+        vst1q_f32(bin_gains + k, g);
+    }
+#endif
+    for (; k < RNNOISE_N_BINS; k++) {
         float g = 0.0f;
         for (int b = 0; b < RNNOISE_N_BANDS; b++) {
             g += band_gains[b] * rnn_erb_inv[k][b];
@@ -260,7 +418,18 @@ void rnnoise_synthesis(RNNoiseState *st,
                        const float *bin_gains,
                        float *out_samples) {
     /* 套用 gain, 並乘 N^+0.5 反正規化 (= torch.istft normalized=True) */
-    for (int i = 0; i < RNNOISE_N_BINS; i++) {
+    int i = 0;
+#if RNNOISE_HAVE_NEON
+    for (; i + 4 <= RNNOISE_N_BINS; i += 4) {
+        float32x4_t gain = vmulq_n_f32(
+            vld1q_f32(bin_gains + i), STFT_NORM_INV);
+        vst1q_f32(spec_re + i,
+                  vmulq_f32(vld1q_f32(spec_re + i), gain));
+        vst1q_f32(spec_im + i,
+                  vmulq_f32(vld1q_f32(spec_im + i), gain));
+    }
+#endif
+    for (; i < RNNOISE_N_BINS; i++) {
         spec_re[i] *= bin_gains[i] * STFT_NORM_INV;
         spec_im[i] *= bin_gains[i] * STFT_NORM_INV;
     }
@@ -282,22 +451,45 @@ void rnnoise_synthesis(RNNoiseState *st,
     /* Root Hann window (synthesis side) — 只取 WIN_LEN 點，丟棄 zero-pad 部分
      * (sqrt-hann × sqrt-hann = hann, 50% overlap COLA 和 = 1 → 免除 torch.istft
      * 的 window-envelope 除法, 穩態等價) */
-    for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
+    i = 0;
+#if RNNOISE_HAVE_NEON
+    for (; i + 4 <= RNNOISE_WIN_LEN; i += 4) {
+        vst1q_f32(full_re + i,
+                  vmulq_f32(vld1q_f32(full_re + i),
+                            vld1q_f32(rnn_hann_win + i)));
+    }
+#endif
+    for (; i < RNNOISE_WIN_LEN; i++) {
         full_re[i] *= rnn_hann_win[i];
     }
     /* full_re[WIN_LEN..N_FFT-1] 為 zero-pad 產生的殘留，不使用 */
 
     /* Overlap-add: 輸出 HOP_LEN 個 sample */
-    for (int i = 0; i < RNNOISE_HOP_LEN; i++) {
+    i = 0;
+#if RNNOISE_HAVE_NEON
+    for (; i + 4 <= RNNOISE_HOP_LEN; i += 4) {
+        vst1q_f32(out_samples + i,
+                  vaddq_f32(vld1q_f32(st->synthesis_buf + i),
+                            vld1q_f32(full_re + i)));
+    }
+#endif
+    for (; i < RNNOISE_HOP_LEN; i++) {
         out_samples[i] = st->synthesis_buf[i] + full_re[i];
     }
 
     /* 更新 synthesis_buf: 存 overlap 部分 (OVL_LEN = WIN_LEN - HOP_LEN) */
-    for (int i = 0; i < RNNOISE_OVL_LEN; i++) {
-        st->synthesis_buf[i] = full_re[i + RNNOISE_HOP_LEN];
-    }
+    memcpy(st->synthesis_buf, full_re + RNNOISE_HOP_LEN,
+           sizeof(float) * RNNOISE_OVL_LEN);
     /* 清除剩餘 */
     for (int i = RNNOISE_OVL_LEN; i < RNNOISE_WIN_LEN; i++) {
         st->synthesis_buf[i] = 0.0f;
     }
+}
+
+const char *rnnoise_simd_backend(void) {
+#if RNNOISE_HAVE_NEON
+    return "aarch64-neon";
+#else
+    return "scalar";
+#endif
 }

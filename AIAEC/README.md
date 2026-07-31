@@ -24,20 +24,19 @@ grid. A model boundary must resample/reframe explicitly; no caller should infer
 compatibility from a shared FFT size alone.
 
 `dataset_gen/` is the one AIAEC dataset implementation and public import/CLI
-path. It renders 3-second chunks inside long stateful scenario sequences and
-stores five lossless stems, including separate full-RIR and
-early-RIR near-speech targets (the echo and pre-clip/AGC mic signal are
-computed at generation time for the corpus's own invariant checks but not
-persisted -- no candidate task reads either one; see
-`dataset_gen/README.md`). `model_views.build_model_view` is the
-single mapping from those stems to each candidate. RES+NR views require the
-actual frozen production linear AEC and deliberately reject an oracle residual.
+path. It renders complete stateful scenarios, runs the frozen Python PBFDKF
+once over each complete sequence, and only then cuts the result into 8-second
+chunks. Every chunk stores six lossless stems:
+`far_render`, `near_speech`, `near_target`, `local_noise`, `mic_postclip`, and
+`linear_error`. The last stem is `E = mic_postclip - D_hat`; it is not the
+oracle residual echo. `model_views.build_model_view` is the single mapping
+from those stems to each candidate.
 
-The common public forwards are clip-level APIs. `SequenceChunkSampler` preserves
-long-sequence ordering, but does not manufacture streaming state: a trainer that
-wants 20–60 s continuity must concatenate adjacent 3-second chunks before the
-forward call, or add model-specific recurrent/convolution-cache state I/O for
-the eventual frame-streaming deployment.
+All trainers use a deterministic random split over chunks. Train batches
+shuffle every epoch and validation batches do not. Chunks from one parent
+sequence, speaker, or RIR are intentionally allowed on both sides of this
+split; use a separately generated source-disjoint or real-recording test set
+when measuring generalisation.
 
 ## DeepFilterNet-AENR note
 
@@ -57,10 +56,16 @@ Every candidate directory owns a `train.py` / `config.ini` / `denoise.py`
 trio, mirroring `AINR/`'s per-project layout -- each file's own top-of-file
 comment documents its exact usage, config sections and CLI. What they do NOT
 each keep a private copy of (seeding, checkpoint contracts, the NaN-halt
-guards, the shared loss, and the frozen linear-AEC frontend the three
-"linear AEC -> RES+NR" candidates need) lives in
-[`training_common.py`](training_common.py) -- see its own top-of-file
+guards, the shared loss, the inference-only frozen linear-AEC frontend, and
+the train/val split itself) lives
+in [`training_common.py`](training_common.py) -- see its own top-of-file
 docstring before adding a seventh copy of any of it into a candidate.
+
+Every candidate's `[data]` points at one packed corpus (`--split all`) and
+holds out `val_fraction` at load time with
+`training_common.split_dataset_by_sample`. The checkpoint stores the dataset
+fingerprint, complete train/validation indices, split seed/fraction, and PBFDKF
+contract; resume refuses a different dataset, split, frontend, or signal grid.
 
 ```bash
 cd AIAEC/Align_CRUSE   # or any of the other five directories
@@ -70,7 +75,7 @@ python3 denoise.py output/align_cruse_best.pth mic.wav far.wav out.wav
 
 ## Navigation and tests
 
-- [`dataset_gen/README.md`](dataset_gen/README.md): five-stem scenario data and
+- [`dataset_gen/README.md`](dataset_gen/README.md): six-stem scenario data and
   per-model views.
 - [`../docs/ai_aec_candidate_matrix.md`](../docs/ai_aec_candidate_matrix.md):
   current selection and deployment rules.

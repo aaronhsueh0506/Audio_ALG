@@ -63,14 +63,15 @@ from dataset_gen import (  # noqa: E402
 # input/output dimensions are unchanged.
 FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v8'
 LOSS_VERSION = 'erb_irm_only_v4'
-# v2 (2026-07-29), three changes that together invalidate v1 checkpoints:
+# The current IRM-only contract evolved from v2; these signal/framing changes
+# still invalidate the older checkpoint families:
 #   * fft_sizes 256,512,1024,2048 -> 128,256,512,1024, i.e. {n_fft/4, n_fft/2,
 #     n_fft, n_fft*2} for THIS model's 512-point FFT.  The old integers were
 #     upstream's, chosen against its own 960-point FFT, and applying them here
 #     shifted every resolution one octave up (16/32/64/128 ms).
-#   * direct ERB IRM term restored alongside MRSL, with the undefined-band mask
-#     and (1 + 5*vad) activity weighting that xiph/rnnoise has and this port
-#     never had.
+#   * direct ERB IRM supervision was restored. MRSL and the provisional
+#     pseudo-VAD weighting are now disabled; see config.ini for the measured
+#     gradient-scale reason and the pure-noise classification bug.
 #   * training STFT moved to center=False so framing matches deployment.
 
 
@@ -158,14 +159,14 @@ def model_capacity_from_checkpoint(ckpt):
 
 
 def require_checkpoint_loss_config(ckpt, loss_cfg, irm_cfg, context='checkpoint'):
-    """Do not resume optimizer state trained with the previous IRM-mixed objective."""
+    """Reject optimizer state trained with a different loss contract."""
     version = ckpt.get('loss_version', ckpt.get('config', {}).get('loss_version'))
     if version != LOSS_VERSION:
         shown = repr(version) if version is not None else 'missing (legacy loss contract)'
         raise ValueError(
             f"{context} loss_version={shown}, expected {LOSS_VERSION!r}. "
-            "The training objective is MRSL + direct ERB-IRM supervision, and "
-            "the MRSL resolutions moved to {n_fft/4..n_fft*2}; "
+            "The shipped training objective is direct ERB-IRM supervision "
+            "(MRSL factors are zero); "
             "start a fresh training run instead of resuming this optimizer state."
         )
     saved = ckpt.get('config', {})

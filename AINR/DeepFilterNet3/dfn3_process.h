@@ -128,6 +128,11 @@
  * 狀態 (呼叫端分配，跨 frame 保持)
  * ============================================================ */
 typedef struct {
+    /* Analysis overlap and instance-owned immutable-after-init tables. */
+    float analysis_buf[DFN3_WIN_LEN];
+    float window[DFN3_WIN_LEN];
+    int erb_borders[DFN3_N_ERB];
+
     /* OLA 緩衝 (長度 = WIN_LEN, 只用前 OVL_LEN) */
     float synthesis_buf[DFN3_WIN_LEN];
 
@@ -142,8 +147,15 @@ typedef struct {
      * 頻譜上，不是作用在已加 mask 的頻譜 (那是 DFN2 串聯做法)。 */
     float df_ring_re[DFN3_DF_RING][DFN3_DF_BINS];
     float df_ring_im[DFN3_DF_RING][DFN3_DF_BINS];
+    float coef_ring[DFN3_DF_RING][DFN3_DF_BINS][DFN3_DF_ORDER][2];
+    float noisy_ring_re[DFN3_DF_RING][DFN3_N_BINS];
+    float noisy_ring_im[DFN3_DF_RING][DFN3_N_BINS];
     int   df_ring_idx;     /* 下一個寫入位置 */
     int   df_ring_count;   /* 已累積框數，用來判斷暖機是否結束 */
+
+    /* Streaming accelerator handoff; see dfn3_compose_stream().  Do not mix
+     * that API with dfn3_compose() without reinitialising the state. */
+    long long stream_frame_index;
 
     /* 高頻段 (bin >= DF_BINS) 也要延遲同樣的框數，否則 band split 會把
      * 不同時刻的兩半拼在一起。⚠ 這是最容易漏的一步。 */
@@ -175,12 +187,10 @@ void dfn3_compute_features(DFN3State *st,
                            const float *spec_re, const float *spec_im,
                            float *feat_erb, float *feat_spec);
 
-/* atten_lim: 把 band gain 往上拉到 lim，限制最大衰減量。
- * lim = 10^(-|atten_lim_db|/20)。⚠ 不是 mask 的 clamp/floor，是仿射混合:
- *   band_gains[b] = lim + band_gains[b] * (1 - lim)
- * 因為 ERB_inv 是 partition of unity (逐 bin 欄和為 1)，這個仿射變換與先展開
- * 再混合是等價的，所以可以在 band 域先做，比較便宜。 */
-void dfn3_apply_atten_lim(float band_gains[DFN3_N_ERB], float atten_lim_db);
+/* DeepFilterNet atten_lim 對最終複數頻譜做 noisy/enhanced 混合。 */
+void dfn3_apply_atten_lim(const float *noisy_re, const float *noisy_im,
+                          float *enh_re, float *enh_im,
+                          float atten_lim_db);
 
 /* 網路輸出 -> 增強頻譜。這是 model.py compose() 的 C 對應。
  *   erb_mask: 長度 N_ERB，sigmoid 後在 [0,1]
@@ -195,6 +205,31 @@ int dfn3_compose(DFN3State *st,
                  const float *erb_mask, const float *coefs,
                  float *out_re, float *out_im);
 
+/* 真正的串流/硬體 handoff。每次呼叫推進 current spectrum；
+ * heads_valid=1 時，erb_mask/coefs 必須對應
+ * current_frame-MASK_LOOKAHEAD。第一個 MASK_LOOKAHEAD 暖機框要傳
+ * heads_valid=0，且 head pointers 可為 NULL。
+ *
+ * DFN3 是平行 band split：DF 未來 tap 讀 raw spectrum，不需要等未來
+ * frame 自己的 mask。因為 DF_LOOKAHEAD <= MASK_LOOKAHEAD，出貨 1/1
+ * 總延遲是 max(1,1)=1 hop = 10.67 ms @48 kHz，不會像 DFN2
+ * cascade 相加成兩框。
+ *
+ * atten_lim_db=0 停用 complex attenuation-limit mix。output_frame_index 可為
+ * NULL；非 NULL 時回報 out frame id。右邊 flush 由中間硬體依訓練
+ * zero padding 產生剩餘 heads，再以零 spectrum 繼續呼叫。
+ * 回傳 1 = 有效 out，0 = 暖機，-1 = pointer/時序合約錯誤。 */
+int dfn3_compose_stream(DFN3State *st,
+                        const float *current_spec_re,
+                        const float *current_spec_im,
+                        int heads_valid,
+                        const float *erb_mask,
+                        const float *coefs,
+                        float atten_lim_db,
+                        float *out_re,
+                        float *out_im,
+                        long long *output_frame_index);
+
 /* Valin post-filter (上游 deepfilternet3.py:388-394 的形式)。
  * ⚠ 作用在最終複數頻譜，mask 是從 |spec_e|/|spec| 推導出來的實際增益，不是
  *   網路輸出的那個 mask。分子沒有 mask 因子。上游不用 training 閘門。
@@ -208,5 +243,7 @@ void dfn3_post_filter(const float *spec_re, const float *spec_im,
 void dfn3_synthesis(DFN3State *st,
                     const float *spec_re, const float *spec_im,
                     float *out_frame);
+
+const char *dfn3_simd_backend(void);
 
 #endif /* DFN3_PROCESS_H */

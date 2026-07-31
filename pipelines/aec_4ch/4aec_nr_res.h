@@ -15,13 +15,14 @@
  * It does not select one microphone's RES gain and does not replicate NR/RES
  * per channel.
  *
- * The lifecycle intentionally mirrors pipelines/audio_pipeline.h:
+ * The file layout, lifecycle, and naming intentionally mirror
+ * pipelines/audio_pipeline.h:
  *
  *   Caller-owned pool (board/static path):
  *
  *     FourAecNrResConfig cfg;
  *     FourAecNrResMemReq req;
- *     four_aec_nr_res_config_defaults(&cfg, 16000);
+ *     cfg = four_aec_nr_res_default_config(16000);
  *     four_aec_nr_res_get_mem_requirements(&cfg, &req);
  *     void* pool = platform_alloc(req.bytes, req.alignment);
  *     FourAecNrRes* p =
@@ -36,8 +37,10 @@
  *     ...
  *     four_aec_nr_res_destroy(p);  // releases create()'s one pool
  *
- * Both construction paths use the same process_pre()/process_post() core and
- * must be byte-identical for the same inputs, weights, config, and backend.
+ * The only API-shape difference from the mono pipeline is that its one
+ * process() call becomes process_pre() -> external beamformer ->
+ * process_post(). Both construction paths use that same core and must be
+ * byte-identical for the same inputs, weights, config, and backend.
  *
  * See pipelines/README.md ("4-ch integration") for the module table and
  * pipelines/aec_4ch/README.md for the full architecture writeup, the
@@ -126,17 +129,6 @@ _Static_assert(
     offsetof(FourAecNrResMemReq, bytes) == 24,
     "bytes offset");
 
-typedef struct FourAecNrResMemBreakdown {
-    size_t aec_bytes;       /* four AEC pools combined */
-    size_t nr_bytes;
-    size_t fft_bytes;
-    size_t wrapper_bytes;   /* control block + shared/post-beam state */
-    size_t total_bytes;
-    int hop_size;
-    int fft_size;
-    int n_freqs;
-} FourAecNrResMemBreakdown;
-
 /* ============================================================================
  * Config, frame handoff and status
  * ========================================================================== */
@@ -150,7 +142,7 @@ typedef enum FourAecNrResStatus {
 
 typedef struct FourAecNrResConfig {
     int sample_rate;              /* 16000 or 48000                         */
-    int fft_size;                 /* 0=rate default; 512 @16k, 1024 @48k   */
+    int fft_size;                 /* 0=default; 256/512 @16k, 1024 @48k   */
     int filter_length;            /* 0=rate default                         */
     int capture_proxy_channel;    /* shared matcher input, [0,3]            */
     float max_delay_ms;           /* shared reference delay-line capacity    */
@@ -172,11 +164,24 @@ typedef struct FourAecNrResDelayState {
 /**
  * Opaque ownership/ordering token returned by process_pre().
  * Callers must copy it without modification and return it to process_post().
+ *
+ * instance_epoch guards a caller-owned-pool ABA case that frame_index/
+ * generation/owner_cookie alone cannot: destroy() never releases caller
+ * memory, so a caller may init_ex() a brand-new instance into the exact same
+ * pool bytes. init_ex() memsets that pool to zero, so the new instance's
+ * frame_index/generation start at 0 again and owner_cookie (the instance
+ * pointer) is identical to the destroyed instance's -- a token captured
+ * before destroy() would otherwise be bit-identical to a token the new
+ * instance mints for its own first frame. instance_epoch is stamped from a
+ * process-wide monotonic counter at construction time (never read back from
+ * the -- possibly reused -- pool bytes themselves), so it differs across any
+ * two constructions even when every other field coincides.
  */
 typedef struct FourAecNrResFrameToken {
     uint64_t frame_index;
     uint64_t generation;
     uintptr_t owner_cookie;
+    uint64_t instance_epoch;
 } FourAecNrResFrameToken;
 
 typedef struct FourAecNrResPreFrame {
@@ -184,6 +189,7 @@ typedef struct FourAecNrResPreFrame {
     FourAecNrResDelayState delay;
     int hop_size;
     int n_channels;               /* always FOUR_AEC_NR_RES_CHANNELS        */
+    int n_freqs;
 
     /**
      * Read-only interleaved linear-AEC output [hop_size][4]:
@@ -193,6 +199,16 @@ typedef struct FourAecNrResPreFrame {
      * may be in flight.
      */
     const float* linear_interleaved;
+
+    /**
+     * Read-only channel pointers to the exact linear-AEC error spectra used
+     * later by process_post(). Shape: linear_spectra[channel][n_freqs].
+     *
+     * This lets an external SRP-PHAT/GSC consume the existing analysis
+     * transform instead of performing a duplicate STFT. Lifetime and
+     * single-frame ownership are identical to linear_interleaved.
+     */
+    const Complex* linear_spectra[FOUR_AEC_NR_RES_CHANNELS];
 } FourAecNrResPreFrame;
 
 typedef struct FourAecNrRes FourAecNrRes;
@@ -201,7 +217,17 @@ typedef struct FourAecNrRes FourAecNrRes;
  * Config and lifecycle
  * ========================================================================== */
 
-/** Fill a validated default: 16 kHz, 512/256, balanced AEC/NR, CNG on. */
+/**
+ * Return the default config for sample_rate. This is the direct counterpart
+ * of audio_pipeline_default_config().
+ */
+FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate);
+
+/**
+ * Compatibility wrapper for existing callers. New code should use the
+ * value-returning four_aec_nr_res_default_config() above so the call sequence
+ * reads the same as the mono pipeline.
+ */
 void four_aec_nr_res_config_defaults(FourAecNrResConfig* cfg,
                                      int sample_rate);
 
@@ -212,11 +238,6 @@ void four_aec_nr_res_config_defaults(FourAecNrResConfig* cfg,
 int four_aec_nr_res_get_mem_requirements(
     const FourAecNrResConfig* cfg,
     FourAecNrResMemReq* out);
-
-/** Optional module/wrapper split for board memory-budget reporting. */
-int four_aec_nr_res_get_mem_breakdown(
-    const FourAecNrResConfig* cfg,
-    FourAecNrResMemBreakdown* out);
 
 /**
  * Place the complete four-AEC/NR/RES pipeline in caller-owned memory.
@@ -263,25 +284,6 @@ FourAecNrRes* four_aec_nr_res_init_ex(
     const FourAecNrResConfig* cfg,
     const FourAecNrResMemReq* expected);
 
-/**
- * Heap convenience wrapper over get_mem_requirements() + init(). All memory
- * is allocated here; process_pre/post perform no allocation. Returns NULL for
- * an invalid config or allocation failure.
- */
-FourAecNrRes* four_aec_nr_res_create(const FourAecNrResConfig* cfg);
-
-/**
- * Reset all delay/AEC/NR/RES/OLA state. Invalidates a pending pre-frame token.
- */
-void four_aec_nr_res_reset(FourAecNrRes* self);
-
-/**
- * Destroy an instance. For caller-owned memory this is idempotent and never
- * frees the pool; the caller releases/reuses it afterward. For a heap-created
- * handle it frees the one owned pool, so call once as with free().
- */
-void four_aec_nr_res_destroy(FourAecNrRes* self);
-
 /* ============================================================================
  * Per-hop processing
  * ========================================================================== */
@@ -295,11 +297,11 @@ void four_aec_nr_res_destroy(FourAecNrRes* self);
  *
  * @return FOUR_AEC_NR_RES_OK on success (*out filled, token valid until the
  *         matching process_post()/reset()/destroy()); FOUR_AEC_NR_RES_INVALID_ARGUMENT
- *         on a NULL self/microphones_interleaved/ref/out; FOUR_AEC_NR_RES_SEQUENCE_ERROR
+ *         on a NULL p/microphones_interleaved/ref/out; FOUR_AEC_NR_RES_SEQUENCE_ERROR
  *         if a pre frame is already pending.
  */
 int four_aec_nr_res_process_pre(
-    FourAecNrRes* self,
+    FourAecNrRes* p,
     const float* microphones_interleaved,
     const float* ref,
     FourAecNrResPreFrame* out);
@@ -323,32 +325,75 @@ int four_aec_nr_res_process_pre(
  *
  * @return FOUR_AEC_NR_RES_OK on success (*out fully written, token
  *         consumed); FOUR_AEC_NR_RES_INVALID_ARGUMENT on a NULL
- *         self/token/weights/out or all-zero weights (the pending frame is
+ *         p/token/weights/out or all-zero weights (the pending frame is
  *         left intact so the caller may correct and retry -- see
  *         "process_pre"/"process_post" ordering above); FOUR_AEC_NR_RES_SEQUENCE_ERROR
  *         if token does not match the pending frame (replay, cross-instance
  *         use, or a token invalidated by an intervening reset()).
  */
 int four_aec_nr_res_process_post(
-    FourAecNrRes* self,
+    FourAecNrRes* p,
     const FourAecNrResFrameToken* token,
     const Complex* weights,
     float* out);
+
+/**
+ * Reset all delay/AEC/NR/RES/OLA state. Invalidates a pending pre-frame token.
+ */
+void four_aec_nr_res_reset(FourAecNrRes* p);
+
+/**
+ * Destroy an instance. For caller-owned memory this is idempotent and never
+ * frees the pool; the caller releases/reuses it afterward. For a heap-created
+ * handle it frees the one owned pool, so call once as with free().
+ */
+void four_aec_nr_res_destroy(FourAecNrRes* p);
+
+/* ============================================================================
+ * Heap convenience
+ * ========================================================================== */
+
+/**
+ * Heap convenience wrapper over get_mem_requirements() + init(). All memory
+ * is allocated here; process_pre/post perform no allocation. Returns NULL for
+ * an invalid config or allocation failure.
+ */
+FourAecNrRes* four_aec_nr_res_create(const FourAecNrResConfig* cfg);
 
 /* ============================================================================
  * Read-only shape/topology accessors
  * ========================================================================== */
 
-int four_aec_nr_res_hop_size(const FourAecNrRes* self);
-int four_aec_nr_res_fft_size(const FourAecNrRes* self);
-int four_aec_nr_res_n_freqs(const FourAecNrRes* self);
-int four_aec_nr_res_sample_rate(const FourAecNrRes* self);
+int four_aec_nr_res_hop_size(const FourAecNrRes* p);
+int four_aec_nr_res_fft_size(const FourAecNrRes* p);
+int four_aec_nr_res_n_freqs(const FourAecNrRes* p);
+int four_aec_nr_res_sample_rate(const FourAecNrRes* p);
 
 /* Structural audit hooks. Values are 1 / 4 / 1 / 1 for a valid handle. */
-int four_aec_nr_res_matched_filter_count(const FourAecNrRes* self);
-int four_aec_nr_res_linear_aec_count(const FourAecNrRes* self);
-int four_aec_nr_res_nr_count(const FourAecNrRes* self);
-int four_aec_nr_res_post_res_count(const FourAecNrRes* self);
+int four_aec_nr_res_matched_filter_count(const FourAecNrRes* p);
+int four_aec_nr_res_linear_aec_count(const FourAecNrRes* p);
+int four_aec_nr_res_nr_count(const FourAecNrRes* p);
+int four_aec_nr_res_post_res_count(const FourAecNrRes* p);
+
+/* ============================================================================
+ * Diagnostic memory breakdown
+ * ========================================================================== */
+
+typedef struct FourAecNrResMemBreakdown {
+    size_t aec_bytes;       /* four AEC pools combined */
+    size_t nr_bytes;
+    size_t fft_bytes;
+    size_t wrapper_bytes;   /* control block + shared/post-beam state */
+    size_t total_bytes;
+    int hop_size;
+    int fft_size;
+    int n_freqs;
+} FourAecNrResMemBreakdown;
+
+/** Optional module/wrapper split for board memory-budget reporting. */
+int four_aec_nr_res_get_mem_breakdown(
+    const FourAecNrResConfig* cfg,
+    FourAecNrResMemBreakdown* out);
 
 #ifdef __cplusplus
 }

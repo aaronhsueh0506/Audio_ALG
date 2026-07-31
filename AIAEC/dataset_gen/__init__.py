@@ -23,6 +23,7 @@ from .aec_dataset import (
     plan_sequences,
 )
 from .aec_features import (
+    BASE_STEM_ORDER,
     STEM_ORDER,
     AecGrid,
     AecStems,
@@ -34,10 +35,22 @@ from .aec_features import (
     sqrt_hann_window,
     stft,
 )
+from .linear_aec import (
+    LINEAR_AEC_CONTRACT_VERSION,
+    LinearAecContract,
+    LinearAecProcessor,
+    linear_aec_contract_from_config,
+    make_linear_aec_config,
+    make_linear_aec_contract,
+    materialize_linear_error,
+    require_linear_aec_contract,
+)
 from .manifest import (
+    ALL_SPLIT_NAMES,
     SourcePools,
     assert_source_disjoint,
     build_manifest,
+    build_unified_manifest,
     config_hash,
     load_manifest,
     pools_for_split,
@@ -53,6 +66,9 @@ from .model_views import (
 )
 
 __all__ = [
+    'ALL_SPLIT_NAMES',
+    'BASE_STEM_ORDER',
+    'LINEAR_AEC_CONTRACT_VERSION',
     'NONLINEAR_MODELS',
     'SCENARIOS',
     'STEM_ORDER',
@@ -63,6 +79,8 @@ __all__ = [
     'PackedAecDataset',
     'MODEL_TASKS',
     'ModelView',
+    'LinearAecContract',
+    'LinearAecProcessor',
     'SpectralModelView',
     'RenderedSequence',
     'SequenceChunkSampler',
@@ -72,6 +90,7 @@ __all__ = [
     'alpha_from_tau',
     'assert_source_disjoint',
     'build_manifest',
+    'build_unified_manifest',
     'build_model_view',
     'build_spectral_model_view',
     'config_hash',
@@ -79,9 +98,14 @@ __all__ = [
     'istft',
     'lane_reset_mask',
     'load_manifest',
+    'linear_aec_contract_from_config',
+    'make_linear_aec_config',
+    'make_linear_aec_contract',
+    'materialize_linear_error',
     'plan_sequences',
     'pools_for_split',
     'save_manifest',
+    'require_linear_aec_contract',
     'sqrt_hann_window',
     'stft',
 ]

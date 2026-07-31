@@ -51,9 +51,9 @@ static void fill_inputs(float* microphones, float* ref, int hop,
     }
 }
 
-static int run_rate(int sample_rate) {
+static int run_grid(int sample_rate, int fft_size) {
     FourAecNrResConfig cfg;
-    FourAecNrRes* pipeline;
+    FourAecNrRes* p;
     FourAecNrResPreFrame pre;
     FourAecNrResFrameToken stale;
     float* microphones;
@@ -67,27 +67,29 @@ static int run_rate(int sample_rate) {
     int k;
     int rc;
 
-    four_aec_nr_res_config_defaults(&cfg, sample_rate);
+    cfg = four_aec_nr_res_default_config(sample_rate);
+    cfg.fft_size = fft_size;
     cfg.enable_cng = 0;
-    pipeline = four_aec_nr_res_create(&cfg);
-    CHECK(pipeline != NULL, "create supported rate");
-    if (!pipeline) return 0;
+    p = four_aec_nr_res_create(&cfg);
+    CHECK(p != NULL, "create supported rate");
+    if (!p) return 0;
 
-    hop = four_aec_nr_res_hop_size(pipeline);
-    n_freqs = four_aec_nr_res_n_freqs(pipeline);
-    CHECK(hop == (sample_rate == 16000 ? 256 : 512),
+    hop = four_aec_nr_res_hop_size(p);
+    n_freqs = four_aec_nr_res_n_freqs(p);
+    CHECK(hop == fft_size / 2,
           "rate-specific hop");
-    CHECK(four_aec_nr_res_fft_size(pipeline) == 2 * hop,
+    CHECK(four_aec_nr_res_fft_size(p) == 2 * hop,
           "FFT is two hops");
-    CHECK(four_aec_nr_res_sample_rate(pipeline) == sample_rate,
+    CHECK(four_aec_nr_res_sample_rate(p) == sample_rate,
           "sample-rate accessor");
-    CHECK(four_aec_nr_res_matched_filter_count(pipeline) == 1,
+    CHECK(four_aec_nr_res_matched_filter_count(p) == 1,
           "one shared matcher");
-    CHECK(four_aec_nr_res_linear_aec_count(pipeline) == 4,
+    CHECK(four_aec_nr_res_linear_aec_count(p) ==
+              FOUR_AEC_NR_RES_CHANNELS,
           "four linear AEC filters");
-    CHECK(four_aec_nr_res_nr_count(pipeline) == 1,
+    CHECK(four_aec_nr_res_nr_count(p) == 1,
           "one mono NR");
-    CHECK(four_aec_nr_res_post_res_count(pipeline) == 1,
+    CHECK(four_aec_nr_res_post_res_count(p) == 1,
           "one post-beam RES");
 
     microphones = (float*)calloc(
@@ -103,7 +105,7 @@ static int run_rate(int sample_rate) {
         free(ref);
         free(out);
         free(weights);
-        four_aec_nr_res_destroy(pipeline);
+        four_aec_nr_res_destroy(p);
         return 0;
     }
 
@@ -116,7 +118,7 @@ static int run_rate(int sample_rate) {
     for (frame = 0; frame < 3; ++frame) {
         fill_inputs(microphones, ref, hop, sample_rate, frame);
         rc = four_aec_nr_res_process_pre(
-            pipeline, microphones, ref, &pre);
+            p, microphones, ref, &pre);
         CHECK(rc == FOUR_AEC_NR_RES_OK, "pre stage succeeds");
         if (rc != FOUR_AEC_NR_RES_OK) break;
         CHECK(pre.linear_interleaved != NULL &&
@@ -131,42 +133,42 @@ static int run_rate(int sample_rate) {
         if (frame == 0) {
             FourAecNrResPreFrame duplicate;
             CHECK(four_aec_nr_res_process_pre(
-                      pipeline, microphones, ref, &duplicate) ==
+                      p, microphones, ref, &duplicate) ==
                       FOUR_AEC_NR_RES_SEQUENCE_ERROR,
                   "second pre frame is rejected while one is pending");
         }
 
         stale = pre.token;
         rc = four_aec_nr_res_process_post(
-            pipeline, &pre.token, weights, out);
+            p, &pre.token, weights, out);
         CHECK(rc == FOUR_AEC_NR_RES_OK, "post NR/RES stage succeeds");
         CHECK(all_finite(out, hop), "mono output is finite");
         CHECK(four_aec_nr_res_process_post(
-                  pipeline, &stale, weights, out) ==
+                  p, &stale, weights, out) ==
                   FOUR_AEC_NR_RES_SEQUENCE_ERROR,
               "post token cannot be replayed");
     }
 
     fill_inputs(microphones, ref, hop, sample_rate, 4);
     CHECK(four_aec_nr_res_process_pre(
-              pipeline, microphones, ref, &pre) == FOUR_AEC_NR_RES_OK,
+              p, microphones, ref, &pre) == FOUR_AEC_NR_RES_OK,
           "pre before reset succeeds");
     stale = pre.token;
-    four_aec_nr_res_reset(pipeline);
+    four_aec_nr_res_reset(p);
     CHECK(four_aec_nr_res_process_post(
-              pipeline, &stale, weights, out) ==
+              p, &stale, weights, out) ==
               FOUR_AEC_NR_RES_SEQUENCE_ERROR,
           "reset invalidates in-flight token");
 
     fill_inputs(microphones, ref, hop, sample_rate, 5);
     CHECK(four_aec_nr_res_process_pre(
-              pipeline, microphones, ref, &pre) == FOUR_AEC_NR_RES_OK,
+              p, microphones, ref, &pre) == FOUR_AEC_NR_RES_OK,
           "pre after reset succeeds");
     memset(weights, 0,
            (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs *
            sizeof(Complex));
     CHECK(four_aec_nr_res_process_post(
-              pipeline, &pre.token, weights, out) ==
+              p, &pre.token, weights, out) ==
               FOUR_AEC_NR_RES_INVALID_ARGUMENT,
           "all-zero beamformer weights are rejected");
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
@@ -175,7 +177,7 @@ static int run_rate(int sample_rate) {
         }
     }
     CHECK(four_aec_nr_res_process_post(
-              pipeline, &pre.token, weights, out) ==
+              p, &pre.token, weights, out) ==
               FOUR_AEC_NR_RES_OK,
           "pending frame may retry after invalid weights");
 
@@ -183,7 +185,7 @@ static int run_rate(int sample_rate) {
     free(ref);
     free(out);
     free(weights);
-    four_aec_nr_res_destroy(pipeline);
+    four_aec_nr_res_destroy(p);
     return 1;
 }
 
@@ -191,24 +193,210 @@ static void test_invalid_configs(void) {
     FourAecNrResConfig cfg;
     FourAecNrResMemReq req;
 
-    four_aec_nr_res_config_defaults(&cfg, 8000);
+    cfg = four_aec_nr_res_default_config(8000);
     CHECK(four_aec_nr_res_create(&cfg) == NULL,
           "8 kHz is outside the 4-channel contract");
     CHECK(four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0,
           "static sizing rejects 8 kHz");
 
-    four_aec_nr_res_config_defaults(&cfg, 16000);
+    cfg = four_aec_nr_res_default_config(16000);
     cfg.fft_size = 1024;
     CHECK(four_aec_nr_res_create(&cfg) == NULL,
           "cross-rate FFT grid is rejected");
 
-    four_aec_nr_res_config_defaults(&cfg, 16000);
+    cfg = four_aec_nr_res_default_config(16000);
     cfg.capture_proxy_channel = 4;
     CHECK(four_aec_nr_res_create(&cfg) == NULL,
           "invalid capture proxy is rejected");
 }
 
-static void run_static_parity(int sample_rate) {
+/* A frame token is stamped with the owning instance's pointer
+ * (owner_cookie); process_post() must reject a token minted by a different
+ * live instance, and doing so must not disturb either instance's own
+ * pending frame. */
+static void test_cross_instance_token(void) {
+    FourAecNrResConfig cfg;
+    FourAecNrRes* a = NULL;
+    FourAecNrRes* b = NULL;
+    FourAecNrResPreFrame pre_a;
+    FourAecNrResPreFrame pre_b;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* out = NULL;
+    Complex* weights = NULL;
+    int hop;
+    int n_freqs;
+    int ch;
+    int k;
+
+    cfg = four_aec_nr_res_default_config(16000);
+    cfg.enable_cng = 0;
+    a = four_aec_nr_res_create(&cfg);
+    b = four_aec_nr_res_create(&cfg);
+    CHECK(a != NULL && b != NULL, "cross-instance test: two instances create");
+    if (!a || !b) goto cleanup;
+
+    hop = four_aec_nr_res_hop_size(a);
+    n_freqs = four_aec_nr_res_n_freqs(a);
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
+    CHECK(microphones && ref && out && weights,
+          "cross-instance test: buffers allocate");
+    if (!microphones || !ref || !out || !weights) goto cleanup;
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+        for (k = 0; k < n_freqs; ++k) {
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+        }
+    }
+
+    fill_inputs(microphones, ref, hop, 16000, 0);
+    CHECK(four_aec_nr_res_process_pre(a, microphones, ref, &pre_a) ==
+              FOUR_AEC_NR_RES_OK,
+          "cross-instance test: instance A pre succeeds");
+    fill_inputs(microphones, ref, hop, 16000, 1);
+    CHECK(four_aec_nr_res_process_pre(b, microphones, ref, &pre_b) ==
+              FOUR_AEC_NR_RES_OK,
+          "cross-instance test: instance B pre succeeds");
+
+    CHECK(four_aec_nr_res_process_post(
+              b, &pre_a.token, weights, out) ==
+              FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "post rejects a token minted by a different instance");
+
+    CHECK(four_aec_nr_res_process_post(
+              b, &pre_b.token, weights, out) == FOUR_AEC_NR_RES_OK,
+          "instance B's own pending frame survives the rejected cross-use");
+    CHECK(four_aec_nr_res_process_post(
+              a, &pre_a.token, weights, out) == FOUR_AEC_NR_RES_OK,
+          "instance A's own pending frame survives the rejected cross-use");
+
+cleanup:
+    four_aec_nr_res_destroy(a);
+    four_aec_nr_res_destroy(b);
+    free(weights);
+    free(out);
+    free(ref);
+    free(microphones);
+}
+
+/* destroy() never releases caller-owned pool memory (documented contract),
+ * so a caller may init() a brand-new instance into the exact same pool
+ * bytes right after destroying the old one. init() memsets that pool to
+ * zero, so the new instance's frame_index/generation restart at 0 and its
+ * owner_cookie (the instance pointer) is identical to the destroyed
+ * instance's, since it is literally the same memory -- a pre-destroy token
+ * would be bit-identical to the new instance's own first-frame token if
+ * instance_epoch did not also distinguish them. This reproduces that ABA
+ * scenario directly and confirms process_post() still rejects the stale
+ * pre-destroy token against the new instance. */
+static void test_pool_reinit_token_rejected(void) {
+    FourAecNrResConfig cfg;
+    FourAecNrResMemReq req;
+    FourAecNrRes* old_instance = NULL;
+    FourAecNrRes* new_instance = NULL;
+    FourAecNrResPreFrame pre_old;
+    FourAecNrResPreFrame pre_new;
+    unsigned char* pool = NULL;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* out = NULL;
+    Complex* weights = NULL;
+    int hop;
+    int n_freqs;
+    int ch;
+    int k;
+
+    cfg = four_aec_nr_res_default_config(16000);
+    cfg.enable_cng = 0;
+    if (four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0 ||
+        req.bytes > (uint64_t)SIZE_MAX) {
+        CHECK(0, "pool-reinit test: memory requirement query succeeds");
+        return;
+    }
+    if (posix_memalign(
+            (void**)&pool, (size_t)req.alignment, (size_t)req.bytes) != 0)
+        pool = NULL;
+    CHECK(pool != NULL, "pool-reinit test: pool allocates");
+    if (!pool) return;
+
+    old_instance = four_aec_nr_res_init(pool, (size_t)req.bytes, &cfg);
+    CHECK(old_instance != NULL, "pool-reinit test: first instance inits");
+    if (!old_instance) { free(pool); return; }
+
+    hop = four_aec_nr_res_hop_size(old_instance);
+    n_freqs = four_aec_nr_res_n_freqs(old_instance);
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
+    CHECK(microphones && ref && out && weights,
+          "pool-reinit test: buffers allocate");
+    if (!microphones || !ref || !out || !weights) {
+        four_aec_nr_res_destroy(old_instance);
+        free(pool);
+        goto cleanup;
+    }
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+        for (k = 0; k < n_freqs; ++k) {
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+        }
+    }
+
+    fill_inputs(microphones, ref, hop, 16000, 0);
+    CHECK(four_aec_nr_res_process_pre(
+              old_instance, microphones, ref, &pre_old) ==
+              FOUR_AEC_NR_RES_OK,
+          "pool-reinit test: first instance pre succeeds");
+
+    /* destroy() does not release or clear caller-owned pool memory. */
+    four_aec_nr_res_destroy(old_instance);
+
+    new_instance = four_aec_nr_res_init(pool, (size_t)req.bytes, &cfg);
+    CHECK(new_instance != NULL,
+          "pool-reinit test: second instance inits into the same pool");
+    if (!new_instance) { free(pool); goto cleanup; }
+
+    CHECK((void*)new_instance == (void*)old_instance,
+          "pool-reinit test: second instance reuses the exact same address");
+
+    fill_inputs(microphones, ref, hop, 16000, 0);
+    CHECK(four_aec_nr_res_process_pre(
+              new_instance, microphones, ref, &pre_new) ==
+              FOUR_AEC_NR_RES_OK,
+          "pool-reinit test: second instance pre succeeds");
+    CHECK(pre_old.token.frame_index == pre_new.token.frame_index &&
+              pre_old.token.generation == pre_new.token.generation &&
+              pre_old.token.owner_cookie == pre_new.token.owner_cookie &&
+              pre_old.token.instance_epoch != pre_new.token.instance_epoch,
+          "pool-reinit test: only instance_epoch differs between the two "
+          "tokens");
+
+    CHECK(four_aec_nr_res_process_post(
+              new_instance, &pre_old.token, weights, out) ==
+              FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "post rejects a pre-destroy token reused after same-pool re-init");
+    CHECK(four_aec_nr_res_process_post(
+              new_instance, &pre_new.token, weights, out) ==
+              FOUR_AEC_NR_RES_OK,
+          "the new instance's own token is still accepted");
+
+    four_aec_nr_res_destroy(new_instance);
+    free(pool);
+
+cleanup:
+    free(weights);
+    free(out);
+    free(ref);
+    free(microphones);
+}
+
+static void run_static_parity(int sample_rate, int fft_size) {
     FourAecNrResConfig cfg;
     FourAecNrResMemReq req;
     FourAecNrResMemReq stale;
@@ -230,7 +418,8 @@ static void run_static_parity(int sample_rate) {
     int k;
     int rc;
 
-    four_aec_nr_res_config_defaults(&cfg, sample_rate);
+    cfg = four_aec_nr_res_default_config(sample_rate);
+    cfg.fft_size = fft_size;
     rc = four_aec_nr_res_get_mem_requirements(&cfg, &req);
     CHECK(rc == 0, "static memory requirement query succeeds");
     CHECK(
@@ -380,10 +569,14 @@ cleanup:
 
 int main(void) {
     test_invalid_configs();
-    run_rate(16000);
-    run_rate(48000);
-    run_static_parity(16000);
-    run_static_parity(48000);
+    test_cross_instance_token();
+    test_pool_reinit_token_rejected();
+    run_grid(16000, 256);
+    run_grid(16000, 512);
+    run_grid(48000, 1024);
+    run_static_parity(16000, 256);
+    run_static_parity(16000, 512);
+    run_static_parity(48000, 1024);
 
     if (failures) {
         printf("%d test(s) failed\n", failures);

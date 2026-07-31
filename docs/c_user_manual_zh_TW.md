@@ -23,7 +23,10 @@
 - reusable API：`pipelines/audio_pipeline.h` / `audio_pipeline.c`
 - linkable archive：config-keyed build directory 內的 `libaudio_pipeline.a`
 - 四麥克風 API：`pipelines/aec_4ch/4aec_nr_res.h` / `4aec_nr_res.c`
+- 完整四麥克風 spatial API：`pipelines/aec_4ch/4aec_doa_gsc.h` /
+  `4aec_doa_gsc.c`
 - 四麥克風 static 對照範例：`pipelines/aec_4ch/4aec_nr_res_static.c`
+- 完整 spatial 實錄 runner：`pipelines/aec_4ch/4aec_doa_gsc_raw.c`
 - 四麥克風 archive：config-keyed build directory 內的 `lib4aec_nr_res.a`
 
 `pipelines/PLAN_audio_pipeline_api.md` 是 API 實作前的歷史設計草案，
@@ -41,10 +44,11 @@ AEC／NR 直接 wrapper 僅保留給尚未過渡的既有呼叫端。
 
 `FourAecNrRes*` 是獨立於 `AudioPipeline*` 的 zero-padding-free 介面，只支援：
 
-| 取樣率 | FFT / hop | 資源拓撲 |
-|---|---|---|
-| 16 kHz | 512 / 256 | 1 shared matcher + 4 linear AEC + 1 post-beam RES + 1 NR |
-| 48 kHz | 1024 / 512 | 1 shared matcher + 4 linear AEC + 1 post-beam RES + 1 NR |
+| 取樣率 | frame | FFT | hop | bins | 資源拓撲 |
+|---|---:|---:|---:|---:|---|
+| 16 kHz | 256 | 256 | 128 | 129 | 1 shared matcher + 4 linear AEC + 1 post-beam RES + 1 NR |
+| 16 kHz | 512 | 512 | 256 | 257 | 同上（預設） |
+| 48 kHz | 1024 | 1024 | 512 | 513 | 同上（唯一合法 48 kHz 格點） |
 
 呼叫端先用 `four_aec_nr_res_process_pre()` 取得 interleaved `[hop][4]`
 linear output 與 token，交由外部 SRP-PHAT/GSC 更新 channel-major
@@ -52,6 +56,12 @@ linear output 與 token，交由外部 SRP-PHAT/GSC 更新 channel-major
 `four_aec_nr_res_process_post()` 取得 mono hop。模組不實作 beamformer，
 但會以該組權重一致地投影 error／near／echo／R2 context，再只執行一次
 NR、RES gain fusion 與 iFFT/OLA。
+
+`FourAecNrRes*` core 本身不實作 beamformer；若要直接包入現有的第三方
+SRP-PHAT/GSC，使用 `FourAecDoaGsc*`。完整 wrapper 的 AEC、DOA、GSC、
+NR、RES 都繼承同一個格點，`frame == FFT`、`hop == frame/2`，不能分別
+指定互相矛盾的 frame/hop/FFT。`four_aec_doa_gsc_*_size()` accessors 可
+分別查詢 main、DOA 與 GSC 實際格點；預設三組設定中三者必須一致。
 
 目前只允許一個 in-flight frame。建立方式比照 mono `AudioPipeline`：
 
@@ -117,7 +127,9 @@ make -C pipelines            # mono heap/static + lib4aec_nr_res.a + 4ch static
 make -C pipelines BACKEND=ne10   # NE10 FFT 後端（obj/ 依 backend+參數雜湊分開目錄，免手動 clean-libs）
 make -C pipelines lib4aec_nr_res.a
 make -C pipelines 4aec_nr_res_static
+make -C pipelines 4aec_doa_gsc_raw
 make -C pipelines test_4aec_nr_res
+make -C pipelines test_4aec_doa_gsc
 ```
 
 若自行編譯 wrapper，沿用目前 Makefile 的 include／link layout（注意：兩個 library 都依賴

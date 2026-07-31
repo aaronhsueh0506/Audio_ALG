@@ -36,8 +36,21 @@
 #     is relative or absolute (see the BUILD_DIR comment below).
 
 CC ?= cc
+SIMD ?= 1
+ifneq ($(words $(SIMD)),1)
+$(error SIMD must be exactly 0 or 1, got '$(SIMD)')
+endif
+ifneq ($(filter-out 0 1,$(SIMD)),)
+$(error SIMD must be exactly 0 or 1, got '$(SIMD)')
+endif
+ifeq ($(SIMD),0)
+SIMD_CFLAGS := -DSIMD_KERNELS_FORCE_SCALAR
+else
+SIMD_CFLAGS :=
+endif
 CFLAGS = -O2 -Wall -Wextra
 CFLAGS += $(EXTRA_CFLAGS)
+CFLAGS += $(SIMD_CFLAGS)
 
 # --- Bare-literal policy flags, defined early (`make -e` environment-override
 # gap; same fix already applied in the sibling C-library Makefiles
@@ -187,12 +200,12 @@ CFLAGS    += $(FP_POLICY)
 # BOTH a relative and an already-absolute BUILD_DIR, and the result is kept
 # double-quoted in the recipe since this checkout's own path may contain
 # spaces.
-CFG_SIG_PAYLOAD := CC=$(CC) CFLAGS=$(CFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS)
+CFG_SIG_PAYLOAD := CC=$(CC) CFLAGS=$(CFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) SIMD=$(SIMD)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 BUILD_DIR = build/$(CFG_SIG)
 PY_TEST_DIR = tests
 
-.PHONY: test test-tables test-features test-feature-contract test-feature-python test-loss-python clean _cfg_guard
+.PHONY: test test-tables test-features test-simd test-feature-contract test-feature-python test-loss-python clean _cfg_guard
 _cfg_guard:
 	@mkdir -p $(BUILD_DIR)
 	@m="$(BUILD_DIR)/config.manifest"; \
@@ -214,7 +227,7 @@ test-tables: $(BUILD_DIR)/test_rnnoise_tables $(BUILD_DIR)/test_rnnoise_tables_p
 	@echo "== rnnoise tables drift-guard: layer 2 (portable, math contracts) =="
 	"$(abspath $(BUILD_DIR))/test_rnnoise_tables_portable"
 
-test: test-tables test-feature-contract test-features
+test: test-tables test-feature-contract test-features test-simd
 
 test-feature-contract:
 	@echo "== rnnoise config/Python/C feature contract =="
@@ -223,6 +236,15 @@ test-feature-contract:
 test-features: $(BUILD_DIR)/test_rnnoise_features
 	@echo "== rnnoise feature-state contract =="
 	"$(abspath $(BUILD_DIR))/test_rnnoise_features"
+
+test-simd: $(BUILD_DIR)/test_rnnoise_simd_auto $(BUILD_DIR)/test_rnnoise_simd_scalar
+	@auto="$$( "$(abspath $(BUILD_DIR))/test_rnnoise_simd_auto" )"; \
+	 scalar="$$( "$(abspath $(BUILD_DIR))/test_rnnoise_simd_scalar" )"; \
+	 test "$$auto" = "$$scalar" || { \
+	   echo "FAIL: RNNoise SIMD/scalar digest mismatch: $$auto != $$scalar" >&2; \
+	   exit 1; \
+	 }; \
+	 echo "PASS: RNNoise SIMD/scalar full preprocessing digest $$auto"
 
 # Requires the training Python environment (torch + numpy).  Kept separate from
 # `make test` so the dependency-free embedded C checks remain runnable on hosts
@@ -258,6 +280,12 @@ $(BUILD_DIR)/test_rnnoise_tables_portable: test_rnnoise_tables.c rnnoise_tables_
 
 $(BUILD_DIR)/test_rnnoise_features: test_rnnoise_features.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ test_rnnoise_features.c process.c -lm
+
+$(BUILD_DIR)/test_rnnoise_simd_auto: test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ test_rnnoise_simd.c process.c -lm
+
+$(BUILD_DIR)/test_rnnoise_simd_scalar: test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
+	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR -o $@ test_rnnoise_simd.c process.c -lm
 
 clean:
 	rm -rf build
