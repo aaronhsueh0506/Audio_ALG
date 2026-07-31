@@ -38,6 +38,11 @@
  *
  * Both construction paths use the same process_pre()/process_post() core and
  * must be byte-identical for the same inputs, weights, config, and backend.
+ *
+ * See pipelines/README.md ("4-ch integration") for the module table and
+ * pipelines/aec_4ch/README.md for the full architecture writeup, the
+ * pre/post hand-off contract with an external SRP-PHAT/GSC, and the
+ * parity-limitation note on bounded vs unbounded R2 in the post-beam RES.
  */
 #ifndef FOUR_AEC_NR_RES_H
 #define FOUR_AEC_NR_RES_H
@@ -68,6 +73,18 @@ extern "C" {
  *
  * Query it at init time and pass the same value to init_ex(). Do not cache it
  * across library, backend, compiler-flag, or config changes.
+ *
+ * Same 32-byte fixed-width-integer shape and same field meanings as
+ * pipelines/audio_pipeline.h's `AudioPipelineMemReq` (descriptor_version =
+ * this struct's own ABI version, checked first; layout_version = this
+ * file's carve order/buffer-set version; backend_id = compile-time FFT
+ * backend as a small integer, compared with plain `==`, never `strcmp`;
+ * build_flags_hash = FNV-1a-32 over this file's own carve structure, NOT
+ * over AecConfig/MmseLsaConfig tunable values; reserved = always 0, VALIDATED
+ * not assumed, because `expected` may originate from persisted/transmitted
+ * bytes) -- see that header's own doc comment for the full rationale
+ * (four problems the old size_t/pointer/strcmp shape had that this fixed
+ * layout fixes) rather than repeating it here.
  */
 typedef struct FourAecNrResMemReq {
     uint32_t descriptor_version;
@@ -79,40 +96,35 @@ typedef struct FourAecNrResMemReq {
     uint64_t bytes;
 } FourAecNrResMemReq;
 
-#if defined(__cplusplus)
-#define FOUR_AEC_NR_RES_STATIC_ASSERT(condition, message) \
-    static_assert(condition, message)
-#else
-#define FOUR_AEC_NR_RES_STATIC_ASSERT(condition, message) \
-    _Static_assert(condition, message)
-#endif
-
-FOUR_AEC_NR_RES_STATIC_ASSERT(
+/* Bare _Static_assert, same as audio_pipeline.h's AudioPipelineMemReq pin --
+ * this header is already only ever included inside an `extern "C" { ... }`
+ * block for C++ callers (see above), so there is nothing a
+ * static_assert/_Static_assert compatibility macro would buy here that the
+ * sibling mono header doesn't already get for free. */
+_Static_assert(
     sizeof(FourAecNrResMemReq) == 32,
     "FourAecNrResMemReq must be exactly 32 bytes");
-FOUR_AEC_NR_RES_STATIC_ASSERT(
+_Static_assert(
     offsetof(FourAecNrResMemReq, descriptor_version) == 0,
     "descriptor_version offset");
-FOUR_AEC_NR_RES_STATIC_ASSERT(
+_Static_assert(
     offsetof(FourAecNrResMemReq, layout_version) == 4,
     "layout_version offset");
-FOUR_AEC_NR_RES_STATIC_ASSERT(
+_Static_assert(
     offsetof(FourAecNrResMemReq, backend_id) == 8,
     "backend_id offset");
-FOUR_AEC_NR_RES_STATIC_ASSERT(
+_Static_assert(
     offsetof(FourAecNrResMemReq, build_flags_hash) == 12,
     "build_flags_hash offset");
-FOUR_AEC_NR_RES_STATIC_ASSERT(
+_Static_assert(
     offsetof(FourAecNrResMemReq, alignment) == 16,
     "alignment offset");
-FOUR_AEC_NR_RES_STATIC_ASSERT(
+_Static_assert(
     offsetof(FourAecNrResMemReq, reserved) == 20,
     "reserved offset");
-FOUR_AEC_NR_RES_STATIC_ASSERT(
+_Static_assert(
     offsetof(FourAecNrResMemReq, bytes) == 24,
     "bytes offset");
-
-#undef FOUR_AEC_NR_RES_STATIC_ASSERT
 
 typedef struct FourAecNrResMemBreakdown {
     size_t aec_bytes;       /* four AEC pools combined */
@@ -222,6 +234,28 @@ FourAecNrRes* four_aec_nr_res_init(
  * Static init plus a stale-descriptor gate. expected should be the descriptor
  * returned by a fresh get_mem_requirements() call for this exact build/config.
  * NULL expected is equivalent to four_aec_nr_res_init().
+ *
+ * When `expected` is non-NULL, every one of the following must hold against
+ * the CURRENT build's own get_mem_requirements(cfg, ...) before anything is
+ * carved (mirrors pipelines/audio_pipeline.h's audio_pipeline_init_ex()):
+ *
+ *   1. expected->descriptor_version == current.descriptor_version
+ *   2. expected->layout_version == current.layout_version
+ *   3. expected->backend_id == current.backend_id
+ *   4. expected->build_flags_hash == current.build_flags_hash
+ *   5. expected->alignment == current.alignment
+ *   6. expected->reserved == 0
+ *   7. expected->bytes >= current.bytes
+ *   8. bytes (the pool ACTUALLY handed to this call) >= current.bytes
+ *
+ * Only once all eight hold does this proceed exactly as
+ * four_aec_nr_res_init() would. Returns NULL on the first failing check
+ * (no diagnostic is printed today -- unlike the mono pipeline's
+ * AP_LOG_ERR()-per-field messages, this module currently returns NULL
+ * silently on every rejection path, mono or four-channel; it links no stdio
+ * symbols as a result. Naming the failed field on stderr, gated the same
+ * NO_STDIO-safe way audio_pipeline.c does, is a reasonable follow-up but is
+ * not implemented here yet).
  */
 FourAecNrRes* four_aec_nr_res_init_ex(
     void* mem,
@@ -258,6 +292,11 @@ void four_aec_nr_res_destroy(FourAecNrRes* self);
  *
  * microphones_interleaved is [hop][4], ref is [hop]. Both are read only.
  * A second pre() before the matching post() returns SEQUENCE_ERROR.
+ *
+ * @return FOUR_AEC_NR_RES_OK on success (*out filled, token valid until the
+ *         matching process_post()/reset()/destroy()); FOUR_AEC_NR_RES_INVALID_ARGUMENT
+ *         on a NULL self/microphones_interleaved/ref/out; FOUR_AEC_NR_RES_SEQUENCE_ERROR
+ *         if a pre frame is already pending.
  */
 int four_aec_nr_res_process_pre(
     FourAecNrRes* self,
@@ -281,6 +320,14 @@ int four_aec_nr_res_process_pre(
  * synthesis is performed from the coherently weighted spectra here. For a
  * multi-frame/time-domain GSC, weights must be its exact effective response
  * for this frame.
+ *
+ * @return FOUR_AEC_NR_RES_OK on success (*out fully written, token
+ *         consumed); FOUR_AEC_NR_RES_INVALID_ARGUMENT on a NULL
+ *         self/token/weights/out or all-zero weights (the pending frame is
+ *         left intact so the caller may correct and retry -- see
+ *         "process_pre"/"process_post" ordering above); FOUR_AEC_NR_RES_SEQUENCE_ERROR
+ *         if token does not match the pending frame (replay, cross-instance
+ *         use, or a token invalidated by an intervening reset()).
  */
 int four_aec_nr_res_process_post(
     FourAecNrRes* self,
