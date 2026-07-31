@@ -67,7 +67,9 @@ extern "C" {
  * ========================================================================== */
 
 #define FOUR_AEC_NR_RES_DESCRIPTOR_VERSION 1u
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 1u
+/* v2 removes unused fused echo/far buffers and adds one residual scratch
+ * vector for the SIMD post-beam projection. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 2u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 

@@ -33,11 +33,15 @@ Hard invariants:
 
 The external beamformer must expose its effective complex weights with shape
 `[4, n_freqs]`. The Python reference also accepts the external mono hop. The C
-library instead synthesizes the mono hop internally from the same weighted AEC
-spectra, so the output samples and the context cannot come from different
-beamformer states. The far-end spectrum remains the one shared digital render
-reference—it is verified equal across lanes and is not spatially weighted.
-The result passes through one mono NR+RES path without a fifth AEC.
+core API synthesizes the mono spectrum internally from the supplied weights,
+so independently supplied output samples and context cannot come from
+different beamformer states. The complete C wrapper can safely skip that one
+reconstruction because `gsc_process_with_weights()` produces its mono spectrum
+and effective weights atomically in the same call; the internal-only trusted
+seam is not exposed to external beamformers. The far-end spectrum remains the
+one shared digital render reference—it is verified equal across lanes and is
+not spatially weighted. The result passes through one mono NR+RES path without
+a fifth AEC.
 
 ## C API
 
@@ -48,6 +52,11 @@ The deployable C seam is:
 - [`4aec_nr_res.c`](4aec_nr_res.c): one shared `DelayAec3`, four linear
   `Aec` instances, coherent context projection, one `SuppressionGain`, one
   MMSE-LSA instance, and one final iFFT/OLA;
+- [`4aec_projection_kernels.h`](4aec_projection_kernels.h): byte-equivalent
+  scalar/NEON complex projection, residual-vector, and comfort-noise kernels;
+- [`4aec_nr_res_internal.h`](4aec_nr_res_internal.h): internal-only trusted
+  GSC-spectrum continuation used by the complete wrapper, not a public
+  external-beamformer API;
 - [`4aec_nr_res_static.c`](4aec_nr_res_static.c): caller-owned-pool example
   following the same query → allocate → `init` → process → destroy →
   release sequence as the mono `aec_nr_pipeline_static.c`;
@@ -202,9 +211,16 @@ its exact current effective frequency response. Returning only a mono waveform
 is insufficient for the traditional RES path.
 
 The implementation never chooses one lane's RES and never takes the minimum
-of four lane gains. It coherently beamforms error/echo spectra, combines R2
-with the same spatial weights, then runs exactly one stateful
-`PostBeamResidualSuppressor` to calculate the mono gain used after NR.
+of four lane gains. It coherently projects error and near spectra, converts
+each lane's R2 into an echo-phase-bearing residual vector and combines that
+vector with the same spatial weights, then runs exactly one stateful
+`PostBeamResidualSuppressor` to calculate the mono gain used after NR. It does
+not calculate unused beamformed echo/far spectra. Residual normalization uses
+one square root and one divide per channel/bin; the public weights-only path
+performs 12 complex MACs per bin (error + near + residual across four lanes),
+while the complete GSC wrapper reuses its atomic mono spectrum and performs 8
+(near + residual). Comfort-noise power projection is a separate real SIMD
+accumulation.
 
 One parity limitation remains explicit: `AecResContext` does not yet export
 unbounded R2 or the complete stationarity/AecState surface. The post-beam RES

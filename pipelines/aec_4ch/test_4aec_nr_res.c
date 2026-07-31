@@ -6,6 +6,8 @@
  */
 
 #include "4aec_nr_res.h"
+#include "4aec_nr_res_internal.h"
+#include "4aec_projection_kernels.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -30,6 +32,179 @@ static int all_finite(const float* values, int count) {
         if (!isfinite(values[i])) return 0;
     }
     return 1;
+}
+
+static void fill_inputs(float* microphones, float* ref, int hop,
+                        int sample_rate, int frame_index);
+
+static void test_projection_kernels(void) {
+    enum { N = 17 };
+    Complex weights[N];
+    Complex input[N];
+    Complex echo[N];
+    Complex acc_scalar[N];
+    Complex acc_dispatch[N];
+    Complex residual_scalar[N];
+    Complex residual_dispatch[N];
+    float r2[N];
+    float comfort[N];
+    float comfort_scalar[N];
+    float comfort_dispatch[N];
+    float mag2_scalar[N];
+    float mag2_dispatch[N];
+    int i;
+
+    for (i = 0; i < N; ++i) {
+        float x = (float)(i + 1);
+        weights[i].r = 0.03125f * x;
+        weights[i].i = -0.015625f * (float)(i % 5);
+        input[i].r = 0.0078125f * (float)(i - 8);
+        input[i].i = 0.00390625f * (float)(7 - i);
+        echo[i].r = 0.002f * (float)(i - 6);
+        echo[i].i = -0.001f * (float)(i + 2);
+        r2[i] = 1.0e-5f * x;
+        comfort[i] = (i % 4 == 0) ? -0.25f : 0.01f * x;
+        acc_scalar[i].r = acc_dispatch[i].r = 0.125f * x;
+        acc_scalar[i].i = acc_dispatch[i].i = -0.0625f * x;
+        comfort_scalar[i] = comfort_dispatch[i] = 0.5f * x;
+    }
+    /* Explicitly exercise both no-phase fallback shapes and a zero R2 bin. */
+    echo[0].r = echo[0].i = 0.0f;
+    echo[1].r = 1.0e-21f;
+    echo[1].i = -1.0e-21f;
+    r2[2] = 0.0f;
+
+    four_aec_projection_cmac_scalar(
+        acc_scalar, weights, input, N);
+    four_aec_projection_cmac(
+        acc_dispatch, weights, input, N);
+    CHECK(memcmp(acc_scalar, acc_dispatch, sizeof(acc_scalar)) == 0,
+          "context complex-MAC SIMD matches scalar bytes");
+
+    four_aec_complex_mag2_scalar(mag2_scalar, input, N);
+    four_aec_complex_mag2(mag2_dispatch, input, N);
+    CHECK(memcmp(mag2_scalar, mag2_dispatch, sizeof(mag2_scalar)) == 0,
+          "context magnitude-squared SIMD matches scalar bytes");
+
+    four_aec_residual_vector_scalar(
+        residual_scalar, echo, r2, N);
+    four_aec_residual_vector(
+        residual_dispatch, echo, r2, N);
+    CHECK(memcmp(
+              residual_scalar, residual_dispatch,
+              sizeof(residual_scalar)) == 0,
+          "residual projection SIMD matches scalar bytes");
+
+    four_aec_comfort_accumulate_scalar(
+        comfort_scalar, weights, comfort, N);
+    four_aec_comfort_accumulate(
+        comfort_dispatch, weights, comfort, N);
+    CHECK(memcmp(
+              comfort_scalar, comfort_dispatch,
+              sizeof(comfort_scalar)) == 0,
+          "comfort projection SIMD matches scalar bytes");
+
+    /* n=0 is part of every header kernel's boundary contract. */
+    four_aec_projection_cmac(acc_dispatch, weights, input, 0);
+    four_aec_complex_mag2(mag2_dispatch, input, 0);
+    four_aec_residual_vector(residual_dispatch, echo, r2, 0);
+    four_aec_comfort_accumulate(
+        comfort_dispatch, weights, comfort, 0);
+    CHECK(1, "projection kernels accept an empty range");
+}
+
+static void test_trusted_spectrum_path(void) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* reconstructed = NULL;
+    FourAecNrRes* trusted = NULL;
+    FourAecNrResPreFrame reconstructed_pre;
+    FourAecNrResPreFrame trusted_pre;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* reconstructed_out = NULL;
+    float* trusted_out = NULL;
+    Complex* weights = NULL;
+    Complex* trusted_spectrum = NULL;
+    int hop;
+    int n_freqs;
+    int frame;
+    int ch;
+    int k;
+
+    cfg.fft_size = 256;
+    cfg.enable_cng = 0;
+    reconstructed = four_aec_nr_res_create(&cfg);
+    trusted = four_aec_nr_res_create(&cfg);
+    CHECK(reconstructed && trusted,
+          "trusted-spectrum parity instances create");
+    if (!reconstructed || !trusted) goto cleanup;
+
+    hop = four_aec_nr_res_hop_size(reconstructed);
+    n_freqs = four_aec_nr_res_n_freqs(reconstructed);
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    reconstructed_out = (float*)calloc((size_t)hop, sizeof(float));
+    trusted_out = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs,
+        sizeof(Complex));
+    trusted_spectrum = (Complex*)calloc(
+        (size_t)n_freqs, sizeof(Complex));
+    CHECK(microphones && ref && reconstructed_out && trusted_out &&
+              weights && trusted_spectrum,
+          "trusted-spectrum parity buffers allocate");
+    if (!microphones || !ref || !reconstructed_out || !trusted_out ||
+        !weights || !trusted_spectrum) goto cleanup;
+
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+        for (k = 0; k < n_freqs; ++k) {
+            Complex* w = weights + (size_t)ch * n_freqs + k;
+            w->r = 0.20f + 0.025f * (float)ch;
+            w->i = 0.0001f * (float)((k % 7) - 3) * (float)ch;
+        }
+    }
+
+    for (frame = 0; frame < 4; ++frame) {
+        fill_inputs(microphones, ref, hop, 16000, frame);
+        CHECK(four_aec_nr_res_process_pre(
+                  reconstructed, microphones, ref, &reconstructed_pre) ==
+                  FOUR_AEC_NR_RES_OK &&
+              four_aec_nr_res_process_pre(
+                  trusted, microphones, ref, &trusted_pre) ==
+                  FOUR_AEC_NR_RES_OK,
+              "trusted-spectrum parity pre stages succeed");
+        memset(
+            trusted_spectrum, 0,
+            (size_t)n_freqs * sizeof(Complex));
+        for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+            four_aec_projection_cmac_scalar(
+                trusted_spectrum,
+                weights + (size_t)ch * n_freqs,
+                trusted_pre.linear_spectra[ch], n_freqs);
+        }
+        CHECK(four_aec_nr_res_process_post(
+                  reconstructed, &reconstructed_pre.token,
+                  weights, reconstructed_out) == FOUR_AEC_NR_RES_OK &&
+              four_aec_nr_res_process_post_trusted_spectrum(
+                  trusted, &trusted_pre.token, weights,
+                  trusted_spectrum, trusted_out) == FOUR_AEC_NR_RES_OK,
+              "trusted and reconstructed post stages succeed");
+        CHECK(memcmp(
+                  reconstructed_out, trusted_out,
+                  (size_t)hop * sizeof(float)) == 0,
+              "trusted spectrum skips reconstruction without output drift");
+    }
+
+cleanup:
+    free(trusted_spectrum);
+    free(weights);
+    free(trusted_out);
+    free(reconstructed_out);
+    free(ref);
+    free(microphones);
+    four_aec_nr_res_destroy(trusted);
+    four_aec_nr_res_destroy(reconstructed);
 }
 
 static void fill_inputs(float* microphones, float* ref, int hop,
@@ -568,6 +743,8 @@ cleanup:
 }
 
 int main(void) {
+    test_projection_kernels();
+    test_trusted_spectrum_path();
     test_invalid_configs();
     test_cross_instance_token();
     test_pool_reinit_token_rejected();

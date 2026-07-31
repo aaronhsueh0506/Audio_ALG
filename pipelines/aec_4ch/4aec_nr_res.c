@@ -29,10 +29,12 @@
 #include <stddef.h>
 
 #include "4aec_nr_res.h"
+#include "4aec_nr_res_internal.h"
 #include "aec3_balanced_config.h"
 #include "fft_wrapper.h"
 #include "mem_align.h"
 #include "suppression_gain.h"
+#include "4aec_projection_kernels.h"
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -130,9 +132,8 @@ struct FourAecNrRes {
     FourAecNrResDelayState last_delay;
 
     Complex* fused_error;
-    Complex* fused_echo;
     Complex* fused_near;
-    Complex* fused_far;
+    Complex* residual_work;
     Complex* output_spec;
     float* fused_r2;
     float* fused_comfort;
@@ -320,11 +321,9 @@ static int carve_working_buffers(FourAecNrRes* p,
 
     p->fused_error =
         (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
-    p->fused_echo =
-        (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
     p->fused_near =
         (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
-    p->fused_far =
+    p->residual_work =
         (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
     p->output_spec =
         (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
@@ -359,8 +358,8 @@ static int carve_working_buffers(FourAecNrRes* p,
     return p->linear_interleaved && p->mic_lane && p->lane_out &&
            p->aligned_ref && p->render_i16 &&
            p->delay_capture && p->delay_render &&
-           p->fused_error && p->fused_echo && p->fused_near &&
-           p->fused_far && p->output_spec &&
+           p->fused_error && p->fused_near &&
+           p->residual_work && p->output_spec &&
            p->fused_r2 && p->fused_comfort && p->post_near_power &&
            p->nr_gain && p->total_gain && p->extra_noise &&
            p->error_power && p->synth_window && p->ifft_buffer &&
@@ -420,7 +419,7 @@ static size_t pipeline_buffer_size(
     for (i = 0; i < 6; ++i)
         total = ck_field_size(total, (size_t)hop, sizeof(float));
 
-    for (i = 0; i < 5; ++i)
+    for (i = 0; i < 4; ++i)
         total = ck_field_size(total, (size_t)n, sizeof(Complex));
     for (i = 0; i < 7; ++i)
         total = ck_field_size(total, (size_t)n, sizeof(float));
@@ -528,7 +527,7 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
     hash = fnv1a_str(
         "|carve:self,aec0,aec1,aec2,aec3,nr,fft,linear,hop6,"
-        "complex5,float7,fftfloat3,snapshot4x6,postsg,delayring",
+        "complex4,float7,fftfloat3,snapshot4x6,postsg,delayring",
         hash);
     hash = fnv1a_str("|align16", hash);
     return hash;
@@ -709,18 +708,6 @@ static int inputs_finite(const float* data, size_t count) {
         if (!isfinite(data[i])) return 0;
     }
     return 1;
-}
-
-static Complex complex_mul(Complex a, Complex b) {
-    Complex out;
-    out.r = a.r * b.r - a.i * b.i;
-    out.i = a.r * b.i + a.i * b.r;
-    return out;
-}
-
-static void complex_accumulate(Complex* dst, Complex value) {
-    dst->r += value.r;
-    dst->i += value.i;
 }
 
 static int complex_close(Complex a, Complex b) {
@@ -975,12 +962,22 @@ static int validate_weights(const FourAecNrRes* p,
     return isfinite(sum) && sum > 1e-12f;
 }
 
+static int complex_vector_finite(const Complex* values, int count) {
+    int i;
+    if (!values || count < 0) return 0;
+    for (i = 0; i < count; ++i) {
+        if (!isfinite(values[i].r) || !isfinite(values[i].i)) return 0;
+    }
+    return 1;
+}
+
 static int fuse_contexts(FourAecNrRes* p,
-                              const Complex* weights,
-                              int* all_converged,
-                              float* max_dt,
-                              float* max_saturation,
-                              float* far_power) {
+                         const Complex* weights,
+                         const Complex* trusted_beamformed_error,
+                         int* all_converged,
+                         float* max_dt,
+                         float* max_saturation,
+                         float* far_power) {
     int n = p->n_freqs;
     int k;
     int ch;
@@ -991,7 +988,23 @@ static int fuse_contexts(FourAecNrRes* p,
     *max_saturation = p->snapshots[0].saturation_level;
     *far_power = base_far_power;
 
+    if (trusted_beamformed_error) {
+        if (!complex_vector_finite(trusted_beamformed_error, n)) return 0;
+        memcpy(
+            p->fused_error, trusted_beamformed_error,
+            (size_t)n * sizeof(Complex));
+    } else {
+        memset(p->fused_error, 0, (size_t)n * sizeof(Complex));
+    }
+    memset(p->fused_near, 0, (size_t)n * sizeof(Complex));
+    /* output_spec is scratch for the coherent residual vector until
+     * run_post_res_and_nr() overwrites every bin with the final spectrum. */
+    memset(p->output_spec, 0, (size_t)n * sizeof(Complex));
+    memset(p->fused_comfort, 0, (size_t)n * sizeof(float));
+
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+        const Complex* lane_weights =
+            weights + (size_t)ch * (size_t)n;
         float delta = fabsf(
             p->snapshots[ch].far_power - base_far_power);
         float scale = 1.0f + fabsf(base_far_power);
@@ -1002,61 +1015,32 @@ static int fuse_contexts(FourAecNrRes* p,
             *max_dt = p->snapshots[ch].dt_indicator;
         if (p->snapshots[ch].saturation_level > *max_saturation)
             *max_saturation = p->snapshots[ch].saturation_level;
-    }
 
-    for (k = 0; k < n; ++k) {
-        Complex error = {0.0f, 0.0f};
-        Complex echo = {0.0f, 0.0f};
-        Complex near = {0.0f, 0.0f};
-        Complex residual = {0.0f, 0.0f};
-        float comfort = 0.0f;
-        Complex far0 = p->snapshots[0].far_spec[k];
-
-        for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-            Complex w = weights[(size_t)ch * n + k];
-            Complex echo_ch = p->snapshots[ch].echo_spec[k];
-            float echo_mag = sqrtf(
-                echo_ch.r * echo_ch.r + echo_ch.i * echo_ch.i);
-            float residual_amp = sqrtf(
-                fmaxf(p->snapshots[ch].r2[k], 0.0f));
-            Complex residual_ch;
-            float w2;
-
+        for (k = 0; k < n; ++k) {
             if (!complex_close(
-                    p->snapshots[ch].far_spec[k], far0)) return 0;
-
-            complex_accumulate(
-                &error, complex_mul(
-                    w, p->snapshots[ch].error_spec[k]));
-            complex_accumulate(
-                &echo, complex_mul(w, echo_ch));
-            complex_accumulate(
-                &near, complex_mul(
-                    w, p->snapshots[ch].near_spec[k]));
-
-            if (echo_mag > 1e-20f) {
-                residual_ch.r = residual_amp * echo_ch.r / echo_mag;
-                residual_ch.i = residual_amp * echo_ch.i / echo_mag;
-            } else {
-                residual_ch.r = residual_amp;
-                residual_ch.i = 0.0f;
-            }
-            complex_accumulate(
-                &residual, complex_mul(w, residual_ch));
-
-            w2 = w.r * w.r + w.i * w.i;
-            comfort += w2 *
-                fmaxf(p->snapshots[ch].comfort_noise[k], 0.0f);
+                    p->snapshots[ch].far_spec[k],
+                    p->snapshots[0].far_spec[k])) return 0;
         }
 
-        p->fused_error[k] = error;
-        p->fused_echo[k] = echo;
-        p->fused_near[k] = near;
-        p->fused_far[k] = far0;
-        p->fused_r2[k] = fmaxf(
-            residual.r * residual.r + residual.i * residual.i, 0.0f);
-        p->fused_comfort[k] = fmaxf(comfort, 0.0f);
+        if (!trusted_beamformed_error) {
+            four_aec_projection_cmac(
+                p->fused_error, lane_weights,
+                p->snapshots[ch].error_spec, n);
+        }
+        four_aec_projection_cmac(
+            p->fused_near, lane_weights,
+            p->snapshots[ch].near_spec, n);
+        four_aec_residual_vector(
+            p->residual_work, p->snapshots[ch].echo_spec,
+            p->snapshots[ch].r2, n);
+        four_aec_projection_cmac(
+            p->output_spec, lane_weights, p->residual_work, n);
+        four_aec_comfort_accumulate(
+            p->fused_comfort, lane_weights,
+            p->snapshots[ch].comfort_noise, n);
     }
+
+    four_aec_complex_mag2(p->fused_r2, p->output_spec, n);
     return 1;
 }
 
@@ -1075,14 +1059,11 @@ static int run_post_res_and_nr(
     int k;
     float nf_eff;
 
+    four_aec_complex_mag2(p->error_power, p->fused_error, n);
+    four_aec_complex_mag2(p->post_near_power, p->fused_near, n);
     for (k = 0; k < n; ++k) {
-        float er = p->fused_error[k].r;
-        float ei = p->fused_error[k].i;
-        float nr = p->fused_near[k].r;
-        float ni = p->fused_near[k].i;
-        float e2 = er * er + ei * ei;
-        float n2 = nr * nr + ni * ni;
-        p->error_power[k] = e2;
+        float e2 = p->error_power[k];
+        float n2 = p->post_near_power[k];
         p->post_near_power[k] =
             (all_converged ? fminf(e2, n2) : n2) *
             PSD_SCALE;
@@ -1182,10 +1163,11 @@ static int run_post_res_and_nr(
     return inputs_finite(out, (size_t)hop);
 }
 
-int four_aec_nr_res_process_post(
+static int process_post_impl(
     FourAecNrRes* p,
     const FourAecNrResFrameToken* token,
     const Complex* weights,
+    const Complex* trusted_beamformed_error,
     float* out) {
     int all_converged;
     float max_dt;
@@ -1200,7 +1182,8 @@ int four_aec_nr_res_process_post(
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
 
     if (!fuse_contexts(
-            p, weights, &all_converged, &max_dt,
+            p, weights, trusted_beamformed_error,
+            &all_converged, &max_dt,
             &max_saturation, &far_power)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
@@ -1215,6 +1198,25 @@ int four_aec_nr_res_process_post(
     p->pending = 0;
     memset(&p->pending_token, 0, sizeof(p->pending_token));
     return FOUR_AEC_NR_RES_OK;
+}
+
+int four_aec_nr_res_process_post(
+    FourAecNrRes* p,
+    const FourAecNrResFrameToken* token,
+    const Complex* weights,
+    float* out) {
+    return process_post_impl(p, token, weights, NULL, out);
+}
+
+int four_aec_nr_res_process_post_trusted_spectrum(
+    FourAecNrRes* p,
+    const FourAecNrResFrameToken* token,
+    const Complex* weights,
+    const Complex* beamformed_error,
+    float* out) {
+    if (!beamformed_error) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    return process_post_impl(
+        p, token, weights, beamformed_error, out);
 }
 
 /* ============================================================================

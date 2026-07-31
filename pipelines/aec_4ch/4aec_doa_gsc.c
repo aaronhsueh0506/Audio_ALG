@@ -16,6 +16,7 @@
 #include <stddef.h>
 
 #include "4aec_doa_gsc.h"
+#include "4aec_nr_res_internal.h"
 #include "gsc.h"
 #include "srp.h"
 #include "steering.h"
@@ -49,6 +50,7 @@ struct FourAecDoaGsc {
     kiss_fft_cpx* gsc_spectrum;
     kiss_fft_cpx* gsc_weights;
     Complex* core_weights;
+    Complex* core_spectrum;
 
     float noise_power;
     int vad_hangover;
@@ -246,8 +248,11 @@ FourAecDoaGsc* four_aec_doa_gsc_create(
         (kiss_fft_cpx*)malloc(spectral_count * sizeof(kiss_fft_cpx));
     p->core_weights =
         (Complex*)malloc(spectral_count * sizeof(Complex));
+    p->core_spectrum =
+        (Complex*)malloc((size_t)p->n_freqs * sizeof(Complex));
     if (!p->spatial_input || !p->gsc_spectrum ||
-        !p->gsc_weights || !p->core_weights) goto fail;
+        !p->gsc_weights || !p->core_weights ||
+        !p->core_spectrum) goto fail;
     for (int m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m) {
         p->spatial_channels[m] =
             p->spatial_input + (size_t)m * p->n_freqs;
@@ -342,10 +347,23 @@ int four_aec_doa_gsc_process_with_activity(
         four_aec_doa_gsc_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
-    memcpy(p->core_weights, p->gsc_weights,
-           spectral_count * sizeof(Complex));
-    status = four_aec_nr_res_process_post(
-        p->core, &pre.token, p->core_weights, output);
+    /* Complex and kiss_fft_cpx share a pinned two-float layout but are
+     * distinct C struct types.  Assign fields rather than type-punning. */
+    for (size_t i = 0; i < spectral_count; ++i) {
+        p->core_weights[i].r = p->gsc_weights[i].r;
+        p->core_weights[i].i = p->gsc_weights[i].i;
+    }
+    for (int f = 0; f < p->n_freqs; ++f) {
+        p->core_spectrum[f].r = p->gsc_spectrum[f].r;
+        p->core_spectrum[f].i = p->gsc_spectrum[f].i;
+    }
+    /* gsc_spectrum and gsc_weights were produced atomically by the same
+     * gsc_process_with_weights() call above.  Reuse that trusted mono error
+     * instead of reconstructing one weighted sum a second time; the core
+     * still projects near/R2/comfort with those exact weights. */
+    status = four_aec_nr_res_process_post_trusted_spectrum(
+        p->core, &pre.token, p->core_weights,
+        p->core_spectrum, output);
     if (status != FOUR_AEC_NR_RES_OK) {
         four_aec_doa_gsc_reset(p);
         return status;
@@ -429,6 +447,7 @@ void four_aec_doa_gsc_destroy(FourAecDoaGsc* p) {
     free(p->gsc_spectrum);
     free(p->gsc_weights);
     free(p->core_weights);
+    free(p->core_spectrum);
     free(p);
 }
 
