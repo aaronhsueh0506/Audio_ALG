@@ -1,4 +1,4 @@
-"""AEC scenario simulator: renders parent sequences of 7 aligned stems.
+"""AEC scenario simulator: renders parent sequences of 5 aligned stems.
 
 THE SIGNAL MODEL THIS FILE EXISTS TO PRODUCE
 --------------------------------------------
@@ -8,14 +8,25 @@ THE SIGNAL MODEL THIS FILE EXISTS TO PRODUCE
     E     = Y - D_hat    linear error                       <-- RES+NR input
     R     = D - D_hat    residual echo -- audit only, not target
 
-The seven stems stay separated so direct AEC, end-to-end AEC+NR, and
+The five PERSISTED stems stay separated so direct AEC, end-to-end AEC+NR, and
 frozen-linear RES+NR routes can share one source corpus without changing task
 targets. ``model_views.py`` owns the authoritative per-model mapping.
 
-Everything a model may need is derivable from the stems:
-    Y = mic_postclip     X = far_render     D = echo
+Everything a model may need is derivable from the persisted stems:
+    Y = mic_postclip     X = far_render
     S = near_speech      N = local_noise
     S_early = near_target (DeepVQE dereverberation target only)
+
+``D`` (echo) and the pre-clip/AGC ``mic_preclip`` are NOT persisted -- no
+model task reads either one, and no candidate is meant to see an oracle
+residual (a linear AEC estimate is always computed live from
+far_render/mic_postclip, never read off a stored "true" echo). Dropping them
+from every stored chunk cuts the corpus's disk footprint by 2/7. Both are
+still COMPUTED on every render and returned as ``RenderedSequence.audit``, so
+the corpus's central invariants (``mic_preclip == S+N+D``, "echo really is a
+delayed copy of X") stay checked at generation time -- see
+``tests/test_aec_dataset.py``, which verifies them directly against the
+renderer rather than from a packed shard.
 
 REUSE
 -----
@@ -452,9 +463,15 @@ class SequencePlan:
 
 @dataclasses.dataclass
 class RenderedSequence:
-    stems: torch.Tensor              # (7, T) float32, channel order = STEM_ORDER
+    stems: torch.Tensor              # (5, T) float32, channel order = STEM_ORDER; PERSISTED
     chunk_meta: List[dict]
     chunk_samples: int
+    audit: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
+    # 'echo' and 'mic_preclip' -- computed on every render (see this module's
+    # docstring), NEVER written to WAV/shard. gen_aec_dataset.py's WAV writer
+    # only ever touches ``.stems``; this field exists purely so
+    # tests/test_aec_dataset.py can still verify the corpus's central
+    # invariants against a full, un-trimmed render.
 
 
 def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
@@ -899,8 +916,11 @@ class AecSequenceRenderer:
         # touched here, so the pre-clip sum identity survives untouched.
         mic_postclip = mic_postclip.clamp(-0.999, 0.999)
 
-        stems = torch.stack([far_render, echo, near_speech, near_target, noise,
-                             mic_preclip, mic_postclip]).to(torch.float32).contiguous()
+        # far_render, echo, near_speech, near_target, noise and mic_preclip are
+        # already the SAME common scale (prevent_clipping above), so the audit
+        # copies below are exact, not an approximation of what got persisted.
+        stems = torch.stack([far_render, near_speech, near_target, noise,
+                             mic_postclip]).to(torch.float32).contiguous()
         if stems.shape[0] != len(STEM_ORDER):
             raise AssertionError("stem stack does not match STEM_ORDER")
 
@@ -911,8 +931,11 @@ class AecSequenceRenderer:
             near_speaker=self.pools.speaker_of.get(near_paths[0], '') if near_paths else '',
             far_speaker=self.pools.speaker_of.get(far_paths[0], '') if far_paths else '',
         )
-        return RenderedSequence(stems=stems, chunk_meta=chunk_meta,
-                                chunk_samples=self.chunk_samples)
+        return RenderedSequence(
+            stems=stems, chunk_meta=chunk_meta, chunk_samples=self.chunk_samples,
+            audit={'echo': echo.to(torch.float32).contiguous(),
+                  'mic_preclip': mic_preclip.to(torch.float32).contiguous()},
+        )
 
     def _build_meta(self, plan, stems, device, room, rir_id, erl_db, ser_db,
                     snr_db, bulk_delay, delay_jitter, sro_ppm, clipped, agc,

@@ -54,14 +54,24 @@ __all__ = [
 #
 # Fixed, and duplicated nowhere else.  The packed shards record this same tuple
 # under 'stems' so a shard that disagrees can be rejected instead of silently
-# feeding the echo into the near-speech slot.
+# feeding a stem into the wrong slot.
+#
+# ⚠ ``echo`` (D) and ``mic_preclip`` (S+N+D pre-clip/AGC) are DELIBERATELY NOT
+# HERE.  No model task reads either one (model_views.py's build_model_view
+# never touches them), and no candidate wants an oracle residual anyway --
+# an AEC estimate is always computed live from far_render/mic_postclip
+# through a linear_aec callback, never read off a stored "true" echo.  They
+# were dropped from storage to cut the packed corpus's disk footprint by
+# 2/7, keeping every stem a model actually consumes and near_target for
+# DeepVQE-S's dereverberation task. Both are still COMPUTED on every render
+# (aec_dataset.py's RenderedSequence.audit) so the corpus's central
+# invariants -- mic_preclip == S+N+D, echo really is a delayed copy of X --
+# stay verified at generation time; see tests/test_aec_dataset.py.
 STEM_ORDER = (
     'far_render',
-    'echo',
     'near_speech',
     'near_target',
     'local_noise',
-    'mic_preclip',
     'mic_postclip',
 )
 
@@ -246,9 +256,9 @@ def frames_from_seconds(seconds: float, frame_rate: float,
 # ============================================================
 
 class AecStems:
-    """Named access to the ``(..., 7, T)`` stem tensor.
+    """Named access to the ``(..., 5, T)`` stem tensor.
 
-    Channel 1 is the echo and channel 2 is the near speech.  Getting those two
+    Channel 0 is far_render and channel 1 is near_speech.  Getting those two
     the wrong way round produces a model that trains, converges, and cancels
     the talker -- so no project indexes this tensor by number.
     """
@@ -284,11 +294,6 @@ class AecStems:
         return self.stem('far_render')
 
     @property
-    def echo(self) -> torch.Tensor:
-        """D: the echo actually present at the mic (audit/evaluation stem)."""
-        return self.stem('echo')
-
-    @property
     def near_speech(self) -> torch.Tensor:
         """S at the mic, i.e. already through the near-talker's room RIR."""
         return self.stem('near_speech')
@@ -303,11 +308,6 @@ class AecStems:
         return self.stem('local_noise')
 
     @property
-    def mic_preclip(self) -> torch.Tensor:
-        """S + N + D, before any clipping or AGC."""
-        return self.stem('mic_preclip')
-
-    @property
     def mic_postclip(self) -> torch.Tensor:
         """The mic signal a model actually receives."""
         return self.stem('mic_postclip')
@@ -320,9 +320,12 @@ class AecStems:
     #   E = Y - D_hat        by subtraction, never a mask on Y
     #   R = D - D_hat        residual echo; emerges, never a target
     #
-    # ⚠ There is deliberately no ``E`` or ``R`` accessor. Both need D_hat from
-    # the frozen production linear front-end; model_views.py enforces that
-    # contract instead of manufacturing an oracle residual from D.
+    # ⚠ There is deliberately no ``D``, ``E`` or ``R`` accessor here. ``D``
+    # (echo) is not stored at all -- see STEM_ORDER's docstring; it is only
+    # ever available at generation time via
+    # ``aec_dataset.RenderedSequence.audit``. ``E``/``R`` both need ``D_hat``
+    # from the frozen production linear front-end; model_views.py enforces
+    # that contract instead of manufacturing an oracle residual from D.
     @property
     def Y(self) -> torch.Tensor:
         return self.mic_postclip
@@ -330,10 +333,6 @@ class AecStems:
     @property
     def X(self) -> torch.Tensor:
         return self.far_render
-
-    @property
-    def D(self) -> torch.Tensor:
-        return self.echo
 
     @property
     def S(self) -> torch.Tensor:

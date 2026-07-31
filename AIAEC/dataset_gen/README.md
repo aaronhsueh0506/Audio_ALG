@@ -1,23 +1,21 @@
 # AEC dataset generation
 
-Renders acoustic-echo scenarios as **seven separated stems** and packs them into
+Renders acoustic-echo scenarios as **five separated stems** and packs them into
 `.pt` shards. This is the only AIAEC dataset package. It reuses shared DSP from
 the separate `AINR/dataset_gen/` NR generator rather than forking that DSP.
 
-## The seven stems
+## The five stems
 
-Every clip is a `(7, T)` tensor whose channel order is fixed and declared in
+Every clip is a `(5, T)` tensor whose channel order is fixed and declared in
 each shard:
 
 | # | stem | what it is |
 |---|---|---|
 | 0 | `far_render` | **X** — the far-end signal as the device rendered it, i.e. the AEC reference. Digital and clean: the loudspeaker's distortion happens *downstream* of this tap. |
-| 1 | `echo` | **D** — the echo actually present at the mic: X through the loudspeaker nonlinearity, the radiated response, the bulk delay and the room. |
-| 2 | `near_speech` | **S** — the near talker at the mic, already through the room RIR. Reverberant on purpose; that reverberation is desired signal. |
-| 3 | `near_target` | **S_early** — the same near talker and gain through the early/late-suppressed RIR; used only for DeepVQE's published dereverberation target. |
-| 4 | `local_noise` | **N** — ambient noise at the mic. |
-| 5 | `mic_preclip` | `S + N + D`, exactly, before any clipping or AGC. |
-| 6 | `mic_postclip` | **Y** — what a model actually receives, after capture clipping/AGC. |
+| 1 | `near_speech` | **S** — the near talker at the mic, already through the room RIR. Reverberant on purpose; that reverberation is desired signal. |
+| 2 | `near_target` | **S_early** — the same near talker and gain through the early/late-suppressed RIR; used only for DeepVQE's published dereverberation target. |
+| 3 | `local_noise` | **N** — ambient noise at the mic. |
+| 4 | `mic_postclip` | **Y** — what a model actually receives, after capture clipping/AGC. |
 
 The signal model the corpus exists to serve:
 
@@ -37,9 +35,20 @@ variants require the real frozen-linear error and target `S`; CAGCRN targets
 dereverberation. The separated stems keep those task
 boundaries auditable instead of silently training every model on one target.
 
-`mic_preclip` and `mic_postclip` are both stored so that clipping/AGC effects
-can be separated from echo-path nonlinearity — they are two different
-distortions and a model that confuses them will fix the wrong one.
+**⚠ `echo` (D) and `mic_preclip` (S+N+D, pre-clip/AGC) are NOT stored.** No
+model task reads either one — `model_views.py`'s `build_model_view` only ever
+touches `far_render`/`near_speech`/`near_target`/`local_noise`/`mic_postclip` —
+and no candidate is meant to see an oracle residual: a `D_hat` estimate is
+always computed live from `far_render`/`mic_postclip` through a `linear_aec`
+callback, never read off a stored "true" echo. Dropping them cuts the packed
+corpus's disk footprint by 2/7 with zero effect on any model. They are still
+**computed on every render** — `aec_dataset.AecSequenceRenderer.render()`
+returns them under `RenderedSequence.audit` — so the corpus's central
+invariants (`mic_preclip == S+N+D`, "echo really is a delayed copy of X") stay
+verified at generation time; see `tests/test_aec_dataset.py`, which checks them
+directly against the renderer rather than a packed shard. If you need `echo`/
+`mic_preclip` for a one-off analysis, call `AecSequenceRenderer.render()`
+yourself — do not add them back to `STEM_ORDER` for that.
 
 `AecStems` gives these names; nothing indexes the channel axis by number.
 
@@ -81,7 +90,9 @@ data** and not only on the manifest.
 `clipped` and `agc` are separate flags because they are separate distortions —
 one memoryless and instantaneous, one a slow gain with memory — and a model
 that confuses them fixes the wrong one. Together they are exact: `mic_postclip`
-differs from `mic_preclip` **if and only if** one of the two is set.
+differs from `mic_preclip` **if and only if** one of the two is set (`mic_preclip`
+itself is audit-only, see above — `tests/test_aec_dataset.py` checks this
+identity against the renderer directly).
 
 **⚠ `ser_db` / `snr_db` / `erl_db` are sequence-level.** They describe how the
 whole 20–60 s sequence was set up. A single chunk departs from them by a few dB
@@ -254,10 +265,13 @@ fixed sequence list up front, so extending a corpus keeps every sequence it
 already had.
 
 **⚠ `--wav-encoding` defaults to `float32`** because the corpus's central
-invariant is `mic_preclip == near_speech + local_noise + echo`. Quantising seven
-stems independently to `int16` makes that identity hold only to ~1e-4, and
-anything that recomputes one stem from the others inherits the error. `int16`
-halves the disk cost and is fine for listening, not for arithmetic.
+invariant, `mic_preclip == near_speech + local_noise + echo`, is checked at
+generation time against the renderer's un-quantised audit tensors (`echo` and
+`mic_preclip` are not among the persisted stems — see "The five stems" above).
+Quantising the PERSISTED stems to `int16` would still degrade any downstream
+arithmetic that combines them (e.g. an SER recomputed from the stored
+`near_speech`/`local_noise`) by ~1e-4. `int16` halves the disk cost and is fine
+for listening, not for arithmetic.
 
 **⚠ `--workers > 0` on macOS uses spawn.** The shipped CLI has the
 `if __name__ == '__main__'` guard it needs; a script that calls

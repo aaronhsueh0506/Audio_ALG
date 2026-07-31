@@ -68,11 +68,14 @@ from .manifest import (  # noqa: E402
 
 
 WAV_ENCODINGS = {
-    # ⚠ float32 is the default because the corpus's central invariant is
-    # mic_preclip == near_speech + local_noise + echo. Quantising seven stems
-    # independently to int16 makes that identity hold only to ~1e-4, and any
-    # consumer that recomputes a stem from the others inherits that error.
-    # int16 halves the disk cost and is fine for listening, not for arithmetic.
+    # ⚠ float32 is the default because mic_preclip == near_speech +
+    # local_noise + echo is the corpus's central invariant, checked at
+    # generation time against the renderer's un-quantised audit tensors (see
+    # aec_dataset.py's RenderedSequence.audit). Quantising the PERSISTED
+    # stems to int16 would still degrade any downstream arithmetic that
+    # combines them (e.g. an SER/SNR recomputed from the stored near_speech/
+    # local_noise) by ~1e-4. int16 halves the disk cost and is fine for
+    # listening, not for arithmetic.
     'float32': dict(encoding='PCM_F', bits_per_sample=32),
     'int16': dict(encoding='PCM_S', bits_per_sample=16),
 }

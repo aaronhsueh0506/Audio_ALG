@@ -153,8 +153,8 @@ def packed(corpus, tmp_path_factory):
 def test_stem_channel_order_matches_declared_list(packed):
     """The shard's declared order must be THE order, in every shard."""
     assert list(STEM_ORDER) == [
-        'far_render', 'echo', 'near_speech', 'near_target', 'local_noise',
-        'mic_preclip', 'mic_postclip',
+        'far_render', 'near_speech', 'near_target', 'local_noise',
+        'mic_postclip',
     ]
     for split in ('train', 'val'):
         dataset = packed[split]
@@ -168,10 +168,17 @@ def test_stem_channel_order_matches_declared_list(packed):
 
 
 def test_named_view_rejects_a_wrong_order():
-    """A shard claiming a different order must fail loudly, not be reordered."""
+    """A shard claiming a corrupt order (dup + missing name) must fail loudly.
+
+    A genuine PERMUTATION of STEM_ORDER is not actually invalid input --
+    ``AecStems`` looks channels up by name via ``order``, so it resolves a
+    reordered declaration correctly by construction. What must be rejected is
+    an order that duplicates one name and drops another, which is what a
+    truly corrupt shard header looks like.
+    """
     with pytest.raises(ValueError):
         AecStems(torch.zeros(len(STEM_ORDER), 16),
-                 ('echo',) + STEM_ORDER[1:])
+                 (STEM_ORDER[1],) + STEM_ORDER[1:])
     with pytest.raises(ValueError):
         AecStems(torch.zeros(len(STEM_ORDER) - 1, 16))
 
@@ -191,65 +198,103 @@ def test_dereverb_target_is_stored_and_uses_the_same_near_gain(packed):
     assert observed_difference, "early/full near RIR targets were accidentally identical"
 
 
-def test_stems_recombine(packed):
+def test_stems_recombine(corpus):
     """mic_preclip == near_speech + local_noise + echo, for every clip.
 
     This is the corpus's central invariant.  If it fails, the stems have been
-    scaled independently somewhere and no consumer can trust that ``echo`` is
-    the echo that is actually in the microphone signal.
+    scaled independently somewhere and no consumer can trust that the echo
+    generation is what actually reached the microphone.
+
+    ``mic_preclip`` and ``echo`` are NOT persisted (see STEM_ORDER's
+    docstring in aec_features.py) -- they are computed on every render
+    regardless, so this checks the invariant against the renderer's
+    ``RenderedSequence.audit`` output directly rather than a packed shard.
     """
-    for split in ('train', 'val'):
-        dataset = packed[split]
-        for index in range(len(dataset)):
-            view = dataset.stems_of(index)
-            recombined = view.near_speech + view.local_noise + view.echo
-            error = (view.mic_preclip - recombined).abs().max().item()
-            assert error < 1e-5, (
-                f"{split}[{index}] stems do not sum: max error {error:.2e}")
+    renderer = AecSequenceRenderer(
+        corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
+        corpus_seed=SEED)
+    checked = 0
+    for sequence_id, scenario in enumerate(
+            ('double_talk', 'far_only', 'near_only', 'clipping_agc'), start=2001):
+        rendered = renderer.render(SequencePlan(
+            sequence_id=sequence_id, n_chunks=2, scenario=scenario,
+            seed=stable_seed(SEED, 'test', f'recombine-{scenario}')))
+        view = AecStems(rendered.stems)
+        recombined = view.near_speech + view.local_noise + rendered.audit['echo']
+        error = (rendered.audit['mic_preclip'] - recombined).abs().max().item()
+        assert error < 1e-5, f"{scenario}: stems do not sum: max error {error:.2e}"
+        checked += 1
+    assert checked > 0
 
 
-def test_postclip_differs_exactly_where_the_metadata_says(packed):
+def test_postclip_differs_exactly_where_the_metadata_says(corpus):
     """`clipped` / `agc` must describe the data, not sit alongside it.
 
     Both directions matter.  A flag that is set when nothing happened would
     poison an ablation; a flag that is clear when the mic path WAS altered
     would make mic_postclip silently untrustworthy.
+
+    ``mic_preclip`` is audit-only (not persisted, see STEM_ORDER's
+    docstring), so this renders directly rather than reading a packed shard.
     """
-    for split in ('train', 'val'):
-        dataset = packed[split]
-        for index in range(len(dataset)):
-            view = dataset.stems_of(index)
-            meta = dataset.meta(index)
-            altered = not torch.allclose(view.mic_postclip, view.mic_preclip,
-                                         atol=1e-6)
+    renderer = AecSequenceRenderer(
+        corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
+        corpus_seed=SEED)
+    checked = 0
+    for sequence_id, scenario in enumerate(
+            ('double_talk', 'far_only', 'clipping_agc', 'near_only'), start=3001):
+        rendered = renderer.render(SequencePlan(
+            sequence_id=sequence_id, n_chunks=2, scenario=scenario,
+            seed=stable_seed(SEED, 'test', f'postclip-{scenario}')))
+        view = AecStems(rendered.stems)
+        for chunk_index, meta in enumerate(rendered.chunk_meta):
+            window = slice(chunk_index * rendered.chunk_samples,
+                           (chunk_index + 1) * rendered.chunk_samples)
+            altered = not torch.allclose(
+                view.mic_postclip[window], rendered.audit['mic_preclip'][window],
+                atol=1e-6)
             flagged = meta['clipped'] or meta['agc']
             assert altered == flagged, (
-                f"{split}[{index}]: mic altered={altered} but "
+                f"{scenario}[{chunk_index}]: mic altered={altered} but "
                 f"clipped={meta['clipped']} agc={meta['agc']}")
             if meta['sequence_scenario'] == 'clipping_agc':
                 assert meta['clipped'] and meta['agc']
+            checked += 1
+    assert checked > 0
 
 
 # ============================================================
 # Reference dropout
 # ============================================================
 
-def test_ref_dropout_clips_have_a_silent_reference(packed):
+def test_ref_dropout_clips_have_a_silent_reference(corpus):
     """Every chunk LABELLED ref_dropout really has X == 0.
 
     ⚠ This is what the idle-loss term and the "ref == 0 implies output ~= mic"
     gate are trained on.  If a dropout-labelled chunk still carried far-end
     audio, the gate would be supervised by contradictory examples.
+
+    ``echo`` is audit-only (not persisted, see STEM_ORDER's docstring), so
+    this renders directly rather than reading a packed shard.
     """
+    renderer = AecSequenceRenderer(
+        corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
+        corpus_seed=SEED)
     found = 0
-    for split in ('train', 'val'):
-        dataset = packed[split]
-        for index in dataset.indices_where(scenario='ref_dropout'):
-            view = dataset.stems_of(index)
-            assert float(view.far_render.abs().max()) == 0.0
+    for sequence_id in range(4001, 4006):
+        rendered = renderer.render(SequencePlan(
+            sequence_id=sequence_id, n_chunks=3, scenario='ref_dropout',
+            seed=stable_seed(SEED, 'test', f'dropout-silent-{sequence_id}')))
+        view = AecStems(rendered.stems)
+        for chunk_index, meta in enumerate(rendered.chunk_meta):
+            if meta['scenario'] != 'ref_dropout':
+                continue
+            window = slice(chunk_index * rendered.chunk_samples,
+                           (chunk_index + 1) * rendered.chunk_samples)
+            assert float(view.far_render[window].abs().max()) == 0.0
             # With the default ref_dropout_echo_continues_p = 0 the far end is
             # silent end to end, so the mic is exactly S + N.
-            assert float(view.echo.abs().max()) == 0.0
+            assert float(rendered.audit['echo'][window].abs().max()) == 0.0
             found += 1
     assert found > 0, "corpus contains no ref_dropout chunks to check"
 
@@ -491,8 +536,8 @@ def test_renderer_produces_finite_recombinable_three_second_48k_stems(corpus):
     assert rendered.stems.shape == (len(STEM_ORDER), 3 * 48000)
     assert torch.isfinite(rendered.stems).all()
     torch.testing.assert_close(
-        view.mic_preclip,
-        view.near_speech + view.local_noise + view.echo,
+        rendered.audit['mic_preclip'],
+        view.near_speech + view.local_noise + rendered.audit['echo'],
         rtol=0.0, atol=1e-5,
     )
 
@@ -560,7 +605,7 @@ def test_echo_is_really_an_echo_of_the_reference(corpus):
         sequence_id=1001, n_chunks=3, scenario='far_only',
         seed=stable_seed(SEED, 'test', 'echo')))
     view = AecStems(rendered.stems)
-    reference, echo = view.X, view.D
+    reference, echo = view.X, rendered.audit['echo']
 
     n = reference.shape[-1]
     spectrum = (torch.fft.rfft(echo, n=2 * n)
@@ -579,7 +624,8 @@ def test_echo_is_really_an_echo_of_the_reference(corpus):
 
     # far_only means no near talker, so the mic is echo + noise alone.
     assert float(view.near_speech.abs().max()) == 0.0
-    assert torch.allclose(view.mic_preclip, view.echo + view.local_noise, atol=1e-5)
+    assert torch.allclose(rendered.audit['mic_preclip'],
+                          echo + view.local_noise, atol=1e-5)
 
 
 def test_metadata_covers_the_declared_contract(packed):
