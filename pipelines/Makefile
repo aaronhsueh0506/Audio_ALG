@@ -61,8 +61,11 @@
 #   make EXTRA_CFLAGS="..."    # forwarded to all three producers AND this
 #                              # pipeline's own compile
 #   make WERROR=1              # opt-in: -Werror for this file's own TUs
-#   make test                  # build + run test_audio_pipeline (audio_pipeline.h
-#                              # acceptance tests -- see that file's header)
+#   make test                  # build + run mono API, 4aec_nr_res, and
+#                              # board-adapter acceptance tests
+#   make lib4aec_nr_res.a      # separate 4-linear-AEC + post-beam NR/RES
+#                              # wrapper archive
+#   make test_4aec_nr_res      # build the 16/48-kHz 4-channel API test
 #   make NO_STDIO=1 libaudio_pipeline.a   # board-firmware stdio-less build of
 #                              # JUST the library object (see the NO_STDIO
 #                              # comment further down) -- does not link, so it
@@ -840,8 +843,8 @@ endif
 FWD = BACKEND=$(BACKEND) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 
 ifeq ($(AC_LIB),)
-.PHONY: all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline example-adapter libaudio_pipeline.a
-all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline example-adapter libaudio_pipeline.a:
+.PHONY: all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline test_4aec_nr_res example-adapter libaudio_pipeline.a lib4aec_nr_res.a
+all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline test_4aec_nr_res example-adapter libaudio_pipeline.a lib4aec_nr_res.a:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: could not resolve audio_common archive path (AC_DIR=$(AC_DIR) -- is audio_common present as a sibling of Audio_ALG?)" >&2; exit 1; }; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
@@ -888,7 +891,7 @@ endif
 # guard-skip knob must not alias a guarded build), SRCS (P1-4: this
 # Makefile's own compiled sources -- the archive's one member TU plus the
 # CLI/test TUs -- so a source-set change keys to a fresh directory).
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort audio_pipeline.c aec_nr_pipeline.c aec_nr_pipeline_static.c test_audio_pipeline.c example_board_adapter.c)
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort audio_pipeline.c 4aec_nr_res.c aec_nr_pipeline.c aec_nr_pipeline_static.c test_audio_pipeline.c test_4aec_nr_res.c example_board_adapter.c)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT (round-6 review P1): where THIS repo's own keyed
@@ -961,11 +964,20 @@ $(OBJ_DIR)/aec_nr_pipeline_static.o: aec_nr_pipeline_static.c audio_pipeline.h |
 $(OBJ_DIR)/audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
+# Four-linear-AEC + one post-beam NR/RES library. It is kept in a separate
+# archive so libaudio_pipeline.a's established one-member ABI/audit remains
+# unchanged.
+$(OBJ_DIR)/4aec_nr_res.o: 4aec_nr_res.c 4aec_nr_res.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
 # test_audio_pipeline: standalone acceptance test for audio_pipeline.h itself
 # (create-vs-init byte equality incl. a dirty/poisoned pool, destroy
 # idempotence, misaligned/undersized pool rejection, sample-rate whitelist
 # rejection) -- see test_audio_pipeline.c's own header for detail.
 $(OBJ_DIR)/test_audio_pipeline.o: test_audio_pipeline.c audio_pipeline.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/test_4aec_nr_res.o: test_4aec_nr_res.c 4aec_nr_res.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # example_board_adapter: REFERENCE ONLY host simulation of a board-side
@@ -976,6 +988,7 @@ $(OBJ_DIR)/example_board_adapter.o: example_board_adapter.c audio_pipeline.h | _
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 LIB_TARGET = $(BIN_DIR)/libaudio_pipeline.a
+FOUR_LIB_TARGET = $(BIN_DIR)/lib4aec_nr_res.a
 
 # `libaudio_pipeline.a` needs only THIS repo's own object (audio_pipeline.o)
 # -- no producer archive is linked into it -- so, per the dispatch design
@@ -997,13 +1010,20 @@ $(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
 	@echo "libaudio_pipeline.a [$(BACKEND)] -> $@"
 
+.PHONY: lib4aec_nr_res.a
+lib4aec_nr_res.a: $(FOUR_LIB_TARGET)
+
+$(FOUR_LIB_TARGET): $(OBJ_DIR)/4aec_nr_res.o | _cfg_guard
+	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
+	@echo "lib4aec_nr_res.a [$(BACKEND)] -> $@"
+
 # =============================================================================
 # Phase 2 real rules: only defined once AC_LIB (and, transitively, AEC_LIB/
 # NR_LIB, always set together by phase 1's re-invoke) is known.
 # =============================================================================
 ifneq ($(AC_LIB),)
-.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline example-adapter example_board_adapter FORCE
-all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static
+.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static test_audio_pipeline test_4aec_nr_res example-adapter example_board_adapter FORCE
+all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(FOUR_LIB_TARGET)
 
 # test: also builds + runs example_board_adapter (round-3 review B02/R04) --
 # wired into the SAME gate as test_audio_pipeline (not left standalone-only)
@@ -1011,8 +1031,9 @@ all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static
 # its own failure modes (a positive-flow step or negative-demonstration
 # check failing) are exactly the kind of regression this gate exists to
 # catch. `make example-adapter` (below) remains available standalone too.
-test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter
+test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/test_4aec_nr_res $(BIN_DIR)/example_board_adapter
 	"$(abspath $(BIN_DIR))/test_audio_pipeline"
+	"$(abspath $(BIN_DIR))/test_4aec_nr_res"
 	"$(abspath $(BIN_DIR))/example_board_adapter"
 
 # example-adapter (round-3 review B02/R04): build + RUN the REFERENCE ONLY
@@ -1041,6 +1062,7 @@ libs: $(AC_LIB) $(AEC_LIB) $(NR_LIB)
 aec_nr_pipeline: $(BIN_DIR)/aec_nr_pipeline
 aec_nr_pipeline_static: $(BIN_DIR)/aec_nr_pipeline_static
 test_audio_pipeline: $(BIN_DIR)/test_audio_pipeline
+test_4aec_nr_res: $(BIN_DIR)/test_4aec_nr_res
 
 FORCE:
 
@@ -1080,6 +1102,10 @@ $(BIN_DIR)/aec_nr_pipeline_static: $(OBJ_DIR)/aec_nr_pipeline_static.o $(LIB_TAR
 $(BIN_DIR)/test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
 	@echo "test_audio_pipeline [$(BACKEND)] -> $@"
+
+$(BIN_DIR)/test_4aec_nr_res: $(OBJ_DIR)/test_4aec_nr_res.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_4aec_nr_res.o $(FOUR_LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+	@echo "test_4aec_nr_res [$(BACKEND)] -> $@"
 
 $(BIN_DIR)/example_board_adapter: $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
@@ -1284,7 +1310,7 @@ audit-no-stdio-stack:
 # (direct invocation skips the lock) and goes through the same
 # three-producer phase-1 dispatch as `all`/`test`.
 # =============================================================================
-PUBLISH_ARTIFACTS = $(LIB_TARGET) $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static
+PUBLISH_ARTIFACTS = $(LIB_TARGET) $(FOUR_LIB_TARGET) $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static
 DIST_BACKEND_DIR  = $(DIST_ROOT)/$(BACKEND)
 DIST_LOCK         = $(DIST_ROOT)/.lock.$(BACKEND)
 
@@ -1644,7 +1670,7 @@ endif
 # (publish is a deliberate release, not a build cache).
 clean:
 	rm -rf $(OBJ_ROOT) $(BIN_ROOT)
-	rm -f aec_nr_pipeline aec_nr_pipeline_static libaudio_pipeline.a test_audio_pipeline
+	rm -f aec_nr_pipeline aec_nr_pipeline_static libaudio_pipeline.a lib4aec_nr_res.a test_audio_pipeline test_4aec_nr_res
 
 # clean-all: full nuke -- this dir's own artifacts plus all three
 # submodule/shared build trees (lib/aec, lib/nr, audio_common). clean-libs is

@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Audio_ALG 架構說明 — AEC + NR + Post-filter</title>
+<title>Audio_ALG 架構說明 — linear AEC + echo-aware NR/RES</title>
 <style>
   :root {
     --bg: #fafafa;
@@ -137,7 +137,7 @@
 <header>
   <div class="container">
     <h1>Audio_ALG 架構說明</h1>
-    <p>單通道全雙工語音增強 Pipeline — AEC + NR + Post-filter</p>
+    <p>單通道全雙工語音增強 Pipeline — linear AEC + echo-aware NR/RES gain fusion</p>
     <p style="font-size: 13px; opacity: 0.75; margin-top: 12px;">
       AEC v2.5.0 (PBFDKF + Shadow + RES C/Python aligned)
       &nbsp;·&nbsp; NR v3 (MMSE-LSA + MCRA + SPP)
@@ -147,6 +147,12 @@
 </header>
 
 <div class="container">
+
+<div class="note">
+  <strong>範圍：</strong>本頁只說明 conventional mono pipeline，不是 AINR、
+  AIAEC 或 4-channel signal-grid contract。實際 API、memory sizing 與 tuning
+  以 <a href="../pipelines/README.md">pipelines/README.md</a> 為準。
+</div>
 
 <div class="toc">
   <strong>目錄</strong>
@@ -165,7 +171,7 @@
 <h2 id="overview">1. 整體架構與訊號流</h2>
 
 <div class="panel">
-<p>Pipeline 共四個處理階段，每 frame 處理 10 ms（160 samples @ 16 kHz）：</p>
+<p>Pipeline 共四個處理階段，每次 process 一個 10 ms hop（160 samples @ 16 kHz）；分析 frame 為 20 ms（320 samples），FFT zero-pad 到 512：</p>
 
 <div class="figure">
 <svg viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
@@ -408,7 +414,7 @@
   <tr><th>項目</th><th>值</th></tr>
   <tr><td>block_size</td><td>320 samples (= 2 × hop)</td></tr>
   <tr><td>fft_size</td><td>512 (next pow2)</td></tr>
-  <tr><td>n_partitions</td><td>filter_length ÷ hop ≈ 4 (預設 FL=512)</td></tr>
+  <tr><td>n_partitions</td><td>ceil(filter_length ÷ hop) = 6（16 kHz 預設 FL=832）</td></tr>
   <tr><td>Kalman Q (process noise)</td><td>1e−3 (high), 1e−5 (low)</td></tr>
   <tr><td>P_MAX</td><td>0.5 (state covariance ceiling)</td></tr>
 </table>
@@ -842,15 +848,15 @@ G<sub>RES</sub>[k] = clamp((enr<sub>s</sub> − ENR) / (enr<sub>s</sub> − enr<
 <table>
   <tr><th>項目</th><th>AEC</th><th>NR</th><th>備註</th></tr>
   <tr><td>取樣率</td><td>8 / 16 / 48 kHz</td><td>8 / 16 / 48 kHz</td><td>單通道</td></tr>
-  <tr><td>Frame / Hop</td><td colspan="2">8k 256/128；16k 512/256（可選256/128）；48k 1024/512</td><td>frame=FFT、50% overlap、不補零</td></tr>
+  <tr><td>Frame / Hop</td><td colspan="2">8k 160/80；16k 320/160；48k 960/480</td><td>20 ms frame、10 ms hop</td></tr>
   <tr><td>FFT size</td><td>256 / 512 / 1024</td><td>256 / 512 / 1024</td><td>kiss_fft single precision</td></tr>
-  <tr><td>Algorithmic delay</td><td>RES 約一個 grid hop</td><td>framing 約一個 grid frame</td><td>依拓樸與所選 grid 計算，不是固定20 ms</td></tr>
+  <tr><td>Algorithmic delay</td><td>AEC hop 約 10 ms</td><td>final OLA 再約 10 ms</td><td>完整 mono pipeline 約 20 ms，不含裝置 I/O／resampler／OS scheduling</td></tr>
   <tr><td>記憶體 (核心)</td><td>~200 KB (main+shadow)</td><td>~50 KB</td><td>FFT + 權重 + 緩衝</td></tr>
   <tr><td>記憶體 (含後處理)</td><td>~280 KB (含 RES + delay est)</td><td>+64 KB (MCRA min buffer)</td><td>L=32, n_freqs=257</td></tr>
   <tr><td>每 frame 計算量</td><td>2 × 512-FFT + Kalman update<br>(257 bins × 4 partitions)</td><td>2 × 512-FFT<br>+ MCRA + SPP + LSA</td><td></td></tr>
 </table>
 
-<h3>6.2 AEC 收斂時間 (PBFDKF + Shadow, FL=512)</h3>
+<h3>6.2 AEC 收斂時間 (PBFDKF + Shadow, 16 kHz FL=832)</h3>
 
 <table>
   <tr><th>階段</th><th>時間</th><th>條件</th></tr>
@@ -1004,14 +1010,15 @@ ONNX，<strong>無 harness pre-align</strong>（讓 AEC 線上 <code>EchoPathDel
 
 <p style="margin-top: 16px;">完整限制詳見：</p>
 <ul>
-  <li><a href="../../AEC/README.md">AEC README — 已知限制</a></li>
-  <li><a href="../../AEC/docs/aec_improve_v13.md">AEC v13 — Stationary DT 修正紀錄</a></li>
-  <li><a href="../../NR/README.md">NR README — SPP+OMLSA 限制</a></li>
+  <li><a href="../lib/aec/README.md">AEC submodule README — 已知限制</a></li>
+  <li><a href="../lib/nr/README.md">NR submodule README — SPP+OMLSA 限制</a></li>
+  <li><a href="../pipelines/README.md">Pipeline README — 現行整合契約</a></li>
 </ul>
 </div>
 
 <footer style="text-align: center; color: var(--muted); padding: 32px 0; border-top: 1px solid var(--border); margin-top: 48px;">
-  Audio_ALG 架構說明 · 對應 AEC v2.5.0 · NR v3 · 2026-04
+  Audio_ALG conventional mono architecture · current contract:
+  pipelines/README.md · reviewed 2026-07-31
 </footer>
 
 </div>

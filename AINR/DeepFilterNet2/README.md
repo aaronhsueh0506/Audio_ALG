@@ -1,0 +1,75 @@
+# DeepFilterNet2
+
+Current 48 kHz DFN2 branch with restored cascade/alpha output composition.
+
+## Architecture contract
+
+The network predicts a full-band ERB mask, low-band five-tap complex
+deep-filter coefficients, and a sigmoid alpha:
+
+```text
+input spectrum
+    → full-band ERB mask
+    → apply the five-tap complex DF to masked bins 0..95
+    → alpha * deep-filtered + (1 - alpha) * masked
+```
+
+Bins above the DF range keep the ERB-masked spectrum. This is a cascade; it is
+not the DFN3 low/high parallel band split.
+
+Default signal contract:
+
+- 48 kHz;
+- FFT/window/hop `1024/1024/512`;
+- 32 ERB bands;
+- `df_bins=96`, `df_order=5`;
+- mask/DF lookahead `1/1`;
+- optional post-filter disabled.
+
+The one-frame lookahead is a deliberate latency choice. Upstream releases use
+2/2; changing it requires retraining and a new checkpoint contract.
+
+## Checkpoints
+
+Current model version:
+
+```text
+dfn2_fmajor_pathway_cascade_alpha_no_lsnr_v6
+```
+
+The feature version remains shared with the preserved DFN3 branch, but the
+model version does not. Old v5 band-split checkpoints belong in
+`../DeepFilterNet3/` and must not be renamed or force-loaded here.
+
+`train.py --resume` and `denoise.py --model` validate the serialized signal,
+feature, and model contract before loading.
+
+## Train and infer
+
+```bash
+python3 train.py --config config.ini --packed-dir /path/to/data_48k
+
+python3 denoise.py --config config.ini \
+    --model /path/to/dfn2_checkpoint.pt \
+    --input input_48k.wav --output output_48k.wav
+```
+
+Use `AINR/dataset_gen` to produce or pack the 48 kHz noisy/clean pairs.
+
+## Debugging excessive low-frequency suppression
+
+Check these in order:
+
+1. confirm the checkpoint reports the v6 cascade/alpha model version;
+2. log ERB mask, alpha, and low-band DF output separately;
+3. compare speech-only, noise-only, and steady low-frequency-noise cohorts;
+4. verify error/far or clip-to-clip EMA state is not shared or leaked;
+5. compare the same 48 kHz dataset against the DFN3 branch.
+
+If the ERB-masked low band is healthy but the alpha-composed output collapses,
+the issue is in the DF/alpha path rather than the shared dataset. If both
+branches fail on the same cohorts, audit low-frequency corpus coverage,
+speech-only sampling, SNR distribution, and target contamination.
+
+The full upstream-alignment and training-stability record is in
+[`UPSTREAM_ALIGNMENT.md`](UPSTREAM_ALIGNMENT.md).

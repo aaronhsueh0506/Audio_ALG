@@ -1,8 +1,13 @@
 # Audio_ALG C User Manual（繁體中文）
 
-本手冊說明 `pipelines/aec_nr_pipeline.c` 的建置、命令列使用方式，以及如何用目前 AEC／NR submodule 的公開 C API 組合出相同的 production pipeline。
+本手冊說明 conventional mono pipeline 的建置、命令列使用方式，以及
+`pipelines/audio_pipeline.h` 的 heap／caller-owned-pool 兩種整合方式；
+四麥克風 C seam 另列於第 1.1 節。
 
-> 驗證基準：Audio_ALG commit `3a055fa`（`main`，2026-07-10）；`lib/aec` commit `9b0b98d`；`lib/nr` commit `de37b1d`。更新 submodule 後若 API 或 tuning 改變，請重新對照 `pipelines/aec_nr_pipeline.c`。
+> 現行 API 與 sizing contract 以 `pipelines/audio_pipeline.h`、
+> `pipelines/audio_pipeline.c` 和 `pipelines/README.md` 為準。更新 submodule
+> 或 tuning 後，必須重新建置並執行 pipeline tests；不要只依賴本手冊中的
+> 範例常數。
 
 ## 1. 目前可用範圍
 
@@ -15,10 +20,40 @@
 - static-memory reference executable：`pipelines/aec_nr_pipeline_static`（source：
   `aec_nr_pipeline_static.c`；單一 caller pool、init 後零 malloc、輸出與 malloc 版
   byte-identical；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
+- reusable API：`pipelines/audio_pipeline.h` / `audio_pipeline.c`
+- linkable archive：config-keyed build directory 內的 `libaudio_pipeline.a`
+- 四麥克風 API：`pipelines/4aec_nr_res.h` / `4aec_nr_res.c`
+- 四麥克風 archive：config-keyed build directory 內的 `lib4aec_nr_res.a`
 
-目前**沒有**已發布的 `audio_pipeline.h`／`AudioPipeline*` library API。`pipelines/PLAN_audio_pipeline_api.md` 是設計草案，不是使用者可依賴的介面。
+`pipelines/PLAN_audio_pipeline_api.md` 是 API 實作前的歷史設計草案，
+不是可依賴的介面。已實作的 function、descriptor version、ownership 與
+錯誤行為只以 `audio_pipeline.h` 為準。
 
-需要嵌入產品時，可先直接採用 reference executable；若要包進既有 audio service，請依本手冊第 5 節使用 AEC／NR 已存在的 API 組合 wrapper。
+嵌入產品時優先使用 `AudioPipeline*`：桌面／服務端可用
+`audio_pipeline_create()`，firmware 則以
+`audio_pipeline_get_mem_requirements()` → 對齊配置 →
+`audio_pipeline_init_ex()` 建立 caller-owned-pool instance。第 5 節的
+AEC／NR 直接 wrapper 僅保留給尚未過渡的既有呼叫端。
+
+### 1.1 四麥克風 C seam
+
+`FourAecNrRes*` 是獨立於 `AudioPipeline*` 的 zero-padding-free 介面，只支援：
+
+| 取樣率 | FFT / hop | 資源拓撲 |
+|---|---|---|
+| 16 kHz | 512 / 256 | 1 shared matcher + 4 linear AEC + 1 post-beam RES + 1 NR |
+| 48 kHz | 1024 / 512 | 1 shared matcher + 4 linear AEC + 1 post-beam RES + 1 NR |
+
+呼叫端先用 `four_aec_nr_res_process_pre()` 取得 interleaved `[hop][4]`
+linear output 與 token，交由外部 SRP-PHAT/GSC 更新 channel-major
+`Complex[4][n_freqs]` 有效權重，再用同一 token 呼叫
+`four_aec_nr_res_process_post()` 取得 mono hop。模組不實作 beamformer，
+但會以該組權重一致地投影 error／near／echo／R2 context，再只執行一次
+NR、RES gain fusion 與 iFFT/OLA。
+
+目前只允許一個 in-flight frame；create 可配置 heap，pre/post 不配置記憶體，
+尚未提供 caller-owned-pool 版本。完整 contract、權重 convention 與 parity
+限制見 [`../pipelines/aec_4ch/README.md`](../pipelines/aec_4ch/README.md)。
 
 ## 2. Production path
 
@@ -65,6 +100,8 @@ git submodule update --init --recursive
 # 從 Audio_ALG 根目錄執行 — 預設 target 會建 libs + 兩個 binary
 make -C pipelines            # aec_nr_pipeline + aec_nr_pipeline_static
 make -C pipelines BACKEND=ne10   # NE10 FFT 後端（obj/ 依 backend+參數雜湊分開目錄，免手動 clean-libs）
+make -C pipelines lib4aec_nr_res.a
+make -C pipelines test_4aec_nr_res
 ```
 
 若自行編譯 wrapper，沿用目前 Makefile 的 include／link layout（注意：兩個 library 都依賴
@@ -432,7 +469,12 @@ audio_alg_destroy(&pipeline);
 
 `AecResContext` pointer 只保證在下一次 AEC process/reset/destroy 前有效。不要修改、free 或跨 hop 保存 pointer；如需非同步分析，複製內容。
 
-16 kHz 預設為 `hop=256`、`frame_size=fft_size=512`、`n_freqs=257`；低算量 grid 為 256/128/129 bins。48 kHz 為 1024/512/513 bins。不要把尺寸寫死。
+Conventional mono pipeline 由 20 ms frame／10 ms hop 推導尺寸：
+8 kHz 為 frame/hop/FFT `160/80/256`，16 kHz 為
+`320/160/512`，48 kHz 為 `960/480/1024`；`n_freqs = FFT/2 + 1`。
+不要把 frame 誤寫成 FFT size，也不要套用 AIAEC 或 4-channel 的
+zero-padding-free 512/256、1024/512 grid。呼叫端應從 API query 實際 hop
+與 bins，而不是寫死。
 
 完整 pipeline 的 final IFFT/OLA 增加約一個 grid hop 延遲；`--aec-only` 走 linear time output，不經這段 final OLA。另需把裝置 I/O buffer、resampler 與 OS scheduling latency 加入產品總預算。
 

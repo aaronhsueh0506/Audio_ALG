@@ -1,6 +1,13 @@
-# Unified Audio Pipeline API（audio_pipeline.h）
+# Archived proposal: Unified Audio Pipeline API
 
-## Context
+> **Historical design only.** The API has been implemented and evolved beyond
+> this proposal. Do not copy declarations or behavior from this file. Current
+> sources of truth are [`audio_pipeline.h`](audio_pipeline.h) and the
+> [Board Integration section](README.md#board-integration). The implemented API
+> includes a versioned caller-owned-pool descriptor and a heap convenience
+> path.
+
+## Original context
 
 AEC 和 NR 是兩個獨立 C 函式庫（libaec + libmmse_lsa），目前串接邏輯在 `aec_nr_pipeline.c` 的 `main()` 裡手動完成。需要包成統一 API，讓外部呼叫者可以：
 

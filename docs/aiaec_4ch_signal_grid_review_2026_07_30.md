@@ -2,6 +2,13 @@
 
 日期：2026-07-30
 
+> **Dated structural audit.** Current model selection and checkpoint rules are
+> maintained in [`../AIAEC/README.md`](../AIAEC/README.md),
+> [`../AINR/README.md`](../AINR/README.md), and
+> [`ai_aec_candidate_matrix.md`](ai_aec_candidate_matrix.md). The DFN-AENR
+> description below was superseded when the local DFN2 cascade/alpha graph was
+> restored.
+
 ## 結論
 
 本輪要求的三個交付面已完成到下列邊界：
@@ -30,7 +37,7 @@
 - `Align_CRUSE`：保留論文的雙 encoder、soft delay distribution、GRU、skip projection、transpose-convolution decoder 與 mic magnitude mask。論文原格點為 16 kHz、320/160；專案改為 power-of-two grid 並維持約一秒的 delay span。作者未公開 code/checkpoint，因此 padding 與 projection width 是明示的 reconstruction。預設 `paper_global` 會使用完整序列證據；即時串流必須選 `causal_running` 並以該模式訓練。
 - `Align_ULCNet`：實作 C-SamFR 的「兩個 FFT bins 一個 subband」取樣、雙 stream、latent cross-attention、FGRU、兩路 temporal GRU 與第二段 complex mask。作者未公開 code/checkpoint；FC activation 等論文未定義處是 reconstruction。
 - `GTCRN_AENR`：GTCRN 主體沿用 audited local port，只把第一層由單譜 9 channels 擴成 error+far 的 18 channels。它是專案 variant，不可宣稱為作者發表的 AEC 模型；目前鎖定 upstream 16 kHz/512/256 ERB grid。
-- `DeepFilterNet_AENR`：DFN mask/deep-filter heads 與 composition 沿用 local DeepFilterNet3-style port，只在 feature boundary 加兩個 1x1 conditioner。conditioner 初始化為 error-only exact pass-through；error/far 必須使用互相獨立的 EMA feature state。這也是專案 variant。
+- `DeepFilterNet_AENR`：目前沿用 local DeepFilterNet2 cascade/alpha graph，只在 feature boundary 加兩個 1x1 conditioner。conditioner 初始化為 error-only exact pass-through；error/far 必須使用互相獨立的 EMA feature state。這也是專案 variant。審查當日的 DFN3-style 描述已被後續架構分流取代。
 - `DeepVQE_S`：完成雙 encoder、約一秒 causal alignment attention、GRU bottleneck、sub-pixel decoder、指定 residual blocks 與 3x3 complex convolving mask。論文原始為 24 kHz/480/240；16/48 kHz power-of-two 版本是 project adaptation。作者未公開 code、loss、GRU width、head count 或 checkpoint。
 - `CAGCRN`：完成雙 residual encoder、CATA、兩組獨立 TF-GRU、TFAG、mirrored decoder 與 CRM。論文的整數 `floor(D)` window 無法由一般 autograd 有效學習，本版改為 differentiable soft delay-window gate；因此可訓練但 checkpoint-incompatible。
 

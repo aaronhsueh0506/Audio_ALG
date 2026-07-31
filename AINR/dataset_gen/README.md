@@ -3,7 +3,7 @@
 Model-independent generator for (noisy, clean) speech-enhancement training
 pairs, living at `AINR/dataset_gen/`. Extracted from the RNNoise-ERB
 dataset-generation chain so one generator can serve multiple models:
-RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2 at 48 kHz.
+RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2/DeepFilterNet3 at 48 kHz.
 
 ## Purpose
 
@@ -22,7 +22,8 @@ and consume the output of this package.
 source paths, segment length, generation/resume controls, mixing, RIR, noise,
 and waveform augmentations. Model architecture, FFT/ERB feature parameters,
 optimizer, training schedule, and loss settings stay in the RNNoise-ERB,
-GTCRN, or DeepFilterNet2 model config that consumes the generated pairs.
+GTCRN, DeepFilterNet2, or DeepFilterNet3 model config that consumes the
+generated pairs.
 
 The optional `[gen] pass_size` limits how many shuffled speech files form one
 generation pass; it is not a training epoch. Omitting it or setting it to `0`
@@ -35,7 +36,7 @@ Use config.ini's `[signal] sr` or override it with `--sample-rate`:
 
 ```text
 16000 Hz → RNNoise-ERB / GTCRN
-48000 Hz → DeepFilterNet2
+48000 Hz → DeepFilterNet2 / DeepFilterNet3
 ```
 
 Run the command separately with different output directories when both are
@@ -171,7 +172,7 @@ cp config.example.ini config.ini
 python3 gen_dataset.py --config config.ini --output data_16k --hours 25 \
     --sample-rate 16000
 
-# DeepFilterNet2
+# DeepFilterNet2 / DeepFilterNet3
 python3 gen_dataset.py --config config.ini --output data_48k --hours 25 \
     --sample-rate 48000
 ```
@@ -250,7 +251,7 @@ python3 pack_dataset.py \
 ```
 
 Use `data_16k/packed.pt` for RNNoise-ERB and `data_48k/packed.pt` for
-DeepFilterNet2.
+DeepFilterNet2 or DeepFilterNet3.
 
 ### Tests
 
@@ -270,5 +271,8 @@ tqdm
 ## Consumers
 
 `../RNNoise-ERB/train.py` imports the shared `PackedDataset` from this package;
-DeepFilterNet2 consumes the corresponding 48 kHz packed copy. Model
-directories do not keep private copies of the augmentation engine.
+DeepFilterNet2 and DeepFilterNet3 consume the corresponding 48 kHz packed
+dataset. Model directories do not keep private copies of the augmentation
+engine. The two DFN branches use different model/checkpoint contracts, but
+they do not require different waveform pairs merely because their output
+composition differs.

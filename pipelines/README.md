@@ -1,12 +1,21 @@
-# C Pipeline: Linear AEC → NR → RES
+# C Pipeline: linear AEC + echo-aware NR/RES gain fusion
 
 ## Architecture
 
 ```
-mic ─┐                       ┌─ aec_out ──┐              ┌─ nr_out ──┐                  ┌─ output
-     ├→ AEC (linear) ────────┤            ├→ NR (MMSE) ──┤           ├→ RES (post) ─────┤
-ref ─┘   PBFDKF+Shadow      └─ context   ┘  LSA+MCRA    └─ gain[]   ┘  echo×nr_gain    └─ final
+mic/ref → linear AEC
+              ├─ E(f) ────────────────→ echo-aware NR ─→ G_nr ─┐
+              └─ AecResContext {R², G_res, CNG, far power} ─────┤
+                                                                ↓
+                                  G_total = min(G_nr, G_res)
+                                  + near-end floor + CNG
+                                                                ↓
+                                                       one iFFT/OLA
 ```
+
+There is no independent time-domain RES filter after NR. `G_res` is calculated
+inside the AEC3 suppression path, exported with the linear residual, fused with
+`G_nr`, and applied once to `E(f)`.
 
 ## Modules
 
@@ -15,6 +24,8 @@ ref ─┘   PBFDKF+Shadow      └─ context   ┘  LSA+MCRA    └─ gain[] 
 | AEC | libaec.a | aec.h | PBFDKF adaptive filter + shadow filter |
 | NR | libmmse_lsa.a | mmse_lsa_denoiser.h | MMSE-LSA + MCRA noise est + SPP |
 | RES | libaec.a (included) | aec.h (`AecResContext`) | Residual echo suppression, folded into AEC's freq-domain seam |
+| Mono integration | libaudio_pipeline.a | audio_pipeline.h | One-mic AEC + NR/RES, heap or caller-owned pool |
+| 4-ch integration | lib4aec_nr_res.a | 4aec_nr_res.h | One shared matcher + four linear AECs + external beamformer weights + one mono NR/RES |
 
 RES is not a standalone module/library — it is exposed as the `AecResContext` seam on
 the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process()`
@@ -24,6 +35,10 @@ output; `aec_get_res_context(a, &ctx)` then exposes `AecResContext` — `echo_sp
 `res_gain` (G_res(f)), `r2` (residual-echo PSD), `comfort_noise`, etc. — so an external caller
 can run AEC(linear) → NR → RES itself. See `lib/aec/c_impl/include/aec.h` (`AecResContext`,
 `aec_get_res_context()`) for the full field list.
+
+The four-channel API is a separate zero-padding-free grid and does not use
+`AudioPipeline`. See [the 4-channel contract](aec_4ch/README.md) and
+[`4aec_nr_res.h`](4aec_nr_res.h) for its synchronous pre/post boundary.
 
 ## Parameter Alignment
 
@@ -139,8 +154,14 @@ BIN="$(make -s print-bin-dir)"
 # bytes each rejected) — each per-rate case runs once per supported rate
 # (8000/16000/48000; 48 kHz uses a reduced hop count, see test_audio_pipeline.c)
 # — AND builds + runs the example_board_adapter smoke test (see "Board
-# Integration" below)
+# Integration" below). It also runs test_4aec_nr_res at both supported
+# 4-channel grids.
 make test
+
+# Build the separate 4-channel wrapper archive or its standalone structural
+# and lifecycle test binary. `make test` above executes that binary.
+make lib4aec_nr_res.a
+make test_4aec_nr_res
 
 # Build + run JUST the REFERENCE ONLY board-adapter example standalone
 # (also runs as part of `make test` above):
@@ -152,11 +173,12 @@ make NO_STDIO=1 libaudio_pipeline.a
 make audit-no-stdio
 ```
 
-`make` also builds `libaudio_pipeline.a` (the linkable pool-sizing/carving/
-processing library both CLIs above are now thin shells over) as a side
-effect of building either binary. See "Board Integration" below for the API
-this exposes to a firmware/board consumer, including the `NO_STDIO=1` build
-knob and `audit-no-stdio` target above.
+`make` builds both `libaudio_pipeline.a` and `lib4aec_nr_res.a`.
+`libaudio_pipeline.a` is the pool-sizing/carving/processing library that both
+mono CLIs wrap; see "Board Integration" below for its firmware API,
+`NO_STDIO=1` knob, and `audit-no-stdio` target. The 4-channel library currently
+has heap construction with allocation-free pre/post processing, but no
+caller-owned-pool constructor.
 
 ## Debugging & Performance Flags
 
