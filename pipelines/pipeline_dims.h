@@ -1,37 +1,32 @@
 /**
- * pipeline_dims.h — shared frame-geometry derivation for the AEC(linear) ->
- * NR -> RES pipeline pair (aec_nr_pipeline.c malloc / aec_nr_pipeline_static.c
- * static-memory). ONE definition of compute_frame_dims() used by BOTH TUs so
- * the two can never diverge again (M6, multi-rate campaign, review F01).
- *
- * Prior bug (the "8 kHz FFT mismatch"): the malloc pipeline seeded its
- * fft_sz doubling loop at a hardcoded 512 (`int fft_sz = 512; while (fft_sz <
- * frame_sz) fft_sz *= 2;`), which happens to equal next-pow2(frame_sz) for
- * every frame_sz > 256 (sr >= ~12.8 kHz) but OVERSHOOTS below that: at 8 kHz
- * frame_sz=160, so the loop never doubles and fft_sz stays 512 (257 bins)
- * while the AEC's own internal grid (aec.c next_pow2(block_size)) correctly
- * lands on 256 (129 bins) — every per-bin loop over the AEC's K=129-length
- * seam arrays (ctx.error_spec/res_gain/r2/comfort_noise) then reads/writes up
- * to 257, well out of bounds.
- *
- * compute_frame_dims() below seeds the doubling loop at 1 (true
- * next-pow2(frame_sz)), matching the AEC's own derivation exactly at EVERY
- * sample rate, and is IDENTICAL to the old hardcoded-512 result whenever
- * frame_sz > 256 (512 @ 16 kHz, 1024 @ 48 kHz) — so this is a strict fix with
- * zero risk to the byte-identical requirement at the rates already verified.
+ * pipeline_dims.h -- one no-padding signal-grid resolver shared by the
+ * traditional AEC -> NR -> RES C pipeline entry points.
  */
 
 #ifndef PIPELINE_DIMS_H
 #define PIPELINE_DIMS_H
 
-static inline void compute_frame_dims(int sr, int* o_hop, int* o_frame_sz,
-                                       int* o_fft_sz, int* o_n_freqs) {
-    int hop      = (int)(0.01f * sr);
-    int frame_sz = 2 * hop;
-    int fft_sz   = 1;
-    while (fft_sz < frame_sz) fft_sz *= 2;
-    *o_hop = hop; *o_frame_sz = frame_sz; *o_fft_sz = fft_sz;
+/* requested_fft == 0 selects the rate default. Returns 0 on success. */
+static inline int compute_frame_dims(int sr, int requested_fft,
+                                     int* o_hop, int* o_frame_sz,
+                                     int* o_fft_sz, int* o_n_freqs) {
+    int fft_sz = requested_fft;
+    if (fft_sz == 0) {
+        fft_sz = (sr == 48000) ? 1024 : (sr == 16000) ? 512
+               : (sr == 8000) ? 256 : 0;
+    }
+
+    if (!((sr == 8000 && fft_sz == 256) ||
+          (sr == 16000 && (fft_sz == 256 || fft_sz == 512)) ||
+          (sr == 48000 && fft_sz == 1024))) {
+        return -1;
+    }
+
+    *o_hop = fft_sz / 2;
+    *o_frame_sz = fft_sz;
+    *o_fft_sz = fft_sz;
     *o_n_freqs = fft_sz / 2 + 1;
+    return 0;
 }
 
 #endif /* PIPELINE_DIMS_H */

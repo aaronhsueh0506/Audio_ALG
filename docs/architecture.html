@@ -842,9 +842,9 @@ G<sub>RES</sub>[k] = clamp((enr<sub>s</sub> − ENR) / (enr<sub>s</sub> − enr<
 <table>
   <tr><th>項目</th><th>AEC</th><th>NR</th><th>備註</th></tr>
   <tr><td>取樣率</td><td>8 / 16 / 48 kHz</td><td>8 / 16 / 48 kHz</td><td>單通道</td></tr>
-  <tr><td>Frame / Hop</td><td>20 ms / 10 ms</td><td>20 ms / 10 ms</td><td>同步</td></tr>
-  <tr><td>FFT size</td><td>512 (PBFDKF)</td><td>512</td><td>kiss_fft single precision</td></tr>
-  <tr><td>Algorithmic delay</td><td>10 ms (1 hop)</td><td>10 ms (1 hop)</td><td>合計 20 ms</td></tr>
+  <tr><td>Frame / Hop</td><td colspan="2">8k 256/128；16k 512/256（可選256/128）；48k 1024/512</td><td>frame=FFT、50% overlap、不補零</td></tr>
+  <tr><td>FFT size</td><td>256 / 512 / 1024</td><td>256 / 512 / 1024</td><td>kiss_fft single precision</td></tr>
+  <tr><td>Algorithmic delay</td><td>RES 約一個 grid hop</td><td>framing 約一個 grid frame</td><td>依拓樸與所選 grid 計算，不是固定20 ms</td></tr>
   <tr><td>記憶體 (核心)</td><td>~200 KB (main+shadow)</td><td>~50 KB</td><td>FFT + 權重 + 緩衝</td></tr>
   <tr><td>記憶體 (含後處理)</td><td>~280 KB (含 RES + delay est)</td><td>+64 KB (MCRA min buffer)</td><td>L=32, n_freqs=257</td></tr>
   <tr><td>每 frame 計算量</td><td>2 × 512-FFT + Kalman update<br>(257 bins × 4 partitions)</td><td>2 × 512-FFT<br>+ MCRA + SPP + LSA</td><td></td></tr>

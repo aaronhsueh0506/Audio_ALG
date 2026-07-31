@@ -10,8 +10,8 @@ Design review + FFT-deduplication plan + NN integration seams · 2026-06-07 (AEC
 
 ## Verdict — FEASIBLE, and most pieces already exist
 The "separated" pipeline (`pipelines/aec_nr_pipeline.py --pipeline-mode linear`) already chains
-`AEC(linear) → NR → RES` and already aligns all three at **hop=160 (10 ms)** ("frame i of AEC = frame i
-of NR", `run_res` docstring). The three freq-domain seams needed for a single-transform pipeline already
+`AEC(linear) → NR → RES` and aligns all stages on the selected no-padding grid
+(frame=FFT、hop=frame/2). The three freq-domain seams needed for a single-transform pipeline already
 exist; the current code merely wires them through **redundant time-domain hops** and re-FFTs at each stage.
 
 | Stage | Freq-domain seam that already exists |
@@ -20,9 +20,9 @@ exist; the current code merely wires them through **redundant time-domain hops**
 | NR | every denoiser has **`denoise_spectrum()`** (base_denoiser.py:36) — a freq-in/freq-out entry separate from the STFT-wrapping `denoise()` |
 | AEC(residual) | `run_res()` already consumes the freq contexts + NR gains: `corrected_echo = ctx.echo_spec * nr_gain`, then `res.process(echo_spec=…, far_spec=…, near_spec=…)` |
 
-Both AEC and NR already use **fft=512, frame=512, sqrt-Hann periodic (COLA), 16 kHz** — identical analysis
-grids. The only divergence is NR's *standalone* hop (256); the *integrated* pipeline already overrides it
-to 160.
+Both AEC and NR use the same runtime grid. Defaults are 8k:256/128,
+16k:512/256, and 48k:1024/512; 16 kHz also accepts 256/128. All have
+frame=FFT, so no stage performs the former 20 ms → power-of-two zero-padding.
 
 ## Current data flow (the redundancy)
 ```
@@ -52,18 +52,16 @@ Measured from the algorithm-structural code (filters.py, modules/delay/, freq_ut
 
 | Knob | Sensitivity | Why |
 |---|---|---|
-| **fft_size** | **Moderate** — changeable with recalibration | `freq_utils.hz_to_bin/bin_to_hz` derive fft from `n_bins`; filter `n_freqs=fft//2+1` is computed. BUT AEC3 echo-model / noise-gate constants are int16²-PSD-**sum** scale calibrated at fft=512 (31.25 Hz/bin) → must be re-derived if fft changes. |
-| **hop_size** | **High** | PBFDKF partition→time mapping, `ms_to_hops`, clock-drift cadence all key off hop; the 10 ms hop is structurally assumed. The integrated pipeline already standardizes **all three stages on hop=160** — keep it. |
-| **sample_rate** | **Highest** | Delay subsystem hardcodes `_K_NUM_BLOCKS_PER_SECOND = 250 = 16000/64` and 4 kHz decimation (16000/4); PSD constants calibrated at 16 k. Changing SR needs delay block-rate + decimation + PSD recalibration. |
+| **fft_size** | **Whitelisted** | AEC/NR derive bins, filters and PSD tables from the selected grid; only 256/512/1024 combinations listed above are accepted. |
+| **hop_size** | **High but supported on the whitelist** | PBFDKF partition mapping and AEC3-derived timers use grid-aware helpers; NR legacy 10-ms EMA/count presets are retimed. Project-specific AEC `*_frames`/some EMAs remain raw per-hop tuning and require qualification. |
+| **sample_rate** | **8/16/48 kHz supported** | Delay decimation, coefficient tables, filter length and bins are rate-selected. Other rates are rejected rather than silently approximated. |
 
-**Design rule:** fix the shared grid at **16 kHz / fft=512 / hop=160 / sqrt-Hann**. Bring NR onto hop=160
-(it was A/B-validated at 160 = its "OLD" setting). Do **not** make AEC follow NR's 256 — SR/hop are most
-baked on the AEC side. SR/fft changes are out-of-scope refactors (would require delay re-derivation + PSD
-recalibration), not free parameters.
+**Design rule:** choose one supported grid when creating the pipeline and keep it fixed for the
+stream. Every stage and NN tensor contract must use that same `sample_rate/fft/hop/n_freqs`.
 
 ## NN integration seams (item 10 — interface, doc-only)
 The single-transform freq pipeline makes each stage a swappable freq-in/freq-out block. An NN replaces a
-stage by matching that block's I/O contract on the shared 257-bin / hop-160 grid:
+stage by matching that block's I/O contract on the selected shared grid:
 
 | Swap | Replaces | Freq-domain contract (in → out) |
 |---|---|---|

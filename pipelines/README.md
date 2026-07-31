@@ -398,7 +398,7 @@ could account for a source it can't. The two flags are orthogonal —
 either, both, or neither may be needed for a given publish.
 
 This repo's own untracked check is **whitelisted by prefix**: any path
-starting `ainr/GTCRN/` or `ainr/gtcrn_github/` never counts against a
+starting `AINR/GTCRN/` or `AINR/gtcrn_github/` never counts against a
 publish here (neither the refusal nor the provenance hash) — this working
 tree permanently carries those two directories as user-owned content that
 is never staged for a release. The three producers get **no such

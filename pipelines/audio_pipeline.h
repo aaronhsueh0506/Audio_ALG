@@ -267,6 +267,7 @@ _Static_assert(offsetof(AudioPipelineMemReq, bytes) == 24,
  */
 typedef struct {
     int           sample_rate;   /* 8000 | 16000 | 48000                              */
+    int           fft_size;      /* 0=rate default; 256/512 @16k, 1024 @48k           */
     AecPreset     aec_preset;    /* MILD | BALANCED | AGGRESSIVE                       */
     MmseLsaNrMode nr_mode;       /* MILD | MODERATE | BALANCED | AGGRESSIVE            */
     int           aec_only;      /* 1 = skip NR/RES entirely (linear AEC output only)  */
@@ -277,7 +278,7 @@ typedef struct {
                                    * strength collapses to the fixed scalar 0.4         */
 } AudioPipelineConfig;
 
-/** Sane defaults: BALANCED/BALANCED, full pipeline, CNG on, non-legacy. */
+/** Sane defaults: rate-default no-padding grid, balanced modes, full pipeline. */
 AudioPipelineConfig audio_pipeline_default_config(int sample_rate);
 
 /* ============================================================================

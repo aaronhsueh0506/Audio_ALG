@@ -87,8 +87,11 @@
                                 * keeps runtime sane without weakening the
                                 * byte-equal parity proof (see file header). */
 
-static const int RATES[] = { 8000, 16000, 48000 };
-#define N_RATES ((int)(sizeof(RATES) / sizeof(RATES[0])))
+typedef struct { int sample_rate; int fft_size; } GridCase;
+static const GridCase GRIDS[] = {
+    {8000, 256}, {16000, 256}, {16000, 512}, {48000, 1024},
+};
+#define N_GRIDS ((int)(sizeof(GRIDS) / sizeof(GRIDS[0])))
 
 static int hop_count_for_rate(int sr) { return (sr >= 48000) ? HOP_COUNT_48K : HOP_COUNT; }
 
@@ -118,14 +121,20 @@ static float lcg_sample(void) {
     return ((float)(int)(lcg_state >> 9) / 4194304.0f - 1.0f) * 0.25f;
 }
 
+static AudioPipelineConfig grid_config(int sr, int fft_size) {
+    AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
+    cfg.fft_size = fft_size;
+    return cfg;
+}
+
 /* sr < 0 disables the (once-only) 44100 rate-whitelist check. */
-static void test_validation(int sr, int check_rate_whitelist) {
+static void test_validation(int sr, int fft_size, int check_rate_whitelist) {
     AudioPipelineMemReq req;
 
     CHECK(audio_pipeline_get_mem_requirements(NULL, &req) == -1,
           "get_mem_requirements rejects a NULL config");
 
-    AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
+    AudioPipelineConfig cfg = grid_config(sr, fft_size);
     CHECK(audio_pipeline_get_mem_requirements(&cfg, NULL) == -1,
           "get_mem_requirements rejects a NULL out-param");
 
@@ -136,15 +145,15 @@ static void test_validation(int sr, int check_rate_whitelist) {
     }
 
     CHECK(audio_pipeline_get_mem_requirements(&cfg, &req) == 0 && req.bytes > 0,
-          fmt_msg("get_mem_requirements accepts sample_rate=%d", sr));
-    printf("       (%d Hz descriptor: descriptor_version=%u bytes=%llu alignment=%u "
+          fmt_msg("get_mem_requirements accepts %d Hz / FFT %d", sr, fft_size));
+    printf("       (%d Hz / FFT %d descriptor: descriptor_version=%u bytes=%llu alignment=%u "
            "layout_version=%u backend_id=%u build_flags_hash=0x%08x)\n",
-           sr, req.descriptor_version, (unsigned long long)req.bytes, req.alignment,
+           sr, fft_size, req.descriptor_version, (unsigned long long)req.bytes, req.alignment,
            req.layout_version, req.backend_id, req.build_flags_hash);
 }
 
-static void test_pool_rejection(int sr) {
-    AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
+static void test_pool_rejection(int sr, int fft_size) {
+    AudioPipelineConfig cfg = grid_config(sr, fft_size);
     AudioPipelineMemReq req;
     if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
         fprintf(stderr, "FAIL: setup (get_mem_requirements) for pool-rejection test @ %d Hz\n", sr);
@@ -198,8 +207,8 @@ static void run_hops(AudioPipeline* p, int hop, int hops, float* out_all) {
     free(ref);
 }
 
-static void test_create_vs_init_parity(int sr, int hop_count) {
-    AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
+static void test_create_vs_init_parity(int sr, int fft_size, int hop_count) {
+    AudioPipelineConfig cfg = grid_config(sr, fft_size);
 
     AudioPipelineMemReq req;
     if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
@@ -261,8 +270,8 @@ static void test_create_vs_init_parity(int sr, int hop_count) {
     free(pool);
 }
 
-static void test_destroy_idempotence(int sr) {
-    AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
+static void test_destroy_idempotence(int sr, int fft_size) {
+    AudioPipelineConfig cfg = grid_config(sr, fft_size);
     AudioPipelineMemReq req;
     if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
         fprintf(stderr, "FAIL: setup (get_mem_requirements) for destroy-idempotence test @ %d Hz\n", sr);
@@ -334,6 +343,11 @@ static void test_config_validation_rejects(void) {
     bad_legacy.legacy_amin = -1;
     CHECK(audio_pipeline_get_mem_requirements(&bad_legacy, &req) == -1,
           "get_mem_requirements rejects legacy_amin=-1 (bool must be 0/1)");
+
+    AudioPipelineConfig bad_grid = audio_pipeline_default_config(48000);
+    bad_grid.fft_size = 512;
+    CHECK(audio_pipeline_get_mem_requirements(&bad_grid, &req) == -1,
+          "get_mem_requirements rejects FFT 512 at 48 kHz");
 
     /* Same rejections must hold on the audio_pipeline_init() entry point too
      * (derive_dims_and_configs is the ONE gate both funnel through) -- build
@@ -468,14 +482,16 @@ static void test_init_ex_descriptor(void) {
 }
 
 int main(void) {
-    for (int r = 0; r < N_RATES; r++) {
-        int sr = RATES[r];
+    for (int r = 0; r < N_GRIDS; r++) {
+        int sr = GRIDS[r].sample_rate;
+        int fft_size = GRIDS[r].fft_size;
         int hop_count = hop_count_for_rate(sr);
-        printf("\n=== sample_rate = %d Hz (hop_count=%d) ===\n", sr, hop_count);
-        test_validation(sr, r == 0);   /* 44100 rejection checked once, at r==0 */
-        test_pool_rejection(sr);
-        test_create_vs_init_parity(sr, hop_count);
-        test_destroy_idempotence(sr);
+        printf("\n=== sample_rate = %d Hz / FFT %d (hop_count=%d) ===\n",
+               sr, fft_size, hop_count);
+        test_validation(sr, fft_size, r == 0); /* 44100 rejection checked once */
+        test_pool_rejection(sr, fft_size);
+        test_create_vs_init_parity(sr, fft_size, hop_count);
+        test_destroy_idempotence(sr, fft_size);
     }
 
     printf("\n=== AudioPipelineConfig reject-first validation (R08) ===\n");

@@ -33,6 +33,7 @@ from lib.aec.python.aec import (
     AEC, AecConfig, AecMode, AecPreset, AecResContext,
 )
 from lib.nr.denoisers import MmseLsaDenoiser
+from lib.nr.core.signal_grid import retime_frame_count
 
 # The standalone ResFilter was retired in AEC v3.21; the separated
 # `--pipeline-mode linear` (AEC-linear -> NR -> RES) is now rebuilt on the
@@ -121,33 +122,73 @@ PROD_NEAR_GATE_THRESH = 1e-3
 PROD_NEAR_HANGOVER = 8
 
 
+def _project_grid(sample_rate: int, fft_size: int = None) -> Tuple[int, int, int]:
+    """Resolve an integrated-pipeline no-padding ``(frame, hop, fft)`` grid."""
+    allowed = {16000: (256, 512), 48000: (1024,)}
+    defaults = {16000: 512, 48000: 1024}
+    if sample_rate not in allowed:
+        raise ValueError(f"supported sample rates are 16000 and 48000, got {sample_rate}")
+    chosen = defaults[sample_rate] if fft_size is None else int(fft_size)
+    if chosen not in allowed[sample_rate]:
+        choices = "/".join(str(v) for v in allowed[sample_rate])
+        raise ValueError(
+            f"unsupported fft_size={chosen} at {sample_rate} Hz; expected {choices}"
+        )
+    return chosen, chosen // 2, chosen
+
+
 def _build_denoiser(sample_rate: int,
-                    nr_preset: str = 'balanced') -> MmseLsaDenoiser:
-    """MMSE-LSA denoiser on the shared 10ms-hop grid (frame=320, shift=160).
+                    nr_preset: str = 'balanced',
+                    frame_size: int = None,
+                    frame_shift: int = None,
+                    fft_size: int = None) -> MmseLsaDenoiser:
+    """MMSE-LSA denoiser on a power-of-two, no-padding 50%-overlap grid.
 
     ``nr_preset`` (mild/balanced/aggressive) selects the strength quartet
     {g_min, q, xi_min, alpha_g} from NR_PRESETS. The pipeline structural tuning
     below is preset-independent.
 
     INTENTIONAL divergence from SE/NR/config/v3_2_config.yaml (tuned for
-    frame=512/hop=256 at 16ms/frame):
+    frame=512/hop=256 at 16 ms/hop):
       - alpha_d not passed → falls back to alpha_noise=0.95 (yaml=0.7).
-        Slower noise-floor tracking is appropriate at 10ms hop (shorter
-        frames = noisier per-frame estimates).
+        Slower noise-floor tracking is retained from the production recipe;
+        the denoiser retimes this EMA to the selected hop duration.
       - broadband_threshold not passed → default 0.8 (yaml=1.0, disabled).
         The broadband scene-reset path is active here; on AEC residual
         signals this provides faster adaptation after echo bursts.
-      - L=150 (1.5s window) vs yaml L=32 (320ms). Longer window improves
+      - L=150 is the legacy 10-ms-hop reference value (1.5 s). The denoiser
+        retimes it to the selected hop, preserving that wall-clock duration.
+        The longer window improves
         stationarity estimation against the AEC-residual echo pedestal.
     The A_min_pl pipeline was benchmarked and shipped with these values.
     DO NOT silently sync to the NR yaml without re-running 800-case bench.
     """
+    # When fft_size is explicitly selected (notably 256 at 16 kHz), infer the
+    # matching frame/hop defaults from that grid instead of first resolving the
+    # sample-rate default (512 at 16 kHz).
+    default_frame, default_hop, default_fft = _project_grid(sample_rate, fft_size)
+    frame_size = default_frame if frame_size is None else int(frame_size)
+    frame_shift = default_hop if frame_shift is None else int(frame_shift)
+    fft_size = default_fft if fft_size is None else int(fft_size)
+    if frame_size != fft_size:
+        raise ValueError(
+            f"no-padding invariant violated: frame_size={frame_size}, fft_size={fft_size}"
+        )
+    if frame_size != 2 * frame_shift:
+        raise ValueError(
+            f"50% overlap invariant violated: frame_size={frame_size}, "
+            f"frame_shift={frame_shift}"
+        )
+    if fft_size <= 0 or fft_size & (fft_size - 1):
+        raise ValueError("fft_size must be a positive power of two")
+    # Enforce the project whitelist as well as the generic DSP invariants.
+    _project_grid(sample_rate, fft_size)
     p = NR_PRESETS[nr_preset]
     return MmseLsaDenoiser(
         sample_rate=sample_rate,
-        frame_size=320,          # 20ms — matches AEC frame_size
-        frame_shift=160,         # 10ms — matches AEC hop_size
-        fft_size=512,
+        frame_size=frame_size,
+        frame_shift=frame_shift,
+        fft_size=fft_size,
         noise_method='mcra',
         g_min_db=p['g_min_db'],
         alpha_g=p['alpha_g'],
@@ -155,7 +196,7 @@ def _build_denoiser(sample_rate: int,
         q=p['q'],
         xi_min_db=p['xi_min_db'],
         alpha_s=0.95,
-        L=150,                   # 150 × 10ms = 1.5s minima window
+        L=150,                   # legacy 10-ms reference; retimed to 1.5 s
         delta_db=10.0,
         num_init_frames=20,
         scene_change_threshold_db=10.0,
@@ -167,7 +208,7 @@ def _build_denoiser(sample_rate: int,
 def run_nr(signal: np.ndarray, sample_rate: int,
            return_gain: bool = False, nr_preset: str = 'balanced',
            ) -> np.ndarray:
-    """Run NR (MMSE-LSA) on a time signal with 10ms hop (frame=320, shift=160)."""
+    """Run NR on the sample-rate-specific no-padding project grid."""
     denoiser = _build_denoiser(sample_rate, nr_preset)
     result = denoiser.denoise(signal, return_gain=return_gain)
     if return_gain:
@@ -184,7 +225,8 @@ def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
 
     Consumes ``ctx.error_spec`` (the AEC's sqrt-Hann-windowed linear error
     spectrum) for every hop, runs MMSE-LSA in the frequency domain via
-    ``denoise_spectrum``, and returns the per-frame gain G_nr(f) (n_frames, 257)
+    ``denoise_spectrum``, and returns the per-frame gain G_nr(f)
+    (``n_frames, n_freqs``)
     for the freq-domain RES. This is the FFT-deduplicated path: the spectra the
     time-domain run_nr would re-derive are already in the context.
 
@@ -195,8 +237,10 @@ def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
     |E|² scale the denoiser's noise floor uses (β_r=1). Combine downstream with
     ``min(g_nr, g_res)`` — g_res stays load-bearing (dropping it kills echo).
     """
+    if not aec_contexts:
+        raise ValueError("aec_contexts must not be empty")
     spectra = np.stack([np.asarray(c.error_spec, dtype=np.complex64)
-                        for c in aec_contexts])          # (n_frames, 257)
+                        for c in aec_contexts])          # (n_frames, n_freqs)
     magnitude = np.abs(spectra).astype(np.float64)
     phase = np.angle(spectra).astype(np.float64)
     extra = None
@@ -206,7 +250,11 @@ def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
         extra = np.stack([
             (np.asarray(c.r2, dtype=np.float64) / psd_scale) if c.r2 is not None
             else np.zeros(n_freqs) for c in aec_contexts])
-    denoiser = _build_denoiser(sample_rate, nr_preset)
+    fft_size = 2 * (spectra.shape[1] - 1)
+    denoiser = _build_denoiser(
+        sample_rate, nr_preset,
+        frame_size=fft_size, frame_shift=fft_size // 2, fft_size=fft_size,
+    )
     _, _, gains = denoiser.denoise_spectrum(
         magnitude, phase, return_gain=True, extra_noise_psd=extra)
     print(f"  NR(freq): {gains.shape[0]} frames on E(f), gain shape {gains.shape}"
@@ -246,10 +294,18 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
     one-frame shift (``np.concatenate([[nr_gains[0]], nr_gains[:-1]])``) or
     use ``--pipeline-mode freq`` (the default).
     """
-    bs = int(config.frame_size)      # 320 — analysis/synthesis block
-    hop = int(config.hop_size)       # 160
-    fft = 512
-    n_freqs = fft // 2 + 1           # 257
+    bs = int(config.frame_size)
+    hop = int(config.hop_size)
+    fft = int(config.fft_size)
+    n_freqs = fft // 2 + 1
+    if bs != fft:
+        raise ValueError(
+            f"no-padding invariant violated: frame_size={bs}, fft_size={fft}"
+        )
+    if bs != 2 * hop:
+        raise ValueError(
+            f"50% overlap invariant violated: frame_size={bs}, hop_size={hop}"
+        )
     psd_scale = 32768.0 ** 2         # int16² scale of ctx.comfort_noise (AEC3)
 
     idx = np.arange(bs, dtype=np.float64)
@@ -391,6 +447,10 @@ Switches:
     parser.add_argument('--mic', required=True, help='Microphone input WAV')
     parser.add_argument('--ref', required=True, help='Reference/loudspeaker WAV')
     parser.add_argument('--output', required=True, help='Output WAV')
+    parser.add_argument(
+        '--fft-size', type=int, choices=[256, 512, 1024], default=None,
+        help=('No-padding FFT/frame size. Defaults: 512 at 16 kHz and 1024 at '
+              '48 kHz; 16 kHz also supports 256. Hop is always FFT/2.'))
     parser.add_argument('--aec-preset', default='balanced',
                         choices=['mild', 'balanced', 'aggressive'],
                         help='AEC preset (default: balanced)')
@@ -413,6 +473,10 @@ Switches:
         sys.exit(1)
 
     sample_rate = sr_mic
+    try:
+        frame_size, hop_size, fft_size = _project_grid(sample_rate, args.fft_size)
+    except ValueError as exc:
+        parser.error(str(exc))
     duration = len(mic_signal) / sample_rate
 
     preset_map = {
@@ -427,6 +491,7 @@ Switches:
     print(f"Ref:      {args.ref}")
     print(f"Output:   {args.output}")
     print(f"Rate:     {sample_rate} Hz")
+    print(f"Grid:     frame={frame_size}, hop={hop_size}, fft={fft_size} (no padding)")
     print(f"AEC:      preset={args.aec_preset}")
     if not args.aec_only:
         print(f"NR:       preset={args.nr_preset}")
@@ -439,6 +504,8 @@ Switches:
     aec_config = AecConfig.from_preset(
         preset,
         sample_rate=sample_rate,
+        frame_size=frame_size,
+        hop_size=hop_size,
         mode=AecMode.PBFDKF,
         mu=0.3,
         enable_res=True,
@@ -470,7 +537,8 @@ Switches:
             use_res=True, combine='min', ne_floor=PROD_NE_FLOOR, ne_gate='both',
             ne_floor_far_active=None if _legacy else PROD_NE_FLOOR_FAR_ACTIVE,
             near_gate_thresh=None if _legacy else PROD_NEAR_GATE_THRESH,
-            near_hangover_frames=PROD_NEAR_HANGOVER)
+            near_hangover_frames=retime_frame_count(
+                PROD_NEAR_HANGOVER, sample_rate, hop_size))
 
     # Save
     sf.write(args.output, final_output, sample_rate)

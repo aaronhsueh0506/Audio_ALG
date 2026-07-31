@@ -223,27 +223,27 @@ static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
 
 #undef AP_CK_BOOL
 
+    if (compute_frame_dims(cfg->sample_rate, cfg->fft_size,
+                           hop, frame_sz, fft_sz, n_freqs) != 0) return -1;
+
     aec_config_from_preset(aec_cfg, cfg->aec_preset, cfg->sample_rate);
+    aec_cfg->fft_size          = *fft_sz;
     aec_cfg->enable_res         = 0;   /* linear AEC + external NR/RES seam */
     aec_cfg->return_res_context = 1;
 
-    *nr_cfg = mmse_lsa_config_for_mode(cfg->sample_rate, cfg->nr_mode);
+    *nr_cfg = mmse_lsa_config_for_mode_grid(
+        cfg->sample_rate, *fft_sz, cfg->nr_mode);
     /* Match the Python pipeline _build_denoiser STRUCTURAL tuning (identical
      * to both CLIs' prior inline copies): L=150, alpha_d=0.95, alpha_attack/
      * alpha_decay pinned off the C-only per-mode values. See
      * aec_nr_pipeline.py:_build_denoiser. */
-    nr_cfg->L            = 150;
-    nr_cfg->alpha_d      = 0.95f;
-    nr_cfg->alpha_attack = 0.3f;
+    nr_cfg->L = mmse_lsa_retime_frames(
+        150, cfg->sample_rate, *hop);
+    nr_cfg->alpha_d = mmse_lsa_retime_alpha(
+        0.95f, cfg->sample_rate, *hop);
+    nr_cfg->alpha_attack = mmse_lsa_retime_alpha(
+        0.3f, cfg->sample_rate, *hop);
     nr_cfg->alpha_decay  = nr_cfg->alpha_g;
-
-    compute_frame_dims(cfg->sample_rate, hop, frame_sz, fft_sz, n_freqs);
-    /* Force the NR config onto the SAME fft grid the pipeline/AEC derive (the
-     * "8 kHz FFT mismatch" fix both CLIs already carried -- see
-     * pipeline_dims.h). At >=12.8 kHz this is a no-op. */
-    nr_cfg->fft_size   = *fft_sz;
-    nr_cfg->frame_size = *frame_sz;
-    nr_cfg->hop_size   = *hop;
     return 0;
 }
 
@@ -407,6 +407,7 @@ static uint32_t audio_pipeline_build_flags_hash(void) {
 AudioPipelineConfig audio_pipeline_default_config(int sample_rate) {
     AudioPipelineConfig cfg;
     cfg.sample_rate = sample_rate;
+    cfg.fft_size    = 0;
     cfg.aec_preset  = AEC_PRESET_BALANCED;
     cfg.nr_mode     = MMSE_LSA_NR_BALANCED;
     cfg.aec_only    = 0;

@@ -1,0 +1,135 @@
+"""Align-CRUSE reproduction for direct neural AEC (including RES).
+
+Paper: Indenbom et al., "Deep model with built-in cross-attention alignment
+for acoustic echo cancellation", arXiv:2208.11308.
+
+The model consumes unaligned microphone/reference complex spectra.  It emits a
+real magnitude mask and preserves microphone phase, exactly as the paper's
+prediction contract specifies.  The project target for this AEC-only route is
+near-end speech plus local noise; it must not learn noise suppression.
+"""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor, nn
+
+from AIAEC.aiaec_common import (
+    AecOutput,
+    CausalConvBlock,
+    GlobalDelayAttention,
+    SignalGrid,
+    fit_frequency,
+    log_power_feature,
+    require_complex_btf,
+)
+
+
+def _half(n: int) -> int:
+    return (n + 1) // 2
+
+
+class AlignCRUSE(nn.Module):
+    """Paper-shaped causal CRUSE with a global soft delay distribution."""
+
+    paper_reference = "arXiv:2208.11308"
+    task = "direct_aec_preserve_noise"
+
+    def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
+                 projection_size: int = 64, gru_hidden: int = 192,
+                 alignment_mode: str = "paper_global"):
+        super().__init__()
+        self.grid = grid
+        self.max_delay_frames = grid.delay_frames(max_delay_seconds)
+
+        # Paper channel schedule: mic 16/40/72/32, far 8/24.
+        self.mic1 = CausalConvBlock(1, 16, (4, 3), (1, 2))
+        self.mic2 = CausalConvBlock(16, 40, (4, 3), (1, 2))
+        self.far1 = CausalConvBlock(1, 8, (4, 3), (1, 2))
+        self.far2 = CausalConvBlock(8, 24, (4, 3), (1, 2))
+
+        f1 = _half(grid.n_freqs)
+        f2 = _half(f1)
+        self.align = GlobalDelayAttention(
+            40, 24, f2, f2, 24, projection_size, self.max_delay_frames,
+            mode=alignment_mode,
+        )
+        self.mic3 = CausalConvBlock(40 + 24, 72, (4, 3), (1, 2))
+        self.mic4 = CausalConvBlock(72, 32, (4, 3), (1, 2))
+
+        f3, f4 = _half(f2), _half(_half(f2))
+        bottleneck_size = 32 * f4
+        self.gru = nn.GRU(bottleneck_size, gru_hidden, batch_first=True)
+        self.gru_out = nn.Linear(gru_hidden, bottleneck_size)
+
+        # Three ConvT blocks (32/48/48) plus the paper's final mask block.
+        # The mask block performs the fourth frequency restoration required by
+        # four stride-2 encoder blocks; this is the only shape-complete reading
+        # of the paper's text/figure at arbitrary odd RFFT widths.
+        self.skip4 = nn.Conv2d(32, 32, 1)
+        self.up3 = FrequencyTransposeBlock(32, 32)
+        self.skip3 = nn.Conv2d(72, 32, 1)
+        self.up2 = FrequencyTransposeBlock(32, 48)
+        self.skip2 = nn.Conv2d(40, 48, 1)
+        self.up1 = FrequencyTransposeBlock(48, 48)
+        self.skip1 = nn.Conv2d(16, 48, 1)
+        self.mask_up = FrequencyTransposeBlock(
+            48, 1, activation=False, normalization=False,
+        )
+        self.mask_gain = nn.Parameter(torch.ones(()))
+
+        self._encoded_freq = (f1, f2, f3, f4)
+
+    def forward(self, microphone: Tensor, far_end: Tensor) -> AecOutput:
+        require_complex_btf(microphone, "microphone")
+        require_complex_btf(far_end, "far_end")
+        if microphone.shape != far_end.shape:
+            raise ValueError("microphone and far_end STFT grids must match")
+        if microphone.shape[-1] != self.grid.n_freqs:
+            raise ValueError("input frequency count does not match SignalGrid")
+
+        m0 = log_power_feature(microphone)
+        f0 = log_power_feature(far_end)
+        m1 = self.mic1(m0)
+        m2 = self.mic2(m1)
+        f1 = self.far1(f0)
+        f2 = self.far2(f1)
+        aligned, delay = self.align(m2, f2)
+        m3 = self.mic3(torch.cat((m2, aligned), dim=1))
+        m4 = self.mic4(m3)
+
+        b, c, t, f = m4.shape
+        sequence = m4.permute(0, 2, 1, 3).reshape(b, t, c * f)
+        sequence, _ = self.gru(sequence)
+        x = self.gru_out(sequence).reshape(b, t, c, f).permute(0, 2, 1, 3)
+
+        x = self.up3(x + self.skip4(m4), m3.shape[-1])
+        x = self.up2(x + self.skip3(m3), m2.shape[-1])
+        x = self.up1(x + self.skip2(m2), m1.shape[-1])
+        logits = self.mask_up(x + self.skip1(m1), self.grid.n_freqs).squeeze(1)
+        mask = torch.sigmoid(fit_frequency(logits, self.grid.n_freqs))
+        mask = mask * self.mask_gain.clamp_min(0.0)
+        enhanced = microphone * mask
+        return AecOutput(enhanced=enhanced, mask=mask,
+                         delay_distribution=delay)
+
+
+class FrequencyTransposeBlock(nn.Module):
+    """Paper ConvT block: a frequency-only 1x3 transposed convolution."""
+
+    def __init__(self, in_channels: int, out_channels: int,
+                 activation: bool = True, normalization: bool = True):
+        super().__init__()
+        self.out_channels = out_channels
+        self.conv = nn.ConvTranspose2d(
+            in_channels, out_channels, kernel_size=(1, 3),
+            stride=(1, 2), padding=(0, 1), bias=False,
+        )
+        self.norm = (nn.BatchNorm2d(out_channels) if normalization
+                     else nn.Identity())
+        self.act = nn.ELU() if activation else nn.Identity()
+
+    def forward(self, x: Tensor, target_freq: int) -> Tensor:
+        output_size = (x.shape[0], self.out_channels, x.shape[2], target_freq)
+        x = self.conv(x, output_size=output_size)
+        return self.act(self.norm(x))

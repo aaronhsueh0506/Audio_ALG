@@ -164,6 +164,7 @@ int main(int argc, char* argv[]) {
         MmseLsaNrMode nr_mode     = MMSE_LSA_NR_BALANCED;
         int           aec_only    = 0;
         int           sample_rate = 16000;
+        int           fft_size    = 0;
 
         for (int i = 2; i < argc; i++) {
             if      (strcmp(argv[i], "--aec-only") == 0) aec_only = 1;
@@ -171,11 +172,14 @@ int main(int argc, char* argv[]) {
                 nr_mode = parse_nr_mode(argv[++i]);
             else if (strcmp(argv[i], "--sample-rate") == 0 && i + 1 < argc)
                 sample_rate = atoi(argv[++i]);
+            else if (strcmp(argv[i], "--fft-size") == 0 && i + 1 < argc)
+                fft_size = atoi(argv[++i]);
             else if (argv[i][0] != '-')
                 preset = parse_preset(argv[i]);
         }
 
         AudioPipelineConfig cfg = audio_pipeline_default_config(sample_rate);
+        cfg.fft_size  = fft_size;
         cfg.aec_preset = preset;
         cfg.nr_mode    = nr_mode;
         cfg.aec_only   = aec_only;
@@ -206,10 +210,10 @@ int main(int argc, char* argv[]) {
     if (argc < 4) {
         printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-preset] "
                "[--nr-preset mild|balanced|aggressive] [--aec-only] [--legacy-amin] "
-               "[--debug]\n",
+               "[--fft-size 256|512|1024] [--debug]\n",
                argv[0]);
         printf("       %s --print-mem-size [preset] [--nr-preset ...] [--aec-only] "
-               "[--sample-rate <hz>]\n", argv[0]);
+               "[--sample-rate <hz>] [--fft-size <n>]\n", argv[0]);
         return 1;
     }
 
@@ -223,12 +227,15 @@ int main(int argc, char* argv[]) {
     int           legacy   = 0;   /* --legacy-amin → prior min-only A_min_pl */
     int           no_cng   = 0;   /* --no-cng → disable comfort noise (parity) */
     int           debug_status = 0; /* --debug → periodic aec+nr status line   */
+    int           fft_size = 0;
 
     for (int i = 4; i < argc; i++) {
         if      (strcmp(argv[i], "--aec-only") == 0)    aec_only = 1;
         else if (strcmp(argv[i], "--legacy-amin") == 0) legacy = 1;
         else if (strcmp(argv[i], "--no-cng") == 0)      no_cng = 1;
         else if (strcmp(argv[i], "--debug") == 0)       debug_status = 1;
+        else if (strcmp(argv[i], "--fft-size") == 0 && i+1 < argc)
+            fft_size = atoi(argv[++i]);
         else if (strcmp(argv[i], "--nr-preset") == 0 && i+1 < argc)
             nr_mode = parse_nr_mode(argv[++i]);
         else if (argv[i][0] != '-')
@@ -258,6 +265,7 @@ int main(int argc, char* argv[]) {
                   ? mic_r->info.num_samples : ref_r->info.num_samples;
 
     AudioPipelineConfig cfg = audio_pipeline_default_config(sr);
+    cfg.fft_size    = fft_size;
     cfg.aec_preset  = preset;
     cfg.nr_mode     = nr_mode;
     cfg.aec_only    = aec_only;

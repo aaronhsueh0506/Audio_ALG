@@ -1,6 +1,16 @@
 # AI-AEC 候選矩陣：架構設計與待審議事項
 
-> 狀態：**設計討論稿，零實作**。`ainr/dataset_gen/` 下沒有 `aec/` 子目錄，本文所述組態皆無任何程式碼。
+> **2026-07-30 狀態更新：本文 rev.2–rev.5 是歷史設計／論證記錄，不再是目前實作清單。**
+> 原先的「零實作」、`AINR/AECNet`、`AINR/PostFilter`、
+> `AINR/JointAECNR` 與 `AINR/dataset_gen/aec` 敘述均已失效；請勿依那些段落建立新工作。
+>
+> 現行實作位於 `AIAEC/`：`Align_CRUSE`、`Align_ULCNet`、
+> `GTCRN_AENR`、`DeepFilterNet_AENR`、`DeepVQE_S`、`CAGCRN`，AEC dataset
+> 的穩定入口為 `AIAEC/dataset_gen/`。完整完成審查、4-ch 實錄結果與
+> signal-grid 驗證請以
+> [`aiaec_4ch_signal_grid_review_2026_07_30.md`](aiaec_4ch_signal_grid_review_2026_07_30.md)
+> 為準。
+>
 > 撰寫 2026-07-29 · rev.2 依深度審查重寫 · **rev.3 收斂為兩級可組合結構**
 >
 > **基準**：standalone `AEC` `eecddff` / `NR` `8cb9597` / `Audio_ALG` `37db9df` / `audio_common` `c68a50b`
@@ -43,10 +53,10 @@
 
 | 位置 | 對應 | 參數量 | 測試 |
 |---|---|---|---|
-| `ainr/dataset_gen/aec/` | 語料 + 共用 `AecGrid`/STFT/sampler | — | 25 |
-| `ainr/AECNet/` | **#4** `(Y,X) → D_hat` | 1,944,322 | 54 |
-| `ainr/PostFilter/` | **#3** `(E,D_hat[,X,Y]) → G` | 1,582,624 / **111.9 M MACs/s** @ 62.5 fps | 72 |
-| `ainr/JointAECNR/` | **#5** `(Y,X) → S_hat` | 1,341,483 | 57 |
+| `AINR/dataset_gen/aec/` | 語料 + 共用 `AecGrid`/STFT/sampler | — | 25 |
+| `AINR/AECNet/` | **#4** `(Y,X) → D_hat` | 1,944,322 | 54 |
+| `AINR/PostFilter/` | **#3** `(E,D_hat[,X,Y]) → G` | 1,582,624 / **111.9 M MACs/s** @ 62.5 fps | 72 |
+| `AINR/JointAECNR/` | **#5** `(Y,X) → S_hat` | 1,341,483 | 57 |
 
 ⚠ 交叉檢查抓到兩個**會靜默毀掉訓練**的缺陷，皆已修並加守衛：① 48 kHz 下以「taps」表示的濾波器跨度只涵蓋 171 ms，**低於語料的 120 ms bulk delay + RIR**，整個語料會變成「打不到的回音」而非「沒除乾淨的回音」，且不會有任何東西報錯；② 三個專案的 `model.py`/`train.py` 同名互相遮蔽，PostFilter 的測試實際在跑 RNNoise-ERB 的 `train()`。
 
@@ -147,7 +157,7 @@ rev.2 的 10 格矩陣**是枚舉不是決策**。rev.3 收斂為**兩級可組�
 
 **有利：**
 
-1. ✅ **AINR 兩個 16 kHz 模型的格點與目標 16k 直接對上**：`ainr/GTCRN/config.ini:2-5` 顯式 `n_fft=512/win_len=512/hop_len=256`；`ainr/RNNoise-ERB/config.ini:2-3` 只設 `sr`/`n_fft`，`win_len`/`hop_len` 走預設。⚠ `ainr/DeepFilterNet2/config.ini` 是 48 kHz/1024/512，正好對上目標 48k。
+1. ✅ **AINR 兩個 16 kHz 模型的格點與目標 16k 直接對上**：`AINR/GTCRN/config.ini:2-5` 顯式 `n_fft=512/win_len=512/hop_len=256`；`AINR/RNNoise-ERB/config.ini:2-3` 只設 `sr`/`n_fft`，`win_len`/`hop_len` 走預設。⚠ `AINR/DeepFilterNet2/config.ini` 是 48 kHz/1024/512，正好對上目標 48k。
 2. **16k 幀率 100 → 62.5 fps**：AI 模組推論次數與加速器往返 ×0.625。⚠ **48k 只有 100 → 93.75 fps（×0.9375）**，幾乎沒有節省——原稿把 ×0.625 當成全域結論是錯的。
 3. 文獻支持：16 kHz / 512 / 256 是該取樣率下最常見的配置（§13.2）。
 
@@ -359,7 +369,7 @@ CNG（`:722-730`）以 `res_gain` 決定 `sqrt(1 - G_res²)` → 間接依賴 R�
 
 **關鍵**：只要下游 NN 要處理殘餘回音，就**必須在真實殘餘回音上訓練**。即使輸入 R²，**noise-only 資料集也不會讓模型自動學會怎麼用那個通道**——它從未見過該通道與任何有意義的東西共變。
 
-⚠ 這直接影響現況：✅ `ainr/dataset_gen/dataset.py` 中 `"echo"` 出現 **0 次** → 三個 AINR 模型**構造上沒見過殘餘回音**。要把任何一個放進 AEC 鏈，**資料集必須先加入殘餘回音，這是不可繞過的**。
+⚠ 這直接影響現況：✅ `AINR/dataset_gen/dataset.py` 中 `"echo"` 出現 **0 次** → 三個 AINR 模型**構造上沒見過殘餘回音**。要把任何一個放進 AEC 鏈，**資料集必須先加入殘餘回音，這是不可繞過的**。
 
 ### 5.2 真正該禁止的是什麼
 
@@ -485,7 +495,8 @@ L = L_echo(D_hat, D)                                  ← 主項：估計回音�
 |---|---|---|---|
 | **RNNoise-ERB** | 實數 band gains | `RNNoise-ERB/train.py:514,567`（`回傳: gains`） | ✅ 展開到 257 bin |
 | **GTCRN** | **Complex Ratio Mask** | `GTCRN/model.py:276-281` | ❌ **不行** |
-| **DeepFilterNet2** | 高頻實數 ERB mask + 低頻 deep filter（複數） | `DeepFilterNet2/model.py:686,698,701,703` | ⚠ 只有高頻可以 |
+| **DeepFilterNet2** | 全頻實數 ERB mask，再於低頻 cascade deep filter + alpha（複數） | `AINR/DeepFilterNet2/model.py::DeepFilterNet2.compose` | ⚠ 最終低頻不行 |
+| **DeepFilterNet3** | 高頻實數 ERB mask + 低頻 deep filter（複數） | `AINR/DeepFilterNet3/model.py::DeepFilterNet3.compose` | ⚠ 只有高頻可以 |
 
 GTCRN 的 mask 是完整複數乘法，**會旋轉相位**：
 
@@ -498,14 +509,19 @@ class Mask(nn.Module):
         s_imag = spec[:, 1] * mask[:, 0] + spec[:, 0] * mask[:, 1]
 ```
 
-DFN2 是**平行 band split**——低頻由 deep filter（複數多幀 FIR）獨佔，高頻才是實數 ERB mask：
+DFN2 現在恢復為**串聯 cascade + learned alpha**：全頻先套 ERB mask，
+低頻再由 deep filter（複數多幀 FIR）處理並與 masked residual 混合。原本的
+**平行 band split** 已獨立保留在 DFN3：
 
 ```python
-# DeepFilterNet2/model.py:686,698-703
-bin_mask = erb_mask.squeeze(1).matmul(self.erb_inv[:, self.df_bins:])   # 高頻實數
-spec_e   = deep_filter_apply(...)                                       # 低頻複數
-spec_e[:, self.df_bins:] = spec_m
-return spec_e, erb_mask
+# AINR/DeepFilterNet2/model.py::DeepFilterNet2.compose
+spec_m = spec * full_band_bin_mask
+spec_df = deep_filter_apply(spec_m, ...)
+spec_e[:, :df_bins] = alpha * spec_df[:, :df_bins] + (1-alpha) * spec_m[:, :df_bins]
+
+# AINR/DeepFilterNet3/model.py::DeepFilterNet3.compose
+spec_e = deep_filter_apply(spec, ...)        # raw low-frequency spectrum
+spec_e[:, df_bins:] = masked_high_spectrum  # parallel band split
 ```
 
 #### 三種串接方式
@@ -848,7 +864,7 @@ rev.3 寫「AINR 資料集必須加入殘餘回音，不可繞過」，**混淆�
 
 ### 8.7 ⚠ V7：現有 split 有資料洩漏風險
 
-✅ `ainr/dataset_gen/loader.py` 的 `locality_preserving_random_split` 是對**已生成的 item** 做隨機排列。由於生成過程是 speech × noise × RIR 的組合，**同一個 speaker / speech source / noise / RIR 可能同時出現在 train 與 validation**。
+✅ `AINR/dataset_gen/loader.py` 的 `locality_preserving_random_split` 是對**已生成的 item** 做隨機排列。由於生成過程是 speech × noise × RIR 的組合，**同一個 speaker / speech source / noise / RIR 可能同時出現在 train 與 validation**。
 
 **建議改為生成前先固定 manifest，並保證：**
 
@@ -1165,9 +1181,10 @@ high_frequency_suppression.{limiting_gain_band=24, bands_in_limiting_gain=3};
 | 參照 `R²=E²×mask` | `AEC/docs/aec3_extracts/.../neural_residual_echo_estimator_impl.cc:560` |
 | 參照 `AdjustConfig`（Suppressor-only） | `..._impl.cc:569-589` + `..._impl.h:83` |
 | 參照上游無 NR；噪音為 masker | `AEC/docs/aec3_extracts/src/aec3/suppression_gain.cc:215-233` |
-| AINR 資料集無回音 | `ainr/dataset_gen/dataset.py`（`"echo"` 0 次） |
-| AINR 16k 格點 | `ainr/GTCRN/config.ini:2-5`、`ainr/RNNoise-ERB/config.ini:2-3` |
-| AINR 48k 格點 | `ainr/DeepFilterNet2/config.ini:2-5` |
-| **RNNoise-ERB 輸出實數 gains** | `ainr/RNNoise-ERB/train.py:514,567` |
-| **GTCRN 輸出 Complex Ratio Mask** | `ainr/GTCRN/model.py:276-281`（`forward` 於 `:305`，回傳於 `:330`） |
-| **DFN2 平行 band split（高頻實數 mask / 低頻複數 deep filter）** | `ainr/DeepFilterNet2/model.py:686,698,701,703` |
+| AINR 資料集無回音 | `AINR/dataset_gen/dataset.py`（`"echo"` 0 次） |
+| AINR 16k 格點 | `AINR/GTCRN/config.ini:2-5`、`AINR/RNNoise-ERB/config.ini:2-3` |
+| AINR 48k 格點 | `AINR/DeepFilterNet2/config.ini:2-5` |
+| **RNNoise-ERB 輸出實數 gains** | `AINR/RNNoise-ERB/train.py:514,567` |
+| **GTCRN 輸出 Complex Ratio Mask** | `AINR/GTCRN/model.py:276-281`（`forward` 於 `:305`，回傳於 `:330`） |
+| **DFN2 cascade + alpha（全頻 mask / 低頻複數 DF residual mix）** | `AINR/DeepFilterNet2/model.py::DeepFilterNet2.compose` |
+| **DFN3 平行 band split（高頻實數 mask / 低頻複數 deep filter）** | `AINR/DeepFilterNet3/model.py::DeepFilterNet3.compose` |

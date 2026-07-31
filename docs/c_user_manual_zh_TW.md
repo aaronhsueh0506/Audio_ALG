@@ -134,7 +134,7 @@ DUMP_CTX=/tmp/pipeline_ctx.bin \
 - mic/ref 必須能被 submodule 的 `wav_io.h` 讀取，並具有相同 sample rate。
 - 支援 PCM16、PCM32、IEEE float32；多聲道只讀第一聲道。
 - 處理長度取 mic/ref 中較短者。
-- 每次處理一個 10 ms hop，最後不足一個 hop 的尾端捨棄。
+- 每次處理所選 signal grid 的一個 hop，最後不足一個 hop 的尾端捨棄。
 - pipeline 沒有主動改寫 `AEC_OUT_FLOAT`，因此預設輸出單聲道 PCM16。
 - 若要 float32 WAV：`AEC_OUT_FLOAT=1 ./pipelines/aec_nr_pipeline ...`。
 
@@ -423,7 +423,7 @@ audio_alg_destroy(&pipeline);
 
 | 資料 | 尺度／尺寸 | 規則 |
 |---|---|---|
-| mic/ref/out | float PCM，`hop` | 一次正好 10 ms，建議幅度 `[-1, 1]` |
+| mic/ref/out | float PCM，`hop` | 一次正好一個 grid hop，建議幅度 `[-1, 1]` |
 | `error_spec` | complex audio amplitude，`n_freqs` | AEC instance 內部 pointer |
 | `res_gain` | amplitude gain `[0,1]` | 與 `G_nr` 逐 bin 比較 |
 | `r2` | int16² PSD | 除以 `32768²` 才能和 `|E|²` 合併 |
@@ -432,9 +432,9 @@ audio_alg_destroy(&pipeline);
 
 `AecResContext` pointer 只保證在下一次 AEC process/reset/destroy 前有效。不要修改、free 或跨 hop 保存 pointer；如需非同步分析，複製內容。
 
-16 kHz 時 `hop=160`、`frame_size=320`、`fft_size=512`、`n_freqs=257`。不要把 257 寫死；48 kHz 會變成 513 bins。
+16 kHz 預設為 `hop=256`、`frame_size=fft_size=512`、`n_freqs=257`；低算量 grid 為 256/128/129 bins。48 kHz 為 1024/512/513 bins。不要把尺寸寫死。
 
-完整 pipeline 的 final IFFT/OLA 增加約一個 hop（10 ms）延遲；`--aec-only` 走 linear time output，不經這段 final OLA。另需把裝置 I/O buffer、resampler 與 OS scheduling latency 加入產品總預算。
+完整 pipeline 的 final IFFT/OLA 增加約一個 grid hop 延遲；`--aec-only` 走 linear time output，不經這段 final OLA。另需把裝置 I/O buffer、resampler 與 OS scheduling latency 加入產品總預算。
 
 ## 7. Preset 與 tuning 原則
 

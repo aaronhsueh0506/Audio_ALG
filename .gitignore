@@ -32,7 +32,7 @@ env/
 output/
 
 # AINR training data & model checkpoints
-ainr/RNNoise-ERB/output/
+AINR/RNNoise-ERB/output/
 *.pth
 *.onnx
 *.npy
@@ -70,4 +70,4 @@ pipelines/bin/
 # published .tar checkpoints.  Kept locally for source comparison only.
 # Vendoring it properly (submodule, or a copy with .git removed) is a separate
 # decision -- see GTCRN/GTCRN_Analysis.md for what was read out of it.
-ainr/gtcrn_github/
+AINR/gtcrn_github/

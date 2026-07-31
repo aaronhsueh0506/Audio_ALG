@@ -1,0 +1,214 @@
+import pathlib
+
+import pytest
+import torch
+
+from AIAEC.aiaec_common import SignalGrid
+from AIAEC.Align_CRUSE import AlignCRUSE
+from AIAEC.Align_ULCNet import AlignULCNet, ChannelSampledReorientation
+from AIAEC.CAGCRN import CAGCRN
+from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
+from AIAEC.DeepVQE_S import DeepVQES
+from AIAEC.GTCRN_AENR import GTCRNAENR
+
+
+G16 = SignalGrid(16000, 512, 512, 256)
+G16_LOW = SignalGrid(16000, 256, 256, 128)
+G48 = SignalGrid(48000, 1024, 1024, 512)
+
+
+def _spec(batch, frames, bins):
+    return torch.complex(torch.randn(batch, frames, bins),
+                         torch.randn(batch, frames, bins))
+
+
+def _assert_finite_parameter_gradients(model, loss):
+    loss.backward()
+    gradients = [
+        parameter.grad for parameter in model.parameters()
+        if parameter.requires_grad and parameter.grad is not None
+    ]
+    assert gradients, "model forward is detached from every trainable parameter"
+    assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+@pytest.mark.parametrize("factory", [
+    lambda: AlignCRUSE(G16),
+    lambda: AlignULCNet(G16),
+    lambda: GTCRNAENR(G16),
+    lambda: DeepVQES(G16),
+    lambda: CAGCRN(G16),
+])
+def test_waveform_boundary_models_forward_finite(factory):
+    model = factory().eval()
+    x = _spec(1, 4, G16.n_freqs)
+    with torch.no_grad():
+        out = model(x, x)
+    assert out.enhanced.shape == x.shape
+    assert torch.is_complex(out.enhanced)
+    assert torch.isfinite(torch.view_as_real(out.enhanced)).all()
+
+
+@pytest.mark.parametrize("factory", [
+    lambda: AlignCRUSE(G16),
+    lambda: AlignULCNet(G16),
+    lambda: GTCRNAENR(G16),
+    lambda: DeepVQES(G16),
+    lambda: CAGCRN(G16),
+])
+def test_waveform_boundary_models_backward_finite(factory):
+    model = factory().train()
+    x = _spec(2, 3, G16.n_freqs)
+    _assert_finite_parameter_gradients(model, model(x, x).enhanced.abs().mean())
+
+
+@pytest.mark.parametrize("factory", [
+    lambda: AlignCRUSE(G48),
+    lambda: AlignULCNet(G48),
+    lambda: DeepVQES(G48),
+    lambda: CAGCRN(G48),
+])
+def test_grid_adapted_models_accept_48k(factory):
+    model = factory().eval()
+    x = _spec(1, 2, G48.n_freqs)
+    with torch.no_grad():
+        out = model(x, x)
+    assert out.enhanced.shape == x.shape
+
+
+def test_gtcrn_aenr_rejects_non_upstream_grid():
+    with pytest.raises(ValueError, match="upstream 16 kHz/512"):
+        GTCRNAENR(G48)
+
+
+def test_deepfilternet_conditioner_is_error_passthrough_at_init():
+    model = DeepFilterNetAENR(
+        G48, enc_ch=8, emb_size=32, df_hidden=32,
+        lin_groups=4, enc_lin_groups=4,
+    ).eval()
+    error_erb = torch.randn(1, 1, 3, 32)
+    far_erb = torch.randn_like(error_erb)
+    error_spec = torch.randn(1, 2, 3, 96)
+    far_spec = torch.randn_like(error_spec)
+    erb, spec = model.condition_features(
+        error_erb, error_spec, far_erb, far_spec,
+    )
+    assert torch.equal(erb, error_erb)
+    assert torch.equal(spec, error_spec)
+
+
+def test_deepfilternet_aenr_forward_contract():
+    model = DeepFilterNetAENR(
+        G48, enc_ch=8, emb_size=32, df_hidden=32,
+        lin_groups=4, enc_lin_groups=4,
+    ).eval()
+    x = _spec(1, 3, G48.n_freqs)
+    erb = torch.randn(1, 1, 3, 32)
+    spec = torch.randn(1, 2, 3, 96)
+    with torch.no_grad():
+        out = model(x, erb, spec, erb, spec)
+    assert out.enhanced.shape == x.shape
+    assert out.auxiliary["deep_filter_coefficients"].shape[:3] == (1, 3, 96)
+
+
+def test_deepfilternet_aenr_backward_finite():
+    model = DeepFilterNetAENR(
+        G48, enc_ch=8, emb_size=32, df_hidden=32,
+        lin_groups=4, enc_lin_groups=4,
+    ).train()
+    error = _spec(2, 3, G48.n_freqs)
+    error_erb = torch.randn(2, 1, 3, 32)
+    far_erb = torch.randn_like(error_erb)
+    error_spec = torch.randn(2, 2, 3, 96)
+    far_spec = torch.randn_like(error_spec)
+    output = model(error, error_erb, error_spec, far_erb, far_spec)
+    _assert_finite_parameter_gradients(model, output.enhanced.abs().mean())
+
+
+def test_cagcrn_soft_window_has_gradient():
+    model = CAGCRN(G16).train()
+    x = _spec(2, 3, G16.n_freqs)
+    model(x, x).enhanced.abs().mean().backward()
+    grad = model.cata.raw_window.grad
+    assert grad is not None
+    assert torch.isfinite(grad)
+    assert grad.abs() > 0
+
+
+def test_align_cruse_uses_paper_global_distribution_and_convt_decoder():
+    model = AlignCRUSE(G16).eval()
+    x = _spec(2, 8, G16.n_freqs)
+    with torch.no_grad():
+        out = model(x, x)
+    assert out.delay_distribution.shape == (2, model.max_delay_frames)
+    assert isinstance(model.up3.conv, torch.nn.ConvTranspose2d)
+    assert isinstance(model.up2.conv, torch.nn.ConvTranspose2d)
+    assert isinstance(model.up1.conv, torch.nn.ConvTranspose2d)
+    assert isinstance(model.mask_up.conv, torch.nn.ConvTranspose2d)
+
+
+def test_csamfr_samples_two_bin_subbands_not_individual_bins():
+    block = ChannelSampledReorientation(257, gamma=5, subband_bins=2)
+    source = torch.arange(257.0).reshape(1, 1, 1, 257)
+    sampled = block(source)
+    assert block.n_subbands == 130
+    assert sampled.shape == (1, 5, 1, 52)
+    # Set zero: bands 0,5,10... => bins [0,1,10,11,20,21,...].
+    torch.testing.assert_close(sampled[0, 0, 0, :6],
+                               torch.tensor([0., 1., 10., 11., 20., 21.]))
+    torch.testing.assert_close(block.inverse(sampled), source[:, 0])
+
+
+def test_published_size_classes_are_preserved_on_project_grid():
+    counts = {
+        "align_cruse": sum(p.numel() for p in AlignCRUSE(G16).parameters()),
+        "align_ulcnet": sum(p.numel() for p in AlignULCNet(G16).parameters()),
+        "deepvqe_s": sum(p.numel() for p in DeepVQES(G16).parameters()),
+    }
+    assert 680_000 <= counts["align_cruse"] <= 780_000
+    assert 640_000 <= counts["align_ulcnet"] <= 720_000
+    assert 580_000 <= counts["deepvqe_s"] <= 680_000
+
+    cag = CAGCRN(G16)
+    # The paper's 0.07 M count includes fixed ERB analysis/synthesis weights.
+    state_elements = sum(value.numel() for value in cag.state_dict().values())
+    assert 60_000 <= state_elements <= 80_000
+    assert cag.mic_tfgru is not cag.far_tfgru
+
+
+@pytest.mark.parametrize("factory", [
+    lambda: AlignCRUSE(G16_LOW),
+    lambda: AlignULCNet(G16_LOW),
+    lambda: DeepVQES(G16_LOW),
+    lambda: CAGCRN(G16_LOW),
+])
+def test_grid_adapted_models_accept_16k_low_latency_grid(factory):
+    model = factory().eval()
+    x = _spec(1, 2, G16_LOW.n_freqs)
+    with torch.no_grad():
+        assert model(x, x).enhanced.shape == x.shape
+
+
+@pytest.mark.parametrize("factory", [
+    lambda: AlignCRUSE(G16, alignment_mode="causal_running"),
+    lambda: AlignULCNet(G16),
+    lambda: GTCRNAENR(G16),
+    lambda: DeepVQES(G16),
+    lambda: CAGCRN(G16),
+])
+def test_no_future_frame_leakage(factory):
+    torch.manual_seed(7)
+    model = factory().eval()
+    a = _spec(1, 6, G16.n_freqs)
+    b = a.clone()
+    b[:, 4:] = _spec(1, 2, G16.n_freqs)
+    with torch.no_grad():
+        ya = model(a, a).enhanced[:, :4]
+        yb = model(b, b).enhanced[:, :4]
+    torch.testing.assert_close(ya, yb, rtol=1e-5, atol=1e-6)
+
+
+def test_old_generic_projects_are_removed():
+    root = pathlib.Path(__file__).parents[1]
+    for stale in ("AECNet", "PostFilter", "JointAECNR"):
+        assert not (root / stale).exists()

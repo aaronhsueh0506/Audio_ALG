@@ -79,7 +79,7 @@
 #     naming audio_common on the untracked dimension; +
 #     ALLOW_UNTRACKED_PUBLISH=1 succeeds with audio_common_git_untracked=1 +
 #     a 64-hex audio_common_untracked_tree_sha256, while pipelines' OWN
-#     git_untracked stays 0 -- the ainr/GTCRN|gtcrn_github whitelist holding)
+#     git_untracked stays 0 -- the AINR/GTCRN|gtcrn_github whitelist holding)
 #     and an unknown-producer probe (AEC_DIR pointed at a no-git scratch
 #     copy is refused UNCONDITIONALLY, naming lib/aec, even with BOTH knobs
 #     set).
@@ -324,7 +324,7 @@ AEC_DIR="$(cd "$PIPE_DIR/../lib/aec/c_impl" && pwd)"
 NR_DIR="$(cd "$PIPE_DIR/../lib/nr/c_impl" && pwd)"
 AEC_SUB_ROOT="$(cd "$AEC_DIR/.." && pwd)"
 NR_SUB_ROOT="$(cd "$NR_DIR/.." && pwd)"
-RNN_DIR="$(cd "$PIPE_DIR/../ainr/RNNoise-ERB" && pwd)"
+RNN_DIR="$(cd "$PIPE_DIR/../AINR/RNNoise-ERB" && pwd)"
 
 # Round-6 submodule caveat (see header comment above): lib/aec and lib/nr
 # above are still pinned at round-5. The round-6 Makefile edits live in
@@ -1429,7 +1429,7 @@ done
 [ "$sp11_untracked_fields_ok" -eq 1 ] && pass "SP-S11: attest carries all four *_git_untracked fields + allow_untracked_publish=" \
   || fail "SP-S11: attest is missing one or more of git_untracked=/audio_common_git_untracked=/aec_git_untracked=/nr_git_untracked=/allow_untracked_publish="
 
-grep -q "^git_untracked=0\$" "$first_attest" && pass "SP-S11: pipelines' own git_untracked=0 (ainr/GTCRN|gtcrn_github whitelist holds)" \
+grep -q "^git_untracked=0\$" "$first_attest" && pass "SP-S11: pipelines' own git_untracked=0 (AINR/GTCRN|gtcrn_github whitelist holds)" \
   || fail "SP-S11: pipelines' own git_untracked= is not 0 (whitelist not filtering, or a genuine untracked file is present)"
 
 release_dir_mtime_before="$(mtime "$rel_dir")"
@@ -1900,7 +1900,7 @@ echo "--- SP-S17a: untracked producer probe (audio_common) -------------------"
 # refused on the UNTRACKED dimension unless ALLOW_UNTRACKED_PUBLISH=1 is
 # ALSO given -- and once given, the attestation records
 # audio_common_git_untracked=1 + a 64-hex audio_common_untracked_tree_sha256,
-# while pipelines' OWN git_untracked stays 0 (the ainr/GTCRN|gtcrn_github
+# while pipelines' OWN git_untracked stays 0 (the AINR/GTCRN|gtcrn_github
 # whitelist holding, since this repo's own tree never gained an untracked
 # file from this scenario).
 echo "int sp17a_untracked_probe;" > "$SP17_AC_CLONE/probe.c"

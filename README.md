@@ -9,8 +9,10 @@
 - **lib/** — 獨立算法模組（Git Submodules）
   - **[aec/](https://github.com/aaronhsueh0506/AEC)**: 聲學回聲消除
   - **[nr/](https://github.com/aaronhsueh0506/CVNR)**: 傳統降噪算法
-- **ainr/**: AI 降噪模型
+- **AINR/**: AI 降噪模型
   - **RNNoise-ERB/**: RNNoise v0.2 架構 + ERB bands（16kHz, DNS4 dataset, DeepFilterNet-style augmentation）
+  - **DeepFilterNet2/**: 全頻 ERB mask → 低頻 DF → learned-alpha residual mix
+  - **DeepFilterNet3/**: 低頻 DF / 高頻 ERB mask 的平行 band-split 版本
 - **pipelines/**: AEC + NR 串接處理鏈
 - **shared/**: 共享工具和代碼
 - **docs/**: 統一文檔

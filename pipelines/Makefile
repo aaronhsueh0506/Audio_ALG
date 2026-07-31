@@ -265,7 +265,7 @@ TOOLCHAIN_CHECK ?= 1
 # THIS repo's untracked check is WHITELISTED BY PREFIX (the three producers
 # get NO such whitelist -- an untracked file there is always a violation):
 # `git ls-files --others --exclude-standard` output with any path matching
-# `^ainr/(GTCRN|gtcrn_github)/` removed (one `grep -vE`, `|| true` guards
+# `^AINR/(GTCRN|gtcrn_github)/` removed (one `grep -vE`, `|| true` guards
 # the empty-list case). This working tree permanently carries those two
 # directories as user-owned, never-staged content (see workflow docs);
 # without the whitelist, an otherwise byte-identical publish would refuse
@@ -276,7 +276,7 @@ TOOLCHAIN_CHECK ?= 1
 # files over time (still must never count against a publish);
 # `gtcrn_github/` is an EMBEDDED git checkout (its own `.git/`, not a
 # registered submodule) and so currently collapses to a single opaque
-# `ainr/gtcrn_github/` line in `git ls-files --others` output rather than
+# `AINR/gtcrn_github/` line in `git ls-files --others` output rather than
 # one line per contained file -- which is ALSO exactly the "neither a
 # regular file nor a symlink" case the X-record type-guard in
 # `hash_untracked()` would otherwise FATAL on as unhashable. If that inner
@@ -1245,8 +1245,8 @@ audit-no-stdio-stack:
 #     three producers) has resolved to a real commit does this recipe
 #     compute (a) TRACKED-dirty (`git status --porcelain -uno`, identical
 #     -uno scope for all four) and (b) UNTRACKED (`git ls-files --others
-#     --exclude-standard`; THIS repo's list has `ainr/GTCRN/` and
-#     `ainr/gtcrn_github/` whitelisted BY PREFIX -- permanent user-owned
+#     --exclude-standard`; THIS repo's list has `AINR/GTCRN/` and
+#     `AINR/gtcrn_github/` whitelisted BY PREFIX -- permanent user-owned
 #     content never staged for a publish -- the three producers get no
 #     such whitelist, so any untracked file there is always a violation).
 #     Ordering is gate-then-hash (round-7): the dirty gate runs for all
@@ -1437,7 +1437,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	  exit 1; \
 	fi; \
 	dirty=0; [ -n "$$(git status --porcelain -uno 2>/dev/null)" ] && dirty=1; \
-	unt_list="$$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE '^ainr/(GTCRN|gtcrn_github)/' || true)"; \
+	unt_list="$$(git ls-files --others --exclude-standard 2>/dev/null | grep -vE '^AINR/(GTCRN|gtcrn_github)/' || true)"; \
 	untracked=0; [ -n "$$unt_list" ] && untracked=1; \
 	if [ -z "$(AC_DIR)" ] || [ ! -d "$(AC_DIR)" ]; then \
 	  echo "FATAL: publish refused -- audio_common has no git identity (not a git checkout, or AC_DIR=$(AC_DIR) not present); no escape hatch admits this." >&2; \
@@ -1492,7 +1492,7 @@ _publish_impl: $(PUBLISH_ARTIFACTS)
 	if [ "$$aup" != "1" ]; then \
 	  bad=0; \
 	  if [ "$$untracked" = "1" ]; then \
-	    echo "FATAL: publish refused -- pipelines (this repo) contains UNTRACKED files outside the ainr/GTCRN|gtcrn_github whitelist:" >&2; \
+	    echo "FATAL: publish refused -- pipelines (this repo) contains UNTRACKED files outside the AINR/GTCRN|gtcrn_github whitelist:" >&2; \
 	    printf '%s\n' "$$unt_list" | head -5 | sed 's/^/    /' >&2; \
 	    bad=1; \
 	  fi; \
