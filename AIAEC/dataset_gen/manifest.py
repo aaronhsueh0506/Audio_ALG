@@ -1,7 +1,18 @@
-"""Source-disjoint train/validation split, decided BEFORE any audio is rendered.
+"""Source manifest: the unified pool (selected protocol) and the optional
+source-disjoint train/validation split, both decided BEFORE any audio is
+rendered.
 
-WHY THIS IS NOT THE NR SPLIT
-----------------------------
+``build_unified_manifest`` / ``--split all`` is the selected training
+protocol: every source goes in one pool, and
+``AIAEC.training_common.split_dataset_by_sample`` performs a deterministic
+per-chunk random split at load time. Chunks from one source or parent
+sequence may therefore straddle train and validation. This is useful for
+optimization tracking, but generalisation must be measured with a separate
+source-disjoint or real-recording set -- which is what the rest of this
+module (``build_manifest``) also provides, for that purpose.
+
+WHY THE SOURCE-DISJOINT MODE IS NOT THE NR SPLIT
+-------------------------------------------------
 ``AINR/dataset_gen/loader.py`` splits the *generated* corpus: it draws a permutation
 over finished clips and holds 5% out.  That is fine when every clip is an
 independent draw, and it is wrong here.
@@ -13,7 +24,8 @@ of that pair land on opposite sides of the fence, so validation measures how
 well the model memorised a room rather than how well it cancels echo.  The
 number that comes out is high, stable, reproducible, and meaningless.
 
-So the split happens over the SOURCE LISTS, before a single sample is rendered:
+So the source-disjoint split happens over the SOURCE LISTS, before a single
+sample is rendered:
 
     speaker      disjoint   (which also makes speech FILES disjoint)
     noise        disjoint
@@ -28,14 +40,6 @@ score answers a different, easier question -- say so if you use it.
 
 The manifest is written to disk so that the train run and the val run, which
 are separate invocations, provably draw from the same decision.
-
-``build_unified_manifest`` / ``--split all`` deliberately skips all of the
-above. Every source goes in one pool and
-``AIAEC.training_common.split_dataset_by_sample`` performs the selected
-per-chunk random split at load time. Chunks from one source or parent sequence
-may therefore straddle train and validation. This is useful for optimization
-tracking, but generalisation must be measured with a separate source-disjoint
-or real-recording set.
 """
 
 import configparser

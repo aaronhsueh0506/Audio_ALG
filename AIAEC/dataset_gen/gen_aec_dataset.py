@@ -4,32 +4,36 @@
 Mirrors ``AINR/dataset_gen/gen_dataset.py``'s flags so the two generators are driven
 the same way, with two additions that the NR generator has no need for:
 
-    --split       which side of the SOURCE-DISJOINT split to draw from
+    --split       'all' (the selected protocol) or a SOURCE-DISJOINT side
+                  ('train'/'val'), for a separate held-out generalisation corpus
     --manifest    where that split decision lives
 
 ⚠ The split is decided BEFORE generation, over the source lists, and both runs
 must use the SAME manifest file.  See manifest.py for why splitting after
 generation (as the NR loader does) is wrong here.
 
-Usage (source-disjoint, the default -- two runs, same --seed):
+Usage (selected training protocol -- one unified pool, then a deterministic
+random chunk split with AIAEC.training_common.split_dataset_by_sample at load
+time; this is also --split's default):
+    python3 gen_aec_dataset.py --config config.ini --output data_aec \\
+        --hours 100 --split all --workers 4 --seed 42
+
+Usage (source-disjoint -- two separate runs, same --seed/--manifest; use this
+for a held-out generalisation corpus, not the main training/validation pool):
     python3 gen_aec_dataset.py --config config.ini --output data_aec \\
         --hours 40 --split train --workers 4 --seed 42
     python3 gen_aec_dataset.py --config config.ini --output data_aec \\
         --hours 4  --split val   --workers 4 --seed 42
 
-Usage (selected training protocol: unified pool, then deterministic random
-chunk split with AIAEC.training_common.split_dataset_by_sample at load time):
-    python3 gen_aec_dataset.py --config config.ini --output data_aec \\
-        --hours 100 --split all --workers 4 --seed 42
-
 Output layout:
     data_aec/
-      manifest.json                 the split decision, shared by both runs
-                                     ('all' mode: just source-list provenance)
-      train/meta.json               run summary
-      train/seqs/000000.json        chunk metadata for one parent sequence
-      train/seqs/000000_000.wav     6-channel chunk, channels = STEM_ORDER
-      val/...                       ('all' mode: a single all/ directory instead)
+      manifest.json                 the split decision ('all' mode: just
+                                     source-list provenance)
+      all/meta.json                 run summary ('all' mode)
+      all/seqs/000000.json          chunk metadata for one parent sequence
+      all/seqs/000000_000.wav       6-channel chunk, channels = STEM_ORDER
+      train/..., val/...            source-disjoint mode instead of all/,
+                                     shared by both runs
 
 Then pack with pack_aec_dataset.py.
 """
@@ -452,17 +456,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--resume', action='store_true',
                         help='Skip sequences whose metadata sidecar already exists')
     parser.add_argument('--seed', type=int, default=42,
-                        help='Corpus seed. Fixes BOTH the source split and every '
-                             'sequence; the train and val runs must share it.')
+                        help="Corpus seed. Fixes both the source split (moot for "
+                             "--split all, a single unified pool) and every "
+                             "sequence; multiple runs sharing a manifest (the "
+                             "source-disjoint train/val pair) must share it.")
     parser.add_argument('--sample-rate', type=int, default=None,
                         help='Generation sample rate in Hz, overriding [signal] sr')
-    parser.add_argument('--split', default='train', choices=ALL_SPLIT_NAMES,
-                        help="'train'/'val': which source-disjoint pool to draw "
-                             "from (two runs, same --seed/--manifest). "
-                             "'all': one unified pool, no source split; pair "
-                             "with AIAEC.training_common.split_dataset_by_sample "
-                             "at load time. Use a separate source-disjoint or "
-                             "real-recording set for generalisation evaluation.")
+    parser.add_argument('--split', default='all', choices=ALL_SPLIT_NAMES,
+                        help="'all' (default, the selected protocol): one "
+                             "unified pool, no source split; pair with "
+                             "AIAEC.training_common.split_dataset_by_sample at "
+                             "load time. 'train'/'val': which side of a "
+                             "SOURCE-DISJOINT pool to draw from instead (two "
+                             "runs, same --seed/--manifest) -- use this for a "
+                             "separate held-out generalisation corpus, or real "
+                             "recordings, not the main training/validation pool.")
     parser.add_argument('--manifest', default=None,
                         help='Manifest path (default: <output>/manifest.json). '
                              'The train and val runs MUST use the same file '
