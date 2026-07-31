@@ -189,10 +189,13 @@ static int run_rate(int sample_rate) {
 
 static void test_invalid_configs(void) {
     FourAecNrResConfig cfg;
+    FourAecNrResMemReq req;
 
     four_aec_nr_res_config_defaults(&cfg, 8000);
     CHECK(four_aec_nr_res_create(&cfg) == NULL,
           "8 kHz is outside the 4-channel contract");
+    CHECK(four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0,
+          "static sizing rejects 8 kHz");
 
     four_aec_nr_res_config_defaults(&cfg, 16000);
     cfg.fft_size = 1024;
@@ -205,10 +208,182 @@ static void test_invalid_configs(void) {
           "invalid capture proxy is rejected");
 }
 
+static void run_static_parity(int sample_rate) {
+    FourAecNrResConfig cfg;
+    FourAecNrResMemReq req;
+    FourAecNrResMemReq stale;
+    FourAecNrResMemBreakdown breakdown;
+    FourAecNrRes* heap = NULL;
+    FourAecNrRes* stat = NULL;
+    FourAecNrResPreFrame heap_pre;
+    FourAecNrResPreFrame stat_pre;
+    unsigned char* pool = NULL;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* heap_out = NULL;
+    float* stat_out = NULL;
+    Complex* weights = NULL;
+    int hop;
+    int n_freqs;
+    int frame;
+    int ch;
+    int k;
+    int rc;
+
+    four_aec_nr_res_config_defaults(&cfg, sample_rate);
+    rc = four_aec_nr_res_get_mem_requirements(&cfg, &req);
+    CHECK(rc == 0, "static memory requirement query succeeds");
+    CHECK(
+        four_aec_nr_res_get_mem_breakdown(&cfg, &breakdown) == 0 &&
+        req.bytes == (uint64_t)breakdown.total_bytes &&
+        breakdown.aec_bytes > breakdown.nr_bytes &&
+        breakdown.wrapper_bytes > 0,
+        "static memory breakdown reconciles with descriptor");
+    if (rc != 0 || req.bytes > (uint64_t)SIZE_MAX) return;
+
+    if (posix_memalign(
+            (void**)&pool, (size_t)req.alignment,
+            (size_t)req.bytes + 32u) != 0)
+        pool = NULL;
+    CHECK(pool != NULL, "aligned caller pool allocates");
+    if (!pool) return;
+    memset(pool, 0xa5, (size_t)req.bytes + 32u);
+
+    CHECK(four_aec_nr_res_init(
+              pool + 1, (size_t)req.bytes, &cfg) == NULL,
+          "static init rejects a misaligned pool");
+    CHECK(four_aec_nr_res_init(
+              pool, (size_t)req.bytes - 1u, &cfg) == NULL,
+          "static init rejects an undersized pool");
+
+    stale = req;
+    stale.descriptor_version += 1u;
+    CHECK(four_aec_nr_res_init_ex(
+              pool, (size_t)req.bytes, &cfg, &stale) == NULL,
+          "static init_ex rejects a stale descriptor ABI");
+    stale = req;
+    stale.layout_version += 1u;
+    CHECK(four_aec_nr_res_init_ex(
+              pool, (size_t)req.bytes, &cfg, &stale) == NULL,
+          "static init_ex rejects a stale carve layout");
+    stale = req;
+    stale.backend_id = 99u;
+    CHECK(four_aec_nr_res_init_ex(
+              pool, (size_t)req.bytes, &cfg, &stale) == NULL,
+          "static init_ex rejects a backend mismatch");
+    stale = req;
+    stale.build_flags_hash ^= 0xffffffffu;
+    CHECK(four_aec_nr_res_init_ex(
+              pool, (size_t)req.bytes, &cfg, &stale) == NULL,
+          "static init_ex rejects a build-layout mismatch");
+    stale = req;
+    stale.alignment *= 2u;
+    CHECK(four_aec_nr_res_init_ex(
+              pool, (size_t)req.bytes, &cfg, &stale) == NULL,
+          "static init_ex rejects an alignment mismatch");
+    stale = req;
+    stale.reserved = 1u;
+    CHECK(four_aec_nr_res_init_ex(
+              pool, (size_t)req.bytes, &cfg, &stale) == NULL,
+          "static init_ex rejects a corrupt reserved field");
+    stale = req;
+    stale.bytes -= 1u;
+    CHECK(four_aec_nr_res_init_ex(
+              pool, (size_t)req.bytes, &cfg, &stale) == NULL,
+          "static init_ex rejects stale descriptor bytes");
+
+    stat = four_aec_nr_res_init_ex(
+        pool, (size_t)req.bytes, &cfg, &req);
+    heap = four_aec_nr_res_create(&cfg);
+    CHECK(stat != NULL && heap != NULL,
+          "poisoned caller pool and heap construction both succeed");
+    if (!stat || !heap) goto cleanup;
+
+    for (k = 0; k < 32; ++k) {
+        if (pool[(size_t)req.bytes + (size_t)k] != 0xa5) break;
+    }
+    CHECK(k == 32, "static init stays inside the queried pool");
+
+    hop = four_aec_nr_res_hop_size(stat);
+    n_freqs = four_aec_nr_res_n_freqs(stat);
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    heap_out = (float*)calloc((size_t)hop, sizeof(float));
+    stat_out = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs,
+        sizeof(Complex));
+    CHECK(microphones && ref && heap_out && stat_out && weights,
+          "static parity buffers allocate");
+    if (!microphones || !ref || !heap_out || !stat_out || !weights)
+        goto cleanup;
+
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+        for (k = 0; k < n_freqs; ++k)
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+    }
+
+    for (frame = 0; frame < 4; ++frame) {
+        fill_inputs(microphones, ref, hop, sample_rate, frame);
+        if (four_aec_nr_res_process_pre(
+                heap, microphones, ref, &heap_pre) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_pre(
+                stat, microphones, ref, &stat_pre) !=
+                FOUR_AEC_NR_RES_OK) {
+            CHECK(0, "heap/static pre stages both succeed");
+            break;
+        }
+        CHECK(memcmp(
+                  heap_pre.linear_interleaved,
+                  stat_pre.linear_interleaved,
+                  (size_t)hop * FOUR_AEC_NR_RES_CHANNELS *
+                  sizeof(float)) == 0,
+              "heap/static linear outputs are byte-identical");
+
+        if (four_aec_nr_res_process_post(
+                heap, &heap_pre.token, weights, heap_out) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_post(
+                stat, &stat_pre.token, weights, stat_out) !=
+                FOUR_AEC_NR_RES_OK) {
+            CHECK(0, "heap/static post stages both succeed");
+            break;
+        }
+        CHECK(memcmp(
+                  heap_out, stat_out,
+                  (size_t)hop * sizeof(float)) == 0,
+              "heap/static mono outputs are byte-identical");
+    }
+
+    four_aec_nr_res_destroy(stat);
+    CHECK(four_aec_nr_res_hop_size(stat) == -1,
+          "destroy marks a caller-pool instance inactive");
+    four_aec_nr_res_destroy(stat);
+    CHECK(four_aec_nr_res_hop_size(stat) == -1,
+          "caller-pool destroy is idempotent");
+    stat = four_aec_nr_res_init_ex(
+        pool, (size_t)req.bytes, &cfg, &req);
+    CHECK(stat != NULL, "caller pool is reusable after destroy");
+
+cleanup:
+    four_aec_nr_res_destroy(stat);
+    four_aec_nr_res_destroy(heap);
+    free(weights);
+    free(stat_out);
+    free(heap_out);
+    free(ref);
+    free(microphones);
+    free(pool);
+}
+
 int main(void) {
     test_invalid_configs();
     run_rate(16000);
     run_rate(48000);
+    run_static_parity(16000);
+    run_static_parity(48000);
 
     if (failures) {
         printf("%d test(s) failed\n", failures);

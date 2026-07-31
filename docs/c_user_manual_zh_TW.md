@@ -23,11 +23,13 @@
 - reusable API：`pipelines/audio_pipeline.h` / `audio_pipeline.c`
 - linkable archive：config-keyed build directory 內的 `libaudio_pipeline.a`
 - 四麥克風 API：`pipelines/aec_4ch/4aec_nr_res.h` / `4aec_nr_res.c`
+- 四麥克風 static 對照範例：`pipelines/aec_4ch/4aec_nr_res_static.c`
 - 四麥克風 archive：config-keyed build directory 內的 `lib4aec_nr_res.a`
 
 `pipelines/PLAN_audio_pipeline_api.md` 是 API 實作前的歷史設計草案，
 不是可依賴的介面。已實作的 function、descriptor version、ownership 與
-錯誤行為只以 `audio_pipeline.h` 為準。
+錯誤行為，mono 以 `audio_pipeline.h`、四麥克風以
+`aec_4ch/4aec_nr_res.h` 為準。
 
 嵌入產品時優先使用 `AudioPipeline*`：桌面／服務端可用
 `audio_pipeline_create()`，firmware 則以
@@ -51,9 +53,22 @@ linear output 與 token，交由外部 SRP-PHAT/GSC 更新 channel-major
 但會以該組權重一致地投影 error／near／echo／R2 context，再只執行一次
 NR、RES gain fusion 與 iFFT/OLA。
 
-目前只允許一個 in-flight frame；create 可配置 heap，pre/post 不配置記憶體，
-尚未提供 caller-owned-pool 版本。完整 contract、權重 convention 與 parity
-限制見 [`../pipelines/aec_4ch/README.md`](../pipelines/aec_4ch/README.md)。
+目前只允許一個 in-flight frame。建立方式比照 mono `AudioPipeline`：
+
+- `four_aec_nr_res_create()`：desktop／測試用 heap convenience；
+- `four_aec_nr_res_get_mem_requirements()` →
+  caller 配置 16-byte aligned pool →
+  `four_aec_nr_res_init_ex()`：board/static 路徑；
+- 兩種建立方式共用完全相同的 `process_pre()`／`process_post()` 核心，
+  process 不配置記憶體，16／48 kHz 皆有 byte-identical parity test。
+
+`four_aec_nr_res_destroy()` 對 static handle 不釋放 caller 的 pool；caller
+應在 destroy 後自行交還平台 memory manager。可直接對照
+`pipelines/aec_nr_pipeline_static.c` 與
+`pipelines/aec_4ch/4aec_nr_res_static.c` 的
+query → allocate → init → process → destroy → release 順序。完整 contract、
+權重 convention 與 parity 限制見
+[`../pipelines/aec_4ch/README.md`](../pipelines/aec_4ch/README.md)。
 
 ## 2. Production path
 
@@ -97,10 +112,11 @@ git submodule update --init --recursive
 建置目前的 C pipeline：
 
 ```bash
-# 從 Audio_ALG 根目錄執行 — 預設 target 會建 libs + 兩個 binary
-make -C pipelines            # aec_nr_pipeline + aec_nr_pipeline_static
+# 從 Audio_ALG 根目錄執行 — 預設 target 也會建 4ch archive/static example
+make -C pipelines            # mono heap/static + lib4aec_nr_res.a + 4ch static
 make -C pipelines BACKEND=ne10   # NE10 FFT 後端（obj/ 依 backend+參數雜湊分開目錄，免手動 clean-libs）
 make -C pipelines lib4aec_nr_res.a
+make -C pipelines 4aec_nr_res_static
 make -C pipelines test_4aec_nr_res
 ```
 

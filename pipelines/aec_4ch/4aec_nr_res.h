@@ -14,10 +14,35 @@
  *
  * It does not select one microphone's RES gain and does not replicate NR/RES
  * per channel.
+ *
+ * The lifecycle intentionally mirrors pipelines/audio_pipeline.h:
+ *
+ *   Caller-owned pool (board/static path):
+ *
+ *     FourAecNrResConfig cfg;
+ *     FourAecNrResMemReq req;
+ *     four_aec_nr_res_config_defaults(&cfg, 16000);
+ *     four_aec_nr_res_get_mem_requirements(&cfg, &req);
+ *     void* pool = platform_alloc(req.bytes, req.alignment);
+ *     FourAecNrRes* p =
+ *         four_aec_nr_res_init_ex(pool, req.bytes, &cfg, &req);
+ *     ...
+ *     four_aec_nr_res_destroy(p);  // never releases caller-owned pool
+ *     platform_free(pool);
+ *
+ *   Heap convenience (desktop/test path):
+ *
+ *     FourAecNrRes* p = four_aec_nr_res_create(&cfg);
+ *     ...
+ *     four_aec_nr_res_destroy(p);  // releases create()'s one pool
+ *
+ * Both construction paths use the same process_pre()/process_post() core and
+ * must be byte-identical for the same inputs, weights, config, and backend.
  */
 #ifndef FOUR_AEC_NR_RES_H
 #define FOUR_AEC_NR_RES_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "aec.h"
@@ -28,6 +53,81 @@ extern "C" {
 #endif
 
 #define FOUR_AEC_NR_RES_CHANNELS 4
+
+/* ============================================================================
+ * Memory descriptor
+ * ========================================================================== */
+
+#define FOUR_AEC_NR_RES_DESCRIPTOR_VERSION 1u
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 1u
+#define FOUR_AEC_NR_RES_BACKEND_KISS 1u
+#define FOUR_AEC_NR_RES_BACKEND_NE10 2u
+
+/**
+ * Fixed-width descriptor for a caller-owned static-memory pool.
+ *
+ * Query it at init time and pass the same value to init_ex(). Do not cache it
+ * across library, backend, compiler-flag, or config changes.
+ */
+typedef struct FourAecNrResMemReq {
+    uint32_t descriptor_version;
+    uint32_t layout_version;
+    uint32_t backend_id;
+    uint32_t build_flags_hash;
+    uint32_t alignment;
+    uint32_t reserved;
+    uint64_t bytes;
+} FourAecNrResMemReq;
+
+#if defined(__cplusplus)
+#define FOUR_AEC_NR_RES_STATIC_ASSERT(condition, message) \
+    static_assert(condition, message)
+#else
+#define FOUR_AEC_NR_RES_STATIC_ASSERT(condition, message) \
+    _Static_assert(condition, message)
+#endif
+
+FOUR_AEC_NR_RES_STATIC_ASSERT(
+    sizeof(FourAecNrResMemReq) == 32,
+    "FourAecNrResMemReq must be exactly 32 bytes");
+FOUR_AEC_NR_RES_STATIC_ASSERT(
+    offsetof(FourAecNrResMemReq, descriptor_version) == 0,
+    "descriptor_version offset");
+FOUR_AEC_NR_RES_STATIC_ASSERT(
+    offsetof(FourAecNrResMemReq, layout_version) == 4,
+    "layout_version offset");
+FOUR_AEC_NR_RES_STATIC_ASSERT(
+    offsetof(FourAecNrResMemReq, backend_id) == 8,
+    "backend_id offset");
+FOUR_AEC_NR_RES_STATIC_ASSERT(
+    offsetof(FourAecNrResMemReq, build_flags_hash) == 12,
+    "build_flags_hash offset");
+FOUR_AEC_NR_RES_STATIC_ASSERT(
+    offsetof(FourAecNrResMemReq, alignment) == 16,
+    "alignment offset");
+FOUR_AEC_NR_RES_STATIC_ASSERT(
+    offsetof(FourAecNrResMemReq, reserved) == 20,
+    "reserved offset");
+FOUR_AEC_NR_RES_STATIC_ASSERT(
+    offsetof(FourAecNrResMemReq, bytes) == 24,
+    "bytes offset");
+
+#undef FOUR_AEC_NR_RES_STATIC_ASSERT
+
+typedef struct FourAecNrResMemBreakdown {
+    size_t aec_bytes;       /* four AEC pools combined */
+    size_t nr_bytes;
+    size_t fft_bytes;
+    size_t wrapper_bytes;   /* control block + shared/post-beam state */
+    size_t total_bytes;
+    int hop_size;
+    int fft_size;
+    int n_freqs;
+} FourAecNrResMemBreakdown;
+
+/* ============================================================================
+ * Config, frame handoff and status
+ * ========================================================================== */
 
 typedef enum FourAecNrResStatus {
     FOUR_AEC_NR_RES_OK = 0,
@@ -85,13 +185,54 @@ typedef struct FourAecNrResPreFrame {
 
 typedef struct FourAecNrRes FourAecNrRes;
 
+/* ============================================================================
+ * Config and lifecycle
+ * ========================================================================== */
+
 /** Fill a validated default: 16 kHz, 512/256, balanced AEC/NR, CNG on. */
 void four_aec_nr_res_config_defaults(FourAecNrResConfig* cfg,
                                      int sample_rate);
 
 /**
- * Heap construction. All memory is allocated here; process_pre/post perform
- * no allocation. Returns NULL for an invalid config or allocation failure.
+ * Query the complete 16-byte-aligned caller pool required by cfg.
+ * Performs no allocation and returns 0 on success.
+ */
+int four_aec_nr_res_get_mem_requirements(
+    const FourAecNrResConfig* cfg,
+    FourAecNrResMemReq* out);
+
+/** Optional module/wrapper split for board memory-budget reporting. */
+int four_aec_nr_res_get_mem_breakdown(
+    const FourAecNrResConfig* cfg,
+    FourAecNrResMemBreakdown* out);
+
+/**
+ * Place the complete four-AEC/NR/RES pipeline in caller-owned memory.
+ *
+ * mem must satisfy the freshly queried alignment and byte requirement.
+ * No heap allocation is performed by this path, including inside the four
+ * AECs, NR, and FFT backend. A dirty/poisoned pool is accepted.
+ */
+FourAecNrRes* four_aec_nr_res_init(
+    void* mem,
+    size_t bytes,
+    const FourAecNrResConfig* cfg);
+
+/**
+ * Static init plus a stale-descriptor gate. expected should be the descriptor
+ * returned by a fresh get_mem_requirements() call for this exact build/config.
+ * NULL expected is equivalent to four_aec_nr_res_init().
+ */
+FourAecNrRes* four_aec_nr_res_init_ex(
+    void* mem,
+    size_t bytes,
+    const FourAecNrResConfig* cfg,
+    const FourAecNrResMemReq* expected);
+
+/**
+ * Heap convenience wrapper over get_mem_requirements() + init(). All memory
+ * is allocated here; process_pre/post perform no allocation. Returns NULL for
+ * an invalid config or allocation failure.
  */
 FourAecNrRes* four_aec_nr_res_create(const FourAecNrResConfig* cfg);
 
@@ -100,8 +241,16 @@ FourAecNrRes* four_aec_nr_res_create(const FourAecNrResConfig* cfg);
  */
 void four_aec_nr_res_reset(FourAecNrRes* self);
 
-/** Destroy a heap-created instance. NULL-safe; call once for a live handle. */
+/**
+ * Destroy an instance. For caller-owned memory this is idempotent and never
+ * frees the pool; the caller releases/reuses it afterward. For a heap-created
+ * handle it frees the one owned pool, so call once as with free().
+ */
 void four_aec_nr_res_destroy(FourAecNrRes* self);
+
+/* ============================================================================
+ * Per-hop processing
+ * ========================================================================== */
 
 /**
  * Run the shared matcher, one shared reference delay line, and four linear
@@ -138,6 +287,10 @@ int four_aec_nr_res_process_post(
     const FourAecNrResFrameToken* token,
     const Complex* weights,
     float* out);
+
+/* ============================================================================
+ * Read-only shape/topology accessors
+ * ========================================================================== */
 
 int four_aec_nr_res_hop_size(const FourAecNrRes* self);
 int four_aec_nr_res_fft_size(const FourAecNrRes* self);

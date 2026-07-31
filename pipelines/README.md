@@ -162,6 +162,7 @@ make test
 # Build the separate 4-channel wrapper archive or its standalone structural
 # and lifecycle test binary. `make test` above executes that binary.
 make lib4aec_nr_res.a
+make 4aec_nr_res_static
 make test_4aec_nr_res
 
 # Build + run JUST the REFERENCE ONLY board-adapter example standalone
@@ -177,9 +178,14 @@ make audit-no-stdio
 `make` builds both `libaudio_pipeline.a` and `lib4aec_nr_res.a`.
 `libaudio_pipeline.a` is the pool-sizing/carving/processing library that both
 mono CLIs wrap; see "Board Integration" below for its firmware API,
-`NO_STDIO=1` knob, and `audit-no-stdio` target. The 4-channel library currently
-has heap construction with allocation-free pre/post processing, but no
-caller-owned-pool constructor.
+`NO_STDIO=1` knob, and `audit-no-stdio` target. `lib4aec_nr_res.a` follows the
+same pool-first pattern: `four_aec_nr_res_create()` is the heap convenience
+path, while `four_aec_nr_res_get_mem_requirements()` +
+`four_aec_nr_res_init_ex()` place the complete four-AEC/NR/FFT/shared-wrapper
+state in one caller-owned 16-byte-aligned pool. Both construction paths share
+the same allocation-free pre/post processing core and are byte-parity tested
+at 16 and 48 kHz. See [`aec_4ch/README.md`](aec_4ch/README.md) and
+`4aec_nr_res_static` for the directly comparable board sequence.
 
 ## Debugging & Performance Flags
 

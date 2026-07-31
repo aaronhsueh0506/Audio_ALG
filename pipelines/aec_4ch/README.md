@@ -48,9 +48,25 @@ The deployable C seam is:
 - [`4aec_nr_res.c`](4aec_nr_res.c): one shared `DelayAec3`, four linear
   `Aec` instances, coherent context projection, one `SuppressionGain`, one
   MMSE-LSA instance, and one final iFFT/OLA;
+- [`4aec_nr_res_static.c`](4aec_nr_res_static.c): caller-owned-pool example
+  following the same query → allocate → `init_ex` → process → destroy →
+  release sequence as the mono `aec_nr_pipeline_static.c`;
 - [`test_4aec_nr_res.c`](test_4aec_nr_res.c): 16/48 kHz grid, lifecycle,
-  ordering, token invalidation, invalid-config, weight, and finite-output
-  acceptance tests.
+  ordering, token invalidation, invalid-config, pool-boundary, heap/static
+  byte-parity, weight, and finite-output acceptance tests.
+
+The naming maps directly to the mono pool-first API:
+
+| Mono `audio_pipeline_*` | Four-channel `four_aec_nr_res_*` |
+|---|---|
+| `default_config` | `config_defaults` |
+| `get_mem_requirements` | `get_mem_requirements` |
+| `init_ex` / `init` | `init_ex` / `init` |
+| `create` | `create` |
+| `process` | `process_pre` → external beamformer → `process_post` |
+| `reset` / `destroy` | `reset` / `destroy` |
+
+Heap convenience:
 
 ```c
 FourAecNrResConfig cfg;
@@ -71,19 +87,45 @@ four_aec_nr_res_process_post(pipeline, &pre.token, weights, mono_output);
 four_aec_nr_res_destroy(pipeline);
 ```
 
+Caller-owned pool (static/board path):
+
+```c
+FourAecNrResConfig cfg;
+FourAecNrResMemReq req;
+FourAecNrRes *pipeline;
+void *pool;
+
+four_aec_nr_res_config_defaults(&cfg, 16000);
+four_aec_nr_res_get_mem_requirements(&cfg, &req);
+pool = platform_alloc(req.bytes, req.alignment);
+pipeline = four_aec_nr_res_init_ex(
+    pool, (size_t)req.bytes, &cfg, &req);
+
+/* The per-hop pre -> external beamformer -> post calls are identical. */
+
+four_aec_nr_res_destroy(pipeline); /* does not release caller-owned memory */
+platform_free(pool);
+```
+
 Only one pre frame may be in flight. `process_post()` must receive the exact
 token returned by `process_pre()`; replay, cross-instance use, and a token
 invalidated by `reset()` are rejected. Invalid weights leave the frame pending
-so the caller may correct and retry them. Construction may allocate from the
-heap, while both process calls perform no allocation.
+so the caller may correct and retry them. `create()` allocates one complete
+pool; `init_ex()` uses only the caller's aligned pool. Both process calls
+perform no allocation.
 
 Build the archive or run the complete C acceptance gate from
 `Audio_ALG/pipelines`:
 
 ```bash
 make lib4aec_nr_res.a
+make 4aec_nr_res_static     # build caller-pool reference executable
 make test_4aec_nr_res      # build only the standalone 4-channel test binary
 make test                 # build and run it plus mono/board-adapter tests
+
+# Query the exact pool budget for the supported grids.
+"$(make -s print-bin-dir)/4aec_nr_res_static" --print-mem-size --sample-rate 16000
+"$(make -s print-bin-dir)/4aec_nr_res_static" --print-mem-size --sample-rate 48000
 ```
 
 The archive contains this repository's wrapper object. A consumer links it
@@ -141,11 +183,12 @@ therefore uses bounded R2 for both gain inputs and omits the stationary mask.
 This is structurally correct but **not bit-exact** to a future fully extracted
 AEC3 post-beam RES API; it must be cohort-tuned before production sign-off.
 
-The C wrapper also does not yet expose a caller-owned-pool constructor, async
-multi-frame queue, or a real SRP-PHAT/GSC implementation. Its automated tests
-prove lifecycle, topology, supported grids, sequencing, and finite DSP output;
-they do not replace real-array recordings, objective speech metrics, or
-subjective quality sign-off with the external beamformer.
+The C wrapper does not expose an async multi-frame queue or a real
+SRP-PHAT/GSC implementation. Its automated tests prove caller-pool and heap
+lifecycle, byte-identical construction paths, topology, supported grids,
+sequencing, and finite DSP output; they do not replace real-array recordings,
+objective speech metrics, or subjective quality sign-off with the external
+beamformer.
 
 Default no-padding grids are `512/256 @ 16 kHz` and `1024/512 @ 48 kHz`, where
 the frame length is the FFT length and hop is half the frame.

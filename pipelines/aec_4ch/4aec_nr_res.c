@@ -8,7 +8,17 @@
  *   -> externally supplied effective beamformer weights
  *   -> one coherent post-beam RES + one NR + one iFFT/OLA
  *
- * Construction may allocate. The two process calls do not.
+ * Like pipelines/audio_pipeline.c, this is a pool-first core with two
+ * construction paths:
+ *
+ *   four_aec_nr_res_get_mem_requirements() + four_aec_nr_res_init_ex()
+ *       caller-owned pool; zero heap from init through destroy
+ *
+ *   four_aec_nr_res_create()
+ *       heap convenience wrapper over that same pool-first implementation
+ *
+ * Both paths call the same process_pre()/process_post() implementation and
+ * therefore have identical DSP arithmetic. Neither process call allocates.
  */
 
 #include "4aec_nr_res.h"
@@ -19,8 +29,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "aec3_balanced_config.h"
 #include "fft_wrapper.h"
+#include "mem_align.h"
 #include "suppression_gain.h"
+
+#ifndef AUDIO_PIPELINE_BACKEND_STR
+#define AUDIO_PIPELINE_BACKEND_STR "unknown"
+#endif
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -34,6 +50,10 @@
 #define FOUR_AEC_NR_RES_FAR_GATE_THRESHOLD 1e-4f
 #define FOUR_AEC_NR_RES_NEAR_GATE_THRESHOLD 1e-3f
 #define FOUR_AEC_NR_RES_NEAR_HANGOVER 8
+
+/* ============================================================================
+ * Instance
+ * ========================================================================== */
 
 typedef struct FourAecLaneSnapshot {
     Complex* error_spec;
@@ -61,7 +81,7 @@ struct FourAecNrRes {
     int rate_factor;
     int initialized_lanes;
 
-    Aec lanes[FOUR_AEC_NR_RES_CHANNELS];
+    Aec* lanes[FOUR_AEC_NR_RES_CHANNELS];
     DelayAec3 shared_delay;
     MmseLsaDenoiser* nr;
     FftHandle* fft;
@@ -113,7 +133,20 @@ struct FourAecNrRes {
     uint64_t generation;
     int pending;
     FourAecNrResFrameToken pending_token;
+
+    void* owned_heap;
+    size_t pool_size;
+    int destroyed;
 };
+
+typedef struct FourPoolCursor {
+    uint8_t* ptr;
+    size_t remaining;
+} FourPoolCursor;
+
+/* ============================================================================
+ * Config validation and small DSP helpers
+ * ========================================================================== */
 
 static int four_is_bool(int value) {
     return value == 0 || value == 1;
@@ -152,33 +185,44 @@ static int four_validate_config(const FourAecNrResConfig* cfg,
     return 1;
 }
 
-static void* four_calloc(size_t count, size_t size) {
-    if (count == 0 || size == 0 || count > SIZE_MAX / size) return NULL;
-    return calloc(count, size);
+/* Pool cursor primitive: same ALIGN16 discipline as audio_pipeline.c. */
+static void* four_carve(FourPoolCursor* cursor,
+                        size_t count,
+                        size_t element_size) {
+    size_t raw;
+    size_t aligned;
+    void* out;
+    if (!cursor || count == 0 || element_size == 0) return NULL;
+    raw = ck_mul_size(count, element_size);
+    aligned = ck_align16_size(raw);
+    if (MEM_SIZE_INVALID(raw) || MEM_SIZE_INVALID(aligned) ||
+        aligned > cursor->remaining) return NULL;
+    out = cursor->ptr;
+    cursor->ptr += aligned;
+    cursor->remaining -= aligned;
+    return out;
 }
 
-static int four_alloc_lane_snapshot(FourAecLaneSnapshot* s, int n_freqs) {
-    s->error_spec = (Complex*)four_calloc((size_t)n_freqs, sizeof(Complex));
-    s->echo_spec = (Complex*)four_calloc((size_t)n_freqs, sizeof(Complex));
-    s->far_spec = (Complex*)four_calloc((size_t)n_freqs, sizeof(Complex));
-    s->near_spec = (Complex*)four_calloc((size_t)n_freqs, sizeof(Complex));
-    s->r2 = (float*)four_calloc((size_t)n_freqs, sizeof(float));
-    s->comfort_noise = (float*)four_calloc((size_t)n_freqs, sizeof(float));
+static int four_carve_lane_snapshot(FourAecLaneSnapshot* s,
+                                    FourPoolCursor* cursor,
+                                    int n_freqs) {
+    s->error_spec =
+        (Complex*)four_carve(cursor, (size_t)n_freqs, sizeof(Complex));
+    s->echo_spec =
+        (Complex*)four_carve(cursor, (size_t)n_freqs, sizeof(Complex));
+    s->far_spec =
+        (Complex*)four_carve(cursor, (size_t)n_freqs, sizeof(Complex));
+    s->near_spec =
+        (Complex*)four_carve(cursor, (size_t)n_freqs, sizeof(Complex));
+    s->r2 = (float*)four_carve(
+        cursor, (size_t)n_freqs, sizeof(float));
+    s->comfort_noise = (float*)four_carve(
+        cursor, (size_t)n_freqs, sizeof(float));
     return s->error_spec && s->echo_spec && s->far_spec && s->near_spec &&
            s->r2 && s->comfort_noise;
 }
 
-static void four_free_lane_snapshot(FourAecLaneSnapshot* s) {
-    if (!s) return;
-    free(s->error_spec);
-    free(s->echo_spec);
-    free(s->far_spec);
-    free(s->near_spec);
-    free(s->r2);
-    free(s->comfort_noise);
-    memset(s, 0, sizeof(*s));
-}
-
+/* Per-hop validation/math helpers. */
 static int four_inputs_finite(const float* data, size_t count) {
     size_t i;
     if (!data) return 0;
@@ -238,7 +282,16 @@ void four_aec_nr_res_config_defaults(FourAecNrResConfig* cfg,
     cfg->legacy_amin = 0;
 }
 
-static int four_allocate_working_buffers(FourAecNrRes* self) {
+/* ============================================================================
+ * Pool sizing and carving
+ *
+ * This is the 4-channel counterpart of audio_pipeline.c's
+ * pipeline_pool_size()/pipeline_build(): all module objects and every
+ * scratch/state buffer are 16-byte-aligned segments in one pool.
+ * ========================================================================== */
+
+static int four_carve_working_buffers(FourAecNrRes* self,
+                                      FourPoolCursor* cursor) {
     int ch;
     int n = self->n_freqs;
     int hop = self->hop_size;
@@ -246,34 +299,56 @@ static int four_allocate_working_buffers(FourAecNrRes* self) {
     size_t linear_count = (size_t)hop * FOUR_AEC_NR_RES_CHANNELS;
 
     self->linear_interleaved =
-        (float*)four_calloc(linear_count, sizeof(float));
-    self->mic_lane = (float*)four_calloc((size_t)hop, sizeof(float));
-    self->lane_out = (float*)four_calloc((size_t)hop, sizeof(float));
-    self->aligned_ref = (float*)four_calloc((size_t)hop, sizeof(float));
-    self->render_i16 = (float*)four_calloc((size_t)hop, sizeof(float));
-    self->delay_capture = (float*)four_calloc((size_t)hop, sizeof(float));
-    self->delay_render = (float*)four_calloc((size_t)hop, sizeof(float));
+        (float*)four_carve(cursor, linear_count, sizeof(float));
+    self->mic_lane =
+        (float*)four_carve(cursor, (size_t)hop, sizeof(float));
+    self->lane_out =
+        (float*)four_carve(cursor, (size_t)hop, sizeof(float));
+    self->aligned_ref =
+        (float*)four_carve(cursor, (size_t)hop, sizeof(float));
+    self->render_i16 =
+        (float*)four_carve(cursor, (size_t)hop, sizeof(float));
+    self->delay_capture =
+        (float*)four_carve(cursor, (size_t)hop, sizeof(float));
+    self->delay_render =
+        (float*)four_carve(cursor, (size_t)hop, sizeof(float));
 
-    self->fused_error = (Complex*)four_calloc((size_t)n, sizeof(Complex));
-    self->fused_echo = (Complex*)four_calloc((size_t)n, sizeof(Complex));
-    self->fused_near = (Complex*)four_calloc((size_t)n, sizeof(Complex));
-    self->fused_far = (Complex*)four_calloc((size_t)n, sizeof(Complex));
-    self->output_spec = (Complex*)four_calloc((size_t)n, sizeof(Complex));
+    self->fused_error =
+        (Complex*)four_carve(cursor, (size_t)n, sizeof(Complex));
+    self->fused_echo =
+        (Complex*)four_carve(cursor, (size_t)n, sizeof(Complex));
+    self->fused_near =
+        (Complex*)four_carve(cursor, (size_t)n, sizeof(Complex));
+    self->fused_far =
+        (Complex*)four_carve(cursor, (size_t)n, sizeof(Complex));
+    self->output_spec =
+        (Complex*)four_carve(cursor, (size_t)n, sizeof(Complex));
 
-    self->fused_r2 = (float*)four_calloc((size_t)n, sizeof(float));
-    self->fused_comfort = (float*)four_calloc((size_t)n, sizeof(float));
-    self->post_near_power = (float*)four_calloc((size_t)n, sizeof(float));
-    self->nr_gain = (float*)four_calloc((size_t)n, sizeof(float));
-    self->total_gain = (float*)four_calloc((size_t)n, sizeof(float));
-    self->extra_noise = (float*)four_calloc((size_t)n, sizeof(float));
-    self->error_power = (float*)four_calloc((size_t)n, sizeof(float));
+    self->fused_r2 =
+        (float*)four_carve(cursor, (size_t)n, sizeof(float));
+    self->fused_comfort =
+        (float*)four_carve(cursor, (size_t)n, sizeof(float));
+    self->post_near_power =
+        (float*)four_carve(cursor, (size_t)n, sizeof(float));
+    self->nr_gain =
+        (float*)four_carve(cursor, (size_t)n, sizeof(float));
+    self->total_gain =
+        (float*)four_carve(cursor, (size_t)n, sizeof(float));
+    self->extra_noise =
+        (float*)four_carve(cursor, (size_t)n, sizeof(float));
+    self->error_power =
+        (float*)four_carve(cursor, (size_t)n, sizeof(float));
 
-    self->synth_window = (float*)four_calloc((size_t)fft, sizeof(float));
-    self->ifft_buffer = (float*)four_calloc((size_t)fft, sizeof(float));
-    self->ola = (float*)four_calloc((size_t)fft, sizeof(float));
+    self->synth_window =
+        (float*)four_carve(cursor, (size_t)fft, sizeof(float));
+    self->ifft_buffer =
+        (float*)four_carve(cursor, (size_t)fft, sizeof(float));
+    self->ola =
+        (float*)four_carve(cursor, (size_t)fft, sizeof(float));
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-        if (!four_alloc_lane_snapshot(&self->snapshots[ch], n)) return 0;
+        if (!four_carve_lane_snapshot(
+                &self->snapshots[ch], cursor, n)) return 0;
     }
 
     return self->linear_interleaved && self->mic_lane && self->lane_out &&
@@ -287,21 +362,22 @@ static int four_allocate_working_buffers(FourAecNrRes* self) {
            self->ola;
 }
 
-static int four_init_post_sg(FourAecNrRes* self) {
+static int four_init_post_sg(FourAecNrRes* self,
+                             FourPoolCursor* pool_cursor) {
     int n = self->n_freqs;
     int ma_n;
     size_t float_count;
     float* cursor;
 
-    self->post_sg_cfg = self->lanes[0].a3_sg.cfg;
-    self->post_sg_tun = self->lanes[0].a3_sg.tun;
+    self->post_sg_cfg = self->lanes[0]->a3_sg.cfg;
+    self->post_sg_tun = self->lanes[0]->a3_sg.tun;
     ma_n = self->post_sg_cfg.nearend_smoother_n;
     if (ma_n < 1 || self->post_sg_cfg.n_bins != n ||
         self->post_sg_tun.table_len != n) return 0;
 
     float_count = (size_t)(10 + ma_n) * (size_t)n;
     self->post_sg_storage =
-        (float*)four_calloc(float_count, sizeof(float));
+        (float*)four_carve(pool_cursor, float_count, sizeof(float));
     if (!self->post_sg_storage) return 0;
 
     cursor = self->post_sg_storage;
@@ -326,78 +402,346 @@ static int four_init_post_sg(FourAecNrRes* self) {
     return 1;
 }
 
-FourAecNrRes* four_aec_nr_res_create(const FourAecNrResConfig* cfg) {
-    FourAecNrRes* self;
-    AecConfig aec_cfg;
-    MmseLsaConfig nr_cfg;
-    int fft_size;
-    int ch;
+static int four_derive_configs(
+    const FourAecNrResConfig* cfg,
+    AecConfig* aec_cfg,
+    MmseLsaConfig* nr_cfg,
+    int* fft_size,
+    int* hop_size,
+    int* n_freqs,
+    int* post_ma_n,
+    int* delay_ring_size) {
+    const Aec3BalancedRateDims* rate_dims;
     int max_delay_samples;
-    int k;
+    if (!cfg || !aec_cfg || !nr_cfg || !fft_size || !hop_size ||
+        !n_freqs || !post_ma_n || !delay_ring_size ||
+        !four_validate_config(cfg, fft_size)) return 0;
 
-    if (!four_validate_config(cfg, &fft_size)) return NULL;
-
-    self = (FourAecNrRes*)calloc(1, sizeof(*self));
-    if (!self) return NULL;
-    self->cfg = *cfg;
-    self->sample_rate = cfg->sample_rate;
-    self->fft_size = fft_size;
-    self->hop_size = fft_size / 2;
-    self->n_freqs = fft_size / 2 + 1;
-    self->rate_factor = cfg->sample_rate / 16000;
-    self->rng_state = FOUR_AEC_NR_RES_RNG_SEED;
-
-    aec_config_from_preset(&aec_cfg, cfg->aec_preset, cfg->sample_rate);
-    aec_cfg.fft_size = fft_size;
-    if (cfg->filter_length > 0) aec_cfg.filter_length = cfg->filter_length;
-    aec_cfg.enable_delay_est = 0;
-    aec_cfg.enable_res = 0;
-    aec_cfg.return_res_context = 1;
-
-    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-        if (aec_create(&self->lanes[ch], &aec_cfg) != 0) {
-            four_aec_nr_res_destroy(self);
-            return NULL;
-        }
-        self->initialized_lanes += 1;
-    }
-
-    delay_aec3_init(&self->shared_delay);
-
-    nr_cfg = mmse_lsa_config_for_mode_grid(
-        cfg->sample_rate, fft_size, cfg->nr_mode);
-    nr_cfg.L = mmse_lsa_retime_frames(
-        150, cfg->sample_rate, self->hop_size);
-    nr_cfg.alpha_d = mmse_lsa_retime_alpha(
-        0.95f, cfg->sample_rate, self->hop_size);
-    nr_cfg.alpha_attack = mmse_lsa_retime_alpha(
-        0.3f, cfg->sample_rate, self->hop_size);
-    nr_cfg.alpha_decay = nr_cfg.alpha_g;
-    self->nr = mmse_lsa_create(&nr_cfg);
-    self->fft = fft_create(fft_size);
-    if (!self->nr || !self->fft || !four_allocate_working_buffers(self) ||
-        !four_init_post_sg(self)) {
-        four_aec_nr_res_destroy(self);
-        return NULL;
-    }
+    *hop_size = *fft_size / 2;
+    *n_freqs = *fft_size / 2 + 1;
+    rate_dims = aec3b_rate_cfg(cfg->sample_rate, *fft_size);
+    if (!rate_dims || rate_dims->sg_nearend_smoother_n < 1) return 0;
+    *post_ma_n = rate_dims->sg_nearend_smoother_n;
 
     max_delay_samples =
         (int)ceilf(cfg->max_delay_ms * (float)cfg->sample_rate / 1000.0f);
-    self->delay_ring_size = max_delay_samples + 2 * self->hop_size + 1;
-    self->delay_ring = (float*)four_calloc(
-        (size_t)self->delay_ring_size, sizeof(float));
-    if (!self->delay_ring) {
-        four_aec_nr_res_destroy(self);
-        return NULL;
+    *delay_ring_size = max_delay_samples + 2 * *hop_size + 1;
+    if (*delay_ring_size <= 0) return 0;
+
+    aec_config_from_preset(aec_cfg, cfg->aec_preset, cfg->sample_rate);
+    aec_cfg->fft_size = *fft_size;
+    if (cfg->filter_length > 0)
+        aec_cfg->filter_length = cfg->filter_length;
+    aec_cfg->enable_delay_est = 0;
+    aec_cfg->enable_res = 0;
+    aec_cfg->return_res_context = 1;
+
+    *nr_cfg = mmse_lsa_config_for_mode_grid(
+        cfg->sample_rate, *fft_size, cfg->nr_mode);
+    nr_cfg->L = mmse_lsa_retime_frames(
+        150, cfg->sample_rate, *hop_size);
+    nr_cfg->alpha_d = mmse_lsa_retime_alpha(
+        0.95f, cfg->sample_rate, *hop_size);
+    nr_cfg->alpha_attack = mmse_lsa_retime_alpha(
+        0.3f, cfg->sample_rate, *hop_size);
+    nr_cfg->alpha_decay = nr_cfg->alpha_g;
+    return 1;
+}
+
+static size_t four_wrapper_storage_size(
+    int hop, int fft, int n, int post_ma_n, int delay_ring_size) {
+    size_t total = 0;
+    int ch;
+    int i;
+
+    total = ck_field_size(
+        total,
+        ck_mul_size((size_t)hop, FOUR_AEC_NR_RES_CHANNELS),
+        sizeof(float));                                      /* linear */
+    for (i = 0; i < 6; ++i)
+        total = ck_field_size(total, (size_t)hop, sizeof(float));
+
+    for (i = 0; i < 5; ++i)
+        total = ck_field_size(total, (size_t)n, sizeof(Complex));
+    for (i = 0; i < 7; ++i)
+        total = ck_field_size(total, (size_t)n, sizeof(float));
+    for (i = 0; i < 3; ++i)
+        total = ck_field_size(total, (size_t)fft, sizeof(float));
+
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+        for (i = 0; i < 4; ++i)
+            total = ck_field_size(
+                total, (size_t)n, sizeof(Complex));
+        for (i = 0; i < 2; ++i)
+            total = ck_field_size(
+                total, (size_t)n, sizeof(float));
     }
 
-    for (k = 0; k < fft_size; ++k) {
-        self->synth_window[k] = sqrtf(
-            0.5f * (1.0f - cosf(2.0f * M_PI_F * (float)k /
-                                (float)fft_size)));
+    total = ck_field_size(
+        total,
+        ck_mul_size((size_t)(10 + post_ma_n), (size_t)n),
+        sizeof(float));                                      /* post SG */
+    total = ck_field_size(
+        total, (size_t)delay_ring_size, sizeof(float));
+    return MEM_SIZE_INVALID(total) ? 0 : total;
+}
+
+static uint32_t four_backend_id(void) {
+    if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "kiss") == 0)
+        return FOUR_AEC_NR_RES_BACKEND_KISS;
+    if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "ne10") == 0)
+        return FOUR_AEC_NR_RES_BACKEND_NE10;
+    return 0u;
+}
+
+static uint32_t four_fnv1a(const char* text, uint32_t hash) {
+    while (*text) {
+        hash ^= (uint32_t)(unsigned char)*text++;
+        hash *= 16777619u;
     }
+    return hash;
+}
+
+static uint32_t four_build_flags_hash(void) {
+    uint32_t hash = 2166136261u;
+    hash = four_fnv1a(AUDIO_PIPELINE_BACKEND_STR, hash);
+    hash = four_fnv1a(
+        "|carve:self,aec0,aec1,aec2,aec3,nr,fft,linear,hop6,"
+        "complex5,float7,fftfloat3,snapshot4x6,postsg,delayring",
+        hash);
+    hash = four_fnv1a("|align16", hash);
+    return hash;
+}
+
+/* ============================================================================
+ * Public memory query and construction
+ *
+ * Same order as the mono board flow:
+ *   defaults -> get_mem_requirements -> init_ex
+ * and the desktop convenience flow:
+ *   defaults -> create
+ * ========================================================================== */
+
+int four_aec_nr_res_get_mem_breakdown(
+    const FourAecNrResConfig* cfg,
+    FourAecNrResMemBreakdown* out) {
+    AecConfig aec_cfg;
+    MmseLsaConfig nr_cfg;
+    size_t aec_one;
+    size_t aec_total = 0;
+    size_t nr_bytes;
+    size_t fft_bytes;
+    size_t wrapper_storage;
+    size_t wrapper_bytes;
+    size_t total;
+    int fft;
+    int hop;
+    int n;
+    int post_ma_n;
+    int delay_ring_size;
+    int ch;
+
+    if (!out || !four_derive_configs(
+            cfg, &aec_cfg, &nr_cfg, &fft, &hop, &n,
+            &post_ma_n, &delay_ring_size)) return -1;
+
+    aec_one = aec_get_mem_size(&aec_cfg);
+    nr_bytes = mmse_lsa_get_mem_size(&nr_cfg);
+    fft_bytes = fft_get_mem_size(fft);
+    wrapper_storage = four_wrapper_storage_size(
+        hop, fft, n, post_ma_n, delay_ring_size);
+    if (aec_one == 0 || nr_bytes == 0 || fft_bytes == 0 ||
+        wrapper_storage == 0) return -1;
+
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+        aec_total = ck_add_size(aec_total, ck_align16_size(aec_one));
+    wrapper_bytes = ck_add_size(
+        ck_align16_size(sizeof(FourAecNrRes)), wrapper_storage);
+    total = wrapper_bytes;
+    total = ck_add_size(total, aec_total);
+    total = ck_add_size(total, ck_align16_size(nr_bytes));
+    total = ck_add_size(total, ck_align16_size(fft_bytes));
+    if (MEM_SIZE_INVALID(total)) return -1;
+
+    memset(out, 0, sizeof(*out));
+    out->aec_bytes = aec_total;
+    out->nr_bytes = nr_bytes;
+    out->fft_bytes = fft_bytes;
+    out->wrapper_bytes = wrapper_bytes;
+    out->total_bytes = total;
+    out->hop_size = hop;
+    out->fft_size = fft;
+    out->n_freqs = n;
+    return 0;
+}
+
+int four_aec_nr_res_get_mem_requirements(
+    const FourAecNrResConfig* cfg,
+    FourAecNrResMemReq* out) {
+    FourAecNrResMemBreakdown breakdown;
+    uint32_t backend;
+    if (!out ||
+        four_aec_nr_res_get_mem_breakdown(cfg, &breakdown) != 0)
+        return -1;
+    backend = four_backend_id();
+    if (backend == 0u) return -1;
+
+    memset(out, 0, sizeof(*out));
+    out->descriptor_version = FOUR_AEC_NR_RES_DESCRIPTOR_VERSION;
+    out->layout_version = FOUR_AEC_NR_RES_LAYOUT_VERSION;
+    out->backend_id = backend;
+    out->build_flags_hash = four_build_flags_hash();
+    out->alignment = 16u;
+    out->bytes = (uint64_t)breakdown.total_bytes;
+    return 0;
+}
+
+static int four_build_from_pool(
+    FourAecNrRes* self,
+    FourPoolCursor* cursor,
+    const AecConfig* aec_cfg,
+    const MmseLsaConfig* nr_cfg) {
+    size_t aec_bytes = aec_get_mem_size(aec_cfg);
+    size_t nr_bytes = mmse_lsa_get_mem_size(nr_cfg);
+    size_t fft_bytes = fft_get_mem_size(self->fft_size);
+    int ch;
+
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+        void* lane_pool = four_carve(cursor, 1, aec_bytes);
+        if (!lane_pool) return 0;
+        self->lanes[ch] = aec_init(lane_pool, aec_bytes, aec_cfg);
+        if (!self->lanes[ch]) return 0;
+        self->initialized_lanes += 1;
+    }
+
+    {
+        void* nr_pool = four_carve(cursor, 1, nr_bytes);
+        void* fft_pool = four_carve(cursor, 1, fft_bytes);
+        if (!nr_pool || !fft_pool) return 0;
+        self->nr = mmse_lsa_init(nr_pool, nr_bytes, nr_cfg);
+        self->fft = fft_init(fft_pool, fft_bytes, self->fft_size);
+        if (!self->nr || !self->fft) return 0;
+    }
+
+    if (!four_carve_working_buffers(self, cursor) ||
+        !four_init_post_sg(self, cursor)) return 0;
+    self->delay_ring = (float*)four_carve(
+        cursor, (size_t)self->delay_ring_size, sizeof(float));
+    if (!self->delay_ring) return 0;
+    return 1;
+}
+
+FourAecNrRes* four_aec_nr_res_init_ex(
+    void* mem,
+    size_t bytes,
+    const FourAecNrResConfig* cfg,
+    const FourAecNrResMemReq* expected) {
+    FourAecNrResConfig cfg_copy;
+    FourAecNrResMemReq current;
+    FourAecNrRes* self;
+    FourPoolCursor cursor;
+    AecConfig aec_cfg;
+    MmseLsaConfig nr_cfg;
+    int fft;
+    int hop;
+    int n;
+    int post_ma_n;
+    int delay_ring_size;
+    int k;
+
+    if (!mem || !cfg) return NULL;
+    cfg_copy = *cfg;
+    if (four_aec_nr_res_get_mem_requirements(
+            &cfg_copy, &current) != 0) return NULL;
+
+    if (expected) {
+        if (expected->descriptor_version != current.descriptor_version ||
+            expected->layout_version != current.layout_version ||
+            expected->backend_id != current.backend_id ||
+            expected->build_flags_hash != current.build_flags_hash ||
+            expected->alignment != current.alignment ||
+            expected->reserved != 0u ||
+            expected->bytes < current.bytes)
+            return NULL;
+    }
+    if (!MEM_IS_ALIGNED16(mem) ||
+        current.bytes > (uint64_t)SIZE_MAX ||
+        (uint64_t)bytes < current.bytes) return NULL;
+    if (!four_derive_configs(
+            &cfg_copy, &aec_cfg, &nr_cfg, &fft, &hop, &n,
+            &post_ma_n, &delay_ring_size)) return NULL;
+
+    memset(mem, 0, (size_t)current.bytes);
+    self = (FourAecNrRes*)mem;
+    self->cfg = cfg_copy;
+    self->sample_rate = cfg_copy.sample_rate;
+    self->fft_size = fft;
+    self->hop_size = hop;
+    self->n_freqs = n;
+    self->rate_factor = cfg_copy.sample_rate / 16000;
+    self->delay_ring_size = delay_ring_size;
+    self->rng_state = FOUR_AEC_NR_RES_RNG_SEED;
+    self->pool_size = (size_t)current.bytes;
+
+    cursor.ptr = (uint8_t*)mem + ALIGN16(sizeof(*self));
+    cursor.remaining =
+        (size_t)current.bytes - ALIGN16(sizeof(*self));
+    if (!four_build_from_pool(
+            self, &cursor, &aec_cfg, &nr_cfg) ||
+        cursor.remaining != 0) return NULL;
+
+    delay_aec3_init(&self->shared_delay);
+    for (k = 0; k < fft; ++k) {
+        self->synth_window[k] = sqrtf(
+            0.5f * (1.0f - cosf(
+                2.0f * M_PI_F * (float)k / (float)fft)));
+    }
+
+    for (k = 0; k < FOUR_AEC_NR_RES_CHANNELS; ++k) {
+        AecResContext context;
+        aec_get_res_context(self->lanes[k], &context);
+        if (context.hop_size != hop || context.n_freqs != n)
+            return NULL;
+    }
+    if (mmse_lsa_get_hop_size(self->nr) != hop ||
+        mmse_lsa_get_n_freqs(self->nr) != n ||
+        fft_get_n_freqs(self->fft) != n) return NULL;
     return self;
 }
+
+FourAecNrRes* four_aec_nr_res_init(
+    void* mem,
+    size_t bytes,
+    const FourAecNrResConfig* cfg) {
+    return four_aec_nr_res_init_ex(mem, bytes, cfg, NULL);
+}
+
+FourAecNrRes* four_aec_nr_res_create(const FourAecNrResConfig* cfg) {
+    FourAecNrResMemReq requirement;
+    FourAecNrRes* self;
+    void* pool = NULL;
+    if (!cfg ||
+        four_aec_nr_res_get_mem_requirements(
+            cfg, &requirement) != 0 ||
+        requirement.bytes > (uint64_t)SIZE_MAX)
+        return NULL;
+    if (posix_memalign(
+            &pool, (size_t)requirement.alignment,
+            (size_t)requirement.bytes) != 0 || !pool)
+        return NULL;
+    self = four_aec_nr_res_init(
+        pool, (size_t)requirement.bytes, cfg);
+    if (!self) {
+        free(pool);
+        return NULL;
+    }
+    self->owned_heap = pool;
+    return self;
+}
+
+/* ============================================================================
+ * Reset and teardown
+ * ========================================================================== */
 
 static void four_reset_post_sg(FourAecNrRes* self) {
     int n;
@@ -441,11 +785,11 @@ static void four_reset_post_sg(FourAecNrRes* self) {
 
 void four_aec_nr_res_reset(FourAecNrRes* self) {
     int ch;
-    if (!self) return;
+    if (!self || self->destroyed) return;
 
     delay_aec3_reset(&self->shared_delay);
     for (ch = 0; ch < self->initialized_lanes; ++ch) {
-        aec_reset(&self->lanes[ch]);
+        aec_reset(self->lanes[ch]);
     }
     if (self->nr) mmse_lsa_reset(self->nr);
     four_reset_post_sg(self);
@@ -486,43 +830,22 @@ void four_aec_nr_res_reset(FourAecNrRes* self) {
 
 void four_aec_nr_res_destroy(FourAecNrRes* self) {
     int ch;
-    if (!self) return;
+    void* owned_heap;
+    if (!self || self->destroyed) return;
 
     if (self->nr) mmse_lsa_destroy(self->nr);
     if (self->fft) fft_destroy(self->fft);
     for (ch = 0; ch < self->initialized_lanes; ++ch) {
-        aec_destroy(&self->lanes[ch]);
+        aec_destroy(self->lanes[ch]);
     }
-    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-        four_free_lane_snapshot(&self->snapshots[ch]);
-    }
-
-    free(self->post_sg_storage);
-    free(self->linear_interleaved);
-    free(self->mic_lane);
-    free(self->lane_out);
-    free(self->aligned_ref);
-    free(self->render_i16);
-    free(self->delay_ring);
-    free(self->delay_capture);
-    free(self->delay_render);
-    free(self->fused_error);
-    free(self->fused_echo);
-    free(self->fused_near);
-    free(self->fused_far);
-    free(self->output_spec);
-    free(self->fused_r2);
-    free(self->fused_comfort);
-    free(self->post_near_power);
-    free(self->nr_gain);
-    free(self->total_gain);
-    free(self->extra_noise);
-    free(self->error_power);
-    free(self->synth_window);
-    free(self->ifft_buffer);
-    free(self->ola);
-    free(self);
+    owned_heap = self->owned_heap;
+    self->destroyed = 1;
+    if (owned_heap) free(owned_heap);
 }
+
+/* ============================================================================
+ * Per-hop processing: pre-beam AEC side
+ * ========================================================================== */
 
 static FourAecNrResDelayState four_update_shared_delay(
     FourAecNrRes* self,
@@ -648,7 +971,8 @@ int four_aec_nr_res_process_pre(
     int ch;
     int i;
 
-    if (!self || !microphones_interleaved || !ref || !out)
+    if (!self || self->destroyed ||
+        !microphones_interleaved || !ref || !out)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     if (self->pending) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
 
@@ -672,7 +996,7 @@ int four_aec_nr_res_process_pre(
     }
     if (delay.changed) {
         for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-            aec_reset(&self->lanes[ch]);
+            aec_reset(self->lanes[ch]);
         }
     }
 
@@ -684,9 +1008,9 @@ int four_aec_nr_res_process_pre(
                     i * FOUR_AEC_NR_RES_CHANNELS + ch];
         }
         aec_process(
-            &self->lanes[ch], self->mic_lane, self->aligned_ref,
+            self->lanes[ch], self->mic_lane, self->aligned_ref,
             self->lane_out);
-        aec_get_res_context(&self->lanes[ch], &context);
+        aec_get_res_context(self->lanes[ch], &context);
         if (!four_snapshot_context(
                 &self->snapshots[ch], &context, self->n_freqs)) {
             four_aec_nr_res_reset(self);
@@ -712,6 +1036,10 @@ int four_aec_nr_res_process_pre(
     out->linear_interleaved = self->linear_interleaved;
     return FOUR_AEC_NR_RES_OK;
 }
+
+/* ============================================================================
+ * Per-hop processing: external-beam resume, one NR/RES and one iFFT/OLA
+ * ========================================================================== */
 
 static int four_token_matches(const FourAecNrRes* self,
                               const FourAecNrResFrameToken* token) {
@@ -955,7 +1283,7 @@ int four_aec_nr_res_process_post(
     float max_saturation;
     float far_power;
 
-    if (!self || !token || !weights || !out)
+    if (!self || self->destroyed || !token || !weights || !out)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     if (!four_token_matches(self, token))
         return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
@@ -980,34 +1308,38 @@ int four_aec_nr_res_process_post(
     return FOUR_AEC_NR_RES_OK;
 }
 
+/* ============================================================================
+ * Read-only shape/topology accessors
+ * ========================================================================== */
+
 int four_aec_nr_res_hop_size(const FourAecNrRes* self) {
-    return self ? self->hop_size : -1;
+    return self && !self->destroyed ? self->hop_size : -1;
 }
 
 int four_aec_nr_res_fft_size(const FourAecNrRes* self) {
-    return self ? self->fft_size : -1;
+    return self && !self->destroyed ? self->fft_size : -1;
 }
 
 int four_aec_nr_res_n_freqs(const FourAecNrRes* self) {
-    return self ? self->n_freqs : -1;
+    return self && !self->destroyed ? self->n_freqs : -1;
 }
 
 int four_aec_nr_res_sample_rate(const FourAecNrRes* self) {
-    return self ? self->sample_rate : -1;
+    return self && !self->destroyed ? self->sample_rate : -1;
 }
 
 int four_aec_nr_res_matched_filter_count(const FourAecNrRes* self) {
-    return self ? 1 : 0;
+    return self && !self->destroyed ? 1 : 0;
 }
 
 int four_aec_nr_res_linear_aec_count(const FourAecNrRes* self) {
-    return self ? FOUR_AEC_NR_RES_CHANNELS : 0;
+    return self && !self->destroyed ? FOUR_AEC_NR_RES_CHANNELS : 0;
 }
 
 int four_aec_nr_res_nr_count(const FourAecNrRes* self) {
-    return self ? 1 : 0;
+    return self && !self->destroyed ? 1 : 0;
 }
 
 int four_aec_nr_res_post_res_count(const FourAecNrRes* self) {
-    return self ? 1 : 0;
+    return self && !self->destroyed ? 1 : 0;
 }

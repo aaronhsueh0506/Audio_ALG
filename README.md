@@ -72,11 +72,11 @@ cd Audio_ALG
 # If the repository was cloned without submodules:
 git submodule update --init --recursive
 
-# Build the conventional C pipeline.
+# Build the conventional mono binaries plus the 4-channel archive/static example.
 make -C pipelines
 
-# Build the separate four-channel C wrapper.
-make -C pipelines lib4aec_nr_res.a
+# Or build only the four-channel C wrapper and caller-owned-pool example.
+make -C pipelines lib4aec_nr_res.a 4aec_nr_res_static
 
 # Run the malloc reference executable.
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced \
