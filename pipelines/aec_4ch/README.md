@@ -234,14 +234,9 @@ sample rate, FFT and bin count for steering; GSC operates on the exact
 selects the same tuple with `--fft-size 256|512|1024` and rejects cross-rate
 combinations.
 
-`doa_downsample_enable` remains an explicit, disabled-by-default 48 kHz
-compute-saving experiment: only SRP analysis becomes 16 kHz/512/256; GSC and
-the main AEC/NR/RES path remain 48 kHz/1024/512. It is not one of the three
-default production-grid configurations. The streaming resampler state and the
-512-sample DOA analysis window are preserved across 48 kHz main hops; when no
-new low-rate frame is ready, GSC uses the last smoothed DOA. Enable it in C
-with `cfg.doa_downsample_enable = 1`, or in the raw runner with
-`--doa-downsample`. The flag is rejected on a 16 kHz main grid.
+There is no legacy/downsample grid entry: DOA, GSC and AEC/NR/RES always use
+the same selected tuple. Changing the grid therefore changes the complete
+pipeline atomically rather than creating a second spatial timing domain.
 
 Reproduce the two checked-in recording tests from the `Audio_ALG` directory:
 

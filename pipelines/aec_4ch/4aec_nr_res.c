@@ -553,11 +553,6 @@ FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     return cfg;
 }
 
-void four_aec_nr_res_config_defaults(FourAecNrResConfig* cfg,
-                                     int sample_rate) {
-    if (cfg) *cfg = four_aec_nr_res_default_config(sample_rate);
-}
-
 int four_aec_nr_res_get_mem_requirements(
     const FourAecNrResConfig* cfg,
     FourAecNrResMemReq* out) {

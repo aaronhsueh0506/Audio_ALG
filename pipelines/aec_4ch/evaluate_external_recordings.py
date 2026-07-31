@@ -78,7 +78,6 @@ def evaluate_case(
     output_dir: Optional[Path],
     uca_radius_m: float,
     fft_size: int,
-    doa_downsample: bool,
 ) -> dict:
     (
         microphones,
@@ -91,8 +90,6 @@ def evaluate_case(
         near_corr,
     ) = _load_case(case_dir)
     selected_fft = fft_size or (512 if sample_rate == 16000 else 1024)
-    if doa_downsample and sample_rate != 48000:
-        raise ValueError("DOA downsample is valid only for a 48 kHz main grid")
     if (
         sample_rate == 16000
         and selected_fft not in (256, 512)
@@ -137,8 +134,6 @@ def evaluate_case(
             "--uca-radius-m",
             str(uca_radius_m),
         ]
-        if doa_downsample:
-            command.append("--doa-downsample")
         completed = subprocess.run(
             command,
             check=True,
@@ -186,7 +181,6 @@ def evaluate_case(
         "frame_size": selected_fft,
         "fft_size": selected_fft,
         "hop_size": hop,
-        "doa_downsample": doa_downsample,
         "c_pipeline": summary,
         "cohorts": {
             name: {
@@ -222,17 +216,16 @@ def validate(result: dict) -> None:
     for key, value in expected.items():
         if summary.get(key) != value:
             failures.append(f"{key}={summary.get(key)}, expected {value}")
-    doa_downsample = result["doa_downsample"]
     expected_grid = {
         "sample_rate": result["sample_rate"],
         "frame_size": result["frame_size"],
         "fft_size": result["fft_size"],
         "hop": result["hop_size"],
         "n_freqs": result["fft_size"] // 2 + 1,
-        "doa_sample_rate": 16000 if doa_downsample else result["sample_rate"],
-        "doa_frame_size": 512 if doa_downsample else result["frame_size"],
-        "doa_hop_size": 256 if doa_downsample else result["hop_size"],
-        "doa_fft_size": 512 if doa_downsample else result["fft_size"],
+        "doa_sample_rate": result["sample_rate"],
+        "doa_frame_size": result["frame_size"],
+        "doa_hop_size": result["hop_size"],
+        "doa_fft_size": result["fft_size"],
         "gsc_sample_rate": result["sample_rate"],
         "gsc_frame_size": result["frame_size"],
         "gsc_hop_size": result["hop_size"],
@@ -280,11 +273,6 @@ def main() -> None:
         default=0,
         help="0=rate default; 16 kHz accepts 256/512, 48 kHz accepts 1024",
     )
-    parser.add_argument(
-        "--doa-downsample",
-        action="store_true",
-        help="48 kHz main grid only: run SRP-PHAT at 16 kHz/512/256",
-    )
     parser.add_argument("--no-contract-check", action="store_true")
     args = parser.parse_args()
     if args.binary is None or not args.binary.exists():
@@ -299,7 +287,6 @@ def main() -> None:
             args.output_dir,
             args.uca_radius_m,
             args.fft_size,
-            args.doa_downsample,
         )
         for name in ("aec_take_turn", "aec_together")
     ]

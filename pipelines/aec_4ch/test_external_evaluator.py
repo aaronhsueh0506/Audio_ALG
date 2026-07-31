@@ -11,7 +11,6 @@ def _valid_result():
         "frame_size": 256,
         "fft_size": 256,
         "hop_size": 128,
-        "doa_downsample": False,
         "final_delay_error_samples": 0,
         "delay_tolerance_samples": 80,
         "c_pipeline": {
@@ -53,30 +52,3 @@ def test_external_recording_contract_rejects_spatial_grid_skew(field):
     result["c_pipeline"][field] += 1
     with pytest.raises(RuntimeError, match=field):
         validate(result)
-
-
-def test_external_recording_contract_accepts_downsampled_doa_grid():
-    result = _valid_result()
-    result["sample_rate"] = 48000
-    result["frame_size"] = 1024
-    result["fft_size"] = 1024
-    result["hop_size"] = 512
-    result["doa_downsample"] = True
-    result["c_pipeline"].update(
-        {
-            "sample_rate": 48000,
-            "frame_size": 1024,
-            "fft_size": 1024,
-            "hop": 512,
-            "n_freqs": 513,
-            "doa_sample_rate": 16000,
-            "doa_frame_size": 512,
-            "doa_hop_size": 256,
-            "doa_fft_size": 512,
-            "gsc_sample_rate": 48000,
-            "gsc_frame_size": 1024,
-            "gsc_hop_size": 512,
-            "gsc_fft_size": 1024,
-        }
-    )
-    validate(result)

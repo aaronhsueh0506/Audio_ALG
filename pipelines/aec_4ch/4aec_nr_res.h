@@ -224,14 +224,6 @@ typedef struct FourAecNrRes FourAecNrRes;
 FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate);
 
 /**
- * Compatibility wrapper for existing callers. New code should use the
- * value-returning four_aec_nr_res_default_config() above so the call sequence
- * reads the same as the mono pipeline.
- */
-void four_aec_nr_res_config_defaults(FourAecNrResConfig* cfg,
-                                     int sample_rate);
-
-/**
  * Query the complete 16-byte-aligned caller pool required by cfg.
  * Performs no allocation and returns 0 on success.
  */

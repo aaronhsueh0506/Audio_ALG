@@ -19,7 +19,7 @@
         }                                                              \
     } while (0)
 
-static int run_grid(int sample_rate, int fft_size, int doa_downsample) {
+static int run_grid(int sample_rate, int fft_size) {
     FourAecDoaGscConfig cfg =
         four_aec_doa_gsc_default_config(sample_rate);
     FourAecDoaGsc* p;
@@ -32,7 +32,6 @@ static int run_grid(int sample_rate, int fft_size, int doa_downsample) {
     int doa_analysis_total = 0;
 
     cfg.core.fft_size = fft_size;
-    cfg.doa_downsample_enable = doa_downsample;
     cfg.gsc_fixed_mode = 1;
     cfg.gsc_fixed_doa_rad = 0.4f;
     cfg.gsc_mu = 0.02f;
@@ -48,14 +47,11 @@ static int run_grid(int sample_rate, int fft_size, int doa_downsample) {
           "spatial bin count follows selected FFT");
     CHECK(
         four_aec_doa_gsc_doa_sample_rate(p) ==
-            (doa_downsample ? 16000 : sample_rate) &&
-        four_aec_doa_gsc_doa_frame_size(p) ==
-            (doa_downsample ? 512 : fft_size) &&
-        four_aec_doa_gsc_doa_hop_size(p) ==
-            (doa_downsample ? 256 : fft_size / 2) &&
-        four_aec_doa_gsc_doa_fft_size(p) ==
-            (doa_downsample ? 512 : fft_size),
-        "DOA grid follows main or explicit 48-to-16 grid");
+            sample_rate &&
+        four_aec_doa_gsc_doa_frame_size(p) == fft_size &&
+        four_aec_doa_gsc_doa_hop_size(p) == fft_size / 2 &&
+        four_aec_doa_gsc_doa_fft_size(p) == fft_size,
+        "DOA grid follows selected main AEC/NR/RES grid");
     CHECK(
         four_aec_doa_gsc_gsc_sample_rate(p) == sample_rate &&
         four_aec_doa_gsc_gsc_frame_size(p) == fft_size &&
@@ -107,13 +103,8 @@ static int run_grid(int sample_rate, int fft_size, int doa_downsample) {
             CHECK(isfinite(output[i]), "complete pipeline output finite");
         }
     }
-    if (doa_downsample) {
-        CHECK(doa_analysis_total > 0 && doa_analysis_total < 80,
-              "downsampled DOA runs on the lower-rate cadence");
-    } else {
-        CHECK(doa_analysis_total == 80,
-              "same-grid DOA consumes every main analysis frame");
-    }
+    CHECK(doa_analysis_total == 80,
+          "same-grid DOA consumes every main analysis frame");
 
     four_aec_doa_gsc_reset(p);
     CHECK(four_aec_doa_gsc_process(
@@ -121,10 +112,8 @@ static int run_grid(int sample_rate, int fft_size, int doa_downsample) {
               FOUR_AEC_NR_RES_OK,
           "fallback-VAD processing after reset");
     CHECK(info.frame_index == 0, "reset restarts wrapper frame index");
-    if (doa_downsample) {
-        CHECK(info.doa_analysis_frames == 0,
-              "downsample reset clears the low-rate analysis buffer");
-    }
+    CHECK(info.doa_analysis_frames == 1,
+          "same-grid DOA resumes immediately after reset");
 
     free(output);
     free(far);
@@ -142,10 +131,6 @@ static int run_grid(int sample_rate, int fft_size, int doa_downsample) {
 static int run_all_tests(void) {
     FourAecDoaGscConfig invalid =
         four_aec_doa_gsc_default_config(16000);
-    invalid.doa_downsample_enable = 1;
-    CHECK(four_aec_doa_gsc_create(&invalid) == NULL,
-          "DOA downsample rejects an already-16-kHz grid");
-    invalid.doa_downsample_enable = 0;
     invalid.core.fft_size = 1024;
     CHECK(four_aec_doa_gsc_create(&invalid) == NULL,
           "16 kHz rejects cross-rate FFT 1024");
@@ -164,14 +149,12 @@ static int run_all_tests(void) {
               "GSC forgetting factor of exactly 1.0 is still accepted");
         four_aec_doa_gsc_destroy(boundary);
     }
-    CHECK(run_grid(16000, 256, 0),
+    CHECK(run_grid(16000, 256),
           "16 kHz 256/128 complete spatial pipeline");
-    CHECK(run_grid(16000, 512, 0),
+    CHECK(run_grid(16000, 512),
           "16 kHz 512/256 complete spatial pipeline");
-    CHECK(run_grid(48000, 1024, 0),
+    CHECK(run_grid(48000, 1024),
           "48 kHz 1024/512 complete spatial pipeline");
-    CHECK(run_grid(48000, 1024, 1),
-          "48 kHz main plus 16 kHz DOA-downsample pipeline");
     printf("All 4aec DOA/GSC tests passed (spatial=%s)\n",
            four_aec_doa_gsc_spatial_backend());
     return 1;

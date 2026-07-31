@@ -16,8 +16,6 @@
 #include <stddef.h>
 
 #include "4aec_doa_gsc.h"
-#include "audio_resampler.h"
-#include "fft_wrapper.h"
 #include "gsc.h"
 #include "srp.h"
 #include "steering.h"
@@ -41,36 +39,16 @@ struct FourAecDoaGsc {
     FourAecNrRes* core;
     SRP* srp;
     kiss_fft_cpx*** gsc_steering;
-    int owns_gsc_steering;
     GSC* gsc;
 
     int hop_size;
     int fft_size;
     int n_freqs;
-    int doa_downsample;
-    int doa_sample_rate;
-    int doa_frame_size;
-    int doa_hop_size;
-    int doa_fft_size;
-    int doa_n_freqs;
     kiss_fft_cpx* spatial_input;
     kiss_fft_cpx* spatial_channels[FOUR_AEC_NR_RES_CHANNELS];
     kiss_fft_cpx* gsc_spectrum;
     kiss_fft_cpx* gsc_weights;
     Complex* core_weights;
-
-    AudioResampler* doa_resampler;
-    FftHandle* doa_fft;
-    float* doa_resampled;
-    int doa_resampled_capacity;
-    float* doa_frame_interleaved;
-    int doa_frame_fill;
-    float* doa_window;
-    float* doa_time_channel;
-    Complex* doa_fft_output;
-    kiss_fft_cpx* doa_spectral_input;
-    kiss_fft_cpx* doa_channels[FOUR_AEC_NR_RES_CHANNELS];
-    int* doa_frequency_mask;
 
     float noise_power;
     int vad_hangover;
@@ -97,8 +75,7 @@ static int validate_config(const FourAecDoaGscConfig* cfg) {
     if (!cfg) return 0;
     if (cfg->core.sample_rate != 16000 &&
         cfg->core.sample_rate != 48000) return 0;
-    nyquist = cfg->doa_downsample_enable
-        ? 8000.0f : 0.5f * (float)cfg->core.sample_rate;
+    nyquist = 0.5f * (float)cfg->core.sample_rate;
     if (cfg->geometry != FOUR_AEC_ARRAY_UCA &&
         cfg->geometry != FOUR_AEC_ARRAY_ULA &&
         cfg->geometry != FOUR_AEC_ARRAY_CUSTOM) return 0;
@@ -117,10 +94,7 @@ static int validate_config(const FourAecDoaGscConfig* cfg) {
         cfg->doa_switch_consecutive <= 0 ||
         !isfinite(cfg->doa_angle_tolerance_rad) ||
         cfg->doa_angle_tolerance_rad < 0.0f ||
-        cfg->doa_update_interval <= 0 ||
-        !is_bool(cfg->doa_downsample_enable)) return 0;
-    if (cfg->doa_downsample_enable && cfg->core.sample_rate != 48000)
-        return 0;
+        cfg->doa_update_interval <= 0) return 0;
     if (!is_bool(cfg->gsc_enable) ||
         !isfinite(cfg->gsc_lambda) || cfg->gsc_lambda <= 0.0f ||
         cfg->gsc_lambda > 1.0f ||
@@ -174,7 +148,6 @@ FourAecDoaGscConfig four_aec_doa_gsc_default_config(int sample_rate) {
     cfg.doa_switch_consecutive = 3;
     cfg.doa_angle_tolerance_rad = 10.0f * M_PI_F / 180.0f;
     cfg.doa_update_interval = 2;
-    cfg.doa_downsample_enable = 0;
     cfg.gsc_enable = 1;
     cfg.gsc_lambda = 0.995f;
     cfg.gsc_mu = 0.1f;
@@ -186,11 +159,6 @@ FourAecDoaGscConfig four_aec_doa_gsc_default_config(int sample_rate) {
     cfg.auto_vad_snr_ratio = 3.0f;
     cfg.auto_vad_hangover_frames = 8;
     return cfg;
-}
-
-void four_aec_doa_gsc_config_defaults(FourAecDoaGscConfig* cfg,
-                                      int sample_rate) {
-    if (cfg) *cfg = four_aec_doa_gsc_default_config(sample_rate);
 }
 
 static ArrayGeometry* create_geometry(
@@ -217,7 +185,6 @@ FourAecDoaGsc* four_aec_doa_gsc_create(
     ArrayGeometry* geometry;
     SRP_Config srp_cfg;
     GSC_Config gsc_cfg;
-    float* main_angles = NULL;
     int fft_size;
     size_t spectral_count;
 
@@ -231,52 +198,27 @@ FourAecDoaGsc* four_aec_doa_gsc_create(
     p->n_freqs = four_aec_nr_res_n_freqs(p->core);
     fft_size = four_aec_nr_res_fft_size(p->core);
     p->fft_size = fft_size;
-    p->doa_downsample = cfg->doa_downsample_enable;
-    p->doa_sample_rate =
-        p->doa_downsample ? 16000 : cfg->core.sample_rate;
-    p->doa_fft_size = p->doa_downsample ? 512 : fft_size;
-    p->doa_frame_size = p->doa_fft_size;
-    p->doa_hop_size = p->doa_fft_size / 2;
-    p->doa_n_freqs = p->doa_fft_size / 2 + 1;
 
     geometry = create_geometry(cfg);
     if (!geometry) goto fail;
     memset(&srp_cfg, 0, sizeof(srp_cfg));
     srp_cfg.M = FOUR_AEC_NR_RES_CHANNELS;
-    srp_cfg.F = p->doa_n_freqs;
+    srp_cfg.F = p->n_freqs;
     srp_cfg.num_angles = cfg->num_angles;
-    srp_cfg.sr = (float)p->doa_sample_rate;
-    srp_cfg.NFFT = (float)p->doa_fft_size;
+    srp_cfg.sr = (float)cfg->core.sample_rate;
+    srp_cfg.NFFT = (float)fft_size;
     srp_cfg.c = cfg->speed_of_sound_m_s;
     srp_cfg.low_freq = cfg->doa_low_freq_hz;
     srp_cfg.high_freq = cfg->doa_high_freq_hz > 0.0f
         ? fminf(cfg->doa_high_freq_hz,
-                0.5f * (float)p->doa_sample_rate)
-        : fminf(7000.0f, 0.5f * (float)p->doa_sample_rate);
+                0.5f * (float)cfg->core.sample_rate)
+        : fminf(7000.0f, 0.5f * (float)cfg->core.sample_rate);
     srp_cfg.enable_smoothing = cfg->doa_enable_smoothing;
     srp_cfg.switch_consec = cfg->doa_switch_consecutive;
     srp_cfg.angle_tol = cfg->doa_angle_tolerance_rad;
     srp_cfg.update_interval = cfg->doa_update_interval;
     p->srp = srp_create_from_geometry(&srp_cfg, geometry);
-    if (p->doa_downsample && p->srp) {
-        SRP_Config main_cfg = srp_cfg;
-        main_cfg.F = p->n_freqs;
-        main_cfg.sr = (float)cfg->core.sample_rate;
-        main_cfg.NFFT = (float)fft_size;
-        main_cfg.high_freq = cfg->doa_high_freq_hz > 0.0f
-            ? fminf(cfg->doa_high_freq_hz,
-                    0.5f * (float)cfg->core.sample_rate)
-            : fminf(7000.0f, 0.5f * (float)cfg->core.sample_rate);
-        main_angles = srp_create_uniform_angles(cfg->num_angles);
-        if (main_angles) {
-            p->gsc_steering =
-                srp_build_steering(&main_cfg, geometry, main_angles);
-        }
-        free(main_angles);
-        p->owns_gsc_steering = p->gsc_steering != NULL;
-    } else {
-        p->gsc_steering = p->srp ? p->srp->a_array : NULL;
-    }
+    p->gsc_steering = p->srp ? p->srp->a_array : NULL;
     array_geometry_destroy(geometry);
     if (!p->srp || !p->gsc_steering) goto fail;
 
@@ -310,52 +252,6 @@ FourAecDoaGsc* four_aec_doa_gsc_create(
         p->spatial_channels[m] =
             p->spatial_input + (size_t)m * p->n_freqs;
     }
-    if (p->doa_downsample) {
-        size_t doa_spectral_count =
-            (size_t)FOUR_AEC_NR_RES_CHANNELS *
-            (size_t)p->doa_n_freqs;
-        p->doa_resampler = audio_resampler_create(
-            cfg->core.sample_rate, p->doa_sample_rate,
-            FOUR_AEC_NR_RES_CHANNELS);
-        p->doa_fft = fft_create(p->doa_fft_size);
-        if (!p->doa_resampler || !p->doa_fft) goto fail;
-        p->doa_resampled_capacity =
-            audio_resampler_output_bound(
-                p->doa_resampler, p->hop_size);
-        if (p->doa_resampled_capacity <= 0) goto fail;
-        p->doa_resampled = (float*)malloc(
-            (size_t)p->doa_resampled_capacity *
-            FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
-        p->doa_frame_interleaved = (float*)calloc(
-            (size_t)p->doa_frame_size *
-            FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
-        p->doa_window = (float*)malloc(
-            (size_t)p->doa_frame_size * sizeof(float));
-        p->doa_time_channel = (float*)malloc(
-            (size_t)p->doa_frame_size * sizeof(float));
-        p->doa_fft_output = (Complex*)malloc(
-            (size_t)p->doa_n_freqs * sizeof(Complex));
-        p->doa_spectral_input = (kiss_fft_cpx*)malloc(
-            doa_spectral_count * sizeof(kiss_fft_cpx));
-        p->doa_frequency_mask = (int*)malloc(
-            (size_t)p->doa_n_freqs * sizeof(int));
-        if (!p->doa_resampled || !p->doa_frame_interleaved ||
-            !p->doa_window || !p->doa_time_channel ||
-            !p->doa_fft_output || !p->doa_spectral_input ||
-            !p->doa_frequency_mask)
-            goto fail;
-        for (int m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m) {
-            p->doa_channels[m] =
-                p->doa_spectral_input +
-                (size_t)m * p->doa_n_freqs;
-        }
-        for (int i = 0; i < p->doa_frame_size; ++i) {
-            p->doa_window[i] = sqrtf(
-                0.5f - 0.5f * cosf(
-                    2.0f * M_PI_F * (float)i /
-                    (float)p->doa_frame_size));
-        }
-    }
     p->noise_power =
         powf(10.0f, cfg->auto_vad_threshold_dbfs / 10.0f);
     return p;
@@ -376,94 +272,6 @@ static int complex_values_finite(
         if (!isfinite(values[i].r) || !isfinite(values[i].i)) return 0;
     }
     return 1;
-}
-
-static int run_doa_analysis(
-    FourAecDoaGsc* p,
-    const FourAecNrResPreFrame* pre,
-    int vad_raw,
-    int vad_out,
-    const int* frequency_mask) {
-    int analysis_frames = 0;
-    if (!p->doa_downsample) {
-        doa_step(
-            p->srp, p->spatial_channels, frequency_mask,
-            vad_raw, vad_out);
-        return 1;
-    }
-
-    {
-        int consumed = 0;
-        int produced = 0;
-        if (audio_resampler_process(
-                p->doa_resampler, pre->linear_interleaved,
-                p->hop_size, p->doa_resampled,
-                p->doa_resampled_capacity, &consumed, &produced) != 0 ||
-            consumed != p->hop_size) {
-            return -1;
-        }
-
-        if (frequency_mask) {
-            for (int k = 0; k < p->doa_n_freqs; ++k) {
-                float frequency =
-                    (float)k * (float)p->doa_sample_rate /
-                    (float)p->doa_fft_size;
-                int main_bin = (int)lroundf(
-                    frequency * (float)p->fft_size /
-                    (float)p->cfg.core.sample_rate);
-                if (main_bin < 0) main_bin = 0;
-                if (main_bin >= p->n_freqs) main_bin = p->n_freqs - 1;
-                p->doa_frequency_mask[k] = frequency_mask[main_bin] != 0;
-            }
-        }
-
-        for (int i = 0; i < produced; ++i) {
-            memcpy(
-                p->doa_frame_interleaved +
-                    (size_t)p->doa_frame_fill *
-                    FOUR_AEC_NR_RES_CHANNELS,
-                p->doa_resampled +
-                    (size_t)i * FOUR_AEC_NR_RES_CHANNELS,
-                FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
-            p->doa_frame_fill += 1;
-            if (p->doa_frame_fill == p->doa_frame_size) {
-                for (int channel = 0;
-                     channel < FOUR_AEC_NR_RES_CHANNELS; ++channel) {
-                    for (int sample = 0;
-                         sample < p->doa_frame_size; ++sample) {
-                        p->doa_time_channel[sample] =
-                            p->doa_frame_interleaved[
-                                sample * FOUR_AEC_NR_RES_CHANNELS +
-                                channel] *
-                            p->doa_window[sample];
-                    }
-                    fft_forward(
-                        p->doa_fft, p->doa_time_channel,
-                        p->doa_fft_output);
-                    memcpy(
-                        p->doa_channels[channel], p->doa_fft_output,
-                        (size_t)p->doa_n_freqs *
-                        sizeof(kiss_fft_cpx));
-                }
-                doa_step(
-                    p->srp, p->doa_channels,
-                    frequency_mask ? p->doa_frequency_mask : NULL,
-                    vad_raw, vad_out);
-                analysis_frames += 1;
-                memmove(
-                    p->doa_frame_interleaved,
-                    p->doa_frame_interleaved +
-                        (size_t)p->doa_hop_size *
-                        FOUR_AEC_NR_RES_CHANNELS,
-                    (size_t)(p->doa_frame_size - p->doa_hop_size) *
-                    FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
-                p->doa_frame_fill =
-                    p->doa_frame_size - p->doa_hop_size;
-            }
-        }
-    }
-    if (analysis_frames == 0) srp_hold(p->srp);
-    return analysis_frames;
 }
 
 static void fill_frame_info(
@@ -516,12 +324,10 @@ int four_aec_doa_gsc_process_with_activity(
         memcpy(p->spatial_channels[m], pre.linear_spectra[m],
                (size_t)p->n_freqs * sizeof(kiss_fft_cpx));
     }
-    doa_analysis_frames = run_doa_analysis(
-        p, &pre, vad_raw, vad_out, frequency_mask);
-    if (doa_analysis_frames < 0) {
-        four_aec_doa_gsc_reset(p);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
-    }
+    doa_step(
+        p->srp, p->spatial_channels, frequency_mask,
+        vad_raw, vad_out);
+    doa_analysis_frames = 1;
     gsc_process_with_weights(
         p->gsc, p->spatial_channels, doa_get_smooth(p->srp),
         vad_out ? 0 : 1, frequency_mask, p->gsc_spectrum,
@@ -607,14 +413,6 @@ void four_aec_doa_gsc_reset(FourAecDoaGsc* p) {
     four_aec_nr_res_reset(p->core);
     srp_reset(p->srp);
     gsc_reset(p->gsc);
-    audio_resampler_reset(p->doa_resampler);
-    if (p->doa_frame_interleaved) {
-        memset(
-            p->doa_frame_interleaved, 0,
-            (size_t)p->doa_frame_size *
-            FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
-    }
-    p->doa_frame_fill = 0;
     p->noise_power =
         powf(10.0f, p->cfg.auto_vad_threshold_dbfs / 10.0f);
     p->vad_hangover = 0;
@@ -625,26 +423,12 @@ void four_aec_doa_gsc_destroy(FourAecDoaGsc* p) {
     if (!p) return;
     /* GSC borrows the steering table; destroy it before its owner. */
     gsc_destroy(p->gsc);
-    if (p->owns_gsc_steering) {
-        srp_destroy_steering(
-            p->gsc_steering, p->cfg.num_angles,
-            FOUR_AEC_NR_RES_CHANNELS);
-    }
     srp_destroy(p->srp);
-    audio_resampler_destroy(p->doa_resampler);
-    fft_destroy(p->doa_fft);
     four_aec_nr_res_destroy(p->core);
     free(p->spatial_input);
     free(p->gsc_spectrum);
     free(p->gsc_weights);
     free(p->core_weights);
-    free(p->doa_resampled);
-    free(p->doa_frame_interleaved);
-    free(p->doa_window);
-    free(p->doa_time_channel);
-    free(p->doa_fft_output);
-    free(p->doa_spectral_input);
-    free(p->doa_frequency_mask);
     free(p);
 }
 
@@ -673,19 +457,19 @@ int four_aec_doa_gsc_sample_rate(const FourAecDoaGsc* p) {
 }
 
 int four_aec_doa_gsc_doa_sample_rate(const FourAecDoaGsc* p) {
-    return p ? p->doa_sample_rate : -1;
+    return four_aec_doa_gsc_sample_rate(p);
 }
 
 int four_aec_doa_gsc_doa_frame_size(const FourAecDoaGsc* p) {
-    return p ? p->doa_frame_size : -1;
+    return four_aec_doa_gsc_frame_size(p);
 }
 
 int four_aec_doa_gsc_doa_hop_size(const FourAecDoaGsc* p) {
-    return p ? p->doa_hop_size : -1;
+    return four_aec_doa_gsc_hop_size(p);
 }
 
 int four_aec_doa_gsc_doa_fft_size(const FourAecDoaGsc* p) {
-    return p ? p->doa_fft_size : -1;
+    return four_aec_doa_gsc_fft_size(p);
 }
 
 int four_aec_doa_gsc_gsc_sample_rate(const FourAecDoaGsc* p) {

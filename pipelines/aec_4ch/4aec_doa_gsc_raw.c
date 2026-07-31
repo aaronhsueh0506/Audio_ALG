@@ -26,7 +26,6 @@ typedef struct Options {
     const char* vad_path;
     int sample_rate;
     int fft_size;
-    int doa_downsample;
     float uca_radius_m;
     int fixed_doa;
     float fixed_doa_rad;
@@ -38,7 +37,7 @@ static void usage(const char* program) {
     fprintf(stderr,
             "Usage: %s --mic-raw MIC.f32 --ref-raw REF.f32 "
             "--output-raw OUT.f32 --sample-rate 16000|48000 "
-            "[--fft-size 256|512|1024] [--doa-downsample] "
+            "[--fft-size 256|512|1024] "
             "[--vad-u8 VAD.u8] [--uca-radius-m 0.035] "
             "[--fixed-doa-deg DEG]\n",
             program);
@@ -78,10 +77,6 @@ static int parse_options(int argc, char** argv, Options* options) {
     memset(options, 0, sizeof(*options));
     options->uca_radius_m = 0.035f;
     for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--doa-downsample") == 0) {
-            options->doa_downsample = 1;
-            continue;
-        }
         if (i + 1 >= argc) return 0;
         if (strcmp(argv[i], "--mic-raw") == 0) {
             options->mic_path = argv[++i];
@@ -151,7 +146,6 @@ int main(int argc, char** argv) {
     }
     cfg = four_aec_doa_gsc_default_config(options.sample_rate);
     cfg.core.fft_size = options.fft_size;
-    cfg.doa_downsample_enable = options.doa_downsample;
     cfg.uca_radius_m = options.uca_radius_m;
     if (options.fixed_doa) {
         cfg.gsc_fixed_mode = 1;

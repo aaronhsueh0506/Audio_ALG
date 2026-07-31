@@ -44,13 +44,6 @@ typedef struct FourAecDoaGscConfig {
     int doa_switch_consecutive;
     float doa_angle_tolerance_rad;
     int doa_update_interval;
-    /*
-     * 48 kHz main-grid only. When enabled, SRP-PHAT receives a streaming
-     * 48->16 kHz resample and runs on 512/256. GSC remains on the selected
-     * main grid so its weights still align with AEC/NR/RES frequency bins.
-     */
-    int doa_downsample_enable;
-
     int gsc_enable;
     float gsc_lambda;
     float gsc_mu;
@@ -88,10 +81,6 @@ typedef struct FourAecDoaGsc FourAecDoaGsc;
  * ========================================================================== */
 
 FourAecDoaGscConfig four_aec_doa_gsc_default_config(int sample_rate);
-
-/* Compatibility wrapper; new code should use default_config(). */
-void four_aec_doa_gsc_config_defaults(FourAecDoaGscConfig* cfg,
-                                      int sample_rate);
 
 FourAecDoaGsc* four_aec_doa_gsc_create(
     const FourAecDoaGscConfig* cfg);
