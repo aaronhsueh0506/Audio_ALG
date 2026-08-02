@@ -5,8 +5,11 @@ for acoustic echo cancellation", arXiv:2208.11308.
 
 The model consumes unaligned microphone/reference complex spectra.  It emits a
 real magnitude mask and preserves microphone phase, exactly as the paper's
-prediction contract specifies.  The project target for this AEC-only route is
-near-end speech plus local noise; it must not learn noise suppression.
+prediction contract specifies.  The project target is now the joint
+end-to-end AEC+RES+NR task (early/dereverberated near speech, denoised and
+echo-cancelled) -- this candidate's original AEC-only, noise-preserving route
+was retired and folded into that shared task (see
+../dataset_gen/model_views.py's MODEL_TASKS).
 """
 
 from __future__ import annotations
@@ -33,7 +36,7 @@ class AlignCRUSE(nn.Module):
     """Paper-shaped CRUSE with configurable streaming/global alignment."""
 
     paper_reference = "arXiv:2208.11308"
-    task = "direct_aec_preserve_noise"
+    task = "end_to_end_aec_res_nr"
 
     def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
                  projection_size: int = 64, gru_hidden: int = 192,

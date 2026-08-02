@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""Recompute AIAEC stem six from existing acoustic stem WAVs.
+"""Recompute AIAEC's final stem from existing acoustic stem WAVs.
 
 This does not rerender speech/noise/RIR mixtures. It concatenates each parent
 sequence in ``chunk_index`` order, runs one fresh Python PBFDKF over that full
-waveform, then atomically rewrites every chunk with ``linear_error`` as channel
-six. The sequence JSON sidecar is updated last and is the resume marker.
+waveform, then atomically rewrites every chunk with ``linear_error`` as the
+last channel (channel five under the current ``STEM_ORDER``; legacy
+``BASE_STEM_ORDER``-only inputs have four). The sequence JSON sidecar is
+updated last and is the resume marker.
 """
 
 from __future__ import annotations
@@ -80,9 +82,9 @@ def _load_sequence(
                 f"{path}: expected {len(BASE_STEM_ORDER)} legacy or "
                 f"{len(STEM_ORDER)} current channels, got {audio.shape[0]}"
             )
-        # A killed prior re-materialization may leave a mixture of five- and
-        # six-channel files while the sidecar still correctly marks the
-        # sequence incomplete. Always recover from the first five stems.
+        # A killed prior re-materialization may leave a mixture of four- and
+        # five-channel files while the sidecar still correctly marks the
+        # sequence incomplete. Always recover from the first four stems.
         channels_seen.add(int(audio.shape[0]))
         chunks.append(audio[:len(BASE_STEM_ORDER)].float())
     return chunks, max(channels_seen)
@@ -175,13 +177,13 @@ def rematerialize(args) -> None:
         for chunk_index, (path, base) in enumerate(zip(wav_paths, chunks)):
             at = chunk_index * chunk_samples
             error_chunk = linear_error[at:at + chunk_samples].unsqueeze(0)
-            six = torch.cat([base, error_chunk], dim=0).contiguous()
+            full = torch.cat([base, error_chunk], dim=0).contiguous()
             tmp = path + ".tmp.wav"
-            torchaudio.save(tmp, six, sr, **WAV_ENCODINGS[encoding])
+            torchaudio.save(tmp, full, sr, **WAV_ENCODINGS[encoding])
             check, check_sr = torchaudio.load(tmp)
-            if check_sr != sr or check.shape != six.shape:
+            if check_sr != sr or check.shape != full.shape:
                 raise RuntimeError(
-                    f"{tmp}: failed six-channel round-trip validation"
+                    f"{tmp}: failed five-channel round-trip validation"
                 )
             os.replace(tmp, path)
 
@@ -213,7 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--resume", action="store_true",
-        help="Skip sequences whose six-channel WAVs and contract markers match",
+        help="Skip sequences whose five-channel WAVs and contract markers match",
     )
     parser.add_argument(
         "--wav-encoding", default="auto",

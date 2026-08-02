@@ -13,7 +13,7 @@ config.ini sections (see the shipped config.ini for every knob, documented):
                  AIAEC/dataset_gen/config.ini rendered with. 48 kHz uses
                  1024/1024/512 with df_bins=96; 16 kHz uses 512/512/256 with
                  df_bins=64 (model.py's own default -- see README.md).
-    [data]       one packed six-stem corpus path + ordinary batch size +
+    [data]       one packed five-stem corpus path + ordinary batch size +
                  per-chunk val_fraction
     [feature]    the SAME normalisation constants as
                  AINR/DeepFilterNet2/config.ini's [feature] section -- this
@@ -33,7 +33,7 @@ config.ini sections (see the shipped config.ini for every knob, documented):
 dataset:
     AIAEC/dataset_gen renders each complete parent sequence, runs one stateful
     frozen Python PBFDKF over it, stores the resulting ``linear_error`` as
-    channel six, then cuts 8-second chunks. This trainer never executes
+    the last channel, then cuts 10-second chunks. This trainer never executes
     PBFDKF. It uses the common deterministic per-chunk random split and an
     ordinary shuffled training DataLoader. DFN feature-normalizer EMA state
     starts fresh for each independent training chunk, matching the standalone

@@ -13,7 +13,7 @@ config.ini sections (see the shipped config.ini for every knob, documented):
                  this project also accepts 48 kHz/1024/1024/512 (see
                  model.py/README.md) -- must equal the grid
                  AIAEC/dataset_gen/config.ini rendered with.
-    [data]       one packed six-stem corpus path + ordinary batch size +
+    [data]       one packed five-stem corpus path + ordinary batch size +
                  per-chunk val_fraction
     [model]      every AlignULCNet constructor keyword (see model.py)
     [training]   optimizer, seed, epoch budget, checkpoint/log locations
@@ -22,7 +22,7 @@ config.ini sections (see the shipped config.ini for every knob, documented):
 dataset:
     AIAEC/dataset_gen renders each complete parent sequence, runs one stateful
     frozen Python PBFDKF over it, stores the resulting ``linear_error`` as
-    channel six, then cuts 8-second chunks. This trainer never executes
+    the last channel, then cuts 10-second chunks. This trainer never executes
     PBFDKF. It uses the common deterministic per-chunk random split and an
     ordinary shuffled training DataLoader.
 

@@ -3,8 +3,12 @@
 Direct neural AEC/RES candidate. There is no matched filter or linear AEC in
 front of this network. Inputs are unaligned microphone and far-end spectra; the
 output is a real magnitude mask applied to the microphone spectrum, preserving
-microphone phase. For this project's **AEC-only** route the training target is
-`near_speech + local_noise`, not clean speech.
+microphone phase. This project runs it as an **end-to-end AEC+RES+NR**
+candidate: the training target is `near_target` (denoised, dereverberated,
+echo-cancelled near speech), the same joint task and target DeepVQE-S uses.
+This candidate's earlier standalone AEC-only route (target `near_speech +
+local_noise`, noise deliberately preserved) was retired -- there is no more
+AEC-only candidate in this project.
 
 Paper-aligned details:
 

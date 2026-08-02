@@ -175,7 +175,7 @@ def packed(corpus, tmp_path_factory):
 def test_stem_channel_order_matches_declared_list(packed):
     """The shard's declared order must be THE order, in every shard."""
     assert list(STEM_ORDER) == [
-        'far_render', 'near_speech', 'near_target', 'local_noise',
+        'far_render', 'near_speech', 'near_target',
         'mic_postclip', 'linear_error',
     ]
     for split in ('train', 'val'):
@@ -262,7 +262,7 @@ def test_linear_aec_state_is_continuous_across_future_chunk_boundaries():
     (('sample_rate', 44100), ('frame_size', 1024), ('hop_size', 128)),
 )
 def test_linear_aec_contract_rejects_wrong_sr_frame_or_hop(field, value):
-    contract = make_linear_aec_contract(16000).as_dict()
+    contract = make_linear_aec_contract(16000, frame_size=512).as_dict()
     contract[field] = value
     with pytest.raises(ValueError, match='linear AEC'):
         LinearAecContract.from_dict(contract)
@@ -277,7 +277,7 @@ def test_dataset_config_rejects_mismatched_model_and_pbfdkf_grid(corpus):
         )
 
 
-def test_packed_dataset_rejects_legacy_five_channel_shard(tmp_path):
+def test_packed_dataset_rejects_legacy_four_channel_shard(tmp_path):
     contract = make_linear_aec_contract(16000, frame_size=512)
     path = tmp_path / 'legacy.pt'
     torch.save({
@@ -314,8 +314,8 @@ def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
         source_wav = source / 'seqs' / f'{sequence_id:06d}_{chunk_index:03d}.wav'
         audio, sr = torchaudio.load(source_wav)
         expected_errors.append(audio[STEM_ORDER.index('linear_error')].clone())
-        # Simulate interruption: the first file was already rewritten to six
-        # channels, while the remaining files are still legacy five-channel.
+        # Simulate interruption: the first file was already rewritten to five
+        # channels, while the remaining files are still legacy four-channel.
         write_audio = audio if chunk_index == 0 else audio[:len(BASE_STEM_ORDER)]
         torchaudio.save(
             str(seqs / source_wav.name), write_audio, sr,
@@ -379,9 +379,9 @@ def test_stems_recombine(corpus):
     scaled independently somewhere and no consumer can trust that the echo
     generation is what actually reached the microphone.
 
-    ``mic_preclip`` and ``echo`` are NOT persisted (see STEM_ORDER's
-    docstring in aec_features.py) -- they are computed on every render
-    regardless, so this checks the invariant against the renderer's
+    ``mic_preclip``, ``echo`` and ``local_noise`` are NOT persisted (see
+    STEM_ORDER's docstring in aec_features.py) -- they are computed on every
+    render regardless, so this checks the invariant against the renderer's
     ``RenderedSequence.audit`` output directly rather than a packed shard.
     """
     renderer = AecSequenceRenderer(
@@ -394,7 +394,8 @@ def test_stems_recombine(corpus):
             sequence_id=sequence_id, n_chunks=2, scenario=scenario,
             seed=stable_seed(SEED, 'test', f'recombine-{scenario}')))
         view = AecStems(rendered.stems)
-        recombined = view.near_speech + view.local_noise + rendered.audit['echo']
+        recombined = (view.near_speech + rendered.audit['noise']
+                      + rendered.audit['echo'])
         error = (rendered.audit['mic_preclip'] - recombined).abs().max().item()
         assert error < 1e-5, f"{scenario}: stems do not sum: max error {error:.2e}"
         checked += 1
@@ -764,7 +765,7 @@ def test_renderer_produces_finite_recombinable_eight_second_48k_stems(corpus):
     assert torch.isfinite(rendered.stems).all()
     torch.testing.assert_close(
         rendered.audit['mic_preclip'],
-        view.near_speech + view.local_noise + rendered.audit['echo'],
+        view.near_speech + rendered.audit['noise'] + rendered.audit['echo'],
         rtol=0.0, atol=1e-5,
     )
 
@@ -852,7 +853,7 @@ def test_echo_is_really_an_echo_of_the_reference(corpus):
     # far_only means no near talker, so the mic is echo + noise alone.
     assert float(view.near_speech.abs().max()) == 0.0
     assert torch.allclose(rendered.audit['mic_preclip'],
-                          echo + view.local_noise, atol=1e-5)
+                          echo + rendered.audit['noise'], atol=1e-5)
 
 
 def test_metadata_covers_the_declared_contract(packed):

@@ -1,4 +1,4 @@
-"""AEC scenario simulator: renders parent sequences of 6 aligned stems.
+"""AEC scenario simulator: renders parent sequences of 5 aligned stems.
 
 THE SIGNAL MODEL THIS FILE EXISTS TO PRODUCE
 --------------------------------------------
@@ -8,19 +8,20 @@ THE SIGNAL MODEL THIS FILE EXISTS TO PRODUCE
     E     = Y - D_hat    materialized linear error          <-- RES+NR input
     R     = D - D_hat    residual echo -- audit only, not target
 
-The five acoustic stems stay separated and the sixth persisted channel is the
+The four acoustic stems stay separated and the fifth persisted channel is the
 real Python-PBFDKF linear error. The filter runs once over the complete parent
 sequence before it is split into chunks, so its adaptation state remains
 continuous while every trainer can still randomize chunks freely.
 
 Everything a model may need is derivable from the persisted stems:
     Y = mic_postclip     X = far_render
-    S = near_speech      N = local_noise
-    S_early = near_target (DeepVQE dereverberation target only)
+    S = near_speech
+    S_early = near_target (DeepVQE-S and Align-CRUSE's dereverb target)
 
-``D`` (echo) and the pre-clip/AGC ``mic_preclip`` are NOT persisted -- no
-model task reads either one, and no candidate is meant to see an oracle
-residual. Both are
+``D`` (echo), ``N`` (local noise) and the pre-clip/AGC ``mic_preclip`` are NOT
+persisted -- no model task targets echo cancellation without denoising any
+more, so none of the three needs to reach a trainer as its own channel, and no
+candidate is meant to see an oracle residual. All three are
 still COMPUTED on every render and returned as ``RenderedSequence.audit``, so
 the corpus's central invariants (``mic_preclip == S+N+D``, "echo really is a
 delayed copy of X") stay checked at generation time -- see
@@ -467,14 +468,14 @@ class SequencePlan:
 
 @dataclasses.dataclass
 class RenderedSequence:
-    stems: torch.Tensor              # (6, T) float32, channel order = STEM_ORDER; PERSISTED
+    stems: torch.Tensor              # (5, T) float32, channel order = STEM_ORDER; PERSISTED
     chunk_meta: List[dict]
     chunk_samples: int
     linear_aec_contract: Dict = dataclasses.field(default_factory=dict)
     audit: Dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
-    # 'echo' and 'mic_preclip' -- computed on every render (see this module's
-    # docstring), NEVER written to WAV/shard. gen_aec_dataset.py's WAV writer
-    # only ever touches ``.stems``; this field exists purely so
+    # 'echo', 'noise' and 'mic_preclip' -- computed on every render (see this
+    # module's docstring), NEVER written to WAV/shard. gen_aec_dataset.py's
+    # WAV writer only ever touches ``.stems``; this field exists purely so
     # tests/test_aec_dataset.py can still verify the corpus's central
     # invariants against a full, un-trimmed render.
 
@@ -993,7 +994,7 @@ class AecSequenceRenderer:
         )
 
         base_stems = torch.stack([
-            far_render, near_speech, near_target, noise, mic_postclip,
+            far_render, near_speech, near_target, mic_postclip,
         ]).to(torch.float32).contiguous()
         if base_stems.shape[0] != len(BASE_STEM_ORDER):
             raise AssertionError("acoustic stem stack does not match BASE_STEM_ORDER")
@@ -1012,6 +1013,7 @@ class AecSequenceRenderer:
             stems=stems, chunk_meta=chunk_meta, chunk_samples=self.chunk_samples,
             linear_aec_contract=self.linear_aec_contract.as_dict(),
             audit={'echo': echo.to(torch.float32).contiguous(),
+                  'noise': noise.to(torch.float32).contiguous(),
                   'mic_preclip': mic_preclip.to(torch.float32).contiguous(),
                   'echo_estimate': echo_estimate.contiguous()},
         )

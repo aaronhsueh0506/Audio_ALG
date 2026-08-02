@@ -11,12 +11,16 @@ arguments.
 
 | Route | Model | Public inputs | Target | Status |
 |---|---|---|---|---|
-| direct AEC/RES, preserve noise | `Align_CRUSE` | mic + unaligned far | near + local noise | selected |
+| end-to-end AEC+RES+NR | `Align_CRUSE` | mic + unaligned far | early near (dereverb) | selected |
 | linear AEC -> RES+NR | `Align_ULCNet` | linear error + far | clean near | paper reference |
 | linear AEC -> RES+NR | `GTCRN_AENR` | linear error + far | clean near | project variant |
 | linear AEC -> RES+NR | `DeepFilterNet_AENR` | conditioned DFN features | clean near | project variant |
 | end-to-end AEC+RES+NR | `DeepVQE_S` | mic + unaligned far | early near (dereverb) | primary |
 | end-to-end AEC+RES+NR | `CAGCRN` | mic + unaligned far | clean near | backup |
+
+Align-CRUSE previously ran its own AEC-only, noise-preserving route (target
+`near_speech + local_noise`); that route was retired and folded into the
+end-to-end AEC+RES+NR task above, so there is no more AEC-only candidate.
 
 All public complex spectra use `[batch,time,frequency]`. The project signal grids
 are zero-padding-free, 50%-overlap `FFT/window/hop = 512/512/256 @ 16 kHz` and
@@ -30,9 +34,9 @@ compatibility from a shared FFT size alone.
 
 `dataset_gen/` is the one AIAEC dataset implementation and public import/CLI
 path. It renders complete stateful scenarios, runs the frozen Python PBFDKF
-once over each complete sequence, and only then cuts the result into 8-second
-chunks. Every chunk stores six lossless stems:
-`far_render`, `near_speech`, `near_target`, `local_noise`, `mic_postclip`, and
+once over each complete sequence, and only then cuts the result into
+10-second chunks. Every chunk stores five lossless stems:
+`far_render`, `near_speech`, `near_target`, `mic_postclip`, and
 `linear_error`. The last stem is `E = mic_postclip - D_hat`; it is not the
 oracle residual echo. `model_views.build_model_view` is the single mapping
 from those stems to each candidate.
@@ -80,7 +84,7 @@ python3 denoise.py output/align_cruse_best.pth mic.wav far.wav out.wav
 
 ## Navigation and tests
 
-- [`dataset_gen/README.md`](dataset_gen/README.md): six-stem scenario data and
+- [`dataset_gen/README.md`](dataset_gen/README.md): five-stem scenario data and
   per-model views.
 - [`../docs/ai_aec_candidate_matrix.md`](../docs/ai_aec_candidate_matrix.md):
   current selection and deployment rules.

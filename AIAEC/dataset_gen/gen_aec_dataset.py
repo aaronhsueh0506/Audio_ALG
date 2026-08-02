@@ -31,7 +31,7 @@ Output layout:
                                      source-list provenance)
       all/meta.json                 run summary ('all' mode)
       all/seqs/000000.json          chunk metadata for one parent sequence
-      all/seqs/000000_000.wav       6-channel chunk, channels = STEM_ORDER
+      all/seqs/000000_000.wav       5-channel chunk, channels = STEM_ORDER
       train/..., val/...            source-disjoint mode instead of all/,
                                      shared by both runs
 
@@ -88,9 +88,9 @@ WAV_ENCODINGS = {
     # generation time against the renderer's un-quantised audit tensors (see
     # aec_dataset.py's RenderedSequence.audit). Quantising the PERSISTED
     # stems to int16 would still degrade any downstream arithmetic that
-    # combines them (e.g. an SER/SNR recomputed from the stored near_speech/
-    # local_noise) by ~1e-4. int16 halves the disk cost and is fine for
-    # listening, not for arithmetic.
+    # combines them (e.g. D_hat = mic_postclip - linear_error) by ~1e-4.
+    # int16 halves the disk cost and is fine for listening, not for
+    # arithmetic.
     'float32': dict(encoding='PCM_F', bits_per_sample=32),
     'int16': dict(encoding='PCM_S', bits_per_sample=16),
 }
@@ -201,7 +201,7 @@ def _sequence_is_complete(plan: SequencePlan, seqs_dir: str, *,
                           sample_rate: int, chunk_samples: int,
                           contract_hash: str, config_hash: str,
                           wav_encoding: str = 'float32') -> bool:
-    """A sidecar alone is not enough to prove a six-channel sequence exists.
+    """A sidecar alone is not enough to prove a five-channel sequence exists.
 
     ``config_hash`` closes the gap ``linear_aec_contract_hash`` alone leaves
     open: two configs can render the SAME chunk count/geometry for a given

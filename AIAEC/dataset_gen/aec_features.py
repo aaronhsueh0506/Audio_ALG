@@ -57,16 +57,18 @@ __all__ = [
 # under 'stems' so a shard that disagrees can be rejected instead of silently
 # feeding a stem into the wrong slot.
 #
-# ``echo`` (D) and ``mic_preclip`` (S+N+D before clipping/AGC) remain audit
-# signals only. ``linear_error`` is different: it is the real frozen PBFDKF
-# output E=Y-D_hat consumed by the three RES+NR candidates. It is materialized
-# over the COMPLETE parent sequence before chunking, never manufactured from
-# oracle D and never recomputed inside a training epoch.
+# ``echo`` (D), ``local_noise`` (N) and ``mic_preclip`` (S+N+D before
+# clipping/AGC) remain audit signals only -- no model task targets echo
+# cancellation without denoising any more, so N never needs to reach a
+# trainer as its own channel (see ``RenderedSequence.audit`` in
+# aec_dataset.py). ``linear_error`` is different: it is the real frozen
+# PBFDKF output E=Y-D_hat consumed by the three RES+NR candidates. It is
+# materialized over the COMPLETE parent sequence before chunking, never
+# manufactured from oracle D and never recomputed inside a training epoch.
 BASE_STEM_ORDER = (
     'far_render',
     'near_speech',
     'near_target',
-    'local_noise',
     'mic_postclip',
 )
 STEM_ORDER = BASE_STEM_ORDER + ('linear_error',)
@@ -252,7 +254,7 @@ def frames_from_seconds(seconds: float, frame_rate: float,
 # ============================================================
 
 class AecStems:
-    """Named access to the ``(..., 6, T)`` stem tensor.
+    """Named access to the ``(..., 5, T)`` stem tensor.
 
     Channel 0 is far_render and channel 1 is near_speech.  Getting those two
     the wrong way round produces a model that trains, converges, and cancels
@@ -300,10 +302,6 @@ class AecStems:
         return self.stem('near_target')
 
     @property
-    def local_noise(self) -> torch.Tensor:
-        return self.stem('local_noise')
-
-    @property
     def mic_postclip(self) -> torch.Tensor:
         """The mic signal a model actually receives."""
         return self.stem('mic_postclip')
@@ -321,9 +319,12 @@ class AecStems:
     #   E = Y - D_hat        by subtraction, never a mask on Y
     #   R = D - D_hat        residual echo; emerges, never a target
     #
-    # ``D`` (true echo) and ``R`` (oracle residual echo) deliberately have no
-    # accessor. E is the materialized *linear error*, not R. D_hat is derived
-    # exactly from the two persisted waveforms rather than stored twice.
+    # ``D`` (true echo), ``N`` (local noise) and ``R`` (oracle residual echo)
+    # deliberately have no accessor: no model task targets echo cancellation
+    # without denoising any more, so N is audit-only (see
+    # ``RenderedSequence.audit`` in aec_dataset.py) like D and R always were.
+    # E is the materialized *linear error*, not R. D_hat is derived exactly
+    # from the two persisted waveforms rather than stored twice.
     @property
     def Y(self) -> torch.Tensor:
         return self.mic_postclip
@@ -335,10 +336,6 @@ class AecStems:
     @property
     def S(self) -> torch.Tensor:
         return self.near_speech
-
-    @property
-    def N(self) -> torch.Tensor:
-        return self.local_noise
 
     @property
     def E(self) -> torch.Tensor:

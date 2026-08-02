@@ -25,7 +25,7 @@ dataset:
     AIAEC/dataset_gen/README.md and ../Align_CRUSE/train.py's docstring for
     the full generation walkthrough (identical for every candidate) --
     including why this generates one unified pool (``--split all``) and
-    performs a deterministic random split over individual 8-second chunks.
+    performs a deterministic random split over individual 10-second chunks.
     CAGCRN is end-to-end -- mic + unaligned far-end go straight to one
     network, no linear AEC in front -- so like Align_CRUSE (and unlike
     ../GTCRN_AENR/train.py) there is no persistent external state to

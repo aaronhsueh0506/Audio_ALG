@@ -7,10 +7,10 @@
 
 mic.wav / far.wav must be mono and at the checkpoint's sample rate (the
 checkpoint's contract sr; resample first if your capture is at a different
-rate). Output is the AEC/RES-only estimate of near_speech + local_noise --
-this candidate deliberately preserves background noise for a later,
-independent NR stage (see ../README.md's decision matrix); it is not a
-"clean speech" denoiser.
+rate). Output is the joint end-to-end AEC+RES+NR estimate of near_target --
+denoised, dereverberated and echo-cancelled near speech (see ../README.md's
+decision matrix). This candidate's earlier AEC-only, noise-preserving route
+was retired.
 
 config.ini is not read here: every shape-relevant setting (grid, model
 kwargs) is recovered from the checkpoint's own contract (see train.py /

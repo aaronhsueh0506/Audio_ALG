@@ -35,6 +35,16 @@ from aec import AEC, AecConfig, AecMode, AecPreset  # noqa: E402
 
 LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v1"
 
+# The linear-AEC frontend is a frozen, versioned contract: its (frame_size,
+# hop_size) per sample rate is a deliberate, pinned choice of this dataset,
+# not meant to track whatever lib/aec's own production preset currently
+# defaults to -- that default has already changed once (512/256 -> 256/128)
+# and will again. Every caller that resolves a frame_size (the contract
+# validator below, the config-driven path, and the factories' own fallback
+# when a caller omits frame_size) reads this one map, so the frontend cannot
+# silently drift with an unrelated upstream default change.
+FROZEN_FRAME_HOP_BY_SR = {16000: (512, 256), 48000: (1024, 512)}
+
 
 def _git_commit(path: str) -> str:
     try:
@@ -91,7 +101,7 @@ class LinearAecContract:
     aec_source_hash: str
 
     def __post_init__(self) -> None:
-        supported = {16000: (512, 256), 48000: (1024, 512)}
+        supported = FROZEN_FRAME_HOP_BY_SR
         if self.engine != "python_pbfdkf":
             raise ValueError(f"unsupported linear AEC engine {self.engine!r}")
         if self.preset != "balanced":
@@ -167,6 +177,13 @@ def make_linear_aec_config(
 ) -> AecConfig:
     if AecPreset(preset) is not AecPreset.BALANCED:
         raise ValueError(f"linear AEC preset must be 'balanced', got {preset!r}")
+    if frame_size is None:
+        # Default to THIS contract's own frozen frame size, never to whatever
+        # AecConfig.from_preset would otherwise pick on its own -- see
+        # FROZEN_FRAME_HOP_BY_SR's docstring.
+        pair = FROZEN_FRAME_HOP_BY_SR.get(int(sample_rate))
+        if pair is not None:
+            frame_size = pair[0]
     overrides = {
         "sample_rate": int(sample_rate),
         "mode": AecMode.PBFDKF,
@@ -227,7 +244,7 @@ def linear_aec_contract_from_config(
         "linear_aec", "frame_size",
         fallback=n_fft,
     )
-    supported = {16000: (512, 256), 48000: (1024, 512)}
+    supported = FROZEN_FRAME_HOP_BY_SR
     if sample_rate not in supported:
         raise ValueError(
             f"linear AEC dataset supports sr=16000 or 48000, got {sample_rate}"

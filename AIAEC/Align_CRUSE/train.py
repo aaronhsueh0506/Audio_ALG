@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Align-CRUSE training -- direct neural AEC/RES, preserves local noise.
+"""Align-CRUSE training -- joint end-to-end AEC+RES+NR.
 
 用法:
     python3 train.py --config config.ini
@@ -29,7 +29,7 @@ dataset:
         cp AIAEC/dataset_gen/config.example.ini AIAEC/dataset_gen/config.ini
         python3 -m AIAEC.dataset_gen.gen_aec_dataset --config ... --split all --hours 100 --output data_aec_16k
         python3 -m AIAEC.dataset_gen.pack_aec_dataset --input data_aec_16k/all --output data_aec_16k/packed/all
-    ``[data] val_fraction`` then holds out individual 8-second chunks via
+    ``[data] val_fraction`` then holds out individual 10-second chunks via
     ``training_common.split_dataset_by_sample``, deterministically from
     ``--seed``. Chunks from the same sequence/speaker/RIR may intentionally
     straddle the split, so generalisation requires a separate held-out set.
@@ -37,9 +37,12 @@ dataset:
 
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['Align_CRUSE']):
-    mic + unaligned far-end in; near_speech + local_noise out. This is an
-    AEC/RES-only route -- background noise is deliberately preserved for a
-    later, independent NR stage, so the target is NOT clean speech.
+    mic + unaligned far-end in; near_target (early/dereverberated, denoised,
+    echo-cancelled near speech) out. This candidate previously ran its own
+    AEC/RES-only route -- background noise deliberately preserved for a
+    later, independent NR stage -- but that route was retired: there is no
+    more standalone AEC-only candidate, so Align-CRUSE now shares the same
+    joint end_to_end_aec_res_nr task and dereverb target as DeepVQE-S.
 
 inference: see denoise.py's own top-of-file usage comment.
 """
@@ -86,12 +89,12 @@ from AIAEC.training_common import (
 
 
 MODEL_NAME = 'Align_CRUSE'
-TASK = 'direct_aec_preserve_noise'
+TASK = 'end_to_end_aec_res_nr'
 LOSS_VERSION = 'aiaec_compressed_spectral_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
-    return build_arg_parser('Train Align-CRUSE (direct AEC/RES, preserve noise)')
+    return build_arg_parser('Train Align-CRUSE (joint end-to-end AEC+RES+NR)')
 
 
 def forward_batch(model, stems_batch, aec_grid, device):

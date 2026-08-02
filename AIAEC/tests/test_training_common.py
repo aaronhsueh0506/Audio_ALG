@@ -65,7 +65,7 @@ def test_checkpoint_contract_roundtrip_and_mismatch():
     grid = SignalGrid(16000, 512, 512, 256)
     kwargs = {'gru_hidden': 64}
     contract = make_checkpoint_contract(
-        model_name='Align_CRUSE', task='direct_aec_preserve_noise', grid=grid,
+        model_name='Align_CRUSE', task='end_to_end_aec_res_nr', grid=grid,
         model_kwargs=kwargs, loss_version='v1',
     )
     require_checkpoint_contract({'contract': contract}, contract)   # must not raise
@@ -75,7 +75,7 @@ def test_checkpoint_contract_roundtrip_and_mismatch():
 
 def test_checkpoint_contract_rejects_changed_data_split_indices():
     grid = SignalGrid(16000, 512, 512, 256)
-    linear = make_linear_aec_contract(16000)
+    linear = make_linear_aec_contract(16000, frame_size=512)
     data_contract = {
         'dataset_fingerprint': 'corpus-a',
         'linear_aec': linear.as_dict(),
@@ -99,7 +99,7 @@ def test_checkpoint_contract_rejects_changed_data_split_indices():
 
 
 def test_checkpoint_linear_aec_rejects_hash_and_model_grid_mismatch():
-    linear = make_linear_aec_contract(16000)
+    linear = make_linear_aec_contract(16000, frame_size=512)
     grid = SignalGrid(16000, 512, 512, 256)
     checkpoint_contract = {
         'linear_aec': linear.as_dict(),
@@ -121,7 +121,7 @@ def test_checkpoint_linear_aec_rejects_hash_and_model_grid_mismatch():
 def test_checkpoint_contract_ctor_prefix_does_not_collide_with_model_name():
     grid = SignalGrid(16000, 512, 512, 256)
     contract = make_checkpoint_contract(
-        model_name='Align_CRUSE', task='direct_aec_preserve_noise', grid=grid,
+        model_name='Align_CRUSE', task='end_to_end_aec_res_nr', grid=grid,
         model_kwargs={'gru_hidden': 64}, loss_version='v1',
     )
     assert contract['model_name'] == 'Align_CRUSE'
@@ -134,7 +134,8 @@ def test_compressed_spectral_loss_zero_for_identical_spectra():
 
 
 def test_linear_aec_engine_full_length_output_and_reset():
-    engine = LinearAecEngine(n_lanes=2, sample_rate=16000, preset='balanced')
+    engine = LinearAecEngine(n_lanes=2, sample_rate=16000, preset='balanced',
+                             frame_size=512)
     mic = torch.randn(2, 16000) * 0.05
     far = torch.randn(2, 16000) * 0.05
     error, echo_estimate = engine(mic, far, 16000)
@@ -149,14 +150,14 @@ def test_linear_aec_engine_full_length_output_and_reset():
 
 
 def test_linear_aec_engine_rejects_sample_rate_mismatch():
-    engine = LinearAecEngine(n_lanes=1, sample_rate=16000)
+    engine = LinearAecEngine(n_lanes=1, sample_rate=16000, frame_size=512)
     mic = torch.randn(1, 16000) * 0.05
     with pytest.raises(ValueError, match='sample_rate'):
         engine(mic, mic, 48000)
 
 
 def test_inference_linear_aec_matches_offline_materializer_exactly():
-    contract = make_linear_aec_contract(16000)
+    contract = make_linear_aec_contract(16000, frame_size=512)
     generator = torch.Generator().manual_seed(19)
     far = torch.randn(32768, generator=generator) * 0.05
     mic = torch.randn(32768, generator=generator) * 0.02 + far * 0.3
@@ -175,7 +176,7 @@ def test_inference_linear_aec_matches_offline_materializer_exactly():
 
 
 def test_inference_rejects_drifted_linear_aec_source_contract():
-    contract = make_linear_aec_contract(16000).as_dict()
+    contract = make_linear_aec_contract(16000, frame_size=512).as_dict()
     contract['aec_source_hash'] = '0' * 64
     with pytest.raises(ValueError, match='aec_source_hash'):
         LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)

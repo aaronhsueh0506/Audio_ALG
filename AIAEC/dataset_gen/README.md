@@ -1,22 +1,25 @@
 # AEC dataset generation
 
-Renders acoustic-echo scenarios as **six separated stems** and packs them into
+Renders acoustic-echo scenarios as **five separated stems** and packs them into
 `.pt` shards. This is the only AIAEC dataset package. It reuses shared DSP from
 the separate `AINR/dataset_gen/` NR generator rather than forking that DSP.
 
-## The six stems
+## The five stems
 
-Every clip is a `(6, T)` tensor whose channel order is fixed and declared in
+Every clip is a `(5, T)` tensor whose channel order is fixed and declared in
 each shard:
 
 | # | stem | what it is |
 |---|---|---|
 | 0 | `far_render` | **X** — the far-end signal as the device rendered it, i.e. the AEC reference. Digital and clean: the loudspeaker's distortion happens *downstream* of this tap. |
 | 1 | `near_speech` | **S** — the near talker at the mic, already through the room RIR. Reverberant on purpose; that reverberation is desired signal. |
-| 2 | `near_target` | **S_early** — the same near talker and gain through the early/late-suppressed RIR; used only for DeepVQE's published dereverberation target. |
-| 3 | `local_noise` | **N** — ambient noise at the mic. |
-| 4 | `mic_postclip` | **Y** — what a model actually receives, after capture clipping/AGC. |
-| 5 | `linear_error` | **E** — frozen PBFDKF output, `Y - D_hat`. This is not oracle residual echo. |
+| 2 | `near_target` | **S_early** — the same near talker and gain through the early/late-suppressed RIR; the dereverberation target for DeepVQE-S and Align-CRUSE. |
+| 3 | `mic_postclip` | **Y** — what a model actually receives, after capture clipping/AGC. |
+| 4 | `linear_error` | **E** — frozen PBFDKF output, `Y - D_hat`. This is not oracle residual echo. |
+
+**N** (`local_noise`, ambient noise at the mic) is no longer a persisted
+stem: no current model task targets echo cancellation without denoising, so
+it is audit-only now, like `echo` and `mic_preclip` always were (see below).
 
 The signal model the corpus exists to serve:
 
@@ -28,32 +31,36 @@ E     = Y - D_hat      stored linear error
 R     = D - D_hat      residual echo — emerges, never a target
 ```
 
-The default config renders each complete 16–24 second parent sequence first, then
+The default config renders each complete 20–30 second parent sequence first, then
 runs one stateful Python PBFDKF instance over `mic_postclip + far_render`, and
-only then cuts all six stems into 8-second chunks. The PBFDKF resets between
+only then cuts all five stems into 10-second chunks. The PBFDKF resets between
 parent sequences and never at a chunk boundary. Its full engine/source/grid
 contract is stored in run, chunk, shard, and checkpoint metadata.
 
-`model_views.py` maps the six stems to the candidate contracts. Align-CRUSE
-targets `S+N`; Align-ULCNet and the two AENR variants read stored `E + X` and
-target `S`; CAGCRN targets `S`; DeepVQE-S targets `S_early`. `D_hat` is derived
-as `mic_postclip - linear_error` when required and is never stored separately.
+`model_views.py` maps the five stems to the candidate contracts. Align-ULCNet
+and the two AENR variants read stored `E + X` and target `S`; CAGCRN targets
+`S`; DeepVQE-S and Align-CRUSE target `S_early` (the joint end-to-end
+AEC+RES+NR task, denoised + dereverberated + echo-cancelled). `D_hat` is
+derived as `mic_postclip - linear_error` when required and is never stored
+separately.
 
-**⚠ `echo` (D) and `mic_preclip` (S+N+D, pre-clip/AGC) are NOT stored.** No
-model task reads either one, and no candidate sees oracle residual `R`.
-They are still
+**⚠ `echo` (D), `local_noise` (N) and `mic_preclip` (S+N+D, pre-clip/AGC) are
+NOT stored.** No model task targets echo cancellation without denoising any
+more, and no candidate sees oracle residual `R`. All three are still
 **computed on every render** — `aec_dataset.AecSequenceRenderer.render()`
 returns them under `RenderedSequence.audit` — so the corpus's central
 invariants (`mic_preclip == S+N+D`, "echo really is a delayed copy of X") stay
 verified at generation time; see `tests/test_aec_dataset.py`, which checks them
 directly against the renderer rather than a packed shard. If you need `echo`/
-`mic_preclip` for a one-off analysis, call `AecSequenceRenderer.render()`
-yourself — do not add them back to `STEM_ORDER` for that.
+`local_noise`/`mic_preclip` for a one-off analysis, call
+`AecSequenceRenderer.render()` yourself — do not add them back to
+`STEM_ORDER` for that.
 
-Old five-channel WAVs/shards are rejected. To upgrade an existing five-channel
-render without repeating speech/noise/RIR mixing, run
-`rematerialize_linear_aec.py`; it reconstructs complete sequences in
-`(sequence_id, chunk_index)` order, rewrites channel six, and updates metadata.
+Old six-channel WAVs/shards (with a separate `local_noise` stem) are rejected.
+To upgrade an existing four-channel render without repeating speech/noise/RIR
+mixing, run `rematerialize_linear_aec.py`; it reconstructs complete sequences
+in `(sequence_id, chunk_index)` order, rewrites the last channel
+(`linear_error`), and updates metadata.
 
 `AecStems` gives these names; nothing indexes the channel axis by number.
 
@@ -127,9 +134,10 @@ contain. `sequence_scenario` keeps the sequence-level intent.
 
 **`ref_dropout` is load-bearing.** During a dropout the far end is genuinely
 silent — `X == 0` **and** `D == 0` — so no model may hallucinate echo removal.
-For AEC-only Align-CRUSE the desired signal is `S+N`; joint-NR models may still
-suppress `N`, so `ref == 0 -> output == mic` is **not** a universal gate.
-`[dropout] ref_dropout_echo_continues_p` can make
+Every current candidate is a joint AEC+NR route and may still suppress `N`, so
+`ref == 0 -> output == mic` is **not** a universal gate (that expectation
+belonged to the now-retired AEC-only Align-CRUSE route, which targeted
+`S+N`). `[dropout] ref_dropout_echo_continues_p` can make
 the loudspeaker keep playing while the reference is lost, but that asks the
 model to predict an echo from nothing, so it is **0 by default**: raising it
 trains hallucination.
@@ -144,7 +152,7 @@ contains the *transition* into and out of idle, which is the hard part.
 
 The selected training protocol generates one unified pool (`--split all`) and
 uses `training_common.split_dataset_by_sample` after packing. A dedicated
-seeded generator randomly assigns individual 8-second chunk indices, so the
+seeded generator randomly assigns individual 10-second chunk indices, so the
 split is reproducible, disjoint, and covers the whole corpus. Different chunks
 from the same sequence, speaker, RIR, or device may intentionally straddle
 train and validation. The train loader reshuffles every epoch; validation does
@@ -160,11 +168,11 @@ the comparison.
 
 ## Why sequences are long
 
-Parent sequences are 16–24 s by default, cut into consecutive fixed-length chunks that
+Parent sequences are 20–30 s by default, cut into consecutive fixed-length chunks that
 share a `sequence_id` and carry an increasing `chunk_index`.
 
 Long sequences are still required because PBFDKF adaptation from cold,
-echo-path changes, and drift must happen before channel six is cut. The packer
+echo-path changes, and drift must happen before the last channel is cut. The packer
 keeps `(sequence_id, chunk_index)` order for deterministic reconstruction and
 streaming evaluation. Training itself treats chunks as independent shuffled
 samples; `SequenceChunkSampler` remains only as an evaluation utility and is
@@ -176,9 +184,9 @@ not used by any trainer.
 |---|---|
 | `aec_dataset.py` | the scenario simulator: nonlinearity, echo path, delay/jitter, SRO, dropout, AGC |
 | `manifest.py` | unified/source-disjoint source manifest |
-| `gen_aec_dataset.py` | CLI — renders complete sequences to 6-channel WAV chunks |
+| `gen_aec_dataset.py` | CLI — renders complete sequences to 5-channel WAV chunks |
 | `linear_aec.py` | frozen PBFDKF contract and full-sequence materializer |
-| `rematerialize_linear_aec.py` | rebuilds channel six from existing five/six-channel WAVs |
+| `rematerialize_linear_aec.py` | rebuilds the last channel from existing four/five-channel WAVs |
 | `pack_aec_dataset.py` | packs those WAVs into `.pt` shards |
 | `packed_aec_dataset.py` | `PackedAecDataset`, returning `(stems, meta)` |
 | `aec_features.py` | **the shared module the model projects import** |
@@ -239,15 +247,15 @@ data_aec/
   manifest.json                 source-list provenance
   all/meta.json                 run summary + PBFDKF contract
   all/seqs/000000.json          chunk metadata for one parent sequence
-  all/seqs/000000_000.wav       6-channel chunk, channels = STEM_ORDER
+  all/seqs/000000_000.wav       5-channel chunk, channels = STEM_ORDER
   packed/all/shard_00000.pt
 ```
 
 The six trainers read `packed/all` and create the deterministic random chunk
 split from `[data] val_fraction` and the training seed.
 
-To refresh PBFDKF channel six after changing its implementation, without
-repeating acoustic mixing:
+To refresh the PBFDKF `linear_error` channel after changing its
+implementation, without repeating acoustic mixing:
 
 ```bash
 python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
@@ -258,7 +266,7 @@ python3 -m AIAEC.dataset_gen.pack_aec_dataset \
     --input data_aec/all --output data_aec/packed/all
 ```
 
-`--resume` marks a sequence complete only after all six-channel WAVs and its
+`--resume` marks a sequence complete only after all five-channel WAVs and its
 matching metadata contract exist. Repacking is mandatory because old shards
 retain the old audio and contract.
 
@@ -270,12 +278,12 @@ already had.
 
 **⚠ `--wav-encoding` defaults to `float32`** because the corpus's central
 invariant, `mic_preclip == near_speech + local_noise + echo`, is checked at
-generation time against the renderer's un-quantised audit tensors (`echo` and
-`mic_preclip` are not among the persisted stems — see "The six stems" above).
-Quantising the PERSISTED stems to `int16` would still degrade any downstream
-arithmetic that combines them (e.g. an SER recomputed from the stored
-`near_speech`/`local_noise`) by ~1e-4. `int16` halves the disk cost and is fine
-for listening, not for arithmetic.
+generation time against the renderer's un-quantised audit tensors (`echo`,
+`local_noise` and `mic_preclip` are not among the persisted stems — see "The
+five stems" above). Quantising the PERSISTED stems to `int16` would still
+degrade any downstream arithmetic that combines them (e.g.
+`D_hat = mic_postclip - linear_error`) by ~1e-4. `int16` halves the disk cost
+and is fine for listening, not for arithmetic.
 
 **⚠ `--workers > 0` on macOS uses spawn.** The shipped CLI has the
 `if __name__ == '__main__'` guard it needs; a script that calls

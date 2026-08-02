@@ -27,7 +27,7 @@ class PackedAecDataset(Dataset):
     """Open one ``.pt`` shard, or every shard in a directory, in order.
 
     ``__getitem__`` returns ``(stems, meta)`` where ``stems`` is the raw
-    ``(6, T)`` tensor in ``STEM_ORDER``.  Wrap it in
+    ``(5, T)`` tensor in ``STEM_ORDER``.  Wrap it in
     :class:`~AIAEC.dataset_gen.aec_features.AecStems` to read channels by name --
     :meth:`stems_of` does that for you.
     """

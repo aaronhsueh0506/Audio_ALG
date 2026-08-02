@@ -29,7 +29,7 @@ dataset:
         cp AIAEC/dataset_gen/config.example.ini AIAEC/dataset_gen/config.ini
         python3 -m AIAEC.dataset_gen.gen_aec_dataset --config ... --split all --hours 100 --output data_aec_16k
         python3 -m AIAEC.dataset_gen.pack_aec_dataset --input data_aec_16k/all --output data_aec_16k/packed/all
-    ``[data] val_fraction`` then holds out individual 8-second chunks via
+    ``[data] val_fraction`` then holds out individual 10-second chunks via
     ``training_common.split_dataset_by_sample``, deterministically from
     ``--seed``. Chunks from the same sequence/speaker/RIR may intentionally
     straddle the split, so generalisation requires a separate held-out set.

@@ -6,9 +6,9 @@ training on a corpus of this size.  The shard layout is the packed format every
 AEC model project consumes:
 
     {
-      'stems': ['far_render','near_speech','near_target','local_noise',
+      'stems': ['far_render','near_speech','near_target',
                 'mic_postclip','linear_error'],  # channel order, fixed
-      'data' : float32 tensor (N, 6, T),
+      'data' : float32 tensor (N, 5, T),
       'sr'   : int,
       'meta' : list of N dicts,
       'generator_commit': str,

@@ -36,10 +36,11 @@ def test_all_six_candidates_have_one_dataset_contract():
     }
 
 
-def test_align_cruse_preserves_noise_in_target():
+def test_align_cruse_uses_early_near_target_for_joint_dereverb_task():
     stems = _stems()
     view = build_model_view(stems, "Align_CRUSE", 16000)
-    assert torch.equal(view.target, stems.near_speech + stems.local_noise)
+    assert torch.equal(view.target, stems.near_target)
+    assert set(view.inputs) == {"microphone", "far_end"}
 
 
 def test_deepvqe_uses_early_near_target_for_published_dereverb_task():
@@ -56,7 +57,7 @@ def test_cagcrn_target_is_clean_reverberant_near_speech():
     assert set(view.inputs) == {"microphone", "far_end"}
 
 
-def test_residual_view_uses_materialized_sixth_stem():
+def test_residual_view_uses_materialized_linear_error_stem():
     stems = _stems()
     view = build_model_view(stems, "Align_ULCNet", 16000)
     assert torch.equal(view.inputs["linear_error"], stems.linear_error)
