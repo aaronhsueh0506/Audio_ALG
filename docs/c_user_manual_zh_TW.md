@@ -47,8 +47,8 @@ AEC／NR 直接 wrapper 僅保留給尚未過渡的既有呼叫端。
 
 | 取樣率 | frame | FFT | hop | bins | 資源拓撲 |
 |---|---:|---:|---:|---:|---|
-| 16 kHz | 256 | 256 | 128 | 129 | 1 shared matcher + 4 linear AEC + 1 post-beam RES + 1 NR |
-| 16 kHz | 512 | 512 | 256 | 257 | 同上（預設） |
+| 16 kHz | 256 | 256 | 128 | 129 | 1 shared matcher + 4 linear AEC + 1 post-beam RES + 1 NR（預設） |
+| 16 kHz | 512 | 512 | 256 | 257 | 同上（可選） |
 | 48 kHz | 1024 | 1024 | 512 | 513 | 同上（唯一合法 48 kHz 格點） |
 
 呼叫端先用 `four_aec_nr_res_process_pre()` 取得 interleaved `[hop][4]`

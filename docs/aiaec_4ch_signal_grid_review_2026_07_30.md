@@ -21,9 +21,15 @@
 
 ### 1.1 現行候選與責任邊界
 
+**⚠ 過期（2026-08-04 標註）**：下表 `Align_CRUSE` 那一列描述的是 `5d28af0`（"retire
+Align-CRUSE's AEC-only route"）之前的舊分類。現況是 `Align_CRUSE` 已併入 E2E AEC+RES+NR
+任務、`local_noise` target 已移除——見 `AIAEC/README.md`、`AIAEC/dataset_gen/model_views.py`
+的 `MODEL_TASKS`。這是使用者明確決定的分類異動，不是需要「恢復」的 regression；這份文件本身
+沒跟上那次改動，下表僅供歷史參考。
+
 | 分類 | 模型 | 前級 | 公開輸入 | target | 16 kHz trainable parameters | 判定 |
 |---|---|---|---|---|---:|---|
-| AEC（含 RES） | `Align_CRUSE` | 無 matched/linear AEC | mic + unaligned far | `near_speech + local_noise` | 710,513 | 保留 |
+| ~~AEC（含 RES）~~ E2E AEC+RES+NR（現況，見上方註記） | `Align_CRUSE` | 無 matched/linear AEC | mic + unaligned far | ~~`near_speech + local_noise`~~ 現為 early near（dereverb），無 local_noise target | 710,513 | 保留 |
 | RES+NR | `Align_ULCNet` | frozen production linear AEC | linear error + far | clean reverberant near | 672,441 | paper reference |
 | RES+NR | `GTCRN_AENR` | frozen production linear AEC | linear error + far | clean reverberant near | 48,965 | project variant |
 | RES+NR | `DeepFilterNet_AENR` | frozen production linear AEC | linear error + independent error/far DFN features | clean reverberant near | 2,113,480 | project variant |
