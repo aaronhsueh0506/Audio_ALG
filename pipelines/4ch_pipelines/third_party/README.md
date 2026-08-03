@@ -48,10 +48,27 @@ perceptually validated against real recordings; the `lambda` forgetting
 factor itself is separately bounded to `(0, 1]` at both `gsc_create()` and
 the wrapper's config validation.
 
-Steering tables are precomputed at construction. The 48 kHz pipeline's optional
-16 kHz DOA mode builds a separate 48 kHz steering table for GSC without
-creating a second SRP scorer. No allocation occurs in SRP/GSC per-frame
-processing.
+Steering tables are precomputed at construction for whichever single grid the
+pipeline is running (`srp_cfg.sr`/FFT/hop are the pipeline's own native
+values -- see `audio_pipeline_4ch.c`'s `..._doa_sample_rate()`/`..._doa_fft_size()`
+getters, which are pure pass-throughs). No allocation occurs in SRP/GSC
+per-frame processing.
+
+There is currently no separate/optional 16 kHz DOA mode: this paragraph
+previously described one, but no corresponding config field, flag, or
+second steering table exists anywhere in this directory or
+`audio_pipeline_4ch.c` (confirmed by grep, 2026-08-02) -- treat the two
+paragraphs below as aspirational, not implemented. `4ch_pipelines/README.md`'s
+"There is no legacy/downsample grid entry" is the accurate statement of the
+current design. If a real 16 kHz-DOA-at-48-kHz-pipeline requirement ever
+lands, prefer first restricting SRP-PHAT's per-bin PHAT/pair-steering/scratch
+work to the frequency band it actually searches (`f_start..f_end`, `srp.c`'s
+`pair_steering`/`prealign` loops currently walk the full bin range even
+though the search band is much narrower) before adding a second STFT/
+downsample domain -- reusing the AEC lanes' existing 48 kHz spectra and
+narrowing the band SRP scores is cheaper than a second FFT pipeline, and a
+naive stride-pick 48->16 kHz decimation would alias exactly like the
+mono/4ch AEC delay-estimator gap documented elsewhere in this repo.
 
 Run the spatial arithmetic and full wrapper gates through:
 
@@ -62,6 +79,7 @@ make -C Audio_ALG/pipelines/4ch_pipelines test
 ```
 
 The complete pipeline supports `16k/256/128`, `16k/512/256`, and
-`48k/1024/512` (`sample-rate/frame/hop`, with frame equal to FFT). With the
-explicit DOA-downsample flag, only 48 kHz SRP-PHAT changes to
-`16k/512/256`; GSC stays on `48k/1024/512`.
+`48k/1024/512` (`sample-rate/frame/hop`, with frame equal to FFT), one grid
+at a time -- DOA, GSC and AEC/NR/RES all run at the same selected tuple
+(see `4ch_pipelines/README.md`). There is no DOA-downsample flag; the
+sentence that used to describe one above is corrected.

@@ -655,6 +655,14 @@ static void run_static_parity(int sample_rate, int fft_size) {
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "static init_ex rejects stale descriptor bytes");
+    stale = req;
+    stale.layout_version -= 1u;
+    stale.bytes += 4096u;
+    CHECK(four_aec_nr_res_init_ex(
+              pool, (size_t)req.bytes, &cfg, &stale) == NULL,
+          "static init_ex rejects a stale layout even when its cached "
+          "bytes are larger than current (byte count fitting must never "
+          "substitute for layout/hash agreement)");
 
     stat = four_aec_nr_res_init_ex(
         pool, (size_t)req.bytes, &cfg, &req);

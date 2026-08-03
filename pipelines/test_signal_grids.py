@@ -4,6 +4,7 @@ import pytest
 from lib.aec.python.modules.config import AecConfig
 from lib.nr.core.frame_processor import FrameProcessor
 from lib.nr.core.signal_grid import (
+    _SIXTEEN_MS_HOP_SECONDS,
     resolve_signal_grid,
     retime_ema_alpha,
     retime_frame_count,
@@ -21,7 +22,10 @@ from pipelines.aec_nr_pipeline import _build_denoiser, _project_grid
 @pytest.mark.parametrize(
     "sample_rate,fft_size,expected",
     [
-        (16000, None, (512, 256, 512)),
+        # 16kHz default flipped 512/256 (16ms hop) -> 256/128 (8ms hop) on
+        # 2026-08-02/03 (NR CHANGELOG [4.5.0]); 512/256 remains a supported,
+        # explicit alternate grid (see the fft_size=256 case below).
+        (16000, None, (256, 128, 256)),
         (16000, 256, (256, 128, 256)),
         (48000, None, (1024, 512, 1024)),
     ],
@@ -33,7 +37,10 @@ def test_nr_project_grid(sample_rate, fft_size, expected):
 @pytest.mark.parametrize(
     "sample_rate,fft_size,expected",
     [
-        (16000, None, (512, 256, 512)),
+        # 16kHz default flipped 512/256 (16ms hop) -> 256/128 (8ms hop) on
+        # 2026-08-02/03 (NR CHANGELOG [4.5.0]); 512/256 remains a supported,
+        # explicit alternate grid (see the fft_size=256 case below).
+        (16000, None, (256, 128, 256)),
         (16000, 256, (256, 128, 256)),
         (48000, None, (1024, 512, 1024)),
     ],
@@ -139,8 +146,13 @@ def test_mmse_lsa_outer_model_retimes_all_frame_domain_state(sample_rate, fft_si
         scene_change_min_frames=5,
     )
     hop = denoiser.processor.frame_shift
+    # L=32 is documented in config/v3_2_config.yaml as authored directly against
+    # a 16ms hop ("32 幀 x 16ms/hop = 512ms"); v3_2_mmse_lsa.py's L retime call
+    # applies that basis unconditionally (NR CHANGELOG [4.5.0], 2026-08-03) --
+    # unlike num_init_frames/scene_change_min_frames below, which stay on the
+    # generic 10ms reference (no equivalent hop-basis evidence for them).
     assert denoiser.noise_estimator.L == retime_frame_count(
-        32, sample_rate, hop
+        32, sample_rate, hop, authored_hop_seconds=_SIXTEEN_MS_HOP_SECONDS
     )
     assert denoiser.noise_estimator.num_init_frames == retime_frame_count(
         20, sample_rate, hop
@@ -151,8 +163,12 @@ def test_mmse_lsa_outer_model_retimes_all_frame_domain_state(sample_rate, fft_si
     assert denoiser.noise_estimator.alpha_s == pytest.approx(
         retime_ema_alpha(0.95, sample_rate, hop)
     )
+    # alpha_xi is 16ms-native unconditionally, regardless of strength (see
+    # v3_2_mmse_lsa.py's __init__ docstring; same NR CHANGELOG [4.5.0] fix as L
+    # above) -- unlike alpha_g just below, which stays on the 10ms reference
+    # here because this denoiser is constructed at the default strength='balanced'.
     assert denoiser.spp_estimator.alpha == pytest.approx(
-        retime_ema_alpha(0.92, sample_rate, hop)
+        retime_ema_alpha(0.92, sample_rate, hop, authored_hop_seconds=_SIXTEEN_MS_HOP_SECONDS)
     )
     assert denoiser.gain_calculator.alpha_g == pytest.approx(
         retime_ema_alpha(0.88, sample_rate, hop)

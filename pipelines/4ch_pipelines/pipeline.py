@@ -57,11 +57,29 @@ class SharedDelayState:
 class SharedMatchedDelayEstimator:
     """One matched filter driven by one configurable array capture proxy.
 
-    The AEC3 matched-filter port is a 16-kHz-domain implementation.  At 48 kHz
-    this wrapper feeds every third sample to that one instance and converts the
-    estimated delay back to 48-kHz samples.  The decimation phase is continuous
-    across hops, so a non-multiple-of-three hop (the project 512-sample hop) does
-    not introduce a frame-boundary timing jump.
+    Anti-alias status (fixed 2026-08-03): this wrapper used to do its OWN
+    external 48 kHz decimation -- a bare stride-pick with NO anti-alias
+    filter, real aliasing at 48 kHz -- ahead of an inner ``LegacyDelayShim``
+    that it hardcoded to ``sample_rate=16000`` regardless of this wrapper's
+    real rate, then manually rescaled the returned delay by
+    ``_rate_factor``. That duplicated (and, at 48 kHz, aliased) a decimation
+    path the estimator now owns correctly, and diverged from the same class
+    of fix already applied to the mono AEC's C port
+    (``delay_aec3.c``'s ``DaResample48`` sidechain, 2026-08-02) and to
+    Python's own ``EchoPathDelayEstimator`` (its ``_Resample48`` sidechain,
+    2026-08-03).
+
+    This wrapper now constructs its inner ``LegacyDelayShim`` with this
+    wrapper's TRUE native ``sample_rate`` (8000/16000/48000) and feeds it
+    every hop RAW and un-decimated. At 48 kHz, ``EchoPathDelayEstimator``
+    internally anti-alias-filters (order-7 elliptic, 4 SOS sections) and
+    decimates by 3 ahead of its inner AEC3-rate matched-filter chain, and it
+    already rescales the delay it returns back to the true native sample
+    domain (see its ``_process_inner_block``'s
+    ``* _DOWN_SAMPLING_FACTOR * self._rate_factor`` line) -- so this wrapper
+    must NOT decimate or rescale a second time. No external decimation, no
+    decimation-phase bookkeeping, and no manual rate-factor rescale live
+    here anymore.
     """
 
     def __init__(self, sample_rate: int, hop_size: int) -> None:
@@ -71,11 +89,14 @@ class SharedMatchedDelayEstimator:
             )
         self.sample_rate = int(sample_rate)
         self.hop_size = int(hop_size)
-        self._rate_factor = self.sample_rate // 16000
-        self._decimation_phase = 0
+        # LegacyDelayShim -> EchoPathDelayEstimator now owns 48kHz anti-alias
+        # + decimation internally (and rescales its returned delay back to
+        # native samples), so it is constructed with the TRUE native rate --
+        # never a hardcoded 16000 -- and fed raw hops directly (see
+        # accumulate() below).
         self._estimator = LegacyDelayShim(
-            sample_rate=16000,
-            hop_size=max(1, self.hop_size // self._rate_factor),
+            sample_rate=self.sample_rate,
+            hop_size=self.hop_size,
         )
         self._calls = 0
         self._accepted_delay = 0
@@ -87,34 +108,25 @@ class SharedMatchedDelayEstimator:
 
     def reset(self) -> None:
         self._estimator.reset()
-        self._decimation_phase = 0
         self._calls = 0
         self._accepted_delay = 0
 
-    def _to_16k_pair(
-        self, capture: np.ndarray, render: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray]:
-        capture = np.asarray(capture, dtype=np.float32)
-        render = np.asarray(render, dtype=np.float32)
-        if capture.ndim != 1 or render.ndim != 1 or capture.shape != render.shape:
-            raise ValueError("capture proxy and render must be equal-length 1-D hops")
-        if self._rate_factor == 1:
-            return capture, render
-        indices = np.arange(capture.size, dtype=np.int64)
-        keep = ((indices + self._decimation_phase) % self._rate_factor) == 0
-        self._decimation_phase = (
-            self._decimation_phase + capture.size
-        ) % self._rate_factor
-        return capture[keep], render[keep]
-
     def accumulate(self, capture_proxy: np.ndarray, render: np.ndarray) -> SharedDelayState:
-        capture_16k, render_16k = self._to_16k_pair(capture_proxy, render)
+        capture_proxy = np.asarray(capture_proxy, dtype=np.float32)
+        render = np.asarray(render, dtype=np.float32)
+        if (
+            capture_proxy.ndim != 1
+            or render.ndim != 1
+            or capture_proxy.shape != render.shape
+        ):
+            raise ValueError("capture proxy and render must be equal-length 1-D hops")
         self._calls += 1
-        if capture_16k.size:
-            self._estimator.accumulate(capture_16k, render_16k)
+        # Raw, un-decimated native-rate hop straight into the estimator --
+        # it anti-alias filters + decimates internally at 48kHz and returns
+        # the delay already rescaled back to native samples.
+        self._estimator.accumulate(capture_proxy, render)
 
-        estimated_16k = int(self._estimator.estimated_delay)
-        estimated = estimated_16k * self._rate_factor if estimated_16k >= 0 else -1
+        estimated = int(self._estimator.estimated_delay)
         # Match the production acquisition rule: a delay is not allowed to
         # disturb four learned filters until the shared estimate is solid and
         # has produced at least three aggregate updates.
@@ -245,7 +257,10 @@ class FourChannelAecConfig:
             raise ValueError(
                 f"four-channel path supports {_SUPPORTED_SAMPLE_RATES}, got {self.sample_rate}"
             )
-        default_frame = 512 if self.sample_rate == 16000 else 1024
+        # 16 kHz default is 256/128 (8ms hop), matching the C core's own
+        # derive_dims_and_configs default (4aec_nr_res.c) as of 2026-08-02/03.
+        # 512/256 remains a supported, explicit alternate (see whitelist below).
+        default_frame = 256 if self.sample_rate == 16000 else 1024
         frame = default_frame if self.frame_size is None else int(self.frame_size)
         hop = frame // 2 if self.hop_size is None else int(self.hop_size)
         # Mirrors the C core's exact whitelist (4aec_nr_res.c derive_dims_and_configs):

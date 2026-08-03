@@ -398,6 +398,69 @@ static int test_gsc_long_run_hermitian_and_finite(void) {
     return 1;
 }
 
+/* Regression test (Codex review): gsc_create() forces the actual RLS update
+ * cadence (g->adapt_interval) to 1 whenever enable_fix_mode &&
+ * fixed_align_notebook, regardless of the caller's requested adapt_interval
+ * -- kept for baseline-matching against the reference notebook. Any external
+ * computation that assumes a particular cadence (e.g. audio_pipeline_4ch.c
+ * retiming lambda for a slower wall-clock update period) MUST derive it via
+ * the same gsc_effective_adapt_interval() gsc_create() uses internally
+ * instead of re-deriving the forcing rule, so the two can never silently
+ * diverge again. This test creates real GSC instances across representative
+ * (enable_fix_mode, fixed_align_notebook, adapt_interval) combinations and
+ * confirms gsc_create()'s actual resulting cadence always matches what
+ * gsc_effective_adapt_interval() predicts for those same inputs. */
+static int test_gsc_effective_adapt_interval_matches_created_cadence(void) {
+    static const struct {
+        int enable_fix_mode;
+        int fixed_align_notebook;
+        int requested_adapt_interval;
+    } cases[] = {
+        {0, 0, 1}, /* auto mode, default cadence */
+        {0, 0, 4}, /* auto mode, slower cadence: no forcing */
+        {1, 0, 4}, /* fixed mode WITHOUT notebook alignment: no forcing */
+        {1, 1, 1}, /* fixed-notebook mode, already 1: forcing is a no-op */
+        {1, 1, 4}, /* fixed-notebook mode: MUST be forced down to 1 */
+        {1, 1, 8},
+    };
+    SRP_Config srp_cfg;
+    GSC_Config gsc_cfg;
+    SRP* srp_handle;
+    size_t i;
+
+    srp_handle = make_test_srp(&srp_cfg);
+    CHECK(srp_handle != NULL,
+          "effective-interval test: create steering owner");
+
+    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        int expected;
+        GSC* g;
+
+        memset(&gsc_cfg, 0, sizeof(gsc_cfg));
+        gsc_cfg.enable = 1;
+        gsc_cfg.lambda = 0.995f;
+        gsc_cfg.mu = 0.05f;
+        gsc_cfg.enable_fix_mode = cases[i].enable_fix_mode;
+        gsc_cfg.fixed_doa_rad = 0.7f;
+        gsc_cfg.fixed_align_notebook = cases[i].fixed_align_notebook;
+        gsc_cfg.adapt_interval = cases[i].requested_adapt_interval;
+
+        expected = gsc_effective_adapt_interval(
+            cases[i].enable_fix_mode, cases[i].fixed_align_notebook,
+            cases[i].requested_adapt_interval);
+
+        g = gsc_create(4, 65, 72, srp_handle->a_array, &gsc_cfg);
+        CHECK(g != NULL, "effective-interval test: create GSC");
+        CHECK(g->adapt_interval == expected,
+              "gsc_create's actual cadence matches "
+              "gsc_effective_adapt_interval()");
+        gsc_destroy(g);
+    }
+
+    srp_destroy(srp_handle);
+    return 1;
+}
+
 /* GSC_WA_LEAK (queried via gsc_wa_leak_factor(), not duplicated as a
  * literal) must be a genuine forgetting factor in (0,1): a leaky
  * accumulator `wa = leak*wa + update` under constant forcing converges to
@@ -450,6 +513,8 @@ int main(void) {
           "GSC create lambda-bound test");
     CHECK(test_gsc_long_run_hermitian_and_finite(),
           "GSC long-run Hermitian/finite test");
+    CHECK(test_gsc_effective_adapt_interval_matches_created_cadence(),
+          "GSC effective-adapt-interval/created-cadence match test");
     CHECK(test_gsc_wa_leak_is_bounded(), "GSC wa-leak boundedness test");
     printf("All third-party spatial tests passed (backend=%s)\n",
            spatial_simd_backend());

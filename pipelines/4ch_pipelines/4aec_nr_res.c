@@ -100,7 +100,6 @@ struct FourAecNrRes {
     int fft_size;
     int hop_size;
     int n_freqs;
-    int rate_factor;
     int initialized_lanes;
 
     Aec* lanes[FOUR_AEC_NR_RES_CHANNELS];
@@ -125,9 +124,6 @@ struct FourAecNrRes {
     int delay_ring_size;
     uint64_t delay_samples_seen;
     int accepted_delay;
-    int delay_phase;
-    float* delay_capture;
-    float* delay_render;
     uint64_t delay_calls;
     FourAecNrResDelayState last_delay;
 
@@ -149,6 +145,7 @@ struct FourAecNrRes {
 
     uint32_t rng_state;
     int near_hang;
+    int near_hangover_frames;  /* PROD_NEAR_HANGOVER retimed to this grid's hop */
 
     uint64_t next_frame;
     uint64_t generation;
@@ -213,7 +210,13 @@ static int derive_dims_and_configs(
 
     selected_fft = cfg->fft_size;
     if (selected_fft == 0)
-        selected_fft = cfg->sample_rate == 16000 ? 512 : 1024;
+        /* 16 kHz rate default is 256/128 (8ms hop) as of 2026-08-02/03,
+         * matching both AEC's (python/modules/config.py, c_impl aec.c) and
+         * NR's (core/signal_grid.py, mmse_lsa_types.h) own per-library
+         * defaults -- this pipeline-level default was previously
+         * independent of both and had drifted to the old 512/256 (16ms)
+         * value. 512 remains a supported, explicit alternate (line below). */
+        selected_fft = cfg->sample_rate == 16000 ? 256 : 1024;
     if (cfg->sample_rate == 16000) {
         if (selected_fft != 256 && selected_fft != 512) return 0;
     } else if (selected_fft != 1024) {
@@ -247,12 +250,23 @@ static int derive_dims_and_configs(
 
     *nr_cfg = mmse_lsa_config_for_mode_grid(
         cfg->sample_rate, *fft_size, cfg->nr_mode);
+    /* 2026-08-03: was an implicit side effect of the C standalone default
+     * (mmse_lsa_default_config_for_grid) also happening to be 0.8f -- that
+     * default is now fixed to match Python's own config/v3_2_config.yaml
+     * (1.0f, disabled), so this pipeline must set 0.8f explicitly to keep its
+     * actual runtime behaviour unchanged. Mirrors audio_pipeline.c (mono) and
+     * the deliberate overlay aec_nr_pipeline.py:_build_denoiser documents. */
+    nr_cfg->broadband_threshold = 0.8f;
+    /* 2026-08-03 A/B decision (824-case VCTK+DEMAND + 90-case AEC blind
+     * manifest, see NR/CHANGELOG.md): take mmse_lsa_config_for_mode_grid()'s
+     * canonical alpha_d/alpha_attack as-is instead of overriding them back
+     * to the old L=150/alpha_d=0.95/alpha_attack=0.3-old-retime tuning --
+     * that legacy tuning measured worse on the AEC-residual/double-talk
+     * angle that matters for this pipeline. L and alpha_decay are untouched:
+     * they already coincide with Python's canonical composition (see
+     * audio_pipeline.c's mono twin for the full rationale). */
     nr_cfg->L = mmse_lsa_retime_frames(
         150, cfg->sample_rate, *hop_size);
-    nr_cfg->alpha_d = mmse_lsa_retime_alpha(
-        0.95f, cfg->sample_rate, *hop_size);
-    nr_cfg->alpha_attack = mmse_lsa_retime_alpha(
-        0.3f, cfg->sample_rate, *hop_size);
     nr_cfg->alpha_decay = nr_cfg->alpha_g;
     return 1;
 }
@@ -314,10 +328,6 @@ static int carve_working_buffers(FourAecNrRes* p,
         (float*)pool_carve(cursor, (size_t)hop, sizeof(float));
     p->render_i16 =
         (float*)pool_carve(cursor, (size_t)hop, sizeof(float));
-    p->delay_capture =
-        (float*)pool_carve(cursor, (size_t)hop, sizeof(float));
-    p->delay_render =
-        (float*)pool_carve(cursor, (size_t)hop, sizeof(float));
 
     p->fused_error =
         (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
@@ -357,7 +367,6 @@ static int carve_working_buffers(FourAecNrRes* p,
 
     return p->linear_interleaved && p->mic_lane && p->lane_out &&
            p->aligned_ref && p->render_i16 &&
-           p->delay_capture && p->delay_render &&
            p->fused_error && p->fused_near &&
            p->residual_work && p->output_spec &&
            p->fused_r2 && p->fused_comfort && p->post_near_power &&
@@ -416,7 +425,13 @@ static size_t pipeline_buffer_size(
         total,
         ck_mul_size((size_t)hop, FOUR_AEC_NR_RES_CHANNELS),
         sizeof(float));                                      /* linear */
-    for (i = 0; i < 6; ++i)
+    /* mic_lane, lane_out, aligned_ref, render_i16 -- 4 hop-sized buffers.
+     * (was 6: delay_capture/delay_render's naive external stride-pick
+     * decimation was removed -- delay_aec3_init() now takes cfg_copy.
+     * sample_rate directly and DelayAec3 anti-alias-filters + decimates
+     * internally, the same shared sidechain the mono AEC repo uses at
+     * 48kHz. Must stay in lockstep with carve_working_buffers() above.) */
+    for (i = 0; i < 4; ++i)
         total = ck_field_size(total, (size_t)hop, sizeof(float));
 
     for (i = 0; i < 4; ++i)
@@ -526,7 +541,7 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
     hash = fnv1a_str(
-        "|carve:self,aec0,aec1,aec2,aec3,nr,fft,linear,hop6,"
+        "|carve:self,aec0,aec1,aec2,aec3,nr,fft,linear,hop4,"
         "complex4,float7,fftfloat3,snapshot4x6,postsg,delayring",
         hash);
     hash = fnv1a_str("|align16", hash);
@@ -639,9 +654,16 @@ FourAecNrRes* four_aec_nr_res_init_ex(
     p->fft_size = fft;
     p->hop_size = hop;
     p->n_freqs = n;
-    p->rate_factor = cfg_copy.sample_rate / 16000;
     p->delay_ring_size = delay_ring_size;
     p->rng_state = PIPELINE_RNG_SEED;
+    /* PROD_NEAR_HANGOVER (8) is a 10-ms-hop frame count (80 ms); was applied
+     * as a raw literal regardless of grid (20-60% off at every one of this
+     * pipeline's 3 real grids). Retimed the same way derive_dims_and_configs
+     * already retimes the NR config's L/alpha_d/alpha_attack, and the same
+     * way the mono pipeline's audio_pipeline.c now retimes this identical
+     * constant. */
+    p->near_hangover_frames = mmse_lsa_retime_frames(
+        PROD_NEAR_HANGOVER, cfg_copy.sample_rate, hop);
     p->pool_size = (size_t)current.bytes;
     p->construction_epoch = g_four_aec_nr_res_next_epoch++;
 
@@ -652,7 +674,19 @@ FourAecNrRes* four_aec_nr_res_init_ex(
             p, &cursor, &aec_cfg, &nr_cfg) ||
         cursor.remaining != 0) return NULL;
 
-    delay_aec3_init(&p->shared_delay);
+    /* delay_aec3_init() takes the pipeline's REAL native sample_rate:
+     * DelayAec3 now owns the 48kHz->16kHz anti-alias sidechain internally
+     * (DaResample48 in delay_aec3.c/.h) -- the exact same shared
+     * implementation the standalone mono AEC repo uses for its own 48kHz
+     * DelayAec3 instance. update_shared_delay() below feeds it raw,
+     * un-decimated capture/render hops directly; the estimator anti-alias
+     * filters + decimates internally when constructed at 48000, and
+     * delay_aec3_estimated_delay() returns the result already rescaled
+     * back to this pipeline's native sample domain. This replaces the
+     * naive (no anti-alias) external stride-pick decimation this file used
+     * to do itself -- unifying mono and 4ch onto one resampler
+     * implementation instead of two, one of which aliased. */
+    delay_aec3_init(&p->shared_delay, cfg_copy.sample_rate);
     for (k = 0; k < fft; ++k) {
         p->synth_window[k] = sqrtf(
             0.5f * (1.0f - cosf(
@@ -742,42 +776,20 @@ static FourAecNrResDelayState update_shared_delay(
     const float* capture,
     const float* render) {
     FourAecNrResDelayState state;
-    const float* capture_16k = capture;
-    const float* render_16k = render;
-    int delay_hop = p->hop_size;
     int emitted;
-    int estimated_16k;
     int estimated;
     int eligible;
-    int i;
 
-    if (p->rate_factor > 1) {
-        int count = 0;
-        for (i = 0; i < p->hop_size; ++i) {
-            if (((i + p->delay_phase) % p->rate_factor) == 0) {
-                p->delay_capture[count] = capture[i];
-                p->delay_render[count] = render[i];
-                count += 1;
-            }
-        }
-        p->delay_phase =
-            (p->delay_phase + p->hop_size) % p->rate_factor;
-        capture_16k = p->delay_capture;
-        render_16k = p->delay_render;
-        delay_hop = count;
-    }
-
-    emitted = delay_hop > 0
-        ? delay_aec3_accumulate(
-              &p->shared_delay, capture_16k, render_16k, delay_hop)
-        : 0;
+    /* Raw, un-decimated hops: delay_aec3_init() constructed p->shared_delay
+     * at this pipeline's real native sample_rate, so DelayAec3 itself now
+     * anti-alias-filters + decimates internally at 48kHz (see delay_aec3.c's
+     * DaResample48) and delay_aec3_estimated_delay() below returns the
+     * result already rescaled back to this pipeline's native domain. */
+    emitted = delay_aec3_accumulate(&p->shared_delay, capture, render, p->hop_size);
     (void)emitted;
     p->delay_calls += 1;
 
-    estimated_16k = delay_aec3_estimated_delay(&p->shared_delay);
-    estimated = estimated_16k >= 0
-        ? estimated_16k * p->rate_factor
-        : -1;
+    estimated = delay_aec3_estimated_delay(&p->shared_delay);
     eligible = estimated >= 0 &&
                delay_aec3_is_solid(&p->shared_delay) &&
                delay_aec3_n_updates(&p->shared_delay) >= 3;
@@ -1107,7 +1119,7 @@ static int run_post_res_and_nr(
         for (k = 0; k < n; ++k) near_mean += p->error_power[k];
         near_mean /= (float)n;
         if (near_mean > PROD_NEAR_GATE_THRESH)
-            p->near_hang = PROD_NEAR_HANGOVER;
+            p->near_hang = p->near_hangover_frames;
         near_active = p->near_hang > 0;
         if (p->near_hang > 0) p->near_hang -= 1;
         nf_eff = (!far_active && near_active)
@@ -1297,7 +1309,6 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
 
     p->delay_samples_seen = 0;
     p->accepted_delay = 0;
-    p->delay_phase = 0;
     p->delay_calls = 0;
     memset(&p->last_delay, 0, sizeof(p->last_delay));
     p->rng_state = PIPELINE_RNG_SEED;

@@ -291,6 +291,7 @@ def test_packed_dataset_rejects_legacy_four_channel_shard(tmp_path):
         }],
         'linear_aec': contract.as_dict(),
         'linear_aec_contract_hash': contract.fingerprint(),
+        'manifest_version': MANIFEST_VERSION,
     }, path)
     with pytest.raises(ValueError, match='stem order'):
         PackedAecDataset(str(path), verbose=False)

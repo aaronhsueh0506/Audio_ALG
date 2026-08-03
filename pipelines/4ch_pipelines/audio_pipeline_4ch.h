@@ -138,6 +138,18 @@ int audio_pipeline_4ch_gsc_sample_rate(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_gsc_frame_size(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_gsc_hop_size(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_gsc_fft_size(const AudioPipeline4Ch* p);
+
+/*
+ * The adapt_interval GSC actually configured (post fixed-notebook-mode
+ * forcing) and the RLS forgetting factor (lambda) it was retimed for, given
+ * that same interval. Exposed read-only so tests can confirm the two were
+ * derived from one shared effective-interval value instead of silently
+ * diverging (see gsc.h's gsc_effective_adapt_interval()).
+ */
+int audio_pipeline_4ch_gsc_effective_adapt_interval(
+    const AudioPipeline4Ch* p);
+float audio_pipeline_4ch_gsc_lambda(const AudioPipeline4Ch* p);
+
 int audio_pipeline_4ch_matched_filter_count(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_linear_aec_count(const AudioPipeline4Ch* p);
 int audio_pipeline_4ch_nr_count(const AudioPipeline4Ch* p);

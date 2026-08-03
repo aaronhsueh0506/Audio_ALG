@@ -51,6 +51,11 @@ struct AudioPipeline4Ch {
 
     float noise_power;
     int vad_hangover;
+    int vad_hangover_frames;      /* live-computed, was raw cfg.auto_vad_hangover_frames */
+    float vad_speech_noise_keep;  /* live-computed, was raw literal 0.999f */
+    float vad_speech_new_weight;  /* live-computed, was raw literal 0.001f */
+    float vad_silence_noise_keep; /* live-computed, was raw literal 0.95f */
+    float vad_silence_new_weight; /* live-computed, was raw literal 0.05f */
     uint64_t frame_index;
 };
 
@@ -214,18 +219,65 @@ AudioPipeline4Ch* audio_pipeline_4ch_create(
     array_geometry_destroy(geometry);
     if (!p->srp || !p->gsc_steering) goto fail;
 
+    /* gsc_create() forces the RLS update cadence to 1 (every hop) whenever
+     * fixed-notebook mode is requested (gsc_fixed_mode && gsc_fixed_align_
+     * notebook), regardless of the caller's configured gsc_adapt_interval --
+     * see gsc.c's gsc_effective_adapt_interval(). Derive that SAME effective
+     * value here, once, and feed it into both the lambda retime scaling
+     * below and gsc_cfg.adapt_interval, so the cadence lambda is calibrated
+     * for and the cadence GSC actually runs at can never silently diverge
+     * (previously lambda was scaled by the raw pre-forced gsc_adapt_interval
+     * while gsc_create() silently forced the real cadence to 1). */
+    int gsc_effective_interval = gsc_effective_adapt_interval(
+        cfg->gsc_fixed_mode, cfg->gsc_fixed_align_notebook,
+        cfg->gsc_adapt_interval);
+
     memset(&gsc_cfg, 0, sizeof(gsc_cfg));
     gsc_cfg.enable = cfg->gsc_enable;
-    gsc_cfg.lambda = cfg->gsc_lambda;
+    /* gsc_lambda is an RLS forgetting/retention factor tuned at a 10-ms
+     * reference update (like NR's alpha_d/alpha_attack just above in the
+     * mono/4ch NR config derivation) -- was forwarded as a raw literal
+     * regardless of grid, so its real wall-clock forgetting time varied
+     * with hop_size/sample_rate. Retimed via the same helper NR already
+     * uses for this exact class of constant. mu is a step-size gain, not
+     * a decay time-constant, so it is left as-is.
+     *
+     * The RLS update itself only actually applies once every
+     * gsc_effective_interval hops (gsc.c gates the whole P/gain/weight-update
+     * block on frame_idx % adapt_interval == 0; default adapt_interval=1,
+     * i.e. every hop). Unlike AEC's ERLE 6-point cadence, the ORIGINAL
+     * "10ms reference" tuning assumed one update per hop (interval=1) --
+     * there is no matching batching on the authored side to cancel against
+     * -- so when the effective interval > 1 the real wall-clock update
+     * period is that many hops, and the retime call must scale hop_size by
+     * it (no-op at the shipped default of 1). */
+    gsc_cfg.lambda = mmse_lsa_retime_alpha(
+        cfg->gsc_lambda, cfg->core.sample_rate,
+        p->hop_size * gsc_effective_interval);
     gsc_cfg.mu = cfg->gsc_mu;
     gsc_cfg.enable_fix_mode = cfg->gsc_fixed_mode;
     gsc_cfg.fixed_doa_rad = cfg->gsc_fixed_doa_rad;
     gsc_cfg.fixed_align_notebook = cfg->gsc_fixed_align_notebook;
-    gsc_cfg.adapt_interval = cfg->gsc_adapt_interval;
+    gsc_cfg.adapt_interval = gsc_effective_interval;
     p->gsc = gsc_create(
         FOUR_AEC_NR_RES_CHANNELS, p->n_freqs, cfg->num_angles,
         p->gsc_steering, &gsc_cfg);
     if (!p->gsc) goto fail;
+
+    /* auto_vad_hangover_frames + the speech/silence noise-EMA pairs were
+     * raw literals (8 frames; 0.999/0.001; 0.95/0.05) applied regardless of
+     * grid -- same class of bug as gsc_lambda above, fixed the same way.
+     * The EMA pairs are retention/new-weight complements (old_weight +
+     * new_weight == 1 by construction); retime the retention factor and
+     * derive new_weight from it so that invariant still holds post-retime. */
+    p->vad_hangover_frames = mmse_lsa_retime_frames(
+        cfg->auto_vad_hangover_frames, cfg->core.sample_rate, p->hop_size);
+    p->vad_speech_noise_keep = mmse_lsa_retime_alpha(
+        0.999f, cfg->core.sample_rate, p->hop_size);
+    p->vad_speech_new_weight = 1.0f - p->vad_speech_noise_keep;
+    p->vad_silence_noise_keep = mmse_lsa_retime_alpha(
+        0.95f, cfg->core.sample_rate, p->hop_size);
+    p->vad_silence_new_weight = 1.0f - p->vad_silence_noise_keep;
 
     spectral_count =
         (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)p->n_freqs;
@@ -367,12 +419,12 @@ static int auto_vad(
     speech = power >= threshold &&
              power >= p->noise_power * p->cfg.auto_vad_snr_ratio;
     if (speech) {
-        p->vad_hangover = p->cfg.auto_vad_hangover_frames;
+        p->vad_hangover = p->vad_hangover_frames;
         p->noise_power =
-            0.999f * p->noise_power + 0.001f * power;
+            p->vad_speech_noise_keep * p->noise_power + p->vad_speech_new_weight * power;
     } else {
         p->noise_power =
-            0.95f * p->noise_power + 0.05f * power;
+            p->vad_silence_noise_keep * p->noise_power + p->vad_silence_new_weight * power;
         if (p->vad_hangover > 0) {
             p->vad_hangover -= 1;
             speech = 1;
@@ -478,6 +530,15 @@ int audio_pipeline_4ch_gsc_hop_size(const AudioPipeline4Ch* p) {
 
 int audio_pipeline_4ch_gsc_fft_size(const AudioPipeline4Ch* p) {
     return p ? p->fft_size : -1;
+}
+
+int audio_pipeline_4ch_gsc_effective_adapt_interval(
+    const AudioPipeline4Ch* p) {
+    return (p && p->gsc) ? p->gsc->adapt_interval : -1;
+}
+
+float audio_pipeline_4ch_gsc_lambda(const AudioPipeline4Ch* p) {
+    return (p && p->gsc) ? p->gsc->lambda : NAN;
 }
 
 int audio_pipeline_4ch_matched_filter_count(const AudioPipeline4Ch* p) {

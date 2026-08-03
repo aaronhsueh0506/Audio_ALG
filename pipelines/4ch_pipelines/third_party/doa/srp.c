@@ -287,10 +287,20 @@ void srp(SRP* s, Complex** X, const int* mask)
      * keeps the score accumulation order and steering math unchanged while
      * removing that redundant work; spatial_phat_cross() supplies the
      * AArch64 NEON hot path.
+     *
+     * Restricted to [f_start, f_end]: pair_phat[p] is one-frame scratch
+     * (srp.h) read ONLY within that same band by the scoring loop below
+     * (lines ~305-308) -- no other reader exists (grep-verified) -- so
+     * computing bins outside the searched band was pure waste. At 48kHz/
+     * 1024-pt (F=513) with a ~300-7000Hz search band this is ~144 bins
+     * instead of 513, roughly a 3.5x reduction in this per-frame,
+     * per-pair hot loop. Bins outside [f_start,f_end] are simply never
+     * touched (not zeroed) since nothing reads them.
      */
     for (int p = 0; p < s->num_pairs; ++p) {
         spatial_phat_cross(
-            X[s->pair_i[p]], X[s->pair_j[p]], s->pair_phat[p], F);
+            X[s->pair_i[p]] + s->f_start, X[s->pair_j[p]] + s->f_start,
+            s->pair_phat[p] + s->f_start, s->f_end - s->f_start + 1);
     }
 #endif
 

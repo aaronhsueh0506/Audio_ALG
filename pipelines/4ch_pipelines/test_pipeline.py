@@ -80,8 +80,12 @@ def test_shared_far_reference_survives_zero_sum_beamformer_weights():
 
 
 def test_default_grids_are_no_padding_power_of_two():
-    assert FourChannelAecConfig(sample_rate=16000).resolved_grid() == (512, 256)
+    assert FourChannelAecConfig(sample_rate=16000).resolved_grid() == (256, 128)
     assert FourChannelAecConfig(sample_rate=48000).resolved_grid() == (1024, 512)
+    assert FourChannelAecConfig(sample_rate=16000, frame_size=512).resolved_grid() == (
+        512,
+        256,
+    )
     with pytest.raises(ValueError, match="256, 512"):
         FourChannelAecConfig(sample_rate=16000, frame_size=320).resolved_grid()
     # frame_size=128 is a power of two but outside the C core's exact
@@ -94,8 +98,15 @@ def test_default_grids_are_no_padding_power_of_two():
         FourChannelAecConfig(sample_rate=48000, frame_size=512).resolved_grid()
 
 
-def test_48k_decimator_keeps_continuous_phase_across_512_sample_hops(monkeypatch):
+def test_48k_wrapper_feeds_inner_estimator_raw_native_rate_hops(monkeypatch):
+    """2026-08-03 fix: the wrapper no longer does its own external 48kHz
+    stride-pick decimation (which had no anti-alias filter and aliased).
+    The inner estimator is now constructed at the TRUE native sample_rate
+    and fed every raw sample; EchoPathDelayEstimator owns the anti-alias +
+    decimate-by-3 sidechain internally (mirrors delay_aec3.c's
+    DaResample48)."""
     estimator = SharedMatchedDelayEstimator(sample_rate=48000, hop_size=512)
+    assert estimator._estimator._sample_rate == 48000
     seen = []
 
     def record(near, far):
@@ -108,7 +119,9 @@ def test_48k_decimator_keeps_continuous_phase_across_512_sample_hops(monkeypatch
     estimator.accumulate(x0, x0)
     estimator.accumulate(x1, x1)
     joined = np.concatenate([pair[0] for pair in seen])
-    np.testing.assert_array_equal(joined, np.arange(0, 1024, 3, dtype=np.float32))
+    # No decimation at this wrapper layer any more: every raw 48kHz sample
+    # reaches the inner estimator unchanged.
+    np.testing.assert_array_equal(joined, np.arange(0, 1024, dtype=np.float32))
 
 
 def test_shape_and_nonfinite_rejection():

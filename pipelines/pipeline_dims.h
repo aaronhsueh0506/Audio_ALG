@@ -12,7 +12,10 @@ static inline int compute_frame_dims(int sr, int requested_fft,
                                      int* o_fft_sz, int* o_n_freqs) {
     int fft_sz = requested_fft;
     if (fft_sz == 0) {
-        fft_sz = (sr == 48000) ? 1024 : (sr == 16000) ? 512
+        /* 16 kHz rate default is 256/128 (8ms hop) as of 2026-08-02/03,
+         * matching AEC/NR/the 4-channel pipeline's own defaults; 512
+         * remains a supported, explicit alternate (line below). */
+        fft_sz = (sr == 48000) ? 1024 : (sr == 16000) ? 256
                : (sr == 8000) ? 256 : 0;
     }
 

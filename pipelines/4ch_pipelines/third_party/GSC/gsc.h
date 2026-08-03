@@ -74,6 +74,23 @@ typedef struct {
 
 } GSC;
 
+/*
+ * Single source of truth for the adapt_interval GSC will actually run at,
+ * once fixed-notebook-mode forcing is taken into account.
+ *
+ * gsc_create() forces the RLS update cadence to 1 (every hop) whenever
+ * enable_fix_mode && fixed_align_notebook, regardless of the caller's
+ * requested adapt_interval (kept for baseline-matching against the
+ * reference notebook). Any quantity that is derived from "how often GSC
+ * actually adapts" -- e.g. a caller retiming lambda/mu for a slower
+ * wall-clock update period -- MUST call this same function with the same
+ * inputs instead of re-deriving the forcing rule, so the effective cadence
+ * used for that derivation and the cadence gsc_create() actually configures
+ * can never silently diverge.
+ */
+int gsc_effective_adapt_interval(
+    int enable_fix_mode, int fixed_align_notebook, int adapt_interval);
+
 /* create */
 GSC* gsc_create(int M, int F, int num_angles,
                 Complex*** a_array,

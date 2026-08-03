@@ -246,8 +246,8 @@ DOA and GSC now follow the same selected no-padding grid as AEC/NR/RES:
 
 | sample rate | frame | FFT | hop | bins | selection |
 |---:|---:|---:|---:|---:|---|
-| 16 kHz | 256 | 256 | 128 | 129 | `cfg.core.fft_size = 256` |
-| 16 kHz | 512 | 512 | 256 | 257 | default |
+| 16 kHz | 256 | 256 | 128 | 129 | default |
+| 16 kHz | 512 | 512 | 256 | 257 | `cfg.core.fft_size = 512` |
 | 48 kHz | 1024 | 1024 | 512 | 513 | default/only main grid |
 
 Frame and hop are derived from the selected FFT rather than independently

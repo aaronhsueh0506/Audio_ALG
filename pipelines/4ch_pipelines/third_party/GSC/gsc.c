@@ -47,6 +47,21 @@
  */
 #define GSC_WA_LEAK 0.99999f
 
+/* ===================== adapt-interval derivation ===================== */
+
+int gsc_effective_adapt_interval(
+    int enable_fix_mode, int fixed_align_notebook, int adapt_interval)
+{
+    int effective = adapt_interval > 0 ? adapt_interval : 1;
+
+    /* For fixed notebook-alignment experiments, keep the original
+     * frame-by-frame adaptive update behavior for easier baseline matching. */
+    if (enable_fix_mode && fixed_align_notebook) {
+        effective = 1;
+    }
+    return effective;
+}
+
 /* ===================== create ===================== */
 
 GSC* gsc_create(int M, int F, int num_angles,
@@ -74,16 +89,8 @@ GSC* gsc_create(int M, int F, int num_angles,
     g->fixed_doa_rad = cfg->fixed_doa_rad;
     g->fixed_align_notebook = cfg->fixed_align_notebook;
 
-    g->adapt_interval = cfg->adapt_interval;
-    if (g->adapt_interval <= 0) {
-        g->adapt_interval = 1;
-    }
-
-    /* For fixed notebook-alignment experiments, keep the original
-     * frame-by-frame adaptive update behavior for easier baseline matching. */
-    if (g->enable_fix_mode && g->fixed_align_notebook) {
-        g->adapt_interval = 1;
-    }
+    g->adapt_interval = gsc_effective_adapt_interval(
+        g->enable_fix_mode, g->fixed_align_notebook, cfg->adapt_interval);
 
     // allocate P (F,M,M)
     g->P = (Complex***)calloc(F, sizeof(Complex**));

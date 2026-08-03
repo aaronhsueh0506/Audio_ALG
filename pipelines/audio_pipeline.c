@@ -162,6 +162,7 @@ struct AudioPipeline {
     /* per-instance comfort-noise RNG + near-end-floor hangover counter */
     uint32_t rng_state;
     int      near_hang;
+    int      near_hangover_frames;  /* PROD_NEAR_HANGOVER retimed to this grid's hop */
 
     /* pool bookkeeping */
     void*  pool;          /* sub-pool AFTER this struct: AEC+FFT+NR+scratch */
@@ -233,16 +234,32 @@ static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
 
     *nr_cfg = mmse_lsa_config_for_mode_grid(
         cfg->sample_rate, *fft_sz, cfg->nr_mode);
-    /* Match the Python pipeline _build_denoiser STRUCTURAL tuning (identical
-     * to both CLIs' prior inline copies): L=150, alpha_d=0.95, alpha_attack/
-     * alpha_decay pinned off the C-only per-mode values. See
-     * aec_nr_pipeline.py:_build_denoiser. */
+    /* 2026-08-03 A/B decision (824-case VCTK+DEMAND + 90-case AEC blind
+     * manifest, see NR/CHANGELOG.md and AEC-side eval_manifest90 runs):
+     * this pipeline now takes mmse_lsa_config_for_mode_grid()'s canonical
+     * alpha_d/alpha_attack AS-IS instead of overriding them back to the old
+     * hardcoded L=150/alpha_d=0.95/alpha_attack=0.3-old-retime tuning --
+     * that legacy tuning measured worse on the AEC-residual/double-talk
+     * angle that actually matters for this pipeline (ERLE-proxy/SDR-proxy/
+     * near-end preservation all favoured canonical across every bucket of
+     * the 90-case manifest, movement/NE buckets n=25-30). L and alpha_decay
+     * are NOT touched here because they already coincide with the Python
+     * pipeline's canonical composition (aec_nr_pipeline.py:_build_denoiser):
+     * mmse_lsa_retime_frames(150,...) here and Python's pipeline-specific
+     * L=94 overlay are two different literals designed to retime to the
+     * SAME frame count at every grid (see _build_denoiser's docstring), and
+     * alpha_decay=alpha_g already matches Python's canonical (unoverlaid)
+     * value. Only alpha_d/alpha_attack were genuinely diverging. */
+    nr_cfg->broadband_threshold = 0.8f;
+    /* 2026-08-03: was an implicit side effect of the C standalone default
+     * (mmse_lsa_default_config_for_grid) also happening to be 0.8f -- that
+     * default is now fixed to match Python's own config/v3_2_config.yaml
+     * (1.0f, disabled), so this pipeline must set 0.8f explicitly to keep its
+     * actual runtime behaviour unchanged. Mirrors the deliberate overlay
+     * aec_nr_pipeline.py:_build_denoiser documents: faster post-echo-burst
+     * adaptation on AEC-residual signals. */
     nr_cfg->L = mmse_lsa_retime_frames(
         150, cfg->sample_rate, *hop);
-    nr_cfg->alpha_d = mmse_lsa_retime_alpha(
-        0.95f, cfg->sample_rate, *hop);
-    nr_cfg->alpha_attack = mmse_lsa_retime_alpha(
-        0.3f, cfg->sample_rate, *hop);
     nr_cfg->alpha_decay  = nr_cfg->alpha_g;
     return 0;
 }
@@ -581,6 +598,14 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
     p->hop = hop; p->frame_sz = frame_sz; p->fft_sz = fft_sz; p->n_freqs = n_freqs;
     p->rng_state  = AUDIO_PIPELINE_RNG_SEED;
     p->near_hang  = 0;
+    /* PROD_NEAR_HANGOVER (8) is a 10-ms-hop frame count (80 ms); was applied
+     * as a raw literal regardless of grid (20-60% off at every one of this
+     * pipeline's 3 real grids). Retimed the same way derive_dims_and_configs
+     * already retimes nr_cfg->L/alpha_d/alpha_attack just above, and the
+     * same way the Python reference (aec_nr_pipeline.py) already retimes
+     * this exact constant via retime_frame_count(). */
+    p->near_hangover_frames = mmse_lsa_retime_frames(
+        PROD_NEAR_HANGOVER, cfg->sample_rate, hop);
     p->pool       = sub_pool;
     p->pool_size  = sub_bytes;
     p->owned_heap = NULL;
@@ -694,7 +719,7 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
             ne += p->e2[k];
         }
         ne /= (float)n_freqs;
-        if (ne > PROD_NEAR_GATE_THRESH) p->near_hang = PROD_NEAR_HANGOVER;
+        if (ne > PROD_NEAR_GATE_THRESH) p->near_hang = p->near_hangover_frames;
         int near_active = p->near_hang > 0;
         if (p->near_hang > 0) p->near_hang--;
         int protect = (!far_active) && near_active;

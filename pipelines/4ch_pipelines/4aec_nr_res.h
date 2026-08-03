@@ -68,8 +68,14 @@ extern "C" {
 
 #define FOUR_AEC_NR_RES_DESCRIPTOR_VERSION 1u
 /* v2 removes unused fused echo/far buffers and adds one residual scratch
- * vector for the SIMD post-beam projection. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 2u
+ * vector for the SIMD post-beam projection.
+ * v3 (2026-08-03) removes the delay_capture/delay_render hop-sized scratch
+ * pair: the shared delay matcher's 48kHz anti-alias + decimation moved
+ * inside DelayAec3 itself (delay_aec3_init() now takes the real native
+ * sample_rate), so this wrapper no longer needs its own external
+ * stride-pick buffers. carve_working_buffers() now carves 4 hop-sized
+ * buffers instead of 6. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 3u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 

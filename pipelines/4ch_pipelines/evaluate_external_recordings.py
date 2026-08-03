@@ -89,7 +89,10 @@ def evaluate_case(
         timeline_lag,
         near_corr,
     ) = _load_case(case_dir)
-    selected_fft = fft_size or (512 if sample_rate == 16000 else 1024)
+    # 16 kHz rate default is 256/128 (8ms hop) as of 2026-08-02/03 (AEC's
+    # python/modules/config.py and NR's core/signal_grid.py both default
+    # here now); 512/256 remains a supported, explicit alternate grid.
+    selected_fft = fft_size or (256 if sample_rate == 16000 else 1024)
     if (
         sample_rate == 16000
         and selected_fft not in (256, 512)

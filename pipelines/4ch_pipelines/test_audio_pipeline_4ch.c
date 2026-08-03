@@ -122,6 +122,94 @@ static int run_grid(int sample_rate, int fft_size) {
     return 1;
 }
 
+/* Regression test (Codex review): in fixed-notebook mode
+ * (gsc_fixed_mode && gsc_fixed_align_notebook), gsc_create() forces the
+ * actual GSC RLS update cadence to 1 hop regardless of the configured
+ * gsc_adapt_interval -- kept for baseline-matching against the reference
+ * notebook. The lambda retime scaling computed in
+ * audio_pipeline_4ch_create() MUST use that same forced cadence, not the
+ * raw pre-forced gsc_adapt_interval, or lambda ends up calibrated for a
+ * slower wall-clock update period than what is actually running (too
+ * aggressive/timid RLS forgetting relative to the intended design). */
+static int test_gsc_fixed_notebook_lambda_matches_forced_cadence(void) {
+    AudioPipeline4ChConfig cfg =
+        audio_pipeline_4ch_default_config(16000);
+    AudioPipeline4Ch* p;
+    int hop_size;
+    int actual_interval;
+    float actual_lambda;
+    float expected_lambda;
+    float buggy_lambda;
+
+    cfg.gsc_fixed_mode = 1;
+    cfg.gsc_fixed_align_notebook = 1;
+    cfg.gsc_adapt_interval = 4; /* caller asks for a slower cadence... */
+    cfg.gsc_lambda = 0.98f;
+
+    p = audio_pipeline_4ch_create(&cfg);
+    CHECK(p != NULL, "fixed-notebook cadence test: create pipeline");
+
+    hop_size = audio_pipeline_4ch_gsc_hop_size(p);
+    actual_interval = audio_pipeline_4ch_gsc_effective_adapt_interval(p);
+    actual_lambda = audio_pipeline_4ch_gsc_lambda(p);
+
+    /* ...but fixed_align_notebook forces the real GSC cadence to every hop
+     * (1), regardless of the requested 4. */
+    CHECK(actual_interval == 1,
+          "fixed-notebook mode forces the actual GSC cadence to 1");
+
+    /* Lambda must be retimed assuming that SAME forced interval (1), i.e.
+     * exactly mmse_lsa_retime_alpha(gsc_lambda, sr, hop_size*1) -- not
+     * hop_size*4, which is what the pre-fix code effectively assumed by
+     * scaling with the raw pre-forced gsc_adapt_interval. */
+    expected_lambda = mmse_lsa_retime_alpha(
+        cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 1);
+    CHECK(fabsf(actual_lambda - expected_lambda) < 1e-9f,
+          "lambda retime uses the forced (not the requested) adapt_interval");
+
+    /* Sanity check that this test would actually have caught the original
+     * bug: the mis-scaled lambda (computed against the pre-forced interval
+     * of 4) must visibly differ from the correct one. */
+    buggy_lambda = mmse_lsa_retime_alpha(
+        cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 4);
+    CHECK(fabsf(actual_lambda - buggy_lambda) > 1e-4f,
+          "forced-cadence lambda differs from the old mis-scaled lambda");
+
+    audio_pipeline_4ch_destroy(p);
+    return 1;
+}
+
+/* Companion check: outside fixed-notebook mode, a configured
+ * gsc_adapt_interval > 1 is NOT forced down, so the effective interval used
+ * for both the actual GSC cadence and the lambda retime must equal the
+ * requested value itself (guards the other branch of
+ * gsc_effective_adapt_interval() from regressing). */
+static int test_gsc_auto_mode_respects_configured_interval(void) {
+    AudioPipeline4ChConfig cfg =
+        audio_pipeline_4ch_default_config(16000);
+    AudioPipeline4Ch* p;
+    int hop_size;
+    float expected_lambda;
+
+    cfg.gsc_adapt_interval = 4;
+    cfg.gsc_lambda = 0.98f;
+
+    p = audio_pipeline_4ch_create(&cfg);
+    CHECK(p != NULL, "auto-mode cadence test: create pipeline");
+
+    hop_size = audio_pipeline_4ch_gsc_hop_size(p);
+    CHECK(audio_pipeline_4ch_gsc_effective_adapt_interval(p) == 4,
+          "auto mode keeps the requested adapt_interval unforced");
+
+    expected_lambda = mmse_lsa_retime_alpha(
+        cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 4);
+    CHECK(fabsf(audio_pipeline_4ch_gsc_lambda(p) - expected_lambda) < 1e-9f,
+          "lambda retime uses the requested adapt_interval in auto mode");
+
+    audio_pipeline_4ch_destroy(p);
+    return 1;
+}
+
 /* CHECK() early-returns 0 from whichever function it is lexically inside.
  * All top-level assertions therefore run inside this helper (not directly in
  * main()) so a failure returns 0 here -- a value main() explicitly turns
@@ -155,6 +243,10 @@ static int run_all_tests(void) {
           "16 kHz 512/256 complete spatial pipeline");
     CHECK(run_grid(48000, 1024),
           "48 kHz 1024/512 complete spatial pipeline");
+    CHECK(test_gsc_fixed_notebook_lambda_matches_forced_cadence(),
+          "GSC fixed-notebook lambda/forced-cadence match test");
+    CHECK(test_gsc_auto_mode_respects_configured_interval(),
+          "GSC auto-mode configured-interval test");
     printf("All audio_pipeline_4ch tests passed (spatial=%s)\n",
            audio_pipeline_4ch_spatial_backend());
     return 1;

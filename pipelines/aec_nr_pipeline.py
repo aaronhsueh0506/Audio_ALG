@@ -34,6 +34,8 @@ from lib.aec.python.aec import (
 )
 from lib.nr.denoisers import MmseLsaDenoiser
 from lib.nr.core.signal_grid import retime_frame_count
+from lib.nr.core.nr_strength import apply_strength
+from lib.nr.process_audio import build_v3_2_base_params, load_config
 
 # The standalone ResFilter was retired in AEC v3.21; the separated
 # `--pipeline-mode linear` (AEC-linear -> NR -> RES) is now rebuilt on the
@@ -92,18 +94,23 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
     return output, contexts
 
 
-# NR strength presets — mirror the C config_for_mode strength quartet
-# (lib/nr/c_impl/include/mmse_lsa_types.h). MmseLsaDenoiser takes the
-# {g_min, q, xi_min, alpha_g} strength set; the pipeline's structural tuning
-# (L=150, alpha_s, frame/hop, MCRA — see _build_denoiser) is preserved either
-# way. The C-only alpha_d / alpha_attack / alpha_decay are not part of Python's
-# NR param structure. BALANCED == the legacy fixed values, so a balanced
-# pipeline run is byte-equal to the pre-preset code.
-NR_PRESETS = {
-    'mild':       dict(g_min_db=-10.0, q=0.60, xi_min_db=-15.0, alpha_g=0.92),
-    'balanced':   dict(g_min_db=-15.0, q=0.50, xi_min_db=-20.0, alpha_g=0.88),
-    'aggressive': dict(g_min_db=-20.0, q=0.35, xi_min_db=-25.0, alpha_g=0.75),
-}
+# 2026-08-03: the standalone hand-rolled NR_PRESETS dict (mild/balanced/aggressive
+# {g_min,q,xi_min,alpha_g}) that used to live here was removed. It duplicated and
+# diverged from NR's own single source of truth (NR/config/v3_2_config.yaml +
+# NR/core/nr_strength.py's apply_strength(), the same composition
+# NR/process_audio.py's create_denoiser_from_config() uses) -- most visibly,
+# 'balanced'.g_min_db was -15.0 here vs the real NR balanced's -30.0
+# (lib/nr/c_impl/include/mmse_lsa_types.h / lib/nr/config/v3_2_config.yaml), an
+# amplitude-dB(/20) floor mismatch, not just a naming coincidence. It also never
+# wired `strength=` into MmseLsaDenoiser, so mild/aggressive never touched the
+# real temporal-smoothing knobs (alpha_noise/alpha_g/alpha_attack/alpha_decay) --
+# only g_min_db (via this dict) changed. See _build_denoiser() for the fix.
+_NR_YAML_CONFIG = os.path.join(_ROOT, 'lib', 'nr', 'config', 'v3_2_config.yaml')
+
+# MCRA minima-tracking window (MmseLsaDenoiser's `L`): this pipeline's own ~1.5s
+# wall-clock design, independent of NR's own L=32 (512ms, tuned for standalone
+# noise) -- see _build_denoiser()'s docstring for the full derivation of 94.
+_NR_L_MINIMA_WINDOW = 94
 
 # Production recipe (2026-06-23 AEC+NR re-review). On top of A_min_pl's
 # min(G_nr, G_res), two changes — validated 800-case (echo FS +0.12~0.15,
@@ -125,7 +132,10 @@ PROD_NEAR_HANGOVER = 8
 def _project_grid(sample_rate: int, fft_size: int = None) -> Tuple[int, int, int]:
     """Resolve an integrated-pipeline no-padding ``(frame, hop, fft)`` grid."""
     allowed = {16000: (256, 512), 48000: (1024,)}
-    defaults = {16000: 512, 48000: 1024}
+    # 16 kHz default is 256/128 (8ms hop) as of 2026-08-02/03, matching
+    # AEC/NR/the 4-channel pipeline's own defaults; 512 remains a
+    # supported, explicit alternate.
+    defaults = {16000: 256, 48000: 1024}
     if sample_rate not in allowed:
         raise ValueError(f"supported sample rates are 16000 and 48000, got {sample_rate}")
     chosen = defaults[sample_rate] if fft_size is None else int(fft_size)
@@ -144,28 +154,81 @@ def _build_denoiser(sample_rate: int,
                     fft_size: int = None) -> MmseLsaDenoiser:
     """MMSE-LSA denoiser on a power-of-two, no-padding 50%-overlap grid.
 
-    ``nr_preset`` (mild/balanced/aggressive) selects the strength quartet
-    {g_min, q, xi_min, alpha_g} from NR_PRESETS. The pipeline structural tuning
-    below is preset-independent.
+    Routed through NR's own single source of truth: NR/config/v3_2_config.yaml's
+    base params (via NR/process_audio.py's build_v3_2_base_params(), the same
+    helper create_denoiser_from_config() uses) with NR/core/nr_strength.py's
+    apply_strength(nr_preset) overlaid -- i.e. exactly the base-YAML -> strength
+    composition create_denoiser_from_config() does, minus the mode overlay (this
+    pipeline has no content-mode selection, so `mode='full'`, itself an empty
+    overlay). ``strength`` is also recorded on the params dict so the
+    MmseLsaDenoiser constructor can correctly disambiguate the pre-/post-16ms-grid
+    provenance of alpha_noise/alpha_g/alpha_attack/alpha_decay when retiming them
+    (see v3_2_mmse_lsa.py's __init__ docstring) -- omitting it would silently
+    retime mild/aggressive's post-16ms-grid overlay values as if they were
+    pre-16ms-grid, corrupting them at any non-16ms-hop grid.
 
-    INTENTIONAL divergence from SE/NR/config/v3_2_config.yaml (tuned for
-    frame=512/hop=256 at 16 ms/hop):
-      - alpha_d not passed → falls back to alpha_noise=0.95 (yaml=0.7).
-        Slower noise-floor tracking is retained from the production recipe;
-        the denoiser retimes this EMA to the selected hop duration.
-      - broadband_threshold not passed → default 0.8 (yaml=1.0, disabled).
-        The broadband scene-reset path is active here; on AEC residual
-        signals this provides faster adaptation after echo bursts.
-      - L=150 is the legacy 10-ms-hop reference value (1.5 s). The denoiser
-        retimes it to the selected hop, preserving that wall-clock duration.
-        The longer window improves
-        stationarity estimation against the AEC-residual echo pedestal.
-    The A_min_pl pipeline was benchmarked and shipped with these values.
-    DO NOT silently sync to the NR yaml without re-running 800-case bench.
+    2026-08-03 fix: this replaces a standalone, hand-rolled NR_PRESETS dict that
+    only touched {g_min, q, xi_min, alpha_g} (so mild/aggressive never affected
+    alpha_noise/alpha_attack/alpha_decay -- a real functional gap, not just a
+    naming coincidence) and whose 'balanced' used g_min_db=-15.0 against the real
+    NR balanced's -30.0 (both are the amplitude-dB/20 convention -- an actual
+    2x-in-dB floor mismatch, confirmed against both
+    lib/nr/c_impl/include/mmse_lsa_types.h and lib/nr/config/v3_2_config.yaml,
+    which already agree with each other). Fixing that wiring gap also surfaces
+    two more stale hardcoded values this file was carrying that have no
+    AEC-specific rationale anywhere in its history (unlike broadband_threshold/L
+    below, which do): alpha_xi 0.88->0.92 (this pipeline predates and never
+    picked up the 2026-07-10 musical-noise fix, shared across ALL strength
+    presets in the real system -- this also closes the project's own
+    long-flagged "AEC-YAML alpha_xi coupling untested" open question) and
+    alpha_noise/alpha_d 0.95->0.7 for the `balanced` preset specifically (0.95
+    was only ever the side effect of never passing alpha_d at all, never a
+    validated choice -- mild/aggressive already need real alpha_noise deltas per
+    the fix above, so there is no consistent way to keep 'balanced' pinned at
+    0.95 without that pin also silently damping mild/aggressive's own tuning).
+    This is a real, intended change to the pipeline's default numerical output --
+    per this project's convention for NR numerical changes, treat this as
+    needing a fresh 800-case bench pass before shipping.
+
+    Two -- and only two -- genuinely pipeline-specific structural overlays
+    remain on top of the canonical params, applied after apply_strength() so
+    they win regardless of preset (neither is part of NR's own strength/mode
+    axes, so there is nothing in the standalone system for them to diverge
+    from):
+      - broadband_threshold=0.8 (yaml=1.0, disabled): the broadband scene-reset
+        path is active here; on AEC residual signals this gives faster
+        adaptation after echo bursts.
+      - L=94 (see _NR_L_MINIMA_WINDOW): the MCRA minima-tracking window,
+        investigated 2026-08-03. This pipeline's own L was authored as
+        "150 x 10ms = 1.5s" (commit de16bce, back when NR ran a literal 10ms
+        hop with no retiming abstraction at all -- an independent AEC-residual
+        stationarity design, unrelated to NR's own L=32/512ms tuning). NR's own
+        L retiming call (lib/nr/denoisers/v3_2_mmse_lsa.py) was just changed
+        (NR CHANGELOG [4.5.0]) from a generic 10ms-authored assumption to an
+        UNCONDITIONAL 16ms-authored one, because NR's own L=32 is genuinely
+        16ms-authored and the shared retime call has no way to tell this
+        pipeline's L apart from NR's. Left as the literal 150, this pipeline's
+        window would have silently grown from 1.5s to 2.4s (150 x 16ms instead
+        of 150 x 10ms) the moment lib/nr picked up that fix -- with no code
+        change or comment update on this side to explain why. 94 (x16ms =
+        1.504s) is the 16ms-authored count that reproduces the *exact* retimed
+        frame counts (188 / 94 / 141 at the 16k-8ms-hop, 16k-16ms-hop, and
+        48k-10.67ms-hop grids respectively) the old literal 150 gave under the
+        pre-fix 10ms-authored retiming -- i.e. this is a compensating fix that
+        restores the original 1.5s behavior, not a new tuning choice.
+        Caveat found in the same investigation, NOT acted on here (out of
+        scope, flagged for follow-up): per NR CHANGELOG [4.5.0]'s own 824-case
+        measurement, L only affects noise_psd when
+        `mcra_accept_external_spp=False`; this pipeline never sets that flag
+        (stays at the MmseLsaDenoiser default `True`), so today L's value --
+        1.5s, 2.4s, or NR's own 512ms -- has NO effect on this pipeline's
+        output either way. The "longer window improves stationarity
+        estimation" rationale in the original commit only holds if/when
+        `mcra_accept_external_spp=False` is also wired in.
     """
-    # When fft_size is explicitly selected (notably 256 at 16 kHz), infer the
+    # When fft_size is explicitly selected (notably 512 at 16 kHz), infer the
     # matching frame/hop defaults from that grid instead of first resolving the
-    # sample-rate default (512 at 16 kHz).
+    # sample-rate default (256 at 16 kHz).
     default_frame, default_hop, default_fft = _project_grid(sample_rate, fft_size)
     frame_size = default_frame if frame_size is None else int(frame_size)
     frame_shift = default_hop if frame_shift is None else int(frame_shift)
@@ -183,26 +246,27 @@ def _build_denoiser(sample_rate: int,
         raise ValueError("fft_size must be a positive power of two")
     # Enforce the project whitelist as well as the generic DSP invariants.
     _project_grid(sample_rate, fft_size)
-    p = NR_PRESETS[nr_preset]
-    return MmseLsaDenoiser(
-        sample_rate=sample_rate,
-        frame_size=frame_size,
-        frame_shift=frame_shift,
-        fft_size=fft_size,
-        noise_method='mcra',
-        g_min_db=p['g_min_db'],
-        alpha_g=p['alpha_g'],
-        alpha_xi=0.88,
-        q=p['q'],
-        xi_min_db=p['xi_min_db'],
-        alpha_s=0.95,
-        L=150,                   # legacy 10-ms reference; retimed to 1.5 s
-        delta_db=10.0,
-        num_init_frames=20,
-        scene_change_threshold_db=10.0,
-        scene_change_min_frames=5,
-        scene_change_blend=0.5,
-    )
+
+    config = load_config(_NR_YAML_CONFIG)
+    if not config:
+        raise RuntimeError(
+            f"failed to load NR config at {_NR_YAML_CONFIG!r} (missing file, or "
+            "PyYAML not installed) -- refusing to silently fall back to "
+            "build_v3_2_base_params()'s own built-in defaults, which do NOT "
+            "match this project's tuned v3_2_config.yaml (e.g. g_min_db "
+            "-40.0 vs the real -30.0) and would reintroduce exactly the kind "
+            "of silent divergent-duplicate bug this function was fixed to avoid"
+        )
+    params = build_v3_2_base_params(config, sample_rate, frame_size, frame_shift, fft_size)
+    params = apply_strength(params, nr_preset)
+    params['strength'] = nr_preset  # retiming-provenance disambiguator; see docstring
+    params['mode'] = 'full'         # no content-mode selection in this pipeline (empty overlay)
+
+    # The only two genuinely pipeline-specific overlays -- see docstring.
+    params['broadband_threshold'] = 0.8
+    params['L'] = _NR_L_MINIMA_WINDOW
+
+    return MmseLsaDenoiser(**params)
 
 
 def run_nr(signal: np.ndarray, sample_rate: int,
@@ -449,8 +513,8 @@ Switches:
     parser.add_argument('--output', required=True, help='Output WAV')
     parser.add_argument(
         '--fft-size', type=int, choices=[256, 512, 1024], default=None,
-        help=('No-padding FFT/frame size. Defaults: 512 at 16 kHz and 1024 at '
-              '48 kHz; 16 kHz also supports 256. Hop is always FFT/2.'))
+        help=('No-padding FFT/frame size. Defaults: 256 at 16 kHz and 1024 at '
+              '48 kHz; 16 kHz also supports 512. Hop is always FFT/2.'))
     parser.add_argument('--aec-preset', default='balanced',
                         choices=['mild', 'balanced', 'aggressive'],
                         help='AEC preset (default: balanced)')
