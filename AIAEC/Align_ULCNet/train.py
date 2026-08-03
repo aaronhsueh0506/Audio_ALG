@@ -69,6 +69,7 @@ from AIAEC.training_common import (
     require_checkpoint_contract,
     scan_non_finite,
     set_seed,
+    training_progress,
 )
 
 
@@ -91,12 +92,16 @@ def forward_batch(model, stems_batch, aec_grid, device):
 
 def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
              epoch=0, global_step=0, output_dir=None, sr=None,
-             grad_clip=1.0, checkpoint_for_halt=None, grad_log=None):
+             grad_clip=1.0, checkpoint_for_halt=None, grad_log=None,
+             max_epochs=None):
     training = optimizer is not None
     model.train(training)
     total_loss, n_batches = 0.0, 0
 
-    for batch_idx, (stems_batch, _meta) in enumerate(loader):
+    batches = training_progress(
+        loader, training=training, epoch=epoch, max_epochs=max_epochs
+    )
+    for batch_idx, (stems_batch, _meta) in enumerate(batches):
         with torch.set_grad_enabled(training):
             output, spectral = forward_batch(
                 model, stems_batch, aec_grid, device
@@ -145,6 +150,11 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
 
         total_loss += loss_value
         n_batches += 1
+        if training:
+            batches.set_postfix(
+                loss=f"{loss_value:.4f}", gnorm=f"{total_norm:.2e}",
+                refresh=False,
+            )
 
     return total_loss / max(1, n_batches), global_step
 
@@ -217,6 +227,7 @@ def main(args):
             epoch=epoch, global_step=global_step, output_dir=output_dir,
             sr=aec_grid.sr, grad_clip=grad_clip,
             checkpoint_for_halt=checkpoint_for_halt, grad_log=grad_log,
+            max_epochs=max_epochs,
         )
         msg = f"epoch {epoch}: train_loss={train_loss:.4f} ({time.time()-started:.0f}s)"
 

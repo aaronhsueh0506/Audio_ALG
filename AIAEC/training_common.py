@@ -50,6 +50,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
+import tqdm
 from torch import Tensor
 from torch.utils.data import DataLoader
 
@@ -93,6 +94,7 @@ __all__ = [
     'set_seed',
     'build_arg_parser',
     'auto_device',
+    'training_progress',
     'read_grids',
     'split_dataset_by_sample',
     'build_plain_loaders',
@@ -159,6 +161,23 @@ def auto_device(requested: Optional[str], gpu: Optional[int] = None) -> str:
     if torch.backends.mps.is_available():
         return 'mps'
     return 'cpu'
+
+
+def training_progress(loader, *, training: bool, epoch: int,
+                      max_epochs: Optional[int] = None):
+    """Return AINR-style tqdm progress for training and a plain val loader.
+
+    AINR shows one ``Epoch current/total`` bar for the training loader and
+    leaves validation quiet. Keeping that policy here avoids six subtly
+    different progress implementations while preserving normal DataLoader
+    behaviour for evaluation.
+    """
+    if not training:
+        return loader
+    current = int(epoch) + 1  # AIAEC checkpoints/loops store zero-based epochs.
+    desc = (f"Epoch {current}/{int(max_epochs)}"
+            if max_epochs is not None else f"Epoch {current}")
+    return tqdm.tqdm(loader, desc=desc)
 
 
 # ============================================================

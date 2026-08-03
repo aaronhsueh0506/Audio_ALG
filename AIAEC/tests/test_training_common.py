@@ -60,6 +60,54 @@ def test_gpu_arg_takes_precedence_over_device():
         auto_device(None, -1)
 
 
+def test_training_progress_matches_ainr_epoch_style(monkeypatch):
+    calls = []
+
+    class FakeBar:
+        def __init__(self, loader, desc):
+            self.loader = loader
+            self.desc = desc
+
+        def __iter__(self):
+            return iter(self.loader)
+
+        def set_postfix(self, **kwargs):
+            calls.append(kwargs)
+
+    monkeypatch.setattr(
+        training_common.tqdm, 'tqdm',
+        lambda loader, desc: FakeBar(loader, desc),
+    )
+    loader = [1, 2]
+    bar = training_common.training_progress(
+        loader, training=True, epoch=2, max_epochs=10,
+    )
+    assert bar.desc == 'Epoch 3/10'
+    assert list(bar) == loader
+    bar.set_postfix(loss='0.1234', gnorm='1.00e-02', refresh=False)
+    assert calls == [{
+        'loss': '0.1234', 'gnorm': '1.00e-02', 'refresh': False,
+    }]
+    assert training_common.training_progress(
+        loader, training=False, epoch=2, max_epochs=10,
+    ) is loader
+
+
+@pytest.mark.parametrize('module_name', [
+    'AIAEC.Align_CRUSE.train',
+    'AIAEC.Align_ULCNet.train',
+    'AIAEC.GTCRN_AENR.train',
+    'AIAEC.DeepFilterNet_AENR.train',
+    'AIAEC.DeepVQE_S.train',
+    'AIAEC.CAGCRN.train',
+])
+def test_all_train_loops_use_shared_progress_and_postfix(module_name):
+    trainer = importlib.import_module(module_name)
+    names = set(trainer.run_epoch.__code__.co_names)
+    assert 'training_progress' in names
+    assert 'set_postfix' in names
+
+
 def test_loader_cli_packed_dir_override_and_mmap_reach_dataset(monkeypatch):
     observed = {}
     linear = make_linear_aec_contract(16000, frame_size=512)
