@@ -47,6 +47,40 @@
  */
 #define GSC_WA_LEAK 0.99999f
 
+/*
+ * RLS per-bin divergence guard + diagonal loading (2026-08-04, real recording
+ * repro: pipeline_failed at frame ~2800-3300, ~20-27s in, at every checked-in
+ * grid and both scalar/SIMD -- see AEC/NR/Audio_ALG review notes).
+ *
+ * The per-bin covariance downdate below, P = (P - gain*q) / lambda, has no
+ * compensating floor/ceiling: dividing by lambda < 1 every adapted frame
+ * amplifies P's diagonal unless the gain*q correction exactly cancels it.
+ * Under sustained low excitation at a bin (the blocking-output u carries
+ * little energy there -- e.g. no interferer in that direction/frequency for
+ * an extended stretch of real audio, which short synthetic tests rarely
+ * exercise), the correction underflows in float32 while the /lambda growth
+ * does not, so P's diagonal drifts upward without bound over enough frames
+ * and eventually overflows to inf -- corrupting gain/wa/gsc_spectrum and
+ * tripping the caller's isfinite() gate (FOUR_AEC_NR_RES_DSP_ERROR).
+ *
+ * Two independent guards, both per-bin (not a whole-GSC reset, which would
+ * discard every OTHER bin's adaptation over one bin's fault):
+ *
+ *   1. GSC_P_DIAG_FLOOR/CEIL: clamp every bin's P diagonal after each
+ *      update, every frame -- proactive, keeps P inside a numerically safe
+ *      range well before it could reach inf. CEIL is chosen generously
+ *      large relative to P's identity initial condition (1.0) so it never
+ *      engages anywhere near a real converged operating point.
+ *   2. The isfinite(upu_real) && upu_real > 0 check before this bin's
+ *      update uses last frame's (possibly already-corrupted) P: reactive,
+ *      catches whatever the floor/ceil didn't (e.g. corruption from a
+ *      source other than diagonal growth) and recovers by resetting only
+ *      this bin's P to identity and wa to zero, skipping this bin's update
+ *      for the current frame instead of propagating a poisoned gain.
+ */
+#define GSC_P_DIAG_FLOOR 1e-6f
+#define GSC_P_DIAG_CEIL  1e6f
+
 /* ===================== adapt-interval derivation ===================== */
 
 int gsc_effective_adapt_interval(
@@ -158,8 +192,25 @@ GSC* gsc_create(int M, int F, int num_angles,
     g->frame_idx = 0;
     g->doa_used = NAN;
     g->adaptive = 0;
+    g->bin_resets = 0;
 
     return g;
+}
+
+/* Reset one bin's RLS state to the same fresh-start condition gsc_create()
+ * gives every bin (P = identity, wa = 0). Used by the per-bin divergence
+ * guards in the RLS update below; see GSC_P_DIAG_FLOOR/CEIL's comment. */
+static void gsc_reset_bin(GSC* g, int f)
+{
+    for (int i = 0; i < g->M; i++) {
+        for (int j = 0; j < g->M; j++) {
+            g->P[f][i][j].r = (i == j) ? 1.0f : 0.0f;
+            g->P[f][i][j].i = 0.0f;
+        }
+        g->wa[i][f].r = 0.0f;
+        g->wa[i][f].i = 0.0f;
+    }
+    g->bin_resets += 1;
 }
 
 /* ===================== DOA index ===================== */
@@ -503,6 +554,21 @@ void gsc_process_with_weights(GSC* g,
 
             float upu_real = upu_c.r;
 
+            /* upu_real = lambda + u^H P u is only ever valid (finite,
+             * positive) when P is still a well-conditioned positive-
+             * semidefinite matrix; lambda > 0 and u^H P u >= 0 for a true
+             * PSD P, so a non-finite or non-positive result here means P
+             * (computed from LAST frame, before this frame's update) has
+             * already drifted -- see GSC_P_DIAG_FLOOR/CEIL's comment above
+             * for why. Recover by resetting only this bin (not the whole
+             * GSC, which would discard every other bin's adaptation) and
+             * skipping its update this frame; the floor/ceiling clamp below
+             * is the proactive guard that should make this branch rare. */
+            if (!isfinite(upu_real) || upu_real <= 0.0f) {
+                gsc_reset_bin(g, f);
+                continue;
+            }
+
             if (fabsf(upu_real) < 1e-12f) {
                 upu_real = (upu_real >= 0.0f) ? 1e-12f : -1e-12f;
             }
@@ -561,6 +627,20 @@ void gsc_process_with_weights(GSC* g,
                 g->P[f][i][i].i = 0.0f;
             }
 
+            /* ---------- diagonal loading: clamp P's diagonal ----------
+             * Proactive counterpart to the isfinite(upu_real) guard above:
+             * runs every adapted frame, on every bin, so P's diagonal never
+             * gets close enough to inf for that reactive check to be the
+             * only thing standing between a quiet stretch of audio and a
+             * corrupted spectrum. See GSC_P_DIAG_FLOOR/CEIL's comment. */
+            for (int i = 0; i < g->M; i++) {
+                if (g->P[f][i][i].r < GSC_P_DIAG_FLOOR) {
+                    g->P[f][i][i].r = GSC_P_DIAG_FLOOR;
+                } else if (g->P[f][i][i].r > GSC_P_DIAG_CEIL) {
+                    g->P[f][i][i].r = GSC_P_DIAG_CEIL;
+                }
+            }
+
             /* ---------- wa update: wa = leak*wa + mu * gain * conj(gsc) ---------- */
             Complex gsc_conj = spatial_complex_conj(gsc_spec[f]);
 
@@ -573,6 +653,20 @@ void gsc_process_with_weights(GSC* g,
                 }
 
                 g->wa[m][f] = spatial_complex_add(spatial_complex_scale(g->wa[m][f], GSC_WA_LEAK), update);
+            }
+
+            /* ---------- final per-bin finite check ----------
+             * Defense in depth: catches corruption from any source other
+             * than P's own diagonal (e.g. a non-finite gsc_spec[f] feeding
+             * gsc_conj above) that the upu_real guard and diagonal clamp
+             * would not see, since both only look at P. Same per-bin
+             * reset+skip recovery -- this frame's wa update for this bin
+             * is discarded in favour of a clean slate. */
+            for (int m = 0; m < g->M; m++) {
+                if (!isfinite(g->wa[m][f].r) || !isfinite(g->wa[m][f].i)) {
+                    gsc_reset_bin(g, f);
+                    break;
+                }
             }
         }
 
@@ -654,6 +748,11 @@ float gsc_get_doa_used(const GSC* g)
 int gsc_get_adaptive(const GSC* g)
 {
     return g ? g->adaptive : 0;
+}
+
+long gsc_get_bin_resets(const GSC* g)
+{
+    return g ? g->bin_resets : 0;
 }
 
 float gsc_wa_leak_factor(void)

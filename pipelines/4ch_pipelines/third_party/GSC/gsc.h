@@ -72,6 +72,14 @@ typedef struct {
     float doa_used;
     int adaptive;
 
+    /* Lifetime count of per-bin RLS divergence recoveries (see
+     * GSC_P_DIAG_FLOOR/CEIL in gsc.c) -- NOT cleared by gsc_reset(), so a
+     * caller/test can observe whether numerical instability occurred at all
+     * across this instance's whole run. Expected to stay at (or very near)
+     * 0 in normal operation; the diagonal clamp is meant to keep this
+     * reactive path rare. */
+    long bin_resets;
+
 } GSC;
 
 /*
@@ -132,6 +140,13 @@ int gsc_get_adaptive(const GSC* g);
  * instead of duplicating its numeric value.
  */
 float gsc_wa_leak_factor(void);
+
+/*
+ * Lifetime count of per-bin RLS divergence recoveries this instance has
+ * performed (see GSC struct's bin_resets field). Read-only diagnostic --
+ * expected to stay at 0 in normal operation.
+ */
+long gsc_get_bin_resets(const GSC* g);
 
 #ifdef __cplusplus
 }
