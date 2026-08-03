@@ -1,0 +1,18 @@
+# Runtime dependencies for pipelines/ (the Audio_ALG AEC+NR integration layer).
+# Install with: pip install -r pipelines/requirements.txt
+#
+# lib/aec and lib/nr are git submodules with their own requirements files;
+# this file covers what pipelines/ itself imports directly.
+
+numpy
+scipy          # 4ch recording evaluator and evaluation/resampling tools
+soundfile      # WAV I/O
+PyYAML         # aec_nr_pipeline.py's load_config() -> lib/nr/process_audio.py reads v3_2_config.yaml
+
+# --- dev / test only ---
+pytest
+
+# --- optional: AECMOS scoring only (python/bench_aecmos.py-style tooling) ---
+# speechmos
+# onnxruntime<=1.16.3   # newer onnxruntime breaks speechmos's bundled ONNX graph
+# numpy<2               # AECMOS scoring path only; core pipelines/ works with numpy 2.x
