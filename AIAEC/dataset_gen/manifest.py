@@ -73,7 +73,7 @@ __all__ = [
 
 # Bumped when the manifest's meaning changes, so a stale file is rejected
 # rather than reinterpreted.
-MANIFEST_VERSION = 'aec_manifest_v1'
+MANIFEST_VERSION = 'aec_manifest_v2'
 
 SPLITS = ('train', 'val')
 
@@ -277,19 +277,35 @@ def _scan_sources(cfg: configparser.ConfigParser, progress: bool):
 
 def _split_entry(speaker_ids, speakers, noise_ids, noises, room_ids, rooms,
                  device_ids) -> dict:
-    """One ``splits[...]`` entry -- the 8-key shape both a source-disjoint
+    """One ``splits[...]`` entry -- the 10-key shape both a source-disjoint
     HALF (``build_manifest``) and the WHOLE unified pool
     (``build_unified_manifest``) produce, differing only in which id lists
     are passed in. Factored out so a future manifest field is added in
     exactly one place instead of two dict literals that would otherwise have
     to be kept structurally parallel by hand.
     """
+    speaker_ids = sorted(speaker_ids)
+    noise_ids = sorted(noise_ids)
+    room_ids = sorted(room_ids)
+    speech_files = sorted(f for spk in speaker_ids for f in speakers[spk])
+    noise_files = sorted(f for nid in noise_ids for f in noises[nid])
+
     return {
-        'speakers': sorted(speaker_ids),
-        'speech_files': sorted(f for spk in speaker_ids for f in speakers[spk]),
-        'noise_ids': sorted(noise_ids),
-        'noise_files': sorted(f for nid in noise_ids for f in noises[nid]),
-        'rooms': sorted(room_ids),
+        'speakers': speaker_ids,
+        'speech_files': speech_files,
+        # Preserve the exact grouping decision made while scanning.  Rebuilding
+        # it later by checking every group id against every file is quadratic
+        # for corpora whose noise fallback is one id per file, and substring
+        # matching can also attach a file to the wrong id.
+        'speaker_of': {
+            rel: spk for spk in speaker_ids for rel in speakers[spk]
+        },
+        'noise_ids': noise_ids,
+        'noise_files': noise_files,
+        'noise_of': {
+            rel: nid for nid in noise_ids for rel in noises[nid]
+        },
+        'rooms': room_ids,
         'rir_files': sorted(f for room in room_ids for f in rooms[room]),
         'devices': sorted(device_ids),
         'rooms_to_rirs': {room: sorted(rooms[room]) for room in room_ids},
@@ -475,7 +491,7 @@ class SourcePools:
     for a source to reach a render.
     """
 
-    __slots__ = ('split', 'speech_files', 'noise_files', 'devices',
+    __slots__ = ('split', 'manifest_version', 'speech_files', 'noise_files', 'devices',
                  'rooms', 'rirs_by_room', 'rt60', 'speaker_of', 'noise_of',
                  'rir_id_of', 'room_of', 'far_speech_files', 'far_speaker_of')
 
@@ -486,6 +502,7 @@ class SourcePools:
         entry = manifest['splits'][split]
 
         self.split = split
+        self.manifest_version = manifest['version']
         self.speech_files = [
             os.path.join(roots['speech_dir'], rel) for rel in entry['speech_files']
         ]
@@ -503,16 +520,29 @@ class SourcePools:
             for rel, value in manifest.get('rt60', {}).items()
         }
 
-        # Source-id lookups, so the renderer can record WHICH source produced a
-        # clip without re-deriving the grouping rule and getting it subtly
-        # different from the rule the split was actually made with.
+        # Source-id lookups are materialised once, in the manifest builder,
+        # from the exact groups used for the split.  Consuming those maps here
+        # is O(files); the old substring reconstruction was O(files * ids) and
+        # was repeated independently by every render worker.
+        speech_rel = entry['speech_files']
+        noise_rel = entry['noise_files']
+        speaker_of_rel = entry['speaker_of']
+        noise_of_rel = entry['noise_of']
+        if set(speaker_of_rel) != set(speech_rel):
+            raise ValueError("manifest speaker_of keys do not match speech_files")
+        if set(noise_of_rel) != set(noise_rel):
+            raise ValueError("manifest noise_of keys do not match noise_files")
+        if not set(speaker_of_rel.values()) <= set(entry['speakers']):
+            raise ValueError("manifest speaker_of contains an unknown speaker id")
+        if not set(noise_of_rel.values()) <= set(entry['noise_ids']):
+            raise ValueError("manifest noise_of contains an unknown noise id")
         self.speaker_of = {
-            absolute: _group_lookup(rel, entry['speakers'])
-            for rel, absolute in zip(entry['speech_files'], self.speech_files)
+            os.path.join(roots['speech_dir'], rel): speaker_of_rel[rel]
+            for rel in speech_rel
         }
         self.noise_of = {
-            absolute: _group_lookup(rel, entry['noise_ids'])
-            for rel, absolute in zip(entry['noise_files'], self.noise_files)
+            os.path.join(roots['noise_dir'], rel): noise_of_rel[rel]
+            for rel in noise_rel
         }
         self.rir_id_of = {}
         self.room_of = {}
@@ -554,20 +584,6 @@ class SourcePools:
         return (f"SourcePools(split={self.split!r}, speech={len(self.speech_files)}, "
                 f"noise={len(self.noise_files)}, rooms={len(self.rooms)}, "
                 f"devices={len(self.devices)})")
-
-
-def _group_lookup(rel_path: str, group_ids: Sequence[str]) -> str:
-    """Match a relative source path back to the group id it was split under.
-
-    The manifest stores both the group list and the file list, so the id can be
-    recovered by substring match without re-running the regex.  Longest first,
-    so 'reader_067' cannot shadow 'reader_0671'.
-    """
-    normalised = rel_path.replace(os.sep, '/')
-    for group_id in sorted(group_ids, key=len, reverse=True):
-        if group_id in normalised:
-            return group_id
-    return os.path.splitext(os.path.basename(normalised))[0]
 
 
 def pools_for_split(manifest: dict, split: str) -> SourcePools:

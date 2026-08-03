@@ -124,6 +124,7 @@ def _save_shard(clips, metas, shard_index, args, run_meta) -> str:
         'meta': metas,
         'generator_commit': run_meta.get('generator_commit', 'unknown'),
         'config_hash': run_meta.get('config_hash', 'unknown'),
+        'manifest_version': run_meta['manifest_version'],
         'manifest_seed': run_meta.get('manifest_seed'),
         'linear_aec': run_meta['linear_aec'],
         'linear_aec_contract_hash': run_meta['linear_aec_contract_hash'],
@@ -133,6 +134,12 @@ def _save_shard(clips, metas, shard_index, args, run_meta) -> str:
 
 def pack(args):
     run_meta = _read_run_meta(args.input)
+    manifest_version = run_meta.get('manifest_version')
+    if not isinstance(manifest_version, str) or not manifest_version:
+        raise ValueError(
+            f"{args.input}/meta.json has no valid manifest_version; "
+            "re-render it with the current generator"
+        )
     declared_stems = run_meta.get('stems')
     if declared_stems is None or list(declared_stems) != list(STEM_ORDER):
         raise ValueError(
@@ -182,6 +189,11 @@ def pack(args):
             clips, metas = [], []
 
         for meta in chunk_meta:
+            if meta.get('manifest_version') != manifest_version:
+                raise ValueError(
+                    f"sequence {sequence_id} chunk {meta.get('chunk_index')} "
+                    "was materialized with a different or missing manifest_version"
+                )
             if meta.get('config_hash') != run_meta.get('config_hash'):
                 raise ValueError(
                     f"sequence {sequence_id} chunk {meta.get('chunk_index')} "
@@ -227,6 +239,7 @@ def pack(args):
         'shards': [os.path.basename(path) for path in written],
         'generator_commit': run_meta.get('generator_commit', 'unknown'),
         'config_hash': run_meta.get('config_hash', 'unknown'),
+        'manifest_version': manifest_version,
         'manifest_seed': run_meta.get('manifest_seed'),
         'linear_aec': linear_aec.as_dict(),
         'linear_aec_contract_hash': contract_hash,

@@ -65,7 +65,6 @@ from .aec_dataset import (  # noqa: E402
     AecSequenceRenderer,
     SequencePlan,
     plan_sequences,
-    rooms_eligible_for_path_change,
 )
 from .aec_features import STEM_ORDER  # noqa: E402
 from .linear_aec import linear_aec_contract_from_config  # noqa: E402
@@ -200,6 +199,7 @@ def _identity_collate(batch):
 def _sequence_is_complete(plan: SequencePlan, seqs_dir: str, *,
                           sample_rate: int, chunk_samples: int,
                           contract_hash: str, config_hash: str,
+                          manifest_version: str,
                           wav_encoding: str = 'float32') -> bool:
     """A sidecar alone is not enough to prove a five-channel sequence exists.
 
@@ -210,7 +210,11 @@ def _sequence_is_complete(plan: SequencePlan, seqs_dir: str, *,
     such an edit would keep the stale sequence and meta.json would still
     claim the whole run reflects the new config.
 
-    ``plan.scenario``/``plan.seed`` close a THIRD gap that config_hash cannot:
+    ``manifest_version`` prevents a structural/identity change in the source
+    manifest from retaining v1 sidecars under a newer run merely because its
+    signal config is unchanged.
+
+    ``plan.scenario``/``plan.seed`` close a FOURTH gap that config_hash cannot:
     ``--seed`` lives outside config.ini, so a --seed change reshuffles which
     scenario/seed plan_sequences() assigns each sequence_id without touching
     config_hash at all. Whenever the reshuffled plan happens to want the same
@@ -232,6 +236,7 @@ def _sequence_is_complete(plan: SequencePlan, seqs_dir: str, *,
                 meta.get("chunk_index") != chunk_index
                 or meta.get("linear_aec_contract_hash") != contract_hash
                 or meta.get("config_hash") != config_hash
+                or meta.get("manifest_version") != manifest_version
                 or meta.get("sequence_scenario") != plan.scenario
                 or meta.get("sequence_seed") != plan.seed
             ):
@@ -258,7 +263,7 @@ def _sequence_is_complete(plan: SequencePlan, seqs_dir: str, *,
 
 def _pending(plans: List[SequencePlan], seqs_dir: str, resume: bool, *,
              sample_rate: int, chunk_samples: int,
-             contract_hash: str, config_hash: str,
+             contract_hash: str, config_hash: str, manifest_version: str,
              wav_encoding: str = 'float32') -> List[SequencePlan]:
     if not resume:
         return list(plans)
@@ -267,7 +272,8 @@ def _pending(plans: List[SequencePlan], seqs_dir: str, resume: bool, *,
         if not _sequence_is_complete(
             plan, seqs_dir, sample_rate=sample_rate,
             chunk_samples=chunk_samples, contract_hash=contract_hash,
-            config_hash=config_hash, wav_encoding=wav_encoding,
+            config_hash=config_hash, manifest_version=manifest_version,
+            wav_encoding=wav_encoding,
         )
     ]
 
@@ -356,7 +362,8 @@ def gen_aec_dataset(args):
         # multi-hour run whenever one happens to draw the first
         # echo_path_change sequence (AecSequenceRenderer checks this too, but
         # only once a worker actually reaches that sequence).
-        if not rooms_eligible_for_path_change(pools_for_split(manifest, args.split)):
+        rooms_to_rirs = manifest['splits'][args.split]['rooms_to_rirs']
+        if not any(len(rirs) >= 2 for rirs in rooms_to_rirs.values()):
             raise ValueError(
                 "the plan includes 'echo_path_change' sequences but no room "
                 "in this split has >= 2 RIR files; add more RIRs per room or "
@@ -371,7 +378,8 @@ def gen_aec_dataset(args):
         sample_rate=generation_sr,
         chunk_samples=chunk_samples,
         contract_hash=linear_aec_contract.fingerprint(),
-        config_hash=cfg_hash, wav_encoding=args.wav_encoding,
+        config_hash=cfg_hash, manifest_version=manifest['version'],
+        wav_encoding=args.wav_encoding,
     )
     bytes_per = 4 if args.wav_encoding == 'float32' else 2
     disk = sum(p.n_chunks for p in plans) * len(STEM_ORDER) * chunk_samples * bytes_per
@@ -429,6 +437,7 @@ def gen_aec_dataset(args):
         'config_hash': cfg_hash,
         'generator_commit': git_commit(),
         'manifest': os.path.abspath(manifest_path),
+        'manifest_version': manifest['version'],
         'manifest_config_hash': manifest['config_hash'],
         'manifest_seed': int(manifest['seed']),
         'sequence_scenarios': plan_counts,

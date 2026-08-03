@@ -71,6 +71,7 @@ class PackedAecDataset(Dataset):
                 'dtype': str(data.dtype),
                 'generator_commit': obj.get('generator_commit'),
                 'config_hash': obj.get('config_hash'),
+                'manifest_version': obj.get('manifest_version'),
                 'manifest_seed': obj.get('manifest_seed'),
             }
             if shard_identity is None:
@@ -105,6 +106,7 @@ class PackedAecDataset(Dataset):
         self.dtype = self._shards[0]['data'].dtype
         self.linear_aec_contract = linear_aec_contract
         self.linear_aec_contract_hash = linear_aec_contract.fingerprint()
+        self.manifest_version = self._shards[0].get('manifest_version')
         self.manifest_seed = self._shards[0].get('manifest_seed')
         self._total = total
 
@@ -149,7 +151,7 @@ class PackedAecDataset(Dataset):
     def _validate(obj: dict, path: str, expected_sr: Optional[int]) -> None:
         for key in (
             'stems', 'data', 'sr', 'meta', 'linear_aec',
-            'linear_aec_contract_hash',
+            'linear_aec_contract_hash', 'manifest_version',
         ):
             if key not in obj:
                 raise ValueError(f"{path} is missing required key {key!r}")
@@ -170,7 +172,13 @@ class PackedAecDataset(Dataset):
                 f"{path}: {len(obj['meta'])} metadata entries for "
                 f"{data.shape[0]} clips")
         contract_hash = obj['linear_aec_contract_hash']
+        manifest_version = obj['manifest_version']
         for index, meta in enumerate(obj['meta']):
+            if meta.get('manifest_version') != manifest_version:
+                raise ValueError(
+                    f"{path}: metadata entry {index} has a missing/different "
+                    "manifest_version"
+                )
             if meta.get('linear_aec_contract_hash') != contract_hash:
                 raise ValueError(
                     f"{path}: metadata entry {index} has a missing/different "
@@ -244,6 +252,7 @@ class PackedAecDataset(Dataset):
             'scenarios': self.scenario_counts(),
             'generator_commit': self._shards[0].get('generator_commit'),
             'config_hash': self._shards[0].get('config_hash'),
+            'manifest_version': self.manifest_version,
             'manifest_seed': self.manifest_seed,
             'linear_aec_contract_hash': self.linear_aec_contract_hash,
             'dataset_fingerprint': self.fingerprint(),
@@ -259,6 +268,7 @@ class PackedAecDataset(Dataset):
             'dtype': str(self.dtype),
             'generator_commit': self._shards[0].get('generator_commit'),
             'config_hash': self._shards[0].get('config_hash'),
+            'manifest_version': self.manifest_version,
             # The manifest seed is part of the audio identity, not just split
             # bookkeeping: the renderer derives device/EQ profiles and every
             # sequence RNG from the corpus seed.  Omitting it could let two

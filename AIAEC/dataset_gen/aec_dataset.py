@@ -1057,6 +1057,7 @@ class AecSequenceRenderer:
                 'nonlinear': device.nonlinear,
                 'clipped': bool(clipped),
                 'agc': bool(agc),
+                'manifest_version': self.pools.manifest_version,
                 'linear_aec_contract_hash': self.linear_aec_contract.fingerprint(),
                 'config_hash': self.config_hash,
                 # config_hash alone does not identify a render: --seed lives

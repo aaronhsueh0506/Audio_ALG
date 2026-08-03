@@ -44,6 +44,7 @@ from AIAEC.dataset_gen.aec_dataset import (
 )
 from AIAEC.dataset_gen.gen_aec_dataset import gen_aec_dataset
 from AIAEC.dataset_gen.manifest import (
+    MANIFEST_VERSION,
     UNIFIED_SPLIT,
     build_manifest,
     build_unified_manifest,
@@ -518,6 +519,15 @@ def test_manifest_split_is_source_disjoint(corpus):
         assert set(train[axis]) & set(val[axis]) == set(), f"leak on {axis}"
         assert train[axis] and val[axis], f"{axis} empty on one side"
 
+    # File identities are resolved once when the manifest is built.  Keeping
+    # these exact maps prevents SourcePools construction from degenerating to
+    # an all-files x all-ids substring search in every worker.
+    for entry in (train, val):
+        assert set(entry['speaker_of']) == set(entry['speech_files'])
+        assert set(entry['noise_of']) == set(entry['noise_files'])
+        assert set(entry['speaker_of'].values()) <= set(entry['speakers'])
+        assert set(entry['noise_of'].values()) <= set(entry['noise_ids'])
+
 
 def test_unified_manifest_has_every_source_in_one_pool(corpus):
     """build_unified_manifest -- the ESCAPE HATCH -- has no train/val axis."""
@@ -861,7 +871,7 @@ def test_metadata_covers_the_declared_contract(packed):
         'sequence_id', 'chunk_index', 'speaker_id', 'noise_id', 'rir_id',
         'ser_db', 'snr_db', 'erl_db', 'bulk_delay_samples', 'delay_jitter',
         'sro_ppm', 'nonlinear', 'clipped', 'scenario',
-        'linear_aec_contract_hash', 'config_hash',
+        'manifest_version', 'linear_aec_contract_hash', 'config_hash',
     }
     from AIAEC.dataset_gen.aec_dataset import SCENARIOS
     dataset = packed['train']
@@ -884,7 +894,8 @@ def test_shard_records_provenance(packed):
     shard = torch.load(dataset.paths[0], map_location='cpu', weights_only=False)
     assert set(shard) >= {
         'stems', 'data', 'sr', 'meta', 'generator_commit', 'config_hash',
-        'manifest_seed', 'linear_aec', 'linear_aec_contract_hash',
+        'manifest_version', 'manifest_seed', 'linear_aec',
+        'linear_aec_contract_hash',
     }
     assert shard['sr'] == SR
     assert shard['data'].dtype == torch.float32
@@ -1005,12 +1016,23 @@ def test_resume_forces_a_rerender_when_config_hash_is_stale(corpus, tmp_path):
     matching = _pending(
         plans, str(seqs_dir), True, sample_rate=SR, chunk_samples=chunk_samples,
         contract_hash=contract_hash, config_hash=config_hash(cfg),
+        manifest_version=MANIFEST_VERSION,
     )
     assert matching == [], "the real config_hash must resume as fully complete"
+
+    stale_manifest = _pending(
+        plans, str(seqs_dir), True, sample_rate=SR,
+        chunk_samples=chunk_samples, contract_hash=contract_hash,
+        config_hash=config_hash(cfg), manifest_version='aec_manifest_v1',
+    )
+    assert len(stale_manifest) == len(plans), (
+        "a manifest version mismatch must force every sequence to re-render"
+    )
 
     stale = _pending(
         plans, str(seqs_dir), True, sample_rate=SR, chunk_samples=chunk_samples,
         contract_hash=contract_hash, config_hash='0' * 16,
+        manifest_version=MANIFEST_VERSION,
     )
     assert len(stale) == len(plans), (
         "a config_hash mismatch must force every sequence to re-render, even "
@@ -1049,6 +1071,7 @@ def test_resume_forces_a_rerender_when_the_plan_scenario_or_seed_drifts(corpus, 
     assert _sequence_is_complete(
         plan, str(seqs_dir), sample_rate=SR, chunk_samples=chunk_samples,
         contract_hash=contract_hash, config_hash=cfg_hash,
+        manifest_version=MANIFEST_VERSION,
     ), "the real plan must resume as complete"
 
     # Same config.ini and chunk count, but a --seed change would reassign this
@@ -1062,6 +1085,7 @@ def test_resume_forces_a_rerender_when_the_plan_scenario_or_seed_drifts(corpus, 
     assert not _sequence_is_complete(
         drifted, str(seqs_dir), sample_rate=SR, chunk_samples=chunk_samples,
         contract_hash=contract_hash, config_hash=cfg_hash,
+        manifest_version=MANIFEST_VERSION,
     ), (
         "a --seed-driven scenario/seed change must force a re-render even "
         "though chunk count, config_hash and contract_hash still agree"
@@ -1087,6 +1111,7 @@ def test_resume_forces_a_rerender_when_wav_encoding_changes(corpus, tmp_path):
         chunk_samples=int(round(cfg.getfloat('sequence', 'chunk_sec') * SR)),
         contract_hash=linear_aec_contract_from_config(cfg).fingerprint(),
         config_hash=config_hash(cfg),
+        manifest_version=MANIFEST_VERSION,
     )
     assert _pending(plans, str(output / 'train' / 'seqs'), True,
                     wav_encoding='float32', **common) == []

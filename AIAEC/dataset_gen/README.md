@@ -88,6 +88,7 @@ Each clip carries a dict. The contract fields:
 | `sequence_id`, `chunk_index` | which parent sequence, and where in it |
 | `speaker_id` | the **near** talker (`''` = none). `far_speaker_id` is the other one -- from an independent pool if `[paths] far_speech_dir` is set, otherwise the same pool |
 | `noise_id`, `rir_id` | source ids; `rir_id` is `"a\|b"` for an echo-path change (both `a` and `b` are always in the same room as `room_id`) |
+| `manifest_version` | source-manifest schema/identity; prevents resume or packing from mixing sequences built under different source-mapping contracts |
 | `config_hash` | fingerprint of the config this chunk was rendered under; what `--resume` compares to reject a sequence rendered under different settings |
 | `sequence_seed` | the per-sequence RNG seed `plan_sequences()` derived from `--seed`; `--resume` also compares this (and `sequence_scenario`) since `--seed` lives outside config.ini and would otherwise not be seen at all |
 | `ser_db` | near-speech-to-echo ratio (`+inf` = no echo, `-inf` = no near talker) |
@@ -267,8 +268,9 @@ python3 -m AIAEC.dataset_gen.pack_aec_dataset \
 ```
 
 `--resume` marks a sequence complete only after all five-channel WAVs and its
-matching metadata contract exist. Repacking is mandatory because old shards
-retain the old audio and contract.
+matching config, manifest and linear-AEC metadata contracts exist. Manifest v1
+files do not contain the exact file-to-source-id maps required by v2; rebuild
+the manifest and re-render/repack rather than mixing old sidecars or shards.
 
 Generation is deterministic given `--seed`: each sequence is seeded from
 `(seed, split, sequence_id)`, so it renders identically regardless of worker
