@@ -164,7 +164,7 @@ typedef struct FourAecNrResDelayState {
     int delay_samples;
     float confidence;
     int solid;
-    int changed;
+    int changed;        /* reset external STFT/OLA history when non-zero */
     uint64_t estimator_calls;
     int estimator_updates;
 } FourAecNrResDelayState;
@@ -200,8 +200,13 @@ typedef struct FourAecNrResPreFrame {
     int n_freqs;
 
     /**
-     * Read-only interleaved linear-AEC output [hop_size][4]:
+     * Read-only interleaved formed linear-AEC output [hop_size][4]:
      * linear_interleaved[sample * 4 + channel].
+     * Each channel is the exact selected/crossfaded time-domain hop
+     * underlying linear_spectra[channel], before the downstream WOLA
+     * synthesis. An external time-domain beamformer that performs its own
+     * sqrt-Hann analysis must consume this signal rather than the standalone
+     * AEC's separately limited return value.
      *
      * Valid until process_post(), reset(), or destroy(). Only one pre frame
      * may be in flight.

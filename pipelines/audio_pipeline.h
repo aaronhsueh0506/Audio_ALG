@@ -178,7 +178,7 @@ extern "C" {
  *                        operation over data this library didn't itself
  *                        produce. The two backends are still not
  *                        byte-identical to each other (pre-existing,
- *                        expected — see lib/aec/CLAUDE.md), so a descriptor
+ *                        expected), so a descriptor
  *                        computed against one is never a valid stand-in for
  *                        the other even at matching `bytes`.
  *   - build_flags_hash:  FNV-1a-32 hash of a small, fixed set of compile-time

@@ -8,6 +8,7 @@
 #include "4aec_nr_res.h"
 #include "4aec_nr_res_internal.h"
 #include "4aec_projection_kernels.h"
+#include "fft_wrapper.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -750,6 +751,118 @@ cleanup:
     free(pool);
 }
 
+static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(sample_rate);
+    FourAecNrRes* pipeline = NULL;
+    FourAecNrResPreFrame pre;
+    FftHandle* fft = NULL;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* out = NULL;
+    float* previous = NULL;
+    float* ola = NULL;
+    float* time_frame = NULL;
+    Complex* weights = NULL;
+    float* window = NULL;
+    float max_error = 0.0f;
+    int valid = 1;
+    int hop;
+    int n_freqs;
+
+    cfg.fft_size = fft_size;
+    cfg.enable_cng = 0;
+    pipeline = four_aec_nr_res_create(&cfg);
+    if (pipeline) fft = fft_create(fft_size);
+    CHECK(pipeline != NULL && fft != NULL,
+          "4ch WOLA identity instances create");
+    if (!pipeline || !fft) goto cleanup;
+
+    hop = four_aec_nr_res_hop_size(pipeline);
+    n_freqs = four_aec_nr_res_n_freqs(pipeline);
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    previous = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    ola = (float*)calloc(
+        (size_t)fft_size * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    time_frame = (float*)calloc((size_t)fft_size, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)n_freqs * FOUR_AEC_NR_RES_CHANNELS, sizeof(Complex));
+    window = (float*)calloc((size_t)fft_size, sizeof(float));
+    if (!microphones || !ref || !out || !previous || !ola ||
+        !time_frame || !weights || !window) {
+        valid = 0;
+        goto check_result;
+    }
+    for (int i = 0; i < fft_size; ++i) {
+        window[i] = sqrtf(0.5f * (1.0f - cosf(
+            2.0f * 3.14159265358979323846f * (float)i /
+            (float)fft_size)));
+    }
+    for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+        for (int k = 0; k < n_freqs; ++k)
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+    }
+
+    for (int frame = 0; frame < 40; ++frame) {
+        fill_inputs(microphones, ref, hop, sample_rate, frame);
+        if (four_aec_nr_res_process_pre(
+                pipeline, microphones, ref, &pre) != FOUR_AEC_NR_RES_OK) {
+            valid = 0;
+            break;
+        }
+        if (pre.delay.changed) {
+            /* A delay realignment resets each lane's WOLA history. An
+             * external time-domain beamformer must reset its matching OLA
+             * state at the same boundary. */
+            memset(previous, 0,
+                   (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
+            memset(ola, 0,
+                   (size_t)fft_size * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
+        }
+        for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+            float* channel_ola = ola + (size_t)ch * fft_size;
+            float* channel_previous = previous + (size_t)ch * hop;
+            fft_inverse(fft, pre.linear_spectra[ch], time_frame);
+            for (int i = 0; i < fft_size; ++i)
+                channel_ola[i] += time_frame[i] * window[i];
+            for (int i = 0; i < hop; ++i) {
+                float d = fabsf(channel_ola[i] - channel_previous[i]);
+                if (d > max_error) max_error = d;
+                channel_previous[i] = pre.linear_interleaved[
+                    i * FOUR_AEC_NR_RES_CHANNELS + ch];
+            }
+            memmove(channel_ola, channel_ola + hop,
+                    (size_t)(fft_size - hop) * sizeof(float));
+            memset(channel_ola + (fft_size - hop), 0,
+                   (size_t)hop * sizeof(float));
+        }
+        if (four_aec_nr_res_process_post(
+                pipeline, &pre.token, weights, out) != FOUR_AEC_NR_RES_OK) {
+            valid = 0;
+            break;
+        }
+    }
+
+check_result:
+    CHECK(valid && max_error <= 1e-4f,
+          "4ch pre time/spectrum seams share one reconstructing WOLA grid");
+
+cleanup:
+    free(window);
+    free(weights);
+    free(time_frame);
+    free(ola);
+    free(previous);
+    free(out);
+    free(ref);
+    free(microphones);
+    fft_destroy(fft);
+    four_aec_nr_res_destroy(pipeline);
+}
+
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
@@ -762,6 +875,9 @@ int main(void) {
     run_static_parity(16000, 256);
     run_static_parity(16000, 512);
     run_static_parity(48000, 1024);
+    test_pre_frame_wola_identity(16000, 256);
+    test_pre_frame_wola_identity(16000, 512);
+    test_pre_frame_wola_identity(48000, 1024);
 
     if (failures) {
         printf("%d test(s) failed\n", failures);

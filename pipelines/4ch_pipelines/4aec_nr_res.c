@@ -900,6 +900,11 @@ int four_aec_nr_res_process_pre(
         for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
             aec_reset(p->lanes[ch]);
         }
+        /* The AEC reset starts a new WOLA sequence whose first analysis
+         * frame has a zero previous half. Discard the old mono synthesis
+         * tail as well; mixing it into the new sequence would join spectra
+         * from opposite sides of the delay realignment. */
+        memset(p->ola, 0, (size_t)p->fft_size * sizeof(float));
     }
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
@@ -913,7 +918,7 @@ int four_aec_nr_res_process_pre(
             p->lanes[ch], p->mic_lane, p->aligned_ref,
             p->lane_out);
         aec_get_res_context(p->lanes[ch], &context);
-        if (!snapshot_context(
+        if (!context.formed_hop || !snapshot_context(
                 &p->snapshots[ch], &context, p->n_freqs)) {
             four_aec_nr_res_reset(p);
             return FOUR_AEC_NR_RES_DSP_ERROR;
@@ -921,7 +926,7 @@ int four_aec_nr_res_process_pre(
         for (i = 0; i < hop; ++i) {
             p->linear_interleaved[
                 i * FOUR_AEC_NR_RES_CHANNELS + ch] =
-                p->lane_out[i];
+                context.formed_hop[i];
         }
     }
 

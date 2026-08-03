@@ -1,6 +1,5 @@
 /**
- * test_audio_pipeline.c — F20/R08/§7.3 acceptance tests for
- * pipelines/audio_pipeline.h.
+ * test_audio_pipeline.c — acceptance tests for pipelines/audio_pipeline.h.
  *
  * Not a DSP-quality test (no AECMOS, no reference WAVs) — a contract test
  * for the library API surface itself: does the pool-first path behave
@@ -10,15 +9,14 @@
  * 0xA5-poisoned pool to prove the "no blanket memset needed" claim,
  * PASS/FAIL prints, nonzero exit on any failure).
  *
- * §7.3 per-rate coverage: every case below (validation, pool rejection,
+ * Per-rate coverage: every case below (validation, pool rejection,
  * create-vs-init byte-equal parity, destroy idempotence) runs once per
  * supported sample rate — 8000 / 16000 / 48000 — not just 16000. The
  * create-vs-init byte-equality (heap vs. an 0xA5-poisoned pool) at every
  * rate, on whichever BACKEND this binary was built with, is the load-bearing
- * §7.3 closure: it is the only place that proves the pool-carve arithmetic
+ * closure: it is the only place that proves the pool-carve arithmetic
  * (pipeline_pool_size/pipeline_build in audio_pipeline.c) agrees with itself
- * across the full 8k/16k/48k FFT-grid range, not just the 16 kHz case F20
- * originally shipped with.
+ * across the full 8k/16k/48k FFT-grid range.
  *
  * 48 kHz runs a REDUCED hop count (HOP_COUNT_48K, see below) — AEC's
  * filter_length (and therefore n_partitions/convolution cost) and the
@@ -32,7 +30,7 @@
  * (independent of the per-rate loop below) — it is a property of the
  * validator, not of any one supported rate.
  *
- * Also covers the R08 reject-first AudioPipelineConfig validation added to
+ * Also covers reject-first AudioPipelineConfig validation in
  * derive_dims_and_configs() (audio_pipeline.c): an out-of-enum aec_preset/
  * nr_mode and an out-of-{0,1} bool-typed field must all be rejected by both
  * audio_pipeline_get_mem_requirements() and audio_pipeline_init() — see
@@ -62,11 +60,11 @@
  *      pool is safe without the caller's blanket memset" claim.
  *   4. audio_pipeline_destroy() idempotence + NULL-safety on a pool-resident
  *      instance, and that the pool itself is untouched/reusable afterward.
- *   5. (once) reject-first AudioPipelineConfig validation (R08): an
+ *   5. (once) reject-first AudioPipelineConfig validation: an
  *      out-of-enum aec_preset/nr_mode and a bool field holding 2 (or -1)
  *      are all rejected by get_mem_requirements() AND init().
- *   6. (once) audio_pipeline_init_ex()'s `expected` descriptor gate (R09,
- *      descriptor V2 review B06): a correct/current descriptor is accepted;
+ *   6. (once) audio_pipeline_init_ex()'s `expected` descriptor gate: a
+ *      correct/current descriptor is accepted;
  *      a NULL descriptor behaves exactly like audio_pipeline_init(); a
  *      descriptor with a tampered descriptor_version, layout_version,
  *      backend_id, build_flags_hash, alignment, or bytes (or an undersized
@@ -309,8 +307,8 @@ static void test_destroy_idempotence(int sr, int fft_size) {
     free(pool);
 }
 
-/* R08: derive_dims_and_configs()'s reject-first AudioPipelineConfig
- * validation (audio_pipeline.c) -- an out-of-enum aec_preset/nr_mode and a
+/* derive_dims_and_configs()'s reject-first AudioPipelineConfig validation
+ * (audio_pipeline.c) -- an out-of-enum aec_preset/nr_mode and a
  * bool-typed field outside {0,1} must be rejected by BOTH
  * audio_pipeline_get_mem_requirements() and audio_pipeline_init(), not just
  * silently fall through to a module's own internal enum-default fallback
@@ -388,9 +386,9 @@ static void test_config_validation_rejects(void) {
     free(pool);
 }
 
-/* R09/descriptor-V2 (review B06): audio_pipeline_init_ex()'s `expected`
- * descriptor gate. Run once (16000 Hz, an arbitrary representative rate) --
- * like R08's config validation above, this exercises a comparison the
+/* audio_pipeline_init_ex()'s `expected` descriptor gate. Run once (16000 Hz,
+ * an arbitrary representative rate) -- like the config validation above,
+ * this exercises a comparison the
  * function does against a freshly-recomputed AudioPipelineMemReq, not a
  * per-rate carve property; see audio_pipeline.h's audio_pipeline_init_ex()
  * doc for the exact seven-condition contract this drills. */
@@ -453,7 +451,7 @@ static void test_init_ex_descriptor(void) {
     CHECK(p_align == NULL, "audio_pipeline_init_ex rejects a tampered alignment");
     if (p_align) audio_pipeline_destroy(p_align);
 
-    /* Round-4 review: `reserved` is documented as always-0 in any descriptor
+    /* `reserved` is documented as always zero in any descriptor
      * this library produced, and `expected` may arrive from persisted bytes
      * -- init_ex must VALIDATE the claim, not assume it. */
     AudioPipelineMemReq bad_reserved = req;
@@ -494,10 +492,10 @@ int main(void) {
         test_destroy_idempotence(sr, fft_size);
     }
 
-    printf("\n=== AudioPipelineConfig reject-first validation (R08) ===\n");
+    printf("\n=== AudioPipelineConfig reject-first validation ===\n");
     test_config_validation_rejects();
 
-    printf("\n=== audio_pipeline_init_ex descriptor gate (R09) ===\n");
+    printf("\n=== audio_pipeline_init_ex descriptor gate ===\n");
     test_init_ex_descriptor();
 
     if (g_failures) {

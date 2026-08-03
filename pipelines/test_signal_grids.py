@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -16,6 +18,7 @@ from lib.nr.denoisers import (
     SppMmseDenoiser,
     WienerDenoiser,
 )
+from pipelines import aec_nr_pipeline as pipeline_module
 from pipelines.aec_nr_pipeline import _build_denoiser, _project_grid
 
 
@@ -24,9 +27,9 @@ from pipelines.aec_nr_pipeline import _build_denoiser, _project_grid
     [
         # 16kHz default flipped 512/256 (16ms hop) -> 256/128 (8ms hop) on
         # 2026-08-02/03 (NR CHANGELOG [4.5.0]); 512/256 remains a supported,
-        # explicit alternate grid (see the fft_size=256 case below).
+        # explicit alternate grid (see the fft_size=512 case below).
         (16000, None, (256, 128, 256)),
-        (16000, 256, (256, 128, 256)),
+        (16000, 512, (512, 256, 512)),
         (48000, None, (1024, 512, 1024)),
     ],
 )
@@ -39,9 +42,9 @@ def test_nr_project_grid(sample_rate, fft_size, expected):
     [
         # 16kHz default flipped 512/256 (16ms hop) -> 256/128 (8ms hop) on
         # 2026-08-02/03 (NR CHANGELOG [4.5.0]); 512/256 remains a supported,
-        # explicit alternate grid (see the fft_size=256 case below).
+        # explicit alternate grid (see the fft_size=512 case below).
         (16000, None, (256, 128, 256)),
-        (16000, 256, (256, 128, 256)),
+        (16000, 512, (512, 256, 512)),
         (48000, None, (1024, 512, 1024)),
     ],
 )
@@ -105,6 +108,39 @@ def test_low_latency_16k_frame_has_no_transform_padding():
     )
     magnitude, phase, spectrum = processor.process_frame(np.ones(256, np.float32))
     assert magnitude.shape == phase.shape == spectrum.shape == (129,)
+
+
+def test_aec_only_time_output_matches_standalone_limiter_path(monkeypatch):
+    class FakeAec:
+        hop_size = 2
+
+        def __init__(self, config):
+            self.config = config
+
+        def process(self, mic, ref):
+            context = SimpleNamespace(
+                formed_output=np.asarray(mic, dtype=np.float32) + 10.0
+            )
+            return np.asarray(mic, dtype=np.float32) + 1.0, context
+
+        def get_erle(self):
+            return 0.0
+
+    monkeypatch.setattr(pipeline_module, "AEC", FakeAec)
+    mic = np.arange(4, dtype=np.float32)
+    ref = np.zeros_like(mic)
+
+    formed, contexts = pipeline_module.run_aec_linear(
+        mic, ref, SimpleNamespace(enable_res=True, return_res_context=False)
+    )
+    standalone, _ = pipeline_module.run_aec_linear(
+        mic, ref, SimpleNamespace(enable_res=True, return_res_context=False),
+        standalone_time_output=True,
+    )
+
+    np.testing.assert_array_equal(formed, mic + 10.0)
+    np.testing.assert_array_equal(standalone, mic + 1.0)
+    assert len(contexts) == 2
 
 
 @pytest.mark.parametrize(

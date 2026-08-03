@@ -45,7 +45,7 @@
  * aec_nr_pipeline_static.c), which are now thin shells over this API. */
 
 /* ============================================================================
- * No-stdio build gate (re-review R09)
+ * No-stdio build gate
  * ========================================================================== */
 
 /**
@@ -482,7 +482,7 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
 }
 
 /* ============================================================================
- * audio_pipeline_init_ex (re-review R09; descriptor V2 review B06) —
+ * audio_pipeline_init_ex descriptor validation —
  * audio_pipeline_init() PLUS an optional `expected` descriptor gate. See
  * audio_pipeline.h for the full contract; the eight-condition check below
  * (run only when `expected` is non-NULL) is the literal implementation of
@@ -535,7 +535,7 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
             return NULL;
         }
         if (expected->reserved != 0u) {
-            /* Round-4 review: the header doc claims reserved is always 0 in
+            /* The header contract requires reserved to be zero in
              * any descriptor this library produced -- validated here, not
              * assumed, because `expected` may arrive from persisted/
              * transmitted bytes this library never wrote. */
@@ -663,7 +663,9 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
     memcpy(p->mic_buf, mic, (size_t)hop * sizeof(float));
     memcpy(p->ref_buf, ref, (size_t)hop * sizeof(float));
 
-    /* Stage 1: AEC (linear residual in aec_out; freq seam in ctx). */
+    /* Stage 1: AEC. aec_out is the standalone limiter-processed return;
+     * downstream NR/RES uses ctx.error_spec, the reconstructing WOLA frame
+     * formed before that limiter. */
     aec_process(p->aec, p->mic_buf, p->ref_buf, p->aec_out);
 
     if (p->aec_only) {
@@ -757,7 +759,8 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
         }
     }
 
-    /* irfft -> sqrt-Hann OLA -> output one hop. */
+    /* ctx.error_spec already contains the matching sqrt-Hann analysis frame;
+     * complete the 50%-overlap WOLA with one IFFT + synthesis + OLA. */
     fft_inverse(p->fft, p->spec, p->ifft_buf);
     for (int k = 0; k < frame_sz; k++) p->ola[k] += p->ifft_buf[k] * p->synth_win[k];
     memcpy(p->out_buf, p->ola, (size_t)hop * sizeof(float));

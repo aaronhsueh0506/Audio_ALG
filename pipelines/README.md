@@ -32,8 +32,10 @@ RES is not a standalone module/library — it is exposed as the `AecResContext` 
 the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process()`
 (or the streaming `aec_analyze_render()` / `aec_process_capture()` pair) still computes the
 AEC3 post-filter's residual-echo suppression internals but does not apply them to the time
-output; `aec_get_res_context(a, &ctx)` then exposes `AecResContext` — `echo_spec`, `error_spec`,
-`res_gain` (G_res(f)), `r2` (residual-echo PSD), `comfort_noise`, etc. — so an external caller
+output; `aec_get_res_context(a, &ctx)` then exposes `AecResContext` — the
+reconstructing 50%-overlap WOLA `error_spec`, its matching `echo_spec` /
+`near_spec`, `formed_hop`, `res_gain` (G_res(f)), `r2` (residual-echo PSD),
+`comfort_noise`, etc. — so an external caller
 can run AEC(linear) → NR → RES itself. See `lib/aec/c_impl/include/aec.h` (`AecResContext`,
 `aec_get_res_context()`) for the full field list.
 
@@ -143,7 +145,7 @@ uses it when the corresponding NR output becomes available.
 make                # libs (BACKEND=kiss) + aec_nr_pipeline + aec_nr_pipeline_static
 make SIMD=0         # one switch: mono pipeline + AEC + NR + audio_common all scalar
 
-# Binaries land in a config-keyed dir (round-3 review B01):
+# Binaries land in a config-keyed directory:
 #   bin/<backend>-<config-hash>/  — resolve it with `make print-bin-dir`
 # (same flags as your build), or use `make publish` for the stable
 # dist/<backend>/current/ handoff path.
@@ -158,7 +160,7 @@ BIN="$(make -s print-bin-dir)"
 "$BIN"/aec_nr_pipeline_static mic.wav ref.wav output.wav balanced
 "$BIN"/aec_nr_pipeline_static --print-mem-size --sample-rate 16000
 
-# Run the audio_pipeline.h library's own acceptance tests (F20/R08/R09/B06/§7.3) —
+# Run the audio_pipeline.h library's own acceptance tests —
 # create-vs-init byte equality (incl. a poisoned pool), destroy idempotence,
 # misaligned/undersized pool rejection, sample-rate whitelist rejection,
 # AudioPipelineConfig reject-first validation (bad enum/bool fields),
@@ -274,16 +276,14 @@ always compiles fresh objects into a fresh directory instead of reusing a
 stale `.o`. Two builds with different flags/backends can even coexist or run
 concurrently in the same worktree without stomping each other's objects.
 
-### Unified FP-contraction policy (round-3 review B04)
+### Unified FP-contraction policy
 
 `-ffp-contract=off` is a **unified policy spanning all four repos**
 (`audio_common`, `lib/nr`, `lib/aec`, this `pipelines/` Makefile): every TU
 each Makefile compiles — own sources and vendored KISS/NE10 alike — builds
 with the flag, appended LAST in the `CFLAGS`/`LIB_CFLAGS` assembly (after
 `-DAUDIO_PIPELINE_BACKEND_STR`, `EXTRA_CFLAGS`, `WERROR`) so nothing can
-override it — this Makefile used to carry the flag as the *fourth* token of
-the base `CFLAGS` assignment (before `EXTRA_CFLAGS` was folded in), which
-this review moved to its current trailing position. `EXTRA_CFLAGS` (or a
+override it. `EXTRA_CFLAGS` (or a
 `CFLAGS=` override) containing `-Ofast`/`-ffast-math`/`-ffp-contract=<any>`
 is rejected at parse time:
 
@@ -372,7 +372,7 @@ I/O + the `--print-mem-size`/`--debug`/`DUMP_CTX` diagnostics) — see
 or `aec_nr_pipeline.c` for the heap-convenience flavor
 (`audio_pipeline_create()`).
 
-**Reference example** (round-3 review B02/R04):
+**Reference example**:
 [`example_board_adapter.c`](example_board_adapter.c) is a compilable,
 runnable HOST SIMULATION of the sequence below — a `board_mem` module
 standing in for a platform memory manager, the query→alloc→init_ex→
@@ -380,14 +380,14 @@ process→reset→process→destroy→free flow (run twice on the same static
 arena, proving pool reusability), and the negative demonstrations
 (undersized/misaligned pool, tampered descriptor, double-destroy, pool
 usable after a rejected init). Build + run it with `make example-adapter`
-(also wired into `make test`). **This example does NOT replace the real
-board adapter review** — the actual platform adapter source, memory-manager
+(also wired into `make test`). **This example does NOT replace production
+board integration and sign-off** — the actual platform adapter source, memory-manager
 implementation, build command, and final link map for the real target must
 still be authored and submitted for sign-off; every `board_mem_*` function
 in that file is a plain host-array stand-in, marked `// BOARD:` wherever
 real platform code belongs instead.
 
-### Cross-compile / board build (round-4 review P1-2)
+### Cross-compile / board build
 
 The board deliverable is built with `make publish BACKEND=ne10` and consumed
 from the stable `dist/ne10/current/` path — immutable, content-addressed
@@ -397,7 +397,7 @@ republish, and it deliberately carries no commit/date so the same release
 id always has the same MANIFEST bytes) and the append-only `ATTEST/`
 directory records provenance.
 
-`ATTEST/` is **one-event-one-file** (round-6 review): exactly one new
+`ATTEST/` is **one-event-one-file**: exactly one new
 `attest-<utc>-<commit>[-dirty]-<seq>.txt` per publish event, including
 idempotent republishes of an already-published release. The file is
 installed atomically with a write-temp + `link(2)` no-clobber step (the
@@ -409,8 +409,8 @@ Each attestation's `event_id` is embedded inside the file, and it records a
 three producers** (audio_common, lib/aec, lib/nr) — "which exact checkout
 of the whole stack published this" lives here, not in MANIFEST.
 
-`publish` **refuses by default** (round-6 review, split into two
-independent dimensions by round-7) when this repo or any of the three
+`publish` **refuses by default**, checking tracked and untracked state as
+two independent dimensions, when this repo or any of the three
 producers (a) has uncommitted **tracked** changes, (b) contains **any
 untracked, non-ignored file** (gitignored build output is excluded by
 design and is never part of this provenance), or (c) isn't a git checkout
@@ -446,11 +446,11 @@ publish here (neither the refusal nor the provenance hash) — this working
 tree permanently carries those two directories as user-owned content that
 is never staged for a release. The three producers get **no such
 whitelist**: an untracked file there is always a violation. (Splitting
-tracked/untracked into two independent dimensions also fixed a round-6
+Splitting tracked/untracked into two independent dimensions also fixed a
 asymmetry: the three producers used to fold untracked files into the
 SAME dirty check as tracked changes — `git status --porcelain`, no `-uno`
 — so an untracked producer file made `ALLOW_DIRTY_PUBLISH=1` the only
-override, with no separate provenance trail for it. Round-7 gives every
+override, with no separate provenance trail for it. The current design gives every
 one of the four repos the identical tracked-only `-uno` check plus its own
 untracked check, so the two kinds of deviation are never conflated for
 anyone, and only this repo's untracked dimension carries the whitelist.)
@@ -462,7 +462,7 @@ as tamper-proof under an attacker model. `MANIFEST.txt` byte-verification
 check; `ATTEST/` is the provenance log.
 
 `make -n|-q|-t ... publish` (dry-run / question / touch mode) is fully
-zero-write (round-6 review, `-t` tightened by round-7) — each flag takes a
+zero-write — each flag takes a
 different path, but none of the three ever create `dist/`, take the
 publish lock, stage/attest anything, or change an artifact's mtime. This
 also holds for **combined** flags (e.g. `-nt`, `-tq`, `-nqt`): `-t` is
@@ -478,7 +478,7 @@ phony, so it always would run — with no output and no recursion); `-t`
 (alone or combined) is an **explicit no-op**: one note printed to stdout
 and exit 0, with no recursion (recursing here used to let plain `touch`
 semantics bump this repo's own build-artifact mtimes — a real write —
-before round-7 special-cased it). `OBJ_ROOT=`/`BIN_ROOT=` relocate this
+before `-t` was special-cased). `OBJ_ROOT=`/`BIN_ROOT=` relocate this
 repo's own keyed obj/bin build trees (default: `obj/`/`bin/` here,
 byte-identical to the previous hardcoded paths) — like `DIST_ROOT=`, these
 are isolation-test knobs for running scratch-directory builds, not part of
@@ -503,7 +503,7 @@ make publish BACKEND=ne10 \
      EXTRA_CFLAGS='-mcpu=cortex-a53'      # or -mcpu=cortex-a73
 ```
 
-Guard rails (all four repos, round-4 review):
+Guard rails (all four repos):
 
 - **CC/CXX target-coherence check**: every BACKEND=ne10 build compares
   `$(CC) -dumpmachine` against `$(CXX) -dumpmachine` and hard-fails on
@@ -514,7 +514,7 @@ Guard rails (all four repos, round-4 review):
   repo-pinned flags (`-ffp-contract=off`, backend defines, `NO_STDIO`); the
   build errors out and points at `EXTRA_CFLAGS`/`EXTRA_LDFLAGS`, the two
   supported hooks. `EXTRA_CFLAGS` containing `-Ofast`/`-ffast-math`/
-  `-ffp-contract=` is likewise rejected (FP-policy conflict, round-3 B04).
+  `-ffp-contract=` is likewise rejected by the FP-policy conflict gate.
 - **C++ runtime comes from the C++ driver** (`libstdc++` on GNU/Linux gcc,
   `libc++` on macOS/clang) — there is no hardcoded `-lc++` anywhere any
   more, so GNU toolchains link cleanly.
@@ -621,11 +621,11 @@ Guard rails (all four repos, round-4 review):
 
 ### Descriptor semantics (`AudioPipelineMemReq`)
 
-Descriptor V2 (review B06): every field is a fixed-width integer
+Descriptor V2: every field is a fixed-width integer
 (`uint32_t`/`uint64_t`, never `size_t` or a pointer), and the struct is
 pinned to a stable, `_Static_assert`-enforced **32-byte** layout — see
 "Serializing the descriptor" below for what that does (and does not) buy
-you. This is a **BREAKING** change from the original (F20) descriptor shape
+you. This is a **BREAKING** change from the original descriptor shape
 (`{size_t bytes; size_t alignment; uint32_t layout_version; const char*
 backend; uint32_t build_flags_hash;}`); every caller in this repo has been
 updated, there is no compatibility shim.
@@ -634,7 +634,7 @@ updated, there is no compatibility shim.
 |-------|---------|
 | `descriptor_version` | This STRUCT's own ABI version — `AUDIO_PIPELINE_DESCRIPTOR_VERSION` (currently `2`). Bumped only when `AudioPipelineMemReq`'s field set/order/width changes, independent of `layout_version` below (which tracks THIS FILE's carve layout, not the descriptor struct's own shape). `audio_pipeline_init_ex()` checks this FIRST, before interpreting any other field. |
 | `layout_version` | Bumped whenever `audio_pipeline.c`'s OWN carve order/buffer set/sizing formula changes — i.e. whenever a `bytes` figure computed by an older build would misdescribe a newer build's actual carve, or vice versa. Starts at 1. Does **not** need bumping for a change purely inside AEC's/NR's/an FFT backend's own internal `_get_mem_size` layout (each is consumed as one opaque composite blob here, same as the pre-F20 static CLI already treated them — a stale cached `bytes` from an old submodule build is still caught by the undersized-pool rejection at init). |
-| `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_KISS` (1) or `AUDIO_PIPELINE_BACKEND_NE10` (2) (matches this Makefile's `BACKEND=`). Replaces the F20 `const char* backend` field — a process-local rodata pointer can't be serialized, and comparing it required `strcmp` against caller-supplied data at a trust boundary; `backend_id` is compared with a plain integer `==` instead. The two backends are still not byte-identical to each other (pre-existing, expected — see `lib/aec/CLAUDE.md`); a descriptor from one is never valid for the other even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
+| `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_KISS` (1) or `AUDIO_PIPELINE_BACKEND_NE10` (2) (matches this Makefile's `BACKEND=`). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. The two backends are not byte-identical to each other; a descriptor from one is never valid for the other even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
 | `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 12 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
 | `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, both FFT backends, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
 | `reserved` | Always 0. Exists only so `bytes` (a `uint64_t`) lands on an 8-byte-aligned offset within the struct with no compiler-inserted padding — part of the fixed 32-byte layout, not a field to read or write. |

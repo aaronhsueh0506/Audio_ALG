@@ -33,7 +33,11 @@ Hard invariants:
   it is never selected by default.
 
 The external beamformer must expose its effective complex weights with shape
-`[4, n_freqs]`. The Python reference also accepts the external mono hop. The C
+`[4, n_freqs]`. `linear_spectra` are reconstructing 50%-overlap sqrt-Hann
+STFT frames and can be consumed directly without four duplicate FFTs.
+`linear_interleaved` contains the exact selected/crossfaded time-domain hops
+underlying those spectra for integrations whose beamformer owns its four
+analysis FFTs. The Python reference also accepts the external mono hop. The C
 core API synthesizes the mono spectrum internally from the supplied weights,
 so independently supplied output samples and context cannot come from
 different beamformer states. The complete C wrapper can safely skip that one
@@ -42,7 +46,10 @@ and effective weights atomically in the same call; the internal-only trusted
 seam is not exposed to external beamformers. The far-end spectrum remains the
 one shared digital render reference—it is verified equal across lanes and is
 not spatially weighted. The result passes through one mono NR+RES path without
-a fifth AEC.
+a fifth AEC or replicated post-filters. When `pre.delay.changed` is non-zero, an
+external beamformer that owns STFT/OLA state must clear that overlap state
+before consuming the frame. The built-in post stage clears its mono synthesis
+overlap automatically.
 
 ## C API
 
@@ -120,9 +127,10 @@ pipeline = four_aec_nr_res_create(&cfg);
 /* microphones is interleaved [hop][4], reference is [hop]. */
 four_aec_nr_res_process_pre(pipeline, microphones, reference, &pre);
 
-/* External SRP-PHAT/GSC updates channel-major Complex[4][n_freqs].
+/* External SRP-PHAT/GSC consumes pre.linear_spectra and updates
+ * channel-major Complex[4][n_freqs].
  * Convention: out[k] = sum(weights[ch,k] * in[ch,k]); no conjugation. */
-external_srp_gsc_update(pre.linear_interleaved, weights);
+external_srp_gsc_update(pre.linear_spectra, weights);
 
 four_aec_nr_res_process_post(pipeline, &pre.token, weights, mono_output);
 four_aec_nr_res_destroy(pipeline);

@@ -307,6 +307,7 @@ def _snapshot_context(context: AecResContext) -> AecResContext:
     return replace(
         context,
         raw_output=copied(context.raw_output),
+        formed_output=copied(context.formed_output),
         echo_spec=copied(context.echo_spec),
         far_spec=copied(context.far_spec),
         near_spec=copied(context.near_spec),
@@ -401,6 +402,7 @@ def _fuse_contexts(
 
     return AecResContext(
         raw_output=samples.copy(),
+        formed_output=samples.copy(),
         echo_spec=echo_spec.astype(np.complex64),
         far_power=shared_far_power,
         far_spec=far_spec.astype(np.complex64),
@@ -660,8 +662,14 @@ class FourChannelAecPipeline:
             result = lane.process(microphones[:, channel], aligned_render)
             if not isinstance(result, tuple) or len(result) != 2:
                 raise RuntimeError("linear AEC lane did not return its RES context")
-            lane_output, context = result
-            lane_outputs[channel] = np.asarray(lane_output, dtype=np.float32)
+            _lane_output, context = result
+            # Keep the time-domain beamformer seam identical to the source of
+            # context.error_spec, including refined/coarse selection and its
+            # transition. The standalone AEC return is limiter-processed and
+            # is not the analysis signal represented by that spectrum.
+            lane_outputs[channel] = np.asarray(
+                context.formed_output, dtype=np.float32
+            )
             contexts.append(_snapshot_context(context))
 
         frame = PreBeamformerFrame(

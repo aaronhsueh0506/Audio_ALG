@@ -65,6 +65,57 @@ def test_one_hop_is_finite_and_exports_post_beam_context():
     assert np.all((0.0 <= result.context.res_gain) & (result.context.res_gain <= 1.0))
 
 
+@pytest.mark.parametrize(
+    "sample_rate,frame_size", [(16000, 256), (16000, 512), (48000, 1024)]
+)
+def test_pre_beamformer_context_is_reconstructing_wola(sample_rate, frame_size):
+    hop = frame_size // 2
+    pipeline = FourChannelAecPipeline(
+        FourChannelAecConfig(
+            sample_rate=sample_rate,
+            frame_size=frame_size,
+            hop_size=hop,
+        )
+    )
+    index = np.arange(frame_size, dtype=np.float64)
+    window = np.sqrt(
+        0.5 * (1.0 - np.cos(2.0 * np.pi * index / float(frame_size)))
+    ).astype(np.float32)
+    previous = np.zeros((4, hop), dtype=np.float32)
+    rng = np.random.default_rng(23)
+
+    for _ in range(12):
+        render = (0.03 * rng.standard_normal(hop)).astype(np.float32)
+        microphones = np.stack(
+            [
+                (0.35 + 0.05 * channel) * render
+                + (0.002 * rng.standard_normal(hop)).astype(np.float32)
+                for channel in range(4)
+            ],
+            axis=1,
+        ).astype(np.float32)
+        pre = pipeline.process_pre_beamformer(microphones, render)
+        if pre.delay.changed:
+            previous.fill(0.0)
+        for channel, context in enumerate(pre.contexts):
+            formed = np.asarray(context.formed_output, dtype=np.float32)
+            expected = np.fft.rfft(
+                np.concatenate((previous[channel], formed)) * window,
+                n=frame_size,
+            ).astype(np.complex64)
+            np.testing.assert_allclose(
+                context.error_spec, expected, rtol=0, atol=1e-6
+            )
+            np.testing.assert_allclose(
+                context.near_spec,
+                context.error_spec + context.echo_spec,
+                rtol=0,
+                atol=1e-6,
+            )
+            np.testing.assert_array_equal(pre.linear_hops[channel], formed)
+            previous[channel] = formed.copy()
+
+
 def test_shared_far_reference_survives_zero_sum_beamformer_weights():
     pipeline = FourChannelAecPipeline(
         FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)

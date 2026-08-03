@@ -88,7 +88,7 @@ Unequal-rate input/output buffers must not overlap; equal-rate conversion is an 
 
 ### Purpose
 
-Single-channel (1 mic + 1 far-end reference) AEC. Two implementations of the same algorithm: `python/` is the fp64 algorithm spec (AEC3-aligned architecture — PBFDKF main filter + PBFDAF shadow filter + `PathChangeRegimeHandler` + AEC3-style post-filter chain), `c_impl/` is the float32 production port. Python↔C parity is tolerance-based, not bit-exact. Current production version is `__version__ = "3.24.1"` in `python/aec.py`; `AEC/CLAUDE.md` documents the fuller architecture.
+Single-channel (1 mic + 1 far-end reference) AEC. Two implementations of the same algorithm: `python/` is the algorithm reference (AEC3-aligned architecture — PBFDKF main filter + PBFDAF shadow filter + `PathChangeRegimeHandler` + AEC3-style post-filter chain), `c_impl/` is the float32 production port. Python↔C parity is tolerance-based, not bit-exact. Current production version is `__version__ = "3.24.1"` in `python/aec.py`; `AEC/docs/aec_methods.md` documents the architecture.
 
 ### Current default configuration
 
@@ -298,9 +298,10 @@ Wires the standalone `AEC` and `NR` libraries (git submodules `lib/aec`, `lib/nr
 
 ### Current default configuration
 
-As of 2026-08-03, **all three pipeline entry points now agree with AEC/NR's own defaults**: 16 kHz → 256/128 (8 ms hop), 48 kHz → 1024/512. This required two separate fixes this session:
-- `4ch_pipelines/4aec_nr_res.c`'s `derive_dims_and_configs()` had its own independent hardcoded 512 default at 16 kHz — fixed.
-- The mono pipeline's `pipelines/pipeline_dims.h` (`compute_frame_dims()`, used by `audio_pipeline_default_config()`) and `aec_nr_pipeline.py`'s `_project_grid()` both also independently hardcoded 512 at 16 kHz — fixed in the same pass. 512 remains a supported, explicit alternate everywhere.
+All three pipeline entry points use the same defaults as AEC/NR: 16 kHz →
+256/128 (8 ms hop), 48 kHz → 1024/512. The 16 kHz 512/256 grid remains a
+supported explicit alternative. Grid validation is shared across the public
+entry points so an unsupported combination is rejected consistently.
 
 ### Public API
 
@@ -366,13 +367,14 @@ FourAecNrRes* p = four_aec_nr_res_create(&cfg);
 
 FourAecNrResPreFrame pre;
 four_aec_nr_res_process_pre(p, mics_interleaved, ref, &pre);
-/* external SRP-PHAT/GSC consumes pre.linear_spectra[4][n_freqs], produces weights[4][n_freqs] */
+/* pre.linear_spectra are the 50%-overlap sqrt-Hann analysis frames;
+ * external SRP-PHAT/GSC consumes them and produces weights[4][n_freqs]. */
 four_aec_nr_res_process_post(p, &pre.token, weights, out);
 
 four_aec_nr_res_destroy(p);
 ```
 
-**DOA / SRP-PHAT** (`4ch_pipelines/third_party/doa/srp.c`): steered-response-power PHAT direction-of-arrival estimator. `srp_create()`/`srp_create_from_geometry()` build per-angle steering vectors; `srp(SRP*, Complex** X, const int* mask)` scores every candidate angle from the cross-spectrum PHAT weighting; `srp2doa()`/`doa_step()` reduce to a DOA estimate. Partially optimized this session to a band-limited PHAT computation (restricted to `[f_start, f_end]`, the configured search band — a real cut in the hot loop). **Known follow-up:** steering-vector precompute (`pair_steer`) and the `score_scratch`/`best_score` buffers are still allocated and cleared full-band every frame — only the runtime accumulate loop was narrowed.
+**DOA / SRP-PHAT** (`4ch_pipelines/third_party/doa/srp.c`): steered-response-power PHAT direction-of-arrival estimator. `srp_create()`/`srp_create_from_geometry()` build per-angle steering vectors; `srp(SRP*, Complex** X, const int* mask)` scores every candidate angle from the cross-spectrum PHAT weighting; `srp2doa()`/`doa_step()` reduce to a DOA estimate. PHAT accumulation is restricted to `[f_start, f_end]`, the configured search band. **Known follow-up:** steering-vector precompute (`pair_steer`) and the `score_scratch`/`best_score` buffers are still allocated and cleared full-band every frame.
 
 **GSC beamformer** (`4ch_pipelines/third_party/GSC/gsc.h`): generalized sidelobe canceller — `gsc_create()`, `gsc_process()`/`gsc_process_with_weights()`, `gsc_reset()`, `gsc_destroy()`. Supports fixed-beam and adaptive (RLS) modes.
 

@@ -10,8 +10,8 @@
  * error handling, and the memory-descriptor contract described in
  * pipelines/README.md's "Board Integration" section — nothing more.
  *
- * It does NOT replace the real board adapter review. Per review R04/B02,
- * the actual platform adapter source, the real memory-manager
+ * It does NOT replace production board integration and sign-off. The actual
+ * platform adapter source, the real memory-manager
  * implementation (allocator, cache/DMA coherence handling, power-state
  * behaviour), the build command used to compile it for-target, and the
  * final link map still have to be authored for the real target and
@@ -392,7 +392,7 @@ static int run_negative_demonstrations(void) {
 
 int main(void) {
     printf("example_board_adapter -- REFERENCE ONLY host simulation.\n");
-    printf("Does NOT replace the real board adapter review (R04/B02): the actual\n");
+    printf("Does NOT replace production board integration: the actual\n");
     printf("adapter source, memory-manager implementation, build command, and\n");
     printf("final link map for the real target must still be submitted for sign-off.\n\n");
 

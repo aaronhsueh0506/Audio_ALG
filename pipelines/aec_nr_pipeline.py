@@ -74,8 +74,16 @@ def run_aec_classic(mic_signal: np.ndarray, ref_signal: np.ndarray,
 
 
 def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
-                   config: AecConfig) -> Tuple[np.ndarray, List[AecResContext]]:
-    """Run AEC without RES, returning per-frame context for external RES."""
+                   config: AecConfig, *,
+                   standalone_time_output: bool = False,
+                   ) -> Tuple[np.ndarray, List[AecResContext]]:
+    """Run AEC without RES, returning per-frame context for external RES.
+
+    By default the time output is the reconstructing WOLA hop underlying
+    ``ctx.error_spec``.  ``standalone_time_output=True`` instead returns the
+    limiter-processed linear AEC hop, matching the C pipeline's ``aec_only``
+    path; the frequency-domain context is unchanged.
+    """
     config.enable_res = False
     config.return_res_context = True
     aec = AEC(config)
@@ -86,8 +94,11 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
 
     for i in range(0, min_len - hop + 1, hop):
         result = aec.process(mic_signal[i:i + hop], ref_signal[i:i + hop])
-        out, ctx = result
-        output[i:i + hop] = out
+        _out, ctx = result
+        # The external WOLA seam may select/crossfade the shadow output.  The
+        # full pipeline needs the exact formed hop underlying ctx.error_spec;
+        # AEC-only instead mirrors C and returns the standalone limiter output.
+        output[i:i + hop] = _out if standalone_time_output else ctx.formed_output
         contexts.append(ctx)
 
     print(f"  AEC ERLE: {aec.get_erle():.1f} dB  ({len(contexts)} frames)")
@@ -112,7 +123,7 @@ _NR_YAML_CONFIG = os.path.join(_ROOT, 'lib', 'nr', 'config', 'v3_2_config.yaml')
 # noise) -- see _build_denoiser()'s docstring for the full derivation of 94.
 _NR_L_MINIMA_WINDOW = 94
 
-# Production recipe (2026-06-23 AEC+NR re-review). On top of A_min_pl's
+# Production recipe. On top of A_min_pl's
 # min(G_nr, G_res), two changes — validated 800-case (echo FS +0.12~0.15,
 # DT BAK +0.06~0.07, NE protected, all ship bars pass, default-OFF byte-equal):
 #   1. UNIFIED gain: fold the AEC residual-echo PSD R²(f) into the OM-LSA noise
@@ -580,7 +591,10 @@ Switches:
     # noise; the AEC's own near-end-aware AEC3 echo gain G_res handles echo; the
     # per-bin min keeps both without the product's double-talk double-cut.
     print("Stage 1: AEC (linear, no RES)...")
-    aec_output, contexts = run_aec_linear(mic_signal, ref_signal, aec_config)
+    aec_output, contexts = run_aec_linear(
+        mic_signal, ref_signal, aec_config,
+        standalone_time_output=args.aec_only,
+    )
 
     if args.aec_only:
         final_output = aec_output
