@@ -159,7 +159,13 @@ size_t gsc_get_mem_size(int M, int F) {
      * full-blocking-matrix baseline is compiled in instead of the default
      * projection-form path -- see GSC_USE_PROJECTION_BLOCKING above). */
     {
-        size_t scratch_count = ck_mul_size((size_t)(M + 3), (size_t)F);
+        /* (size_t)M + 3, not (size_t)(M + 3): the latter computes M + 3 in
+         * `int` arithmetic before the cast, which is signed-overflow UB if a
+         * caller ever passes M within 3 of INT_MAX (M is always the fixed
+         * channel count in practice, but this is a public entry point).
+         * (size_t)M + 3 promotes M to size_t (safe: M > 0 is already
+         * checked above) before the add, so it can never overflow. */
+        size_t scratch_count = ck_mul_size((size_t)M + 3, (size_t)F);
 #if !GSC_USE_PROJECTION_BLOCKING
         scratch_count =
             ck_add_size(scratch_count, ck_mul_size(fM, (size_t)M));
@@ -265,7 +271,7 @@ GSC* gsc_init(void* mem, size_t mem_size, int M, int F,
      * pointer arithmetic copied verbatim from the previous calloc'd
      * version. */
     {
-        size_t count = (size_t)(M + 3) * (size_t)F;
+        size_t count = ((size_t)M + 3) * (size_t)F;   /* see gsc_get_mem_size() */
 #if !GSC_USE_PROJECTION_BLOCKING
         count += fM * (size_t)M;
 #endif
