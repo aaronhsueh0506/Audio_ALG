@@ -54,9 +54,14 @@ static int print_mem_budget(const AudioPipeline4ChConfig* cfg) {
 
     printf("Memory Budget (complete 4ch pipeline: core + SRP-PHAT + GSC)\n");
     printf("=============================================================\n");
+    /* cfg->core.fft_size may be the unresolved 0 sentinel (caller didn't
+     * override --fft-size); print the grid that will actually be used,
+     * matching audio_pipeline_4ch_raw.c's print_mem_budget(). */
     printf("  sample_rate=%d fft=%d geometry=%d num_angles=%d\n",
-           cfg->core.sample_rate, cfg->core.fft_size, (int)cfg->geometry,
-           cfg->num_angles);
+           cfg->core.sample_rate,
+           cfg->core.fft_size ? cfg->core.fft_size
+                              : (cfg->core.sample_rate == 16000 ? 256 : 1024),
+           (int)cfg->geometry, cfg->num_angles);
     printf("  Total:          %9llu bytes (%7.1f KB)\n",
            (unsigned long long)req.bytes, (float)req.bytes / 1024.0f);
     printf("  Descriptor:     descriptor_version=%u alignment=%u "
@@ -197,14 +202,40 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    /* === Processing loop === */
+    /* === Processing loop ===
+     * Uses process_with_activity() with an explicit, product-VAD-style
+     * schedule instead of process()'s auto-VAD fallback: a short warmup
+     * with vad_raw=vad_out=1 (SRP locks a DOA while GSC stays frozen, as
+     * it would during genuine target speech), then vad_raw=1/vad_out=0 for
+     * the remainder (SRP keeps observing so the DOA stays valid, while GSC
+     * -- which by design only adapts while vad_out==0 AND a valid DOA
+     * exists, see gsc.c's DOA-logic comment -- gets a real chance to run).
+     * vad_raw/vad_out are DECOUPLED parameters here (unlike process()'s
+     * auto-VAD fallback, which always passes the same value for both), so
+     * this reaches a state process()'s own slow noise-floor-tracking EMA
+     * would take hundreds of frames to reach on a sustained tone. Also
+     * demonstrates the entry point this header recommends for production
+     * integrations that own a VAD. 40 post-warmup frames is long enough to
+     * see doa_update_interval's periodic SRP refresh (default 2) lock in
+     * and GSC's RLS update (gsc_adapt_interval, default 1) actually run --
+     * a short 6-frame run only ever sampled the LAST frame's diagnostics,
+     * which could land on an off-interval (deliberately NaN doa_raw, see
+     * srp.c) frame and never actually prove SRP/GSC reached a valid
+     * adaptive state, just that the pool lifecycle didn't crash. */
+    const int warmup_frames = 8;
+    const int total_frames = warmup_frames + 40;
     int frame;
-    for (frame = 0; frame < 6; ++frame) {
+    int saw_finite_doa_raw = 0;
+    int saw_gsc_adaptive = 0;
+    for (frame = 0; frame < total_frames; ++frame) {
         AudioPipeline4ChFrameInfo info;
+        int vad_active = frame < warmup_frames ? 1 : 0;
         fill_hop(mic_buf, ref_buf, hop, sample_rate, frame);
-        if (audio_pipeline_4ch_process(p, mic_buf, ref_buf, out_buf, &info) !=
-            0) {
-            fprintf(stderr, "Error: audio_pipeline_4ch_process failed\n");
+        if (audio_pipeline_4ch_process_with_activity(
+                p, mic_buf, ref_buf, /*vad_raw=*/1, /*vad_out=*/vad_active,
+                NULL, out_buf, &info) != 0) {
+            fprintf(stderr,
+                    "Error: audio_pipeline_4ch_process_with_activity failed\n");
             audio_pipeline_4ch_destroy(p);
             free(pool);
             free(mic_buf);
@@ -224,8 +255,10 @@ int main(int argc, char* argv[]) {
                 return 1;
             }
         }
-        if (frame == 5) {
-            printf("doa_raw=%.4f doa_smooth=%.4f doa_used=%.4f "
+        if (isfinite(info.doa_raw_rad)) saw_finite_doa_raw = 1;
+        if (info.gsc_adaptive) saw_gsc_adaptive = 1;
+        if (frame == total_frames - 1) {
+            printf("final frame: doa_raw=%.4f doa_smooth=%.4f doa_used=%.4f "
                    "vad_out=%d gsc_adaptive=%d\n",
                    info.doa_raw_rad, info.doa_smooth_rad, info.doa_used_rad,
                    info.vad_out, info.gsc_adaptive);
@@ -233,6 +266,24 @@ int main(int argc, char* argv[]) {
     }
 
     printf("Processed: %d frames (%d samples)\n", frame, frame * hop);
+    printf("  saw a finite doa_raw at least once: %s\n",
+           saw_finite_doa_raw ? "yes" : "no");
+    printf("  saw gsc_adaptive=1 at least once:   %s\n",
+           saw_gsc_adaptive ? "yes" : "no");
+    if (!saw_finite_doa_raw || !saw_gsc_adaptive) {
+        fprintf(stderr,
+                "Error: SRP/GSC never reached the expected adaptive state "
+                "over %d frames (finite doa_raw=%d, gsc_adaptive=%d) -- "
+                "the pipeline ran without crashing, but that alone does "
+                "not prove SRP-PHAT/GSC actually did anything\n",
+                frame, saw_finite_doa_raw, saw_gsc_adaptive);
+        audio_pipeline_4ch_destroy(p);
+        free(pool);
+        free(mic_buf);
+        free(ref_buf);
+        free(out_buf);
+        return 1;
+    }
     printf("audio_pipeline_4ch_static: smoke PASS\n");
 
     /* === Cleanup === */
