@@ -163,7 +163,7 @@ else
     fi
 fi
 
-# Prior (round-5) behaviour must not regress: a plain command-line
+# Prior behaviour must not regress: a plain command-line
 # CFLAGS=/FP_POLICY= override was already rejected before this fix (a
 # different Make origin, "command line", which is position-independent and
 # was never the bug) -- confirm both still fail.

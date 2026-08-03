@@ -283,7 +283,7 @@ python3 export_erb_matrix.py --config config.ini --format all
 ## 表格 drift-guard(C 部署表格的兩層契約)
 
 `rnnoise_tables_gen.h` 的編譯期常數表(ERB fwd/inv、nfftborder、Hann window)
-有兩層 drift 契約(round-3 審查 B09;round-4 P2-4 接進 make):
+有兩層 drift 契約(已接進 `make test-tables`):
 
 ```bash
 make test-tables   # 兩層都建置+執行,任一 FAIL 即非零退出
