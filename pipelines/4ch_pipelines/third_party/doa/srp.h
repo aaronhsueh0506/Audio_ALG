@@ -1,6 +1,7 @@
 #ifndef SRP_H
 #define SRP_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "fft_wrapper.h"
@@ -85,6 +86,13 @@ struct SRP {
     Complex** pair_phat;     /* [num_pairs][F], one frame scratch */
     float* score_scratch;         /* [F], one candidate angle */
     float* best_score;            /* [F], best candidate seen so far */
+
+    /* NULL on the pool-carved path (srp_init()) -- the caller owns the pool
+     * and srp_destroy() must not free it. Set to the posix_memalign'd block
+     * on the heap-convenience path (srp_create_from_geometry()), which
+     * carves an SRP out of it via srp_init() the same way the pool path
+     * does. */
+    void* owned_heap;
 };
 
 /* ===================== angle / steering API ===================== */
@@ -103,13 +111,21 @@ void srp_destroy_steering(
 /*helper*/
 int srp_angle_to_index(SRP* s, float doa_rad);
 
-/* ===================== SRP create ===================== */
-SRP* srp_create(
-    const SRP_Config* cfg,
-    float* angles,
-    Complex*** a_array
-);
+/* ===================== SRP pool-first create ===================== */
+/* srp_get_mem_size() returns the total byte requirement; caller allocates
+ * once (16-byte aligned). srp_init() places the SRP struct at mem[0] and
+ * carves every internal array out of the rest of the block; no malloc
+ * called. Returns NULL if cfg/geom are invalid, mem is misaligned, or
+ * mem_size is too small. */
+size_t srp_get_mem_size(const SRP_Config* cfg);
+SRP*   srp_init(void* mem, size_t mem_size,
+                const SRP_Config* cfg, const ArrayGeometry* geom);
 
+/* Heap convenience wrapper over srp_init(): posix_memalign's a 16-byte
+ * aligned pool sized by srp_get_mem_size(cfg), carves an SRP into it, and
+ * records the allocation on SRP::owned_heap so srp_destroy() knows to free
+ * it. Returns NULL on any allocation or validation failure (nothing leaks
+ * on that path either). */
 SRP* srp_create_from_geometry(
     const SRP_Config* cfg,
     const ArrayGeometry* geom

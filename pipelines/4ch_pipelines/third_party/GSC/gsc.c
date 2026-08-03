@@ -2,6 +2,7 @@
 #include <math.h>
 #include <string.h>
 #include "gsc.h"
+#include "mem_align.h"
 #include "../utility/complex.h"
 #include "../utility/spatial_simd.h"
 
@@ -96,21 +97,112 @@ int gsc_effective_adapt_interval(
     return effective;
 }
 
-/* ===================== create ===================== */
+/* ===================== pool-first memory layout ===================== */
 
-GSC* gsc_create(int M, int F, int num_angles,
-                Complex*** a_array,
-                const GSC_Config* cfg)
-{
+/*
+ * Bump allocator carving GSC's flat pool into typed sub-blocks. This is a
+ * private, file-local reimplementation of 4aec_nr_res.c's PoolCursor/
+ * pool_carve() helper (that file keeps its own copy file-private too, per
+ * its own header comment) -- not shared/exported -- so gsc_get_mem_size()
+ * and gsc_init() below carve in exact lockstep, the same relationship
+ * aec_get_mem_size()/aec_init() maintain in AEC/c_impl/src/aec.c.
+ */
+typedef struct PoolCursor {
+    uint8_t* ptr;
+    size_t remaining;
+} PoolCursor;
+
+static void* pool_carve(PoolCursor* cursor, size_t count,
+                        size_t element_size) {
+    size_t raw;
+    size_t aligned;
+    void* out;
+    if (!cursor || count == 0 || element_size == 0) return NULL;
+    raw = ck_mul_size(count, element_size);
+    aligned = ck_align16_size(raw);
+    if (MEM_SIZE_INVALID(raw) || MEM_SIZE_INVALID(aligned) ||
+        aligned > cursor->remaining) return NULL;
+    out = cursor->ptr;
+    cursor->ptr += aligned;
+    cursor->remaining -= aligned;
+    return out;
+}
+
+/*
+ * Total byte requirement for a GSC instance of shape (M, F). Deliberately
+ * independent of num_angles/cfg: neither affects GSC's own storage --
+ * num_angles only indexes into the caller-owned a_array (never carved from
+ * this pool), and cfg's fields are plain scalars copied straight into the
+ * struct. Carve order below MUST stay in lockstep with gsc_init()'s carve
+ * order.
+ */
+size_t gsc_get_mem_size(int M, int F) {
+    size_t total;
+    size_t fM;
+
+    if (M <= 0 || F <= 0) return 0;
+
+    total = ck_align16_size(sizeof(GSC));
+
+    /* P (F, M, M): Complex**[F] -> Complex*[F*M] -> Complex[F*M*M] */
+    total = ck_field_size(total, (size_t)F, sizeof(Complex**));
+    fM = ck_mul_size((size_t)F, (size_t)M);
+    total = ck_field_size(total, fM, sizeof(Complex*));
+    total = ck_field_size(total, ck_mul_size(fM, (size_t)M), sizeof(Complex));
+
+    /* wa (M, F): Complex*[M] -> Complex[M*F] */
+    total = ck_field_size(total, (size_t)M, sizeof(Complex*));
+    total = ck_field_size(
+        total, ck_mul_size((size_t)M, (size_t)F), sizeof(Complex));
+
+    /* scratch: flat Complex[(M+3)*F] (+ F*M*M only when the original
+     * full-blocking-matrix baseline is compiled in instead of the default
+     * projection-form path -- see GSC_USE_PROJECTION_BLOCKING above). */
+    {
+        size_t scratch_count = ck_mul_size((size_t)(M + 3), (size_t)F);
+#if !GSC_USE_PROJECTION_BLOCKING
+        scratch_count =
+            ck_add_size(scratch_count, ck_mul_size(fM, (size_t)M));
+#endif
+        total = ck_field_size(total, scratch_count, sizeof(Complex));
+    }
+
+    return MEM_SIZE_INVALID(total) ? 0 : total;
+}
+
+/*
+ * Caller-pool construction: places the GSC struct at mem[0] and carves every
+ * backing array (P/wa/scratch) out of the same block -- no malloc called.
+ * Applies the exact same validation gsc_create() below does. `a_array`
+ * remains a BORROWED pointer, exactly like gsc_create(): owned by the
+ * caller (typically SRP), never carved from this pool or freed here.
+ */
+GSC* gsc_init(void* mem, size_t mem_size, int M, int F,
+              int num_angles, Complex*** a_array,
+              const GSC_Config* cfg) {
     GSC* g;
-    if (!cfg || !a_array || M <= 0 || F <= 0 || num_angles <= 0 ||
+    PoolCursor cursor;
+    size_t need;
+    size_t fM;
+
+    if (!mem || !cfg || !a_array || M <= 0 || F <= 0 || num_angles <= 0 ||
         !isfinite(cfg->lambda) || cfg->lambda <= 0.0f ||
         cfg->lambda > 1.0f ||
         !isfinite(cfg->mu)) {
         return NULL;
     }
-    g = (GSC*)calloc(1, sizeof(GSC));
-    if (!g) return NULL;
+
+    need = gsc_get_mem_size(M, F);
+    if (need == 0 || !MEM_IS_ALIGNED16(mem) || mem_size < need) return NULL;
+
+    /* Only the region gsc_get_mem_size() actually budgeted is touched --
+     * a caller-supplied pool larger than `need` keeps any trailing bytes
+     * beyond it untouched (see test_gsc_init_pool_poison_and_bounds). */
+    memset(mem, 0, need);
+    g = (GSC*)mem;
+
+    cursor.ptr = (uint8_t*)mem + ck_align16_size(sizeof(GSC));
+    cursor.remaining = need - ck_align16_size(sizeof(GSC));
 
     g->enable = cfg->enable;
     g->M = M;
@@ -126,56 +218,59 @@ GSC* gsc_create(int M, int F, int num_angles,
     g->adapt_interval = gsc_effective_adapt_interval(
         g->enable_fix_mode, g->fixed_align_notebook, cfg->adapt_interval);
 
-    // allocate P (F,M,M)
-    g->P = (Complex***)calloc(F, sizeof(Complex**));
-    if (!g->P) {
-        gsc_destroy(g);
-        return NULL;
-    }
-    for (int f = 0; f < F; f++) {
-        g->P[f] = (Complex**)calloc(M, sizeof(Complex*));
-        if (!g->P[f]) {
-            gsc_destroy(g);
-            return NULL;
-        }
-        for (int i = 0; i < M; i++) {
-            g->P[f][i] =
-                (Complex*)malloc(M * sizeof(Complex));
-            if (!g->P[f][i]) {
-                gsc_destroy(g);
-                return NULL;
-            }
-            for (int j = 0; j < M; j++) {
-                g->P[f][i][j].r = (i == j);
-                g->P[f][i][j].i = 0;
+    fM = (size_t)F * (size_t)M;
+
+    /* P (F, M, M): pointer table -> mid pointer table -> flat data,
+     * identity-initialized -- same values the old nested-loop calloc/malloc
+     * version filled. */
+    {
+        Complex*** p_top = (Complex***)pool_carve(
+            &cursor, (size_t)F, sizeof(Complex**));
+        Complex** p_mid = (Complex**)pool_carve(
+            &cursor, fM, sizeof(Complex*));
+        Complex* p_data = (Complex*)pool_carve(
+            &cursor, fM * (size_t)M, sizeof(Complex));
+        if (!p_top || !p_mid || !p_data) return NULL;
+
+        g->P = p_top;
+        for (int f = 0; f < F; f++) {
+            g->P[f] = p_mid + (size_t)f * (size_t)M;
+            for (int i = 0; i < M; i++) {
+                g->P[f][i] =
+                    p_data + ((size_t)f * (size_t)M + (size_t)i) * (size_t)M;
+                for (int j = 0; j < M; j++) {
+                    g->P[f][i][j].r = (i == j);
+                    g->P[f][i][j].i = 0;
+                }
             }
         }
     }
 
-    // wa (M,F)
-    g->wa = (Complex**)calloc(M, sizeof(Complex*));
-    if (!g->wa) {
-        gsc_destroy(g);
-        return NULL;
-    }
-    for (int m = 0; m < M; m++) {
-        g->wa[m] = (Complex*)calloc(F, sizeof(Complex));
-        if (!g->wa[m]) {
-            gsc_destroy(g);
-            return NULL;
+    /* wa (M, F): pointer table -> flat data. Already zeroed by the memset
+     * above, matching the old calloc's zero-fill. */
+    {
+        Complex** wa_top = (Complex**)pool_carve(
+            &cursor, (size_t)M, sizeof(Complex*));
+        Complex* wa_data = (Complex*)pool_carve(
+            &cursor, fM, sizeof(Complex));
+        if (!wa_top || !wa_data) return NULL;
+
+        g->wa = wa_top;
+        for (int m = 0; m < M; m++) {
+            g->wa[m] = wa_data + (size_t)m * (size_t)F;
         }
     }
 
+    /* scratch: one flat block, already zeroed by the memset above --
+     * pointer arithmetic copied verbatim from the previous calloc'd
+     * version. */
     {
         size_t count = (size_t)(M + 3) * (size_t)F;
 #if !GSC_USE_PROJECTION_BLOCKING
-        count += (size_t)F * (size_t)M * (size_t)M;
+        count += fM * (size_t)M;
 #endif
-        g->scratch = (Complex*)calloc(count, sizeof(Complex));
-        if (!g->scratch) {
-            gsc_destroy(g);
-            return NULL;
-        }
+        g->scratch = (Complex*)pool_carve(&cursor, count, sizeof(Complex));
+        if (!g->scratch) return NULL;
         g->scratch_das = g->scratch;
         g->scratch_wu = g->scratch_das + F;
         g->scratch_spec = g->scratch_wu + F;
@@ -185,6 +280,10 @@ GSC* gsc_create(int M, int F, int num_angles,
 #endif
     }
 
+    /* Lockstep proof: gsc_get_mem_size()'s walk and the carves above must
+     * consume exactly `need` bytes, no more, no less. */
+    if (cursor.remaining != 0) return NULL;
+
     g->initialized = 0;
     g->first_doa_found = 0;
     g->first_doa_frame = -1;
@@ -193,7 +292,32 @@ GSC* gsc_create(int M, int F, int num_angles,
     g->doa_used = NAN;
     g->adaptive = 0;
     g->bin_resets = 0;
+    g->owned_heap = NULL;
 
+    return g;
+}
+
+/* ===================== create ===================== */
+
+GSC* gsc_create(int M, int F, int num_angles,
+                Complex*** a_array,
+                const GSC_Config* cfg)
+{
+    size_t need;
+    void* pool = NULL;
+    GSC* g;
+
+    need = gsc_get_mem_size(M, F);
+    if (need == 0) return NULL;
+
+    if (posix_memalign(&pool, 16, need) != 0 || !pool) return NULL;
+
+    g = gsc_init(pool, need, M, F, num_angles, a_array, cfg);
+    if (!g) {
+        free(pool);
+        return NULL;
+    }
+    g->owned_heap = pool;
     return g;
 }
 
@@ -716,28 +840,11 @@ void gsc_destroy(GSC* g)
 {
     if (!g) return;
 
-    if (g->P) {
-        for (int f = 0; f < g->F; f++) {
-            if (g->P[f]) {
-                for (int i = 0; i < g->M; i++) {
-                    free(g->P[f][i]);
-                }
-                free(g->P[f]);
-            }
-        }
-        free(g->P);
-    }
-
-    if (g->wa) {
-        for (int m = 0; m < g->M; m++) {
-            free(g->wa[m]);
-        }
-        free(g->wa);
-    }
-
-    free(g->scratch);
-
-    free(g);
+    /* Pool path (owned_heap == NULL, gsc_init()): the caller owns the
+     * memory (struct + every array carved from it) -- nothing to free
+     * here. Heap path (gsc_create()): a single posix_memalign()'d block
+     * backs everything, so one free() tears it all down. */
+    if (g->owned_heap) free(g->owned_heap);
 }
 
 float gsc_get_doa_used(const GSC* g)

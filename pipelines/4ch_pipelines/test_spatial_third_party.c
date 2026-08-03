@@ -199,6 +199,258 @@ static int test_srp_precompute_equivalence(void) {
     return 1;
 }
 
+/* srp_get_mem_size()/srp_init() pool-first pair (Phase A.1): a caller-owned
+ * pool larger than the queried size must have every byte beyond
+ * srp_get_mem_size(cfg) left untouched, an undersized or misaligned pool
+ * must be rejected outright, and the same pool must be reusable for a
+ * second srp_init() after srp_destroy() releases the first instance (a
+ * no-op on the pool path -- srp_destroy() only frees owned_heap). Also
+ * exercises srp_get_mem_size()'s config validation directly (M<=1, F<=1,
+ * num_angles<=0 -- the union of every check the old srp_create() used to
+ * make). */
+static int test_srp_init_pool_poison_and_bounds(void) {
+    enum { EXTRA = 32 };
+    SRP_Config cfg;
+    ArrayGeometry* geometry;
+    size_t need;
+    unsigned char* pool;
+    size_t pool_bytes;
+    SRP* s;
+    size_t i;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.M = 4;
+    cfg.F = 65;
+    cfg.num_angles = 72;
+    cfg.sr = 16000.0f;
+    cfg.NFFT = 128.0f;
+    cfg.c = 343.0f;
+    cfg.low_freq = 300.0f;
+    cfg.high_freq = 7000.0f;
+    cfg.enable_smoothing = 0;
+    cfg.switch_consec = 1;
+    cfg.update_interval = 1;
+
+    geometry = array_geometry_create_uca(4, 0.035f);
+    CHECK(geometry != NULL, "pool bounds test: create UCA geometry");
+
+    need = srp_get_mem_size(&cfg);
+    CHECK(need > 0,
+          "srp_get_mem_size reports a positive size for a valid config");
+    {
+        SRP_Config bad = cfg;
+        bad.M = 1;
+        CHECK(srp_get_mem_size(&bad) == 0, "srp_get_mem_size rejects M <= 1");
+        bad = cfg;
+        bad.F = 1;
+        CHECK(srp_get_mem_size(&bad) == 0, "srp_get_mem_size rejects F <= 1");
+        bad = cfg;
+        bad.num_angles = 0;
+        CHECK(srp_get_mem_size(&bad) == 0,
+              "srp_get_mem_size rejects num_angles <= 0");
+        bad = cfg;
+        bad.c = 0.0f;
+        CHECK(srp_get_mem_size(&bad) == 0, "srp_get_mem_size rejects c <= 0");
+    }
+    pool_bytes = need + EXTRA;
+    CHECK(posix_memalign((void**)&pool, 16, pool_bytes) == 0 && pool,
+          "pool bounds test: allocate aligned pool");
+    memset(pool, 0xa5, pool_bytes);
+
+    /* srp_init() must also reject a geometry/cfg mismatch -- a check
+     * srp_get_mem_size() cannot make on its own since it never sees an
+     * ArrayGeometry -- and must not touch the pool while rejecting it. */
+    {
+        ArrayGeometry mismatched = *geometry;
+        mismatched.M = cfg.M + 1;
+        CHECK(srp_init(pool, pool_bytes, &cfg, &mismatched) == NULL,
+              "srp_init rejects a geometry whose M does not match cfg->M");
+    }
+    for (i = 0; i < pool_bytes; ++i) {
+        CHECK(pool[i] == 0xa5,
+              "rejected srp_init (geometry mismatch) must not touch the pool");
+    }
+
+    /* too-small pool must be rejected, not silently truncated. */
+    CHECK(srp_init(pool, need - 1, &cfg, geometry) == NULL,
+          "srp_init rejects a pool smaller than srp_get_mem_size()");
+    /* misaligned base pointer must be rejected. */
+    CHECK(srp_init(pool + 1, pool_bytes - 1, &cfg, geometry) == NULL,
+          "srp_init rejects a base pointer that is not 16-byte aligned");
+    /* re-poison check: the rejected calls above must not have written
+     * anything. */
+    for (i = 0; i < pool_bytes; ++i) {
+        CHECK(pool[i] == 0xa5, "rejected srp_init calls must not touch the pool");
+    }
+
+    s = srp_init(pool, pool_bytes, &cfg, geometry);
+    CHECK(s != NULL, "srp_init accepts a correctly sized/aligned pool");
+    CHECK((void*)s == (void*)pool, "SRP struct is placed at mem[0]");
+    CHECK(s->owned_heap == NULL,
+          "pool-path SRP has a NULL owned_heap (nothing for srp_destroy to free)");
+
+    for (i = 0; i < (size_t)EXTRA; ++i) {
+        CHECK(pool[need + i] == 0xa5,
+              "bytes beyond srp_get_mem_size() are left untouched by srp_init");
+    }
+
+    /* sanity: the returned instance is actually usable. */
+    {
+        Complex* storage = (Complex*)calloc((size_t)cfg.M * (size_t)cfg.F,
+                                            sizeof(Complex));
+        Complex* channels[4];
+        int m;
+        CHECK(storage != NULL, "pool bounds test: allocate process inputs");
+        for (m = 0; m < cfg.M; ++m) channels[m] = storage + (size_t)m * cfg.F;
+        doa_step(s, channels, NULL, /*vad_raw=*/1, /*vad_out=*/1);
+        CHECK(isfinite(doa_get_raw(s)) || isnan(doa_get_raw(s)),
+              "pool-path SRP doa_step runs without crashing");
+        free(storage);
+    }
+
+    srp_destroy(s); /* pool path: must be a no-op (owned_heap == NULL) */
+
+    /* pool reuse: the same block must work again for a second instance. */
+    memset(pool, 0xa5, pool_bytes);
+    s = srp_init(pool, pool_bytes, &cfg, geometry);
+    CHECK(s != NULL, "pool is reusable for a second srp_init after srp_destroy");
+    srp_destroy(s);
+
+    free(pool);
+    array_geometry_destroy(geometry);
+    return 1;
+}
+
+/* Heap-vs-pool byte-equal test: srp_create_from_geometry() (heap) and
+ * srp_init() (caller pool) must produce byte-identical a_array steering
+ * vectors and evolve identically across frames with varying VAD, including
+ * doa_step()'s raw/smoothed DOA output and the per-bin S_theta/bin_best_idx
+ * state srp() populates. Also spot-checks a handful of a_array[a][m]
+ * entries directly against srp_build_steering()'s own output --
+ * srp_build_steering() (steering.c) is still a standalone heap utility, no
+ * longer called by either constructor under test here, so this is an
+ * independent cross-check of the pool-carve inline fill formula in
+ * srp_init() against the original formula, not the carve step checking
+ * itself. This is the single highest-risk place for a silent bug now that
+ * the steering formula exists in two separately-maintained places. */
+static int test_srp_heap_vs_pool_byte_equal(void) {
+    enum { M = 4, F = 65, NUM_ANGLES = 72, FRAMES = 40 };
+    SRP_Config cfg;
+    ArrayGeometry* geometry;
+    SRP* heap_s;
+    SRP* pool_s;
+    size_t need;
+    void* pool = NULL;
+    float* angles;
+    Complex*** golden_a_array;
+    Complex* storage;
+    Complex* channels[M];
+    int frame;
+    int a, m, f;
+
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.M = M;
+    cfg.F = F;
+    cfg.num_angles = NUM_ANGLES;
+    cfg.sr = 16000.0f;
+    cfg.NFFT = 128.0f;
+    cfg.c = 343.0f;
+    cfg.low_freq = 300.0f;
+    cfg.high_freq = 7000.0f;
+    cfg.enable_smoothing = 1;
+    cfg.switch_consec = 2;
+    cfg.angle_tol = 0.2f;
+    cfg.update_interval = 2;
+
+    geometry = array_geometry_create_uca(M, 0.035f);
+    CHECK(geometry != NULL, "heap-vs-pool test: create UCA geometry");
+
+    heap_s = srp_create_from_geometry(&cfg, geometry);
+    CHECK(heap_s != NULL, "heap-vs-pool test: srp_create_from_geometry");
+    CHECK(heap_s->owned_heap != NULL,
+          "heap-path SRP records a non-NULL owned_heap");
+
+    need = srp_get_mem_size(&cfg);
+    CHECK(need > 0, "heap-vs-pool test: srp_get_mem_size");
+    CHECK(posix_memalign(&pool, 16, need) == 0 && pool,
+          "heap-vs-pool test: allocate pool");
+    pool_s = srp_init(pool, need, &cfg, geometry);
+    CHECK(pool_s != NULL, "heap-vs-pool test: srp_init");
+    CHECK(pool_s->owned_heap == NULL, "pool-path SRP has a NULL owned_heap");
+
+    angles = srp_create_uniform_angles(NUM_ANGLES);
+    CHECK(angles != NULL, "heap-vs-pool test: build golden angles");
+    golden_a_array = srp_build_steering(&cfg, geometry, angles);
+    CHECK(golden_a_array != NULL, "heap-vs-pool test: build golden steering");
+
+    for (a = 0; a < NUM_ANGLES; a += 7) {
+        for (m = 0; m < M; ++m) {
+            for (f = 0; f < F; f += 5) {
+                CHECK(heap_s->a_array[a][m][f].r ==
+                              golden_a_array[a][m][f].r &&
+                          heap_s->a_array[a][m][f].i ==
+                              golden_a_array[a][m][f].i,
+                      "heap SRP a_array matches srp_build_steering golden");
+                CHECK(pool_s->a_array[a][m][f].r ==
+                              golden_a_array[a][m][f].r &&
+                          pool_s->a_array[a][m][f].i ==
+                              golden_a_array[a][m][f].i,
+                      "pool SRP a_array matches srp_build_steering golden");
+            }
+        }
+    }
+    srp_destroy_steering(golden_a_array, NUM_ANGLES, M);
+    free(angles);
+
+    storage = (Complex*)malloc((size_t)M * F * sizeof(Complex));
+    CHECK(storage != NULL, "heap-vs-pool test: allocate shared inputs");
+    for (m = 0; m < M; ++m) channels[m] = storage + (size_t)m * F;
+
+    for (frame = 0; frame < FRAMES; ++frame) {
+        int vad_raw = (frame % 3) != 0;
+        int vad_out = (frame % 5) != 0;
+        float heap_raw, pool_raw;
+        float heap_smooth, pool_smooth;
+
+        for (m = 0; m < M; ++m) {
+            for (f = 0; f < F; ++f) {
+                channels[m][f].r = random_signed();
+                channels[m][f].i = random_signed();
+            }
+        }
+
+        doa_step(heap_s, channels, NULL, vad_raw, vad_out);
+        doa_step(pool_s, channels, NULL, vad_raw, vad_out);
+
+        heap_raw = doa_get_raw(heap_s);
+        pool_raw = doa_get_raw(pool_s);
+        CHECK((isnan(heap_raw) && isnan(pool_raw)) || heap_raw == pool_raw,
+              "heap vs pool: doa_get_raw is byte-equal every frame");
+
+        heap_smooth = doa_get_smooth(heap_s);
+        pool_smooth = doa_get_smooth(pool_s);
+        CHECK((isnan(heap_smooth) && isnan(pool_smooth)) ||
+                  heap_smooth == pool_smooth,
+              "heap vs pool: doa_get_smooth is byte-equal every frame");
+
+        for (a = 0; a < NUM_ANGLES; ++a) {
+            CHECK(heap_s->S_theta[a] == pool_s->S_theta[a],
+                  "heap vs pool: S_theta is byte-equal every frame");
+        }
+        for (f = 0; f < F; ++f) {
+            CHECK(heap_s->bin_best_idx[f] == pool_s->bin_best_idx[f],
+                  "heap vs pool: bin_best_idx is byte-equal every frame");
+        }
+    }
+
+    free(storage);
+    srp_destroy(pool_s);
+    free(pool);
+    srp_destroy(heap_s);
+    array_geometry_destroy(geometry);
+    return 1;
+}
+
 static int reconstruct_matches(const GSC* g,
                                Complex** x,
                                const Complex* weights,
@@ -657,6 +909,198 @@ static int test_gsc_bin_reset_on_nonfinite_p_propagation(void) {
     return 1;
 }
 
+/* gsc_get_mem_size()/gsc_init() pool-first pair (Phase A.2): a caller-owned
+ * pool larger than the queried size must have every byte beyond
+ * gsc_get_mem_size(M, F) left untouched, an undersized or misaligned pool
+ * must be rejected outright, and the same pool must be reusable for a
+ * second gsc_init() after gsc_destroy() releases the first instance (a
+ * no-op on the pool path -- gsc_destroy() only frees owned_heap). */
+static int test_gsc_init_pool_poison_and_bounds(void) {
+    enum { M = 4, F = 65, NUM_ANGLES = 72, EXTRA = 32 };
+    SRP_Config srp_cfg;
+    GSC_Config gsc_cfg;
+    SRP* srp_handle;
+    size_t need;
+    unsigned char* pool;
+    size_t pool_bytes;
+    GSC* g;
+    size_t i;
+
+    srp_handle = make_test_srp(&srp_cfg);
+    CHECK(srp_handle != NULL, "pool bounds test: create steering owner");
+
+    need = gsc_get_mem_size(M, F);
+    CHECK(need > 0, "gsc_get_mem_size reports a positive size for a valid shape");
+    CHECK(gsc_get_mem_size(0, F) == 0, "gsc_get_mem_size rejects M <= 0");
+    CHECK(gsc_get_mem_size(M, 0) == 0, "gsc_get_mem_size rejects F <= 0");
+    CHECK(gsc_get_mem_size(-1, F) == 0, "gsc_get_mem_size rejects negative M");
+
+    pool_bytes = need + EXTRA;
+    CHECK(posix_memalign((void**)&pool, 16, pool_bytes) == 0 && pool,
+          "pool bounds test: allocate aligned pool");
+    memset(pool, 0xa5, pool_bytes);
+
+    memset(&gsc_cfg, 0, sizeof(gsc_cfg));
+    gsc_cfg.enable = 1;
+    gsc_cfg.lambda = 0.995f;
+    gsc_cfg.mu = 0.05f;
+    gsc_cfg.enable_fix_mode = 1;
+    gsc_cfg.fixed_doa_rad = 0.7f;
+    gsc_cfg.adapt_interval = 1;
+
+    /* too-small pool must be rejected, not silently truncated. */
+    CHECK(gsc_init(pool, need - 1, M, F, NUM_ANGLES, srp_handle->a_array,
+                    &gsc_cfg) == NULL,
+          "gsc_init rejects a pool smaller than gsc_get_mem_size()");
+    /* misaligned base pointer must be rejected. */
+    CHECK(gsc_init(pool + 1, pool_bytes - 1, M, F, NUM_ANGLES,
+                    srp_handle->a_array, &gsc_cfg) == NULL,
+          "gsc_init rejects a base pointer that is not 16-byte aligned");
+    /* re-poison: the rejected calls above must not have written anything. */
+    for (i = 0; i < pool_bytes; ++i) {
+        CHECK(pool[i] == 0xa5, "rejected gsc_init calls must not touch the pool");
+    }
+
+    g = gsc_init(pool, pool_bytes, M, F, NUM_ANGLES,
+                 srp_handle->a_array, &gsc_cfg);
+    CHECK(g != NULL, "gsc_init accepts a correctly sized/aligned pool");
+    CHECK((void*)g == (void*)pool, "GSC struct is placed at mem[0]");
+    CHECK(g->owned_heap == NULL,
+          "pool-path GSC has a NULL owned_heap (nothing for gsc_destroy to free)");
+
+    for (i = 0; i < (size_t)EXTRA; ++i) {
+        CHECK(pool[need + i] == 0xa5,
+              "bytes beyond gsc_get_mem_size() are left untouched by gsc_init");
+    }
+
+    /* sanity: the returned instance is actually usable. */
+    {
+        Complex* storage = (Complex*)calloc((size_t)M * (size_t)F, sizeof(Complex));
+        Complex* channels[M];
+        Complex output[F];
+        int m;
+        int f;
+        CHECK(storage != NULL, "pool bounds test: allocate process inputs");
+        for (m = 0; m < M; ++m) channels[m] = storage + (size_t)m * F;
+        gsc_process_with_weights(
+            g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+        for (f = 0; f < F; ++f) {
+            CHECK(isfinite(output[f].r) && isfinite(output[f].i),
+                  "pool-path GSC produces finite output");
+        }
+        free(storage);
+    }
+
+    gsc_destroy(g); /* pool path: must be a no-op (owned_heap == NULL) */
+
+    /* pool reuse: the same block must work again for a second instance. */
+    memset(pool, 0xa5, pool_bytes);
+    g = gsc_init(pool, pool_bytes, M, F, NUM_ANGLES,
+                 srp_handle->a_array, &gsc_cfg);
+    CHECK(g != NULL, "pool is reusable for a second gsc_init after gsc_destroy");
+    gsc_destroy(g);
+
+    free(pool);
+    srp_destroy(srp_handle);
+    return 1;
+}
+
+/* Heap-vs-pool byte-equal test: gsc_create() (heap) and gsc_init() (caller
+ * pool) must evolve identically, hop for hop, across frames that both skip
+ * AND trigger RLS adaptation -- not just matching gsc_out/effective_weights,
+ * but the internal P[f][i][j]/wa[m][f] RLS state too. This is the strongest
+ * check available that flattening GSC's nested Complex triple- and
+ * double-pointer arrays into one carved pool block does not perturb the RLS
+ * recursion's numeric evolution at all versus the original nested
+ * calloc/malloc layout. */
+static int test_gsc_heap_vs_pool_byte_equal(void) {
+    enum { M = 4, F = 65, NUM_ANGLES = 72, HOPS = 40 };
+    SRP_Config srp_cfg;
+    GSC_Config gsc_cfg;
+    SRP* srp_handle;
+    size_t need;
+    void* pool = NULL;
+    GSC* heap_g;
+    GSC* pool_g;
+    Complex* storage;
+    Complex* channels[M];
+    Complex heap_out[F];
+    Complex pool_out[F];
+    Complex heap_weights[M * F];
+    Complex pool_weights[M * F];
+    int hop;
+    int f, i, j, m;
+
+    srp_handle = make_test_srp(&srp_cfg);
+    CHECK(srp_handle != NULL, "heap-vs-pool test: create steering owner");
+
+    memset(&gsc_cfg, 0, sizeof(gsc_cfg));
+    gsc_cfg.enable = 1;
+    gsc_cfg.lambda = 0.995f;
+    gsc_cfg.mu = 0.05f;
+    gsc_cfg.enable_fix_mode = 1;
+    gsc_cfg.fixed_doa_rad = 0.7f;
+    gsc_cfg.adapt_interval = 1;
+
+    heap_g = gsc_create(M, F, NUM_ANGLES, srp_handle->a_array, &gsc_cfg);
+    CHECK(heap_g != NULL, "heap-vs-pool test: gsc_create");
+    CHECK(heap_g->owned_heap != NULL, "heap-path GSC records a non-NULL owned_heap");
+
+    need = gsc_get_mem_size(M, F);
+    CHECK(need > 0, "heap-vs-pool test: gsc_get_mem_size");
+    CHECK(posix_memalign(&pool, 16, need) == 0 && pool,
+          "heap-vs-pool test: allocate pool");
+    pool_g = gsc_init(pool, need, M, F, NUM_ANGLES, srp_handle->a_array, &gsc_cfg);
+    CHECK(pool_g != NULL, "heap-vs-pool test: gsc_init");
+    CHECK(pool_g->owned_heap == NULL, "pool-path GSC has a NULL owned_heap");
+
+    storage = (Complex*)malloc((size_t)M * F * sizeof(Complex));
+    CHECK(storage != NULL, "heap-vs-pool test: allocate shared inputs");
+    for (m = 0; m < M; ++m) channels[m] = storage + (size_t)m * F;
+
+    for (hop = 0; hop < HOPS; ++hop) {
+        /* Alternate allow_adapt so both instances exercise adapted AND
+         * skipped-adaptation frames identically. */
+        int allow_adapt = (hop % 3) != 0;
+        for (m = 0; m < M; ++m) {
+            for (f = 0; f < F; ++f) {
+                channels[m][f].r = random_signed();
+                channels[m][f].i = random_signed();
+            }
+        }
+
+        gsc_process_with_weights(
+            heap_g, channels, 0.7f, allow_adapt, NULL, heap_out, heap_weights);
+        gsc_process_with_weights(
+            pool_g, channels, 0.7f, allow_adapt, NULL, pool_out, pool_weights);
+
+        CHECK(memcmp(heap_out, pool_out, sizeof(heap_out)) == 0,
+              "heap vs pool: gsc_out is byte-equal every hop");
+        CHECK(memcmp(heap_weights, pool_weights, sizeof(heap_weights)) == 0,
+              "heap vs pool: effective_weights is byte-equal every hop");
+
+        for (f = 0; f < F; ++f) {
+            for (i = 0; i < M; ++i) {
+                CHECK(heap_g->wa[i][f].r == pool_g->wa[i][f].r &&
+                          heap_g->wa[i][f].i == pool_g->wa[i][f].i,
+                      "heap vs pool: wa[m][f] state is byte-equal every hop");
+                for (j = 0; j < M; ++j) {
+                    CHECK(heap_g->P[f][i][j].r == pool_g->P[f][i][j].r &&
+                              heap_g->P[f][i][j].i == pool_g->P[f][i][j].i,
+                          "heap vs pool: P[f][i][j] state is byte-equal every hop");
+                }
+            }
+        }
+    }
+
+    free(storage);
+    gsc_destroy(pool_g);
+    free(pool);
+    gsc_destroy(heap_g);
+    srp_destroy(srp_handle);
+    return 1;
+}
+
 /* frame_idx must not lose precision or wrap once it exceeds what a 32-bit
  * signed int could hold (~2^31, ~199-265 days at typical hop rates) --
  * poke it to just past that old boundary and confirm one hop increments it
@@ -738,6 +1182,10 @@ int main(void) {
     CHECK(test_beamform_and_score_scalar_vs_dispatch(),
           "beamform/SRP-score SIMD test");
     CHECK(test_srp_precompute_equivalence(), "SRP optimization test");
+    CHECK(test_srp_init_pool_poison_and_bounds(),
+          "SRP pool-first poison/bounds test");
+    CHECK(test_srp_heap_vs_pool_byte_equal(),
+          "SRP heap-vs-pool byte-equal test");
     CHECK(test_gsc_weight_export(), "GSC effective-weight test");
     CHECK(test_gsc_create_rejects_invalid_lambda(),
           "GSC create lambda-bound test");
@@ -750,6 +1198,10 @@ int main(void) {
           "GSC P-diagonal clamp boundary test");
     CHECK(test_gsc_bin_reset_on_nonfinite_p_propagation(),
           "GSC non-finite-P bin-reset test");
+    CHECK(test_gsc_init_pool_poison_and_bounds(),
+          "GSC pool-first poison/bounds test");
+    CHECK(test_gsc_heap_vs_pool_byte_equal(),
+          "GSC heap-vs-pool byte-equal test");
     CHECK(test_gsc_frame_idx_survives_32bit_boundary(),
           "GSC frame_idx 32-bit-boundary test");
     CHECK(test_srp_frame_counter_survives_32bit_boundary(),

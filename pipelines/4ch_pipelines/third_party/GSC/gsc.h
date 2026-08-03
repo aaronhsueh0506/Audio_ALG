@@ -88,6 +88,14 @@ typedef struct {
      * reactive path rare. */
     long bin_resets;
 
+    /* Non-NULL only on the gsc_create() heap path: the single
+     * posix_memalign()'d block backing every array above, freed by
+     * gsc_destroy(). NULL on the gsc_init() caller-pool path, where the
+     * caller owns the memory and gsc_destroy() must not free it. Appended
+     * at the end of the struct so every field above keeps its pre-existing
+     * offset (same precedent as AEC/c_impl's Aec.heap_arena). */
+    void* owned_heap;
+
 } GSC;
 
 /*
@@ -110,6 +118,30 @@ int gsc_effective_adapt_interval(
 /* create */
 GSC* gsc_create(int M, int F, int num_angles,
                 Complex*** a_array,
+                const GSC_Config* cfg);
+
+/*
+ * Static-memory companions: place a GSC struct plus every backing array
+ * (P/wa/scratch) in a single caller-owned pool. Mirrors AEC/c_impl's
+ * aec_get_mem_size()/aec_init() pair (same simple, non-descriptor tier --
+ * GSC is a single library-level module, not a composite like
+ * 4aec_nr_res.c).
+ *
+ * gsc_get_mem_size(M, F) returns the total byte requirement; it does not
+ * depend on num_angles or cfg (neither affects GSC's own storage --
+ * num_angles only indexes into the caller-owned a_array, and cfg's fields
+ * are plain scalars copied into the struct). Returns 0 for an invalid
+ * (M <= 0 or F <= 0) shape.
+ *
+ * gsc_init() places the GSC struct at mem[0], carves every backing array out
+ * of the same block (no malloc called), and applies the exact same
+ * validation gsc_create() does. `a_array` remains a BORROWED pointer in both
+ * gsc_create() and gsc_init() -- it is owned by the caller (typically SRP),
+ * never carved from the pool or freed by GSC.
+ */
+size_t gsc_get_mem_size(int M, int F);
+GSC*   gsc_init(void* mem, size_t mem_size, int M, int F,
+                int num_angles, Complex*** a_array,
                 const GSC_Config* cfg);
 
 void gsc_process(GSC* g,
