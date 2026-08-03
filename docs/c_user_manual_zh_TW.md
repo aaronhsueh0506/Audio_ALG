@@ -313,15 +313,19 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
     p->aec_ready = 1;
     p->hop = aec_hop_size(p->aec);
     p->frame_size = 2 * p->hop;
-    p->fft_size = 512;
-    while (p->fft_size < p->frame_size) p->fft_size *= 2;
+    p->fft_size = p->frame_size;   /* no padding: AEC's grid is frame == FFT */
     p->n_freqs = p->fft_size / 2 + 1;
 
-    nr_cfg = mmse_lsa_config_for_mode(sample_rate, nr_mode);
-    nr_cfg.L = 150;
-    nr_cfg.alpha_d = 0.95f;
-    nr_cfg.alpha_attack = 0.3f;
-    nr_cfg.alpha_decay = nr_cfg.alpha_g;
+    /* Use the grid-explicit entry point (matching pipelines/audio_pipeline.c)
+     * so NR resolves the SAME fft_size the AEC instance above just picked --
+     * the 2-arg mmse_lsa_config_for_mode() instead resolves NR's OWN
+     * independent per-rate default grid, which is not the AEC default at
+     * every rate (e.g. NR defaults to 128 at 8 kHz, AEC to 256) and would
+     * silently create an NR instance sized for the wrong n_freqs.
+     * L/alpha_d/alpha_attack are already correctly wall-clock-retimed for
+     * this grid by mmse_lsa_config_for_mode_grid() -- do not override them
+     * with fixed literals authored for a different (10 ms/16 ms) grid. */
+    nr_cfg = mmse_lsa_config_for_mode_grid(sample_rate, p->fft_size, nr_mode);
 
     p->nr = mmse_lsa_create(&nr_cfg);
     p->fft = fft_create(p->fft_size);
@@ -498,12 +502,12 @@ audio_alg_destroy(&pipeline);
 
 `AecResContext` pointer 只保證在下一次 AEC process/reset/destroy 前有效。不要修改、free 或跨 hop 保存 pointer；如需非同步分析，複製內容。
 
-Conventional mono pipeline 由 20 ms frame／10 ms hop 推導尺寸：
-8 kHz 為 frame/hop/FFT `160/80/256`，16 kHz 為
-`320/160/512`，48 kHz 為 `960/480/1024`；`n_freqs = FFT/2 + 1`。
-不要把 frame 誤寫成 FFT size，也不要套用 AIAEC 或 4-channel 的
-zero-padding-free 512/256、1024/512 grid。呼叫端應從 API query 實際 hop
-與 bins，而不是寫死。
+Conventional mono pipeline 跟 4-channel/AIAEC 一樣是 zero-padding-free
+50%-overlap grid（frame == FFT、hop == FFT/2），不再是舊的 20 ms
+frame／10 ms hop 推導：8 kHz 為 frame(=FFT)/hop `256/128`，16 kHz 預設為
+`256/128`（512/256 也是明確支援的可選 grid），48 kHz 為 `1024/512`；
+`n_freqs = FFT/2 + 1`。呼叫端應從 API query 實際 hop 與 bins，而不是寫死
+（16 kHz 有兩種合法 grid，寫死任一組數字對另一組就是錯的）。
 
 完整 pipeline 的 final IFFT/OLA 增加約一個 grid hop 延遲；`--aec-only` 走 linear time output，不經這段 final OLA。另需把裝置 I/O buffer、resampler 與 OS scheduling latency 加入產品總預算。
 

@@ -44,25 +44,28 @@ pre/post boundary.
 
 ## Parameter Alignment
 
-All modules use unified 20ms frame / 10ms hop, auto-configured by sample rate:
+All modules use an explicit, zero-padding-free 50%-overlap grid (frame ==
+fft_size, hop == fft_size/2), auto-configured by sample rate. 16 kHz has two
+selectable grids; the others have exactly one:
 
-| Parameter | 8 kHz | 16 kHz | 48 kHz | Formula |
-|-----------|-------|--------|--------|---------|
-| frame_size | 160 | 320 | 960 | sr × 20ms |
-| hop_size | 80 | 160 | 480 | frame / 2 |
-| fft_size | 256 | 512 | 1024 | next pow2 ≥ frame |
-| n_freqs | 129 | 257 | 513 | fft/2 + 1 |
-| filter_length | 416 | 832 | 3072 | ms-derived: sr × 52ms (64ms ≥44.1 kHz) |
-| n_partitions | 6 | 6 | 7 | ceil(filter_length / hop) |
+| Parameter | 8 kHz | 16 kHz (default) | 16 kHz (alt) | 48 kHz | Formula |
+|-----------|-------|-------------------|--------------|--------|---------|
+| frame_size / fft_size | 256 | 256 | 512 | 1024 | frame == fft_size, no padding |
+| hop_size | 128 | 128 | 256 | 512 | frame / 2 |
+| n_freqs | 129 | 129 | 257 | 513 | fft/2 + 1 |
+| filter_length | 416 | 832 | 832 | 3072 | ms-derived: sr × 52ms (64ms ≥44.1 kHz) |
+| n_partitions | 4 | 7 | 4 | 6 | ceil(filter_length / hop) |
+
+(Verified against a live `aec_create()` at each grid, not hand-derived.)
 
 ## Latency & Performance
 
 | 項目 | 數值 | 說明 |
 |------|------|------|
-| **Algorithmic latency** | 10 ms | 1 hop（所有 sample rate 一致） |
-| **NR OLA delay** | +10 ms | NR frame 處理引入額外 1 hop 延遲 |
-| **Pipeline total latency** | **20 ms** | AEC hop + NR OLA delay |
-| **Processing (per hop)** | < 0.5 ms | AEC + NR + RES 合計（ARM Cortex-A53 @ 1GHz 估計） |
+| **Algorithmic latency** | 1 hop — varies by grid: 16 ms @ 8 kHz, 8 ms @ 16 kHz (default) / 16 ms @ 16 kHz (alt grid), ~10.7 ms @ 48 kHz | 不再是所有 sample rate 統一的 10 ms（見上表 hop_size） |
+| **NR OLA delay** | +1 hop | NR frame 處理引入額外 1 hop 延遲,與 AEC hop 同步縮放 |
+| **Pipeline total latency** | 2 hops | AEC hop + NR OLA delay |
+| **Processing (per hop)** | < 0.5 ms | AEC + NR + RES 合計(ARM Cortex-A53 @ 1GHz 估計) |
 | **RTF** | < 0.05 | 遠低於即時要求 |
 
 ### Memory Budget
@@ -74,27 +77,33 @@ context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
 twiddle configs are carved from these pools too, so both columns are the
 complete memory requirement (strict init→destroy zero-heap on both backends):
 
-Pipeline bufs is now 12 scratch buffers, not 13 — the `g_aec` buffer (a
-per-hop memcpy'd duplicate of `AecResContext.res_gain`) was removed; both
-its former readers now read `ctx.res_gain` directly (stable for the whole
-hop per `aec.h`'s own doc), shrinking each row's `Pipeline bufs`/`Total` by
-`ALIGN16(n_freqs*4)` B — 528 B @ 8 kHz, 1,040 B @ 16 kHz, 2,064 B @ 48 kHz
-(`AUDIO_PIPELINE_LAYOUT_VERSION` bumped 1→2 accordingly):
+Re-measured 2026-08-04 via `./aec_nr_pipeline_static --print-mem-size balanced
+--sample-rate <sr> [--fft-size <alt>]` on both backends, against the current
+grid (16 kHz default is now 256/128, not the 512/256 these numbers used to
+assume — see "Parameter Alignment" above). 16 kHz's alternate 512/256 grid is
+included since it remains explicitly selectable:
 
 | Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |--------|-----|-----------|-----|---------------|-----------|
-| **8 kHz KISS** | 290,672 B | 8,784 B | 97,792 B | 6,736 B | **404,176 B (394.7 KB)** |
-| **8 kHz NE10** | 288,848 B | 8,176 B | 97,792 B | 6,736 B | **401,744 B (392.3 KB)** |
-| **16 kHz KISS** | 538,320 B | 16,976 B | 194,048 B | 13,392 B | **762,928 B (745.0 KB)** |
-| **16 kHz NE10** | 534,192 B | 15,600 B | 194,048 B | 13,392 B | **757,424 B (739.7 KB)** |
-| **48 kHz KISS** | 1,253,680 B | 33,360 B | 386,560 B | 31,824 B | **1,705,616 B (1,665.6 KB)** |
-| **48 kHz NE10** | 1,244,944 B | 30,448 B | 386,560 B | 31,824 B | **1,693,968 B (1,654.3 KB)** |
+| **8 kHz KISS** | 294,976 B | 8,784 B | 67,424 B | 8,272 B | **379,648 B (370.8 KB)** |
+| **8 kHz NE10** | 293,152 B | 8,176 B | 67,424 B | 8,272 B | **377,216 B (368.4 KB)** |
+| **16 kHz KISS (default, 256/128)** | 399,056 B | 8,784 B | 122,160 B | 8,272 B | **538,464 B (525.8 KB)** |
+| **16 kHz NE10 (default, 256/128)** | 397,232 B | 8,176 B | 122,160 B | 8,272 B | **536,032 B (523.5 KB)** |
+| **16 kHz KISS (alt, 512/256)** | 545,024 B | 16,976 B | 133,472 B | 16,464 B | **712,128 B (695.4 KB)** |
+| **16 kHz NE10 (alt, 512/256)** | 540,896 B | 15,600 B | 133,472 B | 16,464 B | **706,624 B (690.1 KB)** |
+| **48 kHz KISS** | 1,235,664 B | 33,360 B | 374,336 B | 32,848 B | **1,676,400 B (1,637.1 KB)** |
+| **48 kHz NE10** | 1,226,928 B | 30,448 B | 374,336 B | 32,848 B | **1,664,752 B (1,625.7 KB)** |
 
-> filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072 taps、
-> 7 partitions），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮 `filter_length`
-> 與 NR 的 `L`（48 kHz 也可用 `n_partitions` override 換較短尾巴）。
-> 三個 rate 都由同一 hop=10 ms 規則自動推導（`pipeline_dims.h`），並在 init 以
-> grid assert 驗證 pipeline/AEC/FFT/NR 四方一致。
+(Totals include the 192 B `AudioPipeline` control block, not broken out as
+its own column above.)
+
+> filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072
+> taps、6 partitions at hop=512），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮
+> `filter_length` 與 NR 的 `L`（48 kHz 也可用 `n_partitions` override 換較短
+> 尾巴）。三個 rate 現在是各自 grid 的 hop=fft_size/2 規則自動推導
+> (`aec_derive_dims()`），不再是統一的 10 ms 規則；16 kHz 另外還有一個可選的
+> 512/256 grid（見上表）。並在 init 以 grid assert 驗證 pipeline/AEC/FFT/NR
+> 四方一致。
 
 ## Integration Flow
 

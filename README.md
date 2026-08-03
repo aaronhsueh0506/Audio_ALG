@@ -38,10 +38,13 @@ checkpoints are not interchangeable.
 
 `AIAEC/` contains:
 
-- direct AEC/RES: `Align_CRUSE`;
 - linear-AEC-conditioned RES+NR: `Align_ULCNet`, `GTCRN_AENR`,
   `DeepFilterNet_AENR`;
-- end-to-end AEC+RES+NR: `DeepVQE_S`, `CAGCRN`.
+- end-to-end AEC+RES+NR: `Align_CRUSE`, `DeepVQE_S`, `CAGCRN`.
+
+(`Align_CRUSE` previously ran its own AEC-only, noise-preserving route; that
+route was retired and folded into the end-to-end task above — see
+`AIAEC/README.md`.)
 
 These candidates use clip-level PyTorch APIs. The 4-channel conventional AEC
 shell is a separate integration boundary and does not replicate any neural
@@ -51,16 +54,18 @@ model per microphone.
 
 | Surface | Supported grid |
 |---|---|
-| Conventional mono pipeline, 8 kHz | frame 160, hop 80, FFT 256 |
-| Conventional mono pipeline, 16 kHz | frame 320, hop 160, FFT 512 |
-| Conventional mono pipeline, 48 kHz | frame 960, hop 480, FFT 1024 |
+| Conventional mono pipeline, 8 kHz | frame/FFT 256, hop 128 |
+| Conventional mono pipeline, 16 kHz | frame/FFT 256, hop 128 (default); frame/FFT 512, hop 256 (also supported) |
+| Conventional mono pipeline, 48 kHz | frame/FFT 1024, hop 512 |
 | Four-channel AEC shell, 16 / 48 kHz | 16k: 256/128 or 512/256; 48k: 1024/512, no padding |
 | AIAEC, 16 kHz | frame/window/FFT 512, hop 256 |
 | AIAEC, 48 kHz | frame/window/FFT 1024, hop 512 |
 
-The conventional mono path derives a 20 ms frame and 10 ms hop, then chooses
-the next radix-2 FFT. The 4-channel shell and AIAEC use explicit,
-zero-padding-free 50%-overlap grids, but remain separate integration surfaces.
+The conventional mono path, the 4-channel shell, and AIAEC all use explicit,
+zero-padding-free 50%-overlap grids (frame == FFT, hop == FFT/2) — they
+remain separate integration surfaces, but none of them derive a 20 ms
+frame/10 ms hop any more (that legacy derivation predates the 16 kHz default
+grid change; see AEC's CHANGELOG "16 kHz default signal grid" entry).
 Standalone AINR follows each model's own config; see the table above.
 
 ## Clone and build
