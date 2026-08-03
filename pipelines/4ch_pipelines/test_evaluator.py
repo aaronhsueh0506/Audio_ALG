@@ -21,6 +21,7 @@ def _valid_result():
         "first_nonzero_delay_frame": 10,
         "final_delay_error_samples": -7,
         "hop_size": 256,
+        "sample_rate": 16000,
         "processed_samples": 4096,
     }
 

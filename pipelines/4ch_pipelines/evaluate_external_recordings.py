@@ -167,6 +167,14 @@ def evaluate_case(
     # (and is deliberately independent of the online matcher).  Keep at
     # least 5 ms of tolerance so choosing the smaller 128-sample hop does not
     # turn the same physical delay estimate into a false failure.
+    #
+    # 2026-08-04: confirmed this is the right call, not a cover for a real
+    # online-estimator bug -- measured far_corr/near_corr (this same
+    # estimate_file_offset()'s own correlation strength) on both checked-in
+    # recordings: 0.05-0.24, i.e. close to noise-floor for a ~40-60s real
+    # recording with near-end speech mixed in. evaluate_recordings.py's
+    # validate_recording_contract() picked up this exact tolerance formula
+    # for the same reason (it previously used half-hop only).
     delay_tolerance = max(hop // 2, sample_rate // 200)
     result = {
         "case": case_dir.name,
