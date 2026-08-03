@@ -1,15 +1,20 @@
 import configparser
 import copy
+import importlib
 import pathlib
 
 import pytest
 import torch
 
+import AIAEC.training_common as training_common
 from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.training_common import (
     LinearAecEngine,
+    auto_device,
+    build_arg_parser,
+    build_plain_loaders,
     compressed_spectral_loss,
     make_checkpoint_contract,
     read_grids,
@@ -26,6 +31,70 @@ def _cfg(text: str) -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
     cfg.read_string(text)
     return cfg
+
+
+@pytest.mark.parametrize('module_name', [
+    'AIAEC.Align_CRUSE.train',
+    'AIAEC.Align_ULCNet.train',
+    'AIAEC.GTCRN_AENR.train',
+    'AIAEC.DeepFilterNet_AENR.train',
+    'AIAEC.DeepVQE_S.train',
+    'AIAEC.CAGCRN.train',
+])
+def test_all_trainers_accept_packed_gpu_and_mmap_args(module_name):
+    trainer = importlib.import_module(module_name)
+    args = trainer.build_parser().parse_args([
+        '--packed-dir', '/datasets/aec-packed', '--gpu', '2', '--mmap',
+    ])
+    assert args.packed_dir == '/datasets/aec-packed'
+    assert args.gpu == 2
+    assert args.mmap is True
+
+
+def test_gpu_arg_takes_precedence_over_device():
+    args = build_arg_parser('test').parse_args([
+        '--device', 'cpu', '--gpu', '3',
+    ])
+    assert auto_device(args.device, args.gpu) == 'cuda:3'
+    with pytest.raises(ValueError, match='non-negative'):
+        auto_device(None, -1)
+
+
+def test_loader_cli_packed_dir_override_and_mmap_reach_dataset(monkeypatch):
+    observed = {}
+    linear = make_linear_aec_contract(16000, frame_size=512)
+
+    class FakePackedDataset:
+        def __init__(self, path, expected_sr=None, mmap=False):
+            observed.update(path=path, expected_sr=expected_sr, mmap=mmap)
+            self.linear_aec_contract = linear
+            self.linear_aec_contract_hash = linear.fingerprint()
+
+        def __len__(self):
+            return 4
+
+        def __getitem__(self, index):
+            return index
+
+        def fingerprint(self):
+            return 'fake-corpus'
+
+    monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
+    cfg = _cfg(
+        '[data]\n'
+        'packed_dir = from-config\n'
+        'val_fraction = 0.25\n'
+        'batch_size = 2\n'
+        'num_workers = 0\n'
+    )
+    aec_grid, _ = read_grids(_cfg('[signal]\nsr=16000\nn_fft=512\n'))
+    _train, _val, contract = build_plain_loaders(
+        cfg, aec_grid, packed_dir='from-cli', mmap=True,
+    )
+    assert observed == {
+        'path': 'from-cli', 'expected_sr': 16000, 'mmap': True,
+    }
+    assert contract['dataset_fingerprint'] == 'fake-corpus'
 
 
 def test_read_grids_builds_matching_aec_and_signal_grids():

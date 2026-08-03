@@ -78,9 +78,14 @@ contract; resume refuses a different dataset, split, frontend, or signal grid.
 
 ```bash
 cd AIAEC/Align_CRUSE   # or any of the other five directories
-python3 train.py --config config.ini
+python3 train.py --config config.ini \
+  --packed-dir /path/to/packed/all --gpu 0 --mmap
 python3 denoise.py output/align_cruse_best.pth mic.wav far.wav out.wav
 ```
+
+`--packed-dir` overrides `[data] packed_dir`; omit it to use the config value.
+`--gpu N` selects `cuda:N` and takes precedence over `--device`. `--mmap`
+keeps packed tensors disk-backed to reduce host RAM use.
 
 ## Navigation and tests
 

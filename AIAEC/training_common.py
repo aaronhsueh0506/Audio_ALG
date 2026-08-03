@@ -114,7 +114,7 @@ __all__ = [
 # ============================================================
 
 def build_arg_parser(description: str) -> argparse.ArgumentParser:
-    """The five flags every AIAEC train.py accepts, so they stop drifting.
+    """The common flags every AIAEC train.py accepts, so they stop drifting.
 
     A candidate whose training genuinely needs an extra flag adds it to the
     parser this returns -- see any train.py's ``build_parser()`` for the
@@ -122,6 +122,18 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     """
     parser = argparse.ArgumentParser(description=description)
     parser.add_argument('--config', default='config.ini', help='Config file path')
+    parser.add_argument(
+        '--packed-dir', default=None,
+        help='Packed shard file/directory; overrides [data] packed_dir',
+    )
+    parser.add_argument(
+        '--mmap', action='store_true',
+        help='Memory-map packed tensors instead of loading them fully into RAM',
+    )
+    parser.add_argument(
+        '--gpu', type=int, default=None,
+        help='CUDA GPU index (for example --gpu 0); takes precedence over --device',
+    )
     parser.add_argument('--device', default=None,
                         help='cuda / cpu / mps (default: auto-detect)')
     parser.add_argument('--resume', default=None,
@@ -135,7 +147,11 @@ def build_arg_parser(description: str) -> argparse.ArgumentParser:
     return parser
 
 
-def auto_device(requested: Optional[str]) -> str:
+def auto_device(requested: Optional[str], gpu: Optional[int] = None) -> str:
+    if gpu is not None:
+        if gpu < 0:
+            raise ValueError(f"--gpu must be non-negative, got {gpu}")
+        return f'cuda:{gpu}'
     if requested is not None:
         return requested
     if torch.cuda.is_available():
@@ -203,7 +219,9 @@ def split_dataset_by_sample(dataset, val_fraction: float,
 
 
 def build_plain_loaders(cfg, aec_grid, seed: int = 42,
-                        section: str = 'data') -> Tuple[
+                        section: str = 'data', *,
+                        packed_dir: Optional[str] = None,
+                        mmap: bool = False) -> Tuple[
                             DataLoader, Optional[DataLoader], Dict]:
     """Build the shared per-chunk split/loaders and its checkpoint contract.
 
@@ -211,7 +229,14 @@ def build_plain_loaders(cfg, aec_grid, seed: int = 42,
     validation order stays stable. The returned JSON-serializable data
     contract records the exact corpus and split used for resume checks.
     """
-    dataset = PackedAecDataset(cfg.get(section, 'packed_dir'), expected_sr=aec_grid.sr)
+    resolved_packed_dir = packed_dir or cfg.get(
+        section, 'packed_dir', fallback=None
+    )
+    if not resolved_packed_dir:
+        raise ValueError("--packed-dir or [data] packed_dir required")
+    dataset = PackedAecDataset(
+        resolved_packed_dir, expected_sr=aec_grid.sr, mmap=mmap
+    )
     val_fraction = cfg.getfloat(section, 'val_fraction', fallback=0.1)
     train_indices, val_indices = split_dataset_by_sample(
         dataset, val_fraction, seed=seed

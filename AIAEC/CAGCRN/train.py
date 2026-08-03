@@ -2,7 +2,7 @@
 """CAGCRN training -- backup end-to-end AEC + RES + NR candidate.
 
 用法:
-    python3 train.py --config config.ini
+    python3 train.py --config config.ini --packed-dir data_aec_16k/packed/all --gpu 0 --mmap
     python3 train.py --config config.ini --device cpu
     python3 train.py --config config.ini --resume output/cagcrn_e5.pth
     python3 train.py --config config.ini --resume output/cagcrn_e5.pth --reset-optimizer
@@ -169,7 +169,7 @@ def main(args):
         raise FileNotFoundError(f"config not found: {args.config}")
 
     set_seed(args.seed)
-    device = auto_device(args.device)
+    device = auto_device(args.device, args.gpu)
     print(f"Device: {device}")
 
     aec_grid, model_grid = read_grids(cfg)
@@ -179,7 +179,8 @@ def main(args):
           f"grid={model_grid}")
 
     train_loader, val_loader, data_contract = build_plain_loaders(
-        cfg, aec_grid, seed=args.seed
+        cfg, aec_grid, seed=args.seed,
+        packed_dir=args.packed_dir, mmap=args.mmap,
     )
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
