@@ -1,5 +1,5 @@
 /* ============================================================
- * Drift-guard (兩層 contract, re-review round-3 B09):
+ * Drift-guard (兩層 contract):
  *
  * 第一層 (預設, 未定義 RNN_TABLES_PORTABLE 時): 確保 rnnoise_tables_gen.h
  * 裡的編譯期常數表格，跟原始演算法 (process.c 舊版 ensure_erb()/

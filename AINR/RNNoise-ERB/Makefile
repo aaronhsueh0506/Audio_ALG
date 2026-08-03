@@ -1,8 +1,8 @@
-# RNNoise-ERB table drift-guard wiring (round-4 review P2-4, hardened by
-# round-5 review P2: the original flat build/ had no compiler/flags identity,
-# so `make CC=false CFLAGS=... test-tables` silently re-ran a STALE binary
-# from an earlier config -- reported PASS without ever invoking CC=false --
-# and a command-line CFLAGS= could replace -ffp-contract=off outright).
+# RNNoise-ERB table drift-guard wiring: the original flat build/ had no
+# compiler/flags identity, so `make CC=false CFLAGS=... test-tables` silently
+# re-ran a STALE binary from an earlier config -- reported PASS without ever
+# invoking CC=false -- and a command-line CFLAGS= could replace
+# -ffp-contract=off outright.
 #
 #   make test-tables    build + run BOTH layers and fail on any FAIL:
 #                         1. canonical (default mode): byte-exact memcmp of
@@ -79,8 +79,8 @@ FP_POLICY := -ffp-contract=off
 # allow-list block below for what it's used for.
 FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 
-# --- Command-line override rejection (round-5; same design as the four main
-# Makefiles' round-4 P1-1 gate -- see audio_common's Makefile). A
+# --- Command-line override rejection (same design as the four main
+# Makefiles' analogous gate -- see audio_common's Makefile). A
 # command-line CFLAGS=/FP_POLICY= would silently drop the FP policy below;
 # a command-line/`-e` FP_ALLOWED_CHARS_RE= could silently widen the
 # allow-list below (e.g. to `.*`) and neuter it.
@@ -141,9 +141,9 @@ $(foreach v,FP_ALLOWLIST_RC,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently defeat the FP-policy allow-list check above, leaving the real CFLAGS content unvalidated; this variable is internal to that check and has no supported external use)))
 
-# FP-policy conflict detection + last-position append (round-3 B04 pattern;
-# hardened to EXACT-TOKEN matching -- same fix as audio_common's Makefile's
-# FP_CONFLICT_FLAGS, see its comment for the full writeup). The original
+# FP-policy conflict detection + last-position append, hardened to
+# EXACT-TOKEN matching -- same fix as audio_common's Makefile's
+# FP_CONFLICT_FLAGS, see its comment for the full writeup. The original
 # three $(findstring -Ofast,...)/$(findstring -ffast-math,...)/
 # $(findstring -ffp-contract=,...) checks matched on SUBSTRING, not whole
 # compiler argv token: a legitimate flag value that merely CONTAINS one of

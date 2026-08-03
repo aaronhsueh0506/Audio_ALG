@@ -124,7 +124,7 @@ static int run_grid(int sample_rate, int fft_size) {
     return 1;
 }
 
-/* Regression test (Codex review): in fixed-notebook mode
+/* Regression test: in fixed-notebook mode
  * (gsc_fixed_mode && gsc_fixed_align_notebook), gsc_create() forces the
  * actual GSC RLS update cadence to 1 hop regardless of the configured
  * gsc_adapt_interval -- kept for baseline-matching against the reference

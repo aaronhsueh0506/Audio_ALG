@@ -1,4 +1,4 @@
-/* test_no_stdio_stack.c — full-stack no-stdio link gate (round-3 review B03).
+/* test_no_stdio_stack.c — full-stack no-stdio link gate.
  *
  * A minimal main() that exercises the WHOLE delivered stack -- query ->
  * audio_pipeline_init_ex -> one hop of audio_pipeline_process -> reset ->
@@ -7,8 +7,8 @@
  * NO_STDIO=1 archives (libaudio_pipeline.a + libaec.a + libmmse_lsa.a +
  * libaudio_common.a) and then `nm`-gates the resulting EXECUTABLE, so a
  * stdio symbol smuggled in by ANY archive (not just the pipeline's own TU)
- * fails the audit -- the round-3 review's point that a per-object gate can
- * pass while the delivered image still drags in stderr machinery.
+ * fails the audit -- a per-object gate alone can pass while the delivered
+ * image still drags in stderr machinery.
  *
  * Exit codes: 0 = every step succeeded; 1..6 identify the failing step so a
  * board bring-up can tell them apart without any logging.

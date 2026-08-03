@@ -1,6 +1,6 @@
 /**
  * audio_pipeline.h — linkable, pool-first library API for the AEC(linear) ->
- * echo-aware NR -> RES pipeline (review F20).
+ * echo-aware NR -> RES pipeline.
  *
  * Before this file, the pool-sizing/carving/per-hop-processing logic that now
  * lives here was file-local `static` code duplicated (byte-for-byte) inside
@@ -85,7 +85,7 @@ extern "C" {
  * ========================================================================== */
 
 /**
- * This struct's own ABI version (review B06). Bumped ONLY when
+ * This struct's own ABI version. Bumped ONLY when
  * AudioPipelineMemReq's field set/order/width changes — independent of
  * layout_version below, which tracks THIS FILE's carve layout, not the
  * descriptor struct's own shape. audio_pipeline_init_ex() checks this FIRST,
@@ -106,9 +106,9 @@ extern "C" {
 #define AUDIO_PIPELINE_BACKEND_NE10 2u
 
 /**
- * Fixed-width, serializable memory descriptor (review B06 — supersedes the
- * F20 struct, a BREAKING pre-release change; every caller is in-repo). The
- * F20 shape — {size_t bytes; size_t alignment; uint32_t layout_version;
+ * Fixed-width, serializable memory descriptor — supersedes the original
+ * struct shape, a BREAKING pre-release change; every caller is in-repo. The
+ * original shape — {size_t bytes; size_t alignment; uint32_t layout_version;
  * const char* backend; uint32_t build_flags_hash;} — had four problems that
  * only matter once a caller wants to persist or transmit this descriptor
  * (a board's own bring-up log, an NVRAM cache, a wire message to another
@@ -169,7 +169,7 @@ extern "C" {
  *                        integer — AUDIO_PIPELINE_BACKEND_KISS (1) or
  *                        AUDIO_PIPELINE_BACKEND_NE10 (2); never 0 in a
  *                        descriptor this library actually returns (see
- *                        above). Replaces F20's `const char* backend`
+ *                        above). Replaces the original struct's `const char* backend`
  *                        ("kiss"/"ne10") for the serializability reason
  *                        above; audio_pipeline_init_ex() compares this field
  *                        with a plain integer `==`, never `strcmp`, so an
@@ -213,7 +213,7 @@ extern "C" {
  *                        `expected` descriptor may arrive from persisted/
  *                        transmitted bytes, audio_pipeline_init_ex()
  *                        VALIDATES this (rejects nonzero) rather than
- *                        assuming it (round-4 review) — a nonzero value
+ *                        assuming it — a nonzero value
  *                        means the bytes are not a faithful descriptor this
  *                        library produced.
  *   - bytes:             total pool size (>= this many bytes, 16-aligned).
@@ -232,7 +232,7 @@ typedef struct {
     uint64_t bytes;               /* total pool size */
 } AudioPipelineMemReq;
 
-/* Fixed 32-byte ABI, pinned field-by-field (review B06) — this must never
+/* Fixed 32-byte ABI, pinned field-by-field — this must never
  * again vary by target/compiler/ABI; see the struct's own doc above. A
  * caller may serialize this struct verbatim (memcpy to/from a file, flash
  * region, or wire buffer) WITHIN A SAME-ENDIANNESS SCOPE only — no
@@ -354,7 +354,8 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes,
 /**
  * Like audio_pipeline_init(), but additionally verifies a caller-supplied
  * `expected` memory descriptor against what THIS build/config would compute
- * right now — the board-bring-up safety net review R09 asked for.
+ * right now — a board-bring-up safety net against a stale or mismatched
+ * descriptor.
  *
  * Intended flow: a board integrator queries `AudioPipelineMemReq` via
  * audio_pipeline_get_mem_requirements() AT INIT TIME (never earlier, never
@@ -385,7 +386,7 @@ AudioPipeline* audio_pipeline_init(void* mem, size_t bytes,
  *      `strcmp`; see AudioPipelineMemReq.backend_id's doc for why)
  *   4. expected->build_flags_hash == cur.build_flags_hash
  *   5. expected->alignment == cur.alignment
- *   6. expected->reserved == 0 (round-4 review: the struct doc above claims
+ *   6. expected->reserved == 0 (the struct doc above claims
  *      this field is always 0 in any descriptor this library produced, and
  *      `expected` may originate from persisted/transmitted bytes — so the
  *      claim is VALIDATED, not assumed; a nonzero value means the bytes are

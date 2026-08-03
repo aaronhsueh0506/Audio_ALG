@@ -651,7 +651,7 @@ static int test_gsc_long_run_hermitian_and_finite(void) {
     return 1;
 }
 
-/* Regression test (Codex review): gsc_create() forces the actual RLS update
+/* Regression test: gsc_create() forces the actual RLS update
  * cadence (g->adapt_interval) to 1 whenever enable_fix_mode &&
  * fixed_align_notebook, regardless of the caller's requested adapt_interval
  * -- kept for baseline-matching against the reference notebook. Any external
