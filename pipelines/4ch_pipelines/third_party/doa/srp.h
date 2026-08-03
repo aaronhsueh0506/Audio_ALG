@@ -1,6 +1,8 @@
 #ifndef SRP_H
 #define SRP_H
 
+#include <stdint.h>
+
 #include "fft_wrapper.h"
 #include "doa_smoother.h"
 
@@ -65,7 +67,10 @@ struct SRP {
     float doa_s;
 
     int update_interval;
-    int frame_counter;
+    uint64_t frame_counter;  /* was int: a per-frame monotonic counter would
+                              * overflow INT_MAX (~199-265 days at typical
+                              * hop rates); uint64_t is effectively unbounded
+                              * for any real run and avoids signed-overflow UB */
 
     float last_doa_raw;
     float last_doa_s;

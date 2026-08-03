@@ -1,6 +1,8 @@
 #ifndef GSC_H
 #define GSC_H
 
+#include <stdint.h>
+
 #include "fft_wrapper.h"
 
 #ifdef __cplusplus
@@ -64,9 +66,15 @@ typedef struct {
     /* state */
     int initialized;
     int first_doa_found;
-    int first_doa_frame;
+    int64_t first_doa_frame;  /* -1 sentinel ("not found yet") preserved --
+                               * int64_t (not uint64_t) so that stays a true
+                               * negative value; still effectively unbounded
+                               * for any real frame_idx snapshot */
     float current_doa;
-    int frame_idx;
+    uint64_t frame_idx;  /* was int: a per-frame monotonic counter would
+                          * overflow INT_MAX (~199-265 days at typical hop
+                          * rates); uint64_t is effectively unbounded for
+                          * any real run and avoids signed-overflow UB */
 
     /* log */
     float doa_used;
@@ -147,6 +155,15 @@ float gsc_wa_leak_factor(void);
  * expected to stay at 0 in normal operation.
  */
 long gsc_get_bin_resets(const GSC* g);
+
+/*
+ * The P-diagonal clamp bounds applied every adapted frame (see gsc.c's
+ * GSC_P_DIAG_FLOOR/CEIL comment). Exposed read-only so callers/tests can
+ * reference the authoritative constants instead of duplicating their
+ * numeric values (same rationale as gsc_wa_leak_factor()).
+ */
+float gsc_p_diag_floor(void);
+float gsc_p_diag_ceil(void);
 
 #ifdef __cplusplus
 }

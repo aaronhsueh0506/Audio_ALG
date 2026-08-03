@@ -755,6 +755,16 @@ long gsc_get_bin_resets(const GSC* g)
     return g ? g->bin_resets : 0;
 }
 
+float gsc_p_diag_floor(void)
+{
+    return GSC_P_DIAG_FLOOR;
+}
+
+float gsc_p_diag_ceil(void)
+{
+    return GSC_P_DIAG_CEIL;
+}
+
 float gsc_wa_leak_factor(void)
 {
     return GSC_WA_LEAK;

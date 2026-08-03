@@ -7,6 +7,7 @@
  */
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -503,6 +504,235 @@ static int test_gsc_wa_leak_is_bounded(void) {
     return 1;
 }
 
+/* GSC's per-bin P-diagonal clamp (GSC_P_DIAG_FLOOR/CEIL) must actually bound
+ * a runaway diagonal, not just exist as dead code. An all-zero spectrum at
+ * one bin makes the blocking-output u == 0 there (u = x - a*(a^H x/a^H a)
+ * is linear in x), which makes upu_real == lambda (finite, positive)
+ * regardless of steering vectors -- so the reactive isfinite/positivity
+ * guard does NOT fire, and P_new[i][i] = P[i][i]/lambda (dividing by
+ * lambda<1 grows the magnitude further), isolating the proactive clamp as
+ * the only thing standing between a poked-in extreme value and an
+ * unbounded diagonal. */
+static int test_gsc_p_diag_clamp_bounds_runaway_values(void) {
+    SRP_Config srp_cfg;
+    GSC_Config gsc_cfg;
+    SRP* srp_handle;
+    GSC* g;
+    Complex* storage;
+    Complex* channels[4];
+    Complex output[65];
+    const int target_bin = 10;
+    const int other_bin = 11;
+    int m;
+
+    srp_handle = make_test_srp(&srp_cfg);
+    CHECK(srp_handle != NULL, "diag clamp test: create steering owner");
+
+    memset(&gsc_cfg, 0, sizeof(gsc_cfg));
+    gsc_cfg.enable = 1;
+    gsc_cfg.lambda = 0.995f;
+    gsc_cfg.mu = 0.05f;
+    gsc_cfg.enable_fix_mode = 1;
+    gsc_cfg.fixed_doa_rad = 0.7f;
+    gsc_cfg.adapt_interval = 1;
+    g = gsc_create(4, 65, 72, srp_handle->a_array, &gsc_cfg);
+    CHECK(g != NULL, "diag clamp test: create GSC");
+
+    storage = (Complex*)calloc(4u * 65u, sizeof(Complex));
+    CHECK(storage != NULL, "diag clamp test: allocate inputs");
+    for (m = 0; m < 4; ++m) channels[m] = storage + m * 65;
+    /* every channel's spectrum at every bin is exactly (0,0) (calloc) ->
+     * u[m][f] == 0 for all m, f, regardless of the steering vector. */
+
+    /* --- ceiling: poke every diagonal entry of target_bin far above the
+     * ceiling, confirm one adapted hop clamps it back down. --- */
+    for (m = 0; m < 4; ++m) g->P[target_bin][m][m].r = 1e12f;
+    gsc_process_with_weights(
+        g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+    for (m = 0; m < 4; ++m) {
+        CHECK(g->P[target_bin][m][m].r == gsc_p_diag_ceil(),
+              "P diagonal above the ceiling is clamped to exactly the ceiling");
+    }
+    CHECK(gsc_get_bin_resets(g) == 0,
+          "the clamp path does not also trigger a bin reset");
+
+    /* --- floor: poke every diagonal entry of target_bin far below the
+     * floor (including negative), confirm one adapted hop clamps it back
+     * up. --- */
+    for (m = 0; m < 4; ++m) g->P[target_bin][m][m].r = -5.0f;
+    gsc_process_with_weights(
+        g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+    for (m = 0; m < 4; ++m) {
+        CHECK(g->P[target_bin][m][m].r == gsc_p_diag_floor(),
+              "P diagonal below the floor is clamped to exactly the floor");
+    }
+    CHECK(gsc_get_bin_resets(g) == 0,
+          "the clamp path does not also trigger a bin reset");
+
+    /* an unrelated, never-poked bin must be untouched by either clamp
+     * call -- the guard operates strictly per-bin. */
+    CHECK(g->P[other_bin][0][0].r != gsc_p_diag_ceil() &&
+              g->P[other_bin][0][0].r != gsc_p_diag_floor(),
+          "an unrelated bin's diagonal is not perturbed by another bin's clamp");
+
+    free(storage);
+    gsc_destroy(g);
+    srp_destroy(srp_handle);
+    return 1;
+}
+
+/* A NaN planted directly in P (as opposed to a runaway-but-finite diagonal,
+ * which the proactive clamp handles) must not silently spread into gain/wa
+ * and out through gsc_out -- some reset guard must catch it and recover
+ * just that one bin. NaN propagates through multiplication unconditionally
+ * (NaN * x == NaN for any x, including 0), so poking a single NaN into P is
+ * enough to corrupt this bin's pipeline regardless of the input spectrum's
+ * content.
+ *
+ * Mutation-tested: with the reactive isfinite(upu_real) guard alone
+ * disabled, this specific corruption (NaN in P feeding a zero input
+ * spectrum) still gets caught -- NaN propagates on into gain and then wa,
+ * and the separate "final per-bin finite check" on wa catches it instead.
+ * Only disabling BOTH guards makes this test fail. That overlap is
+ * consistent with the guards' own comments (the wa check is documented as
+ * defense-in-depth for sources other than P), so this test is verifying
+ * "the guard system recovers from a non-finite P entry" rather than
+ * isolating one specific guard. */
+static int test_gsc_bin_reset_on_nonfinite_p_propagation(void) {
+    SRP_Config srp_cfg;
+    GSC_Config gsc_cfg;
+    SRP* srp_handle;
+    GSC* g;
+    Complex* storage;
+    Complex* channels[4];
+    Complex output[65];
+    const int target_bin = 20;
+    const int other_bin = 21;
+    int m, n;
+
+    srp_handle = make_test_srp(&srp_cfg);
+    CHECK(srp_handle != NULL, "bin reset test: create steering owner");
+
+    memset(&gsc_cfg, 0, sizeof(gsc_cfg));
+    gsc_cfg.enable = 1;
+    gsc_cfg.lambda = 0.995f;
+    gsc_cfg.mu = 0.05f;
+    gsc_cfg.enable_fix_mode = 1;
+    gsc_cfg.fixed_doa_rad = 0.7f;
+    gsc_cfg.adapt_interval = 1;
+    g = gsc_create(4, 65, 72, srp_handle->a_array, &gsc_cfg);
+    CHECK(g != NULL, "bin reset test: create GSC");
+
+    storage = (Complex*)calloc(4u * 65u, sizeof(Complex));
+    CHECK(storage != NULL, "bin reset test: allocate inputs");
+    for (m = 0; m < 4; ++m) channels[m] = storage + m * 65;
+
+    /* Corrupt one bin's P (as could happen from accumulated float error)
+     * and confirm gsc_reset_bin() recovers it cleanly, without disturbing
+     * any other bin. */
+    g->P[target_bin][0][0].r = NAN;
+    CHECK(gsc_get_bin_resets(g) == 0, "bin reset test: starts at 0 resets");
+
+    gsc_process_with_weights(
+        g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+
+    CHECK(gsc_get_bin_resets(g) == 1,
+          "a non-finite P entry triggers exactly one bin reset");
+    for (m = 0; m < 4; ++m) {
+        for (n = 0; n < 4; ++n) {
+            float expected = (m == n) ? 1.0f : 0.0f;
+            CHECK(g->P[target_bin][m][n].r == expected &&
+                      g->P[target_bin][m][n].i == 0.0f,
+                  "reset bin's P is restored to the identity");
+        }
+        CHECK(g->wa[m][target_bin].r == 0.0f && g->wa[m][target_bin].i == 0.0f,
+              "reset bin's wa is cleared to zero");
+    }
+    CHECK(isfinite(g->P[other_bin][0][0].r),
+          "an unrelated bin's P is untouched by another bin's reset");
+
+    free(storage);
+    gsc_destroy(g);
+    srp_destroy(srp_handle);
+    return 1;
+}
+
+/* frame_idx must not lose precision or wrap once it exceeds what a 32-bit
+ * signed int could hold (~2^31, ~199-265 days at typical hop rates) --
+ * poke it to just past that old boundary and confirm one hop increments it
+ * exactly by one, not silently truncating/wrapping to something smaller or
+ * negative. */
+static int test_gsc_frame_idx_survives_32bit_boundary(void) {
+    SRP_Config srp_cfg;
+    GSC_Config gsc_cfg;
+    SRP* srp_handle;
+    GSC* g;
+    Complex* storage;
+    Complex* channels[4];
+    Complex output[65];
+    uint64_t poked;
+    int m;
+
+    srp_handle = make_test_srp(&srp_cfg);
+    CHECK(srp_handle != NULL, "frame_idx overflow test: create steering owner");
+
+    memset(&gsc_cfg, 0, sizeof(gsc_cfg));
+    gsc_cfg.enable = 1;
+    gsc_cfg.lambda = 0.995f;
+    gsc_cfg.mu = 0.05f;
+    gsc_cfg.enable_fix_mode = 1;
+    gsc_cfg.fixed_doa_rad = 0.7f;
+    gsc_cfg.adapt_interval = 4; /* exercises the modulo-gated cadence path too */
+    g = gsc_create(4, 65, 72, srp_handle->a_array, &gsc_cfg);
+    CHECK(g != NULL, "frame_idx overflow test: create GSC");
+
+    storage = (Complex*)calloc(4u * 65u, sizeof(Complex));
+    CHECK(storage != NULL, "frame_idx overflow test: allocate inputs");
+    for (m = 0; m < 4; ++m) channels[m] = storage + m * 65;
+
+    poked = (uint64_t)2147483647u + 5u; /* INT32_MAX + 5: not representable
+                                          * as a positive 32-bit signed int */
+    g->frame_idx = poked;
+    gsc_process_with_weights(
+        g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+    CHECK(g->frame_idx == poked + 1u,
+          "frame_idx increments exactly by one past the old 32-bit boundary");
+
+    free(storage);
+    gsc_destroy(g);
+    srp_destroy(srp_handle);
+    return 1;
+}
+
+/* SRP's frame_counter has the same overflow class of issue GSC's frame_idx
+ * had (see test_gsc_frame_idx_survives_32bit_boundary) -- verify the same
+ * fix here. */
+static int test_srp_frame_counter_survives_32bit_boundary(void) {
+    SRP_Config srp_cfg;
+    SRP* srp_handle;
+    Complex* storage;
+    Complex* channels[4];
+    uint64_t poked;
+    int m;
+
+    srp_handle = make_test_srp(&srp_cfg);
+    CHECK(srp_handle != NULL, "frame_counter overflow test: create SRP");
+
+    storage = (Complex*)calloc(4u * 65u, sizeof(Complex));
+    CHECK(storage != NULL, "frame_counter overflow test: allocate inputs");
+    for (m = 0; m < 4; ++m) channels[m] = storage + m * 65;
+
+    poked = (uint64_t)2147483647u + 5u;
+    srp_handle->frame_counter = poked;
+    doa_step(srp_handle, channels, NULL, /*vad_raw=*/1, /*vad_out=*/1);
+    CHECK(srp_handle->frame_counter == poked + 1u,
+          "frame_counter increments exactly by one past the old 32-bit boundary");
+
+    free(storage);
+    srp_destroy(srp_handle);
+    return 1;
+}
+
 int main(void) {
     CHECK(test_phat_scalar_vs_dispatch(), "PHAT SIMD test");
     CHECK(test_beamform_and_score_scalar_vs_dispatch(),
@@ -516,6 +746,14 @@ int main(void) {
     CHECK(test_gsc_effective_adapt_interval_matches_created_cadence(),
           "GSC effective-adapt-interval/created-cadence match test");
     CHECK(test_gsc_wa_leak_is_bounded(), "GSC wa-leak boundedness test");
+    CHECK(test_gsc_p_diag_clamp_bounds_runaway_values(),
+          "GSC P-diagonal clamp boundary test");
+    CHECK(test_gsc_bin_reset_on_nonfinite_p_propagation(),
+          "GSC non-finite-P bin-reset test");
+    CHECK(test_gsc_frame_idx_survives_32bit_boundary(),
+          "GSC frame_idx 32-bit-boundary test");
+    CHECK(test_srp_frame_counter_survives_32bit_boundary(),
+          "SRP frame_counter 32-bit-boundary test");
     printf("All third-party spatial tests passed (backend=%s)\n",
            spatial_simd_backend());
     return 0;
