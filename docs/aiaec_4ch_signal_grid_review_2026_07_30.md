@@ -228,9 +228,11 @@ Standalone AEC `aec_get_mem_size`：
 
 可立即開始的是模型架構訓練與 dataset smoke generation。建議優先順序維持：
 
-1. E2E：`DeepVQE_S` primary，`CAGCRN` backup。
-2. AEC-only（含 RES）：`Align_CRUSE`；若產品必須 packet streaming，直接用 `causal_running` 訓練，不要先訓 `paper_global` 再期待部署時等價切換。
-3. Hybrid RES+NR：`Align_ULCNet` 做 paper reference；`GTCRN_AENR` 做小模型；`DeepFilterNet_AENR` 做較大但已有 DFN base 的比較。
+1. E2E：`DeepVQE_S` primary，`CAGCRN` backup；~~AEC-only（含 RES）：`Align_CRUSE`~~
+   `Align_CRUSE` 現已併入此類（見第 24 行過期標註，`5d28af0` 之後不再是獨立的
+   AEC-only 分類）；若產品必須 packet streaming，直接用 `causal_running` 訓練，
+   不要先訓 `paper_global` 再期待部署時等價切換。
+2. Hybrid RES+NR：`Align_ULCNet` 做 paper reference；`GTCRN_AENR` 做小模型；`DeepFilterNet_AENR` 做較大但已有 DFN base 的比較。
 
 目前六個模型的共同 public forward 是 clip-level API，尚未統一輸出每層
 GRU/convolution/alignment cache。第一輪 3 秒訓練可直接使用；若要利用長 sequence

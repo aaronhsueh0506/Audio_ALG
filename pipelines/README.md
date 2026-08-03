@@ -131,9 +131,10 @@ removed). Multiplying by the NR gain corrects for this.
 
 ## NR OLA Delay
 
-NR uses OLA (frame_size=320, hop=160), introducing 1-frame (10ms) delay.
-The pipeline saves the previous AEC context and uses it when the
-corresponding NR output becomes available.
+NR uses OLA, introducing exactly one hop of pipeline latency (e.g. 8 ms at
+the 16 kHz default 256/128 grid; see the "Static-memory" table above for the
+grid actually in effect). The pipeline saves the previous AEC context and
+uses it when the corresponding NR output becomes available.
 
 ## Build
 
@@ -883,8 +884,8 @@ older power-dB (`/10`) convention:
 |-----------|---------|-------------|
 | `alpha_s` | 0.95 | 功率譜時間平滑 |
 | `alpha_d` | 0.70 | 噪聲更新速率 |
-| `L` | 32 | 最小值追蹤視窗（幀數，×10ms = 320ms） |
-| `num_init_frames` | 20 | 初始化靜默幀數（200ms） |
+| `L` | 64 | 最小值追蹤視窗（幀數；16 kHz 預設 256/128 grid 下的值，隨 grid 換算） |
+| `num_init_frames` | 25 | 初始化靜默幀數（16 kHz 預設 256/128 grid 下 ≈200ms，隨 grid 換算） |
 | `scene_change_threshold_db` | 10.0 | 場景轉換偵測閾值 |
 
 **SPP**：

@@ -107,8 +107,10 @@ README inside the corresponding model directory.
 - [C integration manual](docs/c_user_manual_zh_TW.md)
 - [Frequency-domain pipeline design](docs/freq_domain_pipeline_design.md)
 - [AIAEC current candidate matrix](docs/ai_aec_candidate_matrix.md)
-- [AIAEC / 4-channel / signal-grid audit](docs/aiaec_4ch_signal_grid_review_2026_07_30.md)
 - [Development and submodule workflow](docs/development.md)
+- Dated audits (historical structural sign-offs, not current reference — see
+  [docs/README.md](docs/README.md#dated-audits)): [AIAEC / 4-channel /
+  signal-grid audit](docs/aiaec_4ch_signal_grid_review_2026_07_30.md)
 
 ## Repository structure
 

@@ -62,11 +62,19 @@ The deployable C seam is:
   following the same query → allocate → `init` → process → destroy →
   release sequence as the mono `aec_nr_pipeline_static.c`;
 - [`audio_pipeline_4ch.h`](audio_pipeline_4ch.h) and
-  [`audio_pipeline_4ch.c`](audio_pipeline_4ch.c): complete heap wrapper that inserts
+  [`audio_pipeline_4ch.c`](audio_pipeline_4ch.c): complete wrapper (pool-first
+  `get_mem_requirements`/`init_ex`/`init`, plus a `create` heap convenience
+  wrapper — same two-tier convention as `4aec_nr_res.h` above) that inserts
   third-party SRP-PHAT/DOA smoothing and GSC between `process_pre()` and
   `process_post()`;
 - [`audio_pipeline_4ch_raw.c`](audio_pipeline_4ch_raw.c): raw-float host CLI for running
-  the complete wrapper on recorded four-channel fixtures;
+  the complete wrapper on recorded four-channel fixtures (heap `create()` —
+  a one-shot host tool, not a board-deployment demo);
+- [`audio_pipeline_4ch_static.c`](audio_pipeline_4ch_static.c): caller-owned-pool
+  example for the COMPLETE wrapper (core + real SRP-PHAT + real GSC, not an
+  externally-supplied fixed-weight stand-in), following the same query →
+  allocate → `init_ex` → process → destroy → release sequence as
+  `4aec_nr_res_static.c` above;
 - [`test_4aec_nr_res.c`](test_4aec_nr_res.c): 16/48 kHz grid, lifecycle,
   ordering, token invalidation, invalid-config, pool-boundary, heap/static
   byte-parity, weight, and finite-output acceptance tests;
@@ -140,6 +148,26 @@ four_aec_nr_res_destroy(pipeline); /* does not release caller-owned memory */
 platform_free(pool);
 ```
 
+The COMPLETE wrapper (core + SRP-PHAT + GSC in one instance) uses the same
+pattern one level up — `audio_pipeline_4ch_get_mem_requirements()` composes
+the core's own requirement with the SRP/GSC sub-modules' `*_get_mem_size()`
+and this wrapper's own scratch, and `audio_pipeline_4ch_init_ex()` places
+all of it, zero-heap, in one caller-owned pool:
+
+```c
+AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
+AudioPipeline4ChMemReq req;
+audio_pipeline_4ch_get_mem_requirements(&cfg, &req);
+void *pool = platform_alloc(req.bytes, req.alignment);
+AudioPipeline4Ch *p =
+    audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &req);
+
+/* audio_pipeline_4ch_process()/_process_with_activity() per hop. */
+
+audio_pipeline_4ch_destroy(p); /* does not release caller-owned memory */
+platform_free(pool);
+```
+
 Only one pre frame may be in flight. `process_post()` must receive the exact
 token returned by `process_pre()`; replay, cross-instance use, and a token
 invalidated by `reset()` are rejected. Invalid weights leave the frame pending
@@ -152,7 +180,8 @@ Build the archive or run the complete C acceptance gate from
 
 ```bash
 make libaudio_pipeline_4ch.a
-make 4aec_nr_res_static     # build caller-pool reference executable
+make 4aec_nr_res_static     # build caller-pool reference executable (core only)
+make audio_pipeline_4ch_static    # build caller-pool reference executable (complete wrapper)
 make audio_pipeline_4ch_raw      # build the complete recording-validation runner
 make test_4aec_nr_res      # build only the core 4-channel test binary
 make test_audio_pipeline_4ch     # build only the complete spatial-wrapper test
@@ -164,6 +193,9 @@ make NO_STDIO=1 audit-no-stdio
 "$(make -s print-bin-dir)/4aec_nr_res_static" --print-mem-size --sample-rate 16000 --fft-size 256
 "$(make -s print-bin-dir)/4aec_nr_res_static" --print-mem-size --sample-rate 16000
 "$(make -s print-bin-dir)/4aec_nr_res_static" --print-mem-size --sample-rate 48000
+"$(make -s print-bin-dir)/audio_pipeline_4ch_static" --print-mem-size --sample-rate 16000 --fft-size 256
+"$(make -s print-bin-dir)/audio_pipeline_4ch_static" --print-mem-size --sample-rate 16000
+"$(make -s print-bin-dir)/audio_pipeline_4ch_static" --print-mem-size --sample-rate 48000
 ```
 
 `libaudio_pipeline_4ch.a` contains only `4aec_nr_res.o` and

@@ -121,11 +121,11 @@ FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) \
 # Resolve every producer before constructing this consumer's CFG identity.
 ifeq ($(AC_LIB),)
 .PHONY: all test libs lib libaudio_pipeline_4ch.a \
-        audio_pipeline_4ch_raw 4aec_nr_res_static \
+        audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static \
         test_4aec_nr_res test_spatial_third_party test_audio_pipeline_4ch \
         print-bin-dir print-obj-dir print-lib-path audit-no-stdio
 all test libs lib libaudio_pipeline_4ch.a \
-audio_pipeline_4ch_raw 4aec_nr_res_static \
+audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static \
 test_4aec_nr_res test_spatial_third_party test_audio_pipeline_4ch \
 print-bin-dir print-obj-dir print-lib-path audit-no-stdio:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
@@ -153,7 +153,7 @@ SPATIAL_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(SPATIAL_COMMON_LIB))))
 endif
 
 SRCS := 4aec_nr_res.c audio_pipeline_4ch.c audio_pipeline_4ch_raw.c \
-        4aec_nr_res_static.c test_4aec_nr_res.c \
+        4aec_nr_res_static.c audio_pipeline_4ch_static.c test_4aec_nr_res.c \
         test_spatial_third_party.c test_audio_pipeline_4ch.c
 CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SPATIAL_PRODUCER_SIG=$(SPATIAL_PRODUCER_SIG) SRCS=$(sort $(SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
@@ -200,6 +200,9 @@ $(OBJ_DIR)/audio_pipeline_4ch_raw.o: audio_pipeline_4ch_raw.c audio_pipeline_4ch
 $(OBJ_DIR)/4aec_nr_res_static.o: 4aec_nr_res_static.c 4aec_nr_res.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
+$(OBJ_DIR)/audio_pipeline_4ch_static.o: audio_pipeline_4ch_static.c audio_pipeline_4ch.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
 $(OBJ_DIR)/test_4aec_nr_res.o: test_4aec_nr_res.c 4aec_nr_res.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
@@ -216,24 +219,29 @@ $(PIPELINE_LIB): $(PIPELINE_OBJS) | _cfg_guard
 
 ifneq ($(AC_LIB),)
 .PHONY: all test libs lib libaudio_pipeline_4ch.a \
-        audio_pipeline_4ch_raw 4aec_nr_res_static \
+        audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static \
         test_4aec_nr_res test_spatial_third_party test_audio_pipeline_4ch \
         audit-no-stdio
 
-all: $(PIPELINE_LIB) $(BIN_DIR)/audio_pipeline_4ch_raw $(BIN_DIR)/4aec_nr_res_static
+all: $(PIPELINE_LIB) $(BIN_DIR)/audio_pipeline_4ch_raw $(BIN_DIR)/4aec_nr_res_static \
+     $(BIN_DIR)/audio_pipeline_4ch_static
 
 test: $(BIN_DIR)/test_4aec_nr_res $(BIN_DIR)/test_spatial_third_party \
-      $(BIN_DIR)/test_audio_pipeline_4ch $(BIN_DIR)/4aec_nr_res_static
+      $(BIN_DIR)/test_audio_pipeline_4ch $(BIN_DIR)/4aec_nr_res_static \
+      $(BIN_DIR)/audio_pipeline_4ch_static
 	"$(abspath $(BIN_DIR))/test_4aec_nr_res"
 	"$(abspath $(BIN_DIR))/test_spatial_third_party"
 	"$(abspath $(BIN_DIR))/test_audio_pipeline_4ch"
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 16000
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 48000
+	"$(abspath $(BIN_DIR))/audio_pipeline_4ch_static" --sample-rate 16000
+	"$(abspath $(BIN_DIR))/audio_pipeline_4ch_static" --sample-rate 48000
 
 lib libaudio_pipeline_4ch.a: $(PIPELINE_LIB)
 libs: $(AC_LIB) $(AEC_LIB) $(NR_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(GSC_LIB) $(PIPELINE_LIB)
 audio_pipeline_4ch_raw: $(BIN_DIR)/audio_pipeline_4ch_raw
 4aec_nr_res_static: $(BIN_DIR)/4aec_nr_res_static
+audio_pipeline_4ch_static: $(BIN_DIR)/audio_pipeline_4ch_static
 test_4aec_nr_res: $(BIN_DIR)/test_4aec_nr_res
 test_spatial_third_party: $(BIN_DIR)/test_spatial_third_party
 test_audio_pipeline_4ch: $(BIN_DIR)/test_audio_pipeline_4ch
@@ -295,6 +303,9 @@ $(BIN_DIR)/test_audio_pipeline_4ch: $(OBJ_DIR)/test_audio_pipeline_4ch.o $(PIPEL
 
 $(BIN_DIR)/4aec_nr_res_static: $(OBJ_DIR)/4aec_nr_res_static.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4aec_nr_res_static.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
+
+$(BIN_DIR)/audio_pipeline_4ch_static: $(OBJ_DIR)/audio_pipeline_4ch_static.o $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/audio_pipeline_4ch_static.o $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
 
 $(BIN_DIR)/audio_pipeline_4ch_raw: $(OBJ_DIR)/audio_pipeline_4ch_raw.o $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/audio_pipeline_4ch_raw.o $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
