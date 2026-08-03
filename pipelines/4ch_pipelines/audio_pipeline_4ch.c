@@ -6,20 +6,29 @@
  *   4AEC process_pre -> SRP-PHAT DOA -> GSC effective weights
  *                    -> 4AEC process_post -> mono NR/RES
  *
+ * It follows the same pool-first layout and lifecycle as 4aec_nr_res.c
+ * (descriptor-tier: get_mem_requirements()/init_ex() compose the core's own
+ * descriptor-tier API with SRP/GSC's simple size_t tier plus this wrapper's
+ * own scratch), with create() as a heap convenience wrapper over that same
+ * pool-first implementation. See audio_pipeline_4ch.h's own doc comment for
+ * the caller-pool vs. heap usage patterns.
+ *
  * The file follows audio_pipeline.c's order: instance, config validation,
- * default/create, processing, reset/destroy, and accessors.
+ * default config, pool-first construction, heap convenience, processing,
+ * reset/destroy, and accessors.
  */
 
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdint.h>
 
 #include "audio_pipeline_4ch.h"
 #include "4aec_nr_res_internal.h"
 #include "gsc.h"
 #include "srp.h"
-#include "steering.h"
 #include "spatial_simd.h"
+#include "mem_align.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -57,6 +66,16 @@ struct AudioPipeline4Ch {
     float vad_silence_noise_keep; /* live-computed, was raw literal 0.95f */
     float vad_silence_new_weight; /* live-computed, was raw literal 0.05f */
     uint64_t frame_index;
+
+    /* Non-NULL only on the audio_pipeline_4ch_create() heap path: the single
+     * posix_memalign()'d block backing this whole struct plus every carved
+     * sub-region below it (core/srp/gsc/scratch), freed by
+     * audio_pipeline_4ch_destroy(). NULL on the audio_pipeline_4ch_init()
+     * caller-pool path, where the caller owns the memory and destroy() must
+     * not free it. Same convention as FourAecNrRes::owned_heap/SRP::
+     * owned_heap/GSC::owned_heap one layer down. */
+    void* owned_heap;
+    int destroyed;
 };
 
 /* ============================================================================
@@ -158,89 +177,190 @@ AudioPipeline4ChConfig audio_pipeline_4ch_default_config(int sample_rate) {
     return cfg;
 }
 
-static ArrayGeometry* create_geometry(
-    const AudioPipeline4ChConfig* cfg) {
-    switch (cfg->geometry) {
-        case AUDIO_PIPELINE_4CH_GEOMETRY_UCA:
-            return array_geometry_create_uca(
-                FOUR_AEC_NR_RES_CHANNELS, cfg->uca_radius_m);
-        case AUDIO_PIPELINE_4CH_GEOMETRY_ULA:
-            return array_geometry_create_ula(
-                FOUR_AEC_NR_RES_CHANNELS, cfg->ula_spacing_m);
-        case AUDIO_PIPELINE_4CH_GEOMETRY_CUSTOM:
-            return array_geometry_create_custom(
-                FOUR_AEC_NR_RES_CHANNELS,
-                cfg->microphone_x_m, cfg->microphone_y_m);
-        default:
-            return NULL;
+/* ============================================================================
+ * Pool-first construction: file-private PoolCursor/pool_carve(), same
+ * bump-allocator shape kept file-private by 4aec_nr_res.c/srp.c/gsc.c (each
+ * keeps its own copy per those files' own precedent, not shared).
+ * ========================================================================== */
+
+typedef struct PoolCursor {
+    uint8_t* ptr;
+    size_t remaining;
+} PoolCursor;
+
+static void* pool_carve(PoolCursor* cursor, size_t count,
+                        size_t element_size) {
+    size_t raw;
+    size_t aligned;
+    void* out;
+    if (!cursor || count == 0 || element_size == 0) return NULL;
+    raw = ck_mul_size(count, element_size);
+    aligned = ck_align16_size(raw);
+    if (MEM_SIZE_INVALID(raw) || MEM_SIZE_INVALID(aligned) ||
+        aligned > cursor->remaining) return NULL;
+    out = cursor->ptr;
+    cursor->ptr += aligned;
+    cursor->remaining -= aligned;
+    return out;
+}
+
+/* ============================================================================
+ * Build-flags hash
+ * ========================================================================== */
+
+static uint32_t fnv1a_str(const char* text, uint32_t hash) {
+    while (*text) {
+        hash ^= (uint32_t)(unsigned char)*text++;
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+/* Plain FNV-style integer mix, no snprintf/stdio -- this path must stay
+ * NO_STDIO-safe (see Makefile's audit-no-stdio). Folds in the core layer's
+ * own build_flags_hash so a core-layout version bump also invalidates every
+ * persisted composite descriptor here, never silently keeps fitting a pool
+ * sized for a stale core layout -- see AudioPipeline4ChMemReq's doc comment. */
+static uint32_t audio_pipeline_4ch_build_flags_hash(
+    uint32_t core_build_flags_hash) {
+    uint32_t hash = 2166136261u;
+    hash = fnv1a_str(
+        "|carve:self,core,srp,gsc,spatial_input,gsc_spectrum,gsc_weights",
+        hash);
+    hash = fnv1a_str("|align16", hash);
+    hash ^= core_build_flags_hash;
+    hash *= 16777619u;
+    return hash;
+}
+
+/* ============================================================================
+ * Stack-only array geometry (no malloc)
+ *
+ * Fill formulas copied verbatim from third_party/doa/steering.c's
+ * array_geometry_create_uca/_ula/_custom() so a stack-local ArrayGeometry
+ * here produces bit-identical x/y coordinates to what the old heap path's
+ * malloc-based geometry produced -- calling that malloc-based helper (even
+ * though it was freed immediately after use) would otherwise be a hidden
+ * allocation inside what is supposed to be a zero-allocator init_ex() path.
+ * M is kept as a local int matching the originals' own locals, so the
+ * float/double promotion sequence in the UCA phi expression stays identical.
+ * ========================================================================== */
+
+static void fill_uca_geometry(float radius, float* x, float* y) {
+    int M = FOUR_AEC_NR_RES_CHANNELS;
+    int m;
+    for (m = 0; m < M; m++) {
+        float phi = 2.0f * M_PI * m / M;
+        x[m] = radius * cosf(phi);
+        y[m] = radius * sinf(phi);
     }
 }
 
-AudioPipeline4Ch* audio_pipeline_4ch_create(
-    const AudioPipeline4ChConfig* cfg) {
-    AudioPipeline4Ch* p;
-    ArrayGeometry* geometry;
-    SRP_Config srp_cfg;
-    GSC_Config gsc_cfg;
-    int fft_size;
-    size_t spectral_count;
+static void fill_ula_geometry(float spacing, float* x, float* y) {
+    int M = FOUR_AEC_NR_RES_CHANNELS;
+    float center = 0.5f * (M - 1);
+    int m;
+    for (m = 0; m < M; m++) {
+        x[m] = (m - center) * spacing;
+        y[m] = 0.0f;
+    }
+}
 
-    if (!validate_config(cfg)) return NULL;
-    p = (AudioPipeline4Ch*)calloc(1, sizeof(*p));
-    if (!p) return NULL;
-    p->cfg = *cfg;
-    p->core = four_aec_nr_res_create(&cfg->core);
-    if (!p->core) goto fail;
-    p->hop_size = four_aec_nr_res_hop_size(p->core);
-    p->n_freqs = four_aec_nr_res_n_freqs(p->core);
-    fft_size = four_aec_nr_res_fft_size(p->core);
-    p->fft_size = fft_size;
+static void fill_custom_geometry(
+    const AudioPipeline4ChConfig* cfg, float* x, float* y) {
+    int m;
+    for (m = 0; m < FOUR_AEC_NR_RES_CHANNELS; m++) {
+        x[m] = cfg->microphone_x_m[m];
+        y[m] = cfg->microphone_y_m[m];
+    }
+}
 
-    geometry = create_geometry(cfg);
-    if (!geometry) goto fail;
-    memset(&srp_cfg, 0, sizeof(srp_cfg));
-    srp_cfg.M = FOUR_AEC_NR_RES_CHANNELS;
-    srp_cfg.F = p->n_freqs;
-    srp_cfg.num_angles = cfg->num_angles;
-    srp_cfg.sr = (float)cfg->core.sample_rate;
-    srp_cfg.NFFT = (float)fft_size;
-    srp_cfg.c = cfg->speed_of_sound_m_s;
-    srp_cfg.low_freq = cfg->doa_low_freq_hz;
-    srp_cfg.high_freq = cfg->doa_high_freq_hz > 0.0f
+/* Builds geom in place from caller-supplied x/y storage (sized
+ * FOUR_AEC_NR_RES_CHANNELS, a compile-time constant -- no VLA needed).
+ * ArrayGeometry is never stored long-term (SRP does not keep a pointer to
+ * it, only reads geom->x/geom->y transiently inside srp_init()), so a
+ * stack-local temporary that goes out of scope right after the srp_init()
+ * call below is safe. */
+static int fill_stack_geometry(
+    const AudioPipeline4ChConfig* cfg,
+    float* x, float* y, ArrayGeometry* geom) {
+    switch (cfg->geometry) {
+        case AUDIO_PIPELINE_4CH_GEOMETRY_UCA:
+            fill_uca_geometry(cfg->uca_radius_m, x, y);
+            break;
+        case AUDIO_PIPELINE_4CH_GEOMETRY_ULA:
+            fill_ula_geometry(cfg->ula_spacing_m, x, y);
+            break;
+        case AUDIO_PIPELINE_4CH_GEOMETRY_CUSTOM:
+            fill_custom_geometry(cfg, x, y);
+            break;
+        default:
+            return 0;
+    }
+    geom->M = FOUR_AEC_NR_RES_CHANNELS;
+    geom->x = x;
+    geom->y = y;
+    return 1;
+}
+
+/* ============================================================================
+ * Config -> SRP/GSC module configs (shared by get_mem_requirements/init_ex)
+ * ========================================================================== */
+
+/*
+ * Builds srp_cfg/gsc_cfg from cfg plus the core's own already-derived
+ * hop/fft/n_freqs -- mirrors 4aec_nr_res.c's derive_dims_and_configs()'s role
+ * of "compute once, reuse in both sizing and init". Extracted from what used
+ * to be audio_pipeline_4ch_create()'s inline SRP_Config/GSC_Config
+ * construction so audio_pipeline_4ch_get_mem_requirements() and
+ * audio_pipeline_4ch_init_ex() can never silently diverge on this logic.
+ */
+static int derive_spatial_configs(
+    const AudioPipeline4ChConfig* cfg,
+    int hop, int fft, int n_freqs,
+    SRP_Config* srp_cfg, GSC_Config* gsc_cfg) {
+    int gsc_effective_interval;
+    if (!cfg || !srp_cfg || !gsc_cfg) return 0;
+
+    memset(srp_cfg, 0, sizeof(*srp_cfg));
+    srp_cfg->M = FOUR_AEC_NR_RES_CHANNELS;
+    srp_cfg->F = n_freqs;
+    srp_cfg->num_angles = cfg->num_angles;
+    srp_cfg->sr = (float)cfg->core.sample_rate;
+    srp_cfg->NFFT = (float)fft;
+    srp_cfg->c = cfg->speed_of_sound_m_s;
+    srp_cfg->low_freq = cfg->doa_low_freq_hz;
+    srp_cfg->high_freq = cfg->doa_high_freq_hz > 0.0f
         ? fminf(cfg->doa_high_freq_hz,
                 0.5f * (float)cfg->core.sample_rate)
         : fminf(7000.0f, 0.5f * (float)cfg->core.sample_rate);
-    srp_cfg.enable_smoothing = cfg->doa_enable_smoothing;
-    srp_cfg.switch_consec = cfg->doa_switch_consecutive;
-    srp_cfg.angle_tol = cfg->doa_angle_tolerance_rad;
-    srp_cfg.update_interval = cfg->doa_update_interval;
-    p->srp = srp_create_from_geometry(&srp_cfg, geometry);
-    p->gsc_steering = p->srp ? p->srp->a_array : NULL;
-    array_geometry_destroy(geometry);
-    if (!p->srp || !p->gsc_steering) goto fail;
+    srp_cfg->enable_smoothing = cfg->doa_enable_smoothing;
+    srp_cfg->switch_consec = cfg->doa_switch_consecutive;
+    srp_cfg->angle_tol = cfg->doa_angle_tolerance_rad;
+    srp_cfg->update_interval = cfg->doa_update_interval;
 
-    /* gsc_create() forces the RLS update cadence to 1 (every hop) whenever
-     * fixed-notebook mode is requested (gsc_fixed_mode && gsc_fixed_align_
-     * notebook), regardless of the caller's configured gsc_adapt_interval --
-     * see gsc.c's gsc_effective_adapt_interval(). Derive that SAME effective
-     * value here, once, and feed it into both the lambda retime scaling
-     * below and gsc_cfg.adapt_interval, so the cadence lambda is calibrated
-     * for and the cadence GSC actually runs at can never silently diverge
-     * (previously lambda was scaled by the raw pre-forced gsc_adapt_interval
-     * while gsc_create() silently forced the real cadence to 1). */
-    int gsc_effective_interval = gsc_effective_adapt_interval(
+    /* gsc_create()/gsc_init() force the RLS update cadence to 1 (every hop)
+     * whenever fixed-notebook mode is requested (gsc_fixed_mode &&
+     * gsc_fixed_align_notebook), regardless of the caller's configured
+     * gsc_adapt_interval -- see gsc.c's gsc_effective_adapt_interval().
+     * Derive that SAME effective value here, once, and feed it into both the
+     * lambda retime scaling below and gsc_cfg->adapt_interval, so the
+     * cadence lambda is calibrated for and the cadence GSC actually runs at
+     * can never silently diverge (a prior bug scaled lambda by the raw
+     * pre-forced gsc_adapt_interval while gsc_create() silently forced the
+     * real cadence to 1). */
+    gsc_effective_interval = gsc_effective_adapt_interval(
         cfg->gsc_fixed_mode, cfg->gsc_fixed_align_notebook,
         cfg->gsc_adapt_interval);
 
-    memset(&gsc_cfg, 0, sizeof(gsc_cfg));
-    gsc_cfg.enable = cfg->gsc_enable;
+    memset(gsc_cfg, 0, sizeof(*gsc_cfg));
+    gsc_cfg->enable = cfg->gsc_enable;
     /* gsc_lambda is an RLS forgetting/retention factor tuned at a 10-ms
-     * reference update (like NR's alpha_d/alpha_attack just above in the
-     * mono/4ch NR config derivation) -- was forwarded as a raw literal
-     * regardless of grid, so its real wall-clock forgetting time varied
-     * with hop_size/sample_rate. Retimed via the same helper NR already
-     * uses for this exact class of constant. mu is a step-size gain, not
-     * a decay time-constant, so it is left as-is.
+     * reference update (like NR's alpha_d/alpha_attack in the mono/4ch NR
+     * config derivation) -- its real wall-clock forgetting time varies with
+     * hop_size/sample_rate, so it is retimed via the same helper NR uses for
+     * this exact class of constant. mu is a step-size gain, not a decay
+     * time-constant, so it is left as-is.
      *
      * The RLS update itself only actually applies once every
      * gsc_effective_interval hops (gsc.c gates the whole P/gain/weight-update
@@ -249,58 +369,253 @@ AudioPipeline4Ch* audio_pipeline_4ch_create(
      * "10ms reference" tuning assumed one update per hop (interval=1) --
      * there is no matching batching on the authored side to cancel against
      * -- so when the effective interval > 1 the real wall-clock update
-     * period is that many hops, and the retime call must scale hop_size by
-     * it (no-op at the shipped default of 1). */
-    gsc_cfg.lambda = mmse_lsa_retime_alpha(
+     * period is that many hops, and the retime call must scale hop by it
+     * (no-op at the shipped default of 1). */
+    gsc_cfg->lambda = mmse_lsa_retime_alpha(
         cfg->gsc_lambda, cfg->core.sample_rate,
-        p->hop_size * gsc_effective_interval);
-    gsc_cfg.mu = cfg->gsc_mu;
-    gsc_cfg.enable_fix_mode = cfg->gsc_fixed_mode;
-    gsc_cfg.fixed_doa_rad = cfg->gsc_fixed_doa_rad;
-    gsc_cfg.fixed_align_notebook = cfg->gsc_fixed_align_notebook;
-    gsc_cfg.adapt_interval = gsc_effective_interval;
-    p->gsc = gsc_create(
-        FOUR_AEC_NR_RES_CHANNELS, p->n_freqs, cfg->num_angles,
-        p->gsc_steering, &gsc_cfg);
-    if (!p->gsc) goto fail;
+        hop * gsc_effective_interval);
+    gsc_cfg->mu = cfg->gsc_mu;
+    gsc_cfg->enable_fix_mode = cfg->gsc_fixed_mode;
+    gsc_cfg->fixed_doa_rad = cfg->gsc_fixed_doa_rad;
+    gsc_cfg->fixed_align_notebook = cfg->gsc_fixed_align_notebook;
+    gsc_cfg->adapt_interval = gsc_effective_interval;
+    return 1;
+}
 
-    /* auto_vad_hangover_frames + the speech/silence noise-EMA pairs were
-     * raw literals (8 frames; 0.999/0.001; 0.95/0.05) applied regardless of
-     * grid -- same class of bug as gsc_lambda above, fixed the same way.
-     * The EMA pairs are retention/new-weight complements (old_weight +
-     * new_weight == 1 by construction); retime the retention factor and
-     * derive new_weight from it so that invariant still holds post-retime. */
+/* ============================================================================
+ * Memory sizing -- compute once, reuse in get_mem_requirements()/init_ex()
+ * ========================================================================== */
+
+static int derive_pipeline_layout(
+    const AudioPipeline4ChConfig* cfg,
+    FourAecNrResMemReq* core_req,
+    SRP_Config* srp_cfg, GSC_Config* gsc_cfg,
+    int* hop, int* fft, int* n_freqs,
+    size_t* srp_bytes, size_t* gsc_bytes) {
+    FourAecNrResMemBreakdown breakdown;
+    if (!cfg || !core_req || !srp_cfg || !gsc_cfg || !hop || !fft ||
+        !n_freqs || !srp_bytes || !gsc_bytes) return 0;
+    if (!validate_config(cfg)) return 0;
+    if (four_aec_nr_res_get_mem_requirements(&cfg->core, core_req) != 0)
+        return 0;
+    /* four_aec_nr_res_get_mem_breakdown() already derives hop/fft/n_freqs
+     * from cfg alone -- no live core instance required. */
+    if (four_aec_nr_res_get_mem_breakdown(&cfg->core, &breakdown) != 0)
+        return 0;
+    *hop = breakdown.hop_size;
+    *fft = breakdown.fft_size;
+    *n_freqs = breakdown.n_freqs;
+    if (!derive_spatial_configs(cfg, *hop, *fft, *n_freqs, srp_cfg, gsc_cfg))
+        return 0;
+    *srp_bytes = srp_get_mem_size(srp_cfg);
+    *gsc_bytes = gsc_get_mem_size(FOUR_AEC_NR_RES_CHANNELS, *n_freqs);
+    if (*srp_bytes == 0 || *gsc_bytes == 0) return 0;
+    return 1;
+}
+
+int audio_pipeline_4ch_get_mem_requirements(
+    const AudioPipeline4ChConfig* cfg,
+    AudioPipeline4ChMemReq* out) {
+    FourAecNrResMemReq core_req;
+    SRP_Config srp_cfg;
+    GSC_Config gsc_cfg;
+    int hop, fft, n_freqs;
+    size_t srp_bytes, gsc_bytes;
+    size_t spectral_count;
+    size_t total;
+
+    if (!out || !derive_pipeline_layout(
+            cfg, &core_req, &srp_cfg, &gsc_cfg,
+            &hop, &fft, &n_freqs, &srp_bytes, &gsc_bytes)) return -1;
+    if (core_req.bytes > (uint64_t)SIZE_MAX) return -1;
+
+    total = ck_align16_size(sizeof(AudioPipeline4Ch));
+    total = ck_add_size(total, ck_align16_size((size_t)core_req.bytes));
+    total = ck_add_size(total, ck_align16_size(srp_bytes));
+    total = ck_add_size(total, ck_align16_size(gsc_bytes));
+
+    spectral_count = (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n_freqs;
+    total = ck_field_size(
+        total, spectral_count, sizeof(Complex));       /* spatial_input */
+    total = ck_field_size(
+        total, (size_t)n_freqs, sizeof(Complex));       /* gsc_spectrum */
+    total = ck_field_size(
+        total, spectral_count, sizeof(Complex));        /* gsc_weights */
+
+    if (MEM_SIZE_INVALID(total)) return -1;
+
+    memset(out, 0, sizeof(*out));
+    out->descriptor_version = AUDIO_PIPELINE_4CH_DESCRIPTOR_VERSION;
+    out->layout_version = AUDIO_PIPELINE_4CH_LAYOUT_VERSION;
+    out->backend_id = core_req.backend_id;
+    out->build_flags_hash =
+        audio_pipeline_4ch_build_flags_hash(core_req.build_flags_hash);
+    out->alignment = 16u;
+    out->bytes = (uint64_t)total;
+    return 0;
+}
+
+/* ============================================================================
+ * Caller-pool init and heap convenience construction
+ * ========================================================================== */
+
+AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
+    void* mem,
+    size_t bytes,
+    const AudioPipeline4ChConfig* cfg,
+    const AudioPipeline4ChMemReq* expected) {
+    AudioPipeline4ChConfig cfg_copy;
+    AudioPipeline4ChMemReq current;
+    FourAecNrResMemReq core_req;
+    SRP_Config srp_cfg;
+    GSC_Config gsc_cfg;
+    int hop, fft, n_freqs;
+    size_t srp_bytes, gsc_bytes;
+    float geom_x[FOUR_AEC_NR_RES_CHANNELS];
+    float geom_y[FOUR_AEC_NR_RES_CHANNELS];
+    ArrayGeometry geom;
+    AudioPipeline4Ch* p;
+    PoolCursor cursor;
+    void* core_region;
+    void* srp_region;
+    void* gsc_region;
+    size_t spectral_count;
+    int m;
+
+    if (!mem || !cfg) return NULL;
+    cfg_copy = *cfg;
+    if (audio_pipeline_4ch_get_mem_requirements(&cfg_copy, &current) != 0)
+        return NULL;
+
+    if (expected) {
+        if (expected->descriptor_version != current.descriptor_version ||
+            expected->layout_version != current.layout_version ||
+            expected->backend_id != current.backend_id ||
+            expected->build_flags_hash != current.build_flags_hash ||
+            expected->alignment != current.alignment ||
+            expected->reserved != 0u ||
+            expected->bytes < current.bytes)
+            return NULL;
+    }
+    if (!MEM_IS_ALIGNED16(mem) ||
+        current.bytes > (uint64_t)SIZE_MAX ||
+        (uint64_t)bytes < current.bytes) return NULL;
+
+    if (!derive_pipeline_layout(
+            &cfg_copy, &core_req, &srp_cfg, &gsc_cfg,
+            &hop, &fft, &n_freqs, &srp_bytes, &gsc_bytes)) return NULL;
+    if (core_req.bytes > (uint64_t)SIZE_MAX) return NULL;
+    if (!fill_stack_geometry(&cfg_copy, geom_x, geom_y, &geom)) return NULL;
+
+    memset(mem, 0, (size_t)current.bytes);
+    p = (AudioPipeline4Ch*)mem;
+    p->cfg = cfg_copy;
+
+    cursor.ptr = (uint8_t*)mem + ALIGN16(sizeof(*p));
+    cursor.remaining = (size_t)current.bytes - ALIGN16(sizeof(*p));
+
+    /* Composition order: query each sub-module's own size -> carve an
+     * equal-sized sub-region from this cursor -> call that sub-module's own
+     * init/init_ex. This is the same technique 4aec_nr_res.c's
+     * pipeline_build() uses to carve its four Aec lanes. Carving core first
+     * is what actually switches this wrapper from four_aec_nr_res_create()
+     * (heap) to four_aec_nr_res_init_ex() (pool). */
+    core_region = pool_carve(&cursor, 1, (size_t)core_req.bytes);
+    if (!core_region) return NULL;
+    p->core = four_aec_nr_res_init_ex(
+        core_region, (size_t)core_req.bytes, &cfg_copy.core, &core_req);
+    if (!p->core) return NULL;
+
+    srp_region = pool_carve(&cursor, 1, srp_bytes);
+    if (!srp_region) return NULL;
+    p->srp = srp_init(srp_region, srp_bytes, &srp_cfg, &geom);
+    if (!p->srp) return NULL;
+    /* Same borrow relationship as the heap path: GSC never owns/frees
+     * a_array. It now points into pool memory with a lifetime tied to p
+     * itself, rather than to a separately heap-managed SRP. */
+    p->gsc_steering = p->srp->a_array;
+    if (!p->gsc_steering) return NULL;
+
+    gsc_region = pool_carve(&cursor, 1, gsc_bytes);
+    if (!gsc_region) return NULL;
+    p->gsc = gsc_init(
+        gsc_region, gsc_bytes, FOUR_AEC_NR_RES_CHANNELS, n_freqs,
+        cfg_copy.num_angles, p->gsc_steering, &gsc_cfg);
+    if (!p->gsc) return NULL;
+
+    spectral_count = (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n_freqs;
+    p->spatial_input =
+        (Complex*)pool_carve(&cursor, spectral_count, sizeof(Complex));
+    p->gsc_spectrum =
+        (Complex*)pool_carve(&cursor, (size_t)n_freqs, sizeof(Complex));
+    p->gsc_weights =
+        (Complex*)pool_carve(&cursor, spectral_count, sizeof(Complex));
+    if (!p->spatial_input || !p->gsc_spectrum ||
+        !p->gsc_weights) return NULL;
+    for (m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m) {
+        p->spatial_channels[m] =
+            p->spatial_input + (size_t)m * n_freqs;
+    }
+
+    p->hop_size = hop;
+    p->fft_size = fft;
+    p->n_freqs = n_freqs;
+
+    /* auto_vad_hangover_frames + the speech/silence noise-EMA pairs were raw
+     * literals (8 frames; 0.999/0.001; 0.95/0.05) applied regardless of grid
+     * -- same class of bug as gsc_lambda in derive_spatial_configs(), fixed
+     * the same way. The EMA pairs are retention/new-weight complements
+     * (old_weight + new_weight == 1 by construction); retime the retention
+     * factor and derive new_weight from it so that invariant still holds
+     * post-retime. */
     p->vad_hangover_frames = mmse_lsa_retime_frames(
-        cfg->auto_vad_hangover_frames, cfg->core.sample_rate, p->hop_size);
+        cfg_copy.auto_vad_hangover_frames, cfg_copy.core.sample_rate, hop);
     p->vad_speech_noise_keep = mmse_lsa_retime_alpha(
-        0.999f, cfg->core.sample_rate, p->hop_size);
+        0.999f, cfg_copy.core.sample_rate, hop);
     p->vad_speech_new_weight = 1.0f - p->vad_speech_noise_keep;
     p->vad_silence_noise_keep = mmse_lsa_retime_alpha(
-        0.95f, cfg->core.sample_rate, p->hop_size);
+        0.95f, cfg_copy.core.sample_rate, hop);
     p->vad_silence_new_weight = 1.0f - p->vad_silence_noise_keep;
-
-    spectral_count =
-        (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)p->n_freqs;
-    p->spatial_input =
-        (Complex*)malloc(spectral_count * sizeof(Complex));
-    p->gsc_spectrum =
-        (Complex*)malloc((size_t)p->n_freqs *
-                             sizeof(Complex));
-    p->gsc_weights =
-        (Complex*)malloc(spectral_count * sizeof(Complex));
-    if (!p->spatial_input || !p->gsc_spectrum ||
-        !p->gsc_weights) goto fail;
-    for (int m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m) {
-        p->spatial_channels[m] =
-            p->spatial_input + (size_t)m * p->n_freqs;
-    }
     p->noise_power =
-        powf(10.0f, cfg->auto_vad_threshold_dbfs / 10.0f);
-    return p;
+        powf(10.0f, cfg_copy.auto_vad_threshold_dbfs / 10.0f);
+    p->vad_hangover = 0;
+    p->frame_index = 0;
+    p->owned_heap = NULL;
+    p->destroyed = 0;
 
-fail:
-    audio_pipeline_4ch_destroy(p);
-    return NULL;
+    /* Lockstep proof: audio_pipeline_4ch_get_mem_requirements()'s walk and
+     * the carves above must consume exactly current.bytes, no more, no
+     * less -- every sub-pointer above is already non-NULL-checked. */
+    if (cursor.remaining != 0) return NULL;
+    return p;
+}
+
+AudioPipeline4Ch* audio_pipeline_4ch_init(
+    void* mem,
+    size_t bytes,
+    const AudioPipeline4ChConfig* cfg) {
+    return audio_pipeline_4ch_init_ex(mem, bytes, cfg, NULL);
+}
+
+AudioPipeline4Ch* audio_pipeline_4ch_create(
+    const AudioPipeline4ChConfig* cfg) {
+    AudioPipeline4ChMemReq req;
+    AudioPipeline4Ch* p;
+    void* pool = NULL;
+    if (!cfg ||
+        audio_pipeline_4ch_get_mem_requirements(cfg, &req) != 0 ||
+        req.bytes > (uint64_t)SIZE_MAX)
+        return NULL;
+    if (posix_memalign(
+            &pool, (size_t)req.alignment, (size_t)req.bytes) != 0 || !pool)
+        return NULL;
+    p = audio_pipeline_4ch_init(pool, (size_t)req.bytes, cfg);
+    if (!p) {
+        free(pool);
+        return NULL;
+    }
+    p->owned_heap = pool;
+    return p;
 }
 
 /* ============================================================================
@@ -348,8 +663,8 @@ int audio_pipeline_4ch_process_with_activity(
     size_t spectral_count;
     int status;
     int doa_analysis_frames;
-    if (!p || !microphones_interleaved || !far_reference || !output ||
-        !is_bool(vad_raw) || !is_bool(vad_out)) {
+    if (!p || p->destroyed || !microphones_interleaved || !far_reference ||
+        !output || !is_bool(vad_raw) || !is_bool(vad_out)) {
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     }
     status = four_aec_nr_res_process_pre(
@@ -441,7 +756,7 @@ int audio_pipeline_4ch_process(
     float* output,
     AudioPipeline4ChFrameInfo* info) {
     int speech;
-    if (!p || !microphones_interleaved)
+    if (!p || p->destroyed || !microphones_interleaved)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     speech = auto_vad(p, microphones_interleaved);
     return audio_pipeline_4ch_process_with_activity(
@@ -454,7 +769,7 @@ int audio_pipeline_4ch_process(
  * ========================================================================== */
 
 void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
-    if (!p) return;
+    if (!p || p->destroyed) return;
     four_aec_nr_res_reset(p->core);
     srp_reset(p->srp);
     gsc_reset(p->gsc);
@@ -465,15 +780,20 @@ void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
 }
 
 void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p) {
-    if (!p) return;
-    /* GSC borrows the steering table; destroy it before its owner. */
+    void* owned_heap;
+    if (!p || p->destroyed) return;
+    /* GSC borrows the steering table; destroy it before its owner. Each of
+     * these three is a no-op free on the pool-carved sub-objects this
+     * wrapper builds inside its own pool/heap block (their own owned_heap
+     * fields stay NULL -- see audio_pipeline_4ch_init_ex()); only this
+     * wrapper's OWN owned_heap (set only by audio_pipeline_4ch_create()) is
+     * ever actually freed below, exactly once. */
     gsc_destroy(p->gsc);
     srp_destroy(p->srp);
     four_aec_nr_res_destroy(p->core);
-    free(p->spatial_input);
-    free(p->gsc_spectrum);
-    free(p->gsc_weights);
-    free(p);
+    owned_heap = p->owned_heap;
+    p->destroyed = 1;
+    if (owned_heap) free(owned_heap);
 }
 
 /* ============================================================================
@@ -481,23 +801,23 @@ void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p) {
  * ========================================================================== */
 
 int audio_pipeline_4ch_hop_size(const AudioPipeline4Ch* p) {
-    return p ? p->hop_size : -1;
+    return (p && !p->destroyed) ? p->hop_size : -1;
 }
 
 int audio_pipeline_4ch_frame_size(const AudioPipeline4Ch* p) {
-    return p ? p->fft_size : -1;
+    return (p && !p->destroyed) ? p->fft_size : -1;
 }
 
 int audio_pipeline_4ch_fft_size(const AudioPipeline4Ch* p) {
-    return p ? p->fft_size : -1;
+    return (p && !p->destroyed) ? p->fft_size : -1;
 }
 
 int audio_pipeline_4ch_n_freqs(const AudioPipeline4Ch* p) {
-    return p ? p->n_freqs : -1;
+    return (p && !p->destroyed) ? p->n_freqs : -1;
 }
 
 int audio_pipeline_4ch_sample_rate(const AudioPipeline4Ch* p) {
-    return p ? four_aec_nr_res_sample_rate(p->core) : -1;
+    return (p && !p->destroyed) ? four_aec_nr_res_sample_rate(p->core) : -1;
 }
 
 int audio_pipeline_4ch_doa_sample_rate(const AudioPipeline4Ch* p) {
@@ -517,28 +837,28 @@ int audio_pipeline_4ch_doa_fft_size(const AudioPipeline4Ch* p) {
 }
 
 int audio_pipeline_4ch_gsc_sample_rate(const AudioPipeline4Ch* p) {
-    return p ? p->cfg.core.sample_rate : -1;
+    return (p && !p->destroyed) ? p->cfg.core.sample_rate : -1;
 }
 
 int audio_pipeline_4ch_gsc_frame_size(const AudioPipeline4Ch* p) {
-    return p ? p->fft_size : -1;
+    return (p && !p->destroyed) ? p->fft_size : -1;
 }
 
 int audio_pipeline_4ch_gsc_hop_size(const AudioPipeline4Ch* p) {
-    return p ? p->hop_size : -1;
+    return (p && !p->destroyed) ? p->hop_size : -1;
 }
 
 int audio_pipeline_4ch_gsc_fft_size(const AudioPipeline4Ch* p) {
-    return p ? p->fft_size : -1;
+    return (p && !p->destroyed) ? p->fft_size : -1;
 }
 
 int audio_pipeline_4ch_gsc_effective_adapt_interval(
     const AudioPipeline4Ch* p) {
-    return (p && p->gsc) ? p->gsc->adapt_interval : -1;
+    return (p && !p->destroyed && p->gsc) ? p->gsc->adapt_interval : -1;
 }
 
 float audio_pipeline_4ch_gsc_lambda(const AudioPipeline4Ch* p) {
-    return (p && p->gsc) ? p->gsc->lambda : NAN;
+    return (p && !p->destroyed && p->gsc) ? p->gsc->lambda : NAN;
 }
 
 int audio_pipeline_4ch_matched_filter_count(const AudioPipeline4Ch* p) {

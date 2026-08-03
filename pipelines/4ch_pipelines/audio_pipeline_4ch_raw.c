@@ -9,6 +9,7 @@
 
 #include <errno.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,7 @@ typedef struct Options {
     float uca_radius_m;
     int fixed_doa;
     float fixed_doa_rad;
+    int print_mem_size;
 } Options;
 
 /* ------------------------------------------------------------------ */
@@ -39,8 +41,42 @@ static void usage(const char* program) {
             "--output-raw OUT.f32 --sample-rate 16000|48000 "
             "[--fft-size 256|512|1024] "
             "[--vad-u8 VAD.u8] [--uca-radius-m 0.035] "
-            "[--fixed-doa-deg DEG]\n",
-            program);
+            "[--fixed-doa-deg DEG]\n"
+            "       %s --print-mem-size --sample-rate 16000|48000 "
+            "[--fft-size 256|512|1024]\n",
+            program, program);
+}
+
+static const char* backend_id_name(uint32_t backend_id) {
+    switch (backend_id) {
+        case FOUR_AEC_NR_RES_BACKEND_KISS: return "kiss";
+        case FOUR_AEC_NR_RES_BACKEND_NE10: return "ne10";
+        default:                           return "unknown";
+    }
+}
+
+static int print_mem_budget(const AudioPipeline4ChConfig* cfg) {
+    AudioPipeline4ChMemReq req;
+    if (audio_pipeline_4ch_get_mem_requirements(cfg, &req) != 0) {
+        fprintf(stderr, "Error: invalid 4ch spatial pipeline config\n");
+        return -1;
+    }
+    printf("Memory Budget (4ch spatial pipeline: core + SRP-PHAT + GSC)\n");
+    printf("=============================================================\n");
+    printf("  sample_rate=%d fft=%d geometry=%d num_angles=%d\n",
+           cfg->core.sample_rate,
+           cfg->core.fft_size ? cfg->core.fft_size
+                              : (cfg->core.sample_rate == 16000 ? 256 : 1024),
+           (int)cfg->geometry, cfg->num_angles);
+    printf("  Total:          %9llu bytes (%7.1f KB)\n",
+           (unsigned long long)req.bytes, (float)req.bytes / 1024.0f);
+    printf("  Descriptor:     descriptor_version=%u alignment=%u "
+           "layout_version=%u backend_id=%u (%s) "
+           "build_flags_hash=0x%08x\n\n",
+           req.descriptor_version, req.alignment, req.layout_version,
+           req.backend_id, backend_id_name(req.backend_id),
+           req.build_flags_hash);
+    return 0;
 }
 
 static int parse_int(const char* text, int* value) {
@@ -77,6 +113,10 @@ static int parse_options(int argc, char** argv, Options* options) {
     memset(options, 0, sizeof(*options));
     options->uca_radius_m = 0.035f;
     for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--print-mem-size") == 0) {
+            options->print_mem_size = 1;
+            continue;
+        }
         if (i + 1 >= argc) return 0;
         if (strcmp(argv[i], "--mic-raw") == 0) {
             options->mic_path = argv[++i];
@@ -102,9 +142,10 @@ static int parse_options(int argc, char** argv, Options* options) {
             return 0;
         }
     }
-    if (!options->mic_path || !options->ref_path ||
-        !options->output_path ||
-        !isfinite(options->uca_radius_m) ||
+    if (!options->print_mem_size &&
+        (!options->mic_path || !options->ref_path ||
+         !options->output_path)) return 0;
+    if (!isfinite(options->uca_radius_m) ||
         options->uca_radius_m <= 0.0f) return 0;
     if (options->sample_rate == 16000)
         return options->fft_size == 0 ||
@@ -150,6 +191,9 @@ int main(int argc, char** argv) {
     if (options.fixed_doa) {
         cfg.gsc_fixed_mode = 1;
         cfg.gsc_fixed_doa_rad = options.fixed_doa_rad;
+    }
+    if (options.print_mem_size) {
+        return print_mem_budget(&cfg) == 0 ? 0 : 1;
     }
     p = audio_pipeline_4ch_create(&cfg);
     if (!p) {

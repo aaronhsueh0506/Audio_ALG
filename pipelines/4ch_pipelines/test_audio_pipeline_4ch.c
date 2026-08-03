@@ -8,8 +8,10 @@
 #include "audio_pipeline_4ch.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define CHECK(condition, message)                                      \
     do {                                                               \
@@ -210,6 +212,215 @@ static int test_gsc_auto_mode_respects_configured_interval(void) {
     return 1;
 }
 
+/*
+ * Static-memory pool coverage for the descriptor-tier composition layer
+ * (Phase A.3): poison/bounds, descriptor-staleness rejection, and a
+ * heap-vs-pool byte-equal run. Mirrors 4ch_pipelines/test_4aec_nr_res.c's
+ * run_static_parity() -- same 0xa5 poison + EXTRA trailing-byte bounds check,
+ * same 8-point descriptor mutation block (descriptor_version/layout_version/
+ * backend_id/build_flags_hash/alignment/reserved/bytes/"stale layout despite
+ * larger cached bytes"), same destroy-then-reinit pool-reuse check -- plus a
+ * heap vs. pool side-by-side run across many synthetic hops comparing both
+ * the mono output hop and every scalar field of AudioPipeline4ChFrameInfo.
+ *
+ * Deliberately does NOT scan the whole poisoned pool for "rejected calls
+ * never touch it" (test_spatial_third_party.c's smaller SRP/GSC pools do;
+ * this composite pool can be several MB at 48 kHz/1024, and
+ * test_4aec_nr_res.c's own run_static_parity() -- the direct precedent for
+ * this descriptor tier -- likewise only checks the EXTRA trailing bytes
+ * after the ACCEPTING init, not a full-pool scan around every rejection).
+ */
+static int run_static_parity(int sample_rate, int fft_size) {
+    enum { EXTRA = 32, FRAMES = 40 };
+    AudioPipeline4ChConfig cfg =
+        audio_pipeline_4ch_default_config(sample_rate);
+    AudioPipeline4ChMemReq req;
+    AudioPipeline4ChMemReq stale;
+    AudioPipeline4Ch* heap;
+    AudioPipeline4Ch* stat;
+    unsigned char* pool = NULL;
+    float* microphones;
+    float* far;
+    float* heap_out;
+    float* stat_out;
+    float phase_step;
+    size_t pool_bytes;
+    size_t k;
+    int hop;
+    int frame;
+
+    cfg.core.fft_size = fft_size;
+    cfg.gsc_fixed_mode = 1;
+    cfg.gsc_fixed_doa_rad = 0.35f;
+    cfg.gsc_mu = 0.02f;
+
+    CHECK(audio_pipeline_4ch_get_mem_requirements(&cfg, &req) == 0,
+          "static memory requirement query succeeds");
+    CHECK(req.bytes <= (uint64_t)SIZE_MAX,
+          "static memory requirement fits size_t");
+    pool_bytes = (size_t)req.bytes + (size_t)EXTRA;
+
+    CHECK(posix_memalign(
+              (void**)&pool, (size_t)req.alignment, pool_bytes) == 0 && pool,
+          "aligned caller pool allocates");
+    memset(pool, 0xa5, pool_bytes);
+
+    CHECK(audio_pipeline_4ch_init(pool + 1, (size_t)req.bytes, &cfg) == NULL,
+          "static init rejects a misaligned pool");
+    CHECK(audio_pipeline_4ch_init(pool, (size_t)req.bytes - 1u, &cfg) == NULL,
+          "static init rejects an undersized pool");
+
+    stale = req;
+    stale.descriptor_version += 1u;
+    CHECK(audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &stale) ==
+              NULL,
+          "static init_ex rejects a stale descriptor ABI");
+    stale = req;
+    stale.layout_version += 1u;
+    CHECK(audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &stale) ==
+              NULL,
+          "static init_ex rejects a stale carve layout");
+    stale = req;
+    stale.backend_id = 99u;
+    CHECK(audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &stale) ==
+              NULL,
+          "static init_ex rejects a backend mismatch");
+    stale = req;
+    stale.build_flags_hash ^= 0xffffffffu;
+    CHECK(audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &stale) ==
+              NULL,
+          "static init_ex rejects a build-layout mismatch");
+    stale = req;
+    stale.alignment *= 2u;
+    CHECK(audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &stale) ==
+              NULL,
+          "static init_ex rejects an alignment mismatch");
+    stale = req;
+    stale.reserved = 1u;
+    CHECK(audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &stale) ==
+              NULL,
+          "static init_ex rejects a corrupt reserved field");
+    stale = req;
+    stale.bytes -= 1u;
+    CHECK(audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &stale) ==
+              NULL,
+          "static init_ex rejects stale descriptor bytes");
+    stale = req;
+    stale.layout_version -= 1u;
+    stale.bytes += 4096u;
+    CHECK(audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &stale) ==
+              NULL,
+          "static init_ex rejects a stale layout even when its cached bytes "
+          "are larger than current (byte count fitting must never "
+          "substitute for layout/hash agreement)");
+
+    stat = audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &req);
+    heap = audio_pipeline_4ch_create(&cfg);
+    CHECK(stat != NULL && heap != NULL,
+          "poisoned caller pool and heap construction both succeed");
+
+    for (k = 0; k < (size_t)EXTRA; ++k) {
+        if (pool[(size_t)req.bytes + k] != 0xa5) break;
+    }
+    CHECK(k == (size_t)EXTRA, "static init stays inside the queried pool");
+
+    hop = audio_pipeline_4ch_hop_size(stat);
+    CHECK(hop == audio_pipeline_4ch_hop_size(heap),
+          "heap and pool instances agree on hop size");
+    CHECK(hop == fft_size / 2, "rate-specific hop");
+
+    microphones = (float*)malloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
+    far = (float*)malloc((size_t)hop * sizeof(float));
+    heap_out = (float*)malloc((size_t)hop * sizeof(float));
+    stat_out = (float*)malloc((size_t)hop * sizeof(float));
+    CHECK(microphones && far && heap_out && stat_out,
+          "static parity buffers allocate");
+
+    phase_step = (float)(2.0 * M_PI * 700.0 / sample_rate);
+    for (frame = 0; frame < FRAMES; ++frame) {
+        AudioPipeline4ChFrameInfo heap_info;
+        AudioPipeline4ChFrameInfo stat_info;
+        int vad = frame >= 15;
+        int i;
+        int ch;
+
+        memset(&heap_info, 0, sizeof(heap_info));
+        memset(&stat_info, 0, sizeof(stat_info));
+
+        for (i = 0; i < hop; ++i) {
+            int64_t absolute = (int64_t)frame * hop + i;
+            float phase = phase_step * (float)absolute;
+            float echo = 0.08f * sinf(phase);
+            float near = vad ? 0.02f * sinf(phase * 1.6f + 0.3f) : 0.0f;
+            far[i] = echo;
+            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+                microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
+                    echo * (1.0f - 0.03f * ch) + near * (1.0f + 0.02f * ch);
+            }
+        }
+
+        CHECK(audio_pipeline_4ch_process_with_activity(
+                  heap, microphones, far, vad, vad, NULL,
+                  heap_out, &heap_info) == FOUR_AEC_NR_RES_OK,
+              "heap instance processes a synthetic hop");
+        CHECK(audio_pipeline_4ch_process_with_activity(
+                  stat, microphones, far, vad, vad, NULL,
+                  stat_out, &stat_info) == FOUR_AEC_NR_RES_OK,
+              "pool instance processes a synthetic hop");
+        CHECK(memcmp(heap_out, stat_out, (size_t)hop * sizeof(float)) == 0,
+              "heap/pool mono output is byte-identical");
+        CHECK(heap_info.frame_index == stat_info.frame_index,
+              "heap/pool frame_index matches");
+        CHECK(heap_info.delay.delay_samples ==
+                      stat_info.delay.delay_samples &&
+                  heap_info.delay.confidence == stat_info.delay.confidence &&
+                  heap_info.delay.solid == stat_info.delay.solid &&
+                  heap_info.delay.changed == stat_info.delay.changed &&
+                  heap_info.delay.estimator_calls ==
+                      stat_info.delay.estimator_calls &&
+                  heap_info.delay.estimator_updates ==
+                      stat_info.delay.estimator_updates,
+              "heap/pool delay state matches");
+        CHECK((isnan(heap_info.doa_raw_rad) &&
+                   isnan(stat_info.doa_raw_rad)) ||
+                  heap_info.doa_raw_rad == stat_info.doa_raw_rad,
+              "heap/pool doa_raw_rad matches");
+        CHECK((isnan(heap_info.doa_smooth_rad) &&
+                   isnan(stat_info.doa_smooth_rad)) ||
+                  heap_info.doa_smooth_rad == stat_info.doa_smooth_rad,
+              "heap/pool doa_smooth_rad matches");
+        CHECK((isnan(heap_info.doa_used_rad) &&
+                   isnan(stat_info.doa_used_rad)) ||
+                  heap_info.doa_used_rad == stat_info.doa_used_rad,
+              "heap/pool doa_used_rad matches");
+        CHECK(heap_info.vad_raw == stat_info.vad_raw &&
+                  heap_info.vad_out == stat_info.vad_out &&
+                  heap_info.gsc_adaptive == stat_info.gsc_adaptive &&
+                  heap_info.doa_analysis_frames ==
+                      stat_info.doa_analysis_frames,
+              "heap/pool remaining frame info fields match");
+    }
+
+    audio_pipeline_4ch_destroy(stat);
+    CHECK(audio_pipeline_4ch_hop_size(stat) == -1,
+          "destroy marks a caller-pool instance inactive");
+    audio_pipeline_4ch_destroy(stat);
+    CHECK(audio_pipeline_4ch_hop_size(stat) == -1,
+          "caller-pool destroy is idempotent");
+    stat = audio_pipeline_4ch_init_ex(pool, (size_t)req.bytes, &cfg, &req);
+    CHECK(stat != NULL, "caller pool is reusable after destroy");
+
+    audio_pipeline_4ch_destroy(stat);
+    audio_pipeline_4ch_destroy(heap);
+    free(stat_out);
+    free(heap_out);
+    free(far);
+    free(microphones);
+    free(pool);
+    return 1;
+}
+
 /* CHECK() early-returns 0 from whichever function it is lexically inside.
  * All top-level assertions therefore run inside this helper (not directly in
  * main()) so a failure returns 0 here -- a value main() explicitly turns
@@ -247,6 +458,12 @@ static int run_all_tests(void) {
           "GSC fixed-notebook lambda/forced-cadence match test");
     CHECK(test_gsc_auto_mode_respects_configured_interval(),
           "GSC auto-mode configured-interval test");
+    CHECK(run_static_parity(16000, 256),
+          "16 kHz 256/128 static-memory pool parity");
+    CHECK(run_static_parity(16000, 512),
+          "16 kHz 512/256 static-memory pool parity");
+    CHECK(run_static_parity(48000, 1024),
+          "48 kHz 1024/512 static-memory pool parity");
     printf("All audio_pipeline_4ch tests passed (spatial=%s)\n",
            audio_pipeline_4ch_spatial_backend());
     return 1;
