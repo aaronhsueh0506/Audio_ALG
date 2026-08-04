@@ -53,12 +53,13 @@ struct AudioPipeline4Ch {
     int hop_size;
     int fft_size;
     int n_freqs;
-    Complex* spatial_input;
-    Complex* spatial_channels[FOUR_AEC_NR_RES_CHANNELS];
     Complex* gsc_spectrum;
     Complex* gsc_weights;
 
     float noise_power;
+    float vad_power_threshold;    /* live-computed from cfg.auto_vad_threshold_dbfs,
+                                    * cached so auto_vad()'s per-hop path doesn't
+                                    * re-derive a config-only constant every call */
     int vad_hangover;
     int vad_hangover_frames;      /* live-computed, was raw cfg.auto_vad_hangover_frames */
     float vad_speech_noise_keep;  /* live-computed, was raw literal 0.999f */
@@ -225,7 +226,7 @@ static uint32_t audio_pipeline_4ch_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(
-        "|carve:self,core,srp,gsc,spatial_input,gsc_spectrum,gsc_weights",
+        "|carve:self,core,srp,gsc,gsc_spectrum,gsc_weights",
         hash);
     hash = fnv1a_str("|align16", hash);
     hash ^= core_build_flags_hash;
@@ -436,8 +437,6 @@ int audio_pipeline_4ch_get_mem_requirements(
 
     spectral_count = (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n_freqs;
     total = ck_field_size(
-        total, spectral_count, sizeof(Complex));       /* spatial_input */
-    total = ck_field_size(
         total, (size_t)n_freqs, sizeof(Complex));       /* gsc_spectrum */
     total = ck_field_size(
         total, spectral_count, sizeof(Complex));        /* gsc_weights */
@@ -480,7 +479,6 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     void* srp_region;
     void* gsc_region;
     size_t spectral_count;
-    int m;
 
     if (!mem || !cfg) return NULL;
     cfg_copy = *cfg;
@@ -544,18 +542,11 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     if (!p->gsc) return NULL;
 
     spectral_count = (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n_freqs;
-    p->spatial_input =
-        (Complex*)pool_carve(&cursor, spectral_count, sizeof(Complex));
     p->gsc_spectrum =
         (Complex*)pool_carve(&cursor, (size_t)n_freqs, sizeof(Complex));
     p->gsc_weights =
         (Complex*)pool_carve(&cursor, spectral_count, sizeof(Complex));
-    if (!p->spatial_input || !p->gsc_spectrum ||
-        !p->gsc_weights) return NULL;
-    for (m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m) {
-        p->spatial_channels[m] =
-            p->spatial_input + (size_t)m * n_freqs;
-    }
+    if (!p->gsc_spectrum || !p->gsc_weights) return NULL;
 
     p->hop_size = hop;
     p->fft_size = fft;
@@ -576,8 +567,9 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     p->vad_silence_noise_keep = mmse_lsa_retime_alpha(
         0.95f, cfg_copy.core.sample_rate, hop);
     p->vad_silence_new_weight = 1.0f - p->vad_silence_noise_keep;
-    p->noise_power =
+    p->vad_power_threshold =
         powf(10.0f, cfg_copy.auto_vad_threshold_dbfs / 10.0f);
+    p->noise_power = p->vad_power_threshold;
     p->vad_hangover = 0;
     p->frame_index = 0;
     p->owned_heap = NULL;
@@ -622,15 +614,6 @@ AudioPipeline4Ch* audio_pipeline_4ch_create(
  * Per-hop processing
  * ========================================================================== */
 
-static int complex_values_finite(
-    const Complex* values, size_t count) {
-    if (!values) return 0;
-    for (size_t i = 0; i < count; ++i) {
-        if (!isfinite(values[i].r) || !isfinite(values[i].i)) return 0;
-    }
-    return 1;
-}
-
 static void fill_frame_info(
     AudioPipeline4Ch* p,
     const FourAecNrResPreFrame* pre,
@@ -660,7 +643,6 @@ int audio_pipeline_4ch_process_with_activity(
     float* output,
     AudioPipeline4ChFrameInfo* info) {
     FourAecNrResPreFrame pre;
-    size_t spectral_count;
     int status;
     int doa_analysis_frames;
     if (!p || p->destroyed || !microphones_interleaved || !far_reference ||
@@ -677,32 +659,32 @@ int audio_pipeline_4ch_process_with_activity(
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
 
-    for (int m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m) {
-        memcpy(p->spatial_channels[m], pre.linear_spectra[m],
-               (size_t)p->n_freqs * sizeof(Complex));
-    }
+    /* pre.linear_spectra[ch] already borrows each lane's own live spectrum
+     * (const Complex*) -- SRP/GSC only ever read through X, never write, so
+     * feeding them this array directly (now that their signatures take
+     * const Complex* const*) needs no per-hop copy into a wrapper-owned
+     * scratch buffer. */
     doa_step(
-        p->srp, p->spatial_channels, frequency_mask,
+        p->srp, pre.linear_spectra, frequency_mask,
         vad_raw, vad_out);
     doa_analysis_frames = 1;
     gsc_process_with_weights(
-        p->gsc, p->spatial_channels, doa_get_smooth(p->srp),
+        p->gsc, pre.linear_spectra, doa_get_smooth(p->srp),
         vad_out ? 0 : 1, frequency_mask, p->gsc_spectrum,
         p->gsc_weights);
 
-    spectral_count =
-        (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)p->n_freqs;
-    if (!complex_values_finite(
-            p->gsc_spectrum, (size_t)p->n_freqs) ||
-        !complex_values_finite(
-            p->gsc_weights, spectral_count)) {
-        audio_pipeline_4ch_reset(p);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
-    }
     /* gsc_spectrum and gsc_weights were produced atomically by the same
      * gsc_process_with_weights() call above.  Reuse that trusted mono error
      * instead of reconstructing one weighted sum a second time; the core
-     * still projects near/R2/comfort with those exact weights. */
+     * still projects near/R2/comfort with those exact weights.
+     *
+     * No finite check here: four_aec_nr_res_process_post_trusted_spectrum()
+     * -> process_post_impl() unconditionally re-validates the identical
+     * arrays on every call (validate_weights() on gsc_weights,
+     * fuse_contexts()'s complex_vector_finite() on gsc_spectrum) before
+     * either is read, and this wrapper's own call site below already resets
+     * on any non-OK status -- a duplicate scan here can only ever agree with
+     * that authoritative check, never catch something it would miss. */
     status = four_aec_nr_res_process_post_trusted_spectrum(
         p->core, &pre.token, p->gsc_weights,
         p->gsc_spectrum, output);
@@ -716,12 +698,20 @@ int audio_pipeline_4ch_process_with_activity(
     return FOUR_AEC_NR_RES_OK;
 }
 
+static int floats_finite(const float* values, size_t count) {
+    size_t i;
+    if (!values) return 0;
+    for (i = 0; i < count; ++i) {
+        if (!isfinite(values[i])) return 0;
+    }
+    return 1;
+}
+
 static int auto_vad(
     AudioPipeline4Ch* p, const float* microphones_interleaved) {
     float sum = 0.0f;
     float power;
-    float threshold =
-        powf(10.0f, p->cfg.auto_vad_threshold_dbfs / 10.0f);
+    float threshold = p->vad_power_threshold;
     int speech;
     size_t count =
         (size_t)p->hop_size * FOUR_AEC_NR_RES_CHANNELS;
@@ -731,6 +721,16 @@ static int auto_vad(
         sum += value * value;
     }
     power = sum / (float)count;
+    if (!isfinite(power)) {
+        /* A non-finite input hop must never touch any VAD state -- not
+         * noise_power's EMA, not vad_hangover, nothing. The deeper pipeline
+         * rejects this frame on its own finite check regardless of what
+         * this function returns, so the return value itself is never
+         * actually consumed; only reading (never writing) p->vad_hangover
+         * here matters, so the NEXT valid frame's decision is computed as
+         * if this rejected one never happened. */
+        return p->vad_hangover > 0;
+    }
     speech = power >= threshold &&
              power >= p->noise_power * p->cfg.auto_vad_snr_ratio;
     if (speech) {
@@ -756,7 +756,19 @@ int audio_pipeline_4ch_process(
     float* output,
     AudioPipeline4ChFrameInfo* info) {
     int speech;
-    if (!p || p->destroyed || !microphones_interleaved)
+    if (!p || p->destroyed || !microphones_interleaved || !far_reference ||
+        !output)
+        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    /* auto_vad() only reads microphones_interleaved (and guards itself
+     * against non-finite mic data), so a non-finite far_reference sails
+     * through unnoticed here and still reaches auto_vad() below -- on
+     * perfectly finite mic data, auto_vad() runs its normal (state-
+     * mutating) path and only the deeper finite check inside
+     * four_aec_nr_res_process_pre() ever notices far_reference was bad,
+     * by which point noise_power/vad_hangover have already moved. Reject
+     * before that call, not just via a NULL check, so this invalid call
+     * touches no VAD state at all -- same contract as the mic-NaN case. */
+    if (!floats_finite(far_reference, (size_t)p->hop_size))
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     speech = auto_vad(p, microphones_interleaved);
     return audio_pipeline_4ch_process_with_activity(
@@ -773,8 +785,9 @@ void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
     four_aec_nr_res_reset(p->core);
     srp_reset(p->srp);
     gsc_reset(p->gsc);
-    p->noise_power =
+    p->vad_power_threshold =
         powf(10.0f, p->cfg.auto_vad_threshold_dbfs / 10.0f);
+    p->noise_power = p->vad_power_threshold;
     p->vad_hangover = 0;
     p->frame_index = 0;
 }

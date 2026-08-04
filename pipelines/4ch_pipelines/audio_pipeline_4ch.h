@@ -105,7 +105,13 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * ========================================================================== */
 
 #define AUDIO_PIPELINE_4CH_DESCRIPTOR_VERSION 1u
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 1u
+/* v2 (2026-08-04) removes the spatial_input scratch buffer and its
+ * spatial_channels[] pointer slices: SRP/GSC's X parameter is now
+ * const Complex* const*, so pre.linear_spectra[ch] (already a borrowed
+ * const Complex* per lane) is passed straight into doa_step()/
+ * gsc_process_with_weights() instead of being memcpy'd into wrapper-owned
+ * scratch first. */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 2u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -166,8 +172,8 @@ AudioPipeline4ChConfig audio_pipeline_4ch_default_config(int sample_rate);
  * Query the complete 16-byte-aligned caller pool required by cfg. Performs
  * no allocation and returns 0 on success. Composes the core's own
  * four_aec_nr_res_get_mem_requirements()/get_mem_breakdown() with
- * srp_get_mem_size()/gsc_get_mem_size() and this wrapper's own three scratch
- * buffers (spatial_input/gsc_spectrum/gsc_weights).
+ * srp_get_mem_size()/gsc_get_mem_size() and this wrapper's own two scratch
+ * buffers (gsc_spectrum/gsc_weights).
  */
 int audio_pipeline_4ch_get_mem_requirements(
     const AudioPipeline4ChConfig* cfg,
