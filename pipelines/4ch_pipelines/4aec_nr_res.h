@@ -83,8 +83,15 @@ extern "C" {
  * calls the removed carve_lane_snapshot().
  * v5 (2026-08-05) removes nr_gain: mmse_lsa_process_gain() is now called
  * with gain_out=NULL and its result is read via mmse_lsa_get_gain() instead,
- * matching the mono pipeline's same-day layout bump. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 5u
+ * matching the mono pipeline's same-day layout bump.
+ * v6 (2026-08-05) shrinks FourAecLaneSnapshot: erle_factor/divergence/
+ * erl_estimate had zero readers anywhere in the tree and are removed.
+ * FourAecLaneSnapshot is embedded (not pointed-to) in FourAecNrRes's
+ * snapshots[FOUR_AEC_NR_RES_CHANNELS] array, so this shrinks
+ * sizeof(FourAecNrRes) itself -- the "self" carve, not a separate
+ * pool-carved buffer -- which is why it needs its own bump despite not
+ * touching the build_flags_hash token list. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 6u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 

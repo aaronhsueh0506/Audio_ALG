@@ -91,11 +91,8 @@ typedef struct FourAecLaneSnapshot {
     const float* comfort_noise;
 
     float far_power;
-    float erle_factor;
     float dt_indicator;
-    float divergence;
     float saturation_level;
-    float erl_estimate;
     int filter_converged;
 } FourAecLaneSnapshot;
 
@@ -858,11 +855,8 @@ static int bind_lane_view(FourAecLaneSnapshot* dst,
     dst->comfort_noise = src->comfort_noise;
 
     dst->far_power = src->far_power;
-    dst->erle_factor = src->erle_factor;
     dst->dt_indicator = src->dt_indicator;
-    dst->divergence = src->divergence;
     dst->saturation_level = src->saturation_level;
-    dst->erl_estimate = src->erl_estimate;
     dst->filter_converged = src->filter_converged;
     return 1;
 }
@@ -889,6 +883,11 @@ int four_aec_nr_res_process_pre(
         !inputs_finite(ref, (size_t)hop))
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
 
+    /* Deinterleaves the proxy channel into p->mic_lane. update_shared_delay()/
+     * align_render() below only ever read this buffer (capture is `const
+     * float*`), so it still holds exactly these samples, unchanged, by the
+     * time the 4-lane loop below reaches ch==capture_proxy_channel -- that
+     * lane's own extraction is skipped there instead of redoing it. */
     for (i = 0; i < hop; ++i) {
         p->mic_lane[i] =
             microphones_interleaved[
@@ -913,10 +912,12 @@ int four_aec_nr_res_process_pre(
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
         AecResContext context;
-        for (i = 0; i < hop; ++i) {
-            p->mic_lane[i] =
-                microphones_interleaved[
-                    i * FOUR_AEC_NR_RES_CHANNELS + ch];
+        if (ch != p->cfg.capture_proxy_channel) {
+            for (i = 0; i < hop; ++i) {
+                p->mic_lane[i] =
+                    microphones_interleaved[
+                        i * FOUR_AEC_NR_RES_CHANNELS + ch];
+            }
         }
         aec_process(
             p->lanes[ch], p->mic_lane, p->aligned_ref,
@@ -1011,9 +1012,10 @@ static int fuse_contexts(FourAecNrRes* p,
 
     if (trusted_beamformed_error) {
         if (!complex_vector_finite(trusted_beamformed_error, n)) return 0;
-        memcpy(
-            p->fused_error, trusted_beamformed_error,
-            (size_t)n * sizeof(Complex));
+        /* No copy into p->fused_error: its lifetime (owned by the caller,
+         * e.g. audio_pipeline_4ch.c's p->gsc_spectrum) already covers every
+         * read run_post_res_and_nr() does this call -- it reads
+         * trusted_beamformed_error directly instead. */
     } else {
         memset(p->fused_error, 0, (size_t)n * sizeof(Complex));
     }
@@ -1071,16 +1073,19 @@ static int run_post_res_and_nr(
     float max_dt,
     float max_saturation,
     float far_power,
+    const Complex* trusted_beamformed_error,
     float* out) {
     const float* res_gain;
     const float* nr_extra;
+    const Complex* error =
+        trusted_beamformed_error ? trusted_beamformed_error : p->fused_error;
     int n = p->n_freqs;
     int hop = p->hop_size;
     int fft = p->fft_size;
     int k;
     float nf_eff;
 
-    four_aec_complex_mag2(p->error_power, p->fused_error, n);
+    four_aec_complex_mag2(p->error_power, error, n);
     four_aec_complex_mag2(p->post_near_power, p->fused_near, n);
     for (k = 0; k < n; ++k) {
         float e2 = p->error_power[k];
@@ -1111,32 +1116,38 @@ static int run_post_res_and_nr(
 
     nr_extra = p->cfg.legacy_amin ? NULL : p->extra_noise;
     if (mmse_lsa_process_gain(
-            p->nr, p->fused_error, nr_extra, NULL) != 0)
+            p->nr, error, nr_extra, NULL) != 0)
         return 0;
 
+    /* total_gain[k]=min(...) and the near_mean reduction below are mutually
+     * independent (neither reads the other's output), so they share one
+     * pass over n instead of two; the final echo_fraction/lift/output_spec
+     * loop still has to stay separate -- nf_eff is a scalar derived from
+     * near_mean plus the stateful near_hang hangover counter, so it must be
+     * fully resolved before any per-bin lift can be computed. */
     {
         const float* nr_gain = mmse_lsa_get_gain(p->nr, NULL);
+        float near_mean = 0.0f;
         for (k = 0; k < n; ++k) {
             p->total_gain[k] =
                 fminf(nr_gain[k], res_gain[k]);
+            near_mean += p->error_power[k];
         }
-    }
-
-    nf_eff = PROD_NE_FLOOR;
-    if (!p->cfg.legacy_amin) {
-        int far_active =
-            far_power > PROD_FAR_GATE_THRESH;
-        float near_mean = 0.0f;
-        int near_active;
-        for (k = 0; k < n; ++k) near_mean += p->error_power[k];
         near_mean /= (float)n;
-        if (near_mean > PROD_NEAR_GATE_THRESH)
-            p->near_hang = p->near_hangover_frames;
-        near_active = p->near_hang > 0;
-        if (p->near_hang > 0) p->near_hang -= 1;
-        nf_eff = (!far_active && near_active)
-            ? PROD_NE_FLOOR
-            : PROD_NE_FLOOR_FAR_ACTIVE;
+
+        nf_eff = PROD_NE_FLOOR;
+        if (!p->cfg.legacy_amin) {
+            int far_active =
+                far_power > PROD_FAR_GATE_THRESH;
+            int near_active;
+            if (near_mean > PROD_NEAR_GATE_THRESH)
+                p->near_hang = p->near_hangover_frames;
+            near_active = p->near_hang > 0;
+            if (p->near_hang > 0) p->near_hang -= 1;
+            nf_eff = (!far_active && near_active)
+                ? PROD_NE_FLOOR
+                : PROD_NE_FLOOR_FAR_ACTIVE;
+        }
     }
 
     for (k = 0; k < n; ++k) {
@@ -1151,9 +1162,9 @@ static int run_post_res_and_nr(
         p->total_gain[k] =
             (1.0f - lift) * p->total_gain[k] + lift;
         p->output_spec[k].r =
-            p->fused_error[k].r * p->total_gain[k];
+            error[k].r * p->total_gain[k];
         p->output_spec[k].i =
-            p->fused_error[k].i * p->total_gain[k];
+            error[k].i * p->total_gain[k];
     }
 
     if (p->cfg.enable_cng) {
@@ -1214,7 +1225,7 @@ static int process_post_impl(
     }
     if (!run_post_res_and_nr(
             p, all_converged, max_dt, max_saturation,
-            far_power, out)) {
+            far_power, trusted_beamformed_error, out)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
