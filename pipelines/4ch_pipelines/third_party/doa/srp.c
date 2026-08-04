@@ -405,7 +405,7 @@ SRP* srp_create_from_geometry(
     return s;
 }
 
-void srp(SRP* s, Complex** X, const int* mask)
+void srp(SRP* s, const Complex* const* X, const int* mask)
 {
     int M = s->M;
     int F = s->F;
@@ -525,7 +525,7 @@ float srp2doa(SRP* s)
 }
 
 void doa_step(SRP* s,
-              Complex** X,
+              const Complex* const* X,
               const int* mask,
               int vad_raw,
               int vad_out)

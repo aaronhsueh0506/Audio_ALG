@@ -166,7 +166,7 @@ static int test_srp_precompute_equivalence(void) {
         }
     }
 
-    srp(srp_handle, channels, NULL);
+    srp(srp_handle, (const Complex* const*)channels, NULL);
     for (int p = 0; p < srp_handle->num_pairs; ++p) {
         Complex phat[65];
         spatial_phat_cross_scalar(
@@ -302,7 +302,7 @@ static int test_srp_init_pool_poison_and_bounds(void) {
         int m;
         CHECK(storage != NULL, "pool bounds test: allocate process inputs");
         for (m = 0; m < cfg.M; ++m) channels[m] = storage + (size_t)m * cfg.F;
-        doa_step(s, channels, NULL, /*vad_raw=*/1, /*vad_out=*/1);
+        doa_step(s, (const Complex* const*)channels, NULL, /*vad_raw=*/1, /*vad_out=*/1);
         CHECK(isfinite(doa_get_raw(s)) || isnan(doa_get_raw(s)),
               "pool-path SRP doa_step runs without crashing");
         free(storage);
@@ -419,8 +419,8 @@ static int test_srp_heap_vs_pool_byte_equal(void) {
             }
         }
 
-        doa_step(heap_s, channels, NULL, vad_raw, vad_out);
-        doa_step(pool_s, channels, NULL, vad_raw, vad_out);
+        doa_step(heap_s, (const Complex* const*)channels, NULL, vad_raw, vad_out);
+        doa_step(pool_s, (const Complex* const*)channels, NULL, vad_raw, vad_out);
 
         heap_raw = doa_get_raw(heap_s);
         pool_raw = doa_get_raw(pool_s);
@@ -510,9 +510,9 @@ static int test_gsc_weight_export(void) {
             }
         }
         gsc_process(
-            original, channels, 0.7f, frame < 5, NULL, output_original);
+            original, (const Complex* const*)channels, 0.7f, frame < 5, NULL, output_original);
         gsc_process_with_weights(
-            exported, channels, 0.7f, frame < 5, NULL,
+            exported, (const Complex* const*)channels, 0.7f, frame < 5, NULL,
             output_exported, weights);
         for (int f = 0; f < 65; ++f) {
             CHECK(complex_error(output_original[f], output_exported[f]) == 0.0f,
@@ -621,7 +621,7 @@ static int test_gsc_long_run_hermitian_and_finite(void) {
 
     for (hop = 0; hop < HOPS; ++hop) {
         gsc_process_with_weights(
-            g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+            g, (const Complex* const*)channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
 
         for (f = 0; f < 65; ++f) {
             CHECK(isfinite(output[f].r) && isfinite(output[f].i),
@@ -800,7 +800,7 @@ static int test_gsc_p_diag_clamp_bounds_runaway_values(void) {
      * ceiling, confirm one adapted hop clamps it back down. --- */
     for (m = 0; m < 4; ++m) g->P[target_bin][m][m].r = 1e12f;
     gsc_process_with_weights(
-        g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+        g, (const Complex* const*)channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
     for (m = 0; m < 4; ++m) {
         CHECK(g->P[target_bin][m][m].r == gsc_p_diag_ceil(),
               "P diagonal above the ceiling is clamped to exactly the ceiling");
@@ -813,7 +813,7 @@ static int test_gsc_p_diag_clamp_bounds_runaway_values(void) {
      * up. --- */
     for (m = 0; m < 4; ++m) g->P[target_bin][m][m].r = -5.0f;
     gsc_process_with_weights(
-        g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+        g, (const Complex* const*)channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
     for (m = 0; m < 4; ++m) {
         CHECK(g->P[target_bin][m][m].r == gsc_p_diag_floor(),
               "P diagonal below the floor is clamped to exactly the floor");
@@ -886,7 +886,7 @@ static int test_gsc_bin_reset_on_nonfinite_p_propagation(void) {
     CHECK(gsc_get_bin_resets(g) == 0, "bin reset test: starts at 0 resets");
 
     gsc_process_with_weights(
-        g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+        g, (const Complex* const*)channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
 
     CHECK(gsc_get_bin_resets(g) == 1,
           "a non-finite P entry triggers exactly one bin reset");
@@ -983,7 +983,7 @@ static int test_gsc_init_pool_poison_and_bounds(void) {
         CHECK(storage != NULL, "pool bounds test: allocate process inputs");
         for (m = 0; m < M; ++m) channels[m] = storage + (size_t)m * F;
         gsc_process_with_weights(
-            g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+            g, (const Complex* const*)channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
         for (f = 0; f < F; ++f) {
             CHECK(isfinite(output[f].r) && isfinite(output[f].i),
                   "pool-path GSC produces finite output");
@@ -1070,9 +1070,9 @@ static int test_gsc_heap_vs_pool_byte_equal(void) {
         }
 
         gsc_process_with_weights(
-            heap_g, channels, 0.7f, allow_adapt, NULL, heap_out, heap_weights);
+            heap_g, (const Complex* const*)channels, 0.7f, allow_adapt, NULL, heap_out, heap_weights);
         gsc_process_with_weights(
-            pool_g, channels, 0.7f, allow_adapt, NULL, pool_out, pool_weights);
+            pool_g, (const Complex* const*)channels, 0.7f, allow_adapt, NULL, pool_out, pool_weights);
 
         CHECK(memcmp(heap_out, pool_out, sizeof(heap_out)) == 0,
               "heap vs pool: gsc_out is byte-equal every hop");
@@ -1138,7 +1138,7 @@ static int test_gsc_frame_idx_survives_32bit_boundary(void) {
                                           * as a positive 32-bit signed int */
     g->frame_idx = poked;
     gsc_process_with_weights(
-        g, channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
+        g, (const Complex* const*)channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
     CHECK(g->frame_idx == poked + 1u,
           "frame_idx increments exactly by one past the old 32-bit boundary");
 
@@ -1168,7 +1168,7 @@ static int test_srp_frame_counter_survives_32bit_boundary(void) {
 
     poked = (uint64_t)2147483647u + 5u;
     srp_handle->frame_counter = poked;
-    doa_step(srp_handle, channels, NULL, /*vad_raw=*/1, /*vad_out=*/1);
+    doa_step(srp_handle, (const Complex* const*)channels, NULL, /*vad_raw=*/1, /*vad_out=*/1);
     CHECK(srp_handle->frame_counter == poked + 1u,
           "frame_counter increments exactly by one past the old 32-bit boundary");
 

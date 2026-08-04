@@ -132,14 +132,14 @@ SRP* srp_create_from_geometry(
 );
 
 /* ===================== SRP ===================== */
-void srp(SRP* s, Complex** X,  const int* mask);
+void srp(SRP* s, const Complex* const* X, const int* mask);
 
 /* ===================== SRP to DOA ===================== */
 float srp2doa(SRP* s);
 
 /* ===================== DOA ===================== */
 void doa_step(SRP* srp,
-              Complex** X,
+              const Complex* const* X,
               const int* mask,
               int vad_raw,
               int vad_out);

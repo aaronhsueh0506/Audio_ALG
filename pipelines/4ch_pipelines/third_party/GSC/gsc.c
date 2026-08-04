@@ -367,7 +367,7 @@ static int doa2index(float doa_rad, int num_angles)
 
 /* ===================== process ===================== */
 void gsc_process_with_weights(GSC* g,
-                              Complex** X,
+                              const Complex* const* X,
                               float doa_s,
                               int allow_adapt_in,
                               const int* mask,
@@ -809,7 +809,7 @@ void gsc_process_with_weights(GSC* g,
 }
 
 void gsc_process(GSC* g,
-                 Complex** X,
+                 const Complex* const* X,
                  float doa_s,
                  int allow_adapt_in,
                  const int* mask,
