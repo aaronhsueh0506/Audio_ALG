@@ -184,7 +184,7 @@ extern "C" {
  *   - build_flags_hash:  FNV-1a-32 hash of a small, fixed set of compile-time
  *                        strings that affect this file's carve STRUCTURE:
  *                        the backend identity (above) plus a literal token
- *                        list naming the pipeline's own 12 scratch buffers
+ *                        list naming the pipeline's own 8 scratch buffers
  *                        in carve order, plus the alignment granularity.
  *                        See audio_pipeline.c's audio_pipeline_build_flags_hash()
  *                        for the exact inputs. Covers: a change to this
@@ -313,16 +313,17 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
 
 /**
  * Carve an AudioPipeline instance (control block + AEC + FFT(OLA) + NR + the
- * 12 pipeline scratch buffers, in that order) out of `mem`, verbatim-porting
+ * 8 pipeline scratch buffers, in that order) out of `mem`, verbatim-porting
  * the carve order/sizes the static CLI's file-local `pipeline_build` used
- * (minus the g_aec buffer, removed in layout v2 — see audio_pipeline.c).
+ * (see audio_pipeline.c's AUDIO_PIPELINE_LAYOUT_VERSION doc for the buffer-
+ * set history).
  *
  * Requirements on `mem`/`bytes` (checked, NULL-returned on violation):
  *   - `mem` must be 16-byte aligned (MEM_IS_ALIGNED16).
  *   - `bytes` must be >= audio_pipeline_get_mem_requirements(cfg, ...)->bytes.
  *   - `mem` need NOT be zero-filled: every pipeline-owned scratch buffer
- *     (OLA accumulator, per-bin gain/spectrum scratch, the mic/ref/output
- *     hop copies) is explicitly zeroed here at carve time, and AEC/NR/the
+ *     (OLA accumulator, per-bin gain/spectrum scratch, the aec_out hop
+ *     copy) is explicitly zeroed here at carve time, and AEC/NR/the
  *     FFT backend each zero their own sub-region during their own
  *     `_init()` — so a pool filled with poison bytes (e.g. `memset(pool,
  *     0xA5, bytes)`, the pattern lib/aec's own zero-heap test uses) inits
@@ -516,7 +517,7 @@ typedef struct {
     size_t aec_bytes;
     size_t fft_bytes;         /* 0 when cfg.aec_only */
     size_t nr_bytes;          /* 0 when cfg.aec_only */
-    size_t pipeline_bytes;    /* the 12 scratch buffers (fewer when aec_only) */
+    size_t pipeline_bytes;    /* the 8 scratch buffers (fewer when aec_only) */
     int    hop, frame_sz, fft_sz, n_freqs;
 } AudioPipelineMemBreakdown;
 
