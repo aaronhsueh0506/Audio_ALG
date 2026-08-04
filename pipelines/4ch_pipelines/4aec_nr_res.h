@@ -80,8 +80,11 @@ extern "C" {
  * each lane's own AecResContext output directly (borrowed via
  * bind_lane_view(), formerly snapshot_context()) instead of being
  * pool-carved and memcpy'd every hop. carve_working_buffers() no longer
- * calls the removed carve_lane_snapshot(). */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 4u
+ * calls the removed carve_lane_snapshot().
+ * v5 (2026-08-05) removes nr_gain: mmse_lsa_process_gain() is now called
+ * with gain_out=NULL and its result is read via mmse_lsa_get_gain() instead,
+ * matching the mono pipeline's same-day layout bump. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 5u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 

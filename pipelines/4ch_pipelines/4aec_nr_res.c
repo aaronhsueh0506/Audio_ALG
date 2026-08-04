@@ -139,7 +139,6 @@ struct FourAecNrRes {
     float* fused_r2;
     float* fused_comfort;
     float* post_near_power;
-    float* nr_gain;
     float* total_gain;
     float* extra_noise;
     float* error_power;
@@ -334,8 +333,6 @@ static int carve_working_buffers(FourAecNrRes* p,
         (float*)pool_carve(cursor, (size_t)n, sizeof(float));
     p->post_near_power =
         (float*)pool_carve(cursor, (size_t)n, sizeof(float));
-    p->nr_gain =
-        (float*)pool_carve(cursor, (size_t)n, sizeof(float));
     p->total_gain =
         (float*)pool_carve(cursor, (size_t)n, sizeof(float));
     p->extra_noise =
@@ -361,7 +358,7 @@ static int carve_working_buffers(FourAecNrRes* p,
            p->fused_error && p->fused_near &&
            p->residual_work && p->output_spec &&
            p->fused_r2 && p->fused_comfort && p->post_near_power &&
-           p->nr_gain && p->total_gain && p->extra_noise &&
+           p->total_gain && p->extra_noise &&
            p->error_power && p->synth_window && p->ifft_buffer &&
            p->ola;
 }
@@ -426,7 +423,7 @@ static size_t pipeline_buffer_size(
 
     for (i = 0; i < 4; ++i)
         total = ck_field_size(total, (size_t)n, sizeof(Complex));
-    for (i = 0; i < 7; ++i)
+    for (i = 0; i < 6; ++i)
         total = ck_field_size(total, (size_t)n, sizeof(float));
     for (i = 0; i < 3; ++i)
         total = ck_field_size(total, (size_t)fft, sizeof(float));
@@ -527,7 +524,7 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
     hash = fnv1a_str(
         "|carve:self,aec0,aec1,aec2,aec3,nr,fft,linear,hop4,"
-        "complex4,float7,fftfloat3,lanebind,postsg,delayring",
+        "complex4,float6,fftfloat3,lanebind,postsg,delayring",
         hash);
     hash = fnv1a_str("|align16", hash);
     return hash;
@@ -1114,12 +1111,15 @@ static int run_post_res_and_nr(
 
     nr_extra = p->cfg.legacy_amin ? NULL : p->extra_noise;
     if (mmse_lsa_process_gain(
-            p->nr, p->fused_error, nr_extra, p->nr_gain) != 0)
+            p->nr, p->fused_error, nr_extra, NULL) != 0)
         return 0;
 
-    for (k = 0; k < n; ++k) {
-        p->total_gain[k] =
-            fminf(p->nr_gain[k], res_gain[k]);
+    {
+        const float* nr_gain = mmse_lsa_get_gain(p->nr, NULL);
+        for (k = 0; k < n; ++k) {
+            p->total_gain[k] =
+                fminf(nr_gain[k], res_gain[k]);
+        }
     }
 
     nf_eff = PROD_NE_FLOOR;

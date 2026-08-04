@@ -94,8 +94,12 @@
  * AudioPipelineMemReq doc for the bump rule). Bumped 1->2: g_aec (a per-hop
  * memcpy'd duplicate of AecResContext.res_gain) was removed from the carve --
  * both call sites that used to read p->g_aec now read ctx.res_gain directly
- * (that pointer is already stable for the whole hop per aec.h's own doc). */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 2u
+ * (that pointer is already stable for the whole hop per aec.h's own doc).
+ * Bumped 2->3 (2026-08-05): g_nr is gone the same way -- mmse_lsa_get_gain()
+ * already exposes the denoiser's own gain buffer with no copy, so
+ * mmse_lsa_process_gain() is now called with gain_out=NULL and both former
+ * p->g_nr readers call mmse_lsa_get_gain(p->nr, NULL) instead. */
+#define AUDIO_PIPELINE_LAYOUT_VERSION 3u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
  * -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" or \"ne10\" to match its own
@@ -139,13 +143,15 @@ struct AudioPipeline {
     FftHandle*       fft;
     MmseLsaDenoiser* nr;
 
-    /* the pipeline's 12 scratch buffers (point into `pool` below; the eight
+    /* the pipeline's 11 scratch buffers (point into `pool` below; the seven
      * marked "iff !aec_only" are NULL when aec_only). There is no g_aec
      * buffer: Stage 3a used to memcpy ctx.res_gain into one every hop purely
      * to have a stable pointer for sk_min_f32()/the CNG loop, but
      * AecResContext's own doc guarantees ctx.res_gain aliases AEC's internal
      * buffer for the whole hop (until the next aec_process() call) -- so
-     * both call sites now read ctx.res_gain directly instead (layout v2). */
+     * both call sites now read ctx.res_gain directly instead (layout v2).
+     * There is likewise no g_nr buffer (layout v3): mmse_lsa_get_gain()
+     * exposes the denoiser's own gain buffer directly, no copy needed. */
     float*   mic_buf;
     float*   ref_buf;
     float*   aec_out;
@@ -153,7 +159,6 @@ struct AudioPipeline {
     float*   synth_win;    /* iff !aec_only */
     float*   ola;          /* iff !aec_only */
     float*   ifft_buf;     /* iff !aec_only */
-    float*   g_nr;         /* iff !aec_only */
     float*   g_total;      /* iff !aec_only */
     float*   extra;        /* iff !aec_only */
     float*   e2;           /* iff !aec_only */
@@ -285,7 +290,6 @@ static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* 
         pipe += ALIGN16((size_t)frame_sz * sizeof(float));   /* ola       */
         pipe += ALIGN16((size_t)fft_sz   * sizeof(float));   /* ifft_buf  */
         pipe += ALIGN16((size_t)hop      * sizeof(float));   /* out_buf   */
-        pipe += ALIGN16((size_t)n_freqs  * sizeof(float));   /* g_nr      */
         pipe += ALIGN16((size_t)n_freqs  * sizeof(float));   /* g_total   */
         pipe += ALIGN16((size_t)n_freqs  * sizeof(float));   /* extra     */
         pipe += ALIGN16((size_t)n_freqs  * sizeof(float));   /* e2        */
@@ -297,7 +301,7 @@ static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* 
 
 /* ============================================================================
  * Carve (verbatim port of aec_nr_pipeline_static.c's file-local
- * pipeline_build, PLUS an explicit zero of each of the 12 pipeline buffers --
+ * pipeline_build, PLUS an explicit zero of each of the 11 pipeline buffers --
  * see audio_pipeline.h's audio_pipeline_init doc for why. Layout v2: the
  * former g_aec buffer is gone -- see AUDIO_PIPELINE_LAYOUT_VERSION's doc.)
  * ========================================================================== */
@@ -344,7 +348,6 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
         p->ola       = (float*)ptr;   ptr += ALIGN16((size_t)frame_sz * sizeof(float));
         p->ifft_buf  = (float*)ptr;   ptr += ALIGN16((size_t)fft_sz   * sizeof(float));
         p->out_buf   = (float*)ptr;   ptr += ALIGN16((size_t)hop      * sizeof(float));
-        p->g_nr      = (float*)ptr;   ptr += ALIGN16((size_t)n_freqs  * sizeof(float));
         p->g_total   = (float*)ptr;   ptr += ALIGN16((size_t)n_freqs  * sizeof(float));
         p->extra     = (float*)ptr;   ptr += ALIGN16((size_t)n_freqs  * sizeof(float));
         p->e2        = (float*)ptr;   ptr += ALIGN16((size_t)n_freqs  * sizeof(float));
@@ -355,13 +358,12 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
          * is zeroed too even though the fill loop right below overwrites all
          * frame_sz elements unconditionally -- it holds a deterministic
          * constant, not accumulated state, so this memset is redundant
-         * belt-and-braces, not load-bearing, but keeps the "all 12 buffers
+         * belt-and-braces, not load-bearing, but keeps the "all 11 buffers
          * explicitly zeroed at carve time" contract literal and unambiguous. */
         memset(p->synth_win, 0, (size_t)frame_sz * sizeof(float));
         memset(p->ola,       0, (size_t)frame_sz * sizeof(float));
         memset(p->ifft_buf,  0, (size_t)fft_sz   * sizeof(float));
         memset(p->out_buf,   0, (size_t)hop      * sizeof(float));
-        memset(p->g_nr,      0, (size_t)n_freqs  * sizeof(float));
         memset(p->g_total,   0, (size_t)n_freqs  * sizeof(float));
         memset(p->extra,     0, (size_t)n_freqs  * sizeof(float));
         memset(p->e2,        0, (size_t)n_freqs  * sizeof(float));
@@ -412,7 +414,7 @@ static uint32_t audio_pipeline_build_flags_hash(void) {
     /* Literal carve-order token list -- bump AUDIO_PIPELINE_LAYOUT_VERSION
      * (and update this string) whenever the buffer set/order changes. */
     h = fnv1a_str("|carve:aec,fft,nr,mic_buf,ref_buf,aec_out,synth_win,ola,"
-                  "ifft_buf,out_buf,g_nr,g_total,extra,e2,spec", h);
+                  "ifft_buf,out_buf,g_total,extra,e2,spec", h);
     h = fnv1a_str("|align16", h);
     return h;
 }
@@ -693,7 +695,9 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
             p->extra[k] = ctx.r2[k] / PSD_SCALE;
         nr_extra = p->legacy_amin ? NULL : p->extra;
     }
-    mmse_lsa_process_gain(p->nr, ctx.error_spec, nr_extra, p->g_nr);
+    /* gain_out=NULL: mmse_lsa_get_gain() below reads the same buffer this
+     * call just filled, no per-hop copy needed (layout v3). */
+    mmse_lsa_process_gain(p->nr, ctx.error_spec, nr_extra, NULL);
 
     /* Stage 3a: g_total = min(G_nr, G_res). ctx.res_gain (= G_res, pre-min)
      * also sets the comfort-noise level below so CNG reflects AEC
@@ -702,8 +706,12 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
      * pointers alias AEC's internal per-hop buffers and stay valid until the
      * next aec_process() call, which doesn't happen again before this hop
      * finishes (verified below: ctx.res_gain is read again, unchanged, at
-     * the near-end-lift loop and the CNG loop further down). */
-    sk_min_f32(p->g_total, p->g_nr, ctx.res_gain, n_freqs);
+     * the near-end-lift loop and the CNG loop further down). Likewise
+     * mmse_lsa_get_gain()'s buffer is stable until the next
+     * mmse_lsa_process_gain()/mmse_lsa_process() call on this instance,
+     * which also doesn't happen again before this hop finishes. */
+    sk_min_f32(p->g_total, mmse_lsa_get_gain(p->nr, NULL), ctx.res_gain,
+               n_freqs);
 
     /* |E(f)|^2 scratch hoist: both the near-energy mean below and the
      * echo-gated lift loop need re*re+im*im per bin. */
@@ -785,7 +793,6 @@ void audio_pipeline_reset(AudioPipeline* p) {
         memset(p->ola,      0, (size_t)p->frame_sz * sizeof(float));
         memset(p->ifft_buf, 0, (size_t)p->fft_sz   * sizeof(float));
         memset(p->out_buf,  0, (size_t)p->hop      * sizeof(float));
-        memset(p->g_nr,     0, (size_t)p->n_freqs  * sizeof(float));
         memset(p->g_total,  0, (size_t)p->n_freqs  * sizeof(float));
         memset(p->extra,    0, (size_t)p->n_freqs  * sizeof(float));
         memset(p->e2,       0, (size_t)p->n_freqs  * sizeof(float));
