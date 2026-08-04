@@ -181,8 +181,6 @@ class MixingPolicyTest(unittest.TestCase):
         dataset.speech_only_p = 0.05
         dataset.p_biquad = 0.0
         dataset.rir_files = []
-        dataset.target_rms_min = -20.0
-        dataset.target_rms_max = -20.0
         dataset.p_resample = 1.0
         dataset.source_sr_values = [8000]
         dataset.p_clipping = 1.0

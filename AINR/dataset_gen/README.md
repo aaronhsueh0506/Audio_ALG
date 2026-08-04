@@ -9,8 +9,8 @@ RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2/DeepFilterNet3 at 48 kHz.
 
 This package does exactly one job: take a raw speech / noise / RIR corpus
 (e.g. DNS Challenge 4) and produce augmented `(noisy, clean)` WAV pairs —
-biquad EQ, RIR/reverb, SNR mixing, gain randomization, optional bandwidth
-simulation for upsampled lower-rate sources, and clipping distortion. It does
+biquad EQ, RIR/reverb, SNR mixing, optional bandwidth simulation for
+upsampled lower-rate sources, and clipping distortion. It does
 **not** know anything about any particular model's architecture, feature
 extraction, or training loop. Model
 training scripts (e.g. RNNoise-ERB's `train.py`) live in their own model repo
@@ -29,20 +29,37 @@ The optional `[gen] pass_size` limits how many shuffled speech files form one
 generation pass; it is not a training epoch. Omitting it or setting it to `0`
 uses all speech files.
 
-## Design: one selected sample rate per run
+## Design: generate once at 48 kHz, resample at pack time for 16 kHz consumers
 
-Each invocation generates exactly one dataset at the requested working rate.
-Use config.ini's `[signal] sr` or override it with `--sample-rate`:
+Each `gen_dataset.py` invocation still generates exactly one dataset at the
+requested working rate (config.ini's `[signal] sr`, overridable with
+`--sample-rate`), but **48 kHz is the recommended single source**: generate
+once at 48 kHz for DeepFilterNet2/DeepFilterNet3, then have
+`pack_dataset.py` resample straight into the RNNoise-ERB/GTCRN packed tensor
+— no intermediate 16 kHz WAV directory:
 
-```text
-16000 Hz → RNNoise-ERB / GTCRN
-48000 Hz → DeepFilterNet2 / DeepFilterNet3
+```bash
+python3 gen_dataset.py --config config.ini --output data_48k --hours 25 \
+    --sample-rate 48000
+
+python3 pack_dataset.py --input data_48k/pairs --output data_48k/packed.pt \
+    --dtype float16
+python3 pack_dataset.py --input data_48k/pairs --output data_16k/packed.pt \
+    --target-sr 16000 --dtype float16
 ```
 
-Run the command separately with different output directories when both are
-needed. These are independent augmentation runs, not synchronized copies.
-`resample_dataset.py` remains available when a downsampled copy of an existing
-dataset is explicitly preferred.
+`pack_dataset.py --target-sr` shares the exact anti-aliasing constants and
+clip guard with `resample_dataset.py` (imported, not duplicated), so the two
+are numerically equivalent up to the 16-bit quantization `resample_dataset.py`
+adds by writing an intermediate WAV — `pack_dataset.py` skips that write
+entirely. Keep using `resample_dataset.py` when you actually want a listenable
+16 kHz WAV copy (spot-checks, external tools); for training-only consumption,
+`pack_dataset.py --target-sr` is the shorter path.
+
+Generating independently per rate (a separate `--sample-rate 16000` run)
+remains supported, and is the only way to get the full, undiluted
+`source_sr_values` sweep for a 16 kHz consumer — see the accepted trade-off
+noted below.
 
 ### Upsampled lower-rate source simulation
 
@@ -68,6 +85,19 @@ automatically. A 48 kHz run can use the complete list, while a 16 kHz run uses
 only 8 and 12 kHz. Samples outside `p_resample` remain at the native algorithm
 rate. The default probability is 10% and should be adjusted to the expected
 deployment mix.
+
+⚠ **Accepted trade-off when reusing a 48 kHz set for a 16 kHz consumer**: this
+filtering happens once, at generation time, against the 48 kHz algorithm rate.
+`resample_dataset.py`'s later 48→16 kHz pass does not re-evaluate it — any
+draw of `source_sr_values` at or above 16000 has a post-resample bandwidth
+cap (≥8 kHz Nyquist) indistinguishable from an unaugmented sample, so the
+*effective* `p_resample` seen by the 16 kHz copy is diluted to roughly
+`p_resample × (rates below 16000) / (rates configured)` — with the example
+list above, about 2/7 of the configured probability. This is a known,
+accepted cost of sharing one 48 kHz source across both rates rather than
+generating natively per rate; restrict `source_sr_values` to `8000, 12000`
+before generating if a 16 kHz consumer needs the full, undiluted augmentation
+rate instead.
 
 ### RIR / DRR contract
 
@@ -149,9 +179,9 @@ augmentation logic itself).
 |---|---|
 | `gen_dataset.py` | CLI entry point — offline pre-generation of `(noisy, clean)` WAV pairs |
 | `dataset.py` | `DNS4Dataset` — the augmentation engine (biquad filters, RIR/RT60, SNR mixing, bandwidth limiting, clipping) |
-| `pack_dataset.py` | Packs a WAV-pair directory into a single `.pt` tensor file (removes per-file I/O overhead for small/medium datasets) |
+| `pack_dataset.py` | Packs a WAV-pair directory into a single `.pt` tensor file, optionally resampling (`--target-sr`) while packing (removes per-file I/O overhead for small/medium datasets) |
 | `packed_dataset.py` | Shared mmap-capable loader for packed `(N, 2, T)` tensors |
-| `resample_dataset.py` | Optional standalone resample of an existing dataset |
+| `resample_dataset.py` | Optional standalone resample of an existing dataset to a WAV copy (listening/QC; `pack_dataset.py --target-sr` covers the training path) |
 | `config.example.ini` | Example config (copy to `config.ini` and edit `[paths]` for your corpus) |
 | `tests/` | Hours, worker seed, RIR delay and resample-length regression tests |
 
@@ -186,6 +216,11 @@ data_16k/ or data_48k/
 
 Each WAV is 2-channel: ch0=noisy, ch1=clean.
 
+Running only the 48 kHz command above and getting the 16 kHz copy from
+`pack_dataset.py --target-sr` (step 2) is the recommended path — run the
+16 kHz command too only when you need the full, undiluted `source_sr_values`
+sweep (see the accepted trade-off note above).
+
 Useful flags: `--resume` (continue an interrupted batch), `--start-idx` /
 `[gen] start_idx` (extend an existing dataset without overwriting or
 re-sampling old data — `effective_seed = seed + start_idx`), and `--seed`.
@@ -200,26 +235,28 @@ NumPy random stream.
 duration by less than one segment. It is not rounded to a complete
 `DNS4Dataset` epoch; when necessary, the final dataset pass is partial.
 
-### 2. Optional: resample an existing dataset
+### 2. Pack the generated dataset, resampling per consumer as needed
 
 ```bash
-python3 resample_dataset.py \
-    --input data_48k --output data_16k --target-sr 16000 --workers 4
+python3 pack_dataset.py \
+    --input data_48k/pairs --output data_48k/packed.pt --dtype float16
+python3 pack_dataset.py \
+    --input data_48k/pairs --output data_16k/packed.pt \
+    --target-sr 16000 --dtype float16
 ```
 
-This produces an independent copy of the dataset at the target
-rate, preserving directory structure, filenames, and the 2-channel
-noisy/clean pair layout, plus an updated `meta.json` (`sr` set to the target
-rate and records the original rate as `source_sr`.
+Use `data_48k/packed.pt` for DeepFilterNet2/DeepFilterNet3 and
+`data_16k/packed.pt` for RNNoise-ERB/GTCRN. Omitting `--target-sr` packs at
+the source WAVs' own rate (the original behavior).
 
 ### Resample guidance (anti-aliasing parameters)
 
-`resample_dataset.py` uses `torchaudio.functional.resample` with the
-Kaiser-windowed sinc-interpolation kernel (`resampling_method
-= "sinc_interp_kaiser"`), which is explicitly anti-aliased — a lowpass is
-applied before decimation so no spectral energy folds back below Nyquist.
-Default preset (`--quality best`, torchaudio's own "kaiser_best" tutorial
-preset):
+`pack_dataset.py --target-sr` (and the standalone `resample_dataset.py`,
+below) use `torchaudio.functional.resample` with the Kaiser-windowed
+sinc-interpolation kernel (`resampling_method = "sinc_interp_kaiser"`), which
+is explicitly anti-aliased — a lowpass is applied before decimation so no
+spectral energy folds back below Nyquist. Default preset (`--quality best`,
+torchaudio's own "kaiser_best" tutorial preset):
 
 | Parameter | Value | Meaning |
 |---|---|---|
@@ -235,23 +272,28 @@ quality was prioritized deliberately.
 
 **Clipping guard:** Kaiser-sinc resampling can slightly overshoot the
 original peak amplitude (Gibbs-like ringing near sharp transients or
-near-full-scale content). If a resampled pair's peak exceeds `0.999`,
-`resample_dataset.py` scales the whole `(noisy, clean)` pair down together
-(preserving their relative level / SNR) before writing, rather than letting
-`torchaudio.save`'s int16 write clip silently. The final run summary reports
-how many files needed this and the overall peak level observed.
+near-full-scale content). If a resampled pair's peak exceeds `0.999`, both
+`pack_dataset.py --target-sr` and `resample_dataset.py` scale the whole
+`(noisy, clean)` pair down together (preserving their relative level / SNR)
+before writing/packing, rather than letting a downstream int16 write clip
+silently. `pack_dataset.py` reports how many pairs needed this; the
+standalone `resample_dataset.py` also reports the overall peak level
+observed.
 
-### 3. Pack the generated datasets
+### 3. Optional: materialize a resampled WAV copy
 
 ```bash
-python3 pack_dataset.py \
-    --input data_16k/pairs --output data_16k/packed.pt --dtype float16
-python3 pack_dataset.py \
-    --input data_48k/pairs --output data_48k/packed.pt --dtype float16
+python3 resample_dataset.py \
+    --input data_48k --output data_16k --target-sr 16000 --workers 4
 ```
 
-Use `data_16k/packed.pt` for RNNoise-ERB and `data_48k/packed.pt` for
-DeepFilterNet2 or DeepFilterNet3.
+Same anti-aliasing/clip-guard as `pack_dataset.py --target-sr` (the constants
+are imported from this module, not duplicated), but writes an actual 16 kHz
+WAV directory — useful for listening spot-checks or feeding external tools —
+plus an updated `meta.json` (`sr` set to the target rate, original rate kept
+as `source_sr`). Not needed for training: `pack_dataset.py --target-sr`
+resamples straight into the packed tensor and skips this WAV write (and the
+16-bit quantization it would otherwise add) entirely.
 
 ### Tests
 

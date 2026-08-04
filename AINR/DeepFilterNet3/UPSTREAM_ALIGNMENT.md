@@ -486,8 +486,18 @@ deliberate, verified divergence.
     time-scale resample. Same key, same probability, different augmentation. Do
     not repurpose it without noting the port then loses its bandwidth-limiting
     aug.
-21. **`target_rms_min/max = -35/-15 dBFS`** — coupled to item 4. Changing the
-    level regime invalidates the norm-init calibration.
+21. ⚠ **SUPERSEDED — `target_rms_min/max` no longer exists in dataset_gen.**
+    It used to read: *"`target_rms_min/max = -35/-15 dBFS` — coupled to item 4.
+    Changing the level regime invalidates the norm-init calibration."* That
+    range was traced to the DNS-Challenge `noisyspeech_synthesizer` convention,
+    not a DeepFilterNet setting, and was removed from `AINR/dataset_gen`
+    (verified against libDF's actual `dataset.rs`/`augmentations.rs`, which use
+    discrete `[-6, 0, 6]` dB gains and no continuous target-level step). Since
+    the calibrated norm-init pair is already reverted (item 4) this does not
+    change today's active config, but if the calibrated pair is ever restored,
+    `calibrate_norm_init.py` must be re-run against a corpus generated *without*
+    `target_rms` — its old measurements assumed the −35/−15 dBFS bound and are
+    now stale.
 22. **`FEATURE_VERSION` / `MODEL_VERSION` gating and the checkpoint contract.**
     Every "align" row that touches numerics — `spec_norm_eps` removal, the
     `1e-10` ERB floor, `erb_power`'s expression, the calibrator's floor — goes

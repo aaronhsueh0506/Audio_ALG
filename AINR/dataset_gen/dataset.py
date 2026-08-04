@@ -527,12 +527,11 @@ class DNS4Dataset(Dataset):
     3. RIR convolution (early for target, full for noisy)
     4. Load and augment noise when required
     5. Discrete-SNR mixing for mixed samples
-    6. Gain randomization
-    7. Optional lower-rate source simulation (noisy + target)
-    8. Clipping distortion (mixed/noise-only input only)
-    9. Clipping prevention
-    10. STFT → features + target gains  (return_raw=False)
-        OR return (noisy, clean) raw audio tensors (return_raw=True)
+    6. Optional lower-rate source simulation (noisy + target)
+    7. Clipping distortion (mixed/noise-only input only)
+    8. Clipping prevention
+    9. STFT → features + target gains  (return_raw=False)
+       OR return (noisy, clean) raw audio tensors (return_raw=True)
     """
 
     def __init__(self, cfg: configparser.ConfigParser, return_raw: bool = False):
@@ -560,8 +559,6 @@ class DNS4Dataset(Dataset):
 
         # mixing
         self.snr_values = parse_snr_values(cfg.get('mixing', 'snr_values'))
-        self.target_rms_min = cfg.getfloat('mixing', 'target_rms_min')
-        self.target_rms_max = cfg.getfloat('mixing', 'target_rms_max')
 
         # rir
         self.p_rir = cfg.getfloat('rir', 'p_rir')
@@ -925,18 +922,7 @@ class DNS4Dataset(Dataset):
             noise_scaled = noise * (speech_rms / noise_rms) * (10 ** (-snr_db / 20))
             noisy = reverbed + noise_scaled
 
-        # 6. Gain randomization
-        target_rms_db = random.uniform(self.target_rms_min, self.target_rms_max)
-        target_rms_linear = 10 ** (target_rms_db / 20)
-        if noise_only:
-            current_rms = active_rms(noisy, self.sr)
-        else:
-            current_rms = active_rms(target, self.sr)
-        scale = target_rms_linear / current_rms
-        target = target * scale
-        noisy = noisy * scale
-
-        # 7. Simulate a lower-rate source upsampled into the algorithm rate.
+        # 6. Simulate a lower-rate source upsampled into the algorithm rate.
         # Apply the identical path to noisy and target: this is denoising of
         # upsampled audio, not DeepFilterNet-style bandwidth extension.
         if random.random() < self.p_resample:
@@ -944,17 +930,17 @@ class DNS4Dataset(Dataset):
             noisy = simulate_upsampled_source(noisy, self.sr, source_sr)
             target = simulate_upsampled_source(target, self.sr, source_sr)
 
-        # 8. Clipping distortion (input only). Skip exact identity pairs.
+        # 7. Clipping distortion (input only). Skip exact identity pairs.
         if not speech_only and random.random() < self.p_clipping:
             noisy = apply_clipping(noisy, self.clip_snr_min, self.clip_snr_max)
 
-        # 9. Clipping prevention
+        # 8. Clipping prevention
         target, noisy = prevent_clipping(target, noisy)
 
         if self.return_raw:
             return noisy, target
 
-        # 10. STFT → features + target gains
+        # 9. STFT → features + target gains
         clean_spec = self._stft(target)
         noisy_spec = self._stft(noisy)
 
