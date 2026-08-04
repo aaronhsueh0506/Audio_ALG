@@ -78,12 +78,17 @@ static uint64_t g_four_aec_nr_res_next_epoch = 1;
  * ========================================================================== */
 
 typedef struct FourAecLaneSnapshot {
-    Complex* error_spec;
-    Complex* echo_spec;
-    Complex* far_spec;
-    Complex* near_spec;
-    float* r2;
-    float* comfort_noise;
+    /* Borrowed (not owned) views into a lane's own AecResContext buffers --
+     * see bind_lane_view()'s doc comment for the lifetime contract. Kept
+     * const to match AecResContext's own field types and because nothing in
+     * this file ever writes through these pointers, only through the
+     * pointer fields themselves (i.e. re-binding to a new hop's buffers). */
+    const Complex* error_spec;
+    const Complex* echo_spec;
+    const Complex* far_spec;
+    const Complex* near_spec;
+    const float* r2;
+    const float* comfort_noise;
 
     float far_power;
     float erle_factor;
@@ -247,6 +252,11 @@ static int derive_dims_and_configs(
     aec_cfg->enable_delay_est = 0;
     aec_cfg->enable_res = 0;
     aec_cfg->return_res_context = 1;
+    /* Every lane's own G_res is never read (see FourAecLaneSnapshot / this
+     * file's fuse_contexts()+run_post_res_and_nr(), which recompute an
+     * equivalent gain once from fused multi-lane data) -- skip computing it
+     * per lane. */
+    aec_cfg->spatial_linear_context = 1;
 
     *nr_cfg = mmse_lsa_config_for_mode_grid(
         cfg->sample_rate, *fft_size, cfg->nr_mode);
@@ -291,28 +301,8 @@ static void* pool_carve(PoolCursor* cursor, size_t count,
     return out;
 }
 
-static int carve_lane_snapshot(FourAecLaneSnapshot* s,
-                               PoolCursor* cursor,
-                               int n_freqs) {
-    s->error_spec =
-        (Complex*)pool_carve(cursor, (size_t)n_freqs, sizeof(Complex));
-    s->echo_spec =
-        (Complex*)pool_carve(cursor, (size_t)n_freqs, sizeof(Complex));
-    s->far_spec =
-        (Complex*)pool_carve(cursor, (size_t)n_freqs, sizeof(Complex));
-    s->near_spec =
-        (Complex*)pool_carve(cursor, (size_t)n_freqs, sizeof(Complex));
-    s->r2 = (float*)pool_carve(
-        cursor, (size_t)n_freqs, sizeof(float));
-    s->comfort_noise = (float*)pool_carve(
-        cursor, (size_t)n_freqs, sizeof(float));
-    return s->error_spec && s->echo_spec && s->far_spec && s->near_spec &&
-           s->r2 && s->comfort_noise;
-}
-
 static int carve_working_buffers(FourAecNrRes* p,
                                  PoolCursor* cursor) {
-    int ch;
     int n = p->n_freqs;
     int hop = p->hop_size;
     int fft = p->fft_size;
@@ -360,10 +350,11 @@ static int carve_working_buffers(FourAecNrRes* p,
     p->ola =
         (float*)pool_carve(cursor, (size_t)fft, sizeof(float));
 
-    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-        if (!carve_lane_snapshot(
-                &p->snapshots[ch], cursor, n)) return 0;
-    }
+    /* p->snapshots[ch]'s Complex- and float-pointer fields are no longer
+     * pool-carved -- bind_lane_view() (formerly snapshot_context()) points
+     * them directly at each lane's own AecResContext buffers every hop
+     * instead of owning a private copy. See bind_lane_view()'s doc comment
+     * for the lifetime contract this depends on. */
 
     return p->linear_interleaved && p->mic_lane && p->lane_out &&
            p->aligned_ref && p->render_i16 &&
@@ -418,7 +409,6 @@ static int init_post_sg(FourAecNrRes* p,
 static size_t pipeline_buffer_size(
     int hop, int fft, int n, int post_ma_n, int delay_ring_size) {
     size_t total = 0;
-    int ch;
     int i;
 
     total = ck_field_size(
@@ -441,14 +431,9 @@ static size_t pipeline_buffer_size(
     for (i = 0; i < 3; ++i)
         total = ck_field_size(total, (size_t)fft, sizeof(float));
 
-    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-        for (i = 0; i < 4; ++i)
-            total = ck_field_size(
-                total, (size_t)n, sizeof(Complex));
-        for (i = 0; i < 2; ++i)
-            total = ck_field_size(
-                total, (size_t)n, sizeof(float));
-    }
+    /* No per-lane snapshot buffers here: FourAecLaneSnapshot's spectrum/PSD
+     * fields are borrowed pointers into each lane's own AecResContext, not
+     * pool-carved copies. See bind_lane_view()/carve_working_buffers(). */
 
     total = ck_field_size(
         total,
@@ -542,7 +527,7 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
     hash = fnv1a_str(
         "|carve:self,aec0,aec1,aec2,aec3,nr,fft,linear,hop4,"
-        "complex4,float7,fftfloat3,snapshot4x6,postsg,delayring",
+        "complex4,float7,fftfloat3,lanebind,postsg,delayring",
         hash);
     hash = fnv1a_str("|align16", hash);
     return hash;
@@ -834,24 +819,46 @@ static int align_render(FourAecNrRes* p, const float* render,
     return 1;
 }
 
-static int snapshot_context(FourAecLaneSnapshot* dst,
-                                 const AecResContext* src,
-                                 int n_freqs) {
+/* Points dst's spectrum/PSD fields (error_spec, echo_spec, far_spec,
+ * near_spec, r2, comfort_noise -- these back out->linear_spectra and the
+ * internal fuse_contexts() inputs) directly at src's own buffers instead of
+ * copying them. Does NOT touch linear_interleaved, which is a separate,
+ * genuinely pipeline-owned buffer filled by a per-sample copy loop in the
+ * caller (four_aec_nr_res_process_pre()) -- only the fields bound here
+ * alias a lane's own memory.
+ *
+ * Safe only because AecResContext's pointers are documented to "alias the
+ * AEC's internal per-hop buffers -- read before the next aec_process()
+ * call" (aec.h), and this file's own pending-token gate
+ * (four_aec_nr_res_process_pre()'s `if (p->pending) return ...`, plus
+ * token_matches() at the top of process_post_impl()) structurally prevents
+ * any lane's aec_process() from running again before the borrowed pointers
+ * are consumed. four_aec_nr_res_reset() does NOT guarantee this memory is
+ * cleared or overwritten -- aec_reset() carries no such promise for a
+ * lane's spectrum buffers, so a stale value may simply be left in place at
+ * the same address. What actually keeps this safe is the API contract
+ * (linear_spectra is valid only until process_post(), reset(), or
+ * destroy() -- see FourAecNrResPreFrame's doc comment) combined with the
+ * pending/token gate, which is what stops THIS file's own process_post()
+ * from ever reading post-reset lane memory; an external caller must
+ * independently honor the same contract rather than assume reset() will
+ * make a violation visible. Do not port this borrow-pointer design to
+ * pipeline.py's FourChannelAecPipeline: that reference implementation's
+ * contract (test_pipeline.py's queued-pre-frames test) allows multiple
+ * pre-frames in flight simultaneously and requires true copy semantics. */
+static int bind_lane_view(FourAecLaneSnapshot* dst,
+                          const AecResContext* src,
+                          int n_freqs) {
     if (!dst || !src || src->n_freqs != n_freqs ||
         !src->error_spec || !src->echo_spec || !src->far_spec ||
         !src->near_spec || !src->r2 || !src->comfort_noise) return 0;
 
-    memcpy(dst->error_spec, src->error_spec,
-           (size_t)n_freqs * sizeof(Complex));
-    memcpy(dst->echo_spec, src->echo_spec,
-           (size_t)n_freqs * sizeof(Complex));
-    memcpy(dst->far_spec, src->far_spec,
-           (size_t)n_freqs * sizeof(Complex));
-    memcpy(dst->near_spec, src->near_spec,
-           (size_t)n_freqs * sizeof(Complex));
-    memcpy(dst->r2, src->r2, (size_t)n_freqs * sizeof(float));
-    memcpy(dst->comfort_noise, src->comfort_noise,
-           (size_t)n_freqs * sizeof(float));
+    dst->error_spec = src->error_spec;
+    dst->echo_spec = src->echo_spec;
+    dst->far_spec = src->far_spec;
+    dst->near_spec = src->near_spec;
+    dst->r2 = src->r2;
+    dst->comfort_noise = src->comfort_noise;
 
     dst->far_power = src->far_power;
     dst->erle_factor = src->erle_factor;
@@ -918,7 +925,7 @@ int four_aec_nr_res_process_pre(
             p->lanes[ch], p->mic_lane, p->aligned_ref,
             p->lane_out);
         aec_get_res_context(p->lanes[ch], &context);
-        if (!context.formed_hop || !snapshot_context(
+        if (!context.formed_hop || !bind_lane_view(
                 &p->snapshots[ch], &context, p->n_freqs)) {
             four_aec_nr_res_reset(p);
             return FOUR_AEC_NR_RES_DSP_ERROR;
@@ -1280,6 +1287,20 @@ static void reset_post_sg(FourAecNrRes* p) {
         min_gain, max_gain, raw_gain, gain, sum);
 }
 
+/* Legal to call while a pre-frame is pending (e.g. align_render()'s error
+ * path above). If a caller is still holding a FourAecNrResPreFrame from that
+ * pending frame, its linear_spectra[channel] pointers alias the per-lane
+ * AecResContext buffers reset below (linear_interleaved is a separate,
+ * pipeline-owned copy, memset below, not an alias). This file's own
+ * token-generation bump (see the end of this function) is what keeps
+ * process_post_impl() from reading linear_spectra afterward through this
+ * instance's own API; it does not protect an external caller who kept a raw
+ * pointer past this call -- aec_reset() carries no promise that a lane's old
+ * spectrum content gets cleared or overwritten, so there is nothing for such
+ * a caller to visibly notice going wrong. This is why FourAecNrResPreFrame's
+ * doc comment requires callers to stop reading on reset() as an API-contract
+ * rule, not on token rejection or on any memory-safety symptom.
+ * Covered by test_4aec_nr_res.c's reset-while-pending test. */
 void four_aec_nr_res_reset(FourAecNrRes* p) {
     int ch;
     if (!p || p->destroyed) return;

@@ -74,8 +74,14 @@ extern "C" {
  * inside DelayAec3 itself (delay_aec3_init() now takes the real native
  * sample_rate), so this wrapper no longer needs its own external
  * stride-pick buffers. carve_working_buffers() now carves 4 hop-sized
- * buffers instead of 6. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 3u
+ * buffers instead of 6.
+ * v4 (2026-08-04) removes the per-lane error/echo/far/near/r2/comfort_noise
+ * snapshot-copy buffers: FourAecLaneSnapshot's 6 buffer fields now alias
+ * each lane's own AecResContext output directly (borrowed via
+ * bind_lane_view(), formerly snapshot_context()) instead of being
+ * pool-carved and memcpy'd every hop. carve_working_buffers() no longer
+ * calls the removed carve_lane_snapshot(). */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 4u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -208,8 +214,11 @@ typedef struct FourAecNrResPreFrame {
      * sqrt-Hann analysis must consume this signal rather than the standalone
      * AEC's separately limited return value.
      *
-     * Valid until process_post(), reset(), or destroy(). Only one pre frame
-     * may be in flight.
+     * This is a pipeline-owned scratch buffer (each lane's formed_hop is
+     * copied into it, not aliased) -- unlike linear_spectra below, it is not
+     * a view into any lane's own memory. Still only safe to read for one
+     * frame: valid until process_post(), reset(), or destroy(), same as the
+     * rest of this struct. Only one pre frame may be in flight.
      */
     const float* linear_interleaved;
 
@@ -218,8 +227,19 @@ typedef struct FourAecNrResPreFrame {
      * later by process_post(). Shape: linear_spectra[channel][n_freqs].
      *
      * This lets an external SRP-PHAT/GSC consume the existing analysis
-     * transform instead of performing a duplicate STFT. Lifetime and
-     * single-frame ownership are identical to linear_interleaved.
+     * transform instead of performing a duplicate STFT. Unlike
+     * linear_interleaved above, these pointers alias each lane's own live
+     * per-hop AEC buffer rather than a pipeline-owned copy -- reset() does
+     * NOT guarantee the underlying memory is cleared or overwritten (a
+     * lane's old spectrum may simply be left in place), so there is no
+     * memory-corruption tripwire to rely on. What actually makes these safe
+     * to use is the pending/token gate (this file rejects a stale token, so
+     * process_post() itself can never read them after an intervening
+     * reset()) plus the API lifetime contract every caller must honor:
+     * valid until process_post(), reset(), or destroy(), identical to
+     * linear_interleaved above -- a caller that keeps reading these past
+     * reset()/destroy() is relying on undefined content, not "the old
+     * hop's data, still correct by coincidence".
      */
     const Complex* linear_spectra[FOUR_AEC_NR_RES_CHANNELS];
 } FourAecNrResPreFrame;
@@ -344,6 +364,22 @@ int four_aec_nr_res_process_post(
 
 /**
  * Reset all delay/AEC/NR/RES/OLA state. Invalidates a pending pre-frame token.
+ *
+ * A caller holding an outstanding FourAecNrResPreFrame from a still-pending
+ * process_pre() must stop reading its linear_interleaved/linear_spectra
+ * pointers the instant this is called, not just once a later process_post()
+ * call would reject the now-stale token. This is an API-contract rule, not a
+ * memory-safety guarantee enforced by this call: linear_interleaved is a
+ * pipeline-owned copy that IS overwritten by the explicit memset below (not
+ * by aec_reset()'s own per-lane resets, which touch each Aec's own internal
+ * state, not this wrapper's buffer), but linear_spectra[channel]
+ * aliases a lane's own AecResContext buffer, and aec_reset() does NOT
+ * guarantee that buffer's old content is cleared or overwritten -- a lane's
+ * stale spectrum may simply be left in place at the same address. Do not
+ * rely on reading garbage/zeroed data as a way to detect a missed
+ * invalidation; the pending/token gate is what keeps this file's own
+ * process_post() from ever reading post-reset lane memory, and external
+ * callers must independently honor the same rule.
  */
 void four_aec_nr_res_reset(FourAecNrRes* p);
 
