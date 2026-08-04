@@ -17,6 +17,15 @@ mic 2 ──> linear AEC 2 ─┼─>[external SRP-PHAT/GSC]───┴─> mon
 mic 3 ──> linear AEC 3 ─┘
 ```
 
+Each `linear AEC` box still runs its own PBFDKF/shadow filter, residual-echo
+(R2) estimate, and `DominantNearend` hold-state update every hop -- the echo
+path genuinely differs per microphone, and the next hop's onset-gated R2
+depends on that lane's own hold-state. What it no longer does is compute its
+own mono suppression gain: `AecConfig.spatial_linear_context=1` (set
+internally by this pipeline, not caller-configurable) skips straight to the
+`DominantNearend` update and leaves `res_gain` `NULL`, so `POST RESUME`'s
+gain fusion is the only place a suppression gain is calculated.
+
 Hard invariants:
 
 - There is exactly **one** matched-filter instance. It uses a configurable
@@ -24,7 +33,10 @@ Hard invariants:
 - Only the adaptive linear filter is replicated, exactly four times.
 - All four filters consume the same delay-aligned reference and reset together
   if that shared alignment changes.
-- No NR, RES, neural model, or delay estimator is replicated per microphone.
+- No NR, RES, neural model, or delay estimator is replicated per microphone --
+  enforced structurally, not just left unused: each lane keeps only the
+  R2/`DominantNearend` state its own echo path needs and never calculates its
+  own suppression gain (`spatial_linear_context=1`; see above).
 - The Python reference and the core C API leave SRP-PHAT/GSC at an explicit
   pre/post ownership seam. The complete C wrapper in `audio_pipeline_4ch.*` connects
   that seam to the reusable implementations under this project's
