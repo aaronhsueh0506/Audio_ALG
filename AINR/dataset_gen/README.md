@@ -60,8 +60,10 @@ drifts far less (most speech/noise energy sits well below either Nyquist),
 but "typically less" is not a contract `pack_dataset.py --target-sr` can
 promise — only re-mixing speech/noise stems natively at the target rate can
 guarantee the requested SNR exactly. `pack_dataset.py`'s packed payload now
-records `effective_rms_dbfs` (measured AFTER any `--target-sr` resample, per
-sample, per channel) precisely so a consumer can audit this drift on its own
+records `effective_rms_dbfs` (measured AFTER any `--target-sr` resample AND
+after casting to the packed `dtype` — i.e. on the exact bytes stored in
+`data`, not the higher-precision tensor before either step — per sample,
+per channel) precisely so a consumer can audit this drift on its own
 packed data rather than trusting generation-time metadata that describes a
 different rate.
 
@@ -233,6 +235,18 @@ generation_split = validation   ; omit (or 'train') for the unconditional defaul
 resuming into the same `--output` directory is refused rather than silently
 mixing a clipped and an unclipped batch together.
 
+⚠ **`generation_split = validation` controls ONLY the clipping
+augmentation.** It does not partition `[paths] speech_dir`/`noise_dir`
+into disjoint train/validation source files, and this generator has no
+mechanism that does. If you need a genuinely held-out validation set (no
+speech/noise source file used in both splits), you must supply separate
+`speech_dir`/`noise_dir` (or otherwise pre-partitioned source lists)
+yourself — e.g. two `config.ini` files pointing at two non-overlapping
+corpus directories, one per `gen_dataset.py --output` batch. Setting
+`generation_split = validation` against the SAME source directories as a
+`train` batch only changes clipping; the two batches can still share
+underlying speech/noise recordings.
+
 ### Per-sample metadata (`return_metadata`)
 
 `DNS4Dataset(cfg, return_raw=True, return_metadata=True)` changes
@@ -374,30 +388,61 @@ written atomically (temp-file + `os.replace`, in that order — WAV first,
 sidecar second), so a process killed mid-write never leaves a corrupt or
 half-written file at its final name; the worst case is an orphan (a WAV
 with no sidecar, from a crash between the two renames — or vice versa if a
-sidecar was manually deleted).
+sidecar was manually deleted). `meta.json` itself is written the same way
+(temp-file + `os.replace`), and — critically — written ONCE IMMEDIATELY
+after the contract/config validation below passes, BEFORE the first sample
+of the run, not only after each full generation pass completes. A batch
+with a large `[gen] pass_size` (or one interrupted during its very first
+pass) could otherwise accumulate thousands of complete WAV+JSON pairs with
+no `meta.json` on disk at all yet.
 
-Before scanning `pairs/`, `--resume` validates the existing `meta.json`
-(if any) against the CURRENT run:
+Contract/config validation itself runs FIRST, before `DNS4Dataset` is even
+constructed (before the RIR directory glob/cache load and the one-sample
+profiling pass) — a mismatch exits immediately rather than after paying for
+both. It checks the existing `meta.json` (if any) against the CURRENT run:
 
+- **`meta.json` must exist if `pairs/` already has any sample files.**
+  Since `meta.json` is now written before the first sample (see above),
+  its absence alongside existing samples means this batch predates
+  contract versioning, or `meta.json` was separately lost/deleted — either
+  way it cannot be validated, so `--resume` refuses rather than treating
+  the directory as a fresh, empty one (a genuinely empty `pairs/` with no
+  `meta.json` IS treated as fresh, as expected).
 - `contract_version` — bumped whenever the on-disk batch format changes in
   a way that makes an old batch unsafe to blindly resume into.
-- `config_hash` — a sha256 of the ENTIRE resolved `config.ini` (every
-  section/key, after any `--sample-rate` override is folded in). Editing
-  `snr_values`, `p_rir`, `level_mode`, the clipping knobs, `generation_split`,
-  or anything else in the config and then resuming into the same `--output`
-  directory is refused, not silently mixed into one dataset.
+- `config_hash` — the FULL sha256 digest (not truncated) of the ENTIRE
+  resolved `config.ini` (every section/key, after any `--sample-rate`
+  override is folded in). Editing `snr_values`, `p_rir`, `level_mode`, the
+  clipping knobs, `generation_split`, or anything else in the config and
+  then resuming into the same `--output` directory is refused, not
+  silently mixed into one dataset.
 - `sr` — the resolved sample rate, checked separately for a clearer error
   message even though it is already covered by `config_hash`.
 
-Any mismatch raises and stops the run. Pass `--resume-force-contract-mismatch`
-only for a deliberate migration (e.g. adopting contract versioning on an
-older batch) — it skips this check entirely.
+**Any mismatch raises and stops the run, with no bypass.** (An earlier
+`--resume-force-contract-mismatch` escape hatch was removed before release:
+it let a caller mix two distributions into one dataset and then silently
+overwrote the only record that had happened, since `meta.json`'s
+`config_hash`/`contract_version` get replaced by the new run's values on
+the very next save. A real migration path needs to record old/new contract
+identity and the switchover index, which nothing here does yet — start a
+new `--output` directory instead.)
 
 If orphan samples are found, `--resume` also refuses by default (listing
 the offending indices) rather than silently either regenerating them
 (losing nothing, but wasting the previous partial write) or skipping them
 (leaving a permanent gap). Pass `--repair-resume` to have it delete the
 orphans first — that index then regenerates normally on this run.
+
+**`meta.json`'s `seed`/`effective_seed`/`seed_source` describe only the
+MOST RECENT invocation** (the default `[gen] seed = -1` draws a fresh
+OS-random seed on every run, including every `--resume`) — they are kept
+for quick/simple reads, but `meta.json` also carries `generation_history`:
+one entry per `gen_dataset.py` invocation against this batch
+(`{seed, effective_seed, seed_source, base_idx, sample_count_at_run_start}`),
+appended, never overwritten. Without this, the full seed sequence needed
+to reproduce a multiply-resumed batch would be unrecoverable from
+`meta.json` alone once a second `--resume` overwrote the first's record.
 
 ### 2. Pack the generated dataset, resampling per consumer as needed
 
@@ -411,7 +456,46 @@ python3 pack_dataset.py \
 
 Use `data_48k/packed.pt` for DeepFilterNet2/DeepFilterNet3 and
 `data_16k/packed.pt` for RNNoise-ERB/GTCRN. Omitting `--target-sr` packs at
-the source WAVs' own rate (the original behavior).
+the source WAVs' own rate, requiring every input file to already share one
+native rate (checked; a lone mismatched file is excluded with a warning,
+same as any other unreadable/malformed input) — `--target-sr` forces every
+file to that rate regardless of its own native rate, so heterogeneous
+native rates are fine there.
+
+`--input` must be a `pairs/` directory produced by `gen_dataset.py`
+(a `meta.json` one level up, `NNNNNN.wav`+`NNNNNN.json` pairs inside) —
+`pack_dataset.py` only ever packs COMPLETE pairs, and refuses by default on
+any of the following (each with its own escape hatch, off by default):
+
+- **No `meta.json` found, or its `contract_version` doesn't match** — pass
+  `--allow-unversioned-input` to pack anyway (e.g. data predating contract
+  versioning). The packed payload's own `contract_version`/`config_hash`
+  fields are `None` in that case, since there is nothing to record.
+- **Any orphan sample** (a `NNNNNN.wav` with no matching `.json`, or vice
+  versa) — always a hard error, with **no bypass**: an orphan is never
+  salvageable content, only ever a crash/interruption artifact (see
+  "Resuming" above) or a manually half-deleted sample. Run `gen_dataset.py
+  --resume --repair-resume` on the source directory first, or fix
+  manually.
+- **A gap in the complete indices** (e.g. 0,1,3 with 2 missing — usually
+  means a `--repair-resume` removed an orphan that was never regenerated
+  in a later run) — pass `--allow-index-gaps` if this is a deliberately
+  curated subset.
+
+A prior version of `pack_dataset.py` recursively globbed `**/*.wav` with
+none of the above checks — meaning a `tmp.NNNNNN.wav` left behind by a
+crashed `gen_dataset.py` write (see "Resuming" above for the atomic-write
+scheme that name comes from) would be silently packed as a real training
+sample. This is exactly the shape of bug the checks above exist to catch.
+
+The packed payload additionally carries `sample_indices` (the original
+`NNNNNN` for each row of `data`, same order — traces a packed row back to
+its source `pairs/NNNNNN.wav`), `contract_version`, and `config_hash`
+(both from the source batch's `meta.json`). The `.pt` file itself is
+written atomically (temp-file + `os.replace`) — a crash/kill partway
+through `torch.save()` (payloads can be many GB) can never leave a
+truncated file that looks like a complete packed dataset at the final
+`--output` path.
 
 ### Resample guidance (anti-aliasing parameters)
 
