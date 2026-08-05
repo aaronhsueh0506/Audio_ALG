@@ -90,8 +90,15 @@ extern "C" {
  * snapshots[FOUR_AEC_NR_RES_CHANNELS] array, so this shrinks
  * sizeof(FourAecNrRes) itself -- the "self" carve, not a separate
  * pool-carved buffer -- which is why it needs its own bump despite not
- * touching the build_flags_hash token list. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 6u
+ * touching the build_flags_hash token list.
+ * v7 (2026-08-05, Group 5) removes lane_out: every lane's per-hop call
+ * switched from aec_process() to the new aec_process_context() (lib/aec),
+ * which has no `out` parameter -- lane_out existed purely to satisfy
+ * aec_process()'s required out buffer and was never read afterward (only
+ * context.formed_hop was, via aec_get_res_context()). carve_working_buffers()
+ * now carves 3 hop-sized buffers instead of 4; build_flags_hash's "hop4"
+ * token is now "hop3". */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 7u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 

@@ -659,22 +659,34 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
      * near_hop/far_hop at the top of the call, so passing the caller's
      * pointers straight through is exactly as safe as an extra pipeline-
      * owned decoupling copy would have been, without paying for one.
-     * aec_out is the standalone limiter-processed return; downstream NR/RES
-     * uses ctx.error_spec, the reconstructing WOLA frame formed before that
-     * limiter. */
-    aec_process(p->aec, mic, ref, p->aec_out);
-
+     *
+     * Dispatch on p->aec_only, fixed at construction and never toggled
+     * per-instance (Group 5's one hard precondition: a single Aec instance
+     * uses ONLY aec_process() or ONLY aec_process_context() for its whole
+     * lifetime, never both interleaved -- see aec.h's doc on
+     * aec_process_context()). aec_only means aec_out (the limiter-
+     * processed, caller-facing return) IS the pipeline's own output --
+     * needs the full aec_process(). !aec_only means downstream NR/RES uses
+     * only ctx.error_spec (the reconstructing WOLA frame formed BEFORE that
+     * limiter) and never reads aec_out at all -- aec_process_context()
+     * skips computing it. */
     if (p->aec_only) {
+        aec_process(p->aec, mic, ref, p->aec_out);
         memcpy(out, p->aec_out, (size_t)hop * sizeof(float));
         return 0;
     }
+    aec_process_context(p->aec, mic, ref);
 
     AecResContext ctx;
     aec_get_res_context(p->aec, &ctx);
-    if (!ctx.error_spec || !ctx.res_gain) {   /* seam unavailable -> linear fallback */
-        memcpy(out, p->aec_out, (size_t)hop * sizeof(float));
-        return 0;
-    }
+    /* enable_res=0/return_res_context=1 is set unconditionally for every
+     * !aec_only instance (derive_dims_and_configs() above), so
+     * ctx.error_spec/ctx.res_gain are always non-NULL here -- there is no
+     * live "seam unavailable" case to fall back from. A prior version of
+     * this function carried a fallback that memcpy'd p->aec_out in that
+     * (unreachable) branch; with aec_out no longer populated on this path,
+     * that fallback would have read stale/uninitialized data if it were
+     * ever somehow hit, so it's removed rather than kept "just in case". */
 
     /* Stage 2: echo-aware NR gain. extra = R^2/PSD_SCALE folds the residual
      * echo into the noise floor (xi = S^2/(N^2+R^2)); off in legacy.

@@ -118,7 +118,6 @@ struct FourAecNrRes {
 
     float* linear_interleaved;
     float* mic_lane;
-    float* lane_out;
     float* aligned_ref;
     float* render_i16;
 
@@ -308,8 +307,6 @@ static int carve_working_buffers(FourAecNrRes* p,
         (float*)pool_carve(cursor, linear_count, sizeof(float));
     p->mic_lane =
         (float*)pool_carve(cursor, (size_t)hop, sizeof(float));
-    p->lane_out =
-        (float*)pool_carve(cursor, (size_t)hop, sizeof(float));
     p->aligned_ref =
         (float*)pool_carve(cursor, (size_t)hop, sizeof(float));
     p->render_i16 =
@@ -350,7 +347,7 @@ static int carve_working_buffers(FourAecNrRes* p,
      * instead of owning a private copy. See bind_lane_view()'s doc comment
      * for the lifetime contract this depends on. */
 
-    return p->linear_interleaved && p->mic_lane && p->lane_out &&
+    return p->linear_interleaved && p->mic_lane &&
            p->aligned_ref && p->render_i16 &&
            p->fused_error && p->fused_near &&
            p->residual_work && p->output_spec &&
@@ -409,13 +406,18 @@ static size_t pipeline_buffer_size(
         total,
         ck_mul_size((size_t)hop, FOUR_AEC_NR_RES_CHANNELS),
         sizeof(float));                                      /* linear */
-    /* mic_lane, lane_out, aligned_ref, render_i16 -- 4 hop-sized buffers.
-     * (was 6: delay_capture/delay_render's naive external stride-pick
-     * decimation was removed -- delay_aec3_init() now takes cfg_copy.
-     * sample_rate directly and DelayAec3 anti-alias-filters + decimates
-     * internally, the same shared sidechain the mono AEC repo uses at
-     * 48kHz. Must stay in lockstep with carve_working_buffers() above.) */
-    for (i = 0; i < 4; ++i)
+    /* mic_lane, aligned_ref, render_i16 -- 3 hop-sized buffers. (Was 4
+     * until Group 5 (2026-08-05) switched the per-lane call below from
+     * aec_process() to aec_process_context(), which has no `out` parameter
+     * -- lane_out existed purely to satisfy aec_process()'s required out
+     * buffer and was never read afterward (only context.formed_hop was).
+     * Before that, was 6: delay_capture/delay_render's naive external
+     * stride-pick decimation was removed -- delay_aec3_init() now takes
+     * cfg_copy.sample_rate directly and DelayAec3 anti-alias-filters +
+     * decimates internally, the same shared sidechain the mono AEC repo
+     * uses at 48kHz. Must stay in lockstep with carve_working_buffers()
+     * above.) */
+    for (i = 0; i < 3; ++i)
         total = ck_field_size(total, (size_t)hop, sizeof(float));
 
     for (i = 0; i < 4; ++i)
@@ -520,7 +522,7 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
     hash = fnv1a_str(
-        "|carve:self,aec0,aec1,aec2,aec3,nr,fft,linear,hop4,"
+        "|carve:self,aec0,aec1,aec2,aec3,nr,fft,linear,hop3,"
         "complex4,float6,fftfloat3,lanebind,postsg,delayring",
         hash);
     hash = fnv1a_str("|align16", hash);
@@ -919,9 +921,15 @@ int four_aec_nr_res_process_pre(
                         i * FOUR_AEC_NR_RES_CHANNELS + ch];
             }
         }
-        aec_process(
-            p->lanes[ch], p->mic_lane, p->aligned_ref,
-            p->lane_out);
+        /* Every lane is constructed with enable_res=0/return_res_context=1
+         * (derive_dims_and_configs() above) -- always context_only, never
+         * dispatched per-call. This lane's own aec_process()-style output
+         * (limiter-processed audio) has no consumer here: only
+         * context.formed_hop below feeds the rest of this pipeline, so
+         * aec_process_context() skips computing the limiter output and the
+         * copy into a caller `out` buffer that aec_process() would have
+         * done for nothing (Group 5). */
+        aec_process_context(p->lanes[ch], p->mic_lane, p->aligned_ref);
         aec_get_res_context(p->lanes[ch], &context);
         if (!context.formed_hop || !bind_lane_view(
                 &p->snapshots[ch], &context, p->n_freqs)) {
