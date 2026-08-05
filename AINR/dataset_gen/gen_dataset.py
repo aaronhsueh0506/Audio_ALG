@@ -286,8 +286,13 @@ def _scan_existing_samples(pairs_dir):
 def _repair_orphans(pairs_dir, orphan_wavs, orphan_jsons):
     """Delete every orphan WAV/JSON --repair-resume identified. An orphan
     WAV's sample was never actually completed (its metadata is missing);
-    an orphan JSON's sample's audio is missing. Neither is salvageable --
-    the only correct repair is to remove it so that index regenerates."""
+    an orphan JSON's sample's audio is missing. Neither is salvageable, so
+    deleting it is always the correct repair -- but the caller must still
+    re-check index contiguity afterwards: if genuinely complete samples
+    exist at higher indices too, deleting an INTERIOR orphan leaves a gap
+    that --resume's own "continue from max(complete)+1" logic can never
+    backfill, and gen_dataset() refuses to proceed in that case rather
+    than silently leaving it (see the caller's post-repair check)."""
     for index in orphan_wavs:
         wav_path, _ = _sample_paths(pairs_dir, index)
         os.remove(wav_path)
@@ -437,16 +442,72 @@ def gen_dataset(args):
                     "with --repair-resume to delete them (that index will "
                     "regenerate), or fix manually."
                 )
+        # Re-derive from the FULL complete-index list, not just max_idx:
+        # --repair-resume above only deletes orphans, it does not by itself
+        # guarantee the remaining complete indices are gap-free. An orphan
+        # that (however it arose -- see AINR_DATASET_CONTRACT_VERSION's
+        # changelog) had genuinely COMPLETE samples after it would otherwise
+        # be silently and permanently unrecoverable: resuming from
+        # max_idx+1 only ever walks FORWARD from the highest complete
+        # index, so a gap anywhere before it can never be revisited once
+        # generation resumes past it.
+        complete_indices, _, _ = _list_complete_sample_indices(pairs_dir)
+        if complete_indices:
+            expected = list(range(complete_indices[0], complete_indices[-1] + 1))
+            if complete_indices != expected:
+                missing = sorted(set(expected) - set(complete_indices))
+                raise DatasetContractError(
+                    f"--resume refused: {pairs_dir} has a gap in its "
+                    f"complete sample indices -- missing {missing} "
+                    f"(range {complete_indices[0]}..{complete_indices[-1]}, "
+                    f"{len(complete_indices)} present). Resuming would "
+                    "silently skip past this gap forever (the next sample "
+                    "written continues from the highest COMPLETE index, "
+                    "never backfills a hole before it). This should not be "
+                    "reachable through normal --resume use -- inspect "
+                    f"{pairs_dir} manually before proceeding."
+                )
+        max_idx = complete_indices[-1] if complete_indices else -1
         sample_count = max(max_idx + 1, base_idx)
         done = sample_count - base_idx
-    elif base_idx > 0:
-        collision_wav, collision_json = _sample_paths(pairs_dir, base_idx)
-        if os.path.exists(collision_wav) or os.path.exists(collision_json):
-            print(f"WARNING: {base_idx:06d}.wav/.json already exist in "
-                  f"{pairs_dir} and will be OVERWRITTEN (not --resume -- "
-                  "if this is unintentional, pass --resume instead or "
-                  "choose a --start-idx past the existing batch)")
-        print(f"Extending dataset: 從 {base_idx:06d}.wav 開始")
+    else:
+        # A non-empty pairs_dir without --resume must never be silently
+        # extended or partially overwritten -- see
+        # AINR_DATASET_CONTRACT_VERSION's changelog for the exact
+        # corruption this closes: forgetting --resume and generating a
+        # smaller batch with a DIFFERENT config into an existing directory
+        # used to silently overwrite only the low indices (leaving a stale
+        # tail from the OLD config behind) while meta.json recorded only
+        # the NEW config -- a distribution mix pack_dataset.py had no way
+        # to detect either. --start-idx remains available, but only for a
+        # genuinely fresh/empty --output directory (e.g. numbering a new
+        # shard so it cannot collide with a DIFFERENT, unrelated batch
+        # elsewhere) -- extending THIS directory's own batch must go
+        # through --resume --hours <new TOTAL, not an increment>.
+        existing_max_idx, existing_orphan_wavs, existing_orphan_jsons = (
+            _scan_existing_samples(pairs_dir)
+        )
+        # Also refuse when meta.json exists even if pairs_dir is currently
+        # EMPTY -- e.g. a crash right after _save_meta(0) but before the
+        # first sample's write (see _save_meta(0)'s own call site above).
+        # Silently overwriting that meta.json here would discard its
+        # generation_history/contract record with nothing to show for it,
+        # the same "old record silently lost" failure mode this whole
+        # check exists to prevent, just with zero samples at stake instead
+        # of a whole batch.
+        if (existing_max_idx >= 0 or existing_orphan_wavs or existing_orphan_jsons
+                or os.path.isfile(meta_path)):
+            raise DatasetContractError(
+                f"refused: {pairs_dir} already contains sample file(s), or "
+                f"{meta_path} already exists, but --resume was not passed. "
+                "Re-run with --resume (and --hours set to the batch's new "
+                "TOTAL target, not an increment) to safely extend it, or "
+                "pick an empty --output directory (with no meta.json "
+                "either) for an unrelated batch."
+            )
+        if base_idx > 0:
+            print(f"New shard starting at {base_idx:06d}.wav (--start-idx, "
+                  f"fresh output directory)")
 
     # One entry appended per gen_dataset() invocation, NEVER overwritten by
     # a later --resume (see AINR_DATASET_CONTRACT_VERSION's v3 changelog).
@@ -639,9 +700,15 @@ if __name__ == '__main__':
                              'contract_version/config_hash/sr，不符則拒絕。')
     parser.add_argument('--repair-resume', action='store_true',
                         help='與 --resume 併用: 自動刪除孤兒檔案 (只有 .wav 缺 '
-                             '.json，或只有 .json 缺 .wav) 而非直接拒絕接續')
+                             '.json，或只有 .json 缺 .wav) 而非直接拒絕接續。'
+                             '若刪除後在既有完整編號中間留下缺口 (缺口前後都'
+                             '有真正完整的樣本)，仍會拒絕接續 (該缺口無法被 '
+                             '"從最大完整編號+1 繼續" 的接續邏輯補回)。')
     parser.add_argument('--start-idx', type=int, default=None,
-                        help='起始檔名編號, 覆寫 config [gen] start_idx (擴增用)')
+                        help='起始檔名編號, 覆寫 config [gen] start_idx。僅適用於 '
+                             '全新/空的 --output 目錄 (例如替一個新 shard 編號)；'
+                             '對已有樣本的目錄一律拒絕 (即使搭配 --start-idx)，'
+                             '擴增既有批次請改用 --resume --hours <新總時數>。')
     parser.add_argument('--seed', type=int, default=None,
                         help='Reproducible random seed. Omit to use [gen] seed; '
                              'negative means a fresh OS-random seed each run.')
