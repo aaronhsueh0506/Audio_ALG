@@ -366,9 +366,13 @@ matters). Skipping the 16 kHz command and relying solely on
 `pack_dataset.py --target-sr` against the 48 kHz batch is only appropriate
 when exact fidelity does not matter for your use case.
 
-Useful flags: `--resume` (continue an interrupted batch), `--start-idx` /
-`[gen] start_idx` (extend an existing dataset without overwriting or
-re-sampling old data — `effective_seed = seed + start_idx`), and `--seed`.
+Useful flags: `--resume` (continue an interrupted batch, or extend a
+finished one to a larger `--hours` total), `--start-idx` / `[gen] start_idx`
+(numbers a brand-new, EMPTY `--output` directory, e.g. a separate shard —
+`effective_seed = seed + start_idx`), and `--seed`. Without `--resume`,
+`gen_dataset.py` refuses to run at all against an `--output` directory that
+already contains any sample file, regardless of `--start-idx` — see
+"Resuming / dataset contract" below for why.
 The default `[gen] seed = -1` requests a fresh OS-generated seed every run;
 the actual seed is printed and stored in `meta.json`. Pass a non-negative
 seed such as `--seed 42` for reproducibility. DataLoader workers are seeded
@@ -389,12 +393,15 @@ sidecar second), so a process killed mid-write never leaves a corrupt or
 half-written file at its final name; the worst case is an orphan (a WAV
 with no sidecar, from a crash between the two renames — or vice versa if a
 sidecar was manually deleted). `meta.json` itself is written the same way
-(temp-file + `os.replace`), and — critically — written ONCE IMMEDIATELY
-after the contract/config validation below passes, BEFORE the first sample
-of the run, not only after each full generation pass completes. A batch
-with a large `[gen] pass_size` (or one interrupted during its very first
-pass) could otherwise accumulate thousands of complete WAV+JSON pairs with
-no `meta.json` on disk at all yet.
+(temp-file + `os.replace`), and — critically — written once BEFORE the
+first sample of the run is generated, not only after each full generation
+pass completes. Contract/config validation runs first (see below), then
+`DNS4Dataset` construction and a one-sample profiling pass (neither of
+which writes anything under `pairs/`), and only then is `meta.json` saved
+for the first time — still strictly before any real sample is written. A
+batch with a large `[gen] pass_size` (or one interrupted during its very
+first pass) could otherwise accumulate thousands of complete WAV+JSON
+pairs with no `meta.json` on disk at all yet.
 
 Contract/config validation itself runs FIRST, before `DNS4Dataset` is even
 constructed (before the RIR directory glob/cache load and the one-sample
@@ -428,11 +435,30 @@ the very next save. A real migration path needs to record old/new contract
 identity and the switchover index, which nothing here does yet — start a
 new `--output` directory instead.)
 
+**Without `--resume`, any sample file already present in `pairs/` (complete
+or orphaned) is a hard refusal — regardless of `--start-idx`.** A plain
+re-run into a non-empty `--output` used to be silently accepted: for
+`--start-idx 0` it validated nothing at all, and for `--start-idx N > 0` it
+only warned about a single exact-index collision. Both let a config change
+(different `snr_values`, `p_rir`, sample rate, ...) get generated into part
+of an existing batch while `meta.json` ended up recording only the new
+run's contract — the old, now-silently-mismatched samples stayed on disk
+with no record they belonged to a different configuration, and
+`pack_dataset.py` had no way to tell. Extending an existing batch must go
+through `--resume --hours <new TOTAL, not an increment>`, which validates
+the contract first; `--start-idx` is now only for numbering a genuinely
+fresh, empty `--output` directory (e.g. a separate shard).
+
 If orphan samples are found, `--resume` also refuses by default (listing
 the offending indices) rather than silently either regenerating them
 (losing nothing, but wasting the previous partial write) or skipping them
 (leaving a permanent gap). Pass `--repair-resume` to have it delete the
-orphans first — that index then regenerates normally on this run.
+orphans first — that index then regenerates normally on this run, UNLESS
+the orphan was interior (genuinely complete samples exist at higher
+indices too): deleting it would then leave a gap that "continue from the
+highest complete index" can never backfill, so `--repair-resume` still
+refuses afterwards in that specific case, rather than silently leaving
+the gap in place.
 
 **`meta.json`'s `seed`/`effective_seed`/`seed_source` describe only the
 MOST RECENT invocation** (the default `[gen] seed = -1` draws a fresh
@@ -457,36 +483,68 @@ python3 pack_dataset.py \
 Use `data_48k/packed.pt` for DeepFilterNet2/DeepFilterNet3 and
 `data_16k/packed.pt` for RNNoise-ERB/GTCRN. Omitting `--target-sr` packs at
 the source WAVs' own rate, requiring every input file to already share one
-native rate (checked; a lone mismatched file is excluded with a warning,
-same as any other unreadable/malformed input) — `--target-sr` forces every
-file to that rate regardless of its own native rate, so heterogeneous
-native rates are fine there.
+native rate — `--target-sr` forces every file to that rate regardless of
+its own native rate, so heterogeneous native rates are fine there.
 
 `--input` must be a `pairs/` directory produced by `gen_dataset.py`
 (a `meta.json` one level up, `NNNNNN.wav`+`NNNNNN.json` pairs inside) —
-`pack_dataset.py` only ever packs COMPLETE pairs, and refuses by default on
-any of the following (each with its own escape hatch, off by default):
+`pack_dataset.py` only ever packs COMPLETE pairs. A stray `tmp.NNNNNN.wav`
+(an in-progress/crashed write, see "Resuming" above for where that name
+comes from) is silently ignored, not an error — it simply isn't a complete
+pair. Everything else below is a hard refusal by default (each with its
+own escape hatch, off by default):
 
 - **No `meta.json` found, or its `contract_version` doesn't match** — pass
   `--allow-unversioned-input` to pack anyway (e.g. data predating contract
-  versioning). The packed payload's own `contract_version`/`config_hash`
-  fields are `None` in that case, since there is nothing to record.
+  versioning). If `meta.json` is missing entirely there is nothing to
+  record, so the packed payload's `contract_version`/`config_hash` fields
+  are `None`; if `meta.json` exists but declares an old/mismatched
+  `contract_version`, its actual `contract_version`/`config_hash` values
+  ARE still read and carried into the payload (only the version-match
+  requirement is waived, not the fields themselves). Passing this flag
+  also switches the three checks below from fail-closed to the weaker
+  legacy behavior, since an unversioned/mismatched `meta.json` cannot be
+  trusted as an authoritative inventory.
 - **Any orphan sample** (a `NNNNNN.wav` with no matching `.json`, or vice
   versa) — always a hard error, with **no bypass**: an orphan is never
   salvageable content, only ever a crash/interruption artifact (see
   "Resuming" above) or a manually half-deleted sample. Run `gen_dataset.py
   --resume --repair-resume` on the source directory first, or fix
   manually.
-- **A gap in the complete indices** (e.g. 0,1,3 with 2 missing — usually
-  means a `--repair-resume` removed an orphan that was never regenerated
-  in a later run) — pass `--allow-index-gaps` if this is a deliberately
-  curated subset.
+- **A corrupt or mismatched `NNNNNN.json` sidecar** (fails to parse, or its
+  own `"index"` field disagrees with its filename) — always a hard error,
+  with **no bypass** (unlike the checks above, this isn't a legitimate
+  legacy-data scenario, just file corruption).
+- **The on-disk complete-index set doesn't exactly match what `meta.json`
+  itself declares** — checked ONLY when `contract_version` matches (the
+  normal case): the actual complete indices must equal exactly
+  `range(batch_start_idx, batch_start_idx + batch_n_samples)`, no more, no
+  fewer. This has **no bypass** other than `--allow-unversioned-input`
+  (which also gives up the version-match guarantee) — there is no
+  "curated subset" escape hatch here, unlike the plain index-gap check
+  below, because a versioned batch disagreeing with its own `meta.json` is
+  always a sign something is wrong (generation still in progress or
+  interrupted mid-round — run `--resume` first — or manual tampering), not
+  a legitimate reason to pack anyway. Every WAV's native sample rate,
+  channel count, length, and finite-ness (no NaN/Inf) is also checked
+  against `meta.json` in this mode; any single malformed sample stops
+  packing immediately rather than being silently excluded, since silent
+  exclusion would also quietly reopen an index gap this very check just
+  closed.
+- **A gap in the complete indices** (e.g. 0,1,3 with 2 missing) — this
+  plain internal-contiguity check, and its `--allow-index-gaps` bypass for
+  a deliberately curated subset, only apply as a *fallback* when
+  `--allow-unversioned-input` is in effect (no trustworthy `meta.json` to
+  check the exact range above against). Under the normal, versioned path
+  it is subsumed by the exact-range check above, which never allows a gap.
 
 A prior version of `pack_dataset.py` recursively globbed `**/*.wav` with
 none of the above checks — meaning a `tmp.NNNNNN.wav` left behind by a
-crashed `gen_dataset.py` write (see "Resuming" above for the atomic-write
-scheme that name comes from) would be silently packed as a real training
-sample. This is exactly the shape of bug the checks above exist to catch.
+crashed `gen_dataset.py` write would be silently packed as a real training
+sample, and a `meta.json` whose declared inventory disagreed with what was
+actually on disk (e.g. from an interrupted run, or two different configs
+written into the same directory) went completely undetected. This is
+exactly the shape of bug the checks above exist to catch.
 
 The packed payload additionally carries `sample_indices` (the original
 `NNNNNN` for each row of `data`, same order — traces a packed row back to
