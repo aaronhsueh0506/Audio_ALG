@@ -9,7 +9,7 @@
  * Integration") for the consumer sequence.
  *
  * What changed vs. the CLI-embedded originals (behaviourally):
- *   - aec_out/synth_win/ola/... are now per-INSTANCE (an AudioPipeline
+ *   - synth_win/ola/... are now per-INSTANCE (an AudioPipeline
  *     field), not per-process-invocation locals — multiple instances (or one
  *     instance across an audio_pipeline_reset()) never share state.
  *   - The comfort-noise RNG and the near-end-floor hangover counter
@@ -103,8 +103,15 @@
  * already copies mic/ref into its own buffers, so this pipeline's own copy
  * was a redundant second layer; the caller's mic/ref pointers now go
  * straight into aec_process(), and the OLA write lands directly in the
- * caller's `out` instead of an intermediate staging buffer. */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 4u
+ * caller's `out` instead of an intermediate staging buffer.
+ * Bumped 4->5 (2026-08-05): aec_out is gone -- its only reader was the
+ * aec_only branch of audio_pipeline_process(), which immediately memcpy'd
+ * it straight into the caller's own `out` buffer every hop. aec_process()'s
+ * `out` parameter is not optional, and the caller's `out` is already
+ * validated non-NULL and hop-sized at function entry, so that branch now
+ * passes `out` to aec_process() directly -- one fewer buffer, one fewer
+ * copy, same bytes in `out` either way. */
+#define AUDIO_PIPELINE_LAYOUT_VERSION 5u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
  * -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" or \"ne10\" to match its own
@@ -148,12 +155,12 @@ struct AudioPipeline {
     FftHandle*       fft;
     MmseLsaDenoiser* nr;
 
-    /* the pipeline's 8 scratch buffers (point into `pool` below; the seven
-     * marked "iff !aec_only" are NULL when aec_only). There is no g_aec
+    /* the pipeline's 7 scratch buffers (point into `pool` below; all seven
+     * are NULL when aec_only). There is no g_aec
      * buffer: Stage 3a used to memcpy ctx.res_gain into one every hop purely
      * to have a stable pointer for sk_min_f32()/the CNG loop, but
      * AecResContext's own doc guarantees ctx.res_gain aliases AEC's internal
-     * buffer for the whole hop (until the next aec_process() call) -- so
+     * buffer for the whole hop (until the next AEC processing call) -- so
      * both call sites now read ctx.res_gain directly instead (layout v2).
      * There is likewise no g_nr buffer (layout v3): mmse_lsa_get_gain()
      * exposes the denoiser's own gain buffer directly, no copy needed.
@@ -161,8 +168,10 @@ struct AudioPipeline {
      * already copies mic/ref into its own near_hop/far_hop at the top of the
      * call, so this pipeline's own decoupling copy was a redundant second
      * layer -- the caller's mic/ref pointers are passed straight through,
-     * and the OLA write lands directly in the caller's `out`. */
-    float*   aec_out;
+     * and the OLA write lands directly in the caller's `out`. There is
+     * likewise no aec_out (layout v5): its only reader (the aec_only branch
+     * of audio_pipeline_process()) now passes the caller's own `out` buffer
+     * straight to aec_process() instead of an intermediate staging copy. */
     float*   synth_win;    /* iff !aec_only */
     float*   ola;          /* iff !aec_only */
     float*   ifft_buf;     /* iff !aec_only */
@@ -284,12 +293,14 @@ static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
 static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* nr_cfg,
                                   int hop, int frame_sz, int fft_sz, int n_freqs,
                                   int aec_only) {
+    (void)hop;   /* kept for signature symmetry with pipeline_build() below
+                  * (same field order/call shape); no buffer here is sized
+                  * from hop since aec_out (the last one that was) is gone. */
     size_t aec_sz     = aec_get_mem_size(aec_cfg);
     size_t fft_sz_mem = aec_only ? 0 : fft_get_mem_size(fft_sz);
     size_t nr_sz      = aec_only ? 0 : mmse_lsa_get_mem_size(nr_cfg);
 
     size_t pipe = 0;
-    pipe += ALIGN16((size_t)hop * sizeof(float));   /* aec_out */
     if (!aec_only) {
         pipe += ALIGN16((size_t)frame_sz * sizeof(float));   /* synth_win */
         pipe += ALIGN16((size_t)frame_sz * sizeof(float));   /* ola       */
@@ -305,7 +316,7 @@ static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* 
 
 /* ============================================================================
  * Carve (verbatim port of aec_nr_pipeline_static.c's file-local
- * pipeline_build, PLUS an explicit zero of each of the 8 pipeline buffers --
+ * pipeline_build, PLUS an explicit zero of each of the 7 pipeline buffers --
  * see audio_pipeline.h's audio_pipeline_init doc for why. See
  * AUDIO_PIPELINE_LAYOUT_VERSION's doc for the buffer-set history.)
  * ========================================================================== */
@@ -340,9 +351,6 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
         if (!p->fft || !p->nr) { AP_LOG_ERR("audio_pipeline: NR/FFT init failed\n"); return -1; }
     }
 
-    p->aec_out = (float*)ptr; ptr += ALIGN16((size_t)hop * sizeof(float));
-    memset(p->aec_out, 0, (size_t)hop * sizeof(float));
-
     if (!aec_only) {
         p->synth_win = (float*)ptr;   ptr += ALIGN16((size_t)frame_sz * sizeof(float));
         p->ola       = (float*)ptr;   ptr += ALIGN16((size_t)frame_sz * sizeof(float));
@@ -357,7 +365,7 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
          * is zeroed too even though the fill loop right below overwrites all
          * frame_sz elements unconditionally -- it holds a deterministic
          * constant, not accumulated state, so this memset is redundant
-         * belt-and-braces, not load-bearing, but keeps the "all 8 buffers
+         * belt-and-braces, not load-bearing, but keeps the "all 7 buffers
          * explicitly zeroed at carve time" contract literal and unambiguous. */
         memset(p->synth_win, 0, (size_t)frame_sz * sizeof(float));
         memset(p->ola,       0, (size_t)frame_sz * sizeof(float));
@@ -411,7 +419,7 @@ static uint32_t audio_pipeline_build_flags_hash(void) {
     h = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, h);
     /* Literal carve-order token list -- bump AUDIO_PIPELINE_LAYOUT_VERSION
      * (and update this string) whenever the buffer set/order changes. */
-    h = fnv1a_str("|carve:aec,fft,nr,aec_out,synth_win,ola,"
+    h = fnv1a_str("|carve:aec,fft,nr,synth_win,ola,"
                   "ifft_buf,g_total,extra,e2,spec", h);
     h = fnv1a_str("|align16", h);
     return h;
@@ -661,18 +669,20 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
      * owned decoupling copy would have been, without paying for one.
      *
      * Dispatch on p->aec_only, fixed at construction and never toggled
-     * per-instance (Group 5's one hard precondition: a single Aec instance
-     * uses ONLY aec_process() or ONLY aec_process_context() for its whole
-     * lifetime, never both interleaved -- see aec.h's doc on
-     * aec_process_context()). aec_only means aec_out (the limiter-
-     * processed, caller-facing return) IS the pipeline's own output --
-     * needs the full aec_process(). !aec_only means downstream NR/RES uses
-     * only ctx.error_spec (the reconstructing WOLA frame formed BEFORE that
-     * limiter) and never reads aec_out at all -- aec_process_context()
-     * skips computing it. */
+     * per-instance (a single Aec instance uses only entry points from one
+     * CLASS -- "full", which drives the output limiter, or "context-only",
+     * which doesn't -- for one construct-or-reset epoch; see aec.h's doc on
+     * aec_process_context() for the full rule). aec_only means the
+     * limiter-processed, caller-facing output IS the pipeline's own
+     * output -- needs the full aec_process(), writing directly into the
+     * caller's own `out` (already validated non-NULL and hop-sized above;
+     * aec_process()'s `out` parameter is not optional, so there is nothing
+     * to gain from an intermediate pipeline-owned buffer here). !aec_only
+     * means downstream NR/RES uses only ctx.error_spec (the reconstructing
+     * WOLA frame formed BEFORE that limiter) and never reads aec_process()'s
+     * own output at all -- aec_process_context() skips computing it. */
     if (p->aec_only) {
-        aec_process(p->aec, mic, ref, p->aec_out);
-        memcpy(out, p->aec_out, (size_t)hop * sizeof(float));
+        aec_process(p->aec, mic, ref, out);
         return 0;
     }
     aec_process_context(p->aec, mic, ref);
@@ -682,11 +692,7 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
     /* enable_res=0/return_res_context=1 is set unconditionally for every
      * !aec_only instance (derive_dims_and_configs() above), so
      * ctx.error_spec/ctx.res_gain are always non-NULL here -- there is no
-     * live "seam unavailable" case to fall back from. A prior version of
-     * this function carried a fallback that memcpy'd p->aec_out in that
-     * (unreachable) branch; with aec_out no longer populated on this path,
-     * that fallback would have read stale/uninitialized data if it were
-     * ever somehow hit, so it's removed rather than kept "just in case". */
+     * live "seam unavailable" case to fall back from. */
 
     /* Stage 2: echo-aware NR gain. extra = R^2/PSD_SCALE folds the residual
      * echo into the noise floor (xi = S^2/(N^2+R^2)); off in legacy.
@@ -802,7 +808,6 @@ void audio_pipeline_reset(AudioPipeline* p) {
         memset(p->e2,       0, (size_t)p->n_freqs  * sizeof(float));
         memset(p->spec,     0, (size_t)p->n_freqs  * sizeof(Complex));
     }
-    memset(p->aec_out, 0, (size_t)p->hop * sizeof(float));
 
     p->rng_state = AUDIO_PIPELINE_RNG_SEED;
     p->near_hang = 0;
