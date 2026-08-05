@@ -33,7 +33,12 @@ import torch
 import torchaudio
 import tqdm
 
-from resample_dataset import KAISER_BEST, KAISER_FAST, CLIP_GUARD
+try:
+    from .dataset import rms_dbfs
+    from .resample_dataset import KAISER_BEST, KAISER_FAST, CLIP_GUARD
+except ImportError:
+    from dataset import rms_dbfs
+    from resample_dataset import KAISER_BEST, KAISER_FAST, CLIP_GUARD
 
 
 def _load_maybe_resampled(path, target_sr, resample_kwargs):
@@ -85,6 +90,18 @@ def pack(args):
     print(f"  SR={out_sr}, 每段 {T} samples, dtype={args.dtype}, 預估大小: {size_str}")
 
     data = torch.empty(N, 2, T, dtype=dtype)
+    # Measured AFTER any --target-sr resample + clip-guard, not carried
+    # forward from generation-time metadata: a downsample does not exactly
+    # preserve the requested level/SNR (narrowband content is the worst
+    # case -- e.g. a 1 kHz-speech/12 kHz-noise pair generated at ~0 dB SNR
+    # measures ~48 dB after a 48k->16k downsample, since the noise energy
+    # above the new Nyquist is simply gone). This is the packed payload's
+    # own record of what a consumer actually trains on, independent of
+    # whatever requested_level_dbfs/snr_db a NNNNNN.json sidecar claims at
+    # the SOURCE rate -- see README.md's "48 kHz source, 16 kHz pack"
+    # section for the full caveat and when to prefer native generation
+    # instead (gen_dataset.py --sample-rate 16000) for exact fidelity.
+    effective_rms_dbfs = torch.empty(N, 2, dtype=torch.float32)
 
     failed = []
     n_clip_guarded = 0
@@ -98,9 +115,12 @@ def pack(args):
             if clipped:
                 n_clip_guarded += 1
             data[i] = audio.to(dtype)
+            effective_rms_dbfs[i, 0] = rms_dbfs(audio[0])   # noisy
+            effective_rms_dbfs[i, 1] = rms_dbfs(audio[1])   # clean
         except Exception as e:
             failed.append((path, str(e)))
             data[i] = 0  # 填 0，之後過濾
+            effective_rms_dbfs[i] = 0.0
 
     if failed:
         print(f"\n警告: {len(failed)} 個檔案讀取失敗，已從 dataset 移除:")
@@ -111,6 +131,7 @@ def pack(args):
         for idx in fail_indices:
             good_mask[idx] = False
         data = data[good_mask]
+        effective_rms_dbfs = effective_rms_dbfs[good_mask]
         N = data.size(0)
 
     if n_clip_guarded:
@@ -123,6 +144,9 @@ def pack(args):
     print(f"儲存中 ({size_str})...")
     payload = {
         'data': data,          # (N, 2, T): ch0=noisy, ch1=clean
+        'effective_rms_dbfs': effective_rms_dbfs,  # (N, 2): ch0=noisy, ch1=clean;
+                                                    # measured post-resample -- see the
+                                                    # comment where this is computed above
         'sr': out_sr,
         'n_samples': N,
         'segment_samples': T,
