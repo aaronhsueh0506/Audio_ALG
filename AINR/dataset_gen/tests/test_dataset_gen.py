@@ -3,13 +3,16 @@
 import configparser
 import json
 import math
+import os
 import random
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 import torch
+import torchaudio
 
 from dataset_gen.dataset import (
     DNS4Dataset,
@@ -685,25 +688,33 @@ class ResumeContractValidationTest(unittest.TestCase):
     def test_fresh_output_directory_returns_none(self):
         with tempfile.TemporaryDirectory() as tmp:
             meta_path = Path(tmp) / 'meta.json'
+            pairs_dir = Path(tmp) / 'pairs'
+            pairs_dir.mkdir()
             result = _validate_resume_contract(
-                str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'abc123', 16000)
+                str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
+                'abc123', 16000)
             self.assertIsNone(result)
 
     def test_matching_meta_is_accepted(self):
         with tempfile.TemporaryDirectory() as tmp:
             meta_path = Path(tmp) / 'meta.json'
+            pairs_dir = Path(tmp) / 'pairs'
+            pairs_dir.mkdir()
             meta_path.write_text(json.dumps({
                 'contract_version': AINR_DATASET_CONTRACT_VERSION,
                 'config_hash': 'abc123',
                 'sr': 16000,
             }))
             result = _validate_resume_contract(
-                str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'abc123', 16000)
+                str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
+                'abc123', 16000)
             self.assertEqual(result['config_hash'], 'abc123')
 
     def test_contract_version_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             meta_path = Path(tmp) / 'meta.json'
+            pairs_dir = Path(tmp) / 'pairs'
+            pairs_dir.mkdir()
             meta_path.write_text(json.dumps({
                 'contract_version': AINR_DATASET_CONTRACT_VERSION - 1,
                 'config_hash': 'abc123',
@@ -711,11 +722,14 @@ class ResumeContractValidationTest(unittest.TestCase):
             }))
             with self.assertRaises(DatasetContractError):
                 _validate_resume_contract(
-                    str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'abc123', 16000)
+                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
+                    'abc123', 16000)
 
     def test_config_hash_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             meta_path = Path(tmp) / 'meta.json'
+            pairs_dir = Path(tmp) / 'pairs'
+            pairs_dir.mkdir()
             meta_path.write_text(json.dumps({
                 'contract_version': AINR_DATASET_CONTRACT_VERSION,
                 'config_hash': 'old_hash',
@@ -723,11 +737,14 @@ class ResumeContractValidationTest(unittest.TestCase):
             }))
             with self.assertRaises(DatasetContractError):
                 _validate_resume_contract(
-                    str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'new_hash', 16000)
+                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
+                    'new_hash', 16000)
 
     def test_sample_rate_mismatch_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             meta_path = Path(tmp) / 'meta.json'
+            pairs_dir = Path(tmp) / 'pairs'
+            pairs_dir.mkdir()
             meta_path.write_text(json.dumps({
                 'contract_version': AINR_DATASET_CONTRACT_VERSION,
                 'config_hash': 'abc123',
@@ -735,20 +752,45 @@ class ResumeContractValidationTest(unittest.TestCase):
             }))
             with self.assertRaises(DatasetContractError):
                 _validate_resume_contract(
-                    str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'abc123', 48000)
+                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
+                    'abc123', 48000)
 
-    def test_force_bypasses_every_mismatch(self):
+    def test_no_bypass_exists_for_any_mismatch(self):
+        # A prior --resume-force-contract-mismatch escape hatch was removed
+        # before release (see AINR_DATASET_CONTRACT_VERSION's changelog) --
+        # pin that _validate_resume_contract has no way to accept a
+        # mismatch at all, i.e. the function signature itself enforces this
+        # rather than relying on nobody passing a force flag.
+        import inspect
+        sig = inspect.signature(_validate_resume_contract)
+        self.assertNotIn('force', sig.parameters)
+
+    def test_missing_meta_with_existing_wav_is_rejected(self):
+        # Exact regression for the reported release blocker: a batch
+        # interrupted before its first meta.json write (or one predating
+        # meta.json entirely) must never be treated as "fresh" just because
+        # meta.json itself is absent -- pairs/ already having sample files
+        # is itself evidence this is NOT a fresh, empty output directory.
         with tempfile.TemporaryDirectory() as tmp:
             meta_path = Path(tmp) / 'meta.json'
-            meta_path.write_text(json.dumps({
-                'contract_version': AINR_DATASET_CONTRACT_VERSION - 1,
-                'config_hash': 'old_hash',
-                'sr': 16000,
-            }))
-            result = _validate_resume_contract(
-                str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'new_hash', 48000,
-                force=True)
-            self.assertEqual(result['config_hash'], 'old_hash')
+            pairs_dir = Path(tmp) / 'pairs'
+            pairs_dir.mkdir()
+            (pairs_dir / '000000.wav').write_bytes(b'not a real wav, just a marker')
+            with self.assertRaises(DatasetContractError):
+                _validate_resume_contract(
+                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
+                    'abc123', 16000)
+
+    def test_missing_meta_with_existing_json_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            meta_path = Path(tmp) / 'meta.json'
+            pairs_dir = Path(tmp) / 'pairs'
+            pairs_dir.mkdir()
+            (pairs_dir / '000000.json').write_text('{}')
+            with self.assertRaises(DatasetContractError):
+                _validate_resume_contract(
+                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
+                    'abc123', 16000)
 
 
 class AtomicSampleWriteTest(unittest.TestCase):
@@ -841,6 +883,178 @@ class OrphanSampleScanTest(unittest.TestCase):
             wav0, json0 = _sample_paths(tmp, 0)
             self.assertTrue(Path(wav0).exists())
             self.assertTrue(Path(json0).exists())
+
+
+class ContractCheckOrderingTest(unittest.TestCase):
+    """gen_dataset() must validate the --resume contract BEFORE
+    constructing DNS4Dataset (RIR glob/cache I/O) or running the one-sample
+    profiling pass -- a mismatch should exit immediately, not after paying
+    for both. Proven here by mocking DNS4Dataset to raise if it is ever
+    instantiated: if the contract check ran second, THAT exception would
+    surface instead of DatasetContractError."""
+
+    def test_contract_mismatch_never_reaches_dns4dataset_construction(self):
+        from dataset_gen import gen_dataset as gen_dataset_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output_dir = os.path.join(tmp, 'batch')
+            pairs_dir = os.path.join(output_dir, 'pairs')
+            os.makedirs(pairs_dir)
+            # A sample file with no meta.json -- the exact "missing
+            # contract record" rejection this test also incidentally
+            # exercises, but the point here is WHEN it's raised.
+            (Path(pairs_dir) / '000000.wav').write_bytes(b'marker')
+            (Path(pairs_dir) / '000000.json').write_text('{}')
+
+            config_path = os.path.join(tmp, 'config.ini')
+            Path(config_path).write_text(
+                "[signal]\nsr = 16000\n[paths]\nspeech_dir = /nonexistent\n"
+                "noise_dir = /nonexistent\nrir_dir = /nonexistent\n"
+                "[audio]\nsegment_sec = 0.5\n[gen]\n[mixing]\n"
+                "snr_values = 0\n[rir]\np_rir = 0.0\nrt60_min = 0.2\n"
+                "rt60_max = 1.0\nearly_rir_ms = 20.0\npre_delay_keep_ms = 1.0\n"
+                "[noise]\nmax_noise_mix = 1\n[augmentation]\np_biquad = 0.0\n"
+                "n_biquad_filters = 3\nbiquad_gain_db = 15.0\n"
+                "biquad_q_min = 0.5\nbiquad_q_max = 1.5\n"
+                "p_noise_clipping = 0.0\np_mixture_clipping = 0.0\n"
+                "clip_snr_min = 0\nclip_snr_max = 20\n"
+            )
+            args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.001,
+                workers=0, resume=True, repair_resume=False,
+                start_idx=None, seed=42, sample_rate=None,
+            )
+
+            with patch.object(
+                    gen_dataset_module, 'DNS4Dataset',
+                    side_effect=AssertionError(
+                        "DNS4Dataset must not be constructed before the "
+                        "--resume contract check has already passed")):
+                with self.assertRaises(DatasetContractError):
+                    gen_dataset_module.gen_dataset(args)
+
+
+def _build_real_corpus(tmp, sr=16000, seconds=0.5):
+    """A tiny REAL speech/noise corpus + matching config.ini, for tests
+    that need to run gen_dataset() end-to-end (not with DNS4Dataset mocked
+    out) -- e.g. proving meta.json's actual on-disk write timing/atomicity,
+    which a DNS4Dataset-mocked test structurally cannot reach. p_rir=0 (no
+    RIR files needed); segment_sec kept short for fast test execution.
+    Returns (config_path, output_dir).
+    """
+    corpus = os.path.join(tmp, 'corpus')
+    speech_dir = os.path.join(corpus, 'speech')
+    noise_dir = os.path.join(corpus, 'noise')
+    os.makedirs(speech_dir)
+    os.makedirs(noise_dir)
+    t = torch.linspace(0, seconds * 4, int(sr * seconds * 4))
+    for i in range(2):
+        speech = (0.3 * torch.sin(2 * math.pi * (200 + i * 50) * t)).unsqueeze(0)
+        torchaudio.save(os.path.join(speech_dir, f'sp{i}.wav'), speech, sr)
+        noise = (0.1 * torch.randn(1, int(sr * seconds * 4)))
+        torchaudio.save(os.path.join(noise_dir, f'no{i}.wav'), noise, sr)
+
+    config_path = os.path.join(tmp, 'config.ini')
+    Path(config_path).write_text(
+        f"[signal]\nsr = {sr}\n"
+        f"[paths]\nspeech_dir = {speech_dir}\nnoise_dir = {noise_dir}\n"
+        "rir_dir = /nonexistent\n"
+        f"[audio]\nsegment_sec = {seconds}\n[gen]\n[mixing]\n"
+        "snr_values = 0\n[rir]\np_rir = 0.0\nrt60_min = 0.2\n"
+        "rt60_max = 1.0\nearly_rir_ms = 20.0\npre_delay_keep_ms = 1.0\n"
+        "[noise]\nmax_noise_mix = 1\n[augmentation]\np_biquad = 0.0\n"
+        "n_biquad_filters = 3\nbiquad_gain_db = 15.0\n"
+        "biquad_q_min = 0.5\nbiquad_q_max = 1.5\n"
+        "p_noise_clipping = 0.0\np_mixture_clipping = 0.0\n"
+        "clip_snr_min = 0\nclip_snr_max = 20\n"
+    )
+    output_dir = os.path.join(tmp, 'batch')
+    return config_path, output_dir
+
+
+class MetaJsonRealWriteTimingTest(unittest.TestCase):
+    """Closes the test-coverage gap an adversarial review pass found:
+    ContractCheckOrderingTest above mocks DNS4Dataset to raise, so it never
+    actually reaches _save_meta(0) or a real _save_meta() write -- these
+    tests run gen_dataset() for real (a tiny real corpus, no mocked
+    DNS4Dataset) to prove the on-disk behavior directly.
+    """
+
+    def test_meta_json_exists_before_any_sample_is_written(self):
+        # A crash on the FIRST sample write (right after _save_meta(0) has
+        # already run) must still leave a valid, readable meta.json with
+        # zero samples recorded -- not a missing file, not a truncated one.
+        from dataset_gen import gen_dataset as gen_dataset_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, output_dir = _build_real_corpus(tmp)
+            args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.001,
+                workers=0, resume=False, repair_resume=False,
+                start_idx=None, seed=42, sample_rate=None,
+            )
+            with patch.object(
+                    gen_dataset_module, '_save_pair_atomic',
+                    side_effect=RuntimeError('simulated crash on first sample')):
+                with self.assertRaises(RuntimeError):
+                    gen_dataset_module.gen_dataset(args)
+
+            meta_path = os.path.join(output_dir, 'meta.json')
+            self.assertTrue(os.path.exists(meta_path),
+                             "meta.json must exist even though zero samples "
+                             "were successfully written")
+            meta = json.loads(Path(meta_path).read_text())
+            self.assertEqual(meta['contract_version'], AINR_DATASET_CONTRACT_VERSION)
+            self.assertEqual(meta['n_samples'], 0)
+            pairs_dir = os.path.join(output_dir, 'pairs')
+            self.assertEqual(
+                _scan_existing_samples(pairs_dir), (-1, [], []),
+                "no sample (complete or orphaned) should exist -- the crash "
+                "happened before the first WAV write completed"
+            )
+
+    def test_meta_json_write_itself_is_atomic_under_crash(self):
+        # A fresh run first produces a genuinely valid meta.json. A second
+        # (--resume) invocation that crashes on ITS OWN meta.json write
+        # (json.dump raising mid-write) must leave the ORIGINAL valid
+        # meta.json byte-for-byte untouched -- not truncated, not replaced
+        # with a partial write.
+        from dataset_gen import gen_dataset as gen_dataset_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, output_dir = _build_real_corpus(tmp)
+            fresh_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.001,
+                workers=0, resume=False, repair_resume=False,
+                start_idx=None, seed=42, sample_rate=None,
+            )
+            gen_dataset_module.gen_dataset(fresh_args)
+
+            meta_path = os.path.join(output_dir, 'meta.json')
+            original_bytes = Path(meta_path).read_bytes()
+            self.assertGreater(len(original_bytes), 0)
+
+            def _raise_on_meta_write(obj, *a, **k):
+                if isinstance(obj, dict) and 'contract_version' in obj:
+                    raise RuntimeError('simulated crash writing meta.json')
+                return real_json_dump(obj, *a, **k)
+
+            real_json_dump = gen_dataset_module.json.dump
+            resume_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.002,
+                workers=0, resume=True, repair_resume=False,
+                start_idx=None, seed=43, sample_rate=None,
+            )
+            with patch.object(gen_dataset_module.json, 'dump',
+                               side_effect=_raise_on_meta_write):
+                with self.assertRaises(RuntimeError):
+                    gen_dataset_module.gen_dataset(resume_args)
+
+            self.assertEqual(
+                Path(meta_path).read_bytes(), original_bytes,
+                "a crash mid-write on meta.json's OWN atomic write must "
+                "never corrupt/replace the previously-valid file"
+            )
 
 
 if __name__ == '__main__':
