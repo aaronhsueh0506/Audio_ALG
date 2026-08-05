@@ -3,7 +3,7 @@
 ## Architecture
 
 ```
-mic/ref → linear AEC
+mic/ref → linear AEC (aec_process_context(): context-only, no limiter/emit)
               ├─ E(f) ────────────────→ echo-aware NR ─→ G_nr ─┐
               └─ AecResContext {R², G_res, CNG, far power} ─────┤
                                                                 ↓
@@ -11,11 +11,25 @@ mic/ref → linear AEC
                                   + near-end floor + CNG
                                                                 ↓
                                                        one iFFT/OLA
+
+aec_only mode (no NR/RES stage at all):
+mic/ref → linear AEC (aec_process(): full limiter + emit) → out
 ```
 
 There is no independent time-domain RES filter after NR. `G_res` is calculated
 inside the AEC3 suppression path, exported with the linear residual, fused with
 `G_nr`, and applied once to `E(f)`.
+
+The non-`aec_only` path never reads `aec_process()`'s own limiter-processed
+output — only `AecResContext`'s pre-limiter linear residual matters downstream
+— so it drives AEC via `aec_process_context()` instead: same linear filter and
+AEC3 post/RES-context computation, minus the limiter and the copy into an
+`out` buffer neither this pipeline nor the caller ever reads on that path. A
+single `Aec` instance uses exactly one of the two entry points for its whole
+construct-to-reset lifetime, chosen once at init from `aec_only` — see
+`lib/aec/c_impl/include/aec.h`'s doc on `aec_process_context()` for why mixing
+them on one instance is unsafe (a one-hop limiter-gain discontinuity, not a
+crash).
 
 ## Modules
 
@@ -29,15 +43,21 @@ inside the AEC3 suppression path, exported with the linear residual, fused with
 | Complete 4-ch spatial | 4ch_pipelines/libaudio_pipeline_4ch.a | 4ch_pipelines/audio_pipeline_4ch.h | Same 4-ch core + reusable SRP-PHAT/GSC libraries on the selected shared grid |
 
 RES is not a standalone module/library — it is exposed as the `AecResContext` seam on
-the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process()`
-(or the streaming `aec_analyze_render()` / `aec_process_capture()` pair) still computes the
+the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process_context()`
+(or the streaming `aec_analyze_render()` / `aec_process_capture()` pair, if the offline/streaming
+split matters more than shedding the limiter's per-hop cost) still computes the
 AEC3 post-filter's residual-echo suppression internals but does not apply them to the time
 output; `aec_get_res_context(a, &ctx)` then exposes `AecResContext` — the
 reconstructing 50%-overlap WOLA `error_spec`, its matching `echo_spec` /
 `near_spec`, `formed_hop`, `res_gain` (G_res(f)), `r2` (residual-echo PSD),
 `comfort_noise`, etc. — so an external caller
-can run AEC(linear) → NR → RES itself. See `lib/aec/c_impl/include/aec.h` (`AecResContext`,
-`aec_get_res_context()`) for the full field list.
+can run AEC(linear) → NR → RES itself. `aec_process_context()` is this mono
+pipeline's own choice for exactly this pattern (this file's Architecture
+diagram above) — it never touches the limiter or emits an `out` buffer, both
+pure waste when nothing downstream reads them. See
+`lib/aec/c_impl/include/aec.h` (`AecResContext`, `aec_get_res_context()`,
+`aec_process_context()`) for the full field list and the one construct-to-
+reset-lifetime precondition on picking an entry point.
 
 The four-channel API is a separate zero-padding-free grid and does not use
 `AudioPipeline`. See [the 4-channel contract](4ch_pipelines/README.md) and

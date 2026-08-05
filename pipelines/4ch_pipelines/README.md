@@ -10,11 +10,14 @@ The core boundary is intentionally narrow:
 ```text
 raw far reference ──> one shared matched-filter/delay estimator
                               |
-                              v (one aligned reference)
-mic 0 ──> linear AEC 0 ─┐                              ┌─> mono NR
-mic 1 ──> linear AEC 1 ─┤  PRE HANDOFF   POST RESUME  ├─> gain fusion/OLA
-mic 2 ──> linear AEC 2 ─┼─>[external SRP-PHAT/GSC]───┴─> mono RES
-mic 3 ──> linear AEC 3 ─┘
+                              v (one aligned reference, identical to every lane)
+mic 0 ──> linear AEC 0 ─┐ (computes the far-end FFT: aec_process_context())
+mic 1 ──> linear AEC 1 ─┤ (borrows lane 0's far_spec: aec_process_context_shared_far())
+mic 2 ──> linear AEC 2 ─┤ (borrows lane 0's far_spec: aec_process_context_shared_far())
+mic 3 ──> linear AEC 3 ─┘ (borrows lane 0's far_spec: aec_process_context_shared_far())
+                        │                              ┌─> mono NR
+                        │  PRE HANDOFF   POST RESUME  ├─> gain fusion/OLA
+                        └─>[external SRP-PHAT/GSC]───┴─> mono RES
 ```
 
 Each `linear AEC` box still runs its own PBFDKF/shadow filter, residual-echo
@@ -26,13 +29,30 @@ internally by this pipeline, not caller-configurable) skips straight to the
 `DominantNearend` update and leaves `res_gain` `NULL`, so `POST RESUME`'s
 gain fusion is the only place a suppression gain is calculated.
 
+**Far-end FFT sharing** (one far-end rfft/hop instead of four): all four
+lanes see the byte-identical `p->aligned_ref` every hop and reset together on
+any delay change (see the hard invariants below) -- the precondition for
+safely sharing one lane's far-end spectrum across the other three was already
+true before this existed. Lane 0 runs `aec_process_context()` (computes its
+own far-end FFT, as always); `aec_get_res_context()`'s always-populated
+`far_spec` field is then handed to lanes 1-3 via
+`aec_process_context_shared_far()`, which borrows it instead of computing a
+redundant, byte-identical transform. `four_aec_nr_res_far_fft_real_compute_count()`
+exposes a running per-hop count for tests to confirm the 4x→1x drop directly,
+rather than trusting the wiring by inspection alone. `ref` is still passed to
+every lane even when its far-end spectrum is borrowed -- the OLA far-buffer
+time-domain history and every non-FFT use of the raw far signal (saturation
+detection, delay estimation, mu_scale) are per-lane state, untouched by this
+sharing.
+
 Hard invariants:
 
 - There is exactly **one** matched-filter instance. It uses a configurable
   capture proxy channel and the raw far reference.
 - Only the adaptive linear filter is replicated, exactly four times.
 - All four filters consume the same delay-aligned reference and reset together
-  if that shared alignment changes.
+  if that shared alignment changes -- this is also the precondition the
+  far-end-FFT-sharing scheme above depends on, not a separate guarantee.
 - No NR, RES, neural model, or delay estimator is replicated per microphone --
   enforced structurally, not just left unused: each lane keeps only the
   R2/`DominantNearend` state its own echo path needs and never calculates its
