@@ -26,6 +26,7 @@ import argparse
 import configparser
 from decimal import Decimal, ROUND_CEILING
 import glob
+import hashlib
 import json
 import math
 import os
@@ -43,6 +44,190 @@ try:
     from .dataset import DNS4Dataset
 except ImportError:
     from dataset import DNS4Dataset
+
+
+# Bump whenever the on-disk batch format or --resume semantics change in a
+# way that would make an old batch directory unsafe to blindly resume into
+# (e.g. this version's introduction: metadata.jsonl -> per-sample atomic
+# JSON sidecars). Written into meta.json and checked against the CURRENT
+# run's value before any --resume proceeds -- see _validate_resume_contract.
+AINR_DATASET_CONTRACT_VERSION = 2
+
+
+class DatasetContractError(RuntimeError):
+    """--resume's contract/config validation (_validate_resume_contract) or
+    orphan-sample detection (_scan_existing_samples) refused to proceed."""
+
+
+def _canonical_config_dict(cfg: configparser.ConfigParser) -> dict:
+    """Every section/key/value in `cfg` as a plain dict of dicts -- the
+    FULL resolved configuration (any CLI override, e.g. --sample-rate, is
+    already folded into `cfg` by the time gen_dataset() calls this), not a
+    hand-picked subset of fields. Hashing this rather than individually
+    tracked dataset.* attributes (snr_values, p_rir, level_mode,
+    p_noise_clipping, ...) means a newly added config knob is automatically
+    covered without anyone having to remember to extend a hash function.
+    """
+    return {section: dict(cfg.items(section)) for section in cfg.sections()}
+
+
+def _canonical_config_hash(cfg: configparser.ConfigParser) -> str:
+    """Stable (sorted-keys JSON) sha256 of the whole resolved config, for
+    detecting a distribution-changing config edit across a --resume run.
+    First 16 hex chars only -- a human-readable fingerprint, not a security
+    hash, so truncation collision risk is not a concern here."""
+    payload = json.dumps(_canonical_config_dict(cfg), sort_keys=True)
+    return hashlib.sha256(payload.encode('utf-8')).hexdigest()[:16]
+
+
+def _validate_resume_contract(meta_path, contract_version, config_hash, sr,
+                               force=False):
+    """Check an existing meta.json (if any) against the CURRENT run's
+    contract_version/config_hash/sr before a --resume run proceeds. Returns
+    the loaded meta dict, or None if no meta.json exists yet (a genuinely
+    fresh --resume into an empty/new output directory -- not an error).
+    Raises DatasetContractError on any mismatch unless force=True: without
+    this check, editing config.ini (SNR list, RIR probability, level
+    normalization, clipping knobs, ...) or switching --sample-rate and then
+    resuming into the same --output directory would silently mix two
+    different distributions (or two different sample rates) into one
+    dataset with no record anything changed.
+    """
+    if not os.path.exists(meta_path):
+        return None
+    with open(meta_path) as f:
+        existing = json.load(f)
+    problems = []
+    existing_cv = existing.get('contract_version')
+    if existing_cv != contract_version:
+        problems.append(
+            f"contract_version mismatch: existing batch={existing_cv!r}, "
+            f"this script={contract_version!r}"
+        )
+    existing_hash = existing.get('config_hash')
+    if existing_hash != config_hash:
+        problems.append(
+            f"config_hash mismatch: existing batch={existing_hash!r}, "
+            f"current config={config_hash!r} -- config.ini (or a CLI "
+            "override) changed since this batch was started"
+        )
+    existing_sr = existing.get('sr')
+    if existing_sr != sr:
+        problems.append(
+            f"sample rate mismatch: existing batch={existing_sr!r} Hz, "
+            f"current run={sr!r} Hz"
+        )
+    if problems and not force:
+        raise DatasetContractError(
+            "--resume refused: this output directory's meta.json does not "
+            "match the current run (would silently mix two distributions "
+            "into one dataset):\n  " + "\n  ".join(problems) +
+            "\nFix config.ini/--sample-rate to match the original batch, "
+            "pick a new --output directory, or pass "
+            "--resume-force-contract-mismatch if this is a deliberate "
+            "migration."
+        )
+    return existing
+
+
+def _sample_paths(pairs_dir, index):
+    stem = f"{index:06d}"
+    return (
+        os.path.join(pairs_dir, f"{stem}.wav"),
+        os.path.join(pairs_dir, f"{stem}.json"),
+    )
+
+
+def _tmp_path(final_path):
+    """Same-directory temp path for `final_path`, named `tmp.<basename>`
+    (prefix, not suffix). Two things need this exact shape:
+      1. torchaudio's soundfile backend infers the save format from the
+         LAST '.'-separated segment of a string path and ignores its own
+         `format=` kwarg in that case (a soundfile-backend quirk) -- so the
+         temp path must still literally END in '.wav' for _save_pair_atomic
+         to work at all; a '.wav.tmp' suffix breaks that.
+      2. _scan_existing_samples()'s glob-based scan must never mistake a
+         temp/in-progress file for a real sample: `tmp.NNNNNN.wav`'s
+         os.path.splitext() stem is `tmp.NNNNNN` (not all-digit), so it is
+         correctly excluded, same as a '*.wav.tmp' suffix would have been.
+    """
+    d = os.path.dirname(final_path)
+    b = os.path.basename(final_path)
+    return os.path.join(d, f"tmp.{b}")
+
+
+def _save_pair_atomic(pairs_dir, index, noisy, clean, sr):
+    """Write pairs/NNNNNN.wav via temp-file + os.replace: a crash mid-write
+    can never leave a partially-written file visible at the final path
+    (os.replace is an atomic rename on POSIX; a tmp file orphaned by a
+    crash before the replace sits under a name no `*.wav` glob ever
+    matches, so it can never be mistaken for a real sample)."""
+    wav_path, _ = _sample_paths(pairs_dir, index)
+    tmp_path = _tmp_path(wav_path)
+    pair = torch.stack([noisy, clean], dim=0)
+    torchaudio.save(tmp_path, pair, sr, bits_per_sample=16)
+    os.replace(tmp_path, wav_path)
+
+
+def _save_metadata_sidecar_atomic(pairs_dir, index, metadata):
+    """Write pairs/NNNNNN.json -- this sample's own metadata, one file per
+    sample (see AINR_DATASET_CONTRACT_VERSION's doc: this replaced a single
+    shared metadata.jsonl that had no atomicity or reconciliation story) --
+    via the same temp-file + os.replace atomicity as _save_pair_atomic.
+    Callers write this AFTER the WAV (see the generation loop below): if a
+    crash lands between the two renames, the WAV exists without its
+    sidecar -- an "orphan" _scan_existing_samples() detects below, that
+    --repair-resume can clean up -- rather than a sidecar existing for
+    audio that was never actually written.
+    """
+    _, json_path = _sample_paths(pairs_dir, index)
+    tmp_path = _tmp_path(json_path)
+    with open(tmp_path, 'w') as f:
+        json.dump({'index': index, **metadata}, f)
+    os.replace(tmp_path, json_path)
+
+
+def _scan_existing_samples(pairs_dir):
+    """Return (max_complete_index, orphan_wav_indices, orphan_json_indices).
+
+    A "complete" sample has BOTH NNNNNN.wav and NNNNNN.json; only complete
+    samples count toward max_complete_index -- an orphan WAV's metadata is
+    missing, so it must never be treated as "already generated" (that would
+    permanently lose that sample's metadata on --resume). Orphan lists are
+    sorted indices for a caller to report and, with --repair-resume,
+    delete. `tmp.NNNNNN.wav`/`tmp.NNNNNN.json` (an in-progress or crashed
+    write -- see _tmp_path) never match the `*.wav`/`*.json` globs' digit-
+    only-stem filter below, so they are correctly ignored here, not
+    misread as orphans.
+    """
+    wav_indices = set()
+    json_indices = set()
+    for path in glob.glob(os.path.join(pairs_dir, '*.wav')):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if stem.isdigit():
+            wav_indices.add(int(stem))
+    for path in glob.glob(os.path.join(pairs_dir, '*.json')):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        if stem.isdigit():
+            json_indices.add(int(stem))
+    complete = wav_indices & json_indices
+    orphan_wavs = sorted(wav_indices - json_indices)
+    orphan_jsons = sorted(json_indices - wav_indices)
+    max_complete = max(complete) if complete else -1
+    return max_complete, orphan_wavs, orphan_jsons
+
+
+def _repair_orphans(pairs_dir, orphan_wavs, orphan_jsons):
+    """Delete every orphan WAV/JSON --repair-resume identified. An orphan
+    WAV's sample was never actually completed (its metadata is missing);
+    an orphan JSON's sample's audio is missing. Neither is salvageable --
+    the only correct repair is to remove it so that index regenerates."""
+    for index in orphan_wavs:
+        wav_path, _ = _sample_paths(pairs_dir, index)
+        os.remove(wav_path)
+    for index in orphan_jsons:
+        _, json_path = _sample_paths(pairs_dir, index)
+        os.remove(json_path)
 
 
 def hours_to_sample_count(hours: float, segment_sec: float) -> int:
@@ -108,6 +293,11 @@ def gen_dataset(args):
     else:
         source = "config.ini [signal] sr" if cli_sample_rate is None else "CLI"
         print(f"Sample rate: {generation_sr} Hz ({source})")
+
+    # Computed AFTER the --sample-rate override is folded into `cfg` above,
+    # so a --sample-rate-only change (no config.ini edit) is still caught by
+    # --resume's contract check below (see _canonical_config_hash's doc).
+    config_hash = _canonical_config_hash(cfg)
 
     segment_sec = cfg.getfloat('audio', 'segment_sec', fallback=3.0)
     n_total = hours_to_sample_count(args.hours, segment_sec)
@@ -184,7 +374,7 @@ def gen_dataset(args):
     print()
 
     # 起始檔名編號 base_idx 是本批的「地板」:
-    #   --resume: 掃 pairs/ 取「最大編號 +1」，但不低於 base_idx。
+    #   --resume: 掃 pairs/ 取「完整 pair (wav+json) 最大編號 +1」，但不低於 base_idx。
     #   無 --resume: 直接從 base_idx 起 (擴增, 不掃碟; start_idx 已保證不洗舊檔)。
     sample_count = base_idx
     start_round = 0
@@ -192,12 +382,31 @@ def gen_dataset(args):
     meta_path = os.path.join(args.output, 'meta.json')
 
     if args.resume:
-        existing = glob.glob(os.path.join(pairs_dir, '*.wav'))
-        max_idx = -1
-        for path in existing:
-            stem = os.path.splitext(os.path.basename(path))[0]
-            if stem.isdigit():
-                max_idx = max(max_idx, int(stem))
+        _validate_resume_contract(
+            meta_path, AINR_DATASET_CONTRACT_VERSION, config_hash, SR,
+            force=args.resume_force_contract_mismatch,
+        )
+        max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(pairs_dir)
+        if orphan_wavs or orphan_jsons:
+            if args.repair_resume:
+                print(f"Repairing: removing {len(orphan_wavs)} orphan WAV(s) "
+                      f"(missing sidecar) and {len(orphan_jsons)} orphan "
+                      f"JSON(s) (missing audio): "
+                      f"{orphan_wavs + orphan_jsons}")
+                _repair_orphans(pairs_dir, orphan_wavs, orphan_jsons)
+                max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(pairs_dir)
+            else:
+                raise DatasetContractError(
+                    "--resume refused: found incomplete sample(s) in "
+                    f"{pairs_dir} -- {len(orphan_wavs)} WAV(s) with no "
+                    f"metadata sidecar {orphan_wavs}, "
+                    f"{len(orphan_jsons)} JSON sidecar(s) with no audio "
+                    f"{orphan_jsons}. Each was interrupted mid-write (or is "
+                    "left over from a pre-contract-version batch) and can "
+                    "never be treated as \"already generated\" -- re-run "
+                    "with --repair-resume to delete them (that index will "
+                    "regenerate), or fix manually."
+                )
         sample_count = max(max_idx + 1, base_idx)
         done = sample_count - base_idx
         if done > 0:
@@ -208,14 +417,22 @@ def gen_dataset(args):
                   f"從 {sample_count:06d}.wav 接續 "
                   f"(round {start_round + 1}, pass idx {pass_start})...")
         else:
-            print(f"Resume: pairs/ 無 >= {base_idx:06d} 的檔 "
+            print(f"Resume: pairs/ 無 >= {base_idx:06d} 的完整 pair "
                   f"→ 從 {base_idx:06d}.wav 開始")
     elif base_idx > 0:
-        print(f"Extending dataset: 從 {base_idx:06d}.wav 開始 (舊檔不會被覆蓋)")
+        collision_wav, collision_json = _sample_paths(pairs_dir, base_idx)
+        if os.path.exists(collision_wav) or os.path.exists(collision_json):
+            print(f"WARNING: {base_idx:06d}.wav/.json already exist in "
+                  f"{pairs_dir} and will be OVERWRITTEN (not --resume -- "
+                  "if this is unintentional, pass --resume instead or "
+                  "choose a --start-idx past the existing batch)")
+        print(f"Extending dataset: 從 {base_idx:06d}.wav 開始")
 
     def _save_meta(rounds_done):
         batch_samples = sample_count - base_idx
         meta = {
+            'contract_version': AINR_DATASET_CONTRACT_VERSION,
+            'config_hash': config_hash,
             'n_samples': sample_count,
             'sr': SR,
             'segment_sec': segment_sec,
@@ -240,29 +457,11 @@ def gen_dataset(args):
             'target_level_max_db': dataset.target_level_max_db,
             'p_noise_clipping': dataset.p_noise_clipping,
             'p_mixture_clipping': dataset.p_mixture_clipping,
+            'generation_split': dataset.generation_split,
             'config': args.config,
         }
         with open(meta_path, 'w') as f:
             json.dump(meta, f, indent=2)
-
-    def _save_pair(noisy, clean, index):
-        pair = torch.stack([noisy, clean], dim=0)
-        fname = f"{index:06d}.wav"
-        torchaudio.save(
-            os.path.join(pairs_dir, fname),
-            pair,
-            SR,
-            bits_per_sample=16,
-        )
-
-    # One JSON line per generated sample (index matches its pairs/NNNNNN.wav
-    # filename), appended incrementally like pairs/ itself -- never rewritten
-    # wholesale, so this also survives --resume across separate invocations.
-    metadata_path = os.path.join(args.output, 'metadata.jsonl')
-
-    def _save_sample_metadata(metadata, index):
-        with open(metadata_path, 'a') as f:
-            f.write(json.dumps({'index': index, **metadata}) + '\n')
 
     gen_start = time.time()
 
@@ -294,15 +493,15 @@ def gen_dataset(args):
                     loader, desc=f"Round {r+1}/{n_rounds}", total=len(indices)):
                 noisy = noisy.squeeze(0)   # (T,)
                 clean = clean.squeeze(0)
-                _save_pair(noisy, clean, sample_count)
-                _save_sample_metadata(metadata[0], sample_count)
+                _save_pair_atomic(pairs_dir, sample_count, noisy, clean, SR)
+                _save_metadata_sidecar_atomic(pairs_dir, sample_count, metadata[0])
                 sample_count += 1
         else:
             for i in tqdm.tqdm(range(idx_start, idx_stop),
                                desc=f"Round {r+1}/{n_rounds}"):
                 noisy, clean, metadata = dataset[i]
-                _save_pair(noisy, clean, sample_count)
-                _save_sample_metadata(metadata, sample_count)
+                _save_pair_atomic(pairs_dir, sample_count, noisy, clean, SR)
+                _save_metadata_sidecar_atomic(pairs_dir, sample_count, metadata)
                 sample_count += 1
 
         _save_meta(r + 1)
@@ -317,7 +516,8 @@ def gen_dataset(args):
           f"next file index is {sample_count:06d}. "
           f"Generation took {gen_elapsed / 3600:.2f} hours → {args.output}/")
     print(f"  {SR} Hz: {pairs_dir} "
-          f"(2-channel WAV: ch0=noisy, ch1=clean)")
+          f"(2-channel WAV ch0=noisy/ch1=clean + NNNNNN.json metadata sidecar, "
+          f"both written atomically per sample)")
 
 
 if __name__ == '__main__':
@@ -331,8 +531,15 @@ if __name__ == '__main__':
     parser.add_argument('--workers', type=int, default=4,
                         help='DataLoader workers (default: 4, 0=single process)')
     parser.add_argument('--resume', action='store_true',
-                        help='接續同一批: 從 pairs/ 最大編號後續寫 '
-                             '(不低於 start_idx)')
+                        help='接續同一批: 從 pairs/ 最大「完整 pair」編號後續寫 '
+                             '(不低於 start_idx)。核對既有 meta.json 的 '
+                             'contract_version/config_hash/sr，不符則拒絕。')
+    parser.add_argument('--repair-resume', action='store_true',
+                        help='與 --resume 併用: 自動刪除孤兒檔案 (只有 .wav 缺 '
+                             '.json，或只有 .json 缺 .wav) 而非直接拒絕接續')
+    parser.add_argument('--resume-force-contract-mismatch', action='store_true',
+                        help='與 --resume 併用: 略過 contract_version/'
+                             'config_hash/sr 核對 (危險 -- 僅供刻意遷移舊批次使用)')
     parser.add_argument('--start-idx', type=int, default=None,
                         help='起始檔名編號, 覆寫 config [gen] start_idx (擴增用)')
     parser.add_argument('--seed', type=int, default=None,

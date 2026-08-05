@@ -684,6 +684,46 @@ class DNS4Dataset(Dataset):
                 raise ValueError(f"[augmentation] {name} must be in [0, 1], got {value}")
         self.clip_snr_min = cfg.getfloat('augmentation', 'clip_snr_min')
         self.clip_snr_max = cfg.getfloat('augmentation', 'clip_snr_max')
+        if not math.isfinite(self.clip_snr_min) or not math.isfinite(self.clip_snr_max):
+            raise ValueError(
+                "[augmentation] clip_snr_min/clip_snr_max must be finite, got "
+                f"{self.clip_snr_min}/{self.clip_snr_max}"
+            )
+        if self.clip_snr_min > self.clip_snr_max:
+            raise ValueError(
+                "[augmentation] clip_snr_min must be <= clip_snr_max, got "
+                f"{self.clip_snr_min} > {self.clip_snr_max}"
+            )
+
+        # This project has no train/val split concept at generation time by
+        # DEFAULT (splitting normally happens downstream, in each model's own
+        # train.py) -- but DFN3's own clipping augmentation is train-only
+        # (validation data is never clipped), and this generator's
+        # p_noise_clipping/p_mixture_clipping applied unconditionally to
+        # every sample otherwise diverges from that. [gen] generation_split
+        # is an OPTIONAL opt-in: omitted (None), both knobs apply exactly as
+        # configured above, unconditionally, to every sample (unchanged
+        # default behavior, and the right choice for a generator whose
+        # output IS the val set too, or that leaves clipping-as-augmentation
+        # as a deliberate distribution choice regardless of split). Set to
+        # 'validation' for a run whose entire output is a held-out
+        # validation batch -- both clipping knobs are force-zeroed for that
+        # whole run, matching DFN3. 'train' is accepted as a no-op alias
+        # (documents intent at the call site; behaves identically to
+        # omitting the key).
+        self.generation_split = cfg.get(
+            'gen', 'generation_split', fallback=None
+        )
+        if self.generation_split is not None:
+            self.generation_split = self.generation_split.strip().lower()
+        if self.generation_split not in (None, 'train', 'validation'):
+            raise ValueError(
+                "[gen] generation_split must be 'train', 'validation', or "
+                f"omitted, got {self.generation_split!r}"
+            )
+        if self.generation_split == 'validation':
+            self.p_noise_clipping = 0.0
+            self.p_mixture_clipping = 0.0
 
         # Optional generation-pass cap. This is not a training epoch setting.
         self.pass_size = cfg.getint('gen', 'pass_size', fallback=0)

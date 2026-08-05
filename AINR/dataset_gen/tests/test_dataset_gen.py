@@ -1,8 +1,10 @@
 """Regression tests for dataset generation planning and RIR alignment."""
 
 import configparser
+import json
 import math
 import random
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -22,7 +24,20 @@ from dataset_gen.dataset import (
     source_sr_candidates,
     validate_mix_probabilities,
 )
-from dataset_gen.gen_dataset import hours_to_sample_count, seed_worker
+from dataset_gen.gen_dataset import (
+    AINR_DATASET_CONTRACT_VERSION,
+    DatasetContractError,
+    _canonical_config_hash,
+    _repair_orphans,
+    _sample_paths,
+    _save_metadata_sidecar_atomic,
+    _save_pair_atomic,
+    _scan_existing_samples,
+    _tmp_path,
+    _validate_resume_contract,
+    hours_to_sample_count,
+    seed_worker,
+)
 from dataset_gen.resample_dataset import resampled_num_frames
 
 
@@ -388,6 +403,57 @@ class ClippingConfigTest(unittest.TestCase):
                     _build_dataset(cfg)
 
 
+class GenerationSplitConfigTest(unittest.TestCase):
+    def test_omitted_generation_split_keeps_clipping_as_configured(self):
+        cfg = _load_example_config()
+        self.assertFalse(cfg.has_option('gen', 'generation_split'))
+        dataset = _build_dataset(cfg)
+        self.assertIsNone(dataset.generation_split)
+        # Example config's own p_noise_clipping=0.10 must survive untouched
+        # -- this is the "unset -> unconditional, unchanged default" case.
+        self.assertAlmostEqual(dataset.p_noise_clipping, 0.10)
+
+    def test_train_split_is_a_no_op_alias(self):
+        cfg = _load_example_config()
+        if not cfg.has_section('gen'):
+            cfg.add_section('gen')
+        cfg.set('gen', 'generation_split', 'train')
+        dataset = _build_dataset(cfg)
+        self.assertEqual(dataset.generation_split, 'train')
+        self.assertAlmostEqual(dataset.p_noise_clipping, 0.10)
+
+    def test_validation_split_force_zeroes_both_clipping_knobs(self):
+        cfg = _load_example_config()
+        if not cfg.has_section('gen'):
+            cfg.add_section('gen')
+        cfg.set('gen', 'generation_split', 'validation')
+        # Prove the zeroing OVERRIDES a nonzero configured probability, not
+        # just "happens to already be zero" -- p_mixture_clipping alone in
+        # the example config is 0.0, so exercise the noisier knob too.
+        cfg.set('augmentation', 'p_mixture_clipping', '0.5')
+        dataset = _build_dataset(cfg)
+        self.assertEqual(dataset.generation_split, 'validation')
+        self.assertEqual(dataset.p_noise_clipping, 0.0)
+        self.assertEqual(dataset.p_mixture_clipping, 0.0)
+
+    def test_generation_split_is_case_insensitive_and_trimmed(self):
+        cfg = _load_example_config()
+        if not cfg.has_section('gen'):
+            cfg.add_section('gen')
+        cfg.set('gen', 'generation_split', '  Validation  ')
+        dataset = _build_dataset(cfg)
+        self.assertEqual(dataset.generation_split, 'validation')
+        self.assertEqual(dataset.p_noise_clipping, 0.0)
+
+    def test_invalid_generation_split_is_rejected(self):
+        cfg = _load_example_config()
+        if not cfg.has_section('gen'):
+            cfg.add_section('gen')
+        cfg.set('gen', 'generation_split', 'test')
+        with self.assertRaises(ValueError):
+            _build_dataset(cfg)
+
+
 class LevelNormalizationBehaviorTest(unittest.TestCase):
     def test_level_normalization_targets_requested_dbfs(self):
         # min == max pins the uniform draw to an exact value without
@@ -545,6 +611,236 @@ class MetadataApiTest(unittest.TestCase):
         self.assertTrue(metadata['resample_simulated'])
         self.assertEqual(metadata['source_sr'], 8000)
         self.assertEqual(metadata['snr_db'], 0.0)
+
+
+class ClipSnrRangeConfigTest(unittest.TestCase):
+    def test_example_config_clip_snr_range_is_finite_and_ordered(self):
+        dataset = _build_dataset(_load_example_config())
+        self.assertTrue(math.isfinite(dataset.clip_snr_min))
+        self.assertTrue(math.isfinite(dataset.clip_snr_max))
+        self.assertLessEqual(dataset.clip_snr_min, dataset.clip_snr_max)
+
+    def test_inverted_clip_snr_range_is_rejected(self):
+        cfg = _load_example_config()
+        cfg.set('augmentation', 'clip_snr_min', '20')
+        cfg.set('augmentation', 'clip_snr_max', '0')
+        with self.assertRaises(ValueError):
+            _build_dataset(cfg)
+
+    def test_non_finite_clip_snr_bounds_are_rejected(self):
+        for key in ('clip_snr_min', 'clip_snr_max'):
+            with self.subTest(key=key):
+                cfg = _load_example_config()
+                cfg.set('augmentation', key, 'nan')
+                with self.assertRaises(ValueError):
+                    _build_dataset(cfg)
+
+
+class ExampleConfigExactValuesTest(unittest.TestCase):
+    """Pins the example config's own documented distribution-defining
+    values -- these are what AINR_DATASET_CONTRACT_VERSION's config_hash
+    ultimately protects against a silent drift across --resume; if either
+    of these ever legitimately changes, the change should be a deliberate,
+    reviewed edit to this test too, not an accident."""
+
+    def test_snr_values_exact_list(self):
+        cfg = _load_example_config()
+        values = parse_snr_values(cfg.get('mixing', 'snr_values'))
+        self.assertEqual(values, [-15.0, -10.0, -5.0, 0.0, 5.0, 10.0, 20.0, 40.0])
+
+    def test_p_rir_exact_value(self):
+        cfg = _load_example_config()
+        self.assertEqual(cfg.getfloat('rir', 'p_rir'), 0.5)
+
+
+class CanonicalConfigHashTest(unittest.TestCase):
+    def test_identical_config_hashes_identically(self):
+        cfg_a = _load_example_config()
+        cfg_b = _load_example_config()
+        self.assertEqual(_canonical_config_hash(cfg_a), _canonical_config_hash(cfg_b))
+
+    def test_changing_snr_values_changes_the_hash(self):
+        cfg_a = _load_example_config()
+        cfg_b = _load_example_config()
+        cfg_b.set('mixing', 'snr_values', '-15, -10, -5, 0, 5, 10, 20')
+        self.assertNotEqual(_canonical_config_hash(cfg_a), _canonical_config_hash(cfg_b))
+
+    def test_changing_p_rir_changes_the_hash(self):
+        cfg_a = _load_example_config()
+        cfg_b = _load_example_config()
+        cfg_b.set('rir', 'p_rir', '0.9')
+        self.assertNotEqual(_canonical_config_hash(cfg_a), _canonical_config_hash(cfg_b))
+
+    def test_changing_sample_rate_changes_the_hash(self):
+        # gen_dataset() folds a --sample-rate override into cfg (cfg.set)
+        # BEFORE computing config_hash -- this proves that resolved value,
+        # not just config.ini's own on-disk sr, is what's protected.
+        cfg_a = _load_example_config()
+        cfg_b = _load_example_config()
+        cfg_b.set('signal', 'sr', str(cfg_a.getint('signal', 'sr') + 1))
+        self.assertNotEqual(_canonical_config_hash(cfg_a), _canonical_config_hash(cfg_b))
+
+
+class ResumeContractValidationTest(unittest.TestCase):
+    def test_fresh_output_directory_returns_none(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            meta_path = Path(tmp) / 'meta.json'
+            result = _validate_resume_contract(
+                str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'abc123', 16000)
+            self.assertIsNone(result)
+
+    def test_matching_meta_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            meta_path = Path(tmp) / 'meta.json'
+            meta_path.write_text(json.dumps({
+                'contract_version': AINR_DATASET_CONTRACT_VERSION,
+                'config_hash': 'abc123',
+                'sr': 16000,
+            }))
+            result = _validate_resume_contract(
+                str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'abc123', 16000)
+            self.assertEqual(result['config_hash'], 'abc123')
+
+    def test_contract_version_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            meta_path = Path(tmp) / 'meta.json'
+            meta_path.write_text(json.dumps({
+                'contract_version': AINR_DATASET_CONTRACT_VERSION - 1,
+                'config_hash': 'abc123',
+                'sr': 16000,
+            }))
+            with self.assertRaises(DatasetContractError):
+                _validate_resume_contract(
+                    str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'abc123', 16000)
+
+    def test_config_hash_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            meta_path = Path(tmp) / 'meta.json'
+            meta_path.write_text(json.dumps({
+                'contract_version': AINR_DATASET_CONTRACT_VERSION,
+                'config_hash': 'old_hash',
+                'sr': 16000,
+            }))
+            with self.assertRaises(DatasetContractError):
+                _validate_resume_contract(
+                    str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'new_hash', 16000)
+
+    def test_sample_rate_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            meta_path = Path(tmp) / 'meta.json'
+            meta_path.write_text(json.dumps({
+                'contract_version': AINR_DATASET_CONTRACT_VERSION,
+                'config_hash': 'abc123',
+                'sr': 16000,
+            }))
+            with self.assertRaises(DatasetContractError):
+                _validate_resume_contract(
+                    str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'abc123', 48000)
+
+    def test_force_bypasses_every_mismatch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            meta_path = Path(tmp) / 'meta.json'
+            meta_path.write_text(json.dumps({
+                'contract_version': AINR_DATASET_CONTRACT_VERSION - 1,
+                'config_hash': 'old_hash',
+                'sr': 16000,
+            }))
+            result = _validate_resume_contract(
+                str(meta_path), AINR_DATASET_CONTRACT_VERSION, 'new_hash', 48000,
+                force=True)
+            self.assertEqual(result['config_hash'], 'old_hash')
+
+
+class AtomicSampleWriteTest(unittest.TestCase):
+    def test_save_pair_atomic_leaves_only_the_final_wav(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            noisy = torch.zeros(160)
+            clean = torch.zeros(160)
+            _save_pair_atomic(tmp, 3, noisy, clean, 16000)
+            wav_path, _ = _sample_paths(tmp, 3)
+            self.assertTrue(Path(wav_path).exists())
+            self.assertFalse(Path(_tmp_path(wav_path)).exists())
+
+    def test_save_pair_atomic_failure_leaves_no_final_wav(self):
+        # A crash/exception inside the write must never leave a partial
+        # file visible at the FINAL path -- torchaudio.save only ever
+        # targets the .tmp path, so a mid-write failure there simply never
+        # reaches os.replace.
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch('dataset_gen.gen_dataset.torchaudio.save',
+                       side_effect=RuntimeError('disk full')):
+                with self.assertRaises(RuntimeError):
+                    _save_pair_atomic(tmp, 5, torch.zeros(160), torch.zeros(160), 16000)
+            wav_path, _ = _sample_paths(tmp, 5)
+            self.assertFalse(Path(wav_path).exists())
+
+    def test_save_metadata_sidecar_atomic_leaves_only_the_final_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _save_metadata_sidecar_atomic(tmp, 7, {'snr_db': 5.0})
+            _, json_path = _sample_paths(tmp, 7)
+            self.assertTrue(Path(json_path).exists())
+            self.assertFalse(Path(_tmp_path(json_path)).exists())
+            content = json.loads(Path(json_path).read_text())
+            self.assertEqual(content['index'], 7)
+            self.assertEqual(content['snr_db'], 5.0)
+
+
+class OrphanSampleScanTest(unittest.TestCase):
+    def test_empty_directory_has_no_complete_samples(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
+            self.assertEqual(max_idx, -1)
+            self.assertEqual(orphan_wavs, [])
+            self.assertEqual(orphan_jsons, [])
+
+    def test_complete_pairs_count_toward_max_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _save_pair_atomic(tmp, 0, torch.zeros(160), torch.zeros(160), 16000)
+            _save_metadata_sidecar_atomic(tmp, 0, {})
+            _save_pair_atomic(tmp, 1, torch.zeros(160), torch.zeros(160), 16000)
+            _save_metadata_sidecar_atomic(tmp, 1, {})
+            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
+            self.assertEqual(max_idx, 1)
+            self.assertEqual(orphan_wavs, [])
+            self.assertEqual(orphan_jsons, [])
+
+    def test_orphan_wav_without_sidecar_is_detected_and_excluded_from_max(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _save_pair_atomic(tmp, 0, torch.zeros(160), torch.zeros(160), 16000)
+            _save_metadata_sidecar_atomic(tmp, 0, {})
+            # index 1: WAV only -- simulates a crash between the two atomic
+            # writes in the generation loop (WAV renamed, sidecar never was).
+            _save_pair_atomic(tmp, 1, torch.zeros(160), torch.zeros(160), 16000)
+            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
+            self.assertEqual(max_idx, 0, "orphan WAV must never count as a completed sample")
+            self.assertEqual(orphan_wavs, [1])
+            self.assertEqual(orphan_jsons, [])
+
+    def test_orphan_json_without_wav_is_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _save_metadata_sidecar_atomic(tmp, 2, {})
+            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
+            self.assertEqual(max_idx, -1)
+            self.assertEqual(orphan_wavs, [])
+            self.assertEqual(orphan_jsons, [2])
+
+    def test_repair_removes_orphans_and_leaves_complete_pairs_intact(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _save_pair_atomic(tmp, 0, torch.zeros(160), torch.zeros(160), 16000)
+            _save_metadata_sidecar_atomic(tmp, 0, {})
+            _save_pair_atomic(tmp, 1, torch.zeros(160), torch.zeros(160), 16000)  # orphan wav
+            _save_metadata_sidecar_atomic(tmp, 2, {})  # orphan json
+
+            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
+            _repair_orphans(tmp, orphan_wavs, orphan_jsons)
+
+            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
+            self.assertEqual(max_idx, 0)
+            self.assertEqual(orphan_wavs, [])
+            self.assertEqual(orphan_jsons, [])
+            wav0, json0 = _sample_paths(tmp, 0)
+            self.assertTrue(Path(wav0).exists())
+            self.assertTrue(Path(json0).exists())
 
 
 if __name__ == '__main__':
