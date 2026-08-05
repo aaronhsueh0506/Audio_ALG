@@ -11,6 +11,7 @@ and wrote its output non-atomically. These tests pin the fixes for all of
 that -- see the pack_dataset.py commit for the full list.
 """
 
+import hashlib
 import json
 import math
 import os
@@ -32,25 +33,49 @@ from dataset_gen.gen_dataset import (
 )
 from dataset_gen.pack_dataset import DatasetContractError, pack
 
+# A real, well-formed 64-hex-char sha256 digest -- pack_dataset.py now
+# validates config_hash's FORMAT (not just its value) whenever
+# contract_version matches, so any fixture meant to exercise the normal
+# "matching, trustworthy contract" path needs a hash that actually looks
+# like one, not a short placeholder string.
+_VALID_CONFIG_HASH = hashlib.sha256(b'test-fixture-config').hexdigest()
+
 
 def _make_batch(tmp, indices_and_audio, contract_version=AINR_DATASET_CONTRACT_VERSION,
-                 config_hash='testhash0123456789', write_meta=True):
+                 config_hash=_VALID_CONFIG_HASH, write_meta=True,
+                 batch_start_idx=None, batch_n_samples=None, sr_override=None):
     """Build a `tmp/pairs/` directory of complete NNNNNN.wav+NNNNNN.json
     samples plus a parent `tmp/meta.json`, mirroring gen_dataset.py's own
     on-disk layout. `indices_and_audio` is a list of (index, noisy, clean,
-    sr) tuples. Returns the pairs_dir path."""
+    sr) tuples. Returns the pairs_dir path.
+
+    `batch_start_idx`/`batch_n_samples` default to exactly what
+    `indices_and_audio` puts on disk (a self-consistent, "meta.json
+    accurately describes what's on disk" fixture) -- pack_dataset.py's
+    fail-closed inventory check requires the on-disk complete-index set to
+    equal EXACTLY `range(batch_start_idx, batch_start_idx + batch_n_samples)`
+    when contract_version matches. Pass explicit, deliberately WRONG values
+    to build a fixture that fails that check on purpose."""
     pairs_dir = os.path.join(tmp, 'pairs')
     os.makedirs(pairs_dir, exist_ok=True)
     for index, noisy, clean, sr in indices_and_audio:
         _save_pair_atomic(pairs_dir, index, noisy, clean, sr)
-        _save_metadata_sidecar_atomic(pairs_dir, index, {'snr_db': 0.0})
+        _save_metadata_sidecar_atomic(pairs_dir, index, {'index': index, 'snr_db': 0.0})
     if write_meta:
+        indices = [t[0] for t in indices_and_audio]
         meta_path = os.path.join(tmp, 'meta.json')
         with open(meta_path, 'w') as f:
             json.dump({
                 'contract_version': contract_version,
                 'config_hash': config_hash,
-                'sr': indices_and_audio[0][3] if indices_and_audio else None,
+                'sr': sr_override if sr_override is not None else (
+                    indices_and_audio[0][3] if indices_and_audio else None),
+                'batch_start_idx': (
+                    batch_start_idx if batch_start_idx is not None
+                    else (min(indices) if indices else 0)),
+                'batch_n_samples': (
+                    batch_n_samples if batch_n_samples is not None
+                    else len(indices_and_audio)),
             }, f)
     return pairs_dir
 
@@ -230,16 +255,40 @@ class CompletePairScanTest(unittest.TestCase):
             with self.assertRaises(DatasetContractError):
                 pack(_pack_args(in_dir, out_path))
 
-    def test_index_gap_accepted_with_allow_index_gaps(self):
+    def test_index_gap_rejected_even_with_allow_index_gaps_in_versioned_mode(self):
+        # In the default (contract_version-matching) mode, the fail-closed
+        # inventory check requires the on-disk complete indices to equal
+        # EXACTLY meta.json's declared range -- there is no "curated
+        # subset" escape hatch for a batch that's supposed to be trusted.
+        # --allow-index-gaps alone must NOT be enough to bypass this.
         with tempfile.TemporaryDirectory() as tmp:
             sr = 16000
             noisy, clean = _tone(sr, 200), _tone(sr, 300)
             in_dir = _make_batch(tmp, [
                 (0, noisy, clean, sr), (1, noisy, clean, sr),
-                (3, noisy, clean, sr),
+                (3, noisy, clean, sr),   # index 2 missing
             ])
             out_path = os.path.join(tmp, 'packed.pt')
-            pack(_pack_args(in_dir, out_path, allow_index_gaps=True))
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path, allow_index_gaps=True))
+
+    def test_index_gap_accepted_with_allow_index_gaps_in_unversioned_mode(self):
+        # The plain internal-contiguity check + --allow-index-gaps escape
+        # hatch is a legacy fallback for when there's no trustworthy
+        # meta.json to check an exact range against (--allow-unversioned-
+        # input, e.g. an old/foreign contract_version).
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(
+                tmp, [
+                    (0, noisy, clean, sr), (1, noisy, clean, sr),
+                    (3, noisy, clean, sr),
+                ],
+                contract_version=AINR_DATASET_CONTRACT_VERSION - 1)
+            out_path = os.path.join(tmp, 'packed.pt')
+            pack(_pack_args(in_dir, out_path, allow_unversioned_input=True,
+                             allow_index_gaps=True))
             payload = torch.load(out_path, weights_only=True)
             self.assertEqual(payload['sample_indices'], [0, 1, 3])
             self.assertEqual(payload['n_samples'], 3)
@@ -251,6 +300,196 @@ class CompletePairScanTest(unittest.TestCase):
             in_dir = _make_batch(tmp, [])
             out_path = os.path.join(tmp, 'packed.pt')
             with self.assertRaises(FileNotFoundError):
+                pack(_pack_args(in_dir, out_path))
+
+
+class DeclaredInventoryMismatchRejectionTest(unittest.TestCase):
+    """Release blocker: pack_dataset.py used to trust whatever complete
+    pairs it found on disk, never cross-checking that count/range against
+    what meta.json itself declares this batch to contain (batch_start_idx/
+    batch_n_samples). A batch that's still mid-generation (interrupted
+    before its last round's meta.json save) or was corrupted/tampered with
+    after the fact would pack silently either way."""
+
+    def test_disk_has_more_samples_than_meta_declares_is_rejected(self):
+        # meta.json declares only 1 sample, but 2 complete pairs actually
+        # exist on disk (e.g. generation continued past the last
+        # successful meta.json save, or two runs wrote into one directory).
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(
+                tmp, [(0, noisy, clean, sr), (1, noisy, clean, sr)],
+                batch_start_idx=0, batch_n_samples=1)
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+            self.assertFalse(os.path.exists(out_path))
+
+    def test_disk_has_fewer_samples_than_meta_declares_is_rejected(self):
+        # meta.json declares 2 samples, but only 1 complete pair actually
+        # exists (e.g. a sample was deleted/corrupted after meta.json was
+        # last saved).
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(
+                tmp, [(0, noisy, clean, sr)],
+                batch_start_idx=0, batch_n_samples=2)
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+            self.assertFalse(os.path.exists(out_path))
+
+    def test_allow_unversioned_input_bypasses_the_exact_range_check(self):
+        # The escape hatch is --allow-unversioned-input (an old/foreign
+        # contract_version), not a dedicated flag for this check alone --
+        # a mismatched-but-present meta.json falls back to the plain
+        # internal-contiguity check instead.
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(
+                tmp, [(0, noisy, clean, sr), (1, noisy, clean, sr)],
+                contract_version=AINR_DATASET_CONTRACT_VERSION - 1,
+                batch_start_idx=0, batch_n_samples=1)
+            out_path = os.path.join(tmp, 'packed.pt')
+            pack(_pack_args(in_dir, out_path, allow_unversioned_input=True))
+            payload = torch.load(out_path, weights_only=True)
+            self.assertEqual(payload['sample_indices'], [0, 1])
+
+
+class SidecarIntegrityRejectionTest(unittest.TestCase):
+    """A sidecar that doesn't parse, or whose own 'index' field disagrees
+    with its filename, is basic file-integrity corruption -- checked
+    upfront (before any WAV is loaded) and always a hard error, in every
+    mode, unlike a contract/config mismatch."""
+
+    def test_corrupt_sidecar_json_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(tmp, [(0, noisy, clean, sr)])
+            _, json_path = _sample_paths(in_dir, 0)
+            Path(json_path).write_text('{not valid json')
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+
+    def test_sidecar_index_field_mismatch_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(tmp, [(0, noisy, clean, sr)])
+            _, json_path = _sample_paths(in_dir, 0)
+            json_path_obj = Path(json_path)
+            sidecar = json.loads(json_path_obj.read_text())
+            sidecar['index'] = 999
+            json_path_obj.write_text(json.dumps(sidecar))
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+
+    def test_no_bypass_via_allow_unversioned_input(self):
+        # Even the legacy/unversioned escape hatch must not tolerate
+        # corrupt metadata -- it relaxes contract/config trust, not basic
+        # file integrity.
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(
+                tmp, [(0, noisy, clean, sr)],
+                contract_version=AINR_DATASET_CONTRACT_VERSION - 1)
+            _, json_path = _sample_paths(in_dir, 0)
+            Path(json_path).write_text('{not valid json')
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path, allow_unversioned_input=True))
+
+
+class ConfigHashFormatValidationTest(unittest.TestCase):
+    def test_malformed_config_hash_is_rejected_when_contract_version_matches(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(tmp, [(0, noisy, clean, sr)],
+                                  config_hash='not-a-real-sha256')
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+
+    def test_malformed_config_hash_tolerated_under_allow_unversioned_input(self):
+        # A mismatched contract_version already means the batch can't be
+        # trusted as-is -- --allow-unversioned-input's whole point is to
+        # pack it anyway, so an also-malformed config_hash on that same
+        # untrusted meta.json doesn't add a new failure mode.
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(
+                tmp, [(0, noisy, clean, sr)],
+                contract_version=AINR_DATASET_CONTRACT_VERSION - 1,
+                config_hash='not-a-real-sha256')
+            out_path = os.path.join(tmp, 'packed.pt')
+            pack(_pack_args(in_dir, out_path, allow_unversioned_input=True))
+            payload = torch.load(out_path, weights_only=True)
+            self.assertEqual(payload['config_hash'], 'not-a-real-sha256')
+
+
+class MalformedMetaJsonRejectionTest(unittest.TestCase):
+    """Found by adversarial review: a meta.json that's corrupt in ways the
+    developer didn't anticipate must fail closed with a clean
+    DatasetContractError, not crash with a raw json.JSONDecodeError/
+    TypeError -- exactly like a genuinely alien contract_version does."""
+
+    def test_meta_json_body_is_not_valid_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(tmp, [(0, noisy, clean, sr)])
+            meta_path = os.path.join(tmp, 'meta.json')
+            Path(meta_path).write_text('{not valid json')
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+
+    def test_batch_start_idx_wrong_type_is_rejected_not_crashed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(tmp, [(0, noisy, clean, sr)])
+            meta_path = os.path.join(tmp, 'meta.json')
+            meta = json.loads(Path(meta_path).read_text())
+            meta['batch_start_idx'] = "0"  # string, not int
+            Path(meta_path).write_text(json.dumps(meta))
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+
+    def test_batch_n_samples_wrong_type_is_rejected_not_crashed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(tmp, [(0, noisy, clean, sr)])
+            meta_path = os.path.join(tmp, 'meta.json')
+            meta = json.loads(Path(meta_path).read_text())
+            meta['batch_n_samples'] = 1.5  # float, not int
+            Path(meta_path).write_text(json.dumps(meta))
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+
+    def test_sr_wrong_type_is_rejected_not_crashed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(tmp, [(0, noisy, clean, sr)])
+            meta_path = os.path.join(tmp, 'meta.json')
+            meta = json.loads(Path(meta_path).read_text())
+            meta['sr'] = [16000]  # list, not int
+            Path(meta_path).write_text(json.dumps(meta))
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
                 pack(_pack_args(in_dir, out_path))
 
 
@@ -314,7 +553,11 @@ class BatchContractValidationTest(unittest.TestCase):
 
 
 class SampleRateConsistencyTest(unittest.TestCase):
-    def test_mismatched_native_rate_without_target_sr_is_excluded(self):
+    def test_mismatched_native_rate_without_target_sr_is_hard_rejected_in_versioned_mode(self):
+        # A validated/contract-versioned batch should never contain a
+        # sample rate mismatch -- pack() now stops immediately rather than
+        # silently excluding it (silent exclusion would also reopen an
+        # index gap the earlier inventory check already closed).
         with tempfile.TemporaryDirectory() as tmp:
             noisy16, clean16 = _tone(16000, 200), _tone(16000, 300)
             noisy48, clean48 = _tone(48000, 200), _tone(48000, 300)
@@ -323,13 +566,36 @@ class SampleRateConsistencyTest(unittest.TestCase):
                 (1, noisy48, clean48, 48000),  # different native rate, no --target-sr
             ])
             out_path = os.path.join(tmp, 'packed.pt')
-            pack(_pack_args(in_dir, out_path))
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+
+    def test_mismatched_native_rate_without_target_sr_is_excluded_in_unversioned_legacy_mode(self):
+        # --allow-unversioned-input (no trustworthy meta.json/contract)
+        # falls back to the pre-fail-closed behavior: soft-exclude and warn
+        # instead of stopping the whole pack.
+        with tempfile.TemporaryDirectory() as tmp:
+            noisy16, clean16 = _tone(16000, 200), _tone(16000, 300)
+            noisy48, clean48 = _tone(48000, 200), _tone(48000, 300)
+            in_dir = _make_batch(
+                tmp, [
+                    (0, noisy16, clean16, 16000),
+                    (1, noisy48, clean48, 48000),
+                ],
+                contract_version=AINR_DATASET_CONTRACT_VERSION - 1)
+            out_path = os.path.join(tmp, 'packed.pt')
+            pack(_pack_args(in_dir, out_path, allow_unversioned_input=True))
             payload = torch.load(out_path, weights_only=True)
             # index 1 excluded (rate mismatch, no forced resample to reconcile it)
             self.assertEqual(payload['sample_indices'], [0])
             self.assertEqual(payload['sr'], 16000)
 
-    def test_mismatched_native_rate_is_fine_when_target_sr_forces_resample(self):
+    def test_mismatched_native_rate_is_hard_rejected_in_versioned_mode_even_with_target_sr(self):
+        # A contract-versioned batch is by construction single-native-rate
+        # (gen_dataset.py only ever generates one rate per invocation) --
+        # --target-sr reconciles the OUTPUT rate, it must not become a
+        # blanket excuse to stop verifying a file's native rate actually
+        # matches what this batch is supposed to contain (exactly the
+        # "different run's file mixed in" tampering this fix targets).
         with tempfile.TemporaryDirectory() as tmp:
             noisy16, clean16 = _tone(16000, 200), _tone(16000, 300)
             noisy48, clean48 = _tone(48000, 200), _tone(48000, 300)
@@ -338,7 +604,25 @@ class SampleRateConsistencyTest(unittest.TestCase):
                 (1, noisy48, clean48, 48000),
             ])
             out_path = os.path.join(tmp, 'packed.pt')
-            pack(_pack_args(in_dir, out_path, target_sr=16000))
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path, target_sr=16000))
+
+    def test_mismatched_native_rate_is_fine_with_target_sr_in_unversioned_legacy_mode(self):
+        # The legacy/unversioned fallback path (no trustworthy meta.json to
+        # check a native rate against) may still legitimately combine
+        # heterogeneous native rates when --target-sr reconciles them.
+        with tempfile.TemporaryDirectory() as tmp:
+            noisy16, clean16 = _tone(16000, 200), _tone(16000, 300)
+            noisy48, clean48 = _tone(48000, 200), _tone(48000, 300)
+            in_dir = _make_batch(
+                tmp, [
+                    (0, noisy16, clean16, 16000),
+                    (1, noisy48, clean48, 48000),
+                ],
+                contract_version=AINR_DATASET_CONTRACT_VERSION - 1)
+            out_path = os.path.join(tmp, 'packed.pt')
+            pack(_pack_args(in_dir, out_path, target_sr=16000,
+                             allow_unversioned_input=True))
             payload = torch.load(out_path, weights_only=True)
             self.assertEqual(payload['sample_indices'], [0, 1])
             self.assertEqual(payload['sr'], 16000)
