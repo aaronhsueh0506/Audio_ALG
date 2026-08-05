@@ -863,6 +863,118 @@ cleanup:
     four_aec_nr_res_destroy(pipeline);
 }
 
+/* Group 6: lane 0 runs its own far-end FFT every hop; lanes 1-3 borrow it
+ * via aec_process_context_shared_far() instead of each recomputing an
+ * identical transform. Proves the total (four_aec_nr_res_far_fft_real_
+ * compute_count(), summed across all four lanes) increases by AT MOST 1
+ * per four_aec_nr_res_process_pre() call, never 4 -- the actual, measured
+ * consequence of the sharing, not just "the code compiles and still
+ * produces plausible output" (already covered by run_grid()'s finite-
+ * output checks and the byte-equal WAV/raw-f32 gates run outside this
+ * suite).
+ *
+ * "At most 1", not "exactly 1": process_pre() resets all four lanes
+ * (aec_reset(), which also zeroes this counter) whenever the shared delay
+ * estimator's estimate changes -- expected, unrelated pre-existing
+ * behavior during the synthetic signal's initial delay-acquisition hops,
+ * confirmed empirically while writing this test (the total visibly drops
+ * back down before climbing again). A drop is fine; the one invariant
+ * that must never break is the total never jumping by MORE than 1 in a
+ * single call, which is exactly what "lanes 1-3 silently stopped sharing
+ * and went back to computing their own FFT" would look like. */
+static void test_far_fft_sharing_reduces_four_to_one(
+        int sample_rate, int fft_size) {
+    FourAecNrResConfig cfg;
+    FourAecNrRes* p;
+    FourAecNrResPreFrame pre;
+    float* microphones;
+    float* ref;
+    float* out;
+    Complex* weights;
+    int hop;
+    int n_freqs;
+    int frame;
+    int ch, k;
+    long before, after;
+    int saw_a_plus_one_increment = 0;
+    int max_single_hop_increment = 0;
+    char label[160];
+
+    cfg = four_aec_nr_res_default_config(sample_rate);
+    cfg.fft_size = fft_size;
+    p = four_aec_nr_res_create(&cfg);
+    CHECK(p != NULL, "far-FFT sharing test: create");
+    if (!p) return;
+
+    hop = four_aec_nr_res_hop_size(p);
+    n_freqs = four_aec_nr_res_n_freqs(p);
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
+    CHECK(microphones && ref && out && weights,
+          "far-FFT sharing test: buffers allocate");
+    if (!microphones || !ref || !out || !weights) {
+        free(microphones); free(ref); free(out); free(weights);
+        four_aec_nr_res_destroy(p);
+        return;
+    }
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+        for (k = 0; k < n_freqs; ++k)
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+
+    snprintf(label, sizeof(label),
+             "far-FFT sharing sr=%d/fft=%d: counter starts at 0",
+             sample_rate, fft_size);
+    CHECK(four_aec_nr_res_far_fft_real_compute_count(p) == 0, label);
+
+    for (frame = 0; frame < 40; ++frame) {
+        fill_inputs(microphones, ref, hop, sample_rate, frame);
+        before = four_aec_nr_res_far_fft_real_compute_count(p);
+        if (four_aec_nr_res_process_pre(p, microphones, ref, &pre) !=
+                FOUR_AEC_NR_RES_OK) {
+            CHECK(0, "far-FFT sharing test: pre stage succeeds");
+            break;
+        }
+        after = four_aec_nr_res_far_fft_real_compute_count(p);
+        if (after - before > max_single_hop_increment)
+            max_single_hop_increment = (int)(after - before);
+        if (after == before + 1) saw_a_plus_one_increment = 1;
+        if (four_aec_nr_res_process_post(p, &pre.token, weights, out) !=
+                FOUR_AEC_NR_RES_OK) {
+            CHECK(0, "far-FFT sharing test: post stage succeeds");
+            break;
+        }
+    }
+
+    snprintf(label, sizeof(label),
+             "far-FFT sharing sr=%d/fft=%d: total never jumps by more than "
+             "1 in a single process_pre() call across 40 hops (max seen: %d)",
+             sample_rate, fft_size, max_single_hop_increment);
+    CHECK(max_single_hop_increment <= 1, label);
+    snprintf(label, sizeof(label),
+             "far-FFT sharing sr=%d/fft=%d: at least one hop actually shows "
+             "the +1 increment (not a vacuous pass from e.g. every hop "
+             "being a reset)",
+             sample_rate, fft_size);
+    CHECK(saw_a_plus_one_increment, label);
+
+    four_aec_nr_res_reset(p);
+    snprintf(label, sizeof(label),
+             "far-FFT sharing sr=%d/fft=%d: four_aec_nr_res_reset() zeroes "
+             "the counter",
+             sample_rate, fft_size);
+    CHECK(four_aec_nr_res_far_fft_real_compute_count(p) == 0, label);
+
+    free(microphones);
+    free(ref);
+    free(out);
+    free(weights);
+    four_aec_nr_res_destroy(p);
+}
+
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
@@ -878,6 +990,9 @@ int main(void) {
     test_pre_frame_wola_identity(16000, 256);
     test_pre_frame_wola_identity(16000, 512);
     test_pre_frame_wola_identity(48000, 1024);
+    test_far_fft_sharing_reduces_four_to_one(16000, 256);
+    test_far_fft_sharing_reduces_four_to_one(16000, 512);
+    test_far_fft_sharing_reduces_four_to_one(48000, 1024);
 
     if (failures) {
         printf("%d test(s) failed\n", failures);

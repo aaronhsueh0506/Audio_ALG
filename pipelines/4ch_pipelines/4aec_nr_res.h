@@ -433,6 +433,16 @@ int four_aec_nr_res_linear_aec_count(const FourAecNrRes* p);
 int four_aec_nr_res_nr_count(const FourAecNrRes* p);
 int four_aec_nr_res_post_res_count(const FourAecNrRes* p);
 
+/* Group 6 instrumentation, read-only: sum of aec_far_fft_real_compute_count()
+ * across all four lanes (cumulative since construction or the last
+ * four_aec_nr_res_reset()). Lane 0 runs its own far-end FFT every hop
+ * (aec_process_context()); lanes 1-3 borrow lane 0's spectrum instead of
+ * recomputing it (aec_process_context_shared_far()) -- so this total
+ * increments by exactly 1 per four_aec_nr_res_process_pre() call, not 4.
+ * Intended for tests/instrumentation proving the cross-lane far-FFT
+ * sharing is genuinely active; has no effect on any processing. */
+long four_aec_nr_res_far_fft_real_compute_count(const FourAecNrRes* p);
+
 /* ============================================================================
  * Diagnostic memory breakdown
  * ========================================================================== */

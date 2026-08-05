@@ -872,6 +872,7 @@ int four_aec_nr_res_process_pre(
     int hop;
     int ch;
     int i;
+    const Complex* shared_far_spec = NULL;   /* Group 6: set by lane 0, borrowed by lanes 1-3 */
 
     if (!p || p->destroyed ||
         !microphones_interleaved || !ref || !out)
@@ -926,11 +927,32 @@ int four_aec_nr_res_process_pre(
          * dispatched per-call. This lane's own aec_process()-style output
          * (limiter-processed audio) has no consumer here: only
          * context.formed_hop below feeds the rest of this pipeline, so
-         * aec_process_context() skips computing the limiter output and the
-         * copy into a caller `out` buffer that aec_process() would have
-         * done for nothing (Group 5). */
-        aec_process_context(p->lanes[ch], p->mic_lane, p->aligned_ref);
+         * aec_process_context()/aec_process_context_shared_far() skip
+         * computing the limiter output and the copy into a caller `out`
+         * buffer that aec_process() would have done for nothing (Group 5).
+         *
+         * Group 6: every lane sees the IDENTICAL p->aligned_ref this hop
+         * (the shared, delay-aligned reference -- same pointer passed to
+         * every lane below), so lane 0's far-end FFT is byte-identical to
+         * what any other lane would compute from the same signal. Lane 0
+         * runs the real transform (aec_process_context(), unchanged) and
+         * exposes it via context.far_spec (unconditionally populated by
+         * aec_get_res_context(), independent of enable_res/
+         * return_res_context); lanes 1-3 borrow it through
+         * aec_process_context_shared_far() instead of each redundantly
+         * recomputing an identical FFT -- 4 far-FFTs/hop become 1. This
+         * borrowed pointer aliases lane 0's own persistent far_spec buffer
+         * (not a copy) and stays valid for the rest of this hop's loop
+         * body, since lane 0 is not touched again until the next call to
+         * this function. */
+        if (ch == 0) {
+            aec_process_context(p->lanes[ch], p->mic_lane, p->aligned_ref);
+        } else {
+            aec_process_context_shared_far(
+                p->lanes[ch], p->mic_lane, p->aligned_ref, shared_far_spec);
+        }
         aec_get_res_context(p->lanes[ch], &context);
+        if (ch == 0) shared_far_spec = context.far_spec;
         if (!context.formed_hop || !bind_lane_view(
                 &p->snapshots[ch], &context, p->n_freqs)) {
             four_aec_nr_res_reset(p);
@@ -1413,6 +1435,15 @@ int four_aec_nr_res_nr_count(const FourAecNrRes* p) {
 
 int four_aec_nr_res_post_res_count(const FourAecNrRes* p) {
     return p && !p->destroyed ? 1 : 0;
+}
+
+long four_aec_nr_res_far_fft_real_compute_count(const FourAecNrRes* p) {
+    long total = 0;
+    int ch;
+    if (!p || p->destroyed) return 0;
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+        total += aec_far_fft_real_compute_count(p->lanes[ch]);
+    return total;
 }
 
 /* ============================================================================
