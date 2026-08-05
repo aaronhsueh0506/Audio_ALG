@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Offline rendering of AEC scenario sequences into 6-channel WAV chunks.
+"""Offline rendering of AEC scenario sequences into 5-channel WAV chunks.
 
 Mirrors ``AINR/dataset_gen/gen_dataset.py``'s flags so the two generators are driven
 the same way, with two additions that the NR generator has no need for:
@@ -455,7 +455,7 @@ def gen_aec_dataset(args):
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description='Render AEC scenario sequences as 6-channel stem WAVs')
+        description='Render AEC scenario sequences as 5-channel stem WAVs')
     parser.add_argument('--config', default='config.ini', help='Config file path')
     parser.add_argument('--output', default='data_aec', help='Output directory')
     parser.add_argument('--hours', type=float, default=8.0,

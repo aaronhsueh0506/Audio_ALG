@@ -33,7 +33,20 @@ if _AEC_PYTHON not in sys.path:
 from aec import AEC, AecConfig, AecMode, AecPreset  # noqa: E402
 
 
-LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v1"
+LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v2"
+# v1 -> v2: linear_error was materialized from AEC.process()'s own return
+# value, which is the output LIMITER's target -- final_output *= limiter_gain
+# runs unconditionally (regardless of enable_res/enable_cng) and produces a
+# real, audible hop-boundary discontinuity whenever the limiter's smoothed
+# gain changes between hops (attack alpha=0.3 / release alpha=0.8), which
+# shows up as a vertical broadband line in ch5's spectrogram. v2 instead
+# reads AEC.get_formed_output() (config.return_formed_output=True): the AEC3
+# UseRefinedOutput-selected/crossfaded, WOLA-formed linear residual, captured
+# BEFORE the limiter multiply -- shadow-selection-correct (unlike the
+# limiter-affected value, which is also unconditionally main-filter-only) and
+# free of RES/CNG/SuppressionGain cost (unlike return_res_context=True, which
+# would also compute all of that unused work). Old (v1) linear_error/ch5 data
+# must be regenerated, not mixed with v2 output in the same packed dataset.
 
 # The linear-AEC frontend is a frozen, versioned contract: its (frame_size,
 # hop_size) per sample rate is a deliberate, pinned choice of this dataset,
@@ -97,6 +110,8 @@ class LinearAecContract:
     enable_shadow: bool
     enable_delay_est: bool
     enable_highpass: bool
+    output_seam: str
+    limiter: bool
     aec_commit: str
     aec_source_hash: str
 
@@ -127,6 +142,8 @@ class LinearAecContract:
             "enable_shadow": True,
             "enable_delay_est": True,
             "enable_highpass": True,
+            "output_seam": "formed_output",
+            "limiter": False,
         }
         for name, expected in expected_flags.items():
             actual = getattr(self, name)
@@ -192,6 +209,9 @@ def make_linear_aec_config(
         "enable_shadow": True,
         "enable_delay_est": True,
         "enable_highpass": True,
+        # v2 seam: get_formed_output() instead of process()'s own
+        # limiter-multiplied return value -- see LINEAR_AEC_CONTRACT_VERSION.
+        "return_formed_output": True,
     }
     if frame_size is not None:
         overrides["frame_size"] = int(frame_size)
@@ -227,6 +247,8 @@ def make_linear_aec_contract(
         enable_shadow=cfg.enable_shadow,
         enable_delay_est=cfg.enable_delay_est,
         enable_highpass=cfg.enable_highpass,
+        output_seam="formed_output",
+        limiter=False,
         aec_commit=_git_commit(_AEC_ROOT),
         aec_source_hash=aec_python_source_hash(),
     )
@@ -338,10 +360,16 @@ class LinearAecProcessor:
         error = np.empty_like(microphone, dtype=np.float32)
         for start in range(0, microphone.size, self.hop_size):
             stop = start + self.hop_size
-            error[start:stop] = self._engine.process(
+            # process()'s own return value is the output-limiter's target
+            # (final_output *= limiter_gain, unconditional) -- not read here.
+            # get_formed_output() (config.return_formed_output=True, set in
+            # make_linear_aec_config()) is the AEC3-selected/crossfaded,
+            # WOLA-formed linear residual captured before that limiter runs.
+            self._engine.process(
                 np.ascontiguousarray(microphone[start:stop]),
                 np.ascontiguousarray(far_end[start:stop]),
             )
+            error[start:stop] = self._engine.get_formed_output()
         if not np.isfinite(error).all():
             raise ValueError("linear AEC produced non-finite samples")
         echo_estimate = microphone - error
