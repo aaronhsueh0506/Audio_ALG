@@ -110,14 +110,16 @@ target and reverberant mixture do not acquire a pre-delay mismatch.
 
 ### SNR and clean/noise edge cases
 
-Mixed samples uniformly draw from DeepFilterNet's discrete SNR set:
-`-5, 0, 5, 10, 20, 40 dB`. DeepFilterNet3 puts `-100` in that list as a
-sentinel for a noise-only sample; this generator represents the edge case
-explicitly instead:
+Mixed samples uniformly draw from a discrete SNR set (extended 2026-08 with
+two lower, harsher values beyond DeepFilterNet's original
+`-5, 0, 5, 10, 20, 40 dB`):
+`-15, -10, -5, 0, 5, 10, 20, 40 dB`. DeepFilterNet3 puts `-100` in that list
+as a sentinel for a noise-only sample; this generator represents the edge
+case explicitly instead:
 
 ```ini
 [mixing]
-snr_values = -5, 0, 5, 10, 20, 40
+snr_values = -15, -10, -5, 0, 5, 10, 20, 40
 
 [noise]
 noise_only_p = 0.05
@@ -131,6 +133,84 @@ pairs deliberately skip input-only clipping so they stay exact identity
 examples. Keeping a small speech-only share teaches the model not to alter an
 already-clean input; use a genuinely clean speech corpus, since any noise in a
 speech source file is necessarily treated as desired target content.
+
+### Target-level normalization (`level_mode`)
+
+Without this, a sample's absolute level is purely inherited from whatever
+level the source speech/noise files happened to be recorded at — a real
+deployment sees far more level variation than that (near vs. far mic
+placement, different recording gain, etc.). DNS-style target-level
+normalization closes that gap:
+
+```ini
+[mixing]
+level_mode = dns_target_level
+target_level_min_db = -40
+target_level_max_db = -10
+```
+
+Per sample, a `requested_level_dbfs` is drawn uniformly from
+`[target_level_min_db, target_level_max_db]`, and ONE scale factor — derived
+from the noisy mixture's whole-signal RMS — is applied identically to both
+`noisy` and `target`, so the requested SNR (and, for `speech_only`, the exact
+`noisy == target` identity) survives untouched. This runs **after** the
+lower-rate-source-simulation step (`p_resample`), not before: measuring
+against whatever that step's resample left behind means the level a
+downstream consumer actually reads matches what was requested — it doesn't
+drift across a resample the way measuring first would. `level_mode` is
+validated at construction time (`'dns_target_level'` is the only implemented
+value today; anything else raises rather than silently no-op'ing on a typo).
+
+Per-sample `requested_level_dbfs` / `effective_level_dbfs` (the latter
+measured last, after the final peak guard) are available via the
+`return_metadata` API below — `effective_level_dbfs` can differ slightly from
+`requested_level_dbfs` when the peak guard or mixture clipping distortion
+also touched the signal after the level scale was applied.
+
+### Clipping distortion: two independent knobs
+
+The single `p_clipping` knob was split into a pre-mix and a post-mix
+probability, aligned with how DeepFilterNet3 actually behaves (not just its
+config surface — see the comment in `config.example.ini`):
+
+```ini
+[augmentation]
+p_noise_clipping = 0.10     ; pre-mix, on the noise chain itself
+p_mixture_clipping = 0.0    ; post-mix, post-level-normalization (old p_clipping)
+clip_snr_min = 0
+clip_snr_max = 20
+```
+
+`p_noise_clipping` distorts the noise signal before it is scaled into any
+mixture — including `noise_only` samples, where `noisy` *is* that noise.
+`p_mixture_clipping` is the old `p_clipping`'s exact behavior/semantics
+(post-mix, `target` unaffected), just renamed for symmetry. Both are skipped
+for `speech_only` pairs, which stay exact identity pairs. This project has no
+train/val split concept at generation time (splitting happens downstream, in
+each model's own `train.py`), so unlike DFN3's train-only clipping, both
+knobs apply unconditionally to every generated sample.
+
+### Per-sample metadata (`return_metadata`)
+
+`DNS4Dataset(cfg, return_raw=True, return_metadata=True)` changes
+`__getitem__`'s return from `(noisy, target)` to `(noisy, target, metadata)`,
+where `metadata` is a plain per-call dict — not a shared/stateful
+side-channel, so it is safe to read under multi-worker `DataLoader` use.
+Fields cover mix mode, source file provenance (speech/noise/RIR paths),
+which augmentations fired this sample (biquad, resample simulation, both
+clipping knobs) and their sampled parameters, and the level-normalization
+pair (`requested_level_dbfs` / `effective_level_dbfs`). `return_metadata=True`
+requires `return_raw=True` (raises otherwise) — it has no meaning against the
+STFT feature/gain-target return shape.
+
+`gen_dataset.py` uses this to write `metadata.jsonl` alongside `pairs/` (one
+JSON line per sample, `{"index": N, ...}` matching `NNNNNN.wav`), appended
+incrementally so it survives `--resume` the same way `pairs/` does. Note the
+"honest finding" above about `self.sr` being the sole place the working rate
+is pinned: metadata is recorded at **this** generation rate, before any
+later `pack_dataset.py --target-sr` resample — `effective_level_dbfs` for a
+48 kHz-generated, 16 kHz-packed sample describes the 48 kHz WAV pair, not
+what a 16 kHz consumer ultimately trains on.
 
 ### Where the working rate actually comes from (honest finding)
 
@@ -178,7 +258,7 @@ augmentation logic itself).
 | File | Role |
 |---|---|
 | `gen_dataset.py` | CLI entry point — offline pre-generation of `(noisy, clean)` WAV pairs |
-| `dataset.py` | `DNS4Dataset` — the augmentation engine (biquad filters, RIR/RT60, SNR mixing, bandwidth limiting, clipping) |
+| `dataset.py` | `DNS4Dataset` — the augmentation engine (biquad filters, RIR/RT60, SNR mixing, bandwidth limiting, DNS-style target-level normalization, split pre/post-mix clipping, opt-in per-sample metadata) |
 | `pack_dataset.py` | Packs a WAV-pair directory into a single `.pt` tensor file, optionally resampling (`--target-sr`) while packing (removes per-file I/O overhead for small/medium datasets) |
 | `packed_dataset.py` | Shared mmap-capable loader for packed `(N, 2, T)` tensors |
 | `resample_dataset.py` | Optional standalone resample of an existing dataset to a WAV copy (listening/QC; `pack_dataset.py --target-sr` covers the training path) |
@@ -211,10 +291,13 @@ Each command creates:
 ```
 data_16k/ or data_48k/
   meta.json
+  metadata.jsonl
   pairs/000000.wav, 000001.wav, ...
 ```
 
-Each WAV is 2-channel: ch0=noisy, ch1=clean.
+Each WAV is 2-channel: ch0=noisy, ch1=clean. `metadata.jsonl` has one JSON
+line per sample (`{"index": N, ...}`, matching `NNNNNN.wav`) — see "Per-sample
+metadata" above for what it contains.
 
 Running only the 48 kHz command above and getting the 16 kHz copy from
 `pack_dataset.py --target-sr` (step 2) is the recommended path — run the

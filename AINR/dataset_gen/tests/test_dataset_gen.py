@@ -1,6 +1,7 @@
 """Regression tests for dataset generation planning and RIR alignment."""
 
 import configparser
+import math
 import random
 import unittest
 from pathlib import Path
@@ -23,6 +24,76 @@ from dataset_gen.dataset import (
 )
 from dataset_gen.gen_dataset import hours_to_sample_count, seed_worker
 from dataset_gen.resample_dataset import resampled_num_frames
+
+
+def _load_example_config() -> configparser.ConfigParser:
+    cfg = configparser.ConfigParser()
+    cfg.read(Path(__file__).parents[1] / "config.example.ini")
+    return cfg
+
+
+def _build_dataset(cfg):
+    """Construct a real DNS4Dataset from a config, without touching disk."""
+    with (
+        patch(
+            "dataset_gen.dataset.glob.glob",
+            side_effect=(["speech.wav"], ["noise.wav"]),
+        ),
+        patch("dataset_gen.dataset.os.path.isdir", return_value=False),
+    ):
+        return DNS4Dataset(cfg, return_raw=True)
+
+
+def _stub_dataset(**overrides):
+    """Build a DNS4Dataset with every _getitem_impl-required attribute set
+    to a deterministic default, bypassing __init__ (no file I/O). Tests
+    override only the fields they care about via kwargs.
+    """
+    dataset = DNS4Dataset.__new__(DNS4Dataset)
+    dataset._indices = [0]
+    dataset.speech_files = ["speech.wav"]
+    dataset.segment_samples = 1600
+    dataset.sr = 16000
+    dataset.noise_only_p = 0.0
+    dataset.speech_only_p = 0.0
+    dataset.p_biquad = 0.0
+    dataset.n_biquad_filters = 3
+    dataset.biquad_gain_db = 15.0
+    dataset.biquad_q_min = 0.5
+    dataset.biquad_q_max = 1.5
+    dataset.rir_files = []
+    dataset.p_rir = 0.0
+    dataset.rt60_min = 0.2
+    dataset.rt60_max = 1.0
+    dataset.early_rir_ms = 20.0
+    dataset.pre_delay_keep_ms = 1.0
+    dataset.drr = 0.3
+    dataset.max_noise_mix = 1
+    dataset.noise_files = ["noise.wav"]
+    dataset.snr_values = [0.0]
+    dataset.p_resample = 0.0
+    dataset.source_sr_values = [8000]
+    dataset.p_noise_clipping = 0.0
+    dataset.p_mixture_clipping = 0.0
+    dataset.clip_snr_min = 0.0
+    dataset.clip_snr_max = 20.0
+    dataset.level_mode = 'dns_target_level'
+    dataset.target_level_min_db = -40.0
+    dataset.target_level_max_db = -10.0
+    dataset.return_raw = True
+    dataset.return_metadata = False
+    dataset._load_and_crop = lambda _path, length: torch.linspace(
+        -0.2, 0.2, length
+    )
+    dataset._load_noise = lambda length: (
+        torch.linspace(-0.05, 0.05, length), "noise.wav"
+    )
+    dataset._load_rir = lambda: (
+        torch.tensor([1.0, 0.5, 0.2] + [0.0] * 20), 0.4, "rir.wav"
+    )
+    for key, value in overrides.items():
+        setattr(dataset, key, value)
+    return dataset
 
 
 class DatasetConfigScopeTest(unittest.TestCase):
@@ -172,23 +243,18 @@ class MixingPolicyTest(unittest.TestCase):
                 validate_mix_probabilities(noise_p, speech_p)
 
     def test_speech_only_pair_stays_identity_through_resampling(self):
-        dataset = DNS4Dataset.__new__(DNS4Dataset)
-        dataset._indices = [0]
-        dataset.speech_files = ["speech.wav"]
-        dataset.segment_samples = 1600
-        dataset.sr = 16000
-        dataset.noise_only_p = 0.05
-        dataset.speech_only_p = 0.05
-        dataset.p_biquad = 0.0
-        dataset.rir_files = []
-        dataset.p_resample = 1.0
-        dataset.source_sr_values = [8000]
-        dataset.p_clipping = 1.0
-        dataset.clip_snr_min = 0.0
-        dataset.clip_snr_max = 20.0
-        dataset.return_raw = True
-        dataset._load_and_crop = lambda _path, length: torch.linspace(
-            -0.2, 0.2, length
+        # p_resample=1.0 and p_mixture_clipping=1.0 (would-be certain) both
+        # exercise the "does speech_only actually skip this" question, not
+        # just "is the probability wired up" -- level normalization
+        # (dns_target_level, always on in _stub_dataset's defaults) is
+        # exercised too: it must scale noisy/target by the identical factor
+        # or this identity breaks.
+        dataset = _stub_dataset(
+            noise_only_p=0.05,
+            speech_only_p=0.05,
+            p_resample=1.0,
+            source_sr_values=[8000],
+            p_mixture_clipping=1.0,
         )
 
         with (
@@ -269,6 +335,216 @@ class ResampleMetadataTest(unittest.TestCase):
     def test_output_length_matches_ceil_contract(self):
         self.assertEqual(resampled_num_frames(4800, 48000, 16000), 1600)
         self.assertEqual(resampled_num_frames(4801, 48000, 24000), 2401)
+
+
+class LevelNormalizationConfigTest(unittest.TestCase):
+    def test_invalid_level_mode_is_rejected(self):
+        cfg = _load_example_config()
+        cfg.set('mixing', 'level_mode', 'bogus_mode')
+        with self.assertRaises(ValueError):
+            _build_dataset(cfg)
+
+    def test_inverted_level_range_is_rejected(self):
+        cfg = _load_example_config()
+        cfg.set('mixing', 'target_level_min_db', '-10')
+        cfg.set('mixing', 'target_level_max_db', '-40')
+        with self.assertRaises(ValueError):
+            _build_dataset(cfg)
+
+    def test_non_finite_level_bounds_are_rejected(self):
+        for value in ('nan', 'inf'):
+            with self.subTest(value=value):
+                cfg = _load_example_config()
+                cfg.set('mixing', 'target_level_max_db', value)
+                with self.assertRaises(ValueError):
+                    _build_dataset(cfg)
+
+    def test_defaults_apply_when_mixing_level_keys_are_omitted(self):
+        cfg = _load_example_config()
+        cfg.remove_option('mixing', 'level_mode')
+        cfg.remove_option('mixing', 'target_level_min_db')
+        cfg.remove_option('mixing', 'target_level_max_db')
+        dataset = _build_dataset(cfg)
+        self.assertEqual(dataset.level_mode, 'dns_target_level')
+        self.assertEqual(dataset.target_level_min_db, -40.0)
+        self.assertEqual(dataset.target_level_max_db, -10.0)
+
+
+class ClippingConfigTest(unittest.TestCase):
+    def test_example_config_splits_noise_and_mixture_clipping(self):
+        dataset = _build_dataset(_load_example_config())
+        self.assertAlmostEqual(dataset.p_noise_clipping, 0.10)
+        self.assertEqual(dataset.p_mixture_clipping, 0.0)
+
+    def test_out_of_range_clipping_probabilities_are_rejected(self):
+        for key, value in (
+            ('p_noise_clipping', '1.5'),
+            ('p_mixture_clipping', '-0.1'),
+        ):
+            with self.subTest(key=key):
+                cfg = _load_example_config()
+                cfg.set('augmentation', key, value)
+                with self.assertRaises(ValueError):
+                    _build_dataset(cfg)
+
+
+class LevelNormalizationBehaviorTest(unittest.TestCase):
+    def test_level_normalization_targets_requested_dbfs(self):
+        # min == max pins the uniform draw to an exact value without
+        # needing to mock random.uniform.
+        dataset = _stub_dataset(
+            return_metadata=True,
+            target_level_min_db=-20.0, target_level_max_db=-20.0,
+        )
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"):
+            noisy, target, metadata = dataset._getitem_impl(0)
+        self.assertAlmostEqual(metadata['requested_level_dbfs'], -20.0)
+        achieved = 20.0 * math.log10(noisy.pow(2).mean().sqrt().item())
+        self.assertAlmostEqual(achieved, -20.0, places=3)
+        self.assertAlmostEqual(metadata['effective_level_dbfs'], achieved, places=3)
+
+    def test_level_normalization_measures_after_resample_simulation(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            p_resample=1.0, source_sr_values=[8000],
+            target_level_min_db=-20.0, target_level_max_db=-20.0,
+        )
+        with (
+            patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"),
+            patch(
+                "dataset_gen.dataset.simulate_upsampled_source",
+                side_effect=lambda audio, algorithm_sr, source_sr: audio * 0.1,
+            ),
+        ):
+            noisy, _target, _metadata = dataset._getitem_impl(0)
+        # If the level were measured/applied BEFORE this (mocked) resample-
+        # simulation step, the trailing *0.1 would knock the result ~20 dB
+        # below the requested target instead of landing on it -- proving
+        # the RMS measurement runs on the POST-resample-simulation signal.
+        achieved = 20.0 * math.log10(noisy.pow(2).mean().sqrt().item())
+        self.assertAlmostEqual(achieved, -20.0, places=3)
+
+    def test_level_normalization_preserves_target_to_noisy_ratio(self):
+        def run_at(level_db):
+            dataset = _stub_dataset(
+                target_level_min_db=level_db, target_level_max_db=level_db,
+            )
+            with patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"):
+                noisy, target = dataset._getitem_impl(0)
+            return noisy, target
+
+        noisy_a, target_a = run_at(-30.0)
+        noisy_b, target_b = run_at(-15.0)
+        ratio_a = target_a.pow(2).mean().sqrt() / noisy_a.pow(2).mean().sqrt()
+        ratio_b = target_b.pow(2).mean().sqrt() / noisy_b.pow(2).mean().sqrt()
+        self.assertAlmostEqual(ratio_a.item(), ratio_b.item(), places=5)
+
+    def test_noise_only_target_stays_exactly_zero(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            target_level_min_db=-25.0, target_level_max_db=-25.0,
+        )
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="noise_only"):
+            _noisy, target, metadata = dataset._getitem_impl(0)
+        self.assertTrue(torch.equal(target, torch.zeros_like(target)))
+        self.assertEqual(metadata['mix_mode'], 'noise_only')
+        self.assertIsNone(metadata['snr_db'])
+
+
+class ClippingBehaviorTest(unittest.TestCase):
+    def test_noise_clipping_is_independent_of_mixture_clipping(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            p_noise_clipping=1.0, p_mixture_clipping=0.0,
+        )
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"):
+            _noisy, _target, metadata = dataset._getitem_impl(0)
+        self.assertTrue(metadata['noise_clipping_applied'])
+        self.assertIsNotNone(metadata['noise_clip_snr_db'])
+        self.assertFalse(metadata['mixture_clipping_applied'])
+        self.assertIsNone(metadata['mixture_clip_snr_db'])
+
+    def test_mixture_clipping_is_independent_of_noise_clipping(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            p_noise_clipping=0.0, p_mixture_clipping=1.0,
+        )
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"):
+            _noisy, _target, metadata = dataset._getitem_impl(0)
+        self.assertFalse(metadata['noise_clipping_applied'])
+        self.assertTrue(metadata['mixture_clipping_applied'])
+        self.assertIsNotNone(metadata['mixture_clip_snr_db'])
+
+    def test_noise_clipping_applies_to_noise_only_mode(self):
+        dataset = _stub_dataset(return_metadata=True, p_noise_clipping=1.0)
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="noise_only"):
+            _noisy, _target, metadata = dataset._getitem_impl(0)
+        self.assertTrue(metadata['noise_clipping_applied'])
+
+    def test_both_clipping_knobs_skip_speech_only(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            p_noise_clipping=1.0, p_mixture_clipping=1.0,
+        )
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="speech_only"):
+            noisy, target, metadata = dataset._getitem_impl(0)
+        self.assertFalse(metadata['noise_clipping_applied'])
+        self.assertFalse(metadata['mixture_clipping_applied'])
+        self.assertTrue(torch.equal(noisy, target))
+
+
+class MetadataApiTest(unittest.TestCase):
+    def test_return_metadata_requires_return_raw(self):
+        cfg = _load_example_config()
+        with (
+            patch(
+                "dataset_gen.dataset.glob.glob",
+                side_effect=(["speech.wav"], ["noise.wav"]),
+            ),
+            patch("dataset_gen.dataset.os.path.isdir", return_value=False),
+            self.assertRaises(ValueError),
+        ):
+            DNS4Dataset(cfg, return_raw=False, return_metadata=True)
+
+    def test_getitem_shape_toggles_on_return_metadata(self):
+        dataset = _stub_dataset(return_metadata=False)
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"):
+            two_tuple = dataset._getitem_impl(0)
+        self.assertEqual(len(two_tuple), 2)
+
+        dataset2 = _stub_dataset(return_metadata=True)
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"):
+            three_tuple = dataset2._getitem_impl(0)
+        self.assertEqual(len(three_tuple), 3)
+        _noisy, _target, metadata = three_tuple
+        self.assertIsInstance(metadata, dict)
+        for field in (
+            'mix_mode', 'speech_file', 'snr_db',
+            'requested_level_dbfs', 'effective_level_dbfs',
+        ):
+            self.assertIn(field, metadata)
+
+    def test_metadata_records_provenance_and_augmentation_decisions(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            rir_files=["rir.wav"], p_rir=1.0,
+            p_resample=1.0, source_sr_values=[8000],
+            max_noise_mix=2,
+        )
+        with (
+            patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"),
+            patch("dataset_gen.dataset.random.randint", return_value=2),
+        ):
+            _noisy, _target, metadata = dataset._getitem_impl(0)
+        self.assertEqual(metadata['speech_file'], "speech.wav")
+        self.assertTrue(metadata['rir_applied'])
+        self.assertEqual(metadata['rir_file'], "rir.wav")
+        self.assertEqual(metadata['rt60'], 0.4)
+        self.assertEqual(metadata['n_noises_mixed'], 2)
+        self.assertEqual(metadata['noise_files'], ["noise.wav", "noise.wav"])
+        self.assertTrue(metadata['resample_simulated'])
+        self.assertEqual(metadata['source_sr'], 8000)
+        self.assertEqual(metadata['snr_db'], 0.0)
 
 
 if __name__ == '__main__':

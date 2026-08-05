@@ -447,6 +447,26 @@ def active_rms(audio: torch.Tensor, sr: int,
 
 
 # ============================================================
+# dBFS Level Helpers (ref: DNS Challenge noisyspeech_synthesizer's
+# target-level normalization)
+# ============================================================
+
+def rms_dbfs(audio: torch.Tensor) -> float:
+    """Whole-signal literal RMS level in dBFS. 0 dBFS is defined as RMS ==
+    1.0 (i.e. a full-scale DC/square wave), NOT the sine-wave convention
+    where a 0 dBFS sine (peak amplitude 1.0) has RMS ~= 0.707 (-3.01 dBFS).
+    This matches this module's other level math, e.g. active_rms's raw RMS
+    return, not an AES17-style sine-referenced dBFS."""
+    rms = audio.pow(2).mean().sqrt().item()
+    return 20.0 * math.log10(max(rms, 1e-10))
+
+
+def dbfs_to_rms(dbfs: float) -> float:
+    """Inverse of rms_dbfs: target linear RMS for a given dBFS level."""
+    return 10.0 ** (dbfs / 20.0)
+
+
+# ============================================================
 # Upsampled Lower-Rate Source Simulation
 # ============================================================
 
@@ -475,11 +495,13 @@ def simulate_upsampled_source(audio: torch.Tensor, algorithm_sr: int,
 
 def apply_clipping(audio: torch.Tensor,
                    clip_snr_min: float = 0.0,
-                   clip_snr_max: float = 20.0) -> torch.Tensor:
+                   clip_snr_max: float = 20.0) -> Tuple[torch.Tensor, float]:
     """
     Clipping distortion — 隨機放大使之 clip
     clip_snr: 10*log10(power_original / power_clipping_noise)
     較低的 clip_snr → 更嚴重的 clipping
+
+    回傳 (clipped_audio, clip_snr) — clip_snr 是實際抽到的值，供呼叫端記錄 metadata。
     """
     clip_snr = random.uniform(clip_snr_min, clip_snr_max)
     # 目標 clipping level: 越低越嚴重
@@ -494,7 +516,7 @@ def apply_clipping(audio: torch.Tensor,
     # normalize back to original RMS
     rms_after = audio_clipped.pow(2).mean().sqrt() + 1e-10
     audio_clipped = audio_clipped * (rms / rms_after)
-    return audio_clipped
+    return audio_clipped, clip_snr
 
 
 # ============================================================
@@ -525,17 +547,33 @@ class DNS4Dataset(Dataset):
     1. Select mixed / noise-only / speech-only sample mode
     2. Load and augment speech when required
     3. RIR convolution (early for target, full for noisy)
-    4. Load and augment noise when required
+    4. Load and augment noise when required (pre-mix clipping distortion,
+       p_noise_clipping, applied here — DFN3-style, on the noise chain
+       before it is scaled into any mixture)
     5. Discrete-SNR mixing for mixed samples
     6. Optional lower-rate source simulation (noisy + target)
-    7. Clipping distortion (mixed/noise-only input only)
-    8. Clipping prevention
-    9. STFT → features + target gains  (return_raw=False)
-       OR return (noisy, clean) raw audio tensors (return_raw=True)
+    7. DNS-style target-level normalization (noisy + target scaled together
+       by one factor so a sampled requested_level_dbfs is hit on the
+       post-resample-simulation mixture — see level_mode below; run AFTER
+       step 6, not before, so the level a downstream consumer actually
+       measures matches what was requested instead of drifting through the
+       lower-rate-source simulation)
+    8. Mixture clipping distortion (mixed/noise-only input only,
+       p_mixture_clipping — post-mix, post-level-normalization; independent
+       knob from step 4's pre-mix p_noise_clipping)
+    9. Clipping prevention (final peak guard)
+    10. STFT → features + target gains  (return_raw=False)
+        OR return (noisy, clean) raw audio tensors (return_raw=True),
+        optionally with a third per-sample metadata dict
+        (return_raw=True and return_metadata=True)
     """
 
-    def __init__(self, cfg: configparser.ConfigParser, return_raw: bool = False):
+    def __init__(self, cfg: configparser.ConfigParser, return_raw: bool = False,
+                 return_metadata: bool = False):
         self.return_raw = return_raw
+        self.return_metadata = return_metadata
+        if self.return_metadata and not self.return_raw:
+            raise ValueError("return_metadata=True requires return_raw=True")
 
         # signal params
         self.sr = cfg.getint('signal', 'sr')
@@ -559,6 +597,36 @@ class DNS4Dataset(Dataset):
 
         # mixing
         self.snr_values = parse_snr_values(cfg.get('mixing', 'snr_values'))
+
+        # DNS-style target-level normalization. 'dns_target_level' is the
+        # only mode implemented today; the explicit fallback/validation
+        # (rather than silently no-op'ing on typos) leaves room for a
+        # future off-switch/alternate mode without breaking every existing
+        # config.ini that omits this key.
+        self.level_mode = cfg.get(
+            'mixing', 'level_mode', fallback='dns_target_level'
+        )
+        if self.level_mode != 'dns_target_level':
+            raise ValueError(
+                "[mixing] level_mode must be 'dns_target_level', got "
+                f"{self.level_mode!r}"
+            )
+        self.target_level_min_db = cfg.getfloat(
+            'mixing', 'target_level_min_db', fallback=-40.0
+        )
+        self.target_level_max_db = cfg.getfloat(
+            'mixing', 'target_level_max_db', fallback=-10.0
+        )
+        if not (math.isfinite(self.target_level_min_db)
+                and math.isfinite(self.target_level_max_db)):
+            raise ValueError(
+                "[mixing] target_level_min_db/target_level_max_db must be finite"
+            )
+        if self.target_level_min_db > self.target_level_max_db:
+            raise ValueError(
+                "[mixing] target_level_min_db must be <= target_level_max_db, "
+                f"got {self.target_level_min_db} > {self.target_level_max_db}"
+            )
 
         # rir
         self.p_rir = cfg.getfloat('rir', 'p_rir')
@@ -599,7 +667,21 @@ class DNS4Dataset(Dataset):
                 "[augmentation] p_resample is enabled, but source_sr_values "
                 f"contains no rate below algorithm sr={self.sr}"
             )
-        self.p_clipping = cfg.getfloat('augmentation', 'p_clipping')
+        # Split from the old single p_clipping (applied post-mix only):
+        # p_noise_clipping is pre-mix, on the noise chain, aligning with
+        # DFN3's actual (config-invisible) RandClipping::default_with_prob(
+        # 0.1) hung on its noise chain (see config.example.ini's comment
+        # for the trace this alignment gap was found under). p_mixture_
+        # clipping keeps the old post-mix p_clipping's exact semantics and
+        # config key meaning, just renamed for symmetry with the new knob.
+        self.p_noise_clipping = cfg.getfloat('augmentation', 'p_noise_clipping')
+        self.p_mixture_clipping = cfg.getfloat('augmentation', 'p_mixture_clipping')
+        for name, value in (
+            ('p_noise_clipping', self.p_noise_clipping),
+            ('p_mixture_clipping', self.p_mixture_clipping),
+        ):
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"[augmentation] {name} must be in [0, 1], got {value}")
         self.clip_snr_min = cfg.getfloat('augmentation', 'clip_snr_min')
         self.clip_snr_max = cfg.getfloat('augmentation', 'clip_snr_max')
 
@@ -766,8 +848,8 @@ class DNS4Dataset(Dataset):
             audio = F.pad(audio, (0, target_len - len(audio)))
         return audio
 
-    def _load_noise(self, target_len: int) -> torch.Tensor:
-        """載入噪音 → resample → loop 到足夠長"""
+    def _load_noise(self, target_len: int) -> Tuple[torch.Tensor, str]:
+        """載入噪音 → resample → loop 到足夠長。回傳 (audio, path) — path 供呼叫端記錄 metadata。"""
         path = random.choice(self.noise_files)
         audio, orig_sr = torchaudio.load(path)
         audio = audio[0]
@@ -777,10 +859,11 @@ class DNS4Dataset(Dataset):
             repeats = (target_len // len(audio)) + 1
             audio = audio.repeat(repeats)
         start = random.randint(0, len(audio) - target_len)
-        return audio[start:start + target_len]
+        return audio[start:start + target_len], path
 
-    def _load_rir(self) -> Tuple[torch.Tensor, float]:
-        """載入隨機 RIR → resample. 同時回傳 cached RT60 (給 prepare_rir 算指數衰減 tau)"""
+    def _load_rir(self) -> Tuple[torch.Tensor, float, str]:
+        """載入隨機 RIR → resample. 回傳 (audio, cached RT60, path) —
+        RT60 給 prepare_rir 算指數衰減 tau, path 供呼叫端記錄 metadata。"""
         path = random.choice(self.rir_files)
         audio, orig_sr = torchaudio.load(path)
         audio = audio[0]
@@ -788,7 +871,7 @@ class DNS4Dataset(Dataset):
             audio = torchaudio.functional.resample(audio, orig_sr, self.sr)
         # Full and target RIR energy normalization happens in prepare_rir().
         rt60 = self.rt60_map.get(path, 0.5)  # fallback if cache miss
-        return audio, rt60
+        return audio, rt60, path
 
     # --------------------------------------------------------
     # Feature extraction
@@ -855,8 +938,35 @@ class DNS4Dataset(Dataset):
         noise_only = mix_mode == "noise_only"
         speech_only = mix_mode == "speech_only"
 
+        # Per-sample provenance/decision trail, populated as the pipeline
+        # runs below. Building this is unconditional (every field is cheap
+        # bookkeeping around a decision the pipeline already makes for
+        # itself) -- only *returning* it is opt-in, gated on return_metadata
+        # at the very end, alongside return_raw.
+        metadata = {
+            'mix_mode': mix_mode,
+            'speech_file': None,
+            'biquad_applied_speech': False,
+            'rir_applied': False,
+            'rt60': None,
+            'rir_file': None,
+            'n_noises_mixed': 0,
+            'noise_files': [],
+            'biquad_applied_noise': False,
+            'noise_clipping_applied': False,
+            'noise_clip_snr_db': None,
+            'snr_db': None,
+            'resample_simulated': False,
+            'source_sr': None,
+            'mixture_clipping_applied': False,
+            'mixture_clip_snr_db': None,
+            'requested_level_dbfs': None,
+            'effective_level_dbfs': None,
+        }
+
         if not noise_only:
             # 2. Load clean speech
+            metadata['speech_file'] = self.speech_files[real_idx]
             speech = self._load_and_crop(self.speech_files[real_idx], target_len)
 
             # Speech augmentation: RandBiquadFilter (混合前)
@@ -867,10 +977,11 @@ class DNS4Dataset(Dataset):
                     gain_db=self.biquad_gain_db,
                     q_min=self.biquad_q_min,
                     q_max=self.biquad_q_max)
+                metadata['biquad_applied_speech'] = True
 
             # 3. RIR convolution (DFN3-style: target = drr·dry + (1-drr)·early_reverb)
             if self.rir_files and random.random() < self.p_rir:
-                rir, rt60 = self._load_rir()
+                rir, rt60, rir_path = self._load_rir()
                 target_rir, full_rir = prepare_rir(
                     rir, self.sr,
                     late_offset_ms=self.early_rir_ms,
@@ -884,6 +995,9 @@ class DNS4Dataset(Dataset):
                     self.drr * aligned_dry
                     + (1.0 - self.drr) * early_reverb
                 )
+                metadata['rir_applied'] = True
+                metadata['rt60'] = rt60
+                metadata['rir_file'] = rir_path
             else:
                 target = speech.clone()
                 reverbed = speech.clone()
@@ -892,8 +1006,13 @@ class DNS4Dataset(Dataset):
         if not speech_only:
             n_noises = random.randint(1, self.max_noise_mix)
             noise = torch.zeros(target_len)
+            noise_paths = []
             for _ in range(n_noises):
-                noise = noise + self._load_noise(target_len)
+                one_noise, noise_path = self._load_noise(target_len)
+                noise = noise + one_noise
+                noise_paths.append(noise_path)
+            metadata['n_noises_mixed'] = n_noises
+            metadata['noise_files'] = noise_paths
 
             if random.random() < self.p_biquad:
                 noise = rand_biquad_filter(
@@ -902,6 +1021,21 @@ class DNS4Dataset(Dataset):
                     gain_db=self.biquad_gain_db,
                     q_min=self.biquad_q_min,
                     q_max=self.biquad_q_max)
+                metadata['biquad_applied_noise'] = True
+
+            # DFN3-aligned pre-mix clipping distortion on the noise chain
+            # itself, before it is scaled into any mixture (noise_only's
+            # noisy IS this noise; mixed's noisy is this noise scaled by
+            # the sampled SNR and added to reverbed speech). Independent
+            # from step 8's post-mix p_mixture_clipping below -- see
+            # config.example.ini's [augmentation] comment for why these are
+            # two separate knobs, not one.
+            if random.random() < self.p_noise_clipping:
+                noise, noise_clip_snr = apply_clipping(
+                    noise, self.clip_snr_min, self.clip_snr_max
+                )
+                metadata['noise_clipping_applied'] = True
+                metadata['noise_clip_snr_db'] = noise_clip_snr
 
         if noise_only:
             # Noise-only: learn pure noise -> silence.
@@ -914,6 +1048,7 @@ class DNS4Dataset(Dataset):
         else:
             # 5. DeepFilterNet-style discrete-SNR mixing.
             snr_db = sample_snr(self.snr_values)
+            metadata['snr_db'] = snr_db
             # Match DeepFilterNet mix_audio_signal(): define the sampled SNR
             # against the clean target, while the mixture contains the more
             # reverberant speech.
@@ -929,18 +1064,54 @@ class DNS4Dataset(Dataset):
             source_sr = random.choice(self.source_sr_values)
             noisy = simulate_upsampled_source(noisy, self.sr, source_sr)
             target = simulate_upsampled_source(target, self.sr, source_sr)
+            metadata['resample_simulated'] = True
+            metadata['source_sr'] = source_sr
 
-        # 7. Clipping distortion (input only). Skip exact identity pairs.
-        if not speech_only and random.random() < self.p_clipping:
-            noisy = apply_clipping(noisy, self.clip_snr_min, self.clip_snr_max)
+        # 7. DNS-style target-level normalization (level_mode=dns_target_
+        # level). Sampled and applied AFTER step 6's resample simulation,
+        # not before: this measures mixture_rms against whatever the
+        # pipeline's last resample left behind, so requested_level_dbfs is
+        # what a consumer reading `noisy` right after this call actually
+        # gets -- not a level that then silently drifts through a later
+        # resample (see this module's level_mode config doc). One scalar
+        # scale, derived from the noisy mixture's RMS, applied identically
+        # to noisy and target so the requested SNR (step 5) is preserved;
+        # noise_only's exact-zero target and speech_only's identity pair
+        # (noisy is literally target.clone() two branches up) both stay
+        # exactly correct under a single uniform scale.
+        requested_level_dbfs = random.uniform(
+            self.target_level_min_db, self.target_level_max_db
+        )
+        metadata['requested_level_dbfs'] = requested_level_dbfs
+        mixture_rms = noisy.pow(2).mean().sqrt().item() + 1e-10
+        level_scale = dbfs_to_rms(requested_level_dbfs) / mixture_rms
+        noisy = noisy * level_scale
+        target = target * level_scale
 
-        # 8. Clipping prevention
+        # 8. Mixture clipping distortion (input only, post-mix,
+        # post-level-normalization). Skip exact identity pairs. Independent
+        # from step 4's pre-mix p_noise_clipping.
+        if not speech_only and random.random() < self.p_mixture_clipping:
+            noisy, mixture_clip_snr = apply_clipping(
+                noisy, self.clip_snr_min, self.clip_snr_max
+            )
+            metadata['mixture_clipping_applied'] = True
+            metadata['mixture_clip_snr_db'] = mixture_clip_snr
+
+        # 9. Clipping prevention (final peak guard)
         target, noisy = prevent_clipping(target, noisy)
+        # Measured last, after every other step that can touch `noisy`'s
+        # level (including the peak guard just above) -- the "effective"
+        # counterpart to requested_level_dbfs, i.e. what was actually
+        # delivered, not just what was asked for.
+        metadata['effective_level_dbfs'] = rms_dbfs(noisy)
 
         if self.return_raw:
+            if self.return_metadata:
+                return noisy, target, metadata
             return noisy, target
 
-        # 9. STFT → features + target gains
+        # 10. STFT → features + target gains
         clean_spec = self._stft(target)
         noisy_spec = self._stft(noisy)
 

@@ -69,6 +69,23 @@ def seed_worker(_worker_id):
     np.random.seed(worker_seed % (2 ** 32))
 
 
+def _collate_pair_with_metadata(batch):
+    """collate_fn for DNS4Dataset(return_raw=True, return_metadata=True).
+
+    batch_size=1 always in this script's DataLoader use -- keep metadata as
+    a plain per-sample dict list instead of running it through
+    default_collate, which raises on the None-valued fields (rir_file,
+    snr_db, ... are None whenever that pipeline step didn't fire for a
+    given sample). Must be a module-level function, not a closure: spawn-
+    based multiprocessing (the default on macOS) pickles collate_fn to
+    hand to worker processes, and a local closure isn't picklable.
+    """
+    noisy = data.default_collate([item[0] for item in batch])
+    clean = data.default_collate([item[1] for item in batch])
+    metadata = [item[2] for item in batch]
+    return noisy, clean, metadata
+
+
 def gen_dataset(args):
     cfg = configparser.ConfigParser()
     cfg.read(args.config)
@@ -122,7 +139,7 @@ def gen_dataset(args):
     else:
         print(f"Random seed ({seed_source}): {effective_seed}")
 
-    dataset = DNS4Dataset(cfg, return_raw=True)
+    dataset = DNS4Dataset(cfg, return_raw=True, return_metadata=True)
     SR = dataset.sr
     pass_size = len(dataset)
     if pass_size <= 0:
@@ -137,7 +154,7 @@ def gen_dataset(args):
     # Profile 1 sample
     print("Profiling 1 sample...")
     t0 = time.time()
-    _s, _t = dataset[0]
+    _s, _t, _m = dataset[0]
     t_sample = time.time() - t0
     # 2 channels × 2 bytes/sample (16-bit WAV).
     disk_bytes = dataset.segment_samples * 2 * 2 * n_total
@@ -218,6 +235,11 @@ def gen_dataset(args):
             'speech_only_p': dataset.speech_only_p,
             'p_resample': dataset.p_resample,
             'source_sr_values': dataset.source_sr_values,
+            'level_mode': dataset.level_mode,
+            'target_level_min_db': dataset.target_level_min_db,
+            'target_level_max_db': dataset.target_level_max_db,
+            'p_noise_clipping': dataset.p_noise_clipping,
+            'p_mixture_clipping': dataset.p_mixture_clipping,
             'config': args.config,
         }
         with open(meta_path, 'w') as f:
@@ -232,6 +254,15 @@ def gen_dataset(args):
             SR,
             bits_per_sample=16,
         )
+
+    # One JSON line per generated sample (index matches its pairs/NNNNNN.wav
+    # filename), appended incrementally like pairs/ itself -- never rewritten
+    # wholesale, so this also survives --resume across separate invocations.
+    metadata_path = os.path.join(args.output, 'metadata.jsonl')
+
+    def _save_sample_metadata(metadata, index):
+        with open(metadata_path, 'a') as f:
+            f.write(json.dumps({'index': index, **metadata}) + '\n')
 
     gen_start = time.time()
 
@@ -257,18 +288,21 @@ def gen_dataset(args):
                 num_workers=n_workers, prefetch_factor=2,
                 worker_init_fn=seed_worker,
                 persistent_workers=False,
+                collate_fn=_collate_pair_with_metadata,
             )
-            for noisy, clean in tqdm.tqdm(loader, desc=f"Round {r+1}/{n_rounds}",
-                                          total=len(indices)):
+            for noisy, clean, metadata in tqdm.tqdm(
+                    loader, desc=f"Round {r+1}/{n_rounds}", total=len(indices)):
                 noisy = noisy.squeeze(0)   # (T,)
                 clean = clean.squeeze(0)
                 _save_pair(noisy, clean, sample_count)
+                _save_sample_metadata(metadata[0], sample_count)
                 sample_count += 1
         else:
             for i in tqdm.tqdm(range(idx_start, idx_stop),
                                desc=f"Round {r+1}/{n_rounds}"):
-                noisy, clean = dataset[i]
+                noisy, clean, metadata = dataset[i]
                 _save_pair(noisy, clean, sample_count)
+                _save_sample_metadata(metadata, sample_count)
                 sample_count += 1
 
         _save_meta(r + 1)
