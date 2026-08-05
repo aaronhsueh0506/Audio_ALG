@@ -29,19 +29,49 @@ The optional `[gen] pass_size` limits how many shuffled speech files form one
 generation pass; it is not a training epoch. Omitting it or setting it to `0`
 uses all speech files.
 
-## Design: generate once at 48 kHz, resample at pack time for 16 kHz consumers
+## Design: generate natively per rate; downsample-at-pack-time is a convenience path, not the standard one
 
-Each `gen_dataset.py` invocation still generates exactly one dataset at the
+Each `gen_dataset.py` invocation generates exactly one dataset at the
 requested working rate (config.ini's `[signal] sr`, overridable with
-`--sample-rate`), but **48 kHz is the recommended single source**: generate
-once at 48 kHz for DeepFilterNet2/DeepFilterNet3, then have
-`pack_dataset.py` resample straight into the RNNoise-ERB/GTCRN packed tensor
-— no intermediate 16 kHz WAV directory:
+`--sample-rate`). **Native per-rate generation is the recommended standard
+flow**: run `gen_dataset.py --sample-rate 16000` for RNNoise-ERB/GTCRN and
+`gen_dataset.py --sample-rate 48000` for DeepFilterNet2/DeepFilterNet3, each
+producing its own WAV pairs measured and mixed at the rate it will actually
+train on:
 
 ```bash
+python3 gen_dataset.py --config config.ini --output data_16k --hours 25 \
+    --sample-rate 16000
 python3 gen_dataset.py --config config.ini --output data_48k --hours 25 \
     --sample-rate 48000
+```
 
+⚠ **`pack_dataset.py --target-sr` does NOT exactly preserve level/SNR** —
+do not treat a 48 kHz→16 kHz downsample-at-pack-time as a standard way to
+produce a second rate's training data when SNR/level fidelity matters. The
+level normalization (and the requested SNR mix) happens at generation time,
+against the SOURCE rate's spectrum; a later resample only re-shapes the
+already-mixed signal, it does not re-mix to the new rate's requested SNR.
+For narrowband content this can drift by tens of dB — an extreme but legal
+config (1 kHz speech mixed against 12 kHz noise at a requested ~0 dB SNR)
+measures ~48.6 dB after a 48 k→16 k downsample, because the noise energy
+above the new 8 kHz Nyquist is simply gone. Real corpus content typically
+drifts far less (most speech/noise energy sits well below either Nyquist),
+but "typically less" is not a contract `pack_dataset.py --target-sr` can
+promise — only re-mixing speech/noise stems natively at the target rate can
+guarantee the requested SNR exactly. `pack_dataset.py`'s packed payload now
+records `effective_rms_dbfs` (measured AFTER any `--target-sr` resample, per
+sample, per channel) precisely so a consumer can audit this drift on its own
+packed data rather than trusting generation-time metadata that describes a
+different rate.
+
+Downsampling at pack time remains a supported, useful SHORTCUT when you
+specifically do not need exact fidelity — e.g. a quick 16 kHz smoke-test
+packed file derived from an already-generated 48 kHz batch, or extending
+`source_sr_values` coverage cheaply (see below) — not the default path to
+a second rate's real training data:
+
+```bash
 python3 pack_dataset.py --input data_48k/pairs --output data_48k/packed.pt \
     --dtype float16
 python3 pack_dataset.py --input data_48k/pairs --output data_16k/packed.pt \
@@ -53,13 +83,11 @@ clip guard with `resample_dataset.py` (imported, not duplicated), so the two
 are numerically equivalent up to the 16-bit quantization `resample_dataset.py`
 adds by writing an intermediate WAV — `pack_dataset.py` skips that write
 entirely. Keep using `resample_dataset.py` when you actually want a listenable
-16 kHz WAV copy (spot-checks, external tools); for training-only consumption,
-`pack_dataset.py --target-sr` is the shorter path.
+16 kHz WAV copy (spot-checks, external tools).
 
-Generating independently per rate (a separate `--sample-rate 16000` run)
-remains supported, and is the only way to get the full, undiluted
-`source_sr_values` sweep for a 16 kHz consumer — see the accepted trade-off
-noted below.
+Generating independently per rate is also the only way to get the full,
+undiluted `source_sr_values` sweep for a 16 kHz consumer — see the accepted
+trade-off noted below.
 
 ### Upsampled lower-rate source simulation
 
@@ -185,10 +213,25 @@ clip_snr_max = 20
 mixture — including `noise_only` samples, where `noisy` *is* that noise.
 `p_mixture_clipping` is the old `p_clipping`'s exact behavior/semantics
 (post-mix, `target` unaffected), just renamed for symmetry. Both are skipped
-for `speech_only` pairs, which stay exact identity pairs. This project has no
-train/val split concept at generation time (splitting happens downstream, in
-each model's own `train.py`), so unlike DFN3's train-only clipping, both
-knobs apply unconditionally to every generated sample.
+for `speech_only` pairs, which stay exact identity pairs.
+
+By default this project has no train/val split concept at generation time
+(splitting happens downstream, in each model's own `train.py`), so unlike
+DFN3's train-only clipping, both knobs apply unconditionally to every
+generated sample — a deliberate distribution choice for a generator whose
+output IS the val set too, not an oversight. For a run whose entire output
+IS a held-out validation batch, set `[gen] generation_split = validation`
+to force-zero both clipping knobs for that run, matching DFN3 exactly:
+
+```ini
+[gen]
+generation_split = validation   ; omit (or 'train') for the unconditional default above
+```
+
+`generation_split` participates in the `--resume` config-hash check (see
+"Resuming" below) like every other `config.ini` key, so switching it and
+resuming into the same `--output` directory is refused rather than silently
+mixing a clipped and an unclipped batch together.
 
 ### Per-sample metadata (`return_metadata`)
 
@@ -203,14 +246,16 @@ pair (`requested_level_dbfs` / `effective_level_dbfs`). `return_metadata=True`
 requires `return_raw=True` (raises otherwise) — it has no meaning against the
 STFT feature/gain-target return shape.
 
-`gen_dataset.py` uses this to write `metadata.jsonl` alongside `pairs/` (one
-JSON line per sample, `{"index": N, ...}` matching `NNNNNN.wav`), appended
-incrementally so it survives `--resume` the same way `pairs/` does. Note the
-"honest finding" above about `self.sr` being the sole place the working rate
-is pinned: metadata is recorded at **this** generation rate, before any
-later `pack_dataset.py --target-sr` resample — `effective_level_dbfs` for a
-48 kHz-generated, 16 kHz-packed sample describes the 48 kHz WAV pair, not
-what a 16 kHz consumer ultimately trains on.
+`gen_dataset.py` uses this to write a `NNNNNN.json` sidecar next to each
+`NNNNNN.wav` in `pairs/` (`{"index": N, ...}`), both written atomically —
+see "Resuming: dataset contract + atomic per-sample writes" below. Note
+the "honest finding" above about `self.sr` being the sole place the working
+rate is pinned: metadata is recorded at **this** generation rate, before
+any later `pack_dataset.py --target-sr` resample — `effective_level_dbfs`
+for a 48 kHz-generated, 16 kHz-packed sample describes the 48 kHz WAV pair,
+not what a 16 kHz consumer ultimately trains on. `pack_dataset.py`'s own
+`effective_rms_dbfs` (see the design section above) is the field that
+actually describes the packed, possibly-resampled audio.
 
 ### Where the working rate actually comes from (honest finding)
 
@@ -291,18 +336,21 @@ Each command creates:
 ```
 data_16k/ or data_48k/
   meta.json
-  metadata.jsonl
-  pairs/000000.wav, 000001.wav, ...
+  pairs/000000.wav, 000000.json, 000001.wav, 000001.json, ...
 ```
 
-Each WAV is 2-channel: ch0=noisy, ch1=clean. `metadata.jsonl` has one JSON
-line per sample (`{"index": N, ...}`, matching `NNNNNN.wav`) — see "Per-sample
-metadata" above for what it contains.
+Each WAV is 2-channel: ch0=noisy, ch1=clean, written atomically
+(temp-file + rename) alongside its own `NNNNNN.json` metadata sidecar
+(`{"index": N, ...}`, also atomic) — see "Per-sample metadata" above for
+what it contains, and "Resuming / dataset contract" below for what happens
+if the two ever get out of sync (crash mid-write, etc).
 
-Running only the 48 kHz command above and getting the 16 kHz copy from
-`pack_dataset.py --target-sr` (step 2) is the recommended path — run the
-16 kHz command too only when you need the full, undiluted `source_sr_values`
-sweep (see the accepted trade-off note above).
+Run BOTH commands above — one native generation per target rate is the
+recommended path (see the design section above for why downsampling at
+pack time is a shortcut, not a substitute, when SNR/level fidelity
+matters). Skipping the 16 kHz command and relying solely on
+`pack_dataset.py --target-sr` against the 48 kHz batch is only appropriate
+when exact fidelity does not matter for your use case.
 
 Useful flags: `--resume` (continue an interrupted batch), `--start-idx` /
 `[gen] start_idx` (extend an existing dataset without overwriting or
@@ -317,6 +365,39 @@ NumPy random stream.
 `ceil(hours × 3600 / segment_sec)`. It therefore exceeds the requested
 duration by less than one segment. It is not rounded to a complete
 `DNS4Dataset` epoch; when necessary, the final dataset pass is partial.
+
+#### Resuming: dataset contract + atomic per-sample writes
+
+`--resume` picks up from the highest COMPLETE sample (a `NNNNNN.wav` with a
+matching `NNNNNN.json` sidecar), not just the highest `.wav`. Both files are
+written atomically (temp-file + `os.replace`, in that order — WAV first,
+sidecar second), so a process killed mid-write never leaves a corrupt or
+half-written file at its final name; the worst case is an orphan (a WAV
+with no sidecar, from a crash between the two renames — or vice versa if a
+sidecar was manually deleted).
+
+Before scanning `pairs/`, `--resume` validates the existing `meta.json`
+(if any) against the CURRENT run:
+
+- `contract_version` — bumped whenever the on-disk batch format changes in
+  a way that makes an old batch unsafe to blindly resume into.
+- `config_hash` — a sha256 of the ENTIRE resolved `config.ini` (every
+  section/key, after any `--sample-rate` override is folded in). Editing
+  `snr_values`, `p_rir`, `level_mode`, the clipping knobs, `generation_split`,
+  or anything else in the config and then resuming into the same `--output`
+  directory is refused, not silently mixed into one dataset.
+- `sr` — the resolved sample rate, checked separately for a clearer error
+  message even though it is already covered by `config_hash`.
+
+Any mismatch raises and stops the run. Pass `--resume-force-contract-mismatch`
+only for a deliberate migration (e.g. adopting contract versioning on an
+older batch) — it skips this check entirely.
+
+If orphan samples are found, `--resume` also refuses by default (listing
+the offending indices) rather than silently either regenerating them
+(losing nothing, but wasting the previous partial write) or skipping them
+(leaving a permanent gap). Pass `--repair-resume` to have it delete the
+orphans first — that index then regenerates normally on this run.
 
 ### 2. Pack the generated dataset, resampling per consumer as needed
 
