@@ -16,6 +16,7 @@ import json
 import math
 import pathlib
 
+import numpy as np
 import pytest
 import torch
 import torchaudio
@@ -32,6 +33,7 @@ from AIAEC.dataset_gen import (
     lane_reset_mask,
     LinearAecContract,
     LinearAecProcessor,
+    make_linear_aec_config,
     make_linear_aec_contract,
     stft,
 )
@@ -54,6 +56,7 @@ from AIAEC.dataset_gen.manifest import (
 from AIAEC.dataset_gen.pack_aec_dataset import pack
 from AIAEC.dataset_gen.packed_aec_dataset import PackedAecDataset
 from AIAEC.dataset_gen.rematerialize_linear_aec import rematerialize
+from aec import AEC  # noqa: E402 -- sys.path wired by linear_aec's own import above
 
 
 SR = 16000
@@ -256,6 +259,80 @@ def test_linear_aec_state_is_continuous_across_future_chunk_boundaries():
         mic[chunk_samples:], far[chunk_samples:]
     )
     assert not torch.equal(second, reset_second)
+
+
+def test_linear_aec_ch5_is_pre_limiter_formed_output_not_process_return():
+    """linear_error (ch5) must come from get_formed_output(), not from
+    AEC.process()'s own limiter-multiplied return value -- pins the
+    LINEAR_AEC_CONTRACT_VERSION v1->v2 fix (see linear_aec.py's version
+    comment) at the LinearAecProcessor public-API level, not just by
+    inspecting process_numpy()'s source.
+
+    Forces a real output-limiter excursion (loud near-end burst against a
+    filter that hasn't adapted to it -- the same technique
+    AEC/python/test_formed_output_seam.py's
+    test_limiter_forced_trigger_leaves_formed_output_unaffected uses,
+    retuned for this contract's 512/256 grid) via a second, independently
+    constructed AEC engine built from the identical config
+    (make_linear_aec_config): two engines built from the same config and
+    fed the same input from a cold start produce byte-identical output --
+    already relied on by
+    test_linear_aec_state_is_continuous_across_future_chunk_boundaries
+    above -- so this raw engine's own get_formed_output() trace is a valid
+    oracle for what LinearAecProcessor's ch5 should equal, and its own
+    process() return is a valid oracle for what ch5 must NOT equal once
+    the limiter actually engages.
+    """
+    sample_rate = 16000
+    contract = make_linear_aec_contract(sample_rate)
+    hop = contract.hop_size
+
+    rng = np.random.RandomState(0x11317E5)
+    n_hops = 80
+    mic = np.empty(n_hops * hop, dtype=np.float32)
+    far = np.empty(n_hops * hop, dtype=np.float32)
+    for i in range(n_hops):
+        # Quiet baseline, then a loud burst (frames 20-29) neither side of
+        # the filter has adapted to -- forces a transient raw-output spike
+        # above the current mic peak, which is exactly what the output
+        # limiter exists to catch.
+        amp = 0.9 if 20 <= i < 30 else 0.02
+        far[i * hop:(i + 1) * hop] = (
+            amp * 0.3 * rng.uniform(-1.0, 1.0, hop)
+        ).astype(np.float32)
+        mic[i * hop:(i + 1) * hop] = (
+            amp * rng.uniform(-1.0, 1.0, hop)
+        ).astype(np.float32)
+
+    raw_engine = AEC(make_linear_aec_config(sample_rate))
+    limiter_out = np.empty_like(mic)
+    formed_oracle = np.empty_like(mic)
+    min_limiter_gain = 1.0
+    for i in range(n_hops):
+        start, stop = i * hop, (i + 1) * hop
+        limiter_out[start:stop] = raw_engine.process(
+            mic[start:stop].copy(), far[start:stop].copy()
+        )
+        formed_oracle[start:stop] = raw_engine.get_formed_output()
+        min_limiter_gain = min(min_limiter_gain, raw_engine._limiter_gain)
+    assert min_limiter_gain < 0.5, (
+        "burst must actually force the output limiter well below 1.0 for "
+        "this test to prove anything -- retune the synthetic signal if "
+        f"AEC's limiter tuning ever changes (got min gain {min_limiter_gain})"
+    )
+
+    processor = LinearAecProcessor(contract)
+    ch5, _ = processor.process(
+        torch.from_numpy(mic), torch.from_numpy(far)
+    )
+    ch5_np = ch5.numpy()
+
+    np.testing.assert_array_equal(ch5_np, formed_oracle)
+    assert np.max(np.abs(ch5_np - limiter_out)) > 1e-3, (
+        "ch5 must actually differ from the limiter-processed process() "
+        "return during the forced excursion -- otherwise this test can't "
+        "distinguish the v2 (pre-limiter) fix from the v1 (post-limiter) bug"
+    )
 
 
 @pytest.mark.parametrize(
