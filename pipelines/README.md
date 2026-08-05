@@ -614,8 +614,8 @@ Guard rails (all four repos):
   yourself while letting `audio_pipeline_create()` heap-allocate another,
   and don't call `aec_create()`/`mmse_lsa_create()`/`fft_create()` directly
   alongside this library's own carve. `audio_pipeline_init()`/`_init_ex()`
-  own the ENTIRE pool layout (control block + AEC + FFT + NR + the 12
-  pipeline buffers) as one unit — there is no supported way to substitute
+  own the ENTIRE pool layout (control block + AEC + FFT + NR + the 8
+  pipeline scratch buffers) as one unit — there is no supported way to substitute
   a heap-obtained sub-module handle into a pool-resident `AudioPipeline`,
   or vice versa.
 
@@ -837,12 +837,13 @@ for real (`free()` on the pool `audio_pipeline_create()` allocated).
 
 ### AEC (`AecConfig`, see `aec.h`)
 
-**Presets**: `AEC_PRESET_GENTLE` / `AEC_PRESET_BALANCED`（default）/ `AEC_PRESET_AGGRESSIVE`
+**Presets**: `AEC_PRESET_MILD` / `AEC_PRESET_BALANCED`（default）/ `AEC_PRESET_AGGRESSIVE`（`MILD` 在
+2026-07-15 前叫 `GENTLE`，同一組 −20dB 參數，只是改名，數值未變）
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `sample_rate` | 16000 | 8000 / 16000 / 48000，自動計算 frame/fft/hop |
-| `filter_length` | sr×32ms | 自適應濾波器長度（256@8k, 512@16k, 1536@48k） |
+| `filter_length` | sr×52ms（sr≥44100 時 sr×64ms） | 自適應濾波器長度（416@8k, 832@16k／52ms, 3072@48k／64ms；`aec_config_defaults()` 的公式，不是固定 32ms） |
 | `enable_highpass` | 1 | 高通濾波器（移除 DC + 低頻） |
 | `highpass_cutoff_hz` | 80.0 | HPF 截止頻率 (Hz) |
 
@@ -851,8 +852,8 @@ and the AEC3 post-filter chain (`SuppressionGain`, `ResidualEchoEstimator`, etc.
 externally through the `AecResContext` seam (see `## Modules` above). The three AEC presets
 differ in exactly one field:
 
-| Parameter | Gentle | Balanced | Aggressive | Description |
-|-----------|--------|----------|------------|-------------|
+| Parameter | Mild | Balanced | Aggressive | Description |
+|-----------|------|----------|------------|-------------|
 | `min_gain_floor_far_active_db` | -20 | -28 | -38 | AEC3 `SuppressionGain` 遠端活躍時的最低增益下限 dB（最大抑制量）；其餘欄位（filter length、Kalman Q、delay buffer、CNG…）三個 preset 皆相同 |
 
 ### NR (`MmseLsaConfig`, see `mmse_lsa_types.h`)
@@ -866,33 +867,59 @@ differ in exactly one field:
 > 'aggressive']`. `MODERATE` is only reachable by calling `mmse_lsa_config_for_mode()` directly.
 
 `g_min_db` is in the amplitude-dB convention (`/20`, i.e. `g_min = 10^(g_min_db/20)`), not the
-older power-dB (`/10`) convention:
+older power-dB (`/10`) convention.
+
+> **Retime basis — read before hand-editing any `alpha_*`/`L`/`num_init_frames` below.**
+> Every `alpha_*` (except `q`/`g_min_db`/`xi_min_db`, which are plain dB/probability
+> constants) and `L`/`num_init_frames`/`scene_change_min_frames` is **not** used as-authored —
+> `mmse_lsa_types.h`'s `mmse_lsa_config_for_mode_grid()` retimes each one from its authored
+> reference duration to the actual `hop_size` of the grid you construct it for
+> (`mmse_lsa_retime_alpha()`/`mmse_lsa_retime_alpha_ref()`/`mmse_lsa_retime_frames[_ref]()`).
+> The tables below list the **authored constants exactly as they appear as literals in
+> source** (what you'd override via `MmseLsaConfig` before construction, or diff against in
+> code) — **not** the realized runtime value at any particular grid; `L`/`num_init_frames`
+> are the one exception, called out per-row below, since a plain frame count without a
+> stated grid is meaningless.
+>
+> The reference duration is **not the same for every field** — mixing them up when
+> hand-deriving a value for a different grid silently reintroduces the exact regression the
+> 2026-07-10 musical-noise fix and the 2026-08-02/03 strength-mode fix both corrected:
+> - **16 ms-authored** (retimed off a 16 ms/hop reference): `alpha_xi`, `L`, `alpha_attack`
+>   (all modes), and `alpha_d`/`alpha_g`/`alpha_decay` **in MILD/MODERATE/AGGRESSIVE only**.
+> - **10 ms-authored** (retimed off the legacy 10 ms/hop reference): `alpha_s`, `alpha_p`,
+>   `num_init_frames`, `scene_change_min_frames`, and `alpha_d`/`alpha_g`/`alpha_decay`
+>   **in BALANCED only** (BALANCED inherits these three straight from
+>   `mmse_lsa_default_config_for_grid()`, which predates the 16 ms-hop grid switch).
+>
+> Don't hand-scale one of these numbers by a grid's sample-rate/hop ratio and expect it to
+> match the library's own value — call `mmse_lsa_default_config()`/`mmse_lsa_config_for_mode()`
+> (or the Python `core/nr_strength.py` equivalent) and read the field back instead.
 
 | Parameter | Mild | Moderate | Balanced | Aggressive | Description |
 |-----------|------|----------|----------|------------|-------------|
 | `g_min_db` | -20 | -25 | -30 | -40 | 最小增益 dB（最大抑制量，amplitude dB, /20） |
 | `q` | 0.60 | 0.55 | 0.50 | 0.35 | 語音先驗機率（低→積極抑噪） |
 | `xi_min_db` | -15 | -18 | -20 | -25 | 先驗 SNR 下限 dB |
-| `alpha_d` | 0.85 | 0.85 | 0.70 | 0.50 | 噪聲追蹤 IIR 係數 |
-| `alpha_g` | 0.92 | 0.92 | 0.88 | 0.85 | 增益時間平滑（高→平滑） |
-| `alpha_attack` | 0.40 | 0.40 | 0.30 | 0.15 | Attack 平滑（語音起始追蹤） |
-| `alpha_decay` | 0.92 | 0.92 | 0.88 | 0.88 | Decay 平滑（噪聲釋放） |
+| `alpha_d` | 0.85 | 0.85 | 0.70 | 0.50 | 噪聲追蹤 IIR 係數（authored 常數，見上方 retime 說明） |
+| `alpha_g` | 0.92 | 0.92 | 0.88 | 0.85 | 增益時間平滑（高→平滑；authored 常數） |
+| `alpha_attack` | 0.40 | 0.40 | 0.30 | 0.15 | Attack 平滑（語音起始追蹤；authored 常數，四個 preset 皆 16ms 基準） |
+| `alpha_decay` | 0.92 | 0.92 | 0.88 | 0.88 | Decay 平滑（噪聲釋放；authored 常數） |
 
 **MCRA 噪聲估計**：
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `alpha_s` | 0.95 | 功率譜時間平滑 |
-| `alpha_d` | 0.70 | 噪聲更新速率 |
-| `L` | 64 | 最小值追蹤視窗（幀數；16 kHz 預設 256/128 grid 下的值，隨 grid 換算） |
-| `num_init_frames` | 25 | 初始化靜默幀數（16 kHz 預設 256/128 grid 下 ≈200ms，隨 grid 換算） |
-| `scene_change_threshold_db` | 10.0 | 場景轉換偵測閾值 |
+| `alpha_s` | 0.95 | 功率譜時間平滑（authored 常數，10ms 基準） |
+| `alpha_d` | 0.70 | 噪聲更新速率（authored 常數，10ms 基準；BALANCED 值，見上方 retime 說明） |
+| `L` | 64 | 最小值追蹤視窗（幀數；**已retime**，16 kHz 預設 256/128 grid（hop=128, 16ms 基準）下的實際值，換到其他 grid 需重算，不可直接按比例縮放） |
+| `num_init_frames` | 25 | 初始化靜默幀數（**已retime**，16 kHz 預設 256/128 grid（10ms 基準）下 ≈200ms 的實際值，換到其他 grid 需重算） |
+| `scene_change_threshold_db` | 10.0 | 場景轉換偵測閾值（純 dB 常數，不 retime） |
 
 **SPP**：
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `alpha_xi` | 0.88 | Decision Directed 先驗 SNR 平滑 |
+| `alpha_xi` | 0.92 | Decision Directed 先驗 SNR 平滑（authored 常數，16ms 基準；2026-07-10 musical-noise fix 由 0.88 調高，所有 preset 共用） |
 
 ---
 
