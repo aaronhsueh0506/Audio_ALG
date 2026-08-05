@@ -967,9 +967,13 @@ class AecSequenceRenderer:
         agc = False
         mic_postclip = mic_preclip.clone()
         if scenario == 'clipping_agc' or rng.random() < cfg.getfloat('mic', 'p_clipping'):
-            mic_postclip = apply_clipping(mic_postclip,
-                                          cfg.getfloat('mic', 'clip_snr_min'),
-                                          cfg.getfloat('mic', 'clip_snr_max'))
+            # apply_clipping() also returns the sampled clip_snr (added for
+            # AINR's own per-sample metadata) -- this caller already tracks
+            # a separate `clipped` boolean, not the exact sampled value.
+            mic_postclip, _clip_snr = apply_clipping(
+                mic_postclip,
+                cfg.getfloat('mic', 'clip_snr_min'),
+                cfg.getfloat('mic', 'clip_snr_max'))
             clipped = True
         if scenario == 'clipping_agc' or rng.random() < cfg.getfloat('mic', 'p_agc'):
             mic_postclip = apply_agc(
