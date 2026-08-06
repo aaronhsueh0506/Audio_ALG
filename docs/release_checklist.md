@@ -28,24 +28,65 @@ fixed and verified, not when it is merely understood.
 As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
 `Audio_ALG 992dc56` (all pushed):
 
+- [x] **F2.4's mu-holdoff no-reset guard was silently reverted and shipped
+      broken for ten weeks.** FIXED 2026-08-06 (Python + C + regression tests at
+      all four grids, mutation-verified). Recorded here because the failure mode
+      is the reusable lesson, not the line: commit `2f3699f` ("remove dead flag
+      branches") collapsed
+      `if not cfg.mu_holdoff_no_reset or holdoff == 0:` to an **unconditional**
+      arm — keeping the arm the flag had *disabled*, because
+      `mu_holdoff_no_reset` was in `AecConfig._LEGACY_HARDCODE_TRUE`. The
+      explanatory comment above the line survived intact and went on describing
+      the guard, so the source read correctly; only the executed branch was
+      wrong, and the C port mirrored it. Nothing caught it for ten weeks.
+      **When retiring a feature flag, evaluate which arm was live — a
+      hardcoded-TRUE flag means the `if not flag` branch is the dead one.**
+
 - [ ] **The wall-clock timing audit is NOT complete, and shipped documentation
       says it is.** `AEC/README.md` presents a closed three-item blocker list
-      (800-case, native 48 kHz, tuning-not-timing) and `AEC/CHANGELOG.md`
+      (800-case, native 48 kHz, tuning-not-timing) and `AEC/CHANGELOG.md:965`
       states "Every constant now covers the same wall-clock span at every
-      grid". At least two hop-authored constants in the default-ON production
-      path are still raw literals routed through no retime helper, and both
-      mistime on this release's own new 16 kHz default grid (hop 128 = 8 ms):
+      grid". Both are false. Known un-retimed constants on the default-ON path,
+      all of which mistime on this release's own new 16 kHz default grid
+      (hop 128 = 8 ms) — **this list is not yet closed; a full inventory is the
+      first task**, see §4:
 
-      | constant | file | authored | effective now |
-      |---|---|---:|---:|
-      | `simple_mu_holdoff = 20` | `c_impl/src/aec.c:448`, `python/modules/orchestrator.py:1332` | 320 ms (20 x 16 ms) | **160 ms** |
-      | `erle_coh_gate_alpha = 0.05` | `c_impl/src/aec3_post.c:56`, `python/modules/config.py:63` | TC 195 ms (@10 ms) | **TC 156 ms** |
+      | constant | site | validated anchor | 16k/256 | 16k/512 | 48k/1024 |
+      |---|---|---:|---:|---:|---:|
+      | `simple_mu_holdoff = 20` | `aec.c:448`, `orchestrator.py:1332` | 200 ms | 160 ms | 320 ms | 213 ms |
+      | coherence `alpha = 0.05` TC | `aec3_post.c:56`, `config.py:63` | 195 ms | 156 ms | 312 ms | 208 ms |
+      | misadjustment `n_hops_target = 2` | `aec.c:1518`, `orchestrator.py:130` | ~16 ms | 16 ms | 32 ms | 21 ms |
+      | ERLE window `decay = 0.999` TC | `aec.c:2213`, `orchestrator.py:2137` | ~10 s | 8 s | 16 s | 10.7 s |
+      | recent ERLE peak `last 15 hops` | — | 150 ms | 120 ms | 240 ms | 160 ms |
+      | stationary-DT baseline `0.999/0.95/0.995` | `aec.c:2286`, `orchestrator.py:2229` | tbd | | | |
+      | instant-ERLE `0.7` | `aec.c:2300`, `orchestrator.py:2249` | tbd | | | |
+      | `simple_mu` alphas `0.3/0.99/0.95` | `aec.c:448-450` | tbd | | | |
 
-      Either retime them and extend `test_rate_structural` check (d2), or
-      classify each as a genuine event count (as `CONV_FRAMES` and
-      `ne_recent_sustain` were, with an explicit recorded rationale) — and in
-      either case restore an accurate disclosure. Do not close §5 or §15 while
-      the README asserts a completeness the tree does not have.
+      **The anchor is the last commit that empirically VALIDATED the constant,
+      not the commit that introduced it, and not the in-code comment.** Worked
+      example: `simple_mu_holdoff = 20` was introduced at `d774771`
+      (2026-03-20) when the default was frame 512 / hop 256 = 16 ms, so its
+      comment says "~320ms" and was correct *then*. It was validated at
+      `7b2cf04` (2026-05-12, the F2.4 800-case ablation) when `AecConfig` had
+      flipped to `frame_size = -1  # Auto: sample_rate * 20ms` = hop 160 =
+      10 ms. The validated span is therefore **200 ms**, and the comment has
+      been stale since 2026-05-12. Anchoring on the introduction commit instead
+      gives a 1.6x error — and did, in an earlier round of this very campaign.
+
+      Each constant needs a verdict: retime (and extend `test_rate_structural`
+      check (d2) + the Python effective-value suite), or classify as a genuine
+      event count with a recorded rationale (as `CONV_FRAMES` and
+      `ne_recent_sustain` were). Then restore an accurate disclosure. Do not
+      close §5 or §15 while the README asserts a completeness the tree lacks.
+
+- [ ] **AIAEC is the most-deviated consumer of the gap above, and must not
+      generate datasets until it closes.** AIAEC pins 16 kHz **512/256**, the
+      grid furthest from every anchor in the table: holdoff 320 ms vs 200 ms,
+      ERLE decay ~16 s vs ~10 s, coherence TC 312 ms vs 195 ms, misadjustment
+      window 32 ms vs ~16 ms. Retiming will change `aec_behavior_hash`, so any
+      dataset generated first must be rematerialized or its contract bumped,
+      and any checkpoint trained on it retrained. Do not start bulk AIAEC
+      dataset generation before the retime lands. AINR is unaffected.
 
 - [ ] **`FrameProcessor`'s docstring contradicts the code shipped with it.**
       `NR/core/frame_processor.py:19` documents per-parameter defaults
@@ -72,6 +113,27 @@ As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
       other. hop=160 is not merely non-default — `config.py`'s grid whitelist
       makes it unreachable. This is the exact misreading that produced the 1.6x
       mistiming class.
+
+- [ ] **`AEC/CHANGELOG.md` has 71 dangling documentation references.** Of 73
+      prose `docs/*.md` / `docs/*.html` mentions, 71 point at verdict and
+      design documents deleted during the release cleanup
+      (`docs/f2_4_verdict.md`, `docs/v3_14_plan.md`, ...). Verify with:
+      `grep -oE '\bdocs/[a-zA-Z0-9_/-]+\.(md|html)' CHANGELOG.md | while read p; do [ -f "$p" ] || echo "$p"; done`
+      An integrator following any of them hits nothing. Either restore the
+      archive, rewrite them as pinned-commit history links, or drop the
+      reference and inline the one-line conclusion. Do not leave them as-is —
+      the CHANGELOG is a release surface, and §13 requires that every
+      documented file exist and work from a clean clone.
+
+- [ ] **Five orchestrator state fields are written but never read.**
+      `_shadow_error_psd`, `_shadow_R`, `_shadow_mu_holdoff` (init + two reset
+      sites each), `_prev_filter_state` (init, reset, one write at
+      `orchestrator.py:2614`), and `_hb_mic_pwr_ring` (a 32-float array
+      allocated at `orchestrator.py:718` and never touched again). Confirmed
+      by grep across `python/` — every reference is an assignment. Dead state
+      in a 4500-line file with tightly coupled state is an active hazard: it
+      reads as live invariant maintenance and invites "fixes" to code paths
+      that do not exist. Remove, or record why they are retained.
 
 ## 1. Product contract
 
