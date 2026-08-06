@@ -77,7 +77,13 @@ except ImportError:
 #      paying for both; meta.json gains generation_history (see gen_dataset()
 #      below) so a --resume run's own seed/effective_seed no longer
 #      silently overwrites and loses the record of every earlier run's.
-AINR_DATASET_CONTRACT_VERSION = 3
+#   4: --resume now takes batch_start_idx from the existing meta.json instead
+#      of recomputing it from the current CLI/config invocation. This keeps a
+#      fresh shard created with `--start-idx N` anchored at N on every later
+#      resume, and rejects an explicit conflicting --start-idx. Top-level
+#      n_samples/hours now mean actual batch size/duration for non-zero-index
+#      shards; next_sample_idx records the filename cursor separately.
+AINR_DATASET_CONTRACT_VERSION = 4
 
 
 class DatasetContractError(RuntimeError):
@@ -381,6 +387,40 @@ def gen_dataset(args):
     if base_idx < 0:
         raise ValueError(f"start_idx must be non-negative, got {base_idx}")
 
+    pairs_dir = os.path.join(args.output, 'pairs')
+    meta_path = os.path.join(args.output, 'meta.json')
+    os.makedirs(pairs_dir, exist_ok=True)
+
+    # For an existing batch, its recorded start is authoritative. In
+    # particular, a fresh shard may have been created with CLI --start-idx
+    # while config.ini still says 0; requiring the caller to repeat that CLI
+    # option on every resume is both unnecessary and unsafe. An explicitly
+    # supplied conflicting value is almost certainly the wrong output
+    # directory, so fail closed instead of silently rewriting the inventory.
+    existing_meta = None
+    if args.resume:
+        existing_meta = _validate_resume_contract(
+            meta_path, pairs_dir, AINR_DATASET_CONTRACT_VERSION, config_hash,
+            generation_sr,
+        )
+        if existing_meta is not None:
+            recorded_base = existing_meta.get('batch_start_idx')
+            if (not isinstance(recorded_base, int)
+                    or isinstance(recorded_base, bool) or recorded_base < 0):
+                raise DatasetContractError(
+                    f"--resume refused: {meta_path} has invalid "
+                    f"batch_start_idx={recorded_base!r}; expected a "
+                    "non-negative integer. The batch contract is corrupt."
+                )
+            if args.start_idx is not None and base_idx != recorded_base:
+                raise DatasetContractError(
+                    f"--resume refused: explicit --start-idx={base_idx} "
+                    f"conflicts with {meta_path}'s batch_start_idx="
+                    f"{recorded_base}. Omit --start-idx when resuming, or "
+                    "use the recorded value exactly."
+                )
+            base_idx = recorded_base
+
     cfg_seed = cfg.getint('gen', 'seed', fallback=-1)
     cli_seed = getattr(args, 'seed', None)
     requested_seed = cli_seed if cli_seed is not None else cfg_seed
@@ -400,10 +440,6 @@ def gen_dataset(args):
     else:
         print(f"Random seed ({seed_source}): {effective_seed}")
 
-    pairs_dir = os.path.join(args.output, 'pairs')
-    meta_path = os.path.join(args.output, 'meta.json')
-    os.makedirs(pairs_dir, exist_ok=True)
-
     # ---- Resume/contract validation runs BEFORE constructing DNS4Dataset
     # (RIR glob/cache I/O) and the one-sample profiling pass below -- a
     # config/contract mismatch must exit immediately, not after paying for
@@ -415,12 +451,7 @@ def gen_dataset(args):
     sample_count = base_idx
     done = 0
     max_idx = -1
-    existing_meta = None
     if args.resume:
-        existing_meta = _validate_resume_contract(
-            meta_path, pairs_dir, AINR_DATASET_CONTRACT_VERSION, config_hash,
-            generation_sr,
-        )
         max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(pairs_dir)
         if orphan_wavs or orphan_jsons:
             if args.repair_resume:
@@ -453,13 +484,16 @@ def gen_dataset(args):
         # generation resumes past it.
         complete_indices, _, _ = _list_complete_sample_indices(pairs_dir)
         if complete_indices:
-            expected = list(range(complete_indices[0], complete_indices[-1] + 1))
+            expected = list(range(base_idx, complete_indices[-1] + 1))
             if complete_indices != expected:
                 missing = sorted(set(expected) - set(complete_indices))
+                unexpected = sorted(set(complete_indices) - set(expected))
                 raise DatasetContractError(
                     f"--resume refused: {pairs_dir} has a gap in its "
-                    f"complete sample indices -- missing {missing} "
-                    f"(range {complete_indices[0]}..{complete_indices[-1]}, "
+                    f"complete sample indices relative to batch_start_idx="
+                    f"{base_idx} -- missing {missing}, unexpected "
+                    f"{unexpected} (disk range {complete_indices[0]}.."
+                    f"{complete_indices[-1]}, "
                     f"{len(complete_indices)} present). Resuming would "
                     "silently skip past this gap forever (the next sample "
                     "written continues from the highest COMPLETE index, "
@@ -584,11 +618,12 @@ def gen_dataset(args):
         meta = {
             'contract_version': AINR_DATASET_CONTRACT_VERSION,
             'config_hash': config_hash,
-            'n_samples': sample_count,
+            'n_samples': batch_samples,
+            'next_sample_idx': sample_count,
             'sr': SR,
             'segment_sec': segment_sec,
             'segment_samples': dataset.segment_samples,
-            'hours': sample_count * segment_sec / 3600,
+            'hours': batch_samples * segment_sec / 3600,
             'batch_start_idx': base_idx,
             'batch_n_samples': batch_samples,
             'batch_hours': batch_samples * segment_sec / 3600,

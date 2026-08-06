@@ -1,4 +1,4 @@
-# RNNoise-ERB 開發紀錄
+# RNNoise-ERB 開發紀錄（歷史封存）
 
 ## 2026-07 — 修正 erb_bandborder() 最小 band 寬度保證（v5）
 

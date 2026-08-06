@@ -1,36 +1,39 @@
 # RNNoise-ERB
 
-以 RNNoise v0.2 的 Conv+GRU 方向為基礎的本地噪音抑制模型，使用
-mean-normalized log-ERB 與低頻 complex spectrum 雙路特徵；並非官方 v0.2
+以 RNNoise v0.2 的 Conv+GRU 方向為基礎的本地噪音抑制模型。出貨設定只讓網路
+使用 mean-normalized log-ERB；程式仍保留可選的低頻 complex spectrum 分支，
+但 `config.ini` 預設 `use_complex_input = false`。本模型並非官方 RNNoise v0.2
 或 DeepFilterNet 的逐層相容移植。
 
 ## 架構
 
 - **ERB 輸入**: 22 個 log-energy bands，做每-band causal EMA mean norm
-- **Complex 輸入**: 0–4 kHz 的 129 個 real/imag bins，做每-bin magnitude EMA unit norm
-- **模型**: ERB temporal conv + complex frequency encoder/temporal conv → fusion → 3 層 GRU(128)
+- **Complex 輸入（可選、預設關閉）**: 0–4 kHz 的 129 個 real/imag bins，做每-bin magnitude EMA unit norm
+- **模型**: ERB temporal conv → 3 層 GRU(128)；開啟 complex 分支時才加入 frequency encoder/temporal conv 與 fusion
 - **輸出**: 22 個 gain masks [0, 1]
-- **參數量**: 376,254（無 VAD head）
+- **參數量**: 329,302（預設純 ERB、無 VAD head）；開啟 complex 分支為 376,254
 - **Latency**: 16ms lookahead（`lookahead_frames=1`，gain 對應 3-frame window 中間幀）
 
 ### Feature preprocessing
 
-目前 feature contract 為 `log_erb_dfn_mean_cplx_unit_0_4k_v5`：
+目前 feature contract 為 `log_erb_dfn_mean_cplx_unit_0_4k_v8`：
 
 ```text
 normalized complex STFT
 ├─ power → triangular ERB → 10*log10(E+1e-10)
-│          → per-band EMA mean → (dB - mean) / 40
+│          → per-band EMA mean → (dB - mean) / 40 → model input
 └─ bins 0..4 kHz → per-bin |X[k]| EMA
-                    → real/imag / sqrt(EMA+eps)
+                    → real/imag / sqrt(EMA+eps) → optional branch (off by default)
 ```
 
-ERB 路徑對穩態訊號會逐步趨近 0，這是原作 DeepFilterNet 的預期行為；
-辨識穩態噪音的細頻率結構、相位及部分 level 資訊由 complex 路徑保留。
+ERB 路徑對穩態訊號會逐步趨近 0，這是 DeepFilterNet 公式的預期行為；但
+DeepFilterNet 同時使用 complex feature，而本模型的出貨設定已關閉該分支。
+因此純 ERB 模式不保留穩態頻譜的 absolute level、帶內細節或相位；這是刻意的
+低算量 bake-off 設定，也是與 complex/hybrid 模型比較時必須納入解讀的限制。
 `X[k] / sqrt(EMA(|X[k]|))` 不是完全 gain-invariant；穩態下輸入振幅放大 `a` 倍，
-complex feature 約放大 `sqrt(a)` 倍，因此不需要額外 absolute-level input。
-同一 stream 分 chunk 處理時必須同時傳遞 ERB EMA、complex EMA 與 GRU state；
-不同 WAV 之間必須重置。
+complex feature 約放大 `sqrt(a)` 倍。只有啟用 complex 分支時，模型才會使用這項
+資訊。同一 stream 分 chunk 處理時必須傳遞 ERB EMA 與 GRU state；若 complex
+分支啟用，還要傳遞 complex EMA。不同 WAV 之間必須重置。
 兩路公式、state 初始值與先更新再輸出的順序精確對齊原作 `libDF`——
 v3 曾額外保留 ERB `±5` 與 complex `±10` clip 作為部署數值安全界線，v4 拿掉了
 這個 clip：對照 upstream `libDF::band_mean_norm_erb`/`band_unit_norm` 與本
@@ -117,7 +120,7 @@ output_dir = ./output
 | `[training] device` | cuda | 訓練裝置 (`cuda` 或 `cpu`) |
 | `[training] epoch_size` | 0 | 每 epoch sample 上限；0 表示使用全部資料 |
 | `[audio] segment_sec` | 3.0 | 每筆訓練音檔長度 (秒) |
-| `[rir] p_rir` | 0.1 | 套用 RIR 的機率 |
+| `[rir] p_rir` | 0.5 | 套用 RIR 的機率（共用 dataset config） |
 | `[feature] erb_norm_tau_sec` | 1.0 | ERB per-band mean EMA 時間常數 |
 | `[feature] erb_norm_init_lo_db` | -20 | 最低 ERB band EMA 初值 |
 | `[feature] erb_norm_init_hi_db` | -45 | 最高 ERB band EMA 初值 |
@@ -143,7 +146,8 @@ noisy/clean WAV tensor；STFT、log-ERB 與 runtime normalization 會在訓練�
 packing 全部由 `../dataset_gen/` 維護，RNNoise-ERB 不再保存重複版本。
 
 訓練 objective 已改回直接 ERB IRM：對 22 個 band gain 與 ideal ratio
-mask 在 `gamma=0.25` 的壓縮域做 MSE。目前 MRSL 的兩個 factor 都是 0；
+mask 在 `gamma=0.5` 的壓縮域做 MSE，對齊原始 RNNoise 論文採用的 perceptual
+compromise。目前 MRSL 的兩個 factor 都是 0；
 沒有假 VAD/activity 加權。低於 `energy_floor` 的 mixture band 無法定義
 ratio，會被 mask 掉而不產生梯度。若要重開 MRSL，必須先依實測 gradient
 norm 重新縮放 IRM；直接恢復 factor 500 會讓 MRSL 壓過 IRM。
@@ -305,7 +309,9 @@ make test-feature-python  # 需 torch training environment
 ```
 
 C test 會以獨立 recurrence 對照 `rnnoise_compute_features()`，並讓固定非平坦
-spectrum 運行 4096 frames，確認 ERB mean norm 收旂為 0，complex 路徑仍非零。
-Python test 另驗證兩路 state/chunk equivalence、ERB 穩態收旂、complex 穩態可觀測性、
-雙路 shape 與 model forward contract；`tests/test_python_c_features.py` 以
-golden vectors 對照 Python/C 的 STFT、雙路特徵與最終 normalization state。
+spectrum 運行 4096 frames，確認 ERB mean norm 收斂為 0，complex preprocessing
+仍非零。Python test 另驗證兩路 state/chunk equivalence、ERB 穩態收斂、complex
+穩態可觀測性，以及純 ERB／可選 complex 兩種 model forward contract；
+`tests/test_python_c_features.py` 以 golden vectors 對照 Python/C 的 STFT、
+兩路特徵與最終 normalization state。即使出貨模型未使用 complex 分支，保留的
+可選路徑仍須通過這些測試，避免日後重新啟用時出現 Python/C 漂移。

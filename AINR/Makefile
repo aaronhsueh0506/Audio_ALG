@@ -1,5 +1,5 @@
 CC ?= cc
-CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -ffp-contract=off
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -ffp-contract=off -I.
 LDFLAGS ?=
 SIMD ?= 1
 
@@ -16,7 +16,7 @@ SIMD_CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
 
 BUILD_DIR := build
-SOURCES := test_c_prepost.c \
+SOURCES := tests/test_c_prepost.c \
 	DeepFilterNet2/dfn2_process.c \
 	DeepFilterNet3/dfn3_process.c \
 	GTCRN/gtcrn_process.c

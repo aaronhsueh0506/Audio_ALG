@@ -139,9 +139,9 @@
     <h1>Audio_ALG 架構說明</h1>
     <p>單通道全雙工語音增強 Pipeline — linear AEC + echo-aware NR/RES gain fusion</p>
     <p style="font-size: 13px; opacity: 0.75; margin-top: 12px;">
-      AEC v2.5.0 (PBFDKF + Shadow + RES C/Python aligned)
-      &nbsp;·&nbsp; NR v3 (MMSE-LSA + MCRA + SPP)
-      &nbsp;·&nbsp; 16kHz / 10ms hop / float32
+      AEC (PBFDKF + Shadow + RES)
+      &nbsp;·&nbsp; NR V3-2 (MMSE-LSA + MCRA + SPP)
+      &nbsp;·&nbsp; 16/48 kHz power-of-two grids / float32
     </p>
   </div>
 </header>
@@ -171,7 +171,7 @@
 <h2 id="overview">1. 整體架構與訊號流</h2>
 
 <div class="panel">
-<p>Pipeline 共四個處理階段，每次 process 一個 10 ms hop（160 samples @ 16 kHz）；分析 frame 為 20 ms（320 samples），FFT zero-pad 到 512：</p>
+<p>Pipeline 共四個處理階段，每次 process 一個 grid hop。預設為 16 kHz、256-sample frame/FFT、128-sample hop；另支援 16 kHz 512/256 與 48 kHz 1024/512。所有 grid 都是 frame=FFT、50% overlap，不做 zero-padding：</p>
 
 <div class="figure">
 <svg viewBox="0 0 900 300" xmlns="http://www.w3.org/2000/svg">
@@ -601,7 +601,7 @@ delta_ratio &lt; 0.3
   <rect x="135" y="80" width="180" height="80" rx="8" fill="#dbeafe" stroke="#2563eb" stroke-width="2"/>
   <text x="225" y="105" font-size="13" fill="#1e40af" text-anchor="middle" font-weight="700">MCRA</text>
   <text x="225" y="123" font-size="10" fill="#1e40af" text-anchor="middle">minimum tracking</text>
-  <text x="225" y="138" font-size="10" fill="#1e40af" text-anchor="middle">L=32 frames (320ms)</text>
+  <text x="225" y="138" font-size="10" fill="#1e40af" text-anchor="middle">L 依 grid retime（預設 64）</text>
   <text x="225" y="153" font-size="10" fill="#1e40af" text-anchor="middle">→ noise_psd[k]</text>
 
   <!-- to SPP -->
@@ -642,11 +642,11 @@ delta_ratio &lt; 0.3
 
 <h3>4.1 MCRA — 噪音追蹤</h3>
 
-<p>用 minimum tracking 估計噪音 PSD，假設噪音在約 320 ms 視窗內統計穩定：</p>
+<p>用 minimum tracking 估計噪音 PSD；<code>L</code> 依 grid 換算，以維持接近的 wall-clock 統計視窗（16 kHz 256/128 預設為 64 hops，約 512 ms）：</p>
 
 <div class="formula">
 P[k,n] = α<sub>p</sub> · P[k,n−1] + (1−α<sub>p</sub>) · |Y[k,n]|²<br>
-P<sub>min</sub>[k] = min over L=32 frames<br>
+P<sub>min</sub>[k] = min over L hops<br>
 S<sub>r</sub> = P / P<sub>min</sub> &lt; δ → 更新 noise_psd
 </div>
 
@@ -848,23 +848,22 @@ G<sub>RES</sub>[k] = clamp((enr<sub>s</sub> − ENR) / (enr<sub>s</sub> − enr<
 <table>
   <tr><th>項目</th><th>AEC</th><th>NR</th><th>備註</th></tr>
   <tr><td>取樣率</td><td>8 / 16 / 48 kHz</td><td>8 / 16 / 48 kHz</td><td>單通道</td></tr>
-  <tr><td>Frame / Hop</td><td colspan="2">8k 160/80；16k 320/160；48k 960/480</td><td>20 ms frame、10 ms hop</td></tr>
-  <tr><td>FFT size</td><td>256 / 512 / 1024</td><td>256 / 512 / 1024</td><td>kiss_fft single precision</td></tr>
-  <tr><td>Algorithmic delay</td><td>AEC hop 約 10 ms</td><td>final OLA 再約 10 ms</td><td>完整 mono pipeline 約 20 ms，不含裝置 I/O／resampler／OS scheduling</td></tr>
-  <tr><td>記憶體 (核心)</td><td>~200 KB (main+shadow)</td><td>~50 KB</td><td>FFT + 權重 + 緩衝</td></tr>
-  <tr><td>記憶體 (含後處理)</td><td>~280 KB (含 RES + delay est)</td><td>+64 KB (MCRA min buffer)</td><td>L=32, n_freqs=257</td></tr>
-  <tr><td>每 frame 計算量</td><td>2 × 512-FFT + Kalman update<br>(257 bins × 4 partitions)</td><td>2 × 512-FFT<br>+ MCRA + SPP + LSA</td><td></td></tr>
+  <tr><td>Frame / Hop</td><td colspan="2">8k 256/128；16k 256/128（預設）或 512/256；48k 1024/512</td><td>frame=FFT、50% overlap、無補零</td></tr>
+  <tr><td>FFT size</td><td>256 / 512 / 1024</td><td>256 / 512 / 1024</td><td>KISS 或 NE10，float32</td></tr>
+  <tr><td>Algorithmic delay</td><td>1 grid hop</td><td>final OLA 再 1 grid hop</td><td>完整 mono pipeline 為 2 hops；不含裝置 I/O／resampler／OS scheduling</td></tr>
+  <tr><td>靜態記憶體</td><td><code>aec_get_mem_size()</code></td><td><code>mmse_lsa_get_mem_size()</code></td><td>完整整合以 <code>audio_pipeline_get_mem_requirements()</code> 為準</td></tr>
+  <tr><td>計算量</td><td>依 grid、partition、shadow 與 backend</td><td>依 n_freqs、MCRA 視窗與 backend</td><td>release 前在目標 SoC profile，不使用本頁固定估算</td></tr>
 </table>
 
 <h3>6.2 AEC 收斂時間 (PBFDKF + Shadow, 16 kHz FL=832)</h3>
 
 <table>
   <tr><th>階段</th><th>時間</th><th>條件</th></tr>
-  <tr><td>Warmup (不更新收斂判定)</td><td>80 frames (800 ms)</td><td>cold start 後固定</td></tr>
+  <tr><td>Warmup (不更新收斂判定)</td><td>約 1.0 s</td><td>依目前 hop retime，僅在有效 far-active hop 遞減</td></tr>
   <tr><td>Cold start → ERLE &gt; 10 dB</td><td>0.3-0.5 s</td><td>寬頻 far-end + 含 echo</td></tr>
   <tr><td>Cold start → ERLE &gt; 20 dB</td><td>0.5-1.0 s</td><td></td></tr>
   <tr><td>Cold start → ERLE &gt; 30 dB</td><td>1.5-3.0 s</td><td></td></tr>
-  <tr><td>EPC 後 re-convergence</td><td>0.3-0.8 s</td><td>P_MAX 暫時放寬 30 frames</td></tr>
+  <tr><td>EPC 後 re-convergence</td><td>0.3-0.8 s</td><td>P_MAX 暫時放寬；實際 hop count 依 grid 換算</td></tr>
   <tr><td>Stationary far-end CV² 收斂</td><td>~1.0 s</td><td>α=0.99 EMA TC≈1s</td></tr>
   <tr><td>Stationary DT hangover</td><td>800 ms</td><td>jump_ratio &gt; 1.5 後維持</td></tr>
 </table>
@@ -898,7 +897,7 @@ ONNX，<strong>無 harness pre-align</strong>（讓 AEC 線上 <code>EchoPathDel
 <div class="note">
 <strong>注意：</strong>AECMOS <strong>不量背景噪音抑制</strong> —— 那才是 NR 的本職。本表只呈現 echo/近端 trade,
 看不到 NR 真正的降噪價值。AEC 模組單獨的 ours / AEC3 / Speex 三方對照見
-<a href="../../AEC/README.md">AEC/README.md</a>。渲染器 <code>rebench_aec_only.py</code> / <code>rebench_joint.py</code>
+<a href="../../AEC/README.md">AEC/README.md</a>。渲染器 <code>pipelines/tools/rebench_aec_only.py</code> / <code>pipelines/tools/rebench_joint.py</code>
 (皆 <code>NO_PREALIGN=1</code>)。
 </div>
 
@@ -959,7 +958,7 @@ ONNX，<strong>無 harness pre-align</strong>（讓 AEC 線上 <code>EchoPathDel
 </div>
 
 <p style="font-size: 12px; color: var(--muted); margin-top: 8px;">
-  詳細參數調整指南見 <a href="../../NR/parameter_adjust_guide.md">NR/parameter_adjust_guide.md</a>。
+  詳細參數調整指南見 <a href="../../NR/docs/parameter_tuning.md">NR/docs/parameter_tuning.md</a>。
 </p>
 
 </div>

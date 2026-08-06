@@ -1,5 +1,5 @@
 /**
- * audio_pipeline.c — implementation of audio_pipeline.h (review F20).
+ * audio_pipeline.c — implementation of audio_pipeline.h.
  *
  * Ports pipelines/aec_nr_pipeline_static.c's file-local `pipeline_pool_size` /
  * `pipeline_build` / `pipeline_destroy` (the pool-sizing/carving) and the
@@ -124,7 +124,7 @@
 
 /* Maps AUDIO_PIPELINE_BACKEND_STR -- THIS TU's OWN compile-time literal,
  * never caller-supplied data -- to the small stable integer a serializable
- * descriptor can carry (review B06; see audio_pipeline.h's
+ * descriptor can carry (see audio_pipeline.h's
  * AudioPipelineMemReq.backend_id doc). One strcmp per
  * audio_pipeline_get_mem_requirements() call against a compiled-in literal
  * is not the caller-facing string hazard the header doc warns about (that
@@ -462,7 +462,7 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
         if (fft_mem == 0 || nr_sz == 0) return -1;
     }
 
-    /* backend_id (review B06): reject up front (same reject-first shape as
+    /* backend_id: reject up front (same reject-first shape as
      * the module validators above) if this TU's own AUDIO_PIPELINE_BACKEND_STR
      * doesn't map to a known backend -- e.g. a build outside pipelines/
      * Makefile that never set -DAUDIO_PIPELINE_BACKEND_STR at all (falls
@@ -668,19 +668,13 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
      * pointers straight through is exactly as safe as an extra pipeline-
      * owned decoupling copy would have been, without paying for one.
      *
-     * Dispatch on p->aec_only, fixed at construction and never toggled
-     * per-instance (a single Aec instance uses only entry points from one
-     * CLASS -- "full", which drives the output limiter, or "context-only",
-     * which doesn't -- for one construct-or-reset epoch; see aec.h's doc on
-     * aec_process_context() for the full rule). aec_only means the
-     * limiter-processed, caller-facing output IS the pipeline's own
-     * output -- needs the full aec_process(), writing directly into the
-     * caller's own `out` (already validated non-NULL and hop-sized above;
-     * aec_process()'s `out` parameter is not optional, so there is nothing
-     * to gain from an intermediate pipeline-owned buffer here). !aec_only
-     * means downstream NR/RES uses only ctx.error_spec (the reconstructing
-     * WOLA frame formed BEFORE that limiter) and never reads aec_process()'s
-     * own output at all -- aec_process_context() skips computing it. */
+     * Dispatch on p->aec_only, fixed at construction. The two entry points
+     * differ only by whether the result is copied out, so this is purely a
+     * cost choice. aec_only means the AEC's own output IS the pipeline's
+     * output -- needs aec_process(), writing directly into the caller's
+     * `out` (already validated non-NULL and hop-sized above). !aec_only
+     * means downstream NR/RES reads only ctx.error_spec and never the
+     * emitted hop, so aec_process_context() skips that copy. */
     if (p->aec_only) {
         aec_process(p->aec, mic, ref, out);
         return 0;

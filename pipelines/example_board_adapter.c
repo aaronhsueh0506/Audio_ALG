@@ -171,7 +171,7 @@ static float lcg_sample(void) {
  * Drive `n_hops` hops of a synthetic mic/ref stream through `p`, checking
  * only that audio_pipeline_process() reports success and that the output
  * contains no NaN -- this is a functional smoke test, not a golden-output
- * comparison (see test_audio_pipeline.c for the byte-exact parity proof).
+ * comparison (see tests/test_audio_pipeline.c for the byte-exact parity proof).
  *
  * BOARD: `mic`/`ref` here are plain stack arrays filled by a host RNG. On a
  * real target these would instead be the current hop read out of a codec

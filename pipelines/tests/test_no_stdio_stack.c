@@ -1,4 +1,4 @@
-/* test_no_stdio_stack.c — full-stack no-stdio link gate.
+/* tests/test_no_stdio_stack.c — full-stack no-stdio link gate.
  *
  * A minimal main() that exercises the WHOLE delivered stack -- query ->
  * audio_pipeline_init_ex -> one hop of audio_pipeline_process -> reset ->

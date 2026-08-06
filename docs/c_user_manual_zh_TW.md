@@ -30,9 +30,9 @@
 - 四麥克風 archive：`pipelines/4ch_pipelines` 的 config-keyed build directory
   內的 `libaudio_pipeline_4ch.a`
 
-`pipelines/PLAN_audio_pipeline_api.md` 是 API 實作前的歷史設計草案，
-不是可依賴的介面。已實作的 function、descriptor version、ownership 與
-錯誤行為，mono 以 `audio_pipeline.h`、四麥克風以
+已退役的 pipeline API 設計草案不是可依賴的介面；需要追溯時請從 Git
+history 取得。已實作的 function、descriptor version、ownership 與錯誤
+行為，mono 以 `audio_pipeline.h`、四麥克風以
 `4ch_pipelines/4aec_nr_res.h` 為準。
 
 嵌入產品時優先使用 `AudioPipeline*`：桌面／服務端可用
@@ -560,6 +560,6 @@ Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`
 | 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`，不要以 NR gain 驅動 CNG |
 | 不同檔案結果互相影響 | state 未 reset | 每個獨立 stream reset 或重建全部 instance |
 | 尾端樣本變短 | CLI 只處理完整 hop | 上層先 padding，並在輸出後裁回原長度 |
-| 想使用 `AudioPipeline*` | 已實作（review F20）| 見 `pipelines/audio_pipeline.h` + `pipelines/README.md`「Board Integration」；本手冊 wrapper 仍可用於未過渡的呼叫端 |
+| 想使用 `AudioPipeline*` | 已實作 | 見 `pipelines/audio_pipeline.h` + `pipelines/README.md`「Board Integration」；本手冊 wrapper 仍可用於未過渡的呼叫端 |
 
 定位問題時建議依序比較：`--aec-only`、完整 production、`--no-cng`、`--legacy-amin`，再用 `DUMP_CTX` 檢查 `E(f)`、`G_res`、`R²` 與 `G_nr`。

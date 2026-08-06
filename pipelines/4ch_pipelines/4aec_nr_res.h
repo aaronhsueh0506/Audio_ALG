@@ -67,37 +67,10 @@ extern "C" {
  * ========================================================================== */
 
 #define FOUR_AEC_NR_RES_DESCRIPTOR_VERSION 1u
-/* v2 removes unused fused echo/far buffers and adds one residual scratch
- * vector for the SIMD post-beam projection.
- * v3 (2026-08-03) removes the delay_capture/delay_render hop-sized scratch
- * pair: the shared delay matcher's 48kHz anti-alias + decimation moved
- * inside DelayAec3 itself (delay_aec3_init() now takes the real native
- * sample_rate), so this wrapper no longer needs its own external
- * stride-pick buffers. carve_working_buffers() now carves 4 hop-sized
- * buffers instead of 6.
- * v4 (2026-08-04) removes the per-lane error/echo/far/near/r2/comfort_noise
- * snapshot-copy buffers: FourAecLaneSnapshot's 6 buffer fields now alias
- * each lane's own AecResContext output directly (borrowed via
- * bind_lane_view(), formerly snapshot_context()) instead of being
- * pool-carved and memcpy'd every hop. carve_working_buffers() no longer
- * calls the removed carve_lane_snapshot().
- * v5 (2026-08-05) removes nr_gain: mmse_lsa_process_gain() is now called
- * with gain_out=NULL and its result is read via mmse_lsa_get_gain() instead,
- * matching the mono pipeline's same-day layout bump.
- * v6 (2026-08-05) shrinks FourAecLaneSnapshot: erle_factor/divergence/
- * erl_estimate had zero readers anywhere in the tree and are removed.
- * FourAecLaneSnapshot is embedded (not pointed-to) in FourAecNrRes's
- * snapshots[FOUR_AEC_NR_RES_CHANNELS] array, so this shrinks
- * sizeof(FourAecNrRes) itself -- the "self" carve, not a separate
- * pool-carved buffer -- which is why it needs its own bump despite not
- * touching the build_flags_hash token list.
- * v7 (2026-08-05, Group 5) removes lane_out: every lane's per-hop call
- * switched from aec_process() to the new aec_process_context() (lib/aec),
- * which has no `out` parameter -- lane_out existed purely to satisfy
- * aec_process()'s required out buffer and was never read afterward (only
- * context.formed_hop was, via aec_get_res_context()). carve_working_buffers()
- * now carves 3 hop-sized buffers instead of 4; build_flags_hash's "hop4"
- * token is now "hop3". */
+/* Current layout: three hop-sized working buffers. Per-lane RES spectra are
+ * borrowed from each AEC instance and are valid only until that lane is
+ * processed or reset again. Query a fresh descriptor for every build; do not
+ * persist or synthesize one from this version number. */
 #define FOUR_AEC_NR_RES_LAYOUT_VERSION 7u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u

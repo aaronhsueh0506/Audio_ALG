@@ -1,4 +1,8 @@
-# Audio DSP library family — internal reference
+# Audio DSP library family — internal reference (historical)
+
+> Snapshot from 2026-08-03. Current public APIs and build commands live in
+> each component README and header; resolved findings in this snapshot are not
+> current setup instructions.
 
 Scope: `audio_common`, `AEC`, `NR`, `Audio_ALG/pipelines` under `SE/`. Written from the code as it stands as of 2026-08-03 (dated comments below are the *files'* own dates, not claims about when this doc was written).
 

@@ -18,4 +18,4 @@ make test-simd
 make SIMD=0 test
 ```
 
-Architecture/paper notes are retained in `GTCRN_Analysis.md`.
+Architecture/paper notes are retained in `docs/architecture_notes.md`.

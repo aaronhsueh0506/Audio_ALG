@@ -141,7 +141,10 @@ def main(args):
             far_erb=far_erb, far_spec=far_feat,
         )
 
-    enhanced = istft(output.enhanced.transpose(-2, -1), grid, length=length)
+    # normalized=True mirrors _normalized_stft() above; without it the output
+    # is silently attenuated by 1/sqrt(n_fft).
+    enhanced = istft(output.enhanced.transpose(-2, -1), grid, length=length,
+                     normalized=True)
     sf.write(args.out_wav, enhanced.squeeze(0).cpu().numpy(), grid.sr, subtype='FLOAT')
     print(f"wrote {args.out_wav} ({length / grid.sr:.2f}s @ {grid.sr} Hz)")
 

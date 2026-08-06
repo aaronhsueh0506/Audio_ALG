@@ -42,10 +42,10 @@ near-end noise too). Compare _aec_res vs _aec_nr_res vs _aec_nr_res_unmasked.
 
 Usage:
     cd Audio_ALG
-    python3 pipelines/compare_res_vs_nr.py input_3ch.wav --dnsmos
-    python3 pipelines/compare_res_vs_nr.py input.wav --out-prefix /tmp/cmp --preset balanced
-    python3 pipelines/compare_res_vs_nr.py input.wav --ne-floor 0.4 --ne-gate both --nr-preset balanced
-    python3 pipelines/compare_res_vs_nr.py input.wav --cng-ab --dnsmos   # A/B comfort noise on vs off
+    python3 pipelines/tools/compare_res_vs_nr.py input_3ch.wav --dnsmos
+    python3 pipelines/tools/compare_res_vs_nr.py input.wav --out-prefix /tmp/cmp --preset balanced
+    python3 pipelines/tools/compare_res_vs_nr.py input.wav --ne-floor 0.4 --ne-gate both --nr-preset balanced
+    python3 pipelines/tools/compare_res_vs_nr.py input.wav --cng-ab --dnsmos   # A/B comfort noise on vs off
 
 Note: uses whatever AEC is checked out in lib/aec. To test the v3.24.0 round-robin
 AEC, make sure lib/aec is at the static-memory tip (495566d) / your merged branch.
@@ -58,7 +58,7 @@ import numpy as np
 import soundfile as sf
 
 # Match aec_nr_pipeline's import wiring (lib.* + pipelines.* + the AEC package).
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)
 sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python'))
 

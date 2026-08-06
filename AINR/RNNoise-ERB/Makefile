@@ -49,6 +49,7 @@ else
 SIMD_CFLAGS :=
 endif
 CFLAGS = -O2 -Wall -Wextra
+CFLAGS += -I.
 CFLAGS += $(EXTRA_CFLAGS)
 CFLAGS += $(SIMD_CFLAGS)
 
@@ -272,20 +273,20 @@ test-calibration:
 	@echo "== normaliser-init calibration method (shared) =="
 	$(PYTHON) ../tests/test_norm_init_calibration.py
 
-$(BUILD_DIR)/test_rnnoise_tables: test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
-	$(CC) $(CFLAGS) -o $@ test_rnnoise_tables.c -lm
+$(BUILD_DIR)/test_rnnoise_tables: test/test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ test/test_rnnoise_tables.c -lm
 
-$(BUILD_DIR)/test_rnnoise_tables_portable: test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
-	$(CC) $(CFLAGS) -DRNN_TABLES_PORTABLE -o $@ test_rnnoise_tables.c -lm
+$(BUILD_DIR)/test_rnnoise_tables_portable: test/test_rnnoise_tables.c rnnoise_tables_gen.h process.h | _cfg_guard
+	$(CC) $(CFLAGS) -DRNN_TABLES_PORTABLE -o $@ test/test_rnnoise_tables.c -lm
 
-$(BUILD_DIR)/test_rnnoise_features: test_rnnoise_features.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
-	$(CC) $(CFLAGS) -o $@ test_rnnoise_features.c process.c -lm
+$(BUILD_DIR)/test_rnnoise_features: test/test_rnnoise_features.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ test/test_rnnoise_features.c process.c -lm
 
-$(BUILD_DIR)/test_rnnoise_simd_auto: test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
-	$(CC) $(CFLAGS) -o $@ test_rnnoise_simd.c process.c -lm
+$(BUILD_DIR)/test_rnnoise_simd_auto: test/test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ test/test_rnnoise_simd.c process.c -lm
 
-$(BUILD_DIR)/test_rnnoise_simd_scalar: test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
-	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR -o $@ test_rnnoise_simd.c process.c -lm
+$(BUILD_DIR)/test_rnnoise_simd_scalar: test/test_rnnoise_simd.c process.c process.h rnnoise_tables_gen.h | _cfg_guard
+	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR -o $@ test/test_rnnoise_simd.c process.c -lm
 
 clean:
 	rm -rf build

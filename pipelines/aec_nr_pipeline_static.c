@@ -1,7 +1,7 @@
 /**
  * aec_nr_pipeline_static.c — AEC(linear) -> echo-aware NR -> RES  (Version B: static memory)
  *
- * Thin CLI shell over pipelines/audio_pipeline.h (review F20). All
+ * Thin CLI shell over pipelines/audio_pipeline.h. All
  * pool-sizing/carving/per-hop-processing logic that used to live here as
  * file-local `static` functions (`pipeline_pool_size`, `pipeline_build`,
  * `pipeline_destroy`, and the processing while-loop body inlined in
@@ -119,7 +119,7 @@ static const char* backend_id_name(uint32_t backend_id) {
 
 /* --print-mem-size diagnostic table. Backed by audio_pipeline_get_mem_breakdown
  * (per-module AEC/FFT/NR/pipeline-buffer split) + audio_pipeline_get_mem_requirements
- * (the descriptor V2 struct, review B06: total bytes incl. the AudioPipeline
+ * (the descriptor V2 struct: total bytes incl. the AudioPipeline
  * control block itself, descriptor_version, layout_version, backend_id,
  * build_flags_hash, alignment). Same table shape as the pre-F20 static CLI,
  * plus the descriptor fields the old bare size_t couldn't carry. */

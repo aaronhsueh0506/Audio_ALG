@@ -108,9 +108,9 @@ README inside the corresponding model directory.
 - [Frequency-domain pipeline design](docs/freq_domain_pipeline_design.md)
 - [AIAEC current candidate matrix](docs/ai_aec_candidate_matrix.md)
 - [Development and submodule workflow](docs/development.md)
-- Dated audits (historical structural sign-offs, not current reference — see
-  [docs/README.md](docs/README.md#dated-audits)): [AIAEC / 4-channel /
-  signal-grid audit](docs/aiaec_4ch_signal_grid_review_2026_07_30.md)
+- Dated audits are historical structural sign-offs, not current references;
+  retired audits remain recoverable from Git history. See
+  [docs/README.md](docs/README.md#dated-audits).
 
 ## Repository structure
 
@@ -122,7 +122,7 @@ Audio_ALG/
 ├── lib/
 │   ├── aec/             # AEC submodule
 │   └── nr/              # NR submodule
-├── pipelines/           # conventional mono and 4-channel integration
+├── pipelines/           # conventional integration; tests/ and offline tools/ are separated
 ├── scripts/             # repository helpers
 └── shared/              # shared utilities
 ```

@@ -425,6 +425,13 @@ both. It checks the existing `meta.json` (if any) against the CURRENT run:
   silently mixed into one dataset.
 - `sr` — the resolved sample rate, checked separately for a clearer error
   message even though it is already covered by `config_hash`.
+- `batch_start_idx` — the existing batch's recorded filename origin is
+  authoritative on resume. A shard first created with `--start-idx 500`
+  therefore resumes at the end of the `000500...` range even when that CLI
+  option is omitted later; explicitly passing a different `--start-idx` is
+  refused rather than silently redefining the batch inventory. Complete
+  indices must be contiguous starting at this recorded origin, so deleting
+  a leading sample is detected just like an interior gap.
 
 **Any mismatch raises and stops the run, with no bypass.** (An earlier
 `--resume-force-contract-mismatch` escape hatch was removed before release:
@@ -469,6 +476,10 @@ one entry per `gen_dataset.py` invocation against this batch
 appended, never overwritten. Without this, the full seed sequence needed
 to reproduce a multiply-resumed batch would be unrecoverable from
 `meta.json` alone once a second `--resume` overwrote the first's record.
+For non-zero-index shards, `n_samples`/`hours` are the actual batch count and
+duration (the same values as `batch_n_samples`/`batch_hours`), while
+`next_sample_idx` is the next filename index. The index offset is never
+misreported as generated audio.
 
 ### 2. Pack the generated dataset, resampling per consumer as needed
 
@@ -483,8 +494,12 @@ python3 pack_dataset.py \
 Use `data_48k/packed.pt` for DeepFilterNet2/DeepFilterNet3 and
 `data_16k/packed.pt` for RNNoise-ERB/GTCRN. Omitting `--target-sr` packs at
 the source WAVs' own rate, requiring every input file to already share one
-native rate — `--target-sr` forces every file to that rate regardless of
-its own native rate, so heterogeneous native rates are fine there.
+native rate. `--target-sr` changes the packed output rate, but a normal
+contract-versioned batch is still required to contain the one native rate
+declared by its `meta.json`; resampling must not hide a foreign-rate WAV
+accidentally copied into that batch. Heterogeneous native rates are accepted
+with `--target-sr` only in the explicitly weaker
+`--allow-unversioned-input` path.
 
 `--input` must be a `pairs/` directory produced by `gen_dataset.py`
 (a `meta.json` one level up, `NNNNNN.wav`+`NNNNNN.json` pairs inside) —
@@ -496,7 +511,9 @@ own escape hatch, off by default):
 
 - **No `meta.json` found, or its `contract_version` doesn't match** — pass
   `--allow-unversioned-input` to pack anyway (e.g. data predating contract
-  versioning). If `meta.json` is missing entirely there is nothing to
+  versioning but already carrying the required per-sample WAV+JSON
+  sidecars; this flag does not invent missing sidecars). If `meta.json` is
+  missing entirely there is nothing to
   record, so the packed payload's `contract_version`/`config_hash` fields
   are `None`; if `meta.json` exists but declares an old/mismatched
   `contract_version`, its actual `contract_version`/`config_hash` values

@@ -6,7 +6,7 @@ two are directly comparable for an "AEC vs AEC+NR" table.
   aec_only : AEC(enable_res=True) full output  — its own AEC3 post-filter RES,
              NO NR stage. The baseline for "what NR adds".
 
-Usage: python3 pipelines/rebench_aec_only.py <out_dir> [limit]
+Usage: python3 pipelines/tools/rebench_aec_only.py <out_dir> [limit]
 Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir>
 """
 import contextlib
@@ -17,13 +17,13 @@ import sys
 import numpy as np
 import soundfile as sf
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 
 from aec import AecConfig, AecMode                              # noqa: E402
 from pipelines.aec_nr_pipeline import run_aec_classic           # noqa: E402
-from pipelines.rebench_sep_vs_classic import (                  # noqa: E402
+from pipelines.tools.rebench_sep_vs_classic import (            # noqa: E402
     CORPUS, SCENARIOS, SR, FL,
 )
 

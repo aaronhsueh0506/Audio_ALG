@@ -153,8 +153,8 @@ SPATIAL_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(SPATIAL_COMMON_LIB))))
 endif
 
 SRCS := 4aec_nr_res.c audio_pipeline_4ch.c audio_pipeline_4ch_raw.c \
-        4aec_nr_res_static.c audio_pipeline_4ch_static.c test_4aec_nr_res.c \
-        test_spatial_third_party.c test_audio_pipeline_4ch.c
+        4aec_nr_res_static.c audio_pipeline_4ch_static.c tests/test_4aec_nr_res.c \
+        tests/test_spatial_third_party.c tests/test_audio_pipeline_4ch.c
 CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SPATIAL_PRODUCER_SIG=$(SPATIAL_PRODUCER_SIG) SRCS=$(sort $(SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
@@ -203,13 +203,13 @@ $(OBJ_DIR)/4aec_nr_res_static.o: 4aec_nr_res_static.c 4aec_nr_res.h | _cfg_guard
 $(OBJ_DIR)/audio_pipeline_4ch_static.o: audio_pipeline_4ch_static.c audio_pipeline_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_4aec_nr_res.o: test_4aec_nr_res.c 4aec_nr_res.h | _cfg_guard
+$(OBJ_DIR)/test_4aec_nr_res.o: tests/test_4aec_nr_res.c 4aec_nr_res.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_spatial_third_party.o: test_spatial_third_party.c | _cfg_guard
+$(OBJ_DIR)/test_spatial_third_party.o: tests/test_spatial_third_party.c | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_audio_pipeline_4ch.o: test_audio_pipeline_4ch.c audio_pipeline_4ch.h | _cfg_guard
+$(OBJ_DIR)/test_audio_pipeline_4ch.o: tests/test_audio_pipeline_4ch.c audio_pipeline_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(PIPELINE_LIB): $(PIPELINE_OBJS) | _cfg_guard

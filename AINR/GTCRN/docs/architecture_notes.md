@@ -1,4 +1,4 @@
-# GTCRN 論文分析與 DeepFilterNet 比較
+# GTCRN architecture and paper notes
 
 > **論文**: GTCRN: A Speech Enhancement Model Requiring Ultralow Computational Resources (ICASSP 2024)
 >

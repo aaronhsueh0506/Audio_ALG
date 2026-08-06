@@ -255,8 +255,69 @@ data_aec/
 The six trainers read `packed/all` and create the deterministic random chunk
 split from `[data] val_fraction` and the training seed.
 
-To refresh the PBFDKF `linear_error` channel after changing its
-implementation, without repeating acoustic mixing:
+The contract records the AEC's identity three ways, and they are used for
+different things:
+
+| Field | Scope | Used by |
+|---|---|---|
+| `aec_commit`, `aec_source_hash` | raw-text **provenance** | `fingerprint()` → `--resume`, packing, integrity |
+| `aec_behavior_hash` | normalized-AST **behaviour** | `require_linear_aec_contract` → materialization + inference |
+| `behavior_hash_schema` | which canonicalizer produced the hash | compared alongside it, so a serializer change reports itself by name |
+
+`aec_behavior_hash` hashes the parsed AST with docstrings stripped, so a comment
+reflow, docstring reword or reindent under `lib/aec/python` does **not**
+invalidate existing shards or checkpoints, while any change to an expression,
+constant or control-flow path does — and fails closed.
+
+**It must not depend on the interpreter, and getting that right needed a custom
+serializer.** The first implementation used `ast.dump()`. Python 3.13 changed
+`ast.dump` to omit fields equal to their default, so the same 48 files digest to
+`89b866cd` under 3.9 and `402acc1a` under 3.14 with no code difference at all —
+a dataset generated under one interpreter would be refused by training under
+another, and a checkpoint would become unloadable on a Python upgrade alone.
+`aec_behavior_hash.py` therefore canonicalizes the tree itself (`_canon_ast`),
+applying that same "drop empty fields" rule uniformly on every version. The rule
+also absorbs fields that simply do not exist on older versions — `type_params`
+(PEP 695) is absent on 3.9 and `[]` on 3.14, so both emit nothing — while a
+field that is genuinely *used* is non-empty, is emitted, and does change the
+hash. Nothing is dropped silently.
+
+That module is deliberately free of third-party imports, so the parity test can
+run it under every CPython on the machine.
+`tests/test_linear_aec_behavior_hash.py` asserts they all agree, and runs a
+control that reproduces the old `ast.dump` path and asserts it *disagrees* — the
+stability claim would otherwise pass vacuously on a single-interpreter machine.
+
+It is a hash rather than a hand-maintained `behavior_version` on purpose: every
+other compared field is either a `__post_init__` literal or echoed out of the
+recorded contract by both call sites, so a version integer would be the same
+constant on both sides and could never differ. That tautology shipped once
+(2026-08-06) and `test_contract_comparison_is_not_vacuous` now guards it.
+
+Scope: `aec_behavior_hash` covers `aec.py` plus everything under `modules/` —
+the code `LinearAecProcessor` can actually reach. `diag/`, `tests/` and the
+bench/eval tooling are excluded, and the module-level `__version__` assignment
+is stripped before hashing, so editing a test, a golden generator or the release
+version cannot strand a checkpoint. `aec_source_hash` still covers all 87 files.
+
+**v2 → v3 has no automatic migration, deliberately.** A v2 contract records only
+a raw-text source hash, so once `lib/aec` has moved on there is no way to
+recover what the producing build's *behaviour* hash was — stamping the current
+one would assert a compatibility nobody verified. Re-stamp a dataset by
+re-running `rematerialize_linear_aec.py` (it re-runs PBFDKF and rewrites the
+`linear_error` channel, which is the honest thing to do). A v2 **checkpoint**
+cannot be repaired and must be retrained against a v3 corpus.
+
+`behavior_hash_schema` is folded into the digest as well as compared, so the two
+can never disagree. Bump it (`canon-ast-1` → `canon-ast-2`) whenever `_canon_ast`
+changes what it emits for unchanged input; a mismatch then names the serializer
+instead of looking like an AEC code change. No stamped artifact has ever carried
+a v3 contract without this field, so there is no migration path for one.
+
+The check is conservative: a pure refactor (renaming a local, reordering
+independent statements) also changes the behaviour hash. Refusing to load is the
+safe direction — rematerialize rather than loosening the check. Refresh the
+channel with the command below, which avoids repeating acoustic mixing:
 
 ```bash
 python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \

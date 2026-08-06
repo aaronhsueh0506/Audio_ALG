@@ -1,5 +1,5 @@
 /**
- * test_audio_pipeline.c — acceptance tests for pipelines/audio_pipeline.h.
+ * tests/test_audio_pipeline.c — acceptance tests for pipelines/audio_pipeline.h.
  *
  * Not a DSP-quality test (no AECMOS, no reference WAVs) — a contract test
  * for the library API surface itself: does the pool-first path behave
@@ -44,7 +44,7 @@
  *   cc -O2 -std=gnu99 -I../lib/aec/c_impl/include -I../lib/aec/c_impl/example \
  *      -I../lib/nr/c_impl/include -I../../audio_common/include \
  *      -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" \
- *      test_audio_pipeline.c audio_pipeline.c \
+ *      tests/test_audio_pipeline.c audio_pipeline.c \
  *      ../lib/aec/c_impl/bin/libaec.a ../lib/nr/c_impl/bin/libmmse_lsa.a \
  *      ../../audio_common/bin/kiss/libaudio_common.a -lm -o /tmp/tap && /tmp/tap
  *

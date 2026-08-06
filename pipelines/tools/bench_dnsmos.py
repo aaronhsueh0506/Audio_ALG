@@ -2,7 +2,7 @@
 """DNSMOS bench analyzer — score enhanced outputs (P.835 SIG/BAK/OVRL + P.808).
 
 Usage:
-    python3 pipelines/bench_dnsmos.py <output_dir> <result_dir>
+    python3 pipelines/tools/bench_dnsmos.py <output_dir> <result_dir>
 
 Walks <output_dir> for `<stem>_<scenario>[_with_movement]_ours.wav` files,
 buckets them exactly like bench_aecmos.py (FS_static / FS_movement / DT_static /

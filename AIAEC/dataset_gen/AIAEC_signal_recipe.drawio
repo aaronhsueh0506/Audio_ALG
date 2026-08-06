@@ -1,0 +1,154 @@
+<mxfile host="65bd71144e">
+  <diagram name="AIAEC 混音流程" id="diagram1">
+    <mxGraphModel dx="1400" dy="900" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1700" pageHeight="2200" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+<mxCell id="n_FAR" value="遠端語者語音&amp;#10;(語料庫)" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;verticalAlign=middle;" vertex="1" parent="1">
+  <mxGeometry x="60.0" y="20.0" width="220.0" height="70.0" as="geometry" />
+</mxCell>
+<mxCell id="n_NEAR" value="近端語者語音&amp;#10;(語料庫)" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;verticalAlign=middle;" vertex="1" parent="1">
+  <mxGeometry x="650.0" y="20.0" width="220.0" height="70.0" as="geometry" />
+</mxCell>
+<mxCell id="n_NOISE" value="環境噪音&amp;#10;(語料庫)" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;verticalAlign=middle;" vertex="1" parent="1">
+  <mxGeometry x="1290.0" y="20.0" width="210.0" height="70.0" as="geometry" />
+</mxCell>
+<mxCell id="n_FARLEVEL" value="調整到隨機 level&amp;#10;→ 遠端參考訊號 X" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="60.0" y="130.0" width="220.0" height="64.0" as="geometry" />
+</mxCell>
+<mxCell id="n_NEARRIR" value="近端 RIR&amp;#10;(語料庫)" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;verticalAlign=middle;" vertex="1" parent="1">
+  <mxGeometry x="950.0" y="130.0" width="180.0" height="64.0" as="geometry" />
+</mxCell>
+<mxCell id="n_FARPLAYED" value="喇叭播放路徑&amp;#10;(非線性失真 + EQ)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="60.0" y="250.0" width="220.0" height="72.0" as="geometry" />
+</mxCell>
+<mxCell id="n_ECHORIR" value="迴音路徑 RIR&amp;#10;(語料庫，通常與&amp;#10;近端 RIR 不同檔)" style="shape=cylinder;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;verticalAlign=middle;" vertex="1" parent="1">
+  <mxGeometry x="320.0" y="250.0" width="180.0" height="72.0" as="geometry" />
+</mxCell>
+<mxCell id="n_NEARCONV" value="套近端 RIR&amp;#10;(直接音+早期反射 → 「S_early」&amp;#10;完整殘響 → 「近端語音」)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="650.0" y="250.0" width="360.0" height="110.0" as="geometry" />
+</mxCell>
+<mxCell id="n_ECHOCONV" value="套迴音路徑 RIR → echo" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="60.0" y="390.0" width="440.0" height="64.0" as="geometry" />
+</mxCell>
+<mxCell id="n_ERL" value="依抽出的 ERL&amp;#10;縮放 echo 的音量" style="triangle;whiteSpace=wrap;html=1;direction=south;fillColor=#FFFFFF;strokeColor=#000000;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="60.0" y="500.0" width="220.0" height="115.0" as="geometry" />
+</mxCell>
+<mxCell id="n_SER" value="依抽出的 SER&amp;#10;縮放近端語音的音量" style="triangle;whiteSpace=wrap;html=1;direction=south;fillColor=#FFFFFF;strokeColor=#000000;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="650.0" y="500.0" width="250.0" height="115.0" as="geometry" />
+</mxCell>
+<mxCell id="n_SNR" value="依抽出的 SNR&amp;#10;縮放噪音的音量" style="triangle;whiteSpace=wrap;html=1;direction=south;fillColor=#FFFFFF;strokeColor=#000000;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="1290.0" y="500.0" width="220.0" height="115.0" as="geometry" />
+</mxCell>
+<mxCell id="n_OUT_SEARLY" value="輸出:早期反射 S_early" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#000000;strokeColor=#000000;fontColor=#FFFFFF;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="1080.0" y="390.0" width="220.0" height="56.0" as="geometry" />
+</mxCell>
+<mxCell id="n_SUM" value="+" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#000000;fontSize=26;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="735.0" y="660.0" width="72.0" height="72.0" as="geometry" />
+</mxCell>
+<mxCell id="n_PEAKGUARD" value="Peak guard&amp;#10;(同一個 scale factor)" style="triangle;whiteSpace=wrap;html=1;direction=south;fillColor=#FFFFFF;strokeColor=#000000;fontSize=12;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="700.0" y="790.0" width="200.0" height="95.0" as="geometry" />
+</mxCell>
+<mxCell id="n_CLIPAGC" value="Clipping / AGC 模擬&amp;#10;(機率套用)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="690.0" y="930.0" width="220.0" height="68.0" as="geometry" />
+</mxCell>
+<mxCell id="n_XJUNCTION" value="" style="ellipse;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#000000;fontSize=26;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="40.0" y="1075.0" width="24.0" height="24.0" as="geometry" />
+</mxCell>
+<mxCell id="n_AECENGINE" value="AEC engine&amp;#10;(拿掉 echo，估計&amp;#10;殘留 linear error)" style="rounded=0;whiteSpace=wrap;html=1;fillColor=#FFFFFF;strokeColor=#000000;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="400.0" y="1075.0" width="440.0" height="95.0" as="geometry" />
+</mxCell>
+<mxCell id="n_OUT_X" value="輸出:遠端參考 X" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#000000;strokeColor=#000000;fontColor=#FFFFFF;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="60.0" y="1170.0" width="210.0" height="56.0" as="geometry" />
+</mxCell>
+<mxCell id="n_OUT_S" value="輸出:近端語音 S" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#000000;strokeColor=#000000;fontColor=#FFFFFF;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="650.0" y="1170.0" width="210.0" height="56.0" as="geometry" />
+</mxCell>
+<mxCell id="n_OUT_Y" value="輸出:麥克風訊號 Y" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#000000;strokeColor=#000000;fontColor=#FFFFFF;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="690.0" y="1250.0" width="220.0" height="56.0" as="geometry" />
+</mxCell>
+<mxCell id="n_OUT_E" value="輸出:線性誤差 E (linear_error)" style="rounded=1;arcSize=50;whiteSpace=wrap;html=1;fillColor=#000000;strokeColor=#000000;fontColor=#FFFFFF;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+  <mxGeometry x="460.0" y="1340.0" width="420.0" height="56.0" as="geometry" />
+</mxCell>
+<mxCell id="e0" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_FAR" target="n_FARLEVEL">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e1" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_FARLEVEL" target="n_FARPLAYED">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e2" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_FARPLAYED" target="n_ECHOCONV">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e3" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_ECHORIR" target="n_ECHOCONV">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e4" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_ECHOCONV" target="n_ERL">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e5" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;dashed=1;dashPattern=8 8;" edge="1" parent="1" source="n_FARLEVEL" target="n_ERL">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e6" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_NEAR" target="n_NEARCONV">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e7" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_NEARRIR" target="n_NEARCONV">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e8" value="近端語音" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_NEARCONV" target="n_SER">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e9" value="S_early" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_NEARCONV" target="n_OUT_SEARLY">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e10" value="echo" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_ERL" target="n_SUM">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e11" value="echo 的 level" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;dashed=1;dashPattern=8 8;" edge="1" parent="1" source="n_ERL" target="n_SER">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e12" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_SER" target="n_SUM">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e13" value="同一個 SER scale factor" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;dashed=1;dashPattern=8 8;" edge="1" parent="1" source="n_SER" target="n_OUT_SEARLY">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e14" value="近端語音的 level" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;dashed=1;dashPattern=8 8;" edge="1" parent="1" source="n_SER" target="n_SNR">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e15" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_NOISE" target="n_SNR">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e16" value="噪音" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_SNR" target="n_SUM">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e17" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_SUM" target="n_PEAKGUARD">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e18" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_PEAKGUARD" target="n_CLIPAGC">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e19" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_CLIPAGC" target="n_OUT_Y">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e20" value="Y" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_CLIPAGC" target="n_AECENGINE">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e21" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=none;endFill=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_FARLEVEL" target="n_XJUNCTION">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e22" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_XJUNCTION" target="n_OUT_X">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e23" value="X" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_XJUNCTION" target="n_AECENGINE">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e24" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_SER" target="n_OUT_S">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+<mxCell id="e25" value="" style="edgeStyle=orthogonalEdgeStyle;rounded=0;html=1;strokeColor=#000000;endArrow=block;endFill=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;" edge="1" parent="1" source="n_AECENGINE" target="n_OUT_E">
+  <mxGeometry relative="1" as="geometry" />
+</mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

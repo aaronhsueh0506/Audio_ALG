@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import dataclasses
 import configparser
-import functools
 import hashlib
 import json
 import os
@@ -32,21 +31,30 @@ if _AEC_PYTHON not in sys.path:
 
 from aec import AEC, AecConfig, AecMode, AecPreset  # noqa: E402
 
+# Behaviour/provenance hashing lives in a dependency-free sibling so the
+# cross-CPython parity test can import it under interpreters without torch.
+from .aec_behavior_hash import (  # noqa: E402
+    BEHAVIOR_HASH_SCHEMA,
+    aec_python_behavior_hash,
+    aec_python_source_hash,
+)
 
-LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v2"
-# v1 -> v2: linear_error was materialized from AEC.process()'s own return
-# value, which is the output LIMITER's target -- final_output *= limiter_gain
-# runs unconditionally (regardless of enable_res/enable_cng) and produces a
-# real, audible hop-boundary discontinuity whenever the limiter's smoothed
-# gain changes between hops (attack alpha=0.3 / release alpha=0.8), which
-# shows up as a vertical broadband line in ch5's spectrogram. v2 instead
-# reads AEC.get_formed_output() (config.return_formed_output=True): the AEC3
-# UseRefinedOutput-selected/crossfaded, WOLA-formed linear residual, captured
-# BEFORE the limiter multiply -- shadow-selection-correct (unlike the
-# limiter-affected value, which is also unconditionally main-filter-only) and
-# free of RES/CNG/SuppressionGain cost (unlike return_res_context=True, which
-# would also compute all of that unused work). Old (v1) linear_error/ch5 data
-# must be regenerated, not mixed with v2 output in the same packed dataset.
+
+LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v3"
+# v2 uses get_formed_output(): the shadow/main-selected, crossfaded,
+# WOLA-formed residual. It keeps RES/CNG disabled and is independent of any
+# product-level output dynamics applied after the AEC chain.
+# v1 data was materialized from a different seam. Old (v1) linear_error/ch5
+# data must be regenerated, not mixed with later output in the same packed
+# dataset.
+# v2 -> v3: split provenance from compatibility. v2 compared the raw-text
+# `aec_source_hash`, so reflowing a comment in lib/aec invalidated
+# byte-identical shards AND refused already-trained checkpoints that no
+# rematerialization could repair. v3 adds `aec_behavior_hash` (normalized AST,
+# comment/format insensitive) as the compatibility condition and demotes
+# `aec_commit`/`aec_source_hash` to provenance. The signal contract itself is
+# unchanged, so v2 DATA is still valid -- but v2 contract dicts lack the new
+# field and are rejected by from_dict; rerun the contract stamp, not the audio.
 
 # The linear-AEC frontend is a frozen, versioned contract: its (frame_size,
 # hop_size) per sample rate is a deliberate, pinned choice of this dataset,
@@ -76,25 +84,6 @@ def _git_commit(path: str) -> str:
     return "unknown"
 
 
-@functools.lru_cache(maxsize=1)
-def aec_python_source_hash() -> str:
-    """Hash the actual Python AEC sources, including uncommitted edits."""
-    digest = hashlib.sha256()
-    paths = []
-    for root, _dirs, files in os.walk(_AEC_PYTHON):
-        for name in files:
-            if name.endswith(".py"):
-                paths.append(os.path.join(root, name))
-    for path in sorted(paths):
-        rel = os.path.relpath(path, _AEC_PYTHON).replace(os.sep, "/")
-        digest.update(rel.encode("utf-8"))
-        digest.update(b"\0")
-        with open(path, "rb") as handle:
-            digest.update(handle.read())
-        digest.update(b"\0")
-    return digest.hexdigest()
-
-
 @dataclasses.dataclass(frozen=True)
 class LinearAecContract:
     version: str
@@ -111,9 +100,18 @@ class LinearAecContract:
     enable_delay_est: bool
     enable_highpass: bool
     output_seam: str
+    # Retained in the v2 serialized contract for backward compatibility.
     limiter: bool
+    # Provenance: exactly which bytes produced this data. Not compared for
+    # compatibility -- see aec_python_source_hash()/aec_python_behavior_hash().
     aec_commit: str
     aec_source_hash: str
+    # Compatibility: the AEC's CODE identity, insensitive to comments/format.
+    aec_behavior_hash: str
+    # Which canonicalization rule produced aec_behavior_hash. Compared so that
+    # changing the serializer reports itself by name instead of masquerading as
+    # an AEC code change. Also folded into the digest, so the two agree.
+    behavior_hash_schema: str = BEHAVIOR_HASH_SCHEMA
 
     def __post_init__(self) -> None:
         supported = FROZEN_FRAME_HOP_BY_SR
@@ -159,7 +157,27 @@ class LinearAecContract:
     def as_dict(self) -> Dict:
         return dataclasses.asdict(self)
 
+    def compatibility_dict(self) -> Dict:
+        """Fields that decide whether recorded data may be used with this build.
+
+        Drops ONLY ``aec_commit``/``aec_source_hash`` -- raw-text provenance
+        that changes on a comment reflow. ``aec_behavior_hash`` stays, and is
+        the one field carrying the AEC's actual code identity: without it this
+        dict is fully determined by the four values both call sites echo out of
+        the recorded contract plus eleven ``__post_init__`` literals, i.e. a
+        tautology. Do not remove it.
+        """
+        value = self.as_dict()
+        value.pop("aec_commit")
+        value.pop("aec_source_hash")
+        return value
+
     def fingerprint(self) -> str:
+        """Integrity hash of the complete recorded contract and provenance.
+
+        Includes provenance on purpose: resume/repack must notice that a
+        different build produced a shard even when behaviour is unchanged.
+        """
         payload = json.dumps(
             self.as_dict(), sort_keys=True, separators=(",", ":")
         ).encode("utf-8")
@@ -172,6 +190,27 @@ class LinearAecContract:
         expected = {field.name for field in dataclasses.fields(cls)}
         missing = sorted(expected - set(value))
         extra = sorted(set(value) - expected)
+        # A v2 contract lacks both v3 compatibility fields. `behavior_hash_schema`
+        # alone missing is NOT v2 -- it is a v3 dict written before the schema
+        # field existed, which never left this repo (no stamped artifact has ever
+        # carried a v3 contract), so it falls through to the generic error rather
+        # than getting a migration path built for a state that cannot exist.
+        if "aec_behavior_hash" in missing and not extra and set(missing) <= {
+                "aec_behavior_hash", "behavior_hash_schema"}:
+            # v2 contract. There is deliberately NO automatic migration: a v2
+            # contract records only a raw-text source hash, and once lib/aec has
+            # moved on there is no way to recover what the producing build's
+            # BEHAVIOUR hash was, so stamping the current one would assert a
+            # compatibility nobody verified. Shards can be re-stamped by
+            # re-running the materializer; a v2 CHECKPOINT cannot be repaired at
+            # all and must be retrained against a v3 corpus.
+            raise ValueError(
+                "linear_aec contract is v2 (no 'aec_behavior_hash'). v2 -> v3 "
+                "has no safe automatic migration: v2 records only a raw-text "
+                "source hash, so the producing build's behaviour identity is "
+                "unrecoverable. Re-stamp a dataset by re-running "
+                "rematerialize_linear_aec.py; a v2 checkpoint must be retrained."
+            )
         if missing or extra:
             raise ValueError(
                 f"linear_aec contract fields differ: missing={missing}, extra={extra}"
@@ -181,6 +220,17 @@ class LinearAecContract:
             raise ValueError(
                 f"linear_aec contract version={contract.version!r}, expected "
                 f"{LINEAR_AEC_CONTRACT_VERSION!r}"
+            )
+        if contract.behavior_hash_schema != BEHAVIOR_HASH_SCHEMA:
+            # Reported by name here so the far commoner failure -- an actual
+            # lib/aec code change -- is not confused with a serializer change.
+            # The schema is folded into the digest too, so the hashes would also
+            # differ; this check exists only to make the reason legible.
+            raise ValueError(
+                "linear_aec behaviour hash was produced by schema "
+                f"{contract.behavior_hash_schema!r}, this build canonicalizes "
+                f"with {BEHAVIOR_HASH_SCHEMA!r}. The hashes are not comparable; "
+                "re-stamp the dataset by re-running rematerialize_linear_aec.py."
             )
         return contract
 
@@ -209,8 +259,7 @@ def make_linear_aec_config(
         "enable_shadow": True,
         "enable_delay_est": True,
         "enable_highpass": True,
-        # v2 seam: get_formed_output() instead of process()'s own
-        # limiter-multiplied return value -- see LINEAR_AEC_CONTRACT_VERSION.
+        # v2 seam: selected/crossfaded WOLA output, not raw process() output.
         "return_formed_output": True,
     }
     if frame_size is not None:
@@ -251,6 +300,7 @@ def make_linear_aec_contract(
         limiter=False,
         aec_commit=_git_commit(_AEC_ROOT),
         aec_source_hash=aec_python_source_hash(),
+        aec_behavior_hash=aec_python_behavior_hash(),
     )
 
 
@@ -299,10 +349,29 @@ def linear_aec_contract_from_config(
 
 
 def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> None:
+    """Refuse a linear-AEC frontend that differs from the recorded one.
+
+    The comparison MUST retain ``aec_behavior_hash``. Every other compared field
+    is either pinned to a literal by ``__post_init__`` (engine, mode, the
+    enable_* flags, output_seam, limiter, version) or echoed out of the recorded
+    contract by both call sites, which build their ``runtime`` contract from
+    ``contract.sample_rate/preset/frame_size/filter_length``. Drop the hash and
+    the comparison becomes a tautology that cannot fail -- a changed PBFDKF step
+    size, delay tolerance or formed-output crossfade would then feed inference a
+    ``linear_error`` from a different filter than the one the checkpoint was
+    trained on, silently. That regression shipped once (2026-08-06); the
+    ``test_contract_comparison_is_not_vacuous`` test exists to stop it
+    recurring.
+
+    ``aec_commit``/``aec_source_hash`` are deliberately NOT compared here: they
+    are raw-text provenance and would reject byte-identical data over a comment
+    reflow. They remain in ``fingerprint()`` for resume/integrity.
+    """
     got = LinearAecContract.from_dict(actual)
     want = LinearAecContract.from_dict(expected)
-    if got != want:
-        got_dict, want_dict = got.as_dict(), want.as_dict()
+    got_dict = got.compatibility_dict()
+    want_dict = want.compatibility_dict()
+    if got_dict != want_dict:
         mismatches = [
             f"{key}: got {got_dict[key]!r}, expected {want_dict[key]!r}"
             for key in want_dict
@@ -360,11 +429,8 @@ class LinearAecProcessor:
         error = np.empty_like(microphone, dtype=np.float32)
         for start in range(0, microphone.size, self.hop_size):
             stop = start + self.hop_size
-            # process()'s own return value is the output-limiter's target
-            # (final_output *= limiter_gain, unconditional) -- not read here.
-            # get_formed_output() (config.return_formed_output=True, set in
-            # make_linear_aec_config()) is the AEC3-selected/crossfaded,
-            # WOLA-formed linear residual captured before that limiter runs.
+            # The model contract consumes the selected/crossfaded WOLA seam,
+            # not process()'s raw main-filter return.
             self._engine.process(
                 np.ascontiguousarray(microphone[start:stop]),
                 np.ascontiguousarray(far_end[start:stop]),
@@ -399,9 +465,11 @@ def materialize_linear_error(
 
 
 __all__ = [
+    "BEHAVIOR_HASH_SCHEMA",
     "LINEAR_AEC_CONTRACT_VERSION",
     "LinearAecContract",
     "LinearAecProcessor",
+    "aec_python_behavior_hash",
     "aec_python_source_hash",
     "linear_aec_contract_from_config",
     "make_linear_aec_config",

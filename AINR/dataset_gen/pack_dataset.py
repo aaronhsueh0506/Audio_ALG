@@ -381,7 +381,7 @@ def pack(args):
     for i, path in enumerate(tqdm.tqdm(files, desc="Packing")):
         try:
             audio, sr, clipped = _load_maybe_resampled(path, args.target_sr, resample_kwargs)
-            if audio.shape[0] < 2:
+            if audio.shape[0] != 2:
                 raise ValueError(f"不是 2-channel WAV (got {audio.shape[0]} channel(s))")
             if audio.shape[1] != T:
                 raise ValueError(f"長度不符 (expected {T}, got {audio.shape[1]})")
@@ -502,7 +502,9 @@ if __name__ == '__main__':
     parser.add_argument('--allow-unversioned-input', action='store_true',
                         help='--input 上一層找不到 meta.json，或 '
                              'contract_version 不符時，預設拒絕打包；此旗標'
-                             '明確允許 (例如舊版無 sidecar 的資料)。同時退回'
+                             '明確允許 (例如已有 WAV+JSON sidecar、但'
+                             '尚未建立 contract-versioned meta.json 的舊資料)。'
+                             '注意此旗標不會補建立缺少的 sidecar。同時退回'
                              '舊的、遇壞檔靜默排除+警告的行為 (跳過 fail-'
                              'closed 的 inventory/sample-rate/finite-value '
                              '核對，因為版本不符的 meta.json 無法信任)。')

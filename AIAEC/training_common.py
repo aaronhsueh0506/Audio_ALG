@@ -623,9 +623,11 @@ class LinearAecEngine:
             mic_lane = np.ascontiguousarray(mic[lane, :used], dtype=np.float32)
             far_lane = np.ascontiguousarray(far[lane, :used], dtype=np.float32)
             for start in range(0, used, hop):
-                block = engine.process(mic_lane[start:start + hop],
-                                       far_lane[start:start + hop])
-                error[lane, start:start + hop] = block
+                # Match the offline materializer: use the selected/crossfaded
+                # WOLA seam, not process()'s raw main-filter return.
+                engine.process(mic_lane[start:start + hop],
+                               far_lane[start:start + hop])
+                error[lane, start:start + hop] = engine.get_formed_output()
             if used < n_samples:
                 error[lane, used:] = mic[lane, used:]
         echo_estimate = mic.astype(np.float32) - error

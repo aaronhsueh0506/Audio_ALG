@@ -1,3 +1,4 @@
+/* Scalar/SIMD equivalence test. */
 #include "process.h"
 
 #include <stdint.h>

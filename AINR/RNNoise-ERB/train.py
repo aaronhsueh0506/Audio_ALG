@@ -230,7 +230,7 @@ def read_irm_loss_config(cfg):
     section = 'erb_irm_loss'
     irm_cfg = {
         'factor': cfg.getfloat(section, 'factor', fallback=1.0),
-        'gamma': cfg.getfloat(section, 'gamma', fallback=0.25),
+        'gamma': cfg.getfloat(section, 'gamma', fallback=0.5),
         'energy_floor': cfg.getfloat(section, 'energy_floor', fallback=1e-9),
     }
     if (irm_cfg['factor'] < 0 or not 0 < irm_cfg['gamma'] <= 1 or
@@ -240,7 +240,7 @@ def read_irm_loss_config(cfg):
 
 
 def read_feature_config(cfg, sr, hop_len, n_fft, win_len=None):
-    """Read the dual-input feature contract shared by train/denoise/C."""
+    """Read the ERB plus optional-complex feature contract shared by train/denoise/C."""
     version = cfg.get('feature', 'version', fallback=FEATURE_VERSION)
     if version != FEATURE_VERSION:
         raise ValueError(
@@ -830,7 +830,7 @@ class ErbIrmLoss(nn.Module):
     than a weighting choice.
     """
 
-    def __init__(self, factor=1.0, gamma=0.25, energy_floor=1e-9):
+    def __init__(self, factor=1.0, gamma=0.5, energy_floor=1e-9):
         super().__init__()
         self.factor = factor
         self.gamma = gamma

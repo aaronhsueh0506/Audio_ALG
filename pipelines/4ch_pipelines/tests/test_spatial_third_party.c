@@ -1,5 +1,5 @@
 /**
- * test_spatial_third_party.c — spatial dependency equivalence tests.
+ * tests/test_spatial_third_party.c — spatial dependency equivalence tests.
  *
  * Keeps the third-party SRP/GSC arithmetic outside the 4AEC wrapper tests:
  * dispatch must match scalar PHAT, cached SRP must select the scalar golden

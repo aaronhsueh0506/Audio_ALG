@@ -4,7 +4,7 @@ import sys, os, argparse
 import soundfile as sf
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _ROOT)                                       # lib.* + pipelines.*
 sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python')) # aec + modules
 from lib.aec.python.aec import AEC, AecConfig, AecMode, AecPreset

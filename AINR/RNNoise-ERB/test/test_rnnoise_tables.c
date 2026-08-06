@@ -31,8 +31,8 @@
  * 位元契約」。
  *
  * 建置 (兩個 mode 都要在這台機器上跑過, 都要 PASS):
- *   cc -O2 -ffp-contract=off -Wall -Wextra test_rnnoise_tables.c -lm -o test_rnnoise_tables && ./test_rnnoise_tables
- *   cc -O2 -ffp-contract=off -Wall -Wextra -DRNN_TABLES_PORTABLE test_rnnoise_tables.c -lm -o test_rnnoise_tables_portable && ./test_rnnoise_tables_portable
+ *   cc -O2 -ffp-contract=off -Wall -Wextra -I. test/test_rnnoise_tables.c -lm -o test_rnnoise_tables && ./test_rnnoise_tables
+ *   cc -O2 -ffp-contract=off -Wall -Wextra -I. -DRNN_TABLES_PORTABLE test/test_rnnoise_tables.c -lm -o test_rnnoise_tables_portable && ./test_rnnoise_tables_portable
  * ============================================================ */
 
 #include "process.h"

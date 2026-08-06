@@ -1,5 +1,5 @@
 /**
- * test_audio_pipeline_4ch.c — complete four-channel pipeline tests.
+ * tests/test_audio_pipeline_4ch.c — complete four-channel pipeline tests.
  *
  * Mirrors test_audio_pipeline.c's public-API acceptance style while exercising
  * the additional SRP-PHAT/GSC stage at all three production signal grids.

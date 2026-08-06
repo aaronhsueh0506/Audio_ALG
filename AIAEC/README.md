@@ -28,9 +28,10 @@ are zero-padding-free, 50%-overlap `FFT/window/hop = 512/512/256 @ 16 kHz` and
 grid; the other reconstructed/project variants accept both grids. A model's
 README distinguishes published facts from reconstruction choices.
 
-These are AIAEC model grids, not the conventional `pipelines/` 20 ms / 10 ms
-grid. A model boundary must resample/reframe explicitly; no caller should infer
-compatibility from a shared FFT size alone.
+These are AIAEC model grids, not an implicit alias of a conventional
+`pipelines/` instance. Both surfaces now use zero-padding-free 50%-overlap
+grids, but a model boundary must still validate rate/frame/hop and checkpoint
+contract explicitly; a shared FFT size alone does not establish compatibility.
 
 `dataset_gen/` is the one AIAEC dataset implementation and public import/CLI
 path. It renders complete stateful scenarios, runs the frozen Python PBFDKF
@@ -75,6 +76,9 @@ holds out `val_fraction` at load time with
 `training_common.split_dataset_by_sample`. The checkpoint stores the dataset
 fingerprint, complete train/validation indices, split seed/fraction, and PBFDKF
 contract; resume refuses a different dataset, split, frontend, or signal grid.
+"Different frontend" means a different `aec_behavior_hash` (the AEC's code
+identity); a comment-only edit under `lib/aec/python` moves the recorded
+provenance but not that hash, so it does not strand a checkpoint.
 
 ```bash
 cd AIAEC/Align_CRUSE   # or any of the other five directories

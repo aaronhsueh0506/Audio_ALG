@@ -1,3 +1,5 @@
+"""Tests for external-recording acceptance validation."""
+
 from importlib import import_module
 
 import pytest

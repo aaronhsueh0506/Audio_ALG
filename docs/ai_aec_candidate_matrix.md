@@ -1,8 +1,7 @@
 # AIAEC current candidate matrix
 
-This is the current implementation map. The long research trail that predates
-the `AIAEC/` refactor is preserved in
-[`archive/ai_aec_candidate_matrix_2026_07_30.md`](archive/ai_aec_candidate_matrix_2026_07_30.md).
+This is the current implementation map. Superseded research notes are retained
+in Git history rather than treated as implementation documentation.
 
 ## Decision matrix
 

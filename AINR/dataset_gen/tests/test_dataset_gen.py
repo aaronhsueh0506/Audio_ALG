@@ -1207,6 +1207,94 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
             self.assertEqual(Path(meta_path).read_bytes(), original_meta_bytes)
 
 
+class ResumeShardStartIndexContractTest(unittest.TestCase):
+    """A resumed shard must retain the filename origin recorded by the first
+    invocation; CLI/config defaults from a later invocation cannot redefine
+    its inventory."""
+
+    def test_resume_inherits_recorded_nonzero_start_and_metadata_counts_samples(self):
+        from dataset_gen import gen_dataset as gen_dataset_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, output_dir = _build_real_corpus(tmp)
+            first_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.001,
+                workers=0, resume=False, repair_resume=False,
+                start_idx=500, seed=42, sample_rate=None,
+            )
+            gen_dataset_module.gen_dataset(first_args)
+            first_meta = json.loads(Path(output_dir, 'meta.json').read_text())
+            first_n = first_meta['batch_n_samples']
+            self.assertEqual(first_meta['batch_start_idx'], 500)
+            self.assertEqual(first_meta['n_samples'], first_n)
+            self.assertEqual(first_meta['next_sample_idx'], 500 + first_n)
+            self.assertAlmostEqual(first_meta['hours'], first_meta['batch_hours'])
+
+            # Do not repeat --start-idx: meta.json is the authoritative batch
+            # origin and the config fixture still contains its default 0.
+            resume_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.002,
+                workers=0, resume=True, repair_resume=False,
+                start_idx=None, seed=43, sample_rate=None,
+            )
+            gen_dataset_module.gen_dataset(resume_args)
+            meta = json.loads(Path(output_dir, 'meta.json').read_text())
+            complete, orphan_wavs, orphan_jsons = (
+                gen_dataset_module._list_complete_sample_indices(
+                    os.path.join(output_dir, 'pairs'))
+            )
+            self.assertEqual(meta['batch_start_idx'], 500)
+            self.assertEqual(complete, list(range(500, meta['next_sample_idx'])))
+            self.assertEqual(meta['n_samples'], len(complete))
+            self.assertEqual(meta['batch_n_samples'], len(complete))
+            self.assertEqual(orphan_wavs, [])
+            self.assertEqual(orphan_jsons, [])
+
+    def test_resume_rejects_explicit_conflicting_start_idx(self):
+        from dataset_gen import gen_dataset as gen_dataset_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, output_dir = _build_real_corpus(tmp)
+            first_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.001,
+                workers=0, resume=False, repair_resume=False,
+                start_idx=500, seed=42, sample_rate=None,
+            )
+            gen_dataset_module.gen_dataset(first_args)
+            original_meta = Path(output_dir, 'meta.json').read_bytes()
+            resume_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.002,
+                workers=0, resume=True, repair_resume=False,
+                start_idx=501, seed=43, sample_rate=None,
+            )
+            with self.assertRaises(DatasetContractError):
+                gen_dataset_module.gen_dataset(resume_args)
+            self.assertEqual(Path(output_dir, 'meta.json').read_bytes(), original_meta)
+
+    def test_resume_rejects_a_missing_leading_sample(self):
+        from dataset_gen import gen_dataset as gen_dataset_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, output_dir = _build_real_corpus(tmp)
+            first_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.001,
+                workers=0, resume=False, repair_resume=False,
+                start_idx=500, seed=42, sample_rate=None,
+            )
+            gen_dataset_module.gen_dataset(first_args)
+            pairs_dir = os.path.join(output_dir, 'pairs')
+            wav_path, json_path = _sample_paths(pairs_dir, 500)
+            os.remove(wav_path)
+            os.remove(json_path)
+            resume_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.002,
+                workers=0, resume=True, repair_resume=False,
+                start_idx=None, seed=43, sample_rate=None,
+            )
+            with self.assertRaises(DatasetContractError):
+                gen_dataset_module.gen_dataset(resume_args)
+
+
 class RepairResumeInteriorOrphanGapTest(unittest.TestCase):
     """Other issue flagged alongside the release blockers above:
     --repair-resume deletes orphans and then always resumes from

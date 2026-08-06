@@ -40,20 +40,22 @@ it fills echo-removal holes rather than every bin attenuated by NR.
 
 ## Signal grid
 
-The mono pipeline uses a 20 ms frame, 10 ms hop, and the next power-of-two FFT:
+The mono pipeline uses an explicit power-of-two, zero-padding-free frame/FFT
+with 50% overlap:
 
 | Sample rate | Frame | Hop | FFT | Frequencies |
 |---:|---:|---:|---:|---:|
-| 8 kHz | 160 | 80 | 256 | 129 |
-| 16 kHz | 320 | 160 | 512 | 257 |
-| 48 kHz | 960 | 480 | 1024 | 513 |
+| 8 kHz | 256 | 128 | 256 | 129 |
+| 16 kHz (default) | 256 | 128 | 256 | 129 |
+| 16 kHz (alternate) | 512 | 256 | 512 | 257 |
+| 48 kHz | 1024 | 512 | 1024 | 513 |
 
 AEC, final OLA, NR gains, and `AecResContext` are validated against the same
 derived dimensions during initialization.
 
-The `pipelines/4ch_pipelines/` shell and AIAEC model candidates intentionally use
-zero-padding-free 50%-overlap grids. They are separate contracts and should
-not be inferred from this table.
+The `pipelines/4ch_pipelines/` shell uses the same three primary product grids
+(16k/256/128, 16k/512/256, 48k/1024/512). AIAEC models remain a separate
+training/checkpoint contract even when a numeric grid happens to match.
 
 ## Public implementation boundary
 
@@ -68,6 +70,5 @@ It supports both a heap convenience constructor and a caller-owned,
 CLI executables are reference wrappers around this implementation.
 
 Low-level details, backend/release rules, memory sizing, presets, and tests are
-maintained in [`../pipelines/README.md`](../pipelines/README.md). The original
-pre-implementation design is archived at
-[`archive/freq_domain_pipeline_design_2026_06_07.md`](archive/freq_domain_pipeline_design_2026_06_07.md).
+maintained in [`../pipelines/README.md`](../pipelines/README.md). Superseded
+pre-implementation proposals are retained in Git history.

@@ -1,3 +1,4 @@
+/* C pre/post-processing contract test. */
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>

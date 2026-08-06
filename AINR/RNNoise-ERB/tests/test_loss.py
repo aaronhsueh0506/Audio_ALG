@@ -76,6 +76,7 @@ def test_config_is_irm_only():
     assert loss_cfg['fft_sizes'] == (128, 256, 512, 1024)
     assert loss_cfg['gamma'] == 0.3
     assert cfg.getfloat('erb_irm_loss', 'factor') > 0
+    assert read_irm_loss_config(cfg)['gamma'] == 0.5
     assert not cfg.has_option('erb_irm_loss', 'activity_weight')
     assert not cfg.has_section('perceptual_loss')
 
@@ -221,7 +222,7 @@ def test_checkpoint_gate_covers_the_irm_settings():
     }
     require_checkpoint_loss_config(
         {'loss_version': LOSS_VERSION, 'config': base}, loss_cfg, irm_cfg)
-    for key, bad in (('irm_gamma', 0.5), ('irm_factor', 100.0),
+    for key, bad in (('irm_gamma', 0.25), ('irm_factor', 100.0),
                      ('irm_energy_floor', 1e-6)):
         drifted = {'loss_version': LOSS_VERSION, 'config': {**base, key: bad}}
         try:

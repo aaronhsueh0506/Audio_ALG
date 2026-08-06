@@ -553,6 +553,18 @@ class BatchContractValidationTest(unittest.TestCase):
 
 
 class SampleRateConsistencyTest(unittest.TestCase):
+    def test_three_channel_wav_is_rejected_as_not_exactly_two_channel(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            noisy, clean = _tone(sr, 200), _tone(sr, 300)
+            in_dir = _make_batch(tmp, [(0, noisy, clean, sr)])
+            wav_path, _ = _sample_paths(in_dir, 0)
+            three_channel = torch.stack([noisy, clean, _tone(sr, 400)], dim=0)
+            torchaudio.save(wav_path, three_channel, sr, bits_per_sample=16)
+            out_path = os.path.join(tmp, 'packed.pt')
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(in_dir, out_path))
+
     def test_mismatched_native_rate_without_target_sr_is_hard_rejected_in_versioned_mode(self):
         # A validated/contract-versioned batch should never contain a
         # sample rate mismatch -- pack() now stops immediately rather than

@@ -1,7 +1,7 @@
 /**
  * aec_nr_pipeline.c — AEC(linear) → echo-aware NR → RES  (Version A: malloc)
  *
- * Thin CLI shell over pipelines/audio_pipeline.h (review F20). Freq-domain
+ * Thin CLI shell over pipelines/audio_pipeline.h. Freq-domain
  * A_min_pl pipeline, a C port of pipelines/aec_nr_pipeline.py (the 2026-06-23
  * re-tune). Per hop:
  *   Stage 1: AEC in LINEAR mode (enable_res=0, return_res_context=1) — the AEC3

@@ -80,9 +80,9 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
     """Run AEC without RES, returning per-frame context for external RES.
 
     By default the time output is the reconstructing WOLA hop underlying
-    ``ctx.error_spec``.  ``standalone_time_output=True`` instead returns the
-    limiter-processed linear AEC hop, matching the C pipeline's ``aec_only``
-    path; the frequency-domain context is unchanged.
+    ``ctx.error_spec``. ``standalone_time_output=True`` instead returns the
+    AEC library's direct time output, matching the C ``aec_only`` path; the
+    frequency-domain context is unchanged.
     """
     config.enable_res = False
     config.return_res_context = True
@@ -97,7 +97,7 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
         _out, ctx = result
         # The external WOLA seam may select/crossfade the shadow output.  The
         # full pipeline needs the exact formed hop underlying ctx.error_spec;
-        # AEC-only instead mirrors C and returns the standalone limiter output.
+        # AEC-only mirrors C and returns the library's direct output.
         output[i:i + hop] = _out if standalone_time_output else ctx.formed_output
         contexts.append(ctx)
 

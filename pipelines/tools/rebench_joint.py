@@ -6,7 +6,7 @@
   This is the 2026-06-23 re-tune of A_min_pl; LEGACY_AMIN=1 renders the prior
   min-only A_min_pl (noise-only NR, scalar ne_floor=0.4).
 
-Usage: python3 pipelines/rebench_joint.py <out_dir> [ne_floor] [ne_gate] [limit]
+Usage: python3 pipelines/tools/rebench_joint.py <out_dir> [ne_floor] [ne_gate] [limit]
 Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir> --baseline <classic>/scores.json
 """
 import contextlib
@@ -17,7 +17,7 @@ import sys
 import numpy as np
 import soundfile as sf
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 
@@ -27,7 +27,7 @@ from pipelines.aec_nr_pipeline import (                         # noqa: E402
     PROD_INJECT_ECHO_PSD, PROD_NE_FLOOR_FAR_ACTIVE,
     PROD_NEAR_GATE_THRESH, PROD_NEAR_HANGOVER,
 )
-from pipelines.rebench_sep_vs_classic import (                  # noqa: E402
+from pipelines.tools.rebench_sep_vs_classic import (            # noqa: E402
     CORPUS, SCENARIOS, SR, FL, NR_PRESET,
 )
 

@@ -351,6 +351,7 @@ endif
 # to the true end of the CFLAGS assembly, so a caller's EXTRA_CFLAGS can
 # never land after it and override it.
 CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
+         -I. \
          -I$(AEC_DIR)/include -I$(AEC_DIR)/example \
          -I$(NR_DIR)/include \
          -I$(AC_DIR)/include -I$(AC_DIR)/lib/kiss_fft
@@ -913,7 +914,7 @@ endif
 # guard-skip knob must not alias a guarded build), SRCS (this
 # Makefile's own compiled sources -- the archive's one member TU plus the
 # CLI/test TUs -- so a source-set change keys to a fresh directory).
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort audio_pipeline.c aec_nr_pipeline.c aec_nr_pipeline_static.c test_audio_pipeline.c example_board_adapter.c)
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort audio_pipeline.c aec_nr_pipeline.c aec_nr_pipeline_static.c tests/test_audio_pipeline.c example_board_adapter.c)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT: where THIS repo's own keyed
@@ -990,7 +991,7 @@ $(OBJ_DIR)/audio_pipeline.o: audio_pipeline.c audio_pipeline.h pipeline_dims.h |
 # (create-vs-init byte equality incl. a dirty/poisoned pool, destroy
 # idempotence, misaligned/undersized pool rejection, sample-rate whitelist
 # rejection) -- see test_audio_pipeline.c's own header for detail.
-$(OBJ_DIR)/test_audio_pipeline.o: test_audio_pipeline.c audio_pipeline.h | _cfg_guard
+$(OBJ_DIR)/test_audio_pipeline.o: tests/test_audio_pipeline.c audio_pipeline.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # example_board_adapter: REFERENCE ONLY host simulation of a board-side
@@ -1219,7 +1220,7 @@ audit-no-stdio-stack:
 	 done; \
 	 bd="$$($(MAKE) -s --no-print-directory BACKEND=$(BACKEND) NO_STDIO=1 print-bin-dir)"; \
 	 mkdir -p "$$bd"; \
-	 $(CC) $(CFLAGS) -DAUDIO_PIPELINE_NO_STDIO -c -o "$$bd/test_no_stdio_stack.o" test_no_stdio_stack.c; \
+	 $(CC) $(CFLAGS) -DAUDIO_PIPELINE_NO_STDIO -c -o "$$bd/test_no_stdio_stack.o" tests/test_no_stdio_stack.c; \
 	 $(LINK) -o "$$bd/test_no_stdio_stack" "$$bd/test_no_stdio_stack.o" "$$pl" "$$aec" "$$nr" "$$ac" -lm; \
 	 hits=$$(nm "$$bd/test_no_stdio_stack" | awk -v re="$$pat" '{ n=$$NF; if (n ~ re) print }'); \
 	 if [ -n "$$hits" ]; then echo "FAIL: stdio symbol(s) in the linked EXECUTABLE:"; echo "$$hits"; exit 1; fi; \

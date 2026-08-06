@@ -1,3 +1,5 @@
+"""Python four-channel orchestration contract tests."""
+
 from importlib import import_module
 
 import numpy as np

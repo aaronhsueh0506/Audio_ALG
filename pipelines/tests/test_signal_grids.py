@@ -1,3 +1,5 @@
+"""Signal-grid and wall-clock-retiming contract tests."""
+
 from types import SimpleNamespace
 
 import numpy as np

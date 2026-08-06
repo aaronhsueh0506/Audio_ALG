@@ -381,7 +381,7 @@ fi
 
 echo "=== Section 4: -Ofast/-ffast-math/-ffp-contract= exact-token matching (no substring false positives) ==="
 
-# The exact Codex-reported false positive: a legitimate flag whose VALUE
+# The exact previously reported false positive: a legitimate flag whose VALUE
 # merely CONTAINS "-Ofast" as a substring (a macro definition, not the
 # compiler flag itself) must build successfully now that the conflict check
 # is $(filter)-based (whole-word match) instead of $(findstring)-based

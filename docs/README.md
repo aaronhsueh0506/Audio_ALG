@@ -11,6 +11,7 @@ README.
 | Repository scope and signal-grid boundary | [`../README.md`](../README.md) |
 | Conventional mono AEC + NR/RES | [`../pipelines/README.md`](../pipelines/README.md) |
 | C and caller-owned-pool integration | [`c_user_manual_zh_TW.md`](c_user_manual_zh_TW.md) |
+| Board integration of `libaudio_pipeline.a` | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
 | Frequency-domain gain fusion | [`freq_domain_pipeline_design.md`](freq_domain_pipeline_design.md) |
 | Four-channel C/Python AEC / external beamformer seam | [`../pipelines/4ch_pipelines/README.md`](../pipelines/4ch_pipelines/README.md) |
 | Standalone AINR models | [`../AINR/README.md`](../AINR/README.md) |
@@ -22,18 +23,6 @@ README.
 
 `architecture.html` is a visual explanation of the conventional mono path. It
 does not describe AINR or AIAEC model internals.
-
-## Dated audits
-
-- [`aiaec_4ch_signal_grid_review_2026_07_30.md`](aiaec_4ch_signal_grid_review_2026_07_30.md)
-  records the structural sign-off that introduced the six AIAEC candidates and
-  the 4-channel boundary.
-- [`archive/ai_aec_candidate_matrix_2026_07_30.md`](archive/ai_aec_candidate_matrix_2026_07_30.md)
-  preserves the long pre-refactor AI-AEC research trail. It mentions removed
-  prototypes and is not an implementation map.
-- [`../pipelines/PLAN_audio_pipeline_api.md`](../pipelines/PLAN_audio_pipeline_api.md)
-  is the historical proposal that preceded the implemented
-  `audio_pipeline.h`; use it for rationale only.
 
 ## Maintenance rule
 

@@ -1,3 +1,5 @@
+"""Tests for the bundled-recording evaluator contract."""
+
 from importlib import import_module
 
 import numpy as np

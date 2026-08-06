@@ -663,10 +663,8 @@ class FourChannelAecPipeline:
             if not isinstance(result, tuple) or len(result) != 2:
                 raise RuntimeError("linear AEC lane did not return its RES context")
             _lane_output, context = result
-            # Keep the time-domain beamformer seam identical to the source of
-            # context.error_spec, including refined/coarse selection and its
-            # transition. The standalone AEC return is limiter-processed and
-            # is not the analysis signal represented by that spectrum.
+            # Match context.error_spec, including refined/coarse selection,
+            # crossfade and WOLA formation.
             lane_outputs[channel] = np.asarray(
                 context.formed_output, dtype=np.float32
             )

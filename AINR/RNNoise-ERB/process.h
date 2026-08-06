@@ -39,7 +39,7 @@ extern "C" {
 #define RNNOISE_LOOKAHEAD     1     /* = config.ini lookahead_frames */
 #define RNNOISE_CONV_DELAY    (2 - RNNOISE_LOOKAHEAD)
 
-/* log_erb_dfn_mean_cplx_unit_0_4k_v6 constants.  Keep byte-for-byte aligned with
+/* log_erb_dfn_mean_cplx_unit_0_4k_v8 constants.  Keep byte-for-byte aligned with
  * config.ini [feature] and checkpoint validation in train.py.
  * v4 removes the erb_norm_clip/spec_clip deployment safety clamp v3 kept on
  * top of the DeepFilterNet formula -- verified against upstream

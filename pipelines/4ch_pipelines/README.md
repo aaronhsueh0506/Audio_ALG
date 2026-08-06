@@ -114,12 +114,12 @@ The deployable C seam is:
   externally-supplied fixed-weight stand-in), following the same query →
   allocate → `init_ex` → process → destroy → release sequence as
   `4aec_nr_res_static.c` above;
-- [`test_4aec_nr_res.c`](test_4aec_nr_res.c): 16/48 kHz grid, lifecycle,
+- [`tests/test_4aec_nr_res.c`](tests/test_4aec_nr_res.c): 16/48 kHz grid, lifecycle,
   ordering, token invalidation, invalid-config, pool-boundary, heap/static
   byte-parity, weight, and finite-output acceptance tests;
-- [`test_audio_pipeline_4ch.c`](test_audio_pipeline_4ch.c): complete-wrapper lifecycle,
+- [`tests/test_audio_pipeline_4ch.c`](tests/test_audio_pipeline_4ch.c): complete-wrapper lifecycle,
   topology, reset, and finite-output tests;
-- [`test_spatial_third_party.c`](test_spatial_third_party.c): scalar/SIMD PHAT,
+- [`tests/test_spatial_third_party.c`](tests/test_spatial_third_party.c): scalar/SIMD PHAT,
   cached SRP, and exported-GSC-weight equivalence tests.
 
 For side-by-side reading, the files and public calls map directly:
@@ -130,7 +130,7 @@ For side-by-side reading, the files and public calls map directly:
 | `audio_pipeline.c` | `4ch_pipelines/4aec_nr_res.c` |
 | `aec_nr_pipeline_static.c` | `4ch_pipelines/4aec_nr_res_static.c` |
 | `aec_nr_pipeline.c` host runner | `4ch_pipelines/audio_pipeline_4ch_raw.c` raw host runner |
-| `test_audio_pipeline.c` | `4ch_pipelines/test_4aec_nr_res.c` |
+| `tests/test_audio_pipeline.c` | `4ch_pipelines/tests/test_4aec_nr_res.c` |
 
 The spatial layer keeps the same order as `audio_pipeline.c`: instance,
 validation, default config/construction, per-hop processing, reset/teardown,

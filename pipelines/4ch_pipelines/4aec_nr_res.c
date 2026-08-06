@@ -840,7 +840,7 @@ static int align_render(FourAecNrRes* p, const float* render,
  * independently honor the same contract rather than assume reset() will
  * make a violation visible. Do not port this borrow-pointer design to
  * pipeline.py's FourChannelAecPipeline: that reference implementation's
- * contract (test_pipeline.py's queued-pre-frames test) allows multiple
+ * contract (tests/test_pipeline.py's queued-pre-frames test) allows multiple
  * pre-frames in flight simultaneously and requires true copy semantics. */
 static int bind_lane_view(FourAecLaneSnapshot* dst,
                           const AecResContext* src,
@@ -922,16 +922,11 @@ int four_aec_nr_res_process_pre(
                         i * FOUR_AEC_NR_RES_CHANNELS + ch];
             }
         }
-        /* Every lane is constructed with enable_res=0/return_res_context=1
-         * (derive_dims_and_configs() above) -- always context_only, never
-         * dispatched per-call. This lane's own aec_process()-style output
-         * (limiter-processed audio) has no consumer here: only
-         * context.formed_hop below feeds the rest of this pipeline, so
-         * aec_process_context()/aec_process_context_shared_far() skip
-         * computing the limiter output and the copy into a caller `out`
-         * buffer that aec_process() would have done for nothing (Group 5).
+        /* Every lane is context-only: downstream processing consumes
+         * context.formed_hop, so the context entry points avoid an unused
+         * output copy while advancing the same AEC state.
          *
-         * Group 6: every lane sees the IDENTICAL p->aligned_ref this hop
+         * Every lane sees the identical p->aligned_ref this hop
          * (the shared, delay-aligned reference -- same pointer passed to
          * every lane below), so lane 0's far-end FFT is byte-identical to
          * what any other lane would compute from the same signal. Lane 0
@@ -1341,7 +1336,7 @@ static void reset_post_sg(FourAecNrRes* p) {
  * a caller to visibly notice going wrong. This is why FourAecNrResPreFrame's
  * doc comment requires callers to stop reading on reset() as an API-contract
  * rule, not on token rejection or on any memory-safety symptom.
- * Covered by test_4aec_nr_res.c's reset-while-pending test. */
+ * Covered by tests/test_4aec_nr_res.c's reset-while-pending test. */
 void four_aec_nr_res_reset(FourAecNrRes* p) {
     int ch;
     if (!p || p->destroyed) return;

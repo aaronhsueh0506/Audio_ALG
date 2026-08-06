@@ -191,8 +191,15 @@ def stft(x: torch.Tensor, grid: AecGrid, center: bool = True) -> torch.Tensor:
 
 
 def istft(spec: torch.Tensor, grid: AecGrid, length: Optional[int] = None,
-          center: bool = True) -> torch.Tensor:
-    """Inverse of :func:`stft`.  ``length`` recovers the exact input length."""
+          center: bool = True, normalized: bool = False) -> torch.Tensor:
+    """Inverse of :func:`stft`.  ``length`` recovers the exact input length.
+
+    ``normalized`` MUST match the analysis that produced ``spec``.  The default
+    (``False``) inverts :func:`stft`.  Pass ``True`` only when the spectrum came
+    from a ``normalized=True`` analysis -- the DFN feature view in
+    ``model_views.py`` is the one such producer.  Getting this wrong does not
+    fail loudly; it scales the waveform by ``1/sqrt(n_fft)``.
+    """
     if not torch.is_complex(spec):
         raise TypeError("istft expects a complex spectrum; use torch.view_as_complex")
     lead = spec.shape[:-2]
@@ -200,7 +207,7 @@ def istft(spec: torch.Tensor, grid: AecGrid, length: Optional[int] = None,
     wav = torch.istft(
         flat, n_fft=grid.n_fft, hop_length=grid.hop_len, win_length=grid.win_len,
         window=grid.window(device=spec.device, dtype=spec.real.dtype),
-        center=center, length=length,
+        center=center, length=length, normalized=normalized,
     )
     return wav.reshape(*lead, wav.shape[-1])
 

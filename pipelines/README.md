@@ -3,7 +3,7 @@
 ## Architecture
 
 ```
-mic/ref → linear AEC (aec_process_context(): context-only, no limiter/emit)
+mic/ref → linear AEC (aec_process_context(): context-only, no emit)
               ├─ E(f) ────────────────→ echo-aware NR ─→ G_nr ─┐
               └─ AecResContext {R², G_res, CNG, far power} ─────┤
                                                                 ↓
@@ -13,23 +13,21 @@ mic/ref → linear AEC (aec_process_context(): context-only, no limiter/emit)
                                                        one iFFT/OLA
 
 aec_only mode (no NR/RES stage at all):
-mic/ref → linear AEC (aec_process(): full limiter + emit) → out
+mic/ref → linear AEC (aec_process(): emits into out) → out
 ```
 
 There is no independent time-domain RES filter after NR. `G_res` is calculated
 inside the AEC3 suppression path, exported with the linear residual, fused with
 `G_nr`, and applied once to `E(f)`.
 
-The non-`aec_only` path never reads `aec_process()`'s own limiter-processed
-output — only `AecResContext`'s pre-limiter linear residual matters downstream
-— so it drives AEC via `aec_process_context()` instead: same linear filter and
-AEC3 post/RES-context computation, minus the limiter and the copy into an
-`out` buffer neither this pipeline nor the caller ever reads on that path. A
-single `Aec` instance uses exactly one of the two entry points for its whole
-construct-to-reset lifetime, chosen once at init from `aec_only` — see
-`lib/aec/c_impl/include/aec.h`'s doc on `aec_process_context()` for why mixing
-them on one instance is unsafe (a one-hop limiter-gain discontinuity, not a
-crash).
+The non-`aec_only` path never reads `aec_process()`'s own returned audio —
+only `AecResContext`'s linear residual matters downstream — so it drives AEC
+via `aec_process_context()` instead: same linear filter and AEC3
+post/RES-context computation, minus the copy into an `out` buffer neither this
+pipeline nor the caller ever reads on that path. This pipeline still picks one
+entry point at init from `aec_only`, but that is now only a cost choice: the
+two entry points advance identical state and may be mixed freely on one
+instance.
 
 ## Modules
 
@@ -45,7 +43,7 @@ crash).
 RES is not a standalone module/library — it is exposed as the `AecResContext` seam on
 the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process_context()`
 (or the streaming `aec_analyze_render()` / `aec_process_capture()` pair, if the offline/streaming
-split matters more than shedding the limiter's per-hop cost) still computes the
+split matters more than shedding the emit copy) still computes the
 AEC3 post-filter's residual-echo suppression internals but does not apply them to the time
 output; `aec_get_res_context(a, &ctx)` then exposes `AecResContext` — the
 reconstructing 50%-overlap WOLA `error_spec`, its matching `echo_spec` /
@@ -53,16 +51,17 @@ reconstructing 50%-overlap WOLA `error_spec`, its matching `echo_spec` /
 `comfort_noise`, etc. — so an external caller
 can run AEC(linear) → NR → RES itself. `aec_process_context()` is this mono
 pipeline's own choice for exactly this pattern (this file's Architecture
-diagram above) — it never touches the limiter or emits an `out` buffer, both
-pure waste when nothing downstream reads them. See
-`lib/aec/c_impl/include/aec.h` (`AecResContext`, `aec_get_res_context()`,
-`aec_process_context()`) for the full field list and the one construct-to-
-reset-lifetime precondition on picking an entry point.
+diagram above) — it never emits an `out` buffer, pure waste when nothing
+downstream reads it. See `lib/aec/c_impl/include/aec.h` (`AecResContext`,
+`aec_get_res_context()`, `aec_process_context()`) for the full field list.
 
 The four-channel API is a separate zero-padding-free grid and does not use
 `AudioPipeline`. See [the 4-channel contract](4ch_pipelines/README.md) and
 [`4ch_pipelines/4aec_nr_res.h`](4ch_pipelines/4aec_nr_res.h) for its synchronous
 pre/post boundary.
+
+Release source is kept at this directory's top level. C/Python regressions are
+under `tests/`; offline scoring and benchmark drivers are under `tools/`.
 
 ## Parameter Alignment
 
@@ -99,7 +98,8 @@ context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
 twiddle configs are carved from these pools too, so both columns are the
 complete memory requirement (strict init→destroy zero-heap on both backends):
 
-Re-measured 2026-08-04 via `./aec_nr_pipeline_static --print-mem-size balanced
+Re-measured 2026-08-05 after shared-FFT/context cleanup via
+`./aec_nr_pipeline_static --print-mem-size balanced
 --sample-rate <sr> [--fft-size <alt>]` on both backends, against the current
 grid (16 kHz default is now 256/128, not the 512/256 these numbers used to
 assume — see "Parameter Alignment" above). 16 kHz's alternate 512/256 grid is
@@ -107,16 +107,20 @@ included since it remains explicitly selectable:
 
 | Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |--------|-----|-----------|-----|---------------|-----------|
-| **8 kHz KISS** | 294,976 B | 8,784 B | 67,424 B | 8,272 B | **379,648 B (370.8 KB)** |
-| **8 kHz NE10** | 293,152 B | 8,176 B | 67,424 B | 8,272 B | **377,216 B (368.4 KB)** |
-| **16 kHz KISS (default, 256/128)** | 399,056 B | 8,784 B | 122,160 B | 8,272 B | **538,464 B (525.8 KB)** |
-| **16 kHz NE10 (default, 256/128)** | 397,232 B | 8,176 B | 122,160 B | 8,272 B | **536,032 B (523.5 KB)** |
-| **16 kHz KISS (alt, 512/256)** | 545,024 B | 16,976 B | 133,472 B | 16,464 B | **712,128 B (695.4 KB)** |
-| **16 kHz NE10 (alt, 512/256)** | 540,896 B | 15,600 B | 133,472 B | 16,464 B | **706,624 B (690.1 KB)** |
-| **48 kHz KISS** | 1,235,664 B | 33,360 B | 374,336 B | 32,848 B | **1,676,400 B (1,637.1 KB)** |
-| **48 kHz NE10** | 1,226,928 B | 30,448 B | 374,336 B | 32,848 B | **1,664,752 B (1,625.7 KB)** |
+| **8 kHz KISS** | 276,928 B | 8,784 B | 67,424 B | 5,696 B | **358,992 B (350.6 KB)** |
+| **8 kHz NE10** | 276,320 B | 8,176 B | 67,424 B | 5,696 B | **357,776 B (349.4 KB)** |
+| **16 kHz KISS (default, 256/128)** | 381,008 B | 8,784 B | 122,160 B | 5,696 B | **517,808 B (505.7 KB)** |
+| **16 kHz NE10 (default, 256/128)** | 380,400 B | 8,176 B | 122,160 B | 5,696 B | **516,592 B (504.5 KB)** |
+| **16 kHz KISS (alt, 512/256)** | 510,080 B | 16,976 B | 133,472 B | 11,328 B | **672,016 B (656.3 KB)** |
+| **16 kHz NE10 (alt, 512/256)** | 508,704 B | 15,600 B | 133,472 B | 11,328 B | **669,264 B (653.6 KB)** |
+| **48 kHz KISS** | 1,166,928 B | 33,360 B | 374,336 B | 22,592 B | **1,597,376 B (1,560.0 KB)** |
+| **48 kHz NE10** | 1,164,016 B | 30,448 B | 374,336 B | 22,592 B | **1,591,552 B (1,554.2 KB)** |
 
-(Totals include the 192 B `AudioPipeline` control block, not broken out as
+The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW.md` §4 — re-measure from
+there rather than editing it here, and always prefer the value
+`audio_pipeline_get_mem_requirements()` returns at runtime.
+
+(Totals include the 160 B `AudioPipeline` control block, not broken out as
 its own column above.)
 
 > filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072
@@ -187,7 +191,7 @@ BIN="$(make -s print-bin-dir)"
 # audio_pipeline_init_ex()'s `expected` descriptor gate (tampered
 # descriptor_version/layout_version/backend_id/build_flags_hash/alignment/
 # bytes each rejected) — each per-rate case runs once per supported rate
-# (8000/16000/48000; 48 kHz uses a reduced hop count, see test_audio_pipeline.c)
+# (8000/16000/48000; 48 kHz uses a reduced hop count, see tests/test_audio_pipeline.c)
 # — AND builds + runs the example_board_adapter smoke test (see "Board
 # Integration" below). Four-channel tests are intentionally isolated in
 # 4ch_pipelines/Makefile.
@@ -279,46 +283,6 @@ root cause as the `--debug` `erle=0.0` caveat above). Full-rate analysis
 still resumes on estimate change or lost solidity, which are the primary
 resume paths.
 
-### Compile flags (`EXTRA_CFLAGS`)
-
-`pipelines/Makefile` passes `EXTRA_CFLAGS` through to the `lib/aec` and
-`lib/nr` sub-builds *and* this pipeline's own compile, so one invocation
-reaches every `.o`. The fast matched-filter arithmetic and delay-estimator
-duty-cycling are built in unconditionally — there are no optional
-performance flags at present.
-
-No manual `make clean-libs` is needed when switching `EXTRA_CFLAGS` (or
-`BACKEND`/`WERROR`): objects are now flag-keyed — each distinct combination
-of `BACKEND`/`CFLAGS`/`EXTRA_CFLAGS`/`WERROR` lands in its own hash-named
-object directory (`obj/<backend>-<config-hash>/`, both here and
-independently in `lib/aec`'s and `lib/nr`'s own Makefiles), so a flag change
-always compiles fresh objects into a fresh directory instead of reusing a
-stale `.o`. Two builds with different flags/backends can even coexist or run
-concurrently in the same worktree without stomping each other's objects.
-
-### Unified FP-contraction policy
-
-`-ffp-contract=off` is a **unified policy spanning all four repos**
-(`audio_common`, `lib/nr`, `lib/aec`, this `pipelines/` Makefile): every TU
-each Makefile compiles — own sources and vendored KISS/NE10 alike — builds
-with the flag, appended LAST in the `CFLAGS`/`LIB_CFLAGS` assembly (after
-`-DAUDIO_PIPELINE_BACKEND_STR`, `EXTRA_CFLAGS`, `WERROR`) so nothing can
-override it. `EXTRA_CFLAGS` (or a
-`CFLAGS=` override) containing `-Ofast`/`-ffast-math`/`-ffp-contract=<any>`
-is rejected at parse time:
-
-```
-$ make EXTRA_CFLAGS=-ffast-math
-Makefile:217: *** FP policy conflict: CFLAGS/EXTRA_CFLAGS contains -ffast-math; this repo pins -ffp-contract=off; remove -ffast-math from EXTRA_CFLAGS.  Stop.
-```
-
-`../../audio_common/scripts/audit_fp_contract.sh` is the disassembly-level
-proof the flag actually bites (audio_common's and NR's TUs — this
-directory's own three TUs, being pure CLI/glue code with no per-sample math
-loops of their own, are outside that script's audit list). See
-`audio_common/README.md`'s "FP-contraction policy" section for the full
-cross-repo writeup.
-
 ## Two Versions
 
 ### Version A: malloc (`aec_nr_pipeline.c`)
@@ -338,520 +302,28 @@ twiddle configs are carved FROM the caller pool too
 caller-supplied memory, no `malloc()` involved) and are already counted in
 the `*_get_mem_size` figures — so "no malloc after init" is zero heap
 allocation ever, end to end, on **both** backends, not just on the per-hop
-audio path. (Pre-P0001 the configs were NE10-internal heap allocations
-*outside* the pool, allocated during `aec_init`/`fft_init` and not counted
-in `*_get_mem_size`; that exception is gone — see the `destroy()` note in
-the code block below.)
-
-The pipeline uses exactly THREE composite static APIs — there are no
-per-submodule `_get_mem_size()` entry points; each library slices its own
-internals (HPF, PBFDKF ×2, delay estimator, RES/post context, internal FFTs
-for AEC; MCRA + SPP for NR) inside its single pool segment:
-
-```c
-size_t aec_sz = aec_get_mem_size(&aec_cfg);          /* lib/aec           */
-size_t nr_sz  = mmse_lsa_get_mem_size(&nr_cfg);      /* lib/nr            */
-size_t fft_sz = fft_get_mem_size(fft_size);          /* audio_common (OLA) */
-/* + pipeline buffers; every segment 16-byte aligned (ALIGN16)            */
-
-Aec*             aec = aec_init(mem_aec, aec_sz, &aec_cfg);
-MmseLsaDenoiser* nr  = mmse_lsa_init(mem_nr, nr_sz, &nr_cfg);
-FftHandle*       fft = fft_init(mem_fft, fft_sz, fft_size);
-/* destroy() on static instances frees no pool memory (runtime is_static)
- * and, since P0001, releases no backend-owned handle OUTSIDE the pool
- * either: on BOTH backends every one of aec_destroy/mmse_lsa_destroy/
- * fft_destroy above is a genuine no-op for a pool-resident instance --
- * nothing lives outside mem_aec/mem_nr/mem_fft to leak or double-free, so
- * each is safe to call any number of times (including never, if the caller
- * is about to free/reuse the whole pool anyway). (Pre-P0001, NE10's
- * destroy calls were NOT idempotent/skippable this way: skipping one
- * leaked its twiddle config, calling it twice double-freed it.) */
-```
-
-Query the exact pool budget for any configuration without running audio:
-
-```bash
-./aec_nr_pipeline_static --print-mem-size --sample-rate 16000
-```
-
-**Embedded-target integration:** allocate one contiguous, 16-byte-aligned
-block of the reported total from the platform allocator, pass it in place of
-the desktop `malloc` — no other change. The pool base MUST be 16-byte
-aligned (both libraries assert this).
+audio path.
 
 ## Board Integration
 
-Review F20: the pool-sizing/carving/per-hop-processing logic both CLIs above
-embed is also available as a standalone, linkable library —
+The pool-sizing/carving/per-hop-processing logic both CLIs above embed is also
+available as a standalone, linkable library —
 [`audio_pipeline.h`](audio_pipeline.h) / [`audio_pipeline.c`](audio_pipeline.c),
 built into `libaudio_pipeline.a`. A board's own memory manager consumes this
-directly instead of copying `aec_nr_pipeline_static.c`'s file-local carve
-code into firmware. Both CLIs are now thin shells over it (arg parsing + WAV
-I/O + the `--print-mem-size`/`--debug`/`DUMP_CTX` diagnostics) — see
-`aec_nr_pipeline_static.c` for the caller-pool flavor of the sequence below,
-or `aec_nr_pipeline.c` for the heap-convenience flavor
-(`audio_pipeline_create()`).
+directly instead of copying `aec_nr_pipeline_static.c`'s file-local carve code
+into firmware; both CLIs are thin shells over it (arg parsing + WAV I/O + the
+`--print-mem-size`/`--debug`/`DUMP_CTX` diagnostics).
 
-**Reference example**:
-[`example_board_adapter.c`](example_board_adapter.c) is a compilable,
-runnable HOST SIMULATION of the sequence below — a `board_mem` module
-standing in for a platform memory manager, the query→alloc→init_ex→
-process→reset→process→destroy→free flow (run twice on the same static
-arena, proving pool reusability), and the negative demonstrations
-(undersized/misaligned pool, tampered descriptor, double-destroy, pool
-usable after a rejected init). Build + run it with `make example-adapter`
-(also wired into `make test`). **This example does NOT replace production
-board integration and sign-off** — the actual platform adapter source, memory-manager
-implementation, build command, and final link map for the real target must
-still be authored and submitted for sign-off; every `board_mem_*` function
-in that file is a plain host-array stand-in, marked `// BOARD:` wherever
-real platform code belongs instead.
+[`example_board_adapter.c`](example_board_adapter.c) is a compilable, runnable
+HOST SIMULATION of that sequence (`make example-adapter`, also wired into
+`make test`). **It does NOT replace production board integration and sign-off**
+— every `board_mem_*` function in it is a plain host-array stand-in, marked
+`// BOARD:` where real platform code belongs.
 
-### Cross-compile / board build
-
-The board deliverable is built with `make publish BACKEND=ne10` and consumed
-from the stable `dist/ne10/current/` path — immutable, content-addressed
-release dirs where `MANIFEST.txt` is the deterministic build-config record
-(flags, tool identities, per-file SHA-256; byte-verified on every
-republish, and it deliberately carries no commit/date so the same release
-id always has the same MANIFEST bytes) and the append-only `ATTEST/`
-directory records provenance.
-
-`ATTEST/` is **one-event-one-file**: exactly one new
-`attest-<utc>-<commit>[-dirty]-<seq>.txt` per publish event, including
-idempotent republishes of an already-published release. The file is
-installed atomically with a write-temp + `link(2)` no-clobber step (the
-kernel-level equivalent of `O_CREAT|O_EXCL`) — a same-second name collision
-(same UTC second, same commit) regenerates the event id with the next
-`<seq>` and retries, so an existing attestation is **never** overwritten.
-Each attestation's `event_id` is embedded inside the file, and it records a
-**full 40-hex git commit OID** plus a dirty flag for **this repo AND all
-three producers** (audio_common, lib/aec, lib/nr) — "which exact checkout
-of the whole stack published this" lives here, not in MANIFEST.
-
-`publish` **refuses by default**, checking tracked and untracked state as
-two independent dimensions, when this repo or any of the three
-producers (a) has uncommitted **tracked** changes, (b) contains **any
-untracked, non-ignored file** (gitignored build output is excluded by
-design and is never part of this provenance), or (c) isn't a git checkout
-at all (commit unknown) — `make publish` FATALs and names exactly the
-offending repo(s) *and* dimension. Case (c) is refused
-**unconditionally**: no combination of `ALLOW_DIRTY_PUBLISH`/
-`ALLOW_UNTRACKED_PUBLISH` admits an identity-less checkout, for this repo
-or any producer — without a commit OID neither the tracked diff nor the
-untracked enumeration can be named for it, so there is no escape hatch to
-offer. `ALLOW_DIRTY_PUBLISH=1` admits tracked changes on an
-otherwise-identified checkout — pass it to publish anyway; the deviation
-is then recorded in the attestation (`allow_dirty_publish=1`) together
-with a `dirty_diff_sha256` per dirty repo (sha256 of that repo's `git diff
---binary HEAD`). `ALLOW_UNTRACKED_PUBLISH=1` separately admits untracked
-files, recording `allow_untracked_publish=1` plus an
-`untracked_tree_sha256` per repo that had one — sha256 over sorted,
-FIXED-FIELD per-file records (the `hash_untracked()` helper in the
-Makefile) in which every variable-length value — path, symlink target,
-file content — is itself hashed before being placed in the record, so two
-records can never be confused by naive concatenation (a raw "path target"
-join is collision-prone: `"a b"->"c"` vs `"a"->"b c"` would otherwise
-encode identically). Any `stat`/`readlink`/`shasum` failure, or a path
-that is neither a regular file nor a symlink (an embedded git checkout, a
-fifo, ...), downgrades that entry to an unhashable record, which is
-**always** a hard FATAL naming the path rather than an empty or
-best-effort hash (fail-closed) — a publish never proceeds as though it
-could account for a source it can't. The two flags are orthogonal —
-either, both, or neither may be needed for a given publish.
-
-This repo's own untracked check is **whitelisted by prefix**: any path
-starting `AINR/GTCRN/` or `AINR/gtcrn_github/` never counts against a
-publish here (neither the refusal nor the provenance hash) — this working
-tree permanently carries those two directories as user-owned content that
-is never staged for a release. The three producers get **no such
-whitelist**: an untracked file there is always a violation. (Splitting
-Splitting tracked/untracked into two independent dimensions also fixed a
-asymmetry: the three producers used to fold untracked files into the
-SAME dirty check as tracked changes — `git status --porcelain`, no `-uno`
-— so an untracked producer file made `ALLOW_DIRTY_PUBLISH=1` the only
-override, with no separate provenance trail for it. The current design gives every
-one of the four repos the identical tracked-only `-uno` check plus its own
-untracked check, so the two kinds of deviation are never conflated for
-anyone, and only this repo's untracked dimension carries the whitelist.)
-
-**Attestations are UNSIGNED**: they provide traceability, not authenticity
-— anyone with filesystem access could forge one, so do not treat `ATTEST/`
-as tamper-proof under an attacker model. `MANIFEST.txt` byte-verification
-(performed automatically on every republish) is the actual integrity
-check; `ATTEST/` is the provenance log.
-
-`make -n|-q|-t ... publish` (dry-run / question / touch mode) is fully
-zero-write — each flag takes a
-different path, but none of the three ever create `dist/`, take the
-publish lock, stage/attest anything, or change an artifact's mtime. This
-also holds for **combined** flags (e.g. `-nt`, `-tq`, `-nqt`): `-t` is
-checked **first**, so any invocation that includes it takes the touch
-no-op path regardless of what else is set — recursing for `-n` first
-would hand a child `make` both flags together, and GNU make then really
-applies touch semantics to the child's own targets, which is exactly the
-real write this ordering exists to prevent. `-n` **prints** what a real
-publish would run (recurses into a print-only child, same as any other
-target, when `-t` is not also set); `-q` **answers via its exit status
-alone** (question mode's documented "needs updating" reply — `publish` is
-phony, so it always would run — with no output and no recursion); `-t`
-(alone or combined) is an **explicit no-op**: one note printed to stdout
-and exit 0, with no recursion (recursing here used to let plain `touch`
-semantics bump this repo's own build-artifact mtimes — a real write —
-before `-t` was special-cased). `OBJ_ROOT=`/`BIN_ROOT=` relocate this
-repo's own keyed obj/bin build trees (default: `obj/`/`bin/` here,
-byte-identical to the previous hardcoded paths) — like `DIST_ROOT=`, these
-are isolation-test knobs for running scratch-directory builds, not part of
-the build's config identity (CFG_SIG).
-
-The `current` symlink is swapped via a rename(2)-atomic helper
-(`audio_common/tools/atomic_symlink_swap.c`, built at publish time with the
-host compiler `HOSTCC`), and `publish` takes its per-backend lock BEFORE
-building anything, so concurrent publishes serialize fully. When
-cross-compiling, pass
-the **full toolchain, not just CC** — BACKEND=ne10 compiles one C++ TU
-(NE10's generic-radix kernel), so a partial override would mix host-built
-C++ objects into a cross build and then try to link ARM objects with the
-host driver:
-
-```bash
-make publish BACKEND=ne10 \
-     CC=aarch64-linux-gnu-gcc \
-     CXX=aarch64-linux-gnu-g++ \
-     AR=aarch64-linux-gnu-ar \
-     RANLIB=aarch64-linux-gnu-ranlib \
-     EXTRA_CFLAGS='-mcpu=cortex-a53'      # or -mcpu=cortex-a73
-```
-
-Guard rails (all four repos):
-
-- **CC/CXX target-coherence check**: every BACKEND=ne10 build compares
-  `$(CC) -dumpmachine` against `$(CXX) -dumpmachine` and hard-fails on
-  mismatch (exactly the partial-toolchain mistake above). `TOOLCHAIN_CHECK=0`
-  skips it (participates in the config signature).
-- **`CFLAGS=`/`CXXFLAGS=`/`LDFLAGS=`/`CPPFLAGS=`/`FP_POLICY=` cannot be
-  overridden on the make command line** — doing so would silently drop the
-  repo-pinned flags (`-ffp-contract=off`, backend defines, `NO_STDIO`); the
-  build errors out and points at `EXTRA_CFLAGS`/`EXTRA_LDFLAGS`, the two
-  supported hooks. `EXTRA_CFLAGS` containing `-Ofast`/`-ffast-math`/
-  `-ffp-contract=` is likewise rejected by the FP-policy conflict gate.
-- **C++ runtime comes from the C++ driver** (`libstdc++` on GNU/Linux gcc,
-  `libc++` on macOS/clang) — there is no hardcoded `-lc++` anywhere any
-  more, so GNU toolchains link cleanly.
-
-### Sequence
-
-```
-1. query    AudioPipelineConfig cfg = audio_pipeline_default_config(sample_rate);
-            cfg.aec_preset/nr_mode/aec_only/enable_cng/legacy_amin = ...;
-            AudioPipelineMemReq req;
-            audio_pipeline_get_mem_requirements(&cfg, &req);   // -> req.bytes/alignment/...
-            // Query THIS SAME `req`, fresh, immediately before every
-            // init_ex call below — never cache it (or just its `bytes`)
-            // across a build/backend/config change and replay it later.
-            // See "Warnings" below.
-
-2. allocate void* pool = platform_alloc(req.bytes, req.alignment);
-            // req.alignment is always 16 today; pool need NOT be zeroed —
-            // see "Dirty-pool contract" below. Pool must stay STABLE and
-            // EXCLUSIVE (nothing else reads/writes it, not shared with any
-            // other instance) for the entire lifetime of the handle below.
-
-3. init     AudioPipeline* p = audio_pipeline_init_ex(pool, req.bytes, &cfg, &req);
-            // Passing `req` back in as `expected` is what makes this call
-            // reject a STALE pool/descriptor instead of silently carving
-            // into one sized/shaped for a different build — see
-            // "Descriptor semantics" below for the seven-condition check
-            // this performs. NULL on: any expected-descriptor mismatch
-            // (descriptor_version / layout_version / backend_id /
-            // build_flags_hash / alignment / bytes), a misaligned/undersized
-            // pool, an invalid cfg, or a sub-module init/grid-agreement
-            // failure (stderr has detail, UNLESS this library was built with
-            // NO_STDIO=1 — see "NO_STDIO=1" below). `audio_pipeline_init(pool,
-            // req.bytes, &cfg)` remains available and is EXACTLY
-            // `audio_pipeline_init_ex(pool, req.bytes, &cfg, NULL)` — it
-            // skips the descriptor check entirely (nothing to compare
-            // against); prefer `_ex` whenever a descriptor was already
-            // queried, which the board flow above always has at hand.
-
-4. process  float mic[hop], ref[hop], out[hop];   // hop = audio_pipeline_hop_size(p)
-            while (have_audio()) {
-                read_hop(mic, ref, hop);
-                audio_pipeline_process(p, mic, ref, out);
-                write_hop(out, hop);
-            }
-
-5. reset?   audio_pipeline_reset(p);   // optional: echo-path change, stream switch
-            // re-zeros pipeline/AEC/NR state in place; no re-validation, no
-            // pool re-touch beyond that.
-
-6. destroy  audio_pipeline_destroy(p);
-            // NR -> pipeline FFT -> AEC, reverse of the init carve order.
-            // NULL-safe; idempotent for THIS pool-resident instance (every
-            // sub-destroy is already a genuine no-op on the pool path, on
-            // BOTH backends — see "Two Versions" above). Call it exactly
-            // once if `p` came from audio_pipeline_create() instead
-            // (ordinary free() semantics — see "Warnings" below).
-
-7. release  platform_free(pool);   // only after step 6 — the pool is dead once
-            //                        audio_pipeline_init_ex/destroy have run on it.
-```
-
-### Warnings
-
-- **`audio_pipeline_create()` ALWAYS uses the heap** (`posix_memalign`
-  under the hood) — it is the desktop/prototyping convenience path (see
-  "Two Versions" above), never the board path. **A board build must never
-  call it.** The pool sequence above
-  (`audio_pipeline_get_mem_requirements` + `audio_pipeline_init_ex` +
-  `audio_pipeline_destroy`) is the only sequence that touches zero heap.
-- **There is no `USE_EXT_MEM` macro.** Both the heap path and the pool
-  path are always compiled into `libaudio_pipeline.a` — the *entry point
-  you call* is the only switch, decided at runtime by which functions your
-  code calls, not by any compile-time flag. See "`USE_EXT_MEM` — not a
-  thing here" below; do not look for one to set, there is nothing to
-  accidentally leave unset either.
-- **Re-query the descriptor after ANY build, backend, or config change** —
-  a firmware rebuild, a `BACKEND=kiss` ↔ `BACKEND=ne10` switch, or a change
-  to any `AudioPipelineConfig` field that affects sizing. Never cache a
-  bare byte count (or a whole `AudioPipelineMemReq`) across one of those
-  changes and replay it into a later build's `audio_pipeline_init_ex()` —
-  that mismatch is exactly what the `expected` argument exists to catch
-  (see "Descriptor semantics" below). This still holds even though V2's
-  fixed 32-byte layout (below) makes the struct meaningfully
-  serializable now — "can be persisted byte-for-byte" is not the same
-  claim as "is still valid after a rebuild/backend/config change": a
-  persisted descriptor from a PREVIOUS build is exactly the stale-cache
-  case `audio_pipeline_init_ex()` exists to catch. If a descriptor must be
-  persisted across a restart (same board, same binary, same CPU — see
-  "Descriptor semantics" for the same-endianness scope this is limited
-  to), re-derive it fresh at the next boot from THAT boot's
-  `audio_pipeline_get_mem_requirements()` and treat any persisted copy as
-  advisory at best — never trust a persisted value as `expected` without
-  also having a freshly-queried one to fall back to.
-- **Mixing `_create()` and pool APIs per submodule is not supported.**
-  Don't hand-carve one of AEC/NR/the FFT backend into a pool segment
-  yourself while letting `audio_pipeline_create()` heap-allocate another,
-  and don't call `aec_create()`/`mmse_lsa_create()`/`fft_create()` directly
-  alongside this library's own carve. `audio_pipeline_init()`/`_init_ex()`
-  own the ENTIRE pool layout (control block + AEC + FFT + NR + the 8
-  pipeline scratch buffers) as one unit — there is no supported way to substitute
-  a heap-obtained sub-module handle into a pool-resident `AudioPipeline`,
-  or vice versa.
-
-### Descriptor semantics (`AudioPipelineMemReq`)
-
-Descriptor V2: every field is a fixed-width integer
-(`uint32_t`/`uint64_t`, never `size_t` or a pointer), and the struct is
-pinned to a stable, `_Static_assert`-enforced **32-byte** layout — see
-"Serializing the descriptor" below for what that does (and does not) buy
-you. This is a **BREAKING** change from the original descriptor shape
-(`{size_t bytes; size_t alignment; uint32_t layout_version; const char*
-backend; uint32_t build_flags_hash;}`); every caller in this repo has been
-updated, there is no compatibility shim.
-
-| Field | Meaning |
-|-------|---------|
-| `descriptor_version` | This STRUCT's own ABI version — `AUDIO_PIPELINE_DESCRIPTOR_VERSION` (currently `2`). Bumped only when `AudioPipelineMemReq`'s field set/order/width changes, independent of `layout_version` below (which tracks THIS FILE's carve layout, not the descriptor struct's own shape). `audio_pipeline_init_ex()` checks this FIRST, before interpreting any other field. |
-| `layout_version` | Bumped whenever `audio_pipeline.c`'s OWN carve order/buffer set/sizing formula changes — i.e. whenever a `bytes` figure computed by an older build would misdescribe a newer build's actual carve, or vice versa. Starts at 1. Does **not** need bumping for a change purely inside AEC's/NR's/an FFT backend's own internal `_get_mem_size` layout (each is consumed as one opaque composite blob here, same as the pre-F20 static CLI already treated them — a stale cached `bytes` from an old submodule build is still caught by the undersized-pool rejection at init). |
-| `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_KISS` (1) or `AUDIO_PIPELINE_BACKEND_NE10` (2) (matches this Makefile's `BACKEND=`). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. The two backends are not byte-identical to each other; a descriptor from one is never valid for the other even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
-| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 8 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
-| `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, both FFT backends, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
-| `reserved` | Always 0. Exists only so `bytes` (a `uint64_t`) lands on an 8-byte-aligned offset within the struct with no compiler-inserted padding — part of the fixed 32-byte layout, not a field to read or write. |
-| `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the 8 pipeline scratch buffers, same carve `aec_nr_pipeline_static.c`'s old file-local `pipeline_pool_size()` produced). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_init*()` on a target where the two widths differ. |
-
-`audio_pipeline_init_ex(mem, bytes, cfg, expected)` (see "Sequence" above)
-automates exactly this comparison: passing the descriptor straight back in
-as `expected` makes the library itself recompute the CURRENT
-`descriptor_version`/`layout_version`/`backend_id`/`build_flags_hash`/
-`alignment`/`bytes` and reject (`NULL`, with a diagnostic naming the
-mismatched field) unless every one still agrees with `expected` — a board
-integrator no longer has to hand-write this comparison. The one discipline
-this does NOT relieve you of: `expected` must itself have been queried
-freshly (see "Warnings" above) — `audio_pipeline_init_ex()` can only compare
-what it's given against what the CURRENT build computes; it has no way to
-know whether the `expected` you passed in was itself stale relative to some
-THIRD, even older, build.
-
-### Serializing the descriptor
-
-`AudioPipelineMemReq` is a fixed-width, 32-byte POD (`_Static_assert`-pinned
-in `audio_pipeline.h`, sizeof and every field's offset) — unlike the F20
-shape, it can be copied byte-for-byte (`memcpy`) to a file, a flash region,
-or a wire message, and read back later, even by a different process, even
-after a restart. This is deliberately scoped narrower than "fully portable
-serialization":
-
-- **Same-endianness only.** The board firmware and this library build run
-  on the SAME CPU, so this struct provides no byte-swap helpers and makes
-  no attempt to support a big-endian producer read by a little-endian
-  consumer (or vice versa). If you ever need cross-endian interchange, add
-  your own swap routine at the serialization boundary — it does not exist
-  here today.
-- **Not a substitute for re-querying.** A persisted/transmitted descriptor
-  is still exactly the "stale cache" risk "Warnings" above describes — the
-  fixed layout only means the BYTES survive the round trip intact, not that
-  they still describe the CURRENT build. Always pass a freshly-queried
-  descriptor as `expected` to `audio_pipeline_init_ex()`; treat a persisted
-  copy as informational at best (e.g. a board bring-up log recording what
-  the PREVIOUS boot's build looked like).
-
-### Dirty-pool contract
-
-`audio_pipeline_init()` does **not** require a zero-filled pool. Every
-pipeline-owned scratch buffer (the OLA accumulator, per-bin gain/spectrum
-scratch, the aec_out hop copy) is explicitly zeroed at carve time,
-and AEC/NR/the FFT backend each zero their own sub-region during their own
-`_init()` — so a pool filled with poison bytes inits and processes
-identically to a freshly-zeroed one. `test_audio_pipeline.c`'s
-create-vs-init parity case exercises exactly this: a `memset(pool, 0xA5,
-bytes)`-poisoned pool run through `audio_pipeline_init()` produces
-byte-for-byte the same 1000-hop output as `audio_pipeline_create()`'s
-(unpoisoned) heap path. There is no need for a caller-side blanket
-`memset(pool, 0, bytes)` before `audio_pipeline_init()` — it was only ever a
-defensive habit carried over from the pre-F20 static CLI, not a requirement.
-
-### `USE_EXT_MEM` — not a thing here
-
-Both the heap path (`audio_pipeline_create`/`audio_pipeline_destroy`) and the
-pool path (`audio_pipeline_get_mem_requirements`/`audio_pipeline_init`/
-`audio_pipeline_destroy`) are always compiled into `libaudio_pipeline.a` —
-which one you use is selected purely by which entry point you call, at
-runtime, same as `lib/aec`'s and `lib/nr`'s own `_create` vs. `_get_mem_size`/
-`_init` pairs. There is no `-DUSE_EXT_MEM`-style compile-time switch (that
-pattern existed historically in `lib/nr` and was removed — see
-`lib/nr/c_impl/CHANGELOG.md` `[v1.11.0]`/later entries); do not look for one,
-and do not add one.
-
-### `NO_STDIO=1` — building without libc stdio
-
-`audio_pipeline.c`'s own diagnostics (init/build-time reject reasons only —
-nothing on the per-hop `audio_pipeline_process()` path ever logs anything)
-are advisory: every failure this file can hit is ALSO signalled through its
-return value (`NULL`/`-1`), so a board image that cannot or will not link
-libc's stdio (no console, or a policy that forbids the stdio symbol set
-outright) still gets a fully-functional library — it only loses the
-human-readable "why" that would otherwise go to `stderr`.
-
-```bash
-make BACKEND=ne10 NO_STDIO=1 libaudio_pipeline.a
-```
-
-compiles `audio_pipeline.o` with `-DAUDIO_PIPELINE_NO_STDIO`, which turns
-every diagnostic in that file into a no-op and drops its `<stdio.h>`
-include entirely — the resulting `libaudio_pipeline.a` references none of
-`fprintf`/`printf`/`puts`/`fputs`/`stderr`/`__stderrp`.
-
-```bash
-make BACKEND=ne10 audit-no-stdio   # PASS/FAIL, non-zero exit on FAIL
-```
-
-builds exactly that and asserts it with `nm` over `audio_pipeline.o` itself
-(pattern/style follows `audio_common/scripts/audit_alloc_symbols.sh`) — run
-it after touching any diagnostic in `audio_pipeline.c` to confirm the gate
-still holds.
-
-`NO_STDIO` only ever changes `audio_pipeline.o`'s own compile flags (see the
-`LIB_CFLAGS` comment in `Makefile`, and its `CFG_SIG`/`OBJ_DIR` participation
-so a `NO_STDIO=1` build never shares an object directory with a default
-build). Both CLIs (`aec_nr_pipeline`/`aec_nr_pipeline_static` — host tools
-that always do their own WAV-I/O stdio) and `test_audio_pipeline` (prints
-its own PASS/FAIL via stdio) keep stdio regardless — neither references
-`AUDIO_PIPELINE_NO_STDIO`, so there is nothing to gain (and real CLI/test
-diagnostics to lose) by gating them too. `make BACKEND=<b> NO_STDIO=1`
-(without a specific target) still builds both CLIs normally, linked against
-a `NO_STDIO=1` `libaudio_pipeline.a` — this is a supported combination, it
-simply means the library half of that binary stays silent on rejection
-while the CLI half keeps its own WAV-path error messages.
-
-A board build linking a `NO_STDIO=1` `libaudio_pipeline.a` must rely
-entirely on return values (`NULL`/`-1`, including the field-by-field
-`audio_pipeline_init_ex()` rejection reasons documented under "Sequence"
-above) — there is no error-callback or status-code-detail mechanism beyond
-what each function already returns. The diagnostic strings exist for a
-dev/desktop build's console only; do not build board firmware assuming
-they will be there.
-
-### Board-side verification checklist
-
-Before trusting a board integration of this library in production, verify
-each of the following on-target. Most of these are properties of the
-**caller's** allocator/integration code, not of `audio_pipeline.c` itself —
-this library only checks what it can observe from inside a single call
-(alignment of the pointer it was handed, the `bytes` count it was told,
-the `expected` descriptor if one was passed); it has no visibility into the
-platform allocator, DMA engine, or power state behind that pointer.
-
-- **16-byte alignment**: the `pool` pointer is aligned exactly as
-  `req.alignment` reports (16 today). `audio_pipeline_init_ex()` rejects a
-  misaligned `mem` argument, but only if one is actually passed in
-  misaligned — the platform allocator itself must honor the alignment it
-  was asked for.
-- **Exact-bytes accounting**: the block handed to `audio_pipeline_init_ex()`
-  really is at least `req.bytes` USABLE bytes — verify the allocator's own
-  bookkeeping (e.g. an internal header carved out of the block it hands
-  back) doesn't silently shrink the usable region below what was requested.
-- **Region non-overlap**: the pool is not aliased with any other
-  allocation, DMA buffer, or another `AudioPipeline`'s pool — every
-  sub-module pointer inside the pool is a raw pointer into it, not a copy,
-  so an overlapping region is silent memory corruption, not a caught error.
-- **Exclusive lifetime**: nothing else reads or writes the pool for the
-  entire lifetime of the handle, from `audio_pipeline_init_ex()` through
-  the matching `audio_pipeline_destroy()` — no other task, ISR, or DMA
-  transfer touches it concurrently.
-- **Cache coherence / DMA ownership**: if `mic`/`ref`/`out` (or the pool
-  itself, on a non-cache-coherent platform) cross a DMA boundary, the
-  board's own cache-maintenance operations (clean/invalidate) run at the
-  correct points. This library has no notion of cache lines or DMA and
-  performs none of its own — `audio_pipeline_process()` assumes `mic`/`ref`
-  are already CPU-visible on entry and that `out` is fully written before
-  any DMA-out on it begins.
-- **Allocator-failure / partial-init rollback**: confirm the caller's own
-  rollback path is correct for a `platform_alloc()` failure BEFORE
-  `audio_pipeline_init_ex()` is ever called — this library never partially
-  commits (every rejection path returns `NULL` before writing into `mem`),
-  so there is nothing on ITS side to roll back, but the caller's own
-  pool-acquisition failure handling is not something this library can
-  verify.
-- **Reset / reconfigure / double-destroy / power-resume**: exercise
-  `audio_pipeline_reset()` (echo-path change), a full destroy-then-
-  re-`init_ex()` on the SAME pool (config change), calling
-  `audio_pipeline_destroy()` twice in a row (must be a safe no-op the
-  second time — see "Teardown order" below), and a power-suspend/resume
-  cycle if the target platform has one (this library has no notion of
-  power state itself; confirm the pool's contents survive whatever the
-  platform does across suspend, or re-`init_ex()` from scratch on resume
-  if they don't).
-- **Allocator-hook trace of init→destroy (zero-heap, both backends)**:
-  with a runtime allocator-hook/interposer (the style `lib/aec`'s and
-  `audio_common`'s own zero-heap tests use), confirm NO `malloc`/`calloc`/
-  `realloc`/`free` call happens between `audio_pipeline_init_ex()`
-  returning and the matching `audio_pipeline_destroy()` returning, ON YOUR
-  ACTUAL TARGET BUILD — KISS and NE10 are both zero-heap end-to-end since
-  P0001 (see "Two Versions" above), but that is a property of THIS repo's
-  reference builds, not a substitute for verifying your own board's build.
-  **Include the logging path in this trace**: on the default (stdio-
-  enabled) library build, a rejected `audio_pipeline_init_ex()` call only
-  ever touches `stderr` (no heap symbol involved), so it does not itself
-  break a zero-heap trace — but if the target forbids the stdio symbol set
-  outright (not just heap use), build with `NO_STDIO=1` (above) so even
-  that `stderr` reference is compiled out, and re-run the same audit
-  against that build (`make BACKEND=<b> audit-no-stdio` is the static,
-  `nm`-based version of this same check — see above).
-
-### Teardown order
-
-`audio_pipeline_destroy()` tears down NR → pipeline FFT (the OLA irfft
-instance) → AEC — the reverse of `audio_pipeline_init()`'s carve order (AEC →
-FFT → NR → scratch). Every one of those three calls is a genuine no-op for a
-pool-resident instance today, on **both** backends (matches the "Two
-Versions" section above — NE10's twiddle configs moved fully into the pool
-under vendored patch P0001, closing the one case that used to need a real
-release); the order is kept anyway as forward-compat insurance — a future
-backend/module MAY hold something outside the pool that a destroy call
-needs to release (see the P0001 history earlier in this file for what that
-looked like pre-fix), and it is exactly what the heap-convenience path needs
-for real (`free()` on the pool `audio_pipeline_create()` allocated).
+The full firmware contract — pool sizing, the query -> init -> process ->
+destroy sequence, descriptor semantics, `NO_STDIO=1`, the cross-compile /
+publish flow, and the on-target verification checklist — is in
+[`../docs/pipeline_board_integration.md`](../docs/pipeline_board_integration.md).
 
 ## Tunable Parameters
 
@@ -931,8 +403,8 @@ older power-dB (`/10`) convention.
 |-----------|---------|-------------|
 | `alpha_s` | 0.95 | 功率譜時間平滑（authored 常數，10ms 基準） |
 | `alpha_d` | 0.70 | 噪聲更新速率（authored 常數，10ms 基準；BALANCED 值，見上方 retime 說明） |
-| `L` | 64 | 最小值追蹤視窗（幀數；**已retime**，16 kHz 預設 256/128 grid（hop=128, 16ms 基準）下的實際值，換到其他 grid 需重算，不可直接按比例縮放） |
-| `num_init_frames` | 25 | 初始化靜默幀數（**已retime**，16 kHz 預設 256/128 grid（10ms 基準）下 ≈200ms 的實際值，換到其他 grid 需重算） |
+| `L` | 64 | 最小值追蹤視窗（幀數；**已 retime**；authored 值為 32 hops @ 16 ms，16 kHz 預設 256/128 grid 的實際 hop 為 8 ms，因此 effective 值為 64；其他 grid 請由設定 API 讀回） |
+| `num_init_frames` | 25 | 初始化靜默幀數（**已 retime**；常數以 10 ms 為 authored basis，16 kHz 預設 256/128 的實際 hop 是 8 ms，因此 25 hops ≈200 ms） |
 | `scene_change_threshold_db` | 10.0 | 場景轉換偵測閾值（純 dB 常數，不 retime） |
 
 **SPP**：

@@ -10,7 +10,7 @@ AEC repo's bench_aecmos.py can score each:
   separated : AEC(linear) -> NR(E(f)) -> RES (freq-domain)  (item-12 topology)
 
 Usage:
-  python3 pipelines/rebench_sep_vs_classic.py <classic_dir> <separated_dir> [limit_per_scenario]
+  python3 pipelines/tools/rebench_sep_vs_classic.py <classic_dir> <separated_dir> [limit_per_scenario]
 Then:
   python3 ../AEC/python/bench_aecmos.py <classic_dir>   <res_classic>
   python3 ../AEC/python/bench_aecmos.py <separated_dir> <res_separated> --baseline <res_classic>/scores.json
@@ -23,7 +23,7 @@ import sys
 import numpy as np
 import soundfile as sf
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # Audio_ALG/
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 

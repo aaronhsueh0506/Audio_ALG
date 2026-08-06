@@ -1,5 +1,6 @@
 import configparser
 import copy
+import dataclasses
 import importlib
 import pathlib
 
@@ -23,7 +24,12 @@ from AIAEC.training_common import (
     require_checkpoint_linear_aec,
     split_dataset_by_sample,
 )
-from AIAEC.dataset_gen import LinearAecProcessor, make_linear_aec_contract
+from AIAEC.dataset_gen import (
+    LinearAecContract,
+    LinearAecProcessor,
+    make_linear_aec_contract,
+    require_linear_aec_contract,
+)
 from AINR.DeepFilterNet2.model import DeepFilterNet2
 
 
@@ -292,11 +298,69 @@ def test_inference_linear_aec_matches_offline_materializer_exactly():
     )
 
 
-def test_inference_rejects_drifted_linear_aec_source_contract():
+def test_inference_rejects_a_different_linear_aec_build():
+    """A dataset materialized by a different lib/aec must not load silently.
+
+    ``aec_behavior_hash`` is the only contract field that carries any
+    information about the AEC implementation, so this is the single test
+    standing between a changed PBFDKF/delay/formed-output seam and inference
+    quietly running a different frontend than the checkpoint was trained on.
+    """
+    contract = make_linear_aec_contract(16000, frame_size=512).as_dict()
+    contract['aec_behavior_hash'] = '0' * 64
+    with pytest.raises(ValueError, match='aec_behavior_hash'):
+        LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
+
+
+def test_inference_accepts_comment_only_provenance_drift():
+    """A comment/format-only edit to lib/aec must NOT invalidate a checkpoint.
+
+    Raw-text provenance moves on a comment reflow; behaviour does not. Only the
+    latter gates compatibility, so a doc cleanup cannot strand an already-trained
+    checkpoint that no rematerialization could repair.
+    """
     contract = make_linear_aec_contract(16000, frame_size=512).as_dict()
     contract['aec_source_hash'] = '0' * 64
-    with pytest.raises(ValueError, match='aec_source_hash'):
-        LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
+    contract['aec_commit'] = 'a-comment-only-cleanup-commit'
+    LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
+
+
+def test_contract_comparison_rejects_behavioral_linear_aec_drift():
+    expected = make_linear_aec_contract(16000, frame_size=512).as_dict()
+    actual = dict(expected)
+    actual['filter_length'] += actual['hop_size']
+    with pytest.raises(ValueError, match='filter_length'):
+        require_linear_aec_contract(actual, expected, 'test')
+
+
+def test_contract_comparison_is_not_vacuous():
+    """Guard against the comparison silently losing its only real condition.
+
+    Both call sites build the ``runtime`` contract by echoing the recorded
+    contract's sample_rate/preset/frame_size/filter_length, and every remaining
+    non-provenance field is pinned to a literal by ``__post_init__``. So if the
+    provenance fields are ever excluded from the comparison again, no field can
+    differ on any real path and the check becomes a tautology -- which is
+    exactly what this asserts is not the case.
+    """
+    recorded = make_linear_aec_contract(16000, frame_size=512)
+    runtime = make_linear_aec_contract(
+        recorded.sample_rate, preset=recorded.preset,
+        frame_size=recorded.frame_size, filter_length=recorded.filter_length,
+    )
+    fields = {f.name for f in dataclasses.fields(LinearAecContract)}
+    provenance = {'aec_commit', 'aec_source_hash', 'aec_behavior_hash'}
+    differing = {
+        name for name in fields - provenance
+        if getattr(runtime, name) != getattr(recorded, name)
+    }
+    assert not differing, (
+        'a non-provenance field varies between an echoed runtime contract and '
+        f'the recorded one ({differing}); update this test if that is intended'
+    )
+    stale = dataclasses.replace(recorded, aec_behavior_hash='0' * 64)
+    with pytest.raises(ValueError, match='aec_behavior_hash'):
+        require_linear_aec_contract(runtime.as_dict(), stale.as_dict(), 'test')
 
 
 def test_resnr_trainers_do_not_import_or_execute_live_linear_aec():

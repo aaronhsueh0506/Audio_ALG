@@ -105,12 +105,8 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * ========================================================================== */
 
 #define AUDIO_PIPELINE_4CH_DESCRIPTOR_VERSION 1u
-/* v2 (2026-08-04) removes the spatial_input scratch buffer and its
- * spatial_channels[] pointer slices: SRP/GSC's X parameter is now
- * const Complex* const*, so pre.linear_spectra[ch] (already a borrowed
- * const Complex* per lane) is passed straight into doa_step()/
- * gsc_process_with_weights() instead of being memcpy'd into wrapper-owned
- * scratch first. */
+/* The current layout passes the core's borrowed per-channel spectra directly
+ * to SRP/GSC; it does not allocate a duplicate spatial-input buffer. */
 #define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 2u
 
 /**
