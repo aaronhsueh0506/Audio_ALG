@@ -308,9 +308,11 @@ This is structurally correct but **not bit-exact** to a future fully extracted
 AEC3 post-beam RES API; it must be cohort-tuned before production sign-off.
 
 The core C API does not expose an async multi-frame queue. The complete C
-wrapper does execute SRP-PHAT/GSC, but it remains synchronous and heap-backed.
-Automated tests prove caller-pool and heap lifecycle, byte-identical core
-construction paths, topology, supported grids, spatial arithmetic equivalence,
+wrapper does execute SRP-PHAT/GSC and remains synchronous; it supports both
+the heap convenience constructor and the caller-owned, zero-heap static-pool
+constructor shown above. Automated tests prove caller-pool and heap lifecycle,
+byte-identical core construction paths, topology, supported grids, spatial
+arithmetic equivalence,
 sequencing, and finite DSP output; they do not replace objective speech
 metrics or subjective quality sign-off on real array recordings.
 

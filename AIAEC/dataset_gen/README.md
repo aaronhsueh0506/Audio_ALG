@@ -298,7 +298,9 @@ Scope: `aec_behavior_hash` covers `aec.py` plus everything under `modules/` —
 the code `LinearAecProcessor` can actually reach. `diag/`, `tests/` and the
 bench/eval tooling are excluded, and the module-level `__version__` assignment
 is stripped before hashing, so editing a test, a golden generator or the release
-version cannot strand a checkpoint. `aec_source_hash` still covers all 87 files.
+version cannot strand a checkpoint. `aec_source_hash` still covers every
+Python file under `lib/aec/python`; unlike the 48-file signal-path scope, that
+provenance count intentionally grows when tests or diagnostics are added.
 
 **v2 → v3 has no automatic migration, deliberately.** A v2 contract records only
 a raw-text source hash, so once `lib/aec` has moved on there is no way to
