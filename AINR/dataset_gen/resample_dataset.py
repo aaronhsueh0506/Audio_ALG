@@ -26,14 +26,15 @@ Usage:
 Preserves:
     - directory structure (relative to --input) and filenames
     - 2-channel (noisy, clean) pair layout produced by gen_dataset.py
-    - meta.json (sr field updated to --target-sr; original rate recorded as
-      source_sr)
+
+The output is WAV only, same as the input: a resampled directory is packable
+by pack_dataset.py exactly like the original.
 """
 
 import argparse
 import glob
-import json
 import os
+import re
 
 import torch.utils.data as data
 import torchaudio
@@ -55,6 +56,7 @@ KAISER_FAST = dict(
     beta=8.555504641634386,
 )
 CLIP_GUARD = 0.999
+PAIR_WAV_RE = re.compile(r'^\d+\.wav$')
 
 
 def resampled_num_frames(num_frames: int, source_sr: int, target_sr: int) -> int:
@@ -120,8 +122,18 @@ class _ResampleJob(data.Dataset):
 
 
 def _scan_wavs(input_dir):
-    """Recursively find WAV pairs under a generated dataset directory."""
-    return sorted(glob.glob(os.path.join(input_dir, '**', '*.wav'), recursive=True))
+    """Recursively find the same numbered WAV pairs the packer accepts.
+
+    In particular, a killed atomic write leaves ``tmp.NNNNNN.wav``.  A broad
+    ``**/*.wav`` scan used to resample that incomplete temp file even though
+    both the generator and packer correctly ignored it.
+    """
+    return sorted(
+        path for path in glob.glob(
+            os.path.join(input_dir, '**', '*.wav'), recursive=True
+        )
+        if PAIR_WAV_RE.fullmatch(os.path.basename(path))
+    )
 
 
 def _identity_collate(batch):
@@ -166,29 +178,6 @@ def resample_dataset(args):
         peak_max = max(peak_max, result['peak_after'])
         if result['rescaled_for_clip_guard']:
             n_clipped += 1
-
-    # Carry over / update meta.json if present at the input root
-    meta_path_in = os.path.join(args.input, 'meta.json')
-    if os.path.isfile(meta_path_in):
-        with open(meta_path_in) as f:
-            meta = json.load(f)
-        meta['source_sr'] = meta.get('sr')
-        meta['sr'] = args.target_sr
-        if meta.get('segment_samples') is not None and meta['source_sr']:
-            meta['segment_samples'] = resampled_num_frames(
-                int(meta['segment_samples']),
-                int(meta['source_sr']),
-                args.target_sr,
-            )
-        elif meta.get('segment_sec') is not None:
-            meta['segment_samples'] = int(
-                round(float(meta['segment_sec']) * args.target_sr)
-            )
-        meta['resampled_from'] = os.path.abspath(args.input)
-        meta['resample_quality'] = args.quality
-        with open(os.path.join(args.output, 'meta.json'), 'w') as f:
-            json.dump(meta, f, indent=2)
-        print(f"  meta.json: sr {meta['source_sr']} -> {meta['sr']} (carried over, updated)")
 
     clip_note = f", {n_clipped} file(s) rescaled to avoid clipping" if n_clipped else ""
     print(f"\nDone. {len(in_files)} file(s) -> {args.output}/ "

@@ -1,7 +1,6 @@
 """Regression tests for dataset generation planning and RIR alignment."""
 
 import configparser
-import json
 import math
 import os
 import random
@@ -28,20 +27,16 @@ from dataset_gen.dataset import (
     validate_mix_probabilities,
 )
 from dataset_gen.gen_dataset import (
-    AINR_DATASET_CONTRACT_VERSION,
     DatasetContractError,
-    _canonical_config_hash,
-    _repair_orphans,
-    _sample_paths,
-    _save_metadata_sidecar_atomic,
+    _list_sample_indices,
+    _list_stale_temp_files,
+    _sample_wav_path,
     _save_pair_atomic,
-    _scan_existing_samples,
     _tmp_path,
-    _validate_resume_contract,
     hours_to_sample_count,
     seed_worker,
 )
-from dataset_gen.resample_dataset import resampled_num_frames
+from dataset_gen.resample_dataset import _scan_wavs, resampled_num_frames
 
 
 def _load_example_config() -> configparser.ConfigParser:
@@ -641,10 +636,9 @@ class ClipSnrRangeConfigTest(unittest.TestCase):
 
 class ExampleConfigExactValuesTest(unittest.TestCase):
     """Pins the example config's own documented distribution-defining
-    values -- these are what AINR_DATASET_CONTRACT_VERSION's config_hash
-    ultimately protects against a silent drift across --resume; if either
-    of these ever legitimately changes, the change should be a deliberate,
-    reviewed edit to this test too, not an accident."""
+    values. Nothing on disk records which config produced a batch any more, so
+    an accidental edit here is no longer detectable after the fact -- which
+    makes pinning them in a test the remaining guard, not a redundant one."""
 
     def test_snr_values_exact_list(self):
         cfg = _load_example_config()
@@ -656,150 +650,16 @@ class ExampleConfigExactValuesTest(unittest.TestCase):
         self.assertEqual(cfg.getfloat('rir', 'p_rir'), 0.5)
 
 
-class CanonicalConfigHashTest(unittest.TestCase):
-    def test_identical_config_hashes_identically(self):
-        cfg_a = _load_example_config()
-        cfg_b = _load_example_config()
-        self.assertEqual(_canonical_config_hash(cfg_a), _canonical_config_hash(cfg_b))
-
-    def test_changing_snr_values_changes_the_hash(self):
-        cfg_a = _load_example_config()
-        cfg_b = _load_example_config()
-        cfg_b.set('mixing', 'snr_values', '-15, -10, -5, 0, 5, 10, 20')
-        self.assertNotEqual(_canonical_config_hash(cfg_a), _canonical_config_hash(cfg_b))
-
-    def test_changing_p_rir_changes_the_hash(self):
-        cfg_a = _load_example_config()
-        cfg_b = _load_example_config()
-        cfg_b.set('rir', 'p_rir', '0.9')
-        self.assertNotEqual(_canonical_config_hash(cfg_a), _canonical_config_hash(cfg_b))
-
-    def test_changing_sample_rate_changes_the_hash(self):
-        # gen_dataset() folds a --sample-rate override into cfg (cfg.set)
-        # BEFORE computing config_hash -- this proves that resolved value,
-        # not just config.ini's own on-disk sr, is what's protected.
-        cfg_a = _load_example_config()
-        cfg_b = _load_example_config()
-        cfg_b.set('signal', 'sr', str(cfg_a.getint('signal', 'sr') + 1))
-        self.assertNotEqual(_canonical_config_hash(cfg_a), _canonical_config_hash(cfg_b))
-
-
-class ResumeContractValidationTest(unittest.TestCase):
-    def test_fresh_output_directory_returns_none(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            meta_path = Path(tmp) / 'meta.json'
-            pairs_dir = Path(tmp) / 'pairs'
-            pairs_dir.mkdir()
-            result = _validate_resume_contract(
-                str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
-                'abc123', 16000)
-            self.assertIsNone(result)
-
-    def test_matching_meta_is_accepted(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            meta_path = Path(tmp) / 'meta.json'
-            pairs_dir = Path(tmp) / 'pairs'
-            pairs_dir.mkdir()
-            meta_path.write_text(json.dumps({
-                'contract_version': AINR_DATASET_CONTRACT_VERSION,
-                'config_hash': 'abc123',
-                'sr': 16000,
-            }))
-            result = _validate_resume_contract(
-                str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
-                'abc123', 16000)
-            self.assertEqual(result['config_hash'], 'abc123')
-
-    def test_contract_version_mismatch_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            meta_path = Path(tmp) / 'meta.json'
-            pairs_dir = Path(tmp) / 'pairs'
-            pairs_dir.mkdir()
-            meta_path.write_text(json.dumps({
-                'contract_version': AINR_DATASET_CONTRACT_VERSION - 1,
-                'config_hash': 'abc123',
-                'sr': 16000,
-            }))
-            with self.assertRaises(DatasetContractError):
-                _validate_resume_contract(
-                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
-                    'abc123', 16000)
-
-    def test_config_hash_mismatch_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            meta_path = Path(tmp) / 'meta.json'
-            pairs_dir = Path(tmp) / 'pairs'
-            pairs_dir.mkdir()
-            meta_path.write_text(json.dumps({
-                'contract_version': AINR_DATASET_CONTRACT_VERSION,
-                'config_hash': 'old_hash',
-                'sr': 16000,
-            }))
-            with self.assertRaises(DatasetContractError):
-                _validate_resume_contract(
-                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
-                    'new_hash', 16000)
-
-    def test_sample_rate_mismatch_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            meta_path = Path(tmp) / 'meta.json'
-            pairs_dir = Path(tmp) / 'pairs'
-            pairs_dir.mkdir()
-            meta_path.write_text(json.dumps({
-                'contract_version': AINR_DATASET_CONTRACT_VERSION,
-                'config_hash': 'abc123',
-                'sr': 16000,
-            }))
-            with self.assertRaises(DatasetContractError):
-                _validate_resume_contract(
-                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
-                    'abc123', 48000)
-
-    def test_no_bypass_exists_for_any_mismatch(self):
-        # A prior --resume-force-contract-mismatch escape hatch was removed
-        # before release (see AINR_DATASET_CONTRACT_VERSION's changelog) --
-        # pin that _validate_resume_contract has no way to accept a
-        # mismatch at all, i.e. the function signature itself enforces this
-        # rather than relying on nobody passing a force flag.
-        import inspect
-        sig = inspect.signature(_validate_resume_contract)
-        self.assertNotIn('force', sig.parameters)
-
-    def test_missing_meta_with_existing_wav_is_rejected(self):
-        # Exact regression for the reported release blocker: a batch
-        # interrupted before its first meta.json write (or one predating
-        # meta.json entirely) must never be treated as "fresh" just because
-        # meta.json itself is absent -- pairs/ already having sample files
-        # is itself evidence this is NOT a fresh, empty output directory.
-        with tempfile.TemporaryDirectory() as tmp:
-            meta_path = Path(tmp) / 'meta.json'
-            pairs_dir = Path(tmp) / 'pairs'
-            pairs_dir.mkdir()
-            (pairs_dir / '000000.wav').write_bytes(b'not a real wav, just a marker')
-            with self.assertRaises(DatasetContractError):
-                _validate_resume_contract(
-                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
-                    'abc123', 16000)
-
-    def test_missing_meta_with_existing_json_is_rejected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            meta_path = Path(tmp) / 'meta.json'
-            pairs_dir = Path(tmp) / 'pairs'
-            pairs_dir.mkdir()
-            (pairs_dir / '000000.json').write_text('{}')
-            with self.assertRaises(DatasetContractError):
-                _validate_resume_contract(
-                    str(meta_path), str(pairs_dir), AINR_DATASET_CONTRACT_VERSION,
-                    'abc123', 16000)
-
-
 class AtomicSampleWriteTest(unittest.TestCase):
+    """With the sidecar gone, the temp-file rename is the ONLY thing that
+    marks a sample finished -- so these are load-bearing, not hygiene."""
+
     def test_save_pair_atomic_leaves_only_the_final_wav(self):
         with tempfile.TemporaryDirectory() as tmp:
             noisy = torch.zeros(160)
             clean = torch.zeros(160)
             _save_pair_atomic(tmp, 3, noisy, clean, 16000)
-            wav_path, _ = _sample_paths(tmp, 3)
+            wav_path = _sample_wav_path(tmp, 3)
             self.assertTrue(Path(wav_path).exists())
             self.assertFalse(Path(_tmp_path(wav_path)).exists())
 
@@ -813,98 +673,59 @@ class AtomicSampleWriteTest(unittest.TestCase):
                        side_effect=RuntimeError('disk full')):
                 with self.assertRaises(RuntimeError):
                     _save_pair_atomic(tmp, 5, torch.zeros(160), torch.zeros(160), 16000)
-            wav_path, _ = _sample_paths(tmp, 5)
-            self.assertFalse(Path(wav_path).exists())
+            self.assertFalse(Path(_sample_wav_path(tmp, 5)).exists())
 
-    def test_save_metadata_sidecar_atomic_leaves_only_the_final_json(self):
+
+class SampleScanTest(unittest.TestCase):
+    def test_empty_directory_has_no_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
-            _save_metadata_sidecar_atomic(tmp, 7, {'snr_db': 5.0})
-            _, json_path = _sample_paths(tmp, 7)
-            self.assertTrue(Path(json_path).exists())
-            self.assertFalse(Path(_tmp_path(json_path)).exists())
-            content = json.loads(Path(json_path).read_text())
-            self.assertEqual(content['index'], 7)
-            self.assertEqual(content['snr_db'], 5.0)
+            self.assertEqual(_list_sample_indices(tmp), [])
+            self.assertEqual(_list_stale_temp_files(tmp), [])
 
-
-class OrphanSampleScanTest(unittest.TestCase):
-    def test_empty_directory_has_no_complete_samples(self):
+    def test_numeric_wavs_are_the_samples(self):
         with tempfile.TemporaryDirectory() as tmp:
-            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
-            self.assertEqual(max_idx, -1)
-            self.assertEqual(orphan_wavs, [])
-            self.assertEqual(orphan_jsons, [])
+            for index in (0, 1):
+                _save_pair_atomic(tmp, index, torch.zeros(160), torch.zeros(160), 16000)
+            self.assertEqual(_list_sample_indices(tmp), [0, 1])
 
-    def test_complete_pairs_count_toward_max_index(self):
+    def test_temp_file_is_not_a_sample_but_is_reported_as_stale(self):
         with tempfile.TemporaryDirectory() as tmp:
             _save_pair_atomic(tmp, 0, torch.zeros(160), torch.zeros(160), 16000)
-            _save_metadata_sidecar_atomic(tmp, 0, {})
-            _save_pair_atomic(tmp, 1, torch.zeros(160), torch.zeros(160), 16000)
-            _save_metadata_sidecar_atomic(tmp, 1, {})
-            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
-            self.assertEqual(max_idx, 1)
-            self.assertEqual(orphan_wavs, [])
-            self.assertEqual(orphan_jsons, [])
+            # A crash between torchaudio.save and os.replace.
+            temp = _tmp_path(_sample_wav_path(tmp, 1))
+            torchaudio.save(temp, torch.zeros(2, 160), 16000, bits_per_sample=16)
 
-    def test_orphan_wav_without_sidecar_is_detected_and_excluded_from_max(self):
+            self.assertEqual(_list_sample_indices(tmp), [0],
+                             "an unfinished write must never count as a sample")
+            self.assertEqual(_list_stale_temp_files(tmp), [temp])
+
+    def test_leftover_sidecars_and_meta_are_not_samples(self):
+        """An older corpus's JSON must be inert, not an error, not a sample."""
         with tempfile.TemporaryDirectory() as tmp:
             _save_pair_atomic(tmp, 0, torch.zeros(160), torch.zeros(160), 16000)
-            _save_metadata_sidecar_atomic(tmp, 0, {})
-            # index 1: WAV only -- simulates a crash between the two atomic
-            # writes in the generation loop (WAV renamed, sidecar never was).
-            _save_pair_atomic(tmp, 1, torch.zeros(160), torch.zeros(160), 16000)
-            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
-            self.assertEqual(max_idx, 0, "orphan WAV must never count as a completed sample")
-            self.assertEqual(orphan_wavs, [1])
-            self.assertEqual(orphan_jsons, [])
-
-    def test_orphan_json_without_wav_is_detected(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _save_metadata_sidecar_atomic(tmp, 2, {})
-            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
-            self.assertEqual(max_idx, -1)
-            self.assertEqual(orphan_wavs, [])
-            self.assertEqual(orphan_jsons, [2])
-
-    def test_repair_removes_orphans_and_leaves_complete_pairs_intact(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            _save_pair_atomic(tmp, 0, torch.zeros(160), torch.zeros(160), 16000)
-            _save_metadata_sidecar_atomic(tmp, 0, {})
-            _save_pair_atomic(tmp, 1, torch.zeros(160), torch.zeros(160), 16000)  # orphan wav
-            _save_metadata_sidecar_atomic(tmp, 2, {})  # orphan json
-
-            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
-            _repair_orphans(tmp, orphan_wavs, orphan_jsons)
-
-            max_idx, orphan_wavs, orphan_jsons = _scan_existing_samples(tmp)
-            self.assertEqual(max_idx, 0)
-            self.assertEqual(orphan_wavs, [])
-            self.assertEqual(orphan_jsons, [])
-            wav0, json0 = _sample_paths(tmp, 0)
-            self.assertTrue(Path(wav0).exists())
-            self.assertTrue(Path(json0).exists())
+            Path(tmp, '000000.json').write_text('{"index": 0}')
+            Path(tmp, '000009.json').write_text('{"index": 9}')
+            self.assertEqual(_list_sample_indices(tmp), [0])
 
 
-class ContractCheckOrderingTest(unittest.TestCase):
-    """gen_dataset() must validate the --resume contract BEFORE
-    constructing DNS4Dataset (RIR glob/cache I/O) or running the one-sample
-    profiling pass -- a mismatch should exit immediately, not after paying
-    for both. Proven here by mocking DNS4Dataset to raise if it is ever
-    instantiated: if the contract check ran second, THAT exception would
-    surface instead of DatasetContractError."""
+class ScanOrderingTest(unittest.TestCase):
+    """gen_dataset() must scan pairs/ BEFORE constructing DNS4Dataset (RIR
+    glob/cache I/O) or running the one-sample profiling pass -- a refusal
+    should exit immediately, not after paying for both. Proven here by mocking
+    DNS4Dataset to raise if it is ever instantiated: if the scan ran second,
+    THAT exception would surface instead of DatasetContractError."""
 
-    def test_contract_mismatch_never_reaches_dns4dataset_construction(self):
+    def test_refusal_never_reaches_dns4dataset_construction(self):
         from dataset_gen import gen_dataset as gen_dataset_module
 
         with tempfile.TemporaryDirectory() as tmp:
             output_dir = os.path.join(tmp, 'batch')
             pairs_dir = os.path.join(output_dir, 'pairs')
             os.makedirs(pairs_dir)
-            # A sample file with no meta.json -- the exact "missing
-            # contract record" rejection this test also incidentally
-            # exercises, but the point here is WHEN it's raised.
+            # A gap in the numbering: resume can never backfill index 1, so
+            # this is refused -- the point here is WHEN it's raised.
             (Path(pairs_dir) / '000000.wav').write_bytes(b'marker')
-            (Path(pairs_dir) / '000000.json').write_text('{}')
+            (Path(pairs_dir) / '000002.wav').write_bytes(b'marker')
 
             config_path = os.path.join(tmp, 'config.ini')
             Path(config_path).write_text(
@@ -972,18 +793,16 @@ def _build_real_corpus(tmp, sr=16000, seconds=0.5):
     return config_path, output_dir
 
 
-class MetaJsonRealWriteTimingTest(unittest.TestCase):
-    """Closes the test-coverage gap an adversarial review pass found:
-    ContractCheckOrderingTest above mocks DNS4Dataset to raise, so it never
-    actually reaches _save_meta(0) or a real _save_meta() write -- these
-    tests run gen_dataset() for real (a tiny real corpus, no mocked
-    DNS4Dataset) to prove the on-disk behavior directly.
+class CrashDuringGenerationTest(unittest.TestCase):
+    """A run killed partway leaves a directory that is still exactly what it
+    looks like: N finished samples and nothing else.
+
+    This is the whole safety story now that there is no meta.json to record
+    what a run intended -- so it is checked against a real gen_dataset() run,
+    not a mocked one.
     """
 
-    def test_meta_json_exists_before_any_sample_is_written(self):
-        # A crash on the FIRST sample write (right after _save_meta(0) has
-        # already run) must still leave a valid, readable meta.json with
-        # zero samples recorded -- not a missing file, not a truncated one.
+    def test_crash_on_the_first_sample_leaves_an_empty_but_valid_directory(self):
         from dataset_gen import gen_dataset as gen_dataset_module
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -999,62 +818,47 @@ class MetaJsonRealWriteTimingTest(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     gen_dataset_module.gen_dataset(args)
 
-            meta_path = os.path.join(output_dir, 'meta.json')
-            self.assertTrue(os.path.exists(meta_path),
-                             "meta.json must exist even though zero samples "
-                             "were successfully written")
-            meta = json.loads(Path(meta_path).read_text())
-            self.assertEqual(meta['contract_version'], AINR_DATASET_CONTRACT_VERSION)
-            self.assertEqual(meta['n_samples'], 0)
             pairs_dir = os.path.join(output_dir, 'pairs')
-            self.assertEqual(
-                _scan_existing_samples(pairs_dir), (-1, [], []),
-                "no sample (complete or orphaned) should exist -- the crash "
-                "happened before the first WAV write completed"
-            )
+            self.assertEqual(_list_sample_indices(pairs_dir), [])
+            self.assertEqual(os.listdir(output_dir), ['pairs'],
+                             "generation must not leave anything but pairs/")
 
-    def test_meta_json_write_itself_is_atomic_under_crash(self):
-        # A fresh run first produces a genuinely valid meta.json. A second
-        # (--resume) invocation that crashes on ITS OWN meta.json write
-        # (json.dump raising mid-write) must leave the ORIGINAL valid
-        # meta.json byte-for-byte untouched -- not truncated, not replaced
-        # with a partial write.
+    def test_crash_partway_leaves_the_finished_samples_resumable(self):
         from dataset_gen import gen_dataset as gen_dataset_module
 
         with tempfile.TemporaryDirectory() as tmp:
             config_path, output_dir = _build_real_corpus(tmp)
-            fresh_args = types.SimpleNamespace(
-                config=config_path, output=output_dir, hours=0.001,
+            pairs_dir = os.path.join(output_dir, 'pairs')
+            real_save = gen_dataset_module._save_pair_atomic
+            calls = {'n': 0}
+
+            def crash_on_third(*a, **k):
+                calls['n'] += 1
+                if calls['n'] > 2:
+                    raise RuntimeError('simulated crash partway')
+                return real_save(*a, **k)
+
+            args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.01,
                 workers=0, resume=False, repair_resume=False,
                 start_idx=None, seed=42, sample_rate=None,
             )
-            gen_dataset_module.gen_dataset(fresh_args)
+            with patch.object(gen_dataset_module, '_save_pair_atomic',
+                              side_effect=crash_on_third):
+                with self.assertRaises(RuntimeError):
+                    gen_dataset_module.gen_dataset(args)
 
-            meta_path = os.path.join(output_dir, 'meta.json')
-            original_bytes = Path(meta_path).read_bytes()
-            self.assertGreater(len(original_bytes), 0)
+            self.assertEqual(_list_sample_indices(pairs_dir), [0, 1])
 
-            def _raise_on_meta_write(obj, *a, **k):
-                if isinstance(obj, dict) and 'contract_version' in obj:
-                    raise RuntimeError('simulated crash writing meta.json')
-                return real_json_dump(obj, *a, **k)
-
-            real_json_dump = gen_dataset_module.json.dump
             resume_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.002,
                 workers=0, resume=True, repair_resume=False,
                 start_idx=None, seed=43, sample_rate=None,
             )
-            with patch.object(gen_dataset_module.json, 'dump',
-                               side_effect=_raise_on_meta_write):
-                with self.assertRaises(RuntimeError):
-                    gen_dataset_module.gen_dataset(resume_args)
-
-            self.assertEqual(
-                Path(meta_path).read_bytes(), original_bytes,
-                "a crash mid-write on meta.json's OWN atomic write must "
-                "never corrupt/replace the previously-valid file"
-            )
+            gen_dataset_module.gen_dataset(resume_args)
+            resumed = _list_sample_indices(pairs_dir)
+            self.assertEqual(resumed, list(range(len(resumed))))
+            self.assertGreater(len(resumed), 2)
 
 
 class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
@@ -1062,11 +866,9 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
     directory that already has samples used to be silently accepted --
     validating nothing at all for --start-idx 0, and only warning about a
     single exact-index collision for --start-idx > 0. Either path let a
-    DIFFERENT config's samples get written into part of an existing batch
-    while meta.json ended up recording only the new run's contract, with
-    the old, now-unrecorded-as-different samples left on disk untouched.
-    gen_dataset() must now refuse unconditionally whenever pairs_dir
-    already has ANY sample file and --resume was not passed."""
+    DIFFERENT config's samples overwrite part of an existing batch and leave
+    the rest behind. gen_dataset() must refuse unconditionally whenever
+    pairs/ already has ANY sample and --resume was not passed."""
 
     def test_second_run_without_resume_is_rejected(self):
         from dataset_gen import gen_dataset as gen_dataset_module
@@ -1079,11 +881,11 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
                 start_idx=None, seed=42, sample_rate=None,
             )
             gen_dataset_module.gen_dataset(first_args)
-            meta_path = os.path.join(output_dir, 'meta.json')
-            original_meta_bytes = Path(meta_path).read_bytes()
             pairs_dir = os.path.join(output_dir, 'pairs')
-            original_complete, _, _ = gen_dataset_module._list_complete_sample_indices(pairs_dir)
-            self.assertTrue(original_complete, "first run must have produced samples")
+            original = _list_sample_indices(pairs_dir)
+            self.assertTrue(original, "first run must have produced samples")
+            digests = {i: Path(_sample_wav_path(pairs_dir, i)).read_bytes()
+                       for i in original}
 
             second_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.001,
@@ -1093,15 +895,12 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
             with self.assertRaises(DatasetContractError):
                 gen_dataset_module.gen_dataset(second_args)
 
-            # Nothing about the first run's on-disk state may change --
-            # the rejection must happen before any write.
-            self.assertEqual(Path(meta_path).read_bytes(), original_meta_bytes)
-            new_complete, orphan_wavs, orphan_jsons = (
-                gen_dataset_module._list_complete_sample_indices(pairs_dir)
-            )
-            self.assertEqual(new_complete, original_complete)
-            self.assertEqual(orphan_wavs, [])
-            self.assertEqual(orphan_jsons, [])
+            # Nothing on disk may change -- the rejection must happen before
+            # any write.
+            self.assertEqual(_list_sample_indices(pairs_dir), original)
+            for index, blob in digests.items():
+                self.assertEqual(
+                    Path(_sample_wav_path(pairs_dir, index)).read_bytes(), blob)
 
     def test_start_idx_does_not_bypass_the_rejection(self):
         # The exact shape of the release-blocking repro: forgetting
@@ -1119,8 +918,7 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
             )
             gen_dataset_module.gen_dataset(first_args)
             pairs_dir = os.path.join(output_dir, 'pairs')
-            original_complete, _, _ = gen_dataset_module._list_complete_sample_indices(pairs_dir)
-            n_existing = len(original_complete)
+            original = _list_sample_indices(pairs_dir)
 
             # start_idx set well past the existing batch -- no exact-index
             # collision at all, which is exactly what the OLD single-index
@@ -1128,15 +926,15 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
             second_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.001,
                 workers=0, resume=False, repair_resume=False,
-                start_idx=n_existing + 100, seed=99, sample_rate=None,
+                start_idx=len(original) + 100, seed=99, sample_rate=None,
             )
             with self.assertRaises(DatasetContractError):
                 gen_dataset_module.gen_dataset(second_args)
 
-            new_complete, _, _ = gen_dataset_module._list_complete_sample_indices(pairs_dir)
-            self.assertEqual(new_complete, original_complete,
-                              "no sample may be written when --resume is omitted "
-                              "against a non-empty --output, regardless of --start-idx")
+            self.assertEqual(_list_sample_indices(pairs_dir), original,
+                             "no sample may be written when --resume is omitted "
+                             "against a non-empty --output, regardless of "
+                             "--start-idx")
 
     def test_start_idx_still_works_for_a_fresh_empty_output(self):
         # --start-idx must remain usable for numbering a brand-new,
@@ -1152,116 +950,61 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
                 start_idx=500, seed=42, sample_rate=None,
             )
             gen_dataset_module.gen_dataset(args)
-            pairs_dir = os.path.join(output_dir, 'pairs')
-            complete, orphan_wavs, orphan_jsons = (
-                gen_dataset_module._list_complete_sample_indices(pairs_dir)
-            )
-            self.assertTrue(complete)
-            self.assertEqual(min(complete), 500)
-            self.assertEqual(orphan_wavs, [])
-            self.assertEqual(orphan_jsons, [])
-
-    def test_meta_json_present_with_empty_pairs_dir_is_also_rejected(self):
-        # Found by adversarial review: the original fix only checked
-        # pairs_dir's contents, not whether meta.json itself already
-        # exists. A crash right after _save_meta(0) (valid meta.json,
-        # zero samples written yet -- see MetaJsonRealWriteTimingTest)
-        # left exactly this state reachable in practice. A non-resume
-        # rerun into it would silently overwrite meta.json (discarding
-        # generation_history) with nothing on disk to show anything was
-        # ever different -- the same "old record silently lost" failure
-        # this whole check exists to prevent, just with zero samples at
-        # stake instead of a whole batch.
-        from dataset_gen import gen_dataset as gen_dataset_module
-
-        with tempfile.TemporaryDirectory() as tmp:
-            config_path, output_dir = _build_real_corpus(tmp)
-            first_args = types.SimpleNamespace(
-                config=config_path, output=output_dir, hours=0.001,
-                workers=0, resume=False, repair_resume=False,
-                start_idx=None, seed=42, sample_rate=None,
-            )
-            with patch.object(
-                    gen_dataset_module, '_save_pair_atomic',
-                    side_effect=RuntimeError('simulated crash on first sample')):
-                with self.assertRaises(RuntimeError):
-                    gen_dataset_module.gen_dataset(first_args)
-
-            meta_path = os.path.join(output_dir, 'meta.json')
-            self.assertTrue(os.path.exists(meta_path))
-            pairs_dir = os.path.join(output_dir, 'pairs')
-            complete, orphan_wavs, orphan_jsons = (
-                gen_dataset_module._list_complete_sample_indices(pairs_dir)
-            )
-            self.assertEqual((complete, orphan_wavs, orphan_jsons), ([], [], []),
-                              "pairs_dir must genuinely be empty for this test")
-            original_meta_bytes = Path(meta_path).read_bytes()
-
-            second_args = types.SimpleNamespace(
-                config=config_path, output=output_dir, hours=0.001,
-                workers=0, resume=False, repair_resume=False,
-                start_idx=None, seed=99, sample_rate=None,
-            )
-            with self.assertRaises(DatasetContractError):
-                gen_dataset_module.gen_dataset(second_args)
-            self.assertEqual(Path(meta_path).read_bytes(), original_meta_bytes)
+            indices = _list_sample_indices(os.path.join(output_dir, 'pairs'))
+            self.assertTrue(indices)
+            self.assertEqual(min(indices), 500)
 
 
 class ResumeShardStartIndexContractTest(unittest.TestCase):
-    """A resumed shard must retain the filename origin recorded by the first
-    invocation; CLI/config defaults from a later invocation cannot redefine
-    its inventory."""
+    """A resumed shard keeps the numbering the first invocation gave it.
 
-    def test_resume_inherits_recorded_nonzero_start_and_metadata_counts_samples(self):
+    The batch start used to come from meta.json's batch_start_idx; the
+    directory's own lowest index carries the same fact, so a shard created
+    with --start-idx 500 stays anchored at 500 without the caller repeating
+    the flag, and a conflicting explicit value is refused rather than
+    silently renumbering."""
+
+    def test_resume_inherits_the_existing_nonzero_start(self):
         from dataset_gen import gen_dataset as gen_dataset_module
 
         with tempfile.TemporaryDirectory() as tmp:
             config_path, output_dir = _build_real_corpus(tmp)
+            pairs_dir = os.path.join(output_dir, 'pairs')
             first_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.001,
                 workers=0, resume=False, repair_resume=False,
                 start_idx=500, seed=42, sample_rate=None,
             )
             gen_dataset_module.gen_dataset(first_args)
-            first_meta = json.loads(Path(output_dir, 'meta.json').read_text())
-            first_n = first_meta['batch_n_samples']
-            self.assertEqual(first_meta['batch_start_idx'], 500)
-            self.assertEqual(first_meta['n_samples'], first_n)
-            self.assertEqual(first_meta['next_sample_idx'], 500 + first_n)
-            self.assertAlmostEqual(first_meta['hours'], first_meta['batch_hours'])
+            first = _list_sample_indices(pairs_dir)
+            self.assertEqual(min(first), 500)
 
-            # Do not repeat --start-idx: meta.json is the authoritative batch
-            # origin and the config fixture still contains its default 0.
+            # Do not repeat --start-idx: the directory is the authoritative
+            # batch origin and the config fixture still contains its default 0.
             resume_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.002,
                 workers=0, resume=True, repair_resume=False,
                 start_idx=None, seed=43, sample_rate=None,
             )
             gen_dataset_module.gen_dataset(resume_args)
-            meta = json.loads(Path(output_dir, 'meta.json').read_text())
-            complete, orphan_wavs, orphan_jsons = (
-                gen_dataset_module._list_complete_sample_indices(
-                    os.path.join(output_dir, 'pairs'))
-            )
-            self.assertEqual(meta['batch_start_idx'], 500)
-            self.assertEqual(complete, list(range(500, meta['next_sample_idx'])))
-            self.assertEqual(meta['n_samples'], len(complete))
-            self.assertEqual(meta['batch_n_samples'], len(complete))
-            self.assertEqual(orphan_wavs, [])
-            self.assertEqual(orphan_jsons, [])
+            resumed = _list_sample_indices(pairs_dir)
+            self.assertEqual(resumed,
+                             list(range(500, 500 + len(resumed))))
+            self.assertGreater(len(resumed), len(first))
 
     def test_resume_rejects_explicit_conflicting_start_idx(self):
         from dataset_gen import gen_dataset as gen_dataset_module
 
         with tempfile.TemporaryDirectory() as tmp:
             config_path, output_dir = _build_real_corpus(tmp)
+            pairs_dir = os.path.join(output_dir, 'pairs')
             first_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.001,
                 workers=0, resume=False, repair_resume=False,
                 start_idx=500, seed=42, sample_rate=None,
             )
             gen_dataset_module.gen_dataset(first_args)
-            original_meta = Path(output_dir, 'meta.json').read_bytes()
+            original = _list_sample_indices(pairs_dir)
             resume_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.002,
                 workers=0, resume=True, repair_resume=False,
@@ -1269,9 +1012,17 @@ class ResumeShardStartIndexContractTest(unittest.TestCase):
             )
             with self.assertRaises(DatasetContractError):
                 gen_dataset_module.gen_dataset(resume_args)
-            self.assertEqual(Path(output_dir, 'meta.json').read_bytes(), original_meta)
+            self.assertEqual(_list_sample_indices(pairs_dir), original)
 
-    def test_resume_rejects_a_missing_leading_sample(self):
+    def test_a_deleted_leading_sample_moves_the_start(self):
+        """The cost of taking the start from the directory instead of a record.
+
+        A shard's declared batch_start_idx used to live in meta.json, so
+        deleting its FIRST sample left a detectable hole. Now the lowest
+        surviving index simply becomes the start: the deletion is absorbed,
+        silently. The resulting corpus is still contiguous and packable -- it
+        is just one sample shorter than the run that made it asked for.
+        """
         from dataset_gen import gen_dataset as gen_dataset_module
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1283,27 +1034,47 @@ class ResumeShardStartIndexContractTest(unittest.TestCase):
             )
             gen_dataset_module.gen_dataset(first_args)
             pairs_dir = os.path.join(output_dir, 'pairs')
-            wav_path, json_path = _sample_paths(pairs_dir, 500)
-            os.remove(wav_path)
-            os.remove(json_path)
+            os.remove(_sample_wav_path(pairs_dir, 500))
             resume_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.002,
                 workers=0, resume=True, repair_resume=False,
                 start_idx=None, seed=43, sample_rate=None,
             )
+            gen_dataset_module.gen_dataset(resume_args)
+            resumed = _list_sample_indices(pairs_dir)
+            self.assertEqual(min(resumed), 501)
+            self.assertEqual(resumed, list(range(501, 501 + len(resumed))))
+
+    def test_resume_still_rejects_an_explicit_start_below_the_surviving_batch(self):
+        """--start-idx is still checked against what is actually on disk."""
+        from dataset_gen import gen_dataset as gen_dataset_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, output_dir = _build_real_corpus(tmp)
+            first_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.001,
+                workers=0, resume=False, repair_resume=False,
+                start_idx=500, seed=42, sample_rate=None,
+            )
+            gen_dataset_module.gen_dataset(first_args)
+            pairs_dir = os.path.join(output_dir, 'pairs')
+            os.remove(_sample_wav_path(pairs_dir, 500))
+            resume_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.002,
+                workers=0, resume=True, repair_resume=False,
+                start_idx=500, seed=43, sample_rate=None,
+            )
             with self.assertRaises(DatasetContractError):
                 gen_dataset_module.gen_dataset(resume_args)
 
 
-class RepairResumeInteriorOrphanGapTest(unittest.TestCase):
-    """Other issue flagged alongside the release blockers above:
-    --repair-resume deletes orphans and then always resumes from
-    max(complete_indices) + 1 forward -- if the orphan it just deleted was
-    an INTERIOR one (genuinely complete samples exist at higher indices
-    too), that gap can never be revisited once generation continues past
-    it. gen_dataset() must refuse rather than silently leave the gap."""
+class ResumeInteriorGapTest(unittest.TestCase):
+    """Resuming continues from max(index) + 1 and only ever walks forward, so
+    a hole below the highest index can never be backfilled. gen_dataset()
+    must refuse rather than silently leave it -- and --repair-resume, which
+    now only clears leftover temp files, must not paper over it either."""
 
-    def test_repair_resume_refuses_when_repair_leaves_an_interior_gap(self):
+    def test_resume_refuses_when_an_interior_sample_is_missing(self):
         from dataset_gen import gen_dataset as gen_dataset_module
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1315,18 +1086,13 @@ class RepairResumeInteriorOrphanGapTest(unittest.TestCase):
             )
             gen_dataset_module.gen_dataset(first_args)
             pairs_dir = os.path.join(output_dir, 'pairs')
-            complete, _, _ = gen_dataset_module._list_complete_sample_indices(pairs_dir)
+            indices = _list_sample_indices(pairs_dir)
             self.assertGreaterEqual(
-                len(complete), 3,
-                "need at least 3 complete samples to carve out an interior one")
+                len(indices), 3,
+                "need at least 3 samples to carve out an interior one")
 
-            # Turn an INTERIOR complete sample into an orphan WAV (delete
-            # just its sidecar) -- genuinely complete samples remain both
-            # before AND after it, unlike the trailing-orphan case
-            # --repair-resume normally handles.
-            interior_idx = complete[len(complete) // 2]
-            _, interior_json = _sample_paths(pairs_dir, interior_idx)
-            os.remove(interior_json)
+            interior = indices[len(indices) // 2]
+            os.remove(_sample_wav_path(pairs_dir, interior))
 
             resume_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.002,
@@ -1336,16 +1102,50 @@ class RepairResumeInteriorOrphanGapTest(unittest.TestCase):
             with self.assertRaises(DatasetContractError):
                 gen_dataset_module.gen_dataset(resume_args)
 
-            # The gap must still be visible afterwards -- refusing must not
-            # itself have silently "fixed" anything further.
-            remaining, orphan_wavs, orphan_jsons = (
-                gen_dataset_module._list_complete_sample_indices(pairs_dir)
+            # Refusing must not itself have silently "fixed" anything.
+            remaining = _list_sample_indices(pairs_dir)
+            self.assertNotIn(interior, remaining)
+            self.assertIn(interior - 1, remaining)
+            self.assertIn(interior + 1, remaining)
+
+    def test_repair_resume_clears_leftover_temp_files(self):
+        from dataset_gen import gen_dataset as gen_dataset_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path, output_dir = _build_real_corpus(tmp)
+            first_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.001,
+                workers=0, resume=False, repair_resume=False,
+                start_idx=None, seed=42, sample_rate=None,
             )
-            self.assertNotIn(interior_idx, remaining)
-            self.assertEqual(orphan_wavs, [])
-            self.assertEqual(orphan_jsons, [])
-            self.assertIn(interior_idx - 1, remaining)
-            self.assertIn(interior_idx + 1, remaining)
+            gen_dataset_module.gen_dataset(first_args)
+            pairs_dir = os.path.join(output_dir, 'pairs')
+            indices = _list_sample_indices(pairs_dir)
+            stale = _tmp_path(_sample_wav_path(pairs_dir, max(indices) + 1))
+            torchaudio.save(stale, torch.zeros(2, 160), 16000, bits_per_sample=16)
+            self.assertEqual(_list_stale_temp_files(pairs_dir), [stale])
+
+            resume_args = types.SimpleNamespace(
+                config=config_path, output=output_dir, hours=0.002,
+                workers=0, resume=True, repair_resume=True,
+                start_idx=None, seed=43, sample_rate=None,
+            )
+            gen_dataset_module.gen_dataset(resume_args)
+            self.assertEqual(_list_stale_temp_files(pairs_dir), [])
+            resumed = _list_sample_indices(pairs_dir)
+            self.assertEqual(resumed, list(range(len(resumed))))
+
+
+class ResampleInputScanTest(unittest.TestCase):
+    def test_scan_ignores_atomic_temp_and_unrelated_wavs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pairs = Path(tmp, 'pairs')
+            pairs.mkdir()
+            valid = pairs / '000000.wav'
+            valid.touch()
+            (pairs / 'tmp.000001.wav').touch()
+            (pairs / 'notes.wav').touch()
+            self.assertEqual(_scan_wavs(tmp), [str(valid)])
 
 
 if __name__ == '__main__':

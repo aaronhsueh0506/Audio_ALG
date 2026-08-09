@@ -10,10 +10,23 @@ AEC model project consumes:
                 'mic_postclip','linear_error'],  # channel order, fixed
       'data' : float32 tensor (N, 5, T),
       'sr'   : int,
-      'meta' : list of N dicts,
-      'generator_commit': str,
-      'config_hash'     : str,
+      'meta' : list of N {'sequence_id', 'chunk_index'},
+      'linear_aec'              : the frozen PBFDKF contract, from --config,
+      'linear_aec_contract_hash': its fingerprint,
     }
+
+Input is rendered audio only: ``<split>/seqs/SSSSSS_CCC.wav``. No meta.json, no
+per-sequence sidecar, no index.json on the way out either -- the packer
+discovers sequences and chunk order from the filenames, and takes T, sr and the
+channel count from the WAVs themselves.  A corpus therefore stays packable
+after being copied, rsynced or trimmed by hand.
+
+⚠ ``--config`` is the one non-audio input, and it is required: the frozen
+linear-AEC contract that produced the ``linear_error`` stem cannot be recovered
+from a WAV, and inference has to construct the SAME one to reproduce ``D_hat``
+(see ``AIAEC.training_common.LinearAecEngine``). Pass the config the corpus was
+generated with. Nothing cross-checks that claim any more, so passing a
+different one silently mislabels the corpus.
 
 ⚠ Chunks are packed in ``(sequence_id, chunk_index)`` order and a sequence is
 never split across shards. Training later randomizes global chunk indices, but
@@ -21,13 +34,13 @@ the physical order is retained for full-sequence reconstruction and streaming
 evaluation.
 
 Usage:
-    python3 pack_aec_dataset.py --input data_aec/train \\
-        --output data_aec/packed/train --shard-clips 512
+    python3 pack_aec_dataset.py --config config.ini --input data_aec/all \\
+        --output data_aec/packed/all --shard-clips 512
 """
 
 import argparse
+import configparser
 import glob
-import json
 import os
 import sys
 from typing import Dict, List
@@ -44,222 +57,220 @@ if __package__ in (None, ''):
     __package__ = 'AIAEC.dataset_gen'
 
 from .aec_features import STEM_ORDER  # noqa: E402
-from .linear_aec import LinearAecContract  # noqa: E402
+from .linear_aec import linear_aec_contract_from_config  # noqa: E402
+from .seq_layout import scan_chunks, stale_temp_files  # noqa: E402
 
 
-def _read_run_meta(input_dir: str) -> dict:
-    path = os.path.join(input_dir, 'meta.json')
-    if not os.path.isfile(path):
-        raise FileNotFoundError(
-            f"{path} not found. Point --input at a split directory produced by "
-            f"gen_aec_dataset.py (the one containing meta.json and seqs/).")
-    with open(path, 'r') as handle:
-        return json.load(handle)
+def _resolve_seqs_dir(input_dir: str) -> str:
+    """Accept either a split directory or its seqs/ subdirectory.
 
-
-def _collect(seqs_dir: str, n_sequences: int) -> Dict[int, List[dict]]:
-    """sequence_id -> ordered chunk metadata. Every id in range must be complete.
-
-    ``n_sequences`` (from meta.json, this run's own plan) bounds which
-    sidecars are eligible: without the upper bound below, generating a large
-    corpus and then re-running with a smaller --hours into the SAME --output
-    would leave the earlier, now out-of-range sequence files on disk, and a
-    later pack of that directory would silently include content the current
-    run never asked for. Those are the ONLY ids allowed to be missing --
-    meta.json declares this run produced ids 0..n_sequences-1, so a gap or a
-    partial sequence anywhere in that range means the corpus on disk is not
-    the one meta.json describes (an interrupted run, a partial rsync, a
-    sidecar deleted after the fact), and packing it into a shard anyway would
-    silently ship a shrunk corpus that still claims meta.json's full size.
+    gen_aec_dataset.py prints the split directory in its "Next:" line, but
+    pointing straight at seqs/ is just as sensible now that there is nothing
+    else in the split directory to read.
     """
-    sequences: Dict[int, List[dict]] = {}
-    for meta_path in sorted(glob.glob(os.path.join(seqs_dir, '[0-9]*.json'))):
-        sequence_id = int(os.path.splitext(os.path.basename(meta_path))[0])
-        if sequence_id >= n_sequences:
-            print(f"  ⚠ sequence {sequence_id:06d}: outside this run's "
-                  f"n_sequences={n_sequences} (stale from a larger prior "
-                  f"generation?), skipped")
-            continue
-        with open(meta_path, 'r') as handle:
-            chunk_meta = json.load(handle)
-        wavs = [
-            os.path.join(seqs_dir, f"{sequence_id:06d}_{index:03d}.wav")
-            for index in range(len(chunk_meta))
-        ]
-        missing = [path for path in wavs if not os.path.isfile(path)]
-        if missing:
-            raise FileNotFoundError(
-                f"sequence {sequence_id:06d}: {len(missing)} chunk wav(s) "
-                f"missing (e.g. {missing[0]}), but this id is within this "
-                f"run's n_sequences={n_sequences}. Re-run gen_aec_dataset.py "
-                f"--resume to complete it before packing -- packing a "
-                f"shrunk sequence would silently ship it as if it were whole."
-            )
-        for index, meta in enumerate(chunk_meta):
-            meta['_wav'] = wavs[index]
-            if meta.get('chunk_index') != index:
-                raise ValueError(
-                    f"{meta_path}: chunk_index {meta.get('chunk_index')} at "
-                    f"position {index}; the sidecar is not in chunk order")
-        sequences[sequence_id] = chunk_meta
-    missing_ids = sorted(set(range(n_sequences)) - set(sequences))
-    if missing_ids:
+    if os.path.isdir(os.path.join(input_dir, 'seqs')):
+        return os.path.join(input_dir, 'seqs')
+    return input_dir
+
+
+def _collect(seqs_dir: str) -> Dict[int, List[str]]:
+    """``sequence_id -> [chunk wav path, ...]`` in chunk order.
+
+    Every sequence present must have chunks 0..n-1 with no hole: a gap means
+    the render was interrupted or a file was deleted, and packing around it
+    would silently ship a sequence that is shorter than it looks while its
+    remaining chunks keep their original indices.
+    """
+    sequences = scan_chunks(seqs_dir)
+    if not sequences:
         raise FileNotFoundError(
-            f"{len(missing_ids)} of {n_sequences} sequence(s) declared by "
-            f"meta.json have no sidecar under {seqs_dir} at all (e.g. "
-            f"sequence {missing_ids[0]:06d}). Re-run gen_aec_dataset.py "
-            f"--resume to fill the gap before packing."
-        )
+            f"no SSSSSS_CCC.wav chunk files under {seqs_dir}. Point --input at "
+            f"a split directory from gen_aec_dataset.py (or directly at its "
+            f"seqs/).")
+    for sequence_id, paths in sequences.items():
+        expected = [
+            os.path.join(seqs_dir, f"{sequence_id:06d}_{index:03d}.wav")
+            for index in range(len(paths))
+        ]
+        if paths != expected:
+            have = [os.path.basename(p) for p in paths]
+            raise FileNotFoundError(
+                f"sequence {sequence_id:06d} has a gap in its chunk numbering: "
+                f"{have}. Re-run gen_aec_dataset.py --resume to complete it "
+                f"before packing -- packing a sequence with a hole in it would "
+                f"silently ship it as if it were whole.")
     return sequences
 
 
-def _save_shard(clips, metas, shard_index, args, run_meta) -> str:
+def _save_shard(clips, metas, shard_index, args, header) -> tuple:
+    """Write one unpublished shard and return ``(temporary, final)``.
+
+    The final name is only made visible after every input chunk has been
+    validated and every shard has been serialized. A failed pack therefore
+    cannot leave a truncated ``shard_*.pt`` that a trainer mistakes for a
+    complete corpus.
+    """
     data = torch.stack(clips).to(
         torch.float16 if args.dtype == 'float16' else torch.float32)
     path = os.path.join(args.output, f"shard_{shard_index:05d}.pt")
+    temporary = path + '.tmp'
     torch.save({
         'stems': list(STEM_ORDER),
         'data': data,
-        'sr': int(run_meta['sr']),
         'meta': metas,
-        'generator_commit': run_meta.get('generator_commit', 'unknown'),
-        'config_hash': run_meta.get('config_hash', 'unknown'),
-        'manifest_version': run_meta['manifest_version'],
-        'manifest_seed': run_meta.get('manifest_seed'),
-        'linear_aec': run_meta['linear_aec'],
-        'linear_aec_contract_hash': run_meta['linear_aec_contract_hash'],
-    }, path)
-    return path
+        **header,
+    }, temporary)
+    return temporary, path
 
 
 def pack(args):
-    run_meta = _read_run_meta(args.input)
-    manifest_version = run_meta.get('manifest_version')
-    if not isinstance(manifest_version, str) or not manifest_version:
-        raise ValueError(
-            f"{args.input}/meta.json has no valid manifest_version; "
-            "re-render it with the current generator"
-        )
-    declared_stems = run_meta.get('stems')
-    if declared_stems is None or list(declared_stems) != list(STEM_ORDER):
-        raise ValueError(
-            f"{args.input}/meta.json declares stems {declared_stems}, "
-            f"but this code packs {list(STEM_ORDER)}; the channel order is the "
-            f"one thing a consumer cannot detect being wrong.")
-    linear_aec = LinearAecContract.from_dict(run_meta.get('linear_aec'))
-    contract_hash = linear_aec.fingerprint()
-    if run_meta.get('linear_aec_contract_hash') != contract_hash:
-        raise ValueError(
-            f"{args.input}/meta.json linear_aec_contract_hash does not match "
-            "its linear_aec contract"
-        )
+    if args.shard_clips <= 0:
+        raise ValueError(f"--shard-clips must be positive, got {args.shard_clips}")
+    cfg = configparser.ConfigParser()
+    if not cfg.read(args.config):
+        raise FileNotFoundError(
+            f"config not found: {args.config}. The frozen linear-AEC contract "
+            f"is rebuilt from it (see this file's docstring); pass the config "
+            f"the corpus was generated with.")
+    linear_aec = linear_aec_contract_from_config(cfg)
 
-    sequences = _collect(os.path.join(args.input, 'seqs'), int(run_meta['n_sequences']))
-    total_chunks = sum(len(chunks) for chunks in sequences.values())
-    if total_chunks != int(run_meta['n_chunks']):
-        # _collect already enforces every declared sequence_id is present and
-        # self-consistent; this is a cheap belt-and-suspenders check against
-        # meta.json's own declared total in case that per-sequence agreement
-        # somehow still summed to the wrong aggregate.
-        raise ValueError(
-            f"{args.input}/meta.json declares n_chunks={run_meta['n_chunks']}, "
-            f"but the collected sequences total {total_chunks}"
-        )
+    seqs_dir = _resolve_seqs_dir(args.input)
+    sequences = _collect(seqs_dir)
+    total_chunks = sum(len(paths) for paths in sequences.values())
+
+    stale = stale_temp_files(seqs_dir)
+    if stale:
+        print(f"  ⚠ ignoring {len(stale)} leftover tmp.*.wav (interrupted "
+              f"write; not packed)")
+
+    # A shard directory that already holds shards from an earlier, differently
+    # configured pack would be loaded as one corpus by PackedAecDataset, which
+    # globs shard_*.pt. There is no index file to disambiguate them, so stop
+    # here rather than quietly mix two packs.
     os.makedirs(args.output, exist_ok=True)
+    existing = sorted(glob.glob(os.path.join(args.output, 'shard_*.pt')))
+    if existing:
+        if not args.overwrite:
+            raise FileExistsError(
+                f"{args.output} already contains {len(existing)} shard(s), e.g. "
+                f"{os.path.basename(existing[0])}. Loading a directory takes "
+                f"every shard_*.pt in it, so a leftover from an earlier pack "
+                f"would silently join this corpus. Pass --overwrite to replace "
+                f"them after a new pack succeeds, or use an empty directory.")
+        print(f"  --overwrite: {len(existing)} pre-existing shard(s) will be "
+              "replaced only after the new pack finishes successfully")
+    stale_pack_temps = sorted(glob.glob(
+        os.path.join(args.output, 'shard_*.pt.tmp')
+    ))
+    for path in stale_pack_temps:
+        os.remove(path)
+    if stale_pack_temps:
+        print(f"  removed {len(stale_pack_temps)} stale temporary shard(s)")
+
+    # Geometry comes from the audio, since nothing declares it any more.
+    first = sequences[min(sequences)][0]
+    info = torchaudio.info(first)
+    sr = int(info.sample_rate)
+    expected_t = int(info.num_frames)
+    if info.num_channels != len(STEM_ORDER):
+        raise ValueError(
+            f"{first}: {info.num_channels} channels, expected "
+            f"{len(STEM_ORDER)} ({list(STEM_ORDER)}). This does not look like "
+            f"a rendered AEC corpus.")
+    if sr != linear_aec.sample_rate:
+        raise ValueError(
+            f"{first} is {sr} Hz but --config's linear AEC grid is "
+            f"{linear_aec.sample_rate} Hz -- wrong config for this corpus.")
+
+    header = {
+        'sr': sr,
+        'linear_aec': linear_aec.as_dict(),
+        'linear_aec_contract_hash': linear_aec.fingerprint(),
+    }
 
     bytes_per = 2 if args.dtype == 'float16' else 4
-    approx = total_chunks * len(STEM_ORDER) * int(run_meta['chunk_samples']) * bytes_per
+    approx = total_chunks * len(STEM_ORDER) * expected_t * bytes_per
     print(f"{len(sequences)} sequences / {total_chunks} chunks -> {args.output}")
-    print(f"  sr={run_meta['sr']}, T={run_meta['chunk_samples']}, "
-          f"dtype={args.dtype}, ~{approx / 1024 ** 3:.1f} GB")
+    print(f"  sr={sr}, T={expected_t}, dtype={args.dtype}, "
+          f"~{approx / 1024 ** 3:.1f} GB")
 
     clips: List[torch.Tensor] = []
     metas: List[dict] = []
     shard_index = 0
-    written: List[str] = []
-    expected_t = int(run_meta['chunk_samples'])
+    staged: List[tuple] = []
 
     progress = tqdm.tqdm(total=total_chunks, desc="Packing")
-    for sequence_id in sorted(sequences):
-        chunk_meta = sequences[sequence_id]
-        # Flush BEFORE adding, so a sequence is never split across shards.
-        if clips and len(clips) + len(chunk_meta) > args.shard_clips:
-            written.append(_save_shard(clips, metas, shard_index, args, run_meta))
-            shard_index += 1
-            clips, metas = [], []
+    try:
+        for sequence_id in sorted(sequences):
+            paths = sequences[sequence_id]
+            # Flush BEFORE adding, so a sequence is never split across shards.
+            if clips and len(clips) + len(paths) > args.shard_clips:
+                staged.append(_save_shard(
+                    clips, metas, shard_index, args, header
+                ))
+                shard_index += 1
+                clips, metas = [], []
 
-        for meta in chunk_meta:
-            if meta.get('manifest_version') != manifest_version:
-                raise ValueError(
-                    f"sequence {sequence_id} chunk {meta.get('chunk_index')} "
-                    "was materialized with a different or missing manifest_version"
-                )
-            if meta.get('config_hash') != run_meta.get('config_hash'):
-                raise ValueError(
-                    f"sequence {sequence_id} chunk {meta.get('chunk_index')} "
-                    "was materialized with a different or missing config_hash "
-                    "than meta.json declares for this run"
-                )
-            if meta.get('linear_aec_contract_hash') != contract_hash:
-                raise ValueError(
-                    f"sequence {sequence_id} chunk {meta.get('chunk_index')} "
-                    "was materialized with a different or missing linear AEC contract"
-                )
-            audio, sr = torchaudio.load(meta.pop('_wav'))
-            if sr != run_meta['sr']:
-                raise ValueError(f"sequence {sequence_id}: wav sr={sr}, "
-                                 f"meta.json says {run_meta['sr']}")
-            if audio.shape[0] != len(STEM_ORDER):
-                raise ValueError(f"sequence {sequence_id}: {audio.shape[0]} "
-                                 f"channels, expected {len(STEM_ORDER)}")
-            if audio.shape[1] != expected_t:
-                raise ValueError(f"sequence {sequence_id}: T={audio.shape[1]}, "
-                                 f"expected {expected_t}")
-            if not torch.isfinite(audio).all():
-                raise ValueError(
-                    f"sequence {sequence_id} chunk {meta.get('chunk_index')}: "
-                    "wav contains NaN or Inf"
-                )
-            clips.append(audio)
-            metas.append(meta)
-            progress.update(1)
-    progress.close()
+            for chunk_index, path in enumerate(paths):
+                audio, chunk_sr = torchaudio.load(path)
+                if chunk_sr != sr:
+                    raise ValueError(f"{path}: sr={chunk_sr}, but this corpus is "
+                                     f"{sr} Hz")
+                if audio.shape[0] != len(STEM_ORDER):
+                    raise ValueError(f"{path}: {audio.shape[0]} channels, expected "
+                                     f"{len(STEM_ORDER)}")
+                if audio.shape[1] != expected_t:
+                    raise ValueError(f"{path}: T={audio.shape[1]}, expected "
+                                     f"{expected_t}")
+                if not torch.isfinite(audio).all():
+                    raise ValueError(f"{path}: contains NaN or Inf")
+                clips.append(audio)
+                metas.append({'sequence_id': int(sequence_id),
+                              'chunk_index': int(chunk_index)})
+                progress.update(1)
 
-    if clips:
-        written.append(_save_shard(clips, metas, shard_index, args, run_meta))
+        if clips:
+            staged.append(_save_shard(
+                clips, metas, shard_index, args, header
+            ))
+    except BaseException:
+        for temporary, _final in staged:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        raise
+    finally:
+        progress.close()
 
-    index = {
-        'stems': list(STEM_ORDER),
-        'sr': int(run_meta['sr']),
-        'chunk_samples': expected_t,
-        'split': run_meta.get('split'),
-        'n_sequences': len(sequences),
-        'n_chunks': total_chunks,
-        'dtype': args.dtype,
-        'shards': [os.path.basename(path) for path in written],
-        'generator_commit': run_meta.get('generator_commit', 'unknown'),
-        'config_hash': run_meta.get('config_hash', 'unknown'),
-        'manifest_version': manifest_version,
-        'manifest_seed': run_meta.get('manifest_seed'),
-        'linear_aec': linear_aec.as_dict(),
-        'linear_aec_contract_hash': contract_hash,
-    }
-    with open(os.path.join(args.output, 'index.json'), 'w') as handle:
-        json.dump(index, handle, indent=2, sort_keys=True)
+    # Publish only after the complete input inventory has passed validation.
+    # Existing shards are kept throughout validation/serialization, so a
+    # failure in either phase leaves the previous usable pack intact.
+    for path in existing:
+        os.remove(path)
+    for temporary, final in staged:
+        os.replace(temporary, final)
 
-    print(f"Done: {len(written)} shard(s), {total_chunks} chunks -> {args.output}")
+    print(f"Done: {len(staged)} shard(s), {total_chunks} chunks -> {args.output}")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description='Pack rendered AEC stem WAVs into .pt shards')
+    parser.add_argument('--config', default='config.ini',
+                        help='The config the corpus was generated with. Only '
+                             'the frozen linear-AEC contract is taken from it '
+                             '(it cannot be recovered from a WAV, and '
+                             'inference needs the same one)')
     parser.add_argument('--input', required=True,
-                        help='A split directory from gen_aec_dataset.py '
-                             '(contains meta.json and seqs/)')
+                        help='A split directory from gen_aec_dataset.py, or '
+                             'its seqs/ subdirectory')
     parser.add_argument('--output', required=True, help='Shard output directory')
     parser.add_argument('--shard-clips', type=int, default=512,
                         help='Soft cap on chunks per shard; a sequence is never '
                              'split, so a shard may exceed it by one sequence')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='Replace shard_*.pt already in --output after the '
+                             'new pack validates and serializes completely '
+                             '(otherwise an existing shard is an error)')
     parser.add_argument('--dtype', default='float32',
                         choices=['float32', 'float16'],
                         help='⚠ float16 halves the size and costs ~3 decimal '

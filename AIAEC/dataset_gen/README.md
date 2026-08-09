@@ -59,8 +59,8 @@ directly against the renderer rather than a packed shard. If you need `echo`/
 Old six-channel WAVs/shards (with a separate `local_noise` stem) are rejected.
 To upgrade an existing four-channel render without repeating speech/noise/RIR
 mixing, run `rematerialize_linear_aec.py`; it reconstructs complete sequences
-in `(sequence_id, chunk_index)` order, rewrites the last channel
-(`linear_error`), and updates metadata.
+in `(sequence_id, chunk_index)` order from the filenames and rewrites the last
+channel (`linear_error`) in place.
 
 `AecStems` gives these names; nothing indexes the channel axis by number.
 
@@ -81,40 +81,50 @@ state because that silently changes both feature distributions.
 
 ## Metadata
 
-Each clip carries a dict. The contract fields:
+**The rendered corpus is WAV and nothing else.** `<split>/seqs/SSSSSS_CCC.wav`
+is the entire on-disk contract: no run `meta.json`, no per-sequence sidecar. A
+packed clip therefore carries only where it came from:
 
 | field | meaning |
 |---|---|
-| `sequence_id`, `chunk_index` | which parent sequence, and where in it |
-| `speaker_id` | the **near** talker (`''` = none). `far_speaker_id` is the other one -- from an independent pool if `[paths] far_speech_dir` is set, otherwise the same pool |
-| `noise_id`, `rir_id` | source ids; `rir_id` is `"a\|b"` for an echo-path change (both `a` and `b` are always in the same room as `room_id`) |
-| `manifest_version` | source-manifest schema/identity; prevents resume or packing from mixing sequences built under different source-mapping contracts |
-| `config_hash` | fingerprint of the config this chunk was rendered under; what `--resume` compares to reject a sequence rendered under different settings |
-| `sequence_seed` | the per-sequence RNG seed `plan_sequences()` derived from `--seed`; `--resume` also compares this (and `sequence_scenario`) since `--seed` lives outside config.ini and would otherwise not be seen at all |
-| `ser_db` | near-speech-to-echo ratio (`+inf` = no echo, `-inf` = no near talker) |
-| `snr_db` | near-speech-to-noise ratio (`-inf` = no near speech to define it against) |
-| `erl_db` | echo return loss, echo vs the stored reference |
-| `bulk_delay_samples` | reference-to-echo delay |
-| `delay_jitter`, `sro_ppm`, `nonlinear`, `clipped`, `agc` | which impairments are present |
-| `scenario` | see below |
+| `sequence_id`, `chunk_index` | which parent sequence, and where in it — both read back out of the filename |
 
-Plus `sequence_scenario`, `far_speaker_id`, `room_id`, `device_id` and `split`.
-The last three exist so that disjointness can be audited on the **generated
-data** and not only on the manifest.
+Everything else the shard needs is either fixed (`stems`, the channel order),
+read from the audio (`sr`, chunk length) or rebuilt from `config.ini` at pack
+time (`linear_aec`, `linear_aec_contract_hash` — the frozen PBFDKF contract,
+which cannot be recovered from a WAV and which inference must reconstruct
+exactly).
 
-`clipped` and `agc` are separate flags because they are separate distortions —
-one memoryless and instantaneous, one a slow gain with memory — and a model
-that confuses them fixes the wrong one. Together they are exact: `mic_postclip`
-differs from `mic_preclip` **if and only if** one of the two is set (`mic_preclip`
-itself is audit-only, see above — `tests/test_aec_dataset.py` checks this
-identity against the renderer directly).
+⚠ **What that costs.** The renderer still computes a full per-chunk
+description — `speaker_id`, `far_speaker_id`, `noise_id`, `rir_id`, `room_id`,
+`device_id`, `ser_db`, `snr_db`, `erl_db`, `bulk_delay_samples`,
+`delay_jitter`, `sro_ppm`, `nonlinear`, `clipped`, `agc`, `scenario`,
+`sequence_scenario`, `sequence_seed`, `split` — but it is now visible only
+in-process, on the `RenderedSequence` a worker hands back
+(`tests/test_aec_dataset.py` reads it there). None of it reaches disk, so:
+
+- a curriculum keyed on `scenario` has to measure the chunk instead, which the
+  separated stems make possible;
+- source-disjointness is audited at the renderer, not on the packed corpus;
+- `--resume` and the packer can no longer tell WHICH config, seed or manifest
+  produced a chunk. They check shape — chunk count, rate, length, channels,
+  encoding — and nothing else. Resume into a directory only with the run that
+  started it.
+
+The clip-level facts below still hold of the audio itself, they are simply no
+longer written down:
+
+`clipped` and `agc` are separate distortions — one memoryless and
+instantaneous, one a slow gain with memory — and a model that confuses them
+fixes the wrong one. Together they are exact: `mic_postclip` differs from
+`mic_preclip` **if and only if** one of the two is set (`mic_preclip` itself is
+audit-only, see above — `tests/test_aec_dataset.py` checks this identity
+against the renderer directly).
 
 **⚠ `ser_db` / `snr_db` / `erl_db` are sequence-level.** They describe how the
-whole configured parent sequence was set up. A single chunk departs from them by a few dB
-(ERL) or by anything at all (SER/SNR), because a chunk in which the near talker
-happens to be silent has no signal to define a ratio against. Build curricula
-on `scenario`, or measure the chunk yourself — which the separated stems make
-possible.
+whole configured parent sequence was set up. A single chunk departs from them
+by a few dB (ERL) or by anything at all (SER/SNR), because a chunk in which the
+near talker happens to be silent has no signal to define a ratio against.
 
 **⚠ `±inf` is deliberate.** It marks a ratio that is undefined because one of
 its two signals is absent, rather than a fabricated number that would silently
@@ -163,6 +173,10 @@ This validation score is useful for optimization progress, not a
 source-generalisation claim. Use a separately generated source-disjoint corpus
 (`--split train`/`val`) or held-out real recordings for that measurement.
 `manifest.py` retains the optional source-disjoint generator for this purpose.
+The split is built deterministically in memory by default, so generation emits
+only WAVs. Pass an explicit `--manifest PATH` only when the source directories
+may change between the separate train/val runs and the split must be frozen on
+disk.
 Every checkpoint stores the dataset fingerprint, split seed/fraction, complete
 train/validation indices, and PBFDKF contract so resume cannot silently change
 the comparison.
@@ -185,6 +199,7 @@ not used by any trainer.
 |---|---|
 | `aec_dataset.py` | the scenario simulator: nonlinearity, echo path, delay/jitter, SRO, dropout, AGC |
 | `manifest.py` | unified/source-disjoint source manifest |
+| `seq_layout.py` | the on-disk naming rules (`SSSSSS_CCC.wav`, temp names, scans) that the generator, packer and re-materializer all agree on |
 | `gen_aec_dataset.py` | CLI — renders complete sequences to 5-channel WAV chunks |
 | `linear_aec.py` | frozen PBFDKF contract and full-sequence materializer |
 | `rematerialize_linear_aec.py` | rebuilds the last channel from existing four/five-channel WAVs |
@@ -230,27 +245,42 @@ python3 -m AIAEC.dataset_gen.gen_aec_dataset \
     --hours 100 --split all --workers 4 --seed 42
 
 python3 -m AIAEC.dataset_gen.pack_aec_dataset \
+    --config AIAEC/dataset_gen/config.ini \
     --input data_aec/all --output data_aec/packed/all
 ```
+
+⚠ The packer needs `--config` because the frozen linear-AEC contract that
+produced the `linear_error` stem cannot be recovered from a WAV, and inference
+has to construct the same one. Pass the config the corpus was generated with;
+nothing cross-checks that claim any more.
+
+⚠ `--output` must not already contain `shard_*.pt`. Loading a packed directory
+takes every `shard_*.pt` in it and there is no index file naming this pack's own
+shards, so a leftover from an earlier pack would silently join the corpus. Use
+`--overwrite` to replace them deliberately. New shards are staged under
+`.pt.tmp` names and published only after every WAV passes validation; a
+validation/serialization failure keeps the previous pack intact.
 
 ⚠ Five of the six trainers run at 16 kHz/512 and one (DeepFilterNet-AENR) runs
 at 48 kHz/1024 (`[signal] sr = 48000, n_fft = win_len = 1024, hop_len = 512`
 in a SEPARATE `config.ini` -- see config.example.ini's top comment). The two
 rates need their OWN `--output` (e.g. `data_aec_16k` / `data_aec_48k`, matching
 each trainer's `packed_dir`): generating the second rate into the same
-`--output` as the first silently overwrites its `seqs/`/`packed/` content,
-since neither directory is namespaced by sample rate.
+`--output` as the first is refused once chunk WAVs exist, since neither
+directory is namespaced by sample rate.
 
 Layout:
 
 ```
 data_aec/
-  manifest.json                 source-list provenance
-  all/meta.json                 run summary + PBFDKF contract
-  all/seqs/000000.json          chunk metadata for one parent sequence
   all/seqs/000000_000.wav       5-channel chunk, channels = STEM_ORDER
+  all/seqs/000000_001.wav
   packed/all/shard_00000.pt
 ```
+
+No JSON is created in the default flow. An explicit `--manifest PATH` is the
+only opt-in exception, used to freeze a source-disjoint split; packing and
+training never read it.
 
 The six trainers read `packed/all` and create the deterministic random chunk
 split from `[data] val_fraction` and the training seed.
@@ -327,13 +357,15 @@ python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
     --config AIAEC/dataset_gen/config.ini \
     --resume
 python3 -m AIAEC.dataset_gen.pack_aec_dataset \
-    --input data_aec/all --output data_aec/packed/all
+    --config AIAEC/dataset_gen/config.ini \
+    --input data_aec/all --output data_aec/packed/all --overwrite
 ```
 
-`--resume` marks a sequence complete only after all five-channel WAVs and its
-matching config, manifest and linear-AEC metadata contracts exist. Manifest v1
-files do not contain the exact file-to-source-id maps required by v2; rebuild
-the manifest and re-render/repack rather than mixing old sidecars or shards.
+⚠ `rematerialize_linear_aec.py --resume` skips a sequence once its chunks are
+all five-channel and the right shape. It cannot tell WHICH contract wrote that
+fifth channel, so re-running after a `[linear_aec]` config edit needs a full
+pass (omit `--resume`) — otherwise the corpus silently keeps a mix of two
+contracts.
 
 Generation is deterministic given `--seed`: each sequence is seeded from
 `(seed, split, sequence_id)`, so it renders identically regardless of worker

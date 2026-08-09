@@ -6,11 +6,13 @@ the same way, with two additions that the NR generator has no need for:
 
     --split       'all' (the selected protocol) or a SOURCE-DISJOINT side
                   ('train'/'val'), for a separate held-out generalisation corpus
-    --manifest    where that split decision lives
+    --manifest    optional persisted source-split decision
 
-⚠ The split is decided BEFORE generation, over the source lists, and both runs
-must use the SAME manifest file.  See manifest.py for why splitting after
-generation (as the NR loader does) is wrong here.
+⚠ The split is decided BEFORE generation, over the source lists. With the same
+config, source inventory and seed, it is rebuilt deterministically in memory;
+pass the SAME explicit ``--manifest`` to both source-disjoint runs if the
+source directories may change between them. See manifest.py for why splitting
+after generation (as the NR loader does) is wrong here.
 
 Usage (selected training protocol -- one unified pool, then a deterministic
 random chunk split with AIAEC.training_common.split_dataset_by_sample at load
@@ -18,31 +20,48 @@ time; this is also --split's default):
     python3 gen_aec_dataset.py --config config.ini --output data_aec \\
         --hours 100 --split all --workers 4 --seed 42
 
-Usage (source-disjoint -- two separate runs, same --seed/--manifest; use this
+Usage (source-disjoint -- two separate runs with the same config/seed; use this
 for a held-out generalisation corpus, not the main training/validation pool):
     python3 gen_aec_dataset.py --config config.ini --output data_aec \\
         --hours 40 --split train --workers 4 --seed 42
     python3 gen_aec_dataset.py --config config.ini --output data_aec \\
         --hours 4  --split val   --workers 4 --seed 42
 
-Output layout:
+Output layout -- rendered audio and nothing else:
     data_aec/
-      manifest.json                 the split decision ('all' mode: just
-                                     source-list provenance)
-      all/meta.json                 run summary ('all' mode)
-      all/seqs/000000.json          chunk metadata for one parent sequence
       all/seqs/000000_000.wav       5-channel chunk, channels = STEM_ORDER
+      all/seqs/000000_001.wav
       train/..., val/...            source-disjoint mode instead of all/,
                                      shared by both runs
+
+By default there is no JSON output at all: `SSSSSS_CCC.wav` is the whole
+on-disk contract, and pack_aec_dataset.py rebuilds everything it needs from
+those filenames, the WAV headers and config.ini. ``--manifest PATH`` is an
+explicit opt-in for persisting a source-disjoint split; the packer never reads
+that control file.
+
+What that costs, stated plainly, because these WERE real checks:
+  * --resume no longer detects a config.ini/--seed edit between runs. It
+    checks that each planned sequence's chunks exist with the right rate,
+    length and channel count -- not that they were rendered by the config now
+    in effect. Resume into a directory only with the config that started it.
+  * The renderer's per-chunk labels (scenario, ser_db, snr_db, rir_id, ...) are
+    no longer persisted. No trainer read them; a curriculum that needs them
+    must measure the stems, which is possible precisely because they are
+    stored separately.
+What survives without any JSON, because it never depended on one:
+  * A visible chunk WAV is complete -- every chunk is written to a `tmp.` name
+    and renamed into place (see _save_chunk_atomic), so a killed run can never
+    leave a truncated chunk that looks finished.
+  * pack_aec_dataset.py re-checks channel count, length, rate and finiteness
+    on every chunk it packs.
 
 Then pack with pack_aec_dataset.py.
 """
 
 import argparse
 import configparser
-import json
 import os
-import subprocess
 import sys
 import time
 from typing import List, Optional
@@ -68,6 +87,15 @@ from .aec_dataset import (  # noqa: E402
 )
 from .aec_features import STEM_ORDER  # noqa: E402
 from .linear_aec import linear_aec_contract_from_config  # noqa: E402
+from .seq_layout import (  # noqa: E402
+    chunk_indices,
+    chunk_path,
+    parse_chunk_name,
+    save_chunk_atomic,
+    scan_chunks,
+    sequence_chunk_paths,
+    stale_temp_files,
+)
 from .manifest import (  # noqa: E402
     ALL_SPLIT_NAMES,
     UNIFIED_SPLIT,
@@ -93,21 +121,6 @@ WAV_ENCODINGS = {
     'float32': dict(encoding='PCM_F', bits_per_sample=32),
     'int16': dict(encoding='PCM_S', bits_per_sample=16),
 }
-
-
-def git_commit() -> str:
-    """Best-effort commit id for provenance; 'unknown' outside a checkout."""
-    try:
-        out = subprocess.run(
-            ['git', 'rev-parse', 'HEAD'],
-            cwd=os.path.dirname(os.path.abspath(__file__)),
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=10,
-        )
-        if out.returncode == 0:
-            return out.stdout.decode().strip()
-    except Exception:
-        pass
-    return 'unknown'
 
 
 def verify_wav_io(tmp_dir: str, encoding: str) -> None:
@@ -167,23 +180,24 @@ class _RenderJobs(data.Dataset):
 
     def __getitem__(self, index):
         plan = self.plans[index]
-        meta_path = os.path.join(self.seqs_dir, f"{plan.sequence_id:06d}.json")
         rendered = self._get_renderer().render(plan)
+        n_chunks = len(rendered.chunk_meta)
+
+        # A shorter re-render of a sequence that already exists on disk must
+        # not leave the old run's surplus chunks behind: with no sidecar to
+        # declare the chunk count, a stray SSSSSS_007.wav would simply be
+        # packed as a seventh chunk.
+        for stale in sequence_chunk_paths(self.seqs_dir, plan.sequence_id):
+            if parse_chunk_name(stale)[1] >= n_chunks:
+                os.remove(stale)
 
         write = WAV_ENCODINGS[self.encoding]
-        for chunk_index in range(len(rendered.chunk_meta)):
+        for chunk_index in range(n_chunks):
             at = chunk_index * rendered.chunk_samples
             chunk = rendered.stems[:, at:at + rendered.chunk_samples].contiguous()
-            torchaudio.save(
-                os.path.join(self.seqs_dir,
-                             f"{plan.sequence_id:06d}_{chunk_index:03d}.wav"),
-                chunk, self.cfg.getint('signal', 'sr'), **write)
-
-        # The sidecar is written LAST and is what --resume looks for, so a run
-        # killed mid-sequence leaves an incomplete sequence that is simply
-        # re-rendered rather than silently kept with missing chunks.
-        with open(meta_path, 'w') as handle:
-            json.dump(rendered.chunk_meta, handle)
+            save_chunk_atomic(
+                self.seqs_dir, plan.sequence_id, chunk_index, chunk,
+                self.cfg.getint('signal', 'sr'), write)
         return {
             'sequence_id': plan.sequence_id,
             'n_chunks': plan.n_chunks,
@@ -198,72 +212,43 @@ def _identity_collate(batch):
 
 def _sequence_is_complete(plan: SequencePlan, seqs_dir: str, *,
                           sample_rate: int, chunk_samples: int,
-                          contract_hash: str, config_hash: str,
-                          manifest_version: str,
                           wav_encoding: str = 'float32') -> bool:
-    """A sidecar alone is not enough to prove a five-channel sequence exists.
+    """Does this sequence's audio already exist, in full and in the right shape?
 
-    ``config_hash`` closes the gap ``linear_aec_contract_hash`` alone leaves
-    open: two configs can render the SAME chunk count/geometry for a given
-    sequence_id (scenario weights, levels, RIR/device settings...) while
-    producing entirely different audio. Without this check, --resume after
-    such an edit would keep the stale sequence and meta.json would still
-    claim the whole run reflects the new config.
+    Every chunk 0..n_chunks-1 must be present with the expected rate, length,
+    channel count and encoding, and there must be no chunk BEYOND that range
+    (a leftover from a longer earlier render, which the packer would otherwise
+    pack as a real chunk).
 
-    ``manifest_version`` prevents a structural/identity change in the source
-    manifest from retaining v1 sidecars under a newer run merely because its
-    signal config is unchanged.
-
-    ``plan.scenario``/``plan.seed`` close a FOURTH gap that config_hash cannot:
-    ``--seed`` lives outside config.ini, so a --seed change reshuffles which
-    scenario/seed plan_sequences() assigns each sequence_id without touching
-    config_hash at all. Whenever the reshuffled plan happens to want the same
-    chunk count for a sequence_id (routine at this corpus's small
-    chunks_min/chunks_max spread), the old checks alone would resume it as
-    complete under the NEW plan's scenario label while the audio on disk is
-    still the OLD plan's.
+    ⚠ What this cannot check, now that nothing records how a chunk was made:
+    whether the audio on disk was rendered by the config and --seed now in
+    effect. A config.ini edit, or a --seed change that reshuffles which
+    scenario each sequence_id draws, leaves same-shaped chunks that resume
+    happily accepts. Resume into a directory only with the run that started
+    it; use a new --output otherwise.
     """
-    meta_path = os.path.join(seqs_dir, f"{plan.sequence_id:06d}.json")
-    if not os.path.isfile(meta_path):
+    present = chunk_indices(seqs_dir, plan.sequence_id)
+    if present != list(range(plan.n_chunks)):
         return False
-    try:
-        with open(meta_path, "r") as handle:
-            chunk_meta = json.load(handle)
-        if len(chunk_meta) != plan.n_chunks:
+    expected_encoding = WAV_ENCODINGS[wav_encoding]
+    for chunk_index in present:
+        try:
+            info = torchaudio.info(chunk_path(seqs_dir, plan.sequence_id, chunk_index))
+        except (OSError, RuntimeError, ValueError):
             return False
-        for chunk_index, meta in enumerate(chunk_meta):
-            if (
-                meta.get("chunk_index") != chunk_index
-                or meta.get("linear_aec_contract_hash") != contract_hash
-                or meta.get("config_hash") != config_hash
-                or meta.get("manifest_version") != manifest_version
-                or meta.get("sequence_scenario") != plan.scenario
-                or meta.get("sequence_seed") != plan.seed
-            ):
-                return False
-            wav_path = os.path.join(
-                seqs_dir, f"{plan.sequence_id:06d}_{chunk_index:03d}.wav"
-            )
-            if not os.path.isfile(wav_path):
-                return False
-            info = torchaudio.info(wav_path)
-            expected_encoding = WAV_ENCODINGS[wav_encoding]
-            if (
-                info.sample_rate != sample_rate
-                or info.num_frames != chunk_samples
-                or info.num_channels != len(STEM_ORDER)
-                or info.encoding != expected_encoding['encoding']
-                or info.bits_per_sample != expected_encoding['bits_per_sample']
-            ):
-                return False
-    except (OSError, RuntimeError, ValueError, TypeError, json.JSONDecodeError):
-        return False
+        if (
+            info.sample_rate != sample_rate
+            or info.num_frames != chunk_samples
+            or info.num_channels != len(STEM_ORDER)
+            or info.encoding != expected_encoding['encoding']
+            or info.bits_per_sample != expected_encoding['bits_per_sample']
+        ):
+            return False
     return True
 
 
 def _pending(plans: List[SequencePlan], seqs_dir: str, resume: bool, *,
              sample_rate: int, chunk_samples: int,
-             contract_hash: str, config_hash: str, manifest_version: str,
              wav_encoding: str = 'float32') -> List[SequencePlan]:
     if not resume:
         return list(plans)
@@ -271,11 +256,40 @@ def _pending(plans: List[SequencePlan], seqs_dir: str, resume: bool, *,
         plan for plan in plans
         if not _sequence_is_complete(
             plan, seqs_dir, sample_rate=sample_rate,
-            chunk_samples=chunk_samples, contract_hash=contract_hash,
-            config_hash=config_hash, manifest_version=manifest_version,
-            wav_encoding=wav_encoding,
+            chunk_samples=chunk_samples, wav_encoding=wav_encoding,
         )
     ]
+
+
+def _validate_existing_output(plans: List[SequencePlan], seqs_dir: str,
+                              resume: bool) -> None:
+    """Prevent a rerun from silently mixing two WAV inventories.
+
+    Without a persisted run record, the filenames are the complete inventory.
+    A plain rerun used to overwrite the planned prefix but leave any old
+    higher sequence ids in place, and the packer would then include both.
+    Resume may extend a corpus, but every existing sequence id must be part of
+    the current plan so lowering ``--hours`` cannot leave an invisible tail.
+    """
+    existing = scan_chunks(seqs_dir)
+    if not existing:
+        return
+    if not resume:
+        raise FileExistsError(
+            f"{seqs_dir} already contains {sum(map(len, existing.values()))} "
+            "chunk WAV(s). Re-run with --resume to continue the same corpus, "
+            "or choose an empty --output directory for a new render."
+        )
+    planned_ids = {int(plan.sequence_id) for plan in plans}
+    unexpected = sorted(set(existing) - planned_ids)
+    if unexpected:
+        raise ValueError(
+            f"--resume refused: {seqs_dir} contains sequence id(s) outside "
+            f"the current --hours plan: {unexpected[:20]}"
+            f"{'...' if len(unexpected) > 20 else ''}. Increase --hours to at "
+            "least the original total or use a new output directory; otherwise "
+            "the packer would silently include this stale tail."
+        )
 
 
 def gen_aec_dataset(args):
@@ -292,25 +306,35 @@ def gen_aec_dataset(args):
     cfg.set('signal', 'sr', str(generation_sr))
     print(f"Sample rate: {generation_sr} Hz "
           f"({'CLI' if args.sample_rate is not None else 'config.ini [signal] sr'})")
-    # Computed once and reused below (the manifest-reuse comparison and the
-    # --resume check both need it, and cfg does not change in between).
+    # Only the manifest-reuse comparison needs this now (the --resume check has
+    # no config record to compare against any more); cfg does not change after
+    # the --sample-rate override above.
     cfg_hash = config_hash(cfg)
 
     split_dir = os.path.join(args.output, args.split)
     seqs_dir = os.path.join(split_dir, 'seqs')
     os.makedirs(seqs_dir, exist_ok=True)
 
+    # Refuse an unsafe rerun before scanning the potentially large source/RIR
+    # trees. The sequence plan depends only on config + seed, not the manifest.
+    plans = plan_sequences(cfg, args.hours, args.seed, args.split)
+    _validate_existing_output(plans, seqs_dir, args.resume)
+
     verify_wav_io(split_dir, args.wav_encoding)
 
     # --- the split decision -------------------------------------------------
-    # One builder per manifest shape -- the caller (here) only decides WHICH
-    # shape this --split wants, not how to build/save/announce it, so the
-    # "reuse vs build" branch below stays two-way instead of three-way.
+    # One builder per manifest shape; persistence is explicit and optional.
     expected_mode = 'unified' if args.split == UNIFIED_SPLIT else 'disjoint'
     manifest_builders = {'disjoint': build_manifest, 'unified': build_unified_manifest}
 
-    manifest_path = args.manifest or os.path.join(args.output, 'manifest.json')
-    if os.path.isfile(manifest_path) and not args.rebuild_manifest:
+    manifest_path = args.manifest
+    if manifest_path is None:
+        if args.rebuild_manifest:
+            raise ValueError("--rebuild-manifest requires an explicit --manifest PATH")
+        print(f"Source inventory: building {expected_mode} split in memory "
+              f"(seed {args.seed}; no JSON written) ...")
+        manifest = manifest_builders[expected_mode](cfg, args.seed)
+    elif os.path.isfile(manifest_path) and not args.rebuild_manifest:
         manifest = load_manifest(manifest_path)
         print(f"Manifest: reusing {manifest_path}")
         if int(manifest['seed']) != int(args.seed):
@@ -337,9 +361,10 @@ def gen_aec_dataset(args):
 
     manifest_mode = manifest.get('split_mode', 'disjoint')   # pre-'all' manifests predate the field
     if manifest_mode != expected_mode:
+        source = manifest_path or 'the in-memory source inventory'
         raise ValueError(
             f"--split {args.split!r} needs a {expected_mode!r}-mode manifest, "
-            f"but {manifest_path} is {manifest_mode!r}. Either change --split to "
+            f"but {source} is {manifest_mode!r}. Either change --split to "
             f"match the existing manifest, or pass --rebuild-manifest to replace "
             f"it (⚠ invalidates every corpus already generated from the old one)."
         )
@@ -354,7 +379,6 @@ def gen_aec_dataset(args):
             f"at {generation_sr}; rebuild it with --rebuild-manifest")
 
     # --- the plan -----------------------------------------------------------
-    plans = plan_sequences(cfg, args.hours, args.seed, args.split)
     planned_sec = sum(p.n_chunks for p in plans) * cfg.getfloat('sequence', 'chunk_sec')
 
     if any(p.scenario == 'echo_path_change' for p in plans):
@@ -372,13 +396,15 @@ def gen_aec_dataset(args):
 
     chunk_sec = cfg.getfloat('sequence', 'chunk_sec')
     chunk_samples = int(round(chunk_sec * generation_sr))
-    linear_aec_contract = linear_aec_contract_from_config(cfg)
+    # Constructed for its validation side effect: it raises if config.ini's
+    # signal/linear_aec grid is not one the frozen PBFDKF supports, which must
+    # fail before rendering, not at pack time. pack_aec_dataset.py rebuilds the
+    # same contract from the same config.
+    linear_aec_contract_from_config(cfg)
     pending = _pending(
         plans, seqs_dir, args.resume,
         sample_rate=generation_sr,
         chunk_samples=chunk_samples,
-        contract_hash=linear_aec_contract.fingerprint(),
-        config_hash=cfg_hash, manifest_version=manifest['version'],
         wav_encoding=args.wav_encoding,
     )
     bytes_per = 4 if args.wav_encoding == 'float32' else 2
@@ -398,7 +424,6 @@ def gen_aec_dataset(args):
     jobs = _RenderJobs(cfg, manifest, args.split, pending, seqs_dir,
                        args.wav_encoding)
     started = time.time()
-    scenario_counts = {}
 
     if pending:
         if args.workers > 0:
@@ -410,8 +435,8 @@ def gen_aec_dataset(args):
         else:
             iterator = tqdm.tqdm((jobs[i] for i in range(len(pending))),
                                  total=len(pending), desc=f"render/{args.split}")
-        for done in iterator:
-            scenario_counts[done['scenario']] = scenario_counts.get(done['scenario'], 0) + 1
+        for _done in iterator:
+            pass
 
     # Sequence-level scenario counts across the WHOLE plan, not just this run's
     # pending slice, so a resumed run reports the corpus and not the remainder.
@@ -419,37 +444,15 @@ def gen_aec_dataset(args):
     for plan in plans:
         plan_counts[plan.scenario] = plan_counts.get(plan.scenario, 0) + 1
 
-    meta = {
-        'split': args.split,
-        'sr': generation_sr,
-        'stems': list(STEM_ORDER),
-        'linear_aec': linear_aec_contract.as_dict(),
-        'linear_aec_contract_hash': linear_aec_contract.fingerprint(),
-        'chunk_sec': chunk_sec,
-        'chunk_samples': chunk_samples,
-        'n_sequences': len(plans),
-        'n_chunks': sum(p.n_chunks for p in plans),
-        'hours': planned_sec / 3600,
-        'requested_hours': args.hours,
-        'seed': args.seed,
-        'wav_encoding': args.wav_encoding,
-        'config': os.path.abspath(args.config),
-        'config_hash': cfg_hash,
-        'generator_commit': git_commit(),
-        'manifest': os.path.abspath(manifest_path),
-        'manifest_version': manifest['version'],
-        'manifest_config_hash': manifest['config_hash'],
-        'manifest_seed': int(manifest['seed']),
-        'sequence_scenarios': plan_counts,
-        'rendered_this_run': len(pending),
-    }
-    with open(os.path.join(split_dir, 'meta.json'), 'w') as handle:
-        json.dump(meta, handle, indent=2, sort_keys=True)
-
     print(f"\nDone. {len(plans)} sequences ({planned_sec / 3600:.3f} h) in "
           f"{seqs_dir}/, {(time.time() - started) / 60:.1f} min this run.")
     print(f"  Sequence scenarios: {plan_counts}")
-    print(f"  Next: python3 pack_aec_dataset.py --input {split_dir} "
+    stale = stale_temp_files(seqs_dir)
+    if stale:
+        print(f"  ⚠ {len(stale)} leftover tmp.*.wav from an interrupted run "
+              f"(ignored by every scan; delete them to reclaim the space)")
+    print(f"  Next: python3 pack_aec_dataset.py --config {args.config} "
+          f"--input {split_dir} "
           f"--output {os.path.join(args.output, 'packed', args.split)}")
 
 
@@ -463,12 +466,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument('--workers', type=int, default=4,
                         help='Render workers (default: 4, 0 = single process)')
     parser.add_argument('--resume', action='store_true',
-                        help='Skip sequences whose metadata sidecar already exists')
+                        help='Skip sequences whose chunk WAVs are all already '
+                             'present with the expected rate/length/channels. '
+                             '⚠ Nothing records WHICH config rendered them, so '
+                             'resume only into a directory started by this same '
+                             'config and --seed')
     parser.add_argument('--seed', type=int, default=42,
                         help="Corpus seed. Fixes both the source split (moot for "
                              "--split all, a single unified pool) and every "
-                             "sequence; multiple runs sharing a manifest (the "
-                             "source-disjoint train/val pair) must share it.")
+                             "sequence; source-disjoint train/val runs must "
+                             "use the same config, source inventory and seed.")
     parser.add_argument('--sample-rate', type=int, default=None,
                         help='Generation sample rate in Hz, overriding [signal] sr')
     parser.add_argument('--split', default='all', choices=ALL_SPLIT_NAMES,
@@ -477,15 +484,17 @@ def build_parser() -> argparse.ArgumentParser:
                              "AIAEC.training_common.split_dataset_by_sample at "
                              "load time. 'train'/'val': which side of a "
                              "SOURCE-DISJOINT pool to draw from instead (two "
-                             "runs, same --seed/--manifest) -- use this for a "
+                             "runs, same config/seed) -- use this for a "
                              "separate held-out generalisation corpus, or real "
                              "recordings, not the main training/validation pool.")
     parser.add_argument('--manifest', default=None,
-                        help='Manifest path (default: <output>/manifest.json). '
-                             'The train and val runs MUST use the same file '
-                             "('all' only ever needs one run).")
+                        help='Optional path used to persist/reuse the source '
+                             'split. Omit for WAV-only output; train/val then '
+                             'rebuild the same split from config + source '
+                             'inventory + seed.')
     parser.add_argument('--rebuild-manifest', action='store_true',
-                        help='⚠ Redraw the source split. Invalidates every corpus '
+                        help='⚠ With an explicit --manifest PATH, redraw that '
+                             'persisted source split. Invalidates every corpus '
                              'already generated from the old manifest.')
     parser.add_argument('--wav-encoding', default='float32',
                         choices=sorted(WAV_ENCODINGS),

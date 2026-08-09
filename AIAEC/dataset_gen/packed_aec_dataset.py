@@ -11,7 +11,7 @@ import glob
 import hashlib
 import json
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch.utils.data import Dataset
@@ -69,10 +69,7 @@ class PackedAecDataset(Dataset):
             current_identity = {
                 'sr': int(obj['sr']),
                 'dtype': str(data.dtype),
-                'generator_commit': obj.get('generator_commit'),
-                'config_hash': obj.get('config_hash'),
-                'manifest_version': obj.get('manifest_version'),
-                'manifest_seed': obj.get('manifest_seed'),
+                'linear_aec_contract_hash': obj['linear_aec_contract_hash'],
             }
             if shard_identity is None:
                 shard_identity = current_identity
@@ -106,8 +103,6 @@ class PackedAecDataset(Dataset):
         self.dtype = self._shards[0]['data'].dtype
         self.linear_aec_contract = linear_aec_contract
         self.linear_aec_contract_hash = linear_aec_contract.fingerprint()
-        self.manifest_version = self._shards[0].get('manifest_version')
-        self.manifest_seed = self._shards[0].get('manifest_seed')
         self._total = total
 
         if verbose:
@@ -122,24 +117,12 @@ class PackedAecDataset(Dataset):
     @staticmethod
     def _resolve(path: str) -> List[str]:
         if os.path.isdir(path):
-            index_path = os.path.join(path, 'index.json')
-            if os.path.isfile(index_path):
-                # Authoritative: a directory can accumulate stray .pt files
-                # left over from an earlier, larger/differently-configured
-                # pack_aec_dataset.py run into the same --output. Globbing
-                # would silently include them; index.json is the one record
-                # of which shards THIS pack actually wrote.
-                with open(index_path, 'r') as handle:
-                    index = json.load(handle)
-                shards = [os.path.join(path, name) for name in index['shards']]
-                missing = [s for s in shards if not os.path.isfile(s)]
-                if missing:
-                    raise FileNotFoundError(
-                        f"{index_path} lists {len(missing)} shard(s) that do "
-                        f"not exist, e.g. {missing[0]}"
-                    )
-                return shards
-            shards = sorted(glob.glob(os.path.join(path, '*.pt')))
+            # Every shard_*.pt in the directory, which is why pack_aec_dataset.py
+            # refuses to write into a directory that already holds shards: a
+            # leftover from an earlier, differently-configured pack would
+            # otherwise silently join this corpus. The per-shard identity
+            # check in __init__ is the second line of defence.
+            shards = sorted(glob.glob(os.path.join(path, 'shard_*.pt')))
             if not shards:
                 raise FileNotFoundError(f"no .pt shards under {path}")
             return shards
@@ -151,7 +134,7 @@ class PackedAecDataset(Dataset):
     def _validate(obj: dict, path: str, expected_sr: Optional[int]) -> None:
         for key in (
             'stems', 'data', 'sr', 'meta', 'linear_aec',
-            'linear_aec_contract_hash', 'manifest_version',
+            'linear_aec_contract_hash',
         ):
             if key not in obj:
                 raise ValueError(f"{path} is missing required key {key!r}")
@@ -171,19 +154,14 @@ class PackedAecDataset(Dataset):
             raise ValueError(
                 f"{path}: {len(obj['meta'])} metadata entries for "
                 f"{data.shape[0]} clips")
-        contract_hash = obj['linear_aec_contract_hash']
-        manifest_version = obj['manifest_version']
+        # Each entry only carries where the clip came from -- the sampler and
+        # full-sequence reconstruction need exactly these two fields, and they
+        # are the two a filename can prove.
         for index, meta in enumerate(obj['meta']):
-            if meta.get('manifest_version') != manifest_version:
-                raise ValueError(
-                    f"{path}: metadata entry {index} has a missing/different "
-                    "manifest_version"
-                )
-            if meta.get('linear_aec_contract_hash') != contract_hash:
-                raise ValueError(
-                    f"{path}: metadata entry {index} has a missing/different "
-                    "linear_aec_contract_hash"
-                )
+            for key in ('sequence_id', 'chunk_index'):
+                if not isinstance(meta.get(key), int):
+                    raise ValueError(
+                        f"{path}: metadata entry {index} has no integer {key!r}")
         if expected_sr is not None and int(obj['sr']) != expected_sr:
             raise ValueError(
                 f"{path}: sr={obj['sr']}, but the config requires {expected_sr}")
@@ -228,20 +206,17 @@ class PackedAecDataset(Dataset):
     def indices_where(self, **conditions) -> List[int]:
         """Dataset indices whose metadata matches every keyword.
 
-        ``dataset.indices_where(scenario='ref_dropout')`` is the intended way to
-        build the idle-loss subset; grepping the meta list by hand in three
-        projects is how three slightly different subsets appear.
+        Only ``sequence_id``/``chunk_index`` are recorded, so this now answers
+        "which chunks belong to sequence N", not "which chunks are dropouts" --
+        the renderer's per-chunk labels are no longer persisted (see
+        pack_aec_dataset.py). A subset that needs an acoustic property has to
+        measure the stems, which is possible precisely because they are stored
+        separately.
         """
         return [
             i for i, m in enumerate(self._meta)
             if all(m.get(key) == value for key, value in conditions.items())
         ]
-
-    def scenario_counts(self) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
-        for m in self._meta:
-            counts[m['scenario']] = counts.get(m['scenario'], 0) + 1
-        return counts
 
     def describe(self) -> str:
         return json.dumps({
@@ -249,46 +224,34 @@ class PackedAecDataset(Dataset):
             'sequences': self.n_sequences(),
             'sr': self.sr,
             'chunk_samples': self.chunk_samples,
-            'scenarios': self.scenario_counts(),
-            'generator_commit': self._shards[0].get('generator_commit'),
-            'config_hash': self._shards[0].get('config_hash'),
-            'manifest_version': self.manifest_version,
-            'manifest_seed': self.manifest_seed,
             'linear_aec_contract_hash': self.linear_aec_contract_hash,
             'dataset_fingerprint': self.fingerprint(),
         }, indent=2, sort_keys=True)
 
     def fingerprint(self) -> str:
-        """Stable corpus identity used by checkpoint/data-resume contracts."""
+        """Stable corpus identity used by checkpoint/data-resume contracts.
+
+        ⚠ This identifies the packed corpus's SHAPE and inventory -- rate,
+        geometry, dtype, linear-AEC contract, and every (sequence, chunk) it
+        contains -- not the audio itself. Two corpora rendered from different
+        configs or seeds into the same shape now fingerprint identically,
+        because nothing on disk records which config rendered a chunk. A
+        checkpoint resumed against the wrong corpus of the same shape will not
+        be caught here.
+        """
         digest = hashlib.sha256()
         header = {
             'sr': self.sr,
             'chunk_samples': self.chunk_samples,
             'stems': list(self.stems),
             'dtype': str(self.dtype),
-            'generator_commit': self._shards[0].get('generator_commit'),
-            'config_hash': self._shards[0].get('config_hash'),
-            'manifest_version': self.manifest_version,
-            # The manifest seed is part of the audio identity, not just split
-            # bookkeeping: the renderer derives device/EQ profiles and every
-            # sequence RNG from the corpus seed.  Omitting it could let two
-            # differently rendered corpora share a checkpoint data contract.
-            'manifest_seed': self.manifest_seed,
             'linear_aec_contract_hash': self.linear_aec_contract_hash,
         }
         digest.update(json.dumps(
             header, sort_keys=True, separators=(',', ':'),
         ).encode('utf-8'))
         for meta in self._meta:
-            identity = (
-                int(meta['sequence_id']),
-                int(meta['chunk_index']),
-                meta.get('scenario'),
-                meta.get('speaker_id'),
-                meta.get('noise_id'),
-                meta.get('rir_id'),
-                meta.get('device_id'),
-            )
+            identity = (int(meta['sequence_id']), int(meta['chunk_index']))
             digest.update(repr(identity).encode('utf-8'))
             digest.update(b'\0')
         return digest.hexdigest()

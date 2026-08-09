@@ -404,8 +404,8 @@ def build_unified_manifest(cfg: configparser.ConfigParser, seed: int,
     There is no train/val axis here
     to keep disjoint, so assert_source_disjoint is never called on this
     shape; ``seed`` is still recorded for provenance even though nothing in
-    THIS function is randomised by it (kept so meta.json/manifest.json are
-    structurally comparable across both manifest shapes).
+    THIS function is randomised by it (kept so the in-memory/optional persisted
+    manifest has one schema across both split shapes).
     """
     scanned = _scan_sources(cfg, progress)
     speakers, noises, rooms = scanned['speakers'], scanned['noises'], scanned['rooms']
