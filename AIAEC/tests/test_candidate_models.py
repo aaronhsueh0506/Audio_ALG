@@ -10,6 +10,7 @@ from AIAEC.CAGCRN import CAGCRN
 from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.DeepVQE_S import DeepVQES
 from AIAEC.GTCRN_AENR import GTCRNAENR
+from AIAEC.dataset_gen import MODEL_TASKS
 
 
 G16 = SignalGrid(16000, 512, 512, 256)
@@ -220,3 +221,15 @@ def test_old_generic_projects_are_removed():
     root = pathlib.Path(__file__).parents[1]
     for stale in ("AECNet", "PostFilter", "JointAECNR"):
         assert not (root / stale).exists()
+
+
+def test_model_task_attributes_match_the_training_contract():
+    classes = {
+        'Align_CRUSE': AlignCRUSE,
+        'Align_ULCNet': AlignULCNet,
+        'GTCRN_AENR': GTCRNAENR,
+        'DeepFilterNet_AENR': DeepFilterNetAENR,
+        'DeepVQE_S': DeepVQES,
+        'CAGCRN': CAGCRN,
+    }
+    assert {name: cls.task for name, cls in classes.items()} == MODEL_TASKS

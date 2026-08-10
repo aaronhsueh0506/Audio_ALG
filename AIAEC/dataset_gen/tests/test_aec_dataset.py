@@ -22,6 +22,7 @@ import torchaudio
 
 from AIAEC.dataset_gen import (
     BASE_STEM_ORDER,
+    PACKED_STEM_ORDER,
     STEM_ORDER,
     AecGrid,
     AecStems,
@@ -201,19 +202,22 @@ def packed(corpus, tmp_path_factory):
 # ============================================================
 
 def test_stem_channel_order_matches_declared_list(packed):
-    """The shard's declared order must be THE order, in every shard."""
+    """WAVs stay five-channel; packed training shards project to four."""
     assert list(STEM_ORDER) == [
         'far_render', 'near_speech', 'near_target',
         'mic_postclip', 'linear_error',
     ]
+    assert list(PACKED_STEM_ORDER) == [
+        'far_render', 'mic_postclip', 'linear_error', 'near_target',
+    ]
     for split in ('train', 'val'):
         dataset = packed[split]
-        assert tuple(dataset.stems) == STEM_ORDER
+        assert tuple(dataset.stems) == PACKED_STEM_ORDER
         stems, _meta = dataset[0]
-        assert stems.shape[0] == len(STEM_ORDER)
+        assert stems.shape[0] == len(PACKED_STEM_ORDER)
         # And the named view must reach the same channels by name.
-        view = AecStems(stems)
-        for position, name in enumerate(STEM_ORDER):
+        view = AecStems(stems, dataset.stems)
+        for position, name in enumerate(PACKED_STEM_ORDER):
             assert torch.equal(view.stem(name), stems[position])
 
 
@@ -233,17 +237,26 @@ def test_named_view_rejects_a_wrong_order():
         AecStems(torch.zeros(len(STEM_ORDER) - 1, 16))
 
 
-def test_dereverb_target_is_stored_and_uses_the_same_near_gain(packed):
-    """DeepVQE gets an early-RIR target, not the full reverberant mic stem."""
+def test_packer_preserves_the_early_target_and_drops_reverberant_near(packed):
+    """The four-channel shard is an exact projection of the generated WAV."""
     observed_difference = False
     for split in ('train', 'val'):
         dataset = packed[split]
         for index in range(len(dataset)):
             view = dataset.stems_of(index)
-            assert view.near_target.shape == view.near_speech.shape
             assert torch.isfinite(view.near_target).all()
-            if (float(view.near_speech.abs().max()) > 1e-6
-                    and not torch.allclose(view.near_target, view.near_speech)):
+            meta = dataset.meta(index)
+            wav_path = (packed['output'] / split / 'seqs' /
+                        f"{meta['sequence_id']:06d}_{meta['chunk_index']:03d}.wav")
+            wav, _sr = torchaudio.load(str(wav_path))
+            for name in PACKED_STEM_ORDER:
+                torch.testing.assert_close(
+                    view.stem(name), wav[STEM_ORDER.index(name)],
+                    rtol=0.0, atol=0.0,
+                )
+            near_speech = wav[STEM_ORDER.index('near_speech')]
+            if (float(near_speech.abs().max()) > 1e-6
+                    and not torch.allclose(view.near_target, near_speech)):
                 observed_difference = True
     assert observed_difference, "early/full near RIR targets were accidentally identical"
 
@@ -373,6 +386,25 @@ def test_packed_dataset_rejects_legacy_four_channel_shard(tmp_path):
         PackedAecDataset(str(path), verbose=False)
 
 
+def test_four_channel_shard_is_loadable_with_mmap(tmp_path):
+    contract = make_linear_aec_contract(16000, frame_size=512)
+    data = torch.randn(2, len(PACKED_STEM_ORDER), 256)
+    path = tmp_path / 'shard_00000.pt'
+    torch.save({
+        'stems': list(PACKED_STEM_ORDER),
+        'data': data,
+        'sr': 16000,
+        'meta': [
+            {'sequence_id': 0, 'chunk_index': 0},
+            {'sequence_id': 0, 'chunk_index': 1},
+        ],
+        'linear_aec': contract.as_dict(),
+        'linear_aec_contract_hash': contract.fingerprint(),
+    }, path)
+    dataset = PackedAecDataset(str(path), mmap=True, verbose=False)
+    torch.testing.assert_close(dataset[1][0], data[1], rtol=0.0, atol=0.0)
+
+
 def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
         packed, corpus, tmp_path):
     """A four-channel corpus is upgraded from the audio alone.
@@ -434,7 +466,7 @@ def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
     packed_dir = tmp_path / 'repacked'
     _pack(corpus, destination, packed_dir)
     upgraded = PackedAecDataset(str(packed_dir), verbose=False)
-    assert tuple(upgraded.stems) == STEM_ORDER
+    assert tuple(upgraded.stems) == PACKED_STEM_ORDER
     assert upgraded.linear_aec_contract_hash == \
         linear_aec_contract_from_config(corpus['cfg']).fingerprint()
 

@@ -12,11 +12,11 @@ arguments.
 | Route | Model | Public inputs | Target | Status |
 |---|---|---|---|---|
 | end-to-end AEC+RES+NR | `Align_CRUSE` | mic + unaligned far | early near (dereverb) | selected |
-| linear AEC -> RES+NR | `Align_ULCNet` | linear error + far | clean near | paper reference |
-| linear AEC -> RES+NR | `GTCRN_AENR` | linear error + far | clean near | project variant |
-| linear AEC -> RES+NR | `DeepFilterNet_AENR` | conditioned DFN features | clean near | project variant |
+| linear AEC -> RES+NR | `Align_ULCNet` | linear error + far | early near (dereverb) | paper reference |
+| linear AEC -> RES+NR | `GTCRN_AENR` | linear error + far | early near (dereverb) | project variant |
+| linear AEC -> RES+NR | `DeepFilterNet_AENR` | conditioned DFN features | early near (dereverb) | project variant |
 | end-to-end AEC+RES+NR | `DeepVQE_S` | mic + unaligned far | early near (dereverb) | primary |
-| end-to-end AEC+RES+NR | `CAGCRN` | mic + unaligned far | clean near | backup |
+| end-to-end AEC+RES+NR | `CAGCRN` | mic + unaligned far | early near (dereverb) | backup |
 
 Align-CRUSE previously ran its own AEC-only, noise-preserving route (target
 `near_speech + local_noise`); that route was retired and folded into the
@@ -36,11 +36,14 @@ contract explicitly; a shared FFT size alone does not establish compatibility.
 `dataset_gen/` is the one AIAEC dataset implementation and public import/CLI
 path. It renders complete stateful scenarios, runs the frozen Python PBFDKF
 once over each complete sequence, and only then cuts the result into
-10-second chunks. Every chunk stores five lossless stems:
+10-second WAV chunks. Generated WAVs retain five lossless stems:
 `far_render`, `near_speech`, `near_target`, `mic_postclip`, and
-`linear_error`. The last stem is `E = mic_postclip - D_hat`; it is not the
-oracle residual echo. `model_views.build_model_view` is the single mapping
-from those stems to each candidate.
+`linear_error`. Packing projects them to the four-channel training contract
+`far_render`, `mic_postclip`, `linear_error`, `near_target`; the reverberant
+`near_speech` audit stem is not copied into `.pt`. `linear_error` is
+`E = mic_postclip - D_hat`, not oracle residual echo. Every candidate targets
+the same denoised, echo-free early near speech; `model_views.build_model_view`
+is the single mapping from the four packed stems to each model.
 
 All trainers use a deterministic random split over chunks. Train batches
 shuffle every epoch and validation batches do not. Chunks from one parent
@@ -93,7 +96,8 @@ keeps packed tensors disk-backed to reduce host RAM use.
 
 ## Navigation and tests
 
-- [`dataset_gen/README.md`](dataset_gen/README.md): five-stem scenario data and
+- [`dataset_gen/README.md`](dataset_gen/README.md): five-channel WAV generation,
+  four-channel packed training data, and
   per-model views.
 - [`../docs/ai_aec_candidate_matrix.md`](../docs/ai_aec_candidate_matrix.md):
   current selection and deployment rules.

@@ -13,7 +13,7 @@ config.ini sections (see the shipped config.ini for every knob, documented):
                  AIAEC/dataset_gen/config.ini rendered with. 48 kHz uses
                  1024/1024/512 with df_bins=96; 16 kHz uses 512/512/256 with
                  df_bins=64 (model.py's own default -- see README.md).
-    [data]       one packed five-stem corpus path + ordinary batch size +
+    [data]       one packed four-stem corpus path + ordinary batch size +
                  per-chunk val_fraction
     [feature]    the SAME normalisation constants as
                  AINR/DeepFilterNet2/config.ini's [feature] section -- this
@@ -42,8 +42,9 @@ dataset:
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['DeepFilterNet_AENR']):
     frozen-linear-AEC error + far-end reference in (as independently
-    normalised DFN features -- error_erb/error_spec/far_erb/far_spec); clean
-    near-end speech out. Requires the real linear AEC, same as GTCRN_AENR.
+    normalised DFN features -- error_erb/error_spec/far_erb/far_spec);
+    denoised, echo-free, early/dereverberated near-end speech out. Requires
+    the real linear AEC, same as GTCRN_AENR.
 
 checkpoint compatibility: initializing from an existing standalone DFN2
 checkpoint only works if its MODEL_VERSION, feature contract, grid and
@@ -72,6 +73,8 @@ from AINR.DeepFilterNet2.train import FEATURE_VERSION, read_feature_config
 from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.dataset_gen import (
     AecStems,
+    MODEL_TASKS,
+    PACKED_STEM_ORDER,
     build_model_view,
     build_spectral_model_view,
 )
@@ -94,7 +97,7 @@ from AIAEC.training_common import (
 
 
 MODEL_NAME = 'DeepFilterNet_AENR'
-TASK = 'linear_aec_postfilter_res_nr'
+TASK = MODEL_TASKS[MODEL_NAME]
 LOSS_VERSION = 'aiaec_compressed_spectral_v1'
 # DeepFilterNetAENR.__init__ binds these itself (from the grid or its own
 # explicit params) before forwarding **kwargs to DeepFilterNet2.__init__;
@@ -109,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def forward_batch(model, stems_batch, aec_grid, device, feature_cfg):
-    stems = AecStems(stems_batch.to(device))
+    stems = AecStems(stems_batch.to(device), PACKED_STEM_ORDER)
     view = build_model_view(stems, MODEL_NAME, sample_rate=aec_grid.sr)
     # dfn_feature_state=None every call -- see this file's top-of-file
     # docstring for why cross-chunk EMA threading is out of scope here.

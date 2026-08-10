@@ -2,7 +2,9 @@
 
 Hybrid `linear AEC -> joint RES + NR` reference candidate. Inputs are the
 **frozen production linear-AEC error** and far-end reference; the target is
-clean near-end speech. It is not a direct neural AEC.
+the common denoised, echo-free, early/dereverberated near-end speech. It is
+not a direct neural AEC. This target is the project's comparison contract and
+should not be reported as an upstream checkpoint-equivalent setting.
 
 The implementation follows arXiv:2410.13620: component-wise power-law
 compression; separate 32-channel NE/error and FE streams; two separable

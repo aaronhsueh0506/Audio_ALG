@@ -149,7 +149,7 @@ class SubbandTemporalGRU(nn.Module):
 
 class AlignULCNet(nn.Module):
     paper_reference = "arXiv:2410.13620"
-    task = "linear_aec_postfilter_res_nr"
+    task = "linear_aec_postfilter_res_nr_dereverb"
 
     def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
                  gamma: int = 5, subband_bins: int = 2,

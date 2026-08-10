@@ -34,9 +34,9 @@ dataset:
 
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['CAGCRN']):
-    mic + unaligned far-end in; clean near-end speech out (unlike DeepVQE_S,
-    CAGCRN's published task does NOT include dereverberation, so
-    ``build_model_view`` targets plain ``near_speech`` here).
+    mic + unaligned far-end in; denoised, echo-free, early/dereverberated
+    near-end speech out. This common product target extends the paper's
+    non-dereverberating task and is recorded in the checkpoint contract.
 
 ⚠ See model.py/README.md: the paper's proposed learnable integer floor(D)
 delay window cannot receive useful ordinary autograd through a tensor-shape
@@ -68,6 +68,8 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.CAGCRN import CAGCRN
 from AIAEC.dataset_gen import (
     AecStems,
+    MODEL_TASKS,
+    PACKED_STEM_ORDER,
     build_model_view,
     build_spectral_model_view,
 )
@@ -90,7 +92,7 @@ from AIAEC.training_common import (
 
 
 MODEL_NAME = 'CAGCRN'
-TASK = 'end_to_end_aec_res_nr'
+TASK = MODEL_TASKS[MODEL_NAME]
 LOSS_VERSION = 'aiaec_compressed_spectral_v1'
 
 
@@ -99,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def forward_batch(model, stems_batch, aec_grid, device):
-    stems = AecStems(stems_batch.to(device))
+    stems = AecStems(stems_batch.to(device), PACKED_STEM_ORDER)
     view = build_model_view(stems, MODEL_NAME, sample_rate=aec_grid.sr)
     spectral = build_spectral_model_view(view, aec_grid)
     output = model(**spectral.inputs)

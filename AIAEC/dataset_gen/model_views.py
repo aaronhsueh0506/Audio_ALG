@@ -38,20 +38,13 @@ class SpectralModelView:
 
 
 MODEL_TASKS = {
-    "Align_CRUSE": "end_to_end_aec_res_nr",
-    "Align_ULCNet": "linear_aec_postfilter_res_nr",
-    "GTCRN_AENR": "linear_aec_postfilter_res_nr",
-    "DeepFilterNet_AENR": "linear_aec_postfilter_res_nr",
-    "DeepVQE_S": "end_to_end_aec_res_nr",
-    "CAGCRN": "end_to_end_aec_res_nr",
+    "Align_CRUSE": "end_to_end_aec_res_nr_dereverb",
+    "Align_ULCNet": "linear_aec_postfilter_res_nr_dereverb",
+    "GTCRN_AENR": "linear_aec_postfilter_res_nr_dereverb",
+    "DeepFilterNet_AENR": "linear_aec_postfilter_res_nr_dereverb",
+    "DeepVQE_S": "end_to_end_aec_res_nr_dereverb",
+    "CAGCRN": "end_to_end_aec_res_nr_dereverb",
 }
-
-# Within "end_to_end_aec_res_nr", published/adopted task scope still splits in
-# two: DeepVQE-S and Align-CRUSE both dereverberate, CAGCRN does not. Keeping
-# both targets in the corpus prevents a silent task change. Listed here,
-# alongside MODEL_TASKS, so a future model joining the dereverb side is a
-# one-line addition instead of another edit to build_model_view's branch.
-DEREVERB_TARGET_MODELS = frozenset({"DeepVQE_S", "Align_CRUSE"})
 
 
 def build_model_view(stems: AecStems, model_name: str,
@@ -64,18 +57,15 @@ def build_model_view(stems: AecStems, model_name: str,
             f"unknown AIAEC model {model_name!r}; expected {sorted(MODEL_TASKS)}"
         ) from None
 
-    if task == "end_to_end_aec_res_nr":
+    if task == "end_to_end_aec_res_nr_dereverb":
         # Align-CRUSE previously ran under its own "direct_aec_preserve_noise"
         # task (echo cancellation only, noise left untouched for a later
         # independent NR stage) -- that route was retired in favour of this
-        # one, joint task. See DEREVERB_TARGET_MODELS above for which of this
-        # task's models also dereverberate.
-        target = (stems.near_target if model_name in DEREVERB_TARGET_MODELS
-                  else stems.near_speech)
+        # one joint AEC+RES+NR+dereverberation task.
         return ModelView(
             model_name, task,
             {"microphone": stems.mic_postclip, "far_end": stems.far_render},
-            target,
+            stems.near_target,
         )
 
     linear_error = stems.linear_error
@@ -89,7 +79,7 @@ def build_model_view(stems: AecStems, model_name: str,
     return ModelView(
         model_name, task,
         {"linear_error": linear_error, "far_end": stems.far_render},
-        stems.near_speech,
+        stems.near_target,
         echo_estimate=echo_estimate,
     )
 

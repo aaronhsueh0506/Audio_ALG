@@ -2,7 +2,8 @@
 
 Project variant for `linear AEC -> joint RES + NR`. It takes the production
 linear error and far reference and predicts a complex ratio mask applied to the
-linear error.
+linear error. Its target is the common denoised, echo-free,
+early/dereverberated near-end speech.
 
 The audited standalone GTCRN is reused unchanged after its first layer:
 ERB band merge/split, SFE, ShuffleNetV2-style group temporal convolutions, TRA,

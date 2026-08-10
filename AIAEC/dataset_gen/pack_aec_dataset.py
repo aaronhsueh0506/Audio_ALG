@@ -6,9 +6,8 @@ training on a corpus of this size.  The shard layout is the packed format every
 AEC model project consumes:
 
     {
-      'stems': ['far_render','near_speech','near_target',
-                'mic_postclip','linear_error'],  # channel order, fixed
-      'data' : float32 tensor (N, 5, T),
+      'stems': ['far_render','mic_postclip','linear_error','near_target'],
+      'data' : float32 tensor (N, 4, T),
       'sr'   : int,
       'meta' : list of N {'sequence_id', 'chunk_index'},
       'linear_aec'              : the frozen PBFDKF contract, from --config,
@@ -56,9 +55,14 @@ if __package__ in (None, ''):
     sys.path.insert(0, _AUDIO_ALG)
     __package__ = 'AIAEC.dataset_gen'
 
-from .aec_features import STEM_ORDER  # noqa: E402
+from .aec_features import PACKED_STEM_ORDER, STEM_ORDER  # noqa: E402
 from .linear_aec import linear_aec_contract_from_config  # noqa: E402
 from .seq_layout import scan_chunks, stale_temp_files  # noqa: E402
+
+
+PACKED_WAV_CHANNELS = tuple(
+    STEM_ORDER.index(name) for name in PACKED_STEM_ORDER
+)
 
 
 def _resolve_seqs_dir(input_dir: str) -> str:
@@ -115,7 +119,7 @@ def _save_shard(clips, metas, shard_index, args, header) -> tuple:
     path = os.path.join(args.output, f"shard_{shard_index:05d}.pt")
     temporary = path + '.tmp'
     torch.save({
-        'stems': list(STEM_ORDER),
+        'stems': list(PACKED_STEM_ORDER),
         'data': data,
         'meta': metas,
         **header,
@@ -189,7 +193,7 @@ def pack(args):
     }
 
     bytes_per = 2 if args.dtype == 'float16' else 4
-    approx = total_chunks * len(STEM_ORDER) * expected_t * bytes_per
+    approx = total_chunks * len(PACKED_STEM_ORDER) * expected_t * bytes_per
     print(f"{len(sequences)} sequences / {total_chunks} chunks -> {args.output}")
     print(f"  sr={sr}, T={expected_t}, dtype={args.dtype}, "
           f"~{approx / 1024 ** 3:.1f} GB")
@@ -224,7 +228,10 @@ def pack(args):
                                      f"{expected_t}")
                 if not torch.isfinite(audio).all():
                     raise ValueError(f"{path}: contains NaN or Inf")
-                clips.append(audio)
+                # Existing generated corpora are five-channel WAVs.  Persist
+                # only the four-channel training contract; no acoustic data
+                # needs to be regenerated.
+                clips.append(audio[list(PACKED_WAV_CHANNELS)].contiguous())
                 metas.append({'sequence_id': int(sequence_id),
                               'chunk_index': int(chunk_index)})
                 progress.update(1)

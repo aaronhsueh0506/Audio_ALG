@@ -42,7 +42,7 @@ task (see ../README.md's decision matrix and
     AEC/RES-only route -- background noise deliberately preserved for a
     later, independent NR stage -- but that route was retired: there is no
     more standalone AEC-only candidate, so Align-CRUSE now shares the same
-    joint end_to_end_aec_res_nr task and dereverb target as DeepVQE-S.
+    joint end-to-end AEC+RES+NR dereverb task and target as DeepVQE-S.
 
 inference: see denoise.py's own top-of-file usage comment.
 """
@@ -68,6 +68,8 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.dataset_gen import (
     AecStems,
+    MODEL_TASKS,
+    PACKED_STEM_ORDER,
     build_model_view,
     build_spectral_model_view,
 )
@@ -90,7 +92,7 @@ from AIAEC.training_common import (
 
 
 MODEL_NAME = 'Align_CRUSE'
-TASK = 'end_to_end_aec_res_nr'
+TASK = MODEL_TASKS[MODEL_NAME]
 LOSS_VERSION = 'aiaec_compressed_spectral_v1'
 
 
@@ -99,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def forward_batch(model, stems_batch, aec_grid, device):
-    stems = AecStems(stems_batch.to(device))
+    stems = AecStems(stems_batch.to(device), PACKED_STEM_ORDER)
     view = build_model_view(stems, MODEL_NAME, sample_rate=aec_grid.sr)
     spectral = build_spectral_model_view(view, aec_grid)
     output = model(**spectral.inputs)

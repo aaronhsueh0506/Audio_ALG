@@ -16,7 +16,7 @@ from AIAEC.aiaec_common import AecOutput, SignalGrid, require_complex_btf
 
 class DeepFilterNetAENR(DeepFilterNet2):
     base_reference = "local DeepFilterNet2 cascade/alpha port"
-    task = "linear_aec_postfilter_res_nr"
+    task = "linear_aec_postfilter_res_nr_dereverb"
 
     def __init__(self, grid: SignalGrid, n_erb: int = 32,
                  df_bins: int | None = None, df_order: int = 5,

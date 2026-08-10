@@ -17,7 +17,7 @@ from AIAEC.aiaec_common import AecOutput, SignalGrid, require_complex_btf
 
 class GTCRNAENR(GTCRN):
     base_reference = "Xiaobin Rong et al., GTCRN (INTERSPEECH 2024)"
-    task = "linear_aec_postfilter_res_nr"
+    task = "linear_aec_postfilter_res_nr_dereverb"
 
     def __init__(self, grid: SignalGrid, erb_subband_1: int = 65,
                  erb_subband_2: int = 64):

@@ -8,11 +8,18 @@ in Git history rather than treated as implementation documentation.
 | Route | Candidate | Public input | Supervised target | Current role |
 |---|---|---|---|---|
 | end-to-end AEC+RES+NR | `Align_CRUSE` | mic + unaligned far | early near target | selected |
-| linear AEC → RES+NR | `Align_ULCNet` | production linear error + far | clean reverberant near | paper reference |
-| linear AEC → RES+NR | `GTCRN_AENR` | production linear error + far | clean reverberant near | project variant |
-| linear AEC → RES+NR | `DeepFilterNet_AENR` | independently normalized error/far DFN features | clean reverberant near | project variant |
+| linear AEC → RES+NR | `Align_ULCNet` | production linear error + far | early near target | paper reference |
+| linear AEC → RES+NR | `GTCRN_AENR` | production linear error + far | early near target | project variant |
+| linear AEC → RES+NR | `DeepFilterNet_AENR` | independently normalized error/far DFN features | early near target | project variant |
 | end-to-end AEC+RES+NR | `DeepVQE_S` | mic + unaligned far | early near target | primary |
-| end-to-end AEC+RES+NR | `CAGCRN` | mic + unaligned far | clean reverberant near | backup |
+| end-to-end AEC+RES+NR | `CAGCRN` | mic + unaligned far | early near target | backup |
+
+⚠ **Every candidate now targets the same early/dereverberated `near_target`**
+(`MODEL_TASKS` values all end in `_dereverb`). For `Align_ULCNet`, `GTCRN_AENR`,
+`DeepFilterNet_AENR` and `CAGCRN` that is a project extension of the published
+task, not the published task itself — they previously targeted the reverberant
+`near_speech`. Checkpoints trained under the old targets are refused at
+inference by `require_checkpoint_model_identity`, so they must be retrained.
 
 `Align_CRUSE` previously ran its own "direct AEC/RES, preserve local noise"
 route (target: near speech + local noise, untouched). That route was retired
@@ -29,8 +36,11 @@ record.
   frozen at deployment. An oracle residual is rejected by the dataset view.
 - Treat `GTCRN_AENR` and `DeepFilterNet_AENR` as project variants, not published
   author AEC models.
-- Use `DeepVQE_S` when dereverberation is part of the target. `CAGCRN` is the
-  smaller backup E2E route.
+- `DeepVQE_S` is the primary E2E route and `CAGCRN` the smaller backup. ⚠ This
+  rule used to read "use `DeepVQE_S` when dereverberation is part of the
+  target"; that no longer separates the two, since every candidate now targets
+  `near_target`. Whatever replaces it as the selection criterion is still an
+  open decision.
 
 ## Common contracts
 
@@ -40,9 +50,12 @@ record.
 - `GTCRN_AENR` stays locked to its original 16 kHz grid.
 - The public forwards are clip-level; explicit per-model cache/state I/O is a
   separate streaming deployment concern.
-- AIAEC data is generated only through `AIAEC/dataset_gen/`. Five stored stems
-  are mapped to model inputs and targets by
-  `dataset_gen.model_views.build_model_view`.
+- AIAEC data is generated only through `AIAEC/dataset_gen/`. Generated WAVs
+  carry five stems; packing projects them to the four-channel training contract
+  `PACKED_STEM_ORDER` (`far_render`, `mic_postclip`, `linear_error`,
+  `near_target`), which `dataset_gen.model_views.build_model_view` maps to each
+  model's inputs and target. The reverberant `near_speech` stem stays in the
+  WAVs for audit and is not packed.
 
 ## DeepFilterNet-AENR baseline
 

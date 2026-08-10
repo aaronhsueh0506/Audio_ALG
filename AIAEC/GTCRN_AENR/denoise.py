@@ -17,6 +17,9 @@ correct single-utterance case for LinearAecEngine (a fresh engine per call
 IS a cold start, matching the file's own beginning -- no cross-call state to
 carry, unlike training's per-lane persistence across chunks).
 
+Output is the common denoised, echo-free, early/dereverberated near-end speech
+estimate used by every selected AIAEC candidate.
+
 config.ini is not read for model shape: every shape-relevant setting is
 recovered from the checkpoint's own contract, including the exact materialized
 Python-PBFDKF frontend. Inference refuses a missing or drifted AEC contract.
@@ -40,6 +43,7 @@ from AIAEC.dataset_gen import AecGrid, istft, stft
 from AIAEC.training_common import (
     LinearAecEngine,
     auto_device,
+    require_checkpoint_model_identity,
     require_checkpoint_linear_aec,
 )
 
@@ -57,6 +61,7 @@ def build_parser() -> argparse.ArgumentParser:
 def load_model(checkpoint_path: str, device: str):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     contract = ckpt['contract']
+    require_checkpoint_model_identity(contract, 'GTCRN_AENR')
     aec_grid = AecGrid(contract['sr'], contract['n_fft'], contract['win_len'], contract['hop_len'])
     linear_aec_contract = require_checkpoint_linear_aec(contract, aec_grid)
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)

@@ -33,7 +33,7 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid, istft, stft
-from AIAEC.training_common import auto_device
+from AIAEC.training_common import auto_device, require_checkpoint_model_identity
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
 def load_model(checkpoint_path: str, device: str):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     contract = ckpt['contract']
+    require_checkpoint_model_identity(contract, 'Align_CRUSE')
     aec_grid = AecGrid(contract['sr'], contract['n_fft'], contract['win_len'], contract['hop_len'])
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)
     model_kwargs = {

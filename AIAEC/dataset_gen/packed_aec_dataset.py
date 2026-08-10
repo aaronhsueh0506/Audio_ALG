@@ -16,7 +16,7 @@ from typing import List, Optional, Tuple
 import torch
 from torch.utils.data import Dataset
 
-from .aec_features import STEM_ORDER, AecStems
+from .aec_features import PACKED_STEM_ORDER, AecStems
 from .linear_aec import LinearAecContract
 
 
@@ -27,7 +27,7 @@ class PackedAecDataset(Dataset):
     """Open one ``.pt`` shard, or every shard in a directory, in order.
 
     ``__getitem__`` returns ``(stems, meta)`` where ``stems`` is the raw
-    ``(5, T)`` tensor in ``STEM_ORDER``.  Wrap it in
+    ``(4, T)`` tensor in ``PACKED_STEM_ORDER``.  Wrap it in
     :class:`~AIAEC.dataset_gen.aec_features.AecStems` to read channels by name --
     :meth:`stems_of` does that for you.
     """
@@ -139,16 +139,16 @@ class PackedAecDataset(Dataset):
             if key not in obj:
                 raise ValueError(f"{path} is missing required key {key!r}")
         # ⚠ The channel order is the one property a consumer cannot notice being
-        # wrong: swapping echo and near_speech trains a model that cancels the
-        # talker and it converges perfectly well.
-        if list(obj['stems']) != list(STEM_ORDER):
+        # wrong: swapping microphone, reference or target can still produce a
+        # numerically convergent model with the wrong product behaviour.
+        if list(obj['stems']) != list(PACKED_STEM_ORDER):
             raise ValueError(
                 f"{path} declares stem order {list(obj['stems'])}, this code "
-                f"expects {list(STEM_ORDER)}")
+                f"expects {list(PACKED_STEM_ORDER)}")
         data = obj['data']
-        if data.ndim != 3 or data.shape[1] != len(STEM_ORDER):
+        if data.ndim != 3 or data.shape[1] != len(PACKED_STEM_ORDER):
             raise ValueError(
-                f"{path}: data must be (N, {len(STEM_ORDER)}, T), got "
+                f"{path}: data must be (N, {len(PACKED_STEM_ORDER)}, T), got "
                 f"{tuple(data.shape)}")
         if len(obj['meta']) != data.shape[0]:
             raise ValueError(

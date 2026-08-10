@@ -79,6 +79,7 @@ from aec import AEC  # noqa: E402
 from AIAEC.aiaec_common import SignalGrid, safe_abs  # noqa: E402
 from AIAEC.dataset_gen import (  # noqa: E402
     AecGrid,
+    MODEL_TASKS,
     PackedAecDataset,
     aec_collate,
 )
@@ -101,6 +102,7 @@ __all__ = [
     'read_model_kwargs',
     'make_checkpoint_contract',
     'require_checkpoint_contract',
+    'require_checkpoint_model_identity',
     'require_checkpoint_linear_aec',
     'scan_non_finite',
     'NonFiniteTraining',
@@ -432,6 +434,24 @@ def require_checkpoint_contract(ckpt: Dict, expected: Dict, context: str = 'chec
             f"{context} {path}={got!r}, but the running config requires "
             f"{want!r}. Retrain, or fix config.ini before resuming/loading "
             f"for inference."
+        )
+
+
+def require_checkpoint_model_identity(contract: Dict, model_name: str) -> None:
+    """Reject a checkpoint from another model or an obsolete task target."""
+    if not isinstance(contract, dict):
+        raise ValueError("checkpoint has no valid contract")
+    expected_task = MODEL_TASKS[model_name]
+    if contract.get('model_name') != model_name:
+        raise ValueError(
+            f"checkpoint model_name={contract.get('model_name')!r}, expected "
+            f"{model_name!r}"
+        )
+    if contract.get('task') != expected_task:
+        raise ValueError(
+            f"checkpoint task={contract.get('task')!r}, expected "
+            f"{expected_task!r}; this checkpoint used a different training "
+            "target and must not be used for inference"
         )
 
 

@@ -21,12 +21,14 @@ from AIAEC.training_common import (
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
+    require_checkpoint_model_identity,
     require_checkpoint_linear_aec,
     split_dataset_by_sample,
 )
 from AIAEC.dataset_gen import (
     LinearAecContract,
     LinearAecProcessor,
+    MODEL_TASKS,
     make_linear_aec_contract,
     require_linear_aec_contract,
 )
@@ -188,7 +190,7 @@ def test_checkpoint_contract_roundtrip_and_mismatch():
     grid = SignalGrid(16000, 512, 512, 256)
     kwargs = {'gru_hidden': 64}
     contract = make_checkpoint_contract(
-        model_name='Align_CRUSE', task='end_to_end_aec_res_nr', grid=grid,
+        model_name='Align_CRUSE', task=MODEL_TASKS['Align_CRUSE'], grid=grid,
         model_kwargs=kwargs, loss_version='v1',
     )
     require_checkpoint_contract({'contract': contract}, contract)   # must not raise
@@ -210,7 +212,7 @@ def test_checkpoint_contract_rejects_changed_data_split_indices():
         'val_indices': [1],
     }
     contract = make_checkpoint_contract(
-        model_name='Align_ULCNet', task='linear_aec_postfilter_res_nr',
+        model_name='Align_ULCNet', task=MODEL_TASKS['Align_ULCNet'],
         grid=grid, model_kwargs={}, loss_version='v1',
         data_contract=data_contract,
     )
@@ -244,11 +246,25 @@ def test_checkpoint_linear_aec_rejects_hash_and_model_grid_mismatch():
 def test_checkpoint_contract_ctor_prefix_does_not_collide_with_model_name():
     grid = SignalGrid(16000, 512, 512, 256)
     contract = make_checkpoint_contract(
-        model_name='Align_CRUSE', task='end_to_end_aec_res_nr', grid=grid,
+        model_name='Align_CRUSE', task=MODEL_TASKS['Align_CRUSE'], grid=grid,
         model_kwargs={'gru_hidden': 64}, loss_version='v1',
     )
     assert contract['model_name'] == 'Align_CRUSE'
     assert contract['ctor_gru_hidden'] == 64
+
+
+def test_inference_checkpoint_identity_rejects_old_target_and_wrong_model():
+    valid = {
+        'model_name': 'CAGCRN',
+        'task': MODEL_TASKS['CAGCRN'],
+    }
+    require_checkpoint_model_identity(valid, 'CAGCRN')
+    with pytest.raises(ValueError, match='different training target'):
+        require_checkpoint_model_identity(
+            {**valid, 'task': 'end_to_end_aec_res_nr'}, 'CAGCRN'
+        )
+    with pytest.raises(ValueError, match='model_name'):
+        require_checkpoint_model_identity(valid, 'DeepVQE_S')
 
 
 def test_compressed_spectral_loss_zero_for_identical_spectra():

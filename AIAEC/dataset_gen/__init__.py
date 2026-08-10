@@ -4,7 +4,7 @@ The six AEC model projects import from here and nowhere else:
 
     from AIAEC.dataset_gen import (
         AecGrid, AecStems, SequenceChunkSampler, PackedAecDataset,
-        STEM_ORDER, alpha_from_tau, stft, istft,
+        PACKED_STEM_ORDER, alpha_from_tau, stft, istft,
     )
 
 ⚠ A project that re-declares any of these is opting out of the comparison.
@@ -24,6 +24,7 @@ from .aec_dataset import (
 )
 from .aec_features import (
     BASE_STEM_ORDER,
+    PACKED_STEM_ORDER,
     STEM_ORDER,
     AecGrid,
     AecStems,
@@ -68,6 +69,7 @@ from .model_views import (
 __all__ = [
     'ALL_SPLIT_NAMES',
     'BASE_STEM_ORDER',
+    'PACKED_STEM_ORDER',
     'LINEAR_AEC_CONTRACT_VERSION',
     'NONLINEAR_MODELS',
     'SCENARIOS',

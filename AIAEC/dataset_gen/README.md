@@ -1,19 +1,19 @@
 # AEC dataset generation
 
-Renders acoustic-echo scenarios as **five separated stems** and packs them into
-`.pt` shards. This is the only AIAEC dataset package. It reuses shared DSP from
-the separate `AINR/dataset_gen/` NR generator rather than forking that DSP.
+Renders acoustic-echo scenarios as five separated WAV stems, then projects the
+four signals required for training into `.pt` shards. This is the only AIAEC
+dataset package. It reuses shared DSP from the separate `AINR/dataset_gen/` NR
+generator rather than forking that DSP.
 
 ## The five stems
 
-Every clip is a `(5, T)` tensor whose channel order is fixed and declared in
-each shard:
+Every generated WAV is a `(5, T)` tensor in `STEM_ORDER`:
 
 | # | stem | what it is |
 |---|---|---|
 | 0 | `far_render` | **X** — the far-end signal as the device rendered it, i.e. the AEC reference. Digital and clean: the loudspeaker's distortion happens *downstream* of this tap. |
-| 1 | `near_speech` | **S** — the near talker at the mic, already through the room RIR. Reverberant on purpose; that reverberation is desired signal. |
-| 2 | `near_target` | **S_early** — the same near talker and gain through the early/late-suppressed RIR; the dereverberation target for DeepVQE-S and Align-CRUSE. |
+| 1 | `near_speech` | **S** — the near talker through the full room RIR; retained in WAVs for mixing/audit, not copied into packed shards. |
+| 2 | `near_target` | **S_early** — the same near talker and gain through the early/late-suppressed RIR; the common training target. |
 | 3 | `mic_postclip` | **Y** — what a model actually receives, after capture clipping/AGC. |
 | 4 | `linear_error` | **E** — frozen PBFDKF output, `Y - D_hat`. This is not oracle residual echo. |
 
@@ -31,18 +31,16 @@ E     = Y - D_hat      stored linear error
 R     = D - D_hat      residual echo — emerges, never a target
 ```
 
-The default config renders each complete 20–30 second parent sequence first, then
+The default config renders each complete 20–30 second parent sequence first,
 runs one stateful Python PBFDKF instance over `mic_postclip + far_render`, and
-only then cuts all five stems into 10-second chunks. The PBFDKF resets between
-parent sequences and never at a chunk boundary. Its full engine/source/grid
-contract is stored in run, chunk, shard, and checkpoint metadata.
+only then cuts all five WAV stems into 10-second chunks. The PBFDKF resets
+between parent sequences and never at a chunk boundary.
 
-`model_views.py` maps the five stems to the candidate contracts. Align-ULCNet
-and the two AENR variants read stored `E + X` and target `S`; CAGCRN targets
-`S`; DeepVQE-S and Align-CRUSE target `S_early` (the joint end-to-end
-AEC+RES+NR task, denoised + dereverberated + echo-cancelled). `D_hat` is
-derived as `mic_postclip - linear_error` when required and is never stored
-separately.
+The packer writes `(4,T)` tensors in `PACKED_STEM_ORDER`:
+`far_render`, `mic_postclip`, `linear_error`, `near_target`. RES+NR candidates
+read `E + X`; end-to-end candidates read `Y + X`; all target `S_early`
+(denoised, dereverberated and echo-free). `D_hat` is derived as
+`mic_postclip - linear_error` when required and is never stored separately.
 
 **⚠ `echo` (D), `local_noise` (N) and `mic_preclip` (S+N+D, pre-clip/AGC) are
 NOT stored.** No model task targets echo cancellation without denoising any
@@ -61,6 +59,11 @@ To upgrade an existing four-channel render without repeating speech/noise/RIR
 mixing, run `rematerialize_linear_aec.py`; it reconstructs complete sequences
 in `(sequence_id, chunk_index)` order from the filenames and rewrites the last
 channel (`linear_error`) in place.
+
+Existing five-channel WAV corpora need no regeneration for the four-channel
+training contract: run `pack_aec_dataset.py` again. Old five-channel `.pt`
+shards are intentionally rejected because their target semantics differ;
+repacking reads the existing WAVs and drops only `near_speech`.
 
 `AecStems` gives these names; nothing indexes the channel axis by number.
 
@@ -203,14 +206,14 @@ not used by any trainer.
 | `gen_aec_dataset.py` | CLI — renders complete sequences to 5-channel WAV chunks |
 | `linear_aec.py` | frozen PBFDKF contract and full-sequence materializer |
 | `rematerialize_linear_aec.py` | rebuilds the last channel from existing four/five-channel WAVs |
-| `pack_aec_dataset.py` | packs those WAVs into `.pt` shards |
+| `pack_aec_dataset.py` | projects the five-channel WAVs into four-channel `.pt` shards |
 | `packed_aec_dataset.py` | `PackedAecDataset`, returning `(stems, meta)` |
 | `aec_features.py` | **the shared module the model projects import** |
 | `config.example.ini` | every knob, documented |
 | `tests/` | the invariants a consumer cannot detect being broken |
 
 `aec_features.py` owns `AecGrid`, `stft`/`istft`, `alpha_from_tau`, `AecStems`,
-`STEM_ORDER` and `SequenceChunkSampler`. **⚠ A model project that re-declares
+`STEM_ORDER`, `PACKED_STEM_ORDER` and `SequenceChunkSampler`. **⚠ A model project that re-declares
 any of these is opting out of the comparison** — the same failure that
 `AINR/tests/test_bakeoff_protocol.py` already guards for the NR split, where a
 5%-vs-10% divergence meant two models were compared on different corpora.
@@ -275,7 +278,7 @@ Layout:
 data_aec/
   all/seqs/000000_000.wav       5-channel chunk, channels = STEM_ORDER
   all/seqs/000000_001.wav
-  packed/all/shard_00000.pt
+  packed/all/shard_00000.pt     4-channel tensor, channels = PACKED_STEM_ORDER
 ```
 
 No JSON is created in the default flow. An explicit `--manifest PATH` is the
@@ -376,8 +379,8 @@ already had.
 **⚠ `--wav-encoding` defaults to `float32`** because the corpus's central
 invariant, `mic_preclip == near_speech + local_noise + echo`, is checked at
 generation time against the renderer's un-quantised audit tensors (`echo`,
-`local_noise` and `mic_preclip` are not among the persisted stems — see "The
-five stems" above). Quantising the PERSISTED stems to `int16` would still
+`local_noise` and `mic_preclip` are not among the generated WAV stems — see
+"The five stems" above). Quantising the WAV stems to `int16` would still
 degrade any downstream arithmetic that combines them (e.g.
 `D_hat = mic_postclip - linear_error`) by ~1e-4. `int16` halves the disk cost
 and is fine for listening, not for arithmetic.

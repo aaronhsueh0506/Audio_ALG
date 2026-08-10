@@ -20,6 +20,9 @@ state at the start of the file, same as training (see train.py's top-of-file
 note on why cross-chunk state threading is out of scope) -- error and far
 each get their OWN independent state, never a shared one.
 
+Output is the common denoised, echo-free, early/dereverberated near-end speech
+estimate used by every selected AIAEC candidate.
+
 config.ini is not read for model shape: every shape-relevant setting is
 recovered from the checkpoint's own contract (train.py's
 make_checkpoint_contract), so inference cannot silently drift from what the
@@ -50,6 +53,7 @@ from AIAEC.dataset_gen import AecGrid, istft
 from AIAEC.training_common import (
     LinearAecEngine,
     auto_device,
+    require_checkpoint_model_identity,
     require_checkpoint_linear_aec,
 )
 
@@ -69,6 +73,7 @@ def build_parser() -> argparse.ArgumentParser:
 def load_model(checkpoint_path: str, device: str):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     contract = ckpt['contract']
+    require_checkpoint_model_identity(contract, 'DeepFilterNet_AENR')
     if contract.get('feature_version') != FEATURE_VERSION:
         raise ValueError(
             f"checkpoint feature_version={contract.get('feature_version')!r}, "

@@ -5,7 +5,8 @@ import pytest
 import torch
 
 from AIAEC.dataset_gen import (
-    MODEL_TASKS, AecGrid, AecStems, STEM_ORDER, build_model_view,
+    MODEL_TASKS, AecGrid, AecStems, PACKED_STEM_ORDER, STEM_ORDER,
+    build_model_view,
     build_spectral_model_view,
 )
 from AIAEC.aiaec_common import SignalGrid
@@ -14,10 +15,10 @@ from AIAEC.DeepVQE_S import DeepVQES
 
 
 def _stems():
-    data = torch.zeros(len(STEM_ORDER), 32)
-    for i in range(len(STEM_ORDER)):
+    data = torch.zeros(len(PACKED_STEM_ORDER), 32)
+    for i in range(len(PACKED_STEM_ORDER)):
         data[i].fill_(float(i + 1))
-    return AecStems(data, STEM_ORDER)
+    return AecStems(data, PACKED_STEM_ORDER)
 
 
 def test_dataset_gen_is_the_single_public_and_implementation_package():
@@ -50,10 +51,10 @@ def test_deepvqe_uses_early_near_target_for_published_dereverb_task():
     assert set(view.inputs) == {"microphone", "far_end"}
 
 
-def test_cagcrn_target_is_clean_reverberant_near_speech():
+def test_cagcrn_uses_the_common_early_clean_target():
     stems = _stems()
     view = build_model_view(stems, "CAGCRN", 16000)
-    assert torch.equal(view.target, stems.near_speech)
+    assert torch.equal(view.target, stems.near_target)
     assert set(view.inputs) == {"microphone", "far_end"}
 
 
@@ -62,7 +63,7 @@ def test_residual_view_uses_materialized_linear_error_stem():
     view = build_model_view(stems, "Align_ULCNet", 16000)
     assert torch.equal(view.inputs["linear_error"], stems.linear_error)
     assert torch.equal(view.echo_estimate, stems.mic_postclip - stems.linear_error)
-    assert torch.equal(view.target, stems.near_speech)
+    assert torch.equal(view.target, stems.near_target)
 
 
 def test_grid_rejects_hidden_zero_padding():
@@ -71,7 +72,9 @@ def test_grid_rejects_hidden_zero_padding():
 
 
 def test_spectral_view_is_directly_accepted_by_public_model_forward():
-    stems = AecStems(torch.randn(len(STEM_ORDER), 4096), STEM_ORDER)
+    stems = AecStems(
+        torch.randn(len(PACKED_STEM_ORDER), 4096), PACKED_STEM_ORDER
+    )
     waveform = build_model_view(stems, "DeepVQE_S", 16000)
     grid = AecGrid(16000, 512, 512, 256)
     spectral = build_spectral_model_view(waveform, grid)
@@ -83,7 +86,9 @@ def test_spectral_view_is_directly_accepted_by_public_model_forward():
 
 def test_dfn_spectral_view_builds_independent_feature_states_and_runs():
     torch.manual_seed(3)
-    stems = AecStems(torch.randn(len(STEM_ORDER), 4096), STEM_ORDER)
+    stems = AecStems(
+        torch.randn(len(PACKED_STEM_ORDER), 4096), PACKED_STEM_ORDER
+    )
 
     waveform = build_model_view(stems, "DeepFilterNet_AENR", 16000)
     grid = AecGrid(16000, 512, 512, 256)

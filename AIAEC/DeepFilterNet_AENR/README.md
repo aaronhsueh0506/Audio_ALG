@@ -1,7 +1,8 @@
 # DeepFilterNet-AENR
 
 Project variant for `linear AEC -> joint RES + NR`. The production linear error
-is enhanced; far-end features condition both DFN branches.
+is enhanced; far-end features condition both DFN branches. Its target is the
+common denoised, echo-free, early/dereverberated near-end speech.
 
 Everything after the feature boundary follows the current local DeepFilterNet2
 cascade/alpha graph: a full-band ERB mask, a low-band five-tap complex deep

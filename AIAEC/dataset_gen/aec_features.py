@@ -15,9 +15,9 @@ corpora.  The same failure mode is available here and is worse, because a
 channel-order or window mismatch does not look like a bug -- it looks like a
 model that is merely worse.
 
-So: one ``AecGrid``, one ``stft``/``istft``, one ``STEM_ORDER``.  A project
-that needs something different is opting out of the comparison and should say
-so in its own README.
+So: one ``AecGrid``, one ``stft``/``istft``, and one declared order for each
+storage boundary. A project that needs something different is opting out of
+the comparison and should say so in its own README.
 
 ⚠ Nothing in this module derives a time constant from a fixed hop count.  Time
 constants arrive in SECONDS and go through ``alpha_from_tau``; a 48 kHz grid
@@ -37,6 +37,7 @@ from torch.utils.data import Sampler
 
 __all__ = [
     'BASE_STEM_ORDER',
+    'PACKED_STEM_ORDER',
     'STEM_ORDER',
     'AecGrid',
     'AecStems',
@@ -72,6 +73,18 @@ BASE_STEM_ORDER = (
     'mic_postclip',
 )
 STEM_ORDER = BASE_STEM_ORDER + ('linear_error',)
+
+# Training keeps only the four signals required by the two selected product
+# paths.  Generated WAVs deliberately retain ``near_speech`` so an existing
+# corpus remains auditable and can be repacked without rerendering acoustics;
+# packed shards omit it because every selected model now targets the common
+# denoised, echo-free, early-RIR signal ``near_target``.
+PACKED_STEM_ORDER = (
+    'far_render',
+    'mic_postclip',
+    'linear_error',
+    'near_target',
+)
 
 
 # ============================================================
@@ -261,11 +274,11 @@ def frames_from_seconds(seconds: float, frame_rate: float,
 # ============================================================
 
 class AecStems:
-    """Named access to the ``(..., 5, T)`` stem tensor.
+    """Named access to a generated-WAV or packed-training stem tensor.
 
-    Channel 0 is far_render and channel 1 is near_speech.  Getting those two
-    the wrong way round produces a model that trains, converges, and cancels
-    the talker -- so no project indexes this tensor by number.
+    Generated WAVs use :data:`STEM_ORDER` (five channels); packed training
+    shards use :data:`PACKED_STEM_ORDER` (four channels).  Models access both
+    layouts by name so the packer's projection cannot silently swap inputs.
     """
 
     __slots__ = ('_data', '_order', '_index')
@@ -280,8 +293,13 @@ class AecStems:
                 f"stem tensor has {data.shape[-2]} channels but the declared "
                 f"order has {len(order)}: {order}"
             )
-        if set(order) != set(STEM_ORDER):
-            raise ValueError(f"unknown stem order {order}; expected {STEM_ORDER}")
+        valid_orders = (STEM_ORDER, PACKED_STEM_ORDER)
+        if not any(len(order) == len(valid) and set(order) == set(valid)
+                   for valid in valid_orders):
+            raise ValueError(
+                f"unknown stem order {order}; expected generated-WAV order "
+                f"{STEM_ORDER} or packed order {PACKED_STEM_ORDER}"
+            )
         self._data = data
         self._order = order
         self._index = {name: i for i, name in enumerate(order)}
@@ -305,7 +323,7 @@ class AecStems:
 
     @property
     def near_target(self) -> torch.Tensor:
-        """Early/direct S target for models that also dereverberate."""
+        """Common early/direct target for every selected AIAEC model."""
         return self.stem('near_target')
 
     @property

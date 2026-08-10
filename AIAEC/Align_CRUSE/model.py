@@ -36,7 +36,7 @@ class AlignCRUSE(nn.Module):
     """Paper-shaped CRUSE with configurable streaming/global alignment."""
 
     paper_reference = "arXiv:2208.11308"
-    task = "end_to_end_aec_res_nr"
+    task = "end_to_end_aec_res_nr_dereverb"
 
     def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
                  projection_size: int = 64, gru_hidden: int = 192,

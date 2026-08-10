@@ -8,9 +8,8 @@
 mic.wav / far.wav must be mono and at the checkpoint's sample rate (resample
 first if your capture is at a different rate).
 
-Output is the EARLY/DEREVERBERATED near-speech estimate (DeepVQE's published
-task includes dereverberation -- see ../README.md's decision matrix); it is
-not the same target as the other five candidates' plain near_speech.
+Output is the common denoised, echo-free, EARLY/DEREVERBERATED near-speech
+estimate (DeepVQE's published task already includes dereverberation).
 
 config.ini is not read here: every shape-relevant setting (grid, model
 kwargs) is recovered from the checkpoint's own contract (see train.py /
@@ -33,7 +32,7 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.DeepVQE_S import DeepVQES
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid, istft, stft
-from AIAEC.training_common import auto_device
+from AIAEC.training_common import auto_device, require_checkpoint_model_identity
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -49,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
 def load_model(checkpoint_path: str, device: str):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     contract = ckpt['contract']
+    require_checkpoint_model_identity(contract, 'DeepVQE_S')
     aec_grid = AecGrid(contract['sr'], contract['n_fft'], contract['win_len'], contract['hop_len'])
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)
     model_kwargs = {

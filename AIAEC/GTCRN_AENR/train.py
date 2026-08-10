@@ -12,7 +12,7 @@ config.ini sections (see the shipped config.ini for every knob, documented):
     [signal]     sample rate + FFT grid. This candidate is LOCKED to upstream
                  16 kHz / 512/512/256 (GTCRNAENR itself rejects other grids);
                  must equal the grid AIAEC/dataset_gen/config.ini rendered with.
-    [data]       one packed five-stem corpus path + ordinary batch size +
+    [data]       one packed four-stem corpus path + ordinary batch size +
                  per-chunk val_fraction
     [model]      every GTCRNAENR constructor keyword (see model.py)
     [training]   optimizer, seed, epoch budget, checkpoint/log locations
@@ -27,7 +27,8 @@ dataset:
 
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['GTCRN_AENR']):
-    frozen-linear-AEC error + far-end reference in; clean near-end speech out.
+    frozen-linear-AEC error + far-end reference in; denoised, echo-free,
+    early/dereverberated near-end speech out.
     Requires the stored real linear-AEC error; an oracle residual is rejected
     by ``build_model_view``.
 
@@ -51,6 +52,8 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.GTCRN_AENR import GTCRNAENR
 from AIAEC.dataset_gen import (
     AecStems,
+    MODEL_TASKS,
+    PACKED_STEM_ORDER,
     build_model_view,
     build_spectral_model_view,
 )
@@ -73,7 +76,7 @@ from AIAEC.training_common import (
 
 
 MODEL_NAME = 'GTCRN_AENR'
-TASK = 'linear_aec_postfilter_res_nr'
+TASK = MODEL_TASKS[MODEL_NAME]
 LOSS_VERSION = 'aiaec_compressed_spectral_v1'
 
 
@@ -82,7 +85,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def forward_batch(model, stems_batch, aec_grid, device):
-    stems = AecStems(stems_batch.to(device))
+    stems = AecStems(stems_batch.to(device), PACKED_STEM_ORDER)
     view = build_model_view(stems, MODEL_NAME, sample_rate=aec_grid.sr)
     spectral = build_spectral_model_view(view, aec_grid)
     output = model(**spectral.inputs)

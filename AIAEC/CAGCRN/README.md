@@ -1,7 +1,9 @@
 # CAGCRN
 
 Backup end-to-end `AEC + RES + NR` candidate, reconstructed from INTERSPEECH
-2025 paper 608. It consumes unaligned mic/far spectra directly.
+2025 paper 608. It consumes unaligned mic/far spectra directly and uses the
+project's common early/dereverberated target; that target extends the paper's
+non-dereverberating task.
 
 Implemented claims: ERB band merging/splitting (linear bins retained through
 2 kHz); four residual causal encoder blocks per branch with channels

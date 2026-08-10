@@ -259,7 +259,7 @@ class DecoderBlock(nn.Module):
 
 class CAGCRN(nn.Module):
     paper_reference = "INTERSPEECH 2025-608"
-    task = "end_to_end_aec_res_nr"
+    task = "end_to_end_aec_res_nr_dereverb"
 
     def __init__(self, grid: SignalGrid, high_erb_bands: int = 32,
                  max_delay_seconds: float = 1.0):
