@@ -90,6 +90,14 @@ python3 train.py --config config.ini \
 python3 denoise.py output/align_cruse_best.pth mic.wav far.wav out.wav
 ```
 
+Inference accepts mono microphone/reference files at rates different from the
+checkpoint. Both inputs are converted together with a band-limited Kaiser-sinc
+resampler **before** PBFDKF/STFT/model processing, so a 48 kHz capture sent to a
+16 kHz checkpoint follows the same 16 kHz frontend used for training. The
+output WAV remains at the checkpoint/model sample rate (16 kHz in that case),
+not the capture rate. The two inputs must cover the same duration; the scripts
+reject a mismatch instead of silently truncating an unaligned echo reference.
+
 `--packed-dir` overrides `[data] packed_dir`; omit it to use the config value.
 `--gpu N` selects `cuda:N` and takes precedence over `--device`. `--mmap`
 keeps packed tensors disk-backed to reduce host RAM use.

@@ -5,9 +5,9 @@
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav --device cpu
 
-mic.wav / far.wav must be mono and at the checkpoint's sample rate (the
-checkpoint's contract sr, 48 kHz or 16 kHz -- resample first if your capture
-is at a different rate).
+mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample
+rate (48 kHz or 16 kHz) before the linear AEC when needed; output stays at
+that model rate.
 
 Like ../GTCRN_AENR/denoise.py, this candidate's input is the FROZEN
 PRODUCTION LINEAR AEC's error, not the raw microphone: this script runs that
@@ -50,6 +50,7 @@ from AINR.DeepFilterNet2.train import FEATURE_VERSION, extract_dfn2_features, re
 from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid, istft
+from AIAEC.inference_common import load_mic_far
 from AIAEC.training_common import (
     LinearAecEngine,
     auto_device,
@@ -114,17 +115,14 @@ def main(args):
         raise FileNotFoundError(f"config not found: {args.config}")
     feature_cfg = read_feature_config(feature_cfg_ini, grid.sr, grid.hop_len)
 
-    mic, mic_sr = sf.read(args.mic_wav, dtype='float32')
-    far, far_sr = sf.read(args.far_wav, dtype='float32')
-    if mic_sr != grid.sr or far_sr != grid.sr:
-        raise ValueError(
-            f"mic/far sample rate ({mic_sr}/{far_sr}) must equal the "
-            f"checkpoint's grid rate ({grid.sr}); resample before calling this")
-    if mic.ndim > 1 or far.ndim > 1:
-        raise ValueError("mic/far must be mono")
-
-    mic_t = torch.from_numpy(mic).unsqueeze(0).to(device)
-    far_t = torch.from_numpy(far).unsqueeze(0).to(device)
+    mic_t, far_t, source_rates = load_mic_far(
+        args.mic_wav, args.far_wav, grid.sr
+    )
+    mic_t = mic_t.to(device)
+    far_t = far_t.to(device)
+    if source_rates != (grid.sr, grid.sr):
+        print(f"resampled mic/far {source_rates[0]}/{source_rates[1]} -> "
+              f"{grid.sr} Hz")
     length = mic_t.shape[-1]
 
     linear_aec = LinearAecEngine(

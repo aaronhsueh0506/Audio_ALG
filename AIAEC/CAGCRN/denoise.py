@@ -5,8 +5,8 @@
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav --device cpu
 
-mic.wav / far.wav must be mono and at the checkpoint's sample rate (resample
-first if your capture is at a different rate).
+mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample
+rate before inference when needed; output stays at that model rate.
 
 Output is the common denoised, echo-free, early/dereverberated near-end speech
 estimate. This product target extends CAGCRN's published task.
@@ -32,6 +32,7 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.CAGCRN import CAGCRN
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid, istft, stft
+from AIAEC.inference_common import load_mic_far
 from AIAEC.training_common import auto_device, require_checkpoint_model_identity
 
 
@@ -64,17 +65,14 @@ def main(args):
     device = auto_device(args.device)
     model, grid = load_model(args.checkpoint, device)
 
-    mic, mic_sr = sf.read(args.mic_wav, dtype='float32')
-    far, far_sr = sf.read(args.far_wav, dtype='float32')
-    if mic_sr != grid.sr or far_sr != grid.sr:
-        raise ValueError(
-            f"mic/far sample rate ({mic_sr}/{far_sr}) must equal the "
-            f"checkpoint's grid rate ({grid.sr}); resample before calling this")
-    if mic.ndim > 1 or far.ndim > 1:
-        raise ValueError("mic/far must be mono")
-
-    mic_t = torch.from_numpy(mic).unsqueeze(0).to(device)
-    far_t = torch.from_numpy(far).unsqueeze(0).to(device)
+    mic_t, far_t, source_rates = load_mic_far(
+        args.mic_wav, args.far_wav, grid.sr
+    )
+    mic_t = mic_t.to(device)
+    far_t = far_t.to(device)
+    if source_rates != (grid.sr, grid.sr):
+        print(f"resampled mic/far {source_rates[0]}/{source_rates[1]} -> "
+              f"{grid.sr} Hz")
     length = mic_t.shape[-1]
 
     mic_spec = stft(mic_t, grid).transpose(-2, -1)   # [B,T,F], the public model boundary

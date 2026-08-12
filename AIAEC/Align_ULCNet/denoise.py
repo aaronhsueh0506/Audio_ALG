@@ -5,8 +5,8 @@
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav --device cpu
 
-mic.wav / far.wav must be mono and at the checkpoint's sample rate (resample
-first if your capture is at a different rate).
+mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample
+rate before the linear AEC when needed; output stays at that model rate.
 
 This candidate's input is the FROZEN PRODUCTION LINEAR AEC's error, not the
 raw microphone -- see AIAEC/training_common.py's LinearAecEngine. This
@@ -39,6 +39,7 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.Align_ULCNet import AlignULCNet
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid, istft, stft
+from AIAEC.inference_common import load_mic_far
 from AIAEC.training_common import (
     LinearAecEngine,
     auto_device,
@@ -77,17 +78,14 @@ def main(args):
     device = auto_device(args.device)
     model, grid, linear_contract = load_model(args.checkpoint, device)
 
-    mic, mic_sr = sf.read(args.mic_wav, dtype='float32')
-    far, far_sr = sf.read(args.far_wav, dtype='float32')
-    if mic_sr != grid.sr or far_sr != grid.sr:
-        raise ValueError(
-            f"mic/far sample rate ({mic_sr}/{far_sr}) must equal the "
-            f"checkpoint's grid rate ({grid.sr}); resample before calling this")
-    if mic.ndim > 1 or far.ndim > 1:
-        raise ValueError("mic/far must be mono")
-
-    mic_t = torch.from_numpy(mic).unsqueeze(0).to(device)
-    far_t = torch.from_numpy(far).unsqueeze(0).to(device)
+    mic_t, far_t, source_rates = load_mic_far(
+        args.mic_wav, args.far_wav, grid.sr
+    )
+    mic_t = mic_t.to(device)
+    far_t = far_t.to(device)
+    if source_rates != (grid.sr, grid.sr):
+        print(f"resampled mic/far {source_rates[0]}/{source_rates[1]} -> "
+              f"{grid.sr} Hz")
     length = mic_t.shape[-1]
 
     linear_aec = LinearAecEngine(
