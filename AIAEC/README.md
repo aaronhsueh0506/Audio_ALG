@@ -95,8 +95,10 @@ checkpoint. Both inputs are converted together with a band-limited Kaiser-sinc
 resampler **before** PBFDKF/STFT/model processing, so a 48 kHz capture sent to a
 16 kHz checkpoint follows the same 16 kHz frontend used for training. The
 output WAV remains at the checkpoint/model sample rate (16 kHz in that case),
-not the capture rate. The two inputs must cover the same duration; the scripts
-reject a mismatch instead of silently truncating an unaligned echo reference.
+not the capture rate. The two inputs must share a source rate and start time.
+A tail mismatch up to 100 ms (for example, one recorder frame) is trimmed from
+the longer file before resampling, with a warning; a larger mismatch is rejected
+as a likely wrong or unaligned pair.
 
 `--packed-dir` overrides `[data] packed_dir`; omit it to use the config value.
 `--gpu N` selects `cuda:N` and takes precedence over `--device`. `--mmap`

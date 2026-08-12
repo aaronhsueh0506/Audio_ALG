@@ -60,10 +60,20 @@ def test_different_source_rates_are_rejected(tmp_path):
         )
 
 
-def test_duration_mismatch_is_not_silently_truncated(tmp_path):
+def test_one_frame_tail_mismatch_is_trimmed_before_resampling(tmp_path):
     _write(tmp_path / "mic.wav", np.zeros(48000), 48000)
-    _write(tmp_path / "far.wav", np.zeros(47700), 48000)
-    with pytest.raises(ValueError, match="durations differ"):
+    _write(tmp_path / "far.wav", np.zeros(47520), 48000)  # 10 ms shorter
+    with pytest.warns(RuntimeWarning, match="tails differ by 10.00 ms"):
+        mic, far, _ = load_mic_far(
+            str(tmp_path / "mic.wav"), str(tmp_path / "far.wav"), 16000
+        )
+    assert mic.shape == far.shape == (1, 15840)
+
+
+def test_large_tail_mismatch_is_rejected(tmp_path):
+    _write(tmp_path / "mic.wav", np.zeros(48000), 48000)
+    _write(tmp_path / "far.wav", np.zeros(42000), 48000)
+    with pytest.raises(ValueError, match="exceeding the 100 ms safety limit"):
         load_mic_far(
             str(tmp_path / "mic.wav"), str(tmp_path / "far.wav"), 16000
         )

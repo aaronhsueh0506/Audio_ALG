@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Tuple
+import warnings
 
 import soundfile as sf
 import torch
@@ -18,6 +19,11 @@ _RESAMPLE_KWARGS = {
     "resampling_method": "sinc_interp_kaiser",
     "beta": 14.769656459379492,
 }
+
+# Capture/export pipelines commonly leave one frame of tail in only one file.
+# Trimming that tail preserves the shared start time and is safe for offline
+# AEC.  A larger mismatch is more likely to mean the wrong pair was supplied.
+_MAX_TAIL_MISMATCH_SECONDS = 0.100
 
 
 def _read_mono(path: str, label: str) -> Tuple[Tensor, int]:
@@ -46,7 +52,8 @@ def load_mic_far(
 
     Returns two ``[1, samples]`` CPU tensors plus the original mic/far rates.
     The synchronized source files must use the same rate and represent the
-    same duration to within one sample at ``model_sample_rate``.
+    same start time. A tail mismatch of at most 100 ms is trimmed before
+    resampling; larger differences are rejected as a likely wrong pair.
     """
     if model_sample_rate <= 0:
         raise ValueError(
@@ -61,16 +68,25 @@ def load_mic_far(
             "aligned pair from the same capture clock"
         )
 
-    duration_error_samples = abs(
-        mic.numel() * model_sample_rate / mic_sr
-        - far.numel() * model_sample_rate / far_sr
-    )
-    if duration_error_samples > 1.0 + 1e-6:
+    source_length_difference = abs(mic.numel() - far.numel())
+    duration_error_seconds = source_length_difference / mic_sr
+    if duration_error_seconds > _MAX_TAIL_MISMATCH_SECONDS + 1e-12:
         raise ValueError(
-            "mic/far durations differ by "
-            f"{duration_error_samples:.2f} samples at {model_sample_rate} Hz; "
-            "AEC inputs must be time-aligned"
+            f"mic/far tails differ by {duration_error_seconds * 1000:.2f} ms "
+            f"({source_length_difference} samples at {mic_sr} Hz), exceeding "
+            f"the {_MAX_TAIL_MISMATCH_SECONDS * 1000:.0f} ms safety limit; "
+            "verify that both files belong to the same aligned capture"
         )
+    if source_length_difference:
+        common_source_length = min(mic.numel(), far.numel())
+        warnings.warn(
+            f"mic/far tails differ by {duration_error_seconds * 1000:.2f} ms; "
+            f"truncating both to {common_source_length} source samples",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        mic = mic[:common_source_length]
+        far = far[:common_source_length]
 
     if mic_sr != model_sample_rate:
         mic = torchaudio.functional.resample(
@@ -81,9 +97,8 @@ def load_mic_far(
             far, far_sr, model_sample_rate, **_RESAMPLE_KWARGS
         )
 
-    # Source files from the same clock can still differ by one input sample.
-    # Trim only the corresponding permitted output rounding sample; larger
-    # differences were rejected above.
+    # Both resamplers saw the same source length. Keep a final min() for the
+    # backend's rational output-length rounding contract.
     common_length = min(mic.numel(), far.numel())
     mic = mic[:common_length].unsqueeze(0).contiguous()
     far = far[:common_length].unsqueeze(0).contiguous()
