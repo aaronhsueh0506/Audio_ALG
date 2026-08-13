@@ -217,6 +217,31 @@ def test_no_future_frame_leakage(factory):
     torch.testing.assert_close(ya, yb, rtol=1e-5, atol=1e-6)
 
 
+def test_delay_attention_chunking_is_bit_exact_to_explicit_broadcast():
+    """The long-file memory optimization preserves the original arithmetic."""
+    from AIAEC.aiaec_common import FrameDelayAttention, causal_delay_stack
+
+    torch.manual_seed(17)
+    attention = FrameDelayAttention(3, 4, 5, 6, 7).eval()
+    mic = torch.randn(2, 3, 9, 11)
+    far = torch.randn(2, 4, 9, 11)
+    with torch.no_grad():
+        actual_aligned, actual_distribution = attention(mic, far)
+
+        q = attention.query(mic)
+        k_delayed = causal_delay_stack(attention.key(far), 7)
+        logits = (q.unsqueeze(3) * k_delayed).sum(dim=-1)
+        logits = attention.score(logits).squeeze(1)
+        expected_distribution = torch.softmax(logits, dim=-1)
+        v_delayed = causal_delay_stack(attention.value(far), 7)
+        expected_aligned = (
+            v_delayed * expected_distribution[:, None, :, :, None]
+        ).sum(dim=3)
+
+    assert torch.equal(actual_distribution, expected_distribution)
+    assert torch.equal(actual_aligned, expected_aligned)
+
+
 def test_old_generic_projects_are_removed():
     root = pathlib.Path(__file__).parents[1]
     for stale in ("AECNet", "PostFilter", "JointAECNR"):

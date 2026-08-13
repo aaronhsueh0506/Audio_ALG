@@ -205,6 +205,11 @@ def causal_delay_stack(x: Tensor, delays: int) -> Tensor:
 class FrameDelayAttention(nn.Module):
     """Per-frame causal cross-attention used by DeepVQE/Align-ULCNet."""
 
+    # Bound the broadcast temporary without changing the original reduction
+    # order.  This matters for long offline evaluation files: materializing all
+    # [B,C,T,D,F] products at once can require gigabytes.
+    _TIME_CHUNK_FRAMES = 64
+
     def __init__(self, mic_channels: int, far_channels: int,
                  value_channels: int, similarity_channels: int,
                  max_delay_frames: int, score_kernel=(5, 3)):
@@ -222,12 +227,26 @@ class FrameDelayAttention(nn.Module):
             raise ValueError("attention feature grids must match")
         q = self.query(mic)
         k_delayed = causal_delay_stack(self.key(far), self.max_delay_frames)
-        # [B,H,T,D], dot product over frequency.
-        logits = (q.unsqueeze(3) * k_delayed).sum(dim=-1)
+        # [B,H,T,D], dot product over frequency.  Preserve the original
+        # multiply-then-sum arithmetic exactly, but limit its temporary to one
+        # time chunk instead of the whole utterance.
+        logits = torch.cat([
+            (q[:, :, start:end].unsqueeze(3)
+             * k_delayed[:, :, start:end]).sum(dim=-1)
+            for start in range(0, q.shape[2], self._TIME_CHUNK_FRAMES)
+            for end in [min(start + self._TIME_CHUNK_FRAMES, q.shape[2])]
+        ], dim=2)
         logits = self.score(logits).squeeze(1)
         distribution = torch.softmax(logits, dim=-1)
         v_delayed = causal_delay_stack(self.value(far), self.max_delay_frames)
-        aligned = (v_delayed * distribution[:, None, :, :, None]).sum(dim=3)
+        aligned = torch.cat([
+            (v_delayed[:, :, start:end]
+             * distribution[:, None, start:end, :, None]).sum(dim=3)
+            for start in range(0, distribution.shape[1],
+                               self._TIME_CHUNK_FRAMES)
+            for end in [min(start + self._TIME_CHUNK_FRAMES,
+                            distribution.shape[1])]
+        ], dim=2)
         return aligned, distribution
 
 
