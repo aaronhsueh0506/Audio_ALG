@@ -86,11 +86,13 @@ torch STFT 不進圖</td></tr>
 <code>export_onnx.py</code>（h1–h3 顯式 I/O）；readiness 文件 §2 各模型 state 主項</td></tr>
 <tr><td>Delay 狀態機（ACQUIRE/LOCKED、flush ring、fail-open、reset/crossfade）</td>
 <td>pipeline 層；訊號 seam 是 AEC C 的 <code>aec_get_linear_context()</code>
-（<code>AecLinearContext.delay_state</code>：NONE/COMPENSATED/CHANGED；
+（<code>AecLinearContext.delay_state</code>：UNLOCKED/LOCKED/CHANGED；
 CHANGED → <code>model-&gt;reset()</code>）</td>
 <td><code>aec.h:628-641</code>、<code>audio_pipeline_ulcnet.h</code> Delay events、
 設計文件 §8</td></tr>
-<tr><td>PBFDKF 線性 AEC frontend（AIAEC 全部候選的輸入是線性誤差）</td>
+<tr><td>PBFDKF 線性 AEC frontend（後級三候選 Align-ULCNet／GTCRN-AENR／DFN-AENR
+的輸入＝線性誤差+far；E2E 三候選 Align-CRUSE／DeepVQE-S／CAGCRN 輸入＝mic+far，
+不經 PBFDKF）</td>
 <td>AEC C（<code>lib/aec</code>）；dataset 端已把 PBFDKF 物化成資料通道</td>
 <td><code>GTCRN_AENR/config.ini</code>［data］註解、pipeline 標頭</td></tr>
 <tr><td>DFN 族的特徵 EMA 正規化與 compose（mask 展開、DF FIR、band split/blend、

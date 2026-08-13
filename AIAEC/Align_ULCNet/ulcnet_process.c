@@ -69,7 +69,11 @@ int ulcnet_analysis_push(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
             (size_t)(ULCNET_N_FFT - ULCNET_HOP) * sizeof(float));
     memcpy(st->history + ULCNET_N_FFT - ULCNET_HOP, hop_in,
            (size_t)ULCNET_HOP * sizeof(float));
-    st->hops_seen++;
+    /* Saturate at 3, guarded BEFORE the increment: every consumer only
+     * distinguishes 1 / 2 / >= 3 (and flush: < 2 vs >= 2), so the clamp is
+     * semantics-preserving while preventing signed overflow (UB) on
+     * unbounded streams. */
+    if (st->hops_seen < 3) st->hops_seen++;
 
     if (st->hops_seen == 1) return 0;   /* frame 0 needs sample index 256 */
 
@@ -147,7 +151,10 @@ int ulcnet_synthesis_push(UlcnetSynthesis *st,
         st->acc[i] += st->time[i] * w;
         st->env[i] += w * w;
     }
-    st->frames_seen++;
+    /* Saturate at 2, guarded BEFORE the increment: consumers only
+     * distinguish 0 / 1 / >= 2, so the clamp is semantics-preserving while
+     * preventing signed overflow (UB) on unbounded streams. */
+    if (st->frames_seen < 2) st->frames_seen++;
 
     emitted = 0;
     if (st->frames_seen > 1) {

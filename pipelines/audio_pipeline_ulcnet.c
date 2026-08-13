@@ -49,7 +49,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <math.h>       /* isfinite -- NaN/Inf guard on the model output */
+#include <math.h>       /* isfinite + NAN -- model-output guard/pre-fill */
 
 #include "audio_pipeline_ulcnet.h"
 #include "mem_align.h"       /* ALIGN16 / MEM_IS_ALIGNED16 */
@@ -407,7 +407,7 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
                                   const float* ref, float* out) {
     AecResContext rctx;
     AecLinearContext lctx;
-    int n_frames, f, wrote;
+    int n_frames, f, wrote, k;
 
     if (!p || !mic || !ref || !out) return -1;
 
@@ -462,10 +462,21 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
         const float* sre = p->err_re[f];
         const float* sim = p->err_im[f];
         if (p->model.infer) {
-            int rc = p->model.infer(p->model.user,
-                                    p->err_re[f], p->err_im[f],
-                                    p->far_re[f], p->far_im[f],
-                                    p->mdl_re, p->mdl_im);
+            int rc;
+            /* Enforce ulcnet_process.h's FULL-WRITE CONTRACT: pre-fill the
+             * model-output staging with NaN before every infer call, so a
+             * partial write (rc == 0 without writing all ULCNET_BINS)
+             * leaves non-finite bins behind and is rejected by the finite
+             * guard below (fail-open identity) instead of silently applying
+             * stale finite values left over from a previous frame. */
+            for (k = 0; k < ULCNET_BINS; k++) {
+                p->mdl_re[k] = NAN;
+                p->mdl_im[k] = NAN;
+            }
+            rc = p->model.infer(p->model.user,
+                                p->err_re[f], p->err_im[f],
+                                p->far_re[f], p->far_im[f],
+                                p->mdl_re, p->mdl_im);
             if (rc == 0 &&
                 (p->far_input_mode == ULCNET_FAR_RAW ||
                  lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED) &&

@@ -33,7 +33,7 @@ th{background:#f5efe8}
 <h3>ONNX / NPU graph 邊界</h3>
 <table>
 <tr><th>位置</th><th>內容</th></tr>
-<tr><td>graph <b>內</b>(export 的 ONNX)</td><td>(error_ri, far_ri, 顯式 states) → enhanced_ri:signed |x|^0.3 壓縮(<code>ULCNET_COMPRESSION_EXP=0.3f</code>)、attention、GRU、解壓縮全部在 graph 內。若目標 runtime 不支援 pow 類算子而把壓縮/解壓縮移出 graph,C 端有 <code>ulcnet_compress_frame()/ulcnet_expand_frame()</code>,但邊界移動必須連 export graph 一起改、兩邊一致。</td></tr>
+<tr><td>graph <b>內</b>(目標 graph boundary；ONNX export 為 Phase 4 待交付)</td><td>(error_ri, far_ri, 顯式 states) → enhanced_ri:signed |x|^0.3 壓縮(<code>ULCNET_COMPRESSION_EXP=0.3f</code>)、attention、GRU、解壓縮全部在 graph 內。若目標 runtime 不支援 pow 類算子而把壓縮/解壓縮移出 graph,C 端有 <code>ulcnet_compress_frame()/ulcnet_expand_frame()</code>,但邊界移動必須連 export graph 一起改、兩邊一致。</td></tr>
 <tr><td>graph <b>外</b>(C 前處理)</td><td>線性 AEC(<code>aec_process_context</code>)、centered sqrt-Hann STFT(<code>ulcnet_analysis_push</code>,重現 torch.stft center=True + reflect 前綴)、delay-state policy。</td></tr>
 <tr><td>graph <b>外</b>(C 後處理)</td><td>enhanced_ri → centered WOLA(sqrt-Hann、包絡正規化、半窗 trim;<code>ulcnet_synthesis_push</code>)。</td></tr>
 <tr><td>runtime 跨呼叫保存的 NN states</td><td>far attention K/V ring、attention-logit 史、GRU hidden h — pipeline 從不觸碰;<code>model.reset</code> 被呼叫時 runtime 應 flush far ring + logit 史(GRU h 去留是 runtime 自己的 A/B 決策)。</td></tr>

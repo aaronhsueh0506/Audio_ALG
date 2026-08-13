@@ -637,8 +637,21 @@ int audio_pipeline_4ch_ulcnet_set_far_input_mode(
     /* Reject-first: only the two defined modes exist; the current mode is
      * left unchanged on rejection (contract in the header). */
     if (mode != ULCNET_FAR_RAW && mode != ULCNET_FAR_ALIGNED) return -1;
+    /* Mid-stream switches are rejected (mode unchanged): once any hop has
+     * been processed, the frames in flight (the saved far hop and the two
+     * analysis histories) were built under the previous mode, and the
+     * delay/analysis state carries that mode's input distribution -- a
+     * silent switch would corrupt the model's err/far pairing. After
+     * audio_pipeline_4ch_ulcnet_reset() (frame_index back to 0, all chain
+     * state cleared) switching is allowed again. */
+    if (p->frame_index != 0) return -1;
     p->far_input_mode = mode;
     return 0;
+}
+
+int audio_pipeline_4ch_ulcnet_far_input_mode(
+    const AudioPipeline4ChUlcnet* p) {
+    return (p && !p->destroyed) ? (int)p->far_input_mode : -1;
 }
 
 /* ============================================================================
@@ -765,16 +778,27 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     for (f = 0; f < n_err_frames; ++f) {
         const float* spec_re = p->frame_err_re[f];
         const float* spec_im = p->frame_err_im[f];
-        if (p->model.infer &&
-            p->model.infer(
-                p->model.user,
-                p->frame_err_re[f], p->frame_err_im[f],
-                p->frame_far_re[f], p->frame_far_im[f],
-                p->enh_re, p->enh_im) == 0 &&
-            apply_allowed &&
-            ulcnet_frame_is_finite(p->enh_re, p->enh_im)) {
-            spec_re = p->enh_re;
-            spec_im = p->enh_im;
+        if (p->model.infer) {
+            /* Enforce ulcnet_process.h's FULL-WRITE CONTRACT: pre-fill the
+             * model-output staging with NaN before every infer call, so a
+             * partial write (rc == 0 without writing all ULCNET_BINS)
+             * leaves non-finite bins behind and is rejected by the finite
+             * guard below (fail-open identity) instead of silently applying
+             * stale finite values left over from a previous frame. */
+            for (k = 0; k < ULCNET_BINS; ++k) {
+                p->enh_re[k] = NAN;
+                p->enh_im[k] = NAN;
+            }
+            if (p->model.infer(
+                    p->model.user,
+                    p->frame_err_re[f], p->frame_err_im[f],
+                    p->frame_far_re[f], p->frame_far_im[f],
+                    p->enh_re, p->enh_im) == 0 &&
+                apply_allowed &&
+                ulcnet_frame_is_finite(p->enh_re, p->enh_im)) {
+                spec_re = p->enh_re;
+                spec_im = p->enh_im;
+            }
         }
         written += ulcnet_synthesis_push(
             &p->synthesis, spec_re, spec_im, out + written);

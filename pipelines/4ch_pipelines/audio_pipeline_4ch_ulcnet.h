@@ -253,12 +253,18 @@ int audio_pipeline_4ch_ulcnet_set_model(
  * Select which far stream feeds the model's far branch (see the FAR-INPUT
  * DEPLOYMENT CONTRACT in this header's preamble). Instances start in
  * ULCNET_FAR_RAW (the checkpoint-compatible default); the mode survives
- * audio_pipeline_4ch_ulcnet_reset() like the model installation does. Set
- * it before streaming: switching mid-stream changes the model's input
- * distribution for the frames already in flight (one saved far hop). The
- * mode MUST match the checkpoint's training far input. Returns 0 on
- * success, nonzero on a NULL/destroyed pipeline or an undefined mode value
- * (the current mode is then left unchanged).
+ * audio_pipeline_4ch_ulcnet_reset() like the model installation does.
+ *
+ * The mode can only be set BEFORE any hop is processed: once processing
+ * has started the call is REJECTED (nonzero return, mode unchanged) --
+ * the frames in flight (the saved far hop and the analysis histories)
+ * were built under the previous mode, so a silent mid-stream switch would
+ * change the model's input distribution and corrupt the err/far pairing.
+ * After audio_pipeline_4ch_ulcnet_reset() (which restarts the stream and
+ * clears that state) switching is allowed again. The mode MUST match the
+ * checkpoint's training far input. Returns 0 on success, nonzero on a
+ * NULL/destroyed pipeline, an undefined mode value, or a mid-stream call
+ * (the current mode is then left unchanged in every rejection case).
  */
 int audio_pipeline_4ch_ulcnet_set_far_input_mode(
     AudioPipeline4ChUlcnet* p,
@@ -312,6 +318,14 @@ int audio_pipeline_4ch_ulcnet_hop_size(const AudioPipeline4ChUlcnet* p);
 int audio_pipeline_4ch_ulcnet_fft_size(const AudioPipeline4ChUlcnet* p);
 int audio_pipeline_4ch_ulcnet_n_freqs(const AudioPipeline4ChUlcnet* p);
 int audio_pipeline_4ch_ulcnet_sample_rate(const AudioPipeline4ChUlcnet* p);
+
+/**
+ * Current far-input mode as an int (a UlcnetFarInputMode value), or -1 for
+ * a NULL/destroyed handle. Trivial const getter, exposed so integrators
+ * and tests can verify the mid-stream rejection contract of
+ * audio_pipeline_4ch_ulcnet_set_far_input_mode() above.
+ */
+int audio_pipeline_4ch_ulcnet_far_input_mode(const AudioPipeline4ChUlcnet* p);
 
 /**
  * Read-only view of the beamformed-error hop reconstructed during the most

@@ -95,7 +95,15 @@ typedef struct UlcnetAnalysis {
                                     * synthesis (strictly sequential use
                                     * within a hop -- never concurrent)   */
     float history[ULCNET_N_FFT];   /* 最近 N_FFT 個 raw 樣本 (rolling) */
-    long  hops_seen;
+    long  hops_seen;               /* SATURATES at 3 (guarded before the
+                                    * increment). Consumers only distinguish
+                                    * 1 (first hop, no frame yet), 2 (the
+                                    * reflect-prefix double emission) and
+                                    * >= 3 steady state (flush: < 2 vs
+                                    * >= 2), so the clamp is semantics-
+                                    * preserving; it exists to prevent
+                                    * signed overflow (UB) on unbounded
+                                    * streams. */
     /* Per-call FFT scratch: caller-owned via this struct, NOT the stack
      * (embedded task stacks cannot absorb multi-KB frames). Contents are
      * undefined between calls. */
@@ -133,7 +141,14 @@ typedef struct UlcnetSynthesis {
                                     * sharing contract as UlcnetAnalysis  */
     float acc[ULCNET_N_FFT];       /* overlap-add 累加器 (局部原點 = 下一段輸出) */
     float env[ULCNET_N_FFT];       /* 窗平方包絡累加器 (torch.istft 語意) */
-    long  frames_seen;
+    long  frames_seen;             /* SATURATES at 2 (guarded before the
+                                    * increment). Consumers only distinguish
+                                    * 0 (nothing accumulated), 1 (frame #0,
+                                    * inside the trimmed half window) and
+                                    * >= 2 (steady one-hop emission), so the
+                                    * clamp is semantics-preserving; it
+                                    * exists to prevent signed overflow (UB)
+                                    * on unbounded streams. */
     /* Per-call FFT scratch -- same off-stack rationale as UlcnetAnalysis. */
     Complex spec[ULCNET_BINS];     /* IRFFT input staging; clobbered by FFT */
     float   time[ULCNET_N_FFT];    /* IRFFT time-domain output              */
@@ -159,7 +174,15 @@ int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]);
  * states（far K/V ring、logit 史、GRU h）由 runtime 自己保存。reset 在
  * delay change / pipeline reset 時被呼叫：runtime 應 flush far attention
  * ring 與 logit 史（GRU hidden 的去留是 runtime 自己的 A/B 決策），可為
- * NULL。infer 回傳 0 表成功；非 0 時 pipeline 以 fail-open 輸出線性誤差。 */
+ * NULL。infer 回傳 0 表成功；非 0 時 pipeline 以 fail-open 輸出線性誤差。
+ *
+ * FULL-WRITE CONTRACT: a return of 0 REQUIRES that infer wrote ALL
+ * ULCNET_BINS entries of BOTH out_re and out_im. The pipelines enforce
+ * this by pre-filling the output staging buffers with NaN before EVERY
+ * infer call, so a partial write leaves non-finite bins behind and is
+ * caught by the pipelines' finite-output guard, which falls open to the
+ * identity (error passthrough) path -- a partially-written frame is never
+ * applied and can never leak stale values from a previous frame. */
 typedef struct UlcnetModel {
     void *user;
     int (*infer)(void *user,

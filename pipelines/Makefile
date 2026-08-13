@@ -1375,7 +1375,26 @@ audit-no-stdio-stack:
 # (direct invocation skips the lock) and goes through the same
 # three-producer phase-1 dispatch as `all`/`test`.
 # =============================================================================
-PUBLISH_ARTIFACTS = $(LIB_TARGET) $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static
+PUBLISH_ARTIFACTS = $(LIB_TARGET) $(ULCNET_LIB_TARGET) $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static
+
+# Release gate (deliberately NOT wired into `test:` -- it runs a full real
+# publish): publishes into a throwaway DIST_ROOT and asserts every
+# PUBLISH_ARTIFACTS basename appears in the resulting MANIFEST.txt. Guards
+# the "new library built but never shipped" failure mode that adding
+# $(ULCNET_LIB_TARGET) above just fixed.
+.PHONY: test-publish-manifest
+test-publish-manifest:
+	@tmp=$$(mktemp -d) || exit 1; \
+	 $(MAKE) --no-print-directory publish DIST_ROOT=$$tmp ALLOW_DIRTY_PUBLISH=1 >/dev/null 2>&1 || \
+	   { echo "FAIL: publish into throwaway DIST_ROOT failed"; rm -rf "$$tmp"; exit 1; }; \
+	 manifest=$$(find "$$tmp" -name MANIFEST.txt | head -1); \
+	 test -n "$$manifest" || { echo "FAIL: no MANIFEST.txt produced"; rm -rf "$$tmp"; exit 1; }; \
+	 rc=0; \
+	 for a in $(notdir $(PUBLISH_ARTIFACTS)); do \
+	   grep -q "$$a" "$$manifest" || { echo "FAIL: $$a missing from MANIFEST.txt"; rc=1; }; \
+	 done; \
+	 [ $$rc -eq 0 ] && echo "publish manifest OK ($(words $(PUBLISH_ARTIFACTS)) artifacts verified)"; \
+	 rm -rf "$$tmp"; exit $$rc
 DIST_BACKEND_DIR  = $(DIST_ROOT)/$(BACKEND)
 DIST_LOCK         = $(DIST_ROOT)/.lock.$(BACKEND)
 

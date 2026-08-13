@@ -53,6 +53,14 @@
  *      to the NULL-model pipeline under the same 50%-overlap mixing rule
  *      as test 3), the next clean frame is applied again, and no NaN ever
  *      reaches the output.
+ *   9. full-write contract: a model returning rc==0 after writing only the
+ *      FIRST 100 bins on scheduled hops — the pipeline's NaN pre-fill of
+ *      the staging buffers leaves the unwritten bins non-finite, so those
+ *      frames take the identity path BITWISE (same mixing rule as test 8)
+ *      and the next fully-written frame recovers. MUTATION: removing the
+ *      pre-fill in audio_pipeline_ulcnet.c leaks stale finite values into
+ *      the unwritten bins, the partial frames get applied, and this test
+ *      goes red.
  *
  * Build (from pipelines/): `make test` (kiss backend). Standalone:
  *   cc -O2 -std=gnu99 -ffp-contract=off -I. -I../lib/aec/c_impl/include \
@@ -948,6 +956,112 @@ static void test_nan_guard(void) {
     audio_pipeline_ulcnet_destroy(pb);
 }
 
+/* =========================================================================
+ * 9. full-write contract. Model writes only the FIRST 100 bins (0.5x) on
+ *    scheduled hops but still returns rc==0; otherwise it writes all bins
+ *    (0.5x). The pipeline pre-fills the mdl_re/mdl_im staging with NaN
+ *    before every infer call (ulcnet_process.h's FULL-WRITE CONTRACT), so
+ *    the 157 unwritten bins stay NaN and the finite guard discards the
+ *    frame: output is bit-identical to the NULL-model pipeline exactly
+ *    when BOTH contributing frames were partial (same 50%-overlap mixing
+ *    rule as test 8), and the next fully-written frame is applied again.
+ *    MUTATION PROOF: removing the pre-fill loop in audio_pipeline_ulcnet.c
+ *    leaves the previous frame's stale FINITE values in bins 100..256 --
+ *    the guard cannot catch them, the partial frames get applied, and the
+ *    bit-identical check below goes red.
+ * ========================================================================= */
+typedef struct {
+    int partial_now;   /* set by the test before each process call */
+} PartialModelState;
+
+static int partial_write_infer(void* user,
+                               const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
+                               const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
+                               float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+    PartialModelState* st = (PartialModelState*)user;
+    (void)far_re; (void)far_im;
+    int n = st->partial_now ? 100 : ULCNET_BINS;
+    for (int k = 0; k < n; k++) {
+        out_re[k] = 0.5f * err_re[k];
+        out_im[k] = 0.5f * err_im[k];
+    }
+    /* rc stays 0 even for the partial write: only the pipeline's NaN
+     * pre-fill + finite guard can catch the 157 unwritten bins. */
+    return 0;
+}
+
+static void test_partial_write_guard(void) {
+    enum { N = 60 };
+    PartialModelState st = {0};
+
+    AudioPipelineUlcnetConfig cfg_a = audio_pipeline_ulcnet_default_config(16000);
+    cfg_a.model.user  = &st;
+    cfg_a.model.infer = partial_write_infer;    /* far_input_mode: RAW default */
+    AudioPipelineUlcnetConfig cfg_b = audio_pipeline_ulcnet_default_config(16000);
+
+    AudioPipelineUlcnet* pa = audio_pipeline_ulcnet_create(&cfg_a);
+    AudioPipelineUlcnet* pb = audio_pipeline_ulcnet_create(&cfg_b);
+    if (!pa || !pb) {
+        fprintf(stderr, "FAIL: setup (create) for partial-write test\n");
+        g_failures++;
+        if (pa) audio_pipeline_ulcnet_destroy(pa);
+        if (pb) audio_pipeline_ulcnet_destroy(pb);
+        return;
+    }
+
+    float mic[HOP], ref[HOP], out_a[HOP], out_b[HOP];
+    EchoSim sim;
+    echo_sim_init(&sim, 0, 0xC0FFEEu);   /* zero-delay: error nonzero from hop 0 */
+
+    static int partial[N];
+    int equal_ok = 1, differ_ok = 1, no_nan = 1;
+    int first_bad_equal = -1, first_bad_differ = -1;
+    int n_equal = 0, n_differ = 0;
+
+    for (int h = 0; h < N; h++) {
+        /* Two windows so recovery is proven twice: 20..27 and 40..47. */
+        st.partial_now = (h >= 20 && h < 28) || (h >= 40 && h < 48);
+        partial[h] = st.partial_now;
+
+        echo_sim_hop(&sim, mic, ref);
+        audio_pipeline_ulcnet_process(pa, mic, ref, out_a);
+        audio_pipeline_ulcnet_process(pb, mic, ref, out_b);
+
+        for (int i = 0; i < HOP; i++)
+            if (!isfinite(out_a[i])) no_nan = 0;
+
+        int equal_expected;
+        if (h == 0)      equal_expected = 1;               /* both all-zero */
+        else if (h == 1) equal_expected = partial[1];
+        else             equal_expected = partial[h - 1] && partial[h];
+
+        int bitwise_equal = memcmp(out_a, out_b, sizeof(out_a)) == 0;
+        if (equal_expected) {
+            n_equal++;
+            if (!bitwise_equal && equal_ok) { equal_ok = 0; first_bad_equal = h; }
+        } else if (h >= 1) {
+            n_differ++;
+            if (bitwise_equal && differ_ok) { differ_ok = 0; first_bad_differ = h; }
+        }
+    }
+
+    CHECK(no_nan, "partial-write guard: no NaN/Inf ever reaches the pipeline output");
+    CHECK(n_equal >= 10 && n_differ >= 10,
+          fmt_msg("coverage: %d partial-identity hops and %d applied hops compared", n_equal, n_differ));
+    CHECK(equal_ok,
+          fmt_msg("rc==0 partial-write frames (first 100 bins only) are discarded: "
+                  "output BIT-IDENTICAL to the NULL-model pipeline on all %d "
+                  "fully-partial hops (NaN pre-fill catches the unwritten bins; "
+                  "first bad hop %d [-1=none])", n_equal, first_bad_equal));
+    CHECK(differ_ok,
+          fmt_msg("fully-written frames recover: output DIFFERS from the NULL-model "
+                  "pipeline on all %d hops with a clean applied frame (first bad "
+                  "hop %d [-1=none])", n_differ, first_bad_differ));
+
+    audio_pipeline_ulcnet_destroy(pa);
+    audio_pipeline_ulcnet_destroy(pb);
+}
+
 int main(void) {
     printf("=== audio_pipeline_ulcnet: identity E2E (one-hop latency) ===\n");
     test_identity_e2e();
@@ -984,6 +1098,9 @@ int main(void) {
 
     printf("\n=== audio_pipeline_ulcnet: NaN/Inf guard ===\n");
     test_nan_guard();
+
+    printf("\n=== audio_pipeline_ulcnet: full-write contract (partial-write guard) ===\n");
+    test_partial_write_guard();
 
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);

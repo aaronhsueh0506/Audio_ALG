@@ -28,6 +28,17 @@
  *   7. NaN guard: rc==0 frames poisoned with NaN/Inf are discarded
  *      (bit-identical to the NULL-model pipeline under the 50%-overlap
  *      mixing rule), the next clean frame recovers, no NaN in the output.
+ *   8. full-write contract: rc==0 frames that wrote only the FIRST 100
+ *      bins are discarded bitwise (the pipeline's NaN pre-fill of the
+ *      staging buffers leaves the unwritten bins non-finite, so the
+ *      finite guard catches the partial write), and the next fully
+ *      written frame recovers. MUTATION: removing the pre-fill in
+ *      audio_pipeline_4ch_ulcnet.c leaks stale finite values into the
+ *      unwritten bins and this test goes red.
+ *   9. far-input mode switch lock: set_far_input_mode succeeds before any
+ *      hop is processed, is REJECTED (nonzero, mode unchanged -- verified
+ *      via the far_input_mode getter) once a hop has been processed, and
+ *      succeeds again after audio_pipeline_4ch_ulcnet_reset().
  */
 
 #include "audio_pipeline_4ch_ulcnet.h"
@@ -992,6 +1003,233 @@ static int test_nan_guard(void) {
 }
 
 /* ============================================================================
+ * 8. Full-write contract: infer() writes only the FIRST 100 bins (0.5x)
+ *    on scheduled hops but still returns rc==0. The pipeline pre-fills the
+ *    enh_re/enh_im staging with NaN before every infer call
+ *    (ulcnet_process.h's FULL-WRITE CONTRACT), so the 157 unwritten bins
+ *    stay NaN and the finite guard discards the frame: bit-identical to
+ *    the NULL-model pipeline under the same 50%-overlap mixing rule as
+ *    test 7, and the next fully-written frame is applied again.
+ *    MUTATION PROOF: removing the pre-fill loop in
+ *    audio_pipeline_4ch_ulcnet.c leaves the previous frame's stale FINITE
+ *    values in bins 100..256 -- the guard cannot catch them, the partial
+ *    frames get applied, and the bit-identical check goes red.
+ * ========================================================================== */
+
+typedef struct PartialModel {
+    int partial;   /* set by the test before each process call */
+} PartialModel;
+
+static int partial_write_infer(
+    void* user,
+    const float* err_re, const float* err_im,
+    const float* far_re, const float* far_im,
+    float* out_re, float* out_im) {
+    PartialModel* m = (PartialModel*)user;
+    int n = m->partial ? 100 : ULCNET_BINS;
+    (void)far_re;
+    (void)far_im;
+    for (int k = 0; k < n; ++k) {
+        out_re[k] = 0.5f * err_re[k];
+        out_im[k] = 0.5f * err_im[k];
+    }
+    /* rc stays 0 even for the partial write: only the pipeline's NaN
+     * pre-fill + finite guard can catch the 157 unwritten bins. */
+    return 0;
+}
+
+static int test_partial_write_guard(void) {
+    enum { FRAMES = 60, TRUE_DELAY = 400 };
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    AudioPipeline4ChUlcnet* pa;
+    AudioPipeline4ChUlcnet* pb;
+    PartialModel m;
+    UlcnetModel model;
+    float* microphones;
+    float* far;
+    float* out_a;
+    float* out_b;
+    float* far_hist;
+    int partial[FRAMES];
+    int n_equal = 0;
+    int n_differ = 0;
+    int hop;
+
+    cfg.gsc_fixed_mode = 1;
+    cfg.gsc_fixed_doa_rad = 0.3f;
+    cfg.gsc_mu = 0.02f;
+    cfg.core.enable_cng = 0;
+
+    pa = audio_pipeline_4ch_ulcnet_create(&cfg);
+    pb = audio_pipeline_4ch_ulcnet_create(&cfg);   /* NULL model: identity */
+    CHECK(pa != NULL && pb != NULL, "create partial-write pipeline pair");
+    hop = audio_pipeline_4ch_ulcnet_hop_size(pa);
+
+    memset(&m, 0, sizeof(m));
+    memset(&model, 0, sizeof(model));
+    model.user = &m;
+    model.infer = partial_write_infer;
+    CHECK(audio_pipeline_4ch_ulcnet_set_model(pa, &model) == 0,
+          "install partial-write model (RAW default mode)");
+
+    microphones = (float*)malloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
+    far = (float*)malloc((size_t)hop * sizeof(float));
+    out_a = (float*)malloc((size_t)hop * sizeof(float));
+    out_b = (float*)malloc((size_t)hop * sizeof(float));
+    far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
+    CHECK(microphones && far && out_a && out_b && far_hist,
+          "allocate partial-write buffers");
+
+    for (int frame = 0; frame < FRAMES; ++frame) {
+        int equal_expected;
+        int bitwise_equal;
+        /* Two windows so recovery is proven twice: 20..27 and 40..47. */
+        m.partial = (frame >= 20 && frame < 28) || (frame >= 40 && frame < 48);
+        partial[frame] = m.partial;
+
+        for (int i = 0; i < hop; ++i) {
+            int64_t t = (int64_t)frame * hop + i;
+            float noise = 0.25f * frand();
+            float echo;
+            far_hist[t] = noise;
+            far[i] = noise;
+            echo = t >= TRUE_DELAY
+                ? 0.6f * far_hist[t - TRUE_DELAY] : 0.0f;
+            for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+                microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
+                    echo * (1.0f - 0.02f * ch);
+            }
+        }
+        CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
+                  pa, microphones, far, 0, out_a) == FOUR_AEC_NR_RES_OK,
+              "partial-write model frame processes");
+        CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
+                  pb, microphones, far, 0, out_b) == FOUR_AEC_NR_RES_OK,
+              "partial-write reference frame processes");
+
+        for (int i = 0; i < hop; ++i) {
+            CHECK(isfinite(out_a[i]),
+                  "no NaN/Inf ever reaches the output (partial-write test)");
+        }
+
+        /* Same 50%-overlap mixing rule as test 7. */
+        if (frame == 0) {
+            equal_expected = 1;
+        } else if (frame == 1) {
+            equal_expected = partial[1];
+        } else {
+            equal_expected = partial[frame - 1] && partial[frame];
+        }
+        bitwise_equal =
+            memcmp(out_a, out_b, (size_t)hop * sizeof(float)) == 0;
+        if (equal_expected) {
+            n_equal += 1;
+            CHECK(bitwise_equal,
+                  "rc==0 partial-write frames are discarded bitwise "
+                  "(NaN pre-fill catches the unwritten bins)");
+        } else if (frame >= 3) {
+            /* Same one-frame margin as test 7 (echo reaches the beam at
+             * frame 3). */
+            n_differ += 1;
+            CHECK(!bitwise_equal,
+                  "fully-written frames after a partial window are applied "
+                  "again");
+        }
+    }
+    CHECK(n_equal >= 10 && n_differ >= 10,
+          "partial-write coverage: both regimes actually compared");
+
+    audio_pipeline_4ch_ulcnet_destroy(pa);
+    audio_pipeline_4ch_ulcnet_destroy(pb);
+    free(far_hist);
+    free(out_b);
+    free(out_a);
+    free(far);
+    free(microphones);
+    return 1;
+}
+
+/* ============================================================================
+ * 9. Far-input mode switch lock: allowed only while no hop has been
+ *    processed; rejected mid-stream (mode unchanged, verified via the
+ *    getter); allowed again after reset.
+ * ========================================================================== */
+
+static int test_far_mode_switch_rejected_midstream(void) {
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    AudioPipeline4ChUlcnet* p;
+    float* microphones;
+    float* far;
+    float* out;
+    int hop;
+
+    cfg.gsc_fixed_mode = 1;
+    cfg.gsc_fixed_doa_rad = 0.3f;
+    cfg.gsc_mu = 0.02f;
+    cfg.core.enable_cng = 0;
+
+    p = audio_pipeline_4ch_ulcnet_create(&cfg);
+    CHECK(p != NULL, "create mode-switch pipeline");
+    hop = audio_pipeline_4ch_ulcnet_hop_size(p);
+
+    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(NULL) == -1,
+          "far_input_mode getter returns -1 for NULL");
+    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_RAW,
+          "instances start in ULCNET_FAR_RAW");
+
+    /* Before any hop: switching (both directions) succeeds. */
+    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
+              p, ULCNET_FAR_ALIGNED) == 0,
+          "pre-stream switch to ALIGNED succeeds");
+    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_ALIGNED,
+          "getter reflects the pre-stream switch");
+    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
+              p, ULCNET_FAR_RAW) == 0,
+          "pre-stream switch back to RAW succeeds");
+
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)malloc((size_t)hop * sizeof(float));
+    CHECK(microphones && far && out, "allocate mode-switch buffers");
+
+    CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
+              p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
+          "one hop processes before the mid-stream switch attempt");
+
+    /* Mid-stream: rejected, mode unchanged. */
+    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
+              p, ULCNET_FAR_ALIGNED) != 0,
+          "mid-stream switch is rejected after one processed hop");
+    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_RAW,
+          "rejected mid-stream switch leaves the mode unchanged");
+
+    /* Undefined values keep being rejected too (reject-first ordering). */
+    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
+              p, (UlcnetFarInputMode)99) != 0,
+          "undefined mode value still rejected mid-stream");
+
+    /* After reset (frame_index back to 0) switching is allowed again. */
+    audio_pipeline_4ch_ulcnet_reset(p);
+    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
+              p, ULCNET_FAR_ALIGNED) == 0,
+          "switch succeeds again after reset");
+    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_ALIGNED,
+          "getter reflects the post-reset switch");
+
+    /* NOTE: no post-destroy getter probe here -- this is a create() (heap)
+     * instance, so destroy() frees the memory containing `p` itself; the
+     * destroyed-accessor contract is covered on the caller-pool instance
+     * in test 4. */
+    audio_pipeline_4ch_ulcnet_destroy(p);
+    free(out);
+    free(far);
+    free(microphones);
+    return 1;
+}
+
+/* ============================================================================
  * Driver
  * ========================================================================== */
 
@@ -1035,6 +1273,10 @@ static int run_all_tests(void) {
           "RAW mode applies without a delay lock");
     CHECK(test_nan_guard(),
           "NaN guard: non-finite model output never reaches the WOLA");
+    CHECK(test_partial_write_guard(),
+          "full-write contract: partial rc==0 frames are discarded");
+    CHECK(test_far_mode_switch_rejected_midstream(),
+          "far-input mode switch is locked once streaming has started");
     printf("All audio_pipeline_4ch_ulcnet tests passed\n");
     return 1;
 }
