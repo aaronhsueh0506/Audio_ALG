@@ -419,9 +419,21 @@ samples lookahead/time origin 與末尾 flush。若產品改採純 past-only fra
 屬於 feature-time contract 變更，必須做 checkpoint A/B，不能只以「同樣是
 512/256」視為等價。
 
-**決策（2026-08-13）**：第一版重現 center=True timing，板端支付 256-sample
-（16 ms）lookahead latency，保住 checkpoint parity，讓 D 的 zero-shot A/B
-不被時序變因污染；past-only 留待量測完成後另行 A/B。
+**決策（2026-08-13）**：第一版重現 center=True timing；past-only 留待量測
+完成後另行 A/B。
+
+**釐清（2026-08-13 稍晚，推導+實作驗證）**：在本 grid（win=n_fft、
+hop=win/2、同一 sqrt-Hann 窗）下，centered 第 k 幀與 non-centered 第
+k-1 幀覆蓋**完全相同的樣本**（逐 bit 同頻譜）——兩種 framing 的穩態特徵
+相同、且 STFT→NN→ISTFT 鏈的穩態 I/O 延遲都是同一個 1 hop（16 ms，WOLA
+收尾本來就要等下一幀；centered 的半窗 lookahead 藏在其中，C 實作
+`ulcnet_process.c` 與 dfn2 的 center=False 串流輸出排程逐 hop 相同可佐
+證）。所以 center 是**邊界與編號慣例**：真實差異只有 (a) 串流開頭第一幀
+（reflect 前綴 vs 冷啟動）造成的 recurrent-state start transient、(b) 檔
+案級評測的幀數/邊界、(c) 幀時間戳語意。維持 center=True 的理由據此修正
+為：**改 past-only 拿不到任何延遲收益，卻要重寫全部 parity 測試的幀對齊
+簿記**——不是原先寫的「板端支付 16 ms 換 parity」（那 16 ms 兩種 framing
+都要付，是鏈路下限）。要真正壓延遲屬重訓等級手段（非對稱窗、縮 hop）。
 
 ## 8. Delay 狀態機與 Fallback
 
@@ -466,11 +478,20 @@ recovery 語意整合，避免同一個 delay event在 AEC 與 NN 被重複 rese
 
 現況注記（2026-08-13 更新）：`delay_state` 與 `generation` 已在 AEC
 standalone 實作（見 5.1 節實作狀態）；out-of-range 偵測仍不存在（超出
-約 509 ms 可靠搜尋上界時狀態停在 UNLOCKED，與冷啟動不可區分）。本節其餘
-部分——HOLD/REACQUIRE policy、fail-open 路由、crossfade、與 NN state
-reset 的整合——仍是「要新蓋的」。4ch pipeline 層已有一份可參考的自建實
-作（delay changed/solid/confidence 差分與 reset 策略，
-`4aec_nr_res.c:778-794, 901-914`）。
+約 509 ms 可靠搜尋上界時狀態停在 UNLOCKED，與冷啟動不可區分）。第一版
+fail-open/reset 已落在兩個 pipeline 變體（`pipelines/audio_pipeline_ulcnet`
+與 `4ch_pipelines/audio_pipeline_4ch_ulcnet`）：UNLOCKED→模型照步進但輸出
+走 identity（timing 恆定）、CHANGED→`model->reset`；HOLD/REACQUIRE 細分
+與 crossfade 仍待做。4ch 側的先例實作在
+`4aec_nr_res.c:778-794, 901-914`。
+
+⚠ **短延遲部署注意（pipeline 實測發現）**：echo path 的 bulk delay 很小
+（linear filter 的 832-tap 涵蓋範圍內）時，filter 未對齊就能收斂 → ERLE
+超過 2.5 dB → Path-A already-cancelling 保護（`delay_acquire_protect_converged`，
+Python/C 現已一致）會**永久擋下 first acquisition**，`delay_state` 恆為
+UNLOCKED，NN 後級永遠在 fail-open。這對音質是安全的（線性殘差直接出），
+但代表短延遲裝置上 NN 從未生效——產品狀態機（Phase 5）需要一條
+「filter 已收斂且無 delay 需求 → 視同 LOCKED、far 直接可用」的路徑。
 
 ## 9. D 的候選與 Checkpoint
 

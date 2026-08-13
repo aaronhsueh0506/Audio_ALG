@@ -70,7 +70,14 @@ extern "C" {
 /* Current layout: three hop-sized working buffers. Per-lane RES spectra are
  * borrowed from each AEC instance and are valid only until that lane is
  * processed or reset again. Query a fresh descriptor for every build; do not
- * persist or synthesize one from this version number. */
+ * persist or synthesize one from this version number.
+ *
+ * 2026-08-13 PreFrame ABI note: FourAecNrResPreFrame gained a trailing
+ * `aligned_ref` field (see its doc comment). That struct is a caller-stack
+ * hand-off, not part of the pool carve, so this layout_version is
+ * deliberately NOT bumped -- the pool byte layout is unchanged. It is still
+ * a recompile-the-world struct change for out-of-tree callers embedding
+ * FourAecNrResPreFrame by value. */
 #define FOUR_AEC_NR_RES_LAYOUT_VERSION 7u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
@@ -232,6 +239,22 @@ typedef struct FourAecNrResPreFrame {
      * hop's data, still correct by coincidence".
      */
     const Complex* linear_spectra[FOUR_AEC_NR_RES_CHANNELS];
+
+    /**
+     * Read-only view of the delay-aligned time-domain far reference actually
+     * fed to every AEC lane this hop: aligned_ref[hop_size]. Content is the
+     * caller's ref stream shifted by delay.delay_samples (leading region is
+     * zero before the ring has produced that many samples).
+     *
+     * Like linear_interleaved above, this is a pipeline-owned buffer (the
+     * shared delay line's per-hop output, not a lane alias) and follows the
+     * exact same lifetime contract: only safe to read for one frame -- valid
+     * until process_post(), abandon_pre(), reset(), or destroy(); only one
+     * pre frame may be in flight. Intended consumer: an external neural
+     * post-filter that needs the SAME aligned far the linear filters
+     * consumed (e.g. the Align-ULCNet post stage's far branch).
+     */
+    const float* aligned_ref;
 } FourAecNrResPreFrame;
 
 typedef struct FourAecNrRes FourAecNrRes;
@@ -351,6 +374,31 @@ int four_aec_nr_res_process_post(
     const FourAecNrResFrameToken* token,
     const Complex* weights,
     float* out);
+
+/**
+ * Release one pending pre frame WITHOUT running this module's post-beam
+ * RES/NR/synthesis path. Companion to process_pre() for pipeline variants
+ * whose post stage is external (e.g. the Align-ULCNet neural post-filter
+ * wrapper, which consumes linear_spectra/aligned_ref and replaces
+ * process_post() entirely).
+ *
+ * Consumes the token exactly like a successful process_post() would (the
+ * next process_pre() is legal again; all PreFrame pointers become invalid),
+ * but advances NO downstream state: the mono NR, the post-beam RES, and this
+ * module's own synthesis OLA are untouched. A stream that interleaves
+ * abandoned and posted frames therefore resumes process_post() with a
+ * synthesis OLA that is missing the abandoned hops -- this call is intended
+ * for pipelines that never call any process_post() variant at all, not for
+ * per-hop mixing.
+ *
+ * @return FOUR_AEC_NR_RES_OK on success; FOUR_AEC_NR_RES_INVALID_ARGUMENT on
+ *         a NULL p/token; FOUR_AEC_NR_RES_SEQUENCE_ERROR if token does not
+ *         match the pending frame (no frame pending, replay, cross-instance
+ *         use, or a token invalidated by an intervening reset()).
+ */
+int four_aec_nr_res_abandon_pre(
+    FourAecNrRes* p,
+    const FourAecNrResFrameToken* token);
 
 /**
  * Reset all delay/AEC/NR/RES/OLA state. Invalidates a pending pre-frame token.

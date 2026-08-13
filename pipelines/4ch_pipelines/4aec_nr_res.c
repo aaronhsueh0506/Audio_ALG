@@ -976,6 +976,10 @@ int four_aec_nr_res_process_pre(
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
         out->linear_spectra[ch] = p->snapshots[ch].error_spec;
     }
+    /* Pipeline-owned per-hop output of align_render() above -- the exact
+     * delay-aligned far every lane consumed this hop. Same one-frame
+     * lifetime contract as linear_interleaved (see the header). */
+    out->aligned_ref = p->aligned_ref;
     return FOUR_AEC_NR_RES_OK;
 }
 
@@ -1277,6 +1281,20 @@ int four_aec_nr_res_process_post_trusted_spectrum(
     if (!beamformed_error) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     return process_post_impl(
         p, token, weights, beamformed_error, out);
+}
+
+int four_aec_nr_res_abandon_pre(
+    FourAecNrRes* p,
+    const FourAecNrResFrameToken* token) {
+    if (!p || p->destroyed || !token)
+        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (!token_matches(p, token))
+        return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+    /* Same token-consumption epilogue as process_post_impl(), with none of
+     * its RES/NR/synthesis work: releasing the frame is the whole job. */
+    p->pending = 0;
+    memset(&p->pending_token, 0, sizeof(p->pending_token));
+    return FOUR_AEC_NR_RES_OK;
 }
 
 /* ============================================================================
