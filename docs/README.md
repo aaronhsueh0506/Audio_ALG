@@ -19,6 +19,8 @@ README.
 | DFN3 band-split contract | [`../AINR/DeepFilterNet3/README.md`](../AINR/DeepFilterNet3/README.md) |
 | Neural AEC candidates | [`../AIAEC/README.md`](../AIAEC/README.md) |
 | AIAEC candidate decision matrix | [`ai_aec_candidate_matrix.md`](ai_aec_candidate_matrix.md) |
+| PBFDKF + Align-ULCNet embedded streaming proposal | [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md) |
+| AIAEC six-candidate streaming readiness audit | [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md) |
 | Development / submodules | [`development.md`](development.md) |
 
 `architecture.html` is a visual explanation of the conventional mono path. It

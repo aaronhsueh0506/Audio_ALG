@@ -49,7 +49,9 @@ record.
   `1024/1024/512 @ 48 kHz`.
 - `GTCRN_AENR` stays locked to its original 16 kHz grid.
 - The public forwards are clip-level; explicit per-model cache/state I/O is a
-  separate streaming deployment concern.
+  separate streaming deployment concern -- see
+  [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md)
+  for the per-candidate streaming audit (lookahead, states, blockers).
 - AIAEC data is generated only through `AIAEC/dataset_gen/`. Generated WAVs
   carry five stems; packing projects them to the four-channel training contract
   `PACKED_STEM_ORDER` (`far_render`, `mic_postclip`, `linear_error`,

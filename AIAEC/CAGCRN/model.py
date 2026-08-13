@@ -10,7 +10,7 @@ CATA, the two TF-GRUs, TFAG and the mirrored decoder are retained here.
 from __future__ import annotations
 
 import math
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -25,6 +25,13 @@ from AIAEC.aiaec_common import (
     fit_frequency,
     mag_ri_feature,
     require_complex_btf,
+)
+from AIAEC.aiaec_streaming import (
+    DelayRingCell,
+    StreamConv2dCell,
+    StreamGRUCell,
+    StreamModuleCell,
+    assert_streaming_ready,
 )
 
 
@@ -257,9 +264,81 @@ class DecoderBlock(nn.Module):
         return x + residual
 
 
+def _stream_encoder_block(block: EncoderBlock, group_cell: StreamConv2dCell,
+                          x: Tensor) -> Tensor:
+    # Only the depthwise group conv is time-extended; every other member of
+    # the block has time kernel 1 and runs per frame unchanged.
+    residual = block.residual(x)
+    x = block.act(block.norm(block.conv(x)))
+    x = block.point2(group_cell.step(block.point1(x)))
+    return x + residual
+
+
+def _stream_decoder_block(block: DecoderBlock, group_cell: StreamConv2dCell,
+                          x: Tensor, target_freq: int) -> Tensor:
+    # The deconv upsamples frequency only (time stride 1), so _first is safe
+    # on a single frame; the group conv again carries the time context.
+    residual = block._first(block.residual, x, target_freq)
+    x = block.act(block.norm(block._first(block.conv, x, target_freq)))
+    x = block.point2(group_cell.step(block.point1(x)))
+    return x + residual
+
+
+def _stream_tfgru(module: TFGRU, time_cell: StreamGRUCell, x: Tensor) -> Tensor:
+    # The frequency BiGRU is bidirectional over F within one frame; only the
+    # time GRU (batch b*f) needs a hidden carrier between frames.
+    b, c, t, f = x.shape
+    residual = x.permute(0, 2, 3, 1)
+    z = residual.reshape(b * t, f, c)
+    z, _ = module.freq_gru(z)
+    z = module.freq_ln(module.freq_fc(z)).reshape(b, t, f, c)
+    z = z + residual
+    freq_residual = z
+    z = z.permute(0, 2, 1, 3).reshape(b * f, t, c)
+    z = time_cell.step(z)
+    z = module.time_ln(module.time_fc(z)).reshape(b, f, t, c)
+    z = z + freq_residual.permute(0, 2, 1, 3)
+    return z.permute(0, 3, 2, 1)
+
+
+def _stream_tfag(module: TFAG, time1_cell: StreamConv2dCell,
+                 time2_cell: StreamConv2dCell, far_aligned: Tensor,
+                 mic: Tensor) -> Tensor:
+    # freq1/freq2 have time kernel 1 (their causal pad is frequency-only);
+    # time1/time2 are (5,1) with dilation 1/2 and need cells.
+    x = module.pre(far_aligned + mic)
+    scales = torch.cat((
+        module.freq1(x), module.freq2(x),
+        time1_cell.step(x), time2_cell.step(x),
+    ), dim=1)
+    gate = module.gate(scales)
+    return module.fuse(far_aligned * gate + mic * (1.0 - gate))
+
+
+def _stream_cata(att: CrossAttentionTemporalAlignment,
+                 query_cell: StreamModuleCell, key_cell: StreamModuleCell,
+                 ref_cell: StreamModuleCell, ring: DelayRingCell,
+                 gate_log: Tensor, mic: Tensor,
+                 far: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+    q = query_cell.step(mic)
+    k_mic = key_cell.step(q)
+    mic_distribution = torch.softmax(q * k_mic, dim=-1)
+    y_mic = att.mic_value(mic) * mic_distribution
+    kv = ref_cell.step(far)
+    delayed = ring.step(kv)                             # [B,C,1,D,F]
+    logits = q.unsqueeze(3) * delayed
+    logits = logits + gate_log[None, None, None, :, None]
+    distribution = torch.softmax(logits, dim=3)
+    y_ref = (distribution * delayed).sum(dim=3)
+    fused = att.fuse(torch.cat((y_mic, y_ref), dim=1))
+    delay_distribution = distribution.mean(dim=(1, 4))
+    return fused, delay_distribution, distribution
+
+
 class CAGCRN(nn.Module):
     paper_reference = "INTERSPEECH 2025-608"
     task = "end_to_end_aec_res_nr_dereverb"
+    stream_output_delay = 0
 
     def __init__(self, grid: SignalGrid, high_erb_bands: int = 32,
                  max_delay_seconds: float = 1.0):
@@ -347,6 +426,118 @@ class CAGCRN(nn.Module):
             target = (mic_skips[-2 - index].shape[-1] if index < 3
                       else self.erb.compressed_bins)
             x = block(x, target)
+
+        mask_erb = self.mask(x)
+        mask_full = fit_frequency(self.erb.split(mask_erb), self.grid.n_freqs)
+        enhanced = complex_mask(mask_full, microphone)
+        return AecOutput(
+            enhanced=enhanced, mask=mask_full,
+            delay_distribution=delay,
+            auxiliary={"erb_mask": mask_erb,
+                       "cata_attention": full_attention},
+        )
+
+    def create_stream_state(self) -> Dict[str, object]:
+        """Named cells whose tensors are the complete inter-frame RAM contract.
+
+        Every time-extended module gets one cell: the eight encoder and four
+        decoder depthwise group convs, CATA's three separable convs plus its
+        delay ring, the two time GRUs and TFAG's two (5,1) convs.  The learned
+        CATA window gate depends only on ``raw_window``, so its log-bias is a
+        constant at inference and is precomputed here.
+        """
+        assert_streaming_ready(self)
+
+        def separable_cell(module: SeparableCausalConv) -> StreamModuleCell:
+            return StreamModuleCell(
+                StreamConv2dCell.from_causal(module.depth),
+                (module.point, module.norm, module.act),
+            )
+
+        state: Dict[str, object] = {}
+        for name, encoder in (("mic", self.mic_encoder),
+                              ("far", self.far_encoder)):
+            for index, block in enumerate(encoder):
+                state[f"{name}_enc{index}_group"] = (
+                    StreamConv2dCell.from_causal(block.group))
+        state["cata_query"] = separable_cell(self.cata.mic_query)
+        state["cata_key"] = separable_cell(self.cata.mic_key)
+        state["cata_ref_kv"] = separable_cell(self.cata.ref_kv)
+        state["cata_ring"] = DelayRingCell(self.cata.max_delay_frames)
+        with torch.no_grad():
+            boundary = 1.0 + (self.cata.max_delay_frames - 1.0) * torch.sigmoid(
+                self.cata.raw_window,
+            )
+            delay = torch.arange(
+                self.cata.max_delay_frames,
+                device=boundary.device, dtype=boundary.dtype,
+            )
+            state["cata_gate_log"] = torch.sigmoid(
+                (boundary - delay) / self.cata.window_temperature,
+            ).clamp_min(1e-6).log()
+        state["mic_tfgru_time"] = StreamGRUCell(self.mic_tfgru.time_gru)
+        state["far_tfgru_time"] = StreamGRUCell(self.far_tfgru.time_gru)
+        state["tfag_time1"] = StreamConv2dCell.from_causal(self.tfag.time1)
+        state["tfag_time2"] = StreamConv2dCell.from_causal(self.tfag.time2)
+        for index, block in enumerate(self.decoder):
+            state[f"dec{index}_group"] = StreamConv2dCell.from_causal(
+                block.group)
+        return state
+
+    def forward_stream(self, microphone: Tensor, far_end: Tensor,
+                       state: Dict[str, object]) -> AecOutput:
+        """One-frame replay of :meth:`forward` (``stream_output_delay`` = 0).
+
+        Inputs are complex ``[B,1,F]`` (a T=1 slice of the offline input) and
+        the returned :class:`AecOutput` carries the same frame's slice of every
+        offline field, including both auxiliaries -- nothing is omitted.
+        """
+        require_complex_btf(microphone, "microphone")
+        require_complex_btf(far_end, "far_end")
+        if microphone.shape[1] != 1:
+            raise ValueError("forward_stream consumes exactly one STFT frame")
+        if microphone.shape != far_end.shape:
+            raise ValueError("microphone and far_end STFT grids must match")
+        if microphone.shape[-1] != self.grid.n_freqs:
+            raise ValueError("input frequency count does not match SignalGrid")
+
+        mic = self.erb.merge(mag_ri_feature(microphone))
+        far = self.erb.merge(mag_ri_feature(far_end))
+        mic_skips: List[Tensor] = []
+        far_skips: List[Tensor] = []
+
+        mic = _stream_encoder_block(
+            self.mic_encoder[0], state["mic_enc0_group"], mic)
+        far = _stream_encoder_block(
+            self.far_encoder[0], state["far_enc0_group"], far)
+        mic_skips.append(mic)
+        far, delay, full_attention = _stream_cata(
+            self.cata, state["cata_query"], state["cata_key"],
+            state["cata_ref_kv"], state["cata_ring"], state["cata_gate_log"],
+            mic, far,
+        )
+        far_skips.append(far)
+        for index in range(1, 4):
+            mic = _stream_encoder_block(
+                self.mic_encoder[index], state[f"mic_enc{index}_group"], mic)
+            far = _stream_encoder_block(
+                self.far_encoder[index], state[f"far_enc{index}_group"], far)
+            mic_skips.append(mic)
+            far_skips.append(far)
+
+        mic = _stream_tfgru(self.mic_tfgru, state["mic_tfgru_time"], mic)
+        far = _stream_tfgru(self.far_tfgru, state["far_tfgru_time"], far)
+        x = _stream_tfag(
+            self.tfag, state["tfag_time1"], state["tfag_time2"], far, mic)
+        for index, block in enumerate(self.decoder):
+            mic_skip = mic_skips[-1 - index]
+            far_skip = far_skips[-1 - index]
+            x = (x + fit_frequency(self.skip_mic[index](mic_skip), x.shape[-1])
+                 + fit_frequency(self.skip_far[index](far_skip), x.shape[-1]))
+            target = (mic_skips[-2 - index].shape[-1] if index < 3
+                      else self.erb.compressed_bins)
+            x = _stream_decoder_block(block, state[f"dec{index}_group"],
+                                      x, target)
 
         mask_erb = self.mask(x)
         mask_full = fit_frequency(self.erb.split(mask_erb), self.grid.n_freqs)

@@ -8,7 +8,7 @@ the network consumes its error signal and the unaligned far-end reference.
 from __future__ import annotations
 
 import math
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import torch
 from torch import Tensor, nn
@@ -20,6 +20,11 @@ from AIAEC.aiaec_common import (
     SeparableCausalConv,
     SignalGrid,
     require_complex_btf,
+)
+from AIAEC.aiaec_streaming import (
+    FrameDelayAttentionCell,
+    StreamGRUCell,
+    assert_streaming_ready,
 )
 
 
@@ -150,6 +155,8 @@ class SubbandTemporalGRU(nn.Module):
 class AlignULCNet(nn.Module):
     paper_reference = "arXiv:2410.13620"
     task = "linear_aec_postfilter_res_nr_dereverb"
+    # forward_stream emits the enhanced frame for its own input frame.
+    stream_output_delay = 0
 
     def __init__(self, grid: SignalGrid, max_delay_seconds: float = 1.0,
                  gamma: int = 5, subband_bins: int = 2,
@@ -237,6 +244,86 @@ class AlignULCNet(nn.Module):
             magnitude_mask * torch.cos(zphase),
             magnitude_mask * torch.sin(zphase),
         ), dim=1)
+        stage2 = self.stage2_act(self.stage2_norm1(self.stage2_conv1(intermediate)))
+        stage2 = self.stage2_act(self.stage2_norm2(self.stage2_conv2(stage2)))
+        mask_ri = self.complex_mask(stage2)
+        mask = torch.complex(mask_ri[:, 0], mask_ri[:, 1])
+
+        compressed_error = torch.complex(zr, zi)
+        compressed_estimate = compressed_error * mask
+        enhanced = torch.complex(
+            _signed_power(compressed_estimate.real, 1.0 / self.compression_exponent),
+            _signed_power(compressed_estimate.imag, 1.0 / self.compression_exponent),
+        )
+        return AecOutput(
+            enhanced=enhanced, mask=mask, delay_distribution=delay,
+            auxiliary={
+                "magnitude_mask": magnitude_mask,
+                "intermediate_ri": intermediate,
+            },
+        )
+
+    def create_stream_state(self) -> Dict[str, object]:
+        """Stateful cells for :meth:`forward_stream`.
+
+        The only time-extended members are the delay attention (key/value
+        rings plus the (5,3) score conv history) and the two temporal subband
+        GRUs.  Every other layer has time kernel 1 and runs per-frame as-is.
+        """
+        assert_streaming_ready(self)
+        state: Dict[str, object] = {
+            "align": FrameDelayAttentionCell(self.align),
+        }
+        for index, block in enumerate(self.subband_grus):
+            state[f"subband_gru{index}"] = StreamGRUCell(block.gru)
+        return state
+
+    def forward_stream(self, linear_error: Tensor, far_end: Tensor,
+                       state: Dict[str, object]) -> AecOutput:
+        """One-frame replay of :meth:`forward` (complex ``[B,1,F]`` in/out)."""
+        require_complex_btf(linear_error, "linear_error")
+        require_complex_btf(far_end, "far_end")
+        if linear_error.shape[1] != 1:
+            raise ValueError("forward_stream consumes exactly one STFT frame")
+        if linear_error.shape != far_end.shape:
+            raise ValueError("linear_error and far_end STFT grids must match")
+        if linear_error.shape[-1] != self.grid.n_freqs:
+            raise ValueError("input frequency count does not match SignalGrid")
+
+        zr, zi, zmag, zphase = _component_power_spectrum(
+            linear_error, self.compression_exponent,
+        )
+        _yr, _yi, ymag, _yphase = _component_power_spectrum(
+            far_end, self.compression_exponent,
+        )
+        # Encoder kernels are (1,5)/(1,3) with frequency-only pooling.
+        e = self.error_encoder(self.reorient(zmag.unsqueeze(1)))
+        f = self.far_encoder(self.reorient(ymag.unsqueeze(1)))
+        aligned, delay = state["align"].step(e, f)
+        x = self.joint2(self.joint1(torch.cat((e, aligned), dim=1)))
+        x = self.fgru(x)
+
+        pieces: List[Tensor] = []
+        at = 0
+        for index, width in enumerate(self.subband_widths):
+            piece = x[..., at:at + width]
+            b, c, _, w = piece.shape
+            # SubbandTemporalGRU's time flatten with T == 1.
+            sequence = piece.permute(0, 2, 1, 3).reshape(b, 1, c * w)
+            pieces.append(state[f"subband_gru{index}"].step(sequence))
+            at += width
+        if at != x.shape[-1]:
+            raise RuntimeError("subband split no longer matches the encoder width")
+        features = torch.cat(pieces, dim=-1)
+        magnitude_mask = torch.sigmoid(
+            self.mask_fc2(self.mask_act(self.mask_fc1(features))),
+        )
+
+        intermediate = torch.stack((
+            magnitude_mask * torch.cos(zphase),
+            magnitude_mask * torch.sin(zphase),
+        ), dim=1)
+        # Stage-2 convs are (1,3): time kernel 1.
         stage2 = self.stage2_act(self.stage2_norm1(self.stage2_conv1(intermediate)))
         stage2 = self.stage2_act(self.stage2_norm2(self.stage2_conv2(stage2)))
         mask_ri = self.complex_mask(stage2)
