@@ -4,6 +4,8 @@
 用法:
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav
     python3 denoise.py checkpoint.pth mic.wav far.wav out.wav --device cpu
+    python3 denoise.py checkpoint.pth kf_error.wav far.wav out.wav \\
+        --input-is-linear-error
 
 mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample
 rate before the linear AEC when needed; output stays at that model rate.
@@ -22,6 +24,10 @@ estimate used by every selected AIAEC candidate.
 config.ini is not read for model shape: every shape-relevant setting is
 recovered from the checkpoint's own contract, including the exact materialized
 Python-PBFDKF frontend. Inference refuses a missing or drifted AEC contract.
+
+``--input-is-linear-error`` is an evaluation-only bypass for published demos
+that already provide KF residual Z. It does not make an external KF equivalent
+to the frozen PBFDKF used to train this repository's checkpoint.
 """
 
 import argparse
@@ -40,6 +46,7 @@ from AIAEC.Align_ULCNet import AlignULCNet
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid, istft, stft
 from AIAEC.inference_common import load_mic_far
+from AIAEC.inference_common import load_linear_error_far
 from AIAEC.training_common import (
     LinearAecEngine,
     auto_device,
@@ -51,10 +58,19 @@ from AIAEC.training_common import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('checkpoint')
-    parser.add_argument('mic_wav')
+    parser.add_argument(
+        'mic_wav', metavar='mic_or_linear_error_wav',
+        help='Microphone input, or precomputed error with '
+             '--input-is-linear-error',
+    )
     parser.add_argument('far_wav')
     parser.add_argument('out_wav')
     parser.add_argument('--device', default=None, help='cuda / cpu / mps (default: auto-detect)')
+    parser.add_argument(
+        '--input-is-linear-error', action='store_true',
+        help='Evaluation only: first WAV is an existing KF/AEC error Z; '
+             'bypass this project\'s PBFDKF and run only the neural post-filter',
+    )
     return parser
 
 
@@ -78,20 +94,27 @@ def main(args):
     device = auto_device(args.device)
     model, grid, linear_contract = load_model(args.checkpoint, device)
 
-    mic_t, far_t, source_rates = load_mic_far(
-        args.mic_wav, args.far_wav, grid.sr
-    )
-    mic_t = mic_t.to(device)
+    if args.input_is_linear_error:
+        error, far_t, source_rates = load_linear_error_far(
+            args.mic_wav, args.far_wav, grid.sr
+        )
+        print("using external linear-error input; PBFDKF bypassed")
+    else:
+        mic_t, far_t, source_rates = load_mic_far(
+            args.mic_wav, args.far_wav, grid.sr
+        )
+        linear_aec = LinearAecEngine(
+            n_lanes=1, sample_rate=grid.sr, contract=linear_contract
+        )
+        error, _echo_estimate = linear_aec(
+            mic_t, far_t, grid.sr
+        )
+    error = error.to(device)
     far_t = far_t.to(device)
     if source_rates != (grid.sr, grid.sr):
-        print(f"resampled mic/far {source_rates[0]}/{source_rates[1]} -> "
+        print(f"resampled primary/far {source_rates[0]}/{source_rates[1]} -> "
               f"{grid.sr} Hz")
-    length = mic_t.shape[-1]
-
-    linear_aec = LinearAecEngine(
-        n_lanes=1, sample_rate=grid.sr, contract=linear_contract
-    )
-    error, _echo_estimate = linear_aec(mic_t, far_t, grid.sr)   # same length as mic_t
+    length = error.shape[-1]
 
     error_spec = stft(error, grid).transpose(-2, -1)   # [B,T,F], the public model boundary
     far_spec = stft(far_t, grid).transpose(-2, -1)

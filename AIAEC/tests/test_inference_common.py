@@ -5,7 +5,7 @@ import pytest
 import soundfile as sf
 import torch
 
-from AIAEC.inference_common import load_mic_far
+from AIAEC.inference_common import load_linear_error_far, load_mic_far
 
 
 def _write(path, audio, sample_rate):
@@ -60,23 +60,71 @@ def test_different_source_rates_are_rejected(tmp_path):
         )
 
 
-def test_one_frame_tail_mismatch_is_trimmed_before_resampling(tmp_path):
+def test_short_far_tail_is_zero_padded_to_preserve_mic_timeline(tmp_path):
     _write(tmp_path / "mic.wav", np.zeros(48000), 48000)
     _write(tmp_path / "far.wav", np.zeros(47520), 48000)  # 10 ms shorter
-    with pytest.warns(RuntimeWarning, match="tails differ by 10.00 ms"):
+    with pytest.warns(RuntimeWarning, match="zero-padding far"):
         mic, far, _ = load_mic_far(
             str(tmp_path / "mic.wav"), str(tmp_path / "far.wav"), 16000
         )
-    assert mic.shape == far.shape == (1, 15840)
+    assert mic.shape == far.shape == (1, 16000)
+    assert torch.count_nonzero(far[:, -160:]) == 0
 
 
-def test_large_tail_mismatch_is_rejected(tmp_path):
+def test_official_demo_sized_short_far_tail_is_supported(tmp_path):
     _write(tmp_path / "mic.wav", np.zeros(48000), 48000)
-    _write(tmp_path / "far.wav", np.zeros(42000), 48000)
-    with pytest.raises(ValueError, match="exceeding the 100 ms safety limit"):
-        load_mic_far(
+    _write(tmp_path / "far.wav", np.zeros(19200), 48000)  # 600 ms shorter
+    with pytest.warns(RuntimeWarning, match="600.00 ms; zero-padding far"):
+        mic, far, _ = load_mic_far(
             str(tmp_path / "mic.wav"), str(tmp_path / "far.wav"), 16000
         )
+    assert mic.shape == far.shape == (1, 16000)
+    assert torch.count_nonzero(far[:, 6400:]) == 0
+
+
+@pytest.mark.parametrize(
+    ("tail_samples", "tail_ms"),
+    ((11520, "240.00"), (115200, "2400.00")),
+)
+def test_reported_align_ulcnet_tail_mismatches_are_supported(
+    tmp_path, tail_samples, tail_ms
+):
+    # 240 ms at 48 kHz is 11,520 samples; keep the reported 115,200-sample
+    # variant as well so either form of the external demo export is covered.
+    mic_length = 144000
+    _write(tmp_path / "mic.wav", np.zeros(mic_length), 48000)
+    _write(
+        tmp_path / "far.wav",
+        np.zeros(mic_length - tail_samples),
+        48000,
+    )
+    with pytest.warns(
+        RuntimeWarning, match=rf"{tail_ms} ms; zero-padding far"
+    ):
+        mic, far, _ = load_mic_far(
+            str(tmp_path / "mic.wav"), str(tmp_path / "far.wav"), 16000
+        )
+    assert mic.shape == far.shape == (1, 48000)
+
+
+def test_long_far_tail_is_cropped_to_mic_timeline(tmp_path):
+    _write(tmp_path / "mic.wav", np.zeros(48000), 48000)
+    _write(tmp_path / "far.wav", np.zeros(48480), 48000)
+    with pytest.warns(RuntimeWarning, match="cropping far"):
+        mic, far, _ = load_mic_far(
+            str(tmp_path / "mic.wav"), str(tmp_path / "far.wav"), 16000
+        )
+    assert mic.shape == far.shape == (1, 16000)
+
+
+def test_published_16k_error_and_48k_far_can_bypass_linear_aec(tmp_path):
+    _write(tmp_path / "error.wav", np.zeros(16000), 16000)
+    _write(tmp_path / "far.wav", np.zeros(48000), 48000)
+    error, far, rates = load_linear_error_far(
+        str(tmp_path / "error.wav"), str(tmp_path / "far.wav"), 16000
+    )
+    assert rates == (16000, 48000)
+    assert error.shape == far.shape == (1, 16000)
 
 
 def test_stereo_input_is_rejected(tmp_path):

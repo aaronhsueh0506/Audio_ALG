@@ -20,12 +20,6 @@ _RESAMPLE_KWARGS = {
     "beta": 14.769656459379492,
 }
 
-# Capture/export pipelines commonly leave one frame of tail in only one file.
-# Trimming that tail preserves the shared start time and is safe for offline
-# AEC.  A larger mismatch is more likely to mean the wrong pair was supplied.
-_MAX_TAIL_MISMATCH_SECONDS = 0.100
-
-
 def _read_mono(path: str, label: str) -> Tuple[Tensor, int]:
     audio, sample_rate = sf.read(path, dtype="float32", always_2d=False)
     if audio.ndim != 1:
@@ -36,6 +30,56 @@ def _read_mono(path: str, label: str) -> Tuple[Tensor, int]:
     if not torch.isfinite(waveform).all():
         raise ValueError(f"{label} contains NaN or Inf: {path}")
     return waveform, int(sample_rate)
+
+
+def _fit_reference_duration(
+    primary: Tensor,
+    primary_sample_rate: int,
+    reference: Tensor,
+    reference_sample_rate: int,
+    primary_label: str,
+) -> Tensor:
+    """Pad/crop a time-aligned reference to the primary signal's duration."""
+    target_length = int(round(
+        primary.numel() * reference_sample_rate / primary_sample_rate
+    ))
+    difference = reference.numel() - target_length
+    if difference == 0:
+        return reference
+    duration_error_ms = abs(difference) * 1000.0 / reference_sample_rate
+    action = "cropping" if difference > 0 else "zero-padding"
+    warnings.warn(
+        f"{primary_label}/far tails differ by {duration_error_ms:.2f} ms; "
+        f"{action} far to the {primary_label}'s duration",
+        RuntimeWarning,
+        stacklevel=3,
+    )
+    if difference > 0:
+        return reference[:target_length]
+    return torch.nn.functional.pad(reference, (0, -difference))
+
+
+def _resample(waveform: Tensor, source_rate: int, model_rate: int) -> Tensor:
+    if source_rate == model_rate:
+        return waveform
+    return torchaudio.functional.resample(
+        waveform, source_rate, model_rate, **_RESAMPLE_KWARGS
+    )
+
+
+def _match_output_length(primary: Tensor, reference: Tensor) -> Tensor:
+    """Resolve at most one rational-resampler rounding sample."""
+    difference = reference.numel() - primary.numel()
+    if abs(difference) > 1:
+        raise RuntimeError(
+            f"resampled primary/far lengths differ "
+            f"({primary.numel()}/{reference.numel()})"
+        )
+    if difference > 0:
+        return reference[:primary.numel()]
+    if difference < 0:
+        return torch.nn.functional.pad(reference, (0, -difference))
+    return reference
 
 
 def load_mic_far(
@@ -52,8 +96,8 @@ def load_mic_far(
 
     Returns two ``[1, samples]`` CPU tensors plus the original mic/far rates.
     The synchronized source files must use the same rate and represent the
-    same start time. A tail mismatch of at most 100 ms is trimmed before
-    resampling; larger differences are rejected as a likely wrong pair.
+    same start time. The microphone owns the output timeline: a short far-end
+    tail is zero-padded and a long one is cropped before resampling.
     """
     if model_sample_rate <= 0:
         raise ValueError(
@@ -68,41 +112,45 @@ def load_mic_far(
             "aligned pair from the same capture clock"
         )
 
-    source_length_difference = abs(mic.numel() - far.numel())
-    duration_error_seconds = source_length_difference / mic_sr
-    if duration_error_seconds > _MAX_TAIL_MISMATCH_SECONDS + 1e-12:
-        raise ValueError(
-            f"mic/far tails differ by {duration_error_seconds * 1000:.2f} ms "
-            f"({source_length_difference} samples at {mic_sr} Hz), exceeding "
-            f"the {_MAX_TAIL_MISMATCH_SECONDS * 1000:.0f} ms safety limit; "
-            "verify that both files belong to the same aligned capture"
-        )
-    if source_length_difference:
-        common_source_length = min(mic.numel(), far.numel())
-        warnings.warn(
-            f"mic/far tails differ by {duration_error_seconds * 1000:.2f} ms; "
-            f"truncating both to {common_source_length} source samples",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        mic = mic[:common_source_length]
-        far = far[:common_source_length]
-
-    if mic_sr != model_sample_rate:
-        mic = torchaudio.functional.resample(
-            mic, mic_sr, model_sample_rate, **_RESAMPLE_KWARGS
-        )
-    if far_sr != model_sample_rate:
-        far = torchaudio.functional.resample(
-            far, far_sr, model_sample_rate, **_RESAMPLE_KWARGS
-        )
-
-    # Both resamplers saw the same source length. Keep a final min() for the
-    # backend's rational output-length rounding contract.
-    common_length = min(mic.numel(), far.numel())
-    mic = mic[:common_length].unsqueeze(0).contiguous()
-    far = far[:common_length].unsqueeze(0).contiguous()
+    far = _fit_reference_duration(mic, mic_sr, far, far_sr, "mic")
+    mic = _resample(mic, mic_sr, model_sample_rate)
+    far = _resample(far, far_sr, model_sample_rate)
+    far = _match_output_length(mic, far)
+    mic = mic.unsqueeze(0).contiguous()
+    far = far.unsqueeze(0).contiguous()
     return mic, far, (mic_sr, far_sr)
 
 
-__all__ = ["load_mic_far"]
+def load_linear_error_far(
+    linear_error_path: str,
+    far_path: str,
+    model_sample_rate: int,
+) -> Tuple[Tensor, Tensor, Tuple[int, int]]:
+    """Load a precomputed KF/AEC error and far reference for NN-only tests.
+
+    Unlike :func:`load_mic_far`, the source rates may differ: published AEC
+    demos commonly provide a 16 kHz KF residual beside a 48 kHz loopback. The
+    error signal owns the output timeline and both tensors leave at the model
+    rate. This helper deliberately does not claim that the external KF matches
+    the frozen PBFDKF used to train this repository's checkpoints.
+    """
+    if model_sample_rate <= 0:
+        raise ValueError(
+            f"model_sample_rate must be positive, got {model_sample_rate}"
+        )
+    error, error_sr = _read_mono(linear_error_path, "linear error")
+    far, far_sr = _read_mono(far_path, "far")
+    far = _fit_reference_duration(
+        error, error_sr, far, far_sr, "linear error"
+    )
+    error = _resample(error, error_sr, model_sample_rate)
+    far = _resample(far, far_sr, model_sample_rate)
+    far = _match_output_length(error, far)
+    return (
+        error.unsqueeze(0).contiguous(),
+        far.unsqueeze(0).contiguous(),
+        (error_sr, far_sr),
+    )
+
+
+__all__ = ["load_linear_error_far", "load_mic_far"]
