@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Align-CRUSE — AIAEC 候選</title>
+<style>
+body{font-family:-apple-system,"Noto Sans TC",sans-serif;max-width:62em;margin:0 auto;padding:1em 1.2em;line-height:1.55;color:#222;background:#fff}
+nav{font-size:.9em;border-bottom:1px solid #ccc;padding-bottom:.5em;margin-bottom:1em}
+nav a{margin-right:.7em}
+h1{font-size:1.4em}h2{font-size:1.12em;border-bottom:1px solid #ddd;padding-bottom:.15em;margin-top:1.5em}
+pre{background:#f6f7f8;border:1px solid #ddd;padding:.7em;overflow-x:auto;font-size:.8em;line-height:1.35}
+code{background:#f2f3f4;padding:0 .15em}
+table{border-collapse:collapse;font-size:.85em;margin:.6em 0;display:block;overflow-x:auto}
+th,td{border:1px solid #bbb;padding:.22em .5em;text-align:left;white-space:nowrap}
+th{background:#eef0f2}
+.note{background:#fff8e1;border:1px solid #e0c96e;padding:.5em .7em;font-size:.9em;margin:.6em 0}
+@media (prefers-color-scheme:dark){body{background:#151719;color:#ddd}pre,code{background:#1e2124;border-color:#333}th{background:#26292d}th,td{border-color:#444}.note{background:#2a2410;border-color:#6b5c1e}nav{border-color:#333}a{color:#7db3e8}}
+</style>
+</head>
+<body>
+<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_cruse.html"><b>Align-CRUSE</b></a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_gtcrn_aenr.html">GTCRN-AENR</a><a href="aiaec_dfn_aenr.html">DFN-AENR</a></nav>
+<h1>Align-CRUSE（end-to-end AEC+RES+NR，selected）</h1>
+
+<h2>概要</h2>
+<p>Indenbom et al.（arXiv:2208.11308）的 cross-attention 對齊 CRUSE 重建。task
+（<code>dataset_gen/model_views.py</code>）= <code>end_to_end_aec_res_nr_dereverb</code>：
+輸入是<b>未對齊的 microphone 與 far-end 複數頻譜</b>（<code>mic_postclip</code> /
+<code>far_render</code>，前面<b>沒有</b>任何 matched filter 或 linear AEC）；target 是
+<code>near_target</code>。輸出為 real magnitude mask 乘在 mic 頻譜上（保留 mic 相位）。
+本候選早期的 AEC-only 路線已裁撤併入此共同 task。</p>
+<p>16k grid 下 <code>max_delay_frames = 63</code>（<code>delay_frames(1.0)</code>=ceil(62.5)）。
+參數量實測 <b>710,513</b> trainable（論文 ~0.75 M class）。<code>stream_output_delay = 0</code>。
+alignment 有兩個 mode：部署預設 <code>causal_running</code>（逐幀 <code>D[B,T,63]</code>，
+只用過去證據）；<code>paper_global</code>（整段一個 <code>D[B,63]</code>）為整段非因果，
+<code>create_stream_state()</code> 直接 <code>ValueError</code> 拒絕串流。</p>
+<p><b>ONNX / NPU graph boundary</b>（尚無 export 檔；boundary 由 streaming reference 固定）：
+graph <b>內</b> = <code>log_power_feature</code>（square+clamp+log）、causal conv +
+BatchNorm + ELU（<code>mic1..mic4</code> / <code>far1..far2</code>）、alignment 的
+MaxPool(1,4) + Linear query/key + <code>softmax</code>（作用在 cumsum 積分 score 上）、
+GRU(192)、頻率 stride-2 的 <code>ConvTranspose2d(1,3)</code> 解碼、sigmoid mask 與
+<code>mask_gain</code> clamp。graph <b>外</b>（C 前後處理）= centered sqrt-Hann
+STFT/ISTFT 與 complex↔RI（Python reference <code>StreamSTFT/StreamISTFT</code>）。
+所有 recurrent state（conv 史、K/V ring、score 積分、GRU h、幀計數）為顯式 state，
+由 runtime 逐次傳入傳回。</p>
+<div class="note"><b>產品風險（readiness §3.2）</b>：<code>causal_running</code> 的 delay
+score 是<b>無衰減 cumsum 積分器</b>（無限記憶）——長通話下 delay 分佈會凍結、追不上
+echo path 變化；streaming 化本身可行，但長時行為需上板前決策。</div>
+
+<h2>API 用法</h2>
+<pre>from AIAEC.Align_CRUSE.denoise import load_model
+from AIAEC.aiaec_streaming import StreamSTFT, StreamISTFT
+
+model, grid = load_model("ckpt.pth", "cpu")
+state = model.create_stream_state()   # mic1..4 / far1..2 / align / gru
+mic_stft = StreamSTFT(grid.n_fft, grid.hop_len, window)  # sqrt-Hann 512
+far_stft = StreamSTFT(grid.n_fft, grid.hop_len, window)
+synth    = StreamISTFT(grid.n_fft, grid.hop_len, window)
+for s in range(0, n, grid.hop_len):
+    for m, f in zip(mic_stft.push(mic[:, s:s+256]), far_stft.push(far[:, s:s+256])):
+        out = model.forward_stream(m.unsqueeze(1), f.unsqueeze(1), state)
+        samples = synth.push(out.enhanced[:, 0])</pre>
+<pre>python3 AIAEC/Align_CRUSE/streaming.py checkpoint.pth mic.wav far.wav out.wav [--verify] [--device cpu]</pre>
+<p><code>--verify</code> 同時跑 offline whole-utterance forward 並打印 max-abs / RMS 波形差
+（utterance ≥ <code>max_delay_frames</code> hops 時預期 ~1e-5 內；見下方 warm-up caveat）。</p>
+
+<h2>Block diagram</h2>
+<pre>mic ──► StreamSTFT ──► [B,1,257] cplx      far ──► StreamSTFT ──► [B,1,257] cplx
+              │                                        │
+        log_power_feature                        log_power_feature
+              ▼                                        ▼
+  state["mic1"].step (CausalConvBlock 16ch)   state["far1"].step (8ch)
+              ▼                                        ▼
+  state["mic2"].step (40ch)  m2 [B,40,1,65]   state["far2"].step (24ch)  f2 [B,24,1,65]
+              │                                        │
+              └────────► state["align"].step(m2, f2) ◄─┘
+                          (GlobalDelayAttentionCell：K/V ring 63、
+                           score_sum cumsum 積分、frame_index 計數)
+                          │ aligned [B,24,1,65], delay [B,63]
+              ┌───────────┘
+              ▼ cat(m2, aligned) [B,64,1,65]
+  state["mic3"].step (72ch) → state["mic4"].step (32ch)  m4 [B,32,1,17]
+              ▼ reshape [B,1,544]
+  state["gru"].step (GRU 192) → gru_out (Linear) → [B,32,1,17]
+              ▼ (+ skip4/3/2/1 各 1x1 conv)
+  up3 → up2 → up1 (FrequencyTransposeBlock, 1x3 stride-2 freq, time kernel 1)
+              ▼
+  mask_up → sigmoid → mask·mask_gain.clamp_min(0)  mask [B,1,257] float
+              ▼
+  enhanced = microphone × mask ──► StreamISTFT ──► 256 samples</pre>
+
+<h2>訊號泳道圖</h2>
+<pre>hop（256 smp = 16 ms @16k）  h0          h1                h2         h3       …  flush
+caller（送樣本）             mic/far 256  256               256        256         —
+C pre：StreamSTFT×2          0 幀        F0+F1（reflect    F2         F3          尾幀
+（centered sqrt-Hann）                    前綴湊滿後補發）
+NN：forward_stream           —           out(F0), out(F1)  out(F2)    out(F3)     每尾幀 1 out
+（delay 0；同 invocation 出幀）
+C post：StreamISTFT          —           out(F0)→0 smp     256 smp    256 smp     尾段補齊
+（WOLA + 半窗 trim）                      out(F1)→256 smp
+輸出樣本對應輸入區間         —           [0,256)           [256,512)  [512,768)
+hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本身 0 hop。</pre>
+
+<h2>I/O 表</h2>
+<p>Streaming（每 invocation 恰 1 幀 = 256 個新 samples；<code>streaming.py</code>
+開機打印之實測，B=1、16k）：</p>
+<table>
+<tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
+<tr><td>microphone</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far_end</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>enhanced</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>mask（real magnitude）</td><td>out</td><td>(1, 1, 257)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>delay_distribution</td><td>out</td><td>(1, 1, 63)</td><td>float32</td><td>1</td><td>—</td></tr>
+</table>
+<p>Offline <code>forward(microphone, far_end)</code>：complex <code>[B,T,257]</code> in/out；
+<code>causal_running</code> 時 delay 為 <code>[B,T,63]</code>、<code>paper_global</code> 時為
+<code>[B,63]</code>（test：<code>test_align_cruse_paper_global_mode_is_explicitly_available</code>）。</p>
+
+<h2>State 表</h2>
+<p><code>state_report</code> 實測（B=1 fp32，total <b>519.6 KB</b>）。部署契約：顯式
+state I/O，NPU runtime／host 保存；STFT/ISTFT 狀態屬 C struct 層：</p>
+<table>
+<tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
+<tr><td>align.key_ring</td><td>(1, 64, 63, 1)</td><td>15.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>align.value_ring</td><td>(1, 24, 63, 65)</td><td>383.9 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>align.score_sum（cumsum 積分器）</td><td>(1, 63)</td><td>0.2 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>align.frame_index（絕對幀計數）</td><td>scalar int（非 tensor）</td><td>—</td><td>host／C 端計數器</td></tr>
+<tr><td>mic1.history</td><td>(1, 1, 3, 257)</td><td>3.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>mic2.history</td><td>(1, 16, 3, 129)</td><td>24.2 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>mic3.history</td><td>(1, 64, 3, 65)</td><td>48.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>mic4.history</td><td>(1, 72, 3, 33)</td><td>27.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>far1.history</td><td>(1, 1, 3, 257)</td><td>3.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>far2.history</td><td>(1, 8, 3, 129)</td><td>12.1 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>gru.hidden</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td><b>NN 合計</b></td><td></td><td><b>519.6 KB</b></td><td></td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>C struct（Python reference：host）</td></tr>
+</table>
+
+<h2>延遲與 warm-up</h2>
+<ul>
+<li>NN 演算法 lookahead = <b>0 hop</b>；framing 半窗 256 samples（16 ms）。</li>
+<li><b>T ≥ D caveat</b>（forward_stream docstring 明文）：offline 用<b>最終 utterance 長度
+T</b> 做 <code>arange(D) &lt; T</code> 的 observable mask，stream 無法預知 T，因此假設
+T ≥ D。utterance ≥ 63 hops（1 s @16k）時<b>每一幀</b>（含前 63 幀）精確等價：實測
+T=90 全幀 stream-vs-offline enhanced 4.9e-7 / mask 1.8e-7 / delay 3.3e-7（ATOL 釘 5e-6）。
+整段 &lt; 63 幀的短檔<b>刻意發散</b>：專屬測試 T=30 差 &gt; 1e-3
+（<code>test_short_utterance_below_delay_window_differs</code>；readiness 實測 1.18e-2）。</li>
+<li><code>paper_global</code> checkpoint 不可串流，必須以 <code>causal_running</code> 重訓。</li>
+<li>startup 前 D 幀的 softmax 含未觀測（score=0）delay 候選——這是 offline 訓練語意
+本身，非 streaming 造成（readiness §3.2）。</li>
+</ul>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>AIAEC/Align_CRUSE/model.py</code>（<code>AlignCRUSE</code>）；<code>AIAEC/aiaec_common.py</code>（<code>GlobalDelayAttention</code>）；<code>AIAEC/aiaec_streaming.py</code>（<code>GlobalDelayAttentionCell</code>）</li>
+<li><code>AIAEC/Align_CRUSE/streaming.py</code>、<code>denoise.py</code>、<code>train.py</code>、<code>config.ini</code></li>
+<li>tests：<code>AIAEC/tests/test_streaming_align_cruse.py</code>（5 tests：等價/can-fail/短檔 caveat/paper_global 拒絕/fresh-state）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 122 passed（2026-08-13 實測）</li>
+<li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.2</li>
+</ul>
+</body>
+</html>

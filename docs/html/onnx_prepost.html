@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ONNX / NPU 邊界現況（AINR + AIAEC 全模型）</title>
+<style>
+body{font-family:system-ui,-apple-system,"PingFang TC","Noto Sans TC",sans-serif;
+     max-width:74rem;margin:0 auto;padding:1rem 1.2rem;line-height:1.55;
+     color:#1c1c1c;background:#fdfdfd}
+@media (prefers-color-scheme:dark){body{color:#ddd;background:#161616}
+  a{color:#7ab8ff}nav,td,th,pre{border-color:#444 !important}
+  th{background:#242424 !important}pre{background:#1e1e1e !important}}
+nav{font-size:.85rem;border-bottom:1px solid #ccc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.35rem;white-space:nowrap}
+h1{font-size:1.45rem}h2{font-size:1.15rem;margin-top:1.6rem}
+table{border-collapse:collapse;width:100%;font-size:.84rem;margin:.6rem 0}
+th,td{border:1px solid #bbb;padding:.28rem .5rem;text-align:left;vertical-align:top}
+th{background:#f0f0f0}
+pre{background:#f5f5f5;border:1px solid #ddd;padding:.6rem;overflow-x:auto;
+    font-size:.8rem;line-height:1.35}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
+.note{font-size:.85rem;opacity:.85}
+.tbl{overflow-x:auto}
+.y{color:#0a7a2f;font-weight:600}.n{color:#b3541e;font-weight:600}
+@media (prefers-color-scheme:dark){.y{color:#5fd08a}.n{color:#f0a06a}}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html">索引</a> ·
+<a href="conventions.html">慣例</a> ·
+<a href="onnx_prepost.html"><b>ONNX 邊界</b></a> ·
+<a href="aec.html">AEC</a> ·
+<a href="nr.html">NR</a> ·
+<a href="audio_common.html">audio_common</a> ·
+<a href="pipeline_mono.html">mono</a> ·
+<a href="pipeline_ulcnet_mono.html">mono-ULCNet</a> ·
+<a href="pipeline_4ch.html">4ch</a> ·
+<a href="pipeline_ulcnet_4ch.html">4ch-ULCNet</a> ·
+<a href="ainr_dfn2.html">DFN2</a> ·
+<a href="ainr_dfn3.html">DFN3</a> ·
+<a href="ainr_gtcrn.html">GTCRN</a> ·
+<a href="ainr_rnnoise_erb.html">RNNoise-ERB</a> ·
+<a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
+<a href="aiaec_align_cruse.html">Align-CRUSE</a> ·
+<a href="aiaec_deepvqe_s.html">DeepVQE-S</a> ·
+<a href="aiaec_cagcrn.html">CAGCRN</a> ·
+<a href="aiaec_gtcrn_aenr.html">GTCRN-AENR</a> ·
+<a href="aiaec_dfn_aenr.html">DFN-AENR</a>
+</nav>
+
+<h1>ONNX / NPU 邊界現況（AINR + AIAEC 全模型）</h1>
+
+<h2>概要</h2>
+<p>「ONNX 邊界」= 匯出圖（NPU 跑的部分）裡有什麼、C 前後處理做什麼、
+runtime 要替模型跨呼叫保存哪些顯式 states。現況（對照當前程式碼）：</p>
+<ul>
+<li><b>已有 C 前後處理</b>：AINR 四個模型全部
+（<code>dfn2_process.c</code> / <code>dfn3_process.c</code> /
+<code>gtcrn_process.c</code> / RNNoise-ERB <code>process.c</code>）+
+AIAEC 的 Align-ULCNet（<code>ulcnet_process.c</code>）。</li>
+<li><b>尚無 C 前後處理</b>：Align-CRUSE、DeepVQE-S、CAGCRN（純 Python）；
+GTCRN-AENR（STFT/ISTFT 可直接重用 AINR 的 <code>gtcrn_process.c</code>，同 grid
+且該 C 無模型特定 state）；DFN-AENR（需 <code>dfn2_process</code> 的雙倍 state
+擴充，見下）。</li>
+<li><b>in-repo ONNX 匯出腳本只有一個</b>：RNNoise-ERB 的
+<code>export_onnx.py</code>。其餘模型的 explicit-state NPU 匯出屬後續工作
+（readiness 文件 §5 的 Phase 4）；六個 AIAEC 候選已有
+<code>create_stream_state()</code>/<code>forward_stream()</code> Python
+frame-by-frame reference + <code>streaming.py</code> CLI，定義 state/I-O contract。</li>
+</ul>
+
+<h2>永遠在 graph 之外的東西</h2>
+<table>
+<tr><th>項目</th><th>誰負責</th><th>依據</th></tr>
+<tr><td>STFT / ISTFT（WOLA、窗、overlap 簿記）</td>
+<td>C 前後處理（各 <code>*_process.c</code>；FFT 走 audio_common
+<code>fft_wrapper.h</code>）</td>
+<td>所有模型的部署邊界皆是「頻譜/特徵進、頻譜/增益出」；
+torch STFT 不進圖</td></tr>
+<tr><td>跨呼叫 state 保存（GRU hidden、K/V ring、conv cache、feature ring）</td>
+<td>NPU runtime：states 做成 graph 的顯式輸入/輸出張量，由 runtime
+每幀帶進帶出</td>
+<td><code>ulcnet_process.h</code> NPU callback 邊界；
+<code>export_onnx.py</code>（h1–h3 顯式 I/O）；readiness 文件 §2 各模型 state 主項</td></tr>
+<tr><td>Delay 狀態機（ACQUIRE/LOCKED、flush ring、fail-open、reset/crossfade）</td>
+<td>pipeline 層；訊號 seam 是 AEC C 的 <code>aec_get_linear_context()</code>
+（<code>AecLinearContext.delay_state</code>：NONE/COMPENSATED/CHANGED；
+CHANGED → <code>model-&gt;reset()</code>）</td>
+<td><code>aec.h:628-641</code>、<code>audio_pipeline_ulcnet.h</code> Delay events、
+設計文件 §8</td></tr>
+<tr><td>PBFDKF 線性 AEC frontend（AIAEC 全部候選的輸入是線性誤差）</td>
+<td>AEC C（<code>lib/aec</code>）；dataset 端已把 PBFDKF 物化成資料通道</td>
+<td><code>GTCRN_AENR/config.ini</code>［data］註解、pipeline 標頭</td></tr>
+<tr><td>DFN 族的特徵 EMA 正規化與 compose（mask 展開、DF FIR、band split/blend、
+atten_lim、post-filter）</td>
+<td>C 前後處理（graph 只含 heads）</td>
+<td><code>dfn2_process.h</code>/<code>dfn3_process.h</code> 檔頭邊界圖</td></tr>
+</table>
+<p class="note">例外方向的備註：Align-ULCNet 的 signed |x|^0.3 壓縮/解壓縮
+<b>在 graph 內</b>（<code>model.py _signed_power</code>）；若目標 runtime 不支援
+pow 類算子，<code>ulcnet_compress_frame()</code>/<code>ulcnet_expand_frame()</code>
+可把這步移到 C——但邊界移動必須連 export graph 一起改，兩邊一致。</p>
+
+<h2>AINR 模型狀態表</h2>
+<div class="tbl">
+<table>
+<tr><th>模型</th><th>grid</th><th>C 前後處理（今日）</th><th>graph 內（部署邊界）</th>
+<th>runtime 跨呼叫 states</th><th>備註</th></tr>
+<tr><td><a href="ainr_dfn2.html">DFN2</a></td><td>48k 1024/512</td>
+<td class="y">有：<code>dfn2_process.c/h</code>（STFT、ERB+complex 特徵含 EMA、
+compose、ISTFT；串流入口 <code>dfn2_compose_stream()</code>）</td>
+<td>只有 heads：(feat_erb[32], feat_spec[2×96]) → (erb_mask[32],
+coefs[96×5×2], alpha)</td>
+<td>網路內部 conv cache/GRU hidden 的 explicit-state 化<b>未交付</b>（匯出腳本
+不在 repo）；C 端 state = <code>DFN2State</code>（EMA ×2、DF ring 5 幀、
+hi_delay、OLA）</td>
+<td>串流 head-to-audio 延遲 = MASK_LOOKAHEAD+DF_LOOKAHEAD = 2 幀
+（cascade，21.3 ms @48k）</td></tr>
+<tr><td><a href="ainr_dfn3.html">DFN3</a></td><td>48k 1024/512</td>
+<td class="y">有：<code>dfn3_process.c/h</code>（同上；<code>dfn3_compose_stream()</code>）</td>
+<td>只有 heads：(feat_erb[32], feat_spec[2×96]) → (erb_mask[32], coefs[96×5×2])
+（無 alpha）</td>
+<td>同 DFN2（匯出未交付）；C 端 <code>DFN3State</code>（無 alpha_ring）</td>
+<td>平行 band split：DF 未來 tap 讀 raw spectrum → 總延遲 max(1,1)=1 hop
+（10.67 ms @48k），不像 DFN2 相加</td></tr>
+<tr><td><a href="ainr_gtcrn.html">GTCRN</a></td><td>16k 512/256</td>
+<td class="y">有：<code>gtcrn_process.c/h</code>——<b>只有 STFT/ISTFT</b>
+（<code>GTCRNProcessState</code> 僅 analysis/synthesis buf + 窗 + scratch）</td>
+<td>複數頻譜進、複數頻譜出：兩張譜之間（特徵、ERB merge/split、SFE、conv、
+DPGRNN、CRM）全在網路</td>
+<td>上游 N=1 streaming 參考的 cache layout：conv_cache (2,1,16,16,33)、
+tra_cache (2,3,1,1,16)、inter_cache (2,1,33,16)，合計 ≈70 KB fp32
+（<code>AINR/gtcrn_github/stream/gtcrn_stream.py:321-326</code>）</td>
+<td>匯出腳本不在 repo；≈33.5 MMAC/s 級（AENR 變體實測值，骨幹同級）</td></tr>
+<tr><td><a href="ainr_rnnoise_erb.html">RNNoise-ERB</a></td><td>16k 512/256</td>
+<td class="y">有：<code>process.c/h</code>（STFT、log-ERB mean-norm +
+0–4 kHz complex unit-norm 特徵、3 幀特徵 ring、band→bin gain、atten_lim、ISTFT）</td>
+<td><b>唯一 in-repo 匯出</b>（<code>export_onnx.py</code>）：輸入
+erb (1,3,22)、spec (1,3,2,129)、h1/h2/h3 (1,1,gru_size)；輸出
+gains (22) + 三個 hidden。gru_size 由 checkpoint 決定（config 預設 128）</td>
+<td>h1–h3（3 層 GRU hidden）；C 端 state = <code>RNNoiseState</code>
+（EMA ×2、erb/spec 特徵 ring 3 幀、OLA）</td>
+<td>lookahead 1 幀（RNNOISE_LOOKAHEAD=1，CONV_DELAY=2−1=1）</td></tr>
+</table>
+</div>
+
+<h2>AIAEC 模型狀態表</h2>
+<div class="tbl">
+<table>
+<tr><th>模型</th><th>grid</th><th>C 前後處理（今日）</th><th>graph 內（部署邊界）</th>
+<th>runtime 跨呼叫 states</th><th>備註 / 阻礙</th></tr>
+<tr><td><a href="aiaec_align_ulcnet.html">Align-ULCNet</a></td><td>16k 512/256</td>
+<td class="y">有：<code>ulcnet_process.c/h</code>（centered sqrt-Hann STFT ×2
+（error/far）、WOLA、<code>UlcnetModel</code> per-frame callback 邊界；
+audio_common FFT，零 heap）</td>
+<td>(error_ri, far_ri, states) → enhanced_ri：壓縮 |x|^0.3、attention 對齊、
+subband GRU、解壓縮<b>全在 graph 內</b></td>
+<td>far K/V ring 各 [D,32,26]（D=64 hard-code @16k/512）、attention logit 史
+4 幀、2×2 層 subband GRU hidden（共 ≈2.0 KB）</td>
+<td>唯一已有 C 的候選；C↔Python parity float-ULP 級（~1e-5 abs @512 點；
+Python reference 對 torch bit-exact）；streaming 等價實測 ≤5.6e-9；
+演算法 lookahead 0；匯出腳本未交付（Phase 4）</td></tr>
+<tr><td><a href="aiaec_align_cruse.html">Align-CRUSE</a></td><td>16k 512/256</td>
+<td class="n">無（純 Python）</td>
+<td>—（部署邊界未定；streaming Python reference 已定義 state contract）</td>
+<td>GRU 192、K/V ring 63、<b>cumsum accumulator + 絕對幀計數</b></td>
+<td>語意風險：cumsum 無衰減積分器（無限記憶，長通話 delay 分佈凍結）；
+<code>paper_global</code> mode 整段非因果，該 checkpoint 不可 streaming；
+&lt;63 幀短檔與 offline 不一致（T=30 差 1.18e-2），≥63 幀全幀 ≤5e-6</td></tr>
+<tr><td><a href="aiaec_deepvqe_s.html">DeepVQE-S</a></td><td>16k 512/256</td>
+<td class="n">無（純 Python）</td>
+<td>—（同上）</td>
+<td>GRU 192、K/V ring 63、score 史 4 幀、CCM 用過去 2 幀 raw complex 譜</td>
+<td>時間軸最乾淨（prefix 一致 ≤1.1e-6）；輸出是 3×3 complex convolving mask
+（9 complex MAC/bin），不是 ratio mask；[B,C,T,D,F] broadcast 須逐幀化</td></tr>
+<tr><td><a href="aiaec_cagcrn.html">CAGCRN</a></td><td>16k 512/256</td>
+<td class="n">無（純 Python）</td>
+<td>—（同上）</td>
+<td>per-bin time-GRU 25×24×2 = 1,200 floats、CATA delay ring 63</td>
+<td>NPU op 面最重：CATA 逐幀化後單幀仍 ~74k 元素中間張量；
+ConvTranspose2d 動態 output_size 須固定；prefix 一致 ≤1.9e-7</td></tr>
+<tr><td><a href="aiaec_gtcrn_aenr.html">GTCRN-AENR</a></td><td>16k 512/256（鎖死）</td>
+<td class="n">無自己的 C；<b>STFT/ISTFT 直接重用 AINR <code>gtcrn_process.c</code></b>
+（同 grid，且該 C 無模型特定 state）</td>
+<td>複數頻譜（error+far 18 ch 進第一層）→ CRM；骨幹與 AINR GTCRN 相同</td>
+<td>與上游 stream 參考完全同 layout：conv_cache/tra_cache/inter_cache ≈70 KB fp32</td>
+<td>唯一改動 = 第一層 conv in_channels 9→18；48k 直接 raise；
+實測 ≈0.535 MMAC/frame ≈ 33.5 MMAC/s @16k</td></tr>
+<tr><td><a href="aiaec_dfn_aenr.html">DFN-AENR</a></td><td>48k 1024/512
+（16k 變體 512/256, df_bins=64）</td>
+<td class="n">無；C 骨架存在但是<b>單輸入版</b>（<code>dfn2_compose_stream</code> +
+<code>DFN2State</code>）。AENR 化需<b>雙倍 state 擴充</b>：error/far 各自獨立的
+ERB+spec EMA 正規化 state（<code>dataset_gen/model_views.py:134-138</code>
+拒絕共用）+ 兩個 1×1 conditioner</td>
+<td>heads 邊界同 DFN2（輸入 5 tensors；<code>error_spec</code>/<code>far_spec</code>
+是 DF feature、真頻譜叫 <code>linear_error</code>——命名陷阱）</td>
+<td>GRU 5×256、DF ring 5 幀、df_convp 4 幀 c0（96 KB）、EMA 共 256 floats
+（error/far 兩源各 32 ERB + 96 spec）</td>
+<td>lookahead 2 hops（mask 1 + DF 1 cascade；16k=32 ms、48k=21.3 ms），
+要 1 hop 須 df_lookahead=0 重訓；全 repo 唯一 normalized=True STFT；
+≈310.6 MMAC/s @48k（GRU 佔 59%）</td></tr>
+</table>
+</div>
+
+<h2>相關檔案與測試路徑</h2>
+<table>
+<tr><th>類別</th><th>路徑</th></tr>
+<tr><td>C 前後處理</td><td><code>AINR/DeepFilterNet2/dfn2_process.c/h</code>、
+<code>AINR/DeepFilterNet3/dfn3_process.c/h</code>、<code>AINR/GTCRN/gtcrn_process.c/h</code>、
+<code>AINR/RNNoise-ERB/process.c/h</code>、<code>AIAEC/Align_ULCNet/ulcnet_process.c/h</code>、
+共用 <code>AINR/dfn_process_common.h</code></td></tr>
+<tr><td>ONNX 匯出</td><td><code>AINR/RNNoise-ERB/export_onnx.py</code>（唯一 in-repo）</td></tr>
+<tr><td>Streaming reference</td><td><code>AIAEC/aiaec_streaming.py</code>、各模型
+<code>streaming.py</code> + <code>create_stream_state()</code>/<code>forward_stream()</code>、
+<code>AINR/gtcrn_github/stream/gtcrn_stream.py</code></td></tr>
+<tr><td>查證文件</td><td><code>docs/aiaec_streaming_readiness_zh_TW.md</code>（2026-08-13
+逐行讀碼+實測）、<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code></td></tr>
+<tr><td>測試</td><td><code>AIAEC/tests/test_ulcnet_process_c.py</code>（C↔Python 逐幀）、
+<code>AIAEC/tests/test_streaming_*.py</code>（六模型等價/can-fail/fresh-state）、
+<code>AINR/tests/test_c_prepost.c</code>、<code>AINR/RNNoise-ERB/tests/</code>
+（feature contract / Python↔C features；C 端 tables/SIMD 測試由其 Makefile 建置：
+test_rnnoise_tables、test_rnnoise_simd_*）、
+<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code>、
+<code>AINR/DeepFilterNet3/tests/test_dfn3_contract.py</code></td></tr>
+</table>
+
+</body>
+</html>

@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GTCRN-AENR — AIAEC 候選</title>
+<style>
+body{font-family:-apple-system,"Noto Sans TC",sans-serif;max-width:62em;margin:0 auto;padding:1em 1.2em;line-height:1.55;color:#222;background:#fff}
+nav{font-size:.9em;border-bottom:1px solid #ccc;padding-bottom:.5em;margin-bottom:1em}
+nav a{margin-right:.7em}
+h1{font-size:1.4em}h2{font-size:1.12em;border-bottom:1px solid #ddd;padding-bottom:.15em;margin-top:1.5em}
+pre{background:#f6f7f8;border:1px solid #ddd;padding:.7em;overflow-x:auto;font-size:.8em;line-height:1.35}
+code{background:#f2f3f4;padding:0 .15em}
+table{border-collapse:collapse;font-size:.85em;margin:.6em 0;display:block;overflow-x:auto}
+th,td{border:1px solid #bbb;padding:.22em .5em;text-align:left;white-space:nowrap}
+th{background:#eef0f2}
+.note{background:#fff8e1;border:1px solid #e0c96e;padding:.5em .7em;font-size:.9em;margin:.6em 0}
+@media (prefers-color-scheme:dark){body{background:#151719;color:#ddd}pre,code{background:#1e2124;border-color:#333}th{background:#26292d}th,td{border-color:#444}.note{background:#2a2410;border-color:#6b5c1e}nav{border-color:#333}a{color:#7db3e8}}
+</style>
+</head>
+<body>
+<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_gtcrn_aenr.html"><b>GTCRN-AENR</b></a><a href="aiaec_dfn_aenr.html">DFN-AENR</a></nav>
+<h1>GTCRN-AENR（linear AEC → RES+NR，project variant）</h1>
+
+<h2>概要</h2>
+<p>以審計過的 <code>AINR/GTCRN</code>（Xiaobin Rong et al., INTERSPEECH 2024）為骨幹的
+<b>project variant</b>——不是作者的 AEC 論文/checkpoint，報告時必須標示
+「GTCRN-AENR project variant」。task（<code>dataset_gen/model_views.py</code>）=
+<code>linear_aec_postfilter_res_nr_dereverb</code>：輸入是凍結 PBFDKF 的
+<code>linear_error</code>（= <code>mic_postclip − D_hat</code>）與未對齊 <code>far_end</code>；
+target 是 <code>near_target</code>。唯一拓撲改動是第一個 conv：一路頻譜的
+<code>[mag,re,im]</code>+SFE 是 9 通道，error+far 兩路 → <code>en_convs[0]</code> in_channels
+9→18；其後 ERB、SFE、group temporal conv、TRA、兩個 DPGRNN、decoder、CRM 完全沿用。</p>
+<p><b>Grid 鎖死 16 kHz / 512/512/256</b>：以 48k grid 建構直接
+<code>ValueError</code>（test：<code>test_gtcrn_aenr_rejects_non_upstream_grid</code>）。
+參數量實測 <b>24,389</b> trainable + <b>24,576</b> frozen ERB 參數（requires_grad=False）。
+<code>stream_output_delay = 0</code>。</p>
+<p><b>ONNX / NPU graph boundary</b>（尚無 export 檔；boundary 由 streaming reference 固定）：
+graph <b>內</b> = <code>_three_features</code>（mag/re/im）、<code>erb.bm/bs</code>（ERB matmul）、
+SFE、ConvBlock、GT block（depthwise dilated conv + TRA attention GRU +
+sigmoid gate）、DPGRNN（<b>頻率軸 bidirectional intra GRU</b> 每幀獨立 + 時間軸
+inter GRU ×2）、decoder GT blocks（stride-1 depthwise <code>ConvTranspose2d</code>——
+streaming/export 時以 <code>_deconv_as_causal_conv</code> 轉成 kernel 翻轉的等價因果
+conv，權重轉換期恆等式）、CRM 套用（<code>self.mask</code>）。graph <b>外</b>（C 前後處理）=
+PBFDKF linear AEC（AEC C seam）、centered sqrt-Hann STFT/ISTFT 與 complex↔RI。
+recurrent state 全為顯式 I/O tensor。</p>
+<div class="note">上游已有 N=1 streaming 參考：<code>AINR/gtcrn_github/stream/gtcrn_stream.py</code>
+的 cache layout（<code>conv_cache (2,1,16,16,33)</code> / <code>tra_cache (2,3,1,1,16)</code> /
+<code>inter_cache (2,1,33,16)</code>，合計 ≈70 KB fp32）；AENR 變體 layout 完全對應
+（本頁 State 表實測 70.5 KB）。移植坑：<code>AINR/GTCRN/model.py</code> 的 GRNN zeros
+初始 hidden 未帶 dtype，<code>double()</code>/fp16 路徑會 dtype mismatch。</div>
+
+<h2>API 用法</h2>
+<pre>from AIAEC.GTCRN_AENR.denoise import load_model
+from AIAEC.aiaec_streaming import StreamSTFT, StreamISTFT
+from AIAEC.training_common import LinearAecEngine
+
+model, grid, linear_contract = load_model("ckpt.pth", "cpu")
+linear_aec = LinearAecEngine(n_lanes=1, sample_rate=grid.sr, contract=linear_contract)
+error, _echo_estimate = linear_aec(mic, far, grid.sr)   # streaming.py 中整檔 offline
+state = model.create_stream_state()      # 16 cells（見 State 表）
+stft_err = StreamSTFT(grid.n_fft, grid.hop_len, window)
+stft_far = StreamSTFT(grid.n_fft, grid.hop_len, window)
+istft    = StreamISTFT(grid.n_fft, grid.hop_len, window)
+for s in range(0, n, grid.hop_len):
+    for e, f in zip(stft_err.push(error[:, s:s+256]), stft_far.push(far[:, s:s+256])):
+        out = model.forward_stream(linear_error=e.unsqueeze(1),
+                                   far_end=f.unsqueeze(1), state=state)
+        samples = istft.push(out.enhanced[:, 0])</pre>
+<pre>python3 AIAEC/GTCRN_AENR/streaming.py checkpoint.pth mic.wav far.wav out.wav [--verify] [--device cpu]</pre>
+
+<h2>Block diagram</h2>
+<pre>mic ─► LinearAecEngine(PBFDKF, frozen) ─► linear_error      far ────────────┐
+              │                                                             │
+              ▼                                                             ▼
+        StreamSTFT ─► [B,1,257] cplx                          StreamSTFT ─► [B,1,257] cplx
+              │ _three_features → erb.bm → sfe（9ch）               │ 同左（9ch）
+              └──────────────► cat dim=1（18ch）◄───────────────────┘
+                                    ▼
+  encoder.en_convs[0]（ConvBlock 18→16, (1,5), stride (1,2)）  skip0
+  encoder.en_convs[1]（ConvBlock）                             skip1
+  _gt_conv_block_step(en_convs[2..4], enc_gtN_depth/enc_gtN_tra)  skip2..4
+  （GT block：depthwise dilated (3,3)，dilation 1/2/5 → 保留 2/4/10 幀輸入史；
+    TRA：att_gru hidden + att_fc + sigmoid gate）
+                                    ▼ [B,16,1,33]
+  _dpgrnn_step(dpgrnn1, inter_a/inter_b) → _dpgrnn_step(dpgrnn2, …)
+  （intra：頻率軸 BiGRU 每幀；inter：時間軸 GRU ×2，hidden per-bin (1,33,8)）
+                                    ▼
+  _gt_conv_block_step(decoder.de_convs[0..2] + skips，dec_gtN_depth/dec_gtN_tra)
+  （stride-1 depthwise ConvTranspose2d 經 _deconv_as_causal_conv 流式化）
+  decoder.de_convs[3](+skip1) → decoder.de_convs[4](+skip0) = mask_erb [B,2,1,129]
+                                    ▼
+  erb.bs(mask_erb) = mask_full → self.mask(mask_full, [err.re, err.im])
+                                    ▼
+  enhanced [B,1,257] cplx ──► StreamISTFT ──► 256 samples</pre>
+
+<h2>訊號泳道圖</h2>
+<pre>hop（256 smp = 16 ms @16k）  h0          h1                h2         h3       …  flush
+caller（送樣本）             mic/far 256  256               256        256         —
+C pre：PBFDKF error +        0 幀        F0+F1（reflect    F2         F3          尾幀
+StreamSTFT×2（err/far）                   前綴湊滿後補發）
+NN：forward_stream           —           out(F0), out(F1)  out(F2)    out(F3)     每尾幀 1 out
+（delay 0；同 invocation 出幀）
+C post：StreamISTFT          —           out(F0)→0 smp     256 smp    256 smp     尾段補齊
+                                          out(F1)→256 smp
+輸出樣本對應輸入區間         —           [0,256)           [256,512)  [512,768)
+hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本身 0 hop。
+（streaming.py 中 PBFDKF 為整檔 offline；產品端 PBFDKF 本身即逐 hop C 引擎。）</pre>
+
+<h2>I/O 表</h2>
+<p>Streaming（每 invocation 恰 1 幀 = 256 個新 samples；<code>streaming.py</code>
+開機打印之實測，B=1）：</p>
+<table>
+<tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
+<tr><td>linear_error</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far_end</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>enhanced</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>mask（複數 CRM，全頻）</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>—</td></tr>
+<tr><td>aux erb_complex_mask</td><td>out</td><td>(1, 2, 1, 129)</td><td>float32</td><td>1</td><td>—</td></tr>
+</table>
+<p>Offline <code>forward(linear_error, far_end)</code>：complex <code>[B,T,257]</code> in/out。
+無 delay_distribution（本模型沒有顯式 alignment 模組——依賴 GT block 的時間感受野）。</p>
+
+<h2>State 表</h2>
+<p><code>state_report</code> 實測（B=1 fp32，total <b>70.5 KB</b>——六候選中最小）。部署
+契約：顯式 state I/O，由 NPU runtime／host 保存；與上游 stream 參考的
+conv_cache/tra_cache/inter_cache layout 一一對應：</p>
+<table>
+<tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
+<tr><td>enc_gt1..3_depth.history（dilation 1/2/5）</td><td>(1,16,2,33) / (1,16,4,33) / (1,16,10,33)</td><td>4.1 / 8.2 / 20.6 KB</td><td>NPU runtime（≙ 上游 conv_cache）</td></tr>
+<tr><td>dec_gt1..3_depth.history（dilation 5/2/1）</td><td>(1,16,10,33) / (1,16,4,33) / (1,16,2,33)</td><td>20.6 / 8.2 / 4.1 KB</td><td>NPU runtime（≙ 上游 conv_cache）</td></tr>
+<tr><td>enc_gt1..3_tra.hidden / dec_gt1..3_tra.hidden</td><td>(1, 1, 16) ×6</td><td>0.1 KB ×6</td><td>NPU runtime（≙ 上游 tra_cache）</td></tr>
+<tr><td>dpgrnn1/2_inter_a/b.hidden（per-bin）</td><td>(1, 33, 8) ×4</td><td>1.0 KB ×4</td><td>NPU runtime（≙ 上游 inter_cache）</td></tr>
+<tr><td><b>NN 合計</b></td><td></td><td><b>70.5 KB</b></td><td></td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>C struct（Python reference：host）</td></tr>
+<tr><td>PBFDKF</td><td>—</td><td>—</td><td>AEC C 端 static pool</td></tr>
+</table>
+<p>decoder 的流式化權重（<code>_deconv_as_causal_conv</code> 翻轉 kernel）在
+<code>create_stream_state()</code> 時一次性轉換，屬權重表非 runtime state。</p>
+
+<h2>延遲與 warm-up</h2>
+<ul>
+<li>NN 演算法 lookahead = <b>0 hop</b>；zero-init ≡ offline 左零 padding
+（<code>F.pad</code> 左補），<b>無 warm-up 特例</b>。</li>
+<li>實測 stream-vs-offline：96 隨機幀 max-abs 1.1e-6（enhanced/mask/erb_complex_mask），
+TOL 釘 2e-5（<code>test_streaming_gtcrn_aenr.py</code> 檔頭：float 累加噪音，非 layout 錯）。</li>
+<li>Framing：center=True → 半窗 256 samples（16 ms）lookahead；端到端演算法延遲 256
+samples。</li>
+<li>運算量實測 ≈0.535 MMAC/frame ≈ 33.5 MMAC/s @16k（readiness §3.5）。</li>
+</ul>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>AIAEC/GTCRN_AENR/model.py</code>（<code>GTCRNAENR</code>、<code>_deconv_as_causal_conv</code>、<code>_gt_conv_block_step</code>、<code>_dpgrnn_step</code>）；骨幹 <code>AINR/GTCRN/model.py</code></li>
+<li><code>AIAEC/GTCRN_AENR/streaming.py</code>、<code>denoise.py</code>、<code>train.py</code>、<code>config.ini</code></li>
+<li>上游 stream 參考：<code>AINR/gtcrn_github/stream/gtcrn_stream.py</code></li>
+<li>tests：<code>AIAEC/tests/test_streaming_gtcrn_aenr.py</code>（4 tests）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 122 passed（2026-08-13 實測）</li>
+<li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.5</li>
+</ul>
+</body>
+</html>

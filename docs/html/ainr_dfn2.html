@@ -1,0 +1,203 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AINR DeepFilterNet2</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
+nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.7rem}
+h1{font-size:1.45rem;margin-bottom:.2em}
+h2{font-size:1.1rem;margin-top:1.7em;border-bottom:1px solid #dde3ea;padding-bottom:.2em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+pre{background:#f5f7fa;border:1px solid #dde3ea;border-radius:6px;padding:.7rem .9rem;overflow-x:auto;line-height:1.35}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:.86rem}
+th,td{border:1px solid #ccd3dc;padding:.25rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef1f5}
+.note{font-size:.88rem;color:#54606e}
+@media (prefers-color-scheme:dark){
+ body{background:#14181d;color:#dbe2ea}
+ pre{background:#1c2229;border-color:#2c343d}
+ th{background:#212932}
+ th,td{border-color:#2c343d}
+ nav,h2{border-color:#2c343d}
+ a{color:#7cb3ff}
+ .note{color:#9aa7b4}
+}
+</style>
+<nav>
+<a href="index.html">index</a>
+<a href="ainr_dfn2.html"><b>DFN2</b></a>
+<a href="ainr_dfn3.html">DFN3</a>
+<a href="ainr_gtcrn.html">GTCRN</a>
+<a href="ainr_rnnoise_erb.html">RNNoise-ERB</a>
+</nav>
+
+<h1>AINR DeepFilterNet2 (48 kHz cascade + learned alpha)</h1>
+
+<h2>概要</h2>
+<p>48 kHz 全頻帶降噪模型。網路只預測三個 head(ERB mask、低頻 deep-filter 係數、alpha
+殘差混合權重),頻譜合成(cascade:全頻 ERB mask → 低頻 5-tap 複數 FIR → alpha blend)
+全部由 C 端 <code>dfn2_process.c</code> 以 parameter-free 算式重現,對應
+<code>model.py</code> 的 <code>heads()</code> / <code>compose()</code> 邊界。</p>
+<div class="tbl"><table>
+<tr><th>項目</th><th>值(以現行程式碼為準)</th></tr>
+<tr><td>取樣率 / grid</td><td>48000 Hz;FFT/win/hop = <code>1024/1024/512</code>(21.33 ms 窗、10.67 ms hop;<code>config.ini [signal]</code>、<code>DFN2_N_FFT/DFN2_HOP_LEN</code>)</td></tr>
+<tr><td>頻譜 bins</td><td>513(<code>DFN2_N_BINS</code>)</td></tr>
+<tr><td>ERB 帶數</td><td>32(<code>DFN2_N_ERB</code>;Glasberg-Moore 三角 filterbank)</td></tr>
+<tr><td>Deep filter</td><td><code>df_bins=96</code>(0..4.5 kHz)、<code>df_order=5</code>、window <code>[t-3 .. t+1]</code></td></tr>
+<tr><td>Lookahead</td><td><code>mask_lookahead=1</code>、<code>df_lookahead=1</code>;cascade 串聯 ⇒ 總延遲 2 hops(非 max)</td></tr>
+<tr><td>參數量</td><td>2,134,971(以出貨 config 實際建構 <code>DeepFilterNet2(...)</code> 量測)</td></tr>
+<tr><td>model / feature version</td><td><code>dfn2_fmajor_pathway_cascade_alpha_no_lsnr_v6</code> / <code>dfn2_libdf_wnorm_upstream_init_no_eps_v5</code></td></tr>
+<tr><td>post-filter</td><td>Valin PF 存在但出貨關閉(<code>DFN2_MASK_PF=0</code>、<code>mask_pf=false</code>)</td></tr>
+</table></div>
+<p class="note">與 DFN3 頁共用同一 feature contract;差別只在輸出合成
+(DFN2 cascade+alpha vs DFN3 平行 band split)。深入數學與上游對齊紀錄見
+<a href="../../AINR/DeepFilterNet2/README.md">README</a> 與
+<a href="../../AINR/DeepFilterNet2/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT</a>,此頁不重複。</p>
+
+<h2>API 用法</h2>
+<p>部署端(串流/加速器 handoff)用 <code>dfn2_compose_stream()</code>;
+<code>dfn2_compose()</code> 是 frame-aligned 的 parity 參考,兩者不可混用
+(切換須重新 <code>dfn2_state_init()</code>)。</p>
+<pre>#include "DeepFilterNet2/dfn2_process.h"
+
+DFN2State st;                       /* 85,632 bytes, 呼叫端配置 */
+dfn2_state_init(&amp;st);
+
+for (each hop of 512 new samples) {
+    dfn2_analysis(&amp;st, frame512, spec_re, spec_im);        /* 原尺度頻譜 [513] */
+    dfn2_compute_features(&amp;st, spec_re, spec_im,
+                          feat_erb /*[32]*/, feat_spec /*[192]*/);
+    /* 送 (feat_erb, feat_spec) 給模型; 這一拍取回的是上一框
+     * (current-1) 的 heads。前 1 拍 heads_valid=0。 */
+    int valid = dfn2_compose_stream(&amp;st, spec_re, spec_im, heads_valid,
+                                    erb_mask /*[32]*/, coefs /*[960]*/,
+                                    alpha, /*atten_lim_db=*/0.0f,
+                                    out_re, out_im, &amp;out_frame_idx);
+    if (valid == 1)                          /* out 屬於 current-2 框 */
+        dfn2_synthesis(&amp;st, out_re, out_im, out512);
+    /* valid==0: 暖機(不送 ISTFT); valid==-1: pointer/時序合約錯誤 */
+}</pre>
+<p class="note">Python 離線推論:<code>denoise.py --config config.ini --model ckpt.pt --input in.wav --output out.wav</code>
+(內部走 <code>extract_dfn2_features()</code> → <code>model()</code>,torch STFT <code>center=True</code>,與 C 串流僅差 clip 起點框對齊,見 <code>dfn2_process.h</code> 檔頭 parity 限制)。</p>
+
+<h2>Block diagram</h2>
+<pre>
+caller (512 samples/hop)
+   |
+   v
+dfn2_analysis                      st.analysis_buf (1024) 滑窗
+   |  df_common_analysis: sqrt-Hann + FFT1024 * N^-0.5
+   v
+spec_re/spec_im [513]  ----------------------------+
+   |                                               |
+   v                                               |
+dfn2_compute_features                              |
+   |  df_common_features: |X|^2 -> ERB(32) dB      |
+   |    - erb_norm_state EMA -> feat_erb /40       |
+   |    - spec_norm_state EMA -> feat_spec (x DFN2_ANALYSIS_SCALE=0.03125)
+   v                                               |
+[模型 heads(): feat_erb,feat_spec -> erb_mask,coefs,alpha]   (圖外=此 C;圖內=網路)
+   |                                               |
+   v                                               v
+dfn2_compose_stream(spec, heads(current-1))   noisy_ring (延遲的原譜)
+   |  df_common_expand_mask: 32 band -> 513 bin gain
+   |  cascade: masked spec 入 df_ring / hi_delay
+   |  DF FIR 5-tap @ target=current-2, alpha blend (低 96 bins)
+   |  (dfn2_post_filter 編譯關閉) -> dfn2_apply_atten_lim(0=no-op)
+   v
+out_re/out_im [513] (frame current-2)
+   |
+   v
+dfn2_synthesis                     st.synthesis_buf OLA
+   |  df_common_synthesis: * N^+0.5, IFFT, sqrt-Hann, 50% OLA
+   v
+512 output samples
+</pre>
+
+<h2>訊號泳道圖</h2>
+<p>欄 = wall-clock hop(每 hop 512 samples = 10.67 ms);<code>f0</code> = 輸入第 0 框。
+模型在 hop n 消化 feat(n) 後才能回出 heads(n-1)(mask 的 conv lookahead = 1)。</p>
+<pre>
+lane \ hop      | n=0            | n=1            | n=2            | n=3 (穩態)
+----------------+----------------+----------------+----------------+----------------
+caller          | frame f0 進    | f1 進          | f2 進          | f3 進
+C pre           | spec0, feat0   | spec1, feat1   | spec2, feat2   | spec3, feat3
+ (analysis+feat)|                |                |                |
+model (NPU)     | 吃 feat0       | 吃 feat1,      | 吃 feat2,      | 吃 feat3,
+                | heads_valid=0  | 回 heads(f0)   | 回 heads(f1)   | 回 heads(f2)
+C post          | return 0       | mask f0 入 ring| mask f1;DF 出  | mask f2;DF 出
+ (compose_stream)| (暖機)        | target=-1 ⇒ 0  | frame f0 ⇒ 1   | frame f1 ⇒ 1
+C post          | --             | --             | audio f0 出    | audio f1 出
+ (synthesis)    |                |                | (512 samples)  |
+----------------+----------------+----------------+----------------+----------------
+hop-lag: 輸出音訊落後輸入 2 hops (heads 1 hop + DF future tap 1 hop, 串聯相加)
+</pre>
+
+<h2>I/O 表</h2>
+<div class="tbl"><table>
+<tr><th>Tensor</th><th>shape</th><th>dtype</th><th>每次呼叫框數</th><th>時域樣本</th><th>備註</th></tr>
+<tr><td><code>frame</code>(C 入)</td><td>[512]</td><td>float32</td><td>1 hop</td><td>512(10.67 ms)</td><td><code>dfn2_analysis</code> 只吃新樣本,滑窗自持</td></tr>
+<tr><td><code>spec_re/spec_im</code></td><td>[513] ×2</td><td>float32</td><td>1</td><td>—</td><td>原尺度頻譜(masking/ISTFT 用)</td></tr>
+<tr><td><code>feat_erb</code>(模型入)</td><td>C: [32];圖: (1,1,T,32)</td><td>float32</td><td>1</td><td>—</td><td>dB mean-norm 後 /40</td></tr>
+<tr><td><code>feat_spec</code>(模型入)</td><td>C: [192] = [re×96 ‖ im×96];圖: (1,2,T,96)</td><td>float32</td><td>1</td><td>—</td><td>非交錯;C 內已乘 <code>DFN2_ANALYSIS_SCALE</code></td></tr>
+<tr><td><code>erb_mask</code>(模型出)</td><td>(1,1,T,32) → C [32]</td><td>float32</td><td>1</td><td>—</td><td>sigmoid ∈ [0,1]</td></tr>
+<tr><td><code>coefs</code>(模型出)</td><td>(1,T,96,10) → C [960]</td><td>float32</td><td>1</td><td>—</td><td>layout = (bin, tap, re/im),bin 最外</td></tr>
+<tr><td><code>alpha</code>(模型出)</td><td>(1,T,1) → C scalar</td><td>float32</td><td>1</td><td>—</td><td>sigmoid;0=走 masked,1=走 DF</td></tr>
+<tr><td><code>out_re/out_im</code></td><td>[513] ×2</td><td>float32</td><td>1(屬 current-2 框)</td><td>—</td><td><code>valid==1</code> 才有效</td></tr>
+<tr><td><code>out_frame</code>(C 出)</td><td>[512]</td><td>float32</td><td>1 hop</td><td>512</td><td>WOLA 輸出</td></tr>
+</table></div>
+<p class="note">模型 I/O shape 以出貨 config 實際 forward 驗證:<code>erb_mask (1,1,T,32)</code>、
+<code>coefs (1,T,96,10)</code>、<code>alpha (1,T,1)</code>、enhanced <code>(1,513,T) complex64</code>。</p>
+
+<h2>State 表</h2>
+<p><b>ONNX/匯出邊界</b>:<code>model.py heads()</code> 即匯出邊界——圖內只有網路
+(encoder/ERBDecoder/DFDecoder);ERB mask 展開、DF FIR、alpha blend、PF、atten-lim、
+ISTFT 全在圖外的 C。本目錄尚無 ONNX 匯出腳本(RNNoise-ERB 有,可類推)。</p>
+<div class="tbl"><table>
+<tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
+<tr><td><code>analysis_buf</code></td><td>[1024]</td><td>4,096</td><td>C struct <code>DFN2State</code></td><td>分析滑窗</td></tr>
+<tr><td><code>window</code> / <code>erb_borders</code></td><td>[1024] f32 / [32] i32</td><td>4,096 / 128</td><td>C struct</td><td>init 後不變表格</td></tr>
+<tr><td><code>synthesis_buf</code></td><td>[1024]</td><td>4,096</td><td>C struct</td><td>OLA(有效 512)</td></tr>
+<tr><td><code>erb_norm_state</code></td><td>[32]</td><td>128</td><td>C struct</td><td>dB mean EMA,α=0.989,init linspace −60→−90 dB</td></tr>
+<tr><td><code>spec_norm_state</code></td><td>[96]</td><td>384</td><td>C struct</td><td>magnitude EMA,init 0.001→0.0001;C 保留 eps 1e-12(FTZ 防 NaN)</td></tr>
+<tr><td><code>df_ring_re/im</code></td><td>[5][96] ×2</td><td>3,840</td><td>C struct</td><td>已套 ERB mask 的低頻 ring(cascade)</td></tr>
+<tr><td><code>coef_ring</code></td><td>[5][96][5][2]</td><td>19,200</td><td>C struct</td><td>各框自己的 DF 係數</td></tr>
+<tr><td><code>alpha_ring</code></td><td>[5]</td><td>20</td><td>C struct</td><td>各框 alpha</td></tr>
+<tr><td><code>noisy_ring_re/im</code></td><td>[5][513] ×2</td><td>20,520</td><td>C struct</td><td>延遲的原譜(PF/atten-lim 的 noisy target)</td></tr>
+<tr><td><code>hi_delay_re/im</code></td><td>[5][417] ×2</td><td>16,680</td><td>C struct</td><td>高頻段同步延遲(band split 對時)</td></tr>
+<tr><td><code>stream_frame_index</code> 等 index</td><td>—</td><td>16</td><td>C struct</td><td>串流框編號 / ring 指標</td></tr>
+<tr><td>scratch 區</td><td>—</td><td>~12.4 KB</td><td>C struct</td><td>非跨呼叫,每次覆寫</td></tr>
+<tr><td><code>encoder.emb_gru</code> h</td><td>(1,B,256)</td><td>1,024</td><td>NPU runtime</td><td>圖內 GRU hidden,跨次呼叫必須保留</td></tr>
+<tr><td><code>erb_dec.emb_gru</code> h</td><td>(2,B,256)</td><td>2,048</td><td>NPU runtime</td><td>ERB decoder 2 層 GRU</td></tr>
+<tr><td><code>df_dec.df_gru</code> h</td><td>(2,B,256)</td><td>2,048</td><td>NPU runtime</td><td>DF decoder 2 層 GRU</td></tr>
+<tr><td>conv 時間快取</td><td>erb_conv0: 2 框×(1×32);df_conv0: 2 框×(2×96);df_convp: 4 框×(64×96)=24,576 f32</td><td>合計 ~100 KB</td><td>NPU runtime</td><td>kt=3 的兩個輸入 conv(lookahead=1)與 kt=5 causal pathway conv;其餘 conv 時間核=1,無快取</td></tr>
+</table></div>
+<p class="note"><code>sizeof(DFN2State)</code> = 85,632 bytes(本機以 <code>-ffp-contract=off</code> 編譯量測)。</p>
+
+<h2>延遲與 warm-up</h2>
+<ul>
+<li><b>演算法延遲(模型側)= 2 hops = 1024 samples = 21.33 ms @48 kHz</b>:
+DFN2 是 cascade——DF 的未來 tap 需要「已套 mask 的 t+1」,而 mask(t+1) 又需要 feat(t+2),
+所以 <code>MASK_LOOKAHEAD + DF_LOOKAHEAD = 1+1 = 2</code> 框,<u>相加而非取 max</u>
+(見 <code>dfn2_process.h</code> 與 <code>dfn2_compose_stream()</code>;DFN3 才是 max)。</li>
+<li>STFT framing 結構延遲:win−hop = 512 samples = 10.67 ms(WOLA 重疊)。</li>
+<li>Warm-up:<code>dfn2_compose_stream()</code> 前 2 次呼叫回 0(無輸出,不送 ISTFT);
+右端 flush 須由中介硬體以訓練同款 zero padding 產生剩餘 heads 再以零頻譜續呼。</li>
+<li>正規化器 EMA warm-up:tau = 1.0 s(α=0.989,3·tau ≈ 273 框);
+init 用 libDF linspace 值,故起始特徵即在上游量級。</li>
+<li>對齊守衛:<code>tests/test_c_prepost.c: test_dfn_stream_alignment()</code> 用逐框變動的
+mask/coefs 驗證 <code>output_frame_index</code> 與逐 bin 3e-6 一致性,off-by-one 的
+head/spectrum 配對無法以「輸出有限」矇混過關。</li>
+</ul>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li>C 前後處理:<code>AINR/DeepFilterNet2/dfn2_process.c</code> / <code>.h</code>;共用 kernel:<code>AINR/dfn_process_common.h</code></li>
+<li>模型 / 訓練 / 推論:<code>AINR/DeepFilterNet2/model.py</code>、<code>train.py</code>、<code>denoise.py</code>、<code>config.ini</code></li>
+<li>文件:<a href="../../AINR/DeepFilterNet2/README.md">README.md</a>、<a href="../../AINR/DeepFilterNet2/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT.md</a></li>
+<li>C 測試:<code>AINR/tests/test_c_prepost.c</code> — <code>make -C AINR test-simd</code>
+實測 NEON/scalar digest 皆 <code>124b768ec938af7d</code>(bit 相同)</li>
+<li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code> — 實測 27 passed;
+共用測試 <code>AINR/tests/</code>(pytest)— 實測 14 passed</li>
+</ul>

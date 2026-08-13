@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>全鏈 grid / window / framing 慣例</title>
+<style>
+body{font-family:system-ui,-apple-system,"PingFang TC","Noto Sans TC",sans-serif;
+     max-width:72rem;margin:0 auto;padding:1rem 1.2rem;line-height:1.55;
+     color:#1c1c1c;background:#fdfdfd}
+@media (prefers-color-scheme:dark){body{color:#ddd;background:#161616}
+  a{color:#7ab8ff}nav,td,th,pre{border-color:#444 !important}
+  th{background:#242424 !important}pre{background:#1e1e1e !important}}
+nav{font-size:.85rem;border-bottom:1px solid #ccc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.35rem;white-space:nowrap}
+h1{font-size:1.45rem}h2{font-size:1.15rem;margin-top:1.6rem}
+table{border-collapse:collapse;width:100%;font-size:.85rem;margin:.6rem 0}
+th,td{border:1px solid #bbb;padding:.28rem .5rem;text-align:left;vertical-align:top}
+th{background:#f0f0f0}
+pre{background:#f5f5f5;border:1px solid #ddd;padding:.6rem;overflow-x:auto;
+    font-size:.8rem;line-height:1.35}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
+.note{font-size:.85rem;opacity:.85}
+.tbl{overflow-x:auto}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html">索引</a> ·
+<a href="conventions.html"><b>慣例</b></a> ·
+<a href="onnx_prepost.html">ONNX 邊界</a> ·
+<a href="aec.html">AEC</a> ·
+<a href="nr.html">NR</a> ·
+<a href="audio_common.html">audio_common</a> ·
+<a href="pipeline_mono.html">mono</a> ·
+<a href="pipeline_ulcnet_mono.html">mono-ULCNet</a> ·
+<a href="pipeline_4ch.html">4ch</a> ·
+<a href="pipeline_ulcnet_4ch.html">4ch-ULCNet</a> ·
+<a href="ainr_dfn2.html">DFN2</a> ·
+<a href="ainr_dfn3.html">DFN3</a> ·
+<a href="ainr_gtcrn.html">GTCRN</a> ·
+<a href="ainr_rnnoise_erb.html">RNNoise-ERB</a> ·
+<a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
+<a href="aiaec_align_cruse.html">Align-CRUSE</a> ·
+<a href="aiaec_deepvqe_s.html">DeepVQE-S</a> ·
+<a href="aiaec_cagcrn.html">CAGCRN</a> ·
+<a href="aiaec_gtcrn_aenr.html">GTCRN-AENR</a> ·
+<a href="aiaec_dfn_aenr.html">DFN-AENR</a>
+</nav>
+
+<h1>全鏈 grid / window / framing 慣例</h1>
+
+<h2>概要</h2>
+<p>整條鏈的共同格點規則：<b>frame == FFT、hop = fft/2（50% overlap）、無
+transform zero-padding、bins = fft/2+1</b>。各層各有自己的預設與白名單，
+本頁把它們放在同一張表；另外收錄三件跨模組最容易踩的 framing 事實：
+重建路徑一律 periodic sqrt-Hann、PBFDKF 線性路徑的矩形窗例外、
+centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
+
+<h2>Grid 總表（各層預設與白名單）</h2>
+<div class="tbl">
+<table>
+<tr><th>元件</th><th>SR</th><th>FFT=frame / hop（bins）</th><th>預設？</th><th>出處</th></tr>
+<tr><td rowspan="4">AEC（<code>lib/aec/c_impl</code>）<br>
+<span class="note">hop=fft/2、block=fft、K=fft/2+1（<code>aec.c:676-678</code>）</span></td>
+<td>8 k</td><td>256 / 128（129）</td><td>預設（唯一）</td>
+<td rowspan="4"><code>aec.c</code> <code>aec_config_defaults()</code>
+（48k→1024、16k→256、8k→256）與 <code>aec_validate_config()</code> 白名單；
+<code>filter_length</code> 預設 52 ms（=832 taps @16k）、sr≥44100 為 64 ms</td></tr>
+<tr><td>16 k</td><td><b>256 / 128（129）＝8 ms hop 預設</b></td><td>預設</td></tr>
+<tr><td>16 k</td><td>512 / 256（257）＝16 ms hop</td><td>配置選項（ULCNet/NN 鏈用）</td></tr>
+<tr><td>48 k</td><td>1024 / 512（513）</td><td>預設（唯一）</td></tr>
+<tr><td rowspan="3">NR（<code>lib/nr/c_impl</code>）</td>
+<td>8 k</td><td>128 / 64（65）；替代 256 / 128</td><td>預設 128</td>
+<td rowspan="3"><code>mmse_lsa_types.h</code> <code>mmse_lsa_default_fft_size()</code>
+（48k→1024、16k→256、8k→128；註明 16 ms-hop 替代 grid 8k/256、16k/512）</td></tr>
+<tr><td>16 k</td><td>256 / 128（129）；替代 512 / 256</td><td>預設 256</td></tr>
+<tr><td>48 k</td><td>1024 / 512（513）</td><td>預設（唯一）</td></tr>
+<tr><td>mono pipeline（<code>pipelines/</code>）</td><td>8/16/48 k</td>
+<td>同 AEC 白名單；16 k 接受 256 或 512</td>
+<td>16k 預設 256/128（2026-08-02/03 起）</td>
+<td><code>pipelines/pipeline_dims.h</code> <code>compute_frame_dims()</code></td></tr>
+<tr><td>4ch core（<code>4ch_pipelines/</code>）</td><td>16/48 k</td>
+<td>只有三個 grid：16k/256、16k/512、48k/1024（<b>無 8 k</b>）</td><td>16k 預設 256</td>
+<td><code>4aec_nr_res.c</code> sample_rate 檢查；<code>aec.c:150-160</code> 註解</td></tr>
+<tr><td>ULCNet 變體（mono + 4ch）</td><td>16 k</td>
+<td><b>512 / 256（257）固定</b>；其他 SR/fft 一律 reject</td><td>編譯期固定</td>
+<td><code>ulcnet_process.h</code>（ULCNET_SR/N_FFT/HOP/BINS）、
+<code>audio_pipeline_ulcnet.h</code>、<code>audio_pipeline_4ch_ulcnet.h</code></td></tr>
+<tr><td>AINR DFN2 / DFN3</td><td>48 k</td>
+<td>1024 / 512（513）；<b>非上游 960/480</b>（2 的次方限制；DF 截止 4500 Hz
+vs 上游 4800 Hz）</td><td>編譯期固定</td>
+<td><code>dfn2_process.h</code> / <code>dfn3_process.h</code></td></tr>
+<tr><td>AINR GTCRN</td><td>16 k</td><td>512 / 256（257）</td><td>編譯期固定</td>
+<td><code>gtcrn_process.h</code></td></tr>
+<tr><td>AINR RNNoise-ERB</td><td>16 k</td>
+<td>512 / 256（257）；22 ERB bands + complex 特徵 0–4 kHz（129 bins）</td>
+<td>編譯期固定</td><td><code>RNNoise-ERB/process.h</code></td></tr>
+<tr><td>AIAEC ×5（ULCNet/CRUSE/DeepVQE-S/CAGCRN/GTCRN-AENR）</td><td>16 k</td>
+<td>512 / 256（257）</td><td>config 固定（GTCRN-AENR 由 model 硬性 raise）</td>
+<td>各 <code>config.ini</code>；<code>GTCRN_AENR/model.py:24-28</code></td></tr>
+<tr><td>AIAEC DFN-AENR</td><td>48 k</td>
+<td>1024 / 512（513），df_bins=96；16 k 變體 512/256，df_bins=64</td>
+<td>config 預設 48 k</td>
+<td><code>DeepFilterNet_AENR/config.ini</code>、README</td></tr>
+</table>
+</div>
+
+<h2>視窗慣例：重建路徑一律 periodic sqrt-Hann</h2>
+<p>所有「會被合成回時域」的路徑（分析與合成兩側）用同一個公式，denominator
+= block 長度 N（periodic，非 symmetric）：</p>
+<pre>w[k] = sqrtf(0.5 * (1 - cos(2*pi*k / N)))     k = 0..N-1</pre>
+<div class="tbl">
+<table>
+<tr><th>使用點</th><th>程式碼</th></tr>
+<tr><td>AEC RES 分析窗（error_spec_windowed 用）</td>
+<td><code>pbfdkf.c</code> <code>pbfdaf_fill_windows()</code>（denom = block_size）</td></tr>
+<tr><td>AEC3 post 合成窗（16k/512 grid 表格化 = sin(πk/512)）</td>
+<td><code>aec3_balanced_config.h</code> <code>AEC3B_SYNTH_WINDOW[512]</code>（per-rate 表）</td></tr>
+<tr><td>mono pipeline 合成窗</td><td><code>audio_pipeline.c:380-382</code>（synth_win）</td></tr>
+<tr><td>4ch pipeline 合成窗</td><td><code>4aec_nr_res.c:672-675</code>、
+<code>audio_pipeline_4ch_ulcnet.c:562-568</code></td></tr>
+<tr><td>ULCNet C 分析+合成（共用一張表）</td>
+<td><code>ulcnet_process.c</code> <code>ulcnet_make_window()</code>（與 Python 逐 bit 同 @f32）</td></tr>
+<tr><td>DFN2/DFN3/GTCRN 分析+合成</td>
+<td><code>AINR/dfn_process_common.h</code> <code>df_common_make_root_hann()</code></td></tr>
+<tr><td>RNNoise-ERB 分析+合成</td>
+<td><code>rnnoise_tables_gen.h</code>（編譯期表；<code>gen_rnnoise_tables.c</code> 產生，
+<code>test_rnnoise_tables.c</code> 逐 byte drift-guard）</td></tr>
+<tr><td>AIAEC Python streaming 參考</td>
+<td><code>AIAEC/aiaec_streaming.py</code> StreamSTFT/StreamISTFT（對 torch center=True bit-exact）</td></tr>
+</table>
+</div>
+<p>sqrt-Hann 分析 × sqrt-Hann 合成 = Hann，在 50% overlap 下滿足 COLA，
+合成端不需 window-envelope 除法（<code>dfn3_synthesis()</code> 註解明文）。
+例外是 torch.istft 語意的 ULCNet WOLA：它照 torch 做窗平方包絡正規化
+（<code>UlcnetSynthesis.env</code>），結果相同、簿記不同。</p>
+
+<h3>PBFDKF far_spec 矩形窗例外</h3>
+<p><b>線性濾波路徑沒有分析窗。</b>PBFDAF/PBFDKF 是 overlap-save 結構：
+far/near 的 block（= 2×hop 原始樣本）直接進 RFFT——
+<code>pbfdkf.c:458</code> <code>rfft_padded(p, p->far_buffer, blk, p->far_spec)</code>、
+<code>:450</code> 同樣的 near_spec——等效矩形窗。輸出取
+<code>echo_time[hop:block]</code> 有效半段、error_spec 由 zero-pad 的有效 hop 重建
+（<code>:542-545</code>），全程無窗。sqrt-Hann 只出現在<b>供 RES/後級分析用</b>的
+<code>error_spec_windowed</code>（<code>:552-553</code>：sqrt-Hann×near − echo_spec）。
+另有 <code>td_window</code>（IR 時域約束窗：causal taps 全 1 + hop/4 非因果
+fade），作用在濾波器係數不是訊號。</p>
+
+<h2>ULCNet centered framing vs AEC/DFN 串流（center=False）framing</h2>
+<p>兩種 framing 並存是刻意的：AINR DFN2/DFN3 的 C 是 center=False 串流
+（<code>dfn2_process.h</code> parity 限制 (1)），Align-ULCNet 的 C 重現
+torch <code>center=True</code> timing（<code>ulcnet_process.h</code> 檔頭 +
+<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> 第 7 節決策）。</p>
+<p><b>穩態幀為何重合（逐 bit）：</b>本 grid 下 win = n_fft、hop = win/2、同一
+sqrt-Hann 窗。centered 第 k 幀以樣本 k·hop 為中心，覆蓋
+[k·hop − win/2, k·hop + win/2) = [(k−1)·hop, (k+1)·hop)；
+non-centered 第 k−1 幀覆蓋 [(k−1)·hop, (k−1)·hop + win)——同一段樣本、
+同一張窗 → 頻譜逐 bit 相同，差別只剩幀編號。因此：</p>
+<ul>
+<li>兩種 framing 的 STFT→NN→ISTFT 鏈<b>穩態 I/O 延遲都是同一個 1 hop</b>
+（WOLA 收尾本來就要等下一幀；centered 的半窗 lookahead 藏在其中）。
+改 past-only framing 拿不到任何延遲收益。</li>
+<li>真實差異只有 (a) 串流開頭第一幀：reflect 前綴 vs 零填冷啟動（影響
+recurrent-state start transient）；(b) 檔案級評測的幀數/邊界；(c) 幀時間戳
+語意。checkpoint 的 feature-time contract 因此不能靜默改 framing——換
+framing 是輸入分佈變更，須 A/B。</li>
+<li>C 實作佐證：<code>ulcnet_analysis_push()</code> 的排程是 push#0→0 幀、
+push#1→2 幀（frame0 含 reflect 前綴 + frame1）、之後每 push 1 幀；輸出端
+frame#0→0 樣本（半窗 trim）、之後每幀 256 樣本——與 dfn2 的 center=False
+串流輸出排程逐 hop 相同。</li>
+</ul>
+
+<h2>延遲預算表（演算法延遲，不含排程/緩衝）</h2>
+
+<h3>mono ULCNet pipeline（16 k / 512 / 256）</h3>
+<div class="tbl">
+<table>
+<tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
+<tr><td>AEC 線性路徑（<code>pbfdaf_frontend</code>，overlap-save）</td>
+<td>+0 hop</td><td>線性誤差與輸入同 hop 交付（<code>AecResContext.formed_hop</code>）</td></tr>
+<tr><td>Align-ULCNet 鏈（centered STFT ×2 → NN callback → WOLA）</td>
+<td>+1 hop = 256 samples = 16 ms</td>
+<td><code>ulcnet_process.h</code>：hop#0 無輸出（pipeline 補零）、hop#p 輸出
+對應輸入 [（p−1)·256, p·256)</td></tr>
+<tr><td><b>合計</b></td><td><b>1 hop = 256 samples = 16 ms</b></td>
+<td><code>audio_pipeline_ulcnet.h</code>：「end-to-end algorithmic latency is
+exactly ONE hop」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
+</table>
+</div>
+
+<h3>4ch ULCNet pipeline（16 k / 512 / 256）</h3>
+<div class="tbl">
+<table>
+<tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
+<tr><td>4×AEC lanes + 共享 delay matcher + SRP-PHAT DOA + GSC 權重
+（<code>four_aec_nr_res process_pre</code> → <code>gsc_process_with_weights</code>）</td>
+<td>+0 hop</td><td>同 hop 產生 beamformed 線性誤差<b>頻譜</b></td></tr>
+<tr><td>GSC 頻譜 WOLA 重建成時域 hop</td><td>+1 hop = 16 ms</td>
+<td>hop p 的 beam 頻譜要到 hop p+1 才重建完整（sqrt-Hann 分析在 AEC 內 +
+sqrt-Hann 合成 + 50% OLA）</td></tr>
+<tr><td>far 分支 1-hop 補償 buffer</td><td>+0（平行）</td>
+<td>讓 model 看到的 error/far 幀對永遠來自同一個輸入 hop</td></tr>
+<tr><td>Align-ULCNet 鏈</td><td>+1 hop = 16 ms</td><td>同 mono 變體</td></tr>
+<tr><td><b>合計（新增）</b></td><td><b>2 hops = 512 samples = 32 ms</b></td>
+<td><code>audio_pipeline_4ch_ulcnet.h</code> TIMING CONTRACT：hop#0、#1 輸出零；
+輸出 hop p（p≥2）≙ 輸入 hop p−2 的 beamformed 線性誤差
+（<code>audio_pipeline_4ch_ulcnet_last_beamformed_error()</code> 可驗證）</td></tr>
+</table>
+</div>
+<p class="note">NN 模型本身：Align-ULCNet 演算法 lookahead = 0
+（readiness 總覽矩陣）；上表已含其 framing 的半窗 lookahead。</p>
+
+<h2>Wall-clock authoring grid 註記</h2>
+<ul>
+<li>AEC 的時間常數多以 legacy 10 ms hop（hop=160@16k）撰寫，於
+<code>aec_carve()</code>/<code>aec3_growth_rehop()</code> 對實際 grid 即時 retime
+（<code>aec.h</code> 各欄位註解）；<b>不要</b>在程式碼裡寫入已 retime 的字面值。</li>
+<li>NR 有兩個 authoring 基準並存：10 ms 參考（<code>mmse_lsa_retime_alpha</code>）
+與 16 ms 撰寫（<code>mmse_lsa_retime_alpha_ref(..., 0.016)</code>，如
+alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
+從錯的基準 retime 會 double-correct（<code>mmse_lsa_types.h</code> 註解）。</li>
+<li>換 grid（如 16k 256↔512）時這些機制讓行為以 wall-clock 不變；
+但 <b>alpha 值本身會不同</b>，比對常數要先問「authoring grid 是哪個」。</li>
+</ul>
+
+<h2>相關檔案與測試路徑</h2>
+<table>
+<tr><th>類別</th><th>路徑</th></tr>
+<tr><td>Grid 定義</td><td><code>lib/aec/c_impl/src/aec.c</code>（defaults/validate/676-678）、
+<code>lib/nr/c_impl/include/mmse_lsa_types.h</code>、<code>pipelines/pipeline_dims.h</code></td></tr>
+<tr><td>視窗</td><td><code>lib/aec/c_impl/src/pbfdkf.c</code>、
+<code>lib/aec/c_impl/include/aec3_balanced_config.h</code>、
+<code>pipelines/audio_pipeline.c</code>、<code>pipelines/4ch_pipelines/4aec_nr_res.c</code>、
+<code>AIAEC/Align_ULCNet/ulcnet_process.c</code>、<code>AINR/dfn_process_common.h</code></td></tr>
+<tr><td>Framing 決策</td><td><code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> §7、
+<code>AINR/DeepFilterNet2/dfn2_process.h</code> parity 限制 (1)</td></tr>
+<tr><td>測試</td><td><code>pipelines/tests/test_signal_grids.py</code>、
+<code>pipelines/tests/test_audio_pipeline_ulcnet.c</code>、
+<code>pipelines/4ch_pipelines/tests/test_audio_pipeline_4ch_ulcnet.c</code>（timing contract）、
+<code>AIAEC/tests/test_ulcnet_process_c.py</code>（C↔Python 逐幀 parity）、
+<code>lib/aec/c_impl/test/test_rate_structural.c</code>（retime 結構檢查）、
+<code>lib/nr/c_impl/test/test_config_parity.c</code></td></tr>
+</table>
+
+</body>
+</html>

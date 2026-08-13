@@ -1,0 +1,204 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AINR RNNoise-ERB</title>
+<style>
+body{font-family:-apple-system,"Segoe UI",Roboto,"Noto Sans TC",sans-serif;max-width:62rem;margin:0 auto;padding:1rem 1.25rem 3rem;line-height:1.55;color:#1a222c;background:#fff}
+nav{font-size:.9rem;border-bottom:1px solid #ccd3dc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.7rem}
+h1{font-size:1.45rem;margin-bottom:.2em}
+h2{font-size:1.1rem;margin-top:1.7em;border-bottom:1px solid #dde3ea;padding-bottom:.2em}
+code,pre{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.85em}
+pre{background:#f5f7fa;border:1px solid #dde3ea;border-radius:6px;padding:.7rem .9rem;overflow-x:auto;line-height:1.35}
+.tbl{overflow-x:auto}
+table{border-collapse:collapse;font-size:.86rem}
+th,td{border:1px solid #ccd3dc;padding:.25rem .55rem;text-align:left;vertical-align:top}
+th{background:#eef1f5}
+.note{font-size:.88rem;color:#54606e}
+@media (prefers-color-scheme:dark){
+ body{background:#14181d;color:#dbe2ea}
+ pre{background:#1c2229;border-color:#2c343d}
+ th{background:#212932}
+ th,td{border-color:#2c343d}
+ nav,h2{border-color:#2c343d}
+ a{color:#7cb3ff}
+ .note{color:#9aa7b4}
+}
+</style>
+<nav>
+<a href="index.html">index</a>
+<a href="ainr_dfn2.html">DFN2</a>
+<a href="ainr_dfn3.html">DFN3</a>
+<a href="ainr_gtcrn.html">GTCRN</a>
+<a href="ainr_rnnoise_erb.html"><b>RNNoise-ERB</b></a>
+</nav>
+
+<h1>AINR RNNoise-ERB (16 kHz ERB band-gain 模型)</h1>
+
+<h2>概要</h2>
+<p>RNNoise v0.2 方向(Conv+GRU)的輕量 16 kHz 降噪模型:網路輸出 22 個實數
+ERB band gain(sigmoid ∈ [0,1]),由 C 端經 partition-of-unity 反向三角矩陣展開為
+257 個 bin gain 後套在頻譜上。出貨設定為<b>純 ERB</b>
+(<code>use_complex_input=false</code>):complex 分支程式仍在,但網路不建、也不吃
+<code>spec_input</code> 的內容(ONNX 簽名仍保留該輸入以固定合約)。</p>
+<div class="tbl"><table>
+<tr><th>項目</th><th>值(以現行程式碼為準)</th></tr>
+<tr><td>取樣率 / grid</td><td>16000 Hz;FFT/win/hop = <code>512/512/256</code>(<code>RNNOISE_N_FFT/RNNOISE_HOP_LEN</code>)</td></tr>
+<tr><td>頻譜 bins / ERB 帶</td><td>257 / 22(<code>RNNOISE_N_BANDS</code>,每帶 ≥ 2 bins greedy-forward 保證)</td></tr>
+<tr><td>模型容量</td><td><code>cond_size=64</code>、<code>gru_size=128</code>、3 層 GRU;參數 321,110(以出貨 config 實際建構量測)</td></tr>
+<tr><td>Lookahead</td><td><code>lookahead_frames=1</code>:conv 3-tap 窗 [t−2,t−1,t] 的 gain 屬於 spectrum t−1(<code>RNNOISE_CONV_DELAY=1</code>)</td></tr>
+<tr><td>feature version</td><td><code>log_erb_dfn_mean_cplx_unit_0_4k_v8</code>(v8 = 以本專案 16 k 語料校準 EMA init)</td></tr>
+<tr><td>正規化 EMA</td><td>tau = 1.0 s → α = 0.984;ERB init −20/−45 dB、spec init 0.04/0.008、eps 1e-12</td></tr>
+</table></div>
+<p class="note">公式推導、v4–v8 演進與純 ERB 的表達力限制見
+<a href="../../AINR/RNNoise-ERB/README.md">README.md</a>;此頁不重複。</p>
+
+<h2>API 用法</h2>
+<p>注意:<code>rnnoise_analysis()</code> 吃的是完整 <code>WIN_LEN=512</code> 窗
+(呼叫端自己維護 256-hop 滑動窗,與 DFN/GTCRN 的「只給新樣本」不同);
+且 lookahead=1 之下,呼叫端必須把 spectrum 延遲一框再套 gain。</p>
+<pre>#include "RNNoise-ERB/process.h"
+
+RNNoiseState st;                    /* 15,328 bytes, 呼叫端配置 */
+rnnoise_state_init(&amp;st);            /* 表格為編譯期常數, 無執行期初始化 */
+
+float win[512];                     /* 呼叫端滑動窗 (每 hop 移入 256 新樣本) */
+float prev_re[257], prev_im[257];   /* 呼叫端: 延遲一框的 spectrum */
+for (each hop of 256 new samples) {
+    rnnoise_analysis(&amp;st, win, spec_re, spec_im);
+    int ready = rnnoise_compute_features(&amp;st, spec_re, spec_im,
+                                         erb3 /*[3][22]*/,
+                                         spec3 /*[3][2][129]*/);
+    if (ready) {                    /* 已累積 3 框 (oldest -&gt; newest) */
+        /* 模型: (erb3, spec3, h1,h2,h3) -&gt; band_gains[22], h1..h3 更新 */
+        run_model(erb3, spec3, h, band_gains);
+        rnnoise_apply_atten_lim(band_gains, atten_lim_db); /* 可選, &lt;=0 = no-op */
+        rnnoise_expand_gains(band_gains, bin_gains /*[257]*/);
+        /* gain 屬於 t-1: 套在延遲一框的 prev_re/prev_im 上 */
+        rnnoise_synthesis(&amp;st, prev_re, prev_im, bin_gains, out256);
+    }
+    save prev_re/prev_im = spec_re/spec_im;   /* 1-hop spectrum 延遲 */
+}</pre>
+<p class="note">Python 離線:<code>denoise.py --config config.ini --model output/rnnoise_best.pth --input in.wav --output out.wav</code>
+(offline 以 <code>F.pad(pad_left=2−LOOKAHEAD, pad_right=LOOKAHEAD)</code> 一次過整段)。
+ONNX 匯出:<code>python export_onnx.py --config config.ini --model output/rnnoise_best.pth --output rnnoise.onnx</code>。</p>
+
+<h2>Block diagram</h2>
+<pre>
+caller (512-sample 滑動窗, hop 256)
+   |
+   v
+rnnoise_analysis
+   |  root-Hann + FFT512 * N^-0.5 (torch normalized=True 對齊)
+   v
+spec_re/spec_im [257] --------------------------+
+   |                                            | (呼叫端延遲 1 框)
+   v                                            |
+rnnoise_compute_features                        |
+   |  |X|^2 -> 三角 ERB(22) -> 10*log10(+1e-10) |
+   |  erb_norm_state EMA -> (dB-mean)/40        |
+   |  bins 0..128: spec_norm_state EMA          |
+   |    -> re/im / sqrt(state+1e-12)            |
+   |  各推入 3-frame ring; 未滿 3 框回 0        |
+   v                                            |
+[ONNX 圖: RNNoiseStreaming.forward]             |
+   |  erb_conv Conv1d(22->64,k=3,valid) -> tanh |
+   |  fuse Linear(64->128) -> tanh              |
+   |  gru1 -> gru2 -> gru3 (各 128)             |
+   |  concat[fused,g1,g2,g3] (512)              |
+   |  dense_out Linear(512->22) -> sigmoid      |
+   v                                            |
+band_gains [22]  (屬 spectrum t-1)              |
+   |                                            |
+   v                                            |
+rnnoise_apply_atten_lim (band 層級, 可選)       |
+   v                                            |
+rnnoise_expand_gains: 22 -> 257 (erb_inv)       |
+   v                                            v
+rnnoise_synthesis(prev_spec, bin_gains)  <------+
+   |  * gain, * N^+0.5, IFFT, root-Hann, 50% OLA
+   v
+256 output samples
+</pre>
+
+<h2>訊號泳道圖</h2>
+<p>欄 = hop(256 samples = 16 ms)。<code>ready</code> = <code>rnnoise_compute_features()</code>
+回傳 1(已累積 3 框)。gain(w) 表示由窗 [w−2..w] 算出、屬於 spectrum w−1 的 gains。</p>
+<pre>
+lane \ hop      | n=0            | n=1            | n=2            | n=3 (穩態)
+----------------+----------------+----------------+----------------+----------------
+caller          | 窗含 f0        | 窗含 f0,f1     | 窗含 f0..f2    | 窗含 f1..f3
+C pre           | spec0, feat0   | spec1, feat1   | spec2, feat2   | spec3, feat3
+ (analysis+feat)| ring 1/3 ⇒ 0   | ring 2/3 ⇒ 0   | ring 滿 ⇒ 1    | ⇒ 1
+model (NPU)     | --             | --             | gains(f1) 出   | gains(f2) 出
+                |                |                | h1..h3 更新    | h1..h3 更新
+C post          | --             | --             | expand 22->257 | expand
+ (expand+synth) |                |                | 套在 spec1 上  | 套在 spec2 上
+                |                |                | audio f1 出    | audio f2 出
+----------------+----------------+----------------+----------------+----------------
+hop-lag: 輸出音訊落後輸入 1 hop (lookahead=1); 前 2 hop 無模型輸出 (3 框暖機)
+</pre>
+
+<h2>I/O 表</h2>
+<div class="tbl"><table>
+<tr><th>Tensor</th><th>shape</th><th>dtype</th><th>每次呼叫框數</th><th>時域樣本</th><th>備註</th></tr>
+<tr><td><code>frame</code>(C 入)</td><td>[512]</td><td>float32</td><td>1(窗)</td><td>512 窗 / 256 新樣本</td><td>呼叫端維護滑動窗</td></tr>
+<tr><td><code>spec_re/spec_im</code></td><td>[257] ×2</td><td>float32</td><td>1</td><td>—</td><td>normalized RFFT(× N^−0.5)</td></tr>
+<tr><td><code>out_erb</code></td><td>[3][22]</td><td>float32</td><td>3(oldest→newest)</td><td>—</td><td>k=3 temporal conv 的完整輸入窗,每呼叫重排</td></tr>
+<tr><td><code>out_spec</code></td><td>[3][2][129]</td><td>float32</td><td>3</td><td>—</td><td>0..4 kHz;純 ERB 出貨下模型不讀內容,僅保簽名</td></tr>
+<tr><td><code>erb_input</code>(ONNX 入)</td><td>(1,3,22)</td><td>float32</td><td>3</td><td>—</td><td>= <code>out_erb</code></td></tr>
+<tr><td><code>spec_input</code>(ONNX 入)</td><td>(1,3,2,129)</td><td>float32</td><td>3</td><td>—</td><td>= <code>out_spec</code></td></tr>
+<tr><td><code>h1_in..h3_in</code> / <code>h1_out..h3_out</code>(ONNX 入/出)</td><td>(1,1,128) ×3</td><td>float32</td><td>—</td><td>—</td><td>GRU hidden,runtime 跨呼叫攜帶(opset 17)</td></tr>
+<tr><td><code>gains</code>(ONNX 出)</td><td>(1,1,22)</td><td>float32</td><td>1(=3−2,conv valid)</td><td>—</td><td>sigmoid;屬 spectrum t−1</td></tr>
+<tr><td><code>band_gains</code> → <code>bin_gains</code></td><td>[22] → [257]</td><td>float32</td><td>1</td><td>—</td><td><code>rnnoise_expand_gains</code>(partition of unity)</td></tr>
+<tr><td><code>out_samples</code>(C 出)</td><td>[256]</td><td>float32</td><td>1 hop</td><td>256(16 ms)</td><td>WOLA 輸出</td></tr>
+</table></div>
+<p class="note">shape 以實際 forward 驗證:<code>gains (1,1,22)</code>、h 皆 <code>(1,1,128)</code>。
+輸出張量只有 gains——無 VAD head。</p>
+
+<h2>State 表</h2>
+<p><b>ONNX 邊界</b>(<code>export_onnx.py RNNoiseStreaming</code>):圖內 = erb_conv → fuse →
+3×GRU → dense_out;圖外(C)= STFT、ERB/complex 特徵與兩組 EMA 正規化、3-frame
+feature ring、gain 展開、atten-lim、頻譜延遲、ISTFT/OLA。<b>runtime 跨呼叫只需攜帶
+h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p>
+<div class="tbl"><table>
+<tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
+<tr><td><code>synthesis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct <code>RNNoiseState</code></td><td>OLA(有效 256)</td></tr>
+<tr><td><code>erb_feat_buf</code></td><td>[3][22]</td><td>264</td><td>C struct</td><td>3-frame ERB 特徵 ring</td></tr>
+<tr><td><code>spec_feat_buf</code></td><td>[3][2][129]</td><td>3,096</td><td>C struct</td><td>3-frame complex 特徵 ring</td></tr>
+<tr><td><code>feat_idx</code> / <code>feat_count</code></td><td>int ×2</td><td>8</td><td>C struct</td><td>ring 指標 / 暖機計數</td></tr>
+<tr><td><code>erb_norm_state</code></td><td>[22]</td><td>88</td><td>C struct</td><td>dB mean EMA,α=0.984,init linspace −20→−45 dB(v8 校準)</td></tr>
+<tr><td><code>spec_norm_state</code></td><td>[129]</td><td>516</td><td>C struct</td><td>magnitude EMA,init 0.04→0.008;<code>sqrtf(state+1e-12)</code></td></tr>
+<tr><td>scratch 區</td><td>—</td><td>~9.3 KB</td><td>C struct</td><td>非跨呼叫(F13:由 stack 移入 state)</td></tr>
+<tr><td><code>h1,h2,h3</code></td><td>(1,1,128) ×3</td><td>1,536</td><td>NPU runtime</td><td>3 層 GRU hidden;不同 WAV / stream 之間必須歸零</td></tr>
+<tr><td>1-hop spectrum 延遲</td><td>[257] ×2</td><td>2,056</td><td>host(呼叫端)</td><td>lookahead=1:gain 屬 t−1,呼叫端自存上一框頻譜</td></tr>
+<tr><td>輸入滑動窗</td><td>[512]</td><td>2,048</td><td>host(呼叫端)</td><td><code>rnnoise_analysis</code> 吃整窗,C 不代管</td></tr>
+<tr><td>ERB/Hann 表格</td><td><code>nfftborder[22]</code>、<code>erb_fwd/erb_inv[257][22]</code>、<code>hann_win[512]</code></td><td>—(.rodata)</td><td>編譯期常數</td><td><code>gen_rnnoise_tables.c</code> 產生 <code>rnnoise_tables_gen.h</code>,無執行期可變表格</td></tr>
+</table></div>
+<p class="note"><code>sizeof(RNNoiseState)</code> = 15,328 bytes(本機量測)。同一 stream 分 chunk
+處理必須傳遞 EMA + GRU state;README 對此有明確要求。</p>
+
+<h2>延遲與 warm-up</h2>
+<ul>
+<li><b>演算法延遲 = 1 hop = 256 samples = 16 ms</b>(<code>lookahead_frames=1</code>:
+3-tap conv 窗置中,gain 對應中間框 t−1;<code>RNNOISE_CONV_DELAY = 2 − LOOKAHEAD = 1</code>)。</li>
+<li>WOLA 重疊結構延遲:win−hop = 256 samples = 16 ms。</li>
+<li>Warm-up:<code>rnnoise_compute_features()</code> 前 2 框回 0(3-frame conv 窗未滿),
+此期間無模型輸出、無音訊輸出。</li>
+<li>EMA 正規化 warm-up:tau = 1.0 s(α=0.984,3·tau ≈ 187.5 框);v8 的 init 校準
+(−20/−45 dB、0.04/0.008,量測自本專案 16 k 語料)把 3 秒片段殘留 init 成分壓到 ~4.9%
+(config.ini [feature] 有完整紀錄)。</li>
+<li>C 特徵測試實證:stationary 輸入下 ERB mean 特徵收斂到 0、complex 特徵在 4096 框後
+仍可觀測(<code>test_rnnoise_features</code> PASS 訊息原文)。</li>
+</ul>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li>C 前後處理:<code>AINR/RNNoise-ERB/process.c</code> / <code>process.h</code>;表格產生器:<code>gen_rnnoise_tables.c</code> → <code>rnnoise_tables_gen.h</code></li>
+<li>模型 / 訓練 / 推論 / 匯出:<code>train.py</code>(<code>RNNoiseModel</code>)、<code>denoise.py</code>、<code>export_onnx.py</code>、<code>config.ini</code>、<code>calibrate_norm_init.py</code></li>
+<li>文件:<a href="../../AINR/RNNoise-ERB/README.md">README.md</a>(歷史版本紀錄在 <code>docs/archive/</code>)</li>
+<li>C 測試:<code>AINR/RNNoise-ERB/test/</code> — <code>make test</code> 實測全 PASS:
+tables byte-exact(canonical)、portable 數學合約(recompute max ULP 0)、
+config/Python/C feature 合約、feature-state 行為、SIMD/scalar digest <code>0506b5ee3d18afb8</code></li>
+<li>Python 測試:<code>AINR/RNNoise-ERB/tests/</code>(pytest)— 實測 24 passed;
+共用測試 <code>AINR/tests/</code> — 實測 14 passed</li>
+</ul>

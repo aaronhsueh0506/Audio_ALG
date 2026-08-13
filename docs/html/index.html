@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Audio_ALG 演算法文件站</title>
+<style>
+body{font-family:system-ui,-apple-system,"PingFang TC","Noto Sans TC",sans-serif;
+     max-width:70rem;margin:0 auto;padding:1rem 1.2rem;line-height:1.55;
+     color:#1c1c1c;background:#fdfdfd}
+@media (prefers-color-scheme:dark){body{color:#ddd;background:#161616}
+  a{color:#7ab8ff}nav,td,th,pre{border-color:#444 !important}
+  th{background:#242424 !important}pre{background:#1e1e1e !important}}
+nav{font-size:.85rem;border-bottom:1px solid #ccc;padding-bottom:.5rem;margin-bottom:1rem}
+nav a{margin-right:.35rem;white-space:nowrap}
+h1{font-size:1.45rem}h2{font-size:1.15rem;margin-top:1.6rem}
+table{border-collapse:collapse;width:100%;font-size:.88rem;margin:.6rem 0}
+th,td{border:1px solid #bbb;padding:.28rem .5rem;text-align:left;vertical-align:top}
+th{background:#f0f0f0}
+pre{background:#f5f5f5;border:1px solid #ddd;padding:.6rem;overflow-x:auto;
+    font-size:.8rem;line-height:1.35}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
+.note{font-size:.85rem;opacity:.85}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html"><b>索引</b></a> ·
+<a href="conventions.html">慣例</a> ·
+<a href="onnx_prepost.html">ONNX 邊界</a> ·
+<a href="aec.html">AEC</a> ·
+<a href="nr.html">NR</a> ·
+<a href="audio_common.html">audio_common</a> ·
+<a href="pipeline_mono.html">mono</a> ·
+<a href="pipeline_ulcnet_mono.html">mono-ULCNet</a> ·
+<a href="pipeline_4ch.html">4ch</a> ·
+<a href="pipeline_ulcnet_4ch.html">4ch-ULCNet</a> ·
+<a href="ainr_dfn2.html">DFN2</a> ·
+<a href="ainr_dfn3.html">DFN3</a> ·
+<a href="ainr_gtcrn.html">GTCRN</a> ·
+<a href="ainr_rnnoise_erb.html">RNNoise-ERB</a> ·
+<a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
+<a href="aiaec_align_cruse.html">Align-CRUSE</a> ·
+<a href="aiaec_deepvqe_s.html">DeepVQE-S</a> ·
+<a href="aiaec_cagcrn.html">CAGCRN</a> ·
+<a href="aiaec_gtcrn_aenr.html">GTCRN-AENR</a> ·
+<a href="aiaec_dfn_aenr.html">DFN-AENR</a>
+</nav>
+
+<h1>Audio_ALG 演算法文件站</h1>
+
+<h2>概要</h2>
+<p>本站是 <code>Audio_ALG</code> 整合 repo 的演算法/移植文件：每個模組一頁，
+純 HTML + 行內 CSS、零外部資源，可離線瀏覽。模組頁固定章節順序為：
+概要 / API 用法 / Block diagram / 訊號泳道圖 / I-O 表 / State 表 /
+延遲與 warm-up / 相關檔案與測試路徑。全站數字皆對照當前程式碼與測試，
+與程式碼衝突時以程式碼為準。</p>
+
+<h2>Repo 架構總覽</h2>
+<pre>
+SE/                                (同層四個 repo)
+│
+├── audio_common/                  共用基礎層 (被下面三者連結)
+│     include/: fft_wrapper.h (BACKEND=kiss/ne10 RFFT/IRFFT)
+│               simd_kernels.h · fast_math.h · wav_io.h · hpf.h
+│               mem_align.h · audio_resampler.h · audio_pre_gain.h
+│         ▲            ▲            ▲
+│         │            │            │ (libaudio_common.a)
+├── AEC/  ┘            │            │   primary dev repo：線性 AEC (PBFDKF
+│                      │            │   main/shadow) + delay est + AEC3 post
+├── NR/  ──────────────┘            │   primary dev repo：OM-LSA/MCRA NR
+│                                   │
+└── Audio_ALG/  ────────────────────┘   整合 repo (本文件站所在)
+      ├── lib/aec        = SE/AEC  submodule (c_impl/: libaec.a)
+      ├── lib/nr         = SE/NR   submodule (c_impl/: libmmse_lsa.a)
+      ├── pipelines/     mono C pipeline (audio_pipeline.c /
+      │     │            audio_pipeline_ulcnet.c)；連結三個 producer
+      │     │            archive：libaudio_common.a + libaec.a + libmmse_lsa.a
+      │     └── 4ch_pipelines/  4 通道 (4aec_nr_res.c + SRP-PHAT/GSC +
+      │                         audio_pipeline_4ch[_ulcnet].c)
+      ├── AINR/          NN NR：DFN2 / DFN3 / GTCRN / RNNoise-ERB
+      │                  (各自的 C 前後處理 + 訓練/推論 Python)
+      ├── AIAEC/         NN AEC/RES 六候選 (Python + Align_ULCNet 的 C 前後處理)
+      └── shared/        Python 工具
+</pre>
+<p class="note">建置關係出處：<code>pipelines/Makefile</code>（三個 producer archive、
+audio_common 位於 <code>../../audio_common</code>）。</p>
+
+<h2>頁面索引</h2>
+
+<table>
+<tr><th>頁面</th><th>一行描述</th></tr>
+<tr><td><a href="conventions.html">conventions</a></td>
+<td>全鏈 grid/window/framing 慣例表：各層 FFT/hop 預設與白名單、sqrt-Hann 慣例、
+PBFDKF 矩形窗例外、centered vs 串流 framing 等價性、ULCNet pipeline 延遲預算。</td></tr>
+<tr><td><a href="onnx_prepost.html">onnx_prepost</a></td>
+<td>全部 AINR + AIAEC 模型的 ONNX/NPU 邊界現況表：誰已有 C 前後處理、graph 內外分工、
+各模型 runtime 需跨呼叫保存的 states。</td></tr>
+</table>
+
+<h3>核心程式庫</h3>
+<table>
+<tr><th>頁面</th><th>一行描述</th></tr>
+<tr><td><a href="aec.html">aec</a></td>
+<td><code>lib/aec/c_impl</code>：PBFDKF main/shadow 線性濾波 + AEC3 matched-filter
+delay estimator + AEC3 post（RES/CNG/suppression）；grid 8k/256、16k/256|512、48k/1024。</td></tr>
+<tr><td><a href="nr.html">nr</a></td>
+<td><code>lib/nr/c_impl</code>：OM-LSA 核心（MCRA 噪聲估計 + SPP + LSA gain），
+4 檔強度 preset + stationary content mode；呼叫端持有 FFT/窗/OLA。</td></tr>
+<tr><td><a href="audio_common.html">audio_common</a></td>
+<td>共用基礎層：<code>fft_wrapper.h</code>（kiss/ne10 後端）、SIMD kernels、
+fast_math、WAV I/O、HPF、resampler；三個上層 repo 的唯一 FFT 來源。</td></tr>
+</table>
+
+<h3>Pipelines（C 整合層）</h3>
+<table>
+<tr><th>頁面</th><th>一行描述</th></tr>
+<tr><td><a href="pipeline_mono.html">pipeline_mono</a></td>
+<td><code>pipelines/audio_pipeline.c</code>：AEC(linear) → echo-aware NR → RES，
+pool-first 零 heap；grid 8k/256、16k/256|512、48k/1024。</td></tr>
+<tr><td><a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a></td>
+<td><code>pipelines/audio_pipeline_ulcnet.c</code>：AEC 線性誤差 + Align-ULCNet
+NN post-filter（per-frame callback）；16k/512/256 固定，演算法延遲 1 hop = 16 ms。</td></tr>
+<tr><td><a href="pipeline_4ch.html">pipeline_4ch</a></td>
+<td><code>pipelines/4ch_pipelines/</code>：4×AEC lanes + 共享 delay + SRP-PHAT DOA +
+GSC beamforming + post RES/NR（<code>4aec_nr_res.c</code> 核心）。</td></tr>
+<tr><td><a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a></td>
+<td><code>audio_pipeline_4ch_ulcnet.c</code>：beamformed 線性誤差 → Align-ULCNet
+NN post stage；新增演算法延遲 2 hops = 32 ms。</td></tr>
+</table>
+
+<h3>AINR（NN 降噪模型）</h3>
+<table>
+<tr><th>頁面</th><th>一行描述</th></tr>
+<tr><td><a href="ainr_dfn2.html">ainr_dfn2</a></td>
+<td>DeepFilterNet2：48k、1024/512（非上游 960/480）；C 前後處理
+<code>dfn2_process.c</code>（STFT/ERB+complex 特徵/EMA 正規化/compose/ISTFT），
+graph 只含 heads。</td></tr>
+<tr><td><a href="ainr_dfn3.html">ainr_dfn3</a></td>
+<td>DeepFilterNet3：同 grid；平行 band-split（DF 與 mask 各管一段），
+串流總延遲 1 hop（DFN2 cascade 為 2）；C 前後處理 <code>dfn3_process.c</code>。</td></tr>
+<tr><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td>
+<td>GTCRN：16k、512/256；C 端 <code>gtcrn_process.c</code> 只做 STFT/ISTFT，
+頻譜之間全部在網路；上游已有 N=1 streaming cache 參考。</td></tr>
+<tr><td><a href="ainr_rnnoise_erb.html">ainr_rnnoise_erb</a></td>
+<td>RNNoise-ERB：16k、512/256、22 ERB bands + 0–4 kHz complex 特徵；
+唯一有 in-repo ONNX 匯出（<code>export_onnx.py</code>，GRU h1–h3 顯式進出）。</td></tr>
+</table>
+
+<h3>AIAEC（NN AEC/RES 六候選）</h3>
+<table>
+<tr><th>頁面</th><th>一行描述</th></tr>
+<tr><td><a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a></td>
+<td>Align-ULCNet：16k/512/256；唯一已有 C 前後處理的候選
+（<code>ulcnet_process.c</code>，centered STFT×2 + WOLA + NPU callback 邊界）。</td></tr>
+<tr><td><a href="aiaec_align_cruse.html">aiaec_align_cruse</a></td>
+<td>Align-CRUSE：16k/512/256；cumsum 無衰減積分器與 paper_global 非因果
+mode 是 streaming 語意風險。</td></tr>
+<tr><td><a href="aiaec_deepvqe_s.html">aiaec_deepvqe_s</a></td>
+<td>DeepVQE-S：16k/512/256；時間軸最乾淨的候選（純 causal conv + 每幀獨立
+attention），輸出 3×3 complex convolving mask。</td></tr>
+<tr><td><a href="aiaec_cagcrn.html">aiaec_cagcrn</a></td>
+<td>CAGCRN：16k/512/256；參數最少（54,963），但 NPU op 面最重
+（CATA broadcast、動態 ConvTranspose2d）。</td></tr>
+<tr><td><a href="aiaec_gtcrn_aenr.html">aiaec_gtcrn_aenr</a></td>
+<td>GTCRN-AENR：鎖死 16k/512/256；骨幹 = AINR GTCRN（第一層 9→18 ch），
+STFT/ISTFT 可直接重用 <code>gtcrn_process.c</code>。</td></tr>
+<tr><td><a href="aiaec_dfn_aenr.html">aiaec_dfn_aenr</a></td>
+<td>DFN-AENR：48k/1024/512（16k 變體 512/256）；error+far 雙路條件化的
+DFN2 cascade，lookahead 2 hops；C 化需 <code>dfn2_process</code> 的雙倍 state 擴充。</td></tr>
+</table>
+
+<h2>相關檔案與測試路徑</h2>
+<table>
+<tr><th>類別</th><th>路徑（相對 repo 根）</th></tr>
+<tr><td>本站</td><td><code>docs/html/</code>（本頁 = <code>index.html</code>）</td></tr>
+<tr><td>整合手冊</td><td><code>docs/c_user_manual_zh_TW.md</code>、
+<code>docs/integration_mono_zh_TW.md</code>、<code>docs/integration_4ch_core_zh_TW.md</code>、
+<code>docs/integration_4ch_spatial_zh_TW.md</code></td></tr>
+<tr><td>AIAEC 設計文件</td><td><code>docs/aiaec_streaming_readiness_zh_TW.md</code>、
+<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code></td></tr>
+<tr><td>pipeline 測試</td><td><code>pipelines/tests/</code>、
+<code>pipelines/4ch_pipelines/tests/</code></td></tr>
+<tr><td>模型測試</td><td><code>AINR/*/tests/</code>、<code>AINR/tests/</code>、
+<code>AIAEC/tests/</code></td></tr>
+<tr><td>程式庫測試</td><td><code>lib/aec/c_impl/test/</code>、<code>lib/nr/c_impl/test/</code></td></tr>
+</table>
+
+</body>
+</html>

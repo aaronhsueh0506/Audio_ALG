@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CAGCRN — AIAEC 候選</title>
+<style>
+body{font-family:-apple-system,"Noto Sans TC",sans-serif;max-width:62em;margin:0 auto;padding:1em 1.2em;line-height:1.55;color:#222;background:#fff}
+nav{font-size:.9em;border-bottom:1px solid #ccc;padding-bottom:.5em;margin-bottom:1em}
+nav a{margin-right:.7em}
+h1{font-size:1.4em}h2{font-size:1.12em;border-bottom:1px solid #ddd;padding-bottom:.15em;margin-top:1.5em}
+pre{background:#f6f7f8;border:1px solid #ddd;padding:.7em;overflow-x:auto;font-size:.8em;line-height:1.35}
+code{background:#f2f3f4;padding:0 .15em}
+table{border-collapse:collapse;font-size:.85em;margin:.6em 0;display:block;overflow-x:auto}
+th,td{border:1px solid #bbb;padding:.22em .5em;text-align:left;white-space:nowrap}
+th{background:#eef0f2}
+.note{background:#fff8e1;border:1px solid #e0c96e;padding:.5em .7em;font-size:.9em;margin:.6em 0}
+@media (prefers-color-scheme:dark){body{background:#151719;color:#ddd}pre,code{background:#1e2124;border-color:#333}th{background:#26292d}th,td{border-color:#444}.note{background:#2a2410;border-color:#6b5c1e}nav{border-color:#333}a{color:#7db3e8}}
+</style>
+</head>
+<body>
+<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html"><b>CAGCRN</b></a><a href="aiaec_gtcrn_aenr.html">GTCRN-AENR</a><a href="aiaec_dfn_aenr.html">DFN-AENR</a></nav>
+<h1>CAGCRN（end-to-end AEC+RES+NR，backup）</h1>
+
+<h2>概要</h2>
+<p>Wang et al.（INTERSPEECH 2025-608）的重建。task（<code>dataset_gen/model_views.py</code>）=
+<code>end_to_end_aec_res_nr_dereverb</code>：輸入是<b>未對齊的 microphone 與 far-end
+複數頻譜</b>（<code>mic_postclip</code> / <code>far_render</code>）；target 是
+<code>near_target</code>。輸出是 bounded CRM（Tanh，<code>[B,2,T,257]</code>）乘在 mic 頻譜。
+論文未公開原始碼、ERB 帶數、delay 上限、decoder 通道與 Mask 塊細節；本實作以
+可微分 soft delay-window gate（<code>raw_window</code> 純量參數）取代不可微的整數
+<code>floor(D)</code> 窗——與任何未公開作者實作 checkpoint 不相容。</p>
+<p>參數量實測 <b>54,963</b> trainable + <b>12,929</b> buffer（ERB merge/split 固定矩陣）；
+state_dict 總量約 0.068 M 值，對應論文 0.07 M class（test：
+<code>test_published_size_classes_are_preserved_on_project_grid</code>，釘 60k–80k）。
+16k grid：ERB 保留 2 kHz 以下線性 65 bins + 高頻 32 帶 → <code>compressed_bins = 97</code>；
+<code>max_delay_frames = 63</code>；<code>stream_output_delay = 0</code>。</p>
+<p><b>ONNX / NPU graph boundary</b>（尚無 export 檔；boundary 由 streaming reference 固定）：
+graph <b>內</b> = <code>mag_ri_feature</code>、<code>ErbBandCodec.merge/split</code>（matmul）、
+四層殘差 causal encoder ×2（depthwise dilated conv，dilation 至 4）、CATA（mic
+自注意 <code>softmax</code> + 對 delay 軸的 <code>softmax</code>，學到的 window gate 在推論期是
+常數 log-bias，<code>create_stream_state()</code> 已預先算成 <code>cata_gate_log</code>）、
+TFGRU ×2（<b>頻率軸 bidirectional GRU</b> 每幀獨立 + 時間軸 GRU，hidden 是
+per-frequency-bin）、TFAG、mirror decoder（含 <code>ConvTranspose2d</code>）、Tanh mask。
+graph <b>外</b>（C 前後處理）= centered sqrt-Hann STFT/ISTFT 與 complex↔RI。
+recurrent state 全為顯式 I/O tensor。</p>
+<div class="note"><b>NPU 風險（readiness §3.4，六候選中 op 面最重）</b>：CATA 的
+<code>q.unsqueeze(3)*delayed</code> 逐幀仍是 <code>[B,24,1,63,49]</code>（≈74k 元素）broadcast；
+decoder 的 <code>ConvTranspose2d</code> 用動態 <code>output_size</code>，export 前必須固定。</div>
+
+<h2>API 用法</h2>
+<pre>from AIAEC.CAGCRN.denoise import load_model
+from AIAEC.aiaec_streaming import StreamSTFT, StreamISTFT
+
+model, grid = load_model("ckpt.pth", "cpu")
+state = model.create_stream_state()   # 23 個 cell/常數（見 State 表）
+mic_stft = StreamSTFT(grid.n_fft, grid.hop_len, window)
+far_stft = StreamSTFT(grid.n_fft, grid.hop_len, window)
+synth    = StreamISTFT(grid.n_fft, grid.hop_len, window)
+for s in range(0, n, grid.hop_len):
+    for m, f in zip(mic_stft.push(mic[:, s:s+256]), far_stft.push(far[:, s:s+256])):
+        out = model.forward_stream(microphone=m.unsqueeze(1),
+                                   far_end=f.unsqueeze(1), state=state)
+        samples = synth.push(out.enhanced[:, 0])</pre>
+<pre>python3 AIAEC/CAGCRN/streaming.py checkpoint.pth mic.wav far.wav out.wav [--verify] [--device cpu]</pre>
+
+<h2>Block diagram</h2>
+<pre>mic ──► StreamSTFT ─► [B,1,257] cplx        far ──► StreamSTFT ─► [B,1,257] cplx
+        │ mag_ri_feature + erb.merge                │ mag_ri_feature + erb.merge
+        ▼ [B,3,1,97]                                ▼ [B,3,1,97]
+  _stream_encoder_block(mic_encoder[0])       _stream_encoder_block(far_encoder[0])
+        │ mic [B,12,1,49]                           │ far [B,12,1,49]
+        │      ┌─────────────────────────────────────┘
+        ▼      ▼
+  _stream_cata(cata, ...)  （CATA：mic_query/mic_key 自注意 softmax；
+        │                   ref_kv → cata_ring(63) → delay softmax + cata_gate_log）
+        │ far' [B,24,1,49], delay [B,1,63], full_attention [B,24,1,63,49]
+        ▼
+  mic/far encoder blocks 1..3（_stream_encoder_block，depthwise dilated 1/2/4）
+        │ mic [B,24,1,25]  far [B,24,1,25]（skip 各層存 mic_skips/far_skips）
+        ▼
+  _stream_tfgru(mic_tfgru) / _stream_tfgru(far_tfgru)
+  （freq BiGRU 每幀 + time GRU per-bin hidden (1,25,24)）
+        ▼
+  _stream_tfag(tfag)（freq1/freq2 每幀；time1/time2 (5,1) 走 cell）
+        ▼ x [B,24,1,25]
+  decoder 0..3（_stream_decoder_block + skip_mic/skip_far 1x1）
+        ▼ x [B,12,1,97]
+  mask = Conv2d(12,2,1) + Tanh → erb.split → mask_full [B,2,1,257]
+        ▼
+  enhanced = complex_mask(mask_full, microphone) ──► StreamISTFT ──► 256 smp</pre>
+
+<h2>訊號泳道圖</h2>
+<pre>hop（256 smp = 16 ms @16k）  h0          h1                h2         h3       …  flush
+caller（送樣本）             mic/far 256  256               256        256         —
+C pre：StreamSTFT×2          0 幀        F0+F1（reflect    F2         F3          尾幀
+（centered sqrt-Hann）                    前綴湊滿後補發）
+NN：forward_stream           —           out(F0), out(F1)  out(F2)    out(F3)     每尾幀 1 out
+（delay 0；同 invocation 出幀）
+C post：StreamISTFT          —           out(F0)→0 smp     256 smp    256 smp     尾段補齊
+                                          out(F1)→256 smp
+輸出樣本對應輸入區間         —           [0,256)           [256,512)  [512,768)
+hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本身 0 hop。</pre>
+
+<h2>I/O 表</h2>
+<p>Streaming（每 invocation 恰 1 幀 = 256 個新 samples；<code>streaming.py</code>
+開機打印之實測，B=1、16k）：</p>
+<table>
+<tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
+<tr><td>microphone</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far_end</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>enhanced</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>mask（bounded CRM）</td><td>out</td><td>(1, 2, 1, 257)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>delay_distribution</td><td>out</td><td>(1, 1, 63)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>aux erb_mask</td><td>out</td><td>(1, 2, 1, 97)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>aux cata_attention</td><td>out</td><td>(1, 24, 1, 63, 49)</td><td>float32</td><td>1</td><td>—（診斷用，逐幀 74k 元素）</td></tr>
+</table>
+<p>Offline <code>forward(microphone, far_end)</code>：同名 tensor、T 軸為整段幀數。</p>
+
+<h2>State 表</h2>
+<p><code>state_report</code> 實測（B=1 fp32，total <b>431.7 KB</b>）。部署契約：顯式
+state I/O，由 NPU runtime／host 保存；STFT/ISTFT 屬 C struct 層：</p>
+<table>
+<tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
+<tr><td>cata_ring.ring（延遲 far 特徵）</td><td>(1, 24, 63, 49)</td><td>289.4 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>cata_gate_log（推論期常數）</td><td>(63,)</td><td>0.2 KB</td><td>常數表（隨權重部署）</td></tr>
+<tr><td>cata_query / cata_key / cata_ref_kv .history</td><td>(1,12,2,49) / (1,24,2,49) / (1,12,2,49)</td><td>4.6 / 9.2 / 4.6 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>mic_enc0..3_group.history</td><td>(1,12,2,49) / (1,12,2,25) / (1,12,4,25) / (1,24,8,25)</td><td>4.6 / 2.3 / 4.7 / 18.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>far_enc0..3_group.history</td><td>(1,12,2,49) / (1,24,2,25) / (1,24,4,25) / (1,24,8,25)</td><td>4.6 / 4.7 / 9.4 / 18.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>mic_tfgru_time / far_tfgru_time .hidden（per-bin）</td><td>(1, 25, 24) ×2</td><td>2.3 KB ×2</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>tfag_time1 / tfag_time2 .history</td><td>(1,12,4,25) / (1,12,8,25)</td><td>4.7 / 9.4 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>dec0..3_group.history</td><td>(1,24,8,25) / (1,12,4,25) / (1,12,2,49) / (1,12,2,97)</td><td>18.8 / 4.7 / 4.6 / 9.1 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td><b>NN 合計</b></td><td></td><td><b>431.7 KB</b></td><td></td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>C struct（Python reference：host）</td></tr>
+</table>
+<p>LayerNorm ×4 只作用在 channel 軸（無跨時間統計）；可學 delay window
+（<code>raw_window</code>）在推論期為常數，已在 <code>create_stream_state()</code> 內以
+<code>torch.no_grad()</code> 預計算成 <code>cata_gate_log</code>。</p>
+
+<h2>延遲與 warm-up</h2>
+<ul>
+<li>NN 演算法 lookahead = <b>0 hop</b>；zero-init ≡ offline 左零 padding，
+<b>無 warm-up 特例</b>（CATA delay softmax 每幀獨立、無累積 state）。</li>
+<li>實測 stream-vs-offline（seeds 0/1、B=2、T=96）：enhanced/mask/delay/erb_mask 最差
+5.3e-7（純 fp32 累加順序噪音）；TOL 以 ~10x headroom 釘 5e-6
+（<code>test_streaming_cagcrn.py</code> 檔頭）。</li>
+<li>Framing：center=True → 半窗 256 samples（16 ms）lookahead；端到端演算法延遲 256
+samples。</li>
+</ul>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>AIAEC/CAGCRN/model.py</code>（<code>CAGCRN</code>、<code>CrossAttentionTemporalAlignment</code>、<code>TFGRU</code>、<code>TFAG</code>、<code>ErbBandCodec</code>、<code>_stream_*</code> helpers）</li>
+<li><code>AIAEC/CAGCRN/streaming.py</code>、<code>denoise.py</code>、<code>train.py</code>、<code>config.ini</code></li>
+<li>tests：<code>AIAEC/tests/test_streaming_cagcrn.py</code>（4 tests）、<code>test_candidate_models.py</code>（含 <code>test_cagcrn_soft_window_has_gradient</code>）——全套 <code>python3 -m pytest AIAEC/tests</code> = 122 passed（2026-08-13 實測）</li>
+<li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.4</li>
+</ul>
+</body>
+</html>

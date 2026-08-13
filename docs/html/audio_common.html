@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>audio_common (FFT / shared DSP)</title>
+<style>
+body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem;margin-left:auto;margin-right:auto}
+nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
+nav a{margin-right:1rem;color:#164;text-decoration:none;font-weight:600}
+nav a:hover{text-decoration:underline}
+h1{font-size:1.5rem;border-bottom:1px solid #ccc;padding-bottom:.3rem}
+h2{font-size:1.15rem;margin-top:1.6rem;border-left:4px solid #2a6;padding-left:.5rem}
+table{border-collapse:collapse;margin:.6rem 0;font-size:.88rem}
+th,td{border:1px solid #bbb;padding:.25rem .5rem;text-align:left;vertical-align:top}
+th{background:#eef5f0}
+pre{background:#f4f6f5;border:1px solid #dde;padding:.6rem;overflow-x:auto;font-size:.8rem;line-height:1.35}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.86em;background:#f2f2f2;padding:0 .15em}
+pre code{background:none;padding:0}
+.note{background:#fff8e6;border:1px solid #e0c878;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.small{font-size:.82rem;color:#555}
+.tblwrap{overflow-x:auto}
+</style>
+</head>
+<body>
+<nav><a href="index.html">index</a><a href="aec.html">aec</a><a href="nr.html">nr</a><a href="audio_common.html">audio_common</a></nav>
+<h1>audio_common — 共用 DSP 層(FFT wrapper 等)</h1>
+
+<h2>概要</h2>
+<p><code>audio_common</code> 是 AEC / NR / Audio_ALG pipelines 共用的 DSP 底層,與 Audio_ALG 同層的獨立 repo(引用時 <code>-I audio_common/include</code> + 連結 <code>libaudio_common.a</code>)。本頁聚焦 <code>FftHandle</code> 契約與零 heap 慣例;其餘模組(fast_math、simd_kernels、HPF、pre-gain、resampler、wav_io)列於檔案節。</p>
+<ul>
+<li><b>一個公開 API、兩個後端</b>:KISS(可攜參考、bit-reproducible、host/CI 用)與 NE10(ARM NEON、嵌入式用)。後端是 build 旋鈕(<code>make BACKEND=kiss|ne10</code>)不是分支屬性。<b>NE10 與 KISS 輸出不逐位元相同</b>;所有 vs-Python parity 保證僅限 KISS。同一後端下 heap 與 static 路徑 byte-equal(selftest 實測)。</li>
+<li><b>FP 政策</b>:<code>-ffp-contract=off</code> 是四 repo 統一政策,每個 Makefile 把它放在 CFLAGS 最後且在 parse 期擋掉 <code>-ffast-math</code>/<code>-Ofast</code>/自帶 <code>-ffp-contract</code> 的覆寫;<code>scripts/audit_fp_contract.sh</code> 用反組譯證明無自動 FMA。</li>
+<li><b>float32 全面政策</b>:production 路徑全 f32(唯一例外:KISS 在 plan 期以 double 算 twiddle;NE10 後端連 init 都無 double)。</li>
+</ul>
+
+<h2>API 用法</h2>
+<pre><code>#include "fft_wrapper.h"
+
+/* 靜態路徑(嵌入式;get_mem_size 含後端 twiddle/cfg 的每一個 byte) */
+size_t bytes = fft_get_mem_size(512);        /* 0 = fft_size 不在白名單 */
+FftHandle* h = fft_init(pool, bytes, 512);   /* pool 16-byte 對齊 */
+/* 或 heap:FftHandle* h = fft_create(512); */
+
+int n_freqs = fft_get_n_freqs(h);            /* 512/2+1 = 257 */
+
+float   time_buf[512];
+Complex spec[257];
+fft_forward(h, time_buf, spec);   /* 未正規化 rfft;buffer 不得重疊(restrict) */
+fft_inverse(h, spec, time_buf);   /* irfft × 1/N(兩後端同約定) */
+
+/* 輸入可拋棄時的免防禦性複製版本(輸入內容呼叫後未定義): */
+fft_forward_scratch(h, scratch_time, spec);
+fft_inverse_scratch(h, scratch_spec, time_buf);
+
+fft_destroy(h);   /* fft_init 的 handle:真 no-op、可重複呼叫 */</code></pre>
+<p><b>FftHandle 契約重點</b>:</p>
+<ul>
+<li><code>fft_size</code> 必須是 2 的冪且在 [16, 8192](兩後端一致拒絕範圍外,回 0/NULL)。</li>
+<li>handle 為 <b>caller-owned</b>:誰配置誰持有,函式庫不藏全域 state;一支 handle 可被多個模組共借——AEC 整個實例(main filter、shadow filter、aec3_post)只carve<b>一支</b> <code>FftHandle</code>(AEC <code>make test-shared-fft-handle</code> 以指標相等實測,63 checks)。</li>
+<li>正規化約定:<code>fft_forward</code> = 未正規化 rfft;<code>fft_inverse</code> = irfft × 1/N。KISS 手動除 N;NE10 的 c2r 自動縮放<b>只因為</b> Makefile 明確 pin 了 <code>NE10_DSP_RFFT_SCALING</code>(round-trip 驗證過)——不要在沒有它的情況下編 NE10。</li>
+<li><code>fft_forward/fft_inverse</code> 參數帶 <code>restrict</code>:輸入輸出不得重疊(全 repo call site 已稽核);需要就地風格用 <code>*_scratch</code> 變體。</li>
+<li>純函式 helpers(無 state):<code>fft_magnitude / fft_power / fft_apply_gain</code>(<code>fft_phase / fft_from_mag_phase</code> 已宣告但目前全 repo 無呼叫者——見標頭註解)。</li>
+</ul>
+
+<p><b>sqrt-Hann 慣例(誠實說明)</b>:audio_common <b>不輸出</b> sqrt-Hann 建表函式。四 repo 共用的是「window = sqrt(periodic Hann)(denom = N、<code>sym=False</code>),50% overlap 即 COLA、無需再正規化」這個<b>約定</b>,各 consumer 自建常數表:AEC <code>lib/aec/c_impl/src/pbfdkf.c</code>(<code>sqrt_hann</code> 分析窗)、NR 範例 <code>lib/nr/c_impl/example/main_mem.c</code> 的 <code>build_sqrt_hann()</code>(bit-match <code>np.sqrt(hann(N, sym=False))</code>)、pipeline <code>pipelines/audio_pipeline.c</code>(<code>synth_win</code> 合成窗)。</p>
+
+<p><b>零 heap 慣例(全模組一體適用)</b>:每個模組都有 heap 路徑(<code>X_create/X_destroy</code>)與 static 路徑(<code>X_get_mem_size(...)</code> + <code>X_init(void* mem, size_t mem_size, ...)</code>),runtime 以 <code>pool_owned/is_static</code> 旗標區分、無編譯期開關;<code>get_mem_size</code> 與 <code>init</code> 必須以<b>相同順序</b>走欄位(對齊 <code>ALIGN16</code>,見 <code>mem_align.h</code>);<code>X_destroy</code> 對兩路徑都安全(pool 實例不 free 任何東西)。<code>fft_get_mem_size</code> 涵蓋 <code>fft_init</code> 會碰的每一個 byte(含後端內部 cfg),兩後端在 init 路徑上完全不碰 heap(<code>test_fft_zero_heap</code> 以 allocator hook 實測)。</p>
+
+<h2>Block diagram(FftHandle 的組成與資料流)</h2>
+<pre>
+ fft_get_mem_size(N) ── 與 fft_init 同序走欄位(lockstep 契約)
+        |
+ fft_init(pool, bytes, N)                fft_create(N)   ← 單一 heap 配置
+        |                                     |
+        +──────────────┬──────────────────────+
+                       v
+   FftHandle { 後端 cfg(KISS: kiss_fftr cfg / NE10: r2c cfg+twiddle)
+               + 內部 scratch + n_freqs }         ← 全部在同一塊記憶體
+                       |
+   fft_forward:  time_in float32[N] ──(backend rfft, 未正規化)──> freq_out Complex[N/2+1]
+   fft_inverse:  freq_in Complex[N/2+1] ──(backend irfft × 1/N)──> time_out float32[N]
+                       |
+   fft_power / fft_magnitude / fft_apply_gain   ← 無 handle、無 state 的逐 bin helpers
+</pre>
+
+<h2>訊號泳道圖(共用 WOLA 框架約定;hop 為欄)</h2>
+<p class="small">FFT 本身無跨呼叫 state、同呼叫內完成;下圖是 consumer(NR 範例 runner / pipeline 合成端)套在它上面的 50%-overlap sqrt-Hann WOLA 慣例與其 1 hop 框架延遲。</p>
+<pre>
+hop →              N-1                       N                        N+1
+────────────────────────────────────────────────────────────────────────────────
+caller 組幀     frame=[hop N-2|hop N-1]    frame=[hop N-1|hop N]     frame=[hop N|hop N+1]
+                × sqrt_hann(分析)          × sqrt_hann               × sqrt_hann
+────────────────────────────────────────────────────────────────────────────────
+fft_forward     spec(N-1)[n_freqs]         spec(N)                   spec(N+1)
+ (同 hop 完成)   ── 0 lag ──
+────────────────────────────────────────────────────────────────────────────────
+(處理:增益等)   spec'(N-1)                 spec'(N)                  spec'(N+1)
+────────────────────────────────────────────────────────────────────────────────
+fft_inverse     y(N-1)[N] × synth_win      y(N) × synth_win          y(N+1) × synth_win
+ + OLA          out_hop(N-1) = y(N-1) 前半 + y(N-2) 後半
+                ── 發出的 hop 混了前一 frame 的貢獻 → 框架 1 hop lag(由 caller 承擔)──
+</pre>
+
+<h2>I O 表</h2>
+<div class="tblwrap"><table>
+<tr><th>張量</th><th>shape</th><th>dtype</th><th>每次呼叫幀數</th><th>時域樣本數</th><th>備註</th></tr>
+<tr><td><code>fft_forward.time_in</code></td><td>[fft_size]</td><td>float32</td><td>1 frame</td><td>fft_size(128–1024 常用)</td><td>不得與輸出重疊</td></tr>
+<tr><td><code>fft_forward.freq_out</code></td><td>[n_freqs]</td><td><code>Complex</code>{float r; float i;}</td><td>1</td><td>—</td><td>n_freqs = fft_size/2+1;未正規化</td></tr>
+<tr><td><code>fft_inverse.freq_in / time_out</code></td><td>[n_freqs] / [fft_size]</td><td>Complex / float32</td><td>1</td><td>fft_size</td><td>已含 ×1/N</td></tr>
+<tr><td><code>fft_power / fft_magnitude</code> 輸出</td><td>[n_freqs]</td><td>float32</td><td>1</td><td>—</td><td>|X|² / |X|</td></tr>
+<tr><td><code>fft_apply_gain</code></td><td>freq [n_freqs] × gain [n_freqs]</td><td>Complex × float32</td><td>1</td><td>—</td><td>就地相乘</td></tr>
+</table></div>
+
+<h2>State 表(跨呼叫 state)</h2>
+<div class="tblwrap"><table>
+<tr><th>state</th><th>大小</th><th>誰存放</th><th>內容</th></tr>
+<tr><td><code>FftHandle</code>(後端 cfg + twiddle + scratch)</td><td>KISS 實測:128→4,688 B、256→8,784 B、512→16,976 B、1024→33,360 B。NE10:688 + 21×fft_size B(對齊前;標頭文件公式)</td><td>C struct(caller pool 經 <code>fft_init</code>,或 heap 經 <code>fft_create</code>)</td><td>plan 期常數(twiddle);<b>呼叫間無可變 state</b>——forward/inverse 為純轉換</td></tr>
+<tr><td><code>Hpf</code>(biquad DF2-transposed)</td><td><code>hpf_get_mem_size()</code>(小,固定)</td><td>C struct(pool/heap)</td><td>2 階濾波器延遲線(跨樣本 state;<code>hpf_reset</code> 清除)</td></tr>
+<tr><td><code>AudioResampler</code></td><td><code>audio_resampler_get_mem_size(in,out,ch)</code></td><td>C struct(pool/heap)</td><td>polyphase 串流歷史(block 邊界不變式;<code>reset</code> 只在換流時呼叫)</td></tr>
+<tr><td>fast_math / simd_kernels</td><td>—</td><td>header-only、無 state</td><td>純函式(LUT 為編譯期常數)</td></tr>
+</table></div>
+<p class="small">本 repo 無 NN/NPU 成分;所有 state 都在上述 C struct 內,host 不需另存。</p>
+
+<h2>延遲與 warm-up</h2>
+<ul>
+<li><code>fft_forward/fft_inverse</code>:單呼叫內完成,<b>0 樣本延遲、無 warm-up</b>。WOLA 框架的 1 hop 延遲屬於 consumer 的組幀/OLA 慣例(見泳道圖),不屬於本函式庫。</li>
+<li><code>Hpf</code>:IIR biquad,無整體(bulk)延遲、無 warm-up(初始 state 為 0)。</li>
+<li><code>AudioResampler</code>:有濾波器延遲,查 <code>audio_resampler_latency_input_frames()</code>;等取樣率為精確 pass-through。</li>
+</ul>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li>FFT:<code>audio_common/include/fft_wrapper.h</code>、<code>src/fft_wrapper.c</code>(KISS)、<code>src/fft_wrapper_ne10.c</code>(NE10);vendored 後端:<code>lib/kiss_fft/</code>、<code>lib/ne10/</code>(本地 patch 記錄於 <code>lib/ne10/VENDORED.md</code>,含 P0003 白名單)</li>
+<li>其他模組:<code>include/fast_math.h</code>、<code>include/simd_kernels.h</code>、<code>include/hpf.h</code>+<code>src/hpf.c</code>、<code>include/audio_pre_gain.h</code>、<code>include/audio_resampler.h</code>、<code>include/wav_io.h</code>、<code>include/mem_align.h</code></li>
+<li>文件:<code>audio_common/docs/c_user_manual_zh_TW.md</code>、<code>audio_common/README.md</code>(build/後端/FP 政策)</li>
+<li>測試(本頁撰寫時實跑):<code>make selftest</code> ALL PASS,TOTAL CHECKS: 17,723,487(SK_HAVE_NEON=1;含 round-trip、static-vs-heap 頻譜與時域 byte-equal、NEON-vs-scalar 逐位元)/ <code>make test_audio_utils</code> 全過(pre-gain + 全部支援的 resample 率對)/ <code>make test_pool</code> ALL PASS / <code>make test_fft_zero_heap</code>(allocator-hook 零 heap 檢查,AEC 端 <code>test-zero-heap</code> 一併實跑 PASS)</li>
+</ul>
+</body>
+</html>
