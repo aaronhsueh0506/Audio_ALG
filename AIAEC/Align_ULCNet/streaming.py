@@ -57,6 +57,14 @@ def build_parser() -> argparse.ArgumentParser:
              'bypass this project\'s PBFDKF and run only the neural post-filter',
     )
     parser.add_argument(
+        '--max-delay-frames', type=int, default=None,
+        help='Deployment override for the alignment search depth D. The '
+             'checkpoint contract stays the source of truth; when this '
+             'differs, only the alignment depth is rebuilt (weights are '
+             'D-agnostic, but the output is NOT numerically identical '
+             'across D).',
+    )
+    parser.add_argument(
         '--verify', action='store_true',
         help='Also run the offline whole-utterance forward and print the '
              'max-abs and RMS difference between the two output waveforms',
@@ -81,7 +89,9 @@ def _print_io_table(inputs, output):
 
 def main(args):
     device = auto_device(args.device)
-    model, grid, linear_contract = load_model(args.checkpoint, device)
+    model, grid, linear_contract = load_model(
+        args.checkpoint, device, max_delay_frames=args.max_delay_frames
+    )
 
     if args.input_is_linear_error:
         error, far, source_rates = load_linear_error_far(
@@ -119,6 +129,13 @@ def main(args):
 
     def run_frames(error_frames, far_frames):
         nonlocal emitted, frames_done
+        # Hard check, not `assert` (must survive python -O): zip() would
+        # silently truncate to the shorter list and drop frames.
+        if len(error_frames) != len(far_frames):
+            raise RuntimeError(
+                f"error/far frame lists diverged: {len(error_frames)} error "
+                f"frames vs {len(far_frames)} far frames"
+            )
         for error_frame, far_frame in zip(error_frames, far_frames):
             inputs = {
                 "linear_error": error_frame.unsqueeze(1),   # complex [B,1,F]

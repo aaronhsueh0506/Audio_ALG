@@ -94,7 +94,13 @@ def main(args):
 
     def run_frames(mic_frames, far_frames):
         nonlocal emitted, printed_contract
-        assert len(mic_frames) == len(far_frames)
+        # Hard check, not `assert` (must survive python -O): zip() would
+        # silently truncate to the shorter list and drop frames.
+        if len(mic_frames) != len(far_frames):
+            raise RuntimeError(
+                f"mic/far frame lists diverged: {len(mic_frames)} mic frames "
+                f"vs {len(far_frames)} far frames"
+            )
         for mic_frame, far_frame in zip(mic_frames, far_frames):
             microphone = mic_frame.unsqueeze(1)   # [B,1,F] complex
             far_end = far_frame.unsqueeze(1)

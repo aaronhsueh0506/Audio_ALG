@@ -30,6 +30,8 @@ that already provide KF residual Z. It does not make an external KF equivalent
 to the frozen PBFDKF used to train this repository's checkpoint.
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import sys
@@ -71,10 +73,27 @@ def build_parser() -> argparse.ArgumentParser:
         help='Evaluation only: first WAV is an existing KF/AEC error Z; '
              'bypass this project\'s PBFDKF and run only the neural post-filter',
     )
+    parser.add_argument(
+        '--max-delay-frames', type=int, default=None,
+        help='Deployment override for the alignment search depth D. The '
+             'checkpoint contract stays the source of truth; when this '
+             'differs, only the alignment depth is rebuilt (weights are '
+             'D-agnostic, but the output is NOT numerically identical '
+             'across D).',
+    )
+    parser.add_argument(
+        '--stream', action='store_true',
+        help='Run the model through create_stream_state()/forward_stream() '
+             'one STFT frame at a time instead of the whole-utterance '
+             'forward, so offline evaluation shares the exact computation '
+             'graph with streaming deployment. STFT/ISTFT and the output '
+             'path are unchanged.',
+    )
     return parser
 
 
-def load_model(checkpoint_path: str, device: str):
+def load_model(checkpoint_path: str, device: str,
+               max_delay_frames: int | None = None):
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     contract = ckpt['contract']
     require_checkpoint_model_identity(contract, 'Align_ULCNet')
@@ -84,15 +103,57 @@ def load_model(checkpoint_path: str, device: str):
     model_kwargs = {
         k[len('ctor_'):]: v for k, v in contract.items() if k.startswith('ctor_')
     }
+    # The checkpoint contract stays the source of truth for the model shape.
+    # Build from the contract first so the checkpoint's own (possibly
+    # grid-derived) alignment depth D is known before any override applies.
     model = AlignULCNet(model_grid, **model_kwargs).to(device)
-    model.load_state_dict(ckpt['state_dict'])
+    if (max_delay_frames is not None
+            and int(max_delay_frames) != model.max_delay_frames):
+        # Deployment-only override of D. It rebuilds the model with ONLY
+        # max_delay_frames replaced; every other constructor argument still
+        # comes from the contract, so nothing else can silently drift. D
+        # never enters weight shapes (the delay attention projections and
+        # score conv are D-agnostic), so the strict load below still
+        # verifies every tensor.
+        print(f"deployment override: max_delay_frames "
+              f"{model.max_delay_frames} -> {int(max_delay_frames)} "
+              f"(weights are D-agnostic; output is NOT numerically "
+              f"identical across D)")
+        override_kwargs = dict(model_kwargs,
+                               max_delay_frames=int(max_delay_frames))
+        model = AlignULCNet(model_grid, **override_kwargs).to(device)
+    model.load_state_dict(ckpt['state_dict'], strict=True)
     model.eval()
     return model, aec_grid, linear_aec_contract
 
 
+def stream_forward_spec(model, error_spec, far_spec):
+    """Frame-by-frame replay of the model over precomputed STFT spectra.
+
+    Takes the same complex ``[B,T,F]`` spectra the offline forward takes and
+    drives ``create_stream_state()``/``forward_stream`` one frame at a time,
+    so the returned enhanced spectrum comes from the exact computation graph
+    streaming deployment runs -- bit-identical to it by construction. The
+    STFT/ISTFT stay the caller's offline ones.
+    """
+    state = model.create_stream_state()
+    enhanced = []
+    with torch.no_grad():
+        for t in range(error_spec.shape[1]):
+            out = model.forward_stream(
+                linear_error=error_spec[:, t:t + 1],
+                far_end=far_spec[:, t:t + 1],
+                state=state,
+            )
+            enhanced.append(out.enhanced)
+    return torch.cat(enhanced, dim=1)
+
+
 def main(args):
     device = auto_device(args.device)
-    model, grid, linear_contract = load_model(args.checkpoint, device)
+    model, grid, linear_contract = load_model(
+        args.checkpoint, device, max_delay_frames=args.max_delay_frames
+    )
 
     if args.input_is_linear_error:
         error, far_t, source_rates = load_linear_error_far(
@@ -119,10 +180,15 @@ def main(args):
     error_spec = stft(error, grid).transpose(-2, -1)   # [B,T,F], the public model boundary
     far_spec = stft(far_t, grid).transpose(-2, -1)
 
-    with torch.no_grad():
-        output = model(linear_error=error_spec, far_end=far_spec)
+    if args.stream:
+        enhanced_spec = stream_forward_spec(model, error_spec, far_spec)
+        print(f"streamed {error_spec.shape[1]} frames through forward_stream")
+    else:
+        with torch.no_grad():
+            output = model(linear_error=error_spec, far_end=far_spec)
+        enhanced_spec = output.enhanced
 
-    enhanced = istft(output.enhanced.transpose(-2, -1), grid, length=length)
+    enhanced = istft(enhanced_spec.transpose(-2, -1), grid, length=length)
     sf.write(args.out_wav, enhanced.squeeze(0).cpu().numpy(), grid.sr, subtype='FLOAT')
     print(f"wrote {args.out_wav} ({length / grid.sr:.2f}s @ {grid.sr} Hz)")
 

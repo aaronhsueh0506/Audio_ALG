@@ -126,3 +126,89 @@ def test_stream_state_requires_eval_mode(model):
             model.create_stream_state()
     finally:
         model.eval()
+
+
+def test_state_dict_is_d_agnostic_but_output_is_not(model):
+    # Zero-shot D transfer: the alignment depth D never enters weight shapes,
+    # so a D=64 checkpoint must strict-load into a D=8 model -- and the two
+    # models must NOT be numerically identical (the softmax support and the
+    # causal delay stack change).  Measured on this fixture: enhanced max-abs
+    # difference 8.9e-6; the bound below leaves ~9x headroom while staying
+    # far above the streaming GEMM noise (4.1e-8) pinned in the header.
+    assert model.max_delay_frames == 64
+    small = AlignULCNet(GRID, max_delay_frames=8).eval()
+    small.load_state_dict(model.state_dict(), strict=True)
+    error = _spec(1, T, GRID.n_freqs, seed=9)
+    far = _spec(1, T, GRID.n_freqs, seed=10)
+    ref = _offline(model, error, far)
+    out = _offline(small, error, far)
+    assert out.delay_distribution.shape[-1] == 8
+    assert torch.isfinite(out.enhanced.real).all()
+    assert torch.isfinite(out.enhanced.imag).all()
+    assert (out.enhanced - ref.enhanced).abs().max() > 1e-6
+
+
+def test_denoise_stream_path_equals_direct_forward_stream(model):
+    # The denoise.py --stream branch calls stream_forward_spec; driving
+    # forward_stream directly over the same frames must give the SAME tensor
+    # (bit-identical by construction -- same ops in the same order).
+    from AIAEC.Align_ULCNet.denoise import stream_forward_spec
+
+    error = _spec(1, T, GRID.n_freqs, seed=11)
+    far = _spec(1, T, GRID.n_freqs, seed=12)
+    via_cli_helper = stream_forward_spec(model, error, far)
+    state = model.create_stream_state()
+    direct = []
+    with torch.no_grad():
+        for t in range(T):
+            direct.append(model.forward_stream(
+                error[:, t:t + 1], far[:, t:t + 1], state).enhanced)
+    direct = torch.cat(direct, dim=1)
+    assert torch.equal(via_cli_helper, direct)
+
+
+def _write_synthetic_checkpoint(path, model):
+    """A minimal checkpoint that satisfies load_model's contract checks."""
+    from AIAEC.dataset_gen import make_linear_aec_contract
+
+    linear = make_linear_aec_contract(GRID.sample_rate)
+    contract = {
+        'model_name': 'Align_ULCNet',
+        'task': AlignULCNet.task,
+        'sr': GRID.sample_rate, 'n_fft': GRID.n_fft,
+        'win_len': GRID.win_len, 'hop_len': GRID.hop_len,
+        'loss_version': 'test',
+        'linear_aec': linear.as_dict(),
+        'linear_aec_contract_hash': linear.fingerprint(),
+        # None = the contract's own grid-derived depth (64 on this grid),
+        # exactly what a config-driven trainer records for the default.
+        'ctor_max_delay_frames': None,
+    }
+    torch.save({'contract': contract, 'state_dict': model.state_dict()}, path)
+
+
+def test_load_model_max_delay_override(model, tmp_path, capsys):
+    from AIAEC.Align_ULCNet.denoise import load_model
+
+    path = str(tmp_path / 'ckpt.pth')
+    _write_synthetic_checkpoint(path, model)
+
+    # Without the flag the contract rules: D stays 64.
+    loaded, _, _ = load_model(path, 'cpu')
+    assert loaded.max_delay_frames == 64
+    assert 'deployment override' not in capsys.readouterr().out
+
+    # Differing override: rebuilt at D=8, unmissable line printed, weights
+    # still strict-loaded from the D=64 checkpoint.
+    loaded, _, _ = load_model(path, 'cpu', max_delay_frames=8)
+    assert loaded.max_delay_frames == 8
+    printed = capsys.readouterr().out
+    assert ('deployment override: max_delay_frames 64 -> 8 (weights are '
+            'D-agnostic; output is NOT numerically identical across D)'
+            ) in printed
+    assert torch.equal(loaded.align.query.weight, model.align.query.weight)
+
+    # Override equal to the contract value: nothing to do, no override line.
+    loaded, _, _ = load_model(path, 'cpu', max_delay_frames=64)
+    assert loaded.max_delay_frames == 64
+    assert 'deployment override' not in capsys.readouterr().out

@@ -196,12 +196,22 @@ def main(args):
     for start in range(0, error.shape[-1], hop):
         err_frames = stft_err.push(error[:, start:start + hop])
         far_frames = stft_far.push(far_cut[:, start:start + hop])
-        assert len(err_frames) == len(far_frames)
+        # Hard check, not `assert` (must survive python -O): zip() would
+        # silently truncate to the shorter list and drop frames.
+        if len(err_frames) != len(far_frames):
+            raise RuntimeError(
+                f"error/far frame lists diverged: {len(err_frames)} error "
+                f"frames vs {len(far_frames)} far frames"
+            )
         for ef, ff in zip(err_frames, far_frames):
             process_pair(ef, ff)
     err_tail = stft_err.flush()
     far_tail = stft_far.flush()
-    assert len(err_tail) == len(far_tail)
+    if len(err_tail) != len(far_tail):
+        raise RuntimeError(
+            f"error/far flush tails diverged: {len(err_tail)} error frames "
+            f"vs {len(far_tail)} far frames"
+        )
     for ef, ff in zip(err_tail, far_tail):
         process_pair(ef, ff)
 
