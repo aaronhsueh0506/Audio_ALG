@@ -52,6 +52,7 @@ from AIAEC.inference_common import load_linear_error_far
 from AIAEC.training_common import (
     LinearAecEngine,
     auto_device,
+    checkpoint_far_input_mode,
     require_checkpoint_model_identity,
     require_checkpoint_linear_aec,
 )
@@ -97,6 +98,10 @@ def load_model(checkpoint_path: str, device: str,
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     contract = ckpt['contract']
     require_checkpoint_model_identity(contract, 'Align_ULCNet')
+    # Missing field defaults to 'raw_far' (legacy checkpoints); an unknown
+    # recorded mode is rejected here, before any weights load. streaming.py
+    # shares this loader, so both CLIs print the mode at load time.
+    print(f"checkpoint far_input_mode: {checkpoint_far_input_mode(contract)}")
     aec_grid = AecGrid(contract['sr'], contract['n_fft'], contract['win_len'], contract['hop_len'])
     linear_aec_contract = require_checkpoint_linear_aec(contract, aec_grid)
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)

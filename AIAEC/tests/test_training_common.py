@@ -16,6 +16,7 @@ from AIAEC.training_common import (
     auto_device,
     build_arg_parser,
     build_plain_loaders,
+    checkpoint_far_input_mode,
     compressed_spectral_loss,
     make_checkpoint_contract,
     read_grids,
@@ -196,6 +197,31 @@ def test_checkpoint_contract_roundtrip_and_mismatch():
     require_checkpoint_contract({'contract': contract}, contract)   # must not raise
     with pytest.raises(ValueError, match=r'contract\.sr'):
         require_checkpoint_contract({'contract': contract}, {**contract, 'sr': 48000})
+
+
+def test_far_input_mode_recorded_legacy_default_and_unknown_rejected():
+    grid = SignalGrid(16000, 512, 512, 256)
+    contract = make_checkpoint_contract(
+        model_name='Align_CRUSE', task=MODEL_TASKS['Align_CRUSE'], grid=grid,
+        model_kwargs={}, loss_version='v1',
+    )
+    # New contracts record the training far-input mode explicitly.
+    assert contract['far_input_mode'] == 'raw_far'
+    assert checkpoint_far_input_mode(contract) == 'raw_far'
+
+    # Legacy checkpoint (written before the field existed): the ONE defaulting
+    # helper reads it as raw_far, and resuming it against a new expected
+    # contract still passes.
+    legacy = {k: v for k, v in contract.items() if k != 'far_input_mode'}
+    assert checkpoint_far_input_mode(legacy) == 'raw_far'
+    require_checkpoint_contract({'contract': legacy}, contract)  # must not raise
+
+    # An unknown recorded mode is rejected on both the helper and resume path.
+    unknown = dict(contract, far_input_mode='aligned_far')
+    with pytest.raises(ValueError, match='far_input_mode'):
+        checkpoint_far_input_mode(unknown)
+    with pytest.raises(ValueError, match='far_input_mode'):
+        require_checkpoint_contract({'contract': unknown}, contract)
 
 
 def test_checkpoint_contract_rejects_changed_data_split_indices():

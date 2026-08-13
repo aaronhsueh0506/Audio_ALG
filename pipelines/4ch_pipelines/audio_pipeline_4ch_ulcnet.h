@@ -27,27 +27,54 @@
  *            hop#0 emits nothing, hop#p output corresponds to chain input
  *            hop p-1).
  *
+ *   The far branch is delayed by ONE HOP inside this wrapper (a saved-hop
+ *   buffer) before entering its analysis, so the model always sees
+ *   error/far frame pairs of the SAME input hop: the WOLA-reconstructed
+ *   beam hop pushed at hop p is the beamformed error of input hop p-1, and
+ *   the far hop pushed beside it is the far source of that same hop p-1.
+ *
  *   Consequently process() emits ZEROS for hop#0 AND hop#1, and the output
  *   of hop#p (p >= 2) corresponds to the beamformed linear error of input
  *   hop p-2. The last reconstructed beamformed-error hop is exposed
  *   read-only via audio_pipeline_4ch_ulcnet_last_beamformed_error() so
  *   integrators/tests can verify exactly this relation.
  *
+ * FAR-INPUT DEPLOYMENT CONTRACT (set_far_input_mode below): the selected
+ * mode MUST match the checkpoint's training far input -- a mismatch is an
+ * input-distribution change, not a tuning knob.
+ *   - ULCNET_FAR_RAW (default): the caller's raw far_reference feeds the
+ *     far branch (with the same one-hop compensation as aligned mode).
+ *     Checkpoint-compatible: current checkpoints are trained with RAW far.
+ *     Model application is NEVER gated on the shared delay lock (the paper
+ *     contract does not depend on lock).
+ *   - ULCNET_FAR_ALIGNED: pre.aligned_ref feeds the far branch and the
+ *     model's output is APPLIED only while the shared delay is locked
+ *     (delay.solid && delay.delay_samples >= 0) -- the Phase-2 embedded
+ *     candidate. Only use with a checkpoint trained on aligned far.
+ *
  * MODEL CALLBACK POLICY (first version):
  *
+ *   - The model is STEPPED (infer() invoked) for EVERY emitted frame
+ *     whenever a callback is installed -- constant per-hop compute and
+ *     continuous runtime recurrent state, matching the mono variant.
  *   - No model set, model->infer == NULL, or infer() returning nonzero
  *     => FAIL-OPEN: the error spectrum passes through the synthesis chain
- *     unchanged (identity), keeping the timing path constant. The same
- *     identity bypass is used while the shared delay is not locked
- *     (!delay.solid || delay.delay_samples < 0) — the runtime only ever
- *     sees frame pairs whose far branch is genuinely delay-aligned.
+ *     unchanged (identity), keeping the timing path constant. A successful
+ *     infer() whose output contains ANY non-finite value is likewise
+ *     discarded (identity frame) -- NaN/Inf never reaches the WOLA. In
+ *     ULCNET_FAR_ALIGNED the same identity bypass applies while the shared
+ *     delay is not locked (!delay.solid || delay.delay_samples < 0) — the
+ *     runtime's output is only applied for frame pairs whose far branch is
+ *     genuinely delay-aligned.
  *   - On a delay change event (delay.changed): model->reset (if set) is
  *     called so the runtime flushes its far attention ring + logit history,
- *     and the beamform WOLA accumulator is cleared (the core reset its
- *     lanes' analysis history at the same boundary — mixing spectra from
- *     opposite sides of the realignment would corrupt the seam). The C-side
- *     ULCNet STFT states keep running: a 1-2 frame transient is accepted in
- *     this version; crossfading is a later phase.
+ *     and the beamform WOLA accumulator AND the one-hop far buffer are
+ *     cleared (the core reset its lanes' analysis history at the same
+ *     boundary — mixing spectra from opposite sides of the realignment
+ *     would corrupt the seam). The C-side ULCNet STFT states keep running:
+ *     a 1-2 frame transient is accepted in this version; crossfading is a
+ *     later phase. This reset policy applies in BOTH far modes (the error
+ *     branch realigns discontinuously even when the far branch is raw).
  *   - audio_pipeline_4ch_ulcnet_reset() also calls model->reset (if set).
  *
  * VAD: this wrapper provides process_with_activity() ONLY (external VAD).
@@ -81,10 +108,17 @@ extern "C" {
 
 #define AUDIO_PIPELINE_4CH_ULCNET_DESCRIPTOR_VERSION 1u
 /* Carve order: self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft,
- * ola, synth_win, beam_hop (the ULCNet analysis/synthesis states and frame
- * scratch live inside `self`). Bump together with the build-flags-hash token
- * string forever after. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 1u
+ * ola, synth_win, beam_hop (the ULCNet analysis/synthesis states, frame
+ * scratch, one-hop far buffer, far_input_mode and the chain's shared
+ * sqrt-Hann window table live inside `self`). The one carved `fft` handle
+ * serves BOTH the beamform WOLA and the ULCNet chain (same 512 size;
+ * strictly sequential use within a hop). Bump together with the
+ * build-flags-hash token string forever after.
+ * v2: self grew the one-hop far-compensation buffer + far_input_mode.
+ * v3: the ULCNet chain moved onto the shared carved FftHandle (its structs
+ * embed their own FFT scratch) and self grew the shared window table
+ * (ulcnet_window) replacing the per-struct window copies. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 3u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -132,6 +166,23 @@ _Static_assert(
     "bytes offset");
 
 typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
+
+/**
+ * Far-input deployment contract, shared by the mono and 4ch ULCNet pipeline
+ * variants (guarded so both headers can be included in one TU). The mode
+ * MUST match the checkpoint's training far input; a mismatch is an
+ * input-distribution change. See this header's preamble for the per-mode
+ * gating rules.
+ */
+#ifndef ULCNET_FAR_INPUT_MODE_DEFINED
+#define ULCNET_FAR_INPUT_MODE_DEFINED
+typedef enum UlcnetFarInputMode {
+    ULCNET_FAR_RAW     = 0,  /* raw far; checkpoint-compatible default; no
+                              * delay-lock gating of model application     */
+    ULCNET_FAR_ALIGNED = 1   /* aligned far + lock gating; the Phase-2
+                              * embedded candidate                         */
+} UlcnetFarInputMode;
+#endif
 
 /* ============================================================================
  * Config and lifecycle
@@ -197,6 +248,21 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_create(
 int audio_pipeline_4ch_ulcnet_set_model(
     AudioPipeline4ChUlcnet* p,
     const UlcnetModel* model);
+
+/**
+ * Select which far stream feeds the model's far branch (see the FAR-INPUT
+ * DEPLOYMENT CONTRACT in this header's preamble). Instances start in
+ * ULCNET_FAR_RAW (the checkpoint-compatible default); the mode survives
+ * audio_pipeline_4ch_ulcnet_reset() like the model installation does. Set
+ * it before streaming: switching mid-stream changes the model's input
+ * distribution for the frames already in flight (one saved far hop). The
+ * mode MUST match the checkpoint's training far input. Returns 0 on
+ * success, nonzero on a NULL/destroyed pipeline or an undefined mode value
+ * (the current mode is then left unchanged).
+ */
+int audio_pipeline_4ch_ulcnet_set_far_input_mode(
+    AudioPipeline4ChUlcnet* p,
+    UlcnetFarInputMode mode);
 
 /* ============================================================================
  * Per-hop processing

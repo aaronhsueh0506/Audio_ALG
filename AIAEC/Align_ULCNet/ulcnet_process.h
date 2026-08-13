@@ -25,15 +25,33 @@
  *   輸入樣本 [(p-1)*256, p*256)。WOLA 收尾不再另加延遲(被半窗 trim 吸收)。
  *   與 Python reference 的 StreamSTFT/StreamISTFT 相同。
  *
- * Parity 期望:
- *   Python reference (AIAEC/aiaec_streaming.py) 對 torch 是 bit-exact；本 C
- *   用 f32 radix-2 FFT (AINR/dfn_process_common.h)，對 Python 是 float-ULP
- *   級近似（512 點實測 ~1e-5 絕對誤差量級），非 bit-exact。回歸測試:
- *   AIAEC/tests/test_ulcnet_process_c.py（cc 編譯本檔 + 與 Python 逐幀對比）。
+ * Parity expectations: the Python reference (AIAEC/aiaec_streaming.py) is
+ * bit-exact vs torch. This C side runs its transforms through audio_common's
+ * fft_wrapper.h on a caller-owned FftHandle, so BACKEND=kiss/ne10 genuinely
+ * selects the FFT backend, real signals pay a 512-point RFFT/IRFFT (not a
+ * full complex FFT), and twiddles are precomputed once inside the handle,
+ * never per call. Agreement vs Python is float-ULP class (~1e-5 absolute at
+ * 512 points), not bit-exact. Regression gate:
+ * AIAEC/tests/test_ulcnet_process_c.py (compiles this file with cc, links
+ * libaudio_common.a BACKEND=kiss, compares frame by frame vs Python).
  *
- * 記憶體: 全部 caller-owned 純 struct, 零 heap, 零全域狀態。
- * 編譯（standalone 範例, 由 pytest harness 使用同樣的行）:
- *   cc -O2 -std=c99 -ffp-contract=off -c AIAEC/Align_ULCNet/ulcnet_process.c
+ * Memory contract: all state is caller-owned plain structs -- zero heap,
+ * zero global state, and NO big stack frames: the per-call FFT scratch is
+ * embedded in the structs (the old stack-local scratch was ~6.2 KB in the
+ * analysis push and ~4.2 KB in the synthesis push -- unsafe headroom for an
+ * embedded RTOS task stack). The FftHandle and the sqrt-Hann window table
+ * are caller-owned and SHARED: one 512-point handle may serve
+ * err-analysis + far-analysis + synthesis, whose transforms are strictly
+ * sequential within a hop (the handle is never used concurrently), and one
+ * window table serves every struct (structs store const pointers only; the
+ * caller keeps handle and table alive, and the table unchanged, for the
+ * structs' whole lifetime).
+ *
+ * Standalone compile (the pytest harness uses these same lines):
+ *   make -s -C ../audio_common BACKEND=kiss lib
+ *   cc -O2 -std=c99 -ffp-contract=off -I AIAEC/Align_ULCNet \
+ *      -I ../audio_common/include -c AIAEC/Align_ULCNet/ulcnet_process.c
+ *   (link: $(make -s -C ../audio_common BACKEND=kiss print-lib-path) -lm)
  *
  * 不包含（porting 時的其他件）:
  *   - NPU graph 與其顯式 states（K/V ring / logit 史 / GRU h）— runtime 保存
@@ -43,6 +61,8 @@
 
 #ifndef ULCNET_PROCESS_H
 #define ULCNET_PROCESS_H
+
+#include "fft_wrapper.h"   /* FftHandle, Complex (audio_common) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -57,14 +77,39 @@ extern "C" {
 /* 模型的 modified power-law 壓縮指數 (compression_exponent)。 */
 #define ULCNET_COMPRESSION_EXP 0.3f
 
+/* ---- Shared sqrt-Hann window ----
+ * Both analyses and the synthesis use the SAME table; build it once into
+ * caller-owned storage and pass the pointer to every *_init below.
+ * Ownership: the caller keeps the array alive AND unchanged for the
+ * lifetime of every struct initialized with it -- the structs store only
+ * the const pointer, never a copy (the old per-struct duplicate window
+ * arrays are gone). Formula matches the Python reference's periodic
+ * sqrt-Hann bit-for-bit at f32. */
+void ulcnet_make_window(float window[ULCNET_N_FFT]);
+
 /* ---- Analysis: centered sqrt-Hann STFT, 每 hop 進 256 樣本 ---- */
 typedef struct UlcnetAnalysis {
-    float window[ULCNET_N_FFT];
+    const float *window;           /* caller-owned shared sqrt-Hann table */
+    FftHandle   *fft;              /* caller-owned 512-point handle; may be
+                                    * shared with the other analysis and the
+                                    * synthesis (strictly sequential use
+                                    * within a hop -- never concurrent)   */
     float history[ULCNET_N_FFT];   /* 最近 N_FFT 個 raw 樣本 (rolling) */
     long  hops_seen;
+    /* Per-call FFT scratch: caller-owned via this struct, NOT the stack
+     * (embedded task stacks cannot absorb multi-KB frames). Contents are
+     * undefined between calls. */
+    float   seg[ULCNET_N_FFT];     /* windowed segment; clobbered by FFT  */
+    Complex spec[ULCNET_BINS];     /* RFFT output staging                 */
 } UlcnetAnalysis;
 
-void ulcnet_analysis_init(UlcnetAnalysis *st);
+/* fft must be a 512-point handle (fft_get_n_freqs(fft) == ULCNET_BINS);
+ * window must be a ULCNET_N_FFT sqrt-Hann table from ulcnet_make_window().
+ * Both stay caller-owned (see the window/handle sharing contract above).
+ * Returns 0, or -1 on NULL args / a wrong-size handle. Re-init on the same
+ * struct (same or different handle/window) is the reset. */
+int ulcnet_analysis_init(UlcnetAnalysis *st, FftHandle *fft,
+                         const float *window);
 
 /* 推入一個 hop。回傳本次產出的幀數 (0 / 2 / 1)，幀依序寫入
  * out_re/out_im[frame][bin]（呼叫端保證至少容納 2 幀）。
@@ -83,13 +128,20 @@ int ulcnet_analysis_flush(UlcnetAnalysis *st,
 
 /* ---- Synthesis: centered WOLA (sqrt-Hann, 包絡正規化, 半窗 trim) ---- */
 typedef struct UlcnetSynthesis {
-    float window[ULCNET_N_FFT];
+    const float *window;           /* caller-owned shared sqrt-Hann table */
+    FftHandle   *fft;              /* caller-owned 512-point handle; same
+                                    * sharing contract as UlcnetAnalysis  */
     float acc[ULCNET_N_FFT];       /* overlap-add 累加器 (局部原點 = 下一段輸出) */
     float env[ULCNET_N_FFT];       /* 窗平方包絡累加器 (torch.istft 語意) */
     long  frames_seen;
+    /* Per-call FFT scratch -- same off-stack rationale as UlcnetAnalysis. */
+    Complex spec[ULCNET_BINS];     /* IRFFT input staging; clobbered by FFT */
+    float   time[ULCNET_N_FFT];    /* IRFFT time-domain output              */
 } UlcnetSynthesis;
 
-void ulcnet_synthesis_init(UlcnetSynthesis *st);
+/* Same argument/ownership/return contract as ulcnet_analysis_init. */
+int ulcnet_synthesis_init(UlcnetSynthesis *st, FftHandle *fft,
+                          const float *window);
 
 /* 推入一幀 enhanced 頻譜。回傳寫入 out 的樣本數：frame#0 回 0（半窗 trim），
  * 之後每幀回 ULCNET_HOP。 */

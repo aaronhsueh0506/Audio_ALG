@@ -187,6 +187,35 @@ def _write_synthetic_checkpoint(path, model):
     torch.save({'contract': contract, 'state_dict': model.state_dict()}, path)
 
 
+def test_load_model_far_input_mode_default_present_and_rejected(
+        model, tmp_path, capsys):
+    from AIAEC.Align_ULCNet.denoise import load_model
+
+    path = str(tmp_path / 'ckpt.pth')
+    _write_synthetic_checkpoint(path, model)
+
+    # _write_synthetic_checkpoint records no far_input_mode -- exactly a
+    # legacy checkpoint. It must load, defaulted to raw_far, and the loader
+    # must say so (streaming.py shares this loader, so both CLIs print it).
+    load_model(path, 'cpu')
+    assert 'checkpoint far_input_mode: raw_far' in capsys.readouterr().out
+
+    # Field present (what every new contract records): loads identically.
+    ckpt = torch.load(path, map_location='cpu', weights_only=False)
+    ckpt['contract']['far_input_mode'] = 'raw_far'
+    explicit_path = str(tmp_path / 'ckpt_explicit.pth')
+    torch.save(ckpt, explicit_path)
+    load_model(explicit_path, 'cpu')
+    assert 'checkpoint far_input_mode: raw_far' in capsys.readouterr().out
+
+    # Unknown mode: rejected before any weights load.
+    ckpt['contract']['far_input_mode'] = 'aligned_far'
+    unknown_path = str(tmp_path / 'ckpt_unknown.pth')
+    torch.save(ckpt, unknown_path)
+    with pytest.raises(ValueError, match='far_input_mode'):
+        load_model(unknown_path, 'cpu')
+
+
 def test_load_model_max_delay_override(model, tmp_path, capsys):
     from AIAEC.Align_ULCNet.denoise import load_model
 

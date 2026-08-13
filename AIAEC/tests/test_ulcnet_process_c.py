@@ -6,11 +6,19 @@ compares, frame by frame and sample by sample, against the Python reference
 (aiaec_streaming.StreamSTFT/StreamISTFT), which is itself the bit-exact twin
 of torch.stft/istft(center=True).
 
+The C side now transforms through audio_common's fft_wrapper (caller-owned
+FftHandle, real RFFT/IRFFT, backend-switched by BACKEND=kiss/ne10), so the
+fixture first builds audio_common's KISS static lib the way the AEC C tests
+document it (make -s -C ../audio_common BACKEND=kiss lib + print-lib-path)
+and links it into the driver. The driver deliberately shares ONE FftHandle
+across the analysis and the synthesis (strictly sequential use), exercising
+the same sharing contract the pipeline variants rely on.
+
 Expected agreement is float-ULP class, not bit-exact: the C side uses the
-shared f32 radix-2 FFT (AINR/dfn_process_common.h) while torch computes with
-double twiddles. Measured ~2e-5 absolute on unit-scale audio; tolerances are
-pinned at ~10x that. A one-frame misalignment shows up as O(1) error, so the
-comparison has teeth by construction (asserted below).
+f32 KISS FFT while torch computes with double twiddles. Measured ~2e-5
+absolute on unit-scale audio; tolerances are pinned at ~10x that. A
+one-frame misalignment shows up as O(1) error, so the comparison has teeth
+by construction (asserted below).
 """
 
 import os
@@ -26,6 +34,9 @@ from AIAEC.dataset_gen.aec_features import sqrt_hann_window
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'Align_ULCNet')
+_AC_DIR = os.path.abspath(
+    os.path.join(_THIS_DIR, '..', '..', '..', 'audio_common'))
+_AC_INCLUDE = os.path.join(_AC_DIR, 'include')
 
 N_FFT, HOP, BINS = 512, 256, 257
 
@@ -36,15 +47,21 @@ _DRIVER = r'''
 
 /* argv: mode in.f32 out.f32
  * mode "analysis":  in = raw samples -> out = frames (re[257] im[257] each)
- * mode "roundtrip": in = raw samples -> out = analysis->synthesis samples */
+ * mode "roundtrip": in = raw samples -> out = analysis->synthesis samples
+ * One shared FftHandle drives BOTH the analysis and the synthesis (their
+ * use is strictly sequential), matching the pipelines' sharing contract. */
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     FILE *fi = fopen(argv[2], "rb"), *fo = fopen(argv[3], "wb");
     if (!fi || !fo) return 3;
     static UlcnetAnalysis an;
     static UlcnetSynthesis sy;
-    ulcnet_analysis_init(&an);
-    ulcnet_synthesis_init(&sy);
+    static float win[ULCNET_N_FFT];
+    FftHandle *fft = fft_create(ULCNET_N_FFT);  /* heap OK in a test driver */
+    if (!fft) return 4;
+    ulcnet_make_window(win);
+    if (ulcnet_analysis_init(&an, fft, win) != 0) return 5;
+    if (ulcnet_synthesis_init(&sy, fft, win) != 0) return 5;
     int roundtrip = argv[1][0] == 'r';
     float hop[ULCNET_HOP];
     float fre[2][ULCNET_BINS], fim[2][ULCNET_BINS];
@@ -76,13 +93,34 @@ int main(int argc, char **argv) {
         fwrite(out, sizeof(float), (size_t)m, fo);
     }
     fclose(fi); fclose(fo);
+    fft_destroy(fft);
     return 0;
 }
 '''
 
 
 @pytest.fixture(scope='module')
-def driver(tmp_path_factory):
+def audio_common_lib():
+    """audio_common's KISS static lib, built + located the way the AEC C
+    tests document it (make -s -C ../audio_common BACKEND=kiss lib, then
+    print-lib-path for this invocation's exact archive path)."""
+    if shutil.which('make') is None:
+        pytest.skip('no make available')
+    subprocess.run(
+        ['make', '-s', '-C', _AC_DIR, 'BACKEND=kiss', 'lib'],
+        check=True, capture_output=True,
+    )
+    out = subprocess.run(
+        ['make', '-s', '-C', _AC_DIR, 'BACKEND=kiss', 'print-lib-path'],
+        check=True, capture_output=True, text=True,
+    )
+    lib = out.stdout.strip().splitlines()[-1]
+    assert os.path.isfile(lib), lib
+    return lib
+
+
+@pytest.fixture(scope='module')
+def driver(tmp_path_factory, audio_common_lib):
     cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     if cc is None:
         pytest.skip('no C compiler available')
@@ -92,9 +130,9 @@ def driver(tmp_path_factory):
     exe = work / 'driver'
     subprocess.run(
         [cc, '-O2', '-std=c99', '-ffp-contract=off',
-         '-I', _ULCNET_DIR,
+         '-I', _ULCNET_DIR, '-I', _AC_INCLUDE,
          str(main_c), os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
-         '-lm', '-o', str(exe)],
+         audio_common_lib, '-lm', '-o', str(exe)],
         check=True, capture_output=True,
     )
     return work, exe
@@ -177,7 +215,7 @@ def test_emission_timing_contract(driver):
     assert raw.size == (7 + 1) * 2 * BINS
 
 
-def test_compression_helpers_roundtrip(driver):
+def test_compression_helpers_roundtrip(driver, audio_common_lib):
     """signed |x|^0.3 then |x|^(1/0.3) is identity to f32 accuracy; checked
     through the Python-side formula to pin the exponent convention."""
     work, exe = driver
@@ -209,7 +247,9 @@ int main(void) {
 }
 ''')
     exe2 = work / 'comp'
-    subprocess.run([cc, '-O2', '-std=c99', '-I', _ULCNET_DIR, str(src),
+    subprocess.run([cc, '-O2', '-std=c99', '-ffp-contract=off',
+                    '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, str(src),
                     os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
-                    '-lm', '-o', str(exe2)], check=True, capture_output=True)
+                    audio_common_lib, '-lm', '-o', str(exe2)],
+                   check=True, capture_output=True)
     subprocess.run([str(exe2)], check=True)

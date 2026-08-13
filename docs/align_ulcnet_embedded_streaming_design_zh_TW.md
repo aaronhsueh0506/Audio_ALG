@@ -480,18 +480,32 @@ recovery 語意整合，避免同一個 delay event在 AEC 與 NN 被重複 rese
 standalone 實作（見 5.1 節實作狀態）；out-of-range 偵測仍不存在（超出
 約 509 ms 可靠搜尋上界時狀態停在 UNLOCKED，與冷啟動不可區分）。第一版
 fail-open/reset 已落在兩個 pipeline 變體（`pipelines/audio_pipeline_ulcnet`
-與 `4ch_pipelines/audio_pipeline_4ch_ulcnet`）：UNLOCKED→模型照步進但輸出
-走 identity（timing 恆定）、CHANGED→`model->reset`；HOLD/REACQUIRE 細分
-與 crossfade 仍待做。4ch 側的先例實作在
-`4aec_nr_res.c:778-794, 901-914`。
+與 `4ch_pipelines/audio_pipeline_4ch_ulcnet`），且**兩個變體現在行為一致**：
+UNLOCKED→模型照步進（每個 emitted frame 都 infer，per-hop 計算量恆定、
+runtime recurrent state 連續）、只閘控「輸出是否套用」；CHANGED→
+`model->reset`；infer 失敗或輸出含非有限值（NaN/Inf）→該 frame 走
+identity，永不進 WOLA；HOLD/REACQUIRE 細分與 crossfade 仍待做。4ch 側的
+先例實作在 `4aec_nr_res.c:778-794, 901-914`。
 
-⚠ **短延遲部署注意（pipeline 實測發現）**：echo path 的 bulk delay 很小
+兩個變體另新增 `far_input_mode` 部署契約（模式必須與 checkpoint 的訓練
+far 輸入一致，不一致即輸入分布改變，見第 9 節的 A/B 表）：
+
+- `ULCNET_FAR_RAW`（預設，checkpoint 相容）：餵 caller 的 raw far（4ch 側
+  與 aligned 模式共用同一個 one-hop far 補償 buffer，err/far frame 對
+  同一個 input hop）；**不以 delay lock 閘控模型套用**——paper 契約不依賴
+  lock。
+- `ULCNET_FAR_ALIGNED`（實驗性，Phase-2 embedded 候選）：餵 aligned far
+  並以 lock 閘控套用（即上述 UNLOCKED bypass 行為）。
+
+⚠ **短延遲部署注意（pipeline 實測發現；只適用 ALIGNED 模式——RAW 模式
+不以 lock 閘控，NN 照常生效）**：echo path 的 bulk delay 很小
 （linear filter 的 832-tap 涵蓋範圍內）時，filter 未對齊就能收斂 → ERLE
 超過 2.5 dB → Path-A already-cancelling 保護（`delay_acquire_protect_converged`，
 Python/C 現已一致）會**永久擋下 first acquisition**，`delay_state` 恆為
-UNLOCKED，NN 後級永遠在 fail-open。這對音質是安全的（線性殘差直接出），
-但代表短延遲裝置上 NN 從未生效——產品狀態機（Phase 5）需要一條
-「filter 已收斂且無 delay 需求 → 視同 LOCKED、far 直接可用」的路徑。
+UNLOCKED，ALIGNED 模式的 NN 後級永遠在 fail-open。這對音質是安全的
+（線性殘差直接出），但代表短延遲裝置上 ALIGNED 模式的 NN 從未生效——
+產品狀態機（Phase 5）需要一條「filter 已收斂且無 delay 需求 → 視同
+LOCKED、far 直接可用」的路徑。
 
 ## 9. D 的候選與 Checkpoint
 
@@ -714,4 +728,3 @@ Outputs:
    維持 causal-only 設計；真實 corpus 的負 offset 比例仍要以升級後的
    工具量測確認邊角案例（弱直達路徑 + pre-echo 未啟動）。
 10. Q10：待 Phase 2/3 的 A/B。
-

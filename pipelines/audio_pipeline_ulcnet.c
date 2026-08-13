@@ -12,16 +12,20 @@
  *      AEC aligns far internally (delay estimation stays on, preset default).
  *   2. error tap  = AecResContext.formed_hop (the refined/coarse-selected +
  *      crossfaded linear error -- the hop the AEC's own spectra describe).
- *   3. far tap + delay status = aec_get_linear_context(): aligned_far_hop
- *      is byte-identical to what the linear filter consumed this hop;
- *      delay_state gates the model per the policy in the header.
+ *   3. far tap + delay status = aec_get_linear_context(): in
+ *      ULCNET_FAR_ALIGNED the far branch is aligned_far_hop (byte-identical
+ *      to what the linear filter consumed this hop) and delay_state gates
+ *      the model APPLICATION; in ULCNET_FAR_RAW (default) the far branch is
+ *      the caller's raw ref hop and application is never lock-gated -- see
+ *      the header's far-input contract.
  *   4. Both hops go into two UlcnetAnalysis instances (0/2/1 emission); for
- *      each emitted frame pair the model callback runs (stepped even while
- *      UNLOCKED -- constant compute -- but its output is applied only when
- *      the delay is locked and infer() returned 0; otherwise the error
- *      frame passes through unchanged, fail-open); the chosen frame goes
- *      into UlcnetSynthesis (WOLA). hop #0 emits nothing -> zeros; hop #p
- *      output corresponds to input hop p-1 (one-hop latency).
+ *      each emitted frame pair the model callback runs (stepped
+ *      unconditionally -- constant compute -- but its output is applied
+ *      only when infer() returned 0, the output frame is fully finite, and
+ *      the mode's gating passes; otherwise the error frame passes through
+ *      unchanged, fail-open); the chosen frame goes into UlcnetSynthesis
+ *      (WOLA). hop #0 emits nothing -> zeros; hop #p output corresponds to
+ *      input hop p-1 (one-hop latency).
  *   5. On a CHANGED delay event, model->reset (if set) runs BEFORE that
  *      hop's infer() so the runtime flushes its far attention ring + logit
  *      history; the C STFT states keep running (1-2 frame transient
@@ -30,28 +34,39 @@
  * Constraints: C99, -ffp-contract=off (pipelines/Makefile appends it last),
  * no stdio in this TU (all failures are signalled by NULL/-1 returns only),
  * no heap on the init/init_ex path (create() is the explicit heap
- * convenience). The Ulcnet analysis/synthesis structs and the per-frame
- * spectrum scratch are plain fixed-size arrays kept INSIDE the instance
- * struct (part of the `self` carve) rather than stack locals -- ~10 KB of
- * frame scratch would be unsafe headroom for an embedded RTOS task stack
- * (same rationale as lib/aec's Tier-1 stack-safety fix).
+ * convenience). The Ulcnet analysis/synthesis structs (which embed their
+ * own per-call FFT scratch), the per-frame spectrum scratch, and the one
+ * shared sqrt-Hann window table are plain fixed-size arrays kept INSIDE
+ * the instance struct (part of the `self` carve) rather than stack locals
+ * -- multi-KB frame scratch would be unsafe headroom for an embedded RTOS
+ * task stack (same rationale as lib/aec's Tier-1 stack-safety fix). The
+ * chain's FFT is ONE pool-carved 512-point fft_wrapper handle shared by
+ * err-analysis + far-analysis + synthesis (strictly sequential use within
+ * a hop, per ulcnet_process.h's sharing contract), so BACKEND=kiss/ne10
+ * genuinely selects the ULCNet FFT backend too.
  */
 
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <math.h>       /* isfinite -- NaN/Inf guard on the model output */
 
 #include "audio_pipeline_ulcnet.h"
 #include "mem_align.h"       /* ALIGN16 / MEM_IS_ALIGNED16 */
 #include "pipeline_dims.h"   /* compute_frame_dims() -- shared grid resolver */
 
 /* This wrapper's own carve-layout version (see AudioPipelineUlcnetMemReq's
- * doc). History starts at 1 (2026-08: first version). Bump TOGETHER with the
- * token string in audio_pipeline_ulcnet_build_flags_hash() below, forever
- * after, whenever the carve structure changes -- including changes to the
- * self-resident Ulcnet state block, which is part of the carve even though
- * it is not a separately-carved pointer. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 1u
+ * doc). History starts at 1 (2026-08: first version); 2 adds the
+ * far_input_mode field to the self control block; 3 moves the ULCNet chain
+ * onto a pool-carved shared FftHandle (the carve grew a trailing `fft`
+ * region), embeds the per-call FFT scratch in the chain structs, and
+ * replaces their per-struct window copies with one self-resident shared
+ * table (ulcnet_window). Bump TOGETHER with the token string in
+ * audio_pipeline_ulcnet_build_flags_hash() below, forever after, whenever
+ * the carve structure changes -- including changes to the self-resident
+ * Ulcnet state block, which is part of the carve even though it is not a
+ * separately-carved pointer. */
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 3u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
  * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"/\"ne10\"
@@ -86,14 +101,22 @@ struct AudioPipelineUlcnet {
     int sample_rate, hop, fft_sz, n_freqs;
 
     UlcnetModel model;            /* by-value copy of cfg.model              */
+    UlcnetFarInputMode far_input_mode;  /* by-value copy of cfg's mode       */
 
     Aec* aec;                     /* points into `pool` below                */
+    FftHandle* fft;               /* points into `pool`; ONE shared 512-point
+                                   * handle for the whole ULCNet chain
+                                   * (strictly sequential use per hop)      */
 
     /* Ulcnet C pre/post state -- plain fixed-size structs, part of the
-     * `self` carve (listed as self(...) tokens in the build-flags hash). */
+     * `self` carve (listed as self(...) tokens in the build-flags hash).
+     * Each embeds its own per-call FFT scratch and points at the shared
+     * window table below (no per-struct window copies). */
     UlcnetAnalysis  ana_err;      /* linear-error analysis                   */
     UlcnetAnalysis  ana_far;      /* aligned-far analysis                    */
     UlcnetSynthesis synth;        /* enhanced-spectrum WOLA                  */
+    float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table; all three
+                                   * chain structs point at it (self-owned) */
 
     /* Per-hop frame scratch (up to 2 frames per push on hop #1). Kept in
      * the instance, not the stack -- see the header comment of this file. */
@@ -140,6 +163,16 @@ static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
             return -1;
     }
 
+    /* Deployment contract: only the two defined far-input modes exist.
+     * RAW (0) is the memset-zero/default, checkpoint-compatible case. */
+    switch (cfg->far_input_mode) {
+        case ULCNET_FAR_RAW:
+        case ULCNET_FAR_ALIGNED:
+            break;
+        default:
+            return -1;
+    }
+
     if (compute_frame_dims(ULCNET_SR, ULCNET_N_FFT,
                            hop, &frame_sz, fft_sz, n_freqs) != 0) return -1;
     /* Defensive: the resolver's 16k/512 row must agree with the compiled
@@ -159,33 +192,48 @@ static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
 
 /* ============================================================================
  * Pool sizing / carve. Carve order: self control block (which embeds the
- * Ulcnet analysis/synthesis/frame-scratch state), then the AEC pool.
+ * Ulcnet analysis/synthesis/frame-scratch state and the shared window
+ * table), then the AEC pool, then the chain's shared FFT handle.
  * ========================================================================== */
 
 static size_t ulcnet_sub_pool_size(const AecConfig* aec_cfg) {
     size_t aec_sz = aec_get_mem_size(aec_cfg);
-    if (aec_sz == 0) return 0;   /* invalid AecConfig per lib/aec's validator */
-    return ALIGN16(aec_sz);
+    size_t fft_sz = fft_get_mem_size(ULCNET_N_FFT);
+    if (aec_sz == 0 || fft_sz == 0) return 0;   /* validator rejected it */
+    return ALIGN16(aec_sz) + ALIGN16(fft_sz);
 }
 
 static int ulcnet_pipeline_build(AudioPipelineUlcnet* p, void* pool, size_t pool_size,
                                  const AecConfig* aec_cfg) {
     size_t aec_sz = aec_get_mem_size(aec_cfg);
+    size_t fft_sz = fft_get_mem_size(ULCNET_N_FFT);
+    uint8_t* ptr = (uint8_t*)pool;
     AecResContext ctx0;
 
-    if (!pool || aec_sz == 0 || pool_size < ALIGN16(aec_sz)) return -1;
+    if (!pool || aec_sz == 0 || fft_sz == 0 ||
+        pool_size < ALIGN16(aec_sz) + ALIGN16(fft_sz)) return -1;
 
-    p->aec = aec_init(pool, aec_sz, aec_cfg);
+    p->aec = aec_init(ptr, aec_sz, aec_cfg);
     if (!p->aec) return -1;
+    ptr += ALIGN16(aec_sz);
+
+    /* ONE shared 512-point handle for the whole ULCNet chain (err-analysis
+     * + far-analysis + synthesis) -- their transforms are strictly
+     * sequential within a hop, per ulcnet_process.h's sharing contract.
+     * Separate from the AEC's own internal FFT instance. */
+    p->fft = fft_init(ptr, fft_sz, ULCNET_N_FFT);
+    if (!p->fft || fft_get_n_freqs(p->fft) != ULCNET_BINS) return -1;
 
     /* Grid-agreement guard, readable right after aec_init (before any frame
      * is processed) -- same shape as audio_pipeline.c's pipeline_build. */
     aec_get_res_context(p->aec, &ctx0);
     if (ctx0.n_freqs != ULCNET_BINS || ctx0.hop_size != ULCNET_HOP) return -1;
 
-    ulcnet_analysis_init(&p->ana_err);
-    ulcnet_analysis_init(&p->ana_far);
-    ulcnet_synthesis_init(&p->synth);
+    ulcnet_make_window(p->ulcnet_window);
+    if (ulcnet_analysis_init(&p->ana_err, p->fft, p->ulcnet_window) != 0 ||
+        ulcnet_analysis_init(&p->ana_far, p->fft, p->ulcnet_window) != 0 ||
+        ulcnet_synthesis_init(&p->synth, p->fft, p->ulcnet_window) != 0)
+        return -1;
     return 0;
 }
 
@@ -205,11 +253,25 @@ static uint32_t audio_pipeline_ulcnet_build_flags_hash(void) {
      * name the Ulcnet state embedded in the control block -- it is part of
      * the carve even though it is not separately carved. Bump
      * AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION (and update this string)
-     * whenever this structure changes -- always both, forever. */
-    h = ulcnet_fnv1a_str("|carve:self(model,ana_err,ana_far,synth,"
-                         "frame_scratch),aec", h);
+     * whenever this structure changes -- always both, forever.
+     * v2: far_input_mode joined the control block.
+     * v3: ulcnet_window joined the control block (shared table replacing
+     * the per-struct copies; the chain structs also grew embedded FFT
+     * scratch) and the carve grew a trailing shared `fft` handle region. */
+    h = ulcnet_fnv1a_str("|carve:self(model,far_input_mode,ana_err,ana_far,"
+                         "synth,frame_scratch,ulcnet_window),aec,fft", h);
     h = ulcnet_fnv1a_str("|align16", h);
     return h;
+}
+
+/* NaN/Inf guard: a model frame with ANY non-finite value must never reach
+ * the WOLA (the synthesis accumulator would poison every later hop). */
+static int ulcnet_frame_is_finite(const float* re, const float* im) {
+    int k;
+    for (k = 0; k < ULCNET_BINS; k++) {
+        if (!isfinite(re[k]) || !isfinite(im[k])) return 0;
+    }
+    return 1;
 }
 
 /* ============================================================================
@@ -222,6 +284,7 @@ AudioPipelineUlcnetConfig audio_pipeline_ulcnet_default_config(int sample_rate) 
     cfg.sample_rate = sample_rate;
     cfg.fft_size    = 0;                /* resolve to the ULCNet grid (512) */
     cfg.aec_preset  = AEC_PRESET_BALANCED;
+    cfg.far_input_mode = ULCNET_FAR_RAW;  /* checkpoint-compatible default */
     return cfg;
 }
 
@@ -312,6 +375,7 @@ AudioPipelineUlcnet* audio_pipeline_ulcnet_init_ex(void* mem, size_t bytes,
     p->sample_rate = cfg->sample_rate;
     p->hop = hop; p->fft_sz = fft_sz; p->n_freqs = n_freqs;
     p->model      = cfg->model;
+    p->far_input_mode = cfg->far_input_mode;
     p->pool       = sub_pool;
     p->pool_size  = sub_bytes;
     p->owned_heap = NULL;
@@ -359,29 +423,40 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
     aec_get_linear_context(p->aec, &lctx);
 
     /* Stage 3: delay-change event -> flush the runtime's far attention ring
-     * + logit history BEFORE this hop's inference. CHANGED is reported
-     * exactly on the hop whose processing bumped the alignment generation
-     * (first acquisition included); the next hop reads LOCKED again. The C
-     * STFT states below keep running across the change (1-2 frame transient
-     * accepted; crossfade is a later phase). */
+     * + logit history BEFORE this hop's inference (both far modes: even
+     * with a raw far branch, the error branch realigns discontinuously at
+     * this boundary). CHANGED is reported exactly on the hop whose
+     * processing bumped the alignment generation (first acquisition
+     * included); the next hop reads LOCKED again. The C STFT states below
+     * keep running across the change (1-2 frame transient accepted;
+     * crossfade is a later phase). */
     if (lctx.delay_state == AEC_LINEAR_DELAY_CHANGED && p->model.reset)
         p->model.reset(p->model.user);
 
     /* Stage 4: push BOTH hops (the two analyses must stay frame-locked, so
      * each is fed every hop unconditionally). 0/2/1 emission: hop #0 emits
-     * nothing, hop #1 emits two frames, then one per hop. */
+     * nothing, hop #1 emits two frames, then one per hop. The far branch
+     * source follows the deployment contract: RAW feeds the caller's ref
+     * hop (checkpoint-compatible; same-hop with the error tap), ALIGNED
+     * feeds the AEC's aligned far. */
     n_frames = ulcnet_analysis_push(&p->ana_err, rctx.formed_hop, p->err_re, p->err_im);
-    (void)ulcnet_analysis_push(&p->ana_far, lctx.aligned_far_hop, p->far_re, p->far_im);
+    (void)ulcnet_analysis_push(&p->ana_far,
+                               p->far_input_mode == ULCNET_FAR_RAW
+                                   ? ref : lctx.aligned_far_hop,
+                               p->far_re, p->far_im);
 
     /* Stage 5: per emitted frame pair, run the model and synthesize. The
      * model is STEPPED whenever an infer callback exists (constant per-hop
-     * compute/timing); its output is APPLIED only when infer() returned 0
-     * AND the delay is locked (LOCKED/CHANGED). UNLOCKED means
-     * aligned_far_hop is raw/unaligned far -- the result computed from it
-     * is not trusted, and the error frame passes through unchanged
-     * (fail-open identity). Any garbage the runtime accumulated from raw
-     * far during UNLOCKED is flushed by the CHANGED reset above at the
-     * first acquisition. */
+     * compute/timing); its output is APPLIED only when infer() returned 0,
+     * every output value is finite (never let NaN/Inf reach the WOLA), and
+     * -- in ULCNET_FAR_ALIGNED only -- the delay is locked (LOCKED/
+     * CHANGED). In ALIGNED mode UNLOCKED means aligned_far_hop is raw/
+     * unaligned far, so the result computed from it is not trusted and the
+     * error frame passes through unchanged (fail-open identity); any
+     * garbage the runtime accumulated from raw far during UNLOCKED is
+     * flushed by the CHANGED reset above at the first acquisition. RAW
+     * mode never gates application on the lock (the checkpoint's paper
+     * contract does not depend on it). */
     wrote = 0;
     for (f = 0; f < n_frames; f++) {
         const float* sre = p->err_re[f];
@@ -391,7 +466,10 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
                                     p->err_re[f], p->err_im[f],
                                     p->far_re[f], p->far_im[f],
                                     p->mdl_re, p->mdl_im);
-            if (rc == 0 && lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED) {
+            if (rc == 0 &&
+                (p->far_input_mode == ULCNET_FAR_RAW ||
+                 lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED) &&
+                ulcnet_frame_is_finite(p->mdl_re, p->mdl_im)) {
                 sre = p->mdl_re;
                 sim = p->mdl_im;
             }
@@ -411,9 +489,12 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
 void audio_pipeline_ulcnet_reset(AudioPipelineUlcnet* p) {
     if (!p) return;
     aec_reset(p->aec);
-    ulcnet_analysis_init(&p->ana_err);
-    ulcnet_analysis_init(&p->ana_far);
-    ulcnet_synthesis_init(&p->synth);
+    /* Re-init with the SAME shared handle/window (both pool/instance
+     * resident and untouched by reset); cannot fail for a handle already
+     * validated at build time. */
+    (void)ulcnet_analysis_init(&p->ana_err, p->fft, p->ulcnet_window);
+    (void)ulcnet_analysis_init(&p->ana_far, p->fft, p->ulcnet_window);
+    (void)ulcnet_synthesis_init(&p->synth, p->fft, p->ulcnet_window);
     /* The external runtime owns the NN's explicit states -- tell it to
      * flush them too, same contract as the CHANGED event. */
     if (p->model.reset) p->model.reset(p->model.user);
@@ -421,9 +502,11 @@ void audio_pipeline_ulcnet_reset(AudioPipelineUlcnet* p) {
 
 void audio_pipeline_ulcnet_destroy(AudioPipelineUlcnet* p) {
     if (!p) return;
-    /* Reverse carve order (only the AEC sits in the sub-pool). A genuine
-     * no-op for a pool-resident instance today; kept for the heap path and
-     * forward-compat, mirroring audio_pipeline_destroy's rationale. */
+    /* Reverse carve order (AEC then the shared FFT handle sit in the
+     * sub-pool). Genuine no-ops for a pool-resident instance today; kept
+     * for the heap path and forward-compat, mirroring
+     * audio_pipeline_destroy's rationale. */
+    if (p->fft) fft_destroy(p->fft);
     if (p->aec) aec_destroy(p->aec);
 
     if (p->owned_heap) {

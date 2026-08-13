@@ -26,24 +26,48 @@
  * 16 ms). hop #0 emits nothing (this pipeline writes zeros); the output of
  * hop #p (p >= 1) corresponds to input hop p-1.
  *
+ * ── Far-input deployment contract (far_input_mode) ───────────────────────
+ *  The config's far_input_mode selects which far stream feeds the model's
+ *  far branch. The chosen mode MUST match the checkpoint's training far
+ *  input -- a mismatch is an input-distribution change, not a tuning knob:
+ *    ULCNET_FAR_RAW     (default) -> the caller's raw ref hop, same-hop with
+ *                  the error tap. Checkpoint-compatible: current checkpoints
+ *                  are trained with RAW far. The model's output is applied
+ *                  WITHOUT any delay-lock gating (the paper contract does
+ *                  not depend on lock); only infer() failure or a non-finite
+ *                  output frame falls back to the identity path.
+ *    ULCNET_FAR_ALIGNED -> the AEC's aligned far (AecLinearContext.
+ *                  aligned_far_hop) plus delay-lock gating of the model
+ *                  APPLICATION (the Phase-2 embedded candidate; see the
+ *                  delay-gating rules below). Only use with a checkpoint
+ *                  trained/fine-tuned on aligned far.
+ *
  * ── Model callback policy (first version) ────────────────────────────────
  *  - Fail-open identity: if the config's model has infer == NULL (including
  *    an all-zero/"NULL" model), or infer() returns nonzero for a frame, the
  *    error spectrum passes through unchanged for that frame. The STFT/WOLA
  *    timing path is identical either way, so latency never depends on the
  *    model's presence or health.
- *  - Delay gating (AecLinearContext.delay_state, read once per hop):
- *      UNLOCKED -> the model's output is BYPASSED (fail-open identity).
- *                  The model is still STEPPED (infer() is invoked for every
- *                  emitted frame) so the per-hop compute/timing budget stays
- *                  constant and the runtime's recurrent states keep
- *                  tracking; its result is simply not applied, because the
- *                  far tap is raw/unaligned in this state.
+ *  - NaN/Inf guard: after a successful infer(), every output value is
+ *    validated; a frame with any non-finite enh value falls back to the
+ *    identity (error) frame -- non-finite data never reaches the WOLA.
+ *  - Delay events (AecLinearContext.delay_state, read once per hop; the
+ *    UNLOCKED application bypass applies to ULCNET_FAR_ALIGNED only --
+ *    ULCNET_FAR_RAW never gates application on the lock):
+ *      UNLOCKED -> ALIGNED mode: the model's output is BYPASSED (fail-open
+ *                  identity). The model is still STEPPED (infer() is
+ *                  invoked for every emitted frame) so the per-hop
+ *                  compute/timing budget stays constant and the runtime's
+ *                  recurrent states keep tracking; its result is simply not
+ *                  applied, because the far tap is raw/unaligned in this
+ *                  state. RAW mode: applied as normal.
  *      CHANGED  -> model->reset (if set) is called BEFORE this hop's
- *                  infer(), so the runtime flushes its far attention ring +
- *                  logit history; then infer() runs and its output is
- *                  applied. The first acquisition is itself a CHANGED
- *                  event, so anything the model accumulated from raw far
+ *                  infer() in BOTH far modes, so the runtime flushes its
+ *                  far attention ring + logit history (the error branch
+ *                  realigns discontinuously at this boundary even in RAW
+ *                  mode); then infer() runs and its output is applied. The
+ *                  first acquisition is itself a CHANGED event, so in
+ *                  ALIGNED mode anything the model accumulated from raw far
  *                  during the UNLOCKED phase is flushed at that boundary.
  *      LOCKED   -> infer() runs and its output is applied.
  *    The C STFT/WOLA states keep running across a delay change; a 1-2 frame
@@ -83,11 +107,12 @@ extern "C" {
  * audio_pipeline.h's AudioPipelineMemReq). Callers may persist it for
  * diagnostics, but must re-query before initialization after any build or
  * configuration change. layout_version and build_flags_hash describe THIS
- * wrapper's carve structure (self control block first, then the AEC pool;
- * the Ulcnet analysis/synthesis/frame-scratch state lives INSIDE the self
- * block -- see the token string in audio_pipeline_ulcnet.c); dependency-
- * internal layouts are reflected in bytes. reserved must be zero. No
- * cross-endian serialization is provided.
+ * wrapper's carve structure (self control block first, then the AEC pool,
+ * then the ULCNet chain's shared 512-point FFT handle; the Ulcnet
+ * analysis/synthesis/frame-scratch state and the shared sqrt-Hann window
+ * table live INSIDE the self block -- see the token string in
+ * audio_pipeline_ulcnet.c); dependency-internal layouts are reflected in
+ * bytes. reserved must be zero. No cross-endian serialization is provided.
  */
 typedef struct {
     uint32_t descriptor_version;  /* = AUDIO_PIPELINE_ULCNET_DESCRIPTOR_VERSION (1) */
@@ -122,6 +147,23 @@ _Static_assert(offsetof(AudioPipelineUlcnetMemReq, bytes) == 24,
  * ========================================================================== */
 
 /**
+ * Far-input deployment contract, shared by the mono and 4ch ULCNet pipeline
+ * variants (guarded so both headers can be included in one TU). The mode
+ * MUST match the checkpoint's training far input; a mismatch is an
+ * input-distribution change. See this header's preamble for the per-mode
+ * gating rules.
+ */
+#ifndef ULCNET_FAR_INPUT_MODE_DEFINED
+#define ULCNET_FAR_INPUT_MODE_DEFINED
+typedef enum UlcnetFarInputMode {
+    ULCNET_FAR_RAW     = 0,  /* raw far; checkpoint-compatible default; no
+                              * delay-lock gating of model application     */
+    ULCNET_FAR_ALIGNED = 1   /* aligned far + lock gating; the Phase-2
+                              * embedded candidate                         */
+} UlcnetFarInputMode;
+#endif
+
+/**
  * model is held BY VALUE (three plain pointers). A memset-zero model (or one
  * with infer == NULL) is the supported "no runtime attached" case: the
  * pipeline output is then the identity STFT->WOLA reconstruction of the
@@ -134,11 +176,14 @@ typedef struct {
     int         fft_size;     /* 0 (resolve to 512) or 512; others rejected   */
     AecPreset   aec_preset;   /* MILD | BALANCED | AGGRESSIVE                 */
     UlcnetModel model;        /* NPU callback boundary; may be all-zero       */
+    UlcnetFarInputMode far_input_mode;  /* RAW (default) | ALIGNED; must
+                              * match the checkpoint's training far input  */
 } AudioPipelineUlcnetConfig;
 
 /** Defaults: the fixed ULCNet grid (fft_size=0 -> 512), balanced preset,
- * all-zero model (identity). sample_rate is stored as passed and validated
- * at query/init time (only 16000 passes). */
+ * all-zero model (identity), far_input_mode = ULCNET_FAR_RAW (the
+ * checkpoint-compatible deployment contract). sample_rate is stored as
+ * passed and validated at query/init time (only 16000 passes). */
 AudioPipelineUlcnetConfig audio_pipeline_ulcnet_default_config(int sample_rate);
 
 /* ============================================================================
@@ -193,9 +238,11 @@ AudioPipelineUlcnet* audio_pipeline_ulcnet_init_ex(void* mem, size_t bytes,
 /**
  * Process exactly one hop (audio_pipeline_ulcnet_hop_size(p) == 256 samples)
  * of mic/ref into `out`: AEC(linear, context-only) -> error tap
- * (AecResContext.formed_hop) + aligned-far tap (AecLinearContext) -> two
- * centered-STFT analyses -> per emitted frame, the model callback (or the
- * fail-open identity, per the policy in this header's preamble) -> WOLA.
+ * (AecResContext.formed_hop) + far tap (raw `ref` in ULCNET_FAR_RAW,
+ * AecLinearContext.aligned_far_hop in ULCNET_FAR_ALIGNED; both same-hop
+ * with the error tap) -> two centered-STFT analyses -> per emitted frame,
+ * the model callback (or the fail-open identity, per the policy in this
+ * header's preamble) -> WOLA.
  * hop #0 writes all zeros; every later call writes exactly one hop whose
  * content corresponds to the PREVIOUS call's input (one-hop latency).
  *

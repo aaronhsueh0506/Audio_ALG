@@ -28,16 +28,31 @@
  *      (the 0/2/1 emission), 1 per hop after; model->reset fires exactly
  *      once per CHANGED hop during the run, plus exactly once more on
  *      audio_pipeline_ulcnet_reset(); a post-reset hop #0 emits 0 frames.
- *   3. fail-open + delay gating: a model whose output halves the spectrum
- *      (rc=0) but doubles it on scheduled failing hops (rc!=0) — output is
- *      bit-identical to the NULL-model pipeline's exactly where the policy
- *      says identity must hold (every UNLOCKED hop, every failing frame)
- *      and differs exactly where the model output must be applied.
+ *   3. fail-open + delay gating (ULCNET_FAR_ALIGNED): a model whose output
+ *      halves the spectrum (rc=0) but doubles it on scheduled failing hops
+ *      (rc!=0) — output is bit-identical to the NULL-model pipeline's
+ *      exactly where the policy says identity must hold (every UNLOCKED
+ *      hop, every failing frame) and differs exactly where the model
+ *      output must be applied.
  *   4. pool rejection / reject-first config validation / init_ex 8-point
  *      descriptor gate / destroy idempotence / create-vs-init byte parity
  *      on a 0xA5-poisoned pool (patterns copied from test_audio_pipeline.c).
  *   5. NULL model == identity (copy err->out, rc=0) model: bit-identical
  *      output across UNLOCKED, CHANGED and LOCKED phases.
+ *   6. far-timestamp (ULCNET_FAR_RAW, the default): far-passthrough model,
+ *      silence on mic, one unit impulse in far at a known sample index —
+ *      the impulse must land in the output at EXACTLY impulse_index + 256:
+ *      the mono far tap is SAME-HOP with the error tap (no wrapper-side far
+ *      compensation exists or is needed), and the centered ULCNet chain
+ *      lags the input by exactly one hop. Documents the mono timing.
+ *   7. RAW mode never gates on the delay lock: a 0.5x model in RAW mode
+ *      diverges from the NULL-model pipeline from the FIRST emitted frame
+ *      (hop #1), long before the delay acquires.
+ *   8. NaN guard: a model returning rc==0 but a NaN-poisoned spectrum on
+ *      scheduled hops — those frames take the identity path BITWISE (equal
+ *      to the NULL-model pipeline under the same 50%-overlap mixing rule
+ *      as test 3), the next clean frame is applied again, and no NaN ever
+ *      reaches the output.
  *
  * Build (from pipelines/): `make test` (kiss backend). Standalone:
  *   cc -O2 -std=gnu99 -ffp-contract=off -I. -I../lib/aec/c_impl/include \
@@ -265,12 +280,14 @@ static void test_counting_model(void) {
 }
 
 /* =========================================================================
- * 3. fail-open + delay gating. Model A halves the spectrum on success
- *    (rc=0) and doubles it on scheduled failing hops (rc!=0); pipeline B
- *    has a NULL model. Output hop p mixes the frames pushed at hops p-1
- *    and p (50% WOLA overlap), so A == B bitwise exactly when BOTH
- *    contributing frames took the identity path (UNLOCKED or rc!=0), and
- *    A != B when any applied (locked, rc==0) frame contributed.
+ * 3. fail-open + delay gating, in ULCNET_FAR_ALIGNED (the mode that gates
+ *    application on the lock; RAW never does -- see test 7). Model A halves
+ *    the spectrum on success (rc=0) and doubles it on scheduled failing
+ *    hops (rc!=0); pipeline B has a NULL model. Output hop p mixes the
+ *    frames pushed at hops p-1 and p (50% WOLA overlap), so A == B bitwise
+ *    exactly when BOTH contributing frames took the identity path
+ *    (UNLOCKED or rc!=0), and A != B when any applied (locked, rc==0)
+ *    frame contributed.
  * ========================================================================= */
 typedef struct {
     int fail_now;   /* set by the test before each process call */
@@ -300,7 +317,9 @@ static void test_fail_open_and_delay_gating(void) {
     AudioPipelineUlcnetConfig cfg_a = audio_pipeline_ulcnet_default_config(16000);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = failing_infer;
+    cfg_a.far_input_mode = ULCNET_FAR_ALIGNED;   /* the lock-gated mode */
     AudioPipelineUlcnetConfig cfg_b = audio_pipeline_ulcnet_default_config(16000); /* NULL model */
+    cfg_b.far_input_mode = ULCNET_FAR_ALIGNED;
 
     AudioPipelineUlcnet* pa = audio_pipeline_ulcnet_create(&cfg_a);
     AudioPipelineUlcnet* pb = audio_pipeline_ulcnet_create(&cfg_b);
@@ -407,6 +426,17 @@ static void test_config_validation_rejects(void) {
     bad_preset.aec_preset = (AecPreset)99;
     CHECK(audio_pipeline_ulcnet_get_mem_requirements(&bad_preset, &req) == -1,
           "get_mem_requirements rejects an out-of-enum aec_preset");
+
+    CHECK(good.far_input_mode == ULCNET_FAR_RAW,
+          "default config far_input_mode is ULCNET_FAR_RAW (checkpoint-compatible)");
+    AudioPipelineUlcnetConfig bad_mode = audio_pipeline_ulcnet_default_config(16000);
+    bad_mode.far_input_mode = (UlcnetFarInputMode)99;
+    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&bad_mode, &req) == -1,
+          "get_mem_requirements rejects an out-of-enum far_input_mode");
+    AudioPipelineUlcnetConfig aligned_mode = audio_pipeline_ulcnet_default_config(16000);
+    aligned_mode.far_input_mode = ULCNET_FAR_ALIGNED;
+    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&aligned_mode, &req) == 0,
+          "get_mem_requirements accepts ULCNET_FAR_ALIGNED");
 
     AudioPipelineUlcnetMemReq req0, req512;
     AudioPipelineUlcnetConfig c0 = audio_pipeline_ulcnet_default_config(16000);   /* fft 0 */
@@ -685,6 +715,239 @@ static void test_null_model_equals_identity_model(void) {
     audio_pipeline_ulcnet_destroy(pi);
 }
 
+/* =========================================================================
+ * 6. far-timestamp (ULCNET_FAR_RAW, the default). Far-passthrough model
+ *    (copies far_ri -> out_ri, ignores err), silence on mic, one unit
+ *    impulse in far at sample index T. The mono far tap is SAME-HOP with
+ *    the error tap (this hop's raw ref feeds the far analysis beside this
+ *    hop's formed error -- no wrapper-side far compensation exists or is
+ *    needed), and the centered ULCNet chain output lags its input by
+ *    exactly one hop (hop #p carries input hop p-1). So the reconstructed
+ *    impulse must land at EXACTLY T + HOP. RAW mode applies the model from
+ *    the first emitted frame (no delay lock ever happens on a silent mic),
+ *    which is also what makes this test able to see the far branch at all.
+ * ========================================================================= */
+static int passthrough_far_infer(void* user,
+                                 const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
+                                 const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
+                                 float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+    (void)user; (void)err_re; (void)err_im;
+    memcpy(out_re, far_re, ULCNET_BINS * sizeof(float));
+    memcpy(out_im, far_im, ULCNET_BINS * sizeof(float));
+    return 0;
+}
+
+static void test_far_timestamp_raw(void) {
+    enum { N = 40, IMP_HOP = 8, IMP_OFF = 37 };
+    const int imp_index = IMP_HOP * HOP + IMP_OFF;
+    const int expect_index = imp_index + HOP;   /* same-hop far tap + 1-hop chain */
+
+    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
+    cfg.model.infer = passthrough_far_infer;    /* far_input_mode: RAW default */
+    AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
+    if (!p) { fprintf(stderr, "FAIL: setup (create) for far-timestamp test\n"); g_failures++; return; }
+
+    float mic[HOP], ref[HOP];
+    static float out_hist[N][HOP];
+    for (int h = 0; h < N; h++) {
+        memset(mic, 0, sizeof(mic));
+        memset(ref, 0, sizeof(ref));
+        if (h == IMP_HOP) ref[IMP_OFF] = 1.0f;
+        audio_pipeline_ulcnet_process(p, mic, ref, out_hist[h]);
+    }
+
+    int   found_index = -1;
+    float peak = 0.0f;
+    for (int h = 0; h < N; h++) {
+        for (int i = 0; i < HOP; i++) {
+            float a = fabsf(out_hist[h][i]);
+            if (a > peak) { peak = a; found_index = h * HOP + i; }
+        }
+    }
+
+    CHECK(found_index == expect_index,
+          fmt_msg("far timestamp (mono RAW): impulse at far[%d] lands at out[%d] "
+                  "(expected %d = impulse + 1 hop; offset %+d samples)",
+                  imp_index, found_index, expect_index, found_index - expect_index));
+    CHECK(peak > 0.9f,
+          fmt_msg("far impulse reconstructed at ~unit amplitude (peak %.4f)", peak));
+
+    audio_pipeline_ulcnet_destroy(p);
+}
+
+/* =========================================================================
+ * 7. RAW mode never gates on the delay lock: the 0.5x model's output is
+ *    APPLIED from the first emitted frame (hop #1), while the delay is
+ *    still UNLOCKED -- the RAW-mode pipeline must differ from the
+ *    NULL-model pipeline on every hop from #1 on (the bulk-delay near-end
+ *    noise makes the error nonzero from the start).
+ * ========================================================================= */
+static int halving_infer(void* user,
+                         const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
+                         const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
+                         float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+    (void)user; (void)far_re; (void)far_im;
+    for (int k = 0; k < ULCNET_BINS; k++) {
+        out_re[k] = 0.5f * err_re[k];
+        out_im[k] = 0.5f * err_im[k];
+    }
+    return 0;
+}
+
+static void test_raw_mode_applies_unlocked(void) {
+    enum { N = 30 };
+    AudioPipelineUlcnetConfig cfg_raw = audio_pipeline_ulcnet_default_config(16000);
+    cfg_raw.model.infer = halving_infer;        /* far_input_mode: RAW default */
+    AudioPipelineUlcnetConfig cfg_null = audio_pipeline_ulcnet_default_config(16000);
+
+    AudioPipelineUlcnet* pr = audio_pipeline_ulcnet_create(&cfg_raw);
+    AudioPipelineUlcnet* pn = audio_pipeline_ulcnet_create(&cfg_null);
+    if (!pr || !pn) {
+        fprintf(stderr, "FAIL: setup (create) for RAW-mode gating test\n");
+        g_failures++;
+        if (pr) audio_pipeline_ulcnet_destroy(pr);
+        if (pn) audio_pipeline_ulcnet_destroy(pn);
+        return;
+    }
+
+    float mic[HOP], ref[HOP], out_r[HOP], out_n[HOP];
+    EchoSim sim;
+    echo_sim_init(&sim, ECHO_DELAY, 0xC0FFEEu);
+
+    int applied_from_hop1 = 1, first_equal_hop = -1, all_unlocked_seen = 1;
+    for (int h = 0; h < N; h++) {
+        echo_sim_hop(&sim, mic, ref);
+        audio_pipeline_ulcnet_process(pr, mic, ref, out_r);
+        audio_pipeline_ulcnet_process(pn, mic, ref, out_n);
+        if (h == 0) {
+            int zero = 1;
+            for (int i = 0; i < HOP; i++) if (out_r[i] != 0.0f) zero = 0;
+            CHECK(zero, "RAW mode hop #0 still emits zeros (timing preamble unchanged)");
+        } else if (memcmp(out_r, out_n, sizeof(out_r)) == 0 && applied_from_hop1) {
+            applied_from_hop1 = 0;
+            first_equal_hop = h;
+        }
+        /* N is small enough that the ECHO_DELAY acquisition (~hop 15 with
+         * this seed) may occur late in the run; the claim only needs some
+         * genuinely-UNLOCKED applied hops, which hop 1 always is. */
+        if (h <= 2 && pipeline_delay_state(pr) != AEC_LINEAR_DELAY_UNLOCKED)
+            all_unlocked_seen = 0;
+    }
+    CHECK(all_unlocked_seen, "delay really is UNLOCKED on the early applied hops");
+    CHECK(applied_from_hop1,
+          fmt_msg("RAW mode applies the model from the FIRST emitted frame with no "
+                  "delay lock (output != NULL-model on every hop >= 1; first equal "
+                  "hop %d [-1=none])", first_equal_hop));
+
+    audio_pipeline_ulcnet_destroy(pr);
+    audio_pipeline_ulcnet_destroy(pn);
+}
+
+/* =========================================================================
+ * 8. NaN guard. Model returns rc==0 but poisons one bin with NaN (and
+ *    another with +Inf) on scheduled hops; otherwise it halves the
+ *    spectrum. RAW mode (applied from frame 1). Pipeline B has a NULL
+ *    model. Same 50%-overlap mixing rule as test 3: output hop p is
+ *    bit-identical to B exactly when BOTH contributing frames took the
+ *    identity path (here: were NaN-poisoned and discarded), and differs
+ *    when any clean (applied, 0.5x) frame contributed -- which also proves
+ *    the next clean frame after a NaN window recovers. No NaN may ever
+ *    appear in the output.
+ * ========================================================================= */
+typedef struct {
+    int poison_now;   /* set by the test before each process call */
+} NanModelState;
+
+static int nan_infer(void* user,
+                     const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
+                     const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
+                     float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+    NanModelState* st = (NanModelState*)user;
+    (void)far_re; (void)far_im;
+    for (int k = 0; k < ULCNET_BINS; k++) {
+        out_re[k] = 0.5f * err_re[k];
+        out_im[k] = 0.5f * err_im[k];
+    }
+    if (st->poison_now) {
+        /* rc stays 0: only the NaN/Inf guard can catch this frame. Poison
+         * mid-array values so a partial scan would miss them. */
+        out_re[100] = nanf("");
+        out_im[200] = INFINITY;
+    }
+    return 0;
+}
+
+static void test_nan_guard(void) {
+    enum { N = 60 };
+    NanModelState st = {0};
+
+    AudioPipelineUlcnetConfig cfg_a = audio_pipeline_ulcnet_default_config(16000);
+    cfg_a.model.user  = &st;
+    cfg_a.model.infer = nan_infer;              /* far_input_mode: RAW default */
+    AudioPipelineUlcnetConfig cfg_b = audio_pipeline_ulcnet_default_config(16000);
+
+    AudioPipelineUlcnet* pa = audio_pipeline_ulcnet_create(&cfg_a);
+    AudioPipelineUlcnet* pb = audio_pipeline_ulcnet_create(&cfg_b);
+    if (!pa || !pb) {
+        fprintf(stderr, "FAIL: setup (create) for NaN-guard test\n");
+        g_failures++;
+        if (pa) audio_pipeline_ulcnet_destroy(pa);
+        if (pb) audio_pipeline_ulcnet_destroy(pb);
+        return;
+    }
+
+    float mic[HOP], ref[HOP], out_a[HOP], out_b[HOP];
+    EchoSim sim;
+    echo_sim_init(&sim, 0, 0xC0FFEEu);   /* zero-delay: error nonzero from hop 0 */
+
+    static int poisoned[N];
+    int equal_ok = 1, differ_ok = 1, no_nan = 1;
+    int first_bad_equal = -1, first_bad_differ = -1;
+    int n_equal = 0, n_differ = 0;
+
+    for (int h = 0; h < N; h++) {
+        /* Two windows so recovery is proven twice: 20..27 and 40..47. */
+        st.poison_now = (h >= 20 && h < 28) || (h >= 40 && h < 48);
+        poisoned[h] = st.poison_now;
+
+        echo_sim_hop(&sim, mic, ref);
+        audio_pipeline_ulcnet_process(pa, mic, ref, out_a);
+        audio_pipeline_ulcnet_process(pb, mic, ref, out_b);
+
+        for (int i = 0; i < HOP; i++)
+            if (!isfinite(out_a[i])) no_nan = 0;
+
+        int equal_expected;
+        if (h == 0)      equal_expected = 1;               /* both all-zero */
+        else if (h == 1) equal_expected = poisoned[1];
+        else             equal_expected = poisoned[h - 1] && poisoned[h];
+
+        int bitwise_equal = memcmp(out_a, out_b, sizeof(out_a)) == 0;
+        if (equal_expected) {
+            n_equal++;
+            if (!bitwise_equal && equal_ok) { equal_ok = 0; first_bad_equal = h; }
+        } else if (h >= 1) {
+            n_differ++;
+            if (bitwise_equal && differ_ok) { differ_ok = 0; first_bad_differ = h; }
+        }
+    }
+
+    CHECK(no_nan, "NaN guard: no NaN/Inf ever reaches the pipeline output");
+    CHECK(n_equal >= 10 && n_differ >= 10,
+          fmt_msg("coverage: %d NaN-identity hops and %d applied hops compared", n_equal, n_differ));
+    CHECK(equal_ok,
+          fmt_msg("rc==0 NaN frames are discarded: output BIT-IDENTICAL to the "
+                  "NULL-model pipeline on all %d fully-poisoned hops (first bad "
+                  "hop %d [-1=none])", n_equal, first_bad_equal));
+    CHECK(differ_ok,
+          fmt_msg("clean frames recover: output DIFFERS from the NULL-model "
+                  "pipeline on all %d hops with a clean applied frame (first bad "
+                  "hop %d [-1=none])", n_differ, first_bad_differ));
+
+    audio_pipeline_ulcnet_destroy(pa);
+    audio_pipeline_ulcnet_destroy(pb);
+}
+
 int main(void) {
     printf("=== audio_pipeline_ulcnet: identity E2E (one-hop latency) ===\n");
     test_identity_e2e();
@@ -712,6 +975,15 @@ int main(void) {
 
     printf("\n=== audio_pipeline_ulcnet: NULL model == identity model ===\n");
     test_null_model_equals_identity_model();
+
+    printf("\n=== audio_pipeline_ulcnet: far timestamp (RAW mode) ===\n");
+    test_far_timestamp_raw();
+
+    printf("\n=== audio_pipeline_ulcnet: RAW mode applies while UNLOCKED ===\n");
+    test_raw_mode_applies_unlocked();
+
+    printf("\n=== audio_pipeline_ulcnet: NaN/Inf guard ===\n");
+    test_nan_guard();
 
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);

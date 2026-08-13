@@ -1004,20 +1004,23 @@ $(OBJ_DIR)/test_audio_pipeline.o: tests/test_audio_pipeline.c audio_pipeline.h |
 # Align-ULCNet pipeline variant objects. ulcnet_process.o compiles the
 # AIAEC-owned C pre/post TU (centered sqrt-Hann STFT / WOLA / model
 # boundary) -- read-only from this Makefile's perspective, never edited
-# here; its own relative include (../../AINR/dfn_process_common.h) resolves
-# against the TU's location, so only -I$(ULCNET_DIR) is needed for its
-# header. The pipeline TU and its test also need that include path for
-# ulcnet_process.h (via audio_pipeline_ulcnet.h).
+# here. It transforms through audio_common's fft_wrapper (so BACKEND=
+# kiss/ne10 genuinely selects the ULCNet FFT backend); the -I$(AC_DIR)/
+# include already in $(CFLAGS) resolves that header, and -I$(ULCNET_DIR)
+# resolves its own. The pipeline TU and its test also need the ULCNET
+# include path for ulcnet_process.h (via audio_pipeline_ulcnet.h).
 $(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
 # audio_pipeline_ulcnet.o: the AEC(linear) -> Align-ULCNet post-filter
 # pipeline TU (audio_pipeline_ulcnet.h). Deliberately NOT a member of
-# libaudio_pipeline.a -- it stays a self-contained object a consumer links
-# alongside libaec.a/libaudio_common.a + ulcnet_process.o, so the existing
-# archive's member set (and its NO_STDIO audit surface) is untouched. The
-# TU itself uses no stdio unconditionally (no NO_STDIO gate needed), so it
-# compiles with the shared $(CFLAGS), not $(LIB_CFLAGS).
+# libaudio_pipeline.a (that archive's member set and its NO_STDIO audit
+# surface stay untouched) -- it is packaged, together with
+# ulcnet_process.o, in the variant's OWN archive libaudio_pipeline_ulcnet.a
+# (see ULCNET_LIB_TARGET below) which consumers link alongside
+# libaec.a/libaudio_common.a. The TU itself uses no stdio unconditionally
+# (no NO_STDIO gate needed), so it compiles with the shared $(CFLAGS), not
+# $(LIB_CFLAGS).
 $(OBJ_DIR)/audio_pipeline_ulcnet.o: audio_pipeline_ulcnet.c audio_pipeline_ulcnet.h pipeline_dims.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
@@ -1057,6 +1060,23 @@ libaudio_pipeline.a: $(LIB_TARGET)
 $(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
 	@echo "libaudio_pipeline.a [$(BACKEND)] -> $@"
+
+# libaudio_pipeline_ulcnet.a: the Align-ULCNet pipeline variant as ONE
+# archive (audio_pipeline_ulcnet.o + the AIAEC pre/post TU ulcnet_process.o)
+# so integrators link a single archive instead of two loose objects. Like
+# libaudio_pipeline.a it is NOT a fat archive: libaec.a + libaudio_common.a
+# still get linked alongside it (no NR stage in this variant, so no
+# libmmse_lsa.a). Also like libaudio_pipeline.a, it needs no producer
+# archive to BUILD, so the rule lives outside the AC_LIB dispatch. Same
+# fresh-archive discipline as $(LIB_TARGET) above.
+ULCNET_LIB_TARGET = $(BIN_DIR)/libaudio_pipeline_ulcnet.a
+
+.PHONY: libaudio_pipeline_ulcnet.a
+libaudio_pipeline_ulcnet.a: $(ULCNET_LIB_TARGET)
+
+$(ULCNET_LIB_TARGET): $(OBJ_DIR)/audio_pipeline_ulcnet.o $(OBJ_DIR)/ulcnet_process.o | _cfg_guard
+	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
+	@echo "libaudio_pipeline_ulcnet.a [$(BACKEND)] -> $@"
 
 # =============================================================================
 # Phase 2 real rules: only defined once AC_LIB (and, transitively, AEC_LIB/
@@ -1144,12 +1164,13 @@ $(BIN_DIR)/test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $
 	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
 	@echo "test_audio_pipeline [$(BACKEND)] -> $@"
 
-# Self-contained link: test.o + the ulcnet pipeline TU + the AIAEC pre/post
-# TU + libaec.a + libaudio_common.a. No libaudio_pipeline.a (the variant is
-# deliberately not an archive member) and no libmmse_lsa.a (this variant has
-# no NR stage).
-$(BIN_DIR)/test_audio_pipeline_ulcnet: $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(OBJ_DIR)/audio_pipeline_ulcnet.o $(OBJ_DIR)/ulcnet_process.o $(AEC_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(OBJ_DIR)/audio_pipeline_ulcnet.o $(OBJ_DIR)/ulcnet_process.o $(AEC_LIB) $(AC_LIB) $(LDFLAGS)
+# Self-contained link: test.o + libaudio_pipeline_ulcnet.a (the variant's
+# own archive: pipeline TU + AIAEC pre/post TU -- the same single archive an
+# integrator links) + libaec.a + libaudio_common.a. No libaudio_pipeline.a
+# (the variant is deliberately not a member of THAT archive) and no
+# libmmse_lsa.a (this variant has no NR stage).
+$(BIN_DIR)/test_audio_pipeline_ulcnet: $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(ULCNET_LIB_TARGET) $(AEC_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_ulcnet.o $(ULCNET_LIB_TARGET) $(AEC_LIB) $(AC_LIB) $(LDFLAGS)
 	@echo "test_audio_pipeline_ulcnet [$(BACKEND)] -> $@"
 
 $(BIN_DIR)/example_board_adapter: $(OBJ_DIR)/example_board_adapter.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard

@@ -7,8 +7,15 @@
  *   four_aec_nr_res_process_pre -> SRP-PHAT DOA -> GSC effective weights
  *     -> gsc_spectrum WOLA reconstruction (one hop behind)
  *     -> UlcnetAnalysis (error branch = beamformed hop,
- *                        far branch  = pre.aligned_ref)
- *     -> UlcnetModel callback (fail-open identity when unset/unlocked/error)
+ *                        far branch  = the PREVIOUS hop's far source, so
+ *                        both branches carry the SAME input hop: the beam
+ *                        hop is itself one hop behind, and the far source
+ *                        -- pre.aligned_ref in ULCNET_FAR_ALIGNED, the
+ *                        caller's raw far in ULCNET_FAR_RAW -- goes through
+ *                        a one-hop saved buffer to match it)
+ *     -> UlcnetModel callback (stepped every frame; fail-open identity
+ *        when unset/error/non-finite, and in ALIGNED mode also while the
+ *        shared delay is unlocked)
  *     -> UlcnetSynthesis -> out
  *
  * The core's pending pre frame is released with four_aec_nr_res_abandon_pre;
@@ -67,7 +74,10 @@ struct AudioPipeline4ChUlcnet {
     Complex* gsc_spectrum;
     Complex* gsc_weights;
 
-    /* Beamformed-error WOLA reconstruction (one hop behind). */
+    /* Beamformed-error WOLA reconstruction (one hop behind). The one
+     * carved handle is ALSO the ULCNet chain's FFT (same 512 size; the
+     * beam IFFT and the chain's three transforms are strictly sequential
+     * within a hop, per ulcnet_process.h's sharing contract). */
     FftHandle* fft;
     float* ifft_buffer;   /* fft_size */
     float* ola;           /* fft_size */
@@ -75,10 +85,13 @@ struct AudioPipeline4ChUlcnet {
     float* beam_hop;      /* hop_size; accessor + analysis input */
 
     /* Align-ULCNet chain state + per-hop frame scratch (fixed-size structs,
-     * part of `self` in the carve). */
+     * part of `self` in the carve). The chain structs embed their own
+     * per-call FFT scratch and point at the shared window table below. */
     UlcnetAnalysis err_analysis;
     UlcnetAnalysis far_analysis;
     UlcnetSynthesis synthesis;
+    float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table for all
+                                         * three chain structs (self-owned) */
     float frame_err_re[2][ULCNET_BINS];
     float frame_err_im[2][ULCNET_BINS];
     float frame_far_re[2][ULCNET_BINS];
@@ -86,7 +99,15 @@ struct AudioPipeline4ChUlcnet {
     float enh_re[ULCNET_BINS];
     float enh_im[ULCNET_BINS];
 
+    /* One-hop far compensation (layout v2): the beam WOLA above closes one
+     * hop late, so far_analysis is fed the far source SAVED on the previous
+     * call -- without this the model would see error[t-1] paired with
+     * far[t] (a fixed 256-sample skew). Cleared together with the beam OLA
+     * on a delay change and on reset. */
+    float far_delay[ULCNET_HOP];
+
     UlcnetModel model;    /* model.infer == NULL => fail-open identity */
+    UlcnetFarInputMode far_input_mode;  /* RAW (default) | ALIGNED */
     FourAecNrResDelayState last_delay;
     uint64_t frame_index;
 
@@ -217,11 +238,20 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
 static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;
+    /* v2: `self` grew the one-hop far-compensation buffer + far_input_mode
+     * (self(...) names the state embedded in the control block -- part of
+     * the carve even though it is not separately carved).
+     * v3: `self` grew the shared window table (ulcnet_window; the chain
+     * structs dropped their window copies and embed FFT scratch instead)
+     * and the carved `fft` handle is now shared by the beam WOLA AND the
+     * ULCNet chain. Bump AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION together
+     * with this string, always both, forever. */
     hash = fnv1a_str(
-        "|carve:self,core,srp,gsc,gsc_spectrum,gsc_weights,"
-        "fft,ifft,ola,synth_win,beam_hop",
+        "|carve:self(ulcnet,far_delay,far_input_mode,ulcnet_window),"
+        "core,srp,gsc,gsc_spectrum,gsc_weights,fft,ifft,ola,synth_win,"
+        "beam_hop",
         hash);
-    hash = fnv1a_str("|align16|ulcnet16k512", hash);
+    hash = fnv1a_str("|align16|ulcnet16k512|sharedfft", hash);
     hash ^= core_build_flags_hash;
     hash *= 16777619u;
     return hash;
@@ -538,11 +568,17 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
                 2.0f * M_PI_F * (float)k / (float)fft)));
     }
 
-    ulcnet_analysis_init(&p->err_analysis);
-    ulcnet_analysis_init(&p->far_analysis);
-    ulcnet_synthesis_init(&p->synthesis);
+    /* The chain reuses the beamforming handle carved above (same 512 grid;
+     * strictly sequential use per hop). Reject-first: the inits re-check
+     * the handle's bin count against the compiled ULCNet grid. */
+    ulcnet_make_window(p->ulcnet_window);
+    if (ulcnet_analysis_init(&p->err_analysis, p->fft, p->ulcnet_window) != 0 ||
+        ulcnet_analysis_init(&p->far_analysis, p->fft, p->ulcnet_window) != 0 ||
+        ulcnet_synthesis_init(&p->synthesis, p->fft, p->ulcnet_window) != 0)
+        return NULL;
 
     memset(&p->model, 0, sizeof(p->model));   /* fail-open until set_model */
+    p->far_input_mode = ULCNET_FAR_RAW;       /* checkpoint-compatible default */
     memset(&p->last_delay, 0, sizeof(p->last_delay));
     p->frame_index = 0;
     p->owned_heap = NULL;
@@ -594,9 +630,30 @@ int audio_pipeline_4ch_ulcnet_set_model(
     return 0;
 }
 
+int audio_pipeline_4ch_ulcnet_set_far_input_mode(
+    AudioPipeline4ChUlcnet* p,
+    UlcnetFarInputMode mode) {
+    if (!p || p->destroyed) return -1;
+    /* Reject-first: only the two defined modes exist; the current mode is
+     * left unchanged on rejection (contract in the header). */
+    if (mode != ULCNET_FAR_RAW && mode != ULCNET_FAR_ALIGNED) return -1;
+    p->far_input_mode = mode;
+    return 0;
+}
+
 /* ============================================================================
  * Per-hop processing
  * ========================================================================== */
+
+/* NaN/Inf guard: a model frame with ANY non-finite value must never reach
+ * the WOLA (the synthesis accumulator would poison every later hop). */
+static int ulcnet_frame_is_finite(const float* re, const float* im) {
+    int k;
+    for (k = 0; k < ULCNET_BINS; ++k) {
+        if (!isfinite(re[k]) || !isfinite(im[k])) return 0;
+    }
+    return 1;
+}
 
 int audio_pipeline_4ch_ulcnet_process_with_activity(
     AudioPipeline4ChUlcnet* p,
@@ -605,12 +662,13 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     int vad_external,
     float* out) {
     FourAecNrResPreFrame pre;
+    const float* far_source;
     int status;
     int hop;
     int fft;
     int n_err_frames;
     int n_far_frames;
-    int bypass;
+    int apply_allowed;
     int written;
     int f;
     int k;
@@ -646,9 +704,13 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
          * same reason its own mono OLA is cleared (mixing spectra from
          * opposite sides of the realignment would corrupt the seam), and
          * tell the runtime to flush its far attention ring + logit history.
-         * The C-side ULCNet STFT states keep running: a 1-2 frame transient
-         * is accepted in this version (crossfade is a later phase). */
+         * The saved far hop straddles the same boundary, so it is cleared
+         * with the OLA (both far modes -- a one-hop zero-far transient is
+         * accepted alongside the model reset). The C-side ULCNet STFT
+         * states keep running: a 1-2 frame transient is accepted in this
+         * version (crossfade is a later phase). */
         memset(p->ola, 0, (size_t)fft * sizeof(float));
+        memset(p->far_delay, 0, sizeof(p->far_delay));
         if (p->model.reset) p->model.reset(p->model.user);
     }
 
@@ -664,11 +726,20 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     memset(p->ola + (fft - hop), 0, (size_t)hop * sizeof(float));
 
     /* Push both ULCNet analysis branches (0/2/1 emission, always in
-     * lockstep since both states advance once per hop). */
+     * lockstep since both states advance once per hop). The beam_hop just
+     * reconstructed above is the PREVIOUS hop's beamformed error (the WOLA
+     * closes one hop late), so the far branch must be delayed by one hop
+     * too: push the far hop SAVED on the previous call, then save this
+     * hop's far source (pre.aligned_ref in ALIGNED mode, the caller's raw
+     * far in RAW mode). Without this the model would see error[t-1] paired
+     * with far[t] -- a fixed 256-sample skew. */
+    far_source = (p->far_input_mode == ULCNET_FAR_RAW)
+        ? far_reference : pre.aligned_ref;
     n_err_frames = ulcnet_analysis_push(
         &p->err_analysis, p->beam_hop, p->frame_err_re, p->frame_err_im);
     n_far_frames = ulcnet_analysis_push(
-        &p->far_analysis, pre.aligned_ref, p->frame_far_re, p->frame_far_im);
+        &p->far_analysis, p->far_delay, p->frame_far_re, p->frame_far_im);
+    memcpy(p->far_delay, far_source, (size_t)hop * sizeof(float));
 
     /* All PreFrame pointers consumed -- release the core's pending frame
      * (no process_post() variant ever runs in this pipeline). */
@@ -679,22 +750,29 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
 
-    /* Fail-open/bypass policy (see the header): identity while the delay is
-     * not locked or no usable model callback is installed; per-frame
-     * fail-open when infer() reports an error. */
-    bypass = !pre.delay.solid || pre.delay.delay_samples < 0 ||
-             !p->model.infer;
+    /* Step/apply split (see the header; matches the mono variant): infer()
+     * is STEPPED for every emitted frame whenever a callback is installed
+     * -- constant per-hop compute and continuous runtime recurrent state --
+     * and its output is APPLIED only when infer() returned 0, every output
+     * value is finite (never let NaN/Inf reach the WOLA), and -- in
+     * ULCNET_FAR_ALIGNED only -- the shared delay is locked. RAW mode never
+     * gates application on the lock (the checkpoint's paper contract does
+     * not depend on it); every other case is the fail-open identity. */
+    apply_allowed = (p->far_input_mode == ULCNET_FAR_RAW) ||
+                    (pre.delay.solid && pre.delay.delay_samples >= 0);
 
     written = 0;
     for (f = 0; f < n_err_frames; ++f) {
         const float* spec_re = p->frame_err_re[f];
         const float* spec_im = p->frame_err_im[f];
-        if (!bypass &&
+        if (p->model.infer &&
             p->model.infer(
                 p->model.user,
                 p->frame_err_re[f], p->frame_err_im[f],
                 p->frame_far_re[f], p->frame_far_im[f],
-                p->enh_re, p->enh_im) == 0) {
+                p->enh_re, p->enh_im) == 0 &&
+            apply_allowed &&
+            ulcnet_frame_is_finite(p->enh_re, p->enh_im)) {
             spec_re = p->enh_re;
             spec_im = p->enh_im;
         }
@@ -728,9 +806,14 @@ void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p) {
     memset(p->ola, 0, (size_t)p->fft_size * sizeof(float));
     memset(p->ifft_buffer, 0, (size_t)p->fft_size * sizeof(float));
     memset(p->beam_hop, 0, (size_t)p->hop_size * sizeof(float));
-    ulcnet_analysis_init(&p->err_analysis);
-    ulcnet_analysis_init(&p->far_analysis);
-    ulcnet_synthesis_init(&p->synthesis);
+    memset(p->far_delay, 0, sizeof(p->far_delay));
+    /* far_input_mode is an installation (like the model callback), not
+     * audio state -- it survives reset. Re-init keeps the same shared
+     * handle/window (pool/instance resident, untouched by reset); cannot
+     * fail for a handle already validated at init time. */
+    (void)ulcnet_analysis_init(&p->err_analysis, p->fft, p->ulcnet_window);
+    (void)ulcnet_analysis_init(&p->far_analysis, p->fft, p->ulcnet_window);
+    (void)ulcnet_synthesis_init(&p->synthesis, p->fft, p->ulcnet_window);
     memset(&p->last_delay, 0, sizeof(p->last_delay));
     p->frame_index = 0;
     /* Documented contract: a pipeline reset also resets the runtime. */

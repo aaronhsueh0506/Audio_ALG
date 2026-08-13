@@ -100,6 +100,8 @@ __all__ = [
     'split_dataset_by_sample',
     'build_plain_loaders',
     'read_model_kwargs',
+    'FAR_INPUT_MODES',
+    'checkpoint_far_input_mode',
     'make_checkpoint_contract',
     'require_checkpoint_contract',
     'require_checkpoint_model_identity',
@@ -361,6 +363,34 @@ def read_model_kwargs(cfg, model_cls, section: str = 'model',
 # Checkpoint contract
 # ============================================================
 
+# The far-end input every current trainer feeds its model: the RAW rendered
+# far-end reference (``stems.far_render`` in dataset_gen/model_views.py, both
+# task families), with no alignment or preprocessing. Recorded in the
+# checkpoint contract so a checkpoint trained on a future preprocessed far
+# variant cannot be loaded into a seam that feeds raw far.
+FAR_INPUT_MODES = ('raw_far',)
+
+
+def checkpoint_far_input_mode(contract: Dict) -> str:
+    """Return the contract's far-input mode; the ONE place the default lives.
+
+    Checkpoints written before ``far_input_mode`` existed all trained on raw
+    far by construction (see ``FAR_INPUT_MODES``), so a missing field reads as
+    ``'raw_far'`` and legacy checkpoints stay loadable. A recorded mode this
+    code does not know is rejected: it means the checkpoint's far
+    preprocessing has no implementation at this seam.
+    """
+    if not isinstance(contract, dict):
+        raise ValueError("checkpoint has no valid contract")
+    mode = contract.get('far_input_mode', 'raw_far')
+    if mode not in FAR_INPUT_MODES:
+        raise ValueError(
+            f"checkpoint far_input_mode={mode!r} is not supported here "
+            f"(known: {', '.join(FAR_INPUT_MODES)})"
+        )
+    return mode
+
+
 def make_checkpoint_contract(*, model_name: str, task: str, grid, model_kwargs: Dict,
                              loss_version: str, feature_version: Optional[str] = None,
                              data_contract: Optional[Dict] = None) -> Dict:
@@ -390,6 +420,10 @@ def make_checkpoint_contract(*, model_name: str, task: str, grid, model_kwargs: 
         'task': task,
         'sr': sr, 'n_fft': grid.n_fft, 'win_len': grid.win_len, 'hop_len': grid.hop_len,
         'loss_version': loss_version,
+        # Every current trainer feeds raw far (dataset_gen/model_views.py);
+        # readers default a missing field to this via
+        # checkpoint_far_input_mode, so the field is additive.
+        'far_input_mode': 'raw_far',
     }
     if feature_version is not None:
         contract['feature_version'] = feature_version
@@ -406,6 +440,11 @@ def make_checkpoint_contract(*, model_name: str, task: str, grid, model_kwargs: 
 def require_checkpoint_contract(ckpt: Dict, expected: Dict, context: str = 'checkpoint') -> None:
     """Reject a checkpoint whose recorded contract disagrees with ``expected``."""
     saved = ckpt.get('contract', {})
+    if isinstance(saved, dict):
+        # Legacy checkpoints predate 'far_input_mode'; the single defaulting
+        # authority is checkpoint_far_input_mode (which also rejects an
+        # unknown recorded mode), so resume does not fail on the added field.
+        saved = dict(saved, far_input_mode=checkpoint_far_input_mode(saved))
     def compare(got, want, path):
         if isinstance(want, dict):
             if not isinstance(got, dict):
