@@ -80,3 +80,8 @@ pipelines/4ch_pipelines/third_party/bin/
 # Vendoring it properly (submodule, or a copy with .git removed) is a separate
 # decision -- see GTCRN/GTCRN_Analysis.md for what was read out of it.
 AINR/gtcrn_github/
+
+# Third-party listening-test assets (local clone of the Align-ULCNet paper's
+# demo page, github.com/fhgainr/alignulcnet-aenr): nested .git + unclear mp3
+# licensing -- keep local-only, re-clone on other machines when needed.
+AIAEC/wav_testset/

@@ -54,6 +54,7 @@ to paste back.  It modifies nothing.
 
 import argparse
 import configparser
+import json
 import os
 import sys
 
@@ -92,6 +93,8 @@ def main():
                          'because clip onsets are atypical.')
     ap.add_argument('--seed', type=int, default=42,
                     help='must match the training seed so the same split is used')
+    ap.add_argument('--output-json', default=None,
+                    help='optional machine-readable calibration report')
     args = ap.parse_args()
 
     cfg = configparser.ConfigParser()
@@ -199,6 +202,28 @@ def main():
           f"rather than merely mis-placed.")
     print("⚠ Do NOT copy these into RNNoise-ERB: different sr, FFT size, band "
           "count and corpus.")
+
+    if args.output_json:
+        report = {
+            'schema': 'dfn2-normalization-calibration-v1',
+            'sample_rate': SR,
+            'n_fft': N_FFT,
+            'win_len': WIN_LEN,
+            'hop_len': HOP_LEN,
+            'clips': len(idx),
+            'frames': int(erb_db.shape[0]),
+            'erb_norm_init_lo_db': float(erb_lo),
+            'erb_norm_init_hi_db': float(erb_hi),
+            'spec_norm_init_lo': float(sp_lo),
+            'spec_norm_init_hi': float(sp_hi),
+            'erb_ramp_residual_db': float(erb_res),
+            'spec_ramp_residual': float(sp_res),
+        }
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_json)), exist_ok=True)
+        with open(args.output_json, 'w', encoding='utf-8') as fp:
+            json.dump(report, fp, indent=2, sort_keys=True)
+            fp.write('\n')
+        print(f"calibration report: {args.output_json}")
 
 
 if __name__ == '__main__':

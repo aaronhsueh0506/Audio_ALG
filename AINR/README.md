@@ -90,3 +90,9 @@ synthesis. GTCRN uses the configured unnormalised
 complex `[F,2]` network boundary. All three C implementations use
 zero-padded streaming warm-up (`center=False` semantics), while the offline
 PyTorch denoisers use centered STFT framing at clip boundaries.
+
+DeepFilterNet2 and GTCRN also provide `export_onnx.py`,
+`export_calibration.py`, and `export_erb_matrix.py`. Install the optional
+packages in `requirements-export.txt`; the model-specific READMEs define
+whether recurrent state is explicit at the ONNX boundary and whether ERB is
+inside or outside the graph.

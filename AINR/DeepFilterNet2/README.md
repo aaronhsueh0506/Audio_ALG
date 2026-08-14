@@ -75,6 +75,30 @@ the future DF source. Therefore the shipped `mask_lookahead=1` and
 masks and nontrivial future taps so an off-by-one head/spectrum pairing cannot
 pass as a merely finite output.
 
+## ONNX, ERB tables and calibration
+
+Install the optional export dependencies from `../requirements-export.txt`.
+The ONNX graph contains only the learned heads; STFT, feature normalization,
+head composition and WOLA remain in `dfn2_process.c/.h`.
+
+```bash
+python3 export_onnx.py --model output/dfn2_best.pth \
+  --frames 64 --output output/dfn2_heads.onnx --verify
+python3 export_erb_matrix.py --model output/dfn2_best.pth \
+  --output-dir output/erb --format all
+python3 export_calibration.py --model output/dfn2_best.pth \
+  --wav-dir /path/to/noisy_wavs --frames 64 --blocks 256 \
+  --output output/dfn2_calibration.npz
+```
+
+`--frames` is fixed in the exported graph and is part of the deployment
+contract. The current graph resets its internal recurrent state on every
+invocation, so it must be validated with that exact block/reset policy; it is
+not a one-frame explicit-state streaming graph. `export_calibration.py`
+captures actual normalized ONNX inputs for PTQ. `calibrate_norm_init.py` is a
+different tool: it estimates the feature EMA initialization constants used by
+the C frontend.
+
 ## Debugging excessive low-frequency suppression
 
 Check these in order:

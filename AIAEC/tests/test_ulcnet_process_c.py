@@ -34,6 +34,7 @@ from AIAEC.dataset_gen.aec_features import sqrt_hann_window
 
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 _ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'Align_ULCNet')
+_AIAEC_DIR = os.path.dirname(_THIS_DIR)
 _AC_DIR = os.path.abspath(
     os.path.join(_THIS_DIR, '..', '..', '..', 'audio_common'))
 _AC_INCLUDE = os.path.join(_AC_DIR, 'include')
@@ -253,3 +254,113 @@ int main(void) {
                     audio_common_lib, '-lm', '-o', str(exe2)],
                    check=True, capture_output=True)
     subprocess.run([str(exe2)], check=True)
+
+
+def test_ulcnet_compressed_mask_helper_matches_python(driver, audio_common_lib):
+    work, _ = driver
+    cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
+    source = work / 'ulc_mask.c'
+    source.write_text(r'''
+#include <stdio.h>
+#include "aiaec_process.h"
+int main(int argc, char **argv) {
+    float in[4][AIAEC_N_BINS], out[2][AIAEC_N_BINS];
+    FILE *fi, *fo;
+    if (argc != 3) return 2;
+    fi = fopen(argv[1], "rb"); fo = fopen(argv[2], "wb");
+    if (!fi || !fo) return 3;
+    if (fread(in, sizeof(float), 4 * AIAEC_N_BINS, fi) !=
+        4 * AIAEC_N_BINS) return 4;
+    aiaec_apply_ulcnet_compressed_mask(
+        in[0], in[1], in[2], in[3], out[0], out[1]);
+    fwrite(out, sizeof(float), 2 * AIAEC_N_BINS, fo);
+    fclose(fi); fclose(fo); return 0;
+}
+''')
+    executable = work / 'ulc_mask'
+    subprocess.run(
+        [cc, '-O2', '-std=c99', '-ffp-contract=off',
+         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _AC_INCLUDE,
+         str(source), os.path.join(_AIAEC_DIR, 'aiaec_process.c'),
+         os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
+         audio_common_lib, '-lm', '-o', str(executable)],
+        check=True, capture_output=True)
+    torch.manual_seed(21)
+    values = torch.randn(4, BINS).clamp(-2.0, 2.0)
+    input_path = work / 'ulc_mask_in.f32'
+    output_path = work / 'ulc_mask_out.f32'
+    values.numpy().astype(np.float32).tofile(input_path)
+    subprocess.run([str(executable), str(input_path), str(output_path)],
+                   check=True)
+    got = torch.from_numpy(np.fromfile(output_path, dtype=np.float32)).reshape(2, BINS)
+    exponent = 0.3
+    compressed = values[:2].sign() * values[:2].abs().pow(exponent)
+    masked = torch.stack((
+        compressed[0] * values[2] - compressed[1] * values[3],
+        compressed[1] * values[2] + compressed[0] * values[3],
+    ))
+    expected = masked.sign() * masked.abs().pow(1.0 / exponent)
+    assert (got - expected).abs().max().item() < 2e-5
+
+
+def test_deepvqe_ccm_helper_matches_python(tmp_path):
+    from AIAEC.aiaec_common import apply_causal_tf_filter
+
+    cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
+    if cc is None:
+        pytest.skip('no C compiler available')
+    source = tmp_path / 'ccm.c'
+    source.write_text(r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include "deepvqe_process.h"
+int main(int argc, char **argv) {
+    DeepVqeCcmState state;
+    float re[AIAEC_N_BINS], im[AIAEC_N_BINS];
+    float taps[AIAEC_N_BINS][DEEPVQE_TIME_ORDER][DEEPVQE_FREQ_TAPS][2];
+    float out_re[AIAEC_N_BINS], out_im[AIAEC_N_BINS];
+    FILE *fi, *fo;
+    if (argc != 4) return 2;
+    fi = fopen(argv[1], "rb"); fo = fopen(argv[2], "wb");
+    if (!fi || !fo) return 3;
+    deepvqe_ccm_init(&state);
+    for (int frame = 0; frame < atoi(argv[3]); ++frame) {
+        if (fread(re, sizeof(float), AIAEC_N_BINS, fi) != AIAEC_N_BINS) return 4;
+        if (fread(im, sizeof(float), AIAEC_N_BINS, fi) != AIAEC_N_BINS) return 4;
+        if (fread(taps, sizeof(float), AIAEC_N_BINS * 3 * 3 * 2, fi) !=
+            AIAEC_N_BINS * 3 * 3 * 2) return 4;
+        deepvqe_ccm_process(&state, re, im, taps, out_re, out_im);
+        fwrite(out_re, sizeof(float), AIAEC_N_BINS, fo);
+        fwrite(out_im, sizeof(float), AIAEC_N_BINS, fo);
+    }
+    fclose(fi); fclose(fo); return 0;
+}
+''')
+    executable = tmp_path / 'ccm'
+    subprocess.run(
+        [cc, '-O2', '-std=c99', '-ffp-contract=off',
+         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR,
+         '-I', os.path.join(_AIAEC_DIR, 'DeepVQE_S'), '-I', _AC_INCLUDE,
+         str(source), os.path.join(_AIAEC_DIR, 'DeepVQE_S', 'deepvqe_process.c'),
+         '-o', str(executable)], check=True, capture_output=True)
+    torch.manual_seed(22)
+    frames = 6
+    spectrum = torch.complex(torch.randn(1, frames, BINS),
+                             torch.randn(1, frames, BINS))
+    taps = torch.complex(torch.randn(1, frames, BINS, 3, 3),
+                         torch.randn(1, frames, BINS, 3, 3))
+    raw = []
+    for frame in range(frames):
+        raw.extend((spectrum.real[0, frame].numpy(),
+                    spectrum.imag[0, frame].numpy(),
+                    torch.view_as_real(taps[0, frame]).numpy().reshape(-1)))
+    input_path = tmp_path / 'ccm_in.f32'
+    output_path = tmp_path / 'ccm_out.f32'
+    np.concatenate(raw).astype(np.float32).tofile(input_path)
+    subprocess.run([str(executable), str(input_path), str(output_path), str(frames)],
+                   check=True)
+    got = torch.from_numpy(np.fromfile(output_path, dtype=np.float32)).reshape(
+        frames, 2, BINS)
+    got = torch.complex(got[:, 0], got[:, 1])
+    expected = apply_causal_tf_filter(spectrum, taps, 3, 1)[0]
+    assert (got - expected).abs().max().item() < 2e-5

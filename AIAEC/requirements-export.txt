@@ -1,0 +1,3 @@
+# Install together with requirements.txt when exporting or verifying ONNX.
+onnx>=1.14,<2
+onnxruntime>=1.16,<2

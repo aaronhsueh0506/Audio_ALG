@@ -105,6 +105,70 @@ before the microphone recording; it does not estimate or correct a start offset.
 `--gpu N` selects `cuda:N` and takes precedence over `--device`. `--mmap`
 keeps packed tensors disk-backed to reduce host RAM use.
 
+## ONNX and embedded pre/post-processing
+
+Install `requirements-export.txt` together with the normal requirements. The
+shared exporter supports all six candidates and emits real/imag tensors rather
+than ONNX complex tensors:
+
+```bash
+python3 AIAEC/export_onnx.py Align_ULCNet \
+  --checkpoint /path/to/checkpoint.pth --frames 8 --max-delay-frames 8 \
+  --output output/align_ulcnet.onnx --verify
+python3 AIAEC/export_calibration.py Align_ULCNet \
+  --checkpoint /path/to/checkpoint.pth \
+  --primary-dir /path/to/linear_error --far-dir /path/to/far \
+  --frames 8 --max-delay-frames 8 --blocks 256 \
+  --output output/calibration.npz
+```
+
+For end-to-end candidates, `--primary-dir` contains microphone WAVs; for
+RES+NR candidates it contains materialized linear-error WAVs. Relative WAV
+paths in the primary and far directories must match. `--frames` must equal the
+ONNX export and cannot be shorter than the selected alignment depth `D`.
+For alignment models, `--max-delay-frames` can reduce D at deployment without
+changing weight shapes or retraining; it changes numerical behavior, so use
+the same override for export and calibration and validate it with the delay
+depth sweep before release.
+
+The default graph outputs only the learned object consumed by host post
+processing: a real/complex mask, DeepVQE CCM taps, or the three DFN heads.
+`--include-debug-outputs` additionally exposes delay/attention tensors but is
+not intended for production I/O. These six exports are fixed-block graphs:
+recurrent and attention state resets at each invocation. They are suitable
+only when the chosen block/reset policy has been validated; they are not a
+substitute for the one-frame `forward_stream()` reference. GTCRN under
+`AINR/GTCRN` has a separate true one-frame explicit-state exporter.
+
+Only three candidates contain ERB maps. Export their checkpoint-exact tables
+with:
+
+```bash
+python3 AIAEC/export_erb_matrix.py CAGCRN \
+  --checkpoint /path/to/checkpoint.pth --output-dir output/erb --format all
+```
+
+The C host boundary is built with `make -C AIAEC` and produces
+`AIAEC/build/libaiaec_prepost.a`. `SIMD=0` selects the shared scalar reference.
+The current mapping is:
+
+| Model | Accelerator output | Host composition |
+|---|---|---|
+| Align-CRUSE | real mask | `aiaec_apply_real_mask` |
+| Align-ULCNet | compressed-domain complex mask | `aiaec_apply_ulcnet_compressed_mask` |
+| CAGCRN / GTCRN-AENR | complex mask | `aiaec_apply_complex_mask` |
+| DeepVQE-S | 3x3 complex CCM taps | `deepvqe_ccm_process` |
+| DeepFilterNet-AENR | ERB mask, DF coefficients, alpha | `dfn_aenr_compose_stream` |
+
+`aiaec_process.c/.h` and `DeepVQE_S/deepvqe_process.c/.h` implement the
+current 16 kHz `512/512/256` centered STFT/WOLA path. The DFN-AENR wrapper is
+separate and uses the current 48 kHz `1024/1024/512` grid. Its centered,
+normalized STFT/WOLA matches AIAEC training and `forward_stream()`; it reuses
+DFN2's feature normalization and head composition, but intentionally does not
+reuse AINR DFN2's zero-padded `center=False` analysis. Generated ERB matrices
+must match the checkpoint and replace, not supplement, any compiled default
+table.
+
 ## Navigation and tests
 
 - [`dataset_gen/README.md`](dataset_gen/README.md): five-channel WAV generation,
@@ -120,3 +184,11 @@ From the repository root:
 ```bash
 python3 -m pytest AIAEC/tests
 ```
+
+## Local test assets (not in version control)
+
+`AIAEC/wav_testset/` is a local clone of the Align-ULCNet paper's listening
+demo page (`github.com/fhgainr/alignulcnet-aenr`), used as real-recording
+test input (e.g. the FST far-end clips). It is gitignored: it carries its
+own nested `.git` and the sample licensing is not established for
+redistribution. Re-clone it locally when a machine needs these inputs.
