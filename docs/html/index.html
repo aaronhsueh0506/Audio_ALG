@@ -28,9 +28,9 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="index.html"><b>索引</b></a> ·
 <a href="conventions.html">慣例</a> ·
 <a href="onnx_prepost.html">ONNX 邊界</a> ·
-<a href="aec.html">AEC</a> ·
-<a href="nr.html">NR</a> ·
-<a href="audio_common.html">audio_common</a> ·
+<a href="../../../AEC/docs/html/aec.html">AEC</a> ·
+<a href="../../../NR/docs/html/nr.html">NR</a> ·
+<a href="../../../audio_common/docs/html/audio_common.html">audio_common</a> ·
 <a href="pipeline_mono.html">mono</a> ·
 <a href="pipeline_ulcnet_mono.html">mono-ULCNet</a> ·
 <a href="pipeline_4ch.html">4ch</a> ·
@@ -55,6 +55,9 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 概要 / API 用法 / Block diagram / 訊號泳道圖 / I-O 表 / State 表 /
 延遲與 warm-up / 相關檔案與測試路徑。全站數字皆對照當前程式碼與測試，
 與程式碼衝突時以程式碼為準。</p>
+<p class="note">元件頁（AEC/NR/audio_common）位於各自 repo 的
+<code>docs/html/</code>，本站以連結方式指向；連結假設 SE 樹 sibling 佈局
+（<code>SE/{AEC,NR,audio_common,Audio_ALG}</code> 同層)。</p>
 
 <h2>Repo 架構總覽</h2>
 <pre>
@@ -101,13 +104,13 @@ PBFDKF 矩形窗例外、centered vs 串流 framing 等價性、ULCNet pipeline 
 <h3>核心程式庫</h3>
 <table>
 <tr><th>頁面</th><th>一行描述</th></tr>
-<tr><td><a href="aec.html">aec</a></td>
+<tr><td><a href="../../../AEC/docs/html/aec.html">aec</a></td>
 <td><code>lib/aec/c_impl</code>：PBFDKF main/shadow 線性濾波 + AEC3 matched-filter
 delay estimator + AEC3 post（RES/CNG/suppression）；grid 8k/256、16k/256|512、48k/1024。</td></tr>
-<tr><td><a href="nr.html">nr</a></td>
+<tr><td><a href="../../../NR/docs/html/nr.html">nr</a></td>
 <td><code>lib/nr/c_impl</code>：OM-LSA 核心（MCRA 噪聲估計 + SPP + LSA gain），
 4 檔強度 preset + stationary content mode；呼叫端持有 FFT/窗/OLA。</td></tr>
-<tr><td><a href="audio_common.html">audio_common</a></td>
+<tr><td><a href="../../../audio_common/docs/html/audio_common.html">audio_common</a></td>
 <td>共用基礎層：<code>fft_wrapper.h</code>（kiss/ne10 後端）、SIMD kernels、
 fast_math、WAV I/O、HPF、resampler；三個上層 repo 的唯一 FFT 來源。</td></tr>
 </table>
