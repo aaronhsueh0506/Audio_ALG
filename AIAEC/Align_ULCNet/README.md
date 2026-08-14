@@ -39,3 +39,32 @@ The page's ``mic``/``lpb`` tracks are 48 kHz while ``err`` is 16 kHz; the
 script converts both to the checkpoint rate. Omit the flag to test the complete
 repository flow (48 kHz mic/lpb -> resample -> frozen PBFDKF -> Align-ULCNet).
 The external KF uses different parameters and is not bit-equivalent to PBFDKF.
+
+## Streaming delay-depth sweep
+
+`sweep_delay_depth.py` runs the same checkpoint through the real
+`forward_stream()` path at several fixed delay depths.  The PBFDKF frontend
+and STFT inputs are computed once, so the resulting WAV differences come only
+from D.  Each run writes a float WAV, a frame-by-frame delay trace, and one row
+in `summary.csv` containing state RAM, Python RTF, boundary-hit rate, and the
+waveform difference from the checkpoint's D:
+
+```bash
+python3 sweep_delay_depth.py checkpoint.pth mic.wav far.wav d_sweep \
+  --depths 64,32,16,8,4 --device cuda
+```
+
+For a published or external KF residual, add `--input-is-linear-error`.  An
+aligned clean reference may be supplied with `--target-wav` to add SNR and
+SI-SDR columns.  To test the proposed small-D deployment seam, add
+`--far-input-mode aligned_far`; the tool then feeds the NN the post-delay-
+buffer far samples that PBFDKF actually consumed.  In
+`--input-is-linear-error` bypass mode it cannot recover that internal tap, so
+the supplied far WAV is explicitly assumed to be pre-aligned.
+
+The Python RTF is only a relative D comparison on the same machine; it does
+not predict NPU runtime.  Compare the boundary rates/probability with the
+uninformative softmax baseline `1/D`: a boundary value near that baseline may
+only mean that attention is diffuse, whereas a trained head repeatedly
+concentrating at the oldest slot suggests D is too small.  Listen to every
+generated WAV and validate task metrics before fixing D in an ONNX export.
