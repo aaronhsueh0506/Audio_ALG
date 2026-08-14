@@ -41,8 +41,9 @@ AINR/RNNoise-ERB/output/
 *.log
 *.tmp
 
-# Claude Code
-.claude/
+# Claude Code (local state ignored; versioned skills are re-included below)
+.claude/*
+!.claude/skills/
 
 # machine-specific built binary (regenerable via make in pipelines/)
 pipelines/aec_nr_pipeline
