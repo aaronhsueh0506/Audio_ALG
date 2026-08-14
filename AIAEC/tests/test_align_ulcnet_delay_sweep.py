@@ -1,15 +1,19 @@
 import argparse
 
+import numpy as np
 import pytest
 import torch
 
 from AIAEC.Align_ULCNet import AlignULCNet
 from AIAEC.Align_ULCNet.sweep_delay_depth import (
+    _alignment_summary,
     _delay_summary,
+    _write_alignment_trace,
     parse_depths,
     run_streaming_frames,
 )
 from AIAEC.aiaec_common import SignalGrid
+from AIAEC.dataset_gen.measure_align_residual import EngineRun
 
 
 GRID = SignalGrid(16000, 512, 512, 256)
@@ -59,3 +63,48 @@ def test_streaming_sweep_uses_requested_depth_and_reports_state_memory():
     assert summary['evaluated_frames'] == 9.0
     assert 0.0 <= summary['argmax_at_max_depth_rate'] <= 1.0
     assert 0.0 <= summary['max_depth_probability_mean'] <= 1.0
+
+
+def test_alignment_trace_reports_applied_delay_and_acquisition(tmp_path):
+    run = EngineRun(
+        sample_rate=16000,
+        hop_size=256,
+        error=np.zeros(4 * 256, dtype=np.float32),
+        echo_estimate=np.zeros(4 * 256, dtype=np.float32),
+        aligned_far=np.zeros(4 * 256, dtype=np.float32),
+        delay_samples=np.asarray([-1, 7936, 7936, 8000], dtype=np.int64),
+        confidence=np.asarray([0.0, 0.5, 1.0, 1.0], dtype=np.float64),
+    )
+
+    summary = _alignment_summary(run)
+    assert summary['aec_delay_acquired'] is True
+    assert summary['aec_first_acquired_ms'] == 32.0
+    assert summary['aec_initial_delay_samples'] == 7936
+    assert summary['aec_final_delay_samples'] == 8000
+    assert summary['aec_final_delay_ms'] == 500.0
+    assert summary['aec_delay_change_events'] == 1
+    assert summary['aec_final_confidence'] == 1.0
+
+    path = tmp_path / 'aec_alignment.csv'
+    _write_alignment_trace(path, run)
+    rows = path.read_text(encoding='utf-8').splitlines()
+    assert rows[0].startswith('hop,time_ms,applied_delay_samples')
+    assert rows[1].split(',')[2:] == ['-1', 'nan', '0.000000000', '0']
+    assert rows[-1].split(',')[1:4] == ['64.000000', '8000', '500.000000']
+
+
+def test_alignment_summary_reports_never_acquired():
+    run = EngineRun(
+        sample_rate=16000,
+        hop_size=256,
+        error=np.zeros(512, dtype=np.float32),
+        echo_estimate=np.zeros(512, dtype=np.float32),
+        aligned_far=np.zeros(512, dtype=np.float32),
+        delay_samples=np.asarray([-1, -1], dtype=np.int64),
+        confidence=np.asarray([0.0, 0.0], dtype=np.float64),
+    )
+    summary = _alignment_summary(run)
+    assert summary['aec_delay_acquired'] is False
+    assert summary['aec_final_delay_samples'] == -1
+    assert np.isnan(summary['aec_first_acquired_ms'])
+    assert np.isnan(summary['aec_final_delay_ms'])

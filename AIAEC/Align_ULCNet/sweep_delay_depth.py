@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+import numpy as np
 import soundfile as sf
 import torch
 from torch import Tensor
@@ -44,7 +45,12 @@ if _AUDIO_ALG_ROOT not in sys.path:
 from AIAEC.Align_ULCNet.denoise import load_model
 from AIAEC.dataset_gen import istft, stft
 from AIAEC.dataset_gen.linear_aec import LinearAecContract
-from AIAEC.dataset_gen.measure_align_residual import run_linear_aec_with_taps
+from AIAEC.dataset_gen.measure_align_residual import (
+    EngineRun,
+    count_delay_change_events,
+    first_lock_hop,
+    run_linear_aec_with_taps,
+)
 from AIAEC.inference_common import load_linear_error_far, load_mic_far
 from AIAEC.training_common import LinearAecEngine, auto_device
 
@@ -224,6 +230,62 @@ def _write_delay_trace(path: Path, distribution: Tensor, hop_seconds: float) -> 
             ])
 
 
+def _alignment_summary(run: EngineRun) -> Dict[str, object]:
+    """Summarize the delay actually applied by the PBFDKF frontend."""
+    delays = np.asarray(run.delay_samples, dtype=np.int64)
+    confidence = np.asarray(run.confidence, dtype=np.float64)
+    first = first_lock_hop(delays)
+    if delays.size == 0:
+        final_delay = -1
+        final_confidence = float('nan')
+    else:
+        final_delay = int(delays[-1])
+        final_confidence = float(confidence[-1])
+    first_at_ms = (
+        (first + 1) * run.hop_size * 1000.0 / run.sample_rate
+        if first >= 0 else float('nan')
+    )
+    return {
+        'aec_delay_acquired': first >= 0,
+        'aec_first_acquired_ms': first_at_ms,
+        'aec_initial_delay_samples': int(delays[first]) if first >= 0 else -1,
+        'aec_final_delay_samples': final_delay,
+        'aec_final_delay_ms': (
+            final_delay * 1000.0 / run.sample_rate
+            if final_delay >= 0 else float('nan')
+        ),
+        'aec_delay_change_events': count_delay_change_events(delays),
+        'aec_final_confidence': final_confidence,
+    }
+
+
+def _write_alignment_trace(path: Path, run: EngineRun) -> None:
+    """Write the post-hop PBFDKF delay state used to produce aligned far."""
+    with path.open('w', newline='', encoding='utf-8') as handle:
+        writer = csv.writer(handle)
+        writer.writerow([
+            'hop', 'time_ms', 'applied_delay_samples', 'applied_delay_ms',
+            'confidence', 'acquired',
+        ])
+        for hop, (delay, confidence) in enumerate(zip(
+                run.delay_samples, run.confidence)):
+            # State is sampled after this hop has been processed, so report
+            # the hop-end time rather than its input start time.
+            time_ms = (hop + 1) * run.hop_size * 1000.0 / run.sample_rate
+            delay_ms = (
+                float(delay) * 1000.0 / run.sample_rate
+                if delay >= 0 else float('nan')
+            )
+            writer.writerow([
+                hop,
+                f"{time_ms:.6f}",
+                int(delay),
+                f"{delay_ms:.6f}",
+                f"{float(confidence):.9f}",
+                int(delay >= 0),
+            ])
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('checkpoint')
@@ -250,9 +312,12 @@ def build_parser() -> argparse.ArgumentParser:
         '--far-input-mode', choices=('raw_far', 'aligned_far'),
         default='raw_far',
         help='Far stream presented to the NN. raw_far reproduces existing '
-             'checkpoint training. aligned_far taps the far hop actually '
-             'consumed by PBFDKF; with --input-is-linear-error, the supplied '
-             'far WAV is assumed to be already aligned.',
+             'checkpoint training. aligned_far is a diagnostic, out-of-'
+             'distribution experiment for current raw-far checkpoints: it '
+             'taps the far hop actually consumed by PBFDKF and writes '
+             'aec_alignment.csv; with --input-is-linear-error, the supplied '
+             'far WAV is assumed to be already aligned and no AEC delay trace '
+             'is available.',
     )
     parser.add_argument(
         '--target-wav', default=None,
@@ -321,6 +386,7 @@ def main(args: argparse.Namespace) -> None:
     if args.max_seconds is not None and args.max_seconds <= 0:
         raise ValueError("--max-seconds must be positive")
 
+    alignment_run: Optional[EngineRun] = None
     if args.input_is_linear_error:
         error, far, source_rates = load_linear_error_far(
             args.mic_wav, args.far_wav, grid.sr
@@ -329,6 +395,8 @@ def main(args: argparse.Namespace) -> None:
         if args.far_input_mode == 'aligned_far':
             print("aligned_far evaluation: treating the supplied far WAV as "
                   "already aligned (no PBFDKF tap is available in bypass mode)")
+            print("WARNING: current checkpoints are trained with raw_far; "
+                  "aligned_far is an out-of-distribution diagnostic")
         if args.max_seconds is not None:
             limit = min(
                 error.shape[-1], max(1, int(round(args.max_seconds * grid.sr)))
@@ -358,8 +426,11 @@ def main(args: argparse.Namespace) -> None:
             far = torch.from_numpy(
                 tapped.aligned_far[:original_length]
             ).unsqueeze(0).contiguous()
+            alignment_run = tapped
             print("aligned_far evaluation: using the post-delay-buffer far "
                   "samples actually consumed by PBFDKF")
+            print("WARNING: current checkpoints are trained with raw_far; "
+                  "aligned_far is an out-of-distribution diagnostic")
         else:
             linear_aec = LinearAecEngine(
                 n_lanes=1, sample_rate=grid.sr, contract=linear_contract
@@ -388,12 +459,36 @@ def main(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     paths = [output_dir / 'summary.csv']
+    if alignment_run is not None:
+        paths.append(output_dir / 'aec_alignment.csv')
     for depth in depths:
         paths.extend((
             output_dir / f'D{depth:03d}.wav',
             output_dir / f'D{depth:03d}_delay.csv',
         ))
     _require_output_paths(paths, args.overwrite)
+
+    alignment_metrics: Dict[str, object] = {}
+    if alignment_run is not None:
+        alignment_metrics = _alignment_summary(alignment_run)
+        _write_alignment_trace(
+            output_dir / 'aec_alignment.csv', alignment_run,
+        )
+        if alignment_metrics['aec_delay_acquired']:
+            print(
+                "PBFDKF delay: first acquired at "
+                f"{alignment_metrics['aec_first_acquired_ms']:.1f} ms, "
+                f"initial={alignment_metrics['aec_initial_delay_samples']} "
+                "samples, final="
+                f"{alignment_metrics['aec_final_delay_samples']} samples "
+                f"({alignment_metrics['aec_final_delay_ms']:.2f} ms), "
+                f"changes={alignment_metrics['aec_delay_change_events']}, "
+                "final confidence="
+                f"{alignment_metrics['aec_final_confidence']:.3f}"
+            )
+        else:
+            print("PBFDKF delay: NOT ACQUIRED during this recording")
+        print(f"wrote {output_dir / 'aec_alignment.csv'}")
 
     target_cpu = target.cpu() if target is not None else None
     reference_waveform: Optional[Tensor] = None
@@ -442,6 +537,7 @@ def main(args: argparse.Namespace) -> None:
         metrics.update(_delay_summary(
             result.delay_distribution, depth, hop_seconds
         ))
+        metrics.update(alignment_metrics)
         if target_cpu is not None:
             metrics['target_snr_db'] = _snr_db(target_cpu, waveform)
             metrics['target_si_sdr_db'] = _si_sdr_db(target_cpu, waveform)
