@@ -143,7 +143,7 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <h2>延遲與 warm-up</h2>
 <ul>
 <li>演算法延遲:<b>1 hop</b>(WOLA;實測 argmax 127 samples @hop=128 → 8 ms @16k 預設)。</li>
-<li>delay acquisition:估計值要 <code>solid</code> 且 <code>n_updates≥3</code> 才被接受;接受值改變的那個 hop 回報 <code>delay.changed=1</code>,核心同時 reset 四條 lane 並清 mono OLA(外部 STFT/OLA 也應照 <code>changed</code> 清)。ring 未累積到 delay 樣本前 <code>aligned_ref</code> 前導為 0。</li>
+<li>delay acquisition:估計值要 <code>solid</code> 且 <code>n_updates≥3</code> 才被接受;<b>開始新的可用 alignment generation 的那個 hop</b> 回報 <code>delay.changed=1</code>——首次 acquisition、unlock 後<b>同值重鎖</b>、鎖定中值改變皆屬之(不只值改變;見 <code>4aec_nr_res.h</code> 的 <code>FourAecNrResDelayState</code> 契約),核心同時 reset 四條 lane 並清 mono OLA(外部 STFT/OLA 也應照 <code>changed</code> 清)。ring 未累積到 delay 樣本前 <code>aligned_ref</code> 前導為 0。</li>
 <li>SRP/GSC warm-up:DOA smoother 需 <code>doa_switch_consecutive=3</code> 次一致觀測才切換;GSC RLS 由 vad_out 凍結(vad_out=1 → 凍結適應)。</li>
 <li>NR 噪聲底 ~1.5 s wall-clock(retimed L)。</li>
 </ul>
@@ -156,11 +156,11 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_projection_kernels.h</code></td><td>投影 kernels(cmac/residual/comfort/mag2)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/third_party/{doa,GSC,utility}</code></td><td>SRP-PHAT / GSC / spatial SIMD</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c</code> / <code>audio_pipeline_4ch_static.c</code>；<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c</code></td><td>應用 CLI 與 core 靜態記憶體 smoke</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c</code></td><td>token/ABA、heap-vs-static byte parity、WOLA identity、far-FFT sharing、descriptor 閘</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c</code></td><td>token/ABA、heap-vs-static byte parity、WOLA identity、far-FFT sharing、descriptor 閘、known-delay profile(acquisition/coverage/mislock/cost, n=1..5,幾何以 <code>DA_*</code> 常數推導、對 ground-truth 斷言)、per-filter RAM/CPU 實測</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c</code> / <code>pipelines/4ch_aec_bf_nr_res/tests/test_spatial_third_party.c</code></td><td>wrapper 與空間庫驗收</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/pipeline.py</code> + <code>tests/test_pipeline.py</code></td><td>Python reference(copy 語意,允許多 pre-frame 在飛)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/Makefile</code></td><td>建置 <code>libaudio_pipeline_4ch.a</code>(只含 <code>4aec_nr_res.o</code> 一個 object;<code>audio_pipeline_4ch.o</code>/ULCNet 變體物件皆各自 link,不進這個 archive)、<code>test</code>、<code>audit-no-stdio</code>;也是 <code>4ch_alignulcnet/</code> 應用轉發建置的目標目錄</td></tr>
 </table>
-<p>測試實測(2026-08-16 重跑, BACKEND=kiss):本目錄 <code>make test</code>(<code>test_4aec_nr_res</code> + <code>test_spatial_third_party</code> + <code>test_audio_pipeline_4ch</code> + 4 個 static smoke @16k/48k;<code>test_audio_pipeline_4ch_ulcnet</code> 已隨 ULCNet 變體移到 <code>4ch_alignulcnet/</code>,不再是本目錄 <code>make test</code> 的一部分)共 <b>262 個 PASS 標記 / 0 FAIL</b>,三支 unit-test binary 各印 <code>All ... tests passed</code>,4 個 static smoke 各印 <code>smoke PASS</code>。<code>4ch_alignulcnet/</code> 自己的 <code>make test</code> 另跑 <code>test_audio_pipeline_4ch_ulcnet</code>(<code>All audio_pipeline_4ch_ulcnet tests passed</code>)+ <code>4ch_alignulcnet</code> smoke,見 <code>pipeline_ulcnet_4ch.html</code>。</p>
+<p>測試實測(2026-08-16 重跑, BACKEND=kiss):本目錄 <code>make test</code> 是一站式關卡(<code>test_4aec_nr_res</code>——含 known-delay profile 區塊——+ <code>test_spatial_third_party</code> + <code>test_audio_pipeline_4ch</code> + <code>test_audio_pipeline_4ch_ulcnet</code> + 4 個 static smoke @16k/48k + <code>4ch_alignulcnet</code> 骨架 bare 與 <code>--delay-num-filters 1</code> 兩種 profile,鏡像 mono 在 <code>pipelines/Makefile</code> 的安排)共 <b>306 個 PASS 標記 / 0 FAIL</b>,四支 unit-test binary 各印 <code>All ... tests passed</code>,4 個 static smoke 各印 <code>smoke PASS</code>。<code>4ch_alignulcnet/</code> 自己的 <code>make test</code> 是委派目標,另可單獨跑,見 <code>pipeline_ulcnet_4ch.html</code>。</p>
 </body>
 </html>
