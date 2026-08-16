@@ -76,11 +76,11 @@ SE/                                (同層四個 repo)
 └── Audio_ALG/  ────────────────────┘   整合 repo (本文件站所在)
       ├── lib/aec        = SE/AEC  submodule (c_impl/: libaec.a)
       ├── lib/nr         = SE/NR   submodule (c_impl/: libmmse_lsa.a)
-      ├── pipelines/     mono C pipeline (audio_pipeline.c /
-      │     │            audio_pipeline_ulcnet.c)；連結三個 producer
-      │     │            archive：libaudio_common.a + libaec.a + libmmse_lsa.a
-      │     └── 4ch_pipelines/  4 通道 (4aec_nr_res.c + SRP-PHAT/GSC +
-      │                         audio_pipeline_4ch[_ulcnet].c)
+      ├── pipelines/     四個應用入口 + 共用 build
+      │     ├── mono_aec_nr_res/      mono AEC + NR/RES
+      │     ├── mono_alignulcnet/     mono AEC + Align-ULCNet
+      │     ├── 4ch_aec_bf_nr_res/    4ch AEC + BF + NR/RES（並擁有共用 4-lane core）
+      │     └── 4ch_alignulcnet/      4ch AEC + BF + Align-ULCNet
       ├── AINR/          NN NR：DFN2 / DFN3 / GTCRN / RNNoise-ERB
       │                  (各自的 C 前後處理 + 訓練/推論 Python)
       ├── AIAEC/         NN AEC/RES 六候選 (Python + Align_ULCNet 的 C 前後處理)
@@ -119,16 +119,16 @@ fast_math、WAV I/O、HPF、resampler；三個上層 repo 的唯一 FFT 來源�
 <table>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="pipeline_mono.html">pipeline_mono</a></td>
-<td><code>pipelines/audio_pipeline.c</code>：AEC(linear) → echo-aware NR → RES，
+<td><code>pipelines/mono_aec_nr_res/audio_pipeline.c</code>：AEC(linear) → echo-aware NR → RES，
 pool-first 零 heap；grid 8k/256、16k/256|512、48k/1024。</td></tr>
 <tr><td><a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a></td>
-<td><code>pipelines/audio_pipeline_ulcnet.c</code>：AEC 線性誤差 + Align-ULCNet
+<td><code>pipelines/mono_alignulcnet/audio_pipeline_ulcnet.c</code>：AEC 線性誤差 + Align-ULCNet
 NN post-filter（per-frame callback）；16k/512/256 固定，演算法延遲 1 hop = 16 ms。</td></tr>
 <tr><td><a href="pipeline_4ch.html">pipeline_4ch</a></td>
-<td><code>pipelines/4ch_pipelines/</code>：4×AEC lanes + 共享 delay + SRP-PHAT DOA +
+<td><code>pipelines/4ch_aec_bf_nr_res/</code>：4×AEC lanes + 共享 delay + SRP-PHAT DOA +
 GSC beamforming + post RES/NR（<code>4aec_nr_res.c</code> 核心）。</td></tr>
 <tr><td><a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a></td>
-<td><code>audio_pipeline_4ch_ulcnet.c</code>：beamformed 線性誤差 → Align-ULCNet
+<td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c</code>：beamformed 線性誤差 → Align-ULCNet
 NN post stage；新增演算法延遲 2 hops = 32 ms。</td></tr>
 </table>
 
@@ -182,8 +182,9 @@ DFN2 cascade，lookahead 2 hops；C 化需 <code>dfn2_process</code> 的雙倍 s
 <code>docs/integration_4ch_spatial_zh_TW.md</code></td></tr>
 <tr><td>AIAEC 設計文件</td><td><code>docs/aiaec_streaming_readiness_zh_TW.md</code>、
 <code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code></td></tr>
-<tr><td>pipeline 測試</td><td><code>pipelines/tests/</code>、
-<code>pipelines/4ch_pipelines/tests/</code></td></tr>
+<tr><td>pipeline 測試</td><td><code>pipelines/tests/</code>（共用格點測試）、
+<code>pipelines/mono_aec_nr_res/tests/</code>、<code>pipelines/mono_alignulcnet/tests/</code>、
+<code>pipelines/4ch_aec_bf_nr_res/tests/</code>、<code>pipelines/4ch_alignulcnet/tests/</code></td></tr>
 <tr><td>模型測試</td><td><code>AINR/*/tests/</code>、<code>AINR/tests/</code>、
 <code>AIAEC/tests/</code></td></tr>
 <tr><td>程式庫測試</td><td><code>lib/aec/c_impl/test/</code>、<code>lib/nr/c_impl/test/</code></td></tr>

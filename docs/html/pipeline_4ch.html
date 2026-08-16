@@ -28,12 +28,12 @@ th{background:#eef0f5}
 <h1>audio_pipeline_4ch — 4 mic 共用 delay + SRP/GSC + fused post</h1>
 
 <h2>概要</h2>
-<p>兩層結構(<code>pipelines/4ch_pipelines/</code>):</p>
+<p>兩層結構(<code>pipelines/4ch_aec_bf_nr_res/</code>):</p>
 <ul>
-<li><b>核心 <code>4aec_nr_res</code></b>:1 個共用 <code>DelayAec3</code> matcher + 1 條共用 aligned render delay line → <b>4 條獨立線性 AEC lane</b> → 外部 beamformer 權重投影 → <b>1 個</b> post-beam RES + <b>1 個</b> mono NR + 1 條 iFFT/OLA(不逐 lane 複製 NR/RES)。mono 的單一 <code>process()</code> 在這裡拆成 <code>process_pre()</code> → 外部 beamformer → <code>process_post()</code>。</li>
+<li><b>核心 <code>4aec_nr_res</code></b>:1 個共用 far aligner(<code>delay_mode=MATCHED</code> 時是 1 個 <code>DelayAec3</code> matcher + 1 條共用 aligned render delay line;<code>FIXED</code>/<code>EXTERNAL_ALIGNED</code> 時 matcher count = 0,兩者都不 carve)→ <b>4 條獨立線性 AEC lane</b> → 外部 beamformer 權重投影 → <b>1 個</b> post-beam RES + <b>1 個</b> mono NR + 1 條 iFFT/OLA(不逐 lane 複製 NR/RES)。mono 的單一 <code>process()</code> 在這裡拆成 <code>process_pre()</code> → 外部 beamformer → <code>process_post()</code>。</li>
 <li><b>完整 wrapper <code>audio_pipeline_4ch</code></b>:把 SRP-PHAT DOA + GSC(<code>third_party/doa</code>、<code>third_party/GSC</code>)接進 pre/post 縫,並提供保守 energy-VAD fallback。</li>
 </ul>
-<p>結構稽核值(<code>*_count()</code>):matched_filter=1 / linear_aec=4 / nr=1 / post_res=1。Lane 0 每 hop 跑真 far-FFT,lane 1–3 經 <code>aec_process_context_shared_far()</code> 借用 lane 0 的 far 頻譜(4 次 far-FFT → 1 次,測試以 <code>four_aec_nr_res_far_fft_real_compute_count()</code> 證明)。支援 16 kHz(fft 256 預設 / 512 明示)與 48 kHz(fft 1024)。</p>
+<p>結構稽核值(<code>*_count()</code>):<code>matched_filter</code> 依 <code>cfg.delay_mode</code> 而定——<code>MATCHED</code> 時 1,<code>FIXED</code>/<code>EXTERNAL_ALIGNED</code> 時 0(無 estimator 可數);<code>linear_aec</code> 恆 4;<code>nr</code>/<code>post_res</code> 依 <code>cfg.enable_post</code> 而定,啟用時各 1、停用時各 0。Lane 0 每 hop 跑真 far-FFT,lane 1–3 經 <code>aec_process_context_shared_far()</code> 借用 lane 0 的 far 頻譜(4 次 far-FFT → 1 次,測試以 <code>four_aec_nr_res_far_fft_real_compute_count()</code> 證明)。支援 16 kHz(fft 256 預設 / 512 明示)與 48 kHz(fft 1024)。</p>
 
 <h2>API 用法</h2>
 <pre>/* 完整 wrapper(含 SRP/GSC) */
@@ -54,7 +54,7 @@ four_aec_nr_res_process_pre(core, mics_interleaved, ref, &amp;pre);
 /* ... 用 pre.linear_spectra / pre.aligned_ref 算 weights ... */
 four_aec_nr_res_process_post(core, &amp;pre.token, weights, out);
 /* 外部 post 變體(如 ULCNet)不跑 post: four_aec_nr_res_abandon_pre(core, &amp;pre.token); */</pre>
-<p>Descriptor 慣例與 mono 相同(32-byte 固定 ABI、init_ex 8 點閘)。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=7</code>、wrapper <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=2</code>,兩者 descriptor_version 皆 1;wrapper 的 build_flags_hash 摺入核心的 hash(核心 layout bump 會連帶作廢外層 descriptor)。核心 config:<code>capture_proxy_channel</code>(matcher 輸入,[0,3])、<code>max_delay_ms</code>(預設 1024,delay ring = ceil(ms×sr/1000)+2×hop+1)、<code>filter_length</code>(0=rate default)。</p>
+<p>Descriptor 慣例與 mono 相同(32-byte 固定 ABI、init_ex 8 點閘)。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=9</code>、wrapper <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=3</code>,兩者 descriptor_version 皆 1;wrapper 的 build_flags_hash 摺入核心的 hash(核心 layout bump 會連帶作廢外層 descriptor)。核心 config:<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,四條 lane 共用同一個決策)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘須 −1)、<code>capture_proxy_channel</code>(matcher 輸入,[0,3])、<code>max_delay_ms</code>(僅 <code>MATCHED</code> 用於 sizing delay ring,預設 1024,delay ring = ceil(ms×sr/1000)+2×hop+1)、<code>filter_length</code>(0=rate default)。</p>
 
 <h3>PreFrame 契約(含新欄位 aligned_ref)</h3>
 <table>
@@ -136,8 +136,8 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>GSC 借用 <code>srp-&gt;a_array</code></td></tr>
 <tr><td><code>GSC</code>(RLS P/weights)</td><td>4×n_freqs 級</td><td>pool(wrapper)</td><td>lambda 0.995 經 <code>mmse_lsa_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
 <tr><td>auto-VAD(<code>noise_power/vad_hangover</code>)</td><td>純量</td><td>C struct(wrapper)</td><td>-55 dBFS / SNR 3.0 / hangover 8(retimed);EMA 0.999/0.95(retimed)</td></tr>
-<tr><td>核心合計 @16k/512</td><td>1,811,568 B</td><td>—</td><td>wrapper 工作區 144,832 B 已含</td></tr>
-<tr><td>完整 wrapper 合計</td><td>2,053,088 B @16k/256(預設)/ 6,967,536 B @48k/1024</td><td>—</td><td>smoke test 印出之 descriptor 佐證(layout_version=2)</td></tr>
+<tr><td>核心合計 @16k/512</td><td>1,669,008 B</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(kiss、<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心,1,485,584 B,見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
+<tr><td>完整 wrapper 合計</td><td>1,910,544 B @16k/256(預設)/ 6,826,368 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(kiss,layout_version=3)</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
@@ -151,16 +151,16 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_pipelines/4aec_nr_res.h / .c</code></td><td>核心(pre/post/abandon、token、fused post;layout v7)</td></tr>
-<tr><td><code>pipelines/4ch_pipelines/audio_pipeline_4ch.h / .c</code></td><td>完整 wrapper(SRP/GSC/auto-VAD;layout v2)</td></tr>
-<tr><td><code>pipelines/4ch_pipelines/4aec_projection_kernels.h</code></td><td>投影 kernels(cmac/residual/comfort/mag2)</td></tr>
-<tr><td><code>pipelines/4ch_pipelines/third_party/{doa,GSC,utility}</code></td><td>SRP-PHAT / GSC / spatial SIMD</td></tr>
-<tr><td><code>pipelines/4ch_pipelines/audio_pipeline_4ch_raw.c</code> / <code>*_static.c</code> / <code>4aec_nr_res_static.c</code></td><td>CLI 與靜態記憶體 smoke</td></tr>
-<tr><td><code>pipelines/4ch_pipelines/tests/test_4aec_nr_res.c</code></td><td>token/ABA、heap-vs-static byte parity、WOLA identity、far-FFT sharing、descriptor 閘</td></tr>
-<tr><td><code>pipelines/4ch_pipelines/tests/test_audio_pipeline_4ch.c</code> / <code>test_spatial_third_party.c</code></td><td>wrapper 與空間庫驗收</td></tr>
-<tr><td><code>pipelines/4ch_pipelines/pipeline.py</code> + <code>tests/test_pipeline.py</code></td><td>Python reference(copy 語意,允許多 pre-frame 在飛)</td></tr>
-<tr><td><code>pipelines/4ch_pipelines/Makefile</code></td><td><code>libaudio_pipeline_4ch.a</code>(含 ULCNet 變體物件)、<code>test</code>、<code>audit-no-stdio</code></td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心(pre/post/abandon、token、fused post;layout v9)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code></td><td>完整 wrapper(SRP/GSC/auto-VAD;layout v3)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_projection_kernels.h</code></td><td>投影 kernels(cmac/residual/comfort/mag2)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/third_party/{doa,GSC,utility}</code></td><td>SRP-PHAT / GSC / spatial SIMD</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c</code> / <code>audio_pipeline_4ch_static.c</code>；<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c</code></td><td>應用 CLI 與 core 靜態記憶體 smoke</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c</code></td><td>token/ABA、heap-vs-static byte parity、WOLA identity、far-FFT sharing、descriptor 閘</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c</code> / <code>pipelines/4ch_aec_bf_nr_res/tests/test_spatial_third_party.c</code></td><td>wrapper 與空間庫驗收</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/pipeline.py</code> + <code>tests/test_pipeline.py</code></td><td>Python reference(copy 語意,允許多 pre-frame 在飛)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/Makefile</code></td><td>建置 <code>libaudio_pipeline_4ch.a</code>(只含 <code>4aec_nr_res.o</code> 一個 object;<code>audio_pipeline_4ch.o</code>/ULCNet 變體物件皆各自 link,不進這個 archive)、<code>test</code>、<code>audit-no-stdio</code>;也是 <code>4ch_alignulcnet/</code> 應用轉發建置的目標目錄</td></tr>
 </table>
-<p>測試實測(2026-08-13, BACKEND=kiss):<code>make test</code>(test_4aec_nr_res + test_spatial_third_party + test_audio_pipeline_4ch + test_audio_pipeline_4ch_ulcnet + 4 個 static smoke @16k/48k)共 <b>248 PASS / 0 FAIL</b>;各 binary 皆印 <code>All ... tests passed</code>。</p>
+<p>測試實測(2026-08-16 重跑, BACKEND=kiss):本目錄 <code>make test</code>(<code>test_4aec_nr_res</code> + <code>test_spatial_third_party</code> + <code>test_audio_pipeline_4ch</code> + 4 個 static smoke @16k/48k;<code>test_audio_pipeline_4ch_ulcnet</code> 已隨 ULCNet 變體移到 <code>4ch_alignulcnet/</code>,不再是本目錄 <code>make test</code> 的一部分)共 <b>262 個 PASS 標記 / 0 FAIL</b>,三支 unit-test binary 各印 <code>All ... tests passed</code>,4 個 static smoke 各印 <code>smoke PASS</code>。<code>4ch_alignulcnet/</code> 自己的 <code>make test</code> 另跑 <code>test_audio_pipeline_4ch_ulcnet</code>(<code>All audio_pipeline_4ch_ulcnet tests passed</code>)+ <code>4ch_alignulcnet</code> smoke,見 <code>pipeline_ulcnet_4ch.html</code>。</p>
 </body>
 </html>

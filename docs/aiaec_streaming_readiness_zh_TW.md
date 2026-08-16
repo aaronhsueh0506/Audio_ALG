@@ -169,5 +169,18 @@ end-to-end streaming。** 尚未包含（對應設計文件的 Phase）：PBFDKF
 frontend streaming 與 aligned-far 餵入（Phase 1 seam 已在 AEC C 端就
 緒，餵入屬 Phase 2 A/B 的輸入分佈變更，不可先斬——C pipeline 變體的
 `far_input_mode` 契約以 RAW_FAR 為預設、ALIGNED_FAR 為實驗性候選，即為
-此決策的落地）、delay generation/reset/fallback 接線（Phase 5）、
-explicit-state NPU export 與 C frontend/postprocess（Phase 4）。
+此決策的落地）、delay generation/reset/fallback 接線（Phase 5）。
+
+**2026-08-16 更新（本節先前版本列 Phase 4 為缺項，Align_ULCNet 現已交
+付，其餘五候選仍缺）**：Align_ULCNet 的 explicit-state NPU export 與 C
+frontend/postprocess（Phase 4）已交付——`AIAEC/Align_ULCNet/export_streaming_onnx.py`
+（stateless one-frame ONNX graph，K/V/logit/GRU state 全顯式 I/O）、
+`ulcnet_process.c/h`（C STFT/WOLA）、`ulcnet_model_io.c/h` +
+`ulcnet_accelerator_adapter.c/h`（CPU 端 state adapter 參考實作，
+含 `far_input_mode` 的 metadata/descriptor/pipeline 三方一致性鎖）；產
+品 pipeline 層（`pipelines/mono_alignulcnet/`、`pipelines/4ch_alignulcnet/`）
+的 delay 狀態機/fail-open 接線（對應 Phase 5 的一部分）也已落地，細節見
+[`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md)
+狀態列與 `Audio_ALG/docs/html/pipeline_ulcnet_mono.html`。其餘五個候選
+（Align_CRUSE/DeepVQE_S/CAGCRN/GTCRN_AENR/DFN_AENR）的 Phase 4 仍是
+純 Python，未交付。

@@ -1,6 +1,16 @@
 # PBFDKF + Align-ULCNet Embedded Streaming 設計提案
 
-狀態：設計評估稿，尚未代表已實作或已選定的 release contract。
+狀態：設計與實作對照稿（2026-08-16 覆核）。第 10 節的單幀 ONNX boundary
+（`AIAEC/Align_ULCNet/export_streaming_onnx.py`）、CPU external-state
+helper（`ulcnet_model_io.c/h`、`ulcnet_accelerator_adapter.c/h`）與 C
+STFT/WOLA（`ulcnet_process.c/h`）已實作；§8 的 delay 狀態機/fail-open 邏輯
+也已落地到 `pipelines/mono_alignulcnet/`、`pipelines/4ch_alignulcnet/`
+兩個 ULCNet pipeline（`AecLinearContext.delay_state` UNLOCKED/LOCKED/CHANGED
+閘控、RAW/ALIGNED 兩種 far_input_mode、reset 時清空 K/V/logit/GRU）。
+尚未完成的是：實際 board/NPU driver（目前 `main.c` 的 `run_accelerator()`
+仍是回 -1 的 TODO 佔位）、pipeline_ulcnet_mono.html 記載的「filter 已收斂
+即視同 LOCKED」狀態機加強（見該頁「短延遲部署注意」），以及 small-D
+（D=4 vs D=8）品質決策的 A/B。因此仍不是 release contract。
 
 本文件供實作者評估如何將現有 PBFDKF + Align-ULCNet 路徑放到記憶體與
 算力受限的 embedded system。產品測試一律使用本專案 PBFDKF 的 linear
@@ -118,9 +128,9 @@ Align-ULCNet 使用 `D=64` 搜尋長時間差的原因之一。
   軸的對稱 padding（kernel 3、左右各補 1）零邊界會隨 D 移動。訓練後
   distribution 若集中在 `d >= 8`，截斷即是實質行為改變——第 9 節的
   zero-shot A/B 因此是必要步驟，不是形式。
-- `denoise.py` 從 checkpoint contract 的 `ctor_max_delay_frames` 重建模
-  型，目前沒有任何 override 途徑；第 11 節 Phase 2 要求的 explicit
-  deployment override 是待新增項，不是既有功能。
+- `denoise.py`、`sweep_delay_depth.py` 與單幀 ONNX exporter 都已有 explicit
+  `max_delay_frames` deployment override。D 會固定在輸出的 graph/descriptor
+  tensor shape；可載入同一組 D-agnostic weights 不代表 small-D 品質已放行。
 
 ## 3. 建議產品 Flow
 
@@ -254,8 +264,7 @@ NN frontend 需要：
 typedef enum AecLinearDelayState {
     AEC_LINEAR_DELAY_UNLOCKED = 0,
     AEC_LINEAR_DELAY_LOCKED,
-    AEC_LINEAR_DELAY_CHANGED,
-    AEC_LINEAR_DELAY_OUT_OF_RANGE
+    AEC_LINEAR_DELAY_CHANGED
 } AecLinearDelayState;
 
 typedef struct AecLinearContext {
@@ -280,15 +289,12 @@ void aec_get_linear_context(const Aec *aec, AecLinearContext *context);
 - getter 不改任何 AEC state；
 - struct layout/API change 要有版本與 changelog。
 
-**實作狀態（2026-08-13 傍晚更新）**：本節提案已在 AEC standalone repo 實
-作為 `AecLinearContext` + `aec_get_linear_context()`（本地 commit
-`389ad6d`，`test-linear-context` 69 checks × KISS/NE10 × SIMD0/1 × 3 grid
-全過、audio byte-equal）。與提案的差異：enum **刻意不含
-`OUT_OF_RANGE`**——超出搜尋範圍在現有機制下與「未鎖定」不可區分（見下
-表），第一版誠實地只回 `UNLOCKED`，fail-open 判斷屬 caller；`generation`
-在 reset/first-acquisition/soft+hard shift 全部遞增（saturating）。
-`Audio_ALG/lib/aec` pin 尚未 bump——依 workflow 待 AEC push 後一起，屆時
-本節狀態再更新。以下對照表保留**實作前**的查證紀錄：
+**實作狀態**：`AecLinearContext` + `aec_get_linear_context()` 已存在於
+standalone AEC 與 `Audio_ALG/lib/aec`。enum 刻意不含 `OUT_OF_RANGE`：超出
+搜尋範圍在現有 estimator 下與「未鎖定」不可區分，第一版只回
+`UNLOCKED`，fail-open 判斷屬 caller；`generation` 在
+reset/first-acquisition/soft+hard shift 全部遞增並 saturate。以下表格是
+導入 seam 前的缺口紀錄，不是目前 API inventory：
 
 | 欄位 | 現況 |
 |---|---|
@@ -369,20 +375,26 @@ for each 256-sample hop:
 
 ### 6.2 State RAM 粗估
 
-16 kHz、512/256、float32、encoder width 26、32 key/value channels：
+16 kHz、512/256、float32、encoder width 26、32 key/value channels。現有
+Python `DelayRingCell` 在 step 後保存「本幀 + 過去 D-1 幀」的完整 D
+ring；第 10 節方案 B 的 CPU pre-call persistent state 只需保存過去
+D-1 幀，本幀 K/V 是 graph 的 delta output。兩者數學等價，但實體
+I/O/RAM layout 不同：
 
-| Persistent state | D=8 粗估 |
-|---|---:|
-| encoded far key ring | 26.6 KB |
-| encoded far value ring | 26.6 KB |
-| attention-logit history（4 frames） | 4.0 KB |
-| two 2-layer temporal-GRU hidden states | 2.0 KB |
-| STFT/WOLA overlap | 數 KB |
+| State | Python full-ring D=8 | 方案 B external-history D=8 |
+|---|---:|---:|
+| encoded far key history | 26.0 KiB（8 幀） | 22.8 KiB（7 幀） |
+| encoded far value history | 26.0 KiB（8 幀） | 22.8 KiB（7 幀） |
+| attention-logit history（4 frames） | 4.0 KiB | 4.0 KiB |
+| two 2-layer temporal-GRU hidden states | 2.0 KiB | 2.0 KiB |
+| STFT/WOLA overlap | 數 KiB | 數 KiB |
 
-總量約 60 KB（GRU hidden = 2 blocks × 2 layers × 128 × 4 B = 2.0 KB，
-GRU 無 cell state），不含 model weights、NPU activation scratch 與 backend
-alignment。D=4 可再降低 key/value ring 與 logit history；最終數字必須由
-export 後的 tensor layout 與版端 allocator 報告。
+方案 B 的 NN persistent state 約 51.5 KiB（本幀 K/V delta outputs 為
+activation/output scratch，不另算 persistent state）；另加 STFT/WOLA 數 KiB。
+GRU hidden = 2 blocks × 2 layers × 128 × 4 B = 2.0 KiB，GRU 無
+cell state。上述不含 model weights、NPU activation scratch 與 backend alignment。
+D=4 可再降低 key/value ring 與 logit history；最終數字必須由 export
+後的 tensor layout 與版端 allocator 報告。
 
 ### 6.3 Attention MAC 粗估
 
@@ -467,9 +479,9 @@ stateDiagram-v2
 - unlocked/reacquire 時輸出 PBFDKF formed linear error；若產品已有 standalone
   NR，可接 PBFDKF + NR；
 - 不把錯位 far 餵給 small-D NN；
-- first lock 或 delay change 時清除 far key/value ring 與 attention-logit
-  history；
-- temporal GRU hidden state先保留並以 A/B 決定是否 reset；
+- first lock 或 delay change 時，第一版 `model->reset` 會清除 far
+  key/value ring、attention-logit history 與兩組 temporal GRU hidden；
+- 日後若要只清 TA history、保留 GRU hidden，必須另做 A/B 並版本化；
 - 新舊輸出以 2--4 hops crossfade，避免切換 click；
 - hold timeout 先由既有 AEC timing convention換算，不新增裸 frame count。
 
@@ -479,8 +491,9 @@ recovery 語意整合，避免同一個 delay event在 AEC 與 NN 被重複 rese
 現況注記（2026-08-13 更新）：`delay_state` 與 `generation` 已在 AEC
 standalone 實作（見 5.1 節實作狀態）；out-of-range 偵測仍不存在（超出
 約 509 ms 可靠搜尋上界時狀態停在 UNLOCKED，與冷啟動不可區分）。第一版
-fail-open/reset 已落在兩個 pipeline 變體（`pipelines/audio_pipeline_ulcnet`
-與 `4ch_pipelines/audio_pipeline_4ch_ulcnet`），且**兩個變體現在行為一致**：
+fail-open/reset 已落在兩個 pipeline 變體
+（`pipelines/mono_alignulcnet/audio_pipeline_ulcnet` 與
+`pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet`），且**兩個變體現在行為一致**：
 UNLOCKED→模型照步進（每個 emitted frame 都 infer，per-hop 計算量恆定、
 runtime recurrent state 連續）、只閘控「輸出是否套用」；CHANGED→
 `model->reset`；infer 失敗或輸出含非有限值（NaN/Inf）→該 frame 走
@@ -539,21 +552,160 @@ E. aligned far + no attention, if graph permits
 
 ## 10. NPU Model Boundary
 
-大多數版端 runtime 不應依賴 complex tensor。建議 graph boundary：
+產品邊界假設加速器完全 **stateless**：加速器不保存 K/V ring、
+score history 或 GRU hidden。這些都是 CPU 管理的 caller-owned
+static memory，每幀以普通 tensor input/output 傳給 graph。「NPU runtime
+保存 state」在本文一律是指 CPU/driver context 保存，不表示模型
+或加速器有隱藏 persistent state。
+
+Align-ULCNet 是 PBFDKF 後的 RES+NR model；原始 `mic` 只進 CPU
+線性 AEC，模型的 primary input 是 `linear_error`，不是 raw mic。
+
+### 10.1 CPU 與 stateless model 的完整流程
+
+```mermaid
+flowchart LR
+    subgraph CPU["CPU / DSP / external SRAM"]
+        MIC["mic PCM hop"]
+        FAR["far PCM hop"]
+        AEC["Matched filter + PBFDKF"]
+        ERR["linear_error PCM"]
+        AFAR["aligned_far PCM"]
+        FMODE{"far_input_mode"}
+        ESTFT["sqrt-Hann STFT<br/>512 / 256"]
+        FSTFT["sqrt-Hann STFT<br/>512 / 256"]
+        ERRI["linear_error_ri<br/>[1,1,257,2]"]
+        FARRI["far_end_ri<br/>[1,1,257,2]"]
+        KH["key_history<br/>[1,32,D-1,26]"]
+        VH["value_history<br/>[1,32,D-1,26]"]
+        LH["logit_history<br/>[1,32,4,D]"]
+        GH["gru0/gru1 hidden<br/>each [2,1,128]"]
+        UPDATE["ring_push(K_now/V_now/logit_now)<br/>hidden = hidden_next"]
+        WOLA["WOLA / IFFT"]
+        PCM["enhanced PCM hop"]
+
+        MIC --> AEC
+        FAR --> AEC
+        AEC --> ERR --> ESTFT --> ERRI
+        AEC --> AFAR --> FMODE
+        FAR --> FMODE
+        FMODE --> FSTFT --> FARRI
+        UPDATE --> KH
+        UPDATE --> VH
+        UPDATE --> LH
+        UPDATE --> GH
+        WOLA --> PCM
+    end
+
+    subgraph NPU["Stateless accelerator: one ONNX invocation / frame"]
+        ENC["signed power + error/far encoders"]
+        QKV["Q_now / K_now / V_now"]
+        TA["TA: current + history<br/>score conv + softmax"]
+        BODY["joint conv + FGRU<br/>two temporal GRUs"]
+        MASK["mask + compressed-domain compose<br/>+ signed expansion"]
+        ENH["enhanced_ri<br/>[1,1,257,2]"]
+        DELTA["state delta outputs<br/>K_now / V_now / logit_now<br/>gru0_next / gru1_next"]
+
+        ENC --> QKV --> TA --> BODY --> MASK --> ENH
+        QKV --> DELTA
+        TA --> DELTA
+        BODY --> DELTA
+    end
+
+    ERRI --> ENC
+    FARRI --> ENC
+    KH --> TA
+    VH --> TA
+    LH --> TA
+    GH --> BODY
+    ENH --> WOLA
+    DELTA --> UPDATE
+```
+
+每個 256-sample hop 會在 centered-STFT priming 後產生一個 model
+frame（第二次 push 的邊界例外會連續產生兩幀，但仍是兩次單幀
+inference）。model graph 不收 PCM、不包 STFT/WOLA、不包
+PBFDKF 或 delay state machine。
+
+### 10.2 ONNX input/output contract（方案 B）
+
+版端第一版固定 `batch=1, T=1`，RI 放在最後一維，不使用 ONNX
+complex tensor。`D` 在 export 時固定；D=4 與 D=8 是不同 graph/
+descriptor，雖然可共用同一份 checkpoint weights。
+portable model-I/O ABI 限制 `2 <= D <= 64`；D=1 會產生長度為零的
+history input，多數版端 runtime 無法穩定支援，只保留為 Python 評測模式。
+
+Inputs：
+
+| tensor | float32 shape | 來源／用途 |
+|---|---:|---|
+| `linear_error_ri` | `[1,1,257,2]` | CPU PBFDKF error 的 STFT |
+| `far_end_ri` | `[1,1,257,2]` | 依 checkpoint contract；現有 checkpoint 為 `raw_far`，`aligned_far` 需另立 contract |
+| `key_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far keys |
+| `value_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far values |
+| `logit_history` | `[1,32,4,D]` | TA `(5,3)` score conv 的前 4 幀 raw logits |
+| `gru0_hidden` | `[2,1,128]` | temporal subband GRU 0，2 layers |
+| `gru1_hidden` | `[2,1,128]` | temporal subband GRU 1，2 layers |
+
+Outputs：
+
+| tensor | float32 shape | CPU 操作 |
+|---|---:|---|
+| `enhanced_ri` | `[1,1,257,2]` | 送 WOLA/IFFT |
+| `key_now` | `[1,32,1,26]` | push 進 `key_history` |
+| `value_now` | `[1,32,1,26]` | push 進 `value_history` |
+| `logit_now` | `[1,32,1,D]` | push 進 4-frame `logit_history` |
+| `gru0_hidden_next` | `[2,1,128]` | 取代 `gru0_hidden` |
+| `gru1_hidden_next` | `[2,1,128]` | 取代 `gru1_hidden` |
+
+這是「delta-state output」：graph 不回傳完整 `*_history_next`，CPU 只把
+新的 K/V/logit 寫進自己的 ring，避免每 16 ms 從加速器搬回
+完整 history。`query_now` 與 error-encoder feature 下一幀不再使用，
+不列為 output。`delay_distribution [1,1,D]` 只能作 debug output，
+production graph 預設不輸出。
+
+這裡的 ring 是邏輯語意。通用 C helper 為了交給 NPU 一個 contiguous
+history tensor，目前以 shift + insert 更新，並非 O(1) circular buffer；若
+版端 runtime 支援 scatter/gather 或 circular tensor view，可在不改 tensor
+順序/ABI 的前提下替換該 copy。
+
+邏輯上 `state_out` 仍是完整 next state，但實體 ABI 以 CPU
+ring-update 實現：
 
 ```text
-Inputs per invocation:
-    error_ri            [1, 2, N, 257]
-    aligned_far_ri      [1, 2, N, 257]
-    far_key_history     explicit state
-    far_value_history   explicit state
-    score_history       explicit state
-    temporal_gru_h_*    explicit states
-
-Outputs:
-    enhanced_ri         [1, 2, N, 257]
-    updated state tensors
+K candidates at t = [K_now, K(t-1), ..., K(t-D+1)]
+key_history next = [K_now, K(t-1), ..., K(t-D+2)]
 ```
+
+stream start/pipeline reset 必須清空所有 state。`delay_state=CHANGED`
+至少清空 K/V ring 與 logit history；第一版為降低風險，連兩組 GRU
+hidden 一起清空，之後才 A/B 「只清 TA」。
+
+### 10.3 C 交付邊界
+
+本專案交付：
+
+- `ulcnet_process.c/.h`：centered sqrt-Hann STFT/WOLA 與 RI frame。
+- model-I/O/state `c/.h`：caller-owned memory requirement/init/reset、K/V/logit
+  ring update、GRU hidden 保存、descriptor/layout validation。RAM 必須隨
+  D 縮小。
+- streaming ONNX exporter：單幀 stateless graph，explicit state inputs +
+  delta-state outputs，同時生成 machine-readable descriptor。
+- PyTorch `forward_stream()` vs export runtime 的長串流、reset 與 mutation
+  parity tests。
+
+本專案不交付：
+
+- 特定廠商 NPU driver/runtime implementation。
+- 加速器內部 persistent state（不存在）。
+- 特定產品的狀態機與廠商 accelerator 呼叫。共用 CPU state adapter 與
+  mono/4ch fail-open wiring 已在 `pipelines/`，其中 vendor callback 保留為
+  board TODO。
+- PBFDKF/matched-filter 演算法改動。
+
+外層 `UlcnetModel.infer(user, error, far, enhanced)` 仍可保留；`user`
+指向 CPU 的 accelerator context + external state buffers。pipeline 不需看到
+K/V/GRU 細節，`reset(user)` 負責清空外部 state。
 
 先做 operator inventory：
 
@@ -603,10 +755,20 @@ Outputs:
 
 ### Phase 4：C frontend/postprocess + export wrapper
 
-1. 所有 buffer 納入 caller-owned static memory。
-2. 統一 `SIMD=0/1` flag；scalar/NEON parity。
-3. export explicit-state RI graph。
-4. 驗證 PyTorch vs export runtime vs board runtime。
+狀態：model-side 已實作；仍需拿實際 checkpoint/board runtime 完成最後一項
+三方 parity，且不包含 Phase 5 pipeline wiring。
+
+1. 保留 `ulcnet_process.c/.h` 的 caller-owned STFT/WOLA，統一
+   `SIMD=0/1` 與 scalar/NEON parity。
+2. 新增 model-I/O/state `c/.h`：D-dependent caller-owned RAM、reset、
+   K/V/logit ring update、GRU hidden 與 descriptor validation。
+3. 新增 `T=1` stateless streaming exporter：explicit state inputs +
+   delta-state outputs；現有 fixed-block exporter 保留供 offline/debug，不得冒稱
+   production streaming equivalent。
+4. 產生 descriptor/metadata，將 D、far-input mode、grid、tensor shape、
+   layout version 與 checkpoint hash 鏖入 contract。
+5. 驗證 PyTorch `forward_stream()` vs ONNX Runtime 多幀輸出與每個
+   state delta；本 phase 不實作特定 NPU driver，不整合 mono/4ch pipeline。
 
 ### Phase 5：產品狀態機
 

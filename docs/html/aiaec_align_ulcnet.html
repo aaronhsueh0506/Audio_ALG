@@ -33,8 +33,11 @@ error</b>（<code>linear_error = mic_postclip − D_hat</code>，不是 oracle r
 Dmax）；其他 grid 用 <code>SignalGrid.delay_frames(1.0)</code>（48 kHz <code>1024/1024/512</code>
 → D=94）。參數量實測 <b>672,441</b> trainable（16k grid；README 記 ~0.67 M，落在論文
 0.69 M class）。<code>stream_output_delay = 0</code>。</p>
-<p><b>ONNX / NPU graph boundary</b>（尚無 export 檔——設計文件 Phase 4 未執行；boundary 由
-streaming reference 與 <code>ulcnet_process.h</code> 固定）：graph <b>內</b> =
+<p><b>ONNX / NPU graph boundary</b>（export 腳本已交付：<code>AIAEC/Align_ULCNet/export_streaming_onnx.py</code>
+匯出 stateless one-frame graph，K/V/logit/GRU state 全部顯式 I/O，
+boundary 標記為 <code>stateless_one_frame_delta_state</code>；D 由 checkpoint
+的 <code>max_delay_frames</code> 決定並在 export 當下固定進 ONNX shape，見下方
+D 覆寫段）：graph <b>內</b> =
 <code>_signed_power</code>（signed <code>pow(0.3)</code> 壓縮與逆冪解壓）、
 <code>atan2/cos/sin</code>（<b>壓縮域</b>相位——對 0.3 次方後分量取角，板端不可用原始相位替代）、
 <code>ChannelSampledReorientation</code>（C-SamFR reshape）、separable conv + ELU + MaxPool、
@@ -48,7 +51,13 @@ delay 對齊（AEC C 端 seam）、centered sqrt-Hann STFT/ISTFT 與 complex↔R
 <code>far_input_mode</code>；欄位缺失（legacy）預設 <code>raw_far</code> 並由
 <code>load_model</code> 印出；未知值在載入權重<b>前</b>即 <code>ValueError</code>
 （test：<code>test_load_model_far_input_mode_default_present_and_rejected</code>）。部署契約以
-RAW_FAR 為預設、ALIGNED_FAR 為實驗性候選。</div>
+RAW_FAR 為預設、ALIGNED_FAR 為實驗性候選。同一個值由
+<code>export_streaming_onnx.py</code> 寫進 ONNX/JSON metadata（<code>far_input_mode</code>
+字串 + <code>far_input_mode_c_value</code>），C 端 <code>UlcnetModelIoDescriptor.far_input_mode</code>
+與兩個 ULCNet pipeline（mono/4ch）各自的 <code>far_input_mode</code> config 欄位用同一份
+<code>ulcnet_far_input_mode_agrees()</code> 做三方比對，metadata/descriptor/pipeline
+三者不合即在 pipeline init 或 <code>set_model()</code> 時 reject——詳見
+<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>「far_input_mode 部署契約」節。</div>
 
 <h2>API 用法</h2>
 <pre>from AIAEC.Align_ULCNet.denoise import load_model
@@ -170,8 +179,9 @@ double twiddles），非 bit-exact（<code>test_ulcnet_process_c.py</code> 檔�
 <li><code>AIAEC/Align_ULCNet/model.py</code>（<code>AlignULCNet</code>：forward / create_stream_state / forward_stream）</li>
 <li><code>AIAEC/Align_ULCNet/streaming.py</code>、<code>denoise.py</code>（<code>--stream</code> / <code>--max-delay-frames</code> / <code>--input-is-linear-error</code>）</li>
 <li><code>AIAEC/Align_ULCNet/ulcnet_process.c / .h</code>（C 前後處理：centered sqrt-Hann STFT/WOLA）</li>
+<li><code>AIAEC/Align_ULCNet/export_streaming_onnx.py</code>（stateless one-frame ONNX 匯出;far_input_mode metadata）；<code>ulcnet_accelerator_adapter.c/h</code>、<code>ulcnet_model_io.c/h</code>（CPU 端 state adapter 參考實作,見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>）</li>
 <li><code>AIAEC/aiaec_streaming.py</code>（cells、StreamSTFT/StreamISTFT、state_report）；<code>AIAEC/dataset_gen/model_views.py</code>（task/輸入 mapping）</li>
-<li>tests：<code>AIAEC/tests/test_streaming_align_ulcnet.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 122 passed（2026-08-13 實測）</li>
+<li>tests：<code>AIAEC/tests/test_streaming_align_ulcnet.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_candidate_models.py</code>、<code>test_export_streaming_ulcnet.py</code>（ONNX runtime vs PyTorch parity 、layout-version 互鎖）、<code>test_ulcnet_model_io_c.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 144 passed（2026-08-16 重跑）</li>
 <li>docs：<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code>、<code>docs/aiaec_streaming_readiness_zh_TW.md</code></li>
 </ul>
 </body>

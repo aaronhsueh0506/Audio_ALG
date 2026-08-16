@@ -53,7 +53,7 @@ with 50% overlap:
 AEC, final OLA, NR gains, and `AecResContext` are validated against the same
 derived dimensions during initialization.
 
-The `pipelines/4ch_pipelines/` shell uses the same three primary product grids
+The `pipelines/4ch_aec_bf_nr_res/` shell uses the same three primary product grids
 (16k/256/128, 16k/512/256, 48k/1024/512). AIAEC models remain a separate
 training/checkpoint contract even when a numeric grid happens to match.
 
@@ -61,8 +61,8 @@ training/checkpoint contract even when a numeric grid happens to match.
 
 The reusable C API is implemented in:
 
-- `pipelines/audio_pipeline.h`;
-- `pipelines/audio_pipeline.c`;
+- `pipelines/mono_aec_nr_res/audio_pipeline.h`;
+- `pipelines/mono_aec_nr_res/audio_pipeline.c`;
 - `libaudio_pipeline.a`.
 
 It supports both a heap convenience constructor and a caller-owned,

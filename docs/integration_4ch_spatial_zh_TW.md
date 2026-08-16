@@ -63,7 +63,7 @@ mic hop [hop][4] + ref hop [hop]
 ### 1.4 編譯需要的 `-I` 清單（consumer 端最小集合）
 
 ```
--I pipelines/4ch_pipelines
+-I pipelines/4ch_aec_bf_nr_res
 -I lib/aec/c_impl/include
 -I lib/nr/c_impl/include
 -I <audio_common>/include
@@ -79,6 +79,7 @@ mic hop [hop][4] + ref hop [hop]
 
 ```
 你的 .o
+audio_pipeline_4ch.o          ← 見下方「不是 archive 成員」
 libaudio_pipeline_4ch.a
 libdoa.a
 libgsc.a
@@ -89,10 +90,19 @@ libaudio_common.a
 -lm
 ```
 
-* 比核心版（另一份手冊）多了 `libdoa.a` / `libgsc.a` / `libspatial_common.a` 三個。
-  這一層真的會參照它們，少連就是 undefined symbol。
-* 順序有意義：`libaudio_pipeline_4ch.a` 在前，三個 spatial archive 在中，
-  AEC / NR / audio_common 在後。
+* **`audio_pipeline_4ch.o` 不是 archive 成員，必須自己編。**
+  `libaudio_pipeline_4ch.a` 的 `PIPELINE_OBJS` 只含 `4aec_nr_res.o`（見核心版
+  手冊 §1.5）——本手冊這層的公開 API(`audio_pipeline_4ch_*`)是從
+  `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` 編出來的獨立 object,不在
+  任何 archive 裡。只連七個 archive、漏了這個 object 會在 link 階段報
+  `audio_pipeline_4ch_default_config` 等符號 undefined(已實測重現此失敗、
+  補上該 object 後可正常連結執行)。頂層 Makefile 的每個消費者(`audio_pipeline_4ch_raw`
+  等)都是這樣連的:`$(OBJ_DIR)/audio_pipeline_4ch.o $(PIPELINE_LIB) ...`。
+* 比核心版（另一份手冊）多了 `libdoa.a` / `libgsc.a` / `libspatial_common.a` 三個
+  archive,以及上述那個額外的 object。這一層真的會參照它們，少連就是
+  undefined symbol。
+* 順序有意義：`audio_pipeline_4ch.o`、`libaudio_pipeline_4ch.a` 在前，三個
+  spatial archive 在中，AEC / NR / audio_common 在後。
 * 所有 archive 路徑都是 config-keyed 的（`bin/<backend>-<hash>/`）。
   用各 Makefile 的 `make -s print-lib-path` 取得，不要硬寫。
 * `BACKEND=ne10` 時最終 link 要用 C++ driver（`c++`）。
@@ -148,7 +158,7 @@ int main(void) {
 
 ```sh
 cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
-  -I pipelines/4ch_pipelines \
+  -I pipelines/4ch_aec_bf_nr_res \
   -I lib/aec/c_impl/include \
   -I lib/nr/c_impl/include \
   -I <audio_common>/include \
@@ -410,21 +420,22 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 |---|---|
 | `core.sample_rate` / `core.fft_size` | 會（改 grid） |
 | `core.filter_length` | 會（四路 AEC 等比縮放） |
-| `core.max_delay_ms` | 會（delay ring 大小） |
+| `core.delay_mode` / `core.delay_num_filters` / `core.fixed_delay_samples` | 會（見核心層手冊 §4.5/4.6a——僅省一份共用 estimator/ring，不是四份） |
+| `core.max_delay_ms` | 會（僅 `MATCHED` 用於 delay ring 大小） |
 | **`num_angles`** | **會，而且影響很大**（見下表） |
 | 其他 DOA / GSC / VAD 欄位 | 不變 |
 | `geometry` 與座標 | 不變 |
 
-實測（**本次 checkout、`BACKEND=kiss`、`SIMD=1`**）：
+實測（2026-08-16、`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設）：
 
 | Config | `req.bytes` |
 |---|---:|
-| 16000，全預設（256/128，`num_angles=72`） | 2,052,832 |
-| 16000，`core.fft_size = 512` | 3,391,440 |
-| 16000，`num_angles = 360` | 5,054,944 |
-| 48000，全預設（1024/512，`num_angles=72`） | 6,967,280 |
+| 16000，全預設（256/128，`num_angles=72`） | 1,910,544 |
+| 16000，`core.fft_size = 512` | 3,249,152 |
+| 16000，`num_angles = 360` | 4,912,656 |
+| 48000，全預設（1024/512，`num_angles=72`） | 6,826,368 |
 
-`num_angles` 從 72 調到 360，記憶體從約 2.05 MB 變成約 5.06 MB。
+`num_angles` 從 72 調到 360，記憶體從約 1.91 MB 變成約 4.91 MB。
 **先確認你的角度解析度真的需要那麼細，再調這個值。**
 
 換 backend、換編譯選項、更新 submodule 都會讓上表失效。
@@ -543,35 +554,35 @@ destroy 之後不要再呼叫任何 accessor。
 
 ## 6. 出貨內容 vs 範例
 
-`pipelines/4ch_pipelines/` 目錄不是自解釋的。
+`pipelines/4ch_aec_bf_nr_res/` 目錄不是自解釋的。
 
 ### 6.1 函式庫（會進產品）
 
 | Source | 產出 | 說明 |
 |---|---|---|
-| `pipelines/4ch_pipelines/audio_pipeline_4ch.c` | `libaudio_pipeline_4ch.a`（object 之一） | **本手冊的主體** |
-| `pipelines/4ch_pipelines/4aec_nr_res.c` | `libaudio_pipeline_4ch.a`（object 之二） | 核心層，本層一定會用到 |
-| `pipelines/4ch_pipelines/audio_pipeline_4ch.h` | — | 本手冊的公開 API |
-| `pipelines/4ch_pipelines/4aec_nr_res.h` | — | 核心層公開 API（本 header 會 include 它） |
-| `pipelines/4ch_pipelines/third_party/doa/` | `libdoa.a` | SRP-PHAT / steering / DOA 平滑。可重用函式庫 |
-| `pipelines/4ch_pipelines/third_party/GSC/` | `libgsc.a` | GSC beamformer。可重用函式庫 |
-| `pipelines/4ch_pipelines/third_party/utility/` | `libspatial_common.a` | spatial kernel 與 complex 輔助 |
-| `pipelines/4ch_pipelines/4aec_nr_res_internal.h`、`4aec_projection_kernels.h` | — | 內部 header，**不是**公開 API，不要 include |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` | 獨立 object（**不進** `libaudio_pipeline_4ch.a`，見 §1.5） | **本手冊的主體**；每個消費它的執行檔各自編、各自連 |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c` | `libaudio_pipeline_4ch.a` 唯一成員 | 核心層，本層一定會用到 |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` | — | 本手冊的公開 API |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` | — | 核心層公開 API（本 header 會 include 它） |
+| `pipelines/4ch_aec_bf_nr_res/third_party/doa/` | `libdoa.a` | SRP-PHAT / steering / DOA 平滑。可重用函式庫 |
+| `pipelines/4ch_aec_bf_nr_res/third_party/GSC/` | `libgsc.a` | GSC beamformer。可重用函式庫 |
+| `pipelines/4ch_aec_bf_nr_res/third_party/utility/` | `libspatial_common.a` | spatial kernel 與 complex 輔助 |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_internal.h`、`4aec_projection_kernels.h` | — | 內部 header，**不是**公開 API，不要 include |
 
 ### 6.2 參考執行檔（全部都有 `main()`，**沒有任何一個會進產品**）
 
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
-| `pipelines/4ch_pipelines/audio_pipeline_4ch_static.c` | caller-owned pool 路徑的主機參考程式 | 示範完整 wrapper 的 query → allocate → init_ex → process → destroy → release。真正的 SRP-PHAT + GSC 在這個 process 裡跑，不是固定權重的替身 |
-| `pipelines/4ch_pipelines/4aec_nr_res_static.c` | **核心層**（外部 beamformer seam）的 pool 路徑參考程式 | 屬於另一份手冊。它在 pre/post 之間塞的是固定等權重的 smoke adapter，不是 production beamformer |
-| `pipelines/4ch_pipelines/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner | 主機一次性工具，刻意走 heap `create()` 路徑（不是板端佈署示範） |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c` | caller-owned pool 路徑的主機參考程式 | 示範完整 wrapper 的 query → allocate → init_ex → process → destroy → release。真正的 SRP-PHAT + GSC 在這個 process 裡跑，不是固定權重的替身 |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` | **核心層**（外部 beamformer seam）的 pool 路徑參考程式 | 屬於另一份手冊。它在 pre/post 之間塞的是固定等權重的 smoke adapter，不是 production beamformer |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner | 主機一次性工具，刻意走 heap `create()` 路徑（不是板端佈署示範） |
 
-單聲道的 library 與參考程式（`aec_nr_pipeline.c`、`aec_nr_pipeline_static.c`、
-`example_board_adapter.c`）見 `docs/integration_mono_zh_TW.md`。
+單聲道的 library 與參考程式（`pipelines/mono_aec_nr_res/main.c`、
+`static_main.c`、`example_board_adapter.c`）見 `docs/integration_mono_zh_TW.md`。
 
 ### 6.3 其他（不出貨）
 
-* `pipelines/4ch_pipelines/tests/` —— 測試。
+* `pipelines/4ch_aec_bf_nr_res/tests/` —— 測試。
 * `.py` 檔（`pipeline.py`、`evaluate_recordings.py`、`evaluate_external_recordings.py`）
   —— 主機端評估與參考實作，不是 C 產品的一部分。
 
@@ -583,7 +594,10 @@ destroy 之後不要再呼叫任何 accessor。
 
 - [ ] 七個 archive（`libaudio_pipeline_4ch.a` / `libdoa.a` / `libgsc.a` /
       `libspatial_common.a` / `libaec.a` / `libmmse_lsa.a` / `libaudio_common.a`）
-      是用**同一組** backend、`SIMD` 與編譯選項建出來的
+      **加上**獨立 object `audio_pipeline_4ch.o`（不在任何 archive 裡,見 §1.5）
+      全部是用**同一組** backend、`SIMD` 與編譯選項建出來的
+- [ ] link 命令裡有把 `audio_pipeline_4ch.o` 當獨立 object 加進去(只連七個
+      archive 會在 `audio_pipeline_4ch_*` 符號上 undefined)
 - [ ] link 順序照 §1.5
 - [ ] `BACKEND=ne10` 時最終 link 用 C++ driver
 - [ ] archive 路徑是用 `print-lib-path` 查的
@@ -652,7 +666,7 @@ Config：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `2` |
+| 4 | `layout_version` | `uint32_t` | `3` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（直接沿用核心層的值，永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，**已把核心層的 `build_flags_hash` 摺進去** |
 | 16 | `alignment` | `uint32_t` | `16` |

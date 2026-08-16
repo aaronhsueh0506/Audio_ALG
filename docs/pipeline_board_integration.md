@@ -168,9 +168,9 @@ updated, there is no compatibility shim.
 | Field | Meaning |
 |-------|---------|
 | `descriptor_version` | This STRUCT's own ABI version — `AUDIO_PIPELINE_DESCRIPTOR_VERSION` (currently `2`). Bumped only when `AudioPipelineMemReq`'s field set/order/width changes, independent of `layout_version` below (which tracks THIS FILE's carve layout, not the descriptor struct's own shape). `audio_pipeline_init_ex()` checks this FIRST, before interpreting any other field. |
-| `layout_version` | Bumped whenever `../pipelines/audio_pipeline.c`'s OWN carve order/buffer set/sizing formula changes — i.e. whenever a `bytes` figure computed by an older build would misdescribe a newer build's actual carve, or vice versa. Starts at 1. Does **not** need bumping for a change purely inside AEC's/NR's/an FFT backend's own internal `_get_mem_size` layout (each is consumed as one opaque composite blob here — a stale cached `bytes` from an old submodule build is still caught by the undersized-pool rejection at init). |
+| `layout_version` | Bumped whenever `../pipelines/mono_aec_nr_res/audio_pipeline.c`'s OWN carve order/buffer set/sizing formula changes — i.e. whenever a `bytes` figure computed by an older build would misdescribe a newer build's actual carve, or vice versa. Starts at 1. Does **not** need bumping for a change purely inside AEC's/NR's/an FFT backend's own internal `_get_mem_size` layout (each is consumed as one opaque composite blob here — a stale cached `bytes` from an old submodule build is still caught by the undersized-pool rejection at init). |
 | `backend_id` | Compile-time FFT backend identity this `audio_pipeline.o` was built with, as a small integer — `AUDIO_PIPELINE_BACKEND_KISS` (1) or `AUDIO_PIPELINE_BACKEND_NE10` (2) (matches `../pipelines/Makefile`'s `BACKEND=`). A process-local rodata pointer cannot be serialized safely, so `backend_id` is compared with a plain integer `==`. The two backends are not byte-identical to each other; a descriptor from one is never valid for the other even at matching `bytes`. `0` is reserved for "unknown backend" and is never present in a descriptor this library actually returns — `audio_pipeline_get_mem_requirements()` rejects an unrecognized backend string outright. |
-| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 8 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `../pipelines/audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
+| `build_flags_hash` | FNV-1a-32 of a small fixed set of compile-time strings that affect the pipeline's own carve STRUCTURE: the backend identity above, a literal token list naming the 8 scratch buffers in carve order, and the alignment granularity — see `audio_pipeline_build_flags_hash()` in `../pipelines/mono_aec_nr_res/audio_pipeline.c`. **Covers:** a change to this file's own carve order/buffer set/alignment. **Does NOT cover:** `AudioPipelineConfig` preset/tunable VALUES (`aec_preset`, `nr_mode`, `sample_rate`, `aec_only`, ...) — those change `bytes` but are config, not layout, so a caller re-querying `get_mem_requirements()` for its actual config already gets the right `bytes` regardless of this hash; AEC's/NR's/an FFT backend's internal struct layouts (opaque blobs, as above); the compiler/ABI/toolchain. |
 | `alignment` | Required base alignment of the pool pointer, bytes. Always 16 today (the one alignment every module in this stack — AEC, NR, both FFT backends, `mem_align.h`'s `ALIGN16` — carves to). `uint32_t`, not `size_t`. |
 | `reserved` | Always 0. Exists only so `bytes` (a `uint64_t`) lands on an 8-byte-aligned offset within the struct with no compiler-inserted padding — part of the fixed 32-byte layout, not a field to read or write. |
 | `bytes` | Total pool size to allocate (includes the opaque `AudioPipeline` control block itself, carved at the front — a few hundred bytes — plus AEC + FFT(OLA) + NR + the 8 pipeline scratch buffers, same carve `aec_nr_pipeline_static.c`'s old file-local `pipeline_pool_size()` produced). `uint64_t`, not `size_t` — cast to `size_t` before passing to `malloc`/`posix_memalign`/`audio_pipeline_init*()` on a target where the two widths differ. |
@@ -191,7 +191,7 @@ THIRD, even older, build.
 ## Serializing the descriptor
 
 `AudioPipelineMemReq` is a fixed-width, 32-byte POD (`_Static_assert`-pinned
-in `../pipelines/audio_pipeline.h`, sizeof and every field's offset) — it
+in `../pipelines/mono_aec_nr_res/audio_pipeline.h`, sizeof and every field's offset) — it
 can be copied byte-for-byte (`memcpy`) to a file, a flash region, or a wire
 message, and read back later, even by a different process, even after a
 restart. This is deliberately scoped narrower than "fully portable
@@ -219,7 +219,7 @@ scratch, the aec_out hop copy) is explicitly zeroed at carve time,
 and AEC/NR/the FFT backend each zero their own sub-region during their own
 `_init()` — so a pool filled with poison bytes inits and processes
 identically to a freshly-zeroed one.
-`../pipelines/tests/test_audio_pipeline.c`'s create-vs-init parity case
+`../pipelines/mono_aec_nr_res/tests/test_audio_pipeline.c`'s create-vs-init parity case
 exercises exactly this: a `memset(pool, 0xA5,
 bytes)`-poisoned pool run through `audio_pipeline_init()` produces
 byte-for-byte the same 1000-hop output as `audio_pipeline_create()`'s
@@ -240,7 +240,7 @@ and do not add one.
 
 ## `NO_STDIO=1` — building without libc stdio
 
-`../pipelines/audio_pipeline.c`'s own diagnostics (init/build-time reject
+`../pipelines/mono_aec_nr_res/audio_pipeline.c`'s own diagnostics (init/build-time reject
 reasons only — nothing on the per-hop `audio_pipeline_process()` path ever
 logs anything) are advisory: every failure this file can hit is ALSO signalled through its
 return value (`NULL`/`-1`), so a board image that cannot or will not link
@@ -263,7 +263,7 @@ make BACKEND=ne10 audit-no-stdio   # PASS/FAIL, non-zero exit on FAIL
 
 builds exactly that and asserts it with `nm` over `audio_pipeline.o` itself
 (pattern/style follows `audio_common/scripts/audit_alloc_symbols.sh`) — run
-it after touching any diagnostic in `../pipelines/audio_pipeline.c` to
+it after touching any diagnostic in `../pipelines/mono_aec_nr_res/audio_pipeline.c` to
 confirm the gate still holds.
 
 `NO_STDIO` only ever changes `audio_pipeline.o`'s own compile flags (see the
@@ -307,7 +307,7 @@ for real (`free()` on the pool `audio_pipeline_create()` allocated).
 Before trusting a board integration of this library in production, verify
 each of the following on-target. Most of these are properties of the
 **caller's** allocator/integration code, not of
-`../pipelines/audio_pipeline.c` itself — this library only checks what it
+`../pipelines/mono_aec_nr_res/audio_pipeline.c` itself — this library only checks what it
 can observe from inside a single call
 (alignment of the pointer it was handed, the `bytes` count it was told,
 the `expected` descriptor if one was passed); it has no visibility into the

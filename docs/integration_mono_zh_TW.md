@@ -231,6 +231,10 @@ AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
 | `sample_rate` | 會（改 grid、改 AEC filter 長度） |
 | `fft_size` | 會（改 grid） |
 | `aec_only` | 會（`1` 時不配置 FFT/NR/pipeline buffer） |
+| `filter_length` | 會（非 0 時覆寫 AEC filter 長度／n_partitions） |
+| `delay_mode` | 會（`MATCHED` 建 matched-filter estimator + 大 ring；`FIXED` 只建剛好夠用的小 ring；`EXTERNAL_ALIGNED` 兩者都不建，見下方 §4.5a） |
+| `delay_num_filters` | 僅 `MATCHED` 有效：每少一個固定省 5,728 B（四格點皆同，與 `lib/aec` 一致） |
+| `fixed_delay_samples` | 僅 `FIXED` 有效：ring 大小 = `ALIGN16((fixed_delay_samples+hop)×4)` B |
 | `aec_preset` | 實測不變 |
 | `nr_mode` | 實測不變 |
 | `enable_cng` | 不變 |
@@ -252,19 +256,35 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout、`BACKEND=kiss`、`pipelines/Makefile` 預設選項**下，
-直接呼叫 API 量到的值。換 backend、換編譯選項、更新 submodule 都會變。
+以下是**本次 checkout（layout_version=6，delay-mode 產品化後）、`BACKEND=kiss`、
+`pipelines/Makefile` 預設選項**下，2026-08-16 直接呼叫 API 量到的值。換
+backend、換編譯選項、更新 submodule 都會變。
 
 | Config | `req.bytes` | `aec_bytes` | `fft_bytes` | `nr_bytes` | `pipeline_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 358,992 | 276,928 | 8,784 | 67,424 | 5,696 |
-| 16000，預設（256/128） | 517,808 | 381,008 | 8,784 | 122,160 | 5,696 |
-| 16000，`fft_size=512` | 672,016 | 510,080 | 16,976 | 133,472 | 11,328 |
-| 48000，預設（1024/512） | 1,597,376 | 1,166,928 | 33,360 | 374,336 | 22,592 |
-| 16000，`aec_only=1` | 381,168 | 381,008 | 0 | 0 | 0 |
+| 8000，預設 | 357,696 | 275,632 | 8,784 | 67,424 | 5,696 |
+| 16000，預設（256/128） | 516,512 | 379,712 | 8,784 | 122,160 | 5,696 |
+| 16000，`fft_size=512` | 670,720 | 508,784 | 16,976 | 133,472 | 11,328 |
+| 48000，預設（1024/512） | 1,597,456 | 1,167,008 | 33,360 | 374,336 | 22,592 |
+| 16000，`aec_only=1` | 379,872 | 379,712 | 0 | 0 | 0 |
 
 `req.bytes` 減去四個分項（各自 16-byte 對齊後）的差額，就是 `AudioPipeline`
 控制區塊，本次量測在每一組 config 都是 160 B。
+
+#### 4.5a delay_mode 對 16000/預設 grid 的影響（`MATCHED` n=5 為 baseline）
+
+| `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
+|---|---:|---:|
+| `MATCHED` n=5（預設） | 516,512 | — |
+| `MATCHED` n=1 | 493,600 | −22,912 |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 358,416 | −158,096 |
+| `EXTERNAL_ALIGNED` | 351,504 | −165,008 |
+
+這四列的差額全部落在 `aec_bytes`（`delay_mode`/`delay_num_filters` 不影響
+FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致
+（見 `lib/aec/docs/c_user_manual_zh_TW.md` §4）。**沒有 CLI 旗標**能測試
+非預設 delay mode——上表用直接呼叫
+`audio_pipeline_get_mem_requirements()`/`_get_mem_breakdown()` 量得。
 
 ---
 
@@ -353,24 +373,25 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 | Source | 產出 | 說明 |
 |---|---|---|
-| `pipelines/audio_pipeline.c` | `libaudio_pipeline.a` | archive 內**只有這一個 object**。這是本手冊的主體 |
-| `pipelines/audio_pipeline.h` | — | 公開 API |
-| `pipelines/pipeline_dims.h` | — | grid 解析用的 `static inline` header，被 `audio_pipeline.c` 與兩個 CLI 共用 |
+| `pipelines/mono_aec_nr_res/audio_pipeline.c` | `libaudio_pipeline.a` | archive 內**只有這一個 object**。這是本手冊的主體 |
+| `pipelines/mono_aec_nr_res/audio_pipeline.h` | — | 公開 API |
+| `pipelines/mono_aec_nr_res/pipeline_dims.h` | — | grid 解析用的 `static inline` header，被 `audio_pipeline.c` 與兩個 CLI 共用 |
 
 ### 6.2 參考執行檔（全部都有 `main()`，**沒有任何一個會進產品**）
 
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
-| `pipelines/aec_nr_pipeline.c` | heap 路徑 CLI（WAV in / WAV out） | 示範 `audio_pipeline_create()` 用法；離線比對用 |
-| `pipelines/aec_nr_pipeline_static.c` | caller-owned pool 路徑 CLI | 示範 query → allocate → init → process → destroy → release；另提供 `--print-mem-size` |
-| `pipelines/example_board_adapter.c` | 板端 adapter 的**主機模擬** | 示範完整呼叫序列、錯誤處理與 descriptor contract。裡面每個 `board_mem_*` 都是主機上的假實作，不是平台程式碼。標了 `// BOARD:` 的地方就是你要換成真實平台程式碼的位置 |
+| `pipelines/mono_aec_nr_res/main.c` | heap 路徑 CLI（WAV in / WAV out） | 示範 `audio_pipeline_create()` 用法；離線比對用 |
+| `pipelines/mono_aec_nr_res/static_main.c` | caller-owned pool 路徑 CLI | 示範 query → allocate → init → process → destroy → release；另提供 `--print-mem-size` |
+| `pipelines/mono_aec_nr_res/example_board_adapter.c` | 板端 adapter 的**主機模擬** | 示範完整呼叫序列、錯誤處理與 descriptor contract。裡面每個 `board_mem_*` 都是主機上的假實作，不是平台程式碼。標了 `// BOARD:` 的地方就是你要換成真實平台程式碼的位置 |
 
 四麥克風的 library 與參考程式是**另外兩份**手冊的主題：
 `docs/integration_4ch_core_zh_TW.md`、`docs/integration_4ch_spatial_zh_TW.md`。
 
 ### 6.3 測試（不出貨）
 
-`pipelines/tests/test_audio_pipeline.c`、`pipelines/tests/test_no_stdio_stack.c`。
+`pipelines/mono_aec_nr_res/tests/test_audio_pipeline.c`、
+`pipelines/mono_aec_nr_res/tests/test_no_stdio_stack.c`。
 
 ---
 
@@ -426,7 +447,7 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `2` |
-| 4 | `layout_version` | `uint32_t` | `5` |
+| 4 | `layout_version` | `uint32_t` | `6` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

@@ -1,11 +1,11 @@
 # Audio_ALG C User Manual（繁體中文）
 
 本手冊說明 conventional mono pipeline 的建置、命令列使用方式，以及
-`pipelines/audio_pipeline.h` 的 heap／caller-owned-pool 兩種整合方式；
+`pipelines/mono_aec_nr_res/audio_pipeline.h` 的 heap／caller-owned-pool 兩種整合方式；
 四麥克風 C seam 另列於第 1.1 節。
 
-> 現行 API 與 sizing contract 以 `pipelines/audio_pipeline.h`、
-> `pipelines/audio_pipeline.c` 和 `pipelines/README.md` 為準。更新 submodule
+> 現行 API 與 sizing contract 以 `pipelines/mono_aec_nr_res/audio_pipeline.h`、
+> `pipelines/mono_aec_nr_res/audio_pipeline.c` 和 `pipelines/README.md` 為準。更新 submodule
 > 或 tuning 後，必須重新建置並執行 pipeline tests；不要只依賴本手冊中的
 > 範例常數。
 
@@ -16,24 +16,25 @@
 - AEC static library：`lib/aec/c_impl/bin/libaec.a`
 - NR static library：`lib/nr/c_impl/bin/libmmse_lsa.a`
 - 共用層 library（FFT/fast_math/hpf）：`../audio_common/bin/<backend>/libaudio_common.a`
-- malloc reference executable：`pipelines/aec_nr_pipeline`（source：`aec_nr_pipeline.c`）
-- static-memory reference executable：`pipelines/aec_nr_pipeline_static`（source：
-  `aec_nr_pipeline_static.c`；單一 caller pool、init 後零 malloc、輸出與 malloc 版
+- malloc reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline`
+  （source：`pipelines/mono_aec_nr_res/main.c`）
+- static-memory reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline_static`
+  （source：`pipelines/mono_aec_nr_res/static_main.c`；單一 caller pool、init 後零 malloc、輸出與 malloc 版
   byte-identical；`--print-mem-size` 可直接查任一取樣率的 pool 需求）
-- reusable API：`pipelines/audio_pipeline.h` / `audio_pipeline.c`
+- reusable API：`pipelines/mono_aec_nr_res/audio_pipeline.h` / `audio_pipeline.c`
 - linkable archive：config-keyed build directory 內的 `libaudio_pipeline.a`
-- 四麥克風 API：`pipelines/4ch_pipelines/4aec_nr_res.h` / `4aec_nr_res.c`
-- 完整四麥克風 spatial API：`pipelines/4ch_pipelines/audio_pipeline_4ch.h` /
+- 四麥克風 API：`pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` / `4aec_nr_res.c`
+- 完整四麥克風 spatial API：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` /
   `audio_pipeline_4ch.c`
-- 四麥克風 static 對照範例：`pipelines/4ch_pipelines/4aec_nr_res_static.c`
-- 完整 spatial 實錄 runner：`pipelines/4ch_pipelines/audio_pipeline_4ch_raw.c`
-- 四麥克風 archive：`pipelines/4ch_pipelines` 的 config-keyed build directory
+- 四麥克風 static 對照範例：`pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c`
+- 完整 spatial 實錄 runner：`pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c`
+- 四麥克風 archive：`pipelines/4ch_aec_bf_nr_res` 的 config-keyed build directory
   內的 `libaudio_pipeline_4ch.a`
 
 已退役的 pipeline API 設計草案不是可依賴的介面；需要追溯時請從 Git
 history 取得。已實作的 function、descriptor version、ownership 與錯誤
 行為，mono 以 `audio_pipeline.h`、四麥克風以
-`4ch_pipelines/4aec_nr_res.h` 為準。
+`4ch_aec_bf_nr_res/4aec_nr_res.h` 為準。
 
 嵌入產品時優先使用 `AudioPipeline*`：桌面／服務端可用
 `audio_pipeline_create()`，firmware 則以
@@ -75,11 +76,11 @@ NR、RES 都繼承同一個格點，`frame == FFT`、`hop == frame/2`，不能�
 
 `four_aec_nr_res_destroy()` 對 static handle 不釋放 caller 的 pool；caller
 應在 destroy 後自行交還平台 memory manager。可直接對照
-`pipelines/aec_nr_pipeline_static.c` 與
-`pipelines/4ch_pipelines/4aec_nr_res_static.c` 的
+`pipelines/mono_aec_nr_res/static_main.c` 與
+`pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` 的
 query → allocate → init → process → destroy → release 順序。完整 contract、
 權重 convention 與 parity 限制見
-[`../pipelines/4ch_pipelines/README.md`](../pipelines/4ch_pipelines/README.md)。
+[`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md)。
 
 ## 2. Production path
 
@@ -126,11 +127,11 @@ git submodule update --init --recursive
 # 從 Audio_ALG 根目錄執行；mono 與 4ch 的 producer 完全分離
 make -C pipelines            # mono heap/static + libaudio_pipeline.a
 make -C pipelines BACKEND=ne10   # NE10 FFT 後端（obj/ 依 backend+參數雜湊分開目錄，免手動 clean-libs）
-make -C pipelines/4ch_pipelines BACKEND=kiss SIMD=1
-make -C pipelines/4ch_pipelines BACKEND=ne10 SIMD=1
-make -C pipelines/4ch_pipelines 4aec_nr_res_static
-make -C pipelines/4ch_pipelines audio_pipeline_4ch_raw
-make -C pipelines/4ch_pipelines test
+make -C pipelines/4ch_aec_bf_nr_res BACKEND=kiss SIMD=1
+make -C pipelines/4ch_aec_bf_nr_res BACKEND=ne10 SIMD=1
+make -C pipelines/4ch_aec_bf_nr_res 4aec_nr_res_static
+make -C pipelines/4ch_aec_bf_nr_res audio_pipeline_4ch_raw
+make -C pipelines/4ch_aec_bf_nr_res test
 ```
 
 若自行編譯 wrapper，沿用目前 Makefile 的 include／link layout（注意：兩個 library 都依賴
@@ -180,7 +181,15 @@ AEC library 本身使用 `-ffp-contract=off` 建置；若 application 內重做�
 | `--aec-only` | flag | off | 跳過 NR 與最終 gain combine |
 | `--legacy-amin` | flag | off | 還原舊版 min-only path |
 | `--no-cng` | flag | off | 關閉最終 CNG 注入 |
+| `--fft-size` | `256`／`512`／`1024` | 0（rate default） | 覆寫訊號格點的 FFT/frame 長度（16 kHz 唯一可切換的一項，見 pipeline_mono.html「訊號格點」表） |
 | `--debug` | flag | off | 每秒一行 AEC+NR 狀態（read-only，不影響輸出） |
+
+`delay_mode`／`delay_num_filters`／`fixed_delay_samples`／`filter_length`
+（見 `audio_pipeline.h` 的 `AudioPipelineConfig`）**沒有對應 CLI 旗標**；
+兩支 CLI（`aec_nr_pipeline`/`aec_nr_pipeline_static`）目前都只能吃
+`audio_pipeline_default_config()` 的預設值（`MATCHED`、n=5、−1）。要測試
+非預設 delay mode 得直接寫 C 呼叫 `audio_pipeline_get_mem_requirements()`/
+`audio_pipeline_init()`（或改 CLI 原始碼），見 `pipeline_mono.html` API 節。
 
 目前 parser 對未知 positional preset 會退回 balanced，且不會為所有未知 dash option 報錯。產品或自動化腳本應只傳上表列出的值，不要依賴 silent fallback。
 
@@ -316,7 +325,7 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
     p->fft_size = p->frame_size;   /* no padding: AEC's grid is frame == FFT */
     p->n_freqs = p->fft_size / 2 + 1;
 
-    /* Use the grid-explicit entry point (matching pipelines/audio_pipeline.c)
+    /* Use the grid-explicit entry point (matching pipelines/mono_aec_nr_res/audio_pipeline.c)
      * so NR resolves the SAME fft_size the AEC instance above just picked --
      * the 2-arg mmse_lsa_config_for_mode() instead resolves NR's OWN
      * independent per-rate default grid, which is not the AEC default at
@@ -529,7 +538,7 @@ NR preset（`--nr-preset`，見 §4.1）：
 | balanced | 預設平衡 |
 | aggressive | 最強背景降噪 |
 
-> `mmse_lsa_config_for_mode()` 底層其實有第四級 `moderate`（介於 mild 與 balanced 之間，`g_min_db -25`，standalone NR 的 `denoise_wav --nr-mode` 可直接選用），但 `aec_nr_pipeline` 的 `parse_nr_mode()`（`pipelines/aec_nr_pipeline.c`）只認得 `"mild"`／`"aggressive"` 字串，其餘（含 `"moderate"`）一律 silently 落回 `balanced`，不會報錯。也就是說目前這條 pipeline 的 `--nr-preset` 實際只有三個可達 preset；要用 moderate 必須自己呼叫 library API。
+> `mmse_lsa_config_for_mode()` 底層其實有第四級 `moderate`（介於 mild 與 balanced 之間，`g_min_db -25`，standalone NR 的 `denoise_wav --nr-mode` 可直接選用），但 `aec_nr_pipeline` 的 `parse_nr_mode()`（`pipelines/mono_aec_nr_res/main.c`）只認得 `"mild"`／`"aggressive"` 字串，其餘（含 `"moderate"`）一律 silently 落回 `balanced`，不會報錯。也就是說目前這條 pipeline 的 `--nr-preset` 實際只有三個可達 preset；要用 moderate 必須自己呼叫 library API。
 
 Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`alpha_attack=0.3`、`alpha_decay=alpha_g`，這是針對 AEC residual signal 的結構性 tuning；不要直接用 standalone NR 的所有預設取代。
 
@@ -560,6 +569,6 @@ Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`
 | 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`，不要以 NR gain 驅動 CNG |
 | 不同檔案結果互相影響 | state 未 reset | 每個獨立 stream reset 或重建全部 instance |
 | 尾端樣本變短 | CLI 只處理完整 hop | 上層先 padding，並在輸出後裁回原長度 |
-| 想使用 `AudioPipeline*` | 已實作 | 見 `pipelines/audio_pipeline.h` + `pipelines/README.md`「Board Integration」；本手冊 wrapper 仍可用於未過渡的呼叫端 |
+| 想使用 `AudioPipeline*` | 已實作 | 見 `pipelines/mono_aec_nr_res/audio_pipeline.h` + `pipelines/README.md`「Board Integration」；本手冊 wrapper 仍可用於未過渡的呼叫端 |
 
 定位問題時建議依序比較：`--aec-only`、完整 production、`--no-cng`、`--legacy-amin`，再用 `DUMP_CTX` 檢查 `E(f)`、`G_res`、`R²` 與 `G_nr`。

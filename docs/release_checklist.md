@@ -462,7 +462,7 @@ Pass conditions:
 
 ## 9. Four-channel pipeline gate
 
-From `Audio_ALG/pipelines/4ch_pipelines/`, run all KISS/NE10 and SIMD 0/1
+From `Audio_ALG/pipelines/4ch_aec_bf_nr_res/`, run all KISS/NE10 and SIMD 0/1
 combinations:
 
 ```bash
@@ -473,7 +473,7 @@ make BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test
 From `Audio_ALG/`:
 
 ```bash
-python3 -m pytest -q pipelines/4ch_pipelines/tests
+python3 -m pytest -q pipelines/4ch_aec_bf_nr_res/tests
 ```
 
 Pass conditions:
@@ -751,7 +751,7 @@ is routinely misattributed to a real bug.
 | `NR` `python3 -m pytest tests` | 46 |
 | `Audio_ALG/lib/nr` `python3 -m pytest tests` | 46 |
 | `Audio_ALG` `python3 -m pytest pipelines/tests` | 26 |
-| `Audio_ALG` `python3 -m pytest pipelines/4ch_pipelines/tests` | 25 |
+| `Audio_ALG` `python3 -m pytest pipelines/4ch_aec_bf_nr_res/tests` | 25 |
 | `Audio_ALG` `python3 -m pytest AIAEC` | 153 |
 
 Pass/fail-only targets (no count): `AEC` `selftest`, `test-counter-saturation`,

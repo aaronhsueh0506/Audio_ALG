@@ -10,7 +10,7 @@ pipeline，請看 `docs/integration_4ch_spatial_zh_TW.md`。
 
 > **路徑慣例**：本文所有路徑都相對於 Audio_ALG repository 根目錄。
 > `audio_common` 是與 Audio_ALG 平行的另一個 checkout，本文寫成 `<audio_common>/`；
-> 從 `pipelines/4ch_pipelines/` 出發的相對路徑是 `../../../audio_common`。
+> 從 `pipelines/4ch_aec_bf_nr_res/` 出發的相對路徑是 `../../../audio_common`。
 >
 > **數值來源**：本文所有數字都是從當前 source 讀出，或以當前 checkout 實際建置後量測。
 > 記憶體數字**必須**用 API 重新查詢，不要抄本文（見 §4.6）。
@@ -65,7 +65,7 @@ mic hop [hop][4] + ref hop [hop]
 ### 1.4 編譯需要的 `-I` 清單（consumer 端最小集合）
 
 ```
--I pipelines/4ch_pipelines
+-I pipelines/4ch_aec_bf_nr_res
 -I lib/aec/c_impl/include
 -I lib/nr/c_impl/include
 -I <audio_common>/include
@@ -87,9 +87,13 @@ libaudio_common.a
 -lm
 ```
 
-* `libaudio_pipeline_4ch.a` 含**兩個** object：`4aec_nr_res.o` 與 `audio_pipeline_4ch.o`。
-  只用本手冊這套 API 時，linker 不會把 `audio_pipeline_4ch.o` 拉進來，
-  所以你**不需要**連 `libdoa.a` / `libgsc.a` / `libspatial_common.a`。
+* `libaudio_pipeline_4ch.a` 只含**一個** object：`4aec_nr_res.o`（Makefile
+  `PIPELINE_OBJS` 只列這一個 `.o`）。`audio_pipeline_4ch.o`（完整 spatial
+  wrapper）**不在這個 archive 裡**——需要它的每個執行檔（`audio_pipeline_4ch_raw`
+  等）各自把 `audio_pipeline_4ch.o` 當獨立 object 加進自己的 link 命令，不是
+  從 archive 帶出來的。只用本手冊這套 API 時，你的 link 命令根本不提
+  `audio_pipeline_4ch.o`，所以你**不需要**連 `libdoa.a` / `libgsc.a` /
+  `libspatial_common.a`。
   （已實測：上面五項就能把只用 `4aec_nr_res.h` 的程式連成執行檔。）
 * archive 路徑是 config-keyed 的（`bin/<backend>-<hash>/`）。用各 Makefile 的
   `make -s print-lib-path` 取得，不要硬寫。
@@ -150,7 +154,7 @@ int main(void) {
 
 ```sh
 cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
-  -I pipelines/4ch_pipelines \
+  -I pipelines/4ch_aec_bf_nr_res \
   -I lib/aec/c_impl/include \
   -I lib/nr/c_impl/include \
   -I <audio_common>/include \
@@ -295,25 +299,55 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 | `sample_rate` | 會（改 grid、改 AEC 預設 filter 長度） |
 | `fft_size` | 會（改 grid） |
 | `filter_length` | 會（四路 AEC 等比縮放） |
-| `max_delay_ms` | 會（delay ring 大小） |
+| `delay_mode` | 會（僅 `MATCHED` 建共用 estimator；三態差異見 4.6a） |
+| `delay_num_filters` | 僅 `MATCHED` 有效，每少一個固定省 5,728 B |
+| `fixed_delay_samples` | 僅 `FIXED` 有效，決定共用 delay ring 大小 |
+| `max_delay_ms` | 會（僅 `MATCHED` 用於 sizing delay ring） |
+| `enable_post` | 會（`0` 時不配置 NR/RES/iFFT，見 4.6b；ULCNet wrapper 用這個省 post 級） |
 | `capture_proxy_channel` | 不變 |
 | `aec_preset` / `nr_mode` / `enable_cng` / `legacy_amin` | 不變 |
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout、`BACKEND=kiss`、`SIMD=1`** 下直接呼叫 API 量到的值。
-換 backend、換編譯選項、更新 submodule 都會變。
+以下是 2026-08-16、`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED`（預設,
+n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backend、換編譯
+選項、更新 submodule 都會變。
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `nr_bytes` | `fft_bytes` | `wrapper_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,255,552 | 999,744 | 122,160 | 8,784 | 124,864 |
-| 16000，`fft_size=512` | 1,811,312 | 1,516,032 | 133,472 | 16,976 | 144,832 |
-| 16000，`max_delay_ms=100` | 1,196,416 | 999,744 | 122,160 | 8,784 | 65,728 |
-| 16000，`filter_length=512` | 1,168,960 | 913,152 | 122,160 | 8,784 | 124,864 |
-| 48000，預設（1024/512） | 3,821,456 | 3,094,848 | 374,336 | 33,360 | 318,912 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,248 | 858,816 | 122,160 | 8,784 | 123,488 |
+| 16000，`fft_size=512` | 1,669,008 | 1,375,104 | 133,472 | 16,976 | 143,456 |
+| 16000，`max_delay_ms=100` | 1,054,112 | 858,816 | 122,160 | 8,784 | 64,352 |
+| 16000，`filter_length=512` | 1,026,656 | 772,224 | 122,160 | 8,784 | 123,488 |
+| 48000，預設（1024/512） | 3,680,528 | 2,953,920 | 374,336 | 33,360 | 318,912 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
-`req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。
+`req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
+`aec_bytes` 除以 4 得單路 214,704 B（@16k/256）——與 `lib/aec` 的
+`AEC_DELAY_EXTERNAL_ALIGNED` 單體大小完全相同,因為每路內部本來就是
+`EXTERNAL_ALIGNED`（delay 由本層共用估計器提供,不建自己的 estimator/ring）。
+
+#### 4.6a delay_mode 對 16000/預設 grid 的影響（`enable_post=1`，`MATCHED n=5` 為 baseline）
+
+| `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
+|---|---:|---:|
+| `MATCHED` n=5（預設） | 1,113,248 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,648 | −93,600 |
+| `EXTERNAL_ALIGNED` | 1,012,736 | −100,512 |
+
+省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
+共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
+一致。
+
+#### 4.6b `enable_post=0`（ULCNet wrapper 用的 pre-only 核心）
+
+| Config | `req.bytes` |
+|---|---:|
+| 16000，`fft_size=512`，`enable_post=0` | 1,485,584 |
+
+即 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 記載的 ULCNet
+4ch wrapper私有核心大小；比同格點 `enable_post=1` 少 183,424 B（NR/RES/iFFT
+的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。
 **實際配置一律以 `req.bytes` 為準。**
 
 ---
@@ -453,33 +487,33 @@ destroy 之後不要再呼叫任何 accessor。
 
 ## 6. 出貨內容 vs 範例
 
-`pipelines/4ch_pipelines/` 目錄不是自解釋的。
+`pipelines/4ch_aec_bf_nr_res/` 目錄不是自解釋的。
 
 ### 6.1 函式庫（會進產品）
 
 | Source | 產出 | 說明 |
 |---|---|---|
-| `pipelines/4ch_pipelines/4aec_nr_res.c` | `libaudio_pipeline_4ch.a`（object 之一） | **本手冊的主體** |
-| `pipelines/4ch_pipelines/audio_pipeline_4ch.c` | `libaudio_pipeline_4ch.a`（object 之二） | 完整 spatial wrapper。只用本手冊 API 時 linker 不會拉進來 |
-| `pipelines/4ch_pipelines/4aec_nr_res.h` | — | 本手冊的公開 API |
-| `pipelines/4ch_pipelines/audio_pipeline_4ch.h` | — | 另一份手冊的公開 API |
-| `pipelines/4ch_pipelines/4aec_nr_res_internal.h`、`4aec_projection_kernels.h` | — | 內部 header，**不是**公開 API，不要 include |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c` | `libaudio_pipeline_4ch.a`（object 之一） | **本手冊的主體** |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` | `libaudio_pipeline_4ch.a`（object 之二） | 完整 spatial wrapper。只用本手冊 API 時 linker 不會拉進來 |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` | — | 本手冊的公開 API |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` | — | 另一份手冊的公開 API |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_internal.h`、`4aec_projection_kernels.h` | — | 內部 header，**不是**公開 API，不要 include |
 
 ### 6.2 參考執行檔（全部都有 `main()`，**沒有任何一個會進產品**）
 
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
-| `pipelines/4ch_pipelines/4aec_nr_res_static.c` | caller-owned pool 路徑的主機參考程式 | 示範 query → allocate → init → process_pre/post → destroy → release。它在 pre/post 之間塞的是**固定等權重**，那是決定性的 smoke adapter，**不是** production beamformer |
-| `pipelines/4ch_pipelines/audio_pipeline_4ch_static.c` | 完整 spatial pipeline 的 pool 路徑主機參考程式 | 屬於另一份手冊；列在這裡是為了讓目錄內容一目了然 |
-| `pipelines/4ch_pipelines/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner | 主機一次性工具，走 heap `create()` 路徑 |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` | caller-owned pool 路徑的主機參考程式 | 示範 query → allocate → init → process_pre/post → destroy → release。它在 pre/post 之間塞的是**固定等權重**，那是決定性的 smoke adapter，**不是** production beamformer |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c` | 完整 spatial pipeline 的 pool 路徑主機參考程式 | 屬於另一份手冊；列在這裡是為了讓目錄內容一目了然 |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner | 主機一次性工具，走 heap `create()` 路徑 |
 
-單聲道的 library 與參考程式（`aec_nr_pipeline.c`、`aec_nr_pipeline_static.c`、
-`example_board_adapter.c`）見 `docs/integration_mono_zh_TW.md`。
+單聲道的 library 與參考程式（`pipelines/mono_aec_nr_res/main.c`、
+`static_main.c`、`example_board_adapter.c`）見 `docs/integration_mono_zh_TW.md`。
 
 ### 6.3 其他（不出貨）
 
-* `pipelines/4ch_pipelines/tests/` —— 測試。
-* `pipelines/4ch_pipelines/third_party/` —— DOA / GSC / spatial kernel 函式庫。
+* `pipelines/4ch_aec_bf_nr_res/tests/` —— 測試。
+* `pipelines/4ch_aec_bf_nr_res/third_party/` —— DOA / GSC / spatial kernel 函式庫。
   **只用本手冊這套 API 的話完全不需要它們。**
 * `.py` 檔 —— 主機端評估與參考實作，不是 C 產品的一部分。
 
@@ -542,7 +576,7 @@ pre/post 協定：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `7` |
+| 4 | `layout_version` | `uint32_t` | `9` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

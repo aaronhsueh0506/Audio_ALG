@@ -28,7 +28,7 @@ th{background:#eef3ee}
 <h1>audio_pipeline — mono AEC(linear) → echo-aware NR → RES</h1>
 
 <h2>概要</h2>
-<p>可連結的單聲道傳統管線(<code>pipelines/audio_pipeline.{h,c}</code>):線性 AEC → echo-aware NR gain → <code>g_total=min(g_nr,g_res)</code> → far/near gated near-end floor lift → 頻譜套 gain(+選配 CNG)→ irfft + sqrt-Hann OLA。兩支 CLI(<code>aec_nr_pipeline.c</code> malloc 版 / <code>aec_nr_pipeline_static.c</code> 靜態記憶體版)都是它的薄殼。Pool-first 建構為板端路徑:init→destroy 之間零 heap。</p>
+<p>可連結的單聲道傳統管線(<code>pipelines/mono_aec_nr_res/audio_pipeline.{h,c}</code>):線性 AEC → echo-aware NR gain → <code>g_total=min(g_nr,g_res)</code> → far/near gated near-end floor lift → 頻譜套 gain(+選配 CNG)→ irfft + sqrt-Hann OLA。兩支 CLI(<code>mono_aec_nr_res/main.c</code> malloc 版 / <code>mono_aec_nr_res/static_main.c</code> 靜態記憶體版)都是它的薄殼。Pool-first 建構為板端路徑:init→destroy 之間零 heap。</p>
 <table>
 <tr><th>訊號格點</th><th>fft/hop/bins</th><th>備註</th></tr>
 <tr><td>8 kHz</td><td>256 / 128 / 129</td><td><code>fft_size=0</code> 的 rate default</td></tr>
@@ -55,7 +55,8 @@ audio_pipeline_reset(p);      /* echo-path 變更時; 不動 pool */
 audio_pipeline_destroy(p);    /* 不釋放 caller pool */
 platform_free(pool);</pre>
 <p>桌面便利路徑 <code>audio_pipeline_create(&amp;cfg)</code>(內部 posix_memalign;destroy 會 free)。診斷用唯讀 handle:<code>audio_pipeline_get_aec()</code> / <code>audio_pipeline_get_nr()</code>(aec_only 時為 NULL);byte 分解表 <code>audio_pipeline_get_mem_breakdown()</code>。</p>
-<p>Descriptor 慣例:<code>AudioPipelineMemReq</code> 為固定 32-byte 同 endian ABI(<code>descriptor_version=2</code> / <code>layout_version=5</code> / <code>backend_id</code> KISS=1, NE10=2 / <code>build_flags_hash</code>=FNV-1a-32(backend+carve token 字串) / <code>alignment=16</code> / <code>reserved=0</code> / <code>bytes</code>)。<code>init_ex</code> 對非 NULL 的 <code>expected</code> 做 8 點整數比對閘(七欄位 + pool 實際 bytes),任何 build/config 變更後必須重新 query。組態驗證是 reject-first:sample_rate 白名單 {8000,16000,48000}、enum/bool 逐項檢查,全部在 <code>derive_dims_and_configs()</code> 一處把關。</p>
+<p>Descriptor 慣例:<code>AudioPipelineMemReq</code> 為固定 32-byte 同 endian ABI(<code>descriptor_version=2</code> / <code>layout_version=6</code> / <code>backend_id</code> KISS=1, NE10=2 / <code>build_flags_hash</code>=FNV-1a-32(backend+carve token 字串) / <code>alignment=16</code> / <code>reserved=0</code> / <code>bytes</code>)。<code>init_ex</code> 對非 NULL 的 <code>expected</code> 做 8 點整數比對閘(七欄位 + pool 實際 bytes),任何 build/config 變更後必須重新 query。組態驗證是 reject-first:sample_rate 白名單 {8000,16000,48000}、enum/bool 逐項檢查,全部在 <code>derive_dims_and_configs()</code> 一處把關。</p>
+<p><code>AudioPipelineConfig</code> 新增四個 delay 相關欄位(layout v6,取代舊版只吃 preset 的隱含 delay 行為):<code>filter_length</code>(0=rate default,PBFDKF taps,init-time immutable)、<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,語意同 <code>lib/aec</code>)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘模式須為 −1)。<code>audio_pipeline_default_config()</code> 填 <code>MATCHED</code>/n=5/−1(行為與 layout v5 之前逐位元相同)。<b>目前兩支 CLI(<code>aec_nr_pipeline</code>/<code>aec_nr_pipeline_static</code>)都沒有對應旗標</b>——只能由呼叫端直接寫 struct 欄位(如板端 adapter 或測試);CLI 只留 <code>--fft-size</code>/<code>--sample-rate</code>。</p>
 
 <h2>Block diagram(每 hop 程式流)</h2>
 <pre>audio_pipeline_process(p, mic, ref, out)
@@ -105,10 +106,10 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <p>n_freqs = 129(16k 預設)/ 257(16k alt)/ 513(48k)。<code>mic/ref</code> 只在呼叫期間讀取(AEC 自己再 copy 一層),<code>out</code> 從不讀取。</p>
 
 <h2>State 表</h2>
-<p>全部 cross-call state 都住在 caller 的單一 pool(C struct 持有;host 只擁有 pool 記憶體本身)。carve 順序 = <code>self, aec, fft, nr, synth_win, ola, ifft_buf, g_total, extra, e2, spec</code>(layout v5)。實測 bytes 為 16 kHz/256 KISS,<code>aec_nr_pipeline_static --print-mem-size</code>(2026-08-13):</p>
+<p>全部 cross-call state 都住在 caller 的單一 pool(C struct 持有;host 只擁有 pool 記憶體本身)。carve 順序 = <code>self, aec, fft, nr, synth_win, ola, ifft_buf, g_total, extra, e2, spec</code>(layout v6)。實測 bytes 為 16 kHz/256 KISS,<code>aec_nr_pipeline_static --print-mem-size</code>(2026-08-16 重跑):</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>Aec</code> 全狀態</td><td>381,072 B</td><td>pool(C struct)</td><td>HPF、PBFDKF×2(main+shadow)、delay estimator、RES context、AEC 內部 FFT</td></tr>
+<tr><td><code>Aec</code> 全狀態</td><td>379,712 B</td><td>pool(C struct)</td><td>HPF、PBFDKF×2(main+shadow)、delay estimator(<code>delay_mode=MATCHED</code> n=5)、RES context、AEC 內部 FFT</td></tr>
 <tr><td><code>FftHandle</code>(OLA 用)</td><td>8,784 B</td><td>pool</td><td>aec_only 時不存在</td></tr>
 <tr><td><code>MmseLsaDenoiser</code></td><td>122,160 B</td><td>pool</td><td>噪聲估計/SPP 等 NR 狀態</td></tr>
 <tr><td><code>synth_win</code></td><td>[frame_sz] f32</td><td>pool</td><td>常數 sqrt periodic Hann</td></tr>
@@ -116,28 +117,37 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <tr><td><code>ifft_buf/g_total/extra/e2</code></td><td>[fft] / 3×[n_freqs] f32</td><td>pool</td><td>hop 內 scratch(carve 時明確清零)</td></tr>
 <tr><td><code>spec</code></td><td>[n_freqs] Complex</td><td>pool</td><td>scratch</td></tr>
 <tr><td><code>rng_state</code>/<code>near_hang</code></td><td>u32 / int</td><td>C struct(self)</td><td>CNG RNG seed 0x9e3779b9;hangover 計數</td></tr>
-<tr><td>合計</td><td>517,872 B(505.7 KB)</td><td>—</td><td>含 160 B 控制塊;pipeline bufs 5,696 B</td></tr>
+<tr><td>合計</td><td>516,512 B(504.4 KB)</td><td>—</td><td>含 160 B 控制塊;pipeline bufs 5,696 B</td></tr>
 </table>
+<p>delay_mode 對總量的影響(16 kHz/256,KISS,實測;AEC 子項與 <code>lib/aec</code> 一致,這裡多疊了 FFT(OLA)+NR+160 B 控制塊+5,696 B pipeline bufs 的固定開銷):</p>
+<table>
+<tr><th>delay_mode</th><th>total_bytes</th><th>相對 MATCHED n=5</th></tr>
+<tr><td><code>MATCHED</code> n=5(預設)</td><td>516,512 B</td><td>—</td></tr>
+<tr><td><code>MATCHED</code> n=1</td><td>493,600 B</td><td>−22,912 B</td></tr>
+<tr><td><code>FIXED</code>,fixed=1600(100 ms)</td><td>358,416 B</td><td>−158,096 B</td></tr>
+<tr><td><code>EXTERNAL_ALIGNED</code></td><td>351,504 B</td><td>−165,008 B</td></tr>
+</table>
+<p class="note">上表用直接呼叫 <code>audio_pipeline_get_mem_requirements()</code>/<code>_get_mem_breakdown()</code> 量得(無對應 CLI 旗標,見上方 API 用法節)。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>
 <li>演算法延遲:full chain = <b>1 hop</b>(實測 128 samples = 8 ms @16k 預設;16k-alt 16 ms、48k ~10.7 ms)。<code>aec_only</code> = <b>0 samples</b>(overlap-save 線性路徑,實測)。</li>
 <li>warm-up:hop#0 輸出僅含半窗 ramp(≈0);AEC 線性濾波器收斂與 delay acquisition 需要 far 活動(duty-cycled estimator);NR 噪聲底估計以 wall-clock ~1.5 s 的 retimed 幀數(<code>mmse_lsa_retime_frames(150, sr, hop)</code>)收斂。</li>
 <li><code>audio_pipeline_reset()</code> 重置 OLA/RNG/hangover 與子模組,等同同 pool 重 init(不重驗 alignment/size)。</li>
-<li>註:<code>pipelines/README.md</code> 的「Pipeline total latency = 2 hops(AEC hop + NR OLA delay)」列描述的是舊的「存前一個 AEC context」設計;目前 <code>audio_pipeline.c</code> 在同一 hop 內算完 NR gain 並套用,實測端到端就是 1 hop。</li>
+<li><code>audio_pipeline.c</code> 在同一個 processing call 內計算並套用當前 AEC context 與 NR gain；只有最後的 WOLA time-domain emission 形成 1 hop 延遲，與 <code>pipelines/README.md</code> 一致。</li>
 </ul>
 
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/audio_pipeline.h / .c</code></td><td>本頁 API 與實作(layout v5)</td></tr>
-<tr><td><code>pipelines/pipeline_dims.h</code></td><td>共用格點 resolver <code>compute_frame_dims()</code></td></tr>
-<tr><td><code>pipelines/aec_nr_pipeline.c</code> / <code>aec_nr_pipeline_static.c</code></td><td>malloc / static CLI 薄殼(WAV I/O、--debug、--print-mem-size)</td></tr>
-<tr><td><code>pipelines/example_board_adapter.c</code></td><td>板端 adapter 參考(REFERENCE ONLY)</td></tr>
-<tr><td><code>pipelines/tests/test_audio_pipeline.c</code></td><td>API 驗收:poisoned-pool create-vs-init byte parity、descriptor 8 點閘、reject-first 驗證,8k/16k/48k 各跑一輪</td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/audio_pipeline.h / .c</code></td><td>本頁 API 與實作(layout v6)</td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/pipeline_dims.h</code></td><td>共用格點 resolver <code>compute_frame_dims()</code></td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/main.c</code> / <code>pipelines/mono_aec_nr_res/static_main.c</code></td><td>malloc / static CLI 薄殼(WAV I/O、--debug、--print-mem-size)</td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/example_board_adapter.c</code></td><td>板端 adapter 參考(REFERENCE ONLY)</td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/tests/test_audio_pipeline.c</code></td><td>API 驗收:poisoned-pool create-vs-init byte parity、descriptor 8 點閘、reject-first 驗證,8k/16k/48k 各跑一輪</td></tr>
 <tr><td><code>pipelines/Makefile</code></td><td>targets:<code>all</code>/<code>test</code>/<code>libaudio_pipeline.a</code>/<code>audit-no-stdio</code>/<code>publish</code>;-ffp-contract=off 最後附加</td></tr>
 <tr><td><code>pipelines/aec_nr_pipeline.py</code></td><td>Python reference(PROD_* 常數同源)</td></tr>
 </table>
-<p>測試實測(2026-08-13, BACKEND=kiss):<code>make test</code>(= test_audio_pipeline + example_board_adapter + test_audio_pipeline_ulcnet)共 <b>132 PASS / 0 FAIL</b>,結尾 <code>ALL PASS</code>。</p>
+<p>測試實測(2026-08-16 重跑, BACKEND=kiss):<code>mono_aec_nr_res/</code> 目錄 <code>make test</code>(= <code>test_audio_pipeline</code> + 建置 <code>example_board_adapter</code>,不含 ULCNet——已移到 <code>mono_alignulcnet/</code>)共 <b>75 PASS / 0 FAIL</b>,結尾 <code>ALL PASS</code>。</p>
 </body>
 </html>

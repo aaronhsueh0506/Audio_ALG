@@ -79,8 +79,8 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <tr><td>mono pipeline（<code>pipelines/</code>）</td><td>8/16/48 k</td>
 <td>同 AEC 白名單；16 k 接受 256 或 512</td>
 <td>16k 預設 256/128（2026-08-02/03 起）</td>
-<td><code>pipelines/pipeline_dims.h</code> <code>compute_frame_dims()</code></td></tr>
-<tr><td>4ch core（<code>4ch_pipelines/</code>）</td><td>16/48 k</td>
+<td><code>pipelines/mono_aec_nr_res/pipeline_dims.h</code> <code>compute_frame_dims()</code></td></tr>
+<tr><td>4ch core（<code>4ch_aec_bf_nr_res/</code>）</td><td>16/48 k</td>
 <td>只有三個 grid：16k/256、16k/512、48k/1024（<b>無 8 k</b>）</td><td>16k 預設 256</td>
 <td><code>4aec_nr_res.c</code> sample_rate 檢查；<code>aec.c:150-160</code> 註解</td></tr>
 <tr><td>ULCNet 變體（mono + 4ch）</td><td>16 k</td>
@@ -117,9 +117,9 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <td><code>pbfdkf.c</code> <code>pbfdaf_fill_windows()</code>（denom = block_size）</td></tr>
 <tr><td>AEC3 post 合成窗（16k/512 grid 表格化 = sin(πk/512)）</td>
 <td><code>aec3_balanced_config.h</code> <code>AEC3B_SYNTH_WINDOW[512]</code>（per-rate 表）</td></tr>
-<tr><td>mono pipeline 合成窗</td><td><code>audio_pipeline.c:380-382</code>（synth_win）</td></tr>
-<tr><td>4ch pipeline 合成窗</td><td><code>4aec_nr_res.c:672-675</code>、
-<code>audio_pipeline_4ch_ulcnet.c:562-568</code></td></tr>
+<tr><td>mono pipeline 合成窗</td><td><code>pipelines/mono_aec_nr_res/audio_pipeline.c:395</code>（synth_win）</td></tr>
+<tr><td>4ch pipeline 合成窗</td><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c:728</code>、
+<code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c:579-582</code></td></tr>
 <tr><td>ULCNet C 分析+合成（共用一張表）</td>
 <td><code>ulcnet_process.c</code> <code>ulcnet_make_window()</code>（與 Python 逐 bit 同 @f32）</td></tr>
 <tr><td>DFN2/DFN3/GTCRN 分析+合成</td>
@@ -228,16 +228,16 @@ alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
 <table>
 <tr><th>類別</th><th>路徑</th></tr>
 <tr><td>Grid 定義</td><td><code>lib/aec/c_impl/src/aec.c</code>（defaults/validate/676-678）、
-<code>lib/nr/c_impl/include/mmse_lsa_types.h</code>、<code>pipelines/pipeline_dims.h</code></td></tr>
+<code>lib/nr/c_impl/include/mmse_lsa_types.h</code>、<code>pipelines/mono_aec_nr_res/pipeline_dims.h</code></td></tr>
 <tr><td>視窗</td><td><code>lib/aec/c_impl/src/pbfdkf.c</code>、
 <code>lib/aec/c_impl/include/aec3_balanced_config.h</code>、
-<code>pipelines/audio_pipeline.c</code>、<code>pipelines/4ch_pipelines/4aec_nr_res.c</code>、
+<code>pipelines/mono_aec_nr_res/audio_pipeline.c</code>、<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c</code>、
 <code>AIAEC/Align_ULCNet/ulcnet_process.c</code>、<code>AINR/dfn_process_common.h</code></td></tr>
 <tr><td>Framing 決策</td><td><code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> §7、
 <code>AINR/DeepFilterNet2/dfn2_process.h</code> parity 限制 (1)</td></tr>
 <tr><td>測試</td><td><code>pipelines/tests/test_signal_grids.py</code>、
-<code>pipelines/tests/test_audio_pipeline_ulcnet.c</code>、
-<code>pipelines/4ch_pipelines/tests/test_audio_pipeline_4ch_ulcnet.c</code>（timing contract）、
+<code>pipelines/mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c</code>、
+<code>pipelines/4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c</code>（timing contract）、
 <code>AIAEC/tests/test_ulcnet_process_c.py</code>（C↔Python 逐幀 parity）、
 <code>lib/aec/c_impl/test/test_rate_structural.c</code>（retime 結構檢查）、
 <code>lib/nr/c_impl/test/test_config_parity.c</code></td></tr>

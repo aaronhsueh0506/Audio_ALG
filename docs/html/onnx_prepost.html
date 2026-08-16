@@ -64,11 +64,13 @@ AIAEC 的 Align-ULCNet（<code>ulcnet_process.c</code>）。</li>
 GTCRN-AENR（STFT/ISTFT 可直接重用 AINR 的 <code>gtcrn_process.c</code>，同 grid
 且該 C 無模型特定 state）；DFN-AENR（需 <code>dfn2_process</code> 的雙倍 state
 擴充，見下）。</li>
-<li><b>in-repo ONNX 匯出腳本只有一個</b>：RNNoise-ERB 的
-<code>export_onnx.py</code>。其餘模型的 explicit-state NPU 匯出屬後續工作
-（readiness 文件 §5 的 Phase 4）；六個 AIAEC 候選已有
-<code>create_stream_state()</code>/<code>forward_stream()</code> Python
-frame-by-frame reference + <code>streaming.py</code> CLI，定義 state/I-O contract。</li>
+<li><b>in-repo ONNX 匯出腳本有兩個</b>：RNNoise-ERB 的 <code>export_onnx.py</code>，與
+Align-ULCNet 的 <code>AIAEC/Align_ULCNet/export_streaming_onnx.py</code>
+（stateless one-frame graph;K/V/logit/GRU state 皆顯式 I/O,見下方 Align-ULCNet
+列）。其餘模型的 explicit-state NPU 匯出屬後續工作（readiness 文件 §5 的
+Phase 4）；六個 AIAEC 候選已有 <code>create_stream_state()</code>/
+<code>forward_stream()</code> Python frame-by-frame reference +
+<code>streaming.py</code> CLI，定義 state/I-O contract。</li>
 </ul>
 
 <h2>永遠在 graph 之外的東西</h2>
@@ -139,7 +141,8 @@ tra_cache (2,3,1,1,16)、inter_cache (2,1,33,16)，合計 ≈70 KB fp32
 <tr><td><a href="ainr_rnnoise_erb.html">RNNoise-ERB</a></td><td>16k 512/256</td>
 <td class="y">有：<code>process.c/h</code>（STFT、log-ERB mean-norm +
 0–4 kHz complex unit-norm 特徵、3 幀特徵 ring、band→bin gain、atten_lim、ISTFT）</td>
-<td><b>唯一 in-repo 匯出</b>（<code>export_onnx.py</code>）：輸入
+<td><b>AINR 側唯一 in-repo 匯出</b>（<code>export_onnx.py</code>；AIAEC 側另有
+Align-ULCNet 的 <code>export_streaming_onnx.py</code>，見上方）：輸入
 erb (1,3,22)、spec (1,3,2,129)、h1/h2/h3 (1,1,gru_size)；輸出
 gains (22) + 三個 hidden。gru_size 由 checkpoint 決定（config 預設 128）</td>
 <td>h1–h3（3 層 GRU hidden）；C 端 state = <code>RNNoiseState</code>
@@ -156,14 +159,28 @@ gains (22) + 三個 hidden。gru_size 由 checkpoint 決定（config 預設 128�
 <tr><td><a href="aiaec_align_ulcnet.html">Align-ULCNet</a></td><td>16k 512/256</td>
 <td class="y">有：<code>ulcnet_process.c/h</code>（centered sqrt-Hann STFT ×2
 （error/far）、WOLA、<code>UlcnetModel</code> per-frame callback 邊界；
-audio_common FFT，零 heap）</td>
-<td>(error_ri, far_ri, states) → enhanced_ri：壓縮 |x|^0.3、attention 對齊、
-subband GRU、解壓縮<b>全在 graph 內</b></td>
-<td>far K/V ring 各 [D,32,26]（D=64 hard-code @16k/512）、attention logit 史
-4 幀、2×2 層 subband GRU hidden（共 ≈2.0 KB）</td>
+audio_common FFT，零 heap）+ CPU 端 state adapter
+<code>ulcnet_accelerator_adapter.c/h</code>／<code>ulcnet_model_io.c/h</code>
+（見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>）</td>
+<td>(error_ri, far_ri, key/value/logit history, gru0/1_hidden) → (enhanced_ri,
+key/value/logit_now, gru0/1_hidden_next)：壓縮 |x|^0.3、attention 對齊、
+subband GRU、解壓縮<b>全在 graph 內</b>；graph 本身<b>無狀態</b>(單幀
+delta-state I/O,見備註)</td>
+<td>far K/V ring 各 [1,32,D−1,26](newest-first)、attention logit 史
+[1,32,4,D](oldest-first)、2×2 層 subband GRU hidden [2,1,128]。
+D=<code>delay_depth</code>∈[2,64](<code>ULCNET_MODEL_IO_MIN/MAX_D</code>)，
+<b>由 checkpoint 的 <code>max_delay_frames</code> 決定、export 當下固定進
+ONNX shape</b>(非寫死 64——64 只是上界)；D=8 參考實測 CPU state 68,912 B
+(<code>ulcnet_accelerator_adapter_get_mem_size(8,...)</code>)</td>
 <td>唯一已有 C 的候選；C↔Python parity float-ULP 級（~1e-5 abs @512 點；
 Python reference 對 torch bit-exact）；streaming 等價實測 ≤5.6e-9；
-演算法 lookahead 0；匯出腳本未交付（Phase 4）</td></tr>
+演算法 lookahead 0；匯出腳本<b>已交付</b>:<code>export_streaming_onnx.py</code>
+(boundary=<code>stateless_one_frame_delta_state</code>)；<code>far_input_mode</code>
+寫進 ONNX/JSON metadata(<code>raw_far</code>/<code>aligned_far</code> 字串 +
+對應 C 值)，與 C <code>UlcnetModelIoDescriptor.far_input_mode</code> 用同一份
+<code>ulcnet_far_input_mode_agrees()</code> 三方對照(metadata/descriptor/
+pipeline config)，不合在 pipeline init/set_model 時 reject——見兩個 ULCNet
+pipeline 頁「三方一致性」節</td></tr>
 <tr><td><a href="aiaec_align_cruse.html">Align-CRUSE</a></td><td>16k 512/256</td>
 <td class="n">無（純 Python）</td>
 <td>—（部署邊界未定；streaming Python reference 已定義 state contract）</td>
@@ -213,13 +230,17 @@ ERB+spec EMA 正規化 state（<code>dataset_gen/model_views.py:134-138</code>
 <code>AINR/DeepFilterNet3/dfn3_process.c/h</code>、<code>AINR/GTCRN/gtcrn_process.c/h</code>、
 <code>AINR/RNNoise-ERB/process.c/h</code>、<code>AIAEC/Align_ULCNet/ulcnet_process.c/h</code>、
 共用 <code>AINR/dfn_process_common.h</code></td></tr>
-<tr><td>ONNX 匯出</td><td><code>AINR/RNNoise-ERB/export_onnx.py</code>（唯一 in-repo）</td></tr>
+<tr><td>ONNX 匯出</td><td><code>AINR/RNNoise-ERB/export_onnx.py</code>、
+<code>AIAEC/Align_ULCNet/export_streaming_onnx.py</code></td></tr>
 <tr><td>Streaming reference</td><td><code>AIAEC/aiaec_streaming.py</code>、各模型
 <code>streaming.py</code> + <code>create_stream_state()</code>/<code>forward_stream()</code>、
 <code>AINR/gtcrn_github/stream/gtcrn_stream.py</code></td></tr>
 <tr><td>查證文件</td><td><code>docs/aiaec_streaming_readiness_zh_TW.md</code>（2026-08-13
 逐行讀碼+實測）、<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code></td></tr>
 <tr><td>測試</td><td><code>AIAEC/tests/test_ulcnet_process_c.py</code>（C↔Python 逐幀）、
+<code>AIAEC/tests/test_ulcnet_model_io_c.py</code>（CPU state adapter Python↔C）、
+<code>AIAEC/tests/test_export_streaming_ulcnet.py</code>（匯出腳本 layout-version
+互鎖、metadata 內容）、<code>AIAEC/tests/test_ulcnet_accelerator_adapter.c</code>、
 <code>AIAEC/tests/test_streaming_*.py</code>（六模型等價/can-fail/fresh-state）、
 <code>AINR/tests/test_c_prepost.c</code>、<code>AINR/RNNoise-ERB/tests/</code>
 （feature contract / Python↔C features；C 端 tables/SIMD 測試由其 Makefile 建置：

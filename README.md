@@ -12,7 +12,7 @@ contracts.
 | `pipelines/` | Production-oriented linear AEC + echo-aware NR/RES | [`pipelines/README.md`](pipelines/README.md) |
 | `AINR/` | Standalone speech enhancement | [`AINR/README.md`](AINR/README.md) |
 | `AIAEC/` | Six neural AEC/AENR candidate architectures | [`AIAEC/README.md`](AIAEC/README.md) |
-| `pipelines/4ch_pipelines/` | Python reference and C API for four linear AEC lanes around an externally owned SRP-PHAT/GSC | [`pipelines/4ch_pipelines/README.md`](pipelines/4ch_pipelines/README.md) |
+| `pipelines/4ch_aec_bf_nr_res/` | Python reference and C API for four linear AEC lanes around an externally owned SRP-PHAT/GSC | [`pipelines/4ch_aec_bf_nr_res/README.md`](pipelines/4ch_aec_bf_nr_res/README.md) |
 | `lib/aec/`, `lib/nr/` | Conventional algorithm libraries | Git submodules |
 
 The conventional pipeline is the deployable reference path. `AINR/` and
@@ -81,13 +81,13 @@ git submodule update --init --recursive
 make -C pipelines
 
 # Build the independent four-channel pipeline and its reusable dependencies.
-make -C pipelines/4ch_pipelines
-make -C pipelines/4ch_pipelines 4aec_nr_res_static
+make -C pipelines/4ch_aec_bf_nr_res
+make -C pipelines/4ch_aec_bf_nr_res 4aec_nr_res_static
 
 # The same switch is forwarded through every conventional/AI pre-post layer.
 # SIMD=1 is the default; SIMD=0 forces scalar fallback for A/B tests.
 make -C pipelines SIMD=0 test
-make -C pipelines/4ch_pipelines SIMD=0 test
+make -C pipelines/4ch_aec_bf_nr_res SIMD=0 test
 make -C AINR SIMD=0 test
 make -C AINR/RNNoise-ERB SIMD=0 test
 
