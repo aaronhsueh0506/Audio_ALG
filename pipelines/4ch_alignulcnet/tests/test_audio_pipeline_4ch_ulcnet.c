@@ -10,6 +10,11 @@
  *      its output is APPLIED only on locked frames; model->reset fired on
  *      every delay change AND on pipeline reset; fail-open on infer()
  *      error (output stays identity, calls continue).
+ *  2b. relock on the SAME delay (ALIGNED): LOCKED(0) -> forced UNLOCKED ->
+ *      LOCKED(0) must still fire model->reset exactly once, on the relock
+ *      hop. Applied delay 0 is the one value a value-only `changed` test
+ *      cannot tell apart from "nothing accepted yet"; see the test's own
+ *      header for the mutation that turns it red.
  *   3. core PreFrame extension: pre.aligned_ref non-NULL, byte-exact against
  *      an independently maintained delayed-far reference, delay lock on a
  *      delayed far, and the abandon_pre token protocol.
@@ -79,6 +84,26 @@ static float frand(void) {
     return ((float)(x >> 8) * (1.0f / 16777216.0f)) - 0.5f;
 }
 
+/* One hop of the shared synthetic scene every delay-lock test drives: fresh
+ * far noise appended to far_hist, and a true_delay-delayed 0.6x echo fanned
+ * out to the four mics with a per-channel taper. Only the delay differs
+ * between tests. */
+static void fill_echo_hop(int frame, int hop, int true_delay,
+                          float* far_hist, float* far, float* microphones) {
+    for (int i = 0; i < hop; ++i) {
+        int64_t t = (int64_t)frame * hop + i;
+        float noise = 0.25f * frand();
+        float echo;
+        far_hist[t] = noise;
+        far[i] = noise;
+        echo = t >= true_delay ? 0.6f * far_hist[t - true_delay] : 0.0f;
+        for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+            microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
+                echo * (1.0f - 0.02f * ch);
+        }
+    }
+}
+
 /* ============================================================================
  * 1. Identity E2E: WOLA + ULCNet chain + 2-hop latency contract
  * ========================================================================== */
@@ -96,6 +121,8 @@ static int test_identity_e2e(void) {
     float max_preamble = 0.0f;
     int hop;
 
+    CHECK(cfg.core.sample_rate == 16000 && cfg.core.fft_size == 512,
+          "default config is the trained 16 kHz / frame-FFT 512 / hop 256 grid");
     cfg.gsc_fixed_mode = 1;
     cfg.gsc_fixed_doa_rad = 0.4f;
     cfg.gsc_mu = 0.02f;
@@ -275,19 +302,7 @@ static int test_counting_model_policy(void) {
             m.scale = 3.0f;
         }
 
-        for (int i = 0; i < hop; ++i) {
-            int64_t t = (int64_t)frame * hop + i;
-            float noise = 0.25f * frand();
-            float echo;
-            far_hist[t] = noise;
-            far[i] = noise;
-            echo = t >= TRUE_DELAY
-                ? 0.6f * far_hist[t - TRUE_DELAY] : 0.0f;
-            for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-                microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
-                    echo * (1.0f - 0.02f * ch);
-            }
-        }
+        fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
               "counting-model frame processes");
@@ -382,6 +397,177 @@ static int test_counting_model_policy(void) {
 }
 
 /* ============================================================================
+ * 2b. Relock on the SAME delay must still reset the model (ALIGNED mode)
+ *
+ * The scenario the shared-delay `changed` flag exists for, in the one variant
+ * a value-only comparison cannot see:
+ *
+ *   LOCKED(applied delay 0) -> UNLOCKED for several hops -> LOCKED(applied
+ *   delay 0 again, the very same value)
+ *
+ * ALIGNED mode gates APPLICATION on `solid` but keeps STEPPING infer() every
+ * hop for a constant compute budget, so across the unlocked stretch the
+ * runtime's recurrent state (attention K/V ring, logit history, GRU hidden)
+ * is advanced over far frames the estimator has not vouched for. Unless the
+ * relock hop reports `changed`, the wrapper never issues model->reset and the
+ * first re-applied frame is computed from that contaminated state.
+ *
+ * The applied delay is deliberately pinned to 0 here. 0 is a legal applied
+ * delay AND the value the core's accepted_delay holds when nothing has been
+ * accepted yet (init, and every four_aec_nr_res_reset()), so "no alignment
+ * yet" and "aligned at 0" are the one pair a value-only `changed` test cannot
+ * distinguish -- every other value relocks through a visible 0 -> V step and
+ * would pass even with the bug present. TRUE_DELAY 64 minus the estimator's
+ * 32-sample headroom lands exactly there; the test asserts delay_samples == 0
+ * rather than assuming it, so a headroom change fails loudly instead of
+ * quietly turning this into a vacuous pass.
+ *
+ * MUTATION: restoring the old `state.changed = eligible && estimated !=
+ * p->accepted_delay;` in 4aec_nr_res.c's update_shared_delay() drops BOTH the
+ * first acquisition and the relock, and this test goes red on the acquisition
+ * assertion.
+ * ========================================================================== */
+
+static int test_relock_same_delay_resets_model(void) {
+    enum { WARM_FRAMES = 60, RELOCK_FRAMES = 60, TRUE_DELAY = 64 };
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    AudioPipeline4ChUlcnet* p;
+    CountingModel m;
+    UlcnetModel model;
+    FourAecNrResDelayState delay;
+    float* microphones;
+    float* far;
+    float* out;
+    float* far_hist;
+    int total_frames = WARM_FRAMES + RELOCK_FRAMES;
+    int hop;
+    int acquire_frame = -1;      /* first frame reporting solid, phase A */
+    int relock_frame = -1;       /* first frame reporting solid, phase B */
+    long reset_at_acquire = -1;
+    long reset_at_relock = -1;
+    long reset_before_relock = -1;
+    int unlocked_hops_after_reset = 0;
+    long resets_during_unlock = 0;
+    long reset_at_pipeline_reset = 0;
+    int applied_after_relock = 0;
+    int changed_events = 0;
+
+    cfg.gsc_fixed_mode = 1;
+    cfg.gsc_fixed_doa_rad = 0.3f;
+    cfg.gsc_mu = 0.02f;
+    cfg.core.enable_cng = 0;
+
+    p = audio_pipeline_4ch_ulcnet_create(&cfg);
+    CHECK(p != NULL, "create relock pipeline");
+    hop = audio_pipeline_4ch_ulcnet_hop_size(p);
+
+    memset(&m, 0, sizeof(m));
+    m.scale = 0.5f;
+    memset(&model, 0, sizeof(model));
+    model.user = &m;
+    model.infer = counting_infer;
+    model.reset = counting_reset;
+    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
+          "install counting model");
+    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
+              p, ULCNET_FAR_ALIGNED) == 0,
+          "select ULCNET_FAR_ALIGNED (the lock-gated mode)");
+
+    microphones = (float*)malloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
+    far = (float*)malloc((size_t)hop * sizeof(float));
+    out = (float*)malloc((size_t)hop * sizeof(float));
+    far_hist = (float*)calloc((size_t)total_frames * hop, sizeof(float));
+    CHECK(microphones && far && out && far_hist, "allocate relock buffers");
+
+    g_rng = 0x1234567u;
+    for (int frame = 0; frame < total_frames; ++frame) {
+        if (frame == WARM_FRAMES) {
+            /* The forced unlock. This is the only lever the core exposes:
+             * four_aec_nr_res_reset() (which audio_pipeline_4ch_ulcnet_reset
+             * calls) is the sole caller of delay_aec3_reset(), and the
+             * estimator's REFINED-confidence latch cannot otherwise drop
+             * once set. It also puts accepted_delay back to 0 -- which is
+             * precisely why a same-value relock at 0 is invisible to a
+             * value-only test. */
+            reset_before_relock = m.reset_calls;
+            audio_pipeline_4ch_ulcnet_reset(p);
+            reset_at_pipeline_reset = m.reset_calls;
+        }
+
+        fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
+        CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
+                  p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
+              "relock frame processes");
+        CHECK(audio_pipeline_4ch_ulcnet_last_delay(p, &delay) == 0,
+              "delay-state accessor works");
+        if (delay.changed) changed_events += 1;
+
+        if (frame < WARM_FRAMES) {
+            if (delay.solid && acquire_frame < 0) {
+                acquire_frame = frame;
+                reset_at_acquire = m.reset_calls;
+                CHECK(delay.delay_samples == 0,
+                      "phase A locks on applied delay 0 (the value a "
+                      "value-only `changed` test cannot distinguish from "
+                      "'nothing accepted yet')");
+                CHECK(delay.changed,
+                      "acquisition hop reports a new alignment generation");
+            }
+        } else {
+            if (!delay.solid) {
+                /* Still re-acquiring: the model is stepped but nothing may
+                 * be applied, and nothing may be flushed either. */
+                unlocked_hops_after_reset += 1;
+                resets_during_unlock =
+                    m.reset_calls - reset_at_pipeline_reset;
+            } else if (relock_frame < 0) {
+                relock_frame = frame;
+                reset_at_relock = m.reset_calls;
+                CHECK(delay.delay_samples == 0,
+                      "phase B relocks on the SAME applied delay 0");
+                CHECK(delay.changed,
+                      "relock on an unchanged delay value still reports a "
+                      "new alignment generation");
+            } else {
+                applied_after_relock += 1;
+            }
+        }
+    }
+
+    CHECK(acquire_frame >= 0, "phase A actually acquired the delay");
+    CHECK(relock_frame >= 0, "phase B actually re-acquired the delay");
+    CHECK(reset_before_relock == 1,
+          "exactly one model->reset up to the pipeline reset (the "
+          "acquisition)");
+    CHECK(reset_at_pipeline_reset == reset_before_relock + 1,
+          "the pipeline reset itself fires model->reset once");
+    CHECK(unlocked_hops_after_reset >= 2,
+          "the forced unlock lasted several hops (not a vacuous pass)");
+    CHECK(resets_during_unlock == 0,
+          "no model->reset while merely unlocked -- only a usable alignment "
+          "starts a new generation");
+    CHECK(reset_at_relock == reset_at_pipeline_reset + 1,
+          "the same-delay relock fires model->reset exactly once, on the "
+          "relock hop itself (before that hop's frames are applied)");
+    CHECK(m.reset_calls == 3,
+          "3 model resets total: acquisition, pipeline reset, same-delay "
+          "relock");
+    CHECK(changed_events == 2,
+          "2 alignment generations: acquisition and same-delay relock");
+    CHECK(applied_after_relock >= 10,
+          "the stream really goes on applying model output after the relock");
+    CHECK(reset_at_acquire == 1, "acquisition reset counted once");
+
+    audio_pipeline_4ch_ulcnet_destroy(p);
+    free(far_hist);
+    free(out);
+    free(far);
+    free(microphones);
+    return 1;
+}
+
+/* ============================================================================
  * 3. Core PreFrame extension: aligned_ref + delay lock + abandon protocol
  * ========================================================================== */
 
@@ -422,19 +608,7 @@ static int test_core_aligned_ref_and_abandon(void) {
           "abandon with NULL token is rejected");
 
     for (int frame = 0; frame < FRAMES; ++frame) {
-        for (int i = 0; i < hop; ++i) {
-            int64_t t = (int64_t)frame * hop + i;
-            float noise = 0.25f * frand();
-            float echo;
-            far_hist[t] = noise;
-            far[i] = noise;
-            echo = t >= TRUE_DELAY
-                ? 0.6f * far_hist[t - TRUE_DELAY] : 0.0f;
-            for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-                microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
-                    echo * (1.0f - 0.02f * ch);
-            }
-        }
+        fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         /* Zero the whole out-struct first: if process_pre ever stopped
          * assigning aligned_ref, the non-NULL check below would fail
          * instead of reading leftover stack garbage. */
@@ -803,19 +977,7 @@ static int test_raw_mode_applies_unlocked(void) {
     for (int frame = 0; frame < FRAMES; ++frame) {
         const float* beam;
         int frames_in_hop = frame == 0 ? 0 : (frame == 1 ? 2 : 1);
-        for (int i = 0; i < hop; ++i) {
-            int64_t t = (int64_t)frame * hop + i;
-            float noise = 0.25f * frand();
-            float echo;
-            far_hist[t] = noise;
-            far[i] = noise;
-            echo = t >= TRUE_DELAY
-                ? 0.6f * far_hist[t - TRUE_DELAY] : 0.0f;
-            for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-                microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
-                    echo * (1.0f - 0.02f * ch);
-            }
-        }
+        fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
               "RAW-mode frame processes");
@@ -947,19 +1109,7 @@ static int test_nan_guard(void) {
         m.poison = (frame >= 20 && frame < 28) || (frame >= 40 && frame < 48);
         poisoned[frame] = m.poison;
 
-        for (int i = 0; i < hop; ++i) {
-            int64_t t = (int64_t)frame * hop + i;
-            float noise = 0.25f * frand();
-            float echo;
-            far_hist[t] = noise;
-            far[i] = noise;
-            echo = t >= TRUE_DELAY
-                ? 0.6f * far_hist[t - TRUE_DELAY] : 0.0f;
-            for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-                microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
-                    echo * (1.0f - 0.02f * ch);
-            }
-        }
+        fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   pa, microphones, far, 0, out_a) == FOUR_AEC_NR_RES_OK,
               "NaN-guard model frame processes");
@@ -1099,19 +1249,7 @@ static int test_partial_write_guard(void) {
         m.partial = (frame >= 20 && frame < 28) || (frame >= 40 && frame < 48);
         partial[frame] = m.partial;
 
-        for (int i = 0; i < hop; ++i) {
-            int64_t t = (int64_t)frame * hop + i;
-            float noise = 0.25f * frand();
-            float echo;
-            far_hist[t] = noise;
-            far[i] = noise;
-            echo = t >= TRUE_DELAY
-                ? 0.6f * far_hist[t - TRUE_DELAY] : 0.0f;
-            for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-                microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
-                    echo * (1.0f - 0.02f * ch);
-            }
-        }
+        fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   pa, microphones, far, 0, out_a) == FOUR_AEC_NR_RES_OK,
               "partial-write model frame processes");
@@ -1373,6 +1511,8 @@ static int run_all_tests(void) {
           "identity E2E / 2-hop timing contract");
     CHECK(test_counting_model_policy(),
           "counting model policy (stepping, lock gating, resets, fail-open)");
+    CHECK(test_relock_same_delay_resets_model(),
+          "relock on the same delay still resets the model (ALIGNED)");
     CHECK(test_core_aligned_ref_and_abandon(),
           "core PreFrame aligned_ref + abandon protocol");
     CHECK(test_pool_and_descriptor_gate(),

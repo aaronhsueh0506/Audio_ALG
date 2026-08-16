@@ -818,6 +818,7 @@ static FourAecNrResDelayState update_shared_delay(
     int emitted;
     int estimated;
     int eligible;
+    int was_usable;
 
     memset(&state, 0, sizeof(state));
     if (p->cfg.delay_mode == AEC_DELAY_EXTERNAL_ALIGNED) {
@@ -854,7 +855,16 @@ static FourAecNrResDelayState update_shared_delay(
                delay_aec3_is_solid(&p->shared_delay) &&
                delay_aec3_n_updates(&p->shared_delay) >= 3;
 
-    state.changed = eligible && estimated != p->accepted_delay;
+    /* `changed` = "this hop starts a NEW USABLE alignment generation" (see
+     * FourAecNrResDelayState's doc for why a value-only comparison misses
+     * every acquisition or relock that lands on applied delay 0). The
+     * previous hop's usability is exactly its published `solid`: this
+     * wrapper's delay_samples is never negative (accepted_delay starts at 0
+     * and only ever takes an `estimated >= 0`), so there is no -1 sentinel
+     * half to test. p->last_delay is zeroed by init's pool memset and by
+     * reset(), so was_usable is 0 at every genuine stream start. */
+    was_usable = p->last_delay.solid;
+    state.changed = eligible && (!was_usable || estimated != p->accepted_delay);
     if (eligible) p->accepted_delay = estimated;
     state.delay_samples = p->accepted_delay;
     state.confidence = delay_aec3_confidence(&p->shared_delay);

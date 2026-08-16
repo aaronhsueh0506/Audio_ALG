@@ -257,16 +257,24 @@ ifneq ($(AC_LIB),)
 all: $(PIPELINE_LIB) $(BIN_DIR)/audio_pipeline_4ch_raw \
      $(BIN_DIR)/4aec_nr_res_static $(BIN_DIR)/audio_pipeline_4ch_static
 
+# The 4ch_alignulcnet application shares this Makefile (its wrapper compiles
+# against this directory's core), so its acceptance test and board skeleton
+# run here too: this directory's `make test` is the one-stop gate, mirroring
+# the mono arrangement in pipelines/Makefile.
 test: $(BIN_DIR)/test_4aec_nr_res $(BIN_DIR)/test_spatial_third_party \
       $(BIN_DIR)/test_audio_pipeline_4ch $(BIN_DIR)/4aec_nr_res_static \
-      $(BIN_DIR)/audio_pipeline_4ch_static
+      $(BIN_DIR)/audio_pipeline_4ch_static \
+      $(BIN_DIR)/test_audio_pipeline_4ch_ulcnet $(BIN_DIR)/4ch_alignulcnet
 	"$(abspath $(BIN_DIR))/test_4aec_nr_res"
 	"$(abspath $(BIN_DIR))/test_spatial_third_party"
 	"$(abspath $(BIN_DIR))/test_audio_pipeline_4ch"
+	"$(abspath $(BIN_DIR))/test_audio_pipeline_4ch_ulcnet"
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 16000
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 48000
 	"$(abspath $(BIN_DIR))/audio_pipeline_4ch_static" --sample-rate 16000
 	"$(abspath $(BIN_DIR))/audio_pipeline_4ch_static" --sample-rate 48000
+	"$(abspath $(BIN_DIR))/4ch_alignulcnet"
+	"$(abspath $(BIN_DIR))/4ch_alignulcnet" --delay-num-filters 1
 
 lib libaudio_pipeline_4ch.a: $(PIPELINE_LIB)
 libs: $(AC_LIB) $(AEC_LIB) $(NR_LIB) $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(GSC_LIB) $(PIPELINE_LIB)

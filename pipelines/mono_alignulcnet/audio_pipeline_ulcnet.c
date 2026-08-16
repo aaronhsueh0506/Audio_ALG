@@ -308,7 +308,7 @@ AudioPipelineUlcnetConfig audio_pipeline_ulcnet_default_config(int sample_rate) 
     AudioPipelineUlcnetConfig cfg;
     memset(&cfg, 0, sizeof(cfg));       /* all-zero model == identity */
     cfg.sample_rate = sample_rate;
-    cfg.fft_size    = 0;                /* resolve to the ULCNet grid (512) */
+    cfg.fft_size    = ULCNET_N_FFT;     /* trained grid: frame/FFT 512 */
     cfg.filter_length = 0;
     cfg.delay_mode = AEC_DELAY_MATCHED;
     cfg.delay_num_filters = 5;

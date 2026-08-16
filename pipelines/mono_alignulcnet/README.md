@@ -15,6 +15,30 @@ together with the ONNX descriptor. `far_input_mode` must also equal the
 checkpoint contract (`RAW` for existing checkpoints, `ALIGNED` only for a
 checkpoint trained that way).
 
+## Delay profile
+
+The matched-filter bank size `n` is a product deployment decision, so it is a
+command-line argument rather than a literal in `main.c`; the resolved profile
+and the pool it costs are printed at start-up. `n` is an init parameter, not
+a runtime setter — changing it means re-querying the pool and re-initializing.
+
+```sh
+./mono_alignulcnet                              # matched, n=5 (default)
+./mono_alignulcnet --delay-num-filters 3        # smaller bank, smaller pool
+./mono_alignulcnet --delay-mode fixed --fixed-delay 1600
+./mono_alignulcnet --delay-mode external        # caller pre-aligns the far
+```
+
+Choose `n` from the SKU's measured bulk far-to-mic delay distribution. The
+reliable search ceiling per bank is ~125 / 221 / 317 / 413 / 509 ms for
+n = 1..5; each filter costs 5,728 bytes of pool. `0` is not "off" — use
+`--delay-mode fixed` (delay known at bring-up) or `external` (upstream
+guarantees alignment) instead. A bulk delay beyond the ceiling does not
+merely fail to lock: with any in-range early reflection present the estimator
+can lock onto that instead, at full confidence, and nothing in the AEC seam
+distinguishes it from a correct lock — see the known-delay tests in
+`tests/`.
+
 ```sh
 make BACKEND=kiss SIMD=0 test
 make BACKEND=ne10 SIMD=1 test

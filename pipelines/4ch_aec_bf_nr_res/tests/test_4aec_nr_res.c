@@ -11,9 +11,11 @@
 #include "fft_wrapper.h"
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 static int failures = 0;
 
@@ -1060,6 +1062,316 @@ cleanup:
     four_aec_nr_res_destroy(pe);
 }
 
+/* ============================================================================
+ * Known-delay profile verification (product delay gate, NOT an audio-quality
+ * run -- see docs/align_ulcnet_delay_profile_plan_zh_TW.md §5.1/§6).
+ *
+ * Everything here is driven by a SYNTHESISED echo whose bulk delay is known
+ * exactly, so every claim is checked against ground truth instead of against
+ * a score. Four questions, in the order the plan asks them:
+ *
+ *   acquisition  Does each bank size acquire the delays it is supposed to
+ *                cover, how fast, and how accurately?
+ *   coverage     Does the reliable-range contract per n actually hold at the
+ *                boundary -- locks just inside, does NOT lock just outside?
+ *   mislock      When the true bulk delay is beyond the bank's reach, is the
+ *                failure DETECTABLE? (It is not detectable from the seam.)
+ *   cost         Pool bytes vs n, and a rough per-hop CPU figure.
+ * ========================================================================== */
+
+/* Reliable bulk-delay search ceiling for a bank of n matched filters, in
+ * native 16 kHz samples, spelled with lib/aec's own constants: the ring
+ * holds (n-1)*DA_FILTER_INTRA_SHIFT + (DA_FILTER_SIZE - 11) DOWNSAMPLED
+ * samples of reach (the -11 is the `lag < filter_size - 10` reliability
+ * cut), and one downsampled sample is DA_DOWN_SAMPLING_FACTOR native
+ * samples (0.25 ms at 16 kHz). That is the 125/221/317/413/509 ms table in
+ * the plan, derived rather than copied as five literals. */
+#define KD_RELIABLE_SAMPLES(n) \
+    (((n) - 1) * DA_FILTER_INTRA_SHIFT * DA_DOWN_SAMPLING_FACTOR + \
+     (DA_FILTER_SIZE - 11) * DA_DOWN_SAMPLING_FACTOR)
+
+/* The applied alignment must never land LATER than the true echo: the AEC3
+ * design deliberately reports early so PBFDKF sees a POSITIVE residual it can
+ * model (a negative residual is non-causal for the filter and cannot be).
+ * Measured across n=1..5 and true delays 4..509 ms, the shortfall is 64 or 80
+ * samples -- one estimator headroom (32) plus pre-echo block quantisation.
+ * 128 samples (8 ms) leaves margin without admitting a whole extra hop. */
+#define KD_MAX_UNDERSHOOT 128
+
+typedef struct KnownDelayRun {
+    int locked;
+    int lock_hop;
+    int applied_delay;
+    float confidence;
+    int changed_events;
+    double us_per_hop;
+} KnownDelayRun;
+
+/* Drives `hops` hops of a two-path synthetic echo (a dominant path at
+ * dominant_delay plus an optional weaker early path) through a MATCHED core
+ * with the given bank size, and reports what the shared estimator did. */
+static void known_delay_run(int num_filters, int hops,
+                            int dominant_delay, float dominant_gain,
+                            int early_delay, float early_gain,
+                            KnownDelayRun* out) {
+    enum { KD_HOP = 256, KD_PAD = 16384 };
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* p;
+    float* far_hist;
+    float mic[KD_HOP * FOUR_AEC_NR_RES_CHANNELS];
+    float far[KD_HOP];
+    uint32_t rng = 0x1234567u;
+    clock_t t0, t1;
+    int hop, i, ch;
+
+    memset(out, 0, sizeof(*out));
+    out->lock_hop = -1;
+    out->applied_delay = -1;
+
+    cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
+    cfg.enable_cng = 0;
+    cfg.delay_num_filters = num_filters;
+    p = four_aec_nr_res_create(&cfg);
+    if (!p) return;
+
+    far_hist = (float*)malloc((size_t)(hops * KD_HOP + KD_PAD) * sizeof(float));
+    if (!far_hist) { four_aec_nr_res_destroy(p); return; }
+    for (i = 0; i < hops * KD_HOP + KD_PAD; ++i) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        far_hist[i] = 0.25f * (((float)(rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
+    }
+
+    t0 = clock();
+    for (hop = 0; hop < hops; ++hop) {
+        FourAecNrResPreFrame pre;
+        int base = hop * KD_HOP + KD_PAD;
+        for (i = 0; i < KD_HOP; ++i) {
+            int t = base + i;
+            float echo = dominant_gain * far_hist[t - dominant_delay] +
+                         early_gain * far_hist[t - early_delay];
+            far[i] = far_hist[t];
+            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+                mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo;
+        }
+        if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+            FOUR_AEC_NR_RES_OK) break;
+        if (pre.delay.changed) out->changed_events += 1;
+        if (!out->locked && pre.delay.solid) {
+            out->locked = 1;
+            out->lock_hop = hop;
+            out->applied_delay = pre.delay.delay_samples;
+            out->confidence = pre.delay.confidence;
+        }
+        four_aec_nr_res_abandon_pre(p, &pre.token);
+    }
+    t1 = clock();
+    out->us_per_hop = hops > 0
+        ? (double)(t1 - t0) * 1e6 / (double)CLOCKS_PER_SEC / (double)hops
+        : 0.0;
+
+    free(far_hist);
+    four_aec_nr_res_destroy(p);
+}
+
+static void test_known_delay_acquisition_and_coverage(void) {
+    /* One point just INSIDE each bank's reliable ceiling and one just
+     * OUTSIDE it (the next bank's inside point, which is by construction
+     * beyond this bank's reach). */
+    static const int inside_ms[6] = { 0, 125, 221, 317, 413, 509 };
+    int n;
+
+    printf("known-delay acquisition (16 kHz, hop 256, synthetic echo):\n");
+    for (n = 1; n <= 5; ++n) {
+        KnownDelayRun in_range, out_of_range;
+        int inside = inside_ms[n] * 16;             /* ms -> samples @16k */
+        /* n=5 has no next bank; 9271 samples = 579.44 ms is the real
+         * recording that first exposed its ceiling. */
+        int outside = (n == 5) ? 9271 : inside_ms[n + 1] * 16;
+        char label[192];
+
+        known_delay_run(n, 200, inside, 0.6f, inside, 0.0f, &in_range);
+        known_delay_run(n, 200, outside, 0.6f, outside, 0.0f, &out_of_range);
+
+        printf("  n=%d ceiling %d samples (%.2f ms): "
+               "in-range %d ms -> lock hop %d applied %d (short by %d); "
+               "out-of-range %d ms -> %s\n",
+               n, KD_RELIABLE_SAMPLES(n), KD_RELIABLE_SAMPLES(n) / 16.0,
+               inside_ms[n], in_range.lock_hop, in_range.applied_delay,
+               in_range.locked ? inside - in_range.applied_delay : -1,
+               outside / 16,
+               out_of_range.locked ? "LOCKED" : "no lock");
+
+        snprintf(label, sizeof(label),
+                 "n=%d acquires a %d ms bulk delay within 60 hops (lock hop "
+                 "%d, inside its %.2f ms ceiling)", n, inside_ms[n],
+                 in_range.lock_hop, KD_RELIABLE_SAMPLES(n) / 16.0);
+        CHECK(in_range.locked && in_range.lock_hop >= 0 &&
+              in_range.lock_hop < 60, label);
+
+        /* The alignment contract, not a tolerance pulled from the air: the
+         * applied delay may sit EARLY of the true echo (PBFDKF then models a
+         * positive residual) but must never sit LATE. */
+        snprintf(label, sizeof(label),
+                 "n=%d applied delay is early-or-exact and short by at most "
+                 "%d samples (true %d, applied %d)",
+                 n, KD_MAX_UNDERSHOOT, inside, in_range.applied_delay);
+        CHECK(in_range.locked &&
+              inside - in_range.applied_delay >= 0 &&
+              inside - in_range.applied_delay <= KD_MAX_UNDERSHOOT, label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d exactly one alignment generation for a static delay "
+                 "(%d)", n, in_range.changed_events);
+        CHECK(in_range.changed_events == 1, label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d does NOT acquire a %d ms bulk delay (beyond its "
+                 "%.2f ms ceiling)", n, outside / 16,
+                 KD_RELIABLE_SAMPLES(n) / 16.0);
+        CHECK(outside > KD_RELIABLE_SAMPLES(n) && !out_of_range.locked, label);
+    }
+}
+
+/* An out-of-range bulk delay is NOT always a clean "never locks". Add any
+ * in-range echo component -- an early reflection, a second speaker path, a
+ * codec artefact -- and the estimator locks onto THAT with full confidence
+ * while the dominant path stays unmodelled far outside the filter's reach.
+ * This reproduces, synthetically, the recording that exposed the n=5 ceiling:
+ * a dominant path at 579.44 ms and a confident lock at ~32 ms.
+ *
+ * This test does NOT bless that behaviour. It pins the property a product
+ * delay gate has to be built around: the seam cannot see the error (solid=1,
+ * confidence=1.0, exactly as for a correct lock), so the ONLY thing that
+ * catches it is comparing the applied delay against an independently known
+ * ground-truth delay. That comparison is the check being asserted here. */
+static void test_known_delay_mislock_is_detectable(void) {
+    KnownDelayRun mislock, control;
+    const int dominant = 9271;      /* 579.44 ms -- beyond every bank */
+    const int early = 512;          /* 32 ms -- inside every bank */
+    int error_samples;
+    char label[224];
+
+    known_delay_run(5, 200, dominant, 0.6f, early, 0.5f, &mislock);
+    /* Control: same two paths, but the dominant one now inside the ceiling.
+     * The estimator must prefer the dominant path, and the ground-truth
+     * check must stay quiet -- otherwise the check below is just "always
+     * flags", which would prove nothing. */
+    known_delay_run(5, 200, 3536, 0.6f, early, 0.5f, &control);
+
+    error_samples = mislock.locked ? dominant - mislock.applied_delay : -1;
+    printf("known-delay mislock: dominant %d samples (%.2f ms) + early %d "
+           "(%.2f ms) -> lock hop %d applied %d (%.2f ms) confidence %.2f, "
+           "wrong by %d samples (%.2f ms)\n",
+           dominant, dominant / 16.0, early, early / 16.0,
+           mislock.lock_hop, mislock.applied_delay,
+           mislock.applied_delay / 16.0, (double)mislock.confidence,
+           error_samples, error_samples / 16.0);
+
+    CHECK(mislock.locked,
+          "an in-range early path makes an out-of-range bulk delay lock "
+          "anyway");
+    CHECK(mislock.confidence >= 1.0f,
+          "the mislock is reported at FULL confidence -- the seam's own "
+          "fields cannot distinguish it from a correct lock");
+    snprintf(label, sizeof(label),
+             "ground-truth comparison FLAGS the mislock: applied is short by "
+             "%d samples (%.2f ms), far past the %d-sample alignment "
+             "contract", error_samples, error_samples / 16.0,
+             KD_MAX_UNDERSHOOT);
+    CHECK(mislock.locked && error_samples > KD_MAX_UNDERSHOOT, label);
+
+    snprintf(label, sizeof(label),
+             "control: with the dominant path in range the SAME check stays "
+             "quiet (applied %d, short by %d)",
+             control.applied_delay,
+             control.locked ? 3536 - control.applied_delay : -1);
+    CHECK(control.locked &&
+          3536 - control.applied_delay >= 0 &&
+          3536 - control.applied_delay <= KD_MAX_UNDERSHOOT, label);
+}
+
+/* Plan §8.6: report the 4ch numbers by CALLING the 4ch queries. n drives the
+ * ONE shared estimator in the wrapper; the four lanes are EXTERNAL_ALIGNED
+ * and must not move with it, so the mono "5,728 B per filter per AEC
+ * instance" contract must NOT be multiplied by four here. */
+static void test_known_delay_memory_and_cost(void) {
+    FourAecNrResMemBreakdown b[6];
+    FourAecNrResMemReq req[6];
+    KnownDelayRun cost;
+    int n;
+    int ok = 1;
+    char label[192];
+
+    for (n = 1; n <= 5; ++n) {
+        FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+        cfg.fft_size = 512;
+        cfg.enable_cng = 0;
+        cfg.delay_num_filters = n;
+        if (four_aec_nr_res_get_mem_breakdown(&cfg, &b[n]) != 0 ||
+            four_aec_nr_res_get_mem_requirements(&cfg, &req[n]) != 0) {
+            ok = 0;
+            break;
+        }
+    }
+    CHECK(ok, "4ch memory breakdown and pool query answer for every n=1..5");
+    if (!ok) return;
+
+    printf("4ch pool vs matched-filter bank size (16 kHz, fft 512):\n");
+    for (n = 1; n <= 5; ++n) {
+        printf("  n=%d  lanes(4x AEC) %9zu  wrapper(shared est + ring + "
+               "bufs) %9zu  total %9llu",
+               n, b[n].aec_bytes, b[n].wrapper_bytes,
+               (unsigned long long)req[n].bytes);
+        if (n > 1)
+            printf("  (+%lld vs n=%d)",
+                   (long long)req[n].bytes - (long long)req[n - 1].bytes, n - 1);
+        printf("\n");
+    }
+
+    for (n = 2; n <= 5; ++n) {
+        snprintf(label, sizeof(label),
+                 "n=%d leaves the four lane AEC pools untouched (%zu bytes, "
+                 "same as n=1) -- n lives in the ONE shared estimator",
+                 n, b[n].aec_bytes);
+        CHECK(b[n].aec_bytes == b[1].aec_bytes, label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d costs strictly more wrapper RAM than n=%d "
+                 "(%zu > %zu)", n, n - 1, b[n].wrapper_bytes,
+                 b[n - 1].wrapper_bytes);
+        CHECK(b[n].wrapper_bytes > b[n - 1].wrapper_bytes, label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d total pool grows by exactly the per-filter cost of "
+                 "one shared estimator bank (%lld bytes, same as every other "
+                 "step)", n,
+                 (long long)req[n].bytes - (long long)req[n - 1].bytes);
+        CHECK((long long)req[n].bytes - (long long)req[n - 1].bytes ==
+              (long long)req[2].bytes - (long long)req[1].bytes, label);
+
+        snprintf(label, sizeof(label),
+                 "n=%d breakdown total agrees with the pool query (%zu == "
+                 "%llu)", n, b[n].total_bytes,
+                 (unsigned long long)req[n].bytes);
+        CHECK((unsigned long long)b[n].total_bytes ==
+              (unsigned long long)req[n].bytes, label);
+    }
+
+    /* Rough per-hop CPU, recorded rather than tuned: one hop is 256 samples
+     * = 16 ms of audio at 16 kHz, so the real-time factor is
+     * us_per_hop / 16000. The bound is a liveness guard (a catastrophic
+     * regression), not a performance target -- this is a host measurement on
+     * whatever machine ran the suite, not a board number. */
+    known_delay_run(5, 400, 3536, 0.6f, 3536, 0.0f, &cost);
+    printf("known-delay cost: 4 lanes + shared estimator (n=5) = "
+           "%.1f us/hop, %.4f x real time (hop = 16.00 ms of audio)\n",
+           cost.us_per_hop, cost.us_per_hop / 16000.0);
+    snprintf(label, sizeof(label),
+             "4ch core runs faster than real time on the host (%.1f us/hop "
+             "vs a 16000 us budget)", cost.us_per_hop);
+    CHECK(cost.us_per_hop > 0.0 && cost.us_per_hop < 16000.0, label);
+}
+
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
@@ -1079,6 +1391,9 @@ int main(void) {
     test_far_fft_sharing_reduces_four_to_one(16000, 512);
     test_far_fft_sharing_reduces_four_to_one(48000, 1024);
     test_delay_modes_and_bank_sizing();
+    test_known_delay_acquisition_and_coverage();
+    test_known_delay_mislock_is_detectable();
+    test_known_delay_memory_and_cost();
 
     if (failures) {
         printf("%d test(s) failed\n", failures);

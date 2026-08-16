@@ -184,7 +184,8 @@ typedef struct {
                               * match the checkpoint's training far input  */
 } AudioPipelineUlcnetConfig;
 
-/** Defaults: the fixed ULCNet grid (fft_size=0 -> 512), balanced preset,
+/** Defaults: the trained ULCNet grid (16 kHz, frame/FFT 512, hop 256),
+ * balanced preset,
  * all-zero model (identity), far_input_mode = ULCNET_FAR_RAW (the
  * checkpoint-compatible deployment contract). sample_rate is stored as
  * passed and validated at query/init time (only 16000 passes). */

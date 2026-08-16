@@ -179,6 +179,31 @@ typedef struct FourAecNrResConfig {
     int legacy_amin;              /* bool: do not fold R2 into NR prior      */
 } FourAecNrResConfig;
 
+/**
+ * Per-hop view of the single shared reference alignment.
+ *
+ * `changed` marks the hop on which a NEW USABLE alignment generation begins:
+ * MATCHED sets it on first acquisition, on a relock after an unlocked stretch
+ * EVEN IF the delay value is unchanged, and on a delay change while locked --
+ * i.e. on any not-usable -> usable transition of `solid` (delay_samples is
+ * never negative here, so usability is solid alone), plus any value change
+ * on top of that. This mirrors lib/aec's per-hop
+ * AEC_LINEAR_DELAY_CHANGED, which the mono pipelines consume: there the
+ * "nothing accepted yet" state is spelled current_delay == -1, so a relock
+ * always crosses a sentinel; here the accepted delay is a plain non-negative
+ * sample count, so the transition has to be tracked explicitly.
+ *
+ * A consumer that keeps history derived from the aligned reference -- STFT/OLA
+ * tails, and any recurrent model state stepped over the far branch -- must
+ * flush it on `changed`, BEFORE the frame it produces for this hop. Gating
+ * only on `solid` is not enough: a consumer that steps its model while
+ * unlocked (for constant per-hop compute) and applies only while solid still
+ * needs `changed` to tell it that everything it accumulated over the unlocked
+ * stretch was built on a reference the estimator had not vouched for.
+ *
+ * FIXED and EXTERNAL_ALIGNED never set `changed`; both follow lib/aec, where
+ * nothing bumps the generation during processing without an estimator.
+ */
 typedef struct FourAecNrResDelayState {
     int delay_samples;
     float confidence;

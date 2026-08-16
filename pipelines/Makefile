@@ -1091,6 +1091,7 @@ test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter $(BIN_DIR)
 	"$(abspath $(BIN_DIR))/test_audio_pipeline_ulcnet"
 	"$(abspath $(BIN_DIR))/test_ulcnet_accelerator_adapter"
 	"$(abspath $(BIN_DIR))/mono_alignulcnet"
+	"$(abspath $(BIN_DIR))/mono_alignulcnet" --delay-num-filters 1
 
 # example-adapter: build + RUN the REFERENCE ONLY
 # board-adapter host simulation (example_board_adapter.c) standalone -- same

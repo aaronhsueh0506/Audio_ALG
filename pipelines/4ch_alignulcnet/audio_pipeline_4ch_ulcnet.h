@@ -194,8 +194,9 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
 
 /**
  * Reuses AudioPipeline4ChConfig (the spatial stage is identical). Returns
- * the standard 16 kHz defaults with core.fft_size pre-set to 512 (the only
- * grid this wrapper accepts). Validation additionally rejects
+ * the trained 16 kHz / frame-FFT 512 / hop 256 defaults, with
+ * core.fft_size explicitly pre-set to 512 (the only grid this wrapper
+ * accepts). Validation additionally rejects
  * core.sample_rate != 16000 and core.fft_size not in {0, 512}; a value of 0
  * is forced to 512, never to the core's own 256 default. Caller
  * core.enable_post must remain 1; this wrapper changes a private config copy

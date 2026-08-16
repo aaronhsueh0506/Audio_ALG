@@ -88,6 +88,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <time.h>
 #include <math.h>
 
 #define HOP            ULCNET_HOP     /* 256 — pinned by the compiled grid  */
@@ -298,6 +299,128 @@ static void test_counting_model(void) {
 }
 
 /* =========================================================================
+ * 2b. relock on the SAME delay still resets the model (ALIGNED).
+ *
+ * The mono twin of test_relock_same_delay_resets_model() in
+ * 4ch_alignulcnet/tests/. Same scenario, same contract:
+ *
+ *   LOCKED(V) -> forced UNLOCKED for several hops -> LOCKED(V), same V
+ *
+ * must issue exactly one model->reset, on the relock hop, because ALIGNED
+ * mode keeps STEPPING infer() while unlocked (constant per-hop compute) and
+ * therefore carries recurrent state built over a reference the estimator had
+ * not vouched for.
+ *
+ * The two families reach this from opposite directions and the test records
+ * which. lib/aec spells "nothing accepted yet" as current_delay == -1, so its
+ * first acquisition after a reset always crosses that sentinel and bumps
+ * delay_generation -> AEC_LINEAR_DELAY_CHANGED, whatever value it relocks on;
+ * mono was already correct. The 4ch core keeps a plain non-negative
+ * accepted_delay with no sentinel, so its same-value relock had to be fixed
+ * by tracking the not-usable -> usable transition explicitly. This test
+ * pins the mono half of that shared contract so the two cannot drift apart.
+ *
+ * MUTATION: deleting the `delay_state == AEC_LINEAR_DELAY_CHANGED` model
+ * reset in audio_pipeline_ulcnet.c turns both the acquisition and the relock
+ * reset off and this test goes red.
+ * ========================================================================= */
+static int pipeline_delay_samples(const AudioPipelineUlcnet* p) {
+    AecLinearContext lctx;
+    aec_get_linear_context(audio_pipeline_ulcnet_get_aec(p), &lctx);
+    return lctx.delay_samples;
+}
+
+static void test_relock_same_delay_resets_model(void) {
+    enum { WARM = 90, RELOCK = 90, BULK_DELAY = 64 };
+    CountingModelState st = {0, 0};
+
+    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
+    cfg.far_input_mode = ULCNET_FAR_ALIGNED;
+    cfg.model.user  = &st;
+    cfg.model.infer = counting_infer;
+    cfg.model.reset = counting_reset;
+
+    AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
+    if (!p) { fprintf(stderr, "FAIL: setup (create) for mono relock test\n"); g_failures++; return; }
+
+    float mic[HOP], ref[HOP], out[HOP];
+    EchoSim sim;
+    int acquire_hop = -1, relock_hop = -1;
+    int acquire_delay = -1, relock_delay = -2;
+    int resets_at_acquire = -1, resets_at_relock = -1;
+    int resets_before_reset = -1, resets_at_pipeline_reset = -1;
+    int unlocked_hops_after_reset = 0, resets_during_unlock = -1;
+    int applied_after_relock = 0;
+
+    echo_sim_init(&sim, BULK_DELAY, 0xC0FFEEu);
+    for (int h = 0; h < WARM + RELOCK; h++) {
+        if (h == WARM) {
+            /* Forced unlock: the pipeline reset runs aec_reset(), which is
+             * lib/aec's only in-processing path back to current_delay == -1
+             * (the estimator's REFINED-confidence latch never drops on its
+             * own). The stimulus continues unchanged, so the AEC re-acquires
+             * the very same bulk delay. */
+            resets_before_reset = st.reset_calls;
+            audio_pipeline_ulcnet_reset(p);
+            resets_at_pipeline_reset = st.reset_calls;
+            echo_sim_init(&sim, BULK_DELAY, 0xC0FFEEu);
+        }
+        echo_sim_hop(&sim, mic, ref);
+        audio_pipeline_ulcnet_process(p, mic, ref, out);
+
+        AecLinearDelayState ds = pipeline_delay_state(p);
+        int locked = (ds == AEC_LINEAR_DELAY_LOCKED ||
+                      ds == AEC_LINEAR_DELAY_CHANGED);
+        if (h < WARM) {
+            if (locked && acquire_hop < 0) {
+                acquire_hop = h;
+                acquire_delay = pipeline_delay_samples(p);
+                resets_at_acquire = st.reset_calls;
+            }
+        } else if (!locked) {
+            unlocked_hops_after_reset++;
+            resets_during_unlock = st.reset_calls - resets_at_pipeline_reset;
+        } else if (relock_hop < 0) {
+            relock_hop = h;
+            relock_delay = pipeline_delay_samples(p);
+            resets_at_relock = st.reset_calls;
+        } else {
+            applied_after_relock++;
+        }
+    }
+
+    CHECK(acquire_hop >= 0 && relock_hop >= 0,
+          fmt_msg("mono relock: both acquisitions happened (acquire hop %d, relock hop %d)",
+                  acquire_hop, relock_hop));
+    CHECK(relock_delay == acquire_delay,
+          fmt_msg("mono relock: re-acquired the SAME applied delay (%d then %d samples)",
+                  acquire_delay, relock_delay));
+    CHECK(resets_at_acquire == 1,
+          fmt_msg("mono relock: first acquisition fired model->reset exactly once (%d)",
+                  resets_at_acquire));
+    CHECK(resets_at_pipeline_reset == resets_before_reset + 1,
+          "mono relock: the pipeline reset itself fires model->reset once");
+    CHECK(unlocked_hops_after_reset >= 2,
+          fmt_msg("mono relock: the forced unlock lasted several hops (%d, not a vacuous pass)",
+                  unlocked_hops_after_reset));
+    CHECK(resets_during_unlock == 0,
+          fmt_msg("mono relock: no model->reset while merely unlocked (%d)",
+                  resets_during_unlock));
+    CHECK(resets_at_relock == resets_at_pipeline_reset + 1,
+          fmt_msg("mono relock: the same-delay relock fires model->reset exactly once, "
+                  "on the relock hop itself (%d after %d)",
+                  resets_at_relock, resets_at_pipeline_reset));
+    CHECK(st.reset_calls == 3,
+          fmt_msg("mono relock: 3 model resets total -- acquisition, pipeline reset, "
+                  "same-delay relock (got %d)", st.reset_calls));
+    CHECK(applied_after_relock >= 10,
+          fmt_msg("mono relock: the stream goes on running locked after the relock (%d hops)",
+                  applied_after_relock));
+
+    audio_pipeline_ulcnet_destroy(p);
+}
+
+/* =========================================================================
  * 3. fail-open + delay gating, in ULCNET_FAR_ALIGNED (the mode that gates
  *    application on the lock; RAW never does -- see test 7). Model A halves
  *    the spectrum on success (rc=0) and doubles it on scheduled failing
@@ -424,6 +547,8 @@ static void test_config_validation_rejects(void) {
           "get_mem_requirements rejects a NULL config");
 
     AudioPipelineUlcnetConfig good = audio_pipeline_ulcnet_default_config(16000);
+    CHECK(good.sample_rate == 16000 && good.fft_size == 512,
+          "default config is the trained 16 kHz / frame-FFT 512 / hop 256 grid");
     CHECK(audio_pipeline_ulcnet_get_mem_requirements(&good, NULL) == -1,
           "get_mem_requirements rejects a NULL out-param");
 
@@ -469,8 +594,9 @@ static void test_config_validation_rejects(void) {
           "ULCNet wrapper passes AEC delay configuration into pool sizing");
 
     AudioPipelineUlcnetMemReq req0, req512;
-    AudioPipelineUlcnetConfig c0 = audio_pipeline_ulcnet_default_config(16000);   /* fft 0 */
+    AudioPipelineUlcnetConfig c0 = audio_pipeline_ulcnet_default_config(16000);
     AudioPipelineUlcnetConfig c512 = audio_pipeline_ulcnet_default_config(16000);
+    c0.fft_size = 0;  /* compatibility spelling for the same fixed grid */
     c512.fft_size = 512;
     CHECK(audio_pipeline_ulcnet_get_mem_requirements(&c0, &req0) == 0 &&
           audio_pipeline_ulcnet_get_mem_requirements(&c512, &req512) == 0 &&
@@ -1176,12 +1302,220 @@ static void test_partial_write_guard(void) {
     audio_pipeline_ulcnet_destroy(pb);
 }
 
+/* =========================================================================
+ * Known-delay profile verification (product delay gate, NOT an audio-quality
+ * run -- see docs/align_ulcnet_delay_profile_plan_zh_TW.md §5.1/§6).
+ *
+ * The mono twin of test_4aec_nr_res.c's known-delay block: same synthetic
+ * two-path echo with an exactly known bulk delay, same four questions
+ * (acquisition, coverage boundary, mislock detectability, cost), checked
+ * against ground truth rather than against a score. The one structural
+ * difference is where n lives -- mono has ONE AEC instance and the whole
+ * "5,728 B per matched filter" contract lands in its pool, whereas 4ch pays
+ * it once in a shared estimator that the four lanes do not multiply.
+ * ========================================================================= */
+
+/* Same geometry as the 4ch twin, spelled with lib/aec's own constants: a
+ * bank of n filters reaches (n-1)*DA_FILTER_INTRA_SHIFT +
+ * (DA_FILTER_SIZE - 11) downsampled samples (the -11 is the
+ * `lag < filter_size - 10` reliability cut), decimation
+ * DA_DOWN_SAMPLING_FACTOR. */
+#define KD_RELIABLE_SAMPLES(n) \
+    (((n) - 1) * DA_FILTER_INTRA_SHIFT * DA_DOWN_SAMPLING_FACTOR + \
+     (DA_FILTER_SIZE - 11) * DA_DOWN_SAMPLING_FACTOR)
+/* Applied alignment may be EARLY of the true echo (PBFDKF then models a
+ * positive residual) but never LATE; measured shortfall is 64-80 samples. */
+#define KD_MAX_UNDERSHOOT 128
+
+typedef struct {
+    int locked;
+    int lock_hop;
+    int applied_delay;
+    int changed_hops;
+    double us_per_hop;
+} MonoKnownDelayRun;
+
+/* Two-path synthetic echo (dominant + optional weaker early path) through a
+ * MATCHED mono pipeline with the given bank size. */
+static void mono_known_delay_run(int num_filters, int hops,
+                                 int dominant_delay, float dominant_gain,
+                                 int early_delay, float early_gain,
+                                 MonoKnownDelayRun* out) {
+    enum { KD_PAD = 16384 };
+    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
+    AudioPipelineUlcnet* p;
+    float* far_hist;
+    float mic[HOP], ref[HOP], outbuf[HOP];
+    clock_t t0, t1;
+    int hop, i;
+
+    memset(out, 0, sizeof(*out));
+    out->lock_hop = -1;
+    out->applied_delay = -1;
+
+    cfg.delay_mode = AEC_DELAY_MATCHED;
+    cfg.delay_num_filters = num_filters;
+    p = audio_pipeline_ulcnet_create(&cfg);
+    if (!p) return;
+
+    far_hist = (float*)malloc((size_t)(hops * HOP + KD_PAD) * sizeof(float));
+    if (!far_hist) { audio_pipeline_ulcnet_destroy(p); return; }
+    lcg_state = 0xC0FFEEu;
+    for (i = 0; i < hops * HOP + KD_PAD; i++) far_hist[i] = lcg_sample();
+
+    t0 = clock();
+    for (hop = 0; hop < hops; hop++) {
+        int base = hop * HOP + KD_PAD;
+        for (i = 0; i < HOP; i++) {
+            int t = base + i;
+            ref[i] = far_hist[t];
+            mic[i] = dominant_gain * far_hist[t - dominant_delay] +
+                     early_gain * far_hist[t - early_delay];
+        }
+        audio_pipeline_ulcnet_process(p, mic, ref, outbuf);
+        {
+            AecLinearDelayState ds = pipeline_delay_state(p);
+            if (ds == AEC_LINEAR_DELAY_CHANGED) out->changed_hops++;
+            if (!out->locked && (ds == AEC_LINEAR_DELAY_LOCKED ||
+                                 ds == AEC_LINEAR_DELAY_CHANGED)) {
+                out->locked = 1;
+                out->lock_hop = hop;
+                out->applied_delay = pipeline_delay_samples(p);
+            }
+        }
+    }
+    t1 = clock();
+    out->us_per_hop = hops > 0
+        ? (double)(t1 - t0) * 1e6 / (double)CLOCKS_PER_SEC / (double)hops
+        : 0.0;
+
+    free(far_hist);
+    audio_pipeline_ulcnet_destroy(p);
+}
+
+static void test_known_delay_profile(void) {
+    static const int inside_ms[6] = { 0, 125, 221, 317, 413, 509 };
+    MonoKnownDelayRun mislock, control, cost;
+    AudioPipelineUlcnetMemReq req[6];
+    int n;
+    int mem_ok = 1;
+    int mislock_error;
+
+    printf("known-delay acquisition (mono, 16 kHz, hop 256, synthetic echo):\n");
+    for (n = 1; n <= 5; n++) {
+        MonoKnownDelayRun in_range, out_of_range;
+        int inside = inside_ms[n] * 16;
+        int outside = (n == 5) ? 9271 : inside_ms[n + 1] * 16;
+
+        mono_known_delay_run(n, 200, inside, 0.6f, inside, 0.0f, &in_range);
+        mono_known_delay_run(n, 200, outside, 0.6f, outside, 0.0f, &out_of_range);
+
+        printf("  n=%d ceiling %d samples (%.2f ms): in-range %d ms -> lock hop %d "
+               "applied %d (short by %d); out-of-range %d ms -> %s\n",
+               n, KD_RELIABLE_SAMPLES(n), KD_RELIABLE_SAMPLES(n) / 16.0,
+               inside_ms[n], in_range.lock_hop, in_range.applied_delay,
+               in_range.locked ? inside - in_range.applied_delay : -1,
+               outside / 16, out_of_range.locked ? "LOCKED" : "no lock");
+
+        CHECK(in_range.locked && in_range.lock_hop >= 0 && in_range.lock_hop < 60,
+              fmt_msg("mono n=%d acquires a %d ms bulk delay within 60 hops "
+                      "(lock hop %d, inside its %.2f ms ceiling)",
+                      n, inside_ms[n], in_range.lock_hop,
+                      KD_RELIABLE_SAMPLES(n) / 16.0));
+        CHECK(in_range.locked &&
+              inside - in_range.applied_delay >= 0 &&
+              inside - in_range.applied_delay <= KD_MAX_UNDERSHOOT,
+              fmt_msg("mono n=%d applied delay is early-or-exact and short by at "
+                      "most %d samples (true %d, applied %d)",
+                      n, KD_MAX_UNDERSHOOT, inside, in_range.applied_delay));
+        CHECK(in_range.changed_hops == 1,
+              fmt_msg("mono n=%d reports exactly one alignment generation for a "
+                      "static delay (%d)", n, in_range.changed_hops));
+        CHECK(outside > KD_RELIABLE_SAMPLES(n) && !out_of_range.locked,
+              fmt_msg("mono n=%d does NOT acquire a %d ms bulk delay (beyond its "
+                      "%.2f ms ceiling)", n, outside / 16,
+                      KD_RELIABLE_SAMPLES(n) / 16.0));
+    }
+
+    /* Mislock detectability. Identical construction to the 4ch twin: an
+     * out-of-range dominant path plus an in-range early reflection makes the
+     * estimator lock, with a LOCKED seam state, onto the wrong path. Nothing
+     * in AecLinearContext distinguishes this from a correct lock, so only a
+     * comparison against an independently known delay catches it -- that
+     * comparison is what is asserted. This does not bless the behaviour. */
+    mono_known_delay_run(5, 200, 9271, 0.6f, 512, 0.5f, &mislock);
+    mono_known_delay_run(5, 200, 3536, 0.6f, 512, 0.5f, &control);
+    mislock_error = mislock.locked ? 9271 - mislock.applied_delay : -1;
+    printf("known-delay mislock (mono): dominant 9271 (579.44 ms) + early 512 "
+           "(32.00 ms) -> lock hop %d applied %d (%.2f ms), wrong by %d samples "
+           "(%.2f ms)\n",
+           mislock.lock_hop, mislock.applied_delay, mislock.applied_delay / 16.0,
+           mislock_error, mislock_error / 16.0);
+    CHECK(mislock.locked,
+          "mono: an in-range early path makes an out-of-range bulk delay lock anyway");
+    CHECK(mislock.locked && mislock_error > KD_MAX_UNDERSHOOT,
+          fmt_msg("mono: ground-truth comparison FLAGS the mislock (applied short "
+                  "by %d samples = %.2f ms, far past the %d-sample alignment "
+                  "contract); the LOCKED seam state alone cannot",
+                  mislock_error, mislock_error / 16.0, KD_MAX_UNDERSHOOT));
+    CHECK(control.locked && 3536 - control.applied_delay >= 0 &&
+          3536 - control.applied_delay <= KD_MAX_UNDERSHOOT,
+          fmt_msg("mono control: with the dominant path in range the SAME check "
+                  "stays quiet (applied %d, short by %d)",
+                  control.applied_delay,
+                  control.locked ? 3536 - control.applied_delay : -1));
+
+    /* RAM. Mono has ONE AEC, so the whole per-filter cost lands in its pool
+     * -- this is where the 5,728 B/filter contract is spent per instance. */
+    for (n = 1; n <= 5; n++) {
+        AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
+        cfg.delay_num_filters = n;
+        if (audio_pipeline_ulcnet_get_mem_requirements(&cfg, &req[n]) != 0)
+            mem_ok = 0;
+    }
+    CHECK(mem_ok, "mono pool query answers for every n=1..5");
+    if (mem_ok) {
+        printf("mono pool vs matched-filter bank size (16 kHz, fft 512):\n");
+        for (n = 1; n <= 5; n++) {
+            printf("  n=%d  total %llu", n, (unsigned long long)req[n].bytes);
+            if (n > 1)
+                printf("  (+%lld vs n=%d)",
+                       (long long)req[n].bytes - (long long)req[n - 1].bytes, n - 1);
+            printf("\n");
+        }
+        for (n = 2; n <= 5; n++) {
+            CHECK(req[n].bytes > req[n - 1].bytes,
+                  fmt_msg("mono n=%d costs strictly more than n=%d (%llu > %llu)",
+                          n, n - 1, (unsigned long long)req[n].bytes,
+                          (unsigned long long)req[n - 1].bytes));
+            CHECK((long long)req[n].bytes - (long long)req[n - 1].bytes ==
+                  (long long)req[2].bytes - (long long)req[1].bytes,
+                  fmt_msg("mono n=%d adds the same per-filter cost as every other "
+                          "step (%lld bytes)", n,
+                          (long long)req[n].bytes - (long long)req[n - 1].bytes));
+        }
+    }
+
+    /* Rough per-hop CPU, recorded rather than tuned. One hop is 256 samples =
+     * 16 ms of audio at 16 kHz. Host measurement, liveness guard only. */
+    mono_known_delay_run(5, 400, 3536, 0.6f, 3536, 0.0f, &cost);
+    printf("known-delay cost (mono, n=5): %.1f us/hop, %.4f x real time "
+           "(hop = 16.00 ms of audio)\n",
+           cost.us_per_hop, cost.us_per_hop / 16000.0);
+    CHECK(cost.us_per_hop > 0.0 && cost.us_per_hop < 16000.0,
+          fmt_msg("mono pipeline runs faster than real time on the host "
+                  "(%.1f us/hop vs a 16000 us budget)", cost.us_per_hop));
+}
+
 int main(void) {
     printf("=== audio_pipeline_ulcnet: identity E2E (one-hop latency) ===\n");
     test_identity_e2e();
 
     printf("\n=== audio_pipeline_ulcnet: counting model (stepping + reset policy) ===\n");
     test_counting_model();
+
+    printf("\n=== audio_pipeline_ulcnet: same-delay relock resets the model ===\n");
+    test_relock_same_delay_resets_model();
 
     printf("\n=== audio_pipeline_ulcnet: fail-open + delay gating ===\n");
     test_fail_open_and_delay_gating();
@@ -1218,6 +1552,9 @@ int main(void) {
 
     printf("\n=== audio_pipeline_ulcnet: far-input contract gate (descriptor vs pipeline) ===\n");
     test_far_mode_descriptor_gate();
+
+    printf("\n=== audio_pipeline_ulcnet: known-delay profile (acquisition/coverage/mislock/cost) ===\n");
+    test_known_delay_profile();
 
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);
