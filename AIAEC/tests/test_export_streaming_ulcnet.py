@@ -1,0 +1,228 @@
+"""Explicit delta-state export contract for streaming Align-ULCNet."""
+
+import re
+from pathlib import Path
+
+import numpy as np
+import pytest
+import torch
+
+from AIAEC.Align_ULCNet.export_streaming_onnx import (
+    AlignUlcnetStreamingExport,
+    GRU_HIDDEN,
+    GRU_LAYERS,
+    INPUT_NAMES,
+    MAX_DELAY_DEPTH,
+    MIN_DELAY_DEPTH,
+    OUTPUT_NAMES,
+    SCORE_HISTORY_FRAMES,
+    STATE_LAYOUT_VERSION,
+    TA_BINS,
+    TA_CHANNELS,
+    _write_metadata,
+    dummy_inputs,
+    next_state,
+    state_shapes,
+)
+from AIAEC.Align_ULCNet.model import AlignULCNet
+from AIAEC.aiaec_common import SignalGrid
+from AIAEC.training_common import FAR_INPUT_MODE_C_VALUES
+
+
+GRID = SignalGrid(16000, 512, 512, 256)
+D = 8
+
+
+def _complex_frame(generator):
+    return torch.complex(
+        torch.randn(1, 1, GRID.n_freqs, generator=generator),
+        torch.randn(1, 1, GRID.n_freqs, generator=generator),
+    )
+
+
+def _ri(value):
+    return torch.stack((value.real, value.imag), dim=-1)
+
+
+def test_streaming_export_shapes_are_fixed_and_delta_only():
+    shapes = state_shapes(D)
+    assert shapes['key_history'] == (1, 32, D - 1, 26)
+    assert shapes['value_history'] == (1, 32, D - 1, 26)
+    assert shapes['logit_history'] == (1, 32, 4, D)
+    assert shapes['gru0_hidden'] == (2, 1, 128)
+    assert INPUT_NAMES == (
+        'linear_error_ri', 'far_end_ri', 'key_history', 'value_history',
+        'logit_history', 'gru0_hidden', 'gru1_hidden',
+    )
+    assert OUTPUT_NAMES == (
+        'enhanced_ri', 'key_now', 'value_now', 'logit_now',
+        'gru0_hidden_next', 'gru1_hidden_next',
+    )
+
+
+def test_c_descriptor_constants_match_export_contract():
+    header = (
+        Path(__file__).resolve().parents[1]
+        / 'Align_ULCNet' / 'ulcnet_model_io.h'
+    ).read_text(encoding='utf-8')
+    expected = {
+        'ULCNET_MODEL_IO_LAYOUT_VERSION': STATE_LAYOUT_VERSION,
+        'ULCNET_MODEL_IO_MIN_D': MIN_DELAY_DEPTH,
+        'ULCNET_MODEL_IO_MAX_D': MAX_DELAY_DEPTH,
+        'ULCNET_MODEL_IO_TA_CHANNELS': TA_CHANNELS,
+        'ULCNET_MODEL_IO_TA_BINS': TA_BINS,
+        'ULCNET_MODEL_IO_SCORE_HISTORY': SCORE_HISTORY_FRAMES,
+        'ULCNET_MODEL_IO_GRU_LAYERS': GRU_LAYERS,
+        'ULCNET_MODEL_IO_GRU_HIDDEN': GRU_HIDDEN,
+    }
+    for name, value in expected.items():
+        match = re.search(
+            r'^#define\s+%s\s+(\d+)u?\s*$' % re.escape(name),
+            header,
+            flags=re.MULTILINE,
+        )
+        assert match is not None, name
+        assert int(match.group(1)) == value
+
+    # The far-input enumeration is a two-sided contract: the exporter writes
+    # the numeric value into the metadata, the descriptor carries the same
+    # field, and both pipelines compare them. Pin the enumerators against the
+    # single Python table rather than restating the numbers here.
+    for name, value in FAR_INPUT_MODE_C_VALUES.items():
+        enumerator = 'ULCNET_FAR_' + (
+            'RAW' if name == 'raw_far' else name.replace('_far', '').upper()
+        )
+        match = re.search(
+            r'^\s+%s\s*=\s*(\d+)\s*,?' % re.escape(enumerator),
+            header,
+            flags=re.MULTILINE,
+        )
+        assert match is not None, enumerator
+        assert int(match.group(1)) == value, enumerator
+    assert 'int far_input_mode;' in header
+
+
+def test_metadata_carries_far_input_mode_for_the_c_descriptor(tmp_path):
+    """The exported metadata must name the checkpoint's far contract twice.
+
+    Once as the string a human reads, once as the integer the C descriptor's
+    far_input_mode field holds -- that pair is what lets board init compare
+    ONNX metadata, compiled descriptor and pipeline far mode.
+    """
+    model = AlignULCNet(GRID, max_delay_frames=D).eval()
+    checkpoint = tmp_path / 'ckpt.pt'
+    checkpoint.write_bytes(b'not a real checkpoint, only hashed')
+    inputs = dummy_inputs(D)
+    outputs = AlignUlcnetStreamingExport(model).eval()(*inputs)
+
+    metadata = _write_metadata(
+        str(tmp_path / 'model.onnx'), str(checkpoint), model,
+        {'far_input_mode': 'raw_far'}, inputs, outputs,
+    )
+    assert metadata['far_input_mode'] == 'raw_far'
+    assert metadata['far_input_mode_c_value'] == FAR_INPUT_MODE_C_VALUES[
+        'raw_far'
+    ]
+    assert metadata['state_layout_version'] == STATE_LAYOUT_VERSION
+
+    # A contract with no recorded mode still exports the raw_far default
+    # (legacy checkpoints), and both fields stay consistent.
+    legacy = _write_metadata(
+        str(tmp_path / 'legacy.onnx'), str(checkpoint), model, {},
+        inputs, outputs,
+    )
+    assert legacy['far_input_mode'] == 'raw_far'
+    assert legacy['far_input_mode_c_value'] == 0
+
+
+def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
+    torch.manual_seed(20260816)
+    model = AlignULCNet(GRID, max_delay_frames=D).eval()
+    wrapper = AlignUlcnetStreamingExport(model).eval()
+    explicit = tuple(value.clone() for value in dummy_inputs(D)[2:])
+    reference = model.create_stream_state()
+    generator = torch.Generator().manual_seed(73)
+
+    with torch.no_grad():
+        for _ in range(2 * D + 5):
+            error = _complex_frame(generator)
+            far = _complex_frame(generator)
+            outputs = wrapper(_ri(error), _ri(far), *explicit)
+            expected = model.forward_stream(error, far, reference)
+
+            assert torch.allclose(
+                outputs[0], _ri(expected.enhanced), atol=5e-7, rtol=1e-6
+            )
+            explicit = next_state(explicit, outputs, D)
+
+            align = reference['align']
+            assert torch.equal(
+                explicit[0], align.key_ring._ring[:, :, :D - 1]
+            )
+            assert torch.equal(
+                explicit[1], align.value_ring._ring[:, :, :D - 1]
+            )
+            assert torch.equal(
+                explicit[2], align.score_cell._history
+            )
+            assert torch.equal(
+                explicit[3], reference['subband_gru0']._hidden
+            )
+            assert torch.equal(
+                explicit[4], reference['subband_gru1']._hidden
+            )
+
+
+def test_reset_is_all_zero_external_state():
+    inputs = dummy_inputs(D)
+    for state in inputs[2:]:
+        assert torch.count_nonzero(state) == 0
+
+
+def test_streaming_onnx_runtime_matches_pytorch(tmp_path):
+    onnx = pytest.importorskip('onnx')
+    ort = pytest.importorskip('onnxruntime')
+    depth = 4
+    torch.manual_seed(17)
+    model = AlignULCNet(GRID, max_delay_frames=depth).eval()
+    wrapper = AlignUlcnetStreamingExport(model).eval()
+    initial = dummy_inputs(depth)
+    output_path = tmp_path / 'align_ulcnet_stream.onnx'
+
+    torch.onnx.export(
+        wrapper,
+        initial,
+        str(output_path),
+        input_names=INPUT_NAMES,
+        output_names=OUTPUT_NAMES,
+        opset_version=17,
+        do_constant_folding=True,
+    )
+    graph = onnx.load(str(output_path))
+    onnx.checker.check_model(graph)
+    session = ort.InferenceSession(
+        str(output_path), providers=['CPUExecutionProvider']
+    )
+    assert tuple(item.name for item in session.get_inputs()) == INPUT_NAMES
+    assert tuple(item.name for item in session.get_outputs()) == OUTPUT_NAMES
+
+    state = tuple(value.clone() for value in initial[2:])
+    generator = torch.Generator().manual_seed(23)
+    worst = 0.0
+    with torch.no_grad():
+        for _ in range(2 * depth + 4):
+            current = (
+                torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
+                torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
+            ) + state
+            expected = wrapper(*current)
+            actual = session.run(None, {
+                name: value.numpy()
+                for name, value in zip(INPUT_NAMES, current)
+            })
+            for got, want in zip(actual, expected):
+                worst = max(worst, float(np.max(
+                    np.abs(got - want.numpy())
+                )))
+            state = next_state(state, expected, depth)
+    assert worst <= 3e-4

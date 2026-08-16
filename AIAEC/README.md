@@ -131,14 +131,30 @@ changing weight shapes or retraining; it changes numerical behavior, so use
 the same override for export and calibration and validate it with the delay
 depth sweep before release.
 
+Align-ULCNet additionally has a true stateless-accelerator, one-frame export:
+
+```bash
+python3 AIAEC/Align_ULCNet/export_streaming_onnx.py \
+  --checkpoint /path/to/checkpoint.pth --max-delay-frames 8 \
+  --output output/align_ulcnet_d8_stream.onnx --verify
+```
+
+Its ONNX inputs include CPU-owned K/V history, four score-history frames and
+two temporal-GRU hidden tensors. Outputs contain enhanced RI spectrum and
+only the new K/V/logit entries plus next GRU hidden tensors. CPU storage and
+ring updates are provided by `Align_ULCNet/ulcnet_model_io.c/.h`; no state is
+retained inside the accelerator. See `Align_ULCNet/README.md` for the complete
+CPU/model flowchart and tensor shapes.
+
 The default graph outputs only the learned object consumed by host post
 processing: a real/complex mask, DeepVQE CCM taps, or the three DFN heads.
 `--include-debug-outputs` additionally exposes delay/attention tensors but is
 not intended for production I/O. These six exports are fixed-block graphs:
 recurrent and attention state resets at each invocation. They are suitable
 only when the chosen block/reset policy has been validated; they are not a
-substitute for the one-frame `forward_stream()` reference. GTCRN under
-`AINR/GTCRN` has a separate true one-frame explicit-state exporter.
+substitute for the one-frame `forward_stream()` reference. True one-frame
+explicit-state exporters are the separate Align-ULCNet tool above and GTCRN's
+exporter under `AINR/GTCRN`.
 
 Only three candidates contain ERB maps. Export their checkpoint-exact tables
 with:
@@ -155,7 +171,8 @@ The current mapping is:
 | Model | Accelerator output | Host composition |
 |---|---|---|
 | Align-CRUSE | real mask | `aiaec_apply_real_mask` |
-| Align-ULCNet | compressed-domain complex mask | `aiaec_apply_ulcnet_compressed_mask` |
+| Align-ULCNet fixed-block/debug | compressed-domain complex mask | `aiaec_apply_ulcnet_compressed_mask` |
+| Align-ULCNet one-frame streaming | enhanced RI + delta state | WOLA; `ulcnet_model_io_commit` updates CPU state |
 | CAGCRN / GTCRN-AENR | complex mask | `aiaec_apply_complex_mask` |
 | DeepVQE-S | 3x3 complex CCM taps | `deepvqe_ccm_process` |
 | DeepFilterNet-AENR | ERB mask, DF coefficients, alpha | `dfn_aenr_compose_stream` |
@@ -176,7 +193,7 @@ table.
   per-model views.
 - [`../docs/ai_aec_candidate_matrix.md`](../docs/ai_aec_candidate_matrix.md):
   current selection and deployment rules.
-- [`../pipelines/4ch_pipelines/README.md`](../pipelines/4ch_pipelines/README.md): separate
+- [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md): separate
   conventional four-channel integration boundary.
 
 From the repository root:

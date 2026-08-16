@@ -4,9 +4,11 @@
  * 這個檔案是「網路以外的訊號路徑」。邊界與部署 NPU graph 完全一致:
  *
  *     C   : hop(256 samples) -> centered sqrt-Hann STFT -> RI 頻譜 (兩路:
- *           linear_error / aligned_far)
+ *           linear_error / checkpoint-matched far；current checkpoints use
+ *           raw_far，aligned_far 需另立 checkpoint contract)
  *     網路: (error_ri, far_ri, 顯式 states) -> enhanced_ri  <-- 只有這段是學來的
- *           (壓縮/attention/GRU/解壓縮全部在 graph 內; states 由 runtime 保存)
+ *           (壓縮/attention/GRU/解壓縮全部在 graph 內；states 由 CPU/driver
+ *           context 保存，加速器本身 stateless)
  *     C   : enhanced_ri -> centered WOLA (sqrt-Hann, 50% overlap, 包絡正規化,
  *           半窗 trim) -> hop(256 samples)
  *
@@ -54,7 +56,9 @@
  *   (link: $(make -s -C ../audio_common BACKEND=kiss print-lib-path) -lm)
  *
  * 不包含（porting 時的其他件）:
- *   - NPU graph 與其顯式 states（K/V ring / logit 史 / GRU h）— runtime 保存
+ *   - NPU graph 與其顯式 states（K/V ring / logit 史 / GRU h）—
+ *     加速器視為 stateless；CPU 以 ulcnet_model_io.c/.h 的 caller-owned
+ *     pool 保存並每幀傳入，graph 只回傳 delta-state outputs
  *   - PBFDKF/aligned-far seam — AEC C 的 aec_get_linear_context()
  *   - delay 狀態機（flush ring / fail-open / crossfade）— pipeline 層
  * ============================================================ */
@@ -62,7 +66,13 @@
 #ifndef ULCNET_PROCESS_H
 #define ULCNET_PROCESS_H
 
-#include "fft_wrapper.h"   /* FftHandle, Complex (audio_common) */
+#include "fft_wrapper.h"     /* FftHandle, Complex (audio_common)          */
+#include "ulcnet_model_io.h" /* UlcnetModelIoDescriptor + UlcnetFarInputMode
+                              * -- a stddef/stdint-only leaf header; the
+                              * UlcnetModel boundary below publishes the
+                              * runtime's compiled model-I/O contract by
+                              * pointer, so both pipeline wrappers get the
+                              * far-input enum from ONE definition          */
 
 #ifdef __cplusplus
 extern "C" {
@@ -170,11 +180,14 @@ int ulcnet_synthesis_push(UlcnetSynthesis *st,
 int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]);
 
 /* ---- NPU model callback 邊界（兩個 pipeline 變體共用） ----
- * pipeline 不持有 NPU runtime；推論以每幀一次的 callback 進行，NN 的顯式
- * states（far K/V ring、logit 史、GRU h）由 runtime 自己保存。reset 在
- * delay change / pipeline reset 時被呼叫：runtime 應 flush far attention
- * ring 與 logit 史（GRU hidden 的去留是 runtime 自己的 A/B 決策），可為
- * NULL。infer 回傳 0 表成功；非 0 時 pipeline 以 fail-open 輸出線性誤差。
+ * pipeline 不持有 NPU runtime；推論以每幀一次的 callback 進行。
+ * 加速器本身不保存 state；NN 的 far K/V ring、logit 史、GRU h
+ * 是 CPU/driver context 的 external state，建議使用 ulcnet_model_io.c/.h
+ * 準備 ONNX inputs 並提交 delta-state outputs。reset 在 delay change /
+ * pipeline reset 時被呼叫；目前 production contract 清空 K/V、logit 與
+ * 兩組 GRU hidden，日後若只清 attention state 必須另做 A/B 並版本化。
+ * reset callback 可為 NULL。infer 回傳 0 表成功；非 0 時 pipeline 以
+ * fail-open 輸出線性誤差。
  *
  * FULL-WRITE CONTRACT: a return of 0 REQUIRES that infer wrote ALL
  * ULCNET_BINS entries of BOTH out_re and out_im. The pipelines enforce
@@ -182,7 +195,19 @@ int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]);
  * infer call, so a partial write leaves non-finite bins behind and is
  * caught by the pipelines' finite-output guard, which falls open to the
  * identity (error passthrough) path -- a partially-written frame is never
- * applied and can never leak stale values from a previous frame. */
+ * applied and can never leak stale values from a previous frame.
+ *
+ * MODEL-CONTRACT PUBLICATION (io_descriptor): a runtime that owns a
+ * ulcnet_model_io state publishes its descriptor here (the accelerator
+ * adapter does this automatically), which is what lets a pipeline reject a
+ * checkpoint whose far_input_mode disagrees with its own far branch instead
+ * of silently feeding the model the wrong input distribution. NULL -- the
+ * memset-zero case, and every runtime that predates the field -- means "no
+ * contract published": the pipelines then keep their previous behaviour and
+ * apply no far-mode gate, because with no checkpoint behind the callback
+ * there is nothing to disagree with. The pointed-at descriptor must outlive
+ * every pipeline the model is installed into; the pipelines copy the
+ * UlcnetModel struct but never the descriptor. */
 typedef struct UlcnetModel {
     void *user;
     int (*infer)(void *user,
@@ -190,6 +215,7 @@ typedef struct UlcnetModel {
                  const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
                  float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]);
     void (*reset)(void *user);
+    const UlcnetModelIoDescriptor *io_descriptor;  /* NULL = not published */
 } UlcnetModel;
 
 /* ---- 可選: 壓縮/解壓縮 helper ----

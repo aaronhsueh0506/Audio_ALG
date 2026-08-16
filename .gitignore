@@ -64,13 +64,12 @@ lib/hpf/obj/
 pipelines/obj/
 pipelines/bin/
 
-# Same hash-keyed obj/bin scheme, 4ch_pipelines' own Makefile + its
-# third_party/ sub-Makefile (2026-08-03: these were missing and showing up
-# in `git status`, flagged by review).
-pipelines/4ch_pipelines/obj/
-pipelines/4ch_pipelines/bin/
-pipelines/4ch_pipelines/third_party/obj/
-pipelines/4ch_pipelines/third_party/bin/
+# Same hash-keyed obj/bin scheme for the conventional 4-channel package and
+# its spatial-component sub-Makefile.
+pipelines/4ch_aec_bf_nr_res/obj/
+pipelines/4ch_aec_bf_nr_res/bin/
+pipelines/4ch_aec_bf_nr_res/third_party/obj/
+pipelines/4ch_aec_bf_nr_res/third_party/bin/
 
 # pytest's own cache (it writes a .gitignore inside, but be explicit)
 .pytest_cache/

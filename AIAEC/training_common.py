@@ -101,6 +101,8 @@ __all__ = [
     'build_plain_loaders',
     'read_model_kwargs',
     'FAR_INPUT_MODES',
+    'FAR_INPUT_MODE_C_VALUES',
+    'far_input_mode_c_value',
     'checkpoint_far_input_mode',
     'make_checkpoint_contract',
     'require_checkpoint_contract',
@@ -369,6 +371,26 @@ def read_model_kwargs(cfg, model_cls, section: str = 'model',
 # checkpoint contract so a checkpoint trained on a future preprocessed far
 # variant cannot be loaded into a seam that feeds raw far.
 FAR_INPUT_MODES = ('raw_far',)
+
+# The C-side UlcnetFarInputMode enumeration (AIAEC/Align_ULCNet/
+# ulcnet_model_io.h), which is what a board compares against: the exporter
+# writes the numeric value beside the string so no integrator has to keep a
+# second copy of this table. It deliberately spans MORE modes than
+# FAR_INPUT_MODES above: FAR_INPUT_MODES is what this training seam can
+# produce today, while this is the full C ABI enumeration, so an
+# 'aligned_far' checkpoint would still map to a defined descriptor value
+# rather than to an unnamed integer.
+FAR_INPUT_MODE_C_VALUES = {'raw_far': 0, 'aligned_far': 1}
+
+
+def far_input_mode_c_value(mode: str) -> int:
+    """Map a far-input mode name to its C ``UlcnetFarInputMode`` value."""
+    if mode not in FAR_INPUT_MODE_C_VALUES:
+        raise ValueError(
+            f"far_input_mode={mode!r} has no C enum value "
+            f"(known: {', '.join(sorted(FAR_INPUT_MODE_C_VALUES))})"
+        )
+    return FAR_INPUT_MODE_C_VALUES[mode]
 
 
 def checkpoint_far_input_mode(contract: Dict) -> str:

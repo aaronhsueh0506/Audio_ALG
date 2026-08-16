@@ -68,3 +68,157 @@ uninformative softmax baseline `1/D`: a boundary value near that baseline may
 only mean that attention is diffuse, whereas a trained head repeatedly
 concentrating at the oldest slot suggests D is too small.  Listen to every
 generated WAV and validate task metrics before fixing D in an ONNX export.
+
+## Stateless accelerator deployment
+
+The accelerator is assumed to retain no state between invocations.  CPU/DSP
+code owns every K/V, score-convolution and GRU tensor in caller-provided
+memory.  Align-ULCNet is a postfilter, so microphone PCM first enters the
+linear AEC; the learned graph consumes `linear_error`, not raw microphone.
+
+```mermaid
+flowchart LR
+    subgraph CPU["CPU / DSP / external SRAM"]
+        MIC["mic PCM hop"]
+        FAR["far PCM hop"]
+        AEC["Matched filter + PBFDKF"]
+        ERR["linear_error"]
+        AFAR["aligned_far"]
+        MODE{"current raw_far / future aligned_far"}
+        STFT["two sqrt-Hann STFTs<br/>512 / 256"]
+        ERRI["linear_error_ri<br/>[1,1,257,2]"]
+        FARRI["far_end_ri<br/>[1,1,257,2]"]
+        STATE["external state inputs<br/>K/V history + logit history<br/>two GRU hidden tensors"]
+        UPDATE["CPU ring update<br/>push K_now/V_now/logit_now<br/>hidden = hidden_next"]
+        WOLA["WOLA / IFFT"]
+        OUT["enhanced PCM hop"]
+        MIC --> AEC
+        FAR --> AEC
+        AEC --> ERR --> STFT
+        AEC --> AFAR --> MODE
+        FAR --> MODE --> STFT
+        STFT --> ERRI
+        STFT --> FARRI
+        UPDATE --> STATE
+        WOLA --> OUT
+    end
+
+    subgraph NPU["Stateless model accelerator: T=1"]
+        ENC["signed power + encoders"]
+        QKV["Q_now / K_now / V_now"]
+        TA["TA over current + history<br/>score conv + softmax"]
+        BODY["joint conv + FGRU<br/>temporal GRUs"]
+        MASK["mask + composition<br/>signed expansion"]
+        ENH["enhanced_ri<br/>[1,1,257,2]"]
+        DELTA["delta state outputs<br/>K_now / V_now / logit_now<br/>gru0_next / gru1_next"]
+        ENC --> QKV --> TA --> BODY --> MASK --> ENH
+        QKV --> DELTA
+        TA --> DELTA
+        BODY --> DELTA
+    end
+
+    ERRI --> ENC
+    FARRI --> ENC
+    STATE --> TA
+    STATE --> BODY
+    ENH --> WOLA
+    DELTA --> UPDATE
+```
+
+The production graph is fixed to `batch=1`, `T=1`, real/imaginary in the last
+dimension. `D` is fixed at export time; D=4 and D=8 are different ONNX tensor
+contracts even though their weight shapes are identical. The portable ABI
+accepts `2 <= D <= 64`; D=1 would create zero-length history inputs, which are
+not portable across target runtimes and is therefore evaluation-only.
+
+Inputs per invocation:
+
+| tensor | float32 shape | ordering |
+|---|---:|---|
+| `linear_error_ri` | `[1,1,257,2]` | real/imag last |
+| `far_end_ri` | `[1,1,257,2]` | checkpoint far-input contract; current checkpoints are `raw_far` |
+| `key_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
+| `value_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
+| `logit_history` | `[1,32,4,D]` | chronological, t-4 through t-1 |
+| `gru0_hidden` | `[2,1,128]` | layer first |
+| `gru1_hidden` | `[2,1,128]` | layer first |
+
+Outputs per invocation:
+
+| tensor | float32 shape | CPU action |
+|---|---:|---|
+| `enhanced_ri` | `[1,1,257,2]` | send to WOLA/IFFT |
+| `key_now` | `[1,32,1,26]` | push into key history |
+| `value_now` | `[1,32,1,26]` | push into value history |
+| `logit_now` | `[1,32,1,D]` | append to four-frame logit history |
+| `gru0_hidden_next` | `[2,1,128]` | replace GRU-0 hidden |
+| `gru1_hidden_next` | `[2,1,128]` | replace GRU-1 hidden |
+
+This delta-state boundary avoids returning the complete K/V rings every 16 ms.
+The graph uses `K_now`/`V_now` immediately and also exposes them as outputs;
+the CPU incorporates them into the next invocation's histories.  `query_now`
+is not state and is not returned.  Delay distribution is debug-only and is
+not part of the production ABI.
+
+The generic C helper exposes each history as one contiguous tensor, so its
+logical ring update is implemented as a shift plus insertion. It avoids NPU
+round-trips of the complete history, but it is not an O(1) circular-buffer
+claim. A board runtime with scatter/gather or circular tensor views may replace
+that internal copy while preserving the same ordering and public tensor ABI.
+
+The board adapter uses the C boundary in this order (error paths fail open and
+must not call `commit` with incomplete accelerator outputs):
+
+```c
+UlcnetModelIoDescriptor desc;
+UlcnetModelIoMemReq req;
+UlcnetModelIoInputs in;
+UlcnetModelIoOutputs out;
+UlcnetModelIoState *state;
+void *pool;  /* board static arena address, assigned after the size query */
+
+ulcnet_model_io_descriptor_default(8, &desc);
+ulcnet_model_io_get_mem_requirements(&desc, &req);
+/* Assign pool to req.bytes at req.alignment in the board's static arena. */
+state = ulcnet_model_io_init(pool, req.bytes, &desc);
+
+ulcnet_model_io_prepare(state, err_re, err_im, far_re, far_im, &in, &out);
+/* Bind in.* and out.* to the accelerator tensors in the table above. */
+if (run_accelerator(&in, &out) == 0 &&
+    ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0) {
+    /* enhanced_re/im may now be sent to ulcnet_synthesis_push(). */
+} else {
+    /* Output the linear-error hop; persistent model state was not advanced. */
+}
+```
+
+Export a true one-frame graph with:
+
+```bash
+python3 export_streaming_onnx.py \
+  --checkpoint checkpoint.pth \
+  --max-delay-frames 8 \
+  --output output/align_ulcnet_d8_stream.onnx \
+  --verify
+```
+
+The exporter writes a sibling JSON descriptor containing the exact grid,
+state layout version, D, far-input mode and tensor schemas.  The older shared
+`AIAEC/export_onnx.py` remains a fixed-block/offline export and must not be
+used as a one-frame deployment graph.
+
+CPU state storage and ring updates are implemented by
+`ulcnet_model_io.c/.h`.  They use one caller-owned pool, allocate RAM according
+to D, prefill accelerator outputs with NaNs to detect partial writes, and leave
+the prior state unchanged if commit validation fails.  The queried pool size
+includes persistent history plus RI input/output and delta-output staging; the
+smaller persistent-state figure alone is not a sufficient allocation.
+`ulcnet_process.c/.h`
+continues to own only STFT/WOLA and the high-level model callback.  Vendor NPU
+drivers and mono/4ch pipeline wiring are intentionally outside this model-side
+deliverable.
+
+`ulcnet_accelerator_adapter.c/.h` is the reusable bridge from this explicit
+state ABI to `UlcnetModel`. It is included in
+`AIAEC/build/libaiaec_prepost.a`; the mono and four-channel applications add
+only their board runtime callback and surrounding audio flow.

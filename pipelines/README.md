@@ -36,9 +36,10 @@ instance.
 | AEC | libaec.a | aec.h | PBFDKF adaptive filter + shadow filter |
 | NR | libmmse_lsa.a | mmse_lsa_denoiser.h | MMSE-LSA + MCRA noise est + SPP |
 | RES | libaec.a (included) | aec.h (`AecResContext`) | Residual echo suppression, folded into AEC's freq-domain seam |
-| Mono integration | libaudio_pipeline.a | audio_pipeline.h | One-mic AEC + NR/RES, heap or caller-owned pool |
-| 4-ch integration | 4ch_pipelines/libaudio_pipeline_4ch.a | 4ch_pipelines/4aec_nr_res.h | One shared matcher + four linear AECs + external beamformer weights + one mono NR/RES |
-| Complete 4-ch spatial | 4ch_pipelines/libaudio_pipeline_4ch.a | 4ch_pipelines/audio_pipeline_4ch.h | Same 4-ch core + reusable SRP-PHAT/GSC libraries on the selected shared grid |
+| Mono integration | libaudio_pipeline.a | mono_aec_nr_res/audio_pipeline.h | One-mic AEC + NR/RES, heap or caller-owned pool |
+| 4-ch linear core | libaudio_pipeline_4ch.a | 4ch_aec_bf_nr_res/4aec_nr_res.h | One shared aligner + four linear AECs; the archive contains only this core |
+| Complete 4-ch spatial | application object | 4ch_aec_bf_nr_res/audio_pipeline_4ch.h | Core + reusable SRP-PHAT/GSC/NR libraries; linked into the application, not another archive |
+| Mono/4-ch Align-ULCNet | application objects | mono_alignulcnet/audio_pipeline_ulcnet.h and 4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h | Existing component libraries + C pre/post + external accelerator callback |
 
 RES is not a standalone module/library — it is exposed as the `AecResContext` seam on
 the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process_context()`
@@ -56,12 +57,31 @@ downstream reads it. See `lib/aec/c_impl/include/aec.h` (`AecResContext`,
 `aec_get_res_context()`, `aec_process_context()`) for the full field list.
 
 The four-channel API is a separate zero-padding-free grid and does not use
-`AudioPipeline`. See [the 4-channel contract](4ch_pipelines/README.md) and
-[`4ch_pipelines/4aec_nr_res.h`](4ch_pipelines/4aec_nr_res.h) for its synchronous
+`AudioPipeline`. See [the 4-channel contract](4ch_aec_bf_nr_res/README.md) and
+[`4ch_aec_bf_nr_res/4aec_nr_res.h`](4ch_aec_bf_nr_res/4aec_nr_res.h) for its synchronous
 pre/post boundary.
 
-Release source is kept at this directory's top level. C/Python regressions are
-under `tests/`; offline scoring and benchmark drivers are under `tools/`.
+The directory root contains only the aggregate build, documentation,
+requirements and the public Python reference module. C sources live with
+their applications. Shared ULCNet model-I/O support is owned by
+`../AIAEC/Align_ULCNet/`; offline scoring and benchmark drivers remain under
+`tools/`.
+
+## Application layout
+
+The four product flows are applications that assemble existing components;
+they are not four additional libraries:
+
+| Application | Entry directory | Composition |
+|---|---|---|
+| Mono AEC + NR/RES | `mono_aec_nr_res/` | `audio_pipeline` + AEC + NR + audio_common |
+| 4-ch AEC + BF + NR/RES | `4ch_aec_bf_nr_res/` | 4-lane core + DOA/GSC + NR + audio_common |
+| Mono Align-ULCNet | `mono_alignulcnet/` | mono ULCNet wrapper + AEC + AIAEC pre/post |
+| 4-ch Align-ULCNet | `4ch_alignulcnet/` | pre-only 4-lane core + DOA/GSC + AIAEC pre/post |
+
+The ULCNet applications use `../AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.*`: CPU memory owns
+K/V, logit and GRU state, while the board implements one stateless tensor
+invocation callback. An absent/failing accelerator is fail-open.
 
 ## Parameter Alignment
 
@@ -83,38 +103,40 @@ selectable grids; the others have exactly one:
 
 | 項目 | 數值 | 說明 |
 |------|------|------|
-| **Algorithmic latency** | 1 hop — varies by grid: 16 ms @ 8 kHz, 8 ms @ 16 kHz (default) / 16 ms @ 16 kHz (alt grid), ~10.7 ms @ 48 kHz | 不再是所有 sample rate 統一的 10 ms（見上表 hop_size） |
-| **NR OLA delay** | +1 hop | NR frame 處理引入額外 1 hop 延遲,與 AEC hop 同步縮放 |
-| **Pipeline total latency** | 2 hops | AEC hop + NR OLA delay |
+| **AEC linear path** | 0 samples | PBFDKF overlap-save 的當前 hop 線性誤差可立即取得 |
+| **Synthesis WOLA delay** | 1 hop | NR/RES 頻譜由 sqrt-Hann WOLA 重建；這就是 full-chain 的演算法延遲 |
+| **Pipeline total latency** | 1 hop — 16 ms @ 8 kHz, 8 ms @ 16 kHz default, 16 ms @ 16 kHz alt, ~10.7 ms @ 48 kHz | 不再額外保存上一個 AEC context；AEC-only 為 0 samples |
 | **Processing (per hop)** | < 0.5 ms | AEC + NR + RES 合計(ARM Cortex-A53 @ 1GHz 估計) |
 | **RTF** | < 0.05 | 遠低於即時要求 |
 
 ### Memory Budget
 
-Measured figures from `./aec_nr_pipeline_static --print-mem-size --sample-rate 16000`
+Measured figures from `"$(make -s print-bin-dir)"/aec_nr_pipeline_static --print-mem-size --sample-rate 16000`
 (balanced presets). The AEC row is the composite `aec_get_mem_size()` pool — it
 already contains HPF, PBFDKF ×2 (main+shadow), delay estimator, the RES/post
 context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
 twiddle configs are carved from these pools too, so both columns are the
 complete memory requirement (strict init→destroy zero-heap on both backends):
 
-Re-measured 2026-08-05 after shared-FFT/context cleanup via
-`./aec_nr_pipeline_static --print-mem-size balanced
---sample-rate <sr> [--fft-size <alt>]` on both backends, against the current
-grid (16 kHz default is now 256/128, not the 512/256 these numbers used to
-assume — see "Parameter Alignment" above). 16 kHz's alternate 512/256 grid is
-included since it remains explicitly selectable:
+Re-measured 2026-08-16 after the delay-mode productization (layout_version=6:
+`AudioPipelineConfig` gained `filter_length`/`delay_mode`/`delay_num_filters`/
+`fixed_delay_samples`; defaults reproduce the pre-v6 byte-for-byte behavior)
+via `"$(make -s print-bin-dir)"/aec_nr_pipeline_static --print-mem-size
+balanced --sample-rate <sr> [--fft-size <alt>]` on both backends, against the
+current grid (16 kHz default is 256/128 — see "Parameter Alignment" above).
+16 kHz's alternate 512/256 grid is included since it remains explicitly
+selectable:
 
 | Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |--------|-----|-----------|-----|---------------|-----------|
-| **8 kHz KISS** | 276,928 B | 8,784 B | 67,424 B | 5,696 B | **358,992 B (350.6 KB)** |
-| **8 kHz NE10** | 276,320 B | 8,176 B | 67,424 B | 5,696 B | **357,776 B (349.4 KB)** |
-| **16 kHz KISS (default, 256/128)** | 381,008 B | 8,784 B | 122,160 B | 5,696 B | **517,808 B (505.7 KB)** |
-| **16 kHz NE10 (default, 256/128)** | 380,400 B | 8,176 B | 122,160 B | 5,696 B | **516,592 B (504.5 KB)** |
-| **16 kHz KISS (alt, 512/256)** | 510,080 B | 16,976 B | 133,472 B | 11,328 B | **672,016 B (656.3 KB)** |
-| **16 kHz NE10 (alt, 512/256)** | 508,704 B | 15,600 B | 133,472 B | 11,328 B | **669,264 B (653.6 KB)** |
-| **48 kHz KISS** | 1,166,928 B | 33,360 B | 374,336 B | 22,592 B | **1,597,376 B (1,560.0 KB)** |
-| **48 kHz NE10** | 1,164,016 B | 30,448 B | 374,336 B | 22,592 B | **1,591,552 B (1,554.2 KB)** |
+| **8 kHz KISS** | 275,632 B | 8,784 B | 67,424 B | 5,696 B | **357,696 B (349.3 KB)** |
+| **8 kHz NE10** | 275,024 B | 8,176 B | 67,424 B | 5,696 B | **356,480 B (348.1 KB)** |
+| **16 kHz KISS (default, 256/128)** | 379,712 B | 8,784 B | 122,160 B | 5,696 B | **516,512 B (504.4 KB)** |
+| **16 kHz NE10 (default, 256/128)** | 379,104 B | 8,176 B | 122,160 B | 5,696 B | **515,296 B (503.2 KB)** |
+| **16 kHz KISS (alt, 512/256)** | 508,784 B | 16,976 B | 133,472 B | 11,328 B | **670,720 B (655.0 KB)** |
+| **16 kHz NE10 (alt, 512/256)** | 507,408 B | 15,600 B | 133,472 B | 11,328 B | **667,968 B (652.3 KB)** |
+| **48 kHz KISS** | 1,167,008 B | 33,360 B | 374,336 B | 22,592 B | **1,597,456 B (1,560.0 KB)** |
+| **48 kHz NE10** | 1,164,096 B | 30,448 B | 374,336 B | 22,592 B | **1,591,632 B (1,554.3 KB)** |
 
 The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW.md` §4 — re-measure from
 there rather than editing it here, and always prefer the value
@@ -157,16 +179,18 @@ removed). Multiplying by the NR gain corrects for this.
 
 ## NR OLA Delay
 
-NR uses OLA, introducing exactly one hop of pipeline latency (e.g. 8 ms at
-the 16 kHz default 256/128 grid; see the "Static-memory" table above for the
-grid actually in effect). The pipeline saves the previous AEC context and
-uses it when the corresponding NR output becomes available.
+The final sqrt-Hann WOLA introduces exactly one hop of full-chain latency
+(e.g. 8 ms at the 16 kHz default 256/128 grid). NR gain and the matching AEC
+context are computed and applied in the same processing call; the pipeline
+does not retain the previous AEC context. The overlap state delays only the
+time-domain emission. The AEC-only overlap-save path remains zero-sample
+latency.
 
 ## Build
 
 ```bash
-# From Audio_ALG/pipelines/ — builds the submodule libs + BOTH binaries
-make                # libs (BACKEND=kiss) + aec_nr_pipeline + aec_nr_pipeline_static
+# From Audio_ALG/pipelines/ — builds component libs and mono applications
+make                # aec_nr_pipeline, static variant and mono_alignulcnet
 make SIMD=0         # one switch: mono pipeline + AEC + NR + audio_common all scalar
 
 # Binaries land in a config-keyed directory:
@@ -191,18 +215,20 @@ BIN="$(make -s print-bin-dir)"
 # audio_pipeline_init_ex()'s `expected` descriptor gate (tampered
 # descriptor_version/layout_version/backend_id/build_flags_hash/alignment/
 # bytes each rejected) — each per-rate case runs once per supported rate
-# (8000/16000/48000; 48 kHz uses a reduced hop count, see tests/test_audio_pipeline.c)
+# (8000/16000/48000; 48 kHz uses a reduced hop count, see
+# mono_aec_nr_res/tests/test_audio_pipeline.c)
 # — AND builds + runs the example_board_adapter smoke test (see "Board
 # Integration" below). Four-channel tests are intentionally isolated in
-# 4ch_pipelines/Makefile.
+# 4ch_aec_bf_nr_res/Makefile.
 make test
 
-# Build/test the independent four-channel producer.
-make -C 4ch_pipelines libaudio_pipeline_4ch.a
-make -C 4ch_pipelines SIMD=0 test  # includes DOA/GSC/spatial scalar fallback
-make -C 4ch_pipelines 4aec_nr_res_static
-make -C 4ch_pipelines audio_pipeline_4ch_raw
-make -C 4ch_pipelines test
+# Build/test the four application packages.
+make -C mono_aec_nr_res SIMD=0 test
+make -C mono_alignulcnet SIMD=0 test
+make -C 4ch_aec_bf_nr_res SIMD=0 test
+make -C 4ch_alignulcnet SIMD=0 test
+make -C 4ch_aec_bf_nr_res 4aec_nr_res_static
+make -C 4ch_aec_bf_nr_res audio_pipeline_4ch_raw
 
 # Build + run JUST the REFERENCE ONLY board-adapter example standalone
 # (also runs as part of `make test` above):
@@ -214,17 +240,18 @@ make NO_STDIO=1 libaudio_pipeline.a
 make audit-no-stdio
 ```
 
-`make` builds the mono executables and `libaudio_pipeline.a` only.
+`make` builds the mono executables and the existing `libaudio_pipeline.a`.
 `libaudio_pipeline.a` is the pool-sizing/carving/processing library that both
 mono CLIs wrap; see "Board Integration" below for its firmware API,
 `NO_STDIO=1` knob, and `audit-no-stdio` target. The independent
-`4ch_pipelines/libaudio_pipeline_4ch.a` follows the
-same pool-first pattern: `four_aec_nr_res_create()` is the heap convenience
+`4ch_aec_bf_nr_res/libaudio_pipeline_4ch.a` contains only the shared linear core.
+The standard and ULCNet 4-ch applications link their wrapper objects directly
+with that core and the existing algorithm libraries. `four_aec_nr_res_create()` is the heap convenience
 path, while `four_aec_nr_res_get_mem_requirements()` +
 `four_aec_nr_res_init_ex()` place the complete four-AEC/NR/FFT/shared-wrapper
 state in one caller-owned 16-byte-aligned pool. Both construction paths share
 the same allocation-free pre/post processing core and are byte-parity tested
-at 16 and 48 kHz. See [`4ch_pipelines/README.md`](4ch_pipelines/README.md) and
+at 16 and 48 kHz. See [`4ch_aec_bf_nr_res/README.md`](4ch_aec_bf_nr_res/README.md) and
 `4aec_nr_res_static` for the directly comparable board sequence.
 
 ## Debugging & Performance Flags
@@ -285,11 +312,11 @@ resume paths.
 
 ## Two Versions
 
-### Version A: malloc (`aec_nr_pipeline.c`)
+### Version A: malloc (`mono_aec_nr_res/main.c`)
 Each module uses `_create()` / `_destroy()` and manages its own memory internally.
 Suitable for desktop testing and Linux servers.
 
-### Version B: static memory (`aec_nr_pipeline_static.c`)
+### Version B: static memory (`mono_aec_nr_res/static_main.c`)
 
 Built by default alongside Version A (both `lib/aec` and `lib/nr` track
 `main` — each library ships the heap and static APIs side by side,
@@ -308,13 +335,14 @@ audio path.
 
 The pool-sizing/carving/per-hop-processing logic both CLIs above embed is also
 available as a standalone, linkable library —
-[`audio_pipeline.h`](audio_pipeline.h) / [`audio_pipeline.c`](audio_pipeline.c),
+[`audio_pipeline.h`](mono_aec_nr_res/audio_pipeline.h) /
+[`audio_pipeline.c`](mono_aec_nr_res/audio_pipeline.c),
 built into `libaudio_pipeline.a`. A board's own memory manager consumes this
-directly instead of copying `aec_nr_pipeline_static.c`'s file-local carve code
+directly instead of copying `mono_aec_nr_res/static_main.c`'s file-local carve code
 into firmware; both CLIs are thin shells over it (arg parsing + WAV I/O + the
 `--print-mem-size`/`--debug`/`DUMP_CTX` diagnostics).
 
-[`example_board_adapter.c`](example_board_adapter.c) is a compilable, runnable
+[`example_board_adapter.c`](mono_aec_nr_res/example_board_adapter.c) is a compilable, runnable
 HOST SIMULATION of that sequence (`make example-adapter`, also wired into
 `make test`). **It does NOT replace production board integration and sign-off**
 — every `board_mem_*` function in it is a plain host-array stand-in, marked
@@ -352,7 +380,7 @@ differ in exactly one field:
 
 **Modes**: `MMSE_LSA_NR_MILD` / `MMSE_LSA_NR_MODERATE` / `MMSE_LSA_NR_BALANCED`（default）/ `MMSE_LSA_NR_AGGRESSIVE`
 
-> These are the library's mode enum, not this pipeline's CLI surface. `aec_nr_pipeline.c`'s
+> These are the library's mode enum, not this pipeline's CLI surface. `mono_aec_nr_res/main.c`'s
 > `parse_nr_mode()` only recognizes `"mild"` / `"aggressive"` (anything else, including
 > `"moderate"`, silently falls back to `MMSE_LSA_NR_BALANCED` — no error); the Python
 > `aec_nr_pipeline.py` CLI likewise restricts `--nr-preset` to `choices=['mild', 'balanced',
