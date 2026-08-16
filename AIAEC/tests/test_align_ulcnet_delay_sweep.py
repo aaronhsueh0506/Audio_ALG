@@ -6,13 +6,21 @@ import torch
 
 from AIAEC.Align_ULCNet import AlignULCNet
 from AIAEC.Align_ULCNet.sweep_delay_depth import (
+    QA_MAX_HEADROOM_MS,
     _alignment_summary,
     _delay_summary,
     _write_alignment_trace,
+    alignment_qa,
+    build_parser,
+    check_argument_conflicts,
+    measure_offline_bulk_delay,
+    parse_delay_num_filters,
     parse_depths,
+    resolve_delay_num_filters,
     run_streaming_frames,
 )
 from AIAEC.aiaec_common import SignalGrid
+from AIAEC.dataset_gen.linear_aec import DATASET_DELAY_NUM_FILTERS
 from AIAEC.dataset_gen.measure_align_residual import EngineRun
 
 
@@ -91,6 +99,138 @@ def test_alignment_trace_reports_applied_delay_and_acquisition(tmp_path):
     assert rows[0].startswith('hop,time_ms,applied_delay_samples')
     assert rows[1].split(',')[2:] == ['-1', 'nan', '0.000000000', '0']
     assert rows[-1].split(',')[1:4] == ['64.000000', '8000', '500.000000']
+
+
+def test_parse_delay_num_filters_enforces_the_bank_range():
+    assert [parse_delay_num_filters(str(n)) for n in (1, 3, 5)] == [1, 3, 5]
+    for bad in ('0', '6', '-1', 'five', ''):
+        with pytest.raises(argparse.ArgumentTypeError):
+            parse_delay_num_filters(bad)
+
+
+def test_delay_num_filters_defaults_to_the_corpus_bank_size():
+    """An unflagged run must reproduce the frontend the corpus was made with.
+
+    The parsed default stays ``None`` rather than the number itself: the tool
+    has to be able to tell "did not ask" from "asked for 5" so that combining
+    the flag with the PBFDKF bypass can be refused, and the resolution to the
+    corpus size happens afterwards.
+    """
+    args = build_parser().parse_args(['c.pth', 'm.wav', 'f.wav', 'out'])
+    assert args.delay_num_filters is None
+    assert resolve_delay_num_filters(None) == DATASET_DELAY_NUM_FILTERS
+    assert resolve_delay_num_filters(2) == 2
+    # Programmatic (non-argparse) callers get the validator's own ValueError;
+    # only the argparse `type=` adapter re-dresses it as ArgumentTypeError.
+    with pytest.raises(ValueError):
+        resolve_delay_num_filters(6)
+
+
+def test_bank_size_override_is_refused_with_the_pbfdkf_bypass():
+    """--input-is-linear-error has no bank to size, so the pair must fail fast.
+
+    Both flags parse -- the conflict is between two individually valid ones --
+    so it is checked before anything is loaded, and asserted here through the
+    same entry ``main`` calls first.
+    """
+    parser = build_parser()
+
+    conflicting = parser.parse_args([
+        'c.pth', 'm.wav', 'f.wav', 'out',
+        '--input-is-linear-error', '--delay-num-filters', '2',
+    ])
+    with pytest.raises(ValueError, match='delay-num-filters'):
+        check_argument_conflicts(conflicting)
+
+    # Either flag alone is legitimate, so the check must not reject them.
+    for argv in (
+        ['--input-is-linear-error'],
+        ['--delay-num-filters', '2'],
+        [],
+    ):
+        check_argument_conflicts(
+            parser.parse_args(['c.pth', 'm.wav', 'f.wav', 'out'] + argv)
+        )
+
+
+def test_offline_bulk_delay_recovers_a_known_delay_without_the_estimator():
+    rng = np.random.default_rng(5)
+    sample_rate = 16000
+    far = (0.2 * rng.standard_normal(6 * sample_rate)).astype(np.float32)
+    delay = 1600
+    mic = np.zeros_like(far)
+    mic[delay:] = 0.5 * far[:-delay]
+
+    measured = measure_offline_bulk_delay(
+        mic, far, sample_rate, max_lag=8192,
+    )
+    assert measured.bulk_delay_samples == delay
+    assert measured.n_boundary_peak == 0
+    assert measured.n_windows >= 2
+
+
+def _engine_run_with_applied_delay(applied: int, aligned_lead: int):
+    """A synthetic EngineRun whose aligned far leads the echo by a known lag."""
+    rng = np.random.default_rng(9)
+    sample_rate, hop = 16000, 256
+    n = 6 * sample_rate
+    far = (0.2 * rng.standard_normal(n)).astype(np.float32)
+    echo = np.zeros_like(far)
+    echo[aligned_lead:] = 0.5 * far[:n - aligned_lead]
+    return EngineRun(
+        sample_rate=sample_rate,
+        hop_size=hop,
+        error=np.zeros(n, dtype=np.float32),
+        echo_estimate=echo,
+        aligned_far=far,
+        delay_samples=np.full(n // hop, applied, dtype=np.int64),
+        confidence=np.ones(n // hop, dtype=np.float64),
+    ), far, echo
+
+
+def test_alignment_qa_accepts_a_delay_that_agrees_with_the_offline_truth():
+    true_delay = 1600
+    run, far, echo = _engine_run_with_applied_delay(
+        applied=true_delay - 64, aligned_lead=64,
+    )
+    # The mic the offline measurement sees is the echo delayed by the bulk
+    # delay the estimator claims to have removed.
+    mic = np.zeros_like(far)
+    mic[true_delay - 64:] = echo[:far.size - (true_delay - 64)]
+
+    qa = alignment_qa(run, mic, far, max_lag=8192)
+    assert qa['qa_status'] == 'ok', qa
+    assert qa['qa_valid'] is True
+    assert 0.0 < qa['qa_residual_p50_ms'] < 10.0
+    assert abs(qa['qa_applied_vs_offline_ms']) <= QA_MAX_HEADROOM_MS
+
+
+def test_alignment_qa_marks_a_confidently_wrong_delay_invalid():
+    """The gate must reject a lock the raw signals contradict.
+
+    Same clip as above, but the estimator reports a delay far from the one the
+    raw correlation measures -- the shape of the mis-lock this QA exists to
+    keep out of a delay-profile statistic. Both directions are checked: a
+    reference left too early (a large positive residual the model's attention
+    could not span) and one pushed too late (a negative residual no causal
+    filter can explain).
+    """
+    true_delay = 1600
+    offline = None
+    for applied in (200, true_delay + 1600):
+        run, far, echo = _engine_run_with_applied_delay(
+            applied=applied, aligned_lead=64,
+        )
+        mic = np.zeros_like(far)
+        mic[true_delay - 64:] = echo[:far.size - (true_delay - 64)]
+
+        # The raw signals are identical across the loop (fixed seed); only
+        # the claimed applied delay varies, so measure offline truth once.
+        if offline is None:
+            offline = measure_offline_bulk_delay(mic, far, 16000, max_lag=8192)
+        qa = alignment_qa(run, mic, far, max_lag=8192, offline=offline)
+        assert qa['qa_status'] == 'mislock', (applied, qa)
+        assert qa['qa_valid'] is False
 
 
 def test_alignment_summary_reports_never_acquired():

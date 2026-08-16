@@ -15,7 +15,7 @@ import json
 import os
 import subprocess
 import sys
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -65,6 +65,68 @@ LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v3"
 # when a caller omits frame_size) reads this one map, so the frontend cannot
 # silently drift with an unrelated upstream default change.
 FROZEN_FRAME_HOP_BY_SR = {16000: (512, 256), 48000: (1024, 512)}
+
+# Matched-filter bank size every AIAEC corpus is, and stays, materialized
+# with. It is NOT part of the contract dict: the contract records the SIGNAL
+# agreement between the frontend and the data, and this value never varies
+# across the dataset, so recording it would only add a field that can never
+# differ. It lives here as the single literal the generation path resolves,
+# and as the number a diagnostic override is reported against.
+DATASET_DELAY_NUM_FILTERS = 5
+# The bank size is a deployment/diagnostic knob, not a data-contract one:
+#   * dataset generation and training/inference materialization always run the
+#     value above -- `materialize_linear_error` and the config-driven contract
+#     builder take no bank-size argument at all, so there is no code path by
+#     which a corpus can be produced at another size;
+#   * a diagnostic (`LinearAecProcessor(..., delay_num_filters=n)`) may deploy
+#     another size to measure how far the bulk-delay search reaches, and the
+#     contract it carries is unchanged and still fingerprints identically.
+# lib/aec sizes its downsampled search ring and aggregator histograms from n at
+# construction and exposes no runtime setter, which is why the override arrives
+# at init and not through a mutator.
+DELAY_NUM_FILTERS_RANGE = (1, 5)
+
+
+def check_delay_num_filters(value: object) -> int:
+    """Validate a matched-filter bank size, refusing anything out of range.
+
+    Rejected rather than clamped, and ``0`` is not an "off" switch: the bank
+    is what searches for the bulk delay at all, so a caller asking for a size
+    the geometry does not have holds a wrong mental model of the search rather
+    than a value to round into range.
+    """
+    low, high = DELAY_NUM_FILTERS_RANGE
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"delay_num_filters must be an integer in [{low}, {high}], got "
+            f"{value!r}"
+        ) from None
+    if not low <= resolved <= high:
+        raise ValueError(
+            f"delay_num_filters must be in [{low}, {high}], got {resolved}"
+        )
+    return resolved
+
+
+def engine_delay_num_filters(engine: AEC) -> int:
+    """The bank size a LIVE engine actually allocated.
+
+    Counts the matched filters the estimator holds instead of echoing back a
+    configured scalar: the point of reading this is to catch an override that
+    was accepted and then not honoured, and a value read out of the same field
+    that was written cannot report that.
+    """
+    estimator = getattr(getattr(engine, "delay_est", None), "_estimator", None)
+    matched = getattr(estimator, "_matched_filter", None)
+    filters = getattr(matched, "_filters", None)
+    if filters is None:
+        raise RuntimeError(
+            "engine has no matched-filter bank to read back; the linear AEC "
+            "frontend requires the MATCHED delay estimator"
+        )
+    return len(filters)
 
 
 def _git_commit(path: str) -> str:
@@ -241,7 +303,17 @@ def make_linear_aec_config(
     preset: str = "balanced",
     frame_size: Optional[int] = None,
     filter_length: Optional[int] = None,
+    delay_num_filters: Optional[int] = None,
 ) -> AecConfig:
+    """Build the frozen frontend's ``AecConfig``.
+
+    ``delay_num_filters`` is the diagnostic/inference-only matched-filter bank
+    size (see ``DATASET_DELAY_NUM_FILTERS``). ``None`` -- what dataset
+    generation and every contract-driven call site pass -- leaves the key out
+    of the overrides entirely, so the resulting config is the one this
+    frontend has always built, not merely one that happens to carry the same
+    number.
+    """
     if AecPreset(preset) is not AecPreset.BALANCED:
         raise ValueError(f"linear AEC preset must be 'balanced', got {preset!r}")
     if frame_size is None:
@@ -266,6 +338,10 @@ def make_linear_aec_config(
         overrides["frame_size"] = int(frame_size)
     if filter_length is not None:
         overrides["filter_length"] = int(filter_length)
+    if delay_num_filters is not None:
+        overrides["delay_num_filters"] = check_delay_num_filters(
+            delay_num_filters
+        )
     return AecConfig.from_preset(AecPreset(preset), **overrides)
 
 
@@ -335,6 +411,26 @@ def linear_aec_contract_from_config(
             "signal.hop_len == frame_size/2, got "
             f"frame={frame_size}, n_fft={n_fft}, win={win_len}, hop={hop_len}"
         )
+    # The delay profile is deliberately not configurable here. A config file
+    # naming it would read as a supported way to materialize a corpus at
+    # another bank size, and the resulting `linear_error` would differ
+    # wherever the bulk delay leaves the smaller reach while every recorded
+    # contract still compared EQUAL -- the shards would be indistinguishable
+    # from full-bank ones. Refuse the key instead of ignoring it.
+    unsupported = sorted(
+        key for key in ("delay_mode", "delay_num_filters",
+                        "fixed_delay_samples")
+        if cfg.has_option("linear_aec", key)
+    )
+    if unsupported:
+        raise ValueError(
+            "linear_aec config option(s) " + ", ".join(unsupported) + " are "
+            "not supported: dataset generation is frozen at the matched "
+            f"{DATASET_DELAY_NUM_FILTERS}-filter bank and the delay profile "
+            "is not part of the recorded contract. A different bank size is a "
+            "deployment/diagnostic override (sweep_delay_depth.py "
+            "--delay-num-filters), not a corpus setting."
+        )
     configured_filter_length = cfg.getint(
         "linear_aec", "filter_length", fallback=-1
     )
@@ -381,9 +477,25 @@ def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> N
 
 
 class LinearAecProcessor:
-    """One stateful PBFDKF instance for one complete parent sequence."""
+    """One stateful PBFDKF instance for one complete parent sequence.
 
-    def __init__(self, contract: LinearAecContract):
+    ``delay_num_filters`` deploys a matched-filter bank other than the
+    ``DATASET_DELAY_NUM_FILTERS`` one this corpus is materialized with. It is
+    a DIAGNOSTIC/INFERENCE knob: it changes what the engine searches, never
+    what ``contract`` says, so the contract carried by an overridden processor
+    is the recorded one, unmodified and identically fingerprinted. That also
+    means an overridden run must never be written back into a dataset -- the
+    resulting ``linear_error`` would be indistinguishable from a default-bank
+    one by contract comparison alone. ``materialize_linear_error`` therefore
+    takes no bank size at all.
+    """
+
+    def __init__(
+        self,
+        contract: LinearAecContract,
+        *,
+        delay_num_filters: Optional[int] = None,
+    ):
         self.contract = contract
         if contract.engine != "python_pbfdkf":
             raise ValueError(f"unsupported linear AEC engine {contract.engine!r}")
@@ -392,6 +504,7 @@ class LinearAecProcessor:
             preset=contract.preset,
             frame_size=contract.frame_size,
             filter_length=contract.filter_length,
+            delay_num_filters=delay_num_filters,
         )
         runtime = make_linear_aec_contract(
             contract.sample_rate,
@@ -404,14 +517,45 @@ class LinearAecProcessor:
                 runtime.as_dict(), contract.as_dict(), "runtime"
             )
         self._engine = AEC(cfg)
+        # Read the bank back off the constructed engine. The contract cannot
+        # carry this check -- it does not record the bank size, by design --
+        # so an override that is accepted and then dropped somewhere between
+        # here and the estimator has to be caught against the live object.
+        self.delay_num_filters = engine_delay_num_filters(self._engine)
+        # `requested` is derived from the ARGUMENT, deliberately not from cfg:
+        # the guard exists to catch the config layer swallowing the request,
+        # so it must not trust that layer's output (its mutation test patches
+        # make_linear_aec_config to drop the forwarding).
+        requested = (
+            DATASET_DELAY_NUM_FILTERS if delay_num_filters is None
+            else check_delay_num_filters(delay_num_filters)
+        )
+        if self.delay_num_filters != requested:
+            raise ValueError(
+                f"linear AEC built a {self.delay_num_filters}-filter matched "
+                f"bank, but {requested} was requested; the bank size is not "
+                "reaching the estimator"
+            )
 
     @property
     def hop_size(self) -> int:
         return int(self.contract.hop_size)
 
     def process_numpy(
-        self, microphone: np.ndarray, far_end: np.ndarray
+        self,
+        microphone: np.ndarray,
+        far_end: np.ndarray,
+        *,
+        hop_tap: Optional[Callable[[AEC, int], None]] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
+        """Run the hop loop; optionally observe the engine after each hop.
+
+        ``hop_tap(engine, hop_index)`` is called after each hop has been
+        processed and its formed output read. It exists so diagnostic taps
+        (applied delay, confidence, the consumed far) run THIS loop instead of
+        maintaining a second copy of it; ``None`` -- the materialization path
+        -- changes nothing.
+        """
         microphone = np.asarray(microphone, dtype=np.float32)
         far_end = np.asarray(far_end, dtype=np.float32)
         if microphone.ndim != 1 or microphone.shape != far_end.shape:
@@ -436,6 +580,8 @@ class LinearAecProcessor:
                 np.ascontiguousarray(far_end[start:stop]),
             )
             error[start:stop] = self._engine.get_formed_output()
+            if hop_tap is not None:
+                hop_tap(self._engine, start // self.hop_size)
         if not np.isfinite(error).all():
             raise ValueError("linear AEC produced non-finite samples")
         echo_estimate = microphone - error
@@ -460,17 +606,26 @@ def materialize_linear_error(
     far_end: torch.Tensor,
     contract: LinearAecContract,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Materialize one complete sequence with a fresh PBFDKF state."""
+    """Materialize one complete sequence with a fresh PBFDKF state.
+
+    Takes no bank size: corpus data is produced at
+    ``DATASET_DELAY_NUM_FILTERS`` and nothing else, and the contract records
+    no profile that could tell a differently-searched shard apart afterwards.
+    """
     return LinearAecProcessor(contract).process(microphone, far_end)
 
 
 __all__ = [
     "BEHAVIOR_HASH_SCHEMA",
+    "DATASET_DELAY_NUM_FILTERS",
+    "DELAY_NUM_FILTERS_RANGE",
     "LINEAR_AEC_CONTRACT_VERSION",
     "LinearAecContract",
     "LinearAecProcessor",
     "aec_python_behavior_hash",
     "aec_python_source_hash",
+    "check_delay_num_filters",
+    "engine_delay_num_filters",
     "linear_aec_contract_from_config",
     "make_linear_aec_config",
     "make_linear_aec_contract",

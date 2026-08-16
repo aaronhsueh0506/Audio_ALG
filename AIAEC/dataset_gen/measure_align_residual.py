@@ -149,23 +149,46 @@ class EngineRun:
     aligned_far: np.ndarray      # far the PBFDKF consumed, float32 [n]
     delay_samples: np.ndarray    # per hop, int64; -1 = not yet acquired
     confidence: np.ndarray       # per hop, float64; NaN if unavailable
+    # Matched-filter bank size the engine actually allocated, read back off the
+    # live instance -- not the number the caller asked for. 0 on a synthetic
+    # EngineRun built without an engine (0 is not a legal bank size).
+    delay_num_filters: int = 0
 
 
 def run_linear_aec_with_taps(
     microphone: np.ndarray,
     far_end: np.ndarray,
     contract: LinearAecContract,
+    *,
+    delay_num_filters: Optional[int] = None,
 ) -> EngineRun:
     """Run the frozen PBFDKF hop loop, tapping per-hop alignment state.
 
-    Same seam as ``LinearAecProcessor.process_numpy`` (formed output), but
-    with per-hop reads of the applied delay, estimator confidence, and the
-    filter's actual aligned far-end input. Inputs are zero-padded at the tail
-    to a whole number of hops.
+    THE seam of ``LinearAecProcessor.process_numpy`` -- this drives that very
+    loop through its ``hop_tap`` callback rather than maintaining a copy of
+    it -- with per-hop reads of the applied delay, estimator confidence, and
+    the filter's actual aligned far-end input. Inputs are zero-padded at the
+    tail to a whole number of hops (``process_numpy`` itself refuses partial
+    hops).
+
+    ``delay_num_filters`` deploys a matched-filter bank other than the corpus
+    one for THIS diagnostic run; ``contract`` is untouched by it (the bank size
+    is not a recorded contract field). The size reported back in
+    :class:`EngineRun` is read off the constructed engine, so a run cannot
+    claim a profile it did not actually execute.
     """
-    processor = LinearAecProcessor(contract)
-    engine = processor._engine
+    processor = LinearAecProcessor(
+        contract, delay_num_filters=delay_num_filters
+    )
     hop = processor.hop_size
+
+    # Fail before minutes of inference, not on the first tap.
+    main_filter = getattr(processor._engine, "filter", None)
+    if main_filter is None or not hasattr(main_filter, "far_buffer"):
+        raise RuntimeError(
+            "engine has no main filter with a far_buffer to tap; the residual "
+            "meter requires the PBFDKF frontend"
+        )
 
     microphone = np.asarray(microphone, dtype=np.float32)
     far_end = np.asarray(far_end, dtype=np.float32)
@@ -179,44 +202,30 @@ def run_linear_aec_with_taps(
         microphone = np.pad(microphone, (0, pad))
         far_end = np.pad(far_end, (0, pad))
 
-    n = microphone.size
-    n_hops = n // hop
-    error = np.empty(n, dtype=np.float32)
-    aligned_far = np.empty(n, dtype=np.float32)
+    n_hops = microphone.size // hop
+    aligned_far = np.empty(microphone.size, dtype=np.float32)
     delay_samples = np.empty(n_hops, dtype=np.int64)
     confidence = np.empty(n_hops, dtype=np.float64)
 
-    main_filter = getattr(engine, "filter", None)
-    if main_filter is None or not hasattr(main_filter, "far_buffer"):
-        raise RuntimeError(
-            "engine has no main filter with a far_buffer to tap; the residual "
-            "meter requires the PBFDKF frontend"
-        )
-
-    for i in range(n_hops):
-        start = i * hop
-        stop = start + hop
-        engine.process(
-            np.ascontiguousarray(microphone[start:stop]),
-            np.ascontiguousarray(far_end[start:stop]),
-        )
-        error[start:stop] = engine.get_formed_output()
+    def tap(engine, i: int) -> None:
         # The last hop of the filter's overlap-save far buffer is exactly the
         # aligned (ring-compensated) far-end block this hop's update consumed.
-        aligned_far[start:stop] = main_filter.far_buffer[-hop:]
+        aligned_far[i * hop:(i + 1) * hop] = main_filter.far_buffer[-hop:]
         delay_samples[i] = _applied_delay(engine)
         confidence[i] = _estimator_confidence(engine)
 
-    if not np.isfinite(error).all():
-        raise ValueError("linear AEC produced non-finite samples")
+    error, echo_estimate = processor.process_numpy(
+        microphone, far_end, hop_tap=tap
+    )
     return EngineRun(
         sample_rate=contract.sample_rate,
         hop_size=hop,
         error=error,
-        echo_estimate=microphone - error,
+        echo_estimate=echo_estimate,
         aligned_far=aligned_far,
         delay_samples=delay_samples,
         confidence=confidence,
+        delay_num_filters=processor.delay_num_filters,
     )
 
 
@@ -287,6 +296,24 @@ def last_change_hops(delay_samples: np.ndarray) -> np.ndarray:
         change[1:] = d[1:] != d[:-1]
     idx = np.where(change, np.arange(d.size, dtype=np.int64), 0)
     return np.maximum.accumulate(idx)
+
+
+def _correlate_valid(fseg: np.ndarray, dwin: np.ndarray) -> np.ndarray:
+    """``np.correlate(fseg, dwin, mode="valid")`` computed via FFT.
+
+    The same quantity to floating-point rounding (~5e-15 relative at this
+    meter's window sizes, verified argmax-identical); the direct form is
+    O(window x lag_range) per window and dominates wall time once the QA path
+    searches +-1 s of lag, where this is >100x faster. Zero-padding to
+    >= len(fseg) keeps every retained output index free of circular
+    wraparound.
+    """
+    n_out = fseg.size - dwin.size + 1
+    n_fft = 1
+    while n_fft < fseg.size:
+        n_fft <<= 1
+    spec = np.fft.rfft(fseg, n_fft) * np.conj(np.fft.rfft(dwin, n_fft))
+    return np.fft.irfft(spec, n_fft)[:n_out]
 
 
 def solid_confidence_threshold(confidence: np.ndarray) -> float:
@@ -384,7 +411,7 @@ def measure_residual_windows(
         fseg = far[start - max_lag:start + window + max_lag]
         # c[k] = sum_t fseg[k + t] * dwin[t], k in [0, 2*max_lag];
         # lag = max_lag - k, so index 0 is lag=+max_lag (far earliest).
-        c = np.correlate(fseg, dwin, mode="valid")
+        c = _correlate_valid(fseg, dwin)
         # Per-lag far energy for normalization (sliding window over fseg).
         csum = np.concatenate(([0.0], np.cumsum(fseg ** 2)))
         e_far = csum[window:] - csum[:-window]

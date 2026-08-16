@@ -1,16 +1,46 @@
 #!/usr/bin/env python3
-"""Compare Align-ULCNet streaming inference at several delay depths.
+"""Compare Align-ULCNet streaming inference across a delay profile.
 
-The microphone/far frontend is evaluated once.  Every requested depth then
-loads the same checkpoint weights into an otherwise identical model and runs
-``forward_stream()`` one STFT frame at a time.  The tool writes one float WAV
-per depth, a summary CSV, and a per-frame delay trace for listening and
-inspection before choosing the fixed D of an embedded ONNX export.
+A delay profile has two independent halves and this tool drives both:
+
+* the AEC half, ``--delay-num-filters`` (n): how far the PBFDKF frontend's
+  matched-filter bank searches for the bulk far-to-mic delay, and how much AEC
+  pool that costs. Reliable reach is 125/221/317/413/509 ms for n=1..5.
+* the model half, ``--depths`` (D): how many past frames the temporal
+  alignment attention keeps, and how much model state that costs. One hop is
+  16 ms on the fixed 16 kHz / 512 / 256 grid.
+
+They do not add up into one delay budget. Each layer must satisfy the input
+condition the previous one delivers, which is why n and D are reported side by
+side in every summary row rather than summed.
+
+Both are DEPLOYMENT knobs and neither is a data-contract change. n is a
+runtime AEC init override applied to the instance this tool builds; D is an
+export-time model shape. The checkpoint's recorded ``linear_aec`` contract is
+read and honoured unchanged either way -- corpora are always materialized at
+the frozen ``DATASET_DELAY_NUM_FILTERS`` bank, so a run at another n is a
+diagnostic of the frontend, reported as departing from the corpus the
+checkpoint was trained on.
+
+The microphone/far frontend is evaluated once, with a tapped hop loop that
+records the delay the PBFDKF actually applied and the far it actually
+consumed. Every requested depth then loads the same checkpoint weights into an
+otherwise identical model and runs ``forward_stream()`` one STFT frame at a
+time. The tool writes one float WAV per depth, a summary CSV, a per-frame
+delay trace, and the AEC alignment trace.
+
+Every clip is also QA'd against an estimator-INDEPENDENT offline measurement
+of the bulk delay (see :func:`alignment_qa`). A clip whose applied delay
+disagrees with that measurement is marked invalid so a mis-lock cannot be
+averaged into a delay-profile statistic.
 
 Examples::
 
     python3 sweep_delay_depth.py model.pth mic.wav far.wav d_sweep \
         --depths 64,32,16,8,4 --device cuda
+
+    python3 sweep_delay_depth.py model.pth mic.wav far.wav short_route \
+        --far-input-mode aligned_far --delay-num-filters 2 --depths 8,4
 
     python3 sweep_delay_depth.py model.pth kf_error.wav far.wav d_sweep \
         --input-is-linear-error --depths 64,16,8 \
@@ -30,7 +60,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, NamedTuple, Optional
 
 import numpy as np
 import soundfile as sf
@@ -44,15 +74,24 @@ if _AUDIO_ALG_ROOT not in sys.path:
 
 from AIAEC.Align_ULCNet.denoise import load_model
 from AIAEC.dataset_gen import istft, stft
-from AIAEC.dataset_gen.linear_aec import LinearAecContract
+from AIAEC.dataset_gen.linear_aec import (
+    DATASET_DELAY_NUM_FILTERS,
+    DELAY_NUM_FILTERS_RANGE,
+    LinearAecContract,
+    check_delay_num_filters,
+)
 from AIAEC.dataset_gen.measure_align_residual import (
+    DEFAULT_MAX_LAG,
+    DEFAULT_SETTLE_S,
+    DEFAULT_WINDOW_S,
     EngineRun,
     count_delay_change_events,
     first_lock_hop,
+    measure_residual_windows,
     run_linear_aec_with_taps,
 )
 from AIAEC.inference_common import load_linear_error_far, load_mic_far
-from AIAEC.training_common import LinearAecEngine, auto_device
+from AIAEC.training_common import auto_device
 
 
 @dataclass
@@ -85,6 +124,68 @@ def parse_depths(value: str) -> List[int]:
     if not depths:
         raise argparse.ArgumentTypeError("at least one delay depth is required")
     return depths
+
+
+def parse_delay_num_filters(value: str) -> int:
+    """argparse adapter over :func:`check_delay_num_filters` -- one validator,
+    two exception dialects."""
+    try:
+        return check_delay_num_filters(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+
+
+# Reliable bulk-delay reach of an n-filter matched bank, in ms: lib/aec's
+# contract value ((n-1)*384 + 501 downsampled samples at 0.25 ms each), not a
+# geometric span -- derived from that arithmetic (125/221/317/413/509 ms)
+# rather than copied as literals, mirroring the C tests' KD_RELIABLE_SAMPLES.
+# Printed so a run that fails to lock says whether the delay was ever inside
+# reach.
+MATCHED_REACH_MS = {
+    n: ((n - 1) * 384 + 501) * 0.25
+    for n in range(DELAY_NUM_FILTERS_RANGE[0], DELAY_NUM_FILTERS_RANGE[1] + 1)
+}
+
+# QA gate for the applied delay. The offline cross-correlation of RAW far
+# against the mic measures the true bulk delay independently of the estimator;
+# a healthy applied delay sits at or just before it (the aligned far leads the
+# echo by the alignment headroom, never trails it). These bounds are wide
+# enough to absorb estimator quantisation and headroom, and orders of
+# magnitude tighter than the failure class they exist to catch -- a corpus
+# tail-length difference reported as a multi-second delay.
+QA_MAX_HEADROOM_MS = 32.0
+QA_MAX_OVERSHOOT_MS = 8.0
+QA_MIN_WINDOWS = 2
+
+
+def resolve_delay_num_filters(requested: Optional[int]) -> int:
+    """The bank size this run deploys.
+
+    ``None`` -- the flag omitted -- resolves to the size every corpus is
+    materialized at, so an unflagged run reproduces exactly the frontend the
+    checkpoint was trained against. Resolved here rather than as an argparse
+    default so the tool can still tell "asked for the corpus size" apart from
+    "did not ask", which is what the ``--input-is-linear-error`` conflict check
+    needs.
+    """
+    if requested is None:
+        return DATASET_DELAY_NUM_FILTERS
+    return check_delay_num_filters(requested)
+
+
+def check_argument_conflicts(args: argparse.Namespace) -> None:
+    """Refuse flag pairs that individually parse but cannot both apply.
+
+    Checked before anything is loaded, so a run that could only produce a
+    misleading report stops at the command line rather than after minutes of
+    inference.
+    """
+    if args.input_is_linear_error and args.delay_num_filters is not None:
+        raise ValueError(
+            "--delay-num-filters has no effect with --input-is-linear-error: "
+            "that bypass skips this project's PBFDKF entirely, so there is no "
+            "matched-filter bank to size. Drop one of the two flags."
+        )
 
 
 def _default_depths(checkpoint_depth: int) -> List[int]:
@@ -259,6 +360,133 @@ def _alignment_summary(run: EngineRun) -> Dict[str, object]:
     }
 
 
+class OfflineBulkDelay(NamedTuple):
+    """What an estimator-independent raw-correlation measurement concluded."""
+
+    n_windows: int
+    n_boundary_peak: int
+    bulk_delay_samples: int     # -1 when no window produced a measurement
+
+
+def measure_offline_bulk_delay(
+    microphone: np.ndarray,
+    far_end: np.ndarray,
+    sample_rate: int,
+    *,
+    max_lag: int,
+    window_s: float = DEFAULT_WINDOW_S,
+) -> OfflineBulkDelay:
+    """Bulk far-to-mic delay from RAW signals, independent of the estimator.
+
+    Reuses the residual meter's windowed, energy-gated, normalized
+    cross-correlation with the RAW far as the reference and the microphone as
+    the target, so ``lag > 0`` means the far leads the mic by that many
+    samples -- the bulk delay. Windows with no far excitation or no
+    explanatory peak are skipped rather than contributing a noise lag, and a
+    peak sitting on the search boundary is reported instead of being read as a
+    measurement: that combination is what separates a real delay from the
+    corpus tail-length artefact that once read as 3744 ms.
+
+    The lock gate is deliberately not applied here. This measurement must stay
+    independent of the very estimator decision it is used to audit.
+    """
+    windows, _skipped = measure_residual_windows(
+        far_end, microphone, sample_rate,
+        window_s=window_s, max_lag=max_lag,
+    )
+    lags = np.asarray([w.lag_samples for w in windows], dtype=np.float64)
+    return OfflineBulkDelay(
+        n_windows=int(lags.size),
+        n_boundary_peak=int(sum(1 for w in windows if w.boundary_peak)),
+        bulk_delay_samples=(
+            int(round(float(np.median(lags)))) if lags.size else -1
+        ),
+    )
+
+
+def alignment_qa(
+    run: EngineRun,
+    microphone: np.ndarray,
+    raw_far: np.ndarray,
+    *,
+    max_lag: int,
+    settle_s: float = DEFAULT_SETTLE_S,
+    offline: Optional[OfflineBulkDelay] = None,
+) -> Dict[str, object]:
+    """Per-clip QA of the estimator's decision against offline ground truth.
+
+    Two independent verdicts, both reported:
+
+    * ``applied vs offline bulk delay`` -- the estimator's applied delay must
+      land at, or just before, the delay an estimator-independent correlation
+      of the raw signals measures. Anything else is a mis-lock and the clip is
+      marked INVALID so it cannot be averaged into a delay-profile statistic.
+    * ``aligned-far residual`` -- over settled, locked windows the far the
+      PBFDKF actually consumed must lead the echo (positive lag) by a bounded
+      amount. This is the seam the NN sees in ``aligned_far`` mode.
+
+    ``status`` is one of ``ok`` / ``mislock`` / ``not_acquired`` /
+    ``undecidable``. ``not_acquired`` is an HONEST outcome, not a defect: a
+    bank too small to reach the clip's delay is supposed to stay unlocked and
+    let the pipeline fail open. It is reported separately from ``mislock``
+    precisely so the two are never averaged together.
+
+    ``offline`` accepts a precomputed measurement: it depends only on the raw
+    signals, so callers that QA several runs of one clip measure once.
+    """
+    if offline is None:
+        offline = measure_offline_bulk_delay(
+            microphone, raw_far, run.sample_rate, max_lag=max_lag,
+        )
+    residual_windows, _ = measure_residual_windows(
+        run.aligned_far, run.echo_estimate, run.sample_rate,
+        hop_size=run.hop_size,
+        delay_samples=run.delay_samples,
+        confidence=run.confidence,
+        settle_s=settle_s,
+    )
+    locked = [w.lag_ms for w in residual_windows if w.locked]
+    applied = int(run.delay_samples[-1]) if run.delay_samples.size else -1
+    to_ms = 1000.0 / run.sample_rate
+
+    decidable = (
+        offline.n_windows >= QA_MIN_WINDOWS
+        and offline.n_boundary_peak == 0
+    )
+    headroom_ms = float('nan')
+    if applied < 0:
+        status = 'not_acquired' if decidable else 'undecidable'
+    elif not decidable:
+        status = 'undecidable'
+    else:
+        headroom_ms = (offline.bulk_delay_samples - applied) * to_ms
+        status = (
+            'ok'
+            if -QA_MAX_OVERSHOOT_MS <= headroom_ms <= QA_MAX_HEADROOM_MS
+            else 'mislock'
+        )
+    return {
+        'qa_status': status,
+        # Only a measured disagreement invalidates a clip. A clip whose delay
+        # was never inside the bank's reach is a valid observation OF that.
+        'qa_valid': status in ('ok', 'not_acquired'),
+        'qa_offline_bulk_delay_samples': offline.bulk_delay_samples,
+        'qa_offline_bulk_delay_ms': (
+            offline.bulk_delay_samples * to_ms
+            if offline.bulk_delay_samples >= 0 else float('nan')
+        ),
+        'qa_offline_windows': offline.n_windows,
+        'qa_offline_boundary_peaks': offline.n_boundary_peak,
+        'qa_applied_vs_offline_ms': headroom_ms,
+        'qa_residual_locked_windows': len(locked),
+        'qa_residual_p50_ms': (
+            float(np.percentile(locked, 50)) if locked else float('nan')
+        ),
+        'qa_residual_max_ms': float(np.max(locked)) if locked else float('nan'),
+        'qa_residual_min_ms': float(np.min(locked)) if locked else float('nan'),
+    }
+
+
 def _write_alignment_trace(path: Path, run: EngineRun) -> None:
     """Write the post-hop PBFDKF delay state used to produce aligned far."""
     with path.open('w', newline='', encoding='utf-8') as handle:
@@ -320,6 +548,26 @@ def build_parser() -> argparse.ArgumentParser:
              'is available.',
     )
     parser.add_argument(
+        '--delay-num-filters', type=parse_delay_num_filters, default=None,
+        metavar='N',
+        help='Matched-filter bank size n (1..5) the PBFDKF frontend runs '
+             f'with (default {DATASET_DELAY_NUM_FILTERS}). This is the '
+             'AEC-side half of a delay profile: it sets how far the '
+             'bulk-delay search reaches (125/221/317/413/509 ms for n=1..5) '
+             'and how much AEC pool it costs, and it is independent of the NN '
+             'depth D set by --depths. It is an AEC init parameter applied to '
+             'this diagnostic run only: it is not written back to any '
+             'contract, and corpora are always materialized at the default, '
+             'so any other value is reported as departing from the corpus the '
+             'checkpoint was trained on.',
+    )
+    parser.add_argument(
+        '--qa-max-lag', type=int, default=DEFAULT_MAX_LAG * 8,
+        help='Search range (+- samples) for the estimator-independent '
+             'offline bulk-delay QA. The default spans 1024 ms at 16 kHz, '
+             'wide enough to bound the n=5 reach with margin.',
+    )
+    parser.add_argument(
         '--target-wav', default=None,
         help='Optional aligned clean target. Adds SNR/SI-SDR columns; it is '
              'resampled to the checkpoint rate and must match the primary '
@@ -367,6 +615,7 @@ def _load_optional_target(
 
 
 def main(args: argparse.Namespace) -> None:
+    check_argument_conflicts(args)
     device_name = auto_device(args.device)
     device = torch.device(device_name)
     checkpoint_model, grid, linear_contract = load_model(
@@ -386,7 +635,25 @@ def main(args: argparse.Namespace) -> None:
     if args.max_seconds is not None and args.max_seconds <= 0:
         raise ValueError("--max-seconds must be positive")
 
+    # The recorded contract is used exactly as stamped; the bank size is a
+    # runtime AEC init override this tool applies on top of it and never a
+    # contract field, so there is no second, "runtime" contract to build.
+    frontend_contract = LinearAecContract.from_dict(linear_contract)
+    delay_num_filters = resolve_delay_num_filters(args.delay_num_filters)
+    if not args.input_is_linear_error:
+        print(f"PBFDKF matched-filter bank: n={delay_num_filters} "
+              f"(reliable bulk-delay reach "
+              f"{MATCHED_REACH_MS[delay_num_filters]:.0f} ms), contract "
+              f"{frontend_contract.version} unchanged")
+        if delay_num_filters != DATASET_DELAY_NUM_FILTERS:
+            print("WARNING: this bank size is a deployment override. Every "
+                  f"corpus is materialized at n={DATASET_DELAY_NUM_FILTERS}, "
+                  "so the linear_error the model sees here is not the one it "
+                  "was trained on; treat the result as a candidate profile "
+                  "measurement, not a release comparison.")
+
     alignment_run: Optional[EngineRun] = None
+    alignment_qa_metrics: Dict[str, object] = {}
     if args.input_is_linear_error:
         error, far, source_rates = load_linear_error_far(
             args.mic_wav, args.far_wav, grid.sr
@@ -413,29 +680,34 @@ def main(args: argparse.Namespace) -> None:
             )
             mic = mic[..., :limit]
             far = far[..., :limit]
+        # One tapped hop loop for BOTH far modes. The frontend and its
+        # linear_error are identical either way -- only which far stream is
+        # handed to the NN differs -- and running the tapped loop
+        # unconditionally is what makes the delay timeline, the aligned-far
+        # residual and the offline QA available for raw_far too, instead of
+        # only for the mode that happens to consume the tap.
+        original_length = mic.shape[-1]
+        mic_numpy = mic.squeeze(0).numpy()
+        raw_far_numpy = far.squeeze(0).numpy()
+        tapped = run_linear_aec_with_taps(
+            mic_numpy, raw_far_numpy, frontend_contract,
+            delay_num_filters=delay_num_filters,
+        )
+        alignment_run = tapped
+        alignment_qa_metrics = alignment_qa(
+            tapped, mic_numpy, raw_far_numpy, max_lag=args.qa_max_lag,
+        )
+        error = torch.from_numpy(
+            tapped.error[:original_length]
+        ).unsqueeze(0).contiguous()
         if args.far_input_mode == 'aligned_far':
-            original_length = mic.shape[-1]
-            tapped = run_linear_aec_with_taps(
-                mic.squeeze(0).numpy(),
-                far.squeeze(0).numpy(),
-                LinearAecContract.from_dict(linear_contract),
-            )
-            error = torch.from_numpy(
-                tapped.error[:original_length]
-            ).unsqueeze(0).contiguous()
             far = torch.from_numpy(
                 tapped.aligned_far[:original_length]
             ).unsqueeze(0).contiguous()
-            alignment_run = tapped
             print("aligned_far evaluation: using the post-delay-buffer far "
                   "samples actually consumed by PBFDKF")
             print("WARNING: current checkpoints are trained with raw_far; "
                   "aligned_far is an out-of-distribution diagnostic")
-        else:
-            linear_aec = LinearAecEngine(
-                n_lanes=1, sample_rate=grid.sr, contract=linear_contract
-            )
-            error, _echo_estimate = linear_aec(mic, far, grid.sr)
     if source_rates != (grid.sr, grid.sr):
         print(f"resampled primary/far {source_rates[0]}/{source_rates[1]} -> "
               f"{grid.sr} Hz")
@@ -487,8 +759,51 @@ def main(args: argparse.Namespace) -> None:
                 f"{alignment_metrics['aec_final_confidence']:.3f}"
             )
         else:
-            print("PBFDKF delay: NOT ACQUIRED during this recording")
+            print(
+                "PBFDKF delay: NOT ACQUIRED during this recording (n="
+                f"{alignment_run.delay_num_filters} reaches "
+                f"{MATCHED_REACH_MS[alignment_run.delay_num_filters]:.0f} ms)"
+            )
         print(f"wrote {output_dir / 'aec_alignment.csv'}")
+    if alignment_qa_metrics:
+        print(
+            f"delay QA: {alignment_qa_metrics['qa_status'].upper()} -- "
+            "offline bulk delay "
+            f"{alignment_qa_metrics['qa_offline_bulk_delay_ms']:.1f} ms over "
+            f"{alignment_qa_metrics['qa_offline_windows']} window(s), applied "
+            "is earlier by "
+            f"{alignment_qa_metrics['qa_applied_vs_offline_ms']:.1f} ms; "
+            "aligned-far residual p50="
+            f"{alignment_qa_metrics['qa_residual_p50_ms']:.2f} ms over "
+            f"{alignment_qa_metrics['qa_residual_locked_windows']} locked "
+            "window(s)"
+        )
+        if (args.far_input_mode == 'aligned_far'
+                and alignment_qa_metrics['qa_status'] == 'not_acquired'):
+            print(
+                "NOTE: no delay was ever acquired, so the 'aligned' far this "
+                "tool fed the model is the raw far. A deployed ALIGNED "
+                "pipeline FAILS OPEN while unlocked and applies no model "
+                "output at all, so these WAVs do not represent what that "
+                "pipeline would emit for this clip."
+            )
+        if not alignment_qa_metrics['qa_valid']:
+            print(
+                "WARNING: this clip is marked INVALID for delay-profile "
+                "statistics -- the applied delay does not agree with the "
+                "estimator-independent offline measurement, so any residual "
+                "or lock number from it describes a mis-lock, not the "
+                "profile under test."
+            )
+
+    # Bank size the run actually deployed, read back off the engine rather
+    # than echoed from the flag; 0 when PBFDKF was bypassed and there was no
+    # bank at all. A summary row must not be able to name a profile the run
+    # did not execute.
+    deployed_bank = (
+        alignment_run.delay_num_filters if alignment_run is not None else 0
+    )
+    bank_label = f"n={deployed_bank}" if deployed_bank else "PBFDKF bypassed"
 
     target_cpu = target.cpu() if target is not None else None
     reference_waveform: Optional[Tensor] = None
@@ -522,6 +837,19 @@ def main(args: argparse.Namespace) -> None:
         )
         metrics: Dict[str, object] = {
             'far_input_mode': args.far_input_mode,
+            # Both halves of the deployed profile in every row, so a summary
+            # can never be read back without knowing which (n, D) produced it.
+            # Diagnostic columns: n is a runtime override, not part of the
+            # recorded contract, so nothing downstream may key off them.
+            'aec_delay_num_filters': deployed_bank,
+            'aec_matched_reach_ms': MATCHED_REACH_MS.get(
+                deployed_bank, float('nan')),
+            # The grid every millisecond in this row is denominated in. A
+            # delay-profile CSV read without it is unreadable: D is a count of
+            # hops, and one hop is only 16 ms because of these three numbers.
+            'grid_sample_rate': grid.sample_rate,
+            'grid_fft_size': grid.n_fft,
+            'grid_hop_size': grid.hop_len,
             'depth_frames': depth,
             'buffer_span_ms': depth * hop_seconds * 1000.0,
             'max_delay_ms': (depth - 1) * hop_seconds * 1000.0,
@@ -538,6 +866,7 @@ def main(args: argparse.Namespace) -> None:
             result.delay_distribution, depth, hop_seconds
         ))
         metrics.update(alignment_metrics)
+        metrics.update(alignment_qa_metrics)
         if target_cpu is not None:
             metrics['target_snr_db'] = _snr_db(target_cpu, waveform)
             metrics['target_si_sdr_db'] = _si_sdr_db(target_cpu, waveform)
@@ -557,7 +886,8 @@ def main(args: argparse.Namespace) -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    print("\nD sweep summary (Python timing is relative, not an NPU estimate):")
+    print(f"\nD sweep summary at far={args.far_input_mode}, {bank_label} "
+          "(Python timing is relative, not an NPU estimate):")
     print("  D   max lag  state KiB  RTF     boundary   SNR vs ref")
     for row in rows:
         print(
