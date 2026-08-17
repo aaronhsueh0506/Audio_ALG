@@ -44,7 +44,7 @@ task (see ../README.md's decision matrix and
     more standalone AEC-only candidate, so Align-CRUSE now shares the same
     joint end-to-end AEC+RES+NR dereverb task and target as DeepVQE-S.
 
-inference: see denoise.py's own top-of-file usage comment.
+inference: see inference.py's own top-of-file usage comment.
 """
 
 import argparse

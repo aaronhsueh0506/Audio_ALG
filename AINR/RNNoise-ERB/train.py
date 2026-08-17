@@ -132,7 +132,7 @@ def model_capacity_from_checkpoint(ckpt):
 
     Capacity is a property of the weights.  A config.ini that disagrees would
     build a model that either fails to load or -- worse -- loads and means
-    something else, so both denoise.py and export_onnx.py construct from here.
+    something else, so both inference.py and export_onnx.py construct from here.
     (Feature/signal constants are the opposite case: those must match the
     runtime config exactly, which is require_checkpoint_feature_config's job.)
 

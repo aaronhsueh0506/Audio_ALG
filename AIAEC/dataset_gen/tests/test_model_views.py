@@ -1,6 +1,3 @@
-import configparser
-import pathlib
-
 import pytest
 import torch
 
@@ -10,7 +7,6 @@ from AIAEC.dataset_gen import (
     build_spectral_model_view,
 )
 from AIAEC.aiaec_common import SignalGrid
-from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.DeepVQE_S import DeepVQES
 
 
@@ -30,10 +26,9 @@ def test_dataset_gen_is_the_single_public_and_implementation_package():
     assert AecStems.__module__ == "AIAEC.dataset_gen.aec_features"
 
 
-def test_all_six_candidates_have_one_dataset_contract():
+def test_all_candidates_have_one_dataset_contract():
     assert set(MODEL_TASKS) == {
-        "Align_CRUSE", "Align_ULCNet", "GTCRN_AENR",
-        "DeepFilterNet_AENR", "DeepVQE_S", "CAGCRN",
+        "Align_CRUSE", "Align_ULCNet", "DeepVQE_S", "CAGCRN",
     }
 
 
@@ -82,44 +77,3 @@ def test_spectral_view_is_directly_accepted_by_public_model_forward():
     with torch.no_grad():
         output = model(**spectral.inputs)
     assert output.enhanced.shape == spectral.target.shape
-
-
-def test_dfn_spectral_view_builds_independent_feature_states_and_runs():
-    torch.manual_seed(3)
-    stems = AecStems(
-        torch.randn(len(PACKED_STEM_ORDER), 4096), PACKED_STEM_ORDER
-    )
-
-    waveform = build_model_view(stems, "DeepFilterNet_AENR", 16000)
-    grid = AecGrid(16000, 512, 512, 256)
-    model = DeepFilterNetAENR(
-        SignalGrid(16000, 512, 512, 256), enc_ch=8, emb_size=32,
-        df_hidden=32, lin_groups=4, enc_lin_groups=4,
-    ).eval()
-    cfg = configparser.ConfigParser()
-    root = pathlib.Path(__file__).resolve().parents[3]
-    cfg.read(root / "AINR" / "DeepFilterNet2" / "config.ini")
-    from AINR.DeepFilterNet2.train import read_feature_config
-    feature_cfg = read_feature_config(cfg, 16000, 256)
-    spectral = build_spectral_model_view(
-        waveform, grid, dfn_model=model, dfn_feature_config=feature_cfg,
-    )
-    assert set(spectral.inputs) == {
-        "linear_error", "error_erb", "error_spec", "far_erb", "far_spec",
-    }
-    assert spectral.feature_state["error"] is not spectral.feature_state["far"]
-    with torch.no_grad():
-        output = model(**spectral.inputs)
-    assert output.enhanced.shape == spectral.target.shape
-
-
-def test_dfn_spectral_view_rejects_shared_ema_state():
-    stems = _stems()
-    view = build_model_view(stems, "DeepFilterNet_AENR", 16000)
-    shared = {"erb": None, "spec": None}
-    with pytest.raises(ValueError, match="must not be shared"):
-        build_spectral_model_view(
-            view, AecGrid(16000, 512, 512, 256),
-            dfn_model=object(), dfn_feature_config={},
-            dfn_feature_state={"error": shared, "far": shared},
-        )

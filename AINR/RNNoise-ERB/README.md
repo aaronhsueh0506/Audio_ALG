@@ -220,7 +220,7 @@ output/
 對單一音檔進行降噪：
 
 ```bash
-python3 denoise.py --config config.ini --model output/rnnoise_best.pth \
+python3 inference.py --config config.ini --model output/rnnoise_best.pth \
                    --input noisy.wav --output clean.wav
 ```
 
@@ -237,7 +237,7 @@ partition of unity),但成本只需 22 次而非 257 次。預設不啟用(`None
 若要定位「全壓成 0」是 feature、model 或 post-filter 造成：
 
 ```bash
-python3 denoise.py --config config.ini --model output/rnnoise_best.pth \
+python3 inference.py --config config.ini --model output/rnnoise_best.pth \
   --input failing.wav --output debug.wav --dump-debug debug/failing.npz
 ```
 
@@ -269,9 +269,18 @@ Streaming ONNX 輸入為 `erb_input[1,3,22]`、`spec_input[1,3,2,129]`
 `RNNOISE_MODEL_IO_LAYOUT_VERSION` 相同，整合端可據此拒絕 state layout
 已經對不上自己配置的 struct 的圖。
 
-PTQ calibration 可直接使用 `denoise.py --dump-calib DIR --max-frames N`；
-它會保存實際串流中的三-frame feature window 與非零 GRU state，而不是只
-重複 zero-state 樣本。
+PTQ calibration 可直接使用：
+
+```bash
+python3 inference.py --config config.ini --model output/rnnoise_best.pth \
+  --input noisy.wav --output enhanced.wav \
+  --dump-calib calib/rnnoise_erb --format bin --max-frames 8192
+```
+
+BIN 會依 ONNX input 分資料夾，每個 streaming frame 各寫一個檔案；例如
+`h1_in/h1_in_1.bin`。使用 `--format npz --dump-calib
+calib/rnnoise_erb.npz` 可改輸出 NumPy archive。兩種格式都保存實際串流中
+的三-frame feature window 與非零 GRU state，而不是重複 zero-state 樣本。
 
 ## ERB 矩陣匯出
 
@@ -287,7 +296,7 @@ python3 export_erb_matrix.py --config config.ini --format all
 | 檔案 | 說明 |
 |------|------|
 | `train.py` | 模型定義與 packed raw-WAV tensor 訓練迴圈 |
-| `denoise.py` | 推論腳本（單檔降噪） |
+| `inference.py` | 推論與 calibration 入口 |
 | `export_onnx.py` | ONNX 匯出（streaming 推論格式） |
 | `export_erb_matrix.py` | ERB 矩陣匯出（npy / C header） |
 | `config.ini` | 所有超參數設定 |

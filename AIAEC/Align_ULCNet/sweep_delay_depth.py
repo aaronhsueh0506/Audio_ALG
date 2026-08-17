@@ -71,7 +71,7 @@ _AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
 
-from AIAEC.Align_ULCNet.denoise import load_model
+from AIAEC.Align_ULCNet.inference import load_model
 from AIAEC.dataset_gen import istft, stft
 from AIAEC.dataset_gen.linear_aec import (
     DATASET_DELAY_NUM_FILTERS,

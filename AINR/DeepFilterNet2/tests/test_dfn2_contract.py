@@ -1,6 +1,7 @@
 """Regression tests for DFN2 feature, FIR, loss, and checkpoint contracts."""
 
 import configparser
+import json
 import math
 import os
 import pathlib
@@ -18,11 +19,11 @@ ROOT_PATH = pathlib.Path(ROOT)
 sys.path.insert(0, ROOT)
 
 # Each of the three model projects has its own top-level ``train.py`` (and
-# ``denoise.py``/``model.py``).  Under a single pytest session the first one
+# ``inference.py``/``model.py``). Under a single pytest session the first one
 # imported wins ``sys.modules``, so a sibling project's tests would silently
 # exercise the wrong code.  Dropping the cached entries forces the re-import
 # to resolve against the ROOT just inserted above.
-for _stale in ('train', 'denoise', 'model', 'checkpoint_utils', 'export_onnx'):
+for _stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx'):
     sys.modules.pop(_stale, None)
 
 
@@ -53,6 +54,8 @@ from train import (  # noqa: E402
 )
 from export_onnx import (  # noqa: E402
     INPUT_FRAMES,
+    INPUT_NAMES,
+    OUTPUT_NAMES,
     STATE_LAYOUT_VERSION,
     StatelessDFN2Heads,
     build_metadata,
@@ -87,7 +90,7 @@ def build_shipped_model(cfg, **overrides):
 
     Goes through the trainer's own ``read_model_config`` rather than re-reading
     the keys: a local copy is a third restatement of the constructor's defaults
-    (train.py and denoise.py were the first two, which is why that function
+    (train.py and inference.py were the first two, which is why that function
     exists), and it silently omitted ``df_hidden``, ``mask_pf`` and ``pf_beta`` --
     so tests built those three from constructor defaults while the trainer built
     them from config.  It also inherits the unknown-key rejection.
@@ -374,6 +377,73 @@ def test_c_model_io_layout_constants_match_the_shipped_export_shapes():
     assert actual == expected
 
 
+def _small_dfn2():
+    return DeepFilterNet2(
+        n_fft=512, sr=16000, n_erb=32, df_bins=64,
+        enc_ch=8, emb_size=32, df_hidden=32,
+        lin_groups=4, enc_lin_groups=4,
+    ).eval()
+
+
+def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
+    """One recorded calibration frame must BE one graph invocation.
+
+    ``capture_calibration_inputs`` keeps the graph's batch dimension and
+    ``np.stack`` adds the calibration-frame axis on top of it.  Dropping the
+    batch axis would leave every ``.bin`` one rank short of the input the
+    accelerator binds it to, and nothing downstream re-derives the shape --
+    the manifest is what a quantizer reads.  So the per-frame shapes are
+    compared against the ONNX graph this exporter really produces rather than
+    against a literal that could be edited to match a regression.
+    """
+    onnx = pytest.importorskip('onnx')
+    from calibration_io import (
+        capture_calibration_inputs,
+        write_calibration_artifact,
+    )
+
+    torch.manual_seed(75)
+    model = _small_dfn2()
+    wrapper = StatelessDFN2Heads(model).eval()
+    inputs = streaming_export_inputs(model)
+
+    graph_path = os.fspath(tmp_path / 'dfn2_stream.onnx')
+    torch.onnx.export(
+        wrapper, inputs, graph_path,
+        input_names=list(INPUT_NAMES),
+        output_names=list(OUTPUT_NAMES),
+        opset_version=17, do_constant_folding=True,
+    )
+    graph_shapes = {
+        value.name: [int(dim.dim_value)
+                     for dim in value.type.tensor_type.shape.dim]
+        for value in onnx.load(graph_path).graph.input
+    }
+    assert set(graph_shapes) == set(INPUT_NAMES)
+
+    # Two invocations, recorded exactly the way calibration_main records them.
+    captured = {}
+    state = tuple(inputs[2:])
+    with torch.no_grad():
+        for _ in range(2):
+            step = (inputs[0], inputs[1]) + state
+            capture_calibration_inputs(captured, INPUT_NAMES, step)
+            state = tuple(wrapper(*step)[3:])
+    arrays = {name: np.stack(values).astype(np.float32, copy=False)
+              for name, values in captured.items()}
+    artifact = tmp_path / 'calib'
+    write_calibration_artifact(artifact, arrays, {'frames': 2}, 'bin')
+    manifest = json.loads((artifact / 'manifest.json').read_text())
+
+    for name in INPUT_NAMES:
+        assert manifest['binary_tensors'][name]['frame_shape'] == (
+            graph_shapes[name]
+        ), name
+        # And the bytes on disk really hold one whole graph input.
+        blob = np.fromfile(artifact / name / ('%s_1.bin' % name), '<f4')
+        assert blob.size == int(np.prod(graph_shapes[name])), name
+
+
 def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
     """The exported metadata must carry the header's layout version.
 
@@ -598,7 +668,7 @@ def test_lookahead_relation_is_enforced_in_the_model_constructor():
     """df_lookahead > mask_lookahead must be rejected at the single source.
 
     Guards against the invariant drifting back out into per-entry-point copies:
-    train.py and denoise.py deliberately no longer check it, so if the
+    train.py and inference.py deliberately no longer check it, so if the
     constructor stops enforcing it nothing does.
     """
     cfg = load_config()

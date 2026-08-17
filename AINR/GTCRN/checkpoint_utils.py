@@ -1,4 +1,4 @@
-"""Checkpoint helpers shared by train.py / denoise.py.
+"""Checkpoint helpers shared by train.py / inference.py.
 
 Kept out of model.py on purpose: model.py is a bit-exact port of upstream
 gtcrn_github/gtcrn.py (verified max|diff| = 0.0, 48,245 total / 23,669

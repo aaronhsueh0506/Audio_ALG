@@ -1,10 +1,13 @@
 """The GTCRN export metadata and gtcrn_process.h are one state contract."""
 
+import json
 import os
 import pathlib
 import re
 import sys
 
+import numpy as np
+import pytest
 import torch
 
 
@@ -16,7 +19,7 @@ sys.path.insert(0, ROOT)
 # ``export_onnx.py``.  Under a single pytest session the first one imported
 # wins ``sys.modules``, so dropping the cached entries is what makes this file
 # exercise GTCRN's code rather than a sibling project's.
-for _stale in ('train', 'denoise', 'model', 'checkpoint_utils', 'export_onnx'):
+for _stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx'):
     sys.modules.pop(_stale, None)
 
 
@@ -44,11 +47,15 @@ def c_macro(name):
     return int(match.group(1))
 
 
+def _stream_model():
+    torch.manual_seed(43)
+    return StreamGTCRN(GTCRN(65, 64, nfft=512, fs=16000).eval()).eval()
+
+
 def _metadata(tmp_path):
     checkpoint = tmp_path / 'ckpt.pth'
     checkpoint.write_bytes(b'not a real checkpoint, only hashed')
-    torch.manual_seed(43)
-    stream = StreamGTCRN(GTCRN(65, 64, nfft=512, fs=16000).eval()).eval()
+    stream = _stream_model()
     inputs = initial_inputs()
     with torch.no_grad():
         outputs = stream(*(tensor.clone() for tensor in inputs))
@@ -101,3 +108,60 @@ def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
     assert set(output_schema) == set(OUTPUT_NAMES)
     for state_in, state_out in metadata['state_handoff'].items():
         assert output_schema[state_out] == schema[state_in]
+
+
+def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
+    """One recorded calibration frame must BE one graph invocation.
+
+    ``capture_calibration_inputs`` keeps the graph's batch dimension and
+    ``np.stack`` adds the calibration-frame axis on top of it.  Dropping the
+    batch axis would leave every ``.bin`` one rank short of the input the
+    accelerator binds it to, and nothing downstream re-derives the shape --
+    the manifest is what a quantizer reads.  So the per-frame shapes are
+    compared against the ONNX graph this exporter really produces rather than
+    against a literal that could be edited to match a regression.
+    """
+    onnx = pytest.importorskip('onnx')
+    from calibration_io import (
+        capture_calibration_inputs,
+        write_calibration_artifact,
+    )
+
+    stream = _stream_model()
+    inputs = initial_inputs()
+    graph_path = os.fspath(tmp_path / 'gtcrn_stream.onnx')
+    torch.onnx.export(
+        stream, tuple(tensor.clone() for tensor in inputs), graph_path,
+        input_names=list(INPUT_NAMES),
+        output_names=list(OUTPUT_NAMES),
+        opset_version=17, do_constant_folding=True,
+    )
+    graph_shapes = {
+        value.name: [int(dim.dim_value)
+                     for dim in value.type.tensor_type.shape.dim]
+        for value in onnx.load(graph_path).graph.input
+    }
+    assert set(graph_shapes) == set(INPUT_NAMES)
+
+    # Two invocations, recorded exactly the way calibration_main records them.
+    captured = {}
+    mix, conv, tra, inter = initial_inputs()
+    with torch.no_grad():
+        for _ in range(2):
+            capture_calibration_inputs(
+                captured, INPUT_NAMES, (mix, conv, tra, inter)
+            )
+            _, conv, tra, inter = stream(mix, conv, tra, inter)
+    arrays = {name: np.stack(values).astype(np.float32, copy=False)
+              for name, values in captured.items()}
+    artifact = tmp_path / 'calib'
+    write_calibration_artifact(artifact, arrays, {'frames': 2}, 'bin')
+    manifest = json.loads((artifact / 'manifest.json').read_text())
+
+    for name in INPUT_NAMES:
+        assert manifest['binary_tensors'][name]['frame_shape'] == (
+            graph_shapes[name]
+        ), name
+        # And the bytes on disk really hold one whole graph input.
+        blob = np.fromfile(artifact / name / ('%s_1.bin' % name), '<f4')
+        assert blob.size == int(np.prod(graph_shapes[name])), name

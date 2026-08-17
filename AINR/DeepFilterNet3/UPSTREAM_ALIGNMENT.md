@@ -73,7 +73,7 @@ complex spectrum after both stages, mask derived as `|spec_e|/|spec|`, beta
 config-driven, **not** gated on `training` (DFN2's was an ERB-mask post-filter with
 beta hardcoded; the two are not interchangeable) · libDF's `wnorm` analysis scale
 (`analysis_scale`, `erb_band_db`) · the lookahead relation enforced once in the
-constructor · `validate_signal_config` shared by the trainer and `denoise.py`.
+constructor · `validate_signal_config` shared by the trainer and `inference.py`.
 
 ### One alignment that was tried and REJECTED
 
@@ -139,8 +139,8 @@ Within a tier, cheapest fix first.
 | # | Item | Upstream | Port | Consequence | Action |
 |---|---|---|---|---|---|
 | 9 | Calibrator vs trainer ERB expression | one expression for both (`lib.rs:229`); no separate calibration script exists | `clamp_min(1e-16)` + `re²+im²` (`calibrate_norm_init.py:119-121`) vs the trainer's `(erb_power+1e-10).log10()*10` + `abs().pow(2)` (`train.py:476-477`) | The calibrator observes band levels 0–60 dB below anything the trainer can render; those frames drag the least-squares ramp's HF endpoint down, biasing `erb_norm_init_hi_db` low. | align (make the calibrator use the trainer's expression) |
-| 10 | Model-input STFT priming | libDF zero-primes `analysis_mem` (`lib.rs:118-119`) and the offline front-end **drops** the primed frame (`transforms.rs:162,187`) | `torch.stft(...)` defaults `center=True, pad_mode='reflect'` — never passed, never commented (`train.py:746-749`, `:799-802`, `denoise.py:117-120`) | Clip onset contains a **time-reversed copy of the signal** where libDF has silence, and that lands inside the init-dominated EMA transient (3τ = 273 frames vs 281 frames per 3 s segment). Steady state is only a fixed half-window frame-timing offset, which a streaming implementation reproduces exactly. Train and inference are mutually consistent, so training converges. | document the offset + the onset difference; consider zero-priming |
-| 11 | `conv_lookahead >= df_lookahead` invariant | asserted (`deepfilternet3.py:357-358`) | validated **independently** at three sites (`model.py:636-644`, `train.py:597-601`, `denoise.py:51-54`); `config.ini:26` states the rule in prose, nothing enforces it | Configs upstream refuses to build are accepted. Latent only — shipped 1/1 satisfies it. | align (2 lines) |
+| 10 | Model-input STFT priming | libDF zero-primes `analysis_mem` (`lib.rs:118-119`) and the offline front-end **drops** the primed frame (`transforms.rs:162,187`) | `torch.stft(...)` defaults `center=True, pad_mode='reflect'` — never passed, never commented (`train.py:746-749`, `:799-802`, `inference.py:117-120`) | Clip onset contains a **time-reversed copy of the signal** where libDF has silence, and that lands inside the init-dominated EMA transient (3τ = 273 frames vs 281 frames per 3 s segment). Steady state is only a fixed half-window frame-timing offset, which a streaming implementation reproduces exactly. Train and inference are mutually consistent, so training converges. | document the offset + the onset difference; consider zero-priming |
+| 11 | `conv_lookahead >= df_lookahead` invariant | asserted (`deepfilternet3.py:357-358`) | validated **independently** at three sites (`model.py:636-644`, `train.py:597-601`, `inference.py:51-54`); `config.ini:26` states the rule in prose, nothing enforces it | Configs upstream refuses to build are accepted. Latent only — shipped 1/1 satisfies it. | align (2 lines) |
 | 12 | `SqueezedGRU_S` skip target | `x = x + self.gru_skip(input)` — the **raw** input (`modules.py:732-738`) | `y = y + self.gru_skip(x)` where `x` was already rebound by `linear_in` (`model.py:300-306`) | Dormant: all three sites pass `gru_skip_op=None` and the released checkpoint has zero `gru_skip` keys. If ever enabled it **crashes loudly** (256 vs 512), not silently. Still a wrong reusable building block whose docstring reads as correct. | align (1 line) |
 | 13 | `enc_concat=True` bus width | separate `emb_in_dim` / `emb_out_dim`; only the **input** doubles (`deepfilternet3.py:125-136,152-155`) | one attribute, so `output_size` doubles too (`model.py:336,348-350,356-357`) | Dormant at shipped `enc_concat = false`; setting it true emits a 1024-wide bus the ERB decoder rejects. `enc_concat` **is** an exposed knob. | align |
 
@@ -462,7 +462,7 @@ deliberate, verified divergence.
 15. **`validate_signal_config` is the one divisibility guard**, and it checks
     `n_erb % 8` — upstream's stricter rule, not the `% 4` the two stride-2 stages
     would need. `model.py` carries no equivalent assert, so do not delete it on
-    the assumption that it does. Both the trainer and `denoise.py` call it.
+    the assumption that it does. Both the trainer and `inference.py` call it.
     Enforced by `test_n_erb_divisibility_follows_upstreams_stricter_rule`.
 
 ### Loss

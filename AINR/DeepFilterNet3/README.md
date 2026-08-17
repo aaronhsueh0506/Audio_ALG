@@ -42,7 +42,7 @@ overlap in parameter names.
 ```bash
 python3 train.py --config config.ini --packed-dir /path/to/data_48k
 
-python3 denoise.py --config config.ini \
+python3 inference.py --config config.ini \
     --model /path/to/dfn3_checkpoint.pt \
     --input input_48k.wav --output output_48k.wav
 ```

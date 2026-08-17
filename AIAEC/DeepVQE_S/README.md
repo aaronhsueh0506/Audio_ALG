@@ -23,3 +23,17 @@ published 0.59 M small-model class (the 16 kHz power-of-two adaptation is about
 0.63 M); four similarity channels and the factorization `27=3*3*3` remain
 explicit reconstruction choices. It is architecture-faithful, not checkpoint
 or bit exact.
+
+## ONNX and calibration
+
+```bash
+python3 export_onnx.py --checkpoint checkpoint.pth \
+  --output output/deepvqe_s.onnx --verify
+python3 inference.py calib --checkpoint checkpoint.pth \
+  --primary-dir /path/to/microphone --far-dir /path/to/far \
+  --frames 8192 --format bin --output calib/deepvqe_s
+```
+
+Use `--format npz --output calib/deepvqe_s.npz` for a NumPy archive. BIN
+output contains one directory per graph input and one numbered file per
+streaming invocation.

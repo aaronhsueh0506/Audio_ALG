@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from AIAEC.Align_ULCNet.export_streaming_onnx import (
+from AIAEC.Align_ULCNet.export_onnx import (
     AlignUlcnetStreamingExport,
     GRU_HIDDEN,
     GRU_LAYERS,

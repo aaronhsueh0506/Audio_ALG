@@ -8,6 +8,17 @@ centre feature frame together with every updated state tensor.
 
 STFT, feature normalisation, the three-frame feature window, deep-filter
 composition and WOLA remain in the host C code.
+
+Run from ``AINR/DeepFilterNet2``::
+
+    python3 export_onnx.py --model output/dfn2_best.pth \
+        --output output/dfn2_stream.onnx --verify
+
+Generate deployment calibration beside this model with::
+
+    python3 inference.py calib --model output/dfn2_best.pth \
+        --wav-dir /path/to/noisy --frames 8192 --format bin \
+        --output calib/dfn2
 """
 
 import argparse
@@ -22,9 +33,9 @@ from torch import nn
 import torch.nn.functional as F
 
 try:
-    from .denoise import load_model
+    from .inference import load_model
 except ImportError:  # direct ``python export_onnx.py`` execution
-    from denoise import load_model
+    from inference import load_model
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))

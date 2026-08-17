@@ -523,7 +523,7 @@ def read_model_config(cfg):
 
     Defaults come from ``DeepFilterNet2.__init__``'s own signature rather than
     from a ``fallback=`` on each read.  They used to be restated in train.py
-    *and* denoise.py, so a knob whose fallback was updated in one place built a
+    *and* inference.py, so a knob whose fallback was updated in one place built a
     differently-shaped model in the other -- which surfaces only as a
     load_state_dict failure at inference time, long after the training run.
 
@@ -742,7 +742,7 @@ def make_checkpoint_contract(
 #: entitled to change on an existing checkpoint -- ⚠ it IS recorded, because DFN3's
 #: form is ungated and therefore does change the training objective, and it IS
 #: still enforced when resuming training; it is only waived on the inference path.
-#: Without this, flipping `mask_pf = true` to try the post-filter made denoise.py
+#: Without this, flipping `mask_pf = true` to try the post-filter made inference.py
 #: refuse to load the checkpoint, i.e. the knob could not be exercised at all.
 RENDER_ONLY_CONTRACT_KEYS = ('mask_pf', 'pf_beta')
 
@@ -1290,7 +1290,7 @@ def train(args):
                 # (3*tau = 273 frames vs 281 frames per 3 s segment).  In steady
                 # state center=True is only a fixed half-window frame-timing
                 # offset that a streaming implementation reproduces exactly, and
-                # train/inference here are mutually consistent (denoise.py uses
+                # train/inference here are mutually consistent (inference.py uses
                 # the same defaults), so this is a documented offset, not a
                 # latency bug.
                 # ⚠ MEASURED: center=False is NOT a one-line alignment.  At

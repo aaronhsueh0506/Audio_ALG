@@ -9,7 +9,6 @@ import torch
 
 import AIAEC.training_common as training_common
 from AIAEC.Align_CRUSE import AlignCRUSE
-from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.training_common import (
     CALIBRATION_ONLY_FAR_INPUT_MODE,
@@ -39,7 +38,6 @@ from AIAEC.dataset_gen import (
     require_linear_aec_contract,
 )
 from AIAEC.dataset_gen.aec_behavior_hash import aec_python_behavior_hash
-from AINR.DeepFilterNet2.model import DeepFilterNet2
 
 
 def _cfg(text: str) -> configparser.ConfigParser:
@@ -51,8 +49,6 @@ def _cfg(text: str) -> configparser.ConfigParser:
 @pytest.mark.parametrize('module_name', [
     'AIAEC.Align_CRUSE.train',
     'AIAEC.Align_ULCNet.train',
-    'AIAEC.GTCRN_AENR.train',
-    'AIAEC.DeepFilterNet_AENR.train',
     'AIAEC.DeepVQE_S.train',
     'AIAEC.CAGCRN.train',
 ])
@@ -111,8 +107,6 @@ def test_training_progress_matches_ainr_epoch_style(monkeypatch):
 @pytest.mark.parametrize('module_name', [
     'AIAEC.Align_CRUSE.train',
     'AIAEC.Align_ULCNet.train',
-    'AIAEC.GTCRN_AENR.train',
-    'AIAEC.DeepFilterNet_AENR.train',
     'AIAEC.DeepVQE_S.train',
     'AIAEC.CAGCRN.train',
 ])
@@ -176,21 +170,6 @@ def test_read_model_kwargs_overlays_only_declared_keys():
 def test_read_model_kwargs_rejects_unknown_key():
     with pytest.raises(ValueError, match='not a AlignCRUSE constructor argument'):
         read_model_kwargs(_cfg('[model]\nnot_a_real_arg = 1\n'), AlignCRUSE)
-
-
-def test_read_model_kwargs_merges_extra_bases_for_kwargs_forwarding_subclass():
-    kwargs = read_model_kwargs(
-        _cfg('[model]\nenc_ch = 8\nn_erb = 32\n'), DeepFilterNetAENR,
-        extra_bases=(DeepFilterNet2,),
-        exclude={'n_fft', 'sr', 'n_erb', 'df_bins', 'df_order',
-                'mask_lookahead', 'df_lookahead'},
-    )
-    # enc_ch only exists on the base class, forwarded via **kwargs.
-    assert kwargs['enc_ch'] == 8
-    # n_erb is DeepFilterNetAENR's own explicit param, not excluded from it.
-    assert kwargs['n_erb'] == 32
-    # Excluded base params must not leak back in as configurable.
-    assert 'sr' not in kwargs and 'n_fft' not in kwargs
 
 
 def test_checkpoint_contract_roundtrip_and_mismatch():
@@ -610,7 +589,7 @@ def test_behaviour_hash_migration_is_refused_in_reverse(pair):
 
 def test_resnr_trainers_do_not_import_or_execute_live_linear_aec():
     aiaec_root = pathlib.Path(__file__).parents[1]
-    for model_name in ('Align_ULCNet', 'GTCRN_AENR', 'DeepFilterNet_AENR'):
+    for model_name in ('Align_ULCNet',):
         source = (aiaec_root / model_name / 'train.py').read_text()
         assert 'LinearAecEngine' not in source
         assert 'build_sequence_loaders' not in source

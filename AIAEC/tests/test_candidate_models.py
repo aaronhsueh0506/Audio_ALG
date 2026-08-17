@@ -7,9 +7,7 @@ from AIAEC.aiaec_common import SignalGrid
 from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.Align_ULCNet import AlignULCNet, ChannelSampledReorientation
 from AIAEC.CAGCRN import CAGCRN
-from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.DeepVQE_S import DeepVQES
-from AIAEC.GTCRN_AENR import GTCRNAENR
 from AIAEC.dataset_gen import MODEL_TASKS
 
 
@@ -36,7 +34,6 @@ def _assert_finite_parameter_gradients(model, loss):
 @pytest.mark.parametrize("factory", [
     lambda: AlignCRUSE(G16),
     lambda: AlignULCNet(G16),
-    lambda: GTCRNAENR(G16),
     lambda: DeepVQES(G16),
     lambda: CAGCRN(G16),
 ])
@@ -53,7 +50,6 @@ def test_waveform_boundary_models_forward_finite(factory):
 @pytest.mark.parametrize("factory", [
     lambda: AlignCRUSE(G16),
     lambda: AlignULCNet(G16),
-    lambda: GTCRNAENR(G16),
     lambda: DeepVQES(G16),
     lambda: CAGCRN(G16),
 ])
@@ -75,55 +71,6 @@ def test_grid_adapted_models_accept_48k(factory):
     with torch.no_grad():
         out = model(x, x)
     assert out.enhanced.shape == x.shape
-
-
-def test_gtcrn_aenr_rejects_non_upstream_grid():
-    with pytest.raises(ValueError, match="upstream 16 kHz/512"):
-        GTCRNAENR(G48)
-
-
-def test_deepfilternet_conditioner_is_error_passthrough_at_init():
-    model = DeepFilterNetAENR(
-        G48, enc_ch=8, emb_size=32, df_hidden=32,
-        lin_groups=4, enc_lin_groups=4,
-    ).eval()
-    error_erb = torch.randn(1, 1, 3, 32)
-    far_erb = torch.randn_like(error_erb)
-    error_spec = torch.randn(1, 2, 3, 96)
-    far_spec = torch.randn_like(error_spec)
-    erb, spec = model.condition_features(
-        error_erb, error_spec, far_erb, far_spec,
-    )
-    assert torch.equal(erb, error_erb)
-    assert torch.equal(spec, error_spec)
-
-
-def test_deepfilternet_aenr_forward_contract():
-    model = DeepFilterNetAENR(
-        G48, enc_ch=8, emb_size=32, df_hidden=32,
-        lin_groups=4, enc_lin_groups=4,
-    ).eval()
-    x = _spec(1, 3, G48.n_freqs)
-    erb = torch.randn(1, 1, 3, 32)
-    spec = torch.randn(1, 2, 3, 96)
-    with torch.no_grad():
-        out = model(x, erb, spec, erb, spec)
-    assert out.enhanced.shape == x.shape
-    assert out.auxiliary["deep_filter_coefficients"].shape[:3] == (1, 3, 96)
-
-
-def test_deepfilternet_aenr_backward_finite():
-    model = DeepFilterNetAENR(
-        G48, enc_ch=8, emb_size=32, df_hidden=32,
-        lin_groups=4, enc_lin_groups=4,
-    ).train()
-    error = _spec(2, 3, G48.n_freqs)
-    error_erb = torch.randn(2, 1, 3, 32)
-    far_erb = torch.randn_like(error_erb)
-    error_spec = torch.randn(2, 2, 3, 96)
-    far_spec = torch.randn_like(error_spec)
-    output = model(error, error_erb, error_spec, far_erb, far_spec)
-    _assert_finite_parameter_gradients(model, output.enhanced.abs().mean())
 
 
 def test_cagcrn_soft_window_has_gradient():
@@ -201,7 +148,6 @@ def test_grid_adapted_models_accept_16k_low_latency_grid(factory):
 @pytest.mark.parametrize("factory", [
     lambda: AlignCRUSE(G16),
     lambda: AlignULCNet(G16),
-    lambda: GTCRNAENR(G16),
     lambda: DeepVQES(G16),
     lambda: CAGCRN(G16),
 ])
@@ -252,8 +198,6 @@ def test_model_task_attributes_match_the_training_contract():
     classes = {
         'Align_CRUSE': AlignCRUSE,
         'Align_ULCNet': AlignULCNet,
-        'GTCRN_AENR': GTCRNAENR,
-        'DeepFilterNet_AENR': DeepFilterNetAENR,
         'DeepVQE_S': DeepVQES,
         'CAGCRN': CAGCRN,
     }

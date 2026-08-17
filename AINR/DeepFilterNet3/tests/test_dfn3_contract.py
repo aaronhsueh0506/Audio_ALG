@@ -17,11 +17,11 @@ ROOT_PATH = pathlib.Path(ROOT)
 sys.path.insert(0, ROOT)
 
 # Each of the three model projects has its own top-level ``train.py`` (and
-# ``denoise.py``/``model.py``).  Under a single pytest session the first one
+# ``inference.py``/``model.py``). Under a single pytest session the first one
 # imported wins ``sys.modules``, so a sibling project's tests would silently
 # exercise the wrong code.  Dropping the cached entries forces the re-import
 # to resolve against the ROOT just inserted above.
-for _stale in ('train', 'denoise', 'model', 'checkpoint_utils'):
+for _stale in ('train', 'inference', 'model', 'checkpoint_utils'):
     sys.modules.pop(_stale, None)
 
 
@@ -63,7 +63,7 @@ def build_shipped_model(cfg, **overrides):
 
     Goes through the trainer's own ``read_model_config`` rather than re-reading
     the keys: a local copy is a third restatement of the constructor's defaults
-    (train.py and denoise.py were the first two, which is why that function
+    (train.py and inference.py were the first two, which is why that function
     exists), and it silently omitted ``df_hidden``, ``mask_pf`` and ``pf_beta`` --
     so tests built those three from constructor defaults while the trainer built
     them from config.  It also inherits the unknown-key rejection.
@@ -429,7 +429,7 @@ def test_lookahead_relation_is_enforced_in_the_model_constructor():
     """df_lookahead > mask_lookahead must be rejected at the single source.
 
     Guards against the invariant drifting back out into per-entry-point copies:
-    train.py and denoise.py deliberately no longer check it, so if the
+    train.py and inference.py deliberately no longer check it, so if the
     constructor stops enforcing it nothing does.
     """
     cfg = load_config()

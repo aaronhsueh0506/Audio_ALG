@@ -37,8 +37,8 @@ typedef struct {
 void dfn2_model_io_init(DFN2ModelIOState *state);
 
 /* Slide a [t-1,t,t+1] feature window by one frame and write the newest frame
- * into the last slot. Exposed rather than inlined because DeepFilterNet-AENR
- * keeps four such windows in its own state struct: a second copy of the
+ * into the last slot. Exported rather than inlined so an external dual-input
+ * consumer keeping its own windows reuses this one: a second copy of the
  * memmove/memcpy pair is a place for the window order to drift silently,
  * which no shape check would catch. */
 void dfn2_model_io_push_erb_window(
@@ -49,9 +49,9 @@ void dfn2_model_io_push_spec_window(
     const float frame[2][DFN2_DF_BINS]);
 
 /* Commit the four explicit-state graph outputs into caller-owned arrays.
- * Takes the arrays instead of a state struct so a host whose struct differs
- * (DeepFilterNet-AENR, which carries four feature windows) shares this
- * implementation without changing its own field layout. */
+ * Takes the arrays instead of a state struct so an external dual-input
+ * consumer whose struct differs reuses this commit discipline without
+ * changing its own field layout. */
 int dfn2_model_io_commit_arrays(
     float encoder_gru_hidden[DFN2_MODEL_ENCODER_GRU_LAYERS]
                             [DFN2_MODEL_GRU_HIDDEN],

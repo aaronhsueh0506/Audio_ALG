@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Export GTCRN as a one-frame explicit-state streaming ONNX graph."""
+"""Export GTCRN as a one-frame explicit-state streaming ONNX graph.
+
+Run from ``AINR/GTCRN``::
+
+    python3 export_onnx.py --model output/gtcrn_best.pth \
+        --output output/gtcrn_stream.onnx --verify
+
+Generate deployment calibration beside this model with::
+
+    python3 inference.py calib --model output/gtcrn_best.pth \
+        --wav-dir /path/to/noisy --frames 8192 --format bin \
+        --output calib/gtcrn
+"""
 
 import argparse
 import configparser

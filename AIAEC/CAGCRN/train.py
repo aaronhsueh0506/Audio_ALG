@@ -28,7 +28,7 @@ dataset:
     performs a deterministic random split over individual 10-second chunks.
     CAGCRN is end-to-end -- mic + unaligned far-end go straight to one
     network, no linear AEC in front -- so like Align_CRUSE (and unlike
-    ../GTCRN_AENR/train.py) there is no persistent external state to
+    the other candidate trainers) there is no persistent external state to
     preserve across chunks, and training draws chunks with a plain SHUFFLED
     DataLoader over each split.
 
@@ -44,7 +44,7 @@ operation. This implementation uses a differentiable soft delay-window gate
 instead -- trainable, but checkpoint-incompatible with any unpublished
 author implementation.
 
-inference: see denoise.py's own top-of-file usage comment.
+inference: see inference.py's own top-of-file usage comment.
 """
 
 import argparse

@@ -43,7 +43,7 @@ The feature version remains shared with the preserved DFN3 branch, but the
 model version does not. Old v5 band-split checkpoints belong in
 `../DeepFilterNet3/` and must not be renamed or force-loaded here.
 
-`train.py --resume` and `denoise.py --model` validate the serialized signal,
+`train.py --resume` and `inference.py --model` validate the serialized signal,
 feature, and model contract before loading.
 
 ## Train and infer
@@ -51,7 +51,7 @@ feature, and model contract before loading.
 ```bash
 python3 train.py --config config.ini --packed-dir /path/to/data_48k
 
-python3 denoise.py --config config.ini \
+python3 inference.py --config config.ini \
     --model /path/to/dfn2_checkpoint.pt \
     --input input_48k.wav --output output_48k.wav
 ```
@@ -86,9 +86,9 @@ python3 export_onnx.py --model output/dfn2_best.pth \
   --output output/dfn2_stream.onnx --verify
 python3 export_erb_matrix.py --model output/dfn2_best.pth \
   --output-dir output/erb --format all
-python3 export_calibration.py --model output/dfn2_best.pth \
-  --wav-dir /path/to/noisy_wavs --frames 256 \
-  --output output/dfn2_calibration.npz
+python3 inference.py calib --model output/dfn2_best.pth \
+  --wav-dir /path/to/noisy_wavs --frames 8192 --format bin \
+  --output calib/dfn2
 ```
 
 The graph is stateless from the accelerator's perspective. Each invocation
@@ -99,17 +99,18 @@ input kernel sees three frames while the DF residual path has a causal
 five-frame kernel; omitting it would silently reduce the trained receptive
 field. CPU-side window/state storage is defined by
 `dfn2_model_io.c/.h`, which also exports the window-slide and state-commit
-helpers so a host with its own state struct — DeepFilterNet-AENR keeps four
-feature windows — shares one implementation instead of copying the
+helpers so an external dual-input consumer with its own state struct reuses
+this window/commit discipline instead of inlining a second copy of the
 memmove/memcpy pair. State commit is transactional: a null or non-finite
 accelerator output returns `-1` before any persistent state is overwritten.
 The exported metadata carries `state_layout_version`,
 kept numerically equal to `DFN2_MODEL_IO_LAYOUT_VERSION` in that header, so an
 integrator can refuse a graph whose state layout no longer matches the struct
-it allocated. `export_calibration.py --frames N` captures `N`
+it allocated. `inference.py calib --frames N` captures `N`
 streaming invocations with real non-zero state. `calibrate_norm_init.py` is a
 different tool: it estimates the feature EMA initialization constants used by
 the C frontend.
+Use `--format npz --output calib/dfn2.npz` when a NumPy archive is needed.
 
 ## Debugging excessive low-frequency suppression
 

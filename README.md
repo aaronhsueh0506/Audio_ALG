@@ -11,7 +11,7 @@ contracts.
 |---|---|---|
 | `pipelines/` | Production-oriented linear AEC + echo-aware NR/RES | [`pipelines/README.md`](pipelines/README.md) |
 | `AINR/` | Standalone speech enhancement | [`AINR/README.md`](AINR/README.md) |
-| `AIAEC/` | Six neural AEC/AENR candidate architectures | [`AIAEC/README.md`](AIAEC/README.md) |
+| `AIAEC/` | Four neural AEC candidate architectures | [`AIAEC/README.md`](AIAEC/README.md) |
 | `pipelines/4ch_aec_bf_nr_res/` | Python reference and C API for four linear AEC lanes around an externally owned SRP-PHAT/GSC | [`pipelines/4ch_aec_bf_nr_res/README.md`](pipelines/4ch_aec_bf_nr_res/README.md) |
 | `lib/aec/`, `lib/nr/` | Conventional algorithm libraries | Git submodules |
 
@@ -38,8 +38,7 @@ checkpoints are not interchangeable.
 
 `AIAEC/` contains:
 
-- linear-AEC-conditioned RES+NR: `Align_ULCNet`, `GTCRN_AENR`,
-  `DeepFilterNet_AENR`;
+- linear-AEC-conditioned RES+NR: `Align_ULCNet`;
 - end-to-end AEC+RES+NR: `Align_CRUSE`, `DeepVQE_S`, `CAGCRN`.
 
 (`Align_CRUSE` previously ran its own AEC-only, noise-preserving route; that
@@ -116,7 +115,7 @@ README inside the corresponding model directory.
 
 ```text
 Audio_ALG/
-├── AIAEC/               # neural AEC/AENR candidates and AEC dataset
+├── AIAEC/               # neural AEC candidates and AEC dataset
 ├── AINR/                # standalone neural noise reduction
 ├── docs/                # current docs plus archived design records
 ├── lib/

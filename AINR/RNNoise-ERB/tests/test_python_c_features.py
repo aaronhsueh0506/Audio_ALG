@@ -17,11 +17,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # Each of the three model projects has its own top-level ``train.py`` (and
-# ``denoise.py``/``model.py``).  Under a single pytest session the first one
+# ``inference.py``/``model.py``). Under a single pytest session the first one
 # imported wins ``sys.modules``, so a sibling project's tests would silently
 # exercise the wrong code.  Dropping the cached entries forces the re-import
 # to resolve against the ROOT just inserted above.
-for _stale in ('train', 'denoise', 'model', 'checkpoint_utils'):
+for _stale in ('train', 'inference', 'model', 'checkpoint_utils'):
     sys.modules.pop(_stale, None)
 
 
@@ -31,7 +31,7 @@ from train import (  # noqa: E402
     extract_model_features,
     read_feature_config,
 )
-from denoise import apply_atten_lim  # noqa: E402
+from inference import apply_atten_lim  # noqa: E402
 
 
 N_BINS = 257
@@ -206,7 +206,7 @@ def main():
     np.testing.assert_allclose(
         c_spec_state, py_state['spec'][0, 0].numpy(), rtol=3e-5, atol=3e-5)
 
-    # rnnoise_apply_atten_lim must agree with denoise.py's apply_atten_lim
+    # rnnoise_apply_atten_lim must agree with inference.py's apply_atten_lim
     # (attenuation-limit gain mix, ported from Rikorose/DeepFilterNet
     # enhance.py) bit-for-bit-equivalent within float32 tolerance, both
     # for the disabled (<=0) no-op path and the active-mixing path.
@@ -225,7 +225,7 @@ def main():
         np.testing.assert_allclose(c_gains, py_out, rtol=1e-6, atol=1e-6)
 
     print('PASS: train.py and process.c STFT/features/states agree')
-    print('PASS: rnnoise_apply_atten_lim matches denoise.py apply_atten_lim')
+    print('PASS: rnnoise_apply_atten_lim matches inference.py apply_atten_lim')
 
 
 def test_main():

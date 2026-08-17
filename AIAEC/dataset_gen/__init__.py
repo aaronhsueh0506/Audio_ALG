@@ -1,6 +1,6 @@
 """AEC scenario dataset generation and the shared primitives models import.
 
-The six AEC model projects import from here and nowhere else:
+The four AEC model projects import from here and nowhere else:
 
     from AIAEC.dataset_gen import (
         AecGrid, AecStems, SequenceChunkSampler, PackedAecDataset,

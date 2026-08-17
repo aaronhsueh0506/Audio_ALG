@@ -707,7 +707,7 @@ class DeepFilterNet3(nn.Module):
             )
         # ⚠ THE single source of truth for the lookahead relation.  Upstream
         # relates the two (deepfilternet3.py:357-358); the port validated them
-        # independently here, in train.py and in denoise.py, and stated the
+        # independently here, in train.py and in inference.py, and stated the
         # relation only in config.ini prose -- so a config upstream refuses to
         # build was accepted by all three.  It belongs in the constructor,
         # because every entry point goes through it.

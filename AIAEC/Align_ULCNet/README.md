@@ -31,7 +31,7 @@ For the listening examples on the paper's project page, the track labelled
 only this neural post-filter with that external frontend, use:
 
 ```bash
-python3 denoise.py checkpoint.pth official_err.mp3 official_lpb.mp3 out.wav \
+python3 inference.py checkpoint.pth official_err.mp3 official_lpb.mp3 out.wav \
   --input-is-linear-error
 ```
 
@@ -231,23 +231,41 @@ if (run_accelerator(&in, &out) == 0 &&
 Export a true one-frame graph with:
 
 ```bash
-python3 export_streaming_onnx.py \
+python3 export_onnx.py \
   --checkpoint checkpoint.pth \
   --max-delay-frames 8 \
   --output output/align_ulcnet_d8_stream.onnx \
   --verify
 ```
 
-Capture PTQ inputs for the same D with the shared streaming calibrator:
+Capture PTQ inputs for the same D with this model's calibration entry point:
 
 ```bash
-python3 ../export_streaming_calibration.py Align_ULCNet \
+python3 inference.py calib \
   --checkpoint checkpoint.pth \
   --primary-dir /path/to/linear_error \
   --far-dir /path/to/raw_far \
   --frames 256 --max-delay-frames 8 \
-  --output output/align_ulcnet_d8_calibration.npz
+  --format npz --output calib/align_ulcnet_d8.npz
 ```
+
+For NPU tools that consume one raw file per input per invocation, select the
+binary directory format:
+
+```bash
+python3 inference.py calib \
+  --checkpoint checkpoint.pth \
+  --primary-dir /path/to/linear_error \
+  --far-dir /path/to/raw_far \
+  --frames 8192 --max-delay-frames 8 \
+  --format bin \
+  --output calib/align_ulcnet_d8
+```
+
+The layout is `<tensor>/<tensor>_<frame>.bin`, with one-based frame numbers;
+for example `gru0_hidden/gru0_hidden_1.bin`. Each file is C-contiguous and
+little-endian. `manifest.json` records dtype and per-frame shape. The output
+directory must not already exist, so a shorter rerun cannot leave stale frames.
 
 Calibration deliberately uses the training-domain raw far signal; the report
 records that provenance separately from the production aligned-far seam. The
@@ -256,9 +274,8 @@ shapes and CPU state allocation, not because changing D requires retraining.
 
 The exporter writes a sibling JSON descriptor containing the exact grid,
 state layout version, D, the fixed `aligned_far` deployment contract, the
-checkpoint's separate training provenance, and tensor schemas. The older shared
-`AIAEC/export_onnx.py` remains a fixed-block/offline export and must not be
-used as a one-frame deployment graph.
+checkpoint's separate training provenance, and tensor schemas. Only the
+model-local `export_onnx.py` is a supported user entry point.
 
 **Every previously exported graph must be re-exported.** The model-I/O layout
 moved v2 -> v3 and the deployed far branch moved RAW -> ALIGNED, so a

@@ -1,5 +1,5 @@
 /* ============================================================
- * RNNoise-ERB 前後處理 C 實現 — 對齊 train.py / denoise.py
+ * RNNoise-ERB 前後處理 C 實現 — 對齊 train.py / inference.py
  *
  * 包含:
  *   - Radix-2 FFT/IFFT (N=N_FFT)
@@ -405,7 +405,7 @@ void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],
 /* --- 後處理: expand gains --- */
 
 void rnnoise_expand_gains(const float *band_gains, float *bin_gains) {
-    /* bin_gains = gains @ erb_inv^T (denoise.py apply gains; mode=1 為
+    /* bin_gains = gains @ erb_inv^T (inference.py apply gains; mode=1 為
      * partition of unity → gains=1 對應 bin_gains=1, 無需列正規化) */
     int k = 0;
 #if RNNOISE_HAVE_NEON

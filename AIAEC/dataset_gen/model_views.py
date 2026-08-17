@@ -40,8 +40,6 @@ class SpectralModelView:
 MODEL_TASKS = {
     "Align_CRUSE": "end_to_end_aec_res_nr_dereverb",
     "Align_ULCNet": "linear_aec_postfilter_res_nr_dereverb",
-    "GTCRN_AENR": "linear_aec_postfilter_res_nr_dereverb",
-    "DeepFilterNet_AENR": "linear_aec_postfilter_res_nr_dereverb",
     "DeepVQE_S": "end_to_end_aec_res_nr_dereverb",
     "CAGCRN": "end_to_end_aec_res_nr_dereverb",
 }
@@ -99,77 +97,19 @@ def _standard_spectrum(waveform: Tensor, grid: AecGrid) -> Tensor:
     return stft(_as_batch(waveform), grid).transpose(-2, -1)
 
 
-def build_spectral_model_view(
-        view: ModelView, grid: AecGrid, *, dfn_model=None,
-        dfn_feature_config: Optional[Dict[str, Any]] = None,
-        dfn_feature_state: Optional[Dict[str, Any]] = None,
-        ) -> SpectralModelView:
-    """Convert a waveform view into exact model ``forward(**inputs)`` tensors.
-
-    DeepFilterNet is intentionally special: its feature path uses normalized
-    STFT coefficients and two independent causal EMA states for linear-error
-    and far-end features.  Reusing one state is rejected by construction.
-    """
+def build_spectral_model_view(view: ModelView,
+                              grid: AecGrid) -> SpectralModelView:
+    """Convert a waveform view into exact model ``forward(**inputs)`` tensors."""
     if grid.sr <= 0:
         raise ValueError("invalid AEC grid")
     target_wave = _as_batch(view.target)
 
-    if view.model_name != "DeepFilterNet_AENR":
-        inputs = {
-            name: _standard_spectrum(waveform, grid)
-            for name, waveform in view.inputs.items()
-        }
-        return SpectralModelView(
-            view.model_name, view.task, inputs,
-            _standard_spectrum(target_wave, grid),
-        )
-
-    if dfn_model is None or dfn_feature_config is None:
-        raise ValueError(
-            "DeepFilterNet_AENR spectral views require dfn_model and the "
-            "exact read_feature_config() result used by that checkpoint"
-        )
-    if set(view.inputs) != {"linear_error", "far_end"}:
-        raise ValueError("DeepFilterNet_AENR waveform view contract is corrupt")
-    if dfn_feature_state is not None:
-        if set(dfn_feature_state) != {"error", "far"}:
-            raise ValueError("DFN state must contain independent 'error' and 'far' states")
-        if dfn_feature_state["error"] is dfn_feature_state["far"]:
-            raise ValueError("error and far DFN EMA states must not be shared")
-
-    def normalized_stft(waveform: Tensor) -> Tensor:
-        waveform = _as_batch(waveform)
-        return torch.stft(
-            waveform, grid.n_fft, grid.hop_len, grid.win_len,
-            window=grid.window(device=waveform.device, dtype=waveform.dtype),
-            normalized=True, return_complex=True,
-        )
-
-    # Import locally so non-DFN dataset consumers do not acquire trainer
-    # dependencies or configuration side effects.
-    from AINR.DeepFilterNet2.train import extract_dfn2_features
-
-    error_spec = normalized_stft(view.inputs["linear_error"])
-    far_spec = normalized_stft(view.inputs["far_end"])
-    error_state = None if dfn_feature_state is None else dfn_feature_state["error"]
-    far_state = None if dfn_feature_state is None else dfn_feature_state["far"]
-    _, error_erb, error_feat, next_error = extract_dfn2_features(
-        error_spec, dfn_model.erb_fb, dfn_model.df_bins,
-        feature_cfg=dfn_feature_config, ema_state=error_state,
-    )
-    _, far_erb, far_feat, next_far = extract_dfn2_features(
-        far_spec, dfn_model.erb_fb, dfn_model.df_bins,
-        feature_cfg=dfn_feature_config, ema_state=far_state,
-    )
+    inputs = {
+        name: _standard_spectrum(waveform, grid)
+        for name, waveform in view.inputs.items()
+    }
     return SpectralModelView(
         view.model_name, view.task,
-        {
-            "linear_error": error_spec.transpose(1, 2),
-            "error_erb": error_erb,
-            "error_spec": error_feat,
-            "far_erb": far_erb,
-            "far_spec": far_feat,
-        },
-        normalized_stft(target_wave).transpose(1, 2),
-        feature_state={"error": next_error, "far": next_far},
+        inputs,
+        _standard_spectrum(target_wave, grid),
     )

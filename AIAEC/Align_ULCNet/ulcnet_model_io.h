@@ -22,7 +22,7 @@ extern "C" {
 
 /* Version 3 fixes the deployed far branch to AEC-aligned far.  The exported
  * metadata separately records the checkpoint's training provenance.  Kept
- * numerically equal to export_streaming_onnx.py's STATE_LAYOUT_VERSION. */
+ * numerically equal to export_onnx.py's STATE_LAYOUT_VERSION. */
 #define ULCNET_MODEL_IO_LAYOUT_VERSION 3u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2

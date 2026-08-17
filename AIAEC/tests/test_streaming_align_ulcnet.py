@@ -148,23 +148,20 @@ def test_state_dict_is_d_agnostic_but_output_is_not(model):
     assert (out.enhanced - ref.enhanced).abs().max() > 1e-6
 
 
-def test_denoise_stream_path_equals_direct_forward_stream(model):
-    # The denoise.py --stream branch calls stream_forward_spec; driving
-    # forward_stream directly over the same frames must give the SAME tensor
-    # (bit-identical by construction -- same ops in the same order).
-    from AIAEC.Align_ULCNet.denoise import stream_forward_spec
+def test_inference_entry_uses_streaming_schedule(monkeypatch):
+    """The user-facing inference command must never fall back to model(...)."""
+    from argparse import Namespace
+    from AIAEC.Align_ULCNet import inference as inference_cli
+    from AIAEC.Align_ULCNet import _streaming as streaming_cli
 
-    error = _spec(1, T, GRID.n_freqs, seed=11)
-    far = _spec(1, T, GRID.n_freqs, seed=12)
-    via_cli_helper = stream_forward_spec(model, error, far)
-    state = model.create_stream_state()
-    direct = []
-    with torch.no_grad():
-        for t in range(T):
-            direct.append(model.forward_stream(
-                error[:, t:t + 1], far[:, t:t + 1], state).enhanced)
-    direct = torch.cat(direct, dim=1)
-    assert torch.equal(via_cli_helper, direct)
+    seen = []
+    monkeypatch.setattr(
+        streaming_cli, 'main',
+        lambda args, load_model_fn=None: seen.append((args, load_model_fn)),
+    )
+    args = Namespace(marker='streaming')
+    inference_cli.main(args)
+    assert seen == [(args, inference_cli.load_model)]
 
 
 def _write_synthetic_checkpoint(path, model):
@@ -189,7 +186,7 @@ def _write_synthetic_checkpoint(path, model):
 
 def test_load_model_far_input_mode_default_present_and_rejected(
         model, tmp_path, capsys):
-    from AIAEC.Align_ULCNet.denoise import load_model
+    from AIAEC.Align_ULCNet.inference import load_model
 
     path = str(tmp_path / 'ckpt.pth')
     _write_synthetic_checkpoint(path, model)
@@ -197,7 +194,7 @@ def test_load_model_far_input_mode_default_present_and_rejected(
     # _write_synthetic_checkpoint records no far_input_mode -- exactly a
     # legacy checkpoint. It must load, defaulted to raw_far, and the loader
     # must name BOTH sides: the mode the checkpoint trained on and the
-    # aligned-far seam deployment feeds it (streaming.py shares this loader
+    # aligned-far seam deployment feeds it (_streaming.py shares this loader
     # and the same seam, so both CLIs print the same line).
     load_model(path, 'cpu')
     assert ('checkpoint training far_input_mode: raw_far; deployment: aligned_far'
@@ -221,7 +218,7 @@ def test_load_model_far_input_mode_default_present_and_rejected(
 
 
 def test_load_model_max_delay_override(model, tmp_path, capsys):
-    from AIAEC.Align_ULCNet.denoise import load_model
+    from AIAEC.Align_ULCNet.inference import load_model
 
     path = str(tmp_path / 'ckpt.pth')
     _write_synthetic_checkpoint(path, model)
@@ -263,23 +260,21 @@ def _write_delayed_scene(tmp_path, samples=32768, delay=1024, seed=23):
     return mic_path, far_path, far.unsqueeze(0)
 
 
-def test_denoise_and_streaming_feed_the_model_the_same_aligned_far(
+def test_inference_feeds_model_the_pbfdkf_consumed_aligned_far(
         model, tmp_path, monkeypatch):
-    """Both CLIs must build the model's far branch from the SAME seam.
+    """The public streaming CLI must feed the exact far PBFDKF consumed.
 
     Production feeds the model the far hop the linear AEC actually consumed
     (raw until the alignment ring can serve the applied delay, ring-aligned
     afterwards), so an offline CLI that fed the raw far WAV instead would be
     evaluating a model on an input distribution deployment never produces.
 
-    The far each CLI hands to its own STFT is captured at that boundary --
-    denoise.py through its module-level ``stft``, streaming.py through the
-    chunks pushed into its far ``StreamSTFT`` -- and compared against the
-    PBFDKF-consumed far recomputed INDEPENDENTLY here from the same contract.
-    The raw-far inequality is what keeps this from passing vacuously.
+    The far handed to StreamSTFT is captured and compared against PBFDKF's
+    consumed far recomputed independently.  The raw-far inequality keeps this
+    from passing vacuously.
     """
-    from AIAEC.Align_ULCNet import denoise as denoise_cli
-    from AIAEC.Align_ULCNet import streaming as streaming_cli
+    from AIAEC.Align_ULCNet import inference as inference_cli
+    from AIAEC.Align_ULCNet import _streaming as streaming_cli
     from AIAEC.aiaec_streaming import StreamSTFT
     from AIAEC.dataset_gen import make_linear_aec_contract
     from AIAEC.inference_common import load_mic_far
@@ -289,26 +284,8 @@ def test_denoise_and_streaming_feed_the_model_the_same_aligned_far(
     _write_synthetic_checkpoint(checkpoint, model)
     mic_path, far_path, raw_far = _write_delayed_scene(tmp_path)
 
-    # --- denoise.py: record the tensors handed to the offline STFT. The CLI
-    # transforms the error first and the far second, and calls stft exactly
-    # twice, so the far branch is call 1.
-    stft_inputs = []
-    real_stft = denoise_cli.stft
-
-    def recording_stft(signal, grid, *args, **kwargs):
-        stft_inputs.append(signal.detach().clone())
-        return real_stft(signal, grid, *args, **kwargs)
-
-    monkeypatch.setattr(denoise_cli, 'stft', recording_stft)
-    denoise_cli.main(denoise_cli.build_parser().parse_args([
-        checkpoint, mic_path, far_path, str(tmp_path / 'denoise_out.wav'),
-        '--device', 'cpu',
-    ]))
-    assert len(stft_inputs) == 2
-    denoise_far = stft_inputs[1]
-
-    # --- streaming.py: record every chunk pushed into the far StreamSTFT.
-    # The CLI constructs the error transform first and the far one second.
+    # Record every chunk pushed into the far StreamSTFT.  The implementation
+    # constructs the error transform first and the far transform second.
     pushed = {}
     constructed = []
 
@@ -324,8 +301,8 @@ def test_denoise_and_streaming_feed_the_model_the_same_aligned_far(
             return super().push(chunk)
 
     monkeypatch.setattr(streaming_cli, 'StreamSTFT', RecordingStreamSTFT)
-    streaming_cli.main(streaming_cli.build_parser().parse_args([
-        checkpoint, mic_path, far_path, str(tmp_path / 'stream_out.wav'),
+    inference_cli.main(inference_cli.build_parser().parse_args([
+        checkpoint, mic_path, far_path, str(tmp_path / 'inference_out.wav'),
         '--device', 'cpu',
     ]))
     assert len(constructed) == 2
@@ -342,8 +319,7 @@ def test_denoise_and_streaming_feed_the_model_the_same_aligned_far(
 
     assert streaming_far.shape == consumed_far.shape
     assert torch.equal(streaming_far, consumed_far)
-    assert torch.equal(denoise_far, consumed_far)
-    assert torch.equal(streaming_far, denoise_far)
+    assert all(chunk.shape[-1] <= GRID.hop_len for chunk in pushed[1])
 
     # Non-vacuous: the scene really was delayed, so the seam really did move
     # the far. A CLI still feeding the raw WAV would satisfy every equality

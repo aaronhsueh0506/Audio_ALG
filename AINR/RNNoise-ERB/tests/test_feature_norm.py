@@ -11,11 +11,11 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 # Each of the three model projects has its own top-level ``train.py`` (and
-# ``denoise.py``/``model.py``).  Under a single pytest session the first one
+# ``inference.py``/``model.py``). Under a single pytest session the first one
 # imported wins ``sys.modules``, so a sibling project's tests would silently
 # exercise the wrong code.  Dropping the cached entries forces the re-import
 # to resolve against the ROOT just inserted above.
-for _stale in ('train', 'denoise', 'model', 'checkpoint_utils'):
+for _stale in ('train', 'inference', 'model', 'checkpoint_utils'):
     sys.modules.pop(_stale, None)
 
 

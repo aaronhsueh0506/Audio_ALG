@@ -1,5 +1,5 @@
 /* ============================================================
- * DeepFilterNet3 前後處理 (C 實現) — 對齊 train.py / model.py / denoise.py
+ * DeepFilterNet3 前後處理 (C 實現) — 對齊 train.py / model.py / inference.py
  *
  * 這個檔案是「網路以外的全部」。邊界與 model.py 的 heads()/compose() 完全一致:
  *
@@ -13,7 +13,7 @@
  *   上游把線畫在同一個位置: 它的 Python forward 會合成 (那是訓練圖)，而部署的
  *   runtime 只跑網路取這兩個張量，合成自己做。
  *
- * 與 Python 參考的對應 (denoise.py 為準):
+ * 與 Python 參考的對應 (inference.py 為準):
  *   - STFT: sqrt-Hann window, normalized=True (x N_FFT^-0.5)
  *   - 分析尺度: 額外乘 DFN3_ANALYSIS_SCALE 才進正規化器 (libDF wnorm, 見下)
  *   - ERB: Glasberg-Moore band borders + 三角 filterbank

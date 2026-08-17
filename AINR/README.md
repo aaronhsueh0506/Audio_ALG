@@ -59,7 +59,7 @@ Run from the selected model directory:
 
 ```bash
 python3 train.py --config config.ini --packed-dir /path/to/packed_data
-python3 denoise.py --config config.ini --model /path/to/checkpoint.pt \
+python3 inference.py --config config.ini --model /path/to/checkpoint.pt \
     --input input.wav --output output.wav
 ```
 
@@ -90,13 +90,24 @@ return zero during warm-up; callers must not send an invalid warm-up frame to
 synthesis. GTCRN uses the configured unnormalised
 complex `[F,2]` network boundary. All three C implementations use
 zero-padded streaming warm-up (`center=False` semantics), while the offline
-PyTorch denoisers use centered STFT framing at clip boundaries.
+PyTorch `inference.py` entry points (the whole-utterance path) use centered
+STFT framing at clip boundaries.
 
 DeepFilterNet2 and GTCRN also provide `export_onnx.py`,
-`export_calibration.py`, and `export_erb_matrix.py`. Install the optional
+`inference.py calib`, and `export_erb_matrix.py`. Install the optional
 packages in `requirements-export.txt`; the model-specific READMEs define
 whether recurrent state is explicit at the ONNX boundary and whether ERB is
 inside or outside the graph.
+
+RNNoise-ERB, DeepFilterNet2 and GTCRN calibration can emit `bin` or `npz`.
+The deployment BIN layout is identical for all three: one subdirectory per
+ONNX input, one `<tensor>_<1-based-frame>.bin` per invocation, and a
+`manifest.json`. Each file contains one complete graph input tensor, including
+its batch dimension; only the filename index is the calibration-frame axis.
+Keep generated data under each model's `calib/`; those
+directories are ignored by Git and remain separate from `output/` weights and
+ONNX graphs. DeepFilterNet3 is a controlled comparison and does not advertise
+a stateless ONNX exporter in this release.
 
 The active deployment exports are stateless accelerator graphs:
 

@@ -1,11 +1,23 @@
 """
-RNNoise ONNX 匯出 — 逐幀串流推論
+RNNoise ONNX 匯出 — stateless 逐幀串流推論
 
 流程: torch.onnx.export → onnxoptimizer (圖清理) → shape inference
 
 用法:
     python export_onnx.py --config config.ini --model output/rnnoise_best.pth \
-                          --output rnnoise.onnx
+                          --output output/rnnoise.onnx --verify
+
+BIN calibration（每個 frame、每個 tensor 一個檔）:
+    python inference.py --config config.ini --model output/rnnoise_best.pth \
+                      --input noisy.wav --output enhanced.wav \
+                      --dump-calib calib/rnnoise_erb --format bin \
+                      --max-frames 8192
+
+NPZ calibration:
+    python inference.py --config config.ini --model output/rnnoise_best.pth \
+                      --input noisy.wav --output enhanced.wav \
+                      --dump-calib calib/rnnoise_erb.npz --format npz \
+                      --max-frames 8192
 """
 
 import argparse
@@ -98,7 +110,7 @@ def optimize_with_onnxoptimizer(inp, outp):
 # 匯出
 # ============================================================
 
-def build_metadata(feature_cfg, n_bands, gru_size):
+def build_metadata(feature_cfg, n_bands, gru_size, use_complex_input=False):
     """匯出圖的 metadata。
 
     從 export() 抽出來, 讓 contract test 不必真的做一次 ONNX 匯出就能把
@@ -130,9 +142,13 @@ def build_metadata(feature_cfg, n_bands, gru_size):
         'feature_spec_norm_init_lo': str(feature_cfg['spec_norm_init_lo']),
         'feature_spec_norm_init_hi': str(feature_cfg['spec_norm_init_hi']),
         'feature_spec_norm_eps': str(feature_cfg['spec_norm_eps']),
-        'input_schema': (f'erb_input[1,3,{n_bands}];'
-                         f'spec_input[1,3,2,{feature_cfg["spec_bins"]}];'
-                         f'h1_in/h2_in/h3_in[1,1,{gru_size}]'),
+        'input_schema': (
+            f'erb_input[1,3,{n_bands}];' +
+            (f'spec_input[1,3,2,{feature_cfg["spec_bins"]}];'
+             if use_complex_input else '') +
+            f'h1_in/h2_in/h3_in[1,1,{gru_size}]'
+        ),
+        'use_complex_input': str(bool(use_complex_input)).lower(),
         'output_schema': (f'gains[1,1,{n_bands}];'
                           f'h1_out/h2_out/h3_out[1,1,{gru_size}]'),
         'c_prepost': 'process.c/process.h',
@@ -206,8 +222,9 @@ def export(args):
     # 3) shape inference
     m = onnx.load(args.output)
     m = onnx.shape_inference.infer_shapes(m)
-    onnx.helper.set_model_props(m, build_metadata(feature_cfg, N_BANDS,
-                                                  gru_size))
+    onnx.helper.set_model_props(m, build_metadata(
+        feature_cfg, N_BANDS, gru_size, model.use_complex_input
+    ))
     onnx.save(m, args.output)
     print_stats("shape inference + feature metadata (final)", args.output)
 

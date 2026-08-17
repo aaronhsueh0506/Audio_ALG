@@ -24,8 +24,7 @@ ifeq ($(WERROR),1)
 override CFLAGS += -Werror
 endif
 
-CPPFLAGS := -I. -IAlign_ULCNet -IDeepVQE_S -IDeepFilterNet_AENR \
-	-I../AINR/DeepFilterNet2 -I../../audio_common/include
+CPPFLAGS := -I. -IAlign_ULCNet -IDeepVQE_S -I../../audio_common/include
 ifeq ($(SIMD),0)
 CPPFLAGS += -DSIMD_KERNELS_FORCE_SCALAR
 endif
@@ -36,10 +35,7 @@ OBJECTS := $(BUILD_DIR)/ulcnet_process.o \
 	$(BUILD_DIR)/ulcnet_model_io.o \
 	$(BUILD_DIR)/ulcnet_accelerator_adapter.o \
 	$(BUILD_DIR)/aiaec_process.o \
-	$(BUILD_DIR)/deepvqe_process.o \
-	$(BUILD_DIR)/dfn_aenr_process.o \
-	$(BUILD_DIR)/dfn2_process.o \
-	$(BUILD_DIR)/dfn2_model_io.o
+	$(BUILD_DIR)/deepvqe_process.o
 
 .PHONY: all lib clean
 
@@ -70,18 +66,6 @@ $(BUILD_DIR)/aiaec_process.o: aiaec_process.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 $(BUILD_DIR)/deepvqe_process.o: DeepVQE_S/deepvqe_process.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
-
-$(BUILD_DIR)/dfn_aenr_process.o: DeepFilterNet_AENR/dfn_aenr_process.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
-
-$(BUILD_DIR)/dfn2_process.o: ../AINR/DeepFilterNet2/dfn2_process.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
-
-# dfn_aenr_process.c pushes its four feature windows and commits its state
-# through the DFN2 model-I/O helpers, so the shared TU is linked here too.
-$(BUILD_DIR)/dfn2_model_io.o: ../AINR/DeepFilterNet2/dfn2_model_io.c \
-	../AINR/DeepFilterNet2/dfn2_model_io.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c "$<" -o "$@"
 
 clean:

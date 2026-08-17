@@ -32,3 +32,18 @@ the fourth is the shape-restoring convolution in the mask block. The default
 192-unit GRU keeps the 16 kHz project-grid graph in the paper's approximately
 0.75 M parameter class. No author code/checkpoint was released, so exact
 padding and projection width remain documented reconstruction choices.
+
+## ONNX and calibration
+
+```bash
+python3 export_onnx.py --checkpoint checkpoint.pth \
+  --output output/align_cruse.onnx --verify
+python3 inference.py calib --checkpoint checkpoint.pth \
+  --primary-dir /path/to/microphone --far-dir /path/to/far \
+  --frames 8192 --format bin --output calib/align_cruse
+```
+
+Use `--format npz --output calib/align_cruse.npz` for a NumPy archive.
+Align-CRUSE requires one uninterrupted source long enough to satisfy
+`--frames`; its cumulative score and frame counter remain outside integer PTQ
+as recorded in `manifest.json`.

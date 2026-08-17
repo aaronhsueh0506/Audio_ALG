@@ -1,5 +1,5 @@
 """
-匯出 ERB 轉換矩陣 (三角版, 對齊 train.py / denoise.py)
+匯出 ERB 轉換矩陣 (三角版, 對齊 train.py / inference.py)
 
 產出給目標平台 C runtime 的 ERB 前/後處理矩陣:
     feature:  power @ W_fwd            (mode=0, edge x2)

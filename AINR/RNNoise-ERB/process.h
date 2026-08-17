@@ -6,9 +6,9 @@ extern "C" {
 #endif
 
 /* ============================================================
- * RNNoise-ERB 前後處理 (C 實現) — 對齊 train.py / denoise.py
+ * RNNoise-ERB 前後處理 (C 實現) — 對齊 train.py / inference.py
  *
- * 與 Python 參考的對應 (denoise.py enhance() 為準):
+ * 與 Python 參考的對應 (inference.py enhance() 為準):
  *   - STFT: root-Hann window, normalized=True (× N_FFT^-0.5)
  *   - ERB: Glasberg-Moore band borders (erb_bandborder) +
  *     三角 filterbank (compute_erb_matrix mode=0 forward / mode=1 inverse)

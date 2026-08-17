@@ -30,9 +30,9 @@ continuously without resetting model history:
 ```bash
 python3 export_onnx.py --model output/gtcrn_best.pth \
   --output output/gtcrn_stream.onnx --verify
-python3 export_calibration.py --model output/gtcrn_best.pth \
-  --wav-dir /path/to/noisy_wavs --frames 256 \
-  --output output/gtcrn_calibration.npz
+python3 inference.py calib --model output/gtcrn_best.pth \
+  --wav-dir /path/to/noisy_wavs --frames 8192 --format bin \
+  --output calib/gtcrn
 python3 export_erb_matrix.py --model output/gtcrn_best.pth \
   --output-dir output/erb --format all
 ```
@@ -40,6 +40,8 @@ python3 export_erb_matrix.py --model output/gtcrn_best.pth \
 The ONNX I/O is `mix` plus `conv_cache`, `tra_cache`, and `inter_cache`, with
 the enhanced spectrum and updated caches returned each call. Calibration
 captures real pre-frame cache values rather than repeating zero state.
+Use `--format npz --output calib/gtcrn.npz` when a NumPy archive is needed.
+BIN output contains one folder per ONNX input and one numbered file per frame.
 GTCRN's ERB transform is already inside the ONNX graph; the exported ERB
 tables are for port verification only and must not be applied a second time.
 `gtcrn_process.c/.h` remains the host STFT/WOLA boundary and defines

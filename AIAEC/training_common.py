@@ -1,12 +1,11 @@
 """Shared training infrastructure for every AIAEC candidate trainer.
 
-Six model directories -- Align_CRUSE, Align_ULCNet, GTCRN_AENR,
-DeepFilterNet_AENR, DeepVQE_S, CAGCRN -- each own a ``train.py`` /
-``config.ini`` / ``denoise.py`` mirroring AINR's per-project layout (see any
+Four model directories -- Align_CRUSE, Align_ULCNet, DeepVQE_S and CAGCRN --
+each own a ``train.py`` / ``config.ini`` / ``inference.py`` (see any
 of their top-of-file docstrings for the exact usage). What they do NOT each
 keep a private copy of lives here, for the same reason
 ``AIAEC/dataset_gen/aec_features.py`` holds the signal grid and
-``AINR/dataset_gen`` holds the seeder: a knob that drifts between six
+``AINR/dataset_gen`` holds the seeder: a knob that drifts between four
 near-identical copies is a checkpoint- or corpus-comparability bug that
 surfaces only as "one model is mysteriously worse."
 
@@ -15,7 +14,7 @@ Provided here:
 * ``set_seed``                                -- re-exported from AINR.dataset_gen
 * ``read_model_kwargs``                       -- ``[model]`` config -> constructor
   kwargs, generalising AINR/DeepFilterNet2's ``read_model_config`` (there:
-  one model class; here: six)
+  one model class; here: four)
 * ``make_checkpoint_contract`` /
   ``require_checkpoint_contract``             -- reject a checkpoint whose grid,
   task, model kwargs or loss version differ from the running config
@@ -23,17 +22,17 @@ Provided here:
   ``halt_on_non_finite``                      -- the NaN-halt machinery
   DeepFilterNet2's alignment pass built is reused via
   ``AINR.DeepFilterNet2.train``, not reimplemented a second time
-* ``compressed_spectral_loss``                -- none of the six candidates'
+* ``compressed_spectral_loss``                -- none of the four candidates'
   papers publish a loss (see ``docs/ai_aec_candidate_matrix.md`` and the
   DeepVQE_S/CAGCRN READMEs' "did not publish ... loss details"); this is the
   one loss every trainer uses, so scores stay comparable across candidates
 * ``LinearAecEngine``                         -- inference-only continuous-file
   wrapper around the same frozen Python PBFDKF whose output is materialized as
-  dataset stem six. Trainers never execute it.
+  dataset stem five (`linear_error`). Trainers never execute it.
 * ``split_dataset_by_sample`` / ``build_plain_loaders`` -- deterministic
   per-chunk train/val split plus epoch-level shuffle for the unified corpus.
 
-Do not add a seventh copy of any of this into a candidate's ``train.py``. If a
+Do not add a fifth copy of any of this into a candidate's ``train.py``. If a
 candidate genuinely needs different behaviour, change the signature here so
 every trainer can see the choice was made -- the same reasoning
 ``AIAEC/dataset_gen/README.md`` gives for ``aec_features.py``.
@@ -176,7 +175,7 @@ def training_progress(loader, *, training: bool, epoch: int,
     """Return AINR-style tqdm progress for training and a plain val loader.
 
     AINR shows one ``Epoch current/total`` bar for the training loader and
-    leaves validation quiet. Keeping that policy here avoids six subtly
+    leaves validation quiet. Keeping that policy here avoids four subtly
     different progress implementations while preserving normal DataLoader
     behaviour for evaluation.
     """
@@ -217,7 +216,7 @@ def split_dataset_by_sample(dataset, val_fraction: float,
     """Deterministically random-split individual materialized chunks.
 
     The frozen PBFDKF has already run over each complete parent sequence before
-    stem six was cut into chunks. Consequently each stored item is now a fixed
+    the `linear_error` stem was cut into chunks. Consequently each stored item is now a fixed
     model sample: the trainer may place any chunk on either side and shuffle
     train order without changing adaptive-filter state. Sharing a sequence,
     speaker or RIR across train/validation is an explicit in-distribution
@@ -300,9 +299,7 @@ def build_plain_loaders(cfg, aec_grid, seed: int = 42,
 # ============================================================
 
 def read_model_kwargs(cfg, model_cls, section: str = 'model',
-                      aliases: Optional[Dict[str, str]] = None,
-                      extra_bases: Sequence[type] = (),
-                      exclude: Sequence[str] = ()) -> Dict:
+                      aliases: Optional[Dict[str, str]] = None) -> Dict:
     """Every ``model_cls.__init__`` keyword argument, overlaid with ``[model]``.
 
     ``grid`` (and ``self``) are excluded: the signal grid comes from
@@ -312,16 +309,6 @@ def read_model_kwargs(cfg, model_cls, section: str = 'model',
     ``AINR/DeepFilterNet2/train.py``'s ``read_model_config``, generalised from
     one model class to whichever ``model_cls`` a candidate's train.py passes.
 
-    ``extra_bases`` covers a subclass whose own ``__init__`` forwards a
-    ``**kwargs`` catch-all to a base constructor (``DeepFilterNetAENR`` ->
-    ``DeepFilterNet2``, see that trainer): those base keywords are invisible
-    to plain introspection of the subclass, so pass the base class here to
-    have its defaults merged in too. A name already found on ``model_cls`` or
-    an earlier base wins -- later bases never override -- and ``exclude``
-    drops base keywords the subclass already binds explicitly (e.g. ``n_erb``,
-    which ``DeepFilterNetAENR.__init__`` takes itself and passes through
-    positionally; leaving it merged in would make it configurable under a
-    name the constructor call would then pass twice).
     """
     aliases = aliases or {}
     sig = inspect.signature(model_cls.__init__)
@@ -329,13 +316,6 @@ def read_model_kwargs(cfg, model_cls, section: str = 'model',
         name: param.default for name, param in sig.parameters.items()
         if name not in ('self', 'grid') and param.default is not inspect.Parameter.empty
     }
-    for base in extra_bases:
-        base_sig = inspect.signature(base.__init__)
-        for name, param in base_sig.parameters.items():
-            if name in ('self', 'grid') or name in exclude or name in kwargs:
-                continue
-            if param.default is not inspect.Parameter.empty:
-                kwargs[name] = param.default
     if not cfg.has_section(section):
         return kwargs
     for name in cfg.options(section):
@@ -569,7 +549,7 @@ def compressed_spectral_loss(estimate: Tensor, target: Tensor, *,
     No AIAEC candidate paper publishes a loss function -- see
     ``docs/ai_aec_candidate_matrix.md`` and the DeepVQE_S / CAGCRN READMEs
     ("did not publish ... loss details"). This is therefore a project choice
-    used identically by all six trainers, so scores stay comparable across
+    used identically by all four trainers, so scores stay comparable across
     candidates instead of each optimising a different objective.
     ``compression=0.3`` matches the compression exponent Align-ULCNet and
     DeepVQE-S already use for their own INPUT features (see
@@ -630,7 +610,7 @@ def halt_on_non_finite(reason: str, *, model, optimizer, mic: Tensor, target: Te
 class LinearAecEngine:
     """Continuous Python-PBFDKF wrapper for RES+NR file inference.
 
-    Training reads the already-materialized sixth dataset stem and never calls
+    Training reads the already-materialized `linear_error` stem and never calls
     this class. Inference constructs it from the checkpoint's exact
     ``linear_aec`` contract, processes the whole file as one stateful stream,
     and recovers ``D_hat`` by subtraction.

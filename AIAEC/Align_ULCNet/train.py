@@ -33,7 +33,7 @@ task (see ../README.md's decision matrix and
     Requires the stored real linear-AEC error; an oracle residual is rejected
     by ``build_model_view``.
 
-inference: see denoise.py's own top-of-file usage comment.
+inference: see inference.py's own top-of-file usage comment.
 """
 
 import argparse

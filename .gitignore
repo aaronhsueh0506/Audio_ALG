@@ -30,6 +30,7 @@ env/
 
 # Output
 output/
+calib/
 
 # AINR training data & model checkpoints
 AINR/RNNoise-ERB/output/

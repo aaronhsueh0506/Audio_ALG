@@ -1,6 +1,9 @@
 """Explicit-state accelerator boundary tests for AIAEC candidates."""
 
+import importlib
 import os
+import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -8,21 +11,18 @@ import torch
 from AIAEC.aiaec_common import SignalGrid, log_power_feature
 from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.CAGCRN import CAGCRN
-from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.DeepVQE_S import DeepVQES
-from AIAEC.GTCRN_AENR import GTCRNAENR
-from AIAEC.export_streaming_onnx import (
+from AIAEC._streaming_export import (
     StatelessOneFrameAIAEC,
     _build,
     requires_contiguous_calibration,
     state_precision_policy,
 )
-from AIAEC.export_streaming_calibration import (
-    MODEL_NAMES as CALIBRATION_MODEL_NAMES,
+from AIAEC._streaming_calibration import (
+    ALL_MODEL_NAMES as CALIBRATION_MODEL_NAMES,
     far_mode_provenance,
 )
 from AIAEC.training_common import DEPLOYED_FAR_INPUT_MODE
-from AINR.DeepFilterNet2.export_onnx import feature_windows
 
 
 GRID = SignalGrid(16000, 512, 512, 256)
@@ -51,9 +51,6 @@ def _learned_output(name, output):
         return torch.stack((taps.real, taps.imag), dim=-1)
     if name == 'CAGCRN':
         return output.mask.permute(0, 2, 3, 1)
-    if name == 'GTCRN_AENR':
-        mask = output.mask
-        return torch.stack((mask.real, mask.imag), dim=-1)
     raise AssertionError(name)
 
 
@@ -61,7 +58,6 @@ def _learned_output(name, output):
     ('Align_CRUSE', lambda: AlignCRUSE(GRID)),
     ('DeepVQE_S', lambda: DeepVQES(GRID)),
     ('CAGCRN', lambda: CAGCRN(GRID)),
-    ('GTCRN_AENR', lambda: GTCRNAENR(GRID)),
 ))
 def test_external_state_round_trip_matches_streaming_reference(name, factory):
     torch.manual_seed(81)
@@ -112,7 +108,6 @@ def test_align_cruse_cumulative_state_is_excluded_from_integer_ptq():
     # The same cumulative state drives both calibration rules.
     assert requires_contiguous_calibration('Align_CRUSE')
     assert not requires_contiguous_calibration('DeepVQE_S')
-    assert not requires_contiguous_calibration('DeepFilterNet_AENR')
 
 
 def test_precision_policy_names_are_real_graph_inputs():
@@ -144,6 +139,32 @@ def test_align_ulcnet_calibration_provenance_is_not_deployment_mode():
     assert far_mode_provenance('DeepVQE_S') == (
         'model_native_far', 'model_native_far'
     )
+    root = Path(__file__).resolve().parents[1]
+    for model_name in CALIBRATION_MODEL_NAMES:
+        model_root = root / model_name
+        assert (model_root / 'export_onnx.py').is_file(), model_name
+        assert (model_root / 'inference.py').is_file(), model_name
+
+
+@pytest.mark.parametrize('model_name', CALIBRATION_MODEL_NAMES)
+def test_calib_subcommand_records_against_its_own_model(
+        model_name, monkeypatch):
+    """``inference.py calib`` must reach the recorder naming ITS OWN model.
+
+    Driving the real dispatcher rather than searching the file for the call is
+    the point: a source-text match is satisfied by a line that never runs, and
+    it cannot tell a model wired to a sibling's name from a correct one.
+    """
+    from AIAEC import _streaming_calibration
+
+    inference = importlib.import_module('AIAEC.%s.inference' % model_name)
+    recorded = []
+    monkeypatch.setattr(_streaming_calibration, 'main', recorded.append)
+    monkeypatch.setattr(
+        sys, 'argv', ['inference.py', 'calib', '--checkpoint', 'unused']
+    )
+    inference.cli()
+    assert recorded == [model_name]
 
 
 def test_calibration_deployment_mode_equals_the_ulcnet_exporter_literal():
@@ -154,7 +175,7 @@ def test_calibration_deployment_mode_equals_the_ulcnet_exporter_literal():
     each against its own literal would let them drift apart while both tests
     stayed green.
     """
-    from AIAEC.Align_ULCNet.export_streaming_onnx import _write_metadata
+    from AIAEC.Align_ULCNet.export_onnx import _write_metadata
     from AIAEC.Align_ULCNet.model import AlignULCNet
 
     import tempfile
@@ -164,7 +185,7 @@ def test_calibration_deployment_mode_equals_the_ulcnet_exporter_literal():
         checkpoint = os.path.join(work, 'ckpt.pt')
         with open(checkpoint, 'wb') as stream:
             stream.write(b'not a real checkpoint, only hashed')
-        from AIAEC.Align_ULCNet.export_streaming_onnx import (
+        from AIAEC.Align_ULCNet.export_onnx import (
             AlignUlcnetStreamingExport,
             dummy_inputs,
         )
@@ -183,61 +204,16 @@ def test_calibration_deployment_mode_equals_the_ulcnet_exporter_literal():
     assert far_mode_provenance('Align_ULCNet')[0] != exported
 
 
-def test_dfn_aenr_three_frame_export_matches_conditioned_offline_heads():
-    torch.manual_seed(82)
-    model = DeepFilterNetAENR(
-        GRID, enc_ch=8, emb_size=32, df_hidden=32,
-        lin_groups=4, enc_lin_groups=4,
-    ).eval()
-    wrapper, dummy, _names, _outputs, split = _build(
-        'DeepFilterNet_AENR', model
-    )
-    frames = 8
-    error_erb = torch.randn(1, 1, frames, model.n_erb)
-    error_spec = torch.randn(1, 2, frames, model.df_bins)
-    far_erb = torch.randn_like(error_erb)
-    far_spec = torch.randn_like(error_spec)
-
-    with torch.no_grad():
-        conditioned = model.condition_features(
-            error_erb, error_spec, far_erb, far_spec
-        )
-        reference = model.heads(*conditioned)
-        state = dummy[split.signal_inputs:]
-        streamed = [[], [], []]
-        for signal in zip(
-            feature_windows(error_erb), feature_windows(error_spec),
-            feature_windows(far_erb), feature_windows(far_spec),
-        ):
-            output = wrapper(*signal, *state)
-            for index in range(3):
-                streamed[index].append(output[index])
-            state = output[split.head_outputs:]
-
-    assembled = (
-        torch.cat(streamed[0], dim=2),
-        torch.cat(streamed[1], dim=1),
-        torch.cat(streamed[2], dim=1),
-    )
-    for actual, expected in zip(assembled, reference):
-        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
-
-
 @pytest.mark.parametrize('name,factory', (
     ('Align_CRUSE', lambda: AlignCRUSE(GRID)),
     ('DeepVQE_S', lambda: DeepVQES(GRID)),
     ('CAGCRN', lambda: CAGCRN(GRID)),
-    ('GTCRN_AENR', lambda: GTCRNAENR(GRID)),
-    ('DeepFilterNet_AENR', lambda: DeepFilterNetAENR(
-        GRID, enc_ch=8, emb_size=32, df_hidden=32,
-        lin_groups=4, enc_lin_groups=4,
-    )),
 ))
 def test_stateless_graph_really_lowers_to_onnx_and_replays_state(
         name, factory, tmp_path):
     onnx = pytest.importorskip('onnx')
     pytest.importorskip('onnxruntime')
-    from AIAEC.export_streaming_onnx import _verify_onnx
+    from AIAEC._streaming_export import _verify_onnx
 
     model = factory().eval()
     wrapper, inputs, input_names, output_names, split = _build(name, model)

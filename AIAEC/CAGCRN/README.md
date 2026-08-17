@@ -22,3 +22,16 @@ soft delay-window gate over a configurable one-second buffer and a bounded CRM.
 Those choices make the architecture trainable but checkpoint-incompatible with
 any unpublished author implementation. CAGCRN remains a backup until these
 ambiguities are resolved empirically.
+
+## ONNX and calibration
+
+```bash
+python3 export_onnx.py --checkpoint checkpoint.pth \
+  --output output/cagcrn.onnx --verify
+python3 inference.py calib --checkpoint checkpoint.pth \
+  --primary-dir /path/to/microphone --far-dir /path/to/far \
+  --frames 8192 --format bin --output calib/cagcrn
+```
+
+Use `--format npz --output calib/cagcrn.npz` for a NumPy archive. BIN output
+contains one directory per graph input and one numbered file per invocation.

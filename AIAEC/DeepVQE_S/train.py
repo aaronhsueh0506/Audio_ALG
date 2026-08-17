@@ -43,7 +43,7 @@ task (see ../README.md's decision matrix and
     product target for every candidate, so this file has no private target
     branch.
 
-inference: see denoise.py's own top-of-file usage comment.
+inference: see inference.py's own top-of-file usage comment.
 """
 
 import argparse

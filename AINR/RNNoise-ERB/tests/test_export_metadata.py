@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 # 三個模型專案各有自己的 top-level ``train.py``/``model.py``/``export_onnx.py``。
 # 同一個 pytest session 裡先被 import 的那個會佔住 ``sys.modules``, 所以先清掉
 # 快取, 這個檔案才會真的跑到 RNNoise 的程式碼。
-for _stale in ('train', 'denoise', 'model', 'checkpoint_utils', 'export_onnx'):
+for _stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx'):
     sys.modules.pop(_stale, None)
 
 
@@ -43,6 +43,7 @@ def _metadata():
         feature_cfg,
         config.getint('signal', 'n_bands'),
         c_macro('RNNOISE_MODEL_GRU_SIZE'),
+        config.getboolean('model', 'use_complex_input'),
     )
 
 
@@ -67,3 +68,8 @@ def test_metadata_state_shapes_match_the_c_state_struct():
     assert f'h1_out/h2_out/h3_out[1,1,{gru_size}]' in metadata['output_schema']
     # 圖只有三個 GRU state, C 端也只配置三層。
     assert c_macro('RNNOISE_MODEL_GRU_COUNT') == 3
+    # The default pure-ERB graph prunes the unused complex-spectrum input;
+    # calibration folders must describe the actual graph, not its Python
+    # wrapper's dead formal argument.
+    assert metadata['use_complex_input'] == 'false'
+    assert 'spec_input' not in metadata['input_schema']

@@ -76,11 +76,7 @@ mic, far, target = view.inputs['microphone'], view.inputs['far_end'], view.targe
 ```
 
 `build_spectral_model_view(view, grid)` converts that waveform contract into
-the exact `[B,T,F]` keyword tensors accepted by each model. For
-`DeepFilterNet_AENR`, also pass the model and its exact `read_feature_config()`
-result; the adapter uses normalized STFT coefficients and returns separate
-causal EMA states for the error and far feature streams. It rejects one shared
-state because that silently changes both feature distributions.
+the exact `[B,T,F]` keyword tensors accepted by each retained model.
 
 ## Metadata
 
@@ -264,13 +260,12 @@ shards, so a leftover from an earlier pack would silently join the corpus. Use
 `.pt.tmp` names and published only after every WAV passes validation; a
 validation/serialization failure keeps the previous pack intact.
 
-⚠ Five of the six trainers run at 16 kHz/512 and one (DeepFilterNet-AENR) runs
-at 48 kHz/1024 (`[signal] sr = 48000, n_fft = win_len = 1024, hop_len = 512`
-in a SEPARATE `config.ini` -- see config.example.ini's top comment). The two
-rates need their OWN `--output` (e.g. `data_aec_16k` / `data_aec_48k`, matching
-each trainer's `packed_dir`): generating the second rate into the same
-`--output` as the first is refused once chunk WAVs exist, since neither
-directory is namespaced by sample rate.
+⚠ Every current trainer runs at 16 kHz/512. A trainer on a different grid
+would need its own `[signal]` block in a SEPARATE `config.ini` (see
+config.example.ini's top comment) and its OWN `--output` (e.g. `data_aec_16k` /
+`data_aec_48k`, matching that trainer's `packed_dir`): generating a second rate
+into the same `--output` as the first is refused once chunk WAVs exist, since
+the directory is not namespaced by sample rate.
 
 Layout:
 
@@ -285,7 +280,7 @@ No JSON is created in the default flow. An explicit `--manifest PATH` is the
 only opt-in exception, used to freeze a source-disjoint split; packing and
 training never read it.
 
-The six trainers read `packed/all` and create the deterministic random chunk
+The four trainers read `packed/all` and create the deterministic random chunk
 split from `[data] val_fraction` and the training seed.
 
 The contract records the AEC's identity three ways, and they are used for
