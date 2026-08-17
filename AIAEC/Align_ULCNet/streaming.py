@@ -7,10 +7,12 @@
     python3 streaming.py checkpoint.pth kf_error.wav far.wav out.wav \\
         --input-is-linear-error
 
-Checkpoint loading and the audio frontend are identical to denoise.py.  The
-frozen PBFDKF linear AEC still runs OFFLINE over the whole file: streaming
-that engine is a separate C-side seam (the production linear AEC is already a
-streaming C implementation), so this CLI verifies the NN streaming path only.
+Checkpoint loading and the audio frontend are identical to denoise.py, far
+branch included: the model is fed the linear AEC's own aligned-far seam, not
+the raw far WAV.  The frozen PBFDKF linear AEC still runs OFFLINE over the
+whole file: streaming that engine is a separate C-side seam (the production
+linear AEC is already a streaming C implementation), so this CLI verifies the
+NN streaming path only.
 
 Everything after the linear AEC is strictly incremental: hop-sized sample
 chunks feed StreamSTFT, every finished frame goes through forward_stream (one
@@ -106,6 +108,10 @@ def main(args):
             n_lanes=1, sample_rate=grid.sr, contract=linear_contract
         )
         error, _echo_estimate = linear_aec(mic, far, grid.sr)
+        # Same seam denoise.py uses, and the same one the production C
+        # pipelines expose: the exact far hop PBFDKF consumed (raw until the
+        # alignment ring can serve the applied delay, ring-aligned after).
+        far = linear_aec.get_aligned_far()
     error = error.to(device)
     far = far.to(device)
     if source_rates != (grid.sr, grid.sr):

@@ -33,7 +33,8 @@ parameter names happen to match.
 - keep separate output directories for separate sample-rate runs.
 
 The generator applies the same waveform transformation to noisy and target
-where required, records run metadata, and can pack pairs for training. See
+where required and can pack WAV pairs for training. The persisted corpus is
+WAV-only; optional sample metadata exists only in the in-process API. See
 [`dataset_gen/README.md`](dataset_gen/README.md).
 
 ## Current DFN interpretation
@@ -96,3 +97,14 @@ DeepFilterNet2 and GTCRN also provide `export_onnx.py`,
 packages in `requirements-export.txt`; the model-specific READMEs define
 whether recurrent state is explicit at the ONNX boundary and whether ERB is
 inside or outside the graph.
+
+The active deployment exports are stateless accelerator graphs:
+
+| Model | New signal context per call | Caller-owned model state |
+|---|---:|---|
+| RNNoise-ERB | 3 feature frames -> 1 gain frame | 3 GRU hidden tensors |
+| DeepFilterNet2 | 3 feature frames -> 1 head frame | 3 GRU tensors + 4-frame DF pathway cache |
+| GTCRN | 1 complex STFT frame | conv/TRA/inter-GRU caches |
+
+“Stateless” describes the accelerator, not the algorithm. The host must return
+every exported `*_out` state tensor as the matching input on the next call.

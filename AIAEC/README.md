@@ -83,6 +83,16 @@ contract; resume refuses a different dataset, split, frontend, or signal grid.
 identity); a comment-only edit under `lib/aec/python` moves the recorded
 provenance but not that hash, so it does not strand a checkpoint.
 
+The one exception is `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` in
+`dataset_gen/linear_aec.py`: today two explicit `recorded -> current` hash
+pairs, each admitted only on measured byte-identical `linear_error` evidence
+plus a control proving the same harness can fail. It applies only when the
+behaviour hash is the sole differing field, is one-way (a newer-hash artifact
+against an older build stays refused) and single-hop (the table is never read
+transitively). Hitting an entry warns and proceeds: existing shards need no
+regeneration and trained checkpoints need no retraining. `dataset_gen/README.md`
+documents the admission evidence; an unlisted hash is refused exactly as before.
+
 ```bash
 cd AIAEC/Align_CRUSE   # or any of the other five directories
 python3 train.py --config config.ini \
@@ -107,29 +117,59 @@ keeps packed tensors disk-backed to reduce host RAM use.
 
 ## ONNX and embedded pre/post-processing
 
-Install `requirements-export.txt` together with the normal requirements. The
-shared exporter supports all six candidates and emits real/imag tensors rather
-than ONNX complex tensors:
+Install `requirements-export.txt` together with the normal requirements.
+Production exports are stateless accelerator graphs: all recurrent,
+convolution, attention and delay-ring state appears as ordinary graph I/O.
+Real/imag pairs are used instead of ONNX complex tensors.
 
 ```bash
-python3 AIAEC/export_onnx.py Align_ULCNet \
-  --checkpoint /path/to/checkpoint.pth --frames 8 --max-delay-frames 8 \
-  --output output/align_ulcnet.onnx --verify
-python3 AIAEC/export_calibration.py Align_ULCNet \
+python3 AIAEC/export_streaming_onnx.py DeepVQE_S \
+  --checkpoint /path/to/checkpoint.pth --max-delay-frames 8 \
+  --output output/deepvqe_stream.onnx --verify
+python3 AIAEC/export_streaming_calibration.py DeepVQE_S \
   --checkpoint /path/to/checkpoint.pth \
-  --primary-dir /path/to/linear_error --far-dir /path/to/far \
-  --frames 8 --max-delay-frames 8 --blocks 256 \
+  --primary-dir /path/to/microphone --far-dir /path/to/far \
+  --frames 256 --max-delay-frames 8 \
   --output output/calibration.npz
 ```
 
 For end-to-end candidates, `--primary-dir` contains microphone WAVs; for
 RES+NR candidates it contains materialized linear-error WAVs. Relative WAV
-paths in the primary and far directories must match. `--frames` must equal the
-ONNX export and cannot be shorter than the selected alignment depth `D`.
-For alignment models, `--max-delay-frames` can reduce D at deployment without
-changing weight shapes or retraining; it changes numerical behavior, so use
-the same override for export and calibration and validate it with the delay
-depth sweep before release.
+paths in the primary and far directories must match. `--frames` on the
+calibration tool means the number of one-frame invocations to capture; it is
+not an ONNX block dimension. For alignment models, `--max-delay-frames` can
+reduce D at export without changing weight shapes or retraining; use the same
+D for calibration and the deployed CPU-side state allocation.
+
+Align-ULCNet calibration intentionally accepts the training-domain
+`linear_error + raw_far` pair. The report records
+`calibration_far_input_mode=raw_far` separately from the fixed production
+`deployment_far_input_mode=aligned_far`; calibration does not claim that the
+two signal seams are identical. D still has to match the exported graph
+because it changes K/V-history tensor shapes and host state RAM, even though D
+does not change learned weight shapes.
+
+Align-CRUSE's `state_align_score_sum` is an undecayed cumulative state. Its
+calibration frames must therefore come from one uninterrupted recording (the
+tool rejects a set that can only reach `--frames` by joining reset clips), and
+the generated metadata marks `score_sum` as `float32_no_ptq` and its frame
+counter as `int64_no_ptq`. If the target accelerator cannot preserve those
+state dtypes, this Align-CRUSE graph is not a valid integer-only deployment
+boundary; collecting more short clips cannot fix the unbounded-state issue.
+
+Tensors named in `state_precision_policy` are recorded WITHOUT `min`/`max`/
+`p001`/`p999`; their `inputs` entry carries a `precision` marker instead. A
+range for an undecayed accumulator only describes how long the capture ran,
+and float percentiles over the int64 frame counter describe nothing at all —
+publishing either would invite a quantizer to use them. The streaming report
+also records `state_layout_version` beside `max_delay_frames`, so a
+calibration set can be checked against the graph it was recorded on before
+either is trusted. Only Align-ULCNet's state layout is versioned today (its
+exporter writes `3`, pinned to `ULCNET_MODEL_IO_LAYOUT_VERSION`); the shared
+exporter does not write that key, so the report carries `null` for the other
+five and only `max_delay_frames` cross-checks. D itself must agree across
+three artifacts — the exported graph, the calibration report, and the C
+descriptor the board initialises from.
 
 Align-ULCNet additionally has a true stateless-accelerator, one-frame export:
 
@@ -146,15 +186,20 @@ ring updates are provided by `Align_ULCNet/ulcnet_model_io.c/.h`; no state is
 retained inside the accelerator. See `Align_ULCNet/README.md` for the complete
 CPU/model flowchart and tensor shapes.
 
-The default graph outputs only the learned object consumed by host post
-processing: a real/complex mask, DeepVQE CCM taps, or the three DFN heads.
-`--include-debug-outputs` additionally exposes delay/attention tensors but is
-not intended for production I/O. These six exports are fixed-block graphs:
-recurrent and attention state resets at each invocation. They are suitable
-only when the chosen block/reset policy has been validated; they are not a
-substitute for the one-frame `forward_stream()` reference. True one-frame
-explicit-state exporters are the separate Align-ULCNet tool above and GTCRN's
-exporter under `AINR/GTCRN`.
+Align-CRUSE, DeepVQE-S, CAGCRN and GTCRN-AENR consume one new STFT frame per
+call. DeepFilterNet-AENR consumes four three-frame feature windows
+(`[t-1,t,t+1]` for error/far ERB/complex features) and returns one set of DFN
+heads. Its additional four-frame DF-path cache and every model's recurrent or
+attention state are explicit input/output tensors. The export JSON records
+the exact `state_handoff` mapping and dtype; the host must return each state
+output as its paired input on the next invocation.
+
+`AIAEC/export_onnx.py` and `export_calibration.py` are retained only as legacy
+fixed-block research tools. They reset temporal state at each block and are
+not the production accelerator boundary. Their report records the same
+`calibration_far_input_mode`/`deployment_far_input_mode` pair as the streaming
+one: the far seam a set was recorded on is a property of the recording, not of
+which exporter produced it.
 
 Only three candidates contain ERB maps. Export their checkpoint-exact tables
 with:

@@ -9,10 +9,26 @@ The model accelerator is intentionally left as the TODO in
 `run_accelerator()`. CPU memory owns every K/V, logit and GRU state tensor.
 The default callback failure demonstrates the production fail-open path.
 
-Existing checkpoints were trained with `ULCNET_FAR_RAW`. This project has
-accepted reuse of those weights with `ULCNET_FAR_ALIGNED` after its deployment
-sweep. The choice is still an init/export profile rather than a per-hop quality
-switch: model descriptor and pipeline wiring must name the same mode.
+The production far branch is fixed to the shared AEC seam's
+`pre.aligned_ref`, the same reference consumed by all four PBFDKF lanes.
+On every hop the shared ring cannot yet serve the applied offset — before
+acquisition under MATCHED, and for the whole ring-fill window under FIXED —
+this seam carries the raw far hop, so the model still runs on real reference
+audio; D handles the remaining offset. From the first hop the ring can serve
+it, the seam carries the aligned far. The switch is whole-hop and coincides
+with `pre.delay.solid`.
+The model and beam/far overlap state are reset at that boundary, including
+FIXED mode's first usable ring output. The C-side STFT keeps running across
+it, so the frames still straddling the switch emit the identity WITHOUT
+stepping the model: `AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES` = 2 frames
+here (both branches lag the input by one hop: beam WOLA plus the matching
+one-hop far compensation), versus 1 in the mono wrapper. The constant is
+derived and asserted by the straddle-derivation test, not estimated; option B
+(keep stepping through those frames) is deferred pending an audio A/B.
+
+Raw/aligned selection exists only in `sweep_delay_depth.py`, not in this
+runtime API. Export metadata keeps the checkpoint's raw-far training
+provenance separate from the aligned-far deployment contract.
 
 ## Delay profile
 

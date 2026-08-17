@@ -39,56 +39,79 @@
  *   read-only via audio_pipeline_4ch_ulcnet_last_beamformed_error() so
  *   integrators/tests can verify exactly this relation.
  *
- * FAR-INPUT DEPLOYMENT CONTRACT (set_far_input_mode below): the selected
- * mode MUST match the exported graph descriptor and the stream actually
- * wired by the application. It is an init/export profile, not a per-hop
- * tuning knob.
- *   - ULCNET_FAR_RAW (default): the caller's raw far_reference feeds the
- *     far branch (with the same one-hop compensation as aligned mode); the
- *     far stream the current weights were trained on. Model application is
- *     NEVER gated on the shared delay lock (the paper contract does not
- *     depend on lock).
- *   - ULCNET_FAR_ALIGNED: pre.aligned_ref feeds the far branch and the
- *     model's output is APPLIED only while the shared delay is locked
- *     (delay.solid && delay.delay_samples >= 0). The deployment sweep
- *     accepted this profile with the existing weights.
- * That match is ENFORCED for any model that publishes a model-I/O contract
- * (UlcnetModel.io_descriptor != NULL, which the accelerator adapter always
- * does): set_model() and set_far_input_mode() BOTH reject the call, leaving
- * the instance unchanged, when the descriptor's far_input_mode differs from
- * the pipeline's mode or is an undefined value. Both entry points are part
- * of the pre-stream install sequence, so the rejection lands before the
- * first hop -- this wrapper takes its mode and its model through setters
- * rather than through the config, so there is nothing to check inside
- * init_ex itself. A model with io_descriptor == NULL publishes no contract
- * and is not gated. This TU carries no stdio; callers that want to name
- * both sides pass the two values through ulcnet_far_input_mode_name()
- * (ulcnet_model_io.h), as main.c does.
+ * FAR-INPUT DEPLOYMENT CONTRACT: the model always receives the shared AEC
+ * seam's pre.aligned_ref. On every hop the shared delay ring cannot yet serve
+ * the applied offset -- before acquisition under MATCHED, and throughout the
+ * ring-fill window under FIXED -- that seam carries the RAW far hop, so the
+ * model still runs on real reference audio and D handles the remaining
+ * offset; from the first hop the ring can serve it, the seam carries the
+ * aligned far consumed by every PBFDKF lane. The switch is whole-hop and
+ * coincides with pre.delay.solid, so a hop is never part raw and part
+ * shifted. Runtime mode
+ * selection is intentionally absent from this production API and remains an
+ * offline sweep option only. A published model descriptor must carry
+ * ULCNET_FAR_ALIGNED.
  *
  * MODEL CALLBACK POLICY (first version):
  *
- *   - The model is STEPPED (infer() invoked) for EVERY emitted frame
- *     whenever a callback is installed -- constant per-hop compute and
- *     continuous runtime recurrent state, matching the mono variant.
+ *   - The model is STEPPED (infer() invoked) for every emitted frame whenever
+ *     a callback is installed, including before matched-delay acquisition --
+ *     except during the identity reprime described below.
  *   - No model set, model->infer == NULL, or infer() returning nonzero
  *     => FAIL-OPEN: the error spectrum passes through the synthesis chain
  *     unchanged (identity), keeping the timing path constant. A successful
  *     infer() whose output contains ANY non-finite value is likewise
- *     discarded (identity frame) -- NaN/Inf never reaches the WOLA. In
- *     ULCNET_FAR_ALIGNED the same identity bypass applies while the shared
- *     delay is not locked (!delay.solid || delay.delay_samples < 0) — the
- *     runtime's output is only applied for frame pairs whose far branch is
- *     genuinely delay-aligned.
- *   - On a delay change event (delay.changed): model->reset (if set) is
+ *     discarded (identity frame) -- NaN/Inf never reaches the WOLA.
+ *   - On a delay change event (delay.changed), or FIXED's first transition
+ *     from ring-fill raw far to usable aligned far: model->reset (if set) is
  *     called so the runtime flushes its far attention ring + logit history,
  *     and the beamform WOLA accumulator AND the one-hop far buffer are
  *     cleared (the core reset its lanes' analysis history at the same
  *     boundary — mixing spectra from opposite sides of the realignment
- *     would corrupt the seam). The C-side ULCNet STFT states keep running:
- *     a 1-2 frame transient is accepted in this version; crossfading is a
- *     later phase. This reset policy applies in BOTH far modes (the error
- *     branch realigns discontinuously even when the far branch is raw).
+ *     would corrupt the seam).
  *   - audio_pipeline_4ch_ulcnet_reset() also calls model->reset (if set).
+ *
+ * IDENTITY REPRIME ACROSS AN ALIGNMENT BOUNDARY (option A):
+ *
+ *   The reset above flushes the runtime's recurrent state, but the C-side
+ *   ULCNet STFT states keep running, so the analysis windows already in
+ *   flight still STRADDLE the boundary: their 512-sample spans cover one hop
+ *   pushed before the switch and one pushed after (on the error branch, the
+ *   far branch, or both). Stepping the model on such a frame would rebuild,
+ *   from a half-stale error/far pair, exactly the state the reset cleared.
+ *
+ *   Policy: starting with the boundary hop, the next
+ *   AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES emitted frames take the
+ *   identity (error passthrough) path and the model is NOT stepped -- no
+ *   infer() call, so no K/V ring entry, logit-history entry or GRU hidden
+ *   update happens on straddling input. Stepping AND applying resume
+ *   together on the first frame whose error and far analysis windows contain
+ *   exclusively post-switch hops. A second boundary inside a reprime re-arms
+ *   the counter (it never accumulates).
+ *
+ *   Derivation of the constant (MEASURED by the straddle-derivation test in
+ *   tests/test_audio_pipeline_4ch_ulcnet.c, never assumed here): BOTH
+ *   branches of this wrapper are pushed one hop behind the input -- the beam
+ *   WOLA closes one hop late, and the far branch is delayed one hop to match
+ *   it -- so the hop pushed at the boundary hop T still belongs to the
+ *   pre-switch input hop T-1 (and is in fact the cleared OLA / cleared far
+ *   buffer). With a centered 512/256 analysis spanning two pushed hops, the
+ *   frames emitted at hops T and T+1 both cover that slot and straddle; the
+ *   frame emitted at hop T+2 covers the two post-switch hops and is clean.
+ *   That is TWICE the mono wrapper's reprime (audio_pipeline_ulcnet.h: 1),
+ *   which pushes both branches from the current hop. The test derives the
+ *   count from a marker run that contains NO boundary at all -- so the
+ *   reprime logic never participates in its own measurement -- and asserts
+ *   it equals the constant below, per branch.
+ *
+ *   Compute: a reprime frame SKIPS inference, so per-hop compute DROPS for
+ *   those frames; it never doubles. The WOLA/STFT path is untouched, so the
+ *   2-hop latency contract holds unchanged across a boundary.
+ *
+ *   Option B (keep stepping the model through the straddling frames and keep
+ *   applying its output) is DEFERRED pending an audio A/B: it trades this
+ *   version's short identity stretch for recurrent state built on half-stale
+ *   frames. Do not switch policies without that A/B.
  *
  * VAD: this wrapper provides process_with_activity() ONLY (external VAD).
  * The conservative auto-VAD fallback stays with the standard wrapper
@@ -116,13 +139,31 @@ extern "C" {
 #endif
 
 /* ============================================================================
+ * Alignment-boundary identity reprime
+ * ========================================================================== */
+
+/**
+ * Emitted frames that still straddle an alignment boundary in this wrapper,
+ * i.e. the length of the identity reprime armed at every generation change
+ * (see "IDENTITY REPRIME" in this header's preamble).
+ *
+ * = 2: both branches are pushed one hop behind the input (beam WOLA lag +
+ * the matching one-hop far compensation), so the slot pushed at the boundary
+ * hop still belongs to the pre-switch input hop, and the centered 512/256
+ * analysis spans two pushed slots. Derived and asserted branch by branch by
+ * the straddle-derivation test; do not edit this value without re-running
+ * it.
+ */
+enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
+
+/* ============================================================================
  * Memory descriptor
  * ========================================================================== */
 
 #define AUDIO_PIPELINE_4CH_ULCNET_DESCRIPTOR_VERSION 1u
 /* Carve order: self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft,
  * ola, synth_win, beam_hop (the ULCNet analysis/synthesis states, frame
- * scratch, one-hop far buffer, far_input_mode and the chain's shared
+ * scratch, one-hop far buffer and the chain's shared
  * sqrt-Hann window table live inside `self`). The one carved `fft` handle
  * serves BOTH the beamform WOLA and the ULCNet chain (same 512 size;
  * strictly sequential use within a hop). Bump together with the
@@ -134,8 +175,11 @@ extern "C" {
  * v4 grows the self-resident core config with explicit delay controls and
  * the pre-only selector.
  * v5 grows the self-resident UlcnetModel copy by the published model-I/O
- * descriptor pointer. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 5u
+ * descriptor pointer. v6 removes the obsolete runtime far-mode field.
+ * v7 adds the identity-reprime counter to self.
+ * v8: the self-resident core config grew the backward-quarantine delay
+ * guard fields (left at their OFF defaults here), moving the self block. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 8u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -183,11 +227,6 @@ _Static_assert(
     "bytes offset");
 
 typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
-
-/* UlcnetFarInputMode (ULCNET_FAR_RAW / ULCNET_FAR_ALIGNED) is defined once,
- * in AIAEC/Align_ULCNet/ulcnet_model_io.h, and reaches this header through
- * ulcnet_process.h. See this header's preamble for the per-mode gating
- * rules. */
 
 /* ============================================================================
  * Config and lifecycle
@@ -253,42 +292,16 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_create(
  * runtime, or call audio_pipeline_4ch_ulcnet_reset() after swapping models
  * mid-stream.
  *
- * A model that publishes a model-I/O contract (model->io_descriptor !=
- * NULL, which model->io_descriptor must then outlive this pipeline) is
- * REJECTED, with the previously installed model left in place, when its
- * far_input_mode disagrees with this instance's current far-input mode or
- * is an undefined value -- see the FAR-INPUT DEPLOYMENT CONTRACT above.
+ * A model that publishes a model-I/O contract (model->io_descriptor != NULL,
+ * which must then outlive this pipeline) is rejected unless that descriptor
+ * matches the fixed aligned-far production ABI.
  *
  * Returns 0 on success, nonzero on a NULL/destroyed pipeline or a
- * far-input-mode disagreement.
+ * invalid model-I/O descriptor.
  */
 int audio_pipeline_4ch_ulcnet_set_model(
     AudioPipeline4ChUlcnet* p,
     const UlcnetModel* model);
-
-/**
- * Select which far stream feeds the model's far branch (see the FAR-INPUT
- * DEPLOYMENT CONTRACT in this header's preamble). Instances start in
- * ULCNET_FAR_RAW (the release default); the mode survives
- * audio_pipeline_4ch_ulcnet_reset() like the model installation does.
- *
- * The mode can only be set BEFORE any hop is processed: once processing
- * has started the call is REJECTED (nonzero return, mode unchanged) --
- * the frames in flight (the saved far hop and the analysis histories)
- * were built under the previous mode, so a silent mid-stream switch would
- * change the model's input distribution and corrupt the err/far pairing.
- * After audio_pipeline_4ch_ulcnet_reset() (which restarts the stream and
- * clears that state) switching is allowed again. The mode MUST match the
- * exported graph descriptor, and when a model publishing a model-I/O
- * contract is already installed that agreement is checked here too.
- * Returns 0 on success, nonzero on a NULL/destroyed pipeline, an undefined
- * mode value, a mid-stream call, or disagreement with the installed model's
- * descriptor (the current mode is then left unchanged in every rejection
- * case).
- */
-int audio_pipeline_4ch_ulcnet_set_far_input_mode(
-    AudioPipeline4ChUlcnet* p,
-    UlcnetFarInputMode mode);
 
 /* ============================================================================
  * Per-hop processing
@@ -318,8 +331,10 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
 
 /**
  * Reset all core/SRP/GSC/WOLA/ULCNet-chain state, restart the 2-hop timing
- * preamble, and call model->reset (if set). Never touches the model
- * callback installation itself.
+ * preamble, and call model->reset (if set). Any pending identity reprime is
+ * dropped: the analysis history is zeroed here, so the frames emitted after
+ * a reset straddle nothing. Never touches the model callback installation
+ * itself.
  */
 void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p);
 
@@ -340,14 +355,6 @@ int audio_pipeline_4ch_ulcnet_n_freqs(const AudioPipeline4ChUlcnet* p);
 int audio_pipeline_4ch_ulcnet_sample_rate(const AudioPipeline4ChUlcnet* p);
 
 /**
- * Current far-input mode as an int (a UlcnetFarInputMode value), or -1 for
- * a NULL/destroyed handle. Trivial const getter, exposed so integrators
- * and tests can verify the mid-stream rejection contract of
- * audio_pipeline_4ch_ulcnet_set_far_input_mode() above.
- */
-int audio_pipeline_4ch_ulcnet_far_input_mode(const AudioPipeline4ChUlcnet* p);
-
-/**
  * Read-only view of the beamformed-error hop reconstructed during the most
  * recent successful process call (hop_size samples; itself one hop behind
  * that call's input -- see the timing contract). All zeros before the first
@@ -360,7 +367,7 @@ const float* audio_pipeline_4ch_ulcnet_last_beamformed_error(
 
 /**
  * Copy the shared delay state observed by the most recent successful
- * process call (drives the fail-open/bypass and model-reset policy above).
+ * process call (drives the model-reset policy and diagnostics above).
  * Returns 0 on success, nonzero on a NULL out or NULL/destroyed handle.
  */
 int audio_pipeline_4ch_ulcnet_last_delay(

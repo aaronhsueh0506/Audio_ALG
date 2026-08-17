@@ -15,6 +15,7 @@ import json
 import os
 import subprocess
 import sys
+import warnings
 from typing import Callable, Dict, Optional, Tuple
 
 import numpy as np
@@ -464,6 +465,69 @@ def linear_aec_contract_from_config(
     )
 
 
+# Recorded-hash -> current-hash pairs that are the SAME materialized signal.
+#
+# `aec_behavior_hash` is deliberately conservative: it changes on any edit to an
+# expression, constant or control-flow path under the signal scope, including
+# one that provably cannot move a sample. Refusing is the right default, but the
+# blunt version of it strands an already-trained checkpoint that no
+# rematerialization can repair -- the shards are fine, the weights are fine, and
+# only the recorded identity disagrees. This table is the narrow, evidence-backed
+# escape: an EXPLICIT single hop, one direction, one pair at a time.
+#
+# Admission rule for a new entry. All four, or it does not go in:
+#   1. the ONLY compared field that differs is `aec_behavior_hash`;
+#   2. the lib/aec change is inert on the path this corpus is materialized with
+#      -- typically a new mechanism defaulted OFF, never a retune of a live one;
+#   3. that inertness is MEASURED, not argued: the frozen frontend
+#      (`LinearAecProcessor`, formed_output seam) renders byte-identical before
+#      and after, over a scene that actually reaches the changed code;
+#   4. the same harness is shown to be capable of failing -- render the changed
+#      mechanism ENABLED and confirm the bytes move. A byte-equality that a dead
+#      harness would also report is not evidence.
+#
+# Single hop by construction: the lookup is not applied transitively, so a value
+# here is never re-read as a key. Two stacked migrations need the composed pair
+# (oldest recorded -> current), re-verified end to end, not a chain.
+# One direction by construction: a checkpoint recorded under the NEW hash run
+# against the OLD build is a genuine downgrade -- the mechanism it may have been
+# trained through is absent -- and stays refused.
+ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
+    # The deployed checkpoint/corpus frontend is the signal path at standalone
+    # AEC commit 8e5d05708.  The intervening productization work made the
+    # matched-filter bank and delay mode configurable, but the frozen dataset
+    # path still resolves to MATCHED with five filters and the same 832-sample
+    # PBFDKF.  The later quarantine is also disabled on this path.
+    #
+    # Measured end to end from 8e5d05708 directly to this build on the same
+    # 32-second, 16-kHz/512/256, 400-ms-delay scene used below: five filters
+    # were constructed and both `linear_error` and `echo_hat` are byte-identical
+    # (2,048,000 bytes each).  SHA-256:
+    #   linear_error bfd504797d831b34ccfac20c50328b662d4bf4240728f391f4c8171a47579eb9
+    #   echo_hat     5abe156cfa0175f2dcd762860c4543eec077b677b2184bffa9f11af8da70ed26
+    "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe":
+        "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd",
+
+    # lib/aec adds the delay backward-quarantine (Path B), which holds a
+    # candidate EARLIER than the delay in force while the linear filter is
+    # still cancelling. Gated by `delay_backward_quarantine_enabled`, default
+    # False, and AIAEC never sets it: the config the frozen frontend builds
+    # leaves the mechanism inert, so the accepted-delay trajectory -- and
+    # therefore `linear_error` -- is unchanged. The added
+    # `delay_backward_quarantine_s` is read only when the enable is True.
+    #
+    # Measured on the pre-echo mis-attribution scene the mechanism targets
+    # (white-noise far, 16 kHz, 400 ms bulk delay, 32 s as one stateful
+    # sequence -- a geometry whose accepted delay re-locks EARLIER than the
+    # truth, so the guarded branch is genuinely reached): `linear_error`
+    # renders byte-identical across the change, 2,048,000 bytes per stem
+    # (4,096,000 with `echo_hat`). The control that makes that meaningful:
+    # the same render with the quarantine ENABLED differs in 121,069 bytes.
+    "ffc2e044d031f06a9d685ee77159e5a8d7d3075e5e3eaea8156746c416c1dd4e":
+        "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd",
+}
+
+
 def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> None:
     """Refuse a linear-AEC frontend that differs from the recorded one.
 
@@ -482,18 +546,42 @@ def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> N
     ``aec_commit``/``aec_source_hash`` are deliberately NOT compared here: they
     are raw-text provenance and would reject byte-identical data over a comment
     reflow. They remain in ``fingerprint()`` for resume/integrity.
+
+    The single documented exception is
+    ``ACCEPTED_BEHAVIOR_HASH_MIGRATIONS``: a recorded/current hash pair proven
+    to describe the same materialized signal. It applies only when the hash is
+    the ONLY field that differs, so a migration cannot smuggle a second change
+    through with it, and it warns rather than passing silently -- the operator
+    should see which frontend identity was accepted and why.
     """
     got = LinearAecContract.from_dict(actual)
     want = LinearAecContract.from_dict(expected)
     got_dict = got.compatibility_dict()
     want_dict = want.compatibility_dict()
-    if got_dict != want_dict:
-        mismatches = [
-            f"{key}: got {got_dict[key]!r}, expected {want_dict[key]!r}"
-            for key in want_dict
-            if got_dict[key] != want_dict[key]
-        ]
-        raise ValueError(f"{context} linear_aec contract mismatch: " + "; ".join(mismatches))
+    if got_dict == want_dict:
+        return
+    differing = [key for key in want_dict if got_dict[key] != want_dict[key]]
+    recorded_hash = want_dict["aec_behavior_hash"]
+    current_hash = got_dict["aec_behavior_hash"]
+    if (differing == ["aec_behavior_hash"]
+            and ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.get(recorded_hash)
+            == current_hash):
+        warnings.warn(
+            f"{context} linear_aec was materialized by AEC behaviour "
+            f"{recorded_hash} and this build is {current_hash}; accepting via "
+            "the verified frontend-equivalent migration table "
+            "(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS in dataset_gen/linear_aec.py), "
+            "which records the byte-identical linear_error evidence for this "
+            "pair. No rematerialization or retraining is required.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    mismatches = [
+        f"{key}: got {got_dict[key]!r}, expected {want_dict[key]!r}"
+        for key in differing
+    ]
+    raise ValueError(f"{context} linear_aec contract mismatch: " + "; ".join(mismatches))
 
 
 class LinearAecProcessor:
@@ -636,6 +724,7 @@ def materialize_linear_error(
 
 
 __all__ = [
+    "ACCEPTED_BEHAVIOR_HASH_MIGRATIONS",
     "BEHAVIOR_HASH_SCHEMA",
     "DATASET_DELAY_NUM_FILTERS",
     "DELAY_NUM_FILTERS_RANGE",

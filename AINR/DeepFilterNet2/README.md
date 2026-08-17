@@ -83,19 +83,31 @@ head composition and WOLA remain in `dfn2_process.c/.h`.
 
 ```bash
 python3 export_onnx.py --model output/dfn2_best.pth \
-  --frames 64 --output output/dfn2_heads.onnx --verify
+  --output output/dfn2_stream.onnx --verify
 python3 export_erb_matrix.py --model output/dfn2_best.pth \
   --output-dir output/erb --format all
 python3 export_calibration.py --model output/dfn2_best.pth \
-  --wav-dir /path/to/noisy_wavs --frames 64 --blocks 256 \
+  --wav-dir /path/to/noisy_wavs --frames 256 \
   --output output/dfn2_calibration.npz
 ```
 
-`--frames` is fixed in the exported graph and is part of the deployment
-contract. The current graph resets its internal recurrent state on every
-invocation, so it must be validated with that exact block/reset policy; it is
-not a one-frame explicit-state streaming graph. `export_calibration.py`
-captures actual normalized ONNX inputs for PTQ. `calibrate_norm_init.py` is a
+The graph is stateless from the accelerator's perspective. Each invocation
+receives exactly three feature frames `[t-1,t,t+1]`, emits the heads for frame
+`t`, and returns three GRU hidden tensors plus the four-frame `df_convp`
+history for the next invocation. The extra history is required because the
+input kernel sees three frames while the DF residual path has a causal
+five-frame kernel; omitting it would silently reduce the trained receptive
+field. CPU-side window/state storage is defined by
+`dfn2_model_io.c/.h`, which also exports the window-slide and state-commit
+helpers so a host with its own state struct — DeepFilterNet-AENR keeps four
+feature windows — shares one implementation instead of copying the
+memmove/memcpy pair. State commit is transactional: a null or non-finite
+accelerator output returns `-1` before any persistent state is overwritten.
+The exported metadata carries `state_layout_version`,
+kept numerically equal to `DFN2_MODEL_IO_LAYOUT_VERSION` in that header, so an
+integrator can refuse a graph whose state layout no longer matches the struct
+it allocated. `export_calibration.py --frames N` captures `N`
+streaming invocations with real non-zero state. `calibrate_norm_init.py` is a
 different tool: it estimates the feature EMA initialization constants used by
 the C frontend.
 

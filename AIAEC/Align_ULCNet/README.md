@@ -121,7 +121,7 @@ flowchart LR
         AEC["Matched filter + PBFDKF"]
         ERR["linear_error"]
         AFAR["aligned_far"]
-        MODE{"deployed raw_far / aligned_far"}
+        SEAM["AEC aligned-far seam<br/>raw until acquisition"]
         STFT["two sqrt-Hann STFTs<br/>512 / 256"]
         ERRI["linear_error_ri<br/>[1,1,257,2]"]
         FARRI["far_end_ri<br/>[1,1,257,2]"]
@@ -132,8 +132,7 @@ flowchart LR
         MIC --> AEC
         FAR --> AEC
         AEC --> ERR --> STFT
-        AEC --> AFAR --> MODE
-        FAR --> MODE --> STFT
+        AEC --> AFAR --> SEAM --> STFT
         STFT --> ERRI
         STFT --> FARRI
         UPDATE --> STATE
@@ -173,7 +172,7 @@ Inputs per invocation:
 | tensor | float32 shape | ordering |
 |---|---:|---|
 | `linear_error_ri` | `[1,1,257,2]` | real/imag last |
-| `far_end_ri` | `[1,1,257,2]` | graph-descriptor far-input contract; every currently exported graph records `raw_far` |
+| `far_end_ri` | `[1,1,257,2]` | AEC aligned-far seam; it carries raw far before acquisition and aligned far afterward |
 | `key_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `value_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `logit_history` | `[1,32,4,D]` | chronological, t-4 through t-1 |
@@ -239,10 +238,39 @@ python3 export_streaming_onnx.py \
   --verify
 ```
 
+Capture PTQ inputs for the same D with the shared streaming calibrator:
+
+```bash
+python3 ../export_streaming_calibration.py Align_ULCNet \
+  --checkpoint checkpoint.pth \
+  --primary-dir /path/to/linear_error \
+  --far-dir /path/to/raw_far \
+  --frames 256 --max-delay-frames 8 \
+  --output output/align_ulcnet_d8_calibration.npz
+```
+
+Calibration deliberately uses the training-domain raw far signal; the report
+records that provenance separately from the production aligned-far seam. The
+D value must match the exported graph because it fixes the K/V-history tensor
+shapes and CPU state allocation, not because changing D requires retraining.
+
 The exporter writes a sibling JSON descriptor containing the exact grid,
-state layout version, D, far-input mode and tensor schemas.  The older shared
+state layout version, D, the fixed `aligned_far` deployment contract, the
+checkpoint's separate training provenance, and tensor schemas. The older shared
 `AIAEC/export_onnx.py` remains a fixed-block/offline export and must not be
 used as a one-frame deployment graph.
+
+**Every previously exported graph must be re-exported.** The model-I/O layout
+moved v2 -> v3 and the deployed far branch moved RAW -> ALIGNED, so a
+descriptor written before this change fails
+`ulcnet_model_io_descriptor_validate()` on BOTH fields (`layout_version !=
+ULCNET_MODEL_IO_LAYOUT_VERSION` and `far_input_mode != ULCNET_FAR_ALIGNED`),
+and `ulcnet_accelerator_adapter_init()` therefore returns NULL. Re-exporting is
+the whole remedy: nothing upstream of the graph changed. Checkpoints keep their
+weights and their recorded training provenance, and datasets need no
+regeneration -- the exporter reads the checkpoint's training
+`far_input_mode` and writes it beside the fixed deployment value rather than
+requiring the two to agree.
 
 CPU state storage and ring updates are implemented by
 `ulcnet_model_io.c/.h`.  They use one caller-owned pool, allocate RAM according

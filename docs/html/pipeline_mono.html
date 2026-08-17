@@ -109,7 +109,7 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <p>全部 cross-call state 都住在 caller 的單一 pool(C struct 持有;host 只擁有 pool 記憶體本身)。carve 順序 = <code>self, aec, fft, nr, synth_win, ola, ifft_buf, g_total, extra, e2, spec</code>(layout v6)。實測 bytes 為 16 kHz/256 KISS,<code>aec_nr_pipeline_static --print-mem-size</code>(2026-08-16 重跑):</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>Aec</code> 全狀態</td><td>379,712 B</td><td>pool(C struct)</td><td>HPF、PBFDKF×2(main+shadow)、delay estimator(<code>delay_mode=MATCHED</code> n=5)、RES context、AEC 內部 FFT</td></tr>
+<tr><td><code>Aec</code> 全狀態</td><td>379,728 B</td><td>pool(C struct)</td><td>HPF、PBFDKF×2(main+shadow)、delay estimator(<code>delay_mode=MATCHED</code> n=5)、RES context、AEC 內部 FFT</td></tr>
 <tr><td><code>FftHandle</code>(OLA 用)</td><td>8,784 B</td><td>pool</td><td>aec_only 時不存在</td></tr>
 <tr><td><code>MmseLsaDenoiser</code></td><td>122,160 B</td><td>pool</td><td>噪聲估計/SPP 等 NR 狀態</td></tr>
 <tr><td><code>synth_win</code></td><td>[frame_sz] f32</td><td>pool</td><td>常數 sqrt periodic Hann</td></tr>
@@ -117,15 +117,15 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <tr><td><code>ifft_buf/g_total/extra/e2</code></td><td>[fft] / 3×[n_freqs] f32</td><td>pool</td><td>hop 內 scratch(carve 時明確清零)</td></tr>
 <tr><td><code>spec</code></td><td>[n_freqs] Complex</td><td>pool</td><td>scratch</td></tr>
 <tr><td><code>rng_state</code>/<code>near_hang</code></td><td>u32 / int</td><td>C struct(self)</td><td>CNG RNG seed 0x9e3779b9;hangover 計數</td></tr>
-<tr><td>合計</td><td>516,512 B(504.4 KB)</td><td>—</td><td>含 160 B 控制塊;pipeline bufs 5,696 B</td></tr>
+<tr><td>合計</td><td>516,528 B(504.4 KB)</td><td>—</td><td>含 160 B 控制塊;pipeline bufs 5,696 B</td></tr>
 </table>
 <p>delay_mode 對總量的影響(16 kHz/256,KISS,實測;AEC 子項與 <code>lib/aec</code> 一致,這裡多疊了 FFT(OLA)+NR+160 B 控制塊+5,696 B pipeline bufs 的固定開銷):</p>
 <table>
 <tr><th>delay_mode</th><th>total_bytes</th><th>相對 MATCHED n=5</th></tr>
-<tr><td><code>MATCHED</code> n=5(預設)</td><td>516,512 B</td><td>—</td></tr>
-<tr><td><code>MATCHED</code> n=1</td><td>493,600 B</td><td>−22,912 B</td></tr>
-<tr><td><code>FIXED</code>,fixed=1600(100 ms)</td><td>358,416 B</td><td>−158,096 B</td></tr>
-<tr><td><code>EXTERNAL_ALIGNED</code></td><td>351,504 B</td><td>−165,008 B</td></tr>
+<tr><td><code>MATCHED</code> n=5(預設)</td><td>516,528 B</td><td>—</td></tr>
+<tr><td><code>MATCHED</code> n=1</td><td>493,616 B</td><td>−22,912 B</td></tr>
+<tr><td><code>FIXED</code>,fixed=1600(100 ms)</td><td>358,432 B</td><td>−158,096 B</td></tr>
+<tr><td><code>EXTERNAL_ALIGNED</code></td><td>351,520 B</td><td>−165,008 B</td></tr>
 </table>
 <p class="note">上表用直接呼叫 <code>audio_pipeline_get_mem_requirements()</code>/<code>_get_mem_breakdown()</code> 量得(無對應 CLI 旗標,見上方 API 用法節)。</p>
 

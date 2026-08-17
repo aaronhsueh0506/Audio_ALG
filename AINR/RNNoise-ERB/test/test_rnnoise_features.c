@@ -98,6 +98,9 @@ static int ref_step(RefState *st, const float *re, const float *im,
 
 int main(void) {
     RNNoiseState actual;
+    RNNoiseModelState model_state;
+    RNNoiseModelState previous_model_state;
+    float hidden_next[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE];
     RefState ref;
     float re[RNNOISE_N_BINS], im[RNNOISE_N_BINS];
     float got_erb[3][RNNOISE_N_BANDS], want_erb[3][RNNOISE_N_BANDS];
@@ -106,6 +109,50 @@ int main(void) {
     int ok = 1;
 
     rnnoise_state_init(&actual);
+    rnnoise_model_state_init(&model_state);
+    memset(hidden_next, 0x3d, sizeof(hidden_next));
+    if (rnnoise_model_state_commit(&model_state, hidden_next) != 0 ||
+        memcmp(model_state.hidden, hidden_next, sizeof(hidden_next)) != 0) {
+        printf("FAIL: RNNoise model-state output/input handoff\n");
+        ok = 0;
+    }
+    previous_model_state = model_state;
+    /* Every byte of the rejected batch must DIFFER from what is already
+     * committed. Re-using the accepted 0x3d pattern made a non-transactional
+     * commit -- one that writes each element until it reaches the bad one --
+     * byte-indistinguishable from a clean refusal, so the memcmp below proved
+     * nothing about partial writeback. */
+    memset(hidden_next, 0x41, sizeof(hidden_next));
+    hidden_next[1][17] = NAN;
+    if (rnnoise_model_state_commit(&model_state, hidden_next) == 0 ||
+        memcmp(&model_state, &previous_model_state, sizeof(model_state)) != 0) {
+        printf("FAIL: RNNoise accepted or partially committed NaN GRU state\n");
+        ok = 0;
+    }
+    memset(hidden_next, 0x41, sizeof(hidden_next));
+    hidden_next[1][17] = INFINITY;
+    if (rnnoise_model_state_commit(&model_state, hidden_next) == 0 ||
+        memcmp(&model_state, &previous_model_state, sizeof(model_state)) != 0) {
+        printf("FAIL: RNNoise accepted or partially committed Inf GRU state\n");
+        ok = 0;
+    }
+    /* The bad value sits in the LAST layer here, so a commit that validated
+     * only the first layer before copying would pass the cases above. */
+    memset(hidden_next, 0x41, sizeof(hidden_next));
+    hidden_next[RNNOISE_MODEL_GRU_COUNT - 1][RNNOISE_MODEL_GRU_SIZE - 1] = NAN;
+    if (rnnoise_model_state_commit(&model_state, hidden_next) == 0 ||
+        memcmp(&model_state, &previous_model_state, sizeof(model_state)) != 0) {
+        printf("FAIL: RNNoise committed a NaN in the final GRU layer\n");
+        ok = 0;
+    }
+    /* A finite batch must still be accepted afterwards: the guard is a
+     * per-call check, not a latch that disables every later commit. */
+    memset(hidden_next, 0x41, sizeof(hidden_next));
+    if (rnnoise_model_state_commit(&model_state, hidden_next) != 0 ||
+        memcmp(model_state.hidden, hidden_next, sizeof(hidden_next)) != 0) {
+        printf("FAIL: RNNoise refused a finite GRU state after a refusal\n");
+        ok = 0;
+    }
     ref_init(&ref);
     fill_stationary_spectrum(re, im);
 

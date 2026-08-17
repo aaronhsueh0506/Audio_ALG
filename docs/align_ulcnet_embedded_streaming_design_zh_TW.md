@@ -5,20 +5,28 @@
 helper（`ulcnet_model_io.c/h`、`ulcnet_accelerator_adapter.c/h`）與 C
 STFT/WOLA（`ulcnet_process.c/h`）已實作；§8 的 delay 狀態機/fail-open 邏輯
 也已落地到 `pipelines/mono_alignulcnet/`、`pipelines/4ch_alignulcnet/`
-兩個 ULCNet pipeline（`AecLinearContext.delay_state` UNLOCKED/LOCKED/CHANGED
-閘控、RAW/ALIGNED 兩種 far_input_mode、reset 時清空 K/V/logit/GRU）。
+兩個 ULCNet pipeline。production 固定讀 AEC 的 aligned-far seam：UNLOCKED
+期間 seam 傳 raw far，模型仍執行並套用；取得 alignment 後 seam 改傳 aligned
+far，切換前 reset K/V/logit/GRU。raw/aligned 選擇只留在 sweep 工具。
 實際 board/NPU driver 尚未完成（目前 `main.c` 的 `run_accelerator()`
 仍是回 -1 的 TODO 佔位）。
 raw/aligned 與 small-D sweep 現已完成，release 裁定（2026-08-17）：
-**部署固定 `raw_far`**；`aligned_far` 為 sweep 驗證過的功能，保留在
-sweep/實驗路徑，exporter 暫不加 far-mode override（generated descriptor
-固定記錄 RAW）。目前真正未完成的是 board/NPU driver、exporter 產
-generated C descriptor（含 D/shape/layout，far mode 記 RAW）與
+**部署固定使用 aligned-far seam**，不提供 runtime far-mode switch；exporter
+分開記錄 checkpoint 的 raw-far training provenance 與 aligned-far deployment
+contract。目前真正未完成的是 board/NPU driver、exporter 產
+generated C descriptor（含 D/shape/layout）與
 application 依 descriptor 配置（移除手寫 D=8）、各產品 route 的 n 範圍
-量測。ALIGNED 專屬的兩項——短延遲 first-lock policy（already_cancelling
-與 seam 採用權的解耦）與 FIXED+ALIGNED 首次可用的 CHANGED/reset 語意
-（UNLOCKED→CHANGED 一 hop→LOCKED、mono/4ch 同以 delay_state 為 gate）——
-延後到真正要啟用 ALIGNED/FIXED+ALIGNED 時處理，不阻擋 RAW release。
+量測。FIXED 首次由 raw ring-fill 切到 aligned far 的 reset 已在兩個 wrapper
+補齊；4ch 的 solid 時序亦已與實際可讀 hop 對齊。
+
+**既有 ONNX/JSON 必須全部重新匯出。** model-I/O layout 由 v2 進到 v3，
+deployed far branch 由 RAW 改為 ALIGNED，因此本次改動之前產出的每一份
+descriptor 在 `ulcnet_model_io_descriptor_validate()` 會同時卡在兩個欄位
+（`layout_version` 與 `far_input_mode`），`ulcnet_accelerator_adapter_init()`
+直接回 NULL。補救動作只有重新匯出 graph 一項：checkpoint 與 dataset
+都**不需要**重新訓練或重新生成——權重未變，exporter 會把 checkpoint 原本的
+training `far_input_mode` 與固定的 aligned-far deployment 值分開寫入，兩者
+不需一致。
 
 本文件供實作者評估如何將現有 PBFDKF + Align-ULCNet 路徑放到記憶體與
 算力受限的 embedded system。產品測試一律使用本專案 PBFDKF 的 linear
@@ -36,8 +44,9 @@ output；論文展示頁提供的 KF residual 只作研究診斷，不是產品 
 - 一次只送一個新 STFT frame 給模型，但所有必要狀態跨呼叫保留。
 - C frontend/postprocess 使用 caller-owned static memory；模型 inference 由
   版端 NPU/DSP runtime 執行。
-- 超出 delay search/ring 或失去可信對齊時 fail-open，不要求 NN 猜測錯位
-  reference。
+- 超出 matched search 時 seam 保持 raw far，模型仍執行；可處理範圍由 export
+  的 D 決定。只有 callback 失敗、partial write 或 NaN/Inf 才走 identity
+  fail-open。
 
 ### 1.2 非目標
 
@@ -86,21 +95,34 @@ output；論文展示頁提供的 KF residual 只作研究診斷，不是產品 
 2. **duty-cycle 數字已驗證**：0.3 s（16k/hop256 = 19 hops ≈ 304 ms）進
    duty、之後每 6 hops（96 ms）分析一次（`aec.c:1711-1741`）；
    ring/decimator 每 hop 連續餵（`delay_aec3.c:1043-1046`）。
-3. **ERLE 相關保護在本案組態下「死一半」**（2026-08-13 codex re-review
-   後修正——先前版本誤寫成全部失效）：`enable_res=0 &&
-   return_res_context=1`（NN seam 與 4ch pipeline 的實際組態）時，
-   - **失效**：windowed-ERLE duty watchdog 與
-     `delay_acquire_protect_converged`（兩者讀 `last_erle_windowed`，而
-     C 只在 `enable_res` 時快取它）；
-   - **仍有效**：warm tap-transfer gate——它讀的是 inst-ERLE ring，該
-     ring 無條件每 hop 填充（aec.c 註解明寫 "works even with
-     enable_res=0"）。
-   另有一個已確認的 **C/Python 分歧**：Python 在
-   `(enable_res or return_res_context)` 下就計算並快取
-   `erle_windowed`（orchestrator），所以 Python 的 already-cancelling
-   保護在 seam 組態下是活的、C 是死的。修法=C 快取條件對齊 Python，屬
-   行為改變、獨立 commit + 驗證。watchdog leak 率固定每 hop `-0.001`
-   未依 hop 重定時（`aec.c:1750`）亦待同批處理。
+3. **ERLE 相關保護在本案組態下全部有效**（先前版本記錄的 C/Python
+   分歧已修復，見下）。`enable_res=0 && return_res_context=1`（NN seam
+   與 4ch pipeline 的實際組態）時：
+   - windowed-ERLE duty watchdog 與 `delay_acquire_protect_converged`
+     讀 `last_erle_windowed`。C 端原本**只在 `enable_res` 時快取**它，
+     所以這兩者在 seam 組態下是死的，而 Python 在
+     `(enable_res or return_res_context)` 下就計算並快取
+     `erle_windowed`（orchestrator）——這是一個真的 C/Python 分歧。
+     **已修**：C 的快取條件改成與 Python 相同（`aec.c` 步驟 19 之後的
+     `last_erle_windowed` 快取），兩端語意一致，seam 組態下保護是活的。
+     此修正只填一個快取值、不進訊號路徑，**音訊輸出逐位元不變**
+     （seam 組態渲染 512,000 bytes 前後相同）。
+   - warm tap-transfer gate 讀的是 inst-ERLE ring，該 ring 無條件每 hop
+     填充（aec.c 註解明寫 "works even with enable_res=0"），本來就有效。
+
+   在此基礎上新增 `delay_backward_quarantine_enabled` / `_s`（預設 OFF，
+   見 `lib/aec/docs/c_user_manual_zh_TW.md` 與
+   `lib/aec/docs/delay_estimator_design_zh_TW.md`）：它是
+   `delay_acquire_protect_converged` 的 Path-B 姊妹機制，針對的是**已鎖定
+   後被 pre-echo 誤鎖搶走**（實測 true 6400 → 4800）。只隔離比現行 delay
+   **更早**的候選，且有時間上限——到期就採用，所以是「延後一個窗」而不是
+   「治癒誤鎖」。判別式 `aec_linear_is_cancelling()` 同時看 windowed 與
+   inst-ERLE 兩個讀數，兩端共用同一函式；4ch core 只問
+   `capture_proxy_channel` 那一條 lane（餵給共用 estimator 的那支 mic）。
+   目前證據只有合成場景與 C／Python 逐 hop 對照，**真實錄音抽測尚未做**，
+   所以產品組態維持預設 OFF；AIAEC 的 frozen frontend 也不開它。
+
+   watchdog leak 率固定每 hop `-0.001` 未依 hop 重定時（`aec.c`）仍待處理。
 
 ### 2.2 現有 AIAEC 資料邊界
 
@@ -300,18 +322,20 @@ void aec_get_linear_context(const Aec *aec, AecLinearContext *context);
 **實作狀態**：`AecLinearContext` + `aec_get_linear_context()` 已存在於
 standalone AEC 與 `Audio_ALG/lib/aec`。enum 刻意不含 `OUT_OF_RANGE`：超出
 搜尋範圍在現有 estimator 下與「未鎖定」不可區分，第一版只回
-`UNLOCKED`，fail-open 判斷屬 caller；`generation` 在
-reset/first-acquisition/soft+hard shift 全部遞增並 saturate。以下表格是
-導入 seam 前的缺口紀錄，不是目前 API inventory：
+`UNLOCKED`。此時 seam 仍持續供給 raw far、模型照常執行並套用，能不能處理
+該偏移由 export 的 D 決定；`delay_state` 只供診斷與 alignment 切換 reset，
+不閘控模型。`generation` 在
+reset/first-acquisition/soft+hard shift 全部遞增並 saturate。目前 API
+inventory：
 
 | 欄位 | 現況 |
 |---|---|
-| `formed_linear_hop` | 已有：`AecResContext.formed_hop`（`aec.c:2761`） |
-| `aligned_far_hop` | 資料在（`a->far_hop` 是公開 struct 欄位，`aec.h:290`），但沒有任何 getter 回傳它 |
-| `delay_samples` | 已有，僅在 `AecDebugStatus`（`aec.c:2791`；`-1` = 未 acquire） |
-| `delay_confidence` | 已有，僅在 `AecDebugStatus`，且只有 0/0.5/1 三值（`delay_aec3.c:1225-1230`） |
-| `delay_state` | 完全不存在；UNLOCKED 可由 `delay_samples < 0` 推得，OUT_OF_RANGE 與 UNLOCKED 在現有程式碼不可區分 |
-| `generation` | 完全不存在。內部僅有當幀即被消費的 `pending_delay_change`（`aec.c:1811/1848/2441-2444`），且 soft-recovery 與 warm tap-transfer 路徑刻意不設旗標（`aec.c:1784-1799, 1828-1837`）——generation 必須做在 AEC 內部所有改變 ring 偏移的路徑上，外部 poll `delay_samples` 差分會漏掉短暫跳變 |
+| `formed_linear_hop` | `AecLinearContext.formed_linear_hop`，alias formed linear-error hop |
+| `aligned_far_hop` | `AecLinearContext.aligned_far_hop`，alias PBFDKF 本 hop 實際消費的 far；UNLOCKED 時為 raw far |
+| `delay_samples` | 已套用的 ring offset；MATCHED 尚未 acquire 時為 `-1` |
+| `delay_confidence` | 與 `AecDebugStatus` 同源的 0/0.5/1 confidence |
+| `delay_state` | `UNLOCKED/LOCKED/CHANGED`；不宣稱能區分 out-of-range 與尚未鎖定 |
+| `generation` | reset、first acquisition、soft/hard shift 均遞增並飽和；外部用於清除跨 hop cache |
 
 另一個必須補的防禦：`current_delay` 從未與 `ref_ring_size` 比對，caller
 把 `max_delay_ms`/`delay_buffer_ms` 調小時取模會 alias 讀錯 far 且不報錯
@@ -499,35 +523,36 @@ recovery 語意整合，避免同一個 delay event在 AEC 與 NN 被重複 rese
 現況注記（2026-08-13 更新）：`delay_state` 與 `generation` 已在 AEC
 standalone 實作（見 5.1 節實作狀態）；out-of-range 偵測仍不存在（超出
 約 509 ms 可靠搜尋上界時狀態停在 UNLOCKED，與冷啟動不可區分）。第一版
-fail-open/reset 已落在兩個 pipeline 變體
+reset/fail-open 已落在兩個 pipeline 變體
 （`pipelines/mono_alignulcnet/audio_pipeline_ulcnet` 與
 `pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet`），且**兩個變體現在行為一致**：
-UNLOCKED→模型照步進（每個 emitted frame 都 infer，per-hop 計算量恆定、
-runtime recurrent state 連續）、只閘控「輸出是否套用」；CHANGED→
-`model->reset`；infer 失敗或輸出含非有限值（NaN/Inf）→該 frame 走
+UNLOCKED→模型照步進並套用成功輸出（seam 此時為 raw far）；CHANGED 或
+FIXED 首次 UNLOCKED→LOCKED→`model->reset`；infer 失敗或輸出含非有限值
+（NaN/Inf）→該 frame 走
 identity，永不進 WOLA；HOLD/REACQUIRE 細分與 crossfade 仍待做。4ch 側的
 先例實作在 `4aec_nr_res.c:778-794, 901-914`。
 
-兩個變體另新增 `far_input_mode` 部署契約：模式必須與 exported
-graph descriptor 及應用實際接線一致，不可每 hop 熱切換。現有權重的
-raw/aligned sweep 已完成並接受兩種明確部署 profile：
+2026-08-17 更新（identity reprime，option A）：邊界的 `model->reset` 之後，
+C 側 STFT 狀態仍連續，緊接著發射的幀其 512 樣本分析窗**跨在邊界上**（一半
+是切換前推入的 hop）。這一版對那些幀改走 identity 且**完全不呼叫 infer**
+（K/V、logit、GRU 都不前進），等 err 與 far 兩路窗都只含切換後的 hop 才
+同時恢復 step 與 apply：mono `AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES=1`、
+4ch `AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES=2`（4ch 兩路都比輸入慢一 hop：
+beam WOLA 一 hop + 對應的 far 一 hop 補償）。兩個常數由各自 test suite 的
+`test_reprime_straddle_derivation()` 以脈衝標記在**無邊界對照跑**中量出並
+斷言，不是寫死的估計值。option B（邊界後照常 step、只是輸出仍套用）暫緩，
+需先做音檔 A/B；crossfade 仍是更後面的 phase。
 
-- `ULCNET_FAR_RAW`（預設；現行權重以 RAW far 訓練，release 部署固定用它）：餵 caller 的 raw far（4ch 側
-  與 aligned 模式共用同一個 one-hop far 補償 buffer，err/far frame 對
-  同一個 input hop）；**不以 delay lock 閘控模型套用**——paper 契約不依賴
-  lock。
-- `ULCNET_FAR_ALIGNED`：餵 aligned far
-  並以 lock 閘控套用（即上述 UNLOCKED bypass 行為）。
+兩個變體的 production far branch 固定讀 AEC aligned-far seam，沒有 runtime
+mode。checkpoint 的 raw-far 欄位僅作 training provenance；export descriptor
+固定 ALIGNED。raw/aligned A/B 只在 sweep 工具保留。
 
-⚠ **短延遲部署注意（pipeline 實測發現；只適用 ALIGNED 模式——RAW 模式
-不以 lock 閘控，NN 照常生效）**：echo path 的 bulk delay 很小
+⚠ **短延遲部署注意**：echo path 的 bulk delay 很小
 （linear filter 的 832-tap 涵蓋範圍內）時，filter 未對齊就能收斂 → ERLE
 超過 2.5 dB → Path-A already-cancelling 保護（`delay_acquire_protect_converged`，
 Python/C 現已一致）會**永久擋下 first acquisition**，`delay_state` 恆為
-UNLOCKED，ALIGNED 模式的 NN 後級永遠在 fail-open。這對音質是安全的
-（線性殘差直接出），但代表短延遲裝置上 ALIGNED 模式的 NN 從未生效——
-產品狀態機（Phase 5）需要一條「filter 已收斂且無 delay 需求 → 視同
-LOCKED、far 直接可用」的路徑。
+UNLOCKED。這不會停用 NN：seam 會持續提供 raw far，模型能否處理該偏移由 D
+決定；若日後要強制只接受 aligned far，才需要額外的 acquisition policy。
 
 ## 9. D 的候選與 Checkpoint
 
@@ -578,8 +603,7 @@ flowchart LR
         FAR["far PCM hop"]
         AEC["Matched filter + PBFDKF"]
         ERR["linear_error PCM"]
-        AFAR["aligned_far PCM"]
-        FMODE{"far_input_mode"}
+        AFAR["aligned-far seam PCM<br/>raw until acquisition"]
         ESTFT["sqrt-Hann STFT<br/>512 / 256"]
         FSTFT["sqrt-Hann STFT<br/>512 / 256"]
         ERRI["linear_error_ri<br/>[1,1,257,2]"]
@@ -595,9 +619,7 @@ flowchart LR
         MIC --> AEC
         FAR --> AEC
         AEC --> ERR --> ESTFT --> ERRI
-        AEC --> AFAR --> FMODE
-        FAR --> FMODE
-        FMODE --> FSTFT --> FARRI
+        AEC --> AFAR --> FSTFT --> FARRI
         UPDATE --> KH
         UPDATE --> VH
         UPDATE --> LH
@@ -648,7 +670,7 @@ Inputs：
 | tensor | float32 shape | 來源／用途 |
 |---|---:|---|
 | `linear_error_ri` | `[1,1,257,2]` | CPU PBFDKF error 的 STFT |
-| `far_end_ri` | `[1,1,257,2]` | 依 graph descriptor contract；現行 export 皆記錄 `raw_far`，`aligned_far` 為已接受的明確 export profile（exporter override 待完成） |
+| `far_end_ri` | `[1,1,257,2]` | 固定取 AEC aligned-far seam；acquisition 前為 raw far，之後為 aligned far |
 | `key_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far keys |
 | `value_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far values |
 | `logit_history` | `[1,32,4,D]` | TA `(5,3)` score conv 的前 4 幀 raw logits |
@@ -687,7 +709,9 @@ key_history next = [K_now, K(t-1), ..., K(t-D+2)]
 
 stream start/pipeline reset 必須清空所有 state。`delay_state=CHANGED`
 至少清空 K/V ring 與 logit history；第一版為降低風險，連兩組 GRU
-hidden 一起清空，之後才 A/B 「只清 TA」。
+hidden 一起清空，之後才 A/B 「只清 TA」。清空後仍跨在邊界上的分析幀由
+pipeline 端的 identity reprime 擋掉（不 step 模型），見 5.x 的
+2026-08-17 更新。
 
 ### 10.3 C 交付邊界
 
@@ -839,22 +863,17 @@ K/V/GRU 細節，`reset(user)` 負責清空外部 state。
 - board runtime與 reference 的 tolerance 必須在文件中固定；
 - 未達標則保留 D=64 或進 fine-tune，不以單一平均分掩蓋 worst cases。
 
-## 13. Claude 評估清單
+## 13. 板端整合確認清單
 
-請實作者先回答以下問題，再動核心流程：
+核心 seam 與 explicit-state graph 已完成；板端整合仍需確認：
 
-1. 現有 `a->far_hop` 是否在所有 process entry point 都能安全作為
-   `aligned_far_hop` 暴露？
-2. 擴充 `AecResContext` 或新增 `AecLinearContext` 哪個對 ABI/versioning
-   風險較低？
-3. Python PBFDKF 能否用同一 contract暴露完全相同語意的 aligned far？
-4. 現有 200-hour WAV/packed資料能否不重生原始場景，只重跑 PBFDKF
-   materialization取得 aligned far？
-5. NPU 是否支援本模型所有算子與 explicit recurrent states？
-6. `center=True` offline contract 在板端要用 256-sample lookahead重現，還是
-   接受改成 past-only feature timing？
-7. board profiler顯示 attention 是不是實際 hotspot；D=8 對整體 latency
-   的收益是多少？
+1. NPU 是否支援 graph 的所有算子與七入/六出 explicit-state I/O？
+2. Board adapter 是否從 exporter descriptor 取得 D/tensor shapes，而非手寫？
+3. CPU 是否在每次 invoke 後驗證全部 model outputs finite，再 commit state？
+4. MATCHED/FIXED alignment transition 是否在同一 hop 清除 K/V/logit/GRU state？
+5. `center=True` 的 256-sample lookahead 是否與 C STFT/WOLA timestamp 相符？
+6. route delay 超出 n 的可靠範圍時，產品如何記錄、告警與選擇 fallback？
+7. board profiler 下 D=4/8/16 的 state RAM、NPU time 與整體 hop margin 為何？
 8. aligned far residual-lag p99 是否真的落在 D=8 的 112 ms causal範圍？
 9. negative residual offset比例是否要求 causal margin或 signed attention？
 10. delay event時哪些 states 要 reset，哪些應保留，A/B 證據是什麼？
@@ -878,7 +897,11 @@ K/V/GRU 細節，`reset(user)` 負責清空外部 state。
    shard 與 checkpoint。
 4. **Q4 = 不需重生 dataset**。raw/aligned zero-shot sweep 已接受現有
    權重直接部署；舊 WAV、packed shard 與 checkpoint 保持不變。只需讓
-   export descriptor 與 pipeline 實際接線同步標示 RAW 或 ALIGNED。
+   export descriptor 與 pipeline 實際接線標示同一個 far branch。
+   （後續裁定把這一項收斂成單一值：descriptor 固定寫 ALIGNED，
+   `ulcnet_model_io.c` 的 validate 直接拒絕 RAW descriptor，checkpoint 的
+   raw-far 只留作 training provenance。既有 ONNX/JSON 因此必須重新匯出，
+   但不需重訓。）
 5. Q5：待 operator inventory 對板端 runtime 逐項核對（第 10 節清單）。
 6. **Q6 = 已決策**：第一版重現 center=True（見第 7 節）。
 7. Q7：待板端 profiler。

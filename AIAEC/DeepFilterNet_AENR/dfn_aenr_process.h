@@ -11,7 +11,28 @@
 #define DFN_AENR_PROCESS_H
 
 #include "dfn2_process.h"
+#include "dfn2_model_io.h"
 #include "fft_wrapper.h"
+
+#define DFN_AENR_MODEL_IO_LAYOUT_VERSION 1
+
+/* Caller-owned tensors for export_streaming_onnx.py's stateless graph. */
+typedef struct DfnAenrModelIOState {
+    float error_erb_window[DFN2_MODEL_INPUT_FRAMES][DFN2_N_ERB];
+    float error_spec_window[2][DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS];
+    float far_erb_window[DFN2_MODEL_INPUT_FRAMES][DFN2_N_ERB];
+    float far_spec_window[2][DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS];
+    float encoder_gru_hidden[DFN2_MODEL_ENCODER_GRU_LAYERS]
+                            [DFN2_MODEL_GRU_HIDDEN];
+    float erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS]
+                        [DFN2_MODEL_GRU_HIDDEN];
+    float df_gru_hidden[DFN2_MODEL_DF_GRU_LAYERS]
+                       [DFN2_MODEL_GRU_HIDDEN];
+    float df_convp_history[DFN2_MODEL_ENCODER_CHANNELS]
+                           [DFN2_MODEL_DF_PATHWAY_HISTORY]
+                           [DFN2_DF_BINS];
+    unsigned long long feature_frames_seen;
+} DfnAenrModelIOState;
 
 typedef struct DfnAenrAnalysis {
     const float *window;
@@ -41,6 +62,32 @@ typedef struct DfnAenrProcessState {
 } DfnAenrProcessState;
 
 void dfn_aenr_make_window(float window[DFN2_N_FFT]);
+
+void dfn_aenr_model_io_init(DfnAenrModelIOState *state);
+
+/* Push one error/far feature pair. Returns 1 when the graph can consume the
+ * four [t-1,t,t+1] windows and emit heads[t], 0 during warm-up, or -1 on an
+ * invalid argument. Push one all-zero pair to flush the final real frame. */
+int dfn_aenr_model_io_push_features(
+    DfnAenrModelIOState *state,
+    const float error_erb[DFN2_N_ERB],
+    const float error_spec[2][DFN2_DF_BINS],
+    const float far_erb[DFN2_N_ERB],
+    const float far_spec[2][DFN2_DF_BINS]);
+
+/* Transactional state handoff: returns -1 without changing state when any
+ * accelerator output is NULL or non-finite. */
+int dfn_aenr_model_io_commit_state(
+    DfnAenrModelIOState *state,
+    const float encoder_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
+                                   [DFN2_MODEL_GRU_HIDDEN],
+    const float erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
+                               [DFN2_MODEL_GRU_HIDDEN],
+    const float df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
+                              [DFN2_MODEL_GRU_HIDDEN],
+    const float pathway_history_next[DFN2_MODEL_ENCODER_CHANNELS]
+                                    [DFN2_MODEL_DF_PATHWAY_HISTORY]
+                                    [DFN2_DF_BINS]);
 
 /* fft/window are caller-owned and may be shared by the two analyses and
  * synthesis because their transforms are invoked sequentially. */

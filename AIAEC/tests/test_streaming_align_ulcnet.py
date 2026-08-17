@@ -196,9 +196,12 @@ def test_load_model_far_input_mode_default_present_and_rejected(
 
     # _write_synthetic_checkpoint records no far_input_mode -- exactly a
     # legacy checkpoint. It must load, defaulted to raw_far, and the loader
-    # must say so (streaming.py shares this loader, so both CLIs print it).
+    # must name BOTH sides: the mode the checkpoint trained on and the
+    # aligned-far seam deployment feeds it (streaming.py shares this loader
+    # and the same seam, so both CLIs print the same line).
     load_model(path, 'cpu')
-    assert 'checkpoint far_input_mode: raw_far' in capsys.readouterr().out
+    assert ('checkpoint training far_input_mode: raw_far; deployment: aligned_far'
+            in capsys.readouterr().out)
 
     # Field present (what every new contract records): loads identically.
     ckpt = torch.load(path, map_location='cpu', weights_only=False)
@@ -206,7 +209,8 @@ def test_load_model_far_input_mode_default_present_and_rejected(
     explicit_path = str(tmp_path / 'ckpt_explicit.pth')
     torch.save(ckpt, explicit_path)
     load_model(explicit_path, 'cpu')
-    assert 'checkpoint far_input_mode: raw_far' in capsys.readouterr().out
+    assert ('checkpoint training far_input_mode: raw_far; deployment: aligned_far'
+            in capsys.readouterr().out)
 
     # Unknown mode: rejected before any weights load.
     ckpt['contract']['far_input_mode'] = 'aligned_far'
@@ -241,3 +245,107 @@ def test_load_model_max_delay_override(model, tmp_path, capsys):
     loaded, _, _ = load_model(path, 'cpu', max_delay_frames=64)
     assert loaded.max_delay_frames == 64
     assert 'deployment override' not in capsys.readouterr().out
+
+
+def _write_delayed_scene(tmp_path, samples=32768, delay=1024, seed=23):
+    """A mic/far pair whose echo sits at a known bulk delay, on disk."""
+    import soundfile as sf
+
+    generator = torch.Generator().manual_seed(seed)
+    far = torch.randn(samples, generator=generator) * 0.05
+    mic = torch.zeros(samples)
+    mic[delay:] = 0.5 * far[:samples - delay]
+    mic += torch.randn(samples, generator=generator) * 0.005
+    mic_path = str(tmp_path / 'mic.wav')
+    far_path = str(tmp_path / 'far.wav')
+    sf.write(mic_path, mic.numpy(), GRID.sample_rate, subtype='FLOAT')
+    sf.write(far_path, far.numpy(), GRID.sample_rate, subtype='FLOAT')
+    return mic_path, far_path, far.unsqueeze(0)
+
+
+def test_denoise_and_streaming_feed_the_model_the_same_aligned_far(
+        model, tmp_path, monkeypatch):
+    """Both CLIs must build the model's far branch from the SAME seam.
+
+    Production feeds the model the far hop the linear AEC actually consumed
+    (raw until the alignment ring can serve the applied delay, ring-aligned
+    afterwards), so an offline CLI that fed the raw far WAV instead would be
+    evaluating a model on an input distribution deployment never produces.
+
+    The far each CLI hands to its own STFT is captured at that boundary --
+    denoise.py through its module-level ``stft``, streaming.py through the
+    chunks pushed into its far ``StreamSTFT`` -- and compared against the
+    PBFDKF-consumed far recomputed INDEPENDENTLY here from the same contract.
+    The raw-far inequality is what keeps this from passing vacuously.
+    """
+    from AIAEC.Align_ULCNet import denoise as denoise_cli
+    from AIAEC.Align_ULCNet import streaming as streaming_cli
+    from AIAEC.aiaec_streaming import StreamSTFT
+    from AIAEC.dataset_gen import make_linear_aec_contract
+    from AIAEC.inference_common import load_mic_far
+    from AIAEC.training_common import LinearAecEngine
+
+    checkpoint = str(tmp_path / 'ckpt.pth')
+    _write_synthetic_checkpoint(checkpoint, model)
+    mic_path, far_path, raw_far = _write_delayed_scene(tmp_path)
+
+    # --- denoise.py: record the tensors handed to the offline STFT. The CLI
+    # transforms the error first and the far second, and calls stft exactly
+    # twice, so the far branch is call 1.
+    stft_inputs = []
+    real_stft = denoise_cli.stft
+
+    def recording_stft(signal, grid, *args, **kwargs):
+        stft_inputs.append(signal.detach().clone())
+        return real_stft(signal, grid, *args, **kwargs)
+
+    monkeypatch.setattr(denoise_cli, 'stft', recording_stft)
+    denoise_cli.main(denoise_cli.build_parser().parse_args([
+        checkpoint, mic_path, far_path, str(tmp_path / 'denoise_out.wav'),
+        '--device', 'cpu',
+    ]))
+    assert len(stft_inputs) == 2
+    denoise_far = stft_inputs[1]
+
+    # --- streaming.py: record every chunk pushed into the far StreamSTFT.
+    # The CLI constructs the error transform first and the far one second.
+    pushed = {}
+    constructed = []
+
+    class RecordingStreamSTFT(StreamSTFT):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.index = len(constructed)
+            constructed.append(self)
+            pushed[self.index] = []
+
+        def push(self, chunk):
+            pushed[self.index].append(chunk.detach().clone())
+            return super().push(chunk)
+
+    monkeypatch.setattr(streaming_cli, 'StreamSTFT', RecordingStreamSTFT)
+    streaming_cli.main(streaming_cli.build_parser().parse_args([
+        checkpoint, mic_path, far_path, str(tmp_path / 'stream_out.wav'),
+        '--device', 'cpu',
+    ]))
+    assert len(constructed) == 2
+    streaming_far = torch.cat(pushed[1], dim=-1)
+
+    # --- the independent reference: the same frozen engine, same contract,
+    # run here over the same audio.
+    contract = make_linear_aec_contract(GRID.sample_rate)
+    mic_t, far_t, _rates = load_mic_far(mic_path, far_path, GRID.sample_rate)
+    engine = LinearAecEngine(n_lanes=1, sample_rate=GRID.sample_rate,
+                             contract=contract.as_dict())
+    engine(mic_t, far_t, GRID.sample_rate)
+    consumed_far = engine.get_aligned_far()
+
+    assert streaming_far.shape == consumed_far.shape
+    assert torch.equal(streaming_far, consumed_far)
+    assert torch.equal(denoise_far, consumed_far)
+    assert torch.equal(streaming_far, denoise_far)
+
+    # Non-vacuous: the scene really was delayed, so the seam really did move
+    # the far. A CLI still feeding the raw WAV would satisfy every equality
+    # above only if this failed.
+    assert not torch.equal(consumed_far, raw_far)

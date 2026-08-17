@@ -22,13 +22,30 @@ _AC_INCLUDE = os.path.join(_AUDIO_COMMON, 'include')
 N_FFT, HOP, BINS = 1024, 512, 513
 
 _DRIVER = r'''
+#include <math.h>
 #include <stdio.h>
+#include <string.h>
 #include "dfn_aenr_process.h"
 
 int main(int argc, char **argv) {
     static DfnAenrProcessState state;
+    static DfnAenrModelIOState model_io;
+    static DfnAenrModelIOState committed_model_io;
+    static float encoder_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
+                             [DFN2_MODEL_GRU_HIDDEN];
+    static float erb_next[DFN2_MODEL_ERB_GRU_LAYERS]
+                         [DFN2_MODEL_GRU_HIDDEN];
+    static float df_next[DFN2_MODEL_DF_GRU_LAYERS]
+                        [DFN2_MODEL_GRU_HIDDEN];
+    static float pathway_next[DFN2_MODEL_ENCODER_CHANNELS]
+                              [DFN2_MODEL_DF_PATHWAY_HISTORY]
+                              [DFN2_DF_BINS];
     static float window[DFN2_N_FFT];
     float hop[DFN2_HOP_LEN];
+    float error_erb[DFN2_N_ERB] = {0};
+    float far_erb[DFN2_N_ERB] = {0};
+    float error_spec[2][DFN2_DF_BINS] = {{0}};
+    float far_spec[2][DFN2_DF_BINS] = {{0}};
     float er[2][DFN2_N_BINS], ei[2][DFN2_N_BINS];
     float fr[2][DFN2_N_BINS], fi[2][DFN2_N_BINS];
     float output[DFN2_N_FFT];
@@ -36,6 +53,62 @@ int main(int argc, char **argv) {
     FILE *input, *result;
     int roundtrip;
     if (argc != 4) return 2;
+    dfn_aenr_model_io_init(&model_io);
+    error_erb[3] = 1.0f; far_erb[3] = 2.0f;
+    error_spec[1][4] = 3.0f; far_spec[1][4] = 4.0f;
+    if (dfn_aenr_model_io_push_features(
+            &model_io, error_erb, error_spec, far_erb, far_spec) != 0)
+        return 20;
+    error_erb[3] = 5.0f; far_erb[3] = 6.0f;
+    if (dfn_aenr_model_io_push_features(
+            &model_io, error_erb, error_spec, far_erb, far_spec) != 1)
+        return 21;
+    if (model_io.error_erb_window[1][3] != 1.0f ||
+        model_io.error_erb_window[2][3] != 5.0f ||
+        model_io.far_erb_window[1][3] != 2.0f ||
+        model_io.far_erb_window[2][3] != 6.0f ||
+        model_io.error_spec_window[1][2][4] != 3.0f ||
+        model_io.far_spec_window[1][2][4] != 4.0f)
+        return 22;
+    encoder_next[0][0] = 7.0f; erb_next[0][0] = 8.0f;
+    df_next[0][0] = 9.0f; pathway_next[0][0][0] = 10.0f;
+    if (dfn_aenr_model_io_commit_state(
+            &model_io, encoder_next, erb_next, df_next, pathway_next) != 0 ||
+        model_io.encoder_gru_hidden[0][0] != 7.0f ||
+        model_io.erb_gru_hidden[0][0] != 8.0f ||
+        model_io.df_gru_hidden[0][0] != 9.0f ||
+        model_io.df_convp_history[0][0][0] != 10.0f)
+        return 23;
+    committed_model_io = model_io;
+    pathway_next[DFN2_MODEL_ENCODER_CHANNELS - 1]
+                [DFN2_MODEL_DF_PATHWAY_HISTORY - 1]
+                [DFN2_DF_BINS - 1] = NAN;
+    if (dfn_aenr_model_io_commit_state(
+            &model_io, encoder_next, erb_next, df_next, pathway_next) == 0 ||
+        memcmp(&model_io, &committed_model_io, sizeof(model_io)) != 0)
+        return 25;
+    /* DFN-AENR owns four feature windows but inherits every DFN2 state
+     * extent; the shared dfn2_model_io helpers write through these arrays, so
+     * a silent re-declaration on either side would corrupt state rather than
+     * fail to compile. */
+    if (DFN_AENR_MODEL_IO_LAYOUT_VERSION != DFN2_MODEL_IO_LAYOUT_VERSION ||
+        sizeof(model_io.error_erb_window) !=
+            sizeof(((DFN2ModelIOState *)0)->erb_window) ||
+        sizeof(model_io.far_erb_window) !=
+            sizeof(((DFN2ModelIOState *)0)->erb_window) ||
+        sizeof(model_io.error_spec_window) !=
+            sizeof(((DFN2ModelIOState *)0)->spec_window) ||
+        sizeof(model_io.far_spec_window) !=
+            sizeof(((DFN2ModelIOState *)0)->spec_window) ||
+        sizeof(model_io.encoder_gru_hidden) !=
+            sizeof(((DFN2ModelIOState *)0)->encoder_gru_hidden) ||
+        sizeof(model_io.erb_gru_hidden) !=
+            sizeof(((DFN2ModelIOState *)0)->erb_gru_hidden) ||
+        sizeof(model_io.df_gru_hidden) !=
+            sizeof(((DFN2ModelIOState *)0)->df_gru_hidden) ||
+        sizeof(model_io.df_convp_history) !=
+            sizeof(((DFN2ModelIOState *)0)->df_convp_history))
+        return 24;
     input = fopen(argv[2], "rb"); result = fopen(argv[3], "wb");
     if (!input || !result) return 3;
     fft = fft_create(DFN2_N_FFT);
@@ -101,7 +174,8 @@ def driver(tmp_path_factory):
         compiler, '-O2', '-std=c11', '-ffp-contract=off',
         '-I', _DFN_AENR, '-I', _DFN2, '-I', _AC_INCLUDE,
         str(source), os.path.join(_DFN_AENR, 'dfn_aenr_process.c'),
-        os.path.join(_DFN2, 'dfn2_process.c'), library, '-lm',
+        os.path.join(_DFN2, 'dfn2_process.c'),
+        os.path.join(_DFN2, 'dfn2_model_io.c'), library, '-lm',
         '-o', str(executable),
     ], check=True, capture_output=True)
     return work, executable

@@ -19,15 +19,28 @@ import torch
 import torchaudio
 import tqdm
 
-from model import DeepFilterNet2
-from train import (
-    extract_dfn2_features,
-    make_checkpoint_contract,
-    read_feature_config,
-    read_loss_config,
-    require_checkpoint_contract, read_model_config,
-    validate_signal_config,
-)
+try:
+    from .model import DeepFilterNet2
+    from .train import (
+        extract_dfn2_features,
+        make_checkpoint_contract,
+        read_feature_config,
+        read_loss_config,
+        require_checkpoint_contract,
+        read_model_config,
+        validate_signal_config,
+    )
+except ImportError:  # direct ``python denoise.py`` execution
+    from model import DeepFilterNet2
+    from train import (
+        extract_dfn2_features,
+        make_checkpoint_contract,
+        read_feature_config,
+        read_loss_config,
+        require_checkpoint_contract,
+        read_model_config,
+        validate_signal_config,
+    )
 
 
 def load_model(args):

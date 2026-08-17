@@ -169,7 +169,7 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p
 <tr><td><code>erb_norm_state</code></td><td>[22]</td><td>88</td><td>C struct</td><td>dB mean EMA,α=0.984,init linspace −20→−45 dB(v8 校準)</td></tr>
 <tr><td><code>spec_norm_state</code></td><td>[129]</td><td>516</td><td>C struct</td><td>magnitude EMA,init 0.04→0.008;<code>sqrtf(state+1e-12)</code></td></tr>
 <tr><td>scratch 區</td><td>—</td><td>~9.3 KB</td><td>C struct</td><td>非跨呼叫(F13:由 stack 移入 state)</td></tr>
-<tr><td><code>h1,h2,h3</code></td><td>(1,1,128) ×3</td><td>1,536</td><td>NPU runtime</td><td>3 層 GRU hidden;不同 WAV / stream 之間必須歸零</td></tr>
+<tr><td><code>h1,h2,h3</code></td><td>(1,1,128) ×3</td><td>1,536</td><td>host <code>RNNoiseModelState</code></td><td>3 層 GRU hidden；不同 stream 間歸零；commit 會拒絕 NaN/Inf 並保留舊 state</td></tr>
 <tr><td>1-hop spectrum 延遲</td><td>[257] ×2</td><td>2,056</td><td>host(呼叫端)</td><td>lookahead=1:gain 屬 t−1,呼叫端自存上一框頻譜</td></tr>
 <tr><td>輸入滑動窗</td><td>[512]</td><td>2,048</td><td>host(呼叫端)</td><td><code>rnnoise_analysis</code> 吃整窗,C 不代管</td></tr>
 <tr><td>ERB/Hann 表格</td><td><code>nfftborder[22]</code>、<code>erb_fwd/erb_inv[257][22]</code>、<code>hann_win[512]</code></td><td>—(.rodata)</td><td>編譯期常數</td><td><code>gen_rnnoise_tables.c</code> 產生 <code>rnnoise_tables_gen.h</code>,無執行期可變表格</td></tr>
@@ -199,6 +199,6 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p
 <li>C 測試:<code>AINR/RNNoise-ERB/test/</code> — <code>make test</code> 實測全 PASS:
 tables byte-exact(canonical)、portable 數學合約(recompute max ULP 0)、
 config/Python/C feature 合約、feature-state 行為、SIMD/scalar digest <code>0506b5ee3d18afb8</code></li>
-<li>Python 測試:<code>AINR/RNNoise-ERB/tests/</code>(pytest)— 實測 24 passed;
-共用測試 <code>AINR/tests/</code> — 實測 14 passed</li>
+<li>Python 測試:<code>AINR/RNNoise-ERB/tests/</code>(pytest)— 實測 26 passed;
+共用測試 <code>AINR/tests/</code> — 實測 16 passed（<code>pytest AINR</code> 全樹 = 187）</li>
 </ul>

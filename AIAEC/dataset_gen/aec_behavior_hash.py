@@ -188,6 +188,16 @@ def aec_python_behavior_hash() -> str:
     independent statements) also changes this hash. Refusing to load is the safe
     direction; the fix is to rematerialize, not to loosen the check.
 
+    The single exception is ``ACCEPTED_BEHAVIOR_HASH_MIGRATIONS`` in
+    ``linear_aec``: an explicit table of recorded/current hash PAIRS shown by
+    measurement to render byte-identical ``linear_error``, so an unchanged
+    corpus and an already-trained checkpoint stay usable across a provably inert
+    lib/aec change. It is a per-pair, one-way, single-hop exemption that applies
+    only when this hash is the sole differing contract field -- not a way to
+    accept old hashes generally, and no reason to weaken what is hashed here.
+    Adding an entry does NOT bump ``BEHAVIOR_HASH_SCHEMA``: the canonicalizer is
+    unchanged, only the sources it runs over.
+
     Stable across CPython versions -- see `_canon_ast()`. It must be: a dataset
     generated under one interpreter is routinely trained against under another,
     and an interpreter-dependent hash would refuse that pairing even though the

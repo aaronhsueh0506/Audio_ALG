@@ -19,24 +19,18 @@ typedef int (*UlcnetAcceleratorRun)(
 typedef struct UlcnetAcceleratorAdapter UlcnetAcceleratorAdapter;
 
 /* Includes the adapter and every CPU-owned K/V, logit and GRU state tensor.
- * Independent of far_input_mode -- that selects which far stream the caller
- * feeds, not how much state is stored. */
-int ulcnet_accelerator_adapter_get_mem_size(int delay_depth,
-                                            size_t *bytes,
-                                            size_t *alignment);
+ * The descriptor is the exported graph contract, including export-time D. */
+int ulcnet_accelerator_adapter_get_mem_size(
+    const UlcnetModelIoDescriptor *descriptor,
+    size_t *bytes,
+    size_t *alignment);
 
-/* far_input_mode is the deployed GRAPH's contract, i.e. the ONNX/JSON
- * metadata's far_input_mode mapped through ulcnet_far_input_mode_name();
- * every currently exported graph records raw_far (the exporter's explicit
- * ALIGNED override is pending). It is not a behaviour switch inside the
- * adapter: it is recorded in the descriptor this adapter publishes, so the
- * pipeline the model is installed into can reject a far branch that
- * disagrees. An undefined value is rejected here. */
+/* Initialize from the same descriptor published beside the ONNX graph.
+ * Production validation requires the fixed aligned-far contract. */
 UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
     void *memory,
     size_t bytes,
-    int delay_depth,
-    int far_input_mode,
+    const UlcnetModelIoDescriptor *descriptor,
     UlcnetAcceleratorRun run,
     void *run_user);
 

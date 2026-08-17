@@ -35,7 +35,8 @@ state_dict 總量約 0.068 M 值，對應論文 0.07 M class（test：
 <code>test_published_size_classes_are_preserved_on_project_grid</code>，釘 60k–80k）。
 16k grid：ERB 保留 2 kHz 以下線性 65 bins + 高頻 32 帶 → <code>compressed_bins = 97</code>；
 <code>max_delay_frames = 63</code>；<code>stream_output_delay = 0</code>。</p>
-<p><b>ONNX / NPU graph boundary</b>（尚無 export 檔；boundary 由 streaming reference 固定）：
+<p><b>ONNX / NPU graph boundary</b>（已交付：
+<code>AIAEC/export_streaming_onnx.py CAGCRN</code>）：
 graph <b>內</b> = <code>mag_ri_feature</code>、<code>ErbBandCodec.merge/split</code>（matmul）、
 四層殘差 causal encoder ×2（depthwise dilated conv，dilation 至 4）、CATA（mic
 自注意 <code>softmax</code> + 對 delay 軸的 <code>softmax</code>，學到的 window gate 在推論期是
@@ -119,17 +120,17 @@ hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本
 
 <h2>State 表</h2>
 <p><code>state_report</code> 實測（B=1 fp32，total <b>431.7 KB</b>）。部署契約：顯式
-state I/O，由 NPU runtime／host 保存；STFT/ISTFT 屬 C struct 層：</p>
+state I/O，由 host caller 保存；STFT/ISTFT 屬 C struct 層：</p>
 <table>
 <tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
-<tr><td>cata_ring.ring（延遲 far 特徵）</td><td>(1, 24, 63, 49)</td><td>289.4 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>cata_ring.ring（延遲 far 特徵）</td><td>(1, 24, 63, 49)</td><td>289.4 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>cata_gate_log（推論期常數）</td><td>(63,)</td><td>0.2 KB</td><td>常數表（隨權重部署）</td></tr>
-<tr><td>cata_query / cata_key / cata_ref_kv .history</td><td>(1,12,2,49) / (1,24,2,49) / (1,12,2,49)</td><td>4.6 / 9.2 / 4.6 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>mic_enc0..3_group.history</td><td>(1,12,2,49) / (1,12,2,25) / (1,12,4,25) / (1,24,8,25)</td><td>4.6 / 2.3 / 4.7 / 18.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>far_enc0..3_group.history</td><td>(1,12,2,49) / (1,24,2,25) / (1,24,4,25) / (1,24,8,25)</td><td>4.6 / 4.7 / 9.4 / 18.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>mic_tfgru_time / far_tfgru_time .hidden（per-bin）</td><td>(1, 25, 24) ×2</td><td>2.3 KB ×2</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>tfag_time1 / tfag_time2 .history</td><td>(1,12,4,25) / (1,12,8,25)</td><td>4.7 / 9.4 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>dec0..3_group.history</td><td>(1,24,8,25) / (1,12,4,25) / (1,12,2,49) / (1,12,2,97)</td><td>18.8 / 4.7 / 4.6 / 9.1 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>cata_query / cata_key / cata_ref_kv .history</td><td>(1,12,2,49) / (1,24,2,49) / (1,12,2,49)</td><td>4.6 / 9.2 / 4.6 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic_enc0..3_group.history</td><td>(1,12,2,49) / (1,12,2,25) / (1,12,4,25) / (1,24,8,25)</td><td>4.6 / 2.3 / 4.7 / 18.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>far_enc0..3_group.history</td><td>(1,12,2,49) / (1,24,2,25) / (1,24,4,25) / (1,24,8,25)</td><td>4.6 / 4.7 / 9.4 / 18.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic_tfgru_time / far_tfgru_time .hidden（per-bin）</td><td>(1, 25, 24) ×2</td><td>2.3 KB ×2</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>tfag_time1 / tfag_time2 .history</td><td>(1,12,4,25) / (1,12,8,25)</td><td>4.7 / 9.4 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>dec0..3_group.history</td><td>(1,24,8,25) / (1,12,4,25) / (1,12,2,49) / (1,12,2,97)</td><td>18.8 / 4.7 / 4.6 / 9.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td><b>NN 合計</b></td><td></td><td><b>431.7 KB</b></td><td></td></tr>
 <tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>C struct（Python reference：host）</td></tr>
 </table>
@@ -152,7 +153,8 @@ samples。</li>
 <ul>
 <li><code>AIAEC/CAGCRN/model.py</code>（<code>CAGCRN</code>、<code>CrossAttentionTemporalAlignment</code>、<code>TFGRU</code>、<code>TFAG</code>、<code>ErbBandCodec</code>、<code>_stream_*</code> helpers）</li>
 <li><code>AIAEC/CAGCRN/streaming.py</code>、<code>denoise.py</code>、<code>train.py</code>、<code>config.ini</code></li>
-<li>tests：<code>AIAEC/tests/test_streaming_cagcrn.py</code>（4 tests）、<code>test_candidate_models.py</code>（含 <code>test_cagcrn_soft_window_has_gradient</code>）——全套 <code>python3 -m pytest AIAEC/tests</code> = 122 passed（2026-08-13 實測）</li>
+<li>tests：<code>AIAEC/tests/test_streaming_cagcrn.py</code>（4 tests）、<code>test_candidate_models.py</code>（含 <code>test_cagcrn_soft_window_has_gradient</code>）——全套 <code>python3 -m pytest AIAEC/tests</code> = 239 passed（<code>pytest AIAEC</code> 含 dataset_gen = 357）</li>
+<li>匯出／calibration：<code>AIAEC/export_streaming_onnx.py CAGCRN</code>、<code>AIAEC/export_streaming_calibration.py CAGCRN</code>（report 兩個 far 欄位同為 <code>model_native_far</code>；<code>state_layout_version</code> 為 <code>null</code>——共用 exporter 目前不寫此欄，只能靠 <code>max_delay_frames</code> 交叉檢查 export/calibration/C descriptor 三方的 D）；tests <code>AIAEC/tests/test_export_stateless.py</code>（16）、<code>test_export_streaming_calibration.py</code>（6）</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.4</li>
 </ul>
 </body>

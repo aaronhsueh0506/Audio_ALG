@@ -20,8 +20,21 @@ README.
 | Neural AEC candidates | [`../AIAEC/README.md`](../AIAEC/README.md) |
 | AIAEC candidate decision matrix | [`ai_aec_candidate_matrix.md`](ai_aec_candidate_matrix.md) |
 | PBFDKF + Align-ULCNet embedded streaming proposal | [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md) |
+| Align-ULCNet delay/`n`/`D` profile plan | [`align_ulcnet_delay_profile_plan_zh_TW.md`](align_ulcnet_delay_profile_plan_zh_TW.md) |
 | AIAEC six-candidate streaming readiness audit | [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md) |
+| Mono pipeline integration (config/pool/errors) | [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md) |
+| 4ch core integration (`4aec_nr_res`) | [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) |
+| 4ch spatial wrapper integration (SRP/GSC) | [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) |
+| Release gate and reference test counts | [`release_checklist.md`](release_checklist.md) |
 | Development / submodules | [`development.md`](development.md) |
+
+The offline HTML documentation site lives in [`html/`](html/index.html): one
+page per module (overview / API / block diagram / signal swimlane / I-O table /
+state table / latency / file paths), plus `conventions.html` for the chain-wide
+grid and framing table and `onnx_prepost.html` for the ONNX-boundary,
+state-layout-version and PTQ-calibration status. Component pages for AEC, NR
+and audio_common live in those repositories' own `docs/html/` and are reached
+through sibling relative links.
 
 `architecture.html` is a visual explanation of the conventional mono path. It
 does not describe AINR or AIAEC model internals.

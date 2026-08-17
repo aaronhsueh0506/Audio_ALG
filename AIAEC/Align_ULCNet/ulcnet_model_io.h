@@ -20,11 +20,10 @@
 extern "C" {
 #endif
 
-/* Version 2 added far_input_mode to the descriptor (and to the exporter's
- * metadata). Kept numerically equal to export_streaming_onnx.py's
- * STATE_LAYOUT_VERSION -- AIAEC/tests/test_export_streaming_ulcnet.py pins
- * the two together, so bump both or neither. */
-#define ULCNET_MODEL_IO_LAYOUT_VERSION 2u
+/* Version 3 fixes the deployed far branch to AEC-aligned far.  The exported
+ * metadata separately records the checkpoint's training provenance.  Kept
+ * numerically equal to export_streaming_onnx.py's STATE_LAYOUT_VERSION. */
+#define ULCNET_MODEL_IO_LAYOUT_VERSION 3u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
@@ -35,31 +34,12 @@ extern "C" {
 #define ULCNET_MODEL_IO_GRU_LAYERS     2
 #define ULCNET_MODEL_IO_GRU_HIDDEN     128
 
-/* Far-input deployment contract -- the SINGLE definition for the whole
- * stack: the descriptor below, the UlcnetModel boundary in ulcnet_process.h,
- * and both ULCNet pipeline wrappers all use these values (the pipeline
- * headers get them by including ulcnet_process.h, which includes this file).
- *
- * The mode names the far stream the EXPORTED graph is deployed with. Existing
- * weights were trained on raw far; this project also permits an explicit
- * aligned-far deployment export after its completed profile sweep. It is an
- * init/export property, not a per-hop tuning knob. ONNX/JSON metadata and the
- * generated C descriptor must record the same choice; the mapping is
- * 'raw_far' <-> ULCNET_FAR_RAW and 'aligned_far' <-> ULCNET_FAR_ALIGNED
- * (ulcnet_far_input_mode_name() below returns exactly those strings, so a
- * board can compare metadata, descriptor and pipeline mode without keeping
- * its own table). AIAEC/training_common.py's FAR_INPUT_MODE_C_VALUES is the
- * Python side of the same mapping. */
+/* Stable values retained for metadata diagnostics. Production descriptors
+ * validate only ULCNET_FAR_ALIGNED: raw/aligned selection belongs to the
+ * offline sweep tool, not to the deployed pipeline API. */
 typedef enum UlcnetFarInputMode {
-    ULCNET_FAR_RAW     = 0,  /* raw far; default -- the far stream current
-                              * weights were trained on; no delay-lock
-                              * gating of model application               */
-    ULCNET_FAR_ALIGNED = 1   /* aligned far + lock gating; explicit export/
-                              * init profile accepted by the deployment
-                              * sweep (exporter's explicit override and the
-                              * generated C descriptor are still pending --
-                              * every currently exported graph records
-                              * raw_far)                                  */
+    ULCNET_FAR_RAW     = 0,
+    ULCNET_FAR_ALIGNED = 1
 } UlcnetFarInputMode;
 
 /* far_input_mode is stored as a plain int (not the enum type) so a
@@ -80,29 +60,6 @@ typedef struct UlcnetModelIoDescriptor {
     int gru_hidden;
     int far_input_mode;   /* a UlcnetFarInputMode value */
 } UlcnetModelIoDescriptor;
-
-/* One shared definition of the descriptor<->pipeline far-mode gate. A NULL
- * descriptor publishes no contract (the all-zero identity model) and is
- * deliberately ungated; an undefined mode value needs no separate check --
- * it fails the equality against the two defined values. Both pipeline
- * variants must call this instead of re-deriving the comparison, so the
- * gate cannot drift between them. */
-static inline int ulcnet_far_input_mode_agrees(
-        const struct UlcnetModelIoDescriptor *d, int far_input_mode) {
-    return !d || d->far_input_mode == far_input_mode;
-}
-
-/* One shared definition of the model-output apply gate's mode/lock rule:
- * RAW never gates on the delay lock (the checkpoint's paper contract does
- * not depend on it); ALIGNED applies only while the delay is locked --
- * unlocked means the "aligned" far is raw/unaligned, so the result is not
- * trusted and the caller falls back to the identity path. Each pipeline
- * derives `delay_locked` from its own delay source; the polarity lives
- * here once. */
-static inline int ulcnet_far_apply_allowed(int far_input_mode,
-                                           int delay_locked) {
-    return far_input_mode == ULCNET_FAR_RAW || delay_locked;
-}
 
 typedef struct UlcnetModelIoMemReq {
     size_t bytes;
@@ -153,30 +110,31 @@ typedef struct UlcnetModelIoOutputs {
 typedef struct UlcnetModelIoState UlcnetModelIoState;
 
 /* Fill the fixed 16 kHz / 512 / 256 model ABI for the selected export-time D.
- * far_input_mode starts at ULCNET_FAR_RAW, which is the contract every
- * current checkpoint is trained under; a caller deploying a checkpoint whose
- * metadata says otherwise overwrites the field and re-validates.
+ * The deployed far branch is always ULCNET_FAR_ALIGNED.
  * Returns 0 on success, -1 for an unsupported D or NULL output. */
 int ulcnet_model_io_descriptor_default(int delay_depth,
                                        UlcnetModelIoDescriptor *descriptor);
 
 /* Validate a descriptor loaded from ONNX/JSON metadata against this C ABI.
- * far_input_mode must be one of the two defined UlcnetFarInputMode values. */
+ * far_input_mode must be ULCNET_FAR_ALIGNED. */
 int ulcnet_model_io_descriptor_validate(
     const UlcnetModelIoDescriptor *descriptor);
 
 /* Stable name of a far-input mode, identical to the exporter's metadata
- * string: "raw_far", "aligned_far", or "unknown" for any other value. The
- * returned pointer is a string literal with static lifetime, so a caller
- * that has stdio can name both sides of a mismatch without this file (or
- * either pipeline wrapper) linking stdio itself. */
+ * string: "raw_far", "aligned_far", or "unknown" for any other value.
+ * Deployment accepts only ULCNET_FAR_ALIGNED, so what this is for is telling
+ * an integrator WHY a descriptor was rejected -- naming the mode the
+ * checkpoint's metadata actually carried, including a value outside the
+ * enum. The returned pointer is a string literal with static lifetime, so a
+ * caller that has stdio can report it without this file (or either pipeline
+ * wrapper) linking stdio itself. */
+const char *ulcnet_far_input_mode_name(int mode);
+
 /* Checked align-up shared with the accelerator adapter: rounds `value` up
  * to a multiple of `alignment` with overflow detection (returns nonzero on
  * overflow / zero alignment). The adapter must use this instead of a local
  * unchecked copy so every pool-sizing path carries the same guarantee. */
 int ulcnet_model_io_align_up(size_t value, size_t alignment, size_t *out);
-
-const char *ulcnet_far_input_mode_name(int mode);
 
 /* Query exact caller-pool size.  The pool address supplied to init() must be
  * aligned to req.alignment.  RAM scales with D; no D=64 maximum arrays are

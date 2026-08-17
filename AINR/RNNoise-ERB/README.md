@@ -259,7 +259,19 @@ python3 export_onnx.py --config config.ini --model output/rnnoise_best.pth \
 ```
 
 Streaming ONNX 輸入為 `erb_input[1,3,22]`、`spec_input[1,3,2,129]`
-與三組 GRU hidden state；輸出 gains 與更新後 hidden state。
+與三組 GRU hidden state；輸出中心 frame 的 gains 與更新後 hidden state。
+加速器本身不保存 state：host 以 `RNNoiseModelState` 保存三組 hidden，並將
+每次的 `h1_out/h2_out/h3_out` 回送為下一次的 input。三個 feature frames
+是輸入 temporal kernel 的完整可視範圍，不代表一次輸出三個 frames。
+`rnnoise_model_state_commit()` 會先檢查三組輸出皆為 finite；失敗時回傳
+`-1` 並保留前一個 state，呼叫端應 fail-open 該 frame，不得回寫壞狀態。
+匯出的 metadata 帶 `state_layout_version`，數值與 `process.h` 的
+`RNNOISE_MODEL_IO_LAYOUT_VERSION` 相同，整合端可據此拒絕 state layout
+已經對不上自己配置的 struct 的圖。
+
+PTQ calibration 可直接使用 `denoise.py --dump-calib DIR --max-frames N`；
+它會保存實際串流中的三-frame feature window 與非零 GRU state，而不是只
+重複 zero-state 樣本。
 
 ## ERB 矩陣匯出
 

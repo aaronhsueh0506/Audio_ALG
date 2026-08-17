@@ -10,12 +10,26 @@ history and GRU hidden states through `ulcnet_accelerator_adapter`; only the
 stateless tensor invocation in `run_accelerator()` remains a board TODO.
 Returning an error is intentionally fail-open and emits the linear error.
 
-The exported graph fixes `D`. The example uses `D=8`; changing D means
-exporting another graph/descriptor and rebuilding its state pool, but does not
-require retraining the weights. Existing checkpoints were trained with RAW
-far. This project has accepted reuse of those weights with ALIGNED far after
-its deployment sweep; the exported descriptor and pipeline must still both
-name the mode actually wired on the board.
+The exported graph fixes `D`. The example constructs a `D=8` descriptor;
+production board code loads the descriptor exported with its graph. Changing
+D means exporting another graph/descriptor and rebuilding its state pool, but
+does not require retraining the weights.
+
+The production far branch is fixed: it always consumes
+`AecLinearContext.aligned_far_hop`, the same hop PBFDKF consumed. Before the
+matched delay is acquired, this seam contains raw far and the model still
+runs; D handles the remaining offset. After acquisition it contains aligned
+far. The model state is reset at that boundary, including FIXED mode's first
+usable ring output. The C-side STFT keeps running across it, so the frames
+still straddling the switch emit the identity WITHOUT stepping the model:
+`AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES` = 1 frame here (both branches are
+pushed from the current hop), versus 2 in the 4ch wrapper. The constant is
+derived and asserted by the straddle-derivation test, not estimated; option B
+(keep stepping through those frames) is deferred pending an audio A/B.
+
+Raw/aligned selection exists only in `sweep_delay_depth.py`, not in this
+runtime API. Export metadata records the checkpoint's raw-far training
+provenance separately from the aligned-far deployment contract.
 
 ## Delay profile
 

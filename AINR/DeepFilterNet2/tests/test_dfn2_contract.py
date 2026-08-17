@@ -4,6 +4,7 @@ import configparser
 import math
 import os
 import pathlib
+import re
 import sys
 
 import numpy as np
@@ -21,7 +22,7 @@ sys.path.insert(0, ROOT)
 # imported wins ``sys.modules``, so a sibling project's tests would silently
 # exercise the wrong code.  Dropping the cached entries forces the re-import
 # to resolve against the ROOT just inserted above.
-for _stale in ('train', 'denoise', 'model', 'checkpoint_utils'):
+for _stale in ('train', 'denoise', 'model', 'checkpoint_utils', 'export_onnx'):
     sys.modules.pop(_stale, None)
 
 
@@ -50,6 +51,29 @@ from train import (  # noqa: E402
     scan_non_finite,
     validate_signal_config,
 )
+from export_onnx import (  # noqa: E402
+    INPUT_FRAMES,
+    STATE_LAYOUT_VERSION,
+    StatelessDFN2Heads,
+    build_metadata,
+    feature_windows,
+    initial_inputs as streaming_export_inputs,
+)
+
+
+def c_macro(header_text, name):
+    """Read a plain integer ``#define`` out of a shipped C header."""
+    match = re.search(
+        r'^#define\s+%s\s+(\d+)u?\s*(?:/\*.*)?$' % re.escape(name),
+        header_text,
+        flags=re.MULTILINE,
+    )
+    assert match is not None, name
+    return int(match.group(1))
+
+
+def model_io_header():
+    return (ROOT_PATH / 'dfn2_model_io.h').read_text(encoding='utf-8')
 
 
 def load_config():
@@ -259,6 +283,125 @@ def test_checkpoint_contract_rejects_legacy_and_accepts_current():
         pass
     else:
         raise AssertionError('legacy checkpoint was accepted')
+
+
+def test_stateless_export_replays_heads_with_explicit_state():
+    """Three feature frames plus returned state must equal offline heads."""
+    torch.manual_seed(73)
+    model = DeepFilterNet2(
+        n_fft=512, sr=16000, n_erb=32, df_bins=64,
+        enc_ch=8, emb_size=32, df_hidden=32,
+        lin_groups=4, enc_lin_groups=4,
+    ).eval()
+    wrapper = StatelessDFN2Heads(model).eval()
+    frames = 9
+    erb = torch.randn(1, 1, frames, model.n_erb)
+    spec = torch.randn(1, 2, frames, model.df_bins)
+
+    with torch.no_grad():
+        reference = model.heads(erb, spec)
+        state = streaming_export_inputs(model)[2:]
+        streamed = [[], [], []]
+        for erb_window, spec_window in zip(
+            feature_windows(erb), feature_windows(spec)
+        ):
+            output = wrapper(erb_window, spec_window, *state)
+            for index in range(3):
+                streamed[index].append(output[index])
+            state = output[3:]
+
+    assembled = (
+        torch.cat(streamed[0], dim=2),
+        torch.cat(streamed[1], dim=1),
+        torch.cat(streamed[2], dim=1),
+    )
+    for actual, expected in zip(assembled, reference):
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
+
+
+def test_stateless_export_df_pathway_cache_is_live():
+    """Dropping the kernel-5 c0 history must change the coefficient stream."""
+    torch.manual_seed(74)
+    model = DeepFilterNet2(
+        n_fft=512, sr=16000, n_erb=32, df_bins=64,
+        enc_ch=8, emb_size=32, df_hidden=32,
+        lin_groups=4, enc_lin_groups=4,
+    ).eval()
+    wrapper = StatelessDFN2Heads(model).eval()
+    inputs = streaming_export_inputs(model)
+    state = inputs[2:]
+    with torch.no_grad():
+        first = wrapper(*inputs)
+        proper = wrapper(inputs[0], inputs[1], *first[3:])[1]
+        broken_state = first[3:-1] + (torch.zeros_like(first[-1]),)
+        broken = wrapper(inputs[0], inputs[1], *broken_state)[1]
+    assert (proper - broken).abs().max().item() > 1e-6
+
+
+def test_c_model_io_layout_constants_match_the_shipped_export_shapes():
+    """dfn2_model_io.h's struct dimensions ARE the graph's state shapes.
+
+    The header hard-codes every tensor extent the accelerator hands back.
+    Nothing else compares them to the model the exporter actually builds from
+    the shipped config, so an emb_hidden_dim or enc_ch edit would silently
+    leave the C side allocating the wrong buffers -- the graph would still
+    export and only a board would find out.
+    """
+    header = model_io_header()
+    process = (ROOT_PATH / 'dfn2_process.h').read_text(encoding='utf-8')
+    frames = c_macro(header, 'DFN2_MODEL_INPUT_FRAMES')
+    hidden = c_macro(header, 'DFN2_MODEL_GRU_HIDDEN')
+    n_erb = c_macro(process, 'DFN2_N_ERB')
+    df_bins = c_macro(process, 'DFN2_DF_BINS')
+    assert frames == INPUT_FRAMES, (
+        'the C window depth and the exporter window depth are one contract'
+    )
+
+    model = build_shipped_model(load_config()).eval()
+    expected = (
+        (1, 1, frames, n_erb),
+        (1, 2, frames, df_bins),
+        (c_macro(header, 'DFN2_MODEL_ENCODER_GRU_LAYERS'), 1, hidden),
+        (c_macro(header, 'DFN2_MODEL_ERB_GRU_LAYERS'), 1, hidden),
+        (c_macro(header, 'DFN2_MODEL_DF_GRU_LAYERS'), 1, hidden),
+        (1, c_macro(header, 'DFN2_MODEL_ENCODER_CHANNELS'),
+         c_macro(header, 'DFN2_MODEL_DF_PATHWAY_HISTORY'), df_bins),
+    )
+    actual = tuple(
+        tuple(int(size) for size in value.shape)
+        for value in streaming_export_inputs(model)
+    )
+    assert actual == expected
+
+
+def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
+    """The exported metadata must carry the header's layout version.
+
+    A board reads ``state_layout_version`` out of the graph to decide whether
+    its ``DFN2ModelIOState`` still matches. Asserting the Python constant
+    alone would not catch the metadata key being dropped, so this goes through
+    the same builder ``main`` uses.
+    """
+    checkpoint = tmp_path / 'ckpt.pth'
+    checkpoint.write_bytes(b'not a real checkpoint, only hashed')
+    model = DeepFilterNet2(
+        n_fft=512, sr=16000, n_erb=32, df_bins=64,
+        enc_ch=8, emb_size=32, df_hidden=32,
+        lin_groups=4, enc_lin_groups=4,
+    ).eval()
+    inputs = streaming_export_inputs(model)
+    with torch.no_grad():
+        outputs = StatelessDFN2Heads(model).eval()(*inputs)
+    metadata = build_metadata(
+        str(checkpoint),
+        {'SR': 16000, 'N_FFT': 512, 'WIN_LEN': 512, 'HOP_LEN': 256},
+        inputs,
+        outputs,
+    )
+    assert metadata['state_layout_version'] == c_macro(
+        model_io_header(), 'DFN2_MODEL_IO_LAYOUT_VERSION'
+    )
+    assert STATE_LAYOUT_VERSION == metadata['state_layout_version']
 
 
 if __name__ == '__main__':

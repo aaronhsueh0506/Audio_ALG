@@ -4,7 +4,7 @@ import soundfile as sf
 import torch
 
 from AIAEC.aiaec_common import SignalGrid
-from AIAEC.dataset_gen import AecGrid
+from AIAEC.dataset_gen import AecGrid, stft
 from AIAEC.Align_CRUSE.model import AlignCRUSE
 from AIAEC.Align_ULCNet.model import AlignULCNet
 from AIAEC.CAGCRN.model import CAGCRN
@@ -128,3 +128,25 @@ def test_calibration_block_removes_only_the_runtime_batch_axis(tmp_path):
         'CAGCRN', model, AEC_GRID, primary, far, frames=4))
     assert block['microphone_ri'].shape == (4, GRID.n_freqs, 2)
     assert block['far_end_ri'].shape == (4, GRID.n_freqs, 2)
+
+
+def test_align_ulcnet_calibration_far_is_the_raw_input_waveform(tmp_path):
+    samples = torch.arange(GRID.sample_rate, dtype=torch.float32)
+    primary_wave = torch.zeros_like(samples)
+    far_wave = 0.25 * torch.sin(2.0 * torch.pi * 733.0 * samples / GRID.sample_rate)
+    primary = tmp_path / 'linear_error.wav'
+    far = tmp_path / 'raw_far.wav'
+    sf.write(primary, primary_wave.numpy(), GRID.sample_rate, subtype='FLOAT')
+    sf.write(far, far_wave.numpy(), GRID.sample_rate, subtype='FLOAT')
+
+    model = AlignULCNet(GRID).eval()
+    block = next(blocks_from_pair(
+        'Align_ULCNet', model, AEC_GRID, primary, far, frames=4
+    ))
+    expected = torch.view_as_real(
+        stft(far_wave.unsqueeze(0), AEC_GRID).transpose(-2, -1)
+    )[0, :4]
+    torch.testing.assert_close(
+        torch.from_numpy(block['far_end_ri']), expected,
+        rtol=0.0, atol=2e-6,
+    )

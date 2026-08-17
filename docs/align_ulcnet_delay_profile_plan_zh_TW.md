@@ -35,9 +35,9 @@ checkpoint 與 weights 全部不動。
    尚存的整幀差異與短期變動。
 3. 三個範圍不能相加成一個「總 delay coverage」。每一層都必須各自滿足
    前一層交付的輸入條件。
-4. 目前 checkpoint 記錄的是 `raw_far`，但使用者已完成 raw/aligned sweep
-   並接受 aligned 部署結果。正式 export descriptor 仍須準確寫出實際
-   `far_input_mode`，pipeline 與 descriptor 必須一致；不需為此重訓。
+4. checkpoint 的 `raw_far` 是 training provenance。使用者完成 sweep 後已
+   決定 production 固定讀 aligned-far seam；export descriptor 因此固定
+   `aligned_far`，pipeline 不提供 runtime mode；不需為此重訓。
 5. `n` 與 `D` 都是 init/export profile，不允許逐 hop 熱切換。切換 profile
    必須停止串流、重建 AEC/model state，並清除 STFT/WOLA、K/V、logit、GRU
    與 delay-generation 相關狀態。
@@ -47,6 +47,9 @@ checkpoint 與 weights 全部不動。
    成不同 D 的 ONNX。這是允許的行為變更，不是 contract error。
 
 ## 2. 正確訊號關係
+
+以下兩條 far branch 只用於說明 sweep 對照；production 固定走
+`aligned_far` seam，沒有 runtime mode switch：
 
 ```text
 raw far ───────────────┬───────────────────────────────┐
@@ -120,8 +123,10 @@ checkpoint linear contract 維持不記錄 n，dataset generation 固定 n=5。
   AEC init、搜尋與 RAM scaling。
 - **產品端仍須量測**：small n 是否涵蓋各 SKU/route 的 bulk-delay 分佈；這是
   delay/liveness gate，不是 checkpoint 品質或重訓 gate。
-- **實作端仍須完成**：generated C descriptor、application 移除手寫 D/far
-  mode，以及 ALIGNED timestamp/FIXED acquisition 的結構測試（見後節）。
+- **實作端已完成**：production 移除 runtime far mode、ALIGNED timestamp、
+  UNLOCKED 仍套用模型、MATCHED/FIXED alignment-transition reset 與 C
+  descriptor validation。Exporter 目前輸出 ONNX + JSON descriptor；若板端
+  build 要直接 include generated C header，仍需再加 header generator。
 
 ## 4. 無 checkpoint 即可完成的實作
 
@@ -164,19 +169,32 @@ checkpoint linear contract 維持不記錄 n，dataset generation 固定 n=5。
 - **相容性規則**：明確的 deployment override 可以讓 runtime n/D 與訓練
   provenance 不同；loader/exporter 應記錄 `training_n/training_D` 與
   `runtime_n/export_D`，但不得因此拒絕 checkpoint。沒有明確 override 時
-  才沿用 checkpoint provenance。`far_input_mode` 也必須由明確的 export
-  override 指定並寫入 descriptor；不得默默把 raw/aligned 接反。
+  才沿用 checkpoint provenance。far branch 不是產品 tuning knob：export
+  metadata 分開記錄 `training_far_input_mode`，部署 descriptor 固定寫
+  `far_input_mode=aligned_far`；不得默默把 raw far 接到 production graph。
 
-由 `export_streaming_onnx.py` 同時產出：
+- **calibration artifact 也在同一條 ABI 鏈上**：
+  `AIAEC/export_streaming_calibration.py` 產生的 report 記錄
+  `max_delay_frames` 與 `state_layout_version`，必須與 export artifact 及 C
+  descriptor 三方一致（D 決定 state tensor shape 與 host state RAM）；現由
+  `AIAEC/tests/test_export_streaming_calibration.py` 交叉比對。同一份 report
+  另以 `calibration_far_input_mode` / `deployment_far_input_mode` 兩個欄位
+  分開記錄「這組 range 是在哪條 seam 上錄的」與「部署會餵哪條 seam」——
+  Align-ULCNet 刻意以訓練域 `linear_error + raw_far` 做 calibration（該階段
+  不跑 matched filter），不代表兩條 seam 相同。
+
+`export_streaming_onnx.py` 目前同時產出：
 
 1. `.onnx`。
 2. JSON metadata（供工具/測試）。
-3. generated C descriptor header（供 board build），至少含 grid、D、
-   far-input mode、layout version 與 tensor sizes。
 
-兩個 application `main.c` 不得再手寫 `D=8` 或 checkpoint far mode；必須
-使用 generated descriptor。descriptor 與 pipeline config 不一致時 init
-失敗，不可 clamp 或 fallback。
+板端若不讀 JSON，後續應再由同一份 metadata 產 generated C descriptor
+header，至少含 grid、D、固定 aligned-far ABI、layout version 與 tensor sizes；
+不能在兩個 `main.c` 各自維護另一份數字。
+
+兩個 application `main.c` 最終不得手寫 `D=8`；必須載入 exporter 的
+descriptor（目前 example main 仍以 `descriptor_default(8)` 示範 board TODO）。
+descriptor 與 pipeline config 不一致時 init 失敗，不可 clamp 或 fallback。
 
 ### 4.4 aligned_far 的時間軸與狀態契約
 
@@ -184,11 +202,13 @@ checkpoint linear contract 維持不記錄 n，dataset generation 固定 n=5。
   reference」，不可重新估計或用 raw far 近似。
 - 每 hop 一次性讀取 `{aligned_far_hop, delay_samples, confidence,
   delay_state, generation}`，避免跨呼叫借用失效的 pointer。
-- `UNLOCKED`：model 可為固定算力而 step，但 aligned-mode output 必須
-  fail-open，不可套用。
+- `UNLOCKED`：seam 暫時承載 raw far；model 照常 step，成功且 finite 的輸出
+  照常套用。D 決定它能否解掉剩餘 frame offset。
 - `CHANGED`：在本 hop inference 前清除 K/V、logit、GRU 等 model state；
   之後才允許新 aligned far 建立狀態。
-- `LOCKED`：正常套用 model output。
+- `LOCKED`：seam 承載 aligned far，正常套用 model output。
+- FIXED 沒有 estimator CHANGED event；wrapper 必須在首次
+  `UNLOCKED→LOCKED` 時做等價 reset。
 - mono/4ch 的 WOLA 與 far branch 必須同 frame timestamp。4ch beamforming
   引入的 one-hop compensation 要由 impulse test 明確鎖定，不能靠註解。
 
@@ -268,8 +288,10 @@ checkpoint linear contract 維持不記錄 n，dataset generation 固定 n=5。
 
 用 identity/deterministic fake model callback，不需 checkpoint：
 
-- mono/4ch、RAW/ALIGNED、`n=1/2/3/5`、descriptor `D=4/8/16/64`。
-- ALIGNED+UNLOCKED 必須 fail-open；RAW 不受 delay lock gate。
+- mono/4ch、`n=1/2/3/5`、descriptor `D=4/8/16/64`；production 固定
+  aligned-far seam，raw/aligned A/B 僅由 sweep 覆蓋。
+- UNLOCKED 仍必須 invoke/apply model；MATCHED CHANGED 與 FIXED 首次可用
+  都必須先 reset model state。
 - model callback 的 error/far frame timestamp 必須匹配。
 - KISS/NE10 × SIMD 0/1 × WERROR。
 - static pool、zero unexpected heap、ASan/UBSan（可用平台）、leak check。
@@ -361,6 +383,26 @@ sanity 仍獨立保留。
 - `LinearAecContract` 維持 v3；dataset generator 與 training materializer
   仍固定使用 `MATCHED n=5`。
 - 不把 n/D 納入 checkpoint compatibility，也不新增 v3→v4 migration。
+- `aec_behavior_hash` 會因為 `lib/aec` 動到 signal scope（`aec.py` +
+  `modules/`）而改變，即使該改動在預設路徑上完全不動訊號。既有 shard 與
+  已訓練 checkpoint 記的是舊 hash，inference 入口會擋下來。處理方式是
+  `linear_aec.py` 的 `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS`：明列
+  `recorded → current` 一對 hash，且必須附上「凍結 frontend 前後
+  byte-identical」的實測證據，以及「同一套 harness 把該機制打開後 bytes
+  真的會變」的對照組。命中時只發 `RuntimeWarning` 後放行。
+  - 只在 `aec_behavior_hash` 是唯一相異欄位時成立；其他欄位有差異照樣拒絕。
+  - 單向、單跳、逐對列舉；未列出的 hash 一律拒絕。單跳＝表中的 value
+    不會再被當成 key 讀一次，兩段連續 migration 必須補上「合成後的那一對」
+    並重新逐端驗證。
+  - **既有 shard 不需重生、不需 re-stamp，已訓練的 checkpoint 不需重訓**，
+    `behavior_hash_schema` 也不 bump（canonicalizer 沒變）。命中時只發
+    `RuntimeWarning` 後放行。
+  - **目前是兩筆**（`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS`，
+    `AIAEC/dataset_gen/linear_aec.py:495-528`），兩筆都指向同一個 current
+    hash：第一筆對應 delay-mode 產品化（frozen 路徑仍解析成 MATCHED n=5），
+    第二筆對應 delay backward-quarantine（預設 OFF，AIAEC 從不設定）。
+    每一筆旁邊都記著 byte-identical 的實測證據與「同一套 harness 打開該機制
+    後 bytes 真的會變」的對照組。
 - 撤回目前 WIP 中 `linear_aec.py` 的 contract-v4、
   `accepted_fingerprints()` 及 pack/training contract 連鎖修改。
 - deployment n 是 runtime AEC init override；D 是 ONNX export/descriptor
@@ -407,14 +449,14 @@ changed = now_usable && (!was_usable || estimated != accepted_delay)
 
 ### 8.5 補 aligned-far timestamp coverage
 
-現有 mono/4ch wrapper 的 timestamp 測試主要覆蓋 RAW；4ch core 雖驗證
-`pre.aligned_ref`，但未穿過 ULCNet wrapper 的 one-hop far compensation。
+現有 mono/4ch wrapper 的 timestamp 測試已覆蓋 production seam；4ch core
+另驗證 `pre.aligned_ref` 並穿過 ULCNet wrapper 的 one-hop far compensation。
 
 需新增：
 
-- mono `ULCNET_FAR_ALIGNED`：model 收到的 error/far STFT frame timestamp
+- mono production seam：model 收到的 error/far STFT frame timestamp
   一致，far samples 等於該 hop PBFDKF 實際消費的 aligned far。
-- 4ch `ULCNET_FAR_ALIGNED`：穿過 core + BF WOLA + wrapper far-delay buffer，
+- 4ch production seam：穿過 core + BF WOLA + wrapper far-delay buffer，
   model 兩個 branch timestamp 一致。
 - delay change 前後各放不同 impulse，驗證 far-delay buffer 與 beam OLA
   同時清除，不會混用兩個 alignment generation。
@@ -461,3 +503,6 @@ make test         # 可用環境下合併執行
 任一步若改變 legacy `n=5 + raw_far + D=64` 的 linear-error WAV，立即停止；
 不得靠重生 dataset 或更新 golden 掩蓋。上述全部通過後可放行結構與部署
 ABI；產品 n/D 由 §6 的應用 delay 量測裁決，不以泛用音質分數代替。
+
+本節的執行順序現已完成；legacy raw-far 只保留為 checkpoint provenance 與
+`sweep_delay_depth.py` 的診斷基準，不再是 production pipeline 選項。

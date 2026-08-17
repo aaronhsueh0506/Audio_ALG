@@ -107,8 +107,13 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
 #define AUDIO_PIPELINE_4CH_DESCRIPTOR_VERSION 1u
 /* v2 passes the core's borrowed per-channel spectra directly to SRP/GSC.
  * v3 grows the self-resident core config with explicit delay mode, bank size,
- * fixed delay and pre/post selection. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 3u
+ * fixed delay and pre/post selection.
+ * v4 grows it again with the core's delay_backward_quarantine_enabled/_s; the
+ * carve order is unchanged, but the self-resident config is, so the pool
+ * total moves and a descriptor from an older build no longer sizes this one.
+ * (The exact totals are reported by `make print-mem-size`; they are not
+ * restated here, where they would silently rot.) */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 4u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

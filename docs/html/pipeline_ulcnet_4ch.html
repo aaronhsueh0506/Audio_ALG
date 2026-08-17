@@ -40,18 +40,16 @@ audio_pipeline_4ch_ulcnet_get_mem_requirements(&amp;cfg, &amp;req);
 void* pool = platform_alloc(req.bytes, req.alignment);
 AudioPipeline4ChUlcnet* p = audio_pipeline_4ch_ulcnet_init_ex(pool, req.bytes, &amp;cfg, &amp;req);
 
-UlcnetModel model = { my_user, my_infer, my_reset };
+UlcnetModel model = { my_user, my_infer, my_reset, &amp;exported_descriptor };
 audio_pipeline_4ch_ulcnet_set_model(p, &amp;model);           /* NULL 可清除; 不觸發 reset */
-audio_pipeline_4ch_ulcnet_set_far_input_mode(p, ULCNET_FAR_RAW);  /* 串流前設定 */
 
 while (stream) {   /* mics=[256][4] interleaved, far/out=[256] */
     audio_pipeline_4ch_ulcnet_process_with_activity(p, mics, far, vad, out);
 }
-audio_pipeline_4ch_ulcnet_reset(p);    /* 也呼叫 model-&gt;reset; 不動 model/mode 安裝 */
+audio_pipeline_4ch_ulcnet_reset(p);    /* 也呼叫 model-&gt;reset; 不動 model 安裝 */
 audio_pipeline_4ch_ulcnet_destroy(p);  /* 不釋放 caller pool */</pre>
 <ul>
-<li><code>set_model()</code>:struct by-value 複製;<code>model-&gt;user</code> 指向物由 caller 保活。中途換模型請先 reset 或裝新 reset 過的 runtime。<b>三方一致性鎖</b>與 mono 變體共用同一個 <code>ulcnet_far_input_mode_agrees()</code>(<code>ulcnet_model_io.h</code>):<code>model.io_descriptor</code>(來自 accelerator adapter,發布部署 graph 的 far_input_mode)與 <code>p-&gt;far_input_mode</code> 不合則 <code>set_model()</code> 回 −1、已裝模型不動——與 mono 頁「init 時失敗」不同,這裡是<b>安裝呼叫本身失敗</b>(runtime 設定,非 init-time config 欄位),邊界細節見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>「far_input_mode 部署契約」節。</li>
-<li><code>set_far_input_mode()</code>:RAW/ALIGNED 都是 export/init profile；本專案已接受既有權重的 aligned-far 部署，但 descriptor 與實際接線必須一致。設定 <b>survive reset</b>;未定義值 reject 且維持原模式;同樣過 <code>ulcnet_far_mode_agrees()</code> 與已裝模型的 descriptor 核對。中途切換會改變在飛幀(one-hop far buffer)的輸入分布,且 <code>frame_index!=0</code> 時直接 reject(只能在 reset 後或串流前設定)。</li>
+<li><code>set_model()</code>:struct by-value 複製;<code>model-&gt;user</code> 指向物由 caller 保活。production far branch 固定為 aligned-far seam，因此非 NULL descriptor 必須通過 <code>ulcnet_model_io_descriptor_validate()</code>（raw/未知 descriptor reject）。runtime 不提供 far-mode setter。</li>
 <li>診斷:<code>audio_pipeline_4ch_ulcnet_last_beamformed_error()</code>(最近一次成功呼叫重建的 beam hop,唯讀)、<code>audio_pipeline_4ch_ulcnet_last_delay()</code>。</li>
 </ul>
 
@@ -62,18 +60,20 @@ audio_pipeline_4ch_ulcnet_destroy(p);  /* 不釋放 caller pool */</pre>
  ├─ doa_step(srp, pre.linear_spectra, NULL, vad, vad)      SRP-PHAT
  ├─ gsc_process_with_weights(gsc, pre.linear_spectra, doa_get_smooth(srp),
  │        vad?0:1, NULL, gsc_spectrum, gsc_weights)        beamformed 誤差頻譜
- ├─ pre.delay.changed → memset(ola,0) + memset(far_delay,0)
- │        + model.reset(user)                              (核心已自行 reset lanes)
+ ├─ pre.delay.changed 或 FIXED 首次 solid → memset(ola,0) + memset(far_delay,0)
+ │        + model.reset(user) + reprime_frames = 2 (武裝)  (核心已自行 reset lanes)
  ├─ fft_inverse(fft, gsc_spectrum, ifft_buffer)            beam WOLA(慢 1 hop)
  │     ola += ifft*synth_window → beam_hop = ola[0:256] → shift
  ├─ n = ulcnet_analysis_push(&amp;err_analysis, beam_hop, ...)
  ├─     ulcnet_analysis_push(&amp;far_analysis, far_delay, ...)  ← 前一 hop 存的 far
- ├─ far_delay = (RAW? far_reference : pre.aligned_ref)     存本 hop far 源
+ ├─ far_delay = pre.aligned_ref                            存本 hop far seam
  ├─ four_aec_nr_res_abandon_pre(core, &amp;pre.token)          釋放 pre frame(無 post)
- ├─ apply_allowed = RAW || (pre.delay.solid &amp;&amp; delay_samples&gt;=0)
  ├─ for f in 0..n-1:
- │     rc = model.infer(user, err_ri[f], far_ri[f], enh_ri)   ── 恆步進
- │     apply = rc==0 &amp;&amp; apply_allowed &amp;&amp; ulcnet_frame_is_finite(enh_ri)
+ │     if reprime_frames &gt; 0:                       跨界幀:identity,不 step
+ │         reprime_frames--                          (K/V、logit、GRU 都不動)
+ │     else:
+ │         rc = model.infer(user, err_ri[f], far_ri[f], enh_ri)  ── 每幀一次
+ │         apply = rc==0 &amp;&amp; ulcnet_frame_is_finite(enh_ri)
  │     ulcnet_synthesis_push(&amp;synthesis, apply? enh_ri : err_ri[f], out+written)
  └─ written==0(前導 hop)→ out 全零</pre>
 
@@ -88,31 +88,38 @@ beam WOLA (C)     beam_hop = 0      beam_hop =          beam_hop =          beam
 far_delay (C)     push far_delay=0  push far#0          push far#1          push far(hop p-1)   ← 慢 1 hop
                   存 far#0          存 far#1            存 far#2            存 far#p            (err/far 同 input hop)
 ULCNet chain      push → 0 幀       push → 2 幀         push → 1 幀         push → 1 幀
-model (NPU)       ─                 infer ×2            infer ×1            infer ×1 (step-always)
+model (NPU)       ─                 infer ×2            infer ×1            infer ×1 (step-always,
+                                                                              alignment 邊界後 2 幀不 step)
 out               全零              全零                enh(beam err        enh(beam err
                                     (=chain 對 hop#0     of input hop#0)     of input hop p-2)
                                      的輸出=精確零)     ── 輸出恆落後輸入 2 hops(512 樣本, 32 ms)</pre>
 <p>far 一 hop 補償的理由:beam WOLA 慢一 hop,所以 far branch 也要慢一 hop(<code>far_delay</code> 存前一 hop 的 far 源),模型看到的 err/far 幀對才屬於<b>同一個 input hop</b>;拿掉這個 buffer,模型會看到 error[t-1] 配 far[t](固定 256 樣本 skew)——4ch far-timestamp 測試就是這樣設計成會紅 256 樣本。</p>
 
+<h2>Identity reprime(alignment 邊界,option A)</h2>
+<p><code>model-&gt;reset</code> 清掉 runtime 的 K/V ring、logit 史與 GRU h,但 C 側 ULCNet STFT 狀態是連續跑的:邊界當下還在飛的分析窗仍<b>跨在邊界上</b>。在那種幀上 step 模型,等於用半舊的 err/far 幀對把剛清掉的 state 重建回去。</p>
+<p>政策:從邊界 hop 起的 <code>AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES</code> 個發射幀走 identity(誤差原樣)且<b>完全不呼叫 infer</b>——K/V、logit、GRU 都不前進;等到 err 與 far 兩路分析窗都只含切換後的 hop,才同時恢復 step 與 apply。reprime 期間再來一次邊界會重新武裝(不累加);<code>audio_pipeline_4ch_ulcnet_reset()</code> 會把它歸零(analysis history 已清空)。compute 只會少 2 幀推論,不會加倍。</p>
+<p>常數是<b>量出來的</b>,不是寫死的,而且比 mono 版(1)多一幀,理由可追:本 wrapper 兩路都比輸入慢一 hop(beam WOLA 一 hop + 對應的 far 一 hop 補償),所以邊界 hop T 推入的那一格仍屬於切換前的 input hop T−1(實作上正是被清成零的 OLA/<code>far_delay</code>);centered 512/256 分析橫跨兩格 ⇒ hop T 與 T+1 發射的兩幀都跨界,hop T+2 才乾淨。測試 <code>test_reprime_straddle_derivation()</code> 用「切換前最後一個 input hop 正中央打一個單位脈衝、其餘全靜音」在一個<b>完全沒有邊界</b>的對照跑(FIXED delay 0)裡量:reprime 不參與量自己,而且邊界跑會把那一格清成零、反而看不到它跨界。兩路各得 <b>2</b>,與常數相符;實測 marked peak 0.6665(err)/0.7071(far) vs unmarked 1.257e-02/0.000e+00。邊界跑再驗:reprime 後第一個模型看得到的幀(hop 10)兩路都不含切換前樣本。</p>
+<p>option B(邊界後照常 step、只是輸出仍套用)<b>暫緩</b>,要先做音檔 A/B 才能換。</p>
+
 <h2>I/O 表</h2>
 <table>
 <tr><th>張量</th><th>shape</th><th>dtype</th><th>每次呼叫幀數</th><th>時域樣本</th></tr>
 <tr><td><code>microphones_interleaved</code>(in)</td><td>[256][4] interleaved</td><td>float32</td><td>1 hop</td><td>256×4(16 ms)</td></tr>
-<tr><td><code>far_reference</code>(in)</td><td>[256]</td><td>float32</td><td>1 hop</td><td>256;RAW 模式的 far 源</td></tr>
+<tr><td><code>far_reference</code>(in)</td><td>[256]</td><td>float32</td><td>1 hop</td><td>256;未取得 alignment 前由 seam 原樣傳遞</td></tr>
 <tr><td><code>vad_external</code>(in)</td><td>純量</td><td>int(0/1)</td><td>—</td><td>同時餵 SRP 觀測閘與 GSC 凍結(單旗標)</td></tr>
 <tr><td><code>out</code>(out)</td><td>[256]</td><td>float32</td><td>1 hop mono</td><td>256;hop#0/#1 全零</td></tr>
-<tr><td><code>pre.aligned_ref</code>(內部)</td><td>[256]</td><td>float32</td><td>1 hop</td><td>ALIGNED 模式的 far 源(核心 delay ring 輸出)</td></tr>
+<tr><td><code>pre.aligned_ref</code>(內部)</td><td>[256]</td><td>float32</td><td>1 hop</td><td>固定 model far seam：ring 尚無法供應該 offset 的 hop(MATCHED 取得 alignment 前、FIXED 整段 ring-fill)整 hop 原樣傳 raw far，可供應後整 hop 改為 delay-ring 輸出;切換為整 hop 且與 <code>pre.delay.solid</code> 同一 hop</td></tr>
 <tr><td><code>gsc_spectrum</code>(內部)</td><td>[257]</td><td>Complex</td><td>1 frame</td><td>beamformed 誤差頻譜</td></tr>
 <tr><td><code>err/far_ri</code>(infer in)</td><td>各 [257]×2(re,im)</td><td>float32</td><td>0/2/1 幀</td><td>centered 分析窗 512</td></tr>
 <tr><td><code>enh_ri</code>(infer out)</td><td>[257]×2</td><td>float32</td><td>每 infer 1 幀</td><td>經 WOLA → 256/幀</td></tr>
 </table>
 
 <h2>State 表</h2>
-<p>Carve 順序(layout v5):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>;ULCNet chain 狀態、幀 scratch、<code>far_delay</code>、<code>far_input_mode</code>、共用視窗表都內嵌在 <code>self</code>。唯一一支 carve 的 512 點 <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain(hop 內嚴格序列使用)。實測 descriptor(kiss, 預設 config):<code>bytes=3,123,888</code>、descriptor_version=1、layout_version=5;其中核心 <code>core_req.bytes=1,485,584</code>(@16k/512,本 wrapper 的私有 <code>cfg_forced</code> 把 <code>core.enable_post</code> 強制設 0——<b>不 carve</b> NR/RES/iFFT,見 <code>audio_pipeline_4ch_ulcnet.c</code> 的 <code>derive_pipeline_layout()</code>;4 lanes 本身的 AEC 狀態合計 1,375,104 B,其餘 110,480 B 是共用 delay ring + 控制塊)。此為預設 delay profile(MATCHED n=5)的數字;n 是 init-time 部署旋鈕(應用 <code>main.c</code> 收 <code>--delay-mode/--delay-num-filters/--fixed-delay</code>),pool 隨 n 每 filter ±5,728 B(n=1..5 實測 3,100,976..3,123,888 B)且<b>只付一次</b>——n 活在單一共用 estimator,4 lanes 的 pool 不隨 n 變。</p>
+<p>Carve 順序(layout v8):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>;ULCNet chain 狀態、幀 scratch、<code>far_delay</code>、reprime 計數器、共用視窗表都內嵌在 <code>self</code>。唯一一支 512 點 <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain。實測 descriptor(kiss, MATCHED n=5):<code>bytes=3,123,968</code>、descriptor_version=1、layout_version=8。n 活在單一共用 estimator，pool 隨 n 每 filter ±5,728 B且只付一次(n=1 實測 3,101,056 B);4 lanes pool 不隨 n 變(實測 1,375,168 B,n=1..5 相同)。<b>換 backend／編譯選項／submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_4ch_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>FourAecNrRes core</code>(pre-only)</td><td>1,485,584 B(4-lane AEC 1,375,104 B + delay ring/控制塊 110,480 B)</td><td>pool</td><td>共用 delay ring + 4 lanes;<code>enable_post=0</code> ⇒ <b>不含</b> NR/RES/iFFT(那些由本 wrapper 自己的 <code>ola/ifft_buffer/synth_window</code> + ULCNet chain 取代)</td></tr>
-<tr><td><code>SRP</code> / <code>GSC</code></td><td>num_angles=72 預設 / RLS 4×257</td><td>pool</td><td>GSC 借用 <code>srp-&gt;a_array</code> steering 表;與下方其餘項目合計 = 3,123,888 − 1,485,584 = 1,638,304 B</td></tr>
+<tr><td><code>FourAecNrRes core</code>(pre-only)</td><td>1,485,664 B(4-lane AEC 1,375,168 B + delay ring/控制塊 110,496 B;實測 <code>four_aec_nr_res_get_mem_breakdown()</code> @16k/fft512/<code>enable_post=0</code>)</td><td>pool</td><td>共用 delay ring + 4 lanes;<code>enable_post=0</code> ⇒ <b>不含</b> NR/RES/iFFT(那些由本 wrapper 自己的 <code>ola/ifft_buffer/synth_window</code> + ULCNet chain 取代)</td></tr>
+<tr><td><code>SRP</code> / <code>GSC</code></td><td>num_angles=72 預設 / RLS 4×257</td><td>pool</td><td>GSC 借用 <code>srp-&gt;a_array</code> steering 表;與下方其餘項目合計 = 3,123,968 − 1,485,664 = 1,638,304 B</td></tr>
 <tr><td><code>gsc_spectrum/gsc_weights</code></td><td>[257] / [4][257] Complex</td><td>pool</td><td>每 hop 由 GSC 原子產生</td></tr>
 <tr><td><code>FftHandle</code>(共用)</td><td>pool 內</td><td>pool</td><td>beam IFFT + chain 三 transform 共用</td></tr>
 <tr><td><code>ola/ifft_buffer/synth_window</code></td><td>各 [512] f32</td><td>pool</td><td>beam WOLA;<code>ola</code> 跨 hop 累加</td></tr>
@@ -120,30 +127,30 @@ out               全零              全零                enh(beam err        
 <tr><td><code>err/far_analysis.history</code>、<code>synthesis.acc/env</code></td><td>各 [512] f32</td><td>C struct(self)</td><td>chain 跨 hop 狀態(scratch 亦內嵌,不佔 stack)</td></tr>
 <tr><td><code>ulcnet_window</code></td><td>[512] f32</td><td>C struct(self)</td><td>共用 sqrt-Hann 表</td></tr>
 <tr><td><code>far_delay</code></td><td>[256] f32</td><td>C struct(self)</td><td>one-hop far 補償;delay change / reset 時清零</td></tr>
-<tr><td><code>model</code>+<code>far_input_mode</code>+<code>last_delay</code></td><td>純量級</td><td>C struct(self)</td><td>安裝性設定 survive reset</td></tr>
+<tr><td><code>model</code>+<code>last_delay</code>+<code>frame_index</code></td><td>純量級</td><td>C struct(self)</td><td>model 安裝 survive reset；delay history 用來偵測 FIXED 首次可用</td></tr>
 <tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 exported D</td><td><b>CPU/DSP caller-owned pool</b></td><td>NPU 單次呼叫無狀態；<code>model.reset</code> 時 K/V、logit 與 GRU hidden 全部清除</td></tr>
-<tr><td>合計 pool</td><td>3,123,888 B(2.98 MB)</td><td>host 擁有 pool</td><td>init_ex 路徑零 heap;sizing 與 carve lockstep(<code>cursor.remaining==0</code> 驗證)</td></tr>
+<tr><td>合計 pool</td><td>3,123,968 B(2.98 MB)</td><td>host 擁有 pool</td><td>init_ex 路徑零 heap;sizing 與 carve lockstep(<code>cursor.remaining==0</code> 驗證)</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
 <ul>
 <li>總附加演算法延遲 = <b>2 hops = 512 samples = 32 ms</b>:1 hop beam-spectrum WOLA(hop p 的頻譜要到 hop p+1 才在時域閉合)+ 1 hop centered ULCNet chain。far branch 由 <code>far_delay</code> 補償一 hop,使 err/far 同 input hop。</li>
-<li>測試佐證:far-timestamp(RAW)測試 far[2085] 的脈衝準確落在 out[2597](= impulse + 512;offset +0;peak 1.0000)。identity E2E:hop#0/#1 全零,out[hop p] = hop p-1 時 accessor 讀到的 beam hop。</li>
-<li>delay change(<code>pre.delay.changed</code>):核心 reset 四條 lane;wrapper 清 beam OLA + <code>far_delay</code> 並呼叫 <code>model-&gt;reset</code>(兩種 far 模式都做);C 端 chain STFT 狀態連續,接受 1–2 幀暫態(crossfade 為後續 phase)。<code>changed</code> 涵蓋 unlock 後<b>同值重鎖</b>(新的可用 alignment generation),因此 unlocked 期間 model 持續 step 累積的 recurrent state 會在重新套用前被 flush。</li>
-<li>ALIGNED 模式套用閘:<code>pre.delay.solid &amp;&amp; delay_samples&gt;=0</code>;未鎖定時 fail-open(模型仍步進)。RAW 模式從第一個發射幀就套用。mono 頁的<b>短延遲部署注意</b>同樣適用(短 bulk delay → acquisition 被 already-cancelling 保護永久擋下 → ALIGNED 模式 NN 永不生效)。</li>
+<li>測試佐證:pre-acquisition seam 的 far[2085] 脈衝準確落在 out[2597](= impulse + 512;offset +0;peak 1.0000)。identity E2E:hop#0/#1 全零,out[hop p] = hop p-1 時 accessor 讀到的 beam hop。</li>
+<li>delay change(<code>pre.delay.changed</code>):核心 reset 四條 lane;wrapper 清 beam OLA + <code>far_delay</code>、呼叫 <code>model-&gt;reset</code> 並武裝 identity reprime;C 端 chain STFT 狀態連續,跨界的 <code>AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES</code>=2 幀改走 identity 且<b>不 step</b> 模型(見下節)。<code>changed</code> 涵蓋 unlock 後<b>同值重鎖</b>(新的可用 alignment generation),因此 unlocked 期間 model 持續 step 累積的 recurrent state 會在重新套用前被 flush。</li>
+<li>delay lock 不閘控模型：ring 尚無法供應該 offset 時 seam 整 hop 傳 raw far(FIXED 的 ring-fill 窗也是 raw,不是靜音),模型照常步進並套用；可供應後 reset state，再改用 aligned far。</li>
 <li>錯誤處理:內部 DSP 錯誤(尺寸不符、abandon 失敗、幀數不同步)→ wrapper 自我 reset 並回核心 status code(與標準 wrapper 同慣例);2-hop 前導重新開始。</li>
 </ul>
 
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v5)</td></tr>
+<tr><td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v8)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心:<code>process_pre</code> / <code>abandon_pre</code> / <code>PreFrame.aligned_ref</code>(見 <a href="pipeline_4ch.html">pipeline_4ch</a>)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_process.h / .c</code></td><td>chain 實作 + <code>UlcnetModel</code> 邊界(兩變體共用)</td></tr>
-<tr><td><code>pipelines/4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c</code></td><td>11 個測試函式:identity E2E(2-hop 契約)、counting model policy(ALIGNED step/apply 分離+reset 計數)、<b>同值重鎖 reset</b>(<code>test_relock_same_delay_resets_model</code>:LOCKED(0)→強制 UNLOCKED→LOCKED(0),斷言重鎖 hop 恰好一次 <code>model-&gt;reset</code>)、core aligned_ref+abandon token 協定(逐 byte 對照獨立維護的 delayed-far 參考)、pool/descriptor 閘+heap-vs-pool byte-equal、far-timestamp(RAW, +512)、RAW-applies-unlocked、NaN/Inf guard、full-write contract(partial-write guard)、far_input_mode 中途切換鎖(<code>frame_index!=0</code> reject)、far-input descriptor 三方一致性閘(<code>set_model</code>/<code>set_far_input_mode</code> 雙向 mismatch 拒絕)</td></tr>
+<tr><td><code>pipelines/4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c</code></td><td>identity E2E、連續 model stepping(除 reprime)、MATCHED 同值重鎖 reset、FIXED raw→aligned 首次切換 reset、FIXED pre-lock seam 逐 byte 等於 raw far(含 8 hop / 320 sample / 500 ms 三組)、identity-reprime straddle 推導(脈衝標記/無邊界對照跑)與 reprime 行為(delay change + FIXED fill)、core aligned_ref+abandon token、pool/descriptor、far timestamp、UNLOCKED 仍套用、NaN/Inf、partial-write 與 aligned-only descriptor gate</td></tr>
 <tr><td><code>pipelines/4ch_alignulcnet/main.c</code></td><td>板端 adapter 參考骨架(fail-open,accelerator run() 回 -1 佔位);收 <code>--delay-mode/--delay-num-filters/--fixed-delay</code> 並打印 resolved profile 與該 config 的 pool bytes</td></tr>
 <tr><td><code>pipelines/4ch_alignulcnet/Makefile</code></td><td>應用入口；<code>audio_pipeline_4ch_ulcnet.o</code> 與 ULCNet pre/post 直接連結到應用。<code>libaudio_pipeline_4ch.a</code> 只包含可重用的 4-lane linear core，不包含 ULCNet wrapper。</td></tr>
 </table>
-<p>測試實測(2026-08-16 重跑, BACKEND=kiss):<code>test_audio_pipeline_4ch_ulcnet</code> 與板端骨架同時掛在 <b>兩層</b> <code>make test</code>——<code>4ch_aec_bf_nr_res/</code> 的一站式關卡(含本變體、板端骨架 bare 與 <code>--delay-num-filters 1</code> 兩種 profile)與 <code>4ch_alignulcnet/</code> 自己的委派目標。實跑結果:11 個測試函式全數通過,結尾印 <code>All audio_pipeline_4ch_ulcnet tests passed</code>;far[2085]→out[2597](+2 hops, offset +0, peak 1.0000);骨架印 <code>4ch_alignulcnet: fail-open board skeleton PASS</code>(並打印 resolved delay profile 與該 config 的 pool bytes)。一站式 <code>make test</code> 全綠:PASS 標記 306 / FAIL 0。</p>
+<p>測試實測(2026-08-16 重跑, BACKEND=kiss):<code>test_audio_pipeline_4ch_ulcnet</code> 與板端骨架同時掛在 <b>兩層</b> <code>make test</code>——<code>4ch_aec_bf_nr_res/</code> 的一站式關卡(含本變體、板端骨架 bare 與 <code>--delay-num-filters 1</code> 兩種 profile)與 <code>4ch_alignulcnet/</code> 自己的委派目標。實跑結果:13 個測試函式全數通過,結尾印 <code>All audio_pipeline_4ch_ulcnet tests passed</code>;far[2085]→out[2597](+2 hops, offset +0, peak 1.0000);reprime 推導 ERROR/FAR 兩路各 2 個跨界幀(marked peak 0.6665/0.7071 vs unmarked 1.257e-02/0.000e+00),邊界後第一個模型可見幀在 hop 10 且兩路皆無切換前樣本;骨架印 <code>4ch_alignulcnet: fail-open board skeleton PASS</code>(並打印 resolved delay profile 與該 config 的 pool bytes)。一站式 <code>make test</code> 全綠:<code>PASS:</code> 標記 <b>316</b> / FAIL 0(另有 4 個 static smoke 與 2 個板端骨架 profile 各印一次 PASS,合計 322 個 PASS 字樣)。</p>
 </body>
 </html>

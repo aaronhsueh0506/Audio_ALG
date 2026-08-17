@@ -36,9 +36,9 @@ from AIAEC.training_common import (
 
 # Kept numerically equal to ULCNET_MODEL_IO_LAYOUT_VERSION in
 # AIAEC/Align_ULCNet/ulcnet_model_io.h; test_export_streaming_ulcnet.py pins
-# the two together. Version 2 added far_input_mode to the C descriptor and
-# far_input_mode_c_value to the metadata below.
-STATE_LAYOUT_VERSION = 2
+# the two together. Version 3 fixes production wiring to aligned far while
+# retaining the checkpoint's original far-input provenance separately.
+STATE_LAYOUT_VERSION = 3
 MIN_DELAY_DEPTH = 2
 MAX_DELAY_DEPTH = 64
 TA_CHANNELS = 32
@@ -294,7 +294,8 @@ def _write_metadata(
     inputs: Sequence[Tensor],
     outputs: Sequence[Tensor],
 ) -> Dict:
-    far_input_mode = checkpoint_far_input_mode(contract)
+    training_far_input_mode = checkpoint_far_input_mode(contract)
+    deployed_far_input_mode = 'aligned_far'
     metadata = {
         'model_family': 'Align_ULCNet',
         'boundary': 'stateless_one_frame_delta_state',
@@ -306,12 +307,13 @@ def _write_metadata(
         'hop_len': model.grid.hop_len,
         'frames_per_invocation': 1,
         'max_delay_frames': model.max_delay_frames,
-        'far_input_mode': far_input_mode,
-        # The same choice as the C UlcnetModelIoDescriptor.far_input_mode
-        # field carries, so board init can compare this metadata against the
-        # compiled descriptor (and thus against the pipeline's far branch)
-        # with an integer ==, without keeping its own name->value table.
-        'far_input_mode_c_value': far_input_mode_c_value(far_input_mode),
+        'training_far_input_mode': training_far_input_mode,
+        'far_input_mode': deployed_far_input_mode,
+        # Fixed production contract. Raw/aligned comparison remains available
+        # only in sweep_delay_depth.py.
+        'far_input_mode_c_value': far_input_mode_c_value(
+            deployed_far_input_mode
+        ),
         'accelerator_persistent_state': False,
         'cpu_delta_state_update': True,
         'tensor_dtype': 'float32',

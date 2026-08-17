@@ -1,7 +1,7 @@
 # AIAEC 六候選模型 Streaming Readiness 評估
 
-狀態：2026-08-13 逐行讀碼 + 實測（autograd receptive field、prefix 一致性、
-參數量、MAC 統計）的查證紀錄。與程式碼衝突時以程式碼為準。
+狀態：2026-08-17。保留 2026-08-13 的逐行讀碼與實測基線，並同步目前的
+stateless export、C 前後處理與產品 pipeline 交付狀態。
 
 本文件回答：每個候選模型能不能改成「每 hop 餵 1 個新 frame、狀態跨呼叫
 保留」的 streaming 推論；需要保存哪些 state；有沒有結構性阻礙。姊妹文件
@@ -16,8 +16,9 @@ model state」分析對其餘五個候選的推廣。
   入口。**同批工作已補上**：每個 model 新增
   `create_stream_state()`/`forward_stream()` 與 `streaming.py` CLI——定位
   是 **NN frame-by-frame Python reference**（驗證等價與定義 state/I-O
-  contract），不是完整產品 streaming flow（PBFDKF frontend 仍整檔
-  offline、delay event 未接線、無 NPU export——見 §5）。
+  contract）。六個模型的 stateless NPU export 已補齊；完整產品
+  delay/reset/fail-open flow 目前只在 Align-ULCNet mono/4ch pipeline
+  落地——見 §5。
 - 六個 `forward()` 全部丟棄 GRU hidden（`_ = self.gru(x)` 形式）；
   streaming 版由 `aiaec_streaming.StreamGRUCell` 在 forward_stream 中
   外部攜帶 hidden，offline forward 未動。
@@ -44,7 +45,14 @@ model state」分析對其餘五個候選的推廣。
 | 最小 N | 1 | 1 | 1 | 1 | 1 | 1 out（3 frames in flight） |
 | 跨時間 state 主項 | K/V ring ×D、logit 史 4 幀、GRU 2×2×128 | GRU 192、K/V ring 63、**cumsum acc + 絕對幀計數** | GRU 192、K/V ring 63、score 史 4 幀、CCM 2 幀譜 | time-GRU per-bin 25×24×2、CATA ring 63 | conv_cache/tra_cache/inter_cache ≈70 KB | GRU 5×256、DF ring 5 幀、df_convp 4 幀 c0（96 KB）、EMA 256 floats ×2 源 |
 | 實測 MAC | — | — | — | — | ≈33.5 MMAC/s @16k | ≈310.6 MMAC/s @48k（GRU 佔 59%） |
-| 既有 streaming 資產 | 無 | 無 | 無 | 無 | 上游 Python N=1 參考 `AINR/gtcrn_github/stream/gtcrn_stream.py` | C 骨架 `AINR/DeepFilterNet2/dfn2_process.c`（單輸入版） |
+| stateless export 腳本 | 專用 `Align_ULCNet/export_streaming_onnx.py`（delta-state） | 共用 `AIAEC/export_streaming_onnx.py` | 同左 | 同左 | 同左 | 同左（`DFN_INPUT_FRAMES` 三幀窗分支） |
+| export metadata `state_layout_version` | **有**：3（釘 `ULCNET_MODEL_IO_LAYOUT_VERSION 3u`） | 無 | 無 | 無 | 無 | 無 |
+| 其餘 export metadata | schema + state_handoff + dtypes + precision policy | 同左（共用 exporter 全寫） | 同左 | 同左 | 同左 | 同左 |
+| calibration far seam 標記 | `calibration=raw_far` / `deployment=aligned_far` | 兩欄同為 `model_native_far` | 同左 | 同左 | 同左 | 同左 |
+| calibration 額外約束 | D 必須與 export 相同 | **單一不中斷錄音**＋2 筆 per-tensor precision marker | 無 | 無 | 無 | 無 |
+| C 前後處理 | `ulcnet_process.c/h` + `ulcnet_model_io.c/h` + accelerator adapter | 共用 `aiaec_process.c/h` | 共用 + `DeepVQE_S/deepvqe_process.c/h`（CCM taps） | 共用 `aiaec_process.c/h` | 共用 `aiaec_process.c/h` | `DeepFilterNet_AENR/dfn_aenr_process.c/h`（**雙輸入** error+far，兩條獨立 EMA） |
+| C 端有 production caller | **有**：`pipelines/{mono,4ch}_alignulcnet/main.c` | 無（僅測試） | 無（僅測試） | 無（僅測試） | 無（僅測試） | 無（僅測試） |
+| 既有上游 streaming 參考 | 無 | 無 | 無 | 無 | `AINR/gtcrn_github/stream/gtcrn_stream.py` | `AINR/DeepFilterNet2/dfn2_process.c`（單輸入 DFN2 版，非 AENR） |
 | 阻礙等級 | 🟢 無 | ⚠ 語意風險（見 §3.2） | 🟢 無（最乾淨） | 🟢 無；NPU op 面最重 | 🟢 無；鎖死 16 kHz | 🟡 接受 2-hop 可直接串流；要 1-hop 須 `df_lookahead=0` 重訓 |
 
 ## 3. 各 model 要點
@@ -124,9 +132,12 @@ DPGRNN intra 雙向在**頻率軸**（`:220`）、inter 單向在時間軸（`:2
   頻譜叫 `linear_error`（命名陷阱）。
 - DF ring 存的是**已套 ERB mask 的譜**；高頻段須同步延遲（
   `AINR/DeepFilterNet2/dfn2_process.h:148-168` 明文警告）。
-- C streaming 骨架已存在（單輸入 DFN2 版：`dfn2_compose_stream` +
-  `DFN2State`）；AENR 化需再開 error/far 前處理 state + 兩個 1×1
-  conditioner。
+- **AENR 專屬的 C 邊界已交付**：`AIAEC/DeepFilterNet_AENR/dfn_aenr_process.c/h`
+  是雙輸入版（`dfn_aenr_analysis_push()` 同時吃 `error_hop` 與 `far_hop`，
+  `DfnAenrProcessState` 內含兩個各自獨立的 `DFN2State`），compose 仍沿用
+  DFN2 的 `dfn2_compose_stream` ring。`DFN_AENR_MODEL_IO_LAYOUT_VERSION`=1。
+  單輸入的 `AINR/DeepFilterNet2/dfn2_process.c` 是 DFN2 自己的骨架，不是
+  AENR 的。兩者目前都只有測試呼叫，沒有 `pipelines/` caller。
 - `_init_error_passthrough`（`DeepFilterNet_AENR/model.py:38-47`）把 far
   分支初始化為零貢獻；訓練後應檢查 far 權重是否仍近零（= far conditioning
   沒學起來）。
@@ -148,7 +159,7 @@ DPGRNN intra 雙向在**頻率軸**（`:220`）、inter 單向在時間軸（`:2
 5. DFN `compose()` 兩次 `[B,513,T]` complex `.clone()`
    （`AINR/DeepFilterNet2/model.py:655, 804`），C/NPU 端應消除。
 
-## 5. 交付狀態與範圍（2026-08-13）
+## 5. 交付狀態與範圍（2026-08-17）
 
 已交付：`AIAEC/aiaec_streaming.py`（共用 stateful 元件，全部對照 offline
 自證；StreamSTFT/ISTFT 對 torch center=True bit-exact）+ 六個 model 的
@@ -157,30 +168,58 @@ N=1、打印 per-invocation I/O 與 state 清單、`--verify` 對照 whole-wav�
 + 六個 `AIAEC/tests/test_streaming_*.py`（等價/can-fail/fresh-state，全
 部 mutation 驗證）。
 
-另已存在（本節先前版本列為缺項，現已交付）：D 的 CLI/deployment
+另已交付：D 的 CLI/deployment
 override（`denoise.py`/`streaming.py` 的 `--max-delay-frames`：checkpoint
 contract 仍是 source of truth，override 只重建 alignment depth，權重
 D-agnostic 但輸出跨 D 不嚴格相同）與 `denoise.py --stream`（逐幀
 `create_stream_state()`/`forward_stream()` 路徑，與 offline graph 的
 streaming 等價自證）。
 
-**範圍界定：這是 NN frame-by-frame Python reference，不是產品
-end-to-end streaming。** 尚未包含（對應設計文件的 Phase）：PBFDKF
-frontend streaming 與 aligned-far 餵入（Phase 1 seam 已在 AEC C 端就
-緒；raw/aligned sweep 已完成，現有權重允許以明確的 ALIGNED export/init
-profile 部署）、delay generation/reset/fallback 接線（Phase 5）。尚未完成的
-是 exporter 產生 C descriptor 與 application 移除手寫 D/far mode，不是權重重訓。
-
-**2026-08-16 更新（本節先前版本列 Phase 4 為缺項，Align_ULCNet 現已交
-付，其餘五候選仍缺）**：Align_ULCNet 的 explicit-state NPU export 與 C
+**範圍界定：六個模型都已有 explicit-state accelerator graph；只有
+Align-ULCNet 已接成完整產品 pipeline。** Align_ULCNet 的 NPU export 與 C
 frontend/postprocess（Phase 4）已交付——`AIAEC/Align_ULCNet/export_streaming_onnx.py`
 （stateless one-frame ONNX graph，K/V/logit/GRU state 全顯式 I/O）、
 `ulcnet_process.c/h`（C STFT/WOLA）、`ulcnet_model_io.c/h` +
-`ulcnet_accelerator_adapter.c/h`（CPU 端 state adapter 參考實作，
-含 `far_input_mode` 的 metadata/descriptor/pipeline 三方一致性鎖）；產
-品 pipeline 層（`pipelines/mono_alignulcnet/`、`pipelines/4ch_alignulcnet/`）
-的 delay 狀態機/fail-open 接線（對應 Phase 5 的一部分）也已落地，細節見
+`ulcnet_accelerator_adapter.c/h`（CPU 端 state adapter 參考實作；metadata
+分開記錄 training provenance 與固定 aligned-far 部署 ABI）；產品 pipeline
+層（`pipelines/mono_alignulcnet/`、`pipelines/4ch_alignulcnet/`）的 delay
+狀態機、UNLOCKED 照常推論、alignment-transition reset 與 fail-open 接線也已
+落地，細節見
 [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md)
 狀態列與 `Audio_ALG/docs/html/pipeline_ulcnet_mono.html`。其餘五個候選
-（Align_CRUSE/DeepVQE_S/CAGCRN/GTCRN_AENR/DFN_AENR）的 Phase 4 仍是
-純 Python，未交付。
+（Align_CRUSE/DeepVQE_S/CAGCRN/GTCRN_AENR/DFN_AENR）共用
+`AIAEC/export_streaming_onnx.py` 與 `export_streaming_calibration.py`；其
+recurrent/conv/attention state 全部是 graph I/O。CPU 端已有
+`aiaec_process.c/h`、DeepVQE-S CCM 與 DFN-AENR compose 邊界，但尚未像
+Align-ULCNet 一樣接進 mono/4ch 產品 application，也尚未接目標板的實際
+accelerator driver。這些是整合缺口，不是訓練或權重缺口。
+
+**「有 C 程式碼」與「已接進產品」要分開讀**：model-state 交接的 C helper
+在 `AINR/DeepFilterNet2/dfn2_model_io.c`、`AINR/GTCRN/gtcrn_process.c`、
+`AINR/RNNoise-ERB/process.c` 與 `AIAEC/DeepFilterNet_AENR/dfn_aenr_process.c`
+都存在，但**目前只有測試呼叫它們**，`pipelines/` 沒有任何 caller。唯一有
+production caller 的是 Align-ULCNet：`ulcnet_model_io.c` ←
+`ulcnet_accelerator_adapter.c` ← `pipelines/{mono,4ch}_alignulcnet/main.c`。
+
+Calibration 由六候選共用的 `AIAEC/export_streaming_calibration.py` 產生
+（report schema `aiaec-stateless-stream-calibration-v1`）：
+
+- **far seam 政策**：Align-ULCNet 的 calibration **刻意**使用訓練域
+  `linear_error + raw_far`（calibration 階段不跑 matched filter），report
+  以 `calibration_far_input_mode=raw_far` 與
+  `deployment_far_input_mode=aligned_far` 兩個欄位分開記錄，不宣稱兩條
+  seam 相同；production 部署的固定是 `aligned_far`。其餘五個候選兩欄同為
+  `model_native_far`。
+- **D 必須三方一致**：export artifact、calibration artifact 與 C descriptor
+  的 `max_delay_frames` 要相同（D 決定 state tensor shape 與 host state
+  RAM，但不改學到的權重 shape），現已由
+  `AIAEC/tests/test_export_streaming_calibration.py` 交叉比對。
+- **per-tensor precision marker**：被 `state_precision_policy` 點名的 state
+  tensor，在 report 的 `inputs` 區塊不寫 `min`/`max`/`p001`/`p999`，改帶
+  `precision` 標記。Align-CRUSE 的累積 `score_sum` 沒有與 session 長度無關
+  的有限 range，標記為 `float32_no_ptq`；其 `frame_index` 標記為
+  `int64_no_ptq`，兩者不得交給整數 PTQ。Align-CRUSE 另要求 calibration 取自
+  **單一不中斷錄音**，工具會拒絕用重置片段拼湊出 `--frames`。
+- **`state_layout_version`**：目前只有 Align-ULCNet 有值（3，釘住
+  `ULCNET_MODEL_IO_LAYOUT_VERSION`）；共用 exporter 不寫這個 key，其餘五個
+  模型的 report 是 `null`，只能靠 `max_delay_frames` 交叉檢查。

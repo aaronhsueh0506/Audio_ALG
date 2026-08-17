@@ -34,7 +34,8 @@ th{background:#eef0f2}
 alignment 有兩個 mode：部署預設 <code>causal_running</code>（逐幀 <code>D[B,T,63]</code>，
 只用過去證據）；<code>paper_global</code>（整段一個 <code>D[B,63]</code>）為整段非因果，
 <code>create_stream_state()</code> 直接 <code>ValueError</code> 拒絕串流。</p>
-<p><b>ONNX / NPU graph boundary</b>（尚無 export 檔；boundary 由 streaming reference 固定）：
+<p><b>ONNX / NPU graph boundary</b>（由
+<code>AIAEC/export_streaming_onnx.py Align_CRUSE</code> 匯出）：
 graph <b>內</b> = <code>log_power_feature</code>（square+clamp+log）、causal conv +
 BatchNorm + ELU（<code>mic1..mic4</code> / <code>far1..far2</code>）、alignment 的
 MaxPool(1,4) + Linear query/key + <code>softmax</code>（作用在 cumsum 積分 score 上）、
@@ -118,20 +119,20 @@ hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本
 
 <h2>State 表</h2>
 <p><code>state_report</code> 實測（B=1 fp32，total <b>519.6 KB</b>）。部署契約：顯式
-state I/O，NPU runtime／host 保存；STFT/ISTFT 狀態屬 C struct 層：</p>
+state I/O，由 host caller 保存；STFT/ISTFT 狀態屬 C struct 層：</p>
 <table>
 <tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
-<tr><td>align.key_ring</td><td>(1, 64, 63, 1)</td><td>15.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>align.value_ring</td><td>(1, 24, 63, 65)</td><td>383.9 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>align.score_sum（cumsum 積分器）</td><td>(1, 63)</td><td>0.2 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>align.frame_index（絕對幀計數）</td><td>scalar int（非 tensor）</td><td>—</td><td>host／C 端計數器</td></tr>
-<tr><td>mic1.history</td><td>(1, 1, 3, 257)</td><td>3.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>mic2.history</td><td>(1, 16, 3, 129)</td><td>24.2 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>mic3.history</td><td>(1, 64, 3, 65)</td><td>48.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>mic4.history</td><td>(1, 72, 3, 33)</td><td>27.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>far1.history</td><td>(1, 1, 3, 257)</td><td>3.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>far2.history</td><td>(1, 8, 3, 129)</td><td>12.1 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>gru.hidden</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>align.key_ring</td><td>(1, 64, 63, 1)</td><td>15.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>align.value_ring</td><td>(1, 24, 63, 65)</td><td>383.9 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>align.score_sum（cumsum 積分器）</td><td>(1, 63)</td><td>0.2 KB</td><td>顯式 fp32 state I/O；不得整數 PTQ</td></tr>
+<tr><td>align.frame_index（絕對幀計數）</td><td>scalar int64 tensor</td><td>8</td><td>顯式 int64 state I/O；不得量化</td></tr>
+<tr><td>mic1.history</td><td>(1, 1, 3, 257)</td><td>3.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic2.history</td><td>(1, 16, 3, 129)</td><td>24.2 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic3.history</td><td>(1, 64, 3, 65)</td><td>48.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>mic4.history</td><td>(1, 72, 3, 33)</td><td>27.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>far1.history</td><td>(1, 1, 3, 257)</td><td>3.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>far2.history</td><td>(1, 8, 3, 129)</td><td>12.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>gru.hidden</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td><b>NN 合計</b></td><td></td><td><b>519.6 KB</b></td><td></td></tr>
 <tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>C struct（Python reference：host）</td></tr>
 </table>
@@ -154,7 +155,8 @@ T=90 全幀 stream-vs-offline enhanced 4.9e-7 / mask 1.8e-7 / delay 3.3e-7（ATO
 <ul>
 <li><code>AIAEC/Align_CRUSE/model.py</code>（<code>AlignCRUSE</code>）；<code>AIAEC/aiaec_common.py</code>（<code>GlobalDelayAttention</code>）；<code>AIAEC/aiaec_streaming.py</code>（<code>GlobalDelayAttentionCell</code>）</li>
 <li><code>AIAEC/Align_CRUSE/streaming.py</code>、<code>denoise.py</code>、<code>train.py</code>、<code>config.ini</code></li>
-<li>tests：<code>AIAEC/tests/test_streaming_align_cruse.py</code>（5 tests：等價/can-fail/短檔 caveat/paper_global 拒絕/fresh-state）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 122 passed（2026-08-13 實測）</li>
+<li>tests：<code>AIAEC/tests/test_streaming_align_cruse.py</code>（5 tests：等價/can-fail/短檔 caveat/paper_global 拒絕/fresh-state）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 239 passed（<code>pytest AIAEC</code> 含 dataset_gen = 357）</li>
+<li>匯出／calibration：<code>AIAEC/export_streaming_onnx.py Align_CRUSE</code>、<code>AIAEC/export_streaming_calibration.py Align_CRUSE</code>。本候選是唯一有 <b>per-tensor precision marker</b> 的：<code>state_align_score_sum</code>=<code>float32_no_ptq</code>、<code>state_align_frame_index</code>=<code>int64_no_ptq</code>，這兩個 tensor 在 report 的 <code>inputs</code> 區塊不寫 range 只寫 <code>precision</code>；並且 calibration 必須取自<b>單一不中斷錄音</b>（工具會拒絕用重置片段拼出 <code>--frames</code>）。far 兩欄同為 <code>model_native_far</code>，<code>state_layout_version</code> 為 <code>null</code>；tests <code>AIAEC/tests/test_export_stateless.py</code>（16）、<code>test_export_streaming_calibration.py</code>（6）</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.2</li>
 </ul>
 </body>

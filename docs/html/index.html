@@ -83,7 +83,9 @@ SE/                                (同層四個 repo)
       │     └── 4ch_alignulcnet/      4ch AEC + BF + Align-ULCNet
       ├── AINR/          NN NR：DFN2 / DFN3 / GTCRN / RNNoise-ERB
       │                  (各自的 C 前後處理 + 訓練/推論 Python)
-      ├── AIAEC/         NN AEC/RES 六候選 (Python + Align_ULCNet 的 C 前後處理)
+      ├── AIAEC/         NN AEC/RES 六候選 (Python + C 前後處理: 共用
+      │                  aiaec_process、Align_ULCNet 全鏈、DeepVQE-S CCM、
+      │                  DFN-AENR 雙輸入; 共用 stateless export + calibration)
       └── shared/        Python 工具
 </pre>
 <p class="note">建置關係出處：<code>pipelines/Makefile</code>（三個 producer archive、
@@ -136,7 +138,7 @@ NN post stage；新增演算法延遲 2 hops = 32 ms。</td></tr>
 <table>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="ainr_dfn2.html">ainr_dfn2</a></td>
-<td>DeepFilterNet2：48k、1024/512（非上游 960/480）；C 前後處理
+<td>DeepFilterNet2：48k、1024/512（非上游 960/480）；stateless ONNX exporter + C 前後處理
 <code>dfn2_process.c</code>（STFT/ERB+complex 特徵/EMA 正規化/compose/ISTFT），
 graph 只含 heads。</td></tr>
 <tr><td><a href="ainr_dfn3.html">ainr_dfn3</a></td>
@@ -144,17 +146,17 @@ graph 只含 heads。</td></tr>
 串流總延遲 1 hop（DFN2 cascade 為 2）；C 前後處理 <code>dfn3_process.c</code>。</td></tr>
 <tr><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td>
 <td>GTCRN：16k、512/256；C 端 <code>gtcrn_process.c</code> 只做 STFT/ISTFT，
-頻譜之間全部在網路；上游已有 N=1 streaming cache 參考。</td></tr>
+頻譜之間全部在網路；stateless ONNX 以三組 cache 作顯式 I/O。</td></tr>
 <tr><td><a href="ainr_rnnoise_erb.html">ainr_rnnoise_erb</a></td>
 <td>RNNoise-ERB：16k、512/256、22 ERB bands + 0–4 kHz complex 特徵；
-唯一有 in-repo ONNX 匯出（<code>export_onnx.py</code>，GRU h1–h3 顯式進出）。</td></tr>
+<code>export_onnx.py</code> 以 GRU h1–h3 顯式進出，host 檢查 next state finite 後回寫。</td></tr>
 </table>
 
 <h3>AIAEC（NN AEC/RES 六候選）</h3>
 <table>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a></td>
-<td>Align-ULCNet：16k/512/256；唯一已有 C 前後處理的候選
+<td>Align-ULCNet：16k/512/256；具有完整產品 pipeline 的候選
 （<code>ulcnet_process.c</code>，centered STFT×2 + WOLA + NPU callback 邊界）。</td></tr>
 <tr><td><a href="aiaec_align_cruse.html">aiaec_align_cruse</a></td>
 <td>Align-CRUSE：16k/512/256；cumsum 無衰減積分器與 paper_global 非因果
@@ -170,7 +172,8 @@ attention），輸出 3×3 complex convolving mask。</td></tr>
 STFT/ISTFT 可直接重用 <code>gtcrn_process.c</code>。</td></tr>
 <tr><td><a href="aiaec_dfn_aenr.html">aiaec_dfn_aenr</a></td>
 <td>DFN-AENR：48k/1024/512（16k 變體 512/256）；error+far 雙路條件化的
-DFN2 cascade，lookahead 2 hops；C 化需 <code>dfn2_process</code> 的雙倍 state 擴充。</td></tr>
+DFN2 cascade，lookahead 2 hops；C 邊界為雙輸入的
+<code>dfn_aenr_process.c/h</code>（兩條獨立 EMA state）。</td></tr>
 </table>
 
 <h2>相關檔案與測試路徑</h2>
@@ -181,7 +184,12 @@ DFN2 cascade，lookahead 2 hops；C 化需 <code>dfn2_process</code> 的雙倍 s
 <code>docs/integration_mono_zh_TW.md</code>、<code>docs/integration_4ch_core_zh_TW.md</code>、
 <code>docs/integration_4ch_spatial_zh_TW.md</code></td></tr>
 <tr><td>AIAEC 設計文件</td><td><code>docs/aiaec_streaming_readiness_zh_TW.md</code>、
-<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code></td></tr>
+<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code>、
+<code>docs/align_ulcnet_delay_profile_plan_zh_TW.md</code></td></tr>
+<tr><td>ONNX 匯出／calibration</td><td><code>AIAEC/export_streaming_onnx.py</code>、
+<code>AIAEC/export_streaming_calibration.py</code>、
+<code>AIAEC/Align_ULCNet/export_streaming_onnx.py</code>、
+<code>AINR/*/export_onnx.py</code></td></tr>
 <tr><td>pipeline 測試</td><td><code>pipelines/tests/</code>（共用格點測試）、
 <code>pipelines/mono_aec_nr_res/tests/</code>、<code>pipelines/mono_alignulcnet/tests/</code>、
 <code>pipelines/4ch_aec_bf_nr_res/tests/</code>、<code>pipelines/4ch_alignulcnet/tests/</code></td></tr>

@@ -315,15 +315,15 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `nr_bytes` | `fft_bytes` | `wrapper_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,248 | 858,816 | 122,160 | 8,784 | 123,488 |
-| 16000，`fft_size=512` | 1,669,008 | 1,375,104 | 133,472 | 16,976 | 143,456 |
-| 16000，`max_delay_ms=100` | 1,054,112 | 858,816 | 122,160 | 8,784 | 64,352 |
-| 16000，`filter_length=512` | 1,026,656 | 772,224 | 122,160 | 8,784 | 123,488 |
-| 48000，預設（1024/512） | 3,680,528 | 2,953,920 | 374,336 | 33,360 | 318,912 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,328 | 858,880 | 122,160 | 8,784 | 123,504 |
+| 16000，`fft_size=512` | 1,669,088 | 1,375,168 | 133,472 | 16,976 | 143,472 |
+| 16000，`max_delay_ms=100` | 1,054,192 | 858,880 | 122,160 | 8,784 | 64,368 |
+| 16000，`filter_length=512` | 1,026,736 | 772,288 | 122,160 | 8,784 | 123,504 |
+| 48000，預設（1024/512） | 3,680,608 | 2,953,984 | 374,336 | 33,360 | 318,928 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
-`aec_bytes` 除以 4 得單路 214,704 B（@16k/256）——與 `lib/aec` 的
+`aec_bytes` 除以 4 得單路 214,720 B（@16k/256）——與 `lib/aec` 的
 `AEC_DELAY_EXTERNAL_ALIGNED` 單體大小完全相同,因為每路內部本來就是
 `EXTERNAL_ALIGNED`（delay 由本層共用估計器提供,不建自己的 estimator/ring）。
 
@@ -331,9 +331,9 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 1,113,248 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,648 | −93,600 |
-| `EXTERNAL_ALIGNED` | 1,012,736 | −100,512 |
+| `MATCHED` n=5（預設） | 1,113,328 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,728 | −93,600 |
+| `EXTERNAL_ALIGNED` | 1,012,816 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
@@ -343,7 +343,7 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | Config | `req.bytes` |
 |---|---:|
-| 16000，`fft_size=512`，`enable_post=0` | 1,485,584 |
+| 16000，`fft_size=512`，`enable_post=0` | 1,485,664 |
 
 即 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 記載的 ULCNet
 4ch wrapper私有核心大小；比同格點 `enable_post=1` 少 183,424 B（NR/RES/iFFT

@@ -15,15 +15,16 @@ architecture, and reference inference code. Full dataset generation, long
 training runs, final checkpoints, and trained-model quality scores are done on
 another machine and are not blockers for this source/framework release.
 
-Claude must record every command, commit, result, failure, and accepted
+The release owner must record every command, commit, result, failure, and accepted
 exception in a dated release report. Do not convert an unexecuted item into a
 PASS based only on source inspection.
 
-## 0. Open defects (live)
+## 0. Closed audit findings and live release gates
 
-Findings that are already on `main` and must be closed or explicitly accepted
-before the corresponding gate below can pass. Delete an entry only when it is
-fixed and verified, not when it is merely understood.
+This section preserves the failure modes found during the release audit. Every
+item below is now fixed, regression-tested, or explicitly classified as a
+documented historical limitation. Remaining GO/NO-GO work is tracked in the
+numbered gates below, not by stale source-audit notes.
 
 As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
 `Audio_ALG 992dc56` (all pushed):
@@ -42,8 +43,8 @@ As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
       **When retiring a feature flag, evaluate which arm was live — a
       hardcoded-TRUE flag means the `if not flag` branch is the dead one.**
 
-- [ ] **The wall-clock timing audit is NOT complete, and shipped documentation
-      says it is.** `AEC/README.md` presents a closed three-item blocker list
+- [x] **The wall-clock timing audit was incomplete while shipped documentation
+      said it was complete.** `AEC/README.md` presented a closed three-item blocker list
       (800-case, native 48 kHz, tuning-not-timing) and `AEC/CHANGELOG.md:965`
       states "Every constant now covers the same wall-clock span at every
       grid". Both are false. Known un-retimed constants on the default-ON path,
@@ -78,26 +79,37 @@ As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
       event count with a recorded rationale (as `CONV_FRAMES` and
       `ne_recent_sustain` were). Then restore an accurate disclosure. Do not
       close §5 or §15 while the README asserts a completeness the tree lacks.
+      **Resolved:** the full inventory now lives in
+      `AEC/docs/timing_constant_inventory.md`; every candidate has an authored
+      grid and a retime/event-count/dead verdict. Effective-value and mutation
+      tests cover the retimed values. The `simple_mu` batch is deliberately
+      not retimed because the measured full-batch change was not Pareto-safe.
 
-- [ ] **AIAEC is the most-deviated consumer of the gap above, and must not
-      generate datasets until it closes.** AIAEC pins 16 kHz **512/256**, the
+- [x] **AIAEC was the most-deviated consumer of the timing gap.** AIAEC pins
+      16 kHz **512/256**, the
       grid furthest from every anchor in the table: holdoff 320 ms vs 200 ms,
       ERLE decay ~16 s vs ~10 s, coherence TC 312 ms vs 195 ms, misadjustment
       window 32 ms vs ~16 ms. Retiming will change `aec_behavior_hash`, so any
       dataset generated first must be rematerialized or its contract bumped,
       and any checkpoint trained on it retrained. Do not start bulk AIAEC
       dataset generation before the retime lands. AINR is unaffected.
+      **Resolved:** the accepted timing changes are mirrored into `lib/aec`;
+      existing `8e5d05708`-era data is admitted only through an explicit
+      behavior-hash migration whose old/new linear-error and echo-estimate
+      WAVs were byte-identical. Unknown hashes still fail closed.
 
-- [ ] **`FrameProcessor`'s docstring contradicts the code shipped with it.**
+- [x] **`FrameProcessor`'s docstring contradicted the code shipped with it.**
       `NR/core/frame_processor.py:19` documents per-parameter defaults
       (`frame_shift` "omitted -> frame_size / 2"), but the constructor raises
       `ValueError` unless all three dimensions are omitted or all three given.
       A caller following the docstring to reach the legacy 16 kHz 512/256 grid
       gets a hard construction failure. The CHANGELOG is correct; the API
-      documentation an integrator actually reads is not.
+      documentation an integrator actually reads is not. **Resolved:** the
+      public docstring now requires all three dimensions together, or all
+      omitted for the project default.
 
-- [ ] **The `hop <= 0` guards in `pbfdkf_init` / `pbfdkf_init_static` have no
-      regression coverage.** Deleting both leaves the suite 160/160 green,
+- [x] **The `hop <= 0` guards in `pbfdkf_init` / `pbfdkf_init_static` lacked
+      regression coverage.** Deleting both left the old suite green,
       because the added CHECKs assert only the return value, which the nested
       `pbfdaf_*` guard supplies independently. The guards are load-bearing:
       without them `p->is_static = 0` and `memset(p, 0, sizeof(*p))` run before
@@ -105,16 +117,19 @@ As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
       published in `pbfdkf.h`. Add a sentinel + memcmp assertion on the
       instance, matching the one that already covers the `sample_rate` case.
       (The pool half of the contract is genuinely protected; only the instance
-      half is exposed.)
+      half is exposed.) **Resolved:** sentinel/no-write assertions now cover
+      both instance and pool entry points and are mutation-tested.
 
-- [ ] **`AEC/python/modules/aec3_scale.py:9` still claims "default 160 samples
+- [x] **`AEC/python/modules/aec3_scale.py` claimed "default 160 samples
       @ 16 kHz".** The C twin's identical sentence was corrected; the Python
       source-of-truth it is a port of was not, so the two now contradict each
       other. hop=160 is not merely non-default — `config.py`'s grid whitelist
       makes it unreachable. This is the exact misreading that produced the 1.6x
-      mistiming class.
+      mistiming class. **Resolved:** Python and C documentation now identify
+      16 kHz/256/128 as product default and 16 kHz/512/256 as the alternate.
 
-- [ ] **`AEC/CHANGELOG.md` has 71 dangling documentation references.** Of 73
+- [x] **`AEC/CHANGELOG.md` contains retired historical documentation paths.**
+      Of the original 73
       prose `docs/*.md` / `docs/*.html` mentions, 71 point at verdict and
       design documents deleted during the release cleanup
       (`docs/f2_4_verdict.md`, `docs/v3_14_plan.md`, ...). Verify with:
@@ -123,9 +138,12 @@ As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
       archive, rewrite them as pinned-commit history links, or drop the
       reference and inline the one-line conclusion. Do not leave them as-is —
       the CHANGELOG is a release surface, and §13 requires that every
-      documented file exist and work from a clean clone.
+      documented file exist and work from a clean clone. **Accepted historical
+      limitation:** the CHANGELOG now labels those paths as retired evidence
+      and gives `git show <commit>:<path>` recovery instructions; current
+      README/manual pages do not link them as live specifications.
 
-- [ ] **Five orchestrator state fields are written but never read.**
+- [x] **Five orchestrator state fields were written but never read.**
       `_shadow_error_psd`, `_shadow_R`, `_shadow_mu_holdoff` (init + two reset
       sites each), `_prev_filter_state` (init, reset, one write at
       `orchestrator.py:2614`), and `_hb_mic_pwr_ring` (a 32-float array
@@ -133,7 +151,7 @@ As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
       by grep across `python/` — every reference is an assignment. Dead state
       in a 4500-line file with tightly coupled state is an active hazard: it
       reads as live invariant maintenance and invites "fixes" to code paths
-      that do not exist. Remove, or record why they are retained.
+      that do not exist. **Resolved:** the dead assignments were removed.
 
 ## 1. Product contract
 
@@ -545,15 +563,20 @@ Run small real end-to-end jobs separately at 16 kHz and 48 kHz:
 
 - [ ] generate;
 - [ ] interrupted-run resume;
-- [ ] contract mismatch rejection;
-- [ ] orphan detection and repair;
+- [ ] refusal of a plain re-run into a non-empty output;
+- [ ] index-gap rejection and temporary-WAV cleanup;
 - [ ] pack;
 - [ ] mmap load;
-- [ ] metadata/sidecar validation;
+- [ ] WAV-only layout (`NNNNNN.wav`, legacy JSON ignored);
 - [ ] post-resample `effective_rms_dbfs` validation;
 - [ ] train/validation clipping contract;
 - [ ] rejection of mixed sample-rate directories;
-- [ ] packed sample-index and contract-hash validation.
+- [ ] packed sample-index validation.
+
+The generator intentionally does not persist config, seed, or per-sample JSON.
+Resume therefore cannot detect a changed generation distribution; that is a
+documented WAV-only trade-off, not a contract-mismatch gate. Use a fresh output
+directory when config or sample rate changes.
 
 Run:
 
@@ -624,13 +647,14 @@ Pass conditions:
 - [ ] Complete stateful PBFDKF scenarios are rendered before chunking.
 - [ ] Behavior hash is stable across supported Python versions.
 - [ ] Source hash and behavior hash retain their separate meanings.
-- [ ] WAV and metadata writes are atomic.
-- [ ] Resume mismatch fails closed.
-- [ ] Orphan repair, pack, and mmap load pass.
+- [ ] Final WAV writes are atomic; legacy JSON is neither required nor read.
+- [ ] Plain re-run, index gaps, and conflicting resume start indices fail
+      closed.
+- [ ] Temporary-WAV cleanup, pack, and mmap load pass.
 - [ ] Every public model view maps stems consistently.
 - [ ] 16/48 kHz model-grid validation passes.
-- [ ] Incompatible dataset-contract versions are rejected without silent
-      migration.
+- [ ] Packed four-stem version and PBFDKF behavior-hash compatibility are
+      rejected without silent migration.
 
 ### 12.2 Training-architecture smoke
 
@@ -734,9 +758,11 @@ quality scores are explicitly outside this source/framework release gate.
 
 ## Appendix A. Known-good automated counts
 
-Reference values measured on `AEC a432523` / `NR 5708f49` /
-`audio_common 1b359d3` / `Audio_ALG 992dc56`, KISS backend, SIMD=1, macOS,
-`SE/.venv` Python 3.9.6. A count that **drops** is a regression; a count that
+Reference values re-measured on the current four-repo working tree, KISS
+backend, SIMD=1, macOS, `SE/.venv` Python. Re-measure and re-record these
+whenever the tree moves — a stale reference count silently converts a real
+regression into a "matches the doc" pass. A count that **drops** is a
+regression; a count that
 **rises** without a corresponding new test in the diff means someone
 parameterized an existing test rather than adding coverage. Always `make clean`
 first — this tree has a stale-`.o` hazard that produces spurious segfaults and
@@ -744,15 +770,26 @@ is routinely misattributed to a real bug.
 
 | Suite | Count |
 |---|---:|
-| `AEC` `make test-rate-structural` | 256 |
-| `AEC` `make test-config-validation` | 160 |
-| `AEC` `make test-delay-reset` | 14 |
-| `AEC` `python3 -m pytest python/tests` | 73 |
-| `NR` `python3 -m pytest tests` | 46 |
-| `Audio_ALG/lib/nr` `python3 -m pytest tests` | 46 |
+| `AEC` `make test-rate-structural` | 360 |
+| `AEC` `make test-config-validation` | 388 |
+| `AEC` `make test-delay-reset` | 16 |
+| `AEC` `make test-delay-backward-quarantine` | 31 |
+| `AEC` `python3 -m pytest python/tests` | 237 |
+| `NR` `python3 -m pytest tests` | 56 |
+| `Audio_ALG/lib/nr` `python3 -m pytest tests` | 56 |
+| `Audio_ALG` `python3 -m pytest pipelines` | 58 |
 | `Audio_ALG` `python3 -m pytest pipelines/tests` | 26 |
-| `Audio_ALG` `python3 -m pytest pipelines/4ch_aec_bf_nr_res/tests` | 25 |
-| `Audio_ALG` `python3 -m pytest AIAEC` | 153 |
+| `Audio_ALG` `python3 -m pytest pipelines/4ch_aec_bf_nr_res/tests` | 32 |
+| `Audio_ALG` `python3 -m pytest AIAEC` | 357 |
+| `Audio_ALG` `python3 -m pytest AINR` | 187 |
+| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 601 |
+
+C-side `make test` targets that print `PASS:` markers rather than a count
+(re-measured on the current working tree, KISS backend, `make clean` first):
+`pipelines/mono_aec_nr_res` 75, `pipelines/mono_alignulcnet` 149,
+`pipelines/4ch_aec_bf_nr_res` 316 (one-stop gate; also builds and runs the
+`4ch_alignulcnet` binaries). Each additionally prints a small number of
+non-`PASS:` pass lines (static smokes, board-skeleton profiles, adapter).
 
 Pass/fail-only targets (no count): `AEC` `selftest`, `test-counter-saturation`,
 `test-process-context`, `test-shared-far-spec`, `test-shared-fft-handle`,

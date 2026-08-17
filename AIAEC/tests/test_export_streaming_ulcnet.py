@@ -102,13 +102,7 @@ def test_c_descriptor_constants_match_export_contract():
     assert 'int far_input_mode;' in header
 
 
-def test_metadata_carries_far_input_mode_for_the_c_descriptor(tmp_path):
-    """The exported metadata must name the checkpoint's far contract twice.
-
-    Once as the string a human reads, once as the integer the C descriptor's
-    far_input_mode field holds -- that pair is what lets board init compare
-    ONNX metadata, compiled descriptor and pipeline far mode.
-    """
+def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     checkpoint = tmp_path / 'ckpt.pt'
     checkpoint.write_bytes(b'not a real checkpoint, only hashed')
@@ -119,20 +113,22 @@ def test_metadata_carries_far_input_mode_for_the_c_descriptor(tmp_path):
         str(tmp_path / 'model.onnx'), str(checkpoint), model,
         {'far_input_mode': 'raw_far'}, inputs, outputs,
     )
-    assert metadata['far_input_mode'] == 'raw_far'
+    assert metadata['training_far_input_mode'] == 'raw_far'
+    assert metadata['far_input_mode'] == 'aligned_far'
     assert metadata['far_input_mode_c_value'] == FAR_INPUT_MODE_C_VALUES[
-        'raw_far'
+        'aligned_far'
     ]
     assert metadata['state_layout_version'] == STATE_LAYOUT_VERSION
 
-    # A contract with no recorded mode still exports the raw_far default
-    # (legacy checkpoints), and both fields stay consistent.
+    # Legacy checkpoints retain raw-far provenance while deployment remains
+    # fixed to aligned far.
     legacy = _write_metadata(
         str(tmp_path / 'legacy.onnx'), str(checkpoint), model, {},
         inputs, outputs,
     )
-    assert legacy['far_input_mode'] == 'raw_far'
-    assert legacy['far_input_mode_c_value'] == 0
+    assert legacy['training_far_input_mode'] == 'raw_far'
+    assert legacy['far_input_mode'] == 'aligned_far'
+    assert legacy['far_input_mode_c_value'] == 1
 
 
 def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():

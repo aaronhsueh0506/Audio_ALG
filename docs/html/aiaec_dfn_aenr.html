@@ -45,9 +45,9 @@ streaming 時 StreamSTFT 幀乘 <code>n_fft**-0.5</code>，實證與 torch bit-e
 （compose 先 mask 後 DF，DF 的未來 tap 吃的是「已套 mask 的譜」）。要 1 hop 須
 <code>df_lookahead=0</code> 並重訓。<code>create_stream_state()</code> 會驗證
 <code>mask_lookahead + df_lookahead == stream_output_delay</code>，不符即拒絕。</p>
-<p><b>ONNX / NPU graph boundary</b>（尚無 export 檔；boundary 由 streaming reference 與
-C twin <code>AINR/DeepFilterNet2/dfn2_process.h</code>（<code>dfn2_compose_stream</code>，
-單輸入 DFN2 版骨架）固定）：graph <b>內</b> = 兩個 1×1 conditioner、
+<p><b>ONNX / NPU graph boundary</b>（已交付：
+<code>AIAEC/export_streaming_onnx.py DeepFilterNet_AENR</code>；C boundary 為
+<code>DeepFilterNet_AENR/dfn_aenr_process.c/h</code>）：graph <b>內</b> = 兩個 1×1 conditioner、
 <code>LookaheadConv2d</code>（erb_conv0/df_conv0，lookahead 1 幀）、conv stack、
 SqueezedGRU_S ×3（encoder/erb_dec/df_dec）、ERB mask head（sigmoid）、DF coefs head、
 alpha head（sigmoid）。compose（ERB mask 套用、5-tap 複數 DF FIR、alpha blend、
@@ -56,9 +56,10 @@ post_filter）在 Python reference 中位於 <code>forward_stream</code> 內，�
 高頻段必須同步延遲——<code>dfn2_process.h</code> 明文警告）。graph <b>外</b>（C 前處理）=
 PBFDKF、normalized STFT×2、<code>extract_dfn2_features</code> 的<b>兩條獨立</b> EMA
 normalization（error/far 各一，逐幀一階遞迴、固定常數初值——共用會被
-<code>model_views.py</code> 拒絕）；（C 後處理）= 逆 scale + WOLA ISTFT。AENR 化尚需在 C
-端加開 error/far 前處理 state 與兩個 conditioner（readiness §3.6）。無 lsnr head，
-不能複製上游 per-frame stage skipping。</p>
+<code>model_views.py</code> 拒絕）；（C 後處理）= 逆 scale + WOLA ISTFT。
+C 端由 <code>DfnAenrProcessState</code> 保存兩條獨立 EMA、analysis/synthesis 與 compose
+state；accelerator 的 GRU/pathway state 由 <code>DfnAenrModelIOState</code> 顯式送入並回寫。
+無 lsnr head，不能複製上游 per-frame stage skipping。</p>
 
 <h2>API 用法</h2>
 <pre>from AIAEC.DeepFilterNet_AENR.denoise import load_model
@@ -150,15 +151,16 @@ hop-lag：NN 2 hops（16k=32 ms）+ centered framing 半窗 1 hop。streaming.py
 <h2>State 表</h2>
 <p>模型內 state（<code>state_report</code> 穩態實測，B=1、16k，total <b>81.4 KB</b>）+
 模型外 feature EMA。部署契約：NN state 顯式 I/O；compose 佇列/ring 對應
-<code>dfn2_process.h</code> 的 C struct ring：</p>
+<code>dfn2_process.h</code> 的 C struct ring。C model-state commit 是 transaction：
+整批 next-state 有 NULL/NaN/Inf 時不覆寫上一筆有效 state：</p>
 <table>
 <tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
-<tr><td>erb_conv0.history（lookahead conv）</td><td>(1, 1, 2, 32)</td><td>0.2 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>df_conv0.history（lookahead conv）</td><td>(1, 2, 2, 64)</td><td>1.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>encoder_gru.hidden</td><td>(1, 1, 256)</td><td>1.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>erb_dec_gru.hidden</td><td>(2, 1, 256)</td><td>2.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>df_gru.hidden</td><td>(2, 1, 256)</td><td>2.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>df_convp.history</td><td>(1, 64, 4, 64)</td><td>64.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>erb_conv0.history（lookahead conv）</td><td>(1, 1, 2, 32)</td><td>0.2 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>df_conv0.history（lookahead conv）</td><td>(1, 2, 2, 64)</td><td>1.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>encoder_gru.hidden</td><td>(1, 1, 256)</td><td>1.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>erb_dec_gru.hidden</td><td>(2, 1, 256)</td><td>2.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>df_gru.hidden</td><td>(2, 1, 256)</td><td>2.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>df_convp.history</td><td>(1, 64, 4, 64)</td><td>64.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>df_ring.ring（<b>已套 mask</b> 低頻譜，5 幀）</td><td>(1, 1, 5, 64)</td><td>2.5 KB（complex64）</td><td>C post（<code>dfn2_compose_stream</code> ring）</td></tr>
 <tr><td>pending_spec（等 heads 的 raw 譜，深度 1）</td><td>(1, 1, 257)</td><td>2.0 KB（complex64）</td><td>C post（compose 佇列）</td></tr>
 <tr><td>df_queue（等 DF 未來幀，深度 1：spec_raw/spec_m/mask/coefs/alpha）</td><td>(1,257)c64 ×2、(1,1,1,32)、(1,1,64,10)、(1,1,1)</td><td>6.6 KB</td><td>C post（compose 佇列）</td></tr>
@@ -189,9 +191,11 @@ RuntimeError。</li>
 <ul>
 <li><code>AIAEC/DeepFilterNet_AENR/model.py</code>（<code>DeepFilterNetAENR</code>：forward / create_stream_state / forward_stream / flush_stream）</li>
 <li>骨幹：<code>AINR/DeepFilterNet2/model.py</code>（<code>DeepFilterNet2.compose</code>）、<code>AINR/DeepFilterNet2/train.py</code>（<code>extract_dfn2_features</code> / <code>read_feature_config</code>）</li>
-<li>C twin：<code>AINR/DeepFilterNet2/dfn2_process.h / .c</code>（<code>dfn2_compose_stream</code>、<code>DFN2State</code>——單輸入 DFN2 版，center=False 串流）</li>
+<li>C 邊界（AENR 專屬,雙輸入）：<code>AIAEC/DeepFilterNet_AENR/dfn_aenr_process.h / .c</code>——<code>DfnAenrProcessState</code> 內含兩個各自獨立的 <code>DFN2State</code>（error/far 各一條 EMA）,<code>dfn_aenr_analysis_push()</code> 同時吃 <code>error_hop</code> 與 <code>far_hop</code>,<code>DFN_AENR_MODEL_IO_LAYOUT_VERSION</code>=1;目前只有 <code>AIAEC/tests/test_dfn_aenr_process_c.py</code> 呼叫,無 <code>pipelines/</code> caller</li>
+<li>C twin（骨幹,非 AENR）：<code>AINR/DeepFilterNet2/dfn2_process.h / .c</code>（<code>dfn2_compose_stream</code>、<code>DFN2State</code>——單輸入 DFN2 版，center=False 串流）</li>
 <li><code>AIAEC/DeepFilterNet_AENR/streaming.py</code>、<code>denoise.py</code>、<code>train.py</code>、<code>config.ini</code>；<code>AIAEC/dataset_gen/model_views.py</code>（<code>build_spectral_model_view</code>：DFN 特例、EMA 不可共用）</li>
-<li>tests：<code>AIAEC/tests/test_streaming_dfn_aenr.py</code>（4 tests）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 122 passed（2026-08-13 實測）</li>
+<li>tests：<code>AIAEC/tests/test_streaming_dfn_aenr.py</code>（4 tests）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 239 passed（<code>pytest AIAEC</code> 含 dataset_gen = 357）</li>
+<li>匯出／calibration：<code>AIAEC/export_streaming_onnx.py DeepFilterNet_AENR</code>、<code>AIAEC/export_streaming_calibration.py DeepFilterNet_AENR</code>（report 兩個 far 欄位同為 <code>model_native_far</code>；<code>state_layout_version</code> 為 <code>null</code>——共用 exporter 目前不寫此欄，只能靠 <code>max_delay_frames</code> 交叉檢查 export/calibration/C descriptor 三方的 D）；tests <code>AIAEC/tests/test_export_stateless.py</code>（16）、<code>test_export_streaming_calibration.py</code>（6）</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.6</li>
 </ul>
 </body>

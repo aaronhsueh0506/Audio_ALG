@@ -153,7 +153,10 @@ hop-lag: 輸出音訊落後輸入 2 hops (heads 1 hop + DF future tap 1 hop, 串
 <h2>State 表</h2>
 <p><b>ONNX/匯出邊界</b>:<code>model.py heads()</code> 即匯出邊界——圖內只有網路
 (encoder/ERBDecoder/DFDecoder);ERB mask 展開、DF FIR、alpha blend、PF、atten-lim、
-ISTFT 全在圖外的 C。本目錄尚無 ONNX 匯出腳本(RNNoise-ERB 有,可類推)。</p>
+ISTFT 全在圖外的 C。<code>export_onnx.py</code> 已交付 stateless heads graph：
+每次由 host 傳入 3 幀 feature window、三組 GRU hidden 與 DF pathway history，
+並取回 heads 與更新後 state；加速器本身不保存跨次呼叫狀態。C helper 在寫入前
+驗證整批 next-state，NULL/NaN/Inf 會回傳 -1 且保留上一筆 state。</p>
 <div class="tbl"><table>
 <tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
 <tr><td><code>analysis_buf</code></td><td>[1024]</td><td>4,096</td><td>C struct <code>DFN2State</code></td><td>分析滑窗</td></tr>
@@ -168,10 +171,10 @@ ISTFT 全在圖外的 C。本目錄尚無 ONNX 匯出腳本(RNNoise-ERB 有,可�
 <tr><td><code>hi_delay_re/im</code></td><td>[5][417] ×2</td><td>16,680</td><td>C struct</td><td>高頻段同步延遲(band split 對時)</td></tr>
 <tr><td><code>stream_frame_index</code> 等 index</td><td>—</td><td>16</td><td>C struct</td><td>串流框編號 / ring 指標</td></tr>
 <tr><td>scratch 區</td><td>—</td><td>~12.4 KB</td><td>C struct</td><td>非跨呼叫,每次覆寫</td></tr>
-<tr><td><code>encoder.emb_gru</code> h</td><td>(1,B,256)</td><td>1,024</td><td>NPU runtime</td><td>圖內 GRU hidden,跨次呼叫必須保留</td></tr>
-<tr><td><code>erb_dec.emb_gru</code> h</td><td>(2,B,256)</td><td>2,048</td><td>NPU runtime</td><td>ERB decoder 2 層 GRU</td></tr>
-<tr><td><code>df_dec.df_gru</code> h</td><td>(2,B,256)</td><td>2,048</td><td>NPU runtime</td><td>DF decoder 2 層 GRU</td></tr>
-<tr><td>conv 時間快取</td><td>erb_conv0: 2 框×(1×32);df_conv0: 2 框×(2×96);df_convp: 4 框×(64×96)=24,576 f32</td><td>合計 ~100 KB</td><td>NPU runtime</td><td>kt=3 的兩個輸入 conv(lookahead=1)與 kt=5 causal pathway conv;其餘 conv 時間核=1,無快取</td></tr>
+<tr><td><code>encoder.emb_gru</code> h</td><td>(1,B,256)</td><td>1,024</td><td>host caller</td><td>顯式 graph I/O；跨次呼叫由 host 保存</td></tr>
+<tr><td><code>erb_dec.emb_gru</code> h</td><td>(2,B,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；ERB decoder 2 層 GRU</td></tr>
+<tr><td><code>df_dec.df_gru</code> h</td><td>(2,B,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；DF decoder 2 層 GRU</td></tr>
+<tr><td>conv 時間快取</td><td>erb_conv0/df_conv0 的 3 幀輸入 window；df_convp:4 框×(64×96)=24,576 f32</td><td>約 100 KB</td><td>host caller</td><td>window/pathway history 都是顯式 graph I/O；加速器不持有 state</td></tr>
 </table></div>
 <p class="note"><code>sizeof(DFN2State)</code> = 85,632 bytes(本機以 <code>-ffp-contract=off</code> 編譯量測)。</p>
 
@@ -198,6 +201,6 @@ head/spectrum 配對無法以「輸出有限」矇混過關。</li>
 <li>文件:<a href="../../AINR/DeepFilterNet2/README.md">README.md</a>、<a href="../../AINR/DeepFilterNet2/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT.md</a></li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code> — <code>make -C AINR test-simd</code>
 實測 NEON/scalar digest 皆 <code>124b768ec938af7d</code>(bit 相同)</li>
-<li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code> — 實測 27 passed;
-共用測試 <code>AINR/tests/</code>(pytest)— 實測 14 passed</li>
+<li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code> — 實測 31 passed;
+共用測試 <code>AINR/tests/</code>(pytest)— 實測 16 passed（<code>pytest AINR</code> 全樹 = 187）</li>
 </ul>

@@ -5,12 +5,12 @@
  *   1. identity E2E: the 2-hop timing contract (hops 0..1 zero; out[hop p]
  *      equals the beamformed-error accessor value captured at hop p-1)
  *      through the WOLA reconstruction + ULCNet chain in fail-open mode.
- *   2. counting model (ULCNET_FAR_ALIGNED): infer STEPPED on every emitted
- *      frame (constant per-hop compute, matching the mono variant) while
- *      its output is APPLIED only on locked frames; model->reset fired on
+ *   2. counting model: infer STEPPED and applied on every emitted frame
+ *      except the identity-reprime frames after an alignment generation;
+ *      model->reset fired on
  *      every delay change AND on pipeline reset; fail-open on infer()
  *      error (output stays identity, calls continue).
- *  2b. relock on the SAME delay (ALIGNED): LOCKED(0) -> forced UNLOCKED ->
+ *  2b. relock on the SAME delay: LOCKED(0) -> forced UNLOCKED ->
  *      LOCKED(0) must still fire model->reset exactly once, on the relock
  *      hop. Applied delay 0 is the one value a value-only `changed` test
  *      cannot tell apart from "nothing accepted yet"; see the test's own
@@ -20,7 +20,7 @@
  *      delayed far, and the abandon_pre token protocol.
  *   4. pool rejection / 8-point descriptor gate / destroy idempotence /
  *      pool reuse, plus a short heap-vs-pool byte-equal run.
- *   5. far-timestamp (ULCNET_FAR_RAW, the default): far-passthrough model,
+ *   5. far-timestamp before acquisition: far-passthrough model,
  *      silence on all mics, one unit impulse in far at a known index -- it
  *      must land in the output at EXACTLY impulse + 2 hops (512 samples):
  *      the wrapper's one-hop far-compensation buffer (matching the beam
@@ -28,7 +28,7 @@
  *      one-hop centered ULCNet chain. Applied delay contributes 0 here
  *      (the shared delay never acquires on silent mics). Goes red by
  *      exactly 256 samples if the far compensation buffer is removed.
- *   6. RAW mode never gates on the delay lock: the 0.5x model's output is
+ *   6. Production never gates on the delay lock: the 0.5x model's output is
  *      applied from the FIRST emitted frame, before the delay is solid.
  *   7. NaN guard: rc==0 frames poisoned with NaN/Inf are discarded
  *      (bit-identical to the NULL-model pipeline under the 50%-overlap
@@ -40,21 +40,22 @@
  *      written frame recovers. MUTATION: removing the pre-fill in
  *      audio_pipeline_4ch_ulcnet.c leaks stale finite values into the
  *      unwritten bins and this test goes red.
- *   9. far-input mode switch lock: set_far_input_mode succeeds before any
- *      hop is processed, is REJECTED (nonzero, mode unchanged -- verified
- *      via the far_input_mode getter) once a hop has been processed, and
- *      succeeds again after audio_pipeline_4ch_ulcnet_reset().
- *  10. far-input contract gate: a model publishing a model-I/O descriptor
- *      (UlcnetModel.io_descriptor, as the accelerator adapter always does)
- *      may only be installed on a pipeline whose far branch matches the
- *      checkpoint the descriptor describes. Both setters carry the gate:
- *      set_model() refuses the disagreeing checkpoint (leaving the previous
- *      model), set_far_input_mode() refuses to move the mode out from under
- *      an installed one (leaving the mode), and both directions of the
- *      pairing are covered; a NULL descriptor is ungated. MUTATION:
- *      deleting the ulcnet_far_mode_agrees() calls in
- *      audio_pipeline_4ch_ulcnet.c turns every rejection above green-side
- *      up and this test goes red.
+ *   9. identity-reprime straddle DERIVATION: a unit impulse in the middle of
+ *      the last pre-boundary input hop measures, branch by branch, how many
+ *      emitted frames still have a pre-switch hop inside their analysis
+ *      window. Measured in a boundary-FREE control run (so the reprime never
+ *      measures itself, and the boundary's own buffer clearing cannot hide
+ *      the straddling slot) and asserted equal to
+ *      AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES; the boundary run then
+ *      proves the first model-visible frame after the reprime is marker-free
+ *      on BOTH branches. MUTATION: no reprime, or one frame too few, goes
+ *      red.
+ *  10. identity-reprime BEHAVIOUR: exactly that many identity frames after a
+ *      mid-stream delay change and after the FIXED fill completion, infer
+ *      frozen for exactly those frames and resuming right after, one
+ *      model->reset per generation.
+ *  11. fixed deployment contract: an aligned-far descriptor is accepted and
+ *      a raw-far descriptor is rejected; no runtime mode setter exists.
  */
 
 #include "audio_pipeline_4ch_ulcnet.h"
@@ -102,6 +103,21 @@ static void fill_echo_hop(int frame, int hop, int true_delay,
                 echo * (1.0f - 0.02f * ch);
         }
     }
+}
+
+/* Frames the 0/2/1 analysis contract emits at hop index `frame`. */
+static int frames_in_hop(int frame) {
+    return frame == 0 ? 0 : (frame == 1 ? 2 : 1);
+}
+
+/* Spend an armed identity-reprime budget over one hop's `frames` emitted
+ * frames, and report how many of them the reprime covered. The budget is
+ * armed at the TOP of the hop that reports the alignment generation, so the
+ * arming hop's own frames are already spending it. */
+static int reprime_take(int* armed, int frames) {
+    int skipped = *armed < frames ? *armed : frames;
+    *armed -= skipped;
+    return skipped;
 }
 
 /* ============================================================================
@@ -202,7 +218,7 @@ static int test_identity_e2e(void) {
 }
 
 /* ============================================================================
- * 2. Counting model: policy wiring (lock gating, delay-change reset,
+ * 2. Counting model: policy wiring (continuous stepping, delay-change reset,
  *    pipeline reset, fail-open on infer error)
  * ========================================================================== */
 
@@ -247,6 +263,10 @@ static int test_counting_model_policy(void) {
     float* beam_hist;
     long expected_infer = 0;
     long changed_count = 0;
+    long skipped_total = 0;
+    int reprime_armed = 0;
+    int cur_reprime = 0;
+    int prev_reprime = 0;
     int locked_frames = 0;
     int scaled_checks = 0;
     int identity_checks = 0;
@@ -273,13 +293,6 @@ static int test_counting_model_policy(void) {
     model.reset = counting_reset;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install counting model");
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, (UlcnetFarInputMode)99) != 0,
-          "set_far_input_mode rejects an undefined mode value");
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_ALIGNED) == 0,
-          "select ULCNET_FAR_ALIGNED (the lock-gated mode)");
-
     microphones = (float*)malloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
@@ -291,7 +304,7 @@ static int test_counting_model_policy(void) {
 
     for (int frame = 0; frame < total_frames; ++frame) {
         const float* beam;
-        int frames_in_hop = frame == 0 ? 0 : (frame == 1 ? 2 : 1);
+        int frames = frames_in_hop(frame);
         int scaled;
 
         if (frame == FRAMES) {
@@ -313,26 +326,37 @@ static int test_counting_model_policy(void) {
         memcpy(beam_hist + (size_t)frame * hop, beam,
                (size_t)hop * sizeof(float));
 
-        if (delay.changed) changed_count += 1;
-        scaled = delay.solid && delay.delay_samples >= 0;
-        if (scaled) locked_frames += 1;
-        /* Step-consistency (matches the mono variant): infer runs for EVERY
-         * emitted frame -- locked or not -- so the per-hop compute budget
-         * is constant and the runtime state stays continuous; the lock only
-         * gates whether its output is APPLIED (checked further below). */
-        expected_infer += frames_in_hop;
+        if (delay.changed) {
+            changed_count += 1;
+            reprime_armed = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
+        }
+        scaled = !m.fail;
+        if (delay.solid && delay.delay_samples >= 0) locked_frames += 1;
+        /* infer runs and applies for every emitted frame, locked or not --
+         * the ONLY exception being the identity-reprime frames after an
+         * alignment generation, which skip inference entirely (compute drops
+         * for those frames; it never doubles anywhere). */
+        {
+            int skipped_here = reprime_take(&reprime_armed, frames);
+            skipped_total += skipped_here;
+            expected_infer += frames - skipped_here;
+            prev_reprime = cur_reprime;
+            cur_reprime = skipped_here > 0;
+        }
         CHECK(m.infer_calls == expected_infer,
-              "infer stepped on every emitted frame (lock gates application only)");
+              "infer stepped on every emitted frame except the identity "
+              "reprime, independent of delay lock");
 
         /* Output relation: both contributing synthesis frames (hop p and
          * hop p-1) must have used the same per-frame gain for the emitted
          * hop to be a pure scaled copy; skip the blend frames. Once
-         * m.fail is set the expected gain is identity again. */
+         * m.fail is set the expected gain is identity again, and a reprime
+         * frame is an identity frame too, so hops either of whose two
+         * contributing frames was one are not comparable at a single gain. */
         if (frame >= 2) {
-            float expected_gain =
-                (scaled && !m.fail) ? m.scale : 1.0f;
+            float expected_gain = scaled ? m.scale : 1.0f;
             int comparable =
-                (scaled == prev_scaled) &&
+                (scaled == prev_scaled) && !cur_reprime && !prev_reprime &&
                 (frame < FRAMES || frame >= FRAMES + 2);
             if (comparable) {
                 float e = 0.0f;
@@ -342,7 +366,7 @@ static int test_counting_model_policy(void) {
                         beam_hist[(size_t)(frame - 1) * hop + i]);
                     if (d > e) e = d;
                 }
-                if (scaled && !m.fail) {
+                if (scaled) {
                     if (e > max_scaled_err) max_scaled_err = e;
                     scaled_checks += 1;
                 } else {
@@ -358,10 +382,15 @@ static int test_counting_model_policy(void) {
     CHECK(changed_count >= 1, "at least one delay change event fired");
     CHECK(m.reset_calls == changed_count,
           "model->reset fired exactly once per delay change");
+    CHECK(skipped_total ==
+              changed_count * AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES &&
+          skipped_total > 0,
+          "the identity reprime really ran: REPRIME skipped frames per "
+          "generation and no others");
     CHECK(scaled_checks > 10,
           "enough locked frames were compared in scaled mode");
     CHECK(max_scaled_err <= 2e-4f,
-          "locked frames carry the model's 0.5x output (infer wired in)");
+          "successful frames carry the model's 0.5x output (infer wired in)");
     CHECK(identity_checks >= FAIL_FRAMES - 2,
           "fail-open frames were compared");
     CHECK(max_identity_err <= 2e-4f,
@@ -396,8 +425,194 @@ static int test_counting_model_policy(void) {
     return 1;
 }
 
+/* FIXED does not have an estimator generation, but its aligned-reference
+ * seam still changes after the ring fills. Reset the external runtime at
+ * that boundary, and skip inference for exactly the straddling frames the
+ * identity reprime covers -- no more. */
+static int test_fixed_first_alignment_resets_model(void) {
+    enum { FIXED_DELAY = 2 * ULCNET_HOP, N = 8 };
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    AudioPipeline4ChUlcnet* p;
+    CountingModel m;
+    UlcnetModel model;
+    FourAecNrResDelayState delay;
+    float microphones[FOUR_AEC_NR_RES_CHANNELS * ULCNET_HOP] = {0};
+    float far[ULCNET_HOP] = {0};
+    float out[ULCNET_HOP];
+    int first_solid = -1;
+    int changed = 0;
+
+    cfg.core.delay_mode = AEC_DELAY_FIXED;
+    cfg.core.fixed_delay_samples = FIXED_DELAY;
+    p = audio_pipeline_4ch_ulcnet_create(&cfg);
+    CHECK(p != NULL, "create 4ch FIXED transition pipeline");
+    if (!p) return 0;
+
+    memset(&m, 0, sizeof(m));
+    m.scale = 1.0f;
+    memset(&model, 0, sizeof(model));
+    model.user = &m;
+    model.infer = counting_infer;
+    model.reset = counting_reset;
+    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
+          "install model for 4ch FIXED transition");
+
+    for (int frame = 0; frame < N; ++frame) {
+        CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
+                  p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
+              "4ch FIXED transition frame processes");
+        CHECK(audio_pipeline_4ch_ulcnet_last_delay(p, &delay) == 0,
+              "4ch FIXED transition exposes delay state");
+        if (delay.changed) changed++;
+        if (delay.solid && first_solid < 0) first_solid = frame;
+    }
+
+    CHECK(first_solid == 2,
+          "4ch FIXED reports aligned far on the same hop the ring can serve it");
+    CHECK(changed == 0,
+          "4ch FIXED has no estimator-generated changed event");
+    CHECK(m.reset_calls == 1,
+          "4ch wrapper resets model once at FIXED raw-to-aligned transition");
+    /* N hops emit N frames (0/2/1); exactly the straddling ones are skipped. */
+    CHECK(m.infer_calls == N - AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
+          "4ch FIXED transition suppresses inference for exactly the "
+          "straddling reprime frames and no others");
+    audio_pipeline_4ch_ulcnet_destroy(p);
+    return 1;
+}
+
 /* ============================================================================
- * 2b. Relock on the SAME delay must still reset the model (ALIGNED mode)
+ * 2c. FIXED pre-lock seam content: RAW far, byte for byte
+ *
+ * "UNLOCKED means the content is the RAW far" is the seam's central promise,
+ * and under FIXED the unlocked stretch is the whole ring fill -- up to half a
+ * second of audio at a realistic loudspeaker delay. Zero-filling it would
+ * hand the linear filters and any external far branch a silent reference for
+ * that entire window while the microphone already carries the echo.
+ *
+ * Checked byte-exactly on both sides of the switch and against
+ * INDEPENDENTLY maintained references (the caller's own far history), not
+ * against anything the pipeline produced:
+ *   - every pre-solid hop equals the RAW far hop of the SAME hop,
+ *   - the first solid hop onward equals the far hop delayed by exactly
+ *     fixed_delay_samples,
+ *   - the switch happens on hop ceil(fixed / hop) and nowhere else, and it
+ *     is whole-hop: the 320-sample case would splice raw and shifted audio
+ *     inside hop 1 under a per-sample rule and go red here.
+ * ========================================================================== */
+
+static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* core;
+    FourAecNrResPreFrame pre;
+    float* microphones;
+    float* far;
+    float* far_hist;
+    float* expected;
+    int hop;
+    int first_solid = -1;
+    int raw_hops = 0;
+    int aligned_hops = 0;
+    int changed = 0;
+    char label[192];
+
+    cfg.fft_size = 512;
+    cfg.enable_cng = 0;
+    cfg.delay_mode = AEC_DELAY_FIXED;
+    cfg.fixed_delay_samples = fixed_delay;
+    core = four_aec_nr_res_create(&cfg);
+    CHECK(core != NULL, "create FIXED seam core");
+    hop = four_aec_nr_res_hop_size(core);
+
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    far = (float*)malloc((size_t)hop * sizeof(float));
+    far_hist = (float*)calloc((size_t)frames * hop, sizeof(float));
+    expected = (float*)malloc((size_t)hop * sizeof(float));
+    CHECK(microphones && far && far_hist && expected,
+          "allocate FIXED seam buffers");
+
+    for (int frame = 0; frame < frames; ++frame) {
+        int64_t hop_start = (int64_t)frame * hop;
+        for (int i = 0; i < hop; ++i) {
+            float noise = 0.25f * frand();
+            far_hist[hop_start + i] = noise;
+            far[i] = noise;
+        }
+        memset(&pre, 0, sizeof(pre));
+        CHECK(four_aec_nr_res_process_pre(
+                  core, microphones, far, &pre) == FOUR_AEC_NR_RES_OK,
+              "FIXED seam hop processes");
+        CHECK(pre.aligned_ref != NULL, "FIXED seam exposes aligned_ref");
+        CHECK(pre.delay.delay_samples == fixed_delay,
+              "FIXED seam reports the configured delay on every hop");
+        if (pre.delay.changed) changed += 1;
+
+        if (!pre.delay.solid) {
+            /* Pre-lock: byte-equal to the raw far hop we just handed in. */
+            if (memcmp(pre.aligned_ref, far, (size_t)hop * sizeof(float))
+                != 0) {
+                snprintf(label, sizeof(label),
+                         "fixed=%d hop %d (pre-lock) serves the RAW far hop "
+                         "byte for byte", fixed_delay, frame);
+                CHECK(0, label);
+            }
+            raw_hops += 1;
+        } else {
+            if (first_solid < 0) first_solid = frame;
+            /* Locked: byte-equal to an independently delayed reference. */
+            for (int i = 0; i < hop; ++i) {
+                int64_t t = hop_start + i - fixed_delay;
+                expected[i] = t >= 0 ? far_hist[t] : 0.0f;
+            }
+            if (memcmp(pre.aligned_ref, expected,
+                       (size_t)hop * sizeof(float)) != 0) {
+                snprintf(label, sizeof(label),
+                         "fixed=%d hop %d (locked) serves the far delayed by "
+                         "exactly %d samples", fixed_delay, frame,
+                         fixed_delay);
+                CHECK(0, label);
+            }
+            aligned_hops += 1;
+        }
+        CHECK(four_aec_nr_res_abandon_pre(core, &pre.token) ==
+                  FOUR_AEC_NR_RES_OK,
+              "FIXED seam pre frame releases");
+    }
+
+    snprintf(label, sizeof(label),
+             "fixed=%d switches to the shifted far on hop %d (expected %d)",
+             fixed_delay, first_solid, expect_first_solid);
+    CHECK(first_solid == expect_first_solid, label);
+    snprintf(label, sizeof(label),
+             "fixed=%d covers both sides of the switch (%d raw hops, %d "
+             "aligned hops)", fixed_delay, raw_hops, aligned_hops);
+    CHECK(raw_hops == expect_first_solid && aligned_hops > 0, label);
+    CHECK(changed == 0, "FIXED never reports an alignment generation event");
+
+    free(expected);
+    free(far_hist);
+    free(far);
+    free(microphones);
+    four_aec_nr_res_destroy(core);
+    return 1;
+}
+
+static int test_fixed_prelock_seam_is_raw_far(void) {
+    g_rng = 0x5EED01u;
+    /* 8 hops of warm-up: the plain multiple-of-hop case. */
+    CHECK(fixed_seam_case(8 * ULCNET_HOP, 12, 8), "fixed=8 hops");
+    /* Not a multiple of the hop: a per-sample rule would splice raw and
+     * shifted audio inside hop 1. */
+    CHECK(fixed_seam_case(320, 8, 2), "fixed=320 samples");
+    /* 500 ms at 16 kHz -- the realistic loudspeaker-path case, and the one
+     * where zero-fill would have silenced half a second of reference. */
+    CHECK(fixed_seam_case(8000, 40, 32), "fixed=500 ms");
+    return 1;
+}
+
+/* ============================================================================
+ * 2b. Relock on the SAME delay must still reset the model
  *
  * The scenario the shared-delay `changed` flag exists for, in the one variant
  * a value-only comparison cannot see:
@@ -405,12 +620,10 @@ static int test_counting_model_policy(void) {
  *   LOCKED(applied delay 0) -> UNLOCKED for several hops -> LOCKED(applied
  *   delay 0 again, the very same value)
  *
- * ALIGNED mode gates APPLICATION on `solid` but keeps STEPPING infer() every
- * hop for a constant compute budget, so across the unlocked stretch the
- * runtime's recurrent state (attention K/V ring, logit history, GRU hidden)
- * is advanced over far frames the estimator has not vouched for. Unless the
- * relock hop reports `changed`, the wrapper never issues model->reset and the
- * first re-applied frame is computed from that contaminated state.
+ * The model keeps running across the unlocked stretch on the seam's raw far,
+ * so its recurrent state advances over a different delay regime. Unless the
+ * relock hop reports `changed`, the wrapper never resets that history before
+ * consuming the newly aligned far.
  *
  * The applied delay is deliberately pinned to 0 here. 0 is a legal applied
  * delay AND the value the core's accepted_delay holds when nothing has been
@@ -451,6 +664,8 @@ static int test_relock_same_delay_resets_model(void) {
     long reset_at_pipeline_reset = 0;
     int applied_after_relock = 0;
     int changed_events = 0;
+    long reset_before_hop = 0;
+    int resets_without_acceptance = 0;
 
     cfg.gsc_fixed_mode = 1;
     cfg.gsc_fixed_doa_rad = 0.3f;
@@ -469,10 +684,6 @@ static int test_relock_same_delay_resets_model(void) {
     model.reset = counting_reset;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install counting model");
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_ALIGNED) == 0,
-          "select ULCNET_FAR_ALIGNED (the lock-gated mode)");
-
     microphones = (float*)malloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
@@ -496,11 +707,29 @@ static int test_relock_same_delay_resets_model(void) {
         }
 
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
+        reset_before_hop = m.reset_calls;
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
               "relock frame processes");
         CHECK(audio_pipeline_4ch_ulcnet_last_delay(p, &delay) == 0,
               "delay-state accessor works");
+        /* A model reset flushes recurrent state against the applied delay,
+         * so it may only fire on a hop where an alignment generation was
+         * actually ACCEPTED -- never on a hop where the estimator is merely
+         * confident (confidence >= 1.0 is delay_aec3_is_solid()) but the
+         * wrapper's acceptance conditions are not all met yet. Recomputed
+         * from the seam's own estimator fields, so it is independent of the
+         * `solid`/`changed` flags being tested.
+         *
+         * MUTATION: adding a raw-confidence arm to this file's own
+         * raw->aligned reset gate in audio_pipeline_4ch_ulcnet.c -- e.g.
+         * `|| (p->frame_index != 0 && p->last_delay.confidence < 0.5f &&
+         * pre.delay.confidence >= 0.5f)` -- fires a reset on the first
+         * COARSE hop, long before anything is accepted, and this counter
+         * goes non-zero. */
+        if (m.reset_calls != reset_before_hop &&
+            !(delay.confidence >= 1.0f && delay.estimator_updates >= 3))
+            resets_without_acceptance += 1;
         if (delay.changed) changed_events += 1;
 
         if (frame < WARM_FRAMES) {
@@ -535,6 +764,9 @@ static int test_relock_same_delay_resets_model(void) {
         }
     }
 
+    CHECK(resets_without_acceptance == 0,
+          "no model->reset fires on a hop where the estimator is confident "
+          "but no alignment generation has been accepted");
     CHECK(acquire_frame >= 0, "phase A actually acquired the delay");
     CHECK(relock_frame >= 0, "phase B actually re-acquired the delay");
     CHECK(reset_before_relock == 1,
@@ -621,18 +853,24 @@ static int test_core_aligned_ref_and_abandon(void) {
 
         /* Byte-exact aligned-far check against our own far history: the
          * ring path is a pure copy, so equality is exact, on every frame
-         * and for whatever delay the estimator currently applies. */
+         * and for whatever delay the estimator currently applies. The
+         * shift is a WHOLE-hop decision -- until the samples already seen
+         * cover the applied delay the seam serves the RAW far hop -- so the
+         * expectation is chosen per hop, never per sample. */
         CHECK(pre.delay.delay_samples >= 0, "applied delay is non-negative");
-        for (int i = 0; i < hop; ++i) {
-            int64_t t = (int64_t)frame * hop + i;
-            float expected =
-                t >= (int64_t)pre.delay.delay_samples
+        {
+            int64_t hop_start = (int64_t)frame * hop;
+            int servable = hop_start >= (int64_t)pre.delay.delay_samples;
+            for (int i = 0; i < hop; ++i) {
+                int64_t t = hop_start + i;
+                float expected = servable
                     ? far_hist[t - pre.delay.delay_samples]
-                    : 0.0f;
-            if (pre.aligned_ref[i] != expected) {
-                CHECK(0, "aligned_ref content matches the delayed far");
+                    : far_hist[t];
+                if (pre.aligned_ref[i] != expected) {
+                    CHECK(0, "aligned_ref content matches the delayed far");
+                }
+                aligned_checked += 1;
             }
-            aligned_checked += 1;
         }
 
         if (pre.delay.solid && pre.delay.delay_samples > 0) locked = 1;
@@ -822,13 +1060,12 @@ static int test_pool_and_descriptor_gate(void) {
 }
 
 /* ============================================================================
- * 5. Far-timestamp (ULCNET_FAR_RAW default): the model's far branch must
+ * 5. Far-timestamp before acquisition: the model's far branch must
  *    carry the SAME input hop as its error branch. Far-passthrough model,
  *    silence on all mics, a single unit impulse in far at sample T. The
  *    expected output position is derived, not measured:
  *      + 0    applied delay (silent mics -> the shared delay never
- *             acquires; process_pre applies delay 0 -- and RAW mode feeds
- *             the caller's far directly anyway)
+ *             acquires; pre.aligned_ref therefore carries raw far)
  *      + 256  the wrapper's one-hop far-compensation buffer (far frames
  *             are delayed one hop to match the beam WOLA's one-hop lag)
  *      + 256  the centered ULCNet chain (hop #p output = chain input hop
@@ -852,7 +1089,7 @@ static int passthrough_far_infer(
     return 0;
 }
 
-static int test_far_timestamp_raw(void) {
+static int test_far_timestamp_before_acquisition(void) {
     enum { FRAMES = 40, IMP_FRAME = 8, IMP_OFF = 37 };
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* p;
@@ -881,9 +1118,6 @@ static int test_far_timestamp_raw(void) {
     model.infer = passthrough_far_infer;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install far-passthrough model");
-    /* far_input_mode stays the ULCNET_FAR_RAW default: applied without a
-     * delay lock (none ever happens on silent mics). */
-
     microphones = (float*)calloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
     far = (float*)calloc((size_t)hop, sizeof(float));
@@ -907,7 +1141,7 @@ static int test_far_timestamp_raw(void) {
             found_index = t;
         }
     }
-    printf("far timestamp (4ch RAW): impulse at far[%d] -> out[%d] "
+    printf("far timestamp (4ch before acquisition): impulse at far[%d] -> out[%d] "
            "(expected %d, offset %+d samples, peak %.4f)\n",
            imp_index, found_index, expect_index,
            found_index - expect_index, peak);
@@ -924,12 +1158,12 @@ static int test_far_timestamp_raw(void) {
 }
 
 /* ============================================================================
- * 6. RAW mode never gates application on the delay lock: the 0.5x model's
+ * 6. Production never gates application on the delay lock: the 0.5x model's
  *    output must appear from the FIRST emitted frame, while delay.solid is
  *    still 0 (the paper contract does not depend on lock).
  * ========================================================================== */
 
-static int test_raw_mode_applies_unlocked(void) {
+static int test_model_applies_unlocked(void) {
     enum { FRAMES = 60, TRUE_DELAY = 400 };
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* p;
@@ -942,6 +1176,9 @@ static int test_raw_mode_applies_unlocked(void) {
     float* far_hist;
     float* beam_hist;
     long expected_infer = 0;
+    int reprime_armed = 0;
+    int cur_reprime = 0;
+    int prev_reprime = 0;
     int unsolid_checks = 0;
     int first_solid_frame = -1;
     float max_err = 0.0f;
@@ -953,7 +1190,7 @@ static int test_raw_mode_applies_unlocked(void) {
     cfg.core.enable_cng = 0;
 
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
-    CHECK(p != NULL, "create RAW-mode pipeline");
+    CHECK(p != NULL, "create unlocked-model pipeline");
     hop = audio_pipeline_4ch_ulcnet_hop_size(p);
 
     memset(&m, 0, sizeof(m));
@@ -963,7 +1200,7 @@ static int test_raw_mode_applies_unlocked(void) {
     model.infer = counting_infer;
     model.reset = counting_reset;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
-          "install 0.5x model (RAW default mode)");
+          "install 0.5x model");
 
     microphones = (float*)malloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
@@ -972,31 +1209,42 @@ static int test_raw_mode_applies_unlocked(void) {
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
     beam_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
     CHECK(microphones && far && out && far_hist && beam_hist,
-          "allocate RAW-mode buffers");
+          "allocate unlocked-model buffers");
 
     for (int frame = 0; frame < FRAMES; ++frame) {
         const float* beam;
-        int frames_in_hop = frame == 0 ? 0 : (frame == 1 ? 2 : 1);
+        int frames = frames_in_hop(frame);
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
-              "RAW-mode frame processes");
+              "unlocked-model frame processes");
         CHECK(audio_pipeline_4ch_ulcnet_last_delay(p, &delay) == 0,
-              "RAW-mode delay accessor works");
+              "unlocked-model delay accessor works");
         if (first_solid_frame < 0 && delay.solid) first_solid_frame = frame;
 
         beam = audio_pipeline_4ch_ulcnet_last_beamformed_error(p);
         memcpy(beam_hist + (size_t)frame * hop, beam,
                (size_t)hop * sizeof(float));
 
-        expected_infer += frames_in_hop;
+        /* Stepped on every emitted frame except the identity-reprime frames
+         * armed at an alignment generation. */
+        if (delay.changed)
+            reprime_armed = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
+        {
+            int skipped_here = reprime_take(&reprime_armed, frames);
+            expected_infer += frames - skipped_here;
+            prev_reprime = cur_reprime;
+            cur_reprime = skipped_here > 0;
+        }
         CHECK(m.infer_calls == expected_infer,
-              "RAW mode also steps infer on every emitted frame");
+              "model steps infer on every emitted frame except the identity "
+              "reprime");
 
         /* Applied from the very first emitted frames: out[p] must be the
          * 0.5x-scaled beam stream on EVERY frame >= 2 (skip delay-change
-         * boundary frames where the beam itself is discontinuous). */
-        if (frame >= 2 && !delay.changed) {
+         * boundary frames where the beam itself is discontinuous, and the
+         * reprime frames, which are identity by policy). */
+        if (frame >= 2 && !delay.changed && !cur_reprime && !prev_reprime) {
             float e = 0.0f;
             for (int i = 0; i < hop; ++i) {
                 float d = fabsf(
@@ -1010,10 +1258,10 @@ static int test_raw_mode_applies_unlocked(void) {
     }
 
     CHECK(unsolid_checks > 5,
-          "RAW-mode application was verified on genuinely unlocked frames");
+          "model application was verified on genuinely unlocked frames");
     (void)first_solid_frame;
     CHECK(max_err <= 2e-4f,
-          "RAW mode applies the model from the first emitted frame "
+          "production applies the model from the first emitted frame "
           "(no delay-lock gating of application)");
 
     audio_pipeline_4ch_ulcnet_destroy(p);
@@ -1066,12 +1314,15 @@ static int test_nan_guard(void) {
     AudioPipeline4ChUlcnet* pb;
     NanModel m;
     UlcnetModel model;
+    FourAecNrResDelayState delay;
     float* microphones;
     float* far;
     float* out_a;
     float* out_b;
     float* far_hist;
     int poisoned[FRAMES];
+    int reprime_left = 0;
+    int n_reprime = 0;
     int n_equal = 0;
     int n_differ = 0;
     int hop;
@@ -1091,7 +1342,7 @@ static int test_nan_guard(void) {
     model.user = &m;
     model.infer = nan_infer;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(pa, &model) == 0,
-          "install NaN-poisoning model (RAW default mode)");
+          "install NaN-poisoning model");
 
     microphones = (float*)malloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
@@ -1116,6 +1367,22 @@ static int test_nan_guard(void) {
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   pb, microphones, far, 0, out_b) == FOUR_AEC_NR_RES_OK,
               "NaN-guard reference frame processes");
+
+        /* Both pipelines cross the same alignment generations, and an
+         * identity-reprime frame is an identity frame exactly like a
+         * discarded poisoned one -- fold it into the same schedule so the
+         * 50%-overlap rule below stays exact. The acquisition lands well
+         * inside the steady one-frame-per-hop region. */
+        CHECK(audio_pipeline_4ch_ulcnet_last_delay(pa, &delay) == 0,
+              "NaN-guard delay accessor works");
+        if (delay.changed)
+            reprime_left = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
+        /* One emitted frame per hop this far into the run, so a hop spends
+         * at most one frame of the budget. */
+        if (reprime_take(&reprime_left, 1) > 0) {
+            poisoned[frame] = 1;
+            n_reprime += 1;
+        }
 
         for (int i = 0; i < hop; ++i) {
             CHECK(isfinite(out_a[i]),
@@ -1152,6 +1419,8 @@ static int test_nan_guard(void) {
     }
     CHECK(n_equal >= 10 && n_differ >= 10,
           "NaN-guard coverage: both regimes actually compared");
+    CHECK(n_reprime % AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES == 0,
+          "NaN-guard: reprime frames accounted for in whole generations");
 
     audio_pipeline_4ch_ulcnet_destroy(pa);
     audio_pipeline_4ch_ulcnet_destroy(pb);
@@ -1206,12 +1475,15 @@ static int test_partial_write_guard(void) {
     AudioPipeline4ChUlcnet* pb;
     PartialModel m;
     UlcnetModel model;
+    FourAecNrResDelayState delay;
     float* microphones;
     float* far;
     float* out_a;
     float* out_b;
     float* far_hist;
     int partial[FRAMES];
+    int reprime_left = 0;
+    int n_reprime = 0;
     int n_equal = 0;
     int n_differ = 0;
     int hop;
@@ -1231,7 +1503,7 @@ static int test_partial_write_guard(void) {
     model.user = &m;
     model.infer = partial_write_infer;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(pa, &model) == 0,
-          "install partial-write model (RAW default mode)");
+          "install partial-write model");
 
     microphones = (float*)malloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
@@ -1256,6 +1528,17 @@ static int test_partial_write_guard(void) {
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   pb, microphones, far, 0, out_b) == FOUR_AEC_NR_RES_OK,
               "partial-write reference frame processes");
+
+        /* Same reprime bookkeeping as the NaN test: an identity-reprime
+         * frame is an identity frame exactly like a discarded partial one. */
+        CHECK(audio_pipeline_4ch_ulcnet_last_delay(pa, &delay) == 0,
+              "partial-write delay accessor works");
+        if (delay.changed)
+            reprime_left = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
+        if (reprime_take(&reprime_left, 1) > 0) {
+            partial[frame] = 1;
+            n_reprime += 1;
+        }
 
         for (int i = 0; i < hop; ++i) {
             CHECK(isfinite(out_a[i]),
@@ -1288,6 +1571,8 @@ static int test_partial_write_guard(void) {
     }
     CHECK(n_equal >= 10 && n_differ >= 10,
           "partial-write coverage: both regimes actually compared");
+    CHECK(n_reprime % AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES == 0,
+          "partial-write: reprime frames accounted for in whole generations");
 
     audio_pipeline_4ch_ulcnet_destroy(pa);
     audio_pipeline_4ch_ulcnet_destroy(pb);
@@ -1300,17 +1585,311 @@ static int test_partial_write_guard(void) {
 }
 
 /* ============================================================================
- * 9. Far-input mode switch lock: allowed only while no hop has been
- *    processed; rejected mid-stream (mode unchanged, verified via the
- *    getter); allowed again after reset.
+ * 9. Identity-reprime straddle DERIVATION (marker/timestamp test).
+ *
+ * Measures the quantity the reprime constant is supposed to be: how many
+ * frames emitted at or after an alignment boundary at hop T still have a
+ * PRE-boundary hop inside their 512-sample analysis window, on the error
+ * branch and on the far branch separately.
+ *
+ * Instrument: total silence except ONE unit impulse at the MIDDLE of input
+ * hop T-1 -- the last input hop that reaches the chain from the pre-boundary
+ * side. The middle is the position the sqrt-Hann window weights at 0.707 in
+ * BOTH frames covering the hop it lands in (a marker at a hop edge would be
+ * multiplied by the window's zero and hide itself). The branches are marked
+ * in SEPARATE runs: the error branch through the four mics (far kept silent,
+ * so the AEC lanes have no far history to leak and the fixed beamformer is
+ * time-invariant), the far branch through the reference.
+ *
+ * The count is derived from a CONTROL run with NO boundary at all (FIXED
+ * delay 0: the shared ring can serve from hop #0, so the wrapper never sees
+ * a raw->aligned transition and never arms a reprime -- asserted, not
+ * assumed). The reprime logic therefore takes no part in measuring its own
+ * length, and the measurement is pure framing/latency: which emitted frames
+ * still reach back across hop T. This also matters for the far branch: at a
+ * real boundary the wrapper CLEARS the saved far hop (and the beam OLA), so
+ * the boundary run itself could not see that slot's pre-switch content --
+ * clearing replaces what the straddling slot holds, it does not move the
+ * slot.
+ *
+ * Both branches come out at 2 here versus 1 for the mono wrapper, and for a
+ * measured reason: this wrapper pushes both branches one hop behind the
+ * input (beam WOLA lag + the matching one-hop far compensation), so the slot
+ * pushed at hop T still belongs to input hop T-1.
+ *
+ * The boundary run (FIXED delay = T hops, so the raw->aligned switch lands
+ * exactly on hop T) then checks the implementation: exactly REPRIME frames
+ * skipped, at hops T..T+REPRIME-1, and the first frame the model DOES see
+ * afterwards carries no pre-switch sample on either branch.
+ *
+ * MUTATION: dropping the reprime counter (stepping always) makes the first
+ * model-visible frame after the boundary a straddling one and the
+ * marker-free assertion goes red; arming it one frame too short does the
+ * same.
  * ========================================================================== */
 
-static int test_far_mode_switch_rejected_midstream(void) {
+enum {
+    RP_T        = 8,             /* boundary hop under test                */
+    RP_MARK_HOP = RP_T - 1,      /* last input hop before the boundary     */
+    RP_MARK_POS = ULCNET_HOP / 2,
+    RP_RUN      = 14,
+    RP_WINDOW   = 4,             /* hops examined from RP_T on             */
+    RP_MAXCALL  = 32
+};
+/* A windowed unit impulse reaches every bin at |w| = 0.707; what a
+ * marker-free frame can still carry (mic-HPF ring plus the fixed
+ * beamformer's own sinc tails on the error branch, plain zero on the far
+ * branch) is orders below. The margin is asserted, so this floor can never
+ * silently become a classifier of noise. */
+#define RP_FLOOR 0.05f
+
+typedef struct ProbeModel {
+    int   hop;                   /* current hop; set by the test           */
+    int   calls;
+    int   call_hop[RP_MAXCALL];
+    float err_peak[RP_MAXCALL];
+    float far_peak[RP_MAXCALL];
+    int   resets;
+    int   overflow;
+} ProbeModel;
+
+static float spec_peak(const float* re, const float* im) {
+    float m = 0.0f;
+    for (int k = 0; k < ULCNET_BINS; ++k) {
+        float a = fabsf(re[k]);
+        if (a > m) m = a;
+        a = fabsf(im[k]);
+        if (a > m) m = a;
+    }
+    return m;
+}
+
+static int probe_infer(
+    void* user,
+    const float* err_re, const float* err_im,
+    const float* far_re, const float* far_im,
+    float* out_re, float* out_im) {
+    ProbeModel* st = (ProbeModel*)user;
+    if (st->calls < RP_MAXCALL) {
+        st->call_hop[st->calls] = st->hop;
+        st->err_peak[st->calls] = spec_peak(err_re, err_im);
+        st->far_peak[st->calls] = spec_peak(far_re, far_im);
+        st->calls += 1;
+    } else {
+        st->overflow = 1;
+    }
+    memcpy(out_re, err_re, ULCNET_BINS * sizeof(float));
+    memcpy(out_im, err_im, ULCNET_BINS * sizeof(float));
+    return 0;
+}
+
+static void probe_reset(void* user) { ((ProbeModel*)user)->resets += 1; }
+
+/* One probe run. fixed_delay == 0 is the boundary-free control;
+ * fixed_delay == RP_T*ULCNET_HOP puts the FIXED raw->aligned switch on hop
+ * RP_T. mark_far selects which branch carries the impulse. */
+static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* p;
+    UlcnetModel model;
+    float microphones[FOUR_AEC_NR_RES_CHANNELS * ULCNET_HOP];
+    float far[ULCNET_HOP];
+    float out[ULCNET_HOP];
+
+    memset(st, 0, sizeof(*st));
+    /* Frozen fixed beamformer (mu 0 and vad_external 1 both freeze GSC
+     * adaptation) so the beam path is time-invariant and the marker cannot
+     * be smeared by an adapting filter. */
+    cfg.gsc_fixed_mode = 1;
+    cfg.gsc_fixed_doa_rad = 0.3f;
+    cfg.gsc_mu = 0.0f;
+    cfg.core.enable_cng = 0;
+    cfg.core.delay_mode = AEC_DELAY_FIXED;
+    cfg.core.fixed_delay_samples = fixed_delay;
+
+    p = audio_pipeline_4ch_ulcnet_create(&cfg);
+    if (!p) return 0;
+    memset(&model, 0, sizeof(model));
+    model.user = st;
+    model.infer = probe_infer;
+    model.reset = probe_reset;
+    if (audio_pipeline_4ch_ulcnet_set_model(p, &model) != 0) {
+        audio_pipeline_4ch_ulcnet_destroy(p);
+        return 0;
+    }
+
+    for (int frame = 0; frame < RP_RUN; ++frame) {
+        memset(microphones, 0, sizeof(microphones));
+        memset(far, 0, sizeof(far));
+        if (frame == RP_MARK_HOP) {
+            if (mark_far) {
+                far[RP_MARK_POS] = 1.0f;
+            } else {
+                for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+                    microphones[RP_MARK_POS * FOUR_AEC_NR_RES_CHANNELS + ch] =
+                        1.0f;
+            }
+        }
+        st->hop = frame;
+        if (audio_pipeline_4ch_ulcnet_process_with_activity(
+                p, microphones, far, 1, out) != FOUR_AEC_NR_RES_OK) {
+            audio_pipeline_4ch_ulcnet_destroy(p);
+            return 0;
+        }
+    }
+    audio_pipeline_4ch_ulcnet_destroy(p);
+    return 1;
+}
+
+/* Frames emitted at hops [RP_T, RP_T+RP_WINDOW) that still carry the marker,
+ * plus the classification margin (smallest marked peak / largest unmarked
+ * peak inside that window). */
+static int reprime_straddle_count(const ProbeModel* st, int far_branch,
+                                  float* dirty_min, float* clean_max) {
+    int n = 0;
+    *dirty_min = 1e30f;
+    *clean_max = 0.0f;
+    for (int c = 0; c < st->calls; ++c) {
+        float peak = far_branch ? st->far_peak[c] : st->err_peak[c];
+        if (st->call_hop[c] < RP_T || st->call_hop[c] >= RP_T + RP_WINDOW)
+            continue;
+        if (peak > RP_FLOOR) {
+            n += 1;
+            if (peak < *dirty_min) *dirty_min = peak;
+        } else if (peak > *clean_max) {
+            *clean_max = peak;
+        }
+    }
+    return n;
+}
+
+static int test_reprime_straddle_derivation(void) {
+    ProbeModel err_ctl, far_ctl, err_bnd, far_bnd;
+    float dmin, cmax;
+    int straddle_err, straddle_far;
+    int expected_frames = 0;
+    int first_visible_err = -1, first_visible_far = -1;
+    float first_visible_err_peak = -1.0f, first_visible_far_peak = -1.0f;
+    int stepped_inside_reprime = 0;
+
+    for (int frame = 0; frame < RP_RUN; ++frame)
+        expected_frames += frames_in_hop(frame);
+
+    CHECK(reprime_probe_run(0, 0, &err_ctl), "run error-branch control probe");
+    CHECK(reprime_probe_run(0, 1, &far_ctl), "run far-branch control probe");
+    CHECK(reprime_probe_run(RP_T * ULCNET_HOP, 0, &err_bnd),
+          "run error-branch boundary probe");
+    CHECK(reprime_probe_run(RP_T * ULCNET_HOP, 1, &far_bnd),
+          "run far-branch boundary probe");
+
+    /* The control runs really are boundary-free and reprime-free. */
+    CHECK(err_ctl.resets == 0 && far_ctl.resets == 0 &&
+          err_ctl.calls == expected_frames &&
+          far_ctl.calls == expected_frames &&
+          !err_ctl.overflow && !far_ctl.overflow,
+          "derivation control (FIXED delay 0) has no alignment boundary: no "
+          "model reset and every emitted frame stepped");
+
+    straddle_err = reprime_straddle_count(&err_ctl, 0, &dmin, &cmax);
+    printf("reprime derivation (4ch, ERROR branch): %d straddling frames at hops "
+           "%d..%d; marked peak >= %.4f, unmarked peak <= %.3e\n",
+           straddle_err, RP_T, RP_T + RP_WINDOW - 1, (double)dmin, (double)cmax);
+    CHECK(straddle_err == AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
+          "4ch ERROR branch: the emitted frames that still contain pre-switch "
+          "samples number exactly AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES");
+    CHECK(straddle_err > 0 && dmin > 20.0f * cmax && dmin > 0.2f,
+          "4ch ERROR branch marker is unambiguous (marked peak far above the "
+          "unmarked residue)");
+
+    straddle_far = reprime_straddle_count(&far_ctl, 1, &dmin, &cmax);
+    printf("reprime derivation (4ch, FAR branch):   %d straddling frames at hops "
+           "%d..%d; marked peak >= %.4f, unmarked peak <= %.3e\n",
+           straddle_far, RP_T, RP_T + RP_WINDOW - 1, (double)dmin, (double)cmax);
+    CHECK(straddle_far == AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
+          "4ch FAR branch: the emitted frames that still contain pre-switch "
+          "samples number exactly AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES");
+    CHECK(straddle_far > 0 && dmin > 20.0f * cmax && dmin > 0.2f,
+          "4ch FAR branch marker is unambiguous (marked peak far above the "
+          "unmarked residue)");
+
+    /* The boundary runs: the wrapper skips exactly those frames. */
+    CHECK(err_bnd.resets == 1 && far_bnd.resets == 1,
+          "boundary run: the FIXED raw->aligned switch fired model->reset once");
+
+    for (int c = 0; c < err_bnd.calls; ++c) {
+        if (err_bnd.call_hop[c] >= RP_T &&
+            err_bnd.call_hop[c] <
+                RP_T + AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES)
+            stepped_inside_reprime += 1;
+        if (err_bnd.call_hop[c] >= RP_T && first_visible_err < 0) {
+            first_visible_err = err_bnd.call_hop[c];
+            first_visible_err_peak = err_bnd.err_peak[c];
+        }
+    }
+    for (int c = 0; c < far_bnd.calls; ++c) {
+        if (far_bnd.call_hop[c] >= RP_T &&
+            far_bnd.call_hop[c] <
+                RP_T + AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES)
+            stepped_inside_reprime += 1;
+        if (far_bnd.call_hop[c] >= RP_T && first_visible_far < 0) {
+            first_visible_far = far_bnd.call_hop[c];
+            first_visible_far_peak = far_bnd.far_peak[c];
+        }
+    }
+    printf("reprime resume (4ch): first model-visible frame after the boundary is "
+           "hop %d; err peak %.3e, far peak %.3e (floor %.3f)\n",
+           first_visible_err, (double)first_visible_err_peak,
+           (double)first_visible_far_peak, (double)RP_FLOOR);
+    /* The primary claim, checked before the bookkeeping so a mutation cannot
+     * be masked by a count assertion firing first. */
+    CHECK(first_visible_err_peak >= 0.0f &&
+          first_visible_err_peak <= RP_FLOOR &&
+          first_visible_far_peak >= 0.0f &&
+          first_visible_far_peak <= RP_FLOOR,
+          "the first model-visible frame after the reprime contains NO "
+          "pre-switch sample on either branch");
+    CHECK(stepped_inside_reprime == 0,
+          "boundary run: the model is not stepped on any reprime hop");
+    CHECK(first_visible_err ==
+              RP_T + AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES &&
+          first_visible_far ==
+              RP_T + AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
+          "boundary run: stepping resumes exactly REPRIME frames after the "
+          "boundary hop");
+    CHECK(err_bnd.calls ==
+              expected_frames - AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES &&
+          far_bnd.calls ==
+              expected_frames - AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
+          "boundary run: exactly REPRIME emitted frames skipped inference");
+    return 1;
+}
+
+/* ============================================================================
+ * 10. Identity-reprime BEHAVIOUR: exactly REPRIME identity frames per
+ *     alignment generation, on both event shapes the wrapper recognises -- a
+ *     mid-stream delay change and the FIXED ring-fill completion. Per hop the
+ *     test predicts the infer delta from its OWN copy of the policy (arm
+ *     REPRIME at the boundary hop, consume one per emitted frame) and
+ *     compares against the counting model, so both a missing and an over-long
+ *     reprime fail. reset stays exactly one per generation.
+ * ========================================================================== */
+
+static int test_reprime_behavior(void) {
+    enum { FRAMES = 120, TRUE_DELAY = 400, FIXED_HOPS = 8 };
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    AudioPipeline4ChUlcnet* p;
+    CountingModel m;
+    UlcnetModel model;
+    FourAecNrResDelayState delay;
     float* microphones;
     float* far;
     float* out;
+    float* far_hist;
+    long changed_count = 0;
+    long skipped_total = 0;
+    int armed = 0;
+    int boundary_frame = -1;
+    int resumed_frame = -1;
     int hop;
 
     cfg.gsc_fixed_mode = 1;
@@ -1319,70 +1898,159 @@ static int test_far_mode_switch_rejected_midstream(void) {
     cfg.core.enable_cng = 0;
 
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
-    CHECK(p != NULL, "create mode-switch pipeline");
+    CHECK(p != NULL, "create reprime-behaviour pipeline");
     hop = audio_pipeline_4ch_ulcnet_hop_size(p);
 
-    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(NULL) == -1,
-          "far_input_mode getter returns -1 for NULL");
-    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_RAW,
-          "instances start in ULCNET_FAR_RAW");
+    memset(&m, 0, sizeof(m));
+    m.scale = 0.5f;
+    memset(&model, 0, sizeof(model));
+    model.user = &m;
+    model.infer = counting_infer;
+    model.reset = counting_reset;
+    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
+          "install counting model (reprime behaviour)");
 
-    /* Before any hop: switching (both directions) succeeds. */
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_ALIGNED) == 0,
-          "pre-stream switch to ALIGNED succeeds");
-    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_ALIGNED,
-          "getter reflects the pre-stream switch");
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_RAW) == 0,
-          "pre-stream switch back to RAW succeeds");
-
-    microphones = (float*)calloc(
-        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
-    far = (float*)calloc((size_t)hop, sizeof(float));
+    microphones = (float*)malloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
+    far = (float*)malloc((size_t)hop * sizeof(float));
     out = (float*)malloc((size_t)hop * sizeof(float));
-    CHECK(microphones && far && out, "allocate mode-switch buffers");
+    far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
+    CHECK(microphones && far && out && far_hist,
+          "allocate reprime-behaviour buffers");
 
-    CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
-              p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
-          "one hop processes before the mid-stream switch attempt");
+    g_rng = 0x1234567u;
+    for (int frame = 0; frame < FRAMES; ++frame) {
+        int frames = frames_in_hop(frame);
+        long calls_before = m.infer_calls;
+        int skipped_here;
+        long delta;
 
-    /* Mid-stream: rejected, mode unchanged. */
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_ALIGNED) != 0,
-          "mid-stream switch is rejected after one processed hop");
-    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_RAW,
-          "rejected mid-stream switch leaves the mode unchanged");
+        fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
+        CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
+                  p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
+              "reprime-behaviour frame processes");
+        CHECK(audio_pipeline_4ch_ulcnet_last_delay(p, &delay) == 0,
+              "reprime-behaviour delay accessor works");
 
-    /* Undefined values keep being rejected too (reject-first ordering). */
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, (UlcnetFarInputMode)99) != 0,
-          "undefined mode value still rejected mid-stream");
+        if (delay.changed) {
+            armed = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
+            changed_count += 1;
+            if (boundary_frame < 0) boundary_frame = frame;
+        }
+        skipped_here = reprime_take(&armed, frames);
+        skipped_total += skipped_here;
+        delta = m.infer_calls - calls_before;
+        CHECK(delta == frames - skipped_here,
+              "infer is stepped once per emitted frame except during the "
+              "identity reprime");
+        if (boundary_frame >= 0 && resumed_frame < 0 && delta > 0 &&
+            frame > boundary_frame)
+            resumed_frame = frame;
+    }
 
-    /* After reset (frame_index back to 0) switching is allowed again. */
-    audio_pipeline_4ch_ulcnet_reset(p);
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_ALIGNED) == 0,
-          "switch succeeds again after reset");
-    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_ALIGNED,
-          "getter reflects the post-reset switch");
-
-    /* NOTE: no post-destroy getter probe here -- this is a create() (heap)
-     * instance, so destroy() frees the memory containing `p` itself; the
-     * destroyed-accessor contract is covered on the caller-pool instance
-     * in test 4. */
+    CHECK(changed_count >= 1,
+          "reprime behaviour: the run really crossed an alignment generation");
+    CHECK(skipped_total ==
+              changed_count * AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
+          "reprime behaviour: REPRIME frames skipped per generation and no "
+          "others -- compute DROPS on those frames, it never doubles");
+    CHECK(resumed_frame ==
+              boundary_frame + AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
+          "reprime behaviour: stepping stops on the boundary hop and resumes "
+          "REPRIME frames later");
+    CHECK(m.reset_calls == changed_count,
+          "reprime behaviour: still exactly one model->reset per generation");
     audio_pipeline_4ch_ulcnet_destroy(p);
+    free(far_hist);
     free(out);
     free(far);
     free(microphones);
+
+    /* ---- FIXED ring-fill completion ---- */
+    {
+        AudioPipeline4ChConfig fcfg =
+            audio_pipeline_4ch_ulcnet_default_config();
+        AudioPipeline4ChUlcnet* fp;
+        CountingModel fm;
+        UlcnetModel fmodel;
+        float mics[FOUR_AEC_NR_RES_CHANNELS * ULCNET_HOP];
+        float ffar[ULCNET_HOP];
+        float fout[ULCNET_HOP];
+        int fixed_boundary = -1;
+        int calls_at_boundary = -1;
+        int calls_after_reprime = -1;
+        long fskipped = 0;
+        int farmed = 0;
+
+        fcfg.core.delay_mode = AEC_DELAY_FIXED;
+        fcfg.core.fixed_delay_samples = FIXED_HOPS * ULCNET_HOP;
+        fcfg.core.enable_cng = 0;
+        fp = audio_pipeline_4ch_ulcnet_create(&fcfg);
+        CHECK(fp != NULL, "create FIXED reprime-behaviour pipeline");
+        memset(&fm, 0, sizeof(fm));
+        fm.scale = 1.0f;
+        memset(&fmodel, 0, sizeof(fmodel));
+        fmodel.user = &fm;
+        fmodel.infer = counting_infer;
+        fmodel.reset = counting_reset;
+        CHECK(audio_pipeline_4ch_ulcnet_set_model(fp, &fmodel) == 0,
+              "install counting model (FIXED reprime behaviour)");
+
+        memset(mics, 0, sizeof(mics));
+        for (int frame = 0; frame < 20; ++frame) {
+            FourAecNrResDelayState fdelay;
+            int frames = frames_in_hop(frame);
+            long calls_before = fm.infer_calls;
+            int solid_before;
+            int skipped_here;
+            long delta;
+
+            CHECK(audio_pipeline_4ch_ulcnet_last_delay(fp, &fdelay) == 0,
+                  "FIXED reprime: delay accessor works before the hop");
+            solid_before = fdelay.solid;
+            for (int i = 0; i < ULCNET_HOP; ++i) ffar[i] = 0.25f * frand();
+            CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
+                      fp, mics, ffar, 0, fout) == FOUR_AEC_NR_RES_OK,
+                  "FIXED reprime frame processes");
+            CHECK(audio_pipeline_4ch_ulcnet_last_delay(fp, &fdelay) == 0,
+                  "FIXED reprime: delay accessor works after the hop");
+            if (frame != 0 && !solid_before && fdelay.solid) {
+                farmed = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
+                fixed_boundary = frame;
+            }
+            skipped_here = reprime_take(&farmed, frames);
+            fskipped += skipped_here;
+            delta = fm.infer_calls - calls_before;
+            CHECK(delta == frames - skipped_here,
+                  "FIXED reprime: infer stepped once per emitted frame except "
+                  "during the reprime");
+            if (fixed_boundary >= 0 && frame == fixed_boundary)
+                calls_at_boundary = (int)delta;
+            if (fixed_boundary >= 0 &&
+                frame == fixed_boundary +
+                             AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES)
+                calls_after_reprime = (int)delta;
+        }
+
+        CHECK(fixed_boundary == FIXED_HOPS,
+              "FIXED reprime: the raw->aligned switch is on the expected hop");
+        CHECK(fskipped == AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
+              "FIXED reprime: exactly REPRIME frames skipped at the fill "
+              "completion");
+        CHECK(calls_at_boundary == 0 && calls_after_reprime == 1,
+              "FIXED reprime: the boundary hop steps the model 0 times and "
+              "stepping is back to one per frame after the reprime");
+        CHECK(fm.reset_calls == 1,
+              "FIXED reprime: exactly one model->reset");
+        audio_pipeline_4ch_ulcnet_destroy(fp);
+    }
     return 1;
 }
 
 /* ============================================================================
- * 11. Far-input contract gate: a model that publishes a model-I/O
- * descriptor may only be installed on a pipeline whose far branch matches
- * the checkpoint the descriptor describes. This wrapper takes its mode and
- * its model through setters, so both of them carry the gate.
+ * 11. Fixed deployment contract: production accepts only the aligned-far
+ * descriptor. The raw enumerator remains useful for negative ABI tests and
+ * the offline sweep, but there is no runtime far-mode setter.
  * ========================================================================== */
 static int gate_infer_identity(
     void* user,
@@ -1395,7 +2063,7 @@ static int gate_infer_identity(
     return 0;
 }
 
-static int test_far_mode_descriptor_gate(void) {
+static int test_aligned_descriptor_gate(void) {
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* p;
     UlcnetModelIoDescriptor raw_desc;
@@ -1406,10 +2074,10 @@ static int test_far_mode_descriptor_gate(void) {
 
     CHECK(ulcnet_model_io_descriptor_default(8, &raw_desc) == 0 &&
           ulcnet_model_io_descriptor_default(8, &aligned_desc) == 0,
-          "build the two model-I/O descriptors");
-    aligned_desc.far_input_mode = ULCNET_FAR_ALIGNED;
-    CHECK(raw_desc.far_input_mode == ULCNET_FAR_RAW,
-          "descriptor_default publishes ULCNET_FAR_RAW");
+          "build model-I/O descriptors");
+    raw_desc.far_input_mode = ULCNET_FAR_RAW;
+    CHECK(aligned_desc.far_input_mode == ULCNET_FAR_ALIGNED,
+          "descriptor_default publishes fixed aligned far");
 
     memset(&undescribed_model, 0, sizeof(undescribed_model));
     undescribed_model.infer = gate_infer_identity;
@@ -1423,51 +2091,18 @@ static int test_far_mode_descriptor_gate(void) {
     cfg.gsc_mu = 0.02f;
     cfg.core.enable_cng = 0;
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
-    CHECK(p != NULL, "create far-mode gate pipeline");
-    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_RAW,
-          "instances start in ULCNET_FAR_RAW");
+    CHECK(p != NULL, "create aligned-descriptor gate pipeline");
 
     /* Baseline: an undescribed model publishes no contract, so the
      * rejections below cannot be passing for want of a model. */
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &undescribed_model) == 0,
-          "a model with io_descriptor == NULL installs in RAW mode");
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_ALIGNED) == 0,
-          "...and does not gate a switch to ALIGNED either");
+          "a model with io_descriptor == NULL remains supported");
 
-    /* set_model(): the pipeline is in ALIGNED, so only the ALIGNED
-     * checkpoint may be installed. A rejection leaves the previous model. */
+    /* Production accepts only an aligned-far descriptor. */
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &raw_model) != 0,
-          "RAW descriptor is rejected by an ALIGNED pipeline");
+          "raw descriptor is rejected");
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &aligned_model) == 0,
-          "ALIGNED descriptor is accepted by an ALIGNED pipeline");
-
-    /* set_far_input_mode(): with an ALIGNED graph descriptor installed, the
-     * reverse move is refused and the mode is left untouched. */
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_RAW) != 0,
-          "switching to RAW is rejected while an ALIGNED graph is installed");
-    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_ALIGNED,
-          "the rejected switch left the mode unchanged");
-
-    /* The reverse pairing, on a fresh instance: RAW pipeline + ALIGNED
-     * checkpoint is refused, RAW + RAW installs, and the mode may then not
-     * be moved to ALIGNED underneath the RAW graph descriptor. */
-    audio_pipeline_4ch_ulcnet_destroy(p);
-    p = audio_pipeline_4ch_ulcnet_create(&cfg);
-    CHECK(p != NULL, "create the reverse-direction gate pipeline");
-    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &aligned_model) != 0,
-          "ALIGNED descriptor is rejected by a RAW pipeline");
-    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &raw_model) == 0,
-          "RAW descriptor is accepted by a RAW pipeline");
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_ALIGNED) != 0,
-          "switching to ALIGNED is rejected while a RAW graph is installed");
-    CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_RAW,
-          "the rejected switch left the mode unchanged");
-    CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
-              p, ULCNET_FAR_RAW) == 0,
-          "re-selecting the matching mode still succeeds");
+          "aligned descriptor is accepted");
 
     audio_pipeline_4ch_ulcnet_destroy(p);
     return 1;
@@ -1510,25 +2145,31 @@ static int run_all_tests(void) {
     CHECK(test_identity_e2e(),
           "identity E2E / 2-hop timing contract");
     CHECK(test_counting_model_policy(),
-          "counting model policy (stepping, lock gating, resets, fail-open)");
+          "counting model policy (stepping, resets, fail-open)");
+    CHECK(test_fixed_first_alignment_resets_model(),
+          "FIXED first aligned far resets the model without gating inference");
+    CHECK(test_fixed_prelock_seam_is_raw_far(),
+          "FIXED pre-lock seam serves the raw far byte for byte");
     CHECK(test_relock_same_delay_resets_model(),
           "relock on the same delay still resets the model (ALIGNED)");
     CHECK(test_core_aligned_ref_and_abandon(),
           "core PreFrame aligned_ref + abandon protocol");
     CHECK(test_pool_and_descriptor_gate(),
           "pool rejection / descriptor gate / destroy idempotence");
-    CHECK(test_far_timestamp_raw(),
-          "far timestamp: err/far frame pairs are same-hop (RAW mode)");
-    CHECK(test_raw_mode_applies_unlocked(),
-          "RAW mode applies without a delay lock");
+    CHECK(test_far_timestamp_before_acquisition(),
+          "far timestamp: err/far frame pairs are same-hop before acquisition");
+    CHECK(test_model_applies_unlocked(),
+          "model applies without a delay lock");
     CHECK(test_nan_guard(),
           "NaN guard: non-finite model output never reaches the WOLA");
     CHECK(test_partial_write_guard(),
           "full-write contract: partial rc==0 frames are discarded");
-    CHECK(test_far_mode_switch_rejected_midstream(),
-          "far-input mode switch is locked once streaming has started");
-    CHECK(test_far_mode_descriptor_gate(),
-          "far-input contract gate: descriptor and pipeline mode must agree");
+    CHECK(test_reprime_straddle_derivation(),
+          "identity-reprime length derived from the straddling frames");
+    CHECK(test_reprime_behavior(),
+          "identity reprime: exactly REPRIME identity frames per generation");
+    CHECK(test_aligned_descriptor_gate(),
+          "production accepts only aligned-far descriptors");
     printf("All audio_pipeline_4ch_ulcnet tests passed\n");
     return 1;
 }

@@ -141,7 +141,7 @@ int ulcnet_model_io_descriptor_default(int delay_depth,
     descriptor->score_history_frames = ULCNET_MODEL_IO_SCORE_HISTORY;
     descriptor->gru_layers = ULCNET_MODEL_IO_GRU_LAYERS;
     descriptor->gru_hidden = ULCNET_MODEL_IO_GRU_HIDDEN;
-    descriptor->far_input_mode = ULCNET_FAR_RAW;
+    descriptor->far_input_mode = ULCNET_FAR_ALIGNED;
     return 0;
 }
 
@@ -170,8 +170,7 @@ int ulcnet_model_io_descriptor_validate(
         descriptor->score_history_frames != ULCNET_MODEL_IO_SCORE_HISTORY ||
         descriptor->gru_layers != ULCNET_MODEL_IO_GRU_LAYERS ||
         descriptor->gru_hidden != ULCNET_MODEL_IO_GRU_HIDDEN ||
-        (descriptor->far_input_mode != ULCNET_FAR_RAW &&
-         descriptor->far_input_mode != ULCNET_FAR_ALIGNED)) {
+        descriptor->far_input_mode != ULCNET_FAR_ALIGNED) {
         return -1;
     }
     return 0;

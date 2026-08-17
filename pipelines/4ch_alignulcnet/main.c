@@ -156,6 +156,7 @@ int main(int argc, char** argv) {
     AudioPipeline4ChConfig cfg;
     DelayProfile profile;
     UlcnetAcceleratorAdapter *adapter;
+    UlcnetModelIoDescriptor model_descriptor;
     AudioPipeline4ChUlcnet *pipeline;
     UlcnetModel model;
     void *adapter_pool = NULL;
@@ -168,12 +169,6 @@ int main(int argc, char** argv) {
     int hop;
     int index;
     int rc;
-    /* A product reads this from the deployed graph's ONNX metadata
-     * ('far_input_mode', whose strings ulcnet_far_input_mode_name() mirrors)
-     * instead of hard-coding it; every currently exported graph records
-     * raw_far (explicit ALIGNED export override pending). */
-    const int deployed_far_input_mode = ULCNET_FAR_RAW;
-
     rc = parse_delay_profile(argc, argv, &profile);
     if (rc != 0) return rc == 1 ? 0 : rc;
 
@@ -198,13 +193,16 @@ int main(int argc, char** argv) {
            profile.fixed_samples, (unsigned long long)req.bytes,
            (unsigned long)req.alignment);
 
-    if (ulcnet_accelerator_adapter_get_mem_size(
-            8, &adapter_bytes, &adapter_alignment) != 0 ||
+    /* The board normally loads this descriptor from the exported model
+     * metadata. D=8 is only this standalone smoke example's model choice. */
+    if (ulcnet_model_io_descriptor_default(8, &model_descriptor) != 0 ||
+        ulcnet_accelerator_adapter_get_mem_size(
+            &model_descriptor, &adapter_bytes, &adapter_alignment) != 0 ||
         posix_memalign(&adapter_pool, adapter_alignment, adapter_bytes) != 0) {
         return 1;
     }
     adapter = ulcnet_accelerator_adapter_init(
-        adapter_pool, adapter_bytes, 8, deployed_far_input_mode,
+        adapter_pool, adapter_bytes, &model_descriptor,
         run_accelerator, NULL);
     pipeline = audio_pipeline_4ch_ulcnet_create(&cfg);
     if (!adapter || !pipeline) {
@@ -214,19 +212,8 @@ int main(int argc, char** argv) {
     }
 
     model = ulcnet_accelerator_adapter_model(adapter);
-    if (audio_pipeline_4ch_ulcnet_set_model(pipeline, &model) != 0 ||
-        audio_pipeline_4ch_ulcnet_set_far_input_mode(
-            pipeline, ULCNET_FAR_RAW) != 0) {
-        /* The pipeline TU has no stdio, so the far-contract disagreement it
-         * rejects is named here, where both values are in hand. */
-        fprintf(stderr,
-                "4ch_alignulcnet: model/far-mode install failed "
-                "(pipeline far_input_mode=%s, descriptor far_input_mode=%s)\n",
-                ulcnet_far_input_mode_name(
-                    audio_pipeline_4ch_ulcnet_far_input_mode(pipeline)),
-                ulcnet_far_input_mode_name(
-                    model.io_descriptor ? model.io_descriptor->far_input_mode
-                                        : -1));
+    if (audio_pipeline_4ch_ulcnet_set_model(pipeline, &model) != 0) {
+        fprintf(stderr, "4ch_alignulcnet: model install failed\n");
         audio_pipeline_4ch_ulcnet_destroy(pipeline);
         free(adapter_pool);
         return 1;

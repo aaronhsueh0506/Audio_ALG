@@ -277,13 +277,13 @@ class GlobalDelayAttentionCell:
         self.key_ring = DelayRingCell(attention.max_delay_frames)
         self.value_ring = DelayRingCell(attention.max_delay_frames)
         self._score_sum: Optional[Tensor] = None
-        self.frame_index = 0
+        self.frame_index: Optional[Tensor] = None
 
     def reset(self) -> None:
         self.key_ring.reset()
         self.value_ring.reset()
         self._score_sum = None
-        self.frame_index = 0
+        self.frame_index = None
 
     def step(self, mic: Tensor, far: Tensor) -> Tuple[Tensor, Tensor]:
         att = self.attention
@@ -295,6 +295,9 @@ class GlobalDelayAttentionCell:
         k_delayed = self.key_ring.step(k.unsqueeze(-1))[:, :, 0, :, 0]  # [B,P,D]
         scores = (q.unsqueeze(-1) * k_delayed).sum(dim=1)               # [B,D]
         delay = torch.arange(att.max_delay_frames, device=mic.device)
+        if self.frame_index is None:
+            self.frame_index = torch.zeros((), dtype=torch.long,
+                                           device=mic.device)
         valid = (self.frame_index >= delay).to(scores.dtype)
         if self._score_sum is None:
             self._score_sum = torch.zeros_like(scores)
@@ -302,7 +305,7 @@ class GlobalDelayAttentionCell:
         distribution = torch.softmax(self._score_sum, dim=-1)
         v_delayed = self.value_ring.step(far[:, :, 0])                  # [B,C,1,D,F]
         aligned = (v_delayed * distribution[:, None, None, :, None]).sum(dim=3)
-        self.frame_index += 1
+        self.frame_index = self.frame_index + 1
         return aligned, distribution
 
     def state_tensors(self) -> Dict[str, Tensor]:
@@ -312,6 +315,8 @@ class GlobalDelayAttentionCell:
                 out[f"{prefix}_{name}"] = tensor
         if self._score_sum is not None:
             out["score_sum"] = self._score_sum
+        if self.frame_index is not None:
+            out["frame_index"] = self.frame_index
         return out
 
 

@@ -87,18 +87,16 @@ int main(void) {
     ++invalid.ta_bins;
     CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
 
-    /* far_input_mode: the deployed graph's contract carried in the
-     * descriptor. Defaults to RAW (what every currently exported graph
-     * records), accepts ALIGNED, rejects anything else. */
-    CHECK(d4.far_input_mode == ULCNET_FAR_RAW);
-    CHECK(d8.far_input_mode == ULCNET_FAR_RAW);
-    CHECK(d64.far_input_mode == ULCNET_FAR_RAW);
+    /* Production descriptors are fixed to aligned far. */
+    CHECK(d4.far_input_mode == ULCNET_FAR_ALIGNED);
+    CHECK(d8.far_input_mode == ULCNET_FAR_ALIGNED);
+    CHECK(d64.far_input_mode == ULCNET_FAR_ALIGNED);
     invalid = d8;
-    invalid.far_input_mode = ULCNET_FAR_ALIGNED;
-    CHECK(ulcnet_model_io_descriptor_validate(&invalid) == 0);
+    invalid.far_input_mode = ULCNET_FAR_RAW;
+    CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
     /* The mode does not change the state size -- it selects which far
      * stream the caller feeds, not how much history is stored. */
-    CHECK(ulcnet_model_io_get_mem_requirements(&invalid, &r8b) == 0);
+    CHECK(ulcnet_model_io_get_mem_requirements(&d8, &r8b) == 0);
     CHECK(r8b.bytes == r8.bytes);
     invalid.far_input_mode = 2;
     CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);

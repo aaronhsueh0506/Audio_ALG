@@ -550,12 +550,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--far-input-mode', choices=('raw_far', 'aligned_far'),
         default='raw_far',
-        help='Far stream presented to the NN. raw_far is the release '
-             'deployment mode and what the current weights were trained on. '
-             'aligned_far is the sweep-validated alternative profile (kept '
-             'here as a sweep/experiment capability; enabling it on a board '
-             'waits on the exporter recording it): it taps the far hop '
-             'actually consumed by PBFDKF and writes aec_alignment.csv; '
+        help='Diagnostic far stream presented to the NN. raw_far reproduces '
+             'the checkpoint training provenance; aligned_far reproduces '
+             'the fixed production seam and taps the far hop actually '
+             'consumed by PBFDKF. This switch exists only in the sweep tool; '
+             'the production exporter and C pipelines always use aligned_far. '
+             'Both modes write aec_alignment.csv; '
              'with --input-is-linear-error, the supplied far WAV is assumed '
              'to be already aligned and no AEC delay trace is available.',
     )
@@ -674,10 +674,8 @@ def main(args: argparse.Namespace) -> None:
         if args.far_input_mode == 'aligned_far':
             print("aligned_far evaluation: treating the supplied far WAV as "
                   "already aligned (no PBFDKF tap is available in bypass mode)")
-            print("NOTE: aligned_far is an accepted deployment profile for "
-                  "the current raw-far-trained weights; exported graphs "
-                  "still record raw_far until the exporter's explicit "
-                  "far-mode override lands")
+            print("NOTE: production uses aligned_far; this bypass cannot "
+                  "verify the supplied WAV's alignment")
         if args.max_seconds is not None:
             limit = min(
                 error.shape[-1], max(1, int(round(args.max_seconds * grid.sr)))
@@ -720,10 +718,8 @@ def main(args: argparse.Namespace) -> None:
             ).unsqueeze(0).contiguous()
             print("aligned_far evaluation: using the post-delay-buffer far "
                   "samples actually consumed by PBFDKF")
-            print("NOTE: aligned_far is an accepted deployment profile for "
-                  "the current raw-far-trained weights; exported graphs "
-                  "still record raw_far until the exporter's explicit "
-                  "far-mode override lands")
+            print("NOTE: this is the production far seam; raw_far remains "
+                  "available here only as a diagnostic reference")
     if source_rates != (grid.sr, grid.sr):
         print(f"resampled primary/far {source_rates[0]}/{source_rates[1]} -> "
               f"{grid.sr} Hz")

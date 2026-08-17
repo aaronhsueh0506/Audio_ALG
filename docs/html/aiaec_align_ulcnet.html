@@ -47,18 +47,28 @@ GRU、FC + sigmoid + PReLU、stage-2 CNN complex mask。所有 recurrent state �
 tensor，由 CPU/DSP caller-owned pool 逐次傳入/傳回；加速器本身無隱藏 state。graph <b>外</b>（C 前後處理）= PBFDKF linear AEC 與
 delay 對齊（AEC C 端 seam）、centered sqrt-Hann STFT/ISTFT 與 complex↔RI 轉換
 （C 實作 <code>ulcnet_process.c</code>；Python reference <code>StreamSTFT/StreamISTFT</code>）。</p>
-<div class="note"><b>far_input_mode 契約</b>：checkpoint contract 記錄
-<code>far_input_mode</code>；欄位缺失（legacy）預設 <code>raw_far</code> 並由
-<code>load_model</code> 印出；未知值在載入權重<b>前</b>即 <code>ValueError</code>
-（test：<code>test_load_model_far_input_mode_default_present_and_rejected</code>）。release 部署固定 RAW_FAR；ALIGNED_FAR 經 deployment sweep 驗證（與 RAW 無顯著差異），保留為 sweep/實驗功能。這是明確的 export/init profile，不是每 hop 熱切換。同一個值由
-<code>export_streaming_onnx.py</code> 寫進 ONNX/JSON metadata（<code>far_input_mode</code>
-字串 + <code>far_input_mode_c_value</code>），C 端 <code>UlcnetModelIoDescriptor.far_input_mode</code>
-與兩個 ULCNet pipeline（mono/4ch）各自的 <code>far_input_mode</code> config 欄位用同一份
-<code>ulcnet_far_input_mode_agrees()</code> 做三方比對，metadata/descriptor/pipeline
-三者不合即在 pipeline init 或 <code>set_model()</code> 時 reject。目前 exporter
-只從 checkpoint contract 繼承 far mode；generated C descriptor 待補（far
-mode 固定記錄 RAW），明確 ALIGNED override 延後到決定啟用 ALIGNED 時——詳見
-<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>「far_input_mode 部署契約」節。</div>
+<div class="note"><b>far branch 契約</b>：checkpoint contract 的
+<code>far_input_mode</code> 只記錄訓練 provenance（legacy 預設
+<code>raw_far</code>）。production 固定使用 AEC aligned-far seam；未取得
+alignment 時 seam 暫時承載 raw far，模型仍執行，取得後切成 aligned far 並
+reset recurrent state。<code>export_streaming_onnx.py</code> 因此分開寫
+<code>training_far_input_mode</code> 與部署用
+<code>far_input_mode=aligned_far</code>。C descriptor 只接受 ALIGNED；production
+pipeline 沒有 runtime far-mode setter。raw/aligned 比較僅保留在 sweep 工具。</div>
+<div class="note"><b>PTQ calibration</b>：可直接使用訓練域的
+<code>linear_error + raw_far</code>；calibration report 會將
+<code>calibration_far_input_mode=raw_far</code> 與 production
+<code>deployment_far_input_mode=aligned_far</code> 分開記錄。D 不改權重，
+但會改 K/V history shape 與 host RAM，因此 calibration 的 D 必須和該份
+ONNX export 相同。</div>
+<div class="note"><b>既有匯出必須全部重跑</b>：model-I/O layout v2 → v3，
+deployed far branch RAW → ALIGNED，因此此前產出的每一份 ONNX/JSON descriptor
+在 <code>ulcnet_model_io_descriptor_validate()</code> 會同時卡住兩個欄位
+（<code>layout_version</code> 與 <code>far_input_mode</code>），
+<code>ulcnet_accelerator_adapter_init()</code> 回 NULL。修法只有「重新
+export graph」一項：checkpoint 與 dataset <b>不需要</b>重新訓練或重新生成，
+權重未變，exporter 會把 checkpoint 原本的 training
+<code>far_input_mode</code> 與固定的 aligned-far deployment 值分開寫入。</div>
 
 <h2>API 用法</h2>
 <pre>from AIAEC.Align_ULCNet.denoise import load_model
@@ -80,8 +90,11 @@ for s in range(0, n, grid.hop_len):                       # 每 hop 256 samples
 <code>stream_forward_spec</code>，與逐幀 <code>forward_stream</code> bit-identical——test：
 <code>test_denoise_stream_path_equals_direct_forward_stream</code>）。<b>D 覆寫</b>
 （<code>--max-delay-frames</code>，denoise.py 與 streaming.py 皆有）：checkpoint contract
-仍是 source of truth；權重 D-agnostic（D=64 checkpoint 可 strict-load 進 D=8），
-但輸出跨 D <b>不</b>數值相同（fixture 實測 enhanced max-abs 差 8.9e-6）。</p>
+記錄的是訓練時的 D（training provenance）；權重 D-agnostic（D=64 checkpoint 可
+strict-load 進 D=8），但輸出跨 D <b>不</b>數值相同（fixture 實測 enhanced max-abs
+差 8.9e-6）。<b>部署閘不是 checkpoint contract 而是 graph descriptor</b>：板端
+比對的是 ONNX metadata／calibration report／C <code>UlcnetModelIoDescriptor</code>
+三方的 D 與 <code>state_layout_version</code>，訓練 D 與部署 D 不同不構成拒絕理由。</p>
 
 <h2>Block diagram</h2>
 <pre>mic ────────┐                          far ──────────────┐
@@ -180,9 +193,9 @@ double twiddles），非 bit-exact（<code>test_ulcnet_process_c.py</code> 檔�
 <li><code>AIAEC/Align_ULCNet/model.py</code>（<code>AlignULCNet</code>：forward / create_stream_state / forward_stream）</li>
 <li><code>AIAEC/Align_ULCNet/streaming.py</code>、<code>denoise.py</code>（<code>--stream</code> / <code>--max-delay-frames</code> / <code>--input-is-linear-error</code>）</li>
 <li><code>AIAEC/Align_ULCNet/ulcnet_process.c / .h</code>（C 前後處理：centered sqrt-Hann STFT/WOLA）</li>
-<li><code>AIAEC/Align_ULCNet/export_streaming_onnx.py</code>（stateless one-frame ONNX 匯出;far_input_mode metadata）；<code>ulcnet_accelerator_adapter.c/h</code>、<code>ulcnet_model_io.c/h</code>（CPU 端 state adapter 參考實作,見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>）</li>
+<li><code>AIAEC/Align_ULCNet/export_streaming_onnx.py</code>（stateless one-frame ONNX 匯出；分開記錄 training provenance 與 aligned-far deployment metadata）；<code>ulcnet_accelerator_adapter.c/h</code>、<code>ulcnet_model_io.c/h</code>（CPU 端 state adapter 參考實作,見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>）</li>
 <li><code>AIAEC/aiaec_streaming.py</code>（cells、StreamSTFT/StreamISTFT、state_report）；<code>AIAEC/dataset_gen/model_views.py</code>（task/輸入 mapping）</li>
-<li>tests：<code>AIAEC/tests/test_streaming_align_ulcnet.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_candidate_models.py</code>、<code>test_export_streaming_ulcnet.py</code>（ONNX runtime vs PyTorch parity 、layout-version 互鎖）、<code>test_ulcnet_model_io_c.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 144 passed（2026-08-16 重跑）</li>
+<li>tests：<code>AIAEC/tests/test_streaming_align_ulcnet.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_candidate_models.py</code>、<code>test_export_streaming_ulcnet.py</code>（ONNX runtime vs PyTorch parity 、layout-version 互鎖）、<code>test_ulcnet_model_io_c.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 239 passed（<code>pytest AIAEC</code> 含 dataset_gen = 357）</li>
 <li>docs：<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code>、<code>docs/aiaec_streaming_readiness_zh_TW.md</code></li>
 </ul>
 </body>

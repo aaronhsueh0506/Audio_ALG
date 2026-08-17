@@ -74,6 +74,9 @@ def streaming_forward_with_dump(model, erb_features, spec_features,
                 })
                 saved += 1
             _, states = model(erb_x, spec_x, [h1, h2, h3])
+            if not all(torch.isfinite(state).all() for state in states):
+                raise RuntimeError(
+                    f'non-finite GRU state produced at streaming frame {t}')
             h1, h2, h3 = states
     print(f"校正資料已存: {dump_dir}/ ({saved} frames)")
 

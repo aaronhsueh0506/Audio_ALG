@@ -7,6 +7,45 @@
 #define M_PI 3.14159265358979323846
 #endif
 
+void dfn_aenr_model_io_init(DfnAenrModelIOState *state) {
+    if (state) memset(state, 0, sizeof(*state));
+}
+
+int dfn_aenr_model_io_push_features(
+    DfnAenrModelIOState *state,
+    const float error_erb[DFN2_N_ERB],
+    const float error_spec[2][DFN2_DF_BINS],
+    const float far_erb[DFN2_N_ERB],
+    const float far_spec[2][DFN2_DF_BINS]) {
+    if (!state || !error_erb || !error_spec || !far_erb || !far_spec)
+        return -1;
+    dfn2_model_io_push_erb_window(state->error_erb_window, error_erb);
+    dfn2_model_io_push_spec_window(state->error_spec_window, error_spec);
+    dfn2_model_io_push_erb_window(state->far_erb_window, far_erb);
+    dfn2_model_io_push_spec_window(state->far_spec_window, far_spec);
+    if (state->feature_frames_seen < 2U) ++state->feature_frames_seen;
+    return state->feature_frames_seen == 2U ? 1 : 0;
+}
+
+int dfn_aenr_model_io_commit_state(
+    DfnAenrModelIOState *state,
+    const float encoder_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
+                                   [DFN2_MODEL_GRU_HIDDEN],
+    const float erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
+                               [DFN2_MODEL_GRU_HIDDEN],
+    const float df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
+                              [DFN2_MODEL_GRU_HIDDEN],
+    const float pathway_history_next[DFN2_MODEL_ENCODER_CHANNELS]
+                                    [DFN2_MODEL_DF_PATHWAY_HISTORY]
+                                    [DFN2_DF_BINS]) {
+    if (!state) return -1;
+    return dfn2_model_io_commit_arrays(
+        state->encoder_gru_hidden, state->erb_gru_hidden,
+        state->df_gru_hidden, state->df_convp_history,
+        encoder_hidden_next, erb_hidden_next, df_hidden_next,
+        pathway_history_next);
+}
+
 void dfn_aenr_make_window(float window[DFN2_N_FFT]) {
     int index;
     if (!window) return;

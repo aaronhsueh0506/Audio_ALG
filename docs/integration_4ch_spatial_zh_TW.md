@@ -258,11 +258,22 @@ AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
 | `core.fft_size` | `int` | `0` | `0` = rate 預設（16 kHz → 256，48 kHz → 1024）；16 kHz 另可指定 `512`；48 kHz 只接受 `1024` | 一般留 `0` |
 | `core.filter_length` | `int` | `0` | `[0, 4096]` | `0` = AEC 依取樣率算的預設（16 kHz → 832，48 kHz → 3072）。記憶體吃緊時最有效的旋鈕 |
 | `core.capture_proxy_channel` | `int` | `0` | `[0, 3]` | 共用 delay matcher 用哪一支麥克風 |
+| `core.delay_backward_quarantine_enabled` | `int`（bool） | `0` | `0` 或 `1` | 預設關閉。開啟後只隔離**一種**共用估計：比現行 accepted delay **更早**（backward／pre-echo 方向）、且 **`capture_proxy_channel` 那一條 lane**（不是任一條——那正是餵給共用 estimator 的那支 mic，也是唯一能對這個估計提供證據的 lane）在目前對齊上仍明顯在消除回音（`aec_linear_is_cancelling()`）。**往後跳（delay 變大）永不隔離**，**首次取得對齊不受影響**。隔離**有上限**（見下一列），到期就採用；消除能力崩掉時則立即採用，但這是 hard replacement 常見而非所有真實路徑變化必然具備的現象。擋的是 pre-echo 誤鎖（實測 true 6400 → 4800，錯值持續，連續確認擋不住），但**只是延後一個窗、不是治癒**。（v1 歷史：舊判別式攔所有不同估計且無上限，multipath 下 ANY-lane 聚合讓任一支 mic 的舊反射無限期擋掉整組 shared delay 更新，實測 0.4/0.5 增益比跑到 hop 850 仍不重鎖。）`FIXED` / `EXTERNAL_ALIGNED` 不重新決定對齊，此旗標對它們無作用 |
+| `core.delay_backward_quarantine_s` | `float` | `1.0` | 有限值，`[0.0, 3600.0]` | 上一列的隔離窗長（秒），在 `init` 時按解析後的 hop／取樣率換算成 hop 數（最小 1；要關閉請用上一列的 enable）。enable 為 0 時無作用，但仍會被驗證——設定檔今天就要是「翻一個旗標也不會壞」的狀態。實測（16 kHz／fft 512／hop 256、true 6400，未隔離時於 hop 50 採用 4800）：窗 0.5/1.0/2.0 s = 31/62/125 hops → 採用點 81/112/175，精確等於「未隔離 hop ＋ 窗長」，C 與 Python 參考實作逐 hop 相同 |
 | `core.max_delay_ms` | `float` | `1024.0f` | 有限值，`[0.0, 4096.0]` | 設成略大於系統真實最大 mic↔ref 延遲。設太大只是白吃記憶體 |
 | `core.aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED` | `MILD` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
 | `core.nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED` | `MILD` / `MODERATE` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
 | `core.enable_cng` | `int`（bool） | `1` | `0` 或 `1` | — |
 | `core.legacy_amin` | `int`（bool） | `0` | `0` 或 `1` | 新整合保持 `0` |
+
+> Quarantine 窗只對「連續符合條件的 backward episode」有界。候選轉為
+> forward／無效、confidence 中斷，或 proxy lane 的 cancellation 證據消失時
+> 會解除本次隔離；之後的新 backward episode 重新計時。Cancellation collapse
+> 常見於路徑完全替換，但不是 multipath／新增路徑的必然特徵。
+>
+> **產品預設維持 `0`。** 目前的證據是合成場景與 C／Python 逐 hop 對照
+> （見上列實測），**尚未做真實錄音的抽測**；在那之前不要在產品組態把它打開。
+> 打開之後也只是把誤鎖往後推一個窗，不會修正誤鎖本身。
 
 Grid 只有三組（`hop = fft_size / 2`、`n_freqs = fft_size / 2 + 1`）：
 
@@ -426,17 +437,24 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 | 其他 DOA / GSC / VAD 欄位 | 不變 |
 | `geometry` 與座標 | 不變 |
 
-實測（2026-08-16、`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設）：
+`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設下的 `req.bytes`
+（最後一欄標明哪幾列是實際查詢出來的、哪一列是推導的）：
 
-| Config | `req.bytes` |
-|---|---:|
-| 16000，全預設（256/128，`num_angles=72`） | 1,910,544 |
-| 16000，`core.fft_size = 512` | 3,249,152 |
-| 16000，`num_angles = 360` | 4,912,656 |
-| 48000，全預設（1024/512，`num_angles=72`） | 6,826,368 |
+| Config | `req.bytes` | 來源 |
+|---|---:|---|
+| 16000，全預設（256/128，`num_angles=72`） | 1,910,640 | 實測 |
+| 16000，`core.fft_size = 512` | 3,249,248 | 實測 |
+| 16000，`num_angles = 360` | 4,912,752 | 實測 |
+| 48000，全預設（1024/512，`num_angles=72`） | 6,826,464 | 實測 |
 
-`num_angles` 從 72 調到 360，記憶體從約 1.91 MB 變成約 4.91 MB。
-**先確認你的角度解析度真的需要那麼細，再調這個值。**
+⚠ 覆蓋差異：只有 `num_angles = 72` 的 16 kHz/256 與 48 kHz/1024 兩組會被
+C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_size = 512`
+與 `num_angles = 360` 兩列是**手動查詢**得到的，沒有任何自動測試會在這兩組
+config 上呼叫 `audio_pipeline_4ch_get_mem_requirements()`，所以它們不會隨程式
+改動自動失效——引用前請自己現查一次。
+
+`num_angles` 從 72 調到 360，記憶體約從 1.91 MB 變成約 4.91 MB（量級可信，
+精確值見上）。**先確認你的角度解析度真的需要那麼細，再調這個值。**
 
 換 backend、換編譯選項、更新 submodule 都會讓上表失效。
 **實際配置一律以 `audio_pipeline_4ch_get_mem_requirements()` 現查的 `req.bytes` 為準。**

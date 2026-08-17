@@ -72,7 +72,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--input-is-linear-error', action='store_true',
         help='Evaluation only: first WAV is an existing KF/AEC error Z; '
-             'bypass this project\'s PBFDKF and run only the neural post-filter',
+             'bypass this project\'s PBFDKF and run only the neural post-filter. '
+             'The supplied far WAV must already be aligned to that error.',
     )
     parser.add_argument(
         '--max-delay-frames', type=int, default=None,
@@ -101,7 +102,8 @@ def load_model(checkpoint_path: str, device: str,
     # Missing field defaults to 'raw_far' (legacy checkpoints); an unknown
     # recorded mode is rejected here, before any weights load. streaming.py
     # shares this loader, so both CLIs print the mode at load time.
-    print(f"checkpoint far_input_mode: {checkpoint_far_input_mode(contract)}")
+    print("checkpoint training far_input_mode: "
+          f"{checkpoint_far_input_mode(contract)}; deployment: aligned_far")
     aec_grid = AecGrid(contract['sr'], contract['n_fft'], contract['win_len'], contract['hop_len'])
     linear_aec_contract = require_checkpoint_linear_aec(contract, aec_grid)
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)
@@ -164,7 +166,8 @@ def main(args):
         error, far_t, source_rates = load_linear_error_far(
             args.mic_wav, args.far_wav, grid.sr
         )
-        print("using external linear-error input; PBFDKF bypassed")
+        print("using external linear-error input; PBFDKF bypassed; supplied "
+              "far is assumed aligned")
     else:
         mic_t, far_t, source_rates = load_mic_far(
             args.mic_wav, args.far_wav, grid.sr
@@ -175,6 +178,9 @@ def main(args):
         error, _echo_estimate = linear_aec(
             mic_t, far_t, grid.sr
         )
+        # Match the production C pipeline: feed the exact far hop PBFDKF
+        # consumed (raw until acquisition, ring-aligned afterward).
+        far_t = linear_aec.get_aligned_far()
     error = error.to(device)
     far_t = far_t.to(device)
     if source_rates != (grid.sr, grid.sr):

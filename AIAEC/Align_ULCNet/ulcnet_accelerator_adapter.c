@@ -9,16 +9,15 @@ struct UlcnetAcceleratorAdapter {
     void *run_user;
 };
 
-int ulcnet_accelerator_adapter_get_mem_size(int delay_depth,
-                                            size_t *bytes,
-                                            size_t *alignment) {
-    UlcnetModelIoDescriptor descriptor;
+int ulcnet_accelerator_adapter_get_mem_size(
+    const UlcnetModelIoDescriptor *descriptor,
+    size_t *bytes,
+    size_t *alignment) {
     UlcnetModelIoMemReq model_req;
     size_t header_bytes;
 
     if (!bytes || !alignment ||
-        ulcnet_model_io_descriptor_default(delay_depth, &descriptor) != 0 ||
-        ulcnet_model_io_get_mem_requirements(&descriptor, &model_req) != 0) {
+        ulcnet_model_io_get_mem_requirements(descriptor, &model_req) != 0) {
         return -1;
     }
     if (ulcnet_model_io_align_up(sizeof(UlcnetAcceleratorAdapter),
@@ -34,11 +33,9 @@ int ulcnet_accelerator_adapter_get_mem_size(int delay_depth,
 UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
     void *memory,
     size_t bytes,
-    int delay_depth,
-    int far_input_mode,
+    const UlcnetModelIoDescriptor *descriptor,
     UlcnetAcceleratorRun run,
     void *run_user) {
-    UlcnetModelIoDescriptor descriptor;
     UlcnetModelIoMemReq model_req;
     UlcnetAcceleratorAdapter *adapter;
     unsigned char *model_memory;
@@ -47,17 +44,13 @@ UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
     size_t header_bytes;
 
     if (!memory ||
-        ulcnet_accelerator_adapter_get_mem_size(delay_depth, &required,
+        ulcnet_accelerator_adapter_get_mem_size(descriptor, &required,
                                                 &alignment) != 0 ||
-        bytes < required || ((uintptr_t)memory % alignment) != 0u ||
-        ulcnet_model_io_descriptor_default(delay_depth, &descriptor) != 0) {
+        bytes < required || ((uintptr_t)memory % alignment) != 0u) {
         return NULL;
     }
-    /* The checkpoint's far contract travels in the descriptor, so it is set
-     * before validate() and before the state is built from it. */
-    descriptor.far_input_mode = far_input_mode;
-    if (ulcnet_model_io_descriptor_validate(&descriptor) != 0 ||
-        ulcnet_model_io_get_mem_requirements(&descriptor, &model_req) != 0) {
+    if (ulcnet_model_io_descriptor_validate(descriptor) != 0 ||
+        ulcnet_model_io_get_mem_requirements(descriptor, &model_req) != 0) {
         return NULL;
     }
 
@@ -69,7 +62,7 @@ UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
     }
     model_memory = (unsigned char *)memory + header_bytes;
     adapter->state = ulcnet_model_io_init(model_memory, model_req.bytes,
-                                          &descriptor);
+                                          descriptor);
     if (!adapter->state) {
         return NULL;
     }

@@ -6,7 +6,7 @@ all:
 test: all
 	$(MAKE) -C .. test_audio_pipeline_ulcnet \
 	  test_ulcnet_accelerator_adapter
-	bin="$$($(MAKE) -s -C .. print-bin-dir)"; \
+	set -e; bin="$$($(MAKE) -s -C .. print-bin-dir)"; \
 	  "$$bin/test_audio_pipeline_ulcnet"; \
 	  "$$bin/test_ulcnet_accelerator_adapter"; \
 	  "$$bin/mono_alignulcnet"; \

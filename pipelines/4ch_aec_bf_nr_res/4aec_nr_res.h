@@ -88,8 +88,18 @@ extern "C" {
  *      spells as post?(...).
  *   9: the delay estimator and the shared reference delay ring became
  *      conditional on the new cfg.delay_mode -- carved for MATCHED only,
- *      spelled delayest?,delayring? (both were unconditional before). */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 9u
+ *      spelled delayest?,delayring? (both were unconditional before).
+ *  10: cfg gained delay_backward_quarantine_enabled + _s, and the control
+ *      block gained the quarantine countdown pair. No new REGION and no
+ *      change to the carve ORDER -- but FourAecNrResConfig is embedded in
+ *      the control block, so the pool total moves (query
+ *      four_aec_nr_res_get_mem_requirements() for the current figure rather
+ *      than trusting a number restated here, which rots on the next bump). A
+ *      descriptor captured from an older build therefore no longer sizes
+ *      this one, which is exactly what this counter exists to say out loud;
+ *      contrast the 2026-08-13 PreFrame note above, which did NOT bump
+ *      because that struct lives on the caller's stack. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 10u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -170,6 +180,38 @@ typedef struct FourAecNrResConfig {
     int delay_num_filters;        /* MATCHED bank size [1,5]                */
     int fixed_delay_samples;      /* FIXED native-rate samples; -1 otherwise*/
     int capture_proxy_channel;    /* shared matcher input, [0,3]            */
+    /* Backward-jump quarantine on a shared-delay CHANGE. DEFAULT OFF, so the
+     * shipped path is unchanged. MATCHED only -- FIXED and EXTERNAL_ALIGNED
+     * never re-decide an alignment, so there is nothing to quarantine.
+     *
+     * Same mechanism as lib/aec's own delay_backward_quarantine_* (see
+     * aec.h for the full derivation, the measured pre-echo scene, and the
+     * unbounded-veto defect this replaced), applied to the SHARED estimate:
+     * a shared estimate strictly EARLIER than the accepted delay is held for
+     * delay_backward_quarantine_s worth of hops while the estimator's own
+     * capture lane still cancels at the applied alignment, and is ADOPTED at
+     * expiry. A collapse in cancellation adopts it immediately. A FORWARD
+     * estimate -- a larger delay, which pre-echo mis-attribution cannot
+     * produce -- is never held.
+     *
+     * ONE lane, not any lane, and specifically cfg.capture_proxy_channel:
+     * that is the microphone the shared estimator is actually fed from, so
+     * it is the only lane whose cancellation is evidence about the estimate
+     * being judged. Judging ANY of the four instead would let a single
+     * microphone's surviving old reflection hold the shared update back for
+     * the whole array.
+     *
+     * First acquisition is NOT guarded: with nothing accepted yet there is
+     * no alignment to protect, and lib/aec makes the same split (Path A
+     * keeps its own delay_acquire_protect_converged).
+     *
+     * The reading the lane answers with is 0 until its ERLE machinery has
+     * run, so an unavailable metric leaves this inert rather than blocking.
+     * That machinery is alive here: the lanes run enable_res=0 with
+     * return_res_context=1, the seam configuration in which lib/aec caches
+     * windowed ERLE. */
+    int delay_backward_quarantine_enabled;  /* bool                         */
+    float delay_backward_quarantine_s;      /* window, seconds; default 1.0 */
     float max_delay_ms;           /* MATCHED reference delay-line capacity   */
     AecPreset aec_preset;
     MmseLsaNrMode nr_mode;
@@ -203,6 +245,13 @@ typedef struct FourAecNrResConfig {
  *
  * FIXED and EXTERNAL_ALIGNED never set `changed`; both follow lib/aec, where
  * nothing bumps the generation during processing without an estimator.
+ *
+ * `solid` = "a usable accepted alignment generation exists". Under MATCHED it
+ * is raised by the same acceptance test that writes the applied delay, so it
+ * never leads `delay_samples`, and it is sticky: a short confidence dip does
+ * not retract an alignment the audio path is still applying, and only
+ * reset() clears it. Under FIXED it is the ring-fill state (raw far below,
+ * shifted far from that hop on); under EXTERNAL_ALIGNED it is always 1.
  */
 typedef struct FourAecNrResDelayState {
     int delay_samples;
@@ -284,8 +333,12 @@ typedef struct FourAecNrResPreFrame {
     /**
      * Read-only view of the delay-aligned time-domain far reference actually
      * fed to every AEC lane this hop: aligned_ref[hop_size]. Content is the
-     * caller's ref stream shifted by delay.delay_samples (leading region is
-     * zero before the ring has produced that many samples).
+     * caller's ref stream shifted by delay.delay_samples on every hop the
+     * shared ring can serve that offset, and the caller's RAW ref hop on the
+     * hops before it can (lib/aec's rule: while the seam is not aligned, the
+     * content is the raw far). The switch is whole-hop and coincides with
+     * `delay.solid` under FIXED, so this buffer never splices raw and shifted
+     * audio inside one hop.
      *
      * Like linear_interleaved above, this is a pipeline-owned buffer (the
      * shared delay line's per-hop output, not a lane alias) and follows the

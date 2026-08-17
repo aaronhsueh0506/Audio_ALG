@@ -132,19 +132,19 @@ hop-lag: 0 框 (模型 causal); I/O 延遲僅 WOLA 重疊 win-hop = 256 samples
 
 <h2>State 表</h2>
 <p><b>ONNX/匯出邊界</b>:模型圖 = <code>GTCRN.forward(spec)</code> 整段(特徵、encoder、
-DPGRNN、decoder、CRM 全在圖內);圖外只有 C 的 STFT/WOLA。本目錄的 <code>model.py</code>
-是 offline 全段 forward,<b>repo 內沒有 GTCRN 匯出腳本</b>;逐框串流版的 cache 介面以
-vendored 上游參考 <code>AINR/gtcrn_github/stream/gtcrn_stream.py</code>(<code>StreamGTCRN</code>)為準,
-其 cache shape 如下表——串流部署時這些全部由 NPU runtime(或 host 代管的圖 I/O)攜帶。</p>
+DPGRNN、decoder、CRM 全在圖內);圖外只有 C 的 STFT/WOLA。
+<code>export_onnx.py</code> 已交付 one-frame stateless graph；cache layout 由
+<code>StreamGTCRN</code> 固定，三組 cache 都由 host 作為 graph input/output 送回，
+加速器本身不保存跨次呼叫狀態。</p>
 <div class="tbl"><table>
 <tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
 <tr><td><code>analysis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct <code>GTCRNProcessState</code></td><td>分析滑窗</td></tr>
 <tr><td><code>synthesis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>OLA(有效 256)</td></tr>
 <tr><td><code>window</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>root-Hann,init 後不變</td></tr>
 <tr><td><code>scratch_re/im</code></td><td>[512] ×2</td><td>4,096</td><td>C struct</td><td>非跨呼叫</td></tr>
-<tr><td><code>conv_cache</code></td><td>(2,1,16,16,33)</td><td>67,584(16,896 f32)</td><td>NPU runtime</td><td>encoder+decoder 各 3 個 GTConvBlock 的 depth_conv 時間快取,(kT−1)·dilation = 2/4/10 框合計 16 slots × 16 ch × 33 freq</td></tr>
-<tr><td><code>tra_cache</code></td><td>(2,3,1,1,16)</td><td>384(96 f32)</td><td>NPU runtime</td><td>6 個 TRA <code>att_gru</code>(GRU 8→16)hidden</td></tr>
-<tr><td><code>inter_cache</code></td><td>(2,1,33,16)</td><td>4,224(1,056 f32)</td><td>NPU runtime</td><td>2 個 DPGRNN 的 inter GRNN hidden(每個頻率位置 16;intra RNN 沿頻率軸、單框內完成,無跨框狀態)</td></tr>
+<tr><td><code>conv_cache</code></td><td>(2,1,16,16,33)</td><td>67,584(16,896 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder+decoder depth-conv 時間快取</td></tr>
+<tr><td><code>tra_cache</code></td><td>(2,3,1,1,16)</td><td>384(96 f32)</td><td>host caller</td><td>顯式 graph I/O；6 個 TRA <code>att_gru</code> hidden</td></tr>
+<tr><td><code>inter_cache</code></td><td>(2,1,33,16)</td><td>4,224(1,056 f32)</td><td>host caller</td><td>顯式 graph I/O；2 個 DPGRNN inter hidden</td></tr>
 </table></div>
 <p class="note"><code>sizeof(GTCRNProcessState)</code> = 10,240 bytes(本機量測)。
 本目錄 <code>model.py</code> 無 cache 介面;上表 NPU 狀態 shape 逐一取自
@@ -171,5 +171,5 @@ context(cache 大小即由此而來),加上 RNN 無限記憶。</li>
 <li>上游 vendored 參考:<code>AINR/gtcrn_github/</code>(offline <code>gtcrn.py</code>、串流 <code>stream/gtcrn_stream.py</code>、論文 PDF)</li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_gtcrn()</code>:回路穩態 unity,誤差門檻 2e-4)—
 <code>make -C AINR test-simd</code> 實測 NEON/scalar digest 皆 <code>124b768ec938af7d</code></li>
-<li>本目錄無獨立 pytest;共用測試 <code>AINR/tests/</code>(pytest)— 實測 14 passed</li>
+<li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code> — 實測 2 passed(metadata 內容、<code>state_layout_version</code> 對 <code>GTCRN_MODEL_LAYOUT_VERSION</code> 互鎖);共用測試 <code>AINR/tests/</code>(pytest)— 實測 16 passed(<code>pytest AINR</code> 全樹 = 187)</li>
 </ul>

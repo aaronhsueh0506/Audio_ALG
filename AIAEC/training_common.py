@@ -102,6 +102,8 @@ __all__ = [
     'read_model_kwargs',
     'FAR_INPUT_MODES',
     'FAR_INPUT_MODE_C_VALUES',
+    'DEPLOYED_FAR_INPUT_MODE',
+    'CALIBRATION_ONLY_FAR_INPUT_MODE',
     'far_input_mode_c_value',
     'checkpoint_far_input_mode',
     'make_checkpoint_contract',
@@ -382,6 +384,21 @@ FAR_INPUT_MODES = ('raw_far',)
 # rather than to an unnamed integer.
 FAR_INPUT_MODE_C_VALUES = {'raw_far': 0, 'aligned_far': 1}
 
+# The far-end signal the production seam presents to the model, fixed for
+# every deployed alignment candidate: the far the linear AEC has already
+# aligned. Deliberately NOT derived from FAR_INPUT_MODES -- that names what
+# training feeds, and the whole point of recording both is that they differ.
+# Raw/aligned comparison survives only in sweep_delay_depth.py.
+DEPLOYED_FAR_INPUT_MODE = 'aligned_far'
+
+# Calibration-seam-only name, used when a model has no separate far seam at
+# all: the recorder fed it exactly the far its own graph consumes, so there is
+# nothing to distinguish. It is deliberately ABSENT from
+# FAR_INPUT_MODE_C_VALUES -- no C enumerator exists for it and none should,
+# because it never describes a deployed wiring; far_input_mode_c_value()
+# rejecting it is the intended behaviour, not an oversight.
+CALIBRATION_ONLY_FAR_INPUT_MODE = 'model_native_far'
+
 
 def far_input_mode_c_value(mode: str) -> int:
     """Map a far-input mode name to its C ``UlcnetFarInputMode`` value."""
@@ -654,6 +671,7 @@ class LinearAecEngine:
         )
         self._engines: List[AEC] = [self._new_engine() for _ in range(self.n_lanes)]
         self._pending_reset: Optional[List[bool]] = None
+        self._last_aligned_far: Optional[Tensor] = None
 
     def _new_engine(self) -> AEC:
         cfg = make_linear_aec_config(
@@ -675,9 +693,10 @@ class LinearAecEngine:
                 f"{self.n_lanes} (one per lane)")
         self._pending_reset = [bool(r) for r in reset_mask]
 
-    def _process_numpy(self, mic: np.ndarray, far: np.ndarray,
-                       reset_mask: Sequence[bool]) -> Tuple[np.ndarray, np.ndarray]:
-        """Returns ``(error, echo_estimate)``, both EXACTLY ``mic.shape``.
+    def _process_numpy(
+        self, mic: np.ndarray, far: np.ndarray, reset_mask: Sequence[bool]
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Returns ``(error, echo_estimate, aligned_far)`` at ``mic.shape``.
 
         The returned signal must stay the same shape as the microphone, so
         this cannot truncate to a whole number of hops. A file may end with
@@ -699,6 +718,9 @@ class LinearAecEngine:
         n_samples = mic.shape[1]
         used = (n_samples // hop) * hop
         error = np.zeros((self.n_lanes, n_samples), dtype=np.float32)
+        # A sub-hop tail is not processed by AEC and therefore remains the
+        # caller's raw far, matching the error tail's pass-through policy.
+        aligned_far = np.ascontiguousarray(far, dtype=np.float32).copy()
         for lane in range(self.n_lanes):
             engine = self._engines[lane]
             mic_lane = np.ascontiguousarray(mic[lane, :used], dtype=np.float32)
@@ -709,10 +731,21 @@ class LinearAecEngine:
                 engine.process(mic_lane[start:start + hop],
                                far_lane[start:start + hop])
                 error[lane, start:start + hop] = engine.get_formed_output()
+                # Exact Python equivalent of C AecLinearContext's
+                # aligned_far_hop: the hop PBFDKF just consumed.
+                aligned_far[lane, start:start + hop] = (
+                    engine.filter.far_buffer[-hop:]
+                )
             if used < n_samples:
                 error[lane, used:] = mic[lane, used:]
         echo_estimate = mic.astype(np.float32) - error
-        return error, echo_estimate
+        return error, echo_estimate, aligned_far
+
+    def get_aligned_far(self) -> Tensor:
+        """Far seam from the most recent call, on that call's device/dtype."""
+        if self._last_aligned_far is None:
+            raise RuntimeError("LinearAecEngine has not processed audio yet")
+        return self._last_aligned_far
 
     def __call__(self, mic: Tensor, far: Tensor, sample_rate: int) -> Tuple[Tensor, Tensor]:
         """``LinearAecFrontend`` signature: ``(mic, far, sample_rate) -> (error, echo_estimate)``."""
@@ -726,7 +759,12 @@ class LinearAecEngine:
             reset_mask = [False] * self.n_lanes
         mic_np = mic.detach().cpu().numpy()
         far_np = far.detach().cpu().numpy()
-        error_np, echo_np = self._process_numpy(mic_np, far_np, reset_mask)
+        error_np, echo_np, aligned_np = self._process_numpy(
+            mic_np, far_np, reset_mask
+        )
         error = torch.from_numpy(error_np).to(device=mic.device, dtype=mic.dtype)
         echo_estimate = torch.from_numpy(echo_np).to(device=mic.device, dtype=mic.dtype)
+        self._last_aligned_far = torch.from_numpy(aligned_np).to(
+            device=far.device, dtype=far.dtype
+        )
         return error, echo_estimate

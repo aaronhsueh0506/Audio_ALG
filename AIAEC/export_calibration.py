@@ -34,11 +34,31 @@ from AIAEC.export_onnx import (
 )
 from AIAEC.dataset_gen import stft
 from AIAEC.inference_common import load_linear_error_far, load_mic_far
+from AIAEC.training_common import (
+    CALIBRATION_ONLY_FAR_INPUT_MODE,
+    DEPLOYED_FAR_INPUT_MODE,
+)
 
 
 LINEAR_ERROR_MODELS = {
     'Align_ULCNet', 'GTCRN_AENR', 'DeepFilterNet_AENR',
 }
+
+
+def far_mode_provenance(model_name):
+    """Describe calibration data separately from the deployment seam.
+
+    Lives here rather than in the streaming recorder because both recorders
+    read the same far directory through ``blocks_from_pair`` and so must
+    describe it the same way. Returns ``(calibration, deployment)``.
+    """
+    if model_name == 'Align_ULCNet':
+        # The far WAVs are the raw rendered reference; deployment feeds the
+        # aligned far the linear AEC produced. Recording only one of the two
+        # would let a consumer assume the ranges were measured on the signal
+        # the board will actually present.
+        return 'raw_far', DEPLOYED_FAR_INPUT_MODE
+    return CALIBRATION_ONLY_FAR_INPUT_MODE, CALIBRATION_ONLY_FAR_INPUT_MODE
 
 
 def discover_pairs(primary_dir, far_dir):
@@ -182,6 +202,8 @@ def main():
         'sample_rate': int(grid.sr), 'n_fft': int(grid.n_fft),
         'win_len': int(grid.win_len), 'hop_len': int(grid.hop_len),
         'frames_per_block': args.frames,
+        'calibration_far_input_mode': far_mode_provenance(args.model_name)[0],
+        'deployment_far_input_mode': far_mode_provenance(args.model_name)[1],
         'max_delay_frames': delay_depth,
         'checkpoint_max_delay_frames': checkpoint_delay_depth,
         'blocks': int(next(iter(arrays.values())).shape[0]),

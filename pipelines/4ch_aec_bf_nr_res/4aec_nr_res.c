@@ -125,6 +125,13 @@ struct FourAecNrRes {
     int delay_ring_size;
     uint64_t delay_samples_seen;
     int accepted_delay;
+    /* Backward-jump quarantine (cfg.delay_backward_quarantine_*), mirroring
+     * lib/aec's own pair: _left is the hops still to spend before a held
+     * EARLIER estimate is adopted anyway (-1 = DISARMED, the only state that
+     * may re-arm; 0 = armed and EXPIRED, i.e. this hop adopts), _hops is the
+     * window converted once at init. */
+    int delay_quarantine_left;
+    int delay_quarantine_hops;
     uint64_t delay_calls;
     FourAecNrResDelayState last_delay;
 
@@ -249,6 +256,20 @@ static int derive_dims_and_configs(
     }
     if (cfg->capture_proxy_channel < 0 ||
         cfg->capture_proxy_channel >= FOUR_AEC_NR_RES_CHANNELS) return 0;
+    /* Range only. Unlike delay_num_filters, these are pure policy knobs with
+     * no effect on the pool carve, and lib/aec accepts its own
+     * delay_backward_quarantine_* in every mode for the same reason -- so a
+     * caller that sets them once for a whole product and switches modes at
+     * bring-up does not have to unset them. Outside MATCHED nothing
+     * re-decides an alignment, so they are simply inert. The window is
+     * range-checked (and NaN-rejected) even while the enable is 0: a config
+     * that would misbehave the moment someone flips one field must not pass
+     * validation today. */
+    if (cfg->delay_backward_quarantine_enabled != 0 &&
+        cfg->delay_backward_quarantine_enabled != 1) return 0;
+    if (!isfinite(cfg->delay_backward_quarantine_s) ||
+        cfg->delay_backward_quarantine_s < 0.0f ||
+        cfg->delay_backward_quarantine_s > 3600.0f) return 0;
     if (!isfinite(cfg->max_delay_ms) ||
         cfg->max_delay_ms < 0.0f || cfg->max_delay_ms > 4096.0f) return 0;
     *fft_size = selected_fft;
@@ -601,6 +622,8 @@ FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     cfg.delay_num_filters = DA_NUM_FILTERS;
     cfg.fixed_delay_samples = -1;
     cfg.capture_proxy_channel = 0;
+    cfg.delay_backward_quarantine_enabled = 0;
+    cfg.delay_backward_quarantine_s = 1.0f;
     cfg.max_delay_ms = 1024.0f;
     cfg.aec_preset = AEC_PRESET_BALANCED;
     cfg.nr_mode = MMSE_LSA_NR_BALANCED;
@@ -704,6 +727,16 @@ FourAecNrRes* four_aec_nr_res_init_ex(
     p->hop_size = hop;
     p->n_freqs = n;
     p->delay_ring_size = delay_ring_size;
+    /* Quarantine window: seconds -> hops ONCE, here, against the resolved
+     * grid -- the same conversion (and the same floor of 1) lib/aec does in
+     * aec_carve(), so the core and its lanes cannot disagree about how long
+     * a window is. */
+    {
+        float q_hop_s = (float)hop / (float)cfg_copy.sample_rate;
+        int q_hops = (int)lrintf(cfg_copy.delay_backward_quarantine_s / q_hop_s);
+        p->delay_quarantine_hops = q_hops < 1 ? 1 : q_hops;
+        p->delay_quarantine_left = -1;   /* disarmed */
+    }
     p->rng_state = PIPELINE_RNG_SEED;
     /* PROD_NEAR_HANGOVER (8) is a 10-ms-hop frame count (80 ms); was applied
      * as a raw literal regardless of grid (20-60% off at every one of this
@@ -819,6 +852,7 @@ static FourAecNrResDelayState update_shared_delay(
     int estimated;
     int eligible;
     int was_usable;
+    int now_usable;
 
     memset(&state, 0, sizeof(state));
     if (p->cfg.delay_mode == AEC_DELAY_EXTERNAL_ALIGNED) {
@@ -832,10 +866,14 @@ static FourAecNrResDelayState update_shared_delay(
     if (p->cfg.delay_mode == AEC_DELAY_FIXED) {
         state.delay_samples = p->cfg.fixed_delay_samples;
         state.confidence = 1.0f;
-        /* Match lib/aec's FIXED contract: do not report usable aligned far
-         * until the ring contains the requested delay plus one full hop. */
+        /* update_shared_delay() runs immediately before align_render().
+         * The current hop will therefore be completely readable when the
+         * samples already stored cover the requested delay. This matches
+         * lib/aec, which checks `filled >= delay + hop` after writing the
+         * current hop; checking delay+hop here would report LOCKED one hop
+         * later than the audio actually switches to aligned far. */
         state.solid = p->delay_samples_seen >=
-            (uint64_t)p->cfg.fixed_delay_samples + (uint64_t)p->hop_size;
+            (uint64_t)p->cfg.fixed_delay_samples;
         p->accepted_delay = p->cfg.fixed_delay_samples;
         p->last_delay = state;
         return state;
@@ -855,20 +893,68 @@ static FourAecNrResDelayState update_shared_delay(
                delay_aec3_is_solid(&p->shared_delay) &&
                delay_aec3_n_updates(&p->shared_delay) >= 3;
 
-    /* `changed` = "this hop starts a NEW USABLE alignment generation" (see
+    /* Backward-jump quarantine (see delay_backward_quarantine_enabled in the
+     * header). Engages only once a usable generation exists and only for an
+     * estimate strictly EARLIER than the one in force: a first acquisition
+     * has no alignment to protect, re-confirming the accepted value is not a
+     * change, and a LARGER estimate is not the pre-echo direction. The lane
+     * is read here, BEFORE this hop's aec_process_context() calls, so what it
+     * answers with is last hop's cancellation -- the same one-hop-behind
+     * reading lib/aec's own Path-B guard judges on.
+     *
+     * ONE lane: cfg.capture_proxy_channel, the microphone the shared
+     * estimator is actually fed from, so the only lane whose cancellation is
+     * evidence about the estimate being judged.
+     *
+     * Armed once per continuously qualifying backward episode, then one tick
+     * per hop; at 0 the estimate is adopted. Candidate values may jitter
+     * within that qualifying class without re-arming. A forward/ineligible
+     * estimate or lost cancellation evidence disarms the episode. */
+    if (eligible && p->cfg.delay_backward_quarantine_enabled &&
+        p->last_delay.solid && estimated < p->accepted_delay &&
+        p->lanes[p->cfg.capture_proxy_channel] &&
+        aec_linear_is_cancelling(p->lanes[p->cfg.capture_proxy_channel])) {
+        if (p->delay_quarantine_left < 0)
+            p->delay_quarantine_left = p->delay_quarantine_hops;
+        if (p->delay_quarantine_left > 0) {
+            p->delay_quarantine_left--;
+            eligible = 0;
+        }
+    } else {
+        p->delay_quarantine_left = -1;
+    }
+
+    /* Published `solid` = "a usable accepted alignment generation exists",
+     * which is why it is derived from the SAME acceptance test that writes
+     * accepted_delay rather than mirroring the estimator's raw confidence.
+     * Nothing in DelayAec3's contract ties its confidence latch to the
+     * acceptance conditions above, so a raw-confidence `solid` would be free
+     * to LEAD accepted_delay on any hop the two disagree -- and a consumer
+     * that flushes recurrent state on the not-usable -> usable edge would
+     * then flush against the previous generation's applied delay.
+     *
+     * Usability is also sticky: once a generation exists, a short
+     * is_solid/confidence dip keeps the accepted delay in force instead of
+     * briefly retracting an alignment the audio path is still applying.
+     * That is exactly lib/aec's semantics, where "nothing accepted yet" is
+     * spelled current_delay == -1 and never un-spells itself without a
+     * reset. p->last_delay is zeroed by init's pool memset and by reset(),
+     * so was_usable is 0 at every genuine stream start.
+     *
+     * `changed` = "this hop starts a NEW USABLE alignment generation" (see
      * FourAecNrResDelayState's doc for why a value-only comparison misses
      * every acquisition or relock that lands on applied delay 0). The
      * previous hop's usability is exactly its published `solid`: this
      * wrapper's delay_samples is never negative (accepted_delay starts at 0
      * and only ever takes an `estimated >= 0`), so there is no -1 sentinel
-     * half to test. p->last_delay is zeroed by init's pool memset and by
-     * reset(), so was_usable is 0 at every genuine stream start. */
+     * half to test. */
     was_usable = p->last_delay.solid;
+    now_usable = was_usable || eligible;
     state.changed = eligible && (!was_usable || estimated != p->accepted_delay);
     if (eligible) p->accepted_delay = estimated;
     state.delay_samples = p->accepted_delay;
     state.confidence = delay_aec3_confidence(&p->shared_delay);
-    state.solid = delay_aec3_is_solid(&p->shared_delay);
+    state.solid = now_usable;
     state.estimator_calls = p->delay_calls;
     state.estimator_updates = delay_aec3_n_updates(&p->shared_delay);
     p->last_delay = state;
@@ -894,16 +980,26 @@ static int align_render(FourAecNrRes* p, const float* render,
         p->delay_ring[absolute % (uint64_t)p->delay_ring_size] =
             render[i];
     }
-    for (i = 0; i < p->hop_size; ++i) {
-        uint64_t absolute = start + (uint64_t)i;
-        if (absolute >= (uint64_t)delay_samples) {
-            uint64_t source = absolute - (uint64_t)delay_samples;
+    /* Whole-hop decision, taken on the SAME predicate the published `solid`
+     * uses under FIXED: the ring can serve this hop's requested offset only
+     * once the samples already seen cover delay_samples. Until then the far
+     * content IS the raw render hop -- lib/aec's rule ("UNLOCKED means the
+     * content is the raw far") rather than silence, so a consumer stepping a
+     * recurrent model over the far branch sees real reference audio from the
+     * first hop instead of a stretch of zeros. Serving zeros would also make
+     * the leading delay_samples of every FIXED stream unmodellable for the
+     * linear filters. Per-hop and not per-sample: `start` is the smallest
+     * absolute index in this hop, so a partly-servable hop would otherwise
+     * splice raw and aligned audio while the seam still reports UNLOCKED. */
+    if (start >= (uint64_t)delay_samples) {
+        for (i = 0; i < p->hop_size; ++i) {
+            uint64_t source = start + (uint64_t)i - (uint64_t)delay_samples;
             p->aligned_ref[i] =
-                p->delay_ring[source %
-                                 (uint64_t)p->delay_ring_size];
-        } else {
-            p->aligned_ref[i] = 0.0f;
+                p->delay_ring[source % (uint64_t)p->delay_ring_size];
         }
+    } else {
+        memcpy(p->aligned_ref, render,
+               (size_t)p->hop_size * sizeof(float));
     }
     p->delay_samples_seen += (uint64_t)p->hop_size;
     return 1;
@@ -1489,6 +1585,10 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
     p->accepted_delay =
         p->cfg.delay_mode == AEC_DELAY_FIXED
             ? p->cfg.fixed_delay_samples : 0;
+    /* A reset abandons the alignment the quarantine was protecting, so a
+     * countdown armed against it must not survive. The WINDOW
+     * (delay_quarantine_hops) is config-derived and stays. */
+    p->delay_quarantine_left = -1;
     p->delay_calls = 0;
     memset(&p->last_delay, 0, sizeof(p->last_delay));
     p->rng_state = PIPELINE_RNG_SEED;

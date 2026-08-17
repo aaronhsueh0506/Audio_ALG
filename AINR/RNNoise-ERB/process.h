@@ -39,6 +39,18 @@ extern "C" {
 #define RNNOISE_LOOKAHEAD     1     /* = config.ini lookahead_frames */
 #define RNNOISE_CONV_DELAY    (2 - RNNOISE_LOOKAHEAD)
 
+/* Model-state shape from the shipped config (three GRU layers, width 128).
+ * export_onnx.py exposes each hidden tensor as an input and *_out output; the
+ * accelerator does not retain this state internally. */
+#define RNNOISE_MODEL_IO_LAYOUT_VERSION 1
+#define RNNOISE_MODEL_GRU_COUNT          3
+#define RNNOISE_MODEL_GRU_SIZE         128
+
+typedef struct {
+    /* h1/h2/h3 each map to ONNX shape [1,1,RNNOISE_MODEL_GRU_SIZE]. */
+    float hidden[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE];
+} RNNoiseModelState;
+
 /* log_erb_dfn_mean_cplx_unit_0_4k_v8 constants.  Keep byte-for-byte aligned with
  * config.ini [feature] and checkpoint validation in train.py.
  * v4 removes the erb_norm_clip/spec_clip deployment safety clamp v3 kept on
@@ -118,6 +130,16 @@ typedef struct {
 /* 初始化狀態 (歸零 + ERB/complex norm 初值; 內部亦會呼叫
  * rnnoise_tables_init() — 見下方說明, 現為 no-op) */
 void rnnoise_state_init(RNNoiseState *st);
+
+void rnnoise_model_state_init(RNNoiseModelState *state);
+
+/* Copy h1_out/h2_out/h3_out into the next invocation's h1/h2/h3 inputs.
+ * Returns 0 on success. NULL or non-finite accelerator output returns -1 and
+ * leaves the previous state untouched, so one bad invocation cannot poison
+ * every later GRU step. */
+int rnnoise_model_state_commit(
+    RNNoiseModelState *state,
+    const float hidden_out[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]);
 
 /* F09 修正 (2026-07): ERB filterbank + root-Hann window 表格已改為編譯期
  * `static const` (由 gen_rnnoise_tables.c 產生 rnnoise_tables_gen.h,

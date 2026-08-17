@@ -54,7 +54,7 @@ four_aec_nr_res_process_pre(core, mics_interleaved, ref, &amp;pre);
 /* ... 用 pre.linear_spectra / pre.aligned_ref 算 weights ... */
 four_aec_nr_res_process_post(core, &amp;pre.token, weights, out);
 /* 外部 post 變體(如 ULCNet)不跑 post: four_aec_nr_res_abandon_pre(core, &amp;pre.token); */</pre>
-<p>Descriptor 慣例與 mono 相同(32-byte 固定 ABI、init_ex 8 點閘)。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=9</code>、wrapper <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=3</code>,兩者 descriptor_version 皆 1;wrapper 的 build_flags_hash 摺入核心的 hash(核心 layout bump 會連帶作廢外層 descriptor)。核心 config:<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,四條 lane 共用同一個決策)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘須 −1)、<code>capture_proxy_channel</code>(matcher 輸入,[0,3])、<code>max_delay_ms</code>(僅 <code>MATCHED</code> 用於 sizing delay ring,預設 1024,delay ring = ceil(ms×sr/1000)+2×hop+1)、<code>filter_length</code>(0=rate default)。</p>
+<p>Descriptor 慣例與 mono 相同(32-byte 固定 ABI、init_ex 8 點閘)。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=10</code>、wrapper <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=4</code>,兩者 descriptor_version 皆 1;wrapper 的 build_flags_hash 摺入核心的 hash(核心 layout bump 會連帶作廢外層 descriptor)。核心 config:<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,四條 lane 共用同一個決策)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘須 −1)、<code>capture_proxy_channel</code>(matcher 輸入,[0,3])、<code>max_delay_ms</code>(僅 <code>MATCHED</code> 用於 sizing delay ring,預設 1024,delay ring = ceil(ms×sr/1000)+2×hop+1)、<code>filter_length</code>(0=rate default)、<code>delay_backward_quarantine_enabled</code>(bool,預設 0;開啟後只隔離比現行 delay <b>更早</b>的新估計,且僅在 <code>capture_proxy_channel</code> 那一條 lane 仍在消除回音時;往後跳與首次取得對齊都不受影響)、<code>delay_backward_quarantine_s</code>(float,預設 1.0;隔離窗長,init 時換算成 hop 數,到期即採用——延後 pre-echo 誤鎖一個窗,不是治癒)。Quarantine 目前<b>只驗過合成場景與 C／Python 逐 hop 對照,真實錄音抽測待做</b>,產品組態維持預設 OFF。</p>
 
 <h3>PreFrame 契約(含新欄位 aligned_ref)</h3>
 <table>
@@ -136,8 +136,8 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>GSC 借用 <code>srp-&gt;a_array</code></td></tr>
 <tr><td><code>GSC</code>(RLS P/weights)</td><td>4×n_freqs 級</td><td>pool(wrapper)</td><td>lambda 0.995 經 <code>mmse_lsa_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
 <tr><td>auto-VAD(<code>noise_power/vad_hangover</code>)</td><td>純量</td><td>C struct(wrapper)</td><td>-55 dBFS / SNR 3.0 / hangover 8(retimed);EMA 0.999/0.95(retimed)</td></tr>
-<tr><td>核心合計 @16k/512</td><td>1,669,008 B</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(kiss、<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心,1,485,584 B,見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
-<tr><td>完整 wrapper 合計</td><td>1,910,544 B @16k/256(預設)/ 6,826,368 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(kiss,layout_version=3)</td></tr>
+<tr><td>核心合計 @16k/512</td><td>1,669,088 B</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(kiss、<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心,1,485,664 B,見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
+<tr><td>完整 wrapper 合計</td><td>1,910,640 B @16k/256(預設)/ 6,826,464 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(kiss,layout_version=4);由 static smoke 的 <code>Total:</code> 行印出。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
@@ -151,7 +151,7 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心(pre/post/abandon、token、fused post;layout v9)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心(pre/post/abandon、token、fused post;layout v10)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code></td><td>完整 wrapper(SRP/GSC/auto-VAD;layout v3)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_projection_kernels.h</code></td><td>投影 kernels(cmac/residual/comfort/mag2)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/third_party/{doa,GSC,utility}</code></td><td>SRP-PHAT / GSC / spatial SIMD</td></tr>
@@ -161,6 +161,6 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/pipeline.py</code> + <code>tests/test_pipeline.py</code></td><td>Python reference(copy 語意,允許多 pre-frame 在飛)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/Makefile</code></td><td>建置 <code>libaudio_pipeline_4ch.a</code>(只含 <code>4aec_nr_res.o</code> 一個 object;<code>audio_pipeline_4ch.o</code>/ULCNet 變體物件皆各自 link,不進這個 archive)、<code>test</code>、<code>audit-no-stdio</code>;也是 <code>4ch_alignulcnet/</code> 應用轉發建置的目標目錄</td></tr>
 </table>
-<p>測試實測(2026-08-16 重跑, BACKEND=kiss):本目錄 <code>make test</code> 是一站式關卡(<code>test_4aec_nr_res</code>——含 known-delay profile 區塊——+ <code>test_spatial_third_party</code> + <code>test_audio_pipeline_4ch</code> + <code>test_audio_pipeline_4ch_ulcnet</code> + 4 個 static smoke @16k/48k + <code>4ch_alignulcnet</code> 骨架 bare 與 <code>--delay-num-filters 1</code> 兩種 profile,鏡像 mono 在 <code>pipelines/Makefile</code> 的安排)共 <b>306 個 PASS 標記 / 0 FAIL</b>,四支 unit-test binary 各印 <code>All ... tests passed</code>,4 個 static smoke 各印 <code>smoke PASS</code>。<code>4ch_alignulcnet/</code> 自己的 <code>make test</code> 是委派目標,另可單獨跑,見 <code>pipeline_ulcnet_4ch.html</code>。</p>
+<p>測試實測(2026-08-16 重跑, BACKEND=kiss):本目錄 <code>make test</code> 是一站式關卡(<code>test_4aec_nr_res</code>——含 known-delay profile 區塊——+ <code>test_spatial_third_party</code> + <code>test_audio_pipeline_4ch</code> + <code>test_audio_pipeline_4ch_ulcnet</code> + 4 個 static smoke @16k/48k + <code>4ch_alignulcnet</code> 骨架 bare 與 <code>--delay-num-filters 1</code> 兩種 profile,鏡像 mono 在 <code>pipelines/Makefile</code> 的安排)共 <b>316 個 <code>PASS:</code> 標記 / 0 FAIL</b>(另有 4 個 static smoke 與 2 個板端骨架 profile 各印一次 PASS,合計 322 個 PASS 字樣),四支 unit-test binary 各印 <code>All ... tests passed</code>,4 個 static smoke 各印 <code>smoke PASS</code>。<code>4ch_alignulcnet/</code> 自己的 <code>make test</code> 是委派目標,另可單獨跑,見 <code>pipeline_ulcnet_4ch.html</code>。</p>
 </body>
 </html>

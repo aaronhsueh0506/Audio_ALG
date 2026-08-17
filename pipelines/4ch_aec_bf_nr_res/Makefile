@@ -124,12 +124,12 @@ ifeq ($(AC_LIB),)
 .PHONY: all test libs lib libaudio_pipeline_4ch.a \
         audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static 4ch_alignulcnet \
         test_4aec_nr_res test_spatial_third_party test_audio_pipeline_4ch \
-        test_audio_pipeline_4ch_ulcnet \
+        test_audio_pipeline_4ch_ulcnet dump_delay_parity \
         print-bin-dir print-obj-dir print-lib-path audit-no-stdio
 all test libs lib libaudio_pipeline_4ch.a \
 audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static 4ch_alignulcnet \
 test_4aec_nr_res test_spatial_third_party test_audio_pipeline_4ch \
-test_audio_pipeline_4ch_ulcnet \
+test_audio_pipeline_4ch_ulcnet dump_delay_parity \
 print-bin-dir print-obj-dir print-lib-path audit-no-stdio:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: cannot resolve audio_common archive" >&2; exit 1; }; \
@@ -160,7 +160,7 @@ SRCS := 4aec_nr_res.c audio_pipeline_4ch.c \
         audio_pipeline_4ch_raw.c \
         4aec_nr_res_static.c audio_pipeline_4ch_static.c \
         tests/test_4aec_nr_res.c tests/test_spatial_third_party.c \
-        tests/test_audio_pipeline_4ch.c \
+        tests/test_audio_pipeline_4ch.c tests/dump_delay_parity.c \
         ../4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c \
         $(ULCNET_DIR)/ulcnet_accelerator_adapter.c \
         ../4ch_alignulcnet/main.c $(ULCNET_DIR)/ulcnet_process.c \
@@ -239,6 +239,9 @@ $(OBJ_DIR)/test_spatial_third_party.o: tests/test_spatial_third_party.c | _cfg_g
 $(OBJ_DIR)/test_audio_pipeline_4ch.o: tests/test_audio_pipeline_4ch.c audio_pipeline_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
+$(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c 4aec_nr_res.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
 $(OBJ_DIR)/test_audio_pipeline_4ch_ulcnet.o: ../4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h audio_pipeline_4ch.h 4aec_nr_res.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
 
@@ -251,7 +254,7 @@ ifneq ($(AC_LIB),)
 .PHONY: all test libs lib libaudio_pipeline_4ch.a \
         audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static 4ch_alignulcnet \
         test_4aec_nr_res test_spatial_third_party test_audio_pipeline_4ch \
-        test_audio_pipeline_4ch_ulcnet \
+        test_audio_pipeline_4ch_ulcnet dump_delay_parity \
         audit-no-stdio
 
 all: $(PIPELINE_LIB) $(BIN_DIR)/audio_pipeline_4ch_raw \
@@ -286,6 +289,10 @@ test_4aec_nr_res: $(BIN_DIR)/test_4aec_nr_res
 test_spatial_third_party: $(BIN_DIR)/test_spatial_third_party
 test_audio_pipeline_4ch: $(BIN_DIR)/test_audio_pipeline_4ch
 test_audio_pipeline_4ch_ulcnet: $(BIN_DIR)/test_audio_pipeline_4ch_ulcnet
+# CSV dumper for the C/Python per-hop alignment parity test
+# (tests/test_delay_parity.py builds and runs it); not part of `make test`,
+# which only runs self-checking binaries.
+dump_delay_parity: $(BIN_DIR)/dump_delay_parity
 
 # Match the established mono full-stack audit tiers. NE10 is the board
 # deliverable and must be clear of the extended S2 set. Vendored KISS retains
@@ -335,6 +342,9 @@ $(GSC_LIB): FORCE
 
 $(BIN_DIR)/test_4aec_nr_res: $(OBJ_DIR)/test_4aec_nr_res.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_4aec_nr_res.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
+
+$(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
 
 $(BIN_DIR)/test_spatial_third_party: $(OBJ_DIR)/test_spatial_third_party.o $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_spatial_third_party.o $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(LDLIBS)

@@ -354,6 +354,45 @@ independent statements) also changes the behaviour hash. Refusing to load is the
 safe direction — rematerialize rather than loosening the check. Refresh the
 channel with the command below, which avoids repeating acoustic mixing:
 
+#### The one exception: verified frontend-equivalent migrations
+
+`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` in `linear_aec.py` is an explicit table of
+`recorded → current` behaviour-hash pairs that are known to produce the *same*
+`linear_error`. `require_linear_aec_contract` accepts exactly those pairs, with
+a `RuntimeWarning` naming the migration; the existing shards and the trained
+checkpoint stay valid, so **no regeneration, no re-stamping, no retraining**.
+`behavior_hash_schema` is *not* bumped — the canonicalizer is unchanged, only
+the sources it is applied to.
+
+This is not a loosening of the guard, and specifically is not a way to accept
+"old hashes" in general:
+
+- an entry is a **single explicit pair**, never a wildcard or a version floor;
+- it applies **only when `aec_behavior_hash` is the sole differing field**, so a
+  real frontend change cannot ride along with an accepted pair;
+- it is **one-way**. A checkpoint recorded under the newer hash run against the
+  older build is a downgrade and stays refused;
+- it is **single-hop**: the table is not applied transitively, so two stacked
+  migrations need the composed pair, re-verified end to end;
+- an unlisted hash is refused exactly as before.
+
+Admission requires *measured* evidence, not an argument that the change looks
+inert: render the frozen frontend (`LinearAecProcessor`, formed_output seam)
+before and after over a scene that actually reaches the changed code, and show
+the bytes are identical — plus a control proving the same harness *can* fail
+(render with the new mechanism enabled and confirm the bytes move). The
+byte-equality of a dead harness is worth nothing. The rationale and the numbers
+for each shipped entry live in the comment on the entry itself.
+
+The shipped entries cover both the deployed 8e5d05708 frontend and the later
+pre-quarantine frontend.  The intervening delay-profile productization keeps
+the frozen corpus path at MATCHED/n=5, while `lib/aec`'s backward quarantine is
+gated by `delay_backward_quarantine_enabled` (default `False`, and AIAEC never
+sets it).  Direct end-to-end renders from each recorded hash to the current
+build are byte-identical; the exact scene, byte counts and digests are recorded
+beside each table entry.  Anything that retunes a *live* mechanism does not
+qualify — rematerialize instead:
+
 ```bash
 python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
     --input data_aec/all \

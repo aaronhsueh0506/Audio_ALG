@@ -179,6 +179,25 @@ void rnnoise_state_init(RNNoiseState *st) {
     rnnoise_tables_init();  /* no-op (表格編譯期已就緒); 保留呼叫只為相容 */
 }
 
+void rnnoise_model_state_init(RNNoiseModelState *state) {
+    if (state != NULL) memset(state, 0, sizeof(*state));
+}
+
+int rnnoise_model_state_commit(
+    RNNoiseModelState *state,
+    const float hidden_out[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]) {
+    int layer;
+    int index;
+    if (state == NULL || hidden_out == NULL) return -1;
+    for (layer = 0; layer < RNNOISE_MODEL_GRU_COUNT; ++layer) {
+        for (index = 0; index < RNNOISE_MODEL_GRU_SIZE; ++index) {
+            if (!isfinite(hidden_out[layer][index])) return -1;
+        }
+    }
+    memcpy(state->hidden, hidden_out, sizeof(state->hidden));
+    return 0;
+}
+
 /* --- 前處理: analysis --- */
 
 void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float *out_im) {

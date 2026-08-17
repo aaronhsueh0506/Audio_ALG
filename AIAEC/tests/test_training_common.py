@@ -12,11 +12,15 @@ from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.DeepFilterNet_AENR import DeepFilterNetAENR
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.training_common import (
+    CALIBRATION_ONLY_FAR_INPUT_MODE,
+    DEPLOYED_FAR_INPUT_MODE,
+    FAR_INPUT_MODE_C_VALUES,
     LinearAecEngine,
     auto_device,
     build_arg_parser,
     build_plain_loaders,
     checkpoint_far_input_mode,
+    far_input_mode_c_value,
     compressed_spectral_loss,
     make_checkpoint_contract,
     read_grids,
@@ -27,12 +31,14 @@ from AIAEC.training_common import (
     split_dataset_by_sample,
 )
 from AIAEC.dataset_gen import (
+    ACCEPTED_BEHAVIOR_HASH_MIGRATIONS,
     LinearAecContract,
     LinearAecProcessor,
     MODEL_TASKS,
     make_linear_aec_contract,
     require_linear_aec_contract,
 )
+from AIAEC.dataset_gen.aec_behavior_hash import aec_python_behavior_hash
 from AINR.DeepFilterNet2.model import DeepFilterNet2
 
 
@@ -224,6 +230,36 @@ def test_far_input_mode_recorded_legacy_default_and_unknown_rejected():
         require_checkpoint_contract({'contract': unknown}, contract)
 
 
+def test_deployed_far_mode_is_a_real_c_enumerator():
+    """The deployed seam name must map to a C value; a typo cannot.
+
+    Both exporters stamp this string beside its numeric enumerator, and a
+    board rejects a descriptor whose two halves disagree.
+    """
+    assert DEPLOYED_FAR_INPUT_MODE in FAR_INPUT_MODE_C_VALUES
+    assert far_input_mode_c_value(DEPLOYED_FAR_INPUT_MODE) == 1
+    # Deployment feeds something training never produced; if these ever
+    # coincide the whole two-field record has stopped saying anything.
+    assert DEPLOYED_FAR_INPUT_MODE not in training_common.FAR_INPUT_MODES
+
+
+def test_calibration_only_far_mode_has_no_c_value_on_purpose():
+    """``model_native_far`` describes recording, never a deployed wiring.
+
+    It exists only so a calibration report can say "this model has no
+    separate far seam" instead of borrowing a deployment name. Refusing it a
+    C enumerator is the intended behaviour: an integrator who somehow got it
+    into a descriptor must fail loudly rather than land on enumerator 0
+    (raw_far) by default.
+    """
+    assert CALIBRATION_ONLY_FAR_INPUT_MODE not in FAR_INPUT_MODE_C_VALUES
+    with pytest.raises(ValueError, match='has no C enum value'):
+        far_input_mode_c_value(CALIBRATION_ONLY_FAR_INPUT_MODE)
+    # And it is not a trainable mode either.
+    assert (CALIBRATION_ONLY_FAR_INPUT_MODE
+            not in training_common.FAR_INPUT_MODES)
+
+
 def test_checkpoint_contract_rejects_changed_data_split_indices():
     grid = SignalGrid(16000, 512, 512, 256)
     linear = make_linear_aec_contract(16000, frame_size=512)
@@ -306,6 +342,17 @@ def test_linear_aec_engine_full_length_output_and_reset():
     error, echo_estimate = engine(mic, far, 16000)
     assert error.shape == mic.shape
     assert echo_estimate.shape == mic.shape
+    aligned_far = engine.get_aligned_far()
+    assert aligned_far.shape == far.shape
+    assert torch.isfinite(aligned_far).all()
+    hop = engine._engines[0].hop_size
+    used = (far.shape[-1] // hop) * hop
+    # A sub-hop tail is never fed to the engine, so it passes through as the
+    # caller's own far -- same policy as the error tail above. (What the tap
+    # CONTAINS on the processed span is pinned separately, against a shift
+    # this test's uncorrelated mic/far could not produce:
+    # test_linear_aec_engine_aligned_far_is_the_shifted_far.)
+    torch.testing.assert_close(aligned_far[:, used:], far[:, used:])
     assert torch.isfinite(error).all() and torch.isfinite(echo_estimate).all()
     torch.testing.assert_close(mic - error, echo_estimate)
 
@@ -314,11 +361,59 @@ def test_linear_aec_engine_full_length_output_and_reset():
     assert error2.shape == mic.shape
 
 
+def test_linear_aec_engine_aligned_far_is_the_shifted_far():
+    """The aligned-far tap must BE the shifted far, not merely self-consistent.
+
+    Both inference CLIs feed this tap to the model as the far branch, so what
+    it contains is a contract, not an internal detail. The scene has a known
+    bulk delay; the applied alignment is read from the engine's public stats
+    seam and the expected content is then built INDEPENDENTLY here by shifting
+    the caller's own far by that many samples -- nothing is compared against
+    the buffer the implementation copied from.
+    """
+    samples, true_delay = 32768, 1024
+    generator = torch.Generator().manual_seed(23)
+    far = (torch.randn(samples, generator=generator) * 0.05).unsqueeze(0)
+    mic = torch.zeros(1, samples)
+    mic[0, true_delay:] = 0.5 * far[0, :samples - true_delay]
+    mic += torch.randn(1, samples, generator=generator) * 0.005
+
+    engine = LinearAecEngine(n_lanes=1, sample_rate=16000, frame_size=512)
+    engine(mic, far, 16000)
+    aligned_far = engine.get_aligned_far()
+
+    lane = engine._engines[0]
+    hop = lane.hop_size
+    applied = lane.get_stats().delay_samples
+    # Non-vacuous on both counts: the alignment really moved, and it moved to
+    # the echo (early-or-exact, never late -- the same contract the C
+    # known-delay suite asserts).
+    assert applied > 0
+    assert 0 <= true_delay - applied <= 128
+    assert not torch.equal(aligned_far, far)
+
+    # Steady state, well past the acquisition hop: the tap is the caller's
+    # own far delayed by exactly `applied` samples.
+    used = (samples // hop) * hop
+    span = slice(used - 8 * hop, used)
+    shifted = slice(span.start - applied, span.stop - applied)
+    assert torch.equal(aligned_far[0, span], far[0, shifted])
+    # ... and before anything is accepted the tap is the RAW far, which is
+    # what production's pre-lock seam serves too.
+    assert torch.equal(aligned_far[0, :hop], far[0, :hop])
+
+
 def test_linear_aec_engine_rejects_sample_rate_mismatch():
     engine = LinearAecEngine(n_lanes=1, sample_rate=16000, frame_size=512)
     mic = torch.randn(1, 16000) * 0.05
     with pytest.raises(ValueError, match='sample_rate'):
         engine(mic, mic, 48000)
+
+
+def test_linear_aec_engine_aligned_far_requires_a_processed_stream():
+    engine = LinearAecEngine(n_lanes=1, sample_rate=16000, frame_size=512)
+    with pytest.raises(RuntimeError, match='has not processed audio'):
+        engine.get_aligned_far()
 
 
 def test_inference_linear_aec_matches_offline_materializer_exactly():
@@ -403,6 +498,114 @@ def test_contract_comparison_is_not_vacuous():
     stale = dataclasses.replace(recorded, aec_behavior_hash='0' * 64)
     with pytest.raises(ValueError, match='aec_behavior_hash'):
         require_linear_aec_contract(runtime.as_dict(), stale.as_dict(), 'test')
+
+
+# ---- verified frontend-equivalent behaviour-hash migrations ----------------
+#
+# These exercise the TABLE, not the live tree: `current` is set to the entry's
+# recorded NEW value rather than to whatever lib/aec hashes to right now, so a
+# later (unrelated, legitimately refused) lib/aec change does not turn the
+# migration mechanism's own tests red.
+
+def _migration_pair():
+    """The shipped migration, as (recorded_old, current_new)."""
+    assert ACCEPTED_BEHAVIOR_HASH_MIGRATIONS, (
+        'no behaviour-hash migration is shipped; if the table was emptied on '
+        'purpose because every corpus/checkpoint predating it has been retired, '
+        'retire these tests with it rather than leaving them asserting nothing'
+    )
+    return next(iter(sorted(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items())))
+
+
+def _contract_pair(pair=None):
+    """(current, recorded) contract dicts, identical except the hash field."""
+    base = make_linear_aec_contract(16000, frame_size=512).as_dict()
+    old, new = _migration_pair() if pair is None else pair
+    return dict(base, aec_behavior_hash=new), dict(base, aec_behavior_hash=old)
+
+
+def test_migration_table_is_one_way_and_not_chained():
+    """Structural invariants the lookup relies on.
+
+    The lookup is a single hop and is never re-applied to its own output, so a
+    value appearing as another entry's key would read as a two-step migration
+    that silently does not work. An identity entry would be dead weight: equal
+    dicts return before the table is consulted at all.
+    """
+    table = ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
+    assert not set(table.values()) & set(table), (
+        'a migration target is also a migration source; the table is not '
+        'applied transitively, so this pair would silently never resolve'
+    )
+    for old, new in table.items():
+        assert old != new
+        assert len(old) == 64 and len(new) == 64
+
+
+def test_migration_targets_are_the_live_frontend_hash():
+    """Every one-hop migration must terminate at the build being shipped.
+
+    The pair-level tests below intentionally use the literal table values, so
+    they would remain green after a later lib/aec signal-path edit made every
+    entry stale. Pinning the targets to the live digest closes that gap.
+    """
+    assert ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
+    assert set(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.values()) == {
+        aec_python_behavior_hash()
+    }
+
+
+@pytest.mark.parametrize(
+    "pair", sorted(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items())
+)
+def test_whitelisted_behaviour_hash_migration_is_accepted_with_a_warning(pair):
+    """The recorded-vs-current pair in the table loads, and says so.
+
+    This is the whole point of the table: a checkpoint trained on shards
+    materialized by the older frontend stays loadable, with no rematerialization
+    and no retraining, because the pair is backed by byte-identical evidence.
+    """
+    current, recorded = _contract_pair(pair)
+    with pytest.warns(RuntimeWarning, match='frontend-equivalent migration'):
+        require_linear_aec_contract(current, recorded, 'test')
+
+
+@pytest.mark.parametrize(
+    "pair", sorted(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items())
+)
+def test_whitelisted_migration_does_not_excuse_a_second_difference(pair):
+    """The hash must be the ONLY differing field.
+
+    Otherwise a migration entry becomes a general-purpose amnesty: a real
+    frontend change (here a different filter length) would ride along with an
+    accepted hash pair and feed inference a `linear_error` from another filter.
+    """
+    current, recorded = _contract_pair(pair)
+    current['filter_length'] += current['hop_size']
+    with pytest.raises(ValueError, match='filter_length'):
+        require_linear_aec_contract(current, recorded, 'test')
+
+
+def test_unlisted_behaviour_hash_is_still_refused():
+    current, _recorded = _contract_pair()
+    unlisted = dict(current, aec_behavior_hash='0' * 64)
+    with pytest.raises(ValueError, match='aec_behavior_hash'):
+        require_linear_aec_contract(current, unlisted, 'test')
+
+
+@pytest.mark.parametrize(
+    "pair", sorted(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items())
+)
+def test_behaviour_hash_migration_is_refused_in_reverse(pair):
+    """NEW recorded against an OLD build is a downgrade, and stays refused.
+
+    The evidence backing an entry is directional: it says the newer frontend
+    reproduces the older one's output, not that an older build can stand in for
+    a newer one, whose mechanisms it does not have.
+    """
+    current, recorded = _contract_pair(pair)
+    with pytest.raises(ValueError, match='aec_behavior_hash'):
+        require_linear_aec_contract(recorded, current, 'test')
 
 
 def test_resnr_trainers_do_not_import_or_execute_live_linear_aec():

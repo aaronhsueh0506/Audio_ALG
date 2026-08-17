@@ -3,8 +3,10 @@
  * Align-CRUSE, Align-ULCNet, DeepVQE-S, CAGCRN and GTCRN-AENR all use the
  * same 16 kHz / 512 / 256 centered sqrt-Hann framing.  This API deliberately
  * aliases the already parity-tested Align-ULCNet implementation instead of
- * maintaining five copies.  Model-specific masks, CCM filters and recurrent
- * states remain inside the accelerator boundary.
+ * maintaining five copies. Model-specific masks/CCM filters cross the model
+ * output boundary, while every recurrent/conv/attention state tensor is
+ * caller-owned and returned to the stateless accelerator on the next call.
+ * Exact state names and shapes are emitted by export_streaming_onnx.py.
  */
 #ifndef AIAEC_PROCESS_H
 #define AIAEC_PROCESS_H

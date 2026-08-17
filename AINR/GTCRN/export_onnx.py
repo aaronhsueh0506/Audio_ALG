@@ -6,6 +6,7 @@ import configparser
 import hashlib
 import json
 import os
+import sys
 
 import numpy as np
 import torch
@@ -15,8 +16,31 @@ from model import GTCRN
 from train import build_contract, require_checkpoint_contract
 from stream_model import StreamGTCRN, initial_inputs
 
-
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
+if _AUDIO_ALG_ROOT not in sys.path:
+    sys.path.insert(0, _AUDIO_ALG_ROOT)
+
+# Package-qualified so it cannot collide with this project's own flat
+# ``model``/``train`` modules. The schema encoder is one contract across every
+# stateless exporter in the repo; a hand-typed shape string is a second copy
+# that drifts the moment a cache extent changes.
+from AINR.DeepFilterNet2.export_onnx import (  # noqa: E402
+    _schema,
+    set_onnx_metadata,
+)
+
+
+# Kept numerically equal to GTCRN_MODEL_LAYOUT_VERSION in gtcrn_process.h,
+# which declares the caller-owned cache struct this graph consumes and emits.
+# tests/test_gtcrn_export_contract.py pins the two together.
+STATE_LAYOUT_VERSION = 1
+
+INPUT_NAMES = ('mix', 'conv_cache', 'tra_cache', 'inter_cache')
+
+OUTPUT_NAMES = (
+    'enhanced', 'conv_cache_out', 'tra_cache_out', 'inter_cache_out',
+)
 
 
 def file_sha256(path):
@@ -50,6 +74,31 @@ def build_stream_model(config_path, checkpoint_path):
                     'hop_len': hop_len, 'sub1': sub1, 'sub2': sub2}
 
 
+def build_metadata(checkpoint_path, grid, inputs, outputs):
+    """The exported graph's metadata.
+
+    Separate from ``main`` so the contract test can compare
+    ``state_layout_version`` against gtcrn_process.h without an ONNX export.
+    """
+    return {
+        'model_family': 'GTCRN',
+        'boundary': 'stateless_streaming_explicit_state',
+        'state_layout_version': STATE_LAYOUT_VERSION,
+        'checkpoint_sha256': file_sha256(checkpoint_path),
+        'sample_rate': grid['sr'], 'n_fft': grid['n_fft'],
+        'win_len': grid['win_len'], 'hop_len': grid['hop_len'],
+        'erb_boundary': 'inside_graph',
+        'c_prepost': 'gtcrn_process.c/gtcrn_process.h',
+        'input_feature_frames': 1,
+        'output_frames_per_invocation': 1,
+        'accelerator_persistent_state': False,
+        'recurrent_state': 'conv_tra_inter_caches_explicit_input_output',
+        'state_handoff': dict(zip(INPUT_NAMES[1:], OUTPUT_NAMES[1:])),
+        'input_schema': _schema(INPUT_NAMES, inputs),
+        'output_schema': _schema(OUTPUT_NAMES, outputs),
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',
@@ -61,26 +110,22 @@ def main():
     args = parser.parse_args()
     model, grid = build_stream_model(args.config, args.model)
     inputs = initial_inputs()
+    # Cloned so the schema comes from the real graph tensors without the
+    # traced export seeing anything this forward pass touched.
+    with torch.no_grad():
+        outputs = model(*(tensor.clone() for tensor in inputs))
     os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
     torch.onnx.export(
         model, inputs, args.output,
-        input_names=('mix', 'conv_cache', 'tra_cache', 'inter_cache'),
-        output_names=('enhanced', 'conv_cache_out', 'tra_cache_out', 'inter_cache_out'),
+        input_names=INPUT_NAMES,
+        output_names=OUTPUT_NAMES,
         opset_version=args.opset, do_constant_folding=True,
     )
     import onnx
     graph = onnx.load(args.output)
     onnx.checker.check_model(graph)
     graph = onnx.shape_inference.infer_shapes(graph)
-    onnx.helper.set_model_props(graph, {
-        'model_family': 'GTCRN', 'boundary': 'one_stft_frame_explicit_state',
-        'checkpoint_sha256': file_sha256(args.model),
-        'sample_rate': str(grid['sr']), 'n_fft': str(grid['n_fft']),
-        'win_len': str(grid['win_len']), 'hop_len': str(grid['hop_len']),
-        'erb_boundary': 'inside_graph', 'c_prepost': 'gtcrn_process.c/gtcrn_process.h',
-        'input_schema': 'mix[1,257,1,2];conv_cache[2,1,16,16,33];tra_cache[2,3,1,1,16];inter_cache[2,1,33,16]',
-        'output_schema': 'enhanced[1,257,1,2];same three updated caches',
-    })
+    set_onnx_metadata(graph, build_metadata(args.model, grid, inputs, outputs))
     onnx.save(graph, args.output)
     with open(os.path.splitext(args.output)[0] + '.json', 'w', encoding='utf-8') as fp:
         json.dump({p.key: p.value for p in graph.metadata_props}, fp,
@@ -90,9 +135,7 @@ def main():
         import onnxruntime as ort
         verify_inputs = initial_inputs()
         ort_feed = {name: tensor.detach().numpy().copy()
-                    for name, tensor in zip(
-                        ('mix', 'conv_cache', 'tra_cache', 'inter_cache'),
-                        verify_inputs)}
+                    for name, tensor in zip(INPUT_NAMES, verify_inputs)}
         with torch.no_grad():
             expected = model(*(tensor.clone() for tensor in verify_inputs))
         session = ort.InferenceSession(args.output, providers=['CPUExecutionProvider'])

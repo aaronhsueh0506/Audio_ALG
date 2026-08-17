@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "DeepFilterNet2/dfn2_process.h"
+#include "DeepFilterNet2/dfn2_model_io.h"
 #include "DeepFilterNet3/dfn3_process.h"
 #include "GTCRN/gtcrn_process.h"
 
@@ -202,6 +203,74 @@ static int test_dfn_stream_alignment(void)
     return 1;
 }
 
+static int test_dfn2_model_io(void)
+{
+    static DFN2ModelIOState state;
+    static DFN2ModelIOState committed;
+    static float encoder_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
+                             [DFN2_MODEL_GRU_HIDDEN];
+    static float erb_next[DFN2_MODEL_ERB_GRU_LAYERS]
+                         [DFN2_MODEL_GRU_HIDDEN];
+    static float df_next[DFN2_MODEL_DF_GRU_LAYERS]
+                        [DFN2_MODEL_GRU_HIDDEN];
+    static float pathway_next[DFN2_MODEL_ENCODER_CHANNELS]
+                              [DFN2_MODEL_DF_PATHWAY_HISTORY]
+                              [DFN2_DF_BINS];
+    float erb[DFN2_N_ERB];
+    float spec[2][DFN2_DF_BINS];
+
+    dfn2_model_io_init(&state);
+    for (int frame = 0; frame < 3; ++frame) {
+        for (int band = 0; band < DFN2_N_ERB; ++band)
+            erb[band] = (float)(100 * frame + band);
+        for (int channel = 0; channel < 2; ++channel)
+            for (int bin = 0; bin < DFN2_DF_BINS; ++bin)
+                spec[channel][bin] =
+                    (float)(1000 * frame + 100 * channel + bin);
+        CHECK(dfn2_model_io_push_features(&state, erb, spec) == (frame != 0),
+              "DFN2 model window warms up for one lookahead frame");
+    }
+    CHECK(state.erb_window[0][7] == 7.0f &&
+          state.erb_window[1][7] == 107.0f &&
+          state.erb_window[2][7] == 207.0f,
+          "DFN2 ERB model window keeps [t-1,t,t+1]");
+    CHECK(state.spec_window[1][0][9] == 109.0f &&
+          state.spec_window[1][2][9] == 2109.0f,
+          "DFN2 complex model window preserves channel-major layout");
+
+    memset(encoder_next, 0x3c, sizeof(encoder_next));
+    memset(erb_next, 0x4d, sizeof(erb_next));
+    memset(df_next, 0x5e, sizeof(df_next));
+    memset(pathway_next, 0x6f, sizeof(pathway_next));
+    CHECK(dfn2_model_io_commit_state(&state, encoder_next, erb_next, df_next,
+                                     pathway_next) == 0 &&
+          memcmp(state.encoder_gru_hidden, encoder_next,
+                 sizeof(encoder_next)) == 0 &&
+          memcmp(state.erb_gru_hidden, erb_next, sizeof(erb_next)) == 0 &&
+          memcmp(state.df_gru_hidden, df_next, sizeof(df_next)) == 0 &&
+          memcmp(state.df_convp_history, pathway_next,
+                 sizeof(pathway_next)) == 0,
+          "DFN2 model state outputs become the next invocation inputs");
+
+    committed = state;
+    memset(encoder_next, 0x41, sizeof(encoder_next));
+    memset(erb_next, 0x41, sizeof(erb_next));
+    memset(df_next, 0x41, sizeof(df_next));
+    memset(pathway_next, 0x41, sizeof(pathway_next));
+    pathway_next[DFN2_MODEL_ENCODER_CHANNELS - 1]
+                [DFN2_MODEL_DF_PATHWAY_HISTORY - 1]
+                [DFN2_DF_BINS - 1] = NAN;
+    CHECK(dfn2_model_io_commit_state(&state, encoder_next, erb_next, df_next,
+                                     pathway_next) != 0,
+          "DFN2 commit refuses a non-finite state batch");
+    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
+          "DFN2 refusal preserves every previously committed state byte");
+    CHECK(dfn2_model_io_commit_state(NULL, encoder_next, erb_next, df_next,
+                                     pathway_next) != 0,
+          "DFN2 commit refuses a null destination");
+    return 1;
+}
+
 static int test_dfn2(uint64_t* digest)
 {
     static DFN2State state;
@@ -337,12 +406,79 @@ static int test_gtcrn(uint64_t* digest)
     return 1;
 }
 
+static int test_gtcrn_model_state(void)
+{
+    static GTCRNModelState state;
+    static GTCRNModelState next;
+    static GTCRNModelState committed;
+    gtcrn_model_state_init(&state);
+    CHECK(state.conv_cache[1][0][15][15][32] == 0.0f &&
+          state.tra_cache[1][2][0][0][15] == 0.0f &&
+          state.inter_cache[1][0][32][15] == 0.0f,
+          "GTCRN model state starts at zero");
+    memset(&next, 0x5a, sizeof(next));
+    CHECK(gtcrn_model_state_commit(&state, &next.conv_cache[0][0][0][0][0],
+                                   &next.tra_cache[0][0][0][0][0],
+                                   &next.inter_cache[0][0][0][0]) == 0,
+          "GTCRN commit accepts a finite state");
+    CHECK(memcmp(&state, &next, sizeof(state)) == 0,
+          "GTCRN state outputs become the next invocation inputs");
+
+    /* Every byte of the rejected batch DIFFERS from the committed state, so a
+     * non-transactional implementation that writes the good elements before
+     * reaching the bad one leaves a visible difference. With a byte pattern
+     * equal to what is already stored, a partial writeback would be
+     * indistinguishable from a clean refusal. */
+    committed = state;
+    memset(&next, 0x41, sizeof(next));
+    next.inter_cache[1][0][32][15] = NAN;
+    CHECK(gtcrn_model_state_commit(&state, &next.conv_cache[0][0][0][0][0],
+                                   &next.tra_cache[0][0][0][0][0],
+                                   &next.inter_cache[0][0][0][0]) != 0,
+          "GTCRN commit refuses a NaN cache");
+    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
+          "GTCRN NaN refusal leaves the previous state byte-identical");
+
+    /* The bad element sits in the FIRST cache here, so the two cases together
+     * also cover refusal before and after the earlier caches are validated. */
+    memset(&next, 0x41, sizeof(next));
+    next.conv_cache[0][0][0][0][0] = INFINITY;
+    CHECK(gtcrn_model_state_commit(&state, &next.conv_cache[0][0][0][0][0],
+                                   &next.tra_cache[0][0][0][0][0],
+                                   &next.inter_cache[0][0][0][0]) != 0,
+          "GTCRN commit refuses an Inf cache");
+    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
+          "GTCRN Inf refusal leaves the previous state byte-identical");
+
+    CHECK(gtcrn_model_state_commit(NULL, &next.conv_cache[0][0][0][0][0],
+                                   &next.tra_cache[0][0][0][0][0],
+                                   &next.inter_cache[0][0][0][0]) != 0 &&
+          gtcrn_model_state_commit(&state, NULL,
+                                   &next.tra_cache[0][0][0][0][0],
+                                   &next.inter_cache[0][0][0][0]) != 0,
+          "GTCRN commit refuses null arguments");
+    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
+          "GTCRN preserved state survives every refused commit");
+
+    /* A finite batch must still be accepted after the refusals, or the guard
+     * could be a permanent latch rather than a per-call check. */
+    memset(&next, 0x41, sizeof(next));
+    CHECK(gtcrn_model_state_commit(&state, &next.conv_cache[0][0][0][0][0],
+                                   &next.tra_cache[0][0][0][0][0],
+                                   &next.inter_cache[0][0][0][0]) == 0 &&
+          memcmp(&state, &next, sizeof(state)) == 0,
+          "GTCRN commit still accepts a finite state after a refusal");
+    return 1;
+}
+
 static int run_all_tests(void)
 {
     uint64_t digest = UINT64_C(1469598103934665603);
+    CHECK(test_dfn2_model_io(), "DFN2 stateless model I/O");
     CHECK(test_dfn_stream_alignment(), "DFN streaming head alignment");
     CHECK(test_dfn2(&digest), "DFN2 C pre/post");
     CHECK(test_dfn3(&digest), "DFN3 C pre/post");
+    CHECK(test_gtcrn_model_state(), "GTCRN stateless model I/O");
     CHECK(test_gtcrn(&digest), "GTCRN C pre/post");
     printf("backend=%s/%s/%s digest=%016llx\n",
            dfn2_simd_backend(), dfn3_simd_backend(), gtcrn_simd_backend(),

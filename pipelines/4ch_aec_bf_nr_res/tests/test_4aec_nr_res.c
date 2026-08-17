@@ -386,6 +386,36 @@ static void test_invalid_configs(void) {
     cfg.capture_proxy_channel = 4;
     CHECK(four_aec_nr_res_create(&cfg) == NULL,
           "invalid capture proxy is rejected");
+
+    /* Backward-jump quarantine. The WINDOW is checked even though the enable
+     * defaults to 0: a config that would misbehave the moment someone flips
+     * one field must not pass validation today. The accept row at the end is
+     * what stops all of this from being a comparison that cannot fail. */
+    cfg = four_aec_nr_res_default_config(16000);
+    CHECK(cfg.delay_backward_quarantine_enabled == 0 &&
+          cfg.delay_backward_quarantine_s == 1.0f,
+          "the quarantine defaults to OFF with a 1.0 s window");
+    cfg.delay_backward_quarantine_enabled = 2;
+    CHECK(four_aec_nr_res_create(&cfg) == NULL,
+          "a non-boolean quarantine enable is rejected");
+
+    cfg = four_aec_nr_res_default_config(16000);
+    cfg.delay_backward_quarantine_s = -1.0f;
+    CHECK(four_aec_nr_res_create(&cfg) == NULL,
+          "a negative quarantine window is rejected");
+    cfg.delay_backward_quarantine_s = 3601.0f;
+    CHECK(four_aec_nr_res_create(&cfg) == NULL,
+          "an out-of-range quarantine window is rejected");
+    cfg.delay_backward_quarantine_s = (float)NAN;
+    CHECK(four_aec_nr_res_create(&cfg) == NULL,
+          "a NaN quarantine window is rejected");
+
+    cfg = four_aec_nr_res_default_config(16000);
+    cfg.delay_backward_quarantine_enabled = 1;
+    cfg.delay_backward_quarantine_s = 0.25f;
+    CHECK(four_aec_nr_res_get_mem_requirements(&cfg, &req) == 0,
+          "a valid enabled quarantine config is ACCEPTED (so the rows above "
+          "are a real check, not an identity)");
 }
 
 /* A frame token is stamped with the owning instance's pointer
@@ -1104,6 +1134,14 @@ typedef struct KnownDelayRun {
     int applied_delay;
     float confidence;
     int changed_events;
+    int first_changed_hop;
+    /* Hops on which the published `solid` disagreed with the acceptance
+     * predicate recomputed from the seam's OWN estimator fields, and hops on
+     * which `solid` was already 1 before any alignment generation had been
+     * accepted. Both must stay 0: see the invariant note above the recompute
+     * in known_delay_run(). */
+    int solid_disagreements;
+    int solid_before_accept;
     double us_per_hop;
 } KnownDelayRun;
 
@@ -1123,10 +1161,12 @@ static void known_delay_run(int num_filters, int hops,
     uint32_t rng = 0x1234567u;
     clock_t t0, t1;
     int hop, i, ch;
+    int expect_solid = 0;
 
     memset(out, 0, sizeof(*out));
     out->lock_hop = -1;
     out->applied_delay = -1;
+    out->first_changed_hop = -1;
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
     cfg.enable_cng = 0;
@@ -1155,7 +1195,34 @@ static void known_delay_run(int num_filters, int hops,
         }
         if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
             FOUR_AEC_NR_RES_OK) break;
-        if (pre.delay.changed) out->changed_events += 1;
+        /* The published `solid` must be exactly "a usable accepted alignment
+         * generation exists", recomputed here from the OTHER published
+         * estimator fields rather than read back from `solid` itself:
+         * confidence >= 1.0 IS delay_aec3_is_solid(), estimator_updates IS
+         * delay_aec3_n_updates(), and the remaining acceptance term
+         * (estimated >= 0) is implied by confidence >= 1.0 -- a confidence
+         * above 0 requires a produced estimate, and a produced estimate is
+         * never negative. Sticky, because a confidence dip must not retract
+         * an alignment the audio path is still applying.
+         *
+         * MUTATIONS: publishing `solid` on COARSE confidence (`state.solid =
+         * now_usable || delay_aec3_confidence(...) >= 0.5f`) makes it lead
+         * the accepted delay and BOTH counters below go non-zero; widening
+         * the wrapper's own `n_updates >= 3` acceptance term (e.g. to 30)
+         * makes it lag instead, and solid_disagreements alone goes
+         * non-zero. */
+        if (pre.delay.changed) {
+            out->changed_events += 1;
+            if (out->first_changed_hop < 0) out->first_changed_hop = hop;
+        }
+        {
+            int accepted_now = pre.delay.confidence >= 1.0f &&
+                               pre.delay.estimator_updates >= 3;
+            expect_solid = expect_solid || accepted_now;
+            if (pre.delay.solid != expect_solid) out->solid_disagreements += 1;
+            if (pre.delay.solid && out->first_changed_hop < 0)
+                out->solid_before_accept += 1;
+        }
         if (!out->locked && pre.delay.solid) {
             out->locked = 1;
             out->lock_hop = hop;
@@ -1223,6 +1290,27 @@ static void test_known_delay_acquisition_and_coverage(void) {
                  "n=%d exactly one alignment generation for a static delay "
                  "(%d)", n, in_range.changed_events);
         CHECK(in_range.changed_events == 1, label);
+
+        /* `solid` publishes "a usable accepted alignment exists", so it can
+         * never lead the accepted delay: the hop it first goes 1 is exactly
+         * the hop the generation is accepted on, and it agrees with the
+         * acceptance predicate on EVERY hop of the run (in range and out of
+         * range alike -- the out-of-range run must stay 0/0 too, which is
+         * what stops these from being vacuous). */
+        snprintf(label, sizeof(label),
+                 "n=%d `solid` never leads the accepted delay (first solid "
+                 "hop %d, first alignment generation hop %d, %d early-solid "
+                 "hops)", n, in_range.lock_hop, in_range.first_changed_hop,
+                 in_range.solid_before_accept);
+        CHECK(in_range.solid_before_accept == 0 &&
+              in_range.first_changed_hop == in_range.lock_hop, label);
+        snprintf(label, sizeof(label),
+                 "n=%d published `solid` equals the sticky acceptance "
+                 "predicate on every hop (%d in-range and %d out-of-range "
+                 "disagreements)", n, in_range.solid_disagreements,
+                 out_of_range.solid_disagreements);
+        CHECK(in_range.solid_disagreements == 0 &&
+              out_of_range.solid_disagreements == 0, label);
 
         snprintf(label, sizeof(label),
                  "n=%d does NOT acquire a %d ms bulk delay (beyond its "

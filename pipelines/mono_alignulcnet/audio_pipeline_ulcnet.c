@@ -12,24 +12,25 @@
  *      AEC aligns far internally (delay estimation stays on, preset default).
  *   2. error tap  = AecResContext.formed_hop (the refined/coarse-selected +
  *      crossfaded linear error -- the hop the AEC's own spectra describe).
- *   3. far tap + delay status = aec_get_linear_context(): in
- *      ULCNET_FAR_ALIGNED the far branch is aligned_far_hop (byte-identical
- *      to what the linear filter consumed this hop) and delay_state gates
- *      the model APPLICATION; in ULCNET_FAR_RAW (default) the far branch is
- *      the caller's raw ref hop and application is never lock-gated -- see
- *      the header's far-input contract.
+ *   3. far tap + delay status = aec_get_linear_context(): the model always
+ *      receives aligned_far_hop, byte-identical to the far hop consumed by
+ *      the linear filter. Before acquisition this seam deliberately carries
+ *      raw far, so the model's D window can handle the remaining offset.
  *   4. Both hops go into two UlcnetAnalysis instances (0/2/1 emission); for
- *      each emitted frame pair the model callback runs (stepped
- *      unconditionally -- constant compute -- but its output is applied
- *      only when infer() returned 0, the output frame is fully finite, and
- *      the mode's gating passes; otherwise the error frame passes through
- *      unchanged, fail-open); the chosen frame goes into UlcnetSynthesis
+ *      each emitted frame pair the model callback runs; its output is
+ *      applied only when infer() returned 0 and the output frame is fully
+ *      finite; otherwise the error passes unchanged (fail-open); the chosen
+ *      frame goes into UlcnetSynthesis
  *      (WOLA). hop #0 emits nothing -> zeros; hop #p output corresponds to
  *      input hop p-1 (one-hop latency).
- *   5. On a CHANGED delay event, model->reset (if set) runs BEFORE that
- *      hop's infer() so the runtime flushes its far attention ring + logit
- *      history; the C STFT states keep running (1-2 frame transient
- *      accepted; crossfade is a later phase).
+ *   5. On a CHANGED event, or FIXED's first UNLOCKED->LOCKED transition,
+ *      model->reset (if set) runs BEFORE that hop's frames so the runtime
+ *      flushes its far attention ring + logit history, and the identity
+ *      reprime is armed: the C STFT states keep running, so the next
+ *      AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES emitted frames still straddle
+ *      the boundary and are emitted as identity WITHOUT stepping the model
+ *      (header: "Identity reprime"; the constant is measured by the
+ *      straddle-derivation test, and option B is deferred).
  *
  * Constraints: C99, -ffp-contract=off (pipelines/Makefile appends it last),
  * no stdio in this TU (all failures are signalled by NULL/-1 returns only),
@@ -67,8 +68,11 @@
  * separately-carved pointer. Version 4 grows the self-resident config with
  * independent filter-length and AEC delay controls. Version 5 grows the
  * self-resident UlcnetModel copy by the published model-I/O descriptor
- * pointer. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 5u
+ * pointer. Version 6 removes the obsolete runtime far-mode field, fixes
+ * production to the AEC aligned-far seam, and adds delay-transition
+ * bookkeeping. Version 7 adds the identity-reprime counter to the control
+ * block. */
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 7u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
  * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"/\"ne10\"
@@ -103,7 +107,19 @@ struct AudioPipelineUlcnet {
     int sample_rate, hop, fft_sz, n_freqs;
 
     UlcnetModel model;            /* by-value copy of cfg.model              */
-    UlcnetFarInputMode far_input_mode;  /* by-value copy of cfg's mode       */
+
+    /* MATCHED acquisitions report CHANGED. FIXED mode instead moves from
+     * raw far during ring fill directly to LOCKED, so track that first
+     * usable transition and flush external recurrent state at the seam. */
+    AecLinearDelayState last_delay_state;
+    uint64_t processed_hops;
+
+    /* Emitted frames still straddling the last alignment boundary: armed to
+     * AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES at the boundary hop, decremented
+     * once per EMITTED frame (not per hop -- hop #1 emits two). While
+     * nonzero the frame takes the identity path and the model is not
+     * stepped. Re-armed, never accumulated, by a boundary during a reprime. */
+    int reprime_frames;
 
     Aec* aec;                     /* points into `pool` below                */
     FftHandle* fft;               /* points into `pool`; ONE shared 512-point
@@ -146,9 +162,8 @@ struct AudioPipelineUlcnet {
  * its defined enum values (rather than silently falling through
  * aec_config_from_preset's own balanced-default fallback). The model's
  * callbacks are deliberately NOT validated -- an all-zero model is the
- * supported identity/fail-open case -- but a model that PUBLISHES a
- * model-I/O contract has its far_input_mode checked against the config's,
- * so an inconsistent pair is rejected before a pool is ever sized. */
+ * supported identity/fail-open case. A published model-I/O descriptor must
+ * match the fixed aligned-far production ABI. */
 static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
                                          AecConfig* aec_cfg,
                                          int* hop, int* fft_sz, int* n_freqs) {
@@ -165,27 +180,8 @@ static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
             return -1;
     }
 
-    /* Deployment contract: only the two defined far-input modes exist.
-     * RAW (0) is the memset-zero/default, release case. */
-    switch (cfg->far_input_mode) {
-        case ULCNET_FAR_RAW:
-        case ULCNET_FAR_ALIGNED:
-            break;
-        default:
-            return -1;
-    }
-
-    /* Checkpoint/pipeline agreement. A runtime that published its model-I/O
-     * contract states which far stream its checkpoint was trained on; wiring
-     * it to the other far branch is an input-distribution change that
-     * nothing downstream can detect, so it is rejected here instead. A NULL
-     * descriptor (the all-zero identity model, and any runtime predating the
-     * field) publishes no contract and is left ungated. An undefined
-     * descriptor value needs no separate test: cfg->far_input_mode has just
-     * been narrowed to the two defined values, so anything else fails this
-     * equality. */
-    if (!ulcnet_far_input_mode_agrees(cfg->model.io_descriptor,
-                                      (int)cfg->far_input_mode))
+    if (cfg->model.io_descriptor &&
+        ulcnet_model_io_descriptor_validate(cfg->model.io_descriptor) != 0)
         return -1;
 
     *hop = ULCNET_HOP;
@@ -206,6 +202,11 @@ static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
         cfg->delay_mode == AEC_DELAY_MATCHED ? 1 : 0;
     aec_cfg->enable_res         = 0;   /* linear AEC + external NN post seam */
     aec_cfg->return_res_context = 1;   /* fills formed_hop/error_spec/...    */
+    /* delay_backward_quarantine_enabled stays at lib/aec's default (OFF).
+     * The guard holds backward candidates only, for a bounded window after
+     * which it accepts -- so a pre-echo mis-lock is DELAYED by the window,
+     * not cured. Enabling it here is therefore a policy decision, and it
+     * waits on a real-audio spot check with the deployed checkpoint. */
     /* spatial_linear_context stays 0: this is the single-lane seam, and the
      * res context (formed_hop) must be populated. Delay estimation stays on
      * (preset default) -- the AEC aligns far internally. */
@@ -282,10 +283,12 @@ static uint32_t audio_pipeline_ulcnet_build_flags_hash(void) {
      * scratch) and the carve grew a trailing shared `fft` handle region.
      * v5: the self-resident `model` copy grew io_descriptor, so the token
      * names it explicitly -- the control block is bigger even though the
-     * carve ORDER is unchanged. */
-    h = ulcnet_fnv1a_str("|carve:self(model(io_descriptor),far_input_mode,"
-                         "aec_delay_cfg,ana_err,ana_far,"
-                         "synth,frame_scratch,ulcnet_window),aec,fft", h);
+     * carve ORDER is unchanged. v6 removes the runtime far-mode field and
+     * adds delay-transition bookkeeping. v7 adds the identity-reprime
+     * counter beside it. */
+    h = ulcnet_fnv1a_str("|carve:self(model(io_descriptor),"
+                         "aec_delay_cfg,delay_transition,reprime,ana_err,"
+                         "ana_far,synth,frame_scratch,ulcnet_window),aec,fft", h);
     h = ulcnet_fnv1a_str("|align16", h);
     return h;
 }
@@ -314,7 +317,6 @@ AudioPipelineUlcnetConfig audio_pipeline_ulcnet_default_config(int sample_rate) 
     cfg.delay_num_filters = 5;
     cfg.fixed_delay_samples = -1;
     cfg.aec_preset  = AEC_PRESET_BALANCED;
-    cfg.far_input_mode = ULCNET_FAR_RAW;  /* release default */
     return cfg;
 }
 
@@ -405,7 +407,6 @@ AudioPipelineUlcnet* audio_pipeline_ulcnet_init_ex(void* mem, size_t bytes,
     p->sample_rate = cfg->sample_rate;
     p->hop = hop; p->fft_sz = fft_sz; p->n_freqs = n_freqs;
     p->model      = cfg->model;
-    p->far_input_mode = cfg->far_input_mode;
     p->pool       = sub_pool;
     p->pool_size  = sub_bytes;
     p->owned_heap = NULL;
@@ -452,46 +453,50 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
     aec_get_res_context(p->aec, &rctx);
     aec_get_linear_context(p->aec, &lctx);
 
-    /* Stage 3: delay-change event -> flush the runtime's far attention ring
-     * + logit history BEFORE this hop's inference (both far modes: even
-     * with a raw far branch, the error branch realigns discontinuously at
-     * this boundary). CHANGED is reported exactly on the hop whose
-     * processing bumped the alignment generation (first acquisition
-     * included); the next hop reads LOCKED again. The C STFT states below
-     * keep running across the change (1-2 frame transient accepted;
-     * crossfade is a later phase). */
-    if (lctx.delay_state == AEC_LINEAR_DELAY_CHANGED && p->model.reset)
-        p->model.reset(p->model.user);
+    /* Stage 3: alignment boundary -> flush the runtime's far attention ring
+     * + logit history BEFORE this hop's inference, and arm the identity
+     * reprime that keeps the straddling frames out of the freshly cleared
+     * state (header: "Identity reprime"). MATCHED reports CHANGED on the hop
+     * that bumps the generation. FIXED has no estimator event, so its first
+     * UNLOCKED->LOCKED transition is detected locally. The C STFT states
+     * keep running across the change; the reprime, not a crossfade, is what
+     * covers the straddling frames in this version. The counter is armed
+     * whether or not a runtime is attached, so the frame policy does not
+     * depend on the model's presence. */
+    if (lctx.delay_state == AEC_LINEAR_DELAY_CHANGED ||
+        (p->processed_hops != 0 &&
+         p->last_delay_state == AEC_LINEAR_DELAY_UNLOCKED &&
+         lctx.delay_state == AEC_LINEAR_DELAY_LOCKED)) {
+        if (p->model.reset) p->model.reset(p->model.user);
+        p->reprime_frames = AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES;
+    }
+    p->last_delay_state = lctx.delay_state;
+    p->processed_hops += 1;
 
     /* Stage 4: push BOTH hops (the two analyses must stay frame-locked, so
      * each is fed every hop unconditionally). 0/2/1 emission: hop #0 emits
      * nothing, hop #1 emits two frames, then one per hop. The far branch
-     * source follows the deployment contract: RAW feeds the caller's ref
-     * hop (the trained far stream; same-hop with the error tap), ALIGNED
-     * feeds the AEC's aligned far. */
+     * source is always the AEC's aligned far. */
     n_frames = ulcnet_analysis_push(&p->ana_err, rctx.formed_hop, p->err_re, p->err_im);
     (void)ulcnet_analysis_push(&p->ana_far,
-                               p->far_input_mode == ULCNET_FAR_RAW
-                                   ? ref : lctx.aligned_far_hop,
+                               lctx.aligned_far_hop,
                                p->far_re, p->far_im);
 
     /* Stage 5: per emitted frame pair, run the model and synthesize. The
-     * model is STEPPED whenever an infer callback exists (constant per-hop
-     * compute/timing); its output is APPLIED only when infer() returned 0,
-     * every output value is finite (never let NaN/Inf reach the WOLA), and
-     * -- in ULCNET_FAR_ALIGNED only -- the delay is locked (LOCKED/
-     * CHANGED). In ALIGNED mode UNLOCKED means aligned_far_hop is raw/
-     * unaligned far, so the result computed from it is not trusted and the
-     * error frame passes through unchanged (fail-open identity); any
-     * garbage the runtime accumulated from raw far during UNLOCKED is
-     * flushed by the CHANGED reset above at the first acquisition. RAW
-     * mode never gates application on the lock (the checkpoint's paper
-     * contract does not depend on it). */
+     * model always receives the AEC seam's best available far: raw before
+     * acquisition, aligned afterward. Its D window handles any remaining
+     * offset. A CHANGED event resets state before this hop's inference, and
+     * the frames whose analysis windows still straddle that boundary emit
+     * the identity WITHOUT stepping the model (they would otherwise rebuild
+     * the just-cleared state from half-stale input). Skipping inference
+     * lowers the per-frame cost of those frames; it never doubles it. */
     wrote = 0;
     for (f = 0; f < n_frames; f++) {
         const float* sre = p->err_re[f];
         const float* sim = p->err_im[f];
-        if (p->model.infer) {
+        if (p->reprime_frames > 0) {
+            p->reprime_frames--;      /* identity; model deliberately idle */
+        } else if (p->model.infer) {
             int rc;
             /* Enforce ulcnet_process.h's FULL-WRITE CONTRACT: pre-fill the
              * model-output staging with NaN before every infer call, so a
@@ -508,9 +513,6 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
                                 p->far_re[f], p->far_im[f],
                                 p->mdl_re, p->mdl_im);
             if (rc == 0 &&
-                ulcnet_far_apply_allowed(
-                    p->far_input_mode,
-                    lctx.delay_state != AEC_LINEAR_DELAY_UNLOCKED) &&
                 ulcnet_frame_is_finite(p->mdl_re, p->mdl_im)) {
                 sre = p->mdl_re;
                 sim = p->mdl_im;
@@ -537,6 +539,11 @@ void audio_pipeline_ulcnet_reset(AudioPipelineUlcnet* p) {
     (void)ulcnet_analysis_init(&p->ana_err, p->fft, p->ulcnet_window);
     (void)ulcnet_analysis_init(&p->ana_far, p->fft, p->ulcnet_window);
     (void)ulcnet_synthesis_init(&p->synth, p->fft, p->ulcnet_window);
+    p->last_delay_state = AEC_LINEAR_DELAY_UNLOCKED;
+    p->processed_hops = 0;
+    /* The analysis history is zeroed above, so nothing emitted after this
+     * point straddles anything: drop any pending reprime. */
+    p->reprime_frames = 0;
     /* The external runtime owns the NN's explicit states -- tell it to
      * flush them too, same contract as the CHANGED event. */
     if (p->model.reset) p->model.reset(p->model.user);

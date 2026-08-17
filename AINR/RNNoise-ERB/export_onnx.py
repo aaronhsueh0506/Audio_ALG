@@ -21,6 +21,12 @@ from train import (
 )
 
 
+# 與 process.h 的 RNNOISE_MODEL_IO_LAYOUT_VERSION 保持數值相同 — 該巨集宣告
+# 這張圖消費/回傳的 caller-owned GRU state struct。
+# tests/test_export_metadata.py 把兩邊釘在一起。
+STATE_LAYOUT_VERSION = 1
+
+
 class RNNoiseStreaming(nn.Module):
     """單幀串流推論 wrapper，輸入 3 frame 雙路特徵。"""
 
@@ -92,6 +98,47 @@ def optimize_with_onnxoptimizer(inp, outp):
 # 匯出
 # ============================================================
 
+def build_metadata(feature_cfg, n_bands, gru_size):
+    """匯出圖的 metadata。
+
+    從 export() 抽出來, 讓 contract test 不必真的做一次 ONNX 匯出就能把
+    state_layout_version 與 process.h 的巨集對起來。
+    """
+    return {
+        'boundary': 'stateless_streaming_explicit_state',
+        'state_layout_version': str(STATE_LAYOUT_VERSION),
+        'input_feature_frames': '3',
+        'output_frames_per_invocation': '1',
+        'accelerator_persistent_state': 'false',
+        'recurrent_state': 'h1_h2_h3_explicit_input_output',
+        'host_updates_feature_window': 'true',
+        'feature_version': feature_cfg['version'],
+        'sr': str(feature_cfg['sr']),
+        'n_fft': str(feature_cfg['n_fft']),
+        'win_len': str(feature_cfg['win_len']),
+        'hop_len': str(feature_cfg['hop_len']),
+        'lookahead_frames': str(feature_cfg['lookahead_frames']),
+        'feature_erb_norm_tau_sec': str(feature_cfg['erb_tau_sec']),
+        'feature_erb_norm_alpha': str(feature_cfg['erb_alpha']),
+        'feature_erb_norm_init_lo_db': str(feature_cfg['erb_norm_init_lo_db']),
+        'feature_erb_norm_init_hi_db': str(feature_cfg['erb_norm_init_hi_db']),
+        'feature_erb_norm_scale_db': str(feature_cfg['erb_norm_scale_db']),
+        'feature_spec_max_hz': str(feature_cfg['spec_max_hz']),
+        'feature_spec_bins': str(feature_cfg['spec_bins']),
+        'feature_spec_norm_tau_sec': str(feature_cfg['spec_tau_sec']),
+        'feature_spec_norm_alpha': str(feature_cfg['spec_alpha']),
+        'feature_spec_norm_init_lo': str(feature_cfg['spec_norm_init_lo']),
+        'feature_spec_norm_init_hi': str(feature_cfg['spec_norm_init_hi']),
+        'feature_spec_norm_eps': str(feature_cfg['spec_norm_eps']),
+        'input_schema': (f'erb_input[1,3,{n_bands}];'
+                         f'spec_input[1,3,2,{feature_cfg["spec_bins"]}];'
+                         f'h1_in/h2_in/h3_in[1,1,{gru_size}]'),
+        'output_schema': (f'gains[1,1,{n_bands}];'
+                          f'h1_out/h2_out/h3_out[1,1,{gru_size}]'),
+        'c_prepost': 'process.c/process.h',
+    }
+
+
 def export(args):
     import onnx
     from collections import Counter
@@ -159,28 +206,8 @@ def export(args):
     # 3) shape inference
     m = onnx.load(args.output)
     m = onnx.shape_inference.infer_shapes(m)
-    onnx.helper.set_model_props(m, {
-        'feature_version': feature_cfg['version'],
-        'sr': str(feature_cfg['sr']),
-        'n_fft': str(feature_cfg['n_fft']),
-        'win_len': str(feature_cfg['win_len']),
-        'hop_len': str(feature_cfg['hop_len']),
-        'lookahead_frames': str(feature_cfg['lookahead_frames']),
-        'feature_erb_norm_tau_sec': str(feature_cfg['erb_tau_sec']),
-        'feature_erb_norm_alpha': str(feature_cfg['erb_alpha']),
-        'feature_erb_norm_init_lo_db': str(feature_cfg['erb_norm_init_lo_db']),
-        'feature_erb_norm_init_hi_db': str(feature_cfg['erb_norm_init_hi_db']),
-        'feature_erb_norm_scale_db': str(feature_cfg['erb_norm_scale_db']),
-        'feature_spec_max_hz': str(feature_cfg['spec_max_hz']),
-        'feature_spec_bins': str(feature_cfg['spec_bins']),
-        'feature_spec_norm_tau_sec': str(feature_cfg['spec_tau_sec']),
-        'feature_spec_norm_alpha': str(feature_cfg['spec_alpha']),
-        'feature_spec_norm_init_lo': str(feature_cfg['spec_norm_init_lo']),
-        'feature_spec_norm_init_hi': str(feature_cfg['spec_norm_init_hi']),
-        'feature_spec_norm_eps': str(feature_cfg['spec_norm_eps']),
-        'input_schema': (f'erb_input[1,3,{N_BANDS}];'
-                         f'spec_input[1,3,2,{feature_cfg["spec_bins"]}]'),
-    })
+    onnx.helper.set_model_props(m, build_metadata(feature_cfg, N_BANDS,
+                                                  gru_size))
     onnx.save(m, args.output)
     print_stats("shape inference + feature metadata (final)", args.output)
 

@@ -44,7 +44,16 @@ _N_CHANNELS = 4
 
 @dataclass(frozen=True)
 class SharedDelayState:
-    """Observable state of the one shared matched-filter instance."""
+    """Observable state of the one shared matched-filter instance.
+
+    ``solid`` is "a usable accepted alignment generation exists" -- it never
+    leads ``delay_samples`` and, once raised, only ``reset()`` clears it.
+    ``changed`` marks the hop on which a NEW usable generation begins (first
+    acquisition included, even at applied delay 0), and is the signal for a
+    consumer to flush any history derived from the aligned reference before
+    the frame it produces for this hop.  Same contract as the C core's
+    ``FourAecNrResDelayState`` (4aec_nr_res.h).
+    """
 
     delay_samples: int
     confidence: float
@@ -82,13 +91,22 @@ class SharedMatchedDelayEstimator:
     here anymore.
     """
 
-    def __init__(self, sample_rate: int, hop_size: int) -> None:
+    def __init__(self, sample_rate: int, hop_size: int,
+                 quarantine_enabled: bool = False,
+                 quarantine_s: float = 1.0) -> None:
         if sample_rate not in _SUPPORTED_SAMPLE_RATES:
             raise ValueError(
                 f"shared delay supports {_SUPPORTED_SAMPLE_RATES}, got {sample_rate}"
             )
         self.sample_rate = int(sample_rate)
         self.hop_size = int(hop_size)
+        self.quarantine_enabled = bool(quarantine_enabled)
+        # Seconds -> hops once, here, with the same floor of 1 the C core and
+        # lib/aec use, so all three cannot disagree about how long a window
+        # is.
+        self.quarantine_hops = max(
+            1, int(round(float(quarantine_s) / (self.hop_size / self.sample_rate))))
+        self._quarantine_left = -1   # -1 = disarmed, the only re-armable state
         # LegacyDelayShim -> EchoPathDelayEstimator now owns 48kHz anti-alias
         # + decimation internally (and rescales its returned delay back to
         # native samples), so it is constructed with the TRUE native rate --
@@ -100,6 +118,7 @@ class SharedMatchedDelayEstimator:
         )
         self._calls = 0
         self._accepted_delay = 0
+        self._usable = False
 
     @property
     def instance_count(self) -> int:
@@ -110,8 +129,24 @@ class SharedMatchedDelayEstimator:
         self._estimator.reset()
         self._calls = 0
         self._accepted_delay = 0
+        self._usable = False
+        self._quarantine_left = -1
 
-    def accumulate(self, capture_proxy: np.ndarray, render: np.ndarray) -> SharedDelayState:
+    def accumulate(
+        self,
+        capture_proxy: np.ndarray,
+        render: np.ndarray,
+        proxy_lane_cancelling: bool = False,
+    ) -> SharedDelayState:
+        """``proxy_lane_cancelling`` mirrors the C core's read of
+        ``p->lanes[cfg.capture_proxy_channel]`` inside
+        ``update_shared_delay()``: True when the lane the shared estimator is
+        FED FROM is still demonstrably cancelling at the alignment currently
+        applied. That one lane, not any of the four: it is the only one whose
+        cancellation is evidence about the estimate being judged. It is
+        passed in rather than read here because this object owns only the
+        estimator, not the lanes -- the C core reaches them through ``p``.
+        Ignored unless ``delay_backward_quarantine_enabled`` is on."""
         capture_proxy = np.asarray(capture_proxy, dtype=np.float32)
         render = np.asarray(render, dtype=np.float32)
         if (
@@ -135,13 +170,55 @@ class SharedMatchedDelayEstimator:
             and self._estimator.is_solid
             and self._estimator._n_updates >= 3
         )
-        changed = bool(eligible and estimated != self._accepted_delay)
+        # Backward-jump quarantine (see delay_backward_quarantine_enabled on
+        # FourChannelAecConfig). Engages only once a usable generation exists
+        # and only for an estimate strictly EARLIER than the one in force: a
+        # first acquisition has no alignment to protect, re-confirming the
+        # accepted value is not a change, and a LARGER estimate is not the
+        # pre-echo direction. Armed once per continuously qualifying backward
+        # episode, then one tick per hop; candidate values may jitter within
+        # that class without re-arming. A forward/ineligible estimate or lost
+        # cancellation evidence disarms the episode. Mirrors the C core's arm
+        # in 4aec_nr_res.c's update_shared_delay().
+        if (
+            eligible
+            and self.quarantine_enabled
+            and self._usable
+            and estimated < self._accepted_delay
+            and proxy_lane_cancelling
+        ):
+            if self._quarantine_left < 0:
+                self._quarantine_left = self.quarantine_hops
+            if self._quarantine_left > 0:
+                self._quarantine_left -= 1
+                eligible = False
+        else:
+            self._quarantine_left = -1
+        # ``solid`` = "a usable accepted alignment generation exists", so it is
+        # derived from the SAME acceptance test that writes the accepted delay
+        # rather than from the estimator's raw confidence -- a raw-confidence
+        # ``solid`` is free to LEAD the applied delay on any hop the two
+        # disagree, and a consumer that flushes recurrent state on the
+        # not-usable -> usable edge would then flush against the previous
+        # generation's alignment.  Usability is sticky: once a generation
+        # exists, a short confidence dip must not retract an alignment the
+        # audio path is still applying (lib/aec spells that state
+        # ``current_delay == -1``, which never un-spells itself without a
+        # reset).  ``changed`` = "this hop starts a NEW USABLE generation", so
+        # it also fires on an acquisition or relock that lands on applied
+        # delay 0, which a value-only comparison misses.
+        was_usable = self._usable
+        now_usable = was_usable or eligible
+        changed = bool(
+            eligible and (not was_usable or estimated != self._accepted_delay)
+        )
         if eligible:
             self._accepted_delay = estimated
+        self._usable = now_usable
         return SharedDelayState(
             delay_samples=int(self._accepted_delay),
             confidence=float(self._estimator.confidence),
-            solid=bool(self._estimator.is_solid),
+            solid=bool(now_usable),
             changed=changed,
             estimator_calls=self._calls,
             estimator_updates=int(self._estimator._n_updates),
@@ -172,10 +249,23 @@ class _SharedReferenceDelayLine:
         start = self._samples_seen
         absolute = start + np.arange(render.size, dtype=np.int64)
         self._ring[absolute % self._capacity] = render
-        source = absolute - int(delay_samples)
-        out = np.zeros(render.size, dtype=np.float32)
-        valid = source >= 0
-        out[valid] = self._ring[source[valid] % self._capacity]
+        # Whole-hop decision on the same predicate the C core's align_render()
+        # uses: the ring can serve this hop's requested offset only once the
+        # samples already seen cover ``delay_samples``.  Until then the far
+        # content IS the raw render hop (lib/aec's rule: while the seam is not
+        # aligned, the content is the raw far), never silence -- a consumer
+        # stepping a recurrent model over the far branch would otherwise see a
+        # stretch of zeros, and the leading ``delay_samples`` of the stream
+        # would be unmodellable for the linear filters.  Per hop and not per
+        # sample: ``start`` is the smallest absolute index in this hop, so a
+        # partly-servable hop would splice raw and shifted audio inside one
+        # frame.  With a constant delay this makes the first
+        # ``ceil(delay_samples / hop)`` hops raw and every later hop aligned.
+        if start >= int(delay_samples):
+            source = absolute - int(delay_samples)
+            out = self._ring[source % self._capacity]
+        else:
+            out = render.copy()
         self._samples_seen += render.size
         return out
 
@@ -251,6 +341,18 @@ class FourChannelAecConfig:
     capture_proxy_channel: int = 0
     max_delay_ms: float = 1024.0
     aec_mode: AecMode = AecMode.PBFDKF
+    # Backward-jump quarantine on a shared-delay CHANGE. DEFAULT OFF, so the
+    # reference path is unchanged. Mirrors
+    # FourAecNrResConfig::delay_backward_quarantine_enabled / _s: a shared
+    # estimate strictly EARLIER than the accepted delay is held while the
+    # estimator's OWN capture lane (capture_proxy_channel — not any lane)
+    # still cancels at the applied alignment, and is adopted at the window's
+    # expiry, or sooner if cancellation collapses. A larger estimate is never
+    # held, and first acquisition is not guarded.
+    delay_backward_quarantine_enabled: bool = False
+    # Window in SECONDS, converted to hops once at construction (minimum 1).
+    # Inert while delay_backward_quarantine_enabled is False.
+    delay_backward_quarantine_s: float = 1.0
 
     def resolved_grid(self) -> tuple[int, int]:
         if self.sample_rate not in _SUPPORTED_SAMPLE_RATES:
@@ -585,7 +687,9 @@ class FourChannelAecPipeline:
         # AEC instance from mutating config state observed by another lane.
         self._lanes = [AEC(replace(lane_config)) for _ in range(_N_CHANNELS)]
         self._shared_delay = SharedMatchedDelayEstimator(
-            sample_rate=self.config.sample_rate, hop_size=hop
+            sample_rate=self.config.sample_rate, hop_size=hop,
+            quarantine_enabled=self.config.delay_backward_quarantine_enabled,
+            quarantine_s=self.config.delay_backward_quarantine_s,
         )
         max_delay = int(self.config.max_delay_ms * self.config.sample_rate / 1000.0)
         self._delay_line = _SharedReferenceDelayLine(max_delay, hop)
@@ -647,7 +751,22 @@ class FourChannelAecPipeline:
             raise ValueError("input contains non-finite samples")
 
         proxy = microphones[:, self.config.capture_proxy_channel]
-        delay = self._shared_delay.accumulate(proxy, render)
+        # Read BEFORE the lanes process this hop, so what it answers with is
+        # last hop's cancellation — the same one-hop-behind reading lib/aec's
+        # own Path-B guard judges on, and the ordering the C core gets for
+        # free by calling update_shared_delay() ahead of its lane loop.
+        # ONE lane, the capture proxy: it is the microphone this shared
+        # estimator is fed from, so the only lane whose cancellation is
+        # evidence about the estimate being judged. Evaluated only when the
+        # quarantine is on, so the default path pays nothing for a disabled
+        # feature.
+        proxy_lane_cancelling = bool(
+            self.config.delay_backward_quarantine_enabled
+            and self._lanes[
+                self.config.capture_proxy_channel].linear_is_cancelling()
+        )
+        delay = self._shared_delay.accumulate(proxy, render,
+                                              proxy_lane_cancelling)
         aligned_render = self._delay_line.process(render, delay.delay_samples)
         if delay.changed:
             # All filters learned against the former shared alignment.  Reset

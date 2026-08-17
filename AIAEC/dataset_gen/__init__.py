@@ -37,6 +37,7 @@ from .aec_features import (
     stft,
 )
 from .linear_aec import (
+    ACCEPTED_BEHAVIOR_HASH_MIGRATIONS,
     LINEAR_AEC_CONTRACT_VERSION,
     LinearAecContract,
     LinearAecProcessor,
@@ -67,6 +68,7 @@ from .model_views import (
 )
 
 __all__ = [
+    'ACCEPTED_BEHAVIOR_HASH_MIGRATIONS',
     'ALL_SPLIT_NAMES',
     'BASE_STEM_ORDER',
     'PACKED_STEM_ORDER',
