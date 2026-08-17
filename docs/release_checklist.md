@@ -626,8 +626,8 @@ Do not claim trained-model quality without a trained checkpoint.
 
 ## 12. AIAEC framework gate
 
-The current public candidates are Align-CRUSE, Align-ULCNet, GTCRN-AENR,
-DeepFilterNet-AENR, DeepVQE-S, and CAGCRN. A candidate that is not intended to
+The current public candidates are Align-CRUSE, Align-ULCNet, DeepVQE-S, and
+CAGCRN. A candidate that is not intended to
 be runnable must be clearly marked experimental or removed from the public
 surface.
 
@@ -681,11 +681,10 @@ steps and verify:
 
 For every public candidate verify:
 
-- [ ] `denoise.py` loads a legal random checkpoint.
+- [ ] `inference.py` loads a legal random checkpoint.
 - [ ] Mic/far or linear-error/far input mapping is correct.
 - [ ] Feature and waveform shapes are correct.
 - [ ] Supported 16/48 kHz grids match the model README.
-- [ ] GTCRN-AENR rejects non-16-kHz input.
 - [ ] Offline/streaming behavior, state, reset, cache, and lookahead are
       explicit.
 - [ ] Hardware inference tensor layout, normalization, output meaning, and
@@ -780,9 +779,9 @@ is routinely misattributed to a real bug.
 | `Audio_ALG` `python3 -m pytest pipelines` | 58 |
 | `Audio_ALG` `python3 -m pytest pipelines/tests` | 26 |
 | `Audio_ALG` `python3 -m pytest pipelines/4ch_aec_bf_nr_res/tests` | 32 |
-| `Audio_ALG` `python3 -m pytest AIAEC` | 357 |
-| `Audio_ALG` `python3 -m pytest AINR` | 187 |
-| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 601 |
+| `Audio_ALG` `python3 -m pytest AIAEC` | 336 |
+| `Audio_ALG` `python3 -m pytest AINR` | 201 |
+| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 595 |
 
 C-side `make test` targets that print `PASS:` markers rather than a count
 (re-measured on the current working tree, KISS backend, `make clean` first):

@@ -20,7 +20,7 @@ description: 演算法改動後同步文件與使用者說明 — 更新 Audio_A
     元件自己的 repo `docs/html/` 下，不要放進 Audio_ALG。
 - **`Audio_ALG/docs/html/` 只留自身內容**：`index.html`（總覽+導覽）、
   `conventions.html`、`onnx_prepost.html`、四個 `pipeline_*.html`、四個
-  `ainr_*.html`、六個 `aiaec_*.html`（Audio_ALG 自有的 pipelines/AINR/AIAEC
+  `ainr_*.html`、四個 `aiaec_*.html`（Audio_ALG 自有的 pipelines/AINR/AIAEC
   才留在這裡；新的 pipeline/AINR/AIAEC 頁面也建在這裡）。
 
 **連結規約（SE 樹 sibling 相對路徑，四個 repo 同層 `SE/{AEC,NR,
@@ -92,7 +92,7 @@ Audio_ALG 自有 pipelines/AINR/AIAEC）**：
 `ainr_dfn2.html`、`ainr_dfn3.html`、`ainr_gtcrn.html`、
 `ainr_rnnoise_erb.html`、
 `aiaec_align_ulcnet.html`、`aiaec_align_cruse.html`、`aiaec_deepvqe_s.html`、
-`aiaec_cagcrn.html`、`aiaec_gtcrn_aenr.html`、`aiaec_dfn_aenr.html`
+`aiaec_cagcrn.html`
 
 ## 硬規則
 

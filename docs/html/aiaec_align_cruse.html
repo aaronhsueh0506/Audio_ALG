@@ -19,7 +19,7 @@ th{background:#eef0f2}
 </style>
 </head>
 <body>
-<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_cruse.html"><b>Align-CRUSE</b></a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a><a href="aiaec_gtcrn_aenr.html">GTCRN-AENR</a><a href="aiaec_dfn_aenr.html">DFN-AENR</a></nav>
+<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html">Align-ULCNet</a><a href="aiaec_align_cruse.html"><b>Align-CRUSE</b></a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a></nav>
 <h1>Align-CRUSE（end-to-end AEC+RES+NR，selected）</h1>
 
 <h2>概要</h2>
@@ -35,7 +35,7 @@ alignment 有兩個 mode：部署預設 <code>causal_running</code>（逐幀 <co
 只用過去證據）；<code>paper_global</code>（整段一個 <code>D[B,63]</code>）為整段非因果，
 <code>create_stream_state()</code> 直接 <code>ValueError</code> 拒絕串流。</p>
 <p><b>ONNX / NPU graph boundary</b>（由
-<code>AIAEC/export_streaming_onnx.py Align_CRUSE</code> 匯出）：
+<code>AIAEC/Align_CRUSE/export_onnx.py</code> 匯出）：
 graph <b>內</b> = <code>log_power_feature</code>（square+clamp+log）、causal conv +
 BatchNorm + ELU（<code>mic1..mic4</code> / <code>far1..far2</code>）、alignment 的
 MaxPool(1,4) + Linear query/key + <code>softmax</code>（作用在 cumsum 積分 score 上）、
@@ -49,7 +49,7 @@ score 是<b>無衰減 cumsum 積分器</b>（無限記憶）——長通話下 d
 echo path 變化；streaming 化本身可行，但長時行為需上板前決策。</div>
 
 <h2>API 用法</h2>
-<pre>from AIAEC.Align_CRUSE.denoise import load_model
+<pre>from AIAEC.Align_CRUSE.inference import load_model
 from AIAEC.aiaec_streaming import StreamSTFT, StreamISTFT
 
 model, grid = load_model("ckpt.pth", "cpu")
@@ -61,7 +61,7 @@ for s in range(0, n, grid.hop_len):
     for m, f in zip(mic_stft.push(mic[:, s:s+256]), far_stft.push(far[:, s:s+256])):
         out = model.forward_stream(m.unsqueeze(1), f.unsqueeze(1), state)
         samples = synth.push(out.enhanced[:, 0])</pre>
-<pre>python3 AIAEC/Align_CRUSE/streaming.py checkpoint.pth mic.wav far.wav out.wav [--verify] [--device cpu]</pre>
+<pre>python3 AIAEC/Align_CRUSE/inference.py checkpoint.pth mic.wav far.wav out.wav [--verify] [--device cpu]</pre>
 <p><code>--verify</code> 同時跑 offline whole-utterance forward 並打印 max-abs / RMS 波形差
 （utterance ≥ <code>max_delay_frames</code> hops 時預期 ~1e-5 內；見下方 warm-up caveat）。</p>
 
@@ -103,7 +103,7 @@ C post：StreamISTFT          —           out(F0)→0 smp     256 smp    256 s
 hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本身 0 hop。</pre>
 
 <h2>I/O 表</h2>
-<p>Streaming（每 invocation 恰 1 幀 = 256 個新 samples；<code>streaming.py</code>
+<p>Streaming（每 invocation 恰 1 幀 = 256 個新 samples；<code>inference.py</code>
 開機打印之實測，B=1、16k）：</p>
 <table>
 <tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
@@ -154,9 +154,9 @@ T=90 全幀 stream-vs-offline enhanced 4.9e-7 / mask 1.8e-7 / delay 3.3e-7（ATO
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li><code>AIAEC/Align_CRUSE/model.py</code>（<code>AlignCRUSE</code>）；<code>AIAEC/aiaec_common.py</code>（<code>GlobalDelayAttention</code>）；<code>AIAEC/aiaec_streaming.py</code>（<code>GlobalDelayAttentionCell</code>）</li>
-<li><code>AIAEC/Align_CRUSE/streaming.py</code>、<code>denoise.py</code>、<code>train.py</code>、<code>config.ini</code></li>
-<li>tests：<code>AIAEC/tests/test_streaming_align_cruse.py</code>（5 tests：等價/can-fail/短檔 caveat/paper_global 拒絕/fresh-state）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 239 passed（<code>pytest AIAEC</code> 含 dataset_gen = 357）</li>
-<li>匯出／calibration：<code>AIAEC/export_streaming_onnx.py Align_CRUSE</code>、<code>AIAEC/export_streaming_calibration.py Align_CRUSE</code>。本候選是唯一有 <b>per-tensor precision marker</b> 的：<code>state_align_score_sum</code>=<code>float32_no_ptq</code>、<code>state_align_frame_index</code>=<code>int64_no_ptq</code>，這兩個 tensor 在 report 的 <code>inputs</code> 區塊不寫 range 只寫 <code>precision</code>；並且 calibration 必須取自<b>單一不中斷錄音</b>（工具會拒絕用重置片段拼出 <code>--frames</code>）。far 兩欄同為 <code>model_native_far</code>，<code>state_layout_version</code> 為 <code>null</code>；tests <code>AIAEC/tests/test_export_stateless.py</code>（16）、<code>test_export_streaming_calibration.py</code>（6）</li>
+<li><code>AIAEC/Align_CRUSE/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
+<li>tests：<code>AIAEC/tests/test_streaming_align_cruse.py</code>（5 tests：等價/can-fail/短檔 caveat/paper_global 拒絕/fresh-state）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 220 passed（<code>pytest AIAEC</code> 含 dataset_gen = 336）</li>
+<li>匯出／calibration：<code>AIAEC/Align_CRUSE/export_onnx.py</code>、<code>AIAEC/Align_CRUSE/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/Align_CRUSE/calib/</code>）。<code>state_align_score_sum</code>=<code>float32_no_ptq</code>、<code>state_align_frame_index</code>=<code>int64_no_ptq</code>；calibration 必須取自單一不中斷錄音。</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.2</li>
 </ul>
 </body>

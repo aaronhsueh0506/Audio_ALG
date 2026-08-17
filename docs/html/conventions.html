@@ -43,9 +43,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
 <a href="aiaec_align_cruse.html">Align-CRUSE</a> ·
 <a href="aiaec_deepvqe_s.html">DeepVQE-S</a> ·
-<a href="aiaec_cagcrn.html">CAGCRN</a> ·
-<a href="aiaec_gtcrn_aenr.html">GTCRN-AENR</a> ·
-<a href="aiaec_dfn_aenr.html">DFN-AENR</a>
+<a href="aiaec_cagcrn.html">CAGCRN</a>
 </nav>
 
 <h1>全鏈 grid / window / framing 慣例</h1>
@@ -96,13 +94,9 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <tr><td>AINR RNNoise-ERB</td><td>16 k</td>
 <td>512 / 256（257）；22 ERB bands + complex 特徵 0–4 kHz（129 bins）</td>
 <td>編譯期固定</td><td><code>RNNoise-ERB/process.h</code></td></tr>
-<tr><td>AIAEC ×5（ULCNet/CRUSE/DeepVQE-S/CAGCRN/GTCRN-AENR）</td><td>16 k</td>
-<td>512 / 256（257）</td><td>config 固定（GTCRN-AENR 由 model 硬性 raise）</td>
-<td>各 <code>config.ini</code>；<code>GTCRN_AENR/model.py:24-28</code></td></tr>
-<tr><td>AIAEC DFN-AENR</td><td>48 k</td>
-<td>1024 / 512（513），df_bins=96；16 k 變體 512/256，df_bins=64</td>
-<td>config 預設 48 k</td>
-<td><code>DeepFilterNet_AENR/config.ini</code>、README</td></tr>
+<tr><td>AIAEC ×4（ULCNet/CRUSE/DeepVQE-S/CAGCRN）</td><td>16 k</td>
+<td>512 / 256（257）</td><td>config 固定</td>
+<td>各模型的 <code>config.ini</code></td></tr>
 </table>
 </div>
 

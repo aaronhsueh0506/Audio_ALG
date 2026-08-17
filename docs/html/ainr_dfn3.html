@@ -73,7 +73,7 @@ for (each hop of 512 new samples) {
         dfn3_synthesis(&amp;st, out_re, out_im, out512);
 }</pre>
 <p class="note">frame-aligned 參考路徑為 <code>dfn3_compose()</code>;與串流 API 混用前必須重新
-<code>dfn3_state_init()</code>。Python 離線:<code>denoise.py --config config.ini --model ckpt.pt --input in.wav --output out.wav</code>。</p>
+<code>dfn3_state_init()</code>。Python 離線:<code>inference.py --config config.ini --model ckpt.pt --input in.wav --output out.wav</code>。</p>
 
 <h2>Block diagram</h2>
 <pre>
@@ -181,10 +181,10 @@ mask 展開、DF FIR、band split、ISTFT 在 C)。本目錄尚無 ONNX 匯出�
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li>C 前後處理:<code>AINR/DeepFilterNet3/dfn3_process.c</code> / <code>.h</code>;共用 kernel:<code>AINR/dfn_process_common.h</code></li>
-<li>模型 / 訓練 / 推論:<code>AINR/DeepFilterNet3/model.py</code>、<code>train.py</code>、<code>denoise.py</code>、<code>config.ini</code></li>
+<li>模型 / 訓練 / 推論:<code>AINR/DeepFilterNet3/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>config.ini</code></li>
 <li>文件:<a href="../../AINR/DeepFilterNet3/README.md">README.md</a>、<a href="../../AINR/DeepFilterNet3/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT.md</a></li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code> — <code>make -C AINR test-simd</code>
 實測 NEON/scalar digest 皆 <code>124b768ec938af7d</code></li>
 <li>Python 合約測試:<code>AINR/DeepFilterNet3/tests/test_dfn3_contract.py</code> — 實測 26 passed;
-共用測試 <code>AINR/tests/</code> — 實測 16 passed（<code>pytest AINR</code> 全樹 = 187）</li>
+共用測試 <code>AINR/tests/</code> — 實測 28 passed（<code>pytest AINR</code> 全樹 = 201）</li>
 </ul>

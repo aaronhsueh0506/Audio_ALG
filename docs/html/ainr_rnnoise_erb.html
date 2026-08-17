@@ -78,7 +78,7 @@ for (each hop of 256 new samples) {
     }
     save prev_re/prev_im = spec_re/spec_im;   /* 1-hop spectrum 延遲 */
 }</pre>
-<p class="note">Python 離線:<code>denoise.py --config config.ini --model output/rnnoise_best.pth --input in.wav --output out.wav</code>
+<p class="note">Python 離線:<code>inference.py --config config.ini --model output/rnnoise_best.pth --input in.wav --output out.wav</code>
 (offline 以 <code>F.pad(pad_left=2−LOOKAHEAD, pad_right=LOOKAHEAD)</code> 一次過整段)。
 ONNX 匯出:<code>python export_onnx.py --config config.ini --model output/rnnoise_best.pth --output rnnoise.onnx</code>。</p>
 
@@ -194,11 +194,11 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li>C 前後處理:<code>AINR/RNNoise-ERB/process.c</code> / <code>process.h</code>;表格產生器:<code>gen_rnnoise_tables.c</code> → <code>rnnoise_tables_gen.h</code></li>
-<li>模型 / 訓練 / 推論 / 匯出:<code>train.py</code>(<code>RNNoiseModel</code>)、<code>denoise.py</code>、<code>export_onnx.py</code>、<code>config.ini</code>、<code>calibrate_norm_init.py</code></li>
+<li>模型 / 訓練 / 推論 / 匯出:<code>train.py</code>(<code>RNNoiseModel</code>)、<code>inference.py</code>、<code>export_onnx.py</code>、<code>config.ini</code>、<code>calibrate_norm_init.py</code></li>
 <li>文件:<a href="../../AINR/RNNoise-ERB/README.md">README.md</a>(歷史版本紀錄在 <code>docs/archive/</code>)</li>
 <li>C 測試:<code>AINR/RNNoise-ERB/test/</code> — <code>make test</code> 實測全 PASS:
 tables byte-exact(canonical)、portable 數學合約(recompute max ULP 0)、
 config/Python/C feature 合約、feature-state 行為、SIMD/scalar digest <code>0506b5ee3d18afb8</code></li>
 <li>Python 測試:<code>AINR/RNNoise-ERB/tests/</code>(pytest)— 實測 26 passed;
-共用測試 <code>AINR/tests/</code> — 實測 16 passed（<code>pytest AINR</code> 全樹 = 187）</li>
+共用測試 <code>AINR/tests/</code> — 實測 28 passed（<code>pytest AINR</code> 全樹 = 201）</li>
 </ul>

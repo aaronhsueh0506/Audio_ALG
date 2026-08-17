@@ -78,7 +78,7 @@ for (each hop of 512 new samples) {
         dfn2_synthesis(&amp;st, out_re, out_im, out512);
     /* valid==0: 暖機(不送 ISTFT); valid==-1: pointer/時序合約錯誤 */
 }</pre>
-<p class="note">Python 離線推論:<code>denoise.py --config config.ini --model ckpt.pt --input in.wav --output out.wav</code>
+<p class="note">Python 離線推論:<code>inference.py --config config.ini --model ckpt.pt --input in.wav --output out.wav</code>
 (內部走 <code>extract_dfn2_features()</code> → <code>model()</code>,torch STFT <code>center=True</code>,與 C 串流僅差 clip 起點框對齊,見 <code>dfn2_process.h</code> 檔頭 parity 限制)。</p>
 
 <h2>Block diagram</h2>
@@ -197,10 +197,10 @@ head/spectrum 配對無法以「輸出有限」矇混過關。</li>
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li>C 前後處理:<code>AINR/DeepFilterNet2/dfn2_process.c</code> / <code>.h</code>;共用 kernel:<code>AINR/dfn_process_common.h</code></li>
-<li>模型 / 訓練 / 推論:<code>AINR/DeepFilterNet2/model.py</code>、<code>train.py</code>、<code>denoise.py</code>、<code>config.ini</code></li>
+<li>模型 / 訓練 / 推論:<code>AINR/DeepFilterNet2/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>config.ini</code></li>
 <li>文件:<a href="../../AINR/DeepFilterNet2/README.md">README.md</a>、<a href="../../AINR/DeepFilterNet2/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT.md</a></li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code> — <code>make -C AINR test-simd</code>
 實測 NEON/scalar digest 皆 <code>124b768ec938af7d</code>(bit 相同)</li>
-<li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code> — 實測 31 passed;
-共用測試 <code>AINR/tests/</code>(pytest)— 實測 16 passed（<code>pytest AINR</code> 全樹 = 187）</li>
+<li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code> — 實測 32 passed;
+共用測試 <code>AINR/tests/</code>(pytest)— 實測 28 passed（<code>pytest AINR</code> 全樹 = 201）</li>
 </ul>

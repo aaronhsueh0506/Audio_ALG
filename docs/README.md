@@ -21,7 +21,7 @@ README.
 | AIAEC candidate decision matrix | [`ai_aec_candidate_matrix.md`](ai_aec_candidate_matrix.md) |
 | PBFDKF + Align-ULCNet embedded streaming proposal | [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md) |
 | Align-ULCNet delay/`n`/`D` profile plan | [`align_ulcnet_delay_profile_plan_zh_TW.md`](align_ulcnet_delay_profile_plan_zh_TW.md) |
-| AIAEC six-candidate streaming readiness audit | [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md) |
+| AIAEC four-candidate streaming readiness audit | [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md) |
 | Mono pipeline integration (config/pool/errors) | [`integration_mono_zh_TW.md`](integration_mono_zh_TW.md) |
 | 4ch core integration (`4aec_nr_res`) | [`integration_4ch_core_zh_TW.md`](integration_4ch_core_zh_TW.md) |
 | 4ch spatial wrapper integration (SRP/GSC) | [`integration_4ch_spatial_zh_TW.md`](integration_4ch_spatial_zh_TW.md) |

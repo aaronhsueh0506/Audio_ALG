@@ -9,14 +9,12 @@ in Git history rather than treated as implementation documentation.
 |---|---|---|---|---|
 | end-to-end AEC+RES+NR | `Align_CRUSE` | mic + unaligned far | early near target | selected |
 | linear AEC → RES+NR | `Align_ULCNet` | production linear error + far | early near target | paper reference |
-| linear AEC → RES+NR | `GTCRN_AENR` | production linear error + far | early near target | project variant |
-| linear AEC → RES+NR | `DeepFilterNet_AENR` | independently normalized error/far DFN features | early near target | project variant |
 | end-to-end AEC+RES+NR | `DeepVQE_S` | mic + unaligned far | early near target | primary |
 | end-to-end AEC+RES+NR | `CAGCRN` | mic + unaligned far | early near target | backup |
 
 ⚠ **Every candidate now targets the same early/dereverberated `near_target`**
-(`MODEL_TASKS` values all end in `_dereverb`). For `Align_ULCNet`, `GTCRN_AENR`,
-`DeepFilterNet_AENR` and `CAGCRN` that is a project extension of the published
+(`MODEL_TASKS` values all end in `_dereverb`). For `Align_ULCNet` and
+`CAGCRN` that is a project extension of the published
 task, not the published task itself — they previously targeted the reverberant
 `near_speech`. Checkpoints trained under the old targets are refused at
 inference by `require_checkpoint_model_identity`, so they must be retrained.
@@ -34,8 +32,6 @@ record.
 
 - Use a RES+NR candidate only after the same production linear AEC that will be
   frozen at deployment. An oracle residual is rejected by the dataset view.
-- Treat `GTCRN_AENR` and `DeepFilterNet_AENR` as project variants, not published
-  author AEC models.
 - `DeepVQE_S` is the primary E2E route and `CAGCRN` the smaller backup. ⚠ This
   rule used to read "use `DeepVQE_S` when dereverberation is part of the
   target"; that no longer separates the two, since every candidate now targets
@@ -47,7 +43,6 @@ record.
 - Public complex spectra have shape `[batch, time, frequency]`.
 - Model grids are `512/512/256 @ 16 kHz` and
   `1024/1024/512 @ 48 kHz`.
-- `GTCRN_AENR` stays locked to its original 16 kHz grid.
 - The public forwards are clip-level; explicit per-model cache/state I/O is a
   separate streaming deployment concern -- see
   [`aiaec_streaming_readiness_zh_TW.md`](aiaec_streaming_readiness_zh_TW.md)
@@ -58,21 +53,6 @@ record.
   `near_target`), which `dataset_gen.model_views.build_model_view` maps to each
   model's inputs and target. The reverberant `near_speech` stem stays in the
   WAVs for audit and is not packed.
-
-## DeepFilterNet-AENR baseline
-
-`DeepFilterNet_AENR` follows the current local DFN2 output graph:
-
-```text
-full-band ERB mask
-    → deep filter only the masked low bins
-    → learned sigmoid-alpha residual blend in those low bins
-```
-
-The AENR conditioners are initialized as an error-only pass-through. A
-standalone checkpoint is a valid initialization only when its DFN2
-`MODEL_VERSION`, feature contract, grid, and tensor shapes all match. The
-preserved DFN3 band-split checkpoint is not compatible.
 
 ## Dataset and deployment boundary
 
@@ -96,5 +76,5 @@ one shared delay matcher
     → one mono NR/RES path
 ```
 
-It is not a six-candidate AIAEC bake-off surface. See
+It is not an AIAEC model bake-off surface. See
 [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md).

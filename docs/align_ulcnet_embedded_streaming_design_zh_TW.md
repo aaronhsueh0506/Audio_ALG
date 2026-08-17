@@ -1,7 +1,7 @@
 # PBFDKF + Align-ULCNet Embedded Streaming 設計提案
 
 狀態：設計與實作對照稿（2026-08-16 覆核）。第 10 節的單幀 ONNX boundary
-（`AIAEC/Align_ULCNet/export_streaming_onnx.py`）、CPU external-state
+（`AIAEC/Align_ULCNet/export_onnx.py`）、CPU external-state
 helper（`ulcnet_model_io.c/h`、`ulcnet_accelerator_adapter.c/h`）與 C
 STFT/WOLA（`ulcnet_process.c/h`）已實作；§8 的 delay 狀態機/fail-open 邏輯
 也已落地到 `pipelines/mono_alignulcnet/`、`pipelines/4ch_alignulcnet/`
@@ -158,7 +158,7 @@ Align-ULCNet 使用 `D=64` 搜尋長時間差的原因之一。
   軸的對稱 padding（kernel 3、左右各補 1）零邊界會隨 D 移動。訓練後
   distribution 若集中在 `d >= 8`，截斷即是實質行為改變——第 9 節的
   zero-shot A/B 因此是必要步驟，不是形式。
-- `denoise.py`、`sweep_delay_depth.py` 與單幀 ONNX exporter 都已有 explicit
+- `inference.py`、`sweep_delay_depth.py` 與單幀 ONNX exporter 都已有 explicit
   `max_delay_frames` deployment override。D 會固定在輸出的 graph/descriptor
   tensor shape；可載入同一組 D-agnostic weights 不代表 small-D 品質已放行。
 

@@ -68,7 +68,7 @@ for (each hop of 256 new samples) {
     run_model(spec, enhanced);
     gtcrn_synthesis(&amp;st, enhanced, out256); /* WOLA, 256 samples */
 }</pre>
-<p class="note">Python 離線:<code>denoise.py --config config.ini --model ckpt.pt --input in.wav --output out.wav</code>
+<p class="note">Python 離線:<code>inference.py --config config.ini --model ckpt.pt --input in.wav --output out.wav</code>
 (整段 <code>torch.stft</code> → <code>model(spec)</code> → <code>torch.istft</code>)。</p>
 
 <h2>Block diagram</h2>
@@ -166,10 +166,10 @@ context(cache 大小即由此而來),加上 RNN 無限記憶。</li>
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li>C 前後處理:<code>AINR/GTCRN/gtcrn_process.c</code> / <code>.h</code>;共用 kernel:<code>AINR/dfn_process_common.h</code></li>
-<li>模型 / 訓練 / 推論:<code>AINR/GTCRN/model.py</code>、<code>train.py</code>、<code>denoise.py</code>、<code>config.ini</code>、<code>checkpoint_utils.py</code></li>
+<li>模型 / 訓練 / 推論:<code>AINR/GTCRN/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>config.ini</code>、<code>checkpoint_utils.py</code></li>
 <li>文件:<a href="../../AINR/GTCRN/README.md">README.md</a>、<a href="../../AINR/GTCRN/docs/architecture_notes.md">docs/architecture_notes.md</a></li>
 <li>上游 vendored 參考:<code>AINR/gtcrn_github/</code>(offline <code>gtcrn.py</code>、串流 <code>stream/gtcrn_stream.py</code>、論文 PDF)</li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_gtcrn()</code>:回路穩態 unity,誤差門檻 2e-4)—
 <code>make -C AINR test-simd</code> 實測 NEON/scalar digest 皆 <code>124b768ec938af7d</code></li>
-<li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code> — 實測 2 passed(metadata 內容、<code>state_layout_version</code> 對 <code>GTCRN_MODEL_LAYOUT_VERSION</code> 互鎖);共用測試 <code>AINR/tests/</code>(pytest)— 實測 16 passed(<code>pytest AINR</code> 全樹 = 187)</li>
+<li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code> — 實測 3 passed(metadata 內容、<code>state_layout_version</code> 對 <code>GTCRN_MODEL_LAYOUT_VERSION</code> 互鎖、calibration frame shape 對 ONNX graph input 互鎖);共用測試 <code>AINR/tests/</code>(pytest)— 實測 28 passed(<code>pytest AINR</code> 全樹 = 201)</li>
 </ul>

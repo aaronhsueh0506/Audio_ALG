@@ -42,9 +42,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
 <a href="aiaec_align_cruse.html">Align-CRUSE</a> ·
 <a href="aiaec_deepvqe_s.html">DeepVQE-S</a> ·
-<a href="aiaec_cagcrn.html">CAGCRN</a> ·
-<a href="aiaec_gtcrn_aenr.html">GTCRN-AENR</a> ·
-<a href="aiaec_dfn_aenr.html">DFN-AENR</a>
+<a href="aiaec_cagcrn.html">CAGCRN</a>
 </nav>
 
 <h1>Audio_ALG 演算法文件站</h1>
@@ -83,9 +81,8 @@ SE/                                (同層四個 repo)
       │     └── 4ch_alignulcnet/      4ch AEC + BF + Align-ULCNet
       ├── AINR/          NN NR：DFN2 / DFN3 / GTCRN / RNNoise-ERB
       │                  (各自的 C 前後處理 + 訓練/推論 Python)
-      ├── AIAEC/         NN AEC/RES 六候選 (Python + C 前後處理: 共用
-      │                  aiaec_process、Align_ULCNet 全鏈、DeepVQE-S CCM、
-      │                  DFN-AENR 雙輸入; 共用 stateless export + calibration)
+      ├── AIAEC/         NN AEC/RES 四候選 (Python + C 前後處理: 共用
+      │                  aiaec_process、Align_ULCNet 全鏈、DeepVQE-S CCM)
       └── shared/        Python 工具
 </pre>
 <p class="note">建置關係出處：<code>pipelines/Makefile</code>（三個 producer archive、
@@ -152,7 +149,7 @@ graph 只含 heads。</td></tr>
 <code>export_onnx.py</code> 以 GRU h1–h3 顯式進出，host 檢查 next state finite 後回寫。</td></tr>
 </table>
 
-<h3>AIAEC（NN AEC/RES 六候選）</h3>
+<h3>AIAEC（NN AEC/RES 四候選）</h3>
 <table>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a></td>
@@ -167,13 +164,6 @@ attention），輸出 3×3 complex convolving mask。</td></tr>
 <tr><td><a href="aiaec_cagcrn.html">aiaec_cagcrn</a></td>
 <td>CAGCRN：16k/512/256；參數最少（54,963），但 NPU op 面最重
 （CATA broadcast、動態 ConvTranspose2d）。</td></tr>
-<tr><td><a href="aiaec_gtcrn_aenr.html">aiaec_gtcrn_aenr</a></td>
-<td>GTCRN-AENR：鎖死 16k/512/256；骨幹 = AINR GTCRN（第一層 9→18 ch），
-STFT/ISTFT 可直接重用 <code>gtcrn_process.c</code>。</td></tr>
-<tr><td><a href="aiaec_dfn_aenr.html">aiaec_dfn_aenr</a></td>
-<td>DFN-AENR：48k/1024/512（16k 變體 512/256）；error+far 雙路條件化的
-DFN2 cascade，lookahead 2 hops；C 邊界為雙輸入的
-<code>dfn_aenr_process.c/h</code>（兩條獨立 EMA state）。</td></tr>
 </table>
 
 <h2>相關檔案與測試路徑</h2>
@@ -186,9 +176,8 @@ DFN2 cascade，lookahead 2 hops；C 邊界為雙輸入的
 <tr><td>AIAEC 設計文件</td><td><code>docs/aiaec_streaming_readiness_zh_TW.md</code>、
 <code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code>、
 <code>docs/align_ulcnet_delay_profile_plan_zh_TW.md</code></td></tr>
-<tr><td>ONNX 匯出／calibration</td><td><code>AIAEC/export_streaming_onnx.py</code>、
-<code>AIAEC/export_streaming_calibration.py</code>、
-<code>AIAEC/Align_ULCNet/export_streaming_onnx.py</code>、
+<tr><td>ONNX 匯出／calibration</td><td><code>AIAEC/&lt;model&gt;/export_onnx.py</code>、
+<code>AIAEC/&lt;model&gt;/inference.py calib</code>、
 <code>AINR/*/export_onnx.py</code></td></tr>
 <tr><td>pipeline 測試</td><td><code>pipelines/tests/</code>（共用格點測試）、
 <code>pipelines/mono_aec_nr_res/tests/</code>、<code>pipelines/mono_alignulcnet/tests/</code>、

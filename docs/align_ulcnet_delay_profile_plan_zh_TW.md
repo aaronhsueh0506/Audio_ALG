@@ -174,7 +174,7 @@ checkpoint linear contract 維持不記錄 n，dataset generation 固定 n=5。
   `far_input_mode=aligned_far`；不得默默把 raw far 接到 production graph。
 
 - **calibration artifact 也在同一條 ABI 鏈上**：
-  `AIAEC/export_streaming_calibration.py` 產生的 report 記錄
+  `AIAEC/Align_ULCNet/inference.py calib` 產生的 report 記錄
   `max_delay_frames` 與 `state_layout_version`，必須與 export artifact 及 C
   descriptor 三方一致（D 決定 state tensor shape 與 host state RAM）；現由
   `AIAEC/tests/test_export_streaming_calibration.py` 交叉比對。同一份 report
@@ -183,7 +183,7 @@ checkpoint linear contract 維持不記錄 n，dataset generation 固定 n=5。
   Align-ULCNet 刻意以訓練域 `linear_error + raw_far` 做 calibration（該階段
   不跑 matched filter），不代表兩條 seam 相同。
 
-`export_streaming_onnx.py` 目前同時產出：
+`AIAEC/Align_ULCNet/export_onnx.py` 目前同時產出：
 
 1. `.onnx`。
 2. JSON metadata（供工具/測試）。
