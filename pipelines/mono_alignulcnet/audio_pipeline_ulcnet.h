@@ -28,19 +28,20 @@
  *
  * ── Far-input deployment contract (far_input_mode) ───────────────────────
  *  The config's far_input_mode selects which far stream feeds the model's
- *  far branch. The chosen mode MUST match the checkpoint's training far
- *  input -- a mismatch is an input-distribution change, not a tuning knob:
+ *  far branch. It MUST match the exported graph descriptor and application
+ *  wiring; it is an init/export profile, not a per-hop tuning knob:
  *    ULCNET_FAR_RAW     (default) -> the caller's raw ref hop, same-hop with
- *                  the error tap. Checkpoint-compatible: current checkpoints
- *                  are trained with RAW far. The model's output is applied
+ *                  the error tap; the far stream the current weights were
+ *                  trained on. The model's output is applied
  *                  WITHOUT any delay-lock gating (the paper contract does
  *                  not depend on lock); only infer() failure or a non-finite
  *                  output frame falls back to the identity path.
  *    ULCNET_FAR_ALIGNED -> the AEC's aligned far (AecLinearContext.
- *                  aligned_far_hop) plus delay-lock gating of the model
- *                  APPLICATION (the Phase-2 embedded candidate; see the
- *                  delay-gating rules below). Only use with a checkpoint
- *                  trained/fine-tuned on aligned far.
+ *                  aligned_far_hop) plus delay-lock gating of model
+ *                  APPLICATION (see the delay-gating rules below). The
+ *                  deployment sweep accepted this profile with the existing
+ *                  weights; graph descriptor and pipeline wiring must both
+ *                  explicitly name ALIGNED.
  *  That match is ENFORCED, not merely documented: when cfg.model publishes a
  *  model-I/O contract (model.io_descriptor != NULL, which the accelerator
  *  adapter always does), get_mem_requirements/init/init_ex all FAIL when its
@@ -181,7 +182,7 @@ typedef struct {
     AecPreset   aec_preset;   /* MILD | BALANCED | AGGRESSIVE                 */
     UlcnetModel model;        /* NPU callback boundary; may be all-zero       */
     UlcnetFarInputMode far_input_mode;  /* RAW (default) | ALIGNED; must
-                              * match the checkpoint's training far input  */
+                              * match graph descriptor and application wire */
 } AudioPipelineUlcnetConfig;
 
 /** Defaults: the trained ULCNet grid (16 kHz, frame/FFT 512, hop 256),

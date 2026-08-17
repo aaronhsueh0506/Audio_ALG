@@ -1442,17 +1442,17 @@ static int test_far_mode_descriptor_gate(void) {
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &aligned_model) == 0,
           "ALIGNED descriptor is accepted by an ALIGNED pipeline");
 
-    /* set_far_input_mode(): with the ALIGNED checkpoint installed, the
+    /* set_far_input_mode(): with an ALIGNED graph descriptor installed, the
      * reverse move is refused and the mode is left untouched. */
     CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
               p, ULCNET_FAR_RAW) != 0,
-          "switching to RAW is rejected while an ALIGNED checkpoint is installed");
+          "switching to RAW is rejected while an ALIGNED graph is installed");
     CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_ALIGNED,
           "the rejected switch left the mode unchanged");
 
     /* The reverse pairing, on a fresh instance: RAW pipeline + ALIGNED
      * checkpoint is refused, RAW + RAW installs, and the mode may then not
-     * be moved to ALIGNED underneath the RAW checkpoint. */
+     * be moved to ALIGNED underneath the RAW graph descriptor. */
     audio_pipeline_4ch_ulcnet_destroy(p);
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
     CHECK(p != NULL, "create the reverse-direction gate pipeline");
@@ -1462,7 +1462,7 @@ static int test_far_mode_descriptor_gate(void) {
           "RAW descriptor is accepted by a RAW pipeline");
     CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(
               p, ULCNET_FAR_ALIGNED) != 0,
-          "switching to ALIGNED is rejected while a RAW checkpoint is installed");
+          "switching to ALIGNED is rejected while a RAW graph is installed");
     CHECK(audio_pipeline_4ch_ulcnet_far_input_mode(p) == ULCNET_FAR_RAW,
           "the rejected switch left the mode unchanged");
     CHECK(audio_pipeline_4ch_ulcnet_set_far_input_mode(

@@ -33,9 +33,12 @@ What is asserted, and why each assertion can fail:
    argument anywhere along the way degrades to the default of 5, which would
    let n=1 lock. ``test_mutation_pinned_bank_size_*`` proves exactly that by
    re-running the n=1 case with the harness knob removed.
-2. NOT LOCKING IS AN HONEST OUTCOME. Out of reach, the estimator must stay
-   unacquired so the ALIGNED pipeline fails open, rather than reporting a
-   confident wrong delay.
+2. NOT LOCKING OUT OF REACH IS AN HONEST OUTCOME for the single-path fixture.
+   That out-of-range input may instead mis-lock confidently when an in-range
+   early reflection exists is pinned by the C known-delay fixtures
+   (test_known_delay_mislock_is_detectable in both pipeline test families);
+   the Python QA side has no such fixture yet. In-range failure to acquire
+   is invalid (``not_acquired_in_range``).
 3. THE ALIGNED-FAR SEAM IS EXACT. The far the PBFDKF consumed is the raw far
    delayed by exactly the applied delay -- checked byte-for-byte, so a
    one-sample slip fails -- and it LEADS the echo by a bounded positive

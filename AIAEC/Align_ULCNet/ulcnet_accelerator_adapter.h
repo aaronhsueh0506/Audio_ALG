@@ -25,12 +25,13 @@ int ulcnet_accelerator_adapter_get_mem_size(int delay_depth,
                                             size_t *bytes,
                                             size_t *alignment);
 
-/* far_input_mode is the deployed CHECKPOINT's contract, i.e. the ONNX/JSON
+/* far_input_mode is the deployed GRAPH's contract, i.e. the ONNX/JSON
  * metadata's far_input_mode mapped through ulcnet_far_input_mode_name();
- * pass ULCNET_FAR_RAW for every current checkpoint. It is not a behaviour
- * switch inside the adapter: it is recorded in the descriptor this adapter
- * publishes, so the pipeline the model is installed into can reject a far
- * branch that disagrees. An undefined value is rejected here. */
+ * every currently exported graph records raw_far (the exporter's explicit
+ * ALIGNED override is pending). It is not a behaviour switch inside the
+ * adapter: it is recorded in the descriptor this adapter publishes, so the
+ * pipeline the model is installed into can reject a far branch that
+ * disagrees. An undefined value is rejected here. */
 UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
     void *memory,
     size_t bytes,

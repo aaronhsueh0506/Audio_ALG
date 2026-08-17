@@ -4,8 +4,8 @@
  * 這個檔案是「網路以外的訊號路徑」。邊界與部署 NPU graph 完全一致:
  *
  *     C   : hop(256 samples) -> centered sqrt-Hann STFT -> RI 頻譜 (兩路:
- *           linear_error / checkpoint-matched far；current checkpoints use
- *           raw_far，aligned_far 需另立 checkpoint contract)
+ *           linear_error / descriptor-matched far；現有權重以 raw_far 訓練，
+ *           aligned_far 為部署 sweep 接受的明確 export/init profile)
  *     網路: (error_ri, far_ri, 顯式 states) -> enhanced_ri  <-- 只有這段是學來的
  *           (壓縮/attention/GRU/解壓縮全部在 graph 內；states 由 CPU/driver
  *           context 保存，加速器本身 stateless)
@@ -200,8 +200,8 @@ int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]);
  * MODEL-CONTRACT PUBLICATION (io_descriptor): a runtime that owns a
  * ulcnet_model_io state publishes its descriptor here (the accelerator
  * adapter does this automatically), which is what lets a pipeline reject a
- * checkpoint whose far_input_mode disagrees with its own far branch instead
- * of silently feeding the model the wrong input distribution. NULL -- the
+ * graph descriptor whose far_input_mode disagrees with its own far branch
+ * instead of silently feeding the model the wrong input distribution. NULL -- the
  * memset-zero case, and every runtime that predates the field -- means "no
  * contract published": the pipelines then keep their previous behaviour and
  * apply no far-mode gate, because with no checkpoint behind the callback

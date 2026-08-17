@@ -10,10 +10,12 @@ history and GRU hidden states through `ulcnet_accelerator_adapter`; only the
 stateless tensor invocation in `run_accelerator()` remains a board TODO.
 Returning an error is intentionally fail-open and emits the linear error.
 
-The exported checkpoint fixes `D`. The example uses `D=8`; change it only
-together with the ONNX descriptor. `far_input_mode` must also equal the
-checkpoint contract (`RAW` for existing checkpoints, `ALIGNED` only for a
-checkpoint trained that way).
+The exported graph fixes `D`. The example uses `D=8`; changing D means
+exporting another graph/descriptor and rebuilding its state pool, but does not
+require retraining the weights. Existing checkpoints were trained with RAW
+far. This project has accepted reuse of those weights with ALIGNED far after
+its deployment sweep; the exported descriptor and pipeline must still both
+name the mode actually wired on the board.
 
 ## Delay profile
 

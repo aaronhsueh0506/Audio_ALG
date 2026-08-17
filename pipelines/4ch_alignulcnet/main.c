@@ -168,10 +168,11 @@ int main(int argc, char** argv) {
     int hop;
     int index;
     int rc;
-    /* A product reads this from the deployed checkpoint's ONNX metadata
+    /* A product reads this from the deployed graph's ONNX metadata
      * ('far_input_mode', whose strings ulcnet_far_input_mode_name() mirrors)
-     * instead of hard-coding it; every current checkpoint is raw_far. */
-    const int checkpoint_far_input_mode = ULCNET_FAR_RAW;
+     * instead of hard-coding it; every currently exported graph records
+     * raw_far (explicit ALIGNED export override pending). */
+    const int deployed_far_input_mode = ULCNET_FAR_RAW;
 
     rc = parse_delay_profile(argc, argv, &profile);
     if (rc != 0) return rc == 1 ? 0 : rc;
@@ -203,7 +204,7 @@ int main(int argc, char** argv) {
         return 1;
     }
     adapter = ulcnet_accelerator_adapter_init(
-        adapter_pool, adapter_bytes, 8, checkpoint_far_input_mode,
+        adapter_pool, adapter_bytes, 8, deployed_far_input_mode,
         run_accelerator, NULL);
     pipeline = audio_pipeline_4ch_ulcnet_create(&cfg);
     if (!adapter || !pipeline) {

@@ -87,9 +87,9 @@ int main(void) {
     ++invalid.ta_bins;
     CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
 
-    /* far_input_mode: the checkpoint contract carried in the descriptor.
-     * Defaults to RAW (what every current checkpoint trains on), accepts
-     * ALIGNED, rejects anything else. */
+    /* far_input_mode: the deployed graph's contract carried in the
+     * descriptor. Defaults to RAW (what every currently exported graph
+     * records), accepts ALIGNED, rejects anything else. */
     CHECK(d4.far_input_mode == ULCNET_FAR_RAW);
     CHECK(d8.far_input_mode == ULCNET_FAR_RAW);
     CHECK(d64.far_input_mode == ULCNET_FAR_RAW);

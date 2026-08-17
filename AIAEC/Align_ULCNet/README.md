@@ -67,16 +67,13 @@ condition the previous one delivers, which is why both appear in every summary
 row instead of being summed.  Reliable reach of the bank is 125 / 221 / 317 /
 413 / 509 ms for `n` = 1..5.
 
-`--delay-num-filters` is a **runtime AEC init override for this diagnostic run
-only**.  It is not a data-contract change: the checkpoint's recorded
-`linear_aec` contract does not carry a bank size and is used exactly as
-stamped, and dataset generation is frozen at `n = 5` with no way to configure
-it.  Omitting the flag therefore reproduces the frontend the checkpoint was
-trained against; naming any other value is reported as a departure from that
-corpus, and the resulting WAVs are candidate profile measurements rather than
-release comparisons.  The bank size recorded in `summary.csv` is read back off
-the constructed engine, so a row cannot name a profile the run did not
-actually execute.
+`--delay-num-filters` is a **runtime AEC init override** for the diagnostic
+frontend. It is not a checkpoint-compatibility or retraining requirement:
+dataset generation remains frozen at `n = 5`, while a product may choose a
+smaller n when its measured bulk-delay range plus acquisition margin fits that
+bank. Omitting the flag reproduces the dataset-generation frontend. The bank
+size recorded in `summary.csv` is read back from the constructed engine, so a
+row cannot name a profile the run did not actually execute.
 
 ```bash
 # short-route candidate: smaller bank, aligned far, shallow attention
@@ -98,9 +95,9 @@ the bulk delay: a windowed, energy-gated, normalized cross-correlation of the
 raw far against the raw mic.  The applied delay must land at, or just before,
 that measurement.  A clip that fails is reported as `mislock` and marked
 invalid (`qa_valid` in `summary.csv`) so it cannot be averaged into a
-delay-profile statistic; a delay the bank simply cannot reach is reported
-separately as `not_acquired`, which is an honest fail-open observation and
-stays valid.
+delay-profile statistic. A delay outside the selected bank's reliable range
+that stays unlocked is reported as valid `not_acquired`; failure to acquire a
+decidable in-range delay is `not_acquired_in_range` and invalid.
 
 The Python RTF is only a relative D comparison on the same machine; it does
 not predict NPU runtime.  Compare the boundary rates/probability with the
@@ -124,7 +121,7 @@ flowchart LR
         AEC["Matched filter + PBFDKF"]
         ERR["linear_error"]
         AFAR["aligned_far"]
-        MODE{"current raw_far / future aligned_far"}
+        MODE{"deployed raw_far / aligned_far"}
         STFT["two sqrt-Hann STFTs<br/>512 / 256"]
         ERRI["linear_error_ri<br/>[1,1,257,2]"]
         FARRI["far_end_ri<br/>[1,1,257,2]"]
@@ -176,7 +173,7 @@ Inputs per invocation:
 | tensor | float32 shape | ordering |
 |---|---:|---|
 | `linear_error_ri` | `[1,1,257,2]` | real/imag last |
-| `far_end_ri` | `[1,1,257,2]` | checkpoint far-input contract; current checkpoints are `raw_far` |
+| `far_end_ri` | `[1,1,257,2]` | graph-descriptor far-input contract; every currently exported graph records `raw_far` |
 | `key_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `value_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `logit_history` | `[1,32,4,D]` | chronological, t-4 through t-1 |

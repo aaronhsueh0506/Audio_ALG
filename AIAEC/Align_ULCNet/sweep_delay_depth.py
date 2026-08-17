@@ -14,13 +14,12 @@ They do not add up into one delay budget. Each layer must satisfy the input
 condition the previous one delivers, which is why n and D are reported side by
 side in every summary row rather than summed.
 
-Both are DEPLOYMENT knobs and neither is a data-contract change. n is a
-runtime AEC init override applied to the instance this tool builds; D is an
-export-time model shape. The checkpoint's recorded ``linear_aec`` contract is
-read and honoured unchanged either way -- corpora are always materialized at
-the frozen ``DATASET_DELAY_NUM_FILTERS`` bank, so a run at another n is a
-diagnostic of the frontend, reported as departing from the corpus the
-checkpoint was trained on.
+Both are DEPLOYMENT knobs and neither is a checkpoint-compatibility or
+retraining requirement. n is a runtime AEC init override applied to the
+instance this tool builds; D is an export-time model shape. Corpora remain
+materialized at the frozen ``DATASET_DELAY_NUM_FILTERS`` bank. A product may
+deploy another n after its measured bulk-delay range and acquisition margin
+fit that bank; this tool records the departure so results remain auditable.
 
 The microphone/far frontend is evaluated once, with a tapped hop loop that
 records the delay the PBFDKF actually applied and the far it actually
@@ -77,6 +76,7 @@ from AIAEC.dataset_gen import istft, stft
 from AIAEC.dataset_gen.linear_aec import (
     DATASET_DELAY_NUM_FILTERS,
     DELAY_NUM_FILTERS_RANGE,
+    MATCHED_REACH_MS,
     LinearAecContract,
     check_delay_num_filters,
 )
@@ -135,16 +135,9 @@ def parse_delay_num_filters(value: str) -> int:
         raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
-# Reliable bulk-delay reach of an n-filter matched bank, in ms: lib/aec's
-# contract value ((n-1)*384 + 501 downsampled samples at 0.25 ms each), not a
-# geometric span -- derived from that arithmetic (125/221/317/413/509 ms)
-# rather than copied as literals, mirroring the C tests' KD_RELIABLE_SAMPLES.
-# Printed so a run that fails to lock says whether the delay was ever inside
-# reach.
-MATCHED_REACH_MS = {
-    n: ((n - 1) * 384 + 501) * 0.25
-    for n in range(DELAY_NUM_FILTERS_RANGE[0], DELAY_NUM_FILTERS_RANGE[1] + 1)
-}
+# MATCHED_REACH_MS (imported above) is the reach table QA verdicts and the
+# printed annotations share; it lives in linear_aec.py beside the range it is
+# defined over.
 
 # QA gate for the applied delay. The offline cross-correlation of RAW far
 # against the mic measures the true bulk delay independently of the estimator;
@@ -426,10 +419,11 @@ def alignment_qa(
       amount. This is the seam the NN sees in ``aligned_far`` mode.
 
     ``status`` is one of ``ok`` / ``mislock`` / ``not_acquired`` /
-    ``undecidable``. ``not_acquired`` is an HONEST outcome, not a defect: a
-    bank too small to reach the clip's delay is supposed to stay unlocked and
-    let the pipeline fail open. It is reported separately from ``mislock``
-    precisely so the two are never averaged together.
+    ``not_acquired_in_range`` / ``undecidable``. ``not_acquired`` is an honest
+    out-of-range observation: a bank too small to reach the clip's delay stays
+    unlocked and lets the pipeline fail open. Failure to acquire a decidable
+    delay that is inside this bank's reliable range is instead invalid and
+    reported as ``not_acquired_in_range``.
 
     ``offline`` accepts a precomputed measurement: it depends only on the raw
     signals, so callers that QA several runs of one clip measure once.
@@ -452,12 +446,31 @@ def alignment_qa(
     decidable = (
         offline.n_windows >= QA_MIN_WINDOWS
         and offline.n_boundary_peak == 0
+        and offline.bulk_delay_samples >= 0
     )
     headroom_ms = float('nan')
-    if applied < 0:
-        status = 'not_acquired' if decidable else 'undecidable'
-    elif not decidable:
+    offline_delay_ms = (
+        offline.bulk_delay_samples * to_ms
+        if offline.bulk_delay_samples >= 0 else float('nan')
+    )
+    reach_ms = MATCHED_REACH_MS.get(run.delay_num_filters, float('nan'))
+    # A run with no legal bank size (synthetic EngineRuns default to 0) has no
+    # reach to judge a non-acquisition against -- that MUST fail closed as
+    # undecidable, never fall through to the valid `not_acquired` arm.
+    known_reach = not math.isnan(reach_ms)
+    expected_in_range = bool(
+        decidable and known_reach and offline_delay_ms <= reach_ms
+    )
+    if not decidable:
         status = 'undecidable'
+    elif applied < 0:
+        if not known_reach:
+            status = 'undecidable'
+        else:
+            status = (
+                'not_acquired_in_range' if expected_in_range
+                else 'not_acquired'
+            )
     else:
         headroom_ms = (offline.bulk_delay_samples - applied) * to_ms
         status = (
@@ -471,10 +484,8 @@ def alignment_qa(
         # was never inside the bank's reach is a valid observation OF that.
         'qa_valid': status in ('ok', 'not_acquired'),
         'qa_offline_bulk_delay_samples': offline.bulk_delay_samples,
-        'qa_offline_bulk_delay_ms': (
-            offline.bulk_delay_samples * to_ms
-            if offline.bulk_delay_samples >= 0 else float('nan')
-        ),
+        'qa_offline_bulk_delay_ms': offline_delay_ms,
+        'qa_expected_in_range': expected_in_range,
         'qa_offline_windows': offline.n_windows,
         'qa_offline_boundary_peaks': offline.n_boundary_peak,
         'qa_applied_vs_offline_ms': headroom_ms,
@@ -557,9 +568,9 @@ def build_parser() -> argparse.ArgumentParser:
              'and how much AEC pool it costs, and it is independent of the NN '
              'depth D set by --depths. It is an AEC init parameter applied to '
              'this diagnostic run only: it is not written back to any '
-             'contract, and corpora are always materialized at the default, '
-             'so any other value is reported as departing from the corpus the '
-             'checkpoint was trained on.',
+             'contract, and corpora are always materialized at the default. '
+             'Choose the deployed n from the product\'s measured bulk-delay '
+             'range; changing n does not require retraining the NN.',
     )
     parser.add_argument(
         '--qa-max-lag', type=int, default=DEFAULT_MAX_LAG * 8,
@@ -646,11 +657,11 @@ def main(args: argparse.Namespace) -> None:
               f"{MATCHED_REACH_MS[delay_num_filters]:.0f} ms), contract "
               f"{frontend_contract.version} unchanged")
         if delay_num_filters != DATASET_DELAY_NUM_FILTERS:
-            print("WARNING: this bank size is a deployment override. Every "
-                  f"corpus is materialized at n={DATASET_DELAY_NUM_FILTERS}, "
-                  "so the linear_error the model sees here is not the one it "
-                  "was trained on; treat the result as a candidate profile "
-                  "measurement, not a release comparison.")
+            print("NOTE: this is a deployment override; dataset generation "
+                  f"remains frozen at n={DATASET_DELAY_NUM_FILTERS}. Choose "
+                  "the deployed n from the product's measured bulk-delay "
+                  "range and verify acquisition/mislock/fail-open behavior; "
+                  "changing n does not require retraining the NN.")
 
     alignment_run: Optional[EngineRun] = None
     alignment_qa_metrics: Dict[str, object] = {}
@@ -662,8 +673,10 @@ def main(args: argparse.Namespace) -> None:
         if args.far_input_mode == 'aligned_far':
             print("aligned_far evaluation: treating the supplied far WAV as "
                   "already aligned (no PBFDKF tap is available in bypass mode)")
-            print("WARNING: current checkpoints are trained with raw_far; "
-                  "aligned_far is an out-of-distribution diagnostic")
+            print("NOTE: aligned_far is an accepted deployment profile for "
+                  "the current raw-far-trained weights; exported graphs "
+                  "still record raw_far until the exporter's explicit "
+                  "far-mode override lands")
         if args.max_seconds is not None:
             limit = min(
                 error.shape[-1], max(1, int(round(args.max_seconds * grid.sr)))
@@ -706,8 +719,10 @@ def main(args: argparse.Namespace) -> None:
             ).unsqueeze(0).contiguous()
             print("aligned_far evaluation: using the post-delay-buffer far "
                   "samples actually consumed by PBFDKF")
-            print("WARNING: current checkpoints are trained with raw_far; "
-                  "aligned_far is an out-of-distribution diagnostic")
+            print("NOTE: aligned_far is an accepted deployment profile for "
+                  "the current raw-far-trained weights; exported graphs "
+                  "still record raw_far until the exporter's explicit "
+                  "far-mode override lands")
     if source_rates != (grid.sr, grid.sr):
         print(f"resampled primary/far {source_rates[0]}/{source_rates[1]} -> "
               f"{grid.sr} Hz")
@@ -779,7 +794,7 @@ def main(args: argparse.Namespace) -> None:
             "window(s)"
         )
         if (args.far_input_mode == 'aligned_far'
-                and alignment_qa_metrics['qa_status'] == 'not_acquired'):
+                and not alignment_metrics.get('aec_delay_acquired', True)):
             print(
                 "NOTE: no delay was ever acquired, so the 'aligned' far this "
                 "tool fed the model is the raw far. A deployed ALIGNED "

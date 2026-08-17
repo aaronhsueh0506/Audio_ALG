@@ -40,19 +40,26 @@ extern "C" {
  * and both ULCNet pipeline wrappers all use these values (the pipeline
  * headers get them by including ulcnet_process.h, which includes this file).
  *
- * The mode names the far stream the CHECKPOINT was trained on, so it is an
- * input-distribution property, not a tuning knob. The exporter records the
- * same choice in the ONNX/JSON metadata as a string; the mapping is
+ * The mode names the far stream the EXPORTED graph is deployed with. Existing
+ * weights were trained on raw far; this project also permits an explicit
+ * aligned-far deployment export after its completed profile sweep. It is an
+ * init/export property, not a per-hop tuning knob. ONNX/JSON metadata and the
+ * generated C descriptor must record the same choice; the mapping is
  * 'raw_far' <-> ULCNET_FAR_RAW and 'aligned_far' <-> ULCNET_FAR_ALIGNED
  * (ulcnet_far_input_mode_name() below returns exactly those strings, so a
  * board can compare metadata, descriptor and pipeline mode without keeping
  * its own table). AIAEC/training_common.py's FAR_INPUT_MODE_C_VALUES is the
  * Python side of the same mapping. */
 typedef enum UlcnetFarInputMode {
-    ULCNET_FAR_RAW     = 0,  /* raw far; checkpoint-compatible default; no
-                              * delay-lock gating of model application     */
-    ULCNET_FAR_ALIGNED = 1   /* aligned far + lock gating; the Phase-2
-                              * embedded candidate                         */
+    ULCNET_FAR_RAW     = 0,  /* raw far; default -- the far stream current
+                              * weights were trained on; no delay-lock
+                              * gating of model application               */
+    ULCNET_FAR_ALIGNED = 1   /* aligned far + lock gating; explicit export/
+                              * init profile accepted by the deployment
+                              * sweep (exporter's explicit override and the
+                              * generated C descriptor are still pending --
+                              * every currently exported graph records
+                              * raw_far)                                  */
 } UlcnetFarInputMode;
 
 /* far_input_mode is stored as a plain int (not the enum type) so a

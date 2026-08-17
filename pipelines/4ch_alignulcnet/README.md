@@ -9,8 +9,10 @@ The model accelerator is intentionally left as the TODO in
 `run_accelerator()`. CPU memory owns every K/V, logit and GRU state tensor.
 The default callback failure demonstrates the production fail-open path.
 
-Existing checkpoints require `ULCNET_FAR_RAW`. `ULCNET_FAR_ALIGNED` is a
-separate training/deployment contract, not a runtime quality switch.
+Existing checkpoints were trained with `ULCNET_FAR_RAW`. This project has
+accepted reuse of those weights with `ULCNET_FAR_ALIGNED` after its deployment
+sweep. The choice is still an init/export profile rather than a per-hop quality
+switch: model descriptor and pipeline wiring must name the same mode.
 
 ## Delay profile
 

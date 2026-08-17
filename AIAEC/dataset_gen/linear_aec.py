@@ -86,6 +86,18 @@ DATASET_DELAY_NUM_FILTERS = 5
 # at init and not through a mutator.
 DELAY_NUM_FILTERS_RANGE = (1, 5)
 
+# Reliable bulk-delay reach of an n-filter matched bank, in ms: lib/aec's
+# contract value ((n-1)*384 + 501 downsampled samples at 0.25 ms each), not a
+# geometric span -- derived from that arithmetic (125/221/317/413/509 ms)
+# rather than copied as literals, mirroring the C tests' KD_RELIABLE_SAMPLES.
+# lib/aec resamples 48 kHz internally and rescales the reported delay, so the
+# ms table holds at both supported rates. It lives here, beside the range it
+# is defined over, because QA verdicts (not just display) depend on it.
+MATCHED_REACH_MS = {
+    n: ((n - 1) * 384 + 501) * 0.25
+    for n in range(DELAY_NUM_FILTERS_RANGE[0], DELAY_NUM_FILTERS_RANGE[1] + 1)
+}
+
 
 def check_delay_num_filters(value: object) -> int:
     """Validate a matched-filter bank size, refusing anything out of range.
@@ -96,17 +108,25 @@ def check_delay_num_filters(value: object) -> int:
     than a value to round into range.
     """
     low, high = DELAY_NUM_FILTERS_RANGE
+    msg = (
+        f"delay_num_filters must be an integer in [{low}, {high}], got "
+        f"{value!r}"
+    )
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(msg)
     try:
         resolved = int(value)
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"delay_num_filters must be an integer in [{low}, {high}], got "
-            f"{value!r}"
-        ) from None
-    if not low <= resolved <= high:
-        raise ValueError(
-            f"delay_num_filters must be in [{low}, {high}], got {resolved}"
-        )
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError(msg) from None
+    # ``int(1.5)`` silently truncates. This is a public Python API as well as
+    # an argparse validator, so direct callers must not accidentally deploy a
+    # different bank from the value they supplied.
+    try:
+        exact = float(value) == resolved
+    except (TypeError, ValueError, OverflowError):
+        exact = False
+    if not exact or not low <= resolved <= high:
+        raise ValueError(msg)
     return resolved
 
 

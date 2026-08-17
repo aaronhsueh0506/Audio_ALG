@@ -40,17 +40,18 @@
  *   integrators/tests can verify exactly this relation.
  *
  * FAR-INPUT DEPLOYMENT CONTRACT (set_far_input_mode below): the selected
- * mode MUST match the checkpoint's training far input -- a mismatch is an
- * input-distribution change, not a tuning knob.
+ * mode MUST match the exported graph descriptor and the stream actually
+ * wired by the application. It is an init/export profile, not a per-hop
+ * tuning knob.
  *   - ULCNET_FAR_RAW (default): the caller's raw far_reference feeds the
- *     far branch (with the same one-hop compensation as aligned mode).
- *     Checkpoint-compatible: current checkpoints are trained with RAW far.
- *     Model application is NEVER gated on the shared delay lock (the paper
- *     contract does not depend on lock).
+ *     far branch (with the same one-hop compensation as aligned mode); the
+ *     far stream the current weights were trained on. Model application is
+ *     NEVER gated on the shared delay lock (the paper contract does not
+ *     depend on lock).
  *   - ULCNET_FAR_ALIGNED: pre.aligned_ref feeds the far branch and the
  *     model's output is APPLIED only while the shared delay is locked
- *     (delay.solid && delay.delay_samples >= 0) -- the Phase-2 embedded
- *     candidate. Only use with a checkpoint trained on aligned far.
+ *     (delay.solid && delay.delay_samples >= 0). The deployment sweep
+ *     accepted this profile with the existing weights.
  * That match is ENFORCED for any model that publishes a model-I/O contract
  * (UlcnetModel.io_descriptor != NULL, which the accelerator adapter always
  * does): set_model() and set_far_input_mode() BOTH reject the call, leaving
@@ -278,7 +279,7 @@ int audio_pipeline_4ch_ulcnet_set_model(
  * change the model's input distribution and corrupt the err/far pairing.
  * After audio_pipeline_4ch_ulcnet_reset() (which restarts the stream and
  * clears that state) switching is allowed again. The mode MUST match the
- * checkpoint's training far input, and when a model publishing a model-I/O
+ * exported graph descriptor, and when a model publishing a model-I/O
  * contract is already installed that agreement is checked here too.
  * Returns 0 on success, nonzero on a NULL/destroyed pipeline, an undefined
  * mode value, a mid-stream call, or disagreement with the installed model's

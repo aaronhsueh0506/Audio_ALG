@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 
 import numpy as np
 import pytest
@@ -7,6 +8,7 @@ import torch
 from AIAEC.Align_ULCNet import AlignULCNet
 from AIAEC.Align_ULCNet.sweep_delay_depth import (
     QA_MAX_HEADROOM_MS,
+    OfflineBulkDelay,
     _alignment_summary,
     _delay_summary,
     _write_alignment_trace,
@@ -20,7 +22,10 @@ from AIAEC.Align_ULCNet.sweep_delay_depth import (
     run_streaming_frames,
 )
 from AIAEC.aiaec_common import SignalGrid
-from AIAEC.dataset_gen.linear_aec import DATASET_DELAY_NUM_FILTERS
+from AIAEC.dataset_gen.linear_aec import (
+    DATASET_DELAY_NUM_FILTERS,
+    check_delay_num_filters,
+)
 from AIAEC.dataset_gen.measure_align_residual import EngineRun
 
 
@@ -106,6 +111,11 @@ def test_parse_delay_num_filters_enforces_the_bank_range():
     for bad in ('0', '6', '-1', 'five', ''):
         with pytest.raises(argparse.ArgumentTypeError):
             parse_delay_num_filters(bad)
+    # The canonical validator itself, asserted directly: values that int()
+    # would silently truncate or that only masquerade as integers.
+    for bad in (True, np.bool_(True), 1.5, np.float32(2.5), float('inf')):
+        with pytest.raises(ValueError):
+            check_delay_num_filters(bad)
 
 
 def test_delay_num_filters_defaults_to_the_corpus_bank_size():
@@ -231,6 +241,92 @@ def test_alignment_qa_marks_a_confidently_wrong_delay_invalid():
         qa = alignment_qa(run, mic, far, max_lag=8192, offline=offline)
         assert qa['qa_status'] == 'mislock', (applied, qa)
         assert qa['qa_valid'] is False
+
+
+def test_alignment_qa_rejects_failure_to_acquire_an_in_range_delay():
+    rng = np.random.default_rng(12)
+    sample_rate, hop, true_delay = 16000, 256, 1280
+    far = (0.2 * rng.standard_normal(6 * sample_rate)).astype(np.float32)
+    mic = np.zeros_like(far)
+    mic[true_delay:] = 0.5 * far[:-true_delay]
+    run = EngineRun(
+        sample_rate=sample_rate,
+        hop_size=hop,
+        error=np.zeros_like(far),
+        echo_estimate=mic.copy(),
+        aligned_far=far.copy(),
+        delay_samples=np.full(far.size // hop, -1, dtype=np.int64),
+        confidence=np.zeros(far.size // hop, dtype=np.float64),
+        delay_num_filters=1,  # reliable reach 125 ms; true delay is 80 ms
+    )
+
+    qa = alignment_qa(run, mic, far, max_lag=8192)
+    assert qa['qa_status'] == 'not_acquired_in_range', qa
+    assert qa['qa_valid'] is False
+
+
+def test_alignment_qa_fails_closed_when_the_bank_size_is_unknown():
+    """A run with no legal bank size has no reach to judge against.
+
+    Synthetic ``EngineRun``s default to ``delay_num_filters=0``. A
+    never-acquired clip on such a run must come out ``undecidable``/invalid,
+    not fall through to the VALID ``not_acquired`` arm -- that would average
+    an unjudgeable clip into the profile statistic as a fail-open
+    observation.
+    """
+    silence = np.zeros(1024, dtype=np.float32)
+    run = EngineRun(
+        sample_rate=16000,
+        hop_size=256,
+        error=silence.copy(),
+        echo_estimate=silence.copy(),
+        aligned_far=silence.copy(),
+        delay_samples=np.full(4, -1, dtype=np.int64),
+        confidence=np.zeros(4, dtype=np.float64),
+    )
+    offline = OfflineBulkDelay(
+        n_windows=3, n_boundary_peak=0, bulk_delay_samples=1280,
+    )
+
+    qa = alignment_qa(run, silence, silence, max_lag=8192, offline=offline)
+    assert qa['qa_expected_in_range'] is False
+    assert qa['qa_status'] == 'undecidable', qa
+    assert qa['qa_valid'] is False
+
+
+def test_alignment_qa_does_not_treat_negative_bulk_lag_as_in_range():
+    silence = np.zeros(1024, dtype=np.float32)
+    run = EngineRun(
+        sample_rate=16000,
+        hop_size=256,
+        error=silence.copy(),
+        echo_estimate=silence.copy(),
+        aligned_far=silence.copy(),
+        delay_samples=np.full(4, -1, dtype=np.int64),
+        confidence=np.zeros(4, dtype=np.float64),
+        delay_num_filters=5,
+    )
+    offline = OfflineBulkDelay(
+        n_windows=3, n_boundary_peak=0, bulk_delay_samples=-160,
+    )
+
+    qa = alignment_qa(run, silence, silence, max_lag=8192, offline=offline)
+    assert qa['qa_expected_in_range'] is False
+    assert qa['qa_status'] == 'undecidable'
+    assert qa['qa_valid'] is False
+
+    # Same negative offline verdict with an ACQUIRED delay: also undecidable
+    # (before the negative-lag guard this arm reported 'mislock'; either way
+    # qa_valid stays False, but the changed diagnosis in summary.csv is
+    # intended, so pin it).
+    acquired_run = dataclasses.replace(
+        run, delay_samples=np.full(4, 160, dtype=np.int64)
+    )
+    acquired = alignment_qa(
+        acquired_run, silence, silence, max_lag=8192, offline=offline,
+    )
+    assert acquired['qa_status'] == 'undecidable'
+    assert acquired['qa_valid'] is False
 
 
 def test_alignment_summary_reports_never_acquired():
