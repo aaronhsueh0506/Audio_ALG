@@ -33,10 +33,10 @@ th{background:#f5efe8}
 <h3>ONNX / NPU graph 邊界</h3>
 <table>
 <tr><th>位置</th><th>內容</th></tr>
-<tr><td>graph <b>內</b>(目標 graph boundary；ONNX export 為 Phase 4 待交付)</td><td>(error_ri, far_ri, 顯式 states) → enhanced_ri:signed |x|^0.3 壓縮(<code>ULCNET_COMPRESSION_EXP=0.3f</code>)、attention、GRU、解壓縮全部在 graph 內。若目標 runtime 不支援 pow 類算子而把壓縮/解壓縮移出 graph,C 端有 <code>ulcnet_compress_frame()/ulcnet_expand_frame()</code>,但邊界移動必須連 export graph 一起改、兩邊一致。</td></tr>
+<tr><td>graph <b>內</b>(已由 <code>export_streaming_onnx.py</code> 匯出)</td><td>(error_ri, far_ri, 顯式 states) → enhanced_ri:signed |x|^0.3 壓縮(<code>ULCNET_COMPRESSION_EXP=0.3f</code>)、attention、GRU、解壓縮全部在 graph 內。若目標 runtime 不支援 pow 類算子而把壓縮/解壓縮移出 graph,C 端有 <code>ulcnet_compress_frame()/ulcnet_expand_frame()</code>,但邊界移動必須連 export graph 一起改、兩邊一致。</td></tr>
 <tr><td>graph <b>外</b>(C 前處理)</td><td>線性 AEC(<code>aec_process_context</code>)、centered sqrt-Hann STFT(<code>ulcnet_analysis_push</code>,重現 torch.stft center=True + reflect 前綴)、delay-state policy。</td></tr>
 <tr><td>graph <b>外</b>(C 後處理)</td><td>enhanced_ri → centered WOLA(sqrt-Hann、包絡正規化、半窗 trim;<code>ulcnet_synthesis_push</code>)。</td></tr>
-<tr><td>runtime 跨呼叫保存的 NN states</td><td>far attention K/V ring、attention-logit 史、GRU hidden h — pipeline 從不觸碰;<code>model.reset</code> 被呼叫時 runtime 應 flush far ring + logit 史(GRU h 去留是 runtime 自己的 A/B 決策)。參考實作見下方「accelerator adapter」。</td></tr>
+<tr><td>runtime 跨呼叫保存的 NN states</td><td>far attention K/V ring、attention-logit 史、GRU hidden h — pipeline 只透過 <code>model.reset</code> 要求全部清除；參考 adapter 的 <code>ulcnet_model_io_reset()</code> 會將 K/V、logit 與兩組 GRU hidden 一併歸零。</td></tr>
 </table>
 
 <h3>accelerator adapter(CPU 擁有 state,加速器本身無狀態)</h3>
@@ -90,11 +90,11 @@ audio_pipeline_ulcnet_reset(p);   /* 也呼叫 model-&gt;reset */
 audio_pipeline_ulcnet_destroy(p); /* 不釋放 caller pool */</pre>
 <h3>far_input_mode 部署契約 + 三方一致性鎖</h3>
 <table>
-<tr><th>模式</th><th>far 來源</th><th>套用閘控</th><th>checkpoint</th></tr>
-<tr><td><code>ULCNET_FAR_RAW</code>(預設=0)</td><td>caller 的 raw <code>ref</code> hop(與 error tap 同 hop)</td><td><b>不以 delay lock 閘控</b>;只有 infer 失敗/非有限輸出才 fail-open</td><td><b>現行 checkpoint 以 RAW far 訓練</b> — 相容</td></tr>
-<tr><td><code>ULCNET_FAR_ALIGNED</code>(=1)</td><td><code>AecLinearContext.aligned_far_hop</code>(本 hop 線性濾波器實際吃到的 aligned far)</td><td>UNLOCKED 時模型輸出 <b>bypass</b>(仍照步進)</td><td>只能配 aligned-far 訓練/微調的 checkpoint(Phase-2 embedded 候選)</td></tr>
+<tr><th>模式</th><th>far 來源</th><th>套用閘控</th><th>權重/export</th></tr>
+<tr><td><code>ULCNET_FAR_RAW</code>(預設=0)</td><td>caller 的 raw <code>ref</code> hop(與 error tap 同 hop)</td><td><b>不以 delay lock 閘控</b>;只有 infer 失敗/非有限輸出才 fail-open</td><td>現行權重以 RAW far 訓練;現行 export 皆記錄 <code>raw_far</code></td></tr>
+<tr><td><code>ULCNET_FAR_ALIGNED</code>(=1)</td><td><code>AecLinearContext.aligned_far_hop</code>(本 hop 線性濾波器實際吃到的 aligned far)</td><td>UNLOCKED 時模型輸出 <b>bypass</b>(仍照步進)</td><td>本專案已接受既有權重的 aligned-far 部署；export descriptor 與 pipeline 接線仍須同為 ALIGNED</td></tr>
 </table>
-<p>模式不匹配 = 輸入分布改變,不是 tuning 旋鈕。未定義值在 <code>ulcnet_derive_dims_and_config()</code> reject。<b>三方一致性</b>由同一個 inline 函式 <code>ulcnet_far_input_mode_agrees()</code>(<code>ulcnet_model_io.h</code>)把關,三個地方共用一份定義:(1) ONNX/JSON metadata 的 <code>far_input_mode</code> 字串(<code>export_streaming_onnx.py</code> 寫入,<code>ulcnet_far_input_mode_name()</code> 雙向映射);(2) 由 (1) 灌進 <code>ulcnet_accelerator_adapter_init()</code> 的 <code>far_input_mode</code> 參數,編譯成 <code>UlcnetModelIoDescriptor.far_input_mode</code>,經 <code>UlcnetModel.io_descriptor</code> 一路帶到 pipeline;(3) pipeline 自己的 <code>cfg.far_input_mode</code>(呼叫端從 far branch 接線決定)。(2)(3) 不合在 <code>audio_pipeline_ulcnet_get_mem_requirements()</code>/<code>_init()</code>/<code>_init_ex()</code>/<code>_create()</code> 全部 reject(mono 的 <code>model</code> 是 init-time config 欄位,不匹配即整個 init 失敗)。<code>io_descriptor==NULL</code>(all-zero identity model 或未發布 contract 的 runtime)不受閘控。回歸測試:<code>AIAEC/tests/test_ulcnet_model_io_c.py</code>、<code>pipelines/mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c</code> 的「far-input contract gate」測試群組(10 個斷言,含 RAW/ALIGNED 互換皆拒、matched pair 仍可 init)。</p>
+<p>far mode 是 export/init profile,不可逐 hop 熱切換。既有權重可依本專案已接受的部署 sweep 明確 export 成 RAW 或 ALIGNED；未定義值在 <code>ulcnet_derive_dims_and_config()</code> reject。<b>三方一致性</b>由同一個 inline 函式 <code>ulcnet_far_input_mode_agrees()</code>(<code>ulcnet_model_io.h</code>)把關,三個地方共用一份定義:(1) ONNX/JSON metadata 的 <code>far_input_mode</code> 字串(<code>export_streaming_onnx.py</code> 寫入,<code>ulcnet_far_input_mode_name()</code> 雙向映射);(2) 由 (1) 灌進 <code>ulcnet_accelerator_adapter_init()</code> 的 <code>far_input_mode</code> 參數,編譯成 <code>UlcnetModelIoDescriptor.far_input_mode</code>,經 <code>UlcnetModel.io_descriptor</code> 一路帶到 pipeline;(3) pipeline 自己的 <code>cfg.far_input_mode</code>(呼叫端從 far branch 接線決定)。(2)(3) 不合在 <code>audio_pipeline_ulcnet_get_mem_requirements()</code>/<code>_init()</code>/<code>_init_ex()</code>/<code>_create()</code> 全部 reject(mono 的 <code>model</code> 是 init-time config 欄位,不匹配即整個 init 失敗)。<code>io_descriptor==NULL</code>(all-zero identity model 或未發布 contract 的 runtime)不受閘控。回歸測試:<code>AIAEC/tests/test_ulcnet_model_io_c.py</code>、<code>pipelines/mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c</code> 的「far-input contract gate」測試群組(10 個斷言,含 RAW/ALIGNED 互換皆拒、matched pair 仍可 init)。</p>
 <h3>UlcnetModel callback 契約(step-always / apply-gated)</h3>
 <ul>
 <li><b>Fail-open identity</b>:<code>infer==NULL</code>(all-zero model)、<code>infer()</code> 回非 0、或輸出幀含任何非有限值(<code>ulcnet_frame_is_finite()</code> 逐 bin isfinite)→ 該幀改走誤差頻譜原樣;NaN/Inf 永不進 WOLA。STFT/WOLA 時序不因模型存在與否改變。</li>

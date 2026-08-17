@@ -44,19 +44,22 @@ D 覆寫段）：graph <b>內</b> =
 <code>FrameDelayAttention</code>（<code>softmax</code> over D）、<code>FrequencyGRU</code>
 （<b>頻率軸 bidirectional GRU</b> 32×2，逐幀、免 state）、兩個 2 層 128-unit 時間軸
 GRU、FC + sigmoid + PReLU、stage-2 CNN complex mask。所有 recurrent state 是顯式 I/O
-tensor，由 runtime 逐次傳入/傳回。graph <b>外</b>（C 前後處理）= PBFDKF linear AEC 與
+tensor，由 CPU/DSP caller-owned pool 逐次傳入/傳回；加速器本身無隱藏 state。graph <b>外</b>（C 前後處理）= PBFDKF linear AEC 與
 delay 對齊（AEC C 端 seam）、centered sqrt-Hann STFT/ISTFT 與 complex↔RI 轉換
 （C 實作 <code>ulcnet_process.c</code>；Python reference <code>StreamSTFT/StreamISTFT</code>）。</p>
 <div class="note"><b>far_input_mode 契約</b>：checkpoint contract 記錄
 <code>far_input_mode</code>；欄位缺失（legacy）預設 <code>raw_far</code> 並由
 <code>load_model</code> 印出；未知值在載入權重<b>前</b>即 <code>ValueError</code>
 （test：<code>test_load_model_far_input_mode_default_present_and_rejected</code>）。部署契約以
-RAW_FAR 為預設、ALIGNED_FAR 為實驗性候選。同一個值由
+RAW_FAR 為預設；本專案的 deployment sweep 已接受現有權重以
+ALIGNED_FAR 部署。這是明確的 export/init profile，不是每 hop 熱切換。同一個值由
 <code>export_streaming_onnx.py</code> 寫進 ONNX/JSON metadata（<code>far_input_mode</code>
 字串 + <code>far_input_mode_c_value</code>），C 端 <code>UlcnetModelIoDescriptor.far_input_mode</code>
 與兩個 ULCNet pipeline（mono/4ch）各自的 <code>far_input_mode</code> config 欄位用同一份
 <code>ulcnet_far_input_mode_agrees()</code> 做三方比對，metadata/descriptor/pipeline
-三者不合即在 pipeline init 或 <code>set_model()</code> 時 reject——詳見
+三者不合即在 pipeline init 或 <code>set_model()</code> 時 reject。目前 exporter
+只從 checkpoint contract 繼承 far mode；generated C descriptor 與明確的
+ALIGNED override 尚待補齊——詳見
 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>「far_input_mode 部署契約」節。</div>
 
 <h2>API 用法</h2>
@@ -147,14 +150,14 @@ hop#0 無輸出（呼叫端補零），hop#p (p≥1) 輸出對應輸入 [(p−1)
 
 <h2>State 表</h2>
 <p>NN state（<code>state_report</code> 實測，B=1 fp32；部署契約：顯式 I/O tensor，由
-NPU runtime／host 每次 invocation 傳入傳回，graph 無隱藏 state）：</p>
+CPU/DSP caller-owned pool 每次 invocation 傳入傳回，graph 與加速器無隱藏 state）：</p>
 <table>
 <tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
-<tr><td>align.key_ring</td><td>(1, 32, 64, 26)</td><td>208.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>align.value_ring</td><td>(1, 32, 64, 26)</td><td>208.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>align.score_history</td><td>(1, 32, 4, 64)</td><td>32.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>subband_gru0.hidden</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
-<tr><td>subband_gru1.hidden</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>NPU runtime（顯式 state I/O）</td></tr>
+<tr><td>align.key_ring</td><td>(1, 32, 64, 26)</td><td>208.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
+<tr><td>align.value_ring</td><td>(1, 32, 64, 26)</td><td>208.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
+<tr><td>align.score_history</td><td>(1, 32, 4, 64)</td><td>32.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
+<tr><td>subband_gru0.hidden</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
+<tr><td>subband_gru1.hidden</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
 <tr><td><b>NN 小計</b></td><td></td><td><b>450.0 KB</b></td><td></td></tr>
 <tr><td>STFT×2 / ISTFT 狀態</td><td>UlcnetAnalysis×2 + UlcnetSynthesis</td><td>caller-owned、zero heap</td><td>C struct（<code>ulcnet_process.h</code>）</td></tr>
 <tr><td>PBFDKF / delay 對齊</td><td>—</td><td>—</td><td>AEC C 端 static pool</td></tr>

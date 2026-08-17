@@ -167,9 +167,9 @@ streaming 等價自證）。
 **範圍界定：這是 NN frame-by-frame Python reference，不是產品
 end-to-end streaming。** 尚未包含（對應設計文件的 Phase）：PBFDKF
 frontend streaming 與 aligned-far 餵入（Phase 1 seam 已在 AEC C 端就
-緒，餵入屬 Phase 2 A/B 的輸入分佈變更，不可先斬——C pipeline 變體的
-`far_input_mode` 契約以 RAW_FAR 為預設、ALIGNED_FAR 為實驗性候選，即為
-此決策的落地）、delay generation/reset/fallback 接線（Phase 5）。
+緒；raw/aligned sweep 已完成，現有權重允許以明確的 ALIGNED export/init
+profile 部署）、delay generation/reset/fallback 接線（Phase 5）。尚未完成的
+是 exporter 產生 C descriptor 與 application 移除手寫 D/far mode，不是權重重訓。
 
 **2026-08-16 更新（本節先前版本列 Phase 4 為缺項，Align_ULCNet 現已交
 付，其餘五候選仍缺）**：Align_ULCNet 的 explicit-state NPU export 與 C

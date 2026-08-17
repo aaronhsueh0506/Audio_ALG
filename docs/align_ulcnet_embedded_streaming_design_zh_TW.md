@@ -7,10 +7,13 @@ STFT/WOLA（`ulcnet_process.c/h`）已實作；§8 的 delay 狀態機/fail-open
 也已落地到 `pipelines/mono_alignulcnet/`、`pipelines/4ch_alignulcnet/`
 兩個 ULCNet pipeline（`AecLinearContext.delay_state` UNLOCKED/LOCKED/CHANGED
 閘控、RAW/ALIGNED 兩種 far_input_mode、reset 時清空 K/V/logit/GRU）。
-尚未完成的是：實際 board/NPU driver（目前 `main.c` 的 `run_accelerator()`
+實際 board/NPU driver 尚未完成（目前 `main.c` 的 `run_accelerator()`
 仍是回 -1 的 TODO 佔位）、pipeline_ulcnet_mono.html 記載的「filter 已收斂
-即視同 LOCKED」狀態機加強（見該頁「短延遲部署注意」），以及 small-D
-（D=4 vs D=8）品質決策的 A/B。因此仍不是 release contract。
+即視同 LOCKED」狀態機加強（見該頁「短延遲部署注意」）。
+raw/aligned 與 small-D sweep 現已完成。目前真正未完成的是 board/NPU driver、generated
+C descriptor 與 application 移除手寫 D/far mode、FIXED+ALIGNED 首次可用時
+的 CHANGED/reset 語意，以及各產品 route 的 n 範圍量測。這些完成前
+仍不是完整 release contract。
 
 本文件供實作者評估如何將現有 PBFDKF + Align-ULCNet 路徑放到記憶體與
 算力受限的 embedded system。產品測試一律使用本專案 PBFDKF 的 linear
@@ -500,14 +503,15 @@ runtime recurrent state 連續）、只閘控「輸出是否套用」；CHANGED�
 identity，永不進 WOLA；HOLD/REACQUIRE 細分與 crossfade 仍待做。4ch 側的
 先例實作在 `4aec_nr_res.c:778-794, 901-914`。
 
-兩個變體另新增 `far_input_mode` 部署契約（模式必須與 checkpoint 的訓練
-far 輸入一致，不一致即輸入分布改變，見第 9 節的 A/B 表）：
+兩個變體另新增 `far_input_mode` 部署契約：模式必須與 exported
+graph descriptor 及應用實際接線一致，不可每 hop 熱切換。現有權重的
+raw/aligned sweep 已完成並接受兩種明確部署 profile：
 
 - `ULCNET_FAR_RAW`（預設，checkpoint 相容）：餵 caller 的 raw far（4ch 側
   與 aligned 模式共用同一個 one-hop far 補償 buffer，err/far frame 對
   同一個 input hop）；**不以 delay lock 閘控模型套用**——paper 契約不依賴
   lock。
-- `ULCNET_FAR_ALIGNED`（實驗性，Phase-2 embedded 候選）：餵 aligned far
+- `ULCNET_FAR_ALIGNED`：餵 aligned far
   並以 lock 閘控套用（即上述 UNLOCKED bypass 行為）。
 
 ⚠ **短延遲部署注意（pipeline 實測發現；只適用 ALIGNED 模式——RAW 模式
@@ -545,10 +549,9 @@ E. aligned far + no attention, if graph permits
 `raw far -> aligned far` 是輸入分布改變，softmax candidate set 也改變。
 因此：
 
-1. 不應因 shape 預先要求重訓；
-2. 先跑同一 checkpoint 的 zero-shot A/B；
-3. 只有 C/D 品質未達標，才決定是否 fine-tune；
-4. inference/export contract 必須記錄實際 D，不可靜默覆寫 checkpoint。
+1. 縮小 D 不需重訓，但 export graph 的 shape 與 state pool 必須重產；
+2. raw/aligned far 的 zero-shot A/B 已完成，本輪不重跑泛用品質分數；
+3. inference/export contract 必須記錄實際 D 與 far mode，不可靜默覆寫。
 
 ## 10. NPU Model Boundary
 
@@ -640,7 +643,7 @@ Inputs：
 | tensor | float32 shape | 來源／用途 |
 |---|---:|---|
 | `linear_error_ri` | `[1,1,257,2]` | CPU PBFDKF error 的 STFT |
-| `far_end_ri` | `[1,1,257,2]` | 依 checkpoint contract；現有 checkpoint 為 `raw_far`，`aligned_far` 需另立 contract |
+| `far_end_ri` | `[1,1,257,2]` | 依 graph descriptor contract；現行 export 皆記錄 `raw_far`，`aligned_far` 為已接受的明確 export profile（exporter override 待完成） |
 | `key_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far keys |
 | `value_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far values |
 | `logit_history` | `[1,32,4,D]` | TA `(5,3)` score conv 的前 4 幀 raw logits |
@@ -738,7 +741,7 @@ K/V/GRU 細節，`reset(user)` 負責清空外部 state。
 4. 測試 context pointer lifetime、reset/generation 與 delay-change。
 5. 證明 exposed aligned far 就是同 hop PBFDKF 實際使用的 reference。
 
-### Phase 2：Offline zero-shot A/B
+### Phase 2：Offline zero-shot A/B（已完成）
 
 1. 保持完整 utterance inference。
 2. 加入 explicit deployment override `D=64/8/4`。
@@ -765,8 +768,9 @@ K/V/GRU 細節，`reset(user)` 負責清空外部 state。
 3. 新增 `T=1` stateless streaming exporter：explicit state inputs +
    delta-state outputs；現有 fixed-block exporter 保留供 offline/debug，不得冒稱
    production streaming equivalent。
-4. 產生 descriptor/metadata，將 D、far-input mode、grid、tensor shape、
-   layout version 與 checkpoint hash 鏖入 contract。
+4. metadata 已產生；generated C descriptor header 尚待完成，並需將
+   D、far-input mode、grid、tensor shape、layout version 與 checkpoint hash
+   固定在同一份部署 contract。
 5. 驗證 PyTorch `forward_stream()` vs ONNX Runtime 多幀輸出與每個
    state delta；本 phase 不實作特定 NPU driver，不整合 mono/4ch pipeline。
 
@@ -867,11 +871,9 @@ K/V/GRU 細節，`reset(user)` 負責清空外部 state。
    byte-exact；從 `linear_aec.py` 外側讀取即可。嚴禁在 `lib/aec` 內新增
    method——`aec_behavior_hash` 涵蓋整個 `modules/` 的 AST，會作廢既有
    shard 與 checkpoint。
-4. **Q4 = yes**。aligned far 是 `(mic_postclip, far_render, contract)` 的
-   確定性函數，200h WAV 已含兩路輸入，可只重跑 PBFDKF materialization 補
-   channel（全量、不可 `--resume`、磁碟 +20%）；corpus 在遠端機器，工具
-   備妥後遠端執行。packed shard 與 checkpoint 在模型改吃 aligned far 之前
-   不受影響。
+4. **Q4 = 不需重生 dataset**。raw/aligned zero-shot sweep 已接受現有
+   權重直接部署；舊 WAV、packed shard 與 checkpoint 保持不變。只需讓
+   export descriptor 與 pipeline 實際接線同步標示 RAW 或 ALIGNED。
 5. Q5：待 operator inventory 對板端 runtime 逐項核對（第 10 節清單）。
 6. **Q6 = 已決策**：第一版重現 center=True（見第 7 節）。
 7. Q7：待板端 profiler。
@@ -889,4 +891,5 @@ K/V/GRU 細節，`reset(user)` 負責清空外部 state。
 9. **Q9 = 同上待量測**：結構上殘差恆正（見 4.1 節）、合成實證亦恆正，
    維持 causal-only 設計；真實 corpus 的負 offset 比例仍要以升級後的
    工具量測確認邊角案例（弱直達路徑 + pre-echo 未啟動）。
-10. Q10：待 Phase 2/3 的 A/B。
+10. **Q10 = 已完成**：raw/aligned 與 D sweep 不重跑；後續只做部署結構與
+    產品 delay envelope 驗證。

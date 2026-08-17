@@ -50,8 +50,8 @@ while (stream) {   /* mics=[256][4] interleaved, far/out=[256] */
 audio_pipeline_4ch_ulcnet_reset(p);    /* 也呼叫 model-&gt;reset; 不動 model/mode 安裝 */
 audio_pipeline_4ch_ulcnet_destroy(p);  /* 不釋放 caller pool */</pre>
 <ul>
-<li><code>set_model()</code>:struct by-value 複製;<code>model-&gt;user</code> 指向物由 caller 保活。中途換模型請先 reset 或裝新 reset 過的 runtime。<b>三方一致性鎖</b>與 mono 變體共用同一個 <code>ulcnet_far_input_mode_agrees()</code>(<code>ulcnet_model_io.h</code>):<code>model.io_descriptor</code>(來自 accelerator adapter,發布 checkpoint 的 far_input_mode)與 <code>p-&gt;far_input_mode</code> 不合則 <code>set_model()</code> 回 −1、已裝模型不動——與 mono 頁「init 時失敗」不同,這裡是<b>安裝呼叫本身失敗</b>(runtime 設定,非 init-time config 欄位),邊界細節見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>「far_input_mode 部署契約」節。</li>
-<li><code>set_far_input_mode()</code>:RAW(預設,checkpoint 相容)/ ALIGNED(Phase-2 embedded 候選,只能配 aligned-far checkpoint);安裝性設定,<b>survive reset</b>;未定義值 reject 且維持原模式;同樣過 <code>ulcnet_far_mode_agrees()</code> 與已裝模型的 descriptor 核對。中途切換會改變在飛幀(one-hop far buffer)的輸入分布,且 <code>frame_index!=0</code> 時直接 reject(只能在 reset 後或串流前設定)。</li>
+<li><code>set_model()</code>:struct by-value 複製;<code>model-&gt;user</code> 指向物由 caller 保活。中途換模型請先 reset 或裝新 reset 過的 runtime。<b>三方一致性鎖</b>與 mono 變體共用同一個 <code>ulcnet_far_input_mode_agrees()</code>(<code>ulcnet_model_io.h</code>):<code>model.io_descriptor</code>(來自 accelerator adapter,發布部署 graph 的 far_input_mode)與 <code>p-&gt;far_input_mode</code> 不合則 <code>set_model()</code> 回 −1、已裝模型不動——與 mono 頁「init 時失敗」不同,這裡是<b>安裝呼叫本身失敗</b>(runtime 設定,非 init-time config 欄位),邊界細節見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>「far_input_mode 部署契約」節。</li>
+<li><code>set_far_input_mode()</code>:RAW/ALIGNED 都是 export/init profile；本專案已接受既有權重的 aligned-far 部署，但 descriptor 與實際接線必須一致。設定 <b>survive reset</b>;未定義值 reject 且維持原模式;同樣過 <code>ulcnet_far_mode_agrees()</code> 與已裝模型的 descriptor 核對。中途切換會改變在飛幀(one-hop far buffer)的輸入分布,且 <code>frame_index!=0</code> 時直接 reject(只能在 reset 後或串流前設定)。</li>
 <li>診斷:<code>audio_pipeline_4ch_ulcnet_last_beamformed_error()</code>(最近一次成功呼叫重建的 beam hop,唯讀)、<code>audio_pipeline_4ch_ulcnet_last_delay()</code>。</li>
 </ul>
 
@@ -121,7 +121,7 @@ out               全零              全零                enh(beam err        
 <tr><td><code>ulcnet_window</code></td><td>[512] f32</td><td>C struct(self)</td><td>共用 sqrt-Hann 表</td></tr>
 <tr><td><code>far_delay</code></td><td>[256] f32</td><td>C struct(self)</td><td>one-hop far 補償;delay change / reset 時清零</td></tr>
 <tr><td><code>model</code>+<code>far_input_mode</code>+<code>last_delay</code></td><td>純量級</td><td>C struct(self)</td><td>安裝性設定 survive reset</td></tr>
-<tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 checkpoint D</td><td><b>NPU runtime</b></td><td><code>model.reset</code> 時 flush far ring+logit 史</td></tr>
+<tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 exported D</td><td><b>CPU/DSP caller-owned pool</b></td><td>NPU 單次呼叫無狀態；<code>model.reset</code> 時 K/V、logit 與 GRU hidden 全部清除</td></tr>
 <tr><td>合計 pool</td><td>3,123,888 B(2.98 MB)</td><td>host 擁有 pool</td><td>init_ex 路徑零 heap;sizing 與 carve lockstep(<code>cursor.remaining==0</code> 驗證)</td></tr>
 </table>
 

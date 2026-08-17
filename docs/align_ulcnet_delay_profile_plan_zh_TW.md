@@ -93,9 +93,11 @@ far branch 看見的 raw far-to-error lag，因此不能用 `n` 的範圍補足�
 1. **基準**：`n=5 + raw_far + D=64`，固定 16 kHz/512/256。
 2. **只縮 n**：維持 `raw_far + D=64`，逐一驗證 `n=4/3/2/1` 的 delay
    acquisition、steady-state linear output、path-change 與 memory/CPU。
-3. **只換 far semantic**：先維持 `n=5 + D=64`，比較 `raw_far` 與
-   `aligned_far`；確認時間戳、lock gate、reset 與輸入內容無誤。
-4. **只縮 D**：固定 `n=5 + aligned_far`，測 `D=32/16/8/4/2`。
+3. **既有結論（不重跑）**：raw/aligned far 與 small-D sweep 已完成並由
+   使用者接受；本輪只保留 C descriptor、時間戳、lock gate、reset 與輸入
+   接線的結構驗證。
+4. **只縮 D**：已完成，不再以泛用分數重跑；export 時建立選定 D 的 graph、
+   descriptor 與 state pool。
 5. **組合 profile**：只在前四步各自通過後，組合選定的 `n + D`，執行
    route/clock/path-change 壓力測試。
 
@@ -109,21 +111,17 @@ far branch 看見的 raw far-to-error lag，因此不能用 `n` 的範圍補足�
 「相同權重能以較小 D 執行」及 D-only 波形差異的既有證據，不需在本輪
 重複執行。
 
-但那個工具目前沒有 `--delay-num-filters` 參數；其 PBFDKF frontend 由
-checkpoint linear contract 建立，而該 contract 未記錄/覆寫 n，因此走
-AEC preset 的 `n=5`。AEC repo 另有 n=1..5 的搜尋範圍、記憶池與 parity
-測試，但兩批證據是分開的。
+工具現已支援 `--delay-num-filters`，並從 live AEC instance 讀回 resolved n；
+checkpoint linear contract 維持不記錄 n，dataset generation 固定 n=5。
 
 因此目前狀態是：
 
 - **已驗證**：`n=5 + small D`；`n=5` 下的 raw/aligned diagnostic；n 本身的
   AEC init、搜尋與 RAM scaling。
-- **尚未由同一條 E2E 音檔路徑驗證**：`small n + aligned_far + small D`
-  的組合 profile。
-- **本輪 Claude 應完成**：讓 sweep/product harness 明確接受並記錄 n，
-  完成無 checkpoint 的組合時間軸、state、pool 與 mutation tests。
-- **使用者於訓練機完成**：組合 profile 的 checkpoint 品質、最佳 n/D
-  與實機效能裁決。
+- **產品端仍須量測**：small n 是否涵蓋各 SKU/route 的 bulk-delay 分佈；這是
+  delay/liveness gate，不是 checkpoint 品質或重訓 gate。
+- **實作端仍須完成**：generated C descriptor、application 移除手寫 D/far
+  mode，以及 ALIGNED timestamp/FIXED acquisition 的結構測試（見後節）。
 
 ## 4. 無 checkpoint 即可完成的實作
 
@@ -166,8 +164,8 @@ AEC preset 的 `n=5`。AEC repo 另有 n=1..5 的搜尋範圍、記憶池與 par
 - **相容性規則**：明確的 deployment override 可以讓 runtime n/D 與訓練
   provenance 不同；loader/exporter 應記錄 `training_n/training_D` 與
   `runtime_n/export_D`，但不得因此拒絕 checkpoint。沒有明確 override 時
-  才沿用 checkpoint provenance。`far_input_mode` 不同則仍是輸入語意改變，
-  必須另立 candidate/release contract，不可被 n/D override 順便放寬。
+  才沿用 checkpoint provenance。`far_input_mode` 也必須由明確的 export
+  override 指定並寫入 descriptor；不得默默把 raw/aligned 接反。
 
 由 `export_streaming_onnx.py` 同時產出：
 
@@ -222,7 +220,8 @@ AEC preset 的 `n=5`。AEC repo 另有 n=1..5 的搜尋範圍、記憶池與 par
 對 `n=1..5`：
 
 - 用 broadband seeded synthetic far，建立已知整數與非 hop 整數 delay。
-- 測範圍內 acquisition、邊界前後、超範圍不得 confident mis-lock。
+- 測範圍內 acquisition、邊界前後；另以「超範圍主路徑 + 範圍內早期反射」
+  釘住可能發生的 confident mis-lock，證明產品選 n 不能只依 seam confidence。
 - 測 cold boot、path change、mid-stream reset、saturation/NaN guard。
 - 比較 C/Python 的 applied delay、state transition、generation 與 aligned
   far；容許的量化誤差需明訂。
@@ -385,11 +384,9 @@ sanity 仍獨立保留。
 
 ### 8.4 修正 4ch unlock→same-delay relock reset
 
-目前 4ch 的 `changed` 僅由
-`eligible && estimated != accepted_delay` 產生。若 estimator 暫時失去 solid
-lock、model 在 UNLOCKED 期間繼續 step，之後以相同 delay 重鎖，
-`estimated == accepted_delay` 會使 `changed=false`；ALIGNED model 可能直接
-套用已被無效 far 污染的 K/V/logit/GRU state。
+此問題已修正。舊版 4ch 的 `changed` 僅由
+`eligible && estimated != accepted_delay` 產生，會漏掉首次鎖在 0 及失鎖後
+同值重鎖；現行實作改以「新的可用 alignment generation」判斷。
 
 修正語意：
 
