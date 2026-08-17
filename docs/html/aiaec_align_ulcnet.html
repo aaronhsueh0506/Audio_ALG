@@ -50,16 +50,14 @@ delay 對齊（AEC C 端 seam）、centered sqrt-Hann STFT/ISTFT 與 complex↔R
 <div class="note"><b>far_input_mode 契約</b>：checkpoint contract 記錄
 <code>far_input_mode</code>；欄位缺失（legacy）預設 <code>raw_far</code> 並由
 <code>load_model</code> 印出；未知值在載入權重<b>前</b>即 <code>ValueError</code>
-（test：<code>test_load_model_far_input_mode_default_present_and_rejected</code>）。部署契約以
-RAW_FAR 為預設；本專案的 deployment sweep 已接受現有權重以
-ALIGNED_FAR 部署。這是明確的 export/init profile，不是每 hop 熱切換。同一個值由
+（test：<code>test_load_model_far_input_mode_default_present_and_rejected</code>）。release 部署固定 RAW_FAR；ALIGNED_FAR 經 deployment sweep 驗證（與 RAW 無顯著差異），保留為 sweep/實驗功能。這是明確的 export/init profile，不是每 hop 熱切換。同一個值由
 <code>export_streaming_onnx.py</code> 寫進 ONNX/JSON metadata（<code>far_input_mode</code>
 字串 + <code>far_input_mode_c_value</code>），C 端 <code>UlcnetModelIoDescriptor.far_input_mode</code>
 與兩個 ULCNet pipeline（mono/4ch）各自的 <code>far_input_mode</code> config 欄位用同一份
 <code>ulcnet_far_input_mode_agrees()</code> 做三方比對，metadata/descriptor/pipeline
 三者不合即在 pipeline init 或 <code>set_model()</code> 時 reject。目前 exporter
-只從 checkpoint contract 繼承 far mode；generated C descriptor 與明確的
-ALIGNED override 尚待補齊——詳見
+只從 checkpoint contract 繼承 far mode；generated C descriptor 待補（far
+mode 固定記錄 RAW），明確 ALIGNED override 延後到決定啟用 ALIGNED 時——詳見
 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>「far_input_mode 部署契約」節。</div>
 
 <h2>API 用法</h2>

@@ -8,12 +8,17 @@ STFT/WOLA（`ulcnet_process.c/h`）已實作；§8 的 delay 狀態機/fail-open
 兩個 ULCNet pipeline（`AecLinearContext.delay_state` UNLOCKED/LOCKED/CHANGED
 閘控、RAW/ALIGNED 兩種 far_input_mode、reset 時清空 K/V/logit/GRU）。
 實際 board/NPU driver 尚未完成（目前 `main.c` 的 `run_accelerator()`
-仍是回 -1 的 TODO 佔位）、pipeline_ulcnet_mono.html 記載的「filter 已收斂
-即視同 LOCKED」狀態機加強（見該頁「短延遲部署注意」）。
-raw/aligned 與 small-D sweep 現已完成。目前真正未完成的是 board/NPU driver、generated
-C descriptor 與 application 移除手寫 D/far mode、FIXED+ALIGNED 首次可用時
-的 CHANGED/reset 語意，以及各產品 route 的 n 範圍量測。這些完成前
-仍不是完整 release contract。
+仍是回 -1 的 TODO 佔位）。
+raw/aligned 與 small-D sweep 現已完成，release 裁定（2026-08-17）：
+**部署固定 `raw_far`**；`aligned_far` 為 sweep 驗證過的功能，保留在
+sweep/實驗路徑，exporter 暫不加 far-mode override（generated descriptor
+固定記錄 RAW）。目前真正未完成的是 board/NPU driver、exporter 產
+generated C descriptor（含 D/shape/layout，far mode 記 RAW）與
+application 依 descriptor 配置（移除手寫 D=8）、各產品 route 的 n 範圍
+量測。ALIGNED 專屬的兩項——短延遲 first-lock policy（already_cancelling
+與 seam 採用權的解耦）與 FIXED+ALIGNED 首次可用的 CHANGED/reset 語意
+（UNLOCKED→CHANGED 一 hop→LOCKED、mono/4ch 同以 delay_state 為 gate）——
+延後到真正要啟用 ALIGNED/FIXED+ALIGNED 時處理，不阻擋 RAW release。
 
 本文件供實作者評估如何將現有 PBFDKF + Align-ULCNet 路徑放到記憶體與
 算力受限的 embedded system。產品測試一律使用本專案 PBFDKF 的 linear
@@ -507,7 +512,7 @@ identity，永不進 WOLA；HOLD/REACQUIRE 細分與 crossfade 仍待做。4ch �
 graph descriptor 及應用實際接線一致，不可每 hop 熱切換。現有權重的
 raw/aligned sweep 已完成並接受兩種明確部署 profile：
 
-- `ULCNET_FAR_RAW`（預設，checkpoint 相容）：餵 caller 的 raw far（4ch 側
+- `ULCNET_FAR_RAW`（預設；現行權重以 RAW far 訓練，release 部署固定用它）：餵 caller 的 raw far（4ch 側
   與 aligned 模式共用同一個 one-hop far 補償 buffer，err/far frame 對
   同一個 input hop）；**不以 delay lock 閘控模型套用**——paper 契約不依賴
   lock。

@@ -591,7 +591,7 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
         return NULL;
 
     memset(&p->model, 0, sizeof(p->model));   /* fail-open until set_model */
-    p->far_input_mode = ULCNET_FAR_RAW;       /* checkpoint-compatible default */
+    p->far_input_mode = ULCNET_FAR_RAW;       /* release default */
     memset(&p->last_delay, 0, sizeof(p->last_delay));
     p->frame_index = 0;
     p->owned_heap = NULL;
@@ -674,7 +674,7 @@ int audio_pipeline_4ch_ulcnet_set_far_input_mode(
      * audio_pipeline_4ch_ulcnet_reset() (frame_index back to 0, all chain
      * state cleared) switching is allowed again. */
     if (p->frame_index != 0) return -1;
-    /* An already-installed runtime's checkpoint contract binds the mode too
+    /* An already-installed runtime's graph descriptor binds the mode too
      * (mode unchanged on rejection, same as every other gate here). */
     if (!ulcnet_far_mode_agrees(&p->model, mode)) return -1;
     p->far_input_mode = mode;

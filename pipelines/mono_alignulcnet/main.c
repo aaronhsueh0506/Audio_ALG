@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
          * rejects is named here, where both values are in hand. */
         fprintf(stderr,
                 "mono_alignulcnet: pipeline init failed "
-                "(pipeline far_input_mode=%s, checkpoint far_input_mode=%s)\n",
+                "(pipeline far_input_mode=%s, descriptor far_input_mode=%s)\n",
                 ulcnet_far_input_mode_name((int)cfg.far_input_mode),
                 ulcnet_far_input_mode_name(
                     model.io_descriptor ? model.io_descriptor->far_input_mode

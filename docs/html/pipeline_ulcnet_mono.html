@@ -63,12 +63,12 @@ th{background:#f5efe8}
                gru0/1_hidden ← gru0/1_hidden_next(整組替換)
                回 0,enhanced_re/im 解包給呼叫端
           否 → persistent state 不動,回 -1(該幀視同失敗,pipeline fail-open)</pre>
-<p class="note">D(<code>delay_depth</code>)決定 ring 深度,依 checkpoint 而定;主機參考範例(<code>pipelines/mono_alignulcnet/main.c</code>)用 D=8 呼叫 <code>ulcnet_accelerator_adapter_get_mem_size(8, ...)</code>,實測(host, kiss)<code>bytes=68,912</code>(其中 <code>ulcnet_model_io</code> state 本體 68,880 B + adapter 控制塊 32 B),<code>ULCNET_MODEL_IO_LAYOUT_VERSION=2</code>。此記憶體<b>不在</b>上方 audio_pipeline_ulcnet 的 558,768 B pool 內——它是呼叫端額外配置、傳給 adapter 的獨立 pool(見下方 API 用法)。</p>
+<p class="note">D(<code>delay_depth</code>)決定 ring 深度,依 export 的 descriptor 而定;主機參考範例(<code>pipelines/mono_alignulcnet/main.c</code>)用 D=8 呼叫 <code>ulcnet_accelerator_adapter_get_mem_size(8, ...)</code>,實測(host, kiss)<code>bytes=68,912</code>(其中 <code>ulcnet_model_io</code> state 本體 68,880 B + adapter 控制塊 32 B),<code>ULCNET_MODEL_IO_LAYOUT_VERSION=2</code>。此記憶體<b>不在</b>上方 audio_pipeline_ulcnet 的 558,768 B pool 內——它是呼叫端額外配置、傳給 adapter 的獨立 pool(見下方 API 用法)。</p>
 
 <h2>API 用法</h2>
 <pre>AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
 /* fft_size=0→512, aec_preset=BALANCED, model=all-zero(identity),
- * far_input_mode=ULCNET_FAR_RAW(checkpoint 相容預設) */
+ * far_input_mode=ULCNET_FAR_RAW(預設;現行權重以 RAW far 訓練) */
 
 /* 推薦路徑:用 accelerator adapter 包一個無狀態 run() callback(main.c 範例) */
 size_t adapter_bytes, adapter_align;
@@ -157,7 +157,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <tr><td><code>ulcnet_window</code></td><td>[512] f32</td><td>C struct(self)</td><td>共用 sqrt-Hann 表,三個 chain struct 指向它</td></tr>
 <tr><td>幀 scratch <code>err/far[2][257]×2, mdl[257]×2</code></td><td>~10 KB</td><td>C struct(self)</td><td>hop#1 一次吐 2 幀所需</td></tr>
 <tr><td><code>model</code>(by value)+<code>far_input_mode</code></td><td>32 B + enum</td><td>C struct(self)</td><td>指標指向物由 caller 保活</td></tr>
-<tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 checkpoint D;D=8 參考值 68,912 B(見上方 accelerator adapter 節)</td><td><b>host/CPU 端獨立 pool</b>(參考實作 <code>ulcnet_model_io.c</code>;真正的矩陣運算在 NPU,但 state 本身活在 CPU RAM,經 <code>UlcnetModelIoInputs/Outputs</code> 每幀搬進搬出)</td><td>不在本頁 558,768 B pool 內;pipeline 只透過 <code>model.reset</code> 要求 flush(對應 <code>ulcnet_model_io_reset()</code>)</td></tr>
+<tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 export D;D=8 參考值 68,912 B(見上方 accelerator adapter 節)</td><td><b>host/CPU 端獨立 pool</b>(參考實作 <code>ulcnet_model_io.c</code>;真正的矩陣運算在 NPU,但 state 本身活在 CPU RAM,經 <code>UlcnetModelIoInputs/Outputs</code> 每幀搬進搬出)</td><td>不在本頁 558,768 B pool 內;pipeline 只透過 <code>model.reset</code> 要求 flush(對應 <code>ulcnet_model_io_reset()</code>)</td></tr>
 <tr><td>合計 pool</td><td>558,768 B(545.7 KB)</td><td>host 擁有 pool 記憶體</td><td>init→destroy 零 heap(create() 除外)</td></tr>
 </table>
 

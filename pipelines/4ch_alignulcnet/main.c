@@ -221,7 +221,7 @@ int main(int argc, char** argv) {
          * rejects is named here, where both values are in hand. */
         fprintf(stderr,
                 "4ch_alignulcnet: model/far-mode install failed "
-                "(pipeline far_input_mode=%s, checkpoint far_input_mode=%s)\n",
+                "(pipeline far_input_mode=%s, descriptor far_input_mode=%s)\n",
                 ulcnet_far_input_mode_name(
                     audio_pipeline_4ch_ulcnet_far_input_mode(pipeline)),
                 ulcnet_far_input_mode_name(

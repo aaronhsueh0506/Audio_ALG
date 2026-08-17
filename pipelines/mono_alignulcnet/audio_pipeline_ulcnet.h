@@ -188,7 +188,8 @@ typedef struct {
 /** Defaults: the trained ULCNet grid (16 kHz, frame/FFT 512, hop 256),
  * balanced preset,
  * all-zero model (identity), far_input_mode = ULCNET_FAR_RAW (the
- * checkpoint-compatible deployment contract). sample_rate is stored as
+ * release deployment default; the far stream the current weights were
+ * trained on). sample_rate is stored as
  * passed and validated at query/init time (only 16000 passes). */
 AudioPipelineUlcnetConfig audio_pipeline_ulcnet_default_config(int sample_rate);
 

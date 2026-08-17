@@ -269,7 +269,7 @@ int audio_pipeline_4ch_ulcnet_set_model(
 /**
  * Select which far stream feeds the model's far branch (see the FAR-INPUT
  * DEPLOYMENT CONTRACT in this header's preamble). Instances start in
- * ULCNET_FAR_RAW (the checkpoint-compatible default); the mode survives
+ * ULCNET_FAR_RAW (the release default); the mode survives
  * audio_pipeline_4ch_ulcnet_reset() like the model installation does.
  *
  * The mode can only be set BEFORE any hop is processed: once processing

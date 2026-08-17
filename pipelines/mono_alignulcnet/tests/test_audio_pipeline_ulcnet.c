@@ -571,7 +571,7 @@ static void test_config_validation_rejects(void) {
           "get_mem_requirements rejects an out-of-enum aec_preset");
 
     CHECK(good.far_input_mode == ULCNET_FAR_RAW,
-          "default config far_input_mode is ULCNET_FAR_RAW (checkpoint-compatible)");
+          "default config far_input_mode is ULCNET_FAR_RAW (release default)");
     AudioPipelineUlcnetConfig bad_mode = audio_pipeline_ulcnet_default_config(16000);
     bad_mode.far_input_mode = (UlcnetFarInputMode)99;
     CHECK(audio_pipeline_ulcnet_get_mem_requirements(&bad_mode, &req) == -1,
@@ -657,7 +657,8 @@ static void test_far_mode_descriptor_gate(void) {
     }
     aligned_desc.far_input_mode = ULCNET_FAR_ALIGNED;
     CHECK(raw_desc.far_input_mode == ULCNET_FAR_RAW,
-          "descriptor_default publishes ULCNET_FAR_RAW (current checkpoint contract)");
+          "descriptor_default publishes ULCNET_FAR_RAW (what every currently "
+          "exported graph records)");
 
     /* Baseline: an undescribed model is not gated in either mode, so the
      * gate below cannot be passing for want of a model. */

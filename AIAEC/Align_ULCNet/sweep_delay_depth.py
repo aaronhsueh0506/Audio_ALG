@@ -550,13 +550,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         '--far-input-mode', choices=('raw_far', 'aligned_far'),
         default='raw_far',
-        help='Far stream presented to the NN. raw_far reproduces existing '
-             'checkpoint training. aligned_far is a diagnostic, out-of-'
-             'distribution experiment for current raw-far checkpoints: it '
-             'taps the far hop actually consumed by PBFDKF and writes '
-             'aec_alignment.csv; with --input-is-linear-error, the supplied '
-             'far WAV is assumed to be already aligned and no AEC delay trace '
-             'is available.',
+        help='Far stream presented to the NN. raw_far is the release '
+             'deployment mode and what the current weights were trained on. '
+             'aligned_far is the sweep-validated alternative profile (kept '
+             'here as a sweep/experiment capability; enabling it on a board '
+             'waits on the exporter recording it): it taps the far hop '
+             'actually consumed by PBFDKF and writes aec_alignment.csv; '
+             'with --input-is-linear-error, the supplied far WAV is assumed '
+             'to be already aligned and no AEC delay trace is available.',
     )
     parser.add_argument(
         '--delay-num-filters', type=parse_delay_num_filters, default=None,

@@ -166,7 +166,7 @@ static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
     }
 
     /* Deployment contract: only the two defined far-input modes exist.
-     * RAW (0) is the memset-zero/default, checkpoint-compatible case. */
+     * RAW (0) is the memset-zero/default, release case. */
     switch (cfg->far_input_mode) {
         case ULCNET_FAR_RAW:
         case ULCNET_FAR_ALIGNED:
@@ -314,7 +314,7 @@ AudioPipelineUlcnetConfig audio_pipeline_ulcnet_default_config(int sample_rate) 
     cfg.delay_num_filters = 5;
     cfg.fixed_delay_samples = -1;
     cfg.aec_preset  = AEC_PRESET_BALANCED;
-    cfg.far_input_mode = ULCNET_FAR_RAW;  /* checkpoint-compatible default */
+    cfg.far_input_mode = ULCNET_FAR_RAW;  /* release default */
     return cfg;
 }
 
@@ -467,7 +467,7 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
      * each is fed every hop unconditionally). 0/2/1 emission: hop #0 emits
      * nothing, hop #1 emits two frames, then one per hop. The far branch
      * source follows the deployment contract: RAW feeds the caller's ref
-     * hop (checkpoint-compatible; same-hop with the error tap), ALIGNED
+     * hop (the trained far stream; same-hop with the error tap), ALIGNED
      * feeds the AEC's aligned far. */
     n_frames = ulcnet_analysis_push(&p->ana_err, rctx.formed_hop, p->err_re, p->err_im);
     (void)ulcnet_analysis_push(&p->ana_far,
