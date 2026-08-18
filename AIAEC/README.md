@@ -117,12 +117,6 @@ Align-ULCNet calibration uses the available training-domain
 linear_error + raw_far WAV pair. Its report separately records that board
 deployment supplies aligned_far.
 
-Only CAGCRN uses an ERB transform:
-
-    cd AIAEC/CAGCRN
-    python3 export_erb_matrix.py CAGCRN \
-      --checkpoint checkpoint.pth --output-dir output/erb --format all
-
 ## C pre/post-processing
 
     make -C AIAEC
