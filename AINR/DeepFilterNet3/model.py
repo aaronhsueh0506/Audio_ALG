@@ -269,7 +269,11 @@ class GroupedLinearEinsum(nn.Module):
     def forward(self, x):
         b, t, _ = x.shape
         x = x.view(b, t, self.groups, self.ws)
-        x = torch.einsum("btgi,gih->btgh", x, self.weight)
+        # Grouped matmul written as broadcast matmul rather than einsum: the
+        # ONNX Einsum op is widely unsupported by accelerator toolchains,
+        # while this form exports as a plain MatMul. (b,t,g,1,i)@(g,i,h) ->
+        # (b,t,g,1,h); identical contraction order, identical numerics.
+        x = (x.unsqueeze(-2) @ self.weight).squeeze(-2)
         return x.flatten(2, 3)
 
     def __repr__(self):
