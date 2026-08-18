@@ -37,6 +37,17 @@ from lib.aec.python.modules.aec3_scale import fft_density_scale
 _SUPPORTED_SAMPLE_RATES = (16000, 48000)
 _N_CHANNELS = 4
 
+# Admission band for a shared-delay CHANGE, in native samples and hops:
+# lib/aec's own Path-B trio (``abs(new_delay - current_delay) > 32``, a second
+# estimate within 16 of the held candidate, and ``pending_delay_ttl = 3`` hops
+# of life for that candidate).  Same values and same spelling as the C core's
+# FOUR_DELAY_CHANGE_MIN_SAMPLES / _CONFIRM_SAMPLES / _CANDIDATE_TTL
+# (4aec_nr_res_internal.h), against an estimate from the same DelayAec3 on the
+# same grid.
+_DELAY_CHANGE_MIN_SAMPLES = 32
+_DELAY_CHANGE_CONFIRM_SAMPLES = 16
+_DELAY_CHANGE_CANDIDATE_TTL = 3
+
 
 # ---------------------------------------------------------------------------
 # Shared delay and beamformer handoff types
@@ -51,8 +62,10 @@ class SharedDelayState:
     ``changed`` marks the hop on which a NEW usable generation begins (first
     acquisition included, even at applied delay 0), and is the signal for a
     consumer to flush any history derived from the aligned reference before
-    the frame it produces for this hop.  Same contract as the C core's
-    ``FourAecNrResDelayState`` (4aec_nr_res.h).
+    the frame it produces for this hop.  A change while locked is admitted
+    only when it exceeds 32 samples and is offered again, within 16, before
+    the held candidate's 3 hops of life run out.  Same contract as the C
+    core's ``FourAecNrResDelayState`` (4aec_nr_res.h).
     """
 
     delay_samples: int
@@ -119,6 +132,13 @@ class SharedMatchedDelayEstimator:
         self._calls = 0
         self._accepted_delay = 0
         self._usable = False
+        # Two-step admission for a CHANGE (see accumulate()): the movement
+        # seen once and held for confirmation, plus the hops of life left on
+        # it.  ``_pending_ttl > 0`` IS "a candidate is held" -- lib/aec spells
+        # that as pending_delay_ttl plus has_pending, but sets and clears the
+        # two together everywhere, so one counter cannot disagree with itself.
+        self._pending_delay = 0
+        self._pending_ttl = 0
 
     @property
     def instance_count(self) -> int:
@@ -131,6 +151,8 @@ class SharedMatchedDelayEstimator:
         self._accepted_delay = 0
         self._usable = False
         self._quarantine_left = -1
+        self._pending_delay = 0
+        self._pending_ttl = 0
 
     def accumulate(
         self,
@@ -170,6 +192,15 @@ class SharedMatchedDelayEstimator:
             and self._estimator.is_solid
             and self._estimator._n_updates >= 3
         )
+        # One hop of the held candidate's life, spent here -- ahead of both the
+        # quarantine and the admission below, exactly where lib/aec ages its
+        # own pending delay, so a candidate expires on hops the quarantine
+        # takes away as readily as on hops the estimate moves elsewhere.
+        if self._pending_ttl > 0:
+            self._pending_ttl -= 1
+            if self._pending_ttl <= 0:
+                self._pending_ttl = 0
+                self._pending_delay = 0
         # Backward-jump quarantine (see delay_backward_quarantine_enabled on
         # FourChannelAecConfig). Engages only once a usable generation exists
         # and only for an estimate strictly EARLIER than the one in force: a
@@ -207,12 +238,45 @@ class SharedMatchedDelayEstimator:
         # reset).  ``changed`` = "this hop starts a NEW USABLE generation", so
         # it also fires on an acquisition or relock that lands on applied
         # delay 0, which a value-only comparison misses.
+        #
+        # A CHANGE to a usable alignment must additionally clear lib/aec's own
+        # Path-B trio, mirrored by the C core's update_shared_delay() and its
+        # four_aec_nr_res_admission_offer(): the movement has to exceed
+        # _DELAY_CHANGE_MIN_SAMPLES and still be offered, within
+        # _DELAY_CHANGE_CONFIRM_SAMPLES, before the candidate's
+        # _DELAY_CHANGE_CANDIDATE_TTL hops of life run out.  Each accepted
+        # generation shifts four converged filters and, on a retard, clears
+        # their far history, so a movement seen once and gone must not buy
+        # one.  A SUSTAINED movement still passes, right or wrong -- this is a
+        # repeated-evidence rule, not a correctness test.  A movement too
+        # small to admit is absorbed WITHOUT clearing the candidate (lib/aec's
+        # Path B has no such clear): one hop of the estimator agreeing with
+        # the alignment being moved away from must not cancel a movement, the
+        # TTL is what ends it.  First acquisition is exempt: nothing is
+        # applied yet to protect.  The accepted delay moves only on
+        # acceptance, so the served alignment and the realign that shifts the
+        # filters are always the same hop.
         was_usable = self._usable
         now_usable = was_usable or eligible
-        changed = bool(
-            eligible and (not was_usable or estimated != self._accepted_delay)
-        )
+        changed = False
         if eligible:
+            if not was_usable:
+                changed = True
+                self._pending_delay = 0
+                self._pending_ttl = 0
+            elif abs(estimated - self._accepted_delay) > _DELAY_CHANGE_MIN_SAMPLES:
+                if (
+                    self._pending_ttl > 0
+                    and abs(estimated - self._pending_delay)
+                    < _DELAY_CHANGE_CONFIRM_SAMPLES
+                ):
+                    changed = True
+                    self._pending_delay = 0
+                    self._pending_ttl = 0
+                else:
+                    self._pending_delay = estimated
+                    self._pending_ttl = _DELAY_CHANGE_CANDIDATE_TTL
+        if changed:
             self._accepted_delay = estimated
         self._usable = now_usable
         return SharedDelayState(

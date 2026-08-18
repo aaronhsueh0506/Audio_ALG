@@ -98,8 +98,17 @@ extern "C" {
  *      descriptor captured from an older build therefore no longer sizes
  *      this one, which is exactly what this counter exists to say out loud;
  *      contrast the 2026-08-13 PreFrame note above, which did NOT bump
- *      because that struct lives on the caller's stack. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 10u
+ *      because that struct lives on the caller's stack.
+ *  11: the control block gained the shared-delay change admission (held
+ *      candidate + its remaining life) and the two realign lane counters.
+ *      Again no new REGION and no carve-order change, and again the control
+ *      block is the first thing carved out of the pool, so the pool total
+ *      moves and every offset after it with it. build_flags_hash is computed
+ *      over the carve TOKEN and so does not move on a control-block-only
+ *      change: this counter is the whole signal that a descriptor from a
+ *      version-10 build must be refused, including when its cached byte
+ *      count still covers the current pool. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 11u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -226,10 +235,10 @@ typedef struct FourAecNrResConfig {
  *
  * `changed` marks the hop on which a NEW USABLE alignment generation begins:
  * MATCHED sets it on first acquisition, on a relock after an unlocked stretch
- * EVEN IF the delay value is unchanged, and on a delay change while locked --
- * i.e. on any not-usable -> usable transition of `solid` (delay_samples is
- * never negative here, so usability is solid alone), plus any value change
- * on top of that. This mirrors lib/aec's per-hop
+ * EVEN IF the delay value is unchanged, and on an ADMITTED delay change while
+ * locked -- i.e. on any not-usable -> usable transition of `solid`
+ * (delay_samples is never negative here, so usability is solid alone), plus
+ * admitted value changes on top of that. This mirrors lib/aec's per-hop
  * AEC_LINEAR_DELAY_CHANGED, which the mono pipelines consume: there the
  * "nothing accepted yet" state is spelled current_delay == -1, so a relock
  * always crosses a sentinel; here the accepted delay is a plain non-negative
@@ -245,6 +254,18 @@ typedef struct FourAecNrResConfig {
  *
  * FIXED and EXTERNAL_ALIGNED never set `changed`; both follow lib/aec, where
  * nothing bumps the generation during processing without an estimator.
+ *
+ * ADMITTED, for a change while locked, is lib/aec's own Path-B trio: the
+ * movement must exceed 32 native samples AND be offered again -- within 16 --
+ * before the held candidate's 3 hops of life run out, and only then is it
+ * applied. Each generation costs an IR shift on all four lanes plus, when the
+ * alignment retards, their far history, so a movement seen once and gone is
+ * not worth one. What survives the trio is a SUSTAINED movement, correct or
+ * not: this is a repeated-evidence rule, not a correctness test (that is
+ * delay_backward_quarantine_enabled's job, on its own evidence and bound).
+ * First acquisition is not subject to it -- nothing is applied yet to
+ * protect. `delay_samples` therefore never moves on a hop without `changed`:
+ * the alignment and the filter shift that follows it are one event.
  *
  * `solid` = "a usable accepted alignment generation exists". Under MATCHED it
  * is raised by the same acceptance test that writes the applied delay, so it
@@ -558,6 +579,24 @@ int four_aec_nr_res_post_res_count(const FourAecNrRes* p);
  * Intended for tests/instrumentation proving the cross-lane far-FFT
  * sharing is genuinely active; has no effect on any processing. */
 long four_aec_nr_res_far_fft_real_compute_count(const FourAecNrRes* p);
+
+/* Realign instrumentation, read-only and cumulative since construction or the
+ * last four_aec_nr_res_reset(): how the four lanes'
+ * aec_apply_external_realign() calls landed.
+ * Every hop that publishes `changed` sweeps all four lanes, so
+ * the pair grows by exactly 4 on such a hop and not at all otherwise -- warm
+ * (returned 1) means the learned IR was shifted and cancellation survived the
+ * move, soft (returned 0) means that lane re-adapts from its current taps. A
+ * sweep that adds fewer than 4 means a lane rejected the call outright, which
+ * is a wiring fault, not a soft realign. Nothing branches on either count. */
+long four_aec_nr_res_realign_warm_lane_count(const FourAecNrRes* p);
+long four_aec_nr_res_realign_soft_lane_count(const FourAecNrRes* p);
+
+/* The shared-delay movement currently held for confirmation, in native
+ * samples, or -1 when none is held (including FIXED/EXTERNAL_ALIGNED, which
+ * never re-decide an alignment). See FourAecNrResDelayState's `changed` for
+ * the rule; diagnostic only. */
+int four_aec_nr_res_pending_delay_candidate(const FourAecNrRes* p);
 
 /* ============================================================================
  * Diagnostic memory breakdown

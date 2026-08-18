@@ -178,8 +178,14 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * descriptor pointer. v6 removes the obsolete runtime far-mode field.
  * v7 adds the identity-reprime counter to self.
  * v8: the self-resident core config grew the backward-quarantine delay
- * guard fields (left at their OFF defaults here), moving the self block. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 8u
+ * guard fields (left at their OFF defaults here), moving the self block.
+ * v9 carries the core's own layout 10 -> 11 (its control block gained the
+ * shared-delay change admission and the realign lane counters). Nothing in
+ * THIS layer's carve changed, but the core sub-pool it composes grew, so
+ * every offset after `core` and this layer's total moved with it -- and
+ * build_flags_hash cannot say so, since it folds in the core's carve-token
+ * hash, which a control-block-only change leaves alone. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 9u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -188,8 +194,11 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * build_flags_hash/alignment/reserved/bytes) -- see that header's own doc
  * comment for the full rationale rather than repeating it here. Like
  * AudioPipeline4ChMemReq, this layer's build_flags_hash folds in the core's
- * own build_flags_hash so a core-layer layout bump also invalidates every
- * persisted composite descriptor here.
+ * own build_flags_hash, so any core change that moves a carve TOKEN also
+ * invalidates every persisted composite descriptor here. A core change that
+ * only grows its control block moves no token and no hash on either layer:
+ * that one is caught by this layer's own layout_version, which is why it
+ * bumps with the core's (see the carve-order list above).
  */
 typedef struct AudioPipeline4ChUlcnetMemReq {
     uint32_t descriptor_version;

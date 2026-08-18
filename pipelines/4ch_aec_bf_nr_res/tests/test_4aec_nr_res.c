@@ -696,6 +696,20 @@ static void run_static_parity(int sample_rate, int fft_size) {
           "static init_ex rejects a stale layout even when its cached "
           "bytes are larger than current (byte count fitting must never "
           "substitute for layout/hash agreement)");
+    /* The superseded version spelled out, not `current - 1`: a descriptor
+     * persisted by a version-10 build carries exactly this number, and its
+     * byte count is left at the CURRENT figure so the only thing wrong with
+     * it is the layout. A control-block-only growth moves no carve token, so
+     * build_flags_hash still matches and this counter is the whole signal. */
+    stale = req;
+    stale.layout_version = 10u;
+    CHECK(four_aec_nr_res_init_ex(
+              pool, (size_t)req.bytes, &cfg, &stale) == NULL,
+          "static init_ex rejects a descriptor from the superseded layout 10 "
+          "even when its byte count exactly covers the current pool");
+    CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 11u,
+          "the queried descriptor publishes the current carve layout (11)");
 
     stat = four_aec_nr_res_init_ex(
         pool, (size_t)req.bytes, &cfg, &req);
@@ -783,6 +797,31 @@ cleanup:
     free(pool);
 }
 
+/* The WOLA identity below has to be measured ACROSS a realign boundary, so
+ * its scene is a delayed echo that MOVES rather than the zero-delay tone the
+ * rest of the file uses: `changed` on a zero-delay scene realigns by a delta
+ * of 0, which aec_apply_external_realign() answers as a no-op, and nothing
+ * about seam continuity would have been exercised. `history` holds
+ * WOLA_SCENE_PAD samples of pre-roll so the echo is valid from the first
+ * streamed sample. */
+#define WOLA_SCENE_PAD   16384
+#define WOLA_SHIFT_HOP   150
+#define WOLA_SCENE_HOPS  600
+
+static void fill_delayed_echo(float* microphones, float* ref, int hop,
+                              const float* history, int base, int delay) {
+    int i;
+    int ch;
+    for (i = 0; i < hop; ++i) {
+        float echo = 0.6f * history[base + i - delay];
+        ref[i] = history[base + i];
+        for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+            microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] =
+                echo * (1.0f + 0.05f * (float)ch);
+        }
+    }
+}
+
 static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(sample_rate);
     FourAecNrRes* pipeline = NULL;
@@ -796,10 +835,20 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
     float* time_frame = NULL;
     Complex* weights = NULL;
     float* window = NULL;
+    float* history = NULL;
+    uint32_t rng = 0x1234567u;
     float max_error = 0.0f;
+    long sweeps_before = 0;
+    int applied_before = -1;
+    int moving_realigns = 0;
+    int lanes_swept_on_moves = 0;
+    int rate_scale = sample_rate / 16000;
+    int base_delay = 512 * rate_scale;
+    int moved_delay = 1024 * rate_scale;
     int valid = 1;
     int hop;
     int n_freqs;
+    char label[224];
 
     cfg.fft_size = fft_size;
     cfg.enable_cng = 0;
@@ -823,10 +872,17 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
     weights = (Complex*)calloc(
         (size_t)n_freqs * FOUR_AEC_NR_RES_CHANNELS, sizeof(Complex));
     window = (float*)calloc((size_t)fft_size, sizeof(float));
+    history = (float*)calloc(
+        (size_t)(WOLA_SCENE_HOPS * hop + WOLA_SCENE_PAD), sizeof(float));
     if (!microphones || !ref || !out || !previous || !ola ||
-        !time_frame || !weights || !window) {
+        !time_frame || !weights || !window || !history) {
         valid = 0;
         goto check_result;
+    }
+    for (int i = 0; i < WOLA_SCENE_HOPS * hop + WOLA_SCENE_PAD; ++i) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        history[i] = 0.1f * (((float)(rng >> 8) *
+                              (1.0f / 16777216.0f)) - 0.5f);
     }
     for (int i = 0; i < fft_size; ++i) {
         window[i] = sqrtf(0.5f * (1.0f - cosf(
@@ -838,8 +894,11 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
             weights[(size_t)ch * n_freqs + k].r = 0.25f;
     }
 
-    for (int frame = 0; frame < 40; ++frame) {
-        fill_inputs(microphones, ref, hop, sample_rate, frame);
+    for (int frame = 0; frame < WOLA_SCENE_HOPS; ++frame) {
+        long sweeps_after;
+        fill_delayed_echo(
+            microphones, ref, hop, history, frame * hop + WOLA_SCENE_PAD,
+            frame >= WOLA_SHIFT_HOP ? moved_delay : base_delay);
         if (four_aec_nr_res_process_pre(
                 pipeline, microphones, ref, &pre) != FOUR_AEC_NR_RES_OK) {
             valid = 0;
@@ -847,9 +906,20 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
         }
         /* A delay realignment no longer restarts any WOLA sequence: the
          * lanes realign their filters in place, so the external mirror keeps
-         * its OLA running too and this identity now proves the seams stay
+         * its OLA running too and this identity proves the seams stay
          * continuous ACROSS the realign boundary, not merely after both
-         * sides were wiped. */
+         * sides were wiped. Counted here so the claim rests on realigns this
+         * scene actually performed: a generation that MOVES the alignment is
+         * the only one that shifts an IR, and each must sweep four lanes. */
+        sweeps_after = four_aec_nr_res_realign_warm_lane_count(pipeline) +
+                       four_aec_nr_res_realign_soft_lane_count(pipeline);
+        if (pre.delay.changed && applied_before >= 0 &&
+            pre.delay.delay_samples != applied_before) {
+            moving_realigns += 1;
+            lanes_swept_on_moves += (int)(sweeps_after - sweeps_before);
+        }
+        applied_before = pre.delay.delay_samples;
+        sweeps_before = sweeps_after;
         for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
             float* channel_ola = ola + (size_t)ch * fft_size;
             float* channel_previous = previous + (size_t)ch * hop;
@@ -875,10 +945,24 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
     }
 
 check_result:
-    CHECK(valid && max_error <= 1e-4f,
-          "4ch pre time/spectrum seams share one reconstructing WOLA grid");
+    snprintf(label, sizeof(label),
+             "4ch pre time/spectrum seams share one reconstructing WOLA grid "
+             "sr=%d/fft=%d (max error %.3g across %d alignment moves)",
+             sample_rate, fft_size, (double)max_error, moving_realigns);
+    CHECK(valid && max_error <= 1e-4f, label);
+    /* Two moves at least: the acquisition off raw far, and the mid-stream
+     * shift. Without them the identity above would only have been measured on
+     * a stream whose alignment never moved. */
+    snprintf(label, sizeof(label),
+             "sr=%d/fft=%d: the scene really crosses realign boundaries (%d "
+             "alignment moves, %d lane realigns)",
+             sample_rate, fft_size, moving_realigns, lanes_swept_on_moves);
+    CHECK(moving_realigns >= 2 &&
+          lanes_swept_on_moves ==
+              moving_realigns * FOUR_AEC_NR_RES_CHANNELS, label);
 
 cleanup:
+    free(history);
     free(window);
     free(weights);
     free(time_frame);
@@ -1456,6 +1540,389 @@ static void test_known_delay_memory_and_cost(void) {
     CHECK(cost.us_per_hop > 0.0 && cost.us_per_hop < 16000.0, label);
 }
 
+/* ============================================================================
+ * Shared-delay change admission and the four-lane realign sweep
+ *
+ * A published `changed` sweeps aec_apply_external_realign() over all four
+ * lanes: an IR shift, plus (when the alignment retards) a far-history clear,
+ * on every one of them. What the rows below pin is that the sweep happens on
+ * exactly the hops it should, sized exactly four, and that the applied
+ * alignment and the sweep are one event -- the delay may never move on a hop
+ * that publishes no `changed`, or the lanes would be handed a reference
+ * shifted out from under filters nothing had realigned.
+ *
+ * Two things absorb movement before the lanes ever see it, and they sit at
+ * different scales:
+ *   - DelayAec3 publishes on a 16-downsampled-sample grid (64 native samples
+ *     at 16 kHz), so a bulk-delay wander finer than that never reaches the
+ *     wrapper at all -- the WANDER row measures that end of the seam;
+ *   - the wrapper's own admission (> 32 samples AND repeated within 16 on the
+ *     next eligible hop) then holds every movement for one hop before it can
+ *     spend a sweep -- the MOVING and SHIFT rows measure that end.
+ * ========================================================================== */
+
+typedef struct RealignRun {
+    int acquisition_hop;        /* first `changed` (the acquisition)         */
+    int later_changes;          /* `changed` hops after the acquisition      */
+    int last_change_hop;
+    int applied_at_end;
+    int hold_hops;              /* hops holding an unconfirmed candidate     */
+    int unconfirmed_changes;    /* accepted with no candidate held first     */
+    int silent_delay_moves;     /* applied delay moved without a `changed`   */
+    int wrong_sized_sweeps;     /* a `changed` hop that did not realign 4    */
+    int sweeps_without_change;  /* lanes realigned on a hop with no `changed`*/
+    long warm;
+    long soft;
+} RealignRun;
+
+/* Drives one 16 kHz/hop-256 MATCHED scene and reports what the shared
+ * alignment did. The echo is a single path at `delay_a`, except:
+ *   second_gain > 0  adds a SIMULTANEOUS second path at delay_b (an
+ *                    ambiguous scene: the estimator's peak moves between the
+ *                    two on its own, which is what real jitter looks like at
+ *                    this seam);
+ *   shift_at >= 0    moves the single path to delay_b from that hop on;
+ *   wander_hops > 0  alternates the single path between delay_a and delay_b
+ *                    every wander_hops hops. */
+static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
+                        int shift_at, int wander_hops, RealignRun* out) {
+    enum { RA_HOP = 256, RA_PAD = 16384 };
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* p;
+    float* far_hist;
+    float mic[RA_HOP * FOUR_AEC_NR_RES_CHANNELS];
+    float far[RA_HOP];
+    uint32_t rng = 0x1234567u;
+    int hop, i, ch;
+    int previous_delay = 0;
+    int previous_pending = -1;
+    long previous_sweeps = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->acquisition_hop = -1;
+    out->last_change_hop = -1;
+    out->applied_at_end = -1;
+
+    cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
+    cfg.enable_cng = 0;
+    p = four_aec_nr_res_create(&cfg);
+    if (!p) return;
+
+    far_hist = (float*)malloc((size_t)(hops * RA_HOP + RA_PAD) * sizeof(float));
+    if (!far_hist) { four_aec_nr_res_destroy(p); return; }
+    for (i = 0; i < hops * RA_HOP + RA_PAD; ++i) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        far_hist[i] = 0.25f * (((float)(rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
+    }
+
+    for (hop = 0; hop < hops; ++hop) {
+        FourAecNrResPreFrame pre;
+        int base = hop * RA_HOP + RA_PAD;
+        int dominant = delay_a;
+        int pending;
+        long sweeps;
+        if (shift_at >= 0 && hop >= shift_at) dominant = delay_b;
+        if (wander_hops > 0 && ((hop / wander_hops) % 2)) dominant = delay_b;
+        for (i = 0; i < RA_HOP; ++i) {
+            int t = base + i;
+            float echo = 0.6f * far_hist[t - dominant];
+            if (second_gain > 0.0f) echo += second_gain * far_hist[t - delay_b];
+            far[i] = far_hist[t];
+            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+                mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo;
+        }
+        if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+            FOUR_AEC_NR_RES_OK) break;
+
+        sweeps = four_aec_nr_res_realign_warm_lane_count(p) +
+                 four_aec_nr_res_realign_soft_lane_count(p);
+        pending = four_aec_nr_res_pending_delay_candidate(p);
+        if (pending >= 0) out->hold_hops += 1;
+
+        if (pre.delay.changed) {
+            if (out->acquisition_hop < 0) {
+                out->acquisition_hop = hop;
+            } else {
+                out->later_changes += 1;
+                /* The candidate must have been HELD on the previous hop and
+                 * must be the value now applied: that pair is the whole
+                 * two-step rule, and it is what disappears if acceptance
+                 * moves back to the first sighting. */
+                if (previous_pending < 0 ||
+                    abs(previous_pending - pre.delay.delay_samples) >= 16)
+                    out->unconfirmed_changes += 1;
+            }
+            out->last_change_hop = hop;
+            if (sweeps - previous_sweeps != FOUR_AEC_NR_RES_CHANNELS)
+                out->wrong_sized_sweeps += 1;
+        } else {
+            if (hop > 0 && pre.delay.delay_samples != previous_delay)
+                out->silent_delay_moves += 1;
+            if (sweeps != previous_sweeps) out->sweeps_without_change += 1;
+        }
+
+        previous_delay = pre.delay.delay_samples;
+        previous_pending = pending;
+        previous_sweeps = sweeps;
+        out->applied_at_end = pre.delay.delay_samples;
+        four_aec_nr_res_abandon_pre(p, &pre.token);
+    }
+
+    out->warm = four_aec_nr_res_realign_warm_lane_count(p);
+    out->soft = four_aec_nr_res_realign_soft_lane_count(p);
+    free(far_hist);
+    four_aec_nr_res_destroy(p);
+}
+
+static void test_shared_delay_change_admission(void) {
+    RealignRun wander, moving, shift;
+    char label[224];
+
+    /* WANDER: the bulk delay itself moves by 24 samples (1.5 ms) back and
+     * forth, below both the wrapper's 32-sample admission and DelayAec3's own
+     * 64-sample output grid. Nothing may reach the lanes: one acquisition
+     * sweep for the whole run and an alignment that never moves again. */
+    realign_run(240, 512, 536, 0.0f, -1, 30, &wander);
+    printf("shared-delay admission: wander +/-24 -> acquired hop %d applied "
+           "%d, %d later generations, %ld warm + %ld soft lane realigns\n",
+           wander.acquisition_hop, wander.applied_at_end, wander.later_changes,
+           wander.warm, wander.soft);
+    snprintf(label, sizeof(label),
+             "a 24-sample bulk-delay wander starts no alignment generation "
+             "after the acquisition (%d later generations)",
+             wander.later_changes);
+    CHECK(wander.acquisition_hop >= 0 && wander.later_changes == 0, label);
+    snprintf(label, sizeof(label),
+             "and realigns the four lanes exactly once, for the acquisition "
+             "itself (%ld warm + %ld soft = %ld lane calls)",
+             wander.warm, wander.soft, wander.warm + wander.soft);
+    CHECK(wander.warm + wander.soft == FOUR_AEC_NR_RES_CHANNELS, label);
+
+    /* MOVING: the echo path really does travel, 512 <-> 1024 samples in
+     * 100-hop blocks, so the shared estimate moves several times over the run
+     * -- and every move is far larger than the admission band, which is what
+     * a movement the lanes SHOULD follow looks like. This is the row that
+     * makes the two-step rule falsifiable: a single-generation scene would
+     * pass the hold assertions for free. */
+    realign_run(600, 512, 1024, 0.0f, -1, 100, &moving);
+    printf("shared-delay admission: 512<->1024 in 100-hop blocks -> acquired "
+           "hop %d, %d later generations, %d holds, applied %d, %ld warm + "
+           "%ld soft\n", moving.acquisition_hop, moving.later_changes,
+           moving.hold_hops, moving.applied_at_end, moving.warm, moving.soft);
+    snprintf(label, sizeof(label),
+             "control: the moving-path scene really does re-lock several "
+             "times (%d later generations)", moving.later_changes);
+    CHECK(moving.later_changes >= 4, label);
+    snprintf(label, sizeof(label),
+             "every alignment change is admitted only after the same value is "
+             "seen on a second eligible hop (%d accepted on a first sighting, "
+             "%d hold hops for %d changes)", moving.unconfirmed_changes,
+             moving.hold_hops, moving.later_changes);
+    CHECK(moving.unconfirmed_changes == 0 &&
+          moving.hold_hops == moving.later_changes, label);
+    snprintf(label, sizeof(label),
+             "the applied alignment never moves on a hop that publishes no "
+             "`changed` (%d silent moves)", moving.silent_delay_moves);
+    CHECK(moving.silent_delay_moves == 0, label);
+    snprintf(label, sizeof(label),
+             "every generation realigns exactly four lanes and no other hop "
+             "realigns any (%d wrong-sized sweeps, %d sweeps without a "
+             "generation)", moving.wrong_sized_sweeps,
+             moving.sweeps_without_change);
+    CHECK(moving.wrong_sized_sweeps == 0 &&
+          moving.sweeps_without_change == 0, label);
+    snprintf(label, sizeof(label),
+             "the warm/soft split accounts for every lane call (%ld + %ld == "
+             "4 x %d generations)", moving.warm, moving.soft,
+             moving.later_changes + 1);
+    CHECK(moving.warm + moving.soft ==
+          (long)FOUR_AEC_NR_RES_CHANNELS * (moving.later_changes + 1),
+          label);
+
+    /* SHIFT: the echo really moves, 512 -> 1024 samples, and stays there. One
+     * generation, held for one hop first, then all four lanes realigned. */
+    realign_run(260, 512, 1024, 0.0f, 100, 0, &shift);
+    printf("shared-delay admission: shift 512 -> 1024 at hop 100 -> acquired "
+           "hop %d, adopted hop %d applied %d, %ld warm + %ld soft\n",
+           shift.acquisition_hop, shift.last_change_hop, shift.applied_at_end,
+           shift.warm, shift.soft);
+    snprintf(label, sizeof(label),
+             "a sustained 512-sample shift starts exactly one new alignment "
+             "generation (%d), on hop %d", shift.later_changes,
+             shift.last_change_hop);
+    CHECK(shift.later_changes == 1 && shift.last_change_hop > 100, label);
+    snprintf(label, sizeof(label),
+             "it is held for confirmation for exactly one hop before it is "
+             "applied (%d holds, %d accepted on a first sighting)",
+             shift.hold_hops, shift.unconfirmed_changes);
+    CHECK(shift.hold_hops == 1 && shift.unconfirmed_changes == 0, label);
+    snprintf(label, sizeof(label),
+             "and then realigns all four lanes on that one hop (%ld warm + "
+             "%ld soft = %ld, two generations x 4 lanes)",
+             shift.warm, shift.soft, shift.warm + shift.soft);
+    CHECK(shift.wrong_sized_sweeps == 0 &&
+          shift.sweeps_without_change == 0 &&
+          shift.warm + shift.soft == 2 * FOUR_AEC_NR_RES_CHANNELS, label);
+    snprintf(label, sizeof(label),
+             "the alignment ends on the moved path, early-or-exact within the "
+             "%d-sample contract (applied %d for a true 1024)",
+             KD_MAX_UNDERSHOOT, shift.applied_at_end);
+    CHECK(1024 - shift.applied_at_end >= 0 &&
+          1024 - shift.applied_at_end <= KD_MAX_UNDERSHOOT, label);
+}
+
+/* ============================================================================
+ * Held-candidate lifetime
+ *
+ * The admission state machine is driven directly here. Through a stream it
+ * cannot be: DelayAec3 re-offers a movement on every hop once it has one, so
+ * the candidate is always resolved on the very next eligible hop and its TTL
+ * never runs out -- the same reason the expiry rule exists at all is the
+ * reason a synthetic scene cannot exercise it. What a scene DOES cover (a
+ * candidate is really held, and really spends a realign when confirmed) is
+ * asserted in test_shared_delay_change_admission() above; the reset row below
+ * closes the loop by clearing a candidate that a real stream produced.
+ * ========================================================================== */
+
+/* One hop, spent the way update_shared_delay() spends it: the held candidate
+ * always ages, and the estimate is only offered on a hop the estimator was
+ * eligible on. */
+static int admission_hop(FourAecDelayAdmission* admission, int accepted,
+                         int estimated, int eligible) {
+    four_aec_nr_res_admission_age(admission);
+    if (!eligible) return 0;
+    return four_aec_nr_res_admission_offer(admission, accepted, estimated);
+}
+
+static void test_delay_change_candidate_ttl(void) {
+    const int applied = 512;        /* the alignment in force */
+    const int moved = 1024;         /* a movement far outside the band */
+    FourAecDelayAdmission a;
+    RealignRun scene_unused;
+    FourAecNrResConfig cfg;
+    FourAecNrRes* p;
+    char label[224];
+    int i;
+    int held_hop = -1;
+    int candidate_before_reset = -1;
+    int candidate_after_reset = 0;
+
+    (void)scene_unused;
+
+    /* Offered once, repeated on the very next hop: admitted, and nothing is
+     * left held afterwards. */
+    memset(&a, 0, sizeof(a));
+    CHECK(admission_hop(&a, applied, moved, 1) == 0 &&
+          a.ttl == FOUR_DELAY_CHANGE_CANDIDATE_TTL && a.candidate == moved,
+          "a first sighting is held, not applied, with a full life");
+    CHECK(admission_hop(&a, applied, moved, 1) == 1 &&
+          a.ttl == 0,
+          "the same movement on the next hop is admitted and releases the "
+          "candidate");
+
+    /* One hop without a usable estimate does not end it: lib/aec's rule is a
+     * bounded life, not a strictly consecutive pair. */
+    memset(&a, 0, sizeof(a));
+    admission_hop(&a, applied, moved, 1);
+    CHECK(admission_hop(&a, applied, 0, 0) == 0 && a.ttl > 0,
+          "a hop with no usable estimate spends one hop of the candidate's "
+          "life and keeps it");
+    CHECK(admission_hop(&a, applied, moved, 1) == 1,
+          "the movement is still admitted when it returns inside that life");
+
+    /* Aged out: the candidate is gone, and a single reappearance can only
+     * start a new one. */
+    memset(&a, 0, sizeof(a));
+    admission_hop(&a, applied, moved, 1);
+    for (i = 0; i < FOUR_DELAY_CHANGE_CANDIDATE_TTL - 1; ++i)
+        admission_hop(&a, applied, 0, 0);
+    snprintf(label, sizeof(label),
+             "the candidate survives exactly %d hops without a usable "
+             "estimate (life left %d)",
+             FOUR_DELAY_CHANGE_CANDIDATE_TTL - 1, a.ttl);
+    CHECK(a.ttl > 0 && a.candidate == moved, label);
+    admission_hop(&a, applied, 0, 0);
+    CHECK(a.ttl == 0 && a.candidate == 0,
+          "one hop later it has expired, holding nothing");
+    CHECK(admission_hop(&a, applied, moved, 1) == 0 &&
+          a.ttl == FOUR_DELAY_CHANGE_CANDIDATE_TTL,
+          "a single reappearance after expiry is NOT admitted -- it is only a "
+          "new first sighting");
+    CHECK(admission_hop(&a, applied, moved, 1) == 1,
+          "and it takes a repeat inside the new life to admit it");
+
+    /* An estimate back at the alignment in force is absorbed without ending
+     * the candidate (lib/aec's Path B has no such clear); a movement to a
+     * different place replaces it with a full life. */
+    memset(&a, 0, sizeof(a));
+    admission_hop(&a, applied, moved, 1);
+    CHECK(admission_hop(&a, applied,
+                        applied + FOUR_DELAY_CHANGE_MIN_SAMPLES, 1) == 0 &&
+          a.candidate == moved && a.ttl > 0,
+          "an estimate inside the admission band is absorbed and leaves the "
+          "held candidate to age");
+    CHECK(admission_hop(&a, applied, 2048, 1) == 0 &&
+          a.candidate == 2048 &&
+          a.ttl == FOUR_DELAY_CHANGE_CANDIDATE_TTL,
+          "a movement somewhere else entirely replaces the candidate and "
+          "restarts its life");
+
+    /* End to end: a candidate a real stream produced is cleared by reset(),
+     * together with the life left on it. */
+    cfg = four_aec_nr_res_default_config(16000);
+    cfg.fft_size = 512;
+    cfg.enable_cng = 0;
+    p = four_aec_nr_res_create(&cfg);
+    CHECK(p != NULL, "candidate-reset scene creates");
+    if (p) {
+        enum { TR_HOP = 256, TR_PAD = 16384, TR_HOPS = 600 };
+        float* far_hist = (float*)malloc(
+            (size_t)(TR_HOPS * TR_HOP + TR_PAD) * sizeof(float));
+        float mic[TR_HOP * FOUR_AEC_NR_RES_CHANNELS];
+        float far[TR_HOP];
+        uint32_t rng = 0x1234567u;
+        int hop, ch;
+        if (far_hist) {
+            for (i = 0; i < TR_HOPS * TR_HOP + TR_PAD; ++i) {
+                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+                far_hist[i] = 0.25f *
+                    (((float)(rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
+            }
+            for (hop = 0; hop < TR_HOPS && held_hop < 0; ++hop) {
+                FourAecNrResPreFrame pre;
+                int base = hop * TR_HOP + TR_PAD;
+                int dominant = ((hop / 100) % 2) ? 1024 : 512;
+                for (i = 0; i < TR_HOP; ++i) {
+                    int t = base + i;
+                    float echo = 0.6f * far_hist[t - dominant];
+                    far[i] = far_hist[t];
+                    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+                        mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo;
+                }
+                if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+                    FOUR_AEC_NR_RES_OK) break;
+                four_aec_nr_res_abandon_pre(p, &pre.token);
+                candidate_before_reset =
+                    four_aec_nr_res_pending_delay_candidate(p);
+                if (candidate_before_reset >= 0) {
+                    held_hop = hop;
+                    four_aec_nr_res_reset(p);
+                    candidate_after_reset =
+                        four_aec_nr_res_pending_delay_candidate(p);
+                }
+            }
+        }
+        free(far_hist);
+        four_aec_nr_res_destroy(p);
+    }
+    snprintf(label, sizeof(label),
+             "reset() clears a candidate a real stream was holding (hop %d, "
+             "held %d, after reset %d)",
+             held_hop, candidate_before_reset, candidate_after_reset);
+    CHECK(held_hop >= 0 && candidate_before_reset >= 0 &&
+          candidate_after_reset == -1, label);
+}
+
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
@@ -1478,6 +1945,8 @@ int main(void) {
     test_known_delay_acquisition_and_coverage();
     test_known_delay_mislock_is_detectable();
     test_known_delay_memory_and_cost();
+    test_shared_delay_change_admission();
+    test_delay_change_candidate_ttl();
 
     if (failures) {
         printf("%d test(s) failed\n", failures);

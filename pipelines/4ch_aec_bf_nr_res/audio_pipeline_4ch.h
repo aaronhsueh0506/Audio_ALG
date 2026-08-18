@@ -111,9 +111,15 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * v4 grows it again with the core's delay_backward_quarantine_enabled/_s; the
  * carve order is unchanged, but the self-resident config is, so the pool
  * total moves and a descriptor from an older build no longer sizes this one.
+ * v5 carries the core's own layout 10 -> 11 (its control block gained the
+ * shared-delay change admission and the realign lane counters). Nothing in
+ * THIS layer's carve changed, but the core sub-pool it composes grew, so this
+ * layer's total moved with it -- and build_flags_hash cannot say so, since it
+ * folds in the core's carve-token hash, which a control-block-only change
+ * leaves alone.
  * (The exact totals are reported by `make print-mem-size`; they are not
  * restated here, where they would silently rot.) */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 4u
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 5u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

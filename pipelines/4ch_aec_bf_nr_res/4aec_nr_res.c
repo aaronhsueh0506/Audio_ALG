@@ -132,6 +132,14 @@ struct FourAecNrRes {
      * window converted once at init. */
     int delay_quarantine_left;
     int delay_quarantine_hops;
+    /* Two-step admission for a shared-delay CHANGE: the movement seen once
+     * and held for confirmation, plus its remaining life in hops (see
+     * 4aec_nr_res_internal.h). Cleared by acceptance, by expiry, by reset(). */
+    FourAecDelayAdmission delay_admission;
+    /* Cumulative aec_apply_external_realign() outcomes across the four lanes,
+     * split warm (returned 1, learned IR shifted) vs soft (returned 0). */
+    long realign_warm_lanes;
+    long realign_soft_lanes;
     uint64_t delay_calls;
     FourAecNrResDelayState last_delay;
 
@@ -843,6 +851,42 @@ static float rng_gauss(FourAecNrRes* p) {
  * Per-hop processing — Stage 1: shared delay + four linear AEC lanes
  * ========================================================================== */
 
+/* The admission band, its confirmation window and the candidate's life are
+ * lib/aec's own Path-B numbers; they and the state they act on are declared
+ * in 4aec_nr_res_internal.h, where the tests can reach them. */
+
+void four_aec_nr_res_admission_age(FourAecDelayAdmission* admission) {
+    if (!admission || admission->ttl <= 0) return;
+    admission->ttl -= 1;
+    if (admission->ttl <= 0) {
+        admission->ttl = 0;
+        admission->candidate = 0;
+    }
+}
+
+int four_aec_nr_res_admission_offer(
+    FourAecDelayAdmission* admission, int accepted_delay, int estimated) {
+    if (!admission) return 0;
+    /* Too small to be worth four IR shifts: absorbed, and deliberately left
+     * to age rather than clearing the candidate, so a movement is not
+     * cancelled by one hop of the estimator agreeing with the alignment it is
+     * moving away from. lib/aec's Path B has no such clear either. */
+    if (abs(estimated - accepted_delay) <= FOUR_DELAY_CHANGE_MIN_SAMPLES)
+        return 0;
+    if (admission->ttl > 0 &&
+        abs(estimated - admission->candidate) <
+            FOUR_DELAY_CHANGE_CONFIRM_SAMPLES) {
+        admission->candidate = 0;
+        admission->ttl = 0;
+        return 1;
+    }
+    /* First sighting, or a movement somewhere else entirely: this becomes the
+     * candidate with a full life, replacing whatever was held. */
+    admission->candidate = estimated;
+    admission->ttl = FOUR_DELAY_CHANGE_CANDIDATE_TTL;
+    return 0;
+}
+
 static FourAecNrResDelayState update_shared_delay(
     FourAecNrRes* p,
     const float* capture,
@@ -853,6 +897,7 @@ static FourAecNrResDelayState update_shared_delay(
     int eligible;
     int was_usable;
     int now_usable;
+    int accepted;
 
     memset(&state, 0, sizeof(state));
     if (p->cfg.delay_mode == AEC_DELAY_EXTERNAL_ALIGNED) {
@@ -892,6 +937,12 @@ static FourAecNrResDelayState update_shared_delay(
     eligible = estimated >= 0 &&
                delay_aec3_is_solid(&p->shared_delay) &&
                delay_aec3_n_updates(&p->shared_delay) >= 3;
+
+    /* One hop of the held candidate's life, spent here -- ahead of both the
+     * quarantine and the admission below, exactly where lib/aec ages its own
+     * pending delay. Held candidates therefore expire on hops the quarantine
+     * takes away as readily as on hops the estimate moves elsewhere. */
+    four_aec_nr_res_admission_age(&p->delay_admission);
 
     /* Backward-jump quarantine (see delay_backward_quarantine_enabled in the
      * header). Engages only once a usable generation exists and only for an
@@ -947,11 +998,48 @@ static FourAecNrResDelayState update_shared_delay(
      * previous hop's usability is exactly its published `solid`: this
      * wrapper's delay_samples is never negative (accepted_delay starts at 0
      * and only ever takes an `estimated >= 0`), so there is no -1 sentinel
-     * half to test. */
+     * half to test.
+     *
+     * A CHANGE to a usable alignment additionally has to clear the admission
+     * in 4aec_nr_res_internal.h, because every one of them costs an IR shift
+     * plus (on a retard) a far-history clear on all FOUR lanes:
+     *
+     *   - FOUR_DELAY_CHANGE_MIN_SAMPLES bounds how small a movement may
+     *     disturb four converged filters at all. DelayAec3 publishes on a
+     *     16-downsampled-sample grid -- 64 native samples at 16 kHz, 192 at
+     *     48 kHz, since its answer is a block index shifted left -- so
+     *     against today's estimator this term is the floor under a finer
+     *     source rather than an active filter.
+     *   - the held candidate is the operative half: a value that is not
+     *     offered again before it ages out never reaches the lanes.
+     *
+     * What this deliberately does NOT reject is a SUSTAINED wrong estimate:
+     * it is re-offered every hop and confirms itself. Holding that one is the
+     * backward quarantine's job above, on its own evidence and its own bound.
+     *
+     * First acquisition keeps its immediate path: with nothing accepted yet
+     * there is no alignment to protect, the same split lib/aec makes between
+     * its Path A and Path B.
+     *
+     * accepted_delay moves only on acceptance, so the alignment served to the
+     * lanes and the realign that shifts their filters always land on the same
+     * hop; a value written on the pending hop would feed them a reference
+     * shifted out from under filters nothing had realigned. */
     was_usable = p->last_delay.solid;
     now_usable = was_usable || eligible;
-    state.changed = eligible && (!was_usable || estimated != p->accepted_delay);
-    if (eligible) p->accepted_delay = estimated;
+    accepted = 0;
+    if (eligible) {
+        if (!was_usable) {
+            accepted = 1;
+            p->delay_admission.candidate = 0;
+            p->delay_admission.ttl = 0;
+        } else {
+            accepted = four_aec_nr_res_admission_offer(
+                &p->delay_admission, p->accepted_delay, estimated);
+        }
+    }
+    state.changed = accepted;
+    if (accepted) p->accepted_delay = estimated;
     state.delay_samples = p->accepted_delay;
     state.confidence = delay_aec3_confidence(&p->shared_delay);
     state.solid = now_usable;
@@ -1107,8 +1195,18 @@ int four_aec_nr_res_process_pre(
          * (regression: lib/aec test_external_realign.c and
          * tests/test_4aec_nr_res.c's realign continuity rows). */
         for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-            aec_apply_external_realign(p->lanes[ch],
-                                       delay.delay_samples - old_align);
+            int outcome = aec_apply_external_realign(
+                p->lanes[ch], delay.delay_samples - old_align);
+            /* Which path each lane took is otherwise invisible from here --
+             * the call reports it and nothing kept the answer. Counted, not
+             * branched on: a lane that goes soft is still correct, just cold
+             * for a while, so this is what makes "the sweep ran, and how it
+             * landed" measurable. A sweep that does not add exactly 4 means a
+             * lane rejected the call (-1: no instance, or a lane not in
+             * EXTERNAL_ALIGNED), which is a wiring fault rather than a soft
+             * realign and must not be counted as one. */
+            if (outcome == 1) p->realign_warm_lanes += 1;
+            else if (outcome == 0) p->realign_soft_lanes += 1;
         }
     }
 
@@ -1595,8 +1693,17 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
             ? p->cfg.fixed_delay_samples : 0;
     /* A reset abandons the alignment the quarantine was protecting, so a
      * countdown armed against it must not survive. The WINDOW
-     * (delay_quarantine_hops) is config-derived and stays. */
+     * (delay_quarantine_hops) is config-derived and stays. Same for a held
+     * change candidate and the life left on it: it was a movement away from
+     * an alignment that no longer exists, and the next acquisition is
+     * immediate anyway. */
     p->delay_quarantine_left = -1;
+    p->delay_admission.candidate = 0;
+    p->delay_admission.ttl = 0;
+    /* Zeroed with the lanes' own counters (aec_reset() clears the per-lane
+     * far-FFT count), so every instrumentation total shares one epoch. */
+    p->realign_warm_lanes = 0;
+    p->realign_soft_lanes = 0;
     p->delay_calls = 0;
     memset(&p->last_delay, 0, sizeof(p->last_delay));
     p->rng_state = PIPELINE_RNG_SEED;
@@ -1666,6 +1773,19 @@ long four_aec_nr_res_far_fft_real_compute_count(const FourAecNrRes* p) {
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
         total += aec_far_fft_real_compute_count(p->lanes[ch]);
     return total;
+}
+
+long four_aec_nr_res_realign_warm_lane_count(const FourAecNrRes* p) {
+    return p && !p->destroyed ? p->realign_warm_lanes : 0;
+}
+
+long four_aec_nr_res_realign_soft_lane_count(const FourAecNrRes* p) {
+    return p && !p->destroyed ? p->realign_soft_lanes : 0;
+}
+
+int four_aec_nr_res_pending_delay_candidate(const FourAecNrRes* p) {
+    if (!p || p->destroyed || p->delay_admission.ttl <= 0) return -1;
+    return p->delay_admission.candidate;
 }
 
 /* ============================================================================

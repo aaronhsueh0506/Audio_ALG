@@ -70,10 +70,12 @@ _RELOCK_SCENE = dict(mode="matched", delay=64, fft=512, hops=200,
 _QUARANTINE_SCENE = dict(mode="matched", delay=6400, fft=512, hops=260)
 _QUARANTINE_CORRECT_DELAY = 6336  # the true path, on the 64-sample grid
 _QUARANTINE_WRONG_DELAY = 4800    # 6400 - 1600: the pre-echo answer
-# Measured, both sides: unquarantined adoption on hop 50; with the quarantine
-# on, adoption on hop 50 + window_hops for every window swept. hop 256 at
-# 16 kHz makes 1.0 s exactly 62 hops.
-_QUARANTINE_UNHELD_HOP = 50
+# Measured, both sides: unquarantined adoption on hop 51 -- the estimator
+# offers the wrong delay on hop 50 and it is applied on the next eligible hop,
+# once the two-step admission has seen it twice -- and, with the quarantine on,
+# adoption on that hop + window_hops for every window swept. hop 256 at 16 kHz
+# makes 1.0 s exactly 62 hops.
+_QUARANTINE_UNHELD_HOP = 51
 _QUARANTINE_WINDOWS_S = (0.5, 1.0, 2.0)
 
 
@@ -111,11 +113,11 @@ _PROXY_SEED = 0x89ABCDEF
 # cannot reach either cancellation threshold, while the other three stay on the
 # clean echo -- and small enough that the estimator (which is fed from that
 # same proxy channel) still reproduces the mis-lock. Measured at this level:
-# acquisition hop 59, unquarantined adoption hop 185.
+# acquisition hop 59, unquarantined adoption hop 186.
 _PROXY_NOISE_GAIN = 0.5
 _PROXY_SCENE = dict(mode="matched", delay=6400, fft=512, hops=300)
 _PROXY_ACQUIRE_HOP = 59
-_PROXY_ADOPT_HOP = 185
+_PROXY_ADOPT_HOP = 186
 
 
 def _fnv1a(samples: np.ndarray) -> int:
@@ -383,6 +385,98 @@ def test_published_solid_survives_a_confidence_dip():
             assert state.delay_samples == accepted
             assert state.confidence == 0.5
     assert accepted is not None, "scene never acquired"
+
+
+class _ScriptedEstimator:
+    """Shim proxy that publishes a scripted ``(delay, solid)`` per hop.
+
+    Scripted rather than provoked, for the same reason the C side drives its
+    admission state machine directly (tests/test_4aec_nr_res.c): a live
+    DelayAec3 re-offers a movement on every hop once it has one, so a held
+    candidate is always resolved on the very next eligible hop and its TTL
+    never runs out.  Every scene in this file is therefore blind to the expiry
+    rule -- removing the countdown from either implementation leaves them
+    agreeing hop for hop -- so it is pinned here instead.
+    """
+
+    def __init__(self, script):
+        self._script = list(script)
+        self._index = -1
+
+    def accumulate(self, capture, render):
+        self._index += 1
+
+    def reset(self):
+        self._index = -1
+
+    @property
+    def _current(self):
+        index = min(self._index, len(self._script) - 1)
+        return self._script[max(index, 0)]
+
+    @property
+    def estimated_delay(self):
+        return self._current[0]
+
+    @property
+    def confidence(self):
+        return 1.0 if self._current[1] else 0.5
+
+    @property
+    def is_solid(self):
+        return bool(self._current[1])
+
+    @property
+    def _n_updates(self):
+        return 3
+
+
+def _scripted_changes(script):
+    """Return the per-hop ``(changed, delay_samples)`` for one script."""
+    estimator = _pipeline.SharedMatchedDelayEstimator(
+        sample_rate=_SAMPLE_RATE, hop_size=128)
+    estimator._estimator = _ScriptedEstimator(script)
+    hop = np.zeros(128, dtype=np.float32)
+    rows = []
+    for _ in script:
+        state = estimator.accumulate(hop, hop)
+        rows.append((state.changed, state.delay_samples))
+    return estimator, rows
+
+
+def test_change_candidate_lives_for_three_hops_like_lib_aec():
+    """The held candidate's bounded life, mirroring lib/aec Path B's
+    ``pending_delay_ttl = 3``: a movement is admitted when it is offered again
+    INSIDE that life, and a single reappearance after it has expired only
+    starts a new candidate.  Same four cases as the C rows, and the same
+    values on both sides, which is what the C/Python mirror is worth here.
+    """
+    ttl = _pipeline._DELAY_CHANGE_CANDIDATE_TTL
+    lapse = (-1, False)          # a hop with no usable estimate
+    hold = (512, True)           # the alignment in force
+
+    # Offered, then repeated on the very next hop: admitted.
+    _est, rows = _scripted_changes([hold, hold, (1024, True), (1024, True)])
+    assert [row[0] for row in rows] == [True, False, False, True]
+    assert rows[-1][1] == 1024
+
+    # One hop without a usable estimate does not end it.
+    _est, rows = _scripted_changes([hold, (1024, True), lapse, (1024, True)])
+    assert [row[0] for row in rows] == [True, False, False, True]
+
+    # Aged out: the reappearance is only a new first sighting, and it takes a
+    # repeat inside the new life to admit it.
+    _est, rows = _scripted_changes(
+        [hold, (1024, True)] + [lapse] * ttl + [(1024, True), (1024, True)])
+    assert [row[0] for row in rows] == (
+        [True, False] + [False] * ttl + [False, True])
+    assert rows[-3][1] == 512, "the alignment holds while the candidate is dead"
+
+    # reset() clears the candidate and the life left on it.
+    estimator, rows = _scripted_changes([hold, (1024, True)])
+    assert estimator._pending_ttl > 0 and estimator._pending_delay == 1024
+    estimator.reset()
+    assert estimator._pending_ttl == 0 and estimator._pending_delay == 0
 
 
 def test_matched_relock_and_zero_delay_acquisition_match_c_per_hop(dumper):

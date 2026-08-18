@@ -136,8 +136,8 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>GSC 借用 <code>srp-&gt;a_array</code></td></tr>
 <tr><td><code>GSC</code>(RLS P/weights)</td><td>4×n_freqs 級</td><td>pool(wrapper)</td><td>lambda 0.995 經 <code>mmse_lsa_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
 <tr><td>auto-VAD(<code>noise_power/vad_hangover</code>)</td><td>純量</td><td>C struct(wrapper)</td><td>-55 dBFS / SNR 3.0 / hangover 8(retimed);EMA 0.999/0.95(retimed)</td></tr>
-<tr><td>核心合計 @16k/512</td><td>1,669,088 B(kiss;ne10 待現查)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(kiss、<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,480,160 B(kiss 舊值 1,485,664 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
-<tr><td>完整 wrapper 合計</td><td>1,907,600 B @16k/256(預設)/ 6,811,904 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,2026-08-18 起的預設後端,layout_version=4);由 static smoke 的 <code>Total:</code> 行印出(kiss 舊值:1,910,640 B @16k/256 / 6,826,464 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
+<tr><td>核心合計 @16k/512</td><td>1,662,240 B(ne10;kiss 舊值 1,669,088 B)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(kiss、<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,480,192 B(kiss 舊值 1,485,664 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
+<tr><td>完整 wrapper 合計</td><td>1,907,632 B @16k/256(預設)/ 6,811,936 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,2026-08-18 起的預設後端,layout_version=5);由 static smoke 的 <code>Total:</code> 行印出(kiss 舊值:1,910,640 B @16k/256 / 6,826,464 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
@@ -151,8 +151,8 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心(pre/post/abandon、token、fused post;layout v10)</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code></td><td>完整 wrapper(SRP/GSC/auto-VAD;layout v3)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心(pre/post/abandon、token、fused post;layout v11)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code></td><td>完整 wrapper(SRP/GSC/auto-VAD;layout v5)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_projection_kernels.h</code></td><td>投影 kernels(cmac/residual/comfort/mag2)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/third_party/{doa,GSC,utility}</code></td><td>SRP-PHAT / GSC / spatial SIMD</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c</code> / <code>audio_pipeline_4ch_static.c</code>；<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c</code></td><td>應用 CLI 與 core 靜態記憶體 smoke</td></tr>
