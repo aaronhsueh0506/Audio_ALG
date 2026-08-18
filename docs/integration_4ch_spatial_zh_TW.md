@@ -442,10 +442,10 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 
 | Config | `req.bytes` | 來源 |
 |---|---:|---|
-| 16000，全預設（256/128，`num_angles=72`） | 1,910,640 | 實測 |
-| 16000，`core.fft_size = 512` | 3,249,248 | 實測 |
-| 16000，`num_angles = 360` | 4,912,752 | 實測 |
-| 48000，全預設（1024/512，`num_angles=72`） | 6,826,464 | 實測 |
+| 16000，全預設（256/128，`num_angles=72`） | 1,910,736 | 實測 |
+| 16000，`core.fft_size = 512` | 3,249,344 | 實測 |
+| 16000，`num_angles = 360` | 4,912,848 | 實測 |
+| 48000，全預設（1024/512，`num_angles=72`） | 6,826,560 | 實測 |
 
 ⚠ 覆蓋差異：只有 `num_angles = 72` 的 16 kHz/256 與 48 kHz/1024 兩組會被
 C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_size = 512`
@@ -684,7 +684,7 @@ Config：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `3` |
+| 4 | `layout_version` | `uint32_t` | `5` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（直接沿用核心層的值，永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，**已把核心層的 `build_flags_hash` 摺進去** |
 | 16 | `alignment` | `uint32_t` | `16` |

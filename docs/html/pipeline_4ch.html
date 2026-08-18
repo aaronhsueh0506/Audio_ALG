@@ -54,14 +54,14 @@ four_aec_nr_res_process_pre(core, mics_interleaved, ref, &amp;pre);
 /* ... 用 pre.linear_spectra / pre.aligned_ref 算 weights ... */
 four_aec_nr_res_process_post(core, &amp;pre.token, weights, out);
 /* 外部 post 變體(如 ULCNet)不跑 post: four_aec_nr_res_abandon_pre(core, &amp;pre.token); */</pre>
-<p>Descriptor 慣例與 mono 相同(32-byte 固定 ABI、init_ex 8 點閘)。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=10</code>、wrapper <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=4</code>,兩者 descriptor_version 皆 1;wrapper 的 build_flags_hash 摺入核心的 hash(核心 layout bump 會連帶作廢外層 descriptor)。核心 config:<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,四條 lane 共用同一個決策)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘須 −1)、<code>capture_proxy_channel</code>(matcher 輸入,[0,3])、<code>max_delay_ms</code>(僅 <code>MATCHED</code> 用於 sizing delay ring,預設 1024,delay ring = ceil(ms×sr/1000)+2×hop+1)、<code>filter_length</code>(0=rate default)、<code>delay_backward_quarantine_enabled</code>(bool,預設 0;開啟後只隔離比現行 delay <b>更早</b>的新估計,且僅在 <code>capture_proxy_channel</code> 那一條 lane 仍在消除回音時;往後跳與首次取得對齊都不受影響)、<code>delay_backward_quarantine_s</code>(float,預設 1.0;隔離窗長,init 時換算成 hop 數,到期即採用——延後 pre-echo 誤鎖一個窗,不是治癒)。Quarantine 目前<b>只驗過合成場景與 C／Python 逐 hop 對照,真實錄音抽測待做</b>,產品組態維持預設 OFF。</p>
+<p>Descriptor 慣例與 mono 相同(32-byte 固定 ABI、init_ex 8 點閘)。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=11</code>、wrapper <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=5</code>,兩者 descriptor_version 皆 1;wrapper 的 build_flags_hash 摺入核心的 hash(核心 layout bump 會連帶作廢外層 descriptor)。核心 config:<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,四條 lane 共用同一個決策)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘須 −1)、<code>capture_proxy_channel</code>(matcher 輸入,[0,3])、<code>max_delay_ms</code>(僅 <code>MATCHED</code> 用於 sizing delay ring,預設 1024,delay ring = ceil(ms×sr/1000)+2×hop+1)、<code>filter_length</code>(0=rate default)、<code>delay_backward_quarantine_enabled</code>(bool,預設 0;開啟後只隔離比現行 delay <b>更早</b>的新估計,且僅在 <code>capture_proxy_channel</code> 那一條 lane 仍在消除回音時;往後跳與首次取得對齊都不受影響)、<code>delay_backward_quarantine_s</code>(float,預設 1.0;隔離窗長,init 時換算成 hop 數,到期即採用——延後 pre-echo 誤鎖一個窗,不是治癒)。Quarantine 目前<b>只驗過合成場景與 C／Python 逐 hop 對照,真實錄音抽測待做</b>,產品組態維持預設 OFF。</p>
 
 <h3>PreFrame 契約(含新欄位 aligned_ref)</h3>
 <table>
 <tr><th>欄位</th><th>內容</th><th>擁有者/壽命</th></tr>
 <tr><td><code>token</code></td><td>frame_index/generation/owner_cookie/instance_epoch;<code>process_post()</code>/<code>abandon_pre()</code> 憑 token 驗序(replay、跨 instance、reset 後皆 SEQUENCE_ERROR)</td><td>copy 使用,不可修改</td></tr>
 <tr><td><code>delay</code></td><td><code>delay_samples/confidence/solid/changed</code>;<code>changed</code> 非零時外部 STFT/OLA 歷史須清除</td><td>值複製</td></tr>
-<tr><td><code>linear_interleaved</code></td><td>[hop][4] formed 線性誤差時域 hop(選定/crossfaded,WOLA 前)</td><td>pipeline-owned copy;有效至 post/reset/destroy</td></tr>
+<tr><td><code>linear_interleaved</code></td><td>[hop][4] formed 線性誤差時域 hop(選定/crossfaded 後的 WOLA 合成輸出)</td><td>pipeline-owned copy;有效至 post/reset/destroy</td></tr>
 <tr><td><code>linear_spectra[4]</code></td><td>各 lane 誤差頻譜 [n_freqs](<b>別名</b> lane 自己的 buffer,非 copy)</td><td>同上;reset 不保證清除,靠 token 閘與呼叫端自律</td></tr>
 <tr><td><code>aligned_ref</code>(2026-08-13 新增)</td><td>[hop] 本 hop 實際餵給四條 lane 的 delay-aligned 時域 far(ring 未滿時前導為 0)。給外部 NN post(Align-ULCNet far branch)用</td><td>pipeline-owned;有效至 post/<b>abandon_pre</b>/reset/destroy</td></tr>
 </table>
@@ -123,7 +123,7 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <p>n_freqs = 129(16k/256)/ 257(16k/512)/ 513(48k/1024)。</p>
 
 <h2>State 表</h2>
-<p>單一 caller pool,wrapper carve 順序 <code>self, core, srp, gsc, gsc_spectrum, gsc_weights</code>;核心自己再 carve 4 lane + NR + FFT + 工作 buffer。實測(16 kHz KISS,2026-08-13 probe / smoke)。<b>2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10</b>(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>);下表除「完整 wrapper 合計」一列已用今日 ne10 實測更新外,其餘 @16k/512 核心細項仍是 backend 切換前的 kiss 參考值,尚未按新預設重跑——ne10 待現查:</p>
+<p>單一 caller pool,wrapper carve 順序 <code>self, core, srp, gsc, gsc_spectrum, gsc_weights</code>;核心自己再 carve 4 lane + NR + FFT + 工作 buffer。<b>2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10</b>(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>)。下表的核心與完整 wrapper 合計均已同日重跑 ne10/kiss；未分 backend 的核心細項是 KISS breakdown 參考值:</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td>4× <code>Aec</code> lanes</td><td>1,516,288 B(@16k/512,kiss;ne10 待現查)</td><td>pool(core)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)</td></tr>
@@ -136,8 +136,8 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>GSC 借用 <code>srp-&gt;a_array</code></td></tr>
 <tr><td><code>GSC</code>(RLS P/weights)</td><td>4×n_freqs 級</td><td>pool(wrapper)</td><td>lambda 0.995 經 <code>mmse_lsa_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
 <tr><td>auto-VAD(<code>noise_power/vad_hangover</code>)</td><td>純量</td><td>C struct(wrapper)</td><td>-55 dBFS / SNR 3.0 / hangover 8(retimed);EMA 0.999/0.95(retimed)</td></tr>
-<tr><td>核心合計 @16k/512</td><td>1,662,240 B(ne10;kiss 舊值 1,669,088 B)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(kiss、<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,480,192 B(kiss 舊值 1,485,664 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
-<tr><td>完整 wrapper 合計</td><td>1,907,632 B @16k/256(預設)/ 6,811,936 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,2026-08-18 起的預設後端,layout_version=5);由 static smoke 的 <code>Total:</code> 行印出(kiss 舊值:1,910,640 B @16k/256 / 6,826,464 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
+<tr><td>核心合計 @16k/512</td><td>1,662,304 B(ne10;kiss 1,669,184 B)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,480,256 B(kiss 1,485,728 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
+<tr><td>完整 wrapper 合計</td><td>1,907,696 B @16k/256(預設)/ 6,812,000 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,2026-08-18 起的預設後端,layout_version=5);由 static smoke 的 <code>Total:</code> 行印出(kiss:1,910,736 B @16k/256 / 6,826,560 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

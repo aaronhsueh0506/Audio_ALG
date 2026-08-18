@@ -1619,7 +1619,7 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
     float* far_hist;
     float mic[RA_HOP * FOUR_AEC_NR_RES_CHANNELS];
     float far[RA_HOP];
-    int hop, i;
+    int hop;
     int previous_delay = 0;
     int previous_pending = -1;
     long previous_sweeps = 0;
