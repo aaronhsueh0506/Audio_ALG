@@ -12,6 +12,19 @@ void gtcrn_process_init(GTCRNProcessState* state)
     df_common_make_root_hann(state->window, GTCRN_WIN_LEN);
 }
 
+void gtcrn_model_input(const float spectrum[GTCRN_N_BINS][2],
+                       float features[GTCRN_N_BINS][3])
+{
+    if (!spectrum || !features) return;
+    for (int k = 0; k < GTCRN_N_BINS; ++k) {
+        float re = spectrum[k][0];
+        float im = spectrum[k][1];
+        features[k][0] = sqrtf(re * re + im * im + 1e-12f);
+        features[k][1] = re;
+        features[k][2] = im;
+    }
+}
+
 void gtcrn_model_state_init(GTCRNModelState* state)
 {
     if (state != NULL) memset(state, 0, sizeof(*state));

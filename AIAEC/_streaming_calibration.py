@@ -113,6 +113,44 @@ def input_range_report(arrays, policy):
     return report
 
 
+def _materialize_linear_error(pairs, linear_contract, grid, output_path):
+    """Derive linear-error stems from RAW microphone pairs, persistently.
+
+    Runs the checkpoint-matched frozen PBFDKF (the exact engine deployment
+    runs in C) hop by hop over every pair and writes the error stems beside
+    the calibration artifact, so the recorded tensors stay auditable and the
+    derived stems are reusable. Returns the pair list rewritten to use the
+    derived stems as primary, plus the directory they were written to.
+    """
+    import soundfile as sf
+
+    from AIAEC.inference_common import load_mic_far
+    from AIAEC.training_common import LinearAecEngine
+
+    root = str(output_path) + '_linear_error'
+    derived = []
+    for relative, primary_path, far_path in pairs:
+        mic, far, _rates = load_mic_far(primary_path, far_path, grid.sr)
+        engine = LinearAecEngine(n_lanes=1, sample_rate=grid.sr,
+                                 contract=linear_contract)
+        hops = []
+        length = mic.shape[-1]
+        for start in range(0, length, grid.hop_len):
+            stop = min(start + grid.hop_len, length)
+            error_hop, _ = engine(mic[:, start:stop], far[:, start:stop],
+                                  grid.sr)
+            hops.append(error_hop)
+        error = torch.cat(hops, dim=-1)[:, :length]
+        out_path = os.path.join(root, relative)
+        parent = os.path.dirname(out_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        sf.write(out_path, error.squeeze(0).cpu().numpy(), grid.sr,
+                 subtype='FLOAT')
+        derived.append((relative, out_path, far_path))
+    return derived, root
+
+
 def main(model_name: str) -> None:
     """Run one model's calib CLI; each model's inference.py names itself."""
     if model_name not in ALL_MODEL_NAMES:
@@ -131,6 +169,11 @@ def main(model_name: str) -> None:
     parser.add_argument('--onnx', default=None,
                         help='where to write the graph these tensors bind to '
                              '(default: <output>.onnx)')
+    parser.add_argument('--primary-is-mic', action='store_true',
+                        help='Align_ULCNet only: --primary-dir holds RAW '
+                             'microphone WAVs; the checkpoint-matched frozen '
+                             'PBFDKF derives the linear-error stems here and '
+                             'persists them beside the artifact')
     args = parser.parse_args()
     args.model_name = model_name
     if args.frames <= 0:
@@ -139,6 +182,10 @@ def main(model_name: str) -> None:
         artifact_format = resolve_calibration_format(args.output, args.format)
     except ValueError as error:
         parser.error(str(error))
+
+    if args.primary_is_mic and args.model_name != 'Align_ULCNet':
+        parser.error('--primary-is-mic applies only to Align_ULCNet; the '
+                     'end-to-end models take microphone WAVs natively')
 
     # Pairs are discovered before the model load and export, so a bad
     # --primary-dir/--far-dir fails on its own actionable error first.
@@ -150,7 +197,7 @@ def main(model_name: str) -> None:
     # deployment artifacts cannot drift apart.
     onnx_path = sibling_onnx_path(args.output, args.onnx)
     if args.model_name == 'Align_ULCNet':
-        model, grid, _linear_contract = load_ulcnet_model(
+        model, grid, linear_contract = load_ulcnet_model(
             args.checkpoint, 'cpu',
             max_delay_frames=args.max_delay_frames,
         )
@@ -159,6 +206,10 @@ def main(model_name: str) -> None:
         )
         input_names = ULCNET_INPUT_NAMES
         split = _ULCNET_SPLIT
+        if args.primary_is_mic:
+            pairs, _ = _materialize_linear_error(
+                pairs, linear_contract, grid, args.output
+            )
     else:
         model, grid = load_checkpoint_model(args.model_name, args.checkpoint)
         checkpoint_depth = alignment_depth(model)
@@ -243,6 +294,12 @@ def main(model_name: str) -> None:
         'win_len': int(grid.win_len),
         'hop_len': int(grid.hop_len),
         'input_feature_frames': 1,
+        'primary_source': (
+            'raw_mic_via_frozen_pbfdkf' if args.primary_is_mic
+            else 'materialized_primary_wavs'),
+        'derived_linear_error_dir': (
+            os.path.basename(str(args.output)) + '_linear_error'
+            if args.primary_is_mic else None),
         'calibration_far_input_mode': far_mode_provenance(
             args.model_name)[0],
         'deployment_far_input_mode': far_mode_provenance(

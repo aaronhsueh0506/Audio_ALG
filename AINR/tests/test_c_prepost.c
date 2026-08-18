@@ -421,6 +421,16 @@ static int test_gtcrn_model_state(void)
     for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
         h_dpgrnn[i] = &next.h_dpgrnn[i][0][0][0];
     }
+    {
+        static float spec_in[GTCRN_N_BINS][2];
+        static float feat_out[GTCRN_N_BINS][3];
+        spec_in[10][0] = 3.0f; spec_in[10][1] = 4.0f;
+        gtcrn_model_input(spec_in, feat_out);
+        CHECK(fabsf(feat_out[10][0] - 5.0f) < 1e-6f &&
+              feat_out[10][1] == 3.0f && feat_out[10][2] == 4.0f &&
+              feat_out[0][0] == sqrtf(1e-12f),
+              "GTCRN host feature: [sqrt(re^2+im^2+1e-12), re, im]");
+    }
     gtcrn_model_state_init(&state);
     CHECK(state.conv_cache[1][15][15][32] == 0.0f &&
           state.h_tra[GTCRN_MODEL_TRA_GRUS - 1][0][0][15] == 0.0f &&

@@ -34,21 +34,21 @@ try:
     from .checkpoint_utils import extract_state_dict
     from .model import GTCRN
     from .train import build_contract, require_checkpoint_contract
-    from .stream_model import StreamGTCRN, initial_inputs
+    from .stream_model import StreamGTCRN, initial_inputs, stream_features
 except ImportError:
     if _SCRIPT_DIR not in sys.path:
         sys.path.insert(0, _SCRIPT_DIR)
     from checkpoint_utils import extract_state_dict
     from model import GTCRN
     from train import build_contract, require_checkpoint_contract
-    from stream_model import StreamGTCRN, initial_inputs
+    from stream_model import StreamGTCRN, initial_inputs, stream_features
 
 
 
 # Kept numerically equal to GTCRN_MODEL_LAYOUT_VERSION in gtcrn_process.h,
 # which declares the caller-owned cache struct this graph consumes and emits.
 # tests/test_gtcrn_export_contract.py pins the two together.
-STATE_LAYOUT_VERSION = 3
+STATE_LAYOUT_VERSION = 4
 
 # One h_* tensor per GRU so each state slot names itself; only the temporal
 # conv history stays a combined cache. Encoder TRA GRUs first, then decoder,

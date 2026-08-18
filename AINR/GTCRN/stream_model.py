@@ -49,13 +49,29 @@ def initial_inputs(model):
     h_dpgrnn = [torch.zeros(inter.num_layers, width, inter.hidden_size)
                 for _ in range(2)]
     return (
-        torch.randn(1, bins, 1, 2),
+        # [mag, re, im]: the magnitude is computed by the HOST in fp32 (see
+        # gtcrn_model_input in gtcrn_process.c) so the sqrt never enters the
+        # quantized graph; channels 1:3 stay the raw spectrum for the CRM.
+        torch.randn(1, bins, 1, 3),
         # [enc/dec, channels, time, freq] -- no batch dim; the wrapper adds
         # and strips it at the graph boundary so PTQ sees a rank-4 tensor.
         torch.zeros(2, channels, depth, width),
         *h_tra,
         *h_dpgrnn,
     )
+
+
+def stream_features(spectrum_ri):
+    """Host-side model input from RI spectra: (..., 2) -> (..., 3).
+
+    [sqrt(re^2 + im^2 + 1e-12), re, im] -- the exact training feature stack,
+    computed in fp32 OUTSIDE the graph (C: gtcrn_model_input) so the sqrt
+    never enters the quantized domain.
+    """
+    real = spectrum_ri[..., 0]
+    imag = spectrum_ri[..., 1]
+    magnitude = (real.square() + imag.square() + 1e-12).sqrt()
+    return torch.stack((magnitude, real, imag), dim=-1)
 
 
 def _tra_step(tra, x, hidden):
@@ -155,9 +171,9 @@ class StreamGTCRN(nn.Module):
                 h_dpgrnn1, h_dpgrnn2):
         model = self.model
         conv_cache = conv_cache.unsqueeze(1)
-        real = spectrum[..., 0].permute(0, 2, 1)
-        imag = spectrum[..., 1].permute(0, 2, 1)
-        magnitude = (real.square() + imag.square() + 1e-12).sqrt()
+        magnitude = spectrum[..., 0].permute(0, 2, 1)
+        real = spectrum[..., 1].permute(0, 2, 1)
+        imag = spectrum[..., 2].permute(0, 2, 1)
         x = torch.stack((magnitude, real, imag), dim=1)
         x = model.sfe(model.erb.bm(x))
 
@@ -195,7 +211,7 @@ class StreamGTCRN(nn.Module):
             x = block(x + skips[4 - index])
 
         mask = model.erb.bs(x)
-        enhanced = model.mask(mask, spectrum.permute(0, 3, 2, 1))
+        enhanced = model.mask(mask, spectrum[..., 1:3].permute(0, 3, 2, 1))
         enhanced = enhanced.permute(0, 3, 2, 1)
         conv_out = torch.stack((
             torch.cat(enc_conv, dim=2),

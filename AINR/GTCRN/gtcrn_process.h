@@ -17,8 +17,11 @@ extern "C" {
  * h_* tensor; only the temporal conv history is a combined cache. */
 /* Version 3 dropped conv_cache's size-1 batch dim from the graph tensor
  * ([2,16,16,33] instead of [2,1,16,16,33]); the bytes in this struct are
- * unchanged, but the tensor rank is part of the binding contract. */
-#define GTCRN_MODEL_LAYOUT_VERSION 3
+ * unchanged, but the tensor rank is part of the binding contract. Version 4
+ * moved the magnitude feature to the host: the graph input is
+ * [1,GTCRN_N_BINS,1,3] = [mag, re, im] built by gtcrn_model_input(), so the
+ * sqrt never enters the quantized graph. */
+#define GTCRN_MODEL_LAYOUT_VERSION 4
 #define GTCRN_MODEL_CONV_SIDES     2
 #define GTCRN_MODEL_CONV_CHANNELS  16
 #define GTCRN_MODEL_CONV_TIME      16
@@ -55,6 +58,12 @@ typedef struct {
 void gtcrn_process_init(GTCRNProcessState* state);
 
 void gtcrn_model_state_init(GTCRNModelState* state);
+
+/* One model-input frame from one analysis frame: features[k] =
+ * [sqrt(re^2 + im^2 + 1e-12), re, im]. The magnitude runs HERE, in fp32,
+ * so the quantized graph starts at the ERB matmul (model layout v4). */
+void gtcrn_model_input(const float spectrum[GTCRN_N_BINS][2],
+                       float features[GTCRN_N_BINS][3]);
 
 /* Copy the accelerator's updated state outputs into the next-call inputs.
  *

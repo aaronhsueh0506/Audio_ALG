@@ -4,16 +4,18 @@ import pytest
 import torch
 
 from AINR.GTCRN.model import GTCRN
-from AINR.GTCRN.stream_model import StreamGTCRN, initial_inputs
+from AINR.GTCRN.stream_model import (StreamGTCRN, initial_inputs,
+                                     stream_features)
 
 
 def _run_stream(model, spectrum, poison_conv=False):
     stream = StreamGTCRN(model).eval()
     state = list(initial_inputs(model)[1:])
+    features = stream_features(spectrum)
     frames = []
     with torch.no_grad():
         for index in range(spectrum.shape[2]):
-            outputs = stream(spectrum[:, :, index:index + 1], *state)
+            outputs = stream(features[:, :, index:index + 1], *state)
             frames.append(outputs[0])
             state = list(outputs[1:])
             if poison_conv:
@@ -28,7 +30,7 @@ def _run_stream(model, spectrum, poison_conv=False):
 def test_stream_wrapper_matches_offline_random_weights(nfft, bins):
     torch.manual_seed(41)
     model = GTCRN(65, 64, nfft=nfft, fs=16000).eval()
-    assert initial_inputs(model)[0].shape == (1, bins, 1, 2)
+    assert initial_inputs(model)[0].shape == (1, bins, 1, 3)
     spectrum = torch.randn(1, bins, 12, 2)
     with torch.no_grad():
         offline = model(spectrum)

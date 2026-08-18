@@ -161,10 +161,12 @@ def calibration_main():
     try:
         from .export_onnx import (
             INPUT_NAMES, build_stream_model, export_graph, initial_inputs,
+            stream_features,
         )
     except ImportError:
         from export_onnx import (
             INPUT_NAMES, build_stream_model, export_graph, initial_inputs,
+            stream_features,
         )
 
     parser = argparse.ArgumentParser(description=calibration_main.__doc__)
@@ -230,7 +232,7 @@ def calibration_main():
             state = initial_inputs(stream_model.model)[1:]
             used = False
             for spectrum in spectra:
-                frame = spectrum[None, :, None, :]
+                frame = stream_features(spectrum)[None, :, None, :]
                 inputs = (frame,) + tuple(state)
                 capture_calibration_inputs(captured, INPUT_NAMES, inputs)
                 state = stream_model(*inputs)[1:]

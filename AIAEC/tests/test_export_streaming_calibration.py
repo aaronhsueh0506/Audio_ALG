@@ -210,3 +210,61 @@ def test_policy_tensors_carry_a_marker_instead_of_numeric_ranges(tmp_path):
         assert np.array_equal(loaded.reshape(value.shape[1:]), value[0])
     with pytest.raises(FileExistsError):
         write_calibration_artifact(output, arrays, {'frames': 8}, 'bin')
+
+
+def test_primary_is_mic_derives_and_persists_linear_error(tmp_path):
+    """--primary-is-mic runs the frozen PBFDKF on RAW mic pairs.
+
+    The derived linear-error stems must be written beside the artifact (the
+    recorded tensors stay auditable and reusable) and the manifest must say
+    where its primary came from -- a consumer pairing calibration with
+    training data has to be able to tell derived stems from materialized
+    ones. The derived stem must actually BE the engine's error: on this
+    echo-only scene it carries less energy than the raw microphone.
+    """
+    from AIAEC import _streaming_calibration as calibration
+    from AIAEC.Align_ULCNet import export_onnx as ulcnet_export  # noqa: F401
+
+    work = tmp_path
+    torch.manual_seed(59)
+    model = AlignULCNet(GRID, max_delay_frames=DEPTH).eval()
+    checkpoint = work / 'ckpt.pth'
+    _write_ulcnet_checkpoint(str(checkpoint), model)
+    # A genuinely cancellable pair: the microphone IS a delayed, attenuated
+    # copy of far, so the frozen PBFDKF must remove energy and the derived
+    # stem is distinguishable from a pass-through by RMS alone.
+    generator = torch.Generator().manual_seed(7)
+    samples = int(1.5 * GRID.sample_rate)
+    primary_dir = work / 'mic'
+    far_dir = work / 'farraw'
+    primary_dir.mkdir()
+    far_dir.mkdir()
+    far_wave = 0.25 * torch.randn(samples, generator=generator)
+    mic_wave = 0.3 * torch.roll(far_wave, 64)
+    sf.write(primary_dir / 'a.wav', mic_wave.numpy(), GRID.sample_rate,
+             subtype='FLOAT')
+    sf.write(far_dir / 'a.wav', far_wave.numpy(), GRID.sample_rate,
+             subtype='FLOAT')
+
+    capture = work / 'rawmic_calibration'
+    with _argv('inference.py',
+               '--checkpoint', str(checkpoint),
+               '--primary-dir', str(primary_dir),
+               '--far-dir', str(far_dir),
+               '--primary-is-mic',
+               '--output', str(capture),
+               '--frames', '8'):
+        calibration.main('Align_ULCNet')
+
+    manifest = json.loads((capture / 'manifest.json').read_text())
+    assert manifest['primary_source'] == 'raw_mic_via_frozen_pbfdkf'
+    assert manifest['derived_linear_error_dir'] == 'rawmic_calibration_linear_error'
+    derived = work / 'rawmic_calibration_linear_error' / 'a.wav'
+    assert derived.is_file()
+    error, sr = sf.read(derived)
+    mic, _ = sf.read(primary_dir / 'a.wav')
+    assert sr == GRID.sample_rate
+    assert len(error) == len(mic)
+    import numpy as np
+    assert float(np.sqrt((error ** 2).mean())) < float(
+        np.sqrt((mic ** 2).mean()))

@@ -197,7 +197,7 @@ def test_build_stream_model_follows_the_config_grid(tmp_path):
     )
     stream, grid = build_stream_model(_grid_config(tmp_path, 256), checkpoint)
     assert grid['n_fft'] == 256
-    assert initial_inputs(stream.model)[0].shape == (1, 129, 1, 2)
+    assert initial_inputs(stream.model)[0].shape == (1, 129, 1, 3)
 
     with pytest.raises(RuntimeError, match='size mismatch'):
         build_stream_model(_grid_config(tmp_path, 512), checkpoint)
