@@ -1188,7 +1188,7 @@ int four_aec_nr_res_process_pre(
     if (delay.changed) {
         /* Realign instead of reset: aec_apply_external_realign() shifts each
          * converged filter by the alignment delta (warm tap-transfer when the
-         * evidence gate holds, soft echo-path-change otherwise), so the
+         * evidence gate holds, a filter-only reset otherwise), so the
          * cancellation survives and the WOLA sequences continue. The old full
          * aec_reset() + OLA wipe produced one near-zero output hop plus
          * dozens of hops of re-exposed echo -- the spectrogram vertical line

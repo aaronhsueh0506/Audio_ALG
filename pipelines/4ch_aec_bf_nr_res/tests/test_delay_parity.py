@@ -43,6 +43,8 @@ from importlib import import_module
 import numpy as np
 import pytest
 
+from _scripted_delay import ScriptedDelay as _ScriptedEstimator
+
 _pipeline = import_module("pipelines.4ch_aec_bf_nr_res.pipeline")
 FourChannelAecConfig = _pipeline.FourChannelAecConfig
 FourChannelAecPipeline = _pipeline.FourChannelAecPipeline
@@ -385,50 +387,6 @@ def test_published_solid_survives_a_confidence_dip():
             assert state.delay_samples == accepted
             assert state.confidence == 0.5
     assert accepted is not None, "scene never acquired"
-
-
-class _ScriptedEstimator:
-    """Shim proxy that publishes a scripted ``(delay, solid)`` per hop.
-
-    Scripted rather than provoked, for the same reason the C side drives its
-    admission state machine directly (tests/test_4aec_nr_res.c): a live
-    DelayAec3 re-offers a movement on every hop once it has one, so a held
-    candidate is always resolved on the very next eligible hop and its TTL
-    never runs out.  Every scene in this file is therefore blind to the expiry
-    rule -- removing the countdown from either implementation leaves them
-    agreeing hop for hop -- so it is pinned here instead.
-    """
-
-    def __init__(self, script):
-        self._script = list(script)
-        self._index = -1
-
-    def accumulate(self, capture, render):
-        self._index += 1
-
-    def reset(self):
-        self._index = -1
-
-    @property
-    def _current(self):
-        index = min(self._index, len(self._script) - 1)
-        return self._script[max(index, 0)]
-
-    @property
-    def estimated_delay(self):
-        return self._current[0]
-
-    @property
-    def confidence(self):
-        return 1.0 if self._current[1] else 0.5
-
-    @property
-    def is_solid(self):
-        return bool(self._current[1])
-
-    @property
-    def _n_updates(self):
-        return 3
 
 
 def _scripted_changes(script):

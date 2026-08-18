@@ -586,7 +586,8 @@ long four_aec_nr_res_far_fft_real_compute_count(const FourAecNrRes* p);
  * Every hop that publishes `changed` sweeps all four lanes, so
  * the pair grows by exactly 4 on such a hop and not at all otherwise -- warm
  * (returned 1) means the learned IR was shifted and cancellation survived the
- * move, soft (returned 0) means that lane re-adapts from its current taps. A
+ * move, soft (returned 0) means the lane took a filter-only reset (taps and
+ * far history cleared, WOLA/framing untouched) and re-converges from zero. A
  * sweep that adds fewer than 4 means a lane rejected the call outright, which
  * is a wiring fault, not a soft realign. Nothing branches on either count. */
 long four_aec_nr_res_realign_warm_lane_count(const FourAecNrRes* p);

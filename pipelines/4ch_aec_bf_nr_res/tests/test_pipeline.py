@@ -5,6 +5,8 @@ from importlib import import_module
 import numpy as np
 import pytest
 
+from _scripted_delay import ScriptedDelay as _ScriptedDelay
+
 _pipeline = import_module("pipelines.4ch_aec_bf_nr_res.pipeline")
 BeamformerFrame = _pipeline.BeamformerFrame
 EqualWeightBeamformer = _pipeline.EqualWeightBeamformer
@@ -273,50 +275,6 @@ _REALIGN_HOP = 128
 _REALIGN_DELAY = 300        # inside the lanes' 896-sample tap span at this grid
 _REALIGN_CONVERGE = 160     # hops served at the raw alignment first
 _REALIGN_WATCH = 8          # hops watched after the change
-
-
-class _ScriptedDelay:
-    """Publish a scripted ``(delay, solid)`` per hop.
-
-    Scripted rather than provoked, for the same reason ``_ScriptedEstimator``
-    in the sibling test_delay_parity.py is (kept separate rather than imported,
-    because that module shells out to a C build at test time and this one is
-    pure Python): a live DelayAec3 decides WHEN it locks, and this test is
-    about what the pipeline does on the hop it locks, not about the estimator.
-    The physical echo path never moves -- only the published alignment does --
-    so the lanes' converged response has to travel exactly ``_REALIGN_DELAY``
-    taps to stay matched, which is precisely what the realign is for.
-    """
-
-    def __init__(self, script):
-        self._script = list(script)
-        self._index = -1
-
-    def accumulate(self, capture, render):
-        self._index += 1
-
-    def reset(self):
-        self._index = -1
-
-    @property
-    def _current(self):
-        return self._script[min(max(self._index, 0), len(self._script) - 1)]
-
-    @property
-    def estimated_delay(self):
-        return self._current[0]
-
-    @property
-    def confidence(self):
-        return 1.0 if self._current[1] else 0.5
-
-    @property
-    def is_solid(self):
-        return bool(self._current[1])
-
-    @property
-    def _n_updates(self):
-        return 3
 
 
 def _realign_scene():

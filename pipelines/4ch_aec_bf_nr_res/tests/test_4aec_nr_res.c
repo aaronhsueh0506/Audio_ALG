@@ -1575,6 +1575,33 @@ typedef struct RealignRun {
     long soft;
 } RealignRun;
 
+/* Shared synthesis for the realign/admission scenes: xorshift far history
+ * and one hop of 4-lane echo at the given dominant delay (optional
+ * simultaneous second path at delay_b when second_gain > 0). */
+static void realign_scene_history(float* far_hist, int count) {
+    uint32_t rng = 0x1234567u;
+    int i;
+    for (i = 0; i < count; ++i) {
+        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
+        far_hist[i] = 0.25f *
+            (((float)(rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
+    }
+}
+
+static void realign_scene_hop(const float* far_hist, int base, int hop_len,
+                              int dominant, float second_gain, int delay_b,
+                              float* mic, float* far) {
+    int i, ch;
+    for (i = 0; i < hop_len; ++i) {
+        int t = base + i;
+        float echo = 0.6f * far_hist[t - dominant];
+        if (second_gain > 0.0f) echo += second_gain * far_hist[t - delay_b];
+        far[i] = far_hist[t];
+        for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+            mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo;
+    }
+}
+
 /* Drives one 16 kHz/hop-256 MATCHED scene and reports what the shared
  * alignment did. The echo is a single path at `delay_a`, except:
  *   second_gain > 0  adds a SIMULTANEOUS second path at delay_b (an
@@ -1592,8 +1619,7 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
     float* far_hist;
     float mic[RA_HOP * FOUR_AEC_NR_RES_CHANNELS];
     float far[RA_HOP];
-    uint32_t rng = 0x1234567u;
-    int hop, i, ch;
+    int hop, i;
     int previous_delay = 0;
     int previous_pending = -1;
     long previous_sweeps = 0;
@@ -1610,10 +1636,7 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
 
     far_hist = (float*)malloc((size_t)(hops * RA_HOP + RA_PAD) * sizeof(float));
     if (!far_hist) { four_aec_nr_res_destroy(p); return; }
-    for (i = 0; i < hops * RA_HOP + RA_PAD; ++i) {
-        rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-        far_hist[i] = 0.25f * (((float)(rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
-    }
+    realign_scene_history(far_hist, hops * RA_HOP + RA_PAD);
 
     for (hop = 0; hop < hops; ++hop) {
         FourAecNrResPreFrame pre;
@@ -1623,14 +1646,8 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
         long sweeps;
         if (shift_at >= 0 && hop >= shift_at) dominant = delay_b;
         if (wander_hops > 0 && ((hop / wander_hops) % 2)) dominant = delay_b;
-        for (i = 0; i < RA_HOP; ++i) {
-            int t = base + i;
-            float echo = 0.6f * far_hist[t - dominant];
-            if (second_gain > 0.0f) echo += second_gain * far_hist[t - delay_b];
-            far[i] = far_hist[t];
-            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
-                mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo;
-        }
+        realign_scene_hop(far_hist, base, RA_HOP, dominant, second_gain,
+                          delay_b, mic, far);
         if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
             FOUR_AEC_NR_RES_OK) break;
 
@@ -1798,7 +1815,6 @@ static void test_delay_change_candidate_ttl(void) {
     const int applied = 512;        /* the alignment in force */
     const int moved = 1024;         /* a movement far outside the band */
     FourAecDelayAdmission a;
-    RealignRun scene_unused;
     FourAecNrResConfig cfg;
     FourAecNrRes* p;
     char label[224];
@@ -1806,8 +1822,6 @@ static void test_delay_change_candidate_ttl(void) {
     int held_hop = -1;
     int candidate_before_reset = -1;
     int candidate_after_reset = 0;
-
-    (void)scene_unused;
 
     /* Offered once, repeated on the very next hop: admitted, and nothing is
      * left held afterwards. */
@@ -1880,25 +1894,15 @@ static void test_delay_change_candidate_ttl(void) {
             (size_t)(TR_HOPS * TR_HOP + TR_PAD) * sizeof(float));
         float mic[TR_HOP * FOUR_AEC_NR_RES_CHANNELS];
         float far[TR_HOP];
-        uint32_t rng = 0x1234567u;
-        int hop, ch;
+        int hop;
         if (far_hist) {
-            for (i = 0; i < TR_HOPS * TR_HOP + TR_PAD; ++i) {
-                rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
-                far_hist[i] = 0.25f *
-                    (((float)(rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
-            }
+            realign_scene_history(far_hist, TR_HOPS * TR_HOP + TR_PAD);
             for (hop = 0; hop < TR_HOPS && held_hop < 0; ++hop) {
                 FourAecNrResPreFrame pre;
                 int base = hop * TR_HOP + TR_PAD;
                 int dominant = ((hop / 100) % 2) ? 1024 : 512;
-                for (i = 0; i < TR_HOP; ++i) {
-                    int t = base + i;
-                    float echo = 0.6f * far_hist[t - dominant];
-                    far[i] = far_hist[t];
-                    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
-                        mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo;
-                }
+                realign_scene_hop(far_hist, base, TR_HOP, dominant, 0.0f, 0,
+                                  mic, far);
                 if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
                     FOUR_AEC_NR_RES_OK) break;
                 four_aec_nr_res_abandon_pre(p, &pre.token);

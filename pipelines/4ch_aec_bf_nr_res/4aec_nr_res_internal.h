@@ -1,5 +1,8 @@
 /**
- * Internal seam shared only by the complete SRP/GSC wrapper and its tests.
+ * Internal seams. Two kinds live here: the trusted-spectrum post entry
+ * shared only by the complete SRP/GSC wrapper and its tests, and the
+ * core-internal delay-admission state machine (exposed non-static so the
+ * core's own tests can drive TTL expiry directly).
  * Public external beamformers must use four_aec_nr_res_process_post(), which
  * reconstructs the mono error from the supplied weights and therefore does
  * not trust a second independently supplied spectrum.
