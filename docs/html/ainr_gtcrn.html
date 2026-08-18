@@ -65,8 +65,8 @@ for (each hop of 256 new samples) {
     gtcrn_analysis(&amp;st, in256, spec);      /* 未正規化 RFFT 一框 */
     /* 模型推論 (圖內含特徵抽取與 CRM 套用):
      * (1, 257, 1, 2) -> (1, 257, 1, 2)  — 本 C 模組刻意不含模型 */
-    run_model(spec, enhanced);
-    gtcrn_synthesis(&amp;st, enhanced, out256); /* WOLA, 256 samples */
+    run_model(spec, output);
+    gtcrn_synthesis(&amp;st, output, out256); /* WOLA, 256 samples */
 }</pre>
 <p class="note">Python 離線:<code>inference.py --config config.ini --model ckpt.pt --input in.wav --output out.wav</code>
 (整段 <code>torch.stft</code> → <code>model(spec)</code> → <code>torch.istft</code>)。</p>
@@ -92,7 +92,7 @@ spec [257][2]  ------------------------------------------+
    ERB.bs: 129 -> 257;  Mask (CRM) * spec_ref  <---------+
    |
    v
-enhanced [257][2]
+output [257][2]
    |
    v
 gtcrn_synthesis                     st.synthesis_buf OLA
@@ -110,7 +110,7 @@ lane \ hop      | n=0             | n=1             | n=2 (穩態)
 caller          | in256 f0 進     | f1 進           | f2 進
 C pre           | spec f0         | spec f1         | spec f2
  (gtcrn_analysis)| (窗前半為 0)   |                 |
-model (NPU)     | enhanced f0     | enhanced f1     | enhanced f2
+model (NPU)     | output f0       | output f1       | output f2
                 | (cache 全零起始)| (cache 累積中)  |
 C post          | audio 出 256s   | audio 出 256s   | audio 出 256s
  (gtcrn_synthesis)| (OLA 前半暖機) |                 |
@@ -136,10 +136,10 @@ DPGRNN、decoder、CRM 全在圖內);圖外只有 C 的 STFT/WOLA。
 <code>export_onnx.py</code> 已交付 one-frame stateless graph；cache 尺寸由
 <code>stream_model.initial_inputs(model)</code> 從 module tree 推導（不寫死 grid：
 spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder stride），
-三組 cache 都由 host 作為 graph input/output 送回，加速器本身不保存跨次呼叫狀態。
+conv_cache 與八顆 h_* state 都由 host 作為 graph input/output 送回，加速器本身不保存跨次呼叫狀態。
 匯出不再 pin 單一 grid——config 與 checkpoint 不成對時在 strict
 <code>load_state_dict</code>（形狀）或 checkpoint contract（同形語意）就大聲失敗；
-因 ERB split 固定 65+64=129，n_fft 改變時三組 cache 尺寸不變、只有 <code>mix</code>
+因 ERB split 固定 65+64=129，n_fft 改變時所有 state 尺寸不變、只有 <code>input</code>
 寬度改變。<code>inference.py calib</code> 會在同一 process 同一 model instance
 一併匯出並 parity-check graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改）。</p>
 <div class="tbl"><table>
@@ -149,8 +149,14 @@ spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder
 <tr><td><code>window</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>root-Hann,init 後不變</td></tr>
 <tr><td><code>scratch_re/im</code></td><td>[512] ×2</td><td>4,096</td><td>C struct</td><td>非跨呼叫</td></tr>
 <tr><td><code>conv_cache</code></td><td>(2,1,16,16,33)</td><td>67,584(16,896 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder+decoder depth-conv 時間快取</td></tr>
-<tr><td><code>tra_cache</code></td><td>(2,3,1,1,16)</td><td>384(96 f32)</td><td>host caller</td><td>顯式 graph I/O；6 個 TRA <code>att_gru</code> hidden</td></tr>
-<tr><td><code>inter_cache</code></td><td>(2,1,33,16)</td><td>4,224(1,056 f32)</td><td>host caller</td><td>顯式 graph I/O；2 個 DPGRNN inter hidden</td></tr>
+<tr><td><code>h_tra_enc0</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 0 個)</td></tr>
+<tr><td><code>h_tra_enc1</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 1 個)</td></tr>
+<tr><td><code>h_tra_enc2</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 2 個)</td></tr>
+<tr><td><code>h_tra_dec0</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；decoder TRA <code>att_gru</code> hidden(第 0 個)</td></tr>
+<tr><td><code>h_tra_dec1</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；decoder TRA <code>att_gru</code> hidden(第 1 個)</td></tr>
+<tr><td><code>h_tra_dec2</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；decoder TRA <code>att_gru</code> hidden(第 2 個);6 個 <code>h_tra_*</code> 合計 384 bytes(96 f32)</td></tr>
+<tr><td><code>h_dpgrnn1</code></td><td>(1,33,16)</td><td>2,112(528 f32)</td><td>host caller</td><td>顯式 graph I/O；DPGRNN inter hidden(層 1)</td></tr>
+<tr><td><code>h_dpgrnn2</code></td><td>(1,33,16)</td><td>2,112(528 f32)</td><td>host caller</td><td>顯式 graph I/O；DPGRNN inter hidden(層 2);2 個 <code>h_dpgrnn*</code> 合計 4,224 bytes(1,056 f32)</td></tr>
 </table></div>
 <p class="note"><code>sizeof(GTCRNProcessState)</code> = 10,240 bytes(本機量測)。
 本目錄 <code>model.py</code> 無 cache 介面;上表 NPU 狀態 shape 逐一取自

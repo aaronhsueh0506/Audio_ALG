@@ -77,9 +77,9 @@ def blocks_from_pair(model_name, model, grid, primary_path, far_path,
               else load_mic_far)
     primary, far, _ = loader(str(primary_path), str(far_path), grid.sr)
     tensors = {
-        ('linear_error_ri' if model_name in LINEAR_ERROR_MODELS
-         else 'microphone_ri'): _ri(stft(primary, grid)),
-        'far_end_ri': _ri(stft(far, grid)),
+        ('error' if model_name in LINEAR_ERROR_MODELS
+         else 'mic'): _ri(stft(primary, grid)),
+        'far': _ri(stft(far, grid)),
     }
     time_axis = {name: 1 for name in tensors}
     total = tensors[next(iter(tensors))].shape[time_axis[next(iter(tensors))]]

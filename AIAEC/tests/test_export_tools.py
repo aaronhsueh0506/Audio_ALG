@@ -99,8 +99,8 @@ def test_calibration_block_removes_only_the_runtime_batch_axis(tmp_path):
     model = CAGCRN(GRID).eval()
     block = next(blocks_from_pair(
         'CAGCRN', model, AEC_GRID, primary, far, frames=4))
-    assert block['microphone_ri'].shape == (4, GRID.n_freqs, 2)
-    assert block['far_end_ri'].shape == (4, GRID.n_freqs, 2)
+    assert block['mic'].shape == (4, GRID.n_freqs, 2)
+    assert block['far'].shape == (4, GRID.n_freqs, 2)
 
 
 def test_align_ulcnet_calibration_far_is_the_raw_input_waveform(tmp_path):
@@ -120,6 +120,6 @@ def test_align_ulcnet_calibration_far_is_the_raw_input_waveform(tmp_path):
         stft(far_wave.unsqueeze(0), AEC_GRID).transpose(-2, -1)
     )[0, :4]
     torch.testing.assert_close(
-        torch.from_numpy(block['far_end_ri']), expected,
+        torch.from_numpy(block['far']), expected,
         rtol=0.0, atol=2e-6,
     )

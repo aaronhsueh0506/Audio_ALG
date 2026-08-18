@@ -59,7 +59,7 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 <tr><td>DeepFilterNet2</td><td>3-frame ERB/complex feature + explicit recurrent/DF state</td>
 <td>mask/DF/alpha heads + next state</td><td><code>DeepFilterNet2/dfn2_process.c/h</code></td></tr>
 <tr><td>GTCRN</td><td>one spectrum + conv/TRA/inter caches</td>
-<td>enhanced spectrum + next caches</td><td><code>GTCRN/gtcrn_process.c/h</code></td></tr>
+<td>output spectrum + next caches</td><td><code>GTCRN/gtcrn_process.c/h</code></td></tr>
 <tr><td>DeepFilterNet3</td><td>comparison model；無 production ONNX contract</td>
 <td>—</td><td><code>DeepFilterNet3/dfn3_process.c/h</code></td></tr>
 </table>
@@ -68,8 +68,8 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 
 <table>
 <tr><th>Model</th><th>Graph input/state</th><th>Graph output</th><th>C 前後處理</th></tr>
-<tr><td>Align-ULCNet</td><td>linear error + far + K/V/logit ring + two GRU states</td>
-<td>enhanced RI + state delta</td><td><code>Align_ULCNet/ulcnet_process.c/h</code>、
+<tr><td>Align-ULCNet</td><td>error + far + K/V/logit ring + two GRU states</td>
+<td>output + state delta</td><td><code>Align_ULCNet/ulcnet_process.c/h</code>、
 <code>ulcnet_model_io.c/h</code></td></tr>
 <tr><td>Align-CRUSE</td><td>mic + far + conv/GRU/alignment state</td>
 <td>real mask + next state</td><td><code>AIAEC/aiaec_process.c/h</code></td></tr>
@@ -86,7 +86,7 @@ calibration manifest 與 CPU descriptor 必須使用相同 D。</p>
 <h2>Calibration signal seam</h2>
 
 <p>AINR calibration 的 WAV 是 noisy speech。AIAEC E2E models 使用
-microphone + far。Align-ULCNet 使用已產生的 linear_error + raw far；
+mic + far。Align-ULCNet 使用已產生的 error + raw far；
 manifest 會另外記錄產品部署輸入是 aligned far，避免把校正資料來源與
 board wiring 混為一談。</p>
 

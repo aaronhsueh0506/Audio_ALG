@@ -411,15 +411,24 @@ static int test_gtcrn_model_state(void)
     static GTCRNModelState state;
     static GTCRNModelState next;
     static GTCRNModelState committed;
+    const float* h_tra[GTCRN_MODEL_TRA_GRUS];
+    const float* h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS];
+    const float* broken[GTCRN_MODEL_TRA_GRUS];
+    int i;
+    for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
+        h_tra[i] = &next.h_tra[i][0][0][0];
+    }
+    for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
+        h_dpgrnn[i] = &next.h_dpgrnn[i][0][0][0];
+    }
     gtcrn_model_state_init(&state);
     CHECK(state.conv_cache[1][0][15][15][32] == 0.0f &&
-          state.tra_cache[1][2][0][0][15] == 0.0f &&
-          state.inter_cache[1][0][32][15] == 0.0f,
+          state.h_tra[GTCRN_MODEL_TRA_GRUS - 1][0][0][15] == 0.0f &&
+          state.h_dpgrnn[1][0][32][15] == 0.0f,
           "GTCRN model state starts at zero");
     memset(&next, 0x5a, sizeof(next));
     CHECK(gtcrn_model_state_commit(&state, &next.conv_cache[0][0][0][0][0],
-                                   &next.tra_cache[0][0][0][0][0],
-                                   &next.inter_cache[0][0][0][0]) == 0,
+                                   h_tra, h_dpgrnn) == 0,
           "GTCRN commit accepts a finite state");
     CHECK(memcmp(&state, &next, sizeof(state)) == 0,
           "GTCRN state outputs become the next invocation inputs");
@@ -431,32 +440,33 @@ static int test_gtcrn_model_state(void)
      * indistinguishable from a clean refusal. */
     committed = state;
     memset(&next, 0x41, sizeof(next));
-    next.inter_cache[1][0][32][15] = NAN;
+    next.h_dpgrnn[1][0][32][15] = NAN;
     CHECK(gtcrn_model_state_commit(&state, &next.conv_cache[0][0][0][0][0],
-                                   &next.tra_cache[0][0][0][0][0],
-                                   &next.inter_cache[0][0][0][0]) != 0,
-          "GTCRN commit refuses a NaN cache");
+                                   h_tra, h_dpgrnn) != 0,
+          "GTCRN commit refuses a NaN state");
     CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
           "GTCRN NaN refusal leaves the previous state byte-identical");
 
-    /* The bad element sits in the FIRST cache here, so the two cases together
-     * also cover refusal before and after the earlier caches are validated. */
+    /* The bad element sits in the FIRST tensor here, so the two cases
+     * together cover refusal before and after the earlier ones validate. */
     memset(&next, 0x41, sizeof(next));
     next.conv_cache[0][0][0][0][0] = INFINITY;
     CHECK(gtcrn_model_state_commit(&state, &next.conv_cache[0][0][0][0][0],
-                                   &next.tra_cache[0][0][0][0][0],
-                                   &next.inter_cache[0][0][0][0]) != 0,
-          "GTCRN commit refuses an Inf cache");
+                                   h_tra, h_dpgrnn) != 0,
+          "GTCRN commit refuses an Inf state");
     CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
           "GTCRN Inf refusal leaves the previous state byte-identical");
 
+    for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
+        broken[i] = h_tra[i];
+    }
+    broken[3] = NULL;
     CHECK(gtcrn_model_state_commit(NULL, &next.conv_cache[0][0][0][0][0],
-                                   &next.tra_cache[0][0][0][0][0],
-                                   &next.inter_cache[0][0][0][0]) != 0 &&
-          gtcrn_model_state_commit(&state, NULL,
-                                   &next.tra_cache[0][0][0][0][0],
-                                   &next.inter_cache[0][0][0][0]) != 0,
-          "GTCRN commit refuses null arguments");
+                                   h_tra, h_dpgrnn) != 0 &&
+          gtcrn_model_state_commit(&state, NULL, h_tra, h_dpgrnn) != 0 &&
+          gtcrn_model_state_commit(&state, &next.conv_cache[0][0][0][0][0],
+                                   broken, h_dpgrnn) != 0,
+          "GTCRN commit refuses null arguments and null h elements");
     CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
           "GTCRN preserved state survives every refused commit");
 
@@ -464,8 +474,7 @@ static int test_gtcrn_model_state(void)
      * could be a permanent latch rather than a per-call check. */
     memset(&next, 0x41, sizeof(next));
     CHECK(gtcrn_model_state_commit(&state, &next.conv_cache[0][0][0][0][0],
-                                   &next.tra_cache[0][0][0][0][0],
-                                   &next.inter_cache[0][0][0][0]) == 0 &&
+                                   h_tra, h_dpgrnn) == 0 &&
           memcmp(&state, &next, sizeof(state)) == 0,
           "GTCRN commit still accepts a finite state after a refusal");
     return 1;

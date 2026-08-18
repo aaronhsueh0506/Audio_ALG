@@ -49,14 +49,14 @@ def test_streaming_export_shapes_are_fixed_and_delta_only():
     assert shapes['key_history'] == (1, 32, D - 1, 26)
     assert shapes['value_history'] == (1, 32, D - 1, 26)
     assert shapes['logit_history'] == (1, 32, 4, D)
-    assert shapes['gru0_hidden'] == (2, 1, 128)
+    assert shapes['h_gru0'] == (2, 1, 128)
     assert INPUT_NAMES == (
-        'linear_error_ri', 'far_end_ri', 'key_history', 'value_history',
-        'logit_history', 'gru0_hidden', 'gru1_hidden',
+        'error', 'far', 'key_history', 'value_history',
+        'logit_history', 'h_gru0', 'h_gru1',
     )
     assert OUTPUT_NAMES == (
-        'enhanced_ri', 'key_now', 'value_now', 'logit_now',
-        'gru0_hidden_next', 'gru1_hidden_next',
+        'output', 'key_now', 'value_now', 'logit_now',
+        'h_gru0_out', 'h_gru1_out',
     )
 
 

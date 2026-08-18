@@ -168,7 +168,7 @@ def test_policy_tensors_carry_a_marker_instead_of_numeric_ranges(tmp_path):
     arrays = {
         'state_align_score_sum': np.full((8, 1), 3.5, dtype=np.float32),
         'state_align_frame_index': np.arange(8, dtype=np.int64),
-        'linear_error_ri': np.random.RandomState(3).randn(
+        'error': np.random.RandomState(3).randn(
             8, 1, 257, 2
         ).astype(np.float32),
     }
@@ -181,7 +181,7 @@ def test_policy_tensors_carry_a_marker_instead_of_numeric_ranges(tmp_path):
         # The shape/dtype record stays: a consumer still has to allocate it.
         assert entry['shape'] and entry['dtype']
 
-    plain = report['linear_error_ri']
+    plain = report['error']
     assert 'precision' not in plain
     assert plain['min'] <= plain['p001'] <= plain['p999'] <= plain['max']
 

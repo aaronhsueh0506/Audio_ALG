@@ -35,7 +35,7 @@ static int all_zero(const float *values, size_t count) {
 static void write_outputs(UlcnetModelIoOutputs *outputs, float base) {
     size_t index;
     for (index = 0; index < outputs->spectrum_ri_elements; ++index)
-        outputs->enhanced_ri[index] = base + 50000.0f + (float)index;
+        outputs->output[index] = base + 50000.0f + (float)index;
     for (index = 0; index < outputs->key_now_elements; ++index)
         outputs->key_now[index] = base + (float)index;
     for (index = 0; index < outputs->value_now_elements; ++index)
@@ -43,8 +43,8 @@ static void write_outputs(UlcnetModelIoOutputs *outputs, float base) {
     for (index = 0; index < outputs->logit_now_elements; ++index)
         outputs->logit_now[index] = base + 20000.0f + (float)index;
     for (index = 0; index < outputs->gru_hidden_elements; ++index) {
-        outputs->gru0_hidden_next[index] = base + 30000.0f + (float)index;
-        outputs->gru1_hidden_next[index] = base + 40000.0f + (float)index;
+        outputs->h_gru0_out[index] = base + 30000.0f + (float)index;
+        outputs->h_gru1_out[index] = base + 40000.0f + (float)index;
     }
 }
 
@@ -124,10 +124,10 @@ int main(void) {
                                   &inputs, &outputs) == 0);
     CHECK(inputs.spectrum_ri_elements == 514u);
     CHECK(outputs.spectrum_ri_elements == 514u);
-    CHECK(inputs.linear_error_ri[2u * 17u] == error_re[17]);
-    CHECK(inputs.linear_error_ri[2u * 17u + 1u] == error_im[17]);
-    CHECK(inputs.far_end_ri[2u * 31u] == far_re[31]);
-    CHECK(inputs.far_end_ri[2u * 31u + 1u] == far_im[31]);
+    CHECK(inputs.error[2u * 17u] == error_re[17]);
+    CHECK(inputs.error[2u * 17u + 1u] == error_im[17]);
+    CHECK(inputs.far[2u * 31u] == far_re[31]);
+    CHECK(inputs.far[2u * 31u + 1u] == far_im[31]);
     CHECK(inputs.key_history_elements ==
           32u * 7u * ULCNET_MODEL_IO_TA_BINS);
     CHECK(inputs.logit_history_elements == 32u * 4u * 8u);
@@ -136,10 +136,10 @@ int main(void) {
     CHECK(all_zero(inputs.key_history, inputs.key_history_elements));
     CHECK(all_zero(inputs.value_history, inputs.value_history_elements));
     CHECK(all_zero(inputs.logit_history, inputs.logit_history_elements));
-    CHECK(all_zero(inputs.gru0_hidden, inputs.gru_hidden_elements));
-    CHECK(isnan(outputs.enhanced_ri[0]));
+    CHECK(all_zero(inputs.h_gru0, inputs.gru_hidden_elements));
+    CHECK(isnan(outputs.output[0]));
     CHECK(isnan(outputs.key_now[0]));
-    CHECK(isnan(outputs.gru1_hidden_next[0]));
+    CHECK(isnan(outputs.h_gru1_out[0]));
 
     write_outputs(&outputs, 1.0f);
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
@@ -155,8 +155,8 @@ int main(void) {
     /* Logits are chronological: t-4,t-3,t-2,t-1. */
     CHECK(inputs.logit_history[0] == 0.0f);
     CHECK(inputs.logit_history[3u * logit_frame] == 20001.0f);
-    CHECK(inputs.gru0_hidden[0] == 30001.0f);
-    CHECK(inputs.gru1_hidden[0] == 40001.0f);
+    CHECK(inputs.h_gru0[0] == 30001.0f);
+    CHECK(inputs.h_gru1[0] == 40001.0f);
 
     /* A partial accelerator write must not advance persistent state. */
     outputs.key_now[0] = 7.0f;
@@ -169,7 +169,7 @@ int main(void) {
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(inputs.key_history[0] == 1.0f);
-    CHECK(inputs.gru0_hidden[0] == 30001.0f);
+    CHECK(inputs.h_gru0[0] == 30001.0f);
 
     write_outputs(&outputs, 2.0f);
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
@@ -179,7 +179,7 @@ int main(void) {
     CHECK(inputs.key_history[feature] == 1.0f);
     CHECK(inputs.logit_history[2u * logit_frame] == 20001.0f);
     CHECK(inputs.logit_history[3u * logit_frame] == 20002.0f);
-    CHECK(inputs.gru0_hidden[0] == 30002.0f);
+    CHECK(inputs.h_gru0[0] == 30002.0f);
 
     ulcnet_model_io_reset(state);
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
@@ -187,8 +187,8 @@ int main(void) {
     CHECK(all_zero(inputs.key_history, inputs.key_history_elements));
     CHECK(all_zero(inputs.value_history, inputs.value_history_elements));
     CHECK(all_zero(inputs.logit_history, inputs.logit_history_elements));
-    CHECK(all_zero(inputs.gru0_hidden, inputs.gru_hidden_elements));
-    CHECK(all_zero(inputs.gru1_hidden, inputs.gru_hidden_elements));
+    CHECK(all_zero(inputs.h_gru0, inputs.gru_hidden_elements));
+    CHECK(all_zero(inputs.h_gru1, inputs.gru_hidden_elements));
     return 0;
 }
 '''

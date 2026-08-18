@@ -108,9 +108,9 @@ hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本
 開機打印之實測，B=1、16k）：</p>
 <table>
 <tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
-<tr><td>microphone</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
-<tr><td>far_end</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
-<tr><td>enhanced</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>mic</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>output</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
 <tr><td>mask（bounded CRM）</td><td>out</td><td>(1, 2, 1, 257)</td><td>float32</td><td>1</td><td>—</td></tr>
 <tr><td>delay_distribution</td><td>out</td><td>(1, 1, 63)</td><td>float32</td><td>1</td><td>—</td></tr>
 <tr><td>aux erb_mask</td><td>out</td><td>(1, 2, 1, 97)</td><td>float32</td><td>1</td><td>—</td></tr>
@@ -128,7 +128,7 @@ state I/O，由 host caller 保存；STFT/ISTFT 屬 C struct 層：</p>
 <tr><td>cata_query / cata_key / cata_ref_kv .history</td><td>(1,12,2,49) / (1,24,2,49) / (1,12,2,49)</td><td>4.6 / 9.2 / 4.6 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>mic_enc0..3_group.history</td><td>(1,12,2,49) / (1,12,2,25) / (1,12,4,25) / (1,24,8,25)</td><td>4.6 / 2.3 / 4.7 / 18.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>far_enc0..3_group.history</td><td>(1,12,2,49) / (1,24,2,25) / (1,24,4,25) / (1,24,8,25)</td><td>4.6 / 4.7 / 9.4 / 18.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
-<tr><td>mic_tfgru_time / far_tfgru_time .hidden（per-bin）</td><td>(1, 25, 24) ×2</td><td>2.3 KB ×2</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>h_mic_tfgru_time / h_far_tfgru_time（per-bin）</td><td>(1, 25, 24) ×2</td><td>2.3 KB ×2</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>tfag_time1 / tfag_time2 .history</td><td>(1,12,4,25) / (1,12,8,25)</td><td>4.7 / 9.4 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>dec0..3_group.history</td><td>(1,24,8,25) / (1,12,4,25) / (1,12,2,49) / (1,12,2,97)</td><td>18.8 / 4.7 / 4.6 / 9.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td><b>NN 合計</b></td><td></td><td><b>431.7 KB</b></td><td></td></tr>

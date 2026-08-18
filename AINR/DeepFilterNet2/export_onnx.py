@@ -43,15 +43,18 @@ INPUT_FRAMES = 3
 
 # Kept numerically equal to DFN2_MODEL_IO_LAYOUT_VERSION in dfn2_model_io.h,
 # which declares the caller-owned state struct this graph consumes and emits.
-# tests/test_dfn2_contract.py pins the two together.
-STATE_LAYOUT_VERSION = 1
+# tests/test_dfn2_contract.py pins the two together. Tensor names are part of
+# this contract: runtimes bind by name.
+STATE_LAYOUT_VERSION = 2
 
+# Content inputs carry content names (two feature streams); each GRU hidden
+# is its own h_* tensor; the deep-filter pathway history is a combined cache.
 INPUT_NAMES = (
-    'feat_erb_window',
-    'feat_spec_window',
-    'encoder_gru_hidden',
-    'erb_gru_hidden',
-    'df_gru_hidden',
+    'erb',
+    'spec',
+    'h_encoder',
+    'h_erb',
+    'h_df',
     'df_convp_history',
 )
 
@@ -59,10 +62,10 @@ OUTPUT_NAMES = (
     'erb_mask',
     'df_coefs',
     'df_alpha',
-    'encoder_gru_hidden_next',
-    'erb_gru_hidden_next',
-    'df_gru_hidden_next',
-    'df_convp_history_next',
+    'h_encoder_out',
+    'h_erb_out',
+    'h_df_out',
+    'df_convp_history_out',
 )
 
 

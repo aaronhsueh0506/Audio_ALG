@@ -93,15 +93,19 @@ def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
         c_macro('GTCRN_MODEL_CONV_TIME'),
         c_macro('GTCRN_MODEL_CONV_FREQ'),
     ]
-    assert schema['tra_cache'] == [
-        c_macro('GTCRN_MODEL_TRA_SIDES'), c_macro('GTCRN_MODEL_TRA_BLOCKS'),
-        1, 1, c_macro('GTCRN_MODEL_TRA_HIDDEN'),
-    ]
-    assert schema['inter_cache'] == [
-        c_macro('GTCRN_MODEL_INTER_LAYERS'), 1,
-        c_macro('GTCRN_MODEL_INTER_FREQ'),
-        c_macro('GTCRN_MODEL_INTER_HIDDEN'),
-    ]
+    h_tra = [name for name in INPUT_NAMES if name.startswith('h_tra_')]
+    assert len(h_tra) == c_macro('GTCRN_MODEL_TRA_GRUS')
+    for name in h_tra:
+        assert schema[name] == [
+            1, 1, c_macro('GTCRN_MODEL_TRA_HIDDEN'),
+        ], name
+    h_dpgrnn = [name for name in INPUT_NAMES if name.startswith('h_dpgrnn')]
+    assert len(h_dpgrnn) == c_macro('GTCRN_MODEL_DPGRNN_GRUS')
+    for name in h_dpgrnn:
+        assert schema[name] == [
+            1, c_macro('GTCRN_MODEL_DPGRNN_FREQ'),
+            c_macro('GTCRN_MODEL_DPGRNN_HIDDEN'),
+        ], name
 
     # Every state output must hand back exactly the shape its input slot
     # expects, or the caller cannot copy one into the other.
@@ -146,13 +150,12 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
 
     # Two invocations, recorded exactly the way calibration_main records them.
     captured = {}
-    mix, conv, tra, inter = initial_inputs(stream.model)
+    first, *state = initial_inputs(stream.model)
     with torch.no_grad():
         for _ in range(2):
-            capture_calibration_inputs(
-                captured, INPUT_NAMES, (mix, conv, tra, inter)
-            )
-            _, conv, tra, inter = stream(mix, conv, tra, inter)
+            frame_inputs = (first,) + tuple(state)
+            capture_calibration_inputs(captured, INPUT_NAMES, frame_inputs)
+            state = list(stream(*frame_inputs)[1:])
     arrays = {name: np.stack(values).astype(np.float32, copy=False)
               for name, values in captured.items()}
     artifact = tmp_path / 'calib'

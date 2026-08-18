@@ -165,7 +165,19 @@ def _state_slots(state: Dict[str, object]) -> List[_StateSlot]:
 
 
 def _onnx_name(path: str) -> str:
-    return 'state_' + re.sub(r'[^A-Za-z0-9_]+', '_', path).strip('_')
+    return 'state_' + _sanitize(path)
+
+
+def _sanitize(path: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_]+', '_', path).strip('_')
+
+
+def _hidden_name(path: str) -> str:
+    """GRU hiddens name themselves ``h_<module>``; ``h_`` already says
+    hidden, so the trailing ``.hidden`` path segment is dropped."""
+    if path.endswith('.hidden'):
+        path = path[:-len('.hidden')]
+    return 'h_' + _sanitize(path)
 
 
 class StatelessOneFrameAIAEC(nn.Module):
@@ -192,7 +204,12 @@ class StatelessOneFrameAIAEC(nn.Module):
 
     @property
     def state_names(self) -> Tuple[str, ...]:
-        return tuple(_onnx_name(slot.path) for slot in self.slots)
+        return tuple(
+            _hidden_name(slot.path)
+            if isinstance(slot.owner, StreamGRUCell)
+            else _onnx_name(slot.path)
+            for slot in self.slots
+        )
 
     def initial_state(self) -> Tuple[Tensor, ...]:
         return tuple(torch.zeros_like(slot.get()) for slot in self.slots)
@@ -370,9 +387,9 @@ def _build(model_name: str, model):
     wrapper = StatelessOneFrameAIAEC(model_name, model).eval()
     shape = (1, 1, model.grid.n_freqs, 2)
     inputs = (torch.randn(shape), torch.randn(shape)) + wrapper.initial_state()
-    input_names = ('microphone_ri', 'far_end_ri') + wrapper.state_names
-    output_names = ('learned_control',) + tuple(
-        name + '_next' for name in wrapper.state_names
+    input_names = ('mic', 'far') + wrapper.state_names
+    output_names = ('output',) + tuple(
+        name + '_out' for name in wrapper.state_names
     )
     split = GraphSplit(signal_inputs=2, head_outputs=1)
     return wrapper, inputs, input_names, output_names, split

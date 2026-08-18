@@ -148,9 +148,9 @@ hop#0 無輸出（呼叫端補零），hop#p (p≥1) 輸出對應輸入 [(p−1)
 512 samples；shapes 為 <code>inference.py</code> 開機打印之實測，B=1、16k grid）：</p>
 <table>
 <tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
-<tr><td>linear_error</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
-<tr><td>far_end</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
-<tr><td>enhanced</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>error</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>output</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
 <tr><td>mask</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>—</td></tr>
 <tr><td>delay_distribution</td><td>out</td><td>(1, 1, 64)</td><td>float32</td><td>1</td><td>—</td></tr>
 <tr><td>aux magnitude_mask</td><td>out</td><td>(1, 1, 257)</td><td>float32</td><td>1</td><td>—</td></tr>
@@ -167,8 +167,8 @@ CPU/DSP caller-owned pool 每次 invocation 傳入傳回，graph 與加速器無
 <tr><td>align.key_ring</td><td>(1, 32, 64, 26)</td><td>208.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
 <tr><td>align.value_ring</td><td>(1, 32, 64, 26)</td><td>208.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
 <tr><td>align.score_history</td><td>(1, 32, 4, 64)</td><td>32.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
-<tr><td>subband_gru0.hidden</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
-<tr><td>subband_gru1.hidden</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
+<tr><td>h_gru0（subband_gru0.hidden）</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
+<tr><td>h_gru1（subband_gru1.hidden）</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
 <tr><td><b>NN 小計</b></td><td></td><td><b>450.0 KB</b></td><td></td></tr>
 <tr><td>STFT×2 / ISTFT 狀態</td><td>UlcnetAnalysis×2 + UlcnetSynthesis</td><td>caller-owned、zero heap</td><td>C struct（<code>ulcnet_process.h</code>）</td></tr>
 <tr><td>PBFDKF / delay 對齊</td><td>—</td><td>—</td><td>AEC C 端 static pool</td></tr>

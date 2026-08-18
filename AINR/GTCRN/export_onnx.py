@@ -46,12 +46,20 @@ from AINR.DeepFilterNet2.export_onnx import (  # noqa: E402
 # Kept numerically equal to GTCRN_MODEL_LAYOUT_VERSION in gtcrn_process.h,
 # which declares the caller-owned cache struct this graph consumes and emits.
 # tests/test_gtcrn_export_contract.py pins the two together.
-STATE_LAYOUT_VERSION = 1
+STATE_LAYOUT_VERSION = 2
 
-INPUT_NAMES = ('mix', 'conv_cache', 'tra_cache', 'inter_cache')
+# One h_* tensor per GRU so each state slot names itself; only the temporal
+# conv history stays a combined cache. Encoder TRA GRUs first, then decoder,
+# then the two DPGRNN inter GRUs (whose hidden batches the frequency lanes).
+INPUT_NAMES = (
+    'input', 'conv_cache',
+    'h_tra_enc0', 'h_tra_enc1', 'h_tra_enc2',
+    'h_tra_dec0', 'h_tra_dec1', 'h_tra_dec2',
+    'h_dpgrnn1', 'h_dpgrnn2',
+)
 
-OUTPUT_NAMES = (
-    'enhanced', 'conv_cache_out', 'tra_cache_out', 'inter_cache_out',
+OUTPUT_NAMES = ('output',) + tuple(
+    name + '_out' for name in INPUT_NAMES[1:]
 )
 
 

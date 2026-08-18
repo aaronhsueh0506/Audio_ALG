@@ -82,9 +82,11 @@ from AIAEC.training_common import (
 
 # Kept numerically equal to ULCNET_MODEL_IO_LAYOUT_VERSION in
 # AIAEC/Align_ULCNet/ulcnet_model_io.h; test_export_streaming_ulcnet.py pins
-# the two together. Version 3 fixes production wiring to aligned far while
-# retaining the checkpoint's original far-input provenance separately.
-STATE_LAYOUT_VERSION = 3
+# the two together. Version 3 fixed production wiring to aligned far while
+# retaining the checkpoint's original far-input provenance separately;
+# version 4 renamed the tensors (error/far inputs, output head,
+# h_gru0/h_gru1 hiddens, *_out states) -- runtimes bind by name.
+STATE_LAYOUT_VERSION = 4
 MIN_DELAY_DEPTH = 2
 MAX_DELAY_DEPTH = 64
 TA_CHANNELS = 32
@@ -94,22 +96,22 @@ GRU_LAYERS = 2
 GRU_HIDDEN = 128
 
 INPUT_NAMES = (
-    'linear_error_ri',
-    'far_end_ri',
+    'error',
+    'far',
     'key_history',
     'value_history',
     'logit_history',
-    'gru0_hidden',
-    'gru1_hidden',
+    'h_gru0',
+    'h_gru1',
 )
 
 OUTPUT_NAMES = (
-    'enhanced_ri',
+    'output',
     'key_now',
     'value_now',
     'logit_now',
-    'gru0_hidden_next',
-    'gru1_hidden_next',
+    'h_gru0_out',
+    'h_gru1_out',
 )
 
 
@@ -147,21 +149,21 @@ class AlignUlcnetStreamingExport(nn.Module):
 
     def forward(
         self,
-        linear_error_ri: Tensor,
-        far_end_ri: Tensor,
+        error: Tensor,
+        far: Tensor,
         key_history: Tensor,
         value_history: Tensor,
         logit_history: Tensor,
-        gru0_hidden: Tensor,
-        gru1_hidden: Tensor,
+        h_gru0: Tensor,
+        h_gru1: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         model = self.model
         exponent = model.compression_exponent
 
-        error_real = _signed_power(linear_error_ri[..., 0], exponent)
-        error_imag = _signed_power(linear_error_ri[..., 1], exponent)
-        far_real = _signed_power(far_end_ri[..., 0], exponent)
-        far_imag = _signed_power(far_end_ri[..., 1], exponent)
+        error_real = _signed_power(error[..., 0], exponent)
+        error_imag = _signed_power(error[..., 1], exponent)
+        far_real = _signed_power(far[..., 0], exponent)
+        far_imag = _signed_power(far[..., 1], exponent)
         error_magnitude = (
             error_real.square() + error_imag.square() + 1e-12
         ).sqrt()
@@ -213,7 +215,7 @@ class AlignUlcnetStreamingExport(nn.Module):
         pieces = []
         hidden_next = []
         at = 0
-        hidden_inputs = (gru0_hidden, gru1_hidden)
+        hidden_inputs = (h_gru0, h_gru1)
         for index, width in enumerate(model.subband_widths):
             piece = features[..., at:at + width]
             batch, channels, _time, bins = piece.shape
@@ -248,13 +250,13 @@ class AlignUlcnetStreamingExport(nn.Module):
         estimate_real = error_real * mask_real - error_imag * mask_imag
         estimate_imag = error_real * mask_imag + error_imag * mask_real
         inverse_exponent = 1.0 / exponent
-        enhanced_ri = torch.stack((
+        output = torch.stack((
             _signed_power(estimate_real, inverse_exponent),
             _signed_power(estimate_imag, inverse_exponent),
         ), dim=-1)
 
         return (
-            enhanced_ri,
+            output,
             key_now,
             value_now,
             logit_now,
@@ -275,8 +277,8 @@ def state_shapes(delay_depth: int) -> Dict[str, Tuple[int, ...]]:
         'logit_history': (
             1, TA_CHANNELS, SCORE_HISTORY_FRAMES, delay_depth
         ),
-        'gru0_hidden': (GRU_LAYERS, 1, GRU_HIDDEN),
-        'gru1_hidden': (GRU_LAYERS, 1, GRU_HIDDEN),
+        'h_gru0': (GRU_LAYERS, 1, GRU_HIDDEN),
+        'h_gru1': (GRU_LAYERS, 1, GRU_HIDDEN),
     }
 
 
@@ -288,8 +290,8 @@ def dummy_inputs(delay_depth: int) -> Tuple[Tensor, ...]:
         torch.zeros(shapes['key_history']),
         torch.zeros(shapes['value_history']),
         torch.zeros(shapes['logit_history']),
-        torch.zeros(shapes['gru0_hidden']),
-        torch.zeros(shapes['gru1_hidden']),
+        torch.zeros(shapes['h_gru0']),
+        torch.zeros(shapes['h_gru1']),
     )
 
 

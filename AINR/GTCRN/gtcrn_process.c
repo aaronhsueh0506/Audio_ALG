@@ -27,24 +27,39 @@ static int all_finite(const float* values, size_t count)
 
 int gtcrn_model_state_commit(GTCRNModelState* state,
                              const float* conv_cache_out,
-                             const float* tra_cache_out,
-                             const float* inter_cache_out)
+                             const float* const h_tra_out[GTCRN_MODEL_TRA_GRUS],
+                             const float* const h_dpgrnn_out[GTCRN_MODEL_DPGRNN_GRUS])
 {
-    if (state == NULL || conv_cache_out == NULL || tra_cache_out == NULL ||
-        inter_cache_out == NULL) return -1;
-    /* Validate all three caches BEFORE writing any of them. A partial commit
-     * would leave the recurrent state a mix of two invocations, which the next
-     * call cannot distinguish from a healthy state; refusing the whole batch
-     * keeps the last good state replayable. */
+    if (state == NULL || conv_cache_out == NULL || h_tra_out == NULL ||
+        h_dpgrnn_out == NULL) return -1;
+    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
+        if (h_tra_out[i] == NULL) return -1;
+    }
+    for (int i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
+        if (h_dpgrnn_out[i] == NULL) return -1;
+    }
+    /* Validate every state tensor BEFORE writing any of them. A partial
+     * commit would leave the recurrent state a mix of two invocations, which
+     * the next call cannot distinguish from a healthy state; refusing the
+     * whole batch keeps the last good state replayable. */
     if (!all_finite(conv_cache_out,
-                    sizeof(state->conv_cache) / sizeof(float)) ||
-        !all_finite(tra_cache_out,
-                    sizeof(state->tra_cache) / sizeof(float)) ||
-        !all_finite(inter_cache_out,
-                    sizeof(state->inter_cache) / sizeof(float))) return -1;
+                    sizeof(state->conv_cache) / sizeof(float))) return -1;
+    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
+        if (!all_finite(h_tra_out[i],
+                        sizeof(state->h_tra[0]) / sizeof(float))) return -1;
+    }
+    for (int i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
+        if (!all_finite(h_dpgrnn_out[i],
+                        sizeof(state->h_dpgrnn[0]) / sizeof(float))) return -1;
+    }
     memcpy(state->conv_cache, conv_cache_out, sizeof(state->conv_cache));
-    memcpy(state->tra_cache, tra_cache_out, sizeof(state->tra_cache));
-    memcpy(state->inter_cache, inter_cache_out, sizeof(state->inter_cache));
+    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
+        memcpy(state->h_tra[i], h_tra_out[i], sizeof(state->h_tra[0]));
+    }
+    for (int i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
+        memcpy(state->h_dpgrnn[i], h_dpgrnn_out[i],
+               sizeof(state->h_dpgrnn[0]));
+    }
     return 0;
 }
 

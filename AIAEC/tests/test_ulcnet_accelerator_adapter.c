@@ -9,8 +9,8 @@ typedef struct TestRuntime {
     int partial_write;
     int fail_run;         /* write every output, then report failure */
     int calls;
-    float stamp;          /* value written into gru0_hidden_next     */
-    float observed_gru0;  /* inputs->gru0_hidden[0] seen on entry    */
+    float stamp;          /* value written into h_gru0_out     */
+    float observed_gru0;  /* inputs->h_gru0[0] seen on entry    */
 } TestRuntime;
 
 static void fill(float *values, size_t elements, float value) {
@@ -23,9 +23,9 @@ static int run(void *user, const UlcnetModelIoInputs *inputs,
     TestRuntime *runtime = (TestRuntime *)user;
     size_t index;
     runtime->calls += 1;
-    runtime->observed_gru0 = inputs->gru0_hidden[0];
+    runtime->observed_gru0 = inputs->h_gru0[0];
     for (index = 0; index < outputs->spectrum_ri_elements; ++index) {
-        outputs->enhanced_ri[index] = inputs->linear_error_ri[index];
+        outputs->output[index] = inputs->error[index];
     }
     if (runtime->partial_write) {
         return 0;
@@ -33,9 +33,9 @@ static int run(void *user, const UlcnetModelIoInputs *inputs,
     fill(outputs->key_now, outputs->key_now_elements, 0.0f);
     fill(outputs->value_now, outputs->value_now_elements, 0.0f);
     fill(outputs->logit_now, outputs->logit_now_elements, 0.0f);
-    fill(outputs->gru0_hidden_next, outputs->gru_hidden_elements,
+    fill(outputs->h_gru0_out, outputs->gru_hidden_elements,
          runtime->stamp);
-    fill(outputs->gru1_hidden_next, outputs->gru_hidden_elements, 0.0f);
+    fill(outputs->h_gru1_out, outputs->gru_hidden_elements, 0.0f);
     return runtime->fail_run ? -1 : 0;
 }
 

@@ -123,8 +123,8 @@ flowchart LR
         AFAR["aligned_far"]
         SEAM["AEC aligned-far seam<br/>raw until acquisition"]
         STFT["two sqrt-Hann STFTs<br/>512 / 256"]
-        ERRI["linear_error_ri<br/>[1,1,257,2]"]
-        FARRI["far_end_ri<br/>[1,1,257,2]"]
+        ERRI["error<br/>[1,1,257,2]"]
+        FARRI["far<br/>[1,1,257,2]"]
         STATE["external state inputs<br/>K/V history + logit history<br/>two GRU hidden tensors"]
         UPDATE["CPU ring update<br/>push K_now/V_now/logit_now<br/>hidden = hidden_next"]
         WOLA["WOLA / IFFT"]
@@ -145,7 +145,7 @@ flowchart LR
         TA["TA over current + history<br/>score conv + softmax"]
         BODY["joint conv + FGRU<br/>temporal GRUs"]
         MASK["mask + composition<br/>signed expansion"]
-        ENH["enhanced_ri<br/>[1,1,257,2]"]
+        ENH["output<br/>[1,1,257,2]"]
         DELTA["delta state outputs<br/>K_now / V_now / logit_now<br/>gru0_next / gru1_next"]
         ENC --> QKV --> TA --> BODY --> MASK --> ENH
         QKV --> DELTA
@@ -171,24 +171,24 @@ Inputs per invocation:
 
 | tensor | float32 shape | ordering |
 |---|---:|---|
-| `linear_error_ri` | `[1,1,257,2]` | real/imag last |
-| `far_end_ri` | `[1,1,257,2]` | AEC aligned-far seam; it carries raw far before acquisition and aligned far afterward |
+| `error` | `[1,1,257,2]` | real/imag last |
+| `far` | `[1,1,257,2]` | AEC aligned-far seam; it carries raw far before acquisition and aligned far afterward |
 | `key_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `value_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `logit_history` | `[1,32,4,D]` | chronological, t-4 through t-1 |
-| `gru0_hidden` | `[2,1,128]` | layer first |
-| `gru1_hidden` | `[2,1,128]` | layer first |
+| `h_gru0` | `[2,1,128]` | layer first |
+| `h_gru1` | `[2,1,128]` | layer first |
 
 Outputs per invocation:
 
 | tensor | float32 shape | CPU action |
 |---|---:|---|
-| `enhanced_ri` | `[1,1,257,2]` | send to WOLA/IFFT |
+| `output` | `[1,1,257,2]` | send to WOLA/IFFT |
 | `key_now` | `[1,32,1,26]` | push into key history |
 | `value_now` | `[1,32,1,26]` | push into value history |
 | `logit_now` | `[1,32,1,D]` | append to four-frame logit history |
-| `gru0_hidden_next` | `[2,1,128]` | replace GRU-0 hidden |
-| `gru1_hidden_next` | `[2,1,128]` | replace GRU-1 hidden |
+| `h_gru0_out` | `[2,1,128]` | replace GRU-0 hidden |
+| `h_gru1_out` | `[2,1,128]` | replace GRU-1 hidden |
 
 This delta-state boundary avoids returning the complete K/V rings every 16 ms.
 The graph uses `K_now`/`V_now` immediately and also exposes them as outputs;
@@ -263,7 +263,7 @@ python3 inference.py calib \
 ```
 
 The layout is `<tensor>/<tensor>_<frame>.bin`, with one-based frame numbers;
-for example `gru0_hidden/gru0_hidden_1.bin`. Each file is C-contiguous and
+for example `h_gru0/gru0_hidden_1.bin`. Each file is C-contiguous and
 little-endian. `manifest.json` records dtype and per-frame shape. The output
 directory must not already exist, so a shorter rerun cannot leave stale frames.
 

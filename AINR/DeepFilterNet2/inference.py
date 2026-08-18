@@ -310,13 +310,13 @@ def calibration_main():
                 outputs = wrapper(*inputs)
                 state = tuple(outputs[3:])
                 used = True
-                if len(captured['feat_erb_window']) >= args.frames:
+                if len(captured['erb']) >= args.frames:
                     break
             if used:
                 source_files.append(os.path.relpath(path, args.wav_dir))
-            if len(captured['feat_erb_window']) >= args.frames:
+            if len(captured['erb']) >= args.frames:
                 break
-    if not captured['feat_erb_window']:
+    if not captured['erb']:
         raise RuntimeError('no calibration frames were produced')
     arrays = {
         name: np.stack(values[:args.frames]).astype(np.float32, copy=False)
@@ -331,7 +331,7 @@ def calibration_main():
         'win_len': params['WIN_LEN'],
         'hop_len': params['HOP_LEN'],
         'input_feature_frames': INPUT_FRAMES,
-        'frames': int(arrays['feat_erb_window'].shape[0]),
+        'frames': int(arrays['erb'].shape[0]),
         'seed': args.seed,
         'source_files': source_files,
         'inputs': {

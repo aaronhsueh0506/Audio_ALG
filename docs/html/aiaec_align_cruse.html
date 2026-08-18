@@ -107,9 +107,9 @@ hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本
 開機打印之實測，B=1、16k）：</p>
 <table>
 <tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
-<tr><td>microphone</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
-<tr><td>far_end</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
-<tr><td>enhanced</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>mic</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>output</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
 <tr><td>mask（real magnitude）</td><td>out</td><td>(1, 1, 257)</td><td>float32</td><td>1</td><td>—</td></tr>
 <tr><td>delay_distribution</td><td>out</td><td>(1, 1, 63)</td><td>float32</td><td>1</td><td>—</td></tr>
 </table>
@@ -132,7 +132,7 @@ state I/O，由 host caller 保存；STFT/ISTFT 狀態屬 C struct 層：</p>
 <tr><td>mic4.history</td><td>(1, 72, 3, 33)</td><td>27.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>far1.history</td><td>(1, 1, 3, 257)</td><td>3.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>far2.history</td><td>(1, 8, 3, 129)</td><td>12.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
-<tr><td>gru.hidden</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>h_gru（gru.hidden）</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td><b>NN 合計</b></td><td></td><td><b>519.6 KB</b></td><td></td></tr>
 <tr><td>STFT×2 / ISTFT 狀態</td><td>—</td><td>—</td><td>C struct（Python reference：host）</td></tr>
 </table>

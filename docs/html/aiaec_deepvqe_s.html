@@ -104,9 +104,9 @@ hop-lag：端到端 256 samples（16 ms）＝ centered 半窗 lookahead；NN 本
 開機打印之實測，B=1、16k）：</p>
 <table>
 <tr><th>tensor</th><th>方向</th><th>shape</th><th>dtype</th><th>幀/invocation</th><th>time-domain samples</th></tr>
-<tr><td>microphone</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
-<tr><td>far_end</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
-<tr><td>enhanced</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
+<tr><td>mic</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>far</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
+<tr><td>output</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
 <tr><td>delay_distribution</td><td>out</td><td>(1, 1, 63)</td><td>float32</td><td>1</td><td>—</td></tr>
 <tr><td>aux ccm_taps</td><td>out</td><td>(1, 1, 257, 3, 3)</td><td>complex64</td><td>1</td><td>—</td></tr>
 </table>
@@ -124,7 +124,7 @@ graph state 由 host caller 保存；STFT/ISTFT 與 CCM 頻譜 ring 屬 C struct
 <tr><td>align.score_history</td><td>(1, 4, 4, 63)</td><td>3.9 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>mic1..mic4.history</td><td>(1,2,3,257) / (1,16,3,129) / (1,64,3,65) / (1,56,3,33)</td><td>6.0 / 24.2 / 48.8 / 21.7 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>far1 / far2.history</td><td>(1,2,3,257) / (1,8,3,129)</td><td>6.0 / 12.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
-<tr><td>gru.hidden</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>h_gru（gru.hidden）</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>up3 / up2 / up1.history</td><td>(1,24,3,17) / (1,40,3,33) / (1,32,3,65)</td><td>4.8 / 15.5 / 24.4 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>res3 / res2.history</td><td>(1,40,3,33) / (1,32,3,65)</td><td>15.5 / 24.4 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>ccm_up.history</td><td>(1, 32, 3, 129)</td><td>48.4 KB</td><td>host caller（顯式 graph I/O）</td></tr>

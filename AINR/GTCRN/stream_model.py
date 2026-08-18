@@ -23,13 +23,16 @@ def _encoder_pad_sizes(model):
 
 
 def initial_inputs(model):
-    """One random spectrum frame plus zero caches, shaped for ``model``.
+    """One random spectrum frame plus zero states, shaped for ``model``.
 
-    Every extent is read off the module tree rather than written down, so the
-    graph follows whatever grid the checkpoint was trained on: the spectrum
-    width tracks n_fft through the ERB split, the cache depth tracks the GT
-    blocks' temporal kernels/dilations, and the frequency width tracks the
-    encoder strides through ``dpgrnn1.width``.
+    Ordered exactly like the graph I/O: ``input``, the shared ``conv_cache``,
+    one ``h_*`` tensor per GRU (the six TRA attention GRUs, encoder blocks
+    first, then the two DPGRNN inter GRUs). Every extent is read off the
+    module tree rather than written down, so the graph follows whatever grid
+    the checkpoint was trained on: the spectrum width tracks n_fft through
+    the ERB split, the cache depth tracks the GT blocks' temporal
+    kernels/dilations, and the frequency width tracks the encoder strides
+    through ``dpgrnn1.width``.
     """
     erb = model.erb
     bins = erb.erb_subband_1 + erb.erb_fc.in_features
@@ -39,11 +42,17 @@ def initial_inputs(model):
     width = model.dpgrnn1.width
     tra = gt_blocks[0].tra.att_gru
     inter = model.dpgrnn1.inter_rnn
+    h_tra = [torch.zeros(tra.num_layers, 1, tra.hidden_size)
+             for _ in range(2 * len(gt_blocks))]
+    # The inter GRU batches the frequency positions, so its hidden really is
+    # (layers, width, hidden) -- one tensor per DPGRNN, not width tensors.
+    h_dpgrnn = [torch.zeros(inter.num_layers, width, inter.hidden_size)
+                for _ in range(2)]
     return (
         torch.randn(1, bins, 1, 2),
         torch.zeros(2, 1, channels, depth, width),
-        torch.zeros(2, len(gt_blocks), tra.num_layers, 1, tra.hidden_size),
-        torch.zeros(2, inter.num_layers, width, inter.hidden_size),
+        *h_tra,
+        *h_dpgrnn,
     )
 
 
@@ -128,7 +137,10 @@ class StreamGTCRN(nn.Module):
         self._encoder_slices = tuple(bounds)
         self._decoder_slices = tuple(reversed(bounds))
 
-    def forward(self, spectrum, conv_cache, tra_cache, inter_cache):
+    def forward(self, spectrum, conv_cache,
+                h_tra_enc0, h_tra_enc1, h_tra_enc2,
+                h_tra_dec0, h_tra_dec1, h_tra_dec2,
+                h_dpgrnn1, h_dpgrnn2):
         model = self.model
         real = spectrum[..., 0].permute(0, 2, 1)
         imag = spectrum[..., 1].permute(0, 2, 1)
@@ -142,25 +154,27 @@ class StreamGTCRN(nn.Module):
             skips.append(x)
         enc_conv = []
         enc_tra = []
+        enc_hidden = (h_tra_enc0, h_tra_enc1, h_tra_enc2)
         for index, block in enumerate(model.encoder.en_convs[2:]):
             start, end = self._encoder_slices[index]
             x, cache, hidden = _gt_step(
                 block, x, conv_cache[0, :, :, start:end],
-                tra_cache[0, index])
+                enc_hidden[index])
             enc_conv.append(cache)
             enc_tra.append(hidden)
             skips.append(x)
 
-        x, inter0 = _dp_step(model.dpgrnn1, x, inter_cache[0])
-        x, inter1 = _dp_step(model.dpgrnn2, x, inter_cache[1])
+        x, inter0 = _dp_step(model.dpgrnn1, x, h_dpgrnn1)
+        x, inter1 = _dp_step(model.dpgrnn2, x, h_dpgrnn2)
 
         dec_conv_reverse = []
         dec_tra = []
+        dec_hidden = (h_tra_dec0, h_tra_dec1, h_tra_dec2)
         for index, block in enumerate(model.decoder.de_convs[:3]):
             start, end = self._decoder_slices[index]
             x, cache, hidden = _gt_step(
                 block, x + skips[4 - index],
-                conv_cache[1, :, :, start:end], tra_cache[1, index],
+                conv_cache[1, :, :, start:end], dec_hidden[index],
                 decoder=True)
             dec_conv_reverse.append(cache)
             dec_tra.append(hidden)
@@ -174,6 +188,4 @@ class StreamGTCRN(nn.Module):
             torch.cat(enc_conv, dim=2),
             torch.cat(tuple(reversed(dec_conv_reverse)), dim=2),
         ), dim=0)
-        tra_out = torch.stack((torch.stack(enc_tra), torch.stack(dec_tra)))
-        inter_out = torch.stack((inter0, inter1))
-        return enhanced, conv_out, tra_out, inter_out
+        return (enhanced, conv_out, *enc_tra, *dec_tra, inter0, inter1)

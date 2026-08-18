@@ -7,21 +7,21 @@
 struct UlcnetModelIoState {
     UlcnetModelIoDescriptor descriptor;
 
-    float *linear_error_ri;
-    float *far_end_ri;
-    float *enhanced_ri;
+    float *error;
+    float *far;
+    float *output;
 
     float *key_history;
     float *value_history;
     float *logit_history;
-    float *gru0_hidden;
-    float *gru1_hidden;
+    float *h_gru0;
+    float *h_gru1;
 
     float *key_now;
     float *value_now;
     float *logit_now;
-    float *gru0_hidden_next;
-    float *gru1_hidden_next;
+    float *h_gru0_out;
+    float *h_gru1_out;
 
     size_t spectrum_ri_elements;
     size_t key_history_elements;
@@ -252,25 +252,25 @@ UlcnetModelIoState *ulcnet_model_io_init(
     state->logit_now_elements = counts.logit_now_elements;
 
     cursor = (unsigned char *)pool + state_bytes;
-    state->linear_error_ri = carve_float(&cursor, counts.spectrum_ri_elements);
-    state->far_end_ri = carve_float(&cursor, counts.spectrum_ri_elements);
-    state->enhanced_ri = carve_float(&cursor, counts.spectrum_ri_elements);
+    state->error = carve_float(&cursor, counts.spectrum_ri_elements);
+    state->far = carve_float(&cursor, counts.spectrum_ri_elements);
+    state->output = carve_float(&cursor, counts.spectrum_ri_elements);
     state->key_history = carve_float(&cursor, counts.key_history_elements);
     state->value_history = carve_float(&cursor, counts.value_history_elements);
     state->logit_history = carve_float(&cursor, counts.logit_history_elements);
-    state->gru0_hidden = carve_float(&cursor, counts.gru_hidden_elements);
-    state->gru1_hidden = carve_float(&cursor, counts.gru_hidden_elements);
+    state->h_gru0 = carve_float(&cursor, counts.gru_hidden_elements);
+    state->h_gru1 = carve_float(&cursor, counts.gru_hidden_elements);
     state->key_now = carve_float(&cursor, counts.key_now_elements);
     state->value_now = carve_float(&cursor, counts.value_now_elements);
     state->logit_now = carve_float(&cursor, counts.logit_now_elements);
-    state->gru0_hidden_next = carve_float(&cursor, counts.gru_hidden_elements);
-    state->gru1_hidden_next = carve_float(&cursor, counts.gru_hidden_elements);
+    state->h_gru0_out = carve_float(&cursor, counts.gru_hidden_elements);
+    state->h_gru1_out = carve_float(&cursor, counts.gru_hidden_elements);
 
-    if (!state->linear_error_ri || !state->far_end_ri ||
-        !state->enhanced_ri || !state->key_history || !state->value_history ||
-        !state->logit_history || !state->gru0_hidden || !state->gru1_hidden ||
+    if (!state->error || !state->far ||
+        !state->output || !state->key_history || !state->value_history ||
+        !state->logit_history || !state->h_gru0 || !state->h_gru1 ||
         !state->key_now || !state->value_now || !state->logit_now ||
-        !state->gru0_hidden_next || !state->gru1_hidden_next ||
+        !state->h_gru0_out || !state->h_gru1_out ||
         (size_t)(cursor - (unsigned char *)pool) != requirements.bytes) {
         return NULL;
     }
@@ -287,13 +287,13 @@ void ulcnet_model_io_reset(UlcnetModelIoState *state) {
            state->value_history_elements * sizeof(float));
     memset(state->logit_history, 0,
            state->logit_history_elements * sizeof(float));
-    memset(state->gru0_hidden, 0,
+    memset(state->h_gru0, 0,
            state->gru_hidden_elements * sizeof(float));
-    memset(state->gru1_hidden, 0,
+    memset(state->h_gru1, 0,
            state->gru_hidden_elements * sizeof(float));
-    memset(state->gru0_hidden_next, 0,
+    memset(state->h_gru0_out, 0,
            state->gru_hidden_elements * sizeof(float));
-    memset(state->gru1_hidden_next, 0,
+    memset(state->h_gru1_out, 0,
            state->gru_hidden_elements * sizeof(float));
     state->prepared = 0;
 }
@@ -320,38 +320,38 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
         return -1;
     }
     for (bin = 0; bin < state->descriptor.spectrum_bins; ++bin) {
-        state->linear_error_ri[2 * bin] = error_re[bin];
-        state->linear_error_ri[2 * bin + 1] = error_im[bin];
-        state->far_end_ri[2 * bin] = far_re[bin];
-        state->far_end_ri[2 * bin + 1] = far_im[bin];
+        state->error[2 * bin] = error_re[bin];
+        state->error[2 * bin + 1] = error_im[bin];
+        state->far[2 * bin] = far_re[bin];
+        state->far[2 * bin + 1] = far_im[bin];
     }
 
-    fill_nan(state->enhanced_ri, state->spectrum_ri_elements);
+    fill_nan(state->output, state->spectrum_ri_elements);
     fill_nan(state->key_now, state->key_now_elements);
     fill_nan(state->value_now, state->value_now_elements);
     fill_nan(state->logit_now, state->logit_now_elements);
-    fill_nan(state->gru0_hidden_next, state->gru_hidden_elements);
-    fill_nan(state->gru1_hidden_next, state->gru_hidden_elements);
+    fill_nan(state->h_gru0_out, state->gru_hidden_elements);
+    fill_nan(state->h_gru1_out, state->gru_hidden_elements);
 
-    inputs->linear_error_ri = state->linear_error_ri;
-    inputs->far_end_ri = state->far_end_ri;
+    inputs->error = state->error;
+    inputs->far = state->far;
     inputs->key_history = state->key_history;
     inputs->value_history = state->value_history;
     inputs->logit_history = state->logit_history;
-    inputs->gru0_hidden = state->gru0_hidden;
-    inputs->gru1_hidden = state->gru1_hidden;
+    inputs->h_gru0 = state->h_gru0;
+    inputs->h_gru1 = state->h_gru1;
     inputs->spectrum_ri_elements = state->spectrum_ri_elements;
     inputs->key_history_elements = state->key_history_elements;
     inputs->value_history_elements = state->value_history_elements;
     inputs->logit_history_elements = state->logit_history_elements;
     inputs->gru_hidden_elements = state->gru_hidden_elements;
 
-    outputs->enhanced_ri = state->enhanced_ri;
+    outputs->output = state->output;
     outputs->key_now = state->key_now;
     outputs->value_now = state->value_now;
     outputs->logit_now = state->logit_now;
-    outputs->gru0_hidden_next = state->gru0_hidden_next;
-    outputs->gru1_hidden_next = state->gru1_hidden_next;
+    outputs->h_gru0_out = state->h_gru0_out;
+    outputs->h_gru1_out = state->h_gru1_out;
     outputs->spectrum_ri_elements = state->spectrum_ri_elements;
     outputs->key_now_elements = state->key_now_elements;
     outputs->value_now_elements = state->value_now_elements;
@@ -416,12 +416,12 @@ int ulcnet_model_io_commit(UlcnetModelIoState *state,
     int bin;
 
     if (!state || !state->prepared || !enhanced_re || !enhanced_im ||
-        !all_finite(state->enhanced_ri, state->spectrum_ri_elements) ||
+        !all_finite(state->output, state->spectrum_ri_elements) ||
         !all_finite(state->key_now, state->key_now_elements) ||
         !all_finite(state->value_now, state->value_now_elements) ||
         !all_finite(state->logit_now, state->logit_now_elements) ||
-        !all_finite(state->gru0_hidden_next, state->gru_hidden_elements) ||
-        !all_finite(state->gru1_hidden_next, state->gru_hidden_elements)) {
+        !all_finite(state->h_gru0_out, state->gru_hidden_elements) ||
+        !all_finite(state->h_gru1_out, state->gru_hidden_elements)) {
         if (state) {
             state->prepared = 0;
         }
@@ -442,16 +442,16 @@ int ulcnet_model_io_commit(UlcnetModelIoState *state,
                          descriptor->score_history_frames,
                          descriptor->delay_depth);
 
-    temporary = state->gru0_hidden;
-    state->gru0_hidden = state->gru0_hidden_next;
-    state->gru0_hidden_next = temporary;
-    temporary = state->gru1_hidden;
-    state->gru1_hidden = state->gru1_hidden_next;
-    state->gru1_hidden_next = temporary;
+    temporary = state->h_gru0;
+    state->h_gru0 = state->h_gru0_out;
+    state->h_gru0_out = temporary;
+    temporary = state->h_gru1;
+    state->h_gru1 = state->h_gru1_out;
+    state->h_gru1_out = temporary;
 
     for (bin = 0; bin < descriptor->spectrum_bins; ++bin) {
-        enhanced_re[bin] = state->enhanced_ri[2 * bin];
-        enhanced_im[bin] = state->enhanced_ri[2 * bin + 1];
+        enhanced_re[bin] = state->output[2 * bin];
+        enhanced_im[bin] = state->output[2 * bin + 1];
     }
     state->prepared = 0;
     return 0;

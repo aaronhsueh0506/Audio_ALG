@@ -222,24 +222,21 @@ def calibration_main():
                 wave, grid['n_fft'], grid['hop_len'], grid['win_len'],
                 window=window, center=False, return_complex=True,
             )).permute(1, 0, 2)
-            _, conv, tra, inter = initial_inputs(stream_model.model)
+            state = initial_inputs(stream_model.model)[1:]
             used = False
             for spectrum in spectra:
-                mix = spectrum[None, :, None, :]
-                capture_calibration_inputs(
-                    captured, INPUT_NAMES, (mix, conv, tra, inter)
-                )
-                _, conv, tra, inter = stream_model(
-                    mix, conv, tra, inter
-                )
+                frame = spectrum[None, :, None, :]
+                inputs = (frame,) + tuple(state)
+                capture_calibration_inputs(captured, INPUT_NAMES, inputs)
+                state = stream_model(*inputs)[1:]
                 used = True
-                if len(captured['mix']) >= args.frames:
+                if len(captured['input']) >= args.frames:
                     break
             if used:
                 source_files.append(os.path.relpath(path, args.wav_dir))
-            if len(captured['mix']) >= args.frames:
+            if len(captured['input']) >= args.frames:
                 break
-    if not captured['mix']:
+    if not captured['input']:
         raise RuntimeError('no calibration frames were produced')
     arrays = {
         name: np.stack(values[:args.frames]).astype(np.float32, copy=False)
@@ -249,7 +246,7 @@ def calibration_main():
         'schema': 'gtcrn-stream-calibration-v1',
         'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
         'graph': os.path.basename(onnx_path),
-        'frames': int(arrays['mix'].shape[0]),
+        'frames': int(arrays['input'].shape[0]),
         'source_files': source_files,
         'sample_rate': grid['sr'],
         'n_fft': grid['n_fft'],
@@ -269,7 +266,7 @@ def calibration_main():
         args.output, arrays, report, artifact_format
     )
     print('%s (%d streaming frames), graph %s' %
-          (args.output, arrays['mix'].shape[0], onnx_path))
+          (args.output, arrays['input'].shape[0], onnx_path))
 
 
 def cli():

@@ -7,8 +7,11 @@
 extern "C" {
 #endif
 
-/* Must match export_onnx.py and the shipped DFN2 config. */
-#define DFN2_MODEL_IO_LAYOUT_VERSION       1
+/* Must match export_onnx.py and the shipped DFN2 config. Version 2 renamed
+ * the graph tensors (erb/spec inputs, h_encoder/h_erb/h_df hiddens, *_out
+ * state outputs); runtimes bind by name, so the rename is a contract change
+ * even though every shape and this struct stayed identical. */
+#define DFN2_MODEL_IO_LAYOUT_VERSION       2
 #define DFN2_MODEL_INPUT_FRAMES            3
 #define DFN2_MODEL_ENCODER_GRU_LAYERS      1
 #define DFN2_MODEL_ERB_GRU_LAYERS          2

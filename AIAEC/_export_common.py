@@ -287,9 +287,8 @@ def load_checkpoint_model(model_name: str, checkpoint: str):
 
 def dummy_inputs(model_name: str, model, frames: int):
     shape = (1, frames, model.grid.n_freqs, 2)
-    primary = ('linear_error_ri' if model_name == 'Align_ULCNet'
-               else 'microphone_ri')
-    return (torch.randn(shape), torch.randn(shape)), (primary, 'far_end_ri')
+    primary = 'error' if model_name == 'Align_ULCNet' else 'mic'
+    return (torch.randn(shape), torch.randn(shape)), (primary, 'far')
 
 
 def alignment_depth(model):

@@ -606,8 +606,8 @@ flowchart LR
         AFAR["aligned-far seam PCM<br/>raw until acquisition"]
         ESTFT["sqrt-Hann STFT<br/>512 / 256"]
         FSTFT["sqrt-Hann STFT<br/>512 / 256"]
-        ERRI["linear_error_ri<br/>[1,1,257,2]"]
-        FARRI["far_end_ri<br/>[1,1,257,2]"]
+        ERRI["error<br/>[1,1,257,2]"]
+        FARRI["far<br/>[1,1,257,2]"]
         KH["key_history<br/>[1,32,D-1,26]"]
         VH["value_history<br/>[1,32,D-1,26]"]
         LH["logit_history<br/>[1,32,4,D]"]
@@ -633,7 +633,7 @@ flowchart LR
         TA["TA: current + history<br/>score conv + softmax"]
         BODY["joint conv + FGRU<br/>two temporal GRUs"]
         MASK["mask + compressed-domain compose<br/>+ signed expansion"]
-        ENH["enhanced_ri<br/>[1,1,257,2]"]
+        ENH["output<br/>[1,1,257,2]"]
         DELTA["state delta outputs<br/>K_now / V_now / logit_now<br/>gru0_next / gru1_next"]
 
         ENC --> QKV --> TA --> BODY --> MASK --> ENH
@@ -669,24 +669,24 @@ Inputs：
 
 | tensor | float32 shape | 來源／用途 |
 |---|---:|---|
-| `linear_error_ri` | `[1,1,257,2]` | CPU PBFDKF error 的 STFT |
-| `far_end_ri` | `[1,1,257,2]` | 固定取 AEC aligned-far seam；acquisition 前為 raw far，之後為 aligned far |
+| `error` | `[1,1,257,2]` | CPU PBFDKF error 的 STFT |
+| `far` | `[1,1,257,2]` | 固定取 AEC aligned-far seam；acquisition 前為 raw far，之後為 aligned far |
 | `key_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far keys |
 | `value_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far values |
 | `logit_history` | `[1,32,4,D]` | TA `(5,3)` score conv 的前 4 幀 raw logits |
-| `gru0_hidden` | `[2,1,128]` | temporal subband GRU 0，2 layers |
-| `gru1_hidden` | `[2,1,128]` | temporal subband GRU 1，2 layers |
+| `h_gru0` | `[2,1,128]` | temporal subband GRU 0，2 layers |
+| `h_gru1` | `[2,1,128]` | temporal subband GRU 1，2 layers |
 
 Outputs：
 
 | tensor | float32 shape | CPU 操作 |
 |---|---:|---|
-| `enhanced_ri` | `[1,1,257,2]` | 送 WOLA/IFFT |
+| `output` | `[1,1,257,2]` | 送 WOLA/IFFT |
 | `key_now` | `[1,32,1,26]` | push 進 `key_history` |
 | `value_now` | `[1,32,1,26]` | push 進 `value_history` |
 | `logit_now` | `[1,32,1,D]` | push 進 4-frame `logit_history` |
-| `gru0_hidden_next` | `[2,1,128]` | 取代 `gru0_hidden` |
-| `gru1_hidden_next` | `[2,1,128]` | 取代 `gru1_hidden` |
+| `h_gru0_out` | `[2,1,128]` | 取代 `h_gru0` |
+| `h_gru1_out` | `[2,1,128]` | 取代 `h_gru1` |
 
 這是「delta-state output」：graph 不回傳完整 `*_history_next`，CPU 只把
 新的 K/V/logit 寫進自己的 ring，避免每 16 ms 從加速器搬回

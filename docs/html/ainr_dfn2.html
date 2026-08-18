@@ -139,8 +139,8 @@ hop-lag: 輸出音訊落後輸入 2 hops (heads 1 hop + DF future tap 1 hop, 串
 <tr><th>Tensor</th><th>shape</th><th>dtype</th><th>每次呼叫框數</th><th>時域樣本</th><th>備註</th></tr>
 <tr><td><code>frame</code>(C 入)</td><td>[512]</td><td>float32</td><td>1 hop</td><td>512(10.67 ms)</td><td><code>dfn2_analysis</code> 只吃新樣本,滑窗自持</td></tr>
 <tr><td><code>spec_re/spec_im</code></td><td>[513] ×2</td><td>float32</td><td>1</td><td>—</td><td>原尺度頻譜(masking/ISTFT 用)</td></tr>
-<tr><td><code>feat_erb</code>(模型入)</td><td>C: [32];圖: (1,1,T,32)</td><td>float32</td><td>1</td><td>—</td><td>dB mean-norm 後 /40</td></tr>
-<tr><td><code>feat_spec</code>(模型入)</td><td>C: [192] = [re×96 ‖ im×96];圖: (1,2,T,96)</td><td>float32</td><td>1</td><td>—</td><td>非交錯;C 內已乘 <code>DFN2_ANALYSIS_SCALE</code></td></tr>
+<tr><td><code>erb</code>(模型入;C 緩衝 <code>feat_erb</code>)</td><td>C: [32];圖: (1,1,T,32)</td><td>float32</td><td>1</td><td>—</td><td>dB mean-norm 後 /40</td></tr>
+<tr><td><code>spec</code>(模型入;C 緩衝 <code>feat_spec</code>)</td><td>C: [192] = [re×96 ‖ im×96];圖: (1,2,T,96)</td><td>float32</td><td>1</td><td>—</td><td>非交錯;C 內已乘 <code>DFN2_ANALYSIS_SCALE</code></td></tr>
 <tr><td><code>erb_mask</code>(模型出)</td><td>(1,1,T,32) → C [32]</td><td>float32</td><td>1</td><td>—</td><td>sigmoid ∈ [0,1]</td></tr>
 <tr><td><code>coefs</code>(模型出)</td><td>(1,T,96,10) → C [960]</td><td>float32</td><td>1</td><td>—</td><td>layout = (bin, tap, re/im),bin 最外</td></tr>
 <tr><td><code>alpha</code>(模型出)</td><td>(1,T,1) → C scalar</td><td>float32</td><td>1</td><td>—</td><td>sigmoid;0=走 masked,1=走 DF</td></tr>
@@ -171,9 +171,9 @@ ISTFT 全在圖外的 C。<code>export_onnx.py</code> 已交付 stateless heads 
 <tr><td><code>hi_delay_re/im</code></td><td>[5][417] ×2</td><td>16,680</td><td>C struct</td><td>高頻段同步延遲(band split 對時)</td></tr>
 <tr><td><code>stream_frame_index</code> 等 index</td><td>—</td><td>16</td><td>C struct</td><td>串流框編號 / ring 指標</td></tr>
 <tr><td>scratch 區</td><td>—</td><td>~12.4 KB</td><td>C struct</td><td>非跨呼叫,每次覆寫</td></tr>
-<tr><td><code>encoder.emb_gru</code> h</td><td>(1,B,256)</td><td>1,024</td><td>host caller</td><td>顯式 graph I/O；跨次呼叫由 host 保存</td></tr>
-<tr><td><code>erb_dec.emb_gru</code> h</td><td>(2,B,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；ERB decoder 2 層 GRU</td></tr>
-<tr><td><code>df_dec.df_gru</code> h</td><td>(2,B,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；DF decoder 2 層 GRU</td></tr>
+<tr><td><code>h_encoder</code></td><td>(1,B,256)</td><td>1,024</td><td>host caller</td><td>顯式 graph I/O；<code>encoder.emb_gru</code> hidden，跨次呼叫由 host 保存</td></tr>
+<tr><td><code>h_erb</code></td><td>(2,B,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；ERB decoder(<code>erb_dec.emb_gru</code>)2 層 GRU</td></tr>
+<tr><td><code>h_df</code></td><td>(2,B,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；DF decoder(<code>df_dec.df_gru</code>)2 層 GRU</td></tr>
 <tr><td>conv 時間快取</td><td>erb_conv0/df_conv0 的 3 幀輸入 window；df_convp:4 框×(64×96)=24,576 f32</td><td>約 100 KB</td><td>host caller</td><td>window/pathway history 都是顯式 graph I/O；加速器不持有 state</td></tr>
 </table></div>
 <p class="note"><code>sizeof(DFN2State)</code> = 85,632 bytes(本機以 <code>-ffp-contract=off</code> 編譯量測)。</p>

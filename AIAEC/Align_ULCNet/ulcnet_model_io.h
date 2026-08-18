@@ -23,7 +23,11 @@ extern "C" {
 /* Version 3 fixes the deployed far branch to AEC-aligned far.  The exported
  * metadata separately records the checkpoint's training provenance.  Kept
  * numerically equal to export_onnx.py's STATE_LAYOUT_VERSION. */
-#define ULCNET_MODEL_IO_LAYOUT_VERSION 3u
+/* Version 4 renamed the tensors and their mirrored fields (error/far
+ * inputs, output head, h_gru0/h_gru1 hiddens, *_out states); runtimes
+ * bind by name, so the rename is a contract change even though every
+ * shape stayed identical. */
+#define ULCNET_MODEL_IO_LAYOUT_VERSION 4u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
@@ -73,13 +77,13 @@ typedef struct UlcnetModelIoMemReq {
  *   GRU hidden        [2,1,128].
  */
 typedef struct UlcnetModelIoInputs {
-    const float *linear_error_ri;
-    const float *far_end_ri;
+    const float *error;
+    const float *far;
     const float *key_history;
     const float *value_history;
     const float *logit_history;
-    const float *gru0_hidden;
-    const float *gru1_hidden;
+    const float *h_gru0;
+    const float *h_gru1;
     size_t spectrum_ri_elements;
     size_t key_history_elements;
     size_t value_history_elements;
@@ -94,12 +98,12 @@ typedef struct UlcnetModelIoInputs {
  * prepare() fills every element with NaN so commit() detects partial writes.
  */
 typedef struct UlcnetModelIoOutputs {
-    float *enhanced_ri;
+    float *output;
     float *key_now;
     float *value_now;
     float *logit_now;
-    float *gru0_hidden_next;
-    float *gru1_hidden_next;
+    float *h_gru0_out;
+    float *h_gru1_out;
     size_t spectrum_ri_elements;
     size_t key_now_elements;
     size_t value_now_elements;

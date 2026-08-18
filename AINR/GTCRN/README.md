@@ -37,7 +37,8 @@ python3 export_erb_matrix.py --model output/gtcrn_best.pth \
   --output-dir output/erb --format all
 ```
 
-The ONNX I/O is `mix` plus `conv_cache`, `tra_cache`, and `inter_cache`, with
+The ONNX I/O is `input` plus `conv_cache`, six per-GRU `h_tra_*` and two
+`h_dpgrnn*` hidden tensors, with
 the enhanced spectrum and updated caches returned each call. Calibration
 captures real pre-frame cache values rather than repeating zero state.
 Use `--format npz --output calib/gtcrn.npz` when a NumPy archive is needed.
