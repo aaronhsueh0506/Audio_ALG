@@ -8,14 +8,15 @@ of torch.stft/istft(center=True).
 
 The C side now transforms through audio_common's fft_wrapper (caller-owned
 FftHandle, real RFFT/IRFFT, backend-switched by BACKEND=kiss/ne10), so the
-fixture first builds audio_common's KISS static lib the way the AEC C tests
-document it (make -s -C ../audio_common BACKEND=kiss lib + print-lib-path)
-and links it into the driver. The driver deliberately shares ONE FftHandle
-across the analysis and the synthesis (strictly sequential use), exercising
-the same sharing contract the pipeline variants rely on.
+fixture first builds audio_common's NE10 static lib (the default backend
+everywhere since 2026-08-18) the way the AEC C tests document it
+(make -s -C ../audio_common BACKEND=ne10 lib + print-lib-path) and links it
+into the driver. The driver deliberately shares ONE FftHandle across the
+analysis and the synthesis (strictly sequential use), exercising the same
+sharing contract the pipeline variants rely on.
 
 Expected agreement is float-ULP class, not bit-exact: the C side uses the
-f32 KISS FFT while torch computes with double twiddles. Measured ~2e-5
+f32 NE10 FFT while torch computes with double twiddles. Measured ~2e-5
 absolute on unit-scale audio; tolerances are pinned at ~10x that. A
 one-frame misalignment shows up as O(1) error, so the comparison has teeth
 by construction (asserted below).
@@ -102,17 +103,17 @@ int main(int argc, char **argv) {
 
 @pytest.fixture(scope='module')
 def audio_common_lib():
-    """audio_common's KISS static lib, built + located the way the AEC C
-    tests document it (make -s -C ../audio_common BACKEND=kiss lib, then
-    print-lib-path for this invocation's exact archive path)."""
+    """audio_common's NE10 static lib (default backend), built + located the
+    way the AEC C tests document it (make -s -C ../audio_common BACKEND=ne10
+    lib, then print-lib-path for this invocation's exact archive path)."""
     if shutil.which('make') is None:
         pytest.skip('no make available')
     subprocess.run(
-        ['make', '-s', '-C', _AC_DIR, 'BACKEND=kiss', 'lib'],
+        ['make', '-s', '-C', _AC_DIR, 'BACKEND=ne10', 'lib'],
         check=True, capture_output=True,
     )
     out = subprocess.run(
-        ['make', '-s', '-C', _AC_DIR, 'BACKEND=kiss', 'print-lib-path'],
+        ['make', '-s', '-C', _AC_DIR, 'BACKEND=ne10', 'print-lib-path'],
         check=True, capture_output=True, text=True,
     )
     lib = out.stdout.strip().splitlines()[-1]

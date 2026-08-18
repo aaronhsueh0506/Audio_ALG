@@ -38,10 +38,11 @@
  * test_config_validation_rejects().
  *
  * Build (from pipelines/, after `make libs` for the selected BACKEND):
- *   make test                     # kiss backend (default)
- *   make BACKEND=ne10 test        # ne10 backend
+ *   make test                     # ne10 backend (default everywhere)
+ *   make BACKEND=kiss test        # portable/bit-reproducible reference backend
  *
- * Standalone (no Makefile):
+ * Standalone (no Makefile; kiss reference variant shown -- swap kiss->ne10
+ * in the define and the audio_common archive path for the default backend):
  *   cc -O2 -std=gnu99 -I../lib/aec/c_impl/include -I../lib/aec/c_impl/example \
  *      -I../lib/nr/c_impl/include -I../../audio_common/include \
  *      -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" \

@@ -22,8 +22,8 @@
  * `// BOARD:` comment.
  *
  * Build/run (from pipelines/):
- *   make example-adapter                # kiss backend (default)
- *   make BACKEND=ne10 example-adapter    # ne10 backend
+ *   make example-adapter                 # ne10 backend (default everywhere)
+ *   make BACKEND=kiss example-adapter    # portable/bit-reproducible reference backend
  *
  * Flow demonstrated (mirrors README.md "Board Integration" -> "Sequence"):
  *   1. query    audio_pipeline_get_mem_requirements() — EVERY time, never

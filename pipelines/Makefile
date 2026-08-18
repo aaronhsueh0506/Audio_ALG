@@ -52,12 +52,15 @@
 #
 # Usage:
 #   make                       # resolves+builds all three producer archives
-#                              # (BACKEND=kiss) + both pipeline binaries
-#   make BACKEND=ne10          # NE10 backend -- every axis this file and the
-#                              # three producers' own Makefiles key on
-#                              # (BACKEND, EXTRA_CFLAGS, WERROR, NO_STDIO, ...)
-#                              # lands in a fresh, separate obj|bin directory
-#                              # automatically; no manual clean needed, ever
+#                              # (BACKEND=ne10, the default everywhere) + both
+#                              # pipeline binaries
+#   make BACKEND=kiss          # portable, bit-reproducible KISS reference
+#                              # backend, pass explicitly -- every axis this
+#                              # file and the three producers' own Makefiles
+#                              # key on (BACKEND, EXTRA_CFLAGS, WERROR,
+#                              # NO_STDIO, ...) lands in a fresh, separate
+#                              # obj|bin directory automatically; no manual
+#                              # clean needed, ever
 #   make EXTRA_CFLAGS="..."    # forwarded to all three producers AND this
 #                              # pipeline's own compile
 #   make WERROR=1              # opt-in: -Werror for this file's own TUs
@@ -156,7 +159,7 @@ ULCNET_DIR = $(AIAEC_DIR)/Align_ULCNet
 # lib/nr sub-makes so all three always agree on the exact same audio_common
 # checkout.
 AC_DIR ?= ../../audio_common
-BACKEND ?= kiss
+BACKEND ?= ne10
 
 # Announce the resolved backend on every build (same MAKECMDGOALS guard as
 # audio_common's own banner: print-bin-dir/print-obj-dir/print-lib-path are

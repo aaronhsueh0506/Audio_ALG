@@ -26,7 +26,7 @@ THIRD_PARTY_DIR ?= third_party
 AC_DIR ?= ../../../audio_common
 ULCNET_DIR ?= $(ALG_DIR)/AIAEC/Align_ULCNet
 
-BACKEND = kiss
+BACKEND = ne10
 SIMD ?= 1
 WERROR = 0
 NO_STDIO = 0

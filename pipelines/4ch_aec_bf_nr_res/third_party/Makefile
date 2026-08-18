@@ -15,7 +15,7 @@ RANLIB ?= ranlib
 
 AC_DIR ?= ../../../../audio_common
 AC_DIR_ABS := $(abspath $(AC_DIR))
-BACKEND = kiss
+BACKEND = ne10
 SIMD ?= 1
 WERROR = 0
 NO_STDIO = 0

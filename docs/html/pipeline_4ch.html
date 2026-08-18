@@ -123,10 +123,10 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <p>n_freqs = 129(16k/256)/ 257(16k/512)/ 513(48k/1024)。</p>
 
 <h2>State 表</h2>
-<p>單一 caller pool,wrapper carve 順序 <code>self, core, srp, gsc, gsc_spectrum, gsc_weights</code>;核心自己再 carve 4 lane + NR + FFT + 工作 buffer。實測(16 kHz KISS,2026-08-13 probe / smoke):</p>
+<p>單一 caller pool,wrapper carve 順序 <code>self, core, srp, gsc, gsc_spectrum, gsc_weights</code>;核心自己再 carve 4 lane + NR + FFT + 工作 buffer。實測(16 kHz KISS,2026-08-13 probe / smoke)。<b>2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10</b>(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>);下表除「完整 wrapper 合計」一列已用今日 ne10 實測更新外,其餘 @16k/512 核心細項仍是 backend 切換前的 kiss 參考值,尚未按新預設重跑——ne10 待現查:</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td>4× <code>Aec</code> lanes</td><td>1,516,288 B(@16k/512)</td><td>pool(core)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)</td></tr>
+<tr><td>4× <code>Aec</code> lanes</td><td>1,516,288 B(@16k/512,kiss;ne10 待現查)</td><td>pool(core)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)</td></tr>
 <tr><td><code>DelayAec3 shared_delay</code></td><td>struct 內嵌</td><td>C struct(core)</td><td>48k 時內建 anti-alias 降頻 sidechain</td></tr>
 <tr><td><code>delay_ring</code></td><td>[ring] f32;ring=ceil(max_delay_ms×sr/1000)+2·hop+1</td><td>pool(core)</td><td>預設 1024 ms → 16,641 samples @16k/128</td></tr>
 <tr><td><code>MmseLsaDenoiser</code>(×1)</td><td>133,472 B(@16k/512)</td><td>pool(core)</td><td>mono NR</td></tr>
@@ -136,8 +136,8 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>GSC 借用 <code>srp-&gt;a_array</code></td></tr>
 <tr><td><code>GSC</code>(RLS P/weights)</td><td>4×n_freqs 級</td><td>pool(wrapper)</td><td>lambda 0.995 經 <code>mmse_lsa_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
 <tr><td>auto-VAD(<code>noise_power/vad_hangover</code>)</td><td>純量</td><td>C struct(wrapper)</td><td>-55 dBFS / SNR 3.0 / hangover 8(retimed);EMA 0.999/0.95(retimed)</td></tr>
-<tr><td>核心合計 @16k/512</td><td>1,669,088 B</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(kiss、<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心,1,485,664 B,見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
-<tr><td>完整 wrapper 合計</td><td>1,910,640 B @16k/256(預設)/ 6,826,464 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(kiss,layout_version=4);由 static smoke 的 <code>Total:</code> 行印出。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
+<tr><td>核心合計 @16k/512</td><td>1,669,088 B(kiss;ne10 待現查)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(kiss、<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,480,160 B(kiss 舊值 1,485,664 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
+<tr><td>完整 wrapper 合計</td><td>1,907,600 B @16k/256(預設)/ 6,811,904 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,2026-08-18 起的預設後端,layout_version=4);由 static smoke 的 <code>Total:</code> 行印出(kiss 舊值:1,910,640 B @16k/256 / 6,826,464 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
@@ -161,6 +161,6 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/pipeline.py</code> + <code>tests/test_pipeline.py</code></td><td>Python reference(copy 語意,允許多 pre-frame 在飛)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/Makefile</code></td><td>建置 <code>libaudio_pipeline_4ch.a</code>(只含 <code>4aec_nr_res.o</code> 一個 object;<code>audio_pipeline_4ch.o</code>/ULCNet 變體物件皆各自 link,不進這個 archive)、<code>test</code>、<code>audit-no-stdio</code>;也是 <code>4ch_alignulcnet/</code> 應用轉發建置的目標目錄</td></tr>
 </table>
-<p>測試實測(2026-08-16 重跑, BACKEND=kiss):本目錄 <code>make test</code> 是一站式關卡(<code>test_4aec_nr_res</code>——含 known-delay profile 區塊——+ <code>test_spatial_third_party</code> + <code>test_audio_pipeline_4ch</code> + <code>test_audio_pipeline_4ch_ulcnet</code> + 4 個 static smoke @16k/48k + <code>4ch_alignulcnet</code> 骨架 bare 與 <code>--delay-num-filters 1</code> 兩種 profile,鏡像 mono 在 <code>pipelines/Makefile</code> 的安排)共 <b>316 個 <code>PASS:</code> 標記 / 0 FAIL</b>(另有 4 個 static smoke 與 2 個板端骨架 profile 各印一次 PASS,合計 322 個 PASS 字樣),四支 unit-test binary 各印 <code>All ... tests passed</code>,4 個 static smoke 各印 <code>smoke PASS</code>。<code>4ch_alignulcnet/</code> 自己的 <code>make test</code> 是委派目標,另可單獨跑,見 <code>pipeline_ulcnet_4ch.html</code>。</p>
+<p>測試實測(2026-08-18 重跑, BACKEND=ne10 預設):本目錄 <code>make test</code> 是一站式關卡(<code>test_4aec_nr_res</code>——含 known-delay profile 區塊——+ <code>test_spatial_third_party</code> + <code>test_audio_pipeline_4ch</code> + <code>test_audio_pipeline_4ch_ulcnet</code> + 4 個 static smoke @16k/48k + <code>4ch_alignulcnet</code> 骨架 bare 與 <code>--delay-num-filters 1</code> 兩種 profile,鏡像 mono 在 <code>pipelines/Makefile</code> 的安排)共 <b>316 個 <code>PASS:</code> 標記 / 0 FAIL</b>(另有 4 個 static smoke 與 2 個板端骨架 profile 各印一次 PASS,合計 322 個 PASS 字樣),四支 unit-test binary 各印 <code>All ... tests passed</code>,4 個 static smoke 各印 <code>smoke PASS</code>。<code>4ch_alignulcnet/</code> 自己的 <code>make test</code> 是委派目標,另可單獨跑,見 <code>pipeline_ulcnet_4ch.html</code>。</p>
 </body>
 </html>

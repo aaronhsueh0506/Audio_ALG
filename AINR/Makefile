@@ -2,7 +2,7 @@ CC ?= cc
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -ffp-contract=off -I.
 LDFLAGS ?=
 SIMD ?= 1
-BACKEND ?= kiss
+BACKEND ?= ne10
 
 # The FFT (and Complex type) come from audio_common -- the cross-product
 # base library every port already carries; the models keep only their own

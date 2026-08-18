@@ -80,7 +80,8 @@
  *      infer frozen for exactly those frames and resuming right after, one
  *      model->reset per generation.
  *
- * Build (from pipelines/): `make test` (kiss backend). Standalone:
+ * Build (from pipelines/): `make test` (ne10 default; BACKEND=kiss for the
+ * portable reference). Standalone (kiss reference variant shown):
  *   cc -O2 -std=gnu99 -ffp-contract=off -I. -I../lib/aec/c_impl/include \
  *      -I../lib/aec/c_impl/example -I../../audio_common/include \
  *      -I../../audio_common/lib/kiss_fft -I../AIAEC/Align_ULCNet \

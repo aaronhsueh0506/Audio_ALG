@@ -163,10 +163,10 @@ def _scene(delay, fft, hops, shift_at=None, shift_delay=None):
 def dumper():
     if shutil.which("make") is None or shutil.which("cc") is None:
         pytest.skip("C build tools are unavailable")
-    subprocess.run(["make", "-s", "-C", _CORE_DIR, "BACKEND=kiss",
+    subprocess.run(["make", "-s", "-C", _CORE_DIR, "BACKEND=ne10",
                     "dump_delay_parity"], check=True)
     located = subprocess.run(
-        ["make", "-s", "-C", _CORE_DIR, "BACKEND=kiss", "print-bin-dir"],
+        ["make", "-s", "-C", _CORE_DIR, "BACKEND=ne10", "print-bin-dir"],
         check=True, capture_output=True, text=True)
     return os.path.join(located.stdout.strip().splitlines()[-1],
                         "dump_delay_parity")
