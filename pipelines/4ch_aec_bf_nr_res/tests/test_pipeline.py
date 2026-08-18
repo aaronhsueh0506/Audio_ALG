@@ -259,3 +259,153 @@ def test_pre_frame_cannot_resume_on_a_different_pipeline_instance():
     )
     with pytest.raises(ValueError, match="different pipeline"):
         other.process_post_beamformer(pre, _external_equal_weight(pre))
+
+
+# ---------------------------------------------------------------------------
+# An admitted shared-delay change REALIGNS the four lanes; it does not reset
+# them.  A reset per lane -- what this used to be -- wipes four converged
+# filters and restarts four WOLA sequences on one hop: the echo comes back for
+# dozens of hops and the output drops a near-silent one.  See
+# lib/aec ``AEC.apply_external_realign`` and its test_external_realign.py.
+# ---------------------------------------------------------------------------
+
+_REALIGN_HOP = 128
+_REALIGN_DELAY = 300        # inside the lanes' 896-sample tap span at this grid
+_REALIGN_CONVERGE = 160     # hops served at the raw alignment first
+_REALIGN_WATCH = 8          # hops watched after the change
+
+
+class _ScriptedDelay:
+    """Publish a scripted ``(delay, solid)`` per hop.
+
+    Scripted rather than provoked, for the same reason ``_ScriptedEstimator``
+    in the sibling test_delay_parity.py is (kept separate rather than imported,
+    because that module shells out to a C build at test time and this one is
+    pure Python): a live DelayAec3 decides WHEN it locks, and this test is
+    about what the pipeline does on the hop it locks, not about the estimator.
+    The physical echo path never moves -- only the published alignment does --
+    so the lanes' converged response has to travel exactly ``_REALIGN_DELAY``
+    taps to stay matched, which is precisely what the realign is for.
+    """
+
+    def __init__(self, script):
+        self._script = list(script)
+        self._index = -1
+
+    def accumulate(self, capture, render):
+        self._index += 1
+
+    def reset(self):
+        self._index = -1
+
+    @property
+    def _current(self):
+        return self._script[min(max(self._index, 0), len(self._script) - 1)]
+
+    @property
+    def estimated_delay(self):
+        return self._current[0]
+
+    @property
+    def confidence(self):
+        return 1.0 if self._current[1] else 0.5
+
+    @property
+    def is_solid(self):
+        return bool(self._current[1])
+
+    @property
+    def _n_updates(self):
+        return 3
+
+
+def _realign_scene():
+    """Four mics carrying the same echo at a fixed bulk delay, and a script
+    that moves the published alignment from 0 to that delay once the lanes
+    have converged against it."""
+    total = _REALIGN_CONVERGE + _REALIGN_WATCH + 2
+    rng = np.random.default_rng(0x4CEA)
+    far = (rng.standard_normal((total + 4) * _REALIGN_HOP) * 0.25).astype(np.float32)
+    mic = np.zeros_like(far)
+    mic[_REALIGN_DELAY:] = 0.5 * far[:-_REALIGN_DELAY]
+    script = [(0, True)] * _REALIGN_CONVERGE
+    script += [(_REALIGN_DELAY, True)] * (total - _REALIGN_CONVERGE)
+    return far, mic, script
+
+
+def _run_realign_scene():
+    pipeline = FourChannelAecPipeline(
+        FourChannelAecConfig(sample_rate=16000, frame_size=2 * _REALIGN_HOP,
+                             hop_size=_REALIGN_HOP)
+    )
+    far, mic, script = _realign_scene()
+    pipeline._shared_delay._estimator = _ScriptedDelay(script)
+    rows = []
+    for index in range(len(script)):
+        lo, hi = index * _REALIGN_HOP, (index + 1) * _REALIGN_HOP
+        mics = np.repeat(mic[lo:hi, None], 4, axis=1)
+        pre = pipeline.process_pre_beamformer(mics, far[lo:hi])
+        rows.append({
+            "changed": bool(pre.delay.changed),
+            "delay": int(pre.delay.delay_samples),
+            "warm": pipeline.realign_warm_lane_count,
+            "soft": pipeline.realign_soft_lane_count,
+            "frames": tuple(lane._frame_count for lane in pipeline._lanes),
+            "residual": float(np.sqrt(np.mean(
+                np.square(pre.linear_channels.astype(np.float64))))),
+            "echo": float(np.sqrt(np.mean(
+                np.square(mic[lo:hi].astype(np.float64))))),
+        })
+    return pipeline, rows
+
+
+def test_admitted_delay_change_realigns_four_lanes_instead_of_resetting_them():
+    pipeline, rows = _run_realign_scene()
+
+    changed = [i for i, row in enumerate(rows) if row["changed"]]
+    assert changed[0] == 0, "the first acquisition must land on hop 0"
+    assert len(changed) == 2, "the scene must acquire once and re-lock once"
+    relock = changed[1]
+    assert rows[relock]["delay"] == _REALIGN_DELAY
+
+    # The acquisition sweep is four zero-delta no-ops reported as soft, which
+    # is what `realign_soft_lane_count` documents and the only reason the
+    # counter is not read as "four filters were restarted".
+    assert (rows[0]["warm"], rows[0]["soft"]) == (0, 4)
+
+    before = rows[relock - 1]
+    assert before["residual"] < 0.5 * before["echo"], (
+        "the lanes must be cancelling before the change, or nothing below "
+        "measures a realign"
+    )
+
+    # 1. Every lane was realigned, and every one of them kept its cancellation
+    #    (the warm tap-transfer path).  A lane.reset() sweep reaches neither
+    #    counter at all.
+    assert rows[relock]["warm"] == before["warm"] + 4
+    assert rows[relock]["soft"] == before["soft"]
+
+    # 2. No lane restarted its framing: _frame_count is the hop counter a
+    #    reset() zeroes, so it is the cheapest witness that the WOLA sequence
+    #    and the analysis frames continued across the boundary.
+    assert rows[relock]["frames"] == tuple(
+        n + 1 for n in before["frames"]
+    ), "a lane restarted its frame sequence across the realign"
+    assert all(row["frames"] == (i + 1,) * 4 for i, row in enumerate(rows)), (
+        "every lane must advance exactly one frame per hop for the whole scene"
+    )
+
+    # 3. The cancellation actually survived: no re-exposed echo on any hop
+    #    after the change.  This is the audible half -- 1 and 2 can be
+    #    satisfied by a realign that shifts the taps the wrong way.
+    for row in rows[relock:]:
+        assert row["residual"] < 0.5 * row["echo"], (
+            f"echo re-exposed after the realign: {row['residual']:.4f} vs "
+            f"echo {row['echo']:.4f}"
+        )
+
+    # 4. The counters share the lanes' reset epoch, so an instrumentation
+    #    total can never span two of them (matches four_aec_nr_res_reset()).
+    pipeline.reset()
+    assert pipeline.realign_warm_lane_count == 0
+    assert pipeline.realign_soft_lane_count == 0

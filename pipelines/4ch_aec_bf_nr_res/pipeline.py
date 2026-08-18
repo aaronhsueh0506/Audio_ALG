@@ -769,6 +769,8 @@ class FourChannelAecPipeline:
         self._owner_token = object()
         self._next_pre_frame = 0
         self._next_post_frame = 0
+        self._realign_warm_lanes = 0
+        self._realign_soft_lanes = 0
 
     @property
     def matched_filter_instance_count(self) -> int:
@@ -786,6 +788,36 @@ class FourChannelAecPipeline:
     def beamformer_configured(self) -> bool:
         return self._beamformer is not None
 
+    @property
+    def realign_warm_lane_count(self) -> int:
+        """How many lane realigns took the warm tap-transfer path.
+
+        Read-only and cumulative since construction or the last ``reset()``.
+        Every hop that publishes ``changed`` sweeps all four lanes, so this and
+        ``realign_soft_lane_count`` grow by exactly 4 between them on such a
+        hop and not at all otherwise. Warm means the learned IR was shifted and
+        the cancellation survived the move.
+
+        Soft is the engine's "not warm" and covers two cases, because
+        ``apply_external_realign`` returns 0 for both: the lane's filter was
+        restarted (taps and far history only — see the method), OR the delta
+        was 0 and nothing happened at all. The second is not hypothetical: a
+        first acquisition that lands on applied delay 0 publishes ``changed``
+        with a zero delta, so a fresh stream's first sweep is four soft counts
+        for four no-ops. Read the pair against the delay trajectory, not on its
+        own. Nothing branches on either count.
+
+        The rejection outcome (-1) is not counted because it cannot occur here:
+        this pipeline builds its own lanes, and their config resolves to
+        EXTERNAL_ALIGNED, the one mode the call accepts. Mirrors the C core's
+        ``four_aec_nr_res_realign_warm_lane_count()`` pair.
+        """
+        return self._realign_warm_lanes
+
+    @property
+    def realign_soft_lane_count(self) -> int:
+        return self._realign_soft_lanes
+
     def reset(self) -> None:
         self._shared_delay.reset()
         self._delay_line.reset()
@@ -793,6 +825,10 @@ class FourChannelAecPipeline:
             lane.reset()
         self._post_beam_res.reset()
         self._last_delay = 0
+        # Zeroed with the lanes' own state, so every instrumentation total
+        # shares one epoch (matches four_aec_nr_res_reset()).
+        self._realign_warm_lanes = 0
+        self._realign_soft_lanes = 0
         self._generation += 1
         self._next_pre_frame = 0
         self._next_post_frame = 0
@@ -833,10 +869,28 @@ class FourChannelAecPipeline:
                                               proxy_lane_cancelling)
         aligned_render = self._delay_line.process(render, delay.delay_samples)
         if delay.changed:
-            # All filters learned against the former shared alignment.  Reset
-            # all four together; never let lanes drift to different delays.
+            # All four filters learned against the former shared alignment, so
+            # all four move together on the SAME hop the reference does; never
+            # let lanes drift to different delays.
+            #
+            # Realign instead of reset: ``apply_external_realign`` shifts each
+            # converged filter by the alignment delta (warm tap-transfer when
+            # the evidence gate holds, a filter-only restart otherwise), so the
+            # cancellation survives the move and the WOLA sequences continue.
+            # A ``reset()`` per lane -- what this used to be -- cost one
+            # near-zero output hop plus dozens of hops of re-exposed echo: the
+            # spectrogram vertical line.  ``_last_delay`` is the alignment the
+            # lanes were served BEFORE this hop's decision (0 until the
+            # estimate first turns solid), so the delta is exactly the movement
+            # they have to absorb.  Same call, same delta and same per-lane
+            # sweep as the C core's process_pre (4aec_nr_res.c).
+            delta = int(delay.delay_samples) - int(self._last_delay)
             for lane in self._lanes:
-                lane.reset()
+                outcome = lane.apply_external_realign(delta)
+                if outcome == 1:
+                    self._realign_warm_lanes += 1
+                elif outcome == 0:
+                    self._realign_soft_lanes += 1
             self._last_delay = delay.delay_samples
 
         lane_outputs = np.empty((_N_CHANNELS, self.hop_size), dtype=np.float32)

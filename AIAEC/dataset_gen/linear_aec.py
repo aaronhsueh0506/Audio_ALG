@@ -518,7 +518,7 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
     #   linear_error bfd504797d831b34ccfac20c50328b662d4bf4240728f391f4c8171a47579eb9
     #   echo_hat     5abe156cfa0175f2dcd762860c4543eec077b677b2184bffa9f11af8da70ed26
     "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe":
-        "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd",
+        "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
 
     # lib/aec adds the delay backward-quarantine (Path B), which holds a
     # candidate EARLIER than the delay in force while the linear filter is
@@ -536,7 +536,48 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
     # (4,096,000 with `echo_hat`). The control that makes that meaningful:
     # the same render with the quarantine ENABLED differs in 121,069 bytes.
     "ffc2e044d031f06a9d685ee77159e5a8d7d3075e5e3eaea8156746c416c1dd4e":
-        "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd",
+        "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
+
+    # lib/aec gains `AEC.apply_external_realign()` -- the caller-side far
+    # realign for EXTERNAL_ALIGNED instances -- and the refactors it needs to
+    # exist: `PBFDAF.reset()` is re-expressed as `reset_taps()` plus the two
+    # time-domain analysis buffers, `_reset_filter_derived_state()` as
+    # `_reset_filter_latches()` plus the AEC3 post chain and the pending-delay
+    # clear, `warm_shift_ir()` accepts a NEGATIVE shift (and owns the far-history
+    # clear for that direction), and the tap span / IR concatenation each get a
+    # single spelling (`PBFDAF.tap_span`, `get_time_domain_filter()`) that the
+    # existing acquisition path now shares.
+    #
+    # Inert on this frontend by CONSTRUCTION and by measurement. By
+    # construction: the entry point is reachable only in EXTERNAL_ALIGNED and
+    # this frontend is MATCHED (it returns -1 without touching state), and
+    # `warm_shift_ir`'s new behaviour is all on the `s < 0` arm, which the
+    # single pre-existing caller cannot reach (its gate is
+    # `0 < new_delay < reach`). The two splits re-group the same statements in
+    # the same order, with one independent pair transposed (the AEC3 post chain
+    # now runs after the warmup re-arm instead of before it).
+    #
+    # By measurement, on the same 32-second, 16-kHz/512/256, 400-ms-delay,
+    # white-noise scene the entry above uses: `linear_error` and `echo_hat`
+    # both render byte-identical, 2,048,000 bytes per stem. SHA-256:
+    #   linear_error 253483eef8730a0fd6b8dd730e3c6cd9f5701e871daf3b81c1e7913029b93b48
+    #   echo_hat     b7c9439882a1c4243ad1fda07832d6b09e8fc1aa6678404be5e8afd5687c6fd7
+    # The control that makes that meaningful -- the refactored code is genuinely
+    # ON this scene's path, not merely present in the file: over this render
+    # `_reset_filter_derived_state` runs twice and reaches the extracted
+    # `_reset_filter_latches` both times, and `PBFDAF.reset`/`reset_taps` and
+    # `PBFDKF._rearm_kalman` run four times each.
+    #
+    # `warm_shift_ir` and `get_time_domain_filter` are NOT on this scene (the
+    # acquisition takes the derived-state branch and the FilterAnalyzer never
+    # runs at this seam), so they are pinned separately: `warm_shift_ir`'s
+    # positive-shift output is byte-identical to the pre-change body across 30
+    # (grid, shift) pairs spanning 16k/512/256, 16k/256/128 and 48k/1024/512
+    # with shifts from 1 sample to 4x the tap span, and `get_time_domain_filter`
+    # -- which `warm_shift_ir` now calls instead of re-deriving the IR -- is
+    # byte-identical to the loop it replaced on those same three grids.
+    "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd":
+        "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
 }
 
 
