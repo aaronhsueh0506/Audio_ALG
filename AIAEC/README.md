@@ -97,7 +97,9 @@ records the calibration frames against it. Run it from the model directory:
 
 For Align-ULCNet, --primary-dir contains materialized linear-error WAVs. For
 the end-to-end models it contains microphone WAVs. Relative WAV paths in the
-primary and far trees must match.
+primary and far trees must match; differently-tokened names
+(mic_001.wav vs lpb_001.wav) pair via an explicit --pair-replace mic:lpb
+rule.
 
 Calibration formats:
 

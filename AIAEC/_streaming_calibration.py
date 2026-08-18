@@ -176,6 +176,11 @@ def main(model_name: str) -> None:
     parser.add_argument('--onnx', default=None,
                         help='where to write the graph these tensors bind to '
                              '(default: <output>.onnx)')
+    parser.add_argument('--pair-replace', default=None,
+                        metavar='PRIMARY_TOKEN:FAR_TOKEN',
+                        help='pair mic_001.wav with lpb_001.wav by replacing '
+                             'the token in primary names when looking up the '
+                             'far tree (identical names still match first)')
     parser.add_argument('--primary-is-mic', action='store_true',
                         help='Align_ULCNet only: --primary-dir holds RAW '
                              'microphone WAVs; the checkpoint-matched frozen '
@@ -196,7 +201,13 @@ def main(model_name: str) -> None:
 
     # Pairs are discovered before the model load and export, so a bad
     # --primary-dir/--far-dir fails on its own actionable error first.
-    pairs = discover_pairs(args.primary_dir, args.far_dir)
+    pair_replace = None
+    if args.pair_replace:
+        pieces = args.pair_replace.split(':')
+        if len(pieces) != 2 or not pieces[0]:
+            parser.error('--pair-replace takes PRIMARY_TOKEN:FAR_TOKEN')
+        pair_replace = (pieces[0], pieces[1])
+    pairs = discover_pairs(args.primary_dir, args.far_dir, pair_replace)
     random.Random(args.seed).shuffle(pairs)
 
     # The graph is exported (and parity-checked) in the same process, from

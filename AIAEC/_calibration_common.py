@@ -47,7 +47,16 @@ def far_mode_provenance(model_name):
     return CALIBRATION_ONLY_FAR_INPUT_MODE, CALIBRATION_ONLY_FAR_INPUT_MODE
 
 
-def discover_pairs(primary_dir, far_dir):
+def discover_pairs(primary_dir, far_dir, pair_replace=None):
+    """Pair primary/far WAVs by relative path.
+
+    Default: IDENTICAL relative names in both trees. With ``pair_replace``
+    = (primary_token, far_token) a primary name may also match the far tree
+    after replacing the token (mic_001.wav -> lpb_001.wav) -- an EXPLICIT,
+    deterministic rule the caller states, never a guessed similarity: a
+    wrong silent pairing would poison the whole calibration capture, so
+    anything unmatched still fails loudly.
+    """
     def inventory(root):
         root = Path(root).resolve()
         if not root.is_dir():
@@ -60,21 +69,40 @@ def discover_pairs(primary_dir, far_dir):
         return result
     primary = inventory(primary_dir)
     far = inventory(far_dir)
-    if set(primary) != set(far):
-        only_primary = sorted(set(primary) - set(far))
-        only_far = sorted(set(far) - set(primary))
+    pairs = []
+    matched_far = set()
+    unmatched = []
+    for name in sorted(primary):
+        candidates = [name]
+        if pair_replace and pair_replace[0] in name:
+            candidates.append(name.replace(*pair_replace))
+        hit = next((c for c in candidates if c in far), None)
+        if hit is None:
+            unmatched.append(name)
+        elif hit in matched_far:
+            raise ValueError(
+                'pair-replace maps two primary files onto the same far file '
+                '%r -- the rule is ambiguous for this data' % hit)
+        else:
+            matched_far.add(hit)
+            pairs.append((name, primary[name], far[hit]))
+    unused_far = sorted(set(far) - matched_far)
+    if unmatched or unused_far:
         raise ValueError(
             'primary/far relative WAV sets differ: pairing is by IDENTICAL '
-            'relative filename in both trees.\n'
-            '  only in primary (%d): %s\n'
-            '  only in far     (%d): %s\n'
-            'Rename one side so every pair shares one relative path '
-            '(e.g. case1.wav in both directories).' % (
-                len(only_primary), ', '.join(only_primary[:5]) +
-                (' ...' if len(only_primary) > 5 else ''),
-                len(only_far), ', '.join(only_far[:5]) +
-                (' ...' if len(only_far) > 5 else '')))
-    return [(name, primary[name], far[name]) for name in sorted(primary)]
+            'relative filename%s.\n'
+            '  unmatched primary (%d): %s\n'
+            '  unmatched far     (%d): %s\n'
+            'Rename one side, or state the naming rule explicitly with '
+            '--pair-replace PRIMARY_TOKEN:FAR_TOKEN '
+            '(e.g. --pair-replace mic:lpb).' % (
+                ' (pair-replace %s->%s applied)' % pair_replace
+                if pair_replace else '',
+                len(unmatched), ', '.join(unmatched[:5]) +
+                (' ...' if len(unmatched) > 5 else ''),
+                len(unused_far), ', '.join(unused_far[:5]) +
+                (' ...' if len(unused_far) > 5 else '')))
+    return pairs
 
 
 def _ri(spec):

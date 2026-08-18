@@ -123,3 +123,39 @@ def test_align_ulcnet_calibration_far_is_the_raw_input_waveform(tmp_path):
         torch.from_numpy(block['far']), expected,
         rtol=0.0, atol=2e-6,
     )
+
+
+def test_discover_pairs_pair_replace(tmp_path):
+    """An explicit token rule pairs mic_*.wav with lpb_*.wav; anything the
+    rule leaves unmatched still fails loudly, and an ambiguous rule (two
+    primaries mapping onto one far file) is rejected outright."""
+    import pytest as _pytest
+
+    from AIAEC._calibration_common import discover_pairs
+
+    primary = tmp_path / 'p'
+    far = tmp_path / 'f'
+    primary.mkdir()
+    far.mkdir()
+    for name in ('case1_mic.wav', 'case2_mic.wav'):
+        (primary / name).write_bytes(b'x')
+    for name in ('case1_lpb.wav', 'case2_lpb.wav'):
+        (far / name).write_bytes(b'x')
+
+    with _pytest.raises(ValueError, match='pair-replace'):
+        discover_pairs(primary, far)
+
+    pairs = discover_pairs(primary, far, ('mic', 'lpb'))
+    assert [(p[0], p[2].name) for p in pairs] == [
+        ('case1_mic.wav', 'case1_lpb.wav'),
+        ('case2_mic.wav', 'case2_lpb.wav'),
+    ]
+
+    (primary / 'case3_mic.wav').write_bytes(b'x')
+    with _pytest.raises(ValueError, match='case3_mic.wav'):
+        discover_pairs(primary, far, ('mic', 'lpb'))
+
+    (far / 'case3_lpb.wav').write_bytes(b'x')
+    (primary / 'case3_lpb.wav').write_bytes(b'x')   # identical-name AND rule
+    with _pytest.raises(ValueError, match='ambiguous'):
+        discover_pairs(primary, far, ('mic', 'lpb'))

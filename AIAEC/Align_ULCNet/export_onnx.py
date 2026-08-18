@@ -53,7 +53,9 @@ beside the artifact)::
         --max-delay-frames 8 \\
         --output AIAEC/Align_ULCNet/calib/align_ulcnet_d8.npz
 
-``--primary-dir`` and ``--far-dir`` must contain matching relative WAV paths.
+``--primary-dir`` and ``--far-dir`` must contain matching relative WAV
+paths; differently-tokened names (mic_001.wav vs lpb_001.wav) pair via an
+explicit ``--pair-replace mic:lpb`` rule.
 Calibration intentionally uses raw far-end audio; deployment supplies aligned
 far-end audio (the graph's ``far`` input is the AEC aligned-far seam on the
 board -- raw far before acquisition, aligned far afterward).  The calibration and ONNX commands must use the same
