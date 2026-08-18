@@ -116,6 +116,24 @@ def optimize_graph_file(path):
     print('[onnxoptimizer] %d -> %d nodes' % (before, len(graph.graph.node)))
 
 
+def _pin_static_output_shapes(graph, output_names, outputs):
+    """Declare every graph output with its concrete traced shape.
+
+    Shape inference cannot prove some extents static after GRU/Slice/Concat
+    and leaves symbolic dim_params, but with every input static the true
+    output shapes ARE static -- they are exactly the reference forward's
+    tensor shapes. Accelerator toolchains require static I/O declarations,
+    so the symbolic dims are overwritten with the measured ones.
+    """
+    shapes = {name: tuple(int(size) for size in tensor.shape)
+              for name, tensor in zip(output_names, outputs)}
+    for value_info in graph.graph.output:
+        tensor_shape = value_info.type.tensor_type.shape
+        tensor_shape.ClearField('dim')
+        for size in shapes[value_info.name]:
+            tensor_shape.dim.add().dim_value = size
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -342,6 +360,7 @@ def export_graph(wrapper, params, checkpoint_path, output_path,
     onnx.checker.check_model(graph)
     metadata = build_metadata(checkpoint_path, params, inputs, outputs)
     set_onnx_metadata(graph, metadata)
+    _pin_static_output_shapes(graph, OUTPUT_NAMES, outputs)
     onnx.save(graph, output_path)
     with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as stream:

@@ -200,3 +200,28 @@ def test_build_stream_model_follows_the_config_grid(tmp_path):
 
     with pytest.raises(RuntimeError, match='size mismatch'):
         build_stream_model(_grid_config(tmp_path, 512), checkpoint)
+
+
+def test_exported_graph_declares_fully_static_io(tmp_path):
+    """Every declared graph input AND output dim must be a concrete integer.
+
+    Shape inference leaves symbolic dim_params after GRU/Slice/Concat even
+    though static inputs make every output extent fixed; accelerator
+    toolchains reject symbolic I/O, so the exporter pins the declared output
+    shapes to the traced tensors' real shapes.
+    """
+    onnx = pytest.importorskip('onnx')
+    from export_onnx import export_graph
+
+    checkpoint = os.fspath(tmp_path / 'ckpt.pth')
+    torch.save(
+        {'state_dict': GTCRN(65, 64, nfft=512, fs=16000).state_dict()},
+        checkpoint,
+    )
+    stream, grid = build_stream_model(_grid_config(tmp_path, 512), checkpoint)
+    graph_path = os.fspath(tmp_path / 'gtcrn_static.onnx')
+    export_graph(stream, grid, checkpoint, graph_path)
+    graph = onnx.load(graph_path)
+    for value in list(graph.graph.input) + list(graph.graph.output):
+        for dim in value.type.tensor_type.shape.dim:
+            assert dim.HasField('dim_value'), value.name
