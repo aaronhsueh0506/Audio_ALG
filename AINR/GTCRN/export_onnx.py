@@ -122,6 +122,40 @@ def build_metadata(checkpoint_path, grid, inputs, outputs):
     }
 
 
+def _optimize_graph(path):
+    """onnxoptimizer cleanup, kept in lockstep with the RNNoise-ERB exporter.
+
+    The tracer leaves Identity/Constant/dead-end noise around every replayed
+    module; the fuse-and-eliminate passes drop it so the deployed graph
+    carries only real ops. Skipped when the package is absent -- the graph is
+    then correct but unoptimized, matching the RNNoise behaviour.
+    """
+    try:
+        import onnxoptimizer
+        from onnxoptimizer import (
+            get_available_passes,
+            get_fuse_and_elimination_passes,
+        )
+    except ImportError:
+        print('[skip] onnxoptimizer not installed; graph left unoptimized')
+        return
+    import onnx
+    wanted = {
+        'eliminate_nop_pad', 'eliminate_nop_transpose', 'eliminate_identity',
+        'eliminate_deadend', 'eliminate_unused_initializer',
+        'fuse_consecutive_transposes', 'fuse_consecutive_squeezes',
+        'fuse_consecutive_unsqueezes', 'fuse_matmul_add_bias_into_gemm',
+        'fuse_add_bias_into_conv',
+    }
+    passes = list(set(get_fuse_and_elimination_passes())
+                  | (wanted & set(get_available_passes())))
+    graph = onnx.load(path)
+    before = len(graph.graph.node)
+    graph = onnxoptimizer.optimize(graph, passes, fixed_point=True)
+    onnx.save(graph, path)
+    print('[onnxoptimizer] %d -> %d nodes' % (before, len(graph.graph.node)))
+
+
 def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
                  verify=False):
     """Write the ONNX graph plus its metadata JSON; optionally verify parity.
@@ -142,6 +176,7 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
         output_names=OUTPUT_NAMES,
         opset_version=opset, do_constant_folding=True,
     )
+    _optimize_graph(output_path)
     import onnx
     graph = onnx.load(output_path)
     onnx.checker.check_model(graph)

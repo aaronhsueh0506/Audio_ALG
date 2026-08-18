@@ -69,8 +69,14 @@ def _conv_depth_step(conv, x, cache):
     return output, combined[:, :, x.shape[2]:]
 
 
-def _deconv_depth_step(deconv, x, cache):
-    """Causal stride-one depthwise ConvTranspose2d as an ordinary Conv2d."""
+def _deconv_depth_step(deconv, x, cache, flipped_weight):
+    """Causal stride-one depthwise ConvTranspose2d as an ordinary Conv2d.
+
+    ``flipped_weight`` is ``deconv.weight.flip(-2, -1)`` precomputed at wrap
+    time: flipping inside the traced forward would put a step=-1 Slice pair
+    into the graph on every invocation (and defeat constant folding) for a
+    tensor that never changes after load.
+    """
     combined = torch.cat((cache, x), dim=2)
     next_cache = combined[:, :, x.shape[2]:]
     kt, kf = deconv.kernel_size
@@ -78,20 +84,19 @@ def _deconv_depth_step(deconv, x, cache):
     frequency_pad = (kf - 1) * df - deconv.padding[1]
     if frequency_pad:
         combined = F.pad(combined, (frequency_pad, frequency_pad, 0, 0))
-    weight = deconv.weight.flip(-2, -1)
     output = F.conv2d(
-        combined, weight, deconv.bias, stride=(1, 1), padding=0,
+        combined, flipped_weight, deconv.bias, stride=(1, 1), padding=0,
         dilation=deconv.dilation, groups=deconv.groups)
     return output, next_cache
 
 
-def _gt_step(block, x, conv_cache, tra_cache, decoder=False):
+def _gt_step(block, x, conv_cache, tra_cache, flipped_weight=None):
     first, residual = torch.chunk(x, chunks=2, dim=1)
     first = block.sfe(first)
     first = block.point_act(block.point_bn1(block.point_conv1(first)))
-    if decoder:
+    if flipped_weight is not None:
         first, conv_cache = _deconv_depth_step(
-            block.depth_conv, first, conv_cache)
+            block.depth_conv, first, conv_cache, flipped_weight)
     else:
         first, conv_cache = _conv_depth_step(
             block.depth_conv, first, conv_cache)
@@ -136,6 +141,11 @@ class StreamGTCRN(nn.Module):
         assert decoder_pads == encoder_pads[::-1]
         self._encoder_slices = tuple(bounds)
         self._decoder_slices = tuple(reversed(bounds))
+        for index, block in enumerate(model.decoder.de_convs[:len(bounds)]):
+            self.register_buffer(
+                '_decoder_flip%d' % index,
+                block.depth_conv.weight.detach().flip(-2, -1).clone(),
+            )
 
     def forward(self, spectrum, conv_cache,
                 h_tra_enc0, h_tra_enc1, h_tra_enc2,
@@ -175,7 +185,7 @@ class StreamGTCRN(nn.Module):
             x, cache, hidden = _gt_step(
                 block, x + skips[4 - index],
                 conv_cache[1, :, :, start:end], dec_hidden[index],
-                decoder=True)
+                flipped_weight=getattr(self, '_decoder_flip%d' % index))
             dec_conv_reverse.append(cache)
             dec_tra.append(hidden)
         for index, block in enumerate(model.decoder.de_convs[3:], start=3):
