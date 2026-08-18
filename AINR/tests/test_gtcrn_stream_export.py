@@ -17,7 +17,7 @@ def _run_stream(model, spectrum, poison_conv=False):
             frames.append(outputs[0])
             state = list(outputs[1:])
             if poison_conv:
-                state[0] = torch.roll(state[0], 1, dims=3)
+                state[0] = torch.roll(state[0], 1, dims=2)
     return torch.cat(frames, dim=2), state
 
 
@@ -35,7 +35,7 @@ def test_stream_wrapper_matches_offline_random_weights(nfft, bins):
     online, state = _run_stream(model, spectrum)
     assert (offline - online).abs().max().item() < 2e-5
     conv, h_tra, h_dpgrnn = state[0], state[1:7], state[7:]
-    assert conv.shape == (2, 1, 16, 16, 33)
+    assert conv.shape == (2, 16, 16, 33)
     assert [h.shape for h in h_tra] == [(1, 1, 16)] * 6
     assert [h.shape for h in h_dpgrnn] == [(1, 33, 16)] * 2
 

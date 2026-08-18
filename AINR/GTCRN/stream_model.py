@@ -50,7 +50,9 @@ def initial_inputs(model):
                 for _ in range(2)]
     return (
         torch.randn(1, bins, 1, 2),
-        torch.zeros(2, 1, channels, depth, width),
+        # [enc/dec, channels, time, freq] -- no batch dim; the wrapper adds
+        # and strips it at the graph boundary so PTQ sees a rank-4 tensor.
+        torch.zeros(2, channels, depth, width),
         *h_tra,
         *h_dpgrnn,
     )
@@ -152,6 +154,7 @@ class StreamGTCRN(nn.Module):
                 h_tra_dec0, h_tra_dec1, h_tra_dec2,
                 h_dpgrnn1, h_dpgrnn2):
         model = self.model
+        conv_cache = conv_cache.unsqueeze(1)
         real = spectrum[..., 0].permute(0, 2, 1)
         imag = spectrum[..., 1].permute(0, 2, 1)
         magnitude = (real.square() + imag.square() + 1e-12).sqrt()
@@ -197,5 +200,5 @@ class StreamGTCRN(nn.Module):
         conv_out = torch.stack((
             torch.cat(enc_conv, dim=2),
             torch.cat(tuple(reversed(dec_conv_reverse)), dim=2),
-        ), dim=0)
+        ), dim=0).squeeze(1)
         return (enhanced, conv_out, *enc_tra, *dec_tra, inter0, inter1)

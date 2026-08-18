@@ -15,7 +15,10 @@ extern "C" {
  * nothing between invocations; its *_out state tensors must be committed
  * here and returned as the next call's inputs. Every GRU hidden is its own
  * h_* tensor; only the temporal conv history is a combined cache. */
-#define GTCRN_MODEL_LAYOUT_VERSION 2
+/* Version 3 dropped conv_cache's size-1 batch dim from the graph tensor
+ * ([2,16,16,33] instead of [2,1,16,16,33]); the bytes in this struct are
+ * unchanged, but the tensor rank is part of the binding contract. */
+#define GTCRN_MODEL_LAYOUT_VERSION 3
 #define GTCRN_MODEL_CONV_SIDES     2
 #define GTCRN_MODEL_CONV_CHANNELS  16
 #define GTCRN_MODEL_CONV_TIME      16
@@ -27,8 +30,8 @@ extern "C" {
 #define GTCRN_MODEL_DPGRNN_HIDDEN  16
 
 typedef struct {
-    /* ONNX: conv_cache[2,1,16,16,33]. */
-    float conv_cache[GTCRN_MODEL_CONV_SIDES][1]
+    /* ONNX: conv_cache[2,16,16,33]. */
+    float conv_cache[GTCRN_MODEL_CONV_SIDES]
                     [GTCRN_MODEL_CONV_CHANNELS]
                     [GTCRN_MODEL_CONV_TIME]
                     [GTCRN_MODEL_CONV_FREQ];

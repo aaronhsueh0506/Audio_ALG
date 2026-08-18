@@ -148,7 +148,7 @@ conv_cache 與八顆 h_* state 都由 host 作為 graph input/output 送回，�
 <tr><td><code>synthesis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>OLA(有效 256)</td></tr>
 <tr><td><code>window</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>root-Hann,init 後不變</td></tr>
 <tr><td><code>scratch_re/im</code></td><td>[512] ×2</td><td>4,096</td><td>C struct</td><td>非跨呼叫</td></tr>
-<tr><td><code>conv_cache</code></td><td>(2,1,16,16,33)</td><td>67,584(16,896 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder+decoder depth-conv 時間快取</td></tr>
+<tr><td><code>conv_cache</code></td><td>(2,16,16,33)</td><td>67,584(16,896 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder+decoder depth-conv 時間快取</td></tr>
 <tr><td><code>h_tra_enc0</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 0 個)</td></tr>
 <tr><td><code>h_tra_enc1</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 1 個)</td></tr>
 <tr><td><code>h_tra_enc2</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 2 個)</td></tr>

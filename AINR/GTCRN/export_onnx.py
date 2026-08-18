@@ -46,7 +46,7 @@ from AINR.DeepFilterNet2.export_onnx import (  # noqa: E402
 # Kept numerically equal to GTCRN_MODEL_LAYOUT_VERSION in gtcrn_process.h,
 # which declares the caller-owned cache struct this graph consumes and emits.
 # tests/test_gtcrn_export_contract.py pins the two together.
-STATE_LAYOUT_VERSION = 2
+STATE_LAYOUT_VERSION = 3
 
 # One h_* tensor per GRU so each state slot names itself; only the temporal
 # conv history stays a combined cache. Encoder TRA GRUs first, then decoder,
@@ -115,7 +115,7 @@ def build_metadata(checkpoint_path, grid, inputs, outputs):
         'input_feature_frames': 1,
         'output_frames_per_invocation': 1,
         'accelerator_persistent_state': False,
-        'recurrent_state': 'conv_tra_inter_caches_explicit_input_output',
+        'recurrent_state': 'conv_cache_plus_per_gru_h_explicit_input_output',
         'state_handoff': dict(zip(INPUT_NAMES[1:], OUTPUT_NAMES[1:])),
         'input_schema': _schema(INPUT_NAMES, inputs),
         'output_schema': _schema(OUTPUT_NAMES, outputs),

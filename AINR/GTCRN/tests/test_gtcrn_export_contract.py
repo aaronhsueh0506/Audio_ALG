@@ -88,7 +88,7 @@ def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
     schema = metadata['input_schema']
     assert set(schema) == set(INPUT_NAMES)
     assert schema['conv_cache'] == [
-        c_macro('GTCRN_MODEL_CONV_SIDES'), 1,
+        c_macro('GTCRN_MODEL_CONV_SIDES'),
         c_macro('GTCRN_MODEL_CONV_CHANNELS'),
         c_macro('GTCRN_MODEL_CONV_TIME'),
         c_macro('GTCRN_MODEL_CONV_FREQ'),
