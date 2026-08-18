@@ -23,15 +23,20 @@ import sys
 import numpy as np
 import torch
 
-from checkpoint_utils import extract_state_dict
-from model import GTCRN
-from train import build_contract, require_checkpoint_contract
-from stream_model import StreamGTCRN, initial_inputs
-
+# Path shims BEFORE the flat sibling imports, so this module also works when
+# imported package-qualified (``import AINR.GTCRN.export_onnx``) from a
+# quantization script instead of being run from this directory.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
+if _SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPT_DIR)
 if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
+
+from checkpoint_utils import extract_state_dict  # noqa: E402
+from model import GTCRN  # noqa: E402
+from train import build_contract, require_checkpoint_contract  # noqa: E402
+from stream_model import StreamGTCRN, initial_inputs  # noqa: E402
 
 # Package-qualified so it cannot collide with this project's own flat
 # ``model``/``train`` modules. The schema encoder is one contract across every
