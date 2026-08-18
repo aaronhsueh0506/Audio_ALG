@@ -61,9 +61,19 @@ def discover_pairs(primary_dir, far_dir):
     primary = inventory(primary_dir)
     far = inventory(far_dir)
     if set(primary) != set(far):
-        raise ValueError('primary/far relative WAV sets differ: missing=%d extra=%d' %
-                         (len(set(primary) - set(far)),
-                          len(set(far) - set(primary))))
+        only_primary = sorted(set(primary) - set(far))
+        only_far = sorted(set(far) - set(primary))
+        raise ValueError(
+            'primary/far relative WAV sets differ: pairing is by IDENTICAL '
+            'relative filename in both trees.\n'
+            '  only in primary (%d): %s\n'
+            '  only in far     (%d): %s\n'
+            'Rename one side so every pair shares one relative path '
+            '(e.g. case1.wav in both directories).' % (
+                len(only_primary), ', '.join(only_primary[:5]) +
+                (' ...' if len(only_primary) > 5 else ''),
+                len(only_far), ', '.join(only_far[:5]) +
+                (' ...' if len(only_far) > 5 else '')))
     return [(name, primary[name], far[name]) for name in sorted(primary)]
 
 
