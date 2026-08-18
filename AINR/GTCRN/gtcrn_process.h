@@ -18,10 +18,12 @@ extern "C" {
 /* Version 3 dropped conv_cache's size-1 batch dim from the graph tensor
  * ([2,16,16,33] instead of [2,1,16,16,33]); the bytes in this struct are
  * unchanged, but the tensor rank is part of the binding contract. Version 4
- * moved the magnitude feature to the host: the graph input is
- * [1,GTCRN_N_BINS,1,3] = [mag, re, im] built by gtcrn_model_input(), so the
- * sqrt never enters the quantized graph. */
-#define GTCRN_MODEL_LAYOUT_VERSION 4
+ * moved the magnitude feature to the host. Version 5 moves the WHOLE fixed
+ * front/back end out: the host bands [mag, re, im] through the exported ERB
+ * forward matrix and feeds THREE separate [1,GTCRN_MODEL_ERB_BANDS,1]
+ * inputs (independent quantization scales); the graph returns the
+ * ERB-domain complex mask and the host applies ERB inverse + CRM. */
+#define GTCRN_MODEL_LAYOUT_VERSION 5
 #define GTCRN_MODEL_CONV_SIDES     2
 #define GTCRN_MODEL_CONV_CHANNELS  16
 #define GTCRN_MODEL_CONV_TIME      16

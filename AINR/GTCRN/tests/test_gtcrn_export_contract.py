@@ -151,10 +151,12 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
 
     # Two invocations, recorded exactly the way calibration_main records them.
     captured = {}
-    first, *state = initial_inputs(stream.model)
+    inputs0 = initial_inputs(stream.model)
+    signals = tuple(inputs0[:3])
+    state = list(inputs0[3:])
     with torch.no_grad():
         for _ in range(2):
-            frame_inputs = (first,) + tuple(state)
+            frame_inputs = signals + tuple(state)
             capture_calibration_inputs(captured, INPUT_NAMES, frame_inputs)
             state = list(stream(*frame_inputs)[1:])
     arrays = {name: np.stack(values).astype(np.float32, copy=False)
@@ -197,7 +199,7 @@ def test_build_stream_model_follows_the_config_grid(tmp_path):
     )
     stream, grid = build_stream_model(_grid_config(tmp_path, 256), checkpoint)
     assert grid['n_fft'] == 256
-    assert initial_inputs(stream.model)[0].shape == (1, 129, 1, 3)
+    assert initial_inputs(stream.model)[0].shape == (1, 129, 1)
 
     with pytest.raises(RuntimeError, match='size mismatch'):
         build_stream_model(_grid_config(tmp_path, 512), checkpoint)

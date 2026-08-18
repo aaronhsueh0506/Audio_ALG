@@ -48,20 +48,24 @@ except ImportError:
 # Kept numerically equal to GTCRN_MODEL_LAYOUT_VERSION in gtcrn_process.h,
 # which declares the caller-owned cache struct this graph consumes and emits.
 # tests/test_gtcrn_export_contract.py pins the two together.
-STATE_LAYOUT_VERSION = 4
+STATE_LAYOUT_VERSION = 5
 
 # One h_* tensor per GRU so each state slot names itself; only the temporal
 # conv history stays a combined cache. Encoder TRA GRUs first, then decoder,
 # then the two DPGRNN inter GRUs (whose hidden batches the frequency lanes).
+# Three separate ERB-domain feature inputs so the positive magnitude and the
+# signed real/imag keep independent quantization scales; the graph
+# concatenates them and carries learned compute only (the fixed front/back
+# ends -- magnitude, ERB forward/inverse, CRM -- run on the host).
 INPUT_NAMES = (
-    'input', 'conv_cache',
+    'mag', 'real', 'imag', 'conv_cache',
     'h_tra_enc0', 'h_tra_enc1', 'h_tra_enc2',
     'h_tra_dec0', 'h_tra_dec1', 'h_tra_dec2',
     'h_dpgrnn1', 'h_dpgrnn2',
 )
 
 OUTPUT_NAMES = ('output',) + tuple(
-    name + '_out' for name in INPUT_NAMES[1:]
+    name + '_out' for name in INPUT_NAMES[3:]
 )
 
 
@@ -214,7 +218,7 @@ def build_metadata(checkpoint_path, grid, inputs, outputs):
         'output_frames_per_invocation': 1,
         'accelerator_persistent_state': False,
         'recurrent_state': 'conv_cache_plus_per_gru_h_explicit_input_output',
-        'state_handoff': dict(zip(INPUT_NAMES[1:], OUTPUT_NAMES[1:])),
+        'state_handoff': dict(zip(INPUT_NAMES[3:], OUTPUT_NAMES[1:])),
         'input_schema': _schema(INPUT_NAMES, inputs),
         'output_schema': _schema(OUTPUT_NAMES, outputs),
     }
@@ -262,10 +266,10 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
         # consistent channels), not raw noise in every channel.
         generator = torch.Generator().manual_seed(20260818)
         verify_inputs = list(initial_inputs(stream.model))
-        spectrum_ri = torch.randn(
-            verify_inputs[0].shape[:-1] + (2,), generator=generator
-        )
-        verify_inputs[0] = stream_features(spectrum_ri)
+        erb = stream.model.erb
+        bins = erb.erb_subband_1 + erb.erb_fc.in_features
+        spectrum_ri = torch.randn(1, bins, 1, 2, generator=generator)
+        verify_inputs[0:3] = stream_features(stream.model, spectrum_ri)
         ort_feed = {name: tensor.detach().numpy().copy()
                     for name, tensor in zip(INPUT_NAMES, verify_inputs)}
         with torch.no_grad():

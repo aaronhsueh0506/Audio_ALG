@@ -48,11 +48,16 @@ def initial_inputs(model):
     # (layers, width, hidden) -- one tensor per DPGRNN, not width tensors.
     h_dpgrnn = [torch.zeros(inter.num_layers, width, inter.hidden_size)
                 for _ in range(2)]
+    bands = erb.erb_subband_1 + erb.erb_fc.out_features
     return (
-        # [mag, re, im]: the magnitude is computed by the HOST in fp32 (see
-        # gtcrn_model_input in gtcrn_process.c) so the sqrt never enters the
-        # quantized graph; channels 1:3 stay the raw spectrum for the CRM.
-        torch.randn(1, bins, 1, 3),
+        # Three separate ERB-domain feature frames (mag, real, imag), each
+        # (1, E, 1): the magnitude AND the frozen ERB forward matmul run on
+        # the HOST in fp32 (C: gtcrn_model_input), the graph concatenates
+        # and holds learned compute only, and each channel keeps its own
+        # quantization scale.
+        torch.randn(1, bands, 1).abs(),
+        torch.randn(1, bands, 1),
+        torch.randn(1, bands, 1),
         # [enc/dec, channels, time, freq] -- no batch dim; the wrapper adds
         # and strips it at the graph boundary so PTQ sees a rank-4 tensor.
         torch.zeros(2, channels, depth, width),
@@ -61,17 +66,39 @@ def initial_inputs(model):
     )
 
 
-def stream_features(spectrum_ri):
-    """Host-side model input from RI spectra: (..., 2) -> (..., 3).
+def stream_features(model, spectrum_ri):
+    """Host-side model input from RI spectra: (1, F, T, 2) -> 3x (1, E, T).
 
-    [sqrt(re^2 + im^2 + 1e-12), re, im] -- the exact training feature stack,
-    computed in fp32 OUTSIDE the graph (C: gtcrn_model_input) so the sqrt
-    never enters the quantized domain.
+    The complete fixed front end, computed in fp32 OUTSIDE the graph
+    (C: gtcrn_model_input): [sqrt(re^2 + im^2 + 1e-12), re, im] followed by
+    the frozen ERB forward matmul (model.erb.bm), so neither the sqrt nor
+    the filterbank ever enters the quantized domain. E = erb_subband_1 +
+    erb_subband_2 (129 on every grid).
     """
     real = spectrum_ri[..., 0]
     imag = spectrum_ri[..., 1]
     magnitude = (real.square() + imag.square() + 1e-12).sqrt()
-    return torch.stack((magnitude, real, imag), dim=-1)
+    stacked = torch.stack((magnitude, real, imag), dim=-1)
+    # (1, F, T, 3) -> (1, 3, T, F) for bm's (B, C, T, F) convention.
+    banded = model.erb.bm(stacked.permute(0, 3, 2, 1))
+    # Three SEPARATE tensors (1, E, T): independent quantization scales for
+    # the positive magnitude and the signed real/imag channels.
+    return (banded[:, 0].permute(0, 2, 1),
+            banded[:, 1].permute(0, 2, 1),
+            banded[:, 2].permute(0, 2, 1))
+
+
+def host_synthesis(model, mask_erb, spectrum_ri):
+    """Host-side fixed back end: ERB inverse + complex ratio mask, in fp32.
+
+    mask_erb (1, E, T, 2) is the graph output; spectrum_ri (1, F, T, 2) is
+    the same frame the features came from. Mirrors model.erb.bs + Mask
+    exactly (C: gtcrn_model_output).
+    """
+    mask = model.erb.bs(mask_erb.permute(0, 3, 2, 1))     # (1, 2, T, F)
+    spec = spectrum_ri.permute(0, 3, 2, 1)                # (1, 2, T, F)
+    enhanced = model.mask(mask, spec)
+    return enhanced.permute(0, 3, 2, 1)                   # (1, F, T, 2)
 
 
 def _tra_step(tra, x, hidden):
@@ -165,17 +192,17 @@ class StreamGTCRN(nn.Module):
                 block.depth_conv.weight.detach().flip(-2, -1).clone(),
             )
 
-    def forward(self, spectrum, conv_cache,
+    def forward(self, mag, real, imag, conv_cache,
                 h_tra_enc0, h_tra_enc1, h_tra_enc2,
                 h_tra_dec0, h_tra_dec1, h_tra_dec2,
                 h_dpgrnn1, h_dpgrnn2):
         model = self.model
         conv_cache = conv_cache.unsqueeze(1)
-        magnitude = spectrum[..., 0].permute(0, 2, 1)
-        real = spectrum[..., 1].permute(0, 2, 1)
-        imag = spectrum[..., 2].permute(0, 2, 1)
-        x = torch.stack((magnitude, real, imag), dim=1)
-        x = model.sfe(model.erb.bm(x))
+        # mag/real/imag are the HOST-banded feature frames (1, E, 1): the
+        # fixed front end already ran outside; the graph concatenates them
+        # into (B, 3, T, E) and holds learned compute only.
+        x = torch.stack((mag, real, imag), dim=1).permute(0, 1, 3, 2)
+        x = model.sfe(x)
 
         skips = []
         for block in model.encoder.en_convs[:2]:
@@ -210,9 +237,9 @@ class StreamGTCRN(nn.Module):
         for index, block in enumerate(model.decoder.de_convs[3:], start=3):
             x = block(x + skips[4 - index])
 
-        mask = model.erb.bs(x)
-        enhanced = model.mask(mask, spectrum[..., 1:3].permute(0, 3, 2, 1))
-        enhanced = enhanced.permute(0, 3, 2, 1)
+        # x is the ERB-domain complex mask (B, 2, T, E); the fixed back end
+        # (ERB inverse + CRM) runs on the host -- see host_synthesis.
+        enhanced = x.permute(0, 3, 2, 1)
         conv_out = torch.stack((
             torch.cat(enc_conv, dim=2),
             torch.cat(tuple(reversed(dec_conv_reverse)), dim=2),

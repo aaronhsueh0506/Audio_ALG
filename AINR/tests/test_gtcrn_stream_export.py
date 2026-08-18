@@ -4,23 +4,28 @@ import pytest
 import torch
 
 from AINR.GTCRN.model import GTCRN
-from AINR.GTCRN.stream_model import (StreamGTCRN, initial_inputs,
-                                     stream_features)
+from AINR.GTCRN.stream_model import (StreamGTCRN, host_synthesis,
+                                     initial_inputs, stream_features)
 
 
 def _run_stream(model, spectrum, poison_conv=False):
     stream = StreamGTCRN(model).eval()
-    state = list(initial_inputs(model)[1:])
-    features = stream_features(spectrum)
+    state = list(initial_inputs(model)[3:])
+    mag, real, imag = stream_features(model, spectrum)
     frames = []
     with torch.no_grad():
         for index in range(spectrum.shape[2]):
-            outputs = stream(features[:, :, index:index + 1], *state)
+            outputs = stream(mag[:, :, index:index + 1],
+                             real[:, :, index:index + 1],
+                             imag[:, :, index:index + 1], *state)
             frames.append(outputs[0])
             state = list(outputs[1:])
             if poison_conv:
                 state[0] = torch.roll(state[0], 1, dims=2)
-    return torch.cat(frames, dim=2), state
+    # The graph emits the ERB-domain mask; the fixed back end (ERB inverse +
+    # CRM) runs on the host, completing the deployment chain under test.
+    mask = torch.cat(frames, dim=2)
+    return host_synthesis(model, mask, spectrum), state
 
 
 # The state extents are identical on both grids: everything behind the ERB
@@ -30,7 +35,10 @@ def _run_stream(model, spectrum, poison_conv=False):
 def test_stream_wrapper_matches_offline_random_weights(nfft, bins):
     torch.manual_seed(41)
     model = GTCRN(65, 64, nfft=nfft, fs=16000).eval()
-    assert initial_inputs(model)[0].shape == (1, bins, 1, 3)
+    # E = 65 + 64 on every grid; only the host-side spectrum width tracks
+    # n_fft.
+    for index in range(3):
+        assert initial_inputs(model)[index].shape == (1, 129, 1)
     spectrum = torch.randn(1, bins, 12, 2)
     with torch.no_grad():
         offline = model(spectrum)
