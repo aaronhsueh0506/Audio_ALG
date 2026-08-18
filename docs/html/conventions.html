@@ -117,7 +117,7 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <tr><td>ULCNet C 分析+合成（共用一張表）</td>
 <td><code>ulcnet_process.c</code> <code>ulcnet_make_window()</code>（與 Python 逐 bit 同 @f32）</td></tr>
 <tr><td>DFN2/DFN3/GTCRN 分析+合成</td>
-<td><code>AINR/dfn_process_common.h</code> <code>df_common_make_root_hann()</code></td></tr>
+<td>各 model process.c 內含 <code>df_common_make_root_hann()</code>（model-local 複本）</td></tr>
 <tr><td>RNNoise-ERB 分析+合成</td>
 <td><code>rnnoise_tables_gen.h</code>（編譯期表；<code>gen_rnnoise_tables.c</code> 產生，
 <code>test_rnnoise_tables.c</code> 逐 byte drift-guard）</td></tr>

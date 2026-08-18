@@ -40,9 +40,23 @@ To write one raw binary per input tensor per streaming frame instead::
         --format bin \
         --output AIAEC/Align_ULCNet/calib/align_ulcnet_d8
 
+Calibration straight from RAW microphone recordings (the checkpoint-matched
+frozen PBFDKF derives the linear-error stems in-process and persists them
+beside the artifact)::
+
+    python3 AIAEC/Align_ULCNet/inference.py calib \\
+        --checkpoint output/align_ulcnet_best.pth \\
+        --primary-dir calibration/raw_mic \\
+        --far-dir calibration/raw_far \\
+        --primary-is-mic \\
+        --frames 8192 \\
+        --max-delay-frames 8 \\
+        --output AIAEC/Align_ULCNet/calib/align_ulcnet_d8.npz
+
 ``--primary-dir`` and ``--far-dir`` must contain matching relative WAV paths.
 Calibration intentionally uses raw far-end audio; deployment supplies aligned
-far-end audio.  The calibration and ONNX commands must use the same
+far-end audio (the graph's ``far`` input is the AEC aligned-far seam on the
+board -- raw far before acquisition, aligned far afterward).  The calibration and ONNX commands must use the same
 ``--max-delay-frames`` value.  NPZ output writes a sibling JSON contract;
 binary output writes ``manifest.json`` inside its output directory.
 

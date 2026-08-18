@@ -196,7 +196,7 @@ head/spectrum 配對無法以「輸出有限」矇混過關。</li>
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li>C 前後處理:<code>AINR/DeepFilterNet2/dfn2_process.c</code> / <code>.h</code>;共用 kernel:<code>AINR/dfn_process_common.h</code></li>
+<li>C 前後處理:<code>AINR/DeepFilterNet2/dfn2_process.c</code> / <code>.h</code>（DSP kernels 內含於本檔——porting 為單一 model，各自攜帶）</li>
 <li>模型 / 訓練 / 推論:<code>AINR/DeepFilterNet2/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>config.ini</code></li>
 <li>文件:<a href="../../AINR/DeepFilterNet2/README.md">README.md</a>、<a href="../../AINR/DeepFilterNet2/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT.md</a></li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code> — <code>make -C AINR test-simd</code>

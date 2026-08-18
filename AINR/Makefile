@@ -21,7 +21,7 @@ SOURCES := tests/test_c_prepost.c \
 	DeepFilterNet2/dfn2_model_io.c \
 	DeepFilterNet3/dfn3_process.c \
 	GTCRN/gtcrn_process.c
-HEADERS := dfn_process_common.h \
+HEADERS := \
 	DeepFilterNet2/dfn2_process.h \
 	DeepFilterNet2/dfn2_model_io.h \
 	DeepFilterNet3/dfn3_process.h \

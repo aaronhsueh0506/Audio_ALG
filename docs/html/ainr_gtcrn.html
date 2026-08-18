@@ -191,7 +191,7 @@ context(cache 大小即由此而來),加上 RNN 無限記憶。</li>
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
-<li>C 前後處理:<code>AINR/GTCRN/gtcrn_process.c</code> / <code>.h</code>;共用 kernel:<code>AINR/dfn_process_common.h</code></li>
+<li>C 前後處理:<code>AINR/GTCRN/gtcrn_process.c</code> / <code>.h</code>（DSP kernels 內含於本檔——porting 為單一 model，各自攜帶）</li>
 <li>模型 / 訓練 / 推論:<code>AINR/GTCRN/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>config.ini</code>、<code>checkpoint_utils.py</code></li>
 <li>文件:<a href="../../AINR/GTCRN/README.md">README.md</a>、<a href="../../AINR/GTCRN/docs/architecture_notes.md">docs/architecture_notes.md</a></li>
 <li>上游 vendored 參考:<code>AINR/gtcrn_github/</code>(offline <code>gtcrn.py</code>、串流 <code>stream/gtcrn_stream.py</code>、論文 PDF)</li>
