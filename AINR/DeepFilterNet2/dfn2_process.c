@@ -5,12 +5,22 @@
 
 #include "../dfn_process_common.h"
 
+void dfn2_set_erb_matrices(DFN2State* st,
+                             const float* erb_fwd,
+                             const float* erb_inv)
+{
+    if (!st) return;
+    st->erb_fwd = erb_fwd;
+    st->erb_inv = erb_inv;
+}
+
 void dfn2_state_init(DFN2State* st)
 {
     if (!st) return;
     memset(st, 0, sizeof(*st));
-    df_common_init(st->window, st->erb_borders,
-                   DFN2_WIN_LEN, DFN2_N_ERB);
+    /* ERB matrices arrive via dfn2_set_erb_matrices(): caller-loaded
+     * erb_fwd.bin / erb_inv.bin from export_erb_matrix.py --runtime-bins. */
+    df_common_init(st->window, DFN2_WIN_LEN);
     for (int b = 0; b < DFN2_N_ERB; ++b) {
         float position = (float)b / (float)(DFN2_N_ERB - 1);
         st->erb_norm_state[b] = DFN2_ERB_NORM_INIT_LO_DB + position *
@@ -40,7 +50,7 @@ void dfn2_compute_features(DFN2State* st,
 {
     if (!st || !spec_re || !spec_im || !feat_erb || !feat_spec) return;
     df_common_features(
-        spec_re, spec_im, st->erb_borders,
+        spec_re, spec_im, st->erb_fwd,
         DFN2_N_BINS, DFN2_N_ERB, DFN2_DF_BINS,
         DFN2_ANALYSIS_SCALE, DFN2_ERB_LOG_FLOOR,
         DFN2_ERB_NORM_ALPHA, DFN2_ERB_NORM_SCALE_DB,
@@ -69,7 +79,7 @@ int dfn2_compose(DFN2State* st,
     int target;
     if (!st || !spec_re || !spec_im || !erb_mask || !coefs ||
         !out_re || !out_im || !isfinite(alpha)) return 0;
-    df_common_expand_mask(erb_mask, st->erb_borders,
+    df_common_expand_mask(erb_mask, st->erb_inv,
                           DFN2_N_BINS, DFN2_N_ERB,
                           st->scratch_bin_gain);
     slot = st->df_ring_idx;
@@ -174,7 +184,7 @@ int dfn2_compose_stream(DFN2State* st,
 
     head_frame = current - DFN2_MASK_LOOKAHEAD;
     head_slot = (int)(head_frame % DFN2_DF_RING);
-    df_common_expand_mask(erb_mask, st->erb_borders,
+    df_common_expand_mask(erb_mask, st->erb_inv,
                           DFN2_N_BINS, DFN2_N_ERB,
                           st->scratch_bin_gain);
     for (int k = 0; k < DFN2_DF_BINS; ++k) {

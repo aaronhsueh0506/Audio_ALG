@@ -17,13 +17,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-/* The two shipped DF models share this exact 48-kHz/1024/32-band contract. */
-static const int df_common_erb_borders_48k_1024_32[32] = {
-    0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 30, 36, 42,
-    50, 59, 69, 81, 94, 110, 129, 151, 176, 205, 239, 279,
-    325, 378, 440, 513
-};
-
 static inline void df_common_fft(float *re, float *im, int n, int inverse) {
     int j = 0;
     for (int i = 0; i < n; ++i) {
@@ -112,13 +105,8 @@ static inline void df_common_make_root_hann(float *window, int win_len) {
     }
 }
 
-static inline void df_common_init(float *window, int *borders,
-                                  int win_len, int n_bands) {
+static inline void df_common_init(float *window, int win_len) {
     df_common_make_root_hann(window, win_len);
-    if (n_bands == 32) {
-        memcpy(borders, df_common_erb_borders_48k_1024_32,
-               sizeof(df_common_erb_borders_48k_1024_32));
-    }
 }
 
 static inline void df_common_analysis(float *analysis_buf, const float *window,
@@ -161,36 +149,26 @@ static inline void df_common_analysis(float *analysis_buf, const float *window,
     }
 }
 
+/* erb_fwd: caller-loaded exported matrix, raw float32, bin-major
+ * [n_bins][n_bands] -- the exact buffer the model trained with (see
+ * export_erb_matrix.py --runtime-bins). The library never derives a
+ * filterbank; the loader owns the file and can swap it at runtime. */
 static inline void df_common_features(
     const float *spec_re, const float *spec_im,
-    const int *borders, int n_bins, int n_bands, int df_bins,
+    const float *erb_fwd, int n_bins, int n_bands, int df_bins,
     float analysis_scale, float log_floor,
     float erb_alpha, float erb_scale, float *erb_state,
     float spec_alpha, float spec_eps, float *spec_state,
     float *power, float *erb_work, float *feat_erb, float *feat_spec) {
     float scale2 = analysis_scale * analysis_scale;
     memset(erb_work, 0, (size_t)n_bands * sizeof(float));
-    {
-        int segment = 0;
-        for (int k = 0; k < n_bins; ++k) {
-            float p = (spec_re[k] * spec_re[k] +
-                       spec_im[k] * spec_im[k]) * scale2;
-            int lo, hi, width, offset;
-            float right, left;
-            power[k] = p;
-            while (segment + 1 < n_bands - 1 &&
-                   k >= borders[segment + 1]) ++segment;
-            lo = borders[segment];
-            hi = borders[segment + 1];
-            width = hi - lo;
-            offset = k - lo;
-            right = (float)offset / (float)width;
-            left = 1.0f - right;
-            if (segment == 0) left *= 2.0f;
-            if (segment + 1 == n_bands - 1) right *= 2.0f;
-            erb_work[segment] += p * left;
-            erb_work[segment + 1] += p * right;
-        }
+    for (int k = 0; k < n_bins; ++k) {
+        float p = (spec_re[k] * spec_re[k] +
+                   spec_im[k] * spec_im[k]) * scale2;
+        const float *row = erb_fwd + (size_t)k * n_bands;
+        power[k] = p;
+        for (int b = 0; b < n_bands; ++b)
+            erb_work[b] += p * row[b];
     }
     for (int b = 0; b < n_bands; ++b) {
         float db = 10.0f * log10f(erb_work[b] + log_floor);
@@ -231,22 +209,19 @@ static inline void df_common_features(
     }
 }
 
+/* erb_inv: caller-loaded exported matrix, band-major [n_bands][n_bins]
+ * (the model's mask-expansion buffer); the inner loop runs contiguously
+ * over bins and auto-vectorizes. */
 static inline void df_common_expand_mask(const float *band_gain,
-                                         const int *borders,
+                                         const float *erb_inv,
                                          int n_bins, int n_bands,
                                          float *bin_gain) {
-    int segment = 0;
-    for (int k = 0; k < n_bins; ++k) {
-        int lo, width, offset;
-        float right;
-        while (segment + 1 < n_bands - 1 &&
-               k >= borders[segment + 1]) ++segment;
-        lo = borders[segment];
-        width = borders[segment + 1] - lo;
-        offset = k - lo;
-        right = (float)offset / (float)width;
-        bin_gain[k] = band_gain[segment] * (1.0f - right) +
-                      band_gain[segment + 1] * right;
+    memset(bin_gain, 0, (size_t)n_bins * sizeof(float));
+    for (int b = 0; b < n_bands; ++b) {
+        float gain = band_gain[b];
+        const float *row = erb_inv + (size_t)b * n_bins;
+        for (int k = 0; k < n_bins; ++k)
+            bin_gain[k] += row[k] * gain;
     }
 }
 

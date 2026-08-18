@@ -68,6 +68,45 @@ static float stream_tap(int tap)
     return taps[tap];
 }
 
+/* Reference ERB matrices for the DFN tests, built from the shipped
+ * 48-kHz/1024/32 border table with the exact triangular construction the
+ * runtime used to derive on-device. The runtime now only consumes
+ * caller-loaded matrices (erb_fwd.bin/erb_inv.bin); reproducing the
+ * construction HERE keeps every existing golden value valid while pinning
+ * the new pointer plumbing. */
+static const int dfn_test_borders[32] = {
+    0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 30, 36, 42,
+    50, 59, 69, 81, 94, 110, 129, 151, 176, 205, 239, 279,
+    325, 378, 440, 513
+};
+static float dfn_test_fwd[513][32];
+static float dfn_test_inv[32][513];
+static void dfn_test_build_erb(void)
+{
+    int segment = 0;
+    memset(dfn_test_fwd, 0, sizeof(dfn_test_fwd));
+    memset(dfn_test_inv, 0, sizeof(dfn_test_inv));
+    for (int k = 0; k < 513; ++k) {
+        int lo, hi, width, offset;
+        float right, left, fleft, fright;
+        while (segment + 1 < 31 && k >= dfn_test_borders[segment + 1])
+            ++segment;
+        lo = dfn_test_borders[segment];
+        hi = dfn_test_borders[segment + 1];
+        width = hi - lo;
+        offset = k - lo;
+        right = (float)offset / (float)width;
+        left = 1.0f - right;
+        fleft = left; fright = right;
+        if (segment == 0) fleft *= 2.0f;
+        if (segment + 1 == 31) fright *= 2.0f;
+        dfn_test_fwd[k][segment] = fleft;
+        dfn_test_fwd[k][segment + 1] = fright;
+        dfn_test_inv[segment][k] = left;
+        dfn_test_inv[segment + 1][k] = right;
+    }
+}
+
 static int test_dfn_stream_alignment(void)
 {
     static DFN2State dfn2;
@@ -81,8 +120,11 @@ static int test_dfn_stream_alignment(void)
     float coef3[DFN3_DF_BINS][DFN3_DF_ORDER][2] = {{{0}}};
     long long output_frame = -1;
 
+    dfn_test_build_erb();
     dfn2_state_init(&dfn2);
     dfn3_state_init(&dfn3);
+    dfn2_set_erb_matrices(&dfn2, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
+    dfn3_set_erb_matrices(&dfn3, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int k = 0; k < DFN2_DF_BINS; ++k)
         for (int tap = 0; tap < DFN2_DF_ORDER; ++tap)
             coef2[k][tap][0] = stream_tap(tap);
@@ -284,7 +326,9 @@ static int test_dfn2(uint64_t* digest)
     float coefs[DFN2_DF_BINS][DFN2_DF_ORDER][2] = {{{0}}};
     float max_spectral_error = 0.0f;
 
+    dfn_test_build_erb();
     dfn2_state_init(&state);
+    dfn2_set_erb_matrices(&state, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int b = 0; b < DFN2_N_ERB; ++b) mask[b] = 1.0f;
     for (int k = 0; k < DFN2_DF_BINS; ++k)
         coefs[k][DFN2_DF_HISTORY][0] = 1.0f;
@@ -336,7 +380,9 @@ static int test_dfn3(uint64_t* digest)
     float coefs[DFN3_DF_BINS][DFN3_DF_ORDER][2] = {{{0}}};
     float max_spectral_error = 0.0f;
 
+    dfn_test_build_erb();
     dfn3_state_init(&state);
+    dfn3_set_erb_matrices(&state, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int b = 0; b < DFN3_N_ERB; ++b) mask[b] = 1.0f;
     for (int k = 0; k < DFN3_DF_BINS; ++k)
         coefs[k][DFN3_DF_HISTORY][0] = 1.0f;

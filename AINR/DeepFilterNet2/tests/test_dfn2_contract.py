@@ -881,3 +881,51 @@ def test_emb_num_layers_one_fails_loudly_instead_of_building_two():
     gru_layers = [n for n, _ in model.named_parameters()
                   if '.gru.weight_ih' in n]
     assert len(gru_layers) == 5
+
+
+def test_runtime_erb_bins_match_both_models(tmp_path):
+    """The exported .bin matrices equal DFN2's AND DFN3's frozen buffers.
+
+    The C host consumes caller-loaded pointers in these exact layouts; both
+    DF models share one filterbank, so one pair of files must serve both.
+    """
+    import sys as _sys
+    _sys.path.insert(0, ROOT)
+    from export_erb_matrix import write_runtime_bins
+
+    out = write_runtime_bins(os.path.join(ROOT, 'config.ini'),
+                             os.fspath(tmp_path))
+    fwd = np.fromfile(os.path.join(out, 'erb_fwd.bin'),
+                      '<f4').reshape(513, 32)
+    inv = np.fromfile(os.path.join(out, 'erb_inv.bin'),
+                      '<f4').reshape(32, 513)
+    model = DeepFilterNet2(**read_model_config(load_config()))
+    ref_fwd = model.erb_fb.detach().numpy().astype(np.float32)
+    if ref_fwd.shape[0] < ref_fwd.shape[1]:
+        ref_fwd = ref_fwd.T
+    ref_inv = model.erb_inv.detach().numpy().astype(np.float32)
+    if ref_inv.shape[0] > ref_inv.shape[1]:
+        ref_inv = ref_inv.T
+    assert np.array_equal(fwd, ref_fwd)
+    assert np.array_equal(inv, ref_inv)
+
+    import importlib
+    for stale in ('train', 'inference', 'model', 'export_onnx'):
+        sys.modules.pop(stale, None)
+    dfn3_root = os.path.join(os.path.dirname(ROOT), 'DeepFilterNet3')
+    _sys.path.insert(0, dfn3_root)
+    try:
+        dfn3_model_mod = importlib.import_module('model')
+        dfn3_train = importlib.import_module('train')
+        cfg3 = configparser.ConfigParser()
+        assert cfg3.read(os.path.join(dfn3_root, 'config.ini'))
+        dfn3 = dfn3_model_mod.DeepFilterNet3(
+            **dfn3_train.read_model_config(cfg3))
+        fwd3 = dfn3.erb_fb.detach().numpy().astype(np.float32)
+        if fwd3.shape[0] < fwd3.shape[1]:
+            fwd3 = fwd3.T
+        assert np.array_equal(fwd, fwd3)
+    finally:
+        _sys.path.remove(dfn3_root)
+        for stale in ('train', 'inference', 'model', 'export_onnx'):
+            sys.modules.pop(stale, None)

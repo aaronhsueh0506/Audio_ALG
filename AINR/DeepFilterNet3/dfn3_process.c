@@ -5,12 +5,22 @@
 
 #include "../dfn_process_common.h"
 
+void dfn3_set_erb_matrices(DFN3State* st,
+                             const float* erb_fwd,
+                             const float* erb_inv)
+{
+    if (!st) return;
+    st->erb_fwd = erb_fwd;
+    st->erb_inv = erb_inv;
+}
+
 void dfn3_state_init(DFN3State* st)
 {
     if (!st) return;
     memset(st, 0, sizeof(*st));
-    df_common_init(st->window, st->erb_borders,
-                   DFN3_WIN_LEN, DFN3_N_ERB);
+    /* ERB matrices arrive via dfn3_set_erb_matrices(): caller-loaded
+     * erb_fwd.bin / erb_inv.bin from export_erb_matrix.py --runtime-bins. */
+    df_common_init(st->window, DFN3_WIN_LEN);
     for (int b = 0; b < DFN3_N_ERB; ++b) {
         float position = (float)b / (float)(DFN3_N_ERB - 1);
         st->erb_norm_state[b] = DFN3_ERB_NORM_INIT_LO_DB + position *
@@ -40,7 +50,7 @@ void dfn3_compute_features(DFN3State* st,
 {
     if (!st || !spec_re || !spec_im || !feat_erb || !feat_spec) return;
     df_common_features(
-        spec_re, spec_im, st->erb_borders,
+        spec_re, spec_im, st->erb_fwd,
         DFN3_N_BINS, DFN3_N_ERB, DFN3_DF_BINS,
         DFN3_ANALYSIS_SCALE, DFN3_ERB_LOG_FLOOR,
         DFN3_ERB_NORM_ALPHA, DFN3_ERB_NORM_SCALE_DB,
@@ -70,7 +80,7 @@ int dfn3_compose(DFN3State* st,
     if (!st || !spec_re || !spec_im || !erb_mask || !coefs ||
         !out_re || !out_im) return 0;
     /* DFN3 owns low bins with the raw spectrum; ERB masking owns highs. */
-    df_common_expand_mask(erb_mask, st->erb_borders,
+    df_common_expand_mask(erb_mask, st->erb_inv,
                           DFN3_N_BINS, DFN3_N_ERB,
                           st->scratch_power);
     slot = st->df_ring_idx;
@@ -161,7 +171,7 @@ int dfn3_compose_stream(DFN3State* st,
     if (current < DFN3_MASK_LOOKAHEAD) return 0;
     target_frame = current - DFN3_MASK_LOOKAHEAD;
     target_slot = (int)(target_frame % DFN3_DF_RING);
-    df_common_expand_mask(erb_mask, st->erb_borders,
+    df_common_expand_mask(erb_mask, st->erb_inv,
                           DFN3_N_BINS, DFN3_N_ERB,
                           st->scratch_power);
 

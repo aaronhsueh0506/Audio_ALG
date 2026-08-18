@@ -16,7 +16,7 @@
  * 與 Python 參考的對應 (inference.py 為準):
  *   - STFT: sqrt-Hann window, normalized=True (x N_FFT^-0.5)
  *   - 分析尺度: 額外乘 DFN3_ANALYSIS_SCALE 才進正規化器 (libDF wnorm, 見下)
- *   - ERB: Glasberg-Moore band borders + 三角 filterbank
+ *   - ERB: caller-loaded exported matrices (erb_fwd.bin/erb_inv.bin)
  *          (mode=0 forward 邊緣欄加倍 / mode=1 inverse partition of unity)
  *   - ERB 特徵: band 能量取 dB 後，逐 band causal EMA mean norm，再 /40
  *   - Complex 特徵: 0..df_bins 的 real/imag，逐 bin magnitude EMA unit norm
@@ -131,7 +131,12 @@ typedef struct {
     /* Analysis overlap and instance-owned immutable-after-init tables. */
     float analysis_buf[DFN3_WIN_LEN];
     float window[DFN3_WIN_LEN];
-    int erb_borders[DFN3_N_ERB];
+    /* Caller-loaded exported ERB matrices (never derived here):
+     * erb_fwd bin-major [DFN3_N_BINS][DFN3_N_ERB], erb_inv band-major
+     * [DFN3_N_ERB][DFN3_N_BINS]; raw float32 from erb_fwd.bin/erb_inv.bin.
+     * The loader owns the memory and may swap it between hops. */
+    const float *erb_fwd;
+    const float *erb_inv;
 
     /* OLA 緩衝 (長度 = WIN_LEN, 只用前 OVL_LEN) */
     float synthesis_buf[DFN3_WIN_LEN];
@@ -172,6 +177,12 @@ typedef struct {
 
 /* 初始化 (歸零 + 兩個正規化器的 linspace 初值) */
 void dfn3_state_init(DFN3State *st);
+
+/* Point the state at the caller-loaded ERB matrices (see the struct field
+ * comment for layout). Must be called before feature extraction or mask
+ * expansion; the library never reads files itself. */
+void dfn3_set_erb_matrices(DFN3State *st, const float *erb_fwd,
+                             const float *erb_inv);
 
 /* frame (HOP_LEN 個新樣本，內部自己維護分析 overlap) -> 複數頻譜。
  * out_re/out_im 長度 N_BINS。⚠ 這是「原尺度」的頻譜，masking 與 ISTFT 用它；
