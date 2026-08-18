@@ -278,7 +278,7 @@ python3 inference.py --config config.ini --model output/rnnoise_best.pth \
 ```
 
 BIN 會依 ONNX input 分資料夾，每個 streaming frame 各寫一個檔案；例如
-`h1_in/0001.bin`。使用 `--format npz --dump-calib
+`h1_in/h1_in_0000.bin`。使用 `--format npz --dump-calib
 calib/rnnoise_erb.npz` 可改輸出 NumPy archive。兩種格式都保存實際串流中
 的三-frame feature window 與非零 GRU state，而不是重複 zero-state 樣本。
 

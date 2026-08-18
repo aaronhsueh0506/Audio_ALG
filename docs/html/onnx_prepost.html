@@ -45,8 +45,8 @@ parity-check calibration tensors 所綁定的 graph（預設 <code>&lt;output&gt
 保留給只要 graph 的情境。</p>
 
 <p>BIN calibration layout 為
-<code>tensor/0001.bin</code>、<code>tensor/0002.bin</code> 等（零填充、1-based，
-寬度超過 9999 幀自動增加，字典序即幀序），每個
+<code>tensor/tensor_0000.bin</code>、<code>tensor/tensor_0001.bin</code> 等
+（零填充、0-based，寬度超過 10000 幀自動增加，字典序即幀序），每個
 tensor 每個 frame 一個檔；<code>manifest.json</code> 記錄 dtype、shape、
 grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 同名 JSON report。</p>

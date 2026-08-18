@@ -101,7 +101,7 @@ primary and far trees must match.
 
 Calibration formats:
 
-- --format bin: tensor/0001.bin, tensor/0002.bin, and so on, plus
+- --format bin: tensor/tensor_0000.bin, tensor/tensor_0001.bin, and so on, plus
   manifest.json. Each file is one complete ONNX input tensor, including batch
   dimension. This is the board-facing format.
 - --format npz: one NumPy archive plus a sibling JSON report.

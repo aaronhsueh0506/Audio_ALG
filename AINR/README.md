@@ -105,7 +105,7 @@ tensors bind to (default `<output>.onnx`, override with `--onnx`), from the
 same model instance in the same process, so the two deployment artifacts
 cannot drift apart; `export_onnx.py` remains available for a graph-only
 export. The deployment BIN layout is identical for all three: one subdirectory per
-ONNX input, one zero-padded `0001.bin`, `0002.bin`, ... per invocation, and a
+ONNX input, one zero-padded `<tensor>_0000.bin`, `<tensor>_0001.bin`, ... per invocation, and a
 `manifest.json`. Each file contains one complete graph input tensor, including
 its batch dimension; only the filename index is the calibration-frame axis.
 Keep generated data under each model's `calib/`; those

@@ -25,7 +25,7 @@ def test_capture_preserves_complete_onnx_input_shape(tmp_path):
     )
     manifest = json.loads((output / 'manifest.json').read_text())
     assert manifest['binary_tensors']['feature']['frame_shape'] == [1, 3, 4]
-    first = np.fromfile(output / 'feature' / '0001.bin', '<f4')
+    first = np.fromfile(output / 'feature' / 'feature_0000.bin', '<f4')
     assert np.array_equal(first.reshape(1, 3, 4), graph_input.numpy())
 
 
