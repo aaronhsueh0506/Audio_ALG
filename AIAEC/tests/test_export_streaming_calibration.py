@@ -203,8 +203,8 @@ def test_policy_tensors_carry_a_marker_instead_of_numeric_ranges(tmp_path):
     assert manifest['binary_frame_index_base'] == 1
     assert manifest['binary_byte_order'] == 'little'
     for name, value in arrays.items():
-        first = output / name / ('%s_1.bin' % name)
-        last = output / name / ('%s_8.bin' % name)
+        first = output / name / '0001.bin'
+        last = output / name / '0008.bin'
         assert first.is_file() and last.is_file()
         loaded = np.fromfile(first, dtype=value.dtype.newbyteorder('<'))
         assert np.array_equal(loaded.reshape(value.shape[1:]), value[0])

@@ -263,7 +263,7 @@ python3 inference.py calib \
 ```
 
 The layout is `<tensor>/<tensor>_<frame>.bin`, with one-based frame numbers;
-for example `h_gru0/gru0_hidden_1.bin`. Each file is C-contiguous and
+for example `h_gru0/0001.bin`. Each file is C-contiguous and
 little-endian. `manifest.json` records dtype and per-frame shape. The output
 directory must not already exist, so a shorter rerun cannot leave stale frames.
 

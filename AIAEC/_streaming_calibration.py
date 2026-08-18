@@ -21,7 +21,7 @@ Per-frame, per-input raw binary files::
         --output AIAEC/Align_ULCNet/calib/align_ulcnet_d8
 
 Binary output uses one directory per ONNX input and one file per invocation,
-for example ``h_gru0/h_gru0_1.bin``.  ``manifest.json`` records each
+for example ``h_gru0/0001.bin``.  ``manifest.json`` records each
 frame shape, dtype, byte order, D and state contract.  The output directory
 must not already exist, preventing stale files from an older capture.
 """

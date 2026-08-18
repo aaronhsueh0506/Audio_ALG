@@ -167,7 +167,7 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
             graph_shapes[name]
         ), name
         # And the bytes on disk really hold one whole graph input.
-        blob = np.fromfile(artifact / name / ('%s_1.bin' % name), '<f4')
+        blob = np.fromfile(artifact / name / '0001.bin', '<f4')
         assert blob.size == int(np.prod(graph_shapes[name])), name
 
 

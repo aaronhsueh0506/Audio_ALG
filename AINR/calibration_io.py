@@ -89,7 +89,9 @@ def write_calibration_artifact(output_path, arrays, report, artifact_format):
 
     ``arrays`` maps graph input names to arrays whose leading dimension is the
     captured invocation index. NPZ keeps those arrays intact. BIN creates one
-    directory per input and writes ``<name>_<1-based-frame>.bin`` beneath it.
+    directory per input and writes zero-padded 1-based ``0001.bin``,
+    ``0002.bin``, ... beneath it (width grows past 9999 frames so a
+    lexicographic listing always equals frame order).
     """
     artifact_format = resolve_calibration_format(output_path, artifact_format)
     frame_count = _validate_arrays(arrays)
@@ -119,6 +121,8 @@ def write_calibration_artifact(output_path, arrays, report, artifact_format):
     temporary = tempfile.mkdtemp(
         prefix='.%s.tmp-' % os.path.basename(output_path), dir=parent
     )
+    width = max(4, len(str(frame_count)))
+    frame_pattern = '%%0%dd.bin' % width
     tensor_manifest = {}
     try:
         for name, value in arrays.items():
@@ -134,14 +138,14 @@ def write_calibration_artifact(output_path, arrays, report, artifact_format):
                 frame = np.ascontiguousarray(
                     value[frame_index], dtype=little_dtype
                 )
-                filename = '%s_%d.bin' % (name, frame_index + 1)
+                filename = frame_pattern % (frame_index + 1)
                 with open(os.path.join(tensor_dir, filename), 'wb') as stream:
                     stream.write(frame.tobytes(order='C'))
         report.update({
             'artifact_format': 'per_frame_per_tensor_bin',
             'binary_byte_order': 'little',
             'binary_frame_index_base': 1,
-            'binary_file_pattern': '<tensor>/<tensor>_<frame>.bin',
+            'binary_file_pattern': '<tensor>/' + frame_pattern,
             'binary_tensors': tensor_manifest,
         })
         report_path = os.path.join(temporary, 'manifest.json')
