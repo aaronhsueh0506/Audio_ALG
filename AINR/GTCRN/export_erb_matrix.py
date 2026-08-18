@@ -19,7 +19,10 @@ import struct
 
 import numpy as np
 
-from export_onnx import build_stream_model, file_sha256
+try:
+    from .export_onnx import build_stream_model, file_sha256
+except ImportError:  # direct ``python export_erb_matrix.py`` execution
+    from export_onnx import build_stream_model, file_sha256
 
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -46,7 +49,10 @@ def write_runtime_bins(config_path, out_dir):
 
     import torch
 
-    from model import GTCRN
+    try:
+        from .model import GTCRN
+    except ImportError:
+        from model import GTCRN
 
     cfg = _configparser.ConfigParser()
     if not cfg.read(config_path):

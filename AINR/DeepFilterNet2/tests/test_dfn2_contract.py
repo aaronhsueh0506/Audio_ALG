@@ -890,6 +890,9 @@ def test_runtime_erb_bins_match_both_models(tmp_path):
     DF models share one filterbank, so one pair of files must serve both.
     """
     import sys as _sys
+    for stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx',
+                  'stream_model', 'export_erb_matrix'):
+        _sys.modules.pop(stale, None)
     _sys.path.insert(0, ROOT)
     from export_erb_matrix import write_runtime_bins
 

@@ -237,6 +237,11 @@ def test_runtime_erb_bins_match_the_constructor(tmp_path):
     (forward bin-major, inverse band-major, float32 LE); the deployment
     loader owns the files, so this round-trip is the single value pin.
     """
+    # The flat names may belong to a sibling model by the time this test
+    # runs; re-bind them to THIS model's files exactly like the file top.
+    for stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx',
+                  'stream_model', 'export_erb_matrix'):
+        sys.modules.pop(stale, None)
     sys.path.insert(0, ROOT)
     from export_erb_matrix import write_runtime_bins
 
