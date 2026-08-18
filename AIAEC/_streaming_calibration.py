@@ -48,6 +48,7 @@ from calibration_io import (  # noqa: E402
     CALIBRATION_FORMATS,
     capture_calibration_inputs,
     resolve_calibration_format,
+    sibling_onnx_path,
     write_calibration_artifact,
 )
 
@@ -59,13 +60,13 @@ from AIAEC._calibration_common import (
 from AIAEC._export_common import (
     ALL_MODEL_NAMES,
     alignment_depth,
-    file_sha256,
     load_checkpoint_model,
     set_alignment_depth,
 )
 from AIAEC._streaming_export import (
     GraphSplit,
     _build,
+    export_graph,
     requires_contiguous_calibration,
     state_precision_policy,
 )
@@ -73,8 +74,7 @@ from AIAEC.Align_ULCNet.inference import load_model as load_ulcnet_model
 from AIAEC.Align_ULCNet.export_onnx import (
     INPUT_NAMES as ULCNET_INPUT_NAMES,
     STATE_LAYOUT_VERSION as ULCNET_STATE_LAYOUT_VERSION,
-    AlignUlcnetStreamingExport,
-    dummy_inputs as ulcnet_dummy_inputs,
+    export_graph as ulcnet_export_graph,
     next_state as ulcnet_next_state,
 )
 
@@ -128,6 +128,9 @@ def main(model_name: str) -> None:
                         help='number of streaming invocations to capture')
     parser.add_argument('--max-delay-frames', type=int, default=None)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--onnx', default=None,
+                        help='where to write the graph these tensors bind to '
+                             '(default: <output>.onnx)')
     args = parser.parse_args()
     args.model_name = model_name
     if args.frames <= 0:
@@ -137,25 +140,35 @@ def main(model_name: str) -> None:
     except ValueError as error:
         parser.error(str(error))
 
+    # Pairs are discovered before the model load and export, so a bad
+    # --primary-dir/--far-dir fails on its own actionable error first.
+    pairs = discover_pairs(args.primary_dir, args.far_dir)
+    random.Random(args.seed).shuffle(pairs)
+
+    # The graph is exported (and parity-checked) in the same process, from
+    # the same wrapper the tensors below are recorded against, so the two
+    # deployment artifacts cannot drift apart.
+    onnx_path = sibling_onnx_path(args.output, args.onnx)
     if args.model_name == 'Align_ULCNet':
         model, grid, _linear_contract = load_ulcnet_model(
             args.checkpoint, 'cpu',
             max_delay_frames=args.max_delay_frames,
         )
-        wrapper = AlignUlcnetStreamingExport(model).eval()
-        dummy = ulcnet_dummy_inputs(wrapper.delay_depth)
+        wrapper, dummy, graph_metadata = ulcnet_export_graph(
+            model, args.checkpoint, onnx_path, verify=True
+        )
         input_names = ULCNET_INPUT_NAMES
         split = _ULCNET_SPLIT
     else:
         model, grid = load_checkpoint_model(args.model_name, args.checkpoint)
+        checkpoint_depth = alignment_depth(model)
         if args.max_delay_frames is not None:
             set_alignment_depth(model, args.max_delay_frames)
         model.eval()
-        wrapper, dummy, input_names, _output_names, split = _build(
-            args.model_name, model
-        )
-    pairs = discover_pairs(args.primary_dir, args.far_dir)
-    random.Random(args.seed).shuffle(pairs)
+        built = _build(args.model_name, model)
+        graph_metadata = export_graph(grid, built, args.checkpoint, onnx_path,
+                                      checkpoint_depth, verify=True)
+        wrapper, dummy, input_names, _output_names, split = built
     feature_config = None
 
     captured = {}
@@ -223,7 +236,8 @@ def main(model_name: str) -> None:
     report = {
         'schema': 'aiaec-stateless-stream-calibration-v1',
         'model_family': args.model_name,
-        'checkpoint_sha256': file_sha256(args.checkpoint),
+        'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
+        'graph': os.path.basename(onnx_path),
         'sample_rate': int(grid.sr),
         'n_fft': int(grid.n_fft),
         'win_len': int(grid.win_len),
@@ -254,4 +268,5 @@ def main(model_name: str) -> None:
     write_calibration_artifact(
         args.output, arrays, report, artifact_format
     )
-    print('%s: %d streaming frames' % (args.output, report['frames']))
+    print('%s: %d streaming frames, graph %s' %
+          (args.output, report['frames'], onnx_path))

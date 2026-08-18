@@ -48,6 +48,7 @@ from calibration_io import (
     CALIBRATION_FORMATS,
     capture_calibration_inputs,
     resolve_calibration_format,
+    sibling_onnx_path,
     write_calibration_artifact,
 )
 
@@ -327,6 +328,9 @@ if __name__ == '__main__':
     parser.add_argument('--format', '--calib-format', dest='calib_format',
                         choices=CALIBRATION_FORMATS, default=None,
                         help='bin or npz; inferred from --dump-calib if omitted')
+    parser.add_argument('--onnx', default=None,
+                        help='where to write the graph the calibration '
+                             'tensors bind to (default: <dump-calib>.onnx)')
     parser.add_argument('--dump-debug', default=None,
                         help='儲存 ERB/complex features 與 raw/post gains 到 .npz')
     parser.add_argument('--max-frames', type=int, default=200)
@@ -353,6 +357,12 @@ if __name__ == '__main__':
             resolve_calibration_format(args.dump_calib, args.calib_format)
         except ValueError as error:
             parser.error(str(error))
+        # The graph is exported (and verified) in the same run, against the
+        # same checkpoint file and feature contract the calibration capture
+        # uses, so the two deployment artifacts cannot drift apart.
+        from export_onnx import export_graph
+        onnx_path = sibling_onnx_path(args.dump_calib, args.onnx)
+        export_graph(args.config, args.model, onnx_path, verify=True)
 
     if args.input_dir and args.output_dir:
         denoise_batch(args)

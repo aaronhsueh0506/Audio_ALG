@@ -209,6 +209,7 @@ def calibration_main():
         CALIBRATION_FORMATS,
         capture_calibration_inputs,
         resolve_calibration_format,
+        sibling_onnx_path,
         write_calibration_artifact,
     )
     try:
@@ -216,8 +217,8 @@ def calibration_main():
             INPUT_FRAMES,
             INPUT_NAMES,
             StatelessDFN2Heads,
+            export_graph,
             feature_windows,
-            file_sha256,
             initial_inputs,
         )
     except ImportError:
@@ -225,8 +226,8 @@ def calibration_main():
             INPUT_FRAMES,
             INPUT_NAMES,
             StatelessDFN2Heads,
+            export_graph,
             feature_windows,
-            file_sha256,
             initial_inputs,
         )
 
@@ -241,6 +242,9 @@ def calibration_main():
                         help='bin or npz; inferred from --output when omitted')
     parser.add_argument('--frames', type=int, default=256)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--onnx', default=None,
+                        help='where to write the graph these tensors bind to '
+                             '(default: <output>.onnx)')
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error('--frames must be positive')
@@ -252,19 +256,25 @@ def calibration_main():
     config = configparser.ConfigParser()
     if not config.read(args.config):
         raise FileNotFoundError(args.config)
-    model, params = load_model(SimpleNamespace(
-        config=args.config, model=args.model
-    ))
-    wrapper = StatelessDFN2Heads(model).eval()
-    feature = read_feature_config(
-        config, params['SR'], params['HOP_LEN']
-    )
     files = sorted(glob.glob(
         os.path.join(args.wav_dir, '**', '*.wav'), recursive=True
     ))
     if not files:
         raise FileNotFoundError('no WAV files under %s' % args.wav_dir)
     random.Random(args.seed).shuffle(files)
+    model, params = load_model(SimpleNamespace(
+        config=args.config, model=args.model
+    ))
+    wrapper = StatelessDFN2Heads(model).eval()
+    # The graph is exported (and parity-checked) in the same process, from the
+    # same model instance the tensors below are recorded against, so the two
+    # deployment artifacts cannot drift apart.
+    onnx_path = sibling_onnx_path(args.output, args.onnx)
+    graph_metadata = export_graph(wrapper, params, args.model, onnx_path,
+                                  verify=True)
+    feature = read_feature_config(
+        config, params['SR'], params['HOP_LEN']
+    )
 
     window = torch.hann_window(params['WIN_LEN']).sqrt()
     captured = {name: [] for name in INPUT_NAMES}
@@ -314,7 +324,8 @@ def calibration_main():
     }
     report = {
         'schema': 'dfn2-stateless-stream-calibration-v2',
-        'checkpoint_sha256': file_sha256(args.model),
+        'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
+        'graph': os.path.basename(onnx_path),
         'sample_rate': params['SR'],
         'n_fft': params['N_FFT'],
         'win_len': params['WIN_LEN'],
@@ -338,8 +349,8 @@ def calibration_main():
     write_calibration_artifact(
         args.output, arrays, report, artifact_format
     )
-    print('%s: %d streaming frames' %
-          (args.output, report['frames']))
+    print('%s: %d streaming frames, graph %s' %
+          (args.output, report['frames'], onnx_path))
 
 
 def cli():

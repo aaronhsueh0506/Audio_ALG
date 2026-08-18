@@ -156,7 +156,7 @@ T=90 全幀 stream-vs-offline enhanced 4.9e-7 / mask 1.8e-7 / delay 3.3e-7（ATO
 <li><code>AIAEC/Align_CRUSE/model.py</code>（<code>AlignCRUSE</code>）；<code>AIAEC/aiaec_common.py</code>（<code>GlobalDelayAttention</code>）；<code>AIAEC/aiaec_streaming.py</code>（<code>GlobalDelayAttentionCell</code>）</li>
 <li><code>AIAEC/Align_CRUSE/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
 <li>tests：<code>AIAEC/tests/test_streaming_align_cruse.py</code>（5 tests：等價/can-fail/短檔 caveat/paper_global 拒絕/fresh-state）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 220 passed（<code>pytest AIAEC</code> 含 dataset_gen = 336）</li>
-<li>匯出／calibration：<code>AIAEC/Align_CRUSE/export_onnx.py</code>、<code>AIAEC/Align_CRUSE/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/Align_CRUSE/calib/</code>）。<code>state_align_score_sum</code>=<code>float32_no_ptq</code>、<code>state_align_frame_index</code>=<code>int64_no_ptq</code>；calibration 必須取自單一不中斷錄音。</li>
+<li>匯出／calibration：<code>AIAEC/Align_CRUSE/export_onnx.py</code>、<code>AIAEC/Align_CRUSE/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/Align_CRUSE/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。<code>state_align_score_sum</code>=<code>float32_no_ptq</code>、<code>state_align_frame_index</code>=<code>int64_no_ptq</code>；calibration 必須取自單一不中斷錄音。</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.2</li>
 </ul>
 </body>

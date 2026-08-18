@@ -133,9 +133,15 @@ hop-lag: 0 框 (模型 causal); I/O 延遲僅 WOLA 重疊 win-hop = 256 samples
 <h2>State 表</h2>
 <p><b>ONNX/匯出邊界</b>:模型圖 = <code>GTCRN.forward(spec)</code> 整段(特徵、encoder、
 DPGRNN、decoder、CRM 全在圖內);圖外只有 C 的 STFT/WOLA。
-<code>export_onnx.py</code> 已交付 one-frame stateless graph；cache layout 由
-<code>StreamGTCRN</code> 固定，三組 cache 都由 host 作為 graph input/output 送回，
-加速器本身不保存跨次呼叫狀態。</p>
+<code>export_onnx.py</code> 已交付 one-frame stateless graph；cache 尺寸由
+<code>stream_model.initial_inputs(model)</code> 從 module tree 推導（不寫死 grid：
+spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder stride），
+三組 cache 都由 host 作為 graph input/output 送回，加速器本身不保存跨次呼叫狀態。
+匯出不再 pin 單一 grid——config 與 checkpoint 不成對時在 strict
+<code>load_state_dict</code>（形狀）或 checkpoint contract（同形語意）就大聲失敗；
+因 ERB split 固定 65+64=129，n_fft 改變時三組 cache 尺寸不變、只有 <code>mix</code>
+寬度改變。<code>inference.py calib</code> 會在同一 process 同一 model instance
+一併匯出並 parity-check graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改）。</p>
 <div class="tbl"><table>
 <tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
 <tr><td><code>analysis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct <code>GTCRNProcessState</code></td><td>分析滑窗</td></tr>
@@ -171,5 +177,5 @@ context(cache 大小即由此而來),加上 RNN 無限記憶。</li>
 <li>上游 vendored 參考:<code>AINR/gtcrn_github/</code>(offline <code>gtcrn.py</code>、串流 <code>stream/gtcrn_stream.py</code>、論文 PDF)</li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_gtcrn()</code>:回路穩態 unity,誤差門檻 2e-4)—
 <code>make -C AINR test-simd</code> 實測 NEON/scalar digest 皆 <code>124b768ec938af7d</code></li>
-<li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code> — 實測 3 passed(metadata 內容、<code>state_layout_version</code> 對 <code>GTCRN_MODEL_LAYOUT_VERSION</code> 互鎖、calibration frame shape 對 ONNX graph input 互鎖);共用測試 <code>AINR/tests/</code>(pytest)— 實測 28 passed(<code>pytest AINR</code> 全樹 = 201)</li>
+<li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code> — 實測 4 passed(metadata 內容、<code>state_layout_version</code> 對 <code>GTCRN_MODEL_LAYOUT_VERSION</code> 互鎖、calibration frame shape 對 ONNX graph input 互鎖、config-driven grid＋錯 grid checkpoint 於 <code>load_state_dict</code> 大聲失敗);共用測試 <code>AINR/tests/</code>(pytest)— 實測 30 passed,含 stream-vs-offline 等價在 512 與 256 兩個 grid＋cache 錯位 must-fail(<code>pytest AINR</code> 全樹 = 204)</li>
 </ul>

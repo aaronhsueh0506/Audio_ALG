@@ -9,7 +9,7 @@ GTCRN 推論腳本
     python inference.py --config config.ini --model output/gtcrn_best.pth \
                       --input-dir /path/to/noisy --output-dir /path/to/enhanced
 
-Calibration:
+Calibration (also exports the ONNX graph the tensors bind to):
     python inference.py calib --model output/gtcrn_best.pth \
         --wav-dir /path/to/noisy --frames 8192 --format bin \
         --output calib/gtcrn
@@ -150,15 +150,16 @@ def calibration_main():
         CALIBRATION_FORMATS,
         capture_calibration_inputs,
         resolve_calibration_format,
+        sibling_onnx_path,
         write_calibration_artifact,
     )
     try:
         from .export_onnx import (
-            INPUT_NAMES, build_stream_model, file_sha256, initial_inputs,
+            INPUT_NAMES, build_stream_model, export_graph, initial_inputs,
         )
     except ImportError:
         from export_onnx import (
-            INPUT_NAMES, build_stream_model, file_sha256, initial_inputs,
+            INPUT_NAMES, build_stream_model, export_graph, initial_inputs,
         )
 
     parser = argparse.ArgumentParser(description=calibration_main.__doc__)
@@ -172,6 +173,9 @@ def calibration_main():
                         help='bin or npz; inferred from --output when omitted')
     parser.add_argument('--frames', type=int, default=256)
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--onnx', default=None,
+                        help='where to write the graph these tensors bind to '
+                             '(default: <output>.onnx)')
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error('--frames must be positive')
@@ -187,6 +191,12 @@ def calibration_main():
         raise FileNotFoundError('no wav files under %s' % args.wav_dir)
     random.Random(args.seed).shuffle(files)
     stream_model, grid = build_stream_model(args.config, args.model)
+    # The graph is exported (and parity-checked) in the same process, from the
+    # same model instance the tensors below are recorded against, so the two
+    # deployment artifacts cannot drift apart.
+    onnx_path = sibling_onnx_path(args.output, args.onnx)
+    graph_metadata = export_graph(stream_model, grid, args.model, onnx_path,
+                                  verify=True)
     captured = {name: [] for name in INPUT_NAMES}
     source_files = []
     window = torch.hann_window(grid['win_len']).sqrt()
@@ -212,7 +222,7 @@ def calibration_main():
                 wave, grid['n_fft'], grid['hop_len'], grid['win_len'],
                 window=window, center=False, return_complex=True,
             )).permute(1, 0, 2)
-            _, conv, tra, inter = initial_inputs()
+            _, conv, tra, inter = initial_inputs(stream_model.model)
             used = False
             for spectrum in spectra:
                 mix = spectrum[None, :, None, :]
@@ -237,7 +247,8 @@ def calibration_main():
     }
     report = {
         'schema': 'gtcrn-stream-calibration-v1',
-        'checkpoint_sha256': file_sha256(args.model),
+        'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
+        'graph': os.path.basename(onnx_path),
         'frames': int(arrays['mix'].shape[0]),
         'source_files': source_files,
         'sample_rate': grid['sr'],
@@ -257,8 +268,8 @@ def calibration_main():
     write_calibration_artifact(
         args.output, arrays, report, artifact_format
     )
-    print('%s (%d streaming frames)' %
-          (args.output, arrays['mix'].shape[0]))
+    print('%s (%d streaming frames), graph %s' %
+          (args.output, arrays['mix'].shape[0], onnx_path))
 
 
 def cli():

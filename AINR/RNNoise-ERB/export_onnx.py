@@ -155,6 +155,18 @@ def build_metadata(feature_cfg, n_bands, gru_size, use_complex_input=False):
     }
 
 
+def export_graph(config_path, checkpoint_path, output_path, verify=False):
+    """Programmatic entry over ``export(args)``.
+
+    Lives here, next to every ``args.*`` field ``export`` reads, so a new
+    CLI knob gets added to this synthesis in the same edit instead of
+    silently breaking a caller that hand-built the namespace elsewhere.
+    """
+    from types import SimpleNamespace
+    export(SimpleNamespace(config=config_path, model=checkpoint_path,
+                           output=output_path, verify=verify))
+
+
 def export(args):
     import onnx
     from collections import Counter

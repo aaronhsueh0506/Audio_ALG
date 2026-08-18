@@ -77,11 +77,10 @@ The accelerator graphs are stateless: convolution history, attention rings
 and recurrent state are explicit graph inputs and outputs. Complex values use
 real/imaginary pairs.
 
-Run both operations from the model directory:
-
-    python3 export_onnx.py \
-      --checkpoint checkpoint.pth \
-      --output output/model.onnx --verify
+One calibration run produces both deployment artifacts: it exports and
+parity-checks the ONNX graph the tensors bind to (default `<output>.onnx`,
+override with `--onnx`) from the same wrapper in the same process, then
+records the calibration frames against it. Run it from the model directory:
 
     python3 inference.py calib \
       --checkpoint checkpoint.pth \
@@ -89,6 +88,12 @@ Run both operations from the model directory:
       --far-dir /path/to/far_wavs \
       --frames 8192 --format bin \
       --output calib/model
+
+`export_onnx.py` remains available for a graph-only export:
+
+    python3 export_onnx.py \
+      --checkpoint checkpoint.pth \
+      --output output/model.onnx --verify
 
 For Align-ULCNet, --primary-dir contains materialized linear-error WAVs. For
 the end-to-end models it contains microphone WAVs. Relative WAV paths in the

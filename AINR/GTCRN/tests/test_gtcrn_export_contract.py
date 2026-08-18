@@ -57,7 +57,7 @@ def _metadata(tmp_path):
     checkpoint = tmp_path / 'ckpt.pth'
     checkpoint.write_bytes(b'not a real checkpoint, only hashed')
     stream = _stream_model()
-    inputs = initial_inputs()
+    inputs = initial_inputs(stream.model)
     with torch.no_grad():
         outputs = stream(*(tensor.clone() for tensor in inputs))
     return build_metadata(str(checkpoint), GRID, inputs, outputs)
@@ -129,7 +129,7 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
     )
 
     stream = _stream_model()
-    inputs = initial_inputs()
+    inputs = initial_inputs(stream.model)
     graph_path = os.fspath(tmp_path / 'gtcrn_stream.onnx')
     torch.onnx.export(
         stream, tuple(tensor.clone() for tensor in inputs), graph_path,
@@ -146,7 +146,7 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
 
     # Two invocations, recorded exactly the way calibration_main records them.
     captured = {}
-    mix, conv, tra, inter = initial_inputs()
+    mix, conv, tra, inter = initial_inputs(stream.model)
     with torch.no_grad():
         for _ in range(2):
             capture_calibration_inputs(
@@ -168,32 +168,32 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
         assert blob.size == int(np.prod(graph_shapes[name])), name
 
 
-def _grid_config(tmp_path, sr):
+def _grid_config(tmp_path, n_fft):
     config = tmp_path / 'config.ini'
     config.write_text(
-        '[signal]\nsr = %d\nn_fft = 512\nwin_len = 512\nhop_len = 256\n'
-        '[model]\nerb_subband_1 = 65\nerb_subband_2 = 64\n' % sr,
+        '[signal]\nsr = 16000\nn_fft = %d\nwin_len = %d\nhop_len = %d\n'
+        '[model]\nerb_subband_1 = 65\nerb_subband_2 = 64\n'
+        % (n_fft, n_fft, n_fft // 2),
         encoding='utf-8',
     )
     return os.fspath(config)
 
 
-def test_stream_grid_pin_names_the_offending_config(tmp_path):
-    """The 16k pin guards the TRAINING grid declared by the config.
+def test_build_stream_model_follows_the_config_grid(tmp_path):
+    """Shapes derive from the config's training grid, not from a default.
 
-    Wav sample rates are resampled by inference and calibration and can never
-    trip it, so the rejection must name the config file and the grid it
-    declares -- that is the only thing the operator can act on.
+    A checkpoint from a different grid must fail loudly at strict
+    ``load_state_dict`` (the ERB matrices change extent with n_fft), never
+    deep inside a matmul on mismatched dummy inputs.
     """
-    config = _grid_config(tmp_path, 48000)
-    with pytest.raises(ValueError) as excinfo:
-        build_stream_model(config, os.fspath(tmp_path / 'absent.pth'))
-    message = str(excinfo.value)
-    assert '48000/512/65/64' in message
-    assert config in message
+    checkpoint = os.fspath(tmp_path / 'gtcrn_256.pth')
+    torch.save(
+        {'state_dict': GTCRN(65, 64, nfft=256, fs=16000).state_dict()},
+        checkpoint,
+    )
+    stream, grid = build_stream_model(_grid_config(tmp_path, 256), checkpoint)
+    assert grid['n_fft'] == 256
+    assert initial_inputs(stream.model)[0].shape == (1, 129, 1, 2)
 
-    # The verified grid gets PAST the pin with the identical call: it fails
-    # later, on the deliberately absent checkpoint. Proof the gate can open.
-    config = _grid_config(tmp_path, 16000)
-    with pytest.raises((FileNotFoundError, OSError)):
-        build_stream_model(config, os.fspath(tmp_path / 'absent.pth'))
+    with pytest.raises(RuntimeError, match='size mismatch'):
+        build_stream_model(_grid_config(tmp_path, 512), checkpoint)

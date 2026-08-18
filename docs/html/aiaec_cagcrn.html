@@ -154,7 +154,7 @@ samples。</li>
 <li><code>AIAEC/CAGCRN/model.py</code>（<code>CAGCRN</code>、<code>CrossAttentionTemporalAlignment</code>、<code>TFGRU</code>、<code>TFAG</code>、<code>ErbBandCodec</code>、<code>_stream_*</code> helpers）</li>
 <li><code>AIAEC/CAGCRN/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
 <li>tests：<code>AIAEC/tests/test_streaming_cagcrn.py</code>（4 tests）、<code>test_candidate_models.py</code>（含 <code>test_cagcrn_soft_window_has_gradient</code>）——全套 <code>python3 -m pytest AIAEC/tests</code> = 220 passed（<code>pytest AIAEC</code> 含 dataset_gen = 336）</li>
-<li>匯出／calibration：<code>AIAEC/CAGCRN/export_onnx.py</code>、<code>AIAEC/CAGCRN/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/CAGCRN/calib/</code>）。</li>
+<li>匯出／calibration：<code>AIAEC/CAGCRN/export_onnx.py</code>、<code>AIAEC/CAGCRN/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/CAGCRN/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.4</li>
 </ul>
 </body>

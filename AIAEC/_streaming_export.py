@@ -404,48 +404,41 @@ def _verify_onnx(path, wrapper, inputs, input_names, split: GraphSplit,
     return worst
 
 
-def main(model_name: str) -> None:
-    """Run one model's export CLI; each model's export_onnx.py names itself."""
-    if model_name not in GENERIC_MODEL_NAMES:
-        raise ValueError('unsupported AIAEC model: %s' % model_name)
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--checkpoint', required=True)
-    parser.add_argument('--output', required=True)
-    parser.add_argument('--max-delay-frames', type=int, default=None)
-    parser.add_argument('--opset', type=int, default=17)
-    parser.add_argument('--verify', action='store_true')
-    args = parser.parse_args()
-    args.model_name = model_name
+def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
+                 opset=17, verify=False):
+    """Write the streaming graph plus its metadata JSON; optionally verify.
 
-    model, grid = load_checkpoint_model(args.model_name, args.checkpoint)
-    checkpoint_depth = alignment_depth(model)
-    if args.max_delay_frames is not None:
-        set_alignment_depth(model, args.max_delay_frames)
-    model.eval()
-    wrapper, inputs, input_names, output_names, split = _build(
-        args.model_name, model
-    )
+    Shared by the export CLI and the calib recorder, so the calibration
+    tensors and the graph they bind to always come from the same wrapper in
+    the same process. ``checkpoint_depth`` is the alignment depth the
+    checkpoint recorded, captured by the caller BEFORE any deployment
+    override -- it cannot be recovered from the model afterwards. Returns
+    the metadata written into the graph.
+    """
+    wrapper, inputs, input_names, output_names, split = built
+    model_name = wrapper.model_name
+    model = wrapper.model
     with torch.no_grad():
         outputs = wrapper(*inputs)
     if not all(torch.isfinite(value).all() for value in outputs):
         raise RuntimeError('streaming export reference contains NaN or Inf')
 
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     torch.onnx.export(
         wrapper,
         inputs,
-        args.output,
+        output_path,
         input_names=input_names,
         output_names=output_names,
-        opset_version=args.opset,
+        opset_version=opset,
         do_constant_folding=True,
     )
     import onnx
-    graph = onnx.shape_inference.infer_shapes(onnx.load(args.output))
+    graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
     onnx.checker.check_model(graph)
     metadata = {
-        'model_family': args.model_name,
-        'checkpoint_sha256': file_sha256(args.checkpoint),
+        'model_family': model_name,
+        'checkpoint_sha256': file_sha256(checkpoint_path),
         'boundary': 'stateless_streaming_explicit_state',
         'sample_rate': int(grid.sr),
         'n_fft': int(grid.n_fft),
@@ -454,8 +447,8 @@ def main(model_name: str) -> None:
         'input_feature_frames': 1,
         'output_frames_per_invocation': 1,
         'accelerator_persistent_state': False,
-        'c_prepost': _C_BOUNDARIES[args.model_name],
-        'learned_control_semantics': _CONTROL_SEMANTICS[args.model_name],
+        'c_prepost': _C_BOUNDARIES[model_name],
+        'learned_control_semantics': _CONTROL_SEMANTICS[model_name],
         'input_schema': _schema(input_names, inputs),
         'output_schema': _schema(output_names, outputs),
         'max_delay_frames': alignment_depth(model),
@@ -475,19 +468,17 @@ def main(model_name: str) -> None:
             input_names[split.signal_inputs:], inputs[split.signal_inputs:]
         )
     }
-    metadata['state_precision_policy'] = state_precision_policy(
-        args.model_name
-    )
+    metadata['state_precision_policy'] = state_precision_policy(model_name)
     set_onnx_metadata(graph, metadata)
-    onnx.save(graph, args.output)
-    with open(os.path.splitext(args.output)[0] + '.json', 'w',
+    onnx.save(graph, output_path)
+    with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as stream:
         json.dump(metadata, stream, indent=2, sort_keys=True)
         stream.write('\n')
 
-    if args.verify:
+    if verify:
         worst = _verify_onnx(
-            args.output, wrapper, inputs, input_names, split,
+            output_path, wrapper, inputs, input_names, split,
             max(4, 2 * alignment_depth(model) + 1),
         )
         if worst > 3e-4:
@@ -495,4 +486,28 @@ def main(model_name: str) -> None:
                 'streaming ONNX parity failed: max_abs=%.6g' % worst
             )
         print('streaming ONNX parity max_abs=%.6g' % worst)
+    return metadata
+
+
+def main(model_name: str) -> None:
+    """Run one model's export CLI; each model's export_onnx.py names itself."""
+    if model_name not in GENERIC_MODEL_NAMES:
+        raise ValueError('unsupported AIAEC model: %s' % model_name)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--checkpoint', required=True)
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--max-delay-frames', type=int, default=None)
+    parser.add_argument('--opset', type=int, default=17)
+    parser.add_argument('--verify', action='store_true')
+    args = parser.parse_args()
+    args.model_name = model_name
+
+    model, grid = load_checkpoint_model(args.model_name, args.checkpoint)
+    checkpoint_depth = alignment_depth(model)
+    if args.max_delay_frames is not None:
+        set_alignment_depth(model, args.max_delay_frames)
+    model.eval()
+    built = _build(args.model_name, model)
+    export_graph(grid, built, args.checkpoint, args.output, checkpoint_depth,
+                 opset=args.opset, verify=args.verify)
     print(args.output)

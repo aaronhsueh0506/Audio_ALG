@@ -100,7 +100,11 @@ whether recurrent state is explicit at the ONNX boundary and whether ERB is
 inside or outside the graph.
 
 RNNoise-ERB, DeepFilterNet2 and GTCRN calibration can emit `bin` or `npz`.
-The deployment BIN layout is identical for all three: one subdirectory per
+Every calibration run also exports and parity-checks the ONNX graph the
+tensors bind to (default `<output>.onnx`, override with `--onnx`), from the
+same model instance in the same process, so the two deployment artifacts
+cannot drift apart; `export_onnx.py` remains available for a graph-only
+export. The deployment BIN layout is identical for all three: one subdirectory per
 ONNX input, one `<tensor>_<1-based-frame>.bin` per invocation, and a
 `manifest.json`. Each file contains one complete graph input tensor, including
 its batch dimension; only the filename index is the calibration-frame axis.

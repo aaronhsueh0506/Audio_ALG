@@ -11,12 +11,39 @@ from torch import nn
 import torch.nn.functional as F
 
 
-def initial_inputs():
+def _encoder_pad_sizes(model):
+    """Per-GT-block temporal cache extent, (kernel-1)*dilation each.
+
+    The single source for how much of the shared temporal cache each encoder
+    block owns; both the cache allocation (`initial_inputs`) and the slice
+    bounds that read it (`StreamGTCRN`) derive from this, so they cannot
+    drift apart.
+    """
+    return [block.pad_size for block in model.encoder.en_convs[2:]]
+
+
+def initial_inputs(model):
+    """One random spectrum frame plus zero caches, shaped for ``model``.
+
+    Every extent is read off the module tree rather than written down, so the
+    graph follows whatever grid the checkpoint was trained on: the spectrum
+    width tracks n_fft through the ERB split, the cache depth tracks the GT
+    blocks' temporal kernels/dilations, and the frequency width tracks the
+    encoder strides through ``dpgrnn1.width``.
+    """
+    erb = model.erb
+    bins = erb.erb_subband_1 + erb.erb_fc.in_features
+    gt_blocks = list(model.encoder.en_convs[2:])
+    channels = gt_blocks[0].depth_conv.in_channels
+    depth = sum(_encoder_pad_sizes(model))
+    width = model.dpgrnn1.width
+    tra = gt_blocks[0].tra.att_gru
+    inter = model.dpgrnn1.inter_rnn
     return (
-        torch.randn(1, 257, 1, 2),
-        torch.zeros(2, 1, 16, 16, 33),
-        torch.zeros(2, 3, 1, 1, 16),
-        torch.zeros(2, 1, 33, 16),
+        torch.randn(1, bins, 1, 2),
+        torch.zeros(2, 1, channels, depth, width),
+        torch.zeros(2, len(gt_blocks), tra.num_layers, 1, tra.hidden_size),
+        torch.zeros(2, inter.num_layers, width, inter.hidden_size),
     )
 
 
@@ -86,6 +113,20 @@ class StreamGTCRN(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
+        # Per-block slices of the shared temporal cache, from each GT block's
+        # own (kernel-1)*dilation extent. The decoder mirrors the encoder's
+        # dilation stack in reverse, so it reuses the same layout backwards;
+        # the assert keeps that assumption loud if the architecture changes.
+        encoder_pads = _encoder_pad_sizes(model)
+        bounds, start = [], 0
+        for pad in encoder_pads:
+            bounds.append((start, start + pad))
+            start += pad
+        decoder_pads = [block.pad_size
+                        for block in model.decoder.de_convs[:len(bounds)]]
+        assert decoder_pads == encoder_pads[::-1]
+        self._encoder_slices = tuple(bounds)
+        self._decoder_slices = tuple(reversed(bounds))
 
     def forward(self, spectrum, conv_cache, tra_cache, inter_cache):
         model = self.model
@@ -101,9 +142,8 @@ class StreamGTCRN(nn.Module):
             skips.append(x)
         enc_conv = []
         enc_tra = []
-        offsets = ((0, 2), (2, 6), (6, 16))
         for index, block in enumerate(model.encoder.en_convs[2:]):
-            start, end = offsets[index]
+            start, end = self._encoder_slices[index]
             x, cache, hidden = _gt_step(
                 block, x, conv_cache[0, :, :, start:end],
                 tra_cache[0, index])
@@ -116,9 +156,8 @@ class StreamGTCRN(nn.Module):
 
         dec_conv_reverse = []
         dec_tra = []
-        decoder_offsets = ((6, 16), (2, 6), (0, 2))
         for index, block in enumerate(model.decoder.de_convs[:3]):
-            start, end = decoder_offsets[index]
+            start, end = self._decoder_slices[index]
             x, cache, hidden = _gt_step(
                 block, x + skips[4 - index],
                 conv_cache[1, :, :, start:end], tra_cache[1, index],

@@ -39,6 +39,11 @@ composition 留在 graph 外。複數一律以 real/imag pair 表示。</p>
 <pre>python3 export_onnx.py --checkpoint checkpoint.pth --output output/model.onnx --verify
 python3 inference.py calib --checkpoint checkpoint.pth ... --format bin --output calib/model</pre>
 
+<p><code>inference.py calib</code> 會在同一 process、同一 model instance 一併匯出並
+parity-check calibration tensors 所綁定的 graph（預設 <code>&lt;output&gt;.onnx</code>，
+<code>--onnx</code> 可改路徑），兩個部署產物不可能 drift；<code>export_onnx.py</code>
+保留給只要 graph 的情境。</p>
+
 <p>BIN calibration layout 為
 <code>tensor/tensor_1.bin</code>、<code>tensor/tensor_2.bin</code> 等，每個
 tensor 每個 frame 一個檔；<code>manifest.json</code> 記錄 dtype、shape、

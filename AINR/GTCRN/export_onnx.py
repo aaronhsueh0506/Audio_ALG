@@ -73,15 +73,11 @@ def build_stream_model(config_path, checkpoint_path):
     hop_len = cfg.getint('signal', 'hop_len', fallback=win_len // 2)
     sub1 = cfg.getint('model', 'erb_subband_1')
     sub2 = cfg.getint('model', 'erb_subband_2')
-    if (sr, n_fft, sub1, sub2) != (16000, 512, 65, 64):
-        # This pins the TRAINING grid declared by the config, not the input
-        # audio: inference and calibration resample wav files of any rate to
-        # the model rate. A checkpoint trained on another grid needs the
-        # stream cache layout re-verified on that grid before export.
-        raise ValueError(
-            'the verified stream graph requires sr/n_fft/ERB=16000/512/65/64, '
-            'but %s declares %d/%d/%d/%d' % (config_path, sr, n_fft, sub1, sub2)
-        )
+    # No grid is pinned here: every graph and cache extent downstream derives
+    # from the model built off this config (see stream_model.initial_inputs),
+    # so the config must simply match the checkpoint's training grid. A
+    # mismatch fails loudly -- shape-changing drift at strict load_state_dict,
+    # shape-preserving drift at the recorded checkpoint contract.
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     require_checkpoint_contract(checkpoint, build_contract(cfg, win_len, hop_len),
                                 context=checkpoint_path, allow_missing=True)
@@ -118,6 +114,57 @@ def build_metadata(checkpoint_path, grid, inputs, outputs):
     }
 
 
+def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
+                 verify=False):
+    """Write the ONNX graph plus its metadata JSON; optionally verify parity.
+
+    Shared by the export CLI and ``inference.py calib``, so the calibration
+    tensors and the graph they bind to always come from the same model
+    instance in the same process.
+    """
+    inputs = initial_inputs(stream.model)
+    # Cloned so the schema comes from the real graph tensors without the
+    # traced export seeing anything this forward pass touched.
+    with torch.no_grad():
+        outputs = stream(*(tensor.clone() for tensor in inputs))
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    torch.onnx.export(
+        stream, inputs, output_path,
+        input_names=INPUT_NAMES,
+        output_names=OUTPUT_NAMES,
+        opset_version=opset, do_constant_folding=True,
+    )
+    import onnx
+    graph = onnx.load(output_path)
+    onnx.checker.check_model(graph)
+    graph = onnx.shape_inference.infer_shapes(graph)
+    metadata = build_metadata(checkpoint_path, grid, inputs, outputs)
+    set_onnx_metadata(graph, metadata)
+    onnx.save(graph, output_path)
+    with open(os.path.splitext(output_path)[0] + '.json', 'w',
+              encoding='utf-8') as fp:
+        json.dump({p.key: p.value for p in graph.metadata_props}, fp,
+                  indent=2, sort_keys=True)
+        fp.write('\n')
+    if verify:
+        import onnxruntime as ort
+        verify_inputs = initial_inputs(stream.model)
+        ort_feed = {name: tensor.detach().numpy().copy()
+                    for name, tensor in zip(INPUT_NAMES, verify_inputs)}
+        with torch.no_grad():
+            expected = stream(*(tensor.clone() for tensor in verify_inputs))
+        session = ort.InferenceSession(output_path,
+                                       providers=['CPUExecutionProvider'])
+        actual = session.run(None, {item.name: ort_feed[item.name]
+                                    for item in session.get_inputs()})
+        worst = max(float(np.max(np.abs(a - b.detach().numpy())))
+                    for a, b in zip(actual, expected))
+        if worst > 2e-4:
+            raise RuntimeError('ONNX parity failed: max abs error %.6g' % worst)
+        print('ONNX parity max_abs=%.6g' % worst)
+    return metadata
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config',
@@ -128,43 +175,8 @@ def main():
     parser.add_argument('--verify', action='store_true')
     args = parser.parse_args()
     model, grid = build_stream_model(args.config, args.model)
-    inputs = initial_inputs()
-    # Cloned so the schema comes from the real graph tensors without the
-    # traced export seeing anything this forward pass touched.
-    with torch.no_grad():
-        outputs = model(*(tensor.clone() for tensor in inputs))
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    torch.onnx.export(
-        model, inputs, args.output,
-        input_names=INPUT_NAMES,
-        output_names=OUTPUT_NAMES,
-        opset_version=args.opset, do_constant_folding=True,
-    )
-    import onnx
-    graph = onnx.load(args.output)
-    onnx.checker.check_model(graph)
-    graph = onnx.shape_inference.infer_shapes(graph)
-    set_onnx_metadata(graph, build_metadata(args.model, grid, inputs, outputs))
-    onnx.save(graph, args.output)
-    with open(os.path.splitext(args.output)[0] + '.json', 'w', encoding='utf-8') as fp:
-        json.dump({p.key: p.value for p in graph.metadata_props}, fp,
-                  indent=2, sort_keys=True)
-        fp.write('\n')
-    if args.verify:
-        import onnxruntime as ort
-        verify_inputs = initial_inputs()
-        ort_feed = {name: tensor.detach().numpy().copy()
-                    for name, tensor in zip(INPUT_NAMES, verify_inputs)}
-        with torch.no_grad():
-            expected = model(*(tensor.clone() for tensor in verify_inputs))
-        session = ort.InferenceSession(args.output, providers=['CPUExecutionProvider'])
-        actual = session.run(None, {item.name: ort_feed[item.name]
-                                    for item in session.get_inputs()})
-        worst = max(float(np.max(np.abs(a - b.detach().numpy())))
-                    for a, b in zip(actual, expected))
-        if worst > 2e-4:
-            raise RuntimeError('ONNX parity failed: max abs error %.6g' % worst)
-        print('ONNX parity max_abs=%.6g' % worst)
+    export_graph(model, grid, args.model, args.output,
+                 opset=args.opset, verify=args.verify)
     print(args.output)
 
 

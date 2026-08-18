@@ -418,6 +418,59 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
     return worst
 
 
+def export_graph(model, checkpoint_path, output_path, opset=17, verify=False):
+    """Write the streaming graph plus its metadata; optionally verify parity.
+
+    Shared by the export CLI and the calib recorder, so the calibration
+    tensors and the graph they bind to always come from the same wrapper in
+    the same process. Returns the wrapper, its dummy inputs and the graph
+    metadata for reuse.
+    """
+    wrapper = AlignUlcnetStreamingExport(model).eval()
+    inputs = dummy_inputs(wrapper.delay_depth)
+    with torch.no_grad():
+        outputs = wrapper(*inputs)
+    if not all(torch.isfinite(value).all() for value in outputs):
+        raise RuntimeError('PyTorch streaming export reference is non-finite')
+
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+    torch.onnx.export(
+        wrapper,
+        inputs,
+        output_path,
+        input_names=INPUT_NAMES,
+        output_names=OUTPUT_NAMES,
+        opset_version=opset,
+        do_constant_folding=True,
+    )
+
+    import onnx
+    graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
+    onnx.checker.check_model(graph)
+    checkpoint_data = torch.load(
+        checkpoint_path, map_location='cpu', weights_only=False
+    )
+    metadata = _write_metadata(
+        output_path,
+        checkpoint_path,
+        model,
+        checkpoint_data['contract'],
+        inputs,
+        outputs,
+    )
+    _set_onnx_metadata(graph, metadata)
+    onnx.save(graph, output_path)
+
+    if verify:
+        worst = _verify_onnx(output_path, wrapper, inputs)
+        if worst > 3e-4:
+            raise RuntimeError(
+                'streaming ONNX parity failed: max_abs=%.6g' % worst
+            )
+        print('streaming ONNX parity max_abs=%.6g' % worst)
+    return wrapper, inputs, metadata
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', required=True)
@@ -431,48 +484,8 @@ def main() -> None:
         args.checkpoint, 'cpu', max_delay_frames=args.max_delay_frames
     )
     model.eval()
-    wrapper = AlignUlcnetStreamingExport(model).eval()
-    inputs = dummy_inputs(wrapper.delay_depth)
-    with torch.no_grad():
-        outputs = wrapper(*inputs)
-    if not all(torch.isfinite(value).all() for value in outputs):
-        raise RuntimeError('PyTorch streaming export reference is non-finite')
-
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
-    torch.onnx.export(
-        wrapper,
-        inputs,
-        args.output,
-        input_names=INPUT_NAMES,
-        output_names=OUTPUT_NAMES,
-        opset_version=args.opset,
-        do_constant_folding=True,
-    )
-
-    import onnx
-    graph = onnx.shape_inference.infer_shapes(onnx.load(args.output))
-    onnx.checker.check_model(graph)
-    checkpoint_data = torch.load(
-        args.checkpoint, map_location='cpu', weights_only=False
-    )
-    metadata = _write_metadata(
-        args.output,
-        args.checkpoint,
-        model,
-        checkpoint_data['contract'],
-        inputs,
-        outputs,
-    )
-    _set_onnx_metadata(graph, metadata)
-    onnx.save(graph, args.output)
-
-    if args.verify:
-        worst = _verify_onnx(args.output, wrapper, inputs)
-        if worst > 3e-4:
-            raise RuntimeError(
-                'streaming ONNX parity failed: max_abs=%.6g' % worst
-            )
-        print('streaming ONNX parity max_abs=%.6g' % worst)
+    export_graph(model, args.checkpoint, args.output,
+                 opset=args.opset, verify=args.verify)
     print(args.output)
 
 

@@ -289,49 +289,43 @@ def build_metadata(checkpoint_path, params, inputs, outputs):
     }
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--config',
-                        default=os.path.join(_SCRIPT_DIR, 'config.ini'))
-    parser.add_argument('--model', required=True)
-    parser.add_argument('--output', required=True)
-    parser.add_argument('--opset', type=int, default=17)
-    parser.add_argument('--verify', action='store_true')
-    args = parser.parse_args()
+def export_graph(wrapper, params, checkpoint_path, output_path,
+                 opset=17, verify=False):
+    """Write the ONNX graph plus its metadata JSON; optionally verify parity.
 
-    model, params = load_model(SimpleNamespace(
-        config=args.config, model=args.model
-    ))
-    wrapper = StatelessDFN2Heads(model).eval()
-    inputs = initial_inputs(model)
+    Shared by the export CLI and ``inference.py calib``, so the calibration
+    tensors and the graph they bind to always come from the same model
+    instance in the same process.
+    """
+    inputs = initial_inputs(wrapper.model)
     with torch.no_grad():
         outputs = wrapper(*inputs)
-    os.makedirs(os.path.dirname(os.path.abspath(args.output)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     torch.onnx.export(
         wrapper,
         inputs,
-        args.output,
+        output_path,
         input_names=INPUT_NAMES,
         output_names=OUTPUT_NAMES,
-        opset_version=args.opset,
+        opset_version=opset,
         do_constant_folding=True,
     )
 
     import onnx
-    graph = onnx.shape_inference.infer_shapes(onnx.load(args.output))
+    graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
     onnx.checker.check_model(graph)
-    metadata = build_metadata(args.model, params, inputs, outputs)
+    metadata = build_metadata(checkpoint_path, params, inputs, outputs)
     set_onnx_metadata(graph, metadata)
-    onnx.save(graph, args.output)
-    with open(os.path.splitext(args.output)[0] + '.json', 'w',
+    onnx.save(graph, output_path)
+    with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as stream:
         json.dump(metadata, stream, indent=2, sort_keys=True)
         stream.write('\n')
 
-    if args.verify:
+    if verify:
         import onnxruntime as ort
         session = ort.InferenceSession(
-            args.output, providers=['CPUExecutionProvider']
+            output_path, providers=['CPUExecutionProvider']
         )
         actual = session.run(None, {
             name: value.detach().numpy()
@@ -346,6 +340,25 @@ def main():
                 'ONNX parity failed: max abs error %.6g' % worst
             )
         print('ONNX parity max_abs=%.6g' % worst)
+    return metadata
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config',
+                        default=os.path.join(_SCRIPT_DIR, 'config.ini'))
+    parser.add_argument('--model', required=True)
+    parser.add_argument('--output', required=True)
+    parser.add_argument('--opset', type=int, default=17)
+    parser.add_argument('--verify', action='store_true')
+    args = parser.parse_args()
+
+    model, params = load_model(SimpleNamespace(
+        config=args.config, model=args.model
+    ))
+    wrapper = StatelessDFN2Heads(model).eval()
+    export_graph(wrapper, params, args.model, args.output,
+                 opset=args.opset, verify=args.verify)
     print(args.output)
 
 

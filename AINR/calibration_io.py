@@ -53,6 +53,19 @@ def resolve_calibration_format(output_path, requested=None):
     return result
 
 
+def sibling_onnx_path(output_path, override=None):
+    """Where a calibration run writes the graph its tensors bind to.
+
+    Beside the artifact, dropping a ``.npz`` suffix first, so ``calib/foo``
+    and ``calib/foo.npz`` both pair with ``calib/foo.onnx``.
+    """
+    if override:
+        return override
+    output_path = str(output_path)
+    base = output_path[:-4] if output_path.endswith('.npz') else output_path
+    return base + '.onnx'
+
+
 def _validate_arrays(arrays):
     if not arrays:
         raise ValueError('calibration requires at least one input tensor')

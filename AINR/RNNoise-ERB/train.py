@@ -197,9 +197,15 @@ def require_checkpoint_loss_config(ckpt, loss_cfg, irm_cfg, context='checkpoint'
 def read_loss_config(cfg):
     """Read the DeepFilterNet 3 production MultiResSpecLoss subset used here."""
     section = 'multi_res_spec_loss'
+    # The correct resolutions are ratios of the model FFT (see
+    # test_fft_sizes_are_ratios_of_the_model_fft), so the fallback derives
+    # from [signal] n_fft instead of restating upstream's 960-FFT literals,
+    # which are an octave high on any other grid.
+    n_fft = cfg.getint('signal', 'n_fft')
+    default_sizes = '%d,%d,%d,%d' % (n_fft // 4, n_fft // 2, n_fft, n_fft * 2)
     fft_sizes = tuple(
         int(x.strip()) for x in
-        cfg.get(section, 'fft_sizes', fallback='256,512,1024,2048').split(',')
+        cfg.get(section, 'fft_sizes', fallback=default_sizes).split(',')
         if x.strip()
     )
     loss_cfg = {

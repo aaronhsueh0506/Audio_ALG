@@ -222,3 +222,16 @@ def test_streaming_onnx_runtime_matches_pytorch(tmp_path):
                 )))
             state = next_state(state, expected, depth)
     assert worst <= 3e-4
+
+
+def test_streaming_export_rejects_a_non_verified_grid():
+    """The C boundary guard must fire before any shape can go wrong.
+
+    SamFR width and the 257-bin dummies in this exporter are written for the
+    16 kHz / 512-FFT boundary; a checkpoint from another grid has to be
+    rejected here with an actionable message, never crash deep in a matmul.
+    """
+    model = AlignULCNet(SignalGrid(16000, 256, 256, 128),
+                        max_delay_frames=D).eval()
+    with pytest.raises(ValueError, match='16 kHz / FFT 512'):
+        AlignUlcnetStreamingExport(model)
