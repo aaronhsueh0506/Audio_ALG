@@ -51,7 +51,11 @@ from AIAEC._export_common import (
     load_checkpoint_model,
     set_alignment_depth,
 )
-from AINR.DeepFilterNet2.export_onnx import _schema, set_onnx_metadata
+from AINR.DeepFilterNet2.export_onnx import (
+    _schema,
+    optimize_graph_file,
+    set_onnx_metadata,
+)
 
 
 # The candidates this shared stateless exporter serves: everything except
@@ -450,6 +454,7 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
         opset_version=opset,
         do_constant_folding=True,
     )
+    optimize_graph_file(output_path)
     import onnx
     graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
     onnx.checker.check_model(graph)

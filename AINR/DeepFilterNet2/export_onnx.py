@@ -69,6 +69,40 @@ OUTPUT_NAMES = (
 )
 
 
+def optimize_graph_file(path):
+    """onnxoptimizer cleanup shared by the stateless exporters.
+
+    The tracer leaves Identity/Constant/dead-end noise around every replayed
+    module; the fuse-and-eliminate passes drop it so the deployed graph
+    carries only real ops. Skipped when the package is absent -- the graph is
+    then correct but unoptimized.
+    """
+    try:
+        import onnxoptimizer
+        from onnxoptimizer import (
+            get_available_passes,
+            get_fuse_and_elimination_passes,
+        )
+    except ImportError:
+        print('[skip] onnxoptimizer not installed; graph left unoptimized')
+        return
+    import onnx
+    wanted = {
+        'eliminate_nop_pad', 'eliminate_nop_transpose', 'eliminate_identity',
+        'eliminate_deadend', 'eliminate_unused_initializer',
+        'fuse_consecutive_transposes', 'fuse_consecutive_squeezes',
+        'fuse_consecutive_unsqueezes', 'fuse_matmul_add_bias_into_gemm',
+        'fuse_add_bias_into_conv',
+    }
+    passes = list(set(get_fuse_and_elimination_passes())
+                  | (wanted & set(get_available_passes())))
+    graph = onnx.load(path)
+    before = len(graph.graph.node)
+    graph = onnxoptimizer.optimize(graph, passes, fixed_point=True)
+    onnx.save(graph, path)
+    print('[onnxoptimizer] %d -> %d nodes' % (before, len(graph.graph.node)))
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -313,6 +347,7 @@ def export_graph(wrapper, params, checkpoint_path, output_path,
         opset_version=opset,
         do_constant_folding=True,
     )
+    optimize_graph_file(output_path)
 
     import onnx
     graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))

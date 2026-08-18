@@ -78,6 +78,7 @@ from AIAEC.training_common import (
     checkpoint_far_input_mode,
     far_input_mode_c_value,
 )
+from AINR.DeepFilterNet2.export_onnx import optimize_graph_file
 
 
 # Kept numerically equal to ULCNET_MODEL_IO_LAYOUT_VERSION in
@@ -445,6 +446,7 @@ def export_graph(model, checkpoint_path, output_path, opset=17, verify=False):
         opset_version=opset,
         do_constant_folding=True,
     )
+    optimize_graph_file(output_path)
 
     import onnx
     graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
