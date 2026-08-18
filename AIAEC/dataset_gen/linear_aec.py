@@ -26,6 +26,18 @@ _AUDIO_ALG_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 _AEC_ROOT = os.path.join(_AUDIO_ALG_ROOT, "lib", "aec")
+if not os.path.isdir(os.path.join(_AEC_ROOT, "python")):
+    # Deployment/training copies carry only AINR/, AIAEC/ and the standalone
+    # AEC/ checkout side by side (no git tree, so no lib/aec submodule): fall
+    # back to a sibling AEC/ beside this root, then to the SE-tree layout one
+    # level up. In a full checkout lib/aec exists and nothing changes.
+    for _candidate in (
+        os.path.join(_AUDIO_ALG_ROOT, "AEC"),
+        os.path.join(os.path.dirname(_AUDIO_ALG_ROOT), "AEC"),
+    ):
+        if os.path.isdir(os.path.join(_candidate, "python")):
+            _AEC_ROOT = _candidate
+            break
 _AEC_PYTHON = os.path.join(_AEC_ROOT, "python")
 if _AEC_PYTHON not in sys.path:
     sys.path.insert(0, _AEC_PYTHON)

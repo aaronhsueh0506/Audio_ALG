@@ -2,8 +2,11 @@
 
 AEC data generation reuses generic augmentation DSP from ``AINR``.
 
-Only the ``Audio_ALG`` root is added. Adding ``AIAEC`` and ``AINR`` themselves
-would create two ambiguous top-level packages both named ``dataset_gen``.
+The ``Audio_ALG`` root serves the package-qualified imports; the ``AINR``
+directory is added as well because ``calibration_io`` lives there (so a
+deployment that copies only the model folders still carries it). ``AIAEC``
+itself is deliberately NOT added -- that would shadow AINR's bare
+``dataset_gen`` with a second top-level package of the same name.
 """
 
 import os
@@ -14,3 +17,6 @@ _AUDIO_ALG = os.path.dirname(_AIAEC)
 
 if _AUDIO_ALG not in sys.path:
     sys.path.insert(0, _AUDIO_ALG)
+_AINR = os.path.join(_AUDIO_ALG, 'AINR')
+if _AINR not in sys.path:
+    sys.path.insert(0, _AINR)

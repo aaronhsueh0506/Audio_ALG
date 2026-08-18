@@ -38,8 +38,11 @@ import torch
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
+_AINR_DIR = os.path.join(_REPO_ROOT, 'AINR')  # home of calibration_io
 if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
+if _AINR_DIR not in sys.path:
+    sys.path.insert(0, _AINR_DIR)
 
 from calibration_io import (  # noqa: E402
     CALIBRATION_FORMATS,

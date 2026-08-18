@@ -31,6 +31,9 @@ if _THIS_DIR not in sys.path:
     sys.path.insert(0, _THIS_DIR)
 if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
+_AINR_DIR = os.path.dirname(_THIS_DIR)  # home of calibration_io
+if _AINR_DIR not in sys.path:
+    sys.path.insert(0, _AINR_DIR)
 
 try:
     from .model import DeepFilterNet2

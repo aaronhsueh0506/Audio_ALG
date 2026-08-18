@@ -19,6 +19,18 @@ _AUDIO_ALG_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 )
 _AEC_ROOT = os.path.join(_AUDIO_ALG_ROOT, "lib", "aec")
+if not os.path.isdir(os.path.join(_AEC_ROOT, "python")):
+    # Deployment/training copies carry only AINR/, AIAEC/ and the standalone
+    # AEC/ checkout side by side (no git tree, so no lib/aec submodule): fall
+    # back to a sibling AEC/ beside this root, then to the SE-tree layout one
+    # level up. In a full checkout lib/aec exists and nothing changes.
+    for _candidate in (
+        os.path.join(_AUDIO_ALG_ROOT, "AEC"),
+        os.path.join(os.path.dirname(_AUDIO_ALG_ROOT), "AEC"),
+    ):
+        if os.path.isdir(os.path.join(_candidate, "python")):
+            _AEC_ROOT = _candidate
+            break
 _AEC_PYTHON = os.path.join(_AEC_ROOT, "python")
 
 
@@ -54,6 +66,12 @@ def _aec_signal_path_files() -> list:
             keep.append(path)
         elif top in _NON_SIGNAL_DIRS:
             continue
+    if not keep:
+        raise RuntimeError(
+            "aec_behavior_hash found no lib/aec python sources under "
+            f"{_AEC_PYTHON!r}; a trimmed checkout must carry the AEC/ "
+            "checkout beside AIAEC/ (see the fallback list in this module)"
+        )
     return keep
 
 
