@@ -845,15 +845,11 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
             valid = 0;
             break;
         }
-        if (pre.delay.changed) {
-            /* A delay realignment resets each lane's WOLA history. An
-             * external time-domain beamformer must reset its matching OLA
-             * state at the same boundary. */
-            memset(previous, 0,
-                   (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
-            memset(ola, 0,
-                   (size_t)fft_size * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
-        }
+        /* A delay realignment no longer restarts any WOLA sequence: the
+         * lanes realign their filters in place, so the external mirror keeps
+         * its OLA running too and this identity now proves the seams stay
+         * continuous ACROSS the realign boundary, not merely after both
+         * sides were wiped. */
         for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
             float* channel_ola = ola + (size_t)ch * fft_size;
             float* channel_previous = previous + (size_t)ch * hop;

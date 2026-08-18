@@ -1062,6 +1062,7 @@ int four_aec_nr_res_process_pre(
     int hop;
     int ch;
     int i;
+    int old_align;
     const Complex* shared_far_spec = NULL;   /* Group 6: set by lane 0, borrowed by lanes 1-3 */
 
     if (!p || p->destroyed ||
@@ -1087,21 +1088,28 @@ int four_aec_nr_res_process_pre(
                 i * FOUR_AEC_NR_RES_CHANNELS +
                 p->cfg.capture_proxy_channel];
     }
+    /* The alignment the lanes were served BEFORE this hop's decision: raw
+     * (0) until the estimate first turns solid. Captured ahead of
+     * update_shared_delay(), which overwrites both fields. */
+    old_align = p->last_delay.solid ? p->accepted_delay : 0;
     delay = update_shared_delay(p, p->mic_lane, ref);
     if (!align_render(p, ref, delay.delay_samples)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
     if (delay.changed) {
+        /* Realign instead of reset: aec_apply_external_realign() shifts each
+         * converged filter by the alignment delta (warm tap-transfer when the
+         * evidence gate holds, soft echo-path-change otherwise), so the
+         * cancellation survives and the WOLA sequences continue. The old full
+         * aec_reset() + OLA wipe produced one near-zero output hop plus
+         * dozens of hops of re-exposed echo -- the spectrogram vertical line
+         * (regression: lib/aec test_external_realign.c and
+         * tests/test_4aec_nr_res.c's realign continuity rows). */
         for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-            aec_reset(p->lanes[ch]);
+            aec_apply_external_realign(p->lanes[ch],
+                                       delay.delay_samples - old_align);
         }
-        /* The AEC reset starts a new WOLA sequence whose first analysis
-         * frame has a zero previous half. Discard the old mono synthesis
-         * tail as well; mixing it into the new sequence would join spectra
-         * from opposite sides of the delay realignment. */
-        if (p->ola)
-            memset(p->ola, 0, (size_t)p->fft_size * sizeof(float));
     }
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
