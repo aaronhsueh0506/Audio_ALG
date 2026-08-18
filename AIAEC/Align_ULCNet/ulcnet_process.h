@@ -84,8 +84,9 @@ extern "C" {
 #define ULCNET_HOP      256          /* = N_FFT/2, 50% overlap (COLA) */
 #define ULCNET_BINS     257          /* N_FFT/2 + 1 */
 
-/* 模型的 modified power-law 壓縮指數 (compression_exponent)。 */
-#define ULCNET_COMPRESSION_EXP 0.3f
+/* 模型的 modified power-law 壓縮指數 (compression_exponent)。單一來源在
+ * ulcnet_model_io.h 的部署契約常數;此名稱保留給既有呼叫端。 */
+#define ULCNET_COMPRESSION_EXP ULCNET_MODEL_IO_COMPRESSION_EXP
 
 /* ---- Shared sqrt-Hann window ----
  * Both analyses and the synthesis use the SAME table; build it once into
@@ -213,17 +214,6 @@ typedef struct UlcnetModel {
     void (*reset)(void *user);
     const UlcnetModelIoDescriptor *io_descriptor;  /* NULL = not published */
 } UlcnetModel;
-
-/* ---- 可選: 壓縮/解壓縮 helper ----
- * 模型 graph 內建 signed |x|^0.3 壓縮與 |x|^(1/0.3) 解壓縮（model.py
- * _signed_power）。若目標 runtime 不支援 pow 類算子而把這兩步移出 graph，
- * 用這兩個 helper——邊界移動要連 export graph 一起改，兩邊必須一致。 */
-void ulcnet_compress_frame(const float re[ULCNET_BINS],
-                           const float im[ULCNET_BINS],
-                           float zr[ULCNET_BINS], float zi[ULCNET_BINS]);
-void ulcnet_expand_frame(const float re[ULCNET_BINS],
-                         const float im[ULCNET_BINS],
-                         float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]);
 
 #ifdef __cplusplus
 }

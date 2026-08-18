@@ -36,17 +36,20 @@ th{background:#eef1f5}
 
 <h2>概要</h2>
 <p>超輕量 16 kHz 降噪模型(ShuffleNetV2 conv + SFE + TRA + 2×DPGRNN,
-輸出 complex ratio mask)。與其他三個模型不同,GTCRN 的特徵抽取
-(mag/real/imag 堆疊、ERB band merge/split、SFE unfold)<b>全部在模型圖內</b>;
-C 端 <code>gtcrn_process.c</code> 只負責串流 STFT 與 WOLA 合成,模型邊界是
-未正規化的複數頻譜 <code>[B,F,T,2]</code>。</p>
+輸出 complex ratio mask)。model layout v5 起固定前後端全部搬到 host:
+C 端 <code>gtcrn_process.c</code> 負責串流 STFT/WOLA 之外,還以
+<code>gtcrn_model_input</code>(magnitude＋ERB 前向矩陣 <code>erb_fwd.bin</code>)
+產生 <code>mag/real/imag</code> 三個 <code>(1,129,1)</code> 獨立輸入(各自量化
+scale),圖只保留 learned compute(concat 後 SFE/conv/GRU),輸出 ERB 域
+complex mask 由 <code>gtcrn_model_output</code>(ERB 逆矩陣
+<code>erb_inv.bin</code>＋CRM)在 host 展開套用。</p>
 <div class="tbl"><table>
 <tr><th>項目</th><th>值(以現行程式碼為準)</th></tr>
 <tr><td>取樣率 / grid</td><td>16000 Hz;FFT/win/hop = <code>512/512/256</code>(32 ms 窗、16 ms hop;<code>GTCRN_N_FFT/GTCRN_HOP_LEN</code>)</td></tr>
 <tr><td>頻譜 bins</td><td>257(<code>GTCRN_N_BINS</code>)</td></tr>
-<tr><td>ERB 混合解析度(圖內)</td><td><code>erb_subband_1=65</code>(低頻原 bins)+ <code>erb_subband_2=64</code>(ERB 帶)= 129;DPGRNN width = 33(由 encoder stride 導出)</td></tr>
+<tr><td>ERB 混合解析度(host 前後端)</td><td><code>erb_subband_1=65</code>(低頻原 bins)+ <code>erb_subband_2=64</code>(ERB 帶)= 129;DPGRNN width = 33(由 encoder stride 導出)</td></tr>
 <tr><td>參數量</td><td>trainable 23,669;含固定 ERB matrix 共 48,245(實際建構量測)</td></tr>
-<tr><td>輸出</td><td>complex ratio mask,圖內直接乘回輸入頻譜</td></tr>
+<tr><td>輸出</td><td>ERB 域 complex mask;host 端 ERB 逆矩陣展開後 CRM 乘回同幀頻譜</td></tr>
 <tr><td>STFT 正規化</td><td>無(<code>torch.stft</code> 預設;C 端 <code>norm=1.0f</code>),root-Hann 窗</td></tr>
 </table></div>
 <p class="note">論文數據與逐層架構筆記見
@@ -89,15 +92,22 @@ gtcrn_analysis                      st.analysis_buf (512) 滑窗
    v
 spec [257][2]  ------------------------------------------+
    |                                                     |
-   v  (以下全部在模型圖內, model.py GTCRN.forward)        |
-   mag = sqrt(re^2+im^2+1e-12); stack -> (B,3,T,257)     |
-   ERB.bm: 低 65 bins 原樣 + 高 192 bins -> 64 帶 = 129  |
+   v  host 固定前端 gtcrn_model_input (fp32)             |
+   mag = sqrt(re^2+im^2+1e-12)                           |
+   ERB 前向 (erb_fwd.bin): 低 65 bins 原樣 +             |
+     高 192 bins -> 64 帶 = 129;mag/re/im 各一路 (1,129,1)|
+   |                                                     |
+   v  (以下在模型圖內, stream_model.StreamGTCRN)         |
+   concat 3x(1,129,1) -> (B,3,T,129)                     |
    SFE(k=3): unfold -> (B,9,T,129)                       |
    Encoder: ConvBlock x2 (freq stride 2,2)               |
             + GTConvBlock x3 (dilation 1/2/5, causal)    |
    DPGRNN x2 (intra: 雙向沿頻率; inter: 單向沿時間)      |
    Decoder: GTConvBlock x3 + ConvBlock x2 (skip add)     |
-   ERB.bs: 129 -> 257;  Mask (CRM) * spec_ref  <---------+
+   mask_erb (B,2,T,129) = 圖輸出                         |
+   |                                                     |
+   v  host 固定後端 gtcrn_model_output (fp32)            |
+   ERB 逆 (erb_inv.bin): 129 -> 257;  CRM * spec  <------+
    |
    v
 output [257][2]
@@ -130,18 +140,20 @@ hop-lag: 0 框 (模型 causal); I/O 延遲僅 WOLA 重疊 win-hop = 256 samples
 <div class="tbl"><table>
 <tr><th>Tensor</th><th>shape</th><th>dtype</th><th>每次呼叫框數</th><th>時域樣本</th><th>備註</th></tr>
 <tr><td><code>input</code>(C 入)</td><td>[256]</td><td>float32</td><td>1 hop</td><td>256(16 ms)</td><td><code>gtcrn_analysis</code> 只吃新樣本,滑窗自持</td></tr>
-<tr><td><code>output</code>(analysis 出 / 模型入)</td><td>C: [257][2];圖: (1,257,T,2)</td><td>float32</td><td>1(串流 T=1)</td><td>—</td><td>bin-major [re,im],未正規化 RFFT,對齊 <code>[B,F,T,2]</code></td></tr>
-<tr><td>模型出</td><td>(1,257,T,2)</td><td>float32</td><td>T</td><td>—</td><td>CRM 已在圖內套用,輸出即增強頻譜(實際 forward 驗證 in/out 同形)</td></tr>
+<tr><td><code>output</code>(analysis 出 / host 前端入)</td><td>[257][2]</td><td>float32</td><td>1</td><td>—</td><td>bin-major [re,im],未正規化 RFFT</td></tr>
+<tr><td><code>mag</code>/<code>real</code>/<code>imag</code>(圖入 ×3)</td><td>各 (1,129,1)</td><td>float32</td><td>1(串流 T=1)</td><td>—</td><td><code>gtcrn_model_input</code> 產生;三個獨立輸入各持量化 scale</td></tr>
+<tr><td><code>output</code>(圖出)</td><td>(1,129,1,2)</td><td>float32</td><td>1</td><td>—</td><td>ERB 域 complex mask;host <code>gtcrn_model_output</code> 做 ERB 逆矩陣＋CRM</td></tr>
 <tr><td><code>input</code>(synthesis 入)</td><td>[257][2]</td><td>float32</td><td>1</td><td>—</td><td>一框增強頻譜</td></tr>
 <tr><td><code>output</code>(C 出)</td><td>[256]</td><td>float32</td><td>1 hop</td><td>256</td><td>WOLA 輸出</td></tr>
 </table></div>
-<p class="note">圖內中間特徵(不跨越模型邊界):stack (B,3,T,257) → ERB.bm (B,3,T,129)
-→ SFE (B,9,T,129) → encoder (B,16,T,33) → decoder → mask (B,2,T,257)。</p>
+<p class="note">圖內中間特徵(不跨越模型邊界):concat (B,3,T,129)
+→ SFE (B,9,T,129) → encoder (B,16,T,33) → decoder → mask_erb (B,2,T,129)。
+離線 Python <code>GTCRN.forward(spec)</code> 仍是整段自含(特徵/ERB/CRM 在模型內),
+v5 邊界只描述部署用 stream graph。</p>
 
 <h2>State 表</h2>
-<p><b>ONNX/匯出邊界</b>:模型圖 = <code>GTCRN.forward(spec)</code> 整段(特徵、encoder、
-DPGRNN、decoder、CRM 全在圖內);圖外只有 C 的 STFT/WOLA。
-<code>export_onnx.py</code> 已交付 one-frame stateless graph；cache 尺寸由
+<p><b>ONNX/匯出邊界</b>:<code>export_onnx.py</code> 交付 one-frame stateless
+graph；cache 尺寸由
 <code>stream_model.initial_inputs(model)</code> 從 module tree 推導（不寫死 grid：
 spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder stride），
 conv_cache 與八顆 h_* state 都由 host 作為 graph input/output 送回，加速器本身不保存跨次呼叫狀態。

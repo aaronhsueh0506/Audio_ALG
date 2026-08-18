@@ -83,6 +83,8 @@ from AIAEC.Align_ULCNet.export_onnx import (
     STATE_LAYOUT_VERSION as ULCNET_STATE_LAYOUT_VERSION,
     export_graph as ulcnet_export_graph,
     next_state as ulcnet_next_state,
+    stream_features as ulcnet_stream_features,
+    SIGNAL_INPUTS as ULCNET_SIGNAL_INPUTS,
 )
 
 
@@ -91,7 +93,9 @@ from AIAEC.Align_ULCNet.export_onnx import (
 #
 # Align-ULCNet's graph emits one head plus delta-state; its state slots are
 # rebuilt by next_state() rather than sliced, so only signal_inputs is read.
-_ULCNET_SPLIT = GraphSplit(signal_inputs=2, head_outputs=1)
+_ULCNET_SPLIT = GraphSplit(
+    signal_inputs=ULCNET_SIGNAL_INPUTS, head_outputs=1
+)
 
 
 def input_range_report(arrays, policy):
@@ -224,6 +228,21 @@ def main(model_name: str) -> None:
         )
         input_names = ULCNET_INPUT_NAMES
         split = _ULCNET_SPLIT
+
+        # The block carries RAW error/far RI; the host front end (the same
+        # fixed math the deployment runs in C) produces the five feature
+        # inputs the graph binds. State is rebuilt by next_state() rather
+        # than sliced from the outputs.
+        def make_signal(block):
+            return ulcnet_stream_features(
+                model,
+                torch.from_numpy(block['error']).unsqueeze(0),
+                torch.from_numpy(block['far']).unsqueeze(0),
+            )
+
+        def advance_state(state, outputs):
+            return ulcnet_next_state(state, outputs, wrapper.delay_depth)
+
         if args.primary_is_mic:
             pairs, _ = _materialize_linear_error(
                 pairs, linear_contract, grid, args.output
@@ -238,6 +257,16 @@ def main(model_name: str) -> None:
         graph_metadata = export_graph(grid, built, args.checkpoint, onnx_path,
                                       checkpoint_depth, verify=True)
         wrapper, dummy, input_names, _output_names, split = built
+        signal_names = input_names[:split.signal_inputs]
+
+        def make_signal(block):
+            return tuple(
+                torch.from_numpy(block[name]).unsqueeze(0)
+                for name in signal_names
+            )
+
+        def advance_state(state, outputs):
+            return tuple(outputs[split.head_outputs:])
     feature_config = None
 
     captured = {}
@@ -262,21 +291,11 @@ def main(model_name: str) -> None:
                 value.clone() for value in dummy[split.signal_inputs:]
             )
             used = False
-            signal_names = input_names[:split.signal_inputs]
             for block in blocks:
-                signal = tuple(
-                    torch.from_numpy(block[name]).unsqueeze(0)
-                    for name in signal_names
-                )
-                inputs = signal + state
+                inputs = make_signal(block) + state
                 capture_calibration_inputs(captured, input_names, inputs)
                 outputs = wrapper(*inputs)
-                if args.model_name == 'Align_ULCNet':
-                    state = ulcnet_next_state(
-                        state, outputs, wrapper.delay_depth
-                    )
-                else:
-                    state = tuple(outputs[split.head_outputs:])
+                state = advance_state(state, outputs)
                 used = True
                 if len(next(iter(captured.values()))) >= args.frames:
                     break

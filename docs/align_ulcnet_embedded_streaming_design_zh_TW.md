@@ -606,34 +606,38 @@ flowchart LR
         AFAR["aligned-far seam PCM<br/>raw until acquisition"]
         ESTFT["sqrt-Hann STFT<br/>512 / 256"]
         FSTFT["sqrt-Hann STFT<br/>512 / 256"]
-        ERRI["error<br/>[1,1,257,2]"]
-        FARRI["far<br/>[1,1,257,2]"]
+        FEAT["固定前端 fp32<br/>signed pow(0.3) + magnitude<br/>+ 壓縮域相位 cos/sin"]
+        ERRI["error_mag / error_cos / error_sin<br/>各 [1,1,257]<br/>error_ri [1,1,257,2] 壓縮域"]
+        FARRI["far_mag<br/>[1,1,257]"]
         KH["key_history<br/>[1,32,D-1,26]"]
         VH["value_history<br/>[1,32,D-1,26]"]
         LH["logit_history<br/>[1,32,4,D]"]
         GH["gru0/gru1 hidden<br/>each [2,1,128]"]
         UPDATE["ring_push(K_now/V_now/logit_now)<br/>hidden = hidden_next"]
+        INV["逆冪 fp32"]
         WOLA["WOLA / IFFT"]
         PCM["enhanced PCM hop"]
 
         MIC --> AEC
         FAR --> AEC
-        AEC --> ERR --> ESTFT --> ERRI
-        AEC --> AFAR --> FSTFT --> FARRI
+        AEC --> ERR --> ESTFT --> FEAT
+        AEC --> AFAR --> FSTFT --> FEAT
+        FEAT --> ERRI
+        FEAT --> FARRI
         UPDATE --> KH
         UPDATE --> VH
         UPDATE --> LH
         UPDATE --> GH
-        WOLA --> PCM
+        INV --> WOLA --> PCM
     end
 
     subgraph NPU["Stateless accelerator: one ONNX invocation / frame"]
-        ENC["signed power + error/far encoders"]
+        ENC["error/far encoders"]
         QKV["Q_now / K_now / V_now"]
         TA["TA: current + history<br/>score conv + softmax"]
         BODY["joint conv + FGRU<br/>two temporal GRUs"]
-        MASK["mask + compressed-domain compose<br/>+ signed expansion"]
-        ENH["output<br/>[1,1,257,2]"]
+        MASK["mask + compressed-domain compose"]
+        ENH["output(壓縮域)<br/>[1,1,257,2]"]
         DELTA["state delta outputs<br/>K_now / V_now / logit_now<br/>gru0_next / gru1_next"]
 
         ENC --> QKV --> TA --> BODY --> MASK --> ENH
@@ -648,7 +652,7 @@ flowchart LR
     VH --> TA
     LH --> TA
     GH --> BODY
-    ENH --> WOLA
+    ENH --> INV
     DELTA --> UPDATE
 ```
 
@@ -665,12 +669,19 @@ descriptor，雖然可共用同一份 checkpoint weights。
 portable model-I/O ABI 限制 `2 <= D <= 64`；D=1 會產生長度為零的
 history input，多數版端 runtime 無法穩定支援，只保留為 Python 評測模式。
 
+固定前後端（layout v5 起）在 host fp32 執行：signed `pow(0.3)` 壓縮、兩路
+magnitude、壓縮域相位 cos/sin 由 `ulcnet_model_io_prepare()` 內算，逆冪由
+`ulcnet_model_io_commit()` 內做；graph 只綁五個特徵輸入，各自持 PTQ scale。
+
 Inputs：
 
 | tensor | float32 shape | 來源／用途 |
 |---|---:|---|
-| `error` | `[1,1,257,2]` | CPU PBFDKF error 的 STFT |
-| `far` | `[1,1,257,2]` | 固定取 AEC aligned-far seam；acquisition 前為 raw far，之後為 aligned far |
+| `error_mag` | `[1,1,257]` | 壓縮域 linear-error magnitude |
+| `far_mag` | `[1,1,257]` | 壓縮域 far magnitude；far 固定取 AEC aligned-far seam（acquisition 前為 raw far，之後為 aligned far） |
+| `error_cos` | `[1,1,257]` | 壓縮域 error 相位 cos |
+| `error_sin` | `[1,1,257]` | 壓縮域 error 相位 sin |
+| `error_ri` | `[1,1,257,2]` | 壓縮域 error real/imag |
 | `key_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far keys |
 | `value_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far values |
 | `logit_history` | `[1,32,4,D]` | TA `(5,3)` score conv 的前 4 幀 raw logits |
@@ -681,7 +692,7 @@ Outputs：
 
 | tensor | float32 shape | CPU 操作 |
 |---|---:|---|
-| `output` | `[1,1,257,2]` | 送 WOLA/IFFT |
+| `output` | `[1,1,257,2]` | 壓縮域 estimate；host 逆冪還原後送 WOLA/IFFT |
 | `key_now` | `[1,32,1,26]` | push 進 `key_history` |
 | `value_now` | `[1,32,1,26]` | push 進 `value_history` |
 | `logit_now` | `[1,32,1,D]` | push 進 4-frame `logit_history` |

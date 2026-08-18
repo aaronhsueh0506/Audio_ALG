@@ -13,6 +13,17 @@ typedef struct TestRuntime {
     float observed_gru0;  /* inputs->h_gru0[0] seen on entry    */
 } TestRuntime;
 
+/* Compression round trip (prepare's signed pow 0.3, commit's inverse) is
+ * identity only up to fp32 powf error, so the copy-through model is checked
+ * with a tolerance instead of memcmp. */
+static int nearly_equal(const float *a, const float *b, size_t elements) {
+    size_t index;
+    for (index = 0; index < elements; ++index) {
+        if (fabsf(a[index] - b[index]) > 1e-5f) return 0;
+    }
+    return 1;
+}
+
 static void fill(float *values, size_t elements, float value) {
     size_t index;
     for (index = 0; index < elements; ++index) values[index] = value;
@@ -25,7 +36,7 @@ static int run(void *user, const UlcnetModelIoInputs *inputs,
     runtime->calls += 1;
     runtime->observed_gru0 = inputs->h_gru0[0];
     for (index = 0; index < outputs->spectrum_ri_elements; ++index) {
-        outputs->output[index] = inputs->error[index];
+        outputs->output[index] = inputs->error_ri[index];
     }
     if (runtime->partial_write) {
         return 0;
@@ -103,8 +114,8 @@ int main(void) {
     }
     if (model.infer(model.user, error_re, error_im, far_re, far_im,
                     output_re, output_im) != 0 || runtime.calls != 1 ||
-        memcmp(error_re, output_re, sizeof(error_re)) != 0 ||
-        memcmp(error_im, output_im, sizeof(error_im)) != 0) {
+        !nearly_equal(error_re, output_re, 257) ||
+        !nearly_equal(error_im, output_im, 257)) {
         free(pool);
         return 1;
     }

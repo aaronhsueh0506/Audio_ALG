@@ -33,9 +33,9 @@ th{background:#f5efe8}
 <h3>ONNX / NPU graph 邊界</h3>
 <table>
 <tr><th>位置</th><th>內容</th></tr>
-<tr><td>graph <b>內</b>(已由 <code>export_onnx.py</code> 匯出)</td><td>(error, far, 顯式 states) → output:signed |x|^0.3 壓縮(<code>ULCNET_COMPRESSION_EXP=0.3f</code>)、attention、GRU、解壓縮全部在 graph 內。若目標 runtime 不支援 pow 類算子而把壓縮/解壓縮移出 graph,C 端有 <code>ulcnet_compress_frame()/ulcnet_expand_frame()</code>,但邊界移動必須連 export graph 一起改、兩邊一致。</td></tr>
-<tr><td>graph <b>外</b>(C 前處理)</td><td>線性 AEC(<code>aec_process_context</code>)、centered sqrt-Hann STFT(<code>ulcnet_analysis_push</code>,重現 torch.stft center=True + reflect 前綴)、delay-state policy。</td></tr>
-<tr><td>graph <b>外</b>(C 後處理)</td><td>output → centered WOLA(sqrt-Hann、包絡正規化、半窗 trim;<code>ulcnet_synthesis_push</code>)。</td></tr>
+<tr><td>graph <b>內</b>(已由 <code>export_onnx.py</code> 匯出)</td><td>(五個壓縮域特徵輸入 error_mag/far_mag/error_cos/error_sin/error_ri, 顯式 states) → 壓縮域 output:reorient、attention、GRU、mask 組合;learned compute only(layout v5)。</td></tr>
+<tr><td>graph <b>外</b>(C 前處理)</td><td>線性 AEC(<code>aec_process_context</code>)、centered sqrt-Hann STFT(<code>ulcnet_analysis_push</code>,重現 torch.stft center=True + reflect 前綴)、delay-state policy、固定前端(signed |x|^0.3 壓縮 <code>ULCNET_MODEL_IO_COMPRESSION_EXP=0.3f</code>、magnitude、壓縮域相位 cos/sin;封在 <code>ulcnet_model_io_prepare()</code> 內)。</td></tr>
+<tr><td>graph <b>外</b>(C 後處理)</td><td>壓縮域 output → 逆冪(<code>ulcnet_model_io_commit()</code> 內)→ centered WOLA(sqrt-Hann、包絡正規化、半窗 trim;<code>ulcnet_synthesis_push</code>)。</td></tr>
 <tr><td>runtime 跨呼叫保存的 NN states</td><td>far attention K/V ring、attention-logit 史、GRU hidden h — pipeline 只透過 <code>model.reset</code> 要求全部清除；參考 adapter 的 <code>ulcnet_model_io_reset()</code> 會將 K/V、logit 與兩組 GRU hidden 一併歸零。</td></tr>
 </table>
 
@@ -182,8 +182,8 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <tr><td><code>pipelines/mono_alignulcnet/audio_pipeline_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v7)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_process.h / .c</code></td><td>C 前後處理 + <code>UlcnetModel</code> 邊界(Python parity gate:<code>AIAEC/tests/test_ulcnet_process_c.py</code>,~1e-5 float-ULP 級)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.h / .c</code></td><td>accelerator adapter(無狀態 run() callback 包裝,見上方專節)</td></tr>
-<tr><td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h / .c</code></td><td>CPU 端 K/V ring / logit 史 / GRU hidden state(layout v4);Python parity:<code>AIAEC/tests/test_ulcnet_model_io_c.py</code></td></tr>
-<tr><td><code>AIAEC/Align_ULCNet/export_onnx.py</code></td><td>stateless one-frame ONNX 匯出(<code>STATE_LAYOUT_VERSION=4</code>);分別寫入 training provenance 與固定 aligned-far deployment metadata</td></tr>
+<tr><td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h / .c</code></td><td>CPU 端 K/V ring / logit 史 / GRU hidden state,內建 v5 固定前後端(signed-pow 特徵/逆冪);Python parity:<code>AIAEC/tests/test_ulcnet_model_io_c.py</code></td></tr>
+<tr><td><code>AIAEC/Align_ULCNet/export_onnx.py</code></td><td>stateless one-frame ONNX 匯出(<code>STATE_LAYOUT_VERSION=5</code>);分別寫入 training provenance 與固定 aligned-far deployment metadata</td></tr>
 <tr><td><code>pipelines/mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c</code></td><td>identity E2E、continuous stepping(除 reprime)、MATCHED 同值重鎖 reset、FIXED raw→aligned 首次切換 reset、identity-reprime straddle 推導(脈衝標記/無邊界對照跑)與 reprime 行為(MATCHED + FIXED)、config/pool/descriptor、create-vs-init parity、pre-acquisition far timestamp、UNLOCKED 仍套用、NaN/Inf、partial-write 與 known-delay n=1..5 coverage/mislock/cost</td></tr>
 <tr><td><code>AIAEC/tests/test_ulcnet_accelerator_adapter.c</code></td><td>accelerator adapter 獨立測試:raw/未定義 descriptor reject、aligned descriptor 發布、partial-write/失敗 run 不推進 state、成功 run 才推進</td></tr>
 <tr><td><code>pipelines/mono_alignulcnet/main.c</code></td><td>板端 adapter 參考骨架(fail-open,accelerator run() 回 -1 佔位);收 <code>--delay-mode/--delay-num-filters/--fixed-delay</code> 並打印 resolved profile 與該 config 的 pool bytes</td></tr>

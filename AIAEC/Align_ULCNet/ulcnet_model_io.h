@@ -13,6 +13,7 @@
 #ifndef ULCNET_MODEL_IO_H
 #define ULCNET_MODEL_IO_H
 
+#include <math.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,7 +28,12 @@ extern "C" {
  * inputs, output head, h_gru0/h_gru1 hiddens, *_out states); runtimes
  * bind by name, so the rename is a contract change even though every
  * shape stayed identical. */
-#define ULCNET_MODEL_IO_LAYOUT_VERSION 4u
+/* Version 5 moves the fixed front/back ends to the host: the graph binds
+ * five feature inputs (error_mag/far_mag/error_cos/error_sin +
+ * compressed error RI, all produced inside prepare()) and returns the
+ * COMPRESSED estimate; commit() applies the inverse signed power. The
+ * graph starts at the learned reorient/encoder compute. */
+#define ULCNET_MODEL_IO_LAYOUT_VERSION 5u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
@@ -37,6 +43,17 @@ extern "C" {
 #define ULCNET_MODEL_IO_SCORE_HISTORY  4
 #define ULCNET_MODEL_IO_GRU_LAYERS     2
 #define ULCNET_MODEL_IO_GRU_HIDDEN     128
+
+/* Modified power-law compression exponent (model.py compression_exponent).
+ * Deployment contract, not an implementation detail: prepare()/commit() and
+ * every tool touching compressed-domain tensors must use this exact value,
+ * and export_onnx.py refuses checkpoints trained with any other exponent. */
+#define ULCNET_MODEL_IO_COMPRESSION_EXP 0.3f
+
+/* sign(x) * |x|^e, the single C copy of model.py's _signed_power. */
+static inline float ulcnet_model_io_signed_pow(float value, float exponent) {
+    return copysignf(powf(fabsf(value), exponent), value);
+}
 
 /* Stable values retained for metadata diagnostics. Production descriptors
  * validate only ULCNET_FAR_ALIGNED: raw/aligned selection belongs to the
@@ -77,14 +94,21 @@ typedef struct UlcnetModelIoMemReq {
  *   GRU hidden        [2,1,128].
  */
 typedef struct UlcnetModelIoInputs {
-    const float *error;
-    const float *far;
+    /* The five feature tensors prepare() computes from the raw spectra
+     * (model layout v5): magnitudes/cos/sin are [1,1,257] and error_ri is
+     * the COMPRESSED [1,1,257,2]. */
+    const float *error_mag;
+    const float *far_mag;
+    const float *error_cos;
+    const float *error_sin;
+    const float *error_ri;
     const float *key_history;
     const float *value_history;
     const float *logit_history;
     const float *h_gru0;
     const float *h_gru1;
     size_t spectrum_ri_elements;
+    size_t spectrum_bins_elements;
     size_t key_history_elements;
     size_t value_history_elements;
     size_t logit_history_elements;
@@ -157,9 +181,11 @@ UlcnetModelIoState *ulcnet_model_io_init(
 
 void ulcnet_model_io_reset(UlcnetModelIoState *state);
 
-/* Pack separate C real/imag spectra into ONNX [1,1,257,2], return current
- * input views, and NaN-prefill every accelerator output.  Call once
- * immediately before every inference. */
+/* Run the fixed front end (signed-power compression, magnitudes, phase
+ * cos/sin) over the separate C real/imag spectra, return current input
+ * views, and NaN-prefill every accelerator output.  Call once immediately
+ * before every inference. commit() applies the matching inverse signed
+ * power to the graph's compressed estimate. */
 int ulcnet_model_io_prepare(UlcnetModelIoState *state,
                             const float error_re[257],
                             const float error_im[257],

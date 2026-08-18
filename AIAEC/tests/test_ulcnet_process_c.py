@@ -216,46 +216,6 @@ def test_emission_timing_contract(driver):
     assert raw.size == (7 + 1) * 2 * BINS
 
 
-def test_compression_helpers_roundtrip(driver, audio_common_lib):
-    """signed |x|^0.3 then |x|^(1/0.3) is identity to f32 accuracy; checked
-    through the Python-side formula to pin the exponent convention."""
-    work, exe = driver
-    # helper functions are exercised via a tiny dedicated main
-    cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
-    src = work / 'comp.c'
-    src.write_text(r'''
-#include <math.h>
-#include <stdio.h>
-#include "ulcnet_process.h"
-int main(void) {
-    float re[ULCNET_BINS], im[ULCNET_BINS], zr[ULCNET_BINS], zi[ULCNET_BINS];
-    float rr[ULCNET_BINS], ri[ULCNET_BINS];
-    for (int k = 0; k < ULCNET_BINS; ++k) {
-        re[k] = (k % 3 == 0 ? -1.0f : 1.0f) * (0.001f + 0.01f * (float)k);
-        im[k] = (k % 2 == 0 ? 1.0f : -1.0f) * (0.002f + 0.005f * (float)k);
-    }
-    ulcnet_compress_frame(re, im, zr, zi);
-    ulcnet_expand_frame(zr, zi, rr, ri);
-    float worst = 0.0f;
-    for (int k = 0; k < ULCNET_BINS; ++k) {
-        float dr = fabsf(rr[k] - re[k]) / fabsf(re[k]);
-        float di = fabsf(ri[k] - im[k]) / fabsf(im[k]);
-        if (dr > worst) worst = dr;
-        if (di > worst) worst = di;
-    }
-    printf("%g\n", worst);
-    return worst < 5e-5f ? 0 : 1;
-}
-''')
-    exe2 = work / 'comp'
-    subprocess.run([cc, '-O2', '-std=c99', '-ffp-contract=off',
-                    '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, str(src),
-                    os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
-                    audio_common_lib, '-lm', '-o', str(exe2)],
-                   check=True, capture_output=True)
-    subprocess.run([str(exe2)], check=True)
-
-
 def test_ulcnet_compressed_mask_helper_matches_python(driver, audio_common_lib):
     work, _ = driver
     cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')

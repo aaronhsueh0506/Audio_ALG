@@ -9,9 +9,13 @@ import torch
 
 from AIAEC.Align_ULCNet.export_onnx import (
     AlignUlcnetStreamingExport,
+    host_output,
+    stream_features,
     GRU_HIDDEN,
     GRU_LAYERS,
+    COMPRESSION_EXPONENT,
     INPUT_NAMES,
+    SIGNAL_INPUTS,
     MAX_DELAY_DEPTH,
     MIN_DELAY_DEPTH,
     OUTPUT_NAMES,
@@ -21,6 +25,7 @@ from AIAEC.Align_ULCNet.export_onnx import (
     TA_CHANNELS,
     _write_metadata,
     dummy_inputs,
+    export_graph,
     next_state,
     state_shapes,
 )
@@ -51,8 +56,8 @@ def test_streaming_export_shapes_are_fixed_and_delta_only():
     assert shapes['logit_history'] == (1, 32, 4, D)
     assert shapes['h_gru0'] == (2, 1, 128)
     assert INPUT_NAMES == (
-        'error', 'far', 'key_history', 'value_history',
-        'logit_history', 'h_gru0', 'h_gru1',
+        'error_mag', 'far_mag', 'error_cos', 'error_sin', 'error_ri',
+        'key_history', 'value_history', 'logit_history', 'h_gru0', 'h_gru1',
     )
     assert OUTPUT_NAMES == (
         'output', 'key_now', 'value_now', 'logit_now',
@@ -101,6 +106,28 @@ def test_c_descriptor_constants_match_export_contract():
         assert int(match.group(1)) == value, enumerator
     assert 'int far_input_mode;' in header
 
+    # v5 moved the compression exponent out of the graph; the C define and
+    # the exporter constant can now drift silently, so pin them here (the
+    # exporter separately refuses checkpoints with any other exponent).
+    match = re.search(
+        r'^#define\s+ULCNET_MODEL_IO_COMPRESSION_EXP\s+([0-9.]+)f\s*$',
+        header,
+        flags=re.MULTILINE,
+    )
+    assert match is not None
+    assert float(match.group(1)) == COMPRESSION_EXPONENT
+
+
+def test_export_refuses_foreign_compression_exponent(tmp_path):
+    model = AlignULCNet(
+        GRID, max_delay_frames=D, compression_exponent=0.5
+    ).eval()
+    checkpoint = tmp_path / 'ckpt.pth'
+    torch.save({'contract': {}, 'state_dict': model.state_dict()},
+               checkpoint)
+    with pytest.raises(ValueError, match='compression_exponent'):
+        export_graph(model, str(checkpoint), str(tmp_path / 'graph.onnx'))
+
 
 def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
@@ -135,7 +162,7 @@ def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
     torch.manual_seed(20260816)
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
-    explicit = tuple(value.clone() for value in dummy_inputs(D)[2:])
+    explicit = tuple(value.clone() for value in dummy_inputs(D)[SIGNAL_INPUTS:])
     reference = model.create_stream_state()
     generator = torch.Generator().manual_seed(73)
 
@@ -143,11 +170,15 @@ def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
         for _ in range(2 * D + 5):
             error = _complex_frame(generator)
             far = _complex_frame(generator)
-            outputs = wrapper(_ri(error), _ri(far), *explicit)
+            signals = stream_features(model, _ri(error), _ri(far))
+            outputs = wrapper(*signals, *explicit)
             expected = model.forward_stream(error, far, reference)
 
+            # The graph output is the COMPRESSED estimate; the host applies
+            # the inverse signed power (host_output), completing the chain.
             assert torch.allclose(
-                outputs[0], _ri(expected.enhanced), atol=5e-7, rtol=1e-6
+                host_output(model, outputs[0]), _ri(expected.enhanced),
+                atol=5e-7, rtol=1e-6
             )
             explicit = next_state(explicit, outputs, D)
 
@@ -171,7 +202,7 @@ def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
 
 def test_reset_is_all_zero_external_state():
     inputs = dummy_inputs(D)
-    for state in inputs[2:]:
+    for state in inputs[SIGNAL_INPUTS:]:
         assert torch.count_nonzero(state) == 0
 
 
@@ -202,12 +233,13 @@ def test_streaming_onnx_runtime_matches_pytorch(tmp_path):
     assert tuple(item.name for item in session.get_inputs()) == INPUT_NAMES
     assert tuple(item.name for item in session.get_outputs()) == OUTPUT_NAMES
 
-    state = tuple(value.clone() for value in initial[2:])
+    state = tuple(value.clone() for value in initial[SIGNAL_INPUTS:])
     generator = torch.Generator().manual_seed(23)
     worst = 0.0
     with torch.no_grad():
         for _ in range(2 * depth + 4):
-            current = (
+            current = stream_features(
+                model,
                 torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
                 torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
             ) + state

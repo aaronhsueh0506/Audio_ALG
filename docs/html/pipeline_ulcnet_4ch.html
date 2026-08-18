@@ -30,7 +30,7 @@ th{background:#f5eef0}
 
 <h2>概要</h2>
 <p><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.{h,c}</code>:沿用四聲道空間前級(共用 delay + 4 AEC lanes + SRP-PHAT + GSC,見 <a href="pipeline_4ch.html">pipeline_4ch</a>),但核心的 post-beam RES/NR 路徑<b>不使用</b>——每個 pre frame 以 <code>four_aec_nr_res_abandon_pre()</code> 釋放,由 Align-ULCNet chain 完全取代 post 級:GSC beamformed 誤差<b>頻譜</b> → 本 wrapper 的 WOLA 重建成時域 beam hop → ULCNet centered STFT chain → <code>UlcnetModel</code> callback(外部 NPU runtime)→ WOLA → 增強 mono hop。格點僅 <b>16 kHz / fft 512 / hop 256 / 257 bins</b>(48 kHz 與 fft≠{0,512} 在驗證期 reject;<code>fft_size=0</code> 強制 512,絕不落到核心自己的 256 預設)。</p>
-<p>ONNX/NPU graph 邊界與 runtime 保存的 NN states 與 mono 變體完全相同(graph 內:壓縮/attention/GRU/解壓縮;graph 外:STFT/WOLA/AEC/beamform/delay policy;runtime 保存 far K/V ring、logit 史、GRU h)——見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a> 的邊界表。VAD 僅提供外部版 <code>process_with_activity()</code>(auto-VAD fallback 留在標準 wrapper;<code>auto_vad_*</code> 欄位驗證但不使用)。</p>
+<p>ONNX/NPU graph 邊界與 runtime 保存的 NN states 與 mono 變體完全相同(graph 內:reorient/attention/GRU/mask 組合, learned compute only;graph 外:STFT/WOLA/AEC/beamform/delay policy＋固定前後端(signed-pow 壓縮特徵/逆冪, 封在 model_io prepare/commit);runtime 保存 far K/V ring、logit 史、GRU h)——見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a> 的邊界表。VAD 僅提供外部版 <code>process_with_activity()</code>(auto-VAD fallback 留在標準 wrapper;<code>auto_vad_*</code> 欄位驗證但不使用)。</p>
 
 <h2>API 用法</h2>
 <pre>AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();

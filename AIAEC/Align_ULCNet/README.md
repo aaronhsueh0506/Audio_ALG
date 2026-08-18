@@ -123,29 +123,32 @@ flowchart LR
         AFAR["aligned_far"]
         SEAM["AEC aligned-far seam<br/>raw until acquisition"]
         STFT["two sqrt-Hann STFTs<br/>512 / 256"]
-        ERRI["error<br/>[1,1,257,2]"]
-        FARRI["far<br/>[1,1,257,2]"]
+        FEAT["fixed front end, fp32<br/>signed power 0.3 + magnitudes<br/>+ phase cos/sin"]
+        ERRF["error_mag / error_cos / error_sin<br/>each [1,1,257]<br/>error_ri [1,1,257,2] compressed"]
+        FARF["far_mag<br/>[1,1,257]"]
         STATE["external state inputs<br/>K/V history + logit history<br/>two GRU hidden tensors"]
         UPDATE["CPU ring update<br/>push K_now/V_now/logit_now<br/>hidden = hidden_next"]
+        INV["inverse signed power<br/>fp32"]
         WOLA["WOLA / IFFT"]
         OUT["enhanced PCM hop"]
         MIC --> AEC
         FAR --> AEC
         AEC --> ERR --> STFT
         AEC --> AFAR --> SEAM --> STFT
-        STFT --> ERRI
-        STFT --> FARRI
+        STFT --> FEAT
+        FEAT --> ERRF
+        FEAT --> FARF
         UPDATE --> STATE
-        WOLA --> OUT
+        INV --> WOLA --> OUT
     end
 
     subgraph NPU["Stateless model accelerator: T=1"]
-        ENC["signed power + encoders"]
+        ENC["encoders"]
         QKV["Q_now / K_now / V_now"]
         TA["TA over current + history<br/>score conv + softmax"]
         BODY["joint conv + FGRU<br/>temporal GRUs"]
         MASK["mask + composition<br/>signed expansion"]
-        ENH["output<br/>[1,1,257,2]"]
+        ENH["output, compressed domain<br/>[1,1,257,2]"]
         DELTA["delta state outputs<br/>K_now / V_now / logit_now<br/>gru0_next / gru1_next"]
         ENC --> QKV --> TA --> BODY --> MASK --> ENH
         QKV --> DELTA
@@ -153,11 +156,11 @@ flowchart LR
         BODY --> DELTA
     end
 
-    ERRI --> ENC
-    FARRI --> ENC
+    ERRF --> ENC
+    FARF --> ENC
     STATE --> TA
     STATE --> BODY
-    ENH --> WOLA
+    ENH --> INV
     DELTA --> UPDATE
 ```
 
@@ -167,12 +170,22 @@ contracts even though their weight shapes are identical. The portable ABI
 accepts `2 <= D <= 64`; D=1 would create zero-length history inputs, which are
 not portable across target runtimes and is therefore evaluation-only.
 
+The fixed front end never enters the quantized domain: the host computes the
+signed-power compression (`sign(x) * |x|^0.3`), both magnitudes and the
+compressed-domain phase as cos/sin in fp32, and the graph binds the five
+feature tensors as separate inputs so each keeps its own quantization scale.
+The far branch is the AEC aligned-far seam; it carries raw far before
+acquisition and aligned far afterward.
+
 Inputs per invocation:
 
 | tensor | float32 shape | ordering |
 |---|---:|---|
-| `error` | `[1,1,257,2]` | real/imag last |
-| `far` | `[1,1,257,2]` | AEC aligned-far seam; it carries raw far before acquisition and aligned far afterward |
+| `error_mag` | `[1,1,257]` | compressed-domain magnitude of linear error |
+| `far_mag` | `[1,1,257]` | compressed-domain magnitude of the far branch |
+| `error_cos` | `[1,1,257]` | cos of the compressed-domain error phase |
+| `error_sin` | `[1,1,257]` | sin of the compressed-domain error phase |
+| `error_ri` | `[1,1,257,2]` | COMPRESSED real/imag, last dim |
 | `key_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `value_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `logit_history` | `[1,32,4,D]` | chronological, t-4 through t-1 |
@@ -183,7 +196,7 @@ Outputs per invocation:
 
 | tensor | float32 shape | CPU action |
 |---|---:|---|
-| `output` | `[1,1,257,2]` | send to WOLA/IFFT |
+| `output` | `[1,1,257,2]` | compressed-domain estimate; apply the inverse signed power (`sign(x) * |x|^(1/0.3)`), then WOLA/IFFT |
 | `key_now` | `[1,32,1,26]` | push into key history |
 | `value_now` | `[1,32,1,26]` | push into value history |
 | `logit_now` | `[1,32,1,D]` | append to four-frame logit history |
@@ -262,7 +275,7 @@ python3 inference.py calib \
   --output calib/align_ulcnet_d8
 ```
 
-The layout is `<tensor>/<tensor>_<frame>.bin`, with one-based frame numbers;
+The layout is `<tensor>/<tensor>_<frame>.bin`, with zero-based frame numbers;
 for example `h_gru0/h_gru0_0000.bin`. Each file is C-contiguous and
 little-endian. `manifest.json` records dtype and per-frame shape. The output
 directory must not already exist, so a shorter rerun cannot leave stale frames.
@@ -278,11 +291,12 @@ checkpoint's separate training provenance, and tensor schemas. Only the
 model-local `export_onnx.py` is a supported user entry point.
 
 **Every previously exported graph must be re-exported.** The model-I/O layout
-moved v2 -> v3 and the deployed far branch moved RAW -> ALIGNED, so a
-descriptor written before this change fails
-`ulcnet_model_io_descriptor_validate()` on BOTH fields (`layout_version !=
-ULCNET_MODEL_IO_LAYOUT_VERSION` and `far_input_mode != ULCNET_FAR_ALIGNED`),
-and `ulcnet_accelerator_adapter_init()` therefore returns NULL. Re-exporting is
+is now v5 (v3 fixed the deployed far branch RAW -> ALIGNED, v4 renamed the
+tensors, v5 moved the fixed front/back ends to the host), so a descriptor
+written before this change fails `ulcnet_model_io_descriptor_validate()` on
+`layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION` (pre-v3 descriptors also
+fail `far_input_mode != ULCNET_FAR_ALIGNED`), and
+`ulcnet_accelerator_adapter_init()` therefore returns NULL. Re-exporting is
 the whole remedy: nothing upstream of the graph changed. Checkpoints keep their
 weights and their recorded training provenance, and datasets need no
 regeneration -- the exporter reads the checkpoint's training
@@ -292,9 +306,13 @@ requiring the two to agree.
 CPU state storage and ring updates are implemented by
 `ulcnet_model_io.c/.h`.  They use one caller-owned pool, allocate RAM according
 to D, prefill accelerator outputs with NaNs to detect partial writes, and leave
-the prior state unchanged if commit validation fails.  The queried pool size
-includes persistent history plus RI input/output and delta-output staging; the
-smaller persistent-state figure alone is not a sufficient allocation.
+the prior state unchanged if commit validation fails.  `prepare()` keeps its
+raw-spectra signature and computes the five feature tensors internally;
+`commit()` applies the inverse signed power before unpacking `enhanced_re/im`,
+so adapter and pipeline callers are unchanged by v5.  The queried pool size
+includes persistent history plus feature-input/output and delta-output
+staging; the smaller persistent-state figure alone is not a sufficient
+allocation.
 `ulcnet_process.c/.h`
 continues to own only STFT/WOLA and the high-level model callback.  Vendor NPU
 drivers and mono/4ch pipeline wiring are intentionally outside this model-side

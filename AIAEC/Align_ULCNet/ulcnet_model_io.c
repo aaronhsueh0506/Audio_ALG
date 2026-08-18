@@ -7,8 +7,6 @@
 struct UlcnetModelIoState {
     UlcnetModelIoDescriptor descriptor;
 
-    float *error;
-    float *far;
     float *output;
 
     float *key_history;
@@ -16,6 +14,13 @@ struct UlcnetModelIoState {
     float *logit_history;
     float *h_gru0;
     float *h_gru1;
+
+    /* The five graph feature tensors prepare() computes. */
+    float *error_mag;
+    float *far_mag;
+    float *error_cos;
+    float *error_sin;
+    float *error_ri;
 
     float *key_now;
     float *value_now;
@@ -36,6 +41,7 @@ struct UlcnetModelIoState {
 
 typedef struct UlcnetModelIoCounts {
     size_t spectrum_ri_elements;
+    size_t spectrum_bins_elements;
     size_t key_history_elements;
     size_t value_history_elements;
     size_t logit_history_elements;
@@ -85,6 +91,17 @@ static int add_float_region(size_t elements, size_t *bytes) {
     return checked_add(*bytes, region, bytes);
 }
 
+static int add_float_regions(size_t count, size_t elements, size_t *bytes) {
+    size_t index;
+
+    for (index = 0; index < count; ++index) {
+        if (add_float_region(elements, bytes) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static int compute_counts(const UlcnetModelIoDescriptor *descriptor,
                           UlcnetModelIoCounts *counts) {
     size_t channels;
@@ -103,6 +120,7 @@ static int compute_counts(const UlcnetModelIoDescriptor *descriptor,
     depth = (size_t)descriptor->delay_depth;
     history_depth = depth - 1u;
 
+    counts->spectrum_bins_elements = (size_t)descriptor->spectrum_bins;
     if (checked_mul((size_t)descriptor->spectrum_bins, 2u,
                     &counts->spectrum_ri_elements) != 0 ||
         checked_mul(channels, bins, &one_feature) != 0 ||
@@ -185,19 +203,20 @@ int ulcnet_model_io_get_mem_requirements(
     if (!requirements || compute_counts(descriptor, &counts) != 0 ||
         align_up(sizeof(UlcnetModelIoState), ULCNET_MODEL_IO_ALIGNMENT,
                  &bytes) != 0 ||
-        add_float_region(counts.spectrum_ri_elements, &bytes) != 0 ||
-        add_float_region(counts.spectrum_ri_elements, &bytes) != 0 ||
-        add_float_region(counts.spectrum_ri_elements, &bytes) != 0 ||
+        /* error_mag, far_mag, error_cos, error_sin */
+        add_float_regions(4u, counts.spectrum_bins_elements, &bytes) != 0 ||
+        /* error_ri, output */
+        add_float_regions(2u, counts.spectrum_ri_elements, &bytes) != 0 ||
         add_float_region(counts.key_history_elements, &bytes) != 0 ||
         add_float_region(counts.value_history_elements, &bytes) != 0 ||
         add_float_region(counts.logit_history_elements, &bytes) != 0 ||
-        add_float_region(counts.gru_hidden_elements, &bytes) != 0 ||
-        add_float_region(counts.gru_hidden_elements, &bytes) != 0 ||
+        /* h_gru0, h_gru1 */
+        add_float_regions(2u, counts.gru_hidden_elements, &bytes) != 0 ||
         add_float_region(counts.key_now_elements, &bytes) != 0 ||
         add_float_region(counts.value_now_elements, &bytes) != 0 ||
         add_float_region(counts.logit_now_elements, &bytes) != 0 ||
-        add_float_region(counts.gru_hidden_elements, &bytes) != 0 ||
-        add_float_region(counts.gru_hidden_elements, &bytes) != 0) {
+        /* h_gru0_out, h_gru1_out */
+        add_float_regions(2u, counts.gru_hidden_elements, &bytes) != 0) {
         return -1;
     }
     requirements->bytes = bytes;
@@ -252,8 +271,11 @@ UlcnetModelIoState *ulcnet_model_io_init(
     state->logit_now_elements = counts.logit_now_elements;
 
     cursor = (unsigned char *)pool + state_bytes;
-    state->error = carve_float(&cursor, counts.spectrum_ri_elements);
-    state->far = carve_float(&cursor, counts.spectrum_ri_elements);
+    state->error_mag = carve_float(&cursor, counts.spectrum_bins_elements);
+    state->far_mag = carve_float(&cursor, counts.spectrum_bins_elements);
+    state->error_cos = carve_float(&cursor, counts.spectrum_bins_elements);
+    state->error_sin = carve_float(&cursor, counts.spectrum_bins_elements);
+    state->error_ri = carve_float(&cursor, counts.spectrum_ri_elements);
     state->output = carve_float(&cursor, counts.spectrum_ri_elements);
     state->key_history = carve_float(&cursor, counts.key_history_elements);
     state->value_history = carve_float(&cursor, counts.value_history_elements);
@@ -266,7 +288,8 @@ UlcnetModelIoState *ulcnet_model_io_init(
     state->h_gru0_out = carve_float(&cursor, counts.gru_hidden_elements);
     state->h_gru1_out = carve_float(&cursor, counts.gru_hidden_elements);
 
-    if (!state->error || !state->far ||
+    if (!state->error_mag || !state->far_mag || !state->error_cos ||
+        !state->error_sin || !state->error_ri ||
         !state->output || !state->key_history || !state->value_history ||
         !state->logit_history || !state->h_gru0 || !state->h_gru1 ||
         !state->key_now || !state->value_now || !state->logit_now ||
@@ -319,11 +342,28 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
         !outputs) {
         return -1;
     }
+    /* The fixed front end: signed-power compression, magnitudes and the
+     * compressed-domain phase direction, all in fp32 on the host. */
     for (bin = 0; bin < state->descriptor.spectrum_bins; ++bin) {
-        state->error[2 * bin] = error_re[bin];
-        state->error[2 * bin + 1] = error_im[bin];
-        state->far[2 * bin] = far_re[bin];
-        state->far[2 * bin + 1] = far_im[bin];
+        float c_re = ulcnet_model_io_signed_pow(
+            error_re[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        float c_im = ulcnet_model_io_signed_pow(
+            error_im[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        float f_re = ulcnet_model_io_signed_pow(
+            far_re[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        float f_im = ulcnet_model_io_signed_pow(
+            far_im[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        /* cos/sin of atan2(c_im, c_re) as the normalized direction: hypotf
+         * avoids underflow for tiny components, and the zero-vector case
+         * follows atan2(0,0) == 0 (cos 1, sin 0), matching the torch
+         * reference in export_onnx.stream_features to fp32 rounding. */
+        float norm = hypotf(c_re, c_im);
+        state->error_mag[bin] = sqrtf(c_re * c_re + c_im * c_im + 1e-12f);
+        state->far_mag[bin] = sqrtf(f_re * f_re + f_im * f_im + 1e-12f);
+        state->error_cos[bin] = norm > 0.0f ? c_re / norm : 1.0f;
+        state->error_sin[bin] = norm > 0.0f ? c_im / norm : 0.0f;
+        state->error_ri[2 * bin] = c_re;
+        state->error_ri[2 * bin + 1] = c_im;
     }
 
     fill_nan(state->output, state->spectrum_ri_elements);
@@ -333,14 +373,18 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     fill_nan(state->h_gru0_out, state->gru_hidden_elements);
     fill_nan(state->h_gru1_out, state->gru_hidden_elements);
 
-    inputs->error = state->error;
-    inputs->far = state->far;
+    inputs->error_mag = state->error_mag;
+    inputs->far_mag = state->far_mag;
+    inputs->error_cos = state->error_cos;
+    inputs->error_sin = state->error_sin;
+    inputs->error_ri = state->error_ri;
     inputs->key_history = state->key_history;
     inputs->value_history = state->value_history;
     inputs->logit_history = state->logit_history;
     inputs->h_gru0 = state->h_gru0;
     inputs->h_gru1 = state->h_gru1;
     inputs->spectrum_ri_elements = state->spectrum_ri_elements;
+    inputs->spectrum_bins_elements = (size_t)state->descriptor.spectrum_bins;
     inputs->key_history_elements = state->key_history_elements;
     inputs->value_history_elements = state->value_history_elements;
     inputs->logit_history_elements = state->logit_history_elements;
@@ -449,9 +493,16 @@ int ulcnet_model_io_commit(UlcnetModelIoState *state,
     state->h_gru1 = state->h_gru1_out;
     state->h_gru1_out = temporary;
 
-    for (bin = 0; bin < descriptor->spectrum_bins; ++bin) {
-        enhanced_re[bin] = state->output[2 * bin];
-        enhanced_im[bin] = state->output[2 * bin + 1];
+    {
+        /* The graph emits the COMPRESSED estimate; the fixed inverse
+         * signed power runs here. */
+        const float inverse_exponent = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
+        for (bin = 0; bin < descriptor->spectrum_bins; ++bin) {
+            enhanced_re[bin] = ulcnet_model_io_signed_pow(
+                state->output[2 * bin], inverse_exponent);
+            enhanced_im[bin] = ulcnet_model_io_signed_pow(
+                state->output[2 * bin + 1], inverse_exponent);
+        }
     }
     state->prepared = 0;
     return 0;

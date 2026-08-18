@@ -186,29 +186,3 @@ int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]) {
     }
     return n;
 }
-
-/* ========================= optional compression ======================= */
-
-static float ulcnet_signed_pow(float x, float e) {
-    float m = powf(fabsf(x), e);
-    return x < 0.0f ? -m : m;
-}
-
-void ulcnet_compress_frame(const float re[ULCNET_BINS],
-                           const float im[ULCNET_BINS],
-                           float zr[ULCNET_BINS], float zi[ULCNET_BINS]) {
-    for (int k = 0; k < ULCNET_BINS; ++k) {
-        zr[k] = ulcnet_signed_pow(re[k], ULCNET_COMPRESSION_EXP);
-        zi[k] = ulcnet_signed_pow(im[k], ULCNET_COMPRESSION_EXP);
-    }
-}
-
-void ulcnet_expand_frame(const float re[ULCNET_BINS],
-                         const float im[ULCNET_BINS],
-                         float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
-    const float inv = 1.0f / ULCNET_COMPRESSION_EXP;
-    for (int k = 0; k < ULCNET_BINS; ++k) {
-        out_re[k] = ulcnet_signed_pow(re[k], inv);
-        out_im[k] = ulcnet_signed_pow(im[k], inv);
-    }
-}

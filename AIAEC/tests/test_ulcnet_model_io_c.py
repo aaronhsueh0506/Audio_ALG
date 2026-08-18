@@ -25,6 +25,15 @@ _DRIVER = r'''
 
 _Alignas(16) static unsigned char pool[1024 * 1024];
 
+/* Independent formulation of model.py's _signed_power (deliberately NOT
+ * copysignf like the implementation, so agreement is a real check). The
+ * exponent itself comes from the header contract define, which the Python
+ * suite pins against export_onnx.COMPRESSION_EXPONENT. */
+static float signed_power_ref(float value, float exponent) {
+    float magnitude = powf(fabsf(value), exponent);
+    return value < 0.0f ? -magnitude : magnitude;
+}
+
 static int all_zero(const float *values, size_t count) {
     size_t index;
     for (index = 0; index < count; ++index)
@@ -123,11 +132,37 @@ int main(void) {
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(inputs.spectrum_ri_elements == 514u);
+    CHECK(inputs.spectrum_bins_elements == 257u);
     CHECK(outputs.spectrum_ri_elements == 514u);
-    CHECK(inputs.error[2u * 17u] == error_re[17]);
-    CHECK(inputs.error[2u * 17u + 1u] == error_im[17]);
-    CHECK(inputs.far[2u * 31u] == far_re[31]);
-    CHECK(inputs.far[2u * 31u + 1u] == far_im[31]);
+    {
+        /* prepare() runs the fixed front end (layout v5): the same fp32
+         * expressions are evaluated here so the values are pinned exactly. */
+        float c_re = signed_power_ref(error_re[17],
+                                      ULCNET_MODEL_IO_COMPRESSION_EXP);
+        float c_im = signed_power_ref(error_im[17],
+                                      ULCNET_MODEL_IO_COMPRESSION_EXP);
+        float f_re = signed_power_ref(far_re[31],
+                                      ULCNET_MODEL_IO_COMPRESSION_EXP);
+        float f_im = signed_power_ref(far_im[31],
+                                      ULCNET_MODEL_IO_COMPRESSION_EXP);
+        /* cos/sin are checked against the torch-reference formulation
+         * (cos/sin of atan2); the implementation uses the mathematically
+         * equal normalized direction, so a small tolerance makes this a
+         * cross-formulation agreement gate, not an identity. */
+        float phase = atan2f(c_im, c_re);
+        CHECK(inputs.error_ri[2u * 17u] == c_re);
+        CHECK(inputs.error_ri[2u * 17u + 1u] == c_im);
+        CHECK(inputs.error_mag[17] ==
+              sqrtf(c_re * c_re + c_im * c_im + 1e-12f));
+        CHECK(inputs.far_mag[31] ==
+              sqrtf(f_re * f_re + f_im * f_im + 1e-12f));
+        CHECK(fabsf(inputs.error_cos[17] - cosf(phase)) <= 1e-6f);
+        CHECK(fabsf(inputs.error_sin[17] - sinf(phase)) <= 1e-6f);
+        /* Zero-vector convention pins atan2(0,0) == 0: bin 0 carries
+         * error_re = error_im = 0. */
+        CHECK(inputs.error_cos[0] == 1.0f);
+        CHECK(inputs.error_sin[0] == 0.0f);
+    }
     CHECK(inputs.key_history_elements ==
           32u * 7u * ULCNET_MODEL_IO_TA_BINS);
     CHECK(inputs.logit_history_elements == 32u * 4u * 8u);
@@ -143,10 +178,16 @@ int main(void) {
 
     write_outputs(&outputs, 1.0f);
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
-    CHECK(enhanced_re[0] == 50001.0f);
-    CHECK(enhanced_im[0] == 50002.0f);
-    CHECK(enhanced_re[256] == 50513.0f);
-    CHECK(enhanced_im[256] == 50514.0f);
+    /* commit() applies the inverse signed power to the graph's compressed
+     * estimate (layout v5). */
+    CHECK(enhanced_re[0] == signed_power_ref(
+        50001.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP));
+    CHECK(enhanced_im[0] == signed_power_ref(
+        50002.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP));
+    CHECK(enhanced_re[256] == signed_power_ref(
+        50513.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP));
+    CHECK(enhanced_im[256] == signed_power_ref(
+        50514.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP));
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(inputs.key_history[0] == 1.0f);

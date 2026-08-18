@@ -101,8 +101,15 @@ from AIAEC.training_common import (
 # the two together. Version 3 fixed production wiring to aligned far while
 # retaining the checkpoint's original far-input provenance separately;
 # version 4 renamed the tensors (error/far inputs, output head,
-# h_gru0/h_gru1 hiddens, *_out states) -- runtimes bind by name.
-STATE_LAYOUT_VERSION = 4
+# h_gru0/h_gru1 hiddens, *_out states) -- runtimes bind by name;
+# version 5 moved the fixed front/back ends (signed-power compression,
+# magnitudes, phase cos/sin, inverse power) out of the graph onto the host.
+STATE_LAYOUT_VERSION = 5
+# The deployed C front/back end hardcodes this exponent
+# (ULCNET_MODEL_IO_COMPRESSION_EXP); export_graph refuses any checkpoint
+# whose model carries a different value, because nothing downstream of the
+# graph could detect the mismatch.
+COMPRESSION_EXPONENT = 0.3
 MIN_DELAY_DEPTH = 2
 MAX_DELAY_DEPTH = 64
 TA_CHANNELS = 32
@@ -111,15 +118,27 @@ SCORE_HISTORY_FRAMES = 4
 GRU_LAYERS = 2
 GRU_HIDDEN = 128
 
-INPUT_NAMES = (
-    'error',
-    'far',
+# Five separate feature inputs so every tensor keeps its own quantization
+# scale; the fixed front end (signed-power compression, magnitude, phase
+# cos/sin) runs on the HOST -- see stream_features, mirrored in C by
+# ulcnet_model_io_prepare() --
+# and the graph starts at the learned reorient/encoder compute.
+SIGNAL_INPUT_NAMES = (
+    'error_mag',
+    'far_mag',
+    'error_cos',
+    'error_sin',
+    'error_ri',
+)
+STATE_INPUT_NAMES = (
     'key_history',
     'value_history',
     'logit_history',
     'h_gru0',
     'h_gru1',
 )
+INPUT_NAMES = SIGNAL_INPUT_NAMES + STATE_INPUT_NAMES
+SIGNAL_INPUTS = len(SIGNAL_INPUT_NAMES)
 
 OUTPUT_NAMES = (
     'output',
@@ -260,8 +279,11 @@ class AlignUlcnetStreamingExport(nn.Module):
 
     def forward(
         self,
-        error: Tensor,
-        far: Tensor,
+        error_mag: Tensor,
+        far_mag: Tensor,
+        error_cos: Tensor,
+        error_sin: Tensor,
+        error_ri: Tensor,
         key_history: Tensor,
         value_history: Tensor,
         logit_history: Tensor,
@@ -269,25 +291,17 @@ class AlignUlcnetStreamingExport(nn.Module):
         h_gru1: Tensor,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         model = self.model
-        exponent = model.compression_exponent
 
-        error_real = _signed_power(error[..., 0], exponent)
-        error_imag = _signed_power(error[..., 1], exponent)
-        far_real = _signed_power(far[..., 0], exponent)
-        far_imag = _signed_power(far[..., 1], exponent)
-        error_magnitude = (
-            error_real.square() + error_imag.square() + 1e-12
-        ).sqrt()
-        far_magnitude = (
-            far_real.square() + far_imag.square() + 1e-12
-        ).sqrt()
-        error_phase = torch.atan2(error_imag, error_real)
+        # All fixed input math (signed-power compression, magnitude, phase)
+        # already ran on the host; the graph holds learned compute only.
+        error_real = error_ri[..., 0]
+        error_imag = error_ri[..., 1]
 
         error_feature = model.error_encoder(
-            model.reorient(error_magnitude.unsqueeze(1))
+            model.reorient(error_mag.unsqueeze(1))
         )
         far_feature = model.far_encoder(
-            model.reorient(far_magnitude.unsqueeze(1))
+            model.reorient(far_mag.unsqueeze(1))
         )
 
         attention = model.align
@@ -345,8 +359,8 @@ class AlignUlcnetStreamingExport(nn.Module):
             model.mask_act(model.mask_fc1(joined))
         ))
         intermediate = torch.stack((
-            magnitude_mask * torch.cos(error_phase),
-            magnitude_mask * torch.sin(error_phase),
+            magnitude_mask * error_cos,
+            magnitude_mask * error_sin,
         ), dim=1)
         stage2 = model.stage2_act(model.stage2_norm1(
             model.stage2_conv1(intermediate)
@@ -360,11 +374,10 @@ class AlignUlcnetStreamingExport(nn.Module):
         mask_imag = mask[:, 1]
         estimate_real = error_real * mask_real - error_imag * mask_imag
         estimate_imag = error_real * mask_imag + error_imag * mask_real
-        inverse_exponent = 1.0 / exponent
-        output = torch.stack((
-            _signed_power(estimate_real, inverse_exponent),
-            _signed_power(estimate_imag, inverse_exponent),
-        ), dim=-1)
+        # COMPRESSED-domain estimate: the fixed inverse signed power runs on
+        # the host (host_output; C: ulcnet_model_io_commit), not in the
+        # graph.
+        output = torch.stack((estimate_real, estimate_imag), dim=-1)
 
         return (
             output,
@@ -393,11 +406,45 @@ def state_shapes(delay_depth: int) -> Dict[str, Tuple[int, ...]]:
     }
 
 
+def stream_features(model, error_ri: Tensor, far_ri: Tensor):
+    """Host-side fixed front end from RAW RI spectra ((1, 1, 257, 2) each).
+
+    Signed-power compression, magnitudes, and the compressed-domain phase as
+    cos/sin -- everything unlearned, in fp32 (C: ulcnet_model_io_prepare).
+    Returns
+    the five graph signal inputs in INPUT_NAMES order; the graph starts at
+    the learned reorient/encoder compute.
+    """
+    exponent = model.compression_exponent
+    e_re = _signed_power(error_ri[..., 0], exponent)
+    e_im = _signed_power(error_ri[..., 1], exponent)
+    f_re = _signed_power(far_ri[..., 0], exponent)
+    f_im = _signed_power(far_ri[..., 1], exponent)
+    error_mag = (e_re.square() + e_im.square() + 1e-12).sqrt()
+    far_mag = (f_re.square() + f_im.square() + 1e-12).sqrt()
+    phase = torch.atan2(e_im, e_re)
+    return (error_mag, far_mag, torch.cos(phase), torch.sin(phase),
+            torch.stack((e_re, e_im), dim=-1))
+
+
+def host_output(model, compressed_ri: Tensor) -> Tensor:
+    """Host-side fixed back end: the inverse signed power the graph no
+    longer applies (C: ulcnet_model_io_commit)."""
+    inverse = 1.0 / model.compression_exponent
+    return torch.stack((
+        _signed_power(compressed_ri[..., 0], inverse),
+        _signed_power(compressed_ri[..., 1], inverse),
+    ), dim=-1)
+
+
 def dummy_inputs(delay_depth: int) -> Tuple[Tensor, ...]:
     shapes = state_shapes(delay_depth)
     return (
-        torch.randn(1, 1, 257, 2),
-        torch.randn(1, 1, 257, 2),
+        torch.randn(1, 1, 257).abs(),          # error_mag
+        torch.randn(1, 1, 257).abs(),          # far_mag
+        torch.randn(1, 1, 257).clamp(-1, 1),   # error_cos
+        torch.randn(1, 1, 257).clamp(-1, 1),   # error_sin
+        torch.randn(1, 1, 257, 2),             # error_ri (compressed)
         torch.zeros(shapes['key_history']),
         torch.zeros(shapes['value_history']),
         torch.zeros(shapes['logit_history']),
@@ -459,6 +506,7 @@ def _write_metadata(
         'model_family': 'Align_ULCNet',
         'boundary': 'stateless_one_frame_delta_state',
         'state_layout_version': STATE_LAYOUT_VERSION,
+        'compression_exponent': COMPRESSION_EXPONENT,
         'checkpoint_sha256': file_sha256(checkpoint),
         'sample_rate': model.grid.sample_rate,
         'n_fft': model.grid.n_fft,
@@ -508,16 +556,17 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
     session = ort.InferenceSession(
         output_path, providers=['CPUExecutionProvider']
     )
-    state = tuple(value.clone() for value in inputs[2:])
+    state = tuple(value.clone() for value in inputs[SIGNAL_INPUTS:])
     worst = 0.0
     generator = torch.Generator().manual_seed(20260816)
     with torch.no_grad():
         for _ in range(2 * wrapper.delay_depth + 5):
-            audio = (
+            signals = stream_features(
+                wrapper.model,
                 torch.randn(1, 1, 257, 2, generator=generator),
                 torch.randn(1, 1, 257, 2, generator=generator),
             )
-            torch_inputs = audio + state
+            torch_inputs = signals + state
             expected = wrapper(*torch_inputs)
             actual = session.run(None, {
                 name: value.numpy()
@@ -539,6 +588,14 @@ def export_graph(model, checkpoint_path, output_path, opset=17, verify=False):
     the same process. Returns the wrapper, its dummy inputs and the graph
     metadata for reuse.
     """
+    if float(model.compression_exponent) != COMPRESSION_EXPONENT:
+        raise ValueError(
+            'checkpoint compression_exponent %r != %r: the deployed C '
+            'front/back end (ULCNET_MODEL_IO_COMPRESSION_EXP in '
+            'ulcnet_model_io.h) is fixed, and a graph exported for another '
+            'exponent would deploy silently wrong'
+            % (float(model.compression_exponent), COMPRESSION_EXPONENT)
+        )
     wrapper = AlignUlcnetStreamingExport(model).eval()
     inputs = dummy_inputs(wrapper.delay_depth)
     with torch.no_grad():
