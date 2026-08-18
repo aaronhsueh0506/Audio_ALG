@@ -115,6 +115,27 @@ def optimize_graph_file(path):
     onnx.save(graph, path)
     print('[onnxoptimizer] %d -> %d nodes' % (before, len(graph.graph.node)))
 
+    try:
+        import onnxruntime as ort
+    except ImportError:
+        print('[skip] onnxruntime not installed; constant folding skipped')
+        return
+    # onnxoptimizer only fuses/eliminates; the ConstantOfShape/Shape/Gather
+    # chains the tracer leaves need actual constant EVALUATION. onnxruntime's
+    # BASIC offline level is generic graph optimization (constant folding
+    # included, no runtime-specific ops) and every export environment already
+    # carries onnxruntime for the parity check.
+    folded = path + '.fold'
+    options = ort.SessionOptions()
+    options.graph_optimization_level = (
+        ort.GraphOptimizationLevel.ORT_ENABLE_BASIC)
+    options.optimized_model_filepath = folded
+    options.log_severity_level = 3
+    ort.InferenceSession(path, options, providers=['CPUExecutionProvider'])
+    os.replace(folded, path)
+    graph = onnx.load(path)
+    print('[ort-fold] -> %d nodes' % len(graph.graph.node))
+
 
 def _pin_static_output_shapes(graph, output_names, outputs):
     """Declare every graph output with its concrete traced shape.
