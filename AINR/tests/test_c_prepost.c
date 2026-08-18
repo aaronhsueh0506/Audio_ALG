@@ -121,8 +121,14 @@ static int test_dfn_stream_alignment(void)
     long long output_frame = -1;
 
     dfn_test_build_erb();
-    dfn2_state_init(&dfn2);
-    dfn3_state_init(&dfn3);
+    {
+        static FftHandle* fft2;
+        static FftHandle* fft3;
+        if (!fft2) fft2 = fft_create(DFN2_N_FFT);
+        if (!fft3) fft3 = fft_create(DFN3_N_FFT);
+        dfn2_state_init(&dfn2, fft2);
+        dfn3_state_init(&dfn3, fft3);
+    }
     dfn2_set_erb_matrices(&dfn2, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     dfn3_set_erb_matrices(&dfn3, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int k = 0; k < DFN2_DF_BINS; ++k)
@@ -327,7 +333,11 @@ static int test_dfn2(uint64_t* digest)
     float max_spectral_error = 0.0f;
 
     dfn_test_build_erb();
-    dfn2_state_init(&state);
+    {
+        static FftHandle* fft_handle;
+        if (!fft_handle) fft_handle = fft_create(DFN2_N_FFT);
+        dfn2_state_init(&state, fft_handle);
+    }
     dfn2_set_erb_matrices(&state, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int b = 0; b < DFN2_N_ERB; ++b) mask[b] = 1.0f;
     for (int k = 0; k < DFN2_DF_BINS; ++k)
@@ -381,7 +391,11 @@ static int test_dfn3(uint64_t* digest)
     float max_spectral_error = 0.0f;
 
     dfn_test_build_erb();
-    dfn3_state_init(&state);
+    {
+        static FftHandle* fft_handle;
+        if (!fft_handle) fft_handle = fft_create(DFN3_N_FFT);
+        dfn3_state_init(&state, fft_handle);
+    }
     dfn3_set_erb_matrices(&state, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int b = 0; b < DFN3_N_ERB; ++b) mask[b] = 1.0f;
     for (int k = 0; k < DFN3_DF_BINS; ++k)
@@ -428,7 +442,11 @@ static int test_gtcrn(uint64_t* digest)
     float spectrum[GTCRN_N_BINS][2];
     float max_error = 0.0f;
 
-    gtcrn_process_init(&state);
+    {
+        static FftHandle* fft_handle;
+        if (!fft_handle) fft_handle = fft_create(GTCRN_N_FFT);
+        gtcrn_process_init(&state, fft_handle);
+    }
     for (int frame = 0; frame < 24; ++frame) {
         for (int i = 0; i < GTCRN_HOP_LEN; ++i)
             input[i] = signal_sample((int64_t)frame * GTCRN_HOP_LEN + i,

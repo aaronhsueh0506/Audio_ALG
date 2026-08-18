@@ -52,6 +52,8 @@
  * ============================================================ */
 
 #ifndef DFN3_PROCESS_H
+#include "fft_wrapper.h"
+
 #define DFN3_PROCESS_H
 
 #include <stddef.h>
@@ -168,15 +170,18 @@ typedef struct {
     float hi_delay_im[DFN3_DF_RING][DFN3_N_BINS - DFN3_DF_BINS];
 
     /* --- scratch: 非跨 frame 狀態，每次使用前完整覆寫 --- */
-    float scratch_re[DFN3_N_FFT];
-    float scratch_im[DFN3_N_FFT];
+    float scratch_time[DFN3_N_FFT];
+    Complex scratch_freq[DFN3_N_BINS];
+    /* Caller-owned audio_common FFT handle (fft_create/fft_init for
+     * DFN3_N_FFT); borrowed like the .bin matrix pointers. */
+    FftHandle* fft;
     float scratch_power[DFN3_N_BINS];
     float scratch_erb_db[DFN3_N_ERB];
     float scratch_bin_gain[DFN3_N_BINS - DFN3_DF_BINS];
 } DFN3State;
 
 /* 初始化 (歸零 + 兩個正規化器的 linspace 初值) */
-void dfn3_state_init(DFN3State *st);
+void dfn3_state_init(DFN3State *st, FftHandle *fft);
 
 /* Point the state at the caller-loaded ERB matrices (see the struct field
  * comment for layout). Must be called before feature extraction or mask

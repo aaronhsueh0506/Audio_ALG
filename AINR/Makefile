@@ -2,6 +2,14 @@ CC ?= cc
 CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -ffp-contract=off -I.
 LDFLAGS ?=
 SIMD ?= 1
+BACKEND ?= kiss
+
+# The FFT (and Complex type) come from audio_common -- the cross-product
+# base library every port already carries; the models keep only their own
+# DSP on top of it.
+AC_DIR ?= $(abspath ../../audio_common)
+AC_LIB = $(shell $(MAKE) -s -C $(AC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
+CFLAGS += -I$(AC_DIR)/include
 
 ifneq ($(words $(SIMD)),1)
 $(error SIMD must be exactly 0 or 1)
@@ -37,10 +45,10 @@ $(BUILD_DIR):
 	mkdir -p "$@"
 
 $(TEST_BIN): $(SOURCES) $(HEADERS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(SOURCES) $(LDFLAGS) -lm -o "$@"
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) $(SOURCES) "$(AC_LIB)" $(LDFLAGS) -lm -o "$@"
 
 $(SCALAR_BIN): $(SOURCES) $(HEADERS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(SOURCES) \
+	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(SOURCES) "$(AC_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
 test: $(TEST_BIN)

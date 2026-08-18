@@ -25,87 +25,6 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-static inline void df_common_fft(float *re, float *im, int n, int inverse) {
-    int j = 0;
-    for (int i = 0; i < n; ++i) {
-        if (i < j) {
-            float t = re[i]; re[i] = re[j]; re[j] = t;
-            t = im[i]; im[i] = im[j]; im[j] = t;
-        }
-        {
-            int m = n >> 1;
-            while (m >= 1 && j >= m) { j -= m; m >>= 1; }
-            j += m;
-        }
-    }
-    for (int len = 2; len <= n; len <<= 1) {
-        float angle = (inverse ? 1.0f : -1.0f) *
-            2.0f * (float)M_PI / (float)len;
-        float step_re = cosf(angle);
-        float step_im = sinf(angle);
-        for (int base = 0; base < n; base += len) {
-            float cur_re = 1.0f, cur_im = 0.0f;
-            int k = 0;
-#if DF_COMMON_HAVE_NEON
-            for (; k + 4 <= len / 2; k += 4) {
-                float tw_re[4], tw_im[4];
-                for (int lane = 0; lane < 4; ++lane) {
-                    float next_re, next_im;
-                    tw_re[lane] = cur_re;
-                    tw_im[lane] = cur_im;
-                    next_re = cur_re * step_re - cur_im * step_im;
-                    next_im = cur_re * step_im + cur_im * step_re;
-                    cur_re = next_re;
-                    cur_im = next_im;
-                }
-                {
-                    int u = base + k, v = u + len / 2;
-                    float32x4_t ur = vld1q_f32(re + u);
-                    float32x4_t ui = vld1q_f32(im + u);
-                    float32x4_t vr = vld1q_f32(re + v);
-                    float32x4_t vi = vld1q_f32(im + v);
-                    float32x4_t wr = vld1q_f32(tw_re);
-                    float32x4_t wi = vld1q_f32(tw_im);
-                    float32x4_t tr = vsubq_f32(
-                        vmulq_f32(vr, wr), vmulq_f32(vi, wi));
-                    float32x4_t ti = vaddq_f32(
-                        vmulq_f32(vr, wi), vmulq_f32(vi, wr));
-                    vst1q_f32(re + v, vsubq_f32(ur, tr));
-                    vst1q_f32(im + v, vsubq_f32(ui, ti));
-                    vst1q_f32(re + u, vaddq_f32(ur, tr));
-                    vst1q_f32(im + u, vaddq_f32(ui, ti));
-                }
-            }
-#endif
-            for (; k < len / 2; ++k) {
-                int u = base + k, v = u + len / 2;
-                float tr = re[v] * cur_re - im[v] * cur_im;
-                float ti = re[v] * cur_im + im[v] * cur_re;
-                float next_re, next_im;
-                re[v] = re[u] - tr;
-                im[v] = im[u] - ti;
-                re[u] += tr;
-                im[u] += ti;
-                next_re = cur_re * step_re - cur_im * step_im;
-                next_im = cur_re * step_im + cur_im * step_re;
-                cur_re = next_re;
-                cur_im = next_im;
-            }
-        }
-    }
-    if (inverse) {
-        int i = 0;
-#if DF_COMMON_HAVE_NEON
-        float32x4_t vn = vdupq_n_f32((float)n);
-        for (; i + 4 <= n; i += 4) {
-            vst1q_f32(re + i, vdivq_f32(vld1q_f32(re + i), vn));
-            vst1q_f32(im + i, vdivq_f32(vld1q_f32(im + i), vn));
-        }
-#endif
-        for (; i < n; ++i) { re[i] /= n; im[i] /= n; }
-    }
-}
-
 static inline void df_common_make_root_hann(float *window, int win_len) {
     for (int i = 0; i < win_len; ++i) {
         window[i] = sqrtf(0.5f - 0.5f * cosf(
@@ -113,8 +32,10 @@ static inline void df_common_make_root_hann(float *window, int win_len) {
     }
 }
 
-static inline void df_common_analysis(float *analysis_buf, const float *window,
-                                      float *scratch_re, float *scratch_im,
+static inline void df_common_analysis(FftHandle* fft, float *analysis_buf,
+                                      const float *window,
+                                      float *scratch_time,
+                                      Complex *scratch_freq,
                                       const float *new_samples, int n_fft,
                                       int hop, float norm,
                                       float *out_re, float *out_im) {
@@ -122,33 +43,23 @@ static inline void df_common_analysis(float *analysis_buf, const float *window,
             (size_t)(n_fft - hop) * sizeof(float));
     memcpy(analysis_buf + n_fft - hop, new_samples,
            (size_t)hop * sizeof(float));
-    memset(scratch_im, 0, (size_t)n_fft * sizeof(float));
     {
         int i = 0;
 #if DF_COMMON_HAVE_NEON
         for (; i + 4 <= n_fft; i += 4) {
-            vst1q_f32(scratch_re + i,
+            vst1q_f32(scratch_time + i,
                       vmulq_f32(vld1q_f32(analysis_buf + i),
                                 vld1q_f32(window + i)));
         }
 #endif
-        for (; i < n_fft; ++i) scratch_re[i] = analysis_buf[i] * window[i];
+        for (; i < n_fft; ++i) scratch_time[i] = analysis_buf[i] * window[i];
     }
-    df_common_fft(scratch_re, scratch_im, n_fft, 0);
+    fft_forward(fft, scratch_time, scratch_freq);
     {
-        int i = 0, bins = n_fft / 2 + 1;
-#if DF_COMMON_HAVE_NEON
-        float32x4_t vnorm = vdupq_n_f32(norm);
-        for (; i + 4 <= bins; i += 4) {
-            vst1q_f32(out_re + i,
-                      vmulq_f32(vld1q_f32(scratch_re + i), vnorm));
-            vst1q_f32(out_im + i,
-                      vmulq_f32(vld1q_f32(scratch_im + i), vnorm));
-        }
-#endif
-        for (; i < bins; ++i) {
-            out_re[i] = scratch_re[i] * norm;
-            out_im[i] = scratch_im[i] * norm;
+        int bins = n_fft / 2 + 1;
+        for (int k = 0; k < bins; ++k) {
+            out_re[k] = scratch_freq[k].r * norm;
+            out_im[k] = scratch_freq[k].i * norm;
         }
     }
 }
@@ -281,60 +192,46 @@ static inline void df_common_post_filter(const float *spec_re,
     }
 }
 
-static inline void df_common_synthesis(float *synthesis_buf,
+static inline void df_common_synthesis(FftHandle* fft,
+                                       float *synthesis_buf,
                                        const float *window,
-                                       float *scratch_re, float *scratch_im,
+                                       float *scratch_time,
+                                       Complex *scratch_freq,
                                        const float *spec_re,
                                        const float *spec_im,
                                        int n_fft, int hop, float inv_norm,
                                        float *output) {
     int bins = n_fft / 2 + 1;
-    int k = 0;
-#if DF_COMMON_HAVE_NEON
-    {
-        float32x4_t norm = vdupq_n_f32(inv_norm);
-        for (; k + 4 <= bins; k += 4) {
-            vst1q_f32(scratch_re + k,
-                      vmulq_f32(vld1q_f32(spec_re + k), norm));
-            vst1q_f32(scratch_im + k,
-                      vmulq_f32(vld1q_f32(spec_im + k), norm));
-        }
+    for (int k = 0; k < bins; ++k) {
+        scratch_freq[k].r = spec_re[k] * inv_norm;
+        scratch_freq[k].i = spec_im[k] * inv_norm;
     }
-#endif
-    for (; k < bins; ++k) {
-        scratch_re[k] = spec_re[k] * inv_norm;
-        scratch_im[k] = spec_im[k] * inv_norm;
-    }
-    for (k = 1; k < n_fft / 2; ++k) {
-        scratch_re[n_fft - k] = scratch_re[k];
-        scratch_im[n_fft - k] = -scratch_im[k];
-    }
-    df_common_fft(scratch_re, scratch_im, n_fft, 1);
+    fft_inverse(fft, scratch_freq, scratch_time);
     {
         int i = 0;
 #if DF_COMMON_HAVE_NEON
         for (; i + 4 <= n_fft; i += 4) {
-            vst1q_f32(scratch_re + i,
-                      vmulq_f32(vld1q_f32(scratch_re + i),
+            vst1q_f32(scratch_time + i,
+                      vmulq_f32(vld1q_f32(scratch_time + i),
                                 vld1q_f32(window + i)));
         }
         for (i = 0; i + 4 <= hop; i += 4) {
             vst1q_f32(output + i,
                       vaddq_f32(vld1q_f32(synthesis_buf + i),
-                                vld1q_f32(scratch_re + i)));
+                                vld1q_f32(scratch_time + i)));
         }
 #else
-        for (; i < n_fft; ++i) scratch_re[i] *= window[i];
+        for (; i < n_fft; ++i) scratch_time[i] *= window[i];
 #endif
 #if DF_COMMON_HAVE_NEON
         for (; i < hop; ++i)
-            output[i] = synthesis_buf[i] + scratch_re[i];
+            output[i] = synthesis_buf[i] + scratch_time[i];
 #else
         for (i = 0; i < hop; ++i)
-            output[i] = synthesis_buf[i] + scratch_re[i];
+            output[i] = synthesis_buf[i] + scratch_time[i];
 #endif
     }
-    memcpy(synthesis_buf, scratch_re + hop,
+    memcpy(synthesis_buf, scratch_time + hop,
            (size_t)(n_fft - hop) * sizeof(float));
     memset(synthesis_buf + n_fft - hop, 0, (size_t)hop * sizeof(float));
 }
@@ -348,10 +245,11 @@ void dfn3_set_erb_matrices(DFN3State* st,
     st->erb_inv = erb_inv;
 }
 
-void dfn3_state_init(DFN3State* st)
+void dfn3_state_init(DFN3State* st, FftHandle* fft)
 {
     if (!st) return;
     memset(st, 0, sizeof(*st));
+    st->fft = fft;
     /* ERB matrices arrive via dfn3_set_erb_matrices(): caller-loaded
      * erb_fwd.bin / erb_inv.bin from export_erb_matrix.py --runtime-bins. */
     df_common_make_root_hann(st->window, DFN3_WIN_LEN);
@@ -372,8 +270,8 @@ void dfn3_analysis(DFN3State* st, const float* frame,
 {
     const float normalization = 1.0f / sqrtf((float)DFN3_N_FFT);
     if (!st || !frame || !out_re || !out_im) return;
-    df_common_analysis(st->analysis_buf, st->window,
-                       st->scratch_re, st->scratch_im, frame,
+    df_common_analysis(st->fft, st->analysis_buf, st->window,
+                       st->scratch_time, st->scratch_freq, frame,
                        DFN3_N_FFT, DFN3_HOP_LEN, normalization,
                        out_re, out_im);
 }
@@ -564,8 +462,8 @@ void dfn3_synthesis(DFN3State* st,
 {
     const float normalization = sqrtf((float)DFN3_N_FFT);
     if (!st || !spec_re || !spec_im || !out_frame) return;
-    df_common_synthesis(st->synthesis_buf, st->window,
-                        st->scratch_re, st->scratch_im,
+    df_common_synthesis(st->fft, st->synthesis_buf, st->window,
+                        st->scratch_time, st->scratch_freq,
                         spec_re, spec_im, DFN3_N_FFT, DFN3_HOP_LEN,
                         normalization, out_frame);
 }

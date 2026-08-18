@@ -52,6 +52,8 @@
  * ============================================================ */
 
 #ifndef DFN2_PROCESS_H
+#include "fft_wrapper.h"
+
 #define DFN2_PROCESS_H
 
 #include <stddef.h>
@@ -173,15 +175,18 @@ typedef struct {
     float hi_delay_im[DFN2_DF_RING][DFN2_N_BINS - DFN2_DF_BINS];
 
     /* --- scratch: 非跨 frame 狀態，每次使用前完整覆寫 --- */
-    float scratch_re[DFN2_N_FFT];
-    float scratch_im[DFN2_N_FFT];
+    float scratch_time[DFN2_N_FFT];
+    Complex scratch_freq[DFN2_N_BINS];
+    /* Caller-owned audio_common FFT handle (fft_create/fft_init for
+     * DFN2_N_FFT); borrowed like the .bin matrix pointers. */
+    FftHandle* fft;
     float scratch_power[DFN2_N_BINS];
     float scratch_erb_db[DFN2_N_ERB];
     float scratch_bin_gain[DFN2_N_BINS];
 } DFN2State;
 
 /* 初始化 (歸零 + 兩個正規化器的 linspace 初值) */
-void dfn2_state_init(DFN2State *st);
+void dfn2_state_init(DFN2State *st, FftHandle *fft);
 
 /* Point the state at the caller-loaded ERB matrices (see the struct field
  * comment for layout). Must be called before feature extraction or mask

@@ -5,6 +5,8 @@
 extern "C" {
 #endif
 
+#include "fft_wrapper.h"
+
 #define GTCRN_SR       16000
 #define GTCRN_N_FFT    512
 #define GTCRN_N_BINS   257
@@ -57,11 +59,15 @@ typedef struct {
     float analysis_buf[GTCRN_WIN_LEN];
     float synthesis_buf[GTCRN_WIN_LEN];
     float window[GTCRN_WIN_LEN];
-    float scratch_re[GTCRN_N_FFT];
-    float scratch_im[GTCRN_N_FFT];
+    float scratch_time[GTCRN_N_FFT];
+    Complex scratch_freq[GTCRN_N_BINS];
+    /* Caller-owned audio_common FFT handle (fft_create/fft_init for
+     * GTCRN_N_FFT); the state only borrows it, mirroring the .bin matrix
+     * pointers -- the loader owns every resource. */
+    FftHandle* fft;
 } GTCRNProcessState;
 
-void gtcrn_process_init(GTCRNProcessState* state);
+void gtcrn_process_init(GTCRNProcessState* state, FftHandle* fft);
 
 void gtcrn_model_state_init(GTCRNModelState* state);
 
