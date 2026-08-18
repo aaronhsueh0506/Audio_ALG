@@ -20,7 +20,7 @@ void dfn3_state_init(DFN3State* st)
     memset(st, 0, sizeof(*st));
     /* ERB matrices arrive via dfn3_set_erb_matrices(): caller-loaded
      * erb_fwd.bin / erb_inv.bin from export_erb_matrix.py --runtime-bins. */
-    df_common_init(st->window, DFN3_WIN_LEN);
+    df_common_make_root_hann(st->window, DFN3_WIN_LEN);
     for (int b = 0; b < DFN3_N_ERB; ++b) {
         float position = (float)b / (float)(DFN3_N_ERB - 1);
         st->erb_norm_state[b] = DFN3_ERB_NORM_INIT_LO_DB + position *

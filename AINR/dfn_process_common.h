@@ -105,10 +105,6 @@ static inline void df_common_make_root_hann(float *window, int win_len) {
     }
 }
 
-static inline void df_common_init(float *window, int win_len) {
-    df_common_make_root_hann(window, win_len);
-}
-
 static inline void df_common_analysis(float *analysis_buf, const float *window,
                                       float *scratch_re, float *scratch_im,
                                       const float *new_samples, int n_fft,
