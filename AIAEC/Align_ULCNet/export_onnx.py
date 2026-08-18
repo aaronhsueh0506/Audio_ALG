@@ -78,7 +78,6 @@ from AIAEC.training_common import (
     checkpoint_far_input_mode,
     far_input_mode_c_value,
 )
-from AINR.DeepFilterNet2.export_onnx import optimize_graph_file
 
 
 # Kept numerically equal to ULCNET_MODEL_IO_LAYOUT_VERSION in
@@ -114,6 +113,36 @@ OUTPUT_NAMES = (
     'h_gru0_out',
     'h_gru1_out',
 )
+
+
+def optimize_graph_file(path):
+    """onnxoptimizer cleanup: drop the tracer's Identity/Constant/dead-end
+    noise so the deployed graph carries only real ops. Skipped when the
+    package is absent -- the graph is then correct but unoptimized."""
+    try:
+        import onnxoptimizer
+        from onnxoptimizer import (
+            get_available_passes,
+            get_fuse_and_elimination_passes,
+        )
+    except ImportError:
+        print('[skip] onnxoptimizer not installed; graph left unoptimized')
+        return
+    import onnx
+    wanted = {
+        'eliminate_nop_pad', 'eliminate_nop_transpose', 'eliminate_identity',
+        'eliminate_deadend', 'eliminate_unused_initializer',
+        'fuse_consecutive_transposes', 'fuse_consecutive_squeezes',
+        'fuse_consecutive_unsqueezes', 'fuse_matmul_add_bias_into_gemm',
+        'fuse_add_bias_into_conv',
+    }
+    passes = list(set(get_fuse_and_elimination_passes())
+                  | (wanted & set(get_available_passes())))
+    graph = onnx.load(path)
+    before = len(graph.graph.node)
+    graph = onnxoptimizer.optimize(graph, passes, fixed_point=True)
+    onnx.save(graph, path)
+    print('[onnxoptimizer] %d -> %d nodes' % (before, len(graph.graph.node)))
 
 
 def _signed_power(value: Tensor, exponent: float) -> Tensor:

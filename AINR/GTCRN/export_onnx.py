@@ -23,30 +23,26 @@ import sys
 import numpy as np
 import torch
 
-# Path shims BEFORE the flat sibling imports, so this module also works when
-# imported package-qualified (``import AINR.GTCRN.export_onnx``) from a
-# quantization script instead of being run from this directory.
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
-if _SCRIPT_DIR not in sys.path:
-    sys.path.insert(0, _SCRIPT_DIR)
-if _AUDIO_ALG_ROOT not in sys.path:
-    sys.path.insert(0, _AUDIO_ALG_ROOT)
 
-from checkpoint_utils import extract_state_dict  # noqa: E402
-from model import GTCRN  # noqa: E402
-from train import build_contract, require_checkpoint_contract  # noqa: E402
-from stream_model import StreamGTCRN, initial_inputs  # noqa: E402
+# Relative imports FIRST: when this module is loaded package-qualified
+# (``import AINR.GTCRN.export_onnx`` from a quantization script) the flat
+# names must not be touched at all -- another model directory may already
+# own ``model``/``train`` in sys.modules. The flat branch serves direct
+# ``python export_onnx.py`` execution only.
+try:
+    from .checkpoint_utils import extract_state_dict
+    from .model import GTCRN
+    from .train import build_contract, require_checkpoint_contract
+    from .stream_model import StreamGTCRN, initial_inputs
+except ImportError:
+    if _SCRIPT_DIR not in sys.path:
+        sys.path.insert(0, _SCRIPT_DIR)
+    from checkpoint_utils import extract_state_dict
+    from model import GTCRN
+    from train import build_contract, require_checkpoint_contract
+    from stream_model import StreamGTCRN, initial_inputs
 
-# Package-qualified so it cannot collide with this project's own flat
-# ``model``/``train`` modules. The schema encoder is one contract across every
-# stateless exporter in the repo; a hand-typed shape string is a second copy
-# that drifts the moment a cache extent changes.
-from AINR.DeepFilterNet2.export_onnx import (  # noqa: E402
-    _schema,
-    optimize_graph_file,
-    set_onnx_metadata,
-)
 
 
 # Kept numerically equal to GTCRN_MODEL_LAYOUT_VERSION in gtcrn_process.h,
@@ -67,6 +63,58 @@ INPUT_NAMES = (
 OUTPUT_NAMES = ('output',) + tuple(
     name + '_out' for name in INPUT_NAMES[1:]
 )
+
+
+def _schema(names, tensors):
+    return {
+        name: [int(size) for size in tensor.shape]
+        for name, tensor in zip(names, tensors)
+    }
+
+
+def set_onnx_metadata(graph, metadata):
+    """Write a Python metadata mapping into an ONNX graph's model props.
+
+    ONNX model properties are string-valued, so structured entries are JSON
+    encoded (containers and bools) and scalars use ``str``; a consumer must
+    see one rule everywhere.
+    """
+    import onnx
+    onnx.helper.set_model_props(graph, {
+        key: (json.dumps(value, sort_keys=True)
+              if isinstance(value, (dict, list, bool)) else str(value))
+        for key, value in metadata.items()
+    })
+
+
+def optimize_graph_file(path):
+    """onnxoptimizer cleanup: drop the tracer's Identity/Constant/dead-end
+    noise so the deployed graph carries only real ops. Skipped when the
+    package is absent -- the graph is then correct but unoptimized."""
+    try:
+        import onnxoptimizer
+        from onnxoptimizer import (
+            get_available_passes,
+            get_fuse_and_elimination_passes,
+        )
+    except ImportError:
+        print('[skip] onnxoptimizer not installed; graph left unoptimized')
+        return
+    import onnx
+    wanted = {
+        'eliminate_nop_pad', 'eliminate_nop_transpose', 'eliminate_identity',
+        'eliminate_deadend', 'eliminate_unused_initializer',
+        'fuse_consecutive_transposes', 'fuse_consecutive_squeezes',
+        'fuse_consecutive_unsqueezes', 'fuse_matmul_add_bias_into_gemm',
+        'fuse_add_bias_into_conv',
+    }
+    passes = list(set(get_fuse_and_elimination_passes())
+                  | (wanted & set(get_available_passes())))
+    graph = onnx.load(path)
+    before = len(graph.graph.node)
+    graph = onnxoptimizer.optimize(graph, passes, fixed_point=True)
+    onnx.save(graph, path)
+    print('[onnxoptimizer] %d -> %d nodes' % (before, len(graph.graph.node)))
 
 
 def file_sha256(path):

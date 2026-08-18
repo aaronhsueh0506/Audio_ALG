@@ -27,10 +27,21 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from train import (
-    RNNoiseModel, read_feature_config,
-    require_checkpoint_feature_config, model_capacity_from_checkpoint,
-)
+try:
+    from .train import (
+        RNNoiseModel, read_feature_config,
+        require_checkpoint_feature_config, model_capacity_from_checkpoint,
+    )
+except ImportError:  # direct ``python export_onnx.py`` execution
+    import os as _os
+    import sys as _sys
+    _SCRIPT_DIR = _os.path.dirname(_os.path.abspath(__file__))
+    if _SCRIPT_DIR not in _sys.path:
+        _sys.path.insert(0, _SCRIPT_DIR)
+    from train import (
+        RNNoiseModel, read_feature_config,
+        require_checkpoint_feature_config, model_capacity_from_checkpoint,
+    )
 
 
 # 與 process.h 的 RNNOISE_MODEL_IO_LAYOUT_VERSION 保持數值相同 — 該巨集宣告

@@ -17,8 +17,12 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, RandomSampler
 import tqdm
 
-from checkpoint_utils import extract_state_dict
-from model import GTCRN
+try:
+    from .checkpoint_utils import extract_state_dict
+    from .model import GTCRN
+except ImportError:  # direct ``python train.py`` execution
+    from checkpoint_utils import extract_state_dict
+    from model import GTCRN
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dataset_gen import (  # noqa: E402

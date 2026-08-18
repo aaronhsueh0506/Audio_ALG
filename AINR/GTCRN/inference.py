@@ -35,9 +35,14 @@ _AINR_DIR = os.path.dirname(_THIS_DIR)  # home of calibration_io
 if _AINR_DIR not in sys.path:
     sys.path.insert(0, _AINR_DIR)
 
-from checkpoint_utils import extract_state_dict
-from model import GTCRN
-from train import build_contract, require_checkpoint_contract
+try:
+    from .checkpoint_utils import extract_state_dict
+    from .model import GTCRN
+    from .train import build_contract, require_checkpoint_contract
+except ImportError:  # direct ``python inference.py`` execution
+    from checkpoint_utils import extract_state_dict
+    from model import GTCRN
+    from train import build_contract, require_checkpoint_contract
 
 
 def load_model(args):

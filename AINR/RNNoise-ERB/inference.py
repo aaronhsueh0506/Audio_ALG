@@ -52,12 +52,20 @@ from calibration_io import (
     write_calibration_artifact,
 )
 
-from train import (
-    erb_bandborder, compute_erb_matrix, RNNoiseModel,
-    extract_model_features, read_feature_config,
-    require_checkpoint_feature_config, stft, istft,
-    model_capacity_from_checkpoint,
-)
+try:
+    from .train import (
+        erb_bandborder, compute_erb_matrix, RNNoiseModel,
+        extract_model_features, read_feature_config,
+        require_checkpoint_feature_config, stft, istft,
+        model_capacity_from_checkpoint,
+    )
+except ImportError:  # direct ``python inference.py`` execution
+    from train import (
+        erb_bandborder, compute_erb_matrix, RNNoiseModel,
+        extract_model_features, read_feature_config,
+        require_checkpoint_feature_config, stft, istft,
+        model_capacity_from_checkpoint,
+    )
 
 
 def valin_post_filter(mask, beta=0.02):

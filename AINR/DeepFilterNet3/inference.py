@@ -19,15 +19,26 @@ import torch
 import torchaudio
 import tqdm
 
-from model import DeepFilterNet3
-from train import (
-    extract_dfn3_features,
-    make_checkpoint_contract,
-    read_feature_config,
-    read_loss_config,
-    require_checkpoint_contract, read_model_config,
-    validate_signal_config,
-)
+try:
+    from .model import DeepFilterNet3
+    from .train import (
+        extract_dfn3_features,
+        make_checkpoint_contract,
+        read_feature_config,
+        read_loss_config,
+        require_checkpoint_contract, read_model_config,
+        validate_signal_config,
+    )
+except ImportError:  # direct ``python inference.py`` execution
+    from model import DeepFilterNet3
+    from train import (
+        extract_dfn3_features,
+        make_checkpoint_contract,
+        read_feature_config,
+        read_loss_config,
+        require_checkpoint_contract, read_model_config,
+        validate_signal_config,
+    )
 
 
 def load_model(args):

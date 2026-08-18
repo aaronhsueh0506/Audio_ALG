@@ -25,18 +25,13 @@ import argparse
 import hashlib
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
-
-try:
-    from .inference import load_model
-except ImportError:  # direct ``python export_onnx.py`` execution
-    from inference import load_model
-
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 INPUT_FRAMES = 3
@@ -69,14 +64,32 @@ OUTPUT_NAMES = (
 )
 
 
-def optimize_graph_file(path):
-    """onnxoptimizer cleanup shared by the stateless exporters.
+def _schema(names, tensors):
+    return {
+        name: [int(size) for size in tensor.shape]
+        for name, tensor in zip(names, tensors)
+    }
 
-    The tracer leaves Identity/Constant/dead-end noise around every replayed
-    module; the fuse-and-eliminate passes drop it so the deployed graph
-    carries only real ops. Skipped when the package is absent -- the graph is
-    then correct but unoptimized.
+
+def set_onnx_metadata(graph, metadata):
+    """Write a Python metadata mapping into an ONNX graph's model props.
+
+    ONNX model properties are string-valued, so structured entries are JSON
+    encoded (containers and bools) and scalars use ``str``; a consumer must
+    see one rule everywhere.
     """
+    import onnx
+    onnx.helper.set_model_props(graph, {
+        key: (json.dumps(value, sort_keys=True)
+              if isinstance(value, (dict, list, bool)) else str(value))
+        for key, value in metadata.items()
+    })
+
+
+def optimize_graph_file(path):
+    """onnxoptimizer cleanup: drop the tracer's Identity/Constant/dead-end
+    noise so the deployed graph carries only real ops. Skipped when the
+    package is absent -- the graph is then correct but unoptimized."""
     try:
         import onnxoptimizer
         from onnxoptimizer import (
@@ -270,31 +283,6 @@ def initial_inputs(model):
     )
 
 
-def _schema(names, tensors):
-    return {
-        name: [int(size) for size in tensor.shape]
-        for name, tensor in zip(names, tensors)
-    }
-
-
-def set_onnx_metadata(graph, metadata):
-    """Write a Python metadata mapping into an ONNX graph's model props.
-
-    ONNX model properties are string-valued, so structured entries have to be
-    encoded.  Every exporter that emits a schema dict needs the same rule --
-    JSON for containers and bools, ``str`` for scalars -- and a second copy of
-    it is a silent divergence: ``str(True)`` is ``'True'`` while
-    ``json.dumps(True)`` is ``'true'``, and a consumer parsing one form breaks
-    on the other.
-    """
-    import onnx
-    onnx.helper.set_model_props(graph, {
-        key: (json.dumps(value, sort_keys=True)
-              if isinstance(value, (dict, list, bool)) else str(value))
-        for key, value in metadata.items()
-    })
-
-
 def build_metadata(checkpoint_path, params, inputs, outputs):
     """The exported graph's metadata.
 
@@ -391,6 +379,10 @@ def main():
     parser.add_argument('--verify', action='store_true')
     args = parser.parse_args()
 
+    try:
+        from .inference import load_model
+    except ImportError:  # direct ``python export_onnx.py`` execution
+        from inference import load_model
     model, params = load_model(SimpleNamespace(
         config=args.config, model=args.model
     ))
