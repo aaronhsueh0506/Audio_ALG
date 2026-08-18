@@ -74,7 +74,14 @@ def build_stream_model(config_path, checkpoint_path):
     sub1 = cfg.getint('model', 'erb_subband_1')
     sub2 = cfg.getint('model', 'erb_subband_2')
     if (sr, n_fft, sub1, sub2) != (16000, 512, 65, 64):
-        raise ValueError('the verified stream graph requires sr/n_fft/ERB=16000/512/65/64')
+        # This pins the TRAINING grid declared by the config, not the input
+        # audio: inference and calibration resample wav files of any rate to
+        # the model rate. A checkpoint trained on another grid needs the
+        # stream cache layout re-verified on that grid before export.
+        raise ValueError(
+            'the verified stream graph requires sr/n_fft/ERB=16000/512/65/64, '
+            'but %s declares %d/%d/%d/%d' % (config_path, sr, n_fft, sub1, sub2)
+        )
     checkpoint = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
     require_checkpoint_contract(checkpoint, build_contract(cfg, win_len, hop_len),
                                 context=checkpoint_path, allow_missing=True)

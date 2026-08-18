@@ -30,6 +30,7 @@ from export_onnx import (  # noqa: E402
     OUTPUT_NAMES,
     STATE_LAYOUT_VERSION,
     build_metadata,
+    build_stream_model,
 )
 
 
@@ -165,3 +166,34 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
         # And the bytes on disk really hold one whole graph input.
         blob = np.fromfile(artifact / name / ('%s_1.bin' % name), '<f4')
         assert blob.size == int(np.prod(graph_shapes[name])), name
+
+
+def _grid_config(tmp_path, sr):
+    config = tmp_path / 'config.ini'
+    config.write_text(
+        '[signal]\nsr = %d\nn_fft = 512\nwin_len = 512\nhop_len = 256\n'
+        '[model]\nerb_subband_1 = 65\nerb_subband_2 = 64\n' % sr,
+        encoding='utf-8',
+    )
+    return os.fspath(config)
+
+
+def test_stream_grid_pin_names_the_offending_config(tmp_path):
+    """The 16k pin guards the TRAINING grid declared by the config.
+
+    Wav sample rates are resampled by inference and calibration and can never
+    trip it, so the rejection must name the config file and the grid it
+    declares -- that is the only thing the operator can act on.
+    """
+    config = _grid_config(tmp_path, 48000)
+    with pytest.raises(ValueError) as excinfo:
+        build_stream_model(config, os.fspath(tmp_path / 'absent.pth'))
+    message = str(excinfo.value)
+    assert '48000/512/65/64' in message
+    assert config in message
+
+    # The verified grid gets PAST the pin with the identical call: it fails
+    # later, on the deliberately absent checkpoint. Proof the gate can open.
+    config = _grid_config(tmp_path, 16000)
+    with pytest.raises((FileNotFoundError, OSError)):
+        build_stream_model(config, os.fspath(tmp_path / 'absent.pth'))
