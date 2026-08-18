@@ -67,13 +67,13 @@ float mask_erb[GTCRN_MODEL_ERB_BANDS][2];
 float enhanced[GTCRN_N_BINS][2];
 for (each hop of 256 new samples) {
     gtcrn_analysis(&amp;st, in256, spec);       /* 未正規化 RFFT 一框 */
-    gtcrn_model_input(spec, mag, re_b, im_b); /* host 固定前端:
-                                                 magnitude + ERB 前向矩陣 */
+    gtcrn_model_input(spec, erb_fwd, mag, re_b, im_b); /* host 固定前端:
+                                magnitude + ERB 前向矩陣 (erb_fwd.bin) */
     /* NPU: 三個 (1,129,1) 輸入 -> ERB 域 mask (1,129,1,2)
      * — 圖內只有學到的運算 */
     run_model(mag, re_b, im_b, mask_erb);
-    gtcrn_model_output(mask_erb, spec, enhanced); /* host 固定後端:
-                                                     ERB 逆矩陣 + CRM */
+    gtcrn_model_output(mask_erb, erb_inv, spec, enhanced); /* host 固定後端:
+                                ERB 逆矩陣 (erb_inv.bin) + CRM */
     gtcrn_synthesis(&amp;st, enhanced, out256);  /* WOLA, 256 samples */
 }</pre>
 <p class="note">Python 離線:<code>inference.py --config config.ini --model ckpt.pt --input in.wav --output out.wav</code>
@@ -147,11 +147,13 @@ spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder
 conv_cache 與八顆 h_* state 都由 host 作為 graph input/output 送回，加速器本身不保存跨次呼叫狀態。
 匯出不再 pin 單一 grid——config 與 checkpoint 不成對時在 strict
 <code>load_state_dict</code>（形狀）或 checkpoint contract（同形語意）就大聲失敗。
-v5 起固定前後端全在 host：<code>gtcrn_model_input</code>（magnitude＋ERB 前向矩陣，
-表格由 <code>export_erb_matrix.py --c-tables</code> 生成一次 commit 進
-<code>gtcrn_erb_tables_gen.h</code>）產生 <code>mag/real/imag</code> 三個獨立輸入
-（各自量化 scale）；圖回傳 ERB 域 complex mask，<code>gtcrn_model_output</code>
-做 ERB 逆矩陣＋CRM。因 ERB split 固定 65+64=129，graph I/O 在任何 n_fft 下都是
+v5 起固定前後端全在 host：<code>gtcrn_model_input</code>（magnitude＋ERB 前向矩陣）
+產生 <code>mag/real/imag</code> 三個獨立輸入（各自量化 scale）；圖回傳 ERB 域
+complex mask，<code>gtcrn_model_output</code> 做 ERB 逆矩陣＋CRM。矩陣由
+<code>export_erb_matrix.py --runtime-bins</code> 匯出成 raw float32 的
+<code>erb_fwd.bin</code>／<code>erb_inv.bin</code>（layout 與 C 迴圈一致，json 記
+shape）；<b>C 只吃呼叫端載入的指標</b>，loader 擁有檔案、可隨時替換 .bin
+不需重編譯。因 ERB split 固定 65+64=129，graph I/O 在任何 n_fft 下都是
 129 帶寬。<code>inference.py calib</code> 會在同一 process 同一 model instance
 一併匯出並 parity-check graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改）。</p>
 <div class="tbl"><table>

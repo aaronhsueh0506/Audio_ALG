@@ -230,30 +230,23 @@ def test_exported_graph_declares_fully_static_io(tmp_path):
             assert dim.HasField('dim_value'), value.name
 
 
-def test_committed_erb_tables_match_the_constructor():
-    """The committed C tables must equal the constructor's frozen buffers.
+def test_runtime_erb_bins_match_the_constructor(tmp_path):
+    """The exported .bin matrices must equal the constructor's buffers.
 
-    gtcrn_erb_tables_gen.h is generated once per grid and committed; if the
-    filterbank construction ever changes, the C host would silently band
-    with different matrices than the graph trained with. %.9e round-trips
-    float32 exactly, so the comparison is equality, not tolerance.
+    The C host consumes caller-loaded pointers in these exact layouts
+    (forward bin-major, inverse band-major, float32 LE); the deployment
+    loader owns the files, so this round-trip is the single value pin.
     """
-    import re as regex
+    sys.path.insert(0, ROOT)
+    from export_erb_matrix import write_runtime_bins
 
-    header = (ROOT_PATH / 'gtcrn_erb_tables_gen.h').read_text(
-        encoding='utf-8')
-    tables = {}
-    for name in ('gtcrn_erb_fwd', 'gtcrn_erb_inv'):
-        start = header.index(name)
-        end = header.index('};', start)
-        tables[name] = np.array(
-            [float(v) for v in regex.findall(
-                r'(-?\d\.\d+e[+-]\d+)f', header[start:end])],
-            dtype=np.float32)
+    out = write_runtime_bins(os.path.join(ROOT, 'config.ini'),
+                             os.fspath(tmp_path))
+    fwd = np.fromfile(os.path.join(out, 'erb_fwd.bin'), '<f4')
+    inv = np.fromfile(os.path.join(out, 'erb_inv.bin'), '<f4')
     erb = GTCRN(65, 64, nfft=512, fs=16000).erb
-    fwd = erb.erb_fc.weight.detach().numpy().T.astype(np.float32).ravel()
-    inv = erb.ierb_fc.weight.detach().numpy().T.astype(np.float32).ravel()
-    assert tables['gtcrn_erb_fwd'].shape == fwd.shape
-    assert tables['gtcrn_erb_inv'].shape == inv.shape
-    assert np.array_equal(tables['gtcrn_erb_fwd'], fwd)
-    assert np.array_equal(tables['gtcrn_erb_inv'], inv)
+    ref_fwd = erb.erb_fc.weight.detach().numpy().T.astype(np.float32).ravel()
+    ref_inv = erb.ierb_fc.weight.detach().numpy().T.astype(np.float32).ravel()
+    assert fwd.shape == ref_fwd.shape and inv.shape == ref_inv.shape
+    assert np.array_equal(fwd, ref_fwd)
+    assert np.array_equal(inv, ref_inv)

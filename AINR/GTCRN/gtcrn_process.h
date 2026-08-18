@@ -67,18 +67,28 @@ void gtcrn_model_state_init(GTCRNModelState* state);
 
 /* The three model-input frames from one analysis frame (model layout v5):
  * [sqrt(re^2 + im^2 + 1e-12), re, im] each banded through the exported ERB
- * forward matrix (gtcrn_erb_tables_gen.h) -- low bins pass through, high
- * bins compress to bands. Everything fixed runs HERE in fp32; the quantized
- * graph concatenates the three tensors and holds learned compute only. */
+ * forward matrix -- low bins pass through, high bins compress to bands.
+ * Everything fixed runs HERE in fp32; the quantized graph concatenates the
+ * three tensors and holds learned compute only.
+ *
+ * erb_fwd is the CALLER-LOADED matrix from export_erb_matrix.py's
+ * erb_fwd.bin: raw float32 little-endian, bin-major
+ * [GTCRN_MODEL_ERB_HIGH_BINS][GTCRN_MODEL_ERB_HIGH_BANDS]. The library
+ * never touches the filesystem, so the .bin can be swapped at any time by
+ * the loader that owns it. */
 void gtcrn_model_input(const float spectrum[GTCRN_N_BINS][2],
+                       const float* erb_fwd,
                        float mag[GTCRN_MODEL_ERB_BANDS],
                        float real_part[GTCRN_MODEL_ERB_BANDS],
                        float imag_part[GTCRN_MODEL_ERB_BANDS]);
 
 /* The fixed back end (model layout v5): expand the graph's ERB-domain
- * complex mask through the exported inverse matrix and apply the complex
- * ratio mask to the SAME analysis frame the inputs came from. */
+ * complex mask through the caller-loaded inverse matrix (erb_inv.bin: raw
+ * float32 little-endian, band-major
+ * [GTCRN_MODEL_ERB_HIGH_BANDS][GTCRN_MODEL_ERB_HIGH_BINS]) and apply the
+ * complex ratio mask to the SAME analysis frame the inputs came from. */
 void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
+                        const float* erb_inv,
                         const float spectrum[GTCRN_N_BINS][2],
                         float enhanced[GTCRN_N_BINS][2]);
 

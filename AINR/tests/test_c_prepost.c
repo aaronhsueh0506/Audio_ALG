@@ -9,7 +9,6 @@
 #include "DeepFilterNet2/dfn2_model_io.h"
 #include "DeepFilterNet3/dfn3_process.h"
 #include "GTCRN/gtcrn_process.h"
-#include "GTCRN/gtcrn_erb_tables_gen.h"
 
 #define CHECK(condition, message) do {                                      \
     if (!(condition)) {                                                     \
@@ -429,11 +428,22 @@ static int test_gtcrn_model_state(void)
         static float im_b[GTCRN_MODEL_ERB_BANDS];
         static float mask_erb[GTCRN_MODEL_ERB_BANDS][2];
         static float enhanced[GTCRN_N_BINS][2];
+        static float fwd[GTCRN_MODEL_ERB_HIGH_BINS]
+                        [GTCRN_MODEL_ERB_HIGH_BANDS];
+        static float inv[GTCRN_MODEL_ERB_HIGH_BANDS]
+                        [GTCRN_MODEL_ERB_HIGH_BINS];
         int b;
+        /* Synthetic caller-loaded matrices: the values live in the .bin the
+         * loader owns, so this test pins the WIRING (which row scales which
+         * band/bin), while the exporter's round-trip test pins the values. */
+        for (b = 0; b < GTCRN_MODEL_ERB_HIGH_BANDS; ++b)
+            fwd[35][b] = 0.25f + 0.001f * (float)b;
+        for (b = 0; b < GTCRN_MODEL_ERB_HIGH_BANDS; ++b)
+            inv[b][35] = 0.125f + 0.002f * (float)b;
         memset(spec_in, 0, sizeof(spec_in));
         spec_in[10][0] = 3.0f; spec_in[10][1] = 4.0f;   /* low: passthrough */
         spec_in[GTCRN_MODEL_ERB_KEPT + 35][0] = 2.0f;   /* one high bin     */
-        gtcrn_model_input(spec_in, mag, re_b, im_b);
+        gtcrn_model_input(spec_in, &fwd[0][0], mag, re_b, im_b);
         CHECK(fabsf(mag[10] - 5.0f) < 1e-6f &&
               re_b[10] == 3.0f && im_b[10] == 4.0f &&
               mag[0] == sqrtf(1e-12f),
@@ -442,23 +452,23 @@ static int test_gtcrn_model_state(void)
             int wired = 1;
             for (b = 0; b < GTCRN_MODEL_ERB_HIGH_BANDS; ++b) {
                 if (fabsf(re_b[GTCRN_MODEL_ERB_KEPT + b] -
-                          gtcrn_erb_fwd[35][b] * 2.0f) > 1e-6f) wired = 0;
+                          fwd[35][b] * 2.0f) > 1e-6f) wired = 0;
             }
             CHECK(wired,
                   "GTCRN host feature: high bins band through the "
-                  "committed forward table");
+                  "caller-loaded forward matrix");
         }
         memset(mask_erb, 0, sizeof(mask_erb));
         mask_erb[10][0] = 1.0f;                          /* unity low mask  */
         mask_erb[GTCRN_MODEL_ERB_KEPT + 7][0] = 0.5f;    /* one high band   */
-        gtcrn_model_output(mask_erb, spec_in, enhanced);
+        gtcrn_model_output(mask_erb, &inv[0][0], spec_in, enhanced);
         CHECK(enhanced[10][0] == 3.0f && enhanced[10][1] == 4.0f,
               "GTCRN host output: unity low-band CRM reproduces the "
               "spectrum bin");
         CHECK(fabsf(enhanced[GTCRN_MODEL_ERB_KEPT + 35][0] -
-                    2.0f * 0.5f * gtcrn_erb_inv[7][35]) < 1e-6f,
-              "GTCRN host output: high bands expand through the committed "
-              "inverse table");
+                    2.0f * 0.5f * inv[7][35]) < 1e-6f,
+              "GTCRN host output: high bands expand through the "
+              "caller-loaded inverse matrix");
     }
     gtcrn_model_state_init(&state);
     CHECK(state.conv_cache[1][15][15][32] == 0.0f &&

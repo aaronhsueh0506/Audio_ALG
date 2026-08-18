@@ -4,7 +4,6 @@
 #include <string.h>
 
 #include "../dfn_process_common.h"
-#include "gtcrn_erb_tables_gen.h"
 
 void gtcrn_process_init(GTCRNProcessState* state)
 {
@@ -17,20 +16,23 @@ void gtcrn_process_init(GTCRNProcessState* state)
  * high 192 bins accumulate into 64 bands via the committed forward table
  * (bin-major, so the inner loop runs contiguously over bands and
  * auto-vectorizes). */
-static void erb_band_channel(const float* full, float* banded)
+static void erb_band_channel(const float* full, const float* erb_fwd,
+                             float* banded)
 {
     for (int k = 0; k < GTCRN_MODEL_ERB_KEPT; ++k) banded[k] = full[k];
     for (int b = 0; b < GTCRN_MODEL_ERB_HIGH_BANDS; ++b)
         banded[GTCRN_MODEL_ERB_KEPT + b] = 0.0f;
     for (int k = 0; k < GTCRN_MODEL_ERB_HIGH_BINS; ++k) {
         float value = full[GTCRN_MODEL_ERB_KEPT + k];
+        const float* row = erb_fwd + (size_t)k * GTCRN_MODEL_ERB_HIGH_BANDS;
         float* out = banded + GTCRN_MODEL_ERB_KEPT;
         for (int b = 0; b < GTCRN_MODEL_ERB_HIGH_BANDS; ++b)
-            out[b] += gtcrn_erb_fwd[k][b] * value;
+            out[b] += row[b] * value;
     }
 }
 
 void gtcrn_model_input(const float spectrum[GTCRN_N_BINS][2],
+                       const float* erb_fwd,
                        float mag[GTCRN_MODEL_ERB_BANDS],
                        float real_part[GTCRN_MODEL_ERB_BANDS],
                        float imag_part[GTCRN_MODEL_ERB_BANDS])
@@ -38,7 +40,7 @@ void gtcrn_model_input(const float spectrum[GTCRN_N_BINS][2],
     float full_mag[GTCRN_N_BINS];
     float full_re[GTCRN_N_BINS];
     float full_im[GTCRN_N_BINS];
-    if (!spectrum || !mag || !real_part || !imag_part) return;
+    if (!spectrum || !erb_fwd || !mag || !real_part || !imag_part) return;
     for (int k = 0; k < GTCRN_N_BINS; ++k) {
         float re = spectrum[k][0];
         float im = spectrum[k][1];
@@ -46,18 +48,19 @@ void gtcrn_model_input(const float spectrum[GTCRN_N_BINS][2],
         full_re[k] = re;
         full_im[k] = im;
     }
-    erb_band_channel(full_mag, mag);
-    erb_band_channel(full_re, real_part);
-    erb_band_channel(full_im, imag_part);
+    erb_band_channel(full_mag, erb_fwd, mag);
+    erb_band_channel(full_re, erb_fwd, real_part);
+    erb_band_channel(full_im, erb_fwd, imag_part);
 }
 
 void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
+                        const float* erb_inv,
                         const float spectrum[GTCRN_N_BINS][2],
                         float enhanced[GTCRN_N_BINS][2])
 {
     float mask_re[GTCRN_N_BINS];
     float mask_im[GTCRN_N_BINS];
-    if (!mask_erb || !spectrum || !enhanced) return;
+    if (!mask_erb || !erb_inv || !spectrum || !enhanced) return;
     for (int k = 0; k < GTCRN_MODEL_ERB_KEPT; ++k) {
         mask_re[k] = mask_erb[k][0];
         mask_im[k] = mask_erb[k][1];
@@ -71,9 +74,10 @@ void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
     for (int b = 0; b < GTCRN_MODEL_ERB_HIGH_BANDS; ++b) {
         float band_re = mask_erb[GTCRN_MODEL_ERB_KEPT + b][0];
         float band_im = mask_erb[GTCRN_MODEL_ERB_KEPT + b][1];
+        const float* row = erb_inv + (size_t)b * GTCRN_MODEL_ERB_HIGH_BINS;
         for (int k = 0; k < GTCRN_MODEL_ERB_HIGH_BINS; ++k) {
-            mask_re[GTCRN_MODEL_ERB_KEPT + k] += gtcrn_erb_inv[b][k] * band_re;
-            mask_im[GTCRN_MODEL_ERB_KEPT + k] += gtcrn_erb_inv[b][k] * band_im;
+            mask_re[GTCRN_MODEL_ERB_KEPT + k] += row[k] * band_re;
+            mask_im[GTCRN_MODEL_ERB_KEPT + k] += row[k] * band_im;
         }
     }
     /* Complex ratio mask, mirroring model.py's Mask exactly. */
