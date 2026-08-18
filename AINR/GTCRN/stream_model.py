@@ -75,7 +75,7 @@ def stream_features(spectrum_ri):
 
 
 def _tra_step(tra, x, hidden):
-    energy = x.pow(2).mean(dim=-1)
+    energy = (x * x).mean(dim=-1)   # x*x, not pow: exports as Mul
     attention, hidden = tra.att_gru(energy.transpose(1, 2), hidden)
     attention = tra.att_act(tra.att_fc(attention)).transpose(1, 2)
     return x * attention[..., None], hidden

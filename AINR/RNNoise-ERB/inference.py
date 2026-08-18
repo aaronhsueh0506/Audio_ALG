@@ -9,7 +9,8 @@ RNNoise-ERB 推論腳本 (DFN-style inference)
     python inference.py --config config.ini --model output/rnnoise_best.pth \
                       --input-dir /path/to/noisy --output-dir /path/to/enhanced
 
-量化校正資料:
+量化校正資料（同時匯出 tensors 綁定的 ONNX graph，預設 <dump-calib>.onnx，
+--onnx 可改路徑）:
     python inference.py --config config.ini --model output/rnnoise_best.pth \
                       --input noisy.wav --output clean.wav \
                       --dump-calib calib/rnnoise_erb \

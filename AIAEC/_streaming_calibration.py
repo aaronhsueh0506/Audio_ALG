@@ -20,6 +20,13 @@ Per-frame, per-input raw binary files::
         --format bin \
         --output AIAEC/Align_ULCNet/calib/align_ulcnet_d8
 
+Align-ULCNet may instead take RAW microphone WAVs: pass ``--primary-is-mic``
+and the checkpoint-matched frozen PBFDKF derives the linear-error stems
+in-process, persisting them beside the artifact (``<output>_linear_error/``).
+
+Every calibration run also exports and parity-checks the ONNX graph the
+tensors bind to (default ``<output>.onnx``, override with ``--onnx``).
+
 Binary output uses one directory per ONNX input and one file per invocation,
 for example ``h_gru0/h_gru0_0000.bin``.  ``manifest.json`` records each
 frame shape, dtype, byte order, D and state contract.  The output directory

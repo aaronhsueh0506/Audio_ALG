@@ -8,10 +8,21 @@
     python3 inference.py checkpoint.pth kf_error.wav far.wav out.wav \\
         --input-is-linear-error
 
-Calibration:
+Calibration (also exports the ONNX graph the tensors bind to; the default
+graph path is <output>.onnx, override with --onnx):
     python3 inference.py calib --checkpoint checkpoint.pth \\
         --primary-dir /path/to/linear_error --far-dir /path/to/raw_far \\
         --frames 8192 --max-delay-frames 8 --format bin \\
+        --output calib/align_ulcnet_d8
+
+Calibration straight from RAW microphone recordings: add --primary-is-mic
+and point --primary-dir at the mic WAVs. The checkpoint-matched frozen
+PBFDKF derives the linear-error stems in-process and persists them beside
+the artifact (<output>_linear_error/); the manifest records
+primary_source=raw_mic_via_frozen_pbfdkf:
+    python3 inference.py calib --checkpoint checkpoint.pth \\
+        --primary-dir /path/to/raw_mic --far-dir /path/to/raw_far \\
+        --primary-is-mic --frames 8192 --max-delay-frames 8 --format bin \\
         --output calib/align_ulcnet_d8
 
 mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample

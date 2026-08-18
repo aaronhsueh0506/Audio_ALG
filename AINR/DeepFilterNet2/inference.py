@@ -9,7 +9,7 @@ DeepFilterNet2 推論腳本
     python inference.py --config config.ini --model output/dfn2_best.pth \
                       --input-dir /path/to/noisy --output-dir /path/to/enhanced
 
-Calibration:
+Calibration (also exports the ONNX graph the tensors bind to):
     python inference.py calib --model output/dfn2_best.pth \
         --wav-dir /path/to/noisy --frames 8192 --format bin \
         --output calib/dfn2
