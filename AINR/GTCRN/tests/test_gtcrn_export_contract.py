@@ -31,6 +31,7 @@ from export_onnx import (  # noqa: E402
     STATE_LAYOUT_VERSION,
     build_metadata,
     build_stream_model,
+    export_graph,
 )
 
 
@@ -211,7 +212,6 @@ def test_exported_graph_declares_fully_static_io(tmp_path):
     shapes to the traced tensors' real shapes.
     """
     onnx = pytest.importorskip('onnx')
-    from export_onnx import export_graph
 
     checkpoint = os.fspath(tmp_path / 'ckpt.pth')
     torch.save(
