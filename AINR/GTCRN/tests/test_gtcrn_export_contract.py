@@ -222,6 +222,7 @@ def test_exported_graph_declares_fully_static_io(tmp_path):
     graph_path = os.fspath(tmp_path / 'gtcrn_static.onnx')
     export_graph(stream, grid, checkpoint, graph_path)
     graph = onnx.load(graph_path)
-    for value in list(graph.graph.input) + list(graph.graph.output):
+    for value in (list(graph.graph.input) + list(graph.graph.output)
+                  + list(graph.graph.value_info)):
         for dim in value.type.tensor_type.shape.dim:
             assert dim.HasField('dim_value'), value.name

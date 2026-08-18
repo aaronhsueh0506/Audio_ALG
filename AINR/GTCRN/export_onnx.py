@@ -135,6 +135,32 @@ def _pin_static_output_shapes(graph, output_names, outputs):
             tensor_shape.dim.add().dim_value = size
 
 
+def _resolve_internal_shapes(model):
+    """Make every internal value_info static, or drop the annotation.
+
+    torch's shape inference labels edges it cannot prove with symbolic
+    unk__N dims even though static inputs fix every extent. onnxruntime's
+    symbolic shape inference folds those to integers; any annotation it
+    still cannot prove is removed -- a missing annotation is re-inferred by
+    the consumer, a symbolic one is read as dynamic.
+    """
+    try:
+        from onnxruntime.tools.symbolic_shape_infer import (
+            SymbolicShapeInference,
+        )
+        model = SymbolicShapeInference.infer_shapes(model, auto_merge=True)
+    except Exception as error:
+        print('[skip] symbolic shape inference unavailable: %s' % error)
+    kept = [
+        value_info for value_info in model.graph.value_info
+        if all(dim.HasField('dim_value')
+               for dim in value_info.type.tensor_type.shape.dim)
+    ]
+    del model.graph.value_info[:]
+    model.graph.value_info.extend(kept)
+    return model
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with open(path, 'rb') as stream:
@@ -222,6 +248,7 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
     metadata = build_metadata(checkpoint_path, grid, inputs, outputs)
     set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, OUTPUT_NAMES, outputs)
+    graph = _resolve_internal_shapes(graph)
     onnx.save(graph, output_path)
     with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as fp:
