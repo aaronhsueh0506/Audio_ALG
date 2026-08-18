@@ -228,3 +228,32 @@ def test_exported_graph_declares_fully_static_io(tmp_path):
                   + list(graph.graph.value_info)):
         for dim in value.type.tensor_type.shape.dim:
             assert dim.HasField('dim_value'), value.name
+
+
+def test_committed_erb_tables_match_the_constructor():
+    """The committed C tables must equal the constructor's frozen buffers.
+
+    gtcrn_erb_tables_gen.h is generated once per grid and committed; if the
+    filterbank construction ever changes, the C host would silently band
+    with different matrices than the graph trained with. %.9e round-trips
+    float32 exactly, so the comparison is equality, not tolerance.
+    """
+    import re as regex
+
+    header = (ROOT_PATH / 'gtcrn_erb_tables_gen.h').read_text(
+        encoding='utf-8')
+    tables = {}
+    for name in ('gtcrn_erb_fwd', 'gtcrn_erb_inv'):
+        start = header.index(name)
+        end = header.index('};', start)
+        tables[name] = np.array(
+            [float(v) for v in regex.findall(
+                r'(-?\d\.\d+e[+-]\d+)f', header[start:end])],
+            dtype=np.float32)
+    erb = GTCRN(65, 64, nfft=512, fs=16000).erb
+    fwd = erb.erb_fc.weight.detach().numpy().T.astype(np.float32).ravel()
+    inv = erb.ierb_fc.weight.detach().numpy().T.astype(np.float32).ravel()
+    assert tables['gtcrn_erb_fwd'].shape == fwd.shape
+    assert tables['gtcrn_erb_inv'].shape == inv.shape
+    assert np.array_equal(tables['gtcrn_erb_fwd'], fwd)
+    assert np.array_equal(tables['gtcrn_erb_inv'], inv)
