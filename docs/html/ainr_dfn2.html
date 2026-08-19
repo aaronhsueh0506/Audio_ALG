@@ -154,7 +154,7 @@ hop-lag: 輸出音訊落後輸入 2 hops (heads 1 hop + DF future tap 1 hop, 串
 <p><b>ONNX/匯出邊界</b>:<code>model.py heads()</code> 即匯出邊界——圖內只有網路
 (encoder/ERBDecoder/DFDecoder);ERB mask 展開、DF FIR、alpha blend、PF、atten-lim、
 ISTFT 全在圖外的 C。<code>export_onnx.py</code> 已交付 stateless heads graph：
-每次由 host 傳入 3 幀 feature window、三組 GRU hidden 與 DF pathway history，
+每次由 host 傳入 3 幀 feature window、五個逐層 GRU hidden tensor 與 DF pathway history，
 並取回 heads 與更新後 state；加速器本身不保存跨次呼叫狀態。C helper 在寫入前
 驗證整批 next-state，NULL/NaN/Inf 會回傳 -1 且保留上一筆 state。</p>
 <div class="tbl"><table>
@@ -172,8 +172,8 @@ ISTFT 全在圖外的 C。<code>export_onnx.py</code> 已交付 stateless heads 
 <tr><td><code>stream_frame_index</code> 等 index</td><td>—</td><td>16</td><td>C struct</td><td>串流框編號 / ring 指標</td></tr>
 <tr><td>scratch 區</td><td>—</td><td>~12.4 KB</td><td>C struct</td><td>非跨呼叫,每次覆寫</td></tr>
 <tr><td><code>h_encoder</code></td><td>(1,B,256)</td><td>1,024</td><td>host caller</td><td>顯式 graph I/O；<code>encoder.emb_gru</code> hidden，跨次呼叫由 host 保存</td></tr>
-<tr><td><code>h_erb</code></td><td>(2,B,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；ERB decoder(<code>erb_dec.emb_gru</code>)2 層 GRU</td></tr>
-<tr><td><code>h_df</code></td><td>(2,B,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；DF decoder(<code>df_dec.df_gru</code>)2 層 GRU</td></tr>
+<tr><td><code>h_erb_0</code>、<code>h_erb_1</code></td><td>各 (1,B,256)</td><td>各 1,024</td><td>host caller</td><td>顯式 graph I/O；ERB decoder 兩層各自校正量化 scale</td></tr>
+<tr><td><code>h_df_0</code>、<code>h_df_1</code></td><td>各 (1,B,256)</td><td>各 1,024</td><td>host caller</td><td>顯式 graph I/O；DF decoder 兩層各自校正量化 scale</td></tr>
 <tr><td>conv 時間快取</td><td>erb_conv0/df_conv0 的 3 幀輸入 window；df_convp:4 框×(64×96)=24,576 f32</td><td>約 100 KB</td><td>host caller</td><td>window/pathway history 都是顯式 graph I/O；加速器不持有 state</td></tr>
 </table></div>
 <p class="note"><code>sizeof(DFN2State)</code> = 85,632 bytes(本機以 <code>-ffp-contract=off</code> 編譯量測)。</p>

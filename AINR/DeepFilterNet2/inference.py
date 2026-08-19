@@ -323,7 +323,7 @@ def calibration_main():
         for name, values in captured.items()
     }
     report = {
-        'schema': 'dfn2-stateless-stream-calibration-v2',
+        'schema': 'dfn2-stateless-stream-calibration-v3',
         'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
         'graph': os.path.basename(onnx_path),
         'sample_rate': params['SR'],

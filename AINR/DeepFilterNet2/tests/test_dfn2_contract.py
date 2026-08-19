@@ -359,14 +359,18 @@ def test_c_model_io_layout_constants_match_the_shipped_export_shapes():
     assert frames == INPUT_FRAMES, (
         'the C window depth and the exporter window depth are one contract'
     )
+    assert c_macro(header, 'DFN2_MODEL_ERB_GRU_LAYERS') == 2
+    assert c_macro(header, 'DFN2_MODEL_DF_GRU_LAYERS') == 2
 
     model = build_shipped_model(load_config()).eval()
     expected = (
         (1, 1, frames, n_erb),
         (1, 2, frames, df_bins),
         (c_macro(header, 'DFN2_MODEL_ENCODER_GRU_LAYERS'), 1, hidden),
-        (c_macro(header, 'DFN2_MODEL_ERB_GRU_LAYERS'), 1, hidden),
-        (c_macro(header, 'DFN2_MODEL_DF_GRU_LAYERS'), 1, hidden),
+        (1, 1, hidden),
+        (1, 1, hidden),
+        (1, 1, hidden),
+        (1, 1, hidden),
         (1, c_macro(header, 'DFN2_MODEL_ENCODER_CHANNELS'),
          c_macro(header, 'DFN2_MODEL_DF_PATHWAY_HISTORY'), df_bins),
     )
@@ -414,12 +418,26 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
         output_names=list(OUTPUT_NAMES),
         opset_version=17, do_constant_folding=True,
     )
+    graph = onnx.load(graph_path)
     graph_shapes = {
         value.name: [int(dim.dim_value)
                      for dim in value.type.tensor_type.shape.dim]
-        for value in onnx.load(graph_path).graph.input
+        for value in graph.graph.input
     }
     assert set(graph_shapes) == set(INPUT_NAMES)
+    consumers = {}
+    for node in graph.graph.node:
+        for input_name in node.input:
+            consumers.setdefault(input_name, []).append(node)
+    split_states = ('h_erb_0', 'h_erb_1', 'h_df_0', 'h_df_1')
+    state_grus = []
+    for name in split_states:
+        direct = consumers.get(name, [])
+        assert len(direct) == 1 and direct[0].op_type == 'GRU', name
+        state_grus.append(direct[0].name)
+    assert len(set(state_grus)) == len(split_states), (
+        'each split state must feed its own GRU node without Cat/requantize'
+    )
 
     # Two invocations, recorded exactly the way calibration_main records them.
     captured = {}

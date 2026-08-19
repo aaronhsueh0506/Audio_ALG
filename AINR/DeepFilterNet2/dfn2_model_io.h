@@ -7,11 +7,11 @@
 extern "C" {
 #endif
 
-/* Must match export_onnx.py and the shipped DFN2 config. Version 2 renamed
- * the graph tensors (erb/spec inputs, h_encoder/h_erb/h_df hiddens, *_out
- * state outputs); runtimes bind by name, so the rename is a contract change
- * even though every shape and this struct stayed identical. */
-#define DFN2_MODEL_IO_LAYOUT_VERSION       2
+/* Must match export_onnx.py and the shipped DFN2 config. Version 3 exposes
+ * h_erb_0/h_erb_1 and h_df_0/h_df_1 as separate graph tensors so per-tensor
+ * PTQ may use one scale per recurrent layer. The state struct remains
+ * contiguous and unchanged; runtimes bind each row to its named tensor. */
+#define DFN2_MODEL_IO_LAYOUT_VERSION       3
 #define DFN2_MODEL_INPUT_FRAMES            3
 #define DFN2_MODEL_ENCODER_GRU_LAYERS      1
 #define DFN2_MODEL_ERB_GRU_LAYERS          2
@@ -51,7 +51,7 @@ void dfn2_model_io_push_spec_window(
     float window[2][DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS],
     const float frame[2][DFN2_DF_BINS]);
 
-/* Commit the four explicit-state graph outputs into caller-owned arrays.
+/* Commit the explicit-state graph outputs into caller-owned arrays.
  * Takes the arrays instead of a state struct so an external dual-input
  * consumer whose struct differs reuses this commit discipline without
  * changing its own field layout. */
@@ -65,10 +65,10 @@ int dfn2_model_io_commit_arrays(
                           [DFN2_DF_BINS],
     const float encoder_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
                                    [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
-                               [DFN2_MODEL_GRU_HIDDEN],
-    const float df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
-                              [DFN2_MODEL_GRU_HIDDEN],
+    const float erb_hidden_0_next[DFN2_MODEL_GRU_HIDDEN],
+    const float erb_hidden_1_next[DFN2_MODEL_GRU_HIDDEN],
+    const float df_hidden_0_next[DFN2_MODEL_GRU_HIDDEN],
+    const float df_hidden_1_next[DFN2_MODEL_GRU_HIDDEN],
     const float pathway_history_next[DFN2_MODEL_ENCODER_CHANNELS]
                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
                                     [DFN2_DF_BINS]);
@@ -87,10 +87,10 @@ int dfn2_model_io_commit_state(
     DFN2ModelIOState *state,
     const float encoder_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
                                    [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
-                               [DFN2_MODEL_GRU_HIDDEN],
-    const float df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
-                              [DFN2_MODEL_GRU_HIDDEN],
+    const float erb_hidden_0_next[DFN2_MODEL_GRU_HIDDEN],
+    const float erb_hidden_1_next[DFN2_MODEL_GRU_HIDDEN],
+    const float df_hidden_0_next[DFN2_MODEL_GRU_HIDDEN],
+    const float df_hidden_1_next[DFN2_MODEL_GRU_HIDDEN],
     const float pathway_history_next[DFN2_MODEL_ENCODER_CHANNELS]
                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
                                     [DFN2_DF_BINS]);

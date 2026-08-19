@@ -290,7 +290,9 @@ static int test_dfn2_model_io(void)
     memset(erb_next, 0x4d, sizeof(erb_next));
     memset(df_next, 0x5e, sizeof(df_next));
     memset(pathway_next, 0x6f, sizeof(pathway_next));
-    CHECK(dfn2_model_io_commit_state(&state, encoder_next, erb_next, df_next,
+    CHECK(dfn2_model_io_commit_state(&state, encoder_next,
+                                     erb_next[0], erb_next[1],
+                                     df_next[0], df_next[1],
                                      pathway_next) == 0 &&
           memcmp(state.encoder_gru_hidden, encoder_next,
                  sizeof(encoder_next)) == 0 &&
@@ -305,15 +307,28 @@ static int test_dfn2_model_io(void)
     memset(erb_next, 0x41, sizeof(erb_next));
     memset(df_next, 0x41, sizeof(df_next));
     memset(pathway_next, 0x41, sizeof(pathway_next));
+    erb_next[1][DFN2_MODEL_GRU_HIDDEN - 1] = NAN;
+    CHECK(dfn2_model_io_commit_state(&state, encoder_next,
+                                     erb_next[0], erb_next[1],
+                                     df_next[0], df_next[1],
+                                     pathway_next) != 0,
+          "DFN2 commit validates the second split ERB state");
+    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
+          "DFN2 split-state refusal is transactional");
+    erb_next[1][DFN2_MODEL_GRU_HIDDEN - 1] = 1.0f;
     pathway_next[DFN2_MODEL_ENCODER_CHANNELS - 1]
                 [DFN2_MODEL_DF_PATHWAY_HISTORY - 1]
                 [DFN2_DF_BINS - 1] = NAN;
-    CHECK(dfn2_model_io_commit_state(&state, encoder_next, erb_next, df_next,
+    CHECK(dfn2_model_io_commit_state(&state, encoder_next,
+                                     erb_next[0], erb_next[1],
+                                     df_next[0], df_next[1],
                                      pathway_next) != 0,
           "DFN2 commit refuses a non-finite state batch");
     CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
           "DFN2 refusal preserves every previously committed state byte");
-    CHECK(dfn2_model_io_commit_state(NULL, encoder_next, erb_next, df_next,
+    CHECK(dfn2_model_io_commit_state(NULL, encoder_next,
+                                     erb_next[0], erb_next[1],
+                                     df_next[0], df_next[1],
                                      pathway_next) != 0,
           "DFN2 commit refuses a null destination");
     return 1;

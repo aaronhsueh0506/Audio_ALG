@@ -93,8 +93,12 @@ python3 inference.py calib --model output/dfn2_best.pth \
 
 The graph is stateless from the accelerator's perspective. Each invocation
 receives exactly three feature frames `[t-1,t,t+1]`, emits the heads for frame
-`t`, and returns three GRU hidden tensors plus the four-frame `df_convp`
-history for the next invocation. The extra history is required because the
+`t`, and returns one encoder GRU tensor, two independently quantizable ERB GRU
+layer tensors, two independently quantizable DF GRU layer tensors, plus the
+four-frame `df_convp` history for the next invocation. The C state keeps each
+pair contiguous; only the graph boundary splits the layers so a per-tensor PTQ
+tool does not force both recurrent layers to share one activation scale. The
+extra history is required because the
 input kernel sees three frames while the DF residual path has a causal
 five-frame kernel; omitting it would silently reduce the trained receptive
 field. CPU-side window/state storage is defined by

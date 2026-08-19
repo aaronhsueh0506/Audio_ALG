@@ -2,9 +2,9 @@
 """Export DFN2 heads as a stateless streaming ONNX graph.
 
 The accelerator owns no persistent state. Each invocation receives the three
-feature frames required by the input kernel, all three GRU hidden states, and
-the four-frame causal history used by ``df_convp``. It emits the heads for the
-centre feature frame together with every updated state tensor.
+feature frames required by the input kernel, five per-layer GRU hidden tensors,
+and the four-frame causal history used by ``df_convp``. It emits the heads for
+the centre feature frame together with every updated state tensor.
 
 STFT, feature normalisation, the three-frame feature window, deep-filter
 composition and WOLA remain in the host C code.
@@ -46,16 +46,21 @@ INPUT_FRAMES = 3
 # which declares the caller-owned state struct this graph consumes and emits.
 # tests/test_dfn2_contract.py pins the two together. Tensor names are part of
 # this contract: runtimes bind by name.
-STATE_LAYOUT_VERSION = 2
+STATE_LAYOUT_VERSION = 3
 
-# Content inputs carry content names (two feature streams); each GRU hidden
-# is its own h_* tensor; the deep-filter pathway history is a combined cache.
+# Content inputs carry content names (two feature streams). Every recurrent
+# layer has its own graph tensor so a per-tensor PTQ tool can calibrate the two
+# ERB and DF GRU layers independently. The C state remains contiguous; only
+# the accelerator boundary is split. The deep-filter pathway history remains
+# a combined cache because it is one convolutional state with one distribution.
 INPUT_NAMES = (
     'erb',
     'spec',
     'h_encoder',
-    'h_erb',
-    'h_df',
+    'h_erb_0',
+    'h_erb_1',
+    'h_df_0',
+    'h_df_1',
     'df_convp_history',
 )
 
@@ -64,8 +69,10 @@ OUTPUT_NAMES = (
     'df_coefs',
     'df_alpha',
     'h_encoder_out',
-    'h_erb_out',
-    'h_df_out',
+    'h_erb_0_out',
+    'h_erb_1_out',
+    'h_df_0_out',
+    'h_df_1_out',
     'df_convp_history_out',
 )
 
@@ -226,6 +233,56 @@ def _squeezed_gru(module, value, hidden):
     return value, hidden_next
 
 
+def _clone_gru_layers(gru):
+    """Clone a stacked GRU into equivalent one-layer export modules.
+
+    PyTorch exports a multi-layer GRU by slicing one combined initial-hidden
+    tensor. Feeding separately named tensors through a Cat before that slice
+    can make an integer compiler assign the Cat output one shared scale, which
+    defeats the split I/O contract. Independent one-layer modules keep every
+    state tensor on a separate graph edge all the way into its GRU node.
+    """
+    if not gru.batch_first or gru.bidirectional or gru.proj_size != 0:
+        raise ValueError('DFN2 export requires unidirectional batch-first GRUs')
+    reference = next(gru.parameters())
+    layers = nn.ModuleList()
+    for index in range(gru.num_layers):
+        input_size = gru.input_size if index == 0 else gru.hidden_size
+        layer = nn.GRU(
+            input_size,
+            gru.hidden_size,
+            num_layers=1,
+            bias=gru.bias,
+            batch_first=True,
+        ).to(device=reference.device, dtype=reference.dtype)
+        names = ['weight_ih', 'weight_hh']
+        if gru.bias:
+            names += ['bias_ih', 'bias_hh']
+        with torch.no_grad():
+            for name in names:
+                getattr(layer, name + '_l0').copy_(
+                    getattr(gru, '%s_l%d' % (name, index))
+                )
+        layers.append(layer)
+    return layers
+
+
+def _squeezed_gru_layers(module, layers, value, hidden_layers):
+    """Run a SqueezedGRU through independently exposed recurrent states."""
+    if len(layers) != len(hidden_layers):
+        raise ValueError('one hidden-state tensor is required per GRU layer')
+    raw = value
+    value = module.linear_in(value)
+    hidden_next = []
+    for layer, hidden in zip(layers, hidden_layers):
+        value, next_layer = layer(value, hidden)
+        hidden_next.append(next_layer)
+    value = module.linear_out(value)
+    if module.gru_skip is not None:
+        value = value + module.gru_skip(raw)
+    return value, tuple(hidden_next)
+
+
 def _df_pathway_step(module, current, history):
     """Run the causal kernel-5 DF residual and return its next history."""
     kernel = module.conv.kernel_size[0]
@@ -268,14 +325,22 @@ class StatelessDFN2Heads(nn.Module):
             )
         if model.encoder.erb_conv0[1].kernel_size[0] != INPUT_FRAMES:
             raise ValueError('this exporter requires a temporal kernel of 3')
+        if model.erb_dec.emb_gru.gru.num_layers != 2:
+            raise ValueError('this exporter requires two ERB decoder GRU layers')
+        if model.df_dec.df_gru.gru.num_layers != 2:
+            raise ValueError('this exporter requires two DF decoder GRU layers')
+        self.erb_gru_layers = _clone_gru_layers(model.erb_dec.emb_gru.gru)
+        self.df_gru_layers = _clone_gru_layers(model.df_dec.df_gru.gru)
 
     def forward(
         self,
         feat_erb_window,
         feat_spec_window,
         encoder_gru_hidden,
-        erb_gru_hidden,
-        df_gru_hidden,
+        erb_gru_hidden_0,
+        erb_gru_hidden_1,
+        df_gru_hidden_0,
+        df_gru_hidden_1,
         df_convp_history,
     ):
         model = self.model
@@ -301,8 +366,11 @@ class StatelessDFN2Heads(nn.Module):
         )
 
         erb = model.erb_dec
-        erb_value, erb_hidden_next = _squeezed_gru(
-            erb.emb_gru, embedding, erb_gru_hidden
+        erb_value, erb_hidden_next = _squeezed_gru_layers(
+            erb.emb_gru,
+            self.erb_gru_layers,
+            embedding,
+            (erb_gru_hidden_0, erb_gru_hidden_1),
         )
         erb_value = erb_value.reshape(
             batch, 1, erb.n_erb_4, erb.enc_ch
@@ -313,8 +381,11 @@ class StatelessDFN2Heads(nn.Module):
         erb_mask = erb.conv0_out(erb.conv0p(e0) + erb_value)
 
         decoder = model.df_dec
-        df_value, df_hidden_next = _squeezed_gru(
-            decoder.df_gru, embedding, df_gru_hidden
+        df_value, df_hidden_next = _squeezed_gru_layers(
+            decoder.df_gru,
+            self.df_gru_layers,
+            embedding,
+            (df_gru_hidden_0, df_gru_hidden_1),
         )
         if decoder.df_skip is not None:
             df_value = df_value + decoder.df_skip(embedding)
@@ -332,8 +403,10 @@ class StatelessDFN2Heads(nn.Module):
             coefficients,
             alpha,
             encoder_hidden_next,
-            erb_hidden_next,
-            df_hidden_next,
+            erb_hidden_next[0],
+            erb_hidden_next[1],
+            df_hidden_next[0],
+            df_hidden_next[1],
             pathway_history_next,
         )
 
@@ -348,8 +421,10 @@ def initial_inputs(model):
         torch.randn(1, 1, INPUT_FRAMES, model.n_erb),
         torch.randn(1, 2, INPUT_FRAMES, model.df_bins),
         torch.zeros(encoder_gru.num_layers, 1, encoder_gru.hidden_size),
-        torch.zeros(erb_gru.num_layers, 1, erb_gru.hidden_size),
-        torch.zeros(df_gru.num_layers, 1, df_gru.hidden_size),
+        *(torch.zeros(1, 1, erb_gru.hidden_size)
+          for _ in range(erb_gru.num_layers)),
+        *(torch.zeros(1, 1, df_gru.hidden_size)
+          for _ in range(df_gru.num_layers)),
         torch.zeros(1, enc_ch, pathway_history, model.df_bins),
     )
 
