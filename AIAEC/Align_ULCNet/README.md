@@ -26,6 +26,14 @@ those remain a reconstruction choice. The 16 kHz graph has about 0.67 M
 trainable parameters, matching the published 0.69 M class without inventing a
 U-Net decoder.
 
+For training, `[model] max_delay_frames` in `config.ini` directly selects D;
+the shipped product-oriented config uses D=8.  The delay-stack activation and
+streaming state grow linearly with D, so this is also the first memory knob to
+reduce when a D=64 run exhausts CUDA memory.  This is a real forward-path
+choice, not only an allocation hint: changing D changes the attention candidate
+set.  Start a new run after changing it; checkpoint resume deliberately rejects
+a different D.  If memory is still insufficient, reduce `[data] batch_size`.
+
 For the listening examples on the paper's project page, the track labelled
 ``KF`` is the 16 kHz **error/residual Z**, not the KF echo estimate. To test
 only this neural post-filter with that external frontend, use:

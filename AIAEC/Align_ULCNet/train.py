@@ -175,7 +175,7 @@ def main(args):
     model_kwargs = read_model_kwargs(cfg, AlignULCNet)
     model = AlignULCNet(model_grid, **model_kwargs).to(device)
     print(f"Align-ULCNet: {sum(p.numel() for p in model.parameters())} params, "
-          f"grid={model_grid}")
+          f"grid={model_grid}, max_delay_frames={model.max_delay_frames}")
 
     train_loader, val_loader, data_contract = build_plain_loaders(
         cfg, aec_grid, seed=args.seed,
