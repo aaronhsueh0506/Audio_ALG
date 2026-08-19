@@ -35,6 +35,51 @@ void spatial_conj_beamform(
     float scale,
     Complex* out);
 
+/* Projection-form GSC blocking output. `u` is channel-major [channels][bins]. */
+void spatial_gsc_projection_scalar(
+    const Complex* const* steering,
+    const Complex* const* inputs,
+    const Complex* das,
+    int channels,
+    int bins,
+    Complex* u);
+
+void spatial_gsc_projection(
+    const Complex* const* steering,
+    const Complex* const* inputs,
+    const Complex* das,
+    int channels,
+    int bins,
+    Complex* u);
+
+void spatial_complex_sub_array_scalar(
+    const Complex* lhs,
+    const Complex* rhs,
+    Complex* out,
+    int count);
+
+void spatial_complex_sub_array(
+    const Complex* lhs,
+    const Complex* rhs,
+    Complex* out,
+    int count);
+
+/* Effective channel-major [channels][bins] response represented by the
+ * current GSC steering vectors and adaptive weights. */
+void spatial_gsc_effective_weights_scalar(
+    const Complex* const* steering,
+    const Complex* const* adaptive_weights,
+    int channels,
+    int bins,
+    Complex* out);
+
+void spatial_gsc_effective_weights(
+    const Complex* const* steering,
+    const Complex* const* adaptive_weights,
+    int channels,
+    int bins,
+    Complex* out);
+
 /* score[f] += 2*real(phat[f] * steering[f]). */
 void spatial_pair_score_accumulate_scalar(
     const Complex* phat,

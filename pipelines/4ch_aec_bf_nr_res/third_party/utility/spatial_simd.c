@@ -152,6 +152,259 @@ void spatial_conj_beamform(
 #endif
 }
 
+static void spatial_gsc_projection_scalar_range(
+    const Complex* const* steering,
+    const Complex* const* inputs,
+    const Complex* das,
+    int channels,
+    int bins,
+    int first,
+    Complex* u)
+{
+    for (int f = first; f < bins; ++f) {
+        float denom = 0.0f;
+        for (int m = 0; m < channels; ++m) {
+            float ar = steering[m][f].r;
+            float ai = steering[m][f].i;
+            denom += ar * ar + ai * ai;
+        }
+        if (denom < 1e-12f) denom = 1e-12f;
+        {
+            float scale = (float)channels / denom;
+            float pr = das[f].r * scale;
+            float pi = das[f].i * scale;
+            for (int m = 0; m < channels; ++m) {
+                float ar = steering[m][f].r;
+                float ai = steering[m][f].i;
+                float rr = ar * pr - ai * pi;
+                float ri = ar * pi + ai * pr;
+                u[(size_t)m * (size_t)bins + (size_t)f].r =
+                    inputs[m][f].r - rr;
+                u[(size_t)m * (size_t)bins + (size_t)f].i =
+                    inputs[m][f].i - ri;
+            }
+        }
+    }
+}
+
+void spatial_gsc_projection_scalar(
+    const Complex* const* steering,
+    const Complex* const* inputs,
+    const Complex* das,
+    int channels,
+    int bins,
+    Complex* u)
+{
+    if (!steering || !inputs || !das || !u || channels <= 0 || bins <= 0)
+        return;
+    spatial_gsc_projection_scalar_range(
+        steering, inputs, das, channels, bins, 0, u);
+}
+
+void spatial_gsc_projection(
+    const Complex* const* steering,
+    const Complex* const* inputs,
+    const Complex* das,
+    int channels,
+    int bins,
+    Complex* u)
+{
+#if THIRD_PARTY_SPATIAL_NEON
+    int f = 0;
+    const float32x4_t floor_value = vdupq_n_f32(1e-12f);
+    if (!steering || !inputs || !das || !u || channels <= 0 || bins <= 0)
+        return;
+    for (; f + 4 <= bins; f += 4) {
+        float32x4_t denom = vdupq_n_f32(0.0f);
+        for (int m = 0; m < channels; ++m) {
+            float32x4x2_t a = sk__cquad_load(steering[m] + f);
+            denom = vaddq_f32(
+                denom,
+                vaddq_f32(vmulq_f32(a.val[0], a.val[0]),
+                           vmulq_f32(a.val[1], a.val[1])));
+        }
+        denom = vbslq_f32(vcltq_f32(denom, floor_value),
+                           floor_value, denom);
+        {
+            float32x4_t scale =
+                vdivq_f32(vdupq_n_f32((float)channels), denom);
+            float32x4x2_t d = sk__cquad_load(das + f);
+            float32x4_t pr = vmulq_f32(d.val[0], scale);
+            float32x4_t pi = vmulq_f32(d.val[1], scale);
+            for (int m = 0; m < channels; ++m) {
+                float32x4x2_t a = sk__cquad_load(steering[m] + f);
+                float32x4x2_t x = sk__cquad_load(inputs[m] + f);
+                float32x4x2_t value;
+                float32x4_t rr = vsubq_f32(
+                    vmulq_f32(a.val[0], pr), vmulq_f32(a.val[1], pi));
+                float32x4_t ri = vaddq_f32(
+                    vmulq_f32(a.val[0], pi), vmulq_f32(a.val[1], pr));
+                value.val[0] = vsubq_f32(x.val[0], rr);
+                value.val[1] = vsubq_f32(x.val[1], ri);
+                sk__cquad_store(u + (size_t)m * (size_t)bins + (size_t)f,
+                                value);
+            }
+        }
+    }
+    spatial_gsc_projection_scalar_range(
+        steering, inputs, das, channels, bins, f, u);
+#else
+    spatial_gsc_projection_scalar(steering, inputs, das, channels, bins, u);
+#endif
+}
+
+void spatial_complex_sub_array_scalar(
+    const Complex* lhs,
+    const Complex* rhs,
+    Complex* out,
+    int count)
+{
+    if (!lhs || !rhs || !out || count <= 0) return;
+    for (int i = 0; i < count; ++i) {
+        out[i].r = lhs[i].r - rhs[i].r;
+        out[i].i = lhs[i].i - rhs[i].i;
+    }
+}
+
+void spatial_complex_sub_array(
+    const Complex* lhs,
+    const Complex* rhs,
+    Complex* out,
+    int count)
+{
+#if THIRD_PARTY_SPATIAL_NEON
+    int i = 0;
+    if (!lhs || !rhs || !out || count <= 0) return;
+    for (; i + 4 <= count; i += 4) {
+        float32x4x2_t a = sk__cquad_load(lhs + i);
+        float32x4x2_t b = sk__cquad_load(rhs + i);
+        float32x4x2_t value;
+        value.val[0] = vsubq_f32(a.val[0], b.val[0]);
+        value.val[1] = vsubq_f32(a.val[1], b.val[1]);
+        sk__cquad_store(out + i, value);
+    }
+    spatial_complex_sub_array_scalar(lhs + i, rhs + i, out + i, count - i);
+#else
+    spatial_complex_sub_array_scalar(lhs, rhs, out, count);
+#endif
+}
+
+static void spatial_gsc_effective_weights_scalar_range(
+    const Complex* const* steering,
+    const Complex* const* adaptive_weights,
+    int channels,
+    int bins,
+    int first,
+    Complex* out)
+{
+    for (int f = first; f < bins; ++f) {
+        float denom = 0.0f;
+        float beta_r = 0.0f;
+        float beta_i = 0.0f;
+        for (int m = 0; m < channels; ++m) {
+            float wr = adaptive_weights[m][f].r;
+            float wi = adaptive_weights[m][f].i;
+            float ar = steering[m][f].r;
+            float ai = steering[m][f].i;
+            beta_r += wr * ar + wi * ai;
+            beta_i += wr * ai - wi * ar;
+            denom += ar * ar + ai * ai;
+        }
+        if (denom < 1e-12f) denom = 1e-12f;
+        beta_r /= denom;
+        beta_i /= denom;
+        for (int m = 0; m < channels; ++m) {
+            float wr = adaptive_weights[m][f].r;
+            float wi = adaptive_weights[m][f].i;
+            float ar = steering[m][f].r;
+            float ai = steering[m][f].i;
+            Complex* weight = out + (size_t)m * (size_t)bins + (size_t)f;
+            weight->r = ar / (float)channels +
+                        (beta_r * ar + beta_i * ai) - wr;
+            weight->i = -ai / (float)channels +
+                        (-beta_r * ai + beta_i * ar) + wi;
+        }
+    }
+}
+
+void spatial_gsc_effective_weights_scalar(
+    const Complex* const* steering,
+    const Complex* const* adaptive_weights,
+    int channels,
+    int bins,
+    Complex* out)
+{
+    if (!steering || !adaptive_weights || !out || channels <= 0 || bins <= 0)
+        return;
+    spatial_gsc_effective_weights_scalar_range(
+        steering, adaptive_weights, channels, bins, 0, out);
+}
+
+void spatial_gsc_effective_weights(
+    const Complex* const* steering,
+    const Complex* const* adaptive_weights,
+    int channels,
+    int bins,
+    Complex* out)
+{
+#if THIRD_PARTY_SPATIAL_NEON
+    int f = 0;
+    const float32x4_t floor_value = vdupq_n_f32(1e-12f);
+    const float32x4_t channels_v = vdupq_n_f32((float)channels);
+    if (!steering || !adaptive_weights || !out || channels <= 0 || bins <= 0)
+        return;
+    for (; f + 4 <= bins; f += 4) {
+        float32x4_t denom = vdupq_n_f32(0.0f);
+        float32x4_t beta_r = vdupq_n_f32(0.0f);
+        float32x4_t beta_i = vdupq_n_f32(0.0f);
+        for (int m = 0; m < channels; ++m) {
+            float32x4x2_t w = sk__cquad_load(adaptive_weights[m] + f);
+            float32x4x2_t a = sk__cquad_load(steering[m] + f);
+            beta_r = vaddq_f32(
+                beta_r,
+                vaddq_f32(vmulq_f32(w.val[0], a.val[0]),
+                           vmulq_f32(w.val[1], a.val[1])));
+            beta_i = vaddq_f32(
+                beta_i,
+                vsubq_f32(vmulq_f32(w.val[0], a.val[1]),
+                           vmulq_f32(w.val[1], a.val[0])));
+            denom = vaddq_f32(
+                denom,
+                vaddq_f32(vmulq_f32(a.val[0], a.val[0]),
+                           vmulq_f32(a.val[1], a.val[1])));
+        }
+        denom = vbslq_f32(vcltq_f32(denom, floor_value),
+                           floor_value, denom);
+        beta_r = vdivq_f32(beta_r, denom);
+        beta_i = vdivq_f32(beta_i, denom);
+        for (int m = 0; m < channels; ++m) {
+            float32x4x2_t w = sk__cquad_load(adaptive_weights[m] + f);
+            float32x4x2_t a = sk__cquad_load(steering[m] + f);
+            float32x4x2_t value;
+            value.val[0] = vsubq_f32(
+                vaddq_f32(
+                    vdivq_f32(a.val[0], channels_v),
+                    vaddq_f32(vmulq_f32(beta_r, a.val[0]),
+                               vmulq_f32(beta_i, a.val[1]))),
+                w.val[0]);
+            value.val[1] = vaddq_f32(
+                vaddq_f32(
+                    vdivq_f32(vnegq_f32(a.val[1]), channels_v),
+                    vaddq_f32(vmulq_f32(vnegq_f32(beta_r), a.val[1]),
+                               vmulq_f32(beta_i, a.val[0]))),
+                w.val[1]);
+            sk__cquad_store(
+                out + (size_t)m * (size_t)bins + (size_t)f, value);
+        }
+    }
+    spatial_gsc_effective_weights_scalar_range(
+        steering, adaptive_weights, channels, bins, f, out);
+#else
+    spatial_gsc_effective_weights_scalar(
+        steering, adaptive_weights, channels, bins, out);
+#endif
+}
+
 void spatial_pair_score_accumulate_scalar(
     const Complex* phat,
     const Complex* steering,

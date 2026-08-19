@@ -126,6 +126,71 @@ static int test_beamform_and_score_scalar_vs_dispatch(void) {
     return 1;
 }
 
+static int test_gsc_vector_kernels_scalar_vs_dispatch(void) {
+    enum { M = 4, F = 259 };
+    Complex a_storage[M][F];
+    Complex x_storage[M][F];
+    Complex wa_storage[M][F];
+    const Complex* a[M];
+    const Complex* x[M];
+    const Complex* wa[M];
+    Complex das[F];
+    Complex rhs[F];
+    Complex projection_scalar[M][F];
+    Complex projection_dispatch[M][F];
+    Complex weights_scalar[M][F];
+    Complex weights_dispatch[M][F];
+    Complex sub_scalar[F];
+    Complex sub_dispatch[F];
+
+    for (int m = 0; m < M; ++m) {
+        a[m] = a_storage[m];
+        x[m] = x_storage[m];
+        wa[m] = wa_storage[m];
+        for (int f = 0; f < F; ++f) {
+            a_storage[m][f].r = random_signed();
+            a_storage[m][f].i = random_signed();
+            x_storage[m][f].r = random_signed();
+            x_storage[m][f].i = random_signed();
+            wa_storage[m][f].r = random_signed();
+            wa_storage[m][f].i = random_signed();
+        }
+        /* Exercise the denominator floor in both the vector body and the
+         * scalar tail, not only the ordinary non-zero steering path. */
+        a_storage[m][0].r = 0.0f;
+        a_storage[m][0].i = 0.0f;
+        a_storage[m][F - 1].r = 0.0f;
+        a_storage[m][F - 1].i = 0.0f;
+    }
+    spatial_conj_beamform(a, x, M, F, 1.0f / (float)M, das);
+    for (int f = 0; f < F; ++f) {
+        rhs[f].r = random_signed();
+        rhs[f].i = random_signed();
+    }
+
+    spatial_gsc_projection_scalar(
+        a, x, das, M, F, &projection_scalar[0][0]);
+    spatial_gsc_projection(
+        a, x, das, M, F, &projection_dispatch[0][0]);
+    CHECK(memcmp(projection_scalar, projection_dispatch,
+                 sizeof(projection_scalar)) == 0,
+          "GSC projection dispatch must be bit-identical to scalar");
+
+    spatial_gsc_effective_weights_scalar(
+        a, wa, M, F, &weights_scalar[0][0]);
+    spatial_gsc_effective_weights(
+        a, wa, M, F, &weights_dispatch[0][0]);
+    CHECK(memcmp(weights_scalar, weights_dispatch,
+                 sizeof(weights_scalar)) == 0,
+          "GSC effective-weight dispatch must be bit-identical to scalar");
+
+    spatial_complex_sub_array_scalar(das, rhs, sub_scalar, F);
+    spatial_complex_sub_array(das, rhs, sub_dispatch, F);
+    CHECK(memcmp(sub_scalar, sub_dispatch, sizeof(sub_scalar)) == 0,
+          "complex subtract dispatch must be bit-identical to scalar");
+    return 1;
+}
+
 static int test_srp_precompute_equivalence(void) {
     SRP_Config cfg;
     ArrayGeometry* geometry;
@@ -1181,6 +1246,8 @@ int main(void) {
     CHECK(test_phat_scalar_vs_dispatch(), "PHAT SIMD test");
     CHECK(test_beamform_and_score_scalar_vs_dispatch(),
           "beamform/SRP-score SIMD test");
+    CHECK(test_gsc_vector_kernels_scalar_vs_dispatch(),
+          "GSC vector-kernel SIMD test");
     CHECK(test_srp_precompute_equivalence(), "SRP optimization test");
     CHECK(test_srp_init_pool_poison_and_bounds(),
           "SRP pool-first poison/bounds test");

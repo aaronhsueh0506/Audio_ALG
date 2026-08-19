@@ -491,6 +491,30 @@ int four_aec_nr_res_process_post(
     float* out);
 
 /**
+ * Resume one pre frame using a mono error spectrum already produced by the
+ * same external beamformer invocation as `weights`.
+ *
+ * This is the zero-reconstruction form of process_post(): beamformed_error is
+ * Complex[n_freqs] and must equal the weighted sum represented by the supplied
+ * channel-major Complex[4][n_freqs] weights for this pending frame. Both
+ * arrays are checked for finite values, but their semantic equality cannot be
+ * inferred from samples alone and is therefore a caller contract. Use this
+ * entry point when one atomic beamformer API returns both objects (the bundled
+ * gsc_process_with_weights() does); otherwise use process_post(), which
+ * reconstructs the mono error from weights and cannot accept a mismatched
+ * spectrum. The remaining near/R2/comfort projections and the mono
+ * NR/RES/IFFT/OLA path are identical between the two entry points.
+ *
+ * Return codes and token-consumption rules are identical to process_post().
+ */
+int four_aec_nr_res_process_post_trusted_spectrum(
+    FourAecNrRes* p,
+    const FourAecNrResFrameToken* token,
+    const Complex* weights,
+    const Complex* beamformed_error,
+    float* out);
+
+/**
  * Release one pending pre frame WITHOUT running this module's post-beam
  * RES/NR/synthesis path. Companion to process_pre() for pipeline variants
  * whose post stage is external (e.g. the Align-ULCNet neural post-filter

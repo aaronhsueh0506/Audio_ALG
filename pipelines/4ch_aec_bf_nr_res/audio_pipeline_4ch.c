@@ -24,7 +24,6 @@
 #include <stdint.h>
 
 #include "audio_pipeline_4ch.h"
-#include "4aec_nr_res_internal.h"
 #include "gsc.h"
 #include "srp.h"
 #include "spatial_simd.h"

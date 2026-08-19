@@ -79,13 +79,15 @@ The external beamformer must expose its effective complex weights with shape
 STFT frames and can be consumed directly without four duplicate FFTs.
 `linear_interleaved` contains the exact selected/crossfaded time-domain hops
 underlying those spectra for integrations whose beamformer owns its four
-analysis FFTs. The Python reference also accepts the external mono hop. The C
-core API synthesizes the mono spectrum internally from the supplied weights,
-so independently supplied output samples and context cannot come from
-different beamformer states. The complete C wrapper can safely skip that one
-reconstruction because `gsc_process_with_weights()` produces its mono spectrum
-and effective weights atomically in the same call; the internal-only trusted
-seam is not exposed to external beamformers. The far-end spectrum remains the
+analysis FFTs. The Python reference also accepts the external mono hop. The
+default C post entry synthesizes the mono spectrum internally from the supplied
+weights, so independently supplied output samples and context cannot come from
+different beamformer states. A beamformer that atomically returns both its
+mono spectrum and effective weights may instead call
+`four_aec_nr_res_process_post_trusted_spectrum()` and skip that duplicate
+weighted sum; both arrays are validated for finiteness, while their coherence
+remains an explicit caller contract. The bundled complete wrapper uses this
+form with `gsc_process_with_weights()`. The far-end spectrum remains the
 one shared digital render reference—it is verified equal across lanes and is
 not spatially weighted. The result passes through one mono NR+RES path without
 a fifth AEC or replicated post-filters. When `pre.delay.changed` is non-zero, an
@@ -104,9 +106,9 @@ The deployable C seam is:
   MMSE-LSA instance, and one final iFFT/OLA;
 - [`4aec_projection_kernels.h`](4aec_projection_kernels.h): byte-equivalent
   scalar/NEON complex projection, residual-vector, and comfort-noise kernels;
-- [`4aec_nr_res_internal.h`](4aec_nr_res_internal.h): internal-only trusted
-  GSC-spectrum continuation used by the complete wrapper, not a public
-  external-beamformer API;
+- [`4aec_nr_res_internal.h`](4aec_nr_res_internal.h): private delay-admission
+  helpers; processing entry points, including the atomic trusted-spectrum
+  continuation, are declared by the public `4aec_nr_res.h` API;
 - [`4aec_nr_res_static.c`](4aec_nr_res_static.c): caller-owned-pool example
   following the same query → allocate → `init` → process → destroy →
   release sequence as the mono `mono_aec_nr_res/static_main.c`;

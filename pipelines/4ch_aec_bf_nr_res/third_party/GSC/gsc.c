@@ -497,26 +497,10 @@ void gsc_process_with_weights(GSC* g,
      * This avoids explicitly building B[f][M][M] and reduces the
      * blocking-output calculation from O(F*M*M) to O(F*M).
      */
-    for (int f = 0; f < g->F; f++) {
-        float denom = 0.0f;
-
-        for (int m = 0; m < g->M; m++) {
-            denom += a[m][f].r * a[m][f].r + a[m][f].i * a[m][f].i;
-        }
-
-        if (denom < 1e-12f) {
-            denom = 1e-12f;
-        }
-
-        Complex proj;
-        proj.r = das[f].r * ((float)g->M / denom);
-        proj.i = das[f].i * ((float)g->M / denom);
-
-        for (int m = 0; m < g->M; m++) {
-            Complex aproj = spatial_complex_mul(a[m][f], proj);
-            u[m][f] = spatial_complex_sub(X[m][f], aproj);
-        }
-    }
+    spatial_gsc_projection(
+        (const Complex* const*)a,
+        (const Complex* const*)X,
+        das, g->M, g->F, &u[0][0]);
 
 #else
 
@@ -573,10 +557,8 @@ void gsc_process_with_weights(GSC* g,
     }
 
     /* ---------- gsc = das - wu ---------- */
-    for (int f = 0; f < g->F; f++) {
-        gsc_spec[f] = spatial_complex_sub(das[f], wu[f]);
-        gsc_out[f] = gsc_spec[f];
-    }
+    spatial_complex_sub_array(das, wu, gsc_spec, g->F);
+    memcpy(gsc_out, gsc_spec, (size_t)g->F * sizeof(Complex));
 
     /*
      * Export the response represented by the CURRENT wa, before the RLS
@@ -585,27 +567,10 @@ void gsc_process_with_weights(GSC* g,
      * y = a^H x/M - wa^H (x - a(a^H x)/denom)
      */
     if (effective_weights) {
-        for (int f = 0; f < g->F; ++f) {
-            float denom = 0.0f;
-            Complex beta = {0.0f, 0.0f};
-            for (int m = 0; m < g->M; ++m) {
-                Complex wa_h_a =
-                    spatial_complex_mul(spatial_complex_conj(g->wa[m][f]), a[m][f]);
-                beta = spatial_complex_add(beta, wa_h_a);
-                denom += a[m][f].r * a[m][f].r +
-                         a[m][f].i * a[m][f].i;
-            }
-            if (denom < 1e-12f) denom = 1e-12f;
-            beta = spatial_complex_div_real(beta, denom);
-            for (int m = 0; m < g->M; ++m) {
-                Complex a_h = spatial_complex_conj(a[m][f]);
-                Complex weight =
-                    spatial_complex_add(spatial_complex_div_real(a_h, (float)g->M),
-                          spatial_complex_mul(beta, a_h));
-                weight = spatial_complex_sub(weight, spatial_complex_conj(g->wa[m][f]));
-                effective_weights[m * g->F + f] = weight;
-            }
-        }
+        spatial_gsc_effective_weights(
+            (const Complex* const*)a,
+            (const Complex* const*)g->wa,
+            g->M, g->F, effective_weights);
     }
 
     /*

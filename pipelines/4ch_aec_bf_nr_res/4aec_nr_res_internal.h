@@ -1,23 +1,12 @@
 /**
- * Internal seams. Two kinds live here: the trusted-spectrum post entry
- * shared only by the complete SRP/GSC wrapper and its tests, and the
- * core-internal delay-admission state machine (exposed non-static so the
- * core's own tests can drive TTL expiry directly).
- * Public external beamformers must use four_aec_nr_res_process_post(), which
- * reconstructs the mono error from the supplied weights and therefore does
- * not trust a second independently supplied spectrum.
+ * Internal delay-admission state machine, exposed non-static so the core's
+ * own tests can drive TTL expiry directly. Public processing entry points,
+ * including the atomic spectrum+weights post seam, live in 4aec_nr_res.h.
  */
 #ifndef FOUR_AEC_NR_RES_INTERNAL_H
 #define FOUR_AEC_NR_RES_INTERNAL_H
 
 #include "4aec_nr_res.h"
-
-int four_aec_nr_res_process_post_trusted_spectrum(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token,
-    const Complex* weights,
-    const Complex* beamformed_error,
-    float* out);
 
 /* ============================================================================
  * Shared-delay change admission (lib/aec Path-B mirror)
