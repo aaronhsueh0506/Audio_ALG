@@ -23,9 +23,17 @@ NPZ calibration:
 import argparse
 import configparser
 import os
+import sys
 import numpy as np
 import torch
 import torch.nn as nn
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
+if _AUDIO_ALG_ROOT not in sys.path:
+    sys.path.insert(0, _AUDIO_ALG_ROOT)
+
+from onnx_streaming_contract import validate_nctf_no_temporal_padding
 
 try:
     from .train import (
@@ -42,6 +50,26 @@ except ImportError:  # direct ``python export_onnx.py`` execution
         RNNoiseModel, read_feature_config,
         require_checkpoint_feature_config, model_capacity_from_checkpoint,
     )
+
+
+def validate_streaming_temporal_kernels(model):
+    """The host supplies all three frames; temporal Conv1d must be valid.
+
+    The optional two kernel-5 convolutions operate across frequency after
+    flattening ``B*T`` and may retain ``padding=2``.  Only ``erb_conv`` and
+    ``spec_temporal`` operate across the three-frame time window.
+    """
+    temporal = [('erb_conv', model.erb_conv)]
+    if model.use_complex_input:
+        temporal.append(('spec_temporal', model.spec_temporal))
+    for name, convolution in temporal:
+        if tuple(convolution.kernel_size) != (3,):
+            raise RuntimeError('%s no longer consumes the 3-frame window' % name)
+        if tuple(convolution.padding) != (0,):
+            raise RuntimeError(
+                '%s pads time inside the streaming graph: %s' %
+                (name, tuple(convolution.padding))
+            )
 
 
 # 與 process.h 的 RNNOISE_MODEL_IO_LAYOUT_VERSION 保持數值相同 — 該巨集宣告
@@ -132,6 +160,8 @@ def build_metadata(feature_cfg, n_bands, gru_size, use_complex_input=False):
         'state_layout_version': str(STATE_LAYOUT_VERSION),
         'input_feature_frames': '3',
         'output_frames_per_invocation': '1',
+        'temporal_padding_inside_graph': 'false',
+        'temporal_context': 'host_supplied_3_frame_window_plus_gru_state',
         'accelerator_persistent_state': 'false',
         'recurrent_state': 'h1_h2_h3_explicit_input_output',
         'host_updates_feature_window': 'true',
@@ -212,6 +242,7 @@ def export(args):
     model = RNNoiseModel(spec_bins=feature_cfg['spec_bins'], **capacity)
     model.load_state_dict(sd)
     model.eval()
+    validate_streaming_temporal_kernels(model)
     gru_size = model.gru_size
     print(f"Model: n_bands={N_BANDS}, spec_bins={feature_cfg['spec_bins']}, "
           f"cond_size={capacity['cond_size']}, gru_size={gru_size}, "
@@ -245,6 +276,7 @@ def export(args):
     # 3) shape inference
     m = onnx.load(args.output)
     m = onnx.shape_inference.infer_shapes(m)
+    validate_nctf_no_temporal_padding(m, require_static=args.verify)
     onnx.helper.set_model_props(m, build_metadata(
         feature_cfg, N_BANDS, gru_size, model.use_complex_input
     ))

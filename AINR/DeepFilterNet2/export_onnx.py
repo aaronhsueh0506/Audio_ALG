@@ -34,6 +34,12 @@ from torch import nn
 import torch.nn.functional as F
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
+if _AUDIO_ALG_ROOT not in sys.path:
+    sys.path.insert(0, _AUDIO_ALG_ROOT)
+
+from onnx_streaming_contract import validate_nctf_no_temporal_padding
+
 INPUT_FRAMES = 3
 
 # Kept numerically equal to DFN2_MODEL_IO_LAYOUT_VERSION in dfn2_model_io.h,
@@ -366,6 +372,8 @@ def build_metadata(checkpoint_path, params, inputs, outputs):
         'input_feature_frames': INPUT_FRAMES,
         'output_frames_per_invocation': 1,
         'input_window_alignment': '[t-1,t,t+1] -> heads[t]',
+        'temporal_padding_inside_graph': False,
+        'frequency_padding_inside_graph': True,
         'accelerator_persistent_state': False,
         'host_updates_feature_window': True,
         'state_handoff': {
@@ -405,6 +413,7 @@ def export_graph(wrapper, params, checkpoint_path, output_path,
     import onnx
     graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
     onnx.checker.check_model(graph)
+    validate_nctf_no_temporal_padding(graph, require_static=verify)
     metadata = build_metadata(checkpoint_path, params, inputs, outputs)
     set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, OUTPUT_NAMES, outputs)

@@ -89,6 +89,8 @@ _AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
 
+from onnx_streaming_contract import validate_nctf_no_temporal_padding
+
 from AIAEC.Align_ULCNet.inference import load_model
 from AIAEC.training_common import (
     checkpoint_far_input_mode,
@@ -513,6 +515,8 @@ def _write_metadata(
         'win_len': model.grid.win_len,
         'hop_len': model.grid.hop_len,
         'frames_per_invocation': 1,
+        'temporal_padding_inside_graph': False,
+        'temporal_context': 'explicit_kv_logit_and_gru_state',
         'max_delay_frames': model.max_delay_frames,
         'training_far_input_mode': training_far_input_mode,
         'far_input_mode': deployed_far_input_mode,
@@ -618,6 +622,7 @@ def export_graph(model, checkpoint_path, output_path, opset=17, verify=False):
     import onnx
     graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
     onnx.checker.check_model(graph)
+    validate_nctf_no_temporal_padding(graph, require_static=verify)
     checkpoint_data = torch.load(
         checkpoint_path, map_location='cpu', weights_only=False
     )

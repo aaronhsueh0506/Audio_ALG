@@ -24,6 +24,11 @@ import numpy as np
 import torch
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
+if _AUDIO_ALG_ROOT not in sys.path:
+    sys.path.insert(0, _AUDIO_ALG_ROOT)
+
+from onnx_streaming_contract import validate_nctf_no_temporal_padding
 
 # Relative imports FIRST: when this module is loaded package-qualified
 # (``import AINR.GTCRN.export_onnx`` from a quantization script) the flat
@@ -237,6 +242,8 @@ def build_metadata(checkpoint_path, grid, inputs, outputs):
         'c_prepost': 'gtcrn_process.c/gtcrn_process.h',
         'input_feature_frames': 1,
         'output_frames_per_invocation': 1,
+        'temporal_padding_inside_graph': False,
+        'temporal_context': 'explicit_conv_cache_and_gru_state',
         'accelerator_persistent_state': False,
         'recurrent_state': 'conv_cache_plus_per_gru_h_explicit_input_output',
         'state_handoff': dict(zip(INPUT_NAMES[3:], OUTPUT_NAMES[1:])),
@@ -270,6 +277,7 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
     graph = onnx.load(output_path)
     onnx.checker.check_model(graph)
     graph = onnx.shape_inference.infer_shapes(graph)
+    validate_nctf_no_temporal_padding(graph, require_static=verify)
     metadata = build_metadata(checkpoint_path, grid, inputs, outputs)
     set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, OUTPUT_NAMES, outputs)

@@ -36,6 +36,7 @@ from AIAEC.aiaec_streaming import (
     StreamModuleCell,
 )
 from AIAEC.aiaec_common import fit_frequency
+from onnx_streaming_contract import validate_nctf_no_temporal_padding
 from AIAEC.CAGCRN.model import (
     _stream_cata,
     _stream_decoder_block,
@@ -570,6 +571,7 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
     import onnx
     graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
     onnx.checker.check_model(graph)
+    validate_nctf_no_temporal_padding(graph, require_static=verify)
     metadata = {
         'model_family': model_name,
         'checkpoint_sha256': file_sha256(checkpoint_path),
@@ -580,6 +582,8 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
         'hop_len': int(grid.hop_len),
         'input_feature_frames': 1,
         'output_frames_per_invocation': 1,
+        'temporal_padding_inside_graph': False,
+        'temporal_context': 'explicit_state_inputs_outputs',
         'accelerator_persistent_state': False,
         'c_prepost': _C_BOUNDARIES[model_name],
         'learned_control_semantics': _CONTROL_SEMANTICS[model_name],
