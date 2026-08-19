@@ -36,7 +36,8 @@ th{background:#eef1f5}
 
 <h2>概要</h2>
 <p>超輕量 16 kHz 降噪模型(ShuffleNetV2 conv + SFE + TRA + 2×DPGRNN,
-輸出 complex ratio mask)。model layout v5 起固定前後端全部搬到 host:
+輸出 complex ratio mask)。model layout v5 起固定前後端全部搬到 host；v6
+把 packed recurrent state 拆成每個 block/GRU 各自的 graph I/O:
 C 端 <code>gtcrn_process.c</code> 負責串流 STFT/WOLA 之外,還以
 <code>gtcrn_model_input</code>(magnitude＋ERB 前向矩陣 <code>erb_fwd.bin</code>)
 產生 <code>mag/real/imag</code> 三個 <code>(1,129,1)</code> 獨立輸入(各自量化
@@ -60,8 +61,10 @@ vendored 於 <code>AINR/gtcrn_github/</code>。</p>
 <h2>API 用法</h2>
 <pre>#include "GTCRN/gtcrn_process.h"
 
-GTCRNProcessState st;               /* 10,240 bytes, 呼叫端配置 */
-gtcrn_process_init(&amp;st);
+GTCRNProcessState st;               /* 10,256 bytes, 呼叫端配置 */
+FftHandle *fft = fft_init(caller_fft_pool, caller_fft_pool_bytes,
+                          GTCRN_N_FFT);
+gtcrn_process_init(&amp;st, fft);       /* state 只借用 caller-owned handle */
 
 float spec[GTCRN_N_BINS][2];        /* bin-major [re, im] */
 float mag[GTCRN_MODEL_ERB_BANDS], re_b[GTCRN_MODEL_ERB_BANDS],
@@ -99,7 +102,7 @@ spec [257][2]  ------------------------------------------+
    |                                                     |
    v  (以下在模型圖內, stream_model.StreamGTCRN)         |
    concat 3x(1,129,1) -> (B,3,T,129)                     |
-   SFE(k=3): unfold -> (B,9,T,129)                       |
+   SFE(k=3): fixed grouped Conv -> (B,9,T,129)           |
    Encoder: ConvBlock x2 (freq stride 2,2)               |
             + GTConvBlock x3 (dilation 1/2/5, causal)    |
    DPGRNN x2 (intra: 雙向沿頻率; inter: 單向沿時間)      |
@@ -156,7 +159,9 @@ v5 邊界只描述部署用 stream graph。</p>
 graph；cache 尺寸由
 <code>stream_model.initial_inputs(model)</code> 從 module tree 推導（不寫死 grid：
 spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder stride），
-conv_cache 與八顆 h_* state 都由 host 作為 graph input/output 送回，加速器本身不保存跨次呼叫狀態。
+六個 conv history、六個 TRA hidden 與四個 DPGRNN hidden 都由 host 作為
+graph input/output 送回，加速器本身不保存跨次呼叫狀態。v6 把 v5 的 packed
+state 拆開，總 bytes 不變，但 graph 不再為 state 執行 Slice/Gather/Concat。
 匯出不再 pin 單一 grid——config 與 checkpoint 不成對時在 strict
 <code>load_state_dict</code>（形狀）或 checkpoint contract（同形語意）就大聲失敗。
 v5 起固定前後端全在 host：<code>gtcrn_model_input</code>（magnitude＋ERB 前向矩陣）
@@ -173,20 +178,24 @@ shape）；<b>C 只吃呼叫端載入的指標</b>，loader 擁有檔案、可�
 <tr><td><code>analysis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct <code>GTCRNProcessState</code></td><td>分析滑窗</td></tr>
 <tr><td><code>synthesis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>OLA(有效 256)</td></tr>
 <tr><td><code>window</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>root-Hann,init 後不變</td></tr>
-<tr><td><code>scratch_re/im</code></td><td>[512] ×2</td><td>4,096</td><td>C struct</td><td>非跨呼叫</td></tr>
-<tr><td><code>conv_cache</code></td><td>(2,16,16,33)</td><td>67,584(16,896 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder+decoder depth-conv 時間快取</td></tr>
+<tr><td><code>scratch_time</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>FFT 時域 scratch，非跨呼叫</td></tr>
+<tr><td><code>scratch_freq</code></td><td>[257] complex</td><td>2,056</td><td>C struct</td><td>FFT 頻域 scratch，非跨呼叫</td></tr>
+<tr><td><code>fft</code></td><td>pointer</td><td>8</td><td>host caller</td><td>借用的 caller-owned <code>FftHandle</code></td></tr>
+<tr><td><code>conv_enc0/1/2</code></td><td>(1,16,2/4/10,33)</td><td>33,792(8,448 f32)</td><td>host caller</td><td>三個 encoder depth-conv 時間快取</td></tr>
+<tr><td><code>conv_dec0/1/2</code></td><td>(1,16,10/4/2,33)</td><td>33,792(8,448 f32)</td><td>host caller</td><td>三個 decoder depth-conv 時間快取</td></tr>
 <tr><td><code>h_tra_enc0</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 0 個)</td></tr>
 <tr><td><code>h_tra_enc1</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 1 個)</td></tr>
 <tr><td><code>h_tra_enc2</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 2 個)</td></tr>
 <tr><td><code>h_tra_dec0</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；decoder TRA <code>att_gru</code> hidden(第 0 個)</td></tr>
 <tr><td><code>h_tra_dec1</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；decoder TRA <code>att_gru</code> hidden(第 1 個)</td></tr>
 <tr><td><code>h_tra_dec2</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；decoder TRA <code>att_gru</code> hidden(第 2 個);6 個 <code>h_tra_*</code> 合計 384 bytes(96 f32)</td></tr>
-<tr><td><code>h_dpgrnn1</code></td><td>(1,33,16)</td><td>2,112(528 f32)</td><td>host caller</td><td>顯式 graph I/O；DPGRNN inter hidden(層 1)</td></tr>
-<tr><td><code>h_dpgrnn2</code></td><td>(1,33,16)</td><td>2,112(528 f32)</td><td>host caller</td><td>顯式 graph I/O；DPGRNN inter hidden(層 2);2 個 <code>h_dpgrnn*</code> 合計 4,224 bytes(1,056 f32)</td></tr>
+<tr><td><code>h_dpgrnn1_0/1</code></td><td>各 (1,33,8)</td><td>2,112(528 f32)</td><td>host caller</td><td>第一個 grouped inter-RNN 的兩顆 GRU hidden</td></tr>
+<tr><td><code>h_dpgrnn2_0/1</code></td><td>各 (1,33,8)</td><td>2,112(528 f32)</td><td>host caller</td><td>第二個 grouped inter-RNN 的兩顆 GRU hidden；四個合計 4,224 bytes</td></tr>
 </table></div>
-<p class="note"><code>sizeof(GTCRNProcessState)</code> = 10,240 bytes(本機量測)。
+<p class="note"><code>sizeof(GTCRNProcessState)</code> = 10,256 bytes(64-bit 本機量測)。
 本目錄 <code>model.py</code> 無 cache 介面;上表 NPU 狀態 shape 逐一取自
-<code>gtcrn_stream.py</code> 的 docstring 與 forward 切片(<code>conv_cache[:,:,:2]/[2:6]/[6:16]</code>)。</p>
+<code>stream_model.initial_inputs()</code> 與匯出 graph schema；
+<code>sizeof(GTCRNModelState)</code> = 72,192 bytes，與 v5 相同。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>
@@ -208,6 +217,8 @@ context(cache 大小即由此而來),加上 RNN 無限記憶。</li>
 <li>文件:<a href="../../AINR/GTCRN/README.md">README.md</a>、<a href="../../AINR/GTCRN/docs/architecture_notes.md">docs/architecture_notes.md</a></li>
 <li>上游 vendored 參考:<code>AINR/gtcrn_github/</code>(offline <code>gtcrn.py</code>、串流 <code>stream/gtcrn_stream.py</code>、論文 PDF)</li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_gtcrn()</code>:回路穩態 unity,誤差門檻 2e-4)—
-<code>make -C AINR test-simd</code> 實測 NEON/scalar digest 皆 <code>124b768ec938af7d</code></li>
-<li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code> — 實測 4 passed(metadata 內容、<code>state_layout_version</code> 對 <code>GTCRN_MODEL_LAYOUT_VERSION</code> 互鎖、calibration frame shape 對 ONNX graph input 互鎖、config-driven grid＋錯 grid checkpoint 於 <code>load_state_dict</code> 大聲失敗);共用測試 <code>AINR/tests/</code>(pytest)— 實測 30 passed,含 stream-vs-offline 等價在 512 與 256 兩個 grid＋cache 錯位 must-fail(<code>pytest AINR</code> 全樹 = 204)</li>
+<code>make -C AINR test-simd</code> 驗證 scalar/NEON 路徑</li>
+<li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code> —
+驗證 metadata/layout 互鎖、calibration/ONNX shape、兩組 grid 的
+stream-vs-offline 等價，以及部署 graph 不含 Gather 且維持 operator budget。</li>
 </ul>

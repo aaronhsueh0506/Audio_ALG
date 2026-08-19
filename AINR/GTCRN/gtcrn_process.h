@@ -15,8 +15,8 @@ extern "C" {
 
 /* Explicit model-state tensors in export_onnx.py. The accelerator retains
  * nothing between invocations; its *_out state tensors must be committed
- * here and returned as the next call's inputs. Every GRU hidden is its own
- * h_* tensor; only the temporal conv history is a combined cache. */
+ * here and returned as the next call's inputs. Every stateful GRU and every
+ * temporal-convolution block owns one graph tensor. */
 /* Version 3 dropped conv_cache's size-1 batch dim from the graph tensor
  * ([2,16,16,33] instead of [2,1,16,16,33]); the bytes in this struct are
  * unchanged, but the tensor rank is part of the binding contract. Version 4
@@ -24,32 +24,48 @@ extern "C" {
  * front/back end out: the host bands [mag, re, im] through the exported ERB
  * forward matrix and feeds THREE separate [1,GTCRN_MODEL_ERB_BANDS,1]
  * inputs (independent quantization scales); the graph returns the
- * ERB-domain complex mask and the host applies ERB inverse + CRM. */
-#define GTCRN_MODEL_LAYOUT_VERSION 5
+ * ERB-domain complex mask and the host applies ERB inverse + CRM. Version 6
+ * splits the packed convolution history and grouped DPGRNN hidden tensors
+ * into their actual block/GRU slots. Total state bytes are unchanged; graph
+ * Slice/Gather/Concat state packing is removed. */
+#define GTCRN_MODEL_LAYOUT_VERSION 6
 #define GTCRN_MODEL_ERB_KEPT       65   /* low bins passed through          */
 #define GTCRN_MODEL_ERB_HIGH_BANDS 64   /* compressed high bands            */
 #define GTCRN_MODEL_ERB_BANDS      129  /* KEPT + HIGH_BANDS = E            */
 #define GTCRN_MODEL_ERB_HIGH_BINS  192  /* N_BINS - KEPT                    */
-#define GTCRN_MODEL_CONV_SIDES     2
+#define GTCRN_MODEL_CONV_STATES    6
 #define GTCRN_MODEL_CONV_CHANNELS  16
-#define GTCRN_MODEL_CONV_TIME      16
+#define GTCRN_MODEL_CONV_TIME_0    2
+#define GTCRN_MODEL_CONV_TIME_1    4
+#define GTCRN_MODEL_CONV_TIME_2    10
 #define GTCRN_MODEL_CONV_FREQ      33
 #define GTCRN_MODEL_TRA_GRUS       6
 #define GTCRN_MODEL_TRA_HIDDEN     16
-#define GTCRN_MODEL_DPGRNN_GRUS    2
+#define GTCRN_MODEL_DPGRNN_GRUS    4
 #define GTCRN_MODEL_DPGRNN_FREQ    33
-#define GTCRN_MODEL_DPGRNN_HIDDEN  16
+#define GTCRN_MODEL_DPGRNN_HIDDEN  8
 
 typedef struct {
-    /* ONNX: conv_cache[2,16,16,33]. */
-    float conv_cache[GTCRN_MODEL_CONV_SIDES]
-                    [GTCRN_MODEL_CONV_CHANNELS]
-                    [GTCRN_MODEL_CONV_TIME]
-                    [GTCRN_MODEL_CONV_FREQ];
+    /* ONNX conv_enc0..2 then conv_dec0..2. Decoder depths reverse the
+     * encoder's [2,4,10] dilation history. The leading graph batch extent is
+     * one and therefore occupies no extra C dimension. */
+    float conv_enc0[GTCRN_MODEL_CONV_CHANNELS]
+                   [GTCRN_MODEL_CONV_TIME_0][GTCRN_MODEL_CONV_FREQ];
+    float conv_enc1[GTCRN_MODEL_CONV_CHANNELS]
+                   [GTCRN_MODEL_CONV_TIME_1][GTCRN_MODEL_CONV_FREQ];
+    float conv_enc2[GTCRN_MODEL_CONV_CHANNELS]
+                   [GTCRN_MODEL_CONV_TIME_2][GTCRN_MODEL_CONV_FREQ];
+    float conv_dec0[GTCRN_MODEL_CONV_CHANNELS]
+                   [GTCRN_MODEL_CONV_TIME_2][GTCRN_MODEL_CONV_FREQ];
+    float conv_dec1[GTCRN_MODEL_CONV_CHANNELS]
+                   [GTCRN_MODEL_CONV_TIME_1][GTCRN_MODEL_CONV_FREQ];
+    float conv_dec2[GTCRN_MODEL_CONV_CHANNELS]
+                   [GTCRN_MODEL_CONV_TIME_0][GTCRN_MODEL_CONV_FREQ];
     /* ONNX: h_tra_enc0..2 then h_tra_dec0..2, each [1,1,16]. */
     float h_tra[GTCRN_MODEL_TRA_GRUS][1][1][GTCRN_MODEL_TRA_HIDDEN];
-    /* ONNX: h_dpgrnn1..2, each [1,33,16]; this GRU batches the frequency
-     * lanes, so the middle extent is the lane count, not a batch of one. */
+    /* ONNX: h_dpgrnn1_0, h_dpgrnn1_1, h_dpgrnn2_0, h_dpgrnn2_1, each
+     * [1,33,8]. Each grouped inter-RNN contains two real GRUs; frequency
+     * lanes are their batch extent. */
     float h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS][1]
                   [GTCRN_MODEL_DPGRNN_FREQ]
                   [GTCRN_MODEL_DPGRNN_HIDDEN];
@@ -100,8 +116,9 @@ void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
 
 /* Copy the accelerator's updated state outputs into the next-call inputs.
  *
- * ``h_tra_out`` holds the six TRA GRU hiddens in graph order (encoder blocks
- * then decoder blocks) and ``h_dpgrnn_out`` the two DPGRNN hiddens.
+ * ``conv_out`` holds conv_enc0..2 then conv_dec0..2. ``h_tra_out`` holds the
+ * six TRA GRU hiddens in graph order (encoder blocks then decoder blocks),
+ * and ``h_dpgrnn_out`` the four grouped inter-GRU hiddens.
  *
  * Transactional: every element of every state tensor is checked first, and a
  * single NaN or Inf anywhere refuses the whole commit with -1, leaving the
@@ -110,7 +127,7 @@ void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
  * ignores the result keeps replaying the last good state, which is the safe
  * direction; a partial write would not be. */
 int gtcrn_model_state_commit(GTCRNModelState* state,
-                             const float* conv_cache_out,
+                             const float* const conv_out[GTCRN_MODEL_CONV_STATES],
                              const float* const h_tra_out[GTCRN_MODEL_TRA_GRUS],
                              const float* const h_dpgrnn_out[GTCRN_MODEL_DPGRNN_GRUS]);
 

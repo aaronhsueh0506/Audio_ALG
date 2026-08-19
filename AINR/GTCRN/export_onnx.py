@@ -53,20 +53,24 @@ except ImportError:
 # Kept numerically equal to GTCRN_MODEL_LAYOUT_VERSION in gtcrn_process.h,
 # which declares the caller-owned cache struct this graph consumes and emits.
 # tests/test_gtcrn_export_contract.py pins the two together.
-STATE_LAYOUT_VERSION = 5
+STATE_LAYOUT_VERSION = 6
 
-# One h_* tensor per GRU so each state slot names itself; only the temporal
-# conv history stays a combined cache. Encoder TRA GRUs first, then decoder,
-# then the two DPGRNN inter GRUs (whose hidden batches the frequency lanes).
+# One tensor per convolution history and per stateful GRU, so the graph never
+# slices or reassembles external state. Encoder cache/TRA slots come first,
+# then decoder, then the four grouped DPGRNN inter GRUs (whose hidden batches
+# are the frequency lanes).
 # Three separate ERB-domain feature inputs so the positive magnitude and the
 # signed real/imag keep independent quantization scales; the graph
 # concatenates them and carries learned compute only (the fixed front/back
 # ends -- magnitude, ERB forward/inverse, CRM -- run on the host).
 INPUT_NAMES = (
-    'mag', 'real', 'imag', 'conv_cache',
+    'mag', 'real', 'imag',
+    'conv_enc0', 'conv_enc1', 'conv_enc2',
+    'conv_dec0', 'conv_dec1', 'conv_dec2',
     'h_tra_enc0', 'h_tra_enc1', 'h_tra_enc2',
     'h_tra_dec0', 'h_tra_dec1', 'h_tra_dec2',
-    'h_dpgrnn1', 'h_dpgrnn2',
+    'h_dpgrnn1_0', 'h_dpgrnn1_1',
+    'h_dpgrnn2_0', 'h_dpgrnn2_1',
 )
 
 OUTPUT_NAMES = ('output',) + tuple(
@@ -238,14 +242,14 @@ def build_metadata(checkpoint_path, grid, inputs, outputs):
         'checkpoint_sha256': file_sha256(checkpoint_path),
         'sample_rate': grid['sr'], 'n_fft': grid['n_fft'],
         'win_len': grid['win_len'], 'hop_len': grid['hop_len'],
-        'erb_boundary': 'inside_graph',
+        'erb_boundary': 'host_prepost',
         'c_prepost': 'gtcrn_process.c/gtcrn_process.h',
         'input_feature_frames': 1,
         'output_frames_per_invocation': 1,
         'temporal_padding_inside_graph': False,
-        'temporal_context': 'explicit_conv_cache_and_gru_state',
+        'temporal_context': 'block_local_conv_cache_and_per_gru_state',
         'accelerator_persistent_state': False,
-        'recurrent_state': 'conv_cache_plus_per_gru_h_explicit_input_output',
+        'recurrent_state': 'per_block_conv_plus_per_gru_explicit_input_output',
         'state_handoff': dict(zip(INPUT_NAMES[3:], OUTPUT_NAMES[1:])),
         'input_schema': _schema(INPUT_NAMES, inputs),
         'output_schema': _schema(OUTPUT_NAMES, outputs),

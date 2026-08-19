@@ -44,10 +44,13 @@ def test_stream_wrapper_matches_offline_random_weights(nfft, bins):
         offline = model(spectrum)
     online, state = _run_stream(model, spectrum)
     assert (offline - online).abs().max().item() < 2e-5
-    conv, h_tra, h_dpgrnn = state[0], state[1:7], state[7:]
-    assert conv.shape == (2, 16, 16, 33)
+    conv, h_tra, h_dpgrnn = state[:6], state[6:12], state[12:]
+    assert [cache.shape for cache in conv] == [
+        (1, 16, 2, 33), (1, 16, 4, 33), (1, 16, 10, 33),
+        (1, 16, 10, 33), (1, 16, 4, 33), (1, 16, 2, 33),
+    ]
     assert [h.shape for h in h_tra] == [(1, 1, 16)] * 6
-    assert [h.shape for h in h_dpgrnn] == [(1, 33, 16)] * 2
+    assert [h.shape for h in h_dpgrnn] == [(1, 33, 8)] * 4
 
 
 def test_equivalence_gate_fails_on_a_mispositioned_cache():

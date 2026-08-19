@@ -252,7 +252,7 @@ def calibration_main():
         for name, values in captured.items()
     }
     report = {
-        'schema': 'gtcrn-stream-calibration-v1',
+        'schema': 'gtcrn-stream-calibration-v2',
         'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
         'graph': os.path.basename(onnx_path),
         'frames': int(arrays['mag'].shape[0]),

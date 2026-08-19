@@ -205,12 +205,29 @@ static int all_finite(const float* values, size_t count)
 }
 
 int gtcrn_model_state_commit(GTCRNModelState* state,
-                             const float* conv_cache_out,
+                             const float* const conv_out[GTCRN_MODEL_CONV_STATES],
                              const float* const h_tra_out[GTCRN_MODEL_TRA_GRUS],
                              const float* const h_dpgrnn_out[GTCRN_MODEL_DPGRNN_GRUS])
 {
-    if (state == NULL || conv_cache_out == NULL || h_tra_out == NULL ||
+    float* conv_dest[GTCRN_MODEL_CONV_STATES];
+    size_t conv_size[GTCRN_MODEL_CONV_STATES];
+    if (state == NULL || conv_out == NULL || h_tra_out == NULL ||
         h_dpgrnn_out == NULL) return -1;
+    conv_dest[0] = &state->conv_enc0[0][0][0];
+    conv_dest[1] = &state->conv_enc1[0][0][0];
+    conv_dest[2] = &state->conv_enc2[0][0][0];
+    conv_dest[3] = &state->conv_dec0[0][0][0];
+    conv_dest[4] = &state->conv_dec1[0][0][0];
+    conv_dest[5] = &state->conv_dec2[0][0][0];
+    conv_size[0] = sizeof(state->conv_enc0);
+    conv_size[1] = sizeof(state->conv_enc1);
+    conv_size[2] = sizeof(state->conv_enc2);
+    conv_size[3] = sizeof(state->conv_dec0);
+    conv_size[4] = sizeof(state->conv_dec1);
+    conv_size[5] = sizeof(state->conv_dec2);
+    for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
+        if (conv_out[i] == NULL) return -1;
+    }
     for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
         if (h_tra_out[i] == NULL) return -1;
     }
@@ -221,8 +238,9 @@ int gtcrn_model_state_commit(GTCRNModelState* state,
      * commit would leave the recurrent state a mix of two invocations, which
      * the next call cannot distinguish from a healthy state; refusing the
      * whole batch keeps the last good state replayable. */
-    if (!all_finite(conv_cache_out,
-                    sizeof(state->conv_cache) / sizeof(float))) return -1;
+    for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
+        if (!all_finite(conv_out[i], conv_size[i] / sizeof(float))) return -1;
+    }
     for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
         if (!all_finite(h_tra_out[i],
                         sizeof(state->h_tra[0]) / sizeof(float))) return -1;
@@ -231,7 +249,9 @@ int gtcrn_model_state_commit(GTCRNModelState* state,
         if (!all_finite(h_dpgrnn_out[i],
                         sizeof(state->h_dpgrnn[0]) / sizeof(float))) return -1;
     }
-    memcpy(state->conv_cache, conv_cache_out, sizeof(state->conv_cache));
+    for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
+        memcpy(conv_dest[i], conv_out[i], conv_size[i]);
+    }
     for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
         memcpy(state->h_tra[i], h_tra_out[i], sizeof(state->h_tra[0]));
     }

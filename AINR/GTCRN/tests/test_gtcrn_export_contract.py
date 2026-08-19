@@ -23,8 +23,12 @@ for _stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx')
     sys.modules.pop(_stale, None)
 
 
-from model import GTCRN  # noqa: E402
-from stream_model import StreamGTCRN, initial_inputs  # noqa: E402
+from model import GTCRN, SFE  # noqa: E402
+from stream_model import (  # noqa: E402
+    StreamGTCRN,
+    _FrequencyNeighborhood,
+    initial_inputs,
+)
 from export_onnx import (  # noqa: E402
     INPUT_NAMES,
     OUTPUT_NAMES,
@@ -54,6 +58,16 @@ def _stream_model():
     return StreamGTCRN(GTCRN(65, 64, nfft=512, fs=16000).eval()).eval()
 
 
+@pytest.mark.parametrize('channels', (3, 8))
+def test_grouped_conv_sfe_matches_training_unfold(channels):
+    """The deployment lowering must preserve SFE values and channel order."""
+    generator = torch.Generator().manual_seed(20260819 + channels)
+    value = torch.randn(2, channels, 3, 17, generator=generator)
+    expected = SFE()(value)
+    actual = _FrequencyNeighborhood(channels)(value)
+    assert torch.equal(actual, expected)
+
+
 def _metadata(tmp_path):
     checkpoint = tmp_path / 'ckpt.pth'
     checkpoint.write_bytes(b'not a real checkpoint, only hashed')
@@ -71,6 +85,7 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
     same builder ``main`` uses.
     """
     metadata = _metadata(tmp_path)
+    assert metadata['erb_boundary'] == 'host_prepost'
     assert metadata['state_layout_version'] == c_macro(
         'GTCRN_MODEL_LAYOUT_VERSION'
     )
@@ -88,12 +103,26 @@ def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
     metadata = _metadata(tmp_path)
     schema = metadata['input_schema']
     assert set(schema) == set(INPUT_NAMES)
-    assert schema['conv_cache'] == [
-        c_macro('GTCRN_MODEL_CONV_SIDES'),
-        c_macro('GTCRN_MODEL_CONV_CHANNELS'),
-        c_macro('GTCRN_MODEL_CONV_TIME'),
-        c_macro('GTCRN_MODEL_CONV_FREQ'),
+    conv = [name for name in INPUT_NAMES if name.startswith('conv_')]
+    assert conv == [
+        'conv_enc0', 'conv_enc1', 'conv_enc2',
+        'conv_dec0', 'conv_dec1', 'conv_dec2',
     ]
+    times = [
+        c_macro('GTCRN_MODEL_CONV_TIME_0'),
+        c_macro('GTCRN_MODEL_CONV_TIME_1'),
+        c_macro('GTCRN_MODEL_CONV_TIME_2'),
+    ]
+    for index, name in enumerate(conv[:3]):
+        assert schema[name] == [
+            1, c_macro('GTCRN_MODEL_CONV_CHANNELS'), times[index],
+            c_macro('GTCRN_MODEL_CONV_FREQ'),
+        ], name
+    for index, name in enumerate(conv[3:]):
+        assert schema[name] == [
+            1, c_macro('GTCRN_MODEL_CONV_CHANNELS'), times[2 - index],
+            c_macro('GTCRN_MODEL_CONV_FREQ'),
+        ], name
     h_tra = [name for name in INPUT_NAMES if name.startswith('h_tra_')]
     assert len(h_tra) == c_macro('GTCRN_MODEL_TRA_GRUS')
     for name in h_tra:
@@ -224,6 +253,11 @@ def test_exported_graph_declares_fully_static_io(tmp_path):
     graph_path = os.fspath(tmp_path / 'gtcrn_static.onnx')
     export_graph(stream, grid, checkpoint, graph_path)
     graph = onnx.load(graph_path)
+    op_types = [node.op_type for node in graph.graph.node]
+    assert 'Gather' not in op_types
+    # Leave optimizer-version headroom while still catching the former
+    # 323-node Unfold/packed-state graph.
+    assert len(op_types) <= 300
     for value in (list(graph.graph.input) + list(graph.graph.output)
                   + list(graph.graph.value_info)):
         for dim in value.type.tensor_type.shape.dim:

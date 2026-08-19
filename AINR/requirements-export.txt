@@ -1,3 +1,4 @@
 # Install in addition to each model's normal training/runtime dependencies.
 onnx>=1.14,<2
+onnxoptimizer>=0.3,<1
 onnxruntime>=1.16,<2

@@ -37,27 +37,31 @@ python3 export_erb_matrix.py --model output/gtcrn_best.pth \
   --output-dir output/erb --format all
 ```
 
-The ONNX I/O is `input` plus `conv_cache`, six per-GRU `h_tra_*` and two
-`h_dpgrnn*` hidden tensors, with
-the enhanced spectrum and updated caches returned each call. Calibration
-captures real pre-frame cache values rather than repeating zero state.
+The ONNX inputs are `mag`, `real`, `imag`, six block-local `conv_*` histories,
+six `h_tra_*` tensors and four per-GRU `h_dpgrnn*` tensors. The graph returns
+the ERB-domain complex mask and every updated state tensor on each call.
+Calibration captures real pre-frame state values rather than repeating zero
+state.
 Use `--format npz --output calib/gtcrn.npz` when a NumPy archive is needed.
 BIN output contains one folder per ONNX input and one numbered file per frame.
-GTCRN's ERB transform is already inside the ONNX graph; the exported ERB
-tables are for port verification only and must not be applied a second time.
-`gtcrn_process.c/.h` remains the host STFT/WOLA boundary and defines
-`GTCRNModelState` for caller-owned cache handoff. The model consumes one new
-STFT frame per invocation; GTCRN must not be padded to an artificial
-three-frame input because its full temporal context already lives in the
-explicit cache tensors.
+The deployment ONNX does not contain the fixed ERB front/back end:
+`gtcrn_model_input()` applies `erb_fwd.bin` before inference and
+`gtcrn_model_output()` applies `erb_inv.bin` plus the complex mask afterward.
+`gtcrn_process.c/.h` also owns STFT/WOLA and defines `GTCRNModelState` for
+caller-owned state handoff. The model consumes one new STFT frame per
+invocation; GTCRN must not be padded to an artificial three-frame input
+because its full temporal context already lives in the explicit state
+tensors.
 
 `gtcrn_model_state_commit()` is transactional and returns `int`. It validates
-every element of all three caches before writing any of them, so a single NaN
-or Inf anywhere refuses the whole commit with `-1` and leaves the previous
+every element of every state output before writing any of them, so a single
+NaN or Inf anywhere refuses the whole commit with `-1` and leaves the previous
 state byte-identical — the caller keeps replaying its last good state instead
 of continuing from a half-updated one, which the next invocation could not
 distinguish from a healthy state. Callers should check the return value; the
-safe fallback is to reuse the previous state or reset. The exported metadata
-carries `state_layout_version`, kept numerically equal to
+safe fallback is to reuse the previous state or reset. State layout v6 keeps
+the same 72,192 state bytes as v5 but removes graph-side cache slicing and
+packing. The exported metadata carries `state_layout_version`, kept
+numerically equal to
 `GTCRN_MODEL_LAYOUT_VERSION` in `gtcrn_process.h`, so an integrator can refuse
 a graph whose cache layout no longer matches the struct it allocated.

@@ -11,6 +11,34 @@ from torch import nn
 import torch.nn.functional as F
 
 
+class _FrequencyNeighborhood(nn.Module):
+    """Exact kernel-3 SFE lowering as one grouped convolution.
+
+    ``nn.Unfold`` exports a frequency-only neighbourhood as Pad/Gather/Gather/
+    Transpose/Reshape.  Seven copies of that pattern dominate the otherwise
+    small GTCRN graph on accelerators with per-operator launch or DMA costs.
+    A grouped one-hot convolution produces the same channel-interleaved
+    ``[left, centre, right]`` values while lowering to one supported Conv.
+    The weights are fixed buffers, not checkpoint parameters.
+    """
+
+    def __init__(self, channels, kernel_size=3):
+        super().__init__()
+        if kernel_size != 3:
+            raise ValueError('streaming GTCRN requires SFE kernel_size=3')
+        self.channels = channels
+        weight = torch.zeros(channels * kernel_size, 1, 1, kernel_size)
+        for channel in range(channels):
+            for offset in range(kernel_size):
+                weight[channel * kernel_size + offset, 0, 0, offset] = 1.0
+        self.register_buffer('weight', weight)
+
+    def forward(self, x):
+        return F.conv2d(
+            x, self.weight, padding=(0, 1), groups=self.channels
+        )
+
+
 def _encoder_pad_sizes(model):
     """Per-GT-block temporal cache extent, (kernel-1)*dilation each.
 
@@ -25,9 +53,10 @@ def _encoder_pad_sizes(model):
 def initial_inputs(model):
     """One random spectrum frame plus zero states, shaped for ``model``.
 
-    Ordered exactly like the graph I/O: ``input``, the shared ``conv_cache``,
-    one ``h_*`` tensor per GRU (the six TRA attention GRUs, encoder blocks
-    first, then the two DPGRNN inter GRUs). Every extent is read off the
+    Ordered exactly like the graph I/O: three feature inputs, six block-local
+    convolution histories, then one ``h_*`` tensor per stateful GRU (the six
+    TRA attention GRUs followed by the four grouped DPGRNN inter GRUs). Every
+    extent is read off the
     module tree rather than written down, so the graph follows whatever grid
     the checkpoint was trained on: the spectrum width tracks n_fft through
     the ERB split, the cache depth tracks the GT blocks' temporal
@@ -38,16 +67,26 @@ def initial_inputs(model):
     bins = erb.erb_subband_1 + erb.erb_fc.in_features
     gt_blocks = list(model.encoder.en_convs[2:])
     channels = gt_blocks[0].depth_conv.in_channels
-    depth = sum(_encoder_pad_sizes(model))
     width = model.dpgrnn1.width
     tra = gt_blocks[0].tra.att_gru
     inter = model.dpgrnn1.inter_rnn
     h_tra = [torch.zeros(tra.num_layers, 1, tra.hidden_size)
              for _ in range(2 * len(gt_blocks))]
-    # The inter GRU batches the frequency positions, so its hidden really is
-    # (layers, width, hidden) -- one tensor per DPGRNN, not width tensors.
-    h_dpgrnn = [torch.zeros(inter.num_layers, width, inter.hidden_size)
-                for _ in range(2)]
+    # Each grouped inter-RNN owns two real GRUs. Exposing one tensor per GRU
+    # avoids slicing and re-concatenating recurrent state inside the graph.
+    # Frequency positions are the GRU batch, hence (layers, width, hidden/2).
+    h_dpgrnn = [
+        torch.zeros(inter.num_layers, width, inter.rnn1.hidden_size)
+        for _ in range(4)
+    ]
+    encoder_cache = [
+        torch.zeros(1, channels, pad, width)
+        for pad in _encoder_pad_sizes(model)
+    ]
+    decoder_cache = [
+        torch.zeros(1, channels, block.pad_size, width)
+        for block in model.decoder.de_convs[:len(gt_blocks)]
+    ]
     bands = erb.erb_subband_1 + erb.erb_fc.out_features
     return (
         # Three separate ERB-domain feature frames (mag, real, imag), each
@@ -58,9 +97,8 @@ def initial_inputs(model):
         torch.randn(1, bands, 1).abs(),
         torch.randn(1, bands, 1),
         torch.randn(1, bands, 1),
-        # [enc/dec, channels, time, freq] -- no batch dim; the wrapper adds
-        # and strips it at the graph boundary so PTQ sees a rank-4 tensor.
-        torch.zeros(2, channels, depth, width),
+        *encoder_cache,
+        *decoder_cache,
         *h_tra,
         *h_dpgrnn,
     )
@@ -135,9 +173,10 @@ def _deconv_depth_step(deconv, x, cache, flipped_weight):
     return output, next_cache
 
 
-def _gt_step(block, x, conv_cache, tra_cache, flipped_weight=None):
+def _gt_step(block, x, conv_cache, tra_cache, frequency_sfe,
+             flipped_weight=None):
     first, residual = torch.chunk(x, chunks=2, dim=1)
-    first = block.sfe(first)
+    first = frequency_sfe(first)
     first = block.point_act(block.point_bn1(block.point_conv1(first)))
     if flipped_weight is not None:
         first, conv_cache = _deconv_depth_step(
@@ -151,7 +190,7 @@ def _gt_step(block, x, conv_cache, tra_cache, flipped_weight=None):
     return block.shuffle(first, residual), conv_cache, tra_cache
 
 
-def _dp_step(dp, x, inter_cache):
+def _dp_step(dp, x, inter_cache_0, inter_cache_1):
     batch = x.shape[0]
     x = x.permute(0, 2, 3, 1)
     intra = x.reshape(batch, dp.width, dp.input_size)
@@ -162,47 +201,66 @@ def _dp_step(dp, x, inter_cache):
     intra_out = x + intra
     inter = intra_out.permute(0, 2, 1, 3).reshape(
         batch * dp.width, 1, dp.hidden_size)
-    inter, inter_cache = dp.inter_rnn(inter, inter_cache)
+    inter_0, inter_1 = torch.chunk(inter, chunks=2, dim=-1)
+    inter_0, inter_cache_0 = dp.inter_rnn.rnn1(
+        inter_0, inter_cache_0
+    )
+    inter_1, inter_cache_1 = dp.inter_rnn.rnn2(
+        inter_1, inter_cache_1
+    )
+    inter = torch.cat((inter_0, inter_1), dim=-1)
     inter = dp.inter_fc(inter).reshape(
         batch, dp.width, 1, dp.hidden_size).permute(0, 2, 1, 3)
-    return (intra_out + dp.inter_ln(inter)).permute(0, 3, 1, 2), inter_cache
+    return ((intra_out + dp.inter_ln(inter)).permute(0, 3, 1, 2),
+            inter_cache_0, inter_cache_1)
 
 
 class StreamGTCRN(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.model = model
-        # Per-block slices of the shared temporal cache, from each GT block's
-        # own (kernel-1)*dilation extent. The decoder mirrors the encoder's
-        # dilation stack in reverse, so it reuses the same layout backwards;
-        # the assert keeps that assumption loud if the architecture changes.
+        self.input_sfe = _FrequencyNeighborhood(
+            3, model.sfe.kernel_size
+        )
+        gt_blocks = list(model.encoder.en_convs[2:])
+        block_channels = (
+            gt_blocks[0].point_conv1.in_channels //
+            gt_blocks[0].sfe.kernel_size
+        )
+        if any(block.point_conv1.in_channels !=
+               block_channels * block.sfe.kernel_size
+               for block in gt_blocks):
+            raise ValueError('GT blocks no longer share one SFE channel shape')
+        self.block_sfe = _FrequencyNeighborhood(
+            block_channels, gt_blocks[0].sfe.kernel_size
+        )
+        # Each GT block receives its own graph state tensor. Keeping histories
+        # separate eliminates the Gather/Slice/Concat packing graph that the
+        # original shared cache required without changing total state bytes.
         encoder_pads = _encoder_pad_sizes(model)
-        bounds, start = [], 0
-        for pad in encoder_pads:
-            bounds.append((start, start + pad))
-            start += pad
         decoder_pads = [block.pad_size
-                        for block in model.decoder.de_convs[:len(bounds)]]
+                        for block in model.decoder.de_convs[:len(encoder_pads)]]
         assert decoder_pads == encoder_pads[::-1]
-        self._encoder_slices = tuple(bounds)
-        self._decoder_slices = tuple(reversed(bounds))
-        for index, block in enumerate(model.decoder.de_convs[:len(bounds)]):
+        for index, block in enumerate(
+                model.decoder.de_convs[:len(encoder_pads)]):
             self.register_buffer(
                 '_decoder_flip%d' % index,
                 block.depth_conv.weight.detach().flip(-2, -1).clone(),
             )
 
-    def forward(self, mag, real, imag, conv_cache,
+    def forward(self, mag, real, imag,
+                conv_enc0, conv_enc1, conv_enc2,
+                conv_dec0, conv_dec1, conv_dec2,
                 h_tra_enc0, h_tra_enc1, h_tra_enc2,
                 h_tra_dec0, h_tra_dec1, h_tra_dec2,
-                h_dpgrnn1, h_dpgrnn2):
+                h_dpgrnn1_0, h_dpgrnn1_1,
+                h_dpgrnn2_0, h_dpgrnn2_1):
         model = self.model
-        conv_cache = conv_cache.unsqueeze(1)
         # mag/real/imag are the HOST-banded feature frames (1, E, 1): the
         # fixed front end already ran outside; the graph concatenates them
         # into (B, 3, T, E) and holds learned compute only.
         x = torch.stack((mag, real, imag), dim=1).permute(0, 1, 3, 2)
-        x = model.sfe(x)
+        x = self.input_sfe(x)
 
         skips = []
         for block in model.encoder.en_convs[:2]:
@@ -211,26 +269,31 @@ class StreamGTCRN(nn.Module):
         enc_conv = []
         enc_tra = []
         enc_hidden = (h_tra_enc0, h_tra_enc1, h_tra_enc2)
+        enc_cache = (conv_enc0, conv_enc1, conv_enc2)
         for index, block in enumerate(model.encoder.en_convs[2:]):
-            start, end = self._encoder_slices[index]
             x, cache, hidden = _gt_step(
-                block, x, conv_cache[0, :, :, start:end],
-                enc_hidden[index])
+                block, x, enc_cache[index],
+                enc_hidden[index], self.block_sfe)
             enc_conv.append(cache)
             enc_tra.append(hidden)
             skips.append(x)
 
-        x, inter0 = _dp_step(model.dpgrnn1, x, h_dpgrnn1)
-        x, inter1 = _dp_step(model.dpgrnn2, x, h_dpgrnn2)
+        x, inter10, inter11 = _dp_step(
+            model.dpgrnn1, x, h_dpgrnn1_0, h_dpgrnn1_1
+        )
+        x, inter20, inter21 = _dp_step(
+            model.dpgrnn2, x, h_dpgrnn2_0, h_dpgrnn2_1
+        )
 
         dec_conv_reverse = []
         dec_tra = []
         dec_hidden = (h_tra_dec0, h_tra_dec1, h_tra_dec2)
+        dec_cache = (conv_dec0, conv_dec1, conv_dec2)
         for index, block in enumerate(model.decoder.de_convs[:3]):
-            start, end = self._decoder_slices[index]
             x, cache, hidden = _gt_step(
                 block, x + skips[4 - index],
-                conv_cache[1, :, :, start:end], dec_hidden[index],
+                dec_cache[index], dec_hidden[index],
+                self.block_sfe,
                 flipped_weight=getattr(self, '_decoder_flip%d' % index))
             dec_conv_reverse.append(cache)
             dec_tra.append(hidden)
@@ -240,8 +303,6 @@ class StreamGTCRN(nn.Module):
         # x is the ERB-domain complex mask (B, 2, T, E); the fixed back end
         # (ERB inverse + CRM) runs on the host -- see host_synthesis.
         enhanced = x.permute(0, 3, 2, 1)
-        conv_out = torch.stack((
-            torch.cat(enc_conv, dim=2),
-            torch.cat(tuple(reversed(dec_conv_reverse)), dim=2),
-        ), dim=0).squeeze(1)
-        return (enhanced, conv_out, *enc_tra, *dec_tra, inter0, inter1)
+        return (enhanced, *enc_conv, *dec_conv_reverse,
+                *enc_tra, *dec_tra,
+                inter10, inter11, inter20, inter21)
