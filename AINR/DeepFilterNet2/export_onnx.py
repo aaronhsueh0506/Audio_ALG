@@ -34,9 +34,9 @@ from torch import nn
 import torch.nn.functional as F
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-_AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))
-if _AUDIO_ALG_ROOT not in sys.path:
-    sys.path.insert(0, _AUDIO_ALG_ROOT)
+_AINR_ROOT = os.path.dirname(_SCRIPT_DIR)
+if _AINR_ROOT not in sys.path:
+    sys.path.insert(0, _AINR_ROOT)
 
 from onnx_streaming_contract import validate_nctf_no_temporal_padding
 

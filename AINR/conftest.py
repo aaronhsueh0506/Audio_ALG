@@ -1,10 +1,10 @@
 """Expose the import roots AINR tests share with the CLIs.
 
-``calibration_io`` lives in ``AINR/`` (so a deployment that copies only the
-model folders still carries it), and the trainers/tests import AINR's own
-``dataset_gen`` bare -- both resolve by putting the ``AINR`` directory on the
-path, exactly as every entry script's own shim does. The ``Audio_ALG`` root
-is added for the cross-package ``AIAEC.*`` imports.
+``calibration_io`` and ``onnx_streaming_contract`` live in ``AINR/`` so an
+AINR release does not depend on its parent directory.  Trainers/tests import
+AINR's own ``dataset_gen`` bare; all three resolve by putting ``AINR`` on the
+path, exactly as every entry script's own shim does. The ``Audio_ALG`` root is
+added only for cross-package ``AIAEC.*`` imports used by integration tests.
 """
 
 import os

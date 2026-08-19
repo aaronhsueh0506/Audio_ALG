@@ -1,6 +1,7 @@
 """User-facing model scripts must work from their own directories."""
 
 from pathlib import Path
+import os
 import subprocess
 import sys
 
@@ -38,3 +39,26 @@ def test_calibration_help_runs_from_model_directory(model):
 @pytest.mark.parametrize('model', ('RNNoise-ERB', 'DeepFilterNet2', 'GTCRN'))
 def test_export_help_runs_from_model_directory(model):
     _help(model, 'export_onnx.py')
+
+
+@pytest.mark.parametrize('model', ('RNNoise-ERB', 'DeepFilterNet2', 'GTCRN'))
+def test_exporter_does_not_import_from_audio_alg_parent(model):
+    """AINR exporters must remain usable when AINR is released alone."""
+    source = (AINR_ROOT / model / 'export_onnx.py').read_text()
+    assert '_AUDIO_ALG_ROOT' not in source
+    assert '_AINR_ROOT' in source
+
+    result = subprocess.run(
+        [sys.executable, '-c',
+         'import onnx_streaming_contract; print(onnx_streaming_contract.__file__)'],
+        cwd=AINR_ROOT / model,
+        env={'PATH': os.environ.get('PATH', ''),
+             'PYTHONPATH': str(AINR_ROOT)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert Path(result.stdout.strip()).resolve() == (
+        AINR_ROOT / 'onnx_streaming_contract.py'
+    ).resolve()
