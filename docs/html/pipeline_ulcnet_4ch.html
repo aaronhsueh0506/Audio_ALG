@@ -115,11 +115,11 @@ out               全零              全零                enh(beam err        
 </table>
 
 <h2>State 表</h2>
-<p>Carve 順序(layout v9):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>;ULCNet chain 狀態、幀 scratch、<code>far_delay</code>、reprime 計數器、共用視窗表都內嵌在 <code>self</code>。唯一一支 512 點 <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain。實測 descriptor(ne10, MATCHED n=5,2026-08-18 起的預設後端):<code>bytes=3,117,184</code>、descriptor_version=1、layout_version=9。n 活在單一共用 estimator，pool 隨 n 每 filter ±5,728 B且只付一次(n=1 實測 3,094,272 B);4 lanes pool 不隨 n 變(實測 1,369,728 B,n=1..5 相同;kiss 1,375,232 B)。kiss 實測:n=5 3,124,064 B / n=1 3,101,152 B。<b>換 backend／編譯選項／submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_4ch_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
+<p>Carve 順序(layout v10):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>;ULCNet chain 狀態、幀 scratch、<code>far_delay</code>、reprime 計數器、共用視窗表都內嵌在 <code>self</code>。唯一一支 512 點 <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain。實測 descriptor(ne10, MATCHED n=5):<code>bytes=3,107,056</code>、descriptor_version=1、layout_version=10。n 活在單一共用 estimator，pool 隨 n 每 filter ±5,728 B且只付一次(n=1 實測 3,084,144 B);4 lanes pool 不隨 n 變(實測 1,369,728 B,n=1..5 相同;kiss 1,375,232 B)。kiss 實測:n=5 3,113,936 B / n=1 3,091,024 B。<b>換 backend／編譯選項／submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_4ch_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td><code>FourAecNrRes core</code>(pre-only)</td><td>1,480,256 B(4-lane AEC 1,369,728 B + delay ring/控制塊 110,528 B;兩項皆實測 <code>four_aec_nr_res_get_mem_breakdown()</code> @16k/fft512/<code>enable_post=0</code>,ne10。kiss 合計:1,485,728 B(1,375,232+110,496))</td><td>pool</td><td>共用 delay ring + 4 lanes;<code>enable_post=0</code> ⇒ <b>不含</b> NR/RES/iFFT(那些由本 wrapper 自己的 <code>ola/ifft_buffer/synth_window</code> + ULCNet chain 取代)</td></tr>
-<tr><td><code>SRP</code> / <code>GSC</code></td><td>num_angles=72 預設 / RLS 4×257</td><td>pool</td><td>GSC 借用 <code>srp-&gt;a_array</code> steering 表;與下方其餘項目合計 = 3,117,184 − 1,480,256 = 1,636,928 B(kiss:3,124,064 − 1,485,728 = 1,638,336 B)</td></tr>
+<tr><td><code>SRP</code> / <code>GSC</code></td><td>num_angles=72 預設 / P:16×257、wa:4×257 Complex</td><td>pool</td><td>GSC 借用 <code>srp-&gt;a_array</code> steering 表;與下方其餘項目合計 = 3,107,056 − 1,480,256 = 1,626,800 B(kiss:3,113,936 − 1,485,728 = 1,628,208 B)</td></tr>
 <tr><td><code>gsc_spectrum/gsc_weights</code></td><td>[257] / [4][257] Complex</td><td>pool</td><td>每 hop 由 GSC 原子產生</td></tr>
 <tr><td><code>FftHandle</code>(共用)</td><td>pool 內</td><td>pool</td><td>beam IFFT + chain 三 transform 共用</td></tr>
 <tr><td><code>ola/ifft_buffer/synth_window</code></td><td>各 [512] f32</td><td>pool</td><td>beam WOLA;<code>ola</code> 跨 hop 累加</td></tr>
@@ -129,7 +129,7 @@ out               全零              全零                enh(beam err        
 <tr><td><code>far_delay</code></td><td>[256] f32</td><td>C struct(self)</td><td>one-hop far 補償;delay change / reset 時清零</td></tr>
 <tr><td><code>model</code>+<code>last_delay</code>+<code>frame_index</code></td><td>純量級</td><td>C struct(self)</td><td>model 安裝 survive reset；delay history 用來偵測 FIXED 首次可用</td></tr>
 <tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 exported D</td><td><b>CPU/DSP caller-owned pool</b></td><td>NPU 單次呼叫無狀態；<code>model.reset</code> 時 K/V、logit 與 GRU hidden 全部清除</td></tr>
-<tr><td>合計 pool</td><td>3,117,184 B(2.97 MB;kiss 3,124,064 B/2.98 MB)</td><td>host 擁有 pool</td><td>init_ex 路徑零 heap;sizing 與 carve lockstep(<code>cursor.remaining==0</code> 驗證)</td></tr>
+<tr><td>合計 pool</td><td>3,107,056 B(2.96 MB;kiss 3,113,936 B/2.97 MB)</td><td>host 擁有 pool</td><td>init_ex 路徑零 heap;sizing 與 carve lockstep(<code>cursor.remaining==0</code> 驗證)</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
@@ -144,13 +144,13 @@ out               全零              全零                enh(beam err        
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v9)</td></tr>
+<tr><td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v10)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心:<code>process_pre</code> / <code>abandon_pre</code> / <code>PreFrame.aligned_ref</code>(見 <a href="pipeline_4ch.html">pipeline_4ch</a>)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_process.h / .c</code></td><td>chain 實作 + <code>UlcnetModel</code> 邊界(兩變體共用)</td></tr>
 <tr><td><code>pipelines/4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c</code></td><td>identity E2E、連續 model stepping(除 reprime)、MATCHED 同值重鎖 reset、FIXED raw→aligned 首次切換 reset、FIXED pre-lock seam 逐 byte 等於 raw far(含 8 hop / 320 sample / 500 ms 三組)、identity-reprime straddle 推導(脈衝標記/無邊界對照跑)與 reprime 行為(delay change + FIXED fill)、core aligned_ref+abandon token、pool/descriptor、far timestamp、UNLOCKED 仍套用、NaN/Inf、partial-write 與 aligned-only descriptor gate</td></tr>
 <tr><td><code>pipelines/4ch_alignulcnet/main.c</code></td><td>板端 adapter 參考骨架(fail-open,accelerator run() 回 -1 佔位);收 <code>--delay-mode/--delay-num-filters/--fixed-delay</code> 並打印 resolved profile 與該 config 的 pool bytes</td></tr>
 <tr><td><code>pipelines/4ch_alignulcnet/Makefile</code></td><td>應用入口；<code>audio_pipeline_4ch_ulcnet.o</code> 與 ULCNet pre/post 直接連結到應用。<code>libaudio_pipeline_4ch.a</code> 只包含可重用的 4-lane linear core，不包含 ULCNet wrapper。</td></tr>
 </table>
-<p>測試實測(2026-08-18 重跑, BACKEND=ne10 預設):<code>test_audio_pipeline_4ch_ulcnet</code> 與板端骨架同時掛在 <b>兩層</b> <code>make test</code>——<code>4ch_aec_bf_nr_res/</code> 的一站式關卡(含本變體、板端骨架 bare 與 <code>--delay-num-filters 1</code> 兩種 profile)與 <code>4ch_alignulcnet/</code> 自己的委派目標。實跑結果:13 個測試函式全數通過,結尾印 <code>All audio_pipeline_4ch_ulcnet tests passed</code>;far[2085]→out[2597](+2 hops, offset +0, peak 1.0000);reprime 推導 ERROR/FAR 兩路各 2 個跨界幀(marked peak 0.6665/0.7071 vs unmarked 1.257e-02/0.000e+00),邊界後第一個模型可見幀在 hop 10 且兩路皆無切換前樣本;骨架印 <code>4ch_alignulcnet: fail-open board skeleton PASS</code>(並打印 resolved delay profile 與該 config 的 pool bytes)。一站式 <code>make test</code> 全綠:<code>PASS:</code> 標記 <b>316</b> / FAIL 0(另有 4 個 static smoke 與 2 個板端骨架 profile 各印一次 PASS,合計 322 個 PASS 字樣)。</p>
+<p>測試實測(2026-08-19 重跑, BACKEND=ne10 預設):<code>test_audio_pipeline_4ch_ulcnet</code> 與板端骨架同時掛在 <b>兩層</b> <code>make test</code>——<code>4ch_aec_bf_nr_res/</code> 的一站式關卡(含本變體、板端骨架 bare 與 <code>--delay-num-filters 1</code> 兩種 profile)與 <code>4ch_alignulcnet/</code> 自己的委派目標。實跑結果:13 個測試函式全數通過,結尾印 <code>All audio_pipeline_4ch_ulcnet tests passed</code>;far[2085]→out[2597](+2 hops, offset +0, peak 1.0000);reprime 推導 ERROR/FAR 兩路各 2 個跨界幀(marked peak 0.6665/0.7071 vs unmarked 1.257e-02/0.000e+00),邊界後第一個模型可見幀在 hop 10 且兩路皆無切換前樣本;骨架印 <code>4ch_alignulcnet: fail-open board skeleton PASS</code>(並打印 resolved delay profile 與該 config 的 pool bytes)。一站式 <code>make test</code> 全綠:<code>PASS:</code> 標記 <b>348</b> / FAIL 0(另有 4 個 static smoke 與 2 個板端骨架 profile 各印一次 PASS,合計 354 個 PASS 字樣)。</p>
 </body>
 </html>

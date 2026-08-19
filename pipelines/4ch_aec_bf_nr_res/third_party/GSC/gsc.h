@@ -48,8 +48,11 @@ typedef struct {
     /* steering */
     Complex*** a_array;
 
-    /* RLS */
-    Complex*** P;   // (F,M,M)
+    /* RLS. P is stored as P[M][M][F], so four adjacent frequency bins of
+     * one matrix element are contiguous for the AArch64 NEON update. The
+     * public processing API is unchanged; this is internal state and must
+     * not be persisted or indexed by integrators. */
+    Complex*** P;   // (M,M,F)
     Complex** wa;   // (M,F)
 
     /* Persistent per-hop work area. Keeping the F- and M*F-sized arrays

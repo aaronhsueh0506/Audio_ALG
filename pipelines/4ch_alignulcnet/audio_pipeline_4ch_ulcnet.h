@@ -184,8 +184,10 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * THIS layer's carve changed, but the core sub-pool it composes grew, so
  * every offset after `core` and this layer's total moved with it -- and
  * build_flags_hash cannot say so, since it folds in the core's carve-token
- * hash, which a control-block-only change leaves alone. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 9u
+ * hash, which a control-block-only change leaves alone.
+ * v10 carries GSC's covariance layout from P[F][M][M] to P[M][M][F]. The
+ * state count is unchanged, but its pointer tables and pool size moved. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 10u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

@@ -442,10 +442,10 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 
 | Config | `req.bytes` | 來源 |
 |---|---:|---|
-| 16000，全預設（256/128，`num_angles=72`） | 1,910,736 | 實測 |
-| 16000，`core.fft_size = 512` | 3,249,344 | 實測 |
-| 16000，`num_angles = 360` | 4,912,848 | 實測 |
-| 48000，全預設（1024/512，`num_angles=72`） | 6,826,560 | 實測 |
+| 16000，全預設（256/128，`num_angles=72`） | 1,905,728 | 實測 |
+| 16000，`core.fft_size = 512` | 3,239,216 | 實測 |
+| 16000，`num_angles = 360` | 4,907,840 | 依相同 129-bin GSC layout 差額更新；發布前現查 |
+| 48000，全預設（1024/512，`num_angles=72`） | 6,806,192 | 實測 |
 
 ⚠ 覆蓋差異：只有 `num_angles = 72` 的 16 kHz/256 與 48 kHz/1024 兩組會被
 C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_size = 512`

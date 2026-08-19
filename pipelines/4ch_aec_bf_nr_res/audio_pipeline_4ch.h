@@ -117,9 +117,12 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * layer's total moved with it -- and build_flags_hash cannot say so, since it
  * folds in the core's carve-token hash, which a control-block-only change
  * leaves alone.
+ * v6 changes GSC's internal covariance storage from P[F][M][M] to
+ * P[M][M][F]. The recursive state count is unchanged, but the pointer-table
+ * overhead and therefore the composed pool byte count are different.
  * (The exact totals are reported by `make print-mem-size`; they are not
  * restated here, where they would silently rot.) */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 5u
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 6u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

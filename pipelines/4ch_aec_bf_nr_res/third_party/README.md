@@ -23,10 +23,13 @@ The integration adds two algorithm-preserving facilities:
   pointer-cast load/store). Its test requires sample-for-sample bit identity
   with the scalar implementation.
 - GSC routes both the distortionless beamformer and adaptive-canceller
-  beamformer through the same scalar/NEON complex kernel. Its small 4-by-4
-  per-bin RLS recursion remains scalar because those matrix elements are not
-  contiguous across frequency; the two long contiguous frequency passes are
-  the accelerated hot path.
+  beamformer through the same scalar/NEON complex kernel. The covariance is
+  stored internally as `P[M][M][F]`, so the four-channel RLS recursion can
+  update four adjacent frequency bins without gather/scatter. The AArch64
+  path preserves the scalar channel/matrix accumulation order and avoids FMA,
+  reciprocal estimates and horizontal reductions; the test-only scalar
+  oracle compares output, effective weights, `P` and `wa` byte-for-byte after
+  every hop. Non-four-channel shapes and exceptional bins use the scalar path.
 - GSC can export the exact effective complex channel weights used to produce
   its mono spectrum. This lets the downstream post-beam RES project all AEC
   contexts with the same spatial state; the original `gsc_process()` API and

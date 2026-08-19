@@ -314,6 +314,13 @@ while the complete GSC wrapper reuses its atomic mono spectrum and performs 8
 (near + residual). Comfort-noise power projection is a separate real SIMD
 accumulation.
 
+For the fixed four-channel GSC, the internal RLS covariance is laid out as
+`P[M][M][F]`. This makes frequency contiguous and lets AArch64 NEON update four
+bins at once without changing the public API or recurrence order. Automated
+tests compare the SIMD and scalar output, effective weights, `P` and `wa`
+byte-for-byte after every hop, including reset, masked, tail-bin and non-finite
+recovery cases.
+
 One parity limitation remains explicit: `AecResContext` does not yet export
 unbounded R2 or the complete stationarity/AecState surface. The post-beam RES
 therefore uses bounded R2 for both gain inputs and omits the stationary mask.

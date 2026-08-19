@@ -3,6 +3,7 @@
 #include <string.h>
 #include "gsc.h"
 #include "mem_align.h"
+#include "simd_kernels.h"
 #include "../utility/complex.h"
 #include "../utility/spatial_simd.h"
 
@@ -139,15 +140,19 @@ static void* pool_carve(PoolCursor* cursor, size_t count,
 size_t gsc_get_mem_size(int M, int F) {
     size_t total;
     size_t fM;
+    size_t mM;
 
     if (M <= 0 || F <= 0) return 0;
 
     total = ck_align16_size(sizeof(GSC));
 
-    /* P (F, M, M): Complex**[F] -> Complex*[F*M] -> Complex[F*M*M] */
-    total = ck_field_size(total, (size_t)F, sizeof(Complex**));
+    /* P (M, M, F): Complex**[M] -> Complex*[M*M] -> Complex[M*M*F].
+     * Frequency is the contiguous axis so one matrix element across four
+     * bins can be updated by one NEON vector without gather/scatter. */
+    total = ck_field_size(total, (size_t)M, sizeof(Complex**));
     fM = ck_mul_size((size_t)F, (size_t)M);
-    total = ck_field_size(total, fM, sizeof(Complex*));
+    mM = ck_mul_size((size_t)M, (size_t)M);
+    total = ck_field_size(total, mM, sizeof(Complex*));
     total = ck_field_size(total, ck_mul_size(fM, (size_t)M), sizeof(Complex));
 
     /* wa (M, F): Complex*[M] -> Complex[M*F] */
@@ -190,6 +195,7 @@ GSC* gsc_init(void* mem, size_t mem_size, int M, int F,
     PoolCursor cursor;
     size_t need;
     size_t fM;
+    size_t mM;
 
     if (!mem || !cfg || !a_array || M <= 0 || F <= 0 || num_angles <= 0 ||
         !isfinite(cfg->lambda) || cfg->lambda <= 0.0f ||
@@ -224,29 +230,31 @@ GSC* gsc_init(void* mem, size_t mem_size, int M, int F,
     g->adapt_interval = gsc_effective_adapt_interval(
         g->enable_fix_mode, g->fixed_align_notebook, cfg->adapt_interval);
 
-    fM = (size_t)F * (size_t)M;
+    fM = ck_mul_size((size_t)F, (size_t)M);
+    mM = ck_mul_size((size_t)M, (size_t)M);
+    if (MEM_SIZE_INVALID(fM) || MEM_SIZE_INVALID(mM)) return NULL;
 
-    /* P (F, M, M): pointer table -> mid pointer table -> flat data,
-     * identity-initialized -- same values the old nested-loop calloc/malloc
-     * version filled. */
+    /* P (M, M, F): pointer table -> matrix-element pointer table -> flat
+     * frequency planes. This is the same per-bin identity state as the old
+     * P[F][M][M] layout, with frequency made contiguous for SIMD. */
     {
         Complex*** p_top = (Complex***)pool_carve(
-            &cursor, (size_t)F, sizeof(Complex**));
+            &cursor, (size_t)M, sizeof(Complex**));
         Complex** p_mid = (Complex**)pool_carve(
-            &cursor, fM, sizeof(Complex*));
+            &cursor, mM, sizeof(Complex*));
         Complex* p_data = (Complex*)pool_carve(
-            &cursor, fM * (size_t)M, sizeof(Complex));
+            &cursor, ck_mul_size(fM, (size_t)M), sizeof(Complex));
         if (!p_top || !p_mid || !p_data) return NULL;
 
         g->P = p_top;
-        for (int f = 0; f < F; f++) {
-            g->P[f] = p_mid + (size_t)f * (size_t)M;
-            for (int i = 0; i < M; i++) {
-                g->P[f][i] =
-                    p_data + ((size_t)f * (size_t)M + (size_t)i) * (size_t)M;
-                for (int j = 0; j < M; j++) {
-                    g->P[f][i][j].r = (i == j);
-                    g->P[f][i][j].i = 0;
+        for (int i = 0; i < M; i++) {
+            g->P[i] = p_mid + (size_t)i * (size_t)M;
+            for (int j = 0; j < M; j++) {
+                g->P[i][j] =
+                    p_data + ((size_t)i * (size_t)M + (size_t)j) * (size_t)F;
+                for (int f = 0; f < F; f++) {
+                    g->P[i][j][f].r = (i == j);
+                    g->P[i][j][f].i = 0;
                 }
             }
         }
@@ -271,9 +279,9 @@ GSC* gsc_init(void* mem, size_t mem_size, int M, int F,
      * pointer arithmetic copied verbatim from the previous calloc'd
      * version. */
     {
-        size_t count = ((size_t)M + 3) * (size_t)F;   /* see gsc_get_mem_size() */
+        size_t count = ck_mul_size((size_t)M + 3, (size_t)F);
 #if !GSC_USE_PROJECTION_BLOCKING
-        count += fM * (size_t)M;
+        count = ck_add_size(count, ck_mul_size(fM, (size_t)M));
 #endif
         g->scratch = (Complex*)pool_carve(&cursor, count, sizeof(Complex));
         if (!g->scratch) return NULL;
@@ -334,13 +342,357 @@ static void gsc_reset_bin(GSC* g, int f)
 {
     for (int i = 0; i < g->M; i++) {
         for (int j = 0; j < g->M; j++) {
-            g->P[f][i][j].r = (i == j) ? 1.0f : 0.0f;
-            g->P[f][i][j].i = 0.0f;
+            g->P[i][j][f].r = (i == j) ? 1.0f : 0.0f;
+            g->P[i][j][f].i = 0.0f;
         }
         g->wa[i][f].r = 0.0f;
         g->wa[i][f].i = 0.0f;
     }
     g->bin_resets += 1;
+}
+
+/* One-bin scalar reference for the RLS recurrence. Keep its operation order
+ * identical to the pre-SIMD implementation: the four-bin NEON path below is
+ * required to match this state transition byte-for-byte on every lane. */
+static void gsc_rls_update_bin_scalar(
+    GSC* g,
+    int f,
+    const Complex* u_flat,
+    const Complex* gsc_spec,
+    int use_notebook_update,
+    int use_mu_scaling)
+{
+    Complex pu[g->M];
+    Complex gain[g->M];
+    Complex q[g->M];
+    const Complex (*u)[g->F] =
+        (const Complex (*)[g->F])u_flat;
+
+    for (int i = 0; i < g->M; i++) {
+        pu[i].r = 0.0f;
+        pu[i].i = 0.0f;
+        for (int k = 0; k < g->M; k++) {
+            Complex term = spatial_complex_mul(g->P[i][k][f], u[k][f]);
+            pu[i] = spatial_complex_add(pu[i], term);
+        }
+    }
+
+    {
+        Complex upu_c;
+        float upu_real;
+        float inv_upu;
+        float inv_lambda;
+
+        upu_c.r = g->lambda;
+        upu_c.i = 0.0f;
+        for (int i = 0; i < g->M; i++) {
+            Complex term = spatial_complex_mul(
+                spatial_complex_conj(u[i][f]), pu[i]);
+            upu_c = spatial_complex_add(upu_c, term);
+        }
+        if (use_notebook_update) upu_c.r += g->lambda;
+        upu_real = upu_c.r;
+
+        if (!isfinite(upu_real) || upu_real <= 0.0f) {
+            gsc_reset_bin(g, f);
+            return;
+        }
+        if (fabsf(upu_real) < 1e-12f) {
+            upu_real = (upu_real >= 0.0f) ? 1e-12f : -1e-12f;
+        }
+        inv_upu = 1.0f / upu_real;
+        inv_lambda = 1.0f / g->lambda;
+
+        for (int i = 0; i < g->M; i++) {
+            gain[i].r = pu[i].r * inv_upu;
+            gain[i].i = pu[i].i * inv_upu;
+        }
+
+        for (int j = 0; j < g->M; j++) {
+            q[j].r = 0.0f;
+            q[j].i = 0.0f;
+            for (int k = 0; k < g->M; k++) {
+                Complex term = spatial_complex_mul(
+                    spatial_complex_conj(u[k][f]), g->P[k][j][f]);
+                q[j] = spatial_complex_add(q[j], term);
+            }
+        }
+
+        for (int i = 0; i < g->M; i++) {
+            for (int j = 0; j < g->M; j++) {
+                Complex term = spatial_complex_mul(gain[i], q[j]);
+                g->P[i][j][f].r =
+                    (g->P[i][j][f].r - term.r) * inv_lambda;
+                g->P[i][j][f].i =
+                    (g->P[i][j][f].i - term.i) * inv_lambda;
+            }
+        }
+    }
+
+    for (int i = 0; i < g->M; i++) {
+        for (int j = i + 1; j < g->M; j++) {
+            Complex avg;
+            avg.r = 0.5f * (g->P[i][j][f].r + g->P[j][i][f].r);
+            avg.i = 0.5f * (g->P[i][j][f].i - g->P[j][i][f].i);
+            g->P[i][j][f] = avg;
+            g->P[j][i][f] = spatial_complex_conj(avg);
+        }
+        g->P[i][i][f].i = 0.0f;
+    }
+
+    for (int i = 0; i < g->M; i++) {
+        if (g->P[i][i][f].r < GSC_P_DIAG_FLOOR) {
+            g->P[i][i][f].r = GSC_P_DIAG_FLOOR;
+        } else if (g->P[i][i][f].r > GSC_P_DIAG_CEIL) {
+            g->P[i][i][f].r = GSC_P_DIAG_CEIL;
+        }
+    }
+
+    {
+        Complex gsc_conj = spatial_complex_conj(gsc_spec[f]);
+        for (int m = 0; m < g->M; m++) {
+            Complex update = spatial_complex_mul(gain[m], gsc_conj);
+            if (use_mu_scaling) {
+                update.r *= g->mu;
+                update.i *= g->mu;
+            }
+            g->wa[m][f] = spatial_complex_add(
+                spatial_complex_scale(g->wa[m][f], GSC_WA_LEAK), update);
+        }
+    }
+
+    for (int m = 0; m < g->M; m++) {
+        if (!isfinite(g->wa[m][f].r) || !isfinite(g->wa[m][f].i)) {
+            gsc_reset_bin(g, f);
+            break;
+        }
+    }
+}
+
+#if SK_HAVE_NEON
+/* Four independent frequency bins, one bin per NEON lane. Channel/matrix
+ * accumulation order remains i/k=0..3, exactly matching the scalar helper;
+ * no horizontal reduction, reciprocal estimate, or FMA is used. */
+static void gsc_rls_update_four_neon(
+    GSC* g,
+    int f,
+    const Complex* u_flat,
+    const Complex* gsc_spec,
+    int use_notebook_update,
+    int use_mu_scaling)
+{
+    const Complex (*u)[g->F] =
+        (const Complex (*)[g->F])u_flat;
+    float32x4_t pu_r[4];
+    float32x4_t pu_i[4];
+    float32x4_t gain_r[4];
+    float32x4_t gain_i[4];
+    float32x4_t q_r[4];
+    float32x4_t q_i[4];
+    float32x4_t upu_r = vdupq_n_f32(g->lambda);
+    float32x4_t upu_i = vdupq_n_f32(0.0f);
+    float upu_lane[4];
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const float32x4_t inv_lambda =
+        vdupq_n_f32(1.0f / g->lambda);
+
+    for (int i = 0; i < 4; ++i) {
+        pu_r[i] = zero;
+        pu_i[i] = zero;
+        for (int k = 0; k < 4; ++k) {
+            float32x4x2_t p = sk__cquad_load(g->P[i][k] + f);
+            float32x4x2_t uv = sk__cquad_load(u[k] + f);
+            float32x4_t tr = vsubq_f32(
+                vmulq_f32(p.val[0], uv.val[0]),
+                vmulq_f32(p.val[1], uv.val[1]));
+            float32x4_t ti = vaddq_f32(
+                vmulq_f32(p.val[0], uv.val[1]),
+                vmulq_f32(p.val[1], uv.val[0]));
+            pu_r[i] = vaddq_f32(pu_r[i], tr);
+            pu_i[i] = vaddq_f32(pu_i[i], ti);
+        }
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        float32x4x2_t uv = sk__cquad_load(u[i] + f);
+        float32x4_t tr = vaddq_f32(
+            vmulq_f32(uv.val[0], pu_r[i]),
+            vmulq_f32(uv.val[1], pu_i[i]));
+        float32x4_t ti = vsubq_f32(
+            vmulq_f32(uv.val[0], pu_i[i]),
+            vmulq_f32(uv.val[1], pu_r[i]));
+        upu_r = vaddq_f32(upu_r, tr);
+        upu_i = vaddq_f32(upu_i, ti);
+    }
+    if (use_notebook_update) {
+        upu_r = vaddq_f32(upu_r, vdupq_n_f32(g->lambda));
+    }
+
+    /* The scalar branch owns all exceptional semantics. Falling back before
+     * any store makes mixed valid/invalid groups exactly equivalent to four
+     * independent scalar calls. */
+    vst1q_f32(upu_lane, upu_r);
+    for (int lane = 0; lane < 4; ++lane) {
+        if (!isfinite(upu_lane[lane]) || upu_lane[lane] <= 0.0f ||
+            fabsf(upu_lane[lane]) < 1e-12f) {
+            for (int n = 0; n < 4; ++n) {
+                gsc_rls_update_bin_scalar(
+                    g, f + n, u_flat, gsc_spec,
+                    use_notebook_update, use_mu_scaling);
+            }
+            return;
+        }
+    }
+
+    {
+        float32x4_t inv_upu = vdivq_f32(vdupq_n_f32(1.0f), upu_r);
+        for (int i = 0; i < 4; ++i) {
+            gain_r[i] = vmulq_f32(pu_r[i], inv_upu);
+            gain_i[i] = vmulq_f32(pu_i[i], inv_upu);
+        }
+    }
+
+    for (int j = 0; j < 4; ++j) {
+        q_r[j] = zero;
+        q_i[j] = zero;
+        for (int k = 0; k < 4; ++k) {
+            float32x4x2_t uv = sk__cquad_load(u[k] + f);
+            float32x4x2_t p = sk__cquad_load(g->P[k][j] + f);
+            float32x4_t tr = vaddq_f32(
+                vmulq_f32(uv.val[0], p.val[0]),
+                vmulq_f32(uv.val[1], p.val[1]));
+            float32x4_t ti = vsubq_f32(
+                vmulq_f32(uv.val[0], p.val[1]),
+                vmulq_f32(uv.val[1], p.val[0]));
+            q_r[j] = vaddq_f32(q_r[j], tr);
+            q_i[j] = vaddq_f32(q_i[j], ti);
+        }
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            float32x4x2_t p = sk__cquad_load(g->P[i][j] + f);
+            float32x4_t tr = vsubq_f32(
+                vmulq_f32(gain_r[i], q_r[j]),
+                vmulq_f32(gain_i[i], q_i[j]));
+            float32x4_t ti = vaddq_f32(
+                vmulq_f32(gain_r[i], q_i[j]),
+                vmulq_f32(gain_i[i], q_r[j]));
+            p.val[0] = vmulq_f32(vsubq_f32(p.val[0], tr), inv_lambda);
+            p.val[1] = vmulq_f32(vsubq_f32(p.val[1], ti), inv_lambda);
+            sk__cquad_store(g->P[i][j] + f, p);
+        }
+    }
+
+    for (int i = 0; i < 4; ++i) {
+        for (int j = i + 1; j < 4; ++j) {
+            float32x4x2_t pij = sk__cquad_load(g->P[i][j] + f);
+            float32x4x2_t pji = sk__cquad_load(g->P[j][i] + f);
+            float32x4x2_t avg;
+            avg.val[0] = vmulq_n_f32(
+                vaddq_f32(pij.val[0], pji.val[0]), 0.5f);
+            avg.val[1] = vmulq_n_f32(
+                vsubq_f32(pij.val[1], pji.val[1]), 0.5f);
+            sk__cquad_store(g->P[i][j] + f, avg);
+            avg.val[1] = vnegq_f32(avg.val[1]);
+            sk__cquad_store(g->P[j][i] + f, avg);
+        }
+        {
+            float32x4x2_t diag = sk__cquad_load(g->P[i][i] + f);
+            uint32x4_t below =
+                vcltq_f32(diag.val[0], vdupq_n_f32(GSC_P_DIAG_FLOOR));
+            uint32x4_t above =
+                vcgtq_f32(diag.val[0], vdupq_n_f32(GSC_P_DIAG_CEIL));
+            diag.val[0] = vbslq_f32(
+                below, vdupq_n_f32(GSC_P_DIAG_FLOOR), diag.val[0]);
+            diag.val[0] = vbslq_f32(
+                above, vdupq_n_f32(GSC_P_DIAG_CEIL), diag.val[0]);
+            diag.val[1] = zero;
+            sk__cquad_store(g->P[i][i] + f, diag);
+        }
+    }
+
+    {
+        float32x4x2_t spec = sk__cquad_load(gsc_spec + f);
+        const float32x4_t leak = vdupq_n_f32(GSC_WA_LEAK);
+        const float32x4_t mu = vdupq_n_f32(g->mu);
+        for (int m = 0; m < 4; ++m) {
+            float32x4x2_t wa = sk__cquad_load(g->wa[m] + f);
+            float32x4_t update_r = vaddq_f32(
+                vmulq_f32(gain_r[m], spec.val[0]),
+                vmulq_f32(gain_i[m], spec.val[1]));
+            float32x4_t update_i = vsubq_f32(
+                vmulq_f32(gain_i[m], spec.val[0]),
+                vmulq_f32(gain_r[m], spec.val[1]));
+            if (use_mu_scaling) {
+                update_r = vmulq_f32(update_r, mu);
+                update_i = vmulq_f32(update_i, mu);
+            }
+            wa.val[0] = vaddq_f32(vmulq_f32(wa.val[0], leak), update_r);
+            wa.val[1] = vaddq_f32(vmulq_f32(wa.val[1], leak), update_i);
+            sk__cquad_store(g->wa[m] + f, wa);
+        }
+    }
+
+    for (int lane = 0; lane < 4; ++lane) {
+        for (int m = 0; m < 4; ++m) {
+            if (!isfinite(g->wa[m][f + lane].r) ||
+                !isfinite(g->wa[m][f + lane].i)) {
+                gsc_reset_bin(g, f + lane);
+                break;
+            }
+        }
+    }
+}
+#endif
+
+static void gsc_rls_update_bins(
+    GSC* g,
+    const Complex* u_flat,
+    const Complex* gsc_spec,
+    int use_notebook_update,
+    int use_mu_scaling,
+    int use_mask_freeze,
+    const int* mask,
+    int force_scalar)
+{
+    int f = 0;
+#if SK_HAVE_NEON
+    if (!force_scalar && g->M == 4) {
+        for (; f + 4 <= g->F; f += 4) {
+            int vector_eligible = 1;
+            if (use_mask_freeze && mask) {
+                for (int lane = 0; lane < 4; ++lane) {
+                    if (mask[f + lane]) {
+                        vector_eligible = 0;
+                        break;
+                    }
+                }
+            }
+            if (vector_eligible) {
+                gsc_rls_update_four_neon(
+                    g, f, u_flat, gsc_spec,
+                    use_notebook_update, use_mu_scaling);
+            } else {
+                for (int lane = 0; lane < 4; ++lane) {
+                    if (!(use_mask_freeze && mask && mask[f + lane])) {
+                        gsc_rls_update_bin_scalar(
+                            g, f + lane, u_flat, gsc_spec,
+                            use_notebook_update, use_mu_scaling);
+                    }
+                }
+            }
+        }
+    }
+#endif
+    (void)force_scalar;
+    for (; f < g->F; ++f) {
+        if (!(use_mask_freeze && mask && mask[f])) {
+            gsc_rls_update_bin_scalar(
+                g, f, u_flat, gsc_spec,
+                use_notebook_update, use_mu_scaling);
+        }
+    }
 }
 
 /* ===================== DOA index ===================== */
@@ -366,13 +718,15 @@ static int doa2index(float doa_rad, int num_angles)
 }
 
 /* ===================== process ===================== */
-void gsc_process_with_weights(GSC* g,
-                              const Complex* const* X,
-                              float doa_s,
-                              int allow_adapt_in,
-                              const int* mask,
-                              Complex* gsc_out,
-                              Complex* effective_weights)
+static void gsc_process_with_weights_impl(
+    GSC* g,
+    const Complex* const* X,
+    float doa_s,
+    int allow_adapt_in,
+    const int* mask,
+    Complex* gsc_out,
+    Complex* effective_weights,
+    int force_scalar_rls)
 {
     float doa_use;
     int doa_idx;
@@ -593,177 +947,10 @@ void gsc_process_with_weights(GSC* g,
     }
 
     if (do_adapt_this_frame) {
-
-        /*
-         * Per-bin in-place RLS update.
-         *
-         * Previous implementation used full-frame temporary buffers:
-         *   pu[F][M]
-         *   gain[F][M]
-         *   P_new[F][M][M]
-         *   wa_new[M][F]
-         *
-         * This version updates one frequency bin at a time.
-         * It keeps the same RLS math, but removes full-frame P_new/wa_new
-         * initialization and copy-back overhead.
-         */
-        for (int f = 0; f < g->F; f++) {
-
-            /*
-             * Early mask skip:
-             * mask[f] == 1 means speech bin. For speech bins, adaptive
-             * update should be frozen, so skip RLS computation directly.
-             */
-            if (use_mask_freeze && mask && mask[f]) {
-                continue;
-            }
-
-            Complex pu[g->M];
-            Complex gain[g->M];
-            Complex q[g->M];
-
-            /* ---------- pu = P * u ---------- */
-            for (int i = 0; i < g->M; i++) {
-                pu[i].r = 0.0f;
-                pu[i].i = 0.0f;
-
-                for (int k = 0; k < g->M; k++) {
-                    Complex term = spatial_complex_mul(g->P[f][i][k], u[k][f]);
-                    pu[i] = spatial_complex_add(pu[i], term);
-                }
-            }
-
-            /* ---------- denominator = lambda + u^H P u ---------- */
-            Complex upu_c;
-            upu_c.r = g->lambda;
-            upu_c.i = 0.0f;
-
-            for (int i = 0; i < g->M; i++) {
-                Complex term = spatial_complex_mul(spatial_complex_conj(u[i][f]), pu[i]);
-                upu_c = spatial_complex_add(upu_c, term);
-            }
-
-            if (use_notebook_update) {
-                upu_c.r += g->lambda;
-            }
-
-            float upu_real = upu_c.r;
-
-            /* upu_real = lambda + u^H P u is only ever valid (finite,
-             * positive) when P is still a well-conditioned positive-
-             * semidefinite matrix; lambda > 0 and u^H P u >= 0 for a true
-             * PSD P, so a non-finite or non-positive result here means P
-             * (computed from LAST frame, before this frame's update) has
-             * already drifted -- see GSC_P_DIAG_FLOOR/CEIL's comment above
-             * for why. Recover by resetting only this bin (not the whole
-             * GSC, which would discard every other bin's adaptation) and
-             * skipping its update this frame; the floor/ceiling clamp below
-             * is the proactive guard that should make this branch rare. */
-            if (!isfinite(upu_real) || upu_real <= 0.0f) {
-                gsc_reset_bin(g, f);
-                continue;
-            }
-
-            if (fabsf(upu_real) < 1e-12f) {
-                upu_real = (upu_real >= 0.0f) ? 1e-12f : -1e-12f;
-            }
-
-            float inv_upu = 1.0f / upu_real;
-            float inv_lambda = 1.0f / g->lambda;
-
-            /* ---------- gain = pu / denominator ---------- */
-            for (int i = 0; i < g->M; i++) {
-                gain[i].r = pu[i].r * inv_upu;
-                gain[i].i = pu[i].i * inv_upu;
-            }
-
-            /* ---------- q = u^H * P ---------- */
-            for (int j = 0; j < g->M; j++) {
-                q[j].r = 0.0f;
-                q[j].i = 0.0f;
-
-                for (int k = 0; k < g->M; k++) {
-                    Complex term = spatial_complex_mul(spatial_complex_conj(u[k][f]), g->P[f][k][j]);
-                    q[j] = spatial_complex_add(q[j], term);
-                }
-            }
-
-            /* ---------- P = (P - gain * q) / lambda ---------- */
-            for (int i = 0; i < g->M; i++) {
-                for (int j = 0; j < g->M; j++) {
-                    Complex term = spatial_complex_mul(gain[i], q[j]);
-
-                    g->P[f][i][j].r =
-                        (g->P[f][i][j].r - term.r) * inv_lambda;
-
-                    g->P[f][i][j].i =
-                        (g->P[f][i][j].i - term.i) * inv_lambda;
-                }
-            }
-
-            /* ---------- restore Hermitian symmetry ----------
-             * P is supposed to stay Hermitian (P[j][i] == conj(P[i][j])) by
-             * construction, but gain (= P*u) and q (= u^H*P) accumulate
-             * independent float32 rounding on each side of the rank-1
-             * downdate above, so the two off-diagonal entries of a pair can
-             * drift apart over many hops. Average them back onto the
-             * Hermitian manifold and force the (real-valued) diagonal's
-             * imaginary part to exactly zero. This is a numerical-hardening
-             * addition, not part of the original supplied algorithm -- see
-             * third_party/README.md. */
-            for (int i = 0; i < g->M; i++) {
-                for (int j = i + 1; j < g->M; j++) {
-                    Complex avg;
-                    avg.r = 0.5f * (g->P[f][i][j].r + g->P[f][j][i].r);
-                    avg.i = 0.5f * (g->P[f][i][j].i - g->P[f][j][i].i);
-                    g->P[f][i][j] = avg;
-                    g->P[f][j][i] = spatial_complex_conj(avg);
-                }
-                g->P[f][i][i].i = 0.0f;
-            }
-
-            /* ---------- diagonal loading: clamp P's diagonal ----------
-             * Proactive counterpart to the isfinite(upu_real) guard above:
-             * runs every adapted frame, on every bin, so P's diagonal never
-             * gets close enough to inf for that reactive check to be the
-             * only thing standing between a quiet stretch of audio and a
-             * corrupted spectrum. See GSC_P_DIAG_FLOOR/CEIL's comment. */
-            for (int i = 0; i < g->M; i++) {
-                if (g->P[f][i][i].r < GSC_P_DIAG_FLOOR) {
-                    g->P[f][i][i].r = GSC_P_DIAG_FLOOR;
-                } else if (g->P[f][i][i].r > GSC_P_DIAG_CEIL) {
-                    g->P[f][i][i].r = GSC_P_DIAG_CEIL;
-                }
-            }
-
-            /* ---------- wa update: wa = leak*wa + mu * gain * conj(gsc) ---------- */
-            Complex gsc_conj = spatial_complex_conj(gsc_spec[f]);
-
-            for (int m = 0; m < g->M; m++) {
-                Complex update = spatial_complex_mul(gain[m], gsc_conj);
-
-                if (use_mu_scaling) {
-                    update.r *= g->mu;
-                    update.i *= g->mu;
-                }
-
-                g->wa[m][f] = spatial_complex_add(spatial_complex_scale(g->wa[m][f], GSC_WA_LEAK), update);
-            }
-
-            /* ---------- final per-bin finite check ----------
-             * Defense in depth: catches corruption from any source other
-             * than P's own diagonal (e.g. a non-finite gsc_spec[f] feeding
-             * gsc_conj above) that the upu_real guard and diagonal clamp
-             * would not see, since both only look at P. Same per-bin
-             * reset+skip recovery -- this frame's wa update for this bin
-             * is discarded in favour of a clean slate. */
-            for (int m = 0; m < g->M; m++) {
-                if (!isfinite(g->wa[m][f].r) || !isfinite(g->wa[m][f].i)) {
-                    gsc_reset_bin(g, f);
-                    break;
-                }
-            }
-        }
+        gsc_rls_update_bins(
+            g, &u[0][0], gsc_spec,
+            use_notebook_update, use_mu_scaling,
+            use_mask_freeze, mask, force_scalar_rls);
 
         g->adaptive = 1;
     } else {
@@ -772,6 +959,38 @@ void gsc_process_with_weights(GSC* g,
 
     g->frame_idx += 1;
 }
+
+void gsc_process_with_weights(GSC* g,
+                              const Complex* const* X,
+                              float doa_s,
+                              int allow_adapt_in,
+                              const int* mask,
+                              Complex* gsc_out,
+                              Complex* effective_weights)
+{
+    gsc_process_with_weights_impl(
+        g, X, doa_s, allow_adapt_in, mask,
+        gsc_out, effective_weights, 0);
+}
+
+#ifdef GSC_TESTING
+/* Test-only oracle entry declared in gsc_test_hooks.h. It shares every
+ * production stage and forces only the RLS recurrence to its scalar path.
+ * Production libgsc.a is compiled without GSC_TESTING. */
+void gsc_test_process_with_weights_scalar_rls(
+    GSC* g,
+    const Complex* const* X,
+    float doa_s,
+    int allow_adapt_in,
+    const int* mask,
+    Complex* gsc_out,
+    Complex* effective_weights)
+{
+    gsc_process_with_weights_impl(
+        g, X, doa_s, allow_adapt_in, mask,
+        gsc_out, effective_weights, 1);
+}
+#endif
 
 void gsc_process(GSC* g,
                  const Complex* const* X,
@@ -787,11 +1006,11 @@ void gsc_process(GSC* g,
 void gsc_reset(GSC* g)
 {
     if (!g) return;
-    for (int f = 0; f < g->F; ++f) {
-        for (int i = 0; i < g->M; ++i) {
-            for (int j = 0; j < g->M; ++j) {
-                g->P[f][i][j].r = i == j ? 1.0f : 0.0f;
-                g->P[f][i][j].i = 0.0f;
+    for (int i = 0; i < g->M; ++i) {
+        for (int j = 0; j < g->M; ++j) {
+            for (int f = 0; f < g->F; ++f) {
+                g->P[i][j][f].r = i == j ? 1.0f : 0.0f;
+                g->P[i][j][f].i = 0.0f;
             }
         }
     }

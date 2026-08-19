@@ -13,6 +13,7 @@
 #include <string.h>
 
 #include "gsc.h"
+#include "gsc_test_hooks.h"
 #include "spatial_simd.h"
 #include "srp.h"
 #include "steering.h"
@@ -692,14 +693,14 @@ static int test_gsc_long_run_hermitian_and_finite(void) {
             CHECK(isfinite(output[f].r) && isfinite(output[f].i),
                   "long-run test: GSC output stays finite");
             for (i = 0; i < 4; ++i) {
-                CHECK(isfinite(g->P[f][i][i].r) && g->P[f][i][i].i == 0.0f,
+                CHECK(isfinite(g->P[i][i][f].r) && g->P[i][i][f].i == 0.0f,
                       "long-run test: P diagonal is real and finite");
                 for (j = i + 1; j < 4; ++j) {
-                    CHECK(isfinite(g->P[f][i][j].r) &&
-                              isfinite(g->P[f][i][j].i),
+                    CHECK(isfinite(g->P[i][j][f].r) &&
+                              isfinite(g->P[i][j][f].i),
                           "long-run test: P off-diagonal stays finite");
-                    CHECK(g->P[f][i][j].r == g->P[f][j][i].r &&
-                              g->P[f][i][j].i == -g->P[f][j][i].i,
+                    CHECK(g->P[i][j][f].r == g->P[j][i][f].r &&
+                              g->P[i][j][f].i == -g->P[j][i][f].i,
                           "long-run test: P stays exactly Hermitian");
                 }
             }
@@ -863,11 +864,11 @@ static int test_gsc_p_diag_clamp_bounds_runaway_values(void) {
 
     /* --- ceiling: poke every diagonal entry of target_bin far above the
      * ceiling, confirm one adapted hop clamps it back down. --- */
-    for (m = 0; m < 4; ++m) g->P[target_bin][m][m].r = 1e12f;
+    for (m = 0; m < 4; ++m) g->P[m][m][target_bin].r = 1e12f;
     gsc_process_with_weights(
         g, (const Complex* const*)channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
     for (m = 0; m < 4; ++m) {
-        CHECK(g->P[target_bin][m][m].r == gsc_p_diag_ceil(),
+        CHECK(g->P[m][m][target_bin].r == gsc_p_diag_ceil(),
               "P diagonal above the ceiling is clamped to exactly the ceiling");
     }
     CHECK(gsc_get_bin_resets(g) == 0,
@@ -876,11 +877,11 @@ static int test_gsc_p_diag_clamp_bounds_runaway_values(void) {
     /* --- floor: poke every diagonal entry of target_bin far below the
      * floor (including negative), confirm one adapted hop clamps it back
      * up. --- */
-    for (m = 0; m < 4; ++m) g->P[target_bin][m][m].r = -5.0f;
+    for (m = 0; m < 4; ++m) g->P[m][m][target_bin].r = -5.0f;
     gsc_process_with_weights(
         g, (const Complex* const*)channels, 0.7f, /*allow_adapt_in=*/1, NULL, output, NULL);
     for (m = 0; m < 4; ++m) {
-        CHECK(g->P[target_bin][m][m].r == gsc_p_diag_floor(),
+        CHECK(g->P[m][m][target_bin].r == gsc_p_diag_floor(),
               "P diagonal below the floor is clamped to exactly the floor");
     }
     CHECK(gsc_get_bin_resets(g) == 0,
@@ -888,8 +889,8 @@ static int test_gsc_p_diag_clamp_bounds_runaway_values(void) {
 
     /* an unrelated, never-poked bin must be untouched by either clamp
      * call -- the guard operates strictly per-bin. */
-    CHECK(g->P[other_bin][0][0].r != gsc_p_diag_ceil() &&
-              g->P[other_bin][0][0].r != gsc_p_diag_floor(),
+    CHECK(g->P[0][0][other_bin].r != gsc_p_diag_ceil() &&
+              g->P[0][0][other_bin].r != gsc_p_diag_floor(),
           "an unrelated bin's diagonal is not perturbed by another bin's clamp");
 
     free(storage);
@@ -947,7 +948,7 @@ static int test_gsc_bin_reset_on_nonfinite_p_propagation(void) {
     /* Corrupt one bin's P (as could happen from accumulated float error)
      * and confirm gsc_reset_bin() recovers it cleanly, without disturbing
      * any other bin. */
-    g->P[target_bin][0][0].r = NAN;
+    g->P[0][0][target_bin].r = NAN;
     CHECK(gsc_get_bin_resets(g) == 0, "bin reset test: starts at 0 resets");
 
     gsc_process_with_weights(
@@ -958,14 +959,14 @@ static int test_gsc_bin_reset_on_nonfinite_p_propagation(void) {
     for (m = 0; m < 4; ++m) {
         for (n = 0; n < 4; ++n) {
             float expected = (m == n) ? 1.0f : 0.0f;
-            CHECK(g->P[target_bin][m][n].r == expected &&
-                      g->P[target_bin][m][n].i == 0.0f,
+            CHECK(g->P[m][n][target_bin].r == expected &&
+                      g->P[m][n][target_bin].i == 0.0f,
                   "reset bin's P is restored to the identity");
         }
         CHECK(g->wa[m][target_bin].r == 0.0f && g->wa[m][target_bin].i == 0.0f,
               "reset bin's wa is cleared to zero");
     }
-    CHECK(isfinite(g->P[other_bin][0][0].r),
+    CHECK(isfinite(g->P[0][0][other_bin].r),
           "an unrelated bin's P is untouched by another bin's reset");
 
     free(storage);
@@ -1073,7 +1074,7 @@ static int test_gsc_init_pool_poison_and_bounds(void) {
 /* Heap-vs-pool byte-equal test: gsc_create() (heap) and gsc_init() (caller
  * pool) must evolve identically, hop for hop, across frames that both skip
  * AND trigger RLS adaptation -- not just matching gsc_out/effective_weights,
- * but the internal P[f][i][j]/wa[m][f] RLS state too. This is the strongest
+ * but the internal P[i][j][f]/wa[m][f] RLS state too. This is the strongest
  * check available that flattening GSC's nested Complex triple- and
  * double-pointer arrays into one carved pool block does not perturb the RLS
  * recursion's numeric evolution at all versus the original nested
@@ -1150,9 +1151,9 @@ static int test_gsc_heap_vs_pool_byte_equal(void) {
                           heap_g->wa[i][f].i == pool_g->wa[i][f].i,
                       "heap vs pool: wa[m][f] state is byte-equal every hop");
                 for (j = 0; j < M; ++j) {
-                    CHECK(heap_g->P[f][i][j].r == pool_g->P[f][i][j].r &&
-                              heap_g->P[f][i][j].i == pool_g->P[f][i][j].i,
-                          "heap vs pool: P[f][i][j] state is byte-equal every hop");
+                    CHECK(heap_g->P[i][j][f].r == pool_g->P[i][j][f].r &&
+                              heap_g->P[i][j][f].i == pool_g->P[i][j][f].i,
+                          "heap vs pool: P[i][j][f] state is byte-equal every hop");
                 }
             }
         }
@@ -1163,6 +1164,105 @@ static int test_gsc_heap_vs_pool_byte_equal(void) {
     free(pool);
     gsc_destroy(heap_g);
     srp_destroy(srp_handle);
+    return 1;
+}
+
+/* Production dispatch vs the scalar RLS oracle, compared after every hop.
+ * This catches a one-bit difference before recursive P/wa state can hide its
+ * origin. It covers four-bin vectors, the scalar tail, mixed mask groups,
+ * skipped adaptation, reset, and exceptional per-bin recovery. */
+static int run_gsc_rls_dispatch_matches_scalar_state(int notebook_mode) {
+    enum { M = 4, F = 65, NUM_ANGLES = 72, HOPS = 500 };
+    SRP_Config srp_cfg;
+    GSC_Config cfg;
+    SRP* srp_handle;
+    GSC* dispatched;
+    GSC* scalar;
+    Complex* storage;
+    Complex* channels[M];
+    Complex dispatched_out[F];
+    Complex scalar_out[F];
+    Complex dispatched_weights[M * F];
+    Complex scalar_weights[M * F];
+    int mask[F];
+
+    srp_handle = make_test_srp(&srp_cfg);
+    CHECK(srp_handle != NULL,
+          "RLS dispatch parity: create steering owner");
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.enable = 1;
+    cfg.lambda = 0.995f;
+    cfg.mu = 0.05f;
+    cfg.enable_fix_mode = 1;
+    cfg.fixed_doa_rad = 0.7f;
+    cfg.fixed_align_notebook = notebook_mode;
+    cfg.adapt_interval = notebook_mode ? 5 : 2;
+    dispatched = gsc_create(M, F, NUM_ANGLES, srp_handle->a_array, &cfg);
+    scalar = gsc_create(M, F, NUM_ANGLES, srp_handle->a_array, &cfg);
+    CHECK(dispatched && scalar,
+          "RLS dispatch parity: create both GSC instances");
+    storage = (Complex*)malloc((size_t)M * F * sizeof(Complex));
+    CHECK(storage != NULL, "RLS dispatch parity: allocate inputs");
+    for (int m = 0; m < M; ++m) channels[m] = storage + (size_t)m * F;
+
+    for (int hop = 0; hop < HOPS; ++hop) {
+        int allow_adapt = (hop % 5) != 0;
+        for (int m = 0; m < M; ++m) {
+            for (int f = 0; f < F; ++f) {
+                channels[m][f].r = random_signed();
+                channels[m][f].i = random_signed();
+            }
+        }
+        for (int f = 0; f < F; ++f) {
+            mask[f] = (hop % 7 == 0) && ((hop + f) % 11 == 0);
+        }
+        if (hop == 173) {
+            /* Force the vector group's pre-store exceptional fallback. */
+            dispatched->P[0][0][4].r = NAN;
+            scalar->P[0][0][4].r = NAN;
+        }
+        if (hop == 251) {
+            gsc_reset(dispatched);
+            gsc_reset(scalar);
+        }
+
+        gsc_process_with_weights(
+            dispatched, (const Complex* const*)channels, 0.7f,
+            allow_adapt, mask, dispatched_out, dispatched_weights);
+        gsc_test_process_with_weights_scalar_rls(
+            scalar, (const Complex* const*)channels, 0.7f,
+            allow_adapt, mask, scalar_out, scalar_weights);
+
+        CHECK(memcmp(dispatched_out, scalar_out,
+                     sizeof(dispatched_out)) == 0,
+              "RLS dispatch parity: output is byte-identical every hop");
+        CHECK(memcmp(dispatched_weights, scalar_weights,
+                     sizeof(dispatched_weights)) == 0,
+              "RLS dispatch parity: effective weights are byte-identical");
+        CHECK(memcmp(dispatched->P[0][0], scalar->P[0][0],
+                     (size_t)M * M * F * sizeof(Complex)) == 0,
+              "RLS dispatch parity: recursive P state is byte-identical");
+        CHECK(memcmp(dispatched->wa[0], scalar->wa[0],
+                     (size_t)M * F * sizeof(Complex)) == 0,
+              "RLS dispatch parity: recursive wa state is byte-identical");
+        CHECK(dispatched->bin_resets == scalar->bin_resets &&
+                  dispatched->frame_idx == scalar->frame_idx &&
+                  dispatched->adaptive == scalar->adaptive,
+              "RLS dispatch parity: control state is identical");
+    }
+
+    free(storage);
+    gsc_destroy(scalar);
+    gsc_destroy(dispatched);
+    srp_destroy(srp_handle);
+    return 1;
+}
+
+static int test_gsc_rls_dispatch_matches_scalar_state(void) {
+    CHECK(run_gsc_rls_dispatch_matches_scalar_state(0),
+          "RLS dispatch parity: production update policy");
+    CHECK(run_gsc_rls_dispatch_matches_scalar_state(1),
+          "RLS dispatch parity: fixed-notebook update policy");
     return 1;
 }
 
@@ -1242,7 +1342,7 @@ static int test_srp_frame_counter_survives_32bit_boundary(void) {
     return 1;
 }
 
-int main(void) {
+static int run_all_tests(void) {
     CHECK(test_phat_scalar_vs_dispatch(), "PHAT SIMD test");
     CHECK(test_beamform_and_score_scalar_vs_dispatch(),
           "beamform/SRP-score SIMD test");
@@ -1269,11 +1369,17 @@ int main(void) {
           "GSC pool-first poison/bounds test");
     CHECK(test_gsc_heap_vs_pool_byte_equal(),
           "GSC heap-vs-pool byte-equal test");
+    CHECK(test_gsc_rls_dispatch_matches_scalar_state(),
+          "GSC RLS scalar-vs-dispatch recursive-state test");
     CHECK(test_gsc_frame_idx_survives_32bit_boundary(),
           "GSC frame_idx 32-bit-boundary test");
     CHECK(test_srp_frame_counter_survives_32bit_boundary(),
           "SRP frame_counter 32-bit-boundary test");
     printf("All third-party spatial tests passed (backend=%s)\n",
            spatial_simd_backend());
-    return 0;
+    return 1;
+}
+
+int main(void) {
+    return run_all_tests() ? 0 : 1;
 }
