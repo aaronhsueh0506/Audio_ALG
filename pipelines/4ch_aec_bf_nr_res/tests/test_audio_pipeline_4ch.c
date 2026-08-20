@@ -457,8 +457,8 @@ static int run_static_parity(int sample_rate, int fft_size) {
     CHECK(audio_pipeline_4ch_get_mem_requirements(&cfg, &req) == 0,
           "static memory requirement query succeeds");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_LAYOUT_VERSION &&
-              AUDIO_PIPELINE_4CH_LAYOUT_VERSION == 7u,
-          "the queried descriptor publishes the current carve layout (7)");
+              AUDIO_PIPELINE_4CH_LAYOUT_VERSION == 8u,
+          "the queried descriptor publishes the current carve layout");
     CHECK(req.bytes <= (uint64_t)SIZE_MAX,
           "static memory requirement fits size_t");
     pool_bytes = (size_t)req.bytes + (size_t)EXTRA;

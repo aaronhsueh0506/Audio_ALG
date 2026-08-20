@@ -191,8 +191,12 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * far-active floor retarget state), so every AEC carved out of this pool
  * moves the total and the offsets after it. Carve order and buffer set are
  * unchanged, so build_flags_hash does not move -- this counter is the only
- * signal. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 11u
+ * signal.
+ * Version 12 carries the core's own layout 12 -> 13 (its control block gained
+ * the per-hop stage-timing record). Nothing in THIS layer's carve changed;
+ * the composed pre-only core sub-pool simply grew, and build_flags_hash
+ * cannot say so for the same carve-token reason as v9. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 12u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

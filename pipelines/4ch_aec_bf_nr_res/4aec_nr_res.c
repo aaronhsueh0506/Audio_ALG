@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include <math.h>
 #include <stddef.h>
+#include <time.h>
 
 #include "4aec_nr_res.h"
 #include "4aec_nr_res_internal.h"
@@ -62,6 +63,17 @@ static uint32_t four_aec_nr_res_backend_id(void) {
     if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "ne10") == 0)
         return FOUR_AEC_NR_RES_BACKEND_NE10;
     return 0u;
+}
+
+/* Microsecond monotonic stamp for the per-stage diagnostic timing. Truncated
+ * to 32 bits: every consumer subtracts two stamps in UNSIGNED arithmetic, so
+ * the difference is exact for any interval shorter than the ~71.6 minute wrap
+ * -- which no hop approaches. */
+static uint32_t four_aec_nr_res_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000000ull
+                      + (uint64_t)ts.tv_nsec / 1000ull);
 }
 
 /* Process-wide monotonic construction counter -- see FourAecNrResFrameToken's
@@ -173,6 +185,14 @@ struct FourAecNrRes {
     void* owned_heap;
     size_t pool_size;
     int destroyed;
+
+    /* Per-stage wall-clock timing -- see FourAecNrResLastTiming's doc comment
+     * (4aec_nr_res.h) for what each field measures. Stored as the published
+     * record itself rather than eight private twins, so the accessor is one
+     * assignment and a new stage cannot be added to one side only. Appended
+     * at the end, the same precedent as aec.h's Aec additions: every field
+     * above keeps its pre-existing offset. */
+    FourAecNrResLastTiming last_timing;
 };
 
 typedef struct PoolCursor {
@@ -1134,12 +1154,23 @@ int four_aec_nr_res_process_pre(
     int ch;
     int i;
     int old_align;
+    uint32_t t0;
     const Complex* shared_far_spec = NULL;   /* Group 6: set by lane 0, borrowed by lanes 1-3 */
 
     if (!p || p->destroyed ||
         !microphones_interleaved || !ref || !out)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     if (p->pending) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+
+    /* Cleared once the call is accepted: a hop that then bails out part-way
+     * reports zero for the stages it never reached rather than the previous
+     * hop's numbers. frontend/lane_res have no writer at all -- see the
+     * header -- so clearing is the only thing that keeps them at zero. The
+     * post half is cleared the same way in process_post_impl(). */
+    p->last_timing.delay_us = 0;
+    p->last_timing.frontend_us = 0;
+    p->last_timing.linear_us = 0;
+    p->last_timing.lane_res_us = 0;
 
     hop = p->hop_size;
     if (!inputs_finite(
@@ -1163,7 +1194,12 @@ int four_aec_nr_res_process_pre(
      * (0) until the estimate first turns solid. Captured ahead of
      * update_shared_delay(), which overwrites both fields. */
     old_align = p->last_delay.solid ? p->accepted_delay : 0;
+    t0 = four_aec_nr_res_now_us();
     delay = update_shared_delay(p, p->mic_lane, ref);
+    p->last_timing.delay_us = four_aec_nr_res_now_us() - t0;
+    /* align_render() below is deliberately OUTSIDE the window: it is a
+     * ring-buffer copy, not delay estimation, and the caller's reconciliation
+     * identity accounts for it in the pre-stage remainder. */
     if (!align_render(p, ref, delay.delay_samples)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
@@ -1193,6 +1229,10 @@ int four_aec_nr_res_process_pre(
         }
     }
 
+    /* The whole four-lane AEC loop, attributed to linear_us -- see
+     * FourAecNrResLastTiming in the header for why the frontend/lane-RES
+     * split cannot be taken from here. */
+    t0 = four_aec_nr_res_now_us();
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
         AecResContext context;
         if (ch != p->cfg.capture_proxy_channel) {
@@ -1239,6 +1279,8 @@ int four_aec_nr_res_process_pre(
                 context.formed_hop[i];
         }
     }
+
+    p->last_timing.linear_us = four_aec_nr_res_now_us() - t0;
 
     p->pending_token.frame_index = p->next_frame;
     p->pending_token.generation = p->generation;
@@ -1393,7 +1435,11 @@ static int run_post_res_and_nr(
     int fft = p->fft_size;
     int k;
     float nf_eff;
+    uint32_t t0, t1;
 
+    /* RES stage: the power/reference preparation this gain depends on, plus
+     * the suppression-gain computation itself. */
+    t0 = four_aec_nr_res_now_us();
     four_aec_complex_mag2(p->error_power, error, n);
     four_aec_complex_mag2(p->post_near_power, p->fused_near, n);
     for (k = 0; k < n; ++k) {
@@ -1422,12 +1468,18 @@ static int run_post_res_and_nr(
         p->cfg.delay_mode == AEC_DELAY_MATCHED
             ? delay_aec3_has_clockdrift(&p->shared_delay) : 0,
         max_saturation > 0.5f);
+    /* One stamp closes RES and opens NR: the two statements between them are
+     * a branch and a ternary, so a second clock read would cost more than the
+     * gap it measures and leave that gap unattributed. */
+    t1 = four_aec_nr_res_now_us();
+    p->last_timing.res_us = t1 - t0;
     if (!res_gain) return 0;
 
     nr_extra = p->cfg.legacy_amin ? NULL : p->extra_noise;
     if (mmse_lsa_process_gain(
             p->nr, error, nr_extra, NULL) != 0)
         return 0;
+    p->last_timing.nr_us = four_aec_nr_res_now_us() - t1;
 
     /* total_gain[k]=min(...) and the near_mean reduction below are mutually
      * independent (neither reads the other's output), so they share one
@@ -1493,6 +1545,11 @@ static int run_post_res_and_nr(
         }
     }
 
+    /* Synthesis: inverse transform, windowed overlap-add, and the hop
+     * emit/shift. The finite check after it is validation, not synthesis, and
+     * falls in the post-stage remainder along with the gain fusion, near-floor
+     * gate and comfort-noise loop above. */
+    t0 = four_aec_nr_res_now_us();
     fft_inverse(p->fft, p->output_spec, p->ifft_buffer);
     sk_wola_accumulate_f32(p->ola, p->ifft_buffer, p->synth_window, fft);
     memcpy(out, p->ola, (size_t)hop * sizeof(float));
@@ -1502,6 +1559,7 @@ static int run_post_res_and_nr(
     memset(
         p->ola + (fft - hop), 0,
         (size_t)hop * sizeof(float));
+    p->last_timing.synth_us = four_aec_nr_res_now_us() - t0;
     return inputs_finite(out, (size_t)hop);
 }
 
@@ -1515,6 +1573,7 @@ static int process_post_impl(
     float max_dt;
     float max_saturation;
     float far_power;
+    uint32_t t0;
 
     if (!p || p->destroyed || !token || !weights || !out ||
         !p->cfg.enable_post)
@@ -1524,6 +1583,15 @@ static int process_post_impl(
     if (!validate_weights(p, weights))
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
 
+    /* Post half cleared here for the same reason process_pre() clears the
+     * pre half: a hop that bails out reports zeros, not stale numbers. */
+    p->last_timing.fuse_us = 0;
+    p->last_timing.res_us = 0;
+    p->last_timing.nr_us = 0;
+    p->last_timing.synth_us = 0;
+
+    /* Fuse stage: the beamformer-weighted projection of the four lanes. */
+    t0 = four_aec_nr_res_now_us();
     if (!fuse_contexts(
             p, weights, trusted_beamformed_error,
             &all_converged, &max_dt,
@@ -1531,6 +1599,7 @@ static int process_post_impl(
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
+    p->last_timing.fuse_us = four_aec_nr_res_now_us() - t0;
     if (!run_post_res_and_nr(
             p, all_converged, max_dt, max_saturation,
             far_power, trusted_beamformed_error, out)) {
@@ -1893,4 +1962,21 @@ int four_aec_nr_res_get_mem_breakdown(
     out->fft_size = fft;
     out->n_freqs = n;
     return 0;
+}
+
+/* ============================================================================
+ * Diagnostic per-stage timing
+ * ========================================================================== */
+
+/* See FourAecNrResLastTiming's doc comment (4aec_nr_res.h) for the full
+ * stage-boundary reference. */
+void four_aec_nr_res_get_last_timing(
+    const FourAecNrRes* p,
+    FourAecNrResLastTiming* out) {
+    if (!out) return;
+    if (!p || p->destroyed) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    *out = p->last_timing;
 }

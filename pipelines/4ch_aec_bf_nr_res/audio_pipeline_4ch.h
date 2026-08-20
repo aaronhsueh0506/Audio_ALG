@@ -126,8 +126,14 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * far-active floor retarget state), so every AEC carved out of this pool
  * moves the total and the offsets after it. Carve order and buffer set are
  * unchanged, so build_flags_hash does not move -- this counter is the only
- * signal. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 7u
+ * signal.
+ * Version 8 carries the core's own layout 12 -> 13 (its control block gained
+ * the per-hop stage-timing record). Same shape as v5: nothing in THIS layer's
+ * carve changed, the composed core sub-pool simply grew, and build_flags_hash
+ * cannot say so -- it folds in the core's carve-TOKEN hash, which a
+ * control-block-only change leaves alone. Bumping this counter by hand is the
+ * only thing that invalidates a persisted descriptor. */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 8u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

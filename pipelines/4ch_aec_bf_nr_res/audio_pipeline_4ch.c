@@ -221,9 +221,14 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
 
 /* Plain FNV-style integer mix, no snprintf/stdio -- this path must stay
  * NO_STDIO-safe (see Makefile's audit-no-stdio). Folds in the core layer's
- * own build_flags_hash so a core-layout version bump also invalidates every
- * persisted composite descriptor here, never silently keeps fitting a pool
- * sized for a stale core layout -- see AudioPipeline4ChMemReq's doc comment. */
+ * own build_flags_hash, so a change to the core's CARVE TOKEN propagates
+ * here. A core LAYOUT VERSION bump does not: the core's hash is taken over
+ * its backend string, carve token and alignment only, so a control-block-only
+ * growth leaves it -- and therefore this hash -- unchanged. Verified: the core
+ * went 12 -> 13 with this hash unmoved. Only bumping
+ * AUDIO_PIPELINE_4CH_LAYOUT_VERSION by hand invalidates a persisted composite
+ * descriptor -- see AudioPipeline4ChMemReq's doc comment, which states this
+ * correctly. */
 static uint32_t audio_pipeline_4ch_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;

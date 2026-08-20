@@ -202,6 +202,44 @@ heap 便利路徑：`four_aec_nr_res_create(&cfg)` 把第 1~3 步合成一步，
 用來在整合測試裡證明拓撲沒有被改掉；最後一個用來證明跨聲道的 far-end 共用真的生效。
 它們對處理結果沒有任何影響。
 
+### 3.1b 逐階段耗時（診斷用）
+
+```c
+typedef struct FourAecNrResLastTiming {
+    uint32_t delay_us, frontend_us, linear_us, lane_res_us;   /* process_pre  */
+    uint32_t fuse_us,  res_us,      nr_us,     synth_us;      /* process_post */
+} FourAecNrResLastTiming;
+
+void four_aec_nr_res_get_last_timing(const FourAecNrRes* p,
+                                     FourAecNrResLastTiming* out);
+```
+
+最近一個 hop 每個階段的 wall-clock 成本（微秒，`CLOCK_MONOTONIC`）。純診斷：
+pipeline 自己不回讀，也不影響處理。`p` 為 NULL 或已 destroy 時把 `out` 清零而
+不是失敗；`out` 不得為 NULL。
+
+**六個欄位是真的量測值**：`delay_us`（只有共用延遲估計，不含 `align_render()`
+的 ring-buffer 複製與 realign 掃描）、`linear_us`（整個四路 AEC 迴圈）、
+`fuse_us`、`res_us`（它消耗的功率準備 ＋ 抑制增益）、`nr_us`、`synth_us`
+（逆轉換 ＋ 加窗 overlap-add ＋ hop 送出）。
+
+**`frontend_us` 與 `lane_res_us` 恆為 0**：AEC frontend、線性濾波器本體與
+per-lane RES 都在 `aec_process_context*()` 內部，那支函式沒有自己的計時窗，
+從這一層切不開，因此三者合計記在 `linear_us`。這兩欄寧可留 0 也不報一個沒量到
+的數字。實測 `linear_us` 約佔整個 hop 的 74%，所以**最大的一塊目前是不可分解
+的**；要拆開必須在 AEC 函式庫內部開窗，那會讓 `sizeof(Aec)` 變大，連帶要 bump
+本層與兩個 mono pipeline 共五個 layout version。
+
+各階段**加起來不等於**整個呼叫的時間，呼叫端要自己用減法補餘額：pre 側餘額涵蓋
+輸入去交錯／有限值檢查、`align_render()` 與 realign 掃描；post 側餘額涵蓋 gain
+融合、near-floor 閘與 comfort-noise 迴圈。
+
+兩半各自在自己的呼叫被**接受之後**清零，所以中途 bail-out 的 hop 會回報 0 而不是
+上一個 hop 的數字；被引數／token 檢查直接拒絕的呼叫則整份記錄不動。在
+`process_post*()` 回傳後讀才是完整的。
+
+解析度是微秒，所以低於 1 µs 的階段會讀到 0。
+
 ### 3.2 執行期強度控制
 
 ```c
@@ -371,19 +409,20 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是 2026-08-19、`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED`（預設,
+以下是 2026-08-20、`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED`（預設,
 n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backend、換編譯
-選項、更新 submodule 都會變。本輪 `sizeof(Aec)` 增加 8 B、`ALIGN16(sizeof(Aec))`
-跨過 16-byte 邊界，四路各 +16 B，所以 `aec_bytes` 與 `req.bytes` 每列 +64 B；
+選項、更新 submodule 都會變。本輪控制區塊新增 32 B 的逐階段計時記錄
+（`four_aec_nr_res_get_last_timing()`），`ALIGN16` 沒有吸收，所以 `req.bytes`
+與 `wrapper_bytes` 每列 +32 B；`aec_bytes`／`nr_bytes`／`fft_bytes` 不動，
 所有差額不變。
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `nr_bytes` | `fft_bytes` | `wrapper_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,488 | 859,008 | 122,160 | 8,784 | 123,536 |
-| 16000，`fft_size=512` | 1,669,248 | 1,375,296 | 133,472 | 16,976 | 143,504 |
-| 16000，`max_delay_ms=100` | 1,054,352 | 859,008 | 122,160 | 8,784 | 64,400 |
-| 16000，`filter_length=512` | 1,026,896 | 772,416 | 122,160 | 8,784 | 123,536 |
-| 48000，預設（1024/512） | 3,680,768 | 2,954,112 | 374,336 | 33,360 | 318,960 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,520 | 859,008 | 122,160 | 8,784 | 123,568 |
+| 16000，`fft_size=512` | 1,669,280 | 1,375,296 | 133,472 | 16,976 | 143,536 |
+| 16000，`max_delay_ms=100` | 1,054,384 | 859,008 | 122,160 | 8,784 | 64,432 |
+| 16000，`filter_length=512` | 1,026,928 | 772,416 | 122,160 | 8,784 | 123,568 |
+| 48000，預設（1024/512） | 3,680,800 | 2,954,112 | 374,336 | 33,360 | 318,992 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
@@ -395,9 +434,9 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 1,113,488 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,888 | −93,600 |
-| `EXTERNAL_ALIGNED` | 1,012,976 | −100,512 |
+| `MATCHED` n=5（預設） | 1,113,520 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,920 | −93,600 |
+| `EXTERNAL_ALIGNED` | 1,013,008 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
@@ -407,14 +446,13 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | Config | `req.bytes` |
 |---|---:|
-| 16000，`fft_size=512`，`enable_post=0` | 1,485,824 |
+| 16000，`fft_size=512`，`enable_post=0` | 1,485,856 |
 
 即 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 記載的 ULCNet
 4ch wrapper私有核心大小；比同格點 `enable_post=1` 少 183,424 B（NR/RES/iFFT
-的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。這一列是**校正**而非單純
-加值：先前記的 1,485,728 除了本輪的 +64 B 之外，還有 32 B 是更早一代就沒跟上的
-`wrapper_bytes`（`enable_post=0` 的 wrapper 為 110,528 B，與後端無關），所以差額
-也從 183,456 B 修正為實測的 183,424 B。
+的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。本輪同樣 +32 B（`enable_post=0` 的
+wrapper 為 110,560 B，與後端無關），兩側同幅移動，所以差額維持實測的
+183,424 B。
 **實際配置一律以 `req.bytes` 為準。**
 
 ---

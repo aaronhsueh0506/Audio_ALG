@@ -279,8 +279,11 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
 }
 
 /* Folds in the core's own build_flags_hash exactly like
- * audio_pipeline_4ch.c's hash does, so a core-layout bump invalidates every
- * persisted composite descriptor here as well. NO_STDIO-safe (no snprintf). */
+ * audio_pipeline_4ch.c's hash does, so a change to the core's CARVE TOKEN
+ * propagates here. A core LAYOUT VERSION bump does not -- the core's hash
+ * never sees it -- so invalidating a persisted composite descriptor still
+ * requires bumping AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION by hand.
+ * NO_STDIO-safe (no snprintf). */
 static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;

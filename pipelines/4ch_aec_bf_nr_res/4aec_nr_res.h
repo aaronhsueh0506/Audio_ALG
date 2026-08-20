@@ -113,8 +113,17 @@ extern "C" {
  *      carved out of this pool, so the total and every offset after the first
  *      lane move. No new REGION and no carve-order change, so the token --
  *      and therefore build_flags_hash -- is unchanged again; this counter is
- *      the only signal. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 12u
+ *      the only signal.
+ *  13: the control block gained the per-hop stage-timing record
+ *      (FourAecNrResLastTiming, 32 B -- see four_aec_nr_res_get_last_timing()
+ *      below). Control-block-only again: no new REGION, no carve-order
+ *      change, build_flags_hash unmoved, so this counter is once more the
+ *      whole signal. The size was not a choice: the pre-change control block
+ *      was 2848 B = 16 x 178 exactly, so ALIGN16 had zero slack and ANY added
+ *      state moves the pool -- measured, a 24 B record rounds to the same
+ *      +32 B pool growth as the 32 B one, so nothing smaller would have
+ *      avoided this bump. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 13u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -710,6 +719,85 @@ typedef struct FourAecNrResMemBreakdown {
 int four_aec_nr_res_get_mem_breakdown(
     const FourAecNrResConfig* cfg,
     FourAecNrResMemBreakdown* out);
+
+/**
+ * Per-stage wall-clock cost of the most recent hop, in microseconds.
+ *
+ * Diagnostic only: nothing in the pipeline reads these back, and they do not
+ * affect processing. Stamped with CLOCK_MONOTONIC, so a build that must have
+ * no clock dependency at all cannot use this header's implementation as-is.
+ *
+ * WHICH STAGE EACH FIELD COVERS
+ *
+ *   delay_us     update_shared_delay() -- the shared delay estimator only.
+ *                align_render()'s ring-buffer copy and the realign sweep are
+ *                deliberately outside it; they are not delay estimation.
+ *   frontend_us  ALWAYS 0 -- see below.
+ *   linear_us    the whole four-lane AEC loop: aec_process_context() for lane
+ *                0, aec_process_context_shared_far() for lanes 1-3, plus each
+ *                lane's context bind and hop copy.
+ *   lane_res_us  ALWAYS 0 -- see below.
+ *   fuse_us      fuse_contexts(): the beamformer-weighted projection of the
+ *                four lane contexts into one.
+ *   res_us       the residual-echo suppression gain: the error/near power
+ *                preparation it consumes plus suppression_gain_get_gain().
+ *   nr_us        mmse_lsa_process_gain() -- the noise-reduction gain.
+ *   synth_us     inverse transform, windowed overlap-add, and the hop
+ *                emit/shift.
+ *
+ * WHY TWO FIELDS ARE ALWAYS ZERO
+ *
+ * The AEC frontend, the linear filter proper and the per-lane RES all run
+ * INSIDE aec_process_context*(), which carries no timing windows of its own.
+ * They cannot be separated from this side, so their combined cost is reported
+ * in linear_us and these two fields stay zero rather than reporting a number
+ * they did not measure. Splitting them needs windows in the AEC library, which
+ * would grow sizeof(Aec) and so bump this layout version, both 4ch wrappers
+ * AND both mono pipelines. Offline, AEC's own test/bench_rtf.c already
+ * separates the residual-echo cost by config differencing (full run minus
+ * enable_res=0) without any library state -- a complement for sizing work,
+ * not a substitute for per-hop numbers.
+ *
+ * The stages do not add up to the enclosing call: a caller presenting a full
+ * breakdown must carry the remainder explicitly. The pre-side remainder holds
+ * align_render(), the realign sweep, the de-interleave and input validation;
+ * the post-side remainder holds the gain fusion, near-floor gate and
+ * comfort-noise loop that sit between the timed calls.
+ *
+ * RESOLUTION. Microseconds, so a stage faster than 1 us reads 0. On the
+ * development host clock_getres(CLOCK_MONOTONIC) is itself 1 us (measured),
+ * which puts fuse/res/synth at 0-2 us -- readable as an order of magnitude,
+ * not as a precise figure. The stage this exists to find (linear_us, measured
+ * at ~74% of the hop) is far above that floor. Storing nanoseconds in the same
+ * uint32_t would give 1000x the resolution and still take 4.29 s to wrap, if
+ * the fine end ever matters.
+ *
+ * LIFETIME. The values describe the last hop that reached each stage. Each
+ * half is cleared once its own call has been ACCEPTED -- after the argument
+ * and token checks -- so a hop that starts and then bails out (a non-finite
+ * input, a DSP error) reports zero for the stages it never reached rather
+ * than the previous hop's numbers. A call rejected outright by those checks
+ * leaves the whole record untouched. Read the record after process_post*()
+ * returns; after process_pre() alone the post half still holds whatever the
+ * previous completed hop left there.
+ */
+typedef struct FourAecNrResLastTiming {
+     uint32_t delay_us;
+     uint32_t frontend_us;
+     uint32_t linear_us;
+     uint32_t lane_res_us;
+     uint32_t fuse_us;
+     uint32_t res_us;
+     uint32_t nr_us;
+     uint32_t synth_us;
+} FourAecNrResLastTiming;
+
+/* Copies the last hop's stage timings into `out`. A NULL/destroyed pipeline
+ * zeroes `out` rather than failing, so a diagnostic caller needs no special
+ * case. `out` must not be NULL. */
+void four_aec_nr_res_get_last_timing(
+    const FourAecNrRes* p,
+    FourAecNrResLastTiming* out);
 
 #ifdef __cplusplus
 }

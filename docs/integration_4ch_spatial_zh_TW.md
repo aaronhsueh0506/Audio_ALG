@@ -478,15 +478,16 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 | `geometry` 與座標 | 不變 |
 
 `BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設下的 `req.bytes`
-（2026-08-19 重量；最後一欄標明每一列的來源）。本輪 `ALIGN16(sizeof(Aec))`
-跨過 16-byte 邊界，四路各 +16 B，所以每一列都 +64 B：
+（2026-08-20 重量；最後一欄標明每一列的來源）。本輪核心控制區塊多了 32 B
+的逐階段計時記錄（`four_aec_nr_res_get_last_timing()`），`ALIGN16` 沒有吸收，
+所以每一列都 +32 B：
 
 | Config | `req.bytes` | 來源 |
 |---|---:|---|
-| 16000，全預設（256/128，`num_angles=72`） | 1,905,792 | 實測 |
-| 16000，`core.fft_size = 512` | 3,239,280 | 實測 |
-| 16000，`num_angles = 360` | 4,907,904 | 實測（直接呼叫 `get_mem_requirements()`）|
-| 48000，全預設（1024/512，`num_angles=72`） | 6,806,256 | 實測 |
+| 16000，全預設（256/128，`num_angles=72`） | 1,905,824 | 實測 |
+| 16000，`core.fft_size = 512` | 3,239,312 | 實測 |
+| 16000，`num_angles = 360` | 4,907,936 | 實測（直接呼叫 `get_mem_requirements()`）|
+| 48000，全預設（1024/512，`num_angles=72`） | 6,806,288 | 實測 |
 
 ⚠ 覆蓋差異：只有 `num_angles = 72` 的 16 kHz/256 與 48 kHz/1024 兩組會被
 C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_size = 512`

@@ -696,20 +696,21 @@ static void run_static_parity(int sample_rate, int fft_size) {
           "static init_ex rejects a stale layout even when its cached "
           "bytes are larger than current (byte count fitting must never "
           "substitute for layout/hash agreement)");
-    /* The superseded version spelled out, not `current - 1`: a descriptor
-     * persisted by a version-10 build carries exactly this number, and its
+    /* The immediately superseded version spelled out, not `current - 1`: a
+     * descriptor persisted by that build carries exactly this number, and its
      * byte count is left at the CURRENT figure so the only thing wrong with
      * it is the layout. A control-block-only growth moves no carve token, so
-     * build_flags_hash still matches and this counter is the whole signal. */
+     * build_flags_hash still matches and this counter is the whole signal.
+     * Bump this literal with FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 11u;
+    stale.layout_version = 12u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
-          "static init_ex rejects a descriptor from the superseded layout 11 "
+          "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 12u,
-          "the queried descriptor publishes the current carve layout (12)");
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 13u,
+          "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(
         pool, (size_t)req.bytes, &cfg, &req);
@@ -1940,7 +1941,19 @@ static void test_delay_change_candidate_ttl(void) {
  * then silently revert, which is exactly what test 3 below pins.
  * ========================================================================== */
 
-static void feed_strength_hops(FourAecNrRes* p, int hops) {
+/* Drives `hops` hops of the shared strength/timing stimulus. When
+ * last_pre_us/last_post_us are non-NULL they receive the wall-clock cost of
+ * the FINAL hop's process_pre/process_post, which is what lets the timing
+ * test bracket the same workload this drives without a second copy of the
+ * stimulus. */
+static uint32_t elapsed_us(const struct timespec* a, const struct timespec* b) {
+    return (uint32_t)((b->tv_sec - a->tv_sec) * 1000000
+                      + (b->tv_nsec - a->tv_nsec) / 1000);
+}
+
+static void feed_strength_hops(FourAecNrRes* p, int hops,
+                               uint32_t* last_pre_us,
+                               uint32_t* last_post_us) {
     int hop = four_aec_nr_res_hop_size(p);
     int n = four_aec_nr_res_n_freqs(p);
     float* mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
@@ -1959,6 +1972,7 @@ static void feed_strength_hops(FourAecNrRes* p, int hops) {
             w[(size_t)ch * (size_t)n + (size_t)k].i = 0.0f;
         }
     for (h = 0; h < hops; ++h) {
+        struct timespec a, b;
         for (i = 0; i < hop; ++i) {
             float t = (float)(h * hop + i);
             float r = 0.6f * sinf(0.06f * t);
@@ -1966,9 +1980,16 @@ static void feed_strength_hops(FourAecNrRes* p, int hops) {
             for (ch = 0; ch < 4; ++ch)
                 mics[(size_t)i * 4u + (size_t)ch] = 0.5f * r + 0.02f * sinf(0.017f * t);
         }
+        clock_gettime(CLOCK_MONOTONIC, &a);
         if (four_aec_nr_res_process_pre(p, mics, far, &pre) != FOUR_AEC_NR_RES_OK)
             break;
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        if (last_pre_us) *last_pre_us = elapsed_us(&a, &b);
+
+        clock_gettime(CLOCK_MONOTONIC, &a);
         (void)four_aec_nr_res_process_post(p, &pre.token, w, out);
+        clock_gettime(CLOCK_MONOTONIC, &b);
+        if (last_post_us) *last_post_us = elapsed_us(&a, &b);
     }
     free(mics); free(far); free(out); free(w);
 }
@@ -1980,7 +2001,7 @@ static void test_runtime_strength(void) {
 
     CHECK(p != NULL, "strength: core created");
     if (!p) return;
-    feed_strength_hops(p, 30);
+    feed_strength_hops(p, 30, NULL, NULL);
     CHECK(four_aec_nr_res_post_split_floor(p, &live0, &target0) == 0,
           "strength: the shared post floor is readable");
 
@@ -2005,15 +2026,15 @@ static void test_runtime_strength(void) {
     }
 
     /* 3. A ramp is genuinely in flight before it lands. */
-    feed_strength_hops(p, 20);
+    feed_strength_hops(p, 20, NULL, NULL);
     CHECK(four_aec_nr_res_set_aec_preset(p, AEC_PRESET_MILD, 100.0f) == 0,
           "strength: ramped retarget accepted");
     {
         float lv = 0.0f, tg = 0.0f;
-        feed_strength_hops(p, 2);
+        feed_strength_hops(p, 2, NULL, NULL);
         four_aec_nr_res_post_split_floor(p, &lv, &tg);
         CHECK(lv != tg, "strength: the ramp is mid-flight after 2 hops");
-        feed_strength_hops(p, 60);
+        feed_strength_hops(p, 60, NULL, NULL);
         four_aec_nr_res_post_split_floor(p, &lv, &tg);
         CHECK(lv == tg, "strength: the ramp lands");
     }
@@ -2036,6 +2057,93 @@ static void test_runtime_strength(void) {
           "strength: NR mode change accepted through the recomposed target");
 
     four_aec_nr_res_destroy(p);
+}
+
+/* Per-stage timing: the numbers must be REAL measurements, not just present.
+ * Each timed stage is bounded by the wall-clock cost of the call it sits in,
+ * and the two fields documented as always-zero must actually be zero -- that
+ * pair is what stops linear_us silently being re-labelled later. */
+static void test_stage_timing(void) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* p = four_aec_nr_res_create(&cfg);
+    FourAecNrResLastTiming t, zero;
+    uint32_t pre_wall_us = 0, post_wall_us = 0;
+    uint32_t pre_sum, post_sum;
+
+    CHECK(p != NULL, "timing: core created");
+    if (!p) return;
+
+    /* A NULL pipeline must zero the whole record rather than fail. Compared
+     * as a struct, so the two always-zero fields are covered too -- they are
+     * exactly where a memset-versus-field-copy slip would hide. */
+    memset(&zero, 0, sizeof(zero));
+    memset(&t, 0xa5, sizeof(t));
+    four_aec_nr_res_get_last_timing(NULL, &t);
+    CHECK(memcmp(&t, &zero, sizeof(t)) == 0,
+          "timing: a NULL pipeline zeroes the record");
+
+    /* Warm up so the delay estimator and filters are doing real work; the
+     * driver hands back the final hop's wall time measured around the same
+     * two calls the library stamps inside. */
+    feed_strength_hops(p, 34, &pre_wall_us, &post_wall_us);
+    four_aec_nr_res_get_last_timing(p, &t);
+
+    /* The two documented-zero fields. If a future change starts filling
+     * these, the header's "always 0" contract and the caller's remainder
+     * arithmetic both need revisiting -- so they are asserted, not assumed. */
+    CHECK(t.frontend_us == 0,
+          "timing: frontend_us is documented as always zero");
+    CHECK(t.lane_res_us == 0,
+          "timing: lane_res_us is documented as always zero");
+
+    /* ⚠ Written so it can FAIL: neither the five-filter matched delay
+     * estimator nor four AEC lanes over a full hop can cost under a
+     * microsecond, so a zero here means that window never ran. */
+    CHECK(t.linear_us > 0, "timing: the AEC lane loop reports a real cost");
+    CHECK(t.delay_us > 0, "timing: the delay estimator reports a real cost");
+
+    /* Every stage is bounded by the call that contains it. This is what
+     * distinguishes a measurement from a number: a stray or uninitialised
+     * value would almost certainly exceed its enclosing call. */
+    pre_sum = t.delay_us + t.linear_us;
+    post_sum = t.fuse_us + t.res_us + t.nr_us + t.synth_us;
+    CHECK(pre_sum <= pre_wall_us,
+          "timing: pre stages must fit inside process_pre's wall time");
+    CHECK(post_sum <= post_wall_us,
+          "timing: post stages must fit inside process_post's wall time");
+
+    /* A hop that is accepted and then bails out must report zeros for the
+     * stages it never reached, not the previous hop's numbers. The non-finite
+     * input check is the reachable bail-out: it runs after the record is
+     * cleared, so without that clearing the values above would survive. */
+    {
+        int hop = four_aec_nr_res_hop_size(p);
+        float* nan_mics = (float*)malloc((size_t)hop * 4u * sizeof(float));
+        float* far = (float*)calloc((size_t)hop, sizeof(float));
+        FourAecNrResPreFrame pre;
+        FourAecNrResLastTiming after_bail;
+        int i;
+        CHECK(nan_mics && far, "timing: allocation");
+        if (nan_mics && far) {
+            for (i = 0; i < hop * 4; ++i) nan_mics[i] = (float)NAN;
+            CHECK(four_aec_nr_res_process_pre(p, nan_mics, far, &pre) ==
+                      FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+                  "timing: a non-finite hop is rejected");
+            /* Read into its own record: `t` still holds the good hop the
+             * report below prints. */
+            four_aec_nr_res_get_last_timing(p, &after_bail);
+            CHECK(after_bail.delay_us == 0 && after_bail.linear_us == 0,
+                  "timing: a bailed-out hop reports zeros, not the last "
+                  "hop's numbers");
+        }
+        free(nan_mics); free(far);
+    }
+
+    four_aec_nr_res_destroy(p);
+    printf("timing: delay=%uus linear=%uus (pre wall %uus) | "
+           "fuse=%uus res=%uus nr=%uus synth=%uus (post wall %uus)\n",
+           t.delay_us, t.linear_us, pre_wall_us,
+           t.fuse_us, t.res_us, t.nr_us, t.synth_us, post_wall_us);
 }
 
 int main(void) {
@@ -2063,6 +2171,7 @@ int main(void) {
     test_shared_delay_change_admission();
     test_delay_change_candidate_ttl();
     test_runtime_strength();
+    test_stage_timing();
 
     if (failures) {
         printf("%d test(s) failed\n", failures);
