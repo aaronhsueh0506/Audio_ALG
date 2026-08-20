@@ -137,7 +137,7 @@ GAIN_OBJS = $(OBJ_DIR)/fix_gain.o $(OBJ_DIR)/nr_gain.o \
 
 .DEFAULT_GOAL := all
 .PHONY: all libs lib libspatial_common.a libdoa.a libgsc.a libvad.a \
-        libgain.a clean \
+        libgain.a clean bench-masker \
         test test_spatial_third_party audit-no-gsc-test-symbols \
         print-bin-dir print-obj-dir print-spatial-common-lib-path \
         print-doa-lib-path print-gsc-lib-path print-vad-lib-path \
@@ -224,6 +224,23 @@ $(BIN_DIR)/test_spatial_third_party: $(OBJ_DIR)/test_spatial_third_party.o \
 	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/test_spatial_third_party.o \
 		$(OBJ_DIR)/gsc_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) $(VAD_LIB) \
 		$(GAIN_LIB) $(AC_LIB) -lm
+
+# Diagnostic only, never part of `test`: it reports timings, so it has no
+# pass/fail and would make the gate depend on how loaded the machine is.
+# Run it ON THE TARGET -- see the file header for why a host number decides
+# nothing here.
+$(OBJ_DIR)/bench_masker.o: tests/bench_masker.c VAD/masker.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(BIN_DIR)/bench_masker: $(OBJ_DIR)/bench_masker.o $(VAD_LIB) $(AC_LIB) \
+        | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/bench_masker.o $(VAD_LIB) $(AC_LIB) -lm
+
+# BENCH_NFFT defaults to the integrator's grid (256/128 @ 16 kHz -> F=129),
+# not to a round number: the stage proportions move with F.
+BENCH_NFFT ?= 256
+bench-masker: $(BIN_DIR)/bench_masker
+	"$(abspath $(BIN_DIR))/bench_masker" $(BENCH_NFFT)
 
 audit-no-gsc-test-symbols: $(GSC_LIB)
 	@if nm "$(GSC_LIB)" | grep -q 'gsc_test_'; then \
