@@ -118,25 +118,28 @@ context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
 twiddle configs are carved from these pools too, so both columns are the
 complete memory requirement (strict init→destroy zero-heap on both backends):
 
-Re-measured 2026-08-16 after the delay-mode productization (layout_version=6:
-`AudioPipelineConfig` gained `filter_length`/`delay_mode`/`delay_num_filters`/
-`fixed_delay_samples`; defaults reproduce the pre-v6 byte-for-byte behavior)
-via `"$(make -s print-bin-dir)"/aec_nr_pipeline_static --print-mem-size
-balanced --sample-rate <sr> [--fft-size <alt>]` on both backends, against the
-current grid (16 kHz default is 256/128 — see "Parameter Alignment" above).
-16 kHz's alternate 512/256 grid is included since it remains explicitly
-selectable:
+Re-measured 2026-08-19 after the runtime strength-retarget ABI change
+(`sizeof(Aec)` grew by 8 B and `ALIGN16(sizeof(Aec))` by 16 B, so every AEC
+pool and every total moved by exactly +16 B; descriptor now reports
+layout_version=7) via `"$(make -s print-bin-dir)"/aec_nr_pipeline_static
+--print-mem-size balanced --sample-rate <sr> [--fft-size <alt>]` on both
+backends, against the current grid (16 kHz default is 256/128 — see "Parameter
+Alignment" above). 16 kHz's alternate 512/256 grid is included since it remains
+explicitly selectable. This table is a RECONCILIATION, not a plain increment:
+its AEC column had also been one earlier ABI generation (32 B) behind
+`lib/aec`'s own tables, so each row moved by 48 B in total and the two
+documents now agree.
 
 | Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |--------|-----|-----------|-----|---------------|-----------|
-| **8 kHz KISS** | 275,632 B | 8,784 B | 67,424 B | 5,696 B | **357,696 B (349.3 KB)** |
-| **8 kHz NE10** | 275,024 B | 8,176 B | 67,424 B | 5,696 B | **356,480 B (348.1 KB)** |
-| **16 kHz KISS (default, 256/128)** | 379,712 B | 8,784 B | 122,160 B | 5,696 B | **516,512 B (504.4 KB)** |
-| **16 kHz NE10 (default, 256/128)** | 379,104 B | 8,176 B | 122,160 B | 5,696 B | **515,296 B (503.2 KB)** |
-| **16 kHz KISS (alt, 512/256)** | 508,784 B | 16,976 B | 133,472 B | 11,328 B | **670,720 B (655.0 KB)** |
-| **16 kHz NE10 (alt, 512/256)** | 507,408 B | 15,600 B | 133,472 B | 11,328 B | **667,968 B (652.3 KB)** |
-| **48 kHz KISS** | 1,167,008 B | 33,360 B | 374,336 B | 22,592 B | **1,597,456 B (1,560.0 KB)** |
-| **48 kHz NE10** | 1,164,096 B | 30,448 B | 374,336 B | 22,592 B | **1,591,632 B (1,554.3 KB)** |
+| **8 kHz KISS** | 275,680 B | 8,784 B | 67,424 B | 5,696 B | **357,744 B (349.4 KB)** |
+| **8 kHz NE10** | 275,072 B | 8,176 B | 67,424 B | 5,696 B | **356,528 B (348.2 KB)** |
+| **16 kHz KISS (default, 256/128)** | 379,760 B | 8,784 B | 122,160 B | 5,696 B | **516,560 B (504.5 KB)** |
+| **16 kHz NE10 (default, 256/128)** | 379,152 B | 8,176 B | 122,160 B | 5,696 B | **515,344 B (503.3 KB)** |
+| **16 kHz KISS (alt, 512/256)** | 508,832 B | 16,976 B | 133,472 B | 11,328 B | **670,768 B (655.0 KB)** |
+| **16 kHz NE10 (alt, 512/256)** | 507,456 B | 15,600 B | 133,472 B | 11,328 B | **668,016 B (652.4 KB)** |
+| **48 kHz KISS** | 1,167,056 B | 33,360 B | 374,336 B | 22,592 B | **1,597,504 B (1,560.1 KB)** |
+| **48 kHz NE10** | 1,164,144 B | 30,448 B | 374,336 B | 22,592 B | **1,591,680 B (1,554.4 KB)** |
 
 The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW.md` §4 — re-measure from
 there rather than editing it here, and always prefer the value
@@ -192,6 +195,18 @@ latency.
 # From Audio_ALG/pipelines/ — builds component libs and mono applications
 make                # aec_nr_pipeline, static variant and mono_alignulcnet
 make SIMD=0         # one switch: mono pipeline + AEC + NR + audio_common all scalar
+
+> **SIMD=0 and SIMD=1 are not bit-identical end to end, by design.** Each
+> shared kernel is byte-exact against its scalar twin (proved per kernel by
+> `audio_common/test/simd_selftest.c`), but the AEC matched filter diverges
+> deliberately: `delay_aec3.c`'s dot product uses four accumulators plus
+> `vfmaq_f32` — reordered summation *and* fused rounding — and its NLMS update
+> fuses where the scalar spells a separate multiply and add. Measured on the
+> mono pipeline, the two builds differ in 75 bytes at fft=256 and 67 at
+> fft=512 over a 6 s stimulus. The contract is **per configuration**: a change
+> must be byte-exact against the same configuration before it. Across
+> configurations only finite output, the same delay winner/state and a quality
+> tolerance are guaranteed — do not gate a release on cross-SIMD WAV equality.
 
 # Binaries land in a config-keyed directory:
 #   bin/<backend>-<config-hash>/  — resolve it with `make print-bin-dir`
@@ -375,6 +390,55 @@ differ in exactly one field:
 | Parameter | Mild | Balanced | Aggressive | Description |
 |-----------|------|----------|------------|-------------|
 | `min_gain_floor_far_active_db` | -20 | -28 | -38 | AEC3 `SuppressionGain` 遠端活躍時的最低增益下限 dB（最大抑制量）；其餘欄位（filter length、Kalman Q、delay buffer、CNG…）三個 preset 皆相同 |
+
+### Runtime strength control（不重建、不動 pool）
+
+兩條強度軸都可以在**運轉中的 pipeline** 上改。呼叫時機一律是**兩個 hop 之間**、
+與 process 序列化；**非 thread-safe**。全部回 `0` 或 `-1`，`-1` 時什麼都不寫。
+
+| Entry point | 目標 |
+|---|---|
+| `audio_pipeline_set_aec_preset(p, preset, ramp_ms)` | mono：底層 `Aec` 的 far-active 地板 |
+| `audio_pipeline_set_nr_mode(p, mode)` | mono：共用降噪器（`aec_only` 建置無降噪器，回 `-1`） |
+| `four_aec_nr_res_set_aec_preset(p, preset, ramp_ms)` | 4ch 核心：**共用 post 級抑制器** |
+| `four_aec_nr_res_set_nr_mode(p, mode)` | 4ch 核心：那**一個**共用降噪器 |
+| `four_aec_nr_res_post_split_floor(p, &live, &target)` | 4ch 核心：唯讀，線性功率。`live == target` 代表 ramp 已走完 |
+| `audio_pipeline_4ch_set_aec_preset()` / `_set_nr_mode()` | 4ch 完整 wrapper：轉呼叫核心的薄殼 |
+
+`ramp_ms == 0` 代表下一個 hop 套用（**不是錯誤**），落點與「用該 preset 從頭建一個新
+實例」完全相同；`> 0` 則以 dB 為單位線性走過去，上限 60 秒（mild ↔ aggressive 是
+18 dB 落差、地板又是硬性 clamp，互動式旋鈕應該給一個 ramp）。ramp 途中再呼叫會從當前
+live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、噪聲底與增益平滑歷史全部繼續
+跑；要重啟請用對應的 `_reset()`。
+
+> **4ch：對四條 lane 重新指定 preset 是無效操作。** 四條 lane 都以
+> `spatial_linear_context` 建立，從不走到 `suppression_gain_get_gain()`，它們的地板
+> 什麼都不塑形。真正乘上輸出的 gain 來自**唯一一個**共用的 post 級抑制器，這就是
+> `four_aec_nr_res_set_aec_preset()` 存在、而不是要你迴圈呼叫 `aec_set_preset()` 的
+> 原因（由 `4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c` 的 `test_runtime_strength()` 釘住）。
+
+> **NR：不要繞過 pipeline 的 setter 去呼叫 `mmse_lsa_set_mode()`。** 兩條 pipeline 的
+> NR 組態都是「canonical preset **加上**自己的覆寫」（`broadband_threshold`、`L`、
+> `alpha_decay`，見兩處的 `compose_nr_config()`）。`mmse_lsa_set_mode()` 組的是裸的
+> canonical preset，在這種實例上會被**拒絕**（它的 `L` 不同）——所以 pipeline 的
+> setter 做的事是重組完整組態再交給 `mmse_lsa_reconfigure()`。
+
+> **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
+> hop 生效：double-talk 期間套的是 DT 地板，而 DT 地板三個 preset **完全相同**；
+> far-active latch 觸發前套的是 far-silent 地板。同一個 `G_res` 還決定注入的 comfort
+> noise 量（振幅正比於 `sqrt(1 - G_res^2)`，見兩處實作的 CNG 步驟——地板越深、CNG
+> 反而越多）。所以**整段錄音的平均值移動幅度會小於 dB 落差所暗示的量**，而且只量
+> echo／degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或
+> degradation 對齊的條件下比較，並實際試聽。
+
+兩條 Align-ULCNet pipeline（`mono_alignulcnet/`、`4ch_alignulcnet/`）**刻意不提供**
+這些 setter：mono 變體沒有 NR 實例、且算出的 `G_res` 沒有任何消費者（輸出由 ULCNet
+mask 塑形）；4ch 變體用的是 `core.enable_post = 0` 的 pre-only 核心，抑制器與降噪器
+根本不存在。強度是模型的性質，不是 runtime 旋鈕。
+
+Python 對應：`AEC.set_preset(preset, ramp_ms=0.0)` 與
+`FourChannelAecPipeline.set_aec_preset(preset, ramp_ms=0.0)`（後者同樣只動共用的
+post-beam 抑制器）。
 
 ### NR (`MmseLsaConfig`, see `mmse_lsa_types.h`)
 

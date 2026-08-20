@@ -56,6 +56,32 @@ four_aec_nr_res_process_post(core, &amp;pre.token, weights, out);
 /* 外部 post 變體(如 ULCNet)不跑 post: four_aec_nr_res_abandon_pre(core, &amp;pre.token); */</pre>
 <p>Descriptor 慣例與 mono 相同(32-byte 固定 ABI、init_ex 8 點閘)。核心 <code>FOUR_AEC_NR_RES_LAYOUT_VERSION=11</code>、wrapper <code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION=6</code>,兩者 descriptor_version 皆 1;wrapper 的 build_flags_hash 摺入核心的 hash(核心 layout bump 會連帶作廢外層 descriptor)。核心 config:<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,四條 lane 共用同一個決策)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘須 −1)、<code>capture_proxy_channel</code>(matcher 輸入,[0,3])、<code>max_delay_ms</code>(僅 <code>MATCHED</code> 用於 sizing delay ring,預設 1024,delay ring = ceil(ms×sr/1000)+2×hop+1)、<code>filter_length</code>(0=rate default)、<code>delay_backward_quarantine_enabled</code>(bool,預設 0;開啟後只隔離比現行 delay <b>更早</b>的新估計,且僅在 <code>capture_proxy_channel</code> 那一條 lane 仍在消除回音時;往後跳與首次取得對齊都不受影響)、<code>delay_backward_quarantine_s</code>(float,預設 1.0;隔離窗長,init 時換算成 hop 數,到期即採用——延後 pre-echo 誤鎖一個窗,不是治癒)。Quarantine 目前<b>只驗過合成場景與 C／Python 逐 hop 對照,真實錄音抽測待做</b>,產品組態維持預設 OFF。</p>
 
+<h3>執行期強度控制</h3>
+<pre>/* 核心 */
+int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset, float ramp_ms);
+int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, MmseLsaNrMode mode);
+int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live, float* target);  /* 唯讀 */
+/* 完整 wrapper(薄殼,轉呼叫核心) */
+int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset, float ramp_ms);
+int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, MmseLsaNrMode mode);
+
+four_aec_nr_res_set_aec_preset(core, AEC_PRESET_AGGRESSIVE, 100.0f);  /* 100 ms 內以 dB 線性走到新地板 */
+four_aec_nr_res_set_nr_mode(core, MMSE_LSA_NR_MILD);
+
+float live, target;                                    /* 線性功率,不是 dB */
+four_aec_nr_res_post_split_floor(core, &amp;live, &amp;target); /* live == target ⇒ ramp 已走完 */</pre>
+<p class="note"><b>本節最重要的一件事:對四條 lane 重新指定 preset 是無效操作。</b>四條 lane 都以 <code>spatial_linear_context</code> 建立,因此<b>沒有任何一條</b>會走到自己的 <code>suppression_gain_get_gain()</code>;它們各自的地板什麼都不塑形。真正乘上本產品輸出、也真正決定 comfort noise 量的那個 gain,來自<b>唯一一個</b>共用的 post 級抑制器——上面兩個 preset setter 針對的就是它,這也是它們存在、而不是要呼叫端自己對四條 lane 迴圈呼叫 <code>aec_set_preset()</code> 的原因。同理 NR 也只有一個共用實例(對 beamform 後的訊號跑),不是每條 lane 一個。這一點由 <code>tests/test_4aec_nr_res.c</code> 的 <code>test_runtime_strength()</code> 釘住,不是推測。</p>
+<table>
+<tr><th>呼叫</th><th>改／讀什麼</th><th>回 −1 的情況(−1 時什麼都不寫)</th></tr>
+<tr><td><code>four_aec_nr_res_set_aec_preset()</code></td><td><b>共用 post 級抑制器</b>的 far-active split floor</td><td><code>p</code> NULL／已 destroy;<code>preset</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000];<code>enable_post == 0</code>(pre-only 核心沒有抑制器)</td></tr>
+<tr><td><code>four_aec_nr_res_set_nr_mode()</code></td><td>本核心擁有的<b>那一個</b>降噪器</td><td><code>p</code> NULL／已 destroy;<code>enable_post == 0</code>;<code>mode</code> 超出 enum;重組出的 target 被拒</td></tr>
+<tr><td><code>four_aec_nr_res_post_split_floor()</code></td><td>唯讀。<code>live</code>=抑制器<b>當下</b>套用的值,<code>target</code>=撐得過 reset 的已設定值;只有 ramp 走到一半時兩者不同。任一指標可為 NULL</td><td><code>p</code> NULL／已 destroy;<code>enable_post == 0</code></td></tr>
+</table>
+<p><code>live</code>/<code>target</code> 這一對是<b>板端唯一值得記錄的強度量</b>:它是真正塑形輸出的東西,兩個值合在一起就回答「我要求的改動落地了沒有」。完整 wrapper 兩個 setter 是薄殼(<code>p</code>/已 destroy/<code>p-&gt;core</code> 為 NULL 回 −1,其餘直接轉給核心),但<b>不轉出</b>核心 handle,所以這一對讀數在 wrapper 層拿不到。</p>
+<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 preset 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:四條 lane 的濾波器、共用延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑。preset 改動<b>撐得過</b> <code>four_aec_nr_res_reset()</code>(目標值另存一份,reset 會重新套用),ramp 進度則會被丟掉。<b>在兩個 hop 之間呼叫、與 <code>process_pre()</code>／<code>process_post()</code> 序列化;非 thread-safe。</b>Python 對應 <code>FourChannelAecPipeline.set_aec_preset(preset, ramp_ms=0.0)</code>(同樣只動共用 post-beam 抑制器)。</p>
+<p class="note"><b>不要繞過 <code>set_nr_mode()</code> 去呼叫 <code>mmse_lsa_set_mode()</code>。</b>本核心的 NR 組態是「canonical 強度 preset <b>加上</b>自己的覆寫」(<code>broadband_threshold</code>、<code>L</code>、<code>alpha_decay</code>;見 <code>compose_nr_config()</code>)。<code>mmse_lsa_set_mode()</code> 組的是裸的 canonical preset,在本核心的實例上會被<b>拒絕</b>(它的 <code>L</code> 不同)——所以 <code>four_aec_nr_res_set_nr_mode()</code> 做的事是重組本核心的完整組態,再交給 <code>mmse_lsa_reconfigure()</code>。</p>
+<p class="note"><b>A/B 量測時該預期什麼。</b>far-active 地板只在 <b>far-active 且非 double-talk</b> 的 hop 生效:DT 期間本核心強制套用 DT 地板(三個 preset <b>完全相同</b>),far-active latch 觸發前套的是 far-silent 地板。同一個 gain 還決定注入的 comfort noise 量(振幅 ∝ <code>sqrt(1 − G_res²)</code>,見下方 block diagram 的 CNG 步驟——地板越深、CNG 反而越多)。所以<b>整段錄音的平均移動幅度會小於 dB 落差所暗示的量</b>,而且只量 echo/degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或 degradation 對齊的條件下比較,並實際試聽。</p>
+
 <h3>PreFrame 契約(含新欄位 aligned_ref)</h3>
 <table>
 <tr><th>欄位</th><th>內容</th><th>擁有者/壽命</th></tr>
@@ -123,10 +149,10 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <p>n_freqs = 129(16k/256)/ 257(16k/512)/ 513(48k/1024)。</p>
 
 <h2>State 表</h2>
-<p>單一 caller pool,wrapper carve 順序 <code>self, core, srp, gsc, gsc_spectrum, gsc_weights</code>;核心自己再 carve 4 lane + NR + FFT + 工作 buffer。<b>2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10</b>(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>)。下表的核心與完整 wrapper 合計均已同日重跑 ne10/kiss；未分 backend 的核心細項是 KISS breakdown 參考值:</p>
+<p>單一 caller pool,wrapper carve 順序 <code>self, core, srp, gsc, gsc_spectrum, gsc_weights</code>;核心自己再 carve 4 lane + NR + FFT + 工作 buffer。<b>2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10</b>(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>)。下表的核心與完整 wrapper 合計已於 2026-08-19 重跑 ne10/kiss；未分 backend 的核心細項是 KISS breakdown 參考值。本輪 <code>ALIGN16(sizeof(Aec))</code> 跨過 16-byte 邊界,四路各 +16 B,所以核心與 wrapper 合計都 +64 B:</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td>4× <code>Aec</code> lanes</td><td>1,516,288 B(@16k/512,kiss;ne10 待現查)</td><td>pool(core)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)</td></tr>
+<tr><td>4× <code>Aec</code> lanes</td><td>1,375,296 B(@16k/512,kiss;ne10 1,369,792 B)</td><td>pool(core)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)。本列是<b>校正</b>而非 +64 B:先前記的 1,516,288 B 是 lane 還自帶 estimator/ring 那一代的舊值,現值取自 <code>four_aec_nr_res_get_mem_breakdown()</code> 的 <code>aec_bytes</code>(單路 343,824 B × 4,即 <code>lib/aec</code> 的 <code>EXTERNAL_ALIGNED</code> @16k/512)</td></tr>
 <tr><td><code>DelayAec3 shared_delay</code></td><td>struct 內嵌</td><td>C struct(core)</td><td>48k 時內建 anti-alias 降頻 sidechain</td></tr>
 <tr><td><code>delay_ring</code></td><td>[ring] f32;ring=ceil(max_delay_ms×sr/1000)+2·hop+1</td><td>pool(core)</td><td>預設 1024 ms → 16,641 samples @16k/128</td></tr>
 <tr><td><code>MmseLsaDenoiser</code>(×1)</td><td>133,472 B(@16k/512)</td><td>pool(core)</td><td>mono NR</td></tr>
@@ -136,8 +162,8 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>GSC 借用 <code>srp-&gt;a_array</code></td></tr>
 <tr><td><code>GSC</code>(RLS P/weights)</td><td>P:16×n_freqs Complex;wa:4×n_freqs Complex</td><td>pool(wrapper)</td><td>內部排列 <code>P[M][M][F]</code>;AArch64 每次更新 4 bins，逐 hop 對 scalar oracle 做 P/wa/output byte-exact 測試。lambda 0.995 經 <code>mmse_lsa_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
 <tr><td>auto-VAD(<code>noise_power/vad_hangover</code>)</td><td>純量</td><td>C struct(wrapper)</td><td>-55 dBFS / SNR 3.0 / hangover 8(retimed);EMA 0.999/0.95(retimed)</td></tr>
-<tr><td>核心合計 @16k/512</td><td>1,662,304 B(ne10;kiss 1,669,184 B)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,480,256 B(kiss 1,485,728 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
-<tr><td>完整 wrapper 合計</td><td>1,902,688 B @16k/256(預設)/ 6,791,632 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,layout_version=6);由 static smoke 的 <code>Total:</code> 行印出(kiss:1,905,728 B @16k/256 / 6,806,192 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
+<tr><td>核心合計 @16k/512</td><td>1,662,368 B(ne10;kiss 1,669,248 B)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,480,320 B(kiss 1,485,824 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
+<tr><td>完整 wrapper 合計</td><td>1,902,752 B @16k/256(預設)/ 6,791,696 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,layout_version=7);由 static smoke 的 <code>Total:</code> 行印出(kiss:1,905,792 B @16k/256 / 6,806,256 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

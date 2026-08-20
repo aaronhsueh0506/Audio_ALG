@@ -782,6 +782,17 @@ int audio_pipeline_4ch_process(
  * Reset and teardown
  * ========================================================================== */
 
+int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset,
+                                      float ramp_ms) {
+    if (!p || p->destroyed || !p->core) return -1;
+    return four_aec_nr_res_set_aec_preset(p->core, preset, ramp_ms);
+}
+
+int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, MmseLsaNrMode mode) {
+    if (!p || p->destroyed || !p->core) return -1;
+    return four_aec_nr_res_set_nr_mode(p->core, mode);
+}
+
 void audio_pipeline_4ch_reset(AudioPipeline4Ch* p) {
     if (!p || p->destroyed) return;
     four_aec_nr_res_reset(p->core);

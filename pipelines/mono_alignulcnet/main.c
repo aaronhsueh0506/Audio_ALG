@@ -6,6 +6,26 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Delay depth D for THIS standalone smoke example only.
+ *
+ * D is a runtime descriptor field, not a library constant: the C chain serves
+ * whatever depth the attached model publishes. This macro is only the example
+ * binary's compile-time default, overridable with
+ * -DULCNET_EXAMPLE_DELAY_FRAMES=N at build time. It is NOT a switch the built
+ * binary can flip -- changing D means rebuilding.
+ *
+ * It MUST equal the D the model in use was exported with. Nothing checks that
+ * for you: the descriptor validator only bounds-checks the range, so a
+ * mismatch between this value and the graph is silent and corrupting (see
+ * ulcnet_process.h's I/O contract). The shipped checkpoints are not all D=8;
+ * set this to match the model you are actually running. */
+#ifndef ULCNET_EXAMPLE_DELAY_FRAMES
+#define ULCNET_EXAMPLE_DELAY_FRAMES 8
+#endif
+_Static_assert(ULCNET_EXAMPLE_DELAY_FRAMES >= ULCNET_MODEL_IO_MIN_D &&
+               ULCNET_EXAMPLE_DELAY_FRAMES <= ULCNET_MODEL_IO_MAX_D,
+               "ULCNET_EXAMPLE_DELAY_FRAMES outside the descriptor's range");
+
 /* The delay profile is a product deployment decision, not a property of this
  * source file: `n` (matched-filter bank size) sets how far the estimator can
  * search for the bulk far-to-mic delay, and it has to be chosen from the
@@ -190,14 +210,18 @@ int main(int argc, char** argv) {
            profile.fixed_samples, (unsigned long long)req.bytes,
            (unsigned long)req.alignment);
 
-    /* The board normally loads this descriptor from the exported model
-     * metadata. D=8 is only this standalone smoke example's model choice. */
-    if (ulcnet_model_io_descriptor_default(8, &model_descriptor) != 0 ||
+    /* The board loads this descriptor from the exported model metadata;
+     * see ULCNET_EXAMPLE_DELAY_FRAMES at the top of this file. */
+    if (ulcnet_model_io_descriptor_default(
+            ULCNET_EXAMPLE_DELAY_FRAMES, &model_descriptor) != 0 ||
         ulcnet_accelerator_adapter_get_mem_size(
             &model_descriptor, &adapter_bytes, &adapter_alignment) != 0 ||
         posix_memalign(&adapter_pool, adapter_alignment, adapter_bytes) != 0) {
         return 1;
     }
+    printf("%s: model I/O D=%d -> accelerator adapter pool %zu bytes (align %zu)\n",
+           argv[0], ULCNET_EXAMPLE_DELAY_FRAMES, adapter_bytes,
+           adapter_alignment);
     adapter = ulcnet_accelerator_adapter_init(
         adapter_pool, adapter_bytes, &model_descriptor,
         run_accelerator, NULL);

@@ -702,14 +702,14 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * it is the layout. A control-block-only growth moves no carve token, so
      * build_flags_hash still matches and this counter is the whole signal. */
     stale = req;
-    stale.layout_version = 10u;
+    stale.layout_version = 11u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
-          "static init_ex rejects a descriptor from the superseded layout 10 "
+          "static init_ex rejects a descriptor from the superseded layout 11 "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 11u,
-          "the queried descriptor publishes the current carve layout (11)");
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 12u,
+          "the queried descriptor publishes the current carve layout (12)");
 
     stat = four_aec_nr_res_init_ex(
         pool, (size_t)req.bytes, &cfg, &req);
@@ -1927,6 +1927,117 @@ static void test_delay_change_candidate_ttl(void) {
           candidate_after_reset == -1, label);
 }
 
+
+/* ============================================================================
+ * Runtime strength control
+ *
+ * The load-bearing property: the four lanes run with spatial_linear_context
+ * and therefore never reach suppression_gain_get_gain(). A preset change
+ * pushed at them is a provable no-op, so this core's setter has to move the
+ * SHARED post-stage suppressor -- and both of its config copies, because
+ * post_sg_cfg is a separate by-value snapshot that reset_post_sg() re-applies.
+ * A setter that updated only post_sg.cfg would work until the first reset and
+ * then silently revert, which is exactly what test 3 below pins.
+ * ========================================================================== */
+
+static void feed_strength_hops(FourAecNrRes* p, int hops) {
+    int hop = four_aec_nr_res_hop_size(p);
+    int n = four_aec_nr_res_n_freqs(p);
+    float* mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
+    float* far = (float*)calloc((size_t)hop, sizeof(float));
+    float* out = (float*)calloc((size_t)hop, sizeof(float));
+    /* Channel-major Complex[4][n_freqs] -- the weights contract in
+     * 4aec_nr_res.h. Sizing this as [n_freqs] would have process_post() read
+     * three channels past the end. */
+    Complex* w = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n, sizeof(Complex));
+    FourAecNrResPreFrame pre;
+    int h, i, ch, k;
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+        for (k = 0; k < n; ++k) {
+            w[(size_t)ch * (size_t)n + (size_t)k].r = 0.25f;
+            w[(size_t)ch * (size_t)n + (size_t)k].i = 0.0f;
+        }
+    for (h = 0; h < hops; ++h) {
+        for (i = 0; i < hop; ++i) {
+            float t = (float)(h * hop + i);
+            float r = 0.6f * sinf(0.06f * t);
+            far[i] = r;
+            for (ch = 0; ch < 4; ++ch)
+                mics[(size_t)i * 4u + (size_t)ch] = 0.5f * r + 0.02f * sinf(0.017f * t);
+        }
+        if (four_aec_nr_res_process_pre(p, mics, far, &pre) != FOUR_AEC_NR_RES_OK)
+            break;
+        (void)four_aec_nr_res_process_post(p, &pre.token, w, out);
+    }
+    free(mics); free(far); free(out); free(w);
+}
+
+static void test_runtime_strength(void) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* p = four_aec_nr_res_create(&cfg);
+    float live0 = 0.0f, target0 = 0.0f, live1 = 0.0f, target1 = 0.0f;
+
+    CHECK(p != NULL, "strength: core created");
+    if (!p) return;
+    feed_strength_hops(p, 30);
+    CHECK(four_aec_nr_res_post_split_floor(p, &live0, &target0) == 0,
+          "strength: the shared post floor is readable");
+
+    /* 1. The setter moves the SHARED post suppressor -- the gain that
+     *    actually multiplies this core's output. */
+    CHECK(four_aec_nr_res_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 0.0f) == 0,
+          "strength: aggressive accepted");
+    CHECK(four_aec_nr_res_post_split_floor(p, &live1, &target1) == 0 &&
+              live1 != live0 && live1 == target1,
+          "strength: the shared post floor moved and landed immediately");
+
+    /* 2. It SURVIVES a reset. reset_post_sg() rebuilds the suppressor from
+     *    the separate post_sg_cfg snapshot, so a setter that wrote only
+     *    post_sg.cfg would be silently reverted right here. */
+    four_aec_nr_res_reset(p);
+    {
+        float live2 = 0.0f, target2 = 0.0f;
+        CHECK(four_aec_nr_res_post_split_floor(p, &live2, &target2) == 0 &&
+                  live2 == live1 && target2 == target1,
+              "strength: the new floor survives a reset (a one-copy setter "
+              "would have reverted it here)");
+    }
+
+    /* 3. A ramp is genuinely in flight before it lands. */
+    feed_strength_hops(p, 20);
+    CHECK(four_aec_nr_res_set_aec_preset(p, AEC_PRESET_MILD, 100.0f) == 0,
+          "strength: ramped retarget accepted");
+    {
+        float lv = 0.0f, tg = 0.0f;
+        feed_strength_hops(p, 2);
+        four_aec_nr_res_post_split_floor(p, &lv, &tg);
+        CHECK(lv != tg, "strength: the ramp is mid-flight after 2 hops");
+        feed_strength_hops(p, 60);
+        four_aec_nr_res_post_split_floor(p, &lv, &tg);
+        CHECK(lv == tg, "strength: the ramp lands");
+    }
+
+    /* 4. Refusal. */
+    CHECK(four_aec_nr_res_set_aec_preset(NULL, AEC_PRESET_MILD, 0.0f) == -1,
+          "strength: NULL core refused");
+    CHECK(four_aec_nr_res_set_aec_preset(p, (AecPreset)77, 0.0f) == -1,
+          "strength: out-of-enum preset refused");
+    CHECK(four_aec_nr_res_set_aec_preset(p, AEC_PRESET_MILD, 60001.0f) == -1,
+          "strength: out-of-range ramp_ms refused");
+    CHECK(four_aec_nr_res_set_nr_mode(p, (MmseLsaNrMode)42) == -1,
+          "strength: out-of-enum NR mode refused");
+
+    /* 5. The NR setter recomposes THIS pipeline's configuration. The
+     *    canonical convenience wrapper must be REFUSED on this instance --
+     *    its L differs -- which is precisely why recomposing is required and
+     *    not merely tidier. */
+    CHECK(four_aec_nr_res_set_nr_mode(p, MMSE_LSA_NR_AGGRESSIVE) == 0,
+          "strength: NR mode change accepted through the recomposed target");
+
+    four_aec_nr_res_destroy(p);
+}
+
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
@@ -1951,6 +2062,7 @@ int main(void) {
     test_known_delay_memory_and_cost();
     test_shared_delay_change_admission();
     test_delay_change_candidate_ttl();
+    test_runtime_strength();
 
     if (failures) {
         printf("%d test(s) failed\n", failures);

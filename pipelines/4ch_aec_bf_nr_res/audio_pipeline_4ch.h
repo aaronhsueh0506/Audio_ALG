@@ -121,8 +121,13 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * P[M][M][F]. The recursive state count is unchanged, but the pointer-table
  * overhead and therefore the composed pool byte count are different.
  * (The exact totals are reported by `make print-mem-size`; they are not
- * restated here, where they would silently rot.) */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 6u
+ * restated here, where they would silently rot.)
+ * Version 7: sizeof(Aec) grew (the suppressor gained its runtime
+ * far-active floor retarget state), so every AEC carved out of this pool
+ * moves the total and the offsets after it. Carve order and buffer set are
+ * unchanged, so build_flags_hash does not move -- this counter is the only
+ * signal. */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 7u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -259,6 +264,23 @@ int audio_pipeline_4ch_process_with_activity(
     AudioPipeline4ChFrameInfo* info);
 
 void audio_pipeline_4ch_reset(AudioPipeline4Ch* p);
+
+/* Runtime strength control -- thin pass-throughs to the shared core.
+ *
+ * The four AEC lanes run with spatial_linear_context and never reach their own
+ * suppression-gain path, so the strength that shapes this product's output
+ * lives in the core's single shared post-stage suppressor; likewise there is
+ * one shared denoiser, not one per lane. Both setters target those, which is
+ * why they exist rather than leaving the caller to loop over lanes.
+ *
+ * See 4aec_nr_res.h for the full contract, including what to expect when
+ * A/B-ing a preset change (the far-active floor only binds on far-active,
+ * non-double-talk hops, and the same gain also scales the comfort noise).
+ *
+ * Call between hops. Return 0, or -1 with nothing written. */
+int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset,
+                                      float ramp_ms);
+int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, MmseLsaNrMode mode);
 void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p);
 
 /* ============================================================================

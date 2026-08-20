@@ -71,8 +71,12 @@
  * pointer. Version 6 removes the obsolete runtime far-mode field, fixes
  * production to the AEC aligned-far seam, and adds delay-transition
  * bookkeeping. Version 7 adds the identity-reprime counter to the control
- * block. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 7u
+ * block. Version 8: sizeof(Aec) grew (the suppressor gained its runtime
+ * far-active floor retarget state), so every AEC carved out of this pool
+ * moves the total and the offsets after it. Carve order and buffer set are
+ * unchanged, so build_flags_hash does not move -- this counter is the only
+ * signal. */
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 8u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
  * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"/\"ne10\"
@@ -180,6 +184,14 @@ static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
             return -1;
     }
 
+    /* A model that actually infers MUST publish a descriptor. Its delay depth,
+     * attention geometry and history shapes are what the host-side rings are
+     * carved from, and nothing downstream can detect a mismatch: the finite
+     * guard catches an UNWRITTEN output, never a WRONG-SHAPED one, so a graph
+     * whose D differs from the descriptor reads and writes past the pool
+     * silently. An identity model (no infer callback) has no shapes to agree
+     * about and may leave it NULL. */
+    if (cfg->model.infer && !cfg->model.io_descriptor) return -1;
     if (cfg->model.io_descriptor &&
         ulcnet_model_io_descriptor_validate(cfg->model.io_descriptor) != 0)
         return -1;

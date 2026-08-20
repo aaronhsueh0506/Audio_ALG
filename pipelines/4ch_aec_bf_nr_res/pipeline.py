@@ -24,7 +24,7 @@ import numpy as np
 from lib.aec.python.modules.config import AecConfig
 from lib.aec.python.modules.dataclasses import AecResContext
 from lib.aec.python.modules.delay.legacy_compat import LegacyDelayShim
-from lib.aec.python.modules.enums import AecMode
+from lib.aec.python.modules.enums import AecMode, AecPreset
 from lib.aec.python.modules.orchestrator import AEC
 from lib.aec.python.modules.residual.suppression_gain import (
     EchoAudibilityConfig,
@@ -621,6 +621,12 @@ class PostBeamResidualSuppressor:
         self.instance_count = 1
         self._state = _PostBeamAecState()
         self._initial_state = True
+        # Chosen far-active floor, or None to take AecConfig's default. Stored
+        # because _build_gain() -- which reset() re-runs -- constructs a fresh
+        # AecConfig every time; without this a runtime strength change would be
+        # silently reverted by the next reset. Mirrors the C core keeping its
+        # own post_sg_cfg copy in step with post_sg.cfg for the same reason.
+        self._split_floor_far_active_db = None
         self._build_gain()
 
     def _build_gain(self) -> None:
@@ -629,6 +635,11 @@ class PostBeamResidualSuppressor:
             frame_size=2 * self.hop_size,
             hop_size=self.hop_size,
         )
+        if self._split_floor_far_active_db is not None:
+            config = replace(
+                config,
+                min_gain_floor_far_active_db=self._split_floor_far_active_db,
+            )
         default_audibility = EchoAudibilityConfig()
         suppressor_config = SuppressorConfig()
         suppressor_config.echo_audibility = replace(
@@ -665,6 +676,31 @@ class PostBeamResidualSuppressor:
             split_floor_dt_db=config.min_gain_floor_dt_db,
             split_floor_latch_power=config.min_gain_far_latch_power,
         )
+
+    def set_preset(self, preset, ramp_ms: float = 0.0) -> None:
+        """Retarget the strength this stage applies, on a running instance.
+
+        This -- not the four lanes -- is what shapes the four-channel output:
+        the lanes run with spatial_linear_context and never compute a gain of
+        their own, so a preset pushed at them does nothing. Mirrors the C
+        core's four_aec_nr_res_set_aec_preset().
+
+        The stored value is what a later reset() rebuilds from, so the change
+        survives one.
+        """
+        # Coerce FIRST: AecConfig.from_preset() falls back to balanced for
+        # anything it does not recognise -- correct for a config factory,
+        # wrong for a setter, which has a caller to tell.
+        try:
+            preset = AecPreset(preset)
+        except (TypeError, ValueError):
+            raise ValueError(f"unknown AEC preset: {preset!r}")
+        db = AecConfig.from_preset(preset).min_gain_floor_far_active_db
+        # Validate through the suppressor first: it raises without writing, so
+        # a rejected call cannot leave the stored value and the live floor
+        # disagreeing.
+        self._gain.set_split_floor_far_active_db(db, ramp_ms)
+        self._split_floor_far_active_db = db
 
     def reset(self) -> None:
         self._state = _PostBeamAecState()
@@ -817,6 +853,17 @@ class FourChannelAecPipeline:
     @property
     def realign_soft_lane_count(self) -> int:
         return self._realign_soft_lanes
+
+    def set_aec_preset(self, preset, ramp_ms: float = 0.0) -> None:
+        """Retarget residual-echo strength on a RUNNING pipeline.
+
+        Targets the SHARED post-beam suppressor, which is what actually shapes
+        this pipeline's output. The four lanes are deliberately left alone:
+        they run with spatial_linear_context and never reach their own gain
+        path, so retargeting them would be a provable no-op. Mirrors the C
+        core's setter exactly.
+        """
+        self._post_beam_res.set_preset(preset, ramp_ms)
 
     def reset(self) -> None:
         self._shared_delay.reset()

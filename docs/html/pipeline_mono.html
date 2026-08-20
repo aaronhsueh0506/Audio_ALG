@@ -55,6 +55,23 @@ audio_pipeline_reset(p);      /* echo-path 變更時; 不動 pool */
 audio_pipeline_destroy(p);    /* 不釋放 caller pool */
 platform_free(pool);</pre>
 <p>桌面便利路徑 <code>audio_pipeline_create(&amp;cfg)</code>(內部 posix_memalign;destroy 會 free)。診斷用唯讀 handle:<code>audio_pipeline_get_aec()</code> / <code>audio_pipeline_get_nr()</code>(aec_only 時為 NULL);byte 分解表 <code>audio_pipeline_get_mem_breakdown()</code>。</p>
+
+<h3>執行期強度控制</h3>
+<pre>int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset, float ramp_ms);
+int audio_pipeline_set_nr_mode(AudioPipeline* p, MmseLsaNrMode mode);
+
+/* 使用者轉旋鈕:在兩個 hop 之間呼叫,不重建、不動 pool */
+audio_pipeline_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f);   /* 100 ms 內以 dB 線性走到新地板 */
+audio_pipeline_set_nr_mode(p, MMSE_LSA_NR_MILD);
+audio_pipeline_process(p, mic, ref, out);                          /* 下一個 hop 起生效 */</pre>
+<table>
+<tr><th>呼叫</th><th>改什麼</th><th>回 −1 的情況(−1 時什麼都不寫)</th></tr>
+<tr><td><code>audio_pipeline_set_aec_preset()</code></td><td>底層 <code>Aec</code> 的 far-active 殘留回音地板(三個 preset 唯一的差異軸);轉呼叫 <code>aec_set_preset()</code></td><td><code>p</code> 或其 AEC 為 NULL;<code>preset</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000]</td></tr>
+<tr><td><code>audio_pipeline_set_nr_mode()</code></td><td>共用降噪器的 tuning 純量</td><td><code>p</code> 為 NULL;<code>aec_only</code> 建置(根本沒有降噪器);<code>mode</code> 超出 enum;重組出的 target 被拒</td></tr>
+</table>
+<p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 preset 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s(mild ↔ aggressive 是 18 dB 落差、地板又是硬 clamp,互動式旋鈕應給 ramp)。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:AEC 濾波器與延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑(要重啟用 <code>audio_pipeline_reset()</code>)。<b>在兩個 hop 之間呼叫、與 <code>audio_pipeline_process()</code> 序列化;非 thread-safe。</b></p>
+<p class="note"><b>不要繞過 <code>set_nr_mode()</code> 去呼叫 <code>mmse_lsa_set_mode()</code>。</b>本 pipeline 的 NR 組態是「canonical 強度 preset <b>加上</b>自己的覆寫」(<code>broadband_threshold</code>、<code>L</code>、<code>alpha_decay</code>;見 <code>compose_nr_config()</code>)。<code>mmse_lsa_set_mode()</code> 組的是裸的 canonical preset,在本 pipeline 的實例上會被<b>拒絕</b>(它的 <code>L</code> 不同)——所以 <code>audio_pipeline_set_nr_mode()</code> 做的事是重組本 pipeline 的完整組態,再交給 <code>mmse_lsa_reconfigure()</code>。</p>
+<p class="note"><b>A/B 量測時該預期什麼。</b>far-active 地板只在 <b>far-active 且非 double-talk</b> 的 hop 生效:DT 期間套的是 DT 地板(三個 preset <b>完全相同</b>),far-active latch 觸發前套的是 far-silent 地板。同一個 <code>ctx.res_gain</code> 還決定注入的 comfort noise 量(振幅 ∝ <code>sqrt(1 − G_res²)</code>,見下方 block diagram 的 CNG 步驟——地板越深、CNG 反而越多)。所以<b>整段錄音的平均移動幅度會小於 dB 落差所暗示的量</b>,而且只量 echo/degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或 degradation 對齊的條件下比較,並實際試聽。</p>
 <p>Descriptor 慣例:<code>AudioPipelineMemReq</code> 為固定 32-byte 同 endian ABI(<code>descriptor_version=2</code> / <code>layout_version=6</code> / <code>backend_id</code> KISS=1, NE10=2 / <code>build_flags_hash</code>=FNV-1a-32(backend+carve token 字串) / <code>alignment=16</code> / <code>reserved=0</code> / <code>bytes</code>)。<code>init_ex</code> 對非 NULL 的 <code>expected</code> 做 8 點整數比對閘(七欄位 + pool 實際 bytes),任何 build/config 變更後必須重新 query。組態驗證是 reject-first:sample_rate 白名單 {8000,16000,48000}、enum/bool 逐項檢查,全部在 <code>derive_dims_and_configs()</code> 一處把關。</p>
 <p><code>AudioPipelineConfig</code> 新增四個 delay 相關欄位(layout v6,取代舊版只吃 preset 的隱含 delay 行為):<code>filter_length</code>(0=rate default,PBFDKF taps,init-time immutable)、<code>delay_mode</code>(<code>AEC_DELAY_MATCHED</code>|<code>FIXED</code>|<code>EXTERNAL_ALIGNED</code>,語意同 <code>lib/aec</code>)、<code>delay_num_filters</code>(僅 <code>MATCHED</code>,[1,5])、<code>fixed_delay_samples</code>(僅 <code>FIXED</code>,原生取樣點數;其餘模式須為 −1)。<code>audio_pipeline_default_config()</code> 填 <code>MATCHED</code>/n=5/−1(行為與 layout v5 之前逐位元相同)。<b>目前兩支 CLI(<code>aec_nr_pipeline</code>/<code>aec_nr_pipeline_static</code>)都沒有對應旗標</b>——只能由呼叫端直接寫 struct 欄位(如板端 adapter 或測試);CLI 只留 <code>--fft-size</code>/<code>--sample-rate</code>。</p>
 
@@ -106,11 +123,11 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <p>n_freqs = 129(16k 預設)/ 257(16k alt)/ 513(48k)。<code>mic/ref</code> 只在呼叫期間讀取(AEC 自己再 copy 一層),<code>out</code> 從不讀取。</p>
 
 <h2>State 表</h2>
-<p>全部 cross-call state 都住在 caller 的單一 pool(C struct 持有;host 只擁有 pool 記憶體本身)。carve 順序 = <code>self, aec, fft, nr, synth_win, ola, ifft_buf, g_total, extra, e2, spec</code>(layout v6)。實測 bytes 為 16 kHz/256 KISS,<code>aec_nr_pipeline_static --print-mem-size</code>(2026-08-18 重跑):</p>
-<p class="note">2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>);下表數字量測時仍是 kiss backend,尚未按新預設重跑——ne10 待現查。</p>
+<p>全部 cross-call state 都住在 caller 的單一 pool(C struct 持有;host 只擁有 pool 記憶體本身)。carve 順序 = <code>self, aec, fft, nr, synth_win, ola, ifft_buf, g_total, extra, e2, spec</code>(layout v7)。實測 bytes 為 16 kHz/256 KISS,<code>aec_nr_pipeline_static --print-mem-size</code>(2026-08-19 重跑):</p>
+<p class="note">2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>);下表分項仍以 kiss backend 列出。同格點的 ne10 實測合計為 <b>515,344 B</b>(<code>Aec</code> 379,152 B、<code>FftHandle</code> 8,176 B,其餘與 kiss 相同)。2026-08-19 的 ABI 變更讓 <code>ALIGN16(sizeof(Aec))</code> 跨過 16-byte 邊界,本頁每一個絕對值都 +16 B,所有差額不變。</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>Aec</code> 全狀態</td><td>379,744 B</td><td>pool(C struct)</td><td>HPF、PBFDKF×2(main+shadow)、delay estimator(<code>delay_mode=MATCHED</code> n=5)、RES context、AEC 內部 FFT</td></tr>
+<tr><td><code>Aec</code> 全狀態</td><td>379,760 B</td><td>pool(C struct)</td><td>HPF、PBFDKF×2(main+shadow)、delay estimator(<code>delay_mode=MATCHED</code> n=5)、RES context、AEC 內部 FFT</td></tr>
 <tr><td><code>FftHandle</code>(OLA 用)</td><td>8,784 B</td><td>pool</td><td>aec_only 時不存在</td></tr>
 <tr><td><code>MmseLsaDenoiser</code></td><td>122,160 B</td><td>pool</td><td>噪聲估計/SPP 等 NR 狀態</td></tr>
 <tr><td><code>synth_win</code></td><td>[frame_sz] f32</td><td>pool</td><td>常數 sqrt periodic Hann</td></tr>
@@ -118,15 +135,15 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <tr><td><code>ifft_buf/g_total/extra/e2</code></td><td>[fft] / 3×[n_freqs] f32</td><td>pool</td><td>hop 內 scratch(carve 時明確清零)</td></tr>
 <tr><td><code>spec</code></td><td>[n_freqs] Complex</td><td>pool</td><td>scratch</td></tr>
 <tr><td><code>rng_state</code>/<code>near_hang</code></td><td>u32 / int</td><td>C struct(self)</td><td>CNG RNG seed 0x9e3779b9;hangover 計數</td></tr>
-<tr><td>合計</td><td>516,544 B(504.4 KB)</td><td>—</td><td>含 160 B 控制塊;pipeline bufs 5,696 B</td></tr>
+<tr><td>合計</td><td>516,560 B(504.5 KB)</td><td>—</td><td>含 160 B 控制塊;pipeline bufs 5,696 B</td></tr>
 </table>
 <p>delay_mode 對總量的影響(16 kHz/256,KISS,實測;AEC 子項與 <code>lib/aec</code> 一致,這裡多疊了 FFT(OLA)+NR+160 B 控制塊+5,696 B pipeline bufs 的固定開銷)。<b>同上,這是 backend 切換前(kiss)的參考值,ne10 待現查——換 backend/編譯選項/submodule 都會讓這些數字失效,一律現查為準:</b></p>
 <table>
 <tr><th>delay_mode</th><th>total_bytes</th><th>相對 MATCHED n=5</th></tr>
-<tr><td><code>MATCHED</code> n=5(預設)</td><td>516,544 B</td><td>—</td></tr>
-<tr><td><code>MATCHED</code> n=1</td><td>493,632 B</td><td>−22,912 B</td></tr>
-<tr><td><code>FIXED</code>,fixed=1600(100 ms)</td><td>358,448 B</td><td>−158,096 B</td></tr>
-<tr><td><code>EXTERNAL_ALIGNED</code></td><td>351,536 B</td><td>−165,008 B</td></tr>
+<tr><td><code>MATCHED</code> n=5(預設)</td><td>516,560 B</td><td>—</td></tr>
+<tr><td><code>MATCHED</code> n=1</td><td>493,648 B</td><td>−22,912 B</td></tr>
+<tr><td><code>FIXED</code>,fixed=1600(100 ms)</td><td>358,464 B</td><td>−158,096 B</td></tr>
+<tr><td><code>EXTERNAL_ALIGNED</code></td><td>351,552 B</td><td>−165,008 B</td></tr>
 </table>
 <p class="note">上表用直接呼叫 <code>audio_pipeline_get_mem_requirements()</code>/<code>_get_mem_breakdown()</code> 量得(無對應 CLI 旗標,見上方 API 用法節)。</p>
 

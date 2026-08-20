@@ -1201,13 +1201,16 @@ endif
 # (which DOES fold in the three resolved producers' identities), resolve
 # AC_LIB/AEC_LIB/NR_LIB the same way phase 1 does and pass them explicitly.
 .PHONY: print-bin-dir print-obj-dir print-lib-path
-# print-bin-dir / print-lib-path dispatch through the same three-producer
-# phase-1 resolution as the build goals, so bare `make -s print-bin-dir` /
-# `make -s print-lib-path` print the exact delivery locations (this repo's
-# archive AND binaries only exist in the resolved-producer directory).
+# print-bin-dir / print-lib-path / print-obj-dir all dispatch through the same
+# three-producer phase-1 resolution as the build goals, so a bare
+# `make -s print-<x>` prints the location that configuration actually uses
+# (this repo's archive, binaries AND objects only exist in the
+# resolved-producer directory). print-obj-dir did NOT dispatch before, so it
+# answered for a different config signature than the one the build used --
+# which made it useless for anything that has to find a just-built object.
 # Passing AC_LIB/AEC_LIB/NR_LIB explicitly skips the query sub-makes.
 ifeq ($(AC_LIB),)
-print-bin-dir print-lib-path:
+print-bin-dir print-lib-path print-obj-dir:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: could not resolve audio_common archive path (AC_DIR=$(AC_DIR))" >&2; exit 1; }; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
@@ -1218,9 +1221,19 @@ print-bin-dir:
 	@echo $(abspath $(BIN_DIR))
 print-lib-path:
 	@echo $(abspath $(LIB_TARGET))
-endif
 print-obj-dir:
 	@echo $(abspath $(OBJ_DIR))
+endif
+
+# test-fp-contract: disassemble the pipeline objects that run windowed
+# overlap-add and assert they emitted no fma-class instruction. Part of the
+# release gate: -ffp-contract=off is a compile flag, fma-free is a property of
+# the generated code, and only this says which one actually happened. The
+# script builds each object itself and queries print-obj-dir from the same
+# configuration, so it can never audit a stale signature's leftovers.
+.PHONY: test-fp-contract
+test-fp-contract:
+	@scripts/audit_fp_contract.sh $(BACKEND)
 
 # audit-no-stdio (adapted to the keyed-directory layout):
 # builds libaudio_pipeline.a with NO_STDIO=1 (current BACKEND=$(BACKEND))

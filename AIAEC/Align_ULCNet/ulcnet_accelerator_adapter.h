@@ -27,6 +27,13 @@ int ulcnet_accelerator_adapter_get_mem_size(
 
 /* Initialize from the same descriptor published beside the ONNX graph.
  * Production validation requires the fixed aligned-far contract. */
+/* Board integrators: the descriptor's delay_depth MUST equal the delay depth
+ * the ONNX graph was exported with. Nothing verifies that -- the validator
+ * only bounds-checks the range, and no C code here reads the model's metadata
+ * -- and a mismatch is silent: the host rings are carved from the descriptor
+ * while the runtime reads and writes the graph's shapes. There is no
+ * exporter-generated descriptor header yet; populate it from the exported
+ * model's own recorded depth. */
 UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
     void *memory,
     size_t bytes,

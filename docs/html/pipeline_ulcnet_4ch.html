@@ -52,6 +52,7 @@ audio_pipeline_4ch_ulcnet_destroy(p);  /* 不釋放 caller pool */</pre>
 <li><code>set_model()</code>:struct by-value 複製;<code>model-&gt;user</code> 指向物由 caller 保活。production far branch 固定為 aligned-far seam，因此非 NULL descriptor 必須通過 <code>ulcnet_model_io_descriptor_validate()</code>（raw/未知 descriptor reject）。runtime 不提供 far-mode setter。</li>
 <li>診斷:<code>audio_pipeline_4ch_ulcnet_last_beamformed_error()</code>(最近一次成功呼叫重建的 beam hop,唯讀)、<code>audio_pipeline_4ch_ulcnet_last_delay()</code>。</li>
 </ul>
+<p class="note"><b>沒有執行期強度 setter,而且是刻意的。</b>標準 wrapper 有 <code>audio_pipeline_4ch_set_aec_preset()</code> / <code>_set_nr_mode()</code>,本變體 <b>兩個都不提供</b>——因為它沒有可以重新指定的強度面。本 wrapper 的核心是 <code>core.enable_post = 0</code> 的 <b>pre-only</b> 組態(<code>validate_config()</code> 拒絕任何其他值),而 <code>enable_post = 0</code> 時核心<b>根本不存在</b> post 級抑制器、也不存在 NR 實例;每個 pre frame 都以 <code>four_aec_nr_res_abandon_pre()</code> 釋放,塑形輸出的是 ULCNet 的 mask。核心那兩個 setter 在 pre-only 核心上本來就回 −1(見 <a href="pipeline_4ch.html">pipeline_4ch</a> 的「執行期強度控制」表),所以這一層不轉出它們。要改強度,請重新訓練/更換模型,或改用有 DSP 後級的 <code>pipeline_4ch</code>。</p>
 
 <h2>Block diagram(每 hop 程式流)</h2>
 <pre>audio_pipeline_4ch_ulcnet_process_with_activity(p, mics, far, vad, out)
@@ -115,11 +116,11 @@ out               全零              全零                enh(beam err        
 </table>
 
 <h2>State 表</h2>
-<p>Carve 順序(layout v10):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>;ULCNet chain 狀態、幀 scratch、<code>far_delay</code>、reprime 計數器、共用視窗表都內嵌在 <code>self</code>。唯一一支 512 點 <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain。實測 descriptor(ne10, MATCHED n=5):<code>bytes=3,107,056</code>、descriptor_version=1、layout_version=10。n 活在單一共用 estimator，pool 隨 n 每 filter ±5,728 B且只付一次(n=1 實測 3,084,144 B);4 lanes pool 不隨 n 變(實測 1,369,728 B,n=1..5 相同;kiss 1,375,232 B)。kiss 實測:n=5 3,113,936 B / n=1 3,091,024 B。<b>換 backend／編譯選項／submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_4ch_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
+<p>Carve 順序(layout v11):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>;ULCNet chain 狀態、幀 scratch、<code>far_delay</code>、reprime 計數器、共用視窗表都內嵌在 <code>self</code>。唯一一支 512 點 <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain。實測 descriptor(2026-08-19 重跑;ne10, MATCHED n=5):<code>bytes=3,107,120</code>、descriptor_version=1、layout_version=11。n 活在單一共用 estimator，pool 隨 n 每 filter ±5,728 B且只付一次(n=1..5 實測 3,084,208 / 3,089,936 / 3,095,664 / 3,101,392 / 3,107,120 B);4 lanes pool 不隨 n 變(實測 1,369,792 B,n=1..5 相同;kiss 1,375,296 B)。kiss 實測 n=1..5:3,091,088 / 3,096,816 / 3,102,544 / 3,108,272 / 3,114,000 B。本輪 <code>ALIGN16(sizeof(Aec))</code> 跨過 16-byte 邊界,四路各 +16 B,所以每一階都 +64 B,5,728 B 的階距不變。<b>換 backend／編譯選項／submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_4ch_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>FourAecNrRes core</code>(pre-only)</td><td>1,480,256 B(4-lane AEC 1,369,728 B + delay ring/控制塊 110,528 B;兩項皆實測 <code>four_aec_nr_res_get_mem_breakdown()</code> @16k/fft512/<code>enable_post=0</code>,ne10。kiss 合計:1,485,728 B(1,375,232+110,496))</td><td>pool</td><td>共用 delay ring + 4 lanes;<code>enable_post=0</code> ⇒ <b>不含</b> NR/RES/iFFT(那些由本 wrapper 自己的 <code>ola/ifft_buffer/synth_window</code> + ULCNet chain 取代)</td></tr>
-<tr><td><code>SRP</code> / <code>GSC</code></td><td>num_angles=72 預設 / P:16×257、wa:4×257 Complex</td><td>pool</td><td>GSC 借用 <code>srp-&gt;a_array</code> steering 表;與下方其餘項目合計 = 3,107,056 − 1,480,256 = 1,626,800 B(kiss:3,113,936 − 1,485,728 = 1,628,208 B)</td></tr>
+<tr><td><code>FourAecNrRes core</code>(pre-only)</td><td>1,480,320 B(4-lane AEC 1,369,792 B + delay ring/控制塊 110,528 B;兩項皆實測 <code>four_aec_nr_res_get_mem_breakdown()</code> @16k/fft512/<code>enable_post=0</code>,ne10。kiss 合計:1,485,824 B(1,375,296+110,528)——kiss 這一列是<b>校正</b>:先前記的 wrapper 110,496 B 少了 32 B,<code>enable_post=0</code> 的 wrapper 與後端無關,兩個 backend 都是 110,528 B)</td><td>pool</td><td>共用 delay ring + 4 lanes;<code>enable_post=0</code> ⇒ <b>不含</b> NR/RES/iFFT(那些由本 wrapper 自己的 <code>ola/ifft_buffer/synth_window</code> + ULCNet chain 取代)</td></tr>
+<tr><td><code>SRP</code> / <code>GSC</code></td><td>num_angles=72 預設 / P:16×257、wa:4×257 Complex</td><td>pool</td><td>GSC 借用 <code>srp-&gt;a_array</code> steering 表;與下方其餘項目合計 = 3,107,120 − 1,480,320 = 1,626,800 B(kiss:3,114,000 − 1,485,824 = 1,628,176 B)</td></tr>
 <tr><td><code>gsc_spectrum/gsc_weights</code></td><td>[257] / [4][257] Complex</td><td>pool</td><td>每 hop 由 GSC 原子產生</td></tr>
 <tr><td><code>FftHandle</code>(共用)</td><td>pool 內</td><td>pool</td><td>beam IFFT + chain 三 transform 共用</td></tr>
 <tr><td><code>ola/ifft_buffer/synth_window</code></td><td>各 [512] f32</td><td>pool</td><td>beam WOLA;<code>ola</code> 跨 hop 累加</td></tr>
@@ -129,7 +130,7 @@ out               全零              全零                enh(beam err        
 <tr><td><code>far_delay</code></td><td>[256] f32</td><td>C struct(self)</td><td>one-hop far 補償;delay change / reset 時清零</td></tr>
 <tr><td><code>model</code>+<code>last_delay</code>+<code>frame_index</code></td><td>純量級</td><td>C struct(self)</td><td>model 安裝 survive reset；delay history 用來偵測 FIXED 首次可用</td></tr>
 <tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 exported D</td><td><b>CPU/DSP caller-owned pool</b></td><td>NPU 單次呼叫無狀態；<code>model.reset</code> 時 K/V、logit 與 GRU hidden 全部清除</td></tr>
-<tr><td>合計 pool</td><td>3,107,056 B(2.96 MB;kiss 3,113,936 B/2.97 MB)</td><td>host 擁有 pool</td><td>init_ex 路徑零 heap;sizing 與 carve lockstep(<code>cursor.remaining==0</code> 驗證)</td></tr>
+<tr><td>合計 pool</td><td>3,107,120 B(2.96 MB;kiss 3,114,000 B/2.97 MB)</td><td>host 擁有 pool</td><td>init_ex 路徑零 heap;sizing 與 carve lockstep(<code>cursor.remaining==0</code> 驗證)</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

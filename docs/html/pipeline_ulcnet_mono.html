@@ -63,7 +63,7 @@ th{background:#f5efe8}
                h_gru0/1 ← h_gru0/1_out(整組替換)
                回 0,enhanced_re/im 解包給呼叫端
           否 → persistent state 不動,回 -1(該幀視同失敗,pipeline fail-open)</pre>
-<p class="note">D(<code>delay_depth</code>)決定 ring 深度,依 export descriptor 而定;主機範例先建立 D=8 descriptor，再把它傳給 <code>ulcnet_accelerator_adapter_get_mem_size()</code>,實測(host, kiss)<code>bytes=68,912</code>(model-I/O state 68,880 B + adapter 32 B),<code>ULCNET_MODEL_IO_LAYOUT_VERSION=4</code>。此記憶體<b>不在</b>audio pipeline pool 內，而是 caller 另外配置。</p>
+<p class="note">D(<code>delay_depth</code>)決定 ring 深度,依 export descriptor 而定;主機範例先建立 D=8 descriptor，再把它傳給 <code>ulcnet_accelerator_adapter_get_mem_size()</code>,實測(host, 2026-08-19)<code>bytes=71,040</code>(model-I/O state 71,008 B + adapter 32 B),<code>ULCNET_MODEL_IO_LAYOUT_VERSION=5</code>。這一組是<b>校正</b>而非 AEC ABI 位移:先前記的 68,912 B / layout 4 是特徵外移前那一代的 model-I/O 佈局,與本輪 <code>sizeof(Aec)</code> 的變動無關。此記憶體<b>不在</b>audio pipeline pool 內，而是 caller 另外配置。</p>
 
 <h2>API 用法</h2>
 <pre>AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
@@ -90,6 +90,8 @@ while (stream) {
 }
 audio_pipeline_ulcnet_reset(p);   /* 也呼叫 model-&gt;reset */
 audio_pipeline_ulcnet_destroy(p); /* 不釋放 caller pool */</pre>
+<p class="note"><b>沒有執行期強度 setter,而且是刻意的。</b><code>pipeline_mono</code> 與 <code>pipeline_4ch</code> 都有 <code>set_aec_preset()</code> / <code>set_nr_mode()</code>,本 pipeline <b>兩個都不提供</b>——因為它沒有可以重新指定的強度面。這條 pipeline 完全沒有 NR 實例(<code>mmse_lsa_*</code> 在本 TU 一次都沒出現);AEC 側則設 <code>enable_res=0</code> / <code>return_res_context=1</code>,post 鏈照跑並把 <code>G_res</code> 填進 <code>AecResContext</code>,但本 pipeline 只讀 <code>formed_hop</code> / <code>error_spec</code>,<b>從不讀 <code>ctx.res_gain</code></b>——塑形輸出的是 ULCNet 的 mask。所以「回音壓多深」在這裡是模型的性質,不是一個 runtime 旋鈕。<code>cfg.aec_preset</code> 仍是 init 時的欄位,但它調的是那個沒有消費者的 <code>G_res</code>。要改強度,請重新訓練/更換模型,或改用有 DSP 後級的 <code>pipeline_mono</code>。</p>
+
 <h3>固定 aligned-far 部署契約</h3>
 <p>production 沒有 raw/aligned runtime switch。模型固定讀 <code>AecLinearContext.aligned_far_hop</code>：MATCHED/FIXED 尚未能提供對齊資料時，這個 seam 暫時承載 raw far，模型仍 infer 並套用成功且 finite 的輸出；取得對齊後，同一 seam 改承載 PBFDKF 實際消費的 aligned far。切換 hop 會先 reset 外部 K/V、logit 與 GRU state。raw/aligned 比較只保留在 <code>sweep_delay_depth.py</code>。export 的 <code>training_far_input_mode</code> 是 checkpoint provenance；<code>far_input_mode=aligned_far</code> 才是部署 ABI。C descriptor 只接受 ALIGNED，raw descriptor 在 init/set_model 被拒；<code>io_descriptor==NULL</code> 僅供 identity 或尚未發布 descriptor 的 callback。</p>
 <h3>UlcnetModel callback 契約(step-always,唯一例外 = reprime)</h3>
@@ -152,7 +154,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <p>infer 介面:<code>int infer(void* user, const float err_re[257], err_im[257], far_re[257], far_im[257], float out_re[257], out_im[257])</code>;回 0=成功。</p>
 
 <h2>State 表</h2>
-<p>Carve 順序(layout v7):self 控制塊(內嵌 Ulcnet 狀態、delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ AEC pool → 共用 512 點 <code>FftHandle</code>(err-analysis/far-analysis/synthesis 三者共用,hop 內嚴格序列使用;<code>BACKEND=kiss/ne10</code> 真正選到 ULCNet FFT)。實測 descriptor(ne10, balanced,2026-08-18 起的預設後端):<code>bytes=556,048</code>、descriptor_version=1、layout_version=7、alignment=16。此為預設 MATCHED n=5；pool 隨 n 每 filter ±5,728 B(n=1..5 實測 533,136 / 538,864 / 544,592 / 550,320 / 556,048 B),改 n 須重查 pool 重 init(kiss 舊值:535,888 / 541,616 / 547,344 / 553,072 / 558,800 B,backend 切換前的參考)。<b>換 backend/編譯選項/submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
+<p>Carve 順序(layout v8):self 控制塊(內嵌 Ulcnet 狀態、delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ AEC pool → 共用 512 點 <code>FftHandle</code>(err-analysis/far-analysis/synthesis 三者共用,hop 內嚴格序列使用;<code>BACKEND=kiss/ne10</code> 真正選到 ULCNet FFT)。實測 descriptor(ne10, balanced,2026-08-19 重跑):<code>bytes=556,080</code>、descriptor_version=1、layout_version=8、alignment=16。此為預設 MATCHED n=5；pool 隨 n 每 filter ±5,728 B(n=1..5 實測 533,168 / 538,896 / 544,624 / 550,352 / 556,080 B),改 n 須重查 pool 重 init(kiss 同日實測:535,920 / 541,648 / 547,376 / 553,104 / 558,832 B)。兩個 backend 的每一階相對前次記載都 +32 B,每 filter 5,728 B 的階距不變。這比本輪 <code>ALIGN16(sizeof(Aec))</code> 單獨貢獻的 +16 B 多,亦即本段是<b>校正</b>而非單純加值:先前的數字在 wrapper 這一側還有 16 B 沒跟上(descriptor 同時由 layout 7 升到 8)。<b>換 backend/編譯選項/submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td><code>Aec</code> 全狀態</td><td>pool 內(16k/512 grid)</td><td>pool(C struct)</td><td><code>enable_res=0 / return_res_context=1</code>;delay estimation 開(preset 預設)</td></tr>
@@ -163,8 +165,8 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <tr><td><code>ulcnet_window</code></td><td>[512] f32</td><td>C struct(self)</td><td>共用 sqrt-Hann 表,三個 chain struct 指向它</td></tr>
 <tr><td>幀 scratch <code>err/far[2][257]×2, mdl[257]×2</code></td><td>~10 KB</td><td>C struct(self)</td><td>hop#1 一次吐 2 幀所需</td></tr>
 <tr><td><code>model</code>(by value)+delay transition+<code>reprime_frames</code></td><td>純量級</td><td>C struct(self)</td><td>model 指標指向物由 caller 保活;<code>reprime_frames</code> 在 alignment 邊界武裝為 <code>AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES</code>=1,每發射一幀遞減</td></tr>
-<tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 export D;D=8 參考值 68,912 B(見上方 accelerator adapter 節)</td><td><b>host/CPU 端獨立 pool</b>(參考實作 <code>ulcnet_model_io.c</code>;真正的矩陣運算在 NPU,但 state 本身活在 CPU RAM,經 <code>UlcnetModelIoInputs/Outputs</code> 每幀搬進搬出)</td><td>不在本頁 556,048 B pool 內;pipeline 只透過 <code>model.reset</code> 要求 flush(對應 <code>ulcnet_model_io_reset()</code>)</td></tr>
-<tr><td>合計 pool</td><td>556,048 B(543.0 KB)</td><td>host 擁有 pool 記憶體</td><td>init→destroy 零 heap(create() 除外)</td></tr>
+<tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 export D;D=8 參考值 71,040 B(見上方 accelerator adapter 節)</td><td><b>host/CPU 端獨立 pool</b>(參考實作 <code>ulcnet_model_io.c</code>;真正的矩陣運算在 NPU,但 state 本身活在 CPU RAM,經 <code>UlcnetModelIoInputs/Outputs</code> 每幀搬進搬出)</td><td>不在本頁 556,080 B pool 內;pipeline 只透過 <code>model.reset</code> 要求 flush(對應 <code>ulcnet_model_io_reset()</code>)</td></tr>
+<tr><td>合計 pool</td><td>556,080 B(543.0 KB)</td><td>host 擁有 pool 記憶體</td><td>init→destroy 零 heap(create() 除外)</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

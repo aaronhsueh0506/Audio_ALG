@@ -200,11 +200,24 @@ int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]);
  *
  * MODEL-CONTRACT PUBLICATION (io_descriptor): a runtime that owns a
  * ulcnet_model_io state publishes its descriptor here (the accelerator
- * adapter does this automatically). Production pipelines validate its grid,
- * D, state layout and fixed aligned-far contract before installation. NULL is
- * retained for the memset-zero identity/test boundary. The descriptor must
- * outlive every pipeline the model is installed into; pipelines copy the
- * UlcnetModel struct but never the descriptor. */
+ * adapter does this automatically). A model with an `infer` callback MUST
+ * publish one -- the pipelines refuse the combination -- because the
+ * host-side attention/logit rings are carved from the descriptor's shapes and
+ * nothing downstream can detect a disagreement with the graph: the finite
+ * guard above catches an UNWRITTEN output, never a WRONG-SHAPED one, so a
+ * graph whose D differs reads and writes past those rings silently. NULL is
+ * retained only for the memset-zero identity boundary, where there are no
+ * shapes to agree about.
+ *
+ * What the pipelines actually check is the grid, the state-layout version,
+ * the fixed aligned-far contract, and that D is inside
+ * [ULCNET_MODEL_IO_MIN_D, ULCNET_MODEL_IO_MAX_D]. They do NOT and cannot
+ * check D against the graph -- no C code reads the exported ONNX metadata or
+ * its sidecar. Keeping the descriptor's delay_depth equal to the depth the
+ * model was exported with is the integrator's obligation.
+ *
+ * The descriptor must outlive every pipeline the model is installed into;
+ * pipelines copy the UlcnetModel struct but never the descriptor. */
 typedef struct UlcnetModel {
     void *user;
     int (*infer)(void *user,

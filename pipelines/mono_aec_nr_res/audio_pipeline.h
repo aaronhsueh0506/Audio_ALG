@@ -189,6 +189,41 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic,
  */
 void audio_pipeline_reset(AudioPipeline* p);
 
+/* ── Runtime strength control ─────────────────────────────────────────────
+ *
+ * Retarget the residual-echo strength on a RUNNING pipeline. The three
+ * presets differ in one scalar floor, so this is a retarget rather than a
+ * rebuild: the filter, the delay lock and every smoothing history carry on.
+ *
+ * ramp_ms is forwarded to the suppressor -- 0 applies on the next hop and
+ * lands on exactly the floor a fresh instance would hold, a positive value
+ * walks there linearly in dB. See aec.h for why that matters.
+ *
+ * Note when measuring: the far-active floor only binds on far-active,
+ * non-double-talk hops, and the same gain also scales the injected comfort
+ * noise, so a whole-recording average moves less than the dB step implies.
+ *
+ * Call between hops, serialised with audio_pipeline_process(); not
+ * thread-safe. Returns 0, or -1 on NULL, an out-of-enum preset or an
+ * out-of-range ramp_ms, with nothing written. */
+int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset,
+                                  float ramp_ms);
+
+/* Retarget the noise-reduction strength on a RUNNING pipeline.
+ *
+ * This recomposes THIS pipeline's own NR configuration -- the canonical
+ * strength preset plus the overrides it has always applied on top -- and hands
+ * the result to mmse_lsa_reconfigure(). It deliberately does not call
+ * mmse_lsa_set_mode(), which composes the bare canonical preset and would
+ * either be refused (its L differs) or revert those overrides.
+ *
+ * The tracked noise floor and the gain smoothing history survive the change;
+ * use audio_pipeline_reset() for a restart.
+ *
+ * Returns 0, or -1 on NULL, an aec_only build (no denoiser exists), an
+ * out-of-enum mode, or a rejected target. */
+int audio_pipeline_set_nr_mode(AudioPipeline* p, MmseLsaNrMode mode);
+
 /**
  * Tear down in reverse carve order: NR -> pipeline FFT (the OLA irfft
  * instance) -> AEC. This is the mirror image of audio_pipeline_init's carve

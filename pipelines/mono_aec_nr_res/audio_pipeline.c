@@ -35,6 +35,7 @@
 #include <math.h>
 
 #include "audio_pipeline.h"
+#include "nr_overlay.h"
 #include "fft_wrapper.h"       /* fft_get_mem_size/fft_init/fft_inverse/fft_destroy, Complex, ALIGN16 */
 #include "simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32                                     */
 #include "pipeline_dims.h"     /* compute_frame_dims() -- shared with both CLIs                       */
@@ -112,8 +113,12 @@
  * passes `out` to aec_process() directly -- one fewer buffer, one fewer
  * copy, same bytes in `out` either way.
  * Bumped 5->6: the self-resident AudioPipelineConfig gained independent
- * filter-length and delay-mode/bank/fixed-delay initialization fields. */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 6u
+ * filter-length and delay-mode/bank/fixed-delay initialization fields.
+ * Bumped 6->7: sizeof(Aec) grew (the suppressor gained its runtime far-active
+ * floor retarget state), so the AEC carved out of this pool moves the total
+ * and every offset after it. Carve order and buffer set are unchanged, so
+ * build_flags_hash does not move -- this counter is the only signal. */
+#define AUDIO_PIPELINE_LAYOUT_VERSION 7u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
  * -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" or \"ne10\" to match its own
@@ -266,35 +271,8 @@ static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
     aec_cfg->enable_res         = 0;   /* linear AEC + external NR/RES seam */
     aec_cfg->return_res_context = 1;
 
-    *nr_cfg = mmse_lsa_config_for_mode_grid(
-        cfg->sample_rate, *fft_sz, cfg->nr_mode);
-    /* 2026-08-03 A/B decision (824-case VCTK+DEMAND + 90-case AEC blind
-     * manifest, see NR/CHANGELOG.md and AEC-side eval_manifest90 runs):
-     * this pipeline now takes mmse_lsa_config_for_mode_grid()'s canonical
-     * alpha_d/alpha_attack AS-IS instead of overriding them back to the old
-     * hardcoded L=150/alpha_d=0.95/alpha_attack=0.3-old-retime tuning --
-     * that legacy tuning measured worse on the AEC-residual/double-talk
-     * angle that actually matters for this pipeline (ERLE-proxy/SDR-proxy/
-     * near-end preservation all favoured canonical across every bucket of
-     * the 90-case manifest, movement/NE buckets n=25-30). L and alpha_decay
-     * are NOT touched here because they already coincide with the Python
-     * pipeline's canonical composition (aec_nr_pipeline.py:_build_denoiser):
-     * mmse_lsa_retime_frames(150,...) here and Python's pipeline-specific
-     * L=94 overlay are two different literals designed to retime to the
-     * SAME frame count at every grid (see _build_denoiser's docstring), and
-     * alpha_decay=alpha_g already matches Python's canonical (unoverlaid)
-     * value. Only alpha_d/alpha_attack were genuinely diverging. */
-    nr_cfg->broadband_threshold = 0.8f;
-    /* 2026-08-03: was an implicit side effect of the C standalone default
-     * (mmse_lsa_default_config_for_grid) also happening to be 0.8f -- that
-     * default is now fixed to match Python's own config/v3_2_config.yaml
-     * (1.0f, disabled), so this pipeline must set 0.8f explicitly to keep its
-     * actual runtime behaviour unchanged. Mirrors the deliberate overlay
-     * aec_nr_pipeline.py:_build_denoiser documents: faster post-echo-burst
-     * adaptation on AEC-residual signals. */
-    nr_cfg->L = mmse_lsa_retime_frames(
-        150, cfg->sample_rate, *hop);
-    nr_cfg->alpha_decay  = nr_cfg->alpha_g;
+    *nr_cfg = pipelines_compose_nr_config(cfg->sample_rate, *fft_sz, *hop,
+                                cfg->nr_mode);
     return 0;
 }
 
@@ -794,12 +772,34 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
     /* ctx.error_spec already contains the matching sqrt-Hann analysis frame;
      * complete the 50%-overlap WOLA with one IFFT + synthesis + OLA. */
     fft_inverse(p->fft, p->spec, p->ifft_buf);
-    for (int k = 0; k < frame_sz; k++) p->ola[k] += p->ifft_buf[k] * p->synth_win[k];
+    sk_wola_accumulate_f32(p->ola, p->ifft_buf, p->synth_win, frame_sz);
     memcpy(out, p->ola, (size_t)hop * sizeof(float));
     memmove(p->ola, p->ola + hop, (size_t)(frame_sz - hop) * sizeof(float));
     memset(p->ola + (frame_sz - hop), 0, (size_t)hop * sizeof(float));
 
     return 0;
+}
+
+int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset,
+                                  float ramp_ms) {
+    if (!p || !p->aec) return -1;
+    /* No pipeline-level mirror: this instance stores resolved dimensions, not
+     * the caller's config, and aec_set_preset already updates the AEC's own
+     * AecConfig -- the single authoritative copy. */
+    return aec_set_preset(p->aec, preset, ramp_ms);
+}
+
+int audio_pipeline_set_nr_mode(AudioPipeline* p, MmseLsaNrMode mode) {
+    MmseLsaConfig target;
+    if (!p || !p->nr) return -1;   /* aec_only builds have no denoiser */
+    if (!mmse_lsa_nr_mode_is_valid(mode)) return -1;
+    /* Recompose THIS pipeline's configuration, not the canonical preset:
+     * mmse_lsa_set_mode() would refuse it (its L differs) or revert the
+     * overrides pipelines_compose_nr_config() applies. */
+    target = pipelines_compose_nr_config(p->sample_rate, p->fft_sz, p->hop, mode);
+    /* mmse_lsa_reconfigure updates the denoiser's own MmseLsaConfig, which is
+     * the authoritative copy; this instance keeps no config of its own. */
+    return mmse_lsa_reconfigure(p->nr, &target);
 }
 
 void audio_pipeline_reset(AudioPipeline* p) {

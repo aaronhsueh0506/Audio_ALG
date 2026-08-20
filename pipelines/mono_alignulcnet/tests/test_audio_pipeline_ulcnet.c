@@ -100,6 +100,22 @@
 #include <time.h>
 #include <math.h>
 
+/* Every test model that actually infers must publish a descriptor: the
+ * pipeline refuses infer-without-descriptor, because a shape disagreement
+ * between the graph and the host-side rings is undetectable downstream (the
+ * finite guard catches an unwritten output, never a wrong-shaped one). One
+ * shared descriptor for the whole file; D is the example default. */
+static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
+    static UlcnetModelIoDescriptor d;
+    static int ready = 0;
+    if (!ready) {
+        if (ulcnet_model_io_descriptor_default(8, &d) != 0) return NULL;
+        ready = 1;
+    }
+    return &d;
+}
+
+
 #define HOP            ULCNET_HOP     /* 256 — pinned by the compiled grid  */
 #define ECHO_DELAY     2000           /* samples; > 832-tap filter reach    */
 #define MAX_LOCK_HOPS  150            /* acquisition bound (measured: ~15)  */
@@ -270,6 +286,7 @@ static void test_counting_model(void) {
     AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
     cfg.model.user  = &st;
     cfg.model.infer = counting_infer;
+    cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = counting_reset;
 
     AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
@@ -371,6 +388,7 @@ static void test_fixed_first_alignment_resets_model(void) {
     cfg.fixed_delay_samples = FIXED_DELAY;
     cfg.model.user = &st;
     cfg.model.infer = counting_infer;
+    cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = counting_reset;
     p = audio_pipeline_ulcnet_create(&cfg);
     if (!p) {
@@ -475,6 +493,7 @@ static void test_relock_same_delay_resets_model(void) {
     AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
     cfg.model.user  = &st;
     cfg.model.infer = counting_infer;
+    cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = counting_reset;
 
     AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
@@ -594,6 +613,7 @@ static void test_fail_open_and_delay_gating(void) {
     AudioPipelineUlcnetConfig cfg_a = audio_pipeline_ulcnet_default_config(16000);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = failing_infer;
+    cfg_a.model.io_descriptor = test_io_descriptor();
     AudioPipelineUlcnetConfig cfg_b = audio_pipeline_ulcnet_default_config(16000); /* NULL model */
 
     AudioPipelineUlcnet* pa = audio_pipeline_ulcnet_create(&cfg_a);
@@ -802,10 +822,22 @@ static void test_aligned_descriptor_gate(void) {
     AudioPipelineUlcnetConfig undescribed = audio_pipeline_ulcnet_default_config(16000);
     undescribed.model.user = NULL;
     undescribed.model.infer = gate_infer_identity;
+    undescribed.model.io_descriptor = test_io_descriptor();
     undescribed.model.reset = NULL;
     undescribed.model.io_descriptor = NULL;
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&undescribed, &req) == 0,
-          "a model with io_descriptor == NULL publishes no contract and is not gated");
+    /* An INFERRING model must publish a descriptor: its delay depth and
+     * history shapes are what the host-side rings are carved from, and a
+     * disagreement with the graph is undetectable downstream. An identity
+     * model -- no infer callback -- has no shapes to agree about. */
+    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&undescribed, &req) == -1,
+          "an INFERRING model with io_descriptor == NULL is refused");
+    {
+        AudioPipelineUlcnetConfig identity_only = undescribed;
+        identity_only.model.infer = NULL;
+        CHECK(audio_pipeline_ulcnet_get_mem_requirements(&identity_only, &req) == 0,
+              "an identity model (no infer) may still leave the descriptor NULL");
+    }
+    undescribed.model.io_descriptor = test_io_descriptor();
 
     AudioPipelineUlcnetConfig aligned_aligned = undescribed;
     aligned_aligned.model.io_descriptor = &aligned_desc;
@@ -1046,6 +1078,7 @@ static void test_null_model_equals_identity_model(void) {
     AudioPipelineUlcnetConfig cfg_id   = audio_pipeline_ulcnet_default_config(16000);
     cfg_id.model.user  = &st;
     cfg_id.model.infer = counting_infer;   /* copies err -> out, returns 0 */
+    cfg_id.model.io_descriptor = test_io_descriptor();
     cfg_id.model.reset = counting_reset;
 
     AudioPipelineUlcnet* pn = audio_pipeline_ulcnet_create(&cfg_null);
@@ -1118,6 +1151,7 @@ static void test_far_timestamp_before_acquisition(void) {
 
     AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
     cfg.model.infer = passthrough_far_infer;
+    cfg.model.io_descriptor = test_io_descriptor();
     AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for far-timestamp test\n"); g_failures++; return; }
 
@@ -1172,6 +1206,7 @@ static void test_model_applies_unlocked(void) {
     enum { N = 30 };
     AudioPipelineUlcnetConfig cfg_raw = audio_pipeline_ulcnet_default_config(16000);
     cfg_raw.model.infer = halving_infer;
+    cfg_raw.model.io_descriptor = test_io_descriptor();
     AudioPipelineUlcnetConfig cfg_null = audio_pipeline_ulcnet_default_config(16000);
 
     AudioPipelineUlcnet* pr = audio_pipeline_ulcnet_create(&cfg_raw);
@@ -1258,6 +1293,7 @@ static void test_nan_guard(void) {
     AudioPipelineUlcnetConfig cfg_a = audio_pipeline_ulcnet_default_config(16000);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = nan_infer;
+    cfg_a.model.io_descriptor = test_io_descriptor();
     AudioPipelineUlcnetConfig cfg_b = audio_pipeline_ulcnet_default_config(16000);
 
     AudioPipelineUlcnet* pa = audio_pipeline_ulcnet_create(&cfg_a);
@@ -1371,6 +1407,7 @@ static void test_partial_write_guard(void) {
     AudioPipelineUlcnetConfig cfg_a = audio_pipeline_ulcnet_default_config(16000);
     cfg_a.model.user  = &st;
     cfg_a.model.infer = partial_write_infer;
+    cfg_a.model.io_descriptor = test_io_descriptor();
     AudioPipelineUlcnetConfig cfg_b = audio_pipeline_ulcnet_default_config(16000);
 
     AudioPipelineUlcnet* pa = audio_pipeline_ulcnet_create(&cfg_a);
@@ -1548,6 +1585,7 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModelState* st)
     cfg.fixed_delay_samples = fixed_delay;
     cfg.model.user  = st;
     cfg.model.infer = probe_infer;
+    cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = probe_reset;
     p = audio_pipeline_ulcnet_create(&cfg);
     if (!p) return -1;
@@ -1720,6 +1758,7 @@ static void test_reprime_behavior(void) {
     /* ---- (a) mid-stream MATCHED CHANGED ---- */
     cfg.model.user  = &st;
     cfg.model.infer = counting_infer;
+    cfg.model.io_descriptor = test_io_descriptor();
     cfg.model.reset = counting_reset;
     p = audio_pipeline_ulcnet_create(&cfg);
     if (!p) { fprintf(stderr, "FAIL: setup (create) for reprime behaviour test\n"); g_failures++; return; }
@@ -1780,6 +1819,7 @@ static void test_reprime_behavior(void) {
         fcfg.fixed_delay_samples = FIXED_HOPS * HOP;
         fcfg.model.user  = &fst;
         fcfg.model.infer = counting_infer;
+        fcfg.model.io_descriptor = test_io_descriptor();
         fcfg.model.reset = counting_reset;
         p = audio_pipeline_ulcnet_create(&fcfg);
         if (!p) { fprintf(stderr, "FAIL: setup (create) for FIXED reprime test\n"); g_failures++; return; }

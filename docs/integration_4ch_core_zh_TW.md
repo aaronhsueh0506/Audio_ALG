@@ -202,6 +202,68 @@ heap 便利路徑：`four_aec_nr_res_create(&cfg)` 把第 1~3 步合成一步，
 用來在整合測試裡證明拓撲沒有被改掉；最後一個用來證明跨聲道的 far-end 共用真的生效。
 它們對處理結果沒有任何影響。
 
+### 3.2 執行期強度控制
+
+```c
+int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset, float ramp_ms);
+int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, MmseLsaNrMode mode);
+int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live, float* target);
+```
+
+> **本節最重要的一件事：對四條 lane 重新指定 preset 是無效操作。**
+>
+> 四條 AEC lane 都以 `spatial_linear_context` 建立，因此**沒有任何一條**會走到
+> 自己的 suppression-gain 路徑；它們各自的地板什麼都不塑形。真正乘上本核心輸出、
+> 也真正決定 comfort noise 量的那個 gain，來自**唯一一個**共用的 post 級抑制器。
+> `four_aec_nr_res_set_aec_preset()` 針對的就是它——這也是它存在、而不是要你自己
+> 對四條 lane 迴圈呼叫 `aec_set_preset()` 的原因。這一點由測試釘住
+> （`tests/test_4aec_nr_res.c` 的 `test_runtime_strength()`），不是推測。
+
+```c
+/* 使用者把回音抑制轉到 aggressive、降噪轉到 mild */
+if (four_aec_nr_res_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { /* 引數不合法 */ }
+if (four_aec_nr_res_set_nr_mode(p, MMSE_LSA_NR_MILD) != 0)                  { /* 同上 */ }
+
+/* 想確認要求有沒有落地，就讀這一對（單位是線性功率，不是 dB） */
+float live, target;
+if (four_aec_nr_res_post_split_floor(p, &live, &target) == 0 && live == target) {
+    /* ramp 已經走完 */
+}
+```
+
+| 呼叫 | 改／讀什麼 | 回 `-1` 的情況（`-1` 時**什麼都不寫**） |
+|---|---|---|
+| `four_aec_nr_res_set_aec_preset()` | **共用 post 級抑制器**的 far-active split floor | `p` 為 NULL 或已 destroy；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]`；`cfg.enable_post == 0`（pre-only 核心根本沒有抑制器） |
+| `four_aec_nr_res_set_nr_mode()` | 本核心擁有的**那一個**降噪器（NR 是對 beamform 後的訊號跑，不是每條 lane 一個） | `p` 為 NULL 或已 destroy；`cfg.enable_post == 0`；`mode` 超出 enum；重組出的 target 被拒 |
+| `four_aec_nr_res_post_split_floor()` | 唯讀。`live` = 抑制器**當下**套用的值，`target` = 撐得過 reset 的已設定值；兩者只有在 ramp 走到一半時才不同。任一指標可為 NULL | `p` 為 NULL 或已 destroy；`cfg.enable_post == 0` |
+
+`live` / `target` 這一對是**板端唯一值得記錄的強度量**：它是真正塑形輸出的東西
+（lane 自己的地板什麼都不塑形），而兩個值合在一起就回答了「我要求的改動落地了沒有」。
+
+`ramp_ms == 0` 代表下一個 hop 就套用，**不是錯誤**，落點與「用該 preset 從頭建一個
+新實例」完全相同；`> 0` 則以 dB 為單位線性走過去，上限 60 秒。mild ↔ aggressive 是
+18 dB 落差、地板又是硬性 clamp，所以互動式旋鈕應該給一個 ramp。ramp 進行中再呼叫
+一次，會從當前的 live 值重新起走。
+
+兩個 setter 都**不是重啟**：四條 lane 的濾波器、共用延遲鎖定、NR 的噪聲底與增益
+平滑歷史全部繼續跑。要重啟請用 `four_aec_nr_res_reset()`——注意 preset 的改動
+**撐得過 reset**（目標值另存一份，reset 會重新套用），但 ramp 進度會被丟掉。
+**在兩個 hop 之間呼叫、與 `process_pre()`／`process_post()` 序列化；非 thread-safe。**
+
+> **不要繞過 `set_nr_mode()` 去呼叫 `mmse_lsa_set_mode()`。** 本核心的 NR 組態是
+> 「canonical 強度 preset **加上**自己的覆寫」（`broadband_threshold`、`L`、
+> `alpha_decay`）。`mmse_lsa_set_mode()` 組的是裸的 canonical preset，在本核心的
+> 實例上會被**拒絕**（它的 `L` 不同）——所以 `four_aec_nr_res_set_nr_mode()` 做的
+> 事是重組本核心的完整組態，再交給 `mmse_lsa_reconfigure()`。
+
+**A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
+hop 上生效：double-talk 期間本核心強制套用 DT 地板，而 DT 地板在三個 preset 之間
+**完全相同**；far-active latch 觸發之前套用的是 far-silent 地板。同一個 gain 還
+決定注入的 comfort noise 量（振幅正比於 `sqrt(1 − G_res²)`——地板壓得越深、CNG
+反而越多）。因此**整段錄音的平均值移動幅度會小於 dB 落差所暗示的量**，而且一個只量
+echo／degradation 的 A/B 會把 CNG 的變化錯記到別的機制頭上。請在 echo 對齊或
+degradation 對齊的條件下比較，並實際試聽。
+
 ---
 
 ## 4. Config 完整參考
@@ -309,21 +371,23 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是 2026-08-18、`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED`（預設,
+以下是 2026-08-19、`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED`（預設,
 n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backend、換編譯
-選項、更新 submodule 都會變。
+選項、更新 submodule 都會變。本輪 `sizeof(Aec)` 增加 8 B、`ALIGN16(sizeof(Aec))`
+跨過 16-byte 邊界，四路各 +16 B，所以 `aec_bytes` 與 `req.bytes` 每列 +64 B；
+所有差額不變。
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `nr_bytes` | `fft_bytes` | `wrapper_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,424 | 858,944 | 122,160 | 8,784 | 123,536 |
-| 16000，`fft_size=512` | 1,669,184 | 1,375,232 | 133,472 | 16,976 | 143,504 |
-| 16000，`max_delay_ms=100` | 1,054,288 | 858,944 | 122,160 | 8,784 | 64,400 |
-| 16000，`filter_length=512` | 1,026,832 | 772,352 | 122,160 | 8,784 | 123,536 |
-| 48000，預設（1024/512） | 3,680,704 | 2,954,048 | 374,336 | 33,360 | 318,960 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,488 | 859,008 | 122,160 | 8,784 | 123,536 |
+| 16000，`fft_size=512` | 1,669,248 | 1,375,296 | 133,472 | 16,976 | 143,504 |
+| 16000，`max_delay_ms=100` | 1,054,352 | 859,008 | 122,160 | 8,784 | 64,400 |
+| 16000，`filter_length=512` | 1,026,896 | 772,416 | 122,160 | 8,784 | 123,536 |
+| 48000，預設（1024/512） | 3,680,768 | 2,954,112 | 374,336 | 33,360 | 318,960 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
-`aec_bytes` 除以 4 得單路 214,736 B（@16k/256）——與 `lib/aec` 的
+`aec_bytes` 除以 4 得單路 214,752 B（@16k/256）——與 `lib/aec` 的
 `AEC_DELAY_EXTERNAL_ALIGNED` 單體大小完全相同,因為每路內部本來就是
 `EXTERNAL_ALIGNED`（delay 由本層共用估計器提供,不建自己的 estimator/ring）。
 
@@ -331,9 +395,9 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 1,113,424 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,824 | −93,600 |
-| `EXTERNAL_ALIGNED` | 1,012,912 | −100,512 |
+| `MATCHED` n=5（預設） | 1,113,488 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,888 | −93,600 |
+| `EXTERNAL_ALIGNED` | 1,012,976 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
@@ -343,11 +407,14 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | Config | `req.bytes` |
 |---|---:|
-| 16000，`fft_size=512`，`enable_post=0` | 1,485,728 |
+| 16000，`fft_size=512`，`enable_post=0` | 1,485,824 |
 
 即 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 記載的 ULCNet
-4ch wrapper私有核心大小；比同格點 `enable_post=1` 少 183,456 B（NR/RES/iFFT
-的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。
+4ch wrapper私有核心大小；比同格點 `enable_post=1` 少 183,424 B（NR/RES/iFFT
+的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。這一列是**校正**而非單純
+加值：先前記的 1,485,728 除了本輪的 +64 B 之外，還有 32 B 是更早一代就沒跟上的
+`wrapper_bytes`（`enable_post=0` 的 wrapper 為 110,528 B，與後端無關），所以差額
+也從 183,456 B 修正為實測的 183,424 B。
 **實際配置一律以 `req.bytes` 為準。**
 
 ---

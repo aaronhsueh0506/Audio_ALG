@@ -186,8 +186,13 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * build_flags_hash cannot say so, since it folds in the core's carve-token
  * hash, which a control-block-only change leaves alone.
  * v10 carries GSC's covariance layout from P[F][M][M] to P[M][M][F]. The
- * state count is unchanged, but its pointer tables and pool size moved. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 10u
+ * state count is unchanged, but its pointer tables and pool size moved.
+ * Version 11: sizeof(Aec) grew (the suppressor gained its runtime
+ * far-active floor retarget state), so every AEC carved out of this pool
+ * moves the total and the offsets after it. Carve order and buffer set are
+ * unchanged, so build_flags_hash does not move -- this counter is the only
+ * signal. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 11u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -243,16 +248,37 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
  * Config and lifecycle
  * ========================================================================== */
 
-/**
- * Reuses AudioPipeline4ChConfig (the spatial stage is identical). Returns
- * the trained 16 kHz / frame-FFT 512 / hop 256 defaults, with
- * core.fft_size explicitly pre-set to 512 (the only grid this wrapper
- * accepts). Validation additionally rejects
- * core.sample_rate != 16000 and core.fft_size not in {0, 512}; a value of 0
- * is forced to 512, never to the core's own 256 default. Caller
- * core.enable_post must remain 1; this wrapper changes a private config copy
- * to pre-only so unused NR/RES/iFFT state is not allocated.
- */
+/* Returns the trained 16 kHz / frame-FFT 512 / hop 256 defaults for the
+ * PRE-ONLY profile this wrapper is the only consumer of: core.fft_size = 512,
+ * core.enable_post = 0 and core.enable_cng = 0.
+ *
+ * Align-ULCNet replaces the post-beam RES/NR/CNG stage entirely, so with
+ * enable_post = 0 the core builds no denoiser, no suppressor, no comfort
+ * noise and no post iFFT. Every post-only field must therefore keep the value
+ * this function returns, and is REJECTED otherwise rather than ignored:
+ *
+ *   core.enable_post  = 0
+ *   core.enable_cng   = 0
+ *   core.legacy_amin  = 0
+ *   core.nr_mode      = MMSE_LSA_NR_BALANCED   (the enum has no "disabled"
+ *                       value and no denoiser exists, so this is a required
+ *                       sentinel, not a strength choice)
+ *   auto_vad_*        = the audio_pipeline_4ch defaults (the built-in energy
+ *                       VAD is unreachable here: only
+ *                       _process_with_activity() exists, and it takes the
+ *                       caller's VAD)
+ *
+ * Rejecting rather than silently accepting is deliberate: a caller who
+ * believes it configured NR finds out at init, not on a board.
+ *
+ * AudioPipeline4ChConfig is SHARED with the standard 4-channel wrapper, so
+ * this application's accepted set is narrower than that struct's. That is the
+ * intended divergence and is why the list above is spelled out here: the
+ * alternative -- accepting the fields and ignoring them -- is what would make
+ * one struct silently mean two different things.
+ *
+ * The pre-stage fields (delay_*, aec_preset, filter_length,
+ * capture_proxy_channel, max_delay_ms) are live and set normally. */
 AudioPipeline4ChConfig audio_pipeline_4ch_ulcnet_default_config(void);
 
 /**

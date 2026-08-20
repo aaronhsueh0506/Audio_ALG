@@ -36,6 +36,7 @@
 #include "gsc.h"
 #include "srp.h"
 #include "mem_align.h"
+#include "simd_kernels.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -139,10 +140,31 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
     if (cfg->core.sample_rate != ULCNET_PIPELINE_SAMPLE_RATE) return 0;
     if (cfg->core.fft_size != 0 &&
         cfg->core.fft_size != ULCNET_PIPELINE_FFT) return 0;
-    /* Callers use the ordinary public config. This wrapper alone changes its
-     * private copy to pre-only; silently accepting caller enable_post=0/2
-     * would make the same public config mean different things by wrapper. */
-    if (cfg->core.enable_post != 1) return 0;
+    /* Post-only fields are REJECTED, not ignored. AudioPipeline4ChConfig is
+     * shared with the standard 4-channel wrapper, so this application's
+     * accepted set is deliberately narrower than that struct's: with
+     * enable_post = 0 there is no NR instance, no suppressor, no comfort
+     * noise and no post iFFT, and a value set in any of these fields could
+     * not have done anything. Silently accepting them is what would make one
+     * struct mean two things; refusing says so at init. */
+    if (cfg->core.enable_post != 0) return 0;
+    if (cfg->core.enable_cng != 0) return 0;
+    if (cfg->core.legacy_amin != 0) return 0;
+    /* MmseLsaNrMode has no "disabled" value and no denoiser is created here,
+     * so the default is a required sentinel rather than a strength choice. */
+    if (cfg->core.nr_mode != MMSE_LSA_NR_BALANCED) return 0;
+    /* The built-in energy VAD is unreachable too: this wrapper exposes only
+     * _process_with_activity(), which takes the caller's VAD. Compared against
+     * a freshly built default rather than transcribed literals, so a change to
+     * the defaults cannot leave this rejecting the default config. Exact float
+     * comparison is right here: these values are copied, never computed. */
+    {
+        AudioPipeline4ChConfig base =
+            audio_pipeline_4ch_default_config(ULCNET_PIPELINE_SAMPLE_RATE);
+        if (cfg->auto_vad_threshold_dbfs != base.auto_vad_threshold_dbfs) return 0;
+        if (cfg->auto_vad_snr_ratio != base.auto_vad_snr_ratio) return 0;
+        if (cfg->auto_vad_hangover_frames != base.auto_vad_hangover_frames) return 0;
+    }
     nyquist = 0.5f * (float)cfg->core.sample_rate;
     if (cfg->geometry != AUDIO_PIPELINE_4CH_GEOMETRY_UCA &&
         cfg->geometry != AUDIO_PIPELINE_4CH_GEOMETRY_ULA &&
@@ -200,6 +222,14 @@ AudioPipeline4ChConfig audio_pipeline_4ch_ulcnet_default_config(void) {
     AudioPipeline4ChConfig cfg =
         audio_pipeline_4ch_default_config(ULCNET_PIPELINE_SAMPLE_RATE);
     cfg.core.fft_size = ULCNET_PIPELINE_FFT;
+    /* Align-ULCNet REPLACES the post-beam RES/NR/CNG stage, so the pre-only
+     * profile is what this function returns rather than something the wrapper
+     * quietly rewrites afterwards. Every post-only core field must keep the
+     * value set here; validate_config() rejects any other, so a caller who
+     * believes it configured NR or comfort noise finds out at init instead of
+     * on a board. */
+    cfg.core.enable_post = 0;
+    cfg.core.enable_cng = 0;
     /* core.delay_backward_quarantine_enabled stays at the core default
      * (OFF). The guard holds backward candidates only, for a bounded window
      * after which it accepts, and judges cancellation on the estimator's
@@ -404,10 +434,9 @@ static int derive_pipeline_layout(
      * and the carve always describe the same (512/256) layout. */
     *cfg_forced = *cfg;
     cfg_forced->core.fft_size = ULCNET_PIPELINE_FFT;
-    /* This application consumes process_pre() and replaces the traditional
-     * post-beam RES/NR/iFFT stage with ULCNet. Do not reserve or initialize
-     * the unused mono post path inside the shared 4AEC core. */
-    cfg_forced->core.enable_post = 0;
+    /* enable_post is already 0: validate_config() refuses anything else, so
+     * the caller has declared the pre-only profile rather than had it
+     * rewritten underneath. Nothing to force here. */
     if (four_aec_nr_res_get_mem_requirements(
             &cfg_forced->core, core_req) != 0)
         return 0;
@@ -653,6 +682,14 @@ int audio_pipeline_4ch_ulcnet_set_model(
     if (!p || p->destroyed) return -1;
     if (model) {
         /* Reject-first: the previously installed model stays in place. */
+        /* A model that actually infers MUST publish a descriptor. Its delay depth,
+         * attention geometry and history shapes are what the host-side rings are
+         * carved from, and nothing downstream can detect a mismatch: the finite
+         * guard catches an UNWRITTEN output, never a WRONG-SHAPED one, so a graph
+         * whose D differs from the descriptor reads and writes past the pool
+         * silently. An identity model (no infer callback) has no shapes to agree
+         * about and may leave it NULL. */
+        if (model->infer && !model->io_descriptor) return -1;
         if (model->io_descriptor &&
             ulcnet_model_io_descriptor_validate(model->io_descriptor) != 0)
             return -1;
@@ -747,9 +784,7 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
      * fft_inverse + sqrt-Hann synthesis + 50% OLA recipe proven by
      * tests/test_4aec_nr_res.c's WOLA-identity test. */
     fft_inverse(p->fft, p->gsc_spectrum, p->ifft_buffer);
-    for (k = 0; k < fft; ++k) {
-        p->ola[k] += p->ifft_buffer[k] * p->synth_window[k];
-    }
+    sk_wola_accumulate_f32(p->ola, p->ifft_buffer, p->synth_window, fft);
     memcpy(p->beam_hop, p->ola, (size_t)hop * sizeof(float));
     memmove(p->ola, p->ola + hop, (size_t)(fft - hop) * sizeof(float));
     memset(p->ola + (fft - hop), 0, (size_t)hop * sizeof(float));

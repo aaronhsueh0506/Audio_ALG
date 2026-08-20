@@ -367,3 +367,86 @@ def test_admitted_delay_change_realigns_four_lanes_instead_of_resetting_them():
     pipeline.reset()
     assert pipeline.realign_warm_lane_count == 0
     assert pipeline.realign_soft_lane_count == 0
+
+
+# ── runtime strength retarget ────────────────────────────────────────────
+
+def _live_floor(pipeline):
+    return pipeline._post_beam_res._gain._split_floor_far_active_live
+
+
+def _lane_floors(pipeline):
+    return [lane._aec3_sg._split_floor_far_active_live for lane in pipeline._lanes]
+
+
+def _new_pipeline():
+    return FourChannelAecPipeline(
+        FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
+    )
+
+
+def test_preset_retarget_moves_the_shared_post_stage_not_the_lanes():
+    """The four lanes run with spatial_linear_context and never compute a gain.
+
+    So the strength that shapes this pipeline's output lives in the ONE shared
+    post-beam suppressor. A setter that looped over the lanes instead would
+    leave this assertion unmoved -- which is exactly the failure the C twin's
+    test pins as well.
+    """
+    pipeline = _new_pipeline()
+    before_post = _live_floor(pipeline)
+    before_lanes = _lane_floors(pipeline)
+
+    pipeline.set_aec_preset("aggressive")
+    assert _live_floor(pipeline) != before_post
+    assert _lane_floors(pipeline) == before_lanes
+
+
+def test_preset_retarget_survives_reset():
+    """reset() rebuilds the suppressor from a freshly constructed AecConfig.
+
+    Without the pipeline storing the chosen floor, that rebuild would silently
+    put balanced back -- the same two-copy hazard the C core has with
+    post_sg_cfg.
+    """
+    pipeline = _new_pipeline()
+    pipeline.set_aec_preset("aggressive")
+    after_set = _live_floor(pipeline)
+
+    pipeline.reset()
+    assert _live_floor(pipeline) == after_set
+
+    # And the mutation that would break it: clearing the stored value makes the
+    # rebuild revert, so the assertion above is not vacuous.
+    pipeline._post_beam_res._split_floor_far_active_db = None
+    pipeline.reset()
+    assert _live_floor(pipeline) != after_set
+
+
+def test_preset_retarget_rejects_bad_arguments_without_writing():
+    pipeline = _new_pipeline()
+    before = _live_floor(pipeline)
+    for bad in (99, None, "gentle"):
+        with pytest.raises(ValueError):
+            pipeline.set_aec_preset(bad)
+        assert _live_floor(pipeline) == before
+    with pytest.raises(ValueError):
+        pipeline.set_aec_preset("aggressive", ramp_ms=-1.0)
+    assert _live_floor(pipeline) == before
+
+
+def test_preset_ramp_walks_and_lands():
+    pipeline = _new_pipeline()
+    start = _live_floor(pipeline)
+    pipeline.set_aec_preset("aggressive", ramp_ms=100.0)
+    gain = pipeline._post_beam_res._gain
+    target = gain._split_floor_far_active
+    assert _live_floor(pipeline) == start, "the setter itself must not move it"
+    prev = start
+    for _ in range(64):
+        gain._advance_split_floor_ramp()
+        cur = _live_floor(pipeline)
+        assert cur <= prev
+        assert cur >= target
+        prev = cur
+    assert _live_floor(pipeline) == target

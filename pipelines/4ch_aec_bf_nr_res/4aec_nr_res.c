@@ -35,6 +35,8 @@
 #include "mem_align.h"
 #include "suppression_gain.h"
 #include "4aec_projection_kernels.h"
+#include "simd_kernels.h"
+#include "nr_overlay.h"
 
 #ifndef M_PI_F
 #define M_PI_F 3.14159265358979323846f
@@ -181,7 +183,6 @@ typedef struct PoolCursor {
 /* ============================================================================
  * Config -> module configs + frame dimensions
  * ========================================================================== */
-
 static int derive_dims_and_configs(
     const FourAecNrResConfig* cfg,
     AecConfig* aec_cfg,
@@ -322,26 +323,8 @@ static int derive_dims_and_configs(
      * per lane. */
     aec_cfg->spatial_linear_context = 1;
 
-    *nr_cfg = mmse_lsa_config_for_mode_grid(
-        cfg->sample_rate, *fft_size, cfg->nr_mode);
-    /* 2026-08-03: was an implicit side effect of the C standalone default
-     * (mmse_lsa_default_config_for_grid) also happening to be 0.8f -- that
-     * default is now fixed to match Python's own config/v3_2_config.yaml
-     * (1.0f, disabled), so this pipeline must set 0.8f explicitly to keep its
-     * actual runtime behaviour unchanged. Mirrors audio_pipeline.c (mono) and
-     * the deliberate overlay aec_nr_pipeline.py:_build_denoiser documents. */
-    nr_cfg->broadband_threshold = 0.8f;
-    /* 2026-08-03 A/B decision (824-case VCTK+DEMAND + 90-case AEC blind
-     * manifest, see NR/CHANGELOG.md): take mmse_lsa_config_for_mode_grid()'s
-     * canonical alpha_d/alpha_attack as-is instead of overriding them back
-     * to the old L=150/alpha_d=0.95/alpha_attack=0.3-old-retime tuning --
-     * that legacy tuning measured worse on the AEC-residual/double-talk
-     * angle that matters for this pipeline. L and alpha_decay are untouched:
-     * they already coincide with Python's canonical composition (see
-     * audio_pipeline.c's mono twin for the full rationale). */
-    nr_cfg->L = mmse_lsa_retime_frames(
-        150, cfg->sample_rate, *hop_size);
-    nr_cfg->alpha_decay = nr_cfg->alpha_g;
+    *nr_cfg = pipelines_compose_nr_config(cfg->sample_rate, *fft_size, *hop_size,
+                                cfg->nr_mode);
     return 1;
 }
 
@@ -1511,10 +1494,7 @@ static int run_post_res_and_nr(
     }
 
     fft_inverse(p->fft, p->output_spec, p->ifft_buffer);
-    for (k = 0; k < fft; ++k) {
-        p->ola[k] +=
-            p->ifft_buffer[k] * p->synth_window[k];
-    }
+    sk_wola_accumulate_f32(p->ola, p->ifft_buffer, p->synth_window, fft);
     memcpy(out, p->ola, (size_t)hop * sizeof(float));
     memmove(
         p->ola, p->ola + hop,
@@ -1638,6 +1618,71 @@ static void reset_post_sg(FourAecNrRes* p) {
         &p->post_sg, &p->post_sg_cfg, &p->post_sg_tun,
         last_gain, last_near, last_echo, ma_buf, near_s, weighted,
         min_gain, max_gain, raw_gain, gain, sum);
+}
+
+int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live,
+                                     float* target) {
+    if (!p || p->destroyed || !p->cfg.enable_post) return -1;
+    if (live) *live = p->post_sg.split_floor_far_active_live;
+    /* Report the RESET-SURVIVING copy, not post_sg.cfg: reset_post_sg()
+     * rebuilds the suppressor from post_sg_cfg, so that is the value a caller
+     * asking "what floor is this instance configured for" actually wants. */
+    if (target) *target = p->post_sg_cfg.split_floor_far_active;
+    return 0;
+}
+
+int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset,
+                                   float ramp_ms) {
+    float db;
+
+    if (!p || p->destroyed) return -1;
+    /* One lookup against the library's own strength table -- which also
+     * refuses an out-of-enum value, where aec_config_from_preset() would fall
+     * back to balanced. */
+    if (aec_preset_floor_db(preset, &db) != 0) return -1;
+    if (!p->cfg.enable_post) return -1;  /* no post suppressor to retarget */
+
+    /* The four lanes run with spatial_linear_context, so they never reach
+     * suppression_gain_get_gain() and their own floors shape nothing. The
+     * gain that actually multiplies the output -- and scales the comfort
+     * noise -- comes from the shared post-stage suppressor, so that is what
+     * a preset change has to move. Validate and apply there FIRST: it refuses
+     * without writing, so a rejected ramp_ms cannot leave the lanes and the
+     * post stage disagreeing. */
+    if (suppression_gain_set_split_floor_far_active_db(
+            &p->post_sg, db, ramp_ms) != 0) {
+        return -1;
+    }
+    /* post_sg_cfg is a separate by-value copy taken at init and re-applied by
+     * reset_post_sg(); without this the next reset would silently revert the
+     * change. */
+    p->post_sg_cfg.split_floor_far_active =
+        p->post_sg.cfg.split_floor_far_active;
+
+    /* The lanes are deliberately left alone. Retargeting them would be inert
+     * -- they never reach get_gain -- but not free: a ramped call would park
+     * all four permanently mid-ramp, with live != target forever, which is
+     * exactly the misleading state a diagnostic reader would trip over. The
+     * mono pipeline and the Python twin take the same position. */
+    p->cfg.aec_preset = preset;
+    return 0;
+}
+
+int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, MmseLsaNrMode mode) {
+    MmseLsaConfig target;
+
+    if (!p || p->destroyed) return -1;
+    if (!p->cfg.enable_post || !p->nr) return -1;
+    if (!mmse_lsa_nr_mode_is_valid(mode)) return -1;
+    /* Recompose exactly what build_nr_config() composes -- the preset plus
+     * this pipeline's own overrides. Handing the canonical preset to
+     * mmse_lsa_set_mode() instead would either be refused (its L differs) or
+     * silently revert those overrides. */
+    target = pipelines_compose_nr_config(p->cfg.sample_rate, p->fft_size,
+                               p->hop_size, mode);
+    if (mmse_lsa_reconfigure(p->nr, &target) != 0) return -1;
+    p->cfg.nr_mode = mode;
+    return 0;
 }
 
 /* Legal to call while a pre-frame is pending (e.g. align_render()'s error

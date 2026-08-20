@@ -66,6 +66,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Every test model that actually infers must publish a descriptor: the
+ * wrapper refuses infer-without-descriptor, because a shape disagreement
+ * between the graph and the host-side rings is undetectable downstream (the
+ * finite guard catches an unwritten output, never a wrong-shaped one). One
+ * shared descriptor for the whole file; D is the example default. */
+static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
+    static UlcnetModelIoDescriptor d;
+    static int ready = 0;
+    if (!ready) {
+        if (ulcnet_model_io_descriptor_default(8, &d) != 0) return NULL;
+        ready = 1;
+    }
+    return &d;
+}
+
+
 #define CHECK(condition, message)                                      \
     do {                                                               \
         if (!(condition)) {                                            \
@@ -290,6 +306,7 @@ static int test_counting_model_policy(void) {
     memset(&model, 0, sizeof(model));
     model.user = &m;
     model.infer = counting_infer;
+    model.io_descriptor = test_io_descriptor();
     model.reset = counting_reset;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install counting model");
@@ -453,6 +470,7 @@ static int test_fixed_first_alignment_resets_model(void) {
     memset(&model, 0, sizeof(model));
     model.user = &m;
     model.infer = counting_infer;
+    model.io_descriptor = test_io_descriptor();
     model.reset = counting_reset;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install model for 4ch FIXED transition");
@@ -681,6 +699,7 @@ static int test_relock_same_delay_resets_model(void) {
     memset(&model, 0, sizeof(model));
     model.user = &m;
     model.infer = counting_infer;
+    model.io_descriptor = test_io_descriptor();
     model.reset = counting_reset;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install counting model");
@@ -991,14 +1010,14 @@ static int test_pool_and_descriptor_gate(void) {
      * count is left at the CURRENT figure so the only mismatch is the GSC
      * covariance layout carried by this wrapper descriptor. */
     stale = req;
-    stale.layout_version = 9u;
+    stale.layout_version = 10u;
     CHECK(audio_pipeline_4ch_ulcnet_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
-          "init_ex rejects a descriptor from the superseded layout 9 even "
+          "init_ex rejects a descriptor from the superseded layout 10 even "
           "when its byte count exactly covers the current pool");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION &&
-          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 10u,
-          "the queried descriptor publishes the current carve layout (10)");
+          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 11u,
+          "the queried descriptor publishes the current carve layout (11)");
 
     stat = audio_pipeline_4ch_ulcnet_init_ex(
         pool, (size_t)req.bytes, &cfg, &req);
@@ -1128,6 +1147,7 @@ static int test_far_timestamp_before_acquisition(void) {
 
     memset(&model, 0, sizeof(model));
     model.infer = passthrough_far_infer;
+    model.io_descriptor = test_io_descriptor();
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install far-passthrough model");
     microphones = (float*)calloc(
@@ -1210,6 +1230,7 @@ static int test_model_applies_unlocked(void) {
     memset(&model, 0, sizeof(model));
     model.user = &m;
     model.infer = counting_infer;
+    model.io_descriptor = test_io_descriptor();
     model.reset = counting_reset;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install 0.5x model");
@@ -1353,6 +1374,7 @@ static int test_nan_guard(void) {
     memset(&model, 0, sizeof(model));
     model.user = &m;
     model.infer = nan_infer;
+    model.io_descriptor = test_io_descriptor();
     CHECK(audio_pipeline_4ch_ulcnet_set_model(pa, &model) == 0,
           "install NaN-poisoning model");
 
@@ -1514,6 +1536,7 @@ static int test_partial_write_guard(void) {
     memset(&model, 0, sizeof(model));
     model.user = &m;
     model.infer = partial_write_infer;
+    model.io_descriptor = test_io_descriptor();
     CHECK(audio_pipeline_4ch_ulcnet_set_model(pa, &model) == 0,
           "install partial-write model");
 
@@ -1724,6 +1747,7 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
     memset(&model, 0, sizeof(model));
     model.user = st;
     model.infer = probe_infer;
+    model.io_descriptor = test_io_descriptor();
     model.reset = probe_reset;
     if (audio_pipeline_4ch_ulcnet_set_model(p, &model) != 0) {
         audio_pipeline_4ch_ulcnet_destroy(p);
@@ -1918,6 +1942,7 @@ static int test_reprime_behavior(void) {
     memset(&model, 0, sizeof(model));
     model.user = &m;
     model.infer = counting_infer;
+    model.io_descriptor = test_io_descriptor();
     model.reset = counting_reset;
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install counting model (reprime behaviour)");
@@ -2004,6 +2029,7 @@ static int test_reprime_behavior(void) {
         memset(&fmodel, 0, sizeof(fmodel));
         fmodel.user = &fm;
         fmodel.infer = counting_infer;
+        fmodel.io_descriptor = test_io_descriptor();
         fmodel.reset = counting_reset;
         CHECK(audio_pipeline_4ch_ulcnet_set_model(fp, &fmodel) == 0,
               "install counting model (FIXED reprime behaviour)");
@@ -2093,6 +2119,7 @@ static int test_aligned_descriptor_gate(void) {
 
     memset(&undescribed_model, 0, sizeof(undescribed_model));
     undescribed_model.infer = gate_infer_identity;
+    undescribed_model.io_descriptor = test_io_descriptor();
     raw_model = undescribed_model;
     raw_model.io_descriptor = &raw_desc;
     aligned_model = undescribed_model;
@@ -2139,10 +2166,41 @@ static int run_all_tests(void) {
         invalid.core.fft_size = 256;
         CHECK(audio_pipeline_4ch_ulcnet_create(&invalid) == NULL,
               "core fft 256 is rejected (ULCNet grid is 512/256)");
+        /* The pre-only contract: every post-only field must keep the value
+         * the default config returns, and is REJECTED otherwise. With
+         * enable_post = 0 the core builds no denoiser, no suppressor, no
+         * comfort noise and no post iFFT, so any of these having been
+         * accepted would have meant a caller configuring something that
+         * cannot exist. One row per field, each proved to fire. */
         invalid = audio_pipeline_4ch_ulcnet_default_config();
-        invalid.core.enable_post = 0;
-        CHECK(audio_pipeline_4ch_ulcnet_create(&invalid) == NULL,
-              "caller cannot select the ULCNet wrapper's private pre-only profile");
+        CHECK(invalid.core.enable_post == 0 && invalid.core.enable_cng == 0,
+              "the default config itself states the pre-only profile");
+        {
+            AudioPipeline4ChUlcnet* ok_default =
+                audio_pipeline_4ch_ulcnet_create(&invalid);
+            CHECK(ok_default != NULL,
+                  "the unmodified default config is accepted");
+            audio_pipeline_4ch_ulcnet_destroy(ok_default);
+        }
+#define REJECT_POST_ONLY(mutate, what)                                       \
+        do {                                                                 \
+            AudioPipeline4ChConfig bad =                                     \
+                audio_pipeline_4ch_ulcnet_default_config();                  \
+            mutate;                                                          \
+            CHECK(audio_pipeline_4ch_ulcnet_create(&bad) == NULL,            \
+                  "post-only field rejected: " what);                        \
+        } while (0)
+        REJECT_POST_ONLY(bad.core.enable_post = 1, "enable_post");
+        REJECT_POST_ONLY(bad.core.enable_cng = 1, "enable_cng");
+        REJECT_POST_ONLY(bad.core.legacy_amin = 1, "legacy_amin");
+        REJECT_POST_ONLY(bad.core.nr_mode = MMSE_LSA_NR_AGGRESSIVE,
+                         "nr_mode (BALANCED is a required sentinel)");
+        REJECT_POST_ONLY(bad.auto_vad_threshold_dbfs = -40.0f,
+                         "auto_vad_threshold_dbfs");
+        REJECT_POST_ONLY(bad.auto_vad_snr_ratio = 4.0f, "auto_vad_snr_ratio");
+        REJECT_POST_ONLY(bad.auto_vad_hangover_frames = 4,
+                         "auto_vad_hangover_frames");
+#undef REJECT_POST_ONLY
         invalid = audio_pipeline_4ch_ulcnet_default_config();
         invalid.core.fft_size = 0;
         {

@@ -107,8 +107,14 @@ extern "C" {
  *      over the carve TOKEN and so does not move on a control-block-only
  *      change: this counter is the whole signal that a descriptor from a
  *      version-10 build must be refused, including when its cached byte
- *      count still covers the current pool. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 11u
+ *      count still covers the current pool.
+ *  12: sizeof(Aec) grew (the suppressor gained its runtime far-active floor
+ *      retarget state), and every lane plus the shared post suppressor is
+ *      carved out of this pool, so the total and every offset after the first
+ *      lane move. No new REGION and no carve-order change, so the token --
+ *      and therefore build_flags_hash -- is unchanged again; this counter is
+ *      the only signal. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 12u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -622,6 +628,68 @@ long four_aec_nr_res_realign_soft_lane_count(const FourAecNrRes* p);
  * never re-decide an alignment). See FourAecNrResDelayState's `changed` for
  * the rule; diagnostic only. */
 int four_aec_nr_res_pending_delay_candidate(const FourAecNrRes* p);
+
+/* ── Runtime strength control ─────────────────────────────────────────────
+ *
+ * Retarget the residual-echo strength on a RUNNING core.
+ *
+ * IMPORTANT, and the reason this exists rather than the caller looping over
+ * the lanes: the four AEC lanes are built with spatial_linear_context, so
+ * none of them ever reaches its own suppression-gain path. Their floors shape
+ * nothing. The gain that multiplies this core's output -- and that scales the
+ * injected comfort noise -- comes from the single shared post-stage
+ * suppressor, so that is what this retargets. Calling aec_set_preset() on the
+ * lanes instead is a provable no-op.
+ *
+ * ramp_ms is forwarded to the suppressor: 0 applies on the next hop, a
+ * positive value walks there linearly in dB. See aec.h for why that matters
+ * (mild <-> aggressive is an 18 dB step into a hard clamp).
+ *
+ * What to expect when measuring: the far-active floor is only in force on
+ * far-active, non-double-talk hops. During double-talk this core forces the
+ * DT floor, which is identical across all three presets, and before the
+ * far-active latch fires the far-silent floor applies instead. An A/B that
+ * averages over a whole recording will therefore see a smaller move than the
+ * dB step suggests, and it will also see the comfort-noise level shift.
+ *
+ * Requires enable_post (with enable_post = 0 there is no suppressor and no NR
+ * instance at all). Call between hops, serialised with process_pre/post; not
+ * thread-safe. Returns 0, or -1 on NULL, an out-of-enum preset, an
+ * out-of-range ramp_ms, or a pre-only core. Nothing is written on -1. */
+int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset,
+                                   float ramp_ms);
+
+/* Read the shared post-stage far-active split floor, in linear power.
+ *
+ * `live` is what the suppressor applies right now -- it differs from `target`
+ * only while a ramp is walking. `target` is the reset-surviving configured
+ * value. Either pointer may be NULL.
+ *
+ * This is the one strength quantity worth logging from a board: it is what
+ * actually shapes the output (the lanes' own floors shape nothing), and the
+ * pair together says whether a requested change has finished landing.
+ *
+ * Returns 0, or -1 on NULL or a pre-only core (no suppressor exists). */
+int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live,
+                                     float* target);
+
+/* Retarget the noise-reduction strength on the ONE shared denoiser this core
+ * owns (there is a single NR instance operating on the beamformed signal, not
+ * one per lane).
+ *
+ * This recomposes THIS pipeline's own NR configuration -- the canonical
+ * strength preset plus the overrides it has always applied on top -- and hands
+ * the result to mmse_lsa_reconfigure(). It deliberately does not call
+ * mmse_lsa_set_mode(), which composes the bare canonical preset and would
+ * either be refused (its L differs from this pipeline's) or revert those
+ * overrides.
+ *
+ * The noise floor, the min-tracking ring and the gain smoothing history all
+ * carry on across the change; use four_aec_nr_res_reset() for a restart.
+ *
+ * Requires enable_post. Call between hops. Returns 0, or -1 on NULL, an
+ * out-of-enum mode, a pre-only core, or a rejected target. */
+int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, MmseLsaNrMode mode);
 
 /* ============================================================================
  * Diagnostic memory breakdown

@@ -518,7 +518,7 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
     #   linear_error bfd504797d831b34ccfac20c50328b662d4bf4240728f391f4c8171a47579eb9
     #   echo_hat     5abe156cfa0175f2dcd762860c4543eec077b677b2184bffa9f11af8da70ed26
     "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe":
-        "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
+        "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
 
     # lib/aec adds the delay backward-quarantine (Path B), which holds a
     # candidate EARLIER than the delay in force while the linear filter is
@@ -536,7 +536,7 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
     # (4,096,000 with `echo_hat`). The control that makes that meaningful:
     # the same render with the quarantine ENABLED differs in 121,069 bytes.
     "ffc2e044d031f06a9d685ee77159e5a8d7d3075e5e3eaea8156746c416c1dd4e":
-        "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
+        "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
 
     # lib/aec gains `AEC.apply_external_realign()` -- the caller-side far
     # realign for EXTERNAL_ALIGNED instances -- and the refactors it needs to
@@ -577,7 +577,63 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
     # -- which `warm_shift_ir` now calls instead of re-deriving the IR -- is
     # byte-identical to the loop it replaced on those same three grids.
     "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd":
-        "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
+        "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
+
+    # lib/aec gains a runtime retarget of the far-active split min-gain floor:
+    # `SuppressionGain.set_split_floor_far_active_db(db, ramp_ms)`, plus the
+    # `AEC.set_preset(preset, ramp_ms)` wrapper that resolves a preset name to
+    # that one field (the only field the shipped presets differ in). The floor
+    # is split into a TARGET (`_split_floor_far_active`) and a LIVE value
+    # (`_split_floor_far_active_live`, seeded equal), `_get_min_gain` now reads
+    # the live one, and a new `_advance_split_floor_ramp()` at the top of
+    # `get_gain` walks live toward target. With the setter never called, live
+    # stays == target for the life of the instance and the advance returns on
+    # its first comparison, so the arithmetic `_get_min_gain` performs is the
+    # pre-change arithmetic.
+    #
+    # Unreachable on this frontend by CONSTRUCTION, not merely idle. The only
+    # `SuppressionGain.get_gain` call site is inside `_aec3_post`, and the only
+    # `_aec3_post` call site is gated on `enable_res or return_res_context`.
+    # The frozen contract pins `enable_res=False` and never sets
+    # `return_res_context` (default False), so the AEC3 post chain -- and with
+    # it `get_gain`, `_advance_split_floor_ramp` and `_get_min_gain` -- does not
+    # run at all at the formed_output seam, and no setter call can reach the
+    # samples this corpus records. Nothing in AIAEC calls either setter. What
+    # the change DOES reach on this path is the constructor: the two new seed
+    # attributes are written on every SuppressionGain built.
+    #
+    # Measured on the same 32-second, 16-kHz/512/256, 400-ms-delay, white-noise
+    # scene the entries above use, run as one stateful sequence: `linear_error`
+    # and `echo_hat` both render byte-identical, 2,048,000 bytes per stem.
+    # SHA-256:
+    #   linear_error af8556efec852a5a858d14e8a741834569952faa253e399879f0e9ec0c4bbe40
+    #   echo_hat     3598102ba153aeba902604db107534164b4746c0b9dbd934deb20eec47ced9d2
+    # Instrumented over that render, SuppressionGain is constructed 3 times --
+    # so the constructor edit is genuinely on this path -- while `get_gain`,
+    # `_advance_split_floor_ramp` and `_get_min_gain` each run 0 times across
+    # all 2000 hops. Driving the new API anyway (`set_preset('aggressive')` at
+    # hop 1000 of the same render) reproduces both SHA-256s exactly, which is
+    # the by-construction claim measured rather than argued.
+    #
+    # Two controls, because the usual single one cannot exist here. The byte
+    # comparison is live at THIS seam: perturbing the PBFDKF update gain
+    # (`mu_aec3` x 1.0001) and re-rendering moves 5,336 bytes of `linear_error`
+    # and 6,151 of `echo_hat`. The MECHANISM is live on the nearest surface
+    # that reaches it -- the same engine, config and scene geometry with
+    # `enable_res=True`, where `get_gain` runs on all 2000 hops, at a 40 ms
+    # bulk delay instead of 400 ms so the linear filter converges (full-file
+    # ERLE 22.65 dB) and the floor becomes the binding constraint on the output
+    # gain. `set_preset` at hop 1000 of that render moves the samples: 202,463
+    # differing bytes for 'mild', 108,132 for 'aggressive', 194,668 for 'mild'
+    # with ramp_ms=2000; the ramp itself walks from -22.128 dB after one hop to
+    # -38.000 dB at hop 125, the requested 2000 ms at a 16 ms hop. At the
+    # pinned 400 ms delay a RES-enabled render does NOT move under the same
+    # setter call -- the matched bank locks 300 ms, the 100 ms residue is
+    # outside the 832-tap span, the filter never converges, the residual-echo
+    # estimate stays small and no bin's gain ends up floor-limited -- which is
+    # why the mechanism control is stated on the converging geometry.
+    "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88":
+        "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
 }
 
 

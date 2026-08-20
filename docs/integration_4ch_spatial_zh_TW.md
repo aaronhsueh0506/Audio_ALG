@@ -234,6 +234,46 @@ AEC、DOA、GSC、NR、RES 全部**共用同一組格點**，`frame == fft_size`
 `const char*`（永不為 NULL），表示 spatial kernel 實際編進去的是哪一種實作
 （NEON 或 scalar）。純資訊用途，可寫進你的開機 log。
 
+### 3.3 執行期強度控制
+
+```c
+int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset, float ramp_ms);
+int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, MmseLsaNrMode mode);
+```
+
+兩者都是**轉呼叫核心的薄殼**（`p`／已 destroy／`p->core` 為 NULL 時回 `-1`，
+其餘直接轉給 `four_aec_nr_res_set_aec_preset()` / `four_aec_nr_res_set_nr_mode()`）。
+完整契約在核心手冊
+[`integration_4ch_core_zh_TW.md` §3.2](integration_4ch_core_zh_TW.md)，這裡只重述
+整合時最容易踩到的一點：
+
+> **不要自己對四條 lane 迴圈呼叫 `aec_set_preset()`。** 四條 lane 都以
+> `spatial_linear_context` 建立，永遠不會走到自己的 suppression-gain 路徑，
+> 它們的地板什麼都不塑形。真正乘上本 pipeline 輸出的 gain 來自核心裡**唯一一個**
+> 共用的 post 級抑制器；同樣地，NR 也只有一個共用實例，不是每條 lane 一個。
+> 上面兩個 setter 針對的就是那兩個共用實例——這就是它們存在的理由。
+
+```c
+if (audio_pipeline_4ch_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { /* 引數不合法 */ }
+if (audio_pipeline_4ch_set_nr_mode(p, MMSE_LSA_NR_MILD) != 0)                  { /* 同上 */ }
+```
+
+本層**不轉出**核心的 handle，所以核心那個唯讀的
+`four_aec_nr_res_post_split_floor()`（`live`／`target`，可看出 ramp 走完了沒有）
+在這一層拿不到。需要那組讀數（例如板端要記錄「要求的強度改動落地了沒有」）的部署，
+請直接整合核心層並自備 beamformer，見
+[`integration_4ch_core_zh_TW.md` §3.2](integration_4ch_core_zh_TW.md)。
+
+`ramp_ms == 0` 代表下一個 hop 就套用（**不是錯誤**），`> 0` 則以 dB 為單位線性走
+過去，上限 60 秒。兩個 setter 都不是重啟：AEC、SRP、GSC、NR 的狀態全部繼續跑；
+preset 的改動撐得過 `audio_pipeline_4ch_reset()`，ramp 進度不會。**在兩個 hop 之間
+呼叫、與 `process()` 序列化；非 thread-safe。**
+
+A/B 量測時：far-active 地板只在 **far-active 且非 double-talk** 的 hop 上生效
+（DT 地板三個 preset 完全相同，latch 觸發前用的是 far-silent 地板），而同一個 gain
+還決定 comfort noise 量，所以整段錄音的平均值移動幅度會小於 dB 落差所暗示的量。
+細節與建議的比較方式見核心手冊 §3.2。
+
 ---
 
 ## 4. Config 完整參考
@@ -438,14 +478,15 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 | `geometry` 與座標 | 不變 |
 
 `BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設下的 `req.bytes`
-（最後一欄標明哪幾列是實際查詢出來的、哪一列是推導的）：
+（2026-08-19 重量；最後一欄標明每一列的來源）。本輪 `ALIGN16(sizeof(Aec))`
+跨過 16-byte 邊界，四路各 +16 B，所以每一列都 +64 B：
 
 | Config | `req.bytes` | 來源 |
 |---|---:|---|
-| 16000，全預設（256/128，`num_angles=72`） | 1,905,728 | 實測 |
-| 16000，`core.fft_size = 512` | 3,239,216 | 實測 |
-| 16000，`num_angles = 360` | 4,907,840 | 依相同 129-bin GSC layout 差額更新；發布前現查 |
-| 48000，全預設（1024/512，`num_angles=72`） | 6,806,192 | 實測 |
+| 16000，全預設（256/128，`num_angles=72`） | 1,905,792 | 實測 |
+| 16000，`core.fft_size = 512` | 3,239,280 | 實測 |
+| 16000，`num_angles = 360` | 4,907,904 | 實測（直接呼叫 `get_mem_requirements()`）|
+| 48000，全預設（1024/512，`num_angles=72`） | 6,806,256 | 實測 |
 
 ⚠ 覆蓋差異：只有 `num_angles = 72` 的 16 kHz/256 與 48 kHz/1024 兩組會被
 C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_size = 512`

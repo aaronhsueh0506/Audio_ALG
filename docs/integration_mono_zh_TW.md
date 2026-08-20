@@ -182,6 +182,52 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
 會改狀態的 entry point —— 一定要走 `audio_pipeline_reset()` / `audio_pipeline_destroy()`，
 否則 pipeline 自己持有的狀態（OLA、CNG RNG、near-end hangover counter）會和子模組脫節。
 
+### 3.2 執行期強度控制
+
+兩條強度軸都可以在**運轉中的 pipeline** 上改，不需要重建、不動 pool：
+
+```c
+int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset, float ramp_ms);
+int audio_pipeline_set_nr_mode(AudioPipeline* p, MmseLsaNrMode mode);
+```
+
+```c
+/* 使用者把回音抑制轉到 aggressive、降噪轉到 mild */
+if (audio_pipeline_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { /* 引數不合法 */ }
+if (audio_pipeline_set_nr_mode(p, MMSE_LSA_NR_MILD) != 0)                   { /* 同上 */ }
+
+audio_pipeline_process(p, mic, ref, out);   /* 下一個 hop 起生效 */
+```
+
+| 呼叫 | 改什麼 | 回 `-1` 的情況（`-1` 時**什麼都不寫**） |
+|---|---|---|
+| `audio_pipeline_set_aec_preset()` | 底層 `Aec` 的 far-active 殘留回音地板（三個 preset 唯一的差異軸）。轉呼叫 `aec_set_preset()` | `p` 或其 AEC 為 NULL；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]` |
+| `audio_pipeline_set_nr_mode()` | 共用降噪器的 tuning 純量 | `p` 為 NULL；`cfg.aec_only` 建置（**根本沒有降噪器**）；`mode` 超出 enum；重組出的 target 被拒 |
+
+`ramp_ms == 0` 代表下一個 hop 就套用，**不是錯誤**，落點與「用該 preset 從頭建一個
+新實例」完全相同；`> 0` 則以 dB 為單位線性走過去，上限 60 秒。mild ↔ aggressive 是
+18 dB 落差、而地板是硬性 clamp，所以互動式旋鈕應該給一個 ramp（100 ms 是合理起點）。
+ramp 進行中再呼叫一次，會從當前的 live 值重新起走。
+
+兩個 setter 都**不是重啟**：AEC 的濾波器與延遲鎖定、NR 追蹤中的噪聲底與增益平滑歷史
+全部繼續跑。要重啟請用 `audio_pipeline_reset()`。**在兩個 hop 之間呼叫、與
+`audio_pipeline_process()` 序列化；非 thread-safe。**
+
+> **不要繞過 `set_nr_mode()` 去呼叫 `mmse_lsa_set_mode()`。** 本 pipeline 的 NR
+> 組態是「canonical 強度 preset **加上**自己的覆寫」（`broadband_threshold`、`L`、
+> `alpha_decay`）。`mmse_lsa_set_mode()` 組的是裸的 canonical preset，在本 pipeline
+> 的實例上會被**拒絕**（它的 `L` 不同）——所以 `audio_pipeline_set_nr_mode()` 做的事
+> 是重組本 pipeline 的完整組態，再交給 `mmse_lsa_reconfigure()`。
+
+**A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
+hop 上生效：double-talk 期間套用的是 DT 地板，而 DT 地板在三個 preset 之間**完全
+相同**；far-active latch 觸發之前套用的是 far-silent 地板。同一個 `ctx.res_gain`
+還決定注入的 comfort noise 量（振幅正比於 `sqrt(1 − G_res²)`，見
+`mono_aec_nr_res/audio_pipeline.c` 的 CNG 步驟——地板壓得越深、CNG 反而越多）。
+因此**整段錄音的平均值移動
+幅度會小於 dB 落差所暗示的量**，而且一個只量 echo／degradation 的 A/B 會把 CNG 的
+變化錯記到別的機制頭上。請在 echo 對齊或 degradation 對齊的條件下比較，並實際試聽。
+
 ---
 
 ## 4. Config 完整參考
@@ -256,17 +302,19 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout（layout_version=6，delay-mode 產品化後）、`BACKEND=kiss`、
-`pipelines/Makefile` 預設選項**下，2026-08-18 直接呼叫 API 量到的值。換
-backend、換編譯選項、更新 submodule 都會變。
+以下是**本次 checkout（layout_version=7，runtime 強度 retarget 的 ABI 變更後）、
+`BACKEND=kiss`、`pipelines/Makefile` 預設選項**下，2026-08-19 直接呼叫 API 量到的
+值。換 backend、換編譯選項、更新 submodule 都會變。`sizeof(Aec)` 增加 8 B 後
+`ALIGN16(sizeof(Aec))` 跨過 16-byte 邊界，因此每一列的 `aec_bytes` 與 `req.bytes`
+都整批 +16 B，所有差額不變。
 
 | Config | `req.bytes` | `aec_bytes` | `fft_bytes` | `nr_bytes` | `pipeline_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 357,728 | 275,664 | 8,784 | 67,424 | 5,696 |
-| 16000，預設（256/128） | 516,544 | 379,744 | 8,784 | 122,160 | 5,696 |
-| 16000，`fft_size=512` | 670,752 | 508,816 | 16,976 | 133,472 | 11,328 |
-| 48000，預設（1024/512） | 1,597,488 | 1,167,040 | 33,360 | 374,336 | 22,592 |
-| 16000，`aec_only=1` | 379,904 | 379,744 | 0 | 0 | 0 |
+| 8000，預設 | 357,744 | 275,680 | 8,784 | 67,424 | 5,696 |
+| 16000，預設（256/128） | 516,560 | 379,760 | 8,784 | 122,160 | 5,696 |
+| 16000，`fft_size=512` | 670,768 | 508,832 | 16,976 | 133,472 | 11,328 |
+| 48000，預設（1024/512） | 1,597,504 | 1,167,056 | 33,360 | 374,336 | 22,592 |
+| 16000，`aec_only=1` | 379,920 | 379,760 | 0 | 0 | 0 |
 
 `req.bytes` 減去四個分項（各自 16-byte 對齊後）的差額，就是 `AudioPipeline`
 控制區塊，本次量測在每一組 config 都是 160 B。
@@ -275,10 +323,10 @@ backend、換編譯選項、更新 submodule 都會變。
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 516,544 | — |
-| `MATCHED` n=1 | 493,632 | −22,912 |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 358,448 | −158,096 |
-| `EXTERNAL_ALIGNED` | 351,536 | −165,008 |
+| `MATCHED` n=5（預設） | 516,560 | — |
+| `MATCHED` n=1 | 493,648 | −22,912 |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 358,464 | −158,096 |
+| `EXTERNAL_ALIGNED` | 351,552 | −165,008 |
 
 這四列的差額全部落在 `aec_bytes`（`delay_mode`/`delay_num_filters` 不影響
 FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致
