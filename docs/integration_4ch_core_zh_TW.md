@@ -411,18 +411,17 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 
 以下是 2026-08-20、`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED`（預設,
 n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backend、換編譯
-選項、更新 submodule 都會變。本輪控制區塊新增 32 B 的逐階段計時記錄
-（`four_aec_nr_res_get_last_timing()`），`ALIGN16` 沒有吸收，所以 `req.bytes`
-與 `wrapper_bytes` 每列 +32 B；`aec_bytes`／`nr_bytes`／`fft_bytes` 不動，
-所有差額不變。
+選項、更新 submodule 都會變。本輪 `sizeof(Aec)` 增加 16 B（每個 AEC 實例各自帶了逐階段計時記錄，
+`aec_get_last_timing()`），四路各 +16 B，所以 `aec_bytes` 與 `req.bytes`
+每列 +64 B；`nr_bytes`／`fft_bytes`／`wrapper_bytes` 不動，所有差額不變。
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `nr_bytes` | `fft_bytes` | `wrapper_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,520 | 859,008 | 122,160 | 8,784 | 123,568 |
-| 16000，`fft_size=512` | 1,669,280 | 1,375,296 | 133,472 | 16,976 | 143,536 |
-| 16000，`max_delay_ms=100` | 1,054,384 | 859,008 | 122,160 | 8,784 | 64,432 |
-| 16000，`filter_length=512` | 1,026,928 | 772,416 | 122,160 | 8,784 | 123,568 |
-| 48000，預設（1024/512） | 3,680,800 | 2,954,112 | 374,336 | 33,360 | 318,992 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,584 | 859,072 | 122,160 | 8,784 | 123,568 |
+| 16000，`fft_size=512` | 1,669,344 | 1,375,360 | 133,472 | 16,976 | 143,536 |
+| 16000，`max_delay_ms=100` | 1,054,448 | 859,072 | 122,160 | 8,784 | 64,432 |
+| 16000，`filter_length=512` | 1,026,992 | 772,480 | 122,160 | 8,784 | 123,568 |
+| 48000，預設（1024/512） | 3,680,864 | 2,954,176 | 374,336 | 33,360 | 318,992 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
@@ -434,9 +433,9 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 1,113,520 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,920 | −93,600 |
-| `EXTERNAL_ALIGNED` | 1,013,008 | −100,512 |
+| `MATCHED` n=5（預設） | 1,113,584 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,984 | −93,600 |
+| `EXTERNAL_ALIGNED` | 1,013,072 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
@@ -446,12 +445,12 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | Config | `req.bytes` |
 |---|---:|
-| 16000，`fft_size=512`，`enable_post=0` | 1,485,856 |
+| 16000，`fft_size=512`，`enable_post=0` | 1,485,920 |
 
 即 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 記載的 ULCNet
 4ch wrapper私有核心大小；比同格點 `enable_post=1` 少 183,424 B（NR/RES/iFFT
-的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。本輪同樣 +32 B（`enable_post=0` 的
-wrapper 為 110,560 B，與後端無關），兩側同幅移動，所以差額維持實測的
+的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。本輪同樣 +64 B（四路各 +16 B；`enable_post=0` 的
+wrapper 仍為 110,560 B，與後端無關），兩側同幅移動，所以差額維持實測的
 183,424 B。
 **實際配置一律以 `req.bytes` 為準。**
 

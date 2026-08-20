@@ -122,8 +122,14 @@ extern "C" {
  *      was 2848 B = 16 x 178 exactly, so ALIGN16 had zero slack and ANY added
  *      state moves the pool -- measured, a 24 B record rounds to the same
  *      +32 B pool growth as the 32 B one, so nothing smaller would have
- *      avoided this bump. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 13u
+ *      avoided this bump.
+ *  14: sizeof(Aec) grew (each lane gained its own per-hop stage-timing
+ *      record -- aec_get_last_timing(), aec.h -- which is what turns
+ *      frontend_us/lane_res_us from documented zeros into measurements), so
+ *      all four lanes move the total and every offset after the first lane.
+ *      Carve token unchanged, so build_flags_hash is again blind and this
+ *      counter is the only signal. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 14u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -732,11 +738,15 @@ int four_aec_nr_res_get_mem_breakdown(
  *   delay_us     update_shared_delay() -- the shared delay estimator only.
  *                align_render()'s ring-buffer copy and the realign sweep are
  *                deliberately outside it; they are not delay estimation.
- *   frontend_us  ALWAYS 0 -- see below.
- *   linear_us    the whole four-lane AEC loop: aec_process_context() for lane
- *                0, aec_process_context_shared_far() for lanes 1-3, plus each
- *                lane's context bind and hop copy.
- *   lane_res_us  ALWAYS 0 -- see below.
+ *   frontend_us  summed over the four lanes: each lane's work from entry up
+ *                to its main filter (mic HPF, saturation, its own delay
+ *                stage, mu/RSA prep, shadow filter).
+ *   linear_us    summed over the four lanes: each lane's main adaptive
+ *                filter, including the far-end FFT on the lane that computes
+ *                it (lanes 1-3 borrow it and pay less here).
+ *   lane_res_us  summed over the four lanes: each lane's AEC3 post/RES block,
+ *                which runs because the lanes set return_res_context even
+ *                though enable_res is 0.
  *   fuse_us      fuse_contexts(): the beamformer-weighted projection of the
  *                four lane contexts into one.
  *   res_us       the residual-echo suppression gain: the error/near power
@@ -745,18 +755,15 @@ int four_aec_nr_res_get_mem_breakdown(
  *   synth_us     inverse transform, windowed overlap-add, and the hop
  *                emit/shift.
  *
- * WHY TWO FIELDS ARE ALWAYS ZERO
+ * WHERE THE THREE AEC-SIDE FIGURES COME FROM
  *
- * The AEC frontend, the linear filter proper and the per-lane RES all run
- * INSIDE aec_process_context*(), which carries no timing windows of its own.
- * They cannot be separated from this side, so their combined cost is reported
- * in linear_us and these two fields stay zero rather than reporting a number
- * they did not measure. Splitting them needs windows in the AEC library, which
- * would grow sizeof(Aec) and so bump this layout version, both 4ch wrappers
- * AND both mono pipelines. Offline, AEC's own test/bench_rtf.c already
- * separates the residual-echo cost by config differencing (full run minus
- * enable_res=0) without any library state -- a complement for sizing work,
- * not a substitute for per-hop numbers.
+ * aec_get_last_timing() (aec.h), read once per lane and summed here. The four
+ * lanes run sequentially inside one loop, so the sums are wall-clock costs of
+ * each stage across the whole loop, not averages. The lane loop's own
+ * remainder -- the context bind and the hop copy into linear_interleaved,
+ * plus the AEC stages between the main filter and the post block -- is not
+ * attributed and falls into the caller's pre-stage remainder along with
+ * align_render().
  *
  * The stages do not add up to the enclosing call: a caller presenting a full
  * breakdown must carry the remainder explicitly. The pre-side remainder holds

@@ -75,8 +75,13 @@
  * far-active floor retarget state), so every AEC carved out of this pool
  * moves the total and the offsets after it. Carve order and buffer set are
  * unchanged, so build_flags_hash does not move -- this counter is the only
- * signal. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 8u
+ * signal.
+ * Version 9: sizeof(Aec) grew again (each AEC instance gained its per-hop
+ * stage-timing record -- aec_get_last_timing(), aec.h), so every AEC
+ * carved out of this pool moves the total and the offsets after it. Carve
+ * order and buffer set are unchanged, so build_flags_hash does not move --
+ * this counter is the only signal. */
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 9u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
  * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"/\"ne10\"

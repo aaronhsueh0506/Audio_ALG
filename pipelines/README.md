@@ -118,10 +118,10 @@ context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
 twiddle configs are carved from these pools too, so both columns are the
 complete memory requirement (strict init→destroy zero-heap on both backends):
 
-Re-measured 2026-08-19 after the runtime strength-retarget ABI change
-(`sizeof(Aec)` grew by 8 B and `ALIGN16(sizeof(Aec))` by 16 B, so every AEC
+Re-measured 2026-08-20 after the per-hop stage-timing ABI change
+(`sizeof(Aec)` grew by 16 B and `ALIGN16(sizeof(Aec))` by 16 B, so every AEC
 pool and every total moved by exactly +16 B; descriptor now reports
-layout_version=7) via `"$(make -s print-bin-dir)"/aec_nr_pipeline_static
+layout_version=8) via `"$(make -s print-bin-dir)"/aec_nr_pipeline_static
 --print-mem-size balanced --sample-rate <sr> [--fft-size <alt>]` on both
 backends, against the current grid (16 kHz default is 256/128 — see "Parameter
 Alignment" above). 16 kHz's alternate 512/256 grid is included since it remains
@@ -132,14 +132,14 @@ documents now agree.
 
 | Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |--------|-----|-----------|-----|---------------|-----------|
-| **8 kHz KISS** | 275,680 B | 8,784 B | 67,424 B | 5,696 B | **357,744 B (349.4 KB)** |
-| **8 kHz NE10** | 275,072 B | 8,176 B | 67,424 B | 5,696 B | **356,528 B (348.2 KB)** |
-| **16 kHz KISS (default, 256/128)** | 379,760 B | 8,784 B | 122,160 B | 5,696 B | **516,560 B (504.5 KB)** |
-| **16 kHz NE10 (default, 256/128)** | 379,152 B | 8,176 B | 122,160 B | 5,696 B | **515,344 B (503.3 KB)** |
-| **16 kHz KISS (alt, 512/256)** | 508,832 B | 16,976 B | 133,472 B | 11,328 B | **670,768 B (655.0 KB)** |
-| **16 kHz NE10 (alt, 512/256)** | 507,456 B | 15,600 B | 133,472 B | 11,328 B | **668,016 B (652.4 KB)** |
-| **48 kHz KISS** | 1,167,056 B | 33,360 B | 374,336 B | 22,592 B | **1,597,504 B (1,560.1 KB)** |
-| **48 kHz NE10** | 1,164,144 B | 30,448 B | 374,336 B | 22,592 B | **1,591,680 B (1,554.4 KB)** |
+| **8 kHz KISS** | 275,696 B | 8,784 B | 67,424 B | 5,696 B | **357,760 B (349.4 KB)** |
+| **8 kHz NE10** | 275,088 B | 8,176 B | 67,424 B | 5,696 B | **356,544 B (348.2 KB)** |
+| **16 kHz KISS (default, 256/128)** | 379,776 B | 8,784 B | 122,160 B | 5,696 B | **516,576 B (504.5 KB)** |
+| **16 kHz NE10 (default, 256/128)** | 379,168 B | 8,176 B | 122,160 B | 5,696 B | **515,360 B (503.3 KB)** |
+| **16 kHz KISS (alt, 512/256)** | 508,848 B | 16,976 B | 133,472 B | 11,328 B | **670,784 B (655.1 KB)** |
+| **16 kHz NE10 (alt, 512/256)** | 507,472 B | 15,600 B | 133,472 B | 11,328 B | **668,032 B (652.4 KB)** |
+| **48 kHz KISS** | 1,167,072 B | 33,360 B | 374,336 B | 22,592 B | **1,597,520 B (1,560.1 KB)** |
+| **48 kHz NE10** | 1,164,160 B | 30,448 B | 374,336 B | 22,592 B | **1,591,696 B (1,554.4 KB)** |
 
 The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW.md` §4 — re-measure from
 there rather than editing it here, and always prefer the value

@@ -117,8 +117,13 @@
  * Bumped 6->7: sizeof(Aec) grew (the suppressor gained its runtime far-active
  * floor retarget state), so the AEC carved out of this pool moves the total
  * and every offset after it. Carve order and buffer set are unchanged, so
- * build_flags_hash does not move -- this counter is the only signal. */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 7u
+ * build_flags_hash does not move -- this counter is the only signal.
+ * Bumped 7->8: sizeof(Aec) grew again (each AEC instance gained its per-hop
+ * stage-timing record -- aec_get_last_timing(), aec.h), so every AEC
+ * carved out of this pool moves the total and the offsets after it. Carve
+ * order and buffer set are unchanged, so build_flags_hash does not move --
+ * this counter is the only signal. */
+#define AUDIO_PIPELINE_LAYOUT_VERSION 8u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
  * -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" or \"ne10\" to match its own

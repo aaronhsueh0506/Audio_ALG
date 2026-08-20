@@ -302,19 +302,19 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout（layout_version=7，runtime 強度 retarget 的 ABI 變更後）、
-`BACKEND=kiss`、`pipelines/Makefile` 預設選項**下，2026-08-19 直接呼叫 API 量到的
-值。換 backend、換編譯選項、更新 submodule 都會變。`sizeof(Aec)` 增加 8 B 後
-`ALIGN16(sizeof(Aec))` 跨過 16-byte 邊界，因此每一列的 `aec_bytes` 與 `req.bytes`
-都整批 +16 B，所有差額不變。
+以下是**本次 checkout（layout_version=8，逐階段計時的 ABI 變更後）、
+`BACKEND=kiss`、`pipelines/Makefile` 預設選項**下，2026-08-20 直接呼叫 API 量到的
+值。換 backend、換編譯選項、更新 submodule 都會變。每個 AEC 實例各自帶了逐階段
+計時記錄（`aec_get_last_timing()`），`sizeof(Aec)` 增加 16 B，因此每一列的
+`aec_bytes` 與 `req.bytes` 都整批 +16 B，所有差額不變。
 
 | Config | `req.bytes` | `aec_bytes` | `fft_bytes` | `nr_bytes` | `pipeline_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 357,744 | 275,680 | 8,784 | 67,424 | 5,696 |
-| 16000，預設（256/128） | 516,560 | 379,760 | 8,784 | 122,160 | 5,696 |
-| 16000，`fft_size=512` | 670,768 | 508,832 | 16,976 | 133,472 | 11,328 |
-| 48000，預設（1024/512） | 1,597,504 | 1,167,056 | 33,360 | 374,336 | 22,592 |
-| 16000，`aec_only=1` | 379,920 | 379,760 | 0 | 0 | 0 |
+| 8000，預設 | 357,760 | 275,696 | 8,784 | 67,424 | 5,696 |
+| 16000，預設（256/128） | 516,576 | 379,776 | 8,784 | 122,160 | 5,696 |
+| 16000，`fft_size=512` | 670,784 | 508,848 | 16,976 | 133,472 | 11,328 |
+| 48000，預設（1024/512） | 1,597,520 | 1,167,072 | 33,360 | 374,336 | 22,592 |
+| 16000，`aec_only=1` | 379,936 | 379,776 | 0 | 0 | 0 |
 
 `req.bytes` 減去四個分項（各自 16-byte 對齊後）的差額，就是 `AudioPipeline`
 控制區塊，本次量測在每一組 config 都是 160 B。
@@ -323,10 +323,10 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 516,560 | — |
-| `MATCHED` n=1 | 493,648 | −22,912 |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 358,464 | −158,096 |
-| `EXTERNAL_ALIGNED` | 351,552 | −165,008 |
+| `MATCHED` n=5（預設） | 516,576 | — |
+| `MATCHED` n=1 | 493,664 | −22,912 |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 358,480 | −158,096 |
+| `EXTERNAL_ALIGNED` | 351,568 | −165,008 |
 
 這四列的差額全部落在 `aec_bytes`（`delay_mode`/`delay_num_filters` 不影響
 FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致

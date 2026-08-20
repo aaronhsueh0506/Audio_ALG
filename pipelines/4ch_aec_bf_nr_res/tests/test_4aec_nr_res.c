@@ -703,13 +703,13 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * build_flags_hash still matches and this counter is the whole signal.
      * Bump this literal with FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 12u;
+    stale.layout_version = 13u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 13u,
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 14u,
           "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(
@@ -2088,24 +2088,23 @@ static void test_stage_timing(void) {
     feed_strength_hops(p, 34, &pre_wall_us, &post_wall_us);
     four_aec_nr_res_get_last_timing(p, &t);
 
-    /* The two documented-zero fields. If a future change starts filling
-     * these, the header's "always 0" contract and the caller's remainder
-     * arithmetic both need revisiting -- so they are asserted, not assumed. */
-    CHECK(t.frontend_us == 0,
-          "timing: frontend_us is documented as always zero");
-    CHECK(t.lane_res_us == 0,
-          "timing: lane_res_us is documented as always zero");
-
-    /* ⚠ Written so it can FAIL: neither the five-filter matched delay
-     * estimator nor four AEC lanes over a full hop can cost under a
-     * microsecond, so a zero here means that window never ran. */
-    CHECK(t.linear_us > 0, "timing: the AEC lane loop reports a real cost");
+    /* ⚠ Written so it can FAIL: four AEC lanes each run a main filter, a
+     * pre-filter stage and a post/RES block over a full hop, and the shared
+     * five-filter matched estimator runs once -- none of those can cost under
+     * a microsecond, so a zero anywhere here means that window never ran.
+     * frontend_us and lane_res_us come from aec_get_last_timing(); they read
+     * zero if the AEC-side windows are ever dropped. */
     CHECK(t.delay_us > 0, "timing: the delay estimator reports a real cost");
+    CHECK(t.frontend_us > 0,
+          "timing: the lanes' pre-filter stage reports a real cost");
+    CHECK(t.linear_us > 0, "timing: the lanes' main filter reports a real cost");
+    CHECK(t.lane_res_us > 0,
+          "timing: the lanes' post/RES block reports a real cost");
 
     /* Every stage is bounded by the call that contains it. This is what
      * distinguishes a measurement from a number: a stray or uninitialised
      * value would almost certainly exceed its enclosing call. */
-    pre_sum = t.delay_us + t.linear_us;
+    pre_sum = t.delay_us + t.frontend_us + t.linear_us + t.lane_res_us;
     post_sum = t.fuse_us + t.res_us + t.nr_us + t.synth_us;
     CHECK(pre_sum <= pre_wall_us,
           "timing: pre stages must fit inside process_pre's wall time");
@@ -2132,7 +2131,8 @@ static void test_stage_timing(void) {
             /* Read into its own record: `t` still holds the good hop the
              * report below prints. */
             four_aec_nr_res_get_last_timing(p, &after_bail);
-            CHECK(after_bail.delay_us == 0 && after_bail.linear_us == 0,
+            CHECK(after_bail.delay_us == 0 && after_bail.linear_us == 0 &&
+                  after_bail.frontend_us == 0 && after_bail.lane_res_us == 0,
                   "timing: a bailed-out hop reports zeros, not the last "
                   "hop's numbers");
         }
@@ -2140,9 +2140,10 @@ static void test_stage_timing(void) {
     }
 
     four_aec_nr_res_destroy(p);
-    printf("timing: delay=%uus linear=%uus (pre wall %uus) | "
-           "fuse=%uus res=%uus nr=%uus synth=%uus (post wall %uus)\n",
-           t.delay_us, t.linear_us, pre_wall_us,
+    printf("timing: delay=%u frontend=%u linear=%u lane_res=%u "
+           "(pre wall %uus) | fuse=%u res=%u nr=%u synth=%u "
+           "(post wall %uus)\n",
+           t.delay_us, t.frontend_us, t.linear_us, t.lane_res_us, pre_wall_us,
            t.fuse_us, t.res_us, t.nr_us, t.synth_us, post_wall_us);
 }
 

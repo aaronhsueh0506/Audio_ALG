@@ -1164,8 +1164,8 @@ int four_aec_nr_res_process_pre(
 
     /* Cleared once the call is accepted: a hop that then bails out part-way
      * reports zero for the stages it never reached rather than the previous
-     * hop's numbers. frontend/lane_res have no writer at all -- see the
-     * header -- so clearing is the only thing that keeps them at zero. The
+     * hop's numbers. The three AEC-side fields are ACCUMULATED over the four
+     * lanes below, so this is also what makes each hop start from zero. The
      * post half is cleared the same way in process_post_impl(). */
     p->last_timing.delay_us = 0;
     p->last_timing.frontend_us = 0;
@@ -1229,10 +1229,6 @@ int four_aec_nr_res_process_pre(
         }
     }
 
-    /* The whole four-lane AEC loop, attributed to linear_us -- see
-     * FourAecNrResLastTiming in the header for why the frontend/lane-RES
-     * split cannot be taken from here. */
-    t0 = four_aec_nr_res_now_us();
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
         AecResContext context;
         if (ch != p->cfg.capture_proxy_channel) {
@@ -1278,9 +1274,18 @@ int four_aec_nr_res_process_pre(
                 i * FOUR_AEC_NR_RES_CHANNELS + ch] =
                 context.formed_hop[i];
         }
-    }
 
-    p->last_timing.linear_us = four_aec_nr_res_now_us() - t0;
+        /* Sum this lane's own stage split into the hop's record. The four
+         * lanes run sequentially, so summing gives the wall-clock cost of
+         * each stage across the whole loop -- see FourAecNrResLastTiming. */
+        {
+            AecStageTiming lane_time;
+            aec_get_last_timing(p->lanes[ch], &lane_time);
+            p->last_timing.frontend_us += lane_time.frontend_us;
+            p->last_timing.linear_us   += lane_time.linear_us;
+            p->last_timing.lane_res_us += lane_time.res_us;
+        }
+    }
 
     p->pending_token.frame_index = p->next_frame;
     p->pending_token.generation = p->generation;

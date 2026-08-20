@@ -195,8 +195,10 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * Version 12 carries the core's own layout 12 -> 13 (its control block gained
  * the per-hop stage-timing record). Nothing in THIS layer's carve changed;
  * the composed pre-only core sub-pool simply grew, and build_flags_hash
- * cannot say so for the same carve-token reason as v9. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 12u
+ * cannot say so for the same carve-token reason as v9.
+ * Version 13 carries the core's own layout 13 -> 14 (sizeof(Aec) grew: each
+ * lane gained its per-hop stage-timing record). Same carve-token reason. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 13u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

@@ -132,8 +132,11 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * carve changed, the composed core sub-pool simply grew, and build_flags_hash
  * cannot say so -- it folds in the core's carve-TOKEN hash, which a
  * control-block-only change leaves alone. Bumping this counter by hand is the
- * only thing that invalidates a persisted descriptor. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 8u
+ * only thing that invalidates a persisted descriptor.
+ * Version 9 carries the core's own layout 13 -> 14 (sizeof(Aec) grew: each
+ * lane gained its per-hop stage-timing record). Same shape again -- nothing
+ * in THIS layer's carve changed, and build_flags_hash cannot see it. */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 9u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
