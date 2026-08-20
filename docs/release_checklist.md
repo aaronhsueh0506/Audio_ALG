@@ -554,8 +554,8 @@ budget is not an efficiency verdict.
 
 ## 11. AINR framework gate
 
-Public AINR models are RNNoise-ERB, GTCRN, DeepFilterNet2, and
-DeepFilterNet3. Full training and trained-model quality are out of scope.
+Public AINR models are RNNoise-ERB, GTCRN, and DeepFilterNet2. Full training
+and trained-model quality are out of scope.
 
 ### 11.1 Dataset generator
 

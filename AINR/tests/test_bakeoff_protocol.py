@@ -45,6 +45,13 @@ def _load(name):
 SHARED_SIGNAL = ('sr', 'n_fft')
 SHARED_TRAINING = ('epoch_size',)
 
+# Schedule SHAPE keys, compared as floats.  These are not cosmetic: two models
+# compared over "the same 100 epochs" are only comparable if the learning rate
+# followed the same trajectory, which is the whole reason the schedule was
+# unified.  ``lr`` itself is deliberately NOT here -- the base rate is a
+# per-model tuning choice; the shape around it is not.
+SHARED_SCHEDULE = ('min_lr', 'warmup_epochs')
+
 
 def test_signal_grid_matches():
     """Both models must analyse the corpus on the same time-frequency grid."""
@@ -75,7 +82,45 @@ def test_epoch_budget_matches():
         assert a == b, f'[training] {key}: RNNoise-ERB={a} GTCRN={b}'
 
 
-NR_TRAINERS = ('RNNoise-ERB', 'GTCRN', 'DeepFilterNet2', 'DeepFilterNet3')
+def test_schedule_shape_matches():
+    """The LR trajectory must not differ between the two models compared."""
+    rnn, gtcrn = _load('RNNoise-ERB'), _load('GTCRN')
+    for key in SHARED_SCHEDULE:
+        a = rnn.getfloat('training', key)
+        b = gtcrn.getfloat('training', key)
+        assert a == b, f'[training] {key}: RNNoise-ERB={a} GTCRN={b}'
+
+
+def test_unreconciled_schedule_divergences_are_visible():
+    """⚠ Two schedule knobs still disagree and NOBODY has decided they should.
+
+    Unlike test_intentional_divergences_are_still_intentional, this test does
+    not claim these are deliberate -- it pins the current values so the pair
+    cannot drift further while the question is open, and so that whoever
+    reconciles them has to come here and say which way it went.
+
+    - warmup start factor (``lr_warmup / lr``): GTCRN warms up from 10% of its
+      base rate, RNNoise-ERB from 1%.  GTCRN took DeepFilterNet2's value when
+      its schedule was introduced; RNNoise-ERB's 0.01 is the explicit form of a
+      start_factor that used to be hard-coded in its train.py.  Neither number
+      was chosen against the other.
+    - ``grad_clip``: 5.0 vs 1.0.  GradNormLog's own docstring argues the clip
+      threshold decides what the gradient trace can distinguish, so it belongs
+      to the comparison protocol on the same footing as the LR.
+    """
+    factors, clips = {}, {}
+    for name in ('RNNoise-ERB', 'GTCRN'):
+        cfg = _load(name)
+        lr = cfg.getfloat('training', 'lr')
+        factors[name] = cfg.getfloat('training', 'lr_warmup') / lr
+        clips[name] = cfg.getfloat('training', 'grad_clip')
+
+    assert round(factors['GTCRN'], 6) == 0.1, factors
+    assert round(factors['RNNoise-ERB'], 6) == 0.01, factors
+    assert clips == {'GTCRN': 5.0, 'RNNoise-ERB': 1.0}, clips
+
+
+NR_TRAINERS = ('RNNoise-ERB', 'GTCRN', 'DeepFilterNet2')
 
 
 def test_split_comes_from_one_shared_implementation():
@@ -142,6 +187,8 @@ if __name__ == '__main__':
     tests = [
         test_signal_grid_matches,
         test_epoch_budget_matches,
+        test_schedule_shape_matches,
+        test_unreconciled_schedule_divergences_are_visible,
         test_split_comes_from_one_shared_implementation,
         test_seed_defaults_match,
         test_intentional_divergences_are_still_intentional,

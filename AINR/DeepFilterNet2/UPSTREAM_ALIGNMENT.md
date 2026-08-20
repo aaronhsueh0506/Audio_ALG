@@ -3,16 +3,16 @@
 > **Current architecture (2026-07-31):** this folder intentionally restores
 > DFN2's parameter-count-invisible output composition: full-band ERB mask →
 > low-band deep filter on that masked spectrum → learned sigmoid-alpha residual
-> blend. The v5 DFN3 band-split implementation audited below now lives unchanged
-> in `../DeepFilterNet3/`.
+> blend. The v5 band-split implementation audited below is no longer built
+> here.
 >
 > The current folder retains the audited v5 encoder/decoder widths, frequency-
 > major flattening, pathway-add skips, triangular ERB bank, 1/1 lookahead,
 > libDF-normalisation constants, AdamW/AMSGrad, MRSL, checkpoint contract and
 > non-finite guards. `MODEL_VERSION` v6 separates new cascade/alpha checkpoints
 > from the old band-split checkpoints. The long audit below is therefore a
-> historical record of the shared base and of the DFN3 branch, not a claim that
-> this folder still uses DFN3 composition.
+> historical record of the shared base and of that earlier band-split
+> architecture, not a claim that this folder still composes that way.
 
 **Audited 2026-07-30.** 34 independent agents across five areas (feature
 normalisation, GRU/embedding architecture, conv stack, loss, training schedule),

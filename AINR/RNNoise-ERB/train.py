@@ -40,6 +40,18 @@ from dataset_gen import (  # noqa: E402
     set_seed,
     split_sizes,
 )
+# The non-finite halt path, the gradient-norm trace and the LR schedule are
+# shared for the same reason as the split: a trainer that halts differently or
+# anneals differently is not running the same protocol as the model it is being
+# compared against.
+from training_common import (
+    NonFiniteTraining,
+    scan_non_finite,  # noqa: E402
+    GradNormLog,
+    fast_forward_scheduler,
+    halt_on_non_finite,
+    make_scheduler,
+)
 
 
 # Feature semantics are intentionally versioned.  v3 keeps the two input shapes
@@ -1039,6 +1051,10 @@ def train(args):
     weight_decay_end = cfg.getfloat('training', 'weight_decay_end', fallback=-1.0)
     wd_scheduled = weight_decay_end >= 0.0
     min_lr = cfg.getfloat('training', 'min_lr', fallback=1e-6)
+    # The warmup's starting lr, stated as an lr rather than as a factor:
+    # make_scheduler derives start_factor = lr_warmup / lr.
+    warmup_lr = cfg.getfloat('training', 'lr_warmup', fallback=0.01 * lr)
+    grad_clip = cfg.getfloat('training', 'grad_clip', fallback=1.0)
     warmup_epochs = cfg.getint('training', 'warmup_epochs', fallback=3)
     patience = cfg.getint('training', 'early_stop_patience', fallback=0)
 
@@ -1056,17 +1072,21 @@ def train(args):
         use_complex_input=USE_COMPLEX_INPUT).to(device)
     if hasattr(torch, 'compile') and device.type == 'cuda':
         model = torch.compile(model)
+    # torch.compile wraps the module, so named_parameters()/named_buffers() gain
+    # an `_orig_mod.` prefix that state_dict() here does not carry.  Everything
+    # that inspects or serialises weights must go through the unwrapped module,
+    # or the buffer names and the state_dict keys stop matching.
+    raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, betas=(0.9, 0.999),
                                   weight_decay=weight_decay, amsgrad=True)
-    # Linear warmup → cosine annealing (DFN2 style)
+    # Linear warmup → cosine annealing, built by the shared factory so this
+    # model and the ones it is compared against anneal identically.
+    # len(train_loader) already reflects epoch_size (or the whole split when
+    # epoch_size = 0), so total_steps is the real step count either way.
     total_steps = epochs * len(train_loader)
     warmup_steps = max(1, warmup_epochs * len(train_loader))
-    warmup_sch = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-    cosine_sch = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, total_steps - warmup_steps), eta_min=min_lr)
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_sch, cosine_sch], milestones=[warmup_steps])
+    scheduler = make_scheduler(
+        optimizer, warmup_steps, total_steps, lr, min_lr, warmup_lr)
 
     loss_cfg = read_loss_config(cfg)
     loss_fn = MultiResSpecLoss(**loss_cfg).to(device)
@@ -1104,13 +1124,11 @@ def train(args):
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         require_checkpoint_feature_config(ckpt, FEATURE_CFG, context=args.resume)
         require_checkpoint_loss_config(ckpt, loss_cfg, irm_cfg, context=args.resume)
-        resume_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-        resume_model.load_state_dict(ckpt['state_dict'])
-        bad_weights = [name for name, value in resume_model.state_dict().items()
-                       if torch.is_tensor(value) and not torch.isfinite(value).all()]
-        if bad_weights:
-            raise FloatingPointError(
-                f"checkpoint contains non-finite weights: {bad_weights[:5]}"
+        raw_model.load_state_dict(ckpt['state_dict'])
+        poisoned = scan_non_finite(raw_model)
+        if poisoned:
+            raise NonFiniteTraining(
+                f"checkpoint contains non-finite weights: {poisoned[:5]}"
             )
         if 'optimizer' in ckpt:
             optimizer.load_state_dict(ckpt['optimizer'])
@@ -1120,12 +1138,12 @@ def train(args):
         )
         best_val_loss = ckpt.get('best_val_loss', ckpt.get('loss', float('inf')))
         no_improve_count = ckpt.get('no_improve_count', 0)
-        # Never restore SequentialLR: its nested cosine state contains the
-        # old run's T_max. Rebuild against the current epochs/loader length,
-        # then index it by the checkpoint's global step.
-        for _ in range(global_step):
-            scheduler.step()
+        # Rebuilt, never restored -- fast_forward_scheduler()'s docstring has
+        # the measured reason.
+        resumed_lr = fast_forward_scheduler(scheduler, global_step)
         print(f"  Resumed from epoch {start_epoch - 1}, best_val_loss={best_val_loss:.5f}")
+        print(f"  scheduler rebuilt for epochs={epochs} and fast-forwarded "
+              f"{global_step} steps (lr={resumed_lr:.4e})")
 
     print(f"Training: SR={SR}, N_FFT={N_FFT}, N_BANDS={N_BANDS}")
     print(f"  WIN_LEN={WIN_LEN}, HOP_LEN={HOP_LEN} (root Hann window)")
@@ -1149,6 +1167,93 @@ def train(args):
     if not os.path.isfile(log_csv):
         with open(log_csv, 'w') as f:
             f.write('epoch,train_loss,val_loss,lr\n')
+
+    # Append mode, so a resumed run continues the same trace instead of starting
+    # a second one that cannot be compared against the first.
+    #
+    # hazard_mag is None for this model, and that is not an omission: the
+    # objective's clamps sit on GAINS and BAND MAGNITUDES (ErbIrmLoss clamps
+    # pred_gains/target at 1e-12, MultiResSpecLoss clamps |X| at 1e-12), not on
+    # a waveform.  dump_batch's near_hazard column measures time-domain sample
+    # magnitudes, so any number passed here would describe a different quantity.
+    grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), SR,
+                           hazard_mag=None)
+
+    # Every value here is fixed for the whole run, so it is built once and
+    # shared by the end-of-epoch checkpoint and the halt checkpoint -- the halt
+    # artefact is only resumable if it carries the identical contract fields
+    # that require_checkpoint_feature_config/_loss_config check.
+    ckpt_config = {
+        'sr': SR, 'n_fft': N_FFT, 'win_len': WIN_LEN,
+        'hop_len': HOP_LEN, 'n_bands': N_BANDS,
+        'lookahead_frames': LOOKAHEAD,
+        'cond_size': COND_SIZE, 'gru_size': GRU_SIZE,
+        'use_complex_input': USE_COMPLEX_INPUT,
+        'spec_conv_channels': SPEC_CONV_CHANNELS,
+        'spec_embed_size': SPEC_EMBED_SIZE,
+        'feature_version': FEATURE_VERSION,
+        'loss_version': LOSS_VERSION,
+        'loss_fft_sizes': ','.join(str(n) for n in loss_cfg['fft_sizes']),
+        'loss_gamma': loss_cfg['gamma'],
+        'loss_factor': loss_cfg['factor'],
+        'loss_factor_complex': loss_cfg['factor_complex'],
+        'irm_factor': irm_cfg['factor'],
+        'irm_gamma': irm_cfg['gamma'],
+        'irm_energy_floor': irm_cfg['energy_floor'],
+        'min_bins_per_band': MIN_BINS_PER_BAND,
+        'feature_erb_norm_tau_sec': FEATURE_CFG['erb_tau_sec'],
+        'feature_erb_norm_alpha': FEATURE_CFG['erb_alpha'],
+        'feature_erb_norm_init_lo_db': FEATURE_CFG['erb_norm_init_lo_db'],
+        'feature_erb_norm_init_hi_db': FEATURE_CFG['erb_norm_init_hi_db'],
+        'feature_erb_norm_scale_db': FEATURE_CFG['erb_norm_scale_db'],
+        'feature_spec_max_hz': FEATURE_CFG['spec_max_hz'],
+        'feature_spec_bins': FEATURE_CFG['spec_bins'],
+        'feature_spec_norm_tau_sec': FEATURE_CFG['spec_tau_sec'],
+        'feature_spec_norm_alpha': FEATURE_CFG['spec_alpha'],
+        'feature_spec_norm_init_lo': FEATURE_CFG['spec_norm_init_lo'],
+        'feature_spec_norm_init_hi': FEATURE_CFG['spec_norm_init_hi'],
+        'feature_spec_norm_eps': FEATURE_CFG['spec_norm_eps'],
+    }
+
+    def make_halt_context(epoch):
+        """Assemble halt_on_non_finite's arguments -- called ONLY when halting.
+
+        Built once per epoch, never per batch: the state_dict copies below are
+        far too expensive to take on every step, and the halt path runs at most
+        once per process.  Model/optimizer state is still pre-step at every call
+        site, so the checkpoint it captures is uncontaminated.
+
+        raw_model, not model: halt_on_non_finite indexes state_dict() by the
+        names it gets from named_buffers(), and under torch.compile those two
+        namespaces disagree.
+
+        enhanced is None because with the MRSL factors at zero this objective
+        never synthesises a waveform -- the model emits band gains and the loss
+        consumes them directly, so there is no enhanced signal to dump.
+        """
+        def context(batch_idx, noisy, clean):
+            return {
+                'model': raw_model,
+                'noisy': noisy, 'clean': clean, 'enhanced': None,
+                'epoch': epoch,
+                'batch_idx': batch_idx, 'global_step': global_step,
+                'output_dir': output_dir, 'sr': SR,
+                'hazard_mag': None,
+                'checkpoint': {
+                    'epoch': epoch - 1,
+                    'global_step': global_step,
+                    'state_dict': raw_model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'loss': best_val_loss,
+                    'best_val_loss': best_val_loss,
+                    'no_improve_count': no_improve_count,
+                    'nfftborder': NFFTBORDER.tolist(),
+                    'feature_version': FEATURE_VERSION,
+                    'loss_version': LOSS_VERSION,
+                    'config': ckpt_config,
+                },
+            }
+        return context
 
     mrsl_enabled = mrsl_is_enabled(loss_cfg)
 
@@ -1204,9 +1309,10 @@ def train(args):
         # --- Train ---
         model.train()
         train_loss_sum = 0
+        halt_context = make_halt_context(epoch)
         with tqdm.tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") as pbar:
             if use_wav:
-                for noisy_wav, clean_wav in pbar:
+                for batch_idx, (noisy_wav, clean_wav) in enumerate(pbar):
                     noisy_wav = noisy_wav.to(
                         device=device, dtype=torch.float32, non_blocking=pin_memory)
                     clean_wav = clean_wav.to(
@@ -1214,9 +1320,17 @@ def train(args):
 
                     loss = batch_loss(noisy_wav, clean_wav)
                     loss_value = float(loss.detach())
+
+                    # ⚠ Check the LOSS separately from the gradient, and BEFORE
+                    # backward().  A non-finite loss is a forward-side fault (a
+                    # division or a log inside the objective) and diagnoses
+                    # differently from a finite loss whose gradient explodes.
                     if not math.isfinite(loss_value):
-                        raise FloatingPointError(
-                            f"non-finite training loss at epoch={epoch}, step={global_step}"
+                        halt_on_non_finite(
+                            'loss is non-finite before backward '
+                            '(forward-side fault)',
+                            loss_value=loss_value, total_norm=None,
+                            **halt_context(batch_idx, noisy_wav, clean_wav),
                         )
 
                     # weight-decay 排程 (DFN-style cosine, 套在這步 optimizer.step 前)
@@ -1229,15 +1343,43 @@ def train(args):
 
                     optimizer.zero_grad()
                     loss.backward()
-                    nn.utils.clip_grad_norm_(
-                        model.parameters(), 1.0, error_if_nonfinite=True
-                    )
+                    # ⚠ error_if_nonfinite=True is what stops clipping from
+                    # CREATING the NaN.  Without it, total_norm=inf gives
+                    # clip_coef = 1.0/(inf+1e-6) = 0.0, and inf*0.0 = NaN --
+                    # which optimizer.step() then writes into the weights AND
+                    # into Adam's exp_avg/exp_avg_sq, so no later clean batch
+                    # can recover it.  With the flag the raise happens BEFORE
+                    # any scaling, so gradients and weights are untouched.
+                    try:
+                        total_norm = nn.utils.clip_grad_norm_(
+                            model.parameters(), grad_clip,
+                            error_if_nonfinite=True
+                        )
+                    except RuntimeError as exc:
+                        halt_on_non_finite(
+                            f'non-finite gradient (backward-side fault): {exc}',
+                            loss_value=loss_value, total_norm='non-finite',
+                            **halt_context(batch_idx, noisy_wav, clean_wav),
+                        )
                     optimizer.step()
                     scheduler.step()
+                    # One device->host sync for the norm, reused by both the CSV
+                    # and the progress bar.
+                    norm_value = float(total_norm)
+                    grad_log.record(
+                        norm_value, epoch=epoch, batch_idx=batch_idx,
+                        global_step=global_step, loss_value=loss_value,
+                        noisy=noisy_wav, clean=clean_wav,
+                        output_dir=output_dir,
+                    )
+
+                    # After record(): the CSV row and a halt report must name the
+                    # same step for the same batch.
                     global_step += 1
 
                     train_loss_sum += loss_value
-                    pbar.set_postfix(loss=f"{loss_value:.5f}")
+                    pbar.set_postfix(loss=f"{loss_value:.5f}",
+                                     gnorm=f"{norm_value:.2e}")
 
         avg_train = train_loss_sum / len(train_loader)
 
@@ -1255,7 +1397,7 @@ def train(args):
                     loss = batch_loss(noisy_wav, clean_wav)
                     loss_value = float(loss)
                     if not math.isfinite(loss_value):
-                        raise FloatingPointError(
+                        raise NonFiniteTraining(
                             f"non-finite validation loss at epoch={epoch}"
                         )
                     val_loss_sum += loss_value
@@ -1267,14 +1409,12 @@ def train(args):
         with open(log_csv, 'a') as f:
             f.write(f'{epoch},{avg_train:.6f},{avg_val:.6f},{cur_lr:.6e}\n')
 
-        # 儲存 checkpoint (compiled model 要取 _orig_mod 避免 key 有 _orig_mod. 前綴)
-        raw_model = model._orig_mod if hasattr(model, '_orig_mod') else model
-        bad_weights = [name for name, value in raw_model.state_dict().items()
-                       if torch.is_tensor(value) and not torch.isfinite(value).all()]
-        if bad_weights:
-            raise FloatingPointError(
+        # 儲存 checkpoint (raw_model = 未經 torch.compile 包裝的模組)
+        poisoned = scan_non_finite(raw_model)
+        if poisoned:
+            raise NonFiniteTraining(
                 "refusing to overwrite a checkpoint with non-finite weights: "
-                f"{bad_weights[:5]}"
+                f"{poisoned[:5]}"
             )
         is_best = avg_val < best_val_loss
         checkpoint_best = min(best_val_loss, avg_val)
@@ -1291,37 +1431,7 @@ def train(args):
             'nfftborder': NFFTBORDER.tolist(),
             'feature_version': FEATURE_VERSION,
             'loss_version': LOSS_VERSION,
-            'config': {
-                'sr': SR, 'n_fft': N_FFT, 'win_len': WIN_LEN,
-                'hop_len': HOP_LEN, 'n_bands': N_BANDS,
-                'lookahead_frames': LOOKAHEAD,
-                'cond_size': COND_SIZE, 'gru_size': GRU_SIZE,
-                'use_complex_input': USE_COMPLEX_INPUT,
-                'spec_conv_channels': SPEC_CONV_CHANNELS,
-                'spec_embed_size': SPEC_EMBED_SIZE,
-                'feature_version': FEATURE_VERSION,
-                'loss_version': LOSS_VERSION,
-                'loss_fft_sizes': ','.join(str(n) for n in loss_cfg['fft_sizes']),
-                'loss_gamma': loss_cfg['gamma'],
-                'loss_factor': loss_cfg['factor'],
-                'loss_factor_complex': loss_cfg['factor_complex'],
-                'irm_factor': irm_cfg['factor'],
-                'irm_gamma': irm_cfg['gamma'],
-                'irm_energy_floor': irm_cfg['energy_floor'],
-                'min_bins_per_band': MIN_BINS_PER_BAND,
-                'feature_erb_norm_tau_sec': FEATURE_CFG['erb_tau_sec'],
-                'feature_erb_norm_alpha': FEATURE_CFG['erb_alpha'],
-                'feature_erb_norm_init_lo_db': FEATURE_CFG['erb_norm_init_lo_db'],
-                'feature_erb_norm_init_hi_db': FEATURE_CFG['erb_norm_init_hi_db'],
-                'feature_erb_norm_scale_db': FEATURE_CFG['erb_norm_scale_db'],
-                'feature_spec_max_hz': FEATURE_CFG['spec_max_hz'],
-                'feature_spec_bins': FEATURE_CFG['spec_bins'],
-                'feature_spec_norm_tau_sec': FEATURE_CFG['spec_tau_sec'],
-                'feature_spec_norm_alpha': FEATURE_CFG['spec_alpha'],
-                'feature_spec_norm_init_lo': FEATURE_CFG['spec_norm_init_lo'],
-                'feature_spec_norm_init_hi': FEATURE_CFG['spec_norm_init_hi'],
-                'feature_spec_norm_eps': FEATURE_CFG['spec_norm_eps'],
-            },
+            'config': ckpt_config,
         }
         torch.save(ckpt, os.path.join(output_dir, f'rnnoise_epoch{epoch}.pth'))
 
@@ -1337,6 +1447,15 @@ def train(args):
                 if no_improve_count >= patience:
                     print(f"  Early stopping at epoch {epoch}")
                     break
+
+    # No try/finally around the epoch loop: the trace is line-buffered, so every
+    # step is already on disk and a halt or a hard kill loses nothing.  This
+    # close is tidiness, not durability.
+    grad_log.close()
+    print(f"Training done. Best val loss: {best_val_loss:.5f}")
+    print(f"  gradient-norm trace: "
+          f"{os.path.join(output_dir, 'grad_norm.csv')}")
+
 
 # ============================================================
 # CLI

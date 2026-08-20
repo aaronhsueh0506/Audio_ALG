@@ -199,7 +199,11 @@ python3 train.py --config config.ini --packed-data data_16k/packed.pt \
     --resume output/rnnoise_epoch5.pth
 ```
 
-續訓會恢復：model weights、optimizer 狀態、scheduler 狀態、epoch 計數、best_val_loss。
+續訓會恢復：model weights、optimizer 狀態、global_step、epoch 計數、best_val_loss。
+⚠ **scheduler 狀態刻意不恢復**：checkpoint 裡沒有存它。restore 會把寫入當時那一輪的
+`T_max` 帶回來蓋掉為現在這輪重建的值——實測從 100-epoch 的 checkpoint 續訓到 120
+epochs，終端 lr 是 1.02e-04 而非 min_lr 1e-06（102 倍）。正確做法是照新的 epochs
+重建，再用 `global_step` 快轉，這也是 `training_common.fast_forward_scheduler()` 做的事。
 Checkpoint 同時檢查 loss contract；舊的 MRSL+IRM checkpoint 不能直接 resume，
 必須從新初始化的訓練開始。
 

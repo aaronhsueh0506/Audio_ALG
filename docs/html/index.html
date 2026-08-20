@@ -36,7 +36,6 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="pipeline_4ch.html">4ch</a> ·
 <a href="pipeline_ulcnet_4ch.html">4ch-ULCNet</a> ·
 <a href="ainr_dfn2.html">DFN2</a> ·
-<a href="ainr_dfn3.html">DFN3</a> ·
 <a href="ainr_gtcrn.html">GTCRN</a> ·
 <a href="ainr_rnnoise_erb.html">RNNoise-ERB</a> ·
 <a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
@@ -79,7 +78,7 @@ SE/                                (同層四個 repo)
       │     ├── mono_alignulcnet/     mono AEC + Align-ULCNet
       │     ├── 4ch_aec_bf_nr_res/    4ch AEC + BF + NR/RES（並擁有共用 4-lane core）
       │     └── 4ch_alignulcnet/      4ch AEC + BF + Align-ULCNet
-      ├── AINR/          NN NR：DFN2 / DFN3 / GTCRN / RNNoise-ERB
+      ├── AINR/          NN NR：DFN2 / GTCRN / RNNoise-ERB
       │                  (各自的 C 前後處理 + 訓練/推論 Python)
       ├── AIAEC/         NN AEC/RES 四候選 (Python + C 前後處理: 共用
       │                  aiaec_process、Align_ULCNet 全鏈、DeepVQE-S CCM)
@@ -138,9 +137,6 @@ NN post stage；新增演算法延遲 2 hops = 32 ms。</td></tr>
 <td>DeepFilterNet2：48k、1024/512（非上游 960/480）；stateless ONNX exporter + C 前後處理
 <code>dfn2_process.c</code>（STFT/ERB+complex 特徵/EMA 正規化/compose/ISTFT），
 graph 只含 heads。</td></tr>
-<tr><td><a href="ainr_dfn3.html">ainr_dfn3</a></td>
-<td>DeepFilterNet3：同 grid；平行 band-split（DF 與 mask 各管一段），
-串流總延遲 1 hop（DFN2 cascade 為 2）；C 前後處理 <code>dfn3_process.c</code>。</td></tr>
 <tr><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td>
 <td>GTCRN：16k、512/256；C 端 <code>gtcrn_process.c</code> 只做 STFT/ISTFT，
 頻譜之間全部在網路；stateless ONNX 以三組 cache 作顯式 I/O。</td></tr>

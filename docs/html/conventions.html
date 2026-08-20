@@ -37,7 +37,6 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="pipeline_4ch.html">4ch</a> ·
 <a href="pipeline_ulcnet_4ch.html">4ch-ULCNet</a> ·
 <a href="ainr_dfn2.html">DFN2</a> ·
-<a href="ainr_dfn3.html">DFN3</a> ·
 <a href="ainr_gtcrn.html">GTCRN</a> ·
 <a href="ainr_rnnoise_erb.html">RNNoise-ERB</a> ·
 <a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
@@ -85,10 +84,10 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <td><b>512 / 256（257）固定</b>；其他 SR/fft 一律 reject</td><td>編譯期固定</td>
 <td><code>ulcnet_process.h</code>（ULCNET_SR/N_FFT/HOP/BINS）、
 <code>audio_pipeline_ulcnet.h</code>、<code>audio_pipeline_4ch_ulcnet.h</code></td></tr>
-<tr><td>AINR DFN2 / DFN3</td><td>48 k</td>
+<tr><td>AINR DFN2</td><td>48 k</td>
 <td>1024 / 512（513）；<b>非上游 960/480</b>（2 的次方限制；DF 截止 4500 Hz
 vs 上游 4800 Hz）</td><td>編譯期固定</td>
-<td><code>dfn2_process.h</code> / <code>dfn3_process.h</code></td></tr>
+<td><code>dfn2_process.h</code></td></tr>
 <tr><td>AINR GTCRN</td><td>16 k</td><td>512 / 256（257）</td><td>編譯期固定</td>
 <td><code>gtcrn_process.h</code></td></tr>
 <tr><td>AINR RNNoise-ERB</td><td>16 k</td>
@@ -116,7 +115,7 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c:579-582</code></td></tr>
 <tr><td>ULCNet C 分析+合成（共用一張表）</td>
 <td><code>ulcnet_process.c</code> <code>ulcnet_make_window()</code>（與 Python 逐 bit 同 @f32）</td></tr>
-<tr><td>DFN2/DFN3/GTCRN 分析+合成</td>
+<tr><td>DFN2/GTCRN 分析+合成</td>
 <td>各 model process.c 內含 <code>df_common_make_root_hann()</code>（model-local 複本）</td></tr>
 <tr><td>RNNoise-ERB 分析+合成</td>
 <td><code>rnnoise_tables_gen.h</code>（編譯期表；<code>gen_rnnoise_tables.c</code> 產生，
@@ -126,7 +125,8 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 </table>
 </div>
 <p>sqrt-Hann 分析 × sqrt-Hann 合成 = Hann，在 50% overlap 下滿足 COLA，
-合成端不需 window-envelope 除法（<code>dfn3_synthesis()</code> 註解明文）。
+合成端不需 window-envelope 除法（<code>dfn2_process.h</code> 的
+<code>dfn2_synthesis()</code> 註解明文）。
 例外是 torch.istft 語意的 ULCNet WOLA：它照 torch 做窗平方包絡正規化
 （<code>UlcnetSynthesis.env</code>），結果相同、簿記不同。</p>
 
@@ -142,7 +142,7 @@ far/near 的 block（= 2×hop 原始樣本）直接進 RFFT——
 fade），作用在濾波器係數不是訊號。</p>
 
 <h2>ULCNet centered framing vs AEC/DFN 串流（center=False）framing</h2>
-<p>兩種 framing 並存是刻意的：AINR DFN2/DFN3 的 C 是 center=False 串流
+<p>兩種 framing 並存是刻意的：AINR DFN2 的 C 是 center=False 串流
 （<code>dfn2_process.h</code> parity 限制 (1)），Align-ULCNet 的 C 重現
 torch <code>center=True</code> timing（<code>ulcnet_process.h</code> 檔頭 +
 <code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code> 第 7 節決策）。</p>

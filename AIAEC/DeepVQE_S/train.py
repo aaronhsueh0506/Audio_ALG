@@ -80,7 +80,9 @@ from AIAEC.training_common import (
     auto_device,
     compressed_spectral_loss,
     halt_on_non_finite,
+    fast_forward_scheduler,
     make_checkpoint_contract,
+    make_scheduler,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
@@ -110,7 +112,7 @@ def forward_batch(model, stems_batch, aec_grid, device):
 def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
              epoch=0, global_step=0, output_dir=None, sr=None,
              grad_clip=1.0, checkpoint_for_halt=None, grad_log=None,
-             max_epochs=None):
+             max_epochs=None, scheduler=None):
     training = optimizer is not None
     model.train(training)
     total_loss, n_batches = 0.0, 0
@@ -133,25 +135,36 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
             loss_value = float(loss.detach())
             if not torch.isfinite(loss.detach()):
                 halt_on_non_finite(
-                    'non-finite loss', model=model, optimizer=optimizer,
+                    'non-finite loss', model=model,
                     mic=spectral.inputs['microphone'], target=spectral.target,
                     epoch=epoch, batch_idx=batch_idx, global_step=global_step,
-                    loss_value=loss_value, total_norm=float('nan'),
+                    loss_value=loss_value, total_norm=None,
                     output_dir=output_dir, sr=sr, checkpoint=checkpoint_for_halt,
                     enhanced=output.enhanced,
                 )
             loss.backward()
-            total_norm = float(nn.utils.clip_grad_norm_(model.parameters(), grad_clip))
-            if not torch.isfinite(torch.tensor(total_norm)):
+            # error_if_nonfinite=True is what stops clipping from CREATING the
+            # NaN.  Without it a non-finite norm gives
+            # clip_coef = grad_clip/(inf+1e-6) = 0.0, and inf*0.0 = NaN, so every
+            # gradient is already NaN by the time a check downstream of the clip
+            # can look at it -- the dump then describes the clip's damage instead
+            # of what backward produced.  With the flag the raise lands before
+            # any scaling.
+            try:
+                total_norm = float(nn.utils.clip_grad_norm_(
+                    model.parameters(), grad_clip, error_if_nonfinite=True))
+            except RuntimeError as exc:
                 halt_on_non_finite(
-                    'non-finite gradient norm', model=model, optimizer=optimizer,
+                    f'non-finite gradient norm: {exc}',
+                    model=model,
                     mic=spectral.inputs['microphone'], target=spectral.target,
                     epoch=epoch, batch_idx=batch_idx, global_step=global_step,
-                    loss_value=loss_value, total_norm=total_norm,
+                    loss_value=loss_value, total_norm='non-finite',
                     output_dir=output_dir, sr=sr, checkpoint=checkpoint_for_halt,
                     enhanced=output.enhanced,
                 )
             optimizer.step()
+            scheduler.step()
             if grad_log is not None:
                 grad_log.record(
                     total_norm, epoch=epoch, batch_idx=batch_idx,
@@ -202,10 +215,24 @@ def main(args):
     output_dir = cfg.get('training', 'output_dir', fallback='output')
     os.makedirs(output_dir, exist_ok=True)
     lr = cfg.getfloat('training', 'lr', fallback=1e-3)
+    min_lr = cfg.getfloat('training', 'min_lr', fallback=1e-6)
+    warmup_lr = cfg.getfloat('training', 'lr_warmup', fallback=1e-4)
+    warmup_ep = cfg.getint('training', 'warmup_epochs', fallback=3)
+    max_epochs = cfg.getint('training', 'max_epochs', fallback=100)
     weight_decay = cfg.getfloat('training', 'weight_decay', fallback=1e-4)
     amsgrad = cfg.getboolean('training', 'amsgrad', fallback=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr,
                                  weight_decay=weight_decay, amsgrad=amsgrad)
+    # Per-step linear warmup into cosine annealing.  This trainer previously had
+    # no scheduler at all: the lr stayed at its initial value for the whole run,
+    # so the late epochs kept taking early-epoch-sized steps and the weights
+    # never settled.  The LR trajectory is part of the comparison protocol --
+    # candidates trained over "the same 100 epochs" must be on the same one.
+    total_steps = max_epochs * len(train_loader)
+    warmup_steps = min(warmup_ep * len(train_loader), total_steps - 1)
+    scheduler = make_scheduler(
+        optimizer, warmup_steps, total_steps, lr, min_lr, warmup_lr,
+    )
 
     start_epoch, global_step, best_val = 0, 0, float('inf')
     if args.resume:
@@ -220,12 +247,15 @@ def main(args):
             start_epoch = ckpt['epoch'] + 1
             global_step = ckpt['global_step']
             best_val = ckpt.get('best_val', best_val)
+        # Rebuilt, never restored -- fast_forward_scheduler()'s docstring has
+        # the measured reason a stored T_max must not come back.
+        resumed_lr = fast_forward_scheduler(scheduler, global_step)
         print(f"Resumed from {args.resume} at epoch {start_epoch}"
-              f"{' (fresh optimizer)' if args.reset_optimizer else ''}")
+              f"{' (fresh optimizer)' if args.reset_optimizer else ''}"
+              f", lr={resumed_lr:.4e}")
 
     loss_cfg = cfg['loss'] if cfg.has_section('loss') else {
         'compression': '0.3', 'magnitude_weight': '1.0', 'complex_weight': '1.0'}
-    max_epochs = cfg.getint('training', 'max_epochs', fallback=100)
     patience = cfg.getint('training', 'early_stop_patience', fallback=15)
     grad_clip = cfg.getfloat('training', 'grad_clip', fallback=1.0)
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), aec_grid.sr)
@@ -242,7 +272,7 @@ def main(args):
             epoch=epoch, global_step=global_step, output_dir=output_dir,
             sr=aec_grid.sr, grad_clip=grad_clip,
             checkpoint_for_halt=checkpoint_for_halt, grad_log=grad_log,
-            max_epochs=max_epochs,
+            max_epochs=max_epochs, scheduler=scheduler,
         )
         msg = f"epoch {epoch}: train_loss={train_loss:.4f} ({time.time()-started:.0f}s)"
 

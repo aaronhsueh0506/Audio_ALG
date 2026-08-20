@@ -8,6 +8,7 @@ GTCRN 訓練腳本
 
 import argparse
 import configparser
+import math
 import os
 import sys
 
@@ -33,6 +34,14 @@ from dataset_gen import (  # noqa: E402
     set_seed,
     split_sizes,
     subsets_from_indices,
+)
+from training_common import (  # noqa: E402
+    GradNormLog,
+    NonFiniteTraining,
+    fast_forward_scheduler,
+    halt_on_non_finite,
+    make_scheduler,
+    scan_non_finite,
 )
 
 
@@ -137,6 +146,15 @@ def si_snr(pred, target, eps=1e-8):
     )
 
 
+#: Both magnitudes are floored at ``sqrt(SPEC_EPS)``, and the compressed
+#: magnitude term's derivative ``0.3 * m ** -0.7`` is largest exactly at that
+#: floor -- a prediction sitting there is where this objective's gradient gain
+#: peaks.  Handed to the batch dumper so a halt report can name the lane that
+#: was in that band instead of leaving it to be guessed.
+SPEC_EPS = 1e-12
+HAZARD_MAG = SPEC_EPS ** 0.5
+
+
 class HybridLoss(nn.Module):
     """
     Paper-faithful GTCRN loss (paper Eq. 1 with alpha=0.01, beta=0.3, scaled
@@ -164,8 +182,8 @@ class HybridLoss(nn.Module):
 
     def forward(self, pred_spec, true_spec):
         # pred_spec, true_spec: (B, F, T, 2)
-        pred_mag = torch.sqrt(pred_spec[..., 0] ** 2 + pred_spec[..., 1] ** 2 + 1e-12)
-        true_mag = torch.sqrt(true_spec[..., 0] ** 2 + true_spec[..., 1] ** 2 + 1e-12)
+        pred_mag = torch.sqrt(pred_spec[..., 0] ** 2 + pred_spec[..., 1] ** 2 + SPEC_EPS)
+        true_mag = torch.sqrt(true_spec[..., 0] ** 2 + true_spec[..., 1] ** 2 + SPEC_EPS)
 
         # Official GTCRN complex compression: S / |S|^0.7.
         pred_real_n = pred_spec[..., 0] / pred_mag.pow(0.7)
@@ -208,7 +226,9 @@ def train(args):
     batch_size   = cfg.getint('training', 'batch_size')
     lr           = cfg.getfloat('training', 'lr')
     min_lr       = cfg.getfloat('training', 'min_lr', fallback=1e-6)
-    lr_patience  = cfg.getint('training', 'lr_patience', fallback=5)
+    warmup_lr    = cfg.getfloat('training', 'lr_warmup', fallback=1e-4)
+    warmup_ep    = cfg.getint('training', 'warmup_epochs', fallback=3)
+    grad_clip    = cfg.getfloat('training', 'grad_clip', fallback=5.0)
     patience     = cfg.getint('training', 'early_stop_patience', fallback=20)
     epoch_size   = cfg.getint('training', 'epoch_size', fallback=0)
     mmap_block_size = cfg.getint('training', 'mmap_block_size', fallback=256)
@@ -301,14 +321,20 @@ def train(args):
         print(f"  mmap: block={mmap_block_size}, workers={train_workers}, "
               f"prefetch={prefetch_factor}, packed_dtype_preserved=True")
 
-    # GTCRN paper §3.2: "The models are trained by Adam Optimizer with an
-    # initial learning rate of 0.001.  The learning rate will be halved if the
-    # validation loss does not decrease for 5 consecutive epochs."
-    # This repo previously used AdamW(wd=0.05) + cosine-with-warmup, which is
-    # neither the paper's optimizer nor its schedule.
+    # The OPTIMIZER is the paper's (§3.2: Adam, initial lr 1e-3).  The SCHEDULE
+    # is deliberately not.  The paper halves the LR after 5 consecutive epochs
+    # without a decrease, and ReduceLROnPlateau implements that against the best
+    # epoch ever seen -- so one improved epoch resets the counter and the LR can
+    # sit at its initial value indefinitely.  Measured on a real run: 32 epochs,
+    # still 1e-3, never halved once.  Per-step warmup→cosine decays
+    # unconditionally.  It is also what the other AINR trainers use, and the LR
+    # trajectory is part of the bake-off protocol: two models compared over "the
+    # same 100 epochs" must not be on different schedules.
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, betas=(0.9, 0.999))
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=lr_patience, min_lr=min_lr,
+    total_steps = epochs * len(train_loader)
+    warmup_steps = min(warmup_ep * len(train_loader), total_steps - 1)
+    scheduler = make_scheduler(
+        optimizer, warmup_steps, total_steps, lr, min_lr, warmup_lr,
     )
     criterion = HybridLoss(n_fft=N_FFT, hop_len=HOP_LEN, win_len=WIN_LEN).to(device)
 
@@ -317,34 +343,74 @@ def train(args):
     os.makedirs(output_dir, exist_ok=True)
     best_val_loss = float('inf')
     start_epoch = 1
+    global_step = 0
     no_improve = 0
 
     if resume_ckpt is not None:
         model.load_state_dict(extract_state_dict(resume_ckpt, args.resume))
-        bad_weights = [name for name, value in model.state_dict().items()
-                       if torch.is_tensor(value) and not torch.isfinite(value).all()]
-        if bad_weights:
-            raise FloatingPointError(
-                f"checkpoint contains non-finite weights: {bad_weights[:5]}"
+        poisoned = scan_non_finite(model)
+        if poisoned:
+            raise NonFiniteTraining(
+                f"checkpoint contains non-finite weights: {poisoned[:5]}"
             )
         if 'optimizer' in resume_ckpt:
             optimizer.load_state_dict(resume_ckpt['optimizer'])
-        if 'scheduler' in resume_ckpt:
-            scheduler.load_state_dict(resume_ckpt['scheduler'])
         start_epoch = resume_ckpt.get('epoch', 0) + 1
+        global_step = resume_ckpt.get(
+            'global_step', (start_epoch - 1) * len(train_loader)
+        )
         best_val_loss = resume_ckpt.get('best_val_loss', float('inf'))
         # Without this, early stopping restarts its patience window on every
         # resume and can never fire.
         no_improve = resume_ckpt.get('no_improve', 0)
+        # Rebuilt, never restored -- fast_forward_scheduler()'s docstring has the
+        # measured reason.
+        resumed_lr = fast_forward_scheduler(scheduler, global_step)
         print(f"  Resumed epoch {start_epoch - 1}, best_val_loss={best_val_loss:.5f}, "
               f"no_improve={no_improve}")
+        print(f"  scheduler rebuilt for epochs={epochs} and fast-forwarded "
+              f"{global_step} steps (lr={resumed_lr:.4e})")
+
+    grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), SR,
+                           hazard_mag=HAZARD_MAG)
+
+    def make_halt_context(epoch):
+        """Assemble halt_on_non_finite's arguments -- called ONLY when halting.
+
+        The state_dict copies here are too expensive to build per batch, and the
+        halt path runs at most once per process.  Model and optimizer state is
+        still pre-step at every call site, so what it captures is uncontaminated.
+        """
+        def context(batch_idx, noisy, clean, enhanced):
+            return {
+                'model': model,
+                'noisy': noisy, 'clean': clean, 'enhanced': enhanced,
+                'epoch': epoch, 'batch_idx': batch_idx,
+                'global_step': global_step,
+                'output_dir': output_dir, 'sr': SR, 'hazard_mag': HAZARD_MAG,
+                'checkpoint': {
+                    'epoch': epoch - 1,
+                    'global_step': global_step,
+                    'state_dict': model.state_dict(),
+                    'optimizer': optimizer.state_dict(),
+                    'best_val_loss': best_val_loss,
+                    'no_improve': no_improve,
+                    'config': dict(cfg['signal']),
+                    'train_indices': train_set.indices,
+                    'val_indices': val_set.indices,
+                    'seed': args.seed,
+                    **contract,
+                },
+            }
+        return context
 
     for epoch in range(start_epoch, epochs + 1):
         # --- Train ---
+        halt_context = make_halt_context(epoch)
         model.train()
         train_loss = 0.0
         with tqdm.tqdm(train_loader, desc=f"Epoch {epoch}/{epochs}") as pbar:
-            for noisy, clean in pbar:
+            for batch_idx, (noisy, clean) in enumerate(pbar):
                 noisy = noisy.to(device=device, dtype=torch.float32,
                                  non_blocking=pin_memory)   # (B, T)
                 clean = clean.to(device=device, dtype=torch.float32,
@@ -364,24 +430,60 @@ def train(args):
                 # The loss ISTFTs both spectra itself (upstream loss.py:24-25).
                 loss = criterion(enhanced_spec, clean_spec)
                 loss_value = float(loss.detach())
-                if not torch.isfinite(loss).item():
-                    raise FloatingPointError(
-                        f"non-finite training loss at epoch={epoch}"
+                # A non-finite LOSS is a forward-side fault and diagnoses
+                # differently from a finite loss with an exploding gradient, so
+                # the two are checked separately and reported as such.
+                if not math.isfinite(loss_value):
+                    halt_on_non_finite(
+                        'loss is non-finite before backward '
+                        '(forward-side fault)',
+                        loss_value=loss_value, total_norm=None,
+                        **halt_context(batch_idx, noisy, clean,
+                                       criterion._istft(enhanced_spec.detach())),
                     )
 
                 optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), 5.0, error_if_nonfinite=True
-                )
+                # error_if_nonfinite=True is what stops clipping from CREATING
+                # the NaN.  Without it total_norm=inf gives
+                # clip_coef = grad_clip/(inf+1e-6) = 0.0, and inf*0.0 = NaN,
+                # which optimizer.step() writes into the weights AND into Adam's
+                # exp_avg/exp_avg_sq -- no later clean batch recovers from that.
+                # With the flag the raise happens BEFORE any scaling, so the
+                # gradients the dump reports are the ones backward produced.
+                try:
+                    total_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(), grad_clip, error_if_nonfinite=True,
+                    )
+                except RuntimeError as exc:
+                    halt_on_non_finite(
+                        f'non-finite gradient (backward-side fault): {exc}',
+                        loss_value=loss_value, total_norm='non-finite',
+                        **halt_context(batch_idx, noisy, clean,
+                                       criterion._istft(enhanced_spec.detach())),
+                    )
                 optimizer.step()
+                scheduler.step()
+
+                norm_value = float(total_norm)
+                # ``enhanced`` is omitted here on purpose: this model's
+                # prediction waveform is an ISTFT the loss computes and discards,
+                # and paying for it on every step to serve a rare spike dump is
+                # not worth it.  The halt path, which runs at most once, does pay.
+                grad_log.record(
+                    norm_value, epoch=epoch, batch_idx=batch_idx,
+                    global_step=global_step, loss_value=loss_value,
+                    noisy=noisy, clean=clean, output_dir=output_dir,
+                )
+                # After record(): the CSV row and a halt report must name the
+                # same step for the same batch.
+                global_step += 1
 
                 train_loss += loss_value
-                pbar.set_postfix(loss=f"{loss_value:.4f}")
+                pbar.set_postfix(loss=f"{loss_value:.4f}",
+                                 gn=f"{norm_value:.2f}")
 
         train_loss /= len(train_loader)
-        # ReduceLROnPlateau steps on the VALIDATION loss, so it is advanced
-        # after the validation pass below, not here.
 
         # --- Validate ---
         model.eval()
@@ -404,16 +506,18 @@ def train(args):
                 enhanced_spec = model(noisy_spec)
 
                 batch_val = float(criterion(enhanced_spec, clean_spec))
-                if not torch.isfinite(torch.tensor(batch_val)).item():
-                    raise FloatingPointError(
+                if not math.isfinite(batch_val):
+                    raise NonFiniteTraining(
                         f"non-finite validation loss at epoch={epoch}"
                     )
                 val_loss += batch_val
 
         val_loss /= len(val_loader)
+        # Read AFTER the epoch's steps, so the number printed is the LR the run
+        # is actually on.  Read before the step, every change showed up one
+        # epoch late in the log.
         lr_now = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch}: train={train_loss:.4f}  val={val_loss:.4f}  lr={lr_now:.2e}")
-        scheduler.step(val_loss)
 
         # Update the early-stopping counter BEFORE writing the checkpoint, so
         # the saved no_improve matches the state a resume needs to restore.
@@ -426,9 +530,11 @@ def train(args):
 
         ckpt = {
             'epoch': epoch,
+            'global_step': global_step,
             'state_dict': model.state_dict(),
             'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
+            # No 'scheduler': rebuilt from epochs/steps and fast-forwarded on
+            # resume, so a stored T_max cannot survive an epochs change.
             'best_val_loss': best_val_loss,
             'no_improve': no_improve,
             'config': dict(cfg['signal']),
@@ -438,12 +544,11 @@ def train(args):
             'seed': args.seed,
             **contract,
         }
-        bad_weights = [name for name, value in model.state_dict().items()
-                       if torch.is_tensor(value) and not torch.isfinite(value).all()]
-        if bad_weights:
-            raise FloatingPointError(
+        poisoned = scan_non_finite(model)
+        if poisoned:
+            raise NonFiniteTraining(
                 "refusing to overwrite a checkpoint with non-finite weights: "
-                f"{bad_weights[:5]}"
+                f"{poisoned[:5]}"
             )
         torch.save(ckpt, os.path.join(output_dir, 'gtcrn_last.pth'))
 
@@ -454,6 +559,7 @@ def train(args):
             print(f"Early stopping at epoch {epoch} (no improvement for {patience} epochs)")
             break
 
+    grad_log.close()
     print(f"Training done. Best val loss: {best_val_loss:.5f}")
 
 

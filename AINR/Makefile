@@ -27,12 +27,10 @@ BUILD_DIR := build
 SOURCES := tests/test_c_prepost.c \
 	DeepFilterNet2/dfn2_process.c \
 	DeepFilterNet2/dfn2_model_io.c \
-	DeepFilterNet3/dfn3_process.c \
 	GTCRN/gtcrn_process.c
 HEADERS := \
 	DeepFilterNet2/dfn2_process.h \
 	DeepFilterNet2/dfn2_model_io.h \
-	DeepFilterNet3/dfn3_process.h \
 	GTCRN/gtcrn_process.h
 TEST_BIN := $(BUILD_DIR)/test_c_prepost_simd$(SIMD)
 SCALAR_BIN := $(BUILD_DIR)/test_c_prepost_scalar

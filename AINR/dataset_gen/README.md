@@ -3,7 +3,7 @@
 Model-independent generator for (noisy, clean) speech-enhancement training
 pairs, living at `AINR/dataset_gen/`. Extracted from the RNNoise-ERB
 dataset-generation chain so one generator can serve multiple models:
-RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2/DeepFilterNet3 at 48 kHz.
+RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2 at 48 kHz.
 
 ## Purpose
 
@@ -22,8 +22,7 @@ and consume the output of this package.
 source paths, segment length, generation/resume controls, mixing, RIR, noise,
 and waveform augmentations. Model architecture, FFT/ERB feature parameters,
 optimizer, training schedule, and loss settings stay in the RNNoise-ERB,
-GTCRN, DeepFilterNet2, or DeepFilterNet3 model config that consumes the
-generated pairs.
+GTCRN, or DeepFilterNet2 model config that consumes the generated pairs.
 
 The optional `[gen] pass_size` limits how many shuffled speech files form one
 generation pass; it is not a training epoch. Omitting it or setting it to `0`
@@ -35,7 +34,7 @@ Each `gen_dataset.py` invocation generates exactly one dataset at the
 requested working rate (config.ini's `[signal] sr`, overridable with
 `--sample-rate`). **Native per-rate generation is the recommended standard
 flow**: run `gen_dataset.py --sample-rate 16000` for RNNoise-ERB/GTCRN and
-`gen_dataset.py --sample-rate 48000` for DeepFilterNet2/DeepFilterNet3, each
+`gen_dataset.py --sample-rate 48000` for DeepFilterNet2, each
 producing its own WAV pairs measured and mixed at the rate it will actually
 train on:
 
@@ -338,7 +337,7 @@ cp config.example.ini config.ini
 python3 gen_dataset.py --config config.ini --output data_16k --hours 25 \
     --sample-rate 16000
 
-# DeepFilterNet2 / DeepFilterNet3
+# DeepFilterNet2
 python3 gen_dataset.py --config config.ini --output data_48k --hours 25 \
     --sample-rate 48000
 ```
@@ -435,7 +434,7 @@ python3 pack_dataset.py \
     --target-sr 16000 --dtype float16
 ```
 
-Use `data_48k/packed.pt` for DeepFilterNet2/DeepFilterNet3 and
+Use `data_48k/packed.pt` for DeepFilterNet2 and
 `data_16k/packed.pt` for RNNoise-ERB/GTCRN. Omitting `--target-sr` packs at
 the source WAVs' own rate and requires every input file to already share one
 native rate. `--target-sr` resamples everything to one output rate, so mixed
@@ -535,8 +534,7 @@ tqdm
 ## Consumers
 
 `../RNNoise-ERB/train.py` imports the shared `PackedDataset` from this package;
-DeepFilterNet2 and DeepFilterNet3 consume the corresponding 48 kHz packed
-dataset. Model directories do not keep private copies of the augmentation
-engine. The two DFN branches use different model/checkpoint contracts, but
-they do not require different waveform pairs merely because their output
-composition differs.
+DeepFilterNet2 consumes the corresponding 48 kHz packed dataset. Model
+directories do not keep private copies of the augmentation engine. A model's
+own checkpoint contract does not require different waveform pairs merely
+because its output composition differs.

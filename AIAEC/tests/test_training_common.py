@@ -659,3 +659,132 @@ def test_split_dataset_by_sample_rejects_out_of_range_fraction():
     dataset = _FakeDataset([1] * 3)
     with pytest.raises(ValueError, match='val_fraction'):
         split_dataset_by_sample(dataset, val_fraction=1.0, seed=1)
+
+
+AIAEC_TRAINER_SOURCES = [
+    pathlib.Path(training_common.__file__).parent / name / 'train.py'
+    for name in sorted(MODEL_TASKS)
+]
+
+
+def test_clipping_a_nonfinite_norm_without_the_flag_creates_the_nan():
+    """Why ``error_if_nonfinite=True`` is not optional in any trainer.
+
+    ⚠ Written so it can FAIL.  If clip_grad_norm_ ever stopped scaling by
+    ``max_norm / (total_norm + eps)``, the unflagged branch would leave the
+    gradient finite and the first assertion would say so, instead of this test
+    passing while proving nothing.
+    """
+    exploded = torch.nn.Parameter(torch.zeros(2))
+    exploded.grad = torch.tensor([float('inf'), 1.0])
+    total = torch.nn.utils.clip_grad_norm_([exploded], 1.0)
+    # clip_coef = 1.0 / (inf + 1e-6) = 0.0, and inf * 0.0 = NaN.  optimizer.step()
+    # would write that into the weights AND into Adam's moments.
+    assert torch.isinf(total)
+    assert torch.isnan(exploded.grad).any(), exploded.grad.tolist()
+
+    guarded = torch.nn.Parameter(torch.zeros(2))
+    guarded.grad = torch.tensor([float('inf'), 1.0])
+    with pytest.raises(RuntimeError):
+        torch.nn.utils.clip_grad_norm_([guarded], 1.0, error_if_nonfinite=True)
+    # Untouched: the raise lands before any scaling, so a halt dump describes
+    # what backward produced rather than what the clip did to it.
+    assert not torch.isnan(guarded.grad).any(), guarded.grad.tolist()
+    assert guarded.grad.tolist() == [float('inf'), 1.0]
+
+
+@pytest.mark.parametrize('source_path', AIAEC_TRAINER_SOURCES,
+                         ids=lambda p: p.parent.name)
+def test_all_trainers_halt_instead_of_clipping_a_nonfinite_norm(source_path):
+    source = source_path.read_text(encoding='utf-8')
+    assert 'error_if_nonfinite=True' in source
+    assert 'halt_on_non_finite(' in source
+    assert 'GradNormLog(' in source
+
+
+@pytest.mark.parametrize('source_path', AIAEC_TRAINER_SOURCES,
+                         ids=lambda p: p.parent.name)
+def test_all_trainers_step_a_schedule_they_rebuild_on_resume(source_path):
+    """A constant LR was this family's actual state: no scheduler at all."""
+    source = source_path.read_text(encoding='utf-8')
+    assert 'make_scheduler(' in source
+    assert 'scheduler.step()' in source
+    assert 'fast_forward_scheduler(' in source
+    assert 'scheduler.load_state_dict' not in source
+
+
+def test_the_shared_schedule_actually_reaches_min_lr():
+    param = torch.nn.Parameter(torch.zeros(1))
+    opt = torch.optim.Adam([param], lr=1e-3)
+    sched = training_common.make_scheduler(opt, 30, 300, 1e-3, 1e-6, 1e-4)
+
+    seen = []
+    for _ in range(300):
+        seen.append(opt.param_groups[0]['lr'])
+        sched.step()
+
+    assert seen[0] == pytest.approx(1e-4)          # warmup starts low
+    assert seen[30] == pytest.approx(1e-3)         # and reaches the base lr
+    assert seen[-1] == pytest.approx(1e-6, rel=0.05)
+    assert len(set(seen)) > 100, 'a constant LR would collapse to one value'
+
+
+class _StopAfterSetup(Exception):
+    """Sentinel: main() reached its first epoch, so setup completed."""
+
+
+@pytest.mark.parametrize('model_name', sorted(MODEL_TASKS))
+def test_main_builds_its_schedule_before_the_first_epoch(
+        model_name, monkeypatch, tmp_path):
+    """Run main() through model, optimizer and scheduler construction.
+
+    ⚠ Written because the source-text assertions above CANNOT see this class of
+    defect. All four trainers once read ``max_epochs`` to size the cosine period
+    on a line ABOVE the one that assigns it -- an UnboundLocalError on the very
+    first run -- while every `'make_scheduler(' in source` assertion still
+    passed. Nothing short of executing the setup path catches that.
+
+    The dataset and the epoch loop are stubbed; everything between them is the
+    trainer's real code reading its real shipped config.ini.
+    """
+    trainer = importlib.import_module(f'AIAEC.{model_name}.train')
+    linear = make_linear_aec_contract(16000, frame_size=512)
+
+    class FakePackedDataset:
+        def __init__(self, path, expected_sr=None, mmap=False):
+            self.linear_aec_contract = linear
+            self.linear_aec_contract_hash = linear.fingerprint()
+
+        def __len__(self):
+            return 8
+
+        def __getitem__(self, index):
+            return torch.zeros(5, 16000), {}
+
+        def fingerprint(self):
+            return 'fake-corpus'
+
+    seen = {}
+
+    def fake_run_epoch(*args, **kwargs):
+        seen['scheduler'] = kwargs.get('scheduler')
+        raise _StopAfterSetup
+
+    monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
+    monkeypatch.setattr(trainer, 'run_epoch', fake_run_epoch)
+    monkeypatch.chdir(tmp_path)
+
+    config = pathlib.Path(training_common.__file__).parent / model_name / 'config.ini'
+    args = trainer.build_parser().parse_args(
+        ['--config', str(config), '--packed-dir', 'fake', '--device', 'cpu']
+    )
+    with pytest.raises(_StopAfterSetup):
+        trainer.main(args)
+
+    scheduler = seen['scheduler']
+    assert scheduler is not None, 'run_epoch was called without a scheduler'
+    # A schedule that never moves is the state this whole contract replaced.
+    before = scheduler.optimizer.param_groups[0]['lr']
+    for _ in range(64):
+        scheduler.step()
+    assert scheduler.optimizer.param_groups[0]['lr'] != before

@@ -19,9 +19,12 @@ Provided here:
   ``require_checkpoint_contract``             -- reject a checkpoint whose grid,
   task, model kwargs or loss version differ from the running config
 * ``scan_non_finite`` / ``NonFiniteTraining`` / ``GradNormLog`` /
-  ``halt_on_non_finite``                      -- the NaN-halt machinery
-  DeepFilterNet2's alignment pass built is reused via
-  ``AINR.DeepFilterNet2.train``, not reimplemented a second time
+  ``halt_on_non_finite``                      -- the NaN-halt machinery is
+  re-exported from ``AINR.training_common``, not reimplemented a second time
+* ``make_scheduler`` / ``fast_forward_scheduler`` -- likewise: linear warmup into
+  cosine annealing, stepped per optimizer step.  The LR trajectory is part of
+  the comparison protocol, so four candidates trained over "the same 100 epochs"
+  must be on the same schedule, and a constant LR is not one
 * ``compressed_spectral_loss``                -- none of the four candidates'
   papers publish a loss (see ``docs/ai_aec_candidate_matrix.md`` and the
   DeepVQE_S/CAGCRN READMEs' "did not publish ... loss details"); this is the
@@ -61,11 +64,15 @@ for _path in (_AUDIO_ALG_ROOT, _LIB_AEC_PYTHON):
         sys.path.insert(0, _path)
 
 from AINR.dataset_gen import set_seed, subsets_from_indices  # noqa: E402
-from AINR.DeepFilterNet2.train import (  # noqa: E402
+# The NaN-halt machinery and the LR schedule factory are AINR's shared trainer
+# module, not any one trainer's -- importing a MODEL to borrow infrastructure
+# meant a DeepFilterNet2 edit could break every AIAEC trainer.
+from AINR.training_common import (  # noqa: E402
     GradNormLog,
     NonFiniteTraining,
-    dump_batch as _dump_batch,
+    fast_forward_scheduler,
     halt_on_non_finite as _halt_on_non_finite,
+    make_scheduler,
     scan_non_finite,
 )
 
@@ -115,6 +122,8 @@ __all__ = [
     'halt_on_non_finite',
     'compressed_spectral_loss',
     'LinearAecEngine',
+    'make_scheduler',
+    'fast_forward_scheduler',
 ]
 
 
@@ -576,11 +585,11 @@ def compressed_spectral_loss(estimate: Tensor, target: Tensor, *,
 # NaN-halt machinery (thin AEC-flavoured wrapper; see the docstring above)
 # ============================================================
 
-def halt_on_non_finite(reason: str, *, model, optimizer, mic: Tensor, target: Tensor,
+def halt_on_non_finite(reason: str, *, model, mic: Tensor, target: Tensor,
                        epoch: int, batch_idx: int, global_step: int,
                        loss_value: float, total_norm: float, output_dir: str,
                        sr: int, checkpoint: Dict, enhanced: Optional[Tensor] = None) -> None:
-    """Dump evidence and raise, delegating to DeepFilterNet2's implementation.
+    """Dump evidence and raise, delegating to ``AINR.training_common``.
 
     ``mic``/``target`` are whatever the caller's loss operates on -- for every
     AIAEC trainer that is a COMPLEX SPECTRUM, not a waveform, because
@@ -592,11 +601,9 @@ def halt_on_non_finite(reason: str, *, model, optimizer, mic: Tensor, target: Te
     through for a real audio dump is a straightforward follow-up, not done
     here to avoid a seventh per-trainer plumbing path.
 
-    No trainer here has a scheduler (see each train.py's own note on why);
-    ``scheduler=None`` is passed through unconditionally.
     """
     _halt_on_non_finite(
-        reason, model=model, optimizer=optimizer, scheduler=None,
+        reason, model=model,
         noisy=mic, clean=target, epoch=epoch, batch_idx=batch_idx,
         global_step=global_step, loss_value=loss_value, total_norm=total_norm,
         output_dir=output_dir, sr=sr, checkpoint=checkpoint, enhanced=enhanced,

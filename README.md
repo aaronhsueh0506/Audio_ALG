@@ -28,11 +28,9 @@ pipeline.
 | `RNNoise-ERB` | 16 kHz / 512 / 512 / 256 | ERB-band recurrent mask |
 | `GTCRN` | 16 kHz / 512 / 512 / 256 | GTCRN complex enhancement |
 | `DeepFilterNet2` | 48 kHz / 1024 / 1024 / 512 | full-band ERB mask → low-band DF → learned-alpha residual mix |
-| `DeepFilterNet3` | 48 kHz / 1024 / 1024 / 512 | low-band DF and high-band ERB mask in a parallel band split |
 
-DFN2 and DFN3 intentionally share most features and training code but have
-different output graphs and different `MODEL_VERSION` values. Their
-checkpoints are not interchangeable.
+Each model carries its own feature contract and `MODEL_VERSION`; checkpoints
+are not interchangeable between them.
 
 ### Neural AEC candidates
 

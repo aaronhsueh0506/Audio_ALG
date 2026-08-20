@@ -7,7 +7,6 @@
 
 #include "DeepFilterNet2/dfn2_process.h"
 #include "DeepFilterNet2/dfn2_model_io.h"
-#include "DeepFilterNet3/dfn3_process.h"
 #include "GTCRN/gtcrn_process.h"
 
 #define CHECK(condition, message) do {                                      \
@@ -110,33 +109,22 @@ static void dfn_test_build_erb(void)
 static int test_dfn_stream_alignment(void)
 {
     static DFN2State dfn2;
-    static DFN3State dfn3;
     float spec2_re[DFN2_N_BINS], spec2_im[DFN2_N_BINS];
-    float spec3_re[DFN3_N_BINS], spec3_im[DFN3_N_BINS];
     float out2_re[DFN2_N_BINS], out2_im[DFN2_N_BINS];
-    float out3_re[DFN3_N_BINS], out3_im[DFN3_N_BINS];
-    float mask2[DFN2_N_ERB] = {0}, mask3[DFN3_N_ERB] = {0};
+    float mask2[DFN2_N_ERB] = {0};
     float coef2[DFN2_DF_BINS][DFN2_DF_ORDER][2] = {{{0}}};
-    float coef3[DFN3_DF_BINS][DFN3_DF_ORDER][2] = {{{0}}};
     long long output_frame = -1;
 
     dfn_test_build_erb();
     {
         static FftHandle* fft2;
-        static FftHandle* fft3;
         if (!fft2) fft2 = fft_create(DFN2_N_FFT);
-        if (!fft3) fft3 = fft_create(DFN3_N_FFT);
         dfn2_state_init(&dfn2, fft2);
-        dfn3_state_init(&dfn3, fft3);
     }
     dfn2_set_erb_matrices(&dfn2, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
-    dfn3_set_erb_matrices(&dfn3, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int k = 0; k < DFN2_DF_BINS; ++k)
         for (int tap = 0; tap < DFN2_DF_ORDER; ++tap)
             coef2[k][tap][0] = stream_tap(tap);
-    for (int k = 0; k < DFN3_DF_BINS; ++k)
-        for (int tap = 0; tap < DFN3_DF_ORDER; ++tap)
-            coef3[k][tap][0] = stream_tap(tap);
 
     memset(spec2_re, 0, sizeof(spec2_re));
     memset(spec2_im, 0, sizeof(spec2_im));
@@ -197,53 +185,6 @@ static int test_dfn_stream_alignment(void)
                     CHECK(fabsf(out2_re[k] - expected_re) < 3e-6f &&
                           fabsf(out2_im[k] - expected_im) < 3e-6f,
                           "DFN2 heads align with their cascade spectra");
-                }
-            }
-        }
-    }
-
-    for (int wall = 0; wall < 14; ++wall) {
-        int expected_target = wall - DFN3_MASK_LOOKAHEAD;
-        for (int k = 0; k < DFN3_N_BINS; ++k) {
-            spec3_re[k] = stream_spec_re(wall, k);
-            spec3_im[k] = stream_spec_im(wall, k);
-        }
-        if (expected_target >= 0)
-            for (int b = 0; b < DFN3_N_ERB; ++b)
-                mask3[b] = stream_mask(expected_target);
-        {
-            int valid = dfn3_compose_stream(
-                &dfn3, spec3_re, spec3_im, expected_target >= 0,
-                expected_target >= 0 ? mask3 : NULL,
-                expected_target >= 0 ? &coef3[0][0][0] : NULL,
-                0.0f, out3_re, out3_im, &output_frame);
-            CHECK(valid == (expected_target >= 0),
-                  "DFN3 warmup equals parallel-branch lookahead");
-            if (valid == 1) {
-                CHECK(output_frame == expected_target,
-                      "DFN3 reports the delayed target frame");
-                for (int k = 0; k < DFN3_N_BINS; ++k) {
-                    float expected_re = 0.0f;
-                    float expected_im = 0.0f;
-                    if (k < DFN3_DF_BINS) {
-                        for (int tap = 0; tap < DFN3_DF_ORDER; ++tap) {
-                            int source = expected_target - DFN3_DF_HISTORY + tap;
-                            if (source >= 0) {
-                                expected_re += stream_spec_re(source, k) *
-                                               stream_tap(tap);
-                                expected_im += stream_spec_im(source, k) *
-                                               stream_tap(tap);
-                            }
-                        }
-                    } else {
-                        expected_re = stream_spec_re(expected_target, k) *
-                                      stream_mask(expected_target);
-                        expected_im = stream_spec_im(expected_target, k) *
-                                      stream_mask(expected_target);
-                    }
-                    CHECK(fabsf(out3_re[k] - expected_re) < 3e-6f &&
-                          fabsf(out3_im[k] - expected_im) < 3e-6f,
-                          "DFN3 heads align with their parallel spectra");
                 }
             }
         }
@@ -389,63 +330,6 @@ static int test_dfn2(uint64_t* digest)
     }
     CHECK(max_spectral_error < 2e-6f,
           "DFN2 lookahead ring returns the target spectrum");
-    return 1;
-}
-
-static int test_dfn3(uint64_t* digest)
-{
-    static DFN3State state;
-    float input[DFN3_HOP_LEN];
-    float spec_re[DFN3_N_BINS], spec_im[DFN3_N_BINS];
-    float previous_re[DFN3_N_BINS] = {0}, previous_im[DFN3_N_BINS] = {0};
-    float enhanced_re[DFN3_N_BINS], enhanced_im[DFN3_N_BINS];
-    float output[DFN3_HOP_LEN];
-    float erb[DFN3_N_ERB], feature_spec[2 * DFN3_DF_BINS];
-    float mask[DFN3_N_ERB];
-    float coefs[DFN3_DF_BINS][DFN3_DF_ORDER][2] = {{{0}}};
-    float max_spectral_error = 0.0f;
-
-    dfn_test_build_erb();
-    {
-        static FftHandle* fft_handle;
-        if (!fft_handle) fft_handle = fft_create(DFN3_N_FFT);
-        dfn3_state_init(&state, fft_handle);
-    }
-    dfn3_set_erb_matrices(&state, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
-    for (int b = 0; b < DFN3_N_ERB; ++b) mask[b] = 1.0f;
-    for (int k = 0; k < DFN3_DF_BINS; ++k)
-        coefs[k][DFN3_DF_HISTORY][0] = 1.0f;
-
-    for (int frame = 0; frame < 24; ++frame) {
-        for (int i = 0; i < DFN3_HOP_LEN; ++i)
-            input[i] = signal_sample((int64_t)frame * DFN3_HOP_LEN + i,
-                                     DFN3_SR);
-        dfn3_analysis(&state, input, spec_re, spec_im);
-        dfn3_compute_features(&state, spec_re, spec_im, erb, feature_spec);
-        CHECK(all_finite(erb, DFN3_N_ERB), "DFN3 finite ERB features");
-        CHECK(all_finite(feature_spec, 2 * DFN3_DF_BINS),
-              "DFN3 finite complex features");
-        if (dfn3_compose(&state, spec_re, spec_im, mask,
-                         &coefs[0][0][0], enhanced_re, enhanced_im)) {
-            for (int k = 0; k < DFN3_N_BINS; ++k) {
-                float er = fabsf(enhanced_re[k] - previous_re[k]);
-                float ei = fabsf(enhanced_im[k] - previous_im[k]);
-                if (er > max_spectral_error) max_spectral_error = er;
-                if (ei > max_spectral_error) max_spectral_error = ei;
-            }
-            dfn3_apply_atten_lim(previous_re, previous_im,
-                                 enhanced_re, enhanced_im, -100.0f);
-            dfn3_synthesis(&state, enhanced_re, enhanced_im, output);
-            CHECK(all_finite(output, DFN3_HOP_LEN), "DFN3 finite WOLA output");
-            *digest = hash_bytes(*digest, erb, sizeof(erb));
-            *digest = hash_bytes(*digest, feature_spec, sizeof(feature_spec));
-            *digest = hash_bytes(*digest, output, sizeof(output));
-        }
-        memcpy(previous_re, spec_re, sizeof(spec_re));
-        memcpy(previous_im, spec_im, sizeof(spec_im));
-    }
-    CHECK(max_spectral_error < 2e-6f,
-          "DFN3 lookahead ring returns the target spectrum");
     return 1;
 }
 
@@ -626,11 +510,10 @@ static int run_all_tests(void)
     CHECK(test_dfn2_model_io(), "DFN2 stateless model I/O");
     CHECK(test_dfn_stream_alignment(), "DFN streaming head alignment");
     CHECK(test_dfn2(&digest), "DFN2 C pre/post");
-    CHECK(test_dfn3(&digest), "DFN3 C pre/post");
     CHECK(test_gtcrn_model_state(), "GTCRN stateless model I/O");
     CHECK(test_gtcrn(&digest), "GTCRN C pre/post");
-    printf("backend=%s/%s/%s digest=%016llx\n",
-           dfn2_simd_backend(), dfn3_simd_backend(), gtcrn_simd_backend(),
+    printf("backend=%s/%s digest=%016llx\n",
+           dfn2_simd_backend(), gtcrn_simd_backend(),
            (unsigned long long)digest);
     return 1;
 }

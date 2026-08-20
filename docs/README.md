@@ -17,7 +17,6 @@ README.
 | Four-channel C/Python AEC / external beamformer seam | [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md) |
 | Standalone AINR models | [`../AINR/README.md`](../AINR/README.md) |
 | DFN2 cascade/alpha contract | [`../AINR/DeepFilterNet2/README.md`](../AINR/DeepFilterNet2/README.md) |
-| DFN3 band-split contract | [`../AINR/DeepFilterNet3/README.md`](../AINR/DeepFilterNet3/README.md) |
 | Neural AEC candidates | [`../AIAEC/README.md`](../AIAEC/README.md) |
 | AIAEC candidate decision matrix | [`ai_aec_candidate_matrix.md`](ai_aec_candidate_matrix.md) |
 | PBFDKF + Align-ULCNet embedded streaming proposal | [`align_ulcnet_embedded_streaming_design_zh_TW.md`](align_ulcnet_embedded_streaming_design_zh_TW.md) |

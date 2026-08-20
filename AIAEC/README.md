@@ -71,6 +71,19 @@ linear-AEC residual. Normal inference advances the checkpoint-matched PBFDKF
 one hop at a time and feeds its formed error plus consumed aligned far to the
 model; PBFDKF is not precomputed over the whole WAV.
 
+## Training contract
+
+Identical to the NR side and defined in the same place: one shared
+`AINR/training_common.py`, re-exported through `AIAEC/training_common.py` and
+imported by all four candidate trainers. Per-step linear warmup into cosine
+annealing, a scheduler rebuilt rather than restored on resume, and a non-finite
+halt that dumps the offending batch instead of raising bare.
+
+**The full contract, with the measurements behind each rule, is in
+[../AINR/README.md](../AINR/README.md) under "Training contract" — it is written
+once so the two model families cannot drift apart on it.** The config keys are
+`lr`, `min_lr`, `lr_warmup`, `warmup_epochs`, `grad_clip`.
+
 ## ONNX export and calibration
 
 The accelerator graphs are stateless: convolution history, attention rings

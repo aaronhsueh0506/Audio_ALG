@@ -49,7 +49,6 @@ from train import (  # noqa: E402
     read_loss_config,
     read_model_config,
     require_checkpoint_contract,
-    scan_non_finite,
     validate_signal_config,
 )
 from export_onnx import (  # noqa: E402
@@ -627,61 +626,6 @@ def test_model_to_loss_backward_is_finite_on_a_silent_target():
     assert grads, 'no parameter received a gradient'
     for grad in grads:
         assert torch.isfinite(grad).all()
-
-
-def test_non_finite_gradient_is_refused_before_it_touches_the_model():
-    """error_if_nonfinite must raise BEFORE clipping scales anything.
-
-    Without the flag, total_norm=inf gives clip_coef=1/(inf+1e-6)=0 and inf*0
-    becomes NaN, which the next step writes into the weights and into Adam's
-    moments -- unrecoverable.  This asserts the ordering, not just that an
-    exception appears: after the raise, gradients and weights are untouched.
-    """
-    model = torch.nn.Linear(4, 1)
-    before = [p.detach().clone() for p in model.parameters()]
-    (model(torch.ones(1, 4)).sum() * float('inf')).backward()
-
-    with pytest.raises(RuntimeError):
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(), 1.0, error_if_nonfinite=True
-        )
-
-    assert any(not torch.isfinite(p.grad).all() for p in model.parameters()), (
-        'gradients were modified; the raise must happen before scaling'
-    )
-    for param, original in zip(model.parameters(), before):
-        assert torch.equal(param.detach(), original)
-    assert scan_non_finite(model) == []
-
-
-def test_scan_non_finite_excludes_buffers_by_default():
-    """⚠ Buffers must be OFF by default, and that default is load-bearing.
-
-    BatchNorm writes running_mean/running_var during forward() in train mode, so a
-    forward-side fault poisons every BN buffer before the loss exists.  Including
-    them made the halt report claim "an earlier step already wrote NaN into the
-    weights" at global step 0 -- the opposite of the truth -- and put non-finite
-    buffers into the checkpoint it told the operator to resume from, which the
-    resume guard then rejected.
-    """
-    model = torch.nn.Sequential(torch.nn.Linear(3, 2), torch.nn.BatchNorm1d(2))
-    assert scan_non_finite(model) == []
-
-    with torch.no_grad():
-        model[1].running_mean[0] = float('nan')
-    assert scan_non_finite(model) == [], (
-        'a poisoned BN buffer must NOT register as a poisoned parameter'
-    )
-    with_buffers = scan_non_finite(model, include_buffers=True)
-    assert [row[0] for row in with_buffers] == ['1.running_mean']
-
-    with torch.no_grad():
-        model[0].weight[0, 0] = float('inf')
-    params_only = scan_non_finite(model)
-    assert [row[0] for row in params_only] == ['0.weight']
-    assert params_only[0][1:3] == (0, 1)
-
-
 def test_lookahead_relation_is_enforced_in_the_model_constructor():
     """df_lookahead > mask_lookahead must be rejected at the single source.
 
@@ -901,11 +845,11 @@ def test_emb_num_layers_one_fails_loudly_instead_of_building_two():
     assert len(gru_layers) == 5
 
 
-def test_runtime_erb_bins_match_both_models(tmp_path):
-    """The exported .bin matrices equal DFN2's AND DFN3's frozen buffers.
+def test_runtime_erb_bins_match_the_model(tmp_path):
+    """The exported .bin matrices equal DFN2's frozen buffers.
 
-    The C host consumes caller-loaded pointers in these exact layouts; both
-    DF models share one filterbank, so one pair of files must serve both.
+    The C host consumes caller-loaded pointers in these exact layouts, so the
+    exported pair must reproduce the model's own filterbank bit for bit.
     """
     import sys as _sys
     for stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx',
@@ -929,24 +873,3 @@ def test_runtime_erb_bins_match_both_models(tmp_path):
         ref_inv = ref_inv.T
     assert np.array_equal(fwd, ref_fwd)
     assert np.array_equal(inv, ref_inv)
-
-    import importlib
-    for stale in ('train', 'inference', 'model', 'export_onnx'):
-        sys.modules.pop(stale, None)
-    dfn3_root = os.path.join(os.path.dirname(ROOT), 'DeepFilterNet3')
-    _sys.path.insert(0, dfn3_root)
-    try:
-        dfn3_model_mod = importlib.import_module('model')
-        dfn3_train = importlib.import_module('train')
-        cfg3 = configparser.ConfigParser()
-        assert cfg3.read(os.path.join(dfn3_root, 'config.ini'))
-        dfn3 = dfn3_model_mod.DeepFilterNet3(
-            **dfn3_train.read_model_config(cfg3))
-        fwd3 = dfn3.erb_fb.detach().numpy().astype(np.float32)
-        if fwd3.shape[0] < fwd3.shape[1]:
-            fwd3 = fwd3.T
-        assert np.array_equal(fwd, fwd3)
-    finally:
-        _sys.path.remove(dfn3_root)
-        for stale in ('train', 'inference', 'model', 'export_onnx'):
-            sys.modules.pop(stale, None)

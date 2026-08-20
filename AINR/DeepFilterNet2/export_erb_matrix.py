@@ -38,9 +38,8 @@ def write_runtime_bins(config_path, out_dir):
     Raw float32 little-endian in exactly the layouts df_common consumes:
     erb_fwd.bin bin-major [n_bins][n_erb], erb_inv.bin band-major
     [n_erb][n_bins], plus erb_matrices.json. The library takes pointers only
-    (dfn2_set_erb_matrices / dfn3_set_erb_matrices), so the deployment
-    loader owns the files and can swap them at any time. DFN2 and DFN3
-    share the filterbank; the contract test pins both models' buffers
+    (dfn2_set_erb_matrices), so the deployment loader owns the files and can
+    swap them at any time. The contract test pins the model's own buffers
     against these files.
     """
     import configparser as _configparser

@@ -39,9 +39,9 @@ Current model version:
 dfn2_fmajor_pathway_cascade_alpha_no_lsnr_v6
 ```
 
-The feature version remains shared with the preserved DFN3 branch, but the
-model version does not. Old v5 band-split checkpoints belong in
-`../DeepFilterNet3/` and must not be renamed or force-loaded here.
+The feature version is unchanged from the earlier v5 band-split lineage, but
+the model version is not. Old v5 band-split checkpoints must not be renamed or
+force-loaded here.
 
 `train.py --resume` and `inference.py --model` validate the serialized signal,
 feature, and model contract before loading.
@@ -123,12 +123,11 @@ Check these in order:
 1. confirm the checkpoint reports the v6 cascade/alpha model version;
 2. log ERB mask, alpha, and low-band DF output separately;
 3. compare speech-only, noise-only, and steady low-frequency-noise cohorts;
-4. verify error/far or clip-to-clip EMA state is not shared or leaked;
-5. compare the same 48 kHz dataset against the DFN3 branch.
+4. verify error/far or clip-to-clip EMA state is not shared or leaked.
 
 If the ERB-masked low band is healthy but the alpha-composed output collapses,
-the issue is in the DF/alpha path rather than the shared dataset. If both
-branches fail on the same cohorts, audit low-frequency corpus coverage,
+the issue is in the DF/alpha path rather than the shared dataset. If the
+ERB-masked low band is already collapsed, audit low-frequency corpus coverage,
 speech-only sampling, SNR distribution, and target contamination.
 
 The full upstream-alignment and training-stability record is in
