@@ -19,14 +19,16 @@ application 依 descriptor 配置（移除手寫 D=8）、各產品 route 的 n 
 量測。FIXED 首次由 raw ring-fill 切到 aligned far 的 reset 已在兩個 wrapper
 補齊；4ch 的 solid 時序亦已與實際可讀 hop 對齊。
 
-**既有 ONNX/JSON 必須全部重新匯出。** model-I/O layout 由 v2 進到 v3，
-deployed far branch 由 RAW 改為 ALIGNED，因此本次改動之前產出的每一份
-descriptor 在 `ulcnet_model_io_descriptor_validate()` 會同時卡在兩個欄位
-（`layout_version` 與 `far_input_mode`），`ulcnet_accelerator_adapter_init()`
-直接回 NULL。補救動作只有重新匯出 graph 一項：checkpoint 與 dataset
-都**不需要**重新訓練或重新生成——權重未變，exporter 會把 checkpoint 原本的
-training `far_input_mode` 與固定的 aligned-far deployment 值分開寫入，兩者
-不需一致。
+**既有 ONNX/JSON 必須全部重新匯出。** model-I/O layout 現為 **v5**（v3 把
+deployed far branch 由 RAW 改為 ALIGNED，v4 更名 tensor，v5 把固定前後端搬到
+host），因此更早產出的每一份 descriptor 在
+`ulcnet_model_io_descriptor_validate()` 會卡在 `layout_version`（v3 之前另外
+卡 `far_input_mode`），`ulcnet_accelerator_adapter_init()` 直接回 NULL。
+補救動作只有重新匯出 graph 一項：checkpoint 與 dataset 都**不需要**重新訓練
+或重新生成——權重未變，exporter 會把 checkpoint 原本的 training
+`far_input_mode` 與固定的 aligned-far deployment 值分開寫入，兩者不需一致。
+版號 4、6、7 已被另外三對 graph boundary 佔用（見 §10.2），不是空號；
+`ULCNET_MODEL_IO_LAYOUT_VERSION` 下一次真正 bump 要跳到 8。
 
 本文件供實作者評估如何將現有 PBFDKF + Align-ULCNet 路徑放到記憶體與
 算力受限的 embedded system。產品測試一律使用本專案 PBFDKF 的 linear
@@ -673,6 +675,37 @@ history input，多數版端 runtime 無法穩定支援，只保留為 Python �
 magnitude、壓縮域相位 cos/sin 由 `ulcnet_model_io_prepare()` 內算，逆冪由
 `ulcnet_model_io_commit()` 內做；graph 只綁五個特徵輸入，各自持 PTQ scale。
 
+下面兩張表是**出貨的 `host`/`split` 這一對 boundary**。boundary 實際上是一對
+互相獨立的開關，version 屬於這一對而不屬於任何一半；四種組合列在
+`export_onnx.py` 的 `LAYOUT_VERSIONS`：
+
+| `--feature-layout` | `--gru-state-layout` | version | signal inputs | graph inputs | 狀態 |
+|---|---|---:|---|---:|---|
+| `host`（預設） | `split`（預設） | 5 | `error_mag`/`far_mag`/`error_cos`/`error_sin`/`error_ri` | 10 | 出貨合約；`ulcnet_model_io.h` 只綁這一對 |
+| `host` | `combined` | 6 | 同上五個 | 9 | 實驗用 |
+| `graph` | `split` | 4 | `error`/`far`（raw RI，各 `[1,1,257,2]`） | 7 | 實驗用；即 v4 當時的 boundary |
+| `graph` | `combined` | 7 | 同上兩個 | 6 | 實驗用 |
+
+- `--feature-layout=graph` 把上一段那份固定數學搬回 graph 內，graph 改綁兩個
+  raw RI 頻譜，host 端不需要前後端。代價是 `sqrt`/`atan2`/`pow` 進了量化域，
+  且 `error_cos`/`error_sin` 共用編譯器替它們推出的同一個 scale；實測多出
+  `Sign`×6、`Abs`×6、`Pow`×6、`Sqrt`×2、`Atan`/`Cos`/`Sin` 各 1（另有隨之
+  增加的 elementwise 與索引節點），經 onnxoptimizer + 常數摺疊後節點數
+  121 → 177。它重現的正是 v4 的 boundary，所以沿用 4 而不是替同一份合約再
+  發一個號碼。
+- `--gru-state-layout=combined` 把 `h_gru0`/`h_gru1` 沿 dim 0 疊成單一
+  `h_gru [4,1,128]`（`h_gru0` 在前），輸出併為一個 `h_gru_out`；三個 attention
+  cache 在兩種 layout 都維持獨立，它們是結構性歷史而不是 recurrent hidden
+  state。存在的目的是量「共用一個量化 scale 要付多少代價」。
+- 四對 boundary 逐幀互跑**位元相同**（`rtol=0, atol=0`；test
+  `test_every_layout_pair_computes_the_same_frames`）。C 端只綁
+  `host`/`split`，板端拿到另外三對會在 `layout_version` 被擋掉——這是刻意的。
+  換 layout 屬**合約變更**不是旗標切換：`ulcnet_model_io.h`、prepare/commit
+  API 與下面兩張表要一起搬。
+- `inference.py calib` 收同樣兩個旗標，並在同一個 process 用同一個 model
+  instance 匯出對應 graph；calibration report 的 `state_layout_version` 讀的
+  是實際 wrapper 的 layout，非預設 layout 不會被記成預設 layout 的版號。
+
 Inputs：
 
 | tensor | float32 shape | 來源／用途 |
@@ -750,17 +783,18 @@ pipeline 端的 identity reprime 擋掉（不 step 模型），見 5.x 的
 指向 CPU 的 accelerator context + external state buffers。pipeline 不需看到
 K/V/GRU 細節，`reset(user)` 負責清空外部 state。
 
-先做 operator inventory：
+出貨 `host`/`split` graph 內、需要 runtime 支援的 operator inventory：
 
-- signed `pow(0.3)` 與 inverse power；
-- `atan2/cos/sin`；
 - unfold/ring gather；
 - softmax；
 - bidirectional GRU（沿 frequency）；
 - stateful unidirectional GRUs；
 - PReLU/ELU/BatchNorm folding。
 
-若 runtime 不支援某些 complex/power算子，再決定移到 C frontend/postprocess。
+signed `pow(0.3)`／inverse power 與 `atan2/cos/sin` **已不在出貨 graph 內**：
+v5 起由 `ulcnet_model_io_prepare()`/`ulcnet_model_io_commit()` 以 host fp32
+執行。只有 `--feature-layout=graph` 會把它們放回 graph，屆時 runtime 必須
+支援這些算子，且它們會進量化域（見 §10.2 的節點數與 op 差異）。
 不要在 operator scan 前任意改數學式，否則 checkpoint parity 不明。
 
 ## 11. 實作順序
@@ -809,7 +843,8 @@ K/V/GRU 細節，`reset(user)` 負責清空外部 state。
    delta-state outputs；現有 fixed-block exporter 保留供 offline/debug，不得冒稱
    production streaming equivalent。
 4. metadata 已產生；generated C descriptor header 尚待完成，並需將
-   D、far-input mode、grid、tensor shape、layout version 與 checkpoint hash
+   D、far-input mode、grid、tensor shape、layout version（連同它所屬的
+   `feature_layout`/`gru_state_layout` 這一對）與 checkpoint hash
    固定在同一份部署 contract。
 5. 驗證 PyTorch `forward_stream()` vs ONNX Runtime 多幀輸出與每個
    state delta；本 phase 不實作特定 NPU driver，不整合 mono/4ch pipeline。

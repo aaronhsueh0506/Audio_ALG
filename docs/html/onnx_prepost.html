@@ -67,9 +67,9 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 
 <table>
 <tr><th>Model</th><th>Graph input/state</th><th>Graph output</th><th>C 前後處理</th></tr>
-<tr><td>Align-ULCNet</td><td>五個壓縮域特徵(error_mag/far_mag/error_cos/error_sin/error_ri,host signed-pow 前端) + K/V/logit ring + two GRU states</td>
-<td>壓縮域 output(host 逆冪) + state delta</td><td><code>Align_ULCNet/ulcnet_process.c/h</code>、
-<code>ulcnet_model_io.c/h</code>(prepare/commit 內建前後端)</td></tr>
+<tr><td>Align-ULCNet</td><td>host 特徵 layout(預設,layout v5,C 端唯一實作):五個壓縮域特徵(error_mag/far_mag/error_cos/error_sin/error_ri,host signed-pow 前端) + K/V/logit ring + two GRU states。graph 特徵 layout(export 可選,layout v4):改綁 error/far 兩組 raw RI spectra,前端搬進 graph 內,無 host 前端</td>
+<td>host layout:壓縮域 output(host 逆冪) + state delta。graph layout:逆冪已在 graph 內完成的 output + state delta</td><td><code>Align_ULCNet/ulcnet_process.c/h</code>、
+<code>ulcnet_model_io.c/h</code>(prepare/commit 內建前後端;只綁 host layout)</td></tr>
 <tr><td>Align-CRUSE</td><td>mic + far + conv/GRU/alignment state</td>
 <td>real mask + next state</td><td><code>AIAEC/aiaec_process.c/h</code></td></tr>
 <tr><td>DeepVQE-S</td><td>mic + far + conv/GRU/delay state</td>

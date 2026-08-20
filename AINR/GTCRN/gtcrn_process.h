@@ -28,6 +28,14 @@ extern "C" {
  * splits the packed convolution history and grouped DPGRNN hidden tensors
  * into their actual block/GRU slots. Total state bytes are unchanged; graph
  * Slice/Gather/Concat state packing is removed. */
+/* ⚠ Version 7 is RESERVED, not free: export_onnx.py's experimental
+ * 'combined' state layout publishes it (the sixteen slots regrouped by shape
+ * into conv_cache [2,C,sum(pads),F], h_tra and h_dpgrnn). Total state bytes
+ * are again unchanged and the struct below still describes them, but the
+ * tensor names and ranks a runtime binds are not. Nothing here binds that
+ * layout, so a board built against this header refuses such a graph -- which
+ * is the intent. The next real bump of this constant must therefore go to 8,
+ * or the two files would disagree about what 7 means. */
 #define GTCRN_MODEL_LAYOUT_VERSION 6
 #define GTCRN_MODEL_ERB_KEPT       65   /* low bins passed through          */
 #define GTCRN_MODEL_ERB_HIGH_BANDS 64   /* compressed high bands            */

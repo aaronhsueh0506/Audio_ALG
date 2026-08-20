@@ -13,6 +13,7 @@ from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.CAGCRN import CAGCRN
 from AIAEC.DeepVQE_S import DeepVQES
 from AIAEC._streaming_export import (
+    GRU_STATE_LAYOUTS,
     StatelessOneFrameAIAEC,
     _build,
     requires_contiguous_calibration,
@@ -231,3 +232,60 @@ def test_stateless_graph_really_lowers_to_onnx_and_replays_state(
     assert _verify_onnx(
         path, wrapper, inputs, input_names, split, steps=3
     ) < 3e-4
+
+
+@pytest.mark.parametrize('name,factory,combinable', (
+    ('CAGCRN', lambda: CAGCRN(GRID), True),
+    ('Align_CRUSE', lambda: AlignCRUSE(GRID), False),
+    ('DeepVQE_S', lambda: DeepVQES(GRID), False),
+))
+def test_combined_gru_state_layout_only_regroups_the_boundary(
+        name, factory, combinable):
+    """The combined layout must change where tensors are cut, nothing else.
+
+    It also must not claim to combine a model that has one GRU hidden: those
+    are served the split layout whatever was asked for, and the wrapper --
+    not the request -- is what the exported metadata records.
+    """
+    assert 'combined' in GRU_STATE_LAYOUTS
+    torch.manual_seed(81)
+    model = factory().eval()
+    split, split_inputs, split_names, _outs, graph = _build(name, model)
+    combined, combined_inputs, combined_names, _o, _g = _build(
+        name, model, 'combined')
+
+    assert combined.gru_state_layout == ('combined' if combinable else 'split')
+    if not combinable:
+        assert combined_names == split_names
+        return
+
+    hidden = len(combined._gru_slots)
+    assert hidden > 1
+    assert len(combined_names) == len(split_names) - hidden + 1
+    assert combined_names[-1] == combined.COMBINED_GRU_STATE_NAME
+    # Regrouping must not change how many state values cross the boundary.
+    assert sum(value.numel() for value in combined_inputs[graph.signal_inputs:]) \
+        == sum(value.numel() for value in split_inputs[graph.signal_inputs:])
+
+    split_state = tuple(value.clone()
+                        for value in split_inputs[graph.signal_inputs:])
+    combined_state = tuple(value.clone()
+                           for value in combined_inputs[graph.signal_inputs:])
+    generator = torch.Generator().manual_seed(11)
+    observed_nonzero = False
+    with torch.no_grad():
+        for _ in range(5):
+            signals = tuple(
+                torch.randn(value.shape, generator=generator)
+                for value in split_inputs[:graph.signal_inputs]
+            )
+            expected = split(*(signals + split_state))
+            actual = combined(*(signals + combined_state))
+            torch.testing.assert_close(actual[0], expected[0],
+                                       rtol=0, atol=0)
+            split_state = expected[1:]
+            combined_state = actual[1:]
+            observed_nonzero = observed_nonzero or bool(
+                combined_state[-1].abs().max() > 0)
+    # Written so it can FAIL: zero state would satisfy every comparison above.
+    assert observed_nonzero, 'state never left its zero initialisation'

@@ -2,12 +2,53 @@
 """Export DFN2 heads as a stateless streaming ONNX graph.
 
 The accelerator owns no persistent state. Each invocation receives the three
-feature frames required by the input kernel, five per-layer GRU hidden tensors,
-and the four-frame causal history used by ``df_convp``. It emits the heads for
-the centre feature frame together with every updated state tensor.
+feature frames required by the input kernel, the GRU hidden state, and the
+four-frame causal history used by ``df_convp``. It emits the heads for the
+centre feature frame together with every updated state tensor.
 
 STFT, feature normalisation, the three-frame feature window, deep-filter
 composition and WOLA remain in the host C code.
+
+Recurrent-state layouts
+-----------------------
+
+``--gru-state-layout`` selects how the five GRU hidden states are presented at
+the graph boundary. The graph maths is identical either way; only the boundary
+differs, and the exported metadata records which layout a file uses.
+
+``split`` (default, state layout version 5, the shipped contract)
+    One tensor per GRU in its native stacked form: ``h_encoder`` (1 layer),
+    ``h_erb`` (2) and ``h_df`` (2), each ``(layers, 1, hidden)``. This is
+    PyTorch's own hidden shape, and it matches ``DFN2ModelIOState``'s three
+    ``[layers][hidden]`` arrays one for one, so a runtime binds each tensor
+    to one contiguous field. It is what ``dfn2_model_io.h`` binds and what a
+    board runs.
+
+    ONNX has no stacked GRU op, so each two-layer stack still becomes two GRU
+    nodes fed by per-layer Slices off its own input -- five GRU nodes in all.
+    The trade this layout makes is therefore per-GRU, not per-layer, PTQ
+    scales: the two layers of ``h_erb`` share one input tensor and one scale.
+    Layout version 3 bought per-layer scales instead, by cloning the stacks
+    into one-layer modules and publishing five tensors; this contract chooses
+    the native shape and the exact match to the C struct.
+
+``combined`` (state layout version 6, EXPERIMENTAL -- no C runtime binds it)
+    All three as one ``(5, 1, hidden)`` tensor named ``h_gru``, ordered
+    encoder, erb, df -- ``DFN2ModelIOState``'s own memory order, since those
+    three arrays are adjacent and equally wide, so a runtime binds the
+    combined tensor to the same bytes with no gather.
+
+    It exists to answer one question with numbers instead of argument: what
+    does a single shared quantization scale cost? ``inference.py calib``
+    publishes that per GRU under ``gru_state_slices``. One caveat before
+    reading a verdict off it: the three states now reach their GRU nodes
+    through Slices off one input, so an integer compiler may assign all three
+    one scale -- which is precisely what the split layout keeps it from
+    doing.
+
+    Adopting it is a contract change, not a flag flip: it contradicts the
+    one-tensor-per-GRU naming convention, and ``dfn2_model_io.h``, its commit
+    API, the I/O tables and the C tests would all have to move with it.
 
 Run from ``AINR/DeepFilterNet2``::
 
@@ -19,6 +60,9 @@ Generate deployment calibration beside this model with::
     python3 inference.py calib --model output/dfn2_best.pth \
         --wav-dir /path/to/noisy --frames 8192 --format bin \
         --output calib/dfn2
+
+``calib`` exports the graph itself, from the same model instance in the same
+process, so pass ``--gru-state-layout`` there rather than exporting twice.
 """
 
 import argparse
@@ -47,41 +91,37 @@ INPUT_FRAMES = 3
 # which declares the caller-owned state struct this graph consumes and emits.
 # tests/test_dfn2_contract.py pins the two together. Tensor names are part of
 # this contract: runtimes bind by name.
-STATE_LAYOUT_VERSION = 3
+#
+# Version 3 published one tensor per recurrent LAYER, which needed the stacked
+# GRUs cloned into one-layer modules; version 5 publishes one tensor per GRU in
+# PyTorch's native stacked shape instead, which is also DFN2ModelIOState's own
+# layout. ONNX has no stacked GRU op, so a two-layer stack still traces to two
+# GRU nodes fed by per-layer Slices -- what moved is the PTQ scale, now one per
+# GRU rather than one per layer. Version 4 was burned by the layout below.
+STATE_LAYOUT_VERSION = 5
 
 # EXPERIMENTAL, no C implementation: the combined-GRU-state layout below
-# publishes a different state layout, so it must not claim version 3. Version 4
+# publishes a different state layout, so it must not claim version 5. Version 6
 # is reserved for it in dfn2_model_io.h so a later C-side bump cannot take the
 # same number. It exists to measure what a single recurrent tensor costs in PTQ
 # accuracy before the contract is committed to.
-COMBINED_STATE_LAYOUT_VERSION = 4
+COMBINED_STATE_LAYOUT_VERSION = 6
 
-# Content inputs carry content names (two feature streams).
-#
-# Two recurrent-state layouts are exportable and the graph metadata records
-# which one a file uses (`gru_state_layout`):
-#
-# 'split' (default, layout version 3, the shipped contract) gives every
-# recurrent layer its own graph tensor so a per-tensor PTQ tool can calibrate
-# the two ERB and DF GRU layers independently.
-#
-# 'combined' (layout version 4) carries all five hidden states as one
-# (5, 1, hidden) tensor, ordered encoder, erb_0, erb_1, df_0, df_1. That order
-# is the memory order of DFN2ModelIOState's three hidden arrays, which are
-# adjacent and equally sized, so a runtime can bind the combined tensor to the
-# same bytes with no gather. ⚠ The cost is the reason the split exists: the
-# five states reach their GRU nodes through one Slice off a shared input, so an
-# integer compiler is free to give all five one scale. Compare PTQ error
-# between the two exports before adopting it.
-#
-# The deep-filter pathway history stays a separate cache in both layouts
-# because it is one convolutional state with one distribution.
+# Numbers no layout may claim again. 4 was the first combined layout, published
+# before the split layout moved to per-GRU tensors; graphs exist that carry it.
+# Stated here rather than only in dfn2_model_io.h's prose so a bump onto one
+# fails a test instead of a review.
+RETIRED_LAYOUT_VERSIONS = frozenset({4})
+
+# One entry per GRU, not per layer: each is that GRU's native stacked hidden
+# ``(num_layers, 1, hidden)``, the shape PyTorch and DFN2ModelIOState both
+# already use. The deep-filter pathway history stays a separate cache in every
+# layout because it is one convolutional state with one distribution. See the
+# module docstring for what each layout trades.
 GRU_STATE_NAMES = (
     'h_encoder',
-    'h_erb_0',
-    'h_erb_1',
-    'h_df_0',
-    'h_df_1',
+    'h_erb',
+    'h_df',
 )
 
 COMBINED_GRU_STATE_NAME = 'h_gru'
@@ -306,56 +346,6 @@ def _squeezed_gru(module, value, hidden):
     return value, hidden_next
 
 
-def _clone_gru_layers(gru):
-    """Clone a stacked GRU into equivalent one-layer export modules.
-
-    PyTorch exports a multi-layer GRU by slicing one combined initial-hidden
-    tensor. Feeding separately named tensors through a Cat before that slice
-    can make an integer compiler assign the Cat output one shared scale, which
-    defeats the split I/O contract. Independent one-layer modules keep every
-    state tensor on a separate graph edge all the way into its GRU node.
-    """
-    if not gru.batch_first or gru.bidirectional or gru.proj_size != 0:
-        raise ValueError('DFN2 export requires unidirectional batch-first GRUs')
-    reference = next(gru.parameters())
-    layers = nn.ModuleList()
-    for index in range(gru.num_layers):
-        input_size = gru.input_size if index == 0 else gru.hidden_size
-        layer = nn.GRU(
-            input_size,
-            gru.hidden_size,
-            num_layers=1,
-            bias=gru.bias,
-            batch_first=True,
-        ).to(device=reference.device, dtype=reference.dtype)
-        names = ['weight_ih', 'weight_hh']
-        if gru.bias:
-            names += ['bias_ih', 'bias_hh']
-        with torch.no_grad():
-            for name in names:
-                getattr(layer, name + '_l0').copy_(
-                    getattr(gru, '%s_l%d' % (name, index))
-                )
-        layers.append(layer)
-    return layers
-
-
-def _squeezed_gru_layers(module, layers, value, hidden_layers):
-    """Run a SqueezedGRU through independently exposed recurrent states."""
-    if len(layers) != len(hidden_layers):
-        raise ValueError('one hidden-state tensor is required per GRU layer')
-    raw = value
-    value = module.linear_in(value)
-    hidden_next = []
-    for layer, hidden in zip(layers, hidden_layers):
-        value, next_layer = layer(value, hidden)
-        hidden_next.append(next_layer)
-    value = module.linear_out(value)
-    if module.gru_skip is not None:
-        value = value + module.gru_skip(raw)
-    return value, tuple(hidden_next)
-
-
 def _df_pathway_step(module, current, history):
     """Run the causal kernel-5 DF residual and return its next history."""
     kernel = module.conv.kernel_size[0]
@@ -407,19 +397,15 @@ class StatelessDFN2Heads(nn.Module):
             raise ValueError('this exporter requires two ERB decoder GRU layers')
         if model.df_dec.df_gru.gru.num_layers != 2:
             raise ValueError('this exporter requires two DF decoder GRU layers')
-        self.erb_gru_layers = _clone_gru_layers(model.erb_dec.emb_gru.gru)
-        self.df_gru_layers = _clone_gru_layers(model.df_dec.df_gru.gru)
+        self.gru_state_slices = gru_state_slices(model)
         if self.gru_state_layout.combined:
             # Checked here beside the other constructor preconditions, not at
             # first use: a wrapper that cannot export must not construct.
-            widths = {
-                tensor.shape[2]
-                for tensor in _split_hidden_inputs(model)
-            }
+            widths = {gru.hidden_size for gru in _state_grus(model)}
             if len(widths) != 1:
                 raise ValueError(
                     'the combined recurrent state requires one hidden width '
-                    'for every layer; got %s' % sorted(widths)
+                    'for every GRU; got %s' % sorted(widths)
                 )
 
     @property
@@ -441,16 +427,16 @@ class StatelessDFN2Heads(nn.Module):
     def forward(self, feat_erb_window, feat_spec_window, *state):
         if self.gru_state_layout.combined:
             combined_hidden, df_convp_history = state
-            # One Slice per layer off the shared input, in GRU_STATE_NAMES
-            # order. Views, not copies: each still arrives at its own GRU node.
-            (encoder_gru_hidden, erb_gru_hidden_0, erb_gru_hidden_1,
-             df_gru_hidden_0, df_gru_hidden_1) = (
-                combined_hidden[index:index + 1]
-                for index in range(len(GRU_STATE_NAMES))
+            # One Slice per GRU off the shared input, in GRU_STATE_NAMES
+            # order. Views, not copies: each still arrives at its own GRU node
+            # carrying that GRU's whole stack.
+            encoder_gru_hidden, erb_gru_hidden, df_gru_hidden = (
+                combined_hidden[start:stop]
+                for _name, start, stop in self.gru_state_slices
             )
         else:
-            (encoder_gru_hidden, erb_gru_hidden_0, erb_gru_hidden_1,
-             df_gru_hidden_0, df_gru_hidden_1, df_convp_history) = state
+            (encoder_gru_hidden, erb_gru_hidden, df_gru_hidden,
+             df_convp_history) = state
         model = self.model
         enc = model.encoder
 
@@ -474,11 +460,8 @@ class StatelessDFN2Heads(nn.Module):
         )
 
         erb = model.erb_dec
-        erb_value, erb_hidden_next = _squeezed_gru_layers(
-            erb.emb_gru,
-            self.erb_gru_layers,
-            embedding,
-            (erb_gru_hidden_0, erb_gru_hidden_1),
+        erb_value, erb_hidden_next = _squeezed_gru(
+            erb.emb_gru, embedding, erb_gru_hidden
         )
         erb_value = erb_value.reshape(
             batch, 1, erb.n_erb_4, erb.enc_ch
@@ -489,11 +472,8 @@ class StatelessDFN2Heads(nn.Module):
         erb_mask = erb.conv0_out(erb.conv0p(e0) + erb_value)
 
         decoder = model.df_dec
-        df_value, df_hidden_next = _squeezed_gru_layers(
-            decoder.df_gru,
-            self.df_gru_layers,
-            embedding,
-            (df_gru_hidden_0, df_gru_hidden_1),
+        df_value, df_hidden_next = _squeezed_gru(
+            decoder.df_gru, embedding, df_gru_hidden
         )
         if decoder.df_skip is not None:
             df_value = df_value + decoder.df_skip(embedding)
@@ -506,13 +486,7 @@ class StatelessDFN2Heads(nn.Module):
             batch, 1, decoder.df_bins, decoder.df_order * 2
         )
         coefficients = coefficients + c0_residual
-        hidden_next = (
-            encoder_hidden_next,
-            erb_hidden_next[0],
-            erb_hidden_next[1],
-            df_hidden_next[0],
-            df_hidden_next[1],
-        )
+        hidden_next = (encoder_hidden_next, erb_hidden_next, df_hidden_next)
         heads = (erb_mask, coefficients, alpha)
         if self.gru_state_layout.combined:
             # Concatenated in the same order the input was sliced, which is
@@ -521,24 +495,39 @@ class StatelessDFN2Heads(nn.Module):
         return heads + hidden_next + (pathway_history_next,)
 
 
-def _split_hidden_inputs(model):
-    """The five per-layer zero hidden states, in GRU_STATE_NAMES order."""
-    encoder_gru = model.encoder.emb_gru.gru
-    erb_gru = model.erb_dec.emb_gru.gru
-    df_gru = model.df_dec.df_gru.gru
+def _state_grus(model):
+    """The stateful GRUs, in GRU_STATE_NAMES order."""
     return (
-        torch.zeros(encoder_gru.num_layers, 1, encoder_gru.hidden_size),
-        *(torch.zeros(1, 1, erb_gru.hidden_size)
-          for _ in range(erb_gru.num_layers)),
-        *(torch.zeros(1, 1, df_gru.hidden_size)
-          for _ in range(df_gru.num_layers)),
+        model.encoder.emb_gru.gru,
+        model.erb_dec.emb_gru.gru,
+        model.df_dec.df_gru.gru,
+    )
+
+
+def gru_state_slices(model):
+    """``(name, start, stop)`` per GRU along the combined state's layer axis.
+
+    Read off the module tree rather than written down, and shared by the
+    graph's own slicing and the calibration report, so a stack depth can never
+    be described one way in the graph and another in the report.
+    """
+    slices = []
+    at = 0
+    for name, gru in zip(GRU_STATE_NAMES, _state_grus(model)):
+        slices.append((name, at, at + gru.num_layers))
+        at += gru.num_layers
+    return tuple(slices)
+
+
+def _split_hidden_inputs(model):
+    """One native stacked zero hidden per GRU, in GRU_STATE_NAMES order."""
+    return tuple(
+        torch.zeros(gru.num_layers, 1, gru.hidden_size)
+        for gru in _state_grus(model)
     )
 
 
 def initial_inputs(model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
-    encoder_gru = model.encoder.emb_gru.gru
-    erb_gru = model.erb_dec.emb_gru.gru
-    df_gru = model.df_dec.df_gru.gru
     enc_ch = model.encoder.erb_conv0[1].out_channels
     pathway_history = model.df_dec.df_convp.conv.kernel_size[0] - 1
     hidden = _split_hidden_inputs(model)
@@ -552,14 +541,14 @@ def initial_inputs(model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
     )
 
 
-def gru_state_slice_report(combined, stats):
-    """What one shared PTQ scale costs each layer of a combined state tensor.
+def gru_state_slice_report(combined, stats, slices):
+    """What one shared PTQ scale costs each GRU of a combined state tensor.
 
-    ``combined`` is the captured (frames, layers, batch, hidden) array and
-    ``stats`` produces one per-tensor range dict, so the per-slice entries are
-    the same shape the calibration report publishes for every other input --
-    in the split layout those five entries exist already, and this restores
-    them.
+    ``combined`` is the captured (frames, layers, batch, hidden) array,
+    ``stats`` produces one per-tensor range dict and ``slices`` comes from
+    ``gru_state_slices``, so the per-slice entries are the same shape the
+    calibration report publishes for every other input -- in the split layout
+    those three entries exist already, and this restores them.
 
     The bits figure is named for the policy it assumes. A symmetric max-abs
     int8 scale is set by the widest slice, so a narrower one keeps only
@@ -572,8 +561,8 @@ def gru_state_slice_report(combined, stats):
     checkpoint and a wav directory.
     """
     per_layer = {}
-    for index, name in enumerate(GRU_STATE_NAMES):
-        entry = stats(combined[:, index])
+    for name, start, stop in slices:
+        entry = stats(combined[:, start:stop])
         # max-abs from the range already computed, not a second pass.
         entry['max_abs'] = max(abs(entry['min']), abs(entry['max']))
         per_layer[name] = entry
@@ -585,7 +574,7 @@ def gru_state_slice_report(combined, stats):
             if own > 0.0 else None
         )
     return {
-        'order': list(GRU_STATE_NAMES),
+        'order': [name for name, _start, _stop in slices],
         'shared_max_abs': shared_max_abs,
         'worst_bits_lost': max(
             (entry['max_abs_symmetric_scale_bits_lost']
@@ -709,13 +698,11 @@ def main():
         '--gru-state-layout', choices=sorted(GRU_STATE_LAYOUTS),
         default=DEFAULT_GRU_STATE_LAYOUT,
         help="'split' (default, layout version %d, the shipped contract) "
-             "exports one tensor per GRU layer; 'combined' (EXPERIMENTAL, "
-             "layout version %d, no C runtime binds it) exports all five as "
-             "one (5,1,hidden) tensor. NOTE the combined graph still clones "
-             "the stacked GRUs into one-layer modules, so it carries five "
-             "Slices feeding five GRU nodes; a shippable combined export "
-             "would instead let PyTorch's native stacked GRU do its own "
-             "slicing. Measure accordingly."
+             "exports one tensor per GRU in its native stacked shape; "
+             "'combined' (EXPERIMENTAL, layout version %d, no C runtime "
+             "binds it) exports all three as one (5,1,hidden) tensor, so the "
+             "three then share one quantization scale. See the module "
+             "docstring for the trade."
              % (STATE_LAYOUT_VERSION, COMBINED_STATE_LAYOUT_VERSION))
     args = parser.parse_args()
 

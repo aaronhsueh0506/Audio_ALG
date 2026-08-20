@@ -7,18 +7,21 @@
 extern "C" {
 #endif
 
-/* Must match export_onnx.py and the shipped DFN2 config. Version 3 exposes
- * h_erb_0/h_erb_1 and h_df_0/h_df_1 as separate graph tensors so per-tensor
- * PTQ may use one scale per recurrent layer. The state struct remains
- * contiguous and unchanged; runtimes bind each row to its named tensor.
+/* Must match export_onnx.py and the shipped DFN2 config. Version 3 exposed
+ * one graph tensor per recurrent LAYER (h_erb_0/h_erb_1, h_df_0/h_df_1) so
+ * PTQ could scale each layer independently; version 5 exposes one per GRU in
+ * its native stacked shape (h_erb, h_df, each (layers, 1, hidden)), which is
+ * exactly how the arrays below are already laid out, so a runtime binds each
+ * tensor to one contiguous field. The graph still holds one GRU node per
+ * layer -- ONNX has no stacked GRU op -- so the layers of one stack now
+ * share that stack's quantization scale.
  *
- * ⚠ Version 4 is RESERVED, not free: export_onnx.py's experimental
- * 'combined' GRU state layout publishes it (all five hidden states as one
- * h_gru tensor). Nothing here binds that layout, so a board built against
- * this header refuses such a graph -- which is the intent. The next real
- * bump of this constant must therefore go to 5, or the two files would
- * disagree about what 4 means. */
-#define DFN2_MODEL_IO_LAYOUT_VERSION       3
+ * ⚠ Versions 4 and 6 are TAKEN, not free -- see export_onnx.py's
+ * RETIRED_LAYOUT_VERSIONS and COMBINED_STATE_LAYOUT_VERSION, which
+ * test_dfn2_contract.py asserts this constant against. Nothing here binds the
+ * combined layout, so a board built against this header refuses such a graph:
+ * that is the intent, not an oversight. */
+#define DFN2_MODEL_IO_LAYOUT_VERSION       5
 #define DFN2_MODEL_INPUT_FRAMES            3
 #define DFN2_MODEL_ENCODER_GRU_LAYERS      1
 #define DFN2_MODEL_ERB_GRU_LAYERS          2
@@ -72,10 +75,10 @@ int dfn2_model_io_commit_arrays(
                           [DFN2_DF_BINS],
     const float encoder_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
                                    [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_hidden_0_next[DFN2_MODEL_GRU_HIDDEN],
-    const float erb_hidden_1_next[DFN2_MODEL_GRU_HIDDEN],
-    const float df_hidden_0_next[DFN2_MODEL_GRU_HIDDEN],
-    const float df_hidden_1_next[DFN2_MODEL_GRU_HIDDEN],
+    const float erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
+                               [DFN2_MODEL_GRU_HIDDEN],
+    const float df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
+                              [DFN2_MODEL_GRU_HIDDEN],
     const float pathway_history_next[DFN2_MODEL_ENCODER_CHANNELS]
                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
                                     [DFN2_DF_BINS]);
@@ -94,10 +97,10 @@ int dfn2_model_io_commit_state(
     DFN2ModelIOState *state,
     const float encoder_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
                                    [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_hidden_0_next[DFN2_MODEL_GRU_HIDDEN],
-    const float erb_hidden_1_next[DFN2_MODEL_GRU_HIDDEN],
-    const float df_hidden_0_next[DFN2_MODEL_GRU_HIDDEN],
-    const float df_hidden_1_next[DFN2_MODEL_GRU_HIDDEN],
+    const float erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
+                               [DFN2_MODEL_GRU_HIDDEN],
+    const float df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
+                              [DFN2_MODEL_GRU_HIDDEN],
     const float pathway_history_next[DFN2_MODEL_ENCODER_CHANNELS]
                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
                                     [DFN2_DF_BINS]);

@@ -71,6 +71,8 @@ from AIAEC._export_common import (
     set_alignment_depth,
 )
 from AIAEC._streaming_export import (
+    DEFAULT_GRU_STATE_LAYOUT,
+    GRU_STATE_LAYOUTS,
     GraphSplit,
     _build,
     export_graph,
@@ -79,23 +81,15 @@ from AIAEC._streaming_export import (
 )
 from AIAEC.Align_ULCNet.inference import load_model as load_ulcnet_model
 from AIAEC.Align_ULCNet.export_onnx import (
-    INPUT_NAMES as ULCNET_INPUT_NAMES,
-    STATE_LAYOUT_VERSION as ULCNET_STATE_LAYOUT_VERSION,
+    FEATURE_LAYOUTS as ULCNET_FEATURE_LAYOUTS,
     export_graph as ulcnet_export_graph,
+    graph_signals as ulcnet_graph_signals,
     next_state as ulcnet_next_state,
-    stream_features as ulcnet_stream_features,
-    SIGNAL_INPUTS as ULCNET_SIGNAL_INPUTS,
 )
 
 
 # Unlike the exporters, this recorder serves every candidate: Align-ULCNet's
 # own graph is driven through its exporter's helpers below.
-#
-# Align-ULCNet's graph emits one head plus delta-state; its state slots are
-# rebuilt by next_state() rather than sliced, so only signal_inputs is read.
-_ULCNET_SPLIT = GraphSplit(
-    signal_inputs=ULCNET_SIGNAL_INPUTS, head_outputs=1
-)
 
 
 def input_range_report(arrays, policy):
@@ -185,6 +179,18 @@ def main(model_name: str) -> None:
                         help='pair mic_001.wav with lpb_001.wav by replacing '
                              'the token in primary names when looking up the '
                              'far tree (identical names still match first)')
+    parser.add_argument(
+        '--gru-state-layout', choices=GRU_STATE_LAYOUTS,
+        default=DEFAULT_GRU_STATE_LAYOUT,
+        help='recurrent-state layout for the graph exported beside these '
+             'tensors; see the export CLI. Align_ULCNet honours it too.')
+    parser.add_argument(
+        '--feature-layout', choices=sorted(ULCNET_FEATURE_LAYOUTS),
+        default='host',
+        help='Align_ULCNet only: which signal tensors the graph binds. '
+             "'host' (default) records the five features the host front end "
+             "computes; 'graph' records the two raw RI spectra instead. See "
+             'the export CLI.')
     parser.add_argument('--primary-is-mic', action='store_true',
                         help='Align_ULCNet only: --primary-dir holds RAW '
                              'microphone WAVs; the checkpoint-matched frozen '
@@ -199,6 +205,9 @@ def main(model_name: str) -> None:
     except ValueError as error:
         parser.error(str(error))
 
+    if args.feature_layout != 'host' and args.model_name != 'Align_ULCNet':
+        parser.error('--feature-layout applies only to Align_ULCNet; the '
+                     'other candidates bind raw mic/far spectra directly')
     if args.primary_is_mic and args.model_name != 'Align_ULCNet':
         parser.error('--primary-is-mic applies only to Align_ULCNet; the '
                      'end-to-end models take microphone WAVs natively')
@@ -224,20 +233,27 @@ def main(model_name: str) -> None:
             max_delay_frames=args.max_delay_frames,
         )
         wrapper, dummy, graph_metadata = ulcnet_export_graph(
-            model, args.checkpoint, onnx_path, verify=True
+            model, args.checkpoint, onnx_path, verify=True,
+            feature_layout=args.feature_layout,
+            gru_state_layout=args.gru_state_layout,
         )
-        input_names = ULCNET_INPUT_NAMES
-        split = _ULCNET_SPLIT
+        input_names = wrapper.layout.input_names
+        # One head plus delta-state; the state slots are rebuilt by
+        # next_state() rather than sliced, so only signal_inputs is read.
+        split = GraphSplit(
+            signal_inputs=wrapper.layout.signal_inputs, head_outputs=1
+        )
+        state_layout_version = wrapper.layout.layout_version
 
-        # The block carries RAW error/far RI; the host front end (the same
-        # fixed math the deployment runs in C) produces the five feature
-        # inputs the graph binds. State is rebuilt by next_state() rather
-        # than sliced from the outputs.
+        # The block carries RAW error/far RI; graph_signals applies as much
+        # of the fixed front end as this layout leaves outside the graph.
+        # State is rebuilt by next_state() rather than sliced.
         def make_signal(block):
-            return ulcnet_stream_features(
+            return ulcnet_graph_signals(
                 model,
                 torch.from_numpy(block['error']).unsqueeze(0),
                 torch.from_numpy(block['far']).unsqueeze(0),
+                wrapper.layout,
             )
 
         def advance_state(state, outputs):
@@ -253,11 +269,13 @@ def main(model_name: str) -> None:
         if args.max_delay_frames is not None:
             set_alignment_depth(model, args.max_delay_frames)
         model.eval()
-        built = _build(args.model_name, model)
+        built = _build(args.model_name, model,
+                       args.gru_state_layout)
         graph_metadata = export_graph(grid, built, args.checkpoint, onnx_path,
                                       checkpoint_depth, verify=True)
         wrapper, dummy, input_names, _output_names, split = built
         signal_names = input_names[:split.signal_inputs]
+        state_layout_version = None
 
         def make_signal(block):
             return tuple(
@@ -344,11 +362,10 @@ def main(model_name: str) -> None:
         'max_delay_frames': alignment_depth(model),
         # The exported graph records the same field; a board that pairs a
         # calibration set with a graph compares the two before trusting the
-        # ranges. Only Align-ULCNet's state layout is versioned today.
-        'state_layout_version': (
-            ULCNET_STATE_LAYOUT_VERSION
-            if args.model_name == 'Align_ULCNet' else None
-        ),
+        # ranges. Read off the wrapper that wrote the graph, so a non-default
+        # layout cannot be recorded under the default layout's version. Only
+        # Align-ULCNet's boundary is versioned today.
+        'state_layout_version': state_layout_version,
         'frames': int(next(iter(arrays.values())).shape[0]),
         'seed': args.seed,
         'source_files': source_files,

@@ -45,6 +45,24 @@ TFGRU ×2（<b>頻率軸 bidirectional GRU</b> 每幀獨立 + 時間軸 GRU，hi
 per-frequency-bin）、TFAG、mirror decoder（含 <code>ConvTranspose2d</code>）、Tanh mask。
 graph <b>外</b>（C 前後處理）= centered sqrt-Hann STFT/ISTFT 與 complex↔RI。
 recurrent state 全為顯式 I/O tensor。</p>
+<p><b>Recurrent state layout</b>（<code>--gru-state-layout</code>；
+<code>export_onnx.py</code> 與 <code>inference.py calib</code> 同旗標，實作在共用的
+<code>AIAEC/_streaming_export.py</code>）：
+<b><code>split</code>＝預設、出貨合約</b>——每顆 GRU hidden 各一個 tensor，依 slot
+順序與 conv 歷史交錯排列，state 20 個、graph inputs <b>22</b>
+（<code>mic</code>/<code>far</code> ＋ 20 個 state）。
+<b><code>combined</code>＝實驗用，無 C runtime 綁定</b>——把
+<code>h_far_tfgru_time</code> 與 <code>h_mic_tfgru_time</code>（各
+<code>(1, 25, 24)</code>）沿 dim 0 疊成單一 <code>h_gru (2, 25, 24)</code> 並移到所有
+cache 之後，graph inputs 降為 <b>21</b>。<b>十七個 convolution 歷史與 CATA delay
+ring（<code>cata_ring.ring</code>）在兩種 layout 都維持獨立</b>：它們是結構性歷史，
+不是 recurrent hidden state，也不與 hidden 共用分布；hidden 形狀不一致的模型會被
+拒絕而不是補零對齊。</p>
+<div class="note"><b>metadata 記的是 wrapper 實際做了什麼，不是請求值</b>：
+Align-CRUSE 與 DeepVQE-S 各只有<b>一顆</b> GRU hidden（本來就是單一
+<code>h_gru</code> tensor），無論請求哪一種 layout 都以 <code>split</code> 供應，
+匯出的 <code>gru_state_layout</code> 也如實寫 <code>split</code>——只有 CAGCRN
+的兩顆 hidden 真的會被合併。</div>
 <div class="note"><b>NPU 風險（readiness §3.4，四候選中 op 面最重）</b>：CATA 的
 <code>q.unsqueeze(3)*delayed</code> 逐幀仍是 <code>[B,24,1,63,49]</code>（≈74k 元素）broadcast；
 decoder 的 <code>ConvTranspose2d</code> 用動態 <code>output_size</code>，export 前必須固定。</div>
@@ -137,6 +155,10 @@ state I/O，由 host caller 保存；STFT/ISTFT 屬 C struct 層：</p>
 <p>LayerNorm ×4 只作用在 channel 軸（無跨時間統計）；可學 delay window
 （<code>raw_window</code>）在推論期為常數，已在 <code>create_stream_state()</code> 內以
 <code>torch.no_grad()</code> 預計算成 <code>cata_gate_log</code>。</p>
+<p>上表 <code>h_mic_tfgru_time</code>/<code>h_far_tfgru_time</code> 是出貨的
+<code>split</code> layout；<code>--gru-state-layout combined</code> 只改 graph
+boundary 上的切法（併成 <code>h_gru (2, 25, 24)</code>，state tensor 20→19、
+graph inputs 22→21），值的總量與 host RAM 皆不變，其餘各列維持原位與原順序。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>
@@ -153,8 +175,8 @@ samples。</li>
 <ul>
 <li><code>AIAEC/CAGCRN/model.py</code>（<code>CAGCRN</code>、<code>CrossAttentionTemporalAlignment</code>、<code>TFGRU</code>、<code>TFAG</code>、<code>ErbBandCodec</code>、<code>_stream_*</code> helpers）</li>
 <li><code>AIAEC/CAGCRN/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
-<li>tests：<code>AIAEC/tests/test_streaming_cagcrn.py</code>（4 tests）、<code>test_candidate_models.py</code>（含 <code>test_cagcrn_soft_window_has_gradient</code>）——全套 <code>python3 -m pytest AIAEC/tests</code> = 220 passed（<code>pytest AIAEC</code> 含 dataset_gen = 336）</li>
-<li>匯出／calibration：<code>AIAEC/CAGCRN/export_onnx.py</code>、<code>AIAEC/CAGCRN/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/CAGCRN/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。</li>
+<li>tests：<code>AIAEC/tests/test_streaming_cagcrn.py</code>（4 tests）、<code>test_candidate_models.py</code>（含 <code>test_cagcrn_soft_window_has_gradient</code>）、<code>test_export_stateless.py</code>（<code>test_combined_gru_state_layout_only_regroups_the_boundary</code>：combined vs split 逐幀 <code>rtol=0, atol=0</code>）——全套 <code>python3 -m pytest AIAEC/tests</code> = 252 passed（<code>pytest AIAEC</code> 含 dataset_gen = 368）</li>
+<li>匯出／calibration：<code>AIAEC/CAGCRN/export_onnx.py</code>、<code>AIAEC/CAGCRN/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/CAGCRN/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改）；兩者同收 <code>--gru-state-layout</code>）。</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.4</li>
 </ul>
 </body>

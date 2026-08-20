@@ -306,3 +306,57 @@ class StreamGTCRN(nn.Module):
         return (enhanced, *enc_conv, *dec_conv_reverse,
                 *enc_tra, *dec_tra,
                 inter10, inter11, inter20, inter21)
+
+
+def pack_state(model, state):
+    """The sixteen per-slot state tensors as three, in graph order.
+
+    The convolution histories become one ``(2, C, sum(pads), F)``: encoder row
+    first, decoder row second, and within a row the blocks keep their order
+    and join along the DEPTH axis, the only axis they differ on -- every
+    history is ``(1, C, pad, F)`` with the same C and F. Every group joins
+    along an axis it already has, the caches along that size-1 batch axis and
+    the hiddens along their layer axis, so nothing gains a dimension and the
+    four-dimensional ceiling holds.
+
+    Shared by the combined wrapper's own forward and by whoever builds its
+    initial inputs, so the packing rule exists once.
+    """
+    blocks = len(_encoder_pad_sizes(model))
+    return (
+        torch.cat((torch.cat(state[:blocks], dim=2),
+                   torch.cat(state[blocks:2 * blocks], dim=2)), dim=0),
+        torch.cat(state[2 * blocks:4 * blocks], dim=0),
+        torch.cat(state[4 * blocks:], dim=0),
+    )
+
+
+class CombinedStateGTCRN(nn.Module):
+    """Three-tensor state boundary over the per-slot streaming graph.
+
+    Wraps ``StreamGTCRN`` instead of reimplementing it, so both boundaries run
+    exactly the same compute and cannot drift; the difference is only where
+    the sixteen state tensors are cut. The three groups are the ones whose
+    members share a shape: the convolution histories (equal C and F, differing
+    depth), the six TRA attention hiddens, and the four DPGRNN inter hiddens.
+    """
+
+    def __init__(self, model):
+        super().__init__()
+        self.stream = StreamGTCRN(model)
+        self.encoder_pads = list(_encoder_pad_sizes(model))
+        self.decoder_pads = self.encoder_pads[::-1]
+
+    @property
+    def model(self):
+        return self.stream.model
+
+    def forward(self, mag, real, imag, conv_cache, h_tra, h_dpgrnn):
+        outputs = self.stream(
+            mag, real, imag,
+            *torch.split(conv_cache[0:1], self.encoder_pads, dim=2),
+            *torch.split(conv_cache[1:2], self.decoder_pads, dim=2),
+            *torch.split(h_tra, 1, dim=0),
+            *torch.split(h_dpgrnn, 1, dim=0),
+        )
+        return (outputs[0],) + pack_state(self.model, outputs[1:])

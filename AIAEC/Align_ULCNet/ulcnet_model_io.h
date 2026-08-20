@@ -33,6 +33,17 @@ extern "C" {
  * compressed error RI, all produced inside prepare()) and returns the
  * COMPRESSED estimate; commit() applies the inverse signed power. The
  * graph starts at the learned reorient/encoder compute. */
+/* ⚠ Versions 4, 6 and 7 are TAKEN, not free.  export_onnx.py's boundary is
+ * the pair (feature layout, GRU state layout) and its LAYOUT_VERSIONS table
+ * names all four: ('host','split') = 5, the version below and the only pair
+ * this file implements; ('host','combined') = 6 stacks both subband hiddens
+ * into one h_gru tensor; ('graph','split') = 4 binds the two raw RI spectra
+ * and runs the front/back ends inside the graph, which is precisely what
+ * version 4 was, so it reuses that number rather than inventing a second one
+ * for the same contract; ('graph','combined') = 7 does both.  Nothing here
+ * binds anything but 5, so a board built against this header refuses the
+ * other three -- which is the intent.  The next real bump of this constant
+ * must therefore go to 8. */
 #define ULCNET_MODEL_IO_LAYOUT_VERSION 5u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2

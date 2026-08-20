@@ -7,6 +7,28 @@ an ordinary graph input/output.
 
 Align-ULCNet keeps its specialised exporter because its delta-state ABI is
 already paired with ``ulcnet_model_io.c``.
+
+Recurrent-state layouts
+-----------------------
+
+``--gru-state-layout`` selects how each model's GRU hidden states are
+presented at the graph boundary. The graph maths is identical either way.
+
+``split`` (default, the shipped contract)
+    One tensor per GRU hidden, interleaved with the structural caches in
+    slot order.
+
+``combined`` (EXPERIMENTAL -- no C runtime binds it)
+    The GRU hiddens stacked along dim 0 into one ``h_gru`` tensor placed
+    after the caches, which keep their own tensors and their relative order.
+    Caches are structural histories, not recurrent hidden state, and do not
+    share a distribution with the hiddens.
+
+    Only models with more than one GRU hidden are affected. Align_CRUSE and
+    DeepVQE_S each have exactly one -- already a single tensor named
+    ``h_gru`` -- so they stay split rather than reorder the boundary for no
+    gain; CAGCRN's two ``(1, width, hidden)`` hiddens stack. A model whose
+    hiddens do not share a shape is refused rather than padded.
 """
 
 from __future__ import annotations
@@ -179,6 +201,12 @@ GENERIC_MODEL_NAMES = (
     'CAGCRN',
 )
 
+# The recurrent-state layouts this exporter can present, described in the
+# module docstring. One table so the constructor guard, both CLIs and any
+# consumer agree on the set.
+GRU_STATE_LAYOUTS = ('split', 'combined')
+DEFAULT_GRU_STATE_LAYOUT = 'split'
+
 _C_BOUNDARIES = {
     'Align_CRUSE': 'aiaec_process.c/aiaec_process.h',
     'DeepVQE_S': ('aiaec_process.c/aiaec_process.h+'
@@ -300,9 +328,17 @@ def _hidden_name(path: str) -> str:
 class StatelessOneFrameAIAEC(nn.Module):
     """Bind explicit tensors to an existing model's streaming reference."""
 
-    def __init__(self, model_name: str, model: nn.Module):
+    #: Name the combined recurrent tensor takes in the 'combined' layout.
+    COMBINED_GRU_STATE_NAME = 'h_gru'
+
+    def __init__(self, model_name: str, model: nn.Module,
+                 gru_state_layout: str = DEFAULT_GRU_STATE_LAYOUT):
         super().__init__()
+        if gru_state_layout not in GRU_STATE_LAYOUTS:
+            raise ValueError('unknown gru_state_layout %r; expected one of %s'
+                             % (gru_state_layout, list(GRU_STATE_LAYOUTS)))
         self.model_name = model_name
+        self.gru_state_layout = gru_state_layout
         self.model = model
         self.stream_state = model.create_stream_state()
         frequency = model.grid.n_freqs
@@ -318,9 +354,40 @@ class StatelessOneFrameAIAEC(nn.Module):
         self.slots = _state_slots(self.stream_state)
         for slot in self.slots:
             slot.get()
+        self._gru_slots = [
+            index for index, slot in enumerate(self.slots)
+            if isinstance(slot.owner, StreamGRUCell)
+        ]
+        gru_slots = set(self._gru_slots)
+        self._other_slots = [
+            index for index in range(len(self.slots))
+            if index not in gru_slots
+        ]
+        # Combining one tensor with itself would only reorder the boundary for
+        # no gain, so a model with a single recurrent state keeps the split
+        # layout. Align_CRUSE and DeepVQE_S are in that position: their one
+        # GRU hidden is already a single tensor called h_gru.
+        if len(self._gru_slots) < 2:
+            self.gru_state_layout = 'split'
+        if self.combines_gru_state:
+            widths = {tuple(self.slots[i].get().shape)
+                      for i in self._gru_slots}
+            if len(widths) != 1:
+                raise ValueError(
+                    '%s: the combined recurrent state requires one shape for '
+                    'every GRU hidden; got %s'
+                    % (model_name, sorted(widths))
+                )
+        # Sanitizing every slot path is regex work, and the boundary is fixed
+        # once the slots are; the per-frame forward() must not redo it.
+        self._state_names = self._regroup(
+            self._split_state_names(), self.COMBINED_GRU_STATE_NAME)
 
     @property
-    def state_names(self) -> Tuple[str, ...]:
+    def combines_gru_state(self) -> bool:
+        return self.gru_state_layout == 'combined'
+
+    def _split_state_names(self) -> Tuple[str, ...]:
         return tuple(
             _hidden_name(slot.path)
             if isinstance(slot.owner, StreamGRUCell)
@@ -328,14 +395,54 @@ class StatelessOneFrameAIAEC(nn.Module):
             for slot in self.slots
         )
 
+    def _regroup(self, per_slot, combined_tail):
+        """Slot-ordered values -> this layout's boundary order.
+
+        Caches keep their original order; the one recurrent entry goes last,
+        so the boundary stays readable and the caches' positions are unchanged
+        relative to each other. The rule lives here alone -- names, initial
+        state and per-frame state must all use it, or a graph would be written
+        in one order and fed in another.
+        """
+        if not self.combines_gru_state:
+            return tuple(per_slot)
+        return tuple(per_slot[i] for i in self._other_slots) + (
+            combined_tail,
+        )
+
+    @property
+    def state_names(self) -> Tuple[str, ...]:
+        return self._state_names
+
     def initial_state(self) -> Tuple[Tensor, ...]:
-        return tuple(torch.zeros_like(slot.get()) for slot in self.slots)
+        return self._collapse_state(
+            [torch.zeros_like(slot.get()) for slot in self.slots])
+
+    def _expand_state(self, state_tensors):
+        """Combined-layout tensors -> one per slot, in slot order."""
+        if not self.combines_gru_state:
+            return state_tensors
+        *others, combined = state_tensors
+        expanded = [None] * len(self.slots)
+        for position, index in enumerate(self._other_slots):
+            expanded[index] = others[position]
+        step = combined.shape[0] // len(self._gru_slots)
+        for position, index in enumerate(self._gru_slots):
+            expanded[index] = combined[position * step:(position + 1) * step]
+        return tuple(expanded)
+
+    def _collapse_state(self, per_slot):
+        """One per slot -> combined-layout tensors."""
+        if not self.combines_gru_state:
+            return tuple(per_slot)
+        return self._regroup(per_slot, torch.cat(
+            [per_slot[i] for i in self._gru_slots], dim=0))
 
     def forward(self, primary_ri: Tensor, far_end_ri: Tensor,
                 *state_tensors: Tensor):
-        if len(state_tensors) != len(self.slots):
+        if len(state_tensors) != len(self._state_names):
             raise ValueError('wrong number of explicit stream-state tensors')
-        for slot, value in zip(self.slots, state_tensors):
+        for slot, value in zip(self.slots, self._expand_state(state_tensors)):
             slot.set(value)
         if self.model_name == 'Align_CRUSE':
             learned = self._align_cruse(primary_ri, far_end_ri)
@@ -345,7 +452,9 @@ class StatelessOneFrameAIAEC(nn.Module):
             learned = self._cagcrn(primary_ri, far_end_ri)
         else:
             raise RuntimeError('unsupported one-frame model')
-        return (learned,) + tuple(slot.get() for slot in self.slots)
+        return (learned,) + self._collapse_state(
+            [slot.get() for slot in self.slots]
+        )
 
     @staticmethod
     def _log_power(value: Tensor) -> Tensor:
@@ -500,8 +609,10 @@ class GraphSplit(NamedTuple):
     head_outputs: int
 
 
-def _build(model_name: str, model):
-    wrapper = StatelessOneFrameAIAEC(model_name, model).eval()
+def _build(model_name: str, model,
+           gru_state_layout: str = DEFAULT_GRU_STATE_LAYOUT):
+    wrapper = StatelessOneFrameAIAEC(
+        model_name, model, gru_state_layout=gru_state_layout).eval()
     shape = (1, 1, model.grid.n_freqs, 2)
     inputs = (torch.randn(shape), torch.randn(shape)) + wrapper.initial_state()
     input_names = ('mic', 'far') + wrapper.state_names
@@ -587,6 +698,10 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
         'accelerator_persistent_state': False,
         'c_prepost': _C_BOUNDARIES[model_name],
         'learned_control_semantics': _CONTROL_SEMANTICS[model_name],
+        # The wrapper's own answer, not the requested one: a model with a
+        # single GRU hidden is served the split layout whatever was asked for,
+        # and an artifact must record the boundary it actually has.
+        'gru_state_layout': wrapper.gru_state_layout,
         'input_schema': _schema(input_names, inputs),
         'output_schema': _schema(output_names, outputs),
         'max_delay_frames': alignment_depth(model),
@@ -639,6 +754,15 @@ def main(model_name: str) -> None:
     parser.add_argument('--max-delay-frames', type=int, default=None)
     parser.add_argument('--opset', type=int, default=17)
     parser.add_argument('--verify', action='store_true')
+    parser.add_argument(
+        '--gru-state-layout', choices=GRU_STATE_LAYOUTS,
+        default=DEFAULT_GRU_STATE_LAYOUT,
+        help="'split' (default, the shipped contract) exports one tensor per "
+             "GRU hidden; 'combined' (EXPERIMENTAL, no C runtime binds it) "
+             "stacks them into one h_gru tensor placed after the caches, "
+             "which keep their own tensors. A model with a single GRU hidden "
+             "(Align_CRUSE, DeepVQE_S) stays split -- there is nothing to "
+             "combine.")
     args = parser.parse_args()
     args.model_name = model_name
 
@@ -647,7 +771,7 @@ def main(model_name: str) -> None:
     if args.max_delay_frames is not None:
         set_alignment_depth(model, args.max_delay_frames)
     model.eval()
-    built = _build(args.model_name, model)
+    built = _build(args.model_name, model, args.gru_state_layout)
     export_graph(grid, built, args.checkpoint, args.output, checkpoint_depth,
                  opset=args.opset, verify=args.verify)
     print(args.output)

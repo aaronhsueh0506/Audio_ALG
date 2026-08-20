@@ -93,21 +93,25 @@ python3 inference.py calib --model output/dfn2_best.pth \
 
 The graph is stateless from the accelerator's perspective. Each invocation
 receives exactly three feature frames `[t-1,t,t+1]`, emits the heads for frame
-`t`, and returns one encoder GRU tensor, two independently quantizable ERB GRU
-layer tensors, two independently quantizable DF GRU layer tensors, plus the
-four-frame `df_convp` history for the next invocation. The C state keeps each
-pair contiguous; only the graph boundary splits the layers so a per-tensor PTQ
-tool does not force both recurrent layers to share one activation scale. The
-extra history is required because the
+`t`, and returns one hidden tensor per GRU -- `h_encoder` `(1,1,256)`, `h_erb`
+`(2,1,256)` and `h_df` `(2,1,256)` -- plus the four-frame `df_convp` history
+for the next invocation. Each hidden is PyTorch's own stacked
+`(num_layers, 1, hidden)` shape, which is exactly how `DFN2ModelIOState`
+already lays its `[layers][hidden]` arrays out, so a runtime binds one tensor
+to one contiguous field. The extra history is required because the
 input kernel sees three frames while the DF residual path has a causal
 five-frame kernel; omitting it would silently reduce the trained receptive
 field. CPU-side window/state storage is defined by
 `dfn2_model_io.c/.h`, which also exports the window-slide and state-commit
 helpers so an external dual-input consumer with its own state struct reuses
 this window/commit discipline instead of inlining a second copy of the
-memmove/memcpy pair. State commit is transactional: a null or non-finite
-accelerator output returns `-1` before any persistent state is overwritten.
-The exported metadata carries `state_layout_version`,
+memmove/memcpy pair. `dfn2_model_io_commit_state()` and
+`dfn2_model_io_commit_arrays()` take one array per GRU stack --
+`erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN]` and
+`df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN]` -- matching
+the graph tensors element for element. State commit is transactional: a null
+or non-finite accelerator output returns `-1` before any persistent state is
+overwritten. The exported metadata carries `state_layout_version`,
 kept numerically equal to `DFN2_MODEL_IO_LAYOUT_VERSION` in that header, so an
 integrator can refuse a graph whose state layout no longer matches the struct
 it allocated. `inference.py calib --frames N` captures `N`
@@ -115,6 +119,41 @@ streaming invocations with real non-zero state. `calibrate_norm_init.py` is a
 different tool: it estimates the feature EMA initialization constants used by
 the C frontend.
 Use `--format npz --output calib/dfn2.npz` when a NumPy archive is needed.
+
+## Recurrent-state layouts
+
+`--gru-state-layout` selects how the recurrent state is presented at the graph
+boundary, on `export_onnx.py` and on `inference.py calib` alike (calibration
+exports the graph from the same model instance in the same process, so pass
+the flag there rather than exporting twice). The maths is identical either
+way; only the boundary and the published `state_layout_version` differ.
+
+| layout | version | state inputs | status |
+| --- | --- | --- | --- |
+| `split` (default) | 5 | `h_encoder`, `h_erb`, `h_df`, `df_convp_history` | shipped; `dfn2_model_io.h` binds it |
+| `combined` | 6 | `h_gru` `(5,1,256)`, `df_convp_history` | experimental; no C runtime binds it |
+
+Version 4 is retired (`RETIRED_LAYOUT_VERSIONS`); the contract test asserts
+`DFN2_MODEL_IO_LAYOUT_VERSION` against both the retired numbers and the
+combined one, so a C-side bump onto either fails a test rather than a review.
+
+ONNX has no stacked GRU op, so a two-layer stack still becomes two GRU nodes
+fed by per-layer `Slice`s -- five GRU nodes in both layouts. What the split
+layout trades is therefore PTQ scale granularity, per GRU rather than per
+layer: the two layers of `h_erb` share one input tensor and one quantization
+scale, in exchange for the native shape and an exact match to the C struct.
+
+The combined layout exists to measure what a single shared scale costs, which
+`inference.py calib` reports per GRU under `gru_state_slices`:
+
+```bash
+python3 inference.py calib --model output/dfn2_best.pth \
+  --wav-dir /path/to/noisy_wavs --frames 8192 --format bin \
+  --gru-state-layout combined --output calib/dfn2_combined
+```
+
+Adopting it would be a contract change, not a flag flip: `dfn2_model_io.h`,
+its commit API, the I/O tables and the C tests would all have to move with it.
 
 ## Debugging excessive low-frequency suppression
 

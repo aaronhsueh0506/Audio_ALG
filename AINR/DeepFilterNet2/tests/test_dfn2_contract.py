@@ -57,6 +57,7 @@ from export_onnx import (  # noqa: E402
     GRU_STATE_NAMES,
     INPUT_NAMES,
     OUTPUT_NAMES,
+    RETIRED_LAYOUT_VERSIONS,
     STATE_LAYOUT_VERSION,
     StatelessDFN2Heads,
     build_metadata,
@@ -368,10 +369,8 @@ def test_c_model_io_layout_constants_match_the_shipped_export_shapes():
         (1, 1, frames, n_erb),
         (1, 2, frames, df_bins),
         (c_macro(header, 'DFN2_MODEL_ENCODER_GRU_LAYERS'), 1, hidden),
-        (1, 1, hidden),
-        (1, 1, hidden),
-        (1, 1, hidden),
-        (1, 1, hidden),
+        (c_macro(header, 'DFN2_MODEL_ERB_GRU_LAYERS'), 1, hidden),
+        (c_macro(header, 'DFN2_MODEL_DF_GRU_LAYERS'), 1, hidden),
         (1, c_macro(header, 'DFN2_MODEL_ENCODER_CHANNELS'),
          c_macro(header, 'DFN2_MODEL_DF_PATHWAY_HISTORY'), df_bins),
     )
@@ -430,14 +429,31 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
     for node in graph.graph.node:
         for input_name in node.input:
             consumers.setdefault(input_name, []).append(node)
-    split_states = ('h_erb_0', 'h_erb_1', 'h_df_0', 'h_df_1')
-    state_grus = []
-    for name in split_states:
-        direct = consumers.get(name, [])
-        assert len(direct) == 1 and direct[0].op_type == 'GRU', name
-        state_grus.append(direct[0].name)
-    assert len(set(state_grus)) == len(split_states), (
-        'each split state must feed its own GRU node without Cat/requantize'
+    # Each hidden stack must reach its own GRU nodes without ever meeting
+    # another state tensor. ONNX has no stacked GRU op, so a two-layer stack
+    # legitimately arrives through per-layer Slices; what must never appear is
+    # a Concat, which would hand two states one quantization scale.
+    def _grus_reached(name):
+        reached = set()
+        for node in consumers.get(name, []):
+            if node.op_type == 'GRU':
+                reached.add(node.name)
+            elif node.op_type == 'Slice':
+                for produced in node.output:
+                    reached |= _grus_reached(produced)
+            else:
+                raise AssertionError(
+                    '%s reaches a %s before its GRU; only per-layer Slices '
+                    'may sit in between' % (name, node.op_type)
+                )
+        return reached
+
+    per_state = {name: _grus_reached(name) for name in GRU_STATE_NAMES}
+    for name, reached in per_state.items():
+        assert reached, name
+    merged = set().union(*per_state.values())
+    assert len(merged) == sum(len(value) for value in per_state.values()), (
+        'two states reached the same GRU node: %r' % per_state
     )
 
     # Two invocations, recorded exactly the way calibration_main records them.
@@ -487,10 +503,18 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
         inputs,
         outputs,
     )
-    assert metadata['state_layout_version'] == c_macro(
-        model_io_header(), 'DFN2_MODEL_IO_LAYOUT_VERSION'
-    )
+    header_version = c_macro(model_io_header(),
+                             'DFN2_MODEL_IO_LAYOUT_VERSION')
+    assert metadata['state_layout_version'] == header_version
     assert STATE_LAYOUT_VERSION == metadata['state_layout_version']
+    # The header's prose says versions 4 and 6 are taken. Stated as an
+    # assertion so a C-side bump onto one fails here rather than shipping a
+    # header that means two different things to two different graphs.
+    taken = RETIRED_LAYOUT_VERSIONS | {COMBINED_STATE_LAYOUT_VERSION}
+    assert header_version not in taken, (
+        'DFN2_MODEL_IO_LAYOUT_VERSION %d collides with a published layout'
+        % header_version
+    )
 
 
 if __name__ == '__main__':
@@ -881,11 +905,10 @@ def test_combined_gru_state_is_the_split_state_stacked_in_struct_order():
     """The experimental single-tensor recurrent state must change nothing.
 
     Both layouts run the same graph maths; the combined one only slices its
-    five hidden states off one input and concatenates them back. Heads and
+    three hidden stacks off one input and concatenates them back. Heads and
     state must therefore be bit-identical, and the concatenation order must be
-    DFN2ModelIOState's memory order (encoder, erb x2, df x2) or a runtime
-    binding the combined tensor to those bytes would silently transpose the
-    layers.
+    DFN2ModelIOState's memory order (encoder, erb, df) or a runtime binding
+    the combined tensor to those bytes would silently transpose the stacks.
     """
     torch.manual_seed(73)
     model = _small_dfn2()
@@ -928,22 +951,26 @@ def test_combined_gru_state_is_the_split_state_stacked_in_struct_order():
     assert float(combined_state[0].abs().max()) > 0.0
 
     assert len(combined_state) == 2, 'combined state is one GRU tensor + cache'
-    stacked = torch.cat(split_state[:5], dim=0)
+    hidden_count = len(GRU_STATE_NAMES)
+    stacked = torch.cat(split_state[:hidden_count], dim=0)
     assert torch.equal(stacked, combined_state[0])
-    for index in range(len(GRU_STATE_NAMES)):
+    for name, start, stop in split.gru_state_slices:
         assert torch.equal(
-            split_state[index], combined_state[0][index:index + 1]
-        ), 'layer %d landed at the wrong offset' % index
-    assert torch.equal(split_state[5], combined_state[1])
+            split_state[GRU_STATE_NAMES.index(name)],
+            combined_state[0][start:stop]
+        ), '%s landed at the wrong offset' % name
+    assert torch.equal(split_state[hidden_count], combined_state[1])
 
 
-def test_combined_gru_state_reaches_five_distinct_grus_through_slices(tmp_path):
+def test_combined_gru_state_reaches_every_gru_through_slices(tmp_path):
     """What the PTQ A/B is actually about: the graph, not the torch maths.
 
-    The five states now arrive on ONE input, so the thing worth pinning is
-    that each still reaches its own GRU node through its own Slice -- if a
-    later change let them meet at a Cat first, the shared-scale hazard the
-    split layout was built to avoid would be worse, not merely present.
+    The three hidden stacks now arrive on ONE input, so the thing worth
+    pinning is that each still reaches its own GRU nodes through its own
+    Slice -- if a later change let them meet at a Cat first, the shared-scale
+    hazard would be worse, not merely present. ONNX has no stacked GRU op, so
+    a two-layer stack legitimately becomes two GRU nodes fed by a further
+    internal Slice; the count below is nodes, not state tensors.
     """
     onnx = pytest.importorskip('onnx')
     torch.manual_seed(73)
@@ -963,11 +990,6 @@ def test_combined_gru_state_reaches_five_distinct_grus_through_slices(tmp_path):
     for name in GRU_STATE_NAMES:
         assert name not in declared, 'combined layout must not also declare %s' % name
 
-    producers = {}
-    for node in graph.graph.node:
-        for output_name in node.output:
-            producers[output_name] = node
-
     def _reaches_gru(name, depth=0):
         """Walk forward from h_gru to the GRU nodes that consume its slices."""
         found = []
@@ -982,12 +1004,15 @@ def test_combined_gru_state_reaches_five_distinct_grus_through_slices(tmp_path):
                     found.extend(_reaches_gru(output_name, depth + 1))
             elif node.op_type == 'Concat':
                 raise AssertionError(
-                    'h_gru reaches a Concat before its GRUs -- the five '
-                    'states would share one quantization scale'
+                    'h_gru reaches a Concat before its GRUs -- the three '
+                    'stacks would share one quantization scale'
                 )
         return found
 
     reached = _reaches_gru('h_gru')
-    assert len(set(reached)) == len(GRU_STATE_NAMES), (
-        'expected one distinct GRU per state, reached %r' % sorted(set(reached))
+    expected = sum(stop - start for _name, start, stop
+                   in wrapper.gru_state_slices)
+    assert len(set(reached)) == expected, (
+        'expected one distinct GRU node per recurrent layer, reached %r'
+        % sorted(set(reached))
     )

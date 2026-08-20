@@ -185,6 +185,10 @@ feature tensors as separate inputs so each keeps its own quantization scale.
 The far branch is the AEC aligned-far seam; it carries raw far before
 acquisition and aligned far afterward.
 
+The two tables below are the shipped `host`/`split` boundary, the only pair
+`ulcnet_model_io.h` binds. "Graph boundary layouts" further down describes the
+other three and the flags that select them.
+
 Inputs per invocation:
 
 | tensor | float32 shape | ordering |
@@ -294,9 +298,71 @@ D value must match the exported graph because it fixes the K/V-history tensor
 shapes and CPU state allocation, not because changing D requires retraining.
 
 The exporter writes a sibling JSON descriptor containing the exact grid,
-state layout version, D, the fixed `aligned_far` deployment contract, the
+state layout version, the `feature_layout`/`gru_state_layout` pair that
+version belongs to, D, the fixed `aligned_far` deployment contract, the
 checkpoint's separate training provenance, and tensor schemas. Only the
 model-local `export_onnx.py` is a supported user entry point.
+
+## Graph boundary layouts
+
+The boundary is a pair of independent switches, and the version belongs to the
+pair rather than to either half: `LAYOUT_VERSIONS` in `export_onnx.py` names
+all four. `inference.py calib` takes the same two flags and exports the graph
+from the same model instance in the same process, so pass them there rather
+than exporting twice.
+
+| `--feature-layout` | `--gru-state-layout` | version | signal inputs | graph inputs | status |
+| --- | --- | ---: | --- | ---: | --- |
+| `host` (default) | `split` (default) | 5 | `error_mag`, `far_mag`, `error_cos`, `error_sin`, `error_ri` | 10 | shipped; `ulcnet_model_io.h` binds it |
+| `host` | `combined` | 6 | the same five | 9 | experimental |
+| `graph` | `split` | 4 | `error`, `far` | 7 | experimental; version 4's boundary, restored |
+| `graph` | `combined` | 7 | `error`, `far` | 6 | experimental |
+
+`--feature-layout` chooses where the fixed front and back ends run. `host`
+leaves the signed-power compression, both magnitudes and the compressed-domain
+phase outside the graph (`stream_features`; C: `ulcnet_model_io_prepare`), and
+the inverse power on the way back (`host_output`; C:
+`ulcnet_model_io_commit`). `graph` binds the two raw RI spectra
+`(1, 1, 257, 2)` instead and runs that same fixed math inside the graph, which
+is precisely the boundary version 4 had -- so it reuses that number rather
+than claiming a new one for a contract that already existed.
+
+The trade is quantization, not arithmetic. `host` keeps a separate scale per
+feature and keeps the unlearned `sqrt`/`atan2`/`pow` out of the quantized
+domain; `graph` binds fewer tensors and needs no host front end, paid for by
+moving that math into the quantized domain and by `error_cos`/`error_sin`
+sharing whatever scale the compiler derives for them. Measured on the exported
+graphs, the `graph` layout adds `Sign` x6, `Abs` x6, `Pow` x6, `Sqrt` x2,
+`Atan`, `Cos` and `Sin`, plus the elementwise and indexing nodes around them:
+121 nodes become 177 after `onnxoptimizer` and constant folding.
+
+`--gru-state-layout` chooses how the two subband GRU hiddens are presented.
+`split` exports `h_gru0` and `h_gru1`, each `(GRU_LAYERS, 1, GRU_HIDDEN)`.
+`combined` stacks them along dim 0 into one `h_gru`
+`(2*GRU_LAYERS, 1, GRU_HIDDEN)`, `h_gru0` first, and returns a single
+`h_gru_out`. The three attention caches (`key_history`, `value_history`,
+`logit_history`) stay separate in both layouts: they are structural histories,
+not recurrent hidden state, and do not share a distribution with the hiddens.
+The combined layout exists to measure what one shared quantization scale
+costs.
+
+All four pairs compute the same frames.
+`test_every_layout_pair_computes_the_same_frames` runs each of them against
+the shipped pair frame by frame and requires bit-identical output
+(`rtol=0, atol=0`).
+
+```bash
+python3 export_onnx.py \
+  --checkpoint checkpoint.pth \
+  --max-delay-frames 8 \
+  --feature-layout graph --gru-state-layout combined \
+  --output output/align_ulcnet_d8_graph_combined.onnx \
+  --verify
+```
+
+Adopting a different pair is a contract change, not a flag flip:
+`ulcnet_model_io.h`, its prepare/commit API and the I/O tables above all move
+with it.
 
 **Every previously exported graph must be re-exported.** The model-I/O layout
 is now v5 (v3 fixed the deployed far branch RAW -> ALIGNED, v4 renamed the
@@ -309,7 +375,9 @@ the whole remedy: nothing upstream of the graph changed. Checkpoints keep their
 weights and their recorded training provenance, and datasets need no
 regeneration -- the exporter reads the checkpoint's training
 `far_input_mode` and writes it beside the fixed deployment value rather than
-requiring the two to agree.
+requiring the two to agree. Versions 4, 6 and 7 are taken by the other three
+boundary pairs rather than free, so the next real bump of
+`ULCNET_MODEL_IO_LAYOUT_VERSION` goes to 8.
 
 CPU state storage and ring updates are implemented by
 `ulcnet_model_io.c/.h`.  They use one caller-owned pool, allocate RAM according

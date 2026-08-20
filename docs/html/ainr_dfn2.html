@@ -137,24 +137,48 @@ hop-lag: 輸出音訊落後輸入 2 hops (heads 1 hop + DF future tap 1 hop, 串
 <tr><th>Tensor</th><th>shape</th><th>dtype</th><th>每次呼叫框數</th><th>時域樣本</th><th>備註</th></tr>
 <tr><td><code>frame</code>(C 入)</td><td>[512]</td><td>float32</td><td>1 hop</td><td>512(10.67 ms)</td><td><code>dfn2_analysis</code> 只吃新樣本,滑窗自持</td></tr>
 <tr><td><code>spec_re/spec_im</code></td><td>[513] ×2</td><td>float32</td><td>1</td><td>—</td><td>原尺度頻譜(masking/ISTFT 用)</td></tr>
-<tr><td><code>erb</code>(模型入;C 緩衝 <code>feat_erb</code>)</td><td>C: [32];圖: (1,1,T,32)</td><td>float32</td><td>1</td><td>—</td><td>dB mean-norm 後 /40</td></tr>
-<tr><td><code>spec</code>(模型入;C 緩衝 <code>feat_spec</code>)</td><td>C: [192] = [re×96 ‖ im×96];圖: (1,2,T,96)</td><td>float32</td><td>1</td><td>—</td><td>非交錯;C 內已乘 <code>DFN2_ANALYSIS_SCALE</code></td></tr>
-<tr><td><code>erb_mask</code>(模型出)</td><td>(1,1,T,32) → C [32]</td><td>float32</td><td>1</td><td>—</td><td>sigmoid ∈ [0,1]</td></tr>
-<tr><td><code>coefs</code>(模型出)</td><td>(1,T,96,10) → C [960]</td><td>float32</td><td>1</td><td>—</td><td>layout = (bin, tap, re/im),bin 最外</td></tr>
-<tr><td><code>alpha</code>(模型出)</td><td>(1,T,1) → C scalar</td><td>float32</td><td>1</td><td>—</td><td>sigmoid;0=走 masked,1=走 DF</td></tr>
+<tr><td><code>erb</code>(圖入;C 緩衝 <code>feat_erb</code>)</td><td>C: [32];圖: (1,1,3,32)</td><td>float32</td><td>1</td><td>—</td><td>dB mean-norm 後 /40;圖吃 <code>[t-1,t,t+1]</code> 三幀視窗</td></tr>
+<tr><td><code>spec</code>(圖入;C 緩衝 <code>feat_spec</code>)</td><td>C: [192] = [re×96 ‖ im×96];圖: (1,2,3,96)</td><td>float32</td><td>1</td><td>—</td><td>非交錯;C 內已乘 <code>DFN2_ANALYSIS_SCALE</code>;同樣是三幀視窗</td></tr>
+<tr><td><code>erb_mask</code>(圖出)</td><td>(1,1,1,32) → C [32]</td><td>float32</td><td>1</td><td>—</td><td>sigmoid ∈ [0,1]</td></tr>
+<tr><td><code>df_coefs</code>(圖出;C 緩衝 <code>coefs</code>)</td><td>(1,1,96,10) → C [960]</td><td>float32</td><td>1</td><td>—</td><td>layout = (bin, tap, re/im),bin 最外</td></tr>
+<tr><td><code>df_alpha</code>(圖出;C 緩衝 <code>alpha</code>)</td><td>(1,1,1) → C scalar</td><td>float32</td><td>1</td><td>—</td><td>sigmoid;0=走 masked,1=走 DF</td></tr>
 <tr><td><code>out_re/out_im</code></td><td>[513] ×2</td><td>float32</td><td>1(屬 current-2 框)</td><td>—</td><td><code>valid==1</code> 才有效</td></tr>
 <tr><td><code>out_frame</code>(C 出)</td><td>[512]</td><td>float32</td><td>1 hop</td><td>512</td><td>WOLA 輸出</td></tr>
 </table></div>
-<p class="note">模型 I/O shape 以出貨 config 實際 forward 驗證:<code>erb_mask (1,1,T,32)</code>、
-<code>coefs (1,T,96,10)</code>、<code>alpha (1,T,1)</code>、enhanced <code>(1,513,T) complex64</code>。</p>
+<p class="note">上表圖側 shape 取自出貨 config 實際匯出的 <code>input_schema</code>/<code>output_schema</code>
+(串流圖 T 固定:輸入視窗 3 幀、輸出 1 幀)。離線 <code>model.py heads()</code> 仍吃整段 T:
+<code>erb_mask (1,1,T,32)</code>、<code>coefs (1,T,96,10)</code>、<code>alpha (1,T,1)</code>、
+enhanced <code>(1,513,T) complex64</code>。</p>
 
 <h2>State 表</h2>
 <p><b>ONNX/匯出邊界</b>:<code>model.py heads()</code> 即匯出邊界——圖內只有網路
 (encoder/ERBDecoder/DFDecoder);ERB mask 展開、DF FIR、alpha blend、PF、atten-lim、
 ISTFT 全在圖外的 C。<code>export_onnx.py</code> 已交付 stateless heads graph：
-每次由 host 傳入 3 幀 feature window、五個逐層 GRU hidden tensor 與 DF pathway history，
-並取回 heads 與更新後 state；加速器本身不保存跨次呼叫狀態。C helper 在寫入前
-驗證整批 next-state，NULL/NaN/Inf 會回傳 -1 且保留上一筆 state。</p>
+每次由 host 傳入 3 幀 feature window、三個 GRU hidden tensor 與 DF pathway history
+(出貨 split layout 共<b>六個 input</b>:<code>erb</code>、<code>spec</code>、
+<code>h_encoder</code>、<code>h_erb</code>、<code>h_df</code>、<code>df_convp_history</code>)，
+並取回三個 head 與四個 <code>*_out</code> state；加速器本身不保存跨次呼叫狀態。
+C 端 <code>dfn2_model_io_commit_state()</code>／<code>dfn2_model_io_commit_arrays()</code>
+收下 <code>erb_hidden_next[2][256]</code> 與 <code>df_hidden_next[2][256]</code> 兩個 stacked 陣列，
+在寫入前驗證整批 next-state，NULL/NaN/Inf 會回傳 -1 且保留上一筆 state。</p>
+
+<p><b>Recurrent state layout</b>(<code>--gru-state-layout</code>,<code>export_onnx.py</code> 與
+<code>inference.py calib</code> 同旗標):
+<b>split = state layout version 5,出貨合約</b>——每顆 GRU 一個 tensor,維持 PyTorch 原生
+stacked 形狀 <code>(num_layers, 1, hidden)</code>,與 <code>DFN2ModelIOState</code> 的
+<code>[layers][hidden]</code> 陣列逐一對位,runtime 一個 tensor 綁一塊連續欄位;
+<code>dfn2_model_io.h</code> 綁的就是這個 layout。
+<b>combined = state layout version 6,EXPERIMENTAL、無 C runtime 綁定</b>——三顆併成一個
+<code>h_gru (5,1,256)</code>,input 只剩四個,用來量測「三顆共用一個量化 scale 值多少」
+(<code>inference.py calib</code> 額外輸出 <code>gru_state_slices</code> 報告)。
+<b>version 4 已退役</b>(<code>RETIRED_LAYOUT_VERSIONS</code>);合約測試把
+<code>DFN2_MODEL_IO_LAYOUT_VERSION</code> 同時對退役號碼與 combined 號碼檢查,
+C 端誤 bump 到 4 或 6 會當場失敗。</p>
+<p class="note">易誤解處:ONNX <b>沒有 stacked GRU op</b>,兩層的 stack 仍展開成兩個 GRU node、
+由 per-layer Slice 餵入——實測兩種 layout <b>都是 5 個 GRU node</b>(1+2+2 層)。
+version 5 換掉的不是 Slice,是 <b>PTQ scale 的粒度</b>:per-GRU 而非 per-layer,
+<code>h_erb</code> 兩層共用同一個 input tensor 與同一個量化 scale。version 3 是把 stack
+複製成單層 module 才買到 per-layer scale;此合約選的是原生形狀與 C struct 的精確對位。</p>
 <div class="tbl"><table>
 <tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
 <tr><td><code>analysis_buf</code></td><td>[1024]</td><td>4,096</td><td>C struct <code>DFN2State</code></td><td>分析滑窗</td></tr>
@@ -169,9 +193,9 @@ ISTFT 全在圖外的 C。<code>export_onnx.py</code> 已交付 stateless heads 
 <tr><td><code>hi_delay_re/im</code></td><td>[5][417] ×2</td><td>16,680</td><td>C struct</td><td>高頻段同步延遲(band split 對時)</td></tr>
 <tr><td><code>stream_frame_index</code> 等 index</td><td>—</td><td>16</td><td>C struct</td><td>串流框編號 / ring 指標</td></tr>
 <tr><td>scratch 區</td><td>—</td><td>~12.4 KB</td><td>C struct</td><td>非跨呼叫,每次覆寫</td></tr>
-<tr><td><code>h_encoder</code></td><td>(1,B,256)</td><td>1,024</td><td>host caller</td><td>顯式 graph I/O；<code>encoder.emb_gru</code> hidden，跨次呼叫由 host 保存</td></tr>
-<tr><td><code>h_erb_0</code>、<code>h_erb_1</code></td><td>各 (1,B,256)</td><td>各 1,024</td><td>host caller</td><td>顯式 graph I/O；ERB decoder 兩層各自校正量化 scale</td></tr>
-<tr><td><code>h_df_0</code>、<code>h_df_1</code></td><td>各 (1,B,256)</td><td>各 1,024</td><td>host caller</td><td>顯式 graph I/O；DF decoder 兩層各自校正量化 scale</td></tr>
+<tr><td><code>h_encoder</code></td><td>(1,1,256)</td><td>1,024</td><td>host caller</td><td>顯式 graph I/O；<code>encoder.emb_gru</code> 的 1 層 stacked hidden，跨次呼叫由 host 保存</td></tr>
+<tr><td><code>h_erb</code></td><td>(2,1,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；ERB decoder GRU 原生 stacked hidden，對應 <code>erb_gru_hidden[2][256]</code>；兩層共用一個量化 scale</td></tr>
+<tr><td><code>h_df</code></td><td>(2,1,256)</td><td>2,048</td><td>host caller</td><td>顯式 graph I/O；DF decoder GRU 原生 stacked hidden，對應 <code>df_gru_hidden[2][256]</code>；兩層共用一個量化 scale</td></tr>
 <tr><td>conv 時間快取</td><td>erb_conv0/df_conv0 的 3 幀輸入 window；df_convp:4 框×(64×96)=24,576 f32</td><td>約 100 KB</td><td>host caller</td><td>window/pathway history 都是顯式 graph I/O；加速器不持有 state</td></tr>
 </table></div>
 <p class="note"><code>sizeof(DFN2State)</code> = 85,632 bytes(本機以 <code>-ffp-contract=off</code> 編譯量測)。</p>
@@ -195,10 +219,12 @@ head/spectrum 配對無法以「輸出有限」矇混過關。</li>
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li>C 前後處理:<code>AINR/DeepFilterNet2/dfn2_process.c</code> / <code>.h</code>（DSP kernels 內含於本檔——porting 為單一 model，各自攜帶）</li>
-<li>模型 / 訓練 / 推論:<code>AINR/DeepFilterNet2/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>config.ini</code></li>
+<li>C 模型 I/O 狀態:<code>AINR/DeepFilterNet2/dfn2_model_io.c</code> / <code>.h</code>(feature 視窗推進、transactional state commit、<code>DFN2_MODEL_IO_LAYOUT_VERSION</code>)</li>
+<li>模型 / 訓練 / 推論 / 匯出:<code>AINR/DeepFilterNet2/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>export_onnx.py</code>、<code>config.ini</code></li>
 <li>文件:<a href="../../AINR/DeepFilterNet2/README.md">README.md</a>、<a href="../../AINR/DeepFilterNet2/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT.md</a></li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code> — <code>make -C AINR test-simd</code>
 實測 NEON/scalar digest 皆 <code>de7e511600d05a10</code>(bit 相同)</li>
-<li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code> — 實測 32 passed;
-共用測試 <code>AINR/tests/</code>(pytest)— 實測 39 passed（<code>pytest AINR</code> 全樹 = 192）</li>
+<li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code> — 實測 33 passed
+(含 layout version 互鎖、split/combined 等價、per-GRU state 各自抵達自己的 GRU node);
+共用測試 <code>AINR/tests/</code>(pytest)— 實測 43 passed（<code>pytest AINR</code> 全樹 = 199）</li>
 </ul>

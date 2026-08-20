@@ -374,7 +374,8 @@ def calibration_main():
     }
     if wrapper.gru_state_layout.combined:
         report['gru_state_slices'] = gru_state_slice_report(
-            arrays[COMBINED_GRU_STATE_NAME], _stats
+            arrays[COMBINED_GRU_STATE_NAME], _stats,
+            wrapper.gru_state_slices,
         )
 
     write_calibration_artifact(

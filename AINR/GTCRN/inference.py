@@ -160,13 +160,13 @@ def calibration_main():
     )
     try:
         from .export_onnx import (
-            INPUT_NAMES, build_stream_model, export_graph, initial_inputs,
-            stream_features,
+            DEFAULT_STATE_LAYOUT, SIGNAL_INPUT_NAMES, STATE_LAYOUTS,
+            build_stream_model, export_graph, layout_of, stream_features,
         )
     except ImportError:
         from export_onnx import (
-            INPUT_NAMES, build_stream_model, export_graph, initial_inputs,
-            stream_features,
+            DEFAULT_STATE_LAYOUT, SIGNAL_INPUT_NAMES, STATE_LAYOUTS,
+            build_stream_model, export_graph, layout_of, stream_features,
         )
 
     parser = argparse.ArgumentParser(description=calibration_main.__doc__)
@@ -183,6 +183,11 @@ def calibration_main():
     parser.add_argument('--onnx', default=None,
                         help='where to write the graph these tensors bind to '
                              '(default: <output>.onnx)')
+    parser.add_argument(
+        '--state-layout', choices=sorted(STATE_LAYOUTS),
+        default=DEFAULT_STATE_LAYOUT,
+        help='state layout for the graph exported beside these tensors; '
+             'see the export CLI')
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error('--frames must be positive')
@@ -197,14 +202,18 @@ def calibration_main():
     if not files:
         raise FileNotFoundError('no wav files under %s' % args.wav_dir)
     random.Random(args.seed).shuffle(files)
-    stream_model, grid = build_stream_model(args.config, args.model)
+    stream_model, grid = build_stream_model(args.config, args.model,
+                                            state_layout=args.state_layout)
     # The graph is exported (and parity-checked) in the same process, from the
     # same model instance the tensors below are recorded against, so the two
     # deployment artifacts cannot drift apart.
     onnx_path = sibling_onnx_path(args.output, args.onnx)
     graph_metadata = export_graph(stream_model, grid, args.model, onnx_path,
                                   verify=True)
-    captured = {name: [] for name in INPUT_NAMES}
+    # Read off the module that was traced, not off the argument, so the
+    # recorded tensor names cannot describe a different boundary.
+    layout = layout_of(stream_model)
+    captured = {name: [] for name in layout.input_names}
     source_files = []
     window = torch.hann_window(grid['win_len']).sqrt()
 
@@ -229,14 +238,16 @@ def calibration_main():
                 wave, grid['n_fft'], grid['hop_len'], grid['win_len'],
                 window=window, center=False, return_complex=True,
             )).permute(1, 0, 2)
-            state = initial_inputs(stream_model.model)[3:]
+            state = layout.graph_inputs(
+                stream_model.model)[len(SIGNAL_INPUT_NAMES):]
             used = False
             for spectrum in spectra:
                 features = stream_features(
                     stream_model.model, spectrum[None, :, None, :]
                 )
                 inputs = tuple(features) + tuple(state)
-                capture_calibration_inputs(captured, INPUT_NAMES, inputs)
+                capture_calibration_inputs(captured, layout.input_names,
+                                           inputs)
                 state = stream_model(*inputs)[1:]
                 used = True
                 if len(captured['mag']) >= args.frames:

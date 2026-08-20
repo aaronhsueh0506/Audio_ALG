@@ -25,17 +25,24 @@ for _stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx')
 
 from model import GTCRN, SFE  # noqa: E402
 from stream_model import (  # noqa: E402
+    CombinedStateGTCRN,
     StreamGTCRN,
     _FrequencyNeighborhood,
     initial_inputs,
+    pack_state,
 )
 from export_onnx import (  # noqa: E402
+    COMBINED_STATE_LAYOUT_VERSION,
     INPUT_NAMES,
     OUTPUT_NAMES,
+    SIGNAL_INPUT_NAMES,
+    STATE_LAYOUTS,
     STATE_LAYOUT_VERSION,
     build_metadata,
     build_stream_model,
     export_graph,
+    layout_of,
+    resolve_state_layout,
 )
 
 
@@ -86,10 +93,16 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
     """
     metadata = _metadata(tmp_path)
     assert metadata['erb_boundary'] == 'host_prepost'
-    assert metadata['state_layout_version'] == c_macro(
-        'GTCRN_MODEL_LAYOUT_VERSION'
-    )
+    header_version = c_macro('GTCRN_MODEL_LAYOUT_VERSION')
+    assert metadata['state_layout_version'] == header_version
     assert STATE_LAYOUT_VERSION == metadata['state_layout_version']
+    # gtcrn_process.h's prose reserves the combined layout's number. Stated as
+    # an assertion so a C-side bump onto it fails here rather than shipping a
+    # header that means two different things to two different graphs.
+    assert header_version != COMBINED_STATE_LAYOUT_VERSION, (
+        'GTCRN_MODEL_LAYOUT_VERSION %d collides with the combined layout'
+        % header_version
+    )
 
 
 def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
@@ -203,6 +216,16 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
         assert blob.size == int(np.prod(graph_shapes[name])), name
 
 
+def _checkpoint(tmp_path, n_fft=512):
+    """A throwaway checkpoint on the grid ``_grid_config`` describes."""
+    path = os.fspath(tmp_path / ('gtcrn_%d.pth' % n_fft))
+    torch.save(
+        {'state_dict': GTCRN(65, 64, nfft=n_fft, fs=16000).state_dict()},
+        path,
+    )
+    return path
+
+
 def _grid_config(tmp_path, n_fft):
     config = tmp_path / 'config.ini'
     config.write_text(
@@ -221,11 +244,7 @@ def test_build_stream_model_follows_the_config_grid(tmp_path):
     ``load_state_dict`` (the ERB matrices change extent with n_fft), never
     deep inside a matmul on mismatched dummy inputs.
     """
-    checkpoint = os.fspath(tmp_path / 'gtcrn_256.pth')
-    torch.save(
-        {'state_dict': GTCRN(65, 64, nfft=256, fs=16000).state_dict()},
-        checkpoint,
-    )
+    checkpoint = _checkpoint(tmp_path, 256)
     stream, grid = build_stream_model(_grid_config(tmp_path, 256), checkpoint)
     assert grid['n_fft'] == 256
     assert initial_inputs(stream.model)[0].shape == (1, 129, 1)
@@ -244,11 +263,7 @@ def test_exported_graph_declares_fully_static_io(tmp_path):
     """
     onnx = pytest.importorskip('onnx')
 
-    checkpoint = os.fspath(tmp_path / 'ckpt.pth')
-    torch.save(
-        {'state_dict': GTCRN(65, 64, nfft=512, fs=16000).state_dict()},
-        checkpoint,
-    )
+    checkpoint = _checkpoint(tmp_path)
     stream, grid = build_stream_model(_grid_config(tmp_path, 512), checkpoint)
     graph_path = os.fspath(tmp_path / 'gtcrn_static.onnx')
     export_graph(stream, grid, checkpoint, graph_path)
@@ -289,3 +304,95 @@ def test_runtime_erb_bins_match_the_constructor(tmp_path):
     assert fwd.shape == ref_fwd.shape and inv.shape == ref_inv.shape
     assert np.array_equal(fwd, ref_fwd)
     assert np.array_equal(inv, ref_inv)
+
+
+def test_combined_state_groups_the_sixteen_slots_by_shape():
+    """The combined boundary must regroup state without reshaping it.
+
+    Every group is concatenated along an axis its members already have -- the
+    convolution histories along depth, the hiddens along their layer axis --
+    so no tensor gains a dimension and the four-dimensional ceiling holds.
+    """
+    layout = resolve_state_layout('combined')
+    assert layout.state_names == ('conv_cache', 'h_tra', 'h_dpgrnn')
+    assert layout.input_names == ('mag', 'real', 'imag') + layout.state_names
+    assert layout.output_names == (
+        'output', 'conv_cache_out', 'h_tra_out', 'h_dpgrnn_out')
+    assert layout.layout_version == COMBINED_STATE_LAYOUT_VERSION
+    assert layout.layout_version != STATE_LAYOUT_VERSION, (
+        'a different state layout must not claim the shipped version'
+    )
+
+    model = _stream_model().model
+    packed = layout.graph_inputs(model)
+    assert len(packed) == len(layout.input_names)
+    split = initial_inputs(model)
+    assert [tuple(value.shape) for value in packed[:3]] == [
+        tuple(value.shape) for value in split[:3]
+    ], 'the feature inputs are untouched by the state regrouping'
+    conv_cache, h_tra, h_dpgrnn = packed[len(SIGNAL_INPUT_NAMES):]
+    # Two rows (encoder, decoder) x channels x summed depth x frequency.
+    assert conv_cache.shape == (2, 16, 16, 33)
+    assert h_tra.shape == (6, 1, 16)
+    assert h_dpgrnn.shape == (4, 33, 8)
+    for tensor in packed[len(SIGNAL_INPUT_NAMES):]:
+        assert tensor.dim() <= 4
+    assert sum(tensor.numel() for tensor in packed[len(SIGNAL_INPUT_NAMES):]) == sum(
+        tensor.numel() for tensor in split[len(SIGNAL_INPUT_NAMES):]
+    ), 'regrouping must not change the number of state values'
+
+
+def test_combined_and_split_state_layouts_compute_the_same_frames():
+    """Both boundaries wrap one streaming graph, so they must agree exactly."""
+    torch.manual_seed(19)
+    split = _stream_model()
+    model = split.model
+    combined = CombinedStateGTCRN(model).eval()
+    assert layout_of(split) is STATE_LAYOUTS['split']
+    assert layout_of(combined) is STATE_LAYOUTS['combined']
+
+    start = initial_inputs(model)
+    bands = start[0].shape[1]
+    split_state = start[len(SIGNAL_INPUT_NAMES):]
+    combined_state = pack_state(model, split_state)
+    generator = torch.Generator().manual_seed(23)
+    observed_nonzero = False
+    with torch.no_grad():
+        for _ in range(5):
+            signals = (
+                torch.randn(1, bands, 1, generator=generator).abs(),
+                torch.randn(1, bands, 1, generator=generator),
+                torch.randn(1, bands, 1, generator=generator),
+            )
+            expected = split(*(signals + split_state))
+            actual = combined(*(signals + combined_state))
+            assert torch.equal(actual[0], expected[0])
+            split_state = expected[1:]
+            combined_state = actual[1:]
+            for packed, reference in zip(combined_state,
+                                         pack_state(model, split_state)):
+                assert torch.equal(packed, reference)
+            observed_nonzero = observed_nonzero or bool(
+                combined_state[0].abs().max() > 0)
+    # Written so it can FAIL: zero state would satisfy every comparison above.
+    assert observed_nonzero, 'state never left its zero initialisation'
+
+
+def test_combined_state_graph_exports_and_matches_the_runtime(tmp_path):
+    onnx = pytest.importorskip('onnx')
+    pytest.importorskip('onnxruntime')
+    checkpoint = _checkpoint(tmp_path)
+    stream, grid = build_stream_model(
+        _grid_config(tmp_path, 512), checkpoint, state_layout='combined')
+    path = tmp_path / 'gtcrn_combined.onnx'
+    metadata = export_graph(stream, grid, checkpoint, os.fspath(path),
+                            verify=True)
+    assert metadata['state_layout'] == 'combined'
+    assert metadata['state_layout_version'] == COMBINED_STATE_LAYOUT_VERSION
+    graph = onnx.load(os.fspath(path))
+    declared = [entry.name for entry in graph.graph.input]
+    assert declared == list(STATE_LAYOUTS['combined'].input_names)
+    for name in INPUT_NAMES[len(SIGNAL_INPUT_NAMES):]:
+        assert name not in declared, (
+            'combined layout must not also declare %s' % name
+        )

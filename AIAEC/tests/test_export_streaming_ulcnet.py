@@ -14,7 +14,10 @@ from AIAEC.Align_ULCNet.export_onnx import (
     GRU_HIDDEN,
     GRU_LAYERS,
     COMPRESSION_EXPONENT,
+    FEATURE_LAYOUTS,
+    GRU_STATE_LAYOUTS,
     INPUT_NAMES,
+    LAYOUT_VERSIONS,
     SIGNAL_INPUTS,
     MAX_DELAY_DEPTH,
     MIN_DELAY_DEPTH,
@@ -26,7 +29,9 @@ from AIAEC.Align_ULCNet.export_onnx import (
     _write_metadata,
     dummy_inputs,
     export_graph,
+    graph_signals,
     next_state,
+    resolve_layout,
     state_shapes,
 )
 from AIAEC.Align_ULCNet.model import AlignULCNet
@@ -63,6 +68,76 @@ def test_streaming_export_shapes_are_fixed_and_delta_only():
         'output', 'key_now', 'value_now', 'logit_now',
         'h_gru0_out', 'h_gru1_out',
     )
+
+
+def test_every_boundary_pair_has_its_own_version():
+    pairs = {(feature, gru)
+             for feature in FEATURE_LAYOUTS for gru in GRU_STATE_LAYOUTS}
+    assert set(LAYOUT_VERSIONS) == pairs
+    assert len(set(LAYOUT_VERSIONS.values())) == len(LAYOUT_VERSIONS)
+    # ulcnet_model_io.h implements exactly one pair; every other pair must
+    # therefore carry a version the header rejects.
+    # With every version distinct, pinning the shipped pair is enough: no
+    # other pair can then carry the version ulcnet_model_io.h implements.
+    assert LAYOUT_VERSIONS[('host', 'split')] == STATE_LAYOUT_VERSION
+
+
+def test_graph_feature_layout_restores_the_pre_host_boundary():
+    layout = resolve_layout('graph', 'split')
+    assert layout.input_names == (
+        'error', 'far',
+        'key_history', 'value_history', 'logit_history', 'h_gru0', 'h_gru1',
+    )
+    assert layout.output_names == OUTPUT_NAMES
+    # Same tensor names, shapes and semantics as version 4, so it reuses that
+    # number rather than inventing a second one for the same contract.
+    assert layout.layout_version == 4
+
+
+@pytest.mark.parametrize('feature', sorted(FEATURE_LAYOUTS))
+@pytest.mark.parametrize('gru', sorted(GRU_STATE_LAYOUTS))
+def test_every_layout_pair_computes_the_same_frames(feature, gru):
+    """The four boundaries differ only in where tensors are cut, so a run
+    through any of them must reproduce the shipped pair bit for bit."""
+    torch.manual_seed(7)
+    model = AlignULCNet(GRID, max_delay_frames=D).eval()
+    reference = AlignUlcnetStreamingExport(model).eval()
+    candidate = AlignUlcnetStreamingExport(
+        model, feature_layout=feature, gru_state_layout=gru).eval()
+
+    def start(wrapper):
+        return tuple(value.clone() for value in
+                     dummy_inputs(D, wrapper.layout)[
+                         wrapper.layout.signal_inputs:])
+
+    def head(wrapper, outputs):
+        # Compare in one domain: the host layout leaves the inverse signed
+        # power to host_output(), the graph layout has already applied it.
+        if wrapper.layout.in_graph_features:
+            return outputs[0]
+        return host_output(model, outputs[0])
+
+    reference_state, candidate_state = start(reference), start(candidate)
+    generator = torch.Generator().manual_seed(11)
+    observed_nonzero = False
+    with torch.no_grad():
+        for _ in range(2 * D + 5):
+            error_ri = _ri(_complex_frame(generator))
+            far_ri = _ri(_complex_frame(generator))
+            expected = reference(*(
+                graph_signals(model, error_ri, far_ri, reference.layout)
+                + reference_state))
+            actual = candidate(*(
+                graph_signals(model, error_ri, far_ri, candidate.layout)
+                + candidate_state))
+            torch.testing.assert_close(
+                head(candidate, actual), head(reference, expected),
+                rtol=0, atol=0)
+            observed_nonzero = observed_nonzero or bool(
+                candidate_state[-1].abs().max() > 0)
+            reference_state = next_state(reference_state, expected, D)
+            candidate_state = next_state(candidate_state, actual, D)
+    assert observed_nonzero, 'state never left its zero initialisation'
 
 
 def test_c_descriptor_constants_match_export_contract():
