@@ -69,8 +69,11 @@ pipelines/bin/
 # its spatial-component sub-Makefile.
 pipelines/4ch_aec_bf_nr_res/obj/
 pipelines/4ch_aec_bf_nr_res/bin/
-pipelines/4ch_aec_bf_nr_res/third_party/obj/
-pipelines/4ch_aec_bf_nr_res/third_party/bin/
+# Config-keyed build output. Written as a pattern, not per-directory: the
+# hash-dir scheme is the same for every producer under pipelines/, and
+# spelling each one out meant a directory move silently lost coverage.
+pipelines/**/obj/
+pipelines/**/bin/
 
 # pytest's own cache (it writes a .gitignore inside, but be explicit)
 .pytest_cache/

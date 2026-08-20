@@ -69,8 +69,8 @@ Hard invariants:
   Align-ULCNet checkpoint's TA depth `D` are independent budgets.
 - The Python reference and the core C API leave SRP-PHAT/GSC at an explicit
   pre/post ownership seam. The complete C wrapper in `audio_pipeline_4ch.*` connects
-  that seam to the reusable implementations under this project's
-  `third_party/` directory.
+  that seam to the reusable implementations under `pipelines/third_party/`
+  (a sibling of this directory, shared by every pipeline).
 - `EqualWeightBeamformer` exists only as a deterministic offline/test adapter;
   it is never selected by default.
 
@@ -131,8 +131,10 @@ The deployable C seam is:
   byte-parity, weight, and finite-output acceptance tests;
 - [`tests/test_audio_pipeline_4ch.c`](tests/test_audio_pipeline_4ch.c): complete-wrapper lifecycle,
   topology, reset, and finite-output tests;
-- [`tests/test_spatial_third_party.c`](tests/test_spatial_third_party.c): scalar/SIMD PHAT,
-  cached SRP, and exported-GSC-weight equivalence tests.
+- [`../third_party/tests/test_spatial_third_party.c`](../third_party/tests/test_spatial_third_party.c):
+  scalar/SIMD PHAT, cached SRP, exported-GSC-weight and VAD pool equivalence
+  tests. These live with the modules they cover; `make test` here delegates to
+  `make -C ../third_party test`.
 
 For side-by-side reading, the files and public calls map directly:
 
@@ -237,7 +239,6 @@ make audio_pipeline_4ch_raw      # build the complete recording-validation runne
 make test_4aec_nr_res      # build only the core 4-channel test binary
 make test_audio_pipeline_4ch     # build only the complete spatial-wrapper test
 make 4ch_alignulcnet       # model callback remains a board TODO; fail-open smoke
-make test_spatial_third_party
 make test                  # run only the isolated 4ch acceptance gate
 make NO_STDIO=1 audit-no-stdio
 

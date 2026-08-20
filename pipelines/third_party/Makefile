@@ -13,7 +13,7 @@ CXX ?= c++
 AR ?= ar
 RANLIB ?= ranlib
 
-AC_DIR ?= ../../../../audio_common
+AC_DIR ?= ../../../audio_common
 AC_DIR_ABS := $(abspath $(AC_DIR))
 BACKEND = ne10
 SIMD ?= 1
@@ -73,12 +73,13 @@ WERROR_CFLAGS :=
 endif
 
 override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
-                   -Iutility -Idoa -IGSC -I$(AC_DIR_ABS)/include \
+                   -Iutility -Idoa -IGSC -IVAD -I$(AC_DIR_ABS)/include \
                    $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) \
                    $(WERROR_CFLAGS) -ffp-contract=off
 
 SRCS = utility/complex.c utility/spatial_simd.c \
-       doa/doa_smoother.c doa/steering.c doa/srp.c GSC/gsc.c
+       doa/doa_smoother.c doa/steering.c doa/srp.c GSC/gsc.c \
+       VAD/masker.c VAD/vad.c VAD/vad_api.c
 CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) SRCS=$(sort $(SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
@@ -90,20 +91,60 @@ BIN_DIR = $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 SPATIAL_COMMON_LIB = $(BIN_DIR)/libspatial_common.a
 DOA_LIB = $(BIN_DIR)/libdoa.a
 GSC_LIB = $(BIN_DIR)/libgsc.a
+VAD_LIB = $(BIN_DIR)/libvad.a
+
+# Every deployable archive, in one place: `all`, `libs` and the NO_STDIO
+# audit all read this, so a new archive cannot be added to the build while
+# quietly escaping the gate.
+ARCHIVES = $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(GSC_LIB) $(VAD_LIB)
+
+# The archives above need only audio_common's HEADERS. The test BINARY links,
+# so it needs the archive itself.
+#
+# ⚠ audio_common keys its output directory on FIFTEEN variables, not just
+# BACKEND/SIMD -- DEBUG=1 and NO_STDIO=1 each land in a different hash dir
+# (measured). Forwarding a subset would resolve, and link, the WRONG archive
+# with no diagnostic. So every knob this Makefile accepts is forwarded, and
+# AC_LIB is an input a caller can supply directly (the 4ch Makefile already
+# has the resolved path in hand and passes it).
+# Same set the 4ch Makefile forwards to its producers. CFLAGS/CXXFLAGS are
+# deliberately absent: audio_common refuses them from the command line because
+# overriding would drop its own FP-policy and backend appends.
+AC_FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) \
+         CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' \
+         EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) \
+         TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
+AC_LIB ?= $(shell $(MAKE) -s --no-print-directory -C $(AC_DIR_ABS) $(AC_FWD) print-lib-path)
+ifeq ($(strip $(AC_LIB)),)
+$(error cannot resolve the audio_common archive; pass AC_LIB= explicitly)
+endif
+
+# print-lib-path only ECHOES; nothing builds the archive. Without this rule the
+# test link would reference a file no target ever asked anyone to produce.
+$(AC_LIB): FORCE
+	+$(MAKE) -C $(AC_DIR_ABS) $(AC_FWD) lib
+	@test -f '$@' || { echo "FATAL: audio_common did not produce $@" >&2; exit 1; }
 
 SPATIAL_COMMON_OBJS = $(OBJ_DIR)/complex.o $(OBJ_DIR)/spatial_simd.o
 DOA_OBJS = $(OBJ_DIR)/doa_smoother.o $(OBJ_DIR)/steering.o $(OBJ_DIR)/srp.o
 GSC_OBJS = $(OBJ_DIR)/gsc.o
+VAD_OBJS = $(OBJ_DIR)/masker.o $(OBJ_DIR)/vad.o $(OBJ_DIR)/vad_api.o
 
 .DEFAULT_GOAL := all
-.PHONY: all libs lib libspatial_common.a libdoa.a libgsc.a clean \
+.PHONY: all libs lib libspatial_common.a libdoa.a libgsc.a libvad.a clean \
+        test test_spatial_third_party audit-no-gsc-test-symbols \
         print-bin-dir print-obj-dir print-spatial-common-lib-path \
-        print-doa-lib-path print-gsc-lib-path audit-no-stdio _cfg_guard
+        print-doa-lib-path print-gsc-lib-path print-vad-lib-path \
+        audit-no-stdio _cfg_guard
 
-all libs lib: $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(GSC_LIB)
+all libs lib: $(ARCHIVES)
 libspatial_common.a: $(SPATIAL_COMMON_LIB)
 libdoa.a: $(DOA_LIB)
 libgsc.a: $(GSC_LIB)
+libvad.a: $(VAD_LIB)
+
+FORCE:
+.PHONY: FORCE
 
 _cfg_guard:
 	@if [ "$(BACKEND)" = "ne10" ] && [ "$(TOOLCHAIN_CHECK)" = "1" ]; then \
@@ -137,8 +178,46 @@ $(OBJ_DIR)/steering.o: doa/steering.c doa/steering.h doa/srp.h | _cfg_guard
 $(OBJ_DIR)/srp.o: doa/srp.c doa/srp.h utility/complex.h utility/spatial_simd.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
+$(OBJ_DIR)/masker.o: VAD/masker.c VAD/masker.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/vad.o: VAD/vad.c VAD/vad.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/vad_api.o: VAD/vad_api.c VAD/vad_api.h VAD/masker.h VAD/vad.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
 $(OBJ_DIR)/gsc.o: GSC/gsc.c GSC/gsc.h utility/complex.h utility/spatial_simd.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/test_spatial_third_party.o: tests/test_spatial_third_party.c \
+        GSC/gsc.h GSC/gsc_test_hooks.h VAD/vad_api.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+# The GSC_TESTING build of gsc.c, compiled ONLY here. audit-no-gsc-test-symbols
+# below proves the deployable archive never picks it up.
+$(OBJ_DIR)/gsc_test.o: GSC/gsc.c GSC/gsc.h utility/complex.h \
+        utility/spatial_simd.h | _cfg_guard
+	$(CC) $(CFLAGS) -DGSC_TESTING=1 -MD -MP -c -o $@ $<
+
+$(BIN_DIR)/test_spatial_third_party: $(OBJ_DIR)/test_spatial_third_party.o \
+        $(OBJ_DIR)/gsc_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) $(VAD_LIB) \
+        $(AC_LIB) | _cfg_guard
+	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/test_spatial_third_party.o \
+		$(OBJ_DIR)/gsc_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) $(VAD_LIB) \
+		$(AC_LIB) -lm
+
+audit-no-gsc-test-symbols: $(GSC_LIB)
+	@if nm "$(GSC_LIB)" | grep -q 'gsc_test_'; then \
+	  echo "FAIL: test-only symbol present in deployable $(GSC_LIB)" >&2; \
+	  exit 1; \
+	fi
+	@echo "audit-no-gsc-test-symbols: clean"
+
+test: audit-no-gsc-test-symbols $(BIN_DIR)/test_spatial_third_party
+	"$(abspath $(BIN_DIR))/test_spatial_third_party"
+
+test_spatial_third_party: $(BIN_DIR)/test_spatial_third_party
 
 $(SPATIAL_COMMON_LIB): $(SPATIAL_COMMON_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
@@ -152,6 +231,10 @@ $(GSC_LIB): $(GSC_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
 	@echo "gsc [$(BACKEND), SIMD=$(SIMD)] -> $@"
 
+$(VAD_LIB): $(VAD_OBJS) | _cfg_guard
+	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
+	@echo "vad [$(BACKEND), SIMD=$(SIMD)] -> $@"
+
 print-bin-dir:
 	@echo $(abspath $(BIN_DIR))
 print-obj-dir:
@@ -162,9 +245,11 @@ print-doa-lib-path:
 	@echo $(abspath $(DOA_LIB))
 print-gsc-lib-path:
 	@echo $(abspath $(GSC_LIB))
+print-vad-lib-path:
+	@echo $(abspath $(VAD_LIB))
 
 audit-no-stdio: libs
-	@for lib in "$(SPATIAL_COMMON_LIB)" "$(DOA_LIB)" "$(GSC_LIB)"; do \
+	@for lib in $(ARCHIVES); do \
 	  hits=$$(nm -A "$$lib" | awk '{ n=$$NF; if (n ~ /^_?(fprintf|vfprintf|printf|puts|fputs|stderr|__stderrp|fputc|fwrite)$$/) print }'); \
 	  if [ -n "$$hits" ]; then echo "FAIL: stdio symbols in $$lib"; echo "$$hits"; exit 1; fi; \
 	done

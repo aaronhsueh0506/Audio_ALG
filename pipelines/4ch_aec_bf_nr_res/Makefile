@@ -22,7 +22,7 @@ PIPELINES_DIR := ..
 ALG_DIR := ../..
 AEC_DIR ?= $(ALG_DIR)/lib/aec/c_impl
 NR_DIR ?= $(ALG_DIR)/lib/nr/c_impl
-THIRD_PARTY_DIR ?= third_party
+THIRD_PARTY_DIR ?= ../third_party
 AC_DIR ?= ../../../audio_common
 ULCNET_DIR ?= $(ALG_DIR)/AIAEC/Align_ULCNet
 
@@ -123,16 +123,16 @@ FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) \
 ifeq ($(AC_LIB),)
 .PHONY: all test libs lib libaudio_pipeline_4ch.a \
         audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static 4ch_alignulcnet \
-        test_4aec_nr_res test_spatial_third_party test_audio_pipeline_4ch \
+        test_4aec_nr_res test_audio_pipeline_4ch \
         test_audio_pipeline_4ch_ulcnet dump_delay_parity \
         print-bin-dir print-obj-dir print-lib-path audit-no-stdio \
-        audit-no-gsc-test-symbols
+        test-third-party
 all test libs lib libaudio_pipeline_4ch.a \
 audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static 4ch_alignulcnet \
-test_4aec_nr_res test_spatial_third_party test_audio_pipeline_4ch \
+test_4aec_nr_res test_audio_pipeline_4ch \
 test_audio_pipeline_4ch_ulcnet dump_delay_parity \
 print-bin-dir print-obj-dir print-lib-path audit-no-stdio \
-audit-no-gsc-test-symbols:
+test-third-party:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: cannot resolve audio_common archive" >&2; exit 1; }; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
@@ -161,7 +161,7 @@ SRCS := 4aec_nr_res.c audio_pipeline_4ch.c \
         ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c \
         audio_pipeline_4ch_raw.c \
         4aec_nr_res_static.c audio_pipeline_4ch_static.c \
-        tests/test_4aec_nr_res.c tests/test_spatial_third_party.c \
+        tests/test_4aec_nr_res.c \
         tests/test_audio_pipeline_4ch.c tests/dump_delay_parity.c \
         ../4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c \
         $(ULCNET_DIR)/ulcnet_accelerator_adapter.c \
@@ -235,14 +235,6 @@ $(OBJ_DIR)/audio_pipeline_4ch_static.o: audio_pipeline_4ch_static.c audio_pipeli
 $(OBJ_DIR)/test_4aec_nr_res.o: tests/test_4aec_nr_res.c 4aec_nr_res.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/test_spatial_third_party.o: tests/test_spatial_third_party.c \
-        third_party/GSC/gsc.h third_party/GSC/gsc_test_hooks.h | _cfg_guard
-	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
-
-$(OBJ_DIR)/gsc_test.o: third_party/GSC/gsc.c third_party/GSC/gsc.h \
-        third_party/utility/complex.h third_party/utility/spatial_simd.h | _cfg_guard
-	$(CC) $(CFLAGS) -DGSC_TESTING=1 -MD -MP -c -o $@ $<
-
 $(OBJ_DIR)/test_audio_pipeline_4ch.o: tests/test_audio_pipeline_4ch.c audio_pipeline_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
@@ -260,9 +252,9 @@ $(PIPELINE_LIB): $(PIPELINE_OBJS) | _cfg_guard
 ifneq ($(AC_LIB),)
 .PHONY: all test libs lib libaudio_pipeline_4ch.a \
         audio_pipeline_4ch_raw 4aec_nr_res_static audio_pipeline_4ch_static 4ch_alignulcnet \
-        test_4aec_nr_res test_spatial_third_party test_audio_pipeline_4ch \
+        test_4aec_nr_res test_audio_pipeline_4ch \
         test_audio_pipeline_4ch_ulcnet dump_delay_parity \
-        audit-no-stdio audit-no-gsc-test-symbols
+        audit-no-stdio test-third-party
 
 all: $(PIPELINE_LIB) $(BIN_DIR)/audio_pipeline_4ch_raw \
      $(BIN_DIR)/4aec_nr_res_static $(BIN_DIR)/audio_pipeline_4ch_static
@@ -271,13 +263,12 @@ all: $(PIPELINE_LIB) $(BIN_DIR)/audio_pipeline_4ch_raw \
 # against this directory's core), so its acceptance test and board skeleton
 # run here too: this directory's `make test` is the one-stop gate, mirroring
 # the mono arrangement in pipelines/Makefile.
-test: audit-no-gsc-test-symbols \
-      $(BIN_DIR)/test_4aec_nr_res $(BIN_DIR)/test_spatial_third_party \
+test: test-third-party \
+      $(BIN_DIR)/test_4aec_nr_res \
       $(BIN_DIR)/test_audio_pipeline_4ch $(BIN_DIR)/4aec_nr_res_static \
       $(BIN_DIR)/audio_pipeline_4ch_static \
       $(BIN_DIR)/test_audio_pipeline_4ch_ulcnet $(BIN_DIR)/4ch_alignulcnet
 	"$(abspath $(BIN_DIR))/test_4aec_nr_res"
-	"$(abspath $(BIN_DIR))/test_spatial_third_party"
 	"$(abspath $(BIN_DIR))/test_audio_pipeline_4ch"
 	"$(abspath $(BIN_DIR))/test_audio_pipeline_4ch_ulcnet"
 	"$(abspath $(BIN_DIR))/4aec_nr_res_static" --sample-rate 16000
@@ -294,7 +285,6 @@ audio_pipeline_4ch_raw: $(BIN_DIR)/audio_pipeline_4ch_raw
 audio_pipeline_4ch_static: $(BIN_DIR)/audio_pipeline_4ch_static
 4ch_alignulcnet: $(BIN_DIR)/4ch_alignulcnet
 test_4aec_nr_res: $(BIN_DIR)/test_4aec_nr_res
-test_spatial_third_party: $(BIN_DIR)/test_spatial_third_party
 test_audio_pipeline_4ch: $(BIN_DIR)/test_audio_pipeline_4ch
 test_audio_pipeline_4ch_ulcnet: $(BIN_DIR)/test_audio_pipeline_4ch_ulcnet
 # CSV dumper for the C/Python per-hop alignment parity test
@@ -354,16 +344,11 @@ $(BIN_DIR)/test_4aec_nr_res: $(OBJ_DIR)/test_4aec_nr_res.o $(PIPELINE_LIB) $(AEC
 $(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
 
-$(BIN_DIR)/test_spatial_third_party: $(OBJ_DIR)/test_spatial_third_party.o \
-        $(OBJ_DIR)/gsc_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/test_spatial_third_party.o \
-		$(OBJ_DIR)/gsc_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) $(LDLIBS)
-
-audit-no-gsc-test-symbols: $(GSC_LIB)
-	@if nm "$(GSC_LIB)" | grep -q 'gsc_test_'; then \
-	  echo "FAIL: test-only symbol present in deployable $(GSC_LIB)" >&2; \
-	  exit 1; \
-	fi
+# The spatial dependencies test themselves now: their sources, their
+# GSC_TESTING build and their deployable-archive audit all live in
+# third_party/, so this directory only has to invoke them.
+test-third-party: FORCE
+	+$(MAKE) -C $(THIRD_PARTY_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) test
 
 $(BIN_DIR)/test_audio_pipeline_4ch: $(OBJ_DIR)/test_audio_pipeline_4ch.o $(OBJ_DIR)/audio_pipeline_4ch.o $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_4ch.o $(OBJ_DIR)/audio_pipeline_4ch.o $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)

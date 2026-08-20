@@ -5,11 +5,16 @@ implementations vendored with this repository and used by
 `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c`.
 `utility/complex.*` is their shared complex arithmetic.
 
-`third_party/Makefile` builds three config-keyed reusable archives:
+`third_party/Makefile` builds four config-keyed reusable archives:
 
 - `libspatial_common.a`: namespaced complex helpers and scalar/NEON kernels;
 - `libdoa.a`: geometry, steering, SRP-PHAT, and DOA smoothing;
-- `libgsc.a`: the GSC state and processing API.
+- `libgsc.a`: the GSC state and processing API;
+- `libvad.a`: single-channel spectral mask estimation and the mask VAD.
+
+Every archive offers the caller-pool constructor pair the rest of this stack
+uses -- `X_get_mem_size()` sizes, `X_init()` carves a caller-owned block, and
+`X_destroy()` frees nothing on that path.
 
 Their public spectra use `audio_common`'s backend-neutral `Complex` type.
 They do not expose KISS types, so the same headers and source-level API work
@@ -73,11 +78,15 @@ narrowing the band SRP scores is cheaper than a second FFT pipeline, and a
 naive stride-pick 48->16 kHz decimation would alias exactly like the
 mono/4ch AEC delay-estimator gap documented elsewhere in this repo.
 
+These modules own their own tests: `make -C pipelines/third_party test` builds
+the GSC_TESTING object, runs the equivalence suite and runs
+`audit-no-gsc-test-symbols`, which proves no test-only symbol reached a
+deployable archive. The 4ch pipeline's `make test` delegates to it.
+
 Run the spatial arithmetic and full wrapper gates through:
 
 ```bash
-make -C Audio_ALG/pipelines/4ch_aec_bf_nr_res/third_party BACKEND=kiss SIMD=1
-make -C Audio_ALG/pipelines/4ch_aec_bf_nr_res test_spatial_third_party test_audio_pipeline_4ch
+make -C Audio_ALG/pipelines/third_party BACKEND=kiss SIMD=1 test
 make -C Audio_ALG/pipelines/4ch_aec_bf_nr_res test
 ```
 

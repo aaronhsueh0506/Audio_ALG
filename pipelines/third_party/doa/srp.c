@@ -4,8 +4,8 @@
 #include "srp.h"
 #include "steering.h"
 #include "mem_align.h"
-#include "../utility/complex.h"
-#include "../utility/spatial_simd.h"
+#include "complex.h"
+#include "spatial_simd.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846

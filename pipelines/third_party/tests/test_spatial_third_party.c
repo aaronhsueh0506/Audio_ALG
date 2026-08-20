@@ -1,9 +1,11 @@
 /**
- * tests/test_spatial_third_party.c — spatial dependency equivalence tests.
+ * tests/test_spatial_third_party.c — equivalence tests for the modules in
+ * this directory.
  *
- * Keeps the third-party SRP/GSC arithmetic outside the 4AEC wrapper tests:
- * dispatch must match scalar PHAT, cached SRP must select the scalar golden
- * angle, and exported GSC weights must reconstruct the mono spectrum.
+ * Keeps this arithmetic outside the 4AEC wrapper tests: dispatch must match
+ * scalar PHAT, cached SRP must select the scalar golden angle, exported GSC
+ * weights must reconstruct the mono spectrum, and the VAD's caller-pool path
+ * must agree with its heap path bin for bin.
  */
 
 #include <math.h>
@@ -17,6 +19,7 @@
 #include "spatial_simd.h"
 #include "srp.h"
 #include "steering.h"
+#include "vad_api.h"
 
 #define CHECK(condition, message)                                      \
     do {                                                               \
@@ -1342,6 +1345,147 @@ static int test_srp_frame_counter_survives_32bit_boundary(void) {
     return 1;
 }
 
+
+/* ===================== VAD (masker + mask VAD) ===================== */
+
+static VADApiConfig vad_test_config(int nfft) {
+    VADApiConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.backend = VAD_BACKEND_MASKER;
+    cfg.masker_cfg.NFFT = nfft;
+    cfg.masker_cfg.sr = 16000;
+    cfg.masker_cfg.E_alpha_up = 0.999f;
+    cfg.masker_cfg.E_alpha_down = 0.97f;
+    cfg.masker_cfg.margin_dB = 6.0f;
+    cfg.masker_cfg.low_freq = 200.0f;
+    cfg.masker_cfg.high_freq = 8000.0f;
+    cfg.masker_cfg.M_alpha = 0.995f;
+    cfg.masker_cfg.spp_thr = 0.5f;
+    cfg.masker_cfg.spp_upd_thr = 0.3f;
+    cfg.masker_cfg.enable_freq_smooth = 1;
+    cfg.masker_cfg.smooth_size = 5;
+    cfg.masker_cfg.enable_time_smooth = 1;
+    cfg.masker_cfg.T_alpha = 0.6f;
+    cfg.masker_cfg.enable_energy = 1;
+    cfg.masker_cfg.enable_spp = 1;
+    cfg.masker_cfg.enable_band = 1;
+    cfg.vad_cfg.F = nfft / 2 + 1;
+    cfg.vad_cfg.mode = 1;
+    cfg.vad_cfg.mask_thr = 0.2f;
+    cfg.vad_cfg.min_bins = 3;
+    cfg.vad_cfg.enable_median = 1;
+    cfg.vad_cfg.median_k = 5;
+    cfg.vad_cfg.enable_smooth = 1;
+    cfg.vad_cfg.hangover = 4;
+    return cfg;
+}
+
+static int test_vad_api_init_pool_poison_and_bounds(void) {
+    const int nfft = 512;
+    VADApiConfig cfg = vad_test_config(nfft);
+    size_t need = vad_api_get_mem_size(&cfg);
+    size_t slack = 256;
+    size_t pool_bytes = need + slack;
+    uint8_t* pool = NULL;
+    VADApi* v;
+    size_t i;
+
+    CHECK(need > 0, "vad_api_get_mem_size must size a legal config");
+    CHECK(posix_memalign((void**)&pool, 16, pool_bytes) == 0 && pool,
+          "pool allocation");
+    memset(pool, 0xa5, pool_bytes);
+
+    /* An undersized pool must be refused, not silently carved. */
+    CHECK(vad_api_init(&cfg, pool, need - 1) == NULL,
+          "undersized pool must be refused");
+    /* So must a misaligned one. */
+    CHECK(vad_api_init(&cfg, pool + 1, pool_bytes - 1) == NULL,
+          "misaligned pool must be refused");
+    /* A refusal must write NOTHING -- the whole pool is still poison. */
+    for (i = 0; i < pool_bytes; ++i) {
+        CHECK(pool[i] == 0xa5u, "a refused init wrote into the pool");
+    }
+
+    v = vad_api_init(&cfg, pool, pool_bytes);
+    CHECK(v != NULL, "vad_api_init on a legal pool");
+    CHECK((void*)v == (void*)pool, "the instance must sit at mem[0]");
+
+    /* Only the budgeted region may be touched: everything past `need` must
+     * still hold the poison. */
+    for (i = need; i < pool_bytes; ++i) {
+        CHECK(pool[i] == 0xA5u, "vad_api_init wrote past its own budget");
+    }
+
+    vad_api_destroy(v);   /* must NOT free caller memory */
+    memset(pool, 0x5a, 1);   /* still ours to write */
+    /* The same block must take a second init -- destroy left nothing behind. */
+    CHECK(vad_api_init(&cfg, pool, pool_bytes) != NULL,
+          "the pool must be reusable after destroy");
+    free(pool);
+    printf("PASS VAD pool-first poison/bounds\n");
+    return 1;
+}
+
+static int test_vad_api_heap_vs_pool_identical(void) {
+    const int nfft = 512;
+    const int F = nfft / 2 + 1;
+    const int frames = 40;
+    VADApiConfig cfg = vad_test_config(nfft);
+    size_t need = vad_api_get_mem_size(&cfg);
+    uint8_t* raw = (uint8_t*)malloc(need + 16);
+    uint8_t* pool;
+    VADApi* heap;
+    VADApi* fromPool;
+    Complex* frame = (Complex*)malloc((size_t)F * sizeof(Complex));
+    int t, f;
+
+    CHECK(raw && frame, "allocation");
+    pool = (uint8_t*)(((uintptr_t)raw + 15u) & ~(uintptr_t)15u);
+
+    heap = vad_api_create(&cfg);
+    fromPool = vad_api_init(&cfg, pool, need);
+    CHECK(heap && fromPool, "both constructors must succeed");
+
+    test_rng = 0x2468acef;
+    for (t = 0; t < frames; ++t) {
+        const int* mask_h;
+        const int* mask_p;
+        for (f = 0; f < F; ++f) {
+            frame[f].r = random_signed() * (f < F / 4 ? 4.0f : 0.25f);
+            frame[f].i = random_signed() * (f < F / 4 ? 4.0f : 0.25f);
+        }
+        vad_api_process(heap, frame);
+        vad_api_process(fromPool, frame);
+
+        CHECK(vad_api_get(heap) == vad_api_get(fromPool),
+              "heap and pool VAD decisions must agree");
+        CHECK(vad_api_get_raw(heap) == vad_api_get_raw(fromPool),
+              "heap and pool raw VAD must agree");
+        mask_h = vad_api_get_mask(heap);
+        mask_p = vad_api_get_mask(fromPool);
+        CHECK(mask_h && mask_p, "both masks must exist");
+        CHECK(memcmp(mask_h, mask_p, (size_t)F * sizeof(int)) == 0,
+              "heap and pool TF masks must be byte-identical");
+    }
+
+    /* ⚠ Written so it can FAIL: if the driver never made the VAD fire, the
+     * comparison above would be trivially satisfied by two silent instances. */
+    {
+        int ones = 0;
+        const int* mask = vad_api_get_mask(heap);
+        for (f = 0; f < F; ++f) ones += mask[f];
+        CHECK(ones > 0, "the driver never activated any mask bin -- "
+                        "the equivalence above would prove nothing");
+    }
+
+    vad_api_destroy(heap);
+    vad_api_destroy(fromPool);
+    free(frame);
+    free(raw);
+    printf("PASS VAD heap-vs-pool identical over %d frames\n", frames);
+    return 1;
+}
+
 static int run_all_tests(void) {
     CHECK(test_phat_scalar_vs_dispatch(), "PHAT SIMD test");
     CHECK(test_beamform_and_score_scalar_vs_dispatch(),
@@ -1367,6 +1511,10 @@ static int run_all_tests(void) {
           "GSC non-finite-P bin-reset test");
     CHECK(test_gsc_init_pool_poison_and_bounds(),
           "GSC pool-first poison/bounds test");
+    CHECK(test_vad_api_init_pool_poison_and_bounds(),
+          "VAD pool-first poison/bounds test");
+    CHECK(test_vad_api_heap_vs_pool_identical(),
+          "VAD heap-vs-pool equivalence test");
     CHECK(test_gsc_heap_vs_pool_byte_equal(),
           "GSC heap-vs-pool byte-equal test");
     CHECK(test_gsc_rls_dispatch_matches_scalar_state(),
