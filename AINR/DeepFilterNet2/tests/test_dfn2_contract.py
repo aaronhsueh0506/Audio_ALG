@@ -53,6 +53,8 @@ from train import (  # noqa: E402
 )
 from export_onnx import (  # noqa: E402
     INPUT_FRAMES,
+    COMBINED_STATE_LAYOUT_VERSION,
+    GRU_STATE_NAMES,
     INPUT_NAMES,
     OUTPUT_NAMES,
     STATE_LAYOUT_VERSION,
@@ -873,3 +875,119 @@ def test_runtime_erb_bins_match_the_model(tmp_path):
         ref_inv = ref_inv.T
     assert np.array_equal(fwd, ref_fwd)
     assert np.array_equal(inv, ref_inv)
+
+
+def test_combined_gru_state_is_the_split_state_stacked_in_struct_order():
+    """The experimental single-tensor recurrent state must change nothing.
+
+    Both layouts run the same graph maths; the combined one only slices its
+    five hidden states off one input and concatenates them back. Heads and
+    state must therefore be bit-identical, and the concatenation order must be
+    DFN2ModelIOState's memory order (encoder, erb x2, df x2) or a runtime
+    binding the combined tensor to those bytes would silently transpose the
+    layers.
+    """
+    torch.manual_seed(73)
+    model = _small_dfn2()
+    split = StatelessDFN2Heads(model).eval()
+    combined = StatelessDFN2Heads(model, gru_state_layout='combined').eval()
+
+    assert combined.input_names == (
+        'erb', 'spec', 'h_gru', 'df_convp_history')
+    assert combined.output_names[3:] == ('h_gru_out', 'df_convp_history_out')
+    assert combined.state_layout_version == COMBINED_STATE_LAYOUT_VERSION
+    assert combined.state_layout_version != STATE_LAYOUT_VERSION, (
+        'a different state layout must not claim the shipped version'
+    )
+
+    frames = 7
+    erb = torch.randn(1, 1, frames, model.n_erb)
+    spec = torch.randn(1, 2, frames, model.df_bins)
+
+    def replay(wrapper):
+        state = wrapper.initial_inputs()[2:]
+        heads = [[], [], []]
+        with torch.no_grad():
+            for erb_window, spec_window in zip(
+                    feature_windows(erb), feature_windows(spec)):
+                output = wrapper(erb_window, spec_window, *state)
+                for index in range(3):
+                    heads[index].append(output[index])
+                state = output[3:]
+        return heads, state
+
+    split_heads, split_state = replay(split)
+    combined_heads, combined_state = replay(combined)
+
+    for left, right in zip(split_heads, combined_heads):
+        for a, b in zip(left, right):
+            assert torch.equal(a, b), 'combined layout changed a head'
+
+    # ⚠ Written so it can FAIL: a driver whose states stayed at their zero
+    # initial value would satisfy every comparison above trivially.
+    assert float(combined_state[0].abs().max()) > 0.0
+
+    assert len(combined_state) == 2, 'combined state is one GRU tensor + cache'
+    stacked = torch.cat(split_state[:5], dim=0)
+    assert torch.equal(stacked, combined_state[0])
+    for index in range(len(GRU_STATE_NAMES)):
+        assert torch.equal(
+            split_state[index], combined_state[0][index:index + 1]
+        ), 'layer %d landed at the wrong offset' % index
+    assert torch.equal(split_state[5], combined_state[1])
+
+
+def test_combined_gru_state_reaches_five_distinct_grus_through_slices(tmp_path):
+    """What the PTQ A/B is actually about: the graph, not the torch maths.
+
+    The five states now arrive on ONE input, so the thing worth pinning is
+    that each still reaches its own GRU node through its own Slice -- if a
+    later change let them meet at a Cat first, the shared-scale hazard the
+    split layout was built to avoid would be worse, not merely present.
+    """
+    onnx = pytest.importorskip('onnx')
+    torch.manual_seed(73)
+    model = _small_dfn2()
+    wrapper = StatelessDFN2Heads(model, gru_state_layout='combined').eval()
+    inputs = wrapper.initial_inputs()
+    path = tmp_path / 'combined.onnx'
+    torch.onnx.export(
+        wrapper, inputs, str(path),
+        input_names=list(wrapper.input_names),
+        output_names=list(wrapper.output_names),
+        opset_version=17, do_constant_folding=True,
+    )
+    graph = onnx.load(str(path))
+    declared = [entry.name for entry in graph.graph.input]
+    assert 'h_gru' in declared
+    for name in GRU_STATE_NAMES:
+        assert name not in declared, 'combined layout must not also declare %s' % name
+
+    producers = {}
+    for node in graph.graph.node:
+        for output_name in node.output:
+            producers[output_name] = node
+
+    def _reaches_gru(name, depth=0):
+        """Walk forward from h_gru to the GRU nodes that consume its slices."""
+        found = []
+        for node in graph.graph.node:
+            if name not in node.input:
+                continue
+            if node.op_type == 'GRU':
+                found.append(node.name)
+            elif node.op_type in ('Slice', 'Squeeze', 'Unsqueeze',
+                                  'Identity', 'Reshape') and depth < 6:
+                for output_name in node.output:
+                    found.extend(_reaches_gru(output_name, depth + 1))
+            elif node.op_type == 'Concat':
+                raise AssertionError(
+                    'h_gru reaches a Concat before its GRUs -- the five '
+                    'states would share one quantization scale'
+                )
+        return found
+
+    reached = _reaches_gru('h_gru')
+    assert len(set(reached)) == len(GRU_STATE_NAMES), (
+        'expected one distinct GRU per state, reached %r' % sorted(set(reached))
+    )

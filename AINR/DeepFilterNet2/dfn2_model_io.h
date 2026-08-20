@@ -10,7 +10,14 @@ extern "C" {
 /* Must match export_onnx.py and the shipped DFN2 config. Version 3 exposes
  * h_erb_0/h_erb_1 and h_df_0/h_df_1 as separate graph tensors so per-tensor
  * PTQ may use one scale per recurrent layer. The state struct remains
- * contiguous and unchanged; runtimes bind each row to its named tensor. */
+ * contiguous and unchanged; runtimes bind each row to its named tensor.
+ *
+ * ⚠ Version 4 is RESERVED, not free: export_onnx.py's experimental
+ * 'combined' GRU state layout publishes it (all five hidden states as one
+ * h_gru tensor). Nothing here binds that layout, so a board built against
+ * this header refuses such a graph -- which is the intent. The next real
+ * bump of this constant must therefore go to 5, or the two files would
+ * disagree about what 4 means. */
 #define DFN2_MODEL_IO_LAYOUT_VERSION       3
 #define DFN2_MODEL_INPUT_FRAMES            3
 #define DFN2_MODEL_ENCODER_GRU_LAYERS      1

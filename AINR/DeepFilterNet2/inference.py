@@ -214,21 +214,29 @@ def calibration_main():
     )
     try:
         from .export_onnx import (
+            COMBINED_GRU_STATE_NAME,
+            DEFAULT_GRU_STATE_LAYOUT,
+            GRU_STATE_LAYOUTS,
+            GRU_STATE_NAMES,
+            HEAD_OUTPUT_NAMES,
             INPUT_FRAMES,
-            INPUT_NAMES,
             StatelessDFN2Heads,
             export_graph,
             feature_windows,
-            initial_inputs,
+            gru_state_slice_report,
         )
     except ImportError:
         from export_onnx import (
+            COMBINED_GRU_STATE_NAME,
+            DEFAULT_GRU_STATE_LAYOUT,
+            GRU_STATE_LAYOUTS,
+            GRU_STATE_NAMES,
+            HEAD_OUTPUT_NAMES,
             INPUT_FRAMES,
-            INPUT_NAMES,
             StatelessDFN2Heads,
             export_graph,
             feature_windows,
-            initial_inputs,
+            gru_state_slice_report,
         )
 
     parser = argparse.ArgumentParser(description=calibration_main.__doc__)
@@ -245,6 +253,11 @@ def calibration_main():
     parser.add_argument('--onnx', default=None,
                         help='where to write the graph these tensors bind to '
                              '(default: <output>.onnx)')
+    parser.add_argument(
+        '--gru-state-layout', choices=sorted(GRU_STATE_LAYOUTS),
+        default=DEFAULT_GRU_STATE_LAYOUT,
+        help='recurrent-state layout for the graph exported beside these '
+             'tensors; see export_onnx.py --gru-state-layout')
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error('--frames must be positive')
@@ -265,10 +278,13 @@ def calibration_main():
     model, params = load_model(SimpleNamespace(
         config=args.config, model=args.model
     ))
-    wrapper = StatelessDFN2Heads(model).eval()
+    wrapper = StatelessDFN2Heads(
+        model, gru_state_layout=args.gru_state_layout).eval()
     # The graph is exported (and parity-checked) in the same process, from the
     # same model instance the tensors below are recorded against, so the two
-    # deployment artifacts cannot drift apart.
+    # deployment artifacts cannot drift apart. The recurrent-state layout comes
+    # off that same wrapper below, so the recorded tensor set is the graph's
+    # input set by construction rather than by a second reading of the flag.
     onnx_path = sibling_onnx_path(args.output, args.onnx)
     graph_metadata = export_graph(wrapper, params, args.model, onnx_path,
                                   verify=True)
@@ -277,7 +293,8 @@ def calibration_main():
     )
 
     window = torch.hann_window(params['WIN_LEN']).sqrt()
-    captured = {name: [] for name in INPUT_NAMES}
+    input_names = wrapper.input_names
+    captured = {name: [] for name in input_names}
     source_files = []
     with torch.no_grad():
         for path in files:
@@ -301,14 +318,14 @@ def calibration_main():
             _, erb, spec, _ = extract_dfn2_features(
                 spectrum, model.erb_fb, model.df_bins, feature, None
             )
-            state = tuple(value for value in initial_inputs(model)[2:])
+            state = wrapper.initial_inputs()[2:]
             used = False
             for erb_window, spec_window in zip(
                     feature_windows(erb), feature_windows(spec)):
                 inputs = (erb_window, spec_window) + state
-                capture_calibration_inputs(captured, INPUT_NAMES, inputs)
+                capture_calibration_inputs(captured, input_names, inputs)
                 outputs = wrapper(*inputs)
-                state = tuple(outputs[3:])
+                state = tuple(outputs[len(HEAD_OUTPUT_NAMES):])
                 used = True
                 if len(captured['erb']) >= args.frames:
                     break
@@ -322,8 +339,27 @@ def calibration_main():
         name: np.stack(values[:args.frames]).astype(np.float32, copy=False)
         for name, values in captured.items()
     }
+    def _stats(value):
+        # One percentile call for both quantiles: np.percentile copies and
+        # partitions per call, so two calls do that work twice for the same
+        # numbers (measured 2x on the captured shapes).
+        low, high = np.percentile(value, [0.1, 99.9])
+        return {
+            'shape': list(value.shape),
+            'dtype': str(value.dtype),
+            'min': float(value.min()),
+            'max': float(value.max()),
+            'p001': float(low),
+            'p999': float(high),
+        }
+
     report = {
+        # The report FORMAT version, deliberately not the graph's state
+        # layout version: the two are independent axes elsewhere in this repo
+        # (GTCRN is layout 6 / schema v2, ULCNet layout 5 / schema v1), and
+        # the layout is already published on its own line below.
         'schema': 'dfn2-stateless-stream-calibration-v3',
+        'gru_state_layout': graph_metadata['gru_state_layout'],
         'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
         'graph': os.path.basename(onnx_path),
         'sample_rate': params['SR'],
@@ -334,23 +370,23 @@ def calibration_main():
         'frames': int(arrays['erb'].shape[0]),
         'seed': args.seed,
         'source_files': source_files,
-        'inputs': {
-            name: {
-                'shape': list(value.shape),
-                'dtype': str(value.dtype),
-                'min': float(value.min()),
-                'max': float(value.max()),
-                'p001': float(np.percentile(value, 0.1)),
-                'p999': float(np.percentile(value, 99.9)),
-            }
-            for name, value in arrays.items()
-        },
+        'inputs': {name: _stats(value) for name, value in arrays.items()},
     }
+    if wrapper.gru_state_layout.combined:
+        report['gru_state_slices'] = gru_state_slice_report(
+            arrays[COMBINED_GRU_STATE_NAME], _stats
+        )
+
     write_calibration_artifact(
         args.output, arrays, report, artifact_format
     )
     print('%s: %d streaming frames, graph %s' %
           (args.output, report['frames'], onnx_path))
+    if wrapper.gru_state_layout.combined:
+        worst = report['gru_state_slices']['worst_bits_lost']
+        print('combined GRU state: one symmetric max-abs int8 scale costs '
+              'the narrowest layer %s bits'
+              % ('%.2f' % worst if worst is not None else 'n/a'))
 
 
 def cli():
