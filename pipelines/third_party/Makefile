@@ -1,4 +1,4 @@
-# Reusable spatial DSP libraries used by Audio_ALG pipelines.
+# Reusable spatial DSP and gain-staging libraries used by Audio_ALG pipelines.
 #
 #   make BACKEND=kiss|ne10 SIMD=0|1
 #
@@ -73,13 +73,14 @@ WERROR_CFLAGS :=
 endif
 
 override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
-                   -Iutility -Idoa -IGSC -IVAD -I$(AC_DIR_ABS)/include \
+                   -Iutility -Idoa -IGSC -IVAD -Igain -I$(AC_DIR_ABS)/include \
                    $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) \
                    $(WERROR_CFLAGS) -ffp-contract=off
 
 SRCS = utility/complex.c utility/spatial_simd.c \
        doa/doa_smoother.c doa/steering.c doa/srp.c GSC/gsc.c \
-       VAD/masker.c VAD/vad.c VAD/vad_api.c
+       VAD/masker.c VAD/vad.c VAD/vad_api.c \
+       gain/fix_gain.c gain/nr_gain.c gain/post_gain.c
 CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) SRCS=$(sort $(SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
@@ -92,11 +93,13 @@ SPATIAL_COMMON_LIB = $(BIN_DIR)/libspatial_common.a
 DOA_LIB = $(BIN_DIR)/libdoa.a
 GSC_LIB = $(BIN_DIR)/libgsc.a
 VAD_LIB = $(BIN_DIR)/libvad.a
+GAIN_LIB = $(BIN_DIR)/libgain.a
 
 # Every deployable archive, in one place: `all`, `libs` and the NO_STDIO
 # audit all read this, so a new archive cannot be added to the build while
 # quietly escaping the gate.
-ARCHIVES = $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(GSC_LIB) $(VAD_LIB)
+ARCHIVES = $(SPATIAL_COMMON_LIB) $(DOA_LIB) $(GSC_LIB) $(VAD_LIB) \
+           $(GAIN_LIB)
 
 # The archives above need only audio_common's HEADERS. The test BINARY links,
 # so it needs the archive itself.
@@ -129,12 +132,16 @@ SPATIAL_COMMON_OBJS = $(OBJ_DIR)/complex.o $(OBJ_DIR)/spatial_simd.o
 DOA_OBJS = $(OBJ_DIR)/doa_smoother.o $(OBJ_DIR)/steering.o $(OBJ_DIR)/srp.o
 GSC_OBJS = $(OBJ_DIR)/gsc.o
 VAD_OBJS = $(OBJ_DIR)/masker.o $(OBJ_DIR)/vad.o $(OBJ_DIR)/vad_api.o
+GAIN_OBJS = $(OBJ_DIR)/fix_gain.o $(OBJ_DIR)/nr_gain.o \
+            $(OBJ_DIR)/post_gain.o
 
 .DEFAULT_GOAL := all
-.PHONY: all libs lib libspatial_common.a libdoa.a libgsc.a libvad.a clean \
+.PHONY: all libs lib libspatial_common.a libdoa.a libgsc.a libvad.a \
+        libgain.a clean \
         test test_spatial_third_party audit-no-gsc-test-symbols \
         print-bin-dir print-obj-dir print-spatial-common-lib-path \
         print-doa-lib-path print-gsc-lib-path print-vad-lib-path \
+        print-gain-lib-path \
         audit-no-stdio _cfg_guard
 
 all libs lib: $(ARCHIVES)
@@ -142,6 +149,7 @@ libspatial_common.a: $(SPATIAL_COMMON_LIB)
 libdoa.a: $(DOA_LIB)
 libgsc.a: $(GSC_LIB)
 libvad.a: $(VAD_LIB)
+libgain.a: $(GAIN_LIB)
 
 FORCE:
 .PHONY: FORCE
@@ -190,8 +198,18 @@ $(OBJ_DIR)/vad_api.o: VAD/vad_api.c VAD/vad_api.h VAD/masker.h VAD/vad.h | _cfg_
 $(OBJ_DIR)/gsc.o: GSC/gsc.c GSC/gsc.h utility/complex.h utility/spatial_simd.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
+$(OBJ_DIR)/fix_gain.o: gain/fix_gain.c gain/fix_gain.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/nr_gain.o: gain/nr_gain.c gain/nr_gain.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/post_gain.o: gain/post_gain.c gain/post_gain.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
 $(OBJ_DIR)/test_spatial_third_party.o: tests/test_spatial_third_party.c \
-        GSC/gsc.h GSC/gsc_test_hooks.h VAD/vad_api.h | _cfg_guard
+        GSC/gsc.h GSC/gsc_test_hooks.h VAD/vad_api.h gain/fix_gain.h \
+        gain/nr_gain.h gain/post_gain.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 # The GSC_TESTING build of gsc.c, compiled ONLY here. audit-no-gsc-test-symbols
@@ -202,10 +220,10 @@ $(OBJ_DIR)/gsc_test.o: GSC/gsc.c GSC/gsc.h utility/complex.h \
 
 $(BIN_DIR)/test_spatial_third_party: $(OBJ_DIR)/test_spatial_third_party.o \
         $(OBJ_DIR)/gsc_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) $(VAD_LIB) \
-        $(AC_LIB) | _cfg_guard
+        $(GAIN_LIB) $(AC_LIB) | _cfg_guard
 	$(CC) $(CFLAGS) -o $@ $(OBJ_DIR)/test_spatial_third_party.o \
 		$(OBJ_DIR)/gsc_test.o $(DOA_LIB) $(SPATIAL_COMMON_LIB) $(VAD_LIB) \
-		$(AC_LIB) -lm
+		$(GAIN_LIB) $(AC_LIB) -lm
 
 audit-no-gsc-test-symbols: $(GSC_LIB)
 	@if nm "$(GSC_LIB)" | grep -q 'gsc_test_'; then \
@@ -235,6 +253,10 @@ $(VAD_LIB): $(VAD_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
 	@echo "vad [$(BACKEND), SIMD=$(SIMD)] -> $@"
 
+$(GAIN_LIB): $(GAIN_OBJS) | _cfg_guard
+	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
+	@echo "gain [$(BACKEND), SIMD=$(SIMD)] -> $@"
+
 print-bin-dir:
 	@echo $(abspath $(BIN_DIR))
 print-obj-dir:
@@ -247,6 +269,8 @@ print-gsc-lib-path:
 	@echo $(abspath $(GSC_LIB))
 print-vad-lib-path:
 	@echo $(abspath $(VAD_LIB))
+print-gain-lib-path:
+	@echo $(abspath $(GAIN_LIB))
 
 audit-no-stdio: libs
 	@for lib in $(ARCHIVES); do \
