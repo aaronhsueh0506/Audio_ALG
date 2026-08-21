@@ -87,13 +87,14 @@ FROZEN_FRAME_HOP_BY_SR = {16000: (512, 256), 48000: (1024, 512)}
 # and as the number a diagnostic override is reported against.
 DATASET_DELAY_NUM_FILTERS = 5
 # The bank size is a deployment/diagnostic knob, not a data-contract one:
-#   * dataset generation and training/inference materialization always run the
-#     value above -- `materialize_linear_error` and the config-driven contract
-#     builder take no bank-size argument at all, so there is no code path by
-#     which a corpus can be produced at another size;
-#   * a diagnostic (`LinearAecProcessor(..., delay_num_filters=n)`) may deploy
-#     another size to measure how far the bulk-delay search reaches, and the
-#     contract it carries is unchanged and still fingerprints identically.
+#   * dataset generation always runs the value above --
+#     `materialize_linear_error` and the config-driven contract builder take no
+#     bank-size argument, so there is no code path by which a corpus can be
+#     produced at another size;
+#   * inference/diagnostics may deploy another size through
+#     `LinearAecEngine(..., delay_num_filters=n)` or
+#     `LinearAecProcessor(..., delay_num_filters=n)`. The recorded data contract
+#     remains unchanged and fingerprints identically.
 # lib/aec sizes its downsampled search ring and aggregator histograms from n at
 # construction and exposes no runtime setter, which is why the override arrives
 # at init and not through a mutator.

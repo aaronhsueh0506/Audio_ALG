@@ -75,13 +75,25 @@ condition the previous one delivers, which is why both appear in every summary
 row instead of being summed.  Reliable reach of the bank is 125 / 221 / 317 /
 413 / 509 ms for `n` = 1..5.
 
-`--delay-num-filters` is a **runtime AEC init override** for the diagnostic
-frontend. It is not a checkpoint-compatibility or retraining requirement:
+`--delay-num-filters` is a **runtime AEC init override** for the deployment or
+diagnostic frontend. It is not a checkpoint-compatibility or retraining
+requirement:
 dataset generation remains frozen at `n = 5`, while a product may choose a
 smaller n when its measured bulk-delay range plus acquisition margin fits that
 bank. Omitting the flag reproduces the dataset-generation frontend. The bank
 size recorded in `summary.csv` is read back from the constructed engine, so a
 row cannot name a profile the run did not actually execute.
+
+The normal streaming inference CLI exposes the same deployment override:
+
+```bash
+python3 inference.py checkpoint.pth mic.wav far.wav out.wav \
+  --delay-num-filters 2
+```
+
+The default remains `n = 5`. The flag is rejected together with
+`--input-is-linear-error`, because that mode bypasses PBFDKF and therefore has
+no matched-filter bank to resize.
 
 ```bash
 # short-route candidate: smaller bank, aligned far, shallow attention

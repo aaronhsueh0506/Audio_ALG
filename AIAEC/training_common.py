@@ -90,7 +90,10 @@ from AIAEC.dataset_gen import (  # noqa: E402
     aec_collate,
 )
 from AIAEC.dataset_gen.linear_aec import (  # noqa: E402
+    DATASET_DELAY_NUM_FILTERS,
     LinearAecContract,
+    check_delay_num_filters,
+    engine_delay_num_filters,
     make_linear_aec_config,
     make_linear_aec_contract,
     require_linear_aec_contract,
@@ -629,7 +632,8 @@ class LinearAecEngine:
     def __init__(self, n_lanes: int, sample_rate: int, preset: str = 'balanced',
                  filter_length: Optional[int] = None,
                  frame_size: Optional[int] = None,
-                 contract: Optional[Dict] = None):
+                 contract: Optional[Dict] = None,
+                 delay_num_filters: Optional[int] = None):
         if n_lanes <= 0:
             raise ValueError(f"n_lanes must be positive, got {n_lanes}")
         self.n_lanes = int(n_lanes)
@@ -647,6 +651,10 @@ class LinearAecEngine:
                 f"linear AEC contract sr={self.contract.sample_rate}, requested "
                 f"sample_rate={self.sample_rate}"
             )
+        self._requested_delay_num_filters = (
+            None if delay_num_filters is None
+            else check_delay_num_filters(delay_num_filters)
+        )
         runtime_contract = make_linear_aec_contract(
             self.contract.sample_rate,
             preset=self.contract.preset,
@@ -657,6 +665,17 @@ class LinearAecEngine:
             runtime_contract.as_dict(), self.contract.as_dict(), "inference runtime"
         )
         self._engines: List[AEC] = [self._new_engine() for _ in range(self.n_lanes)]
+        self.delay_num_filters = engine_delay_num_filters(self._engines[0])
+        expected_filters = (
+            DATASET_DELAY_NUM_FILTERS
+            if self._requested_delay_num_filters is None
+            else self._requested_delay_num_filters
+        )
+        if self.delay_num_filters != expected_filters:
+            raise ValueError(
+                f"linear AEC built a {self.delay_num_filters}-filter matched "
+                f"bank, but {expected_filters} was requested"
+            )
         self._pending_reset: Optional[List[bool]] = None
         self._last_aligned_far: Optional[Tensor] = None
 
@@ -666,6 +685,7 @@ class LinearAecEngine:
             preset=self.contract.preset,
             frame_size=self.contract.frame_size,
             filter_length=self.contract.filter_length,
+            delay_num_filters=self._requested_delay_num_filters,
         )
         return AEC(cfg)
 

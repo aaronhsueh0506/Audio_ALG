@@ -340,6 +340,20 @@ def test_linear_aec_engine_full_length_output_and_reset():
     assert error2.shape == mic.shape
 
 
+def test_linear_aec_engine_honours_deployment_filter_bank_override():
+    engine = LinearAecEngine(
+        n_lanes=1, sample_rate=16000, frame_size=512,
+        delay_num_filters=2,
+    )
+    assert engine.delay_num_filters == 2
+    assert len(engine._engines[0].delay_est._estimator._matched_filter._filters) == 2
+
+    # A reset must rebuild the same deployment profile, not fall back to the
+    # corpus default of five filters.
+    engine.reset_lane(0)
+    assert len(engine._engines[0].delay_est._estimator._matched_filter._filters) == 2
+
+
 def test_linear_aec_engine_aligned_far_is_the_shifted_far():
     """The aligned-far tap must BE the shifted far, not merely self-consistent.
 
@@ -748,3 +762,109 @@ def test_main_builds_its_schedule_before_the_first_epoch(
     for _ in range(64):
         scheduler.step()
     assert scheduler.optimizer.param_groups[0]['lr'] != before
+
+
+def test_align_ulcnet_resume_restores_early_stop_counter(
+        monkeypatch, tmp_path):
+    """A resumed run must not receive a fresh patience window.
+
+    This executes ``main`` through checkpoint loading, scheduler rebuilding,
+    one train/validation epoch and checkpoint writing.  The expensive epoch
+    body is stubbed, but the state transition under test is the production
+    one.  Starting from ``patience - 1`` and observing one non-improvement
+    must stop immediately and persist ``patience`` in the new checkpoint.
+    """
+    trainer = importlib.import_module('AIAEC.Align_ULCNet.train')
+    linear = make_linear_aec_contract(16000, frame_size=512)
+
+    class FakePackedDataset:
+        def __init__(self, path, expected_sr=None, mmap=False):
+            self.linear_aec_contract = linear
+            self.linear_aec_contract_hash = linear.fingerprint()
+
+        def __len__(self):
+            return 8
+
+        def __getitem__(self, index):
+            return torch.zeros(4, 16000), {
+                'sequence_id': index // 2, 'chunk_index': index % 2,
+            }
+
+        def fingerprint(self):
+            return 'resume-test-corpus'
+
+    config_path = tmp_path / 'config.ini'
+    config_path.write_text(
+        '[signal]\n'
+        'sr = 16000\n'
+        'n_fft = 512\n'
+        '[data]\n'
+        'packed_dir = fake\n'
+        'batch_size = 2\n'
+        'num_workers = 0\n'
+        'val_fraction = 0.25\n'
+        '[model]\n'
+        'max_delay_frames = 2\n'
+        '[training]\n'
+        f'output_dir = {tmp_path / "output"}\n'
+        'lr = 0.001\n'
+        'min_lr = 0.000001\n'
+        'lr_warmup = 0.0001\n'
+        'warmup_epochs = 1\n'
+        'max_epochs = 20\n'
+        'early_stop_patience = 15\n'
+        'grad_clip = 1.0\n'
+        '[loss]\n'
+        'compression = 0.3\n'
+        'magnitude_weight = 1.0\n'
+        'complex_weight = 1.0\n',
+        encoding='utf-8',
+    )
+
+    model = trainer.AlignULCNet(
+        SignalGrid(16000, 512, 512, 256), max_delay_frames=2,
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    resume_path = tmp_path / 'resume.pth'
+    torch.save({
+        'state_dict': model.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'epoch': 3,
+        'global_step': 4,
+        'best_val': 0.0,
+        'no_improve': 14,
+        'contract': {},
+    }, resume_path)
+
+    calls = []
+
+    def fake_run_epoch(*args, **kwargs):
+        calls.append(kwargs.get('optimizer') is not None or len(args) > 5)
+        return 1.0, kwargs.get('global_step', 0) + 1
+
+    saved = []
+    real_save = torch.save
+
+    def capture_save(obj, path):
+        saved.append((copy.deepcopy(obj), str(path)))
+
+    monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
+    monkeypatch.setattr(trainer, 'require_checkpoint_contract',
+                        lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer, 'run_epoch', fake_run_epoch)
+    monkeypatch.setattr(trainer.torch, 'save', capture_save)
+    args = trainer.build_parser().parse_args([
+        '--config', str(config_path), '--packed-dir', 'fake', '--device', 'cpu',
+        '--resume', str(resume_path),
+    ])
+    trainer.main(args)
+
+    # One train call and one validation call, then patience is exhausted.
+    assert calls == [True, False]
+    last = next(obj for obj, path in saved if path.endswith('_last.pth'))
+    assert last['best_val'] == 0.0
+    assert last['no_improve'] == 15
+
+    # Keep the local name alive until after the monkeypatch has captured the
+    # saves; this also makes accidental use of a mocked writer above obvious.
+    assert real_save is not capture_save

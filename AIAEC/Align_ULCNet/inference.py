@@ -5,6 +5,8 @@
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --device cpu
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --verify
+    python3 inference.py checkpoint.pth mic.wav far.wav out.wav \
+        --delay-num-filters 2
     python3 inference.py checkpoint.pth kf_error.wav far.wav out.wav \\
         --input-is-linear-error
 
@@ -78,11 +80,22 @@ from AIAEC._cli_common import (
 )
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid
+from AIAEC.dataset_gen.linear_aec import (
+    DATASET_DELAY_NUM_FILTERS,
+    check_delay_num_filters,
+)
 from AIAEC.training_common import (
     checkpoint_far_input_mode,
     require_checkpoint_model_identity,
     require_checkpoint_linear_aec,
 )
+
+
+def _parse_delay_num_filters(value: str) -> int:
+    try:
+        return check_delay_num_filters(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -112,6 +125,15 @@ def build_parser() -> argparse.ArgumentParser:
              'differs, only the alignment depth is rebuilt (weights are '
              'D-agnostic, but the output is NOT numerically identical '
              'across D).',
+    )
+    parser.add_argument(
+        '--delay-num-filters', type=_parse_delay_num_filters, default=None,
+        metavar='N',
+        help='Deployment override for the PBFDKF matched-filter bank size '
+             f'n (1..5; default {DATASET_DELAY_NUM_FILTERS}). Reliable bulk-'
+             'delay reach is approximately 125/221/317/413/509 ms for '
+             'n=1/2/3/4/5. This changes only the runtime AEC search bank; it '
+             'does not alter the checkpoint or neural depth D.',
     )
     parser.add_argument('--verify', action='store_true', help=VERIFY_HELP)
     add_directory_arguments(parser)
@@ -167,6 +189,12 @@ def _run_one(args):
 
 
 def main(args):
+    if (getattr(args, 'input_is_linear_error', False)
+            and getattr(args, 'delay_num_filters', None) is not None):
+        raise ValueError(
+            '--delay-num-filters cannot be used with '
+            '--input-is-linear-error because that mode bypasses PBFDKF'
+        )
     run_pipeline(args, _run_one)
 
 

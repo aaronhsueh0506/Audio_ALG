@@ -222,19 +222,25 @@ def main(args):
         optimizer, warmup_steps, total_steps, lr, min_lr, warmup_lr,
     )
 
-    start_epoch, global_step, best_val = 0, 0, float('inf')
+    start_epoch, global_step, best_val, no_improve = 0, 0, float('inf'), 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         require_checkpoint_contract(ckpt, contract, context=args.resume)
-        poisoned = scan_non_finite(model)
         model.load_state_dict(ckpt['state_dict'])
-        if scan_non_finite(model) and not poisoned:
-            raise NonFiniteTraining(f"{args.resume} contains non-finite weights")
+        poisoned = scan_non_finite(model)
+        if poisoned:
+            raise NonFiniteTraining(
+                f"{args.resume} contains non-finite weights: {poisoned[:5]}"
+            )
         if not args.reset_optimizer:
             optimizer.load_state_dict(ckpt['optimizer'])
             start_epoch = ckpt['epoch'] + 1
             global_step = ckpt['global_step']
             best_val = ckpt.get('best_val', best_val)
+            # Early stopping is training state just like the optimizer.  If it
+            # restarts at zero on every resume, repeated short jobs can evade
+            # the configured patience indefinitely.
+            no_improve = ckpt.get('no_improve', 0)
         # Rebuilt, never restored -- fast_forward_scheduler()'s docstring has
         # the measured reason a stored T_max must not come back.
         resumed_lr = fast_forward_scheduler(scheduler, global_step)
@@ -248,11 +254,11 @@ def main(args):
     grad_clip = cfg.getfloat('training', 'grad_clip', fallback=1.0)
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), aec_grid.sr)
 
-    no_improve = 0
     for epoch in range(start_epoch, max_epochs):
         checkpoint_for_halt = {
             'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
             'epoch': epoch - 1, 'global_step': global_step, 'contract': contract,
+            'best_val': best_val, 'no_improve': no_improve,
         }
         started = time.time()
         train_loss, global_step = run_epoch(
@@ -272,21 +278,30 @@ def main(args):
             msg += f" val_loss={val_loss:.4f}"
         print(msg)
 
+        is_best = val_loss < best_val
+        if is_best:
+            best_val = val_loss
+            no_improve = 0
+        else:
+            no_improve += 1
+
         checkpoint = {
             'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
             'epoch': epoch, 'global_step': global_step, 'contract': contract,
-            'best_val': min(best_val, val_loss),
+            'best_val': best_val, 'no_improve': no_improve,
         }
+        poisoned = scan_non_finite(model)
+        if poisoned:
+            raise NonFiniteTraining(
+                "refusing to write a checkpoint with non-finite weights: "
+                f"{poisoned[:5]}"
+            )
         torch.save(checkpoint, os.path.join(output_dir, f'{MODEL_NAME.lower()}_last.pth'))
-        if val_loss < best_val:
-            best_val = val_loss
-            no_improve = 0
+        if is_best:
             torch.save(checkpoint, os.path.join(output_dir, f'{MODEL_NAME.lower()}_best.pth'))
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                print(f"early stop: no improvement in {patience} epochs")
-                break
+        elif no_improve >= patience:
+            print(f"early stop: no improvement in {patience} epochs")
+            break
     grad_log.close()
 
 

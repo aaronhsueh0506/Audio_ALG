@@ -164,6 +164,34 @@ def test_inference_entry_uses_streaming_schedule(monkeypatch):
     assert seen == [(args, inference_cli.load_model)]
 
 
+def test_inference_cli_accepts_only_real_matched_filter_banks():
+    from AIAEC.Align_ULCNet import inference as inference_cli
+
+    parser = inference_cli.build_parser()
+    args = parser.parse_args([
+        'checkpoint.pth', 'mic.wav', 'far.wav', 'out.wav',
+        '--delay-num-filters', '2',
+    ])
+    assert args.delay_num_filters == 2
+    for bad in ('0', '6', '-1', '1.5'):
+        with pytest.raises(SystemExit):
+            parser.parse_args([
+                'checkpoint.pth', 'mic.wav', 'far.wav', 'out.wav',
+                '--delay-num-filters', bad,
+            ])
+
+
+def test_inference_rejects_filter_bank_override_when_pbfdkf_is_bypassed():
+    from AIAEC.Align_ULCNet import inference as inference_cli
+
+    args = inference_cli.build_parser().parse_args([
+        'checkpoint.pth', 'error.wav', 'far.wav', 'out.wav',
+        '--input-is-linear-error', '--delay-num-filters', '2',
+    ])
+    with pytest.raises(ValueError, match='bypasses PBFDKF'):
+        inference_cli.main(args)
+
+
 def _write_synthetic_checkpoint(path, model):
     """A minimal checkpoint that satisfies load_model's contract checks."""
     from AIAEC.dataset_gen import make_linear_aec_contract

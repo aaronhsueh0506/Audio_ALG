@@ -62,8 +62,11 @@ def main(args, load_model_fn=None):
             args.mic_wav, args.far_wav, grid.sr
         )
         linear_aec = LinearAecEngine(
-            n_lanes=1, sample_rate=grid.sr, contract=linear_contract
+            n_lanes=1, sample_rate=grid.sr, contract=linear_contract,
+            delay_num_filters=getattr(args, 'delay_num_filters', None),
         )
+        print('PBFDKF matched-filter bank: n=%d' %
+              linear_aec.delay_num_filters)
     if source_rates != (grid.sr, grid.sr):
         print(f"resampled primary/far {source_rates[0]}/{source_rates[1]} -> "
               f"{grid.sr} Hz")
