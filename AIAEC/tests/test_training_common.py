@@ -481,25 +481,25 @@ def test_contract_comparison_is_not_vacuous():
 
 # ---- verified frontend-equivalent behaviour-hash migrations ----------------
 #
-# These exercise the TABLE, not the live tree: `current` is set to the entry's
-# recorded NEW value rather than to whatever lib/aec hashes to right now, so a
-# later (unrelated, legitimately refused) lib/aec change does not turn the
-# migration mechanism's own tests red.
+# The table is EMPTY for this release: the matched-filter aggregator now
+# reports the dominant peak, which moves `linear_error`, so no recorded
+# identity is frontend-equivalent to this build any more. Following this
+# section's own instruction -- retire the tests with the table rather than
+# leave them asserting nothing -- the rows that drove a shipped pair
+# (accepted-with-a-warning, refused-in-reverse, targets-are-live) are gone.
+# What replaces them is
+# AIAEC/tests/test_linear_aec_behavior_migration.py, which pins the CURRENT
+# contract: the table is empty, nothing targets the live hash, and each
+# retired identity is refused with a rematerialization instruction.
+#
+# The two rows kept below do not need a shipped pair: they are the structural
+# invariants the lookup relies on whatever the table contains, and they are
+# what a future entry would be admitted against.
 
-def _migration_pair():
-    """The shipped migration, as (recorded_old, current_new)."""
-    assert ACCEPTED_BEHAVIOR_HASH_MIGRATIONS, (
-        'no behaviour-hash migration is shipped; if the table was emptied on '
-        'purpose because every corpus/checkpoint predating it has been retired, '
-        'retire these tests with it rather than leaving them asserting nothing'
-    )
-    return next(iter(sorted(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items())))
-
-
-def _contract_pair(pair=None):
+def _contract_pair(pair):
     """(current, recorded) contract dicts, identical except the hash field."""
     base = make_linear_aec_contract(16000, frame_size=512).as_dict()
-    old, new = _migration_pair() if pair is None else pair
+    old, new = pair
     return dict(base, aec_behavior_hash=new), dict(base, aec_behavior_hash=old)
 
 
@@ -521,34 +521,6 @@ def test_migration_table_is_one_way_and_not_chained():
         assert len(old) == 64 and len(new) == 64
 
 
-def test_migration_targets_are_the_live_frontend_hash():
-    """Every one-hop migration must terminate at the build being shipped.
-
-    The pair-level tests below intentionally use the literal table values, so
-    they would remain green after a later lib/aec signal-path edit made every
-    entry stale. Pinning the targets to the live digest closes that gap.
-    """
-    assert ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
-    assert set(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.values()) == {
-        aec_python_behavior_hash()
-    }
-
-
-@pytest.mark.parametrize(
-    "pair", sorted(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items())
-)
-def test_whitelisted_behaviour_hash_migration_is_accepted_with_a_warning(pair):
-    """The recorded-vs-current pair in the table loads, and says so.
-
-    This is the whole point of the table: a checkpoint trained on shards
-    materialized by the older frontend stays loadable, with no rematerialization
-    and no retraining, because the pair is backed by byte-identical evidence.
-    """
-    current, recorded = _contract_pair(pair)
-    with pytest.warns(RuntimeWarning, match='frontend-equivalent migration'):
-        require_linear_aec_contract(current, recorded, 'test')
-
-
 @pytest.mark.parametrize(
     "pair", sorted(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items())
 )
@@ -566,25 +538,13 @@ def test_whitelisted_migration_does_not_excuse_a_second_difference(pair):
 
 
 def test_unlisted_behaviour_hash_is_still_refused():
-    current, _recorded = _contract_pair()
-    unlisted = dict(current, aec_behavior_hash='0' * 64)
+    """An identity in neither the migration table nor the retired list is
+    refused on the plain mismatch path -- built without a table entry, so it
+    keeps working whatever the table contains."""
+    base = make_linear_aec_contract(16000, frame_size=512).as_dict()
+    unlisted = dict(base, aec_behavior_hash='0' * 64)
     with pytest.raises(ValueError, match='aec_behavior_hash'):
-        require_linear_aec_contract(current, unlisted, 'test')
-
-
-@pytest.mark.parametrize(
-    "pair", sorted(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items())
-)
-def test_behaviour_hash_migration_is_refused_in_reverse(pair):
-    """NEW recorded against an OLD build is a downgrade, and stays refused.
-
-    The evidence backing an entry is directional: it says the newer frontend
-    reproduces the older one's output, not that an older build can stand in for
-    a newer one, whose mechanisms it does not have.
-    """
-    current, recorded = _contract_pair(pair)
-    with pytest.raises(ValueError, match='aec_behavior_hash'):
-        require_linear_aec_contract(recorded, current, 'test')
+        require_linear_aec_contract(base, unlisted, 'test')
 
 
 def test_resnr_trainers_do_not_import_or_execute_live_linear_aec():

@@ -505,136 +505,53 @@ def linear_aec_contract_from_config(
 # against the OLD build is a genuine downgrade -- the mechanism it may have been
 # trained through is absent -- and stays refused.
 ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
-    # The deployed checkpoint/corpus frontend is the signal path at standalone
-    # AEC commit 8e5d05708.  The intervening productization work made the
-    # matched-filter bank and delay mode configurable, but the frozen dataset
-    # path still resolves to MATCHED with five filters and the same 832-sample
-    # PBFDKF.  The later quarantine is also disabled on this path.
+    # EMPTY, and deliberately so for this release.
     #
-    # Measured end to end from 8e5d05708 directly to this build on the same
-    # 32-second, 16-kHz/512/256, 400-ms-delay scene used below: five filters
-    # were constructed and both `linear_error` and `echo_hat` are byte-identical
-    # (2,048,000 bytes each).  SHA-256:
-    #   linear_error bfd504797d831b34ccfac20c50328b662d4bf4240728f391f4c8171a47579eb9
-    #   echo_hat     5abe156cfa0175f2dcd762860c4543eec077b677b2184bffa9f11af8da70ed26
-    "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe":
-        "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
-
-    # lib/aec adds the delay backward-quarantine (Path B), which holds a
-    # candidate EARLIER than the delay in force while the linear filter is
-    # still cancelling. Gated by `delay_backward_quarantine_enabled`, default
-    # False, and AIAEC never sets it: the config the frozen frontend builds
-    # leaves the mechanism inert, so the accepted-delay trajectory -- and
-    # therefore `linear_error` -- is unchanged. The added
-    # `delay_backward_quarantine_s` is read only when the enable is True.
+    # Every entry this table held migrated some older frontend identity to
+    # abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239, on
+    # evidence that `linear_error` rendered byte-identical across the pair.
+    # The dominant-matched-filter-peak change MOVES `linear_error`, so that
+    # evidence no longer describes the current frontend and none of those
+    # entries may be retargeted to the new hash -- doing so would declare an
+    # old waveform compatible with a build that does not produce it.
     #
-    # Measured on the pre-echo mis-attribution scene the mechanism targets
-    # (white-noise far, 16 kHz, 400 ms bulk delay, 32 s as one stateful
-    # sequence -- a geometry whose accepted delay re-locks EARLIER than the
-    # truth, so the guarded branch is genuinely reached): `linear_error`
-    # renders byte-identical across the change, 2,048,000 bytes per stem
-    # (4,096,000 with `echo_hat`). The control that makes that meaningful:
-    # the same render with the quarantine ENABLED differs in 121,069 bytes.
-    "ffc2e044d031f06a9d685ee77159e5a8d7d3075e5e3eaea8156746c416c1dd4e":
-        "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
-
-    # lib/aec gains `AEC.apply_external_realign()` -- the caller-side far
-    # realign for EXTERNAL_ALIGNED instances -- and the refactors it needs to
-    # exist: `PBFDAF.reset()` is re-expressed as `reset_taps()` plus the two
-    # time-domain analysis buffers, `_reset_filter_derived_state()` as
-    # `_reset_filter_latches()` plus the AEC3 post chain and the pending-delay
-    # clear, `warm_shift_ir()` accepts a NEGATIVE shift (and owns the far-history
-    # clear for that direction), and the tap span / IR concatenation each get a
-    # single spelling (`PBFDAF.tap_span`, `get_time_domain_filter()`) that the
-    # existing acquisition path now shares.
+    # They are retired rather than rewritten: see RETIRED_BEHAVIOR_HASHES,
+    # which names them so a corpus or checkpoint recorded under any of them is
+    # refused with an instruction to rematerialize, instead of failing with a
+    # bare hash mismatch that reads like a mystery.
     #
-    # Inert on this frontend by CONSTRUCTION and by measurement. By
-    # construction: the entry point is reachable only in EXTERNAL_ALIGNED and
-    # this frontend is MATCHED (it returns -1 without touching state), and
-    # `warm_shift_ir`'s new behaviour is all on the `s < 0` arm, which the
-    # single pre-existing caller cannot reach (its gate is
-    # `0 < new_delay < reach`). The two splits re-group the same statements in
-    # the same order, with one independent pair transposed (the AEC3 post chain
-    # now runs after the warmup re-arm instead of before it).
+    # The admission rule for a FUTURE entry is unchanged and still all four:
+    #   1. the ONLY compared field that differs is `aec_behavior_hash`;
+    #   2. the lib/aec change is inert on the path this corpus is materialized
+    #      with -- typically a new mechanism defaulted OFF, never a retune of
+    #      a live one;
+    #   3. that inertness is MEASURED, not argued: the frozen frontend
+    #      (`LinearAecProcessor`, formed_output seam) renders byte-identical
+    #      before and after, over a scene that actually reaches the changed
+    #      code;
+    #   4. the same harness is shown to be capable of failing -- render the
+    #      changed mechanism ENABLED and confirm the bytes move. A byte-
+    #      equality that a dead harness would also report is not evidence.
     #
-    # By measurement, on the same 32-second, 16-kHz/512/256, 400-ms-delay,
-    # white-noise scene the entry above uses: `linear_error` and `echo_hat`
-    # both render byte-identical, 2,048,000 bytes per stem. SHA-256:
-    #   linear_error 253483eef8730a0fd6b8dd730e3c6cd9f5701e871daf3b81c1e7913029b93b48
-    #   echo_hat     b7c9439882a1c4243ad1fda07832d6b09e8fc1aa6678404be5e8afd5687c6fd7
-    # The control that makes that meaningful -- the refactored code is genuinely
-    # ON this scene's path, not merely present in the file: over this render
-    # `_reset_filter_derived_state` runs twice and reaches the extracted
-    # `_reset_filter_latches` both times, and `PBFDAF.reset`/`reset_taps` and
-    # `PBFDKF._rearm_kalman` run four times each.
-    #
-    # `warm_shift_ir` and `get_time_domain_filter` are NOT on this scene (the
-    # acquisition takes the derived-state branch and the FilterAnalyzer never
-    # runs at this seam), so they are pinned separately: `warm_shift_ir`'s
-    # positive-shift output is byte-identical to the pre-change body across 30
-    # (grid, shift) pairs spanning 16k/512/256, 16k/256/128 and 48k/1024/512
-    # with shifts from 1 sample to 4x the tap span, and `get_time_domain_filter`
-    # -- which `warm_shift_ir` now calls instead of re-deriving the IR -- is
-    # byte-identical to the loop it replaced on those same three grids.
-    "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd":
-        "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
-
-    # lib/aec gains a runtime retarget of the far-active split min-gain floor:
-    # `SuppressionGain.set_split_floor_far_active_db(db, ramp_ms)`, plus the
-    # `AEC.set_preset(preset, ramp_ms)` wrapper that resolves a preset name to
-    # that one field (the only field the shipped presets differ in). The floor
-    # is split into a TARGET (`_split_floor_far_active`) and a LIVE value
-    # (`_split_floor_far_active_live`, seeded equal), `_get_min_gain` now reads
-    # the live one, and a new `_advance_split_floor_ramp()` at the top of
-    # `get_gain` walks live toward target. With the setter never called, live
-    # stays == target for the life of the instance and the advance returns on
-    # its first comparison, so the arithmetic `_get_min_gain` performs is the
-    # pre-change arithmetic.
-    #
-    # Unreachable on this frontend by CONSTRUCTION, not merely idle. The only
-    # `SuppressionGain.get_gain` call site is inside `_aec3_post`, and the only
-    # `_aec3_post` call site is gated on `enable_res or return_res_context`.
-    # The frozen contract pins `enable_res=False` and never sets
-    # `return_res_context` (default False), so the AEC3 post chain -- and with
-    # it `get_gain`, `_advance_split_floor_ramp` and `_get_min_gain` -- does not
-    # run at all at the formed_output seam, and no setter call can reach the
-    # samples this corpus records. Nothing in AIAEC calls either setter. What
-    # the change DOES reach on this path is the constructor: the two new seed
-    # attributes are written on every SuppressionGain built.
-    #
-    # Measured on the same 32-second, 16-kHz/512/256, 400-ms-delay, white-noise
-    # scene the entries above use, run as one stateful sequence: `linear_error`
-    # and `echo_hat` both render byte-identical, 2,048,000 bytes per stem.
-    # SHA-256:
-    #   linear_error af8556efec852a5a858d14e8a741834569952faa253e399879f0e9ec0c4bbe40
-    #   echo_hat     3598102ba153aeba902604db107534164b4746c0b9dbd934deb20eec47ced9d2
-    # Instrumented over that render, SuppressionGain is constructed 3 times --
-    # so the constructor edit is genuinely on this path -- while `get_gain`,
-    # `_advance_split_floor_ramp` and `_get_min_gain` each run 0 times across
-    # all 2000 hops. Driving the new API anyway (`set_preset('aggressive')` at
-    # hop 1000 of the same render) reproduces both SHA-256s exactly, which is
-    # the by-construction claim measured rather than argued.
-    #
-    # Two controls, because the usual single one cannot exist here. The byte
-    # comparison is live at THIS seam: perturbing the PBFDKF update gain
-    # (`mu_aec3` x 1.0001) and re-rendering moves 5,336 bytes of `linear_error`
-    # and 6,151 of `echo_hat`. The MECHANISM is live on the nearest surface
-    # that reaches it -- the same engine, config and scene geometry with
-    # `enable_res=True`, where `get_gain` runs on all 2000 hops, at a 40 ms
-    # bulk delay instead of 400 ms so the linear filter converges (full-file
-    # ERLE 22.65 dB) and the floor becomes the binding constraint on the output
-    # gain. `set_preset` at hop 1000 of that render moves the samples: 202,463
-    # differing bytes for 'mild', 108,132 for 'aggressive', 194,668 for 'mild'
-    # with ramp_ms=2000; the ramp itself walks from -22.128 dB after one hop to
-    # -38.000 dB at hop 125, the requested 2000 ms at a 16 ms hop. At the
-    # pinned 400 ms delay a RES-enabled render does NOT move under the same
-    # setter call -- the matched bank locks 300 ms, the 100 ms residue is
-    # outside the 832-tap span, the filter never converges, the residual-echo
-    # estimate stays small and no bin's gain ends up floor-limited -- which is
-    # why the mechanism control is stated on the converging geometry.
-    "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88":
-        "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
+    # Single hop by construction: the lookup is not applied transitively, so a
+    # value here is never re-read as a key. One direction by construction: a
+    # checkpoint recorded under the NEW hash run against an OLD build is a
+    # genuine downgrade and stays refused.
 }
+
+# Frontend identities that produced a DIFFERENT `linear_error` from the current
+# build. Listed so the refusal can say what to do about it. Nothing may migrate
+# from these: they are named to be rejected clearly, not to be accepted.
+RETIRED_BEHAVIOR_HASHES = frozenset({
+    # The frontend the shipped corpus and the Align-ULCNet checkpoints were
+    # materialized and trained on, and the three identities that had been
+    # verified frontend-equivalent to it.
+    "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239",
+    "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe",
+    "ffc2e044d031f06a9d685ee77159e5a8d7d3075e5e3eaea8156746c416c1dd4e",
+    "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd",
+    "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
+})
 
 
 def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> None:
@@ -686,6 +603,18 @@ def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> N
             stacklevel=2,
         )
         return
+    if differing == ["aec_behavior_hash"] and recorded_hash in RETIRED_BEHAVIOR_HASHES:
+        raise ValueError(
+            f"{context} linear_aec was materialized by AEC behaviour "
+            f"{recorded_hash}, which this build ({current_hash}) does not "
+            "reproduce: the matched-filter aggregator now reports the dominant "
+            "peak instead of the pre-echo candidate, which MOVES linear_error. "
+            "There is no migration for this pair and none may be added -- the "
+            "byte-identity evidence the old entries carried does not describe "
+            "this frontend. Recompute the corpus's linear_error channel "
+            "(AIAEC.dataset_gen.rematerialize_linear_aec, without --resume), "
+            "repack, and retrain any checkpoint trained on the old data."
+        )
     mismatches = [
         f"{key}: got {got_dict[key]!r}, expected {want_dict[key]!r}"
         for key in differing
@@ -834,6 +763,7 @@ def materialize_linear_error(
 
 __all__ = [
     "ACCEPTED_BEHAVIOR_HASH_MIGRATIONS",
+    "RETIRED_BEHAVIOR_HASHES",
     "BEHAVIOR_HASH_SCHEMA",
     "DATASET_DELAY_NUM_FILTERS",
     "DELAY_NUM_FILTERS_RANGE",

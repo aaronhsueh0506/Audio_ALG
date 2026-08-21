@@ -47,10 +47,11 @@ What is asserted, and why each assertion can fail:
    frontend and therefore one bit-identical ``linear_error``.
 5. MEMORY SCALES. Model stream state grows linearly and strictly with D; the
    AEC's search ring and aggregator histogram grow strictly with n.
-6. THE QA GATE CAN FAIL. ``alignment_qa`` is proved against a real mis-lock
-   this repository currently has (see the pre-echo note in
-   ``test_qa_gate_catches_the_known_pre_echo_mislock``), not only against
-   healthy clips.
+6. THE QA GATE CAN FAIL. ``alignment_qa`` is proved by making it go red on an
+   INJECTED wrong applied delay, not only against healthy clips. It used to be
+   proved on a real defect -- the aggregator reported one delay per bank size
+   100 ms early -- which was fixed at the estimator; injecting the same
+   signature tests the gate itself and survives the next estimator change.
 7. THE OVERRIDE DOES NOT TOUCH THE CONTRACT. Same contract object, same dict,
    same fingerprint at every n -- so no shard or checkpoint stamp can shift
    because a diagnostic ran at a different bank size.
@@ -68,6 +69,7 @@ Run:
 """
 
 import configparser
+import dataclasses
 import functools
 
 import numpy as np
@@ -423,36 +425,41 @@ def test_joint_profile_runs_and_stays_finite(bank_size, far_mode, depth):
 # 6. Instrument proofs: the gates must be able to go red
 # ---------------------------------------------------------------------------
 
-def test_qa_gate_catches_the_known_pre_echo_mislock():
-    """The QA gate is proved on a real mis-lock, not only on healthy clips.
+def test_qa_gate_goes_red_on_a_wrong_applied_delay():
+    """The QA gate is proved by making it fail, not only by healthy clips.
 
-    lib/aec's matched-filter aggregator currently reports one specific delay
-    per bank size exactly 1600 samples (100 ms) early -- a pre-echo
-    attribution whose fix is still branch-pending. At n=2 that lands on a
-    ~100 ms bulk delay, i.e. squarely inside the range a short-route product
-    would run. The point here is NOT to bless that behaviour: it is that the
-    sweep's per-clip QA refuses such a clip instead of averaging it into a
-    delay-profile statistic.
+    This used to be proved on a real defect: lib/aec's aggregator reported one
+    delay per bank size exactly 1600 samples (100 ms) early, a pre-echo
+    attribution the docstring called "branch-pending". That fix landed -- the
+    aggregator now reports the dominant peak -- so the fixture is healthy at
+    every bank size and cannot supply a red case any more.
+
+    Proving the gate on an INJECTED wrong delay is the better test regardless:
+    it exercises the gate itself rather than depending on the estimator having
+    a bug, and it keeps working after the next estimator change too.
     """
     delay_ms = 100.0
     microphone, far_end = _scene(delay_ms)
-    run = _run(2, delay_ms)
-    applied = int(run.delay_samples[-1])
-    assert applied >= 0, (
-        "this case is about a CONFIDENT wrong lock; if the estimator stopped "
-        "locking here the fixture, not the gate, needs updating"
+    healthy = _run(5, delay_ms)
+    offline = _offline(delay_ms)
+
+    # The premise: the clip really is healthy now, so a red verdict below can
+    # only come from the injected delay.
+    ok = alignment_qa(healthy, microphone, far_end, max_lag=QA_MAX_LAG,
+                      offline=offline)
+    assert ok["qa_status"] == "ok", ok
+    assert ok["qa_valid"] is True
+
+    # The signature the retired defect produced: a confident lock 1600 samples
+    # (100 ms) EARLY. Injected rather than provoked.
+    wrong = dataclasses.replace(
+        healthy,
+        delay_samples=np.maximum(healthy.delay_samples - 1600, 0),
     )
-    qa = alignment_qa(run, microphone, far_end, max_lag=QA_MAX_LAG,
-                      offline=_offline(delay_ms))
-    assert qa["qa_status"] == "mislock", qa
-    assert qa["qa_valid"] is False
-    # The same clip at n=5 is healthy, so the gate is discriminating between
-    # profiles rather than rejecting the fixture.
-    healthy = alignment_qa(
-        _run(5, delay_ms), microphone, far_end, max_lag=QA_MAX_LAG,
-        offline=_offline(delay_ms),
-    )
-    assert healthy["qa_status"] == "ok", healthy
+    verdict = alignment_qa(wrong, microphone, far_end, max_lag=QA_MAX_LAG,
+                           offline=offline)
+    assert verdict["qa_status"] == "mislock", verdict
+    assert verdict["qa_valid"] is False
 
 
 def test_mutation_pinned_bank_size_makes_the_out_of_reach_case_lock():

@@ -330,6 +330,24 @@ version cannot strand a checkpoint. `aec_source_hash` still covers every
 Python file under `lib/aec/python`; unlike the 48-file signal-path scope, that
 provenance count intentionally grows when tests or diagnostics are added.
 
+**Recomputing `linear_error` after a frontend change.** The source WAVs do not
+need re-rendering — only the fifth channel does, then the packed shards:
+
+```bash
+python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
+    --input data_aec/all --config AIAEC/dataset_gen/config.ini
+
+python3 -m AIAEC.dataset_gen.pack_aec_dataset \
+    --config AIAEC/dataset_gen/config.ini \
+    --input data_aec/all --output data_aec/packed/all --overwrite
+```
+
+⚠ **Do not pass `--resume`.** It can only see that a sequence already HAS five
+channels, not which frontend produced that fifth one, so a resumed pass would
+silently leave a corpus mixing two contracts. Far, mic, near-target and the
+sequence boundaries are preserved; only `linear_error` is recomputed. Any
+checkpoint trained on the old distribution must be retrained.
+
 **v2 → v3 has no automatic migration, deliberately.** A v2 contract records only
 a raw-text source hash, so once `lib/aec` has moved on there is no way to
 recover what the producing build's *behaviour* hash was — stamping the current
@@ -350,6 +368,23 @@ safe direction — rematerialize rather than loosening the check. Refresh the
 channel with the command below, which avoids repeating acoustic mixing:
 
 #### The one exception: verified frontend-equivalent migrations
+
+> **⚠ The table is EMPTY for this release.** The matched-filter aggregator now
+> reports the dominant peak instead of the pre-echo candidate, which **moves
+> `linear_error`**. Every entry the table held was admitted on byte-identity
+> evidence against the previous frontend, and that evidence does not describe
+> this build — so the entries are **retired, not retargeted**: pointing them at
+> the new hash would declare an old waveform compatible with a build that does
+> not produce it. The identities they named are listed in
+> `RETIRED_BEHAVIOR_HASHES` and refused with an instruction to rematerialize
+> (`rematerialize_linear_aec.py`, WITHOUT `--resume`, then repack, then
+> retrain), not with a bare hash mismatch.
+> `behavior_hash_schema` stays `canon-ast-1`: this is a behaviour change, not a
+> canonicalizer change. Pinned by
+> `tests/test_linear_aec_behavior_migration.py`.
+>
+> The mechanism below is unchanged and still available for a genuinely inert
+> future `lib/aec` change; it simply has no live entries.
 
 `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` in `linear_aec.py` is an explicit table of
 `recorded → current` behaviour-hash pairs that are known to produce the *same*
