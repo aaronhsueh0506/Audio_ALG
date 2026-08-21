@@ -57,6 +57,11 @@ if __package__ in (None, ''):
 
 from .aec_features import PACKED_STEM_ORDER, STEM_ORDER  # noqa: E402
 from .linear_aec import linear_aec_contract_from_config  # noqa: E402
+from .linear_error_ledger import (  # noqa: E402
+    LEDGER_NAME,
+    claimed_vs_present,
+    ledger_path,
+)
 from .seq_layout import scan_chunks, stale_temp_files  # noqa: E402
 
 
@@ -127,6 +132,48 @@ def _save_shard(clips, metas, shard_index, args, header) -> tuple:
     return temporary, path
 
 
+def _require_complete_rematerialization(seqs_dir, sequences, contract_hash):
+    """Stop if the fifth channel was only partly rebuilt.
+
+    rematerialize_linear_aec writes a ledger keyed to the contract it ran, and
+    records a sequence only once all of that sequence's chunks are on disk. So
+    a ledger that exists but does not name every sequence means a run was
+    interrupted: some sequences carry the new frontend and the rest still
+    carry the old one. Packing that produces a shard set labelled with ONE
+    contract while holding two, which nothing downstream can detect -- the
+    fifth channel is just samples once it is packed.
+
+    No ledger at all is not an error. A corpus generated in one pass by
+    gen_aec_dataset.py never had one, and there is nothing to contradict.
+    The failure this guards is a PARTIAL claim, not an absent one.
+    """
+    if not os.path.exists(ledger_path(seqs_dir)):
+        return
+    claimed, missing, extra = claimed_vs_present(
+        seqs_dir, contract_hash, sequences)
+    if not claimed:
+        raise ValueError(
+            f"{ledger_path(seqs_dir)} was written by a DIFFERENT linear-AEC "
+            f"contract than the one this --config builds "
+            f"({contract_hash[:12]}). Either pass the "
+            f"config the corpus was rematerialized with, or re-run "
+            f"rematerialize_linear_aec with this one; packing now would label "
+            f"the shards with a contract that did not produce them.")
+    if missing:
+        raise ValueError(
+            f"{len(missing)} of {len(sequences)} sequence(s) are absent from "
+            f"{LEDGER_NAME} (first: {missing[0]:06d}). rematerialize_linear_aec "
+            f"records a sequence only when all of its chunks are written, so "
+            f"this corpus is part new frontend and part old. Finish the "
+            f"rematerialization before packing -- a mixed corpus packs without "
+            f"complaint and is undetectable afterwards.")
+    if extra:
+        raise ValueError(
+            f"{LEDGER_NAME} claims {len(extra)} sequence(s) that are not in "
+            f"the corpus (first: {extra[0]:06d}); the ledger and the WAVs "
+            f"disagree about what this split contains.")
+
+
 def pack(args):
     if args.shard_clips <= 0:
         raise ValueError(f"--shard-clips must be positive, got {args.shard_clips}")
@@ -140,6 +187,8 @@ def pack(args):
 
     seqs_dir = _resolve_seqs_dir(args.input)
     sequences = _collect(seqs_dir)
+    _require_complete_rematerialization(
+        seqs_dir, sequences, linear_aec.fingerprint())
     total_chunks = sum(len(paths) for paths in sequences.values())
 
     stale = stale_temp_files(seqs_dir)

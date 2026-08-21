@@ -13,7 +13,8 @@ order come from the ``SSSSSS_CCC.wav`` filenames; rate, length and the current
 channel count come from the WAV headers.
 
 Sequences are independent by construction -- each gets a fresh PBFDKF -- and
-each writes only its own chunks, so ``--jobs N`` fans them across processes.
+each writes only its own chunks, so ``--jobs N`` fans them across processes
+and scales approximately with N until CPU or memory bandwidth saturates.
 That is the only lever worth pulling: measured on a 16 kHz corpus the Python
 PBFDKF is 99.8% of the run and all file I/O is 0.1%, at roughly 3.3x realtime
 per process. Nothing about the WAV handling is worth optimizing, and the
@@ -28,8 +29,10 @@ a PEAK chunk with the wall-clock time when it writes a float WAV, so any two
 runs seconds apart differ in one byte at offset 61 -- at any --jobs, including
 two serial runs.
 
-``--resume`` skips a sequence only when THIS contract already wrote it, which
-it knows from the ledger beside the corpus (see LEDGER_NAME). A ledger written
+``--resume`` skips a sequence only when THIS contract already wrote it and
+that sequence's chunks still match on disk -- the ledger (see linear_error_ledger) records what was WRITTEN, not what survived. A full pass empties
+the ledger first, so it cannot inherit a claim it did not make, and
+pack_aec_dataset refuses a ledger that names only some of the corpus. A ledger written
 by a different contract is ignored wholesale rather than partially trusted, so
 a resumed run after a [linear_aec] change redoes everything instead of leaving
 a corpus with two frontends mixed into it.
@@ -39,7 +42,6 @@ from __future__ import annotations
 
 import argparse
 import configparser
-import json
 import multiprocessing
 import os
 import sys
@@ -63,45 +65,8 @@ from .linear_aec import (  # noqa: E402
     linear_aec_contract_from_config,
     materialize_linear_error,
 )
+from .linear_error_ledger import load_ledger, save_ledger  # noqa: E402
 from .seq_layout import scan_chunks  # noqa: E402
-
-
-LEDGER_NAME = "linear_error.done.json"
-
-
-def _ledger_path(seqs_dir: str) -> str:
-    """Beside the corpus root, not inside seqs/, so a glob for chunks cannot
-    pick it up and scan_chunks() stays a pure *.wav scan."""
-    return os.path.join(os.path.dirname(os.path.abspath(seqs_dir)), LEDGER_NAME)
-
-
-def _load_ledger(seqs_dir: str, contract_hash: str) -> set:
-    """Sequence ids this exact contract has already written.
-
-    A ledger from a DIFFERENT contract is discarded whole. Trusting part of it
-    is what produces a corpus with two frontends in it, which is the failure
-    this file exists to make impossible.
-    """
-    try:
-        with open(_ledger_path(seqs_dir), "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, ValueError):
-        return set()
-    if data.get("contract") != contract_hash:
-        return set()
-    return {int(x) for x in data.get("sequences", ())}
-
-
-def _save_ledger(seqs_dir: str, contract_hash: str, done: set) -> None:
-    """Rewritten after every sequence, atomically. A run killed mid-write
-    leaves the previous ledger intact, so the worst case is redoing one
-    sequence -- never recording one that did not finish."""
-    path = _ledger_path(seqs_dir)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as handle:
-        json.dump({"contract": contract_hash,
-                   "sequences": sorted(int(x) for x in done)}, handle)
-    os.replace(tmp, path)
 
 
 WAV_ENCODINGS = {
@@ -149,8 +114,9 @@ def _sequence_is_current(wav_paths: List[str], expected_sr: int,
                          expected_t: int) -> bool:
     """Every chunk already five-channel and the right shape.
 
-    This is a SHAPE check only -- see the module docstring on what --resume
-    can no longer prove.
+    A shape check, and deliberately only that: WHICH contract wrote the fifth
+    channel is the ledger's job. This answers the other half -- whether the
+    files the ledger is talking about are still the files it saw.
     """
     for path in wav_paths:
         info = torchaudio.info(path)
@@ -255,10 +221,32 @@ def rematerialize(args) -> None:
     jobs = int(args.jobs)
     if jobs < 1:
         raise ValueError(f"--jobs must be at least 1, got {jobs}")
-    done = _load_ledger(seqs_dir, contract_hash) if args.resume else set()
+
     if args.resume:
+        claimed = load_ledger(seqs_dir, contract_hash)
+        # The ledger records what this contract WROTE, not what is still on
+        # disk. A file deleted, truncated or half-restored since then would be
+        # skipped on its say-so, so every claim is re-checked against the
+        # actual chunks before it is honoured. One torchaudio.info() per chunk,
+        # measured at 67 us warm: about 5 s to re-check a whole 200-hour corpus,
+        # and zero on a full pass, which never enters this branch.
+        done = {sid for sid in claimed
+                if sid in sequences
+                and _sequence_is_current(sequences[sid], sr, chunk_samples)}
+        dropped = len(claimed) - len(done)
         print(f"resume: {len(done)} sequence(s) already written by this "
-              f"contract ({contract_hash[:12]})")
+              f"contract ({contract_hash[:12]})"
+              + (f"; {dropped} re-queued -- their chunks no longer match"
+                 if dropped else ""))
+        if dropped:
+            save_ledger(seqs_dir, contract_hash, done)
+    else:
+        done = set()
+        # Start from an empty ledger rather than whatever a previous run left.
+        # Otherwise a full-pass run that dies before its first sequence lands
+        # leaves the old ledger intact, and the next --resume trusts a claim
+        # this run never made.
+        save_ledger(seqs_dir, contract_hash, done)
 
     pending = [sid for sid in sorted(sequences) if sid not in done]
     work = [
@@ -286,7 +274,7 @@ def rematerialize(args) -> None:
             rewritten += 1
             # Recorded only once the sequence's own chunks are all on disk,
             # so an interrupted run never claims one it did not finish.
-            _save_ledger(seqs_dir, contract_hash, done)
+            save_ledger(seqs_dir, contract_hash, done)
             progress.update(1)
     except BaseException:
         # terminate(), not close(): close() only stops NEW tasks being queued,

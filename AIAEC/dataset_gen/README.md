@@ -350,7 +350,10 @@ must be retrained.
 Python PBFDKF is **99.8%** of the run and file I/O is 0.1%, so nothing about
 the WAV handling is worth optimizing. One process sustains roughly 3.3x
 realtime, which puts a 200-hour corpus near 62 hours; sequences are
-independent, so `--jobs N` divides that by N until the cores run out.
+independent, so `--jobs N` scales approximately with N until CPU or memory
+bandwidth saturates. Do not expect exactly N×: process startup, memory
+bandwidth and storage all take a cut, and the useful ceiling is usually below
+the logical-core count.
 
 `--jobs` cannot change the corpus. Each sequence gets a fresh PBFDKF, writes
 only its own chunks, and has no random source, so the only thing N changes is
@@ -364,12 +367,39 @@ the order sequences finish in. Pinned by
 > `--jobs`.
 
 **`--resume` is safe for this.** It skips a sequence only when THIS contract
-already wrote it, which it reads from `linear_error.done.json` beside the
-corpus. A ledger written by a different contract is discarded whole rather
-than partially trusted, so resuming after a `[linear_aec]` change redoes
-everything instead of leaving two frontends mixed together. The ledger records
-a sequence only after all of its chunks are on disk, so an interrupted run
-redoes at most the one it was in the middle of.
+already wrote it AND that sequence's chunks still match on disk — the ledger
+records what was written, not what survived, so every claim is re-checked
+before it is honoured. A ledger written by a different contract is discarded
+whole rather than partially trusted. The ledger records a sequence only after
+all of its chunks are on disk, so an interrupted run redoes at most the ones
+that were in flight (up to `--jobs` of them). A run WITHOUT `--resume` starts
+by emptying the ledger, so it can never inherit a claim it did not make.
+
+**Between the two commands.** The packer is the only thing that checks the
+corpus is whole, so the order matters and there is no step to skip:
+
+1. `rematerialize_linear_aec` must exit **0**. A non-zero exit means some
+   sequences still carry the old fifth channel; the ledger will say so and the
+   packer will refuse, but do not go looking for a way around that.
+2. Do not run a second rematerializer against the same split concurrently.
+   Both would write the same ledger and each would overwrite the other's
+   claims.
+3. Then pack. If it refuses, finish the rematerialization -- re-run it, this
+   time WITH `--resume`, which now re-checks each claim against the chunks on
+   disk before honouring it.
+
+If the run was interrupted, re-running with `--resume` is the cheap path and
+is safe: it redoes only what is not already recorded and verified. Re-running
+without `--resume` is also correct, just slower -- it empties the ledger and
+starts over.
+
+**The packer refuses a half-rematerialized corpus.** If
+`linear_error.done.json` exists but does not name every sequence, the split is
+part new frontend and part old, and `pack_aec_dataset.py` stops instead of
+labelling the shards with one contract while they hold two — the one failure
+here with no downstream detector, since the fifth channel is just samples once
+packed. A corpus with no ledger at all is fine: a one-pass generation never
+had one, and the guard is against a PARTIAL claim, not an absent one.
 
 **v2 → v3 has no automatic migration, deliberately.** A v2 contract records only
 a raw-text source hash, so once `lib/aec` has moved on there is no way to
