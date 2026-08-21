@@ -75,6 +75,18 @@ OUT_DIR_HELP = (
 )
 
 
+def _same_or_descendant(parent, candidate):
+    """Whether ``candidate`` is ``parent`` or nested below it.
+
+    ``commonpath`` raises when Windows paths live on different drives; those
+    paths cannot be nested and are therefore safe for this check.
+    """
+    try:
+        return os.path.commonpath((parent, candidate)) == parent
+    except ValueError:
+        return False
+
+
 def add_directory_arguments(parser: argparse.ArgumentParser) -> None:
     """The batch form of the positional mic/far/out trio."""
     group = parser.add_argument_group('directory mode')
@@ -92,15 +104,24 @@ def resolve_directory_jobs(args):
     level problems -- a stereo file, a rate disagreement, a non-finite sample
     -- are still found when that file is read, and abort the batch.
     """
-    mic_dir = os.path.abspath(args.mic_dir)
-    out_dir = os.path.abspath(args.out_dir)
-    if out_dir == mic_dir:
+    mic_dir = os.path.realpath(args.mic_dir)
+    out_dir = os.path.realpath(args.out_dir)
+    if _same_or_descendant(mic_dir, out_dir):
         raise ValueError(
-            '--out-dir must differ from --mic-dir: results keep their '
-            'microphone file names and would overwrite the inputs'
+            '--out-dir must differ from --mic-dir and must not be one of its '
+            'descendants: '
+            'directory mode scans microphone WAVs recursively, so a later '
+            'run would consume its own earlier outputs'
         )
     if args.ref_dir:
-        found = discover_pairs(mic_dir, args.ref_dir, MIC_TO_REFERENCE)
+        ref_dir = os.path.realpath(args.ref_dir)
+        if _same_or_descendant(ref_dir, out_dir):
+            raise ValueError(
+                '--out-dir must not be --ref-dir or one of its descendants: '
+                'directory mode scans far-end WAVs recursively, so a later '
+                'run would treat earlier outputs as unpaired references'
+            )
+        found = discover_pairs(mic_dir, ref_dir, MIC_TO_REFERENCE)
     else:
         found = [(name, path, None)
                  for name, path in sorted(wav_inventory(mic_dir).items())]

@@ -320,6 +320,22 @@ def test_without_ref_dir_every_job_carries_no_reference(tmp_path):
     )
 
 
+def test_output_tree_cannot_be_nested_under_microphone_tree(tmp_path):
+    _tree(tmp_path, ["a69_mic.wav"])
+    args = _job_args(tmp_path)
+    args.out_dir = str(tmp_path / "mic" / "enhanced")
+    with pytest.raises(ValueError, match="descendants"):
+        resolve_directory_jobs(args)
+
+
+def test_output_tree_cannot_be_nested_under_reference_tree(tmp_path):
+    ref_dir = _tree(tmp_path, ["a69_mic.wav"], ["a69_lpb.wav"])
+    args = _job_args(tmp_path, ref_dir)
+    args.out_dir = str(ref_dir / "enhanced")
+    with pytest.raises(ValueError, match="descendants"):
+        resolve_directory_jobs(args)
+
+
 def test_writing_results_over_the_inputs_is_refused(tmp_path):
     _tree(tmp_path, ["a69_mic.wav"])
     args = _job_args(tmp_path)
