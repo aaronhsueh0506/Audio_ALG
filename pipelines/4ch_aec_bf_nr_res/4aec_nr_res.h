@@ -779,6 +779,19 @@ int four_aec_nr_res_get_mem_breakdown(
  * uint32_t would give 1000x the resolution and still take 4.29 s to wrap, if
  * the fine end ever matters.
  *
+ * ⚠ OFF BY DEFAULT, IN TWO HALVES. This record costs 29 clock reads per hop
+ * -- nine here plus five inside each of the four lanes -- so a release build
+ * takes none of them and every field reads 0. Build with
+ * -DFOUR_AEC_NR_RES_STAGE_TIMING=1 for the wrapper's own stages
+ * (delay/fuse/res/nr/synth) and -DAEC_STAGE_TIMING=1 for the three summed off
+ * the lanes (frontend/linear/lane_res); `make PROFILE=1` sets both, which is
+ * what a profile build should use. Setting one alone is legible rather than
+ * broken: the other half simply reads 0.
+ *
+ * A display-side flag in the CONSUMER does not enable any of this. It decides
+ * whether a breakdown is printed; these decide whether there is anything to
+ * print. Built one way and read the other, the report renders zeros.
+ *
  * LIFETIME. The values describe the last hop that reached each stage. Each
  * half is cleared once its own call has been ACCEPTED -- after the argument
  * and token checks -- so a hop that starts and then bails out (a non-finite

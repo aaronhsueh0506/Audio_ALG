@@ -2094,12 +2094,28 @@ static void test_stage_timing(void) {
      * a microsecond, so a zero anywhere here means that window never ran.
      * frontend_us and lane_res_us come from aec_get_last_timing(); they read
      * zero if the AEC-side windows are ever dropped. */
+    /* Each half is asserted against its OWN flag, because the two are
+     * separate builds: FOUR_AEC_NR_RES_STAGE_TIMING governs the wrapper's
+     * stages, AEC_STAGE_TIMING governs the three summed off the lanes. Both
+     * default off, and the zero branches are not filler -- they are what
+     * proves the flag removes the measurement rather than merely hiding it,
+     * and that a compiled-out build reports zeros instead of stale values. */
+#if FOUR_AEC_NR_RES_STAGE_TIMING
     CHECK(t.delay_us > 0, "timing: the delay estimator reports a real cost");
+#else
+    CHECK(t.delay_us == 0,
+          "timing: the wrapper's stages read zero when compiled out");
+#endif
+#if AEC_STAGE_TIMING
     CHECK(t.frontend_us > 0,
           "timing: the lanes' pre-filter stage reports a real cost");
     CHECK(t.linear_us > 0, "timing: the lanes' main filter reports a real cost");
     CHECK(t.lane_res_us > 0,
           "timing: the lanes' post/RES block reports a real cost");
+#else
+    CHECK(t.frontend_us == 0 && t.linear_us == 0 && t.lane_res_us == 0,
+          "timing: the lanes' stages read zero when compiled out");
+#endif
 
     /* Every stage is bounded by the call that contains it. This is what
      * distinguishes a measurement from a number: a stray or uninitialised

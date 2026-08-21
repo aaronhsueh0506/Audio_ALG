@@ -33,6 +33,19 @@ NO_STDIO = 0
 DEBUG = 0
 TOOLCHAIN_CHECK = 1
 EXTRA_CFLAGS =
+# PROFILE=1 turns on the per-hop stage timing across the WHOLE chain: this
+# wrapper's own stages and, through EXTRA_CFLAGS reaching the lib/aec producer
+# build, the three summed off the four lanes. Both are off otherwise, so a
+# release build takes none of the 29 clock reads per hop.
+#
+# It lands in EXTRA_CFLAGS deliberately: that is already forwarded to every
+# producer sub-make AND folded into CFG_SIG, so a profile build and a release
+# build occupy different obj/bin directories and cannot hand each other a
+# stale object.
+PROFILE ?= 0
+ifeq ($(PROFILE),1)
+EXTRA_CFLAGS += -DFOUR_AEC_NR_RES_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1
+endif
 EXTRA_LDFLAGS =
 CPPFLAGS ?=
 CXXFLAGS ?=

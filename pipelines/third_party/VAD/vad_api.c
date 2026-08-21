@@ -37,12 +37,15 @@ size_t vad_api_get_mem_size(const VADApiConfig* cfg)
      * refuse the combination. */
     if (cfg->vad_cfg.F != cfg->masker_cfg.NFFT / 2 + 1) return 0;
     if (!vad_config_is_valid(&cfg->vad_cfg)) return 0;
-    /* An even smooth_size asks for a k-wide window and gets k+1: the
-     * frequency smoother centres on +-(k/2), so only odd k spans exactly k
-     * bins. Refuse rather than widen it silently. */
+    /* Frequency smoothing has two ways to not do what was asked, and both
+     * are silent. An even smooth_size asks for a k-wide window and gets k+1,
+     * because the smoother centres on +-(k/2) -- only odd k spans exactly k
+     * bins. A smooth_size of zero or less makes median_filter_1d() copy its
+     * input straight through, so the pass runs and changes nothing. Refuse
+     * both rather than widen or skip silently. */
     if (cfg->masker_cfg.enable_freq_smooth &&
-        cfg->masker_cfg.smooth_size > 0 &&
-        cfg->masker_cfg.smooth_size % 2 == 0) return 0;
+        (cfg->masker_cfg.smooth_size <= 0 ||
+         (cfg->masker_cfg.smooth_size & 1) == 0)) return 0;
 
     masker_need = masker_get_mem_size(&cfg->masker_cfg);
     vad_need    = vad_get_mem_size();

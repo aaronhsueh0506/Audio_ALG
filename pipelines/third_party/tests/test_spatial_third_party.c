@@ -1516,10 +1516,18 @@ static int test_vad_api_refuses_configs_its_modules_cannot_serve(void) {
     cfg.vad_cfg.enable_median = 1;
     cfg.vad_cfg.median_k = 5;
 
-    /* An even smooth_size spans k+1 bins, not k. */
+    /* An even smooth_size spans k+1 bins, not k; a non-positive one makes the
+     * smoothing pass copy its input through. Both ask for smoothing and get
+     * something else. */
     cfg.masker_cfg.smooth_size = 4;
     CHECK(vad_api_get_mem_size(&cfg) == 0,
           "an even smooth_size is refused rather than widened");
+    cfg.masker_cfg.smooth_size = 0;
+    CHECK(vad_api_get_mem_size(&cfg) == 0,
+          "a zero smooth_size is refused rather than silently skipped");
+    cfg.masker_cfg.smooth_size = -1;
+    CHECK(vad_api_get_mem_size(&cfg) == 0,
+          "a negative smooth_size is refused rather than silently skipped");
     cfg.masker_cfg.enable_freq_smooth = 0;
     CHECK(vad_api_get_mem_size(&cfg) > 0,
           "the same smooth_size is fine once frequency smoothing is off");

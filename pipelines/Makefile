@@ -336,6 +336,17 @@ ATTEST_STAMP ?=
 # `make clean-libs`/`clean-all` remain available but are no longer required
 # for correctness.
 EXTRA_CFLAGS ?=
+# PROFILE=1 turns on lib/aec's per-hop stage timing, which is off by default so
+# a release build takes none of its five clock reads per hop per instance. It
+# lands in EXTRA_CFLAGS deliberately: that is already forwarded to the producer
+# sub-makes AND folded into CFG_SIG, so a profile build and a release build
+# occupy different obj/bin directories and cannot hand each other a stale
+# object. The four-lane pipeline has its own Makefile and its own wrapper-side
+# half of this switch; `make PROFILE=1` there sets both.
+PROFILE ?= 0
+ifeq ($(PROFILE),1)
+EXTRA_CFLAGS += -DAEC_STAGE_TIMING=1
+endif
 
 SIMD ?= 1
 ifneq ($(words $(SIMD)),1)

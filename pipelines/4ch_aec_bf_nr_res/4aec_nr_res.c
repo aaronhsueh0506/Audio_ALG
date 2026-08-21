@@ -65,6 +65,21 @@ static uint32_t four_aec_nr_res_backend_id(void) {
     return 0u;
 }
 
+/* Per-stage timing is diagnostic and costs nine clock_gettime() calls per hop
+ * here, on top of the five each of the four lanes makes inside lib/aec -- 29
+ * in all. DEFAULT OFF for the same reason lib/aec's is: a diagnostic that has
+ * to be switched off is one that ships on by accident.
+ *
+ * The two flags are separate because the two builds are: this one governs the
+ * wrapper's own stages, AEC_STAGE_TIMING governs what the lanes report back.
+ * Setting only this one leaves frontend/linear/lane_res reading 0 while the
+ * wrapper's own stages measure, which is a legible state, not a broken one.
+ * `make PROFILE=1` sets both, and is what a profile build should use. */
+#ifndef FOUR_AEC_NR_RES_STAGE_TIMING
+#define FOUR_AEC_NR_RES_STAGE_TIMING 0
+#endif
+
+#if FOUR_AEC_NR_RES_STAGE_TIMING
 /* Microsecond monotonic stamp for the per-stage diagnostic timing. Truncated
  * to 32 bits: every consumer subtracts two stamps in UNSIGNED arithmetic, so
  * the difference is exact for any interval shorter than the ~71.6 minute wrap
@@ -75,6 +90,11 @@ static uint32_t four_aec_nr_res_now_us(void) {
     return (uint32_t)((uint64_t)ts.tv_sec * 1000000ull
                       + (uint64_t)ts.tv_nsec / 1000ull);
 }
+#else
+/* Every stamp folds to a constant, so the subtractions fold to zero and no
+ * clock is read. */
+#define four_aec_nr_res_now_us() 0u
+#endif
 
 /* Process-wide monotonic construction counter -- see FourAecNrResFrameToken's
  * instance_epoch doc comment in the header for why this cannot be derived
