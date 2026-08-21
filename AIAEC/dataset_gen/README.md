@@ -426,8 +426,7 @@ qualify — rematerialize instead:
 ```bash
 python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
     --input data_aec/all \
-    --config AIAEC/dataset_gen/config.ini \
-    --resume
+    --config AIAEC/dataset_gen/config.ini
 python3 -m AIAEC.dataset_gen.pack_aec_dataset \
     --config AIAEC/dataset_gen/config.ini \
     --input data_aec/all --output data_aec/packed/all --overwrite
