@@ -41,6 +41,13 @@ def _corpus(root):
     return root
 
 
+def _read_config():
+    import configparser
+    parser = configparser.ConfigParser()
+    parser.read(CONFIG)
+    return parser
+
+
 def _run(root, jobs=1, resume=False):
     R.rematerialize(argparse.Namespace(
         input=root, config=CONFIG, resume=resume, wav_encoding="auto",
@@ -117,4 +124,14 @@ def test_an_unfinished_sequence_is_never_recorded(tmp_path):
     os.remove(os.path.join(seqs, f"{1:06d}_{1:03d}.wav"))
     with pytest.raises(FileNotFoundError):
         _run(root, jobs=1)
-    assert 1 not in R._load_ledger(seqs, "irrelevant")
+
+    # Read with the contract that actually wrote the ledger. Asking for any
+    # other hash returns an empty set by design, which would make this pass
+    # whether or not the sequence was wrongly recorded.
+    contract = R.linear_aec_contract_from_config(
+        _read_config()).fingerprint()
+    recorded = R._load_ledger(seqs, contract)
+    assert 1 not in recorded, "an unfinished sequence was recorded as done"
+    # ...and the ledger is not simply empty, which would also satisfy the line
+    # above without proving anything: sequence 0 completed before 1 raised.
+    assert 0 in recorded

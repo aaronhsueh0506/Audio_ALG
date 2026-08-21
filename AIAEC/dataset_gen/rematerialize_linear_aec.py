@@ -252,7 +252,9 @@ def rematerialize(args) -> None:
     if encoding not in WAV_ENCODINGS:
         raise ValueError(f"unsupported WAV encoding {encoding!r}")
 
-    jobs = max(1, int(args.jobs))
+    jobs = int(args.jobs)
+    if jobs < 1:
+        raise ValueError(f"--jobs must be at least 1, got {jobs}")
     done = _load_ledger(seqs_dir, contract_hash) if args.resume else set()
     if args.resume:
         print(f"resume: {len(done)} sequence(s) already written by this "
@@ -265,12 +267,19 @@ def rematerialize(args) -> None:
     ]
 
     rewritten = 0
+    pool = None
     progress = tqdm.tqdm(total=len(work), desc="linear-aec")
     try:
         if jobs == 1:
             results = (_rewrite_sequence(job) for job in work)
         else:
-            pool = multiprocessing.Pool(jobs, initializer=_worker_init)
+            # SPAWN, explicitly. Linux defaults to fork, and forking a process
+            # that has already imported torch inherits its OpenMP thread state
+            # into a child that never ran pthread_atfork -- a documented way to
+            # deadlock. spawn costs a fresh interpreter per worker, which is
+            # nothing against a run measured in hours.
+            pool = multiprocessing.get_context("spawn").Pool(
+                jobs, initializer=_worker_init)
             results = pool.imap_unordered(_rewrite_sequence, work)
         for sequence_id in results:
             done.add(sequence_id)
@@ -279,10 +288,20 @@ def rematerialize(args) -> None:
             # so an interrupted run never claims one it did not finish.
             _save_ledger(seqs_dir, contract_hash, done)
             progress.update(1)
-    finally:
-        if jobs != 1:
+    except BaseException:
+        # terminate(), not close(): close() only stops NEW tasks being queued,
+        # so the ones already dispatched would keep rewriting WAVs for minutes
+        # after the failure that is on its way up the stack. KeyboardInterrupt
+        # is caught here for the same reason, which is why this is BaseException.
+        if pool is not None:
+            pool.terminate()
+            pool.join()
+        raise
+    else:
+        if pool is not None:
             pool.close()
             pool.join()
+    finally:
         progress.close()
 
     print(
