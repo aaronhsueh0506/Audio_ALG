@@ -41,12 +41,30 @@ size_t vad_get_mem_size(void)
     return ck_align16_size(sizeof(MaskVAD));
 }
 
+int vad_config_is_valid(const VadConfig* cfg)
+{
+    if (!cfg || cfg->F <= 0) return 0;
+    /* vad_median() ignores any median_k that is not 5, 7 or 9, and med_buf
+     * holds exactly 9 entries -- that guard is what keeps a larger k from
+     * indexing past the array, not a policy. Refusing the config means a
+     * caller who asked for median smoothing either gets it or gets NULL,
+     * never a run with the filter silently switched off.
+     *
+     * Exported because vad_get_mem_size() takes no config: without it the
+     * sizing call would accept a config that vad_init() then refuses, which
+     * is exactly the split that makes a caller allocate and only then fail. */
+    if (cfg->enable_median &&
+        cfg->median_k != 5 && cfg->median_k != 7 && cfg->median_k != 9)
+        return 0;
+    return 1;
+}
+
 MaskVAD* vad_init(void* mem, size_t mem_size, const VadConfig* cfg)
 {
     MaskVAD* v;
     size_t need;
 
-    if (!mem || !cfg || cfg->F <= 0) return NULL;
+    if (!mem || !vad_config_is_valid(cfg)) return NULL;
     need = vad_get_mem_size();
     if (need == 0 || !MEM_IS_ALIGNED16(mem) || mem_size < need) return NULL;
 

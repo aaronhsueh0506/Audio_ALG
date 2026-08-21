@@ -52,6 +52,11 @@ size_t   vad_get_mem_size(void);
 MaskVAD* vad_init(void* mem, size_t mem_size, const VadConfig* cfg);
 
 /* per-frame step */
+/* Whether vad_init()/vad_create() will accept this config. Exported so a
+ * caller that sizes before it constructs -- vad_get_mem_size() takes no
+ * config -- can ask the same question the constructor will. */
+int vad_config_is_valid(const VadConfig* cfg);
+
 void vad_step(MaskVAD* v,
               const int* mask);
 

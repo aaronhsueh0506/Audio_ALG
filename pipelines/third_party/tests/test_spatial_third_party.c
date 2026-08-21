@@ -1482,6 +1482,50 @@ static void pool_destroy_post_gain(void* inst) {
     post_gain_destroy((PostGainState*)inst);
 }
 
+/* The two sub-configs are one contract and nothing downstream compares them,
+ * so this is the only gate. Each case is a combination a caller can express
+ * that the code below would otherwise mis-serve rather than refuse. */
+static int test_vad_api_refuses_configs_its_modules_cannot_serve(void) {
+    VADApiConfig cfg = vad_test_config(512);
+    const int expected_bins = 512 / 2 + 1;
+
+    CHECK(vad_api_get_mem_size(&cfg) > 0,
+          "the matched reference config is accepted");
+    CHECK(cfg.vad_cfg.F == expected_bins,
+          "the reference config really is the matched one");
+
+    /* One bin past the mask the masker emits: vad_step() would read it. */
+    cfg.vad_cfg.F = expected_bins + 1;
+    CHECK(vad_api_get_mem_size(&cfg) == 0,
+          "an F longer than the masker's mask is refused");
+    CHECK(vad_api_create(&cfg) == NULL,
+          "the heap path refuses it too");
+    cfg.vad_cfg.F = expected_bins - 1;
+    CHECK(vad_api_get_mem_size(&cfg) == 0,
+          "an F shorter than the masker's mask is refused");
+    cfg.vad_cfg.F = expected_bins;
+    CHECK(vad_api_get_mem_size(&cfg) > 0, "restoring F re-accepts the config");
+
+    /* Silently ignored by vad_median() rather than applied. */
+    cfg.vad_cfg.median_k = 6;
+    CHECK(vad_api_get_mem_size(&cfg) == 0,
+          "a median_k the median filter would ignore is refused");
+    cfg.vad_cfg.enable_median = 0;
+    CHECK(vad_api_get_mem_size(&cfg) > 0,
+          "the same median_k is fine once median smoothing is off");
+    cfg.vad_cfg.enable_median = 1;
+    cfg.vad_cfg.median_k = 5;
+
+    /* An even smooth_size spans k+1 bins, not k. */
+    cfg.masker_cfg.smooth_size = 4;
+    CHECK(vad_api_get_mem_size(&cfg) == 0,
+          "an even smooth_size is refused rather than widened");
+    cfg.masker_cfg.enable_freq_smooth = 0;
+    CHECK(vad_api_get_mem_size(&cfg) > 0,
+          "the same smooth_size is fine once frequency smoothing is off");
+    return 1;
+}
+
 static int test_vad_api_init_pool_poison_and_bounds(void) {
     VADApiConfig cfg = vad_test_config(512);
     return check_pool_contract("VAD", vad_api_get_mem_size(&cfg),
@@ -2222,6 +2266,8 @@ static int run_all_tests(void) {
           "GSC non-finite-P bin-reset test");
     CHECK(test_gsc_init_pool_poison_and_bounds(),
           "GSC pool-first poison/bounds test");
+    CHECK(test_vad_api_refuses_configs_its_modules_cannot_serve(),
+          "VAD API refuses configs its modules cannot serve");
     CHECK(test_vad_api_init_pool_poison_and_bounds(),
           "VAD pool-first poison/bounds test");
     CHECK(test_vad_api_heap_vs_pool_identical(),

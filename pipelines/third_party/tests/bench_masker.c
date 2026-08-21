@@ -46,6 +46,7 @@ int main(int argc, char** argv) {
     Complex* frame;
     float* a; float* b;
     double t0, clock_cost, total, s_cmag, s_db, s_ema;
+    volatile float sink = 0.0f;
     int i, f;
 
     memset(&cfg, 0, sizeof(cfg));
@@ -90,17 +91,34 @@ int main(int argc, char** argv) {
         sk_asym_ema_f32(a, b, F, cfg.E_alpha_up, cfg.E_alpha_down);
     s_ema = (now_s() - t0) / BENCH_FRAMES;
 
+    /* Consume every result so no loop below can be hoisted out of its
+     * repeat count. Measured behaviour without it was already correct here
+     * -- the per-kernel times scale ~linearly with F -- but that is a
+     * property of one compiler on one host, not something to rely on. */
+    for (f = 0; f < F; ++f) sink += a[f] + b[f];
+
     /* Printed first because a wrong answer here dwarfs anything measured
-     * below: an -O0 build or a scalar-only build explains a large regression
-     * on its own, and neither is visible from a timing number alone. */
-    printf("backend=%s optimize=%s nfft=%d F=%d frames=%d\n",
-           SK_HAVE_NEON ? "neon" : "scalar",
+     * below: an -O0 build explains a large regression on its own, and it is
+     * not visible from a timing number alone.
+     *
+     * ⚠ The kernel label says which IMPLEMENTATION was compiled, NOT whether
+     * the code is vectorized. SIMD=0 defines SIMD_KERNELS_FORCE_SCALAR, which
+     * selects the plain-C fallback -- and the compiler is free to
+     * auto-vectorize that fallback, which on some hosts makes the "off" build
+     * the faster one. So SIMD=0 vs SIMD=1 answers "do the hand-written
+     * intrinsics beat what the compiler does on its own", which is the
+     * question worth asking, but it is NOT a SIMD-vs-scalar comparison. For a
+     * genuine scalar baseline build the fallback with vectorization disabled
+     * (-fno-tree-vectorize on GCC, -fno-vectorize on clang). */
+    printf("kernels=%s optimize=%s nfft=%d F=%d frames=%d sink=%.3g\n",
+           SK_HAVE_NEON ? "neon-intrinsics"
+                        : "scalar-fallback (compiler may vectorize it)",
 #ifdef __OPTIMIZE__
            "yes",
 #else
            "NO (-O0! this alone explains a large slowdown)",
 #endif
-           nfft, F, BENCH_FRAMES);
+           nfft, F, BENCH_FRAMES, (double)sink);
     printf("clock_gettime      %8.1f ns/call\n", clock_cost * 1e9);
     printf("masker_step        %8.2f us/frame   (100%%)\n", total * 1e6);
     printf("  sk_cmag_f32      %8.2f us/frame   (%5.1f%%)\n",

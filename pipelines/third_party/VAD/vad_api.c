@@ -29,6 +29,21 @@ size_t vad_api_get_mem_size(const VADApiConfig* cfg)
 
     if (!cfg || cfg->backend != VAD_BACKEND_MASKER) return 0;
 
+    /* The two sub-configs are one contract, and nothing downstream compares
+     * them. masker_step() emits NFFT/2+1 mask entries; vad_step() then reads
+     * vad_cfg.F of them, so a larger F reads past the end of the mask -- a
+     * silent out-of-bounds read, not a wrong answer. Both fields are
+     * caller-supplied and independent, so this is the only place that can
+     * refuse the combination. */
+    if (cfg->vad_cfg.F != cfg->masker_cfg.NFFT / 2 + 1) return 0;
+    if (!vad_config_is_valid(&cfg->vad_cfg)) return 0;
+    /* An even smooth_size asks for a k-wide window and gets k+1: the
+     * frequency smoother centres on +-(k/2), so only odd k spans exactly k
+     * bins. Refuse rather than widen it silently. */
+    if (cfg->masker_cfg.enable_freq_smooth &&
+        cfg->masker_cfg.smooth_size > 0 &&
+        cfg->masker_cfg.smooth_size % 2 == 0) return 0;
+
     masker_need = masker_get_mem_size(&cfg->masker_cfg);
     vad_need    = vad_get_mem_size();
     if (masker_need == 0 || vad_need == 0) return 0;
