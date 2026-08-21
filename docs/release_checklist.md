@@ -785,7 +785,7 @@ is routinely misattributed to a real bug.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
 (re-measured on the current working tree, KISS backend, `make clean` first):
-`pipelines/mono_aec_nr_res` 75, `pipelines/mono_alignulcnet` 149,
+`pipelines/mono_aec_nr_res` 78, `pipelines/mono_alignulcnet` 149,
 `pipelines/4ch_aec_bf_nr_res` 316 (one-stop gate; also builds and runs the
 `4ch_alignulcnet` binaries). Each additionally prints a small number of
 non-`PASS:` pass lines (static smokes, board-skeleton profiles, adapter).

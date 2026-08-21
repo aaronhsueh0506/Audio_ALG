@@ -308,6 +308,109 @@ typedef struct {
 int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
                                       AudioPipelineMemBreakdown* out);
 
+/* ============================================================================
+ * Diagnostic per-stage timing
+ * ========================================================================== */
+
+/**
+ * Per-hop wall-clock cost of the stages inside audio_pipeline_process(), in
+ * microseconds. Diagnostic only: nothing in the chain reads these back and
+ * they do not affect processing. Stamped with CLOCK_MONOTONIC.
+ *
+ * STAGE BOUNDARIES
+ *
+ *   aec          the AEC's own four stages, copied verbatim from
+ *                aec_get_last_timing(): aec.delay_us, aec.frontend_us,
+ *                aec.linear_us, aec.res_us. AecStageTiming's doc comment
+ *                (aec.h) is the single definition of what each covers --
+ *                this header deliberately does not restate it.
+ *
+ *                Worth knowing before reading them: on the default MATCHED
+ *                path aec.delay_us is routinely the LARGEST single stage of
+ *                the hop, measured at roughly two thirds of it on a
+ *                16 kHz/256 grid. Where the four-lane wrapper differs: there
+ *                the estimator is hoisted OUT of the lanes and run once for
+ *                all four, so its delay figure is the wrapper's own stage.
+ *                Here it stays inside the single AEC -- same quantity,
+ *                different owner.
+ *   nr_us        mmse_lsa_process_gain() -- the noise-reduction gain.
+ *   post_us      the gain arithmetic between the two: the r2/PSD_SCALE fold,
+ *                min(G_nr, G_res), the |E|^2 hoist, the far-activity and
+ *                near-VAD gate, the echo-gated near-end lift, the spectral
+ *                apply, and the comfort-noise loop.
+ *   synth_us     inverse transform, windowed overlap-add, and the hop
+ *                emit/shift.
+ *
+ * WHERE THE AEC BLOCK COMES FROM
+ *
+ * aec_get_last_timing() (aec.h), read once after the AEC call into the
+ * embedded record. They are governed by that library's OWN build flag, not this
+ * one -- see the two-halves note below.
+ *
+ * The stages do NOT sum to the call. The remainder holds the argument
+ * checks, aec_get_res_context(), and -- inside the AEC and therefore
+ * invisible from here -- the stationarity refresh, e2_coarse/ERL publish,
+ * the DT analyzer, EPV, shadow_rise, the misadjustment estimator, the power
+ * EMAs and convergence detection. A caller presenting a full breakdown must
+ * carry that remainder explicitly rather than implying the parts are whole.
+ *
+ * AEC-ONLY INSTANCES. cfg.aec_only returns as soon as aec_process() does,
+ * so nr_us/post_us/synth_us stay 0 on every hop: those stages do not exist
+ * in that mode. That zero means "no such stage", while the same zero in a
+ * !aec_only build means "not measured" -- the two are distinguished by
+ * audio_pipeline_get_nr() being NULL, not by the record.
+ *
+ * RESOLUTION. Microseconds, so a stage faster than 1 us reads 0. On the
+ * development host clock_getres(CLOCK_MONOTONIC) is itself 1 us, which puts
+ * post/synth near that floor -- readable as an order of magnitude, not as a
+ * precise figure. linear_us, the stage this exists to find, is far above it.
+ *
+ * OFF BY DEFAULT, IN TWO HALVES. This record costs four clock reads per hop
+ * here, on top of whatever the AEC makes inside its own call (its own
+ * header carries that count). A release
+ * build takes none of them and every field reads 0. Build with
+ * -DAUDIO_PIPELINE_STAGE_TIMING=1 for this pipeline's own stages
+ * (nr/post/synth) and -DAEC_STAGE_TIMING=1 for the embedded
+ * AEC block; `make PROFILE=1` sets both, which is what a profile
+ * build should use. Setting one alone is legible rather than broken: the
+ * other half simply reads 0.
+ *
+ * A display-side flag in the CONSUMER does not enable any of this. It
+ * decides whether a breakdown is printed; these decide whether there is
+ * anything to print. Built one way and read the other, the report renders
+ * zeros.
+ *
+ * THE RECORD IS NOT CONDITIONAL, ONLY THE STAMPING IS. The field lives in
+ * the control block whether or not either flag is set, so a profile build
+ * and a release build carve byte-identical pools and one memory budget
+ * covers both. Turning the flag on never moves an offset.
+ *
+ * LIFETIME. The values describe the last ACCEPTED hop. This pipeline has no
+ * path that is accepted and then abandoned -- audio_pipeline_process()
+ * validates its arguments and then runs to completion -- so every field a
+ * mode has is rewritten every hop, and the three an aec_only instance does
+ * not have stay zero from init. A call REJECTED by the argument checks
+ * leaves the record untouched, and so does audio_pipeline_reset(): the
+ * record describes hops, not instance state, and the next accepted hop is
+ * what replaces it. Read it after audio_pipeline_process() returns 0.
+ */
+typedef struct AudioPipelineLastTiming {
+    /* Verbatim from aec_get_last_timing(). Embedded rather than flattened so
+     * a field the AEC adds arrives here without this header re-enumerating
+     * its stage set -- and so there is exactly one place that names those
+     * stage boundaries: AecStageTiming's own doc in aec.h. */
+    AecStageTiming aec;
+    uint32_t nr_us;
+    uint32_t post_us;
+    uint32_t synth_us;
+} AudioPipelineLastTiming;
+
+/* Copies the last hop's stage timings into `out`. A NULL pipeline zeroes
+ * `out` rather than failing, so a diagnostic caller needs no special case.
+ * `out` must not be NULL. */
+void audio_pipeline_get_last_timing(const AudioPipeline* p,
+                                    AudioPipelineLastTiming* out);
+
 #ifdef __cplusplus
 }
 #endif

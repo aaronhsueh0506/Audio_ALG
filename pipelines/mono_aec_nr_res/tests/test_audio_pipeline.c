@@ -77,6 +77,7 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>   /* clock_gettime -- the timing test's own wall clock */
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
@@ -499,6 +500,191 @@ static void test_init_ex_descriptor(void) {
     free(pool);
 }
 
+/* ---------------------------------------------------------------------------
+ * Per-stage timing
+ *
+ * The numbers must be REAL measurements, not merely present. Two properties
+ * carry that: every stage is bounded by the wall time of the call it sits
+ * inside (a stray or uninitialised value would almost certainly exceed it),
+ * and each half is asserted against its OWN build flag, so a compiled-out
+ * build is required to report zeros rather than stale values.
+ *
+ * This pipeline has no accepted-then-bail path -- audio_pipeline_process()
+ * validates its arguments and then runs to completion -- so the 4ch suite's
+ * non-finite-hop case has no counterpart here and is deliberately absent
+ * rather than written as an assertion that cannot fail. What replaces it is
+ * the aec_only case on a POISONED pool: that instance never writes nr/post/
+ * synth, so those three read whatever the caller's memory held unless the
+ * control block was zeroed at init.
+ *
+ * These are a real gate on the control block's init-time
+ * memset(p, 0, sizeof(*p)): remove it and they go red. That is the only
+ * thing keeping an aec_only instance's nr/post/synth at zero, since no
+ * path ever writes them.
+ * ------------------------------------------------------------------------- */
+static uint32_t wall_us_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000000ull
+                      + (uint64_t)ts.tv_nsec / 1000ull);
+}
+
+static void test_stage_timing(void) {
+    AudioPipelineConfig cfg = grid_config(16000, 256);
+    AudioPipeline* p = audio_pipeline_create(&cfg);
+    AudioPipelineLastTiming t, zero;
+    uint32_t wall_us = 0, sum;
+    int hop, i;
+
+    CHECK(p != NULL, "timing: pipeline created");
+    if (!p) return;
+    hop = audio_pipeline_hop_size(p);
+
+    /* A NULL pipeline zeroes the whole record rather than failing. Compared
+     * as a struct, which is where a field-by-field copy that forgets one
+     * would hide. */
+    memset(&zero, 0, sizeof(zero));
+    memset(&t, 0xa5, sizeof(t));
+    audio_pipeline_get_last_timing(NULL, &t);
+    CHECK(memcmp(&t, &zero, sizeof(t)) == 0,
+          "timing: a NULL pipeline zeroes the record");
+
+    /* Warm up so the filter is doing real work, then time the FINAL hop
+     * around the same call the library stamps inside. */
+    {
+        float* mic = (float*)malloc((size_t)hop * sizeof(float));
+        float* ref = (float*)malloc((size_t)hop * sizeof(float));
+        float* out = (float*)malloc((size_t)hop * sizeof(float));
+        int h;
+        CHECK(mic && ref && out, "timing: allocation");
+        if (mic && ref && out) {
+            lcg_state = 0xC0FFEEu;
+            for (h = 0; h < 200; h++) {
+                for (i = 0; i < hop; i++) {
+                    ref[i] = lcg_sample();
+                    mic[i] = 0.3f * ref[i] + 0.05f * lcg_sample();
+                }
+                if (h == 199) {
+                    uint32_t t_in = wall_us_now();
+                    audio_pipeline_process(p, mic, ref, out);
+                    wall_us = wall_us_now() - t_in;
+                } else {
+                    audio_pipeline_process(p, mic, ref, out);
+                }
+            }
+        }
+        free(mic); free(ref); free(out);
+    }
+    audio_pipeline_get_last_timing(p, &t);
+
+    /* ⚠ Written so it can FAIL: over a full hop the AEC runs a main filter,
+     * a pre-filter stage and a post/RES block, and this layer runs an NR
+     * gain, the gain arithmetic and a synthesis -- on this grid the delay
+     * bank, the main filter and the post/RES block cannot cost under a
+     * microsecond, so a zero there means that window never ran. post_us and
+     * synth_us are NOT asserted nonzero: they
+     * sit at the 1 us clock floor on the development host, and an assertion
+     * that depends on the host being slow is a flake, not a test.
+     *
+     * Each half is asserted against its own flag because the two are
+     * separate builds: AUDIO_PIPELINE_STAGE_TIMING governs the stages
+     * measured here, AEC_STAGE_TIMING governs the three copied out of
+     * aec_get_last_timing(). The zero branches are not filler -- they are
+     * what proves a flag removes the measurement rather than merely hiding
+     * it. */
+#if AUDIO_PIPELINE_STAGE_TIMING
+    CHECK(t.nr_us > 0, "timing: the NR gain reports a real cost");
+#else
+    CHECK(t.nr_us == 0 && t.post_us == 0 && t.synth_us == 0,
+          "timing: this layer's stages read zero when compiled out");
+#endif
+#if AEC_STAGE_TIMING
+    CHECK(t.aec.delay_us > 0,  "timing: the delay estimator reports a real cost");
+    CHECK(t.aec.linear_us > 0, "timing: the AEC main filter reports a real cost");
+    CHECK(t.aec.res_us > 0,    "timing: the AEC post/RES block reports a real cost");
+    /* frontend_us is deliberately NOT asserted nonzero. Once delay_us was
+     * split out of it, what remains -- mic HPF, saturation, render activity,
+     * mu_scale, mic-clip, RSA, shadow filter -- measures ~1 us on this grid,
+     * i.e. at the clock floor. Asserting it would be asserting that the host
+     * is slow. That it can now read 0 while delay_us is large IS the
+     * measurement this split exists to make. */
+    CHECK(t.aec.delay_us > t.aec.frontend_us,
+          "timing: the delay estimator dominates what is left of the frontend");
+#else
+    CHECK(t.aec.delay_us == 0 && t.aec.frontend_us == 0 && t.aec.linear_us == 0 &&
+          t.aec.res_us == 0,
+          "timing: the AEC stages read zero when compiled out");
+#endif
+
+    /* Every stage is bounded by the call that contains it. This is what
+     * separates a measurement from a number. */
+    sum = t.aec.delay_us + t.aec.frontend_us + t.aec.linear_us + t.aec.res_us
+        + t.nr_us + t.post_us + t.synth_us;
+    CHECK(sum <= wall_us,
+          "timing: the stages must fit inside audio_pipeline_process's wall time");
+
+    /* A REJECTED call must leave the record alone -- it describes the last
+     * hop that ran, and no hop ran here. */
+    {
+        float* ref = (float*)calloc((size_t)hop, sizeof(float));
+        float* out = (float*)calloc((size_t)hop, sizeof(float));
+        AudioPipelineLastTiming after;
+        CHECK(audio_pipeline_process(p, NULL, ref, out) == -1,
+              "timing: a NULL mic pointer is rejected");
+        audio_pipeline_get_last_timing(p, &after);
+        CHECK(memcmp(&after, &t, sizeof(t)) == 0,
+              "timing: a rejected call leaves the record untouched");
+        free(ref); free(out);
+    }
+    audio_pipeline_destroy(p);
+
+    /* aec_only on a POISONED pool: nr/post/synth are stages that do not
+     * exist in that mode, so they must read zero even though nothing ever
+     * writes them and the memory underneath arrived full of 0xA5. */
+    {
+        AudioPipelineConfig ao = grid_config(16000, 256);
+        AudioPipelineMemReq req;
+        void* pool = NULL;
+        ao.aec_only = 1;
+        if (audio_pipeline_get_mem_requirements(&ao, &req) == 0 &&
+            posix_memalign(&pool, req.alignment, req.bytes) == 0) {
+            AudioPipeline* q;
+            memset(pool, 0xA5, req.bytes);
+            q = audio_pipeline_init(pool, req.bytes, &ao);
+            CHECK(q != NULL, "timing: aec_only init on a poisoned pool");
+            if (q) {
+                AudioPipelineLastTiming ao_t;
+                int qhop = audio_pipeline_hop_size(q);
+                float* m = (float*)calloc((size_t)qhop, sizeof(float));
+                float* r = (float*)calloc((size_t)qhop, sizeof(float));
+                float* o = (float*)calloc((size_t)qhop, sizeof(float));
+
+                /* Read BEFORE any hop: the record must already be defined. */
+                audio_pipeline_get_last_timing(q, &ao_t);
+                CHECK(memcmp(&ao_t, &zero, sizeof(ao_t)) == 0,
+                      "timing: a fresh instance on a poisoned pool reads all "
+                      "zeros before the first hop");
+
+                lcg_state = 0xC0FFEEu;
+                for (i = 0; i < qhop; i++) { r[i] = lcg_sample(); m[i] = 0.3f * r[i]; }
+                audio_pipeline_process(q, m, r, o);
+                audio_pipeline_get_last_timing(q, &ao_t);
+                CHECK(ao_t.nr_us == 0 && ao_t.post_us == 0 && ao_t.synth_us == 0,
+                      "timing: aec_only reports zero for the stages it does "
+                      "not have, on a poisoned pool");
+                free(m); free(r); free(o);
+                audio_pipeline_destroy(q);
+            }
+            free(pool);
+        }
+    }
+
+    printf("timing: delay=%u frontend=%u linear=%u res=%u | nr=%u post=%u "
+           "synth=%u (call wall %uus)\n",
+           t.aec.delay_us, t.aec.frontend_us, t.aec.linear_us, t.aec.res_us,
+           t.nr_us, t.post_us, t.synth_us, wall_us);
+}
+
 int main(void) {
     for (int r = 0; r < N_GRIDS; r++) {
         int sr = GRIDS[r].sample_rate;
@@ -517,6 +703,9 @@ int main(void) {
 
     printf("\n=== audio_pipeline_init_ex descriptor gate ===\n");
     test_init_ex_descriptor();
+
+    printf("\n=== per-stage timing ===\n");
+    test_stage_timing();
 
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);

@@ -1301,6 +1301,14 @@ int four_aec_nr_res_process_pre(
         {
             AecStageTiming lane_time;
             aec_get_last_timing(p->lanes[ch], &lane_time);
+            /* Lane-internal delay work folds into the same delay_us the
+             * shared estimator reports, because it is the same quantity:
+             * time spent aligning the far end. It is structurally ZERO today
+             * -- every lane is built AEC_DELAY_EXTERNAL_ALIGNED, so no lane
+             * owns a ring or an estimator -- and is summed anyway so that a
+             * future lane-mode change cannot silently drop its cost out of
+             * the breakdown. */
+            p->last_timing.delay_us    += lane_time.delay_us;
             p->last_timing.frontend_us += lane_time.frontend_us;
             p->last_timing.linear_us   += lane_time.linear_us;
             p->last_timing.lane_res_us += lane_time.res_us;

@@ -35,6 +35,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
+#include <time.h>
 
 #include "audio_pipeline.h"
 #include "wav_io.h"
@@ -155,6 +156,75 @@ static void print_mem_budget(const AudioPipelineConfig* cfg) {
 
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ *
+ * --timing: per-stage cost accumulation.
+ *
+ * Summed over the run and reported as a mean per hop, because a per-hop
+ * print at 100 hops/s is noise and a single hop is not a measurement. The
+ * UNATTRIBUTED line is not decoration: the stages deliberately do not sum to
+ * the call (audio_pipeline.h documents what sits in the gap), so a table
+ * that printed only the parts would imply a whole it never measured.
+ * ------------------------------------------------------------------ */
+typedef struct {
+    uint64_t delay, frontend, linear, res, nr, post, synth, wall;
+    uint64_t hops;
+} StageAccum;
+
+static void stage_accum_add(StageAccum* a, const AudioPipelineLastTiming* t,
+                            uint32_t wall_us) {
+    a->delay    += t->aec.delay_us;
+    a->frontend += t->aec.frontend_us;
+    a->linear   += t->aec.linear_us;
+    a->res      += t->aec.res_us;
+    a->nr       += t->nr_us;
+    a->post     += t->post_us;
+    a->synth    += t->synth_us;
+    a->wall     += wall_us;
+    a->hops     += 1u;
+}
+
+static void stage_accum_row(const char* name, uint64_t total,
+                            const StageAccum* a) {
+    double per_hop = a->hops ? (double)total / (double)a->hops : 0.0;
+    double share   = a->wall ? 100.0 * (double)total / (double)a->wall : 0.0;
+    printf("  %-14s %8.2f  %6.1f%%\n", name, per_hop, share);
+}
+
+static void print_stage_timing(const StageAccum* a) {
+    uint64_t measured = a->delay + a->frontend + a->linear + a->res
+                      + a->nr + a->post + a->synth;
+    if (!a->hops) { printf("\nStage timing: no hops processed.\n"); return; }
+    printf("\nStage timing over %llu hops (mean us/hop, share of wall):\n",
+           (unsigned long long)a->hops);
+    if (measured == 0u) {
+        printf("  every stage reads 0 -- this binary was built WITHOUT the\n"
+               "  timing flags. Rebuild with `make PROFILE=1` (or pass\n"
+               "  -DAUDIO_PIPELINE_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1) to\n"
+               "  measure; the display flag alone cannot turn it on.\n");
+        return;
+    }
+    stage_accum_row("AEC delay", a->delay, a);
+    stage_accum_row("AEC frontend", a->frontend, a);
+    stage_accum_row("AEC linear", a->linear, a);
+    stage_accum_row("AEC post/RES", a->res, a);
+    stage_accum_row("NR gain", a->nr, a);
+    stage_accum_row("post arith", a->post, a);
+    stage_accum_row("synthesis", a->synth, a);
+    printf("  ------------------------------------\n");
+    stage_accum_row("measured", measured, a);
+    stage_accum_row("unattributed",
+                    a->wall > measured ? a->wall - measured : 0u, a);
+    stage_accum_row("call wall", a->wall, a);
+}
+
+static uint32_t timing_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000000ull
+                      + (uint64_t)ts.tv_nsec / 1000ull);
+}
+
+
 int main(int argc, char* argv[]) {
     /* --print-mem-size diagnostic mode: report the pool byte budget (and
      * exercise a real audio_pipeline_init(), same guard coverage the old
@@ -210,7 +280,7 @@ int main(int argc, char* argv[]) {
     if (argc < 4) {
         printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-preset] "
                "[--nr-preset mild|balanced|aggressive] [--aec-only] [--legacy-amin] "
-               "[--fft-size 256|512|1024] [--debug]\n",
+               "[--fft-size 256|512|1024] [--debug] [--timing]\n",
                argv[0]);
         printf("       %s --print-mem-size [preset] [--nr-preset ...] [--aec-only] "
                "[--sample-rate <hz>] [--fft-size <n>]\n", argv[0]);
@@ -227,6 +297,8 @@ int main(int argc, char* argv[]) {
     int           legacy   = 0;   /* --legacy-amin → prior min-only A_min_pl */
     int           no_cng   = 0;   /* --no-cng → disable comfort noise (parity) */
     int           debug_status = 0; /* --debug → periodic aec+nr status line   */
+    int           show_timing  = 0; /* --timing → per-stage cost summary at exit */
+    StageAccum    acc; memset(&acc, 0, sizeof(acc));
     int           fft_size = 0;
 
     for (int i = 4; i < argc; i++) {
@@ -234,6 +306,7 @@ int main(int argc, char* argv[]) {
         else if (strcmp(argv[i], "--legacy-amin") == 0) legacy = 1;
         else if (strcmp(argv[i], "--no-cng") == 0)      no_cng = 1;
         else if (strcmp(argv[i], "--debug") == 0)       debug_status = 1;
+        else if (strcmp(argv[i], "--timing") == 0)      show_timing = 1;
         else if (strcmp(argv[i], "--fft-size") == 0 && i+1 < argc)
             fft_size = atoi(argv[++i]);
         else if (strcmp(argv[i], "--nr-preset") == 0 && i+1 < argc)
@@ -347,7 +420,18 @@ int main(int argc, char* argv[]) {
         wav_read_float(mic_r, mic_buf, hop);
         wav_read_float(ref_r, ref_buf, hop);
 
-        audio_pipeline_process(pipe, mic_buf, ref_buf, out_buf);
+        if (show_timing) {
+            AudioPipelineLastTiming t;
+            uint32_t t_in = timing_now_us();
+            audio_pipeline_process(pipe, mic_buf, ref_buf, out_buf);
+            {
+                uint32_t wall = timing_now_us() - t_in;
+                audio_pipeline_get_last_timing(pipe, &t);
+                stage_accum_add(&acc, &t, wall);
+            }
+        } else {
+            audio_pipeline_process(pipe, mic_buf, ref_buf, out_buf);
+        }
         wav_write_float(writer, out_buf, hop);
 
         if (dctx) {
@@ -374,6 +458,7 @@ int main(int argc, char* argv[]) {
     if (dctx) fclose(dctx);
 
     printf("\nProcessed: %d samples (%.2fs)\n", processed, (float)processed / sr);
+    if (show_timing) print_stage_timing(&acc);
     printf("Output: %s\n", out_path);
 
     /* === Cleanup ===

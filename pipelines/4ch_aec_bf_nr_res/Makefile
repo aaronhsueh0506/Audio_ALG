@@ -35,8 +35,9 @@ TOOLCHAIN_CHECK = 1
 EXTRA_CFLAGS =
 # PROFILE=1 turns on the per-hop stage timing across the WHOLE chain: this
 # wrapper's own stages and, through EXTRA_CFLAGS reaching the lib/aec producer
-# build, the three summed off the four lanes. Both are off otherwise, so a
-# release build takes none of the 29 clock reads per hop.
+# build, the four summed off the four lanes. Both are off otherwise, so a
+# release build takes none of the clock reads; FourAecNrResLastTiming's doc
+# comment (4aec_nr_res.h) carries the count, and is the only place that does.
 #
 # It lands in EXTRA_CFLAGS deliberately: that is already forwarded to every
 # producer sub-make AND folded into CFG_SIG, so a profile build and a release

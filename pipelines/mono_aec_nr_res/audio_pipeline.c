@@ -122,8 +122,19 @@
  * stage-timing record -- aec_get_last_timing(), aec.h), so every AEC
  * carved out of this pool moves the total and the offsets after it. Carve
  * order and buffer set are unchanged, so build_flags_hash does not move --
- * this counter is the only signal. */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 8u
+ * this counter is the only signal.
+ * Bumped 8->9: the control block gained the per-hop stage-timing record
+ * (AudioPipelineLastTiming, 28 B -- see audio_pipeline_get_last_timing()).
+ * The pool total grows by 16 B, not 28: sizeof(AudioPipeline) goes 152->176
+ * and ALIGN16 of it goes 160->176, so 12 B of the record lands in slack the
+ * struct already had. Measured, not derived -- `--print-mem-size` reports
+ * the control block directly. Every per-module column (AEC/FFT/NR/pipeline
+ * buffers) is unchanged; only the total moves. The record is present whether
+ * or not the timing is compiled in, so a profile build and a release build
+ * still carve byte-identical pools. Carve order and buffer set are
+ * unchanged, so build_flags_hash does not move -- this counter is the only
+ * signal. */
+#define AUDIO_PIPELINE_LAYOUT_VERSION 9u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
  * -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" or \"ne10\" to match its own
@@ -144,6 +155,39 @@
  * this file no longer does at all -- audio_pipeline_init_ex() below compares
  * backend_id with plain integer `==`). Returns 0 ("unknown") for anything
  * else; get_mem_requirements() rejects that -- see its own comment. */
+/* Per-stage timing is diagnostic and costs four clock_gettime() calls per hop
+ * here, on top of whatever the AEC makes inside its own call (aec.h carries
+ * that count). DEFAULT OFF for
+ * the same reason lib/aec's is: a diagnostic that has to be switched off is
+ * one that ships on by accident.
+ *
+ * The two flags are separate because the two builds are: this one governs the
+ * stages measured here, AEC_STAGE_TIMING governs what aec_get_last_timing()
+ * reports back. Setting only this one leaves frontend/linear/res reading 0
+ * while nr/post/synth measure, which is a legible state, not a broken one.
+ * `make PROFILE=1` sets both, and is what a profile build should use. */
+#ifndef AUDIO_PIPELINE_STAGE_TIMING
+#define AUDIO_PIPELINE_STAGE_TIMING 0
+#endif
+
+#if AUDIO_PIPELINE_STAGE_TIMING
+#include <time.h>
+/* Microsecond monotonic stamp for the per-stage diagnostic timing. Truncated
+ * to 32 bits: every consumer subtracts two stamps in UNSIGNED arithmetic, so
+ * the difference is exact for any interval shorter than the ~71.6 minute wrap
+ * -- which no hop approaches. */
+static uint32_t audio_pipeline_now_us(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint32_t)((uint64_t)ts.tv_sec * 1000000ull
+                      + (uint64_t)ts.tv_nsec / 1000ull);
+}
+#else
+/* Every stamp folds to a constant, so the subtractions fold to zero and no
+ * clock is read. */
+#define audio_pipeline_now_us() 0u
+#endif
+
 static uint32_t audio_pipeline_backend_id(void) {
     if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "kiss") == 0) return AUDIO_PIPELINE_BACKEND_KISS;
     if (strcmp(AUDIO_PIPELINE_BACKEND_STR, "ne10") == 0) return AUDIO_PIPELINE_BACKEND_NE10;
@@ -196,6 +240,12 @@ struct AudioPipeline {
     uint32_t rng_state;
     int      near_hang;
     int      near_hangover_frames;  /* PROD_NEAR_HANGOVER retimed to this grid's hop */
+
+    /* Per-hop wall-clock stage timing -- see AudioPipelineLastTiming's doc
+     * comment (audio_pipeline.h) for the stage-boundary reference. Present
+     * unconditionally so the pool carve does not depend on the build flag;
+     * only the stamping compiles out. */
+    AudioPipelineLastTiming last_timing;
 
     /* pool bookkeeping */
     void*  pool;          /* sub-pool AFTER this struct: AEC+FFT+NR+scratch */
@@ -657,8 +707,35 @@ static float rng_gauss(AudioPipeline* p) {                       /* Box-Muller *
     return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * M_PI_F * u2);
 }
 
+/* The AEC block is not measured here -- the AEC measures them
+ * itself and this copies them through. They are governed by AEC_STAGE_TIMING,
+ * not by AUDIO_PIPELINE_STAGE_TIMING, which is why this is not inside the
+ * #if above: with only the AEC half built, that block still carries real
+ * numbers while nr/post/synth read 0. */
+#if AEC_STAGE_TIMING
+static void audio_pipeline_copy_aec_timing(AudioPipeline* p) {
+    aec_get_last_timing(p->aec, &p->last_timing.aec);
+}
+#else
+/* Guarded, not just cheap: aec_get_last_timing() is a cross-TU call, so
+ * leaving it unguarded made a fully-release build pay one per hop on both
+ * paths to copy four zeros. With the AEC half off, the embedded record keeps
+ * the zero it got at init, which is exactly what it should report. The macro
+ * is defined by aec.h, so this reads the same value the AEC itself was
+ * built with. */
+#define audio_pipeline_copy_aec_timing(p) ((void)(p))
+#endif
+
 int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref, float* out) {
     if (!p || !mic || !ref || !out) return -1;
+
+    /* No per-hop clear of p->last_timing: every field a mode owns is
+     * rewritten below before this function returns, and the fields a mode
+     * does not own are written by no path at all, so they keep the zero the
+     * control block got at init. A clear here would run in every build --
+     * it cannot be gated on the timing flags without changing what a
+     * release build reports -- to guard a bail-out this function does not
+     * have. Add one if it ever gains one. */
 
     const int hop      = p->hop;
     const int n_freqs   = p->n_freqs;
@@ -678,9 +755,12 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
      * emitted hop, so aec_process_context() skips that copy. */
     if (p->aec_only) {
         aec_process(p->aec, mic, ref, out);
+        audio_pipeline_copy_aec_timing(p);
         return 0;
     }
     aec_process_context(p->aec, mic, ref);
+    audio_pipeline_copy_aec_timing(p);
+    uint32_t t0 = audio_pipeline_now_us();
 
     AecResContext ctx;
     aec_get_res_context(p->aec, &ctx);
@@ -705,6 +785,8 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
     /* gain_out=NULL: mmse_lsa_get_gain() below reads the same buffer this
      * call just filled, no per-hop copy needed (layout v3). */
     mmse_lsa_process_gain(p->nr, ctx.error_spec, nr_extra, NULL);
+    uint32_t t1 = audio_pipeline_now_us();
+    p->last_timing.nr_us = t1 - t0;
 
     /* Stage 3a: g_total = min(G_nr, G_res). ctx.res_gain (= G_res, pre-min)
      * also sets the comfort-noise level below so CNG reflects AEC
@@ -776,11 +858,15 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
 
     /* ctx.error_spec already contains the matching sqrt-Hann analysis frame;
      * complete the 50%-overlap WOLA with one IFFT + synthesis + OLA. */
+    uint32_t t2 = audio_pipeline_now_us();
+    p->last_timing.post_us = t2 - t1;
+
     fft_inverse(p->fft, p->spec, p->ifft_buf);
     sk_wola_accumulate_f32(p->ola, p->ifft_buf, p->synth_win, frame_sz);
     memcpy(out, p->ola, (size_t)hop * sizeof(float));
     memmove(p->ola, p->ola + hop, (size_t)(frame_sz - hop) * sizeof(float));
     memset(p->ola + (frame_sz - hop), 0, (size_t)hop * sizeof(float));
+    p->last_timing.synth_us = audio_pipeline_now_us() - t2;
 
     return 0;
 }
@@ -880,4 +966,20 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
     out->pipeline_bytes = pipe_bufs;
     out->hop = hop; out->frame_sz = frame_sz; out->fft_sz = fft_sz; out->n_freqs = n_freqs;
     return 0;
+}
+
+/* ============================================================================
+ * Diagnostic per-stage timing
+ * ========================================================================== */
+
+/* See AudioPipelineLastTiming's doc comment (audio_pipeline.h) for the full
+ * stage-boundary reference. */
+void audio_pipeline_get_last_timing(const AudioPipeline* p,
+                                    AudioPipelineLastTiming* out) {
+    if (!out) return;
+    if (!p) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    *out = p->last_timing;
 }

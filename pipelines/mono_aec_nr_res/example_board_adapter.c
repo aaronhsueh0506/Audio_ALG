@@ -76,9 +76,9 @@
  *
  * The arena is sized from the LARGEST configuration this repo currently
  * supports — 48 kHz, either FFT backend — plus headroom, per
- * pipelines/README.md's "Memory Budget" table (measured: 1,705,568 B KISS
- * / 1,693,920 B NE10 @ 48 kHz, balanced presets). 2 MiB leaves a comfortable
- * ~300+ KB margin over the larger (KISS) figure. This is a REFERENCE
+ * pipelines/README.md's "Memory Budget" table (measured: 1,597,536 B KISS
+ * / 1,591,712 B NE10 @ 48 kHz, balanced presets). 2 MiB leaves a comfortable
+ * ~480+ KB margin over the larger (KISS) figure. This is a REFERENCE
  * sizing choice for the host simulation, not a platform requirement —
  * BOARD: size the platform's real common pool from whatever set of
  * configs (sample rates, presets, aec_only, backend) the product actually

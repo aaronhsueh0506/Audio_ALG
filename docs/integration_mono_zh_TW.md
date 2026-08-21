@@ -182,6 +182,59 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
 會改狀態的 entry point —— 一定要走 `audio_pipeline_reset()` / `audio_pipeline_destroy()`，
 否則 pipeline 自己持有的狀態（OLA、CNG RNG、near-end hangover counter）會和子模組脫節。
 
+### 3.1b 逐階段耗時（診斷用）
+
+`audio_pipeline_get_last_timing(p, &t)` 回報**上一個被接受的 hop** 中各階段的
+牆鐘耗時（微秒）。純診斷，chain 內部不會回讀，也不影響任何運算。
+
+```c
+AudioPipelineLastTiming t;
+audio_pipeline_process(p, mic, ref, out);
+audio_pipeline_get_last_timing(p, &t);
+/* t.delay_us t.frontend_us t.linear_us t.res_us ← 由 aec_get_last_timing() 帶出
+   t.nr_us    t.post_us     t.synth_us           ← 本層自己量 */
+```
+
+| 欄位 | 涵蓋範圍 |
+|---|---|
+| `delay_us` | **延遲估計與 ring 對齊**：matched-filter bank、其 duty-cycle 記帳、reference ring 寫入與延遲補償讀取。`EXTERNAL_ALIGNED` 下為 0，`FIXED` 下很小 |
+| `frontend_us` | AEC 到主濾波器之前的**其餘**部分：mic HPF、飽和、render activity、`mu_scale`、mic-clip、RSA、shadow filter。**不含 `delay_us`**，兩者不重複計算 |
+| `linear_us` | AEC 主自適應濾波器（`pbfdkf_process`），含 far-end FFT |
+| `res_us` | AEC 自己的 AEC3 post/RES 區塊 |
+| `nr_us` | `mmse_lsa_process_gain()` |
+| `post_us` | 兩者之間的增益運算：`r2/PSD_SCALE`、`min(G_nr, G_res)`、`|E|²`、遠端活動與近端 VAD 閘、echo-gated 近端 lift、頻譜套用、comfort noise |
+| `synth_us` | 逆轉換、加窗 overlap-add、hop 送出與位移 |
+
+**實測：`delay_us` 通常是整個 hop 最大的一塊。** 16 kHz/256 ne10 上量到
+60.9%，而拆出去之後 `frontend_us` 只剩 6.8%——也就是說舊版把 matched filter
+和 mic HPF/RSA/shadow filter 混在同一欄時，那一欄的絕大部分其實都是 matched
+filter。這條線直接對應 `delay_num_filters`（1..5）這個可調旋鈕。
+
+**與四聲道版本的差異**：那邊把 estimator **外提**到 wrapper、四條 lane 共用，
+所以 `delay_us` 是 wrapper 自己的階段；這裡 estimator 留在單一 AEC 內部，經
+`aec_get_last_timing()` 帶出來——**同一個量，不同的擁有者**。真正沒有的是
+`fuse_us`（只有一條 lane）。
+
+**各階段不會加總成整通呼叫。** 餘數包含引數檢查、`aec_get_res_context()`，以及
+AEC 內部（因此從這層看不見）的 stationarity 更新、`e2_coarse`/ERL 發布、DT
+analyzer、EPV、shadow_rise、失調估計、功率 EMA 與收斂偵測。要呈現完整分解的
+呼叫端必須把餘數明確列出來，不能讓部分看起來像全部。
+
+**預設關閉，而且分成兩半。** 每 hop 這層 4 次、AEC 內部 7 次 clock 讀取，release
+build 一次都不做，所有欄位讀 0。`make PROFILE=1` 會同時開啟兩半
+（`-DAUDIO_PIPELINE_STAGE_TIMING=1` 與 `-DAEC_STAGE_TIMING=1`）；只開一半是**可讀
+的狀態而非壞掉**——另一半就是讀 0。呼叫端自己的顯示旗標**不會**打開任何量測。
+
+**記錄本身不是條件編譯的，只有取樣是。** 欄位無論旗標開關都在 struct 裡，所以
+profile build 與 release build 切出來的 pool 逐位元相同，開旗標永遠不會移動任何
+offset。
+
+`aec_only` 實例在 `aec_process()` 回來後就返回，所以 `nr_us`/`post_us`/`synth_us`
+每個 hop 都是 0：那些階段在該模式下不存在。
+
+兩支 CLI 都有 `--timing`，在結束時印出整段 run 的每 hop 平均與佔比（含未歸屬餘數）。
+
+
 ### 3.2 執行期強度控制
 
 兩條強度軸都可以在**運轉中的 pipeline** 上改，不需要重建、不動 pool：
@@ -302,31 +355,35 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout（layout_version=8，逐階段計時的 ABI 變更後）、
-`BACKEND=kiss`、`pipelines/Makefile` 預設選項**下，2026-08-20 直接呼叫 API 量到的
-值。換 backend、換編譯選項、更新 submodule 都會變。每個 AEC 實例各自帶了逐階段
-計時記錄（`aec_get_last_timing()`），`sizeof(Aec)` 增加 16 B，因此每一列的
-`aec_bytes` 與 `req.bytes` 都整批 +16 B，所有差額不變。
+以下是**本次 checkout（layout_version=9）、`BACKEND=kiss`、`pipelines/Makefile`
+預設選項**下，直接以 `--print-mem-size` 量到的值。換 backend、換編譯選項、更新
+submodule 都會變。
+
+這一輪 `sizeof(Aec)` **沒有動**：長大的是本 pipeline 自己的 control block，因為它
+新增了逐階段計時記錄（`AudioPipelineLastTiming`，24 B）。`sizeof(AudioPipeline)`
+從 152 變 176，`ALIGN16` 之後從 160 變 176，所以 **`req.bytes` 每列 +16 B（不是
++24，有 8 B 落在原本就有的對齊餘裕裡），而 `aec_bytes`/`fft_bytes`/`nr_bytes`/
+`pipeline_bytes` 四欄一個位元組都沒變。**
 
 | Config | `req.bytes` | `aec_bytes` | `fft_bytes` | `nr_bytes` | `pipeline_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 357,760 | 275,696 | 8,784 | 67,424 | 5,696 |
-| 16000，預設（256/128） | 516,576 | 379,776 | 8,784 | 122,160 | 5,696 |
-| 16000，`fft_size=512` | 670,784 | 508,848 | 16,976 | 133,472 | 11,328 |
-| 48000，預設（1024/512） | 1,597,520 | 1,167,072 | 33,360 | 374,336 | 22,592 |
-| 16000，`aec_only=1` | 379,936 | 379,776 | 0 | 0 | 0 |
+| 8000，預設 | 357,776 | 275,696 | 8,784 | 67,424 | 5,696 |
+| 16000，預設（256/128） | 516,592 | 379,776 | 8,784 | 122,160 | 5,696 |
+| 16000，`fft_size=512` | 670,800 | 508,848 | 16,976 | 133,472 | 11,328 |
+| 48000，預設（1024/512） | 1,597,536 | 1,167,072 | 33,360 | 374,336 | 22,592 |
+| 16000，`aec_only=1` | 379,952 | 379,776 | 0 | 0 | 0 |
 
 `req.bytes` 減去四個分項（各自 16-byte 對齊後）的差額，就是 `AudioPipeline`
-控制區塊，本次量測在每一組 config 都是 160 B。
+控制區塊，本次量測在每一組 config 都是 176 B（前一版 160 B，逐階段計時記錄加上來的）。
 
 #### 4.5a delay_mode 對 16000/預設 grid 的影響（`MATCHED` n=5 為 baseline）
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 516,576 | — |
-| `MATCHED` n=1 | 493,664 | −22,912 |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 358,480 | −158,096 |
-| `EXTERNAL_ALIGNED` | 351,568 | −165,008 |
+| `MATCHED` n=5（預設） | 516,592 | — |
+| `MATCHED` n=1 | 493,680 | −22,912 |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 358,496 | −158,096 |
+| `EXTERNAL_ALIGNED` | 351,584 | −165,008 |
 
 這四列的差額全部落在 `aec_bytes`（`delay_mode`/`delay_num_filters` 不影響
 FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致
@@ -346,6 +403,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 |---|---|---|---|
 | `audio_pipeline_default_config()` | 永遠回傳一個填好的 struct | 不會失敗，**也不驗證** | 無 |
 | `audio_pipeline_get_mem_requirements()` | `0`，`*out` 填妥 | `-1` | 無（僅回傳碼） |
+| `audio_pipeline_get_last_timing()` | `void`，`*out` 填妥 | 不會失敗 | `p` 為 NULL 時把 `*out` 清零；`out` 為 NULL 直接返回 |
 | `audio_pipeline_get_mem_breakdown()` | `0`，`*out` 填妥 | `-1` | 無 |
 | `audio_pipeline_init()` | 非 NULL handle | `NULL` | 部分路徑寫 stderr（見 5.2） |
 | `audio_pipeline_init_ex()` | 非 NULL handle | `NULL` | 每一項 descriptor 不符各自一行 stderr（見 5.3） |
@@ -495,7 +553,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `2` |
-| 4 | `layout_version` | `uint32_t` | `6` |
+| 4 | `layout_version` | `uint32_t` | `9` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

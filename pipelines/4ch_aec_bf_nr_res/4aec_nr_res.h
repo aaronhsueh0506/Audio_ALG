@@ -739,8 +739,10 @@ int four_aec_nr_res_get_mem_breakdown(
  *                align_render()'s ring-buffer copy and the realign sweep are
  *                deliberately outside it; they are not delay estimation.
  *   frontend_us  summed over the four lanes: each lane's work from entry up
- *                to its main filter (mic HPF, saturation, its own delay
- *                stage, mu/RSA prep, shadow filter).
+ *                to its main filter (mic HPF, saturation, mu/RSA prep,
+ *                shadow filter). Lane-internal delay work is NOT here -- it
+ *                is added to delay_us above, where it is structurally zero
+ *                because every lane is AEC_DELAY_EXTERNAL_ALIGNED.
  *   linear_us    summed over the four lanes: each lane's main adaptive
  *                filter, including the far-end FFT on the lane that computes
  *                it (lanes 1-3 borrow it and pay less here).
@@ -755,7 +757,7 @@ int four_aec_nr_res_get_mem_breakdown(
  *   synth_us     inverse transform, windowed overlap-add, and the hop
  *                emit/shift.
  *
- * WHERE THE THREE AEC-SIDE FIGURES COME FROM
+ * WHERE THE FOUR AEC-SIDE FIGURES COME FROM
  *
  * aec_get_last_timing() (aec.h), read once per lane and summed here. The four
  * lanes run sequentially inside one loop, so the sums are wall-clock costs of
@@ -779,12 +781,12 @@ int four_aec_nr_res_get_mem_breakdown(
  * uint32_t would give 1000x the resolution and still take 4.29 s to wrap, if
  * the fine end ever matters.
  *
- * ⚠ OFF BY DEFAULT, IN TWO HALVES. This record costs 29 clock reads per hop
- * -- nine here plus five inside each of the four lanes -- so a release build
+ * ⚠ OFF BY DEFAULT, IN TWO HALVES. This record costs 37 clock reads per hop
+ * -- nine here plus seven inside each of the four lanes -- so a release build
  * takes none of them and every field reads 0. Build with
  * -DFOUR_AEC_NR_RES_STAGE_TIMING=1 for the wrapper's own stages
- * (delay/fuse/res/nr/synth) and -DAEC_STAGE_TIMING=1 for the three summed off
- * the lanes (frontend/linear/lane_res); `make PROFILE=1` sets both, which is
+ * (delay/fuse/res/nr/synth) and -DAEC_STAGE_TIMING=1 for the four summed off
+ * the lanes (delay/frontend/linear/lane_res); `make PROFILE=1` sets both, which is
  * what a profile build should use. Setting one alone is legible rather than
  * broken: the other half simply reads 0.
  *
