@@ -412,7 +412,10 @@ def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
     Nothing declares the channel count, the rate or the chunk count any more,
     so this also covers the re-materializer discovering all three from the
     files themselves -- including a half-finished directory where one chunk is
-    already five-channel and the rest are still legacy four.
+    already five-channel and the rest are still legacy four. That mixture is
+    recovered from the first four stems regardless of --resume: a
+    half-rewritten sequence is never a resumable one, because the ledger only
+    ever records sequences whose chunks all landed.
     """
     source_seqs = packed['output'] / 'train' / 'seqs'
     destination = tmp_path / 'legacy_train'
@@ -437,7 +440,7 @@ def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
 
     args = argparse.Namespace(
         input=str(destination), config=str(corpus['config_path']),
-        resume=True, wav_encoding='auto',
+        resume=True, wav_encoding='auto', jobs=1,
     )
     rematerialize(args)
 
@@ -452,8 +455,11 @@ def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
         rtol=0.0, atol=0.0,
     )
 
-    # A second --resume must find every chunk already five-channel and rewrite
-    # nothing, leaving the samples untouched.
+    # A second --resume must rewrite nothing. The first pass recorded this
+    # sequence in the contract-keyed ledger, which is what --resume reads --
+    # note the FIRST pass still had to do the work, because a corpus with no
+    # ledger is a corpus this contract cannot claim, whatever shape its files
+    # happen to be in.
     before = [torch.load if False else torchaudio.load(
         str(seqs / f'{sequence_id:06d}_{i:03d}.wav'))[0]
         for i in range(len(source_chunks))]

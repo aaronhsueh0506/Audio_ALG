@@ -105,7 +105,7 @@ in-process, on the `RenderedSequence` a worker hands back
 - a curriculum keyed on `scenario` has to measure the chunk instead, which the
   separated stems make possible;
 - source-disjointness is audited at the renderer, not on the packed corpus;
-- `--resume` and the packer can no longer tell WHICH config, seed or manifest
+- the packer can no longer tell WHICH config, seed or manifest
   produced a chunk. They check shape — chunk count, rate, length, channels,
   encoding — and nothing else. Resume into a directory only with the run that
   started it.
@@ -335,18 +335,41 @@ need re-rendering — only the fifth channel does, then the packed shards:
 
 ```bash
 python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
-    --input data_aec/all --config AIAEC/dataset_gen/config.ini
+    --input data_aec/all --config AIAEC/dataset_gen/config.ini --jobs 8
 
 python3 -m AIAEC.dataset_gen.pack_aec_dataset \
     --config AIAEC/dataset_gen/config.ini \
     --input data_aec/all --output data_aec/packed/all --overwrite
 ```
 
-⚠ **Do not pass `--resume`.** It can only see that a sequence already HAS five
-channels, not which frontend produced that fifth one, so a resumed pass would
-silently leave a corpus mixing two contracts. Far, mic, near-target and the
-sequence boundaries are preserved; only `linear_error` is recomputed. Any
-checkpoint trained on the old distribution must be retrained.
+Far, mic, near-target and the sequence boundaries are preserved; only
+`linear_error` is recomputed. Any checkpoint trained on the old distribution
+must be retrained.
+
+**`--jobs` is the only lever that matters.** Measured on a 16 kHz corpus, the
+Python PBFDKF is **99.8%** of the run and file I/O is 0.1%, so nothing about
+the WAV handling is worth optimizing. One process sustains roughly 3.3x
+realtime, which puts a 200-hour corpus near 62 hours; sequences are
+independent, so `--jobs N` divides that by N until the cores run out.
+
+`--jobs` cannot change the corpus. Each sequence gets a fresh PBFDKF, writes
+only its own chunks, and has no random source, so the only thing N changes is
+the order sequences finish in. Pinned by
+`tests/test_rematerialize_linear_aec.py`, which compares every sample of
+`--jobs 1` against `--jobs 3`.
+
+> ⚠ Compare AUDIO, not file bytes, if you check this yourself. libsndfile
+> stamps a `PEAK` chunk with the wall-clock time when it writes a float WAV,
+> so any two runs seconds apart differ in one byte at offset 61 regardless of
+> `--jobs`.
+
+**`--resume` is safe for this.** It skips a sequence only when THIS contract
+already wrote it, which it reads from `linear_error.done.json` beside the
+corpus. A ledger written by a different contract is discarded whole rather
+than partially trusted, so resuming after a `[linear_aec]` change redoes
+everything instead of leaving two frontends mixed together. The ledger records
+a sequence only after all of its chunks are on disk, so an interrupted run
+redoes at most the one it was in the middle of.
 
 **v2 → v3 has no automatic migration, deliberately.** A v2 contract records only
 a raw-text source hash, so once `lib/aec` has moved on there is no way to
@@ -432,11 +455,12 @@ python3 -m AIAEC.dataset_gen.pack_aec_dataset \
     --input data_aec/all --output data_aec/packed/all --overwrite
 ```
 
-⚠ `rematerialize_linear_aec.py --resume` skips a sequence once its chunks are
-all five-channel and the right shape. It cannot tell WHICH contract wrote that
-fifth channel, so re-running after a `[linear_aec]` config edit needs a full
-pass (omit `--resume`) — otherwise the corpus silently keeps a mix of two
-contracts.
+`rematerialize_linear_aec.py --resume` skips a sequence only when the CURRENT
+contract already wrote it, per the `linear_error.done.json` ledger beside the
+corpus; a ledger from another contract is ignored whole. Re-running after a
+`[linear_aec]` config edit therefore redoes every sequence on its own, with or
+without `--resume`. Add `--jobs N` to spread independent sequences across
+cores — it does not change a single sample.
 
 Generation is deterministic given `--seed`: each sequence is seeded from
 `(seed, split, sequence_id)`, so it renders identically regardless of worker
