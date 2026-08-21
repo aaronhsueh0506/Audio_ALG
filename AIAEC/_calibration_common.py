@@ -47,6 +47,24 @@ def far_mode_provenance(model_name):
     return CALIBRATION_ONLY_FAR_INPUT_MODE, CALIBRATION_ONLY_FAR_INPUT_MODE
 
 
+def wav_inventory(root):
+    """Every WAV under ``root``, keyed by POSIX relative path.
+
+    Module level because both the paired walk below and the unpaired one in
+    ``_cli_common`` need the same rule -- notably that the suffix match is
+    case-insensitive, which a bare glob pattern is not.
+    """
+    root = Path(root).resolve()
+    if not root.is_dir():
+        raise ValueError('directory does not exist: %s' % root)
+    result = {path.relative_to(root).as_posix(): path
+              for path in sorted(root.rglob('*'))
+              if path.is_file() and path.suffix.lower() == '.wav'}
+    if not result:
+        raise ValueError('no WAV files under %s' % root)
+    return result
+
+
 def discover_pairs(primary_dir, far_dir, pair_replace=None):
     """Pair primary/far WAVs by relative path.
 
@@ -57,18 +75,8 @@ def discover_pairs(primary_dir, far_dir, pair_replace=None):
     wrong silent pairing would poison the whole calibration capture, so
     anything unmatched still fails loudly.
     """
-    def inventory(root):
-        root = Path(root).resolve()
-        if not root.is_dir():
-            raise ValueError('directory does not exist: %s' % root)
-        result = {path.relative_to(root).as_posix(): path
-                  for path in sorted(root.rglob('*'))
-                  if path.is_file() and path.suffix.lower() == '.wav'}
-        if not result:
-            raise ValueError('no WAV files under %s' % root)
-        return result
-    primary = inventory(primary_dir)
-    far = inventory(far_dir)
+    primary = wav_inventory(primary_dir)
+    far = wav_inventory(far_dir)
     pairs = []
     matched_far = set()
     unmatched = []

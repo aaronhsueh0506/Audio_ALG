@@ -6,6 +6,14 @@
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --device cpu
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --verify
 
+目錄批次 (--mic-dir 取代三個位置參數):
+    # 沒帶 --ref-dir: reference 為數位靜音, 等同純降噪
+    python3 inference.py checkpoint.pth --mic-dir /path/to/mic \\
+        --out-dir /path/to/out
+    # 帶了 --ref-dir: 逐檔以檔名配對, stem 的 mic 換成 lpb
+    python3 inference.py checkpoint.pth --mic-dir /path/to/mic \\
+        --ref-dir /path/to/lpb --out-dir /path/to/out
+
 Calibration:
     python3 inference.py calib --checkpoint checkpoint.pth \\
         --primary-dir /path/to/mic --far-dir /path/to/far \\

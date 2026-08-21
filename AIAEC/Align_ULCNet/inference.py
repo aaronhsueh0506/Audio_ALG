@@ -8,6 +8,14 @@
     python3 inference.py checkpoint.pth kf_error.wav far.wav out.wav \\
         --input-is-linear-error
 
+目錄批次 (--mic-dir 取代三個位置參數):
+    # 沒帶 --ref-dir: reference 為數位靜音, 等同純降噪
+    python3 inference.py checkpoint.pth --mic-dir /path/to/mic \\
+        --out-dir /path/to/out
+    # 帶了 --ref-dir: 逐檔以檔名配對, stem 的 mic 換成 lpb
+    python3 inference.py checkpoint.pth --mic-dir /path/to/mic \\
+        --ref-dir /path/to/lpb --out-dir /path/to/out
+
 Calibration (also exports the ONNX graph the tensors bind to; the default
 graph path is <output>.onnx, override with --onnx):
     python3 inference.py calib --checkpoint checkpoint.pth \\
@@ -61,7 +69,13 @@ if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
 
 from AIAEC.Align_ULCNet import AlignULCNet
-from AIAEC._cli_common import DEVICE_HELP, VERIFY_HELP
+from AIAEC._cli_common import (
+    DEVICE_HELP,
+    VERIFY_HELP,
+    add_directory_arguments,
+    require_single_or_directory,
+    run_pipeline,
+)
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.dataset_gen import AecGrid
 from AIAEC.training_common import (
@@ -72,15 +86,18 @@ from AIAEC.training_common import (
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    # Raw: the docstring is a usage block whose line breaks carry meaning.
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('checkpoint')
     parser.add_argument(
-        'mic_wav', metavar='mic_or_linear_error_wav',
+        'mic_wav', metavar='mic_or_linear_error_wav', nargs='?',
         help='Microphone input, or precomputed error with '
              '--input-is-linear-error',
     )
-    parser.add_argument('far_wav')
-    parser.add_argument('out_wav')
+    parser.add_argument('far_wav', nargs='?')
+    parser.add_argument('out_wav', nargs='?')
     parser.add_argument('--device', default=None, help=DEVICE_HELP)
     parser.add_argument(
         '--input-is-linear-error', action='store_true',
@@ -97,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
              'across D).',
     )
     parser.add_argument('--verify', action='store_true', help=VERIFY_HELP)
+    add_directory_arguments(parser)
     return parser
 
 
@@ -140,12 +158,16 @@ def load_model(checkpoint_path: str, device: str,
     return model, aec_grid, linear_aec_contract
 
 
-def main(args):
+def _run_one(args):
     # Keep checkpoint construction here as the single source used by export
     # and calibration.  The audio schedule itself lives in _streaming.py so
     # the public CLI executes the same hop-by-hop implementation used by tests.
     from AIAEC.Align_ULCNet._streaming import main as streaming_main
     streaming_main(args, load_model_fn=load_model)
+
+
+def main(args):
+    run_pipeline(args, _run_one)
 
 
 def cli():
@@ -154,7 +176,10 @@ def cli():
         from AIAEC._streaming_calibration import main as calibration_main
         calibration_main('Align_ULCNet')
         return
-    main(build_parser().parse_args())
+    parser = build_parser()
+    args = parser.parse_args()
+    require_single_or_directory(parser, args)
+    main(args)
 
 
 if __name__ == '__main__':

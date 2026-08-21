@@ -1,4 +1,5 @@
 import importlib
+import os
 from types import SimpleNamespace
 
 import numpy as np
@@ -6,6 +7,7 @@ import pytest
 import soundfile as sf
 import torch
 
+from AIAEC._cli_common import resolve_directory_jobs
 from AIAEC.inference_common import load_linear_error_far, load_mic_far
 
 
@@ -235,6 +237,102 @@ def test_every_public_inference_entry_delegates_to_streaming(
         streaming, "main",
         lambda args, load_model_fn=None: seen.append((args, load_model_fn)),
     )
-    args = SimpleNamespace(candidate=candidate)
+    # mic_dir=None is the single-pair form; directory mode is covered by the
+    # resolve/pairing tests below.
+    args = SimpleNamespace(candidate=candidate, mic_dir=None)
     inference.main(args)
     assert seen == [(args, inference.load_model)]
+
+
+# ---------- directory mode ----------
+
+def _job_args(tmp_path, ref_dir=None):
+    return SimpleNamespace(
+        mic_dir=str(tmp_path / "mic"),
+        ref_dir=None if ref_dir is None else str(ref_dir),
+        out_dir=str(tmp_path / "out"),
+    )
+
+
+def _tree(tmp_path, mic_names, ref_names=()):
+    for sub_dir, names in (("mic", mic_names), ("ref", ref_names)):
+        for name in names:
+            path = tmp_path / sub_dir / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _write(path, np.zeros(1600), 16000)
+    return tmp_path / "ref"
+
+
+def test_no_far_end_run_uses_digital_silence(tmp_path):
+    """Omitting the reference must give a silent one of the mic's own shape --
+    that is what turns the run into pure noise reduction."""
+    _write(tmp_path / "mic.wav", np.sin(np.arange(16000) / 20.0), 16000)
+    mic, far, rates = load_mic_far(str(tmp_path / "mic.wav"), None, 16000)
+    assert mic.shape == far.shape == (1, 16000)
+    assert torch.count_nonzero(far) == 0
+    # No second file was read, so the far rate reported is the mic's own.
+    assert rates == (16000, 16000)
+    # Written so it can FAIL: an all-zero mic would satisfy the check above.
+    assert torch.count_nonzero(mic) > 0
+
+
+def test_a_missing_reference_is_an_error_not_a_silent_noise_reduction_run(
+        tmp_path):
+    """The failure mode this refuses: a mistyped --ref-dir silently turning an
+    AEC evaluation into noise reduction, with nothing in the output to say so.
+    """
+    ref_dir = _tree(tmp_path, ["a69_mic.wav", "a70_mic.wav"],
+                    ["a69_lpb.wav"])
+    args = _job_args(tmp_path, ref_dir)
+    with pytest.raises(ValueError, match="a70_mic.wav"):
+        resolve_directory_jobs(args)
+
+
+def test_a_reference_matching_no_microphone_is_also_an_error(tmp_path):
+    """Reported from the far side too: an orphan there means the trees do not
+    describe the same capture, which a per-file lookup would never notice."""
+    ref_dir = _tree(tmp_path, ["a69_mic.wav"],
+                    ["a69_lpb.wav", "a70_lpb.wav"])
+    with pytest.raises(ValueError, match="a70_lpb.wav"):
+        resolve_directory_jobs(_job_args(tmp_path, ref_dir))
+
+
+def test_directory_jobs_resolve_before_the_first_file_runs(tmp_path):
+    ref_dir = _tree(tmp_path, ["b/a70_mic.wav", "a69_mic.wav"],
+                    ["b/a70_lpb.wav", "a69_lpb.wav"])
+    jobs = resolve_directory_jobs(_job_args(tmp_path, ref_dir))
+    assert [os.path.basename(mic) for mic, _ref, _out in jobs] == [
+        "a69_mic.wav", "a70_mic.wav"], "jobs run in a stable sorted order"
+    for mic, ref, out in jobs:
+        assert os.path.basename(ref) == \
+            os.path.basename(mic).replace("mic", "lpb")
+        # The output tree mirrors the input tree and keeps the mic's name.
+        assert os.path.relpath(out, str(tmp_path / "out")) == \
+            os.path.relpath(mic, str(tmp_path / "mic"))
+
+
+def test_without_ref_dir_every_job_carries_no_reference(tmp_path):
+    _tree(tmp_path, ["a69_mic.wav", "not_named_by_the_rule.wav"])
+    jobs = resolve_directory_jobs(_job_args(tmp_path))
+    assert len(jobs) == 2
+    assert all(ref is None for _mic, ref, _out in jobs), (
+        "no --ref-dir means no pairing, so the naming rule must not apply"
+    )
+
+
+def test_writing_results_over_the_inputs_is_refused(tmp_path):
+    _tree(tmp_path, ["a69_mic.wav"])
+    args = _job_args(tmp_path)
+    args.out_dir = args.mic_dir
+    with pytest.raises(ValueError, match="must differ"):
+        resolve_directory_jobs(args)
+
+
+def test_an_empty_or_missing_mic_dir_is_refused(tmp_path):
+    (tmp_path / "mic").mkdir()
+    with pytest.raises(ValueError, match="no WAV files"):
+        resolve_directory_jobs(_job_args(tmp_path))
+    args = _job_args(tmp_path)
+    args.mic_dir = str(tmp_path / "absent")
+    with pytest.raises(ValueError, match="does not exist"):
+        resolve_directory_jobs(args)

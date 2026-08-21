@@ -82,9 +82,21 @@ def _match_output_length(primary: Tensor, reference: Tensor) -> Tensor:
     return reference
 
 
+def silent_reference(primary: Tensor) -> Tensor:
+    """A far-end of digital silence, shaped like ``primary``.
+
+    Every candidate takes a far-end signal, so "no far-end recording" is
+    expressed as a silent one rather than as a second code path: one
+    implementation, so the with-far and without-far runs cannot drift in
+    framing, resampling or length. What a silent reference then means for the
+    processing is the model path's business, not this module's.
+    """
+    return torch.zeros_like(primary)
+
+
 def load_mic_far(
     mic_path: str,
-    far_path: str,
+    far_path,
     model_sample_rate: int,
 ) -> Tuple[Tensor, Tensor, Tuple[int, int]]:
     """Load an aligned mono pair and convert both signals to the model rate.
@@ -93,6 +105,11 @@ def load_mic_far(
     for RES+NR candidates: running PBFDKF at the capture rate and resampling
     only its residual would not reproduce the linear-AEC frontend used during
     training.
+
+    ``far_path`` may be None, meaning there is no far-end recording: the
+    reference becomes digital silence matching the microphone's output length.
+    The reported far rate is then the microphone's, because no second file was
+    read.
 
     Returns two ``[1, samples]`` CPU tensors plus the original mic/far rates.
     The synchronized source files must use the same rate and represent the
@@ -105,6 +122,14 @@ def load_mic_far(
         )
 
     mic, mic_sr = _read_mono(mic_path, "mic")
+    if far_path is None:
+        # Built at the OUTPUT length rather than resampled: a Kaiser-sinc pass
+        # over an all-zero buffer is provably all-zero, and the duration fit
+        # and length match would have nothing to reconcile.
+        mic = _resample(mic, mic_sr, model_sample_rate)
+        return (mic.unsqueeze(0).contiguous(),
+                silent_reference(mic).unsqueeze(0).contiguous(),
+                (mic_sr, mic_sr))
     far, far_sr = _read_mono(far_path, "far")
     if mic_sr != far_sr:
         raise ValueError(
@@ -123,7 +148,7 @@ def load_mic_far(
 
 def load_linear_error_far(
     linear_error_path: str,
-    far_path: str,
+    far_path,
     model_sample_rate: int,
 ) -> Tuple[Tensor, Tensor, Tuple[int, int]]:
     """Load a precomputed KF/AEC error and far reference for NN-only tests.
@@ -133,12 +158,19 @@ def load_linear_error_far(
     error signal owns the output timeline and both tensors leave at the model
     rate. This helper deliberately does not claim that the external KF matches
     the frozen PBFDKF used to train this repository's checkpoints.
+
+    ``far_path`` may be None, with the same meaning as in :func:`load_mic_far`.
     """
     if model_sample_rate <= 0:
         raise ValueError(
             f"model_sample_rate must be positive, got {model_sample_rate}"
         )
     error, error_sr = _read_mono(linear_error_path, "linear error")
+    if far_path is None:
+        error = _resample(error, error_sr, model_sample_rate)
+        return (error.unsqueeze(0).contiguous(),
+                silent_reference(error).unsqueeze(0).contiguous(),
+                (error_sr, error_sr))
     far, far_sr = _read_mono(far_path, "far")
     far = _fit_reference_duration(
         error, error_sr, far, far_sr, "linear error"
@@ -153,4 +185,4 @@ def load_linear_error_far(
     )
 
 
-__all__ = ["load_linear_error_far", "load_mic_far"]
+__all__ = ["load_linear_error_far", "load_mic_far", "silent_reference"]

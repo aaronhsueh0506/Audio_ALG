@@ -18,6 +18,7 @@ helpers both hop loops call.
 from __future__ import annotations
 
 import argparse
+import copy
 import importlib
 import os
 import sys
@@ -30,6 +31,7 @@ _AUDIO_ALG_ROOT = os.path.dirname(_THIS_DIR)
 if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
 
+from AIAEC._calibration_common import discover_pairs, wav_inventory
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.aiaec_streaming import StreamISTFT, StreamSTFT, state_report
 from AIAEC.dataset_gen import AecGrid, istft, stft
@@ -48,6 +50,118 @@ VERIFY_HELP = (
     'exit code never changes -- the streaming-equivalence gate is the '
     'test_stream_matches_offline test, not this flag'
 )
+
+
+# Directory mode pairs microphone and far-end files by the same explicit
+# token rule the calibration recorder already exposes as
+# --pair-replace mic:lpb, through the same discover_pairs() walk. One rule and
+# one walk, so a tree that pairs for calibration also pairs for inference.
+MIC_TO_REFERENCE = ('mic', 'lpb')
+
+MIC_DIR_HELP = (
+    'run every .wav under this directory instead of the positional trio '
+    '(recursive). Requires --out-dir'
+)
+REF_DIR_HELP = (
+    "far-end tree for --mic-dir; omit it to run with a silent reference, "
+    "which makes the run pure noise reduction. Files pair by relative name, "
+    "with '%s' in a microphone name also matching '%s' here. Anything "
+    "unpaired on either side is an error, never a silent fallback" %
+    MIC_TO_REFERENCE
+)
+OUT_DIR_HELP = (
+    'where --mic-dir results are written, mirroring the input tree and '
+    "keeping each microphone file's own name"
+)
+
+
+def add_directory_arguments(parser: argparse.ArgumentParser) -> None:
+    """The batch form of the positional mic/far/out trio."""
+    group = parser.add_argument_group('directory mode')
+    group.add_argument('--mic-dir', default=None, help=MIC_DIR_HELP)
+    group.add_argument('--ref-dir', default=None, help=REF_DIR_HELP)
+    group.add_argument('--out-dir', default=None, help=OUT_DIR_HELP)
+
+
+def resolve_directory_jobs(args):
+    """``(mic_path, ref_path_or_None, out_path)`` per microphone file.
+
+    NAMES are resolved for the whole directory before the first file runs, so
+    a pairing mistake in the last file fails before anything has been written,
+    and discover_pairs reports every mismatch on both sides at once. Audio-
+    level problems -- a stereo file, a rate disagreement, a non-finite sample
+    -- are still found when that file is read, and abort the batch.
+    """
+    mic_dir = os.path.abspath(args.mic_dir)
+    out_dir = os.path.abspath(args.out_dir)
+    if out_dir == mic_dir:
+        raise ValueError(
+            '--out-dir must differ from --mic-dir: results keep their '
+            'microphone file names and would overwrite the inputs'
+        )
+    if args.ref_dir:
+        found = discover_pairs(mic_dir, args.ref_dir, MIC_TO_REFERENCE)
+    else:
+        found = [(name, path, None)
+                 for name, path in sorted(wav_inventory(mic_dir).items())]
+    return [(str(mic), None if ref is None else str(ref),
+             os.path.join(out_dir, *name.split('/')))
+            for name, mic, ref in found]
+
+
+def run_directory(args, run_one) -> None:
+    """Run ``run_one`` over every job, one file at a time.
+
+    Each file gets its own COPY of the parsed arguments with the positional
+    trio filled in, so the per-file path is the same code the single-pair CLI
+    runs by construction rather than by audit -- directory mode adds a loop,
+    not a second implementation.
+    """
+    jobs = resolve_directory_jobs(args)
+    print('%d file(s) from %s%s' % (
+        len(jobs), args.mic_dir,
+        '' if args.ref_dir else ' with a silent reference (noise reduction)'))
+    for index, (mic_path, reference, out_path) in enumerate(jobs, 1):
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        print('[%d/%d] %s' % (index, len(jobs), os.path.basename(mic_path)))
+        job = copy.copy(args)
+        job.mic_wav, job.far_wav, job.out_wav = mic_path, reference, out_path
+        run_one(job)
+
+
+def require_single_or_directory(parser, args) -> None:
+    """Refuse an invocation that is neither form, or is both.
+
+    Argument SHAPE only, and here rather than in resolve_directory_jobs
+    because this is the layer that can answer with a usage message instead of
+    a traceback. Whether the directories exist and pair up is a filesystem
+    question, and stays where the filesystem is read.
+    """
+    positional = (args.mic_wav, args.far_wav, args.out_wav)
+    if args.mic_dir:
+        if any(value is not None for value in positional):
+            parser.error('--mic-dir replaces the positional mic/far/out '
+                         'arguments; pass one form or the other')
+        if not args.out_dir:
+            parser.error('--mic-dir requires --out-dir')
+        return
+    if args.ref_dir or args.out_dir:
+        parser.error('--ref-dir/--out-dir apply to --mic-dir only')
+    if any(value is None for value in positional):
+        parser.error('the mic/far/out arguments are required without '
+                     '--mic-dir')
+
+
+def run_pipeline(args, run_one) -> None:
+    """Run one pair or a whole directory, whichever this invocation is.
+
+    The single place that branches, so the four CLIs cannot answer the
+    question differently.
+    """
+    if getattr(args, 'mic_dir', None):
+        run_directory(args, run_one)
+    else:
+        run_one(args)
 
 
 def require_matched_frames(primary_frames, far_frames,
@@ -186,13 +300,21 @@ def make_inference_cli(model_name, model_class, description):
     """
 
     def build_parser() -> argparse.ArgumentParser:
-        parser = argparse.ArgumentParser(description=description)
+        # Raw: the description is a usage block with line breaks that carry
+        # meaning. The default formatter reflows it into one paragraph, so
+        # every example the docstring spells out arrives unreadable.
+        parser = argparse.ArgumentParser(
+            description=description,
+            formatter_class=argparse.RawDescriptionHelpFormatter)
         parser.add_argument('checkpoint')
-        parser.add_argument('mic_wav')
-        parser.add_argument('far_wav')
-        parser.add_argument('out_wav')
+        # Optional so --mic-dir can replace the trio; presence is checked by
+        # require_single_or_directory(), which can name the two forms.
+        parser.add_argument('mic_wav', nargs='?')
+        parser.add_argument('far_wav', nargs='?')
+        parser.add_argument('out_wav', nargs='?')
         parser.add_argument('--device', default=None, help=DEVICE_HELP)
         parser.add_argument('--verify', action='store_true', help=VERIFY_HELP)
+        add_directory_arguments(parser)
         return parser
 
     def load_model(checkpoint_path: str, device: str):
@@ -213,7 +335,7 @@ def make_inference_cli(model_name, model_class, description):
         model.eval()
         return model, aec_grid
 
-    def main(args):
+    def run_one(args):
         # The audio schedule lives in _streaming.py so the public CLI executes
         # the same hop-by-hop implementation the streaming tests drive.
         streaming = importlib.import_module(
@@ -221,12 +343,18 @@ def make_inference_cli(model_name, model_class, description):
         )
         streaming.main(args, load_model_fn=load_model)
 
+    def main(args):
+        run_pipeline(args, run_one)
+
     def cli():
         if len(sys.argv) > 1 and sys.argv[1] == 'calib':
             del sys.argv[1]
             from AIAEC._streaming_calibration import main as calibration_main
             calibration_main(model_name)
             return
-        main(build_parser().parse_args())
+        parser = build_parser()
+        args = parser.parse_args()
+        require_single_or_directory(parser, args)
+        main(args)
 
     return build_parser, load_model, main, cli
