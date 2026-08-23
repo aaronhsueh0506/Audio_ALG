@@ -102,7 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def forward_batch(model, stems_batch, aec_grid, device):
-    stems = AecStems(stems_batch.to(device), PACKED_STEM_ORDER)
+    # dtype rides the same .to() as the device move, not the dataset: a
+    # --dtype float16 corpus arrives here still half and dies in
+    # torch.stft, which has no half CPU kernel. Widening here keeps the
+    # smaller dtype across the loader. float32 corpora: no-op.
+    stems = AecStems(
+        stems_batch.to(device=device, dtype=torch.float32),
+        PACKED_STEM_ORDER,
+    )
     view = build_model_view(stems, MODEL_NAME, sample_rate=aec_grid.sr)
     spectral = build_spectral_model_view(view, aec_grid)
     output = model(**spectral.inputs)

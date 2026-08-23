@@ -30,6 +30,15 @@ class PackedAecDataset(Dataset):
     ``(4, T)`` tensor in ``PACKED_STEM_ORDER``.  Wrap it in
     :class:`~AIAEC.dataset_gen.aec_features.AecStems` to read channels by name --
     :meth:`stems_of` does that for you.
+
+    ⚠ ``stems`` comes out in the dtype the shard was PACKED with, which
+    ``--dtype float16`` makes half.  Widening is the consumer's job, and is
+    deliberately left there so the smaller dtype survives the loader: the
+    trainers do it on the same ``.to()`` as the device move.  A half tensor
+    handed straight to ``torch.stft`` raises ``expected scalar type Double
+    but found Half`` -- there is no half kernel on CPU -- so anything that
+    measures the stems needs ``.float()`` first.  ``self.dtype`` reports what
+    is on disk.
     """
 
     def __init__(self, path: str, expected_sr: Optional[int] = None,
