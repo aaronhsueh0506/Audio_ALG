@@ -27,7 +27,6 @@
 #include <stdint.h>
 #include <math.h>
 #include <stddef.h>
-#include <time.h>
 
 #include "4aec_nr_res.h"
 #include "4aec_nr_res_internal.h"
@@ -83,13 +82,29 @@ static uint32_t four_aec_nr_res_backend_id(void) {
 /* Microsecond monotonic stamp for the per-stage diagnostic timing. Truncated
  * to 32 bits: every consumer subtracts two stamps in UNSIGNED arithmetic, so
  * the difference is exact for any interval shorter than the ~71.6 minute wrap
- * -- which no hop approaches. */
+ * -- which no hop approaches. *
+ * CLOCK_MONOTONIC is POSIX, not C99. A target with a reduced libc enables the
+ * timing with -DFOUR_AEC_NR_RES_STAGE_TIMING=1 -DFOUR_AEC_NR_RES_NOW_US=board_timer_us, naming a function that takes
+ * no argument and returns uint32_t microseconds -- a plain identifier, because
+ * these Makefiles reject parentheses in EXTRA_CFLAGS, and its declaration is
+ * the integrator's to supply. The default below is then neither compiled nor
+ * linked and <time.h> is not included.
+ *
+ * Each component carries its own override rather than sharing one: lib/aec has
+ * AEC_NOW_US and the other pipeline has its own, so a chain built for such a
+ * target names a timer per component it actually builds.
+ */
+#ifndef FOUR_AEC_NR_RES_NOW_US
+#include <time.h>
 static uint32_t four_aec_nr_res_now_us(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)((uint64_t)ts.tv_sec * 1000000ull
                       + (uint64_t)ts.tv_nsec / 1000ull);
 }
+#else
+static uint32_t four_aec_nr_res_now_us(void) { return FOUR_AEC_NR_RES_NOW_US(); }
+#endif
 #else
 /* Every stamp folds to a constant, so the subtractions fold to zero and no
  * clock is read. */

@@ -598,6 +598,18 @@ static void test_stage_timing(void) {
     CHECK(t.nr_us == 0 && t.post_us == 0 && t.synth_us == 0,
           "timing: this layer's stages read zero when compiled out");
 #endif
+#if AUDIO_PIPELINE_STAGE_TIMING && !AEC_STAGE_TIMING
+    /* Not an error: the halves are independent by design. But `make
+     * PROFILE=1` sets both, so this combination means the flags were
+     * hand-written -- or that the build lost one of them. Say so, because
+     * the zero branch below agrees with a library that DID measure while
+     * this layer's copy was compiled out, and would pass without proving
+     * anything. The four-lane test catches that case by reading the lanes
+     * unconditionally; this one cannot. */
+    printf("NOTE: this layer measures but lib/aec's half is off -- the AEC\n"
+           "      zero check below cannot distinguish 'not measured' from\n"
+           "      'measured and not copied out'.\n");
+#endif
 #if AEC_STAGE_TIMING
     CHECK(t.aec.delay_us > 0,  "timing: the delay estimator reports a real cost");
     CHECK(t.aec.linear_us > 0, "timing: the AEC main filter reports a real cost");

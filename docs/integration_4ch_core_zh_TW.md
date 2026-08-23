@@ -218,17 +218,20 @@ void four_aec_nr_res_get_last_timing(const FourAecNrRes* p,
 pipeline 自己不回讀，也不影響處理。`p` 為 NULL 或已 destroy 時把 `out` 清零而
 不是失敗；`out` 不得為 NULL。
 
-**六個欄位是真的量測值**：`delay_us`（只有共用延遲估計，不含 `align_render()`
-的 ring-buffer 複製與 realign 掃描）、`linear_us`（整個四路 AEC 迴圈）、
-`fuse_us`、`res_us`（它消耗的功率準備 ＋ 抑制增益）、`nr_us`、`synth_us`
-（逆轉換 ＋ 加窗 overlap-add ＋ hop 送出）。
+**八個欄位分成兩個來源。** 本層自己量的是 `fuse_us`、`res_us`（功率準備 ＋
+抑制增益）、`nr_us`、`synth_us`（逆轉換 ＋ 加窗 overlap-add ＋ hop 送出），以及
+`delay_us` 的共用延遲估計部分（不含 `align_render()` 的 ring-buffer 複製與
+realign 掃描）。
 
-**`frontend_us` 與 `lane_res_us` 恆為 0**：AEC frontend、線性濾波器本體與
-per-lane RES 都在 `aec_process_context*()` 內部，那支函式沒有自己的計時窗，
-從這一層切不開，因此三者合計記在 `linear_us`。這兩欄寧可留 0 也不報一個沒量到
-的數字。實測 `linear_us` 約佔整個 hop 的 74%，所以**最大的一塊目前是不可分解
-的**；要拆開必須在 AEC 函式庫內部開窗，那會讓 `sizeof(Aec)` 變大，連帶要 bump
-本層與兩個 mono pipeline 共五個 layout version。
+`frontend_us`、`linear_us`、`lane_res_us` 來自 `aec_get_last_timing()`
+（`aec.h`）：四條 lane 各讀一次再相加，所以得到的是該階段在整個 lane 迴圈上的
+wall-clock 成本。lane 內部的 `delay_us` 也一併加進上面的 `delay_us`——它是同一
+個量（對齊遠端所花的時間），且**結構上恆為 0**，因為四條 lane 都是
+`AEC_DELAY_EXTERNAL_ALIGNED`，沒有自己的 ring 也沒有估計器；相加而不是丟棄，是
+為了讓日後改變 lane 模式時不會靜默漏掉那筆成本。
+
+這三欄由**另一半旗標** `-DAEC_STAGE_TIMING=1` 管轄。只建本層那半，這三欄讀 0
+而其餘照常量測，是可讀的狀態而非壞掉；`make PROFILE=1` 兩半一起開。
 
 各階段**加起來不等於**整個呼叫的時間，呼叫端要自己用減法補餘額：pre 側餘額涵蓋
 輸入去交錯／有限值檢查、`align_render()` 與 realign 掃描；post 側餘額涵蓋 gain
@@ -239,6 +242,14 @@ per-lane RES 都在 `aec_process_context*()` 內部，那支函式沒有自己�
 `process_post*()` 回傳後讀才是完整的。
 
 解析度是微秒，所以低於 1 µs 的階段會讀到 0。
+
+**目標平台沒有 `CLOCK_MONOTONIC` 時**：`clock_gettime` 是 POSIX 而非 C99。用
+`make PROFILE=1 EXTRA_CFLAGS='-DFOUR_AEC_NR_RES_NOW_US=board_timer_us
+-DAEC_NOW_US=board_timer_us -include my_timer.h'` 換掉時鐘；巨集要是**純識別字**
+（Makefile 的 FP policy 不允許 `EXTRA_CFLAGS` 出現括號），指向不收參數、回傳
+`uint32_t` 微秒的函式。替代時鐘必須**單調**，否則無號減法會產生接近 32-bit 全距
+的荒謬值。本層與 `lib/aec` 各有自己的覆寫點，刻意不共用——一個元件的時鐘屬於該
+元件自己的建置契約。開著旗標但指向常數函式是合法用法，所有欄位讀 0。
 
 ### 3.2 執行期強度控制
 

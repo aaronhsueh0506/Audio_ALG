@@ -730,8 +730,9 @@ int four_aec_nr_res_get_mem_breakdown(
  * Per-stage wall-clock cost of the most recent hop, in microseconds.
  *
  * Diagnostic only: nothing in the pipeline reads these back, and they do not
- * affect processing. Stamped with CLOCK_MONOTONIC, so a build that must have
- * no clock dependency at all cannot use this header's implementation as-is.
+ * affect processing. The stamp is described at the end of this comment,
+ * along with what a build that must carry no clock dependency at all
+ * substitutes it with.
  *
  * WHICH STAGE EACH FIELD COVERS
  *
@@ -793,6 +794,12 @@ int four_aec_nr_res_get_mem_breakdown(
  * A display-side flag in the CONSUMER does not enable any of this. It decides
  * whether a breakdown is printed; these decide whether there is anything to
  * print. Built one way and read the other, the report renders zeros.
+ *
+ * A target whose libc has no POSIX CLOCK_MONOTONIC combines the flags with
+ * -DFOUR_AEC_NR_RES_NOW_US=<fn> (and lib/aec's own -DAEC_NOW_US=<fn>) to name
+ * its microsecond timer -- see the stamp's comment in 4aec_nr_res.c. A
+ * substitute that returns a constant keeps the flags on and reads 0 here,
+ * which this record cannot distinguish from a build without them.
  *
  * LIFETIME. The values describe the last hop that reached each stage. Each
  * half is cleared once its own call has been ACCEPTED -- after the argument

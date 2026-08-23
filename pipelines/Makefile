@@ -337,19 +337,50 @@ ATTEST_STAMP ?=
 # for correctness.
 EXTRA_CFLAGS ?=
 # PROFILE=1 turns on the per-hop stage timing across everything this Makefile
-# builds: lib/aec's own stages, and the mono pipeline's own nr/post/synth on
-# top of them. Both are off by default so a release build takes none of the
-# clock reads; each component's own header carries its count, and this file
-# deliberately does not restate it.
-# They land in EXTRA_CFLAGS deliberately: that is already forwarded to the
-# producer sub-makes AND folded into CFG_SIG, so a profile build and a release
-# build occupy different obj/bin directories and cannot hand each other a stale
-# object. Setting only one of the two is legible rather than broken -- the
-# other half simply reads 0. The four-lane pipeline has its own Makefile and
-# its own wrapper-side half of this switch; `make PROFILE=1` there sets both.
+# builds: the mono pipeline's own nr/post/synth here, and lib/aec's own stages
+# through the same knob forwarded by name. Off by default so a release build
+# takes none of the clock reads; each component's own header carries its
+# count, and this file deliberately does not restate it. Folded into CFG_SIG
+# both by name and through CFLAGS, so a profile build and a release build
+# occupy different obj/bin directories and cannot hand each other a stale
+# object. Setting only one component's -D by hand is legible rather than
+# broken -- the other half simply reads 0.
 PROFILE ?= 0
+ifneq ($(words $(PROFILE)),1)
+$(error PROFILE must be exactly 0 or 1, got '$(PROFILE)')
+endif
+ifneq ($(filter-out 0 1,$(PROFILE)),)
+$(error PROFILE must be exactly 0 or 1, got '$(PROFILE)')
+endif
+# Set through PROFILE_CFLAGS -> CFLAGS rather than EXTRA_CFLAGS, mirroring
+# SIMD right below. EXTRA_CFLAGS is forwarded verbatim to the producer
+# sub-makes and folded into CFG_SIG, so smuggling the -D through it made the
+# flag arrive twice whenever a consumer that also has PROFILE drove this
+# build, splitting byte-identical objects across two keys, and re-keyed
+# producers that never reference the macro at all. CFLAGS is already
+# protected from a command-line assignment (see the FP policy guard below),
+# so the knob cannot be silently dropped either.
+# Both -D land in THIS Makefile's CFLAGS, which is not forwarded: lib/aec gets
+# its own AEC_STAGE_TIMING from the PROFILE knob forwarded by name in FWD
+# below, so the flag reaches its compile once rather than twice.
+#
+# AEC_STAGE_TIMING is repeated here on purpose. It is not only the library's
+# switch -- this layer's own translation units test it, to decide whether to
+# copy the lanes' record out and what the tests may assert about it. Leaving
+# it out built a consumer that believed the library had not measured while it
+# had: every AEC stage reported zero with the cost showing up as
+# unattributed, and the test that should have caught it agreed with the
+# broken behaviour instead. Both sides deriving from PROFILE is what keeps
+# the two views from disagreeing.
+#
+# A lib/aec pin older than the PROFILE knob has nothing to receive and
+# degrades to the documented one-half state -- the wrapper's stages measure,
+# the AEC block reads zero -- which the --timing report shows as real numbers
+# beside a row of zeros rather than hiding.
 ifeq ($(PROFILE),1)
-EXTRA_CFLAGS += -DAEC_STAGE_TIMING=1 -DAUDIO_PIPELINE_STAGE_TIMING=1
+PROFILE_CFLAGS := -DAUDIO_PIPELINE_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1
+else
+PROFILE_CFLAGS :=
 endif
 
 SIMD ?= 1
@@ -389,6 +420,7 @@ CFLAGS = -Wall -Wextra -O2 -std=gnu99 \
 CFLAGS += -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\"
 CFLAGS += $(EXTRA_CFLAGS)
 CFLAGS += $(SIMD_CFLAGS)
+CFLAGS += $(PROFILE_CFLAGS)
 
 # -Werror opt-in for this Makefile's OWN TUs (default off; CI can flip it
 # on with `make WERROR=1`). Vendor code (audio_common's NE10/KISS) is built by
@@ -890,7 +922,7 @@ endif
 # build invoked without AC_LIB would land in a DIFFERENT (AC_PRODUCER_SIG-less)
 # keyed directory than the one this Makefile's query call resolved, and the
 # "does $(AEC_LIB) exist" assertion in that FORCE rule would fail.
-FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
+FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 
 ifeq ($(AC_LIB),)
 .PHONY: all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter example-adapter libaudio_pipeline.a
@@ -941,7 +973,7 @@ endif
 # guard-skip knob must not alias a guarded build), SRCS (this
 # Makefile's own compiled sources -- the archive's one member TU plus the
 # CLI/test TUs -- so a source-set change keys to a fresh directory).
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c)
+CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT: where THIS repo's own keyed

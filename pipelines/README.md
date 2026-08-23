@@ -292,7 +292,16 @@ make PROFILE=1                 # both halves: the pipeline's own stages AND lib/
 Run `--timing` against a build that did not measure and every stage reads 0;
 the report says so in words rather than printing a table of zeros. Setting
 only one of the two `-D` flags by hand is legible rather than broken — the
-other half simply reads 0. See `AudioPipelineLastTiming` in
+other half simply reads 0.
+
+`CLOCK_MONOTONIC` is POSIX rather than C99. A target whose libc lacks it names
+its own microsecond timer instead — `make PROFILE=1
+EXTRA_CFLAGS='-DAUDIO_PIPELINE_NOW_US=board_timer_us -DAEC_NOW_US=board_timer_us
+-include my_timer.h'`, a plain identifier because these Makefiles reject
+parentheses in `EXTRA_CFLAGS`. Each component carries its own override, so a
+chain names one timer per component it actually builds. A substitute that
+returns a constant keeps the flags on and reads 0, which `--timing` cannot
+distinguish from a build without them. See `AudioPipelineLastTiming` in
 `mono_aec_nr_res/audio_pipeline.h` for what each stage covers and for why the
 stages deliberately do not sum to the call.
 

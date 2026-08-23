@@ -39,13 +39,36 @@ EXTRA_CFLAGS =
 # release build takes none of the clock reads; FourAecNrResLastTiming's doc
 # comment (4aec_nr_res.h) carries the count, and is the only place that does.
 #
-# It lands in EXTRA_CFLAGS deliberately: that is already forwarded to every
-# producer sub-make AND folded into CFG_SIG, so a profile build and a release
-# build occupy different obj/bin directories and cannot hand each other a
-# stale object.
+# Set through PROFILE_CFLAGS -> CFLAGS rather than EXTRA_CFLAGS, mirroring
+# SIMD. EXTRA_CFLAGS is forwarded verbatim to every producer sub-make and
+# folded into CFG_SIG, so smuggling the -D through it made the flag arrive
+# twice at lib/aec once that gained its own PROFILE, splitting byte-identical
+# objects across two keys, and re-keyed producers that never reference the
+# macro. CFLAGS here is `override CFLAGS :=`, so a command-line assignment
+# cannot silently drop the knob either.
+#
+# Both -D land in THIS Makefile's CFLAGS, which is not forwarded: lib/aec gets
+# its own AEC_STAGE_TIMING from the PROFILE knob forwarded by name in FWD
+# below, so the flag reaches its compile once rather than twice.
+#
+# AEC_STAGE_TIMING is repeated here on purpose. It is not only the library's
+# switch -- this layer's own translation units test it, to decide whether to
+# copy the lanes' record out and what the tests may assert about it. Leaving
+# it out built a consumer that believed the library had not measured while it
+# had: every AEC stage reported zero with the cost showing up as
+# unattributed, and the test that should have caught it agreed with the
+# broken behaviour instead. Both sides deriving from PROFILE is what keeps
+# the two views from disagreeing.
+#
+# A lib/aec pin older than the PROFILE knob has nothing to receive and
+# degrades to the documented one-half state -- the wrapper's stages measure,
+# the AEC block reads zero -- which the --timing report shows as real numbers
+# beside a row of zeros rather than hiding.
 PROFILE ?= 0
 ifeq ($(PROFILE),1)
-EXTRA_CFLAGS += -DFOUR_AEC_NR_RES_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1
+PROFILE_CFLAGS := -DFOUR_AEC_NR_RES_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1
+else
+PROFILE_CFLAGS :=
 endif
 EXTRA_LDFLAGS =
 CPPFLAGS ?=
@@ -77,6 +100,7 @@ $(info Audio_ALG/4ch_aec_bf_nr_res: FFT backend = $(BACKEND) -- switch with `mak
 endif
 
 $(eval $(call require_bool,SIMD))
+$(eval $(call require_bool,PROFILE))
 $(eval $(call require_bool,WERROR))
 $(eval $(call require_bool,NO_STDIO))
 $(eval $(call require_bool,DEBUG))
@@ -117,7 +141,7 @@ override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
           -I$(THIRD_PARTY_DIR)/utility \
           -I$(THIRD_PARTY_DIR)/doa \
           -I$(THIRD_PARTY_DIR)/GSC \
-          $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) \
+          $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) $(PROFILE_CFLAGS) \
           -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\" \
           $(WERROR_CFLAGS) -ffp-contract=off
 LIB_CFLAGS := $(CFLAGS)
@@ -128,7 +152,7 @@ LINK := $(CXX)
 endif
 LDLIBS := $(EXTRA_LDFLAGS) $(LDFLAGS) -lm
 
-FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) \
+FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) \
       CC='$(CC)' CXX='$(CXX)' AR='$(AR)' RANLIB='$(RANLIB)' \
       EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) \
       TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)

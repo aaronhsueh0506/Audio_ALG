@@ -159,7 +159,10 @@ static void print_stage_timing(const StageAccum* a) {
         printf("  every stage reads 0 -- this binary was built WITHOUT the\n"
                "  timing flags. Rebuild with `make PROFILE=1` (or pass\n"
                "  -DAUDIO_PIPELINE_STAGE_TIMING=1 -DAEC_STAGE_TIMING=1) to\n"
-               "  measure; the display flag alone cannot turn it on.\n");
+               "  measure; the display flag alone cannot turn it on. A build\n"
+               "  that HAS the flags but substituted a constant stamp through\n"
+               "  AUDIO_PIPELINE_NOW_US/AEC_NOW_US reads 0 here too, and this\n"
+               "  report cannot tell the two apart.\n");
         return;
     }
     stage_accum_row("AEC delay", a->delay, a);

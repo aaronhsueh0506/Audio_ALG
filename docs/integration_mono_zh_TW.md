@@ -229,6 +229,15 @@ build 一次都不做，所有欄位讀 0。`make PROFILE=1` 會同時開啟兩�
 profile build 與 release build 切出來的 pool 逐位元相同，開旗標永遠不會移動任何
 offset。
 
+**目標平台沒有 `CLOCK_MONOTONIC` 時。** `clock_gettime` 是 POSIX 而非 C99。這種
+平台用 `make PROFILE=1 EXTRA_CFLAGS='-DAUDIO_PIPELINE_NOW_US=board_timer_us
+-DAEC_NOW_US=board_timer_us -include my_timer.h'` 換掉時鐘：巨集要是**純識別字**
+（Makefile 的 FP policy 不允許 `EXTRA_CFLAGS` 出現括號），指向不收參數、回傳
+`uint32_t` 微秒的函式。替代時鐘必須單調，否則無號減法會產生接近 32-bit 全距的
+荒謬值。每個元件各有自己的覆寫點（這層、`lib/aec`、四路 pipeline），刻意不共用
+——一個元件的時鐘屬於該元件自己的建置契約。開著旗標但指向常數函式是合法用法，
+所有欄位讀 0，`--timing` 的報表無法分辨這種情況與「根本沒開旗標」。
+
 `aec_only` 實例在 `aec_process()` 回來後就返回，所以 `nr_us`/`post_us`/`synth_us`
 每個 hop 都是 0：那些階段在該模式下不存在。
 

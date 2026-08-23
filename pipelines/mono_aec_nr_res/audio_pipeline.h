@@ -315,7 +315,8 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
 /**
  * Per-hop wall-clock cost of the stages inside audio_pipeline_process(), in
  * microseconds. Diagnostic only: nothing in the chain reads these back and
- * they do not affect processing. Stamped with CLOCK_MONOTONIC.
+ * they do not affect processing. The stamp is described at the end of this
+ * comment, along with what a target substitutes it with.
  *
  * STAGE BOUNDARIES
  *
@@ -379,6 +380,12 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
  * decides whether a breakdown is printed; these decide whether there is
  * anything to print. Built one way and read the other, the report renders
  * zeros.
+ *
+ * A target whose libc has no POSIX CLOCK_MONOTONIC combines the flags with
+ * -DAUDIO_PIPELINE_NOW_US=<fn> (and lib/aec's own -DAEC_NOW_US=<fn>) to name
+ * its microsecond timer -- see the stamp's comment in audio_pipeline.c. A
+ * substitute that returns a constant keeps the flags on and reads 0 here,
+ * which this record cannot distinguish from a build without them.
  *
  * THE RECORD IS NOT CONDITIONAL, ONLY THE STAMPING IS. The field lives in
  * the control block whether or not either flag is set, so a profile build
