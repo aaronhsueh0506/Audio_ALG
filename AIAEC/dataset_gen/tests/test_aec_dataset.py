@@ -579,6 +579,38 @@ def test_ref_dropout_clips_have_a_silent_reference(corpus):
     assert found > 0, "corpus contains no ref_dropout chunks to check"
 
 
+def test_far_active_no_echo_has_a_loud_reference_and_no_echo(corpus):
+    """The converse of ref_dropout: X is loud end to end and D is exactly 0.
+
+    ⚠ This is the only scenario that can express it. Everywhere else the echo
+    is tied to the reference through erl_db, whose range stops at 30 dB, so
+    the quietest echo the corpus could otherwise produce still sits only
+    ser_db_max below the near speech. A model trained without this case has
+    never seen a reference that is loud and irrelevant.
+
+    ``echo`` is audit-only (not persisted, see STEM_ORDER's docstring), so
+    this renders directly rather than reading a packed shard.
+    """
+    renderer = AecSequenceRenderer(
+        corpus['cfg'], pools_for_split(corpus['manifest'], 'train'),
+        corpus_seed=SEED)
+    found = 0
+    for sequence_id in range(4101, 4106):
+        rendered = renderer.render(SequencePlan(
+            sequence_id=sequence_id, n_chunks=3,
+            scenario='far_active_no_echo',
+            seed=stable_seed(SEED, 'test', f'no-echo-{sequence_id}')))
+        view = AecStems(rendered.stems)
+        assert float(rendered.audit['echo'].abs().max()) == 0.0
+        assert float(view.far_render.abs().max()) > 0.0
+        # Whole-sequence scenario: no chunk is exempt, so the label has to
+        # hold everywhere rather than marking a localised event.
+        for meta in rendered.chunk_meta:
+            assert meta['scenario'] == 'far_active_no_echo'
+        found += 1
+    assert found > 0
+
+
 def test_ref_dropout_sequences_keep_active_chunks_too(corpus):
     """A dropout sequence must not be labelled dropout end to end.
 

@@ -99,6 +99,7 @@ SCENARIOS = (
     'near_only',
     'double_talk',
     'ref_dropout',
+    'far_active_no_echo',
     'echo_path_change',
     'nonlinear_spk',
     'clipping_agc',
@@ -111,6 +112,9 @@ SCENARIOS = (
 # localised in time and get a per-chunk label instead -- see _chunk_scenario.
 WHOLE_SEQUENCE_SCENARIOS = frozenset({
     'nonlinear_spk', 'clipping_agc', 'delay_jitter', 'sro', 'codec_mismatch',
+    # The reference plays for the whole sequence and none of it reaches the
+    # microphone, so there is no chunk where the event is not happening.
+    'far_active_no_echo',
 })
 
 # Memoryless loudspeaker distortion models.  A device is pinned to exactly one
@@ -902,6 +906,24 @@ class AecSequenceRenderer:
         erl_db = rng.uniform(cfg.getfloat('levels', 'erl_db_min'),
                              cfg.getfloat('levels', 'erl_db_max'))
         echo = _scale_to_ratio(echo, far_render, sr, -erl_db)
+
+        if scenario == 'far_active_no_echo':
+            # Near-end single talk with the far end playing: a reference at
+            # full level and no acoustic path back to this microphone.  Every
+            # other scenario ties echo to far_render through erl_db, whose
+            # range stops at 30 dB, so the quietest echo the corpus could
+            # otherwise produce still sits only ser_db_max below the near
+            # speech -- around 25 dB short of what a real headset or a muted
+            # loudspeaker looks like.  Without this case nothing teaches that a
+            # loud reference can be irrelevant, and a linear filter is free to
+            # fit reference-shaped noise onto near speech and subtract
+            # something that was never there.
+            #
+            # Distinct from near_only (far_render itself is silent, so there is
+            # no reference to be misled by) and from ref_dropout (which zeros
+            # the reference and the echo together, teaching the converse).
+            echo = torch.zeros_like(echo)
+            erl_db = float('inf')
 
         if dropout_chunks and rng.random() >= cfg.getfloat(
                 'dropout', 'ref_dropout_echo_continues_p'):
