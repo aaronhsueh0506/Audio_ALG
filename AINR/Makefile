@@ -1,5 +1,9 @@
 CC ?= cc
-CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -ffp-contract=off -I.
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
+# The floating-point contract and project include paths are invariants of the
+# C/Python parity boundary. Keep them even when a board build overrides
+# CFLAGS on the command line.
+override CFLAGS += -ffp-contract=off -I.
 LDFLAGS ?=
 SIMD ?= 1
 BACKEND ?= ne10
@@ -9,7 +13,7 @@ BACKEND ?= ne10
 # DSP on top of it.
 AC_DIR ?= $(abspath ../../audio_common)
 AC_LIB = $(shell $(MAKE) -s -C $(AC_DIR) BACKEND=$(BACKEND) SIMD=$(SIMD) 	lib print-lib-path | tail -1)
-CFLAGS += -I$(AC_DIR)/include
+override CFLAGS += -I$(AC_DIR)/include
 
 ifneq ($(words $(SIMD)),1)
 $(error SIMD must be exactly 0 or 1)

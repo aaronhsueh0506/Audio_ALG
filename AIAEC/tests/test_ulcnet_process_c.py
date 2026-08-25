@@ -264,6 +264,56 @@ int main(int argc, char **argv) {
     assert (got - expected).abs().max().item() < 2e-5
 
 
+def test_shared_real_and_complex_masks_match_python(driver, audio_common_lib):
+    """Pins the host post-processing used by Align-CRUSE and CAGCRN."""
+    work, _ = driver
+    cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
+    source = work / 'shared_masks.c'
+    source.write_text(r'''
+#include <stdio.h>
+#include "aiaec_process.h"
+int main(int argc, char **argv) {
+    float in[5][AIAEC_N_BINS], out[4][AIAEC_N_BINS];
+    FILE *fi, *fo;
+    if (argc != 3) return 2;
+    fi = fopen(argv[1], "rb"); fo = fopen(argv[2], "wb");
+    if (!fi || !fo) return 3;
+    if (fread(in, sizeof(float), 5 * AIAEC_N_BINS, fi) !=
+        5 * AIAEC_N_BINS) return 4;
+    aiaec_apply_real_mask(in[0], in[1], in[2], out[0], out[1]);
+    aiaec_apply_complex_mask(in[0], in[1], in[3], in[4], out[2], out[3]);
+    fwrite(out, sizeof(float), 4 * AIAEC_N_BINS, fo);
+    fclose(fi); fclose(fo); return 0;
+}
+''')
+    executable = work / 'shared_masks'
+    subprocess.run(
+        [cc, '-O2', '-std=c99', '-ffp-contract=off',
+         '-I', _AIAEC_DIR, '-I', _ULCNET_DIR, '-I', _AC_INCLUDE,
+         str(source), os.path.join(_AIAEC_DIR, 'aiaec_process.c'),
+         os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
+         audio_common_lib, '-lm', '-o', str(executable)],
+        check=True, capture_output=True)
+
+    torch.manual_seed(24)
+    values = torch.randn(5, BINS, dtype=torch.float32)
+    input_path = work / 'shared_masks_in.f32'
+    output_path = work / 'shared_masks_out.f32'
+    values.numpy().tofile(input_path)
+    subprocess.run([str(executable), str(input_path), str(output_path)],
+                   check=True)
+    got = torch.from_numpy(
+        np.fromfile(output_path, dtype=np.float32)).reshape(4, BINS)
+    real_expected = torch.stack((values[0] * values[2],
+                                 values[1] * values[2]))
+    complex_expected = torch.stack((
+        values[0] * values[3] - values[1] * values[4],
+        values[1] * values[3] + values[0] * values[4],
+    ))
+    torch.testing.assert_close(got[:2], real_expected, rtol=0, atol=0)
+    torch.testing.assert_close(got[2:], complex_expected, rtol=0, atol=0)
+
+
 def test_deepvqe_ccm_helper_matches_python(tmp_path):
     from AIAEC.aiaec_common import apply_causal_tf_filter
 
