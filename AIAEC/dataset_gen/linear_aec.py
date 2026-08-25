@@ -362,6 +362,15 @@ def make_linear_aec_config(
         "mode": AecMode.PBFDKF,
         "enable_res": False,
         "enable_cng": False,
+        # The AEC3 post chain has to run for AecState to advance, and the
+        # over-output guard on the formed seam reads its verdict. Without this
+        # the analyzer never updates and the guard sees a permanent "unusable",
+        # degrading to a bare energy comparison. This is also the mode the
+        # shipped C pipeline uses (enable_res=0 with the context seam on), so
+        # the training signal and the deployed one now come off the same
+        # branch. Byte-identical to the previous FORM-only setting on material
+        # where the guard does not fire.
+        "return_res_context": True,
         "enable_shadow": True,
         "enable_delay_est": True,
         "enable_highpass": True,
