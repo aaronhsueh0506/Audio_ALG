@@ -1405,8 +1405,13 @@ static int fuse_contexts(FourAecNrRes* p,
     float base_far_power = p->snapshots[0].far_power;
 
     *all_converged = 1;
-    *max_dt = p->snapshots[0].dt_indicator;
-    *max_saturation = p->snapshots[0].saturation_level;
+    /* Seeded neutral rather than from lane 0, so lane 0 is subject to the
+     * same contributes-to-the-output test as every other lane below. Both
+     * quantities are non-negative, so 0 is the identity for the max. At
+     * least one lane always survives that test: process_post*() rejects
+     * all-zero weights before reaching here. */
+    *max_dt = 0.0f;
+    *max_saturation = 0.0f;
     *far_power = base_far_power;
 
     if (trusted_beamformed_error) {
@@ -1427,16 +1432,36 @@ static int fuse_contexts(FourAecNrRes* p,
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
         const Complex* lane_weights =
             weights + (size_t)ch * (size_t)n;
+        /* A lane the beamformer has zeroed in every bin contributes exactly
+         * nothing to fused_error/fused_near/output_spec/fused_comfort below,
+         * so it must not vote on the three scalars that steer the post stage
+         * either -- those govern a spectrum this lane is absent from. The
+         * degenerate case is real: with the external beamformer disabled the
+         * bypass emits identity weights [1,0,0,0], and lanes 1-3 were still
+         * driving max_dt, which selects the residual suppressor's floor.
+         *
+         * With a beamformer that actually beamforms, every lane carries
+         * weight somewhere and this skips nothing: the reductions see the
+         * same four lanes they always did, bit for bit. */
+        int lane_contributes = 0;
+        for (k = 0; k < n; ++k) {
+            if (lane_weights[k].r != 0.0f || lane_weights[k].i != 0.0f) {
+                lane_contributes = 1;
+                break;
+            }
+        }
         float delta = fabsf(
             p->snapshots[ch].far_power - base_far_power);
         float scale = 1.0f + fabsf(base_far_power);
         if (delta > 1e-5f * scale) return 0;
-        if (!p->snapshots[ch].filter_converged)
-            *all_converged = 0;
-        if (p->snapshots[ch].dt_indicator > *max_dt)
-            *max_dt = p->snapshots[ch].dt_indicator;
-        if (p->snapshots[ch].saturation_level > *max_saturation)
-            *max_saturation = p->snapshots[ch].saturation_level;
+        if (lane_contributes) {
+            if (!p->snapshots[ch].filter_converged)
+                *all_converged = 0;
+            if (p->snapshots[ch].dt_indicator > *max_dt)
+                *max_dt = p->snapshots[ch].dt_indicator;
+            if (p->snapshots[ch].saturation_level > *max_saturation)
+                *max_saturation = p->snapshots[ch].saturation_level;
+        }
 
         for (k = 0; k < n; ++k) {
             if (!complex_close(

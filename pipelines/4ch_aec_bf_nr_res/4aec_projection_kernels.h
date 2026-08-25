@@ -13,6 +13,9 @@
 
 #include "simd_kernels.h"
 
+#include <float.h>
+#include <math.h>
+
 static inline void four_aec_projection_cmac_scalar(
     Complex* acc, const Complex* weights, const Complex* input, int n) {
     int i;
@@ -87,73 +90,88 @@ static inline void four_aec_complex_mag2(
 }
 #endif
 
-/* Convert each lane's scalar residual power into a phase-bearing complex
- * residual aligned to that lane's estimated echo:
+/* Rebuild the residual-echo PSD as a complex vector carrying the echo
+ * estimate's PHASE and the residual's MAGNITUDE:
  *
- *   residual = echo * sqrt(max(r2, 0) / |echo|^2)
+ *     |out[i]|^2 == max(r2[i], 0)
  *
- * A near-zero echo has no usable phase, so it falls back to +real sqrt(r2),
- * matching the previous implementation.  The ratio form needs one sqrt and
- * one divide instead of two sqrt and two divides per channel/bin.
+ * That identity is the kernel's whole contract -- echo supplies direction
+ * only, and its magnitude divides out. The Python reference spells it as
+ * sqrt(r2) * exp(1j * angle(echo)); the ratio form here is the same thing
+ * without atan2/sincos EXCEPT on the phase floor, which only this side has:
+ * for 0 < |echo|^2 <= phase_floor2 (the mic-path HPF routinely puts the DC
+ * bin there) C pins the result to the +real axis while Python follows
+ * np.angle. That divergence predates the range handling below.
  *
- * 2026-08-04, real-recording repro (pipeline_failed at frame ~2800-3300 on
- * every checked-in grid, scalar AND SIMD, ~20-27s in -- see AEC/NR/Audio_ALG
- * review notes): phase_floor2's original 1e-40 threshold only rules out an
- * echo estimate that is essentially bit-for-bit zero. At the DC bin
- * specifically, the per-lane AEC's echo estimate is routinely pushed to a
- * genuinely tiny (not zero, but e.g. 1e-20-1e-30 range) magnitude by the
- * mic-path HPF suppressing near-DC content -- while r2 (an independently
- * smoothed residual-POWER estimate, not derived from this same echo sample)
- * has no equivalent DC suppression and stays at a normal scale. The old
- * 1e-40 floor let this case through the "has usable phase" branch, so
- * sqrt(r2/mag2) computed a ratio of a normal-scale numerator over a near-
- * hardware-underflow denominator -- a scale factor that grew over many
- * frames (each frame's r2 EMA nudging it further) until squaring it
- * downstream (four_aec_complex_mag2) overflowed float32 to inf, corrupting
- * every stage after it (fused_r2 -> extra_noise -> echo_fraction ->
- * total_gain -> the final synthesized sample).
+ * There is deliberately no fixed upper bound on `scale`. r2 arrives
+ * int16^2-scaled (aec.h) while echo_spec is audio-scaled, so
+ * sqrt(r2/|echo|^2) carries a factor of 32768 unrelated to residual gain. A
+ * bound would make |out| smaller than sqrt(r2) and understate residual echo.
+ * The phase floor handles estimates without useful phase; the overflow
+ * fallback below preserves the same magnitude contract for every finite
+ * float32 input.
  *
- * Fix, two independent guards:
- *   1. phase_floor2 raised to 1e-12 (echo magnitude >= ~1e-6) -- a
- *      genuinely-silent-at-this-bin threshold for float32 audio, several
- *      orders of magnitude above the noise floor of any real signal, so it
- *      does not change behavior anywhere phase information is actually
- *      meaningful.
- *   2. scale is clamped to SCALE_MAX regardless of guard 1 -- proactive
- *      defense in depth against any other combination (e.g. an
- *      unexpectedly large r2) producing the same kind of ratio blowup.
- *      1e4 leaves enormous headroom relative to any legitimate residual
- *      gain while stopping this value's square from ever approaching
- *      float32's overflow range this many multiplications upstream of it.
- */
+ * Neither overflow mode announces itself. power/|echo|^2 saturating yields
+ * inf and poisons every downstream stage; |echo|^2 saturating yields
+ * sqrt(power/inf) == 0, reporting NO residual echo on that bin and quietly
+ * stopping the suppressor -- the same class of failure as bounding `scale`,
+ * just further out. The exceptional path below normalizes the phase vector
+ * before applying the magnitude, which is the reference formulation and
+ * cannot form the overflowing intermediate at all. */
+static inline Complex four_aec_residual_sample(
+    float er, float ei, float raw_r2) {
+    const float phase_floor2 = 1.0e-12f; /* (1e-6)^2 */
+    Complex out;
+    float mag2 = er * er + ei * ei;
+    float power = fmaxf(raw_r2, 0.0f);
+    float ratio, axis, unit_r, unit_i, scale;
+
+    if (!(mag2 > phase_floor2)) {
+        out.r = sqrtf(power);
+        out.i = 0.0f;
+        return out;
+    }
+
+    /* mag2 > phase_floor2 > 0, so the ratio is never 0/0 and can be formed
+     * unconditionally; only its range is in question. */
+    ratio = power / mag2;
+    if (isfinite(mag2) && isfinite(ratio)) {
+        scale = sqrtf(ratio);
+        out.r = er * scale;
+        out.i = ei * scale;
+        return out;
+    }
+
+    /* Exceptional path: scale the phase vector down before combining, so no
+     * intermediate ever leaves float32 range. Dividing by the larger
+     * component puts the sum of squares in [1, 2], which is why a plain
+     * sqrt suffices here where the direct form overflowed. */
+    axis = fmaxf(fabsf(er), fabsf(ei));
+    unit_r = er / axis;
+    unit_i = ei / axis;
+    scale = sqrtf(power) / sqrtf(unit_r * unit_r + unit_i * unit_i);
+    out.r = unit_r * scale;
+    out.i = unit_i * scale;
+    return out;
+}
+
 static inline void four_aec_residual_vector_scalar(
     Complex* out, const Complex* echo, const float* r2, int n) {
-    const float phase_floor2 = 1.0e-12f; /* (1e-6)^2 */
-    const float scale_max = 1.0e4f;
     int i;
     for (i = 0; i < n; ++i) {
-        float er = echo[i].r;
-        float ei = echo[i].i;
-        float mag2 = er * er + ei * ei;
-        float power = fmaxf(r2[i], 0.0f);
-        int has_phase = mag2 > phase_floor2;
-        float denominator = has_phase ? mag2 : 1.0f;
-        float scale = sqrtf(power / denominator);
-        if (scale > scale_max) scale = scale_max;
-        out[i].r = has_phase ? er * scale : scale;
-        out[i].i = has_phase ? ei * scale : 0.0f;
+        out[i] = four_aec_residual_sample(
+            echo[i].r, echo[i].i, r2[i]);
     }
 }
 
 #if SK_HAVE_NEON
 static inline void four_aec_residual_vector(
     Complex* out, const Complex* echo, const float* r2, int n) {
-    /* Must match four_aec_residual_vector_scalar's phase_floor2/scale_max
-     * exactly -- see that function's comment for why -- so SIMD=1 and
-     * SIMD=0 stay byte-identical for finite inputs, per this header's own
-     * documented invariant. */
+    /* Must match four_aec_residual_sample's phase_floor2 exactly -- see that
+     * function's comment for why -- so SIMD=1 and SIMD=0 stay byte-identical
+     * for finite inputs, per this header's own documented invariant. Neither
+     * form bounds `scale`; that comment says why. */
     const float phase_floor2 = 1.0e-12f;
-    const float scale_max = 1.0e4f;
     int i = 0;
     for (; i + 4 <= n; i += 4) {
         float32x4_t zero = vdupq_n_f32(0.0f);
@@ -169,13 +187,44 @@ static inline void four_aec_residual_vector(
             vcgtq_f32(mag2, vdupq_n_f32(phase_floor2));
         float32x4_t denominator = vbslq_f32(has_phase, mag2, one);
         float32x4_t scale = vsqrtq_f32(vdivq_f32(power, denominator));
-        scale = vminq_f32(scale, vdupq_n_f32(scale_max));
         float32x4x2_t residual;
         residual.val[0] = vbslq_f32(
             has_phase, vmulq_f32(e.val[0], scale), scale);
         residual.val[1] = vbslq_f32(
             has_phase, vmulq_f32(e.val[1], scale), zero);
         sk__cquad_store(out + i, residual);
+
+        /* Both overflow modes are visible in values this block already holds,
+         * so detecting them costs no arithmetic: |echo|^2 saturating shows up
+         * in mag2, and power/|echo|^2 saturating shows up as an infinite
+         * scale. Both terms are needed -- the first mode degrades scale to a
+         * perfectly finite zero. Recomputing the test in scalar instead would
+         * make the repair decision depend on the vector and scalar forms
+         * agreeing bit-for-bit, and would have to re-read echo after the
+         * store just above, which is what would forbid an in-place call.
+         *
+         * The reduction is false on every hop of real audio, leaving the
+         * vectorized path exactly as it was. When it does trip, all four
+         * lanes go back through the scalar form: for a lane that did not
+         * overflow it reproduces the stored bytes, which is the same
+         * SIMD/scalar identity the tests already assert. */
+        {
+            const float32x4_t huge = vdupq_n_f32(FLT_MAX);
+            uint32x4_t overflowed = vandq_u32(
+                has_phase,
+                vorrq_u32(vcgtq_f32(mag2, huge), vcgtq_f32(scale, huge)));
+            if (vmaxvq_u32(overflowed)) {
+                float lane_r[4], lane_i[4], lane_power[4];
+                int lane;
+                vst1q_f32(lane_r, e.val[0]);
+                vst1q_f32(lane_i, e.val[1]);
+                vst1q_f32(lane_power, raw_power);
+                for (lane = 0; lane < 4; ++lane) {
+                    out[i + lane] = four_aec_residual_sample(
+                        lane_r[lane], lane_i[lane], lane_power[lane]);
+                }
+            }
+        }
     }
     four_aec_residual_vector_scalar(
         out + i, echo + i, r2 + i, n - i);

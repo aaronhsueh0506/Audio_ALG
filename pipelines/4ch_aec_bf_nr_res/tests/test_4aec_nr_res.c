@@ -10,6 +10,7 @@
 #include "4aec_projection_kernels.h"
 #include "fft_wrapper.h"
 
+#include <float.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -39,6 +40,17 @@ static int all_finite(const float* values, int count) {
 
 static void fill_inputs(float* microphones, float* ref, int hop,
                         int sample_rate, int frame_index);
+
+/* Production-scale seed shared by the two residual-projection blocks: an
+ * audio-domain echo estimate against an int16^2-domain residual PSD. */
+static void seed_residual_inputs(Complex* echo, float* r2, int n) {
+    int b;
+    for (b = 0; b < n; ++b) {
+        echo[b].r = 0.05f * (float)(b - 7);
+        echo[b].i = -0.03f * (float)(b + 1);
+        r2[b] = 6.0e11f * (float)(b + 1);
+    }
+}
 
 static void test_projection_kernels(void) {
     enum { N = 17 };
@@ -97,6 +109,83 @@ static void test_projection_kernels(void) {
               residual_scalar, residual_dispatch,
               sizeof(residual_scalar)) == 0,
           "residual projection SIMD matches scalar bytes");
+
+    /* The kernel's actual contract: |out|^2 == max(r2, 0), with echo
+     * supplying phase only. The byte-equality check above cannot see this --
+     * scalar and SIMD agree just as happily on a wrong magnitude -- and the
+     * magnitudes seeded at the top of this function (r2 ~ 1e-5, echo ~ 1e-3)
+     * are nowhere near production, where r2 arrives int16^2-scaled (~1e11)
+     * against an audio-scaled echo (~1e-2). A bound on the intermediate
+     * sqrt(r2/|echo|^2) is invisible at test magnitudes and clamps most bins
+     * at real ones, so this asserts the identity at the levels that matter. */
+    {
+        Complex prod_echo[N];
+        float prod_r2[N];
+        Complex prod_out[N];
+        int b;
+        seed_residual_inputs(prod_echo, prod_r2, N);
+        prod_echo[0].r = prod_echo[0].i = 0.0f;   /* no-phase fallback */
+        prod_r2[1] = 0.0f;                        /* zero-power bin */
+        four_aec_residual_vector(prod_out, prod_echo, prod_r2, N);
+        for (b = 0; b < N; ++b) {
+            float got = prod_out[b].r * prod_out[b].r
+                      + prod_out[b].i * prod_out[b].i;
+            float want = prod_r2[b] > 0.0f ? prod_r2[b] : 0.0f;
+            float tol = want * 1.0e-5f + 1.0e-6f;
+            CHECK(fabsf(got - want) <= tol,
+                  "residual projection carries r2 as its squared magnitude "
+                  "at production scales");
+        }
+    }
+
+    /* Range safety, exercised where it actually lives. A length below four
+     * falls straight through to the scalar tail, so a scalar-vs-dispatch
+     * memcmp on one element compares the scalar path against itself and the
+     * vectorized repair goes untested. These pathological lanes therefore sit
+     * inside vector blocks (1, 5, 9) and one in the tail (N-1). */
+    {
+        Complex range_echo[N];
+        float range_r2[N];
+        Complex range_scalar[N];
+        Complex range_dispatch[N];
+        int b;
+
+        seed_residual_inputs(range_echo, range_r2, N);
+        /* power / mag2 overflows although the normalized result cannot. */
+        range_echo[1].r = 1.1e-6f;
+        range_echo[1].i = 0.2e-6f;
+        range_r2[1] = FLT_MAX;
+        /* mag2 itself overflows on finite components. */
+        range_echo[5].r = FLT_MAX;
+        range_echo[5].i = FLT_MAX / 2.0f;
+        range_r2[5] = 4.0f;
+        /* Below the phase floor: no usable phase, real-axis fallback. */
+        range_echo[9].r = 1.0e-9f;
+        range_echo[9].i = 0.0f;
+        /* Same overflow in the scalar tail. */
+        range_echo[N - 1].r = 2.0e-6f;
+        range_echo[N - 1].i = -0.5e-6f;
+        range_r2[N - 1] = FLT_MAX;
+
+        four_aec_residual_vector_scalar(
+            range_scalar, range_echo, range_r2, N);
+        four_aec_residual_vector(
+            range_dispatch, range_echo, range_r2, N);
+
+        CHECK(memcmp(range_scalar, range_dispatch,
+                     sizeof(range_scalar)) == 0,
+              "range-safe residual projection SIMD matches scalar bytes");
+        /* Compares |out|, not |out|^2 like the block above: at r2 == FLT_MAX
+         * the squared form overflows inside the assertion itself. An inf or
+         * NaN component fails this compare too, so it doubles as the
+         * finiteness check. */
+        for (b = 0; b < N; ++b) {
+            float want = sqrtf(range_r2[b]);
+            float got = hypotf(range_dispatch[b].r, range_dispatch[b].i);
+            CHECK(fabsf(got - want) <= want * 4.0e-6f,
+                  "range-safe residual projection preserves sqrt(r2)");
+        }
+    }
 
     four_aec_comfort_accumulate_scalar(
         comfort_scalar, weights, comfort, N);
