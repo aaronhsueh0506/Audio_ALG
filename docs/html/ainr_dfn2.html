@@ -168,12 +168,12 @@ C 端 <code>dfn2_model_io_commit_state()</code>／<code>dfn2_model_io_commit_arr
 stacked 形狀 <code>(num_layers, 1, hidden)</code>,與 <code>DFN2ModelIOState</code> 的
 <code>[layers][hidden]</code> 陣列逐一對位,runtime 一個 tensor 綁一塊連續欄位;
 <code>dfn2_model_io.h</code> 綁的就是這個 layout。
-<b>combined = state layout version 6,EXPERIMENTAL、無 C runtime 綁定</b>——三顆併成一個
-<code>h_gru (5,1,256)</code>,input 只剩四個,用來量測「三顆共用一個量化 scale 值多少」
+<b>combined = state layout version 7,EXPERIMENTAL、無 C runtime 綁定</b>——三顆併成一個
+<code>h_gru (1,5,1,256)</code>,input 只剩四個,用來量測「三顆共用一個量化 scale 值多少」
 (<code>inference.py calib</code> 額外輸出 <code>gru_state_slices</code> 報告)。
-<b>version 4 已退役</b>(<code>RETIRED_LAYOUT_VERSIONS</code>);合約測試把
+<b>version 4 與 6 已退役</b>(<code>RETIRED_LAYOUT_VERSIONS</code>);合約測試把
 <code>DFN2_MODEL_IO_LAYOUT_VERSION</code> 同時對退役號碼與 combined 號碼檢查,
-C 端誤 bump 到 4 或 6 會當場失敗。</p>
+C 端誤 bump 到 4、6 或 7 會當場失敗。</p>
 <p class="note">易誤解處:ONNX <b>沒有 stacked GRU op</b>,兩層的 stack 仍展開成兩個 GRU node、
 由 per-layer Slice 餵入——實測兩種 layout <b>都是 5 個 GRU node</b>(1+2+2 層)。
 version 5 換掉的不是 Slice,是 <b>PTQ scale 的粒度</b>:per-GRU 而非 per-layer,

@@ -16,7 +16,7 @@ extern "C" {
  * layer -- ONNX has no stacked GRU op -- so the layers of one stack now
  * share that stack's quantization scale.
  *
- * ⚠ Versions 4 and 6 are TAKEN, not free -- see export_onnx.py's
+ * ⚠ Versions 4, 6 and 7 are TAKEN, not free -- see export_onnx.py's
  * RETIRED_LAYOUT_VERSIONS and COMBINED_STATE_LAYOUT_VERSION, which
  * test_dfn2_contract.py asserts this constant against. Nothing here binds the
  * combined layout, so a board built against this header refuses such a graph:

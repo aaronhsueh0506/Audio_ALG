@@ -131,9 +131,9 @@ way; only the boundary and the published `state_layout_version` differ.
 | layout | version | state inputs | status |
 | --- | --- | --- | --- |
 | `split` (default) | 5 | `h_encoder`, `h_erb`, `h_df`, `df_convp_history` | shipped; `dfn2_model_io.h` binds it |
-| `combined` | 6 | `h_gru` `(5,1,256)`, `df_convp_history` | experimental; no C runtime binds it |
+| `combined` | 7 | `h_gru` `(1,5,1,256)`, `df_convp_history` | experimental; no C runtime binds it |
 
-Version 4 is retired (`RETIRED_LAYOUT_VERSIONS`); the contract test asserts
+Versions 4 and 6 are retired (`RETIRED_LAYOUT_VERSIONS`); the contract test asserts
 `DFN2_MODEL_IO_LAYOUT_VERSION` against both the retired numbers and the
 combined one, so a C-side bump onto either fails a test rather than a review.
 

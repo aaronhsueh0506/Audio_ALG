@@ -62,6 +62,7 @@ from export_onnx import (  # noqa: E402
     StatelessDFN2Heads,
     build_metadata,
     feature_windows,
+    gru_state_slice_report,
     initial_inputs as streaming_export_inputs,
 )
 
@@ -507,7 +508,8 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
                              'DFN2_MODEL_IO_LAYOUT_VERSION')
     assert metadata['state_layout_version'] == header_version
     assert STATE_LAYOUT_VERSION == metadata['state_layout_version']
-    # The header's prose says versions 4 and 6 are taken. Stated as an
+    # The header's prose says versions 4, 6 and the current experimental
+    # combined version are taken. Stated as an
     # assertion so a C-side bump onto one fails here rather than shipping a
     # header that means two different things to two different graphs.
     taken = RETIRED_LAYOUT_VERSIONS | {COMBINED_STATE_LAYOUT_VERSION}
@@ -922,6 +924,7 @@ def test_combined_gru_state_is_the_split_state_stacked_in_struct_order():
     assert combined.state_layout_version != STATE_LAYOUT_VERSION, (
         'a different state layout must not claim the shipped version'
     )
+    assert tuple(combined.initial_inputs()[2].shape) == (1, 5, 1, 32)
 
     frames = 7
     erb = torch.randn(1, 1, frames, model.n_erb)
@@ -951,13 +954,14 @@ def test_combined_gru_state_is_the_split_state_stacked_in_struct_order():
     assert float(combined_state[0].abs().max()) > 0.0
 
     assert len(combined_state) == 2, 'combined state is one GRU tensor + cache'
+    assert tuple(combined_state[0].shape) == (1, 5, 1, 32)
     hidden_count = len(GRU_STATE_NAMES)
-    stacked = torch.cat(split_state[:hidden_count], dim=0)
+    stacked = torch.cat(split_state[:hidden_count], dim=0).unsqueeze(0)
     assert torch.equal(stacked, combined_state[0])
     for name, start, stop in split.gru_state_slices:
         assert torch.equal(
             split_state[GRU_STATE_NAMES.index(name)],
-            combined_state[0][start:stop]
+            combined_state[0][0, start:stop]
         ), '%s landed at the wrong offset' % name
     assert torch.equal(split_state[hidden_count], combined_state[1])
 
@@ -990,6 +994,17 @@ def test_combined_gru_state_reaches_every_gru_through_slices(tmp_path):
     for name in GRU_STATE_NAMES:
         assert name not in declared, 'combined layout must not also declare %s' % name
 
+    def _shape(value_info):
+        return [dim.dim_value
+                for dim in value_info.type.tensor_type.shape.dim]
+
+    h_gru_in = next(value for value in graph.graph.input
+                    if value.name == 'h_gru')
+    h_gru_out = next(value for value in graph.graph.output
+                     if value.name == 'h_gru_out')
+    assert _shape(h_gru_in) == [1, 5, 1, 32]
+    assert _shape(h_gru_out) == [1, 5, 1, 32]
+
     def _reaches_gru(name, depth=0):
         """Walk forward from h_gru to the GRU nodes that consume its slices."""
         found = []
@@ -1016,3 +1031,29 @@ def test_combined_gru_state_reaches_every_gru_through_slices(tmp_path):
         'expected one distinct GRU node per recurrent layer, reached %r'
         % sorted(set(reached))
     )
+
+
+def test_combined_gru_calibration_report_slices_the_layer_axis():
+    """The added graph-batch axis must not shift per-GRU PTQ statistics."""
+    captured = np.zeros((2, 1, 5, 1, 3), dtype=np.float32)
+    captured[:, :, 0:1] = 1.0
+    captured[:, :, 1:3] = 2.0
+    captured[:, :, 3:5] = 3.0
+
+    def stats(value):
+        return {
+            'shape': list(value.shape),
+            'min': float(value.min()),
+            'max': float(value.max()),
+        }
+
+    report = gru_state_slice_report(
+        captured, stats,
+        (('h_encoder', 0, 1), ('h_erb', 1, 3), ('h_df', 3, 5)),
+    )
+    assert report['per_layer']['h_encoder']['shape'] == [2, 1, 1, 1, 3]
+    assert report['per_layer']['h_erb']['shape'] == [2, 1, 2, 1, 3]
+    assert report['per_layer']['h_df']['shape'] == [2, 1, 2, 1, 3]
+    assert report['per_layer']['h_encoder']['max'] == 1.0
+    assert report['per_layer']['h_erb']['max'] == 2.0
+    assert report['per_layer']['h_df']['max'] == 3.0

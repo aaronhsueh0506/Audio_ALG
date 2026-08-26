@@ -32,8 +32,8 @@ differs, and the exported metadata records which layout a file uses.
     into one-layer modules and publishing five tensors; this contract chooses
     the native shape and the exact match to the C struct.
 
-``combined`` (state layout version 6, EXPERIMENTAL -- no C runtime binds it)
-    All three as one ``(5, 1, hidden)`` tensor named ``h_gru``, ordered
+``combined`` (state layout version 7, EXPERIMENTAL -- no C runtime binds it)
+    All three as one ``(1, 5, 1, hidden)`` tensor named ``h_gru``, ordered
     encoder, erb, df -- ``DFN2ModelIOState``'s own memory order, since those
     three arrays are adjacent and equally wide, so a runtime binds the
     combined tensor to the same bytes with no gather.
@@ -101,17 +101,18 @@ INPUT_FRAMES = 3
 STATE_LAYOUT_VERSION = 5
 
 # EXPERIMENTAL, no C implementation: the combined-GRU-state layout below
-# publishes a different state layout, so it must not claim version 5. Version 6
+# publishes a different state layout, so it must not claim version 5. Version 7
 # is reserved for it in dfn2_model_io.h so a later C-side bump cannot take the
 # same number. It exists to measure what a single recurrent tensor costs in PTQ
 # accuracy before the contract is committed to.
-COMBINED_STATE_LAYOUT_VERSION = 6
+COMBINED_STATE_LAYOUT_VERSION = 7
 
 # Numbers no layout may claim again. 4 was the first combined layout, published
-# before the split layout moved to per-GRU tensors; graphs exist that carry it.
+# before the split layout moved to per-GRU tensors; 6 was the combined
+# ``(5,1,hidden)`` layout. Graphs exist that carry both.
 # Stated here rather than only in dfn2_model_io.h's prose so a bump onto one
 # fails a test instead of a review.
-RETIRED_LAYOUT_VERSIONS = frozenset({4})
+RETIRED_LAYOUT_VERSIONS = frozenset({4, 6})
 
 # One entry per GRU, not per layer: each is that GRU's native stacked hidden
 # ``(num_layers, 1, hidden)``, the shape PyTorch and DFN2ModelIOState both
@@ -407,6 +408,12 @@ class StatelessDFN2Heads(nn.Module):
                     'the combined recurrent state requires one hidden width '
                     'for every GRU; got %s' % sorted(widths)
                 )
+            self.combined_gru_state_shape = (
+                1,
+                sum(gru.num_layers for gru in _state_grus(model)),
+                1,
+                widths.pop(),
+            )
 
     @property
     def input_names(self):
@@ -427,11 +434,15 @@ class StatelessDFN2Heads(nn.Module):
     def forward(self, feat_erb_window, feat_spec_window, *state):
         if self.gru_state_layout.combined:
             combined_hidden, df_convp_history = state
+            # The leading dimension is the graph invocation batch. Remove it
+            # before feeding PyTorch's native (layers, batch, hidden) GRU
+            # state; the exported combined ABI is (1, layers, 1, hidden).
+            native_hidden = combined_hidden.squeeze(0)
             # One Slice per GRU off the shared input, in GRU_STATE_NAMES
             # order. Views, not copies: each still arrives at its own GRU node
             # carrying that GRU's whole stack.
             encoder_gru_hidden, erb_gru_hidden, df_gru_hidden = (
-                combined_hidden[start:stop]
+                native_hidden[start:stop]
                 for _name, start, stop in self.gru_state_slices
             )
         else:
@@ -490,8 +501,12 @@ class StatelessDFN2Heads(nn.Module):
         heads = (erb_mask, coefficients, alpha)
         if self.gru_state_layout.combined:
             # Concatenated in the same order the input was sliced, which is
-            # also DFN2ModelIOState's memory order.
-            return heads + (torch.cat(hidden_next, dim=0), pathway_history_next)
+            # also DFN2ModelIOState's memory order. Restore the graph batch
+            # dimension at the boundary.
+            combined_next = torch.cat(hidden_next, dim=0).reshape(
+                self.combined_gru_state_shape
+            )
+            return heads + (combined_next, pathway_history_next)
         return heads + hidden_next + (pathway_history_next,)
 
 
@@ -532,7 +547,7 @@ def initial_inputs(model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
     pathway_history = model.df_dec.df_convp.conv.kernel_size[0] - 1
     hidden = _split_hidden_inputs(model)
     if resolve_gru_state_layout(gru_state_layout).combined:
-        hidden = (torch.cat(hidden, dim=0),)
+        hidden = (torch.cat(hidden, dim=0).unsqueeze(0),)
     return (
         torch.randn(1, 1, INPUT_FRAMES, model.n_erb),
         torch.randn(1, 2, INPUT_FRAMES, model.df_bins),
@@ -544,7 +559,8 @@ def initial_inputs(model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
 def gru_state_slice_report(combined, stats, slices):
     """What one shared PTQ scale costs each GRU of a combined state tensor.
 
-    ``combined`` is the captured (frames, layers, batch, hidden) array,
+    ``combined`` is the captured
+    ``(frames, graph_batch, layers, gru_batch, hidden)`` array,
     ``stats`` produces one per-tensor range dict and ``slices`` comes from
     ``gru_state_slices``, so the per-slice entries are the same shape the
     calibration report publishes for every other input -- in the split layout
@@ -562,7 +578,7 @@ def gru_state_slice_report(combined, stats, slices):
     """
     per_layer = {}
     for name, start, stop in slices:
-        entry = stats(combined[:, start:stop])
+        entry = stats(combined[:, :, start:stop])
         # max-abs from the range already computed, not a second pass.
         entry['max_abs'] = max(abs(entry['min']), abs(entry['max']))
         per_layer[name] = entry
@@ -700,8 +716,8 @@ def main():
         help="'split' (default, layout version %d, the shipped contract) "
              "exports one tensor per GRU in its native stacked shape; "
              "'combined' (EXPERIMENTAL, layout version %d, no C runtime "
-             "binds it) exports all three as one (5,1,hidden) tensor, so the "
-             "three then share one quantization scale. See the module "
+             "binds it) exports all three as one (1,5,1,hidden) tensor, "
+             "so the three share one quantization scale. See the module "
              "docstring for the trade."
              % (STATE_LAYOUT_VERSION, COMBINED_STATE_LAYOUT_VERSION))
     args = parser.parse_args()
