@@ -3126,6 +3126,152 @@ static void test_comfort_noise_contract(void) {
     four_aec_nr_res_destroy(p_off);
 }
 
+/* ---------------------------------------------------------------------------
+ * Pool placement invariance
+ *
+ * Everything this module owns is carved out of one caller-supplied block, so
+ * where that block sits, and what surrounds it, must not reach the audio. Two
+ * independent ways it could:
+ *
+ *   - a consumer reading past the end of its own carve, or past the end of
+ *     the pool, picks up whatever the neighbouring bytes happen to hold;
+ *   - a decision taken on a pointer VALUE rather than on the samples behind
+ *     it turns the carve base into an input.
+ *
+ * A uniform shift of every carve -- a control block that grows, a board
+ * moving the pool -- looks identical to correct behaviour when a build is
+ * only ever compared against itself, so this drives ONE build four times with
+ * the pool at four different 16-aligned bases inside a larger block, and with
+ * the bytes on both sides of it set to a different filler each time.
+ * Byte-equal output across all four is the whole assertion; the filler check
+ * afterwards is the write-side half of the same property, measured over the
+ * processing run rather than over init alone.
+ * ------------------------------------------------------------------------ */
+
+#define POOL_PLACEMENT_GUARD  4096u
+#define POOL_PLACEMENT_FRAMES 64
+
+static void test_pool_placement_invariance(int sample_rate, int fft_size) {
+    /* 16-aligned (the published alignment) but deliberately not all congruent
+     * modulo 32 or 64: a kernel quietly depending on a wider alignment than
+     * the descriptor promises separates these. */
+    static const size_t bases[] = { 0u, 16u, 32u, 48u };
+    static const int fillers[] = { 0xa5, 0x5a, 0x00, 0xff };
+    const int placements = (int)(sizeof(bases) / sizeof(bases[0]));
+    FourAecNrResConfig cfg;
+    FourAecNrResMemReq req;
+    float* reference = NULL;
+    float* current = NULL;
+    float* microphones = NULL;
+    float* ref = NULL;
+    float* out = NULL;
+    Complex* weights = NULL;
+    size_t stream_bytes = 0;
+    int hop = 0;
+    int n_freqs = 0;
+    int placement;
+    int built = 0;
+    int streamed = 0;
+    int identical = 1;
+    int guards_intact = 1;
+
+    cfg = four_aec_nr_res_default_config(sample_rate);
+    cfg.fft_size = fft_size;
+    if (four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0 ||
+        req.bytes > (uint64_t)SIZE_MAX) {
+        CHECK(0, "pool placement memory requirement query succeeds");
+        return;
+    }
+
+    for (placement = 0; placement < placements; ++placement) {
+        size_t lead = POOL_PLACEMENT_GUARD + bases[placement];
+        size_t block_bytes = lead + (size_t)req.bytes + POOL_PLACEMENT_GUARD;
+        unsigned char* block = NULL;
+        unsigned char* pool;
+        FourAecNrRes* p;
+        FourAecNrResPreFrame pre;
+        float* destination;
+        size_t i;
+        int frame;
+
+        if (posix_memalign(
+                (void**)&block, (size_t)req.alignment, block_bytes) != 0)
+            break;
+        memset(block, fillers[placement], block_bytes);
+        pool = block + lead;
+
+        p = four_aec_nr_res_init_ex(pool, (size_t)req.bytes, &cfg, &req);
+        if (!p) { free(block); break; }
+        built += 1;
+
+        if (built == 1) {
+            hop = four_aec_nr_res_hop_size(p);
+            n_freqs = four_aec_nr_res_n_freqs(p);
+            stream_bytes = (size_t)POOL_PLACEMENT_FRAMES * (size_t)hop *
+                           sizeof(float);
+            reference = (float*)malloc(stream_bytes);
+            current = (float*)malloc(stream_bytes);
+            microphones = (float*)calloc(
+                (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+            ref = (float*)calloc((size_t)hop, sizeof(float));
+            out = (float*)calloc((size_t)hop, sizeof(float));
+            weights = (Complex*)calloc(
+                (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
+            CHECK(reference && current && microphones && ref && out && weights,
+                  "pool placement buffers allocate");
+            if (!reference || !current || !microphones || !ref || !out ||
+                !weights) {
+                four_aec_nr_res_destroy(p);
+                free(block);
+                break;
+            }
+            for (i = 0; i < (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs; ++i)
+                weights[i].r = 0.25f;
+        }
+
+        destination = (built == 1) ? reference : current;
+        for (frame = 0; frame < POOL_PLACEMENT_FRAMES; ++frame) {
+            fill_inputs(microphones, ref, hop, sample_rate, frame);
+            if (four_aec_nr_res_process_pre(
+                    p, microphones, ref, &pre) != FOUR_AEC_NR_RES_OK ||
+                four_aec_nr_res_process_post(
+                    p, &pre.token, weights, out) != FOUR_AEC_NR_RES_OK)
+                break;
+            memcpy(destination + (size_t)frame * hop, out,
+                   (size_t)hop * sizeof(float));
+        }
+        if (frame == POOL_PLACEMENT_FRAMES) streamed += 1;
+
+        for (i = 0; i < lead; ++i)
+            if (block[i] != (unsigned char)fillers[placement])
+                guards_intact = 0;
+        for (i = lead + (size_t)req.bytes; i < block_bytes; ++i)
+            if (block[i] != (unsigned char)fillers[placement])
+                guards_intact = 0;
+
+        if (built > 1 && memcmp(reference, current, stream_bytes) != 0)
+            identical = 0;
+
+        four_aec_nr_res_destroy(p);
+        free(block);
+    }
+
+    CHECK(built == placements && streamed == placements,
+          "every shifted pool base constructs and streams");
+    CHECK(streamed == placements && identical,
+          "output is byte-identical across four pool bases surrounded by "
+          "four different fillers");
+    CHECK(streamed == placements && guards_intact,
+          "processing writes nothing outside the queried pool");
+
+    free(weights);
+    free(out);
+    free(ref);
+    free(microphones);
+    free(current);
+    free(reference);
+}
+
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
@@ -3138,6 +3284,9 @@ int main(void) {
     run_static_parity(16000, 256);
     run_static_parity(16000, 512);
     run_static_parity(48000, 1024);
+    test_pool_placement_invariance(16000, 256);
+    test_pool_placement_invariance(16000, 512);
+    test_pool_placement_invariance(48000, 1024);
     test_pre_frame_wola_identity(16000, 256);
     test_pre_frame_wola_identity(16000, 512);
     test_pre_frame_wola_identity(48000, 1024);
