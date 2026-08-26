@@ -67,10 +67,24 @@
  * The divisor and the two floors -- one hop of hold, and a period of at
  * least 2 so "decimated" always means something -- stay literals for the
  * same reason they are literals in lib/aec: they are the SHAPE of the
- * schedule, not a tuning surface, and neither library exposes them. The ERLE
- * watchdog's leak and collapse figures are lib/aec's own literals likewise. */
+ * schedule, not a tuning surface, and neither library exposes them. So does
+ * the watchdog's collapse figure: it is a depth in dB and carries no clock.
+ *
+ * The watchdog's LEAK does carry one, and is the only number here that is not
+ * used as written. It is lib/aec's literal, and lib/aec calibrated it on the
+ * 10 ms hop its config defaulted to when the watchdog was written: 0.001 dB
+ * per hop there means 0.1 dB per SECOND, i.e. 60 s to leak the whole
+ * DUTY_ERLE_COLLAPSE_DB threshold. Applied as a per-hop literal it would be
+ * 0.125 dB/s on this pipeline's 8 ms grid and 0.0625 dB/s on its 16 ms one --
+ * the watchdog would disengage the schedule on a merely quiet stretch at one
+ * grid and sit on a stale peak at the other. duty_leak_db_for_grid() converts
+ * it once at init, beside the two windows and for the same reason, by the
+ * rule an ADDITIVE per-hop amount takes: it scales LINEARLY with the hop
+ * period, where a retention would take a power law -- N hops of a leak sum to
+ * N*leak, they do not compound. */
 #define DUTY_PERIOD_DIVISOR       5
-#define DUTY_ERLE_LEAK_DB         0.001f
+#define DUTY_ERLE_LEAK_DB         0.001f   /* per hop AT DUTY_LEAK_REF_HOP_S */
+#define DUTY_LEAK_REF_HOP_S       0.010f
 #define DUTY_ERLE_COLLAPSE_DB     6.0f
 
 /* Same compile-time backend identity used by audio_pipeline.c. */
@@ -274,6 +288,10 @@ struct FourAecNrRes {
      * watches -- see update_shared_delay()); the two window figures are
      * converted from seconds once at init, where lib/aec converts them per
      * hop from its config, and hold the same values on the same grid.
+     * duty_erle_leak_db is that peak's per-hop decay, converted at init from
+     * the same 0.1 dB/s the lib calibrated (see DUTY_ERLE_LEAK_DB); it sits
+     * here rather than beside the windows above because the tail padding
+     * ahead of the counter absorbs it and the control block does not grow.
      *
      * duty_hops_run is the engagement half of the census, counted at the one
      * site that consumes the decision so it cannot drift from what ran;
@@ -287,6 +305,7 @@ struct FourAecNrRes {
     float duty_erle_peak;
     int duty_hold_hops;
     int duty_period_hops;
+    float duty_erle_leak_db;
     unsigned long long duty_hops_run;
 };
 
@@ -294,6 +313,24 @@ typedef struct PoolCursor {
     uint8_t* ptr;
     size_t remaining;
 } PoolCursor;
+
+/* The watchdog leak in this grid's own per-hop units -- see the
+ * DUTY_ERLE_LEAK_DB banner for why it is the one duty constant that is
+ * converted rather than used as written.
+ *
+ * Exact at the calibration grid, by construction rather than by rounding:
+ * hop 160 at 16 kHz makes hop_s the same float DUTY_LEAK_REF_HOP_S is, so
+ * the ratio is exactly 1.0f and the authored 0.001f comes back bit-for-bit.
+ * That grid is not one this pipeline builds (its three are 8 / 16 / 10.667 ms),
+ * which is why four_aec_nr_res_duty_leak_db_for_grid() exposes this for a
+ * test to call at the reference directly. Both stacks pin -ffp-contract=off
+ * and reject -ffast-math, so x/x == 1.0f holds. */
+static float duty_leak_db_for_grid(int hop_size, int sample_rate) {
+    float hop_s;
+    if (hop_size <= 0 || sample_rate <= 0) return DUTY_ERLE_LEAK_DB;
+    hop_s = (float)hop_size / (float)sample_rate;
+    return DUTY_ERLE_LEAK_DB * (hop_s / DUTY_LEAK_REF_HOP_S);
+}
 
 /* ============================================================================
  * Config -> module configs + frame dimensions
@@ -854,6 +891,8 @@ FourAecNrRes* four_aec_nr_res_init_ex(
                          DUTY_PERIOD_DIVISOR;
             p->duty_hold_hops = hold < 1 ? 1 : hold;
             p->duty_period_hops = period < 2 ? 2 : period;
+            p->duty_erle_leak_db =
+                duty_leak_db_for_grid(hop, cfg_copy.sample_rate);
         }
         p->duty_last_delay = -1;   /* the rest is zeroed by the pool memset */
     }
@@ -1160,11 +1199,12 @@ static FourAecNrResDelayState update_shared_delay(
         /* Cancellation watchdog: a leaky peak of the lanes' windowed ERLE,
          * with full-rate analysis resumed on a DUTY_ERLE_COLLAPSE_DB drop
          * from it. Armed only once the peak clears that same figure, so it
-         * cannot fire before any lane ever converged. Same shape, same two
-         * numbers as lib/aec's. */
+         * cannot fire before any lane ever converged. Same shape and same
+         * collapse depth as lib/aec's; the leak is the same 0.1 dB/s, carried
+         * in this grid's per-hop units by duty_erle_leak_db. */
         float erle = max_lane_erle_windowed(p);
         if (erle > p->duty_erle_peak) p->duty_erle_peak = erle;
-        else p->duty_erle_peak -= DUTY_ERLE_LEAK_DB;
+        else p->duty_erle_peak -= p->duty_erle_leak_db;
         if (p->duty_erle_peak > DUTY_ERLE_COLLAPSE_DB &&
             erle < p->duty_erle_peak - DUTY_ERLE_COLLAPSE_DB) {
             p->duty_active = 0;
@@ -2268,6 +2308,20 @@ int four_aec_nr_res_far_spec_provenance(const FourAecNrRes* p) {
 void four_aec_nr_res_pin_duty_full_rate(FourAecNrRes* p) {
     if (!p || p->destroyed) return;
     p->duty_period_hops = 1;
+}
+
+float four_aec_nr_res_duty_leak_db_for_grid(int hop_size, int sample_rate) {
+    return duty_leak_db_for_grid(hop_size, sample_rate);
+}
+
+float four_aec_nr_res_duty_erle_leak_db(const FourAecNrRes* p) {
+    if (!p || p->destroyed) return 0.0f;
+    return p->duty_erle_leak_db;
+}
+
+float four_aec_nr_res_duty_erle_peak(const FourAecNrRes* p) {
+    if (!p || p->destroyed) return 0.0f;
+    return p->duty_erle_peak;
 }
 
 int four_aec_nr_res_pending_delay_candidate(const FourAecNrRes* p) {

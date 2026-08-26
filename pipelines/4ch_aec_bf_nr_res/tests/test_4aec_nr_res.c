@@ -2132,6 +2132,13 @@ typedef struct DutyRun {
     int hops_after_change;
     int reacquire_hop;
     int reacquire_delay;
+    /* Watchdog leak, reconstructed from the peak trajectory: hops on which
+     * the peak decayed, and how many of those decayed by anything other than
+     * the converted per-hop amount the core stored. A leak that is converted
+     * correctly and then not USED leaves every value-level assertion green,
+     * so this is the half that holds the branch. */
+    int leak_hops;
+    int leak_mismatches;
 } DutyRun;
 
 /* One 16 kHz/hop-256 MATCHED scene through the shared estimator, reporting
@@ -2157,6 +2164,8 @@ static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
     out->reacquire_hop = -1;
     out->reacquire_delay = -1;
     out->first_full_rate_hop = -1;
+    out->leak_hops = 0;
+    out->leak_mismatches = 0;
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
     cfg.enable_cng = 0;
@@ -2173,11 +2182,31 @@ static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
         int dominant = (shift_at >= 0 && hop >= shift_at) ? delay_b : delay_a;
         unsigned long long total_now, run_now;
         int analysed;
+        float peak_before = four_aec_nr_res_duty_erle_peak(p);
         realign_scene_hop(far_hist, base, DU_HOP, dominant, 0.0f, delay_b,
                           mic, far);
         if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
             FOUR_AEC_NR_RES_OK) break;
         out->hops_seen += 1;
+
+        /* The watchdog's steady decay branch, reconstructed. A DECREASE is
+         * the branch's signature -- arming jumps the peak to the current lane
+         * ERLE and a rise re-seeds it from the same -- with one other way
+         * down: a trip zeroes it outright, which is excluded by its own
+         * value rather than by a threshold (measured on the moved scene:
+         * 15.50 -> 0 at hop 312, the one hop this scene's watchdog fires).
+         * Compared with == because it is the identical float subtraction, so
+         * anything else means the branch subtracted a different number than
+         * the core converted. */
+        {
+            float peak_after = four_aec_nr_res_duty_erle_peak(p);
+            if (peak_after < peak_before && peak_after != 0.0f) {
+                out->leak_hops += 1;
+                if (peak_after != peak_before -
+                        four_aec_nr_res_duty_erle_leak_db(p))
+                    out->leak_mismatches += 1;
+            }
+        }
 
         total_now = four_aec_nr_res_duty_hops_total(p);
         run_now = four_aec_nr_res_duty_hops_run(p);
@@ -2320,6 +2349,28 @@ static void test_duty_cycle_machine(void) {
           moved.census_total_mismatch == 0 &&
           moved.updates_on_skipped_hop == 0, label);
 
+    /* The watchdog subtracts the CONVERTED leak, not the authored per-hop
+     * literal. test_duty_watchdog_leak_is_a_rate pins the value the core
+     * STORES; this is the other half -- that the branch READS it -- and it is
+     * the only assertion in the file that a use site reverted to
+     * DUTY_ERLE_LEAK_DB turns red.
+     *
+     * The MOVED scene is where the decay lives. The static one never reaches
+     * the branch at all: its lanes converge monotonically, so the peak is
+     * re-seeded from a rising ERLE on every armed hop and never decays --
+     * which is why coverage is asserted on the moved scene only, and stated
+     * rather than left to look like an oversight. */
+    snprintf(label, sizeof(label),
+             "the watchdog subtracts the converted leak on every decay hop "
+             "(%d decay hops, %d subtracted something else; static scene "
+             "never decays: %d)",
+             moved.leak_hops, moved.leak_mismatches, stable.leak_hops);
+    CHECK(moved.leak_mismatches == 0 && stable.leak_mismatches == 0, label);
+    snprintf(label, sizeof(label),
+             "and the decay branch was actually reached (%d hops)",
+             moved.leak_hops);
+    CHECK(moved.leak_hops > 0, label);
+
     /* Only MATCHED builds a matched filter, so only MATCHED has a cost to
      * decimate: the other two modes must leave both counters at 0 rather
      * than reporting a saving on a machine that was never built. */
@@ -2408,6 +2459,124 @@ static void test_duty_cycle_machine(void) {
             four_aec_nr_res_destroy(p);
         }
     }
+}
+
+/* ============================================================================
+ * The watchdog leak is a RATE, not a per-hop amount
+ *
+ * The duty machine's two windows are converted from seconds at init. Its
+ * collapse depth needs no conversion -- it is dB. Its LEAK does: 0.001 dB per
+ * hop is 0.1 dB per SECOND only on the 10 ms hop lib/aec calibrated it on,
+ * and this pipeline builds no such grid. Used as a literal it would be
+ * 0.125 dB/s at 16 kHz/256 and 0.0625 dB/s at 16 kHz/512 -- the watchdog
+ * disengaging the schedule on a quiet stretch at one grid and sitting on a
+ * stale peak at the other.
+ *
+ * Asserted as the rate, at all three grids the pipeline ships, so the target
+ * is one number rather than three. None of the three IS the calibration grid
+ * (8 / 16 / 10.667 ms hops), so there is no row where "converted" and "left
+ * as the literal" agree: reverting the conversion turns all three red.
+ *
+ * The calibration grid itself cannot be built here -- hop 160 at 16 kHz is a
+ * 320-sample frame this pipeline does not accept -- so the identity that
+ * makes this a retime rather than a retune is asserted against the pure
+ * conversion, bit-for-bit, and the per-grid rows tie what the core actually
+ * stored back to that same conversion.
+ * ========================================================================== */
+/* The authored per-hop amount, restated here because the core keeps it
+ * file-local -- same reason LE_ERLE_COLLAPSE_DB is restated further down. A
+ * divergence makes this test's premise false rather than its assertions
+ * wrong, which is why the per-grid rows below also tie back to the core's own
+ * conversion. */
+#define DUTY_LEAK_AUTHORED_PER_HOP 0.001f
+
+static void test_duty_watchdog_leak_is_a_rate(void) {
+    static const struct { int sample_rate; int fft_size; } grids[] = {
+        { 16000, 256 }, { 16000, 512 }, { 48000, 1024 }
+    };
+    const float target_db_per_s = 0.1f;
+    char label[192];
+    size_t g;
+
+    for (g = 0; g < sizeof(grids) / sizeof(grids[0]); ++g) {
+        FourAecNrResConfig cfg =
+            four_aec_nr_res_default_config(grids[g].sample_rate);
+        FourAecNrRes* p;
+        float leak;
+        double per_s;
+        int hop;
+
+        cfg.fft_size = grids[g].fft_size;
+        p = four_aec_nr_res_create(&cfg);
+        snprintf(label, sizeof(label),
+                 "watchdog leak: core creates at %d Hz / fft %d",
+                 grids[g].sample_rate, grids[g].fft_size);
+        CHECK(p != NULL, label);
+        if (!p) continue;
+
+        hop = four_aec_nr_res_hop_size(p);
+        leak = four_aec_nr_res_duty_erle_leak_db(p);
+        per_s = (double)leak * grids[g].sample_rate / hop;
+
+        snprintf(label, sizeof(label),
+                 "watchdog leak: %d Hz / fft %d leaks %.9g dB per hop = "
+                 "%.6f dB/s (calibrated 0.100000)",
+                 grids[g].sample_rate, grids[g].fft_size, (double)leak, per_s);
+        CHECK(fabs(per_s - (double)target_db_per_s) <= 1e-6, label);
+
+        /* No shipped grid is the calibration grid, so every row must have
+         * moved off the authored literal -- this is the assertion a reverted
+         * conversion fails, on all three rows. */
+        snprintf(label, sizeof(label),
+                 "watchdog leak: %d Hz / fft %d moved off the 10 ms literal "
+                 "(%.9g != 0.001)",
+                 grids[g].sample_rate, grids[g].fft_size, (double)leak);
+        CHECK(leak != DUTY_LEAK_AUTHORED_PER_HOP, label);
+
+        /* And what init stored is the conversion's own answer for this grid,
+         * so the two cannot drift apart. */
+        snprintf(label, sizeof(label),
+                 "watchdog leak: %d Hz / fft %d stored the conversion's own "
+                 "answer", grids[g].sample_rate, grids[g].fft_size);
+        CHECK(leak == four_aec_nr_res_duty_leak_db_for_grid(
+                          hop, grids[g].sample_rate), label);
+
+        four_aec_nr_res_destroy(p);
+    }
+
+    /* The calibration point. Bit-exact, not within a tolerance: one ulp of
+     * drift here would mean the 10 ms grid's behaviour had been rewritten
+     * rather than preserved, which is the difference between a retime and a
+     * retune. */
+    snprintf(label, sizeof(label),
+             "watchdog leak: the conversion is the identity at the "
+             "calibration grid (hop 160 @ 16 kHz -> %.9g)",
+             (double)four_aec_nr_res_duty_leak_db_for_grid(160, 16000));
+    CHECK(four_aec_nr_res_duty_leak_db_for_grid(160, 16000) ==
+              DUTY_LEAK_AUTHORED_PER_HOP, label);
+
+    /* LINEAR in the hop period, which is the whole reason this is its own
+     * conversion and not the power law a retention takes: doubling the hop
+     * doubles the leak, exactly. A power-law conversion reproduces the
+     * calibration point above and fails here. Asserted with == because the
+     * two hop periods differ by a power of two, so the quotients do too and
+     * neither rounds. */
+    snprintf(label, sizeof(label),
+             "watchdog leak: doubling the hop doubles the leak exactly "
+             "(%.9g -> %.9g)",
+             (double)four_aec_nr_res_duty_leak_db_for_grid(128, 16000),
+             (double)four_aec_nr_res_duty_leak_db_for_grid(256, 16000));
+    CHECK(four_aec_nr_res_duty_leak_db_for_grid(256, 16000) ==
+              2.0f * four_aec_nr_res_duty_leak_db_for_grid(128, 16000), label);
+
+    /* Degenerate grid: fall back to the authored per-hop amount ("not
+     * converted") rather than dividing by zero. */
+    CHECK(four_aec_nr_res_duty_leak_db_for_grid(0, 16000) ==
+              DUTY_LEAK_AUTHORED_PER_HOP &&
+          four_aec_nr_res_duty_leak_db_for_grid(160, 0) ==
+              DUTY_LEAK_AUTHORED_PER_HOP,
+          "watchdog leak: a non-positive grid falls back to the authored "
+          "per-hop amount");
 }
 
 /* ============================================================================
@@ -3300,6 +3469,7 @@ int main(void) {
     test_shared_delay_change_admission();
     test_delay_change_candidate_ttl();
     test_duty_cycle_machine();
+    test_duty_watchdog_leak_is_a_rate();
     test_duty_low_erle_delay_change();
     test_far_spec_provenance_guard();
     test_runtime_strength();

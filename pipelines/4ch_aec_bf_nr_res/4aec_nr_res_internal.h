@@ -101,4 +101,43 @@ int four_aec_nr_res_far_spec_provenance(const FourAecNrRes* p);
  * harness, not of the alignment generation the reset abandons. */
 void four_aec_nr_res_pin_duty_full_rate(FourAecNrRes* p);
 
+/* ============================================================================
+ * Watchdog leak, and the conversion behind it
+ *
+ * The leak is the duty machine's only wall-clock RATE: 0.1 dB per second,
+ * carried in whatever per-hop amount this core's grid makes that. Three
+ * seams, because the claim has three parts and no one of them implies the
+ * others. All read-only; nothing in the signal path calls any of them.
+ *
+ * _for_grid() is the conversion itself, pure, so a test can evaluate it at
+ * the grid the constant was CALIBRATED on -- hop 160 at 16 kHz, where it must
+ * return the authored literal bit-for-bit or the retime is a rewrite. That
+ * grid has a 320-sample frame, which this pipeline does not build, so no
+ * core can be constructed carrying that value and no reader can observe it.
+ *
+ * _duty_erle_leak_db() is what the core actually stored at init, so a test
+ * can hold the shipped path to the conversion rather than to a restatement
+ * of it.
+ *
+ * _duty_erle_peak() is the state the watchdog applies it to, so a test can
+ * prove the branch READS the stored value -- the part neither of the other
+ * two can see.
+ * ========================================================================== */
+
+/* The per-hop leak the given grid implies. Falls back to the authored
+ * per-hop literal on a non-positive grid ("not converted"), rather than
+ * dividing by zero. */
+float four_aec_nr_res_duty_leak_db_for_grid(int hop_size, int sample_rate);
+
+/* The value this core converted for its own grid at init. 0.0f on NULL or a
+ * destroyed core. */
+float four_aec_nr_res_duty_erle_leak_db(const FourAecNrRes* p);
+
+/* The leaky peak itself, so a test can reconstruct the subtraction from the
+ * trajectory. Without it a correct leak can sit in the control block while
+ * the branch that is supposed to apply it keeps subtracting the raw literal,
+ * and every value-level assertion stays green. 0.0f on NULL or a destroyed
+ * core. */
+float four_aec_nr_res_duty_erle_peak(const FourAecNrRes* p);
+
 #endif /* FOUR_AEC_NR_RES_INTERNAL_H */
