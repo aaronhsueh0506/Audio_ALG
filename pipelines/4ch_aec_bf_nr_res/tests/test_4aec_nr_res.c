@@ -3441,6 +3441,101 @@ static void test_pool_placement_invariance(int sample_rate, int fft_size) {
     free(reference);
 }
 
+/* four_aec_nr_res_reset() has the same contract the mono wrapper's header
+ * spells out: the instance it leaves behind must be the one a fresh
+ * four_aec_nr_res_init() on the same pool/cfg would have produced. It could
+ * not be, until the AEC's own aec_reset() stopped carrying a converged
+ * filter's startup gates and Kalman H_error across the call -- the first
+ * post-reset hop of all four lanes differed from a never-warmed twin.
+ *
+ * Warmed on a different stretch of the scene than the one compared, so what
+ * the subject remembers is wrong for what follows. Run with CNG both ON and
+ * OFF: reset re-seeds the comfort-noise generator, so the CNG path is
+ * compared for real rather than excused. */
+static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
+                                             int enable_cng) {
+    enum { WARM = 400, WARM_OFFSET = 100000, COMPARE = 200 };
+    FourAecNrResConfig cfg;
+    FourAecNrRes* fresh;
+    FourAecNrRes* warmed;
+    float* mics;
+    float* far;
+    float* out_a;
+    float* out_b;
+    Complex* w;
+    long differing = 0;
+    int first_bad = -1;
+    int hop, n_freqs, h, ch, k, ok = 1;
+
+    cfg = four_aec_nr_res_default_config(sample_rate);
+    cfg.fft_size = fft_size;
+    cfg.enable_cng = enable_cng;
+    fresh = four_aec_nr_res_create(&cfg);
+    warmed = four_aec_nr_res_create(&cfg);
+    CHECK(fresh != NULL && warmed != NULL, "reset parity: both cores create");
+    if (!fresh || !warmed) {
+        four_aec_nr_res_destroy(fresh);
+        four_aec_nr_res_destroy(warmed);
+        return;
+    }
+
+    hop = four_aec_nr_res_hop_size(fresh);
+    n_freqs = four_aec_nr_res_n_freqs(fresh);
+    mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out_a = (float*)calloc((size_t)hop, sizeof(float));
+    out_b = (float*)calloc((size_t)hop, sizeof(float));
+    w = (Complex*)calloc((size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n_freqs,
+                         sizeof(Complex));
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+        for (k = 0; k < n_freqs; ++k)
+            w[(size_t)ch * (size_t)n_freqs + (size_t)k].r = 0.25f;
+
+    for (h = 0; h < WARM && ok; ++h) {
+        FourAecNrResPreFrame pre;
+        fill_inputs(mics, far, hop, sample_rate, WARM_OFFSET + h);
+        if (four_aec_nr_res_process_pre(warmed, mics, far, &pre) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_post(warmed, &pre.token, w, out_b) !=
+                FOUR_AEC_NR_RES_OK)
+            ok = 0;
+    }
+    CHECK(ok, "reset parity: the warm phase runs to completion");
+    four_aec_nr_res_reset(warmed);
+
+    for (h = 0; h < COMPARE && ok; ++h) {
+        FourAecNrResPreFrame pre_a;
+        FourAecNrResPreFrame pre_b;
+        fill_inputs(mics, far, hop, sample_rate, h);
+        if (four_aec_nr_res_process_pre(fresh, mics, far, &pre_a) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_post(fresh, &pre_a.token, w, out_a) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_pre(warmed, mics, far, &pre_b) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_post(warmed, &pre_b.token, w, out_b) !=
+                FOUR_AEC_NR_RES_OK) {
+            ok = 0;
+            break;
+        }
+        if (memcmp(out_a, out_b, (size_t)hop * sizeof(float)) != 0) {
+            differing++;
+            if (first_bad < 0) first_bad = h;
+        }
+    }
+    CHECK(ok, "reset parity: the compare phase runs to completion");
+    if (differing != 0)
+        printf("  reset parity @ %d Hz/%d cng=%d: %ld of %d hops differ, "
+               "first at %d\n",
+               sample_rate, fft_size, enable_cng, differing, COMPARE, first_bad);
+    CHECK(differing == 0,
+          "four_aec_nr_res_reset leaves a core byte-identical to a fresh one");
+
+    free(mics); free(far); free(out_a); free(out_b); free(w);
+    four_aec_nr_res_destroy(fresh);
+    four_aec_nr_res_destroy(warmed);
+}
+
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
@@ -3475,6 +3570,10 @@ int main(void) {
     test_runtime_strength();
     test_stage_timing();
     test_comfort_noise_contract();
+    test_reset_equals_fresh_instance(16000, 256, 1);
+    test_reset_equals_fresh_instance(16000, 256, 0);
+    test_reset_equals_fresh_instance(16000, 512, 1);
+    test_reset_equals_fresh_instance(48000, 1024, 1);
 
     if (failures) {
         printf("%d test(s) failed\n", failures);

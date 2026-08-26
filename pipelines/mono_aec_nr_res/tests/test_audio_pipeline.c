@@ -273,6 +273,113 @@ static void test_create_vs_init_parity(int sr, int fft_size, int hop_count) {
     free(pool);
 }
 
+/* An echo path a warm run can converge on and the delay estimator can lock
+ * onto, kept separate from run_hops(): that one deliberately re-seeds the LCG
+ * per call so two instances see identical bytes, which is the wrong shape for
+ * a run that has to CONTINUE past a reset. `hist` carries the far tail across
+ * hops so the delay is real rather than a per-hop wrap. */
+static void reset_scene_hop(unsigned int* rng, float* mic, float* ref, int hop,
+                            int h, float* hist, int hist_len,
+                            int delay, float erl) {
+    float gain = ((h % 40) < 30) ? 0.4f : 0.0f;
+    for (int i = 0; i < hop; i++) {
+        *rng = *rng * 1103515245u + 12345u;
+        ref[i] = gain * ((float)((*rng >> 9) & 0x7fffff) / 8388608.0f * 2.0f - 1.0f);
+    }
+    for (int i = 0; i < hop; i++) {
+        int back = delay + (hop - 1 - i);
+        float echo = (back < hist_len) ? hist[back] : 0.0f;
+        *rng = *rng * 1103515245u + 12345u;
+        float n1 = (float)((*rng >> 9) & 0x7fffff) / 8388608.0f * 2.0f - 1.0f;
+        *rng = *rng * 1103515245u + 12345u;
+        float n2 = (float)((*rng >> 9) & 0x7fffff) / 8388608.0f * 2.0f - 1.0f;
+        mic[i] = erl * echo + (((h % 130) < 35) ? 0.25f * n1 : 0.0f) + 0.01f * n2;
+    }
+    memmove(hist + hop, hist, (size_t)(hist_len - hop) * sizeof(float));
+    for (int i = 0; i < hop; i++) hist[hop - 1 - i] = ref[i];
+}
+
+/* audio_pipeline_reset()'s documented contract (audio_pipeline.h): equivalent
+ * to a fresh audio_pipeline_init() on the same pool/cfg. That was prose until
+ * the AEC's own reset was made to deliver it -- state survived aec_reset()
+ * that a fresh instance never has, so the first post-reset hop of this
+ * pipeline already differed from a never-warmed twin. Run with CNG both ON
+ * and OFF: reset re-seeds the comfort-noise RNG to the same construction-time
+ * seed, so the CNG path is compared for real rather than excused. */
+static void test_reset_equals_fresh_instance(int sr, int fft_size,
+                                             int enable_cng) {
+    enum { HIST = 8192, WARM = 600, COMPARE = 300 };
+    AudioPipelineConfig cfg = grid_config(sr, fft_size);
+    cfg.enable_cng = enable_cng;
+
+    AudioPipelineMemReq req;
+    if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
+        fprintf(stderr, "FAIL: setup (get_mem_requirements) for reset parity @ %d Hz\n", sr);
+        g_failures++;
+        return;
+    }
+    void* pool_a = NULL;
+    void* pool_b = NULL;
+    if (posix_memalign(&pool_a, req.alignment, req.bytes) != 0 ||
+        posix_memalign(&pool_b, req.alignment, req.bytes) != 0) {
+        fprintf(stderr, "FAIL: pool alloc for reset parity @ %d Hz\n", sr);
+        g_failures++;
+        free(pool_a); free(pool_b);
+        return;
+    }
+    AudioPipeline* fresh  = audio_pipeline_init(pool_a, req.bytes, &cfg);
+    AudioPipeline* warmed = audio_pipeline_init(pool_b, req.bytes, &cfg);
+    if (!fresh || !warmed) {
+        fprintf(stderr, "FAIL: audio_pipeline_init for reset parity @ %d Hz\n", sr);
+        g_failures++;
+        free(pool_a); free(pool_b);
+        return;
+    }
+
+    int hop = audio_pipeline_hop_size(fresh);
+    float* mic  = (float*)malloc((size_t)hop * sizeof(float));
+    float* ref  = (float*)malloc((size_t)hop * sizeof(float));
+    float* out_a = (float*)malloc((size_t)hop * sizeof(float));
+    float* out_b = (float*)malloc((size_t)hop * sizeof(float));
+    float* hist  = (float*)calloc(HIST, sizeof(float));
+
+    /* Warm on an echo path the compare phase does NOT reuse, so anything the
+     * subject remembers is wrong for what follows. */
+    unsigned int rng = 1234567u;
+    for (int h = 0; h < WARM; h++) {
+        reset_scene_hop(&rng, mic, ref, hop, h, hist, HIST, 611, 0.65f);
+        audio_pipeline_process(warmed, mic, ref, out_b);
+    }
+    audio_pipeline_reset(warmed);
+
+    unsigned int rng_a = 0x89abcdefu;
+    unsigned int rng_b = 0x89abcdefu;
+    float* hist_a = (float*)calloc(HIST, sizeof(float));
+    float* hist_b = (float*)calloc(HIST, sizeof(float));
+    long differing = 0;
+    int first_bad = -1;
+    for (int h = 0; h < COMPARE; h++) {
+        reset_scene_hop(&rng_a, mic, ref, hop, h, hist_a, HIST, 293, 0.5f);
+        audio_pipeline_process(fresh, mic, ref, out_a);
+        reset_scene_hop(&rng_b, mic, ref, hop, h, hist_b, HIST, 293, 0.5f);
+        audio_pipeline_process(warmed, mic, ref, out_b);
+        if (memcmp(out_a, out_b, (size_t)hop * sizeof(float)) != 0) {
+            differing++;
+            if (first_bad < 0) first_bad = h;
+        }
+    }
+    CHECK(differing == 0,
+          fmt_msg("audio_pipeline_reset == a fresh instance @ %d Hz, cng=%d: "
+                  "%ld of %d post-reset hops differ (first at %d)",
+                  sr, enable_cng, differing, COMPARE, first_bad));
+
+    free(mic); free(ref); free(out_a); free(out_b);
+    free(hist); free(hist_a); free(hist_b);
+    audio_pipeline_destroy(fresh);
+    audio_pipeline_destroy(warmed);
+    free(pool_a); free(pool_b);
+}
+
 static void test_destroy_idempotence(int sr, int fft_size) {
     AudioPipelineConfig cfg = grid_config(sr, fft_size);
     AudioPipelineMemReq req;
@@ -854,6 +961,8 @@ int main(void) {
         test_validation(sr, fft_size, r == 0); /* 44100 rejection checked once */
         test_pool_rejection(sr, fft_size);
         test_create_vs_init_parity(sr, fft_size, hop_count);
+        test_reset_equals_fresh_instance(sr, fft_size, /*enable_cng=*/1);
+        test_reset_equals_fresh_instance(sr, fft_size, /*enable_cng=*/0);
         test_destroy_idempotence(sr, fft_size);
     }
 
