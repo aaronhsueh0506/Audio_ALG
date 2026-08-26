@@ -378,11 +378,23 @@ def feature_windows(feature):
 
 
 class StatelessDFN2Heads(nn.Module):
-    """Functional one-output-frame twin of ``DeepFilterNet2.heads``."""
+    """Functional one-output-frame twin of ``DeepFilterNet2.heads``.
 
-    def __init__(self, model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
+    ``batch_size`` is a fixed graph contract, not a dynamic ONNX axis.  Each
+    batch element is an independent streaming lane with its own recurrent and
+    convolutional state.  The normal deployment graph keeps the default of
+    one; ``inference_batch.py`` uses larger values for NPU profiling.
+    """
+
+    def __init__(self, model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT,
+                 batch_size=1):
         super().__init__()
         self.model = model
+        if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+            raise TypeError('batch_size must be an integer')
+        if batch_size <= 0:
+            raise ValueError('batch_size must be positive')
+        self.batch_size = batch_size
         # The wrapper is the single source of truth for which recurrent-state
         # layout this instance exports: every caller reads the layout back off
         # it rather than re-deriving one, so a graph cannot be written with one
@@ -409,7 +421,7 @@ class StatelessDFN2Heads(nn.Module):
                     'for every GRU; got %s' % sorted(widths)
                 )
             self.combined_gru_state_shape = (
-                1,
+                self.batch_size,
                 sum(gru.num_layers for gru in _state_grus(model)),
                 1,
                 widths.pop(),
@@ -429,15 +441,21 @@ class StatelessDFN2Heads(nn.Module):
 
     def initial_inputs(self):
         """This instance's dummy inputs, in its own layout."""
-        return initial_inputs(self.model, self.gru_state_layout)
+        return initial_inputs(
+            self.model, self.gru_state_layout, batch_size=self.batch_size
+        )
 
     def forward(self, feat_erb_window, feat_spec_window, *state):
         if self.gru_state_layout.combined:
             combined_hidden, df_convp_history = state
-            # The leading dimension is the graph invocation batch. Remove it
-            # before feeding PyTorch's native (layers, batch, hidden) GRU
-            # state; the exported combined ABI is (1, layers, 1, hidden).
-            native_hidden = combined_hidden.squeeze(0)
+            # Preserve the published batch-one graph exactly.  A profiling
+            # graph with B>1 uses (batch, layers, 1, hidden), whereas the
+            # existing B=1 ABI is also naturally read as
+            # (1, layers, gru_batch, hidden).
+            if self.batch_size == 1:
+                native_hidden = combined_hidden.squeeze(0)
+            else:
+                native_hidden = combined_hidden.squeeze(2).permute(1, 0, 2)
             # One Slice per GRU off the shared input, in GRU_STATE_NAMES
             # order. Views, not copies: each still arrives at its own GRU node
             # carrying that GRU's whole stack.
@@ -503,9 +521,17 @@ class StatelessDFN2Heads(nn.Module):
             # Concatenated in the same order the input was sliced, which is
             # also DFN2ModelIOState's memory order. Restore the graph batch
             # dimension at the boundary.
-            combined_next = torch.cat(hidden_next, dim=0).reshape(
-                self.combined_gru_state_shape
-            )
+            if self.batch_size == 1:
+                combined_next = torch.cat(hidden_next, dim=0).reshape(
+                    self.combined_gru_state_shape
+                )
+            else:
+                combined_next = (
+                    torch.cat(hidden_next, dim=0)
+                    .permute(1, 0, 2)
+                    .unsqueeze(2)
+                    .reshape(self.combined_gru_state_shape)
+                )
             return heads + (combined_next, pathway_history_next)
         return heads + hidden_next + (pathway_history_next,)
 
@@ -534,25 +560,34 @@ def gru_state_slices(model):
     return tuple(slices)
 
 
-def _split_hidden_inputs(model):
+def _split_hidden_inputs(model, batch_size=1):
     """One native stacked zero hidden per GRU, in GRU_STATE_NAMES order."""
     return tuple(
-        torch.zeros(gru.num_layers, 1, gru.hidden_size)
+        torch.zeros(gru.num_layers, batch_size, gru.hidden_size)
         for gru in _state_grus(model)
     )
 
 
-def initial_inputs(model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
+def initial_inputs(model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT,
+                   batch_size=1):
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int):
+        raise TypeError('batch_size must be an integer')
+    if batch_size <= 0:
+        raise ValueError('batch_size must be positive')
     enc_ch = model.encoder.erb_conv0[1].out_channels
     pathway_history = model.df_dec.df_convp.conv.kernel_size[0] - 1
-    hidden = _split_hidden_inputs(model)
+    hidden = _split_hidden_inputs(model, batch_size=batch_size)
     if resolve_gru_state_layout(gru_state_layout).combined:
-        hidden = (torch.cat(hidden, dim=0).unsqueeze(0),)
+        hidden = (
+            torch.cat(hidden, dim=0).permute(1, 0, 2).unsqueeze(2),
+        )
     return (
-        torch.randn(1, 1, INPUT_FRAMES, model.n_erb),
-        torch.randn(1, 2, INPUT_FRAMES, model.df_bins),
+        torch.randn(batch_size, 1, INPUT_FRAMES, model.n_erb),
+        torch.randn(batch_size, 2, INPUT_FRAMES, model.df_bins),
         *hidden,
-        torch.zeros(1, enc_ch, pathway_history, model.df_bins),
+        torch.zeros(
+            batch_size, enc_ch, pathway_history, model.df_bins
+        ),
     )
 
 
@@ -627,6 +662,8 @@ def build_metadata(checkpoint_path, params, inputs, outputs,
         'hop_len': params['HOP_LEN'],
         'input_feature_frames': INPUT_FRAMES,
         'output_frames_per_invocation': 1,
+        'fixed_batch_size': int(inputs[0].shape[0]),
+        'batch_semantics': 'independent_streaming_lanes',
         'input_window_alignment': '[t-1,t,t+1] -> heads[t]',
         'temporal_padding_inside_graph': False,
         'frequency_padding_inside_graph': True,

@@ -120,6 +120,32 @@ different tool: it estimates the feature EMA initialization constants used by
 the C frontend.
 Use `--format npz --output calib/dfn2.npz` when a NumPy archive is needed.
 
+### Fixed-batch NPU profiling
+
+`inference_batch.py` exports a static batch graph and its matching calibration
+inputs.  Batch elements are independent streaming lanes: they share weights,
+but each has its own GRU and `df_convp` state.  They are not consecutive audio
+frames packed together.
+
+```bash
+python3 inference_batch.py export \
+  --model output/dfn2_best.pth --batch-size 4 \
+  --gru-state-layout combined \
+  --output output/dfn2_stream_b4.onnx --verify
+
+python3 inference_batch.py calib \
+  --model output/dfn2_best.pth --wav-dir /path/to/noisy_wavs \
+  --batch-size 4 --batches 1000 --gru-state-layout combined \
+  --format bin --output calib/dfn2_b4
+```
+
+Each tensor BIN file is one complete NPU invocation and therefore contains
+all four lanes.  The combined recurrent input is `(B,5,1,256)`; the split
+layout keeps PyTorch's native `(layers,B,256)` hidden tensors.  The generated
+JSON records `fixed_batch_size`, exact tensor shapes, and the number of source
+frame snapshots.  The C model-I/O helper remains the shipped batch-one/split
+contract; fixed batch and combined state are profiling contracts only.
+
 ## Recurrent-state layouts
 
 `--gru-state-layout` selects how the recurrent state is presented at the graph

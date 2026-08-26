@@ -1057,3 +1057,110 @@ def test_combined_gru_calibration_report_slices_the_layer_axis():
     assert report['per_layer']['h_encoder']['max'] == 1.0
     assert report['per_layer']['h_erb']['max'] == 2.0
     assert report['per_layer']['h_df']['max'] == 3.0
+
+
+@pytest.mark.parametrize('layout', ['split', 'combined'])
+def test_fixed_batch_graph_matches_independent_streaming_lanes(layout):
+    """Batch profiling must not turn adjacent frames into shared state.
+
+    Run three independent batch-one invocations, merge exactly the tensor
+    axes published by ``inference_batch.py``, and require the fixed-batch
+    wrapper to produce the same result for every head and state tensor.
+    """
+    from inference_batch import _merge_independent_samples
+
+    torch.manual_seed(809)
+    model = _small_dfn2().eval()
+    single = StatelessDFN2Heads(
+        model, gru_state_layout=layout, batch_size=1
+    ).eval()
+    batch = StatelessDFN2Heads(
+        model, gru_state_layout=layout, batch_size=3
+    ).eval()
+    samples = []
+    expected = []
+    with torch.no_grad():
+        for _ in range(3):
+            values = tuple(torch.randn_like(value)
+                           for value in single.initial_inputs())
+            samples.append(values)
+            expected.append(single(*values))
+        merged = _merge_independent_samples(
+            batch.input_names, samples, batch.gru_state_layout.combined
+        )
+        actual = batch(*merged)
+
+    assert tuple(merged[0].shape[:2]) == (3, 1)
+    if layout == 'combined':
+        assert tuple(merged[2].shape) == (3, 5, 1, 32)
+    else:
+        assert tuple(merged[2].shape) == (1, 3, 32)
+        assert tuple(merged[3].shape) == (2, 3, 32)
+        assert tuple(merged[4].shape) == (2, 3, 32)
+
+    for output_index, got in enumerate(actual):
+        if layout == 'split' and 3 <= output_index < 6:
+            want = torch.cat(
+                tuple(value[output_index] for value in expected), dim=1
+            )
+        else:
+            want = torch.cat(
+                tuple(value[output_index] for value in expected), dim=0
+            )
+        torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-6)
+
+
+def test_fixed_batch_metadata_publishes_static_lane_count(tmp_path):
+    checkpoint = tmp_path / 'ckpt.pth'
+    checkpoint.write_bytes(b'fixed-batch metadata test')
+    model = _small_dfn2().eval()
+    wrapper = StatelessDFN2Heads(model, batch_size=4).eval()
+    inputs = wrapper.initial_inputs()
+    with torch.no_grad():
+        outputs = wrapper(*inputs)
+    metadata = build_metadata(
+        str(checkpoint),
+        {'SR': 16000, 'N_FFT': 512, 'WIN_LEN': 512, 'HOP_LEN': 256},
+        inputs,
+        outputs,
+        gru_state_layout=wrapper.gru_state_layout,
+    )
+    assert metadata['fixed_batch_size'] == 4
+    assert metadata['batch_semantics'] == 'independent_streaming_lanes'
+    assert metadata['input_schema']['erb'][0] == 4
+    assert metadata['input_schema']['h_encoder'] == [1, 4, 32]
+
+
+def test_fixed_batch_bin_contains_every_lane(tmp_path):
+    from calibration_io import (
+        capture_calibration_inputs,
+        write_calibration_artifact,
+    )
+    from inference_batch import _merge_independent_samples
+
+    model = _small_dfn2().eval()
+    single = StatelessDFN2Heads(
+        model, gru_state_layout='combined', batch_size=1
+    ).eval()
+    batch = StatelessDFN2Heads(
+        model, gru_state_layout='combined', batch_size=3
+    ).eval()
+    samples = [single.initial_inputs() for _ in range(3)]
+    merged = _merge_independent_samples(
+        batch.input_names, samples, combined=True
+    )
+    captured = {}
+    capture_calibration_inputs(captured, batch.input_names, merged)
+    arrays = {name: np.stack(values).astype(np.float32, copy=False)
+              for name, values in captured.items()}
+    artifact = tmp_path / 'batch_calib'
+    write_calibration_artifact(
+        artifact, arrays, {'frames': 1}, 'bin'
+    )
+    manifest = json.loads((artifact / 'manifest.json').read_text())
+    assert manifest['binary_tensors']['erb']['frame_shape'][0] == 3
+    assert manifest['binary_tensors']['h_gru']['frame_shape'] == [3, 5, 1, 32]
+    blob = np.fromfile(
+        artifact / 'h_gru' / 'h_gru_0000.bin', '<f4'
+    )
+    assert blob.size == 3 * 5 * 1 * 32
