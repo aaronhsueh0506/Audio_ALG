@@ -15,7 +15,7 @@ Every generated WAV is a `(5, T)` tensor in `STEM_ORDER`:
 | 1 | `near_speech` | **S** — the near talker through the full room RIR; retained in WAVs for mixing/audit, not copied into packed shards. |
 | 2 | `near_target` | **S_early** — the same near talker and gain through the early/late-suppressed RIR; the common training target. |
 | 3 | `mic_postclip` | **Y** — what a model actually receives, after capture clipping/AGC. |
-| 4 | `linear_error` | **E** — frozen PBFDKF output, `Y - D_hat`. This is not oracle residual echo. |
+| 4 | `linear_error` | **E** — frozen PBFDKF output, `Y - D_hat`. This is not oracle residual echo, and it is not unconditionally the filter's residual: the frontend runs the AEC3 post chain on the context seam, so a hop whose linear estimate the quality analyzer has not declared usable and whose residual carries more energy than the capture publishes the capture instead (`E == Y` there, crossfaded over 30 samples). |
 
 **N** (`local_noise`, ambient noise at the mic) is no longer a persisted
 stem: no current model task targets echo cancellation without denoising, so
@@ -64,6 +64,13 @@ Existing five-channel WAV corpora need no regeneration for the four-channel
 training contract: run `pack_aec_dataset.py` again. Old five-channel `.pt`
 shards are intentionally rejected because their target semantics differ;
 repacking reads the existing WAVs and drops only `near_speech`.
+
+**⚠ That covers the channel layout, not the fifth channel's contents.** A corpus
+rendered before the frozen frontend moved onto the context seam carries a
+`linear_error` produced without the over-output capture guard, and the packer
+stamps whatever contract `--config` builds today onto whatever audio it finds.
+Rematerialize that channel first — see "Recomputing `linear_error` after a
+frontend change".
 
 `AecStems` gives these names; nothing indexes the channel axis by number.
 
@@ -131,8 +138,9 @@ pass a threshold filter.
 
 ### Scenarios
 
-`far_only`, `near_only`, `double_talk`, `ref_dropout`, `echo_path_change`,
-`nonlinear_spk`, `clipping_agc`, `delay_jitter`, `sro`, `codec_mismatch`.
+`far_only`, `near_only`, `double_talk`, `ref_dropout`, `far_active_no_echo`,
+`echo_path_change`, `nonlinear_spk`, `clipping_agc`, `delay_jitter`, `sro`,
+`codec_mismatch`.
 
 `scenario` is **per chunk** and is not always the sequence's intent. A 40 s
 `ref_dropout` sequence is mostly *not* a dropout, and an `echo_path_change`
@@ -202,7 +210,7 @@ not used by any trainer.
 | `gen_aec_dataset.py` | CLI — renders complete sequences to 5-channel WAV chunks |
 | `linear_aec.py` | frozen PBFDKF contract and full-sequence materializer |
 | `rematerialize_linear_aec.py` | rebuilds the last channel from existing four/five-channel WAVs |
-| `pack_aec_dataset.py` | projects the five-channel WAVs into four-channel `.pt` shards |
+| `pack_aec_dataset.py` | projects the five-channel WAVs into four-channel `.pt` shards (`--dtype float16` halves shard size and is safe to train on: every trainer widens to float32 at the device move, so only the stored dtype changes) |
 | `packed_aec_dataset.py` | `PackedAecDataset`, returning `(stems, meta)` |
 | `aec_features.py` | **the shared module the model projects import** |
 | `config.example.ini` | every knob, documented |

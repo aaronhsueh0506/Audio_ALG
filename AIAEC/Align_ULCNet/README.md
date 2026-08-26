@@ -1,7 +1,11 @@
 # Align-ULCNet
 
 Hybrid `linear AEC -> joint RES + NR` reference candidate. Inputs are the
-**frozen production linear-AEC error** and far-end reference; the target is
+**frozen production linear-AEC error** and far-end reference. That frontend
+runs on the context-only seam (`enable_res=0`, `return_res_context=1`) — the
+same seam the board pipelines use — so its over-output capture guard is live:
+a hop the filtering-quality analyzer has not cleared and whose residual
+outweighs the capture publishes the capture instead. The target is
 the common denoised, echo-free, early/dereverberated near-end speech. It is
 not a direct neural AEC. This target is the project's comparison contract and
 should not be reported as an upstream checkpoint-equivalent setting.

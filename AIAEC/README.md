@@ -29,7 +29,11 @@ generation stores five stems:
 
 Packing stores only the four tensors used by training: far_render,
 mic_postclip, linear_error, and near_target. Existing generated WAV data does
-not need to be regenerated when repacking.
+not need to be regenerated when repacking, but a corpus rendered before the
+frozen frontend moved onto the context seam carries a `linear_error` produced
+without the over-output capture guard; rematerialize that channel before
+repacking (`dataset_gen/README.md`, "Recomputing `linear_error` after a
+frontend change").
 
 model_views.build_model_view() is the only waveform-to-model mapping:
 Align-ULCNet receives linear_error + far_render; the other three receive

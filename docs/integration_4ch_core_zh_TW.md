@@ -368,6 +368,13 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 **權重約定**：`output[bin] = Σ_channel weights[channel][bin] * input[channel][bin]`，
 **不做共軛**。多幀 / 時域型 GSC 請把它「這一幀的有效頻率響應」填進來。
 
+**一條在每個 bin 權重都是 0 的 lane 不會投票。** `process_post()` 除了投影頻譜，還會把四條
+lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個純量去操縱那個共用的
+post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一條在每個 bin 權重都是 0 的 lane 對
+融合後的頻譜貢獻恰好為零，所以也不參與這三個縮減——縮減從中性值起算，lane 0 一樣受檢。整組
+全零權重會先被 `-1` 擋掉（見 §5.3），所以至少有一條 lane 會通過這個檢查；真正在 beamform 的
+權重每條 lane 都有非零 bin，這條規則不會跳過任何東西。
+
 外部 beamformer**不需要**再回傳一份 mono hop —— 合成是在 `process_post()` 內部
 以那組權重加權後的頻譜完成的。
 

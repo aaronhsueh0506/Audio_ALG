@@ -141,6 +141,7 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <tr><td>NR gain(<code>mmse_lsa_get_gain</code>)</td><td>[n_freqs]</td><td>float32</td><td>1 frame</td><td>—</td></tr>
 </table>
 <p>n_freqs = 129(16k 預設)/ 257(16k alt)/ 513(48k)。<code>mic/ref</code> 只在呼叫期間讀取(AEC 自己再 copy 一層),<code>out</code> 從不讀取。</p>
+<p class="note"><b><code>ctx.error_spec</code> 不保證每個 hop 都是誤差。</b>本 pipeline 無條件以 <code>enable_res=0</code> / <code>return_res_context=1</code> 建 AEC,而 <code>lib/aec</code> 的 formed 選擇器<b>只在這個 context-only 模式</b>多開一個 capture 候選:上一個 hop 的濾波品質判定尚未認可線性估計、且被選中的殘差在這個 hop 的能量大於同一 hop 的 mic capture 時,formed 時域 hop 與 <code>ctx.error_spec</code> 一起改送 capture,既有的 30-sample crossfade 承接邊界。換句話說,濾波器在加訊號的 hop 上這條 seam 就是 mic;NR/RES 照常套在它上面。<code>aec_only=1</code> 走 <code>aec_process()</code>,輸出仍是 raw 線性殘差,不受影響。</p>
 
 <h2>State 表</h2>
 <p>全部 cross-call state 都住在 caller 的單一 pool(C struct 持有;host 只擁有 pool 記憶體本身)。carve 順序 = <code>self, aec, fft, nr, synth_win, ola, ifft_buf, g_total, extra, e2, spec</code>(layout v9)。實測 bytes 為 16 kHz/256 KISS,<code>aec_nr_pipeline_static --print-mem-size</code>(2026-08-20 重跑):</p>

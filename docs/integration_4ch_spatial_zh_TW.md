@@ -357,7 +357,7 @@ Grid 只有三組（`hop = fft_size / 2`、`n_freqs = fft_size / 2 + 1`）：
 
 | 欄位 | 型別 | 預設 | 合法值 | 你該怎麼設 |
 |---|---|---|---|---|
-| `gsc_enable` | `int`（bool） | `1` | `0` 或 `1` | `0` = 關閉 GSC |
+| `gsc_enable` | `int`（bool） | `1` | `0` 或 `1` | `0` = 關閉 GSC：直接輸出 channel 0，並在每個 bin 送出單位權重 `[1,0,0,0]`，因此 lane 1–3 權重全零。全零權重的 lane 不參與 post 級的三個縮減，見 [`integration_4ch_core_zh_TW.md` §4.3](integration_4ch_core_zh_TW.md) |
 | `gsc_lambda` | `float` | `0.995f` | 有限，且 `> 0.0` 並 `<= 1.0` | 自適應的遺忘因子。**你設的值不是實際生效的值，見 §4.6** |
 | `gsc_mu` | `float` | `0.1f` | 有限且 `>= 0` | 步長增益。**不會**被 retime，設多少就是多少 |
 | `gsc_fixed_mode` | `int`（bool） | `0` | `0` 或 `1` | `1` = 用固定方向，不吃 DOA 結果 |

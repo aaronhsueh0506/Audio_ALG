@@ -56,6 +56,15 @@ diagram above) — it never emits an `out` buffer, pure waste when nothing
 downstream reads it. See `lib/aec/c_impl/include/aec.h` (`AecResContext`,
 `aec_get_res_context()`, `aec_process_context()`) for the full field list.
 
+**`error_spec` does not always mean "error."** That configuration —
+`enable_res=0` with `return_res_context=1` — is the one mode where `lib/aec`'s
+formed selector opens a third candidate: on a hop the filtering-quality
+analyzer has not yet cleared, whose selected residual carries more energy than
+the mic capture, `formed_hop` and `error_spec` both become the capture itself,
+faded in over the existing 30-sample transition. NR/RES still run on it as
+usual — this is the steady-state fallback for a filter that is adding signal
+rather than cancelling. `aec_process()`'s own emitted audio is unaffected.
+
 The four-channel API is a separate zero-padding-free grid and does not use
 `AudioPipeline`. See [the 4-channel contract](4ch_aec_bf_nr_res/README.md) and
 [`4ch_aec_bf_nr_res/4aec_nr_res.h`](4ch_aec_bf_nr_res/4aec_nr_res.h) for its synchronous

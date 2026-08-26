@@ -95,6 +95,7 @@ out               全零              全零                enh(beam err        
                                     (=chain 對 hop#0     of input hop#0)     of input hop p-2)
                                      的輸出=精確零)     ── 輸出恆落後輸入 2 hops(512 樣本, 32 ms)</pre>
 <p>far 一 hop 補償的理由:beam WOLA 慢一 hop,所以 far branch 也要慢一 hop(<code>far_delay</code> 存前一 hop 的 far 源),模型看到的 err/far 幀對才屬於<b>同一個 input hop</b>;拿掉這個 buffer,模型會看到 error[t-1] 配 far[t](固定 256 樣本 skew)——4ch far-timestamp 測試就是這樣設計成會紅 256 樣本。</p>
+<p class="note"><b>err 分支不保證每個 hop 都是誤差。</b>模型的 err 幀來自 GSC 對 <code>pre.linear_spectra</code> 的加權,而那四路是各 lane 的 <b>formed</b> 頻譜;四條 lane 都以 <code>enable_res=0</code> / <code>return_res_context=1</code> 建立,而 <code>lib/aec</code> 的 formed 選擇器<b>只在這個 context-only 模式</b>多開一個 capture 候選:上一個 hop 的濾波品質判定尚未認可線性估計、且該 lane 被選中的殘差在這個 hop 的能量大於同一 hop 的 mic capture 時,該 lane 的時域 hop 與頻譜一起改送 capture(既有 30-sample crossfade 承接邊界)。這種 hop 上 beamform 出來的 err 幀混的是 mic 原樣,不是誤差。</p>
 
 <h2>Identity reprime(alignment 邊界,option A)</h2>
 <p><code>model-&gt;reset</code> 清掉 runtime 的 K/V ring、logit 史與 GRU h,但 C 側 ULCNet STFT 狀態是連續跑的:邊界當下還在飛的分析窗仍<b>跨在邊界上</b>。在那種幀上 step 模型,等於用半舊的 err/far 幀對把剛清掉的 state 重建回去。</p>

@@ -100,7 +100,7 @@ mic/ref
 
 主要設計點：
 
-1. AEC 設 `enable_res=0`，讓 time output 保持 linear residual；同時設 `return_res_context=1`，仍由 AEC3 post block 計算 frequency seam。
+1. AEC 設 `enable_res=0`，讓 time output 保持 linear residual；同時設 `return_res_context=1`，仍由 AEC3 post block 計算 frequency seam（此組態下 formed seam 另有 capture 候選，`ctx.error_spec` 不保證每個 hop 都是誤差，見 [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW.md) §8.1）。
 2. `R²` 除以 `32768²` 後，作為 NR 的 `extra_noise_psd`，得到 echo-aware `G_nr`。
 3. `G_nr` 與 AEC3 `G_res` 逐 bin 取較小值，不重複跑另一個時域 RES。
 4. near-end floor 只在低 echo bin 拉高 gain，並以 far/near activity gate 控制保護強度。

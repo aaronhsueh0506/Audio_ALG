@@ -79,7 +79,10 @@ The external beamformer must expose its effective complex weights with shape
 STFT frames and can be consumed directly without four duplicate FFTs.
 `linear_interleaved` contains the exact selected/crossfaded time-domain hops
 underlying those spectra for integrations whose beamformer owns its four
-analysis FFTs. The Python reference also accepts the external mono hop. The
+analysis FFTs. The per-lane candidate set is refined, coarse, or — in this
+seam's context-only mode — the lane's own mic capture, on a hop the
+filtering-quality analyzer has not cleared; a beamformer computing its own
+residual-echo estimate from this buffer inherits that substitution. The Python reference also accepts the external mono hop. The
 default C post entry synthesizes the mono spectrum internally from the supplied
 weights, so independently supplied output samples and context cannot come from
 different beamformer states. A beamformer that atomically returns both its
@@ -323,8 +326,14 @@ byte-for-byte after every hop, including reset, masked, tail-bin and non-finite
 recovery cases.
 
 One parity limitation remains explicit: `AecResContext` does not yet export
-unbounded R2 or the complete stationarity/AecState surface. The post-beam RES
-therefore uses bounded R2 for both gain inputs and omits the stationary mask.
+the complete stationarity/AecState surface, so the post-beam RES omits the
+stationary mask. R2 itself is **not** bounded. The phase-bearing residual
+vector's intermediate used to be clamped, which broke the projection's
+`|out|^2 == r2` contract — `r2` arrives int16^2-scaled while `echo_spec` is
+audio-scaled, so the honest scale routinely exceeds any fixed bound and the
+clamp simply understated residual echo. The bound is gone; only the overflow
+fallback guards the intermediates, and it preserves the same magnitude
+contract for every finite float32 input.
 This is structurally correct but **not bit-exact** to a future fully extracted
 AEC3 post-beam RES API; it must be cohort-tuned before production sign-off.
 

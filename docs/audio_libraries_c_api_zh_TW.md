@@ -180,6 +180,8 @@ aec_process_capture(aec, mic_hop, out); /* 唯一 consumer thread */
 | `aec_apply_external_realign()` | 僅 `EXTERNAL_ALIGNED` mode；通知外部 alignment 已改變 |
 
 `AecLinearContext`／`AecResContext` 是 read-only borrowed views，不可保存其 pointer 跨 hop。
+`enable_res=0` 搭 `return_res_context=1` 時 formed seam 多一個 capture 候選，**不保證每個 hop
+都是誤差**，條件與後果見 [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW.md) §8.1。
 
 ### 3.5 執行期改抑制強度
 

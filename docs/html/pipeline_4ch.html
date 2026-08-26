@@ -100,10 +100,11 @@ void four_aec_nr_res_get_last_timing(const FourAecNrRes* p, FourAecNrResLastTimi
 <tr><th>欄位</th><th>內容</th><th>擁有者/壽命</th></tr>
 <tr><td><code>token</code></td><td>frame_index/generation/owner_cookie/instance_epoch;<code>process_post()</code>/<code>abandon_pre()</code> 憑 token 驗序(replay、跨 instance、reset 後皆 SEQUENCE_ERROR)</td><td>copy 使用,不可修改</td></tr>
 <tr><td><code>delay</code></td><td><code>delay_samples/confidence/solid/changed</code>;<code>changed</code> 非零時外部 STFT/OLA 歷史須清除</td><td>值複製</td></tr>
-<tr><td><code>linear_interleaved</code></td><td>[hop][4] formed 線性誤差時域 hop(選定/crossfaded 後的 WOLA 合成輸出)</td><td>pipeline-owned copy;有效至 post/reset/destroy</td></tr>
-<tr><td><code>linear_spectra[4]</code></td><td>各 lane 誤差頻譜 [n_freqs](<b>別名</b> lane 自己的 buffer,非 copy)</td><td>同上;reset 不保證清除,靠 token 閘與呼叫端自律</td></tr>
+<tr><td><code>linear_interleaved</code></td><td>[hop][4] formed 線性 hop(選定/crossfaded 後的 WOLA 合成輸出;候選為 refined／coarse／<b>capture</b>,見下方 formed capture 註)</td><td>pipeline-owned copy;有效至 post/reset/destroy</td></tr>
+<tr><td><code>linear_spectra[4]</code></td><td>各 lane formed 頻譜 [n_freqs](與時域 hop 同一次選擇,<b>別名</b> lane 自己的 buffer,非 copy)</td><td>同上;reset 不保證清除,靠 token 閘與呼叫端自律</td></tr>
 <tr><td><code>aligned_ref</code>(2026-08-13 新增)</td><td>[hop] 本 hop 實際餵給四條 lane 的 delay-aligned 時域 far(ring 未滿時前導為 0)。給外部 NN post(Align-ULCNet far branch)用</td><td>pipeline-owned;有效至 post/<b>abandon_pre</b>/reset/destroy</td></tr>
 </table>
+<p class="note"><b>formed seam 的第三個候選是 capture。</b>四條 lane 都以 <code>enable_res=0</code> / <code>return_res_context=1</code> 建立,而 <code>lib/aec</code> 的 formed 選擇器<b>只在這個 context-only 模式</b>多開一個候選:上一個 hop 的濾波品質判定尚未認可線性估計、且被選中的殘差(refined 或 coarse)在這個 hop 的能量大於<b>同一 hop 的 mic capture</b> 時,該 lane 的時域 hop 與其頻譜<b>一起</b>改送 capture,既有的 30-sample crossfade 承接邊界(不丟 OLA 歷史、不歸零任何 hop)。外部 beamformer 因此可能在這些 hop 上拿到 mic 原樣而不是誤差——那正是「濾波器在加訊號」時該有的行為。<code>enable_res=1</code> 的路徑不走這條,仍由 AEC3 post 自己的頻域 over-output 保護處理。</p>
 <p class="note">ABI 註記:<code>aligned_ref</code> 是 caller-stack 交接 struct 的尾端新欄位,pool byte layout 不變,故 layout_version <b>刻意不 bump</b>;但對把 <code>FourAecNrResPreFrame</code> by-value 內嵌的 out-of-tree caller 仍是需要整體重編的 struct 變更。<code>abandon_pre()</code> 消耗 token 如同成功的 post,但<b>不推進</b>任何下游狀態(NR/RES/OLA 不動)——設計給從不呼叫 post 的外部-post 變體,不是給逐 hop 混用。</p>
 
 <h2>Block diagram(每 hop 程式流)</h2>
@@ -126,7 +127,8 @@ void four_aec_nr_res_get_last_timing(const FourAecNrRes* p, FourAecNrResLastTimi
       ├─ token_matches() + validate_weights()(全零權重拒收)
       ├─ fuse_contexts(): 用同一組 weights 投影 near/residual/comfort
       │     residual_vec[k] = sqrt(r2[k])·echo[k]/|echo[k]| (取 echo 相位)
-      │     fused_r2 = |Σ_ch w·residual_vec|²  (coherent, bounded R²)
+      │       契約 |residual_vec[k]|² == max(r2[k],0);scale 刻意無上界
+      │     fused_r2 = |Σ_ch w·residual_vec|²  (coherent)
       ├─ run_post_res_and_nr():
       │     suppression_gain_get_gain(post_sg, ...)      1 個 post-beam RES
       │     mmse_lsa_process_gain(nr, beam_error, extra) 1 個 mono NR

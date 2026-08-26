@@ -226,5 +226,5 @@ head/spectrum 配對無法以「輸出有限」矇混過關。</li>
 實測 NEON/scalar digest 皆 <code>de7e511600d05a10</code>(bit 相同)</li>
 <li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code> — 實測 33 passed
 (含 layout version 互鎖、split/combined 等價、per-GRU state 各自抵達自己的 GRU node);
-共用測試 <code>AINR/tests/</code>(pytest)— 實測 43 passed（<code>pytest AINR</code> 全樹 = 199）</li>
+共用測試 <code>AINR/tests/</code>(pytest)— 實測 45 passed（新增 <code>test_python_c_prepost_parity.py</code> 的 host-boundary numeric parity 兩項；<code>pytest AINR</code> 全樹 = 201）</li>
 </ul>

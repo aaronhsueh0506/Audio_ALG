@@ -57,8 +57,11 @@ record.
 ## Dataset and deployment boundary
 
 The AIAEC generator renders complete stateful scenario sequences, executes one
-frozen production Python PBFDKF over each sequence, appends its
-`linear_error = mic_postclip - D_hat` as the dataset's last channel, and then
+frozen production Python PBFDKF over each sequence on the context seam
+(`enable_res=False`, `return_res_context=True`), appends its `linear_error` as
+the dataset's last channel — usually `mic_postclip - D_hat`, but a hop the
+filtering-quality analyzer has not cleared and whose residual outweighs the
+capture publishes the capture instead — and then
 cuts 10-second chunks. RES+NR trainers read this stored channel directly. File/stream
 inference restores the same PBFDKF contract from the checkpoint and runs the
 frontend continuously before the neural model.
