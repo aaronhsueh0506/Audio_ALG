@@ -210,6 +210,7 @@ not used by any trainer.
 | `gen_aec_dataset.py` | CLI — renders complete sequences to 5-channel WAV chunks |
 | `linear_aec.py` | frozen PBFDKF contract and full-sequence materializer |
 | `rematerialize_linear_aec.py` | rebuilds the last channel from existing four/five-channel WAVs |
+| `materialize_pair.py` | **diagnostic**: one loose mic/far pair to a `linear_error` WAV, contract taken from the runtime |
 | `pack_aec_dataset.py` | projects the five-channel WAVs into four-channel `.pt` shards (`--dtype float16` halves shard size and is safe to train on: every trainer widens to float32 at the device move, so only the stored dtype changes) |
 | `packed_aec_dataset.py` | `PackedAecDataset`, returning `(stems, meta)` |
 | `aec_features.py` | **the shared module the model projects import** |
@@ -353,6 +354,33 @@ python3 -m AIAEC.dataset_gen.pack_aec_dataset \
 Far, mic, near-target and the sequence boundaries are preserved; only
 `linear_error` is recomputed. Any checkpoint trained on the old distribution
 must be retrained.
+
+**Before you retrain, you can measure what the change cost.** A checkpoint
+carries the contract it was trained under, so every path that loads one refuses
+an engine whose `aec_behavior_hash` has moved — that refusal is the guard doing
+its job, not a defect. To see how the existing checkpoint behaves on the new
+frontend's signal, materialize one pair and hand it straight to the neural
+post-filter:
+
+```bash
+python3 -m AIAEC.dataset_gen.materialize_pair mic.wav far.wav error.wav
+
+python3 -m AIAEC.Align_ULCNet.inference ckpt.pt error.wav far.wav out.wav \
+    --input-is-linear-error
+```
+
+`materialize_pair.py` builds its contract from the installed library rather
+than from a checkpoint, so it has no recorded hash to disagree with;
+`--input-is-linear-error` bypasses the frontend entirely, so nothing on that
+side carries a contract either. Pass the **raw** far to inference — the
+training contract pairs `linear_error` with raw far and the model's alignment
+consumes it.
+
+⚠ Both halves are evaluation-only. `materialize_pair.py` pads one waveform to a
+hop boundary and trims the result back, so its tail is not what the corpus path
+produces; its output must never be written into a corpus, and no contract
+comparison can tell the two apart. Run the same pair through the old library
+too if you want the comparison to have a baseline.
 
 **`--jobs` is the only lever that matters.** Measured on a 16 kHz corpus, the
 Python PBFDKF is **99.8%** of the run and file I/O is 0.1%, so nothing about
