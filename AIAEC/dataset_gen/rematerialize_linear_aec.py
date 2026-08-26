@@ -239,14 +239,14 @@ def rematerialize(args) -> None:
               + (f"; {dropped} re-queued -- their chunks no longer match"
                  if dropped else ""))
         if dropped:
-            save_ledger(seqs_dir, contract_hash, done)
+            save_ledger(seqs_dir, contract_hash, done, contract.as_dict())
     else:
         done = set()
         # Start from an empty ledger rather than whatever a previous run left.
         # Otherwise a full-pass run that dies before its first sequence lands
         # leaves the old ledger intact, and the next --resume trusts a claim
         # this run never made.
-        save_ledger(seqs_dir, contract_hash, done)
+        save_ledger(seqs_dir, contract_hash, done, contract.as_dict())
 
     pending = [sid for sid in sorted(sequences) if sid not in done]
     work = [
@@ -274,7 +274,7 @@ def rematerialize(args) -> None:
             rewritten += 1
             # Recorded only once the sequence's own chunks are all on disk,
             # so an interrupted run never claims one it did not finish.
-            save_ledger(seqs_dir, contract_hash, done)
+            save_ledger(seqs_dir, contract_hash, done, contract.as_dict())
             progress.update(1)
     except BaseException:
         # terminate(), not close(): close() only stops NEW tasks being queued,

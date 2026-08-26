@@ -58,14 +58,17 @@ if __package__ in (None, ''):
 
 from .aec_features import PACKED_STEM_ORDER, STEM_ORDER  # noqa: E402
 from .linear_aec import (  # noqa: E402
+    LinearAecContract,
     linear_aec_contract_from_config,
     migrated_ledger_fingerprints,
+    require_linear_aec_contract,
 )
 from .linear_error_ledger import (  # noqa: E402
     LEDGER_NAME,
     claimed_vs_present,
     ledger_path,
     recorded_contract,
+    recorded_identity,
 )
 from .seq_layout import scan_chunks, stale_temp_files  # noqa: E402
 
@@ -137,6 +140,51 @@ def _save_shard(clips, metas, shard_index, args, header) -> tuple:
     return temporary, path
 
 
+def _frontend_line(contract) -> str:
+    """One line naming a frontend: which lib/aec built it, and on what grid."""
+    return (
+        f"lib/aec {contract.aec_commit[:12]}, behaviour "
+        f"{contract.aec_behavior_hash[:12]}, {contract.sample_rate} Hz, "
+        f"frame/hop {contract.frame_size}/{contract.hop_size}, "
+        f"taps {contract.filter_length}"
+    )
+
+
+def _honour_recorded_identity(path, contract, recorded, identity):
+    """Decide a ledger that NAMES the frontend that wrote it. Raise to refuse.
+
+    Preferred over reconstructing candidate fingerprints: the ledger states
+    the producing contract, so the comparison is exact, independent of which
+    --config this run passed, and needs no table of revisions to enumerate.
+    ``require_linear_aec_contract`` is the one authority on whether two
+    frontends may share data -- it compares every compatibility field, admits
+    only a migration the evidence table already holds, and reports a retired
+    identity with what to do about it -- so the decision is delegated rather
+    than re-derived here.
+    """
+    try:
+        source = LinearAecContract.from_dict(identity)
+    except ValueError as exc:
+        raise ValueError(
+            f"{path} records a linear_aec contract that does not read as one "
+            f"({exc}); it cannot say which frontend wrote this corpus. Repair "
+            f"or remove it before packing.") from exc
+    if source.fingerprint() != recorded:
+        raise ValueError(
+            f"{path} is internally inconsistent: the linear_aec contract it "
+            f"records fingerprints to {source.fingerprint()[:12]}, but the "
+            f"same ledger claims {recorded[:12]}. It has been edited or "
+            f"merged from two runs; repair or remove it before packing.")
+    try:
+        require_linear_aec_contract(contract.as_dict(), identity, path)
+    except ValueError as exc:
+        raise ValueError(
+            f"{path} was written by a frontend this build may not use. The "
+            f"ledger says: {_frontend_line(source)}. This --config and this "
+            f"lib/aec build: {_frontend_line(contract)}. {exc}") from exc
+    return source
+
+
 def _require_complete_rematerialization(seqs_dir, sequences, contract):
     """Stop if the fifth channel was only partly rebuilt.
 
@@ -152,54 +200,86 @@ def _require_complete_rematerialization(seqs_dir, sequences, contract):
     gen_aec_dataset.py never had one, and there is nothing to contradict.
     The failure this guards is a PARTIAL claim, not an absent one.
 
-    A ledger written under an ACCEPTED migration source is honoured. The
-    ledger keys on ``fingerprint()``, which folds in `aec_commit` and
-    `aec_source_hash`, so it moves on any lib/aec edit -- including one whose
-    `linear_error` is byte-identical by the evidence
+    A ledger written by an equivalent frontend is honoured. It keys on
+    ``fingerprint()``, which folds in `aec_commit` and `aec_source_hash`, so
+    it moves on any lib/aec edit -- including a comment reflow, and including
+    one whose `linear_error` is byte-identical by the evidence
     ACCEPTED_BEHAVIOR_HASH_MIGRATIONS required to admit it. Refusing there
-    would strand a COMPLETED corpus behind advice that cannot be followed:
-    the config is identical, and what moved is lib/aec, which --config cannot
-    address. Bridging is exact rather than lenient -- the source build's
-    fingerprint is reconstructed from its recorded provenance and compared
-    whole, so an unrelated build still fails -- and it does not weaken the
-    completeness check below, which runs against the ledger either way.
+    would strand a COMPLETED corpus behind advice that cannot be followed: the
+    config is identical, and what moved is lib/aec, which --config cannot
+    address.
+
+    Two routes to that, in order of preference:
+
+      * the ledger RECORDS the producing contract, so the comparison is exact
+        and config-independent -- ``require_linear_aec_contract`` decides it
+        on the same terms every other gate uses;
+      * a LEGACY ledger records only the fingerprint, which is one-way. The
+        source build's fingerprint is then reconstructed from its recorded
+        provenance (MIGRATED_SOURCE_PROVENANCE, one candidate per lib/aec
+        revision that carried the migrated-from behaviour) and compared whole,
+        so an unrelated build still fails.
+
+    Neither weakens the completeness check below, which runs against the
+    ledger either way.
     """
-    if not os.path.exists(ledger_path(seqs_dir)):
+    path = ledger_path(seqs_dir)
+    if not os.path.exists(path):
         return
     contract_hash = contract.fingerprint()
     recorded = recorded_contract(seqs_dir)
+    identity = recorded_identity(seqs_dir)
     if recorded is None:
         raise ValueError(
-            f"{ledger_path(seqs_dir)} exists but does not read as a ledger; "
+            f"{path} exists but does not read as a ledger; "
             f"it cannot say whether this corpus was completely "
             f"rematerialized. Repair or remove it before packing.")
-    if recorded != contract_hash:
-        for source_hash, source_fingerprint in migrated_ledger_fingerprints(
-                contract):
-            if recorded == source_fingerprint:
-                warnings.warn(
-                    f"{ledger_path(seqs_dir)} was written by AEC behaviour "
-                    f"{source_hash[:12]} and this build is "
-                    f"{contract.aec_behavior_hash[:12]}; accepting via the "
-                    "verified frontend-equivalent migration table "
-                    "(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS in "
-                    "dataset_gen/linear_aec.py), which records the "
-                    "byte-identical linear_error evidence for this pair. The "
-                    "shards are stamped with THIS build's contract, which "
-                    "describes the same waveform.",
-                    RuntimeWarning, stacklevel=2)
-                contract_hash = recorded
-                break
+    if recorded != contract_hash and identity is not None:
+        source = _honour_recorded_identity(path, contract, recorded, identity)
+        warnings.warn(
+            f"{path} was written by {_frontend_line(source)}; this build is "
+            f"{_frontend_line(contract)}. The two frontends produce the same "
+            f"linear_error, so the ledger is honoured and the shards are "
+            f"stamped with THIS build's contract, which describes the same "
+            f"waveform.",
+            RuntimeWarning, stacklevel=2)
+        contract_hash = recorded
+    elif recorded != contract_hash:
+        for source_hash, source_commit, source_fingerprint in (
+                migrated_ledger_fingerprints(contract)):
+            if recorded != source_fingerprint:
+                continue
+            warnings.warn(
+                f"{path} records no frontend identity, but its fingerprint is "
+                f"the one lib/aec {source_commit[:12]} (behaviour "
+                f"{source_hash[:12]}) would have written for this config; this "
+                f"build is {_frontend_line(contract)}. Accepting via the "
+                "verified frontend-equivalent migration table "
+                "(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS in "
+                "dataset_gen/linear_aec.py), which records the byte-identical "
+                "linear_error evidence for this pair. The shards are stamped "
+                "with THIS build's contract, which describes the same "
+                "waveform.",
+                RuntimeWarning, stacklevel=2)
+            contract_hash = recorded
+            break
     if recorded != contract_hash:
         raise ValueError(
-            f"{ledger_path(seqs_dir)} was written by a DIFFERENT linear-AEC "
-            f"contract ({recorded[:12]}) than the one this --config and this "
-            f"lib/aec build ({contract_hash[:12]}). Pass the config the "
-            f"corpus was rematerialized with, or re-run "
-            f"rematerialize_linear_aec with this one. If only lib/aec moved, "
-            f"--config cannot fix it: either the pair belongs in "
+            f"{path} was written by a DIFFERENT linear-AEC contract "
+            f"({recorded[:12]}) than this --config and this lib/aec build "
+            f"produce ({contract_hash[:12]}), and it records no frontend "
+            f"identity -- a ledger written before that field existed carries "
+            f"only the fingerprint, which is one-way and cannot say WHICH "
+            f"build wrote the corpus. This build: {_frontend_line(contract)}. "
+            f"To identify the build that wrote it, report from the machine "
+            f"that ran "
+            f"rematerialize_linear_aec: `git -C lib/aec rev-parse HEAD`, and "
+            f"the [signal] and [linear_aec] sections of the --config it used. "
+            f"Then pass that config; or, if only lib/aec moved, --config "
+            f"cannot fix it -- either the pair belongs in "
             f"ACCEPTED_BEHAVIOR_HASH_MIGRATIONS with the byte-identity "
-            f"evidence that admits it, or the corpus genuinely needs "
+            f"evidence that admits it and its revision in "
+            f"MIGRATED_SOURCE_PROVENANCE, or the corpus genuinely needs "
             f"rematerializing. Packing now would label the shards with a "
             f"contract that did not produce them.")
     _, missing, extra = claimed_vs_present(seqs_dir, contract_hash, sequences)

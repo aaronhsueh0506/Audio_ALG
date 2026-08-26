@@ -592,31 +592,78 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
         "a02f30f6a491a92165b8c8a40b5fd967351647c7bc8481e4284a8c4d9a95f19f",
 }
 
-# Provenance of the build each accepted migration's SOURCE identity belongs to.
+# Provenance of every build each accepted migration's SOURCE identity ran on.
 #
 # Needed because one gate downstream cannot use ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
-# on its own: the rematerialization ledger records a contract as its
-# `fingerprint()`, which folds in `aec_commit` and `aec_source_hash` alongside
-# the behaviour hash and is one-way. A build that computes the migration TARGET
-# cannot re-derive the SOURCE build's fingerprint from the corpus -- the corpus
-# stores no contract dict anywhere -- so without this it cannot tell a ledger
-# written by a migrated frontend from one written by an unrelated build, and a
-# COMPLETED corpus gets refused with advice its operator cannot follow (the
-# config is identical; what moved is lib/aec).
+# on its own: a LEGACY rematerialization ledger records a contract as its
+# `fingerprint()` and nothing else, and that fingerprint folds in `aec_commit`
+# and `aec_source_hash` alongside the behaviour hash and is one-way. A build
+# that computes the migration TARGET cannot re-derive the SOURCE build's
+# fingerprint from such a ledger, so without this it cannot tell one written by
+# a migrated frontend from one written by an unrelated build, and a COMPLETED
+# corpus gets refused with advice its operator cannot follow (the config is
+# identical; what moved is lib/aec). A ledger that records the producing
+# contract dict needs none of this -- see `linear_error_ledger.save_ledger` --
+# and the reconstruction here exists for the ones written before it did.
 #
-# One entry per migration source, and only for a source whose build is pinned
-# and known. An entry here grants nothing on its own: it is consulted only
-# after ACCEPTED_BEHAVIOR_HASH_MIGRATIONS has already admitted the pair, and
-# only to reconstruct a fingerprint the guard then compares exactly. A source
-# with no entry simply gets no ledger bridge -- the migration still applies to
-# every other gate.
+# A behaviour hash is carried by a RANGE of revisions, not by one: it is
+# insensitive to comments and formatting, so every docs-only or comment-only
+# lib/aec commit in the range keeps it while moving `aec_commit` and usually
+# `aec_source_hash` too. One pair per behaviour hash therefore under-covers --
+# a corpus materialized under any other revision in the range reconstructs to a
+# fingerprint the bridge does not hold. Each behaviour hash maps to the TUPLE
+# of revisions that carried it; adding a newly discovered one is appending a
+# `{"aec_commit": ..., "aec_source_hash": ...}` row.
+#
+# How a range is derived, so the next person can extend it. Walk lib/aec back
+# from the revision that changed the hash and measure each commit with
+# `aec_python_behavior_hash()` / `aec_python_source_hash()`, repointing
+# `aec_behavior_hash._AEC_PYTHON` at a checkout of that commit -- ONE COMMIT PER
+# PROCESS, because both functions are `lru_cache`d and a second call in the same
+# process is served the first checkout's digest. The range runs from the commit
+# that INTRODUCED the hash (its parent measures differently) to the last commit
+# before the one that changed it. Record every distinct (commit, source_hash)
+# pair in it, including the commits that share a source hash: `fingerprint()`
+# folds in `aec_commit`, so each commit is its own fingerprint regardless.
+#
+# An entry here grants nothing on its own: it is consulted only after
+# ACCEPTED_BEHAVIOR_HASH_MIGRATIONS has already admitted the pair, and only to
+# reconstruct a fingerprint the guard then compares WHOLE -- an unrelated build
+# still fails. A source with no entry simply gets no legacy-ledger bridge; the
+# migration still applies to every other gate.
 MIGRATED_SOURCE_PROVENANCE = {
-    # lib/aec at the revision the 200-hour corpus was materialized under.
-    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061": {
-        "aec_commit": "d5193ad6b58efc54f13cbc71980a3e5659c7388d",
-        "aec_source_hash":
-            "9380c512bca01b8da842e22426c66c016335d33ab4b232f78bafd9cd1efe39fe",
-    },
+    # lib/aec revisions the 200-hour corpus could have been materialized under.
+    # Introduced by 2f66c17 (its parent 070787b measures 8c615885); ends at
+    # d5193ad, the last revision before the fresh-instance reset (9dd9e78)
+    # moved the hash to this build's. Four commits, two source hashes: the
+    # three later ones differ from each other only in commit message and
+    # non-signal files, which `aec_python_source_hash` does not see.
+    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061": (
+        {
+            # scope formed capture fallback to the context seam
+            "aec_commit": "2f66c17c03b1fc2c96dd9cd74b15c543824cc757",
+            "aec_source_hash":
+                "2d5b119d8a69126b94acb98ebfe44d6982aeb12c41bdd46b51ddf0ae20843faf",
+        },
+        {
+            # docs: the formed seam's third candidate
+            "aec_commit": "fc5103cff82e7add40325bc44031a9cb0048ccf0",
+            "aec_source_hash":
+                "9380c512bca01b8da842e22426c66c016335d33ab4b232f78bafd9cd1efe39fe",
+        },
+        {
+            # perf: the hop pays for what it uses
+            "aec_commit": "631eb78665eda1e5e0d06f17e046f448e8938328",
+            "aec_source_hash":
+                "9380c512bca01b8da842e22426c66c016335d33ab4b232f78bafd9cd1efe39fe",
+        },
+        {
+            # fix: the ERLE watchdog leaks by the clock, not by the hop
+            "aec_commit": "d5193ad6b58efc54f13cbc71980a3e5659c7388d",
+            "aec_source_hash":
+                "9380c512bca01b8da842e22426c66c016335d33ab4b232f78bafd9cd1efe39fe",
+        },
+    ),
 }
 
 
@@ -626,24 +673,28 @@ def migrated_ledger_fingerprints(contract: "LinearAecContract") -> tuple:
     ``contract`` is what THIS build makes of the corpus's config. A migration
     source differs from it only in the three provenance fields, all of which
     are recorded, so the source's fingerprint is reconstructible exactly rather
-    than guessed. Returns an empty tuple when nothing migrates to this build,
-    or when the source that does has no recorded provenance -- both of which
-    must leave the caller's exact-match behaviour untouched.
+    than guessed. One candidate per recorded REVISION, since `fingerprint()`
+    folds in `aec_commit` and every revision that carried the behaviour hash
+    wrote a different one.
+
+    Yields ``(behaviour_hash, aec_commit, fingerprint)``: a caller that matches
+    one has to be able to name the build it matched, not just its behaviour.
+    Returns an empty tuple when nothing migrates to this build, or when the
+    source that does has no recorded provenance -- both of which must leave the
+    caller's exact-match behaviour untouched.
     """
     out = []
     for recorded, current in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items():
         if current != contract.aec_behavior_hash:
             continue
-        provenance = MIGRATED_SOURCE_PROVENANCE.get(recorded)
-        if provenance is None:
-            continue
-        source = dataclasses.replace(
-            contract,
-            aec_behavior_hash=recorded,
-            aec_commit=provenance["aec_commit"],
-            aec_source_hash=provenance["aec_source_hash"],
-        )
-        out.append((recorded, source.fingerprint()))
+        for revision in MIGRATED_SOURCE_PROVENANCE.get(recorded, ()):
+            source = dataclasses.replace(
+                contract,
+                aec_behavior_hash=recorded,
+                aec_commit=revision["aec_commit"],
+                aec_source_hash=revision["aec_source_hash"],
+            )
+            out.append((recorded, revision["aec_commit"], source.fingerprint()))
     return tuple(out)
 
 

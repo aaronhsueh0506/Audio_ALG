@@ -533,11 +533,28 @@ corpus; a ledger from another contract is ignored whole. Re-running after a
 without `--resume`. That holds across an accepted migration too: the ledger is
 keyed on `fingerprint()`, which folds in the raw-text `aec_source_hash` and
 `aec_commit`, so an INTERRUPTED rematerialization restarts even where the
-migration applies. A COMPLETED one does not — the packer reconstructs the
-migrated-from build's fingerprint from its recorded provenance
-(`MIGRATED_SOURCE_PROVENANCE`) and honours that ledger with a `RuntimeWarning`,
-because refusing there would strand a finished corpus behind advice that cannot
-be followed: the config is identical, and what moved is `lib/aec`. Add `--jobs N` to spread independent sequences across
+migration applies. A COMPLETED one does not — the packer honours that ledger
+with a `RuntimeWarning`, because refusing there would strand a finished corpus
+behind advice that cannot be followed: the config is identical, and what moved
+is `lib/aec`.
+
+**The ledger records the frontend that wrote it,** not only the fingerprint.
+The fingerprint is one-way, so a ledger carrying nothing else can say a corpus
+was written by a different contract but never *which* — which leaves an
+operator comparing two opaque hashes. `linear_error.done.json` therefore also
+carries the producing contract under `linear_aec`, and the packer bridges on
+that: an exact, config-independent comparison through
+`require_linear_aec_contract`, which reports the field that disagrees and
+names both builds. A ledger written before that field existed (only `contract`
+and `sequences`) still reads normally everywhere; for those the packer
+reconstructs the migrated-from build's fingerprint from its recorded
+provenance instead (`MIGRATED_SOURCE_PROVENANCE`, one candidate per `lib/aec`
+revision that carried the migrated-from behaviour hash — a behaviour hash is
+comment-insensitive, so a RANGE of revisions carries it and each one wrote a
+different fingerprint). If that refuses, the message says the ledger records
+no identity and asks for `git -C lib/aec rev-parse HEAD` plus the `[signal]`
+and `[linear_aec]` config sections from the machine that ran the
+rematerialization — the two things needed to identify the build. Add `--jobs N` to spread independent sequences across
 cores — it does not change a single sample.
 
 Generation is deterministic given `--seed`: each sequence is seeded from

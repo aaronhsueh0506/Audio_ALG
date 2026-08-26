@@ -37,6 +37,10 @@ from AIAEC.dataset_gen import (
     make_linear_aec_contract,
     require_linear_aec_contract,
 )
+from AIAEC.dataset_gen.linear_aec import (
+    MIGRATED_SOURCE_PROVENANCE,
+    migrated_ledger_fingerprints,
+)
 from AIAEC.dataset_gen.aec_behavior_hash import aec_python_behavior_hash
 
 
@@ -545,6 +549,64 @@ def test_whitelisted_migration_does_not_excuse_a_second_difference(pair):
     current['filter_length'] += current['hop_size']
     with pytest.raises(ValueError, match='filter_length'):
         require_linear_aec_contract(current, recorded, 'test')
+
+
+def test_migrated_source_provenance_describes_only_accepted_sources():
+    """Structural invariants of the legacy-ledger bridge.
+
+    An entry keyed on a behaviour hash nothing migrates from is never
+    consulted -- it would look like coverage while granting nothing. And each
+    revision has to be a full provenance pair, because the fingerprint is
+    reconstructed from it whole.
+    """
+    for source, revisions in MIGRATED_SOURCE_PROVENANCE.items():
+        assert source in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS, (
+            'provenance recorded for a behaviour hash no migration admits; '
+            'the bridge would never reach it'
+        )
+        assert revisions, 'an empty revision set covers no corpus'
+        commits = [revision['aec_commit'] for revision in revisions]
+        assert len(set(commits)) == len(commits), 'duplicate revision'
+        for revision in revisions:
+            assert set(revision) == {'aec_commit', 'aec_source_hash'}
+            assert len(revision['aec_commit']) == 40
+            assert len(revision['aec_source_hash']) == 64
+
+
+def test_every_recorded_revision_reconstructs_its_own_fingerprint():
+    """One candidate per revision, and no two revisions collapse into one.
+
+    Several revisions can share an `aec_source_hash` -- a commit that touches
+    only non-signal files does not move it -- so distinctness here is what
+    proves `aec_commit` is folded into the reconstruction. Drop it and the
+    candidates collide, the count falls, and an unrelated build that differs
+    only in commit would be accepted.
+    """
+    current = make_linear_aec_contract(16000, frame_size=512)
+    candidates = migrated_ledger_fingerprints(current)
+    expected = sum(
+        len(MIGRATED_SOURCE_PROVENANCE.get(source, ()))
+        for source, target in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items()
+        if target == current.aec_behavior_hash
+    )
+    assert len(candidates) == expected
+    assert len({fingerprint for _, _, fingerprint in candidates}) == expected
+    assert len({commit for _, commit, _ in candidates}) == expected
+    for source, _commit, _fingerprint in candidates:
+        assert ACCEPTED_BEHAVIOR_HASH_MIGRATIONS[source] == \
+            current.aec_behavior_hash
+
+
+def test_the_legacy_ledger_bridge_is_one_way():
+    """A build running a migration SOURCE gets no candidates: the table is
+    read forwards only, so a corpus written by the newer frontend is never
+    handed to the older one."""
+    for source in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS:
+        running_source = dataclasses.replace(
+            make_linear_aec_contract(16000, frame_size=512),
+            aec_behavior_hash=source,
+        )
+        assert migrated_ledger_fingerprints(running_source) == ()
 
 
 def test_unlisted_behaviour_hash_is_still_refused():
