@@ -54,19 +54,21 @@
 #define PSD_SCALE                 (32768.0f * 32768.0f)
 #define PIPELINE_RNG_SEED         0x9e3779b9u
 
-/* Matched-filter duty cycle. Same two windows lib/aec bakes into its own
- * always-on machine (its delay_est_init_s / delay_est_period_s defaults) and
- * the same derivation from them, so the shared estimator here decimates on
- * exactly the schedule a lane's own estimator would: hold the analysis at
- * full rate until the estimate has been solid and unchanged for
- * DUTY_HOLD_S, then analyse one hop in K = round(DUTY_PERIOD_S/hop_s)/5.
- * The two floors are lib/aec's as well -- one hop of hold, and a period of
- * at least 2 so "decimated" always means something.
+/* Matched-filter duty cycle. The two WINDOWS are not literals here: they are
+ * read from the lane AecConfig this file already builds at init --
+ * delay_est_init_s and delay_est_period_s, the very fields lib/aec reads for
+ * its own always-on machine -- so the shared estimator decimates on exactly
+ * the schedule a lane's own estimator would, and a future retune of either
+ * field reaches both implementations instead of silently reaching one. Hold
+ * the analysis at full rate until the estimate has been solid and unchanged
+ * for delay_est_init_s, then analyse one hop in
+ * K = round(delay_est_period_s/hop_s)/DUTY_PERIOD_DIVISOR.
  *
- * Constants rather than config: the shared estimator has no AecConfig of its
- * own to carry them, and a knob nothing sets is a knob that rots. */
-#define DUTY_HOLD_S               0.3f
-#define DUTY_PERIOD_S             0.5f
+ * The divisor and the two floors -- one hop of hold, and a period of at
+ * least 2 so "decimated" always means something -- stay literals for the
+ * same reason they are literals in lib/aec: they are the SHAPE of the
+ * schedule, not a tuning surface, and neither library exposes them. The ERLE
+ * watchdog's leak and collapse figures are lib/aec's own literals likewise. */
 #define DUTY_PERIOD_DIVISOR       5
 #define DUTY_ERLE_LEAK_DB         0.001f
 #define DUTY_ERLE_COLLAPSE_DB     6.0f
@@ -261,8 +263,11 @@ struct FourAecNrRes {
      * lib/aec's own always-on machine (the duty_* fields in aec.h): the
      * estimator is FED every hop and ANALYSED at full rate until the
      * published estimate has been solid and unchanged for duty_hold_hops,
-     * then 1-in-duty_period_hops until the estimate moves, confidence is
-     * lost, or the watchdog below sees cancellation collapse.
+     * then 1-in-duty_period_hops until the estimate is seen to move, seen to
+     * lose confidence, or the watchdog below sees cancellation collapse. Seen
+     * is the operative word for the first two: only an ANALYSED hop can
+     * republish, so those two triggers land at the next scheduled analysis
+     * and not before (update_shared_delay() carries the bound).
      *
      * duty_erle_peak is a leaky running peak of the LANES' windowed ERLE
      * (the wrapper's stand-in for the single instance's own reading lib/aec
@@ -837,14 +842,15 @@ FourAecNrRes* four_aec_nr_res_init_ex(
         int q_hops = (int)lrintf(cfg_copy.delay_backward_quarantine_s / q_hop_s);
         p->delay_quarantine_hops = q_hops < 1 ? 1 : q_hops;
         p->delay_quarantine_left = -1;   /* disarmed */
-        /* Duty-cycle windows, converted on the same resolved grid and with
-         * the same floors lib/aec applies to its own pair. Converted once
-         * here rather than per hop because this grid cannot change after
-         * init; the values are the ones lib/aec's per-hop conversion would
-         * produce. */
+        /* Duty-cycle windows, taken from the lane config built just above --
+         * the same two fields lib/aec converts for its own machine -- on the
+         * same resolved grid and with the same floors. Converted once here
+         * rather than per hop because this grid cannot change after init; the
+         * values are the ones lib/aec's per-hop conversion would produce from
+         * the same seconds. */
         {
-            int hold = (int)lrintf(DUTY_HOLD_S / q_hop_s);
-            int period = (int)lrintf(DUTY_PERIOD_S / q_hop_s) /
+            int hold = (int)lrintf(aec_cfg.delay_est_init_s / q_hop_s);
+            int period = (int)lrintf(aec_cfg.delay_est_period_s / q_hop_s) /
                          DUTY_PERIOD_DIVISOR;
             p->duty_hold_hops = hold < 1 ? 1 : hold;
             p->duty_period_hops = period < 2 ? 2 : period;
@@ -1099,10 +1105,25 @@ static FourAecNrResDelayState update_shared_delay(
      * render ring gapless, so the matched filter never sees spliced audio --
      * and only the matched-filter ANALYSIS is decimated, and only once the
      * published estimate has held still long enough to make analysing it
-     * again redundant. Any movement, any loss of confidence, or the
-     * cancellation watchdog below re-arms full rate on the very next hop,
-     * so the machine costs latency only where the answer was already
-     * static.
+     * again redundant.
+     *
+     * What re-arms full rate, stated as the contract it actually is: the
+     * estimate is compared against the previous hop's below, and a decimated
+     * hop cannot publish a new one -- so a movement mid-stream is SEEN at the
+     * next SCHEDULED analysis, not on the hop it happens. Full rate then
+     * resumes from the hop that sees it, and the whole exposure is bounded by
+     * one duty period: at most duty_period_hops of extra wait, which is ~96 ms
+     * on every grid this pipeline ships (16 kHz/128 K=12, 16 kHz/256 K=6,
+     * 48 kHz/512 K=9 -- the /5 divisor and the rounding land all three on the
+     * same wall clock). The ERLE watchdog below can shorten that by
+     * disengaging on a cancellation collapse the skipped hops still measure,
+     * but it is armed only once a lane's windowed ERLE clears
+     * DUTY_ERLE_COLLAPSE_DB: on a path where no lane ever cancels that well,
+     * the 1-in-K sampling is the whole re-lock mechanism and re-acquisition
+     * costs a multiple of what full rate would -- measured 2.5x on the
+     * 16 kHz/256 grid, bounded at K, with both arms pinned in
+     * test_4aec_nr_res.c. So the machine costs latency where the answer was
+     * already static, plus one duty period wherever it stops being static.
      *
      * The census is counted HERE, at the one site that consumes the
      * decision, so it can never claim a schedule the estimator did not run. */

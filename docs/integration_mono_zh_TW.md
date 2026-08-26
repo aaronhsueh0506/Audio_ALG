@@ -364,35 +364,37 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout（layout_version=9）、`BACKEND=kiss`、`pipelines/Makefile`
+以下是**本次 checkout（layout_version=10）、`BACKEND=kiss`、`pipelines/Makefile`
 預設選項**下，直接以 `--print-mem-size` 量到的值。換 backend、換編譯選項、更新
 submodule 都會變。
 
-這一輪 `sizeof(Aec)` **沒有動**：長大的是本 pipeline 自己的 control block，因為它
-新增了逐階段計時記錄（`AudioPipelineLastTiming`，24 B）。`sizeof(AudioPipeline)`
-從 152 變 176，`ALIGN16` 之後從 160 變 176，所以 **`req.bytes` 每列 +16 B（不是
-+24，有 8 B 落在原本就有的對齊餘裕裡），而 `aec_bytes`/`fft_bytes`/`nr_bytes`/
-`pipeline_bytes` 四欄一個位元組都沒變。**
+這一輪 `sizeof(Aec)` 由 5832 變 5848 B，AEC pool 依 grid 各長一個常數
+（8 kHz +2,560 B、16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B），
+所以 `aec_bytes` 與 `req.bytes` 兩欄都動了。控制區塊另外再 +16 B：
+`AudioPipelineLastTiming` 直接內嵌 `AecStageTiming`，後者由 16 變 20 B，而
+`ALIGN16(sizeof(AudioPipeline))` 已經沒有餘裕可以吸收，於是
+**控制區塊由 176 變 192 B**。`fft_bytes`/`nr_bytes`/`pipeline_bytes` 三欄未變。
 
 | Config | `req.bytes` | `aec_bytes` | `fft_bytes` | `nr_bytes` | `pipeline_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 357,776 | 275,696 | 8,784 | 67,424 | 5,696 |
-| 16000，預設（256/128） | 516,592 | 379,776 | 8,784 | 122,160 | 5,696 |
-| 16000，`fft_size=512` | 670,800 | 508,848 | 16,976 | 133,472 | 11,328 |
-| 48000，預設（1024/512） | 1,597,536 | 1,167,072 | 33,360 | 374,336 | 22,592 |
-| 16000，`aec_only=1` | 379,952 | 379,776 | 0 | 0 | 0 |
+| 8000，預設 | 360,352 | 278,256 | 8,784 | 67,424 | 5,696 |
+| 16000，預設（256/128） | 522,272 | 385,440 | 8,784 | 122,160 | 5,696 |
+| 16000，`fft_size=512` | 675,936 | 513,968 | 16,976 | 133,472 | 11,328 |
+| 48000，預設（1024/512） | 1,616,016 | 1,185,536 | 33,360 | 374,336 | 22,592 |
+| 16000，`aec_only=1` | 385,632 | 385,440 | 0 | 0 | 0 |
 
 `req.bytes` 減去四個分項（各自 16-byte 對齊後）的差額，就是 `AudioPipeline`
-控制區塊，本次量測在每一組 config 都是 176 B（前一版 160 B，逐階段計時記錄加上來的）。
+控制區塊，本次量測在每一組 config 都是 192 B（前一版 176 B，`AecStageTiming`
+長大帶起來的）。
 
 #### 4.5a delay_mode 對 16000/預設 grid 的影響（`MATCHED` n=5 為 baseline）
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 516,592 | — |
-| `MATCHED` n=1 | 493,680 | −22,912 |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 358,496 | −158,096 |
-| `EXTERNAL_ALIGNED` | 351,584 | −165,008 |
+| `MATCHED` n=5（預設） | 522,272 | — |
+| `MATCHED` n=1 | 499,360 | −22,912 |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 364,176 | −158,096 |
+| `EXTERNAL_ALIGNED` | 357,264 | −165,008 |
 
 這四列的差額全部落在 `aec_bytes`（`delay_mode`/`delay_num_filters` 不影響
 FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致
@@ -562,7 +564,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `2` |
-| 4 | `layout_version` | `uint32_t` | `9` |
+| 4 | `layout_version` | `uint32_t` | `10` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

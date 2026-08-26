@@ -478,15 +478,17 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 | `geometry` 與座標 | 不變 |
 
 `BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設下的 `req.bytes`
-（2026-08-20 重量；最後一欄標明每一列的來源）。本輪 `sizeof(Aec)` 增加 16 B
-（每個 AEC 實例各自帶了逐階段計時記錄），四路各 +16 B，所以每一列都 +64 B：
+（本次 checkout，`layout_version=10`；最後一欄標明每一列的來源）。本輪
+`sizeof(Aec)` 由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數
+（16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B），四路即四倍，
+每一列都跟著移動：
 
 | Config | `req.bytes` | 來源 |
 |---|---:|---|
-| 16000，全預設（256/128，`num_angles=72`） | 1,905,888 | 實測 |
-| 16000，`core.fft_size = 512` | 3,239,376 | 實測 |
-| 16000，`num_angles = 360` | 4,908,000 | 實測（直接呼叫 `get_mem_requirements()`）|
-| 48000，全預設（1024/512，`num_angles=72`） | 6,806,352 | 實測 |
+| 16000，全預設（256/128，`num_angles=72`） | 1,928,592 | 實測 |
+| 16000，`core.fft_size = 512` | 3,259,904 | 實測 |
+| 16000，`num_angles = 360` | 4,930,704 | 實測（直接呼叫 `get_mem_requirements()`）|
+| 48000，全預設（1024/512，`num_angles=72`） | 6,880,256 | 實測 |
 
 ⚠ 覆蓋差異：只有 `num_angles = 72` 的 16 kHz/256 與 48 kHz/1024 兩組會被
 C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_size = 512`
@@ -494,7 +496,7 @@ C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_s
 config 上呼叫 `audio_pipeline_4ch_get_mem_requirements()`，所以它們不會隨程式
 改動自動失效——引用前請自己現查一次。
 
-`num_angles` 從 72 調到 360，記憶體約從 1.91 MB 變成約 4.91 MB（量級可信，
+`num_angles` 從 72 調到 360，記憶體約從 1.93 MB 變成約 4.93 MB（量級可信，
 精確值見上）。**先確認你的角度解析度真的需要那麼細，再調這個值。**
 
 換 backend、換編譯選項、更新 submodule 都會讓上表失效。
@@ -725,7 +727,7 @@ Config：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `5` |
+| 4 | `layout_version` | `uint32_t` | `10` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（直接沿用核心層的值，永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，**已把核心層的 `build_flags_hash` 摺進去** |
 | 16 | `alignment` | `uint32_t` | `16` |

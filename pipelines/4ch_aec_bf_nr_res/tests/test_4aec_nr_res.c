@@ -2411,6 +2411,288 @@ static void test_duty_cycle_machine(void) {
 }
 
 /* ============================================================================
+ * Duty cycle vs a delay change the watchdog cannot see
+ * ========================================================================== */
+
+/* test_duty_cycle_machine's MOVED scene cancels well, so its ERLE watchdog
+ * arms and then fires, and the machine is back at full rate within a few tens
+ * of hops. This is the other half of the contract -- the boundary the core's
+ * own doc comment names, measured instead of asserted in prose.
+ *
+ * Here cancellation is deliberately poor: the echo is the same single path,
+ * but an independent near-end noise of comparable power sits on every
+ * microphone, so the best a lane can do is remove the echo and leave the
+ * noise. That caps lane ERLE near 3 dB, and the watchdog is armed only once
+ * its running peak EXCEEDS DUTY_ERLE_COLLAPSE_DB (6 dB) -- so in this scene
+ * it provably never arms, cannot fire, and the 1-in-K analysis schedule is
+ * the WHOLE re-lock mechanism. The same scene is driven twice, once with the
+ * schedule pinned at full rate through four_aec_nr_res_pin_duty_full_rate()
+ * and once as production runs it, and the two re-lock latencies are printed
+ * side by side.
+ *
+ * This is a CHARACTERIZATION: the numbers below are measured, not derived,
+ * and they exist so a change that makes the gap WORSE fails here instead of
+ * being discovered on a board. K is 6 on this grid because
+ * delay_est_period_s is 0.5 s and the hop is 16 ms
+ * (round(0.5/0.016)/5 = 6); a retune of that field moves K and is SUPPOSED
+ * to land here as a red test that has to be re-measured.
+ *
+ * One non-obvious property, spelled out because the assertions below are
+ * shaped around it: removing the estimate-moved disengage entirely does NOT
+ * move either re-lock latency here -- both arms still re-lock on the same
+ * hop. That rule fires only once the matched filter has ALREADY found the
+ * new peak, so it shortens nothing in this scene, and the census check
+ * further down is what holds it, not the latency bound. Widening K, by
+ * contrast, stops the duty arm re-locking inside the scene at all. */
+
+#define LE_HOP              256
+#define LE_PAD              32768
+#define LE_SHIFT_AT         400
+#define LE_DELAY_A          2048
+#define LE_DELAY_B          4096
+#define LE_ECHO_GAIN        0.6f
+#define LE_NEAR_NOISE_GAIN  0.15f
+#define LE_SETTLED_WINDOW   60
+/* Analysis period in hops at 16 kHz / hop 256, and the full-rate re-lock
+ * bound (measured 319 hops, identical on both backends and both SIMD
+ * settings). The scene runs exactly LE_DUTY_K * LE_FULL_RATE_BOUND hops
+ * after the move, so "the duty arm re-locked before the scene ended" IS the
+ * "within K times the full-rate bound" assertion -- there is no second,
+ * looser number to drift. */
+#define LE_DUTY_K           6
+#define LE_FULL_RATE_BOUND  400
+#define LE_HOPS             (LE_SHIFT_AT + LE_DUTY_K * LE_FULL_RATE_BOUND)
+/* The lane-ERLE figure the watchdog arms on, restated here because the core
+ * keeps it file-local; a divergence makes this test's premise false. */
+#define LE_ERLE_COLLAPSE_DB 6.0f
+
+typedef struct LowErleRun {
+    int acquisition_hop;
+    /* First hop at or after the move that publishes an alignment covering
+     * the new path. Same acceptance window the realign scenes use. */
+    int relock_hop;
+    int relock_delay;
+    int hops_after;
+    int analysed_after;
+    /* Best per-hop lane ERLE anywhere in the run, measured from the core's
+     * own linear output against the microphone it was given -- audio, not a
+     * counter. If this ever clears LE_ERLE_COLLAPSE_DB the scene has stopped
+     * being the scene. */
+    double peak_erle_db;
+    /* The same figure over the settled window immediately before the move. */
+    double settled_erle_db;
+    unsigned long long run;
+    unsigned long long total;
+} LowErleRun;
+
+static void low_erle_run(int pin_full_rate, LowErleRun* out) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* p;
+    float* far_hist;
+    float mic[LE_HOP * FOUR_AEC_NR_RES_CHANNELS];
+    float far[LE_HOP];
+    uint32_t noise_rng = 0x77aa55u;
+    double settled_mic = 0.0;
+    double settled_err = 0.0;
+    unsigned long long previous_run = 0;
+    int hop;
+
+    memset(out, 0, sizeof(*out));
+    out->acquisition_hop = -1;
+    out->relock_hop = -1;
+    out->relock_delay = -1;
+
+    cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
+    cfg.enable_cng = 0;
+    p = four_aec_nr_res_create(&cfg);
+    if (!p) return;
+    if (pin_full_rate) four_aec_nr_res_pin_duty_full_rate(p);
+
+    far_hist = (float*)malloc(
+        (size_t)(LE_HOPS * LE_HOP + LE_PAD) * sizeof(float));
+    if (!far_hist) { four_aec_nr_res_destroy(p); return; }
+    realign_scene_history(far_hist, LE_HOPS * LE_HOP + LE_PAD);
+
+    for (hop = 0; hop < LE_HOPS; ++hop) {
+        FourAecNrResPreFrame pre;
+        int base = hop * LE_HOP + LE_PAD;
+        int dominant = (hop >= LE_SHIFT_AT) ? LE_DELAY_B : LE_DELAY_A;
+        double hop_best = -1.0e30;
+        unsigned long long run_now;
+        int analysed;
+        int i, ch;
+
+        for (i = 0; i < LE_HOP; ++i) {
+            int t = base + i;
+            float echo = LE_ECHO_GAIN * far_hist[t - dominant];
+            float noise;
+            noise_rng ^= noise_rng << 13;
+            noise_rng ^= noise_rng >> 17;
+            noise_rng ^= noise_rng << 5;
+            /* Independent of the far end, so no filter can cancel it: this
+             * is what holds ERLE under the watchdog's arming threshold. */
+            noise = LE_NEAR_NOISE_GAIN *
+                (((float)(noise_rng >> 8) * (1.0f / 16777216.0f)) - 0.5f);
+            far[i] = far_hist[t];
+            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+                mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo + noise;
+        }
+        if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+            FOUR_AEC_NR_RES_OK) break;
+
+        run_now = four_aec_nr_res_duty_hops_run(p);
+        analysed = (int)(run_now - previous_run);
+        previous_run = run_now;
+
+        /* The watchdog reads the BEST of the four lanes, so measure the same
+         * way -- one quiet lane must not be able to fake a low reading. */
+        for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+            double mic_power = 0.0;
+            double err_power = 0.0;
+            for (i = 0; i < LE_HOP; ++i) {
+                double m = (double)mic[i * FOUR_AEC_NR_RES_CHANNELS + ch];
+                double e = (double)pre.linear_interleaved[
+                    i * FOUR_AEC_NR_RES_CHANNELS + ch];
+                mic_power += m * m;
+                err_power += e * e;
+            }
+            if (mic_power > 0.0 && err_power > 0.0) {
+                double db = 10.0 * log10(mic_power / err_power);
+                if (db > hop_best) hop_best = db;
+            }
+            if (ch == 0 && hop >= LE_SHIFT_AT - LE_SETTLED_WINDOW &&
+                hop < LE_SHIFT_AT) {
+                settled_mic += mic_power;
+                settled_err += err_power;
+            }
+        }
+        if (hop_best > -1.0e29 && (hop == 0 || hop_best > out->peak_erle_db))
+            out->peak_erle_db = hop_best;
+
+        if (hop >= LE_SHIFT_AT) {
+            out->hops_after += 1;
+            out->analysed_after += analysed;
+        }
+        if (pre.delay.changed) {
+            if (out->acquisition_hop < 0) out->acquisition_hop = hop;
+            if (hop >= LE_SHIFT_AT && out->relock_hop < 0 &&
+                LE_DELAY_B - pre.delay.delay_samples >= 0 &&
+                LE_DELAY_B - pre.delay.delay_samples <= KD_MAX_UNDERSHOOT) {
+                out->relock_hop = hop;
+                out->relock_delay = pre.delay.delay_samples;
+            }
+        }
+        four_aec_nr_res_abandon_pre(p, &pre.token);
+    }
+
+    out->settled_erle_db = (settled_err > 0.0)
+        ? 10.0 * log10(settled_mic / settled_err) : 0.0;
+    out->run = four_aec_nr_res_duty_hops_run(p);
+    out->total = four_aec_nr_res_duty_hops_total(p);
+    free(far_hist);
+    four_aec_nr_res_destroy(p);
+}
+
+static void test_duty_low_erle_delay_change(void) {
+    LowErleRun full, duty;
+    int full_latency;
+    int duty_latency;
+    int pure_schedule;
+    char label[288];
+
+    low_erle_run(1, &full);
+    low_erle_run(0, &duty);
+
+    full_latency = full.relock_hop >= 0 ? full.relock_hop - LE_SHIFT_AT : -1;
+    duty_latency = duty.relock_hop >= 0 ? duty.relock_hop - LE_SHIFT_AT : -1;
+    /* What a schedule that never went back to full rate would have analysed. */
+    pure_schedule = duty.hops_after / LE_DUTY_K;
+
+    printf("duty low-ERLE: full rate re-locks %d hops after the move "
+           "(%.0f ms), duty %d hops (%.0f ms) -- %.2fx, K=%d; peak lane ERLE "
+           "%.2f dB full / %.2f dB duty (settled %.2f dB, watchdog arms above "
+           "%.1f dB); analysed %d of %d hops after the move against %d for a "
+           "schedule that never disengaged\n",
+           full_latency, (double)full_latency * 16.0,
+           duty_latency, (double)duty_latency * 16.0,
+           full_latency > 0 ? (double)duty_latency / (double)full_latency : 0.0,
+           LE_DUTY_K, full.peak_erle_db, duty.peak_erle_db,
+           duty.settled_erle_db, (double)LE_ERLE_COLLAPSE_DB,
+           duty.analysed_after, duty.hops_after, pure_schedule);
+
+    /* Premise first: if cancellation were good enough to arm the watchdog,
+     * everything below would be measuring the watchdog instead of the
+     * schedule, and the scene would be silently the wrong one. */
+    snprintf(label, sizeof(label),
+             "the scene really does hold lane ERLE under the watchdog's "
+             "arming threshold (peak %.2f dB full / %.2f dB duty, threshold "
+             "%.1f dB)", full.peak_erle_db, duty.peak_erle_db,
+             (double)LE_ERLE_COLLAPSE_DB);
+    CHECK(full.peak_erle_db < (double)LE_ERLE_COLLAPSE_DB &&
+          duty.peak_erle_db < (double)LE_ERLE_COLLAPSE_DB, label);
+
+    snprintf(label, sizeof(label),
+             "both arms acquire the first alignment identically, before the "
+             "schedule can differ (hop %d full, hop %d duty)",
+             full.acquisition_hop, duty.acquisition_hop);
+    CHECK(full.acquisition_hop >= 0 &&
+          full.acquisition_hop == duty.acquisition_hop, label);
+
+    snprintf(label, sizeof(label),
+             "full rate re-locks the moved path within its measured bound "
+             "(%d hops after the move, bound %d, applied %d for a true %d)",
+             full_latency, LE_FULL_RATE_BOUND, full.relock_delay, LE_DELAY_B);
+    CHECK(full_latency > 0 && full_latency <= LE_FULL_RATE_BOUND &&
+          LE_DELAY_B - full.relock_delay >= 0 &&
+          LE_DELAY_B - full.relock_delay <= KD_MAX_UNDERSHOOT, label);
+
+    /* The scene is exactly LE_DUTY_K * LE_FULL_RATE_BOUND hops long after the
+     * move, so re-locking at all inside it IS re-locking within K times the
+     * full-rate bound. */
+    snprintf(label, sizeof(label),
+             "duty re-locks the same path within K times that bound (%d hops "
+             "after the move, bound %d = %dx%d, applied %d)",
+             duty_latency, LE_DUTY_K * LE_FULL_RATE_BOUND, LE_DUTY_K,
+             LE_FULL_RATE_BOUND, duty.relock_delay);
+    CHECK(duty_latency > 0 &&
+          duty_latency <= LE_DUTY_K * LE_FULL_RATE_BOUND &&
+          LE_DELAY_B - duty.relock_delay >= 0 &&
+          LE_DELAY_B - duty.relock_delay <= KD_MAX_UNDERSHOOT, label);
+
+    /* The gap is the point. A build where the two arms cost the same has
+     * either stopped decimating or stopped honouring the pin, and every
+     * bound above would still be green. */
+    snprintf(label, sizeof(label),
+             "and it really is slower than full rate -- the gap this scene "
+             "exists to document (%d vs %d hops, %d hops of extra wait)",
+             duty_latency, full_latency, duty_latency - full_latency);
+    CHECK(duty_latency > full_latency, label);
+
+    snprintf(label, sizeof(label),
+             "the machine stayed engaged across the whole re-acquisition "
+             "(%d of %d hops analysed after the move; full rate would be %d)",
+             duty.analysed_after, duty.hops_after, duty.hops_after);
+    CHECK(duty.analysed_after > 0 &&
+          duty.analysed_after * 4 < duty.hops_after, label);
+
+    /* ...but it did disengage, once. The estimate-moved re-arm shortens no
+     * latency here (see this block's header), so the census is the only
+     * evidence it ran at all: a schedule that never disengaged would analyse
+     * exactly hops_after/K hops and not one more. */
+    snprintf(label, sizeof(label),
+             "the estimate-moved re-arm still fires once the filter finds the "
+             "new peak (%d analysed, more than the %d a never-disengaging "
+             "schedule would)", duty.analysed_after, pure_schedule);
+    CHECK(duty.analysed_after > pure_schedule, label);
+
+    snprintf(label, sizeof(label),
+             "the pinned arm analysed every hop and the census says so "
+             "(%llu of %llu)", full.run, full.total);
+    CHECK(full.total == (unsigned long long)LE_HOPS &&
+          full.run == full.total, label);
+}
+
+/* ============================================================================
  * Cross-lane far-end spectrum guard
  * ========================================================================== */
 
@@ -2869,6 +3151,7 @@ int main(void) {
     test_shared_delay_change_admission();
     test_delay_change_candidate_ttl();
     test_duty_cycle_machine();
+    test_duty_low_erle_delay_change();
     test_far_spec_provenance_guard();
     test_runtime_strength();
     test_stage_timing();

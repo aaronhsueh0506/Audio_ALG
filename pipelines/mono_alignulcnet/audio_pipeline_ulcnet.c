@@ -80,8 +80,15 @@
  * stage-timing record -- aec_get_last_timing(), aec.h), so every AEC
  * carved out of this pool moves the total and the offsets after it. Carve
  * order and buffer set are unchanged, so build_flags_hash does not move --
- * this counter is the only signal. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 9u
+ * this counter is the only signal.
+ * Version 10: the lib/aec pin moved to the hop-cost revision. sizeof(Aec)
+ * grew 5832 -> 5848 B and the AEC pool grew by a per-grid constant (+5,120 B
+ * on this wrapper's 16 kHz/512 grid), so the AEC carved out of this pool
+ * moves the total and the offsets after it -- and the per-filter step of
+ * 5,728 B for delay_num_filters is unchanged, so every n moves by the same
+ * constant. Carve order and buffer set are unchanged, so build_flags_hash
+ * does not move -- this counter is the only signal. */
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 10u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
  * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"/\"ne10\"

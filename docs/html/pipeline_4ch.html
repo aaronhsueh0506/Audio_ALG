@@ -34,7 +34,7 @@ th{background:#eef0f5}
 <li><b>完整 wrapper <code>audio_pipeline_4ch</code></b>:把 SRP-PHAT DOA + GSC(<code>third_party/doa</code>、<code>third_party/GSC</code>)接進 pre/post 縫,並提供保守 energy-VAD fallback。</li>
 </ul>
 <p>結構稽核值(<code>*_count()</code>):<code>matched_filter</code> 依 <code>cfg.delay_mode</code> 而定——<code>MATCHED</code> 時 1,<code>FIXED</code>/<code>EXTERNAL_ALIGNED</code> 時 0(無 estimator 可數);<code>linear_aec</code> 恆 4;<code>nr</code>/<code>post_res</code> 依 <code>cfg.enable_post</code> 而定,啟用時各 1、停用時各 0。Lane 0 每 hop 跑真 far-FFT,lane 1–3 經 <code>aec_process_context_shared_far()</code> 借用 lane 0 的 far 頻譜(4 次 far-FFT → 1 次,測試以 <code>four_aec_nr_res_far_fft_real_compute_count()</code> 證明)。支援 16 kHz(fft 256 預設 / 512 明示)與 48 kHz(fft 1024)。</p>
-<p><b>共用 estimator 的 duty-cycle(<code>MATCHED</code>)</b>:與 mono lib 同一套機器——估計 solid 且 0.3 s 不變後,matched-filter 分析降為 1-in-K(K=0.5s/hop÷5);estimator 每 hop 照餵(decimation 只作用於分析,不作用於音訊),delay 改變/信心流失/windowed-ERLE 自洩漏峰值崩 6 dB 任一發生即回全速。實測 shared delay 段 17.0→4.3µs/hop,delay 軌跡與全速版逐 hop 相同。census:<code>four_aec_nr_res_duty_hops_run()</code>(實跑分析的 hop)對 <code>four_aec_nr_res_duty_hops_total()</code>(=<code>estimator_calls</code> 的別名,分母)。已知邊界:ERLE 低於 6 dB 崩潰閾值可觸及的場景中,delay change 的 re-lock 由 1-in-K 取樣承擔,比全速慢約 K 倍(mono 同款行為)。</p>
+<p><b>共用 estimator 的 duty-cycle(<code>MATCHED</code>)</b>:與 mono lib 同一套機器,兩個視窗直接讀自本層已經建好的 lane <code>AecConfig</code>(<code>delay_est_init_s</code>/<code>delay_est_period_s</code>,預設 0.3 s/0.5 s)——估計 solid 且 <code>delay_est_init_s</code> 不變後,matched-filter 分析降為 1-in-K(K=<code>delay_est_period_s</code>/hop÷5:16k/128 為 12、16k/256 為 6、48k/512 為 9,三個格點的 duty 週期都是 ~96 ms);estimator 每 hop 照餵(decimation 只作用於分析,不作用於音訊)。<b>回全速的時機不是「立刻」</b>:被略過的 hop 不會發佈新估計,所以 delay 改變/信心流失只能在<b>下一個排定的分析</b>被看見,全速從看見的那個 hop 起恢復——最壞多等一個 duty 週期(~96 ms)。windowed-ERLE 自洩漏峰值崩 6 dB 的看門狗可以提早喚醒它,但它必須先讓峰值超過同一個 6 dB 才會武裝。實測 shared delay 段 17.0→4.3µs/hop,delay 軌跡與全速版逐 hop 相同。census:<code>four_aec_nr_res_duty_hops_run()</code>(實跑分析的 hop)對 <code>four_aec_nr_res_duty_hops_total()</code>(=<code>estimator_calls</code> 的別名,分母)。已知邊界(已由 <code>test_4aec_nr_res.c</code> 的低 ERLE A/B 場景釘住):lane ERLE 壓在 6 dB 之下時看門狗永遠不會武裝,delay change 的 re-lock 完全由 1-in-K 取樣承擔——16k/256 實測全速 319 hops(5.10 s)、duty 805 hops(12.88 s),2.52 倍,峰值 lane ERLE 3.3 dB(mono 同款行為)。</p>
 
 <h2>API 用法</h2>
 <pre>/* 完整 wrapper(含 SRP/GSC) */
@@ -165,10 +165,10 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <p>n_freqs = 129(16k/256)/ 257(16k/512)/ 513(48k/1024)。</p>
 
 <h2>State 表</h2>
-<p>單一 caller pool,wrapper carve 順序 <code>self, core, srp, gsc, gsc_spectrum, gsc_weights</code>;核心自己再 carve 4 lane + NR + FFT + 工作 buffer。<b>2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10</b>(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>)。下表的核心與完整 wrapper 合計已於 2026-08-19 重跑 ne10/kiss；未分 backend 的核心細項是 KISS breakdown 參考值。本輪 <code>ALIGN16(sizeof(Aec))</code> 跨過 16-byte 邊界,四路各 +16 B,所以核心與 wrapper 合計都 +64 B:</p>
+<p>單一 caller pool,wrapper carve 順序 <code>self, core, srp, gsc, gsc_spectrum, gsc_weights</code>;核心自己再 carve 4 lane + NR + FFT + 工作 buffer。<b>2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10</b>(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>)。下表的核心與完整 wrapper 合計已隨本次 <code>lib/aec</code> pin 重跑 ne10/kiss；未分 backend 的核心細項是 KISS breakdown 參考值。本輪 <code>sizeof(Aec)</code> 由 5832 變 5848 B,每個實例的 pool 依 grid 各長一個常數(16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B),四路即四倍,所以核心與 wrapper 合計一起移動:</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td>4× <code>Aec</code> lanes</td><td>1,375,360 B(@16k/512,kiss;ne10 1,369,856 B)</td><td>pool(core)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)。本列是<b>校正</b>而非 +64 B:先前記的 1,516,288 B 是 lane 還自帶 estimator/ring 那一代的舊值,現值取自 <code>four_aec_nr_res_get_mem_breakdown()</code> 的 <code>aec_bytes</code>(單路 343,840 B × 4,即 <code>lib/aec</code> 的 <code>EXTERNAL_ALIGNED</code> @16k/512)</td></tr>
+<tr><td>4× <code>Aec</code> lanes</td><td>1,395,840 B(@16k/512,kiss;ne10 1,390,336 B)</td><td>pool(core)</td><td>lane 各自 PBFDKF/shadow/context;<code>enable_delay_est=0</code>(delay 共用)。取自 <code>four_aec_nr_res_get_mem_breakdown()</code> 的 <code>aec_bytes</code>(單路 348,960 B × 4,即 <code>lib/aec</code> 的 <code>EXTERNAL_ALIGNED</code> @16k/512)</td></tr>
 <tr><td><code>DelayAec3 shared_delay</code></td><td>struct 內嵌</td><td>C struct(core)</td><td>48k 時內建 anti-alias 降頻 sidechain</td></tr>
 <tr><td><code>delay_ring</code></td><td>[ring] f32;ring=ceil(max_delay_ms×sr/1000)+2·hop+1</td><td>pool(core)</td><td>預設 1024 ms → 16,641 samples @16k/128</td></tr>
 <tr><td><code>MmseLsaDenoiser</code>(×1)</td><td>133,472 B(@16k/512)</td><td>pool(core)</td><td>mono NR</td></tr>
@@ -178,8 +178,8 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>GSC 借用 <code>srp-&gt;a_array</code></td></tr>
 <tr><td><code>GSC</code>(RLS P/weights)</td><td>P:16×n_freqs Complex;wa:4×n_freqs Complex</td><td>pool(wrapper)</td><td>內部排列 <code>P[M][M][F]</code>;AArch64 每次更新 4 bins，逐 hop 對 scalar oracle 做 P/wa/output byte-exact 測試。lambda 0.995 經 <code>mmse_lsa_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
 <tr><td>auto-VAD(<code>noise_power/vad_hangover</code>)</td><td>純量</td><td>C struct(wrapper)</td><td>-55 dBFS / SNR 3.0 / hangover 8(retimed);EMA 0.999/0.95(retimed)</td></tr>
-<tr><td>核心合計 @16k/512</td><td>1,662,464 B(ne10;kiss 1,669,344 B)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,480,416 B(kiss 1,485,920 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
-<tr><td>完整 wrapper 合計</td><td>1,902,848 B @16k/256(預設)/ 6,791,792 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,layout_version=9);由 static smoke 的 <code>Total:</code> 行印出(kiss:1,905,888 B @16k/256 / 6,806,352 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
+<tr><td>核心合計 @16k/512</td><td>1,682,992 B(ne10;kiss 1,689,872 B)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,500,944 B(kiss 1,506,448 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
+<tr><td>完整 wrapper 合計</td><td>1,925,552 B @16k/256(預設)/ 6,865,696 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,layout_version=10);由 static smoke 的 <code>Total:</code> 行印出(kiss:1,928,592 B @16k/256 / 6,880,256 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
@@ -193,8 +193,8 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心(pre/post/abandon、token、fused post;layout v14)</td></tr>
-<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code></td><td>完整 wrapper(SRP/GSC/auto-VAD;layout v9)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心(pre/post/abandon、token、fused post;layout v15)</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h / .c</code></td><td>完整 wrapper(SRP/GSC/auto-VAD;layout v10)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_projection_kernels.h</code></td><td>投影 kernels(cmac/residual/comfort/mag2)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/third_party/{doa,GSC,utility}</code></td><td>SRP-PHAT / GSC / spatial SIMD</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c</code> / <code>audio_pipeline_4ch_static.c</code>；<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c</code></td><td>應用 CLI 與 core 靜態記憶體 smoke</td></tr>

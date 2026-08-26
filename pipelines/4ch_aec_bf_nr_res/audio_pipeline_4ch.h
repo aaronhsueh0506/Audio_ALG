@@ -138,7 +138,11 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * in THIS layer's carve changed, and build_flags_hash cannot see it.
  * Version 10 carries the core's own layout 14 -> 15 (its control block gained
  * the fuse stage's far-end provenance flag and the matched-filter duty-cycle
- * state and census). Same shape once more. */
+ * state and census). Same shape once more. It also carries the lib/aec pin
+ * that shipped with it: sizeof(Aec) grew 5832 -> 5848 B and the per-instance
+ * pool grew by a per-grid constant, so the four lanes inside the composed
+ * core sub-pool move this layer's total too. Same release unit, so one bump
+ * covers both -- a version-9 descriptor is refused for either reason. */
 #define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 10u
 
 /**

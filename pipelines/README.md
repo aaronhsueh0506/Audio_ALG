@@ -127,39 +127,39 @@ context and the AEC-internal FFTs. Since NE10 vendored patch P0001 the NE10
 twiddle configs are carved from these pools too, so both columns are the
 complete memory requirement (strict init→destroy zero-heap on both backends):
 
-Re-measured after this pipeline's own per-hop stage-timing record landed
-(descriptor now reports layout_version=9). `sizeof(Aec)` did NOT move this
-round -- the record lives in this pipeline's control block, so the AEC column
-is unchanged and only the Total moved, by +16 B; see the note under the table.
-Measured via `"$(make -s print-bin-dir)"/aec_nr_pipeline_static
---print-mem-size balanced --sample-rate <sr> [--fft-size <alt>]` on both
-backends, against the current grid (16 kHz default is 256/128 — see "Parameter
-Alignment" above). 16 kHz's alternate 512/256 grid is included since it remains
-explicitly selectable. This table is a RECONCILIATION, not a plain increment:
-its AEC column had also been one earlier ABI generation (32 B) behind
-`lib/aec`'s own tables, so each row moved by 48 B in total and the two
-documents now agree.
+Re-measured against the current `lib/aec` pin (descriptor now reports
+layout_version=10). Both the AEC column and the control block moved this
+round: `sizeof(Aec)` grew 5832 -> 5848 B and the AEC pool grew by a per-grid
+constant (+2,560 B @8 kHz, +5,664 B @16 kHz/256, +5,120 B @16 kHz/512,
++18,464 B @48 kHz), while `AudioPipelineLastTiming` embeds `AecStageTiming`
+verbatim, which went 16 -> 20 B and pushed the control block 176 -> 192 B --
+see the note under the table. Measured via
+`"$(make -s print-bin-dir)"/aec_nr_pipeline_static --print-mem-size balanced
+--sample-rate <sr> [--fft-size <alt>]` on both backends, against the current
+grid (16 kHz default is 256/128 — see "Parameter Alignment" above). 16 kHz's
+alternate 512/256 grid is included since it remains explicitly selectable.
 
 | Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |--------|-----|-----------|-----|---------------|-----------|
-| **8 kHz KISS** | 275,696 B | 8,784 B | 67,424 B | 5,696 B | **357,776 B (349.4 KB)** |
-| **8 kHz NE10** | 275,088 B | 8,176 B | 67,424 B | 5,696 B | **356,560 B (348.2 KB)** |
-| **16 kHz KISS (default, 256/128)** | 379,776 B | 8,784 B | 122,160 B | 5,696 B | **516,592 B (504.5 KB)** |
-| **16 kHz NE10 (default, 256/128)** | 379,168 B | 8,176 B | 122,160 B | 5,696 B | **515,376 B (503.3 KB)** |
-| **16 kHz KISS (alt, 512/256)** | 508,848 B | 16,976 B | 133,472 B | 11,328 B | **670,800 B (655.1 KB)** |
-| **16 kHz NE10 (alt, 512/256)** | 507,472 B | 15,600 B | 133,472 B | 11,328 B | **668,048 B (652.4 KB)** |
-| **48 kHz KISS** | 1,167,072 B | 33,360 B | 374,336 B | 22,592 B | **1,597,536 B (1,560.1 KB)** |
-| **48 kHz NE10** | 1,164,160 B | 30,448 B | 374,336 B | 22,592 B | **1,591,712 B (1,554.4 KB)** |
+| **8 kHz KISS** | 278,256 B | 8,784 B | 67,424 B | 5,696 B | **360,352 B (351.9 KB)** |
+| **8 kHz NE10** | 277,648 B | 8,176 B | 67,424 B | 5,696 B | **359,136 B (350.7 KB)** |
+| **16 kHz KISS (default, 256/128)** | 385,440 B | 8,784 B | 122,160 B | 5,696 B | **522,272 B (510.0 KB)** |
+| **16 kHz NE10 (default, 256/128)** | 384,832 B | 8,176 B | 122,160 B | 5,696 B | **521,056 B (508.8 KB)** |
+| **16 kHz KISS (alt, 512/256)** | 513,968 B | 16,976 B | 133,472 B | 11,328 B | **675,936 B (660.1 KB)** |
+| **16 kHz NE10 (alt, 512/256)** | 512,592 B | 15,600 B | 133,472 B | 11,328 B | **673,184 B (657.4 KB)** |
+| **48 kHz KISS** | 1,185,536 B | 33,360 B | 374,336 B | 22,592 B | **1,616,016 B (1,578.1 KB)** |
+| **48 kHz NE10** | 1,182,624 B | 30,448 B | 374,336 B | 22,592 B | **1,610,192 B (1,572.5 KB)** |
 
 The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW.md` §4 — re-measure from
 there rather than editing it here, and always prefer the value
 `audio_pipeline_get_mem_requirements()` returns at runtime.
 
-(Totals include the 176 B `AudioPipeline` control block, not broken out as
-its own column above. It grew 160 -> 176 B when the per-hop stage-timing
-record was added: the record is 24 B, but 8 B of it landed in ALIGN16 slack
-the struct already had, so every Total above moved by 16 B and no per-module
-column moved at all.)
+(Totals include the 192 B `AudioPipeline` control block, not broken out as
+its own column above. It grew 176 -> 192 B with the `AecStageTiming` growth
+described above: the record itself gained 4 B, but `ALIGN16(sizeof(
+AudioPipeline))` had no slack left to absorb it, so the whole 16 B lands in
+every Total. That is measured from `--print-mem-size`, which reports the
+control block directly, not derived from the struct.)
 
 > filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072
 > taps、6 partitions at hop=512），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮
@@ -353,19 +353,26 @@ power). `nr:` fields are `MmseLsaDebugStatus` (`init` = noise-floor initialized;
 
 The AEC3 matched-filter delay estimator duty-cycles itself — no flag or
 config field: once the delay estimate is solid (confidence 1.0) and unchanged
-for `delay_est_period_s` (default 0.5s), analysis drops to 1 hop in every K
-(K=10 by default) instead of every hop — full-rate analysis resumes
-immediately if the estimate changes, loses solidity, or ERLE drops >6dB off
-its running peak. **Sampled-quality-verified ~zero cost** (60-case AECMOS:
-≤+0.014 / worst −0.006). On a stable-delay clip the decimated schedule never
-actually skips a *different* outcome; verified here on
+for `delay_est_init_s` (default 0.3s), analysis drops to 1 hop in every
+K = round(`delay_est_period_s`/hop)/5 instead of every hop — K = 12 at
+8 ms hops, 6 at 16 ms, 9 at 10.67 ms, i.e. a duty period of ~96 ms on all
+three of this pipeline's grids. Full-rate analysis resumes when the estimate
+changes, loses solidity, or ERLE drops >6dB off its running peak.
+**Sampled-quality-verified ~zero cost** (60-case AECMOS: ≤+0.014 / worst
+−0.006). On a stable-delay clip the decimated schedule never actually skips a
+*different* outcome; verified here on
 `wav/aec_challenge_blind/doubletalk/0I0XMl3M0ECO0U1N0cJvpg_*`.
 
-Note: in THIS pipeline the ERLE-watchdog resume leg is inert — the AEC runs
-linear-mode (`enable_res=0`) so `last_erle_windowed` is never updated (same
-root cause as the `--debug` `erle=0.0` caveat above). Full-rate analysis
-still resumes on estimate change or lost solidity, which are the primary
-resume paths.
+Two things that read as "immediately" but are not. First, a decimated hop
+publishes no new estimate, so "the estimate changed" can only be observed on
+an ANALYSED hop: a delay movement mid-stream is seen at the next scheduled
+analysis, and full rate resumes from the hop that sees it — up to one duty
+period (~96 ms) later than the movement itself. Second, in THIS pipeline the
+ERLE-watchdog resume leg is inert — the AEC runs linear-mode
+(`enable_res=0`) so `last_erle_windowed` is never updated (same root cause as
+the `--debug` `erle=0.0` caveat above). Together that leaves the
+1-in-K-sampled estimate change as the only resume path here, which is exactly
+the bound above and not a shorter one.
 
 ## Two Versions
 

@@ -200,7 +200,11 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * lane gained its per-hop stage-timing record). Same carve-token reason.
  * Version 14 carries the core's own layout 14 -> 15 (its control block gained
  * the fuse stage's far-end provenance flag and the matched-filter duty-cycle
- * state and census). Same carve-token reason. */
+ * state and census). Same carve-token reason. It also carries the lib/aec pin
+ * that shipped with it: sizeof(Aec) grew 5832 -> 5848 B and the per-instance
+ * pool grew by a per-grid constant, so the four lanes inside the composed
+ * pre-only core sub-pool move this layer's total too. One release unit, one
+ * bump -- a version-13 descriptor is refused for either reason. */
 #define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 14u
 
 /**

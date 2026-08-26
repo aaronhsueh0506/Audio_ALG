@@ -428,23 +428,25 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是 2026-08-20、`BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED`（預設,
-n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backend、換編譯
-選項、更新 submodule 都會變。本輪 `sizeof(Aec)` 增加 16 B（每個 AEC 實例各自帶了逐階段計時記錄，
-`aec_get_last_timing()`），四路各 +16 B，所以 `aec_bytes` 與 `req.bytes`
-每列 +64 B；`nr_bytes`／`fft_bytes`／`wrapper_bytes` 不動，所有差額不變。
+以下是本次 checkout（`layout_version=15`）、`BACKEND=kiss`、`SIMD=1`、
+`delay_mode=MATCHED`（預設,n=5）、`enable_post=1`（預設）下直接呼叫 API
+量到的值。換 backend、換編譯選項、更新 submodule 都會變。本輪 `sizeof(Aec)`
+由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數
+（16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B），四路即四倍，
+所以 `aec_bytes` 與 `req.bytes` 兩欄一起移動；`nr_bytes`／`fft_bytes`／
+`wrapper_bytes` 不動，所有差額不變。
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `nr_bytes` | `fft_bytes` | `wrapper_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,113,584 | 859,072 | 122,160 | 8,784 | 123,568 |
-| 16000，`fft_size=512` | 1,669,344 | 1,375,360 | 133,472 | 16,976 | 143,536 |
-| 16000，`max_delay_ms=100` | 1,054,448 | 859,072 | 122,160 | 8,784 | 64,432 |
-| 16000，`filter_length=512` | 1,026,992 | 772,480 | 122,160 | 8,784 | 123,568 |
-| 48000，預設（1024/512） | 3,680,864 | 2,954,176 | 374,336 | 33,360 | 318,992 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,136,288 | 881,728 | 122,160 | 8,784 | 123,616 |
+| 16000，`fft_size=512` | 1,689,872 | 1,395,840 | 133,472 | 16,976 | 143,584 |
+| 16000，`max_delay_ms=100` | 1,077,152 | 881,728 | 122,160 | 8,784 | 64,480 |
+| 16000，`filter_length=512` | 1,037,280 | 782,720 | 122,160 | 8,784 | 123,616 |
+| 48000，預設（1024/512） | 3,754,768 | 3,028,032 | 374,336 | 33,360 | 319,040 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
-`aec_bytes` 除以 4 得單路 214,752 B（@16k/256）——與 `lib/aec` 的
+`aec_bytes` 除以 4 得單路 220,432 B（@16k/256）——與 `lib/aec` 的
 `AEC_DELAY_EXTERNAL_ALIGNED` 單體大小完全相同,因為每路內部本來就是
 `EXTERNAL_ALIGNED`（delay 由本層共用估計器提供,不建自己的 estimator/ring）。
 
@@ -452,9 +454,9 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 1,113,584 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,019,984 | −93,600 |
-| `EXTERNAL_ALIGNED` | 1,013,072 | −100,512 |
+| `MATCHED` n=5（預設） | 1,136,288 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,042,688 | −93,600 |
+| `EXTERNAL_ALIGNED` | 1,035,776 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
@@ -464,13 +466,13 @@ n=5）、`enable_post=1`（預設）下直接呼叫 API 量到的值。換 backe
 
 | Config | `req.bytes` |
 |---|---:|
-| 16000，`fft_size=512`，`enable_post=0` | 1,485,920 |
+| 16000，`fft_size=512`，`enable_post=0` | 1,506,448 |
 
 即 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 記載的 ULCNet
 4ch wrapper私有核心大小；比同格點 `enable_post=1` 少 183,424 B（NR/RES/iFFT
-的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。本輪同樣 +64 B（四路各 +16 B；`enable_post=0` 的
-wrapper 仍為 110,560 B，與後端無關），兩側同幅移動，所以差額維持實測的
-183,424 B。
+的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。本輪同樣是四路各長
+5,120 B（@16 kHz/512；`enable_post=0` 的 wrapper 為 110,608 B，與後端無關），
+兩側同幅移動，所以差額維持實測的 183,424 B。
 **實際配置一律以 `req.bytes` 為準。**
 
 ---
@@ -699,7 +701,7 @@ pre/post 協定：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `11` |
+| 4 | `layout_version` | `uint32_t` | `15` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

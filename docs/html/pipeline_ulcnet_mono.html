@@ -155,7 +155,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <p>infer 介面:<code>int infer(void* user, const float err_re[257], err_im[257], far_re[257], far_im[257], float out_re[257], out_im[257])</code>;回 0=成功。</p>
 
 <h2>State 表</h2>
-<p>Carve 順序(layout v9):self 控制塊(內嵌 Ulcnet 狀態、delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ AEC pool → 共用 512 點 <code>FftHandle</code>(err-analysis/far-analysis/synthesis 三者共用,hop 內嚴格序列使用;<code>BACKEND=kiss/ne10</code> 真正選到 ULCNet FFT)。實測 descriptor(ne10, balanced,2026-08-20 重跑):<code>bytes=556,096</code>、descriptor_version=1、layout_version=9、alignment=16。此為預設 MATCHED n=5；pool 隨 n 每 filter ±5,728 B(n=1..5 實測 533,184 / 538,912 / 544,640 / 550,368 / 556,096 B),改 n 須重查 pool 重 init(kiss 同日實測:535,936 / 541,664 / 547,392 / 553,120 / 558,848 B)。兩個 backend 的每一階相對前次記載都 +16 B(<code>sizeof(Aec)</code> 因逐階段計時記錄增加 16 B),每 filter 5,728 B 的階距不變;descriptor 同時由 layout 8 升到 9。<b>換 backend/編譯選項/submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
+<p>Carve 順序(layout v10):self 控制塊(內嵌 Ulcnet 狀態、delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ AEC pool → 共用 512 點 <code>FftHandle</code>(err-analysis/far-analysis/synthesis 三者共用,hop 內嚴格序列使用;<code>BACKEND=kiss/ne10</code> 真正選到 ULCNet FFT)。實測 descriptor(ne10, balanced,本次 <code>lib/aec</code> pin 重跑):<code>bytes=561,216</code>、descriptor_version=1、layout_version=10、alignment=16。此為預設 MATCHED n=5；pool 隨 n 每 filter ±5,728 B(n=1..5 實測 538,304 / 544,032 / 549,760 / 555,488 / 561,216 B),改 n 須重查 pool 重 init(kiss 同時實測:541,056 / 546,784 / 552,512 / 558,240 / 563,968 B)。兩個 backend 的每一階相對前次記載都 +5,120 B(<code>sizeof(Aec)</code> 由 5832 變 5848 B,AEC pool 在本 wrapper 的 16 kHz/512 格點長 5,120 B),每 filter 5,728 B 的階距不變;descriptor 同時由 layout 9 升到 10。<b>換 backend/編譯選項/submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td><code>Aec</code> 全狀態</td><td>pool 內(16k/512 grid)</td><td>pool(C struct)</td><td><code>enable_res=0 / return_res_context=1</code>;delay estimation 開(preset 預設)</td></tr>
@@ -166,8 +166,8 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <tr><td><code>ulcnet_window</code></td><td>[512] f32</td><td>C struct(self)</td><td>共用 sqrt-Hann 表,三個 chain struct 指向它</td></tr>
 <tr><td>幀 scratch <code>err/far[2][257]×2, mdl[257]×2</code></td><td>~10 KB</td><td>C struct(self)</td><td>hop#1 一次吐 2 幀所需</td></tr>
 <tr><td><code>model</code>(by value)+delay transition+<code>reprime_frames</code></td><td>純量級</td><td>C struct(self)</td><td>model 指標指向物由 caller 保活;<code>reprime_frames</code> 在 alignment 邊界武裝為 <code>AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES</code>=1,每發射一幀遞減</td></tr>
-<tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 export D;D=8 參考值 71,040 B(見上方 accelerator adapter 節)</td><td><b>host/CPU 端獨立 pool</b>(參考實作 <code>ulcnet_model_io.c</code>;真正的矩陣運算在 NPU,但 state 本身活在 CPU RAM,經 <code>UlcnetModelIoInputs/Outputs</code> 每幀搬進搬出)</td><td>不在本頁 556,096 B pool 內;pipeline 只透過 <code>model.reset</code> 要求 flush(對應 <code>ulcnet_model_io_reset()</code>)</td></tr>
-<tr><td>合計 pool</td><td>556,096 B(543.0 KB)</td><td>host 擁有 pool 記憶體</td><td>init→destroy 零 heap(create() 除外)</td></tr>
+<tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 export D;D=8 參考值 71,040 B(見上方 accelerator adapter 節)</td><td><b>host/CPU 端獨立 pool</b>(參考實作 <code>ulcnet_model_io.c</code>;真正的矩陣運算在 NPU,但 state 本身活在 CPU RAM,經 <code>UlcnetModelIoInputs/Outputs</code> 每幀搬進搬出)</td><td>不在本頁 561,216 B pool 內;pipeline 只透過 <code>model.reset</code> 要求 flush(對應 <code>ulcnet_model_io_reset()</code>)</td></tr>
+<tr><td>合計 pool</td><td>561,216 B(548.1 KB)</td><td>host 擁有 pool 記憶體</td><td>init→destroy 零 heap(create() 除外)</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
@@ -182,7 +182,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/mono_alignulcnet/audio_pipeline_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v7)</td></tr>
+<tr><td><code>pipelines/mono_alignulcnet/audio_pipeline_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v10)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_process.h / .c</code></td><td>C 前後處理 + <code>UlcnetModel</code> 邊界(Python parity gate:<code>AIAEC/tests/test_ulcnet_process_c.py</code>,~1e-5 float-ULP 級)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.h / .c</code></td><td>accelerator adapter(無狀態 run() callback 包裝,見上方專節)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_model_io.h / .c</code></td><td>CPU 端 K/V ring / logit 史 / GRU hidden state,內建 v5 固定前後端(signed-pow 特徵/逆冪);Python parity:<code>AIAEC/tests/test_ulcnet_model_io_c.py</code></td></tr>

@@ -140,8 +140,18 @@
  * or not the timing is compiled in, so a profile build and a release build
  * still carve byte-identical pools. Carve order and buffer set are
  * unchanged, so build_flags_hash does not move -- this counter is the only
- * signal. */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 9u
+ * signal.
+ * Bumped 9->10: the lib/aec pin moved to the hop-cost revision. sizeof(Aec)
+ * grew 5832 -> 5848 B and the AEC pool grew by a per-grid constant (+5,664 B
+ * @16 kHz/256, +5,120 B @16 kHz/512, +18,464 B @48 kHz/1024, +2,560 B @8 kHz
+ * /256), so the AEC carved out of this pool moves the total and every offset
+ * after it. This layer's OWN control block moves with it, by a further 16 B:
+ * AudioPipelineLastTiming embeds AecStageTiming verbatim (audio_pipeline.h
+ * says why), that struct went 16 -> 20 B, and ALIGN16(sizeof(AudioPipeline))
+ * had no slack left to absorb it -- 176 -> 192 B, measured through
+ * `--print-mem-size`, not derived. Carve order and buffer set are unchanged,
+ * so build_flags_hash does not move -- this counter is the only signal. */
+#define AUDIO_PIPELINE_LAYOUT_VERSION 10u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
  * -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" or \"ne10\" to match its own

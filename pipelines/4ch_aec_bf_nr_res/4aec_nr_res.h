@@ -133,7 +133,15 @@ extern "C" {
  *      flag and the matched-filter duty-cycle machine's state and census
  *      (see four_aec_nr_res_duty_hops_total() below). Control-block-only
  *      again -- no new REGION, no carve-order change, build_flags_hash
- *      unmoved -- so this counter is once more the whole signal. */
+ *      unmoved -- so this counter is once more the whole signal.
+ *
+ *      The same release pins lib/aec at the hop-cost revision, where
+ *      sizeof(Aec) grew 5832 -> 5848 B and the per-instance pool grew by a
+ *      per-grid constant (+5,664 B @16 kHz/256, +5,120 B @16 kHz/512,
+ *      +18,464 B @48 kHz/1024 -- four lanes here, so four times that). That
+ *      moves the total and every offset after the first lane as well. Two
+ *      reasons to refuse a version-14 descriptor, one release unit, one
+ *      bump: this counter is not incremented twice for the same ship. */
 #define FOUR_AEC_NR_RES_LAYOUT_VERSION 15u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
@@ -655,8 +663,13 @@ int four_aec_nr_res_pending_delay_candidate(const FourAecNrRes* p);
  * matched-filter analysis. _run / _total is therefore the MEASURED engagement
  * -- the saving stops being a design intention and becomes a number a caller
  * can print -- which matters because the machine re-arms full rate whenever
- * the estimate moves, so on an unstable echo path the realised engagement is
- * nothing like the steady-state 1-in-K.
+ * the estimate is SEEN to move, so on an unstable echo path the realised
+ * engagement is nothing like the steady-state 1-in-K. Seen, not moved: a
+ * decimated hop publishes nothing, so a movement mid-period is picked up at
+ * the next scheduled analysis and full rate resumes from there -- up to one
+ * duty period of extra wait (~96 ms on all three shipped grids). The ERLE
+ * watchdog can cut that short, but only where a lane's windowed ERLE ever
+ * cleared the 6 dB collapse threshold to arm it.
  *
  * Both are 0 outside AEC_DELAY_MATCHED, where no matched filter is built and
  * there is no cost to decimate. Same counters, same contract, and the same

@@ -117,11 +117,11 @@ out               全零              全零                enh(beam err        
 </table>
 
 <h2>State 表</h2>
-<p>Carve 順序(layout v13):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>;ULCNet chain 狀態、幀 scratch、<code>far_delay</code>、reprime 計數器、共用視窗表都內嵌在 <code>self</code>。唯一一支 512 點 <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain。實測 descriptor(2026-08-20 重跑;ne10, MATCHED n=5):<code>bytes=3,107,216</code>、descriptor_version=1、layout_version=13。n 活在單一共用 estimator，pool 隨 n 每 filter ±5,728 B且只付一次(n=1..5 實測 3,084,304 / 3,090,032 / 3,095,760 / 3,101,488 / 3,107,216 B);4 lanes pool 不隨 n 變(實測 1,369,856 B,n=1..5 相同;kiss 1,375,360 B)。kiss 實測 n=1..5:3,091,184 / 3,096,912 / 3,102,640 / 3,108,368 / 3,114,096 B。本輪 <code>sizeof(Aec)</code> 增加 16 B(每個 AEC 實例各自帶了逐階段計時記錄),四路各 +16 B,所以每一階都 +64 B,5,728 B 的階距不變;這一次 lanes pool 也跟著動(1,369,792 → 1,369,856 B / kiss 1,375,296 → 1,375,360 B)。<b>換 backend／編譯選項／submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_4ch_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
+<p>Carve 順序(layout v14):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>;ULCNet chain 狀態、幀 scratch、<code>far_delay</code>、reprime 計數器、共用視窗表都內嵌在 <code>self</code>。唯一一支 512 點 <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain。實測 descriptor(本次 <code>lib/aec</code> pin 重跑;ne10, MATCHED n=5):<code>bytes=3,127,744</code>、descriptor_version=1、layout_version=14。n 活在單一共用 estimator，pool 隨 n 每 filter ±5,728 B且只付一次(n=1..5 實測 3,104,832 / 3,110,560 / 3,116,288 / 3,122,016 / 3,127,744 B);4 lanes pool 不隨 n 變(實測 1,390,336 B,n=1..5 相同;kiss 1,395,840 B)。kiss 實測 n=1..5:3,111,712 / 3,117,440 / 3,123,168 / 3,128,896 / 3,134,624 B。本輪 <code>sizeof(Aec)</code> 由 5832 變 5848 B,每個實例的 pool 在 16 kHz/512 格點長 5,120 B,四路即 +20,480 B,所以每一階都同幅移動,5,728 B 的階距不變;lanes pool 由 1,369,856 → 1,390,336 B(kiss 1,375,360 → 1,395,840 B)。<b>換 backend／編譯選項／submodule 都會讓這些數字失效——一律以 <code>audio_pipeline_4ch_ulcnet_get_mem_requirements()</code> 現查為準。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>FourAecNrRes core</code>(pre-only)</td><td>1,480,416 B(4-lane AEC 1,369,856 B + delay ring/控制塊 110,560 B;兩項皆實測 <code>four_aec_nr_res_get_mem_breakdown()</code> @16k/fft512/<code>enable_post=0</code>,ne10。kiss 合計:1,485,920 B(1,375,360+110,560)——<code>enable_post=0</code> 的 wrapper 與後端無關,兩個 backend 都是 110,560 B)</td><td>pool</td><td>共用 delay ring + 4 lanes;<code>enable_post=0</code> ⇒ <b>不含</b> NR/RES/iFFT(那些由本 wrapper 自己的 <code>ola/ifft_buffer/synth_window</code> + ULCNet chain 取代)</td></tr>
-<tr><td><code>SRP</code> / <code>GSC</code></td><td>num_angles=72 預設 / P:16×257、wa:4×257 Complex</td><td>pool</td><td>GSC 借用 <code>srp-&gt;a_array</code> steering 表;與下方其餘項目合計 = 3,107,216 − 1,480,416 = 1,626,800 B(kiss:3,114,096 − 1,485,920 = 1,628,176 B)</td></tr>
+<tr><td><code>FourAecNrRes core</code>(pre-only)</td><td>1,500,944 B(4-lane AEC 1,390,336 B + delay ring/控制塊 110,608 B;兩項皆實測 <code>four_aec_nr_res_get_mem_breakdown()</code> @16k/fft512/<code>enable_post=0</code>,ne10。kiss 合計:1,506,448 B(1,395,840+110,608)——<code>enable_post=0</code> 的 wrapper 與後端無關,兩個 backend 都是 110,608 B)</td><td>pool</td><td>共用 delay ring + 4 lanes;<code>enable_post=0</code> ⇒ <b>不含</b> NR/RES/iFFT(那些由本 wrapper 自己的 <code>ola/ifft_buffer/synth_window</code> + ULCNet chain 取代)</td></tr>
+<tr><td><code>SRP</code> / <code>GSC</code></td><td>num_angles=72 預設 / P:16×257、wa:4×257 Complex</td><td>pool</td><td>GSC 借用 <code>srp-&gt;a_array</code> steering 表;與下方其餘項目合計 = 3,127,744 − 1,500,944 = 1,626,800 B(kiss:3,134,624 − 1,506,448 = 1,628,176 B)</td></tr>
 <tr><td><code>gsc_spectrum/gsc_weights</code></td><td>[257] / [4][257] Complex</td><td>pool</td><td>每 hop 由 GSC 原子產生</td></tr>
 <tr><td><code>FftHandle</code>(共用)</td><td>pool 內</td><td>pool</td><td>beam IFFT + chain 三 transform 共用</td></tr>
 <tr><td><code>ola/ifft_buffer/synth_window</code></td><td>各 [512] f32</td><td>pool</td><td>beam WOLA;<code>ola</code> 跨 hop 累加</td></tr>
@@ -131,7 +131,7 @@ out               全零              全零                enh(beam err        
 <tr><td><code>far_delay</code></td><td>[256] f32</td><td>C struct(self)</td><td>one-hop far 補償;delay change / reset 時清零</td></tr>
 <tr><td><code>model</code>+<code>last_delay</code>+<code>frame_index</code></td><td>純量級</td><td>C struct(self)</td><td>model 安裝 survive reset；delay history 用來偵測 FIXED 首次可用</td></tr>
 <tr><td>NN 顯式 states(far K/V ring、logit 史、GRU h)</td><td>依 exported D</td><td><b>CPU/DSP caller-owned pool</b></td><td>NPU 單次呼叫無狀態；<code>model.reset</code> 時 K/V、logit 與 GRU hidden 全部清除</td></tr>
-<tr><td>合計 pool</td><td>3,107,216 B(2.96 MB;kiss 3,114,096 B/2.97 MB)</td><td>host 擁有 pool</td><td>init_ex 路徑零 heap;sizing 與 carve lockstep(<code>cursor.remaining==0</code> 驗證)</td></tr>
+<tr><td>合計 pool</td><td>3,127,744 B(2.98 MB;kiss 3,134,624 B/2.99 MB)</td><td>host 擁有 pool</td><td>init_ex 路徑零 heap;sizing 與 carve lockstep(<code>cursor.remaining==0</code> 驗證)</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>
@@ -146,7 +146,7 @@ out               全零              全零                enh(beam err        
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v13)</td></tr>
+<tr><td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v14)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心:<code>process_pre</code> / <code>abandon_pre</code> / <code>PreFrame.aligned_ref</code>(見 <a href="pipeline_4ch.html">pipeline_4ch</a>)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_process.h / .c</code></td><td>chain 實作 + <code>UlcnetModel</code> 邊界(兩變體共用)</td></tr>
 <tr><td><code>pipelines/4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c</code></td><td>identity E2E、連續 model stepping(除 reprime)、MATCHED 同值重鎖 reset、FIXED raw→aligned 首次切換 reset、FIXED pre-lock seam 逐 byte 等於 raw far(含 8 hop / 320 sample / 500 ms 三組)、identity-reprime straddle 推導(脈衝標記/無邊界對照跑)與 reprime 行為(delay change + FIXED fill)、core aligned_ref+abandon token、pool/descriptor、far timestamp、UNLOCKED 仍套用、NaN/Inf、partial-write 與 aligned-only descriptor gate</td></tr>
