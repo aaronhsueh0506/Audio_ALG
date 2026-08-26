@@ -31,6 +31,24 @@ def ledger_path(seqs_dir: str) -> str:
     return os.path.join(os.path.dirname(os.path.abspath(seqs_dir)), LEDGER_NAME)
 
 
+def recorded_contract(seqs_dir: str):
+    """The contract fingerprint this ledger was written under, or ``None``.
+
+    ``None`` covers both "no ledger" and "not readable as one"; a caller that
+    needs to tell those apart checks ``ledger_path`` itself. Exists so the
+    packer's gate can ask WHICH contract wrote the corpus -- a question
+    ``load_ledger`` answers only as "not yours", which is the same answer it
+    gives for a ledger that claims nothing.
+    """
+    try:
+        with open(ledger_path(seqs_dir), "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    recorded = data.get("contract")
+    return recorded if isinstance(recorded, str) else None
+
+
 def load_ledger(seqs_dir: str, contract_hash: str) -> set:
     """Sequence ids this exact contract has already written.
 

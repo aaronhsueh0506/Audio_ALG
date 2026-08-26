@@ -42,6 +42,7 @@ import configparser
 import glob
 import os
 import sys
+import warnings
 from typing import Dict, List
 
 import torch
@@ -56,11 +57,15 @@ if __package__ in (None, ''):
     __package__ = 'AIAEC.dataset_gen'
 
 from .aec_features import PACKED_STEM_ORDER, STEM_ORDER  # noqa: E402
-from .linear_aec import linear_aec_contract_from_config  # noqa: E402
+from .linear_aec import (  # noqa: E402
+    linear_aec_contract_from_config,
+    migrated_ledger_fingerprints,
+)
 from .linear_error_ledger import (  # noqa: E402
     LEDGER_NAME,
     claimed_vs_present,
     ledger_path,
+    recorded_contract,
 )
 from .seq_layout import scan_chunks, stale_temp_files  # noqa: E402
 
@@ -132,7 +137,7 @@ def _save_shard(clips, metas, shard_index, args, header) -> tuple:
     return temporary, path
 
 
-def _require_complete_rematerialization(seqs_dir, sequences, contract_hash):
+def _require_complete_rematerialization(seqs_dir, sequences, contract):
     """Stop if the fifth channel was only partly rebuilt.
 
     rematerialize_linear_aec writes a ledger keyed to the contract it ran, and
@@ -146,19 +151,58 @@ def _require_complete_rematerialization(seqs_dir, sequences, contract_hash):
     No ledger at all is not an error. A corpus generated in one pass by
     gen_aec_dataset.py never had one, and there is nothing to contradict.
     The failure this guards is a PARTIAL claim, not an absent one.
+
+    A ledger written under an ACCEPTED migration source is honoured. The
+    ledger keys on ``fingerprint()``, which folds in `aec_commit` and
+    `aec_source_hash`, so it moves on any lib/aec edit -- including one whose
+    `linear_error` is byte-identical by the evidence
+    ACCEPTED_BEHAVIOR_HASH_MIGRATIONS required to admit it. Refusing there
+    would strand a COMPLETED corpus behind advice that cannot be followed:
+    the config is identical, and what moved is lib/aec, which --config cannot
+    address. Bridging is exact rather than lenient -- the source build's
+    fingerprint is reconstructed from its recorded provenance and compared
+    whole, so an unrelated build still fails -- and it does not weaken the
+    completeness check below, which runs against the ledger either way.
     """
     if not os.path.exists(ledger_path(seqs_dir)):
         return
-    claimed, missing, extra = claimed_vs_present(
-        seqs_dir, contract_hash, sequences)
-    if not claimed:
+    contract_hash = contract.fingerprint()
+    recorded = recorded_contract(seqs_dir)
+    if recorded is None:
+        raise ValueError(
+            f"{ledger_path(seqs_dir)} exists but does not read as a ledger; "
+            f"it cannot say whether this corpus was completely "
+            f"rematerialized. Repair or remove it before packing.")
+    if recorded != contract_hash:
+        for source_hash, source_fingerprint in migrated_ledger_fingerprints(
+                contract):
+            if recorded == source_fingerprint:
+                warnings.warn(
+                    f"{ledger_path(seqs_dir)} was written by AEC behaviour "
+                    f"{source_hash[:12]} and this build is "
+                    f"{contract.aec_behavior_hash[:12]}; accepting via the "
+                    "verified frontend-equivalent migration table "
+                    "(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS in "
+                    "dataset_gen/linear_aec.py), which records the "
+                    "byte-identical linear_error evidence for this pair. The "
+                    "shards are stamped with THIS build's contract, which "
+                    "describes the same waveform.",
+                    RuntimeWarning, stacklevel=2)
+                contract_hash = recorded
+                break
+    if recorded != contract_hash:
         raise ValueError(
             f"{ledger_path(seqs_dir)} was written by a DIFFERENT linear-AEC "
-            f"contract than the one this --config builds "
-            f"({contract_hash[:12]}). Either pass the "
-            f"config the corpus was rematerialized with, or re-run "
-            f"rematerialize_linear_aec with this one; packing now would label "
-            f"the shards with a contract that did not produce them.")
+            f"contract ({recorded[:12]}) than the one this --config and this "
+            f"lib/aec build ({contract_hash[:12]}). Pass the config the "
+            f"corpus was rematerialized with, or re-run "
+            f"rematerialize_linear_aec with this one. If only lib/aec moved, "
+            f"--config cannot fix it: either the pair belongs in "
+            f"ACCEPTED_BEHAVIOR_HASH_MIGRATIONS with the byte-identity "
+            f"evidence that admits it, or the corpus genuinely needs "
+            f"rematerializing. Packing now would label the shards with a "
+            f"contract that did not produce them.")
+    _, missing, extra = claimed_vs_present(seqs_dir, contract_hash, sequences)
     if missing:
         raise ValueError(
             f"{len(missing)} of {len(sequences)} sequence(s) are absent from "
@@ -187,8 +231,7 @@ def pack(args):
 
     seqs_dir = _resolve_seqs_dir(args.input)
     sequences = _collect(seqs_dir)
-    _require_complete_rematerialization(
-        seqs_dir, sequences, linear_aec.fingerprint())
+    _require_complete_rematerialization(seqs_dir, sequences, linear_aec)
     total_chunks = sum(len(paths) for paths in sequences.values())
 
     stale = stale_temp_files(seqs_dir)

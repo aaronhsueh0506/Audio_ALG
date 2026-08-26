@@ -1,12 +1,17 @@
-"""No migration connects the old linear_error waveform to this frontend.
+"""Exactly one migration connects a recorded linear_error to this frontend.
 
-The dominant-matched-filter-peak change MOVES `linear_error`. Every entry
-`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` used to hold was admitted on evidence that
-the stem rendered byte-identical across the pair, and that evidence does not
-describe this build. Retargeting those entries would declare an old waveform
-compatible with a build that does not produce it -- so they are retired, and
-the identities they named are refused with an instruction to rematerialize
-rather than with a bare hash mismatch.
+`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` holds the fresh-instance-reset pair and
+nothing else. That pair was admitted on measured byte-identity: materialization
+builds one engine per parent sequence and never calls `reset()`, so the change
+cannot reach the corpus -- see the entry's own comment for the evidence and for
+the control that proves the harness can fail.
+
+What must NOT happen is the pre-dominant-peak entries coming back. The
+dominant-matched-filter-peak change MOVES `linear_error`, so their byte-identity
+evidence describes no frontend after it; retargeting one at a live build would
+declare an old waveform compatible with a build that does not produce it. They
+stay in `RETIRED_BEHAVIOR_HASHES` and are refused with an instruction to
+rematerialize rather than with a bare hash mismatch.
 
 Run:
     python3 -m pytest AIAEC/tests/test_linear_aec_behavior_migration.py
@@ -27,15 +32,23 @@ from AIAEC.dataset_gen.linear_aec import (
 )
 
 
-# The frontend the shipped corpus and the Align-ULCNet checkpoints were built
-# on, and one of the identities that had been verified equivalent to it. Both
-# are spelled out rather than read from RETIRED_BEHAVIOR_HASHES: a test that
-# takes its inputs from the table it is checking would still pass if the table
-# were emptied.
+# Two identities that must stay refused: the frontend the shipped corpus and
+# the Align-ULCNet checkpoints were built on, and one of the identities that
+# had been verified equivalent to it. Both are spelled out rather than read
+# from RETIRED_BEHAVIOR_HASHES: a test that takes its inputs from the table it
+# is checking would still pass if the table were emptied.
 DEPLOYED_OLD_HASH = (
     "abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239")
 EARLIER_MIGRATED_HASH = (
     "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe")
+
+# The one identity that IS carried forward: the frontend the 200-hour corpus
+# was materialized under, before aec_reset() was made to return a fresh
+# instance. Spelled out for the same reason as the two above -- reading it
+# back out of ACCEPTED_BEHAVIOR_HASH_MIGRATIONS would make every assertion
+# below satisfied by whatever the table happens to contain.
+MIGRATED_FROM_HASH = (
+    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061")
 
 
 def _contract_recorded_as(hash_value):
@@ -49,18 +62,54 @@ def test_the_frontend_identity_actually_changed():
     assert aec_python_behavior_hash() != DEPLOYED_OLD_HASH
 
 
-def test_the_migration_table_is_empty():
-    assert ACCEPTED_BEHAVIOR_HASH_MIGRATIONS == {}, (
-        "no pair may connect the old linear_error waveform to this frontend"
-    )
+def test_the_migration_table_holds_exactly_the_one_admitted_pair():
+    assert ACCEPTED_BEHAVIOR_HASH_MIGRATIONS == {
+        MIGRATED_FROM_HASH: aec_python_behavior_hash()
+    }, "every pair in this table needs its own admission evidence"
 
 
-def test_no_migration_targets_this_build():
-    """Guards the specific mistake: retargeting the retired entries at the new
-    hash instead of retiring them."""
-    current = aec_python_behavior_hash()
-    assert current not in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.values()
-    assert current not in RETIRED_BEHAVIOR_HASHES
+def test_no_retired_identity_migrates_to_anything():
+    """Guards the specific mistake: retargeting a retired entry at a live hash
+    instead of leaving it retired. A pair is admissible only on evidence that
+    the stem renders byte-identical across it, and no such evidence can exist
+    for a frontend that moves `linear_error`."""
+    for retired in RETIRED_BEHAVIOR_HASHES:
+        assert retired not in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
+    assert not (set(RETIRED_BEHAVIOR_HASHES)
+                & set(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.values()))
+    assert aec_python_behavior_hash() not in RETIRED_BEHAVIOR_HASHES
+
+
+def test_the_admitted_pair_is_accepted_with_a_warning():
+    """The remote flow: a corpus materialized under the recorded identity,
+    packed and validated by a build that computes the new one. Accepting
+    SILENTLY would be as wrong as refusing -- the operator has to see which
+    frontend identity was let through."""
+    current = make_linear_aec_contract(16000, preset="balanced").as_dict()
+    with pytest.warns(RuntimeWarning, match="frontend-equivalent migration"):
+        # (actual=this build, expected=the contract the data recorded)
+        require_linear_aec_contract(
+            current, _contract_recorded_as(MIGRATED_FROM_HASH),
+            context="fixture")
+
+
+def test_the_admitted_pair_is_refused_in_reverse():
+    """One direction by construction. Data recorded under the NEW identity run
+    against the OLD build is a genuine downgrade, and the table is not
+    consulted backwards."""
+    recorded_new = _contract_recorded_as(aec_python_behavior_hash())
+    running_old = _contract_recorded_as(MIGRATED_FROM_HASH)
+    with pytest.raises(ValueError, match="contract mismatch"):
+        require_linear_aec_contract(running_old, recorded_new,
+                                    context="fixture")
+
+
+def test_an_unlisted_identity_is_still_refused():
+    """The table is an explicit, per-pair exemption, not a general amnesty."""
+    with pytest.raises(ValueError):
+        require_linear_aec_contract(
+            make_linear_aec_contract(16000, preset="balanced").as_dict(),
+            _contract_recorded_as("f" * 64), context="fixture")
 
 
 @pytest.mark.parametrize("recorded", (DEPLOYED_OLD_HASH, EARLIER_MIGRATED_HASH))

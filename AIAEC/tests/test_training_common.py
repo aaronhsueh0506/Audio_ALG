@@ -495,20 +495,16 @@ def test_contract_comparison_is_not_vacuous():
 
 # ---- verified frontend-equivalent behaviour-hash migrations ----------------
 #
-# The table is EMPTY for this release: the matched-filter aggregator now
-# reports the dominant peak, which moves `linear_error`, so no recorded
-# identity is frontend-equivalent to this build any more. Following this
-# section's own instruction -- retire the tests with the table rather than
-# leave them asserting nothing -- the rows that drove a shipped pair
-# (accepted-with-a-warning, refused-in-reverse, targets-are-live) are gone.
-# What replaces them is
-# AIAEC/tests/test_linear_aec_behavior_migration.py, which pins the CURRENT
-# contract: the table is empty, nothing targets the live hash, and each
-# retired identity is refused with a rematerialization instruction.
+# The rows here are the STRUCTURAL invariants the lookup relies on whatever
+# the table contains, and they are what a new entry is admitted against. They
+# hold for an empty table too, which is why they stayed when it was emptied.
 #
-# The two rows kept below do not need a shipped pair: they are the structural
-# invariants the lookup relies on whatever the table contains, and they are
-# what a future entry would be admitted against.
+# The per-pair rows -- accepted-with-a-warning, refused-in-reverse, the pair
+# actually targeting the live build -- live in
+# AIAEC/tests/test_linear_aec_behavior_migration.py, together with the
+# retired identities that must never come back. That file is the one to read
+# for what the table currently claims; this one only checks the shape of the
+# claim.
 
 def _contract_pair(pair):
     """(current, recorded) contract dicts, identical except the hash field."""

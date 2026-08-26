@@ -458,22 +458,26 @@ channel with the command below, which avoids repeating acoustic mixing:
 
 #### The one exception: verified frontend-equivalent migrations
 
-> **⚠ The table is EMPTY for this release.** The matched-filter aggregator now
-> reports the dominant peak instead of the pre-echo candidate, which **moves
-> `linear_error`**. Every entry the table held was admitted on byte-identity
-> evidence against the previous frontend, and that evidence does not describe
-> this build — so the entries are **retired, not retargeted**: pointing them at
-> the new hash would declare an old waveform compatible with a build that does
-> not produce it. The identities they named are listed in
+> **⚠ The table holds exactly one pair.** `aec_reset()` was made to return a
+> fresh instance (it had been carrying a converged filter's AEC3 startup gates,
+> its Kalman `H_error` and the near-end recency pair across the call), and the
+> same revision removed the dead far-end power EMA from the Python filter. Both
+> edits are under the signal scope, so the hash moved — but materialization
+> builds one engine per parent sequence and never calls `reset()`, and nothing
+> read the removed fields, so `linear_error` is byte-identical across the pair.
+> A corpus already on disk travels forward; nothing needs rematerializing.
+>
+> The identities that predate the dominant-matched-filter-peak change are a
+> different matter and are **retired, not retargeted**: that change **moves
+> `linear_error`**, so their byte-identity evidence describes no frontend after
+> it, and pointing one at a live hash would declare an old waveform compatible
+> with a build that does not produce it. They are listed in
 > `RETIRED_BEHAVIOR_HASHES` and refused with an instruction to rematerialize
 > (`rematerialize_linear_aec.py`, WITHOUT `--resume`, then repack, then
 > retrain), not with a bare hash mismatch.
-> `behavior_hash_schema` stays `canon-ast-1`: this is a behaviour change, not a
-> canonicalizer change. Pinned by
+> `behavior_hash_schema` stays `canon-ast-1`: these are behaviour changes, not
+> canonicalizer changes. Pinned by
 > `tests/test_linear_aec_behavior_migration.py`.
->
-> The mechanism below is unchanged and still available for a genuinely inert
-> future `lib/aec` change; it simply has no live entries.
 
 `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` in `linear_aec.py` is an explicit table of
 `recorded → current` behaviour-hash pairs that are known to produce the *same*
@@ -503,14 +507,15 @@ the bytes are identical — plus a control proving the same harness *can* fail
 byte-equality of a dead harness is worth nothing. The rationale and the numbers
 for each shipped entry live in the comment on the entry itself.
 
-The shipped entries cover both the deployed 8e5d05708 frontend and the later
-pre-quarantine frontend.  The intervening delay-profile productization keeps
-the frozen corpus path at MATCHED/n=5, while `lib/aec`'s backward quarantine is
-gated by `delay_backward_quarantine_enabled` (default `False`, and AIAEC never
-sets it).  Direct end-to-end renders from each recorded hash to the current
-build are byte-identical; the exact scene, byte counts and digests are recorded
-beside each table entry.  Anything that retunes a *live* mechanism does not
-qualify — rematerialize instead:
+The one shipped entry covers the frontend the 200-hour corpus was materialized
+under. Its evidence is three complete 30 s sequences whose echo path changes
+delay mid-sequence — so each one acquires, loses and re-acquires a lock, which
+is the shared filter-restart path the same revision touches — rendered through
+`LinearAecProcessor` on both sides of the pair and compared byte for byte, with
+the run asserting `AEC.reset` is never called while materializing. The control
+splices one `engine.reset()` into the hop loop and confirms the bytes move.
+The exact scene and digests are recorded beside the table entry. Anything that
+retunes a *live* mechanism does not qualify — rematerialize instead:
 
 ```bash
 python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \
@@ -525,7 +530,14 @@ python3 -m AIAEC.dataset_gen.pack_aec_dataset \
 contract already wrote it, per the `linear_error.done.json` ledger beside the
 corpus; a ledger from another contract is ignored whole. Re-running after a
 `[linear_aec]` config edit therefore redoes every sequence on its own, with or
-without `--resume`. Add `--jobs N` to spread independent sequences across
+without `--resume`. That holds across an accepted migration too: the ledger is
+keyed on `fingerprint()`, which folds in the raw-text `aec_source_hash` and
+`aec_commit`, so an INTERRUPTED rematerialization restarts even where the
+migration applies. A COMPLETED one does not — the packer reconstructs the
+migrated-from build's fingerprint from its recorded provenance
+(`MIGRATED_SOURCE_PROVENANCE`) and honours that ledger with a `RuntimeWarning`,
+because refusing there would strand a finished corpus behind advice that cannot
+be followed: the config is identical, and what moved is `lib/aec`. Add `--jobs N` to spread independent sequences across
 cores — it does not change a single sample.
 
 Generation is deterministic given `--seed`: each sequence is seeded from

@@ -515,22 +515,7 @@ def linear_aec_contract_from_config(
 # against the OLD build is a genuine downgrade -- the mechanism it may have been
 # trained through is absent -- and stays refused.
 ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
-    # EMPTY, and deliberately so for this release.
-    #
-    # Every entry this table held migrated some older frontend identity to
-    # abd8aa04272d8f833e948999fb54c5a9b2348d0f57f38efb21f43a15bbe6a239, on
-    # evidence that `linear_error` rendered byte-identical across the pair.
-    # The dominant-matched-filter-peak change MOVES `linear_error`, so that
-    # evidence no longer describes the current frontend and none of those
-    # entries may be retargeted to the new hash -- doing so would declare an
-    # old waveform compatible with a build that does not produce it.
-    #
-    # They are retired rather than rewritten: see RETIRED_BEHAVIOR_HASHES,
-    # which names them so a corpus or checkpoint recorded under any of them is
-    # refused with an instruction to rematerialize, instead of failing with a
-    # bare hash mismatch that reads like a mystery.
-    #
-    # The admission rule for a FUTURE entry is unchanged and still all four:
+    # The admission rule, all four or it does not go in:
     #   1. the ONLY compared field that differs is `aec_behavior_hash`;
     #   2. the lib/aec change is inert on the path this corpus is materialized
     #      with -- typically a new mechanism defaulted OFF, never a retune of
@@ -544,10 +529,123 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
     #      equality that a dead harness would also report is not evidence.
     #
     # Single hop by construction: the lookup is not applied transitively, so a
-    # value here is never re-read as a key. One direction by construction: a
-    # checkpoint recorded under the NEW hash run against an OLD build is a
-    # genuine downgrade and stays refused.
+    # value here is never re-read as a key. Two stacked migrations need the
+    # composed pair (oldest recorded -> current), re-verified end to end, not
+    # a chain. One direction by construction: a checkpoint recorded under the
+    # NEW hash run against an OLD build is a genuine downgrade -- the
+    # mechanism it may have been trained through is absent -- and stays
+    # refused.
+    #
+    # Entries this table held BEFORE the dominant-matched-filter-peak change
+    # are not here and may never be retargeted: that change MOVES
+    # `linear_error`, so their byte-identity evidence does not describe any
+    # frontend after it. They live in RETIRED_BEHAVIOR_HASHES instead, which
+    # refuses them with an instruction to rematerialize.
+
+    # aec_reset() now returns a fresh instance. The AEC's reset carried a
+    # converged filter's AEC3 startup gates, its Kalman H_error, the inst-ERLE
+    # slope ring and the near-end recency pair across the call, so a reused
+    # instance's second stream started from state a freshly built one never
+    # has; the same revision also removes the dead far-end power EMA from the
+    # Python filter. Both edits are under the signal scope, so the hash moves.
+    #
+    #   1. Verified against the recorded contract: `aec_behavior_hash` is the
+    #      only compared field that differs. Everything else in
+    #      `compatibility_dict()` is a __post_init__ literal or comes from the
+    #      same config, and `behavior_hash_schema` is unchanged at
+    #      "canon-ast-1".
+    #   2. Inert here because materialization never reaches the changed code:
+    #      `LinearAecProcessor.__init__` builds ONE engine per parent sequence
+    #      and `process_numpy` never calls `reset()`. Nothing reads the removed
+    #      `power` / `alpha_power` -- their only consumer was their own
+    #      cold-start guard.
+    #   3. MEASURED: three complete 30 s sequences at 16 kHz/512/256, each with
+    #      an echo path that CHANGES delay mid-sequence, so each one acquires,
+    #      loses and re-acquires a lock -- 2 filter-derived restarts and 3
+    #      distinct applied delays per sequence, i.e. the shared relock path
+    #      this revision also touches -- over far-end bursts, silent stretches
+    #      and a near-end talker. `linear_error` is byte-identical on all three
+    #      across the pair, 1,920,000 bytes per sequence. SHA-256:
+    #        seq0 (800 -> 1500 samples @ 12 s)
+    #          8b8e3cb8250261cb8945de9426ec032e65cd7dc5dfa709a04fdb2112b02ef437
+    #        seq1 (400 -> 2600 samples @ 17 s)
+    #          80437ca60b1cc745d2ca4be2d0cb7bf2bab9fc80de33c6976e3e1e473d80af8c
+    #        seq2 (2000 -> 650 samples @ 9 s)
+    #          c46b4b0f544e7c5be88de0daadf5fce6371d6b0943d656a9b1bd76650a59b504
+    #      The same run asserts `AEC.reset` is called zero times while
+    #      materializing, against the live class rather than by reading source.
+    #   4. The control that makes that meaningful: the same scene through the
+    #      same `LinearAecProcessor`, with one `engine.reset()` spliced into
+    #      the hop loop at hop 937 of seq0, renders DIFFERENT bytes on either
+    #      side of the pair --
+    #        recorded build 69fe3c6517e812f43410689344ce18e3bb3405e6c7d0fabeff51addb43ed8390
+    #        this build     dbdfb30a76c3cbabccf23b44055c9573bb054952470ca024cd18635e036eb9ae
+    #      A control that cannot fire proves nothing, so the harness aborts
+    #      unless the spliced reset actually happens.
+    #
+    # Scope note for a resumed run: this migration carries a COMPLETED corpus
+    # forward. `--resume` is keyed on `fingerprint()`, which includes the
+    # raw-text `aec_source_hash` and `aec_commit`, so an INTERRUPTED
+    # rematerialization restarts from scratch across this pair regardless --
+    # by design, since a half-rebuilt corpus must never mix two frontends.
+    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061":
+        "a02f30f6a491a92165b8c8a40b5fd967351647c7bc8481e4284a8c4d9a95f19f",
 }
+
+# Provenance of the build each accepted migration's SOURCE identity belongs to.
+#
+# Needed because one gate downstream cannot use ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
+# on its own: the rematerialization ledger records a contract as its
+# `fingerprint()`, which folds in `aec_commit` and `aec_source_hash` alongside
+# the behaviour hash and is one-way. A build that computes the migration TARGET
+# cannot re-derive the SOURCE build's fingerprint from the corpus -- the corpus
+# stores no contract dict anywhere -- so without this it cannot tell a ledger
+# written by a migrated frontend from one written by an unrelated build, and a
+# COMPLETED corpus gets refused with advice its operator cannot follow (the
+# config is identical; what moved is lib/aec).
+#
+# One entry per migration source, and only for a source whose build is pinned
+# and known. An entry here grants nothing on its own: it is consulted only
+# after ACCEPTED_BEHAVIOR_HASH_MIGRATIONS has already admitted the pair, and
+# only to reconstruct a fingerprint the guard then compares exactly. A source
+# with no entry simply gets no ledger bridge -- the migration still applies to
+# every other gate.
+MIGRATED_SOURCE_PROVENANCE = {
+    # lib/aec at the revision the 200-hour corpus was materialized under.
+    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061": {
+        "aec_commit": "d5193ad6b58efc54f13cbc71980a3e5659c7388d",
+        "aec_source_hash":
+            "9380c512bca01b8da842e22426c66c016335d33ab4b232f78bafd9cd1efe39fe",
+    },
+}
+
+
+def migrated_ledger_fingerprints(contract: "LinearAecContract") -> tuple:
+    """Fingerprints a migration SOURCE build would have written for ``contract``.
+
+    ``contract`` is what THIS build makes of the corpus's config. A migration
+    source differs from it only in the three provenance fields, all of which
+    are recorded, so the source's fingerprint is reconstructible exactly rather
+    than guessed. Returns an empty tuple when nothing migrates to this build,
+    or when the source that does has no recorded provenance -- both of which
+    must leave the caller's exact-match behaviour untouched.
+    """
+    out = []
+    for recorded, current in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items():
+        if current != contract.aec_behavior_hash:
+            continue
+        provenance = MIGRATED_SOURCE_PROVENANCE.get(recorded)
+        if provenance is None:
+            continue
+        source = dataclasses.replace(
+            contract,
+            aec_behavior_hash=recorded,
+            aec_commit=provenance["aec_commit"],
+            aec_source_hash=provenance["aec_source_hash"],
+        )
+        out.append((recorded, source.fingerprint()))
+    return tuple(out)
+
 
 # Frontend identities that produced a DIFFERENT `linear_error` from the current
 # build. Listed so the refusal can say what to do about it. Nothing may migrate
@@ -773,6 +871,7 @@ def materialize_linear_error(
 
 __all__ = [
     "ACCEPTED_BEHAVIOR_HASH_MIGRATIONS",
+    "MIGRATED_SOURCE_PROVENANCE",
     "RETIRED_BEHAVIOR_HASHES",
     "BEHAVIOR_HASH_SCHEMA",
     "DATASET_DELAY_NUM_FILTERS",
@@ -788,5 +887,6 @@ __all__ = [
     "make_linear_aec_config",
     "make_linear_aec_contract",
     "materialize_linear_error",
+    "migrated_ledger_fingerprints",
     "require_linear_aec_contract",
 ]

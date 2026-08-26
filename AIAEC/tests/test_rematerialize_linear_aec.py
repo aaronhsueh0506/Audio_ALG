@@ -99,6 +99,33 @@ def test_a_ledger_from_another_contract_is_ignored_whole(tmp_path):
     assert load_ledger(seqs, "a" * 64) == set(range(N_SEQ))
 
 
+def test_resume_does_not_bridge_an_accepted_behaviour_migration(tmp_path):
+    """The asymmetry the migration entry documents, pinned.
+
+    A COMPLETED corpus travels forward on ACCEPTED_BEHAVIOR_HASH_MIGRATIONS --
+    the packer's gate reconstructs the migrated-from fingerprint and honours
+    that ledger. Resume must NOT: it decides which sequences to SKIP, and the
+    only safe answer for a run that is still partly unwritten is to redo it.
+    ``load_ledger`` is the resume path's whole view of the ledger, and it stays
+    an exact-match on fingerprint().
+    """
+    import dataclasses
+
+    root = _corpus(str(tmp_path / "c"))
+    seqs = os.path.join(root, "seqs")
+    _run(root, jobs=1)
+    migrated = dataclasses.replace(
+        shipped_contract(),
+        aec_behavior_hash=(
+            "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061"),
+        aec_commit="d5193ad6b58efc54f13cbc71980a3e5659c7388d",
+        aec_source_hash=(
+            "9380c512bca01b8da842e22426c66c016335d33ab4b232f78bafd9cd1efe39fe"),
+    ).fingerprint()
+    save_ledger(seqs, migrated, set(range(N_SEQ)))
+    assert load_ledger(seqs, shipped_contract().fingerprint()) == set()
+
+
 def test_an_unfinished_sequence_is_never_recorded(tmp_path):
     """A killed run must redo a sequence, not skip it. The ledger is written
     only after _rewrite_sequence returns, so a sequence that raised is absent."""
