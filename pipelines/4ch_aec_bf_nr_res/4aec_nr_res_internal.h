@@ -49,4 +49,56 @@ void four_aec_nr_res_admission_age(FourAecDelayAdmission* admission);
 int four_aec_nr_res_admission_offer(
     FourAecDelayAdmission* admission, int accepted_delay, int estimated);
 
+/* ============================================================================
+ * Cross-lane far-end agreement (fuse-stage precondition)
+ *
+ * Exposed for the same reason the admission machine is: the rejecting half
+ * is unreachable from a stream. This file's own lanes always share one far
+ * spectrum by construction, so a test driving process_pre()/process_post()
+ * can only ever exercise the accepting branch -- the divergent case, which
+ * is what the rejection exists for, has to be handed to the predicate
+ * directly.
+ * ========================================================================== */
+
+/* 1 = this lane may be folded into the beam, 0 = it carries a different
+ * far-end spectrum and the fuse must reject the frame.
+ *
+ * shared_far_provenance is the per-hop evidence that the four lanes consumed
+ * ONE spectrum (see four_aec_nr_res_process_pre()); with it the answer is
+ * immediate, without it every bin is compared. */
+int four_aec_nr_res_far_spec_agrees(int shared_far_provenance,
+                                    const Complex* lane_far_spec,
+                                    const Complex* reference_far_spec,
+                                    int n_freqs);
+
+/* The provenance the LAST accepted process_pre() established, so a test can
+ * assert that the cheap path is the one production actually takes (and that
+ * a bailed-out hop leaves the expensive one). Read-only. */
+int four_aec_nr_res_far_spec_provenance(const FourAecNrRes* p);
+
+/* ============================================================================
+ * Matched-filter duty cycle, pinned at full rate
+ *
+ * The duty machine in update_shared_delay() is a C-only SCHEDULE: it decides
+ * on which hops the matched-filter analysis runs, and pipeline.py -- the
+ * reference for the shared alignment's MATH -- has no counterpart for it
+ * (delay_aec3.h says so of the underlying delay_aec3_accumulate_ex()). A
+ * per-hop C/Python comparison therefore has to neutralise the schedule
+ * first, or it measures the divergence the schedule IS instead of the
+ * arithmetic it is supposed to gate.
+ *
+ * This is that neutraliser, and it is the only one that keeps the rest of
+ * the core intact: the estimator, the admission machine, the quarantine and
+ * the ring all run exactly as they do in production, and only the
+ * decimation of the analysis is removed. Not reachable from the public
+ * header, and nothing in the signal path calls it -- production keeps the
+ * duty cycle it was built with. tests/dump_delay_parity.c is the caller.
+ * ========================================================================== */
+
+/* Analyse every hop for the rest of this core's life. Idempotent, and inert
+ * outside AEC_DELAY_MATCHED (no matched filter is built there to decimate).
+ * four_aec_nr_res_reset() does not undo it: the pin is a property of the
+ * harness, not of the alignment generation the reset abandons. */
+void four_aec_nr_res_pin_duty_full_rate(FourAecNrRes* p);
+
 #endif /* FOUR_AEC_NR_RES_INTERNAL_H */

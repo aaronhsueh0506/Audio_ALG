@@ -135,8 +135,11 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * only thing that invalidates a persisted descriptor.
  * Version 9 carries the core's own layout 13 -> 14 (sizeof(Aec) grew: each
  * lane gained its per-hop stage-timing record). Same shape again -- nothing
- * in THIS layer's carve changed, and build_flags_hash cannot see it. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 9u
+ * in THIS layer's carve changed, and build_flags_hash cannot see it.
+ * Version 10 carries the core's own layout 14 -> 15 (its control block gained
+ * the fuse stage's far-end provenance flag and the matched-filter duty-cycle
+ * state and census). Same shape once more. */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 10u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

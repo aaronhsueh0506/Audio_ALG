@@ -74,7 +74,9 @@
  *      each independently rejected; the pool remains usable afterward.
  */
 #include "audio_pipeline.h"
+#include "aec3_balanced_config.h"   /* AEC3B_SQRT2_SIN_LUT -- the comfort-noise table */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>   /* clock_gettime -- the timing test's own wall clock */
@@ -697,6 +699,151 @@ static void test_stage_timing(void) {
            t.nr_us, t.post_us, t.synth_us, wall_us);
 }
 
+/* ---- comfort-noise contract ----------------------------------------------
+ *
+ * The pipeline fills AEC-suppressed bins from lib/aec's own comfort-noise
+ * recipe: an LCG step per bin whose top five bits index AEC3B_SQRT2_SIN_LUT,
+ * the imaginary part reading a quarter turn (+8 of 32) ahead of the real one.
+ * The three properties the injected noise is required to have -- bounded
+ * samples, the same expected power as the unit-variance Gaussian pair the
+ * recipe replaced, and a sequence that actually advances -- are what this
+ * pins. The exact output samples deliberately are NOT pinned: the recipe is
+ * specified statistically, so a byte assertion here would only re-state the
+ * arithmetic.
+ *
+ * Part 1 checks the shared table itself (a table edit moves every
+ * CNG-enabled render's noise power). Part 2 checks the pipeline actually
+ * draws from it and advances its state, by differencing a CNG-on run against
+ * a byte-identical CNG-off one -- comfort noise is added after every gain,
+ * so that difference IS the injected noise and nothing else. */
+static void test_comfort_noise_contract(void) {
+    const int sr = 16000, fft_size = 256, hops = 400;
+    double sum = 0.0, sq = 0.0, worst_pair = 0.0;
+    float bound = 0.0f;
+    int i;
+
+    for (i = 0; i < 32; i++) {
+        float v = AEC3B_SQRT2_SIN_LUT[i];
+        float q = AEC3B_SQRT2_SIN_LUT[(i + 8) & 31];
+        double power = (double)v * v + (double)q * q;
+        if (fabsf(v) > bound) bound = fabsf(v);
+        sum += v;
+        sq += (double)v * v;
+        if (fabs(power - 2.0) > worst_pair) worst_pair = fabs(power - 2.0);
+    }
+    CHECK(bound <= 1.41421366f,
+          "cng: every table entry is bounded by sqrt(2) (the injected noise "
+          "has no unbounded tail)");
+    CHECK(fabs(sum / 32.0) < 1e-6,
+          "cng: the table is zero-mean over a uniform index (no DC injected)");
+    CHECK(fabs(sq / 32.0 - 1.0) < 1e-6,
+          "cng: the table has unit mean square -- same expected per-bin power "
+          "as the unit-variance Gaussian pair it replaced");
+    CHECK(worst_pair < 1e-6,
+          "cng: real and imaginary entries are a quarter turn apart, so each "
+          "bin's injected power is exactly 2*amplitude^2");
+
+    {
+        AudioPipelineConfig on = grid_config(sr, fft_size);
+        AudioPipelineConfig off = grid_config(sr, fft_size);
+        AudioPipeline* p_on;
+        AudioPipeline* p_off;
+        float *mic, *ref, *o_on, *o_off, *prev_noise, *noise_stream;
+        int hop, h, k, injected = 0, all_finite = 1;
+        int prev_active = 0, corr_n = 0;
+        double noise_sq = 0.0, corr_sum = 0.0;
+
+        off.enable_cng = 0;
+        p_on = audio_pipeline_create(&on);
+        p_off = audio_pipeline_create(&off);
+        CHECK(p_on != NULL && p_off != NULL, "cng: both instances create");
+        if (!p_on || !p_off) { audio_pipeline_destroy(p_on); audio_pipeline_destroy(p_off); return; }
+
+        hop = audio_pipeline_hop_size(p_on);
+        mic = (float*)calloc((size_t)hop, sizeof(float));
+        ref = (float*)calloc((size_t)hop, sizeof(float));
+        o_on = (float*)calloc((size_t)hop, sizeof(float));
+        o_off = (float*)calloc((size_t)hop, sizeof(float));
+        prev_noise = (float*)calloc((size_t)hop, sizeof(float));
+        noise_stream = (float*)calloc((size_t)hops * hop, sizeof(float));
+
+        lcg_state = 0x5EEDu;
+        for (h = 0; h < hops; h++) {
+            for (k = 0; k < hop; k++) { ref[k] = lcg_sample(); mic[k] = 0.5f * ref[k]; }
+            audio_pipeline_process(p_on, mic, ref, o_on);
+            audio_pipeline_process(p_off, mic, ref, o_off);
+            {
+                double hop_sq = 0.0, cross = 0.0, prev_sq = 0.0;
+                for (k = 0; k < hop; k++) {
+                    float noise = o_on[k] - o_off[k];
+                    noise_stream[(size_t)h * hop + k] = noise;
+                    if (!isfinite(o_on[k]) || !isfinite(noise)) all_finite = 0;
+                    noise_sq += (double)noise * noise;
+                    hop_sq += (double)noise * noise;
+                    cross += (double)noise * prev_noise[k];
+                    prev_sq += (double)prev_noise[k] * prev_noise[k];
+                    if (noise != 0.0f) injected = 1;
+                }
+                /* A generator whose state never advanced would hand every bin
+                 * of every hop the same table entry, so each hop's injected
+                 * spectrum would be the amplitude profile times one fixed
+                 * complex constant -- successive hops would then be nearly
+                 * collinear. Advancing per bin decorrelates them. */
+                if (hop_sq > 0.0 && prev_active && prev_sq > 0.0) {
+                    corr_sum += fabs(cross / sqrt(hop_sq * prev_sq));
+                    corr_n++;
+                }
+                prev_active = (hop_sq > 0.0);
+                if (prev_active)
+                    for (k = 0; k < hop; k++) prev_noise[k] = o_on[k] - o_off[k];
+            }
+        }
+        CHECK(all_finite, "cng: every CNG-on sample and every injected sample "
+                          "is finite");
+        CHECK(injected && noise_sq > 0.0,
+              "cng: comfort noise is actually injected (CNG-on and CNG-off "
+              "renders carry different energy)");
+        CHECK(corr_n > 20 && corr_sum / corr_n < 0.5,
+              "cng: successive hops' injected noise is decorrelated -- the "
+              "generator advances instead of re-injecting one fixed spectrum");
+
+        /* The seed is per-INSTANCE, not per-process: a second, independently
+         * created instance fed the same input must inject the byte-identical
+         * noise stream. A generator that shared one process-wide state across
+         * instances would fail here, and so would one seeded from anything
+         * outside the instance. */
+        {
+            AudioPipeline* q_on = audio_pipeline_create(&on);
+            AudioPipeline* q_off = audio_pipeline_create(&off);
+            int same = 1;
+            if (q_on && q_off) {
+                lcg_state = 0x5EEDu;
+                for (h = 0; h < hops && same; h++) {
+                    for (k = 0; k < hop; k++) { ref[k] = lcg_sample(); mic[k] = 0.5f * ref[k]; }
+                    audio_pipeline_process(q_on, mic, ref, o_on);
+                    audio_pipeline_process(q_off, mic, ref, o_off);
+                    for (k = 0; k < hop; k++)
+                        if (o_on[k] - o_off[k] != noise_stream[(size_t)h * hop + k]) same = 0;
+                }
+            }
+            CHECK(q_on && q_off && same,
+                  "cng: a second, independently created instance injects the "
+                  "identical noise stream (the seed is per-instance)");
+            audio_pipeline_destroy(q_on);
+            audio_pipeline_destroy(q_off);
+        }
+
+        printf("cng: %d hops, injected RMS %.3e, hop-to-hop |corr| %.4f over "
+               "%d pairs (bound %.8f, table mean %.2e)\n",
+               hops, sqrt(noise_sq / ((double)hops * hop)),
+               corr_n ? corr_sum / corr_n : -1.0, corr_n, bound, sum / 32.0);
+        free(mic); free(ref); free(o_on); free(o_off); free(prev_noise);
+        free(noise_stream);
+        audio_pipeline_destroy(p_on);
+        audio_pipeline_destroy(p_off);
+    }
+}
+
 int main(void) {
     for (int r = 0; r < N_GRIDS; r++) {
         int sr = GRIDS[r].sample_rate;
@@ -718,6 +865,9 @@ int main(void) {
 
     printf("\n=== per-stage timing ===\n");
     test_stage_timing();
+
+    printf("\n=== comfort-noise contract ===\n");
+    test_comfort_noise_contract();
 
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);

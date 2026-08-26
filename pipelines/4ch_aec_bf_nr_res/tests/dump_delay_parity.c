@@ -10,6 +10,10 @@
  * C core's acquisition/ring-fill rules and the Python reference's shows up
  * as a per-hop mismatch instead of as an audio-quality drift nobody bisects.
  *
+ * The core's matched-filter duty cycle is pinned at full rate for the whole
+ * run (four_aec_nr_res_pin_duty_full_rate(), 4aec_nr_res_internal.h): it is
+ * a C-only schedule, so it belongs to neither side of a math comparison.
+ *
  * printf lives in THIS test binary only -- 4aec_nr_res.c and everything it
  * links stay stdio-free (see the Makefile's audit-no-stdio target).
  *
@@ -50,6 +54,7 @@
 #include <string.h>
 
 #include "4aec_nr_res.h"
+#include "4aec_nr_res_internal.h"
 
 /* xorshift32 -> [-0.125, 0.125). Every operation is exactly representable in
  * float32 (the 24-bit mantissa feed is exact, the two scale factors are
@@ -162,6 +167,14 @@ int main(int argc, char** argv) {
         fprintf(stderr, "four_aec_nr_res_create failed\n");
         return 3;
     }
+    /* Analyse every hop. The core's matched-filter duty cycle is a C-only
+     * SCHEDULE with no counterpart on the Python side, so leaving it in
+     * would make every row below a comparison of when the two implementations
+     * looked rather than of what they computed. Everything else -- the
+     * estimator, the admission machine, the quarantine, the ring -- runs
+     * exactly as production runs it. The schedule itself is covered where it
+     * is the subject, in tests/test_4aec_nr_res.c. */
+    four_aec_nr_res_pin_duty_full_rate(p);
     hop = four_aec_nr_res_hop_size(p);
 
     /* `pad` samples of pre-history so the echo is valid from the first

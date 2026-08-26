@@ -128,8 +128,13 @@ extern "C" {
  *      frontend_us/lane_res_us from documented zeros into measurements), so
  *      all four lanes move the total and every offset after the first lane.
  *      Carve token unchanged, so build_flags_hash is again blind and this
- *      counter is the only signal. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 14u
+ *      counter is the only signal.
+ *  15: the control block gained the fuse stage's per-hop far-end provenance
+ *      flag and the matched-filter duty-cycle machine's state and census
+ *      (see four_aec_nr_res_duty_hops_total() below). Control-block-only
+ *      again -- no new REGION, no carve-order change, build_flags_hash
+ *      unmoved -- so this counter is once more the whole signal. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 15u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -643,6 +648,28 @@ long four_aec_nr_res_realign_soft_lane_count(const FourAecNrRes* p);
  * never re-decide an alignment). See FourAecNrResDelayState's `changed` for
  * the rule; diagnostic only. */
 int four_aec_nr_res_pending_delay_candidate(const FourAecNrRes* p);
+
+/* Matched-filter duty-cycle engagement census, read-only and cumulative since
+ * construction or the last four_aec_nr_res_reset(): _total counts every hop
+ * through the shared delay stage, _run counts those that actually ran the
+ * matched-filter analysis. _run / _total is therefore the MEASURED engagement
+ * -- the saving stops being a design intention and becomes a number a caller
+ * can print -- which matters because the machine re-arms full rate whenever
+ * the estimate moves, so on an unstable echo path the realised engagement is
+ * nothing like the steady-state 1-in-K.
+ *
+ * Both are 0 outside AEC_DELAY_MATCHED, where no matched filter is built and
+ * there is no cost to decimate. Same counters, same contract, and the same
+ * placement at the decision site as lib/aec's own pair (AecDebugStatus).
+ * Diagnostic: nothing in the signal path reads them.
+ *
+ * The estimator is FED on every analysed hop -- decimation applies to the
+ * matched-filter ANALYSIS only, never to the audio the estimator sees -- so
+ * duty_hops_total is BY CONSTRUCTION equal to FourAecNrResDelayState's
+ * estimator_calls (the accessor is an alias of the same counter; a second
+ * field would just be a copy that could drift). */
+unsigned long long four_aec_nr_res_duty_hops_total(const FourAecNrRes* p);
+unsigned long long four_aec_nr_res_duty_hops_run(const FourAecNrRes* p);
 
 /* ── Runtime strength control ─────────────────────────────────────────────
  *

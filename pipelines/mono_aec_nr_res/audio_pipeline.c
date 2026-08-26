@@ -12,13 +12,16 @@
  *   - synth_win/ola/... are now per-INSTANCE (an AudioPipeline
  *     field), not per-process-invocation locals — multiple instances (or one
  *     instance across an audio_pipeline_reset()) never share state.
- *   - The comfort-noise RNG and the near-end-floor hangover counter
+ *   - The comfort-noise generator and the near-end-floor hangover counter
  *     (`near_hang`) move from a file-global / a `main()` stack local into
- *     per-instance fields for the same reason — same seed (0x9e3779b9u), same
- *     xorshift+Box-Muller sequence, so a single instance's FIRST render is
- *     bit-for-bit identical to the old CLI's (see the anchors this file was
- *     gated against in the F20 review — 16k/8k/48k, both backends, both old
- *     binaries).
+ *     per-instance fields, so multiple instances (or one instance across a
+ *     reset) never share a noise sequence. The generator itself is lib/aec's
+ *     own comfort-noise recipe (see the cng_lut_index() comment below), not
+ *     the CLIs' former xorshift+Box-Muller pair: the injected noise has the
+ *     same expected per-bin power but a different, bounded sample sequence,
+ *     so a CNG-enabled render is statistically — not bit-for-bit — the same
+ *     as the old CLIs'. With `enable_cng = 0` nothing about this file's
+ *     output moved.
  *   - Every pipeline-owned scratch buffer is explicitly zeroed at carve time
  *     (audio_pipeline_init) instead of relying on the CLI's blanket
  *     `memset(pool, 0, total)` before pipeline_build ran — a caller handing
@@ -38,6 +41,10 @@
 #include "nr_overlay.h"
 #include "fft_wrapper.h"       /* fft_get_mem_size/fft_init/fft_inverse/fft_destroy, Complex, ALIGN16 */
 #include "simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32                                     */
+#include "aec3_balanced_config.h" /* AEC3B_SQRT2_SIN_LUT: the lib's own CNG
+ * table. Generated header -- the ONE cross-boundary symbol this pipeline
+ * reads from it is that table; a regeneration that drops or renames it
+ * fails loudly here at compile time, which is the intended signal. */ /* AEC3B_SQRT2_SIN_LUT -- shared comfort-noise table                */
 #include "pipeline_dims.h"     /* compute_frame_dims() -- shared with both CLIs                       */
 
 /* Deliberately NO "wav_io.h" here: this TU takes raw float* mic/ref/out
@@ -86,9 +93,9 @@
 #define PROD_NEAR_HANGOVER        8
 #define PSD_SCALE                 (32768.0f * 32768.0f)  /* int16^2 (Python _PSD_SCALE) */
 
-/* Comfort-noise RNG seed -- identical constant to both CLIs' old file-global
- * g_rng, so the first hop's noise sequence out of a fresh instance matches
- * theirs exactly. */
+/* Comfort-noise generator seed -- the constant both CLIs' old file-global
+ * g_rng carried, kept so a fresh instance and a reset instance start the same
+ * noise sequence. */
 #define AUDIO_PIPELINE_RNG_SEED 0x9e3779b9u
 
 /* This file's own carve-layout version (see audio_pipeline.h's
@@ -708,18 +715,24 @@ AudioPipeline* audio_pipeline_create(const AudioPipelineConfig* cfg) {
     return p;
 }
 
-/* ---- comfort-noise RNG (per-instance xorshift32 + Box-Muller; identical
- * arithmetic/seed to both CLIs' old file-global generator) ---- */
-static float rng_uniform(AudioPipeline* p) {                    /* (0,1) */
-    uint32_t x = p->rng_state;
-    x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-    p->rng_state = x;
-    return ((x >> 8) + 0.5f) * (1.0f / 16777216.0f);
-}
-static float rng_gauss(AudioPipeline* p) {                       /* Box-Muller */
-    float u1 = rng_uniform(p), u2 = rng_uniform(p);
-    if (u1 < 1e-7f) u1 = 1e-7f;
-    return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * M_PI_F * u2);
+/* ---- comfort-noise generator ----
+ *
+ * Same recipe lib/aec generates ITS comfort noise with (c_impl/src/
+ * aec3_post.c's enable_cng block): one multiplicative-congruential step per
+ * bin, whose top five bits index the shared sqrt(2)*sin(2*pi*i/32) table
+ * (AEC3B_SQRT2_SIN_LUT), with the imaginary part reading a quarter turn
+ * (+8 of 32) ahead of the real one.
+ *
+ * Contract vs. the Gaussian pair this replaces: the table has mean 0 and
+ * mean square 1 over a uniform index, so a bin's EXPECTED noise power is
+ * unchanged -- what changes is that each bin now draws a random phase on a
+ * circle of radius sqrt(2) instead of two independent unbounded normals, so
+ * every sample is bounded by sqrt(2)*amplitude and no per-bin log/sqrt/cos
+ * is evaluated. Same per-instance rng_state field, same seed.
+ */
+static uint32_t cng_lut_index(AudioPipeline* p) {
+    p->rng_state = (p->rng_state * 69069u + 1u) & 0x7FFFFFFFu;
+    return p->rng_state >> 26;                          /* top 5 bits: 0..31 */
 }
 
 /* The AEC block is not measured here -- the AEC measures them
@@ -866,8 +879,9 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
             float ng2 = 1.0f - ctx.res_gain[k] * ctx.res_gain[k];
             float noise_gain = (ng2 > 0.0f) ? sqrtf(ng2) : 0.0f;
             float a = noise_gain * n_amp;
-            p->spec[k].r += a * rng_gauss(p);
-            p->spec[k].i += a * rng_gauss(p);
+            uint32_t ix = cng_lut_index(p);
+            p->spec[k].r += a * AEC3B_SQRT2_SIN_LUT[ix];
+            p->spec[k].i += a * AEC3B_SQRT2_SIN_LUT[(ix + 8u) & 31u];
         }
     }
 

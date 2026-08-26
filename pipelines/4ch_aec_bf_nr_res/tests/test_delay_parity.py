@@ -10,24 +10,44 @@ acquisition or ring-fill rule that drifts between the two implementations
 fails here instead of surfacing as an unexplained audio difference.
 
 The C side is ``tests/dump_delay_parity.c``, built through this directory's
-Makefile; it prints one CSV row per hop.
+Makefile; it prints one CSV row per hop. It pins the core's matched-filter
+duty cycle at full rate for the whole run: that cycle is a C-only SCHEDULE
+with no counterpart on this side, so leaving it in would turn every row here
+into a comparison of when the two implementations looked rather than of what
+they computed.
 
-Mutation checks for the backward-jump quarantine rows (each breaks one line
-and must go red here; run 2026-08-17, one failing test each, control green
+Mutation checks (each breaks one line and must go red here; control green
 before and after):
 
   C core (4aec_nr_res.c)      | pipeline.py mirror
   ----------------------------|-------------------------------------------
-  drop the direction test     | drop the direction test
+  widen the direction test to | widen the direction test to `!=`
+  `!=` (the v1 predicate)     |
     -> forward row red        |   -> forward row red
+  drop the direction test     | drop the direction test
+    -> backward row red       |   -> backward row red
   drop the expiry             | drop the expiry
-    -> quarantine row red     |   -> quarantine row red
+    -> backward row red       |   -> backward row red
   judge ANY lane              | judge ANY lane
     -> proxy row red          |   -> proxy row red
   ignore the enable           |
-    -> quarantine row red     |
+    -> backward row red       |
   hardcode the window         |
-    -> quarantine row red     |
+    -> backward row red       |
+
+  dumper scene shifted one hop -> every per-hop row red
+  pipeline.py: `changed` made a value-only comparison
+    -> zero-delay row red
+  lib/aec: the pre-echo candidate reported again in place of the dominant
+    peak -> mis-lock row red, and every per-hop row with it
+
+Widening the direction test and deleting it are separate rows because they
+fail in different places, and the reason says something about the mechanism:
+widening to `!=` leaves the arm predicate false during steady state and true
+on a forward move, so the forward row sees it; deleting the clause makes the
+predicate true on every steady-state hop, which arms the episode and spends
+the countdown long before any move arrives -- invisible on a forward move,
+and visible on the backward one as an adoption that is no longer held.
 
 The ANY-lane pair is why ``--proxy-noise`` exists: on every other scene all
 four microphones carry identical audio, so "the estimator's own lane" and
@@ -58,27 +78,48 @@ _SEED = 0x1234567
 # ring-fill rule (3 raw hops, then aligned) differs from any per-sample rule.
 _FIXED_SCENE = dict(mode="fixed", delay=320, fft=256, hops=40)
 _MATCHED_SCENE = dict(mode="matched", delay=2000, fft=512, hops=120)
-# Acquires at applied delay 0 (the estimator reports early and clamps), then
-# relocks onto a far larger path: the first event is exactly the acquisition a
-# value-only ``changed`` comparison misses, the second a value change.
+
+# The shared estimator reports the DOMINANT matched-filter peak less its own
+# delay headroom (lib/aec's delay_headroom_samples, spent on the 4-sample
+# decimated grid this rate gives it), so on a scene whose bulk delay sits on
+# that grid the applied delay is the bulk delay minus this, exactly. Every
+# expected delay below is spelled that way rather than as a number only a run
+# can supply: a mis-lock then breaks the identity instead of quietly
+# redefining the constant it is compared against.
+_DELAY_HEADROOM = 32              # native samples at _SAMPLE_RATE
+
+# Acquires on a 64-sample path and then relocks onto a far larger one: one
+# acquisition and one value change, both served through the ring.
 _RELOCK_SCENE = dict(mode="matched", delay=64, fft=512, hops=200,
                      shift_at=60, shift_delay=3000)
-# The pre-echo mis-lock scene behind delay_backward_quarantine_enabled: the
-# echo never moves, but the estimator acquires 6336 and then re-locks 1600
-# samples (100 ms) EARLY and stays there. 260 hops covers the acquisition
-# (hop 34), the unquarantined re-lock (hop 50), the quarantined adoption at
-# the widest window swept below (hop 175) and enough afterwards to show it is
-# sustained.
-_QUARANTINE_SCENE = dict(mode="matched", delay=6400, fft=512, hops=260)
-_QUARANTINE_CORRECT_DELAY = 6336  # the true path, on the 64-sample grid
-_QUARANTINE_WRONG_DELAY = 4800    # 6400 - 1600: the pre-echo answer
-# Measured, both sides: unquarantined adoption on hop 51 -- the estimator
-# offers the wrong delay on hop 50 and it is applied on the next eligible hop,
-# once the two-step admission has seen it twice -- and, with the quarantine on,
-# adoption on that hop + window_hops for every window swept. hop 256 at 16 kHz
-# makes 1.0 s exactly 62 hops.
-_QUARANTINE_UNHELD_HOP = 51
-_QUARANTINE_WINDOWS_S = (0.5, 1.0, 2.0)
+
+# The scene that USED to be the pre-echo mis-lock: a true bulk delay of 6400
+# where the estimator acquired correctly and then re-locked 1600 samples
+# (100 ms) EARLY and held that answer to the end. It is kept, inverted, as the
+# end-to-end guard that the fix at the selection seam -- lib/aec's aggregator
+# reports the dominant peak and never the pre-echo candidate -- still holds
+# through this pipeline's own acquisition and admission rules, which an
+# aggregator-level test cannot see. Asserted with the quarantine OFF, the
+# shipped default, so the subject is the estimator and not the guard.
+_MISLOCK_SCENE = dict(mode="matched", delay=6400, fft=512, hops=260)
+_MISLOCK_PRE_ECHO_DELAY = 4800    # 6400 - 1600: the answer that must not return
+
+# The backward MOVE, which is the only scene left that offers the quarantine a
+# backward candidate at all: the echo path jumps from 3000 samples to 64 at
+# hop 375, so the shared estimate moves EARLIER and the direction test fires.
+# Measured, both sides: acquisition hop 29, unguarded adoption hop 444, and --
+# with the guard on -- release by the EXPIRY while the old alignment is still
+# cancelling, or by that cancellation collapsing at hop 482 for any window
+# that outlasts it. Both release paths on one scene, which the pre-echo
+# fixture could only show one of.
+_BACKWARD_SCENE = dict(mode="matched", delay=3000, fft=512, hops=560,
+                       shift_at=375, shift_delay=64)
+_BACKWARD_UNHELD_HOP = 444
+_BACKWARD_COLLAPSE_HOP = 482
+# Two windows that expire before the collapse and two that outlast it. hop 256
+# at 16 kHz makes 1.0 s exactly 62 hops.
+_BACKWARD_EXPIRY_WINDOWS_S = (0.1, 0.5)
+_BACKWARD_COLLAPSE_WINDOWS_S = (1.0, 2.0)
 
 
 def _window_hops(seconds, hop):
@@ -111,15 +152,20 @@ def _far_noise(count: int, seed: int = _SEED) -> np.ndarray:
 
 
 _PROXY_SEED = 0x89ABCDEF
-# Enough uncorrelated noise on the capture-proxy microphone that its lane
-# cannot reach either cancellation threshold, while the other three stay on the
-# clean echo -- and small enough that the estimator (which is fed from that
-# same proxy channel) still reproduces the mis-lock. Measured at this level:
-# acquisition hop 59, unquarantined adoption hop 186.
-_PROXY_NOISE_GAIN = 0.5
-_PROXY_SCENE = dict(mode="matched", delay=6400, fft=512, hops=300)
-_PROXY_ACQUIRE_HOP = 59
-_PROXY_ADOPT_HOP = 186
+# Uncorrelated noise on the capture-proxy microphone ONLY, run over
+# _BACKWARD_SCENE, so that at the hop the backward candidate is offered the
+# proxy lane is not cancelling and the other three are. The level is bounded
+# on BOTH sides and neither bound is cosmetic: louder and the estimator (which
+# is fed from that same channel) takes so long to follow the move that every
+# lane's cancellation has collapsed by then and the two rules agree again --
+# measured, at 0.5 the ANY-lane mutation goes green and the row stops testing
+# anything; quieter and the proxy lane starts cancelling too. At this level
+# the correct rule never engages across the whole run while the ANY-lane one
+# does. Measured: acquisition hop 35, adoption hop 475, and a 1.0 s ANY-lane
+# hold would land on hop 537 -- inside the scene's 560.
+_PROXY_NOISE_GAIN = 0.25
+_PROXY_ACQUIRE_HOP = 35
+_PROXY_ADOPT_HOP = 475
 
 
 def _fnv1a(samples: np.ndarray) -> int:
@@ -437,7 +483,7 @@ def test_change_candidate_lives_for_three_hops_like_lib_aec():
     assert estimator._pending_ttl == 0 and estimator._pending_delay == 0
 
 
-def test_matched_relock_and_zero_delay_acquisition_match_c_per_hop(dumper):
+def test_matched_relock_matches_c_per_hop(dumper):
     scene = _RELOCK_SCENE
     c_hop, c_rows = _c_rows(dumper, **scene)
     hop, far, python_rows = _python_matched_rows(
@@ -449,31 +495,101 @@ def test_matched_relock_and_zero_delay_acquisition_match_c_per_hop(dumper):
 
     changed = [row[0] for row in c_rows if row[3]]
     assert len(changed) == 2, "scene must acquire once and relock once"
-    # The acquisition lands on applied delay 0 -- the case a value-only
-    # `changed` comparison (estimated != accepted_delay, accepted starting at
-    # 0) silently drops -- and the relock is a plain value change.
-    assert c_rows[changed[0]][1] == 0
-    assert c_rows[changed[1]][1] > 0
+    # Both events land on their own path's bulk delay less the headroom, which
+    # is what "the dominant peak was the one selected" looks like from out
+    # here: the pre-echo candidate on this scene is a different number at both
+    # events (0 and 2944), so a substitution at the selection seam moves these
+    # rows rather than leaving them true.
+    assert c_rows[changed[0]][1] == scene["delay"] - _DELAY_HEADROOM
+    assert c_rows[changed[1]][1] == scene["shift_delay"] - _DELAY_HEADROOM
     assert all(row[2] == 1 for row in c_rows[changed[0]:]), (
         "usability must be sticky once a generation is accepted"
     )
 
 
-def test_backward_quarantine_delays_the_pre_echo_relock_and_matches_c_per_hop(dumper):
+def test_an_acquisition_at_applied_delay_zero_still_sets_changed():
+    """``changed`` is "a NEW USABLE generation starts on this hop", not "the
+    value moved": an acquisition that lands on applied delay 0 has to set it,
+    and a value-only comparison (``estimated != accepted_delay`` with
+    ``accepted_delay`` starting at 0) drops exactly that case in silence.
+
+    Scripted rather than driven from a scene, and that demotion is itself part
+    of the contract this file tracks. It used to be _RELOCK_SCENE's own first
+    event, because the aggregator reported the pre-echo candidate and on a
+    64-sample path that candidate fell below the estimator's headroom and
+    clamped to 0. The dominant peak sits on the echo itself, so reaching an
+    applied delay of 0 now takes a bulk delay no larger than _DELAY_HEADROOM
+    -- and measured on this harness, bulk delays of 0, 16 and 32 samples
+    produce no estimate at all while 40 upwards produce one. Applied delay 0
+    is therefore not reachable from any scene this harness can build, and the
+    wrapper's acceptance rule is the only thing left that can be asked.
+    """
+    _est, rows = _scripted_changes([(0, True)] * 3)
+    # Nothing but `changed` distinguishes the first hop from the other two:
+    # the published delay is 0 on all three.
+    assert [row[1] for row in rows] == [0, 0, 0]
+    assert [row[0] for row in rows] == [True, False, False]
+
+
+def test_the_pre_echo_mislock_scene_no_longer_mislocks(dumper):
+    """The scene this file's quarantine rows used to be built on, inverted.
+
+    A true bulk delay of 6400 samples used to be acquired correctly and then
+    re-locked to 4800 -- exactly 1600 samples (100 ms) EARLY -- and held
+    there, and no consecutive-confirmation rule could reject it because the
+    aggregator qualified the estimate with the DOMINANT peak's histogram and
+    then reported the PRE-ECHO candidate: the wrong answer carried confidence
+    1.0 by construction. That is fixed at the selection seam in lib/aec, which
+    has its own aggregator-level coverage.
+
+    What this row adds is the end-to-end half: the aggregator test cannot see
+    this pipeline's acquisition gate, two-step admission or shared ring, so a
+    substitution reaching the applied delay by some other route would pass
+    there and fail here. Asserted with the quarantine OFF -- the shipped
+    default -- so what is under test is the estimator and not the guard.
+    """
+    scene = _MISLOCK_SCENE
+    c_hop, c_rows = _c_rows(dumper, **scene)
+    hop, far, python_rows = _python_matched_rows(
+        scene["delay"], scene["fft"], scene["hops"])
+    assert c_hop == hop
+    _assert_rows_equal(c_rows, python_rows)
+    _assert_served_far_is_the_delayed_far(python_rows, far, hop)
+
+    correct = scene["delay"] - _DELAY_HEADROOM
+    changed = [row[0] for row in c_rows if row[3]]
+    assert len(changed) == 1, "the scene acquires once and never re-locks"
+    assert c_rows[changed[0]][1] == correct
+    assert all(row[1] == correct for row in c_rows[changed[0]:]), (
+        "the acquired delay is held for the rest of the run"
+    )
+    assert _MISLOCK_PRE_ECHO_DELAY not in {row[1] for row in c_rows}, (
+        "the pre-echo answer is never the applied delay, on any hop"
+    )
+
+
+def test_backward_quarantine_holds_a_backward_move_and_matches_c_per_hop(dumper):
     """``delay_backward_quarantine_enabled`` (default OFF) on both sides.
 
-    The scene is the pre-echo mis-lock this mechanism exists for: a true bulk
-    delay of 6400 samples, where the shared estimator acquires CORRECTLY at
-    6336 and then re-locks to 4800 -- exactly 1600 samples (100 ms) EARLY --
-    and sustains that wrong answer, so no consecutive-confirmation rule can
-    reject it. The quarantine's evidence is the capture-proxy lane's own
-    cancellation, and its bound is the configured window.
+    The scene is a backward MOVE: the echo path jumps from 3000 samples to 64
+    at hop 375, so the shared estimate moves EARLIER and the direction test
+    fires. It replaces the pre-echo mis-lock fixture, which was this
+    mechanism's original subject and is now cured at the estimator (see the
+    row above) -- a guard whose only engaging scene was a defect has no
+    coverage once the defect is gone. A real echo-path change is a better
+    subject anyway: the guard was always about how long to withhold a
+    backward estimate, never about whether that estimate was wrong.
 
-    What is asserted, and deliberately NOT asserted: adoption of the wrong
-    delay is DELAYED by exactly the window, not prevented. A mis-lock is not
-    cured here and never was -- that is estimator work. Sweeping the window
-    is what makes "the expiry is what releases" falsifiable: the adoption hop
-    tracks it linearly, on BOTH implementations.
+    What is asserted, and deliberately NOT asserted: adoption is DELAYED, not
+    prevented, and there are two ways it is released. Sweeping the window is
+    what makes each of them falsifiable. Under
+    _BACKWARD_EXPIRY_WINDOWS_S the countdown runs out while the old alignment
+    is still cancelling, and adoption lands on exactly unguarded + window --
+    the expiry is what releases, and the hop tracks the window linearly. Under
+    _BACKWARD_COLLAPSE_WINDOWS_S the window outlasts the cancellation, the
+    evidence disarms the episode, and adoption lands on the SAME hop for every
+    such window -- which is both the "no permanent veto, however long the
+    window" property and the only proof the disarm path runs at all.
 
     Parity is worth more here than on the unquarantined scenes: the C core
     reads ``p->lanes[capture_proxy_channel]`` inside ``update_shared_delay()``
@@ -484,23 +600,26 @@ def test_backward_quarantine_delays_the_pre_echo_relock_and_matches_c_per_hop(du
     the lane AFTER it processes this hop would judge on a different ERLE and
     diverge.
     """
-    scene = _QUARANTINE_SCENE
+    scene = _BACKWARD_SCENE
     off_hop, off_rows = _c_rows(dumper, **scene)
 
-    # The scene must actually mis-lock with the quarantine OFF, or the rows
-    # below prove nothing.
+    # The scene must actually offer a BACKWARD candidate with the quarantine
+    # OFF, or every row below is vacuous.
+    acquired = scene["delay"] - _DELAY_HEADROOM
+    moved = scene["shift_delay"] - _DELAY_HEADROOM
     off_changed = [row[0] for row in off_rows if row[3]]
-    assert len(off_changed) == 2, "scene must acquire once and re-lock once"
-    assert off_rows[off_changed[0]][1] == _QUARANTINE_CORRECT_DELAY
-    assert off_changed[1] == _QUARANTINE_UNHELD_HOP
-    assert off_rows[off_changed[1]][1] == _QUARANTINE_WRONG_DELAY
-    assert off_rows[-1][1] == _QUARANTINE_WRONG_DELAY, "the wrong delay is sustained"
+    assert len(off_changed) == 2, "scene must acquire once and move once"
+    assert off_rows[off_changed[0]][1] == acquired
+    assert off_changed[1] == _BACKWARD_UNHELD_HOP
+    assert off_rows[off_changed[1]][1] == moved
+    assert moved < acquired, "the move must be BACKWARD or nothing engages"
 
-    for window_s in _QUARANTINE_WINDOWS_S:
+    for window_s in _BACKWARD_EXPIRY_WINDOWS_S + _BACKWARD_COLLAPSE_WINDOWS_S:
         c_hop, c_rows = _c_rows(dumper, quarantine=True, quarantine_s=window_s,
                                 **scene)
         hop, far, python_rows = _python_matched_rows(
             scene["delay"], scene["fft"], scene["hops"],
+            scene["shift_at"], scene["shift_delay"],
             quarantine=True, quarantine_s=window_s)
         assert c_hop == hop == off_hop
         _assert_rows_equal(c_rows, python_rows)
@@ -511,16 +630,28 @@ def test_backward_quarantine_delays_the_pre_echo_relock_and_matches_c_per_hop(du
         assert on_changed[0] == off_changed[0], (
             "first acquisition is never quarantined"
         )
-        assert len(on_changed) == 2, "the wrong delay IS adopted, at expiry"
-        assert on_changed[1] == _QUARANTINE_UNHELD_HOP + held, (
-            f"window {window_s}s = {held} hops: adoption must land on "
-            f"{_QUARANTINE_UNHELD_HOP} + {held}"
-        )
-        assert c_rows[on_changed[1]][1] == _QUARANTINE_WRONG_DELAY
-        # The correct delay is what the array is actually ALIGNED to for the
-        # whole window -- the property a consumer sees.
+        assert len(on_changed) == 2, "the move IS adopted -- nothing vetoes it"
+        assert on_changed[1] > _BACKWARD_UNHELD_HOP, "and it IS held first"
+        if window_s in _BACKWARD_EXPIRY_WINDOWS_S:
+            assert on_changed[1] == _BACKWARD_UNHELD_HOP + held, (
+                f"window {window_s}s = {held} hops: the expiry is what "
+                f"releases, so adoption lands on {_BACKWARD_UNHELD_HOP} + "
+                f"{held}"
+            )
+        else:
+            assert _BACKWARD_UNHELD_HOP + held > _BACKWARD_COLLAPSE_HOP, (
+                f"window {window_s}s = {held} hops must outlast the collapse, "
+                f"or this row is testing the expiry again"
+            )
+            assert on_changed[1] == _BACKWARD_COLLAPSE_HOP, (
+                "cancellation at the old alignment is gone, which disarms the "
+                "episode and releases the move regardless of the window left"
+            )
+        assert c_rows[on_changed[1]][1] == moved
+        # The old delay is what the array is actually ALIGNED to for the whole
+        # hold -- the property a consumer sees.
         assert {row[1] for row in c_rows[on_changed[0]:on_changed[1]]} == {
-            _QUARANTINE_CORRECT_DELAY
+            acquired
         }
         assert all(row[2] == 1 for row in c_rows[on_changed[0]:])
 
@@ -529,7 +660,7 @@ def test_a_forward_shared_delay_change_is_never_quarantined(dumper):
     """The direction test, on the shared estimate. When the echo moves to a
     LARGER delay -- which pre-echo mis-attribution cannot produce -- the
     quarantine is not this mechanism's business, so every published field on
-    every hop is identical with it on and off. Measured: adoption on hop 442
+    every hop is identical with it on and off. Measured: adoption on hop 443
     either way.
 
     This is the row that fails if the v1 predicate ("any differing estimate
@@ -551,7 +682,9 @@ def test_a_forward_shared_delay_change_is_never_quarantined(dumper):
     accepted = [row[0] for row in on_rows
                 if row[3] and row[0] > scene["shift_at"]]
     assert accepted, "control: the core accepts the move at all"
-    assert on_rows[-1][1] == 2944, "and ends on the moved delay"
+    assert on_rows[-1][1] == scene["shift_delay"] - _DELAY_HEADROOM, (
+        "and ends on the moved delay"
+    )
 
 
 def test_only_the_capture_proxy_lane_gates_the_quarantine(dumper):
@@ -564,32 +697,37 @@ def test_only_the_capture_proxy_lane_gates_the_quarantine(dumper):
     the whole array.
 
     Every scene above hands all four microphones identical audio, which makes
-    the two rules indistinguishable -- so this one does not: the capture proxy
-    carries enough uncorrelated noise that its lane cannot reach either
-    cancellation threshold, while the other three stay on the clean echo. The
-    correct rule therefore never engages here and the accepted delay is the
-    unquarantined trajectory; an ANY-lane rule would engage on the three clean
-    lanes and hold adoption for a window.
+    the two rules indistinguishable -- so this one does not: the backward-move
+    scene again, but with the capture proxy carrying enough uncorrelated noise
+    that its lane cannot reach either cancellation threshold, while the other
+    three stay on the clean echo. The correct rule therefore never engages
+    here and the accepted delay is the unquarantined trajectory; an ANY-lane
+    rule would engage on the three clean lanes and hold adoption for a window.
     """
-    scene = _PROXY_SCENE
+    scene = _BACKWARD_SCENE
     kwargs = dict(proxy_noise=_PROXY_NOISE_GAIN, **scene)
     off_hop, off_rows = _c_rows(dumper, **kwargs)
     c_hop, c_rows = _c_rows(dumper, quarantine=True, **kwargs)
     hop, far, python_rows = _python_matched_rows(
-        scene["delay"], scene["fft"], scene["hops"], quarantine=True,
+        scene["delay"], scene["fft"], scene["hops"],
+        scene["shift_at"], scene["shift_delay"], quarantine=True,
         proxy_noise=_PROXY_NOISE_GAIN)
     assert c_hop == hop == off_hop
     _assert_rows_equal(c_rows, python_rows)
     _assert_served_far_is_the_delayed_far(python_rows, far, hop)
 
-    # The scene must still mis-lock, or "the quarantine did not engage" would
-    # be vacuous.
+    # The scene must still offer a backward candidate, or "the quarantine did
+    # not engage" would be vacuous.
     off_changed = [row[0] for row in off_rows if row[3]]
     assert off_changed == [_PROXY_ACQUIRE_HOP, _PROXY_ADOPT_HOP], (
-        "control: the noisy-proxy scene still acquires and then mis-locks"
+        "control: the noisy-proxy scene still acquires and then moves back"
     )
-    assert off_rows[off_changed[0]][1] == _QUARANTINE_CORRECT_DELAY
-    assert off_rows[off_changed[1]][1] == _QUARANTINE_WRONG_DELAY
+    assert off_rows[off_changed[0]][1] == scene["delay"] - _DELAY_HEADROOM
+    assert off_rows[off_changed[1]][1] == scene["shift_delay"] - _DELAY_HEADROOM
+    # ...and the hold an ANY-lane rule would impose has to fit inside the run,
+    # or its absence would be a run that ended early rather than a rule that
+    # did not fire.
+    assert _PROXY_ADOPT_HOP + _window_hops(1.0, hop) < scene["hops"]
 
     assert c_rows == off_rows, (
         "the proxy lane is not cancelling, so the quarantine does not engage "

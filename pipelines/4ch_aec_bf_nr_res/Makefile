@@ -276,7 +276,7 @@ $(OBJ_DIR)/test_4aec_nr_res.o: tests/test_4aec_nr_res.c 4aec_nr_res.h | _cfg_gua
 $(OBJ_DIR)/test_audio_pipeline_4ch.o: tests/test_audio_pipeline_4ch.c audio_pipeline_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c 4aec_nr_res.h | _cfg_guard
+$(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c 4aec_nr_res.h 4aec_nr_res_internal.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_audio_pipeline_4ch_ulcnet.o: ../4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h audio_pipeline_4ch.h 4aec_nr_res.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard

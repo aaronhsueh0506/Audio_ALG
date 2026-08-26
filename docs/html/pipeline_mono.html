@@ -114,7 +114,9 @@ void audio_pipeline_get_last_timing(const AudioPipeline* p,
  │      lift = nf_eff * ctx.res_gain[k]*(1-echo_frac);  g_total 向 1 混合
  ├─ sk_capply_gain_f32(spec, ctx.error_spec, g_total)
  ├─ CNG(enable_cng_effective): spec[1..n-2] += sqrt(N²/PSD_SCALE)
- │      * sqrt(1-res_gain²) * rng_gauss()   xorshift32+Box-Muller, seed 0x9e3779b9
+ │      * sqrt(1-res_gain²) * AEC3B_SQRT2_SIN_LUT[ix / (ix+8)&amp;31]
+ │      ix = (rng_state*69069+1)&amp;0x7FFFFFFF &gt;&gt; 26, seed 0x9e3779b9
+ │      (lib/aec aec3_post.c 的同一份 CNG 配方:期望功率不變、|樣本| ≤ sqrt(2))
  └─ fft_inverse(fft, spec, ifft_buf) ─► ola += ifft_buf*synth_win
         ─► memcpy(out, ola, hop) ─► shift ola                       (1-hop lag)</pre>
 

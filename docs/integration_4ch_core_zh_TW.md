@@ -193,6 +193,7 @@ heap 便利路徑：`four_aec_nr_res_create(&cfg)` 把第 1~3 步合成一步，
 | `four_aec_nr_res_n_freqs(p)` | 頻域 bin 數 | `-1` |
 | `four_aec_nr_res_sample_rate(p)` | 實際生效的取樣率 | `-1` |
 | `four_aec_nr_res_matched_filter_count(p)` | 恆為 `1` | `0` |
+| `four_aec_nr_res_duty_hops_run(p)` | 共用 estimator 實跑 matched-filter 分析的 hop 數（duty-cycle census 分子；分母用 `estimator_calls`，`duty_hops_total()` 是其別名） | `0` |
 | `four_aec_nr_res_linear_aec_count(p)` | 恆為 `4` | `0` |
 | `four_aec_nr_res_nr_count(p)` | 恆為 `1` | `0` |
 | `four_aec_nr_res_post_res_count(p)` | 恆為 `1` | `0` |

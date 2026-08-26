@@ -8,6 +8,7 @@
 #include "4aec_nr_res.h"
 #include "4aec_nr_res_internal.h"
 #include "4aec_projection_kernels.h"
+#include "aec3_balanced_config.h"   /* AEC3B_SQRT2_SIN_LUT -- the comfort-noise table */
 #include "fft_wrapper.h"
 
 #include <float.h>
@@ -792,13 +793,13 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * build_flags_hash still matches and this counter is the whole signal.
      * Bump this literal with FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 13u;
+    stale.layout_version = 14u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 14u,
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 15u,
           "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(
@@ -893,10 +894,16 @@ cleanup:
  * of 0, which aec_apply_external_realign() answers as a no-op, and nothing
  * about seam continuity would have been exercised. `history` holds
  * WOLA_SCENE_PAD samples of pre-roll so the echo is valid from the first
- * streamed sample. */
+ * streamed sample.
+ *
+ * The run is long because the second boundary is a RE-lock: the shared
+ * matched filter is duty-cycled, so the estimator answers a movement after a
+ * number of ANALYSED hops, and the coarsest grid here (48 kHz, hop 512)
+ * decimates hardest. The scene has to outlast that, or the identity would
+ * only ever be measured across the acquisition. */
 #define WOLA_SCENE_PAD   16384
 #define WOLA_SHIFT_HOP   150
-#define WOLA_SCENE_HOPS  600
+#define WOLA_SCENE_HOPS  3000
 
 static void fill_delayed_echo(float* microphones, float* ref, int hop,
                               const float* history, int base, int delay) {
@@ -1806,13 +1813,16 @@ static void test_shared_delay_change_admission(void) {
     CHECK(wander.warm + wander.soft == FOUR_AEC_NR_RES_CHANNELS, label);
 
     /* MOVING: the echo path really does travel, 512 <-> 1024 samples in
-     * 100-hop blocks, so the shared estimate moves several times over the run
+     * 400-hop blocks, so the shared estimate moves several times over the run
      * -- and every move is far larger than the admission band, which is what
      * a movement the lanes SHOULD follow looks like. This is the row that
      * makes the two-step rule falsifiable: a single-generation scene would
-     * pass the hold assertions for free. */
-    realign_run(600, 512, 1024, 0.0f, -1, 100, &moving);
-    printf("shared-delay admission: 512<->1024 in 100-hop blocks -> acquired "
+     * pass the hold assertions for free. The blocks are long and so is the
+     * run: the shared matched filter is duty-cycled, so each re-lock costs a
+     * number of ANALYSED hops, and a scene that switched faster than that
+     * would simply never move the estimate. */
+    realign_run(2400, 512, 1024, 0.0f, -1, 400, &moving);
+    printf("shared-delay admission: 512<->1024 in 400-hop blocks -> acquired "
            "hop %d, %d later generations, %d holds, applied %d, %ld warm + "
            "%ld soft\n", moving.acquisition_hop, moving.later_changes,
            moving.hold_hops, moving.applied_at_end, moving.warm, moving.soft);
@@ -1847,8 +1857,10 @@ static void test_shared_delay_change_admission(void) {
           label);
 
     /* SHIFT: the echo really moves, 512 -> 1024 samples, and stays there. One
-     * generation, held for one hop first, then all four lanes realigned. */
-    realign_run(260, 512, 1024, 0.0f, 100, 0, &shift);
+     * generation, held for one hop first, then all four lanes realigned. The
+     * run outlasts the re-lock for the same reason the MOVING scene's blocks
+     * are long. */
+    realign_run(700, 512, 1024, 0.0f, 100, 0, &shift);
     printf("shared-delay admission: shift 512 -> 1024 at hop 100 -> acquired "
            "hop %d, adopted hop %d applied %d, %ld warm + %ld soft\n",
            shift.acquisition_hop, shift.last_change_hop, shift.applied_at_end,
@@ -1972,14 +1984,18 @@ static void test_delay_change_candidate_ttl(void) {
           "restarts its life");
 
     /* End to end: a candidate a real stream produced is cleared by reset(),
-     * together with the life left on it. */
+     * together with the life left on it. The path alternates in long blocks
+     * and the run is long: the shared estimator's matched filter is
+     * duty-cycled, so a movement is published after a number of ANALYSED
+     * hops, not after a number of hops -- a scene that switches faster than
+     * the estimator can answer holds no candidate to clear. */
     cfg = four_aec_nr_res_default_config(16000);
     cfg.fft_size = 512;
     cfg.enable_cng = 0;
     p = four_aec_nr_res_create(&cfg);
     CHECK(p != NULL, "candidate-reset scene creates");
     if (p) {
-        enum { TR_HOP = 256, TR_PAD = 16384, TR_HOPS = 600 };
+        enum { TR_HOP = 256, TR_PAD = 16384, TR_HOPS = 1600 };
         float* far_hist = (float*)malloc(
             (size_t)(TR_HOPS * TR_HOP + TR_PAD) * sizeof(float));
         float mic[TR_HOP * FOUR_AEC_NR_RES_CHANNELS];
@@ -1990,7 +2006,7 @@ static void test_delay_change_candidate_ttl(void) {
             for (hop = 0; hop < TR_HOPS && held_hop < 0; ++hop) {
                 FourAecNrResPreFrame pre;
                 int base = hop * TR_HOP + TR_PAD;
-                int dominant = ((hop / 100) % 2) ? 1024 : 512;
+                int dominant = ((hop / 400) % 2) ? 1024 : 512;
                 realign_scene_hop(far_hist, base, TR_HOP, dominant, 0.0f, 0,
                                   mic, far);
                 if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
@@ -2081,6 +2097,407 @@ static void feed_strength_hops(FourAecNrRes* p, int hops,
         if (last_post_us) *last_post_us = elapsed_us(&a, &b);
     }
     free(mics); free(far); free(out); free(w);
+}
+
+/* ============================================================================
+ * Matched-filter duty cycle
+ * ========================================================================== */
+
+/* Long enough that no 1-in-K schedule this file's grids produce could
+ * manufacture it by accident (the coarsest K here is well under this), short
+ * enough to fit inside the hold window the machine re-arms after. */
+#define DUTY_FULL_RATE_RUN 8
+
+typedef struct DutyRun {
+    unsigned long long total;
+    unsigned long long run;
+    int hops_seen;
+    /* Every hop must advance the census total exactly once: a census wired to
+     * anything but the decision site would drift from what actually ran. */
+    int census_total_mismatch;
+    /* An unanalysed hop must publish nothing new -- that is the whole
+     * contract of feeding without analysing. */
+    int updates_on_skipped_hop;
+    int stable_tail_hops;
+    int stable_tail_analysed;
+    int acquisition_hop;
+    int longest_analysed_streak_after_change;
+    /* Where the machine went back to full rate: the hop the first run of
+     * DUTY_FULL_RATE_RUN consecutive analysed hops after the move begins on.
+     * Consecutive analysed hops are impossible while the machine is engaged,
+     * so this is when it disengaged -- and WHEN is the whole question, since
+     * the estimate itself does not move at the point of the change. */
+    int first_full_rate_hop;
+    int analysed_after_change;
+    int hops_after_change;
+    int reacquire_hop;
+    int reacquire_delay;
+} DutyRun;
+
+/* One 16 kHz/hop-256 MATCHED scene through the shared estimator, reporting
+ * what the duty machine did with it. Same single-path echo generator the
+ * realign scenes use; `shift_at` >= 0 moves the path to delay_b from that hop
+ * on, which is the scene the disengage rule exists for. */
+static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
+                     int stable_tail, DutyRun* out) {
+    enum { DU_HOP = 256, DU_PAD = 32768 };
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* p;
+    float* far_hist;
+    float mic[DU_HOP * FOUR_AEC_NR_RES_CHANNELS];
+    float far[DU_HOP];
+    int hop;
+    int previous_updates = 0;
+    int streak = 0;
+    unsigned long long previous_total = 0;
+    unsigned long long previous_run = 0;
+
+    memset(out, 0, sizeof(*out));
+    out->acquisition_hop = -1;
+    out->reacquire_hop = -1;
+    out->reacquire_delay = -1;
+    out->first_full_rate_hop = -1;
+
+    cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
+    cfg.enable_cng = 0;
+    p = four_aec_nr_res_create(&cfg);
+    if (!p) return;
+
+    far_hist = (float*)malloc((size_t)(hops * DU_HOP + DU_PAD) * sizeof(float));
+    if (!far_hist) { four_aec_nr_res_destroy(p); return; }
+    realign_scene_history(far_hist, hops * DU_HOP + DU_PAD);
+
+    for (hop = 0; hop < hops; ++hop) {
+        FourAecNrResPreFrame pre;
+        int base = hop * DU_HOP + DU_PAD;
+        int dominant = (shift_at >= 0 && hop >= shift_at) ? delay_b : delay_a;
+        unsigned long long total_now, run_now;
+        int analysed;
+        realign_scene_hop(far_hist, base, DU_HOP, dominant, 0.0f, delay_b,
+                          mic, far);
+        if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+            FOUR_AEC_NR_RES_OK) break;
+        out->hops_seen += 1;
+
+        total_now = four_aec_nr_res_duty_hops_total(p);
+        run_now = four_aec_nr_res_duty_hops_run(p);
+        analysed = (int)(run_now - previous_run);
+        if (total_now - previous_total != 1ull) out->census_total_mismatch += 1;
+        if (!analysed && hop > 0 &&
+            pre.delay.estimator_updates != previous_updates)
+            out->updates_on_skipped_hop += 1;
+
+        /* Tail window: the last stable_tail hops before the shift, or before
+         * the end of the run when there is no shift -- so a shift-free call
+         * measures its settled tail without a second, byte-identical run. */
+        {
+            int tail_end = (shift_at >= 0) ? shift_at : hops;
+            if (stable_tail > 0 && hop >= tail_end - stable_tail &&
+                hop < tail_end) {
+                out->stable_tail_hops += 1;
+                out->stable_tail_analysed += analysed;
+            }
+        }
+        if (shift_at >= 0 && hop >= shift_at) {
+            out->hops_after_change += 1;
+            out->analysed_after_change += analysed;
+            streak = analysed ? streak + 1 : 0;
+            if (streak > out->longest_analysed_streak_after_change)
+                out->longest_analysed_streak_after_change = streak;
+            if (streak >= DUTY_FULL_RATE_RUN && out->first_full_rate_hop < 0)
+                out->first_full_rate_hop = hop - streak + 1;
+        }
+        if (pre.delay.changed) {
+            if (out->acquisition_hop < 0) out->acquisition_hop = hop;
+            if (shift_at >= 0 && hop >= shift_at && out->reacquire_hop < 0) {
+                out->reacquire_hop = hop;
+                out->reacquire_delay = pre.delay.delay_samples;
+            }
+        }
+        previous_total = total_now;
+        previous_run = run_now;
+        previous_updates = pre.delay.estimator_updates;
+        four_aec_nr_res_abandon_pre(p, &pre.token);
+    }
+
+    out->total = four_aec_nr_res_duty_hops_total(p);
+    out->run = four_aec_nr_res_duty_hops_run(p);
+    free(far_hist);
+    four_aec_nr_res_destroy(p);
+}
+
+static void test_duty_cycle_machine(void) {
+    DutyRun stable, moved;
+    FourAecNrResConfig cfg;
+    FourAecNrRes* p;
+    char label[224];
+
+    /* STABLE: one path, held for the whole run. This is exactly the condition
+     * the machine is built to decimate (estimate solid and unchanged for the
+     * hold window), so "it never armed" is a failure here, not a property of
+     * the stimulus. */
+    duty_run(400, 2048, 2048, -1, 120, &stable);
+    printf("duty cycle: static 2048-sample path -> acquired hop %d, analysed "
+           "%llu of %llu hops (%.1f%%)\n", stable.acquisition_hop,
+           stable.run, stable.total,
+           stable.total ? 100.0 * (double)stable.run / (double)stable.total
+                        : 0.0);
+
+    snprintf(label, sizeof(label),
+             "the census counts every hop through the shared delay stage "
+             "(%llu counted, %d hops driven, %d hops that advanced it by "
+             "anything but 1)", stable.total, stable.hops_seen,
+             stable.census_total_mismatch);
+    CHECK(stable.total == (unsigned long long)stable.hops_seen &&
+          stable.hops_seen == 400 && stable.census_total_mismatch == 0, label);
+
+    /* The assertion that can actually fail: a machine that never arms, or a
+     * census wired to a plain hop counter, makes run == total. The band is
+     * deliberately wide -- how fast the estimate goes solid is
+     * stimulus-dependent, and only the decimated REGIME is being pinned. */
+    snprintf(label, sizeof(label),
+             "engagement drops below full rate once the estimate holds still "
+             "(%llu analysed of %llu)", stable.run, stable.total);
+    CHECK(stable.run > 0ull && stable.run < stable.total &&
+          (double)stable.run < 0.6 * (double)stable.total, label);
+
+    snprintf(label, sizeof(label),
+             "the analysed share over the settled tail is decimated, not "
+             "merely reduced (%d of the last %d hops)",
+             stable.stable_tail_analysed, stable.stable_tail_hops);
+    CHECK(stable.stable_tail_hops == 120 &&
+          stable.stable_tail_analysed > 0 &&
+          stable.stable_tail_analysed <= 30, label);
+
+    snprintf(label, sizeof(label),
+             "a hop the matched filter did not analyse publishes no new "
+             "estimate (%d hops published one anyway)",
+             stable.updates_on_skipped_hop);
+    CHECK(stable.updates_on_skipped_hop == 0, label);
+
+    /* MOVED: the echo path really travels, from 2048 to 4096 samples, after
+     * the filters have converged on the first one. Nothing in the PUBLISHED
+     * estimate changes at the move -- it keeps reporting the old delay with
+     * full confidence -- so the only thing that can take the machine back to
+     * full rate is the cancellation watchdog. */
+    duty_run(900, 2048, 4096, 300, 120, &moved);
+    printf("duty cycle: 2048 -> 4096 at hop 300 -> re-acquired hop %d applied "
+           "%d, %d analysed of %d hops after the move, longest full-rate run "
+           "%d hops\n", moved.reacquire_hop, moved.reacquire_delay,
+           moved.analysed_after_change, moved.hops_after_change,
+           moved.longest_analysed_streak_after_change);
+
+    snprintf(label, sizeof(label),
+             "control: the moved path is really re-acquired, at the new "
+             "alignment (hop %d, applied %d for a true 4096)",
+             moved.reacquire_hop, moved.reacquire_delay);
+    CHECK(moved.reacquire_hop > 300 && moved.reacquire_delay >= 0 &&
+          4096 - moved.reacquire_delay >= 0 &&
+          4096 - moved.reacquire_delay <= KD_MAX_UNDERSHOOT, label);
+
+    /* While engaged the schedule is 1-in-K, so consecutive analysed hops are
+     * impossible: a run of them proves the machine DISENGAGED. Deleting the
+     * cancellation watchdog leaves this at 1 -- the estimate itself never
+     * moves at the point of the change, so nothing else can disengage it. */
+    snprintf(label, sizeof(label),
+             "the cancellation watchdog takes the machine back to full rate "
+             "PROMPTLY after the move (first run of %d consecutive analysed "
+             "hops starts on hop %d, %d hops after it; longest run %d)",
+             DUTY_FULL_RATE_RUN, moved.first_full_rate_hop,
+             moved.first_full_rate_hop >= 0 ? moved.first_full_rate_hop - 300
+                                            : -1,
+             moved.longest_analysed_streak_after_change);
+    CHECK(moved.first_full_rate_hop >= 300 &&
+          moved.first_full_rate_hop - 300 <= 60 &&
+          moved.longest_analysed_streak_after_change >= DUTY_FULL_RATE_RUN,
+          label);
+
+    snprintf(label, sizeof(label),
+             "and the census still accounts for every hop of the moved scene "
+             "(%llu counted, %d driven, %d skipped hops that published)",
+             moved.total, moved.hops_seen, moved.updates_on_skipped_hop);
+    CHECK(moved.total == (unsigned long long)moved.hops_seen &&
+          moved.census_total_mismatch == 0 &&
+          moved.updates_on_skipped_hop == 0, label);
+
+    /* Only MATCHED builds a matched filter, so only MATCHED has a cost to
+     * decimate: the other two modes must leave both counters at 0 rather
+     * than reporting a saving on a machine that was never built. */
+    {
+        int mode;
+        for (mode = 0; mode < 2; ++mode) {
+            float mic[128 * FOUR_AEC_NR_RES_CHANNELS];
+            float far[128];
+            float out[128];
+            Complex* weights;
+            int hop, i, n_freqs;
+            cfg = four_aec_nr_res_default_config(16000);
+            if (mode == 0) {
+                cfg.delay_mode = AEC_DELAY_FIXED;
+                cfg.fixed_delay_samples = 256;
+            } else {
+                cfg.delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
+                cfg.fixed_delay_samples = -1;
+            }
+            p = four_aec_nr_res_create(&cfg);
+            CHECK(p != NULL, "duty census: non-MATCHED core creates");
+            if (!p) continue;
+            hop = four_aec_nr_res_hop_size(p);
+            n_freqs = four_aec_nr_res_n_freqs(p);
+            weights = (Complex*)calloc(
+                (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
+            for (i = 0; i < FOUR_AEC_NR_RES_CHANNELS * n_freqs; ++i)
+                weights[i].r = 0.25f;
+            for (i = 0; i < 20; ++i) {
+                FourAecNrResPreFrame pre;
+                fill_inputs(mic, far, hop, 16000, i);
+                if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+                    FOUR_AEC_NR_RES_OK) break;
+                four_aec_nr_res_process_post(p, &pre.token, weights, out);
+            }
+            snprintf(label, sizeof(label),
+                     "%s builds no matched filter, so its duty census stays "
+                     "at 0/0 (%llu/%llu)",
+                     mode == 0 ? "FIXED" : "EXTERNAL_ALIGNED",
+                     four_aec_nr_res_duty_hops_run(p),
+                     four_aec_nr_res_duty_hops_total(p));
+            CHECK(four_aec_nr_res_duty_hops_total(p) == 0ull &&
+                  four_aec_nr_res_duty_hops_run(p) == 0ull, label);
+            free(weights);
+            four_aec_nr_res_destroy(p);
+        }
+    }
+
+    /* The census measures ONE run of the machine: reset() restarts it, and
+     * counting resumes rather than sticking at zero. */
+    {
+        float mic[128 * FOUR_AEC_NR_RES_CHANNELS];
+        float far[128];
+        unsigned long long after_reset;
+        int hop, i;
+        cfg = four_aec_nr_res_default_config(16000);
+        cfg.enable_post = 0;
+        p = four_aec_nr_res_create(&cfg);
+        CHECK(p != NULL, "duty census: reset-scope core creates");
+        if (p) {
+            hop = four_aec_nr_res_hop_size(p);
+            for (i = 0; i < 12; ++i) {
+                FourAecNrResPreFrame pre;
+                fill_inputs(mic, far, hop, 16000, i);
+                if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+                    FOUR_AEC_NR_RES_OK) break;
+                four_aec_nr_res_abandon_pre(p, &pre.token);
+            }
+            CHECK(four_aec_nr_res_duty_hops_total(p) == 12ull,
+                  "duty census counts the hops before a reset");
+            four_aec_nr_res_reset(p);
+            CHECK(four_aec_nr_res_duty_hops_total(p) == 0ull &&
+                  four_aec_nr_res_duty_hops_run(p) == 0ull,
+                  "four_aec_nr_res_reset() zeroes the duty census");
+            for (i = 0; i < 5; ++i) {
+                FourAecNrResPreFrame pre;
+                fill_inputs(mic, far, hop, 16000, i);
+                if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+                    FOUR_AEC_NR_RES_OK) break;
+                four_aec_nr_res_abandon_pre(p, &pre.token);
+            }
+            after_reset = four_aec_nr_res_duty_hops_total(p);
+            snprintf(label, sizeof(label),
+                     "and counting resumes after it (%llu)", after_reset);
+            CHECK(after_reset == 5ull, label);
+            four_aec_nr_res_destroy(p);
+        }
+    }
+}
+
+/* ============================================================================
+ * Cross-lane far-end spectrum guard
+ * ========================================================================== */
+
+static void test_far_spec_provenance_guard(void) {
+    enum { FS_N = 33 };
+    Complex reference[FS_N];
+    Complex lane[FS_N];
+    FourAecNrResConfig cfg;
+    FourAecNrRes* p;
+    char label[224];
+    int k;
+
+    for (k = 0; k < FS_N; ++k) {
+        reference[k].r = 0.5f * (float)(k - 11);
+        reference[k].i = -0.25f * (float)(k + 3);
+    }
+    memcpy(lane, reference, sizeof(reference));
+
+    CHECK(four_aec_nr_res_far_spec_agrees(0, lane, reference, FS_N) == 1,
+          "a lane carrying the same far spectrum is accepted on the "
+          "comparison path");
+    CHECK(four_aec_nr_res_far_spec_agrees(1, lane, reference, FS_N) == 1,
+          "and on the provenance path");
+
+    /* A lane whose far-end spectrum genuinely differs must still be rejected
+     * -- X is one shared render reference, not a fourth observation of it.
+     * The divergence is far outside complex_close()'s relative window. */
+    lane[7].r = reference[7].r + 1.0f;
+    CHECK(four_aec_nr_res_far_spec_agrees(0, lane, reference, FS_N) == 0,
+          "a lane carrying a DIFFERENT far spectrum is rejected when nothing "
+          "establishes where it came from");
+
+    /* MUTATION, asserted rather than described: the provenance flag is what
+     * licenses skipping the comparison, so a flag that says "shared" when the
+     * lanes are not lets exactly this frame through. That is why nothing sets
+     * it except the counter evidence in process_pre(), and why every bail-out
+     * path leaves it 0. Make four_aec_nr_res_far_spec_agrees() ignore its
+     * first argument and the row above goes red. */
+    CHECK(four_aec_nr_res_far_spec_agrees(1, lane, reference, FS_N) == 1,
+          "and would be accepted if provenance claimed the lanes shared one "
+          "spectrum (the flag is load-bearing, not decorative)");
+
+    CHECK(four_aec_nr_res_far_spec_agrees(0, NULL, reference, FS_N) == 0 &&
+          four_aec_nr_res_far_spec_agrees(1, lane, NULL, FS_N) == 0,
+          "a missing spectrum is rejected on either path");
+
+    /* End to end: production really does take the cheap path, and the
+     * evidence it rests on -- one real far transform per hop across the four
+     * lanes -- is the same figure the sharing test pins. */
+    cfg = four_aec_nr_res_default_config(16000);
+    p = four_aec_nr_res_create(&cfg);
+    CHECK(p != NULL, "far-spec provenance: core creates");
+    if (p) {
+        float mic[128 * FOUR_AEC_NR_RES_CHANNELS];
+        float far[128];
+        float out[128];
+        Complex* weights;
+        int hop = four_aec_nr_res_hop_size(p);
+        int n_freqs = four_aec_nr_res_n_freqs(p);
+        int established = 0;
+        int hops = 0;
+        int i;
+        weights = (Complex*)calloc(
+            (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
+        for (i = 0; i < FOUR_AEC_NR_RES_CHANNELS * n_freqs; ++i)
+            weights[i].r = 0.25f;
+        for (i = 0; i < 40; ++i) {
+            FourAecNrResPreFrame pre;
+            fill_inputs(mic, far, hop, 16000, i);
+            if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+                FOUR_AEC_NR_RES_OK) break;
+            hops += 1;
+            established += four_aec_nr_res_far_spec_provenance(p) ? 1 : 0;
+            if (four_aec_nr_res_process_post(p, &pre.token, weights, out) !=
+                FOUR_AEC_NR_RES_OK) break;
+        }
+        snprintf(label, sizeof(label),
+                 "every hop establishes the shared-far provenance (%d of %d), "
+                 "backed by one real far transform per hop (%ld)",
+                 established, hops,
+                 four_aec_nr_res_far_fft_real_compute_count(p));
+        CHECK(hops == 40 && established == 40 &&
+              four_aec_nr_res_far_fft_real_compute_count(p) == (long)hops,
+              label);
+        free(weights);
+        four_aec_nr_res_destroy(p);
+    }
 }
 
 static void test_runtime_strength(void) {
@@ -2252,6 +2669,181 @@ static void test_stage_timing(void) {
            t.fuse_us, t.res_us, t.nr_us, t.synth_us, post_wall_us);
 }
 
+/* Comfort noise fills the AEC-suppressed bins from lib/aec's own recipe: an
+ * LCG step per bin whose top five bits index AEC3B_SQRT2_SIN_LUT, the
+ * imaginary part reading a quarter turn (+8 of 32) ahead of the real one.
+ * What the injected noise owes the caller is bounded samples, the same
+ * expected per-bin power as the unit-variance Gaussian pair the recipe
+ * replaced, and a sequence that advances -- not one fixed sample stream, so
+ * nothing here pins output bytes. The pipeline half differences a CNG-on run
+ * against a byte-identical CNG-off one; comfort noise is added after every
+ * gain, so that difference is the injected noise and nothing else. */
+static void test_comfort_noise_contract(void) {
+    FourAecNrResConfig on = four_aec_nr_res_default_config(16000);
+    FourAecNrResConfig off = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* p_on;
+    FourAecNrRes* p_off;
+    float* mics;
+    float* far;
+    float* out_on;
+    float* out_off;
+    float* prev_noise;
+    float* noise_stream;
+    Complex* w;
+    double sum = 0.0;
+    double sq = 0.0;
+    double worst_pair = 0.0;
+    double noise_sq = 0.0;
+    double corr_sum = 0.0;
+    float bound = 0.0f;
+    const int hops = 240;
+    int hop;
+    int n;
+    int h, i, ch, k;
+    int injected = 0;
+    int prev_active = 0;
+    int corr_n = 0;
+    int finite = 1;
+
+    for (i = 0; i < 32; ++i) {
+        float v = AEC3B_SQRT2_SIN_LUT[i];
+        float q = AEC3B_SQRT2_SIN_LUT[(i + 8) & 31];
+        double power = (double)v * v + (double)q * q;
+        if (fabsf(v) > bound) bound = fabsf(v);
+        sum += v;
+        sq += (double)v * v;
+        if (fabs(power - 2.0) > worst_pair) worst_pair = fabs(power - 2.0);
+    }
+    CHECK(bound <= 1.41421366f,
+          "cng: every table entry is bounded by sqrt(2) (no unbounded tail)");
+    CHECK(fabs(sum / 32.0) < 1e-6,
+          "cng: the table is zero-mean over a uniform index");
+    CHECK(fabs(sq / 32.0 - 1.0) < 1e-6,
+          "cng: the table has unit mean square -- same expected per-bin power "
+          "as the unit-variance Gaussian pair it replaced");
+    CHECK(worst_pair < 1e-6,
+          "cng: real and imaginary entries are a quarter turn apart, so each "
+          "bin's injected power is exactly 2*amplitude^2");
+
+    off.enable_cng = 0;
+    p_on = four_aec_nr_res_create(&on);
+    p_off = four_aec_nr_res_create(&off);
+    CHECK(p_on != NULL && p_off != NULL, "cng: both cores create");
+    if (!p_on || !p_off) {
+        four_aec_nr_res_destroy(p_on);
+        four_aec_nr_res_destroy(p_off);
+        return;
+    }
+    hop = four_aec_nr_res_hop_size(p_on);
+    n = four_aec_nr_res_n_freqs(p_on);
+    mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out_on = (float*)calloc((size_t)hop, sizeof(float));
+    out_off = (float*)calloc((size_t)hop, sizeof(float));
+    prev_noise = (float*)calloc((size_t)hop, sizeof(float));
+    noise_stream = (float*)calloc((size_t)hops * (size_t)hop, sizeof(float));
+    w = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n, sizeof(Complex));
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+        for (k = 0; k < n; ++k) w[(size_t)ch * (size_t)n + (size_t)k].r = 0.25f;
+
+    for (h = 0; h < hops; ++h) {
+        FourAecNrResPreFrame pre_on;
+        FourAecNrResPreFrame pre_off;
+        fill_inputs(mics, far, hop, 16000, h);
+        if (four_aec_nr_res_process_pre(p_on, mics, far, &pre_on) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_post(p_on, &pre_on.token, w, out_on) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_pre(p_off, mics, far, &pre_off) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_post(p_off, &pre_off.token, w, out_off) !=
+                FOUR_AEC_NR_RES_OK) {
+            finite = 0;
+            break;
+        }
+        {
+            double hop_sq = 0.0;
+            double cross = 0.0;
+            double prev_sq = 0.0;
+            for (i = 0; i < hop; ++i) {
+                float noise = out_on[i] - out_off[i];
+                noise_stream[(size_t)h * (size_t)hop + (size_t)i] = noise;
+                if (!isfinite(out_on[i]) || !isfinite(noise)) finite = 0;
+                noise_sq += (double)noise * noise;
+                hop_sq += (double)noise * noise;
+                cross += (double)noise * prev_noise[i];
+                prev_sq += (double)prev_noise[i] * prev_noise[i];
+                if (noise != 0.0f) injected = 1;
+            }
+            /* A generator whose state never advanced would hand every bin of
+             * every hop the same table entry, so each hop's injected spectrum
+             * would be the amplitude profile times one fixed complex constant
+             * -- successive hops would then be nearly collinear. Advancing per
+             * bin decorrelates them. */
+            if (hop_sq > 0.0 && prev_active && prev_sq > 0.0) {
+                corr_sum += fabs(cross / sqrt(hop_sq * prev_sq));
+                corr_n += 1;
+            }
+            prev_active = (hop_sq > 0.0);
+            if (prev_active)
+                for (i = 0; i < hop; ++i) prev_noise[i] = out_on[i] - out_off[i];
+        }
+    }
+    CHECK(finite, "cng: every CNG-on sample and every injected sample is finite");
+    CHECK(injected && noise_sq > 0.0,
+          "cng: comfort noise is actually injected (CNG-on and CNG-off cores "
+          "carry different energy)");
+    CHECK(corr_n > 20 && corr_sum / corr_n < 0.5,
+          "cng: successive hops' injected noise is decorrelated -- the "
+          "generator advances instead of re-injecting one fixed spectrum");
+
+    /* The seed is per-INSTANCE: a second, independently created pair fed the
+     * same input must inject the byte-identical stream. A process-wide
+     * generator state would fail here. */
+    {
+        FourAecNrRes* q_on = four_aec_nr_res_create(&on);
+        FourAecNrRes* q_off = four_aec_nr_res_create(&off);
+        int same = 1;
+        if (q_on && q_off) {
+            for (h = 0; h < hops && same; ++h) {
+                FourAecNrResPreFrame a;
+                FourAecNrResPreFrame b;
+                fill_inputs(mics, far, hop, 16000, h);
+                if (four_aec_nr_res_process_pre(q_on, mics, far, &a) !=
+                        FOUR_AEC_NR_RES_OK ||
+                    four_aec_nr_res_process_post(q_on, &a.token, w, out_on) !=
+                        FOUR_AEC_NR_RES_OK ||
+                    four_aec_nr_res_process_pre(q_off, mics, far, &b) !=
+                        FOUR_AEC_NR_RES_OK ||
+                    four_aec_nr_res_process_post(q_off, &b.token, w, out_off) !=
+                        FOUR_AEC_NR_RES_OK) {
+                    same = 0;
+                    break;
+                }
+                for (i = 0; i < hop; ++i)
+                    if (out_on[i] - out_off[i] !=
+                        noise_stream[(size_t)h * (size_t)hop + (size_t)i])
+                        same = 0;
+            }
+        }
+        CHECK(q_on && q_off && same,
+              "cng: a second, independently created core injects the identical "
+              "noise stream (the seed is per-instance)");
+        four_aec_nr_res_destroy(q_on);
+        four_aec_nr_res_destroy(q_off);
+    }
+
+    printf("cng: %d hops, injected RMS %.3e, hop-to-hop |corr| %.4f over %d "
+           "pairs (bound %.8f)\n",
+           hops, sqrt(noise_sq / ((double)hops * (double)hop)),
+           corr_n ? corr_sum / corr_n : -1.0, corr_n, bound);
+    free(mics); free(far); free(out_on); free(out_off);
+    free(prev_noise); free(noise_stream); free(w);
+    four_aec_nr_res_destroy(p_on);
+    four_aec_nr_res_destroy(p_off);
+}
+
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
@@ -2276,8 +2868,11 @@ int main(void) {
     test_known_delay_memory_and_cost();
     test_shared_delay_change_admission();
     test_delay_change_candidate_ttl();
+    test_duty_cycle_machine();
+    test_far_spec_provenance_guard();
     test_runtime_strength();
     test_stage_timing();
+    test_comfort_noise_contract();
 
     if (failures) {
         printf("%d test(s) failed\n", failures);
