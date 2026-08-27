@@ -45,6 +45,7 @@ from dataset_gen import (  # noqa: E402
 from training_common import (  # noqa: E402
     GradNormLog,
     NonFiniteTraining,
+    WeightScaleGuard,
     fast_forward_scheduler,
     halt_on_non_finite,
     make_scheduler,
@@ -921,6 +922,11 @@ def train(args):
     # a second one that cannot be compared against the first.
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), SR,
                            hazard_mag=SAFE_ANGLE_WORST_MAG)
+    # Per-tensor, because grad_norm.csv above is a GLOBAL norm and stays
+    # healthy while one branch's weights decay to nothing.  Built here,
+    # after any resume load, so a resumed run measures against what it
+    # resumed from.
+    weight_guard = WeightScaleGuard(model)
 
     def make_halt_context(epoch):
         """Assemble halt_on_non_finite's arguments -- called ONLY when halting.
@@ -1156,6 +1162,7 @@ def train(args):
             'contract': contract,
             'config': {k: dict(v) for k, v in cfg.items() if k != 'DEFAULT'},
         }
+        weight_guard.check(epoch=epoch, global_step=global_step)
         torch.save(ckpt, os.path.join(output_dir, 'dfn2_last.pth'))
 
         if is_best:

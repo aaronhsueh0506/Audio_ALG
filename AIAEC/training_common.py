@@ -19,8 +19,15 @@ Provided here:
   ``require_checkpoint_contract``             -- reject a checkpoint whose grid,
   task, model kwargs or loss version differ from the running config
 * ``scan_non_finite`` / ``NonFiniteTraining`` / ``GradNormLog`` /
-  ``halt_on_non_finite``                      -- the NaN-halt machinery is
-  re-exported from ``AINR.training_common``, not reimplemented a second time
+  ``halt_on_non_finite`` / ``WeightScaleGuard`` / ``VanishedWeights``
+                                              -- the halt machinery is
+  re-exported from ``AINR.training_common``, not reimplemented a second time.
+  ``WeightScaleGuard`` covers the failure ``scan_non_finite`` structurally
+  cannot: weights that decay to denormal magnitudes stay FINITE
+* ``make_optimizer``                          -- ``[training] optimizer``, part
+  of the comparison protocol for the same reason the LR schedule is: four
+  candidates are not comparable if one of them decays its weights inside Adam's
+  moment normaliser and the others do not
 * ``make_scheduler`` / ``fast_forward_scheduler`` -- likewise: linear warmup into
   cosine annealing, stepped per optimizer step.  The LR trajectory is part of
   the comparison protocol, so four candidates trained over "the same 100 epochs"
@@ -70,6 +77,8 @@ from AINR.dataset_gen import set_seed, subsets_from_indices  # noqa: E402
 from AINR.training_common import (  # noqa: E402
     GradNormLog,
     NonFiniteTraining,
+    VanishedWeights,
+    WeightScaleGuard,
     fast_forward_scheduler,
     halt_on_non_finite as _halt_on_non_finite,
     make_scheduler,
@@ -123,6 +132,10 @@ __all__ = [
     'NonFiniteTraining',
     'GradNormLog',
     'halt_on_non_finite',
+    'VanishedWeights',
+    'WeightScaleGuard',
+    'DEFAULT_OPTIMIZER',
+    'make_optimizer',
     'compressed_spectral_loss',
     'LinearAecEngine',
     'make_scheduler',
@@ -582,6 +595,57 @@ def compressed_spectral_loss(estimate: Tensor, target: Tensor, *,
                     + (comp_e.imag - comp_t.imag).abs().mean())
     magnitude_term = (mag_e.pow(compression) - mag_t.pow(compression)).abs().mean()
     return complex_weight * complex_term + magnitude_weight * magnitude_term
+
+
+# ============================================================
+# Optimizer
+# ============================================================
+
+#: ``[training] optimizer`` -> class.  AdamW is the default because plain Adam's
+#: COUPLED L2 term is a weight-killer on a branch whose gradient has gone quiet:
+#: ``weight_decay * w`` is then the only consistently signed contribution left in
+#: that tensor's gradient, and Adam divides it by ``sqrt(v_hat)`` of that same
+#: contribution, so the normalised step is ~1 and the weight moves a full ~lr
+#: per step -- through zero and on down into denormal magnitudes.  AdamW applies
+#: the identical ``weight_decay`` OUTSIDE the moment normaliser, a bounded
+#: ``(1 - lr * weight_decay)`` shrink per step that no vanishing gradient can
+#: amplify.  ``adam`` stays selectable so a run that predates the switch can be
+#: reproduced exactly.
+OPTIMIZERS = {
+    'adamw': torch.optim.AdamW,
+    'adam': torch.optim.Adam,
+}
+DEFAULT_OPTIMIZER = 'adamw'
+
+
+def make_optimizer(cfg, params, *, lr: float) -> torch.optim.Optimizer:
+    """Build the ``[training]`` optimizer every AIAEC candidate shares.
+
+    The optimizer belongs to the comparison protocol exactly as the LR schedule
+    does: four candidates trained over "the same 100 epochs" are not comparable
+    if one of them decays its weights inside the moment normaliser and the rest
+    do not.  So the name, ``weight_decay`` and ``amsgrad`` are read here once
+    instead of in four ``train.py`` files, and an unrecognised name is REFUSED
+    rather than quietly falling back -- a typo that silently trains something
+    else is the drift this module exists to prevent.
+
+    ``weight_decay`` keeps its nominal 1e-4 across the switch.  Decoupled, that
+    number is a much gentler regulariser than the same number was coupled, and
+    that is the intent: bounded shrink instead of an unbounded push once a
+    tensor's gradient vanishes.
+    """
+    name = cfg.get('training', 'optimizer', fallback=DEFAULT_OPTIMIZER)
+    name = name.strip().lower()
+    if name not in OPTIMIZERS:
+        raise ValueError(
+            f"[training] optimizer must be one of {sorted(OPTIMIZERS)}, "
+            f"got {name!r}"
+        )
+    return OPTIMIZERS[name](
+        params, lr=lr,
+        weight_decay=cfg.getfloat('training', 'weight_decay', fallback=1e-4),
+        amsgrad=cfg.getboolean('training', 'amsgrad', fallback=True),
+    )
 
 
 # ============================================================

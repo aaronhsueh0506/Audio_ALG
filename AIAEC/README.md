@@ -80,13 +80,28 @@ model; PBFDKF is not precomputed over the whole WAV.
 Identical to the NR side and defined in the same place: one shared
 `AINR/training_common.py`, re-exported through `AIAEC/training_common.py` and
 imported by all four candidate trainers. Per-step linear warmup into cosine
-annealing, a scheduler rebuilt rather than restored on resume, and a non-finite
-halt that dumps the offending batch instead of raising bare.
+annealing, a scheduler rebuilt rather than restored on resume, a non-finite halt
+that dumps the offending batch instead of raising bare, and a per-tensor
+vanished-weight guard before every checkpoint write.
 
 **The full contract, with the measurements behind each rule, is in
 [../AINR/README.md](../AINR/README.md) under "Training contract" — it is written
 once so the two model families cannot drift apart on it.** The config keys are
-`lr`, `min_lr`, `lr_warmup`, `warmup_epochs`, `grad_clip`.
+`lr`, `min_lr`, `lr_warmup`, `warmup_epochs`, `grad_clip`, `optimizer`,
+`weight_decay`, `amsgrad`.
+
+The optimizer is the one part of the contract the AEC side pins on its own.
+`[training] optimizer` selects `adamw` (the default) or `adam`, an unrecognised
+name is refused rather than silently defaulted, and all four candidates must
+agree on the value for the same reason they must agree on the LR schedule. The
+NR trainers keep their upstream-faithful optimizers instead, which is why the
+key lives here. `adam`'s COUPLED L2 term is what cost a real Align-ULCNet run
+one of its two subband GRU blocks: once that branch's true gradient went quiet,
+`weight_decay * w` was the only consistently signed contribution left in the
+tensor, and dividing it by the `sqrt(v)` of that same contribution restored it
+to a full ~`lr` step, driving the weights through zero and down into denormals.
+`weight_decay` keeps its nominal `1e-4` across the switch: decoupled, that
+number is a much gentler regulariser than it was coupled, which is the intent.
 
 ## ONNX export and calibration
 

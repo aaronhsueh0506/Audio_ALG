@@ -1,4 +1,4 @@
-"""AINR trainer 共用機制：非有限值攔截、梯度範數追蹤、LR schedule。
+"""AINR trainer 共用機制：非有限值攔截、權重塌陷攔截、梯度範數追蹤、LR schedule。
 
 這裡放的是「每個 trainer 都需要、而且必須完全一致」的東西。理由與
 ``dataset_gen`` 相同：sampler / seeder / train-val split 曾經被各個 trainer 各
@@ -67,6 +67,156 @@ def scan_non_finite(module, include_buffers=False):
     bad.sort(key=lambda row: row[1] + row[2], reverse=True)
     return bad
 
+
+class VanishedWeights(RuntimeError):
+    """Raised to HALT training when a parameter tensor's scale has collapsed.
+
+    Deliberately NOT a ``NonFiniteTraining``: the values that trigger this are
+    FINITE.  A GRU block whose weights have decayed to 1e-25 passes
+    ``scan_non_finite``, passes every ``torch.isfinite`` assertion, and exports
+    to an ONNX graph that agrees with PyTorch to the last bit -- both reproduce
+    the same dead branch.  Folding it into the non-finite exception would make
+    that name false for whatever catches it, and this halt has no offending
+    batch to dump, so it cannot travel through ``halt_on_non_finite`` either.
+    """
+
+
+#: A tensor counts as collapsed only when BOTH hold; ``WeightScaleGuard``'s
+#: docstring has the measurements behind the two numbers.
+VANISHED_RATIO = 1e-6
+VANISHED_FLOOR = 1e-12
+
+
+class WeightScaleGuard:
+    """Per-tensor ``max|w|`` watch that halts when one tensor's scale collapses.
+
+    ⚠ PER-TENSOR is the whole point.  A real run lost one of two parallel
+    subband GRU blocks to weights of 6.5e-25 while its twin stayed at 6e-01, and
+    ``grad_norm.csv`` never dropped below 0.2 for the entire run: that trace
+    records the GLOBAL norm, which the surviving branch and the rest of the
+    network sustain on their own.  No global scalar can see one branch die, and
+    nothing else in this module can either -- the weights stay finite, so the
+    loss curve, ``scan_non_finite`` and an ONNX parity check all agree that
+    everything is fine.
+
+    Each tensor is judged against ITS OWN scale, never an absolute one.  Many
+    biases initialize to exactly zero (8 of Align-ULCNet's 67 parameter tensors
+    do) and some norm/gate parameters are legitimately small, so a bare
+    ``max|w| < eps`` test fires at step 0.  The baseline is the RUNNING maximum
+    of ``max|w|`` seen so far rather than the initial value, which costs nothing
+    extra and is strictly more sensitive: a zero-initialized bias that grows and
+    only then collapses is still caught, where a fixed initial snapshot would
+    have written it off forever.  Under ``--resume`` the baseline starts from
+    the loaded weights, because what a resumed run departs from is what it
+    resumed from.
+
+    A tensor whose running peak has never risen above ``floor`` is SKIPPED: it
+    has no scale to fall from, and the ratio against it is meaningless.  That
+    exclusion cannot hide a collapse, because a collapse is by definition a fall
+    from a healthy scale and a healthy scale pins the peak above ``floor``
+    permanently.
+
+    Both constants carry orders of magnitude on both sides (Align-ULCNet at
+    init, and the five tensors of the run described above):
+
+    * ``floor`` 1e-12 -- float32's smallest normal is 1.18e-38.  The collapsed
+      tensors sat at 6.5e-25 .. 5.3e-14, so the floor is 19x above even the
+      least collapsed of them, while the smallest non-zero ``max|w|`` any
+      healthy tensor starts at is 3.8e-02, eight and a half decades clear.
+    * ``ratio`` 1e-6 -- those same tensors were at 7.4e-24 .. 6.0e-13 of their
+      initial peak, so the least collapsed one still clears the threshold by six
+      decades.  Decay shrinks a healthy tensor's peak by a fraction of a decade
+      over a whole run, not by six.
+
+    The two are ANDed, so a false positive needs a tensor that both fell by a
+    factor of a million AND ended below 1e-12.
+
+    Cost: one ``max|abs|`` per parameter tensor, 0.78 ms for Align-ULCNet's 67
+    tensors / 672k parameters.  Callers run it ONCE PER EPOCH, immediately
+    before the checkpoint write, where it is 5% of the 15 ms that write itself
+    costs and 0.6% of one training step (batch 8 x 1 s of audio; the shipped
+    10 s chunk makes it ten times smaller again).  Per step it would be that
+    0.78 ms on every step of the run to catch something that takes epochs to
+    develop.
+    """
+
+    def __init__(self, model, ratio=VANISHED_RATIO, floor=VANISHED_FLOOR):
+        # The module is held rather than passed per call so the peaks cannot be
+        # compared against a different module than they were keyed from -- the
+        # trainer that wraps its model for compilation has both to hand.
+        self.model = model
+        self.ratio = ratio
+        self.floor = floor
+        self.peak = {}
+        self._update()
+
+    def _update(self):
+        """Raise each tracked peak to today's ``max|w|``; return today's values.
+
+        NaN never becomes a peak and never trips the test: every comparison
+        against it is False.  That is ``scan_non_finite``'s question, not this
+        one.
+        """
+        floats = [(name, param) for name, param in self.model.named_parameters()
+                  if param.is_floating_point()]
+        if not floats:
+            return {}
+        with torch.no_grad():
+            # One stack, one device sync -- the same reason scan_non_finite
+            # fuses its check instead of syncing once per tensor.
+            values = torch.stack(
+                [param.detach().abs().max() for _, param in floats]
+            ).tolist()
+        current = {}
+        for (name, _), value in zip(floats, values):
+            current[name] = value
+            # max() keeps its FIRST argument when the comparison is False, so a
+            # NaN never becomes a peak.
+            self.peak[name] = max(self.peak.get(name, 0.0), value)
+        return current
+
+    def check(self, *, epoch, global_step):
+        """Halt if any tensor's ``max|w|`` has collapsed away from its own peak."""
+        current = self._update()
+        collapsed = [
+            (name, self.peak[name], value, value / self.peak[name])
+            for name, value in current.items()
+            if self.peak[name] > self.floor
+            and value < self.floor
+            and value < self.ratio * self.peak[name]
+        ]
+        if not collapsed:
+            return
+        collapsed.sort(key=lambda row: row[3])
+
+        report = [
+            f'epoch         : {epoch}',
+            f'global step   : {global_step}',
+            f'test          : max|w| < {self.floor:.1e} AND < {self.ratio:.1e} '
+            f"x the tensor's own running peak",
+            '',
+            f'{len(collapsed)} parameter tensor(s) collapsed:',
+        ]
+        for name, peak, value, ratio in collapsed:
+            report.append(
+                f'    {name}: peak {peak:.6e} -> now {value:.6e} '
+                f'(ratio {ratio:.3e})'
+            )
+        print('\n' + '=' * 68)
+        print('HALTED: a parameter tensor has decayed to nothing')
+        print('=' * 68)
+        print('\n'.join(report))
+        print('\nthese values are FINITE, so no NaN check and no ONNX parity')
+        print('check can see them -- an export reproduces the dead branch exactly')
+        print('no checkpoint was written for this epoch; the newest one on disk')
+        print('is the previous epoch\'s')
+        print('=' * 68)
+        raise VanishedWeights(
+            'collapsed parameter tensor(s): ' + ', '.join(
+                f'{name} {peak:.3e}->{value:.3e}'
+                for name, peak, value, _ in collapsed[:5]
+            )
+        )
 
 def dump_batch(dump_dir, noisy, clean, sr, enhanced=None, hazard_mag=None):
     """Write the batch as a .pt plus one wav pair per lane, and describe it.

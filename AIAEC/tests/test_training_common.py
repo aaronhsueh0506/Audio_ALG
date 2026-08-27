@@ -12,6 +12,7 @@ from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.training_common import (
     CALIBRATION_ONLY_FAR_INPUT_MODE,
+    DEFAULT_OPTIMIZER,
     DEPLOYED_FAR_INPUT_MODE,
     FAR_INPUT_MODE_C_VALUES,
     LinearAecEngine,
@@ -22,6 +23,7 @@ from AIAEC.training_common import (
     far_input_mode_c_value,
     compressed_spectral_loss,
     make_checkpoint_contract,
+    make_optimizer,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
@@ -734,6 +736,48 @@ def test_all_trainers_halt_instead_of_clipping_a_nonfinite_norm(source_path):
     assert 'GradNormLog(' in source
 
 
+AIAEC_TRAINER_CONFIGS = [
+    pathlib.Path(training_common.__file__).parent / name / 'config.ini'
+    for name in sorted(MODEL_TASKS)
+]
+
+
+@pytest.mark.parametrize('source_path', AIAEC_TRAINER_SOURCES,
+                         ids=lambda p: p.parent.name)
+def test_all_trainers_share_one_optimizer_and_one_weight_guard(source_path):
+    """Both are comparison-protocol state, so all four build them identically.
+
+    The ordering assertions are the load-bearing half: a guard built before the
+    ``--resume`` load would baseline against fresh init instead of the weights
+    the run actually resumed from, and a check placed after the write would let
+    a dead model overwrite the last good checkpoint.
+    """
+    source = source_path.read_text(encoding='utf-8')
+    assert 'make_optimizer(cfg, model.parameters(), lr=lr)' in source
+    assert 'torch.optim.' not in source
+    assert 'WeightScaleGuard(model)' in source
+
+    assert (source.index('WeightScaleGuard(model)')
+            > source.index("model.load_state_dict(ckpt['state_dict'])"))
+    assert (source.index('weight_guard.check(')
+            < source.index("_last.pth"))
+
+
+def test_all_four_configs_declare_the_same_optimizer():
+    """⚠ Written so it can FAIL: it reads the four SHIPPED files, not the module
+    default, so a single directory edited on its own -- the exact way this
+    family has drifted before -- lands here rather than in a bake-off result.
+    """
+    declared = {}
+    for path in AIAEC_TRAINER_CONFIGS:
+        cfg = configparser.ConfigParser()
+        assert cfg.read(path), path
+        declared[path.parent.name] = cfg.get('training', 'optimizer',
+                                             fallback=None)
+    assert len(declared) == 4, declared
+    assert set(declared.values()) == {DEFAULT_OPTIMIZER}, declared
+
+
 @pytest.mark.parametrize('source_path', AIAEC_TRAINER_SOURCES,
                          ids=lambda p: p.parent.name)
 def test_all_trainers_step_a_schedule_they_rebuild_on_resume(source_path):
@@ -926,3 +970,65 @@ def test_align_ulcnet_resume_restores_early_stop_counter(
     # Keep the local name alive until after the monkeypatch has captured the
     # saves; this also makes accidental use of a mocked writer above obvious.
     assert real_save is not capture_save
+
+
+# ============================================================
+# Optimizer selection
+# ============================================================
+
+def test_optimizer_selector_defaults_to_decoupled_decay():
+    """⚠ ``type(...) is``, not isinstance: torch 2.8's AdamW SUBCLASSES Adam, so
+    ``isinstance(opt, torch.optim.Adam)`` is True for both and an isinstance
+    assertion here would pass no matter which one was built.
+    """
+    params = [torch.nn.Parameter(torch.zeros(2))]
+
+    default = make_optimizer(_cfg('[training]\n'), params, lr=1e-3)
+    assert type(default) is torch.optim.AdamW
+    assert default.param_groups[0]['lr'] == pytest.approx(1e-3)
+    assert default.param_groups[0]['weight_decay'] == pytest.approx(1e-4)
+    assert default.param_groups[0]['amsgrad'] is True
+
+    # Kept selectable so a run that predates the switch can be reproduced.
+    legacy = make_optimizer(
+        _cfg('[training]\noptimizer = Adam\n'), params, lr=1e-3)
+    assert type(legacy) is torch.optim.Adam
+
+
+def test_optimizer_selector_refuses_an_unknown_name():
+    """A typo must not silently train something other than what it says."""
+    with pytest.raises(ValueError, match='optimizer must be one of'):
+        make_optimizer(_cfg('[training]\noptimizer = lion\n'),
+                       [torch.nn.Parameter(torch.zeros(2))], lr=1e-3)
+
+
+def test_coupled_decay_is_what_walks_a_quiet_weight_into_denormals():
+    """The mechanism behind the default, demonstrated both ways.
+
+    One parameter whose true gradient is exactly zero -- a branch that has
+    stopped receiving signal -- decayed at the shipped lr 1e-3 /
+    weight_decay 1e-4 / amsgrad for 5000 steps, about one epoch's worth.
+    Coupled, ``weight_decay * w`` is the whole gradient, so
+    ``m_hat / sqrt(v_hat)`` normalises it back to ~1 and the weight moves a full
+    lr per step: it crosses zero and keeps shrinking, ending nine decades below
+    where it started and still falling.  Decoupled, the same number is a
+    ``(1 - lr * weight_decay)`` shrink and costs the weight 0.06%.
+
+    ⚠ Written so it can FAIL: if AdamW's decay ever became coupled again, the
+    second branch would land on the first branch's value and the final
+    assertion would say so instead of this test passing vacuously.
+    """
+    def decay_a_quiet_weight(cls, steps=5000):
+        param = torch.nn.Parameter(torch.tensor([0.5]))
+        opt = cls([param], lr=1e-3, weight_decay=1e-4, amsgrad=True)
+        for _ in range(steps):
+            param.grad = torch.zeros_like(param)
+            opt.step()
+        return float(param.detach().abs())
+
+    coupled = decay_a_quiet_weight(torch.optim.Adam)
+    decoupled = decay_a_quiet_weight(torch.optim.AdamW)
+
+    assert coupled < 1e-9, coupled
+    assert decoupled > 0.49, decoupled
+    assert decoupled / coupled > 1e8, (decoupled, coupled)

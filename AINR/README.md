@@ -100,6 +100,27 @@ Once clipping is in effect the loss curve cannot distinguish a few enormous
 isolated spikes (a pathological batch) from bounded gradients pointing the wrong
 way (an optimizer-state problem); the trace can.
 
+**Vanished weights** — a PER-TENSOR guard (`WeightScaleGuard`) runs once per
+epoch, immediately before the checkpoint write, and halts when a parameter
+tensor's `max|w|` has fallen below both 1e-06 of its own running peak and an
+absolute 1e-12. Nothing else above can see that failure. A real run lost one of
+two parallel subband GRU blocks to weights of 6.5e-25 while its twin stayed at
+6e-01, and every value stayed FINITE the whole way down, so the loss curve,
+`scan_non_finite()` and an ONNX `--verify` parity check all reported agreement —
+PyTorch and ONNX produce the same garbage. `grad_norm.csv` could not see it
+either: that is the GLOBAL norm, which the surviving branch and the rest of the
+network held above 0.2 for the entire run.
+
+The baseline is the running maximum of each tensor's own `max|w|`, not its
+initial value, so a bias that initializes at exactly zero is skipped until it
+has grown and is still caught if it later collapses; under `--resume` the
+baseline starts from the loaded weights. Both thresholds have orders of
+magnitude on either side: float32's smallest normal is 1.18e-38, so the 1e-12
+floor sits 26 decades above the denormal boundary, 19x above even the least
+collapsed tensor of that run (5.3e-14), and eight and a half decades below the
+smallest `max|w|` any healthy tensor starts at (3.8e-02).
+`WeightScaleGuard`'s docstring carries the rest of the arithmetic.
+
 ## C pre/post-processing
 
 RNNoise-ERB, GTCRN, and DeepFilterNet2 provide streaming C analysis/synthesis

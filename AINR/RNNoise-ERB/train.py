@@ -46,6 +46,7 @@ from dataset_gen import (  # noqa: E402
 # compared against.
 from training_common import (
     NonFiniteTraining,
+    WeightScaleGuard,
     scan_non_finite,  # noqa: E402
     GradNormLog,
     fast_forward_scheduler,
@@ -1178,6 +1179,11 @@ def train(args):
     # magnitudes, so any number passed here would describe a different quantity.
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), SR,
                            hazard_mag=None)
+    # Per-tensor, because grad_norm.csv above is a GLOBAL norm and stays
+    # healthy while one branch's weights decay to nothing.  Built here,
+    # after any resume load, so a resumed run measures against what it
+    # resumed from.
+    weight_guard = WeightScaleGuard(raw_model)
 
     # Every value here is fixed for the whole run, so it is built once and
     # shared by the end-of-epoch checkpoint and the halt checkpoint -- the halt
@@ -1433,6 +1439,7 @@ def train(args):
             'loss_version': LOSS_VERSION,
             'config': ckpt_config,
         }
+        weight_guard.check(epoch=epoch, global_step=global_step)
         torch.save(ckpt, os.path.join(output_dir, f'rnnoise_epoch{epoch}.pth'))
 
         if is_best:

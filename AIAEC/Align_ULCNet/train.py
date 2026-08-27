@@ -61,6 +61,7 @@ from AIAEC.dataset_gen import (
 from AIAEC.training_common import (
     GradNormLog,
     NonFiniteTraining,
+    WeightScaleGuard,
     build_arg_parser,
     build_plain_loaders,
     auto_device,
@@ -68,6 +69,7 @@ from AIAEC.training_common import (
     halt_on_non_finite,
     fast_forward_scheduler,
     make_checkpoint_contract,
+    make_optimizer,
     make_scheduler,
     read_grids,
     read_model_kwargs,
@@ -214,10 +216,9 @@ def main(args):
     warmup_lr = cfg.getfloat('training', 'lr_warmup', fallback=1e-4)
     warmup_ep = cfg.getint('training', 'warmup_epochs', fallback=3)
     max_epochs = cfg.getint('training', 'max_epochs', fallback=100)
-    weight_decay = cfg.getfloat('training', 'weight_decay', fallback=1e-4)
-    amsgrad = cfg.getboolean('training', 'amsgrad', fallback=True)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr,
-                                 weight_decay=weight_decay, amsgrad=amsgrad)
+    # Decoupled weight decay by default -- make_optimizer()'s comment has the
+    # mechanism by which the coupled form drives a quiet branch into denormals.
+    optimizer = make_optimizer(cfg, model.parameters(), lr=lr)
     # Per-step linear warmup into cosine annealing.  This trainer previously had
     # no scheduler at all: the lr stayed at its initial value for the whole run,
     # so the late epochs kept taking early-epoch-sized steps and the weights
@@ -260,6 +261,10 @@ def main(args):
     patience = cfg.getint('training', 'early_stop_patience', fallback=15)
     grad_clip = cfg.getfloat('training', 'grad_clip', fallback=1.0)
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), aec_grid.sr)
+    # Per-tensor, because grad_norm.csv above is a GLOBAL norm and stays healthy
+    # while one branch's weights decay to nothing.  Built here, after any
+    # --resume load, so a resumed run measures against what it resumed from.
+    weight_guard = WeightScaleGuard(model)
 
     for epoch in range(start_epoch, max_epochs):
         checkpoint_for_halt = {
@@ -303,6 +308,7 @@ def main(args):
                 "refusing to write a checkpoint with non-finite weights: "
                 f"{poisoned[:5]}"
             )
+        weight_guard.check(epoch=epoch, global_step=global_step)
         torch.save(checkpoint, os.path.join(output_dir, f'{MODEL_NAME.lower()}_last.pth'))
         if is_best:
             torch.save(checkpoint, os.path.join(output_dir, f'{MODEL_NAME.lower()}_best.pth'))
