@@ -217,8 +217,8 @@ Inputs per invocation:
 | `key_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `value_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
 | `logit_history` | `[1,32,4,D]` | chronological, t-4 through t-1 |
-| `h_gru0` | `[2,1,128]` | layer first |
-| `h_gru1` | `[2,1,128]` | layer first |
+| `h_gru0` | `[1,2,1,128]` | NCHW, layer on C |
+| `h_gru1` | `[1,2,1,128]` | NCHW, layer on C |
 
 Outputs per invocation:
 
@@ -228,8 +228,8 @@ Outputs per invocation:
 | `key_now` | `[1,32,1,26]` | push into key history |
 | `value_now` | `[1,32,1,26]` | push into value history |
 | `logit_now` | `[1,32,1,D]` | append to four-frame logit history |
-| `h_gru0_out` | `[2,1,128]` | replace GRU-0 hidden |
-| `h_gru1_out` | `[2,1,128]` | replace GRU-1 hidden |
+| `h_gru0_out` | `[1,2,1,128]` | replace GRU-0 hidden |
+| `h_gru1_out` | `[1,2,1,128]` | replace GRU-1 hidden |
 
 This delta-state boundary avoids returning the complete K/V rings every 16 ms.
 The graph uses `K_now`/`V_now` immediately and also exposes them as outputs;
@@ -329,19 +329,26 @@ than exporting twice.
 
 | `--feature-layout` | `--gru-state-layout` | version | signal inputs | graph inputs | status |
 | --- | --- | ---: | --- | ---: | --- |
-| `host` (default) | `split` (default) | 5 | `error_mag`, `far_mag`, `error_cos`, `error_sin`, `error_ri` | 10 | shipped; `ulcnet_model_io.h` binds it |
-| `host` | `combined` | 6 | the same five | 9 | experimental |
-| `graph` | `split` | 4 | `error`, `far` | 7 | experimental; version 4's boundary, restored |
-| `graph` | `combined` | 7 | `error`, `far` | 6 | experimental |
+| `host` (default) | `split` (default) | 8 | `error_mag`, `far_mag`, `error_cos`, `error_sin`, `error_ri` | 10 | shipped; `ulcnet_model_io.h` binds it |
+| `host` | `combined` | 9 | the same five | 9 | experimental |
+| `graph` | `split` | 10 | `error`, `far` | 7 | experimental |
+| `graph` | `combined` | 11 | `error`, `far` | 6 | experimental |
+
+Every recurrent hidden crosses the boundary as rank-4 NCHW, matching the three
+attention caches. Versions 3-7 denoted rank-3 boundaries and are retired: a
+number that once meant rank-3 must never also mean rank-4, because the element
+counts are identical at either rank and nothing but the version can tell them
+apart.
 
 `--feature-layout` chooses where the fixed front and back ends run. `host`
 leaves the signed-power compression, both magnitudes and the compressed-domain
 phase outside the graph (`stream_features`; C: `ulcnet_model_io_prepare`), and
 the inverse power on the way back (`host_output`; C:
 `ulcnet_model_io_commit`). `graph` binds the two raw RI spectra
-`(1, 1, 257, 2)` instead and runs that same fixed math inside the graph, which
-is precisely the boundary version 4 had -- so it reuses that number rather
-than claiming a new one for a contract that already existed.
+`(1, 1, 257, 2)` instead and runs that same fixed math inside the graph. That
+reproduces the pre-host-front-end boundary in every respect except the
+recurrent-state rank, which is why it carries its own version rather than the
+retired one that boundary once had.
 
 The trade is quantization, not arithmetic. `host` keeps a separate scale per
 feature and keeps the unlearned `sqrt`/`atan2`/`pow` out of the quantized
@@ -353,9 +360,10 @@ graphs, the `graph` layout adds `Sign` x6, `Abs` x6, `Pow` x6, `Sqrt` x2,
 121 nodes become 177 after `onnxoptimizer` and constant folding.
 
 `--gru-state-layout` chooses how the two subband GRU hiddens are presented.
-`split` exports `h_gru0` and `h_gru1`, each `(GRU_LAYERS, 1, GRU_HIDDEN)`.
-`combined` stacks them along dim 0 into one `h_gru`
-`(2*GRU_LAYERS, 1, GRU_HIDDEN)`, `h_gru0` first, and returns a single
+`split` exports `h_gru0` and `h_gru1`, each `(1, GRU_LAYERS, 1, GRU_HIDDEN)`.
+`combined` stacks them along dim 1 -- dim 0 is the singleton N -- into one
+`h_gru` `(1, 2*GRU_LAYERS, 1, GRU_HIDDEN)`, `h_gru0` first, and returns a
+single
 `h_gru_out`. The three attention caches (`key_history`, `value_history`,
 `logit_history`) stay separate in both layouts: they are structural histories,
 not recurrent hidden state, and do not share a distribution with the hiddens.

@@ -13,11 +13,13 @@ from AIAEC.Align_ULCNet.export_onnx import (
     stream_features,
     GRU_HIDDEN,
     GRU_LAYERS,
+    COMBINED_GRU_STATE_NAME,
     COMPRESSION_EXPONENT,
     FEATURE_LAYOUTS,
     GRU_STATE_LAYOUTS,
     INPUT_NAMES,
     LAYOUT_VERSIONS,
+    RETIRED_LAYOUT_VERSIONS,
     SIGNAL_INPUTS,
     MAX_DELAY_DEPTH,
     MIN_DELAY_DEPTH,
@@ -59,7 +61,12 @@ def test_streaming_export_shapes_are_fixed_and_delta_only():
     assert shapes['key_history'] == (1, 32, D - 1, 26)
     assert shapes['value_history'] == (1, 32, D - 1, 26)
     assert shapes['logit_history'] == (1, 32, 4, D)
-    assert shapes['h_gru0'] == (2, 1, 128)
+    assert shapes['h_gru0'] == (1, 2, 1, 128)
+    assert shapes['h_gru1'] == (1, 2, 1, 128)
+    assert shapes['h_gru'] == (1, 4, 1, 128)
+    # Every boundary state is rank-4 NCHW. Written once, as a rule, so a new
+    # state cannot be added at the wrong rank without failing here.
+    assert all(len(shape) == 4 for shape in shapes.values())
     assert INPUT_NAMES == (
         'error_mag', 'far_mag', 'error_cos', 'error_sin', 'error_ri',
         'key_history', 'value_history', 'logit_history', 'h_gru0', 'h_gru1',
@@ -80,6 +87,12 @@ def test_every_boundary_pair_has_its_own_version():
     # With every version distinct, pinning the shipped pair is enough: no
     # other pair can then carry the version ulcnet_model_io.h implements.
     assert LAYOUT_VERSIONS[('host', 'split')] == STATE_LAYOUT_VERSION
+    # 3-7 denoted rank-3 boundaries. Reusing one would make a single number
+    # mean two different contracts, which no runtime could tell apart. Tied to
+    # the shipped pair rather than a literal floor, which would still pass
+    # after the next bump while no longer guarding anything.
+    assert not (set(LAYOUT_VERSIONS.values()) & RETIRED_LAYOUT_VERSIONS)
+    assert min(LAYOUT_VERSIONS.values()) == STATE_LAYOUT_VERSION
 
 
 def test_graph_feature_layout_restores_the_pre_host_boundary():
@@ -89,9 +102,10 @@ def test_graph_feature_layout_restores_the_pre_host_boundary():
         'key_history', 'value_history', 'logit_history', 'h_gru0', 'h_gru1',
     )
     assert layout.output_names == OUTPUT_NAMES
-    # Same tensor names, shapes and semantics as version 4, so it reuses that
-    # number rather than inventing a second one for the same contract.
-    assert layout.layout_version == 4
+    # Same tensor names and semantics as the pre-host boundary, but the
+    # recurrent hiddens are rank-4 now, so it cannot reuse that boundary's
+    # retired number.
+    assert layout.layout_version == 10
 
 
 @pytest.mark.parametrize('feature', sorted(FEATURE_LAYOUTS))
@@ -267,12 +281,94 @@ def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
             assert torch.equal(
                 explicit[2], align.score_cell._history
             )
+            # The boundary carries rank-4 NCHW; the streaming reference holds
+            # nn.GRU's rank-3 hidden. Lift the reference rather than squeezing
+            # the boundary, so this still pins where the new axis sits.
+            assert explicit[3].shape == (1, GRU_LAYERS, 1, GRU_HIDDEN)
+            assert explicit[4].shape == (1, GRU_LAYERS, 1, GRU_HIDDEN)
             assert torch.equal(
-                explicit[3], reference['subband_gru0']._hidden
+                explicit[3], reference['subband_gru0']._hidden.unsqueeze(0)
             )
             assert torch.equal(
-                explicit[4], reference['subband_gru1']._hidden
+                explicit[4], reference['subband_gru1']._hidden.unsqueeze(0)
             )
+
+
+def test_exported_onnx_state_tensors_are_rank_four(tmp_path):
+    """The declared table is not the contract -- the shipped graph is.
+
+    Goes through export_graph rather than torch.onnx.export directly: the
+    optimizer and _pin_static_output_shapes both run there, and raw tracing
+    leaves the *_out states with an unresolved middle dimension that only
+    that pinning step fixes. Reading the raw graph would pin the wrong thing.
+    """
+    onnx = pytest.importorskip('onnx')
+    depth = 4
+    model = AlignULCNet(GRID, max_delay_frames=depth).eval()
+    checkpoint = tmp_path / 'ckpt.pth'
+    torch.save({'contract': {}, 'state_dict': model.state_dict()}, checkpoint)
+    path = tmp_path / 'rank.onnx'
+    export_graph(model, str(checkpoint), str(path))
+
+    graph = onnx.load(str(path)).graph
+    shapes = state_shapes(depth)
+
+    def dims(value):
+        return tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+
+    ins = {}
+    for value in graph.input:
+        if value.name in shapes:
+            assert dims(value) == shapes[value.name], value.name
+            ins[value.name] = dims(value)
+    outs = {}
+    for value in graph.output:
+        name = value.name[:-4] if value.name.endswith('_out') else value.name
+        if name in shapes:
+            assert dims(value) == shapes[name], value.name
+            outs[name] = dims(value)
+    # The GRU hiddens are REPLACED whole, so each must have an _out partner of
+    # exactly its own shape or the recurrence cannot be fed back. The three
+    # caches are deliberately not here: their outputs are the delta-only
+    # key_now/value_now/logit_now, one frame rather than the ring.
+    assert set(outs) == {'h_gru0', 'h_gru1'}, sorted(outs)
+    assert all(outs[name] == ins[name] for name in outs)
+    assert set(ins) == set(shapes) - {COMBINED_GRU_STATE_NAME}
+
+
+def test_combined_state_stacks_on_the_channel_axis():
+    """Pins WHICH axis the combined layout stacks on.
+
+    dim 0 is the singleton N. Slicing it returns the whole tensor and an
+    empty one without raising, so a wrong axis is silent -- and the
+    all-pairs equivalence test only compares the audio head, not the state.
+    """
+    depth = 4
+    torch.manual_seed(5)
+    model = AlignULCNet(GRID, max_delay_frames=depth).eval()
+    split = AlignUlcnetStreamingExport(model, gru_state_layout='split').eval()
+    combined = AlignUlcnetStreamingExport(
+        model, gru_state_layout='combined').eval()
+
+    split_state = dummy_inputs(depth, split.layout)[SIGNAL_INPUTS:]
+    combined_state = dummy_inputs(depth, combined.layout)[SIGNAL_INPUTS:]
+    generator = torch.Generator().manual_seed(11)
+    with torch.no_grad():
+        for _ in range(2 * depth + 2):
+            signals = stream_features(
+                model,
+                torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
+                torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
+            )
+            split_out = split(*(signals + split_state))
+            combined_out = combined(*(signals + combined_state))
+            split_state = next_state(split_state, split_out, depth)
+            combined_state = next_state(combined_state, combined_out, depth)
+
+            merged = combined_state[-1]
+            assert merged.shape == (1, 2 * GRU_LAYERS, 1, GRU_HIDDEN)
+            assert torch.equal(merged[:, :GRU_LAYERS], split_state[-2])
+            assert torch.equal(merged[:, GRU_LAYERS:], split_state[-1])
 
 
 def test_reset_is_all_zero_external_state():

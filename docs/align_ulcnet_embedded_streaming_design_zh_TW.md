@@ -19,9 +19,12 @@ application 依 descriptor 配置（移除手寫 D=8）、各產品 route 的 n 
 量測。FIXED 首次由 raw ring-fill 切到 aligned far 的 reset 已在兩個 wrapper
 補齊；4ch 的 solid 時序亦已與實際可讀 hop 對齊。
 
-**既有 ONNX/JSON 必須全部重新匯出。** model-I/O layout 現為 **v5**（v3 把
+**既有 ONNX/JSON 必須全部重新匯出。** model-I/O layout 現為 **v8**（v3 把
 deployed far branch 由 RAW 改為 ALIGNED，v4 更名 tensor，v5 把固定前後端搬到
-host），因此更早產出的每一份 descriptor 在
+host，v8 把兩顆 GRU hidden 由 rank-3 改為 rank-4 NCHW，與三個 attention cache
+同一慣例）。v8 只動 rank：元素數、row-major 次序與 pool 大小全部不變，因此
+`descriptor_validate()` 比對的每個欄位在新舊兩代完全相同，**版本號是唯一能
+攔下舊板綁新圖的閘門**。3–7 一律退役不得重用。更早產出的每一份 descriptor 在
 `ulcnet_model_io_descriptor_validate()` 會卡在 `layout_version`（v3 之前另外
 卡 `far_input_mode`），`ulcnet_accelerator_adapter_init()` 直接回 NULL。
 補救動作只有重新匯出 graph 一項：checkpoint 與 dataset 都**不需要**重新訓練
@@ -614,7 +617,7 @@ flowchart LR
         KH["key_history<br/>[1,32,D-1,26]"]
         VH["value_history<br/>[1,32,D-1,26]"]
         LH["logit_history<br/>[1,32,4,D]"]
-        GH["gru0/gru1 hidden<br/>each [2,1,128]"]
+        GH["gru0/gru1 hidden<br/>each [1,2,1,128]"]
         UPDATE["ring_push(K_now/V_now/logit_now)<br/>hidden = hidden_next"]
         INV["逆冪 fp32"]
         WOLA["WOLA / IFFT"]
@@ -681,20 +684,25 @@ magnitude、壓縮域相位 cos/sin 由 `ulcnet_model_io_prepare()` 內算，逆
 
 | `--feature-layout` | `--gru-state-layout` | version | signal inputs | graph inputs | 狀態 |
 |---|---|---:|---|---:|---|
-| `host`（預設） | `split`（預設） | 5 | `error_mag`/`far_mag`/`error_cos`/`error_sin`/`error_ri` | 10 | 出貨合約；`ulcnet_model_io.h` 只綁這一對 |
-| `host` | `combined` | 6 | 同上五個 | 9 | 實驗用 |
-| `graph` | `split` | 4 | `error`/`far`（raw RI，各 `[1,1,257,2]`） | 7 | 實驗用；即 v4 當時的 boundary |
-| `graph` | `combined` | 7 | 同上兩個 | 6 | 實驗用 |
+| `host`（預設） | `split`（預設） | 8 | `error_mag`/`far_mag`/`error_cos`/`error_sin`/`error_ri` | 10 | 出貨合約；`ulcnet_model_io.h` 只綁這一對 |
+| `host` | `combined` | 9 | 同上五個 | 9 | 實驗用 |
+| `graph` | `split` | 10 | `error`/`far`（raw RI，各 `[1,1,257,2]`） | 7 | 實驗用 |
+| `graph` | `combined` | 11 | 同上兩個 | 6 | 實驗用 |
+
+  四對的 recurrent hidden 都是 rank-4 NCHW，所以 rank 改動時四對一起換號；
+  3–7 是 rank-3 世代，一律退役不得重用。
 
 - `--feature-layout=graph` 把上一段那份固定數學搬回 graph 內，graph 改綁兩個
   raw RI 頻譜，host 端不需要前後端。代價是 `sqrt`/`atan2`/`pow` 進了量化域，
   且 `error_cos`/`error_sin` 共用編譯器替它們推出的同一個 scale；實測多出
   `Sign`×6、`Abs`×6、`Pow`×6、`Sqrt`×2、`Atan`/`Cos`/`Sin` 各 1（另有隨之
   增加的 elementwise 與索引節點），經 onnxoptimizer + 常數摺疊後節點數
-  121 → 177。它重現的正是 v4 的 boundary，所以沿用 4 而不是替同一份合約再
-  發一個號碼。
-- `--gru-state-layout=combined` 把 `h_gru0`/`h_gru1` 沿 dim 0 疊成單一
-  `h_gru [4,1,128]`（`h_gru0` 在前），輸出併為一個 `h_gru_out`；三個 attention
+  121 → 177。除了 recurrent state 的 rank 之外，它重現的正是固定前後端搬到
+  host 之前的 boundary，因此自帶版本號，而不是沿用那個 boundary 當年、如今
+  已退役的號碼。
+- `--gru-state-layout=combined` 把 `h_gru0`/`h_gru1` 沿 dim 1（dim 0 是
+  singleton N）疊成單一 `h_gru [1,4,1,128]`（`h_gru0` 在前），輸出併為一個
+  `h_gru_out`；三個 attention
   cache 在兩種 layout 都維持獨立，它們是結構性歷史而不是 recurrent hidden
   state。存在的目的是量「共用一個量化 scale 要付多少代價」。
 - 四對 boundary 逐幀互跑**位元相同**（`rtol=0, atol=0`；test
@@ -718,8 +726,8 @@ Inputs：
 | `key_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far keys |
 | `value_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far values |
 | `logit_history` | `[1,32,4,D]` | TA `(5,3)` score conv 的前 4 幀 raw logits |
-| `h_gru0` | `[2,1,128]` | temporal subband GRU 0，2 layers |
-| `h_gru1` | `[2,1,128]` | temporal subband GRU 1，2 layers |
+| `h_gru0` | `[1,2,1,128]` | temporal subband GRU 0，2 layers |
+| `h_gru1` | `[1,2,1,128]` | temporal subband GRU 1，2 layers |
 
 Outputs：
 
@@ -729,8 +737,8 @@ Outputs：
 | `key_now` | `[1,32,1,26]` | push 進 `key_history` |
 | `value_now` | `[1,32,1,26]` | push 進 `value_history` |
 | `logit_now` | `[1,32,1,D]` | push 進 4-frame `logit_history` |
-| `h_gru0_out` | `[2,1,128]` | 取代 `h_gru0` |
-| `h_gru1_out` | `[2,1,128]` | 取代 `h_gru1` |
+| `h_gru0_out` | `[1,2,1,128]` | 取代 `h_gru0` |
+| `h_gru1_out` | `[1,2,1,128]` | 取代 `h_gru1` |
 
 這是「delta-state output」：graph 不回傳完整 `*_history_next`，CPU 只把
 新的 K/V/logit 寫進自己的 ring，避免每 16 ms 從加速器搬回

@@ -67,9 +67,10 @@ pipeline 沒有 runtime far-mode setter。raw/aligned 比較僅保留在 sweep �
 <code>deployment_far_input_mode=aligned_far</code> 分開記錄。D 不改權重，
 但會改 K/V history shape 與 host RAM，因此 calibration 的 D 必須和該份
 ONNX export 相同。</div>
-<div class="note"><b>既有匯出必須全部重跑</b>：model-I/O layout 現為 v5
+<div class="note"><b>既有匯出必須全部重跑</b>：model-I/O layout 現為 v8
 （v3 = far branch RAW → ALIGNED；v4 = tensor 更名；v5 = 固定前後端搬到
-host），此前產出的每一份 ONNX/JSON descriptor 在
+host；v8 = 兩顆 GRU hidden 由 rank-3 改為 rank-4 NCHW，與三個 attention
+cache 同一慣例；3–7 一律退役不得重用），此前產出的每一份 ONNX/JSON descriptor 在
 <code>ulcnet_model_io_descriptor_validate()</code> 卡在
 <code>layout_version</code>（v3 之前另卡 <code>far_input_mode</code>），
 <code>ulcnet_accelerator_adapter_init()</code> 回 NULL。修法只有「重新
@@ -86,17 +87,17 @@ export graph」一項：checkpoint 與 dataset <b>不需要</b>重新訓練或�
 instance 匯出對應 graph，不必為了換 layout 匯出兩次。</p>
 <table>
 <tr><th><code>--feature-layout</code></th><th><code>--gru-state-layout</code></th><th>version</th><th>signal inputs</th><th>graph inputs</th><th>狀態</th></tr>
-<tr><td><code>host</code>（預設）</td><td><code>split</code>（預設）</td><td>5</td><td><code>error_mag/far_mag/error_cos/error_sin/error_ri</code></td><td>10</td><td><b>出貨合約</b>；<code>ulcnet_model_io.h</code> 只綁這一對</td></tr>
-<tr><td><code>host</code></td><td><code>combined</code></td><td>6</td><td>同上五個</td><td>9</td><td>實驗用</td></tr>
-<tr><td><code>graph</code></td><td><code>split</code></td><td>4</td><td><code>error/far</code>（raw RI，各 <code>[1,1,257,2]</code>）</td><td>7</td><td>實驗用；即 v4 當時的 boundary</td></tr>
-<tr><td><code>graph</code></td><td><code>combined</code></td><td>7</td><td>同上兩個</td><td>6</td><td>實驗用</td></tr>
+<tr><td><code>host</code>（預設）</td><td><code>split</code>（預設）</td><td>8</td><td><code>error_mag/far_mag/error_cos/error_sin/error_ri</code></td><td>10</td><td><b>出貨合約</b>；<code>ulcnet_model_io.h</code> 只綁這一對</td></tr>
+<tr><td><code>host</code></td><td><code>combined</code></td><td>9</td><td>同上五個</td><td>9</td><td>實驗用</td></tr>
+<tr><td><code>graph</code></td><td><code>split</code></td><td>10</td><td><code>error/far</code>（raw RI，各 <code>[1,1,257,2]</code>）</td><td>7</td><td>實驗用</td></tr>
+<tr><td><code>graph</code></td><td><code>combined</code></td><td>11</td><td>同上兩個</td><td>6</td><td>實驗用</td></tr>
 </table>
 <p><b><code>--feature-layout</code></b>＝固定前後端跑在哪裡。<code>host</code> 把 signed
 <code>pow(0.3)</code> 壓縮、兩路 magnitude、壓縮域相位 cos/sin 留在 graph 外
 （<code>stream_features</code>；C <code>ulcnet_model_io_prepare</code>），回程逆冪也在外
 （<code>host_output</code>；C <code>ulcnet_model_io_commit</code>）。<code>graph</code>
-改綁兩個 raw RI 頻譜，把同一份固定數學搬回 graph 內——這正是 v4 當時的 boundary，
-所以沿用 4 而不是替同一份合約再發一個號碼。</p>
+改綁兩個 raw RI 頻譜，把同一份固定數學搬回 graph 內——除了 recurrent state 的 rank 之外，這重現了固定前後端搬到 host 之前的 boundary，
+因此它自帶版本號，而不是沿用那個 boundary 當年、如今已退役的號碼。</p>
 <p>差別在<b>量化</b>不在算術：<code>host</code> 讓五個特徵各持自己的 scale，且
 <code>sqrt/atan2/pow</code> 這些非學習運算不進量化域；<code>graph</code> 少綁 tensor、
 host 端不需要前端，代價是那些運算進了量化域，且 <code>error_cos</code>/<code>error_sin</code>
@@ -106,8 +107,9 @@ host 端不需要前端，代價是那些運算進了量化域，且 <code>error
 與索引節點）；經 onnxoptimizer + 常數摺疊後節點數 <b>121 → 177</b>。</p>
 <p><b><code>--gru-state-layout</code></b>＝兩顆 subband GRU hidden 怎麼呈現。
 <code>split</code> 出 <code>h_gru0</code>/<code>h_gru1</code>，各
-<code>(GRU_LAYERS, 1, GRU_HIDDEN)</code>；<code>combined</code> 沿 dim 0 疊成單一
-<code>h_gru (2*GRU_LAYERS, 1, GRU_HIDDEN)</code>（<code>h_gru0</code> 在前），
+<code>(1, GRU_LAYERS, 1, GRU_HIDDEN)</code>；<code>combined</code> 沿 dim 1
+（dim 0 是 singleton N）疊成單一
+<code>h_gru (1, 2*GRU_LAYERS, 1, GRU_HIDDEN)</code>（<code>h_gru0</code> 在前，沿 channel 軸堆疊），
 輸出也併成一個 <code>h_gru_out</code>。三個 attention cache
 （<code>key_history</code>/<code>value_history</code>/<code>logit_history</code>）
 在兩種 layout 都維持獨立：它們是<b>結構性歷史</b>而不是 recurrent hidden state，
@@ -220,8 +222,8 @@ CPU/DSP caller-owned pool 每次 invocation 傳入傳回，graph 與加速器無
 <tr><td>align.key_ring</td><td>(1, 32, 64, 26)</td><td>208.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
 <tr><td>align.value_ring</td><td>(1, 32, 64, 26)</td><td>208.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
 <tr><td>align.score_history</td><td>(1, 32, 4, 64)</td><td>32.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
-<tr><td>h_gru0（subband_gru0.hidden）</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
-<tr><td>h_gru1（subband_gru1.hidden）</td><td>(2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
+<tr><td>h_gru0（subband_gru0.hidden）</td><td>(1, 2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
+<tr><td>h_gru1（subband_gru1.hidden）</td><td>(1, 2, 1, 128)</td><td>1.0 KB</td><td>CPU/DSP caller-owned pool（顯式 state I/O）</td></tr>
 <tr><td><b>NN 小計</b></td><td></td><td><b>450.0 KB</b></td><td></td></tr>
 <tr><td>STFT×2 / ISTFT 狀態</td><td>UlcnetAnalysis×2 + UlcnetSynthesis</td><td>caller-owned、zero heap</td><td>C struct（<code>ulcnet_process.h</code>）</td></tr>
 <tr><td>PBFDKF / delay 對齊</td><td>—</td><td>—</td><td>AEC C 端 static pool</td></tr>
@@ -230,7 +232,7 @@ CPU/DSP caller-owned pool 每次 invocation 傳入傳回，graph 與加速器無
 dict。D 只進 ring/score 史的形狀，不進權重形狀。</p>
 <p>上表 <code>h_gru0</code>/<code>h_gru1</code> 兩列是出貨的 <code>split</code> layout；
 <code>--gru-state-layout combined</code> 只是把這兩個 tensor 在 graph boundary 上併成
-單一 <code>h_gru (4, 1, 128)</code>，值的總量與 host RAM 不變，三個 attention cache
+單一 <code>h_gru (1, 4, 1, 128)</code>，值的總量與 host RAM 不變，三個 attention cache
 仍各自獨立。C 端不綁該 layout。</p>
 
 <h2>延遲與 warm-up</h2>
@@ -252,7 +254,7 @@ double twiddles），非 bit-exact（<code>test_ulcnet_process_c.py</code> 檔�
 <li><code>AIAEC/Align_ULCNet/ulcnet_process.c / .h</code>（C 前後處理：centered sqrt-Hann STFT/WOLA）</li>
 <li><code>AIAEC/Align_ULCNet/export_onnx.py</code>、<code>inference.py calib</code>（BIN/NPZ calibration 放在該 model 的 <code>calib/</code>；分開記錄 training provenance 與 aligned-far deployment metadata；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改）；兩者同收 <code>--feature-layout</code> / <code>--gru-state-layout</code>）；<code>ulcnet_accelerator_adapter.c/h</code>、<code>ulcnet_model_io.c/h</code>（CPU 端 state adapter 參考實作,見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>）</li>
 <li><code>AIAEC/aiaec_streaming.py</code>（cells、StreamSTFT/StreamISTFT、state_report）；<code>AIAEC/dataset_gen/model_views.py</code>（task/輸入 mapping）</li>
-<li>tests：<code>AIAEC/tests/test_streaming_align_ulcnet.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_candidate_models.py</code>、<code>test_export_streaming_ulcnet.py</code>（ONNX runtime vs PyTorch parity、layout-version 互鎖、四對 boundary 位元一致）、<code>test_ulcnet_model_io_c.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 287 passed（<code>pytest AIAEC</code> 含 dataset_gen = 404）</li>
+<li>tests：<code>AIAEC/tests/test_streaming_align_ulcnet.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_candidate_models.py</code>、<code>test_export_streaming_ulcnet.py</code>（ONNX runtime vs PyTorch parity、layout-version 互鎖、四對 boundary 位元一致）、<code>test_ulcnet_model_io_c.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 326 passed（<code>pytest AIAEC</code> 含 dataset_gen = 456）</li>
 <li>docs：<code>docs/align_ulcnet_embedded_streaming_design_zh_TW.md</code>、<code>docs/aiaec_streaming_readiness_zh_TW.md</code></li>
 </ul>
 </body>

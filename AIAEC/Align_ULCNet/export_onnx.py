@@ -93,18 +93,20 @@ under all four combinations, and the exported metadata records the pair under
     same fixed math back inside the graph. Fewer tensors to bind and no host
     front end, paid for by putting sqrt/atan2/pow into the quantized domain
     and by ``error_cos``/``error_sin`` sharing whatever scale the compiler
-    derives for them. It exists to measure that trade, and it reproduces the
-    pre-host-front-end boundary exactly -- hence layout version 4.
+    derives for them. It exists to measure that trade. It reproduces the
+    pre-host-front-end boundary in every respect except the recurrent-state
+    rank, so it carries its own version rather than the retired one that
+    boundary once had.
 
 ``--gru-state-layout`` -- how the two subband GRU hiddens are presented.
 
 ``split`` (default, the shipped contract)
     ``h_gru0``/``h_gru1``, one tensor per subband GRU, each
-    ``(GRU_LAYERS, 1, GRU_HIDDEN)``.
+    ``(1, GRU_LAYERS, 1, GRU_HIDDEN)``.
 
 ``combined``
-    One ``(2*GRU_LAYERS, 1, GRU_HIDDEN)`` tensor named ``h_gru``, h_gru0 then
-    h_gru1. The attention caches (key/value/logit history) stay separate in
+    One ``(1, 2*GRU_LAYERS, 1, GRU_HIDDEN)`` tensor named ``h_gru``, h_gru0
+    then h_gru1, stacked along dim 1. The attention caches (key/value/logit history) stay separate in
     both layouts: they are structural histories, not recurrent hidden state,
     and they do not share a distribution with the hiddens.
 
@@ -153,20 +155,36 @@ from AIAEC.training_common import (
 # front/back ends (signed-power compression, magnitudes, phase cos/sin,
 # inverse power) out of the graph onto the host.
 #
+# Versions 8-11 present every recurrent hidden as rank-4 NCHW, matching the
+# three attention caches, which were already NCHW. The target platform's
+# quantization toolchain requires rank-4 tensors; element count, row-major
+# order and the per-tensor quantization scales are all unchanged by the rank,
+# so this costs a version number and nothing else.
+# The five SIGNAL inputs are deliberately not touched here: error_mag/far_mag/
+# error_cos/error_sin are [1,1,257] and only error_ri is rank-4. If the
+# toolchain turns out to reject those too, they move in their own bump --
+# folding them in here would not have made that re-export any cheaper.
+#
 # The boundary is the PAIR (feature layout, recurrent-state layout), so the
 # version belongs to the pair and is written down once rather than derived
-# from either half. ('graph', 'split') reproduces version 4's boundary
-# exactly -- same tensor names, shapes and semantics -- so it keeps 4 instead
-# of claiming a new number for a contract that already had one.
+# from either half. The rank change reaches every pair -- both split hiddens
+# and the combined tensor -- so all four boundaries moved together and
+# versions 3-7 are retired. No later contract may reclaim them: a number that
+# denoted a rank-3 boundary must never also denote a rank-4 one.
 #
 # ULCNET_MODEL_IO_LAYOUT_VERSION in ulcnet_model_io.h is the deployed pair's
 # version; test_export_streaming_ulcnet.py pins the two together. The other
 # three are reserved there so a later C-side bump cannot take their numbers.
+# Stated here rather than only in ulcnet_model_io.h's prose so a bump onto one
+# fails a test instead of a review. 3, 4 and 5 were shipped rank-3 boundaries;
+# 6 and 7 were rank-3 pairs reachable from the CLI and stamped into exported
+# metadata, so they were allocated, not merely reserved.
+RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 8))
 LAYOUT_VERSIONS = {
-    ('host', 'split'): 5,
-    ('host', 'combined'): 6,
-    ('graph', 'split'): 4,
-    ('graph', 'combined'): 7,
+    ('host', 'split'): 8,
+    ('host', 'combined'): 9,
+    ('graph', 'split'): 10,
+    ('graph', 'combined'): 11,
 }
 # The deployed pair's version, named because ulcnet_model_io.h pins it.
 STATE_LAYOUT_VERSION = LAYOUT_VERSIONS[('host', 'split')]
@@ -199,10 +217,12 @@ HOST_SIGNAL_INPUT_NAMES = (
 # the graph run that same fixed math itself, so there is no host front end and
 # nothing to keep in step with ulcnet_model_io_prepare().
 GRAPH_SIGNAL_INPUT_NAMES = ('error', 'far')
-# The two subband GRU hiddens. Both are (GRU_LAYERS, 1, GRU_HIDDEN), so they
-# stack along dim 0 into one (2*GRU_LAYERS, 1, GRU_HIDDEN) tensor -- see
-# GRU_STATE_LAYOUTS. The attention caches stay separate in both layouts:
-# they are structural histories, not recurrent hidden state.
+# The two subband GRU hiddens. Both are (1, GRU_LAYERS, 1, GRU_HIDDEN), so
+# they stack along dim 1 into one (1, 2*GRU_LAYERS, 1, GRU_HIDDEN) tensor --
+# see GRU_STATE_LAYOUTS. dim 0 is the singleton N of the shared NCHW
+# convention, so it is never the stacking axis. The attention caches stay
+# separate in both layouts: they are structural histories, not recurrent
+# hidden state.
 GRU_STATE_NAMES = ('h_gru0', 'h_gru1')
 COMBINED_GRU_STATE_NAME = 'h_gru'
 CACHE_STATE_NAMES = ('key_history', 'value_history', 'logit_history')
@@ -467,8 +487,10 @@ class AlignUlcnetStreamingExport(nn.Module):
             # One Slice per subband GRU off the shared input, in
             # GRU_STATE_NAMES order. Views, not copies.
             combined_hidden, = hidden
-            h_gru0 = combined_hidden[:GRU_LAYERS]
-            h_gru1 = combined_hidden[GRU_LAYERS:]
+            # dim 1, not dim 0: dim 0 is the singleton N. Slicing dim 0 here
+            # would return the whole tensor and an empty one WITHOUT raising.
+            h_gru0 = combined_hidden[:, :GRU_LAYERS]
+            h_gru1 = combined_hidden[:, GRU_LAYERS:]
         else:
             h_gru0, h_gru1 = hidden
 
@@ -526,7 +548,12 @@ class AlignUlcnetStreamingExport(nn.Module):
         pieces = []
         hidden_next = []
         at = 0
-        hidden_inputs = (h_gru0, h_gru1)
+        # nn.GRU's h_0 is strictly rank-3, so the boundary's singleton N is
+        # dropped on the way in and restored on the way out. squeeze/unsqueeze
+        # rather than reshape: reshape would silently reinterpret a tensor that
+        # had the same element count with the axes in another order, which is
+        # the failure this boundary convention exists to make impossible.
+        hidden_inputs = (h_gru0.squeeze(0), h_gru1.squeeze(0))
         for index, width in enumerate(model.subband_widths):
             piece = features[..., at:at + width]
             batch, channels, _time, bins = piece.shape
@@ -537,7 +564,7 @@ class AlignUlcnetStreamingExport(nn.Module):
                 sequence, hidden_inputs[index]
             )
             pieces.append(output)
-            hidden_next.append(hidden)
+            hidden_next.append(hidden.unsqueeze(0))
             at += width
 
         joined = torch.cat(pieces, dim=-1)
@@ -570,7 +597,7 @@ class AlignUlcnetStreamingExport(nn.Module):
         if layout.combined:
             # Concatenated in the order it was sliced, which is also the
             # order ulcnet_model_io.h stores the two hiddens in.
-            return heads + (torch.cat(tuple(hidden_next), dim=0),)
+            return heads + (torch.cat(tuple(hidden_next), dim=1),)
         return heads + tuple(hidden_next)
 
 
@@ -586,9 +613,9 @@ def state_shapes(delay_depth: int) -> Dict[str, Tuple[int, ...]]:
         'logit_history': (
             1, TA_CHANNELS, SCORE_HISTORY_FRAMES, delay_depth
         ),
-        'h_gru0': (GRU_LAYERS, 1, GRU_HIDDEN),
-        'h_gru1': (GRU_LAYERS, 1, GRU_HIDDEN),
-        COMBINED_GRU_STATE_NAME: (2 * GRU_LAYERS, 1, GRU_HIDDEN),
+        'h_gru0': (1, GRU_LAYERS, 1, GRU_HIDDEN),
+        'h_gru1': (1, GRU_LAYERS, 1, GRU_HIDDEN),
+        COMBINED_GRU_STATE_NAME: (1, 2 * GRU_LAYERS, 1, GRU_HIDDEN),
     }
 
 
@@ -890,8 +917,9 @@ def main() -> None:
         default=DEFAULT_GRU_STATE_LAYOUT,
         help="'split' (default, the shipped contract) exports one tensor "
              "per subband GRU; 'combined' stacks both into one "
-             "(2*layers, 1, hidden) tensor. The attention caches stay "
-             "separate either way.")
+             "(1, 2*layers, 1, hidden) tensor. Every recurrent state is "
+             "rank-4 NCHW either way, matching the attention caches, which "
+             "stay separate in both layouts.")
     args = parser.parse_args()
 
     model, _grid, _linear_contract = load_model(

@@ -33,18 +33,31 @@ extern "C" {
  * compressed error RI, all produced inside prepare()) and returns the
  * COMPRESSED estimate; commit() applies the inverse signed power. The
  * graph starts at the learned reorient/encoder compute. */
-/* ⚠ Versions 4, 6 and 7 are TAKEN, not free.  export_onnx.py's boundary is
- * the pair (feature layout, GRU state layout) and its LAYOUT_VERSIONS table
- * names all four: ('host','split') = 5, the version below and the only pair
- * this file implements; ('host','combined') = 6 stacks both subband hiddens
- * into one h_gru tensor; ('graph','split') = 4 binds the two raw RI spectra
- * and runs the front/back ends inside the graph, which is precisely what
- * version 4 was, so it reuses that number rather than inventing a second one
- * for the same contract; ('graph','combined') = 7 does both.  Nothing here
- * binds anything but 5, so a board built against this header refuses the
- * other three -- which is the intent.  The next real bump of this constant
- * must therefore go to 8. */
-#define ULCNET_MODEL_IO_LAYOUT_VERSION 5u
+/* Version 8 presents every recurrent hidden as rank-4 NCHW -- h_gru0/h_gru1
+ * become [1,2,1,128] and the combined tensor [1,4,1,128] -- so all five
+ * boundary states share the one convention the attention caches already
+ * used.  Nothing about this file's arithmetic moves with it: the hiddens
+ * cross the boundary as flat float arrays whose element count
+ * (GRU_LAYERS * GRU_HIDDEN) is identical at either rank, so compute_counts(),
+ * the pool carve and prepare()/commit() are byte-for-byte what they were.
+ * That is exactly why the version has to move.  descriptor_validate()
+ * compares gru_layers, gru_hidden and every *_elements count, and every one
+ * of them is unchanged between rank-3 and rank-4 -- so the version constant
+ * is the ONLY thing that can stop a board built for the rank-3 boundary from
+ * silently binding a rank-4 graph. */
+/* ⚠ Versions 3-7 are RETIRED, not free.  3, 4 and 5 were shipped rank-3
+ * boundaries and 6 and 7 were reserved for rank-3 pairs; a number that once
+ * denoted a rank-3 boundary must never also denote a rank-4 one.
+ * export_onnx.py's boundary is the pair (feature layout, GRU state layout)
+ * and its LAYOUT_VERSIONS table now names all four: ('host','split') = 8,
+ * the version below and the only pair this file implements;
+ * ('host','combined') = 9 stacks both subband hiddens into one h_gru tensor;
+ * ('graph','split') = 10 binds the two raw RI spectra and runs the
+ * front/back ends inside the graph; ('graph','combined') = 11 does both.
+ * Nothing here binds anything but 8, so a board built against this header
+ * refuses the other three -- which is the intent.  The next real bump of
+ * this constant must therefore go to 12. */
+#define ULCNET_MODEL_IO_LAYOUT_VERSION 8u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
@@ -102,7 +115,9 @@ typedef struct UlcnetModelIoMemReq {
  * omitted from the pointer type:
  *   key/value history [1,32,D-1,26], newest frame first;
  *   logit history     [1,32,4,D], oldest frame first;
- *   GRU hidden        [2,1,128].
+ *   GRU hidden        [1,2,1,128].
+ * Those are the GRAPH shapes; the pointers below stay flat, and the
+ * *_elements counts are what this file actually works in.
  */
 typedef struct UlcnetModelIoInputs {
     /* The five feature tensors prepare() computes from the raw spectra
@@ -129,7 +144,7 @@ typedef struct UlcnetModelIoInputs {
 /* Accelerator-writable delta-state outputs:
  *   key/value now [1,32,1,26];
  *   logit now     [1,32,1,D];
- *   GRU next      [2,1,128].
+ *   GRU next      [1,2,1,128].
  * prepare() fills every element with NaN so commit() detects partial writes.
  */
 typedef struct UlcnetModelIoOutputs {
