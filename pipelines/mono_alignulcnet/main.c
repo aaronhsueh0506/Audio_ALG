@@ -40,8 +40,26 @@ _Static_assert(ULCNET_EXAMPLE_DELAY_FRAMES >= ULCNET_MODEL_IO_MIN_D &&
  * Reliable bulk-delay search range per bank (lib/aec's contract value, not a
  * geometric span): n=1 ~125 ms, 2 ~221 ms, 3 ~317 ms, 4 ~413 ms, 5 ~509 ms.
  *
- * lib/aec's DA_NUM_FILTERS is both the bank-size cap and the default the
- * non-MATCHED modes require, so it is used for both roles below. */
+ * lib/aec's DA_NUM_FILTERS is both the bank-size cap and the exact value the
+ * non-MATCHED modes require -- aec_validate_config() rejects any other n once
+ * the mode is not MATCHED -- so it is used for both roles below. The MATCHED
+ * default is a separate decision; see ULCNET_EXAMPLE_DELAY_NUM_FILTERS. */
+
+/* MATCHED bank size n for THIS standalone smoke example only, overridable with
+ * -DULCNET_EXAMPLE_DELAY_NUM_FILTERS=N so a per-SKU build can bake in its
+ * measured delay profile instead of passing the flag on every run.
+ *
+ * It is only the DEFAULT: --delay-num-filters still wins. It applies to
+ * MATCHED alone, because the other two modes build no bank and lib/aec
+ * requires DA_NUM_FILTERS there. Like D, it is NOT a switch the built binary
+ * can flip -- n sizes the matched bank, so changing it means a rebuild, a
+ * fresh pool query and a re-init. */
+#ifndef ULCNET_EXAMPLE_DELAY_NUM_FILTERS
+#define ULCNET_EXAMPLE_DELAY_NUM_FILTERS DA_NUM_FILTERS
+#endif
+_Static_assert(ULCNET_EXAMPLE_DELAY_NUM_FILTERS >= 1 &&
+               ULCNET_EXAMPLE_DELAY_NUM_FILTERS <= DA_NUM_FILTERS,
+               "ULCNET_EXAMPLE_DELAY_NUM_FILTERS outside lib/aec's bank range");
 
 typedef struct DelayProfile {
     AecDelayMode mode;
@@ -61,7 +79,7 @@ static void usage(const char* prog) {
         "                              changing it re-queries the pool.\n"
         "  --fixed-delay <samples>     FIXED delay in native-rate samples (>=0)\n"
         "  -h, --help                  this message\n",
-        prog, DA_NUM_FILTERS);
+        prog, ULCNET_EXAMPLE_DELAY_NUM_FILTERS);
 }
 
 static int parse_delay_mode(const char* s, AecDelayMode* out) {
@@ -89,7 +107,7 @@ static int parse_delay_profile(int argc, char** argv, DelayProfile* out) {
     int i;
 
     out->mode = AEC_DELAY_MATCHED;
-    out->num_filters = DA_NUM_FILTERS;
+    out->num_filters = ULCNET_EXAMPLE_DELAY_NUM_FILTERS;
     out->fixed_samples = -1;
 
     for (i = 1; i < argc; ++i) {
@@ -118,8 +136,8 @@ static int parse_delay_profile(int argc, char** argv, DelayProfile* out) {
     }
 
     /* n is meaningful only where a matched bank exists. 0 is NOT "disabled" --
-     * FIXED and EXTERNAL_ALIGNED are separate modes, and both require n to
-     * stay at the default because they build no bank at all. */
+     * FIXED and EXTERNAL_ALIGNED are separate modes, and both require
+     * n == DA_NUM_FILTERS because they build no bank at all. */
     if (have_fixed && out->mode != AEC_DELAY_FIXED) {
         fprintf(stderr,
                 "mono_alignulcnet: --fixed-delay %d is only valid with "
@@ -144,14 +162,20 @@ static int parse_delay_profile(int argc, char** argv, DelayProfile* out) {
                     out->num_filters, DA_NUM_FILTERS);
             return 2;
         }
-    } else if (have_num_filters && out->num_filters != DA_NUM_FILTERS) {
-        fprintf(stderr,
-                "mono_alignulcnet: --delay-num-filters %d is only valid "
-                "with --delay-mode matched (requested mode: %s, which "
-                "builds no matched bank and requires n == %d)\n",
-                out->num_filters, delay_mode_name(out->mode),
-                DA_NUM_FILTERS);
-        return 2;
+    } else {
+        if (have_num_filters && out->num_filters != DA_NUM_FILTERS) {
+            fprintf(stderr,
+                    "mono_alignulcnet: --delay-num-filters %d is only valid "
+                    "with --delay-mode matched (requested mode: %s, which "
+                    "builds no matched bank and requires n == %d)\n",
+                    out->num_filters, delay_mode_name(out->mode),
+                    DA_NUM_FILTERS);
+            return 2;
+        }
+        /* The build-time default is a matched-bank knob, so it does not carry
+         * into a mode that has no bank: the caller asked for the mode, not for
+         * n, and lib/aec would reject the pair. */
+        out->num_filters = DA_NUM_FILTERS;
     }
     return 0;
 }
