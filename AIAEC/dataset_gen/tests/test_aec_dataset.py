@@ -14,6 +14,7 @@ import configparser
 import dataclasses
 import math
 import pathlib
+import re
 
 import numpy as np
 import pytest
@@ -40,11 +41,14 @@ from AIAEC.dataset_gen import (
 from AIAEC.dataset_gen.aec_dataset import (
     AecSequenceRenderer,
     SequencePlan,
+    check_rate_dependent_values,
+    chunk_samples_from_config,
     plan_sequences,
     resample_by_ratio,
     stable_seed,
 )
-from AIAEC.dataset_gen.gen_aec_dataset import gen_aec_dataset
+from AIAEC.dataset_gen import gen_aec_dataset as gen_aec_dataset_module
+from AIAEC.dataset_gen.gen_aec_dataset import build_parser, gen_aec_dataset
 from AIAEC.dataset_gen.linear_aec import linear_aec_contract_from_config
 from AIAEC.dataset_gen.manifest import (
     MANIFEST_VERSION,
@@ -94,6 +98,14 @@ def _rir(n_samples, rt60, generator):
     return out * 0.5
 
 
+def _example_config():
+    """The shipped example config, unmodified. One place knows how to find
+    and parse it; every other helper layers its own overrides on top."""
+    cfg = configparser.ConfigParser()
+    cfg.read(pathlib.Path(__file__).parents[1] / 'config.example.ini')
+    return cfg
+
+
 def _base_cfg(root):
     """config.example.ini pointed at ``root``'s sources, on a tiny but
     PBFDKF-hop-exact grid: 1.024 s = 64 hops @16 kHz/256.
@@ -102,8 +114,7 @@ def _base_cfg(root):
     its own ``root`` -- each caller layers its own extra ``cfg.set(...)`` on
     top (e.g. ``corpus`` sets ``val_fraction``/``p_ref_dropout``).
     """
-    cfg = configparser.ConfigParser()
-    cfg.read(pathlib.Path(__file__).parents[1] / 'config.example.ini')
+    cfg = _example_config()
     cfg.set('signal', 'sr', str(SR))
     cfg.set('paths', 'speech_dir', str(root / 'speech'))
     cfg.set('paths', 'noise_dir', str(root / 'noise'))
@@ -180,12 +191,12 @@ def packed(corpus, tmp_path_factory):
     output = tmp_path_factory.mktemp('aec_data')
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        workers=0, resume=False, seed=SEED, split='train',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.004,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='val',
+        workers=0, resume=False, seed=SEED, split='val',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     for split in ('train', 'val'):
@@ -692,7 +703,7 @@ def test_gen_aec_dataset_split_all_draws_from_one_unified_pool(corpus, tmp_path)
     output = tmp_path / 'aec_data_unified'
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split=UNIFIED_SPLIT,
+        workers=0, resume=False, seed=SEED, split=UNIFIED_SPLIT,
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     assert not (output / 'manifest.json').exists()
@@ -911,6 +922,269 @@ def test_renderer_produces_finite_recombinable_eight_second_48k_stems(corpus):
         view.near_speech + rendered.audit['noise'] + rendered.audit['echo'],
         rtol=0.0, atol=1e-5,
     )
+
+
+# ============================================================
+# The documented 48 kHz recipe
+# ============================================================
+
+_RECIPE_HEADING = 'COMPLETE 48 kHz recipe'
+_RECIPE_LINE = re.compile(r'^;\s+\[(?P<section>\w+)\]\s+(?P<settings>\S.*?)\s*$')
+
+
+def _documented_48k_recipe():
+    """The 48 kHz recipe exactly as config.example.ini's header states it.
+
+    Read out of the file rather than restated here, so an incomplete recipe
+    fails the tests below instead of only failing whoever follows it.
+    Returns ``[(section, key, value), ...]`` in the order the header lists.
+    """
+    lines = (pathlib.Path(__file__).parents[1] / 'config.example.ini').read_text(
+        encoding='utf-8').splitlines()
+    start = next(i for i, line in enumerate(lines) if _RECIPE_HEADING in line)
+    recipe = []
+    for line in lines[start + 1:]:
+        match = _RECIPE_LINE.match(line)
+        if match is None:
+            break
+        # Commas separate keys, but a value may carry commas of its own
+        # ([codec] source_sr_values); only a fragment holding '=' starts a key.
+        fragments = []
+        for fragment in match.group('settings').split(','):
+            if '=' in fragment or not fragments:
+                fragments.append(fragment)
+            else:
+                fragments[-1] += ',' + fragment
+        for fragment in fragments:
+            key, _, value = fragment.partition('=')
+            recipe.append((match.group('section'), key.strip(), value.strip()))
+    return recipe
+
+
+def test_rate_dependent_values_left_at_the_other_rates_defaults_are_refused():
+    """The two keys that degrade a corpus SILENTLY.
+
+    A 48 kHz run that kept the 16 kHz loudspeaker fractions or codec ladder
+    generates a complete, finite, plausible corpus -- with no band-limit and
+    a 4-6x codec resample. Nothing downstream can tell, so the only place it
+    can be caught is before generation starts.
+    """
+    cfg = _example_config()
+    for section, key, value in _documented_48k_recipe():
+        if section == 'signal':
+            cfg.set(section, key, value)          # rate moved, editorials not
+    with pytest.raises(ValueError, match="still carries another rate"):
+        check_rate_dependent_values(cfg)
+
+    # The full recipe is accepted.
+    cfg = _example_config()
+    for section, key, value in _documented_48k_recipe():
+        cfg.set(section, key, value)
+    check_rate_dependent_values(cfg)
+
+    # So is the shipped 16 kHz config, untouched.
+    check_rate_dependent_values(_example_config())
+
+    # A deliberately DIFFERENT device population is not blocked -- only an
+    # exact match with the other rate's shipped default is.
+    cfg.set('devices', 'speaker_lp_nyquist_frac_min', '0.21')
+    check_rate_dependent_values(cfg)
+
+
+def test_the_documented_48k_recipe_is_complete_and_hop_exact():
+    """Every claim the header makes about the recipe, checked against the file.
+
+    ⚠ Nothing here restates a key or a duration: they all come from
+    config.example.ini, which is the artefact that was wrong.
+    """
+    recipe = _documented_48k_recipe()
+    assert [(section, key) for section, key, _ in recipe] == [
+        ('signal', 'sr'), ('signal', 'n_fft'), ('signal', 'win_len'),
+        ('signal', 'hop_len'), ('sequence', 'chunk_sec'),
+        ('codec', 'source_sr_values'),
+        ('devices', 'speaker_lp_nyquist_frac_min'),
+        ('devices', 'speaker_lp_nyquist_frac_max'),
+    ]
+    values = {key: value for _, key, value in recipe}
+
+    shipped = _example_config()
+    shipped_chunk_sec = shipped.getfloat('sequence', 'chunk_sec')
+    shipped_codec = [int(v) for v in
+                     shipped.get('codec', 'source_sr_values').split(',')]
+
+    cfg = _example_config()
+    for section, key, value in recipe:
+        cfg.set(section, key, value)
+
+    # [signal] + [sequence]: the grid is one the frozen PBFDKF supports, and
+    # the chunk is a whole number of its hops.
+    contract = linear_aec_contract_from_config(cfg)
+    assert (contract.sample_rate, contract.frame_size, contract.hop_size) == (
+        48000, 1024, 512)
+    hop = contract.hop_size
+    assert chunk_samples_from_config(cfg, hop) % hop == 0
+
+    # [devices]: the loudspeaker low-pass is a fraction of Nyquist, so the
+    # recipe has to rescale it or the band-limit stops band-limiting. The 48
+    # kHz fractions must land on the same ABSOLUTE band the 16 kHz ones do,
+    # because a real driver's rolloff does not move with the sample rate.
+    for bound in ('min', 'max'):
+        shipped_hz = 16000 / 2 * shipped.getfloat(
+            'devices', 'speaker_lp_nyquist_frac_' + bound)
+        recipe_hz = 48000 / 2 * cfg.getfloat(
+            'devices', 'speaker_lp_nyquist_frac_' + bound)
+        assert abs(recipe_hz - shipped_hz) < 5.0, (bound, recipe_hz, shipped_hz)
+
+    # The same chunk_sec stays exact on the 16 kHz grid, so one duration
+    # serves both rates -- the header's reason for choosing it.
+    both = _example_config()
+    both.set('sequence', 'chunk_sec', values['chunk_sec'])
+    hop_16k = linear_aec_contract_from_config(both).hop_size
+    assert chunk_samples_from_config(both, hop_16k) % hop_16k == 0
+
+    # ... and it leaves the sequence shape alone: the same whole-chunk count
+    # per sequence that the 16 kHz duration gives over seq_sec_min/max.
+    chunk_sec = float(values['chunk_sec'])
+    seq_min = cfg.getfloat('sequence', 'seq_sec_min')
+    seq_max = cfg.getfloat('sequence', 'seq_sec_max')
+    assert (int(seq_min / chunk_sec), int(seq_max / chunk_sec)) == (
+        int(seq_min / shipped_chunk_sec), int(seq_max / shipped_chunk_sec))
+
+    # [codec]: source_sr_values is filtered by `< sr`, so at 48 kHz the 16 kHz
+    # list would leave only ratios far harsher than any it produces at
+    # 16 kHz. The recipe's list restores a mild end.
+    recipe_codec = [int(v) for v in values['source_sr_values'].split(',')]
+    assert min(48000 / v for v in shipped_codec if v < 48000) == 4.0
+    assert max(16000 / v for v in shipped_codec if v < 16000) == 2.0
+    assert min(48000 / v for v in recipe_codec if v < 48000) == 1.5
+
+
+def test_the_documented_48k_recipe_generates_and_packs_end_to_end(corpus, tmp_path):
+    """Follow the recipe verbatim, from sources to a packed shard.
+
+    ⚠ chunk_sec is NOT overridden here -- it is whatever the recipe says. The
+    other 48 kHz tests pick a duration that happens to be hop-exact at both
+    rates, which is exactly what let an incomplete recipe survive: the shipped
+    16 kHz chunk_sec is not hop-exact at 48 kHz, so a recipe that omits it
+    cannot render a single chunk.
+    """
+    cfg = copy.deepcopy(corpus['cfg'])
+    # Stand on the shipped sequence geometry, not the tiny one the 16 kHz
+    # fixtures shrink to; only [paths] stays local.
+    shipped = _example_config()
+    for key in ('seq_sec_min', 'seq_sec_max', 'chunk_sec'):
+        cfg.set('sequence', key, shipped.get('sequence', key))
+    for section, key, value in _documented_48k_recipe():
+        cfg.set(section, key, value)
+
+    config_path = tmp_path / 'config_48k.ini'
+    with open(config_path, 'w') as handle:
+        cfg.write(handle)
+
+    output = tmp_path / 'data_48k'
+    gen_aec_dataset(argparse.Namespace(
+        config=str(config_path), output=str(output), hours=0.004, workers=0,
+        resume=False, seed=SEED, split=UNIFIED_SPLIT, manifest=None,
+        rebuild_manifest=False, wav_encoding='float32',
+    ))
+    pack(argparse.Namespace(
+        config=str(config_path), input=str(output / UNIFIED_SPLIT),
+        output=str(output / 'packed'), shard_clips=8, dtype='float32',
+        overwrite=False,
+    ))
+
+    chunk_sec = cfg.getfloat('sequence', 'chunk_sec')
+    contract = linear_aec_contract_from_config(cfg)
+    chunk_samples = chunk_samples_from_config(cfg, contract.hop_size)
+
+    packed_48k = PackedAecDataset(str(output / 'packed'), verbose=False)
+    assert packed_48k.sr == 48000
+    for index in range(len(packed_48k)):
+        clip, _meta = packed_48k[index]
+        assert clip.shape == (len(PACKED_STEM_ORDER), chunk_samples)
+        assert torch.isfinite(clip).all()
+
+    # --hours is sized for exactly one sequence, so the chunk count is the
+    # recipe's own whole-chunks-per-sequence range and nothing else.
+    metas = [packed_48k[index][1] for index in range(len(packed_48k))]
+    assert {meta['sequence_id'] for meta in metas} == {0}
+    assert len(metas) in range(
+        int(cfg.getfloat('sequence', 'seq_sec_min') / chunk_sec),
+        int(cfg.getfloat('sequence', 'seq_sec_max') / chunk_sec) + 1)
+
+
+@pytest.mark.parametrize('sample_rate, hop, chunk_sec', [
+    (48000, 512, 10.0),        # the shipped 16 kHz duration, 480000/512 = 937.5
+    (16000, 256, 1.0),         # a whole second is not hop-exact at 16 kHz either
+])
+def test_chunk_geometry_refusal_names_the_key_the_rate_and_a_working_value(
+        sample_rate, hop, chunk_sec):
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({'signal': {'sr': str(sample_rate)},
+                   'sequence': {'chunk_sec': str(chunk_sec)}})
+    with pytest.raises(ValueError) as excinfo:
+        chunk_samples_from_config(cfg, hop)
+    message = str(excinfo.value)
+    assert '[sequence] chunk_sec' in message
+    assert str(sample_rate) in message
+    assert f'hop={hop}' in message
+
+    # The value it offers has to be one that actually renders.
+    suggested = re.search(r'chunk_sec = ([0-9.]+)\.$', message).group(1)
+    cfg.set('sequence', 'chunk_sec', suggested)
+    assert chunk_samples_from_config(cfg, hop) % hop == 0
+
+
+def test_gen_refuses_an_inexact_chunk_sec_before_touching_the_sources(
+        corpus, tmp_path, monkeypatch):
+    """The [signal]-only 48 kHz change -- the recipe this config used to give.
+
+    Two things: that it is refused at all, and that the refusal is free. This
+    check used to live in the renderer, so it arrived as a worker traceback,
+    after the sequence plan, the manifest and the full RIR RT60 scan.
+    """
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('signal', 'sr', '48000')
+    cfg.set('signal', 'n_fft', '1024')
+    cfg.set('signal', 'win_len', '1024')
+    cfg.set('signal', 'hop_len', '512')
+    shipped = _example_config()
+    for key in ('seq_sec_min', 'seq_sec_max', 'chunk_sec'):
+        cfg.set('sequence', key, shipped.get('sequence', key))
+
+    config_path = tmp_path / 'config_48k_signal_only.ini'
+    with open(config_path, 'w') as handle:
+        cfg.write(handle)
+
+    def _too_late(*args, **kwargs):
+        raise AssertionError(
+            'the source inventory was reached before the geometry check')
+
+    for name in ('plan_sequences', 'build_manifest', 'build_unified_manifest'):
+        monkeypatch.setattr(gen_aec_dataset_module, name, _too_late)
+
+    output = tmp_path / 'data_48k_signal_only'
+    with pytest.raises(ValueError, match=r'\[sequence\] chunk_sec'):
+        gen_aec_dataset(argparse.Namespace(
+            config=str(config_path), output=str(output), hours=0.004,
+            workers=0, resume=False, seed=SEED, split=UNIFIED_SPLIT,
+            manifest=None, rebuild_manifest=False, wav_encoding='float32',
+        ))
+    assert not output.exists()
+
+
+def test_gen_has_no_sample_rate_override():
+    """The rate belongs to the config file the packer is later handed.
+
+    --sample-rate moved [signal] sr alone, which could never produce a valid
+    run at the other rate (the grid, chunk_sec and the codec rates stay put)
+    and left pack_aec_dataset.py rebuilding the contract at whatever rate the
+    file still claimed.
+    """
+    flags = {action.dest for action in build_parser()._actions}
+    assert 'sample_rate' not in flags
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(['--sample-rate', '48000'])
 
 
 def test_grid_rejects_a_non_cola_hop():
@@ -1169,7 +1443,7 @@ def test_resume_rerenders_a_sequence_whose_chunks_are_missing_or_reshaped(
     output = tmp_path / 'aec_data_resume'
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        workers=0, resume=False, seed=SEED, split='train',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     cfg = corpus['cfg']
@@ -1207,7 +1481,7 @@ def test_resume_cannot_see_a_config_or_seed_change(corpus, tmp_path):
     output = tmp_path / 'aec_data_seed_drift'
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        workers=0, resume=False, seed=SEED, split='train',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     cfg = corpus['cfg']
@@ -1232,7 +1506,7 @@ def test_resume_forces_a_rerender_when_wav_encoding_changes(corpus, tmp_path):
     output = tmp_path / 'aec_data_encoding_drift'
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        workers=0, resume=False, seed=SEED, split='train',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     cfg = corpus['cfg']
@@ -1252,7 +1526,7 @@ def test_reusing_manifest_with_a_different_seed_is_rejected(corpus, tmp_path):
     output = tmp_path / 'aec_data_manifest_seed_drift'
     kwargs = dict(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, sample_rate=None, split='train',
+        workers=0, resume=False, split='train',
         manifest=str(output / 'source_split.json'), rebuild_manifest=False,
         wav_encoding='float32',
     )
@@ -1272,7 +1546,7 @@ def test_pack_takes_the_whole_directory_and_only_chunk_files(corpus, tmp_path):
     output = tmp_path / 'aec_data_whole_dir'
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        workers=0, resume=False, seed=SEED, split='train',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     seqs_dir = output / 'train' / 'seqs'
@@ -1300,7 +1574,7 @@ def test_pack_fails_loudly_when_a_sequence_is_missing_some_chunk_wavs(
     output = tmp_path / 'aec_data_partial'
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        workers=0, resume=False, seed=SEED, split='train',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     seqs_dir = output / 'train' / 'seqs'
@@ -1320,7 +1594,7 @@ def test_pack_rejects_a_chunk_of_the_wrong_length(corpus, tmp_path):
     output = tmp_path / 'aec_data_short_chunk'
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        workers=0, resume=False, seed=SEED, split='train',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     victim = sorted((output / 'train' / 'seqs').glob('[0-9]*_[0-9]*.wav'))[-1]
@@ -1337,7 +1611,7 @@ def test_pack_rejects_non_finite_wav_samples(corpus, tmp_path):
     output = tmp_path / 'aec_data_non_finite'
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        workers=0, resume=False, seed=SEED, split='train',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     wav_path = output / 'train' / 'seqs' / '000000_000.wav'
@@ -1361,7 +1635,7 @@ def test_pack_refuses_to_add_shards_to_a_directory_that_already_has_some(
     output = tmp_path / 'aec_data_repack'
     gen_aec_dataset(argparse.Namespace(
         config=str(corpus['config_path']), output=str(output), hours=0.012,
-        workers=0, resume=False, seed=SEED, sample_rate=None, split='train',
+        workers=0, resume=False, seed=SEED, split='train',
         manifest=None, rebuild_manifest=False, wav_encoding='float32',
     ))
     packed_dir = output / 'packed' / 'train'

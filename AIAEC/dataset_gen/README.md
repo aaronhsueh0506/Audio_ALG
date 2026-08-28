@@ -227,9 +227,19 @@ any of these is opting out of the comparison** — the same failure that
 
 16 kHz first target: `n_fft = 512`, `win_len = 512`, `hop_len = 256`,
 `n_freqs = 257`, sqrt-Hann (periodic), 50 % overlap (COLA), 62.5 fps. The
-48 kHz variant is `sr = 48000, n_fft = 1024, win_len = 1024, hop_len = 512` and
-**nothing else** — `AecGrid` derives `n_freqs` and `frame_rate`, and rejects a
-hop that is not `win_len/2` or a `win_len` different from `n_fft`.
+48 kHz grid is `sr = 48000, n_fft = 1024, win_len = 1024, hop_len = 512` —
+`AecGrid` derives `n_freqs` and `frame_rate`, and rejects a hop that is not
+`win_len/2` or a `win_len` different from `n_fft`.
+
+**⚠ `[signal]` is not the whole rate change.** The linear-AEC frontend's
+`(frame, hop)` is frozen per rate in `linear_aec.py`'s
+`FROZEN_FRAME_HOP_BY_SR`, so `[sequence] chunk_sec` must satisfy
+`round(chunk_sec * sr) % hop == 0` — the shipped `10.0` is exact at 16 kHz and
+not at 48 kHz, where whole seconds must be multiples of 4 (`8.0` is exact on
+both grids and keeps the same 2–3 chunks per sequence). `[codec]
+source_sr_values` is rate-dependent as well. The complete 48 kHz recipe
+is at the top of `config.example.ini`; generation refuses an inexact
+`chunk_sec` in its config preflight, before the source/RIR scan.
 
 **⚠ No frame counts, EMA coefficients or window lengths are hardcoded
 anywhere.** Time constants are given in seconds and converted with
@@ -270,11 +280,13 @@ shards, so a leftover from an earlier pack would silently join the corpus. Use
 validation/serialization failure keeps the previous pack intact.
 
 ⚠ Every current trainer runs at 16 kHz/512. A trainer on a different grid
-would need its own `[signal]` block in a SEPARATE `config.ini` (see
-config.example.ini's top comment) and its OWN `--output` (e.g. `data_aec_16k` /
-`data_aec_48k`, matching that trainer's `packed_dir`): generating a second rate
-into the same `--output` as the first is refused once chunk WAVs exist, since
-the directory is not namespaced by sample rate.
+would need a SEPARATE `config.ini` carrying the whole recipe for that rate (see
+config.example.ini's top comment — `[signal]` alone is not enough) and its OWN
+`--output` (e.g. `data_aec_16k` / `data_aec_48k`, matching that trainer's
+`packed_dir`): generating a second rate into the same `--output` as the first
+is refused once chunk WAVs exist, since the directory is not namespaced by
+sample rate. The rate is a config property with no CLI override, precisely so
+that the config the packer is later handed cannot disagree with the audio.
 
 Layout:
 

@@ -83,6 +83,7 @@ __all__ = [
     'SequencePlan',
     'apply_agc',
     'apply_loudspeaker_nonlinearity',
+    'chunk_samples_from_config',
     'device_for_id',
     'plan_sequences',
     'resample_by_ratio',
@@ -232,8 +233,13 @@ def device_for_id(device_id: str, cfg: configparser.ConfigParser,
         mic_eq_seed=rng.getrandbits(40),
         speaker_hp_hz=rng.uniform(cfg.getfloat('devices', 'speaker_hp_hz_min'),
                                   cfg.getfloat('devices', 'speaker_hp_hz_max')),
-        # A small loudspeaker rolls off well below Nyquist; expressed as a
-        # fraction of Nyquist so the 48 kHz variant needs no new number.
+        # A small loudspeaker rolls off well below Nyquist. ⚠ Expressed as a
+        # FRACTION of Nyquist, but a real driver's rolloff sits at an absolute
+        # frequency, so the fraction does not carry across rates: left alone
+        # at 48 kHz it lands at 13-23 kHz, where the device population's
+        # spread at 6 kHz is 0.4 dB instead of 12.5 dB -- i.e. gone. The
+        # per-rate values are in config.example.ini's recipe, and the
+        # generator refuses a rate whose fractions were never rescaled.
         speaker_lp_hz=min(nyquist * lp_frac, nyquist * 0.98),
     )
 
@@ -546,6 +552,113 @@ def _scenario_weights(cfg: configparser.ConfigParser) -> Dict[str, float]:
 
 
 # ============================================================
+# Chunk geometry
+# ============================================================
+
+# Keys that are correct at one product rate and wrong at the other, but whose
+# right value is editorial -- the generator cannot pick a device population or
+# a codec ladder for you. What it CAN see is that a key was never revisited:
+# "still exactly the OTHER rate's shipped default" is not a choice anyone
+# makes on purpose. Everything else is accepted silently, so deliberate tuning
+# is never blocked.
+#
+# This exists because both of these degrade SILENTLY. A 48 kHz run that kept
+# the 16 kHz loudspeaker fractions band-limits at 13-23 kHz, i.e. not at all
+# (the device population's spread at 6 kHz collapses from -6.5..-1.4 dB to
+# -0.18..-0.02 dB, and device-disjoint validation loses an axis); one that
+# kept the 16 kHz codec ladder turns a 1.3-2x resample into a 4-6x one. Both
+# produce a full, finite, plausible corpus.
+RATE_DEPENDENT_KEYS = {
+    ('devices', 'speaker_lp_nyquist_frac_min'): {16000: '0.55', 48000: '0.1833'},
+    ('devices', 'speaker_lp_nyquist_frac_max'): {16000: '0.95', 48000: '0.3167'},
+    ('codec', 'source_sr_values'): {
+        16000: '8000, 12000',
+        48000: '8000, 12000, 16000, 24000, 32000',
+    },
+}
+
+
+def _normalised(value: str) -> str:
+    return ','.join(part.strip() for part in value.split(','))
+
+
+def check_rate_dependent_values(cfg: configparser.ConfigParser) -> None:
+    """Refuse a config whose rate-dependent keys were never rescaled.
+
+    Only fires on an exact match with another rate's shipped default, so it
+    cannot stand in the way of a deliberately different device population.
+    """
+    sample_rate = cfg.getint('signal', 'sr')
+    stale = []
+    for (section, key), by_rate in sorted(RATE_DEPENDENT_KEYS.items()):
+        if sample_rate not in by_rate or not cfg.has_option(section, key):
+            continue
+        current = _normalised(cfg.get(section, key))
+        if current == _normalised(by_rate[sample_rate]):
+            continue
+        for other_rate, other_value in by_rate.items():
+            if other_rate != sample_rate and current == _normalised(other_value):
+                stale.append(
+                    '[%s] %s = %s is the %d Hz value; at %d Hz it should be %s'
+                    % (section, key, current, other_rate, sample_rate,
+                       by_rate[sample_rate])
+                )
+    if stale:
+        raise ValueError(
+            'this config is set to sr=%d but still carries another rate\'s '
+            'values:\n  %s\nThese do not fail loudly during generation -- '
+            'they quietly change what the corpus contains -- so they are '
+            'refused here. See the recipe at the top of config.example.ini. '
+            'Any OTHER value is accepted; only an exact match with the other '
+            'rate\'s shipped default is treated as "never revisited".'
+            % (sample_rate, '\n  '.join(stale))
+        )
+
+
+def chunk_samples_from_config(cfg: configparser.ConfigParser,
+                              hop_size: int) -> int:
+    """`[sequence] chunk_sec` in samples, or raise naming what has to change.
+
+    The linear-AEC frontend consumes whole hops, so a chunk that is not an
+    integer number of them cannot be materialized. The hop is frozen per
+    sample rate (linear_aec.FROZEN_FRAME_HOP_BY_SR), which makes `chunk_sec`
+    the only adjustable side of
+
+        round(chunk_sec * sr) % hop == 0
+
+    and makes the constraint rate-dependent: the same `chunk_sec` that is
+    exact at one rate need not be at another. Called both by the renderer
+    (below) and by gen_aec_dataset.py's config preflight, so a CLI run and an
+    in-process one fail identically.
+    """
+    sample_rate = cfg.getint('signal', 'sr')
+    chunk_sec = cfg.getfloat('sequence', 'chunk_sec')
+    chunk_samples = int(round(chunk_sec * sample_rate))
+    if chunk_samples <= 0:
+        raise ValueError(
+            f"[sequence] chunk_sec = {chunk_sec:g} is too small for "
+            f"sr={sample_rate}: it rounds to {chunk_samples} samples"
+        )
+    if chunk_samples % hop_size:
+        # Whole seconds are exact only in multiples of this many, from
+        # n * sr = 0 (mod hop)  <=>  n = 0 (mod hop / gcd(sr, hop)).
+        second_step = hop_size // math.gcd(sample_rate, hop_size)
+        suggestion = max(second_step,
+                         round(chunk_sec / second_step) * second_step)
+        raise ValueError(
+            f"training chunk geometry must be divisible by the linear AEC "
+            f"hop: [sequence] chunk_sec = {chunk_sec:g} at sr={sample_rate} "
+            f"is {chunk_samples} samples, which is not a whole number of "
+            f"hop={hop_size} hops. The hop is frozen per sample rate, so "
+            f"chunk_sec is the side that has to change: it must satisfy "
+            f"round(chunk_sec * sr) % hop == 0. Among whole seconds this "
+            f"rate admits only multiples of {second_step} s -- "
+            f"e.g. chunk_sec = {suggestion:g}."
+        )
+    return chunk_samples
+
+
+# ============================================================
 # Renderer
 # ============================================================
 
@@ -559,9 +672,6 @@ class AecSequenceRenderer:
         self.corpus_seed = int(corpus_seed)
 
         self.sr = cfg.getint('signal', 'sr')
-        self.chunk_samples = int(round(cfg.getfloat('sequence', 'chunk_sec') * self.sr))
-        if self.chunk_samples <= 0:
-            raise ValueError("[sequence] chunk_sec is too small for this sample rate")
 
         # Stamped into every chunk's metadata so --resume can tell "this
         # sequence was rendered under the config this run is using" apart
@@ -572,12 +682,8 @@ class AecSequenceRenderer:
         self.linear_aec_contract: LinearAecContract = (
             linear_aec_contract_from_config(cfg)
         )
-        if self.chunk_samples % self.linear_aec_contract.hop_size:
-            raise ValueError(
-                f"training chunk geometry must be divisible by the "
-                f"linear AEC hop: chunk_samples={self.chunk_samples}, "
-                f"hop={self.linear_aec_contract.hop_size}"
-            )
+        self.chunk_samples = chunk_samples_from_config(
+            cfg, self.linear_aec_contract.hop_size)
 
         self.snr_values = parse_snr_values(cfg.get('levels', 'snr_values'))
         self.devices = {

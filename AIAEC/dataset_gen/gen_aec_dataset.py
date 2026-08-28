@@ -1,12 +1,19 @@
 # -*- coding: utf-8 -*-
 """Offline rendering of AEC scenario sequences into 5-channel WAV chunks.
 
-Mirrors ``AINR/dataset_gen/gen_dataset.py``'s flags so the two generators are driven
-the same way, with two additions that the NR generator has no need for:
+Mirrors ``AINR/dataset_gen/gen_dataset.py``'s flags so the two generators are
+driven the same way, with two additions that the NR generator has no need for
+(and one omission, noted below):
 
     --split       'all' (the selected protocol) or a SOURCE-DISJOINT side
                   ('train'/'val'), for a separate held-out generalisation corpus
     --manifest    optional persisted source-split decision
+
+⚠ There is no ``--sample-rate``. The generation rate is one member of a grid
+that also fixes ``[signal] n_fft/win_len/hop_len``, ``[sequence] chunk_sec``
+and ``[codec] source_sr_values``, and pack_aec_dataset.py rebuilds the frozen
+linear-AEC contract from the same config file; only config.ini can move all of
+them together. See config.example.ini's header for the complete 48 kHz recipe.
 
 ⚠ The split is decided BEFORE generation, over the source lists. With the same
 config, source inventory and seed, it is rebuilt deterministically in memory;
@@ -83,6 +90,8 @@ if __package__ in (None, ''):
 from .aec_dataset import (  # noqa: E402
     AecSequenceRenderer,
     SequencePlan,
+    check_rate_dependent_values,
+    chunk_samples_from_config,
     plan_sequences,
 )
 from .aec_features import STEM_ORDER  # noqa: E402
@@ -297,19 +306,34 @@ def gen_aec_dataset(args):
     if not cfg.read(args.config):
         raise FileNotFoundError(f"config not found: {args.config}")
 
-    # One generation rate per run; CLI overrides config, exactly as the NR
-    # generator does.
-    cfg_sr = cfg.getint('signal', 'sr')
-    generation_sr = args.sample_rate if args.sample_rate is not None else cfg_sr
+    # One generation rate per run, and it comes from the config file only.
+    # There is deliberately no CLI override: the rate is one member of a grid
+    # that also fixes n_fft/win_len/hop_len, [sequence] chunk_sec and
+    # [codec] source_sr_values, and pack_aec_dataset.py rebuilds the frozen
+    # contract from this same file. A flag that moved `sr` behind the config's
+    # back could not produce a valid run at the other rate, and would leave the
+    # packer describing the corpus at the rate the file still claims.
+    generation_sr = cfg.getint('signal', 'sr')
     if generation_sr <= 0:
         raise ValueError(f"Sample rate must be positive, got {generation_sr}")
-    cfg.set('signal', 'sr', str(generation_sr))
-    print(f"Sample rate: {generation_sr} Hz "
-          f"({'CLI' if args.sample_rate is not None else 'config.ini [signal] sr'})")
+    print(f"Sample rate: {generation_sr} Hz (config.ini [signal] sr)")
     # Only the manifest-reuse comparison needs this now (the --resume check has
-    # no config record to compare against any more); cfg does not change after
-    # the --sample-rate override above.
+    # no config record to compare against any more).
     cfg_hash = config_hash(cfg)
+
+    # --- config-only preflight ---------------------------------------------
+    # The frozen PBFDKF grid and the chunk geometry depend on nothing but cfg,
+    # so they are checked here -- before the sequence plan, the manifest and
+    # the RIR RT60 scan. An unsupported grid or a chunk_sec that is not a whole
+    # number of linear-AEC hops must not cost a full source inventory pass
+    # first, and must not surface as a worker traceback partway into a render.
+    # (The echo_path_change preflight further down cannot join them: it needs
+    # the manifest's rooms_to_rirs.) pack_aec_dataset.py rebuilds the same
+    # contract from the same config.
+    linear_aec_contract = linear_aec_contract_from_config(cfg)
+    chunk_sec = cfg.getfloat('sequence', 'chunk_sec')
+    chunk_samples = chunk_samples_from_config(cfg, linear_aec_contract.hop_size)
+    check_rate_dependent_values(cfg)
 
     split_dir = os.path.join(args.output, args.split)
     seqs_dir = os.path.join(split_dir, 'seqs')
@@ -379,7 +403,7 @@ def gen_aec_dataset(args):
             f"at {generation_sr}; rebuild it with --rebuild-manifest")
 
     # --- the plan -----------------------------------------------------------
-    planned_sec = sum(p.n_chunks for p in plans) * cfg.getfloat('sequence', 'chunk_sec')
+    planned_sec = sum(p.n_chunks for p in plans) * chunk_sec
 
     if any(p.scenario == 'echo_path_change' for p in plans):
         # Fail before any worker starts rendering, not partway through a
@@ -394,13 +418,6 @@ def gen_aec_dataset(args):
                 "set [scenarios] p_echo_path_change = 0"
             )
 
-    chunk_sec = cfg.getfloat('sequence', 'chunk_sec')
-    chunk_samples = int(round(chunk_sec * generation_sr))
-    # Constructed for its validation side effect: it raises if config.ini's
-    # signal/linear_aec grid is not one the frozen PBFDKF supports, which must
-    # fail before rendering, not at pack time. pack_aec_dataset.py rebuilds the
-    # same contract from the same config.
-    linear_aec_contract_from_config(cfg)
     pending = _pending(
         plans, seqs_dir, args.resume,
         sample_rate=generation_sr,
@@ -476,8 +493,6 @@ def build_parser() -> argparse.ArgumentParser:
                              "--split all, a single unified pool) and every "
                              "sequence; source-disjoint train/val runs must "
                              "use the same config, source inventory and seed.")
-    parser.add_argument('--sample-rate', type=int, default=None,
-                        help='Generation sample rate in Hz, overriding [signal] sr')
     parser.add_argument('--split', default='all', choices=ALL_SPLIT_NAMES,
                         help="'all' (default, the selected protocol): one "
                              "unified pool, no source split; pair with "
