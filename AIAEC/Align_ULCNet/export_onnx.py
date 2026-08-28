@@ -67,7 +67,9 @@ attention-score history and temporal-GRU hidden tensors on every invocation.
 The graph returns only the new K/V/logit entries plus next GRU hidden tensors;
 the CPU updates its caller-owned rings.  STFT/WOLA and PBFDKF stay outside the
 graph in ``ulcnet_process.c`` and the AEC library respectively.  The exported
-graph boundary is fixed at 16 kHz, FFT/window 512 and hop 256.
+graph boundary follows the checkpoint and supports 16 kHz / FFT-window 512 /
+hop 256 or 48 kHz / 1024 / 512.  The C pre/post must be compiled for the same
+grid; one binary serves one grid.
 
 Graph boundary layouts
 ----------------------
@@ -161,7 +163,7 @@ from AIAEC.training_common import (
 # order and the per-tensor quantization scales are all unchanged by the rank,
 # so this costs a version number and nothing else.
 # The five SIGNAL inputs are deliberately not touched here: error_mag/far_mag/
-# error_cos/error_sin are [1,1,257] and only error_ri is rank-4. If the
+# error_cos/error_sin are [1,1,n_freqs] and only error_ri is rank-4. If the
 # toolchain turns out to reject those too, they move in their own bump --
 # folding them in here would not have made that re-export any cheaper.
 #
@@ -192,11 +194,16 @@ STATE_LAYOUT_VERSION = LAYOUT_VERSIONS[('host', 'split')]
 # (ULCNET_MODEL_IO_COMPRESSION_EXP); export_graph refuses any checkpoint
 # whose model carries a different value, because nothing downstream of the
 # graph could detect the mismatch.
+# The two product grids. SignalGrid admits more than these -- 16 kHz / 256 is
+# constructible and the model runs on it -- but the deployed boundary is
+# defined only for the pair the corpus is materialized on, so anything else is
+# refused here rather than left to fail deep in a matmul or, worse, to export a
+# graph no C build can bind.
+SUPPORTED_GRIDS = ((16000, 512), (48000, 1024))
 COMPRESSION_EXPONENT = 0.3
 MIN_DELAY_DEPTH = 2
 MAX_DELAY_DEPTH = 64
 TA_CHANNELS = 32
-TA_BINS = 26
 SCORE_HISTORY_FRAMES = 4
 GRU_LAYERS = 2
 GRU_HIDDEN = 128
@@ -463,20 +470,38 @@ class AlignUlcnetStreamingExport(nn.Module):
         self.layout = resolve_layout(feature_layout, gru_state_layout)
         self.delay_depth = int(model.max_delay_frames)
         if not MIN_DELAY_DEPTH <= self.delay_depth <= MAX_DELAY_DEPTH:
+            # The common way to land here is a config that leaves
+            # max_delay_frames unset. The 16 kHz grid pins 64 (the paper's
+            # Dmax), but every other grid falls through to one physical
+            # second, which is 94 frames at 48 kHz. Such a run trains to
+            # completion and only fails here, so the message names the
+            # remedy rather than just the bound.
             raise ValueError(
-                'streaming export delay depth must be in [%d, %d]' %
-                (MIN_DELAY_DEPTH, MAX_DELAY_DEPTH)
+                'streaming export delay depth must be in [%d, %d], got %d. '
+                'Set [model] max_delay_frames explicitly -- the one-second '
+                'default overshoots this bound on the 48 kHz grid.' %
+                (MIN_DELAY_DEPTH, MAX_DELAY_DEPTH, self.delay_depth)
             )
-        if model.grid.sample_rate != 16000 or model.grid.n_fft != 512:
+        grid = (model.grid.sample_rate, model.grid.n_fft)
+        if grid not in SUPPORTED_GRIDS:
             raise ValueError(
-                'streaming C boundary currently requires 16 kHz / FFT 512'
+                'streaming export supports %s, got %r' %
+                (' and '.join('%d Hz / FFT %d' % g for g in SUPPORTED_GRIDS),
+                 grid)
             )
-        if model.grid.win_len != 512 or model.grid.hop_len != 256:
+        # win/hop need no test of their own: SignalGrid already requires
+        # win_len == n_fft and hop_len == n_fft/2. What is NOT implied by the
+        # grid is the C-SamFR sampling pair -- gamma and subband_bins change
+        # reorient.width, and hence the K/V feature width, independently of
+        # n_freqs.
+        if (model.reorient.gamma, model.reorient.subband_bins) != (5, 2):
             raise ValueError(
-                'streaming C boundary currently requires window/hop 512/256'
+                'streaming C boundary requires C-SamFR (gamma, subband_bins) '
+                '= (5, 2), got (%r, %r)'
+                % (model.reorient.gamma, model.reorient.subband_bins)
             )
-        if model.reorient.width != 52:
-            raise ValueError('unexpected C-SamFR width')
+        self.n_freqs = int(model.grid.n_freqs)
+        self.ta_bins = ta_bins_for(model)
 
     def forward(self, *tensors: Tensor) -> Tuple[Tensor, ...]:
         layout = self.layout
@@ -601,15 +626,33 @@ class AlignUlcnetStreamingExport(nn.Module):
         return heads + tuple(hidden_next)
 
 
-def state_shapes(delay_depth: int) -> Dict[str, Tuple[int, ...]]:
+def ta_bins_for(model) -> int:
+    """The K/V feature width the encoder emits.
+
+    NOT a constant -- it follows n_freqs, so it is 26 on the 16 kHz grid and
+    52 on the 48 kHz one. Read off the encoder rather than re-derived, so
+    there is nothing here to drift from model.py. The C side derives the
+    same number from its compiled grid as (BINS + 9) / 10, which is equal to
+    this for the (gamma, subband_bins) pair the export guard enforces;
+    test_c_ta_bins_matches_the_python_derivation evaluates both and compares
+    them at each supported grid.
+
+    ⚠ Not model.reorient.width. That is 52 at 16 kHz -- the same number this
+    returns at 48 kHz -- so the wrong derivation looks right in a 48 kHz
+    trace and is off by 2x on the shipped grid.
+    """
+    return model.encoded_width
+
+
+def state_shapes(delay_depth: int, ta_bins: int) -> Dict[str, Tuple[int, ...]]:
     if not MIN_DELAY_DEPTH <= delay_depth <= MAX_DELAY_DEPTH:
         raise ValueError(
             'delay depth must be in [%d, %d]' %
             (MIN_DELAY_DEPTH, MAX_DELAY_DEPTH)
         )
     return {
-        'key_history': (1, TA_CHANNELS, delay_depth - 1, TA_BINS),
-        'value_history': (1, TA_CHANNELS, delay_depth - 1, TA_BINS),
+        'key_history': (1, TA_CHANNELS, delay_depth - 1, ta_bins),
+        'value_history': (1, TA_CHANNELS, delay_depth - 1, ta_bins),
         'logit_history': (
             1, TA_CHANNELS, SCORE_HISTORY_FRAMES, delay_depth
         ),
@@ -620,7 +663,7 @@ def state_shapes(delay_depth: int) -> Dict[str, Tuple[int, ...]]:
 
 
 def stream_features(model, error_ri: Tensor, far_ri: Tensor):
-    """Host-side fixed front end from RAW RI spectra ((1, 1, 257, 2) each).
+    """Host-side fixed front end from RAW RI spectra ((1, 1, n_freqs, 2) each).
 
     Signed-power compression, magnitudes, and the compressed-domain phase as
     cos/sin -- everything unlearned, in fp32 (C: ulcnet_model_io_prepare).
@@ -663,24 +706,25 @@ def graph_signals(model, error_ri: Tensor, far_ri: Tensor,
     return stream_features(model, error_ri, far_ri)
 
 
-def dummy_inputs(delay_depth: int,
-                 feature_layout=DEFAULT_FEATURE_LAYOUT,
-                 gru_state_layout=DEFAULT_GRU_STATE_LAYOUT
-                 ) -> Tuple[Tensor, ...]:
-    layout = resolve_layout(feature_layout, gru_state_layout)
-    shapes = state_shapes(delay_depth)
+def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int,
+                 layout=DEFAULT_LAYOUT) -> Tuple[Tensor, ...]:
+    """Trace inputs for one frame. n_freqs and ta_bins have no defaults on
+    purpose: a default would let a caller that forgot them trace one grid's
+    graph while believing it had another."""
+    layout = resolve_layout(layout)
+    shapes = state_shapes(delay_depth, ta_bins)
     if layout.in_graph_features:
         signals = (
-            torch.randn(1, 1, 257, 2),         # error (raw RI)
-            torch.randn(1, 1, 257, 2),         # far (raw RI)
+            torch.randn(1, 1, n_freqs, 2),         # error (raw RI)
+            torch.randn(1, 1, n_freqs, 2),         # far (raw RI)
         )
     else:
         signals = (
-            torch.randn(1, 1, 257).abs(),          # error_mag
-            torch.randn(1, 1, 257).abs(),          # far_mag
-            torch.randn(1, 1, 257).clamp(-1, 1),   # error_cos
-            torch.randn(1, 1, 257).clamp(-1, 1),   # error_sin
-            torch.randn(1, 1, 257, 2),             # error_ri (compressed)
+            torch.randn(1, 1, n_freqs).abs(),          # error_mag
+            torch.randn(1, 1, n_freqs).abs(),          # far_mag
+            torch.randn(1, 1, n_freqs).clamp(-1, 1),   # error_cos
+            torch.randn(1, 1, n_freqs).clamp(-1, 1),   # error_sin
+            torch.randn(1, 1, n_freqs, 2),             # error_ri (compressed)
         )
     return signals + (
         torch.zeros(shapes['key_history']),
@@ -809,8 +853,8 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
         for _ in range(2 * wrapper.delay_depth + 5):
             signals = graph_signals(
                 wrapper.model,
-                torch.randn(1, 1, 257, 2, generator=generator),
-                torch.randn(1, 1, 257, 2, generator=generator),
+                torch.randn(1, 1, wrapper.n_freqs, 2, generator=generator),
+                torch.randn(1, 1, wrapper.n_freqs, 2, generator=generator),
                 layout,
             )
             torch_inputs = signals + state
@@ -849,7 +893,8 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
         model, feature_layout=feature_layout,
         gru_state_layout=gru_state_layout).eval()
     layout = wrapper.layout
-    inputs = dummy_inputs(wrapper.delay_depth, layout)
+    inputs = dummy_inputs(
+        wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins, layout)
     with torch.no_grad():
         outputs = wrapper(*inputs)
     if not all(torch.isfinite(value).all() for value in outputs):

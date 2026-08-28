@@ -43,19 +43,14 @@
 #endif
 #define M_PI_F ((float)M_PI)
 
-/* This wrapper's one supported grid. ULCNet's constants are compile-time
- * 16 kHz / 512 / 256 / 257; the core must be forced onto the same grid. */
-#define ULCNET_PIPELINE_SAMPLE_RATE 16000
-#define ULCNET_PIPELINE_FFT 512
-
-_Static_assert(ULCNET_SR == ULCNET_PIPELINE_SAMPLE_RATE,
-               "ULCNet compile-time sample rate must match this wrapper");
-_Static_assert(ULCNET_N_FFT == ULCNET_PIPELINE_FFT,
-               "ULCNet frame must match the forced core FFT size");
-_Static_assert(ULCNET_HOP == ULCNET_PIPELINE_FFT / 2,
-               "ULCNet hop must match the core hop (fft/2)");
-_Static_assert(ULCNET_BINS == ULCNET_PIPELINE_FFT / 2 + 1,
-               "ULCNet bin count must match the core bin count");
+/* This wrapper's one supported grid IS whichever grid the ULCNet layer was
+ * built for -- a build parameter of ulcnet_model_io.h, taken from there
+ * rather than restated. The core is then forced onto the same grid.
+ * Asserting hop == fft/2 or bins == fft/2+1 here would assert nothing:
+ * ULCNET_HOP and ULCNET_BINS ARE those expressions. The FFT size is what
+ * can actually differ, so that is what is pinned. */
+_Static_assert(ULCNET_N_FFT == 512 || ULCNET_N_FFT == 1024,
+               "ULCNet wrapper supports FFT 512 (16 kHz) or 1024 (48 kHz)");
 
 /* ============================================================================
  * Instance
@@ -75,7 +70,7 @@ struct AudioPipeline4ChUlcnet {
     Complex* gsc_weights;
 
     /* Beamformed-error WOLA reconstruction (one hop behind). The one
-     * carved handle is ALSO the ULCNet chain's FFT (same 512 size; the
+     * carved handle is ALSO the ULCNet chain's FFT (same compiled size; the
      * beam IFFT and the chain's three transforms are strictly sequential
      * within a hop, per ulcnet_process.h's sharing contract). */
     FftHandle* fft;
@@ -102,7 +97,7 @@ struct AudioPipeline4ChUlcnet {
     /* One-hop far compensation (layout v2): the beam WOLA above closes one
      * hop late, so far_analysis is fed the far source SAVED on the previous
      * call -- without this the model would see error[t-1] paired with
-     * far[t] (a fixed 256-sample skew). Cleared together with the beam OLA
+     * far[t] (a fixed one-hop skew). Cleared together with the beam OLA
      * on a delay change and on reset. */
     float far_delay[ULCNET_HOP];
 
@@ -136,10 +131,10 @@ static int is_bool(int value) {
 static int validate_config(const AudioPipeline4ChConfig* cfg) {
     float nyquist;
     if (!cfg) return 0;
-    /* ULCNet grid gate: 16 kHz only, core fft 0 (forced to 512) or 512. */
-    if (cfg->core.sample_rate != ULCNET_PIPELINE_SAMPLE_RATE) return 0;
+    /* Accept only the grid compiled into this ULCNet build. */
+    if (cfg->core.sample_rate != ULCNET_SR) return 0;
     if (cfg->core.fft_size != 0 &&
-        cfg->core.fft_size != ULCNET_PIPELINE_FFT) return 0;
+        cfg->core.fft_size != ULCNET_N_FFT) return 0;
     /* Post-only fields are REJECTED, not ignored. AudioPipeline4ChConfig is
      * shared with the standard 4-channel wrapper, so this application's
      * accepted set is deliberately narrower than that struct's: with
@@ -160,7 +155,7 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
      * comparison is right here: these values are copied, never computed. */
     {
         AudioPipeline4ChConfig base =
-            audio_pipeline_4ch_default_config(ULCNET_PIPELINE_SAMPLE_RATE);
+            audio_pipeline_4ch_default_config(ULCNET_SR);
         if (cfg->auto_vad_threshold_dbfs != base.auto_vad_threshold_dbfs) return 0;
         if (cfg->auto_vad_snr_ratio != base.auto_vad_snr_ratio) return 0;
         if (cfg->auto_vad_hangover_frames != base.auto_vad_hangover_frames) return 0;
@@ -220,8 +215,8 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
 
 AudioPipeline4ChConfig audio_pipeline_4ch_ulcnet_default_config(void) {
     AudioPipeline4ChConfig cfg =
-        audio_pipeline_4ch_default_config(ULCNET_PIPELINE_SAMPLE_RATE);
-    cfg.core.fft_size = ULCNET_PIPELINE_FFT;
+        audio_pipeline_4ch_default_config(ULCNET_SR);
+    cfg.core.fft_size = ULCNET_N_FFT;
     /* Align-ULCNet REPLACES the post-beam RES/NR/CNG stage, so the pre-only
      * profile is what this function returns rather than something the wrapper
      * quietly rewrites afterwards. Every post-only core field must keep the
@@ -309,7 +304,10 @@ static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
         "core,srp,gsc,gsc_spectrum,gsc_weights,fft,ifft,ola,synth_win,"
         "beam_hop",
         hash);
-    hash = fnv1a_str("|align16|ulcnet16k512|sharedfft", hash);
+    /* The grid is a build parameter now, so it cannot be spelled into the
+     * token as a literal: stringify the macros instead, or two builds on
+     * different grids would share one descriptor hash. */
+    hash = fnv1a_str("|align|ulcnet" ULCNET_GRID_TOKEN "|sharedfft", hash);
     hash ^= core_build_flags_hash;
     hash *= 16777619u;
     return hash;
@@ -433,10 +431,10 @@ static int derive_pipeline_layout(
     if (!cfg || !cfg_forced || !core_req || !srp_cfg || !gsc_cfg || !hop ||
         !fft || !n_freqs || !srp_bytes || !gsc_bytes || !fft_bytes) return 0;
     if (!validate_config(cfg)) return 0;
-    /* Force the one supported grid before ANY core sizing so the descriptor
-     * and the carve always describe the same (512/256) layout. */
+    /* Force the compiled grid before ANY core sizing so the descriptor and
+     * the carve always describe the same layout. */
     *cfg_forced = *cfg;
-    cfg_forced->core.fft_size = ULCNET_PIPELINE_FFT;
+    cfg_forced->core.fft_size = ULCNET_N_FFT;
     /* enable_post is already 0: validate_config() refuses anything else, so
      * the caller has declared the pre-only profile rather than had it
      * rewritten underneath. Nothing to force here. */
@@ -629,7 +627,7 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
                 2.0f * M_PI_F * (float)k / (float)fft)));
     }
 
-    /* The chain reuses the beamforming handle carved above (same 512 grid;
+    /* The chain reuses the beamforming handle carved above (same compiled grid;
      * strictly sequential use per hop). Reject-first: the inits re-check
      * the handle's bin count against the compiled ULCNet grid. */
     ulcnet_make_window(p->ulcnet_window);
@@ -799,7 +797,7 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
      * too: push the far hop SAVED on the previous call, then save this
      * hop's aligned far source. Without this the model would see
      * error[t-1] paired
-     * with far[t] -- a fixed 256-sample skew. */
+     * with far[t] -- a fixed one-hop skew. */
     n_err_frames = ulcnet_analysis_push(
         &p->err_analysis, p->beam_hop, p->frame_err_re, p->frame_err_im);
     n_far_frames = ulcnet_analysis_push(

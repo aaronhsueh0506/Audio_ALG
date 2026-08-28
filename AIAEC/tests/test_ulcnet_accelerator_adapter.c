@@ -59,12 +59,15 @@ int main(void) {
     size_t alignment;
     UlcnetModelIoDescriptor descriptor;
     UlcnetModelIoDescriptor invalid_descriptor;
-    float error_re[257];
-    float error_im[257];
-    float far_re[257] = {0};
-    float far_im[257] = {0};
-    float output_re[257];
-    float output_im[257];
+    /* Sized from the compiled grid, not from 257: the adapter reads and
+     * writes descriptor->spectrum_bins floats through these, so a fixed
+     * 16 kHz width silently overflows the stack on the 48 kHz build. */
+    float error_re[ULCNET_MODEL_IO_BINS];
+    float error_im[ULCNET_MODEL_IO_BINS];
+    float far_re[ULCNET_MODEL_IO_BINS] = {0};
+    float far_im[ULCNET_MODEL_IO_BINS] = {0};
+    float output_re[ULCNET_MODEL_IO_BINS];
+    float output_im[ULCNET_MODEL_IO_BINS];
     int bin;
 
     if (ulcnet_model_io_descriptor_default(8, &descriptor) != 0 ||
@@ -108,14 +111,14 @@ int main(void) {
         free(pool);
         return 1;
     }
-    for (bin = 0; bin < 257; ++bin) {
+    for (bin = 0; bin < ULCNET_MODEL_IO_BINS; ++bin) {
         error_re[bin] = (float)bin * 0.001f;
         error_im[bin] = (float)-bin * 0.002f;
     }
     if (model.infer(model.user, error_re, error_im, far_re, far_im,
                     output_re, output_im) != 0 || runtime.calls != 1 ||
-        !nearly_equal(error_re, output_re, 257) ||
-        !nearly_equal(error_im, output_im, 257)) {
+        !nearly_equal(error_re, output_re, ULCNET_MODEL_IO_BINS) ||
+        !nearly_equal(error_im, output_im, ULCNET_MODEL_IO_BINS)) {
         free(pool);
         return 1;
     }

@@ -41,7 +41,7 @@
  * the instance struct (part of the `self` carve) rather than stack locals
  * -- multi-KB frame scratch would be unsafe headroom for an embedded RTOS
  * task stack (same rationale as lib/aec's Tier-1 stack-safety fix). The
- * chain's FFT is ONE pool-carved 512-point fft_wrapper handle shared by
+ * chain's FFT is ONE pool-carved compiled-grid fft_wrapper handle shared by
  * err-analysis + far-analysis + synthesis (strictly sequential use within
  * a hop, per ulcnet_process.h's sharing contract), so BACKEND=kiss/ne10
  * genuinely selects the ULCNet FFT backend too.
@@ -83,12 +83,15 @@
  * this counter is the only signal.
  * Version 10: the lib/aec pin moved to the hop-cost revision. sizeof(Aec)
  * grew 5832 -> 5848 B and the AEC pool grew by a per-grid constant (+5,120 B
- * on this wrapper's 16 kHz/512 grid), so the AEC carved out of this pool
+ * on the then-default 16 kHz/512 grid), so the AEC carved out of this pool
  * moves the total and the offsets after it -- and the per-filter step of
  * 5,728 B for delay_num_filters is unchanged, so every n moves by the same
  * constant. Carve order and buffer set are unchanged, so build_flags_hash
- * does not move -- this counter is the only signal. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 10u
+ * does not move -- this counter is the only signal.
+ * Version 11: the ULCNet deployment grid became a build parameter. The
+ * build-flags hash now includes ULCNET_SR and ULCNET_N_FFT, preventing
+ * descriptors from 16 kHz and 48 kHz builds from aliasing. */
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 11u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
  * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"/\"ne10\"
@@ -106,14 +109,16 @@ static uint32_t audio_pipeline_ulcnet_backend_id(void) {
     return 0u;
 }
 
-/* The compiled ULCNet deployment grid is fixed at 16 kHz/512/256:
- * hop = fft/2, bins = fft/2+1. Checked at compile time here and re-checked
- * at runtime against the live AEC instance in ulcnet_pipeline_build(). */
-_Static_assert(ULCNET_N_FFT == 2 * ULCNET_HOP,
-               "ULCNet grid must be 50%-overlap (fft == 2*hop)");
-_Static_assert(ULCNET_BINS == ULCNET_N_FFT / 2 + 1,
-               "ULCNet bins must be fft/2+1");
-_Static_assert(ULCNET_SR == 16000, "ULCNet deployment grid is 16 kHz");
+/* The deployment grid is a build parameter of ulcnet_model_io.h, so this
+ * wrapper follows whichever grid the ULCNet layer was built for rather than
+ * pinning a rate. Asserting hop == fft/2 or bins == fft/2+1 here would
+ * assert nothing: ULCNET_HOP and ULCNET_BINS ARE those expressions, so the
+ * comparison is an identity for every -D. What can actually fail is the FFT
+ * size itself, and ulcnet_model_io.h's own #error rejects a bad pair first;
+ * this repeats the FFT half so a wrapper compiled against a future third
+ * grid stops here rather than sizing its buffers for one it never saw. */
+_Static_assert(ULCNET_N_FFT == 512 || ULCNET_N_FFT == 1024,
+               "ULCNet wrapper supports FFT 512 (16 kHz) or 1024 (48 kHz)");
 
 /* ============================================================================
  * Instance
@@ -138,7 +143,7 @@ struct AudioPipelineUlcnet {
     int reprime_frames;
 
     Aec* aec;                     /* points into `pool` below                */
-    FftHandle* fft;               /* points into `pool`; ONE shared 512-point
+    FftHandle* fft;               /* points into `pool`; ONE shared compiled-grid
                                    * handle for the whole ULCNet chain
                                    * (strictly sequential use per hop)      */
 
@@ -169,12 +174,9 @@ struct AudioPipelineUlcnet {
  * funnels through, mirroring audio_pipeline.c's derive_dims_and_configs)
  * ========================================================================== */
 
-/* Returns 0 and fills every out-param, or -1: NULL cfg; sample_rate != 16000
- * (the ULCNet checkpoint's feature-time contract is compiled at 16 kHz --
- * 8 k/48 k are rejected here, not left to a downstream 0); fft_size neither
- * 0 nor 512 (0 resolves to 512, the ULCNet deployment grid; the conventional
- * 16 kHz rate-default of 256 does NOT apply to this variant -- a 256 grid
- * would not match the compiled ULCNET_* constants); or aec_preset outside
+/* Returns 0 and fills every out-param, or -1: NULL cfg; sample_rate differs
+ * from ULCNET_SR; fft_size is neither 0 nor ULCNET_N_FFT (0 resolves to the
+ * compiled checkpoint grid); or aec_preset lies outside
  * its defined enum values (rather than silently falling through
  * aec_config_from_preset's own balanced-default fallback). The model's
  * callbacks are deliberately NOT validated -- an all-zero model is the
@@ -264,7 +266,7 @@ static int ulcnet_pipeline_build(AudioPipelineUlcnet* p, void* pool, size_t pool
     if (!p->aec) return -1;
     ptr += ALIGN16(aec_sz);
 
-    /* ONE shared 512-point handle for the whole ULCNet chain (err-analysis
+    /* ONE shared compiled-grid handle for the whole ULCNet chain (err-analysis
      * + far-analysis + synthesis) -- their transforms are strictly
      * sequential within a hop, per ulcnet_process.h's sharing contract.
      * Separate from the AEC's own internal FFT instance. */
@@ -313,7 +315,7 @@ static uint32_t audio_pipeline_ulcnet_build_flags_hash(void) {
     h = ulcnet_fnv1a_str("|carve:self(model(io_descriptor),"
                          "aec_delay_cfg,delay_transition,reprime,ana_err,"
                          "ana_far,synth,frame_scratch,ulcnet_window),aec,fft", h);
-    h = ulcnet_fnv1a_str("|align16", h);
+    h = ulcnet_fnv1a_str("|align|ulcnet" ULCNET_GRID_TOKEN, h);
     return h;
 }
 
@@ -335,7 +337,7 @@ AudioPipelineUlcnetConfig audio_pipeline_ulcnet_default_config(int sample_rate) 
     AudioPipelineUlcnetConfig cfg;
     memset(&cfg, 0, sizeof(cfg));       /* all-zero model == identity */
     cfg.sample_rate = sample_rate;
-    cfg.fft_size    = ULCNET_N_FFT;     /* trained grid: frame/FFT 512 */
+    cfg.fft_size    = ULCNET_N_FFT;     /* compiled checkpoint grid */
     cfg.filter_length = 0;
     cfg.delay_mode = AEC_DELAY_MATCHED;
     cfg.delay_num_filters = 5;

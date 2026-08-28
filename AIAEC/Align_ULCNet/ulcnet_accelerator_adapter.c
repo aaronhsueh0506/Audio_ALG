@@ -72,9 +72,9 @@ UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
 }
 
 static int infer(void *user,
-                 const float error_re[257], const float error_im[257],
-                 const float far_re[257], const float far_im[257],
-                 float enhanced_re[257], float enhanced_im[257]) {
+                 const float error_re[ULCNET_MODEL_IO_BINS], const float error_im[ULCNET_MODEL_IO_BINS],
+                 const float far_re[ULCNET_MODEL_IO_BINS], const float far_im[ULCNET_MODEL_IO_BINS],
+                 float enhanced_re[ULCNET_MODEL_IO_BINS], float enhanced_im[ULCNET_MODEL_IO_BINS]) {
     UlcnetAcceleratorAdapter *adapter = (UlcnetAcceleratorAdapter *)user;
     UlcnetModelIoInputs inputs;
     UlcnetModelIoOutputs outputs;

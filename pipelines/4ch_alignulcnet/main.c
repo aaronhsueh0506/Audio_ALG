@@ -183,9 +183,9 @@ int main(int argc, char** argv) {
     size_t adapter_bytes;
     size_t adapter_alignment;
     AudioPipeline4ChUlcnetMemReq req;
-    float microphones[256 * 4] = {0};
-    float far[256] = {0};
-    float output[256];
+    float microphones[ULCNET_HOP * 4] = {0};
+    float far[ULCNET_HOP] = {0};
+    float output[ULCNET_HOP];
     int hop;
     int index;
     int rc;
@@ -250,7 +250,7 @@ int main(int argc, char** argv) {
             free(adapter_pool);
             return 1;
         }
-        for (index = 0; index < 256; ++index) {
+        for (index = 0; index < ULCNET_HOP; ++index) {
             if (!isfinite(output[index])) {
                 audio_pipeline_4ch_ulcnet_destroy(pipeline);
                 free(adapter_pool);

@@ -26,6 +26,22 @@ THIRD_PARTY_DIR ?= ../third_party
 AC_DIR ?= ../../../audio_common
 ULCNET_DIR ?= $(ALG_DIR)/AIAEC/Align_ULCNet
 
+# Align-ULCNet deployment grid, same knob and same values as pipelines/
+# Makefile. One binary serves one grid (the C structs embed the STFT/WOLA
+# tables and scratch), so it is a build parameter. Kept out of EXTRA_CFLAGS
+# on purpose: that is forwarded verbatim to the AEC/NR/audio_common/spatial
+# producer sub-makes, none of which contain ULCNet code, and would split
+# their object caches for nothing. Applied only to the ULCNet TUs below and
+# folded into CFG_SIG_PAYLOAD so the two grids never share an object dir.
+ULCNET_GRID ?= 16k
+ifeq ($(ULCNET_GRID),16k)
+ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=16000 -DULCNET_MODEL_IO_N_FFT=512
+else ifeq ($(ULCNET_GRID),48k)
+ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=48000 -DULCNET_MODEL_IO_N_FFT=1024
+else
+$(error ULCNET_GRID must be 16k or 48k, got '$(ULCNET_GRID)')
+endif
+
 BACKEND = ne10
 SIMD ?= 1
 WERROR = 0
@@ -205,7 +221,7 @@ SRCS := 4aec_nr_res.c audio_pipeline_4ch.c \
         $(ULCNET_DIR)/ulcnet_accelerator_adapter.c \
         ../4ch_alignulcnet/main.c $(ULCNET_DIR)/ulcnet_process.c \
         $(ULCNET_DIR)/ulcnet_model_io.c
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SPATIAL_PRODUCER_SIG=$(SPATIAL_PRODUCER_SIG) SRCS=$(sort $(SRCS))
+CFG_SIG_PAYLOAD := ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SPATIAL_PRODUCER_SIG=$(SPATIAL_PRODUCER_SIG) SRCS=$(sort $(SRCS))
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 OBJ_ROOT ?= obj
@@ -247,19 +263,19 @@ $(OBJ_DIR)/audio_pipeline_4ch.o: audio_pipeline_4ch.c audio_pipeline_4ch.h 4aec_
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/audio_pipeline_4ch_ulcnet.o: ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h audio_pipeline_4ch.h 4aec_nr_res.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_alignulcnet_main.o: ../4ch_alignulcnet/main.c ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/audio_pipeline_4ch_raw.o: audio_pipeline_4ch_raw.c audio_pipeline_4ch.h | _cfg_guard
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
@@ -280,7 +296,7 @@ $(OBJ_DIR)/dump_delay_parity.o: tests/dump_delay_parity.c 4aec_nr_res.h 4aec_nr_
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_audio_pipeline_4ch_ulcnet.o: ../4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h audio_pipeline_4ch.h 4aec_nr_res.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(PIPELINE_LIB): $(PIPELINE_OBJS) | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && \
@@ -436,3 +452,22 @@ clean-all: clean
 	$(MAKE) -C $(AC_DIR) clean
 
 -include $(wildcard $(OBJ_DIR)/*.d)
+
+# ---------------------------------------------------------------------------
+# test-grids: prove BOTH Align-ULCNet deployment grids in one command.
+#
+# `test` only ever exercises whichever grid ULCNET_GRID selects, so a
+# 16 kHz-only CI would never compile or run the 48 kHz build at all. Each
+# grid gets its own object/bin directory (ULCNET_GRID is in CFG_SIG), so the
+# two runs cannot contaminate each other.
+#
+# Defined outside the AC_LIB bootstrap conditionals on purpose: it needs no
+# resolved producer archives of its own, and each recursive `test` bootstraps
+# itself. Adding it to the bootstrap target list instead would resolve the
+# producers once and then hand both grids the same resolved set, which is
+# harmless but pointless work.
+# ---------------------------------------------------------------------------
+.PHONY: test-grids
+test-grids:
+	$(MAKE) ULCNET_GRID=16k test
+	$(MAKE) ULCNET_GRID=48k test

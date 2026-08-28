@@ -62,8 +62,39 @@ extern "C" {
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
 
+/* ---- Deployment grid (build parameter) ----------------------------------
+ * One build serves ONE grid: the analysis/synthesis structs in
+ * ulcnet_process.h carry their buffers by value, so the sizes have to be
+ * compile-time. Override with -DULCNET_MODEL_IO_SR / -DULCNET_MODEL_IO_N_FFT
+ * to build for the other product grid (48000 / 1024).
+ *
+ * Only those TWO are settable. HOP, BINS and TA_BINS are DERIVED, because a
+ * grid whose hop is not N_FFT/2 or whose bin count is not N_FFT/2+1 is not a
+ * grid this model has -- letting them be set independently would make an
+ * inconsistent combination expressible, and it would compile.
+ *
+ * TA_BINS is the temporal-attention K/V feature width. It is NOT a fixed
+ * model constant: the C-SamFR reorientation widens to ceil(BINS/(gamma*
+ * subband_bins))*subband_bins and the encoder's (1,2) ceil-mode pool halves
+ * it, which for the (gamma, subband_bins) = (5, 2) pair the exporter enforces
+ * is exactly ceil(BINS/10). 26 at 16 kHz, 52 at 48 kHz. The exporter derives
+ * the same number from the model itself (ta_bins_for) and
+ * test_c_descriptor_constants_match_export_contract pins the two together. */
+#ifndef ULCNET_MODEL_IO_SR
+#define ULCNET_MODEL_IO_SR             16000
+#endif
+#ifndef ULCNET_MODEL_IO_N_FFT
+#define ULCNET_MODEL_IO_N_FFT          512
+#endif
+#if !((ULCNET_MODEL_IO_SR == 16000 && ULCNET_MODEL_IO_N_FFT == 512) || \
+      (ULCNET_MODEL_IO_SR == 48000 && ULCNET_MODEL_IO_N_FFT == 1024))
+#error "Align-ULCNet supports only 16000/512 or 48000/1024"
+#endif
+#define ULCNET_MODEL_IO_HOP            (ULCNET_MODEL_IO_N_FFT / 2)
+#define ULCNET_MODEL_IO_BINS           (ULCNET_MODEL_IO_N_FFT / 2 + 1)
+#define ULCNET_MODEL_IO_TA_BINS        ((ULCNET_MODEL_IO_BINS + 9) / 10)
+
 #define ULCNET_MODEL_IO_TA_CHANNELS    32
-#define ULCNET_MODEL_IO_TA_BINS        26
 #define ULCNET_MODEL_IO_SCORE_HISTORY  4
 #define ULCNET_MODEL_IO_GRU_LAYERS     2
 #define ULCNET_MODEL_IO_GRU_HIDDEN     128
@@ -113,7 +144,7 @@ typedef struct UlcnetModelIoMemReq {
 
 /* Shapes use row-major ONNX order with the batch/time singleton dimensions
  * omitted from the pointer type:
- *   key/value history [1,32,D-1,26], newest frame first;
+ *   key/value history [1,32,D-1,TA_BINS], newest frame first;
  *   logit history     [1,32,4,D], oldest frame first;
  *   GRU hidden        [1,2,1,128].
  * Those are the GRAPH shapes; the pointers below stay flat, and the
@@ -121,8 +152,8 @@ typedef struct UlcnetModelIoMemReq {
  */
 typedef struct UlcnetModelIoInputs {
     /* The five feature tensors prepare() computes from the raw spectra
-     * (model layout v5): magnitudes/cos/sin are [1,1,257] and error_ri is
-     * the COMPRESSED [1,1,257,2]. */
+     * (model layout v5): magnitudes/cos/sin are [1,1,BINS] and error_ri is
+     * the COMPRESSED [1,1,BINS,2]. */
     const float *error_mag;
     const float *far_mag;
     const float *error_cos;
@@ -142,7 +173,7 @@ typedef struct UlcnetModelIoInputs {
 } UlcnetModelIoInputs;
 
 /* Accelerator-writable delta-state outputs:
- *   key/value now [1,32,1,26];
+ *   key/value now [1,32,1,TA_BINS];
  *   logit now     [1,32,1,D];
  *   GRU next      [1,2,1,128].
  * prepare() fills every element with NaN so commit() detects partial writes.
@@ -163,7 +194,7 @@ typedef struct UlcnetModelIoOutputs {
 
 typedef struct UlcnetModelIoState UlcnetModelIoState;
 
-/* Fill the fixed 16 kHz / 512 / 256 model ABI for the selected export-time D.
+/* Fill the compiled deployment-grid model ABI for the selected export-time D.
  * The deployed far branch is always ULCNET_FAR_ALIGNED.
  * Returns 0 on success, -1 for an unsupported D or NULL output. */
 int ulcnet_model_io_descriptor_default(int delay_depth,
@@ -213,10 +244,10 @@ void ulcnet_model_io_reset(UlcnetModelIoState *state);
  * before every inference. commit() applies the matching inverse signed
  * power to the graph's compressed estimate. */
 int ulcnet_model_io_prepare(UlcnetModelIoState *state,
-                            const float error_re[257],
-                            const float error_im[257],
-                            const float far_re[257],
-                            const float far_im[257],
+                            const float error_re[ULCNET_MODEL_IO_BINS],
+                            const float error_im[ULCNET_MODEL_IO_BINS],
+                            const float far_re[ULCNET_MODEL_IO_BINS],
+                            const float far_im[ULCNET_MODEL_IO_BINS],
                             UlcnetModelIoInputs *inputs,
                             UlcnetModelIoOutputs *outputs);
 
@@ -227,8 +258,8 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
  * persistent model state and caller outputs remain unchanged, the transaction
  * is discarded, and -1 is returned. */
 int ulcnet_model_io_commit(UlcnetModelIoState *state,
-                           float enhanced_re[257],
-                           float enhanced_im[257]);
+                           float enhanced_re[ULCNET_MODEL_IO_BINS],
+                           float enhanced_im[ULCNET_MODEL_IO_BINS]);
 
 const UlcnetModelIoDescriptor *ulcnet_model_io_descriptor(
     const UlcnetModelIoState *state);

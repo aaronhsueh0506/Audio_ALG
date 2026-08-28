@@ -29,7 +29,7 @@ void ulcnet_make_window(float window[ULCNET_N_FFT]) {
     }
 }
 
-/* ---- forward rFFT of one windowed 512-sample segment ----
+/* ---- forward rFFT of one windowed ULCNET_N_FFT-sample segment ----
  * Stages the windowed copy in st->seg (struct-owned scratch; clobber
  * permitted, so fft_forward_scratch may skip any backend defensive copy).
  * `segment` may alias st->seg itself: the windowing loop is a same-index
@@ -53,7 +53,7 @@ static void ulcnet_rfft(UlcnetAnalysis *st, const float *segment,
 int ulcnet_analysis_init(UlcnetAnalysis *st, FftHandle *fft,
                          const float *window) {
     if (!st || !fft || !window) return -1;
-    /* Reject-first: the handle must be the compiled 512 grid -- a wrong
+    /* Reject-first: the handle must match the compiled deployment grid -- a wrong
      * size would silently break the checkpoint's feature-time contract. */
     if (fft_get_n_freqs(fft) != ULCNET_BINS) return -1;
     memset(st, 0, sizeof(*st));
@@ -75,24 +75,24 @@ int ulcnet_analysis_push(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
      * unbounded streams. */
     if (st->hops_seen < 3) st->hops_seen++;
 
-    if (st->hops_seen == 1) return 0;   /* frame 0 needs sample index 256 */
+    if (st->hops_seen == 1) return 0;   /* frame 0 needs sample index HOP */
 
     if (st->hops_seen == 2) {
-        /* history == x[0..511]. Frame 0 covers the reflect prefix
-         * (x[256..1], i.e. x[1..256] reversed) followed by x[0..255].
+        /* history == x[0..N_FFT-1]. Frame 0 covers the reflect prefix
+         * (x[HOP..1], i.e. x[1..HOP] reversed) followed by x[0..HOP-1].
          * Built directly in st->seg (allowed to alias ulcnet_rfft's
          * windowing input -- see that function's comment). */
         int i;
         for (i = 0; i < ULCNET_HOP; ++i)
-            st->seg[i] = st->history[ULCNET_HOP - i];  /* x[256-i], i=0..255 */
+            st->seg[i] = st->history[ULCNET_HOP - i];  /* x[HOP-i] */
         memcpy(st->seg + ULCNET_HOP, st->history,
-               (size_t)ULCNET_HOP * sizeof(float));    /* x[0..255] */
+               (size_t)ULCNET_HOP * sizeof(float));    /* x[0..HOP-1] */
         ulcnet_rfft(st, st->seg, out_re[0], out_im[0]);
         ulcnet_rfft(st, st->history, out_re[1], out_im[1]);
         return 2;
     }
 
-    /* Steady state: frame k = window over the last 512 raw samples,
+    /* Steady state: frame k = window over the last N_FFT raw samples,
      * centred on hop grid point k*HOP. */
     ulcnet_rfft(st, st->history, out_re[0], out_im[0]);
     return 1;

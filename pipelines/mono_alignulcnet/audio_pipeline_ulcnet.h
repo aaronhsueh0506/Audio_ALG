@@ -18,12 +18,13 @@
  *     ...per hop: audio_pipeline_ulcnet_process(p, mic, ref, out);
  *     audio_pipeline_ulcnet_destroy(p);          // never frees the caller's pool
  *
- * Signal grid (compile-time fixed by the ULCNET_* constants): 16 kHz only,
- * FFT 512 / hop 256 / 257 bins. Validation rejects any other sample rate
- * (8 k/48 k included) and any fft_size other than 0 (resolve to 512) or 512.
+ * Signal grid is compile-time fixed by the ULCNET_* constants. Supported
+ * builds are 16 kHz / FFT 512 / hop 256 / 257 bins and 48 kHz / FFT 1024 /
+ * hop 512 / 513 bins. Validation accepts only the grid compiled into this
+ * binary; one binary never switches grids at run time.
  *
- * Latency: end-to-end algorithmic latency is exactly ONE hop (256 samples,
- * 16 ms). hop #0 emits nothing (this pipeline writes zeros); the output of
+ * Latency: end-to-end algorithmic latency is exactly ONE compiled-grid hop.
+ * hop #0 emits nothing (this pipeline writes zeros); the output of
  * hop #p (p >= 1) corresponds to input hop p-1.
  *
  * ── Far-input deployment contract ─────────────────────────────────────────
@@ -57,7 +58,7 @@
  * ── Identity reprime across an alignment boundary (option A) ─────────────
  *  A generation change flushes the runtime's recurrent state, but the C
  *  STFT states keep running: the analysis windows already in flight still
- *  STRADDLE the boundary -- their 512-sample spans cover one hop pushed
+ *  STRADDLE the boundary -- their two-hop spans cover one hop pushed
  *  before the switch and one pushed after, on the error branch, the far
  *  branch, or both. Stepping the model on such a frame would rebuild, from
  *  a half-stale error/far pair, exactly the recurrent state the reset just
@@ -76,7 +77,7 @@
  *  tests/test_audio_pipeline_ulcnet.c, never assumed here): this wrapper
  *  pushes both branches from the CURRENT hop -- the error tap
  *  (AecResContext.formed_hop) and the aligned-far tap are same-hop, no
- *  wrapper-side far compensation exists -- and the centered 512/256 analysis
+ *  wrapper-side far compensation exists -- and the centered 50%-overlap analysis
  *  spans exactly two pushed hops. A boundary at hop T therefore leaves
  *  exactly ONE emitted frame straddling (the frame emitted at hop T, whose
  *  window covers the pre-switch hop T-1 and the post-switch hop T); the
@@ -117,7 +118,7 @@ extern "C" {
  * (see the "Identity reprime" section of this header's preamble).
  *
  * = 1: both branches are pushed from the CURRENT hop and the centered
- * 512/256 analysis spans two pushed hops, so a boundary at hop T leaves the
+ * centered 50%-overlap analysis spans two pushed hops, so a boundary at hop T leaves the
  * single frame emitted at hop T straddling. Derived and asserted branch by
  * branch by the straddle-derivation test; do not edit this value without
  * re-running it.
@@ -144,7 +145,7 @@ enum { AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES = 1 };
  * diagnostics, but must re-query before initialization after any build or
  * configuration change. layout_version and build_flags_hash describe THIS
  * wrapper's carve structure (self control block first, then the AEC pool,
- * then the ULCNet chain's shared 512-point FFT handle; the Ulcnet
+ * then the ULCNet chain's shared compiled-grid FFT handle; the Ulcnet
  * analysis/synthesis/frame-scratch state and the shared sqrt-Hann window
  * table live INSIDE the self block -- see the token string in
  * audio_pipeline_ulcnet.c); dependency-internal layouts are reflected in
@@ -191,8 +192,8 @@ _Static_assert(offsetof(AudioPipelineUlcnetMemReq, bytes) == 24,
  * they point at.
  */
 typedef struct {
-    int         sample_rate;  /* must be 16000 (the compiled ULCNet grid)     */
-    int         fft_size;     /* 0 (resolve to 512) or 512; others rejected   */
+    int         sample_rate;  /* must equal ULCNET_SR                         */
+    int         fft_size;     /* 0 (resolve) or ULCNET_N_FFT                  */
     int         filter_length; /* 0=rate default; PBFDKF taps                  */
     AecDelayMode delay_mode;   /* AEC far alignment policy                     */
     int         delay_num_filters;   /* MATCHED bank size [1,5]                 */
@@ -201,9 +202,9 @@ typedef struct {
     UlcnetModel model;        /* NPU callback boundary; may be all-zero       */
 } AudioPipelineUlcnetConfig;
 
-/** Defaults: the trained ULCNet grid (16 kHz, frame/FFT 512, hop 256),
+/** Defaults: the compiled ULCNet checkpoint grid,
  * balanced preset and all-zero model (identity). sample_rate is stored as
- * passed and validated at query/init time (only 16000 passes). */
+ * passed and validated at query/init time (only ULCNET_SR passes). */
 AudioPipelineUlcnetConfig audio_pipeline_ulcnet_default_config(int sample_rate);
 
 /* ============================================================================
@@ -218,8 +219,8 @@ typedef struct AudioPipelineUlcnet AudioPipelineUlcnet;
 
 /**
  * Query the memory descriptor for `cfg` WITHOUT touching any audio state.
- * Reject-first validation up front: sample_rate must be 16000, fft_size must
- * be 0 or 512, aec_preset must be a defined enum value; then the derived
+ * Reject-first validation up front: sample_rate must be ULCNET_SR, fft_size
+ * must be 0 or ULCNET_N_FFT, aec_preset must be a defined enum value; then the derived
  * AecConfig must pass lib/aec's own aec_get_mem_size() validator. Model
  * callbacks may be NULL (an all-zero model is legal); when io_descriptor is
  * non-NULL it must match the fixed aligned-far model ABI.
@@ -257,7 +258,7 @@ AudioPipelineUlcnet* audio_pipeline_ulcnet_init_ex(void* mem, size_t bytes,
                                                    const AudioPipelineUlcnetMemReq* expected);
 
 /**
- * Process exactly one hop (audio_pipeline_ulcnet_hop_size(p) == 256 samples)
+ * Process exactly one hop (audio_pipeline_ulcnet_hop_size(p) == ULCNET_HOP)
  * of mic/ref into `out`: AEC(linear, context-only) -> error tap
  * (AecResContext.formed_hop) + AecLinearContext.aligned_far_hop -> two
  * centered-STFT analyses -> per emitted frame,
@@ -313,7 +314,7 @@ AudioPipelineUlcnet* audio_pipeline_ulcnet_create(const AudioPipelineUlcnetConfi
  * Accessors
  * ========================================================================== */
 
-int audio_pipeline_ulcnet_hop_size(const AudioPipelineUlcnet* p);  /* 256, or -1 if p is NULL */
+int audio_pipeline_ulcnet_hop_size(const AudioPipelineUlcnet* p);  /* ULCNET_HOP, or -1 */
 
 /**
  * Read-only access to the underlying AEC handle for a caller's OWN

@@ -82,6 +82,11 @@ static const UlcnetModelIoDescriptor* test_io_descriptor(void) {
 }
 
 
+/* DelayAec3 searches a 16 kHz-equivalent sidechain and scales the selected
+ * delay back to native samples. Echo-delay stimuli therefore scale by
+ * exactly three on the 48 kHz product grid. */
+#define DELAY_RATE_FACTOR (ULCNET_SR / 16000)
+
 #define CHECK(condition, message)                                      \
     do {                                                               \
         if (!(condition)) {                                            \
@@ -153,8 +158,9 @@ static int test_identity_e2e(void) {
     float max_preamble = 0.0f;
     int hop;
 
-    CHECK(cfg.core.sample_rate == 16000 && cfg.core.fft_size == 512,
-          "default config is the trained 16 kHz / frame-FFT 512 / hop 256 grid");
+    CHECK(cfg.core.sample_rate == ULCNET_SR &&
+          cfg.core.fft_size == ULCNET_N_FFT,
+          "default config matches the compiled ULCNet deployment grid");
     cfg.gsc_fixed_mode = 1;
     cfg.gsc_fixed_doa_rad = 0.4f;
     cfg.gsc_mu = 0.02f;
@@ -167,7 +173,7 @@ static int test_identity_e2e(void) {
     CHECK(audio_pipeline_4ch_ulcnet_fft_size(p) == ULCNET_N_FFT &&
           audio_pipeline_4ch_ulcnet_n_freqs(p) == ULCNET_BINS &&
           audio_pipeline_4ch_ulcnet_sample_rate(p) == ULCNET_SR,
-          "grid pinned to 16 kHz / 512 / 257");
+          "runtime dimensions match the compiled ULCNet deployment grid");
 
     microphones = (float*)malloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
@@ -519,8 +525,16 @@ static int test_fixed_first_alignment_resets_model(void) {
  *     inside hop 1 under a per-sample rule and go red here.
  * ========================================================================== */
 
+/* This case exercises the 4ch CORE's FIXED seam, so it pins the core's own
+ * 16 kHz / FFT 512 grid rather than the compiled ULCNet grid. Delays handed
+ * to it must therefore be expressed in FIXED_SEAM_HOP, not in ULCNET_HOP:
+ * the switch hop is ceil(fixed / FIXED_SEAM_HOP). */
+#define FIXED_SEAM_SR   16000
+#define FIXED_SEAM_FFT  512
+#define FIXED_SEAM_HOP  (FIXED_SEAM_FFT / 2)
+
 static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) {
-    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(FIXED_SEAM_SR);
     FourAecNrRes* core;
     FourAecNrResPreFrame pre;
     float* microphones;
@@ -534,7 +548,7 @@ static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) 
     int changed = 0;
     char label[192];
 
-    cfg.fft_size = 512;
+    cfg.fft_size = FIXED_SEAM_FFT;
     cfg.enable_cng = 0;
     cfg.delay_mode = AEC_DELAY_FIXED;
     cfg.fixed_delay_samples = fixed_delay;
@@ -619,7 +633,7 @@ static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) 
 static int test_fixed_prelock_seam_is_raw_far(void) {
     g_rng = 0x5EED01u;
     /* 8 hops of warm-up: the plain multiple-of-hop case. */
-    CHECK(fixed_seam_case(8 * ULCNET_HOP, 12, 8), "fixed=8 hops");
+    CHECK(fixed_seam_case(8 * FIXED_SEAM_HOP, 12, 8), "fixed=8 hops");
     /* Not a multiple of the hop: a per-sample rule would splice raw and
      * shifted audio inside hop 1. */
     CHECK(fixed_seam_case(320, 8, 2), "fixed=320 samples");
@@ -660,7 +674,8 @@ static int test_fixed_prelock_seam_is_raw_far(void) {
  * ========================================================================== */
 
 static int test_relock_same_delay_resets_model(void) {
-    enum { WARM_FRAMES = 60, RELOCK_FRAMES = 60, TRUE_DELAY = 64 };
+    enum { WARM_FRAMES = 60, RELOCK_FRAMES = 60 };
+    const int true_delay = 64 * DELAY_RATE_FACTOR;
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* p;
     CountingModel m;
@@ -726,7 +741,7 @@ static int test_relock_same_delay_resets_model(void) {
             reset_at_pipeline_reset = m.reset_calls;
         }
 
-        fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
+        fill_echo_hop(frame, hop, true_delay, far_hist, far, microphones);
         reset_before_hop = m.reset_calls;
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
@@ -767,10 +782,11 @@ static int test_relock_same_delay_resets_model(void) {
                     snprintf(why, sizeof why,
                              "phase A locks within one grid step of the true "
                              "delay (applied %d, true %d)",
-                             acquired_delay, (int)TRUE_DELAY);
+                             acquired_delay, true_delay);
                     CHECK(acquired_delay >= 0 &&
-                          acquired_delay <= (int)TRUE_DELAY &&
-                          (int)TRUE_DELAY - acquired_delay <= 64, why);
+                          acquired_delay <= true_delay &&
+                          true_delay - acquired_delay <=
+                              64 * DELAY_RATE_FACTOR, why);
                 }
                 CHECK(delay.changed,
                       "acquisition hop reports a new alignment generation");
@@ -1040,7 +1056,7 @@ static int test_pool_and_descriptor_gate(void) {
           "init_ex rejects a descriptor from the superseded layout even "
           "when its byte count exactly covers the current pool");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION &&
-          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 14u,
+          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 15u,
           "the queried descriptor publishes the current carve layout");
 
     stat = audio_pipeline_4ch_ulcnet_init_ex(
@@ -1648,7 +1664,7 @@ static int test_partial_write_guard(void) {
  *
  * Measures the quantity the reprime constant is supposed to be: how many
  * frames emitted at or after an alignment boundary at hop T still have a
- * PRE-boundary hop inside their 512-sample analysis window, on the error
+ * PRE-boundary hop inside their two-hop analysis window, on the error
  * branch and on the far branch separately.
  *
  * Instrument: total silence except ONE unit impulse at the MIDDLE of input
@@ -1803,7 +1819,20 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
 
 /* Frames emitted at hops [RP_T, RP_T+RP_WINDOW) that still carry the marker,
  * plus the classification margin (smallest marked peak / largest unmarked
- * peak inside that window). */
+ * peak inside that window).
+ *
+ * Measured on the boundary-free control, so this is the chain's MEMORY of
+ * content injected before hop RP_T, not a straddle count. Per branch:
+ *   far   -- the marker reaches the analysis untouched, so the memory is
+ *            exactly the beam/far lag plus the centered 50%-overlap window
+ *            straddle. This is the derivation of REPRIME_FRAMES.
+ *   error -- the marker passes the AEC linear filter first, so the memory is
+ *            the straddle PLUS the filter's causal tail. Waiting that tail
+ *            out is not what the reprime is for and has no principled bound,
+ *            so this branch can only bound the straddle from above.
+ * The tail is why the branches agree at 16 kHz and differ at 48 kHz:
+ * filter_length is 52 ms (3.25 hops) at 16 kHz but 64 ms (6.00 hops) at
+ * 48 kHz, while the straddle stays at two hops on both. */
 static int reprime_straddle_count(const ProbeModel* st, int far_branch,
                                   float* dirty_min, float* clean_max) {
     int n = 0;
@@ -1854,10 +1883,15 @@ static int test_reprime_straddle_derivation(void) {
     printf("reprime derivation (4ch, ERROR branch): %d straddling frames at hops "
            "%d..%d; marked peak >= %.4f, unmarked peak <= %.3e\n",
            straddle_err, RP_T, RP_T + RP_WINDOW - 1, (double)dmin, (double)cmax);
-    CHECK(straddle_err == AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
-          "4ch ERROR branch: the emitted frames that still contain pre-switch "
-          "samples number exactly AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES");
-    CHECK(straddle_err > 0 && dmin > 20.0f * cmax && dmin > 0.2f,
+    CHECK(straddle_err >= AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
+          "4ch ERROR branch: chain memory is at least "
+          "AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES -- it carries the AEC "
+          "filter tail on top of the straddle, so it bounds rather than "
+          "derives it");
+    /* No absolute floor on dmin: the impulse arrives spread by the AEC
+     * filter, so its peak is grid-dependent. The separation ratio is what
+     * makes the classification sound. */
+    CHECK(straddle_err > 0 && dmin > 20.0f * cmax,
           "4ch ERROR branch marker is unambiguous (marked peak far above the "
           "unmarked residue)");
 
@@ -1901,13 +1935,15 @@ static int test_reprime_straddle_derivation(void) {
            first_visible_err, (double)first_visible_err_peak,
            (double)first_visible_far_peak, (double)RP_FLOOR);
     /* The primary claim, checked before the bookkeeping so a mutation cannot
-     * be masked by a count assertion firing first. */
-    CHECK(first_visible_err_peak >= 0.0f &&
-          first_visible_err_peak <= RP_FLOOR &&
-          first_visible_far_peak >= 0.0f &&
+     * be masked by a count assertion firing first. Only the far branch can
+     * carry it: the error branch's first visible frame legitimately holds
+     * AEC filter tail, which is filtered echo of pre-switch content rather
+     * than a pre-switch SAMPLE, and no reprime length removes it. */
+    CHECK(first_visible_far_peak >= 0.0f &&
           first_visible_far_peak <= RP_FLOOR,
           "the first model-visible frame after the reprime contains NO "
-          "pre-switch sample on either branch");
+          "pre-switch sample on the far branch (the error branch's residue "
+          "is AEC filter tail, not a straddling sample)");
     CHECK(stepped_inside_reprime == 0,
           "boundary run: the model is not stepped on any reprime hop");
     CHECK(first_visible_err ==
@@ -2176,20 +2212,27 @@ static int test_aligned_descriptor_gate(void) {
  * ========================================================================== */
 
 static int run_all_tests(void) {
-    /* Grid gate: this wrapper is 16 kHz / 512 only. */
+    /* Grid gate. Both rejected values below are legal on the OTHER supported
+     * grid, so they prove the gate reads the compiled grid rather than merely
+     * rejecting nonsense. */
     {
+        const int foreign_sr = ULCNET_OTHER_SR;
+        const int foreign_fft = ULCNET_OTHER_N_FFT;
+        char label[128];
         AudioPipeline4ChConfig invalid =
-            audio_pipeline_4ch_default_config(48000);
+            audio_pipeline_4ch_default_config(foreign_sr);
         AudioPipeline4ChUlcnetMemReq req;
+        snprintf(label, sizeof label, "%d Hz config is rejected", foreign_sr);
         CHECK(audio_pipeline_4ch_ulcnet_get_mem_requirements(
-                  &invalid, &req) != 0,
-              "48 kHz config is rejected");
-        CHECK(audio_pipeline_4ch_ulcnet_create(&invalid) == NULL,
-              "48 kHz create is rejected");
+                  &invalid, &req) != 0, label);
+        snprintf(label, sizeof label, "%d Hz create is rejected", foreign_sr);
+        CHECK(audio_pipeline_4ch_ulcnet_create(&invalid) == NULL, label);
         invalid = audio_pipeline_4ch_ulcnet_default_config();
-        invalid.core.fft_size = 256;
-        CHECK(audio_pipeline_4ch_ulcnet_create(&invalid) == NULL,
-              "core fft 256 is rejected (ULCNet grid is 512/256)");
+        invalid.core.fft_size = foreign_fft;
+        snprintf(label, sizeof label,
+                 "core fft %d is rejected (ULCNet grid is %d/%d)",
+                 foreign_fft, ULCNET_N_FFT, ULCNET_HOP);
+        CHECK(audio_pipeline_4ch_ulcnet_create(&invalid) == NULL, label);
         /* The pre-only contract: every post-only field must keep the value
          * the default config returns, and is REJECTED otherwise. With
          * enable_post = 0 the core builds no denoiser, no suppressor, no
@@ -2231,8 +2274,11 @@ static int run_all_tests(void) {
             AudioPipeline4ChUlcnet* forced =
                 audio_pipeline_4ch_ulcnet_create(&invalid);
             CHECK(forced != NULL, "core fft 0 is accepted");
-            CHECK(audio_pipeline_4ch_ulcnet_fft_size(forced) == 512,
-                  "core fft 0 is forced to 512, not the core's 256 default");
+            snprintf(label, sizeof label,
+                     "core fft 0 is forced to %d, not the core's own default",
+                     ULCNET_N_FFT);
+            CHECK(audio_pipeline_4ch_ulcnet_fft_size(forced) == ULCNET_N_FFT,
+                  label);
             audio_pipeline_4ch_ulcnet_destroy(forced);
         }
     }
@@ -2258,6 +2304,10 @@ static int run_all_tests(void) {
           "NaN guard: non-finite model output never reaches the WOLA");
     CHECK(test_partial_write_guard(),
           "full-write contract: partial rc==0 frames are discarded");
+    /* Runs on every grid. The far branch derives REPRIME_FRAMES exactly; the
+     * error branch only bounds it, because its marker arrives through the AEC
+     * filter and carries a causal tail that no reprime length can remove.
+     * See reprime_straddle_count's comment. */
     CHECK(test_reprime_straddle_derivation(),
           "identity-reprime length derived from the straddling frames");
     CHECK(test_reprime_behavior(),

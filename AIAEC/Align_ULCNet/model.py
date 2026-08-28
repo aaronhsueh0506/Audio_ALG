@@ -44,9 +44,10 @@ def _component_power_spectrum(spec: Tensor, exponent: float) -> Tuple[Tensor, Te
 class ChannelSampledReorientation(nn.Module):
     """Paper C-SamFR: sample *subbands*, then frequency-stack each set.
 
-    With ``K=257, K_B=2, gamma=5`` the input is padded to 130 two-bin
-    subbands.  Channel 0 is ``[bands 0,5,10,...]`` (each band remains two
-    contiguous bins), not ``[bins 0,5,10,...]``.
+    On the 16 kHz grid, ``K=257, K_B=2, gamma=5`` pads the input to 130
+    two-bin subbands.  Channel 0 is ``[bands 0,5,10,...]`` (each band remains
+    two contiguous bins), not ``[bins 0,5,10,...]``.  The same formula is
+    applied to the 48 kHz grid's 513 bins; none of these widths is hard-coded.
     """
 
     def __init__(self, n_freqs: int, gamma: int = 5,
@@ -184,9 +185,14 @@ class AlignULCNet(nn.Module):
         self.joint2 = JointConvBlock(64, 96)
         self.fgru = FrequencyGRU(96)
 
+        # The encoder's own output width, and the width of every K/V entry
+        # the alignment attention caches. Named because the export and the C
+        # descriptor both need it: recomputing it there would be a second
+        # copy of this halving with nothing tying the two together.
+        self.encoded_width = math.ceil(self.reorient.width / 2)
+
         # Width after pool / two stride-2 joint convolutions.
-        width = math.ceil(self.reorient.width / 2)
-        width = math.ceil(width / 2)
+        width = math.ceil(self.encoded_width / 2)
         width = math.ceil(width / 2)
         split = (math.ceil(width / 2), width // 2)
         if split[1] == 0:

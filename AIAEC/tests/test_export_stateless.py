@@ -190,9 +190,10 @@ def test_calibration_deployment_mode_equals_the_ulcnet_exporter_literal():
             AlignUlcnetStreamingExport,
             dummy_inputs,
         )
-        inputs = dummy_inputs(2)
+        wrapper = AlignUlcnetStreamingExport(model).eval()
+        inputs = dummy_inputs(2, wrapper.n_freqs, wrapper.ta_bins)
         with torch.no_grad():
-            outputs = AlignUlcnetStreamingExport(model).eval()(*inputs)
+            outputs = wrapper(*inputs)
         metadata = _write_metadata(
             os.path.join(work, 'model.onnx'), checkpoint, model,
             {'far_input_mode': 'raw_far'}, inputs, outputs,

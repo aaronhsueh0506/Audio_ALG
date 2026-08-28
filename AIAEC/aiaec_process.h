@@ -17,10 +17,22 @@
 extern "C" {
 #endif
 
-#define AIAEC_SR       ULCNET_SR
-#define AIAEC_N_FFT    ULCNET_N_FFT
-#define AIAEC_HOP      ULCNET_HOP
-#define AIAEC_N_BINS   ULCNET_BINS
+/* Held here, NOT aliased from ULCNET_*. Align-ULCNet's grid is a build
+ * parameter (ulcnet_model_io.h) so it can be pointed at the 48 kHz product
+ * grid; the other three models have no such build and their framing must not
+ * move because someone rebuilt Align-ULCNet. These four are this boundary's
+ * own contract. */
+#define AIAEC_SR       16000
+#define AIAEC_N_FFT    512
+#define AIAEC_HOP      (AIAEC_N_FFT / 2)
+#define AIAEC_N_BINS   (AIAEC_N_FFT / 2 + 1)
+
+/* The typedefs below alias Align-ULCNet's structs, whose buffers are sized by
+ * ITS grid, so this boundary is only meaningful while the two agree. A build
+ * that moved Align-ULCNet off 16 kHz must not silently reinterpret these. */
+#if ULCNET_SR != AIAEC_SR || ULCNET_N_FFT != AIAEC_N_FFT
+#error "aiaec_process.h is a 16 kHz boundary; it cannot alias a non-16 kHz Align-ULCNet build"
+#endif
 
 typedef UlcnetAnalysis AiaecAnalysis;
 typedef UlcnetSynthesis AiaecSynthesis;

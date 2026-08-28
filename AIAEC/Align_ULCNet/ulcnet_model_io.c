@@ -150,10 +150,10 @@ int ulcnet_model_io_descriptor_default(int delay_depth,
     }
     descriptor->layout_version = ULCNET_MODEL_IO_LAYOUT_VERSION;
     descriptor->delay_depth = delay_depth;
-    descriptor->sample_rate = 16000;
-    descriptor->fft_size = 512;
-    descriptor->hop_size = 256;
-    descriptor->spectrum_bins = 257;
+    descriptor->sample_rate = ULCNET_MODEL_IO_SR;
+    descriptor->fft_size = ULCNET_MODEL_IO_N_FFT;
+    descriptor->hop_size = ULCNET_MODEL_IO_HOP;
+    descriptor->spectrum_bins = ULCNET_MODEL_IO_BINS;
     descriptor->ta_channels = ULCNET_MODEL_IO_TA_CHANNELS;
     descriptor->ta_bins = ULCNET_MODEL_IO_TA_BINS;
     descriptor->score_history_frames = ULCNET_MODEL_IO_SCORE_HISTORY;
@@ -181,8 +181,10 @@ int ulcnet_model_io_descriptor_validate(
         descriptor->layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION ||
         descriptor->delay_depth < ULCNET_MODEL_IO_MIN_D ||
         descriptor->delay_depth > ULCNET_MODEL_IO_MAX_D ||
-        descriptor->sample_rate != 16000 || descriptor->fft_size != 512 ||
-        descriptor->hop_size != 256 || descriptor->spectrum_bins != 257 ||
+        descriptor->sample_rate != ULCNET_MODEL_IO_SR ||
+        descriptor->fft_size != ULCNET_MODEL_IO_N_FFT ||
+        descriptor->hop_size != ULCNET_MODEL_IO_HOP ||
+        descriptor->spectrum_bins != ULCNET_MODEL_IO_BINS ||
         descriptor->ta_channels != ULCNET_MODEL_IO_TA_CHANNELS ||
         descriptor->ta_bins != ULCNET_MODEL_IO_TA_BINS ||
         descriptor->score_history_frames != ULCNET_MODEL_IO_SCORE_HISTORY ||
@@ -330,10 +332,10 @@ static void fill_nan(float *values, size_t elements) {
 }
 
 int ulcnet_model_io_prepare(UlcnetModelIoState *state,
-                            const float error_re[257],
-                            const float error_im[257],
-                            const float far_re[257],
-                            const float far_im[257],
+                            const float error_re[ULCNET_MODEL_IO_BINS],
+                            const float error_im[ULCNET_MODEL_IO_BINS],
+                            const float far_re[ULCNET_MODEL_IO_BINS],
+                            const float far_im[ULCNET_MODEL_IO_BINS],
                             UlcnetModelIoInputs *inputs,
                             UlcnetModelIoOutputs *outputs) {
     int bin;
@@ -453,8 +455,8 @@ static void update_logit_history(float *history, const float *current,
 }
 
 int ulcnet_model_io_commit(UlcnetModelIoState *state,
-                           float enhanced_re[257],
-                           float enhanced_im[257]) {
+                           float enhanced_re[ULCNET_MODEL_IO_BINS],
+                           float enhanced_im[ULCNET_MODEL_IO_BINS]) {
     const UlcnetModelIoDescriptor *descriptor;
     float *temporary;
     int bin;

@@ -2,7 +2,7 @@
  * audio_pipeline_4ch_ulcnet.h — four-channel spatial pipeline with the
  * Align-ULCNet neural post-filter as its post stage.
  *
- * Architecture per hop (hop = 256 samples @ 16 kHz, fixed):
+ * Architecture per hop (compile-time ULCNET_HOP samples):
  *
  *   4x linear AEC lanes + one shared far aligner (FourAecNrRes process_pre)
  *     -> SRP-PHAT DOA -> GSC effective weights (existing spatial libraries)
@@ -16,8 +16,8 @@
  * NOT used: each pre frame is released via four_aec_nr_res_abandon_pre()
  * and the Align-ULCNet chain replaces that post stage entirely.
  *
- * TIMING CONTRACT (total added algorithmic latency = 2 hops = 512 samples
- * = 32 ms @ 16 kHz):
+ * TIMING CONTRACT (total added algorithmic latency = 2 compiled-grid hops;
+ * 32 ms for 16 kHz/512 and 21.33 ms for 48 kHz/1024):
  *
  *   1 hop  — the gsc-spectrum WOLA: the beamformed-error spectrum of hop p
  *            is only fully reconstructed in the time domain at hop p+1
@@ -75,7 +75,7 @@
  *
  *   The reset above flushes the runtime's recurrent state, but the C-side
  *   ULCNet STFT states keep running, so the analysis windows already in
- *   flight still STRADDLE the boundary: their 512-sample spans cover one hop
+ *   flight still STRADDLE the boundary: their two-hop spans cover one hop
  *   pushed before the switch and one pushed after (on the error branch, the
  *   far branch, or both). Stepping the model on such a frame would rebuild,
  *   from a half-stale error/far pair, exactly the state the reset cleared.
@@ -95,7 +95,7 @@
  *   WOLA closes one hop late, and the far branch is delayed one hop to match
  *   it -- so the hop pushed at the boundary hop T still belongs to the
  *   pre-switch input hop T-1 (and is in fact the cleared OLA / cleared far
- *   buffer). With a centered 512/256 analysis spanning two pushed hops, the
+ *   buffer). With a centered 50%-overlap analysis spanning two pushed hops, the
  *   frames emitted at hops T and T+1 both cover that slot and straddle; the
  *   frame emitted at hop T+2 covers the two post-switch hops and is clean.
  *   That is TWICE the mono wrapper's reprime (audio_pipeline_ulcnet.h: 1),
@@ -119,10 +119,10 @@
  * auto_vad_threshold_dbfs/auto_vad_snr_ratio/auto_vad_hangover_frames
  * config fields are validated but never used here.
  *
- * GRID: 16 kHz / fft 512 / hop 256 ONLY. The ULCNet pre/post constants are
- * compile-time 16 kHz (ULCNET_SR/N_FFT/HOP/BINS); 48 kHz configs and any
- * core fft_size other than 0 (forced to 512) or 512 are rejected at
- * validation time.
+ * GRID: one build serves one compile-time ULCNet grid. Supported builds are
+ * 16 kHz / fft 512 / hop 256 and 48 kHz / fft 1024 / hop 512. A config for
+ * the other rate, or a core fft_size other than 0 or the compiled FFT, is
+ * rejected at validation time.
  *
  * Lifecycle mirrors audio_pipeline_4ch.h's descriptor-tier pool-first
  * pattern (caller-owned pool via get_mem_requirements()/init_ex(), heap
@@ -149,7 +149,7 @@ extern "C" {
  *
  * = 2: both branches are pushed one hop behind the input (beam WOLA lag +
  * the matching one-hop far compensation), so the slot pushed at the boundary
- * hop still belongs to the pre-switch input hop, and the centered 512/256
+ * hop still belongs to the pre-switch input hop, and the centered 50%-overlap
  * analysis spans two pushed slots. Derived and asserted branch by branch by
  * the straddle-derivation test; do not edit this value without re-running
  * it.
@@ -165,7 +165,7 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * ola, synth_win, beam_hop (the ULCNet analysis/synthesis states, frame
  * scratch, one-hop far buffer and the chain's shared
  * sqrt-Hann window table live inside `self`). The one carved `fft` handle
- * serves BOTH the beamform WOLA and the ULCNet chain (same 512 size;
+ * serves BOTH the beamform WOLA and the ULCNet chain (same compiled size;
  * strictly sequential use within a hop). Bump together with the
  * build-flags-hash token string forever after.
  * v2: self grew the one-hop far-compensation buffer + far_input_mode.
@@ -205,7 +205,12 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * pool grew by a per-grid constant, so the four lanes inside the composed
  * pre-only core sub-pool move this layer's total too. One release unit, one
  * bump -- a version-13 descriptor is refused for either reason. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 14u
+/* v15: the ULCNet deployment grid became a build parameter, so the
+ * build-flags-hash token no longer spells it as a literal -- it folds in
+ * the stringified ULCNET_SR/ULCNET_N_FFT instead, and two builds on
+ * different grids no longer share a descriptor hash. Bumped with the
+ * token string, as this file's rule requires. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 15u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -261,8 +266,8 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
  * Config and lifecycle
  * ========================================================================== */
 
-/* Returns the trained 16 kHz / frame-FFT 512 / hop 256 defaults for the
- * PRE-ONLY profile this wrapper is the only consumer of: core.fft_size = 512,
+/* Returns the compiled checkpoint-grid defaults for the PRE-ONLY profile
+ * this wrapper is the only consumer of: core.fft_size = ULCNET_N_FFT,
  * core.enable_post = 0 and core.enable_cng = 0.
  *
  * Align-ULCNet replaces the post-beam RES/NR/CNG stage entirely, so with

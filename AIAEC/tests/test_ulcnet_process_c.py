@@ -121,23 +121,37 @@ def audio_common_lib():
     return lib
 
 
-@pytest.fixture(scope='module')
-def driver(tmp_path_factory, audio_common_lib):
+def _build_driver(tmp_path_factory, audio_common_lib, name, defines=()):
+    """Compile the pre/post driver, optionally for a non-default grid."""
     cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     if cc is None:
         pytest.skip('no C compiler available')
-    work = tmp_path_factory.mktemp('ulcnet_c')
+    work = tmp_path_factory.mktemp(name)
     main_c = work / 'driver.c'
     main_c.write_text(_DRIVER)
     exe = work / 'driver'
     subprocess.run(
-        [cc, '-O2', '-std=c99', '-ffp-contract=off',
+        [cc, '-O2', '-std=c99', '-ffp-contract=off', *defines,
          '-I', _ULCNET_DIR, '-I', _AC_INCLUDE,
          str(main_c), os.path.join(_ULCNET_DIR, 'ulcnet_process.c'),
          audio_common_lib, '-lm', '-o', str(exe)],
         check=True, capture_output=True,
     )
     return work, exe
+
+
+@pytest.fixture(scope='module')
+def driver(tmp_path_factory, audio_common_lib):
+    return _build_driver(tmp_path_factory, audio_common_lib, 'ulcnet_c')
+
+
+@pytest.fixture(scope='module')
+def driver48(tmp_path_factory, audio_common_lib):
+    """The same pre/post driver compiled for the 48 kHz / 1024 grid."""
+    return _build_driver(
+        tmp_path_factory, audio_common_lib, 'ulcnet_c_48k',
+        ('-DULCNET_MODEL_IO_SR=48000', '-DULCNET_MODEL_IO_N_FFT=1024'),
+    )
 
 
 def _run(driver_fx, mode, samples):
@@ -149,13 +163,38 @@ def _run(driver_fx, mode, samples):
     return np.fromfile(fout, dtype=np.float32)
 
 
-def _python_frames(x):
-    st = StreamSTFT(N_FFT, HOP, sqrt_hann_window(N_FFT))
+def _python_frames(x, n_fft=N_FFT, hop=HOP):
+    st = StreamSTFT(n_fft, hop, sqrt_hann_window(n_fft))
     frames = []
-    for s in range(0, x.numel(), HOP):
-        frames += st.push(x[None, s:s + HOP])
+    for start in range(0, x.numel(), hop):
+        frames += st.push(x[None, start:start + hop])
     frames += st.flush()
-    return torch.stack(frames, dim=1)[0]          # [T, 257] complex
+    return torch.stack(frames, dim=1)[0]          # [T, n_fft/2+1] complex
+
+
+def test_48k_analysis_and_roundtrip_match_python(driver48):
+    """Numerical parity for the complete C STFT/WOLA path at 48 kHz.
+
+    The pipeline build smoke catches dimensions and linking; this test also
+    catches a correct-sized but incorrectly framed 513-bin implementation.
+    """
+    n_fft, hop = 1024, 512
+    bins = n_fft // 2 + 1
+    torch.manual_seed(31)
+    x = torch.randn(hop * 24)
+    ref_frames = _python_frames(x, n_fft, hop)
+
+    raw = _run(driver48, 'analysis', x.numpy())
+    got = raw.reshape(-1, 2, bins)
+    assert got.shape[0] == ref_frames.shape[0]
+    got_complex = torch.complex(
+        torch.from_numpy(got[:, 0]), torch.from_numpy(got[:, 1]))
+    assert (got_complex - ref_frames).abs().max().item() < 4e-4
+
+    roundtrip = torch.from_numpy(
+        _run(driver48, 'roundtrip', x.numpy())[:x.numel()])
+    assert roundtrip.shape == x.shape
+    assert (roundtrip - x).abs().max().item() < 4e-4
 
 
 def test_analysis_matches_python_reference(driver):

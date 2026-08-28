@@ -80,10 +80,16 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <tr><td>4ch core（<code>4ch_aec_bf_nr_res/</code>）</td><td>16/48 k</td>
 <td>只有三個 grid：16k/256、16k/512、48k/1024（<b>無 8 k</b>）</td><td>16k 預設 256</td>
 <td><code>4aec_nr_res.c</code> sample_rate 檢查；<code>aec.c:150-160</code> 註解</td></tr>
-<tr><td>ULCNet 變體（mono + 4ch）</td><td>16 k</td>
-<td><b>512 / 256（257）固定</b>；其他 SR/fft 一律 reject</td><td>編譯期固定</td>
-<td><code>ulcnet_process.h</code>（ULCNET_SR/N_FFT/HOP/BINS）、
+<tr><td rowspan="2">ULCNet 變體（mono + 4ch）</td><td>16 k</td>
+<td><b>512 / 256（257）</b>；ta_bins 26</td>
+<td rowspan="2">編譯期固定：<code>make ULCNET_GRID=16k|48k</code>
+（底層是 <code>-DULCNET_MODEL_IO_SR</code> / <code>_N_FFT</code>），
+其他組合 <code>#error</code>；執行期其他 SR/fft 一律 reject。
+<code>make test-grids</code> 一次測兩個 grid</td>
+<td rowspan="2"><code>ulcnet_model_io.h</code>（SR/N_FFT 可覆寫，
+HOP/BINS/TA_BINS 由 N_FFT 導出）、<code>ulcnet_process.h</code>（四個別名）、
 <code>audio_pipeline_ulcnet.h</code>、<code>audio_pipeline_4ch_ulcnet.h</code></td></tr>
+<tr><td>48 k</td><td><b>1024 / 512（513）</b>；ta_bins 52</td></tr>
 <tr><td>AINR DFN2</td><td>48 k</td>
 <td>1024 / 512（513）；<b>非上游 960/480</b>（2 的次方限制；DF 截止 4500 Hz
 vs 上游 4800 Hz）</td><td>編譯期固定</td>
@@ -93,8 +99,13 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <tr><td>AINR RNNoise-ERB</td><td>16 k</td>
 <td>512 / 256（257）；22 ERB bands + complex 特徵 0–4 kHz（129 bins）</td>
 <td>編譯期固定</td><td><code>RNNoise-ERB/process.h</code></td></tr>
-<tr><td>AIAEC ×4（ULCNet/CRUSE/DeepVQE-S/CAGCRN）</td><td>16 k</td>
-<td>512 / 256（257）</td><td>config 固定</td>
+<tr><td>AIAEC Align-ULCNet</td><td>16 k / 48 k</td>
+<td>512 / 256（257）或 1024 / 512（513）</td><td>config 固定，兩個 grid 擇一</td>
+<td><code>config.ini</code>；<code>export_onnx.py</code> 的
+<code>SUPPORTED_GRIDS</code></td></tr>
+<tr><td>AIAEC 其餘三個（CRUSE/DeepVQE-S/CAGCRN）</td><td>16 k</td>
+<td>512 / 256（257）</td><td>config 固定；共用的
+<code>aiaec_process.h</code> 邊界也只有 16 k</td>
 <td>各模型的 <code>config.ini</code></td></tr>
 </table>
 </div>
@@ -167,17 +178,17 @@ frame#0→0 樣本（半窗 trim）、之後每幀 256 樣本——與 dfn2 的 
 
 <h2>延遲預算表（演算法延遲，不含排程/緩衝）</h2>
 
-<h3>mono ULCNet pipeline（16 k / 512 / 256）</h3>
+<h3>mono ULCNet pipeline（16 k / 512 / 256；48 k 為 1024 / 512）</h3>
 <div class="tbl">
 <table>
 <tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
 <tr><td>AEC 線性路徑（<code>pbfdaf_frontend</code>，overlap-save）</td>
 <td>+0 hop</td><td>線性誤差與輸入同 hop 交付（<code>AecResContext.formed_hop</code>）</td></tr>
 <tr><td>Align-ULCNet 鏈（centered STFT ×2 → NN callback → WOLA）</td>
-<td>+1 hop = 256 samples = 16 ms</td>
+<td>+1 hop（16 k: 256 smp = 16 ms；48 k: 512 smp = 10.67 ms）</td>
 <td><code>ulcnet_process.h</code>：hop#0 無輸出（pipeline 補零）、hop#p 輸出
-對應輸入 [（p−1)·256, p·256)</td></tr>
-<tr><td><b>合計</b></td><td><b>1 hop = 256 samples = 16 ms</b></td>
+對應輸入 [（p−1)·HOP, p·HOP)</td></tr>
+<tr><td><b>合計</b></td><td><b>1 hop（16 k: 16 ms；48 k: 10.67 ms）</b></td>
 <td><code>audio_pipeline_ulcnet.h</code>：「end-to-end algorithmic latency is
 exactly ONE hop」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 </table>

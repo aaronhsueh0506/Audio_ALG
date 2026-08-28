@@ -1,6 +1,8 @@
 """Explicit delta-state export contract for streaming Align-ULCNet."""
 
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import numpy as np
@@ -26,7 +28,8 @@ from AIAEC.Align_ULCNet.export_onnx import (
     OUTPUT_NAMES,
     SCORE_HISTORY_FRAMES,
     STATE_LAYOUT_VERSION,
-    TA_BINS,
+    SUPPORTED_GRIDS,
+    ta_bins_for,
     TA_CHANNELS,
     _write_metadata,
     dummy_inputs,
@@ -42,6 +45,10 @@ from AIAEC.training_common import FAR_INPUT_MODE_C_VALUES
 
 
 GRID = SignalGrid(16000, 512, 512, 256)
+# The 16 kHz values of the two grid-derived quantities. ta_bins_for()
+# is the single derivation; test_ta_bins_follows_the_grid pins both.
+N_FREQS = GRID.n_freqs
+TA_BINS = 26
 D = 8
 
 
@@ -56,8 +63,92 @@ def _ri(value):
     return torch.stack((value.real, value.imag), dim=-1)
 
 
+def test_ta_bins_follows_the_grid():
+    """ta_bins is derived, not a constant, and the derivation has a trap.
+
+    At 48 kHz the correct value (52) equals reorient.width at 16 kHz (52),
+    so a derivation that read reorient.width instead of ceil(width/2) would
+    look right in a 48 kHz trace and be 2x wrong on the shipped grid. Both
+    grids are checked here for exactly that reason.
+    """
+    g48 = SignalGrid(48000, 1024, 1024, 512)
+    m16 = AlignULCNet(GRID, max_delay_frames=D)
+    m48 = AlignULCNet(g48, max_delay_frames=D)
+    assert ta_bins_for(m16) == TA_BINS == 26
+    assert ta_bins_for(m48) == 52
+    assert m16.reorient.width == 52 and m48.reorient.width == 104
+    # The K/V caches carry it, so the state geometry follows the grid too.
+    assert state_shapes(D, ta_bins_for(m48))['key_history'][-1] == 52
+
+
+def test_c_header_enumerates_the_same_grids_as_the_exporter():
+    """The legal-grid set is stated in both languages; pin them together.
+
+    export_onnx refuses a foreign grid in Python and ulcnet_model_io.h
+    #errors on one in C. Nothing compared the two sets, so a grid could be
+    added to one side alone and the mismatch would only surface as a build
+    that the exporter is happy to feed and the C cannot accept.
+    """
+    header = (
+        Path(__file__).resolve().parents[1]
+        / 'Align_ULCNet' / 'ulcnet_model_io.h'
+    ).read_text(encoding='utf-8')
+    pairs = re.findall(
+        r'ULCNET_MODEL_IO_SR\s*==\s*(\d+)\s*&&\s*'
+        r'ULCNET_MODEL_IO_N_FFT\s*==\s*(\d+)',
+        header,
+    )
+    assert pairs, 'no grid pairs found in the header guard'
+    assert {(int(sr), int(fft)) for sr, fft in pairs} == set(SUPPORTED_GRIDS)
+
+
+_TA_BINS_PROBE = """
+#include <stdio.h>
+#include "ulcnet_model_io.h"
+int main(void) {
+    printf("%d %d\\n", ULCNET_MODEL_IO_BINS, ULCNET_MODEL_IO_TA_BINS);
+    return 0;
+}
+"""
+
+
+@pytest.mark.parametrize('sample_rate,n_fft', SUPPORTED_GRIDS)
+def test_c_ta_bins_matches_the_python_derivation(tmp_path, sample_rate, n_fft):
+    """The C macro and the Python derivation are independent encodings.
+
+    Nothing else compares them: the C driver checks the descriptor against
+    the same macro it was built from, which is an identity, and a text match
+    on the header survives a changed divisor. Only evaluating the macro and
+    comparing it to the model's own width closes that gap -- change the 10 in
+    ULCNET_MODEL_IO_TA_BINS to an 11 and this is the test that goes red.
+    """
+    compiler = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
+    if compiler is None:
+        pytest.skip('no C compiler available')
+    ulcnet_dir = Path(__file__).resolve().parents[1] / 'Align_ULCNet'
+    probe = tmp_path / 'probe.c'
+    probe.write_text(_TA_BINS_PROBE, encoding='utf-8')
+    executable = tmp_path / 'probe'
+    subprocess.run([
+        compiler, '-std=c99', '-Wall', '-Werror',
+        '-DULCNET_MODEL_IO_SR=%d' % sample_rate,
+        '-DULCNET_MODEL_IO_N_FFT=%d' % n_fft,
+        '-I', str(ulcnet_dir), str(probe), '-o', str(executable),
+    ], check=True, capture_output=True)
+    c_bins, c_ta_bins = (
+        int(value) for value in
+        subprocess.run([str(executable)], check=True, capture_output=True)
+        .stdout.split()
+    )
+
+    grid = SignalGrid(sample_rate, n_fft, n_fft, n_fft // 2)
+    model = AlignULCNet(grid, max_delay_frames=D)
+    assert c_bins == grid.n_freqs
+    assert c_ta_bins == ta_bins_for(model)
+
+
 def test_streaming_export_shapes_are_fixed_and_delta_only():
-    shapes = state_shapes(D)
+    shapes = state_shapes(D, TA_BINS)
     assert shapes['key_history'] == (1, 32, D - 1, 26)
     assert shapes['value_history'] == (1, 32, D - 1, 26)
     assert shapes['logit_history'] == (1, 32, 4, D)
@@ -121,7 +212,7 @@ def test_every_layout_pair_computes_the_same_frames(feature, gru):
 
     def start(wrapper):
         return tuple(value.clone() for value in
-                     dummy_inputs(D, wrapper.layout)[
+                     dummy_inputs(D, N_FREQS, TA_BINS, wrapper.layout)[
                          wrapper.layout.signal_inputs:])
 
     def head(wrapper, outputs):
@@ -164,7 +255,6 @@ def test_c_descriptor_constants_match_export_contract():
         'ULCNET_MODEL_IO_MIN_D': MIN_DELAY_DEPTH,
         'ULCNET_MODEL_IO_MAX_D': MAX_DELAY_DEPTH,
         'ULCNET_MODEL_IO_TA_CHANNELS': TA_CHANNELS,
-        'ULCNET_MODEL_IO_TA_BINS': TA_BINS,
         'ULCNET_MODEL_IO_SCORE_HISTORY': SCORE_HISTORY_FRAMES,
         'ULCNET_MODEL_IO_GRU_LAYERS': GRU_LAYERS,
         'ULCNET_MODEL_IO_GRU_HIDDEN': GRU_HIDDEN,
@@ -177,6 +267,12 @@ def test_c_descriptor_constants_match_export_contract():
         )
         assert match is not None, name
         assert int(match.group(1)) == value
+
+    # TA_BINS is derived from the compiled grid rather than transcribed, so
+    # it cannot be pinned by value here. Matching the header TEXT would not
+    # pin it either -- a changed divisor keeps the same text. The evaluated
+    # comparison lives in test_c_ta_bins_matches_the_python_derivation.
+    assert '#define ULCNET_MODEL_IO_TA_BINS' in header
 
     # The far-input enumeration is a two-sided contract: the exporter writes
     # the numeric value into the metadata, the descriptor carries the same
@@ -222,7 +318,7 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     checkpoint = tmp_path / 'ckpt.pt'
     checkpoint.write_bytes(b'not a real checkpoint, only hashed')
-    inputs = dummy_inputs(D)
+    inputs = dummy_inputs(D, N_FREQS, TA_BINS)
     outputs = AlignUlcnetStreamingExport(model).eval()(*inputs)
 
     metadata = _write_metadata(
@@ -251,7 +347,7 @@ def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
     torch.manual_seed(20260816)
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
-    explicit = tuple(value.clone() for value in dummy_inputs(D)[SIGNAL_INPUTS:])
+    explicit = tuple(value.clone() for value in dummy_inputs(D, N_FREQS, TA_BINS)[SIGNAL_INPUTS:])
     reference = model.create_stream_state()
     generator = torch.Generator().manual_seed(73)
 
@@ -311,7 +407,7 @@ def test_exported_onnx_state_tensors_are_rank_four(tmp_path):
     export_graph(model, str(checkpoint), str(path))
 
     graph = onnx.load(str(path)).graph
-    shapes = state_shapes(depth)
+    shapes = state_shapes(depth, TA_BINS)
 
     def dims(value):
         return tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
@@ -350,8 +446,8 @@ def test_combined_state_stacks_on_the_channel_axis():
     combined = AlignUlcnetStreamingExport(
         model, gru_state_layout='combined').eval()
 
-    split_state = dummy_inputs(depth, split.layout)[SIGNAL_INPUTS:]
-    combined_state = dummy_inputs(depth, combined.layout)[SIGNAL_INPUTS:]
+    split_state = dummy_inputs(depth, N_FREQS, TA_BINS, split.layout)[SIGNAL_INPUTS:]
+    combined_state = dummy_inputs(depth, N_FREQS, TA_BINS, combined.layout)[SIGNAL_INPUTS:]
     generator = torch.Generator().manual_seed(11)
     with torch.no_grad():
         for _ in range(2 * depth + 2):
@@ -372,7 +468,7 @@ def test_combined_state_stacks_on_the_channel_axis():
 
 
 def test_reset_is_all_zero_external_state():
-    inputs = dummy_inputs(D)
+    inputs = dummy_inputs(D, N_FREQS, TA_BINS)
     for state in inputs[SIGNAL_INPUTS:]:
         assert torch.count_nonzero(state) == 0
 
@@ -384,7 +480,7 @@ def test_streaming_onnx_runtime_matches_pytorch(tmp_path):
     torch.manual_seed(17)
     model = AlignULCNet(GRID, max_delay_frames=depth).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
-    initial = dummy_inputs(depth)
+    initial = dummy_inputs(depth, N_FREQS, TA_BINS)
     output_path = tmp_path / 'align_ulcnet_stream.onnx'
 
     torch.onnx.export(
@@ -428,13 +524,26 @@ def test_streaming_onnx_runtime_matches_pytorch(tmp_path):
 
 
 def test_streaming_export_rejects_a_non_verified_grid():
-    """The C boundary guard must fire before any shape can go wrong.
+    """The boundary guard must fire before any shape can go wrong.
 
-    SamFR width and the 257-bin dummies in this exporter are written for the
-    16 kHz / 512-FFT boundary; a checkpoint from another grid has to be
-    rejected here with an actionable message, never crash deep in a matmul.
+    SignalGrid admits grids the deployed boundary is not defined for -- 16 kHz
+    / 256 is constructible and the model runs on it -- so a checkpoint from one
+    has to be rejected here with an actionable message, never crash deep in a
+    matmul nor export a graph no C build can bind. Both product grids must be
+    accepted, or lifting the rate pin achieved nothing.
     """
     model = AlignULCNet(SignalGrid(16000, 256, 256, 128),
                         max_delay_frames=D).eval()
-    with pytest.raises(ValueError, match='16 kHz / FFT 512'):
+    with pytest.raises(ValueError, match='streaming export supports'):
         AlignUlcnetStreamingExport(model)
+
+    for grid in (GRID, SignalGrid(48000, 1024, 1024, 512)):
+        wrapper = AlignUlcnetStreamingExport(
+            AlignULCNet(grid, max_delay_frames=D).eval())
+        assert wrapper.n_freqs == grid.n_freqs
+
+    # The C-SamFR sampling pair is not implied by the grid, so it keeps a
+    # guard of its own.
+    off = AlignULCNet(GRID, max_delay_frames=D, gamma=4).eval()
+    with pytest.raises(ValueError, match='gamma, subband_bins'):
+        AlignUlcnetStreamingExport(off)

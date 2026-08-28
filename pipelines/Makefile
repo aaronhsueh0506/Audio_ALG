@@ -151,6 +151,23 @@ NR_DIR  = ../lib/nr/c_impl
 AIAEC_DIR = ../AIAEC
 ULCNET_DIR = $(AIAEC_DIR)/Align_ULCNet
 
+# Align-ULCNet deployment grid. One binary serves one grid: the C structs
+# embed the STFT/WOLA tables and scratch, so the grid is a build parameter,
+# not a runtime field. Selected by name here rather than by hand-writing the
+# two -D flags into EXTRA_CFLAGS, because EXTRA_CFLAGS is forwarded verbatim
+# to the AEC/NR/audio_common producer sub-makes -- none of which contain any
+# ULCNet code -- and would split their object caches for no reason.
+# Applied ONLY to the ULCNet TUs below, and folded into CFG_SIG_PAYLOAD so
+# the two grids never share an object directory.
+ULCNET_GRID ?= 16k
+ifeq ($(ULCNET_GRID),16k)
+ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=16000 -DULCNET_MODEL_IO_N_FFT=512
+else ifeq ($(ULCNET_GRID),48k)
+ULCNET_GRID_CFLAGS = -DULCNET_MODEL_IO_SR=48000 -DULCNET_MODEL_IO_N_FFT=1024
+else
+$(error ULCNET_GRID must be 16k or 48k, got '$(ULCNET_GRID)')
+endif
+
 # audio_common sits two levels up from pipelines/ (SE/Audio_ALG/pipelines -> SE/audio_common).
 # lib/aec/c_impl and lib/nr/c_impl each resolve it themselves from their own
 # location (../../../../audio_common from c_impl/, verified to exist as a
@@ -973,7 +990,7 @@ endif
 # guard-skip knob must not alias a guarded build), SRCS (this
 # Makefile's own compiled sources -- the archive's one member TU plus the
 # CLI/test TUs -- so a source-set change keys to a fresh directory).
-CFG_SIG_PAYLOAD := CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c)
+CFG_SIG_PAYLOAD := ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT: where THIS repo's own keyed
@@ -1062,19 +1079,19 @@ $(OBJ_DIR)/test_audio_pipeline.o: mono_aec_nr_res/tests/test_audio_pipeline.c mo
 # resolves its own. The pipeline TU and its test also need the ULCNET
 # include path for ulcnet_process.h (via audio_pipeline_ulcnet.h).
 $(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/mono_alignulcnet_main.o: mono_alignulcnet/main.c mono_alignulcnet/audio_pipeline_ulcnet.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o: $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 # audio_pipeline_ulcnet.o: the AEC(linear) -> Align-ULCNet post-filter
 # pipeline TU (audio_pipeline_ulcnet.h). It is deliberately not a member of
@@ -1082,7 +1099,7 @@ $(OBJ_DIR)/test_ulcnet_accelerator_adapter.o: $(AIAEC_DIR)/tests/test_ulcnet_acc
 # pre/post object directly alongside libaec/libaudio_common, avoiding a
 # second application-specific wrapper archive.
 $(OBJ_DIR)/audio_pipeline_ulcnet.o: mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/audio_pipeline_ulcnet.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 # test_audio_pipeline_ulcnet: standalone acceptance test for
 # audio_pipeline_ulcnet.h (identity E2E one-hop-latency proof, model
@@ -1090,7 +1107,7 @@ $(OBJ_DIR)/audio_pipeline_ulcnet.o: mono_alignulcnet/audio_pipeline_ulcnet.c mon
 # rejection, create-vs-init parity, NULL-model == identity-model) -- see
 # tests/test_audio_pipeline_ulcnet.c's own header for detail.
 $(OBJ_DIR)/test_audio_pipeline_ulcnet.o: mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c mono_alignulcnet/audio_pipeline_ulcnet.h | _cfg_guard
-	$(CC) $(CFLAGS) -I$(ULCNET_DIR) -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 # example_board_adapter: REFERENCE ONLY host simulation of a board-side
 # common-memory-manager integration -- see that
@@ -1848,3 +1865,22 @@ clean-libs: clean-all
 # evaluate to nothing (not an error) before any objects exist yet for this
 # CFG_SIG.
 -include $(wildcard $(OBJ_DIR)/*.d)
+
+# ---------------------------------------------------------------------------
+# test-grids: prove BOTH Align-ULCNet deployment grids in one command.
+#
+# `test` only ever exercises whichever grid ULCNET_GRID selects, so a
+# 16 kHz-only CI would never compile or run the 48 kHz build at all. Each
+# grid gets its own object/bin directory (ULCNET_GRID is in CFG_SIG), so the
+# two runs cannot contaminate each other.
+#
+# Defined outside the AC_LIB bootstrap conditionals on purpose: it needs no
+# resolved producer archives of its own, and each recursive `test` bootstraps
+# itself. Adding it to the bootstrap target list instead would resolve the
+# producers once and then hand both grids the same resolved set, which is
+# harmless but pointless work.
+# ---------------------------------------------------------------------------
+.PHONY: test-grids
+test-grids:
+	$(MAKE) ULCNET_GRID=16k test
+	$(MAKE) ULCNET_GRID=48k test

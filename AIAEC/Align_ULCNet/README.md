@@ -18,14 +18,55 @@ parallel, two-layer 128-unit temporal subband GRUs; two full-band FC layers;
 and the ULCNet second-stage CNN complex mask. The compressed real/imaginary
 estimate is decompressed component-wise.
 
-C-SamFR follows Figure 2 at the subband level. At `K=257`, `K_B=2`,
-`gamma=5`, it pads to 130 subbands and produces five 52-bin channels; it does
-not interleave individual FFT bins and break two-bin subbands apart.
+C-SamFR follows Figure 2 at the subband level. On the 16 kHz grid, `K=257`,
+`K_B=2`, `gamma=5` pads to 130 subbands and produces five 52-bin channels; the
+same formula derives the larger 48 kHz widths from `K=513`. It does not
+interleave individual FFT bins and break two-bin subbands apart.
 
 Paper defaults are 16 kHz, `512/512/256`, 3-second samples, `alpha=0.3`, and a
-64-frame (~1 s) delay buffer. At 48 kHz the project uses `1024/1024/512` and
-derives the frame count from one physical second. No author code/checkpoint was
-released. The paper leaves activation details inside the FC pair unspecified;
+64-frame (~1 s) delay buffer. The project ships two grids, and every width
+below is derived from `n_fft` rather than written down anywhere:
+
+| grid | `n_fft`/win/hop | `K` (bins) | C-SamFR channel width | attention `ta_bins` | hop duration |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 16 kHz | `512/512/256` | 257 | 52 | 26 | 16.00 ms |
+| 48 kHz | `1024/1024/512` | 513 | 104 | 52 | 10.67 ms |
+
+Those two are the only supported grids: `export_onnx.py` rejects anything else
+(`SUPPORTED_GRIDS`), and `ulcnet_model_io.h` refuses to compile off them.
+Changing grids also changes learned frequency-axis tensor shapes (including
+the reorientation, bottleneck and fully connected layers). A 16 kHz checkpoint
+therefore cannot be exported or deployed as 48 kHz: train a separate 48 kHz
+checkpoint from a matching packed corpus. This is different from changing D,
+whose history length changes the streaming contract but not the weight shapes.
+
+On the training side the grid comes from `[signal] sr`/`n_fft` in `config.ini`.
+On the C side it is a build parameter, selected by name:
+
+```bash
+make                       # 16 kHz (the default)
+make ULCNET_GRID=48k       # 48 kHz
+make test-grids            # build and test BOTH, in separate object dirs
+```
+
+`ULCNET_GRID` reaches only the ULCNet translation units and is folded into the
+pipeline `CFG_SIG`, so the two grids never share an object directory and the
+AEC/NR/audio_common producer archives -- which contain no ULCNet code -- are
+not rebuilt when the grid changes. Passing the two `-D` flags through
+`EXTRA_CFLAGS` also works but does forward them to those producers, splitting
+their caches for nothing.
+
+D does **not** carry across the two grids, because the hop it counts is a
+different length. A depth D reaches `(D-1)` hops back, so D=8 reaches 112 ms at
+16 kHz but only 74.7 ms at 48 kHz; matching the 16 kHz reach needs D=12 there.
+Deriving D from one physical second is also not available at 48 kHz: that comes
+to 94 frames, above the `D <= 64` ceiling that `export_onnx.py`
+(`MAX_DELAY_DEPTH`) and the C runtime (`ULCNET_MODEL_IO_MAX_D`) both enforce.
+So on the 48 kHz grid `[model] max_delay_frames` must be set explicitly -- a
+run that leaves it to the one-second default trains, then fails at export. The
+shipped `config.ini` sets it to 8 and is unaffected.
+
+No author code/checkpoint was released. The paper leaves activation details inside the FC pair unspecified;
 those remain a reconstruction choice. The 16 kHz graph has about 0.67 M
 trainable parameters, matching the published 0.69 M class without inventing a
 U-Net decoder.
@@ -146,10 +187,10 @@ flowchart LR
         ERR["linear_error"]
         AFAR["aligned_far"]
         SEAM["AEC aligned-far seam<br/>raw until acquisition"]
-        STFT["two sqrt-Hann STFTs<br/>512 / 256"]
+        STFT["two sqrt-Hann STFTs<br/>compiled FFT / 50% hop"]
         FEAT["fixed front end, fp32<br/>signed power 0.3 + magnitudes<br/>+ phase cos/sin"]
-        ERRF["error_mag / error_cos / error_sin<br/>each [1,1,257]<br/>error_ri [1,1,257,2] compressed"]
-        FARF["far_mag<br/>[1,1,257]"]
+        ERRF["error_mag / error_cos / error_sin<br/>each [1,1,BINS]<br/>error_ri [1,1,BINS,2] compressed"]
+        FARF["far_mag<br/>[1,1,BINS]"]
         STATE["external state inputs<br/>K/V history + logit history<br/>two GRU hidden tensors"]
         UPDATE["CPU ring update<br/>push K_now/V_now/logit_now<br/>hidden = hidden_next"]
         INV["inverse signed power<br/>fp32"]
@@ -172,7 +213,7 @@ flowchart LR
         TA["TA over current + history<br/>score conv + softmax"]
         BODY["joint conv + FGRU<br/>temporal GRUs"]
         MASK["mask + composition<br/>signed expansion"]
-        ENH["output, compressed domain<br/>[1,1,257,2]"]
+        ENH["output, compressed domain<br/>[1,1,BINS,2]"]
         DELTA["delta state outputs<br/>K_now / V_now / logit_now<br/>gru0_next / gru1_next"]
         ENC --> QKV --> TA --> BODY --> MASK --> ENH
         QKV --> DELTA
@@ -209,13 +250,13 @@ Inputs per invocation:
 
 | tensor | float32 shape | ordering |
 |---|---:|---|
-| `error_mag` | `[1,1,257]` | compressed-domain magnitude of linear error |
-| `far_mag` | `[1,1,257]` | compressed-domain magnitude of the far branch |
-| `error_cos` | `[1,1,257]` | cos of the compressed-domain error phase |
-| `error_sin` | `[1,1,257]` | sin of the compressed-domain error phase |
-| `error_ri` | `[1,1,257,2]` | COMPRESSED real/imag, last dim |
-| `key_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
-| `value_history` | `[1,32,D-1,26]` | newest first, beginning at t-1 |
+| `error_mag` | `[1,1,BINS]` | compressed-domain magnitude of linear error |
+| `far_mag` | `[1,1,BINS]` | compressed-domain magnitude of the far branch |
+| `error_cos` | `[1,1,BINS]` | cos of the compressed-domain error phase |
+| `error_sin` | `[1,1,BINS]` | sin of the compressed-domain error phase |
+| `error_ri` | `[1,1,BINS,2]` | COMPRESSED real/imag, last dim |
+| `key_history` | `[1,32,D-1,TA_BINS]` | newest first, beginning at t-1 |
+| `value_history` | `[1,32,D-1,TA_BINS]` | newest first, beginning at t-1 |
 | `logit_history` | `[1,32,4,D]` | chronological, t-4 through t-1 |
 | `h_gru0` | `[1,2,1,128]` | NCHW, layer on C |
 | `h_gru1` | `[1,2,1,128]` | NCHW, layer on C |
@@ -224,9 +265,9 @@ Outputs per invocation:
 
 | tensor | float32 shape | CPU action |
 |---|---:|---|
-| `output` | `[1,1,257,2]` | compressed-domain estimate; apply the inverse signed power (`sign(x) * |x|^(1/0.3)`), then WOLA/IFFT |
-| `key_now` | `[1,32,1,26]` | push into key history |
-| `value_now` | `[1,32,1,26]` | push into value history |
+| `output` | `[1,1,BINS,2]` | compressed-domain estimate; apply the inverse signed power (`sign(x) * |x|^(1/0.3)`), then WOLA/IFFT |
+| `key_now` | `[1,32,1,TA_BINS]` | push into key history |
+| `value_now` | `[1,32,1,TA_BINS]` | push into value history |
 | `logit_now` | `[1,32,1,D]` | append to four-frame logit history |
 | `h_gru0_out` | `[1,2,1,128]` | replace GRU-0 hidden |
 | `h_gru1_out` | `[1,2,1,128]` | replace GRU-1 hidden |
@@ -345,7 +386,7 @@ leaves the signed-power compression, both magnitudes and the compressed-domain
 phase outside the graph (`stream_features`; C: `ulcnet_model_io_prepare`), and
 the inverse power on the way back (`host_output`; C:
 `ulcnet_model_io_commit`). `graph` binds the two raw RI spectra
-`(1, 1, 257, 2)` instead and runs that same fixed math inside the graph. That
+`(1, 1, BINS, 2)` instead and runs that same fixed math inside the graph. That
 reproduces the pre-host-front-end boundary in every respect except the
 recurrent-state rank, which is why it carries its own version rather than the
 retired one that boundary once had.

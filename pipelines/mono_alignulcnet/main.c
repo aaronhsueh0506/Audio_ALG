@@ -178,16 +178,16 @@ int main(int argc, char** argv) {
     size_t adapter_bytes;
     size_t adapter_alignment;
     AudioPipelineUlcnetMemReq req;
-    float mic[256] = {0};
-    float far[256] = {0};
-    float output[256];
+    float mic[ULCNET_HOP] = {0};
+    float far[ULCNET_HOP] = {0};
+    float output[ULCNET_HOP];
     int hop;
     int index;
     int rc;
     rc = parse_delay_profile(argc, argv, &profile);
     if (rc != 0) return rc == 1 ? 0 : rc;
 
-    cfg = audio_pipeline_ulcnet_default_config(16000);
+    cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
     cfg.delay_mode = profile.mode;
     cfg.delay_num_filters = profile.num_filters;
     cfg.fixed_delay_samples = profile.fixed_samples;
@@ -240,14 +240,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    /* Host smoke path. A product calls process() once per 256-sample hop. */
+    /* Host smoke path. A product calls process() once per ULCNET_HOP-sample hop. */
     for (hop = 0; hop < 4; ++hop) {
         if (audio_pipeline_ulcnet_process(pipeline, mic, far, output) != 0) {
             audio_pipeline_ulcnet_destroy(pipeline);
             free(adapter_pool);
             return 1;
         }
-        for (index = 0; index < 256; ++index) {
+        for (index = 0; index < ULCNET_HOP; ++index) {
             if (!isfinite(output[index])) {
                 audio_pipeline_ulcnet_destroy(pipeline);
                 free(adapter_pool);

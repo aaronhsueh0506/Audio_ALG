@@ -3,14 +3,14 @@
  *
  * 這個檔案是「網路以外的訊號路徑」。邊界與部署 NPU graph 完全一致:
  *
- *     C   : hop(256 samples) -> centered sqrt-Hann STFT -> RI 頻譜 (兩路:
+ *     C   : hop(ULCNET_HOP samples) -> centered sqrt-Hann STFT -> RI 頻譜 (兩路:
  *           linear_error / AEC aligned-far seam；seam 在 acquisition 前
  *           承載 raw far，production descriptor 固定 aligned_far)
  *     網路: (error_ri, far_ri, 顯式 states) -> enhanced_ri  <-- 只有這段是學來的
  *           (壓縮/attention/GRU/解壓縮全部在 graph 內；states 由 CPU/driver
  *           context 保存，加速器本身 stateless)
  *     C   : enhanced_ri -> centered WOLA (sqrt-Hann, 50% overlap, 包絡正規化,
- *           半窗 trim) -> hop(256 samples)
+ *           半窗 trim) -> hop(ULCNET_HOP samples)
  *
  * ⚠ Framing contract = center=True 重現（專案既定決策, 見
  *   docs/align_ulcnet_embedded_streaming_design_zh_TW.md 第 7 節）:
@@ -19,21 +19,22 @@
  *   AINR/DeepFilterNet2/dfn2_process.c 的 center=False 串流不同, 是刻意的:
  *   ULCNet checkpoint 的 feature-time contract 不能靜默改變。
  *
- * 時序（每 push 一個 256-sample hop）:
+ * 時序（每 push 一個 ULCNET_HOP-sample hop）:
  *   analysis:  push#0 -> 0 幀;  push#1 -> 2 幀 (frame0+frame1);  之後每 push 1 幀
- *   synthesis: frame#0 -> 0 樣本(落在被 trim 的半窗);  之後每 frame 256 樣本
- *   端到端演算法延遲 = 256 samples (16 ms @16 kHz)，即 centered 分析的半窗
+ *   synthesis: frame#0 -> 0 樣本(落在被 trim 的半窗);  之後每 frame ULCNET_HOP 樣本
+ *   端到端演算法延遲 = ULCNET_HOP samples，即 centered 分析的半窗
+ *   (16 kHz build: 256 samples / 16 ms; 48 kHz build: 512 samples / 10.67 ms)
  *   lookahead 本身——hop#0 無輸出(呼叫端補零)，hop#p(p>=1) 輸出的內容對應
- *   輸入樣本 [(p-1)*256, p*256)。WOLA 收尾不再另加延遲(被半窗 trim 吸收)。
+ *   輸入樣本 [(p-1)*ULCNET_HOP, p*ULCNET_HOP)。WOLA 收尾不再另加延遲(被半窗 trim 吸收)。
  *   與 Python reference 的 StreamSTFT/StreamISTFT 相同。
  *
  * Parity expectations: the Python reference (AIAEC/aiaec_streaming.py) is
  * bit-exact vs torch. This C side runs its transforms through audio_common's
  * fft_wrapper.h on a caller-owned FftHandle, so BACKEND=kiss/ne10 genuinely
- * selects the FFT backend, real signals pay a 512-point RFFT/IRFFT (not a
+ * selects the FFT backend, real signals pay an ULCNET_N_FFT-point RFFT/IRFFT (not a
  * full complex FFT), and twiddles are precomputed once inside the handle,
  * never per call. Agreement vs Python is float-ULP class (~1e-5 absolute at
- * 512 points), not bit-exact. Regression gate:
+ * ULCNET_N_FFT points), not bit-exact. Regression gate:
  * AIAEC/tests/test_ulcnet_process_c.py (compiles this file with cc, links
  * libaudio_common.a BACKEND=kiss, compares frame by frame vs Python).
  *
@@ -42,7 +43,7 @@
  * embedded in the structs (the old stack-local scratch was ~6.2 KB in the
  * analysis push and ~4.2 KB in the synthesis push -- unsafe headroom for an
  * embedded RTOS task stack). The FftHandle and the sqrt-Hann window table
- * are caller-owned and SHARED: one 512-point handle may serve
+ * are caller-owned and SHARED: one ULCNET_N_FFT-point handle may serve
  * err-analysis + far-analysis + synthesis, whose transforms are strictly
  * sequential within a hop (the handle is never used concurrently), and one
  * window table serves every struct (structs store const pointers only; the
@@ -78,11 +79,27 @@
 extern "C" {
 #endif
 
-/* ---- 訊號格點: 16 kHz / 512 / 512 / 256 (ULCNet 部署 grid, 編譯期固定) ---- */
-#define ULCNET_SR       16000
-#define ULCNET_N_FFT    512
-#define ULCNET_HOP      256          /* = N_FFT/2, 50% overlap (COLA) */
-#define ULCNET_BINS     257          /* N_FFT/2 + 1 */
+/* ---- 訊號格點 (編譯期固定,一個 build 服務一個 grid) ----
+ * 單一來源與改法都在 ulcnet_model_io.h;此處四個名稱是給既有呼叫端的
+ * alias,與 ULCNET_COMPRESSION_EXP 同一個慣例。 */
+#define ULCNET_SR       ULCNET_MODEL_IO_SR
+#define ULCNET_N_FFT    ULCNET_MODEL_IO_N_FFT
+#define ULCNET_HOP      ULCNET_MODEL_IO_HOP    /* = N_FFT/2, 50% overlap (COLA) */
+#define ULCNET_BINS     ULCNET_MODEL_IO_BINS   /* N_FFT/2 + 1 */
+
+/* "<SR>x<N_FFT>" as a string literal, for callers that fold the deployment
+ * grid into a build-flags hash. Assembled once here so the two pipeline
+ * wrappers cannot drift into two spellings of the same token. */
+#define ULCNET_STRINGIFY_(x) #x
+#define ULCNET_STRINGIFY(x)  ULCNET_STRINGIFY_(x)
+#define ULCNET_GRID_TOKEN \
+    ULCNET_STRINGIFY(ULCNET_SR) "x" ULCNET_STRINGIFY(ULCNET_N_FFT)
+
+/* The other supported grid: a rate and an FFT size THIS build must reject.
+ * Both are legal on that other grid, so a gate that accepts either is
+ * reading something other than the compiled grid. */
+#define ULCNET_OTHER_SR     (ULCNET_SR == 16000 ? 48000 : 16000)
+#define ULCNET_OTHER_N_FFT  (ULCNET_N_FFT == 512 ? 1024 : 512)
 
 /* 模型的 modified power-law 壓縮指數 (compression_exponent)。單一來源在
  * ulcnet_model_io.h 的部署契約常數;此名稱保留給既有呼叫端。 */
@@ -98,10 +115,10 @@ extern "C" {
  * sqrt-Hann bit-for-bit at f32. */
 void ulcnet_make_window(float window[ULCNET_N_FFT]);
 
-/* ---- Analysis: centered sqrt-Hann STFT, 每 hop 進 256 樣本 ---- */
+/* ---- Analysis: centered sqrt-Hann STFT, 每 hop 進 ULCNET_HOP 樣本 ---- */
 typedef struct UlcnetAnalysis {
     const float *window;           /* caller-owned shared sqrt-Hann table */
-    FftHandle   *fft;              /* caller-owned 512-point handle; may be
+    FftHandle   *fft;              /* caller-owned ULCNET_N_FFT-point handle; may be
                                     * shared with the other analysis and the
                                     * synthesis (strictly sequential use
                                     * within a hop -- never concurrent)   */
@@ -122,7 +139,7 @@ typedef struct UlcnetAnalysis {
     Complex spec[ULCNET_BINS];     /* RFFT output staging                 */
 } UlcnetAnalysis;
 
-/* fft must be a 512-point handle (fft_get_n_freqs(fft) == ULCNET_BINS);
+/* fft must be an ULCNET_N_FFT-point handle (fft_get_n_freqs(fft) == ULCNET_BINS);
  * window must be a ULCNET_N_FFT sqrt-Hann table from ulcnet_make_window().
  * Both stay caller-owned (see the window/handle sharing contract above).
  * Returns 0, or -1 on NULL args / a wrong-size handle. Re-init on the same
@@ -132,7 +149,7 @@ int ulcnet_analysis_init(UlcnetAnalysis *st, FftHandle *fft,
 
 /* 推入一個 hop。回傳本次產出的幀數 (0 / 2 / 1)，幀依序寫入
  * out_re/out_im[frame][bin]（呼叫端保證至少容納 2 幀）。
- * 第一次 push 產出 0 幀（centered 前綴要等第 257 個樣本）；第二次 push 一次
+ * 第一次 push 產出 0 幀（centered 前綴要等第 ULCNET_HOP+1 個樣本）；第二次 push 一次
  * 產出 frame0（含 reflect 前綴）與 frame1；之後每 push 產出 1 幀。 */
 int ulcnet_analysis_push(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
                          float out_re[2][ULCNET_BINS],
@@ -148,7 +165,7 @@ int ulcnet_analysis_flush(UlcnetAnalysis *st,
 /* ---- Synthesis: centered WOLA (sqrt-Hann, 包絡正規化, 半窗 trim) ---- */
 typedef struct UlcnetSynthesis {
     const float *window;           /* caller-owned shared sqrt-Hann table */
-    FftHandle   *fft;              /* caller-owned 512-point handle; same
+    FftHandle   *fft;              /* caller-owned ULCNET_N_FFT-point handle; same
                                     * sharing contract as UlcnetAnalysis  */
     float acc[ULCNET_N_FFT];       /* overlap-add 累加器 (局部原點 = 下一段輸出) */
     float env[ULCNET_N_FFT];       /* 窗平方包絡累加器 (torch.istft 語意) */

@@ -43,12 +43,14 @@ output；論文展示頁提供的 KF residual 只作研究診斷，不是產品 
 
 - 固定主路徑為「本專案 matched filter + PBFDKF + Align-ULCNet」。
 - 16 kHz、FFT/window/hop = `512/512/256`，每 256 samples（16 ms）處理一次。
+  本文其餘各節的毫秒數、bin 數與 duty-cycle 都是這個 grid 的值；程式碼現在
+  另外支援 48 kHz `1024/1024/512`，兩者的差異集中列在 §1.3。
 - matched filter 處理設備與聲學路徑的大範圍 bulk delay。
 - NN 只處理對齊後的小幅 residual alignment error，先評估 `D=8`，再評估
   `D=4`。
 - 一次只送一個新 STFT frame 給模型，但所有必要狀態跨呼叫保留。
 - C frontend/postprocess 使用 caller-owned static memory；模型 inference 由
-  版端 NPU/DSP runtime 執行。
+  板端 NPU/DSP runtime 執行。
 - 超出 matched search 時 seam 保持 raw far，模型仍執行；可處理範圍由 export
   的 D 決定。只有 callback 失敗、partial write 或 NaN/Inf 才走 identity
   fail-open。
@@ -61,6 +63,59 @@ output；論文展示頁提供的 KF residual 只作研究診斷，不是產品 
 - 第一版不追求完全移除 time-alignment block。
 - 第一版不改變 16 kHz signal grid，也不把模型切成互相獨立、每段重置的
   chunks。
+
+### 1.2.1 reprime 常數的推導範圍
+
+`REPRIME_FRAMES` 由測試量出，但**只有 far 一路是推導**：脈衝標記在 far 路
+未經濾波抵達 analysis，量到的鏈記憶就是窗跨界本身，兩個 grid 都精確等於常數
+（mono 1、4ch 2）。**error 一路不是**：標記先過 AEC 線性濾波器，量到的是
+跨界**加上**濾波器因果尾音，所以只能給上界。尾音長度隨 grid 變（16 kHz 的
+`filter_length` 是 52 ms = 3.25 hops，48 kHz 是 64 ms = 6.00 hops），這就是
+error 路在 16 kHz 與 far 路同值、在 48 kHz 多一幀的原因——**不是常數錯了**。
+
+等尾音消失不是 reprime 的職責，也沒有原則上的上限（照那個邏輯每個 IIR 尾音
+都會延長 reprime）。要讓 error 路也成為推導，標記必須注在 AEC 之後的
+`formed_hop` / ULCNet analysis 輸入 seam，這一項尚未做。
+
+### 1.3 48 kHz grid（第一版之後補上）
+
+支援的 grid 恰好兩組，且是**編譯期**選擇：C struct 內嵌 STFT/WOLA 與 scratch
+buffer，一個 binary 固定一組 grid。`export_onnx.py` 的 `SUPPORTED_GRIDS` 拒絕
+其他組合，`ulcnet_model_io.h` 對其他組合直接 `#error`。
+
+| | 16 kHz | 48 kHz |
+|---|---:|---:|
+| `n_fft`/win/hop | `512/512/256` | `1024/1024/512` |
+| K（bins） | 257 | 513 |
+| C-SamFR 每通道寬 | 52 | 104 |
+| attention `ta_bins` | 26 | 52 |
+| hop 時長 | 16.00 ms | 10.67 ms |
+| joint2 之後頻率寬 | 7 | 13 |
+| subband split | (4, 3) | (7, 6) |
+
+C 端用 `make ULCNET_GRID=16k|48k` 選 grid（底層就是那兩個 `-D`），其餘
+（`HOP`/`BINS`/`TA_BINS`）全部由 `n_fft` 導出，沒有第二處需要改。`ULCNET_GRID`
+只套到 ULCNet 的 TU，並折進 pipeline 的 `CFG_SIG`，所以兩個 grid 不共用 object
+目錄，AEC/NR/audio_common 這些不含 ULCNet 程式碼的 producer 也不會跟著重建。
+`make test-grids` 一次建置並測試兩個 grid。
+
+三件跨 grid 時會咬人的事：
+
+1. **D 不能沿用**。D 數的是 hop，而 hop 的長度不同。深度 D 往回搆到 `(D-1)`
+   個 hop，所以 D=8 在 16 kHz 是 112 ms、在 48 kHz 只剩 74.7 ms；要在 48 kHz
+   搆到同樣的 112 ms 需要 D=12。
+2. **「由一個物理秒導出 D」在 48 kHz 不可用**。`SignalGrid.delay_frames(1.0)`
+   在該 grid 給出 94，超過 `export_onnx.py` 的 `MAX_DELAY_DEPTH` 與 C 端
+   `ULCNET_MODEL_IO_MAX_D` 共同的 D ≤ 64 上限。這種 run 會訓練成功、到 export
+   才失敗，所以 48 kHz 必須在 `[model] max_delay_frames` 明寫 D。出貨的
+   `config.ini` 寫的是 8，不受影響。
+3. **checkpoint 不能跨 grid 沿用**。K 從 257 變 513 會改變 C-SamFR 寬度、
+   `mask_fc1`/`mask_fc2` 的 `out_features` 與 attention 的 `ta_bins`，是不同的
+   weight shape，必須各自訓練。
+
+`AIAEC/aiaec_process.h` 這條**共用候選模型 API 仍固定為 16 kHz**，並以
+`#if ULCNET_SR != AIAEC_SR` 的 `#error` 擋住用 48 kHz 的 Align-ULCNet 去別名它。
+48 kHz 目前只有 Align-ULCNet 自己的 C pipeline 支援。
 
 ## 2. 現況查證
 
@@ -431,7 +486,19 @@ activation/output scratch，不另算 persistent state）；另加 STFT/WOLA 數
 GRU hidden = 2 blocks × 2 layers × 128 × 4 B = 2.0 KiB，GRU 無
 cell state。上述不含 model weights、NPU activation scratch 與 backend alignment。
 D=4 可再降低 key/value ring 與 logit history；最終數字必須由 export
-後的 tensor layout 與版端 allocator 報告。
+後的 tensor layout 與板端 allocator 報告。
+
+48 kHz 的 `ta_bins` 加倍（26 → 52），key/value history 跟著加倍，但
+logit history 只隨 D 走、不隨 grid 走，所以整體不是兩倍。實測
+`ulcnet_accelerator_adapter_get_mem_size()`（含本幀 delta outputs 與工作區）：
+
+| adapter pool | D=4 | D=8 | D=16 | D=32 | D=64 |
+|---|---:|---:|---:|---:|---:|
+| 16 kHz（TA=26） | 41,856 B | 71,040 B | 129,408 B | 246,144 B | 479,616 B |
+| 48 kHz（TA=52） | 76,672 B | 132,480 B | 244,096 B | 467,328 B | 913,792 B |
+
+過邊界的 persistent tensor 小計（不含本幀 delta 與工作區）：16 kHz D=8 為
+51.50 KiB、48 kHz D=8 為 97.00 KiB；D=64 則是 443.50 KiB 與 853.00 KiB。
 
 ### 6.3 Attention MAC 粗估
 
@@ -612,10 +679,10 @@ flowchart LR
         ESTFT["sqrt-Hann STFT<br/>512 / 256"]
         FSTFT["sqrt-Hann STFT<br/>512 / 256"]
         FEAT["固定前端 fp32<br/>signed pow(0.3) + magnitude<br/>+ 壓縮域相位 cos/sin"]
-        ERRI["error_mag / error_cos / error_sin<br/>各 [1,1,257]<br/>error_ri [1,1,257,2] 壓縮域"]
-        FARRI["far_mag<br/>[1,1,257]"]
-        KH["key_history<br/>[1,32,D-1,26]"]
-        VH["value_history<br/>[1,32,D-1,26]"]
+        ERRI["error_mag / error_cos / error_sin<br/>各 [1,1,K]<br/>error_ri [1,1,K,2] 壓縮域"]
+        FARRI["far_mag<br/>[1,1,K]"]
+        KH["key_history<br/>[1,32,D-1,TA]"]
+        VH["value_history<br/>[1,32,D-1,TA]"]
         LH["logit_history<br/>[1,32,4,D]"]
         GH["gru0/gru1 hidden<br/>each [1,2,1,128]"]
         UPDATE["ring_push(K_now/V_now/logit_now)<br/>hidden = hidden_next"]
@@ -642,7 +709,7 @@ flowchart LR
         TA["TA: current + history<br/>score conv + softmax"]
         BODY["joint conv + FGRU<br/>two temporal GRUs"]
         MASK["mask + compressed-domain compose"]
-        ENH["output(壓縮域)<br/>[1,1,257,2]"]
+        ENH["output(壓縮域)<br/>[1,1,K,2]"]
         DELTA["state delta outputs<br/>K_now / V_now / logit_now<br/>gru0_next / gru1_next"]
 
         ENC --> QKV --> TA --> BODY --> MASK --> ENH
@@ -686,7 +753,7 @@ magnitude、壓縮域相位 cos/sin 由 `ulcnet_model_io_prepare()` 內算，逆
 |---|---|---:|---|---:|---|
 | `host`（預設） | `split`（預設） | 8 | `error_mag`/`far_mag`/`error_cos`/`error_sin`/`error_ri` | 10 | 出貨合約；`ulcnet_model_io.h` 只綁這一對 |
 | `host` | `combined` | 9 | 同上五個 | 9 | 實驗用 |
-| `graph` | `split` | 10 | `error`/`far`（raw RI，各 `[1,1,257,2]`） | 7 | 實驗用 |
+| `graph` | `split` | 10 | `error`/`far`（raw RI，各 `[1,1,K,2]`） | 7 | 實驗用 |
 | `graph` | `combined` | 11 | 同上兩個 | 6 | 實驗用 |
 
   四對的 recurrent hidden 都是 rank-4 NCHW，所以 rank 改動時四對一起換號；
@@ -714,17 +781,18 @@ magnitude、壓縮域相位 cos/sin 由 `ulcnet_model_io_prepare()` 內算，逆
   instance 匯出對應 graph；calibration report 的 `state_layout_version` 讀的
   是實際 wrapper 的 layout，非預設 layout 不會被記成預設 layout 的版號。
 
-Inputs：
+Inputs（K = `n_fft/2+1`，16k: 257、48k: 513；TA = `ta_bins` = `ceil(K/10)`，
+16k: 26、48k: 52；D = `max_delay_frames`——見 §1.3）：
 
 | tensor | float32 shape | 來源／用途 |
 |---|---:|---|
-| `error_mag` | `[1,1,257]` | 壓縮域 linear-error magnitude |
-| `far_mag` | `[1,1,257]` | 壓縮域 far magnitude；far 固定取 AEC aligned-far seam（acquisition 前為 raw far，之後為 aligned far） |
-| `error_cos` | `[1,1,257]` | 壓縮域 error 相位 cos |
-| `error_sin` | `[1,1,257]` | 壓縮域 error 相位 sin |
-| `error_ri` | `[1,1,257,2]` | 壓縮域 error real/imag |
-| `key_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far keys |
-| `value_history` | `[1,32,D-1,26]` | 過去 D-1 幀 encoded far values |
+| `error_mag` | `[1,1,K]` | 壓縮域 linear-error magnitude |
+| `far_mag` | `[1,1,K]` | 壓縮域 far magnitude；far 固定取 AEC aligned-far seam（acquisition 前為 raw far，之後為 aligned far） |
+| `error_cos` | `[1,1,K]` | 壓縮域 error 相位 cos |
+| `error_sin` | `[1,1,K]` | 壓縮域 error 相位 sin |
+| `error_ri` | `[1,1,K,2]` | 壓縮域 error real/imag |
+| `key_history` | `[1,32,D-1,TA]` | 過去 D-1 幀 encoded far keys |
+| `value_history` | `[1,32,D-1,TA]` | 過去 D-1 幀 encoded far values |
 | `logit_history` | `[1,32,4,D]` | TA `(5,3)` score conv 的前 4 幀 raw logits |
 | `h_gru0` | `[1,2,1,128]` | temporal subband GRU 0，2 layers |
 | `h_gru1` | `[1,2,1,128]` | temporal subband GRU 1，2 layers |
@@ -733,9 +801,9 @@ Outputs：
 
 | tensor | float32 shape | CPU 操作 |
 |---|---:|---|
-| `output` | `[1,1,257,2]` | 壓縮域 estimate；host 逆冪還原後送 WOLA/IFFT |
-| `key_now` | `[1,32,1,26]` | push 進 `key_history` |
-| `value_now` | `[1,32,1,26]` | push 進 `value_history` |
+| `output` | `[1,1,K,2]` | 壓縮域 estimate；host 逆冪還原後送 WOLA/IFFT |
+| `key_now` | `[1,32,1,TA]` | push 進 `key_history` |
+| `value_now` | `[1,32,1,TA]` | push 進 `value_history` |
 | `logit_now` | `[1,32,1,D]` | push 進 4-frame `logit_history` |
 | `h_gru0_out` | `[1,2,1,128]` | 取代 `h_gru0` |
 | `h_gru1_out` | `[1,2,1,128]` | 取代 `h_gru1` |

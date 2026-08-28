@@ -12,6 +12,7 @@ _ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'Align_ULCNet')
 
 _DRIVER = r'''
 #include <math.h>
+#include <float.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -32,6 +33,11 @@ _Alignas(16) static unsigned char pool[1024 * 1024];
 static float signed_power_ref(float value, float exponent) {
     float magnitude = powf(fabsf(value), exponent);
     return value < 0.0f ? -magnitude : magnitude;
+}
+
+static int close_fp32(float actual, float expected) {
+    float scale = fmaxf(1.0f, fabsf(expected));
+    return fabsf(actual - expected) <= 2.0f * FLT_EPSILON * scale;
 }
 
 static int all_zero(const float *values, size_t count) {
@@ -65,11 +71,13 @@ int main(void) {
     UlcnetModelIoOutputs outputs;
     const size_t feature = ULCNET_MODEL_IO_TA_BINS;
     const size_t logit_frame = 8u;
-    float error_re[257], error_im[257], far_re[257], far_im[257];
-    float enhanced_re[257], enhanced_im[257];
+    float error_re[ULCNET_MODEL_IO_BINS], error_im[ULCNET_MODEL_IO_BINS];
+    float far_re[ULCNET_MODEL_IO_BINS], far_im[ULCNET_MODEL_IO_BINS];
+    float enhanced_re[ULCNET_MODEL_IO_BINS];
+    float enhanced_im[ULCNET_MODEL_IO_BINS];
     size_t index;
 
-    for (index = 0; index < 257u; ++index) {
+    for (index = 0; index < ULCNET_MODEL_IO_BINS; ++index) {
         error_re[index] = (float)index;
         error_im[index] = -(float)index;
         far_re[index] = 1000.0f + (float)index;
@@ -88,6 +96,11 @@ int main(void) {
     CHECK(ulcnet_model_io_get_mem_requirements(&d64, &r64) == 0);
     CHECK(r4.bytes < r8.bytes && r8.bytes < r64.bytes);
     CHECK(r8.alignment == ULCNET_MODEL_IO_ALIGNMENT);
+    CHECK(d8.sample_rate == ULCNET_MODEL_IO_SR);
+    CHECK(d8.fft_size == ULCNET_MODEL_IO_N_FFT);
+    CHECK(d8.hop_size == ULCNET_MODEL_IO_HOP);
+    CHECK(d8.spectrum_bins == ULCNET_MODEL_IO_BINS);
+    CHECK(d8.ta_bins == ULCNET_MODEL_IO_TA_BINS);
 
     invalid = d8;
     ++invalid.layout_version;
@@ -131,9 +144,9 @@ int main(void) {
 
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
-    CHECK(inputs.spectrum_ri_elements == 514u);
-    CHECK(inputs.spectrum_bins_elements == 257u);
-    CHECK(outputs.spectrum_ri_elements == 514u);
+    CHECK(inputs.spectrum_ri_elements == 2u * ULCNET_MODEL_IO_BINS);
+    CHECK(inputs.spectrum_bins_elements == ULCNET_MODEL_IO_BINS);
+    CHECK(outputs.spectrum_ri_elements == 2u * ULCNET_MODEL_IO_BINS);
     {
         /* prepare() runs the fixed front end (layout v5): the same fp32
          * expressions are evaluated here so the values are pinned exactly. */
@@ -180,14 +193,16 @@ int main(void) {
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
     /* commit() applies the inverse signed power to the graph's compressed
      * estimate (layout v5). */
-    CHECK(enhanced_re[0] == signed_power_ref(
-        50001.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP));
-    CHECK(enhanced_im[0] == signed_power_ref(
-        50002.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP));
-    CHECK(enhanced_re[256] == signed_power_ref(
-        50513.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP));
-    CHECK(enhanced_im[256] == signed_power_ref(
-        50514.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP));
+    CHECK(close_fp32(enhanced_re[0], signed_power_ref(
+        50001.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP)));
+    CHECK(close_fp32(enhanced_im[0], signed_power_ref(
+        50002.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP)));
+    CHECK(close_fp32(enhanced_re[ULCNET_MODEL_IO_BINS - 1], signed_power_ref(
+        50001.0f + 2.0f * (ULCNET_MODEL_IO_BINS - 1),
+        1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP)));
+    CHECK(close_fp32(enhanced_im[ULCNET_MODEL_IO_BINS - 1], signed_power_ref(
+        50002.0f + 2.0f * (ULCNET_MODEL_IO_BINS - 1),
+        1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP)));
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(inputs.key_history[0] == 1.0f);
@@ -235,7 +250,9 @@ int main(void) {
 '''
 
 
-def test_ulcnet_model_io_external_state_contract(tmp_path):
+@pytest.mark.parametrize('sample_rate,n_fft', [(16000, 512), (48000, 1024)])
+def test_ulcnet_model_io_external_state_contract(
+        tmp_path, sample_rate, n_fft):
     compiler = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
     if compiler is None:
         pytest.skip('no C compiler available')
@@ -245,6 +262,8 @@ def test_ulcnet_model_io_external_state_contract(tmp_path):
     subprocess.run([
         compiler,
         '-O2', '-std=c11', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
+        '-DULCNET_MODEL_IO_SR=%d' % sample_rate,
+        '-DULCNET_MODEL_IO_N_FFT=%d' % n_fft,
         '-I', _ULCNET_DIR,
         str(driver), os.path.join(_ULCNET_DIR, 'ulcnet_model_io.c'),
         '-lm', '-o', str(executable),
