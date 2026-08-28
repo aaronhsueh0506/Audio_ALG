@@ -197,33 +197,49 @@ def main(args):
         cfg, aec_grid, seed=args.seed,
         packed_dir=args.packed_dir, mmap=args.mmap,
     )
+    # The resolved numeric recipe, read ONCE and used both to record the
+    # contract and to build the optimizer below -- so what the checkpoint says
+    # trained the weights cannot drift from what did. No fallbacks: every key
+    # is in the shipped config, and a fallback would let one be deleted and
+    # silently re-supplied from source.
+    recipe = {
+        'name': cfg.get('training', 'optimizer').lower(),
+        'lr': cfg.getfloat('training', 'lr'),
+        'weight_decay': cfg.getfloat('training', 'weight_decay'),
+        'amsgrad': cfg.getboolean('training', 'amsgrad'),
+        'schedule': cfg.get('training', 'scheduler').lower(),
+        'lr_decay_factor': cfg.getfloat('training', 'lr_decay_factor'),
+        'lr_patience': cfg.getint('training', 'lr_patience'),
+        'min_lr': cfg.getfloat('training', 'min_lr'),
+    }
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
         model_kwargs=model_kwargs, loss_version=LOSS_VERSION,
-        data_contract=data_contract,
+        data_contract=data_contract, optimizer=recipe,
     )
 
     output_dir = cfg.get('training', 'output_dir', fallback='output')
     os.makedirs(output_dir, exist_ok=True)
-    lr = cfg.getfloat('training', 'lr', fallback=4e-3)
+    lr = recipe['lr']
     max_epochs = cfg.getint('training', 'max_epochs', fallback=50)
-    optimizer_name = cfg.get('training', 'optimizer', fallback='adam').lower()
-    if optimizer_name != 'adam':
+    if recipe['name'] != 'adam':
         raise ValueError("Align-ULCNet paper recipe requires optimizer=adam")
     optimizer = torch.optim.Adam(
         model.parameters(), lr=lr,
-        weight_decay=cfg.getfloat('training', 'weight_decay', fallback=0.0),
-        amsgrad=cfg.getboolean('training', 'amsgrad', fallback=False),
+        weight_decay=recipe['weight_decay'], amsgrad=recipe['amsgrad'],
     )
-    scheduler_name = cfg.get(
-        'training', 'scheduler', fallback='reduce_on_plateau').lower()
-    if scheduler_name != 'reduce_on_plateau':
+    if recipe['schedule'] != 'reduce_on_plateau':
         raise ValueError(
             "Align-ULCNet paper recipe requires scheduler=reduce_on_plateau")
+    # min_lr is a floor, not a paper value -- the paper gives the factor and
+    # the patience but no bound, and PyTorch's default is 0. Without it a run
+    # whose validation stalls halves its way to a dead LR and keeps going:
+    # two non-improving epochs per x0.1 is 24 reductions inside a 50-epoch
+    # budget, and early stopping is off by design.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min',
-        factor=cfg.getfloat('training', 'lr_decay_factor', fallback=0.1),
-        patience=cfg.getint('training', 'lr_patience', fallback=1),
+        factor=recipe['lr_decay_factor'], patience=recipe['lr_patience'],
+        min_lr=recipe['min_lr'],
     )
 
     start_epoch, global_step, best_val, no_improve = 0, 0, float('inf'), 0

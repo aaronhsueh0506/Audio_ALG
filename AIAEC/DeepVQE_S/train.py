@@ -218,28 +218,40 @@ def main(args):
         cfg, aec_grid, seed=args.seed,
         packed_dir=args.packed_dir, mmap=args.mmap,
     )
+    # The resolved numeric recipe, read ONCE and used both to record the
+    # contract and to build the optimizer below -- so what the checkpoint says
+    # trained the weights cannot drift from what did. No fallbacks: every key
+    # is in the shipped config, and a fallback would let one be deleted and
+    # silently re-supplied from source.
+    recipe = {
+        'name': cfg.get('training', 'optimizer').lower(),
+        'lr': cfg.getfloat('training', 'lr'),
+        'weight_decay': cfg.getfloat('training', 'weight_decay'),
+        'amsgrad': cfg.getboolean('training', 'amsgrad'),
+        'schedule': cfg.get('training', 'scheduler').lower(),
+        'min_lr': cfg.getfloat('training', 'min_lr'),
+        'lr_warmup': cfg.getfloat('training', 'lr_warmup'),
+        'warmup_epochs': cfg.getint('training', 'warmup_epochs'),
+    }
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
         model_kwargs=model_kwargs, loss_version=LOSS_VERSION,
-        data_contract=data_contract,
+        data_contract=data_contract, optimizer=recipe,
     )
 
     output_dir = cfg.get('training', 'output_dir', fallback='output')
     os.makedirs(output_dir, exist_ok=True)
-    lr = cfg.getfloat('training', 'lr', fallback=1.2e-3)
+    lr = recipe['lr']
     max_epochs = cfg.getint('training', 'max_epochs', fallback=50)
-    optimizer_name = cfg.get('training', 'optimizer', fallback='adamw').lower()
-    if optimizer_name != 'adamw':
+    if recipe['name'] != 'adamw':
         raise ValueError("DeepVQE-S paper recipe requires optimizer=adamw")
-    if cfg.get('training', 'scheduler',
-               fallback='warmup_cosine').lower() != 'warmup_cosine':
+    if recipe['schedule'] != 'warmup_cosine':
         raise ValueError(
             "DeepVQE-S uses the shared warmup/cosine schedule; the paper "
             "publishes no schedule of its own")
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr,
-        weight_decay=cfg.getfloat('training', 'weight_decay', fallback=5e-7),
-        amsgrad=cfg.getboolean('training', 'amsgrad', fallback=False),
+        weight_decay=recipe['weight_decay'], amsgrad=recipe['amsgrad'],
     )
     # Per optimizer step, so the horizon is steps and not epochs. Deliberately
     # NOT stored in the checkpoint: fast_forward_scheduler()'s docstring has

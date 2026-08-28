@@ -97,6 +97,13 @@ Early stopping cannot end these runs before epoch 50; validation still selects
 the best checkpoint, and Align-ULCNet still applies its published LR reduction.
 Changing a loss recipe changes `loss_version`, so a checkpoint from the old
 generic recipe is rejected instead of silently resuming under a new objective.
+The checkpoint contract also records the resolved training recipe -- optimizer
+name, learning rate, weight decay, amsgrad, schedule and the schedule's own
+scalars -- read once and used both to build the optimizer and to write the
+contract. Without it two runs of one model that differ only in learning rate
+produce identical contracts and resume into each other in silence, which is
+exactly the drift `require_checkpoint_contract` exists to catch and which
+became reachable the moment the four candidates stopped sharing one recipe.
 Align-ULCNet is the only model with a STATEFUL scheduler: plateau state cannot
 be reconstructed from a step count, so it is stored and restored with the
 optimizer. DeepVQE-S also runs a schedule, but a reconstructible one -- the

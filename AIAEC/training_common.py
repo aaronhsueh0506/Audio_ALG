@@ -447,13 +447,23 @@ def checkpoint_far_input_mode(contract: Dict) -> str:
 
 def make_checkpoint_contract(*, model_name: str, task: str, grid, model_kwargs: Dict,
                              loss_version: str, feature_version: Optional[str] = None,
-                             data_contract: Optional[Dict] = None) -> Dict:
+                             data_contract: Optional[Dict] = None,
+                             optimizer: Optional[Dict] = None) -> Dict:
     """The fields a checkpoint must match to be resumed or loaded for inference.
 
     ``model_kwargs`` should be exactly what ``read_model_kwargs`` returned
     (or what was passed to the model constructor), so a config edit that
     changes the model's shape is caught before ``load_state_dict`` turns it
     into a cryptic size-mismatch error.
+
+    ``optimizer`` is the resolved training recipe -- the optimizer name, its
+    numeric arguments and the schedule.  Since the four candidates diverged
+    onto their own papers' recipes these differ per model AND per run, and
+    without them two runs of one model at different learning rates produce
+    identical contracts and resume into each other in silence.  Recording the
+    recipe here rather than encoding it in ``loss_version`` keeps the loss
+    string about the loss.  Optional so a caller with no optimizer (an export
+    or an evaluation) can still build a contract.
 
     ``grid`` accepts either ``AIAEC.aiaec_common.SignalGrid`` (``.sample_rate``,
     the model-boundary type) or ``AIAEC.dataset_gen.AecGrid`` (``.sr``, the
@@ -479,6 +489,8 @@ def make_checkpoint_contract(*, model_name: str, task: str, grid, model_kwargs: 
         # checkpoint_far_input_mode, so the field is additive.
         'far_input_mode': 'raw_far',
     }
+    if optimizer is not None:
+        contract['optimizer'] = dict(optimizer)
     if feature_version is not None:
         contract['feature_version'] = feature_version
     if data_contract is not None:

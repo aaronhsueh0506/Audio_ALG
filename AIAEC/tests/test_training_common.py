@@ -965,6 +965,121 @@ def test_main_builds_its_paper_optimizer_before_the_first_epoch(
     assert type(seen['optimizer']) is expected_type
 
 
+def _drive_main_capturing(model_name, monkeypatch, tmp_path, config_path,
+                          capture, scheduler_box=None):
+    """Run a trainer's real ``main`` far enough to build its objects."""
+    trainer = importlib.import_module(f'AIAEC.{model_name}.train')
+    linear = make_linear_aec_contract(16000, frame_size=512)
+
+    class FakePackedDataset:
+        def __init__(self, path, expected_sr=None, mmap=False):
+            self.linear_aec_contract = linear
+            self.linear_aec_contract_hash = linear.fingerprint()
+
+        def __len__(self):
+            return 8
+
+        def __getitem__(self, index):
+            return torch.zeros(5, 16000), {}
+
+        def fingerprint(self):
+            return 'fake-corpus'
+
+    def fake_run_epoch(*args, **kwargs):
+        capture['contract'] = kwargs['checkpoint_for_halt']['contract']
+        raise _StopAfterSetup
+
+    if scheduler_box is not None:
+        real_plateau = torch.optim.lr_scheduler.ReduceLROnPlateau
+
+        def spy(*args, **kwargs):
+            built = real_plateau(*args, **kwargs)
+            scheduler_box['kwargs'] = kwargs
+            scheduler_box['scheduler'] = built
+            return built
+
+        monkeypatch.setattr(
+            torch.optim.lr_scheduler, 'ReduceLROnPlateau', spy)
+
+    monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
+    monkeypatch.setattr(trainer, 'run_epoch', fake_run_epoch)
+    monkeypatch.chdir(tmp_path)
+    args = trainer.build_parser().parse_args(
+        ['--config', str(config_path), '--packed-dir', 'fake', '--device', 'cpu']
+    )
+    with pytest.raises(_StopAfterSetup):
+        trainer.main(args)
+    return capture['contract']
+
+
+@pytest.mark.parametrize('model_name', sorted(MODEL_TASKS))
+def test_the_checkpoint_contract_records_the_training_recipe(
+        model_name, monkeypatch, tmp_path):
+    """Two runs of one model at different learning rates must not resume into
+    each other.
+
+    ``require_checkpoint_contract`` compares the contract and nothing else, so
+    if the recipe is absent those two runs are indistinguishable -- same model,
+    same grid, same ``loss_version`` -- and a checkpoint trained at one LR
+    silently continues under another.  The four candidates now carry different
+    optimizers and different numbers, which is exactly when this stops being
+    hypothetical.
+    """
+    shipped = (pathlib.Path(training_common.__file__).parent
+               / model_name / 'config.ini')
+    cfg = configparser.ConfigParser()
+    assert cfg.read(shipped), shipped
+
+    contract = _drive_main_capturing(
+        model_name, monkeypatch, tmp_path, shipped, {})
+    recorded = contract['optimizer']
+    assert recorded['name'] == cfg.get('training', 'optimizer').lower()
+    assert recorded['lr'] == pytest.approx(cfg.getfloat('training', 'lr'))
+    assert recorded['weight_decay'] == pytest.approx(
+        cfg.getfloat('training', 'weight_decay'))
+    assert recorded['schedule'] == cfg.get('training', 'scheduler').lower()
+
+    # The same config with one number changed must produce a contract the
+    # comparison refuses -- that is the property, not merely that a field
+    # exists.
+    cfg.set('training', 'lr', repr(cfg.getfloat('training', 'lr') * 2.0))
+    other_path = tmp_path / 'other.ini'
+    with open(other_path, 'w', encoding='utf-8') as handle:
+        cfg.write(handle)
+    other = _drive_main_capturing(
+        model_name, monkeypatch, tmp_path, other_path, {})
+    assert other != contract
+    with pytest.raises(ValueError):
+        require_checkpoint_contract({'contract': other}, contract)
+
+
+def test_align_ulcnet_plateau_reductions_have_a_floor(monkeypatch, tmp_path):
+    """The plateau schedule must not be able to anneal the LR to nothing.
+
+    PyTorch's default ``min_lr`` is 0 and this campaign disables early
+    stopping, so a run whose validation stalls takes one x0.1 every two epochs
+    -- up to 24 of them inside the 50-epoch budget -- and spends its tail at an
+    LR that cannot learn while still reporting a full run.  Driving the real
+    ``main`` proves the floor reaches the scheduler, not merely the config.
+    """
+    shipped = (pathlib.Path(training_common.__file__).parent
+               / 'Align_ULCNet' / 'config.ini')
+    cfg = configparser.ConfigParser()
+    assert cfg.read(shipped), shipped
+    floor = cfg.getfloat('training', 'min_lr')
+
+    box = {}
+    _drive_main_capturing(
+        'Align_ULCNet', monkeypatch, tmp_path, shipped, {}, scheduler_box=box)
+    assert box['kwargs'].get('min_lr') == pytest.approx(floor), (
+        'ReduceLROnPlateau was built without the configured floor')
+
+    scheduler = box['scheduler']
+    for _ in range(cfg.getint('training', 'max_epochs')):
+        scheduler.step(1.0)          # never improves
+    assert scheduler.optimizer.param_groups[0]['lr'] == pytest.approx(floor)
+
+
 def test_deepvqe_s_steps_its_schedule_per_batch_not_per_epoch(
         monkeypatch, tmp_path):
     """The cosine horizon must be counted in optimizer steps, not epochs.
@@ -1102,6 +1217,7 @@ def test_align_ulcnet_resume_restores_early_stop_counter(
         'scheduler = reduce_on_plateau\n'
         'lr_decay_factor = 0.1\n'
         'lr_patience = 1\n'
+        'min_lr = 1e-6\n'
         'max_epochs = 20\n'
         'early_stop_patience = 15\n'
         'grad_clip = 1.0\n'

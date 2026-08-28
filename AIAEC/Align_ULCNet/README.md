@@ -101,7 +101,12 @@ a different D.  If memory is still insufficient, reduce `[data] batch_size`.
 ## Training recipe
 
 The shipped `config.ini` uses the paper's Adam optimizer (`lr=4e-3`) and
-reduces LR by 10x after one validation epoch without improvement. The loss is
+reduces LR by 10x after one validation epoch without improvement. PyTorch
+counts that patience as "tolerate one non-improving epoch, reduce on the
+second". The `min_lr=1e-6` floor is NOT a paper value -- the paper gives the
+factor and the patience but no bound and PyTorch defaults to 0, which lets a
+stalled run take up to 24 reductions inside the 50-epoch budget and spend its
+tail unable to learn while still reporting a full run. The loss is
 ULCNet's component-wise signed power compression followed by frequency-domain
 MSE (`c=0.3`). This campaign uses D=32, batch 16, and the full 50-epoch budget;
 the paper used D=64, batch 64, 3-second examples, and 20,000 steps per epoch.
