@@ -24,6 +24,14 @@ published 0.59 M small-model class (the 16 kHz power-of-two adaptation is about
 explicit reconstruction choices. It is architecture-faithful, not checkpoint
 or bit exact.
 
+## Training recipe
+
+The shipped `config.ini` uses the paper's AdamW settings (`lr=1.2e-3`,
+`weight_decay=5e-7`) with constant LR. The paper does not publish its loss, so
+this implementation explicitly inherits Align-CRUSE's STFT-consistent PLCPA
+objective (`c=0.3`, `beta=0.7` on the phase-aware complex term). This campaign
+uses batch 8 to fit the available GPU and runs the full 50-epoch budget.
+
 ## ONNX and calibration
 
 ```bash

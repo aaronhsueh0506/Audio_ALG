@@ -18,7 +18,7 @@ config.ini sections (see the shipped config.ini for every knob, documented):
                an unknown key raises rather than being silently ignored, so a
                typo cannot build a differently-shaped model
     [training] optimizer, seed, epoch budget, checkpoint/log locations
-    [loss]     compressed_spectral_loss term weights
+    [loss]     paper MSE + SI-SNR + L1 objective weights
 
 dataset:
     Data is rendered and packed by AIAEC/dataset_gen/ only -- see
@@ -80,24 +80,22 @@ from AIAEC.training_common import (
     build_arg_parser,
     build_plain_loaders,
     auto_device,
-    compressed_spectral_loss,
     halt_on_non_finite,
-    fast_forward_scheduler,
     make_checkpoint_contract,
-    make_optimizer,
-    make_scheduler,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
     scan_non_finite,
     set_seed,
+    si_snr_loss,
+    spectrum_to_waveform,
     training_progress,
 )
 
 
 MODEL_NAME = 'CAGCRN'
 TASK = MODEL_TASKS[MODEL_NAME]
-LOSS_VERSION = 'aiaec_compressed_spectral_v1'
+LOSS_VERSION = 'cagcrn_mse_sisnr_l1_adamw_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -122,10 +120,13 @@ def forward_batch(model, stems_batch, aec_grid, device):
 def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
              epoch=0, global_step=0, output_dir=None, sr=None,
              grad_clip=1.0, checkpoint_for_halt=None, grad_log=None,
-             max_epochs=None, scheduler=None):
+             max_epochs=None):
     training = optimizer is not None
     model.train(training)
     total_loss, n_batches = 0.0, 0
+    # Fixed once the model is built. Counting it inside the batch loop walked
+    # every parameter tensor in Python on every step for a constant.
+    parameter_count = sum(p.numel() for p in model.parameters())
 
     batches = training_progress(
         loader, training=training, epoch=epoch, max_epochs=max_epochs
@@ -133,12 +134,21 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
     for batch_idx, (stems_batch, _meta) in enumerate(batches):
         with torch.set_grad_enabled(training):
             output, spectral = forward_batch(model, stems_batch, aec_grid, device)
-            loss = compressed_spectral_loss(
-                output.enhanced, spectral.target,
-                compression=loss_cfg.getfloat('compression'),
-                magnitude_weight=loss_cfg.getfloat('magnitude_weight'),
-                complex_weight=loss_cfg.getfloat('complex_weight'),
+            spectral_mse = (output.enhanced - spectral.target).abs().square().mean()
+            estimate_wave = spectrum_to_waveform(output.enhanced, aec_grid)
+            target_wave = spectrum_to_waveform(spectral.target, aec_grid)
+            sisnr = si_snr_loss(
+                estimate_wave, target_wave,
+                eps=loss_cfg.getfloat('eps', fallback=1e-8),
             )
+            # The paper calls L1 a sparsity regularizer but does not state a
+            # normalization.  Mean absolute parameter value keeps its scale
+            # invariant when the model width changes; a raw sum would make the
+            # coefficient secretly depend on parameter count.
+            l1 = sum(p.abs().sum() for p in model.parameters()) / parameter_count
+            loss = (loss_cfg.getfloat('mse_weight', fallback=1.0) * spectral_mse
+                    + loss_cfg.getfloat('si_snr_weight', fallback=1.0) * sisnr
+                    + loss_cfg.getfloat('l1_weight', fallback=1.0) * l1)
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -174,7 +184,6 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
                     enhanced=output.enhanced,
                 )
             optimizer.step()
-            scheduler.step()
             if grad_log is not None:
                 grad_log.record(
                     total_norm, epoch=epoch, batch_idx=batch_idx,
@@ -225,47 +234,41 @@ def main(args):
     output_dir = cfg.get('training', 'output_dir', fallback='output')
     os.makedirs(output_dir, exist_ok=True)
     lr = cfg.getfloat('training', 'lr', fallback=1e-3)
-    min_lr = cfg.getfloat('training', 'min_lr', fallback=1e-6)
-    warmup_lr = cfg.getfloat('training', 'lr_warmup', fallback=1e-4)
-    warmup_ep = cfg.getint('training', 'warmup_epochs', fallback=3)
-    max_epochs = cfg.getint('training', 'max_epochs', fallback=100)
-    # Decoupled weight decay by default -- make_optimizer()'s comment has the
-    # mechanism by which the coupled form drives a quiet branch into denormals.
-    optimizer = make_optimizer(cfg, model.parameters(), lr=lr)
-    # Per-step linear warmup into cosine annealing.  This trainer previously had
-    # no scheduler at all: the lr stayed at its initial value for the whole run,
-    # so the late epochs kept taking early-epoch-sized steps and the weights
-    # never settled.  The LR trajectory is part of the comparison protocol --
-    # candidates trained over "the same 100 epochs" must be on the same one.
-    total_steps = max_epochs * len(train_loader)
-    warmup_steps = min(warmup_ep * len(train_loader), total_steps - 1)
-    scheduler = make_scheduler(
-        optimizer, warmup_steps, total_steps, lr, min_lr, warmup_lr,
+    max_epochs = cfg.getint('training', 'max_epochs', fallback=50)
+    optimizer_name = cfg.get('training', 'optimizer', fallback='adamw').lower()
+    if optimizer_name != 'adamw':
+        raise ValueError("CAGCRN paper recipe requires optimizer=adamw")
+    if cfg.get('training', 'scheduler', fallback='constant').lower() != 'constant':
+        raise ValueError("CAGCRN paper reports a constant LR")
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr,
+        weight_decay=cfg.getfloat('training', 'weight_decay', fallback=5e-7),
+        amsgrad=cfg.getboolean('training', 'amsgrad', fallback=False),
     )
 
     start_epoch, global_step, best_val = 0, 0, float('inf')
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         require_checkpoint_contract(ckpt, contract, context=args.resume)
-        poisoned = scan_non_finite(model)
         model.load_state_dict(ckpt['state_dict'])
-        if scan_non_finite(model) and not poisoned:
-            raise NonFiniteTraining(f"{args.resume} contains non-finite weights")
+        poisoned = scan_non_finite(model)
+        if poisoned:
+            raise NonFiniteTraining(
+                f"{args.resume} contains non-finite weights: {poisoned[:5]}")
         if not args.reset_optimizer:
             optimizer.load_state_dict(ckpt['optimizer'])
             start_epoch = ckpt['epoch'] + 1
             global_step = ckpt['global_step']
             best_val = ckpt.get('best_val', best_val)
-        # Rebuilt, never restored -- fast_forward_scheduler()'s docstring has
-        # the measured reason a stored T_max must not come back.
-        resumed_lr = fast_forward_scheduler(scheduler, global_step)
+        resumed_lr = optimizer.param_groups[0]['lr']
         print(f"Resumed from {args.resume} at epoch {start_epoch}"
               f"{' (fresh optimizer)' if args.reset_optimizer else ''}"
               f", lr={resumed_lr:.4e}")
 
     loss_cfg = cfg['loss'] if cfg.has_section('loss') else {
-        'compression': '0.3', 'magnitude_weight': '1.0', 'complex_weight': '1.0'}
-    patience = cfg.getint('training', 'early_stop_patience', fallback=15)
+        'mse_weight': '1.0', 'si_snr_weight': '1.0',
+        'l1_weight': '1.0', 'eps': '1e-8'}
+    patience = cfg.getint('training', 'early_stop_patience', fallback=50)
     grad_clip = cfg.getfloat('training', 'grad_clip', fallback=1.0)
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), aec_grid.sr)
     # Per-tensor, because grad_norm.csv above is a GLOBAL norm and stays healthy
@@ -285,7 +288,7 @@ def main(args):
             epoch=epoch, global_step=global_step, output_dir=output_dir,
             sr=aec_grid.sr, grad_clip=grad_clip,
             checkpoint_for_halt=checkpoint_for_halt, grad_log=grad_log,
-            max_epochs=max_epochs, scheduler=scheduler,
+            max_epochs=max_epochs,
         )
         msg = f"epoch {epoch}: train_loss={train_loss:.4f} ({time.time()-started:.0f}s)"
 
@@ -300,6 +303,10 @@ def main(args):
             'epoch': epoch, 'global_step': global_step, 'contract': contract,
             'best_val': min(best_val, val_loss),
         }
+        poisoned = scan_non_finite(model)
+        if poisoned:
+            raise NonFiniteTraining(
+                f"refusing to save non-finite weights: {poisoned[:5]}")
         weight_guard.check(epoch=epoch, global_step=global_step)
         torch.save(checkpoint, os.path.join(output_dir, f'{MODEL_NAME.lower()}_last.pth'))
         if val_loss < best_val:

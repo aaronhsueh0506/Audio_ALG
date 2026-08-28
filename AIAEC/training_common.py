@@ -24,27 +24,30 @@ Provided here:
   re-exported from ``AINR.training_common``, not reimplemented a second time.
   ``WeightScaleGuard`` covers the failure ``scan_non_finite`` structurally
   cannot: weights that decay to denormal magnitudes stay FINITE
-* ``make_optimizer``                          -- ``[training] optimizer``, part
-  of the comparison protocol for the same reason the LR schedule is: four
-  candidates are not comparable if one of them decays its weights inside Adam's
-  moment normaliser and the others do not
-* ``make_scheduler`` / ``fast_forward_scheduler`` -- likewise: linear warmup into
-  cosine annealing, stepped per optimizer step.  The LR trajectory is part of
-  the comparison protocol, so four candidates trained over "the same 100 epochs"
-  must be on the same schedule, and a constant LR is not one
-* ``compressed_spectral_loss``                -- none of the four candidates'
-  papers publish a loss (see ``docs/ai_aec_candidate_matrix.md`` and the
-  DeepVQE_S/CAGCRN READMEs' "did not publish ... loss details"); this is the
-  one loss every trainer uses, so scores stay comparable across candidates
+* ``make_optimizer``                          -- fallback optimizer selector for
+  candidates whose paper does not prescribe a different recipe
+* ``make_scheduler`` / ``fast_forward_scheduler`` -- the legacy project
+  warmup/cosine recipe, retained for old checkpoints rather than imposed on
+  models whose papers prescribe another schedule
+* ``compressed_spectral_loss``                -- project fallback for candidates
+  whose paper does not publish a training objective
+* ``component_compressed_mse_loss``           -- Align-ULCNet/ULCNet paper
+  objective: component-wise signed power compression followed by complex MSE
+* ``power_compressed_complex_mse_loss``       -- Align-CRUSE PLCPA objective
+* ``si_snr_loss``                             -- waveform SI-SNR term used by
+  CAGCRN
+* ``stft_consistent_spectrum`` / ``spectrum_to_waveform`` -- differentiable
+  shared synthesis boundaries for objectives defined after iSTFT
 * ``LinearAecEngine``                         -- inference-only continuous-file
   wrapper around the same frozen Python PBFDKF whose output is materialized as
   dataset stem five (`linear_error`). Trainers never execute it.
 * ``split_dataset_by_sample`` / ``build_plain_loaders`` -- deterministic
   per-chunk train/val split plus epoch-level shuffle for the unified corpus.
 
-Do not add a fifth copy of any of this into a candidate's ``train.py``. If a
-candidate genuinely needs different behaviour, change the signature here so
-every trainer can see the choice was made -- the same reasoning
+Do not add a fifth copy of generic infrastructure into a candidate's
+``train.py``. A paper-specific optimizer or scheduler remains in that
+candidate, is recorded in its checkpoint contract, and must not be presented
+as a cross-model comparison rule. The same reasoning
 ``AIAEC/dataset_gen/README.md`` gives for ``aec_features.py``.
 """
 
@@ -97,6 +100,8 @@ from AIAEC.dataset_gen import (  # noqa: E402
     MODEL_TASKS,
     PackedAecDataset,
     aec_collate,
+    istft,
+    stft,
 )
 from AIAEC.dataset_gen.linear_aec import (  # noqa: E402
     DATASET_DELAY_NUM_FILTERS,
@@ -137,6 +142,11 @@ __all__ = [
     'DEFAULT_OPTIMIZER',
     'make_optimizer',
     'compressed_spectral_loss',
+    'component_compressed_mse_loss',
+    'power_compressed_complex_mse_loss',
+    'si_snr_loss',
+    'stft_consistent_spectrum',
+    'spectrum_to_waveform',
     'LinearAecEngine',
     'make_scheduler',
     'fast_forward_scheduler',
@@ -571,15 +581,10 @@ def compressed_spectral_loss(estimate: Tensor, target: Tensor, *,
                              eps: float = 1e-12) -> Tensor:
     """Power-law compressed magnitude + complex L1 loss.
 
-    No AIAEC candidate paper publishes a loss function -- see
-    ``docs/ai_aec_candidate_matrix.md`` and the DeepVQE_S / CAGCRN READMEs
-    ("did not publish ... loss details"). This is therefore a project choice
-    used identically by all four trainers, so scores stay comparable across
-    candidates instead of each optimising a different objective.
-    ``compression=0.3`` matches the compression exponent Align-ULCNet and
-    DeepVQE-S already use for their own INPUT features (see
-    ``aiaec_common.compressed_ri_feature``), so the loss and the feature
-    domain share one compression law rather than two unrelated ones.
+    This is the project fallback for candidates without a published objective.
+    It is not the ULCNet frequency-domain loss: ULCNet compresses real and
+    imaginary components independently and applies MSE, which is implemented
+    by :func:`component_compressed_mse_loss`.
     """
     if estimate.shape != target.shape:
         raise ValueError(
@@ -595,6 +600,122 @@ def compressed_spectral_loss(estimate: Tensor, target: Tensor, *,
                     + (comp_e.imag - comp_t.imag).abs().mean())
     magnitude_term = (mag_e.pow(compression) - mag_t.pow(compression)).abs().mean()
     return complex_weight * complex_term + magnitude_weight * magnitude_term
+
+
+def component_compressed_mse_loss(estimate: Tensor, target: Tensor, *,
+                                  compression: float = 0.3,
+                                  eps: float = 1e-12) -> Tensor:
+    """ULCNet frequency-domain MSE after component-wise compression.
+
+    ULCNet applies ``sign(x) * abs(x) ** alpha`` independently to the real and
+    imaginary STFT components.  This differs from conventional PLCPA, which
+    compresses the complex magnitude while retaining the original phase.
+    """
+    if estimate.shape != target.shape:
+        raise ValueError(
+            f"estimate/target shape mismatch: {tuple(estimate.shape)} vs "
+            f"{tuple(target.shape)}")
+    if not torch.is_complex(estimate) or not torch.is_complex(target):
+        raise ValueError(
+            "component_compressed_mse_loss expects complex spectra")
+    if not 0.0 < compression <= 1.0:
+        raise ValueError("compression must be in (0, 1]")
+
+    def compress_component(x: Tensor) -> Tensor:
+        # Clamp only inside the selected nonzero branch.  abs(x)**c has an
+        # infinite derivative at zero for c<1; the literal formula therefore
+        # turns exact-zero bins into NaN gradients even though their value is
+        # well defined.  This keeps f(0)=0 while making backward finite.
+        magnitude = x.abs()
+        # A 0-d zero broadcasts, so the false branch costs nothing; zeros_like
+        # would allocate and fill a full [B,T,F] frame on each of the four
+        # calls this loss makes per batch.
+        return torch.where(
+            magnitude > 0,
+            x.sign() * magnitude.clamp_min(eps).pow(compression),
+            x.new_zeros(()),
+        )
+
+    estimate_real = compress_component(estimate.real)
+    estimate_imag = compress_component(estimate.imag)
+    target_real = compress_component(target.real)
+    target_imag = compress_component(target.imag)
+    return ((estimate_real - target_real).square()
+            + (estimate_imag - target_imag).square()).mean()
+
+
+def power_compressed_complex_mse_loss(
+        estimate: Tensor, target: Tensor, *, compression: float = 0.3,
+        complex_weight: float = 0.7, eps: float = 1e-12) -> Tensor:
+    """Align-CRUSE power-compressed magnitude/complex MSE (PLCPA).
+
+    ``complex_weight`` is the paper's beta: beta weights the phase-aware
+    complex error and ``1-beta`` weights the compressed magnitude error.
+    """
+    if estimate.shape != target.shape:
+        raise ValueError(
+            f"estimate/target shape mismatch: {tuple(estimate.shape)} vs "
+            f"{tuple(target.shape)}")
+    if not torch.is_complex(estimate) or not torch.is_complex(target):
+        raise ValueError(
+            "power_compressed_complex_mse_loss expects complex spectra")
+    if not 0.0 < compression <= 1.0:
+        raise ValueError("compression must be in (0, 1]")
+    if not 0.0 <= complex_weight <= 1.0:
+        raise ValueError("complex_weight must be in [0, 1]")
+
+    mag_e = safe_abs(estimate, eps)
+    mag_t = safe_abs(target, eps)
+    mag_e_c = mag_e.pow(compression)
+    mag_t_c = mag_t.pow(compression)
+    complex_e = estimate * mag_e.pow(compression - 1.0)
+    complex_t = target * mag_t.pow(compression - 1.0)
+    magnitude_mse = (mag_e_c - mag_t_c).square().mean()
+    complex_mse = ((complex_e.real - complex_t.real).square()
+                   + (complex_e.imag - complex_t.imag).square()).mean()
+    return ((1.0 - complex_weight) * magnitude_mse
+            + complex_weight * complex_mse)
+
+
+def si_snr_loss(estimate: Tensor, target: Tensor,
+                eps: float = 1e-8) -> Tensor:
+    """Negative scale-invariant SNR, averaged over the leading dimensions."""
+    if estimate.shape != target.shape:
+        raise ValueError(
+            f"estimate/target shape mismatch: {tuple(estimate.shape)} vs "
+            f"{tuple(target.shape)}")
+    if estimate.ndim < 1 or torch.is_complex(estimate) or torch.is_complex(target):
+        raise ValueError("si_snr_loss expects real waveforms ending in time")
+    estimate_zm = estimate - estimate.mean(dim=-1, keepdim=True)
+    target_zm = target - target.mean(dim=-1, keepdim=True)
+    projection = ((estimate_zm * target_zm).sum(dim=-1, keepdim=True)
+                  * target_zm
+                  / target_zm.square().sum(dim=-1, keepdim=True).clamp_min(eps))
+    noise = estimate_zm - projection
+    ratio = (projection.square().sum(dim=-1)
+             / noise.square().sum(dim=-1).clamp_min(eps))
+    return -10.0 * torch.log10(ratio.clamp_min(eps)).mean()
+
+
+def spectrum_to_waveform(spectrum: Tensor, grid: AecGrid) -> Tensor:
+    """Public ``[B,T,F]`` complex spectrum -> differentiable waveform."""
+    if spectrum.ndim != 3 or not torch.is_complex(spectrum):
+        raise ValueError("spectrum_to_waveform expects complex [B,T,F]")
+    if spectrum.shape[-1] != grid.n_freqs:
+        raise ValueError(
+            f"spectrum has {spectrum.shape[-1]} bins, expected {grid.n_freqs}")
+    return istft(spectrum.transpose(-2, -1), grid)
+
+
+def stft_consistent_spectrum(spectrum: Tensor, grid: AecGrid) -> Tensor:
+    """Project a public ``[B,T,F]`` spectrum through iSTFT -> STFT."""
+    waveform = spectrum_to_waveform(spectrum, grid)
+    consistent = stft(waveform, grid).transpose(-2, -1)
+    if consistent.shape != spectrum.shape:
+        raise RuntimeError(
+            "STFT consistency changed shape: "
+            f"{tuple(spectrum.shape)} -> {tuple(consistent.shape)}")
+    return consistent
 
 
 # ============================================================
@@ -619,15 +740,11 @@ DEFAULT_OPTIMIZER = 'adamw'
 
 
 def make_optimizer(cfg, params, *, lr: float) -> torch.optim.Optimizer:
-    """Build the ``[training]`` optimizer every AIAEC candidate shares.
+    """Build the legacy configurable optimizer used by older experiments.
 
-    The optimizer belongs to the comparison protocol exactly as the LR schedule
-    does: four candidates trained over "the same 100 epochs" are not comparable
-    if one of them decays its weights inside the moment normaliser and the rest
-    do not.  So the name, ``weight_decay`` and ``amsgrad`` are read here once
-    instead of in four ``train.py`` files, and an unrecognised name is REFUSED
-    rather than quietly falling back -- a typo that silently trains something
-    else is the drift this module exists to prevent.
+    New paper-reference trainers construct the optimizer named by their own
+    recipe directly.  This selector remains for checkpoint reproduction and
+    for candidates without a published optimizer; an unknown name is refused.
 
     ``weight_decay`` keeps its nominal 1e-4 across the switch.  Decoupled, that
     number is a much gentler regulariser than the same number was coupled, and
@@ -659,8 +776,8 @@ def halt_on_non_finite(reason: str, *, model, mic: Tensor, target: Tensor,
     """Dump evidence and raise, delegating to ``AINR.training_common``.
 
     ``mic``/``target`` are whatever the caller's loss operates on -- for every
-    AIAEC trainer that is a COMPLEX SPECTRUM, not a waveform, because
-    ``compressed_spectral_loss`` runs in the spectral domain. The delegate's
+    AIAEC trainer that is a COMPLEX SPECTRUM, not a waveform, because the
+    model-specific spectral objectives run in that domain. The delegate's
     WAV dump therefore raises inside its own try/except and is skipped (it
     tries ``torchaudio.save`` on a complex tensor); the ``batch.pt`` tensor
     dump and ``lanes.txt`` per-lane summary, which do not assume a waveform

@@ -23,6 +23,15 @@ Those choices make the architecture trainable but checkpoint-incompatible with
 any unpublished author implementation. CAGCRN remains a backup until these
 ambiguities are resolved empirically.
 
+## Training recipe
+
+The shipped `config.ini` uses the paper's AdamW settings (`lr=1e-3`,
+`weight_decay=5e-7`), batch 32, constant LR, and the published MSE + SI-SNR +
+L1 objective. Because the paper does not define the L1 normalization, this
+implementation uses the mean absolute parameter value and records that choice
+in the checkpoint loss version. This campaign runs 50 epochs rather than the
+paper's 1000.
+
 ## ONNX and calibration
 
 ```bash

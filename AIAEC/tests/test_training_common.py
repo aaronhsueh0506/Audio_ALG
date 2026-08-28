@@ -22,17 +22,23 @@ from AIAEC.training_common import (
     checkpoint_far_input_mode,
     far_input_mode_c_value,
     compressed_spectral_loss,
+    component_compressed_mse_loss,
     make_checkpoint_contract,
     make_optimizer,
+    power_compressed_complex_mse_loss,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
     require_checkpoint_model_identity,
     require_checkpoint_linear_aec,
+    si_snr_loss,
+    spectrum_to_waveform,
     split_dataset_by_sample,
+    stft_consistent_spectrum,
 )
 from AIAEC.dataset_gen import (
     ACCEPTED_BEHAVIOR_HASH_MIGRATIONS,
+    AecGrid,
     LinearAecContract,
     LinearAecProcessor,
     MODEL_TASKS,
@@ -317,6 +323,54 @@ def test_inference_checkpoint_identity_rejects_old_target_and_wrong_model():
 def test_compressed_spectral_loss_zero_for_identical_spectra():
     spec = torch.complex(torch.randn(1, 4, 32), torch.randn(1, 4, 32))
     assert float(compressed_spectral_loss(spec, spec)) == pytest.approx(0.0, abs=1e-6)
+
+
+@pytest.mark.parametrize('loss_fn', [
+    component_compressed_mse_loss,
+    power_compressed_complex_mse_loss,
+])
+def test_paper_spectral_losses_are_zero_and_finite_at_zero(loss_fn):
+    target = torch.zeros(2, 3, 5, dtype=torch.complex64)
+    estimate = target.clone().requires_grad_(True)
+    loss = loss_fn(estimate, target)
+    assert float(loss.detach()) == pytest.approx(0.0)
+    loss.backward()
+    assert torch.isfinite(estimate.grad).all()
+
+
+def test_plcpa_beta_weights_the_phase_aware_complex_term():
+    target = torch.ones(1, 1, 1, dtype=torch.complex64)
+    phase_rotated = torch.full_like(target, 1j)
+    magnitude_only = power_compressed_complex_mse_loss(
+        phase_rotated, target, complex_weight=0.0,
+    )
+    phase_aware = power_compressed_complex_mse_loss(
+        phase_rotated, target, complex_weight=1.0,
+    )
+    assert float(magnitude_only) == pytest.approx(0.0)
+    assert float(phase_aware) > 0.0
+
+
+def test_si_snr_loss_prefers_the_clean_target():
+    target = torch.randn(2, 800)
+    clean = si_snr_loss(target, target)
+    noisy = si_snr_loss(target + 0.5 * torch.randn_like(target), target)
+    assert clean < noisy
+
+
+def test_stft_consistency_helpers_preserve_shape_and_gradient():
+    grid = AecGrid(16000, 512, 512, 256)
+    spectrum = torch.complex(
+        torch.randn(2, 9, grid.n_freqs),
+        torch.randn(2, 9, grid.n_freqs),
+    ).requires_grad_(True)
+    waveform = spectrum_to_waveform(spectrum, grid)
+    consistent = stft_consistent_spectrum(spectrum, grid)
+    assert waveform.shape == (2, 8 * grid.hop_len)
+    assert consistent.shape == spectrum.shape
+    consistent.abs().mean().backward()
+    assert spectrum.grad is not None
+    assert torch.isfinite(spectrum.grad).all()
 
 
 def test_linear_aec_engine_full_length_output_and_reset():
@@ -744,17 +798,9 @@ AIAEC_TRAINER_CONFIGS = [
 
 @pytest.mark.parametrize('source_path', AIAEC_TRAINER_SOURCES,
                          ids=lambda p: p.parent.name)
-def test_all_trainers_share_one_optimizer_and_one_weight_guard(source_path):
-    """Both are comparison-protocol state, so all four build them identically.
-
-    The ordering assertions are the load-bearing half: a guard built before the
-    ``--resume`` load would baseline against fresh init instead of the weights
-    the run actually resumed from, and a check placed after the write would let
-    a dead model overwrite the last good checkpoint.
-    """
+def test_all_trainers_keep_the_weight_guard_around_checkpoint_writes(source_path):
+    """Paper recipes differ; checkpoint corruption protection must not."""
     source = source_path.read_text(encoding='utf-8')
-    assert 'make_optimizer(cfg, model.parameters(), lr=lr)' in source
-    assert 'torch.optim.' not in source
     assert 'WeightScaleGuard(model)' in source
 
     assert (source.index('WeightScaleGuard(model)')
@@ -763,30 +809,66 @@ def test_all_trainers_share_one_optimizer_and_one_weight_guard(source_path):
             < source.index("_last.pth"))
 
 
-def test_all_four_configs_declare_the_same_optimizer():
-    """⚠ Written so it can FAIL: it reads the four SHIPPED files, not the module
-    default, so a single directory edited on its own -- the exact way this
-    family has drifted before -- lands here rather than in a bake-off result.
-    """
+def test_shipped_configs_declare_the_model_specific_paper_recipes():
+    expected = {
+        'Align_ULCNet': ('adam', 'reduce_on_plateau', 4e-3, 0.0,
+                         16, 50, 50),
+        'Align_CRUSE': ('adam', 'constant', 1.5e-4, 5e-6,
+                        16, 50, 50),
+        'DeepVQE_S': ('adamw', 'constant', 1.2e-3, 5e-7,
+                      8, 50, 50),
+        'CAGCRN': ('adamw', 'constant', 1e-3, 5e-7,
+                   32, 50, 50),
+    }
     declared = {}
     for path in AIAEC_TRAINER_CONFIGS:
         cfg = configparser.ConfigParser()
         assert cfg.read(path), path
-        declared[path.parent.name] = cfg.get('training', 'optimizer',
-                                             fallback=None)
-    assert len(declared) == 4, declared
-    assert set(declared.values()) == {DEFAULT_OPTIMIZER}, declared
+        declared[path.parent.name] = (
+            cfg.get('training', 'optimizer'),
+            cfg.get('training', 'scheduler'),
+            cfg.getfloat('training', 'lr'),
+            cfg.getfloat('training', 'weight_decay'),
+            cfg.getint('data', 'batch_size'),
+            cfg.getint('training', 'max_epochs'),
+            cfg.getint('training', 'early_stop_patience'),
+        )
+    assert declared == expected
 
 
-@pytest.mark.parametrize('source_path', AIAEC_TRAINER_SOURCES,
-                         ids=lambda p: p.parent.name)
-def test_all_trainers_step_a_schedule_they_rebuild_on_resume(source_path):
-    """A constant LR was this family's actual state: no scheduler at all."""
-    source = source_path.read_text(encoding='utf-8')
-    assert 'make_scheduler(' in source
-    assert 'scheduler.step()' in source
-    assert 'fast_forward_scheduler(' in source
-    assert 'scheduler.load_state_dict' not in source
+def test_shipped_loss_and_delay_overrides_are_explicit():
+    configs = {}
+    for path in AIAEC_TRAINER_CONFIGS:
+        cfg = configparser.ConfigParser()
+        assert cfg.read(path), path
+        configs[path.parent.name] = cfg
+
+    ulcnet = configs['Align_ULCNet']
+    assert ulcnet.getint('model', 'max_delay_frames') == 32
+    assert ulcnet.getfloat('loss', 'compression') == pytest.approx(0.3)
+
+    for name in ('Align_CRUSE', 'DeepVQE_S'):
+        cfg = configs[name]
+        assert cfg.getfloat('loss', 'compression') == pytest.approx(0.3)
+        assert cfg.getfloat('loss', 'complex_weight') == pytest.approx(0.7)
+        assert cfg.getboolean('loss', 'stft_consistency')
+
+    cagcrn = configs['CAGCRN']
+    assert cagcrn.getfloat('loss', 'mse_weight') == pytest.approx(1.0)
+    assert cagcrn.getfloat('loss', 'si_snr_weight') == pytest.approx(1.0)
+    assert cagcrn.getfloat('loss', 'l1_weight') == pytest.approx(1.0)
+
+
+def test_only_align_ulcnet_uses_and_restores_a_plateau_scheduler():
+    for path in AIAEC_TRAINER_SOURCES:
+        source = path.read_text(encoding='utf-8')
+        if path.parent.name == 'Align_ULCNet':
+            assert 'ReduceLROnPlateau(' in source
+            assert 'scheduler.step(val_loss)' in source
+            assert "scheduler.load_state_dict(ckpt['scheduler'])" in source
+        else:
+            assert 'scheduler.step(' not in source
+            assert 'lr_scheduler.' not in source
 
 
 def test_the_shared_schedule_actually_reaches_min_lr():
@@ -810,19 +892,9 @@ class _StopAfterSetup(Exception):
 
 
 @pytest.mark.parametrize('model_name', sorted(MODEL_TASKS))
-def test_main_builds_its_schedule_before_the_first_epoch(
+def test_main_builds_its_paper_optimizer_before_the_first_epoch(
         model_name, monkeypatch, tmp_path):
-    """Run main() through model, optimizer and scheduler construction.
-
-    ⚠ Written because the source-text assertions above CANNOT see this class of
-    defect. All four trainers once read ``max_epochs`` to size the cosine period
-    on a line ABOVE the one that assigns it -- an UnboundLocalError on the very
-    first run -- while every `'make_scheduler(' in source` assertion still
-    passed. Nothing short of executing the setup path catches that.
-
-    The dataset and the epoch loop are stubbed; everything between them is the
-    trainer's real code reading its real shipped config.ini.
-    """
+    """Execute setup using each shipped config; stub only the epoch body."""
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
     linear = make_linear_aec_contract(16000, frame_size=512)
 
@@ -843,7 +915,7 @@ def test_main_builds_its_schedule_before_the_first_epoch(
     seen = {}
 
     def fake_run_epoch(*args, **kwargs):
-        seen['scheduler'] = kwargs.get('scheduler')
+        seen['optimizer'] = args[5]
         raise _StopAfterSetup
 
     monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
@@ -857,13 +929,13 @@ def test_main_builds_its_schedule_before_the_first_epoch(
     with pytest.raises(_StopAfterSetup):
         trainer.main(args)
 
-    scheduler = seen['scheduler']
-    assert scheduler is not None, 'run_epoch was called without a scheduler'
-    # A schedule that never moves is the state this whole contract replaced.
-    before = scheduler.optimizer.param_groups[0]['lr']
-    for _ in range(64):
-        scheduler.step()
-    assert scheduler.optimizer.param_groups[0]['lr'] != before
+    expected_type = {
+        'Align_ULCNet': torch.optim.Adam,
+        'Align_CRUSE': torch.optim.Adam,
+        'DeepVQE_S': torch.optim.AdamW,
+        'CAGCRN': torch.optim.AdamW,
+    }[model_name]
+    assert type(seen['optimizer']) is expected_type
 
 
 def test_align_ulcnet_resume_restores_early_stop_counter(
@@ -909,17 +981,18 @@ def test_align_ulcnet_resume_restores_early_stop_counter(
         'max_delay_frames = 2\n'
         '[training]\n'
         f'output_dir = {tmp_path / "output"}\n'
+        'optimizer = adam\n'
         'lr = 0.001\n'
-        'min_lr = 0.000001\n'
-        'lr_warmup = 0.0001\n'
-        'warmup_epochs = 1\n'
+        'weight_decay = 0\n'
+        'amsgrad = false\n'
+        'scheduler = reduce_on_plateau\n'
+        'lr_decay_factor = 0.1\n'
+        'lr_patience = 1\n'
         'max_epochs = 20\n'
         'early_stop_patience = 15\n'
         'grad_clip = 1.0\n'
         '[loss]\n'
-        'compression = 0.3\n'
-        'magnitude_weight = 1.0\n'
-        'complex_weight = 1.0\n',
+        'compression = 0.3\n',
         encoding='utf-8',
     )
 
@@ -927,10 +1000,14 @@ def test_align_ulcnet_resume_restores_early_stop_counter(
         SignalGrid(16000, 512, 512, 256), max_delay_frames=2,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, factor=0.1, patience=1,
+    )
     resume_path = tmp_path / 'resume.pth'
     torch.save({
         'state_dict': model.state_dict(),
         'optimizer': optimizer.state_dict(),
+        'scheduler': scheduler.state_dict(),
         'epoch': 3,
         'global_step': 4,
         'best_val': 0.0,

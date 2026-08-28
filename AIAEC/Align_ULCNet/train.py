@@ -17,7 +17,7 @@ config.ini sections (see the shipped config.ini for every knob, documented):
                  per-chunk val_fraction
     [model]      every AlignULCNet constructor keyword (see model.py)
     [training]   optimizer, seed, epoch budget, checkpoint/log locations
-    [loss]       compressed_spectral_loss term weights
+    [loss]       ULCNet component-compressed frequency-domain MSE
 
 dataset:
     AIAEC/dataset_gen renders each complete parent sequence, runs one stateful
@@ -65,12 +65,9 @@ from AIAEC.training_common import (
     build_arg_parser,
     build_plain_loaders,
     auto_device,
-    compressed_spectral_loss,
+    component_compressed_mse_loss,
     halt_on_non_finite,
-    fast_forward_scheduler,
     make_checkpoint_contract,
-    make_optimizer,
-    make_scheduler,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
@@ -82,7 +79,7 @@ from AIAEC.training_common import (
 
 MODEL_NAME = 'Align_ULCNet'
 TASK = MODEL_TASKS[MODEL_NAME]
-LOSS_VERSION = 'aiaec_compressed_spectral_v1'
+LOSS_VERSION = 'align_ulcnet_component_mse_c03_adam_plateau_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -107,7 +104,7 @@ def forward_batch(model, stems_batch, aec_grid, device):
 def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
              epoch=0, global_step=0, output_dir=None, sr=None,
              grad_clip=1.0, checkpoint_for_halt=None, grad_log=None,
-             max_epochs=None, scheduler=None):
+             max_epochs=None):
     training = optimizer is not None
     model.train(training)
     total_loss, n_batches = 0.0, 0
@@ -120,11 +117,9 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
             output, spectral = forward_batch(
                 model, stems_batch, aec_grid, device
             )
-            loss = compressed_spectral_loss(
+            loss = component_compressed_mse_loss(
                 output.enhanced, spectral.target,
                 compression=loss_cfg.getfloat('compression'),
-                magnitude_weight=loss_cfg.getfloat('magnitude_weight'),
-                complex_weight=loss_cfg.getfloat('complex_weight'),
             )
 
         if training:
@@ -161,7 +156,6 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
                     enhanced=output.enhanced,
                 )
             optimizer.step()
-            scheduler.step()
             if grad_log is not None:
                 grad_log.record(
                     total_norm, epoch=epoch, batch_idx=batch_idx,
@@ -211,23 +205,25 @@ def main(args):
 
     output_dir = cfg.get('training', 'output_dir', fallback='output')
     os.makedirs(output_dir, exist_ok=True)
-    lr = cfg.getfloat('training', 'lr', fallback=1e-3)
-    min_lr = cfg.getfloat('training', 'min_lr', fallback=1e-6)
-    warmup_lr = cfg.getfloat('training', 'lr_warmup', fallback=1e-4)
-    warmup_ep = cfg.getint('training', 'warmup_epochs', fallback=3)
-    max_epochs = cfg.getint('training', 'max_epochs', fallback=100)
-    # Decoupled weight decay by default -- make_optimizer()'s comment has the
-    # mechanism by which the coupled form drives a quiet branch into denormals.
-    optimizer = make_optimizer(cfg, model.parameters(), lr=lr)
-    # Per-step linear warmup into cosine annealing.  This trainer previously had
-    # no scheduler at all: the lr stayed at its initial value for the whole run,
-    # so the late epochs kept taking early-epoch-sized steps and the weights
-    # never settled.  The LR trajectory is part of the comparison protocol --
-    # candidates trained over "the same 100 epochs" must be on the same one.
-    total_steps = max_epochs * len(train_loader)
-    warmup_steps = min(warmup_ep * len(train_loader), total_steps - 1)
-    scheduler = make_scheduler(
-        optimizer, warmup_steps, total_steps, lr, min_lr, warmup_lr,
+    lr = cfg.getfloat('training', 'lr', fallback=4e-3)
+    max_epochs = cfg.getint('training', 'max_epochs', fallback=50)
+    optimizer_name = cfg.get('training', 'optimizer', fallback='adam').lower()
+    if optimizer_name != 'adam':
+        raise ValueError("Align-ULCNet paper recipe requires optimizer=adam")
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=lr,
+        weight_decay=cfg.getfloat('training', 'weight_decay', fallback=0.0),
+        amsgrad=cfg.getboolean('training', 'amsgrad', fallback=False),
+    )
+    scheduler_name = cfg.get(
+        'training', 'scheduler', fallback='reduce_on_plateau').lower()
+    if scheduler_name != 'reduce_on_plateau':
+        raise ValueError(
+            "Align-ULCNet paper recipe requires scheduler=reduce_on_plateau")
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min',
+        factor=cfg.getfloat('training', 'lr_decay_factor', fallback=0.1),
+        patience=cfg.getint('training', 'lr_patience', fallback=1),
     )
 
     start_epoch, global_step, best_val, no_improve = 0, 0, float('inf'), 0
@@ -242,6 +238,7 @@ def main(args):
             )
         if not args.reset_optimizer:
             optimizer.load_state_dict(ckpt['optimizer'])
+            scheduler.load_state_dict(ckpt['scheduler'])
             start_epoch = ckpt['epoch'] + 1
             global_step = ckpt['global_step']
             best_val = ckpt.get('best_val', best_val)
@@ -249,16 +246,14 @@ def main(args):
             # restarts at zero on every resume, repeated short jobs can evade
             # the configured patience indefinitely.
             no_improve = ckpt.get('no_improve', 0)
-        # Rebuilt, never restored -- fast_forward_scheduler()'s docstring has
-        # the measured reason a stored T_max must not come back.
-        resumed_lr = fast_forward_scheduler(scheduler, global_step)
+        resumed_lr = optimizer.param_groups[0]['lr']
         print(f"Resumed from {args.resume} at epoch {start_epoch}"
               f"{' (fresh optimizer)' if args.reset_optimizer else ''}"
               f", lr={resumed_lr:.4e}")
 
     loss_cfg = cfg['loss'] if cfg.has_section('loss') else {
-        'compression': '0.3', 'magnitude_weight': '1.0', 'complex_weight': '1.0'}
-    patience = cfg.getint('training', 'early_stop_patience', fallback=15)
+        'compression': '0.3'}
+    patience = cfg.getint('training', 'early_stop_patience', fallback=50)
     grad_clip = cfg.getfloat('training', 'grad_clip', fallback=1.0)
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), aec_grid.sr)
     # Per-tensor, because grad_norm.csv above is a GLOBAL norm and stays healthy
@@ -269,6 +264,7 @@ def main(args):
     for epoch in range(start_epoch, max_epochs):
         checkpoint_for_halt = {
             'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'epoch': epoch - 1, 'global_step': global_step, 'contract': contract,
             'best_val': best_val, 'no_improve': no_improve,
         }
@@ -278,7 +274,7 @@ def main(args):
             epoch=epoch, global_step=global_step, output_dir=output_dir,
             sr=aec_grid.sr, grad_clip=grad_clip,
             checkpoint_for_halt=checkpoint_for_halt, grad_log=grad_log,
-            max_epochs=max_epochs, scheduler=scheduler,
+            max_epochs=max_epochs,
         )
         msg = f"epoch {epoch}: train_loss={train_loss:.4f} ({time.time()-started:.0f}s)"
 
@@ -288,6 +284,8 @@ def main(args):
                 model, val_loader, aec_grid, device, loss_cfg
             )
             msg += f" val_loss={val_loss:.4f}"
+        scheduler.step(val_loss)
+        msg += f" lr={optimizer.param_groups[0]['lr']:.4e}"
         print(msg)
 
         is_best = val_loss < best_val
@@ -299,6 +297,7 @@ def main(args):
 
         checkpoint = {
             'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
             'epoch': epoch, 'global_step': global_step, 'contract': contract,
             'best_val': best_val, 'no_improve': no_improve,
         }

@@ -77,31 +77,34 @@ model; PBFDKF is not precomputed over the whole WAV.
 
 ## Training contract
 
-Identical to the NR side and defined in the same place: one shared
-`AINR/training_common.py`, re-exported through `AIAEC/training_common.py` and
-imported by all four candidate trainers. Per-step linear warmup into cosine
-annealing, a scheduler rebuilt rather than restored on resume, a non-finite halt
-that dumps the offending batch instead of raising bare, and a per-tensor
-vanished-weight guard before every checkpoint write.
+Generic safety machinery is shared through `AIAEC/training_common.py`:
+non-finite evidence dumps, finite gradient clipping, the per-tensor
+vanished-weight guard, data loading, and checkpoint contracts.  The numerical
+training recipe is intentionally **model-specific**; forcing all papers through
+one optimizer/loss/scheduler was not a valid comparison protocol.
 
-**The full contract, with the measurements behind each rule, is in
-[../AINR/README.md](../AINR/README.md) under "Training contract" — it is written
-once so the two model families cannot drift apart on it.** The config keys are
-`lr`, `min_lr`, `lr_warmup`, `warmup_epochs`, `grad_clip`, `optimizer`,
-`weight_decay`, `amsgrad`.
+| model | optimizer / LR | schedule | objective | shipped batch / epochs |
+|---|---|---|---|---|
+| Align-ULCNet | Adam / 4e-3 | validation plateau, x0.1, patience 1 | component-compressed frequency MSE, c=0.3 | 16 / 50 |
+| Align-CRUSE | Adam / 1.5e-4, decay 5e-6 | constant | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term | 16 / 50 |
+| DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | constant | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
+| CAGCRN | AdamW / 1e-3, decay 5e-7 | constant | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
 
-The optimizer is the one part of the contract the AEC side pins on its own.
-`[training] optimizer` selects `adamw` (the default) or `adam`, an unrecognised
-name is refused rather than silently defaulted, and all four candidates must
-agree on the value for the same reason they must agree on the LR schedule. The
-NR trainers keep their upstream-faithful optimizers instead, which is why the
-key lives here. `adam`'s COUPLED L2 term is what cost a real Align-ULCNet run
-one of its two subband GRU blocks: once that branch's true gradient went quiet,
-`weight_decay * w` was the only consistently signed contribution left in the
-tensor, and dividing it by the `sqrt(v)` of that same contribution restored it
-to a full ~`lr` step, driving the weights through zero and down into denormals.
-`weight_decay` keeps its nominal `1e-4` across the switch: decoupled, that
-number is a much gentler regulariser than it was coupled, which is the intent.
+The epoch budget is the project decision requested for this training campaign.
+Align-ULCNet batch 16 and DeepVQE-S batch 8 are GPU-memory overrides; the
+papers use 64 and 400 respectively. CAGCRN explicitly publishes batch 32.
+Early stopping cannot end these runs before epoch 50; validation still selects
+the best checkpoint, and Align-ULCNet still applies its published LR reduction.
+Changing a loss recipe changes `loss_version`, so a checkpoint from the old
+generic recipe is rejected instead of silently resuming under a new objective.
+Align-ULCNet is the only model with a stateful scheduler; its plateau state is
+stored and restored with the optimizer. The other papers report no schedule,
+so their LR is constant rather than an invented cosine trajectory.
+
+The stored project examples remain 10-second chunks and one epoch remains one
+complete DataLoader pass. Align-ULCNet's paper used random 3-second examples
+and 20,000 steps per epoch; this campaign intentionally does not rewrite the
+already generated dataset or silently redefine an epoch.
 
 ## ONNX export and calibration
 

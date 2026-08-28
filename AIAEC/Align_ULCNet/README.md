@@ -64,7 +64,26 @@ to 94 frames, above the `D <= 64` ceiling that `export_onnx.py`
 (`MAX_DELAY_DEPTH`) and the C runtime (`ULCNET_MODEL_IO_MAX_D`) both enforce.
 So on the 48 kHz grid `[model] max_delay_frames` must be set explicitly -- a
 run that leaves it to the one-second default trains, then fails at export. The
-shipped `config.ini` sets it to 8 and is unaffected.
+shipped 16 kHz training `config.ini` sets D=32 explicitly.
+
+The two standalone examples (`mono_alignulcnet`, `4ch_alignulcnet`) read their
+delay settings from file-head macros, so a per-SKU build can bake in a measured
+profile instead of passing flags on every run:
+`ULCNET_EXAMPLE_DELAY_FRAMES` (D, default 8) and
+`ULCNET_EXAMPLE_DELAY_NUM_FILTERS` (MATCHED bank size n, default
+`DA_NUM_FILTERS` = 5). Both are compile-time only: D must equal the D the model
+was exported with, and n sizes the matched bank, so changing either means a
+rebuild and a fresh pool query. `--delay-num-filters` still overrides n at run
+time, and n applies to MATCHED alone -- the other two delay modes build no bank
+and `aec_validate_config()` requires n == 5 there, so the example resets it.
+Each macro reaches a single translation unit, so `EXTRA_CFLAGS` carries them:
+
+```sh
+make EXTRA_CFLAGS=-DULCNET_EXAMPLE_DELAY_NUM_FILTERS=3 mono_alignulcnet
+```
+
+Out-of-range values fail to compile rather than at run time. The producer-cache
+caveat above applies here too.
 
 No author code/checkpoint was released. The paper leaves activation details inside the FC pair unspecified;
 those remain a reconstruction choice. The 16 kHz graph has about 0.67 M
@@ -72,12 +91,20 @@ trainable parameters, matching the published 0.69 M class without inventing a
 U-Net decoder.
 
 For training, `[model] max_delay_frames` in `config.ini` directly selects D;
-the shipped product-oriented config uses D=8.  The delay-stack activation and
+the shipped campaign config uses D=32.  The delay-stack activation and
 streaming state grow linearly with D, so this is also the first memory knob to
 reduce when a D=64 run exhausts CUDA memory.  This is a real forward-path
 choice, not only an allocation hint: changing D changes the attention candidate
 set.  Start a new run after changing it; checkpoint resume deliberately rejects
 a different D.  If memory is still insufficient, reduce `[data] batch_size`.
+
+## Training recipe
+
+The shipped `config.ini` uses the paper's Adam optimizer (`lr=4e-3`) and
+reduces LR by 10x after one validation epoch without improvement. The loss is
+ULCNet's component-wise signed power compression followed by frequency-domain
+MSE (`c=0.3`). This campaign uses D=32, batch 16, and the full 50-epoch budget;
+the paper used D=64, batch 64, 3-second examples, and 20,000 steps per epoch.
 
 For the listening examples on the paper's project page, the track labelled
 ``KF`` is the 16 kHz **error/residual Z**, not the KF echo estimate. To test
