@@ -303,6 +303,7 @@ AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
 | `core.max_delay_ms` | `float` | `1024.0f` | 有限值，`[0.0, 4096.0]` | 設成略大於系統真實最大 mic↔ref 延遲。設太大只是白吃記憶體 |
 | `core.aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED` | `MILD` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
 | `core.nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED` | `MILD` / `MODERATE` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
+| `core.enable_nr` | `int`（bool） | `1` | `0` 或 `1` | `0` = post 級跳過 MMSE-LSA，只留 RES／CNG／iFFT／WOLA |
 | `core.enable_cng` | `int`（bool） | `1` | `0` 或 `1` | — |
 | `core.legacy_amin` | `int`（bool） | `0` | `0` 或 `1` | 新整合保持 `0` |
 
@@ -478,7 +479,7 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 | `geometry` 與座標 | 不變 |
 
 `BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設下的 `req.bytes`
-（本次 checkout，`layout_version=10`；最後一欄標明每一列的來源）。本輪
+（本次 checkout，`layout_version=11`；最後一欄標明每一列的來源）。本輪
 `sizeof(Aec)` 由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數
 （16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B），四路即四倍，
 每一列都跟著移動：

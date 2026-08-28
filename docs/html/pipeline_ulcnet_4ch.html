@@ -117,7 +117,7 @@ out               全零              全零                enh(beam err        
 </table>
 
 <h2>State 表</h2>
-<p>Carve 順序(layout v15):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>；唯一一支 compiled-grid <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain。build hash 含 sample rate/FFT，跨 grid descriptor 會被拒絕。既有 3,127,744 B 等數字只代表當時的 16 kHz/ne10/n=5 build；48 kHz/n=5 smoke 實測為 6,505,696 B(ne10)與 6,520,256 B(kiss)。<b>任何 grid/backend/config 改動皆以 <code>audio_pipeline_4ch_ulcnet_get_mem_requirements()</code> 現查並重 init。</b></p>
+<p>Carve 順序(layout v16):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft, ola, synth_win, beam_hop</code>；唯一一支 compiled-grid <code>FftHandle</code> 同時服務 beam WOLA 與 ULCNet chain。build hash 含 sample rate/FFT，跨 grid descriptor 會被拒絕。既有 3,127,760 B 等數字只代表當時的 16 kHz/ne10/n=5 build；48 kHz/n=5 smoke 實測為 6,505,696 B(ne10)與 6,520,256 B(kiss)。<b>任何 grid/backend/config 改動皆以 <code>audio_pipeline_4ch_ulcnet_get_mem_requirements()</code> 現查並重 init。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td><code>FourAecNrRes core</code>(pre-only)</td><td>1,500,944 B(4-lane AEC 1,390,336 B + delay ring/控制塊 110,608 B;兩項皆實測 <code>four_aec_nr_res_get_mem_breakdown()</code> @16k/fft512/<code>enable_post=0</code>,ne10。kiss 合計:1,506,448 B(1,395,840+110,608)——<code>enable_post=0</code> 的 wrapper 與後端無關,兩個 backend 都是 110,608 B)</td><td>pool</td><td>共用 delay ring + 4 lanes;<code>enable_post=0</code> ⇒ <b>不含</b> NR/RES/iFFT(那些由本 wrapper 自己的 <code>ola/ifft_buffer/synth_window</code> + ULCNet chain 取代)</td></tr>
@@ -146,7 +146,7 @@ out               全零              全零                enh(beam err        
 <h2>相關檔案與測試路徑</h2>
 <table>
 <tr><th>路徑(repo-relative)</th><th>內容</th></tr>
-<tr><td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v15)</td></tr>
+<tr><td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h / .c</code></td><td>本頁 API 與實作(descriptor v1 / layout v16)</td></tr>
 <tr><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h / .c</code></td><td>核心:<code>process_pre</code> / <code>abandon_pre</code> / <code>PreFrame.aligned_ref</code>(見 <a href="pipeline_4ch.html">pipeline_4ch</a>)</td></tr>
 <tr><td><code>AIAEC/Align_ULCNet/ulcnet_process.h / .c</code></td><td>chain 實作 + <code>UlcnetModel</code> 邊界(兩變體共用)</td></tr>
 <tr><td><code>pipelines/4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c</code></td><td>identity E2E、連續 model stepping(除 reprime)、MATCHED 同值重鎖 reset、FIXED raw→aligned 首次切換 reset、FIXED pre-lock seam 逐 byte 等於 raw far(含 8 hop / 320 sample / 500 ms 三組)、identity-reprime straddle 推導(脈衝標記/無邊界對照跑;<b>far 路是推導、error 路只是上界</b>——error 標記先過 AEC 濾波器,量到的含因果尾音)與 reprime 行為(delay change + FIXED fill)、core aligned_ref+abandon token、pool/descriptor、far timestamp、UNLOCKED 仍套用、NaN/Inf、partial-write 與 aligned-only descriptor gate</td></tr>

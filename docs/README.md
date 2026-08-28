@@ -12,6 +12,7 @@ README.
 | Conventional mono AEC + NR/RES | [`../pipelines/README.md`](../pipelines/README.md) |
 | C and caller-owned-pool integration | [`c_user_manual_zh_TW.md`](c_user_manual_zh_TW.md) |
 | AEC / NR / audio_common public API quick reference | [`audio_libraries_c_api_zh_TW.md`](audio_libraries_c_api_zh_TW.md) |
+| DEBUG observability: current inventory and proposals | [`debug_observability_zh_TW.md`](debug_observability_zh_TW.md) |
 | Board integration of `libaudio_pipeline.a` | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
 | Frequency-domain gain fusion | [`freq_domain_pipeline_design.md`](freq_domain_pipeline_design.md) |
 | Four-channel C/Python AEC / external beamformer seam | [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md) |
@@ -36,8 +37,11 @@ state-layout-version and PTQ-calibration status. Component pages for AEC, NR
 and audio_common live in those repositories' own `docs/html/` and are reached
 through sibling relative links.
 
-`architecture.html` is a visual explanation of the conventional mono path. It
-does not describe AINR or AIAEC model internals.
+For integrator-facing C API reference, the site also carries one page per
+library -- `aec_c_api.html`, `nr_c_api.html` and `audio_common_c_api.html` in
+those repositories' own `docs/html/` -- plus `integration_example.html` here,
+which uses the four pipelines as the worked wiring example and records what
+remains observable in a release build.
 
 ## Maintenance rule
 

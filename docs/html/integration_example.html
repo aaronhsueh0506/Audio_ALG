@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>串接範例：pipelines 怎麼組三個 lib</title>
+<style>
+body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;margin:0 auto;padding:0 1rem 3rem;line-height:1.55;color:#1a1a1a;max-width:70rem}
+nav{padding:.6rem 0;border-bottom:2px solid #2a6;margin-bottom:1rem;font-size:.95rem}
+nav a{margin-right:1rem;color:#164;text-decoration:none;font-weight:600}
+nav a:hover{text-decoration:underline}
+nav .sep{color:#999;margin-right:1rem}
+h1{font-size:1.5rem;border-bottom:1px solid #ccc;padding-bottom:.3rem}
+h2{font-size:1.15rem;margin-top:1.6rem;border-left:4px solid #2a6;padding-left:.5rem}
+h3{font-size:1rem;margin-top:1.1rem;color:#164}
+table{border-collapse:collapse;margin:.6rem 0;font-size:.85rem}
+th,td{border:1px solid #bbb;padding:.25rem .5rem;text-align:left;vertical-align:top}
+th{background:#eef5f0}
+pre{background:#f4f6f5;border:1px solid #dde;padding:.6rem;overflow-x:auto;font-size:.78rem;line-height:1.35}
+code{font-family:ui-monospace,Menlo,monospace;font-size:.86em;background:#f2f2f2;padding:0 .15em}
+pre code{background:none;padding:0}
+.note{background:#fff8e6;border:1px solid #e0c878;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.warn{background:#fdeeee;border:1px solid #e0a0a0;padding:.4rem .6rem;font-size:.88rem;margin:.5rem 0}
+.small{font-size:.82rem;color:#555}
+.tblwrap{overflow-x:auto}
+.dead{color:#a00;font-weight:600}
+.ok{color:#161;font-weight:600}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html">index</a>
+<a href="../../../AEC/docs/html/aec.html">aec</a>
+<a href="../../../NR/docs/html/nr.html">nr</a>
+<a href="../../../audio_common/docs/html/audio_common.html">audio_common</a>
+<span class="sep">|</span>
+<a href="../../../AEC/docs/html/aec_c_api.html">AEC API</a>
+<a href="../../../NR/docs/html/nr_c_api.html">NR API</a>
+<a href="../../../audio_common/docs/html/audio_common_c_api.html">audio_common API</a>
+<a href="integration_example.html"><b>串接範例</b></a>
+</nav>
+
+<h1>串接範例:四條 pipeline 怎麼組三個 lib</h1>
+<p class="small">三個 lib 的 API 說明各自在 <a href="../../../AEC/docs/html/aec_c_api.html">AEC API</a>／<a href="../../../NR/docs/html/nr_c_api.html">NR API</a>／<a href="../../../audio_common/docs/html/audio_common_c_api.html">audio_common API</a>。<b>本頁是「怎麼把它們接起來」的實作範例</b>——四條出貨 pipeline 就是四份可編譯、已測試的參考接線。各 pipeline 自身的演算法說明在 <a href="pipeline_mono.html">pipeline_mono</a>／<a href="pipeline_4ch.html">pipeline_4ch</a>／<a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>／<a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>。</p>
+
+<h2>0. 先決定使用層級</h2>
+<div class="tblwrap"><table>
+<tr><th>需求</th><th>入口</th></tr>
+<tr><td>完整 mono <code>AEC + NR + RES</code></td><td><code>pipelines/mono_aec_nr_res/audio_pipeline.h</code></td></tr>
+<tr><td>完整 4ch <code>4×linear AEC → BF → mono NR+RES</code></td><td><code>pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h</code></td></tr>
+<tr><td>4ch linear AEC + <b>外部</b> beamformer seam</td><td><code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h</code></td></tr>
+<tr><td>mono linear AEC + NN 後級</td><td><code>pipelines/mono_alignulcnet/audio_pipeline_ulcnet.h</code></td></tr>
+<tr><td>4ch linear AEC + SRP/GSC + NN 後級</td><td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h</code></td></tr>
+<tr><td>只做單路 AEC,或自行組合其他 post-filter</td><td><code>aec.h</code></td></tr>
+<tr><td>已有 STFT/WOLA,只需要頻域 NR</td><td><code>mmse_lsa_denoiser.h</code></td></tr>
+</table></div>
+<div class="note"><b>產品要的若是既有完整 flow,優先呼叫 pipeline API。</b>不要在 application 重新複製 AEC/NR gain fusion、window、OLA 或 CNG 邏輯——那些細節(尺度換算、near-end floor gate、CNG LUT 索引)很容易做錯而且不會報錯。</div>
+
+<h2>1. 四條共通的骨架</h2>
+<div class="tblwrap"><table>
+<tr><th>面向</th><th>四條一致的事實</th></tr>
+<tr><td>AEC 一律 linear-seam</td><td><b>四條全部無條件設 <code>enable_res = 0</code>、<code>return_res_context = 1</code></b>。AEC 只當線性前級,殘留抑制由 pipeline 自己(或 NN)做</td></tr>
+<tr><td>沒有一條用 streaming API</td><td><code>aec_analyze_render()</code>／<code>aec_process_capture()</code> 在 <code>pipelines/</code> 下<b>零引用</b> → <code>AecBufferingEvent</code> 在出貨路徑上結構性不可達</td></tr>
+<tr><td>audio_common 只用到少數符號</td><td><code>fft_*</code>、<code>sk_min_f32</code>、<code>sk_capply_gain_f32</code>、<code>sk_wola_accumulate_f32</code>、<code>ALIGN16</code>/<code>ck_*</code>。<b>沒有任何一條用 <code>hpf_*</code>／<code>audio_pre_gain_*</code>／<code>audio_resampler_*</code></b>——HPF 在 AEC 內部,gain 與 resample 是 pipeline <b>之外</b>的前級</td></tr>
+<tr><td>32-byte 固定寬度 descriptor</td><td>四條的 <code>*MemReq</code> 形狀一致,都走 <code>get_mem_requirements()</code> → <code>init_ex()</code> 的 descriptor gate</td></tr>
+</table></div>
+
+<h2>2. 誰做 FFT、誰擁有 window、WOLA 在哪</h2>
+<p>這是接線時<b>最容易搞錯</b>的一件事,而四條 pipeline 給了<b>三種不同答案</b>:</p>
+<div class="tblwrap"><table>
+<tr><th></th><th>forward FFT</th><th>analysis window</th><th>NR gain 怎麼套</th><th>inverse + WOLA</th></tr>
+<tr><td><code>mono_aec_nr_res</code></td><td><b>AEC 內部</b>(<code>ctx.error_spec</code> 就是它的 50% overlap periodic-sqrt-Hann STFT)</td><td>AEC 擁有</td><td>NR <b>只算 gain 不套</b>,pipeline <code>sk_min_f32</code> 融合後一次套</td><td><b>pipeline 自己</b>(獨立的 <code>FftHandle</code>)</td></tr>
+<tr><td><code>4ch_aec_bf_nr_res</code></td><td><b>每條 lane 的 AEC 內部</b>,pipeline <b>借指標不複製</b></td><td>各 lane 的 AEC</td><td>同上,但 RES gain 來自<b>一個共用 <code>SuppressionGain</code></b>(不屬於任何 <code>Aec</code>)</td><td>pipeline 自己</td></tr>
+<tr><td><code>mono_alignulcnet</code></td><td class="dead"><b>AEC 的 FFT 完全不用</b>——ULCNet 自己的 centered STFT 做 forward</td><td>ULCNet(centered sqrt-Hann)</td><td class="dead"><b>沒有 NR</b>(沒有 <code>MmseLsaDenoiser</code> 實例)</td><td><code>ulcnet_synthesis_push()</code></td></tr>
+<tr><td><code>4ch_alignulcnet</code></td><td colspan="4"><b>三個獨立頻域階段</b>:① 每 lane AEC 的 STFT → 餵 SRP-PHAT + GSC;② GSC 輸出的 mono 頻譜 → pipeline 自己 iFFT+WOLA 回時域(<b>吃掉 1 hop</b>);③ ULCNet 的 centered STFT → model → synthesis(<b>再吃 1 hop</b>)</td></tr>
+</table></div>
+<div class="warn"><b><code>4ch_alignulcnet</code> 的總演算法延遲 = 2 hops = 512 samples = 32 ms</b>,而且 far branch 被<b>刻意延遲一個 hop</b>——否則 model 會看到 <code>error[t-1]</code> 配 <code>far[t]</code> 的 256-sample 固定偏斜。接 NN 時這種「兩個 branch 要對齊到同一個時間點」的細節<b>沒有任何自動檢查</b>。</div>
+
+<h2>3. 範例 A:<code>mono_aec_nr_res</code> — 最完整的參考接線</h2>
+<h3>建立</h3>
+<pre>AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
+/* cfg.fft_size=0(rate default) aec_preset=BALANCED nr_mode=BALANCED
+ * aec_only=0 enable_cng=1 legacy_amin=0 */
+
+AudioPipelineMemReq req;
+if (audio_pipeline_get_mem_requirements(&amp;cfg, &amp;req) != 0) { /* reject-first */ }
+void *pool = platform_alloc(req.bytes, req.alignment);   /* 16-byte aligned */
+AudioPipeline *p = audio_pipeline_init_ex(pool, req.bytes, &amp;cfg, &amp;req);
+
+int hop = audio_pipeline_hop_size(p);                    /* 128 @16k default */
+while (streaming) audio_pipeline_process(p, mic, ref, out);   /* 三者皆 hop floats */
+
+audio_pipeline_reset(p);      /* echo path 變更時;不動 pool */
+audio_pipeline_destroy(p);    /* 不釋放 caller pool */</pre>
+
+<h3>每 hop 對底層 lib 的精確呼叫序列</h3>
+<p>這就是「怎麼串」的答案。<code>aec_only=1</code> 時只有第一行,其餘整段跳過:</p>
+<pre>audio_pipeline_process(p, mic, ref, out)
+ │
+ ├─ aec_only ─→ aec_process(p->aec, mic, ref, out)        ← 直寫 caller 的 out,結束
+ │
+ └─ 1.  aec_process_context(p->aec, mic, ref)             ← 不取時域輸出,省一次 memcpy
+    2.  aec_get_last_timing(p->aec, ...)                  ← 只有 PROFILE=1 才有數值
+    3.  aec_get_res_context(p->aec, &ctx)
+    4.  extra[k] = ctx.r2[k] / PSD_SCALE                  ← int16² → audio power(32768²)
+    5.  mmse_lsa_process_gain(p->nr, ctx.error_spec, extra, NULL)
+        └ gain_out=NULL:之後用 mmse_lsa_get_gain() 讀,省一次複製
+    6.  sk_min_f32(g_total, mmse_lsa_get_gain(p->nr,NULL), ctx.res_gain, n_freqs)
+        └ gain fusion = 逐 bin 取小
+    7.  e2[k] = |ctx.error_spec[k]|²
+    8.  near-end floor gate:far_active = ctx.far_power > 1e-4
+    9.  per-bin echo-gated lift:
+        echo_frac = clamp(extra[k]/(e2[k]+1e-12), 0, 1)
+        lift      = nf_eff * ctx.res_gain[k] * (1 - echo_frac)
+        g_total[k]= (1-lift)*g_total[k] + lift
+   10.  sk_capply_gain_f32(spec, ctx.error_spec, g_total, n_freqs)
+   11.  CNG(bins 1..n-2):a = sqrt(1-G_res²) * sqrt(N²/PSD_SCALE)
+   12.  fft_inverse(p->fft, spec, ifft_buf)
+   13.  sk_wola_accumulate_f32(ola, ifft_buf, synth_win, frame_size)
+   14.  memcpy(out, ola, hop) ; memmove ; memset          ← hop emit + shift</pre>
+<div class="note"><b>為什麼是 <code>aec_process_context()</code> 而不是 <code>aec_process()</code>:</b>兩個入口只差「要不要把結果複製出來」,所以純粹是成本選擇。<code>aec_only=1</code> 時 AEC 的輸出<b>就是</b> pipeline 的輸出 → 用 <code>aec_process()</code> 直寫 caller 的 <code>out</code>;<code>aec_only=0</code> 時下游只讀 <code>ctx.error_spec</code>、從不碰 AEC 吐出的 hop → <code>aec_process_context()</code> 省掉那次複製。</div>
+<h3>Init 期的接線順序</h3>
+<pre>aec_get_mem_size → aec_init
+fft_get_mem_size → fft_init                 ← 獨立於 AEC 內部的 FFT
+mmse_lsa_get_mem_size → mmse_lsa_init
+七個 scratch 逐一 carve + memset
+synth_win = sqrt periodic-Hann
+grid agreement guard:
+   aec_get_res_context(p->aec, &ctx0)  → 比對 n_freqs / hop
+   fft_get_n_freqs() / mmse_lsa_get_n_freqs() → 再比對一次</pre>
+<div class="note">那個 <b>grid agreement guard</b> 值得照抄:三個 lib 各自 resolve 自己的 grid,如果 config 讓它們對不上,<b>不檢查就會在頻域靜默錯位</b>。自組 chain 時務必在 init 尾端做同樣的三方比對。</div>
+
+<h2>4. 範例 B:<code>4ch_aec_bf_nr_res</code> — pre/post 分裂,外部 beamformer</h2>
+<p>這是唯一有<b>狀態協定</b>的 API:<code>process_pre()</code> 產生一個 pending frame,外部做 beamforming,再 <code>process_post()</code> 消費它。</p>
+<pre>FourAecNrResPreFrame pre;
+FourAecNrResStatus st = four_aec_nr_res_process_pre(core, mics_interleaved, far, &amp;pre);
+if (st != FOUR_AEC_NR_RES_OK) { /* 見下方 status 表 */ }
+
+/* ── 外部:SRP-PHAT / GSC,用 pre.linear_spectra[4] 算出 Complex[4][n_freqs] 權重 ── */
+
+st = four_aec_nr_res_process_post(core, &amp;pre.token, weights, out);
+/* 或 four_aec_nr_res_abandon_pre(core, &amp;pre.token) 放棄這一 frame */</pre>
+<h3>pre 半的呼叫序列(重點在 far-FFT 共用)</h3>
+<pre>1. inputs_finite(mic_interleaved, hop*4) && inputs_finite(ref)   ← 唯一的輸入 NaN gate
+2. de-interleave proxy channel → mic_lane
+3. update_shared_delay(...)          ← duty 決策 + matched filter + ERLE watchdog
+4. align_render(ref, delay)  → aligned_ref
+5. if (delay.changed) 四 lane 各跑 aec_apply_external_realign(lanes[ch], delta)
+6. for ch in 0..3:
+     de-interleave lane ch
+     ch==0 : aec_process_context(lanes[0], mic_lane, aligned_ref)
+     ch!=0 : aec_process_context_shared_far(lanes[ch], mic_lane, aligned_ref, shared_far_spec)
+     aec_get_res_context(lanes[ch], &context)
+     ch==0 → shared_far_spec = context.far_spec        ← lane 0 算,1..3 借
+     bind_lane_view(&snapshots[ch], &context)          ← 借指標,不複製
+7. mint token(frame_index / generation / owner_cookie / instance_epoch)</pre>
+<div class="note"><b>四條 lane 這一 hop 看到同一個 <code>aligned_ref</code> 指標</b>,所以 lane 0 的 far-FFT 對其他三條逐位元相同 → <b>4 次 far-FFT/hop 變成 1 次</b>。這是 <code>aec_process_context_shared_far()</code> 存在的理由,也是它嚴格的 same-hop/same-reference 前提的由來。</div>
+<h3>post 半</h3>
+<pre>1. token_matches()                         ← 序列協定
+2. validate_weights():逐元 isfinite + Σ|.| > 1e-12
+3. fuse_contexts():coherent projection,四 lane far_power 一致性檢查
+4. run_post_res_and_nr():
+     suppression_gain_get_gain(&post_sg, ...)      ← 共用 post 抑制器
+     mmse_lsa_process_gain(p->nr, error, nr_extra, NULL)   ← 僅 enable_nr=1
+     total_gain[k] = min(nr_gain, res_gain)                ← enable_nr=0 時 = res_gain
+     near-end floor gate + echo-gated lift(常數與 mono 相同)
+     CNG → fft_inverse → sk_wola_accumulate_f32 → hop emit
+5. return inputs_finite(out, hop)          ← 唯一的輸出 NaN gate</pre>
+<div class="tblwrap"><table>
+<tr><th><code>FourAecNrResStatus</code></th><th>意義</th><th>pending frame</th></tr>
+<tr><td><code>OK</code>(0)</td><td>成功</td><td>已消費</td></tr>
+<tr><td><code>INVALID_ARGUMENT</code>(−1)</td><td>NULL、非有限輸入、權重不合法</td><td><b>保留,可重試</b></td></tr>
+<tr><td><code>SEQUENCE_ERROR</code>(−2)</td><td>token 不符 / 協定被違反</td><td>—</td></tr>
+<tr><td><code>DSP_ERROR</code>(−3)</td><td>內部已 <b>self-reset</b></td><td>已丟棄</td></tr>
+</table></div>
+<div class="warn">四條 lane 都以 <code>spatial_linear_context</code> 建立,<b>永遠走不到自己的 suppression path</b> → 對 lane 呼叫 <code>aec_set_preset()</code> 依構造是無效操作。要改強度請用 <code>four_aec_nr_res_set_aec_preset()</code>,它針對的是那個共用的 post 級抑制器。</div>
+
+<h2>5. 範例 C／D:兩條 ULCNet pipeline — 接 NN 的做法</h2>
+<h3>從 AEC 拿什麼</h3>
+<pre>aec_process_context(p->aec, mic, ref);
+aec_get_res_context(p->aec, &rctx);      /* rctx.formed_hop     ← 時域線性誤差 */
+aec_get_linear_context(p->aec, &lctx);   /* lctx.aligned_far_hop ← 對齊後的 far  */</pre>
+<p><b>注意這裡拿的是「時域」兩個 tap,不是頻譜</b>——ULCNet 有自己的 centered STFT,AEC 的 <code>error_spec</code> 在這條路上完全不用。</p>
+<h3>邊界偵測與 reprime</h3>
+<pre>if (lctx.delay_state == AEC_LINEAR_DELAY_CHANGED
+    || (FIXED 模式下 UNLOCKED→LOCKED 的首次轉換)) {
+    if (p->model.reset) p->model.reset(user);   /* 通知 NN 丟棄跨 frame 狀態 */
+    p->reprime_frames = REPRIME;                /* mono=1, 4ch=2 */
+}</pre>
+<div class="note"><b>reprime frame 數是量測出來的,不是猜的</b>:mono = 1、4ch = 2。差別來自 4ch 的兩個 branch 都落後輸入一個 hop,所以邊界 hop 有兩個 emitted frame 跨在接縫上。這個常數<b>綁定於該 pipeline 的 hop 結構</b>,改動 framing 就必須重新量。</div>
+<h3>Fail-open 三層 + FULL-WRITE CONTRACT</h3>
+<pre>if (reprime_frames > 0) {
+    /* identity,不 step model */
+} else if (model.infer) {
+    for (k) { mdl_re[k] = NAN; mdl_im[k] = NAN; }   /* ← 先全填 NaN */
+    rc = model.infer(user, err_re, err_im, far_re, far_im, mdl_re, mdl_im);
+    if (rc == 0 && ulcnet_frame_is_finite(mdl_re, mdl_im)) { /* 採用 */ }
+    /* 否則 identity */
+}
+ulcnet_synthesis_push(&synth, sre, sim, out + wrote);</pre>
+<div class="tblwrap"><table>
+<tr><th>Fallback 條件</th><th>行為</th></tr>
+<tr><td><code>infer == NULL</code></td><td>identity</td></tr>
+<tr><td><code>infer</code> 回非 0</td><td>identity</td></tr>
+<tr><td>輸出有任何非有限值</td><td>identity</td></tr>
+</table></div>
+<p><b>三種情況的時序路徑完全相同 → latency 不隨 model 健康度變動</b>。先全填 <code>NAN</code> 是為了把「沒寫」變成可偵測——finite guard 抓得到<b>未寫入</b>,但抓不到<b>寫錯形狀</b>。</p>
+<h3>Model I/O descriptor 是必要的,不是選配</h3>
+<pre>if (cfg->model.infer &amp;&amp; !cfg->model.io_descriptor) return -1;
+if (cfg->model.io_descriptor &amp;&amp;
+    ulcnet_model_io_descriptor_validate(cfg->model.io_descriptor) != 0) return -1;</pre>
+<div class="warn"><b>掛了真的 runtime 就必須提供 descriptor</b>(identity model 才可以留 NULL)。理由:finite guard 只抓得到「沒寫」,永遠抓不到「寫錯形狀」——graph 的 <code>D</code> 與 descriptor 不符時會<b>靜默地</b>越界讀寫 pool。descriptor 內容包含 <code>layout_version</code>(必須等於 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code>)、<code>delay_depth</code> D ∈ [2,64]、grid 幾何、以及 <code>far_input_mode</code> 必須是 <code>ULCNET_FAR_ALIGNED</code>。</div>
+
+<h3>4ch ULCNet 的 pre-only 契約:<b>拒絕而非忽略</b></h3>
+<p><code>core.enable_post = 0</code> 時 core <b>完全不 carve</b> denoiser／suppressor／comfort noise／post iFFT。因此以下欄位<b>必須</b>維持 <code>_default_config()</code> 的值,否則<b>在 init 被拒</b>:</p>
+<div class="tblwrap"><table>
+<tr><th>欄位</th><th>必須值</th><th>理由</th></tr>
+<tr><td><code>core.enable_post</code></td><td>0</td><td>—</td></tr>
+<tr><td><code>core.enable_nr</code></td><td>0</td><td>core 自己的預設是 1;pre-only profile 關掉它,讓欄位陳述此處的事實,而不是留一個不可能生效的值</td></tr>
+<tr><td><code>core.enable_cng</code></td><td>0</td><td>沒有 suppressor 就沒有 CNG level</td></tr>
+<tr><td><code>core.legacy_amin</code></td><td>0</td><td>post-only 欄位</td></tr>
+<tr><td><code>core.nr_mode</code></td><td><code>MMSE_LSA_NR_BALANCED</code></td><td>enum 沒有 disabled 值,而且根本沒有 denoiser 實例 → 這是<b>必要哨兵,不是強度選擇</b></td></tr>
+<tr><td><code>auto_vad_*</code></td><td><code>audio_pipeline_4ch</code> 的預設</td><td>內建 energy VAD 在此不可達(只有 <code>_process_with_activity</code>)</td></tr>
+</table></div>
+<p class="small">設計理由:<b>「自以為設好 NR 的呼叫端,要在 init 就知道,而不是上板才發現。」</b>pre-stage 欄位(<code>delay_*</code>／<code>aec_preset</code>／<code>filter_length</code>／<code>capture_proxy_channel</code>／<code>max_delay_ms</code>)照常生效。</p>
+
+<h2>6. <code>layout_version</code> 對整合者的意義</h2>
+<div class="tblwrap"><table>
+<tr><th>Pipeline</th><th>目前版本</th></tr>
+<tr><td><code>mono_aec_nr_res</code></td><td><code>AUDIO_PIPELINE_LAYOUT_VERSION</code> = 10</td></tr>
+<tr><td><code>4ch_aec_bf_nr_res</code>(核心)</td><td><code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = 16</td></tr>
+<tr><td><code>4ch_aec_bf_nr_res</code>(完整 wrapper)</td><td><code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION</code> = 11</td></tr>
+<tr><td><code>mono_alignulcnet</code></td><td><code>AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION</code> = 11</td></tr>
+<tr><td><code>4ch_alignulcnet</code></td><td><code>AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION</code> = 16</td></tr>
+</table></div>
+<div class="warn"><b>版本一動,任何持久化的 descriptor 都必須丟棄重查。</b>關鍵微妙處:<code>build_flags_hash</code> 只是 carve token 字串的 FNV-1a,<b>不含任何 sizeof／byte count</b> → 當 control block 只是<b>長大</b>而 carve 結構沒變時,hash <b>不會動</b>。所以 <code>layout_version</code> 是<b>唯一</b>訊號。<br>「a descriptor from a version-10 build must be refused, <b>including when its cached byte count still covers the current pool</b>」——descriptor 的 <code>bytes</code> 比較是下界,擋得住成長、擋不住等量語意變更。</div>
+<p class="small">4ch ULCNet 的版本會<b>純轉播</b>下層 core 的版本:core 只長 control block 時兩層 hash 都不動,只能靠本層 <code>layout_version</code> 一起 bump 來攔。</p>
+
+<h2>7. DEBUG:出貨板上還剩什麼</h2>
+<p>這一節只描述<b>現況</b>。要新增哪些 DEBUG 資訊的評估與提案,見 <code>docs/debug_observability_zh_TW.md</code>。</p>
+<h3>7.1 Release build 的實測結論</h3>
+<p>以 <code>NO_STDIO=1</code> 建出 archive 後用 <code>nm</code> 檢查,結果是一個很乾淨的分界:</p>
+<div class="tblwrap"><table>
+<tr><th>類別</th><th class="ok">存活</th><th class="dead">消失</th></tr>
+<tr><td><b>狀態快照(pull)</b></td><td><code>aec_debug_status</code>、<code>aec_get_res_context</code>、<code>aec_get_linear_context</code>、<code>aec_linear_is_cancelling</code>、<code>aec_far_fft_real_compute_count</code>、<code>aec_get_mem_breakdown</code>、<code>mmse_lsa_debug_status</code>、<code>mmse_lsa_get_gain/_spp/_noise_psd</code>、4ch 的全部 census/counter accessor</td><td>—</td></tr>
+<tr><td><b>耗時</b></td><td>函式在(<b>回 0</b>)</td><td><b>全部數值</b>(<code>AecStageTiming</code>／<code>AudioPipelineLastTiming</code>／<code>FourAecNrResLastTiming</code>)</td></tr>
+<tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_logf</code>、<code>aec_debug_set_level/_log/_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 14 欄;mono 的 init 期 stderr 診斷</td></tr>
+<tr><td><b>錯誤碼</b></td><td>全部</td><td>—</td></tr>
+<tr><td><b>Finite guards</b></td><td>全部(不受任何開關影響)</td><td>—</td></tr>
+</table></div>
+<div class="note"><b>一句話:出貨板上唯一還活著的診斷面,是「主動 poll 的結構化狀態快照」。</b>所有<b>事件式</b>(log／trace／buffering event)與所有<b>時間式</b>(stage timing)觀測在 release 組態下歸零。任何 DEBUG 設計都必須建立在 pull 型快照上,而不是 printf。</div>
+
+<h3>7.2 可以直接照抄的板端監看迴圈</h3>
+<pre>/* 每秒一次即可;三個 API 都是免費的(只讀引擎已維護的欄位) */
+AecDebugStatus      a;  aec_debug_status(audio_pipeline_get_aec(p), &amp;a);
+MmseLsaDebugStatus  n;  mmse_lsa_debug_status(audio_pipeline_get_nr(p), &amp;n);
+
+log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
+    "near=%.4f out=%.4f duty=%llu/%llu | nr_init=%d gain=%.1f/%.1fdB "
+    "spp=%.2f noise=%.1fdB",
+    a.delay_samples, a.delay_confidence, a.delay_updates,
+    a.erle_windowed_db, a.usable_linear, a.filter_converged,
+    a.near_power, a.out_power, a.duty_hops_run, a.duty_hops_total,
+    n.initialized, n.mean_gain_db, n.min_gain_db, n.mean_spp, n.noise_floor_db);</pre>
+<div class="tblwrap"><table>
+<tr><th>讀到這樣</th><th>通常代表</th></tr>
+<tr><td><code>delay=-1</code> 一直不變</td><td>從未鎖定。檢查 ref 是否真的是送往喇叭的訊號、電平是否過低</td></tr>
+<tr><td><code>erle</code> 低但 <code>conv=1</code></td><td>濾波器收斂了但 echo 仍在 → 懷疑鎖到錯的 delay(早期反射),或非線性失真超出線性模型</td></tr>
+<tr><td><code>duty_run/duty_total</code> 接近 1.0 且長時間不降</td><td>duty-cycle 從未進入省電抽樣 → delay 一直不穩定</td></tr>
+<tr><td><code>nr_init=0</code> 持續</td><td>還在啟動 pass-through(前 <code>num_init_frames</code> 個 frame),此時完全不降噪是正常的</td></tr>
+<tr><td><code>mean_spp</code> 長期接近 0</td><td>判定沒有語音 → 檢查電平或噪聲底是否估過高</td></tr>
+<tr><td><code>noise_floor_db</code> 隨語音一起爬升</td><td>噪聲估計正在吸收語音 → 檢查 <code>delta_db</code>／<code>alpha_d</code></td></tr>
+</table></div>
+<div class="warn"><b>三個常見誤判,先看這裡再懷疑演算法:</b>
+<ul>
+<li><code>aec_get_last_timing()</code> 回全 0 <b>不代表很快</b>——代表沒有用 <code>PROFILE=1</code> 建 library。而且函式<b>不會告訴你</b>它沒被啟用。</li>
+<li><code>delay_updates</code> 是 matched-filter 的<b>更新總數</b>,<b>不區分</b>「同一值重複確認」與「跳到新值」,不能當成 lock 穩定度指標。</li>
+<li><code>near_power</code>／<code>out_power</code> 是 <b>EMA(alpha=0.95)</b>,不是瞬時值;<code>duty_*</code> 會被 <code>reset()</code> 清零。</li>
+</ul></div>
+
+<h3>7.3 現況的已知盲點(整合前先知道)</h3>
+<div class="tblwrap"><table>
+<tr><th>盲點</th><th>實情</th></tr>
+<tr><td class="dead">per-hop CSV trace <b>四條 pipeline 全部不可達</b></td><td><code>AecDebugTraceRow</code> 的唯一填寫點要求 <code>cfg.enable_res == 1</code> <b>且</b>走 <code>aec_process()</code>。四條 pipeline <b>全部</b>設 <code>enable_res = 0</code> → <code>dominant_nearend</code>／<code>saturated_echo</code>／<code>usable_linear</code>／<code>fullband_erle</code>／<code>gain_mean</code> 這些沒有第二個出口的量,在產品組態下<b>永遠取不到</b>。只有 CLI <code>aec_wav --debug-trace</code> 拿得到</td></tr>
+<tr><td class="dead">層級式 log 是<b>死碼</b></td><td><code>AEC_DEBUG_LOG</code> 在整個 library 的 <code>src/</code> 有 <b>0 個呼叫點</b>(唯一命中是一句註解)。level 1/2/3、<code>aec_debug_logf</code>、時間/frame 前綴——整套四層基礎設施沒有任何 emit 端</td></tr>
+<tr><td class="dead"><code>assert()</code> 在出貨板上是<b>活的</b></td><td>四個 Makefile <b>沒有任何一個</b>設 <code>-DNDEBUG</code>。<code>suppression_gain.c</code> 的 table-length assert <b>沒有 release-path fallback</b>,失敗即 <code>abort()</code>——沒有回傳碼、沒有 log、沒有 hook 可攔</td></tr>
+<tr><td class="dead">self-reset 不計數</td><td><code>DSP_ERROR</code> 路徑會內部呼叫 <code>reset()</code>,而 <code>reset()</code> 本身<b>清掉所有 instrumentation</b>(realign counters／duty census 全歸零)→ 一次 self-reset 之後「之前發生過什麼」在計數器上完全消失</td></tr>
+<tr><td class="dead">delay lock 遺失不計數</td><td><code>AecLinearContext.delay_state</code> 與 <code>generation</code> 每 hop 可讀,但 <code>AecDebugStatus</code> <b>兩者都沒有</b> → 只 poll <code>aec_debug_status()</code> 的整合者<b>看不到 lock 的丟失與重獲</b></td></tr>
+<tr><td class="dead">NN fail-open 是靜默的</td><td>三種 fallback 走<b>同一條 else 分支、無區別、無計數</b> → 「NPU 掛了整段跑 identity」與「NPU 正常但某幾 frame 吐 NaN」<b>從外部無法區分</b></td></tr>
+<tr><td class="dead">4ch init 失敗<b>一個字都不說</b></td><td><code>init_ex()</code> 的 8 項檢查任一失敗都<b>靜默回 NULL</b>。mono 有逐欄位 stderr,但 <code>NO_STDIO=1</code>(正是板端組態)一開就沒了</td></tr>
+<tr><td class="dead">沒有 frame counter</td><td>四條 pipeline <b>都沒有</b> frame counter 的 public accessor → 「這條 stream 到目前為止處理了幾個 hop」都答不出來,遑論 xrun</td></tr>
+<tr><td class="dead">mono pipeline 沒有 finite 守衛</td><td><code>audio_pipeline_process()</code> 輸入不檢、輸出不檢。<b>只有 4ch 有</b>(輸入與輸出各一道)</td></tr>
+<tr><td class="dead">兩條 ULCNet pipeline 幾乎沒有觀測面</td><td>mono ULCNet 只有 <code>_get_aec()</code>;4ch ULCNet 只有 <code>_last_beamformed_error()</code>／<code>_last_delay()</code>,而且<b>沒有暴露 core handle</b> → core 的 duty census、realign counters、timing、post floor 對整合者全部不可達</td></tr>
+</table></div>
+
+<h2>8. 整合檢查清單</h2>
+<ul>
+<li>sample rate、frame/FFT、hop 是<b>同一個</b>合法 grid,且三個 lib 對得上(照抄 mono 的 grid agreement guard)。</li>
+<li>mic/ref 同 sample rate、同 clock;ref 是<b>實際 speaker render reference</b>。</li>
+<li>每次呼叫恰好傳一個 hop。</li>
+<li>所有 pool 以 resolved config 查 size,base 至少 16-byte 對齊;<b>descriptor 不可跨版本快取</b>。</li>
+<li>process hot path 沒有 malloc/free/file I/O/logging。</li>
+<li>stream boundary 同時 reset DSP instance <b>與</b> caller 自己的 ring/WOLA state。</li>
+<li>borrowed context/gain pointer 沒有跨下一次 process 保存。</li>
+<li>AEC 的 <code>r2</code>／<code>comfort_noise</code> 交給 NR 前已除以 <code>32768²</code>。</li>
+<li>接 NN 時 descriptor 非 NULL,且其 <code>D</code> 與 graph 一致(<b>這條沒有任何自動檢查</b>)。</li>
+<li>application 與三個 archive 使用相同 backend、SIMD、FP flags。</li>
+<li>最終 float→PCM 前做 saturating conversion;limiter 只放在整條 chain 最後。</li>
+<li>完整應用優先跑 pipeline tests,而不只跑各 library 的 unit test。</li>
+</ul>
+
+<h2>相關檔案與測試路徑</h2>
+<ul class="small">
+<li><code>Audio_ALG/pipelines/README.md</code> — 四條 pipeline 的 CLI 與建置</li>
+<li><code>Audio_ALG/docs/integration_mono_zh_TW.md</code> — mono 的 lifecycle／錯誤語意／逐階段耗時(最完整)</li>
+<li><code>Audio_ALG/docs/integration_4ch_core_zh_TW.md</code> — 4ch pre/post 協定</li>
+<li><code>Audio_ALG/docs/integration_4ch_spatial_zh_TW.md</code> — SRP/GSC wrapper</li>
+<li><code>Audio_ALG/docs/audio_libraries_c_api_zh_TW.md</code> — 三個 lib 的 API 速查(md 版)</li>
+<li><code>Audio_ALG/docs/debug_observability_zh_TW.md</code> — DEBUG 現況盤點與新增提案</li>
+</ul>
+</body>
+</html>

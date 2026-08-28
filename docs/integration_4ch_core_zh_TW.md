@@ -284,7 +284,7 @@ if (four_aec_nr_res_post_split_floor(p, &live, &target) == 0 && live == target) 
 | 呼叫 | 改／讀什麼 | 回 `-1` 的情況（`-1` 時**什麼都不寫**） |
 |---|---|---|
 | `four_aec_nr_res_set_aec_preset()` | **共用 post 級抑制器**的 far-active split floor | `p` 為 NULL 或已 destroy；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]`；`cfg.enable_post == 0`（pre-only 核心根本沒有抑制器） |
-| `four_aec_nr_res_set_nr_mode()` | 本核心擁有的**那一個**降噪器（NR 是對 beamform 後的訊號跑，不是每條 lane 一個） | `p` 為 NULL 或已 destroy；`cfg.enable_post == 0`；`mode` 超出 enum；重組出的 target 被拒 |
+| `four_aec_nr_res_set_nr_mode()` | 本核心擁有的**那一個**降噪器（NR 是對 beamform 後的訊號跑，不是每條 lane 一個） | `p` 為 NULL 或已 destroy；`cfg.enable_post == 0` **或 `cfg.enable_nr == 0`**（兩者都代表沒有降噪器實例）；`mode` 超出 enum；重組出的 target 被拒 |
 | `four_aec_nr_res_post_split_floor()` | 唯讀。`live` = 抑制器**當下**套用的值，`target` = 撐得過 reset 的已設定值；兩者只有在 ramp 走到一半時才不同。任一指標可為 NULL | `p` 為 NULL 或已 destroy；`cfg.enable_post == 0` |
 
 `live` / `target` 這一對是**板端唯一值得記錄的強度量**：它是真正塑形輸出的東西
@@ -340,6 +340,7 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 | `max_delay_ms` | `float` | `1024.0f` | 必須是有限值，且落在 `[0.0, 4096.0]` | 共用 reference delay line 的容量上限（毫秒）。實際的 ring 大小 = `ceil(max_delay_ms * sample_rate / 1000) + 2 * hop + 1` 個 sample。設得比你系統真實最大 mic↔ref 延遲**略大**即可；設太大只是白白吃記憶體 |
 | `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `MILD`(0) / `BALANCED`(1) / `AGGRESSIVE`(2)。列舉以外拒絕（**不會**默默 fallback） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE` |
 | `nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED`（= 2） | `MILD`(0) / `MODERATE`(1) / `BALANCED`(2) / `AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度，四級都可用 |
+| `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = post 級跳過 MMSE-LSA，`total_gain` 只由 RES 決定；RES／CNG／iFFT／WOLA 照常。給「要回聲抑制但不要降噪」的產品 |
 | `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在被抑制的 bin 填舒適噪音 |
 | `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = NR 的 noise prior 不摺入 R²。只用於比對舊行為，新整合請保持 `0` |
 
@@ -424,11 +425,12 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 | `max_delay_ms` | 會（僅 `MATCHED` 用於 sizing delay ring） |
 | `enable_post` | 會（`0` 時不配置 NR/RES/iFFT，見 4.6b；ULCNet wrapper 用這個省 post 級） |
 | `capture_proxy_channel` | 不變 |
+| `enable_nr` | 會（`enable_post=1` 時，`0` 省下對齊後的整份 MMSE-LSA state；`enable_post=0` 時無作用，那條路徑本來就不配置 NR） |
 | `aec_preset` / `nr_mode` / `enable_cng` / `legacy_amin` | 不變 |
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是本次 checkout（`layout_version=15`）、`BACKEND=kiss`、`SIMD=1`、
+以下是本次 checkout（`layout_version=16`）、`BACKEND=kiss`、`SIMD=1`、
 `delay_mode=MATCHED`（預設,n=5）、`enable_post=1`（預設）下直接呼叫 API
 量到的值。換 backend、換編譯選項、更新 submodule 都會變。本輪 `sizeof(Aec)`
 由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數

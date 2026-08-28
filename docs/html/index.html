@@ -31,6 +31,10 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="../../../AEC/docs/html/aec.html">AEC</a> ·
 <a href="../../../NR/docs/html/nr.html">NR</a> ·
 <a href="../../../audio_common/docs/html/audio_common.html">audio_common</a> ·
+<a href="../../../AEC/docs/html/aec_c_api.html">AEC API</a> ·
+<a href="../../../NR/docs/html/nr_c_api.html">NR API</a> ·
+<a href="../../../audio_common/docs/html/audio_common_c_api.html">audio_common API</a> ·
+<a href="integration_example.html">串接範例</a> ·
 <a href="pipeline_mono.html">mono</a> ·
 <a href="pipeline_ulcnet_mono.html">mono-ULCNet</a> ·
 <a href="pipeline_4ch.html">4ch</a> ·
@@ -97,6 +101,25 @@ PBFDKF 矩形窗例外、centered vs 串流 framing 等價性、ULCNet pipeline 
 <tr><td><a href="onnx_prepost.html">onnx_prepost</a></td>
 <td>全部 AINR + AIAEC 模型的 ONNX/NPU 邊界現況表：誰已有 C 前後處理、graph 內外分工、
 各模型 runtime 需跨呼叫保存的 states。</td></tr>
+</table>
+
+<h3>C API 使用說明（整合者視角）</h3>
+<table>
+<tr><th>頁面</th><th>一行描述</th></tr>
+<tr><td><a href="../../../AEC/docs/html/aec_c_api.html">aec_c_api</a></td>
+<td>AEC 的 init/process C API：grid 與 hop 選擇、三態 delay mode、五個 per-hop 入口、
+逐欄位參數效果、前端 HPF、搭配 NN 後級的 context-only 用法、狀態查詢與建置旗標。</td></tr>
+<tr><td><a href="../../../AEC/docs/html/aec_c_api_params.html">aec_c_api_params</a></td>
+<td>AEC 逐欄位參數的可調範圍與「調了會怎樣」（自 <code>aec_c_api</code> 拆出的參考頁）。</td></tr>
+<tr><td><a href="../../../NR/docs/html/nr_c_api.html">nr_c_api</a></td>
+<td>NR 的頻域 C API：五組合法 grid、<code>process</code> vs <code>process_gain</code>、
+逐欄位參數效果與四級 mode、stationary 疊加層的覆寫陷阱、執行期 reconfigure 契約。</td></tr>
+<tr><td><a href="../../../audio_common/docs/html/audio_common_c_api.html">audio_common_c_api</a></td>
+<td>八個 header 哪些該碰：FFT（scaling 與 aliasing 規則）、HPF 設定、pre-gain／FixGain
+兩套 gain 的差異、resampler、共用 <code>sk_*</code> 核心與建置旗標。</td></tr>
+<tr><td><a href="integration_example.html">integration_example</a></td>
+<td><b>怎麼把三個 lib 接起來</b>：四條 pipeline 的逐 hop 呼叫序列、誰做 FFT／誰擁有 window／
+WOLA 在哪的三種答案、4ch pre/post 協定、接 NN 的做法、以及 release build 還剩什麼可 DEBUG。</td></tr>
 </table>
 
 <h3>核心程式庫</h3>
