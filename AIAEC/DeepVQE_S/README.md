@@ -27,10 +27,23 @@ or bit exact.
 ## Training recipe
 
 The shipped `config.ini` uses the paper's AdamW settings (`lr=1.2e-3`,
-`weight_decay=5e-7`) with constant LR. The paper does not publish its loss, so
-this implementation explicitly inherits Align-CRUSE's STFT-consistent PLCPA
-objective (`c=0.3`, `beta=0.7` on the phase-aware complex term). This campaign
-uses batch 8 to fit the available GPU and runs the full 50-epoch budget.
+`weight_decay=5e-7`). Two things in this recipe are **not** from the paper and
+are marked as such in the config:
+
+- **The LR schedule.** The paper publishes an optimizer but no schedule. Rather
+  than hold LR constant -- which leaves the late epochs taking
+  early-epoch-sized steps -- this trainer uses the same per-step linear warmup
+  into cosine annealing that `AINR/DeepFilterNet2/train.py` runs
+  (`lr_warmup=1e-4` climbing to `lr` over `warmup_epochs=3`, then cosine to
+  `min_lr=1e-6`). The schedule is rebuilt from the epoch budget and
+  fast-forwarded on resume, never restored from the checkpoint. Weight decay
+  stays at the published constant and is not given a schedule of its own.
+- **The loss.** The paper does not publish one, so this implementation
+  explicitly inherits Align-CRUSE's STFT-consistent PLCPA objective (`c=0.3`,
+  `beta=0.7` on the phase-aware complex term).
+
+This campaign uses batch 8 to fit the available GPU and runs the full 50-epoch
+budget.
 
 ## ONNX and calibration
 

@@ -2,6 +2,7 @@ import configparser
 import copy
 import dataclasses
 import importlib
+import inspect
 import pathlib
 
 import pytest
@@ -815,7 +816,7 @@ def test_shipped_configs_declare_the_model_specific_paper_recipes():
                          16, 50, 50),
         'Align_CRUSE': ('adam', 'constant', 1.5e-4, 5e-6,
                         16, 50, 50),
-        'DeepVQE_S': ('adamw', 'constant', 1.2e-3, 5e-7,
+        'DeepVQE_S': ('adamw', 'warmup_cosine', 1.2e-3, 5e-7,
                       8, 50, 50),
         'CAGCRN': ('adamw', 'constant', 1e-3, 5e-7,
                    32, 50, 50),
@@ -859,16 +860,42 @@ def test_shipped_loss_and_delay_overrides_are_explicit():
     assert cagcrn.getfloat('loss', 'l1_weight') == pytest.approx(1.0)
 
 
-def test_only_align_ulcnet_uses_and_restores_a_plateau_scheduler():
+def test_each_trainer_wires_the_schedule_its_recipe_declares():
+    """Three shapes, and the checkpoint handling differs between them.
+
+    Align-ULCNet steps a plateau scheduler on the validation loss.  That state
+    cannot be reconstructed from a step count, so it MUST be checkpointed and
+    restored.  DeepVQE-S steps the shared warmup/cosine schedule once per
+    optimizer step; that state IS reconstructible, so it is deliberately
+    rebuilt from the epoch budget and fast-forwarded on resume rather than
+    restored -- carrying a stored T_max back is the failure
+    ``fast_forward_scheduler`` exists to document.  The remaining two report no
+    schedule and must not quietly grow one.
+    """
     for path in AIAEC_TRAINER_SOURCES:
         source = path.read_text(encoding='utf-8')
-        if path.parent.name == 'Align_ULCNet':
+        name = path.parent.name
+        if name == 'Align_ULCNet':
             assert 'ReduceLROnPlateau(' in source
             assert 'scheduler.step(val_loss)' in source
             assert "scheduler.load_state_dict(ckpt['scheduler'])" in source
+        elif name == 'DeepVQE_S':
+            assert 'make_scheduler(' in source
+            assert 'scheduler.step()' in source
+            assert 'fast_forward_scheduler(scheduler, global_step)' in source
+            assert "ckpt['scheduler']" not in source, (
+                'the rebuilt schedule must not be restored from the checkpoint')
+            # The restore side is only half of it: writing the state is what
+            # puts a stale T_max where a later resume can pick it up, and that
+            # line contains no `ckpt[` at all. Match on the method instead, so
+            # neither quote style nor `.get()` slips past.
+            assert 'scheduler.state_dict()' not in source, (
+                'the rebuilt schedule must not be written to the checkpoint')
+            assert 'ReduceLROnPlateau(' not in source
         else:
             assert 'scheduler.step(' not in source
             assert 'lr_scheduler.' not in source
+            assert 'make_scheduler(' not in source
 
 
 def test_the_shared_schedule_actually_reaches_min_lr():
@@ -936,6 +963,93 @@ def test_main_builds_its_paper_optimizer_before_the_first_epoch(
         'CAGCRN': torch.optim.AdamW,
     }[model_name]
     assert type(seen['optimizer']) is expected_type
+
+
+def test_deepvqe_s_steps_its_schedule_per_batch_not_per_epoch(
+        monkeypatch, tmp_path):
+    """The cosine horizon must be counted in optimizer steps, not epochs.
+
+    No source grep can see this. Moving ``scheduler.step()`` out of the batch
+    loop and into the epoch loop leaves every string in the file unchanged
+    while compressing the whole trajectory into ``max_epochs`` steps -- here a
+    600x re-timing. So drive the real ``main()`` against the SHIPPED config,
+    with a corpus large enough that one epoch is many batches, and then step
+    the captured schedule ``max_epochs`` times: per-epoch wiring would already
+    have annealed to ``min_lr``, per-batch wiring is barely out of warmup.
+
+    The shared optimizer harness cannot do this. Its fake corpus yields one
+    batch per epoch, which makes the two wirings numerically identical.
+    """
+    trainer = importlib.import_module('AIAEC.DeepVQE_S.train')
+    config_path = (pathlib.Path(training_common.__file__).parent
+                   / 'DeepVQE_S' / 'config.ini')
+    cfg = configparser.ConfigParser()
+    assert cfg.read(config_path), config_path
+    max_epochs = cfg.getint('training', 'max_epochs')
+    min_lr = cfg.getfloat('training', 'min_lr')
+    warmup_lr = cfg.getfloat('training', 'lr_warmup')
+
+    linear = make_linear_aec_contract(16000, frame_size=512)
+
+    class FakePackedDataset:
+        """160 chunks so a train epoch is 18 batches, not 1."""
+
+        def __init__(self, path, expected_sr=None, mmap=False):
+            self.linear_aec_contract = linear
+            self.linear_aec_contract_hash = linear.fingerprint()
+
+        def __len__(self):
+            return 160
+
+        def __getitem__(self, index):
+            return torch.zeros(5, 16000), {
+                'sequence_id': index // 2, 'chunk_index': index % 2,
+            }
+
+        def fingerprint(self):
+            return 'per-step-schedule-corpus'
+
+    seen = {}
+    # Captured BEFORE the stub replaces it: inspecting trainer.run_epoch after
+    # monkeypatching would read the stub's source, not the trainer's.
+    real_run_epoch = trainer.run_epoch
+
+    def fake_run_epoch(*args, **kwargs):
+        seen['scheduler'] = kwargs.get('scheduler')
+        raise _StopAfterSetup
+
+    monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
+    monkeypatch.setattr(trainer, 'run_epoch', fake_run_epoch)
+    monkeypatch.chdir(tmp_path)
+    args = trainer.build_parser().parse_args(
+        ['--config', str(config_path), '--packed-dir', 'fake', '--device', 'cpu']
+    )
+    with pytest.raises(_StopAfterSetup):
+        trainer.main(args)
+
+    scheduler = seen['scheduler']
+    assert scheduler is not None, 'run_epoch was not handed the schedule'
+
+    # The horizon being batch-sized is only half the contract: it says nothing
+    # about WHERE the schedule is advanced. Stubbing run_epoch means this test
+    # never executes the batch loop, so moving scheduler.step() out to the
+    # epoch loop would leave every assertion below green while the trajectory
+    # advanced 50 steps along a 900-step curve. Pin the call site to the
+    # function that owns the batch loop -- inspecting that ONE function, not
+    # the file, is what makes this a location check rather than a grep.
+    assert 'scheduler.step()' in inspect.getsource(real_run_epoch), (
+        'scheduler.step() must live in run_epoch, which owns the batch loop')
+    assert 'scheduler.step()' not in inspect.getsource(trainer.main), (
+        'advancing the schedule in main would make it once per epoch')
+    assert scheduler.get_last_lr()[0] == pytest.approx(warmup_lr, rel=1e-3), (
+        'the trajectory must start at lr_warmup, not at lr')
+
+    for _ in range(max_epochs):
+        scheduler.step()
+    lr_after = scheduler.get_last_lr()[0]
+    assert lr_after > 100 * min_lr, (
+        'after max_epochs steps the schedule is already at %.3e; a horizon '
+        'that short means it is being stepped once per EPOCH' % lr_after)
 
 
 def test_align_ulcnet_resume_restores_early_stop_counter(

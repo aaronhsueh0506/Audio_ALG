@@ -79,9 +79,11 @@ from AIAEC.training_common import (
     build_arg_parser,
     build_plain_loaders,
     auto_device,
+    fast_forward_scheduler,
     power_compressed_complex_mse_loss,
     halt_on_non_finite,
     make_checkpoint_contract,
+    make_scheduler,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
@@ -94,7 +96,7 @@ from AIAEC.training_common import (
 
 MODEL_NAME = 'DeepVQE_S'
 TASK = MODEL_TASKS[MODEL_NAME]
-LOSS_VERSION = 'deepvqe_s_plcpa_c03_beta07_consistent_adamw_v1'
+LOSS_VERSION = 'deepvqe_s_plcpa_c03_beta07_consistent_adamw_cosine_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,7 +121,7 @@ def forward_batch(model, stems_batch, aec_grid, device):
 def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
              epoch=0, global_step=0, output_dir=None, sr=None,
              grad_clip=1.0, checkpoint_for_halt=None, grad_log=None,
-             max_epochs=None):
+             max_epochs=None, scheduler=None):
     training = optimizer is not None
     model.train(training)
     total_loss, n_batches = 0.0, 0
@@ -173,6 +175,8 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
                     enhanced=output.enhanced,
                 )
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             if grad_log is not None:
                 grad_log.record(
                     total_norm, epoch=epoch, batch_idx=batch_idx,
@@ -227,12 +231,31 @@ def main(args):
     optimizer_name = cfg.get('training', 'optimizer', fallback='adamw').lower()
     if optimizer_name != 'adamw':
         raise ValueError("DeepVQE-S paper recipe requires optimizer=adamw")
-    if cfg.get('training', 'scheduler', fallback='constant').lower() != 'constant':
-        raise ValueError("DeepVQE-S paper reports a constant LR")
+    if cfg.get('training', 'scheduler',
+               fallback='warmup_cosine').lower() != 'warmup_cosine':
+        raise ValueError(
+            "DeepVQE-S uses the shared warmup/cosine schedule; the paper "
+            "publishes no schedule of its own")
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr,
         weight_decay=cfg.getfloat('training', 'weight_decay', fallback=5e-7),
         amsgrad=cfg.getboolean('training', 'amsgrad', fallback=False),
+    )
+    # Per optimizer step, so the horizon is steps and not epochs. Deliberately
+    # NOT stored in the checkpoint: fast_forward_scheduler()'s docstring has
+    # the measured reason a saved T_max must not come back on resume.
+    # No fallbacks: these three are a project choice, and the config comment
+    # says so. A fallback here would let the shipped value be deleted and
+    # silently re-supplied from source, which is the drift the optimizer and
+    # scheduler names two lines up already refuse.
+    total_steps = max_epochs * len(train_loader)
+    warmup_steps = min(
+        cfg.getint('training', 'warmup_epochs') * len(train_loader),
+        total_steps - 1)
+    scheduler = make_scheduler(
+        optimizer, warmup_steps, total_steps, lr,
+        cfg.getfloat('training', 'min_lr'),
+        cfg.getfloat('training', 'lr_warmup'),
     )
 
     start_epoch, global_step, best_val = 0, 0, float('inf')
@@ -249,7 +272,7 @@ def main(args):
             start_epoch = ckpt['epoch'] + 1
             global_step = ckpt['global_step']
             best_val = ckpt.get('best_val', best_val)
-        resumed_lr = optimizer.param_groups[0]['lr']
+        resumed_lr = fast_forward_scheduler(scheduler, global_step)
         print(f"Resumed from {args.resume} at epoch {start_epoch}"
               f"{' (fresh optimizer)' if args.reset_optimizer else ''}"
               f", lr={resumed_lr:.4e}")
@@ -274,6 +297,7 @@ def main(args):
         started = time.time()
         train_loss, global_step = run_epoch(
             model, train_loader, aec_grid, device, loss_cfg, optimizer,
+            scheduler=scheduler,
             epoch=epoch, global_step=global_step, output_dir=output_dir,
             sr=aec_grid.sr, grad_clip=grad_clip,
             checkpoint_for_halt=checkpoint_for_halt, grad_log=grad_log,

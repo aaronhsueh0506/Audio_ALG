@@ -87,7 +87,7 @@ one optimizer/loss/scheduler was not a valid comparison protocol.
 |---|---|---|---|---|
 | Align-ULCNet | Adam / 4e-3 | validation plateau, x0.1, patience 1 | component-compressed frequency MSE, c=0.3 | 16 / 50 |
 | Align-CRUSE | Adam / 1.5e-4, decay 5e-6 | constant | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term | 16 / 50 |
-| DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | constant | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
+| DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | warmup -> cosine (project choice) | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
 | CAGCRN | AdamW / 1e-3, decay 5e-7 | constant | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
 
 The epoch budget is the project decision requested for this training campaign.
@@ -97,9 +97,15 @@ Early stopping cannot end these runs before epoch 50; validation still selects
 the best checkpoint, and Align-ULCNet still applies its published LR reduction.
 Changing a loss recipe changes `loss_version`, so a checkpoint from the old
 generic recipe is rejected instead of silently resuming under a new objective.
-Align-ULCNet is the only model with a stateful scheduler; its plateau state is
-stored and restored with the optimizer. The other papers report no schedule,
-so their LR is constant rather than an invented cosine trajectory.
+Align-ULCNet is the only model with a STATEFUL scheduler: plateau state cannot
+be reconstructed from a step count, so it is stored and restored with the
+optimizer. DeepVQE-S also runs a schedule, but a reconstructible one -- the
+shared per-step warmup/cosine, rebuilt from the epoch budget and fast-forwarded
+on resume rather than checkpointed. Its paper publishes an optimizer but no
+schedule, so that trajectory is a project choice and is labelled as one in its
+config and README; a constant LR was the alternative and leaves the late epochs
+taking early-epoch-sized steps. Align-CRUSE and CAGCRN report no schedule
+either and do keep a constant LR.
 
 The stored project examples remain 10-second chunks and one epoch remains one
 complete DataLoader pass. Align-ULCNet's paper used random 3-second examples
