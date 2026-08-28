@@ -1129,8 +1129,11 @@ def test_chunk_geometry_refusal_names_the_key_the_rate_and_a_working_value(
     assert str(sample_rate) in message
     assert f'hop={hop}' in message
 
-    # The value it offers has to be one that actually renders.
-    suggested = re.search(r'chunk_sec = ([0-9.]+)\.$', message).group(1)
+    # The value it offers has to be one that actually renders. Anchored on the
+    # 'e.g.' lead-in rather than the end of the message, which is free to grow
+    # further advice after the suggestion.
+    suggested = re.search(
+        r'e\.g\. chunk_sec = ([0-9]+(?:\.[0-9]+)?)\.', message).group(1)
     cfg.set('sequence', 'chunk_sec', suggested)
     assert chunk_samples_from_config(cfg, hop) % hop == 0
 
