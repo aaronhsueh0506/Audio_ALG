@@ -185,6 +185,12 @@ four_aec_nr_res_process_post(pipeline, &pre.token, weights, mono_output);
 four_aec_nr_res_destroy(pipeline);
 ```
 
+For a product that keeps linear AEC, shared RES, CNG and synthesis but omits
+MMSE-LSA, set `cfg.enable_nr = 0` before querying memory or constructing the
+instance. The static-memory requirement then excludes the NR state. This is
+independent of `enable_post`: setting `enable_post = 0` selects the pre-only
+integration seam and removes the complete post path.
+
 Caller-owned pool (static/board path):
 
 ```c

@@ -1050,13 +1050,13 @@ static int test_pool_and_descriptor_gate(void) {
      * layout this wrapper descriptor carries. Bump this literal with
      * AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 13u;
+    stale.layout_version = 15u;
     CHECK(audio_pipeline_4ch_ulcnet_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "init_ex rejects a descriptor from the superseded layout even "
           "when its byte count exactly covers the current pool");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION &&
-          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 15u,
+          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 16u,
           "the queried descriptor publishes the current carve layout");
 
     stat = audio_pipeline_4ch_ulcnet_init_ex(
@@ -2240,7 +2240,8 @@ static int run_all_tests(void) {
          * accepted would have meant a caller configuring something that
          * cannot exist. One row per field, each proved to fire. */
         invalid = audio_pipeline_4ch_ulcnet_default_config();
-        CHECK(invalid.core.enable_post == 0 && invalid.core.enable_cng == 0,
+        CHECK(invalid.core.enable_post == 0 && invalid.core.enable_nr == 0 &&
+              invalid.core.enable_cng == 0,
               "the default config itself states the pre-only profile");
         {
             AudioPipeline4ChUlcnet* ok_default =
@@ -2258,6 +2259,7 @@ static int run_all_tests(void) {
                   "post-only field rejected: " what);                        \
         } while (0)
         REJECT_POST_ONLY(bad.core.enable_post = 1, "enable_post");
+        REJECT_POST_ONLY(bad.core.enable_nr = 1, "enable_nr");
         REJECT_POST_ONLY(bad.core.enable_cng = 1, "enable_cng");
         REJECT_POST_ONLY(bad.core.legacy_amin = 1, "legacy_amin");
         REJECT_POST_ONLY(bad.core.nr_mode = MMSE_LSA_NR_AGGRESSIVE,

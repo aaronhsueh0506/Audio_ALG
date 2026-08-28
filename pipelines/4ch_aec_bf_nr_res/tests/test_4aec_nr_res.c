@@ -477,6 +477,12 @@ static void test_invalid_configs(void) {
     CHECK(four_aec_nr_res_create(&cfg) == NULL,
           "invalid capture proxy is rejected");
 
+    cfg = four_aec_nr_res_default_config(16000);
+    cfg.enable_nr = 2;
+    CHECK(four_aec_nr_res_create(&cfg) == NULL &&
+          four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0,
+          "a non-boolean NR enable is rejected by create and sizing");
+
     /* Backward-jump quarantine. The WINDOW is checked even though the enable
      * defaults to 0: a config that would misbehave the moment someone flips
      * one field must not pass validation today. The accept row at the end is
@@ -793,13 +799,13 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * build_flags_hash still matches and this counter is the whole signal.
      * Bump this literal with FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 14u;
+    stale.layout_version = 15u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 15u,
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 16u,
           "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(
@@ -2056,9 +2062,9 @@ static uint32_t elapsed_us(const struct timespec* a, const struct timespec* b) {
                       + (b->tv_nsec - a->tv_nsec) / 1000);
 }
 
-static void feed_strength_hops(FourAecNrRes* p, int hops,
-                               uint32_t* last_pre_us,
-                               uint32_t* last_post_us) {
+static int feed_strength_hops(FourAecNrRes* p, int hops,
+                              uint32_t* last_pre_us,
+                              uint32_t* last_post_us) {
     int hop = four_aec_nr_res_hop_size(p);
     int n = four_aec_nr_res_n_freqs(p);
     float* mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
@@ -2092,11 +2098,13 @@ static void feed_strength_hops(FourAecNrRes* p, int hops,
         if (last_pre_us) *last_pre_us = elapsed_us(&a, &b);
 
         clock_gettime(CLOCK_MONOTONIC, &a);
-        (void)four_aec_nr_res_process_post(p, &pre.token, w, out);
+        if (four_aec_nr_res_process_post(p, &pre.token, w, out) !=
+            FOUR_AEC_NR_RES_OK) break;
         clock_gettime(CLOCK_MONOTONIC, &b);
         if (last_post_us) *last_post_us = elapsed_us(&a, &b);
     }
     free(mics); free(far); free(out); free(w);
+    return h;
 }
 
 /* ============================================================================
@@ -3016,6 +3024,165 @@ static void test_runtime_strength(void) {
     four_aec_nr_res_destroy(p);
 }
 
+static void test_nr_bypass(void) {
+    FourAecNrResConfig enabled = four_aec_nr_res_default_config(16000);
+    FourAecNrResConfig disabled = enabled;
+    FourAecNrResMemBreakdown on_mem, off_mem;
+    FourAecNrRes* p;
+    FourAecNrResLastTiming timing;
+
+    disabled.enable_nr = 0;
+    CHECK(four_aec_nr_res_get_mem_breakdown(&enabled, &on_mem) == 0 &&
+          four_aec_nr_res_get_mem_breakdown(&disabled, &off_mem) == 0 &&
+          on_mem.nr_bytes > 0 && off_mem.nr_bytes == 0 &&
+          on_mem.total_bytes - off_mem.total_bytes ==
+              ((on_mem.nr_bytes + 15u) & ~(size_t)15u),
+          "NR-disabled sizing omits exactly the aligned MMSE-LSA state");
+
+    p = four_aec_nr_res_create(&disabled);
+    CHECK(p != NULL, "RES-only core creates without an NR state");
+    if (!p) return;
+    CHECK(four_aec_nr_res_nr_count(p) == 0 &&
+          four_aec_nr_res_post_res_count(p) == 1,
+          "NR-disabled core still owns the shared RES/post path");
+    CHECK(four_aec_nr_res_set_nr_mode(
+              p, MMSE_LSA_NR_AGGRESSIVE) == -1,
+          "runtime NR mode changes are refused when NR is disabled");
+
+    CHECK(feed_strength_hops(p, 40, NULL, NULL) == 40,
+          "NR-disabled core processes the complete RES-only stimulus");
+    four_aec_nr_res_get_last_timing(p, &timing);
+#if FOUR_AEC_NR_RES_STAGE_TIMING
+    /* Both rows belong inside the guard. With the timers compiled out every
+     * field reads zero whatever enable_nr is, so `nr_us == 0` outside this
+     * branch would be an identity rather than evidence. */
+    CHECK(timing.nr_us == 0,
+          "NR-disabled processing completes without entering MMSE-LSA");
+    CHECK(timing.res_us > 0,
+          "NR-disabled processing retains the RES stage");
+#else
+    CHECK(timing.nr_us == 0 && timing.res_us == 0,
+          "NR-disabled build reports compiled-out stage timing as zero");
+#endif
+    four_aec_nr_res_destroy(p);
+}
+
+/* The NR-disabled post path must apply EXACTLY the RES gain, with no scaling
+ * of its own. total_gain is not readable from outside, but the identity still
+ * has an external witness: MMSE-LSA PASSES THROUGH -- gain == 1.0 in every
+ * bin -- for its first num_init_frames hops, and min(1.0, res_gain) IS
+ * res_gain. So over that window an NR-enabled and an NR-disabled instance fed
+ * the same stimulus must emit the same samples, bit for bit.
+ *
+ * All three assertions are load-bearing. Without the equality, a wrong
+ * constant on the RES-only branch passes every structural row in
+ * test_nr_bypass(). Without the non-zero check the equality would hold
+ * trivially on a silent output. Without the later divergence it would also
+ * hold for a denoiser that never shapes anything, which would make the first
+ * assertion prove nothing about the bypass. */
+static void test_nr_bypass_output_identity(void) {
+    FourAecNrResConfig on_cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrResConfig off_cfg = on_cfg;
+    FourAecNrRes* on;
+    FourAecNrRes* off;
+    FourAecNrResPreFrame pre_on, pre_off;
+    float *mics, *far, *out_on, *out_off;
+    Complex* w;
+    uint32_t rng = 12345u;
+    int hop, n, init_hops, total_hops, h, i, ch, k;
+    int prefix_equal = 1, prefix_nonzero = 0, diverged_after_init = 0;
+
+    off_cfg.enable_nr = 0;
+    on = four_aec_nr_res_create(&on_cfg);
+    off = four_aec_nr_res_create(&off_cfg);
+    CHECK(on != NULL && off != NULL,
+          "NR-enabled and NR-disabled instances both create");
+    if (!on || !off) {
+        four_aec_nr_res_destroy(on);
+        four_aec_nr_res_destroy(off);
+        return;
+    }
+    hop = four_aec_nr_res_hop_size(on);
+    n = four_aec_nr_res_n_freqs(on);
+    CHECK(four_aec_nr_res_hop_size(off) == hop &&
+          four_aec_nr_res_n_freqs(off) == n,
+          "the two instances resolve the same grid");
+
+    /* The canonical noise-init length: the pipeline's NR overlay retimes L,
+     * not num_init_frames, so the denoiser's pass-through window is the
+     * canonical one for this grid. */
+    init_hops = mmse_lsa_retime_frames(20, 16000, hop);
+    total_hops = init_hops + 80;
+
+    mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out_on = (float*)calloc((size_t)hop, sizeof(float));
+    out_off = (float*)calloc((size_t)hop, sizeof(float));
+    w = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n, sizeof(Complex));
+    if (!mics || !far || !out_on || !out_off || !w) {
+        free(mics); free(far); free(out_on); free(out_off); free(w);
+        four_aec_nr_res_destroy(on);
+        four_aec_nr_res_destroy(off);
+        CHECK(0, "NR bypass identity stimulus allocates");
+        return;
+    }
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+        for (k = 0; k < n; ++k) {
+            w[(size_t)ch * (size_t)n + (size_t)k].r = 0.25f;
+            w[(size_t)ch * (size_t)n + (size_t)k].i = 0.0f;
+        }
+
+    for (h = 0; h < total_hops; ++h) {
+        for (i = 0; i < hop; ++i) {
+            float t = (float)(h * hop + i);
+            float r = 0.6f * sinf(0.06f * t);
+            float noise;
+            /* Deterministic broadband term so the denoiser has something to
+             * shape once it leaves init; a pure tone pair can leave the gain
+             * at its ceiling and the divergence row would never fire. */
+            rng = rng * 1664525u + 1013904223u;
+            noise = 0.02f * ((float)((rng >> 8) & 0xFFFFu) / 32768.0f - 1.0f);
+            far[i] = r;
+            for (ch = 0; ch < 4; ++ch)
+                mics[(size_t)i * 4u + (size_t)ch] =
+                    0.5f * r + 0.02f * sinf(0.017f * t) + noise;
+        }
+        if (four_aec_nr_res_process_pre(on, mics, far, &pre_on) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_pre(off, mics, far, &pre_off) !=
+                FOUR_AEC_NR_RES_OK) break;
+        if (four_aec_nr_res_process_post(on, &pre_on.token, w, out_on) !=
+                FOUR_AEC_NR_RES_OK ||
+            four_aec_nr_res_process_post(off, &pre_off.token, w, out_off) !=
+                FOUR_AEC_NR_RES_OK) break;
+
+        if (h < init_hops) {
+            if (memcmp(out_on, out_off, (size_t)hop * sizeof(float)) != 0)
+                prefix_equal = 0;
+            for (i = 0; i < hop; ++i)
+                if (out_off[i] != 0.0f) prefix_nonzero = 1;
+        } else if (memcmp(out_on, out_off,
+                          (size_t)hop * sizeof(float)) != 0) {
+            diverged_after_init = 1;
+        }
+    }
+    CHECK(h == total_hops, "both instances process the whole stimulus");
+    CHECK(prefix_equal,
+          "NR-disabled output is bit-identical to NR-enabled while the "
+          "denoiser passes through -- the RES-only branch applies res_gain "
+          "with nothing of its own");
+    CHECK(prefix_nonzero,
+          "that identity window carries a non-zero signal");
+    CHECK(diverged_after_init,
+          "the two paths diverge once the denoiser starts shaping, so the "
+          "identity above is a constraint and not a silent no-op");
+
+    free(mics); free(far); free(out_on); free(out_off); free(w);
+    four_aec_nr_res_destroy(on);
+    four_aec_nr_res_destroy(off);
+}
+
 /* Per-stage timing: the numbers must be REAL measurements, not just present.
  * Each timed stage is bounded by the wall-clock cost of the call it sits in,
  * and the two fields documented as always-zero must actually be zero -- that
@@ -3568,6 +3735,8 @@ int main(void) {
     test_duty_low_erle_delay_change();
     test_far_spec_provenance_guard();
     test_runtime_strength();
+    test_nr_bypass();
+    test_nr_bypass_output_identity();
     test_stage_timing();
     test_comfort_noise_contract();
     test_reset_equals_fresh_instance(16000, 256, 1);

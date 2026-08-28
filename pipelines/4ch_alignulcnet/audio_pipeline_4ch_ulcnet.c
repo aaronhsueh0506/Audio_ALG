@@ -143,6 +143,7 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
      * not have done anything. Silently accepting them is what would make one
      * struct mean two things; refusing says so at init. */
     if (cfg->core.enable_post != 0) return 0;
+    if (cfg->core.enable_nr != 0) return 0;
     if (cfg->core.enable_cng != 0) return 0;
     if (cfg->core.legacy_amin != 0) return 0;
     /* MmseLsaNrMode has no "disabled" value and no denoiser is created here,
@@ -224,6 +225,7 @@ AudioPipeline4ChConfig audio_pipeline_4ch_ulcnet_default_config(void) {
      * believes it configured NR or comfort noise finds out at init instead of
      * on a board. */
     cfg.core.enable_post = 0;
+    cfg.core.enable_nr = 0;
     cfg.core.enable_cng = 0;
     /* core.delay_backward_quarantine_enabled stays at the core default
      * (OFF). The guard holds backward candidates only, for a bounded window

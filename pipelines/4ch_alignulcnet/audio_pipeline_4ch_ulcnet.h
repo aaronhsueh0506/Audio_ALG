@@ -209,8 +209,16 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * build-flags-hash token no longer spells it as a literal -- it folds in
  * the stringified ULCNET_SR/ULCNET_N_FFT instead, and two builds on
  * different grids no longer share a descriptor hash. Bumped with the
- * token string, as this file's rule requires. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 15u
+ * token string, as this file's rule requires.
+ * Version 16 carries the core's own layout 15 -> 16: FourAecNrResConfig
+ * gained enable_nr. This wrapper embeds AudioPipeline4ChConfig by value in
+ * its control block, so that struct grew 176 -> 180 B and every field after
+ * it moved. The composed pre-only sub-pool is unchanged -- enable_post = 0
+ * already carves no NR state either way -- so the pool byte count alone
+ * cannot say this happened, and a version-15 descriptor must be refused on
+ * the counter. It is also a C struct-ABI change: a caller compiled against
+ * the version-15 header must not be linked against this one. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 16u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -268,7 +276,7 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
 
 /* Returns the compiled checkpoint-grid defaults for the PRE-ONLY profile
  * this wrapper is the only consumer of: core.fft_size = ULCNET_N_FFT,
- * core.enable_post = 0 and core.enable_cng = 0.
+ * core.enable_post = 0, core.enable_nr = 0 and core.enable_cng = 0.
  *
  * Align-ULCNet replaces the post-beam RES/NR/CNG stage entirely, so with
  * enable_post = 0 the core builds no denoiser, no suppressor, no comfort
@@ -276,6 +284,10 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
  * this function returns, and is REJECTED otherwise rather than ignored:
  *
  *   core.enable_post  = 0
+ *   core.enable_nr    = 0   (the core's own default is 1; the pre-only
+ *                       profile turns it off so the field states what is
+ *                       true here rather than being left at a value that
+ *                       could not take effect)
  *   core.enable_cng   = 0
  *   core.legacy_amin  = 0
  *   core.nr_mode      = MMSE_LSA_NR_BALANCED   (the enum has no "disabled"

@@ -142,8 +142,12 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * that shipped with it: sizeof(Aec) grew 5832 -> 5848 B and the per-instance
  * pool grew by a per-grid constant, so the four lanes inside the composed
  * core sub-pool move this layer's total too. Same release unit, so one bump
- * covers both -- a version-9 descriptor is refused for either reason. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 10u
+ * covers both -- a version-9 descriptor is refused for either reason.
+ * Version 11 carries the core's layout 15 -> 16: its embedded config gained
+ * enable_nr and its MMSE-LSA region can now be omitted for RES-only products.
+ * This wrapper embeds that config and composes the core pool, so both its
+ * control-block size and a valid sub-pool shape changed. */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 11u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

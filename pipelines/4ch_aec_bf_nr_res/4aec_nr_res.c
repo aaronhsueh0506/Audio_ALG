@@ -376,6 +376,7 @@ static int derive_dims_and_configs(
     FOUR_CK_BOOL(enable_cng);
     FOUR_CK_BOOL(legacy_amin);
     FOUR_CK_BOOL(enable_post);
+    FOUR_CK_BOOL(enable_nr);
 
 #undef FOUR_CK_BOOL
 
@@ -654,9 +655,14 @@ static size_t pipeline_pool_size(
     int post_ma_n,
     int delay_ring_size,
     size_t delay_estimator_bytes,
-    int enable_post) {
+    int enable_post,
+    int enable_nr) {
+    /* "the MMSE-LSA region exists" -- NR lives only inside the post path, so
+     * the pair is one fact. Named once here rather than re-spelled at each
+     * of the three places below that need it. */
+    const int want_nr = enable_post && enable_nr;
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
-    size_t nr_bytes = enable_post ? mmse_lsa_get_mem_size(nr_cfg) : 0;
+    size_t nr_bytes = want_nr ? mmse_lsa_get_mem_size(nr_cfg) : 0;
     size_t fft_bytes = enable_post ? fft_get_mem_size(fft) : 0;
     size_t buffer_bytes = pipeline_buffer_size(
         hop, fft, n, post_ma_n, delay_ring_size, delay_estimator_bytes,
@@ -665,14 +671,15 @@ static size_t pipeline_pool_size(
     int ch;
 
     if (aec_bytes == 0 || buffer_bytes == 0 ||
-        (enable_post && (nr_bytes == 0 || fft_bytes == 0))) return 0;
+        (enable_post && fft_bytes == 0) ||
+        (want_nr && nr_bytes == 0)) return 0;
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
         total = ck_add_size(total, ck_align16_size(aec_bytes));
-    if (enable_post) {
+    if (want_nr)
         total = ck_add_size(total, ck_align16_size(nr_bytes));
+    if (enable_post)
         total = ck_add_size(total, ck_align16_size(fft_bytes));
-    }
     total = ck_add_size(total, buffer_bytes);
     return MEM_SIZE_INVALID(total) ? 0 : total;
 }
@@ -687,7 +694,8 @@ static int pipeline_build(
     const AecConfig* aec_cfg,
     const MmseLsaConfig* nr_cfg) {
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
-    size_t nr_bytes = p->cfg.enable_post ? mmse_lsa_get_mem_size(nr_cfg) : 0;
+    size_t nr_bytes = p->cfg.enable_post && p->cfg.enable_nr
+        ? mmse_lsa_get_mem_size(nr_cfg) : 0;
     size_t fft_bytes = p->cfg.enable_post ? fft_get_mem_size(p->fft_size) : 0;
     int ch;
 
@@ -700,12 +708,17 @@ static int pipeline_build(
     }
 
     if (p->cfg.enable_post) {
-        void* nr_pool = pool_carve(cursor, 1, nr_bytes);
-        void* fft_pool = pool_carve(cursor, 1, fft_bytes);
-        if (!nr_pool || !fft_pool) return 0;
-        p->nr = mmse_lsa_init(nr_pool, nr_bytes, nr_cfg);
+        void* fft_pool;
+        if (p->cfg.enable_nr) {
+            void* nr_pool = pool_carve(cursor, 1, nr_bytes);
+            if (!nr_pool) return 0;
+            p->nr = mmse_lsa_init(nr_pool, nr_bytes, nr_cfg);
+            if (!p->nr) return 0;
+        }
+        fft_pool = pool_carve(cursor, 1, fft_bytes);
+        if (!fft_pool) return 0;
         p->fft = fft_init(fft_pool, fft_bytes, p->fft_size);
-        if (!p->nr || !p->fft) return 0;
+        if (!p->fft) return 0;
     }
 
     if (!carve_working_buffers(p, cursor) ||
@@ -743,8 +756,8 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
     hash = fnv1a_str(
-        "|carve:self,aec0,aec1,aec2,aec3,nr,fft,linear,hop3,"
-        "post?(nr,fft,hop1,complex4,float6,fftfloat3,postsg),"
+        "|carve:self,aec0,aec1,aec2,aec3,post?(nr?,fft),linear,hop3,"
+        "post?(hop1,complex4,float6,fftfloat3,postsg),"
         "lanebind,delayest?,delayring?",
         hash);
     hash = fnv1a_str("|align16", hash);
@@ -771,6 +784,7 @@ FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     cfg.aec_preset = AEC_PRESET_BALANCED;
     cfg.nr_mode = MMSE_LSA_NR_BALANCED;
     cfg.enable_post = 1;
+    cfg.enable_nr = 1;
     cfg.enable_cng = 1;
     cfg.legacy_amin = 0;
     return cfg;
@@ -798,7 +812,7 @@ int four_aec_nr_res_get_mem_requirements(
 
     pool_bytes = pipeline_pool_size(
         &aec_cfg, &nr_cfg, hop, fft, n, post_ma_n, delay_ring_size,
-        delay_estimator_bytes, cfg->enable_post);
+        delay_estimator_bytes, cfg->enable_post, cfg->enable_nr);
     total_bytes = ck_add_size(
         ck_align16_size(sizeof(FourAecNrRes)), pool_bytes);
     backend = four_aec_nr_res_backend_id();
@@ -929,10 +943,12 @@ FourAecNrRes* four_aec_nr_res_init_ex(
         if (context.hop_size != hop || context.n_freqs != n)
             return NULL;
     }
-    if (p->cfg.enable_post &&
-        (mmse_lsa_get_hop_size(p->nr) != hop ||
-         mmse_lsa_get_n_freqs(p->nr) != n ||
-         fft_get_n_freqs(p->fft) != n)) return NULL;
+    if (p->cfg.enable_post && fft_get_n_freqs(p->fft) != n) return NULL;
+    /* p->nr is non-NULL exactly when the NR region was carved (the whole
+     * pool is memset before build), so it answers the same question the two
+     * config fields do -- and it is the pointer about to be dereferenced. */
+    if (p->nr && (mmse_lsa_get_hop_size(p->nr) != hop ||
+                  mmse_lsa_get_n_freqs(p->nr) != n)) return NULL;
     return p;
 }
 
@@ -1848,11 +1864,15 @@ static int run_post_res_and_nr(
     p->last_timing.res_us = t1 - t0;
     if (!res_gain) return 0;
 
-    nr_extra = p->cfg.legacy_amin ? NULL : p->extra_noise;
-    if (mmse_lsa_process_gain(
-            p->nr, error, nr_extra, NULL) != 0)
-        return 0;
-    p->last_timing.nr_us = four_aec_nr_res_now_us() - t1;
+    if (p->cfg.enable_nr) {
+        nr_extra = p->cfg.legacy_amin ? NULL : p->extra_noise;
+        if (mmse_lsa_process_gain(
+                p->nr, error, nr_extra, NULL) != 0)
+            return 0;
+        p->last_timing.nr_us = four_aec_nr_res_now_us() - t1;
+    } else {
+        p->last_timing.nr_us = 0;
+    }
 
     /* total_gain[k]=min(...) and the near_mean reduction below are mutually
      * independent (neither reads the other's output), so they share one
@@ -1861,12 +1881,23 @@ static int run_post_res_and_nr(
      * near_mean plus the stateful near_hang hangover counter, so it must be
      * fully resolved before any per-bin lift can be computed. */
     {
-        const float* nr_gain = mmse_lsa_get_gain(p->nr, NULL);
         float near_mean = 0.0f;
-        for (k = 0; k < n; ++k) {
-            p->total_gain[k] =
-                fminf(nr_gain[k], res_gain[k]);
-            near_mean += p->error_power[k];
+        /* Unswitched rather than a per-bin ternary: enable_nr cannot change
+         * within a hop, and at -O2 neither arm of that ternary is hoisted or
+         * if-converted -- nr_gain is NULL on the disabled path, so the load
+         * cannot be speculated and what remains is one branch per bin, 513 of
+         * them per hop on the 48 kHz grid. */
+        if (p->cfg.enable_nr) {
+            const float* nr_gain = mmse_lsa_get_gain(p->nr, NULL);
+            for (k = 0; k < n; ++k) {
+                p->total_gain[k] = fminf(nr_gain[k], res_gain[k]);
+                near_mean += p->error_power[k];
+            }
+        } else {
+            for (k = 0; k < n; ++k) {
+                p->total_gain[k] = res_gain[k];
+                near_mean += p->error_power[k];
+            }
         }
         near_mean /= (float)n;
 
@@ -2259,7 +2290,7 @@ int four_aec_nr_res_linear_aec_count(const FourAecNrRes* p) {
 }
 
 int four_aec_nr_res_nr_count(const FourAecNrRes* p) {
-    return p && !p->destroyed && p->cfg.enable_post ? 1 : 0;
+    return p && !p->destroyed && p->nr ? 1 : 0;
 }
 
 int four_aec_nr_res_post_res_count(const FourAecNrRes* p) {
@@ -2352,6 +2383,7 @@ int four_aec_nr_res_get_mem_breakdown(
     int delay_ring_size;
     size_t delay_estimator_bytes;
     int ch;
+    int want_nr;
 
     if (!out || !derive_dims_and_configs(
             cfg, &aec_cfg, &nr_cfg, &fft, &hop, &n,
@@ -2359,13 +2391,15 @@ int four_aec_nr_res_get_mem_breakdown(
             &delay_estimator_bytes)) return -1;
 
     aec_one = aec_get_mem_size(&aec_cfg);
-    nr_bytes = cfg->enable_post ? mmse_lsa_get_mem_size(&nr_cfg) : 0;
+    want_nr = cfg->enable_post && cfg->enable_nr;
+    nr_bytes = want_nr ? mmse_lsa_get_mem_size(&nr_cfg) : 0;
     fft_bytes = cfg->enable_post ? fft_get_mem_size(fft) : 0;
     wrapper_storage = pipeline_buffer_size(
         hop, fft, n, post_ma_n, delay_ring_size, delay_estimator_bytes,
         cfg->enable_post);
     if (aec_one == 0 || wrapper_storage == 0 ||
-        (cfg->enable_post && (nr_bytes == 0 || fft_bytes == 0))) return -1;
+        (cfg->enable_post && fft_bytes == 0) ||
+        (want_nr && nr_bytes == 0)) return -1;
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
         aec_total = ck_add_size(aec_total, ck_align16_size(aec_one));
@@ -2373,10 +2407,10 @@ int four_aec_nr_res_get_mem_breakdown(
         ck_align16_size(sizeof(FourAecNrRes)), wrapper_storage);
     total = wrapper_bytes;
     total = ck_add_size(total, aec_total);
-    if (cfg->enable_post) {
+    if (want_nr)
         total = ck_add_size(total, ck_align16_size(nr_bytes));
+    if (cfg->enable_post)
         total = ck_add_size(total, ck_align16_size(fft_bytes));
-    }
     if (MEM_SIZE_INVALID(total)) return -1;
 
     memset(out, 0, sizeof(*out));

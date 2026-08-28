@@ -141,8 +141,17 @@ extern "C" {
  *      +18,464 B @48 kHz/1024 -- four lanes here, so four times that). That
  *      moves the total and every offset after the first lane as well. Two
  *      reasons to refuse a version-14 descriptor, one release unit, one
- *      bump: this counter is not incremented twice for the same ship. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 15u
+ *      bump: this counter is not incremented twice for the same ship.
+ *
+ *  16: FourAecNrResConfig gained enable_nr and the MMSE-LSA region became
+ *      conditional on it. The default (enable_nr=1) retains the prior carve,
+ *      while RES-only instances omit the NR state but retain the shared RES,
+ *      FFT and WOLA regions. Both the embedded config size and the set of
+ *      possible carves changed, so persisted version-15 descriptors must be
+ *      refused even when their byte count happens to be large enough. This
+ *      is also a C struct-ABI change: callers must be rebuilt with this
+ *      header and must not mix a version-15 object with a version-16 library. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 16u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -260,6 +269,8 @@ typedef struct FourAecNrResConfig {
     MmseLsaNrMode nr_mode;
     int enable_post;              /* direct core: 1=RES/NR/iFFT, 0=pre-only;
                                     * complete wrappers require caller value 1 */
+    int enable_nr;                /* bool: run shared MMSE-LSA; when 0, the
+                                    * post path remains RES+CNG+iFFT/WOLA */
     int enable_cng;               /* bool                                   */
     int legacy_amin;              /* bool: do not fold R2 into NR prior      */
 } FourAecNrResConfig;
@@ -622,7 +633,8 @@ int four_aec_nr_res_n_freqs(const FourAecNrRes* p);
 int four_aec_nr_res_sample_rate(const FourAecNrRes* p);
 
 /* Structural audit hooks. The matcher count is 1 only in MATCHED mode and 0
- * in FIXED/EXTERNAL; the other values are 4 / enable_post / enable_post. */
+ * in FIXED/EXTERNAL; the other values are 4 /
+ * (enable_post && enable_nr) / enable_post. */
 int four_aec_nr_res_matched_filter_count(const FourAecNrRes* p);
 int four_aec_nr_res_linear_aec_count(const FourAecNrRes* p);
 int four_aec_nr_res_nr_count(const FourAecNrRes* p);
@@ -742,8 +754,9 @@ int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live,
  * The noise floor, the min-tracking ring and the gain smoothing history all
  * carry on across the change; use four_aec_nr_res_reset() for a restart.
  *
- * Requires enable_post. Call between hops. Returns 0, or -1 on NULL, an
- * out-of-enum mode, a pre-only core, or a rejected target. */
+ * Requires enable_post and enable_nr. Call between hops. Returns 0, or -1 on
+ * NULL, an out-of-enum mode, a pre-only/NR-disabled core, or a rejected
+ * target. */
 int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, MmseLsaNrMode mode);
 
 /* ============================================================================

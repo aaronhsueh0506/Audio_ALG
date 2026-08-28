@@ -457,7 +457,7 @@ static int run_static_parity(int sample_rate, int fft_size) {
     CHECK(audio_pipeline_4ch_get_mem_requirements(&cfg, &req) == 0,
           "static memory requirement query succeeds");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_LAYOUT_VERSION &&
-              AUDIO_PIPELINE_4CH_LAYOUT_VERSION == 10u,
+              AUDIO_PIPELINE_4CH_LAYOUT_VERSION == 11u,
           "the queried descriptor publishes the current carve layout");
     CHECK(req.bytes <= (uint64_t)SIZE_MAX,
           "static memory requirement fits size_t");
@@ -644,6 +644,14 @@ static int run_all_tests(void) {
     invalid.core.enable_post = 0;
     CHECK(audio_pipeline_4ch_create(&invalid) == NULL,
           "standard wrapper rejects the core-only pre profile");
+    invalid = audio_pipeline_4ch_default_config(16000);
+    invalid.core.enable_nr = 0;
+    {
+        AudioPipeline4Ch* res_only = audio_pipeline_4ch_create(&invalid);
+        CHECK(res_only != NULL,
+              "standard wrapper accepts the RES-only post profile");
+        audio_pipeline_4ch_destroy(res_only);
+    }
     invalid = audio_pipeline_4ch_default_config(16000);
     invalid.gsc_lambda = 1.0f + 1e-6f;
     CHECK(audio_pipeline_4ch_create(&invalid) == NULL,
