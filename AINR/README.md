@@ -59,25 +59,28 @@ python3 inference.py --config config.ini --model /path/to/checkpoint.pt \
 Use `--resume` only with a checkpoint accepted by that directory's serialized
 feature/model contract.
 
-## Training contract (shared by every trainer)
+## Shared training safety and AINR schedule
 
-One definition, in `AINR/training_common.py`, imported by every trainer in
-this directory and, through `AIAEC/training_common.py`, by all four AEC
-candidates. This is the single write-up; `AIAEC/README.md` points here. The
-schedule and the non-finite handling are part of the comparison protocol: two
-models trained over "the same 100 epochs" are not comparable if one of them
-annealed and the other sat at its initial learning rate.
+The generic safety/checkpoint machinery lives in `AINR/training_common.py` and
+is reused, through `AIAEC/training_common.py`, by the AEC candidates. It covers
+non-finite handling, finite gradient clipping, evidence dumps, resume helpers
+and the per-tensor vanished-weight guard. The numerical training recipe is not
+universal: the AIAEC models deliberately use model-specific optimizers, losses
+and schedules documented in `AIAEC/README.md`.
 
-**Learning rate** — per *optimizer step*, linear warmup from `lr_warmup` to `lr`
-over `warmup_epochs`, then cosine annealing to `min_lr`. It decays
-unconditionally; nothing about it depends on the validation loss.
+**AINR learning rate** — the AINR trainers use a per-*optimizer-step* linear
+warmup from `lr_warmup` to `lr` over `warmup_epochs`, then cosine annealing to
+`min_lr`. It decays unconditionally; nothing about it depends on validation
+loss. Do not infer an AIAEC model's schedule from this section.
 
-**Resume** — the scheduler is deliberately NOT stored in the checkpoint. Restoring
-it brings back the `T_max` of the run that wrote it: measured, a checkpoint from a
-100-epoch run resumed at 120 epochs ends on lr 1.02e-04 against a `min_lr` of
-1e-06, 102x. `global_step` is stored instead, and `fast_forward_scheduler()`
-rebuilds for the current run and indexes the fresh schedule by step, which stays
-correct across a change of epochs, batch size or corpus.
+**Resume for reconstructible schedules** — warmup/cosine scheduler state is
+deliberately not restored from the checkpoint. Restoring it brings back the
+`T_max` of the run that wrote it: measured, a checkpoint from a 100-epoch run
+resumed at 120 epochs ends on lr 1.02e-04 against a `min_lr` of 1e-06, 102x.
+`global_step` is stored instead, and `fast_forward_scheduler()` rebuilds for
+the current run and indexes the fresh schedule by step. Stateful schedules,
+such as Align-ULCNet's validation plateau scheduler, have their own checkpoint
+contract described in `AIAEC/README.md`.
 
 **Non-finite values** — the loss and the gradient are checked separately, because a
 non-finite loss is a forward-side fault and a finite loss with an exploding

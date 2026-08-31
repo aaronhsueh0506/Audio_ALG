@@ -151,7 +151,7 @@ samples。</li>
 <li><code>AIAEC/DeepVQE_S/model.py</code>（<code>DeepVQES</code>、<code>_apply_ccm_frame</code>、<code>_StreamFreqUpsampleCell</code>、<code>_StreamResidualCell</code>）</li>
 <li><code>AIAEC/aiaec_common.py</code>（<code>FrameDelayAttention</code>、<code>apply_causal_tf_filter</code>、<code>three_vector_complex</code>）</li>
 <li><code>AIAEC/DeepVQE_S/inference.py</code>、<code>export_onnx.py</code>、<code>train.py</code>、<code>config.ini</code></li>
-<li>tests：<code>AIAEC/tests/test_streaming_deepvqe_s.py</code>（3 tests）、<code>test_candidate_models.py</code>——全套 <code>python3 -m pytest AIAEC/tests</code> = 220 passed（<code>pytest AIAEC</code> 含 dataset_gen = 336）</li>
+<li>tests：<code>AIAEC/tests/test_streaming_deepvqe_s.py</code>、<code>test_candidate_models.py</code>；全樹請執行 <code>python3 -m pytest AIAEC</code>，目前基準數集中記錄於 <code>docs/release_checklist.md</code>。</li>
 <li>匯出／calibration：<code>AIAEC/DeepVQE_S/export_onnx.py</code>、<code>AIAEC/DeepVQE_S/inference.py calib</code>（BIN/NPZ calibration 放在 <code>AIAEC/DeepVQE_S/calib/</code>；calib 會同 process 一併匯出並 parity-check 對應 graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改））。</li>
 <li>docs：<code>docs/aiaec_streaming_readiness_zh_TW.md</code> §3.3</li>
 </ul>

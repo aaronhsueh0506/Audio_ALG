@@ -198,6 +198,6 @@ h1/h2/h3</b>——3 框 conv 窗由 C 端 ring 重送,圖內無 conv cache。</p
 <li>C 測試:<code>AINR/RNNoise-ERB/test/</code> — <code>make test</code> 實測全 PASS:
 tables byte-exact(canonical)、portable 數學合約(recompute max ULP 0)、
 config/Python/C feature 合約、feature-state 行為、SIMD/scalar digest <code>0506b5ee3d18afb8</code></li>
-<li>Python 測試:<code>AINR/RNNoise-ERB/tests/</code>(pytest)— 實測 26 passed;
-共用測試 <code>AINR/tests/</code> — 實測 39 passed（<code>pytest AINR</code> 全樹 = 192）</li>
+<li>Python 測試:<code>AINR/RNNoise-ERB/tests/</code>(pytest);
+共用測試位於 <code>AINR/tests/</code>；全樹請執行 <code>python3 -m pytest AINR</code>，目前基準數集中記錄於 <code>docs/release_checklist.md</code>。</li>
 </ul>

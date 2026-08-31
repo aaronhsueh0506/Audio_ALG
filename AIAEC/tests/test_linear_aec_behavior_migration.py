@@ -1,10 +1,9 @@
-"""Exactly one migration connects a recorded linear_error to this frontend.
+"""Exactly one, rate-scoped migration connects recorded data to this frontend.
 
-`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` holds the fresh-instance-reset pair and
-nothing else. That pair was admitted on measured byte-identity: materialization
-builds one engine per parent sequence and never calls `reset()`, so the change
-cannot reach the corpus -- see the entry's own comment for the evidence and for
-the control that proves the harness can fail.
+`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` holds the composed fresh-instance-reset and
+48-kHz FilterAnalyzer-correction pair, and nothing else. It is admitted only at
+16 kHz: measured formed-output bytes are identical there, while the live
+detector window intentionally changes at 48 kHz.
 
 What must NOT happen is the pre-dominant-peak entries coming back. The
 dominant-matched-filter-peak change MOVES `linear_error`, so their byte-identity
@@ -91,6 +90,15 @@ def test_the_admitted_pair_is_accepted_with_a_warning():
         require_linear_aec_contract(
             current, _contract_recorded_as(MIGRATED_FROM_HASH),
             context="fixture")
+
+
+def test_the_admitted_hash_pair_is_refused_at_48khz():
+    """Hash equality evidence at 16 kHz must not pardon old 48-kHz data."""
+    current = make_linear_aec_contract(
+        48000, preset="balanced", frame_size=1024).as_dict()
+    recorded = dict(current, aec_behavior_hash=MIGRATED_FROM_HASH)
+    with pytest.raises(ValueError, match="aec_behavior_hash"):
+        require_linear_aec_contract(current, recorded, context="fixture")
 
 
 def test_the_admitted_pair_is_refused_in_reverse():

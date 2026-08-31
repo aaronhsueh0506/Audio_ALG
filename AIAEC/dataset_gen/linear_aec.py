@@ -504,9 +504,9 @@ def linear_aec_contract_from_config(
 #   3. that inertness is MEASURED, not argued: the frozen frontend
 #      (`LinearAecProcessor`, formed_output seam) renders byte-identical before
 #      and after, over a scene that actually reaches the changed code;
-#   4. the same harness is shown to be capable of failing -- render the changed
-#      mechanism ENABLED and confirm the bytes move. A byte-equality that a dead
-#      harness would also report is not evidence.
+#   4. the same harness is shown to be capable of failing. For a rate-scoped
+#      correction, an effective-value test may supply that control only when
+#      the migration is explicitly restricted to unaffected sample rates.
 #
 # Single hop by construction: the lookup is not applied transitively, so a value
 # here is never re-read as a key. Two stacked migrations need the composed pair
@@ -524,9 +524,10 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
     #      (`LinearAecProcessor`, formed_output seam) renders byte-identical
     #      before and after, over a scene that actually reaches the changed
     #      code;
-    #   4. the same harness is shown to be capable of failing -- render the
-    #      changed mechanism ENABLED and confirm the bytes move. A byte-
-    #      equality that a dead harness would also report is not evidence.
+    #   4. the same harness is shown to be capable of failing. For a rate-
+    #      scoped correction, an effective-value test may supply that control
+    #      only when the migration is explicitly restricted to unaffected
+    #      sample rates.
     #
     # Single hop by construction: the lookup is not applied transitively, so a
     # value here is never re-read as a key. Two stacked migrations need the
@@ -583,14 +584,57 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
     #      A control that cannot fire proves nothing, so the harness aborts
     #      unless the spliced reset actually happens.
     #
+    # Composed-pair revalidation after the 48-kHz FilterAnalyzer correction:
+    # the original d5193ad source frontend and the current frontend rendered
+    # the same 12 s, 16-kHz/512/256 scene through LinearAecProcessor's exact
+    # formed-output loop. The scene contains far-end bursts, double-talk and a
+    # delay change (800 -> 1500 samples); FilterAnalyzer.update ran all 750
+    # hops. Both outputs are 768,000 bytes with SHA-256:
+    #   850ff08f8b8551f204d7ff5dbe5ac2ef80a9e68186fe04026efcf68aa5aafc56
+    # The control is the effective-value test in both AEC ports: replacing the
+    # 48-kHz 192/384-sample exclusion span with the former 64/128 literals
+    # fails, while both 16-kHz grids remain 64/128.
+    #
+    # Why 16 kHz byte-equality is not evidence that 48 kHz is also inert.
+    # Rendered at 48k/1024/512 with an echo path whose second arrival sits
+    # 200 samples after the peak -- inside the old window, outside the
+    # corrected one -- the two spans disagree on the detector itself:
+    # significant_peak on 934 of 1125 hops, consistent_estimate on 424,
+    # max_echo_path_gain on 656. That verdict reaches the formed seam only
+    # through SaturationDetector -> saturated_echo -> the over-output guard,
+    # which those scenes never tripped, so no 48-kHz `linear_error`
+    # divergence has actually been exhibited. The route exists, the corpus
+    # cannot be searched for a scene that takes it, and a false accept is
+    # unrecoverable while a false reject only costs a rematerialization --
+    # so the migration is restricted to 16 kHz below and an old 48-kHz
+    # corpus must be rematerialized.
+    #
     # Scope note for a resumed run: this migration carries a COMPLETED corpus
     # forward. `--resume` is keyed on `fingerprint()`, which includes the
     # raw-text `aec_source_hash` and `aec_commit`, so an INTERRUPTED
     # rematerialization restarts from scratch across this pair regardless --
     # by design, since a half-rebuilt corpus must never mix two frontends.
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061":
-        "a02f30f6a491a92165b8c8a40b5fd967351647c7bc8481e4284a8c4d9a95f19f",
+        "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45",
 }
+
+# A migration pair can be frontend-equivalent at one sample rate and
+# intentionally different at another. Never infer this from the hash alone:
+# the FilterAnalyzer correction above is a no-op at 16 kHz but changes the live
+# 48-kHz detector window. Old 48-kHz material must therefore fail closed.
+_BEHAVIOR_MIGRATION_SAMPLE_RATES = {
+    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061":
+        frozenset({16000}),
+}
+
+
+def _behavior_migration_applies(recorded: str, current: str,
+                                sample_rate: int) -> bool:
+    return (
+        ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.get(recorded) == current
+        and int(sample_rate) in _BEHAVIOR_MIGRATION_SAMPLE_RATES.get(
+            recorded, frozenset())
+    )
 
 # Provenance of every build each accepted migration's SOURCE identity ran on.
 #
@@ -685,7 +729,8 @@ def migrated_ledger_fingerprints(contract: "LinearAecContract") -> tuple:
     """
     out = []
     for recorded, current in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.items():
-        if current != contract.aec_behavior_hash:
+        if not _behavior_migration_applies(
+                recorded, contract.aec_behavior_hash, contract.sample_rate):
             continue
         for revision in MIGRATED_SOURCE_PROVENANCE.get(recorded, ()):
             source = dataclasses.replace(
@@ -749,15 +794,16 @@ def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> N
     recorded_hash = want_dict["aec_behavior_hash"]
     current_hash = got_dict["aec_behavior_hash"]
     if (differing == ["aec_behavior_hash"]
-            and ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.get(recorded_hash)
-            == current_hash):
+            and _behavior_migration_applies(
+                recorded_hash, current_hash, got.sample_rate)):
         warnings.warn(
             f"{context} linear_aec was materialized by AEC behaviour "
             f"{recorded_hash} and this build is {current_hash}; accepting via "
             "the verified frontend-equivalent migration table "
             "(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS in dataset_gen/linear_aec.py), "
             "which records the byte-identical linear_error evidence for this "
-            "pair. No rematerialization or retraining is required.",
+            f"pair at {got.sample_rate} Hz. No rematerialization or retraining "
+            "is required.",
             RuntimeWarning,
             stacklevel=2,
         )

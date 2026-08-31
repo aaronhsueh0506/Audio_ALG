@@ -182,7 +182,8 @@ C 端用 `make ULCNET_GRID=16k|48k` 選 grid（底層就是那兩個 `-D`），�
    目前證據只有合成場景與 C／Python 逐 hop 對照，**真實錄音抽測尚未做**，
    所以產品組態維持預設 OFF；AIAEC 的 frozen frontend 也不開它。
 
-   watchdog leak 率固定每 hop `-0.001` 未依 hop 重定時（`aec.c`）仍待處理。
+   watchdog leak 已依各 grid 的 hop 時間重定時，使衰減固定為
+   0.1 dB/s；C/Python effective-value 與 mutation 測試會鎖住此契約。
 
 ### 2.2 現有 AIAEC 資料邊界
 

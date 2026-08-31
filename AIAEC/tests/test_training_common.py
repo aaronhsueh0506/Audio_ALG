@@ -666,6 +666,11 @@ def test_the_legacy_ledger_bridge_is_one_way():
         assert migrated_ledger_fingerprints(running_source) == ()
 
 
+def test_the_legacy_ledger_bridge_does_not_migrate_48khz():
+    current_48k = make_linear_aec_contract(48000, frame_size=1024)
+    assert migrated_ledger_fingerprints(current_48k) == ()
+
+
 def test_unlisted_behaviour_hash_is_still_refused():
     """An identity in neither the migration table nor the retired list is
     refused on the plain mismatch path -- built without a table entry, so it

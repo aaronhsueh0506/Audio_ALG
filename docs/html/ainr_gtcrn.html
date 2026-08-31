@@ -238,7 +238,7 @@ context(cache 大小即由此而來),加上 RNN 無限記憶。</li>
 <li>上游 vendored 參考:<code>AINR/gtcrn_github/</code>(offline <code>gtcrn.py</code>、串流 <code>stream/gtcrn_stream.py</code>、論文 PDF)</li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_gtcrn()</code>:回路穩態 unity,誤差門檻 2e-4)—
 <code>make -C AINR test-simd</code> 驗證 scalar/NEON 路徑</li>
-<li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code> — 實測 11 passed:
+<li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code>:
 metadata/layout 互鎖(含 combined 號碼不得與出貨版本相撞)、calibration/ONNX shape、
 兩組 grid 的 config↔checkpoint 互鎖、部署 graph 不含 Gather 且維持 operator budget，
 以及 split／combined 兩種邊界逐框輸出與 state 完全相等。</li>

@@ -757,8 +757,8 @@ quality scores are explicitly outside this source/framework release gate.
 
 ## Appendix A. Known-good automated counts
 
-Reference values re-measured on the current four-repo working tree, KISS
-backend, SIMD=1, macOS, `SE/.venv` Python. Re-measure and re-record these
+Reference values re-measured on 2026-08-31 from the current four-repo working
+tree, KISS backend, SIMD=1, macOS, `SE/.venv` Python. Re-measure and re-record these
 whenever the tree moves — a stale reference count silently converts a real
 regression into a "matches the doc" pass. A count that **drops** is a
 regression; a count that
@@ -769,19 +769,25 @@ is routinely misattributed to a real bug.
 
 | Suite | Count |
 |---|---:|
-| `AEC` `make test-rate-structural` | 360 |
+| `AEC` `make test-rate-structural` | 370 |
 | `AEC` `make test-config-validation` | 388 |
 | `AEC` `make test-delay-reset` | 16 |
-| `AEC` `make test-delay-backward-quarantine` | 31 |
-| `AEC` `python3 -m pytest python/tests` | 237 |
+| `AEC` `make test-delay-backward-quarantine` | 22 |
+| `AEC` `python3 -m pytest python/tests` | 289 |
 | `NR` `python3 -m pytest tests` | 56 |
 | `Audio_ALG/lib/nr` `python3 -m pytest tests` | 56 |
-| `Audio_ALG` `python3 -m pytest pipelines` | 58 |
-| `Audio_ALG` `python3 -m pytest pipelines/tests` | 26 |
-| `Audio_ALG` `python3 -m pytest pipelines/4ch_aec_bf_nr_res/tests` | 32 |
-| `Audio_ALG` `python3 -m pytest AIAEC` | 336 |
-| `Audio_ALG` `python3 -m pytest AINR` | 201 |
-| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 595 |
+| `Audio_ALG` `python3 -m pytest pipelines` | 72 |
+| `Audio_ALG` `python3 -m pytest AIAEC` | 483 |
+| `Audio_ALG` `python3 -m pytest AINR` | 212 |
+| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 767 |
+
+The combined row is the one that matters, and it is the one that used to be
+impossible: pytest gives every `conftest.py` the same top-level module name, so
+a test doing `from conftest import ...` picks up whichever package was imported
+first and the whole run dies at collection while each package on its own stays
+green. `AIAEC/tests/test_cross_package_collection.py` now drives the combined
+invocation in a subprocess, in both argument orders, so the per-package rows
+can no longer be green over a suite that cannot start.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
 (re-measured on the current working tree, KISS backend, `make clean` first):

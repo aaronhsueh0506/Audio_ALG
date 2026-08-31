@@ -24,7 +24,7 @@ from AIAEC.dataset_gen.linear_error_ledger import (
     save_ledger,
 )
 
-from conftest import CONFIG, build_corpus, shipped_contract
+from ledger_corpus import CONFIG, build_corpus, shipped_contract
 
 N_SEQ, N_CHUNK = 3, 3
 
