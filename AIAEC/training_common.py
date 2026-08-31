@@ -719,9 +719,35 @@ def spectrum_to_waveform(spectrum: Tensor, grid: AecGrid) -> Tensor:
     return istft(spectrum.transpose(-2, -1), grid)
 
 
+#: Longest waveform whose ``torch.stft`` BACKWARD is trustworthy on the MPS
+#: backend. Measured on torch 2.8.0: an iSTFT->STFT round trip differentiated
+#: on MPS agrees with CPU to 1.0000 up to 65,536 samples and then breaks
+#: discontinuously -- 65,792 samples gives a gradient-norm ratio of 0.063, and
+#: the shipped 10 s chunk at 16 kHz (160,256 samples) gives 0.424. The FORWARD
+#: is exact and the loss value is bit-identical, so a run on MPS descends
+#: normally on a gradient that is wrong by ~2.4x, with no symptom to catch it.
+#: ``torch.istft`` alone is exact at every length tested, which is why only the
+#: consistency projection is affected and not the SI-SNR path.
+_MPS_STFT_BACKWARD_SAFE_SAMPLES = 65536
+
+
 def stft_consistent_spectrum(spectrum: Tensor, grid: AecGrid) -> Tensor:
     """Project a public ``[B,T,F]`` spectrum through iSTFT -> STFT."""
     waveform = spectrum_to_waveform(spectrum, grid)
+    if (waveform.device.type == 'mps'
+            and waveform.requires_grad
+            and waveform.shape[-1] > _MPS_STFT_BACKWARD_SAFE_SAMPLES):
+        raise RuntimeError(
+            "STFT consistency needs torch.stft's backward, and this build's "
+            "MPS backend computes it incorrectly above "
+            f"{_MPS_STFT_BACKWARD_SAFE_SAMPLES} samples (got "
+            f"{waveform.shape[-1]}). Nothing would raise and the loss would "
+            "still fall -- the gradient is simply wrong, measured ~2.4x at "
+            "this length -- so this refuses rather than warns. Use --device "
+            "cpu or a CUDA device, or set [loss] stft_consistency = false, "
+            "which is the only setting that puts torch.stft in the backward "
+            "graph. Re-measure before raising the bound: compare an "
+            "iSTFT->STFT round-trip gradient on MPS against CPU.")
     consistent = stft(waveform, grid).transpose(-2, -1)
     if consistent.shape != spectrum.shape:
         raise RuntimeError(

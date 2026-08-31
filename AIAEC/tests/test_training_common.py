@@ -13,6 +13,8 @@ import AIAEC.training_common as training_common
 from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.aiaec_common import SignalGrid
 from AIAEC.training_common import (
+    _MPS_STFT_BACKWARD_SAFE_SAMPLES,
+    spectrum_to_waveform,
     CALIBRATION_ONLY_FAR_INPUT_MODE,
     DEFAULT_OPTIMIZER,
     DEPLOYED_FAR_INPUT_MODE,
@@ -815,6 +817,95 @@ def test_all_trainers_keep_the_weight_guard_around_checkpoint_writes(source_path
             > source.index("model.load_state_dict(ckpt['state_dict'])"))
     assert (source.index('weight_guard.check(')
             < source.index("_last.pth"))
+
+
+@pytest.mark.skipif(not torch.backends.mps.is_available(),
+                    reason='the defect being guarded is an MPS backend one')
+def test_stft_consistency_refuses_a_device_whose_stft_backward_is_wrong():
+    """A silently wrong gradient must stop the run, not merely warn.
+
+    Measured on torch 2.8.0's MPS backend, an iSTFT->STFT round trip
+    differentiated on MPS matches CPU to 1.0000 up to 65,536 samples and then
+    breaks discontinuously: 65,792 samples gives a gradient-norm ratio of
+    0.063, and the shipped 10 s chunk at 16 kHz (160,256 samples) gives 0.424.
+    The forward is exact and the loss value is bit-identical, so a 50-epoch run
+    would descend normally on a gradient wrong by roughly 2.4x with nothing to
+    catch it -- which is why the projection refuses instead of warning.
+
+    ``train.py`` defaults ``--device`` to None and ``auto_device`` returns
+    'mps' on a machine with no CUDA, so this is the default launch on such a
+    machine, not an exotic one.
+
+    Pinned here rather than left to the comment because the bound is the whole
+    guard: forward-only use at any length, and any length at or below the
+    bound, must still be allowed.
+    """
+    grid = AecGrid(sr=16000, n_fft=512, win_len=512, hop_len=256)
+
+    def frames_for(samples):
+        """Smallest frame count whose projected waveform exceeds `samples`.
+
+        Derived from the real projection rather than assumed: the centred
+        round trip yields (T-1)*hop, so an off-by-one here would test the
+        bound instead of the far side of it.
+        """
+        probe = torch.zeros(1, 2, grid.n_freqs, dtype=torch.complex64)
+        count = 2
+        while spectrum_to_waveform(
+                torch.zeros(1, count, grid.n_freqs, dtype=torch.complex64),
+                grid).shape[-1] <= samples:
+            count += 1
+        return count
+
+    over = frames_for(_MPS_STFT_BACKWARD_SAFE_SAMPLES)
+    at_bound = over - 1
+
+    with pytest.raises(RuntimeError, match='stft'):
+        spectrum = torch.randn(1, over, grid.n_freqs,
+                               dtype=torch.complex64, device='mps')
+        stft_consistent_spectrum(spectrum.requires_grad_(True), grid)
+
+    # At the bound, and without a gradient at any length, nothing is refused.
+    stft_consistent_spectrum(
+        torch.randn(1, at_bound, grid.n_freqs, dtype=torch.complex64,
+                    device='mps').requires_grad_(True), grid)
+    stft_consistent_spectrum(
+        torch.randn(1, over, grid.n_freqs, dtype=torch.complex64,
+                    device='mps'), grid)
+
+
+def test_the_mps_stft_backward_bound_is_where_the_backend_actually_breaks():
+    """The bound has to track the defect, not a remembered number.
+
+    Differentiates an iSTFT->STFT round trip on both devices and checks that
+    CPU and MPS still agree at the bound and still disagree past it. If a
+    future torch fixes the backend this fails, which is the point: the guard
+    should be relaxed by measurement rather than by assumption.
+    """
+    if not torch.backends.mps.is_available():
+        pytest.skip('the defect being guarded is an MPS backend one')
+
+    def round_trip_grad(device, samples):
+        torch.manual_seed(0)
+        x = torch.randn(samples, device=device, requires_grad=True)
+        window = torch.hann_window(512, device=device)
+        spectrum = torch.stft(x, 512, 256, 512, window, return_complex=True,
+                              center=True)
+        torch.istft(spectrum, 512, 256, 512, window, center=True,
+                    length=samples).pow(2).sum().backward()
+        return x.grad.norm().item()
+
+    bound = _MPS_STFT_BACKWARD_SAFE_SAMPLES
+    at = round_trip_grad('mps', bound) / round_trip_grad('cpu', bound)
+    past = (round_trip_grad('mps', bound + 256)
+            / round_trip_grad('cpu', bound + 256))
+    assert abs(at - 1.0) < 0.01, (
+        f'MPS and CPU already disagree AT the bound (ratio {at:.4f}); the '
+        'safe length is lower than the guard allows')
+    assert abs(past - 1.0) > 0.1, (
+        f'MPS and CPU now agree past the bound (ratio {past:.4f}); the backend '
+        'may be fixed -- re-measure and raise _MPS_STFT_BACKWARD_SAFE_SAMPLES '
+        'rather than leaving a guard that costs a device for nothing')
 
 
 def test_a_configured_weight_decay_is_not_silently_rounded_away():
