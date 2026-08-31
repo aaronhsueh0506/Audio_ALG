@@ -111,12 +111,12 @@ paper is credited with 20,000 steps per epoch, while one pass over this corpus
 is roughly 2,025 steps at batch 16. `lr_patience = 1` therefore bought about a
 tenth of the grace it was written for. Measured against the real scheduler,
 only four reductions separate `4e-3` from the `1e-6` floor, and with
-`cooldown=0` and `best` a running minimum, 95.5% of 200 seeded runs reach that
-floor inside 50 epochs at 2% validation jitter (100% at 5%). Such a run then
-delivers 2.9% of its LR budget to epochs 15-49, against 48.2% for the
-warmup/cosine trajectory -- and that window is where this model's best epoch has
-actually landed. A step-indexed schedule cannot inherit the defect because it
-never counts epochs. `reduce_on_plateau` remains selectable, at
+`cooldown=0` and `best` a running minimum, 96.5% of 200 seeded runs reach that
+floor inside 50 epochs at 2% validation jitter, 100% at 5%; and in closed loop
+on this model it floored by epoch 11. With early stopping disabled at
+50 = `max_epochs`, the rest of the campaign then runs at 1/4000 of the peak
+while the job still reports 50 completed epochs. A step-indexed schedule cannot
+inherit the defect because it never counts epochs. `reduce_on_plateau` remains selectable, at
 `lr_decay_factor = 0.5` / `lr_patience = 5`, which over 200 seeds never reaches
 the floor within 50 epochs at any jitter up to 15%.
 
