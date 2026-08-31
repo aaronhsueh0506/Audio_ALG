@@ -1127,8 +1127,9 @@ def test_align_ulcnet_ships_a_step_indexed_schedule(monkeypatch, tmp_path):
         'denominated in epochs and this project redefined the epoch')
 
 
+@pytest.mark.parametrize('model_name', ['Align_ULCNet', 'DeepVQE_S'])
 def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
-        monkeypatch, tmp_path):
+        model_name, monkeypatch, tmp_path):
     """Changing the schedule's denominator must change the contract.
 
     ``warmup_cosine`` is rebuilt from ``max_epochs * len(train_loader)`` and
@@ -1138,7 +1139,7 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
     ``batch_size``.  Neither was recorded, so either one produced a DIFFERENT
     curve under an IDENTICAL contract, and the resume was accepted.
 
-    Measured on this model's grid, resuming at epoch 20 after batch_size
+    Measured on Align-ULCNet's grid, resuming at epoch 20 after batch_size
     16 -> 64 reads 160% progress; and past the horizon the chainable cosine
     walks BACKWARDS, reaching 0.97 x peak LR at 1.75x rather than resting at
     min_lr.  The config names the GPU as the batch-size constraint, which makes
@@ -1148,7 +1149,7 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
     Compares real contracts built by the real ``main``, not the source text.
     """
     shipped = (pathlib.Path(training_common.__file__).parent
-               / 'Align_ULCNet' / 'config.ini')
+               / model_name / 'config.ini')
 
     def contract_for(section=None, key=None, value=None):
         cfg = configparser.ConfigParser()
@@ -1159,7 +1160,7 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
         with io.open(path, 'w', encoding='utf-8') as handle:
             cfg.write(handle)
         return _drive_main_capturing(
-            'Align_ULCNet', monkeypatch, tmp_path, path, {})
+            model_name, monkeypatch, tmp_path, path, {})
 
     base = contract_for()
     for section, key, value in (
@@ -1267,89 +1268,87 @@ def test_align_ulcnet_steps_its_schedule_per_batch_not_per_epoch(
 
 def test_deepvqe_s_steps_its_schedule_per_batch_not_per_epoch(
         monkeypatch, tmp_path):
-    """The cosine horizon must be counted in optimizer steps, not epochs.
+    """The cosine horizon has to be advanced once per optimizer step.
 
-    No source grep can see this. Moving ``scheduler.step()`` out of the batch
-    loop and into the epoch loop leaves every string in the file unchanged
-    while compressing the whole trajectory into ``max_epochs`` steps -- here a
-    600x re-timing. So drive the real ``main()`` against the SHIPPED config,
-    with a corpus large enough that one epoch is many batches, and then step
-    the captured schedule ``max_epochs`` times: per-epoch wiring would already
-    have annealed to ``min_lr``, per-batch wiring is barely out of warmup.
+    The previous version of this test asserted ``'scheduler.step()' in
+    inspect.getsource(run_epoch)`` plus a bound on the LR after ``max_epochs``
+    advances.  Measured, a mutant that keeps ``scheduler.step()`` inside
+    ``run_epoch`` but moves it OUT of the batch loop -- so the schedule
+    advances once per epoch, a 4050x re-timing -- passes both assertions: the
+    string is still there, and ``main()`` still builds a step-sized horizon so
+    the numeric bound still holds.  The whole suite stayed green under it.
 
-    The shared optimizer harness cannot do this. Its fake corpus yields one
-    batch per epoch, which makes the two wirings numerically identical.
+    So count the scheduler's own advances over one real epoch instead, exactly
+    as the Align-ULCNet twin does.  Anything but one advance per training batch
+    fails.
     """
     trainer = importlib.import_module('AIAEC.DeepVQE_S.train')
-    config_path = (pathlib.Path(training_common.__file__).parent
-                   / 'DeepVQE_S' / 'config.ini')
+    shipped = (pathlib.Path(training_common.__file__).parent
+               / 'DeepVQE_S' / 'config.ini')
     cfg = configparser.ConfigParser()
-    assert cfg.read(config_path), config_path
-    max_epochs = cfg.getint('training', 'max_epochs')
-    min_lr = cfg.getfloat('training', 'min_lr')
-    warmup_lr = cfg.getfloat('training', 'lr_warmup')
+    assert cfg.read(shipped), shipped
+    cfg.set('training', 'max_epochs', '1')
+    cfg.set('training', 'warmup_epochs', '1')
+    cfg.set('data', 'batch_size', '4')
+    cfg.set('data', 'num_workers', '0')
+    override = tmp_path / 'one_epoch.ini'
+    with io.open(override, 'w', encoding='utf-8') as handle:
+        cfg.write(handle)
 
     linear = make_linear_aec_contract(16000, frame_size=512)
 
     class FakePackedDataset:
-        """160 chunks so a train epoch is 18 batches, not 1."""
-
         def __init__(self, path, expected_sr=None, mmap=False):
             self.linear_aec_contract = linear
             self.linear_aec_contract_hash = linear.fingerprint()
 
         def __len__(self):
-            return 160
+            return 40
 
         def __getitem__(self, index):
-            return torch.zeros(5, 16000), {
-                'sequence_id': index // 2, 'chunk_index': index % 2,
-            }
+            return torch.zeros(len(PACKED_STEM_ORDER), 8192), {}
 
         def fingerprint(self):
-            return 'per-step-schedule-corpus'
+            return 'fake-corpus'
 
-    seen = {}
-    # Captured BEFORE the stub replaces it: inspecting trainer.run_epoch after
-    # monkeypatching would read the stub's source, not the trainer's.
+    calls = {'n': 0}
+    real_make = trainer.make_scheduler
+
+    def counting_make_scheduler(*args, **kwargs):
+        built = real_make(*args, **kwargs)
+        real_step = built.step
+
+        def counted(*a, **k):
+            calls['n'] += 1
+            return real_step(*a, **k)
+
+        built.step = counted
+        return built
+
+    batches = {'n': 0}
     real_run_epoch = trainer.run_epoch
 
-    def fake_run_epoch(*args, **kwargs):
-        seen['scheduler'] = kwargs.get('scheduler')
-        raise _StopAfterSetup
+    def counting_run_epoch(model, loader, *args, **kwargs):
+        if kwargs.get('scheduler') is not None:
+            batches['n'] = len(loader)
+        return real_run_epoch(model, loader, *args, **kwargs)
 
     monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
-    monkeypatch.setattr(trainer, 'run_epoch', fake_run_epoch)
+    monkeypatch.setattr(trainer, 'make_scheduler', counting_make_scheduler)
+    monkeypatch.setattr(trainer, 'run_epoch', counting_run_epoch)
     monkeypatch.chdir(tmp_path)
     args = trainer.build_parser().parse_args(
-        ['--config', str(config_path), '--packed-dir', 'fake', '--device', 'cpu']
+        ['--config', str(override), '--packed-dir', 'fake', '--device', 'cpu']
     )
-    with pytest.raises(_StopAfterSetup):
-        trainer.main(args)
+    trainer.main(args)
 
-    scheduler = seen['scheduler']
-    assert scheduler is not None, 'run_epoch was not handed the schedule'
-
-    # The horizon being batch-sized is only half the contract: it says nothing
-    # about WHERE the schedule is advanced. Stubbing run_epoch means this test
-    # never executes the batch loop, so moving scheduler.step() out to the
-    # epoch loop would leave every assertion below green while the trajectory
-    # advanced 50 steps along a 900-step curve. Pin the call site to the
-    # function that owns the batch loop -- inspecting that ONE function, not
-    # the file, is what makes this a location check rather than a grep.
-    assert 'scheduler.step()' in inspect.getsource(real_run_epoch), (
-        'scheduler.step() must live in run_epoch, which owns the batch loop')
-    assert 'scheduler.step()' not in inspect.getsource(trainer.main), (
-        'advancing the schedule in main would make it once per epoch')
-    assert scheduler.get_last_lr()[0] == pytest.approx(warmup_lr, rel=1e-3), (
-        'the trajectory must start at lr_warmup, not at lr')
-
-    for _ in range(max_epochs):
-        scheduler.step()
-    lr_after = scheduler.get_last_lr()[0]
-    assert lr_after > 100 * min_lr, (
-        'after max_epochs steps the schedule is already at %.3e; a horizon '
-        'that short means it is being stepped once per EPOCH' % lr_after)
+    assert batches['n'] > 1, (
+        'the training loader yielded one batch, so per-batch and per-epoch '
+        'stepping are indistinguishable and this test proves nothing')
+    assert calls['n'] == batches['n'], (
+        f"the schedule advanced {calls['n']} times over an epoch of "
+        f"{batches['n']} batches; it must advance once per optimizer step, "
+        'not once per epoch')
 
 
 def test_align_ulcnet_resume_restores_early_stop_counter(

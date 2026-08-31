@@ -232,6 +232,17 @@ def main(args):
         'min_lr': cfg.getfloat('training', 'min_lr'),
         'lr_warmup': cfg.getfloat('training', 'lr_warmup'),
         'warmup_epochs': cfg.getint('training', 'warmup_epochs'),
+        # The schedule's DENOMINATOR. total_steps is
+        # max_epochs * len(train_loader), and len(train_loader) follows
+        # batch_size, so either one silently re-times the whole curve on a
+        # resume -- the schedule is rebuilt, never restored. Worse than
+        # re-timing: a resume landing past the rebuilt horizon walks the
+        # chainable cosine BACKWARDS instead of resting at min_lr, measured at
+        # 0.97 x peak by 1.75x a horizon. The config names the GPU as the
+        # batch-size constraint, which makes a hardware change the likeliest
+        # reason anyone resumes.
+        'max_epochs': cfg.getint('training', 'max_epochs', fallback=50),
+        'batch_size': cfg.getint('data', 'batch_size'),
     }
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
@@ -242,7 +253,7 @@ def main(args):
     output_dir = cfg.get('training', 'output_dir', fallback='output')
     os.makedirs(output_dir, exist_ok=True)
     lr = recipe['lr']
-    max_epochs = cfg.getint('training', 'max_epochs', fallback=50)
+    max_epochs = recipe['max_epochs']
     if recipe['name'] != 'adamw':
         raise ValueError("DeepVQE-S paper recipe requires optimizer=adamw")
     if recipe['schedule'] != 'warmup_cosine':

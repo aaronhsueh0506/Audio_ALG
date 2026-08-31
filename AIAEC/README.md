@@ -91,8 +91,12 @@ one optimizer/loss/scheduler was not a valid comparison protocol.
 | CAGCRN | AdamW / 1e-3, decay 5e-7 | constant | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
 
 The epoch budget is the project decision requested for this training campaign.
-Align-ULCNet batch 16 and DeepVQE-S batch 8 are GPU-memory overrides; the
-papers use 64 and 400 respectively. CAGCRN explicitly publishes batch 32.
+Align-ULCNet batch 16 and DeepVQE-S batch 8 are GPU-memory overrides. The
+number ascribed to Align-ULCNet's paper is 64; the 400 previously ascribed to
+DeepVQE-S is Align-CRUSE's, per that model's own README and per d2c272f's
+deviation table, which records DeepVQE-S's paper batch as unknown. CAGCRN
+explicitly publishes batch 32. No paper is in this repo, so none of these is
+verifiable here.
 Early stopping cannot end these runs before epoch 50; validation still selects
 the best checkpoint, and Align-ULCNet still applies its published LR reduction.
 Changing a loss recipe changes `loss_version`, so a checkpoint from the old
