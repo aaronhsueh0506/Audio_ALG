@@ -1127,6 +1127,52 @@ def test_align_ulcnet_ships_a_step_indexed_schedule(monkeypatch, tmp_path):
         'denominated in epochs and this project redefined the epoch')
 
 
+def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
+        monkeypatch, tmp_path):
+    """Changing the schedule's denominator must change the contract.
+
+    ``warmup_cosine`` is rebuilt from ``max_epochs * len(train_loader)`` and
+    fast-forwarded by ``global_step`` -- deliberately, so a saved ``T_max``
+    cannot come back on a run with a different horizon.  That makes the rebuild
+    only as trustworthy as its two inputs, and ``len(train_loader)`` follows
+    ``batch_size``.  Neither was recorded, so either one produced a DIFFERENT
+    curve under an IDENTICAL contract, and the resume was accepted.
+
+    Measured on this model's grid, resuming at epoch 20 after batch_size
+    16 -> 64 reads 160% progress; and past the horizon the chainable cosine
+    walks BACKWARDS, reaching 0.97 x peak LR at 1.75x rather than resting at
+    min_lr.  The config names the GPU as the batch-size constraint, which makes
+    a hardware change the likeliest reason anyone resumes -- exactly the edit
+    this has to refuse.
+
+    Compares real contracts built by the real ``main``, not the source text.
+    """
+    shipped = (pathlib.Path(training_common.__file__).parent
+               / 'Align_ULCNet' / 'config.ini')
+
+    def contract_for(section=None, key=None, value=None):
+        cfg = configparser.ConfigParser()
+        assert cfg.read(shipped), shipped
+        if section is not None:
+            cfg.set(section, key, value)
+        path = tmp_path / ('cfg_%d.ini' % len(list(tmp_path.iterdir())))
+        with io.open(path, 'w', encoding='utf-8') as handle:
+            cfg.write(handle)
+        return _drive_main_capturing(
+            'Align_ULCNet', monkeypatch, tmp_path, path, {})
+
+    base = contract_for()
+    for section, key, value in (
+            ('data', 'batch_size', '64'),
+            ('training', 'max_epochs', '30'),
+    ):
+        changed = contract_for(section, key, value)
+        assert changed != base, (
+            f'{section}.{key} does not reach the checkpoint contract, so a '
+            'resume after changing it rebuilds a different LR curve and is '
+            'accepted anyway')
+
+
 def test_align_ulcnet_steps_its_schedule_per_batch_not_per_epoch(
         monkeypatch, tmp_path):
     """The shipped schedule has to be advanced once per optimizer step.

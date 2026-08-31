@@ -221,6 +221,18 @@ def main(args):
         'warmup_epochs': cfg.getint('training', 'warmup_epochs'),
         'lr_decay_factor': cfg.getfloat('training', 'lr_decay_factor'),
         'lr_patience': cfg.getint('training', 'lr_patience'),
+        # The step schedule's DENOMINATOR. total_steps is
+        # max_epochs * len(train_loader), and len(train_loader) follows
+        # batch_size, so either one silently re-times the whole curve on a
+        # resume -- the schedule is rebuilt, never restored. Worse than
+        # re-timing: a resume landing past the rebuilt horizon walks the
+        # chainable cosine BACKWARDS. Measured on this model's own grid,
+        # resuming at epoch 20 after batch_size 16 -> 64 reads 160% progress,
+        # and at 1.75x a horizon the LR is back to 0.97 x peak instead of at
+        # min_lr. Recording both makes require_checkpoint_contract refuse the
+        # resume rather than rebuild a different curve.
+        'max_epochs': cfg.getint('training', 'max_epochs', fallback=50),
+        'batch_size': cfg.getint('data', 'batch_size'),
     }
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
@@ -231,7 +243,7 @@ def main(args):
     output_dir = cfg.get('training', 'output_dir', fallback='output')
     os.makedirs(output_dir, exist_ok=True)
     lr = recipe['lr']
-    max_epochs = cfg.getint('training', 'max_epochs', fallback=50)
+    max_epochs = recipe['max_epochs']
     optimizer_classes = {'adam': torch.optim.Adam, 'adamw': torch.optim.AdamW}
     if recipe['name'] not in optimizer_classes:
         raise ValueError(
