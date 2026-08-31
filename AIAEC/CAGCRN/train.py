@@ -236,6 +236,13 @@ def main(args):
         'weight_decay': cfg.getfloat('training', 'weight_decay'),
         'amsgrad': cfg.getboolean('training', 'amsgrad'),
         'schedule': cfg.get('training', 'scheduler').lower(),
+        # Recorded even though a constant LR cannot be re-timed by them: without
+        # batch_size two runs at different effective batch produce an identical
+        # contract and resume into each other in silence, and max_epochs is what
+        # the sibling warmup/cosine trainers rebuild their horizon from. Same
+        # keys everywhere means one rule rather than a per-model exception.
+        'max_epochs': cfg.getint('training', 'max_epochs', fallback=50),
+        'batch_size': cfg.getint('data', 'batch_size'),
     }
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,

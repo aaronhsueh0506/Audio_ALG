@@ -817,6 +817,38 @@ def test_all_trainers_keep_the_weight_guard_around_checkpoint_writes(source_path
             < source.index("_last.pth"))
 
 
+def test_a_configured_weight_decay_is_not_silently_rounded_away():
+    """A decay that float32 cannot represent must not read as regularisation.
+
+    Decoupled decay multiplies each weight by ``1 - lr*wd`` per step. Three of
+    the four shipped configs set a decay whose ``lr*wd`` is 159-238x BELOW
+    float32 eps, so the factor is exactly 1.0f and the run has no
+    optimizer-side regularisation at all -- measured, 2000 steps of
+    AdamW(5e-7) are bit-identical to AdamW(0) and to Adam(0).
+
+    Those values are deliberately kept: there is no paper in this repo to take
+    a real number from, and inventing one is worse than carrying an inert one.
+    What must not happen is the inertness becoming invisible. Each such config
+    carries a comment saying so, and this pins the pairing: any config whose
+    decay rounds away has to admit it in the same file.
+    """
+    import numpy as np
+    for path in AIAEC_TRAINER_CONFIGS:
+        cfg = configparser.ConfigParser()
+        assert cfg.read(path), path
+        lr = cfg.getfloat('training', 'lr')
+        wd = cfg.getfloat('training', 'weight_decay')
+        if wd == 0.0:
+            continue
+        inert = np.float32(1.0 - lr * wd) == np.float32(1.0)
+        text = pathlib.Path(path).read_text(encoding='utf-8')
+        admits = 'does NOTHING' in text
+        assert inert == admits, (
+            f'{path}: lr*wd = {lr * wd:.2e} rounds away in float32 = {inert}, '
+            f'but the config says it is inert = {admits}. Either the decay now '
+            'acts and the comment is stale, or it is inert and unmarked.')
+
+
 def test_shipped_configs_declare_the_model_specific_paper_recipes():
     expected = {
         'Align_ULCNet': ('adam', 'warmup_cosine', 4e-3, 0.0,

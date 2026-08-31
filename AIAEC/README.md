@@ -90,6 +90,42 @@ one optimizer/loss/scheduler was not a valid comparison protocol.
 | DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | warmup -> cosine (project choice) | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
 | CAGCRN | AdamW / 1e-3, decay 5e-7 | constant | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
 
+### What a four-way comparison can and cannot conclude
+
+The four candidates no longer share an optimizer, a schedule, or a loss, so a
+ranking of their final numbers is not a ranking of their architectures. Two
+independent reasons, both measurable from this directory:
+
+**The losses are different functions.** Component-compressed frequency MSE,
+PLCPA, and MSE+SI-SNR+L1 do not share a scale or a zero. Cross-model loss
+values are not comparable at all -- only a common external metric is.
+
+**The optimisation budgets differ by 13x.** Integrated learning rate over the
+same corpus and the same 50 epochs (100 h / 10 s chunks, val_fraction 0.1):
+
+| model | schedule | peak lr | batch | steps | integrated lr | lr per sample |
+|---|---|---:|---:|---:|---:|---:|
+| Align-CRUSE | constant | 1.5e-4 | 16 | 101,250 | 15.2 | 9.4e-06 |
+| CAGCRN | constant | 1e-3 | 32 | 50,600 | 50.6 | 3.1e-05 |
+| DeepVQE-S | warmup+cosine | 1.2e-3 | 8 | 202,500 | 122.2 | 1.5e-04 |
+| Align-ULCNet | warmup+cosine | 4e-3 | 16 | 101,250 | 202.9 | 2.5e-04 |
+
+Align-ULCNet receives 13.4x Align-CRUSE's total LR distance. A win by either of
+the top two would not be attributable to its architecture.
+
+This is a deliberate trade: per-paper fidelity was chosen over a shared
+protocol at d2c272f, and the two cannot both hold in one campaign. Whichever is
+wanted, it should be an explicit decision rather than an artefact:
+
+- **To rank architectures**, put all four on one optimiser, one schedule and
+  one loss, and accept that none is then paper-faithful.
+- **To reproduce each paper**, keep these recipes and judge each model against
+  its own published numbers, not against its siblings here.
+
+Note also that no AIAEC paper is present in this repo and none has ever been
+committed, so every value ascribed to one is transcribed prose with no primary
+source. Treat "the paper says" as an open question throughout.
+
 The epoch budget is the project decision requested for this training campaign.
 Align-ULCNet batch 16 and DeepVQE-S batch 8 are GPU-memory overrides. The
 number ascribed to Align-ULCNet's paper is 64; the 400 previously ascribed to
