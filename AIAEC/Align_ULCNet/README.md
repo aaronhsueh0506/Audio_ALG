@@ -100,16 +100,39 @@ a different D.  If memory is still insufficient, reduce `[data] batch_size`.
 
 ## Training recipe
 
-The shipped `config.ini` uses the paper's Adam optimizer (`lr=4e-3`) and
-reduces LR by 10x after one validation epoch without improvement. PyTorch
-counts that patience as "tolerate one non-improving epoch, reduce on the
-second". The `min_lr=1e-6` floor is NOT a paper value -- the paper gives the
-factor and the patience but no bound and PyTorch defaults to 0, which lets a
-stalled run take up to 24 reductions inside the 50-epoch budget and spend its
-tail unable to learn while still reporting a full run. The loss is
-ULCNet's component-wise signed power compression followed by frequency-domain
-MSE (`c=0.3`). This campaign uses D=32, batch 16, and the full 50-epoch budget;
-the paper used D=64, batch 64, 3-second examples, and 20,000 steps per epoch.
+The shipped `config.ini` keeps the optimizer ascribed to the paper (Adam,
+`lr=4e-3`, no weight decay, no AMSGrad) and runs it on a per-step linear warmup
+into cosine annealing -- a PROJECT choice, replacing the validation-plateau
+schedule that the same prose ascribes to the paper.
+
+**Why the plateau schedule is not shipped.** Its patience is denominated in
+EPOCHS, and this project's epoch is not the one the recipe was written for: the
+paper is credited with 20,000 steps per epoch, while one pass over this corpus
+is roughly 2,025 steps at batch 16. `lr_patience = 1` therefore bought about a
+tenth of the grace it was written for. Measured against the real scheduler,
+only four reductions separate `4e-3` from the `1e-6` floor, and with
+`cooldown=0` and `best` a running minimum, 95.5% of 200 seeded runs reach that
+floor inside 50 epochs at 2% validation jitter (100% at 5%). Such a run then
+delivers 2.9% of its LR budget to epochs 15-49, against 48.2% for the
+warmup/cosine trajectory -- and that window is where this model's best epoch has
+actually landed. A step-indexed schedule cannot inherit the defect because it
+never counts epochs. `reduce_on_plateau` remains selectable, at
+`lr_decay_factor = 0.5` / `lr_patience = 5`, which over 200 seeds never reaches
+the floor within 50 epochs at any jitter up to 15%.
+
+`early_stop_patience` is back to 15. At 50 (= `max_epochs`) early stopping is
+off, which pairs badly with any schedule that can stall: the run reports a
+complete campaign while its tail contributes nothing.
+
+The loss is unchanged: ULCNet's component-wise signed power compression
+followed by frequency-domain MSE (`c=0.3`).
+
+**On "the paper".** No copy of arXiv:2410.13620 is in this repo, and none has
+ever been committed. Every paper-side value here -- Adam, `4e-3`, no weight
+decay, D=64, batch 64, 3-second examples, 20,000 steps per epoch -- is
+transcribed prose whose only in-repo source is the commit that introduced it.
+Treat it as unverified rather than as a citation. This campaign uses D=32,
+batch 16 and the 50-epoch budget.
 
 For the listening examples on the paper's project page, the track labelled
 ``KF`` is the 16 kHz **error/residual Z**, not the KF echo estimate. To test

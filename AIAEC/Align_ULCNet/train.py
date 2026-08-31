@@ -66,7 +66,9 @@ from AIAEC.training_common import (
     build_plain_loaders,
     auto_device,
     component_compressed_mse_loss,
+    fast_forward_scheduler,
     halt_on_non_finite,
+    make_scheduler,
     make_checkpoint_contract,
     read_grids,
     read_model_kwargs,
@@ -79,7 +81,7 @@ from AIAEC.training_common import (
 
 MODEL_NAME = 'Align_ULCNet'
 TASK = MODEL_TASKS[MODEL_NAME]
-LOSS_VERSION = 'align_ulcnet_component_mse_c03_adam_plateau_v1'
+LOSS_VERSION = 'align_ulcnet_component_mse_c03_warmup_cosine_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -104,7 +106,7 @@ def forward_batch(model, stems_batch, aec_grid, device):
 def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
              epoch=0, global_step=0, output_dir=None, sr=None,
              grad_clip=1.0, checkpoint_for_halt=None, grad_log=None,
-             max_epochs=None):
+             max_epochs=None, scheduler=None):
     training = optimizer is not None
     model.train(training)
     total_loss, n_batches = 0.0, 0
@@ -156,6 +158,8 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
                     enhanced=output.enhanced,
                 )
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             if grad_log is not None:
                 grad_log.record(
                     total_norm, epoch=epoch, batch_idx=batch_idx,
@@ -208,9 +212,15 @@ def main(args):
         'weight_decay': cfg.getfloat('training', 'weight_decay'),
         'amsgrad': cfg.getboolean('training', 'amsgrad'),
         'schedule': cfg.get('training', 'scheduler').lower(),
+        'min_lr': cfg.getfloat('training', 'min_lr'),
+        # Both schedules' scalars, always recorded: which pair is live depends
+        # on `schedule`, but a contract that dropped the inactive pair would
+        # let two runs that differ only in a plateau setting resume into each
+        # other after a switch back.
+        'lr_warmup': cfg.getfloat('training', 'lr_warmup'),
+        'warmup_epochs': cfg.getint('training', 'warmup_epochs'),
         'lr_decay_factor': cfg.getfloat('training', 'lr_decay_factor'),
         'lr_patience': cfg.getint('training', 'lr_patience'),
-        'min_lr': cfg.getfloat('training', 'min_lr'),
     }
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
@@ -222,25 +232,45 @@ def main(args):
     os.makedirs(output_dir, exist_ok=True)
     lr = recipe['lr']
     max_epochs = cfg.getint('training', 'max_epochs', fallback=50)
-    if recipe['name'] != 'adam':
-        raise ValueError("Align-ULCNet paper recipe requires optimizer=adam")
-    optimizer = torch.optim.Adam(
+    optimizer_classes = {'adam': torch.optim.Adam, 'adamw': torch.optim.AdamW}
+    if recipe['name'] not in optimizer_classes:
+        raise ValueError(
+            f"unknown optimizer {recipe['name']!r}; expected one of "
+            f"{sorted(optimizer_classes)}")
+    optimizer = optimizer_classes[recipe['name']](
         model.parameters(), lr=lr,
         weight_decay=recipe['weight_decay'], amsgrad=recipe['amsgrad'],
     )
-    if recipe['schedule'] != 'reduce_on_plateau':
+    # Two schedules, and which one is live decides where it is stepped:
+    # warmup_cosine is indexed by optimizer step and advances inside
+    # run_epoch; reduce_on_plateau consumes a validation metric that exists
+    # only once per epoch and advances in the epoch loop. `step_scheduler` is
+    # what run_epoch receives, so the two can never both fire.
+    step_scheduler = None
+    epoch_scheduler = None
+    if recipe['schedule'] == 'warmup_cosine':
+        # Deliberately NOT stored in the checkpoint: fast_forward_scheduler()'s
+        # docstring carries the measured reason a saved T_max must not come
+        # back on a resume with a different horizon.
+        total_steps = max_epochs * len(train_loader)
+        warmup_steps = min(
+            recipe['warmup_epochs'] * len(train_loader), total_steps - 1)
+        step_scheduler = make_scheduler(
+            optimizer, warmup_steps, total_steps, lr,
+            recipe['min_lr'], recipe['lr_warmup'],
+        )
+    elif recipe['schedule'] == 'reduce_on_plateau':
+        # min_lr is a floor, not a paper value: the recipe gives a factor and
+        # a patience but no bound, and PyTorch's default is 0.
+        epoch_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min',
+            factor=recipe['lr_decay_factor'], patience=recipe['lr_patience'],
+            min_lr=recipe['min_lr'],
+        )
+    else:
         raise ValueError(
-            "Align-ULCNet paper recipe requires scheduler=reduce_on_plateau")
-    # min_lr is a floor, not a paper value -- the paper gives the factor and
-    # the patience but no bound, and PyTorch's default is 0. Without it a run
-    # whose validation stalls halves its way to a dead LR and keeps going:
-    # two non-improving epochs per x0.1 is 24 reductions inside a 50-epoch
-    # budget, and early stopping is off by design.
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min',
-        factor=recipe['lr_decay_factor'], patience=recipe['lr_patience'],
-        min_lr=recipe['min_lr'],
-    )
+            f"unknown scheduler {recipe['schedule']!r}; expected "
+            "'warmup_cosine' or 'reduce_on_plateau'")
 
     start_epoch, global_step, best_val, no_improve = 0, 0, float('inf'), 0
     if args.resume:
@@ -254,7 +284,11 @@ def main(args):
             )
         if not args.reset_optimizer:
             optimizer.load_state_dict(ckpt['optimizer'])
-            scheduler.load_state_dict(ckpt['scheduler'])
+            if epoch_scheduler is not None:
+                # Plateau state IS restored: its counters (best, num_bad_epochs,
+                # cooldown) are earned history with no horizon baked in, so
+                # dropping them would hand a stalled run a fresh patience.
+                epoch_scheduler.load_state_dict(ckpt['scheduler'])
             start_epoch = ckpt['epoch'] + 1
             global_step = ckpt['global_step']
             best_val = ckpt.get('best_val', best_val)
@@ -262,7 +296,12 @@ def main(args):
             # restarts at zero on every resume, repeated short jobs can evade
             # the configured patience indefinitely.
             no_improve = ckpt.get('no_improve', 0)
-        resumed_lr = optimizer.param_groups[0]['lr']
+        # The step schedule is rebuilt for THIS run's horizon and re-indexed by
+        # global_step, never restored -- see fast_forward_scheduler().
+        if step_scheduler is not None and not args.reset_optimizer:
+            resumed_lr = fast_forward_scheduler(step_scheduler, global_step)
+        else:
+            resumed_lr = optimizer.param_groups[0]['lr']
         print(f"Resumed from {args.resume} at epoch {start_epoch}"
               f"{' (fresh optimizer)' if args.reset_optimizer else ''}"
               f", lr={resumed_lr:.4e}")
@@ -280,7 +319,8 @@ def main(args):
     for epoch in range(start_epoch, max_epochs):
         checkpoint_for_halt = {
             'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
+            'scheduler': (epoch_scheduler.state_dict()
+                          if epoch_scheduler is not None else None),
             'epoch': epoch - 1, 'global_step': global_step, 'contract': contract,
             'best_val': best_val, 'no_improve': no_improve,
         }
@@ -290,7 +330,7 @@ def main(args):
             epoch=epoch, global_step=global_step, output_dir=output_dir,
             sr=aec_grid.sr, grad_clip=grad_clip,
             checkpoint_for_halt=checkpoint_for_halt, grad_log=grad_log,
-            max_epochs=max_epochs,
+            max_epochs=max_epochs, scheduler=step_scheduler,
         )
         msg = f"epoch {epoch}: train_loss={train_loss:.4f} ({time.time()-started:.0f}s)"
 
@@ -300,7 +340,8 @@ def main(args):
                 model, val_loader, aec_grid, device, loss_cfg
             )
             msg += f" val_loss={val_loss:.4f}"
-        scheduler.step(val_loss)
+        if epoch_scheduler is not None:
+            epoch_scheduler.step(val_loss)
         msg += f" lr={optimizer.param_groups[0]['lr']:.4e}"
         print(msg)
 
@@ -313,7 +354,8 @@ def main(args):
 
         checkpoint = {
             'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
+            'scheduler': (epoch_scheduler.state_dict()
+                          if epoch_scheduler is not None else None),
             'epoch': epoch, 'global_step': global_step, 'contract': contract,
             'best_val': best_val, 'no_improve': no_improve,
         }

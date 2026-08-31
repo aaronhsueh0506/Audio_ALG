@@ -85,7 +85,7 @@ one optimizer/loss/scheduler was not a valid comparison protocol.
 
 | model | optimizer / LR | schedule | objective | shipped batch / epochs |
 |---|---|---|---|---|
-| Align-ULCNet | Adam / 4e-3 | validation plateau, x0.1, patience 1 | component-compressed frequency MSE, c=0.3 | 16 / 50 |
+| Align-ULCNet | Adam / 4e-3 | warmup -> cosine (project choice; the plateau schedule its prose cites counts epochs this project redefined) | component-compressed frequency MSE, c=0.3 | 16 / 50 |
 | Align-CRUSE | Adam / 1.5e-4, decay 5e-6 | constant | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term | 16 / 50 |
 | DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | warmup -> cosine (project choice) | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
 | CAGCRN | AdamW / 1e-3, decay 5e-7 | constant | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
@@ -104,11 +104,12 @@ contract. Without it two runs of one model that differ only in learning rate
 produce identical contracts and resume into each other in silence, which is
 exactly the drift `require_checkpoint_contract` exists to catch and which
 became reachable the moment the four candidates stopped sharing one recipe.
-Align-ULCNet is the only model with a STATEFUL scheduler: plateau state cannot
-be reconstructed from a step count, so it is stored and restored with the
-optimizer. DeepVQE-S also runs a schedule, but a reconstructible one -- the
-shared per-step warmup/cosine, rebuilt from the epoch budget and fast-forwarded
-on resume rather than checkpointed. Its paper publishes an optimizer but no
+Align-ULCNet and DeepVQE-S both run the shared per-step warmup/cosine, which is
+reconstructible: it is rebuilt from the epoch budget and fast-forwarded on
+resume rather than checkpointed, so a saved `T_max` can never come back onto a
+run with a different horizon. Align-ULCNet can still select the stateful
+`reduce_on_plateau`; that one's counters ARE stored and restored with the
+optimizer, because they are earned history with no horizon baked in. Its paper publishes an optimizer but no
 schedule, so that trajectory is a project choice and is labelled as one in its
 config and README; a constant LR was the alternative and leaves the late epochs
 taking early-epoch-sized steps. Align-CRUSE and CAGCRN report no schedule
