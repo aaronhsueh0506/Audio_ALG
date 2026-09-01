@@ -81,7 +81,7 @@ from AIAEC.training_common import (
 
 MODEL_NAME = 'Align_ULCNet'
 TASK = MODEL_TASKS[MODEL_NAME]
-LOSS_VERSION = 'align_ulcnet_component_mse_c03_warmup_cosine_v1'
+LOSS_VERSION = 'align_ulcnet_component_mse_c03_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -186,6 +186,7 @@ def main(args):
     cfg = configparser.ConfigParser()
     if not cfg.read(args.config):
         raise FileNotFoundError(f"config not found: {args.config}")
+    print(f"Config: {os.path.abspath(args.config)}")
 
     set_seed(args.seed)
     device = auto_device(args.device, args.gpu)
@@ -213,27 +214,31 @@ def main(args):
         'amsgrad': cfg.getboolean('training', 'amsgrad'),
         'schedule': cfg.get('training', 'scheduler').lower(),
         'min_lr': cfg.getfloat('training', 'min_lr'),
-        # Both schedules' scalars, always recorded: which pair is live depends
-        # on `schedule`, but a contract that dropped the inactive pair would
-        # let two runs that differ only in a plateau setting resume into each
-        # other after a switch back.
-        'lr_warmup': cfg.getfloat('training', 'lr_warmup'),
-        'warmup_epochs': cfg.getint('training', 'warmup_epochs'),
-        'lr_decay_factor': cfg.getfloat('training', 'lr_decay_factor'),
-        'lr_patience': cfg.getint('training', 'lr_patience'),
-        # The step schedule's DENOMINATOR. total_steps is
-        # max_epochs * len(train_loader), and len(train_loader) follows
-        # batch_size, so either one silently re-times the whole curve on a
-        # resume -- the schedule is rebuilt, never restored. Worse than
-        # re-timing: a resume landing past the rebuilt horizon walks the
-        # chainable cosine BACKWARDS. Measured on this model's own grid,
-        # resuming at epoch 20 after batch_size 16 -> 64 reads 160% progress,
-        # and at 1.75x a horizon the LR is back to 0.97 x peak instead of at
-        # min_lr. Recording both makes require_checkpoint_contract refuse the
-        # resume rather than rebuild a different curve.
         'max_epochs': cfg.getint('training', 'max_epochs', fallback=50),
         'batch_size': cfg.getint('data', 'batch_size'),
+        'grad_clip': cfg.getfloat('training', 'grad_clip', fallback=1.0),
+        'early_stop_patience': cfg.getint(
+            'training', 'early_stop_patience', fallback=0),
+        'loss_compression': cfg.getfloat('loss', 'compression', fallback=0.3),
     }
+    if recipe['schedule'] == 'warmup_cosine':
+        # These two values and the denominator above define the entire step LR
+        # curve, so all are checkpoint compatibility fields.
+        recipe.update({
+            'lr_warmup': cfg.getfloat('training', 'lr_warmup'),
+            'warmup_epochs': cfg.getint('training', 'warmup_epochs'),
+        })
+    elif recipe['schedule'] == 'reduce_on_plateau':
+        recipe.update({
+            'lr_decay_factor': cfg.getfloat('training', 'lr_decay_factor'),
+            'lr_patience': cfg.getint('training', 'lr_patience'),
+        })
+    if recipe['early_stop_patience'] < 0:
+        raise ValueError("early_stop_patience must be >= 0 (0 disables it)")
+    stop_label = (str(recipe['early_stop_patience'])
+                  if recipe['early_stop_patience'] else 'off')
+    print(f"Training recipe: optimizer={recipe['name']} lr={recipe['lr']:.4g} "
+          f"schedule={recipe['schedule']} early_stop={stop_label}")
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
         model_kwargs=model_kwargs, loss_version=LOSS_VERSION,
@@ -320,8 +325,8 @@ def main(args):
 
     loss_cfg = cfg['loss'] if cfg.has_section('loss') else {
         'compression': '0.3'}
-    patience = cfg.getint('training', 'early_stop_patience', fallback=50)
-    grad_clip = cfg.getfloat('training', 'grad_clip', fallback=1.0)
+    patience = recipe['early_stop_patience']
+    grad_clip = recipe['grad_clip']
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), aec_grid.sr)
     # Per-tensor, because grad_norm.csv above is a GLOBAL norm and stays healthy
     # while one branch's weights decay to nothing.  Built here, after any
@@ -381,7 +386,7 @@ def main(args):
         torch.save(checkpoint, os.path.join(output_dir, f'{MODEL_NAME.lower()}_last.pth'))
         if is_best:
             torch.save(checkpoint, os.path.join(output_dir, f'{MODEL_NAME.lower()}_best.pth'))
-        elif no_improve >= patience:
+        elif patience > 0 and no_improve >= patience:
             print(f"early stop: no improvement in {patience} epochs")
             break
     grad_log.close()

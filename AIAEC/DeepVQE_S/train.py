@@ -96,7 +96,7 @@ from AIAEC.training_common import (
 
 MODEL_NAME = 'DeepVQE_S'
 TASK = MODEL_TASKS[MODEL_NAME]
-LOSS_VERSION = 'deepvqe_s_plcpa_c03_beta07_consistent_adamw_cosine_v1'
+LOSS_VERSION = 'deepvqe_s_plcpa_c03_beta07_consistent_v1'
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -203,6 +203,7 @@ def main(args):
     cfg = configparser.ConfigParser()
     if not cfg.read(args.config):
         raise FileNotFoundError(f"config not found: {args.config}")
+    print(f"Config: {os.path.abspath(args.config)}")
 
     set_seed(args.seed)
     device = auto_device(args.device, args.gpu)
@@ -229,21 +230,29 @@ def main(args):
         'weight_decay': cfg.getfloat('training', 'weight_decay'),
         'amsgrad': cfg.getboolean('training', 'amsgrad'),
         'schedule': cfg.get('training', 'scheduler').lower(),
-        'min_lr': cfg.getfloat('training', 'min_lr'),
-        'lr_warmup': cfg.getfloat('training', 'lr_warmup'),
-        'warmup_epochs': cfg.getint('training', 'warmup_epochs'),
-        # The schedule's DENOMINATOR. total_steps is
-        # max_epochs * len(train_loader), and len(train_loader) follows
-        # batch_size, so either one silently re-times the whole curve on a
-        # resume -- the schedule is rebuilt, never restored. Worse than
-        # re-timing: a resume landing past the rebuilt horizon walks the
-        # chainable cosine BACKWARDS instead of resting at min_lr, measured at
-        # 0.97 x peak by 1.75x a horizon. The config names the GPU as the
-        # batch-size constraint, which makes a hardware change the likeliest
-        # reason anyone resumes.
         'max_epochs': cfg.getint('training', 'max_epochs', fallback=50),
         'batch_size': cfg.getint('data', 'batch_size'),
+        'grad_clip': cfg.getfloat('training', 'grad_clip', fallback=1.0),
+        'early_stop_patience': cfg.getint(
+            'training', 'early_stop_patience', fallback=0),
+        'loss_compression': cfg.getfloat('loss', 'compression', fallback=0.3),
+        'loss_complex_weight': cfg.getfloat(
+            'loss', 'complex_weight', fallback=0.7),
+        'loss_stft_consistency': cfg.getboolean(
+            'loss', 'stft_consistency', fallback=True),
     }
+    if recipe['schedule'] == 'warmup_cosine':
+        recipe.update({
+            'min_lr': cfg.getfloat('training', 'min_lr'),
+            'lr_warmup': cfg.getfloat('training', 'lr_warmup'),
+            'warmup_epochs': cfg.getint('training', 'warmup_epochs'),
+        })
+    if recipe['early_stop_patience'] < 0:
+        raise ValueError("early_stop_patience must be >= 0 (0 disables it)")
+    stop_label = (str(recipe['early_stop_patience'])
+                  if recipe['early_stop_patience'] else 'off')
+    print(f"Training recipe: optimizer={recipe['name']} lr={recipe['lr']:.4g} "
+          f"schedule={recipe['schedule']} early_stop={stop_label}")
     contract = make_checkpoint_contract(
         model_name=MODEL_NAME, task=TASK, grid=model_grid,
         model_kwargs=model_kwargs, loss_version=LOSS_VERSION,
@@ -256,32 +265,29 @@ def main(args):
     max_epochs = recipe['max_epochs']
     if recipe['name'] != 'adamw':
         raise ValueError("DeepVQE-S paper recipe requires optimizer=adamw")
-    if recipe['schedule'] != 'warmup_cosine':
+    if recipe['schedule'] not in {'constant', 'warmup_cosine'}:
         raise ValueError(
-            "DeepVQE-S uses the shared warmup/cosine schedule; the paper "
-            "publishes no schedule of its own")
+            "DeepVQE-S scheduler must be 'constant' (paper-reference) or "
+            "'warmup_cosine' (explicit comparison)")
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr,
         weight_decay=recipe['weight_decay'], amsgrad=recipe['amsgrad'],
     )
-    # Per optimizer step, so the horizon is steps and not epochs. Deliberately
-    # NOT stored in the checkpoint: fast_forward_scheduler()'s docstring has
-    # the measured reason a saved T_max must not come back on resume.
-    # No fallbacks: these three are a project choice, and the config comment
-    # says so. A fallback here would let the shipped value be deleted and
-    # silently re-supplied from source, which is the drift the optimizer and
-    # scheduler names two lines up already refuse.
-    total_steps = max_epochs * len(train_loader)
-    warmup_steps = min(
-        cfg.getint('training', 'warmup_epochs') * len(train_loader),
-        total_steps - 1)
-    scheduler = make_scheduler(
-        optimizer, warmup_steps, total_steps, lr,
-        cfg.getfloat('training', 'min_lr'),
-        cfg.getfloat('training', 'lr_warmup'),
-    )
+    # The paper-reference path is constant.  warmup_cosine remains an explicit
+    # comparison option; when selected it is per optimizer step and its horizon
+    # is rebuilt/fast-forwarded rather than restored from a checkpoint.
+    scheduler = None
+    if recipe['schedule'] == 'warmup_cosine':
+        total_steps = max_epochs * len(train_loader)
+        warmup_steps = min(
+            recipe['warmup_epochs'] * len(train_loader),
+            total_steps - 1)
+        scheduler = make_scheduler(
+            optimizer, warmup_steps, total_steps, lr,
+            recipe['min_lr'], recipe['lr_warmup'],
+        )
 
-    start_epoch, global_step, best_val = 0, 0, float('inf')
+    start_epoch, global_step, best_val, no_improve = 0, 0, float('inf'), 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device, weights_only=False)
         require_checkpoint_contract(ckpt, contract, context=args.resume)
@@ -295,7 +301,11 @@ def main(args):
             start_epoch = ckpt['epoch'] + 1
             global_step = ckpt['global_step']
             best_val = ckpt.get('best_val', best_val)
-        resumed_lr = fast_forward_scheduler(scheduler, global_step)
+            no_improve = ckpt.get('no_improve', 0)
+        if scheduler is not None and not args.reset_optimizer:
+            resumed_lr = fast_forward_scheduler(scheduler, global_step)
+        else:
+            resumed_lr = optimizer.param_groups[0]['lr']
         print(f"Resumed from {args.resume} at epoch {start_epoch}"
               f"{' (fresh optimizer)' if args.reset_optimizer else ''}"
               f", lr={resumed_lr:.4e}")
@@ -303,19 +313,19 @@ def main(args):
     loss_cfg = cfg['loss'] if cfg.has_section('loss') else {
         'compression': '0.3', 'complex_weight': '0.7',
         'stft_consistency': 'true'}
-    patience = cfg.getint('training', 'early_stop_patience', fallback=50)
-    grad_clip = cfg.getfloat('training', 'grad_clip', fallback=1.0)
+    patience = recipe['early_stop_patience']
+    grad_clip = recipe['grad_clip']
     grad_log = GradNormLog(os.path.join(output_dir, 'grad_norm.csv'), aec_grid.sr)
     # Per-tensor, because grad_norm.csv above is a GLOBAL norm and stays healthy
     # while one branch's weights decay to nothing.  Built here, after any
     # --resume load, so a resumed run measures against what it resumed from.
     weight_guard = WeightScaleGuard(model)
 
-    no_improve = 0
     for epoch in range(start_epoch, max_epochs):
         checkpoint_for_halt = {
             'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
             'epoch': epoch - 1, 'global_step': global_step, 'contract': contract,
+            'best_val': best_val, 'no_improve': no_improve,
         }
         started = time.time()
         train_loss, global_step = run_epoch(
@@ -332,12 +342,21 @@ def main(args):
         if val_loader is not None:
             val_loss, _ = run_epoch(model, val_loader, aec_grid, device, loss_cfg)
             msg += f" val_loss={val_loss:.4f}"
+        msg += f" lr={optimizer.param_groups[0]['lr']:.4e}"
         print(msg)
+
+        is_best = val_loss < best_val
+        if is_best:
+            best_val = val_loss
+            no_improve = 0
+        else:
+            no_improve += 1
 
         checkpoint = {
             'state_dict': model.state_dict(), 'optimizer': optimizer.state_dict(),
             'epoch': epoch, 'global_step': global_step, 'contract': contract,
-            'best_val': min(best_val, val_loss),
+            'best_val': best_val,
+            'no_improve': no_improve,
         }
         poisoned = scan_non_finite(model)
         if poisoned:
@@ -345,15 +364,11 @@ def main(args):
                 f"refusing to save non-finite weights: {poisoned[:5]}")
         weight_guard.check(epoch=epoch, global_step=global_step)
         torch.save(checkpoint, os.path.join(output_dir, f'{MODEL_NAME.lower()}_last.pth'))
-        if val_loss < best_val:
-            best_val = val_loss
-            no_improve = 0
+        if is_best:
             torch.save(checkpoint, os.path.join(output_dir, f'{MODEL_NAME.lower()}_best.pth'))
-        else:
-            no_improve += 1
-            if no_improve >= patience:
-                print(f"early stop: no improvement in {patience} epochs")
-                break
+        elif patience > 0 and no_improve >= patience:
+            print(f"early stop: no improvement in {patience} epochs")
+            break
     grad_log.close()
 
 

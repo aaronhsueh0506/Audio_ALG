@@ -942,12 +942,12 @@ def test_a_configured_weight_decay_is_not_silently_rounded_away():
 
 def test_shipped_configs_declare_the_model_specific_paper_recipes():
     expected = {
-        'Align_ULCNet': ('adam', 'warmup_cosine', 4e-3, 0.0,
-                         16, 50, 15),
+        'Align_ULCNet': ('adam', 'reduce_on_plateau', 4e-3, 0.0,
+                         16, 50, 0),
         'Align_CRUSE': ('adam', 'constant', 1.5e-4, 5e-6,
                         16, 50, 50),
-        'DeepVQE_S': ('adamw', 'warmup_cosine', 1.2e-3, 5e-7,
-                      8, 50, 50),
+        'DeepVQE_S': ('adamw', 'constant', 1.2e-3, 5e-7,
+                      8, 50, 0),
         'CAGCRN': ('adamw', 'constant', 1e-3, 5e-7,
                    32, 50, 50),
     }
@@ -995,12 +995,10 @@ def test_each_trainer_wires_the_schedule_its_recipe_declares():
 
     Align-ULCNet steps a plateau scheduler on the validation loss.  That state
     cannot be reconstructed from a step count, so it MUST be checkpointed and
-    restored.  DeepVQE-S steps the shared warmup/cosine schedule once per
-    optimizer step; that state IS reconstructible, so it is deliberately
-    rebuilt from the epoch budget and fast-forwarded on resume rather than
-    restored -- carrying a stored T_max back is the failure
-    ``fast_forward_scheduler`` exists to document.  The remaining two report no
-    schedule and must not quietly grow one.
+    restored.  DeepVQE-S ships constant LR, but retains warmup/cosine behind an
+    explicit config choice for controlled comparisons; that state IS
+    reconstructible and is rebuilt from the epoch budget rather than restored.
+    The remaining two report no schedule and must not quietly grow one.
     """
     for path in AIAEC_TRAINER_SOURCES:
         source = path.read_text(encoding='utf-8')
@@ -1010,6 +1008,11 @@ def test_each_trainer_wires_the_schedule_its_recipe_declares():
             assert 'scheduler.step(val_loss)' in source
             assert "scheduler.load_state_dict(ckpt['scheduler'])" in source
         elif name == 'DeepVQE_S':
+            cfg = configparser.ConfigParser()
+            assert cfg.read(path.with_name('config.ini'))
+            assert cfg.get('training', 'scheduler') == 'constant'
+            assert "if recipe['schedule'] == 'warmup_cosine':" in source
+            assert 'scheduler = None' in source
             assert 'make_scheduler(' in source
             assert 'scheduler.step()' in source
             assert 'fast_forward_scheduler(scheduler, global_step)' in source
@@ -1172,6 +1175,13 @@ def test_the_checkpoint_contract_records_the_training_recipe(
     assert recorded['weight_decay'] == pytest.approx(
         cfg.getfloat('training', 'weight_decay'))
     assert recorded['schedule'] == cfg.get('training', 'scheduler').lower()
+    if model_name in {'Align_ULCNet', 'DeepVQE_S'}:
+        assert recorded['grad_clip'] == pytest.approx(
+            cfg.getfloat('training', 'grad_clip'))
+        assert recorded['early_stop_patience'] == cfg.getint(
+            'training', 'early_stop_patience')
+        assert recorded['loss_compression'] == pytest.approx(
+            cfg.getfloat('loss', 'compression'))
 
     # The same config with one number changed must produce a contract the
     # comparison refuses -- that is the property, not merely that a field
@@ -1190,12 +1200,8 @@ def test_the_checkpoint_contract_records_the_training_recipe(
 def test_align_ulcnet_plateau_reductions_have_a_floor(monkeypatch, tmp_path):
     """The plateau schedule must not be able to anneal the LR to nothing.
 
-    ``reduce_on_plateau`` is no longer what Align-ULCNet ships, but it stays
-    selectable, so it keeps its guard: PyTorch's default ``min_lr`` is 0, and a
-    run whose validation stalls takes one x0.1 every two epochs while still
-    reporting a full campaign.  The config is copied and overridden here rather
-    than read as shipped, so this test states which schedule it is exercising
-    instead of inheriting whichever one happens to be current.
+    ``reduce_on_plateau`` is the shipped paper-reference schedule. PyTorch's
+    default ``min_lr`` is 0, so the project floor must be wired explicitly.
     """
     shipped = (pathlib.Path(training_common.__file__).parent
                / 'Align_ULCNet' / 'config.ini')
@@ -1214,10 +1220,8 @@ def test_align_ulcnet_plateau_reductions_have_a_floor(monkeypatch, tmp_path):
         'ReduceLROnPlateau was built without the configured floor')
 
     scheduler = box['scheduler']
-    # Far past max_epochs on purpose. The shipped factor/patience are gentle
-    # enough that 50 non-improving epochs do NOT reach the floor -- that is the
-    # point of them -- so a 50-epoch loop here would pass with min_lr removed.
-    # What this pins is that the reductions CLAMP rather than run to zero.
+    # Far past max_epochs on purpose. What this pins is that repeated
+    # reductions CLAMP at the configured floor rather than running to zero.
     for _ in range(500):
         scheduler.step(1.0)          # never improves
         assert scheduler.optimizer.param_groups[0]['lr'] >= floor
@@ -1225,29 +1229,28 @@ def test_align_ulcnet_plateau_reductions_have_a_floor(monkeypatch, tmp_path):
         'the plateau schedule did not settle on the configured floor')
 
 
-def test_align_ulcnet_ships_a_step_indexed_schedule(monkeypatch, tmp_path):
-    """The shipped schedule must not count epochs.
+def test_align_ulcnet_ships_the_adapted_paper_plateau_schedule(
+        monkeypatch, tmp_path):
+    """Ship the paper's x0.1 plateau rule on the local epoch definition.
 
-    This is the whole point of the change away from ``reduce_on_plateau``.
-    That scheduler took its patience in EPOCHS, and this project's epoch is
-    roughly a tenth of the one the recipe was written against, so the LR
-    reached its floor within single-digit epochs and the rest of the campaign
-    ran on a dead LR.  Any schedule indexed by optimizer step is structurally
-    immune, so what has to be pinned is that the shipped config selects one AND
-    that no per-epoch plateau scheduler is constructed alongside it.
+    A paper step carries 64 x 3 s = 192 s; a local step carries 16 x 10 s =
+    160 s.  The paper's 20k-step interval is therefore about 24k local steps,
+    or six passes over the 200-hour corpus. PyTorch patience five reduces on
+    bad interval six while factor 0.1 remains unchanged.
     """
     shipped = (pathlib.Path(training_common.__file__).parent
                / 'Align_ULCNet' / 'config.ini')
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
-    assert cfg.get('training', 'scheduler') == 'warmup_cosine'
+    assert cfg.get('training', 'scheduler') == 'reduce_on_plateau'
+    assert cfg.getfloat('training', 'lr_decay_factor') == pytest.approx(0.1)
+    assert cfg.getint('training', 'lr_patience') == 5
 
     box = {}
     _drive_main_capturing(
         'Align_ULCNet', monkeypatch, tmp_path, shipped, {}, scheduler_box=box)
-    assert not box, (
-        'the shipped config still builds a ReduceLROnPlateau; its patience is '
-        'denominated in epochs and this project redefined the epoch')
+    assert box['kwargs']['factor'] == pytest.approx(0.1)
+    assert box['kwargs']['patience'] == 5
 
 
 @pytest.mark.parametrize('model_name', ['Align_ULCNet', 'DeepVQE_S'])
@@ -1277,6 +1280,9 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
     def contract_for(section=None, key=None, value=None):
         cfg = configparser.ConfigParser()
         assert cfg.read(shipped), shipped
+        # Both trainers retain this optional step-indexed schedule for an
+        # explicit A/B run even though neither ships it now.
+        cfg.set('training', 'scheduler', 'warmup_cosine')
         if section is not None:
             cfg.set(section, key, value)
         path = tmp_path / ('cfg_%d.ini' % len(list(tmp_path.iterdir())))
@@ -1297,9 +1303,9 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
             'accepted anyway')
 
 
-def test_align_ulcnet_steps_its_schedule_per_batch_not_per_epoch(
+def test_align_ulcnet_optional_step_schedule_advances_per_batch(
         monkeypatch, tmp_path):
-    """The shipped schedule has to be advanced once per optimizer step.
+    """The optional comparison schedule advances once per optimizer step.
 
     Selecting ``warmup_cosine`` is not enough. Moving ``scheduler.step()`` out
     of the batch loop and into the epoch loop leaves every string in the file
@@ -1317,6 +1323,7 @@ def test_align_ulcnet_steps_its_schedule_per_batch_not_per_epoch(
                / 'Align_ULCNet' / 'config.ini')
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
+    cfg.set('training', 'scheduler', 'warmup_cosine')
     # One short epoch on a small corpus: the wiring is what is under test, not
     # convergence.  batch 4 over 36 training chunks makes the per-batch and
     # per-epoch answers differ by 9x rather than by 1.
@@ -1389,7 +1396,7 @@ def test_align_ulcnet_steps_its_schedule_per_batch_not_per_epoch(
         'not once per epoch')
 
 
-def test_deepvqe_s_steps_its_schedule_per_batch_not_per_epoch(
+def test_deepvqe_s_optional_step_schedule_advances_per_batch(
         monkeypatch, tmp_path):
     """The cosine horizon has to be advanced once per optimizer step.
 
@@ -1410,6 +1417,7 @@ def test_deepvqe_s_steps_its_schedule_per_batch_not_per_epoch(
                / 'DeepVQE_S' / 'config.ini')
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
+    cfg.set('training', 'scheduler', 'warmup_cosine')
     cfg.set('training', 'max_epochs', '1')
     cfg.set('training', 'warmup_epochs', '1')
     cfg.set('data', 'batch_size', '4')
@@ -1472,6 +1480,74 @@ def test_deepvqe_s_steps_its_schedule_per_batch_not_per_epoch(
         f"the schedule advanced {calls['n']} times over an epoch of "
         f"{batches['n']} batches; it must advance once per optimizer step, "
         'not once per epoch')
+
+
+@pytest.mark.parametrize('model_name', ['Align_ULCNet', 'DeepVQE_S'])
+def test_zero_patience_finishes_the_budget_and_saves_the_live_counter(
+        model_name, monkeypatch, tmp_path):
+    """Zero disables stopping; it must not mean "stop at first plateau".
+
+    Three flat validation epochs produce one best followed by two bad epochs.
+    Both trainers must finish all three and persist ``no_improve=2`` in the
+    last checkpoint.  The latter also catches saving the DeepVQE checkpoint
+    before updating its counter, which used to hand a resume stale patience.
+    """
+    trainer = importlib.import_module(f'AIAEC.{model_name}.train')
+    shipped = (pathlib.Path(training_common.__file__).parent
+               / model_name / 'config.ini')
+    cfg = configparser.ConfigParser()
+    assert cfg.read(shipped), shipped
+    cfg.set('training', 'max_epochs', '3')
+    cfg.set('training', 'early_stop_patience', '0')
+    cfg.set('training', 'output_dir', str(tmp_path / 'output'))
+    cfg.set('data', 'batch_size', '2')
+    cfg.set('data', 'num_workers', '0')
+    if model_name == 'Align_ULCNet':
+        cfg.set('model', 'max_delay_frames', '2')
+    override = tmp_path / f'{model_name}.ini'
+    with io.open(override, 'w', encoding='utf-8') as handle:
+        cfg.write(handle)
+
+    linear = make_linear_aec_contract(16000, frame_size=512)
+
+    class FakePackedDataset:
+        def __init__(self, path, expected_sr=None, mmap=False):
+            self.linear_aec_contract = linear
+            self.linear_aec_contract_hash = linear.fingerprint()
+
+        def __len__(self):
+            return 8
+
+        def __getitem__(self, index):
+            return torch.zeros(len(PACKED_STEM_ORDER), 8192), {}
+
+        def fingerprint(self):
+            return 'zero-patience-corpus'
+
+    calls = []
+
+    def flat_epoch(*args, **kwargs):
+        calls.append(1)
+        return 1.0, kwargs.get('global_step', 0) + 1
+
+    saved = []
+
+    def capture_save(obj, path):
+        if str(path).endswith('_last.pth'):
+            saved.append(copy.deepcopy(obj))
+
+    monkeypatch.setattr(training_common, 'PackedAecDataset', FakePackedDataset)
+    monkeypatch.setattr(trainer, 'run_epoch', flat_epoch)
+    monkeypatch.setattr(trainer.torch, 'save', capture_save)
+    monkeypatch.chdir(tmp_path)
+    args = trainer.build_parser().parse_args([
+        '--config', str(override), '--packed-dir', 'fake', '--device', 'cpu',
+    ])
+    trainer.main(args)
+
+    assert len(calls) == 6, 'three train and three validation passes must run'
+    assert saved[-1]['epoch'] == 2
+    assert saved[-1]['no_improve'] == 2
 
 
 def test_align_ulcnet_resume_restores_early_stop_counter(

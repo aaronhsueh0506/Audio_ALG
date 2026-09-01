@@ -85,9 +85,9 @@ one optimizer/loss/scheduler was not a valid comparison protocol.
 
 | model | optimizer / LR | schedule | objective | shipped batch / epochs |
 |---|---|---|---|---|
-| Align-ULCNet | Adam / 4e-3 | warmup -> cosine (project choice; the plateau schedule its prose cites counts epochs this project redefined) | component-compressed frequency MSE, c=0.3 | 16 / 50 |
+| Align-ULCNet | Adam / 4e-3 | plateau x0.1 after ~24k local steps (paper's 20k-step audio exposure adjusted for 3 s x 64 vs 10 s x 16) | component-compressed frequency MSE, c=0.3 | 16 / 50 |
 | Align-CRUSE | Adam / 1.5e-4, decay 5e-6 | constant | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term | 16 / 50 |
-| DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | warmup -> cosine (project choice) | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
+| DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | constant (paper publishes no schedule) | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
 | CAGCRN | AdamW / 1e-3, decay 5e-7 | constant | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
 
 ### What a four-way comparison can and cannot conclude
@@ -100,18 +100,10 @@ independent reasons, both measurable from this directory:
 PLCPA, and MSE+SI-SNR+L1 do not share a scale or a zero. Cross-model loss
 values are not comparable at all -- only a common external metric is.
 
-**The optimisation budgets differ by 13x.** Integrated learning rate over the
-same corpus and the same 50 epochs (100 h / 10 s chunks, val_fraction 0.1):
-
-| model | schedule | peak lr | batch | steps | integrated lr | lr per sample |
-|---|---|---:|---:|---:|---:|---:|
-| Align-CRUSE | constant | 1.5e-4 | 16 | 101,250 | 15.2 | 9.4e-06 |
-| CAGCRN | constant | 1e-3 | 32 | 50,600 | 50.6 | 3.1e-05 |
-| DeepVQE-S | warmup+cosine | 1.2e-3 | 8 | 202,500 | 122.2 | 1.5e-04 |
-| Align-ULCNet | warmup+cosine | 4e-3 | 16 | 101,250 | 202.9 | 2.5e-04 |
-
-Align-ULCNet receives 13.4x Align-CRUSE's total LR distance. A win by either of
-the top two would not be attributable to its architecture.
+**The optimisation budgets differ.** Batch sizes, epoch definitions, schedules
+and published training durations differ, and Align-ULCNet's plateau schedule is
+validation-dependent, so there is no single honest precomputed "integrated LR"
+table. A win by one model is not attributable to architecture alone.
 
 This is a deliberate trade: per-paper fidelity was chosen over a shared
 protocol at d2c272f, and the two cannot both hold in one campaign. Whichever is
@@ -122,18 +114,11 @@ wanted, it should be an explicit decision rather than an artefact:
 - **To reproduce each paper**, keep these recipes and judge each model against
   its own published numbers, not against its siblings here.
 
-Note also that no AIAEC paper is present in this repo and none has ever been
-committed, so every value ascribed to one is transcribed prose with no primary
-source. Treat "the paper says" as an open question throughout.
-
 The epoch budget is the project decision requested for this training campaign.
 Align-ULCNet batch 16 and DeepVQE-S batch 8 are GPU-memory overrides. The
-number ascribed to Align-ULCNet's paper is 64; the 400 previously ascribed to
-DeepVQE-S is Align-CRUSE's, per that model's own README and per d2c272f's
-deviation table, which records DeepVQE-S's paper batch as unknown. CAGCRN
-explicitly publishes batch 32. No paper is in this repo, so none of these is
-verifiable here.
-Early stopping cannot end these runs before epoch 50; validation still selects
+Align-ULCNet paper uses 64; DeepVQE-S and Align-CRUSE both publish batch 400
+(for 250 and 150 epochs respectively). CAGCRN explicitly publishes batch 32.
+Early stopping is disabled for Align-ULCNet and DeepVQE-S; validation still selects
 the best checkpoint, and Align-ULCNet still applies its published LR reduction.
 Changing a loss recipe changes `loss_version`, so a checkpoint from the old
 generic recipe is rejected instead of silently resuming under a new objective.
@@ -144,16 +129,11 @@ contract. Without it two runs of one model that differ only in learning rate
 produce identical contracts and resume into each other in silence, which is
 exactly the drift `require_checkpoint_contract` exists to catch and which
 became reachable the moment the four candidates stopped sharing one recipe.
-Align-ULCNet and DeepVQE-S both run the shared per-step warmup/cosine, which is
-reconstructible: it is rebuilt from the epoch budget and fast-forwarded on
-resume rather than checkpointed, so a saved `T_max` can never come back onto a
-run with a different horizon. Align-ULCNet can still select the stateful
-`reduce_on_plateau`; that one's counters ARE stored and restored with the
-optimizer, because they are earned history with no horizon baked in. Its paper publishes an optimizer but no
-schedule, so that trajectory is a project choice and is labelled as one in its
-config and README; a constant LR was the alternative and leaves the late epochs
-taking early-epoch-sized steps. Align-CRUSE and CAGCRN report no schedule
-either and do keep a constant LR.
+Align-ULCNet runs a stateful `reduce_on_plateau`; its counters are stored and
+restored with the optimizer. DeepVQE-S, Align-CRUSE and CAGCRN use constant LR
+because their papers do not publish a schedule. The optional warmup/cosine path
+is retained only for explicit comparison runs and is rebuilt from step count on
+resume.
 
 The stored project examples remain 10-second chunks and one epoch remains one
 complete DataLoader pass. Align-ULCNet's paper used random 3-second examples
