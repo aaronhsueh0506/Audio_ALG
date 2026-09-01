@@ -35,11 +35,14 @@ padding and projection width remain documented reconstruction choices.
 
 ## Training recipe
 
-The shipped `config.ini` uses the paper's Adam settings (`lr=1.5e-4`,
-`weight_decay=5e-6`) and STFT-consistent PLCPA (`c=0.3`, `beta=0.7` on the
+The shipped `config.ini` uses the paper's Adam settings (`lr=1.5e-4`, coupled
+L2 `weight_decay=5e-6`) and STFT-consistent PLCPA (`c=0.3`, `beta=0.7` on the
 phase-aware complex term). LR is constant because the paper reports no
 scheduler. Batch 16 is the project memory-fit setting and this campaign runs
-50 epochs instead of the paper's batch 400 / 150 epochs.
+50 epochs instead of the paper's batch 400 / 150 epochs. The paper does not
+publish example duration or steps per epoch, so the LR is not rescaled from an
+unknown exposure ratio. Early stopping is disabled; validation still selects
+the best checkpoint.
 
 ## ONNX and calibration
 

@@ -909,19 +909,17 @@ def test_the_mps_stft_backward_bound_is_where_the_backend_actually_breaks():
 
 
 def test_a_configured_weight_decay_is_not_silently_rounded_away():
-    """A decay that float32 cannot represent must not read as regularisation.
+    """Document coupled Adam and decoupled AdamW decay truthfully.
 
     Decoupled decay multiplies each weight by ``1 - lr*wd`` per step. Three of
-    the four shipped configs set a decay whose ``lr*wd`` is 159-238x BELOW
-    float32 eps, so the factor is exactly 1.0f and the run has no
-    optimizer-side regularisation at all -- measured, 2000 steps of
-    AdamW(5e-7) are bit-identical to AdamW(0) and to Adam(0).
+    the shipped configs use AdamW with a decay whose ``lr*wd`` is below
+    float32 eps, so the factor is exactly 1.0f and those runs have no effective
+    optimizer-side regularisation.
 
-    Those values are deliberately kept: there is no paper in this repo to take
-    a real number from, and inventing one is worse than carrying an inert one.
-    What must not happen is the inertness becoming invisible. Each such config
-    carries a comment saying so, and this pins the pairing: any config whose
-    decay rounds away has to admit it in the same file.
+    Align-CRUSE is different: torch.optim.Adam applies weight_decay as a
+    coupled L2 gradient penalty before updating its moments. Applying the
+    AdamW rounding test to that config is a category error, so its config must
+    explicitly state the coupled semantics instead of calling it inert.
     """
     import numpy as np
     for path in AIAEC_TRAINER_CONFIGS:
@@ -931,13 +929,16 @@ def test_a_configured_weight_decay_is_not_silently_rounded_away():
         wd = cfg.getfloat('training', 'weight_decay')
         if wd == 0.0:
             continue
-        inert = np.float32(1.0 - lr * wd) == np.float32(1.0)
         text = pathlib.Path(path).read_text(encoding='utf-8')
-        admits = 'does NOTHING' in text
-        assert inert == admits, (
-            f'{path}: lr*wd = {lr * wd:.2e} rounds away in float32 = {inert}, '
-            f'but the config says it is inert = {admits}. Either the decay now '
-            'acts and the comment is stale, or it is inert and unmarked.')
+        if cfg.get('training', 'optimizer').lower() == 'adamw':
+            inert = np.float32(1.0 - lr * wd) == np.float32(1.0)
+            admits = 'does NOTHING' in text
+            assert inert == admits, (
+                f'{path}: lr*wd = {lr * wd:.2e} rounds away in float32 = '
+                f'{inert}, but the config says it is inert = {admits}.')
+        else:
+            assert 'coupled L2 penalty' in text
+            assert 'does NOTHING' not in text
 
 
 def test_shipped_configs_declare_the_model_specific_paper_recipes():
@@ -945,11 +946,11 @@ def test_shipped_configs_declare_the_model_specific_paper_recipes():
         'Align_ULCNet': ('adam', 'reduce_on_plateau', 4e-3, 0.0,
                          16, 50, 0),
         'Align_CRUSE': ('adam', 'constant', 1.5e-4, 5e-6,
-                        16, 50, 50),
+                        16, 50, 0),
         'DeepVQE_S': ('adamw', 'constant', 1.2e-3, 5e-7,
                       8, 50, 0),
-        'CAGCRN': ('adamw', 'constant', 1e-3, 5e-7,
-                   32, 50, 50),
+        'CAGCRN': ('adamw', 'constant', 1.2e-3, 5e-7,
+                   32, 50, 0),
     }
     declared = {}
     for path in AIAEC_TRAINER_CONFIGS:
@@ -1175,13 +1176,27 @@ def test_the_checkpoint_contract_records_the_training_recipe(
     assert recorded['weight_decay'] == pytest.approx(
         cfg.getfloat('training', 'weight_decay'))
     assert recorded['schedule'] == cfg.get('training', 'scheduler').lower()
-    if model_name in {'Align_ULCNet', 'DeepVQE_S'}:
-        assert recorded['grad_clip'] == pytest.approx(
-            cfg.getfloat('training', 'grad_clip'))
-        assert recorded['early_stop_patience'] == cfg.getint(
-            'training', 'early_stop_patience')
+    assert recorded['grad_clip'] == pytest.approx(
+        cfg.getfloat('training', 'grad_clip'))
+    assert recorded['early_stop_patience'] == cfg.getint(
+        'training', 'early_stop_patience')
+    if model_name in {'Align_ULCNet', 'Align_CRUSE', 'DeepVQE_S'}:
         assert recorded['loss_compression'] == pytest.approx(
             cfg.getfloat('loss', 'compression'))
+    if model_name in {'Align_CRUSE', 'DeepVQE_S'}:
+        assert recorded['loss_complex_weight'] == pytest.approx(
+            cfg.getfloat('loss', 'complex_weight'))
+        assert recorded['loss_stft_consistency'] == cfg.getboolean(
+            'loss', 'stft_consistency')
+    if model_name == 'CAGCRN':
+        assert recorded['loss_mse_weight'] == pytest.approx(
+            cfg.getfloat('loss', 'mse_weight'))
+        assert recorded['loss_si_snr_weight'] == pytest.approx(
+            cfg.getfloat('loss', 'si_snr_weight'))
+        assert recorded['loss_l1_weight'] == pytest.approx(
+            cfg.getfloat('loss', 'l1_weight'))
+        assert recorded['loss_eps'] == pytest.approx(
+            cfg.getfloat('loss', 'eps'))
 
     # The same config with one number changed must produce a contract the
     # comparison refuses -- that is the property, not merely that a field
@@ -1482,15 +1497,16 @@ def test_deepvqe_s_optional_step_schedule_advances_per_batch(
         'not once per epoch')
 
 
-@pytest.mark.parametrize('model_name', ['Align_ULCNet', 'DeepVQE_S'])
+@pytest.mark.parametrize(
+    'model_name', ['Align_ULCNet', 'Align_CRUSE', 'DeepVQE_S', 'CAGCRN'])
 def test_zero_patience_finishes_the_budget_and_saves_the_live_counter(
         model_name, monkeypatch, tmp_path):
     """Zero disables stopping; it must not mean "stop at first plateau".
 
     Three flat validation epochs produce one best followed by two bad epochs.
-    Both trainers must finish all three and persist ``no_improve=2`` in the
-    last checkpoint.  The latter also catches saving the DeepVQE checkpoint
-    before updating its counter, which used to hand a resume stale patience.
+    Every trainer must finish all three and persist ``no_improve=2`` in the
+    last checkpoint.  The latter also catches saving before updating the
+    counter, which hands a resume stale patience.
     """
     trainer = importlib.import_module(f'AIAEC.{model_name}.train')
     shipped = (pathlib.Path(training_common.__file__).parent

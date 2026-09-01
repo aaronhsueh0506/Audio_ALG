@@ -88,7 +88,7 @@ one optimizer/loss/scheduler was not a valid comparison protocol.
 | Align-ULCNet | Adam / 4e-3 | plateau x0.1 after ~24k local steps (paper's 20k-step audio exposure adjusted for 3 s x 64 vs 10 s x 16) | component-compressed frequency MSE, c=0.3 | 16 / 50 |
 | Align-CRUSE | Adam / 1.5e-4, decay 5e-6 | constant | STFT-consistent PLCPA, c=0.3, beta=0.7 on complex term | 16 / 50 |
 | DeepVQE-S | AdamW / 1.2e-3, decay 5e-7 | constant (paper publishes no schedule) | inherited Align-CRUSE PLCPA; the DeepVQE paper does not state its loss | 8 / 50 |
-| CAGCRN | AdamW / 1e-3, decay 5e-7 | constant | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
+| CAGCRN | AdamW / 1.2e-3, decay 5e-7 | constant | MSE + SI-SNR + normalized parameter L1 | 32 / 50 |
 
 ### What a four-way comparison can and cannot conclude
 
@@ -118,8 +118,9 @@ The epoch budget is the project decision requested for this training campaign.
 Align-ULCNet batch 16 and DeepVQE-S batch 8 are GPU-memory overrides. The
 Align-ULCNet paper uses 64; DeepVQE-S and Align-CRUSE both publish batch 400
 (for 250 and 150 epochs respectively). CAGCRN explicitly publishes batch 32.
-Early stopping is disabled for Align-ULCNet and DeepVQE-S; validation still selects
-the best checkpoint, and Align-ULCNet still applies its published LR reduction.
+Early stopping is disabled for all four shipped 50-epoch runs; validation still
+selects the best checkpoint, and Align-ULCNet still applies its published LR
+reduction.
 Changing a loss recipe changes `loss_version`, so a checkpoint from the old
 generic recipe is rejected instead of silently resuming under a new objective.
 The checkpoint contract also records the resolved training recipe -- optimizer
