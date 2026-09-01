@@ -101,17 +101,13 @@ a different D.  If memory is still insufficient, reduce `[data] batch_size`.
 ## Training recipe
 
 The shipped `config.ini` uses the published optimizer and peak LR: Adam at
-`4e-3`. The paper reduces LR by `0.1` after validation has not improved for one
-paper epoch: 20,000 steps at batch 64 with 3-second examples, or 192 seconds of
-audio per step. This run uses batch 16 with 10-second chunks, or 160 seconds per
-step, so the exposure-equivalent interval is about 24,000 local steps. On the
-200-hour corpus that is about six local epochs; the shipped `lr_patience=5`
-makes PyTorch reduce on bad interval six. `min_lr=1e-6` is a project safety
-floor because the paper gives no floor.
+`4e-3`. It then applies the project-wide schedule: three local epochs of linear
+warmup from `1e-4`, followed by per-optimizer-step cosine decay to `1e-6` over
+the remaining 50-epoch budget. This gives every run a deterministic LR curve
+rather than one driven by validation noise.
 
 Early stopping is disabled (`early_stop_patience=0`) for the requested
-50-epoch campaign. Validation still selects `*_best.pth`; a validation plateau
-now reduces LR rather than mechanically ending the run at epoch 15.
+50-epoch campaign. Validation still selects `*_best.pth`.
 
 The loss is unchanged: ULCNet's component-wise signed power compression
 followed by frequency-domain MSE (`c=0.3`).
@@ -119,8 +115,8 @@ followed by frequency-domain MSE (`c=0.3`).
 The primary source is arXiv:2410.13620. It explicitly publishes Adam, `4e-3`,
 D=64, batch 64, 3-second examples, a 20,000-step epoch, and the `0.1` plateau
 reduction. It does not state weight decay, AMSGrad, an LR floor, or an early-stop
-rule. This campaign deliberately changes D to 32, batch to 16, and the budget
-to 50 local epochs.
+rule. This campaign deliberately changes D to 32, batch to 16, the schedule to
+warmup/cosine, and the budget to 50 local epochs.
 
 For the listening examples on the paper's project page, the track labelled
 ``KF`` is the 16 kHz **error/residual Z**, not the KF echo estimate. To test

@@ -27,9 +27,9 @@ or bit exact.
 ## Training recipe
 
 The shipped `config.ini` uses the paper's AdamW settings (`lr=1.2e-3`,
-`weight_decay=5e-7`) at a constant LR. The paper publishes no LR schedule, so
-DeepFilterNet2's warmup/cosine is not silently imported into this model.
-`warmup_cosine` remains an explicit comparison option.
+`weight_decay=5e-7`). The local campaign adds the shared three-epoch warmup from
+`1e-4`, followed by per-step cosine decay to `1e-6`. This is an explicit project
+choice; the paper does not publish its LR schedule.
 
 The paper trains batch 400 for 250 epochs. This campaign deliberately uses
 batch 8 (GPU limit) for 50 epochs (requested budget); those are substantial
@@ -37,9 +37,8 @@ reproduction gaps and are recorded as such. Gradient accumulation is not
 presented as an exact substitute because the BatchNorm layers would still see
 micro-batches of eight. The paper does not publish its training-example
 duration, dataset hours, or steps per epoch, so there is no defensible
-batch/time-normalised LR or epoch conversion. The published `1.2e-3` constant
-LR is retained as the first controlled baseline rather than inventing a linear
-or square-root batch scaling rule.
+batch/time-normalised LR or epoch conversion. The published `1.2e-3` remains
+the peak LR rather than inventing a linear or square-root batch scaling rule.
 
 The other reconstruction choice is the loss. The paper does not publish one,
 so this implementation

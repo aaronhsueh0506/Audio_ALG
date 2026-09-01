@@ -26,9 +26,8 @@ Provided here:
   cannot: weights that decay to denormal magnitudes stay FINITE
 * ``make_optimizer``                          -- fallback optimizer selector for
   candidates whose paper does not prescribe a different recipe
-* ``make_scheduler`` / ``fast_forward_scheduler`` -- the legacy project
-  warmup/cosine recipe, retained for old checkpoints rather than imposed on
-  models whose papers prescribe another schedule
+* ``make_scheduler`` / ``fast_forward_scheduler`` -- the common project
+  warmup/cosine recipe used by all shipped AIAEC training configs
 * ``compressed_spectral_loss``                -- project fallback for candidates
   whose paper does not publish a training objective
 * ``component_compressed_mse_loss``           -- Align-ULCNet/ULCNet paper
@@ -45,9 +44,9 @@ Provided here:
   per-chunk train/val split plus epoch-level shuffle for the unified corpus.
 
 Do not add a fifth copy of generic infrastructure into a candidate's
-``train.py``. A paper-specific optimizer or scheduler remains in that
-candidate, is recorded in its checkpoint contract, and must not be presented
-as a cross-model comparison rule. The same reasoning
+``train.py``. A paper-specific optimizer remains in that candidate and is
+recorded in its checkpoint contract; the shared project schedule must not be
+presented as paper-published when a paper omits it. The same reasoning
 ``AIAEC/dataset_gen/README.md`` gives for ``aec_features.py``.
 """
 

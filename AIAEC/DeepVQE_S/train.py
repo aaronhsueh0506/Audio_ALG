@@ -267,15 +267,13 @@ def main(args):
         raise ValueError("DeepVQE-S paper recipe requires optimizer=adamw")
     if recipe['schedule'] not in {'constant', 'warmup_cosine'}:
         raise ValueError(
-            "DeepVQE-S scheduler must be 'constant' (paper-reference) or "
-            "'warmup_cosine' (explicit comparison)")
+            "DeepVQE-S scheduler must be 'warmup_cosine' or 'constant'")
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=lr,
         weight_decay=recipe['weight_decay'], amsgrad=recipe['amsgrad'],
     )
-    # The paper-reference path is constant.  warmup_cosine remains an explicit
-    # comparison option; when selected it is per optimizer step and its horizon
-    # is rebuilt/fast-forwarded rather than restored from a checkpoint.
+    # The shipped warmup/cosine schedule is per optimizer step. Its horizon is
+    # rebuilt/fast-forwarded rather than restored from a checkpoint.
     scheduler = None
     if recipe['schedule'] == 'warmup_cosine':
         total_steps = max_epochs * len(train_loader)

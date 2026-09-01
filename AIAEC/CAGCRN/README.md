@@ -26,8 +26,9 @@ ambiguities are resolved empirically.
 ## Training recipe
 
 The shipped `config.ini` uses the paper's AdamW settings (`lr=1.2e-3`,
-`weight_decay=5e-7`), batch 32, constant LR, and the published MSE + SI-SNR +
-L1 objective. Because the paper does not define the L1 normalization, this
+`weight_decay=5e-7`), batch 32, and the published MSE + SI-SNR + L1 objective.
+The local campaign adds three epochs of warmup from `1e-4`, then per-step cosine
+decay to `1e-6`. Because the paper does not define the L1 normalization, this
 implementation uses the mean absolute parameter value and records that choice
 in the checkpoint loss version. Both use 10-second examples and batch 32; this
 campaign runs 50 epochs rather than the paper's 1000 and therefore has a much

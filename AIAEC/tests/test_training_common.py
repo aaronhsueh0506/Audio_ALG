@@ -941,15 +941,15 @@ def test_a_configured_weight_decay_is_not_silently_rounded_away():
             assert 'does NOTHING' not in text
 
 
-def test_shipped_configs_declare_the_model_specific_paper_recipes():
+def test_shipped_configs_declare_the_model_specific_training_recipes():
     expected = {
-        'Align_ULCNet': ('adam', 'reduce_on_plateau', 4e-3, 0.0,
+        'Align_ULCNet': ('adam', 'warmup_cosine', 4e-3, 0.0,
                          16, 50, 0),
-        'Align_CRUSE': ('adam', 'constant', 1.5e-4, 5e-6,
+        'Align_CRUSE': ('adam', 'warmup_cosine', 1.5e-4, 5e-6,
                         16, 50, 0),
-        'DeepVQE_S': ('adamw', 'constant', 1.2e-3, 5e-7,
+        'DeepVQE_S': ('adamw', 'warmup_cosine', 1.2e-3, 5e-7,
                       8, 50, 0),
-        'CAGCRN': ('adamw', 'constant', 1.2e-3, 5e-7,
+        'CAGCRN': ('adamw', 'warmup_cosine', 1.2e-3, 5e-7,
                    32, 50, 0),
     }
     declared = {}
@@ -992,44 +992,21 @@ def test_shipped_loss_and_delay_overrides_are_explicit():
 
 
 def test_each_trainer_wires_the_schedule_its_recipe_declares():
-    """Three shapes, and the checkpoint handling differs between them.
-
-    Align-ULCNet steps a plateau scheduler on the validation loss.  That state
-    cannot be reconstructed from a step count, so it MUST be checkpointed and
-    restored.  DeepVQE-S ships constant LR, but retains warmup/cosine behind an
-    explicit config choice for controlled comparisons; that state IS
-    reconstructible and is rebuilt from the epoch budget rather than restored.
-    The remaining two report no schedule and must not quietly grow one.
-    """
+    """Every shipped trainer must run the shared step-indexed schedule."""
     for path in AIAEC_TRAINER_SOURCES:
         source = path.read_text(encoding='utf-8')
-        name = path.parent.name
-        if name == 'Align_ULCNet':
-            assert 'ReduceLROnPlateau(' in source
-            assert 'scheduler.step(val_loss)' in source
-            assert "scheduler.load_state_dict(ckpt['scheduler'])" in source
-        elif name == 'DeepVQE_S':
-            cfg = configparser.ConfigParser()
-            assert cfg.read(path.with_name('config.ini'))
-            assert cfg.get('training', 'scheduler') == 'constant'
-            assert "if recipe['schedule'] == 'warmup_cosine':" in source
-            assert 'scheduler = None' in source
-            assert 'make_scheduler(' in source
-            assert 'scheduler.step()' in source
-            assert 'fast_forward_scheduler(scheduler, global_step)' in source
+        cfg = configparser.ConfigParser()
+        assert cfg.read(path.with_name('config.ini'))
+        assert cfg.get('training', 'scheduler') == 'warmup_cosine'
+        assert "if recipe['schedule'] == 'warmup_cosine':" in source
+        assert 'make_scheduler(' in source
+        assert 'scheduler.step()' in source
+        assert 'fast_forward_scheduler(' in source
+        if path.parent.name != 'Align_ULCNet':
             assert "ckpt['scheduler']" not in source, (
                 'the rebuilt schedule must not be restored from the checkpoint')
-            # The restore side is only half of it: writing the state is what
-            # puts a stale T_max where a later resume can pick it up, and that
-            # line contains no `ckpt[` at all. Match on the method instead, so
-            # neither quote style nor `.get()` slips past.
             assert 'scheduler.state_dict()' not in source, (
                 'the rebuilt schedule must not be written to the checkpoint')
-            assert 'ReduceLROnPlateau(' not in source
-        else:
-            assert 'scheduler.step(' not in source
-            assert 'lr_scheduler.' not in source
-            assert 'make_scheduler(' not in source
 
 
 def test_the_shared_schedule_actually_reaches_min_lr():
@@ -1180,6 +1157,12 @@ def test_the_checkpoint_contract_records_the_training_recipe(
         cfg.getfloat('training', 'grad_clip'))
     assert recorded['early_stop_patience'] == cfg.getint(
         'training', 'early_stop_patience')
+    assert recorded['warmup_epochs'] == cfg.getint(
+        'training', 'warmup_epochs')
+    assert recorded['lr_warmup'] == pytest.approx(
+        cfg.getfloat('training', 'lr_warmup'))
+    assert recorded['min_lr'] == pytest.approx(
+        cfg.getfloat('training', 'min_lr'))
     if model_name in {'Align_ULCNet', 'Align_CRUSE', 'DeepVQE_S'}:
         assert recorded['loss_compression'] == pytest.approx(
             cfg.getfloat('loss', 'compression'))
@@ -1215,8 +1198,8 @@ def test_the_checkpoint_contract_records_the_training_recipe(
 def test_align_ulcnet_plateau_reductions_have_a_floor(monkeypatch, tmp_path):
     """The plateau schedule must not be able to anneal the LR to nothing.
 
-    ``reduce_on_plateau`` is the shipped paper-reference schedule. PyTorch's
-    default ``min_lr`` is 0, so the project floor must be wired explicitly.
+    ``reduce_on_plateau`` remains an optional legacy comparison. PyTorch's
+    default ``min_lr`` is 0, so the project floor must stay wired explicitly.
     """
     shipped = (pathlib.Path(training_common.__file__).parent
                / 'Align_ULCNet' / 'config.ini')
@@ -1244,31 +1227,19 @@ def test_align_ulcnet_plateau_reductions_have_a_floor(monkeypatch, tmp_path):
         'the plateau schedule did not settle on the configured floor')
 
 
-def test_align_ulcnet_ships_the_adapted_paper_plateau_schedule(
-        monkeypatch, tmp_path):
-    """Ship the paper's x0.1 plateau rule on the local epoch definition.
-
-    A paper step carries 64 x 3 s = 192 s; a local step carries 16 x 10 s =
-    160 s.  The paper's 20k-step interval is therefore about 24k local steps,
-    or six passes over the 200-hour corpus. PyTorch patience five reduces on
-    bad interval six while factor 0.1 remains unchanged.
-    """
-    shipped = (pathlib.Path(training_common.__file__).parent
-               / 'Align_ULCNet' / 'config.ini')
-    cfg = configparser.ConfigParser()
-    assert cfg.read(shipped), shipped
-    assert cfg.get('training', 'scheduler') == 'reduce_on_plateau'
-    assert cfg.getfloat('training', 'lr_decay_factor') == pytest.approx(0.1)
-    assert cfg.getint('training', 'lr_patience') == 5
-
-    box = {}
-    _drive_main_capturing(
-        'Align_ULCNet', monkeypatch, tmp_path, shipped, {}, scheduler_box=box)
-    assert box['kwargs']['factor'] == pytest.approx(0.1)
-    assert box['kwargs']['patience'] == 5
+def test_all_shipped_schedules_declare_the_cosine_horizon():
+    for path in AIAEC_TRAINER_CONFIGS:
+        cfg = configparser.ConfigParser()
+        assert cfg.read(path), path
+        assert cfg.get('training', 'scheduler') == 'warmup_cosine'
+        assert cfg.getint('training', 'warmup_epochs') == 3
+        assert 0 < cfg.getfloat('training', 'lr_warmup') <= cfg.getfloat(
+            'training', 'lr')
+        assert 0 < cfg.getfloat('training', 'min_lr') < cfg.getfloat(
+            'training', 'lr')
 
 
-@pytest.mark.parametrize('model_name', ['Align_ULCNet', 'DeepVQE_S'])
+@pytest.mark.parametrize('model_name', sorted(MODEL_TASKS))
 def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
         model_name, monkeypatch, tmp_path):
     """Changing the schedule's denominator must change the contract.
@@ -1295,8 +1266,6 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
     def contract_for(section=None, key=None, value=None):
         cfg = configparser.ConfigParser()
         assert cfg.read(shipped), shipped
-        # Both trainers retain this optional step-indexed schedule for an
-        # explicit A/B run even though neither ships it now.
         cfg.set('training', 'scheduler', 'warmup_cosine')
         if section is not None:
             cfg.set(section, key, value)
@@ -1318,9 +1287,9 @@ def test_a_resume_cannot_silently_rebuild_a_different_lr_curve(
             'accepted anyway')
 
 
-def test_align_ulcnet_optional_step_schedule_advances_per_batch(
+def test_align_ulcnet_step_schedule_advances_per_batch(
         monkeypatch, tmp_path):
-    """The optional comparison schedule advances once per optimizer step.
+    """The shipped schedule advances once per optimizer step.
 
     Selecting ``warmup_cosine`` is not enough. Moving ``scheduler.step()`` out
     of the batch loop and into the epoch loop leaves every string in the file
@@ -1411,8 +1380,9 @@ def test_align_ulcnet_optional_step_schedule_advances_per_batch(
         'not once per epoch')
 
 
-def test_deepvqe_s_optional_step_schedule_advances_per_batch(
-        monkeypatch, tmp_path):
+@pytest.mark.parametrize('model_name', ['DeepVQE_S', 'Align_CRUSE', 'CAGCRN'])
+def test_other_step_schedules_advance_per_batch(
+        model_name, monkeypatch, tmp_path):
     """The cosine horizon has to be advanced once per optimizer step.
 
     The previous version of this test asserted ``'scheduler.step()' in
@@ -1424,12 +1394,12 @@ def test_deepvqe_s_optional_step_schedule_advances_per_batch(
     the numeric bound still holds.  The whole suite stayed green under it.
 
     So count the scheduler's own advances over one real epoch instead, exactly
-    as the Align-ULCNet twin does.  Anything but one advance per training batch
+    as the Align-ULCNet twin does. Anything but one advance per training batch
     fails.
     """
-    trainer = importlib.import_module('AIAEC.DeepVQE_S.train')
+    trainer = importlib.import_module(f'AIAEC.{model_name}.train')
     shipped = (pathlib.Path(training_common.__file__).parent
-               / 'DeepVQE_S' / 'config.ini')
+               / model_name / 'config.ini')
     cfg = configparser.ConfigParser()
     assert cfg.read(shipped), shipped
     cfg.set('training', 'scheduler', 'warmup_cosine')

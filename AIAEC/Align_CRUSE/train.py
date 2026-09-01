@@ -80,9 +80,11 @@ from AIAEC.training_common import (
     build_arg_parser,
     build_plain_loaders,
     auto_device,
+    fast_forward_scheduler,
     power_compressed_complex_mse_loss,
     halt_on_non_finite,
     make_checkpoint_contract,
+    make_scheduler,
     read_grids,
     read_model_kwargs,
     require_checkpoint_contract,
@@ -120,7 +122,7 @@ def forward_batch(model, stems_batch, aec_grid, device):
 def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
              epoch=0, global_step=0, output_dir=None, sr=None,
              grad_clip=1.0, checkpoint_for_halt=None, grad_log=None,
-             max_epochs=None):
+             max_epochs=None, scheduler=None):
     training = optimizer is not None
     model.train(training)
     total_loss, n_batches = 0.0, 0
@@ -174,6 +176,8 @@ def run_epoch(model, loader, aec_grid, device, loss_cfg, optimizer=None, *,
                     enhanced=output.enhanced,
                 )
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             if grad_log is not None:
                 grad_log.record(
                     total_norm, epoch=epoch, batch_idx=batch_idx,
@@ -227,11 +231,6 @@ def main(args):
         'weight_decay': cfg.getfloat('training', 'weight_decay'),
         'amsgrad': cfg.getboolean('training', 'amsgrad'),
         'schedule': cfg.get('training', 'scheduler').lower(),
-        # Recorded even though a constant LR cannot be re-timed by them: without
-        # batch_size two runs at different effective batch produce an identical
-        # contract and resume into each other in silence, and max_epochs is what
-        # the sibling warmup/cosine trainers rebuild their horizon from. Same
-        # keys everywhere means one rule rather than a per-model exception.
         'max_epochs': cfg.getint('training', 'max_epochs', fallback=50),
         'batch_size': cfg.getint('data', 'batch_size'),
         'grad_clip': cfg.getfloat('training', 'grad_clip', fallback=1.0),
@@ -243,6 +242,12 @@ def main(args):
         'loss_stft_consistency': cfg.getboolean(
             'loss', 'stft_consistency', fallback=True),
     }
+    if recipe['schedule'] == 'warmup_cosine':
+        recipe.update({
+            'min_lr': cfg.getfloat('training', 'min_lr'),
+            'lr_warmup': cfg.getfloat('training', 'lr_warmup'),
+            'warmup_epochs': cfg.getint('training', 'warmup_epochs'),
+        })
     if recipe['early_stop_patience'] < 0:
         raise ValueError("early_stop_patience must be >= 0 (0 disables it)")
     stop_label = (str(recipe['early_stop_patience'])
@@ -261,12 +266,22 @@ def main(args):
     max_epochs = recipe['max_epochs']
     if recipe['name'] != 'adam':
         raise ValueError("Align-CRUSE paper recipe requires optimizer=adam")
-    if recipe['schedule'] != 'constant':
-        raise ValueError("Align-CRUSE paper reports a constant LR")
+    if recipe['schedule'] not in {'constant', 'warmup_cosine'}:
+        raise ValueError(
+            "Align-CRUSE scheduler must be 'warmup_cosine' or 'constant'")
     optimizer = torch.optim.Adam(
         model.parameters(), lr=lr,
         weight_decay=recipe['weight_decay'], amsgrad=recipe['amsgrad'],
     )
+    scheduler = None
+    if recipe['schedule'] == 'warmup_cosine':
+        total_steps = max_epochs * len(train_loader)
+        warmup_steps = min(
+            recipe['warmup_epochs'] * len(train_loader), total_steps - 1)
+        scheduler = make_scheduler(
+            optimizer, warmup_steps, total_steps, lr,
+            recipe['min_lr'], recipe['lr_warmup'],
+        )
 
     start_epoch, global_step, best_val, no_improve = 0, 0, float('inf'), 0
     if args.resume:
@@ -283,7 +298,10 @@ def main(args):
             global_step = ckpt['global_step']
             best_val = ckpt.get('best_val', best_val)
             no_improve = ckpt.get('no_improve', 0)
-        resumed_lr = optimizer.param_groups[0]['lr']
+        if scheduler is not None and not args.reset_optimizer:
+            resumed_lr = fast_forward_scheduler(scheduler, global_step)
+        else:
+            resumed_lr = optimizer.param_groups[0]['lr']
         print(f"Resumed from {args.resume} at epoch {start_epoch}"
               f"{' (fresh optimizer)' if args.reset_optimizer else ''}"
               f", lr={resumed_lr:.4e}")
@@ -308,6 +326,7 @@ def main(args):
         started = time.time()
         train_loss, global_step = run_epoch(
             model, train_loader, aec_grid, device, loss_cfg, optimizer,
+            scheduler=scheduler,
             epoch=epoch, global_step=global_step, output_dir=output_dir,
             sr=aec_grid.sr, grad_clip=grad_clip,
             checkpoint_for_halt=checkpoint_for_halt, grad_log=grad_log,
@@ -319,6 +338,7 @@ def main(args):
         if val_loader is not None:
             val_loss, _ = run_epoch(model, val_loader, aec_grid, device, loss_cfg)
             msg += f" val_loss={val_loss:.4f}"
+        msg += f" lr={optimizer.param_groups[0]['lr']:.4e}"
         print(msg)
 
         is_best = val_loss < best_val
