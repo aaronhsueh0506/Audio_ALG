@@ -14,13 +14,17 @@ stem channel order, which are equally silent when they drift.
 """
 
 from .aec_dataset import (
+    ECHO_MODES,
+    IMPAIRMENTS,
     NONLINEAR_MODELS,
     SCENARIOS,
+    TALK_MODES,
     AecSequenceRenderer,
     DeviceModel,
     RenderedSequence,
     SequencePlan,
     plan_sequences,
+    resolve_sequence_plan,
 )
 from .aec_features import (
     BASE_STEM_ORDER,
@@ -73,8 +77,11 @@ __all__ = [
     'BASE_STEM_ORDER',
     'PACKED_STEM_ORDER',
     'LINEAR_AEC_CONTRACT_VERSION',
+    'ECHO_MODES',
+    'IMPAIRMENTS',
     'NONLINEAR_MODELS',
     'SCENARIOS',
+    'TALK_MODES',
     'STEM_ORDER',
     'AecGrid',
     'AecSequenceRenderer',
@@ -107,6 +114,7 @@ __all__ = [
     'make_linear_aec_contract',
     'materialize_linear_error',
     'plan_sequences',
+    'resolve_sequence_plan',
     'pools_for_split',
     'save_manifest',
     'require_linear_aec_contract',

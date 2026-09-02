@@ -104,8 +104,9 @@ exactly).
 ⚠ **What that costs.** The renderer still computes a full per-chunk
 description — `speaker_id`, `far_speaker_id`, `noise_id`, `rir_id`, `room_id`,
 `device_id`, `ser_db`, `snr_db`, `erl_db`, `bulk_delay_samples`,
-`delay_jitter`, `sro_ppm`, `nonlinear`, `clipped`, `agc`, `scenario`,
-`sequence_scenario`, `sequence_seed`, `split` — but it is now visible only
+`delay_jitter`, `sro_ppm`, `nonlinear`, `clipped`, `agc`, `talk_mode`,
+`echo_mode`, `impairments`, `scenario`, `sequence_scenario`, `sequence_seed`,
+`split` — but it is now visible only
 in-process, on the `RenderedSequence` a worker hands back
 (`tests/test_aec_dataset.py` reads it there). None of it reaches disk, so:
 
@@ -136,19 +137,40 @@ near talker happens to be silent has no signal to define a ratio against.
 its two signals is absent, rather than a fabricated number that would silently
 pass a threshold filter.
 
-### Scenarios
+### Layered scenes
 
-`far_only`, `near_only`, `double_talk`, `ref_dropout`, `far_active_no_echo`,
-`echo_path_change`, `nonlinear_spk`, `clipping_agc`, `delay_jitter`, `sro`,
-`codec_mismatch`.
+New corpora no longer choose one mutually-exclusive scenario. They draw three
+orthogonal layers:
 
-`scenario` is **per chunk** and is not always the sequence's intent. A 40 s
-`ref_dropout` sequence is mostly *not* a dropout, and an `echo_path_change`
-sequence contains exactly one chunk where the path changes. Labelling every
-chunk with the sequence's intent would train a dropout-conditioned loss on
-chunks whose reference is fully active. So localised events label only the
-chunks that really are the event, and the rest are labelled by what they
-contain. `sequence_scenario` keeps the sequence-level intent.
+- `[talk_modes]`: `far_only`, `near_only`, `double_talk`, or
+  `duplex_random` (relative categorical weights);
+- `[echo_modes]`: normal echo, `ref_dropout`, or `far_active_no_echo`
+  (conditional probabilities for far-capable sequences);
+- `[impairments]`: independent path/capture events such as
+  `echo_path_change`, `nonlinear_spk`, `clipping_agc`, `delay_jitter`, `sro`
+  and `codec_mismatch`.
+
+This separation is intentional. In the former categorical planner a sequence
+could be `double_talk` **or** `echo_path_change` **or** nonlinear/clipped, so
+the difficult intersection never existed. `[complex_cases]
+p_dt_stress_combo` now guarantees a small measurable tail containing DT +
+path movement + nonlinear loudspeaker + clipping/AGC. Within that tail,
+`[activity] dt_force_edge_overlap` pins DT to the leading edge of the first far
+burst and trailing edge of the last, covering both a cold PBFDKF/model state
+and a mature state late in the sequence without making ordinary DT scripted.
+`far_active_no_echo` is a hard negative: its far scheduler covers the complete
+parent sequence — as back-to-back utterances, each drawing its own file, since
+one whole-sequence run would be zero-padded to length and go silent after the
+first utterance — while acoustic echo is exactly zero. The per-chunk label is
+then measured rather than asserted, so no emitted chunk can silently degenerate
+into the already-covered silent-reference case and keep the label anyway.
+
+`scenario` remains a compatibility, **per-chunk** summary and cannot describe
+all simultaneous conditions. A `ref_dropout` parent is mostly *not* in
+dropout, and a path-changing parent has exactly one transition chunk. New
+diagnostics must use `talk_mode`, `echo_mode` and `impairments` in-process (or
+measure the persisted separated stems). `sequence_scenario` remains only a
+legacy summary.
 
 **`ref_dropout` is load-bearing.** During a dropout the far end is genuinely
 silent — `X == 0` **and** `D == 0` — so no model may hallucinate echo removal.
@@ -160,8 +182,8 @@ the loudspeaker keep playing while the reference is lost, but that asks the
 model to predict an echo from nothing, so it is **0 by default**: raising it
 trains hallucination.
 
-Note that `p_ref_dropout` is a per-*sequence* probability; the per-*chunk*
-share is far smaller. If the idle term needs more, lengthen the dropouts
+Note that `p_ref_dropout` is conditional per far-capable *sequence*; the
+per-*chunk* share is smaller. If the idle term needs more, lengthen the dropouts
 (`ref_dropout_chunks_max`) rather than adding sequences that are mostly not
 dropouts. `near_only` supplies idle chunks too, but only `ref_dropout`
 contains the *transition* into and out of idle, which is the hard part.
@@ -200,6 +222,16 @@ streaming evaluation. Training itself treats chunks as independent shuffled
 samples; `SequenceChunkSampler` remains only as an evaluation utility and is
 not used by any trainer.
 
+### Migrating an existing corpus
+
+Changing only `linear_error` cannot create the newly composed acoustic scenes:
+the four source stems already encode talk activity, path movement,
+nonlinearity and capture clipping. Generate a new WAV corpus in a new output
+directory, pack it, and train a new checkpoint. Do **not** use `--resume` into
+an old corpus: WAV filenames carry no config fingerprint, so shape-compatible
+old chunks would be accepted even though they were rendered by the categorical
+planner.
+
 ## Files
 
 | File | Role |
@@ -214,7 +246,8 @@ not used by any trainer.
 | `pack_aec_dataset.py` | projects the five-channel WAVs into four-channel `.pt` shards (`--dtype float16` halves shard size and is safe to train on: every trainer widens to float32 at the device move, so only the stored dtype changes) |
 | `packed_aec_dataset.py` | `PackedAecDataset`, returning `(stems, meta)` |
 | `aec_features.py` | **the shared module the model projects import** |
-| `config.example.ini` | every knob, documented |
+| `config.example.ini` | every knob, documented (16 kHz) |
+| `config.example.48k.ini` | the same file with the 48 kHz recipe already applied; the tests derive it from the recipe above and compare key by key, so the two cannot drift apart |
 | `tests/` | the invariants a consumer cannot detect being broken |
 
 `aec_features.py` owns `AecGrid`, `stft`/`istft`, `alpha_from_tau`, `AecStems`,
@@ -238,8 +271,10 @@ any of these is opting out of the comparison** — the same failure that
 not at 48 kHz, where whole seconds must be multiples of 4 (`8.0` is exact on
 both grids and keeps the same 2–3 chunks per sequence). `[codec]
 source_sr_values` is rate-dependent as well. The complete 48 kHz recipe
-is at the top of `config.example.ini`; generation refuses an inexact
-`chunk_sec` in its config preflight, before the source/RIR scan.
+is at the top of `config.example.ini`, and `config.example.48k.ini` is that
+recipe already applied — copy it instead of re-deriving the values by hand.
+Generation refuses an inexact `chunk_sec` in its config preflight, before the
+source/RIR scan.
 
 **⚠ No frame counts, EMA coefficients or window lengths are hardcoded
 anywhere.** Time constants are given in seconds and converted with
@@ -280,8 +315,9 @@ shards, so a leftover from an earlier pack would silently join the corpus. Use
 validation/serialization failure keeps the previous pack intact.
 
 ⚠ Every current trainer runs at 16 kHz/512. A trainer on a different grid
-would need a SEPARATE `config.ini` carrying the whole recipe for that rate (see
-config.example.ini's top comment — `[signal]` alone is not enough) and its OWN
+would need a SEPARATE `config.ini` carrying the whole recipe for that rate
+(`[signal]` alone is not enough — start from `config.example.48k.ini`, which
+carries the whole 48 kHz recipe) and its OWN
 `--output` (e.g. `data_aec_16k` / `data_aec_48k`, matching that trainer's
 `packed_dir`): generating a second rate into the same `--output` as the first
 is refused once chunk WAVs exist, since the directory is not namespaced by

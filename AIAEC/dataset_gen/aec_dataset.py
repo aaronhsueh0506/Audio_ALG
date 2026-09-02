@@ -75,8 +75,11 @@ from .manifest import SourcePools, config_hash
 
 
 __all__ = [
+    'ECHO_MODES',
+    'IMPAIRMENTS',
     'NONLINEAR_MODELS',
     'SCENARIOS',
+    'TALK_MODES',
     'AecSequenceRenderer',
     'DeviceModel',
     'RenderedSequence',
@@ -86,6 +89,7 @@ __all__ = [
     'chunk_samples_from_config',
     'device_for_id',
     'plan_sequences',
+    'resolve_sequence_plan',
     'resample_by_ratio',
     'simulate_codec',
     'stable_seed',
@@ -95,12 +99,13 @@ __all__ = [
 # The scenario vocabulary.  A chunk's `scenario` metadata is always one of
 # these, so a downstream filter such as `meta['scenario'] == 'double_talk'`
 # never silently matches nothing because of a typo.
-SCENARIOS = (
-    'far_only',
-    'near_only',
-    'double_talk',
-    'ref_dropout',
-    'far_active_no_echo',
+# New corpora plan speech activity, echo availability, and physical
+# impairments independently.  ``SCENARIOS`` below remains the public label
+# vocabulary and the compatibility vocabulary for old hand-built
+# ``SequencePlan(scenario=...)`` callers.
+TALK_MODES = ('far_only', 'near_only', 'double_talk', 'duplex_random')
+ECHO_MODES = ('normal', 'ref_dropout', 'far_active_no_echo')
+IMPAIRMENTS = (
     'echo_path_change',
     'nonlinear_spk',
     'clipping_agc',
@@ -109,13 +114,40 @@ SCENARIOS = (
     'codec_mismatch',
 )
 
+# Derived, not restated: the label vocabulary IS the three axes projected onto
+# one string, and spelling it out again is how the two drift apart.  'normal'
+# is not a label -- it is the absence of an echo-mode event.
+# ⚠ A chunk's `scenario` is one of these, and so is a sequence's
+# `sequence_scenario`, but the two do not draw from the same subset:
+# 'duplex_random' is a sequence-level talk mode that no chunk is ever labelled.
+SCENARIOS = (TALK_MODES
+             + tuple(mode for mode in ECHO_MODES if mode != 'normal')
+             + IMPAIRMENTS)
+
+# Impairments that act on the echo path, so they have nothing to act on when
+# there is no far end or no acoustic return.  Named once because two places
+# depend on agreeing about it: plan_sequences() STRIPS these from such plans
+# and resolve_sequence_plan() REJECTS them, and a new echo-path impairment
+# added to only one of the two is either never generated or always fatal.
+ECHO_PATH_IMPAIRMENTS = frozenset({
+    'echo_path_change', 'nonlinear_spk', 'delay_jitter', 'sro',
+    'codec_mismatch',
+})
+
+# The impairments [complex_cases] p_dt_stress_combo forces together.  Named
+# because three places must agree on it: the planner that sets it, the
+# renderer's forced-edge-overlap gate that detects it, and the CLI census that
+# counts it.  Two of those three fail SILENTLY when the definition moves.
+DT_STRESS_IMPAIRMENTS = frozenset({
+    'echo_path_change', 'nonlinear_spk', 'clipping_agc',
+})
+
 # Scenarios whose defining event occupies the WHOLE sequence.  The others are
 # localised in time and get a per-chunk label instead -- see _chunk_scenario.
+# ⚠ 'far_active_no_echo' is deliberately NOT here: its label is measured per
+# chunk from the reference's actual activity, never asserted for the sequence.
 WHOLE_SEQUENCE_SCENARIOS = frozenset({
     'nonlinear_spk', 'clipping_agc', 'delay_jitter', 'sro', 'codec_mismatch',
-    # The reference plays for the whole sequence and none of it reaches the
-    # microphone, so there is no chunk where the event is not happening.
-    'far_active_no_echo',
 })
 
 # Memoryless loudspeaker distortion models.  A device is pinned to exactly one
@@ -445,15 +477,46 @@ def activity_runs(n_samples: int, sr: int, talk_sec: float, gap_sec: float,
     position = 0
     active = rng.random() < 0.5 if start_active is None else start_active
     while position < n_samples:
-        mean = talk_sec if active else gap_sec
-        # Clamped so one unlucky exponential draw cannot swallow a whole 60 s
-        # sequence in a single silence.
-        seconds = min(max(rng.expovariate(1.0 / mean), 0.15), mean * 4.0)
-        end = min(position + max(int(sr * seconds), int(sr * 0.15)), n_samples)
+        end = _draw_run_end(rng, position, talk_sec if active else gap_sec,
+                            sr, n_samples)
         if active:
             runs.append((position, end))
         position = end
         active = not active
+    return runs
+
+
+def _draw_run_end(rng: random.Random, position: int, mean_sec: float,
+                  sr: int, n_samples: int) -> int:
+    """Where a run starting at ``position`` ends, drawn from an exponential.
+
+    Clamped so one unlucky draw cannot swallow a whole 60 s sequence in a
+    single run, and floored so no run is too short to carry an utterance.
+    Shared by both schedulers so the two cannot drift into different rhythms.
+    """
+    seconds = min(max(rng.expovariate(1.0 / mean_sec), 0.15), mean_sec * 4.0)
+    return min(position + max(int(sr * seconds), int(sr * 0.15)), n_samples)
+
+
+def _contiguous_runs(n_samples: int, sr: int, talk_sec: float,
+                     rng: random.Random) -> List[Tuple[int, int]]:
+    """Back-to-back talk runs covering the whole span, with no silent gap.
+
+    The degenerate case of ``activity_runs`` where the talker never stops.
+    Split into utterance-sized runs rather than returned as ONE long run so
+    that ``_render_talker`` draws a fresh pool file per run: one whole-sequence
+    run would be a single speaker repeating for 20-30 s.  Keeping the far end
+    ACTIVE across a run that outlasts its file is the other half of the job and
+    belongs to that caller's ``loop=True``.
+    """
+    if talk_sec <= 0:
+        raise ValueError("talk_sec must be positive")
+    runs = []
+    position = 0
+    while position < n_samples:
+        end = _draw_run_end(rng, position, talk_sec, sr, n_samples)
+        runs.append((position, end))
+        position = end
     return runs
 
 
@@ -474,6 +537,12 @@ class SequencePlan:
     n_chunks: int
     scenario: str
     seed: int
+    # Layered planner fields. ``None`` keeps old direct callers source- and
+    # behaviour-compatible: their single scenario is resolved below into one
+    # talk mode / echo mode / impairment tuple.
+    talk_mode: Optional[str] = None
+    echo_mode: str = 'normal'
+    impairments: Tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -505,9 +574,64 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
             f"got chunk={chunk_sec}, min={seq_min}, max={seq_max}"
         )
 
-    weights = _scenario_weights(cfg)
-    names = list(weights)
-    probabilities = [weights[name] for name in names]
+    layer_sections = ('talk_modes', 'echo_modes', 'impairments',
+                      'complex_cases')
+    present_layers = tuple(name for name in layer_sections
+                           if cfg.has_section(name))
+    layered = bool(present_layers)
+    if layered:
+        # Every probability below reads through a fallback, and configparser
+        # returns that fallback for an ABSENT SECTION just as readily as for an
+        # absent key. A layered config missing [impairments] would therefore
+        # generate a full, plausible, impairment-free corpus and say nothing.
+        absent = [name for name in layer_sections
+                  if not cfg.has_section(name)]
+        if absent:
+            raise ValueError(
+                "a layered config must carry all four planner sections; "
+                f"found {', '.join('[' + name + ']' for name in present_layers)} "
+                "but not "
+                f"{', '.join('[' + name + ']' for name in absent)}; without "
+                "the section every probability in it silently reads as 0")
+        required_options = {
+            'talk_modes': tuple(f'p_{name}' for name in TALK_MODES),
+            'echo_modes': ('p_ref_dropout', 'p_far_active_no_echo'),
+            'impairments': tuple(f'p_{name}' for name in IMPAIRMENTS),
+            'complex_cases': ('p_dt_stress_combo',),
+        }
+        missing_options = [
+            f'[{section}] {option}'
+            for section, options in required_options.items()
+            for option in options
+            if not cfg.has_option(section, option)
+        ]
+        if missing_options:
+            raise ValueError(
+                "a layered config must explicitly set every planner option; "
+                "missing " + ', '.join(missing_options))
+        talk_weights = _named_weights(cfg, 'talk_modes', TALK_MODES)
+        talk_names = list(talk_weights)
+        talk_probabilities = [talk_weights[name] for name in talk_names]
+        p_ref_dropout = _probability(cfg, 'echo_modes', 'p_ref_dropout')
+        p_far_active_no_echo = _probability(
+            cfg, 'echo_modes', 'p_far_active_no_echo')
+        if p_ref_dropout + p_far_active_no_echo > 1.0:
+            raise ValueError(
+                "[echo_modes] p_ref_dropout + p_far_active_no_echo must be "
+                f"<= 1, got {p_ref_dropout + p_far_active_no_echo:g}")
+        impairment_p = {
+            name: _probability(cfg, 'impairments', f'p_{name}')
+            for name in IMPAIRMENTS
+        }
+        p_dt_stress = _probability(
+            cfg, 'complex_cases', 'p_dt_stress_combo')
+    else:
+        # Compatibility for an older copied config or a focused test config.
+        # It deliberately preserves the old mutually-exclusive semantics;
+        # shipped configs use the layered sections above.
+        weights = _named_weights(cfg, 'scenarios', SCENARIOS)
+        names = list(weights)
+        probabilities = [weights[name] for name in names]
 
     # Depends on (seed, split) only -- not on --hours -- so extending a corpus
     # keeps every sequence it already had, byte for byte.
@@ -522,33 +646,124 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
     sequence_id = start_id
     while total_sec < target_sec:
         n_chunks = rng.randint(chunks_min, chunks_max)
-        plans.append(SequencePlan(
-            sequence_id=sequence_id,
-            n_chunks=n_chunks,
-            scenario=rng.choices(names, weights=probabilities, k=1)[0],
-            seed=stable_seed(seed, 'sequence', split, sequence_id),
-        ))
+        sequence_seed = stable_seed(seed, 'sequence', split, sequence_id)
+        if layered:
+            # Each field owns a seed. Changing one impairment probability no
+            # longer silently reshuffles talk modes or every impairment after
+            # it, and worker/render order remains irrelevant.
+            talk_mode = random.Random(stable_seed(
+                sequence_seed, 'talk_mode')).choices(
+                    talk_names, weights=talk_probabilities, k=1)[0]
+            has_far = talk_mode != 'near_only'
+            echo_mode = 'normal'
+            if has_far:
+                draw = random.Random(stable_seed(
+                    sequence_seed, 'echo_mode')).random()
+                if draw < p_far_active_no_echo:
+                    echo_mode = 'far_active_no_echo'
+                elif draw < p_far_active_no_echo + p_ref_dropout:
+                    echo_mode = 'ref_dropout'
+
+            impairments = set()
+            for name, probability in impairment_p.items():
+                if random.Random(stable_seed(
+                        sequence_seed, 'impairment', name)).random() < probability:
+                    impairments.add(name)
+
+            # Echo-path impairments have no signal to act on in near-only or
+            # far-active/no-echo sequences. Capture clipping/AGC remains valid
+            # in both and is therefore intentionally retained.
+            if not has_far or echo_mode == 'far_active_no_echo':
+                impairments.difference_update(ECHO_PATH_IMPAIRMENTS)
+
+            # Pure independent draws make the exact DT + moving/nonlinear/
+            # clipped intersection too rare to teach in a 200 h campaign.
+            # This conditional draw creates a measurable tail without turning
+            # every ordinary DT example into an adversarial one.
+            if (talk_mode == 'double_talk'
+                    and echo_mode == 'normal'
+                    and random.Random(stable_seed(
+                        sequence_seed, 'dt_stress_combo')).random() < p_dt_stress):
+                impairments.update(DT_STRESS_IMPAIRMENTS)
+
+            plans.append(SequencePlan(
+                sequence_id=sequence_id,
+                n_chunks=n_chunks,
+                scenario=talk_mode,
+                seed=sequence_seed,
+                talk_mode=talk_mode,
+                echo_mode=echo_mode,
+                impairments=tuple(sorted(impairments)),
+            ))
+        else:
+            plans.append(SequencePlan(
+                sequence_id=sequence_id,
+                n_chunks=n_chunks,
+                scenario=rng.choices(names, weights=probabilities, k=1)[0],
+                seed=sequence_seed,
+            ))
         total_sec += n_chunks * chunk_sec
         sequence_id += 1
     return plans
 
 
-def _scenario_weights(cfg: configparser.ConfigParser) -> Dict[str, float]:
+def _named_weights(cfg: configparser.ConfigParser, section: str,
+                   names: Sequence[str]) -> Dict[str, float]:
     weights = {}
-    for name in SCENARIOS:
-        value = cfg.getfloat('scenarios', f'p_{name}', fallback=0.0)
+    for name in names:
+        value = cfg.getfloat(section, f'p_{name}', fallback=0.0)
         if value < 0 or not math.isfinite(value):
-            raise ValueError(f"[scenarios] p_{name} must be finite and >= 0, got {value}")
+            raise ValueError(
+                f"[{section}] p_{name} must be finite and >= 0, got {value}")
         if value > 0:
             weights[name] = value
     if not weights:
-        raise ValueError("[scenarios] every probability is zero; nothing to generate")
-    missing = sorted(set(SCENARIOS) - set(weights))
+        raise ValueError(f"[{section}] every weight is zero; nothing to generate")
+    missing = sorted(set(names) - set(weights))
     if missing:
         # Not fatal -- an ablation corpus is a legitimate thing to want -- but a
-        # silently absent scenario is a hole nobody finds until evaluation.
-        print(f"  ⚠ zero-probability scenarios, absent from this corpus: {missing}")
+        # silently absent mode is a hole nobody finds until evaluation.
+        print(f"  ⚠ zero-probability [{section}] entries, absent from this "
+              f"corpus: {missing}")
     return weights
+
+
+def _probability(cfg: configparser.ConfigParser, section: str, key: str) -> float:
+    # No fallback: plan_sequences has already refused a layered config that
+    # omits any of these keys, so a default here could only mask that check.
+    value = cfg.getfloat(section, key)
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"[{section}] {key} must be in [0, 1], got {value}")
+    return value
+
+
+def resolve_sequence_plan(plan: SequencePlan) -> Tuple[str, str, Tuple[str, ...]]:
+    """Return ``(talk_mode, echo_mode, impairments)`` for new and old plans."""
+    if plan.talk_mode is not None:
+        talk_mode = plan.talk_mode
+        echo_mode = plan.echo_mode
+        impairments = tuple(plan.impairments)
+    else:
+        legacy = plan.scenario
+        talk_mode = legacy if legacy in TALK_MODES else 'duplex_random'
+        echo_mode = (legacy if legacy in ('ref_dropout', 'far_active_no_echo')
+                     else 'normal')
+        impairments = (legacy,) if legacy in IMPAIRMENTS else ()
+
+    if talk_mode not in TALK_MODES:
+        raise ValueError(f"unknown talk_mode {talk_mode!r}")
+    if echo_mode not in ECHO_MODES:
+        raise ValueError(f"unknown echo_mode {echo_mode!r}")
+    unknown = sorted(set(impairments) - set(IMPAIRMENTS))
+    if unknown:
+        raise ValueError(f"unknown impairments: {unknown}")
+    if talk_mode == 'near_only' and echo_mode != 'normal':
+        raise ValueError(f"near_only cannot use echo_mode={echo_mode}")
+    if echo_mode == 'far_active_no_echo' and (
+            set(impairments) & ECHO_PATH_IMPAIRMENTS):
+        raise ValueError(
+            "far_active_no_echo cannot carry echo-path impairments")
+    return talk_mode, echo_mode, tuple(sorted(set(impairments)))
 
 
 # ============================================================
@@ -673,10 +888,9 @@ class AecSequenceRenderer:
 
         self.sr = cfg.getint('signal', 'sr')
 
-        # Stamped into every chunk's metadata so --resume can tell "this
-        # sequence was rendered under the config this run is using" apart
-        # from "it merely has the right chunk count" -- see
-        # _sequence_is_complete in gen_aec_dataset.py.
+        # Kept in the in-process audit metadata. The WAV-only corpus does not
+        # persist this value, so gen_aec_dataset.py's --resume can validate
+        # shape/encoding but cannot use it to identify an earlier render.
         self.config_hash = config_hash(cfg)
 
         self.linear_aec_contract: LinearAecContract = (
@@ -736,7 +950,8 @@ class AecSequenceRenderer:
         return self._load_rir_pair(path)[1]
 
     def _render_talker(self, runs: Sequence[Tuple[int, int]], n_samples: int,
-                       rng: random.Random, pool: Sequence[str]
+                       rng: random.Random, pool: Sequence[str],
+                       *, loop: bool = False
                        ) -> Tuple[torch.Tensor, List[str]]:
         """Place whole utterances inside the active runs, drawn from ``pool``.
 
@@ -747,6 +962,11 @@ class AecSequenceRenderer:
         ``pool`` is which speech corpus to draw from -- ``self.pools.far_speech_files``
         for the far-end talker, ``self.pools.speech_files`` for the near-end one.
         They are the same list unless ``[paths] far_speech_dir`` is configured.
+
+        ``loop`` repeats a drawn file that is shorter than its run instead of
+        zero-padding it.  Off for conversational talkers, where a run that
+        outlasts its utterance SHOULD fall silent; on only where the run's
+        whole purpose is that the signal never stops (far_active_no_echo).
         """
         out = torch.zeros(n_samples)
         used: List[str] = []
@@ -757,7 +977,7 @@ class AecSequenceRenderer:
                 continue
             path = pool[rng.randrange(len(pool))]
             try:
-                segment = self._load_audio(path, rng, length, loop=False)
+                segment = self._load_audio(path, rng, length, loop=loop)
             except Exception:
                 continue
             ramp = torch.linspace(0.0, 1.0, fade)
@@ -833,13 +1053,15 @@ class AecSequenceRenderer:
         rng = random.Random(plan.seed)
         n_chunks = plan.n_chunks
         n_samples = n_chunks * self.chunk_samples
-        scenario = plan.scenario
+        talk_mode, echo_mode, impairments_tuple = resolve_sequence_plan(plan)
+        impairments = frozenset(impairments_tuple)
+        legacy_scenario = plan.scenario if plan.talk_mode is None else None
 
         # --- sources -------------------------------------------------------
         device = self.devices[self.pools.devices[rng.randrange(len(self.pools.devices))]]
-        if scenario == 'nonlinear_spk':
-            # The scenario IS strong distortion, so drawing a linear device
-            # would make the label a lie a consumer cannot detect.
+        if 'nonlinear_spk' in impairments:
+            # This impairment IS strong distortion, so drawing a linear
+            # device would make the plan a lie a consumer cannot detect.
             distorting = sorted(
                 (d for d in self.devices.values() if d.nonlinear != 'linear'),
                 key=lambda d: d.device_id,
@@ -848,7 +1070,7 @@ class AecSequenceRenderer:
                 device = distorting[rng.randrange(len(distorting))]
 
         room_pool = self.pools.rooms
-        if scenario == 'echo_path_change':
+        if 'echo_path_change' in impairments:
             # The post-change RIR (_pick_path_change_rir below) must stay in
             # this same room -- see the invariant note just below -- so this
             # scenario may only draw a room that actually has a second RIR
@@ -874,27 +1096,47 @@ class AecSequenceRenderer:
         near_pool = [p for p in room_rirs if p != echo_rir_path] or room_rirs
         near_rir_path = near_pool[rng.randrange(len(near_pool))]
 
-        has_far = scenario != 'near_only'
-        has_near = scenario != 'far_only'
+        has_far = talk_mode != 'near_only'
+        has_near = talk_mode != 'far_only'
 
         # --- talker activity -----------------------------------------------
-        far_runs = activity_runs(
-            n_samples, sr,
-            cfg.getfloat('activity', 'far_talk_sec_mean'),
-            cfg.getfloat('activity', 'far_gap_sec_mean'),
-            rng, start_active=True,
-        ) if has_far else []
+        if echo_mode == 'far_active_no_echo':
+            # This is a hard negative for the adaptive filter/model, not an
+            # ordinary conversation label. Keep the reference scheduled over
+            # the whole parent sequence so every future chunk actually tests
+            # "far present, echo absent" instead of spending part of this
+            # scarce class on an ordinary silent-reference interval.
+            far_runs = _contiguous_runs(
+                n_samples, sr,
+                cfg.getfloat('activity', 'far_talk_sec_mean'), rng)
+        else:
+            far_runs = activity_runs(
+                n_samples, sr,
+                cfg.getfloat('activity', 'far_talk_sec_mean'),
+                cfg.getfloat('activity', 'far_gap_sec_mean'),
+                rng, start_active=True,
+            ) if has_far else []
         near_runs = activity_runs(
             n_samples, sr,
             cfg.getfloat('activity', 'near_talk_sec_mean'),
             cfg.getfloat('activity', 'near_gap_sec_mean'),
             rng,
         ) if has_near else []
-        if scenario == 'double_talk' and far_runs:
-            near_runs = _force_overlap(far_runs, near_runs, rng, sr, cfg)
+        if talk_mode == 'double_talk' and far_runs:
+            # Set test first: it rejects ~98% of double_talk sequences for a
+            # fraction of what parsing the config value costs.
+            force_edges = (
+                DT_STRESS_IMPAIRMENTS <= impairments
+                and cfg.getboolean(
+                    'activity', 'dt_force_edge_overlap', fallback=False)
+            )
+            near_runs = _force_overlap(
+                far_runs, near_runs, rng, sr, cfg, force_edges=force_edges)
 
         far_speech, far_paths = (
-            self._render_talker(far_runs, n_samples, rng, self.pools.far_speech_files)
+            self._render_talker(far_runs, n_samples, rng,
+                                self.pools.far_speech_files,
+                                loop=echo_mode == 'far_active_no_echo')
             if has_far else (torch.zeros(n_samples), []))
         near_dry, near_paths = (
             self._render_talker(near_runs, n_samples, rng, self.pools.speech_files)
@@ -909,7 +1151,7 @@ class AecSequenceRenderer:
         # Reference dropout, chosen as WHOLE chunks so that a chunk labelled
         # 'ref_dropout' is unambiguously an idle chunk.
         dropout_chunks = set()
-        if scenario == 'ref_dropout' and has_far and n_chunks > 1:
+        if echo_mode == 'ref_dropout' and has_far and n_chunks > 1:
             hi = min(cfg.getint('dropout', 'ref_dropout_chunks_max'), n_chunks - 1)
             lo = min(cfg.getint('dropout', 'ref_dropout_chunks_min'), hi)
             count = rng.randint(max(1, lo), max(1, hi))
@@ -922,7 +1164,7 @@ class AecSequenceRenderer:
         # --- the played signal (what the loudspeaker actually radiates) -----
         played = far_render
         sro_ppm = 0.0
-        if scenario == 'codec_mismatch':
+        if 'codec_mismatch' in impairments:
             candidates = [int(v) for v in cfg.get('codec', 'source_sr_values').split(',')
                           if v.strip() and int(v) < sr]
             if candidates:
@@ -935,7 +1177,7 @@ class AecSequenceRenderer:
                                 cfg.getint('codec', 'bits_max')))
 
         drive = device.drive
-        if scenario == 'nonlinear_spk':
+        if 'nonlinear_spk' in impairments:
             drive *= cfg.getfloat('devices', 'nonlinear_spk_drive_boost')
         played = apply_loudspeaker_nonlinearity(played, device.nonlinear, drive)
 
@@ -953,7 +1195,7 @@ class AecSequenceRenderer:
                 q_min=cfg.getfloat('devices', 'biquad_q_min'),
                 q_max=cfg.getfloat('devices', 'biquad_q_max'))
 
-        if scenario == 'sro':
+        if 'sro' in impairments:
             sro_ppm = rng.uniform(cfg.getfloat('sro', 'ppm_min'),
                                   cfg.getfloat('sro', 'ppm_max'))
             if rng.random() < 0.5:
@@ -966,13 +1208,13 @@ class AecSequenceRenderer:
         bulk_delay = rng.randint(
             int(sr * cfg.getfloat('echo_path', 'bulk_delay_ms_min') / 1000),
             int(sr * cfg.getfloat('echo_path', 'bulk_delay_ms_max') / 1000))
-        delay_jitter = scenario == 'delay_jitter'
+        delay_jitter = 'delay_jitter' in impairments
         played = (_apply_jittered_delay(played, bulk_delay, sr, rng, cfg)
                   if delay_jitter else delay_signal(played, bulk_delay))
 
         # --- echo path -----------------------------------------------------
         switch_chunk = -1
-        if scenario == 'echo_path_change':
+        if 'echo_path_change' in impairments:
             second_path = _pick_path_change_rir(room_rirs, echo_rir_path, rng)
             switch = self._switch_point(n_chunks, rng)
             echo_raw = _crossfade(
@@ -1013,10 +1255,10 @@ class AecSequenceRenderer:
                              cfg.getfloat('levels', 'erl_db_max'))
         echo = _scale_to_ratio(echo, far_render, sr, -erl_db)
 
-        if scenario == 'far_active_no_echo':
-            # Near-end single talk with the far end playing: a reference at
-            # full level and no acoustic path back to this microphone.  Every
-            # other scenario ties echo to far_render through erl_db, whose
+        if echo_mode == 'far_active_no_echo':
+            # A reference at full level and no acoustic path back to this
+            # microphone; near-end speech may independently be present. Every
+            # normal-echo plan ties echo to far_render through erl_db, whose
             # range stops at 30 dB, so the quietest echo the corpus could
             # otherwise produce still sits only ser_db_max below the near
             # speech -- around 25 dB short of what a real headset or a muted
@@ -1094,7 +1336,8 @@ class AecSequenceRenderer:
         clipped = False
         agc = False
         mic_postclip = mic_preclip.clone()
-        if scenario == 'clipping_agc' or rng.random() < cfg.getfloat('mic', 'p_clipping'):
+        if ('clipping_agc' in impairments
+                or rng.random() < cfg.getfloat('mic', 'p_clipping')):
             # apply_clipping() also returns the sampled clip_snr (added for
             # AINR's own per-sample metadata) -- this caller already tracks
             # a separate `clipped` boolean, not the exact sampled value.
@@ -1103,7 +1346,8 @@ class AecSequenceRenderer:
                 cfg.getfloat('mic', 'clip_snr_min'),
                 cfg.getfloat('mic', 'clip_snr_max'))
             clipped = True
-        if scenario == 'clipping_agc' or rng.random() < cfg.getfloat('mic', 'p_agc'):
+        if ('clipping_agc' in impairments
+                or rng.random() < cfg.getfloat('mic', 'p_agc')):
             mic_postclip = apply_agc(
                 mic_postclip, sr,
                 cfg.getfloat('mic', 'agc_target_dbfs'),
@@ -1154,6 +1398,11 @@ class AecSequenceRenderer:
                     snr_db, bulk_delay, delay_jitter, sro_ppm, clipped, agc,
                     dropout_chunks, switch_chunk, noise_ids,
                     near_speaker, far_speaker) -> List[dict]:
+        # Re-derived from `plan` rather than threaded down as four more
+        # positional arguments: resolve_sequence_plan is pure and O(1), and
+        # this call already carries enough of them to align by eye.
+        talk_mode, echo_mode, impairments = resolve_sequence_plan(plan)
+        legacy_scenario = plan.scenario if plan.talk_mode is None else None
         # ⚠ ser_db / snr_db / erl_db are SEQUENCE-level: they describe how the
         # parent sequence was set up, measured over its whole duration.  A
         # single 4 s chunk can depart from them by several dB (ERL) or by
@@ -1189,32 +1438,41 @@ class AecSequenceRenderer:
                 'nonlinear': device.nonlinear,
                 'clipped': bool(clipped),
                 'agc': bool(agc),
+                'talk_mode': talk_mode,
+                'echo_mode': echo_mode,
+                'impairments': list(impairments),
+                'echo_path_change': 'echo_path_change' in impairments,
+                'codec_mismatch': 'codec_mismatch' in impairments,
                 'manifest_version': self.pools.manifest_version,
                 'linear_aec_contract_hash': self.linear_aec_contract.fingerprint(),
                 'config_hash': self.config_hash,
-                # config_hash alone does not identify a render: --seed lives
-                # outside config.ini, so a --seed change reshuffles which
-                # scenario/seed plan_sequences() hands each sequence_id
-                # without touching config_hash at all. gen_aec_dataset.py's
-                # _sequence_is_complete compares these against the CURRENT
-                # plan for this sequence_id to catch that case on --resume.
+                # config_hash alone would not identify a render: --seed lives
+                # outside config.ini, so sequence_seed is recorded beside it.
+                # Both fields are in-process audit data only; neither is
+                # persisted in the WAV-only corpus or checked by --resume.
                 'sequence_seed': int(plan.seed),
                 'scenario': _chunk_scenario(
-                    plan.scenario, chunk_index, dropout_chunks, switch_chunk,
+                    echo_mode, legacy_scenario,
+                    chunk_index, dropout_chunks, switch_chunk,
                     far_active=float(far[window].pow(2).mean().sqrt()) > threshold,
                     near_active=float(near[window].pow(2).mean().sqrt()) > threshold,
                 ),
+                # Compatibility summary. New consumers must use the
+                # orthogonal fields above rather than infer combinations from
+                # this one string.
                 'sequence_scenario': plan.scenario,
                 'split': self.pools.split,
             })
         return meta
 
 
-def _chunk_scenario(sequence_scenario: str, chunk_index: int, dropout_chunks,
-                    switch_chunk: int, far_active: bool, near_active: bool) -> str:
+def _chunk_scenario(echo_mode: str,
+                    legacy_scenario: Optional[str], chunk_index: int,
+                    dropout_chunks, switch_chunk: int, far_active: bool,
+                    near_active: bool) -> str:
     """Per-chunk label, which is not always the sequence's label.
 
-    ⚠ A 40 s 'ref_dropout' sequence is mostly NOT a dropout, and an
+    ⚠ A 'ref_dropout' parent sequence is mostly NOT a dropout, and an
     'echo_path_change' sequence contains exactly one chunk where the path
     changes.  Labelling every chunk with the sequence's intent would make the
     honest test "every ref_dropout clip has a silent reference" fail, and would
@@ -1227,8 +1485,18 @@ def _chunk_scenario(sequence_scenario: str, chunk_index: int, dropout_chunks,
         return 'ref_dropout'
     if chunk_index == switch_chunk:
         return 'echo_path_change'
-    if sequence_scenario in WHOLE_SEQUENCE_SCENARIOS:
-        return sequence_scenario
+    # Measured, not asserted: this label claims the reference IS playing, so a
+    # chunk whose far end is actually silent must fall through and be labelled
+    # by what it contains.  Otherwise a scheduling regression upstream would
+    # keep emitting the label over a silent reference -- signal-identical to a
+    # 'ref_dropout' chunk, and contradicting it.
+    if echo_mode == 'far_active_no_echo' and far_active:
+        return 'far_active_no_echo'
+    # Preserve old direct-plan diagnostics exactly. In a layered corpus the
+    # physical conditions live in ``impairments`` and this label is reserved
+    # for the actual speech activity of the chunk.
+    if legacy_scenario in WHOLE_SEQUENCE_SCENARIOS:
+        return legacy_scenario
     if far_active and near_active:
         return 'double_talk'
     if far_active:
@@ -1236,20 +1504,43 @@ def _chunk_scenario(sequence_scenario: str, chunk_index: int, dropout_chunks,
     return 'near_only'
 
 
-def _force_overlap(far_runs, near_runs, rng, sr, cfg):
-    """Guarantee genuine double talk instead of hoping two chains collide."""
+def _force_overlap(far_runs, near_runs, rng, sr, cfg, *, force_edges=False):
+    """Guarantee genuine double talk instead of hoping two chains collide.
+
+    The first and last far bursts are optionally load-bearing. They expose the
+    model to DT while the frozen linear AEC is cold and again after its state
+    has matured, matching the two failure positions that random middle-only
+    overlap used to miss.
+    """
     overlap_p = cfg.getfloat('activity', 'dt_overlap_p')
     frac_min = cfg.getfloat('activity', 'dt_overlap_frac_min')
     frac_max = cfg.getfloat('activity', 'dt_overlap_frac_max')
     added = list(near_runs)
-    for start, end in far_runs:
-        if rng.random() >= overlap_p:
+    floor = int(sr * 0.2)
+    last_index = len(far_runs) - 1
+    for index, (start, end) in enumerate(far_runs):
+        edge = force_edges and index in (0, last_index)
+        if not edge and rng.random() >= overlap_p:
             continue
         length = end - start
         window = int(length * rng.uniform(frac_min, frac_max))
-        if window < int(sr * 0.2):
+        if edge:
+            # A forced edge is a guarantee, so a short draw is widened rather
+            # than dropped, and a burst too short to reach the floor is covered
+            # whole instead of skipped. Applying the floor here as a `continue`
+            # silently cost ~21% of stress-combo sequences at least one of
+            # their two edges, while the config and README promised both.
+            window = max(window, min(length, floor))
+        elif window < floor:
             continue
-        offset = rng.randint(0, length - window)
+        if edge and index == 0:
+            # The far activity chain starts at sample zero. Pinning this
+            # overlap to its leading edge creates a real cold-start DT case.
+            offset = 0
+        elif edge and index == last_index:
+            offset = length - window
+        else:
+            offset = rng.randint(0, length - window)
         added.append((start + offset, start + offset + window))
     return _merge_runs(added)
 

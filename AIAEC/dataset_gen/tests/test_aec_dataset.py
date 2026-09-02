@@ -14,6 +14,7 @@ import configparser
 import dataclasses
 import math
 import pathlib
+import random
 import re
 
 import numpy as np
@@ -39,11 +40,16 @@ from AIAEC.dataset_gen import (
     stft,
 )
 from AIAEC.dataset_gen.aec_dataset import (
+    ACTIVITY_LABEL_DBFS,
     AecSequenceRenderer,
     SequencePlan,
+    _chunk_scenario,
+    _force_overlap,
+    _normalised,
     check_rate_dependent_values,
     chunk_samples_from_config,
     plan_sequences,
+    resolve_sequence_plan,
     resample_by_ratio,
     stable_seed,
 )
@@ -148,7 +154,7 @@ def corpus(tmp_path_factory):
     cfg = _base_cfg(root)
     cfg.set('split', 'val_fraction', '0.25')
     # Boosted so the small corpus reliably contains the load-bearing scenario.
-    cfg.set('scenarios', 'p_ref_dropout', '0.30')
+    cfg.set('echo_modes', 'p_ref_dropout', '0.30')
 
     config_path = root / 'config.ini'
     with open(config_path, 'w') as handle:
@@ -625,7 +631,7 @@ def test_far_active_no_echo_has_a_loud_reference_and_no_echo(corpus):
 def test_ref_dropout_sequences_keep_active_chunks_too(corpus):
     """A dropout sequence must not be labelled dropout end to end.
 
-    Rendered directly so the scenario is forced: a 40 s ref_dropout sequence is
+    Rendered directly so the scenario is forced: a ref_dropout parent is
     mostly NOT a dropout, and labelling all of it 'ref_dropout' would both fail
     the test above and train the idle term on active chunks.
     """
@@ -850,6 +856,277 @@ def test_plan_is_stable_across_hours(corpus):
     assert long[:len(short)] == short
 
 
+def test_layered_plan_rejects_invalid_probabilities(corpus):
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('echo_modes', 'p_ref_dropout', '0.7')
+    cfg.set('echo_modes', 'p_far_active_no_echo', '0.4')
+    with pytest.raises(ValueError, match=r'p_ref_dropout .* must be <= 1'):
+        plan_sequences(cfg, 0.001, SEED, 'train')
+
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('impairments', 'p_sro', '1.01')
+    with pytest.raises(ValueError, match=r'p_sro must be in \[0, 1\]'):
+        plan_sequences(cfg, 0.001, SEED, 'train')
+
+    cfg = copy.deepcopy(corpus['cfg'])
+    for name in ('far_only', 'near_only', 'double_talk', 'duplex_random'):
+        cfg.set('talk_modes', f'p_{name}', '0')
+    with pytest.raises(ValueError, match='every weight is zero'):
+        plan_sequences(cfg, 0.001, SEED, 'train')
+
+
+def test_layered_plan_composes_dt_path_nonlinearity_and_capture(corpus):
+    """The difficult intersection must be constructible, not four labels.
+
+    The old categorical planner could draw exactly one of double_talk,
+    echo_path_change, nonlinear_spk and clipping_agc.  Forcing only the
+    conditional combo here pins the new contract and its metadata together.
+    """
+    cfg = copy.deepcopy(corpus['cfg'])
+    for name in ('far_only', 'near_only', 'duplex_random'):
+        cfg.set('talk_modes', f'p_{name}', '0')
+    cfg.set('talk_modes', 'p_double_talk', '1')
+    cfg.set('echo_modes', 'p_ref_dropout', '0')
+    cfg.set('echo_modes', 'p_far_active_no_echo', '0')
+    for name in ('echo_path_change', 'nonlinear_spk', 'clipping_agc',
+                 'delay_jitter', 'sro', 'codec_mismatch'):
+        cfg.set('impairments', f'p_{name}', '0')
+    cfg.set('complex_cases', 'p_dt_stress_combo', '1')
+
+    plan = plan_sequences(cfg, 0.001, SEED, 'train')[0]
+    talk_mode, echo_mode, impairments = resolve_sequence_plan(plan)
+    assert talk_mode == 'double_talk'
+    assert echo_mode == 'normal'
+    assert {'echo_path_change', 'nonlinear_spk', 'clipping_agc'} <= set(
+        impairments)
+
+    rendered = AecSequenceRenderer(
+        cfg, pools_for_split(corpus['manifest'], 'train'),
+        corpus_seed=SEED).render(plan)
+    for meta in rendered.chunk_meta:
+        assert meta['talk_mode'] == 'double_talk'
+        assert meta['echo_mode'] == 'normal'
+        assert {'echo_path_change', 'nonlinear_spk', 'clipping_agc'} <= set(
+            meta['impairments'])
+        assert meta['echo_path_change']
+        assert meta['clipped'] and meta['agc']
+        assert meta['nonlinear'] != 'linear'
+
+
+def test_no_echo_plan_strips_echo_path_impairments_but_keeps_capture(corpus):
+    """A no-echo sequence cannot claim an RIR/SRO/nonlinearity event."""
+    cfg = copy.deepcopy(corpus['cfg'])
+    for name in ('far_only', 'near_only', 'duplex_random'):
+        cfg.set('talk_modes', f'p_{name}', '0')
+    cfg.set('talk_modes', 'p_double_talk', '1')
+    cfg.set('echo_modes', 'p_ref_dropout', '0')
+    cfg.set('echo_modes', 'p_far_active_no_echo', '1')
+    for name in ('echo_path_change', 'nonlinear_spk', 'clipping_agc',
+                 'delay_jitter', 'sro', 'codec_mismatch'):
+        cfg.set('impairments', f'p_{name}', '1')
+    cfg.set('complex_cases', 'p_dt_stress_combo', '1')
+
+    plan = plan_sequences(cfg, 0.001, SEED, 'train')[0]
+    talk_mode, echo_mode, impairments = resolve_sequence_plan(plan)
+    assert talk_mode == 'double_talk'
+    assert echo_mode == 'far_active_no_echo'
+    assert impairments == ('clipping_agc',)
+
+    rendered = AecSequenceRenderer(
+        cfg, pools_for_split(corpus['manifest'], 'train'),
+        corpus_seed=SEED).render(plan)
+    view = AecStems(rendered.stems)
+    assert float(view.far_render.abs().max()) > 0.0
+    assert float(rendered.audit['echo'].abs().max()) == 0.0
+    for chunk_index, meta in enumerate(rendered.chunk_meta):
+        window = slice(chunk_index * rendered.chunk_samples,
+                       (chunk_index + 1) * rendered.chunk_samples)
+        assert float(view.far_render[window].abs().max()) > 0.0
+        assert meta['echo_mode'] == 'far_active_no_echo'
+        assert meta['scenario'] == 'far_active_no_echo'
+
+
+def test_no_echo_far_reference_never_runs_out_on_a_long_sequence(corpus):
+    """The hard negative must stay far-ACTIVE in every chunk it labels.
+
+    ⚠ The module fixture writes speech files LONGER than its tiny sequences,
+    so no other test here can see this: `_render_talker` draws ONE pool file
+    per run and `_load_audio(loop=False)` zero-pads a file shorter than its
+    run, so a single whole-sequence far run goes silent after one utterance.
+    Those chunks are X == 0 and D == 0 -- signal-identical to `ref_dropout` --
+    and would still carry the `far_active_no_echo` label. This test makes the
+    sequence LONGER than any source file, which is the production shape
+    (20-30 s sequences, single-digit-second utterances).
+    """
+    cfg = copy.deepcopy(corpus['cfg'])
+    for name in ('far_only', 'near_only', 'duplex_random'):
+        cfg.set('talk_modes', f'p_{name}', '0')
+    cfg.set('talk_modes', 'p_double_talk', '1')
+    cfg.set('echo_modes', 'p_ref_dropout', '0')
+    cfg.set('echo_modes', 'p_far_active_no_echo', '1')
+    # 8.192 s of sequence against the fixture's 4 s speech files.
+    cfg.set('sequence', 'seq_sec_min', '8.192')
+    cfg.set('sequence', 'seq_sec_max', '8.192')
+
+    renderer = AecSequenceRenderer(
+        cfg, pools_for_split(corpus['manifest'], 'train'), corpus_seed=SEED)
+    checked = 0
+    for plan in plan_sequences(cfg, 0.01, SEED, 'train')[:2]:
+        rendered = renderer.render(plan)
+        assert rendered.chunk_samples * len(rendered.chunk_meta) > 4 * SR, (
+            "this test is only meaningful while the sequence outlasts the "
+            "fixture's source files")
+        view = AecStems(rendered.stems)
+        assert float(rendered.audit['echo'].abs().max()) == 0.0
+        for index, meta in enumerate(rendered.chunk_meta):
+            window = slice(index * rendered.chunk_samples,
+                           (index + 1) * rendered.chunk_samples)
+            rms = float(view.far_render[window].pow(2).mean().sqrt())
+            assert rms > 10.0 ** (ACTIVITY_LABEL_DBFS / 20.0), (
+                f"chunk {index} reference fell silent (rms {rms:.2e}); the "
+                f"class degenerated into a silent-reference interval")
+            assert meta['scenario'] == 'far_active_no_echo'
+            checked += 1
+    assert checked >= 8
+
+
+def test_layered_plan_requires_every_layer_section_and_option(corpus):
+    """A missing section or option must not become a silent corpus change.
+
+    configparser returns the fallback for an absent SECTION exactly as for an
+    absent option, so a layered config without [impairments] would render a
+    full, plausible, impairment-free corpus and say nothing about it.
+    """
+    for section in ('talk_modes', 'echo_modes', 'impairments',
+                    'complex_cases'):
+        cfg = copy.deepcopy(corpus['cfg'])
+        cfg.remove_section(section)
+        with pytest.raises(ValueError, match=re.escape(f'[{section}]')):
+            plan_sequences(cfg, 0.001, SEED, 'train')
+
+    required = {
+        'talk_modes': tuple(f'p_{name}' for name in
+                            ('far_only', 'near_only', 'double_talk',
+                             'duplex_random')),
+        'echo_modes': ('p_ref_dropout', 'p_far_active_no_echo'),
+        'impairments': tuple(f'p_{name}' for name in
+                             ('echo_path_change', 'nonlinear_spk',
+                              'clipping_agc', 'delay_jitter', 'sro',
+                              'codec_mismatch')),
+        'complex_cases': ('p_dt_stress_combo',),
+    }
+    for section, options in required.items():
+        for option in options:
+            cfg = copy.deepcopy(corpus['cfg'])
+            assert cfg.remove_option(section, option)
+            with pytest.raises(ValueError, match=re.escape(
+                    f'[{section}] {option}')):
+                plan_sequences(cfg, 0.001, SEED, 'train')
+
+
+def test_far_active_no_echo_chunk_label_is_measured_for_legacy_plans():
+    """The compatibility path must not restore a label the signal disproves."""
+    common = dict(
+        echo_mode='far_active_no_echo',
+        legacy_scenario='far_active_no_echo', chunk_index=0,
+        dropout_chunks=set(), switch_chunk=-1,
+    )
+    assert _chunk_scenario(
+        **common, far_active=False, near_active=True) == 'near_only'
+    assert _chunk_scenario(
+        **common, far_active=True, near_active=True) == 'far_active_no_echo'
+
+
+def test_impairments_are_drawn_independently_of_one_another(corpus):
+    """Every impairment owns its own seed.
+
+    One shared draw across the loop would make them perfectly NESTED -- the
+    rarer impairment could never occur without every commoner one -- so the
+    co-occurrence this whole layered planner exists to create would collapse
+    to a chain. Two fair coins must produce all four combinations.
+    """
+    cfg = copy.deepcopy(corpus['cfg'])
+    for name in ('far_only', 'near_only', 'duplex_random'):
+        cfg.set('talk_modes', f'p_{name}', '0')
+    cfg.set('talk_modes', 'p_double_talk', '1')
+    cfg.set('echo_modes', 'p_ref_dropout', '0')
+    cfg.set('echo_modes', 'p_far_active_no_echo', '0')
+    cfg.set('complex_cases', 'p_dt_stress_combo', '0')
+    for name in ('echo_path_change', 'clipping_agc', 'delay_jitter',
+                 'codec_mismatch'):
+        cfg.set('impairments', f'p_{name}', '0')
+    cfg.set('impairments', 'p_sro', '0.5')
+    cfg.set('impairments', 'p_nonlinear_spk', '0.5')
+
+    seen = {resolve_sequence_plan(plan)[2]
+            for plan in plan_sequences(cfg, 0.5, SEED, 'train')}
+    assert seen == {(), ('sro',), ('nonlinear_spk',),
+                    ('nonlinear_spk', 'sro')}, sorted(seen)
+
+
+def test_forced_edge_overlap_survives_the_minimum_window(corpus):
+    """A forced edge is a guarantee, so a short draw widens instead of skipping.
+
+    The 0.2 s floor is applied before the edge branch and used to `continue`,
+    which silently cost ~21% of stress-combo sequences at least one of their
+    two edges while the config and README promised both unconditionally.
+    Here every draw lands under the floor, so only the clamp can save them.
+    """
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('activity', 'dt_overlap_p', '1')
+    cfg.set('activity', 'dt_overlap_frac_min', '0.01')
+    cfg.set('activity', 'dt_overlap_frac_max', '0.01')
+    far_runs = [(0, SR), (2 * SR, 3 * SR), (4 * SR, 5 * SR)]
+
+    near_runs = _force_overlap(
+        far_runs, [], random.Random(7), SR, cfg, force_edges=True)
+
+    def overlaps(run):
+        return any(max(run[0], start) < min(run[1], end)
+                   for start, end in near_runs)
+
+    assert overlaps(far_runs[0]), "leading edge was dropped by the floor"
+    assert overlaps(far_runs[-1]), "trailing edge was dropped by the floor"
+    # A middle burst has no guarantee, so the floor still drops it.
+    assert not overlaps(far_runs[1])
+    assert near_runs[0][0] == 0
+    assert near_runs[-1][1] == far_runs[-1][1]
+
+    # A burst too SHORT to reach the floor at all is covered whole rather than
+    # skipped -- activity_runs' own minimum run is 0.15 s, below the 0.2 s
+    # floor, so this is a shape the shipped config really produces.
+    short = int(SR * 0.16)
+    edge_runs = [(0, short), (2 * SR, 2 * SR + short)]
+    near_short = _force_overlap(
+        edge_runs, [], random.Random(11), SR, cfg, force_edges=True)
+    assert any(max(0, s) < min(short, e) for s, e in near_short), \
+        "a sub-floor leading burst lost its guaranteed overlap"
+    assert any(max(edge_runs[1][0], s) < min(edge_runs[1][1], e)
+               for s, e in near_short), \
+        "a sub-floor trailing burst lost its guaranteed overlap"
+
+
+def test_dt_edge_overlap_covers_cold_start_and_mature_state(corpus):
+    """First and last far bursts receive near speech even when p=0."""
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('activity', 'dt_overlap_p', '0')
+    cfg.set('activity', 'dt_overlap_frac_min', '0.5')
+    cfg.set('activity', 'dt_overlap_frac_max', '0.5')
+    far_runs = [(0, SR), (2 * SR, 3 * SR), (4 * SR, 5 * SR)]
+    near_runs = _force_overlap(
+        far_runs, [], random.Random(7), SR, cfg, force_edges=True)
+
+    def overlaps(run):
+        return any(max(run[0], start) < min(run[1], end)
+                   for start, end in near_runs)
+
+    assert overlaps(far_runs[0])
+    assert not overlaps(far_runs[1])
+    assert overlaps(far_runs[-1])
+    assert near_runs[0][0] == 0
+    assert near_runs[-1][1] == far_runs[-1][1]
+
+
 def test_render_is_deterministic_and_order_independent(corpus):
     """Sequence 5 renders identically regardless of what was rendered first."""
     pools = pools_for_split(corpus['manifest'], 'train')
@@ -1057,6 +1334,49 @@ def test_the_documented_48k_recipe_is_complete_and_hop_exact():
     assert min(48000 / v for v in shipped_codec if v < 48000) == 4.0
     assert max(16000 / v for v in shipped_codec if v < 16000) == 2.0
     assert min(48000 / v for v in recipe_codec if v < 48000) == 1.5
+
+
+def test_the_48k_example_config_is_the_recipe_already_applied():
+    """`config.example.48k.ini` must BE `config.example.ini` + the recipe.
+
+    Shipping two configs means two places to forget, and every key the recipe
+    covers degrades SILENTLY when it is missed. So the 48 kHz file is not
+    trusted to have been edited correctly by hand: it is compared against the
+    16 kHz file with that file's OWN documented recipe applied, key by key.
+    A value changed in one file and not the other fails here, and so does a
+    recipe key left at the 16 kHz default.
+
+    ⚠ Comments are deliberately not compared. They are prose, and the
+    rate-specific ones (worked hop arithmetic, the loudspeaker band table)
+    legitimately differ; the VALUES are the contract.
+    """
+    directory = pathlib.Path(__file__).parents[1]
+    rate_48k = configparser.ConfigParser()
+    assert rate_48k.read(directory / 'config.example.48k.ini',
+                         encoding='utf-8'), "config.example.48k.ini is missing"
+
+    shipped = _example_config()
+    assert rate_48k.sections() == shipped.sections()
+    for section in shipped.sections():
+        assert set(rate_48k[section]) == set(shipped[section]), section
+
+    expected = _example_config()
+    for section, key, value in _documented_48k_recipe():
+        expected.set(section, key, value)
+    for section in expected.sections():
+        for key in expected[section]:
+            assert _normalised(rate_48k[section][key]) == _normalised(
+                expected[section][key]), f"[{section}] {key}"
+
+    # Not merely consistent with the 16 kHz file -- actually a config the
+    # generator accepts AT 48 kHz, on a grid the frozen PBFDKF supports and
+    # with a chunk that is a whole number of its hops.
+    check_rate_dependent_values(rate_48k)
+    contract = linear_aec_contract_from_config(rate_48k)
+    assert (contract.sample_rate, contract.frame_size, contract.hop_size) == (
+        48000, 1024, 512)
+    assert chunk_samples_from_config(
+        rate_48k, contract.hop_size) % contract.hop_size == 0
 
 
 def test_the_documented_48k_recipe_generates_and_packs_end_to_end(corpus, tmp_path):
@@ -1286,7 +1606,8 @@ def test_renderer_metadata_covers_the_declared_contract(corpus):
     required = {
         'sequence_id', 'chunk_index', 'speaker_id', 'noise_id', 'rir_id',
         'ser_db', 'snr_db', 'erl_db', 'bulk_delay_samples', 'delay_jitter',
-        'sro_ppm', 'nonlinear', 'clipped', 'scenario',
+        'sro_ppm', 'nonlinear', 'clipped', 'scenario', 'talk_mode',
+        'echo_mode', 'impairments', 'echo_path_change', 'codec_mismatch',
     }
     checked = 0
     for _plan, rendered in _render_plans(
@@ -1296,6 +1617,11 @@ def test_renderer_metadata_covers_the_declared_contract(corpus):
             assert required <= set(meta), f"missing {required - set(meta)}"
             assert meta['scenario'] in SCENARIOS
             assert meta['sequence_scenario'] in SCENARIOS
+            assert meta['talk_mode'] in ('far_only', 'near_only',
+                                         'double_talk', 'duplex_random')
+            assert meta['echo_mode'] in ('normal', 'ref_dropout',
+                                         'far_active_no_echo')
+            assert isinstance(meta['impairments'], list)
             assert isinstance(meta['sequence_seed'], int)
             assert isinstance(meta['delay_jitter'], bool)
             assert isinstance(meta['clipped'], bool)

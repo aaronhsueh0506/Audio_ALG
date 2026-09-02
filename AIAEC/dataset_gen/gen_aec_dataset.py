@@ -67,6 +67,7 @@ Then pack with pack_aec_dataset.py.
 """
 
 import argparse
+import collections
 import configparser
 import os
 import sys
@@ -88,11 +89,13 @@ if __package__ in (None, ''):
     __package__ = 'AIAEC.dataset_gen'
 
 from .aec_dataset import (  # noqa: E402
+    DT_STRESS_IMPAIRMENTS,
     AecSequenceRenderer,
     SequencePlan,
     check_rate_dependent_values,
     chunk_samples_from_config,
     plan_sequences,
+    resolve_sequence_plan,
 )
 from .aec_features import STEM_ORDER  # noqa: E402
 from .linear_aec import linear_aec_contract_from_config  # noqa: E402
@@ -405,7 +408,7 @@ def gen_aec_dataset(args):
     # --- the plan -----------------------------------------------------------
     planned_sec = sum(p.n_chunks for p in plans) * chunk_sec
 
-    if any(p.scenario == 'echo_path_change' for p in plans):
+    if any('echo_path_change' in resolve_sequence_plan(p)[2] for p in plans):
         # Fail before any worker starts rendering, not partway through a
         # multi-hour run whenever one happens to draw the first
         # echo_path_change sequence (AecSequenceRenderer checks this too, but
@@ -415,7 +418,8 @@ def gen_aec_dataset(args):
             raise ValueError(
                 "the plan includes 'echo_path_change' sequences but no room "
                 "in this split has >= 2 RIR files; add more RIRs per room or "
-                "set [scenarios] p_echo_path_change = 0"
+                "set [impairments] p_echo_path_change = 0 and "
+                "[complex_cases] p_dt_stress_combo = 0"
             )
 
     pending = _pending(
@@ -455,15 +459,40 @@ def gen_aec_dataset(args):
         for _done in iterator:
             pass
 
-    # Sequence-level scenario counts across the WHOLE plan, not just this run's
-    # pending slice, so a resumed run reports the corpus and not the remainder.
-    plan_counts = {}
+    # Layer counts across the WHOLE plan, not just this run's pending slice, so
+    # a resumed run reports the corpus and not the remainder. Reporting each
+    # axis separately is load-bearing: one categorical "scenario" count would
+    # hide whether the difficult intersections actually exist.
+    talk_counts = collections.Counter()
+    echo_counts = collections.Counter()
+    impairment_counts = collections.Counter()
+    # Label -> the impairment set a double_talk plan must contain to count.
+    # The full combo is DT_STRESS_IMPAIRMENTS itself, so the census cannot
+    # drift from what [complex_cases] p_dt_stress_combo actually forces.
+    dt_combos = {'dt+path_change': {'echo_path_change'},
+                 'dt+nonlinear': {'nonlinear_spk'},
+                 'dt+clipping_agc': {'clipping_agc'},
+                 'dt+path_change+nonlinear+clipping_agc':
+                     DT_STRESS_IMPAIRMENTS}
+    combo_counts = dict.fromkeys(dt_combos, 0)
     for plan in plans:
-        plan_counts[plan.scenario] = plan_counts.get(plan.scenario, 0) + 1
+        talk_mode, echo_mode, impairments = resolve_sequence_plan(plan)
+        impairment_set = set(impairments)
+        talk_counts[talk_mode] += 1
+        echo_counts['not_applicable'
+                    if talk_mode == 'near_only' else echo_mode] += 1
+        impairment_counts.update(impairments)
+        if talk_mode == 'double_talk':
+            for label, needed in dt_combos.items():
+                if needed <= impairment_set:
+                    combo_counts[label] += 1
 
     print(f"\nDone. {len(plans)} sequences ({planned_sec / 3600:.3f} h) in "
           f"{seqs_dir}/, {(time.time() - started) / 60:.1f} min this run.")
-    print(f"  Sequence scenarios: {plan_counts}")
+    print(f"  Talk modes       : {dict(talk_counts)}")
+    print(f"  Echo modes       : {dict(echo_counts)}")
+    print(f"  Impairments      : {dict(impairment_counts)}")
+    print(f"  DT intersections : {combo_counts}")
     stale = stale_temp_files(seqs_dir)
     if stale:
         print(f"  ⚠ {len(stale)} leftover tmp.*.wav from an interrupted run "
