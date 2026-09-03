@@ -81,6 +81,11 @@ deployment_far_input_mode=aligned_far 分開記錄，避免誤認兩個 seam 相
 
 ## C 前後處理
 
+> 2026-09-03 已被取代：archive 改為依 configuration 分目錄（`make -C AIAEC
+> print-lib-path` 印出絕對路徑），成員另增 `ulcnet_prepost`、`deepvqe_prepost`
+> 與 `ulcnet_accelerator_adapter`；現況見 AIAEC/README.md「C pre/post-processing」。
+> 以下保留當時的盤點。
+
 AIAEC/build/libaiaec_prepost.a 提供：
 
 - aiaec_process.c/.h：Align-CRUSE 與 CAGCRN mask 合成及共通 STFT/WOLA

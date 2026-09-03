@@ -38,7 +38,7 @@ import json
 import os
 import re
 import sys
-from typing import Dict, List, NamedTuple, Tuple
+from typing import Dict, List, NamedTuple, Optional, Tuple
 
 import numpy as np
 import torch
@@ -219,6 +219,75 @@ _CONTROL_SEMANTICS = {
     'DeepVQE_S': 'complex_ccm_taps_host_applies_spectrum_ring',
     'CAGCRN': 'complex_mask_for_microphone_spectrum',
 }
+DEEPVQE_C_LAYOUT_VERSION = 1
+
+
+def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
+    """DeepVqePrepostDescriptor (DeepVQE_S/deepvqe_prepost.h), MEASURED off
+    the graph just built rather than restated by hand: the head's tap axes,
+    the conv and score history depths, the GRU shape, the alignment depth and
+    the state count all come from the boundary tensors, and the grid from the
+    model's own. A topology change therefore surfaces as a
+    deepvqe_prepost_descriptor_validate() refusal on the board, never as a
+    silently wrong binding."""
+    wrapper, inputs, input_names, _output_names, split = built
+    grid = wrapper.model.grid
+    shapes = {
+        name: tuple(int(size) for size in tensor.shape)
+        for name, tensor in zip(input_names, inputs)
+    }
+    head = tuple(int(size) for size in outputs[0].shape)
+    # The CCM taps: [1, 1, bins, time_order, freq_taps, 2].
+    if len(head) != 6 or head[2] != grid.n_freqs or head[5] != 2:
+        raise ValueError(
+            'DeepVQE_S head is not a [1,1,F,T,K,2] tap tensor: %r' % (head,))
+    h_gru = shapes['h_gru']                       # [1, layers, hidden]
+    conv = shapes['state_mic1_history']           # [1, C, history, F]
+    key_ring = shapes['state_align_key_ring']     # [1, sim, D, F2]
+    score = shapes['state_align_score_history']   # [1, sim, history, D]
+    # D is the one deployment parameter: both rings must agree on it, and
+    # with the depth the export was asked for.
+    depth = key_ring[2]
+    if score[3] != depth or alignment_depth(wrapper.model) != depth:
+        raise ValueError(
+            'DeepVQE_S alignment depth is inconsistent: key ring %d, score '
+            'history %d, model %d'
+            % (depth, score[3], alignment_depth(wrapper.model)))
+    return {
+        'layout_version': DEEPVQE_C_LAYOUT_VERSION,
+        'delay_depth': depth,
+        'sample_rate': int(grid.sample_rate),
+        'fft_size': int(grid.n_fft),
+        'hop_size': int(grid.hop_len),
+        'spectrum_bins': int(grid.n_freqs),
+        'time_order': head[3],
+        'freq_taps': head[4],
+        'conv_history_frames': conv[2],
+        'score_history_frames': score[2],
+        'gru_layers': h_gru[1],
+        'gru_hidden': h_gru[2],
+        'state_tensor_count': len(input_names) - split.signal_inputs,
+    }
+
+
+# Models with a C pre/post class, mapped to the function that measures that
+# class's descriptor. The layout version inside it is the class header's
+# *_PREPOST_LAYOUT_VERSION (the header is the source of truth; the class test
+# pins the two). A model absent here has no C class yet -- only the shared
+# aiaec_process.c helpers -- and its artifact carries neither
+# `state_layout_version` nor `c_descriptor`: ABSENT means "nothing on the C
+# side pins this boundary", and a present value is always real JSON (a None
+# would reach the ONNX props as the string "None").
+_C_DESCRIPTORS = {
+    'DeepVQE_S': _deepvqe_c_descriptor,
+}
+
+
+def c_descriptor(model_name: str, built, outputs) -> Optional[Dict[str, int]]:
+    """The compiled-ABI descriptor the model's C class validates, or None
+    for a model with no C class."""
+    measure = _C_DESCRIPTORS.get(model_name)
+    return None if measure is None else measure(built, outputs)
 
 
 def state_precision_policy(model_name: str) -> Dict[str, str]:
@@ -708,6 +777,10 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
         'checkpoint_max_delay_frames': checkpoint_depth,
         'production_streaming_equivalent': True,
     }
+    descriptor = c_descriptor(model_name, built, outputs)
+    if descriptor is not None:
+        metadata['state_layout_version'] = descriptor['layout_version']
+        metadata['c_descriptor'] = descriptor
     metadata['state_handoff'] = {
         input_name: output_name
         for input_name, output_name in zip(

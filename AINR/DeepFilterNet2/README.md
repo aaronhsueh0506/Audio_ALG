@@ -66,6 +66,20 @@ accelerator only needs to emit `(erb_mask, coefs, alpha)`. Run
 `make -C .. test-simd` to compare the default NEON path against the scalar
 reference; `make -C .. SIMD=0 test` forces the latter.
 
+`dfn2_prepost.h/.c` is the integrator's entry point: one opaque object that
+composes `dfn2_process.c` and `dfn2_model_io.c` (neither changes, so their
+standalone parity builds keep linking) behind the same lifecycle and per-hop
+shape as the AIAEC classes, described once in `../../AIAEC/README.md`
+("C pre/post-processing"). Specific to this one: `pre_process` returns 0 on
+the first hop (the graph needs its right-hand neighbour) and 1 after; the
+spectra at the `DFN2_IO_FREQ` boundary are torch.stft normalized=True on this
+48 kHz/1024 grid, so chaining an AIAEC spectrum in is a 32x scale error (the
+header's warning block); and the window is copied rather than borrowed
+because `DFN2State` embeds its table by value. Its gate is
+`../tests/test_dfn2_prepost_c.py`; `make -C .. lib` ships it in
+`libainr_prepost.a` (`make -C .. print-lib-path` prints the configuration-keyed
+location).
+
 Use `dfn2_compose_stream()` for the accelerator boundary, not the aligned
 `dfn2_compose()` reference. At wall frame `n`, the returned head describes
 `n-mask_lookahead`; the cascade can emit only after that head has also masked

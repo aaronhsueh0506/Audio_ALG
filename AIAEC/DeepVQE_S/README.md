@@ -48,6 +48,28 @@ so this implementation
 Early stopping is disabled for the 50-epoch campaign; validation continues to
 select `*_best.pth`.
 
+## C deployment boundary
+
+`deepvqe_prepost.h/.c` is the integrator's entry point: one opaque
+`DeepVqePrepost` composing the shared `aiaec_process.c` STFT/WOLA and the
+`deepvqe_process.c` CCM kernel (neither changes, so their standalone parity
+tests keep linking). The lifecycle and per-hop sequence shared by every
+class are described once, in `../README.md` ("C pre/post-processing").
+Specific to this one: the accelerator boundary is the exporter's exactly --
+raw RI `mic`/`far` in, CCM taps out, and the sixteen explicit state tensors
+in `DeepVqeStateId` order, held in two host-side banks that `frame_commit`
+swaps only after every tap and state element is finite -- and `frame_skip`
+FAILS CLOSED (mutes the frame): stream 0 is the raw microphone, so the
+pass-through identity a post-filter can take would emit the uncancelled
+echo here.
+
+The exporter writes `state_layout_version` (`DEEPVQE_PREPOST_LAYOUT_VERSION`)
+and a `c_descriptor` block measured from the built graph into the ONNX
+metadata and the sidecar JSON; a board feeds that block to
+`deepvqe_prepost_descriptor_validate()` before binding. The class gate is
+`../tests/test_deepvqe_prepost_c.py`, which also pins the header, the exporter
+table and the graph's state shapes to each other.
+
 ## ONNX and calibration
 
 ```bash

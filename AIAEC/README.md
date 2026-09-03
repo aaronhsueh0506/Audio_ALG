@@ -191,15 +191,42 @@ deployment supplies aligned_far.
 ## C pre/post-processing
 
     make -C AIAEC
+    make -C AIAEC print-lib-path
 
-This builds AIAEC/build/libaiaec_prepost.a.
+This builds libaiaec_prepost.a under AIAEC/build/simd<N>-<sig>/ -- outputs
+are keyed by configuration (SIMD, flags, compiler), so a SIMD=0 build never
+reuses SIMD=1 objects; print-lib-path prints the archive's absolute path for
+the current configuration. Members: ulcnet_process, ulcnet_model_io,
+ulcnet_prepost, ulcnet_accelerator_adapter, aiaec_process, deepvqe_process
+and deepvqe_prepost, one object each.
 
 | Model | Accelerator output | Host composition |
 |---|---|---|
-| Align-ULCNet | enhanced RI spectrum + delta state | WOLA + ulcnet_model_io_commit() |
+| Align-ULCNet | enhanced RI spectrum + delta state | `ulcnet_prepost` class (WOLA + ulcnet_model_io_commit()) |
 | Align-CRUSE | real mask | aiaec_apply_real_mask() |
-| DeepVQE-S | 3x3 complex CCM taps | deepvqe_ccm_process() |
+| DeepVQE-S | 3x3 complex CCM taps | `deepvqe_prepost` class (deepvqe_ccm_process()) |
 | CAGCRN | complex mask | aiaec_apply_complex_mask() |
+
+Align-ULCNet and DeepVQE-S each ship a pre/post *class*
+(`Align_ULCNet/ulcnet_prepost.h`, `DeepVQE_S/deepvqe_prepost.h`) that owns
+everything between the caller's audio and the accelerator's tensors behind
+one opaque object: `_get_mem_size`/`_init` on a caller pool or
+`_create`/`_destroy` on the heap, then per hop `pre_process` ->
+`frame_inputs` -> (accelerator) -> `frame_commit` or `frame_skip` ->
+`post_process`. Each is compiled once with the io mode fixed at init: TIME
+(hop in, hop out; the class runs the framing on the caller's `FftHandle`) or
+FREQ (spectrum in, spectrum out; for chaining behind the AEC/GSC seam, whose
+spectra are already in this center=False framing). Both AIAEC classes are one
+inference per hop from the first hop. The classes are a third TU on top of
+the two parity-tested files each composes, so those keep their own
+standalone parity tests; the class gates are
+`tests/test_ulcnet_prepost_c.py` and `tests/test_deepvqe_prepost_c.py`.
+DeepFilterNet2's class, `../AINR/DeepFilterNet2/dfn2_prepost.h`, has the same
+shape with two differences an integrator must know: its first hop returns 0
+(the graph needs its right-hand neighbour before it can run), and its
+spectra are torch.stft normalized=True on a 48 kHz/1024 grid, so chaining an
+AIAEC spectrum into it is a 32x scale error on a different grid -- see that
+header's warning block.
 
 Align-ULCNet CPU state/ring ownership is documented in
 Align_ULCNet/README.md and implemented by ulcnet_model_io.c/.h.

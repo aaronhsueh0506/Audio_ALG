@@ -132,6 +132,10 @@ accelerator. The production default enables AArch64 NEON.
 Use the same switch as the conventional stack to build the scalar reference:
 
 ```bash
+make lib                # libainr_prepost.a: DeepFilterNet2 + GTCRN C pre/post code
+                        # (RNNoise-ERB is built from RNNoise-ERB/ directly, no
+                        # archive); outputs are keyed by configuration --
+                        # `make print-lib-path` prints the absolute path
 make test-simd          # NEON and forced-scalar digest must match
 make SIMD=0 test        # scalar-only build
 make -C RNNoise-ERB SIMD=0 test

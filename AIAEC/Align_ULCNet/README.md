@@ -498,7 +498,20 @@ continues to own only STFT/WOLA and the high-level model callback.  Vendor NPU
 drivers and mono/4ch pipeline wiring are intentionally outside this model-side
 deliverable.
 
+`ulcnet_prepost.c/.h` is the pre/post *class* over those two files: one
+opaque `UlcnetPrepost` owning the framing states, the feature front end and
+the per-frame accelerator transaction, so an integrator never composes
+`ulcnet_process` and `ulcnet_model_io` by hand. The lifecycle and per-hop
+sequence shared by every class are described once, in `../README.md`
+("C pre/post-processing"). Specific to this one: the analysis is a
+center=False rolling window (one frame per hop from hop 0, bit-identical to
+the centered schedule's last frame per hop -- pinned by the class test), and
+`frame_skip` is the pass-through identity because stream 0 is a residual.
+Its gate is `tests/test_ulcnet_prepost_c.py`.
+
 `ulcnet_accelerator_adapter.c/.h` is the reusable bridge from this explicit
-state ABI to `UlcnetModel`. It is included in
-`AIAEC/build/libaiaec_prepost.a`; the mono and four-channel applications add
-only their board runtime callback and surrounding audio flow.
+state ABI to `UlcnetModel`; it drives an `ULCNET_IO_FREQ` instance of the
+class. It is included in `libaiaec_prepost.a` (`make -C AIAEC print-lib-path`);
+the mono and
+four-channel applications add only their board runtime callback and
+surrounding audio flow.
