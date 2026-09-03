@@ -840,19 +840,25 @@ can no longer be green over a suite that cannot start.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
 (re-measured on the current working tree, KISS backend, `make clean` first):
-`pipelines/mono_aec_nr_res` 78, `pipelines/mono_alignulcnet` 149,
+`pipelines/mono_aec_nr_res` 78, `pipelines/mono_alignulcnet` 150,
 `pipelines/4ch_aec_bf_nr_res` 502 (one-stop gate, re-measured 2026-09-03 the
 same way; also builds and runs the `4ch_alignulcnet` binaries, whose test
 prints a single `All audio_pipeline_4ch_ulcnet tests passed` line and no
 `PASS:` markers). Each additionally prints a small number of
 non-`PASS:` pass lines (static smokes, board-skeleton profiles, adapter).
 
-The two mono rows are still the 2026-08-31 measurement; the
-`4ch_aec_bf_nr_res` row was re-measured on 2026-09-03 after the 4-channel
-Align-ULCNet suite was rewritten for the direct GSC-spectrum path (identity
-E2E now compares against a reference the test synthesises from the spectra
-the model saw; a new error-branch impulse test reads that branch against the
-input).
+`mono_aec_nr_res` is still the 2026-08-31 measurement. `mono_alignulcnet`
+was re-checked 2026-09-03 (150, up from 149) against the pre-built NE10
+binaries in `pipelines/bin/`, not a fresh KISS `make clean` — its mono
+wrapper switched both analysis branches from the centered
+`ulcnet_analysis_push()` 0/2/1 schedule to the rolling
+`ulcnet_analysis_push_frame()` one-frame-per-hop schedule (layout v11 -> v12);
+no `PASS:`-marker-count-affecting logic is backend-conditional, so KISS should
+match but has not been independently re-run. The `4ch_aec_bf_nr_res` row was
+re-measured on 2026-09-03 after the 4-channel Align-ULCNet suite was
+rewritten for the direct GSC-spectrum path (identity E2E now compares against
+a reference the test synthesises from the spectra the model saw; a new
+error-branch impulse test reads that branch against the input).
 
 Pass/fail-only targets (no count): `AEC` `selftest`, `test-counter-saturation`,
 `test-process-context`, `test-shared-far-spec`, `test-shared-fft-handle`,

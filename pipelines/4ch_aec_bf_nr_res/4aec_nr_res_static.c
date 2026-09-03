@@ -18,7 +18,7 @@
  *
  * Usage:
  *   ./4aec_nr_res_static [aec-preset]
- *       [--nr-preset mild|balanced|aggressive]
+ *       [--nr-preset mild|moderate|balanced|aggressive]
  *       [--sample-rate 16000|48000] [--fft-size 256|512|1024]
  *       [--capture-proxy 0|1|2|3] [--legacy-amin] [--no-cng]
  *   ./4aec_nr_res_static --print-mem-size [same options]
@@ -48,19 +48,15 @@ static const char* preset_name(AecPreset p) {
     }
 }
 
+/* Name table lives beside the enum (lib/nr mmse_lsa_types.h); an unknown
+ * name keeps this tool's long-standing fallback to balanced. */
 static MmseLsaNrMode parse_nr_mode(const char* s) {
-    if (strcmp(s, "mild") == 0) return MMSE_LSA_NR_MILD;
-    if (strcmp(s, "aggressive") == 0)
-        return MMSE_LSA_NR_AGGRESSIVE;
-    return MMSE_LSA_NR_BALANCED;
+    int m = mmse_lsa_nr_mode_from_name(s);
+    return m < 0 ? MMSE_LSA_NR_BALANCED : (MmseLsaNrMode)m;
 }
 
 static const char* nr_mode_name(MmseLsaNrMode mode) {
-    switch (mode) {
-        case MMSE_LSA_NR_MILD:       return "mild";
-        case MMSE_LSA_NR_AGGRESSIVE: return "aggressive";
-        default:                     return "balanced";
-    }
+    return mmse_lsa_nr_mode_name(mode);
 }
 
 static const char* backend_id_name(uint32_t backend_id) {

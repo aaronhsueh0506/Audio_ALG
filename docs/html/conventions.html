@@ -187,12 +187,16 @@ frame#0→0 樣本（半窗 trim）、之後每幀 256 樣本——與 dfn2 的 
 <li>用 <code>_push_frame()</code>：三支前後處理 class
 （<code>ulcnet_prepost</code>／<code>deepvqe_prepost</code> 的
 <code>aiaec_analysis_push_frame()</code>／<code>dfn2_prepost</code> 本來就是
-center=False）與 <b>4ch ULCNet pipeline 的 far 分支</b>——因為它們要和
+center=False）、<b>4ch ULCNet pipeline 的 far 分支</b>，以及自 2026-09-03 起
+<b>mono ULCNet pipeline 兩路皆是</b>
+（<code>audio_pipeline_ulcnet.c:513-514</code>）——因為它們要和
 AEC/GSC seam 自己的頻譜（一 hop 一幀、從 hop 0 起）配對，一手已經是那種幀時，
-另一手就得用同一個排程才對得上 hop。</li>
-<li>用 centered <code>_push()</code>：mono ULCNet pipeline
-（<code>audio_pipeline_ulcnet.c:506-507</code>，兩路皆是），維持既有 checkpoint 的
-feature-time contract。</li>
+另一手就得用同一個排程才對得上 hop；mono 的 error/far 兩路本來就同 hop 推入，換成
+rolling 排程後兩者天生 hop-locked，不需再靠 centered 排程的 0/2/1 發射對齊。</li>
+<li>用 centered <code>_push()</code>：只剩 Python parity gate
+（<code>AIAEC/tests/test_ulcnet_process_c.py</code>）與
+<code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例，兩者都需要
+0/2/1 排程本身作為比對基準，不代表任何出貨 pipeline。</li>
 </ul>
 
 <h2>延遲預算表（演算法延遲，不含排程/緩衝）</h2>
@@ -203,7 +207,7 @@ feature-time contract。</li>
 <tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
 <tr><td>AEC 線性路徑（<code>pbfdaf_frontend</code>，overlap-save）</td>
 <td>+0 hop</td><td>線性誤差與輸入同 hop 交付（<code>AecResContext.formed_hop</code>）</td></tr>
-<tr><td>Align-ULCNet 鏈（centered STFT ×2 → NN callback → WOLA）</td>
+<tr><td>Align-ULCNet 鏈（rolling center=False STFT ×2 → NN callback → WOLA）</td>
 <td>+1 hop（16 k: 256 smp = 16 ms；48 k: 512 smp = 10.67 ms）</td>
 <td><code>ulcnet_process.h</code>：hop#0 無輸出（pipeline 補零）、hop#p 輸出
 對應輸入 [（p−1)·HOP, p·HOP)</td></tr>
@@ -227,7 +231,7 @@ exactly ONE hop」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 <tr><td>far 分支 <code>ulcnet_analysis_push_frame()</code></td><td>+0（平行）</td>
 <td>同一 hop 的 far 走同樣的一 hop 一幀 framing（center=False），
 兩路幀對恆屬同一輸入 hop；<b>沒有補償 buffer</b></td></tr>
-<tr><td>Align-ULCNet synthesis（centered WOLA 半窗 trim）</td><td>+1 hop
+<tr><td>Align-ULCNet synthesis（WOLA 半窗 trim）</td><td>+1 hop
 （16 k: 256 smp = 16 ms；48 k: 512 smp = 10.67 ms）</td><td>同 mono 變體</td></tr>
 <tr><td><b>合計（新增）</b></td><td><b>1 hop（16 k: 256 samples = 16 ms；
 48 k: 512 samples = 10.67 ms）</b></td>

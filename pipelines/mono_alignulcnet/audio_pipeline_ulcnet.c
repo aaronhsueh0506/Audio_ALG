@@ -16,8 +16,9 @@
  *      receives aligned_far_hop, byte-identical to the far hop consumed by
  *      the linear filter. Before acquisition this seam deliberately carries
  *      raw far, so the model's D window can handle the remaining offset.
- *   4. Both hops go into two UlcnetAnalysis instances (0/2/1 emission); for
- *      each emitted frame pair the model callback runs; its output is
+ *   4. Both hops go into two UlcnetAnalysis instances driven by the rolling
+ *      center=False push (exactly one frame per hop from hop #0); on that
+ *      frame pair the model callback runs once; its output is
  *      applied only when infer() returned 0 and the output frame is fully
  *      finite; otherwise the error passes unchanged (fail-open); the chosen
  *      frame goes into UlcnetSynthesis
@@ -50,7 +51,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
-#include <math.h>       /* isfinite + NAN -- model-output guard/pre-fill */
 
 #include "audio_pipeline_ulcnet.h"
 #include "mem_align.h"       /* ALIGN16 / MEM_IS_ALIGNED16 */
@@ -91,7 +91,7 @@
  * Version 11: the ULCNet deployment grid became a build parameter. The
  * build-flags hash now includes ULCNET_SR and ULCNET_N_FFT, preventing
  * descriptors from 16 kHz and 48 kHz builds from aliasing. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 11u
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 12u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
  * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"/\"ne10\"
@@ -137,8 +137,8 @@ struct AudioPipelineUlcnet {
 
     /* Emitted frames still straddling the last alignment boundary: armed to
      * AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES at the boundary hop, decremented
-     * once per EMITTED frame (not per hop -- hop #1 emits two). While
-     * nonzero the frame takes the identity path and the model is not
+     * once per hop (the rolling push emits exactly one frame per hop).
+     * While nonzero the frame takes the identity path and the model is not
      * stepped. Re-armed, never accumulated, by a boundary during a reprime. */
     int reprime_frames;
 
@@ -157,10 +157,10 @@ struct AudioPipelineUlcnet {
     float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table; all three
                                    * chain structs point at it (self-owned) */
 
-    /* Per-hop frame scratch (up to 2 frames per push on hop #1). Kept in
-     * the instance, not the stack -- see the header comment of this file. */
-    float err_re[2][ULCNET_BINS], err_im[2][ULCNET_BINS];
-    float far_re[2][ULCNET_BINS], far_im[2][ULCNET_BINS];
+    /* Per-hop frame scratch (one frame per hop). Kept in the instance, not
+     * the stack -- see the header comment of this file. */
+    float err_re[ULCNET_BINS], err_im[ULCNET_BINS];
+    float far_re[ULCNET_BINS], far_im[ULCNET_BINS];
     float mdl_re[ULCNET_BINS],    mdl_im[ULCNET_BINS];
 
     /* pool bookkeeping */
@@ -312,23 +312,18 @@ static uint32_t audio_pipeline_ulcnet_build_flags_hash(void) {
      * carve ORDER is unchanged. v6 removes the runtime far-mode field and
      * adds delay-transition bookkeeping. v7 adds the identity-reprime
      * counter beside it. */
+    /* v12: the frame scratch shrinks to one frame per branch (the rolling
+     * push emits exactly one frame per hop; the 0/2/1 centered schedule and
+     * its two-frame staging are gone). */
     h = ulcnet_fnv1a_str("|carve:self(model(io_descriptor),"
                          "aec_delay_cfg,delay_transition,reprime,ana_err,"
-                         "ana_far,synth,frame_scratch,ulcnet_window),aec,fft", h);
+                         "ana_far,synth,frame_scratch[1],ulcnet_window),aec,fft", h);
     h = ulcnet_fnv1a_str("|align|ulcnet" ULCNET_GRID_TOKEN, h);
     return h;
 }
 
 /* NaN/Inf guard: a model frame with ANY non-finite value must never reach
  * the WOLA (the synthesis accumulator would poison every later hop). */
-static int ulcnet_frame_is_finite(const float* re, const float* im) {
-    int k;
-    for (k = 0; k < ULCNET_BINS; k++) {
-        if (!isfinite(re[k]) || !isfinite(im[k])) return 0;
-    }
-    return 1;
-}
-
 /* ============================================================================
  * Public API
  * ========================================================================== */
@@ -464,7 +459,9 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
                                   const float* ref, float* out) {
     AecResContext rctx;
     AecLinearContext lctx;
-    int n_frames, f, wrote, k;
+    int wrote;
+    const float* sre;
+    const float* sim;
 
     if (!p || !mic || !ref || !out) return -1;
 
@@ -499,58 +496,44 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
     p->last_delay_state = lctx.delay_state;
     p->processed_hops += 1;
 
-    /* Stage 4: push BOTH hops (the two analyses must stay frame-locked, so
-     * each is fed every hop unconditionally). 0/2/1 emission: hop #0 emits
-     * nothing, hop #1 emits two frames, then one per hop. The far branch
-     * source is always the AEC's aligned far. */
-    n_frames = ulcnet_analysis_push(&p->ana_err, rctx.formed_hop, p->err_re, p->err_im);
-    (void)ulcnet_analysis_push(&p->ana_far,
-                               lctx.aligned_far_hop,
-                               p->far_re, p->far_im);
+    /* Stage 4: frame BOTH branches from the CURRENT hop with the rolling
+     * (center=False) analysis: exactly one frame per hop from hop #0, over
+     * the last N_FFT samples of each branch, so the two analyses stay
+     * frame-locked by construction. The far branch source is always the
+     * AEC's aligned far. */
+    (void)ulcnet_analysis_push_frame(&p->ana_err, rctx.formed_hop, p->err_re, p->err_im);
+    (void)ulcnet_analysis_push_frame(&p->ana_far, lctx.aligned_far_hop,
+                                     p->far_re, p->far_im);
 
-    /* Stage 5: per emitted frame pair, run the model and synthesize. The
-     * model always receives the AEC seam's best available far: raw before
-     * acquisition, aligned afterward. Its D window handles any remaining
-     * offset. A CHANGED event resets state before this hop's inference, and
-     * the frames whose analysis windows still straddle that boundary emit
-     * the identity WITHOUT stepping the model (they would otherwise rebuild
-     * the just-cleared state from half-stale input). Skipping inference
-     * lowers the per-frame cost of those frames; it never doubles it. */
-    wrote = 0;
-    for (f = 0; f < n_frames; f++) {
-        const float* sre = p->err_re[f];
-        const float* sim = p->err_im[f];
-        if (p->reprime_frames > 0) {
-            p->reprime_frames--;      /* identity; model deliberately idle */
-        } else if (p->model.infer) {
-            int rc;
-            /* Enforce ulcnet_process.h's FULL-WRITE CONTRACT: pre-fill the
-             * model-output staging with NaN before every infer call, so a
-             * partial write (rc == 0 without writing all ULCNET_BINS)
-             * leaves non-finite bins behind and is rejected by the finite
-             * guard below (fail-open identity) instead of silently applying
-             * stale finite values left over from a previous frame. */
-            for (k = 0; k < ULCNET_BINS; k++) {
-                p->mdl_re[k] = NAN;
-                p->mdl_im[k] = NAN;
-            }
-            rc = p->model.infer(p->model.user,
-                                p->err_re[f], p->err_im[f],
-                                p->far_re[f], p->far_im[f],
-                                p->mdl_re, p->mdl_im);
-            if (rc == 0 &&
-                ulcnet_frame_is_finite(p->mdl_re, p->mdl_im)) {
-                sre = p->mdl_re;
-                sim = p->mdl_im;
-            }
+    /* Stage 5: run the model once on this hop's frame pair and synthesize.
+     * The model always receives the AEC seam's best available far: raw
+     * before acquisition, aligned afterward. Its D window handles any
+     * remaining offset. A CHANGED event resets state before this hop's
+     * inference, and the frame whose analysis window still straddles that
+     * boundary emits the identity WITHOUT stepping the model (it would
+     * otherwise rebuild the just-cleared state from half-stale input).
+     * Skipping inference lowers the cost of that frame; it never doubles
+     * it: at most ONE inference per hop, always. */
+    sre = p->err_re;
+    sim = p->err_im;
+    if (p->reprime_frames > 0) {
+        p->reprime_frames--;          /* identity; model deliberately idle */
+    } else if (p->model.infer) {
+        /* FULL-WRITE CONTRACT (NaN prefill + finite guard, fail-open
+         * identity on any failure) lives in ulcnet_model_run_frame(). */
+        if (ulcnet_model_run_frame(&p->model, p->err_re, p->err_im,
+                                   p->far_re, p->far_im, p->mdl_re, p->mdl_im)) {
+            sre = p->mdl_re;
+            sim = p->mdl_im;
         }
-        wrote += ulcnet_synthesis_push(&p->synth, sre, sim, out + wrote);
     }
+    wrote = ulcnet_synthesis_push(&p->synth, sre, sim, out);
 
-    /* hop #0 (n_frames == 0, nothing emitted): the one-hop-latency contract
-     * says the caller's output for this hop is silence. Every later hop
-     * emits exactly one hop of samples (frame #0's share of hop #1 lands in
-     * the trimmed half window), so this memset never runs again. */
+    /* hop #0: the synthesis holds its first frame back (that frame's
+     * first half is the trimmed half window), so nothing is emitted and the
+     * one-hop-latency contract says the caller's output for this hop is
+     * silence. Every later hop emits exactly one hop of samples, so this
+     * memset never runs again. */
     if (wrote < p->hop)
         memset(out + wrote, 0, (size_t)(p->hop - wrote) * sizeof(float));
     return 0;

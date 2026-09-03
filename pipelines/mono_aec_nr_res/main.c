@@ -28,7 +28,7 @@
  * Build:  make libs && make aec_nr_pipeline
  * Usage:
  *   ./aec_nr_pipeline <mic.wav> <ref.wav> <out.wav> [aec-preset]
- *                     [--nr-preset mild|balanced|aggressive] [--aec-only] [--legacy-amin]
+ *                     [--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--legacy-amin]
  *                     [--debug]
  *
  * --debug: once per second of processed audio, print one compact status line
@@ -61,18 +61,15 @@ static const char* preset_name(AecPreset p) {
     }
 }
 
+/* Name table lives beside the enum (lib/nr mmse_lsa_types.h); an unknown
+ * name keeps this tool's long-standing fallback to balanced. */
 static MmseLsaNrMode parse_nr_mode(const char* s) {
-    if (strcmp(s, "mild") == 0)       return MMSE_LSA_NR_MILD;
-    if (strcmp(s, "aggressive") == 0) return MMSE_LSA_NR_AGGRESSIVE;
-    return MMSE_LSA_NR_BALANCED;
+    int m = mmse_lsa_nr_mode_from_name(s);
+    return m < 0 ? MMSE_LSA_NR_BALANCED : (MmseLsaNrMode)m;
 }
 
 static const char* nr_mode_name(MmseLsaNrMode m) {
-    switch (m) {
-        case MMSE_LSA_NR_MILD:       return "mild";
-        case MMSE_LSA_NR_AGGRESSIVE: return "aggressive";
-        default:                     return "balanced";
-    }
+    return mmse_lsa_nr_mode_name(m);
 }
 
 /* --debug: one compact status line/sec to stderr, combining both libraries'
@@ -190,7 +187,7 @@ static uint32_t timing_now_us(void) {
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-preset] "
-               "[--nr-preset mild|balanced|aggressive] [--aec-only] [--legacy-amin] "
+               "[--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--legacy-amin] "
                "[--fft-size 256|512|1024] [--debug] [--timing]\n",
                argv[0]);
         return 1;

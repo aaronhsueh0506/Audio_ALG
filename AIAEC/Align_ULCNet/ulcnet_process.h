@@ -260,6 +260,25 @@ typedef struct UlcnetModel {
     const UlcnetModelIoDescriptor *io_descriptor;  /* NULL = not published */
 } UlcnetModel;
 
+/* 1 when every bin of (re, im) is finite. */
+int ulcnet_frame_is_finite(const float re[ULCNET_BINS], const float im[ULCNET_BINS]);
+
+/**
+ * Run the model callback once on one (err, far) frame pair under the
+ * FULL-WRITE CONTRACT: out_re/out_im are pre-filled with NaN, infer() is
+ * called, and the output is accepted only if infer() returned 0 AND every
+ * bin came back finite -- so a partial write (rc == 0 without writing all
+ * ULCNET_BINS) is rejected instead of silently applying stale values from a
+ * previous frame. Returns 1 when the output was accepted (the caller
+ * synthesises out_*), 0 when the caller must fall back to the identity
+ * (err_*) path. model->infer must be non-NULL. Shared by every wrapper that
+ * drives a UlcnetModel so the fail-open policy is defined in one place.
+ */
+int ulcnet_model_run_frame(const UlcnetModel *model,
+                           const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
+                           const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
+                           float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]);
+
 #ifdef __cplusplus
 }
 #endif

@@ -180,7 +180,7 @@ st = four_aec_nr_res_process_post(core, &amp;pre.token, weights, out);
 <pre>aec_process_context(p->aec, mic, ref);
 aec_get_res_context(p->aec, &rctx);      /* rctx.formed_hop     ← 時域線性誤差 */
 aec_get_linear_context(p->aec, &lctx);   /* lctx.aligned_far_hop ← 對齊後的 far  */</pre>
-<p><b>注意 mono 拿的是「時域」兩個 tap,不是頻譜</b>——它有自己的 centered STFT,AEC 的 <code>error_spec</code> 完全不用。4ch 則<b>不做 error 分析</b>:<code>gsc_spectrum</code> 直接當 error 幀,只有 far 分支走 center=False 的 <code>ulcnet_analysis_push_frame()</code>。<b>不可與 centered 的 <code>ulcnet_analysis_push()</code> 混用同一 state</b>(共用 history,不共用排程)。</p>
+<p><b>注意 mono 拿的是「時域」兩個 tap,不是頻譜</b>——它有自己的 STFT,AEC 的 <code>error_spec</code> 完全不用;兩路都走 rolling <code>push_frame()</code>(2026-09-03 起,先前 centered)。4ch<b>不做 error 分析</b>:<code>gsc_spectrum</code> 直接當 error 幀,far 分支走同一個 push_frame。<b>不可與 centered <code>push()</code> 混用同一 state</b>(共用 history、不共用排程;現只剩 Python parity gate 用 centered 版)。</p>
 <h3>邊界偵測與 reprime</h3>
 <pre>if (lctx.delay_state == AEC_LINEAR_DELAY_CHANGED
     || (FIXED 模式下 UNLOCKED→LOCKED 的首次轉換)) {
@@ -230,7 +230,7 @@ if (cfg->model.io_descriptor &amp;&amp;
 <tr><td><code>mono_aec_nr_res</code></td><td><code>AUDIO_PIPELINE_LAYOUT_VERSION</code> = 10</td></tr>
 <tr><td><code>4ch_aec_bf_nr_res</code>(核心)</td><td><code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = 16</td></tr>
 <tr><td><code>4ch_aec_bf_nr_res</code>(完整 wrapper)</td><td><code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION</code> = 11</td></tr>
-<tr><td><code>mono_alignulcnet</code></td><td><code>AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION</code> = 11</td></tr>
+<tr><td><code>mono_alignulcnet</code></td><td><code>AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION</code> = 12</td></tr>
 <tr><td><code>4ch_alignulcnet</code></td><td><code>AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION</code> = 17</td></tr>
 </table></div>
 <div class="warn"><b>版本一動,任何持久化的 descriptor 都必須丟棄重查。</b>關鍵微妙處:<code>build_flags_hash</code> 只是 carve token 字串的 FNV-1a,<b>不含任何 sizeof／byte count</b> → 當 control block 只是<b>長大</b>而 carve 結構沒變時,hash <b>不會動</b>。所以 <code>layout_version</code> 是<b>唯一</b>訊號。<br>「a descriptor from a version-10 build must be refused, <b>including when its cached byte count still covers the current pool</b>」——descriptor 的 <code>bytes</code> 比較是下界,擋得住成長、擋不住等量語意變更。</div>

@@ -652,8 +652,18 @@ beam WOLA、不再有 error 路的二次 analysis，也不再有 one-hop far buf
 兩路因此都從**當前** input hop 成幀，跨界幀只剩邊界 hop 那一幀，常數變成 1，
 與 mono 同值；`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION` 同時由 16 推到 17。
 邊界處理也簡化為「只做 `model->reset` ＋ arm reprime」，不再清任何 buffer
-（C 側成幀狀態一路連續）。mono wrapper 不受影響（仍是 centered 0/2/1 push、
-REPRIME 1、1 hop 延遲）。
+（C 側成幀狀態一路連續）。
+
+**2026-09-03 追加更新（mono 也走 rolling push，上面「mono wrapper 不受影響」已過時）**：
+mono wrapper 的兩路 analysis 同一天稍後也從 centered `ulcnet_analysis_push()`
+（0/2/1 幀發射）改用 rolling center=False `ulcnet_analysis_push_frame()`（自
+hop#0 起每 hop 恰一幀、每 hop 至多一次推論）。這不是像 4ch 那樣移除一段
+round trip——mono 兩路本來就同 hop 推入、無 wrapper 端 far 補償——純粹是把
+排程換成與 AEC/GSC seam 一致的每 hop 一幀。`AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES`
+仍是 1（含義從「每發射幀遞減」變成「每 hop 遞減」，因為兩者現在相等），
+1 hop 端到端延遲不變（來源從「centered 分析半窗 lookahead」正名為
+「synthesis 半窗 trim」），幀 scratch 由 2 幀縮為 1 幀，
+`AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION` 由 11 推到 12。
 
 兩個變體的 production far branch 固定讀 AEC aligned-far seam，沒有 runtime
 mode。checkpoint 的 raw-far 欄位僅作 training provenance；export descriptor
@@ -768,12 +778,13 @@ flowchart LR
     DELTA --> UPDATE
 ```
 
-每個 256-sample hop 產生一個 model frame。走 centered
-`ulcnet_analysis_push()`（mono wrapper）時，priming 期間的第二次 push 會連續
-產生兩幀，但仍是兩次單幀 inference；走 `ulcnet_analysis_push_frame()`
-（4ch direct path、pre/post class 的 TIME 模式）時，從第一次推入起就固定
-一幀一次 inference，沒有這個例外。model graph 不收 PCM、不包 STFT/WOLA、不包
-PBFDKF 或 delay state machine。
+每個 256-sample hop 產生一個 model frame，且每 hop 至多一次 inference。
+`ulcnet_analysis_push_frame()`（mono wrapper、4ch direct path、pre/post
+class 的 TIME 模式全走這個）從第一次推入起就固定一幀一次 inference，沒有
+priming 例外。centered `ulcnet_analysis_push()`（0/2/1 幀發射，priming 期間的
+第二次 push 會連續產生兩幀）自 2026-09-03 起不再有出貨 pipeline 呼叫，只剩
+Python parity gate 使用。model graph 不收 PCM、不包 STFT/WOLA、不包 PBFDKF
+或 delay state machine。
 
 ### 10.2 ONNX input/output contract（方案 B）
 
@@ -880,11 +891,12 @@ pipeline 端的 identity reprime 擋掉（不 step 模型），見 5.x 的
 本專案交付：
 
 - `ulcnet_process.c/.h`：sqrt-Hann STFT/WOLA 與 RI frame。兩種 analysis
-  推入方式：`ulcnet_analysis_push()`（centered、0/2/1 出幀排程，mono wrapper
-  在用）與 `ulcnet_analysis_push_frame()`（2026-09-03 新增；center=False、
-  每次推入固定出一幀，與同一 hop 的 centered 最後一幀逐 bit 相同，4ch
-  direct path 的 far 路與兩個 AIAEC pre/post class 的 TIME 模式在用）。
-  同一個 state 不可混用兩種推入函式。
+  推入方式：`ulcnet_analysis_push()`（centered、0/2/1 出幀排程，2026-09-03
+  起不再有出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
+  `ulcnet_analysis_push_frame()`（2026-09-03 新增；center=False、每次推入
+  固定出一幀，與同一 hop 的 centered 最後一幀逐 bit 相同；mono wrapper 兩路、
+  4ch direct path 的 far 路，以及兩個 AIAEC pre/post class 的 TIME 模式都在用，
+  mono 是同一天稍後跟進的）。同一個 state 不可混用兩種推入函式。
 - model-I/O/state `c/.h`：caller-owned memory requirement/init/reset、K/V/logit
   ring update、GRU hidden 保存、descriptor/layout validation。RAM 必須隨
   D 縮小。

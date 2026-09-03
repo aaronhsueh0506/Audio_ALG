@@ -6,8 +6,8 @@
  * stage is the Align-ULCNet NN driven through the per-frame callback
  * boundary defined in AIAEC/Align_ULCNet/ulcnet_process.h (UlcnetModel).
  * The NN itself runs on an external runtime; this pipeline owns only the
- * verified C pre/post (centered sqrt-Hann STFT, 0/2/1 frame emission,
- * WOLA) plus the linear AEC and the delay-state policy around the model.
+ * verified C pre/post (rolling center=False sqrt-Hann STFT, exactly one
+ * frame and at most one inference per hop, WOLA) plus the linear AEC and the delay-state policy around the model.
  *
  *     AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(16000);
  *     cfg.model = my_runtime_model;             // may be left all-zero
@@ -77,8 +77,8 @@
  *  tests/test_audio_pipeline_ulcnet.c, never assumed here): this wrapper
  *  pushes both branches from the CURRENT hop -- the error tap
  *  (AecResContext.formed_hop) and the aligned-far tap are same-hop, no
- *  wrapper-side far compensation exists -- and the centered 50%-overlap analysis
- *  spans exactly two pushed hops. A boundary at hop T therefore leaves
+ *  wrapper-side far compensation exists -- and the rolling 50%-overlap analysis
+ *  frame at hop T spans the two pushed hops T-1 and T. A boundary at hop T therefore leaves
  *  exactly ONE emitted frame straddling (the frame emitted at hop T, whose
  *  window covers the pre-switch hop T-1 and the post-switch hop T); the
  *  frame emitted at hop T+1 covers hops T and T+1 and is already clean. The
@@ -117,9 +117,9 @@ extern "C" {
  * i.e. the length of the identity reprime armed at every generation change
  * (see the "Identity reprime" section of this header's preamble).
  *
- * = 1: both branches are pushed from the CURRENT hop and the centered
- * centered 50%-overlap analysis spans two pushed hops, so a boundary at hop T leaves the
- * single frame emitted at hop T straddling. Derived and asserted branch by
+ * = 1: both branches are pushed from the CURRENT hop and the rolling
+ * 50%-overlap analysis frame at hop T spans hops T-1 and T, so a boundary
+ * at hop T leaves exactly the frame emitted at hop T straddling. Derived and asserted branch by
  * branch by the straddle-derivation test; do not edit this value without
  * re-running it.
  */

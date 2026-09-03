@@ -204,3 +204,27 @@ int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]) {
     }
     return n;
 }
+
+/* ---- model callback step (shared by the pipeline wrappers) --------------- */
+
+int ulcnet_frame_is_finite(const float re[ULCNET_BINS], const float im[ULCNET_BINS]) {
+    int k;
+    for (k = 0; k < ULCNET_BINS; k++) {
+        if (!isfinite(re[k]) || !isfinite(im[k])) return 0;
+    }
+    return 1;
+}
+
+int ulcnet_model_run_frame(const UlcnetModel *model,
+                           const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
+                           const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
+                           float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+    int k;
+    for (k = 0; k < ULCNET_BINS; k++) {
+        out_re[k] = NAN;
+        out_im[k] = NAN;
+    }
+    if (model->infer(model->user, err_re, err_im, far_re, far_im, out_re, out_im) != 0)
+        return 0;
+    return ulcnet_frame_is_finite(out_re, out_im);
+}

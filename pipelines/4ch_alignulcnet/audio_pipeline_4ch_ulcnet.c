@@ -668,14 +668,6 @@ int audio_pipeline_4ch_ulcnet_set_model(
 
 /* NaN/Inf guard: a model frame with ANY non-finite value must never reach
  * the WOLA (the synthesis accumulator would poison every later hop). */
-static int ulcnet_frame_is_finite(const float* re, const float* im) {
-    int k;
-    for (k = 0; k < ULCNET_BINS; ++k) {
-        if (!isfinite(re[k]) || !isfinite(im[k])) return 0;
-    }
-    return 1;
-}
-
 int audio_pipeline_4ch_ulcnet_process_with_activity(
     AudioPipeline4ChUlcnet* p,
     const float* microphones_interleaved,
@@ -766,21 +758,10 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     if (p->reprime_frames > 0) {
         p->reprime_frames -= 1;   /* identity; model deliberately idle */
     } else if (p->model.infer) {
-        /* Enforce ulcnet_process.h's FULL-WRITE CONTRACT: pre-fill the
-         * model-output staging with NaN before every infer call, so a
-         * partial write (rc == 0 without writing all ULCNET_BINS) leaves
-         * non-finite bins behind and is rejected by the finite guard below
-         * (fail-open identity) instead of silently applying stale finite
-         * values left over from a previous frame. */
-        for (k = 0; k < ULCNET_BINS; ++k) {
-            p->enh_re[k] = NAN;
-            p->enh_im[k] = NAN;
-        }
-        if (p->model.infer(
-                p->model.user,
-                p->err_re, p->err_im, p->far_re, p->far_im,
-                p->enh_re, p->enh_im) == 0 &&
-            ulcnet_frame_is_finite(p->enh_re, p->enh_im)) {
+        /* FULL-WRITE CONTRACT (NaN prefill + finite guard, fail-open
+         * identity on any failure) lives in ulcnet_model_run_frame(). */
+        if (ulcnet_model_run_frame(&p->model, p->err_re, p->err_im,
+                                   p->far_re, p->far_im, p->enh_re, p->enh_im)) {
             spec_re = p->enh_re;
             spec_im = p->enh_im;
         }

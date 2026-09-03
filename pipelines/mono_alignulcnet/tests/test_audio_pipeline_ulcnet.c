@@ -26,10 +26,10 @@
  *   2. counting model: infer is stepped for every emitted frame (constant
  *      compute path) EXCEPT the identity-reprime frames after an alignment
  *      generation: cumulative calls after hop #p == p+1 minus the reprime
- *      frames consumed so far — 2 on hop #1 (the 0/2/1 emission), 1 per hop
- *      after; model->reset fires exactly once per CHANGED hop during the
+ *      frames consumed so far (one frame per hop from hop #0, rolling
+ *      analysis); model->reset fires exactly once per CHANGED hop during the
  *      run, plus exactly once more on audio_pipeline_ulcnet_reset(); a
- *      post-reset hop #0 emits 0 frames.
+ *      post-reset hop #0 is one inference again with an all-zero output.
  *   3. fail-open callback handling: a model whose output
  *      halves the spectrum (rc=0) but doubles it on scheduled failing hops
  *      (rc!=0) — output is bit-identical to the NULL-model pipeline's
@@ -183,8 +183,10 @@ static AecLinearDelayState pipeline_delay_state(const AudioPipelineUlcnet* p) {
     return lctx.delay_state;
 }
 
-/* Frames emitted by the 0/2/1 analysis contract at hop index h. */
-static int frames_at_hop(int h) { return (h == 0) ? 0 : (h == 1) ? 2 : 1; }
+/* Frames emitted at hop index h: the rolling (center=False) analysis emits
+ * exactly one frame per hop from hop #0 (the centered 0/2/1 schedule is
+ * gone; kept as a function so the schedule stays in one place). */
+static int frames_at_hop(int h) { (void)h; return 1; }
 
 /* Spend an armed identity-reprime budget over one hop's `frames` emitted
  * frames, and report how many of them the reprime covered. The budget is
@@ -252,7 +254,7 @@ static void test_identity_e2e(void) {
  *    CHANGED -> LOCKED. infer is stepped for EVERY emitted frame EXCEPT the
  *    AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES straddling frames after each
  *    CHANGED hop (the identity reprime), so cumulative calls after hop #p ==
- *    p+1 minus the reprime frames consumed so far (2 on hop #1);
+ *    p+1 minus the reprime frames consumed so far (one frame per hop);
  *    model->reset fires once per CHANGED hop + once per pipeline reset.
  *
  *    Original intent kept: the per-hop compute is CONSTANT everywhere else
@@ -326,8 +328,8 @@ static void test_counting_model(void) {
     }
 
     CHECK(calls_after_hop1 == 2,
-          fmt_msg("counting model: 2 infer calls after hop #1 (0/2/1 emission; got %d)",
-                  calls_after_hop1));
+          fmt_msg("counting model: 2 infer calls after hop #1 (one per hop from "
+                  "hop #0; got %d)", calls_after_hop1));
     CHECK(pattern_ok && st.infer_calls == N - skipped_total,
           fmt_msg("counting model: one infer per emitted frame at every hop except the "
                   "%d reprime frames per alignment generation "
@@ -356,8 +358,9 @@ static void test_counting_model(void) {
     audio_pipeline_ulcnet_process(p, mic, ref, out);
     int hop0_zero = 1;
     for (int i = 0; i < HOP; i++) if (out[i] != 0.0f) hop0_zero = 0;
-    CHECK(st.infer_calls == calls_before && hop0_zero,
-          "after pipeline reset the next hop is hop #0 again: 0 infer calls, all-zero output");
+    CHECK(st.infer_calls == calls_before + 1 && hop0_zero,
+          "after pipeline reset the next hop is hop #0 again: one inference "
+          "(like every hop), all-zero output (synthesis preamble)");
 
     audio_pipeline_ulcnet_destroy(p);
 }
@@ -674,11 +677,10 @@ static void test_fail_open_and_delay_gating(void) {
             n_reprime_hops += reprimed;
         }
 
-        /* equal_expected: hop 0 both zero; hop 1 mixes only frames pushed at
-         * hop 1; hop p>=2 mixes frames pushed at hops p-1 and p. */
+        /* equal_expected: hop 0 both zero; hop p>=1 mixes the frames pushed
+         * at hops p-1 and p (one frame per hop from hop #0). */
         int equal_expected;
         if (h == 0)      equal_expected = 1;
-        else if (h == 1) equal_expected = ident[1];
         else             equal_expected = ident[h - 1] && ident[h];
 
         int bitwise_equal = memcmp(out_a, out_b, sizeof(out_a)) == 0;
@@ -1339,7 +1341,6 @@ static void test_nan_guard(void) {
 
         int equal_expected;
         if (h == 0)      equal_expected = 1;               /* both all-zero */
-        else if (h == 1) equal_expected = poisoned[1];
         else             equal_expected = poisoned[h - 1] && poisoned[h];
 
         int bitwise_equal = memcmp(out_a, out_b, sizeof(out_a)) == 0;
@@ -1453,7 +1454,6 @@ static void test_partial_write_guard(void) {
 
         int equal_expected;
         if (h == 0)      equal_expected = 1;               /* both all-zero */
-        else if (h == 1) equal_expected = partial[1];
         else             equal_expected = partial[h - 1] && partial[h];
 
         int bitwise_equal = memcmp(out_a, out_b, sizeof(out_a)) == 0;

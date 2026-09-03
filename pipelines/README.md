@@ -505,11 +505,13 @@ post-beam 抑制器）。
 
 **Modes**: `MMSE_LSA_NR_MILD` / `MMSE_LSA_NR_MODERATE` / `MMSE_LSA_NR_BALANCED`（default）/ `MMSE_LSA_NR_AGGRESSIVE`
 
-> These are the library's mode enum, not this pipeline's CLI surface. `mono_aec_nr_res/main.c`'s
-> `parse_nr_mode()` only recognizes `"mild"` / `"aggressive"` (anything else, including
-> `"moderate"`, silently falls back to `MMSE_LSA_NR_BALANCED` — no error); the Python
-> `aec_nr_pipeline.py` CLI likewise restricts `--nr-preset` to `choices=['mild', 'balanced',
-> 'aggressive']`. `MODERATE` is only reachable by calling `mmse_lsa_config_for_mode()` directly.
+> These are the library's mode enum. Both C pipeline CLIs' `parse_nr_mode()` —
+> `mono_aec_nr_res/main.c` and `4ch_aec_bf_nr_res/4aec_nr_res_static.c` — now also recognize
+> `"moderate"` (`--nr-preset mild|moderate|balanced|aggressive`, since 2026-09-03); anything else
+> still silently falls back to `MMSE_LSA_NR_BALANCED` — no error. The Python `aec_nr_pipeline.py`
+> CLI has not been updated and still restricts `--nr-preset` to `choices=['mild', 'balanced',
+> 'aggressive']`; `MODERATE` there is only reachable by calling `mmse_lsa_config_for_mode()`
+> directly.
 
 `g_min_db` is in the amplitude-dB convention (`/20`, i.e. `g_min = 10^(g_min_db/20)`), not the
 older power-dB (`/10`) convention.
