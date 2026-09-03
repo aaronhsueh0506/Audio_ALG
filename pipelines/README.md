@@ -547,7 +547,7 @@ older power-dB (`/10`) convention.
 | `g_min_db` | -20 | -25 | -30 | -40 | 最小增益 dB（最大抑制量，amplitude dB, /20） |
 | `q` | 0.60 | 0.55 | 0.50 | 0.35 | 語音先驗機率（低→積極抑噪） |
 | `xi_min_db` | -15 | -18 | -20 | -25 | 先驗 SNR 下限 dB |
-| `alpha_d` | 0.85 | 0.85 | 0.70 | 0.50 | 噪聲追蹤 IIR 係數（authored 常數，見上方 retime 說明） |
+| `alpha_d` | 0.85 | 0.85 | 0.903414 (10 ms 基準 = 0.85 @16 ms) | 0.50 | 噪聲追蹤 IIR 係數（authored 常數，見上方 retime 說明；BALANCED 2026-09-03 調慢） |
 | `alpha_g` | 0.92 | 0.92 | 0.88 | 0.85 | 增益時間平滑（高→平滑；authored 常數） |
 | `alpha_attack` | 0.40 | 0.40 | 0.30 | 0.15 | Attack 平滑（語音起始追蹤；authored 常數，四個 preset 皆 16ms 基準） |
 | `alpha_decay` | 0.92 | 0.92 | 0.88 | 0.88 | Decay 平滑（噪聲釋放；authored 常數） |
@@ -557,7 +557,7 @@ older power-dB (`/10`) convention.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `alpha_s` | 0.95 | 功率譜時間平滑（authored 常數，10ms 基準） |
-| `alpha_d` | 0.70 | 噪聲更新速率（authored 常數，10ms 基準；BALANCED 值，見上方 retime 說明） |
+| `alpha_d` | 0.903414 | 噪聲更新速率（authored 常數，10ms 基準 = 0.85 @16 ms；BALANCED 值，2026-09-03 由 0.70 調慢，見上方 retime 說明） |
 | `L` | 64 | 最小值追蹤視窗（幀數；**已 retime**；authored 值為 32 hops @ 16 ms，16 kHz 預設 256/128 grid 的實際 hop 為 8 ms，因此 effective 值為 64；其他 grid 請由設定 API 讀回） |
 | `num_init_frames` | 25 | 初始化靜默幀數（**已 retime**；常數以 10 ms 為 authored basis，16 kHz 預設 256/128 的實際 hop 是 8 ms，因此 25 hops ≈200 ms） |
 | `scene_change_threshold_db` | 10.0 | 場景轉換偵測閾值（純 dB 常數，不 retime） |
