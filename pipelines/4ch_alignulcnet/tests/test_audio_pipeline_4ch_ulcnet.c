@@ -2,9 +2,11 @@
  * tests/test_audio_pipeline_4ch_ulcnet.c — Align-ULCNet 4ch pipeline tests.
  *
  * Mirrors test_audio_pipeline_4ch.c's public-API acceptance style. Covers:
- *   1. identity E2E: the 2-hop timing contract (hops 0..1 zero; out[hop p]
- *      equals the beamformed-error accessor value captured at hop p-1)
- *      through the WOLA reconstruction + ULCNet chain in fail-open mode.
+ *   1. identity E2E: the 1-hop timing contract (hop 0 zero; every hop is
+ *      exactly one inference from hop 0; out[hop p] is bit-identical to a
+ *      reference the test synthesises ITSELF from the spectra the pipeline
+ *      hands the model) through the direct GSC -> model -> synthesis chain
+ *      in identity mode.
  *   2. counting model: infer STEPPED and applied on every emitted frame
  *      except the identity-reprime frames after an alignment generation;
  *      model->reset fired on
@@ -22,12 +24,17 @@
  *      pool reuse, plus a short heap-vs-pool byte-equal run.
  *   5. far-timestamp before acquisition: far-passthrough model,
  *      silence on all mics, one unit impulse in far at a known index -- it
- *      must land in the output at EXACTLY impulse + 2 hops (512 samples):
- *      the wrapper's one-hop far-compensation buffer (matching the beam
- *      WOLA's one-hop lag, so err/far frame pairs are same-hop) plus the
- *      one-hop centered ULCNet chain. Applied delay contributes 0 here
- *      (the shared delay never acquires on silent mics). Goes red by
- *      exactly 256 samples if the far compensation buffer is removed.
+ *      must land in the output at EXACTLY impulse + 1 hop: the far branch
+ *      is framed from the current hop (err/far frame pairs are same-hop)
+ *      and the only latency is the ULCNet synthesis. Applied delay
+ *      contributes 0 here (the shared delay never acquires on silent mics).
+ *      Goes red by exactly one hop if either branch is delayed.
+ *  5b. error-branch timestamp and content: the same impulse on the four
+ *      mics (frozen beamformer, silent far, NULL model) lands at impulse +
+ *      1 hop AND comes out as an impulse -- the one check that reads the
+ *      error branch against the INPUT, so a dropped imaginary part or a
+ *      hop of delay on that branch cannot hide behind a self-consistent
+ *      model-output comparison.
  *   6. Production never gates on the delay lock: the 0.5x model's output is
  *      applied from the FIRST emitted frame, before the delay is solid.
  *   7. NaN guard: rc==0 frames poisoned with NaN/Inf are discarded
@@ -126,11 +133,6 @@ static void fill_echo_hop(int frame, int hop, int true_delay,
     }
 }
 
-/* Frames the 0/2/1 analysis contract emits at hop index `frame`. */
-static int frames_in_hop(int frame) {
-    return frame == 0 ? 0 : (frame == 1 ? 2 : 1);
-}
-
 /* Spend an armed identity-reprime budget over one hop's `frames` emitted
  * frames, and report how many of them the reprime covered. The budget is
  * armed at the TOP of the hop that reports the alignment generation, so the
@@ -142,20 +144,57 @@ static int reprime_take(int* armed, int frames) {
 }
 
 /* ============================================================================
- * 1. Identity E2E: WOLA + ULCNet chain + 2-hop latency contract
+ * 1. Identity E2E: direct GSC -> model -> synthesis chain + 1-hop latency
+ *    contract. The reference is synthesised by the TEST from the spectra the
+ *    pipeline hands the model (a capture model that also returns the
+ *    identity), through the test's own UlcnetSynthesis: a bit-identical
+ *    output proves the chain adds nothing between the model's frame and the
+ *    WOLA, and the call count proves every hop from hop #0 is exactly one
+ *    inference. FIXED delay 0 keeps the run boundary-free (asserted), so no
+ *    reprime frame can bypass the model and leave the capture stale.
  * ========================================================================== */
+
+typedef struct CaptureModel {
+    float re[ULCNET_BINS];
+    float im[ULCNET_BINS];
+    long calls;
+    long resets;
+} CaptureModel;
+
+static int capture_infer(
+    void* user,
+    const float* err_re, const float* err_im,
+    const float* far_re, const float* far_im,
+    float* out_re, float* out_im) {
+    CaptureModel* m = (CaptureModel*)user;
+    (void)far_re;
+    (void)far_im;
+    memcpy(m->re, err_re, ULCNET_BINS * sizeof(float));
+    memcpy(m->im, err_im, ULCNET_BINS * sizeof(float));
+    memcpy(out_re, err_re, ULCNET_BINS * sizeof(float));
+    memcpy(out_im, err_im, ULCNET_BINS * sizeof(float));
+    m->calls += 1;
+    return 0;
+}
+
+static void capture_reset(void* user) { ((CaptureModel*)user)->resets += 1; }
 
 static int test_identity_e2e(void) {
     enum { FRAMES = 60 };
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* p;
+    CaptureModel m;
+    UlcnetModel model;
+    UlcnetSynthesis ref_synth;
+    FftHandle* ref_fft;
+    float ref_window[ULCNET_N_FFT];
     float* microphones;
     float* far;
     float* out;
-    float* beam_hist;
-    float max_beam = 0.0f;
-    float max_err = 0.0f;
+    float* ref;
+    float max_ref = 0.0f;
     float max_preamble = 0.0f;
+    int identical_hops = 0;
     int hop;
 
     CHECK(cfg.core.sample_rate == ULCNET_SR &&
@@ -165,6 +204,8 @@ static int test_identity_e2e(void) {
     cfg.gsc_fixed_doa_rad = 0.4f;
     cfg.gsc_mu = 0.02f;
     cfg.core.enable_cng = 0;
+    cfg.core.delay_mode = AEC_DELAY_FIXED;
+    cfg.core.fixed_delay_samples = 0;
 
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
     CHECK(p != NULL, "create ULCNet 4ch pipeline");
@@ -175,22 +216,41 @@ static int test_identity_e2e(void) {
           audio_pipeline_4ch_ulcnet_sample_rate(p) == ULCNET_SR,
           "runtime dimensions match the compiled ULCNet deployment grid");
 
+    memset(&m, 0, sizeof(m));
+    memset(&model, 0, sizeof(model));
+    model.user = &m;
+    model.infer = capture_infer;
+    model.reset = capture_reset;
+    model.io_descriptor = test_io_descriptor();
+    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
+          "install capture model");
+
+    /* The test's own synthesis: the same window table, its own handle. */
+    ref_fft = fft_create(ULCNET_N_FFT);
+    CHECK(ref_fft != NULL, "create reference FFT handle");
+    ulcnet_make_window(ref_window);
+    CHECK(ulcnet_synthesis_init(&ref_synth, ref_fft, ref_window) == 0,
+          "init reference synthesis");
+
     microphones = (float*)malloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out = (float*)malloc((size_t)hop * sizeof(float));
-    beam_hist = (float*)malloc((size_t)FRAMES * hop * sizeof(float));
-    CHECK(microphones && far && out && beam_hist,
-          "allocate identity-test buffers");
+    ref = (float*)malloc((size_t)hop * sizeof(float));
+    CHECK(microphones && far && out && ref, "allocate identity-test buffers");
 
     for (int frame = 0; frame < FRAMES; ++frame) {
-        const float* beam;
+        int ref_wrote;
+        /* Poison the output buffer first, so "hop 0 is exact zeros" and the
+         * memcmp below prove the pipeline WROTE the hop, not that the
+         * allocator handed over zeroed memory. */
+        for (int i = 0; i < hop; ++i) out[i] = 1.0f;
         for (int i = 0; i < hop; ++i) {
             int64_t absolute = (int64_t)frame * hop + i;
             float phase = 2.0f * (float)M_PI * 700.0f *
                           (float)absolute / (float)ULCNET_SR;
-            /* frames 0..1 silent so the 2-hop preamble is provably zero. */
-            float echo = frame >= 2 ? 0.08f * sinf(phase) : 0.0f;
+            /* frame 0 silent so the 1-hop preamble is provably zero. */
+            float echo = frame >= 1 ? 0.08f * sinf(phase) : 0.0f;
             float near = frame >= 30
                 ? 0.025f * sinf(phase * 1.73f + 0.2f) : 0.0f;
             far[i] = echo;
@@ -203,40 +263,78 @@ static int test_identity_e2e(void) {
                   p, microphones, far, frame >= 30, out) ==
                   FOUR_AEC_NR_RES_OK,
               "identity frame processes");
+        CHECK(m.calls == (long)frame + 1,
+              "exactly one inference per hop, from hop #0");
 
-        beam = audio_pipeline_4ch_ulcnet_last_beamformed_error(p);
-        CHECK(beam != NULL, "beamformed-error accessor non-NULL");
-        memcpy(beam_hist + (size_t)frame * hop, beam,
-               (size_t)hop * sizeof(float));
-
-        for (int i = 0; i < hop; ++i) {
-            float b = fabsf(beam_hist[(size_t)frame * hop + i]);
-            if (b > max_beam) max_beam = b;
-            CHECK(isfinite(out[i]), "identity output finite");
-            if (frame <= 1) {
+        /* The reference: the frame the model saw, through the test's own
+         * synthesis. Same arithmetic on the same history -> bit-identical. */
+        ref_wrote = ulcnet_synthesis_push(&ref_synth, m.re, m.im, ref);
+        if (frame == 0) {
+            CHECK(ref_wrote == 0, "reference emits nothing on hop #0");
+            for (int i = 0; i < hop; ++i) {
                 float a = fabsf(out[i]);
                 if (a > max_preamble) max_preamble = a;
-            } else {
-                float d = fabsf(
-                    out[i] - beam_hist[(size_t)(frame - 1) * hop + i]);
-                if (d > max_err) max_err = d;
             }
+        } else {
+            CHECK(ref_wrote == hop, "reference emits a full hop from hop #1");
+            for (int i = 0; i < hop; ++i) {
+                float a = fabsf(ref[i]);
+                if (a > max_ref) max_ref = a;
+                CHECK(isfinite(out[i]), "identity output finite");
+            }
+            CHECK(memcmp(out, ref, (size_t)hop * sizeof(float)) == 0,
+                  "out[hop p] is bit-identical to the synthesis of the "
+                  "spectrum the model saw at hop p (identity chain, 1-hop "
+                  "latency)");
+            identical_hops += 1;
         }
     }
-    CHECK(max_preamble <= 2e-4f,
-          "hops 0..1 emit zeros (2-hop latency preamble)");
-    CHECK(max_err <= 2e-4f,
-          "out[hop p] equals beamformed[p-1] (identity chain, one extra hop)");
-    /* The comparison must not be vacuous: the beamformed error itself has
-     * to carry real signal for this test to be able to fail. */
-    CHECK(max_beam > 1e-3f, "beamformed error is non-trivial");
+    CHECK(m.resets == 0,
+          "FIXED delay 0 keeps the identity run boundary-free (no reprime "
+          "frame ever bypassed the capture model)");
+    CHECK(max_preamble == 0.0f, "hop 0 emits exact zeros (1-hop preamble)");
+    CHECK(identical_hops == FRAMES - 1, "every later hop was compared");
+    /* The comparison must not be vacuous: the reference has to carry real
+     * signal for this test to be able to fail. */
+    CHECK(max_ref > 1e-3f, "beamformed error is non-trivial");
 
     audio_pipeline_4ch_ulcnet_destroy(p);
-    free(beam_hist);
+    fft_destroy(ref_fft);
+    free(ref);
     free(out);
     free(far);
     free(microphones);
     return 1;
+}
+
+/* Identity twin: a second pipeline built from the same config with NO model,
+ * stepped in lockstep with the pipeline under test, so a test can compare
+ * against what that pipeline WOULD emit without a model (identity frames
+ * throughout, including its own reprime frames). */
+typedef struct IdentityTwin {
+    AudioPipeline4ChUlcnet* p;
+    float* out;
+} IdentityTwin;
+
+static int twin_create(IdentityTwin* t, const AudioPipeline4ChConfig* cfg) {
+    t->p = audio_pipeline_4ch_ulcnet_create(cfg);
+    t->out = NULL;
+    if (t->p != NULL) {
+        t->out = (float*)malloc(
+            (size_t)audio_pipeline_4ch_ulcnet_hop_size(t->p) * sizeof(float));
+    }
+    return t->p != NULL && t->out != NULL;
+}
+
+static int twin_step(IdentityTwin* t, const float* microphones,
+                     const float* far) {
+    return audio_pipeline_4ch_ulcnet_process_with_activity(
+               t->p, microphones, far, 0, t->out) == FOUR_AEC_NR_RES_OK;
+}
+
+static void twin_destroy(IdentityTwin* t) {
+    audio_pipeline_4ch_ulcnet_destroy(t->p);
+    free(t->out);
 }
 
 /* ============================================================================
@@ -282,7 +380,7 @@ static int test_counting_model_policy(void) {
     float* far;
     float* out;
     float* far_hist;   /* full far stream for the echo path */
-    float* beam_hist;
+    IdentityTwin twin;   /* NULL-model twin: the identity reference */
     long expected_infer = 0;
     long changed_count = 0;
     long skipped_total = 0;
@@ -304,7 +402,8 @@ static int test_counting_model_policy(void) {
     cfg.core.enable_cng = 0;
 
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
-    CHECK(p != NULL, "create counting-model pipeline");
+    CHECK(p != NULL && twin_create(&twin, &cfg),
+          "create counting-model pipeline pair");
     hop = audio_pipeline_4ch_ulcnet_hop_size(p);
 
     memset(&m, 0, sizeof(m));
@@ -321,13 +420,11 @@ static int test_counting_model_policy(void) {
     far = (float*)malloc((size_t)hop * sizeof(float));
     out = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)total_frames * hop, sizeof(float));
-    beam_hist = (float*)calloc((size_t)total_frames * hop, sizeof(float));
-    CHECK(microphones && far && out && far_hist && beam_hist,
+    CHECK(microphones && far && out && far_hist,
           "allocate counting-model buffers");
 
     for (int frame = 0; frame < total_frames; ++frame) {
-        const float* beam;
-        int frames = frames_in_hop(frame);
+        const int frames = 1;   /* one frame per hop, from hop #0 */
         int scaled;
 
         if (frame == FRAMES) {
@@ -344,10 +441,8 @@ static int test_counting_model_policy(void) {
               "counting-model frame processes");
         CHECK(audio_pipeline_4ch_ulcnet_last_delay(p, &delay) == 0,
               "delay-state accessor works");
-
-        beam = audio_pipeline_4ch_ulcnet_last_beamformed_error(p);
-        memcpy(beam_hist + (size_t)frame * hop, beam,
-               (size_t)hop * sizeof(float));
+        CHECK(twin_step(&twin, microphones, far),
+              "counting-model reference frame processes");
 
         if (delay.changed) {
             changed_count += 1;
@@ -384,9 +479,7 @@ static int test_counting_model_policy(void) {
             if (comparable) {
                 float e = 0.0f;
                 for (int i = 0; i < hop; ++i) {
-                    float d = fabsf(
-                        out[i] - expected_gain *
-                        beam_hist[(size_t)(frame - 1) * hop + i]);
+                    float d = fabsf(out[i] - expected_gain * twin.out[i]);
                     if (d > e) e = d;
                 }
                 if (scaled) {
@@ -419,7 +512,7 @@ static int test_counting_model_policy(void) {
     CHECK(max_identity_err <= 2e-4f,
           "infer error => fail-open identity (3x marker ignored)");
 
-    /* Pipeline reset must also reset the runtime and restart the 2-hop
+    /* Pipeline reset must also reset the runtime and restart the 1-hop
      * preamble. */
     audio_pipeline_4ch_ulcnet_reset(p);
     CHECK(m.reset_calls == changed_count + 1,
@@ -435,12 +528,12 @@ static int test_counting_model_policy(void) {
             if (a > max_out) max_out = a;
         }
         CHECK(max_out == 0.0f, "post-reset hop#0 emits exact zeros");
-        CHECK(m.infer_calls == infer_before,
-              "post-reset hop#0 emits no frames to the model");
+        CHECK(m.infer_calls == infer_before + 1,
+              "post-reset hop#0 is one inference, like every hop");
     }
 
     audio_pipeline_4ch_ulcnet_destroy(p);
-    free(beam_hist);
+    twin_destroy(&twin);
     free(far_hist);
     free(out);
     free(far);
@@ -497,7 +590,7 @@ static int test_fixed_first_alignment_resets_model(void) {
           "4ch FIXED has no estimator-generated changed event");
     CHECK(m.reset_calls == 1,
           "4ch wrapper resets model once at FIXED raw-to-aligned transition");
-    /* N hops emit N frames (0/2/1); exactly the straddling ones are skipped. */
+    /* N hops, one frame each; exactly the straddling ones are skipped. */
     CHECK(m.infer_calls == N - AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES,
           "4ch FIXED transition suppresses inference for exactly the "
           "straddling reprime frames and no others");
@@ -1050,13 +1143,13 @@ static int test_pool_and_descriptor_gate(void) {
      * layout this wrapper descriptor carries. Bump this literal with
      * AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 15u;
+    stale.layout_version = 16u;
     CHECK(audio_pipeline_4ch_ulcnet_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "init_ex rejects a descriptor from the superseded layout even "
           "when its byte count exactly covers the current pool");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION &&
-          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 16u,
+          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 17u,
           "the queried descriptor publishes the current carve layout");
 
     stat = audio_pipeline_4ch_ulcnet_init_ex(
@@ -1111,8 +1204,6 @@ static int test_pool_and_descriptor_gate(void) {
     audio_pipeline_4ch_ulcnet_destroy(stat);
     CHECK(audio_pipeline_4ch_ulcnet_hop_size(stat) == -1,
           "destroy marks a caller-pool instance inactive");
-    CHECK(audio_pipeline_4ch_ulcnet_last_beamformed_error(stat) == NULL,
-          "destroyed instance returns NULL beamformed accessor");
     audio_pipeline_4ch_ulcnet_destroy(stat);
     CHECK(audio_pipeline_4ch_ulcnet_hop_size(stat) == -1,
           "caller-pool destroy is idempotent");
@@ -1137,14 +1228,13 @@ static int test_pool_and_descriptor_gate(void) {
  *    expected output position is derived, not measured:
  *      + 0    applied delay (silent mics -> the shared delay never
  *             acquires; pre.aligned_ref therefore carries raw far)
- *      + 256  the wrapper's one-hop far-compensation buffer (far frames
- *             are delayed one hop to match the beam WOLA's one-hop lag)
- *      + 256  the centered ULCNet chain (hop #p output = chain input hop
- *             p-1) closed by its WOLA
- *      = T + 512.
- *    MUTATION PROOF: pushing this hop's far directly (removing the
- *    one-hop far buffer) moves the reconstructed impulse to T + 256 --
- *    this check then fails with offset -256.
+ *      + 0    the far branch is framed from the CURRENT hop, like the
+ *             error branch (no compensation buffer on either side)
+ *      + hop  the ULCNet synthesis (hop #p output = chain input hop p-1)
+ *      = T + one hop.
+ *    MUTATION PROOF: delaying the far branch by a hop moves the
+ *    reconstructed impulse to T + 2 hops -- this check then fails with
+ *    offset +hop.
  * ========================================================================== */
 
 static int passthrough_far_infer(
@@ -1160,72 +1250,163 @@ static int passthrough_far_infer(
     return 0;
 }
 
-static int test_far_timestamp_before_acquisition(void) {
+/* Shared shell of the two impulse-timestamp tests (5 and 5b): FRAMES hops
+ * of silence with one unit impulse on ONE branch at (IMP_FRAME, IMP_OFF),
+ * through `model` (NULL = identity). Reports where the output peaks and how
+ * much of its energy sits within +-8 samples of the expected position; the
+ * assertions differ per branch and stay in the callers. */
+typedef struct ImpulseRun {
+    int imp_index;
+    int expect_index;    /* imp_index + 1 hop: the synthesis' one hop */
+    int found_index;
+    float peak;
+    double near_ratio;   /* energy within +-8 of expect_index / total */
+} ImpulseRun;
+
+static int run_impulse(const AudioPipeline4ChConfig* cfg,
+                       const UlcnetModel* model, int impulse_on_mics,
+                       int activity, ImpulseRun* r) {
     enum { FRAMES = 40, IMP_FRAME = 8, IMP_OFF = 37 };
-    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* p;
-    UlcnetModel model;
     float* microphones;
     float* far;
     float* out_hist;
     int hop;
-    int imp_index;
-    int expect_index;
-    int found_index = -1;
-    float peak = 0.0f;
+    double energy_total = 0.0;
+    double energy_near = 0.0;
 
-    cfg.gsc_fixed_mode = 1;
-    cfg.gsc_fixed_doa_rad = 0.4f;
-    cfg.gsc_mu = 0.02f;
-    cfg.core.enable_cng = 0;
-
-    p = audio_pipeline_4ch_ulcnet_create(&cfg);
-    CHECK(p != NULL, "create far-timestamp pipeline");
+    p = audio_pipeline_4ch_ulcnet_create(cfg);
+    CHECK(p != NULL, "create impulse-timestamp pipeline");
     hop = audio_pipeline_4ch_ulcnet_hop_size(p);
-    imp_index = IMP_FRAME * hop + IMP_OFF;
-    expect_index = imp_index + 2 * hop;
-
-    memset(&model, 0, sizeof(model));
-    model.infer = passthrough_far_infer;
-    model.io_descriptor = test_io_descriptor();
-    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
-          "install far-passthrough model");
+    if (model != NULL) {
+        CHECK(audio_pipeline_4ch_ulcnet_set_model(p, model) == 0,
+              "install impulse-timestamp model");
+    }
     microphones = (float*)calloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
     far = (float*)calloc((size_t)hop, sizeof(float));
     out_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
     CHECK(microphones && far && out_hist,
-          "allocate far-timestamp buffers");
+          "allocate impulse-timestamp buffers");
+
+    memset(r, 0, sizeof(*r));
+    r->imp_index = IMP_FRAME * hop + IMP_OFF;
+    r->expect_index = r->imp_index + hop;
+    r->found_index = -1;
 
     for (int frame = 0; frame < FRAMES; ++frame) {
         memset(far, 0, (size_t)hop * sizeof(float));
-        if (frame == IMP_FRAME) far[IMP_OFF] = 1.0f;
+        memset(microphones, 0,
+               (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
+        if (frame == IMP_FRAME) {
+            if (impulse_on_mics) {
+                for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+                    microphones[IMP_OFF * FOUR_AEC_NR_RES_CHANNELS + ch] = 1.0f;
+            } else {
+                far[IMP_OFF] = 1.0f;
+            }
+        }
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
-                  p, microphones, far, 0,
+                  p, microphones, far, activity,
                   out_hist + (size_t)frame * hop) == FOUR_AEC_NR_RES_OK,
-              "far-timestamp frame processes");
+              "impulse-timestamp frame processes");
     }
 
     for (int t = 0; t < FRAMES * hop; ++t) {
         float a = fabsf(out_hist[t]);
-        if (a > peak) {
-            peak = a;
-            found_index = t;
+        energy_total += (double)a * (double)a;
+        if (a > r->peak) {
+            r->peak = a;
+            r->found_index = t;
         }
     }
-    printf("far timestamp (4ch before acquisition): impulse at far[%d] -> out[%d] "
-           "(expected %d, offset %+d samples, peak %.4f)\n",
-           imp_index, found_index, expect_index,
-           found_index - expect_index, peak);
-    CHECK(found_index == expect_index,
-          "far impulse lands at impulse + 2 hops (1-hop far buffer + "
-          "1-hop ULCNet chain; no err/far skew)");
-    CHECK(peak > 0.9f, "far impulse reconstructed at ~unit amplitude");
+    for (int t = r->expect_index - 8; t <= r->expect_index + 8; ++t) {
+        if (t >= 0 && t < FRAMES * hop)
+            energy_near += (double)out_hist[t] * (double)out_hist[t];
+    }
+    r->near_ratio = energy_total > 0.0 ? energy_near / energy_total : 0.0;
 
     audio_pipeline_4ch_ulcnet_destroy(p);
     free(out_hist);
     free(far);
     free(microphones);
+    return 1;
+}
+
+static int test_far_timestamp_before_acquisition(void) {
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    UlcnetModel model;
+    ImpulseRun r;
+
+    cfg.gsc_fixed_mode = 1;
+    cfg.gsc_fixed_doa_rad = 0.4f;
+    cfg.gsc_mu = 0.02f;
+    cfg.core.enable_cng = 0;
+    memset(&model, 0, sizeof(model));
+    model.infer = passthrough_far_infer;
+    model.io_descriptor = test_io_descriptor();
+
+    CHECK(run_impulse(&cfg, &model, 0, 0, &r), "far-timestamp run");
+    printf("far timestamp (4ch before acquisition): impulse at far[%d] -> out[%d] "
+           "(expected %d, offset %+d samples, peak %.4f)\n",
+           r.imp_index, r.found_index, r.expect_index,
+           r.found_index - r.expect_index, r.peak);
+    CHECK(r.found_index == r.expect_index,
+          "far impulse lands at impulse + 1 hop (the ULCNet synthesis only; "
+          "no err/far skew)");
+    CHECK(r.peak > 0.9f, "far impulse reconstructed at ~unit amplitude");
+    return 1;
+}
+
+/* ============================================================================
+ * 5b. Error-branch timestamp and content: the mirror of test 5 on the OTHER
+ *    branch, against the INPUT rather than the model's output. Silence on
+ *    far, one unit impulse on all four mics, a frozen fixed beamformer
+ *    (mu 0, vad 1), FIXED delay 0 (boundary-free), NULL model (identity).
+ *    The impulse must come out at EXACTLY impulse + 1 hop -- the GSC
+ *    spectrum of hop p is the model's frame at hop p and the synthesis adds
+ *    the one hop -- and it must come out AS an impulse: a spectrum handed
+ *    over with its imaginary part dropped, or an error branch delayed by a
+ *    hop, both pass every model-output test (they are self-consistent) and
+ *    are caught only here.
+ *    MUTATION: delaying the error branch by a hop moves the peak by +hop;
+ *    zeroing err_im mirrors the impulse inside the frame and the energy
+ *    outside the peak neighbourhood rises to about half.
+ * ========================================================================== */
+
+static int test_error_timestamp_and_content(void) {
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    ImpulseRun r;
+
+    cfg.gsc_fixed_mode = 1;
+    cfg.gsc_fixed_doa_rad = 0.3f;
+    cfg.gsc_mu = 0.0f;
+    cfg.core.enable_cng = 0;
+    cfg.core.delay_mode = AEC_DELAY_FIXED;
+    cfg.core.fixed_delay_samples = 0;
+
+    /* Mics carry the impulse, far is silent, NULL model = identity. */
+    CHECK(run_impulse(&cfg, NULL, 1, 1, &r), "error-timestamp run");
+    printf("error timestamp (4ch): impulse at mic[%d] -> out[%d] (expected %d, "
+           "offset %+d samples, peak %.4f, near-peak energy %.3f of total)\n",
+           r.imp_index, r.found_index, r.expect_index,
+           r.found_index - r.expect_index, r.peak, r.near_ratio);
+    /* The frozen beamformer's fractional steering delays and the mic HPF
+     * spread the impulse over a few samples and can move its peak sample by
+     * one or two (measured: +0 at 16 kHz, -1 at 48 kHz) and scale it to
+     * about 0.2-0.25 of unit; +-8 covers the spread and nothing else. A
+     * mirrored copy (imaginary part dropped) lands a hop-scale distance away
+     * and halves the ratio (measured 0.48 vs 0.91/0.96). */
+    CHECK(r.found_index >= r.expect_index - 2 &&
+          r.found_index <= r.expect_index + 2,
+          "mic impulse lands at impulse + 1 hop (within the beamformer's "
+          "steering spread) through the direct GSC -> synthesis path");
+    CHECK(r.peak > 0.1f,
+          "mic impulse comes through the frozen beamformer (spread, not "
+          "attenuated away)");
+    CHECK(r.near_ratio > 0.8,
+          "the impulse comes out as an impulse: the spectrum reached the "
+          "synthesis with both parts intact (no mirrored copy, no smear)");
     return 1;
 }
 
@@ -1246,7 +1427,7 @@ static int test_model_applies_unlocked(void) {
     float* far;
     float* out;
     float* far_hist;
-    float* beam_hist;
+    IdentityTwin twin;   /* NULL-model twin: the identity reference */
     long expected_infer = 0;
     int reprime_armed = 0;
     int cur_reprime = 0;
@@ -1262,7 +1443,8 @@ static int test_model_applies_unlocked(void) {
     cfg.core.enable_cng = 0;
 
     p = audio_pipeline_4ch_ulcnet_create(&cfg);
-    CHECK(p != NULL, "create unlocked-model pipeline");
+    CHECK(p != NULL && twin_create(&twin, &cfg),
+          "create unlocked-model pipeline pair");
     hop = audio_pipeline_4ch_ulcnet_hop_size(p);
 
     memset(&m, 0, sizeof(m));
@@ -1280,13 +1462,11 @@ static int test_model_applies_unlocked(void) {
     far = (float*)malloc((size_t)hop * sizeof(float));
     out = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
-    beam_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
-    CHECK(microphones && far && out && far_hist && beam_hist,
+    CHECK(microphones && far && out && far_hist,
           "allocate unlocked-model buffers");
 
     for (int frame = 0; frame < FRAMES; ++frame) {
-        const float* beam;
-        int frames = frames_in_hop(frame);
+        const int frames = 1;   /* one frame per hop, from hop #0 */
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   p, microphones, far, 0, out) == FOUR_AEC_NR_RES_OK,
@@ -1294,10 +1474,8 @@ static int test_model_applies_unlocked(void) {
         CHECK(audio_pipeline_4ch_ulcnet_last_delay(p, &delay) == 0,
               "unlocked-model delay accessor works");
         if (first_solid_frame < 0 && delay.solid) first_solid_frame = frame;
-
-        beam = audio_pipeline_4ch_ulcnet_last_beamformed_error(p);
-        memcpy(beam_hist + (size_t)frame * hop, beam,
-               (size_t)hop * sizeof(float));
+        CHECK(twin_step(&twin, microphones, far),
+              "unlocked-model reference frame processes");
 
         /* Stepped on every emitted frame except the identity-reprime frames
          * armed at an alignment generation. */
@@ -1314,15 +1492,13 @@ static int test_model_applies_unlocked(void) {
               "reprime");
 
         /* Applied from the very first emitted frames: out[p] must be the
-         * 0.5x-scaled beam stream on EVERY frame >= 2 (skip delay-change
+         * 0.5x-scaled identity stream on EVERY frame >= 2 (skip delay-change
          * boundary frames where the beam itself is discontinuous, and the
          * reprime frames, which are identity by policy). */
         if (frame >= 2 && !delay.changed && !cur_reprime && !prev_reprime) {
             float e = 0.0f;
             for (int i = 0; i < hop; ++i) {
-                float d = fabsf(
-                    out[i] - m.scale *
-                    beam_hist[(size_t)(frame - 1) * hop + i]);
+                float d = fabsf(out[i] - m.scale * twin.out[i]);
                 if (d > e) e = d;
             }
             if (e > max_err) max_err = e;
@@ -1338,7 +1514,7 @@ static int test_model_applies_unlocked(void) {
           "(no delay-lock gating of application)");
 
     audio_pipeline_4ch_ulcnet_destroy(p);
-    free(beam_hist);
+    twin_destroy(&twin);
     free(far_hist);
     free(out);
     free(far);
@@ -1384,14 +1560,13 @@ static int test_nan_guard(void) {
     enum { FRAMES = 60, TRUE_DELAY = 400 };
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* pa;
-    AudioPipeline4ChUlcnet* pb;
+    IdentityTwin twin;   /* NULL model: identity */
     NanModel m;
     UlcnetModel model;
     FourAecNrResDelayState delay;
     float* microphones;
     float* far;
     float* out_a;
-    float* out_b;
     float* far_hist;
     int poisoned[FRAMES];
     int reprime_left = 0;
@@ -1406,8 +1581,8 @@ static int test_nan_guard(void) {
     cfg.core.enable_cng = 0;
 
     pa = audio_pipeline_4ch_ulcnet_create(&cfg);
-    pb = audio_pipeline_4ch_ulcnet_create(&cfg);   /* NULL model: identity */
-    CHECK(pa != NULL && pb != NULL, "create NaN-guard pipeline pair");
+    CHECK(pa != NULL && twin_create(&twin, &cfg),
+          "create NaN-guard pipeline pair");
     hop = audio_pipeline_4ch_ulcnet_hop_size(pa);
 
     memset(&m, 0, sizeof(m));
@@ -1422,9 +1597,8 @@ static int test_nan_guard(void) {
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out_a = (float*)malloc((size_t)hop * sizeof(float));
-    out_b = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
-    CHECK(microphones && far && out_a && out_b && far_hist,
+    CHECK(microphones && far && out_a && far_hist,
           "allocate NaN-guard buffers");
 
     for (int frame = 0; frame < FRAMES; ++frame) {
@@ -1438,8 +1612,7 @@ static int test_nan_guard(void) {
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   pa, microphones, far, 0, out_a) == FOUR_AEC_NR_RES_OK,
               "NaN-guard model frame processes");
-        CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
-                  pb, microphones, far, 0, out_b) == FOUR_AEC_NR_RES_OK,
+        CHECK(twin_step(&twin, microphones, far),
               "NaN-guard reference frame processes");
 
         /* Both pipelines cross the same alignment generations, and an
@@ -1451,8 +1624,8 @@ static int test_nan_guard(void) {
               "NaN-guard delay accessor works");
         if (delay.changed)
             reprime_left = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
-        /* One emitted frame per hop this far into the run, so a hop spends
-         * at most one frame of the budget. */
+        /* One frame per hop, so a hop spends at most one frame of the
+         * budget. */
         if (reprime_take(&reprime_left, 1) > 0) {
             poisoned[frame] = 1;
             n_reprime += 1;
@@ -1463,29 +1636,25 @@ static int test_nan_guard(void) {
                   "no NaN/Inf ever reaches the pipeline output");
         }
 
-        /* 50%-overlap mixing rule (same as the mono test's): hop 0 emits
-         * exact zeros on both sides; hop 1 mixes ONLY the two frames
-         * pushed at hop 1 (and the beam is NOT exactly zero there -- the
-         * AEC lanes leak ~1e-12 residual from the far noise even on
-         * silent mics, so an applied 0.5x frame already differs); hop
-         * p >= 2 mixes the frames pushed at hops p-1 and p. */
+        /* 50%-overlap mixing rule: hop 0 emits exact zeros on both sides
+         * (frame #0 lies inside the synthesis's trimmed half window); hop
+         * p >= 1 mixes the frames pushed at hops p-1 and p, so it is
+         * bit-identical only when BOTH were identity frames. */
         if (frame == 0) {
             equal_expected = 1;
-        } else if (frame == 1) {
-            equal_expected = poisoned[1];
         } else {
             equal_expected = poisoned[frame - 1] && poisoned[frame];
         }
         bitwise_equal =
-            memcmp(out_a, out_b, (size_t)hop * sizeof(float)) == 0;
+            memcmp(out_a, twin.out, (size_t)hop * sizeof(float)) == 0;
         if (equal_expected) {
             n_equal += 1;
             CHECK(bitwise_equal,
                   "rc==0 NaN frames are discarded bitwise (identity path)");
         } else if (frame >= 3) {
-            /* frame 2's beam may still be zero (echo starts at t=400 which
-             * lands in beam hop 1, reconstructed at hop 2 -- keep a one-
-             * frame margin); from frame 3 the 0.5x scale must show. */
+            /* frame 2's beam may still be near zero (echo starts at t=400,
+             * i.e. hop 1, whose frame reaches the output at hop 2 -- keep a
+             * one-frame margin); from frame 3 the 0.5x scale must show. */
             n_differ += 1;
             CHECK(!bitwise_equal,
                   "clean frames after a NaN window are applied again");
@@ -1497,9 +1666,8 @@ static int test_nan_guard(void) {
           "NaN-guard: reprime frames accounted for in whole generations");
 
     audio_pipeline_4ch_ulcnet_destroy(pa);
-    audio_pipeline_4ch_ulcnet_destroy(pb);
+    twin_destroy(&twin);
     free(far_hist);
-    free(out_b);
     free(out_a);
     free(far);
     free(microphones);
@@ -1546,14 +1714,13 @@ static int test_partial_write_guard(void) {
     enum { FRAMES = 60, TRUE_DELAY = 400 };
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* pa;
-    AudioPipeline4ChUlcnet* pb;
+    IdentityTwin twin;   /* NULL model: identity */
     PartialModel m;
     UlcnetModel model;
     FourAecNrResDelayState delay;
     float* microphones;
     float* far;
     float* out_a;
-    float* out_b;
     float* far_hist;
     int partial[FRAMES];
     int reprime_left = 0;
@@ -1568,8 +1735,8 @@ static int test_partial_write_guard(void) {
     cfg.core.enable_cng = 0;
 
     pa = audio_pipeline_4ch_ulcnet_create(&cfg);
-    pb = audio_pipeline_4ch_ulcnet_create(&cfg);   /* NULL model: identity */
-    CHECK(pa != NULL && pb != NULL, "create partial-write pipeline pair");
+    CHECK(pa != NULL && twin_create(&twin, &cfg),
+          "create partial-write pipeline pair");
     hop = audio_pipeline_4ch_ulcnet_hop_size(pa);
 
     memset(&m, 0, sizeof(m));
@@ -1584,9 +1751,8 @@ static int test_partial_write_guard(void) {
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
     far = (float*)malloc((size_t)hop * sizeof(float));
     out_a = (float*)malloc((size_t)hop * sizeof(float));
-    out_b = (float*)malloc((size_t)hop * sizeof(float));
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
-    CHECK(microphones && far && out_a && out_b && far_hist,
+    CHECK(microphones && far && out_a && far_hist,
           "allocate partial-write buffers");
 
     for (int frame = 0; frame < FRAMES; ++frame) {
@@ -1600,8 +1766,7 @@ static int test_partial_write_guard(void) {
         CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
                   pa, microphones, far, 0, out_a) == FOUR_AEC_NR_RES_OK,
               "partial-write model frame processes");
-        CHECK(audio_pipeline_4ch_ulcnet_process_with_activity(
-                  pb, microphones, far, 0, out_b) == FOUR_AEC_NR_RES_OK,
+        CHECK(twin_step(&twin, microphones, far),
               "partial-write reference frame processes");
 
         /* Same reprime bookkeeping as the NaN test: an identity-reprime
@@ -1623,13 +1788,11 @@ static int test_partial_write_guard(void) {
         /* Same 50%-overlap mixing rule as test 7. */
         if (frame == 0) {
             equal_expected = 1;
-        } else if (frame == 1) {
-            equal_expected = partial[1];
         } else {
             equal_expected = partial[frame - 1] && partial[frame];
         }
         bitwise_equal =
-            memcmp(out_a, out_b, (size_t)hop * sizeof(float)) == 0;
+            memcmp(out_a, twin.out, (size_t)hop * sizeof(float)) == 0;
         if (equal_expected) {
             n_equal += 1;
             CHECK(bitwise_equal,
@@ -1650,9 +1813,8 @@ static int test_partial_write_guard(void) {
           "partial-write: reprime frames accounted for in whole generations");
 
     audio_pipeline_4ch_ulcnet_destroy(pa);
-    audio_pipeline_4ch_ulcnet_destroy(pb);
+    twin_destroy(&twin);
     free(far_hist);
-    free(out_b);
     free(out_a);
     free(far);
     free(microphones);
@@ -1681,16 +1843,14 @@ static int test_partial_write_guard(void) {
  * a raw->aligned transition and never arms a reprime -- asserted, not
  * assumed). The reprime logic therefore takes no part in measuring its own
  * length, and the measurement is pure framing/latency: which emitted frames
- * still reach back across hop T. This also matters for the far branch: at a
- * real boundary the wrapper CLEARS the saved far hop (and the beam OLA), so
- * the boundary run itself could not see that slot's pre-switch content --
- * clearing replaces what the straddling slot holds, it does not move the
- * slot.
+ * still reach back across hop T. Measuring at a real boundary would also
+ * entangle the model reset and the arming of the reprime with the framing
+ * question; the control run keeps them apart (nothing is cleared at a
+ * boundary any more, so there is no other difference to account for).
  *
- * Both branches come out at 2 here versus 1 for the mono wrapper, and for a
- * measured reason: this wrapper pushes both branches one hop behind the
- * input (beam WOLA lag + the matching one-hop far compensation), so the slot
- * pushed at hop T still belongs to input hop T-1.
+ * Both branches come out at 1, as in the mono wrapper, and for a measured
+ * reason: both are framed from the current input hop, so only the frame at
+ * hop T still reaches back to input hop T-1.
  *
  * The boundary run (FIXED delay = T hops, so the raw->aligned switch lands
  * exactly on hop T) then checks the implementation: exactly REPRIME frames
@@ -1824,15 +1984,15 @@ static int reprime_probe_run(int fixed_delay, int mark_far, ProbeModel* st) {
  * Measured on the boundary-free control, so this is the chain's MEMORY of
  * content injected before hop RP_T, not a straddle count. Per branch:
  *   far   -- the marker reaches the analysis untouched, so the memory is
- *            exactly the beam/far lag plus the centered 50%-overlap window
- *            straddle. This is the derivation of REPRIME_FRAMES.
+ *            exactly the 50%-overlap window straddle. This is the
+ *            derivation of REPRIME_FRAMES.
  *   error -- the marker passes the AEC linear filter first, so the memory is
  *            the straddle PLUS the filter's causal tail. Waiting that tail
  *            out is not what the reprime is for and has no principled bound,
  *            so this branch can only bound the straddle from above.
  * The tail is why the branches agree at 16 kHz and differ at 48 kHz:
  * filter_length is 52 ms (3.25 hops) at 16 kHz but 64 ms (6.00 hops) at
- * 48 kHz, while the straddle stays at two hops on both. */
+ * 48 kHz, while the straddle stays at one hop on both. */
 static int reprime_straddle_count(const ProbeModel* st, int far_branch,
                                   float* dirty_min, float* clean_max) {
     int n = 0;
@@ -1861,8 +2021,7 @@ static int test_reprime_straddle_derivation(void) {
     float first_visible_err_peak = -1.0f, first_visible_far_peak = -1.0f;
     int stepped_inside_reprime = 0;
 
-    for (int frame = 0; frame < RP_RUN; ++frame)
-        expected_frames += frames_in_hop(frame);
+    expected_frames = RP_RUN;   /* one frame per hop, from hop #0 */
 
     CHECK(reprime_probe_run(0, 0, &err_ctl), "run error-branch control probe");
     CHECK(reprime_probe_run(0, 1, &far_ctl), "run far-branch control probe");
@@ -2017,7 +2176,7 @@ static int test_reprime_behavior(void) {
 
     g_rng = 0x1234567u;
     for (int frame = 0; frame < FRAMES; ++frame) {
-        int frames = frames_in_hop(frame);
+        const int frames = 1;   /* one frame per hop, from hop #0 */
         long calls_before = m.infer_calls;
         int skipped_here;
         long delta;
@@ -2097,7 +2256,7 @@ static int test_reprime_behavior(void) {
         memset(mics, 0, sizeof(mics));
         for (int frame = 0; frame < 20; ++frame) {
             FourAecNrResDelayState fdelay;
-            int frames = frames_in_hop(frame);
+            const int frames = 1;   /* one frame per hop, from hop #0 */
             long calls_before = fm.infer_calls;
             int solid_before;
             int skipped_here;
@@ -2285,7 +2444,7 @@ static int run_all_tests(void) {
         }
     }
     CHECK(test_identity_e2e(),
-          "identity E2E / 2-hop timing contract");
+          "identity E2E / 1-hop timing contract");
     CHECK(test_counting_model_policy(),
           "counting model policy (stepping, resets, fail-open)");
     CHECK(test_fixed_first_alignment_resets_model(),
@@ -2300,6 +2459,8 @@ static int run_all_tests(void) {
           "pool rejection / descriptor gate / destroy idempotence");
     CHECK(test_far_timestamp_before_acquisition(),
           "far timestamp: err/far frame pairs are same-hop before acquisition");
+    CHECK(test_error_timestamp_and_content(),
+          "error timestamp: the mic impulse lands at +1 hop, as an impulse");
     CHECK(test_model_applies_unlocked(),
           "model applies without a delay lock");
     CHECK(test_nan_guard(),

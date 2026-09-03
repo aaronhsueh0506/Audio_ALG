@@ -129,6 +129,7 @@ static uint32_t pp_build_hash(int io_mode) {
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MASK_LOOKAHEAD);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_DF_LOOKAHEAD);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_IO_LAYOUT_VERSION);
+    h = pp_fnv1a_u32(h, (uint32_t)DFN2_PREPOST_CARVE_VERSION);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_INPUT_FRAMES);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_GRU_HIDDEN);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_ENCODER_CHANNELS);

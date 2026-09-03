@@ -16,6 +16,7 @@ README.
 | Board integration of `libaudio_pipeline.a` | [`pipeline_board_integration.md`](pipeline_board_integration.md) |
 | Frequency-domain gain fusion | [`freq_domain_pipeline_design.md`](freq_domain_pipeline_design.md) |
 | Four-channel C/Python AEC / external beamformer seam | [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md) |
+| Four-channel Align-ULCNet application (direct GSC-spectrum path) | [`../pipelines/4ch_alignulcnet/README.md`](../pipelines/4ch_alignulcnet/README.md) |
 | Standalone AINR models | [`../AINR/README.md`](../AINR/README.md) |
 | DFN2 cascade/alpha contract | [`../AINR/DeepFilterNet2/README.md`](../AINR/DeepFilterNet2/README.md) |
 | Neural AEC candidates | [`../AIAEC/README.md`](../AIAEC/README.md) |

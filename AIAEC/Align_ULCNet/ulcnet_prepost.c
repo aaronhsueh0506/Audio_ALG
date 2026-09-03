@@ -1,11 +1,12 @@
 /* Align-ULCNet pre/post class. Contract: see ulcnet_prepost.h.
  *
  * This file OWNS no signal processing of its own. It composes the two
- * parity-tested translation units -- ulcnet_process.c (centered sqrt-Hann
- * STFT/WOLA) and ulcnet_model_io.c (feature front end, accelerator tensor
+ * parity-tested translation units -- ulcnet_process.c (sqrt-Hann STFT/WOLA,
+ * driven here in its one-frame-per-hop rolling form) and ulcnet_model_io.c
+ * (feature front end, accelerator tensor
  * views, recurrent rings) -- and adds only the object lifecycle, the pool
- * carve and the per-hop frame state machine. Neither of those files
- * changes, so both of their standalone parity builds keep linking.
+ * carve and the per-hop frame state machine. Neither file's existing entry
+ * points change, so both of their standalone parity builds keep linking.
  *
  * Constraint inherited from both: -ffp-contract=off. No heap in _init, no
  * globals, no stdio. */
@@ -32,17 +33,12 @@ struct UlcnetPrepost {
 
     /* ULCNET_IO_TIME only; NULL in ULCNET_IO_FREQ.
      *
-     * The analysis is a plain 1-frame-per-hop rolling window, NOT
-     * ulcnet_analysis_push's centered schedule -- see the header's FRAMING
-     * note. `seg`/`spec` are the shared per-call transform scratch: the two
-     * analyses and the synthesis are strictly sequential within a hop, so
-     * one set serves all three (the same rule the FftHandle is shared
-     * under). Struct-owned, never stack, so an embedded task stack never
-     * sees a multi-KB frame. */
-    float           *hist_err;   /* [ULCNET_N_FFT] */
-    float           *hist_far;   /* [ULCNET_N_FFT] */
-    float           *seg;        /* [ULCNET_N_FFT] windowed staging  */
-    Complex         *spec;       /* [ULCNET_BINS]  rfft staging      */
+     * Both analyses are driven with ulcnet_analysis_push_frame -- the plain
+     * one-frame-per-hop rolling window, NOT ulcnet_analysis_push's centered
+     * schedule -- see the header's FRAMING note. The structs embed their
+     * own transform scratch (struct-owned, never stack). */
+    UlcnetAnalysis  *ana_err;
+    UlcnetAnalysis  *ana_far;
     UlcnetSynthesis *synth;
 
     /* Per-hop frame staging: one frame, in both I/O modes. */
@@ -101,6 +97,7 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth) {
     h = pp_fnv1a(h, (uint32_t)ULCNET_SR);
     h = pp_fnv1a(h, (uint32_t)ULCNET_N_FFT);
     h = pp_fnv1a(h, (uint32_t)ULCNET_MODEL_IO_LAYOUT_VERSION);
+    h = pp_fnv1a(h, (uint32_t)ULCNET_PREPOST_CARVE_VERSION);
     h = pp_fnv1a(h, (uint32_t)io_mode);
     h = pp_fnv1a(h, (uint32_t)delay_depth);
     return h;
@@ -135,16 +132,10 @@ static int pp_layout(UlcnetPrepost *p, unsigned char *base,
     }
 
     if (cfg->io_mode == ULCNET_IO_TIME) {
-        const size_t nfft = (size_t)ULCNET_N_FFT * sizeof(float);
-        if (pp_carve(base, &cursor, nfft, &ptr) != 0) return -1;
-        if (base && p) p->hist_err = (float *)ptr;
-        if (pp_carve(base, &cursor, nfft, &ptr) != 0) return -1;
-        if (base && p) p->hist_far = (float *)ptr;
-        if (pp_carve(base, &cursor, nfft, &ptr) != 0) return -1;
-        if (base && p) p->seg = (float *)ptr;
-        if (pp_carve(base, &cursor, (size_t)ULCNET_BINS * sizeof(Complex),
-                     &ptr) != 0) return -1;
-        if (base && p) p->spec = (Complex *)ptr;
+        if (pp_carve(base, &cursor, sizeof(UlcnetAnalysis), &ptr) != 0) return -1;
+        if (base && p) p->ana_err = (UlcnetAnalysis *)ptr;
+        if (pp_carve(base, &cursor, sizeof(UlcnetAnalysis), &ptr) != 0) return -1;
+        if (base && p) p->ana_far = (UlcnetAnalysis *)ptr;
         if (pp_carve(base, &cursor, sizeof(UlcnetSynthesis), &ptr) != 0) return -1;
         if (base && p) p->synth = (UlcnetSynthesis *)ptr;
         if (pp_carve(base, &cursor, (size_t)ULCNET_HOP * sizeof(float),
@@ -273,9 +264,10 @@ UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes,
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
 
     if (cfg->io_mode == ULCNET_IO_TIME &&
-        ulcnet_synthesis_init(p->synth, p->fft, p->window) != 0) {
-        return NULL;   /* the rolling analysis has no state but its history,
-                        * which the whole-pool memset above already cleared */
+        (ulcnet_analysis_init(p->ana_err, p->fft, p->window) != 0 ||
+         ulcnet_analysis_init(p->ana_far, p->fft, p->window) != 0 ||
+         ulcnet_synthesis_init(p->synth, p->fft, p->window) != 0)) {
+        return NULL;
     }
     return p;
 }
@@ -320,10 +312,10 @@ void ulcnet_prepost_reset(UlcnetPrepost *p) {
     if (!p) return;
     ulcnet_model_io_reset(p->io);
     if (p->io_mode == ULCNET_IO_TIME) {
-        /* Re-init IS the reset for the synthesis (see ulcnet_process.h);
-         * the rolling analysis resets by zeroing its history. */
-        memset(p->hist_err, 0, (size_t)ULCNET_N_FFT * sizeof(float));
-        memset(p->hist_far, 0, (size_t)ULCNET_N_FFT * sizeof(float));
+        /* Re-init IS the reset for all three framing states (see
+         * ulcnet_process.h); the handle and window are unchanged. */
+        ulcnet_analysis_init(p->ana_err, p->fft, p->window);
+        ulcnet_analysis_init(p->ana_far, p->fft, p->window);
         ulcnet_synthesis_init(p->synth, p->fft, p->window);
         memset(p->out_hop, 0, (size_t)ULCNET_HOP * sizeof(float));
     }
@@ -354,30 +346,6 @@ const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p)
 
 /* ---- per-hop stages -------------------------------------------------- */
 
-/* center=False rolling analysis: append one hop, then transform the last
- * ULCNET_N_FFT samples. Exactly one frame per hop, from the very first hop.
- *
- * Arithmetic is deliberately identical -- same window multiply, same
- * fft_forward_scratch, same expression order -- to ulcnet_process.c's
- * ulcnet_rfft, so a frame produced here is bit-for-bit the frame the
- * centered analysis emits LAST on the same hop. That equality is what makes
- * this a pure re-labelling of the schedule rather than a change of signal. */
-static void pp_roll(UlcnetPrepost *p, float *history,
-                    const float hop_in[ULCNET_HOP],
-                    float *out_re, float *out_im) {
-    int k;
-    memmove(history, history + ULCNET_HOP,
-            (size_t)(ULCNET_N_FFT - ULCNET_HOP) * sizeof(float));
-    memcpy(history + ULCNET_N_FFT - ULCNET_HOP, hop_in,
-           (size_t)ULCNET_HOP * sizeof(float));
-    for (k = 0; k < ULCNET_N_FFT; ++k) p->seg[k] = history[k] * p->window[k];
-    fft_forward_scratch(p->fft, p->seg, p->spec);
-    for (k = 0; k < ULCNET_BINS; ++k) {
-        out_re[k] = p->spec[k].r;
-        out_im[k] = p->spec[k].i;
-    }
-}
-
 int ulcnet_prepost_pre_process(UlcnetPrepost *p,
                                const float err_hop[ULCNET_HOP],
                                const float far_hop[ULCNET_HOP]) {
@@ -385,10 +353,12 @@ int ulcnet_prepost_pre_process(UlcnetPrepost *p,
     if (p->io_mode != ULCNET_IO_TIME) return -1;
     if (p->frame_open) return -1;   /* previous frame neither committed nor skipped */
 
-    /* Both streams are transformed from the SAME hop index -- this class
-     * applies no internal skew -- so they cannot desynchronise. */
-    pp_roll(p, p->hist_err, err_hop, p->err_re, p->err_im);
-    pp_roll(p, p->hist_far, far_hop, p->far_re, p->far_im);
+    /* center=False rolling analysis, one frame per hop from the very first
+     * hop (see ulcnet_process.h). Both streams are transformed from the
+     * SAME hop index -- this class applies no internal skew -- so they
+     * cannot desynchronise. */
+    (void)ulcnet_analysis_push_frame(p->ana_err, err_hop, p->err_re, p->err_im);
+    (void)ulcnet_analysis_push_frame(p->ana_far, far_hop, p->far_re, p->far_im);
 
     p->frame_open = 1;
     return 1;   /* invariant: exactly one accelerator invocation per hop */

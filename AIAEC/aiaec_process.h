@@ -47,6 +47,12 @@ int aiaec_analysis_push(AiaecAnalysis *state,
 int aiaec_analysis_flush(AiaecAnalysis *state,
                          float real[2][AIAEC_N_BINS],
                          float imag[2][AIAEC_N_BINS]);
+/* center=False rolling analysis, one frame per push from the first push
+ * (ulcnet_analysis_push_frame). */
+int aiaec_analysis_push_frame(AiaecAnalysis *state,
+                              const float input[AIAEC_HOP],
+                              float real[AIAEC_N_BINS],
+                              float imag[AIAEC_N_BINS]);
 int aiaec_synthesis_init(AiaecSynthesis *state, FftHandle *fft,
                          const float *window);
 int aiaec_synthesis_push(AiaecSynthesis *state,

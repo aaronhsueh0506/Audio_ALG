@@ -219,6 +219,7 @@ SRCS := 4aec_nr_res.c audio_pipeline_4ch.c \
         tests/test_audio_pipeline_4ch.c tests/dump_delay_parity.c \
         ../4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c \
         $(ULCNET_DIR)/ulcnet_accelerator_adapter.c \
+        $(ULCNET_DIR)/ulcnet_prepost.c \
         ../4ch_alignulcnet/main.c $(ULCNET_DIR)/ulcnet_process.c \
         $(ULCNET_DIR)/ulcnet_model_io.c
 CFG_SIG_PAYLOAD := ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) LDFLAGS=$(LDLIBS) BACKEND=$(BACKEND) SIMD=$(SIMD) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SPATIAL_PRODUCER_SIG=$(SPATIAL_PRODUCER_SIG) SRCS=$(sort $(SRCS))
@@ -271,7 +272,13 @@ $(OBJ_DIR)/ulcnet_process.o: $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet
 $(OBJ_DIR)/ulcnet_model_io.o: $(ULCNET_DIR)/ulcnet_model_io.c $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
-$(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
+# ulcnet_prepost.o: the AIAEC-owned pre/post class the accelerator adapter
+# drives (the same third TU pipelines/Makefile links for the mono
+# application). Anything linking the adapter links this with it.
+$(OBJ_DIR)/ulcnet_prepost.o: $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_process.h $(ULCNET_DIR)/ulcnet_model_io.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/ulcnet_accelerator_adapter.o: $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.h $(ULCNET_DIR)/ulcnet_prepost.h $(ULCNET_DIR)/ulcnet_model_io.h $(ULCNET_DIR)/ulcnet_process.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4ch_alignulcnet_main.o: ../4ch_alignulcnet/main.c ../4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h $(ULCNET_DIR)/ulcnet_accelerator_adapter.h | _cfg_guard
@@ -418,8 +425,14 @@ ULCNET_4CH_OBJS := $(OBJ_DIR)/audio_pipeline_4ch_ulcnet.o \
 $(BIN_DIR)/test_audio_pipeline_4ch_ulcnet: $(OBJ_DIR)/test_audio_pipeline_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_audio_pipeline_4ch_ulcnet.o $(ULCNET_4CH_OBJS) $(OBJ_DIR)/ulcnet_model_io.o $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
 
-$(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/ulcnet_accelerator_adapter.o $(OBJ_DIR)/ulcnet_model_io.o $(ULCNET_4CH_OBJS) $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
-	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(OBJ_DIR)/ulcnet_accelerator_adapter.o $(OBJ_DIR)/ulcnet_model_io.o $(ULCNET_4CH_OBJS) $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
+# The adapter drives the pre/post class, so the application links
+# ulcnet_prepost.o with it (the test above does not link the adapter).
+ULCNET_ADAPTER_OBJS := $(OBJ_DIR)/ulcnet_accelerator_adapter.o \
+                       $(OBJ_DIR)/ulcnet_prepost.o \
+                       $(OBJ_DIR)/ulcnet_model_io.o
+
+$(BIN_DIR)/4ch_alignulcnet: $(OBJ_DIR)/4ch_alignulcnet_main.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/4ch_alignulcnet_main.o $(ULCNET_ADAPTER_OBJS) $(ULCNET_4CH_OBJS) $(PIPELINE_LIB) $(DOA_LIB) $(GSC_LIB) $(SPATIAL_COMMON_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
 
 $(BIN_DIR)/4aec_nr_res_static: $(OBJ_DIR)/4aec_nr_res_static.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/4aec_nr_res_static.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)

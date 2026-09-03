@@ -1,6 +1,7 @@
 # PBFDKF + Align-ULCNet Embedded Streaming 設計提案
 
-狀態：設計與實作對照稿（2026-08-16 覆核）。第 10 節的單幀 ONNX boundary
+狀態：設計與實作對照稿（2026-08-16 覆核，2026-09-03 就 4ch direct path、
+`ulcnet_prepost` class 與 adapter pool 三處改寫）。第 10 節的單幀 ONNX boundary
 （`AIAEC/Align_ULCNet/export_onnx.py`）、CPU external-state
 helper（`ulcnet_model_io.c/h`、`ulcnet_accelerator_adapter.c/h`）與 C
 STFT/WOLA（`ulcnet_process.c/h`）已實作；§8 的 delay 狀態機/fail-open 邏輯
@@ -68,7 +69,8 @@ output；論文展示頁提供的 KF residual 只作研究診斷，不是產品 
 
 `REPRIME_FRAMES` 由測試量出，但**只有 far 一路是推導**：脈衝標記在 far 路
 未經濾波抵達 analysis，量到的鏈記憶就是窗跨界本身，兩個 grid 都精確等於常數
-（mono 1、4ch 2）。**error 一路不是**：標記先過 AEC 線性濾波器，量到的是
+（mono 1、4ch 1；4ch 由 2 改為 1 的原因見 §8 的 2026-09-03 更新）。
+**error 一路不是**：標記先過 AEC 線性濾波器，量到的是
 跨界**加上**濾波器因果尾音，所以只能給上界。尾音長度隨 grid 變（16 kHz 的
 `filter_length` 是 52 ms = 3.25 hops，48 kHz 是 64 ms = 6.00 hops），這就是
 error 路在 16 kHz 與 far 路同值、在 48 kHz 多一幀的原因——**不是常數錯了**。
@@ -490,13 +492,29 @@ D=4 可再降低 key/value ring 與 logit history；最終數字必須由 export
 後的 tensor layout 與板端 allocator 報告。
 
 48 kHz 的 `ta_bins` 加倍（26 → 52），key/value history 跟著加倍，但
-logit history 只隨 D 走、不隨 grid 走，所以整體不是兩倍。實測
+logit history 只隨 D 走、不隨 grid 走，所以整體不是兩倍。
+
+**2026-09-03 更新**：adapter 現在驅動的是 `ulcnet_prepost` class 的一個
+`ULCNET_IO_FREQ` 實例（頻譜進、頻譜出、不做 transform），所以 adapter pool
+＝ class 的 FREQ pool ＋ 32 B 的 adapter 自身結構，比先前只包 model_io 的版本
+大一個 class 前後處理 scratch（16 kHz D=8：71,040 → 77,424 B）。實測
 `ulcnet_accelerator_adapter_get_mem_size()`（含本幀 delta outputs 與工作區）：
 
 | adapter pool | D=4 | D=8 | D=16 | D=32 | D=64 |
 |---|---:|---:|---:|---:|---:|
-| 16 kHz（TA=26） | 41,856 B | 71,040 B | 129,408 B | 246,144 B | 479,616 B |
-| 48 kHz（TA=52） | 76,672 B | 132,480 B | 244,096 B | 467,328 B | 913,792 B |
+| 16 kHz（TA=26） | 48,240 B | 77,424 B | 135,792 B | 252,528 B | 486,000 B |
+| 48 kHz（TA=52） | 89,200 B | 145,008 B | 256,624 B | 479,856 B | 926,320 B |
+
+只要 model_io 的 K/V／logit／GRU state（`ulcnet_model_io_get_mem_requirements()`，
+不含 class 的前後處理 scratch）：
+
+| model_io pool | D=4 | D=8 | D=16 | D=32 | D=64 |
+|---|---:|---:|---:|---:|---:|
+| 16 kHz（TA=26） | 41,824 B | 71,008 B | 129,376 B | 246,112 B | 479,584 B |
+| 48 kHz（TA=52） | 76,640 B | 132,448 B | 244,064 B | 467,296 B | 913,760 B |
+
+這一列沒有隨 class 改動而移動——model_io 的 state 佈局未變，變的只是它上面
+多包了一層 class。
 
 過邊界的 persistent tensor 小計（不含本幀 delta 與工作區）：16 kHz D=8 為
 51.50 KiB、48 kHz D=8 為 97.00 KiB；D=64 則是 443.50 KiB 與 853.00 KiB。
@@ -551,6 +569,16 @@ k-1 幀覆蓋**完全相同的樣本**（逐 bit 同頻譜）——兩種 framin
 為：**改 past-only 拿不到任何延遲收益，卻要重寫全部 parity 測試的幀對齊
 簿記**——不是原先寫的「板端支付 16 ms 換 parity」（那 16 ms 兩種 framing
 都要付，是鏈路下限）。要真正壓延遲屬重訓等級手段（非對稱窗、縮 hop）。
+
+**2026-09-03 更新（4ch 的實際 latency contract）**：4ch Align-ULCNet pipeline
+的「加總後額外演算法延遲」是 **1 hop**（16 kHz 256 samples = 16 ms、48 kHz
+512 samples = 10.67 ms），與 mono wrapper 相同，而不是曾經的 2 hop。GSC 產出的
+beamformed error **頻譜**直接餵給模型（它已經是本 hop 的 sqrt-Hann 50%-overlap
+單幀），中間不再插入 beam WOLA→再 analysis 的來回，far 路也不再需要配一個
+one-hop 補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WOLA。
+`process()` 只有 hop #0 輸出零，之後 hop p 的輸出是 input hop p-1 的
+beamformed error；實測 far 脈衝落在 `far[2085]` 時輸出峰值在 `out[2341]`
+（＝脈衝 + 256，偏差 0）。每個 hop 從 hop #0 起都恰好一次 inference。
 
 ## 8. Delay 狀態機與 Fallback
 
@@ -610,11 +638,22 @@ C 側 STFT 狀態仍連續，緊接著發射的幀其 512 樣本分析窗**跨�
 是切換前推入的 hop）。這一版對那些幀改走 identity 且**完全不呼叫 infer**
 （K/V、logit、GRU 都不前進），等 err 與 far 兩路窗都只含切換後的 hop 才
 同時恢復 step 與 apply：mono `AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES=1`、
-4ch `AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES=2`（4ch 兩路都比輸入慢一 hop：
-beam WOLA 一 hop + 對應的 far 一 hop 補償）。兩個常數由各自 test suite 的
+4ch `AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES=1`。兩個常數由各自 test suite 的
 `test_reprime_straddle_derivation()` 以脈衝標記在**無邊界對照跑**中量出並
 斷言，不是寫死的估計值。option B（邊界後照常 step、只是輸出仍套用）暫緩，
 需先做音檔 A/B；crossfade 仍是更後面的 phase。
+
+**2026-09-03 更新（4ch 走 direct path，本節上面那段的 4ch 數字已隨之改寫）**：
+4ch 常數原本是 2，理由是「兩路都比輸入慢一 hop：beam WOLA 一 hop ＋ 對應的
+far 一 hop 補償」。那條 round trip 已經移除——GSC 的 beamformed error
+**頻譜**直接當成模型的 error frame（它本來就是本 hop 的 sqrt-Hann 50%-overlap
+單幀），far 路改用同一個 hop 的 `ulcnet_analysis_push_frame()`，中間不再有
+beam WOLA、不再有 error 路的二次 analysis，也不再有 one-hop far buffer。
+兩路因此都從**當前** input hop 成幀，跨界幀只剩邊界 hop 那一幀，常數變成 1，
+與 mono 同值；`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION` 同時由 16 推到 17。
+邊界處理也簡化為「只做 `model->reset` ＋ arm reprime」，不再清任何 buffer
+（C 側成幀狀態一路連續）。mono wrapper 不受影響（仍是 centered 0/2/1 push、
+REPRIME 1、1 hop 延遲）。
 
 兩個變體的 production far branch 固定讀 AEC aligned-far seam，沒有 runtime
 mode。checkpoint 的 raw-far 欄位僅作 training provenance；export descriptor
@@ -729,9 +768,11 @@ flowchart LR
     DELTA --> UPDATE
 ```
 
-每個 256-sample hop 會在 centered-STFT priming 後產生一個 model
-frame（第二次 push 的邊界例外會連續產生兩幀，但仍是兩次單幀
-inference）。model graph 不收 PCM、不包 STFT/WOLA、不包
+每個 256-sample hop 產生一個 model frame。走 centered
+`ulcnet_analysis_push()`（mono wrapper）時，priming 期間的第二次 push 會連續
+產生兩幀，但仍是兩次單幀 inference；走 `ulcnet_analysis_push_frame()`
+（4ch direct path、pre/post class 的 TIME 模式）時，從第一次推入起就固定
+一幀一次 inference，沒有這個例外。model graph 不收 PCM、不包 STFT/WOLA、不包
 PBFDKF 或 delay state machine。
 
 ### 10.2 ONNX input/output contract（方案 B）
@@ -838,7 +879,12 @@ pipeline 端的 identity reprime 擋掉（不 step 模型），見 5.x 的
 
 本專案交付：
 
-- `ulcnet_process.c/.h`：centered sqrt-Hann STFT/WOLA 與 RI frame。
+- `ulcnet_process.c/.h`：sqrt-Hann STFT/WOLA 與 RI frame。兩種 analysis
+  推入方式：`ulcnet_analysis_push()`（centered、0/2/1 出幀排程，mono wrapper
+  在用）與 `ulcnet_analysis_push_frame()`（2026-09-03 新增；center=False、
+  每次推入固定出一幀，與同一 hop 的 centered 最後一幀逐 bit 相同，4ch
+  direct path 的 far 路與兩個 AIAEC pre/post class 的 TIME 模式在用）。
+  同一個 state 不可混用兩種推入函式。
 - model-I/O/state `c/.h`：caller-owned memory requirement/init/reset、K/V/logit
   ring update、GRU hidden 保存、descriptor/layout validation。RAM 必須隨
   D 縮小。

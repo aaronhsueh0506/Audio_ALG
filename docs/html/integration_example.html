@@ -66,15 +66,15 @@ pre code{background:none;padding:0}
 </table></div>
 
 <h2>2. 誰做 FFT、誰擁有 window、WOLA 在哪</h2>
-<p>這是接線時<b>最容易搞錯</b>的一件事,而四條 pipeline 給了<b>三種不同答案</b>:</p>
+<p>這是接線時<b>最容易搞錯</b>的一件事,四條 pipeline 給了<b>三種不同答案</b>:</p>
 <div class="tblwrap"><table>
 <tr><th></th><th>forward FFT</th><th>analysis window</th><th>NR gain 怎麼套</th><th>inverse + WOLA</th></tr>
 <tr><td><code>mono_aec_nr_res</code></td><td><b>AEC 內部</b>(<code>ctx.error_spec</code> 就是它的 50% overlap periodic-sqrt-Hann STFT)</td><td>AEC 擁有</td><td>NR <b>只算 gain 不套</b>,pipeline <code>sk_min_f32</code> 融合後一次套</td><td><b>pipeline 自己</b>(獨立的 <code>FftHandle</code>)</td></tr>
 <tr><td><code>4ch_aec_bf_nr_res</code></td><td><b>每條 lane 的 AEC 內部</b>,pipeline <b>借指標不複製</b></td><td>各 lane 的 AEC</td><td>同上,但 RES gain 來自<b>一個共用 <code>SuppressionGain</code></b>(不屬於任何 <code>Aec</code>)</td><td>pipeline 自己</td></tr>
 <tr><td><code>mono_alignulcnet</code></td><td class="dead"><b>AEC 的 FFT 完全不用</b>——ULCNet 自己的 centered STFT 做 forward</td><td>ULCNet(centered sqrt-Hann)</td><td class="dead"><b>沒有 NR</b>(沒有 <code>MmseLsaDenoiser</code> 實例)</td><td><code>ulcnet_synthesis_push()</code></td></tr>
-<tr><td><code>4ch_alignulcnet</code></td><td colspan="4"><b>三個獨立頻域階段</b>:① 每 lane AEC 的 STFT → 餵 SRP-PHAT + GSC;② GSC 輸出的 mono 頻譜 → pipeline 自己 iFFT+WOLA 回時域(<b>吃掉 1 hop</b>);③ ULCNet 的 centered STFT → model → synthesis(<b>再吃 1 hop</b>)</td></tr>
+<tr><td><code>4ch_alignulcnet</code></td><td colspan="4"><b>頻域直送</b>:① 每 lane AEC 的 STFT → SRP-PHAT + GSC;② GSC 的 mono 頻譜<b>直接</b>當 model 的 error 幀(<b>不重建、不再分析</b>),far 分支用 <code>ulcnet_analysis_push_frame()</code> 取同一 hop;③ model → <code>ulcnet_synthesis_push()</code>(<b>吃掉 1 hop</b>)</td></tr>
 </table></div>
-<div class="warn"><b><code>4ch_alignulcnet</code> 的總演算法延遲 = 2 hops = 512 samples = 32 ms</b>,而且 far branch 被<b>刻意延遲一個 hop</b>——否則 model 會看到 <code>error[t-1]</code> 配 <code>far[t]</code> 的 256-sample 固定偏斜。接 NN 時這種「兩個 branch 要對齊到同一個時間點」的細節<b>沒有任何自動檢查</b>。</div>
+<div class="warn"><b><code>4ch_alignulcnet</code> 的總演算法延遲 = 1 hop</b>(16 k 256 smp/16 ms、48 k 512 smp/10.67 ms),只來自 synthesis 的半窗 trim。<b>兩個 branch 都從當前 input hop 取幀,所以不可以有 far 補償 buffer</b>——加回去就是 <code>error[t]</code> 配 <code>far[t-1]</code> 的一 hop 偏斜,而這種對齊細節<b>沒有任何自動檢查</b>。</div>
 
 <h2>3. 範例 A:<code>mono_aec_nr_res</code> — 最完整的參考接線</h2>
 <h3>建立</h3>
@@ -180,14 +180,14 @@ st = four_aec_nr_res_process_post(core, &amp;pre.token, weights, out);
 <pre>aec_process_context(p->aec, mic, ref);
 aec_get_res_context(p->aec, &rctx);      /* rctx.formed_hop     ← 時域線性誤差 */
 aec_get_linear_context(p->aec, &lctx);   /* lctx.aligned_far_hop ← 對齊後的 far  */</pre>
-<p><b>注意這裡拿的是「時域」兩個 tap,不是頻譜</b>——ULCNet 有自己的 centered STFT,AEC 的 <code>error_spec</code> 在這條路上完全不用。</p>
+<p><b>注意 mono 拿的是「時域」兩個 tap,不是頻譜</b>——它有自己的 centered STFT,AEC 的 <code>error_spec</code> 完全不用。4ch 則<b>不做 error 分析</b>:<code>gsc_spectrum</code> 直接當 error 幀,只有 far 分支走 center=False 的 <code>ulcnet_analysis_push_frame()</code>。<b>不可與 centered 的 <code>ulcnet_analysis_push()</code> 混用同一 state</b>(共用 history,不共用排程)。</p>
 <h3>邊界偵測與 reprime</h3>
 <pre>if (lctx.delay_state == AEC_LINEAR_DELAY_CHANGED
     || (FIXED 模式下 UNLOCKED→LOCKED 的首次轉換)) {
     if (p->model.reset) p->model.reset(user);   /* 通知 NN 丟棄跨 frame 狀態 */
-    p->reprime_frames = REPRIME;                /* mono=1, 4ch=2 */
+    p->reprime_frames = REPRIME;                /* mono=1, 4ch=1 */
 }</pre>
-<div class="note"><b>reprime frame 數是量測出來的,不是猜的</b>:mono = 1、4ch = 2。差別來自 4ch 的兩個 branch 都落後輸入一個 hop,所以邊界 hop 有兩個 emitted frame 跨在接縫上。這個常數<b>綁定於該 pipeline 的 hop 結構</b>,改動 framing 就必須重新量。</div>
+<div class="note"><b>reprime frame 數是量測出來的,不是猜的</b>:兩條都是 <b>1</b>——兩條的兩個 branch 都從<b>當前</b> input hop 取幀,50%-overlap 幀橫跨兩個 hop,只有邊界 hop 那一幀還蓋到切換前的 hop(4ch 早先是 2,肇因於已移除的 WOLA)。常數<b>綁定 hop 結構</b>,改 framing 必須重新量(<code>test_reprime_straddle_derivation()</code>)。</div>
 <h3>Fail-open 三層 + FULL-WRITE CONTRACT</h3>
 <pre>if (reprime_frames > 0) {
     /* identity,不 step model */
@@ -231,7 +231,7 @@ if (cfg->model.io_descriptor &amp;&amp;
 <tr><td><code>4ch_aec_bf_nr_res</code>(核心)</td><td><code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = 16</td></tr>
 <tr><td><code>4ch_aec_bf_nr_res</code>(完整 wrapper)</td><td><code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION</code> = 11</td></tr>
 <tr><td><code>mono_alignulcnet</code></td><td><code>AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION</code> = 11</td></tr>
-<tr><td><code>4ch_alignulcnet</code></td><td><code>AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION</code> = 16</td></tr>
+<tr><td><code>4ch_alignulcnet</code></td><td><code>AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION</code> = 17</td></tr>
 </table></div>
 <div class="warn"><b>版本一動,任何持久化的 descriptor 都必須丟棄重查。</b>關鍵微妙處:<code>build_flags_hash</code> 只是 carve token 字串的 FNV-1a,<b>不含任何 sizeof／byte count</b> → 當 control block 只是<b>長大</b>而 carve 結構沒變時,hash <b>不會動</b>。所以 <code>layout_version</code> 是<b>唯一</b>訊號。<br>「a descriptor from a version-10 build must be refused, <b>including when its cached byte count still covers the current pool</b>」——descriptor 的 <code>bytes</code> 比較是下界,擋得住成長、擋不住等量語意變更。</div>
 <p class="small">4ch ULCNet 的版本會<b>純轉播</b>下層 core 的版本:core 只長 control block 時兩層 hash 都不動,只能靠本層 <code>layout_version</code> 一起 bump 來攔。</p>
@@ -290,7 +290,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <tr><td class="dead">4ch init 失敗<b>一個字都不說</b></td><td><code>init_ex()</code> 的 8 項檢查任一失敗都<b>靜默回 NULL</b>。mono 有逐欄位 stderr,但 <code>NO_STDIO=1</code>(正是板端組態)一開就沒了</td></tr>
 <tr><td class="dead">沒有 frame counter</td><td>四條 pipeline <b>都沒有</b> frame counter 的 public accessor → 「這條 stream 到目前為止處理了幾個 hop」都答不出來,遑論 xrun</td></tr>
 <tr><td class="dead">mono pipeline 沒有 finite 守衛</td><td><code>audio_pipeline_process()</code> 輸入不檢、輸出不檢。<b>只有 4ch 有</b>(輸入與輸出各一道)</td></tr>
-<tr><td class="dead">兩條 ULCNet pipeline 幾乎沒有觀測面</td><td>mono ULCNet 只有 <code>_get_aec()</code>;4ch ULCNet 只有 <code>_last_beamformed_error()</code>／<code>_last_delay()</code>,而且<b>沒有暴露 core handle</b> → core 的 duty census、realign counters、timing、post floor 對整合者全部不可達</td></tr>
+<tr><td class="dead">兩條 ULCNet pipeline 幾乎沒有觀測面</td><td>mono ULCNet 只有 <code>_get_aec()</code>;4ch ULCNet <b>只剩</b> <code>_last_delay()</code> 與尺寸查詢(<code>_last_beamformed_error()</code> 已隨 layout v17 移除)。兩條都<b>沒有暴露 core handle</b> → core 的 duty census、realign counters、timing、post floor 對整合者全部不可達</td></tr>
 </table></div>
 
 <h2>8. 整合檢查清單</h2>

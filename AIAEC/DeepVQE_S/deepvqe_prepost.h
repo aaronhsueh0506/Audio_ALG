@@ -100,6 +100,10 @@ extern "C" {
  * the boundary bumps this. */
 #define DEEPVQE_PREPOST_LAYOUT_VERSION 1u
 #define DEEPVQE_PREPOST_ALIGNMENT      16u
+/* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
+ * so a pool recorded by the previous carve is refused on the hash, not only
+ * on `bytes`. 2: the TIME analyses became two AiaecAnalysis states. */
+#define DEEPVQE_PREPOST_CARVE_VERSION  2u
 
 /* Alignment search depth D, the exporter's max_delay_frames. It sizes the
  * attention key/value rings and the score history, so it is a pool-size
@@ -167,9 +171,9 @@ typedef enum DeepVqeStateId {
 #define DEEPVQE_STATE_MAX_RANK 4
 
 /* Which side of the transform the caller works on. FIXED AT INIT because it
- * decides the pool size: DEEPVQE_IO_TIME additionally carves the two rolling
- * analysis histories, the shared transform scratch, one synthesis state and
- * the output hop staging. */
+ * decides the pool size: DEEPVQE_IO_TIME additionally carves two analysis
+ * states (each with its own transform scratch), one synthesis state and the
+ * output hop staging. */
 typedef enum DeepVqeIoMode {
     /* Spectrum in, spectrum out. NO framing, windowing, FFT, iFFT or
      * overlap-add -- the caller owns the transform. This is the mode for
@@ -332,8 +336,8 @@ DeepVqePrepost *deepvqe_prepost_create(const DeepVqePrepostConfig *cfg);
 void deepvqe_prepost_destroy(DeepVqePrepost *p);
 
 /* Zero every state tensor and the CCM spectrum ring, drop any open frame,
- * and reset the framing state -- the two rolling analysis histories and the
- * synthesis. Config and pool are untouched. */
+ * and reset the framing state -- the two analysis states and the synthesis.
+ * Config and pool are untouched. */
 void deepvqe_prepost_reset(DeepVqePrepost *p);
 
 int deepvqe_prepost_hop_size(const DeepVqePrepost *p);   /* or -1 */

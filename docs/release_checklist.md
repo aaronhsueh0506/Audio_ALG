@@ -624,6 +624,26 @@ For each model verify:
 
 Do not claim trained-model quality without a trained checkpoint.
 
+### 11.4 C pre/post archive
+
+`AINR/Makefile` builds `libainr_prepost.a` — `dfn2_process`, `dfn2_model_io`,
+`dfn2_prepost` and `gtcrn_process`. RNNoise-ERB is deliberately NOT a member:
+it has its own Makefile and no archive.
+
+```bash
+make -C AINR SIMD=1 WERROR=1 lib
+make -C AINR SIMD=1 WERROR=1 print-lib-path   # absolute path of THIS config
+make -C AINR SIMD=0 WERROR=1 test
+```
+
+- [ ] Objects, test binaries and the archive are configuration-keyed
+      (`build/simd<N>-<sig>/`), so a `SIMD=0` build never hands back the
+      `SIMD=1` archive; resolve the archive with `print-lib-path`, never by
+      spelling the directory.
+- [ ] `WERROR=1` actually reaches the compiler.
+- [ ] The SIMD knob changes only `dfn2_process.o` and `gtcrn_process.o`; the
+      other members are byte-identical between `SIMD=0` and `SIMD=1`.
+
 ## 12. AIAEC framework gate
 
 The current public candidates are Align-CRUSE, Align-ULCNet, DeepVQE-S, and
@@ -691,6 +711,29 @@ For every public candidate verify:
       pre/post-processing are documented.
 
 No production quality claim is required or permitted without trained models.
+
+### 12.4 C pre/post archive
+
+`AIAEC/Makefile` builds `libaiaec_prepost.a` — `ulcnet_process`,
+`ulcnet_model_io`, `ulcnet_prepost`, `ulcnet_accelerator_adapter`,
+`aiaec_process`, `deepvqe_process`, `deepvqe_prepost`.
+
+```bash
+make -C AIAEC SIMD=1 WERROR=1 lib
+make -C AIAEC SIMD=1 WERROR=1 print-lib-path   # absolute path of THIS config
+make -C AIAEC SIMD=0 WERROR=1 test             # lib + pytest
+```
+
+- [ ] The archive is configuration-keyed (`build/simd<N>-<cksum>/`, keyed on
+      `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`) and a signature collision
+      is refused rather than reinterpreted; resolve it with `print-lib-path`.
+- [ ] No AIAEC translation unit includes `simd_kernels.h`, so the SIMD knob
+      must leave every AIAEC object byte-identical — a difference here means
+      something started depending on the kernels and the claim needs redoing.
+- [ ] Each pre/post class (`ulcnet_prepost`, `deepvqe_prepost`) is a THIRD
+      translation unit composing two files that stay independently linkable
+      for their own parity tests, and its byte-identity tests against the
+      hand-composed path pass.
 
 ## 13. Documentation gate
 
@@ -777,9 +820,15 @@ is routinely misattributed to a real bug.
 | `NR` `python3 -m pytest tests` | 56 |
 | `Audio_ALG/lib/nr` `python3 -m pytest tests` | 56 |
 | `Audio_ALG` `python3 -m pytest pipelines` | 72 |
-| `Audio_ALG` `python3 -m pytest AIAEC` | 483 |
-| `Audio_ALG` `python3 -m pytest AINR` | 212 |
-| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 767 |
+| `Audio_ALG` `python3 -m pytest AIAEC` | 528 |
+| `Audio_ALG` `python3 -m pytest AINR` | 221 |
+| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 821 |
+
+The four `Audio_ALG` rows were re-measured on 2026-09-03 (same tree, same
+`SE/.venv` Python); the `AEC` and `NR` rows above them still carry their
+2026-08-31 measurement and were NOT re-run. The three per-package rows sum
+exactly to the combined row, which is the check that the combined invocation
+collected everything.
 
 The combined row is the one that matters, and it is the one that used to be
 impossible: pytest gives every `conftest.py` the same top-level module name, so
@@ -792,9 +841,18 @@ can no longer be green over a suite that cannot start.
 C-side `make test` targets that print `PASS:` markers rather than a count
 (re-measured on the current working tree, KISS backend, `make clean` first):
 `pipelines/mono_aec_nr_res` 78, `pipelines/mono_alignulcnet` 149,
-`pipelines/4ch_aec_bf_nr_res` 316 (one-stop gate; also builds and runs the
-`4ch_alignulcnet` binaries). Each additionally prints a small number of
+`pipelines/4ch_aec_bf_nr_res` 502 (one-stop gate, re-measured 2026-09-03 the
+same way; also builds and runs the `4ch_alignulcnet` binaries, whose test
+prints a single `All audio_pipeline_4ch_ulcnet tests passed` line and no
+`PASS:` markers). Each additionally prints a small number of
 non-`PASS:` pass lines (static smokes, board-skeleton profiles, adapter).
+
+The two mono rows are still the 2026-08-31 measurement; the
+`4ch_aec_bf_nr_res` row was re-measured on 2026-09-03 after the 4-channel
+Align-ULCNet suite was rewritten for the direct GSC-spectrum path (identity
+E2E now compares against a reference the test synthesises from the spectra
+the model saw; a new error-branch impulse test reads that branch against the
+input).
 
 Pass/fail-only targets (no count): `AEC` `selftest`, `test-counter-saturation`,
 `test-process-context`, `test-shared-far-spec`, `test-shared-fft-handle`,

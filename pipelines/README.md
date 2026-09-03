@@ -90,7 +90,12 @@ they are not four additional libraries:
 
 The ULCNet applications use `../AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.*`: CPU memory owns
 K/V, logit and GRU state, while the board implements one stateless tensor
-invocation callback. An absent/failing accelerator is fail-open.
+invocation callback. An absent/failing accelerator is fail-open. The adapter
+drives an `ULCNET_IO_FREQ` instance of the `ulcnet_prepost` pre/post class
+(spectrum in, spectrum out, no transform of its own), so both application
+Makefiles link `ulcnet_prepost.o` wherever the adapter is linked — see
+`ULCNET_ADAPTER_OBJS` in [`Makefile`](Makefile) and
+[`4ch_aec_bf_nr_res/Makefile`](4ch_aec_bf_nr_res/Makefile).
 
 ## Parameter Alignment
 
@@ -117,6 +122,13 @@ selectable grids; the others have exactly one:
 | **Pipeline total latency** | 1 hop — 16 ms @ 8 kHz, 8 ms @ 16 kHz default, 16 ms @ 16 kHz alt, ~10.7 ms @ 48 kHz | 不再額外保存上一個 AEC context；AEC-only 為 0 samples |
 | **Processing (per hop)** | < 0.5 ms | AEC + NR + RES 合計(ARM Cortex-A53 @ 1GHz 估計) |
 | **RTF** | < 0.05 | 遠低於即時要求 |
+
+上表是 conventional mono pipeline 的數字。兩條 Align-ULCNet application 的
+加總額外延遲同樣是 **1 hop**（唯一來源是 ULCNet synthesis WOLA）：mono 一直
+如此，4ch 變體自 2026-09-03 起由 2 hop 降為 1 hop——GSC 的 beamformed error
+頻譜直接當成模型的分析幀，中間的 beam WOLA→再 analysis 來回與配套的 one-hop
+far 補償都已移除。細節見
+[`4ch_alignulcnet/README.md`](4ch_alignulcnet/README.md)。
 
 ### Memory Budget
 

@@ -65,13 +65,18 @@ extern "C" {
 #endif
 
 #define ULCNET_PREPOST_DESCRIPTOR_VERSION 1u
+/* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes
+ * (a region added, removed, resized or reordered), so a pool recorded by the
+ * previous carve is refused by _init_ex on the hash, not only on `bytes`.
+ * 2: the TIME analyses became two UlcnetAnalysis states (own scratch each). */
+#define ULCNET_PREPOST_CARVE_VERSION 2u
 
 /* Which side of the transform the caller works on. FIXED AT INIT because it
- * decides the pool size: ULCNET_IO_TIME additionally carves two rolling
- * analysis histories, the shared transform scratch, one synthesis state and
- * the output hop staging. At D=4 that is larger than the recurrent state
- * itself, so a runtime switch would make every frequency-domain instance
- * pay for machinery it never runs. */
+ * decides the pool size: ULCNET_IO_TIME additionally carves two analysis
+ * states (each with its own transform scratch), one synthesis state and the
+ * output hop staging. At D=4 that is larger than the recurrent state itself,
+ * so a runtime switch would make every frequency-domain instance pay for
+ * machinery it never runs. */
 typedef enum UlcnetIoMode {
     /* Spectrum in, spectrum out. NO framing, windowing, FFT, iFFT or
      * overlap-add -- the caller owns the transform. This is the mode for

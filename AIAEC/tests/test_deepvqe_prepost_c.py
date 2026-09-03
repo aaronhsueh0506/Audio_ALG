@@ -216,9 +216,10 @@ static int drive_time(DeepVqePrepost *p, const float *mic, const float *far,
 }
 
 /* center=False rolling analysis: one frame per hop over the last N_FFT
- * samples. Deliberately expression-for-expression the same as the class's
- * pp_roll (and ulcnet_process.c's ulcnet_rfft behind it), so this reference
- * is independent of deepvqe_prepost.c yet bit-comparable with it. */
+ * samples. Deliberately expression-for-expression the same as
+ * ulcnet_process.c's ulcnet_rfft (the transform behind the
+ * aiaec_analysis_push_frame the class drives), so this reference is
+ * independent of deepvqe_prepost.c yet bit-comparable with it. */
 static void ref_roll(FftHandle *fft, float *history, const float *hop_in,
                      float *out_re, float *out_im) {
     static float seg[AIAEC_N_FFT];

@@ -4,9 +4,9 @@
  * parity-tested translation units -- aiaec_process.c (the centered sqrt-Hann
  * STFT/WOLA it shares with Align-ULCNet) and deepvqe_process.c (the CCM
  * kernel) -- and adds only the object lifecycle, the pool carve, the
- * accelerator tensor views and the per-hop frame state machine. Neither of
- * those files changes, so both of their standalone parity builds keep
- * linking.
+ * accelerator tensor views and the per-hop frame state machine. Neither
+ * file's existing entry points change, so both of their standalone parity
+ * builds keep linking.
  *
  * It deliberately does NOT use ulcnet_model_io.c: DeepVQE-S's boundary is a
  * different one (raw RI in, full next state out) and pulling that TU in would
@@ -109,17 +109,12 @@ struct DeepVqePrepost {
 
     /* DEEPVQE_IO_TIME only; NULL in DEEPVQE_IO_FREQ.
      *
-     * The analysis is a plain 1-frame-per-hop rolling window, NOT
-     * aiaec_analysis_push's centered schedule -- see the header's FRAMING
-     * note. `seg`/`spec` are the shared per-call transform scratch: the two
-     * analyses and the synthesis are strictly sequential within a hop, so
-     * one set serves all three (the same rule the FftHandle is shared
-     * under). Struct-owned, never stack, so an embedded task stack never
-     * sees a multi-KB frame. */
-    float          *hist_mic;   /* [AIAEC_N_FFT] */
-    float          *hist_far;   /* [AIAEC_N_FFT] */
-    float          *seg;        /* [AIAEC_N_FFT]  windowed staging */
-    Complex        *spec;       /* [AIAEC_N_BINS] rfft staging     */
+     * Both analyses are driven with aiaec_analysis_push_frame -- the plain
+     * one-frame-per-hop rolling window, NOT aiaec_analysis_push's centered
+     * schedule -- see the header's FRAMING note. The structs embed their
+     * own transform scratch (struct-owned, never stack). */
+    AiaecAnalysis  *ana_mic;
+    AiaecAnalysis  *ana_far;
     AiaecSynthesis *synth;
     float          *out_hop;    /* [AIAEC_HOP] the synthesis output. Zero
                                  * from init/reset, then only ever written
@@ -277,6 +272,7 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth) {
     h = pp_fnv1a(h, (uint32_t)AIAEC_SR);
     h = pp_fnv1a(h, (uint32_t)AIAEC_N_FFT);
     h = pp_fnv1a(h, (uint32_t)DEEPVQE_PREPOST_LAYOUT_VERSION);
+    h = pp_fnv1a(h, (uint32_t)DEEPVQE_PREPOST_CARVE_VERSION);
     h = pp_fnv1a(h, (uint32_t)io_mode);
     h = pp_fnv1a(h, (uint32_t)delay_depth);
     return h;
@@ -326,16 +322,10 @@ static int pp_layout(DeepVqePrepost *p, unsigned char *base,
     if (base && p) p->ccm = (DeepVqeCcmState *)ptr;
 
     if (cfg->io_mode == DEEPVQE_IO_TIME) {
-        const size_t nfft = (size_t)AIAEC_N_FFT * sizeof(float);
-        if (pp_carve(base, &cursor, nfft, &ptr) != 0) return -1;
-        if (base && p) p->hist_mic = (float *)ptr;
-        if (pp_carve(base, &cursor, nfft, &ptr) != 0) return -1;
-        if (base && p) p->hist_far = (float *)ptr;
-        if (pp_carve(base, &cursor, nfft, &ptr) != 0) return -1;
-        if (base && p) p->seg = (float *)ptr;
-        if (pp_carve(base, &cursor, (size_t)AIAEC_N_BINS * sizeof(Complex),
-                     &ptr) != 0) return -1;
-        if (base && p) p->spec = (Complex *)ptr;
+        if (pp_carve(base, &cursor, sizeof(AiaecAnalysis), &ptr) != 0) return -1;
+        if (base && p) p->ana_mic = (AiaecAnalysis *)ptr;
+        if (pp_carve(base, &cursor, sizeof(AiaecAnalysis), &ptr) != 0) return -1;
+        if (base && p) p->ana_far = (AiaecAnalysis *)ptr;
         if (pp_carve(base, &cursor, sizeof(AiaecSynthesis), &ptr) != 0)
             return -1;
         if (base && p) p->synth = (AiaecSynthesis *)ptr;
@@ -500,9 +490,10 @@ DeepVqePrepost *deepvqe_prepost_init_ex(void *pool, size_t bytes,
 
     deepvqe_ccm_init(p->ccm);
     if (cfg->io_mode == DEEPVQE_IO_TIME &&
-        aiaec_synthesis_init(p->synth, p->fft, p->window) != 0) {
-        return NULL;   /* the rolling analysis has no state but its history,
-                        * which the whole-pool memset above already cleared */
+        (aiaec_analysis_init(p->ana_mic, p->fft, p->window) != 0 ||
+         aiaec_analysis_init(p->ana_far, p->fft, p->window) != 0 ||
+         aiaec_synthesis_init(p->synth, p->fft, p->window) != 0)) {
+        return NULL;
     }
     return p;
 }
@@ -558,10 +549,10 @@ void deepvqe_prepost_reset(DeepVqePrepost *p) {
     memset(p->taps, 0, DEEPVQE_TAPS_ELEMENTS * sizeof(float));
     deepvqe_ccm_init(p->ccm);
     if (p->io_mode == DEEPVQE_IO_TIME) {
-        /* Re-init IS the reset for the synthesis (see aiaec_process.h);
-         * the rolling analysis resets by zeroing its history. */
-        memset(p->hist_mic, 0, (size_t)AIAEC_N_FFT * sizeof(float));
-        memset(p->hist_far, 0, (size_t)AIAEC_N_FFT * sizeof(float));
+        /* Re-init IS the reset for all three framing states (see
+         * aiaec_process.h); the handle and window are unchanged. */
+        aiaec_analysis_init(p->ana_mic, p->fft, p->window);
+        aiaec_analysis_init(p->ana_far, p->fft, p->window);
         aiaec_synthesis_init(p->synth, p->fft, p->window);
         memset(p->out_hop, 0, (size_t)AIAEC_HOP * sizeof(float));
     }
@@ -612,31 +603,6 @@ static int all_finite(const float *values, size_t elements) {
     return 1;
 }
 
-/* center=False rolling analysis: append one hop, then transform the last
- * AIAEC_N_FFT samples. Exactly one frame per hop, from the very first hop.
- *
- * Arithmetic is deliberately identical -- same window multiply, same
- * fft_forward_scratch, same expression order -- to ulcnet_process.c's
- * ulcnet_rfft (the transform behind aiaec_analysis_push), so a frame
- * produced here is bit-for-bit the frame the centered analysis emits LAST on
- * the same hop. That equality is what makes this a pure re-labelling of the
- * schedule rather than a change of signal. */
-static void pp_roll(DeepVqePrepost *p, float *history,
-                    const float hop_in[AIAEC_HOP],
-                    float *out_re, float *out_im) {
-    int k;
-    memmove(history, history + AIAEC_HOP,
-            (size_t)(AIAEC_N_FFT - AIAEC_HOP) * sizeof(float));
-    memcpy(history + AIAEC_N_FFT - AIAEC_HOP, hop_in,
-           (size_t)AIAEC_HOP * sizeof(float));
-    for (k = 0; k < AIAEC_N_FFT; ++k) p->seg[k] = history[k] * p->window[k];
-    fft_forward_scratch(p->fft, p->seg, p->spec);
-    for (k = 0; k < AIAEC_N_BINS; ++k) {
-        out_re[k] = p->spec[k].r;
-        out_im[k] = p->spec[k].i;
-    }
-}
-
 int deepvqe_prepost_pre_process(DeepVqePrepost *p,
                                 const float mic_hop[AIAEC_HOP],
                                 const float far_hop[AIAEC_HOP]) {
@@ -644,10 +610,12 @@ int deepvqe_prepost_pre_process(DeepVqePrepost *p,
     if (p->io_mode != DEEPVQE_IO_TIME) return -1;
     if (p->frame_open) return -1;   /* previous frame neither committed nor skipped */
 
-    /* Both streams are transformed from the SAME hop index -- this class
-     * applies no internal skew -- so they cannot desynchronise. */
-    pp_roll(p, p->hist_mic, mic_hop, p->mic_re, p->mic_im);
-    pp_roll(p, p->hist_far, far_hop, p->far_re, p->far_im);
+    /* center=False rolling analysis, one frame per hop from the very first
+     * hop (see aiaec_process.h). Both streams are transformed from the SAME
+     * hop index -- this class applies no internal skew -- so they cannot
+     * desynchronise. */
+    (void)aiaec_analysis_push_frame(p->ana_mic, mic_hop, p->mic_re, p->mic_im);
+    (void)aiaec_analysis_push_frame(p->ana_far, far_hop, p->far_re, p->far_im);
 
     p->frame_open = 1;
     return 1;   /* invariant: exactly one accelerator invocation per hop */

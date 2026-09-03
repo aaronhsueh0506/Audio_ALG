@@ -114,6 +114,10 @@ extern "C" {
 #endif
 
 #define DFN2_PREPOST_DESCRIPTOR_VERSION 1u
+/* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
+ * so a pool recorded by the previous carve is refused on the hash, not only
+ * on `bytes`. */
+#define DFN2_PREPOST_CARVE_VERSION      1u
 
 /* One shared alignment for every module (audio_common mem_align.h). */
 #define DFN2_PREPOST_ALIGNMENT 16u

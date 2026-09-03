@@ -5,16 +5,17 @@
  * Per-hop flow (see the header's timing contract):
  *
  *   four_aec_nr_res_process_pre -> SRP-PHAT DOA -> GSC effective weights
- *     -> gsc_spectrum WOLA reconstruction (one hop behind)
- *     -> UlcnetAnalysis (error branch = beamformed hop,
- *                        far branch  = the PREVIOUS hop's far source, so
- *                        both branches carry the SAME input hop: the beam
- *                        hop is itself one hop behind, and the far source
- *                        -- the shared AEC seam's pre.aligned_ref -- goes through
- *                        a one-hop saved buffer to match it)
- *     -> UlcnetModel callback (stepped every frame except during the
- *        post-boundary identity reprime; fail-open identity when
- *        unset/error/non-finite)
+ *     -> gsc_spectrum, taken DIRECTLY as the model's error frame: it is
+ *        already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis
+ *        frame of the current hop that the Align-ULCNet chain would
+ *        compute, so there is no reconstruction and no re-analysis between
+ *     -> far branch: the same hop's far source (the shared AEC seam's
+ *        pre.aligned_ref) through ulcnet_analysis_push_frame -- the same
+ *        one-frame-per-hop framing -- so both branches carry the SAME
+ *        input hop with no delay buffer
+ *     -> UlcnetModel callback, exactly once per hop from hop #0 (skipped
+ *        only during the post-boundary identity reprime; fail-open identity
+ *        when unset/error/non-finite)
  *     -> UlcnetSynthesis -> out
  *
  * The core's pending pre frame is released with four_aec_nr_res_abandon_pre;
@@ -36,12 +37,10 @@
 #include "gsc.h"
 #include "srp.h"
 #include "mem_align.h"
-#include "simd_kernels.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-#define M_PI_F ((float)M_PI)
 
 /* This wrapper's one supported grid IS whichever grid the ULCNet layer was
  * built for -- a build parameter of ulcnet_model_io.h, taken from there
@@ -69,48 +68,36 @@ struct AudioPipeline4ChUlcnet {
     Complex* gsc_spectrum;
     Complex* gsc_weights;
 
-    /* Beamformed-error WOLA reconstruction (one hop behind). The one
-     * carved handle is ALSO the ULCNet chain's FFT (same compiled size; the
-     * beam IFFT and the chain's three transforms are strictly sequential
-     * within a hop, per ulcnet_process.h's sharing contract). */
+    /* The one carved FFT handle serves the ULCNet chain (far analysis and
+     * synthesis; same compiled size, strictly sequential use within a hop,
+     * per ulcnet_process.h's sharing contract). */
     FftHandle* fft;
-    float* ifft_buffer;   /* fft_size */
-    float* ola;           /* fft_size */
-    float* synth_window;  /* fft_size */
-    float* beam_hop;      /* hop_size; accessor + analysis input */
 
     /* Align-ULCNet chain state + per-hop frame scratch (fixed-size structs,
      * part of `self` in the carve). The chain structs embed their own
-     * per-call FFT scratch and point at the shared window table below. */
-    UlcnetAnalysis err_analysis;
+     * per-call FFT scratch and point at the shared window table below.
+     * There is no error-branch analysis: the GSC spectrum IS the error
+     * frame, de-interleaved into err_re/err_im for the model callback. */
     UlcnetAnalysis far_analysis;
     UlcnetSynthesis synthesis;
-    float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table for all
-                                         * three chain structs (self-owned) */
-    float frame_err_re[2][ULCNET_BINS];
-    float frame_err_im[2][ULCNET_BINS];
-    float frame_far_re[2][ULCNET_BINS];
-    float frame_far_im[2][ULCNET_BINS];
+    float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table for both
+                                         * chain structs (self-owned) */
+    float err_re[ULCNET_BINS];
+    float err_im[ULCNET_BINS];
+    float far_re[ULCNET_BINS];
+    float far_im[ULCNET_BINS];
     float enh_re[ULCNET_BINS];
     float enh_im[ULCNET_BINS];
-
-    /* One-hop far compensation (layout v2): the beam WOLA above closes one
-     * hop late, so far_analysis is fed the far source SAVED on the previous
-     * call -- without this the model would see error[t-1] paired with
-     * far[t] (a fixed one-hop skew). Cleared together with the beam OLA
-     * on a delay change and on reset. */
-    float far_delay[ULCNET_HOP];
 
     UlcnetModel model;    /* model.infer == NULL => fail-open identity */
     FourAecNrResDelayState last_delay;
     uint64_t frame_index;
 
-    /* Emitted frames still straddling the last alignment boundary: armed to
+    /* Frames still straddling the last alignment boundary: armed to
      * AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES at the boundary hop,
-     * decremented once per EMITTED frame (not per hop -- the chain's second
-     * hop emits two). While nonzero the frame takes the identity path and
-     * the model is not stepped. Re-armed, never accumulated, by a boundary
-     * that lands inside a reprime. */
+     * decremented once per hop (one frame per hop). While nonzero the frame
+     * takes the identity path and the model is not stepped. Re-armed, never
+     * accumulated, by a boundary that lands inside a reprime. */
     int reprime_frames;
 
     /* Non-NULL only on the create() heap path (same convention as
@@ -297,14 +284,16 @@ static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
      * far-mode field and fixes production to aligned far. The existing
      * last_delay/frame_index fields also identify FIXED's first transition
      * from ring-fill raw far to aligned far. v7 adds the identity-reprime
-     * counter. Bump
+     * counter. v17: the GSC spectrum feeds the model directly -- the beam
+     * WOLA (ifft, ola, synth_win, beam_hop), the error-branch analysis, the
+     * two-frame staging and the one-hop far buffer are gone, and `self`
+     * carries one-frame err/far staging instead. Bump
      * AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION together with this string,
      * always both, forever. */
     hash = fnv1a_str(
-        "|carve:self(corecfg-delay-v2,ulcnet,model(io_descriptor),far_delay,"
-        "reprime,ulcnet_window),"
-        "core,srp,gsc,gsc_spectrum,gsc_weights,fft,ifft,ola,synth_win,"
-        "beam_hop",
+        "|carve:self(corecfg-delay-v2,ulcnet-direct,model(io_descriptor),"
+        "reprime,ulcnet_window,frame),"
+        "core,srp,gsc,gsc_spectrum,gsc_weights,fft",
         hash);
     /* The grid is a build parameter now, so it cannot be spelled into the
      * token as a literal: stringify the macros instead, or two builds on
@@ -490,14 +479,6 @@ int audio_pipeline_4ch_ulcnet_get_mem_requirements(
     total = ck_field_size(
         total, spectral_count, sizeof(Complex));        /* gsc_weights */
     total = ck_add_size(total, ck_align16_size(fft_bytes));  /* fft */
-    total = ck_field_size(
-        total, (size_t)fft, sizeof(float));             /* ifft_buffer */
-    total = ck_field_size(
-        total, (size_t)fft, sizeof(float));             /* ola */
-    total = ck_field_size(
-        total, (size_t)fft, sizeof(float));             /* synth_win */
-    total = ck_field_size(
-        total, (size_t)hop, sizeof(float));             /* beam_hop */
 
     if (MEM_SIZE_INVALID(total)) return -1;
 
@@ -527,7 +508,6 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     SRP_Config srp_cfg;
     GSC_Config gsc_cfg;
     int hop, fft, n_freqs;
-    int k;
     size_t srp_bytes, gsc_bytes, fft_bytes;
     float geom_x[FOUR_AEC_NR_RES_CHANNELS];
     float geom_y[FOUR_AEC_NR_RES_CHANNELS];
@@ -605,36 +585,15 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     p->fft = fft_init(fft_region, fft_bytes, fft);
     if (!p->fft || fft_get_n_freqs(p->fft) != n_freqs) return NULL;
 
-    p->ifft_buffer =
-        (float*)pool_carve(&cursor, (size_t)fft, sizeof(float));
-    p->ola =
-        (float*)pool_carve(&cursor, (size_t)fft, sizeof(float));
-    p->synth_window =
-        (float*)pool_carve(&cursor, (size_t)fft, sizeof(float));
-    p->beam_hop =
-        (float*)pool_carve(&cursor, (size_t)hop, sizeof(float));
-    if (!p->ifft_buffer || !p->ola || !p->synth_window || !p->beam_hop)
-        return NULL;
-
     p->hop_size = hop;
     p->fft_size = fft;
     p->n_freqs = n_freqs;
 
-    /* Same sqrt-Hann synthesis window formula as 4aec_nr_res.c's own
-     * synthesis path -- the reconstruction seam proven by
-     * tests/test_4aec_nr_res.c's WOLA-identity test. */
-    for (k = 0; k < fft; ++k) {
-        p->synth_window[k] = sqrtf(
-            0.5f * (1.0f - cosf(
-                2.0f * M_PI_F * (float)k / (float)fft)));
-    }
-
-    /* The chain reuses the beamforming handle carved above (same compiled grid;
-     * strictly sequential use per hop). Reject-first: the inits re-check
-     * the handle's bin count against the compiled ULCNet grid. */
+    /* The chain uses the handle carved above (same compiled grid; strictly
+     * sequential use per hop). Reject-first: the inits re-check the
+     * handle's bin count against the compiled ULCNet grid. */
     ulcnet_make_window(p->ulcnet_window);
-    if (ulcnet_analysis_init(&p->err_analysis, p->fft, p->ulcnet_window) != 0 ||
-        ulcnet_analysis_init(&p->far_analysis, p->fft, p->ulcnet_window) != 0 ||
+    if (ulcnet_analysis_init(&p->far_analysis, p->fft, p->ulcnet_window) != 0 ||
         ulcnet_synthesis_init(&p->synthesis, p->fft, p->ulcnet_window) != 0)
         return NULL;
 
@@ -724,20 +683,17 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     int vad_external,
     float* out) {
     FourAecNrResPreFrame pre;
+    const float* spec_re;
+    const float* spec_im;
     int status;
     int hop;
-    int fft;
-    int n_err_frames;
-    int n_far_frames;
     int written;
-    int f;
     int k;
 
     if (!p || p->destroyed || !microphones_interleaved || !far_reference ||
         !out || !is_bool(vad_external))
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     hop = p->hop_size;
-    fft = p->fft_size;
 
     status = four_aec_nr_res_process_pre(
         p->core, microphones_interleaved, far_reference, &pre);
@@ -764,100 +720,79 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
      * whose time basis crosses the boundary before this hop's inference. */
     if (pre.delay.changed ||
         (p->frame_index != 0 && !p->last_delay.solid && pre.delay.solid)) {
-        /* The core reset its lanes' analysis history before producing this
-         * hop's spectra; discard the matching synthesis tail here for the
-         * same reason its own mono OLA is cleared (mixing spectra from
-         * opposite sides of the realignment would corrupt the seam), and
-         * tell the runtime to flush its far attention ring + logit history.
-         * The saved far hop straddles the same boundary, so it is cleared
-         * with the OLA (a one-hop zero-far transient is
-         * accepted alongside the model reset). The C-side ULCNet STFT states
-         * keep running, so the frames whose windows still cover this cleared
-         * slot are covered by the identity reprime armed here rather than by
-         * a crossfade. The counter is armed whether or not a runtime is
-         * attached, so the frame policy does not depend on the model's
-         * presence. */
-        memset(p->ola, 0, (size_t)fft * sizeof(float));
-        memset(p->far_delay, 0, sizeof(p->far_delay));
+        /* Tell the runtime to flush its far attention ring + logit history.
+         * The C-side framing states keep running across the boundary -- the
+         * core's lane analysis behind the GSC spectrum, and this wrapper's
+         * far analysis -- so the frame whose window still covers a
+         * pre-switch hop is covered by the identity reprime armed here
+         * rather than by a crossfade. The counter is armed whether or not a
+         * runtime is attached, so the frame policy does not depend on the
+         * model's presence. */
         if (p->model.reset) p->model.reset(p->model.user);
         p->reprime_frames = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
     }
 
-    /* Reconstruct the time-domain beamformed error (one hop behind): same
-     * fft_inverse + sqrt-Hann synthesis + 50% OLA recipe proven by
-     * tests/test_4aec_nr_res.c's WOLA-identity test. */
-    fft_inverse(p->fft, p->gsc_spectrum, p->ifft_buffer);
-    sk_wola_accumulate_f32(p->ola, p->ifft_buffer, p->synth_window, fft);
-    memcpy(p->beam_hop, p->ola, (size_t)hop * sizeof(float));
-    memmove(p->ola, p->ola + hop, (size_t)(fft - hop) * sizeof(float));
-    memset(p->ola + (fft - hop), 0, (size_t)hop * sizeof(float));
-
-    /* Push both ULCNet analysis branches (0/2/1 emission, always in
-     * lockstep since both states advance once per hop). The beam_hop just
-     * reconstructed above is the PREVIOUS hop's beamformed error (the WOLA
-     * closes one hop late), so the far branch must be delayed by one hop
-     * too: push the far hop SAVED on the previous call, then save this
-     * hop's aligned far source. Without this the model would see
-     * error[t-1] paired
-     * with far[t] -- a fixed one-hop skew. */
-    n_err_frames = ulcnet_analysis_push(
-        &p->err_analysis, p->beam_hop, p->frame_err_re, p->frame_err_im);
-    n_far_frames = ulcnet_analysis_push(
-        &p->far_analysis, p->far_delay, p->frame_far_re, p->frame_far_im);
-    memcpy(p->far_delay, pre.aligned_ref, (size_t)hop * sizeof(float));
+    /* Error branch: the GSC spectrum is already the model's analysis frame
+     * -- the core's lanes analyse with the same sqrt-Hann window at the same
+     * 50% overlap, one frame per hop from hop #0, and the beamformer only
+     * weights bins -- so it is handed over as-is. Far branch: the same hop's
+     * far source through the same one-frame-per-hop framing. Both branches
+     * therefore carry input hop t at pipeline hop t, with no reconstruction,
+     * no re-analysis and no delay buffer in between. */
+    for (k = 0; k < ULCNET_BINS; ++k) {
+        p->err_re[k] = p->gsc_spectrum[k].r;
+        p->err_im[k] = p->gsc_spectrum[k].i;
+    }
+    (void)ulcnet_analysis_push_frame(
+        &p->far_analysis, pre.aligned_ref, p->far_re, p->far_im);
 
     /* All PreFrame pointers consumed -- release the core's pending frame
      * (no process_post() variant ever runs in this pipeline). */
     status = four_aec_nr_res_abandon_pre(p->core, &pre.token);
     p->last_delay = pre.delay;
-    if (n_err_frames != n_far_frames || status != FOUR_AEC_NR_RES_OK) {
+    if (status != FOUR_AEC_NR_RES_OK) {
         audio_pipeline_4ch_ulcnet_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
 
-    /* Per emitted frame: step the model and apply its output, EXCEPT while
-     * the identity reprime armed at the last boundary is still running --
-     * those frames' windows still cover the pre-switch (here: cleared) slot,
-     * and stepping them would rebuild the just-flushed recurrent state from
-     * half-stale input. Skipping inference lowers the cost of those frames;
+    /* One frame, one inference: step the model and apply its output, EXCEPT
+     * while the identity reprime armed at the last boundary is still
+     * running -- that frame's window still covers the pre-switch hop, and
+     * stepping it would rebuild the just-flushed recurrent state from
+     * half-stale input. Skipping inference lowers the cost of that frame;
      * it never doubles it. */
-    written = 0;
-    for (f = 0; f < n_err_frames; ++f) {
-        const float* spec_re = p->frame_err_re[f];
-        const float* spec_im = p->frame_err_im[f];
-        if (p->reprime_frames > 0) {
-            p->reprime_frames -= 1;   /* identity; model deliberately idle */
-        } else if (p->model.infer) {
-            /* Enforce ulcnet_process.h's FULL-WRITE CONTRACT: pre-fill the
-             * model-output staging with NaN before every infer call, so a
-             * partial write (rc == 0 without writing all ULCNET_BINS)
-             * leaves non-finite bins behind and is rejected by the finite
-             * guard below (fail-open identity) instead of silently applying
-             * stale finite values left over from a previous frame. */
-            for (k = 0; k < ULCNET_BINS; ++k) {
-                p->enh_re[k] = NAN;
-                p->enh_im[k] = NAN;
-            }
-            if (p->model.infer(
-                    p->model.user,
-                    p->frame_err_re[f], p->frame_err_im[f],
-                    p->frame_far_re[f], p->frame_far_im[f],
-                    p->enh_re, p->enh_im) == 0 &&
-                ulcnet_frame_is_finite(p->enh_re, p->enh_im)) {
-                spec_re = p->enh_re;
-                spec_im = p->enh_im;
-            }
+    spec_re = p->err_re;
+    spec_im = p->err_im;
+    if (p->reprime_frames > 0) {
+        p->reprime_frames -= 1;   /* identity; model deliberately idle */
+    } else if (p->model.infer) {
+        /* Enforce ulcnet_process.h's FULL-WRITE CONTRACT: pre-fill the
+         * model-output staging with NaN before every infer call, so a
+         * partial write (rc == 0 without writing all ULCNET_BINS) leaves
+         * non-finite bins behind and is rejected by the finite guard below
+         * (fail-open identity) instead of silently applying stale finite
+         * values left over from a previous frame. */
+        for (k = 0; k < ULCNET_BINS; ++k) {
+            p->enh_re[k] = NAN;
+            p->enh_im[k] = NAN;
         }
-        written += ulcnet_synthesis_push(
-            &p->synthesis, spec_re, spec_im, out + written);
+        if (p->model.infer(
+                p->model.user,
+                p->err_re, p->err_im, p->far_re, p->far_im,
+                p->enh_re, p->enh_im) == 0 &&
+            ulcnet_frame_is_finite(p->enh_re, p->enh_im)) {
+            spec_re = p->enh_re;
+            spec_im = p->enh_im;
+        }
     }
+    written = ulcnet_synthesis_push(&p->synthesis, spec_re, spec_im, out);
     if (written == 0) {
-        /* hop#0 (and any other preamble hop): the chain emitted nothing;
-         * the caller-facing contract is zeros. */
+        /* hop#0: frame #0's block lies inside the synthesis's trimmed half
+         * window; the caller-facing contract is zeros. */
         memset(out, 0, (size_t)hop * sizeof(float));
     } else if (written != hop) {
-        /* Structurally impossible under the 0/2/1 emission contract; treat
-         * as an internal DSP error rather than emitting a short hop. */
+        /* Structurally impossible (the synthesis emits 0 or one full hop);
+         * treat as an internal DSP error rather than emitting a short hop. */
         audio_pipeline_4ch_ulcnet_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
@@ -875,14 +810,9 @@ void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p) {
     four_aec_nr_res_reset(p->core);   /* invalidates any pending pre frame */
     srp_reset(p->srp);
     gsc_reset(p->gsc);
-    memset(p->ola, 0, (size_t)p->fft_size * sizeof(float));
-    memset(p->ifft_buffer, 0, (size_t)p->fft_size * sizeof(float));
-    memset(p->beam_hop, 0, (size_t)p->hop_size * sizeof(float));
-    memset(p->far_delay, 0, sizeof(p->far_delay));
     /* Re-init keeps the same shared handle/window (pool/instance resident,
-     * untouched by reset); cannot
-     * fail for a handle already validated at init time. */
-    (void)ulcnet_analysis_init(&p->err_analysis, p->fft, p->ulcnet_window);
+     * untouched by reset); cannot fail for a handle already validated at
+     * init time. */
     (void)ulcnet_analysis_init(&p->far_analysis, p->fft, p->ulcnet_window);
     (void)ulcnet_synthesis_init(&p->synthesis, p->fft, p->ulcnet_window);
     memset(&p->last_delay, 0, sizeof(p->last_delay));
@@ -929,11 +859,6 @@ int audio_pipeline_4ch_ulcnet_n_freqs(const AudioPipeline4ChUlcnet* p) {
 int audio_pipeline_4ch_ulcnet_sample_rate(const AudioPipeline4ChUlcnet* p) {
     return (p && !p->destroyed)
         ? four_aec_nr_res_sample_rate(p->core) : -1;
-}
-
-const float* audio_pipeline_4ch_ulcnet_last_beamformed_error(
-    const AudioPipeline4ChUlcnet* p) {
-    return (p && !p->destroyed) ? p->beam_hop : NULL;
 }
 
 int audio_pipeline_4ch_ulcnet_last_delay(

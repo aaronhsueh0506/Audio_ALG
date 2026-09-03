@@ -29,6 +29,13 @@ int aiaec_analysis_flush(AiaecAnalysis *state,
     return ulcnet_analysis_flush(state, real, imag);
 }
 
+int aiaec_analysis_push_frame(AiaecAnalysis *state,
+                              const float input[AIAEC_HOP],
+                              float real[AIAEC_N_BINS],
+                              float imag[AIAEC_N_BINS]) {
+    return ulcnet_analysis_push_frame(state, input, real, imag);
+}
+
 int aiaec_synthesis_init(AiaecSynthesis *state, FftHandle *fft,
                          const float *window) {
     return ulcnet_synthesis_init(state, fft, window);

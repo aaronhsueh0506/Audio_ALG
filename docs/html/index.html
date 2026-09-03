@@ -83,9 +83,11 @@ SE/                                (同層四個 repo)
       │     ├── 4ch_aec_bf_nr_res/    4ch AEC + BF + NR/RES（並擁有共用 4-lane core）
       │     └── 4ch_alignulcnet/      4ch AEC + BF + Align-ULCNet
       ├── AINR/          NN NR：DFN2 / GTCRN / RNNoise-ERB
-      │                  (各自的 C 前後處理 + 訓練/推論 Python)
+      │                  (各自的 C 前後處理 + dfn2_prepost class
+      │                   + 訓練/推論 Python)
       ├── AIAEC/         NN AEC/RES 四候選 (Python + C 前後處理: 共用
-      │                  aiaec_process、Align_ULCNet 全鏈、DeepVQE-S CCM)
+      │                  aiaec_process、Align_ULCNet 全鏈、DeepVQE-S CCM;
+      │                  ulcnet_prepost / deepvqe_prepost class)
       └── shared/        Python 工具
 </pre>
 <p class="note">建置關係出處：<code>pipelines/Makefile</code>（三個 producer archive、
@@ -144,13 +146,14 @@ fast_math、WAV I/O、HPF、resampler；三個上層 repo 的唯一 FFT 來源�
 pool-first 零 heap；grid 8k/256、16k/256|512、48k/1024。</td></tr>
 <tr><td><a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a></td>
 <td><code>pipelines/mono_alignulcnet/audio_pipeline_ulcnet.c</code>：AEC 線性誤差 + Align-ULCNet
-NN post-filter（per-frame callback）；16k/512/256 固定，演算法延遲 1 hop = 16 ms。</td></tr>
+NN post-filter（per-frame callback）；一個 build 一個編譯期格點（16k/512/256 或
+48k/1024/512），演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>
 <tr><td><a href="pipeline_4ch.html">pipeline_4ch</a></td>
 <td><code>pipelines/4ch_aec_bf_nr_res/</code>：4×AEC lanes + 共享 delay + SRP-PHAT DOA +
 GSC beamforming + post RES/NR（<code>4aec_nr_res.c</code> 核心）。</td></tr>
 <tr><td><a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a></td>
-<td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c</code>：beamformed 線性誤差 → Align-ULCNet
-NN post stage；新增演算法延遲 2 hops = 32 ms。</td></tr>
+<td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c</code>：GSC 的 beamformed 誤差<b>頻譜直送</b>
+Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>
 </table>
 
 <h3>AINR（NN 降噪模型）</h3>
@@ -173,7 +176,9 @@ graph 只含 heads。</td></tr>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a></td>
 <td>Align-ULCNet：16k/512/256；具有完整產品 pipeline 的候選
-（<code>ulcnet_process.c</code>，centered STFT×2 + WOLA + NPU callback 邊界）。</td></tr>
+（<code>ulcnet_process.c</code>，centered STFT 與 center=False 的
+<code>ulcnet_analysis_push_frame()</code>（一 hop 一幀）兩種分析並存 + WOLA + NPU
+callback 邊界；每幀交易封在 <code>ulcnet_prepost.c</code> class）。</td></tr>
 <tr><td><a href="aiaec_align_cruse.html">aiaec_align_cruse</a></td>
 <td>Align-CRUSE：16k/512/256；cumsum 無衰減積分器與 paper_global 非因果
 mode 是 streaming 語意風險。</td></tr>

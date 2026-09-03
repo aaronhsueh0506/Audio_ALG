@@ -155,6 +155,21 @@ int ulcnet_analysis_push(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
                          float out_re[2][ULCNET_BINS],
                          float out_im[2][ULCNET_BINS]);
 
+/* center=False rolling analysis: append one hop and transform the last
+ * ULCNET_N_FFT samples. Exactly ONE frame per push, from the very first push
+ * (the first frame's leading half is the zeroed history). Bit-identical to
+ * the LAST frame ulcnet_analysis_push() emits for the same pushed hop: the
+ * centered schedule differs only by the reflect-prefix frame it adds at the
+ * head. This is the framing of the AEC/GSC seam's own spectra (one frame per
+ * hop from hop 0), so a consumer that already holds such a spectrum for one
+ * stream uses this for the other and the pair stays hop-aligned. Do not mix
+ * the two push functions on one state: they share the history, not the
+ * schedule. Always returns 1. */
+int ulcnet_analysis_push_frame(UlcnetAnalysis *st,
+                               const float hop_in[ULCNET_HOP],
+                               float out_re[ULCNET_BINS],
+                               float out_im[ULCNET_BINS]);
+
 /* 檔尾 flush：套 reflect 後綴，產出剩餘幀（總幀數 = L/HOP + 1，L 為總樣本
  * 數、hop 的整數倍時）。回傳幀數（0..2），寫入同樣的 out 佈局。連續串流
  * 部署用不到；離線 parity 對齊 torch 幀數時才需要。flush 後須 init 重來。 */

@@ -58,7 +58,8 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 <tr><td>RNNoise-ERB</td><td>3-frame ERB/complex feature + h1/h2/h3</td>
 <td>gain + next h1/h2/h3</td><td><code>RNNoise-ERB/process.c/h</code></td></tr>
 <tr><td>DeepFilterNet2</td><td>3-frame ERB/complex feature + explicit recurrent/DF state</td>
-<td>mask/DF/alpha heads + next state</td><td><code>DeepFilterNet2/dfn2_process.c/h</code></td></tr>
+<td>mask/DF/alpha heads + next state</td><td><code>DeepFilterNet2/dfn2_process.c/h</code> +
+<code>dfn2_model_io.c/h</code>，外面包 <b><code>dfn2_prepost.c/h</code> 類別</b></td></tr>
 <tr><td>GTCRN</td><td>mag/real/imag 三個 ERB 域特徵(host ERB 前向) + conv/TRA/inter caches</td>
 <td>ERB 域 complex mask + next caches(host ERB 逆矩陣＋CRM)</td><td><code>GTCRN/gtcrn_process.c/h</code> + <code>erb_fwd/erb_inv.bin</code></td></tr>
 </table>
@@ -69,18 +70,137 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 <tr><th>Model</th><th>Graph input/state</th><th>Graph output</th><th>C 前後處理</th></tr>
 <tr><td>Align-ULCNet</td><td>host 特徵 layout(預設,layout v8,C 端唯一實作):五個壓縮域特徵(error_mag/far_mag/error_cos/error_sin/error_ri,host signed-pow 前端) + K/V/logit ring + two GRU states。graph 特徵 layout(export 可選,layout v10):改綁 error/far 兩組 raw RI spectra,前端搬進 graph 內,無 host 前端</td>
 <td>host layout:壓縮域 output(host 逆冪) + state delta。graph layout:逆冪已在 graph 內完成的 output + state delta</td><td><code>Align_ULCNet/ulcnet_process.c/h</code>、
-<code>ulcnet_model_io.c/h</code>(prepare/commit 內建前後端;只綁 host layout)</td></tr>
+<code>ulcnet_model_io.c/h</code>(prepare/commit 內建前後端;只綁 host layout)，
+外面包 <b><code>ulcnet_prepost.c/h</code> 類別</b></td></tr>
 <tr><td>Align-CRUSE</td><td>mic + far + conv/GRU/alignment state</td>
-<td>real mask + next state</td><td><code>AIAEC/aiaec_process.c/h</code></td></tr>
-<tr><td>DeepVQE-S</td><td>mic + far + conv/GRU/delay state</td>
-<td>3x3 complex CCM taps + next state</td><td><code>DeepVQE_S/deepvqe_process.c/h</code></td></tr>
+<td>real mask + next state</td><td><code>AIAEC/aiaec_process.c/h</code> 的共用 helper
+<b>而已，沒有 C 類別</b></td></tr>
+<tr><td>DeepVQE-S</td><td>mic + far(raw RI，壓縮在 graph 內) + 16 個顯式 state</td>
+<td>3x3 complex CCM taps + <b>每個 state 的完整下一個值</b></td>
+<td><code>AIAEC/aiaec_process.c/h</code> + <code>DeepVQE_S/deepvqe_process.c/h</code>，
+外面包 <b><code>deepvqe_prepost.c/h</code> 類別</b></td></tr>
 <tr><td>CAGCRN</td><td>mic + far + conv/GRU/delay state</td>
-<td>complex mask + next state</td><td><code>AIAEC/aiaec_process.c/h</code></td></tr>
+<td>complex mask + next state</td><td><code>AIAEC/aiaec_process.c/h</code> 的共用 helper
+<b>而已，沒有 C 類別</b></td></tr>
 </table>
 
 <p class="note">Align-CRUSE 的 cumulative score_sum 必須是 float32，frame
 index 必須是 int64，兩者不可做 integer PTQ。Align-ULCNet 的 ONNX、
 calibration manifest 與 CPU descriptor 必須使用相同 D。</p>
+
+<h2>C pre/post 類別（三個模型共用的形狀）</h2>
+
+<p>三個模型各有一個 pre/post 類別，把「caller 音訊 ↔ 加速器張量」之間的一切收進<b>一個物件</b>：
+framing、特徵前後端、recurrent ring／state bank。整合者不再自己把兩個 TU 接起來。
+三個類別的 API 形狀相同，只是前綴 <code>&lt;pfx&gt;</code> 不同（<code>ulcnet</code> /
+<code>deepvqe</code> / <code>dfn2</code>）：</p>
+
+<pre>&lt;pfx&gt;_config_defaults(&amp;cfg, io_mode[, delay_depth]);   /* 本 build 的 grid 預設值 */
+&lt;pfx&gt;_get_mem_size(&amp;cfg, &amp;req);                       /* reject-first：壞參數時 req 不動 */
+&lt;pfx&gt;_init(pool, bytes, &amp;cfg) | _init_ex(pool, bytes, &amp;cfg, &amp;expected) | _create(&amp;cfg)
+每 hop：
+  n = &lt;pfx&gt;_pre_process(p, hop…);      /* 或 _pre_process_freq()：這一 hop 的推論次數 */
+      &lt;pfx&gt;_frame_inputs(p, &amp;in, &amp;out); /* pool 內的 view；每個可寫輸出預填 NaN */
+      加速器填 out
+      &lt;pfx&gt;_frame_commit(p);            /* 或 &lt;pfx&gt;_frame_skip(p) */
+  &lt;pfx&gt;_post_process(p, out_hop, &amp;written);   /* 或 _post_process_freq() */
+其餘：_reset / _destroy / _hop_size / _num_bins / _io_mode / _descriptor</pre>
+
+<p><b><code>io_mode</code> 在 init 固定</b>（它決定 pool 大小，不是可切換的旗標）：
+<code>*_IO_TIME</code> hop 進 hop 出，framing／加窗／overlap-add 由類別做，但呼叫的是
+<b>caller 自己的 <code>FftHandle</code> 與 window 表</b>（借用，類別不建也不毀）；
+<code>*_IO_FREQ</code> 頻譜進頻譜出、完全不做 transform，<code>fft</code>/<code>window</code>
+可為 NULL，是<b>串接</b>用的模式（Align-ULCNet 的 accelerator adapter 就是開一個 FREQ 實例）。</p>
+
+<p><b>一 hop = 一次推論</b>：<code>pre_process</code> 回傳這一 hop 需要的加速器呼叫次數。
+Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起恆為 1</b>；DFN2 在<b>第一個 hop 回 0</b>（它的 graph 要
+<code>[t−1, t, t+1]</code>，hop 0 沒有右鄰居，不可以呼叫），之後每 hop 1 次。</p>
+
+<p><b>交易式 frame 狀態機</b>：<code>frame_inputs</code> 把每個可寫輸出<b>預填 NaN</b>；
+<code>frame_commit</code> 先驗證加速器把每個輸出都寫成有限值，<b>之後</b>才讓任何東西移動。
+驗證失敗時<b>什麼都不動</b>——persistent state 位元不變、幀維持開啟、回 −1，呼叫端再選
+<code>frame_skip</code> 或用新的 <code>frame_inputs</code> 重跑加速器。commit 必須有
+<code>frame_inputs</code> 墊背（<code>prepared</code> 閂，三個類別皆然），所以「加速器根本沒跑」
+不可能把未動過的緩衝區當成結果收下；幀還開著時再呼叫 <code>pre_process</code> 回 −1。</p>
+
+<p><b>生命週期</b>兩條（<code>audio_common/include/fft_wrapper.h</code>「Static memory support」）：
+板端 <code>_init</code>／<code>_init_ex</code> 建構在 caller pool 上，host 工具用
+<code>_create</code>／<code>_destroy</code>。<code>_init_ex</code> 多收一個 <b>32-byte MemReq</b>
+當<b>陳舊 pool 閘</b>（<code>descriptor_version</code>、<code>layout_version</code>、
+<code>io_mode</code>、<code>build_flags_hash</code>（grid+io_mode+D 的 FNV-1a-32）、
+<code>alignment</code>、<code>reserved</code>、<code>bytes</code>）：為別的 io_mode／D／build
+量出來的 pool 會被<b>拒絕</b>，不會被重新解讀。<code>_destroy</code> 對 <code>_init</code>
+實例是真正的 no-op、可重複呼叫；<code>_create</code> 實例只能毀一次。</p>
+
+<p><b>為什麼各自是第三個 TU</b>：被組合的兩個檔（<code>ulcnet_process.c</code> +
+<code>ulcnet_model_io.c</code>；<code>aiaec_process.c</code> + <code>deepvqe_process.c</code>；
+<code>dfn2_process.c</code> + <code>dfn2_model_io.c</code>）必須維持<b>各自可獨立連結</b>——它們的
+parity 測試各自只編其中一個。把類別塞進任一邊，就會在另一邊的 parity build 留下未定義符號。
+三個類別都是純組合，被組合的檔一行沒改。</p>
+
+<h2>哪些模型有 C 類別</h2>
+
+<table>
+<tr><th>Model</th><th>C 類別</th><th>測試</th><th><code>frame_skip</code> 政策</th><th>exporter 寫的 metadata key</th></tr>
+<tr><td>Align-ULCNet</td><td><code>AIAEC/Align_ULCNet/ulcnet_prepost.c/h</code></td>
+<td><code>AIAEC/tests/test_ulcnet_prepost_c.py</code>（8 案例）</td>
+<td>identity：error 頻譜原樣通過（stream 0 是 linear-AEC error）</td>
+<td><code>state_layout_version</code>（<code>Align_ULCNet/export_onnx.py</code>）</td></tr>
+<tr><td>DeepVQE-S</td><td><code>AIAEC/DeepVQE_S/deepvqe_prepost.c/h</code></td>
+<td><code>AIAEC/tests/test_deepvqe_prepost_c.py</code>（12 案例）</td>
+<td><b>mute_fail_closed</b>：靜音（stream 0 是原始 mic，放行＝未消迴聲）</td>
+<td><code>state_layout_version</code> + <code>c_descriptor</code>（<code>AIAEC/_streaming_export.py</code>）</td></tr>
+<tr><td>DeepFilterNet2</td><td><code>AINR/DeepFilterNet2/dfn2_prepost.c/h</code></td>
+<td><code>AINR/tests/test_dfn2_prepost_c.py</code>（9 案例）</td>
+<td>identity：unit ERB mask + alpha 0</td>
+<td><code>state_layout_version</code>（<code>DeepFilterNet2/export_onnx.py</code>）</td></tr>
+<tr><td>Align-CRUSE</td><td><b>沒有</b>——只有共用的 <code>AIAEC/aiaec_process.c/h</code> helper</td>
+<td>—</td><td>—</td>
+<td><b>兩個 key 都沒有</b></td></tr>
+<tr><td>CAGCRN</td><td><b>沒有</b>——只有共用的 <code>AIAEC/aiaec_process.c/h</code> helper</td>
+<td>—</td><td>—</td>
+<td><b>兩個 key 都沒有</b></td></tr>
+<tr><td>GTCRN</td><td><b>沒有</b>——<code>AINR/GTCRN/gtcrn_process.c/h</code> helper</td>
+<td>—</td><td>—</td>
+<td><code>state_layout_version</code>（<code>GTCRN/export_onnx.py</code>）</td></tr>
+<tr><td>RNNoise-ERB</td><td><b>沒有</b>——<code>AINR/RNNoise-ERB/process.c/h</code> helper</td>
+<td>—</td><td>—</td>
+<td><code>state_layout_version</code>（<code>RNNoise-ERB/export_onnx.py</code>）</td></tr>
+</table>
+
+<p class="note"><b><code>c_descriptor</code> 只有 DeepVQE-S 有。</b>
+走 <code>AIAEC/_streaming_export.py</code> 的三個 AIAEC 模型裡，
+<code>_C_DESCRIPTORS</code> 目前只映 <code>DeepVQE_S</code>；另外兩個（Align-CRUSE、CAGCRN）
+代表「C 側沒有東西釘住這個 boundary」，artifact <code>state_layout_version</code> 與
+<code>c_descriptor</code> <b>兩個都不寫</b>（缺席就是缺席，而不是寫一個會在 ONNX props 變成
+字串 <code>"None"</code> 的空值）。其餘模型各有自己的 exporter，只寫
+<code>state_layout_version</code>。DeepVQE-S 的 <code>c_descriptor</code> 是 13 欄
+（<code>layout_version</code>、<code>delay_depth</code>、<code>sample_rate</code>、
+<code>fft_size</code>、<code>hop_size</code>、<code>spectrum_bins</code>、
+<code>time_order</code>、<code>freq_taps</code>、<code>conv_history_frames</code>、
+<code>score_history_frames</code>、<code>gru_layers</code>、<code>gru_hidden</code>、
+<code>state_tensor_count</code>），而且是<b>從剛建好的 graph 量出來</b>而不是手寫重述，
+板端用 <code>deepvqe_prepost_descriptor_validate()</code> 比對。
+Align-CRUSE 與 CAGCRN 只有共用的 <code>aiaec_process.c</code> helper，沒有這一層。</p>
+
+<h2>Build</h2>
+
+<p>兩個 repo 的靜態庫都<b>依組態編碼</b>：物件與封存檔放在
+<code>build/simd&lt;N&gt;-&lt;sig&gt;/</code>（sig 由 CC/AR/CFLAGS/CPPFLAGS/SIMD/WERROR 算出），
+每個目錄記下自己的 payload，簽章相撞會被拒絕而不是重新解讀，
+<code>make print-lib-path</code> 印出該組態封存檔的絕對路徑。</p>
+
+<pre>make -C AIAEC lib &amp;&amp; make -C AIAEC print-lib-path   # libaiaec_prepost.a
+make -C AINR  lib &amp;&amp; make -C AINR  print-lib-path   # libainr_prepost.a
+make -C AIAEC test                                  # 建庫 + pytest</pre>
+
+<p><code>libaiaec_prepost.a</code> 成員：<code>ulcnet_process</code>、
+<code>ulcnet_model_io</code>、<code>ulcnet_prepost</code>、
+<code>ulcnet_accelerator_adapter</code>、<code>aiaec_process</code>、
+<code>deepvqe_process</code>、<code>deepvqe_prepost</code>。
+<code>libainr_prepost.a</code> 成員：<code>dfn2_process</code>、<code>dfn2_model_io</code>、
+<code>dfn2_prepost</code>、<code>gtcrn_process</code>——<b>RNNoise-ERB 不在裡面</b>：它有自己的
+Makefile、沒有封存檔，板端要用就把它的 <code>process.c</code> 直接加進自己的 build。</p>
 
 <h2>Calibration signal seam</h2>
 

@@ -1,6 +1,7 @@
 # AEC、NR、audio_common C API 整合速查
 
-本文件是給 application／board integration 使用者的**短版入口**，回答三件事：
+本文件是給 application／board integration 使用者的**短版入口**，涵蓋 AEC、NR、audio_common
+三個 library，以及三個 AI 模型的 pre/post 類別（§6），回答三件事：
 
 1. 應該 include 哪些 public header；
 2. init、process、reset、destroy 的正確順序；
@@ -12,6 +13,7 @@
 - [NR C 使用手冊](../lib/nr/docs/c_user_manual_zh_TW.md)
 - [audio_common C 使用手冊](../../audio_common/docs/c_user_manual_zh_TW.md)
 - [Audio_ALG mono／4ch pipeline 使用手冊](c_user_manual_zh_TW.md)
+- 模型側的圖邊界、I/O 表與延遲：`docs/html/` 的各模型頁（`ainr_dfn2.html` 等）
 
 若本文件與 header 不一致，以目前 pin 住的 public header 與測試為準。
 
@@ -27,6 +29,9 @@
 | 只做單路 AEC，或自行組合 NN／其他 post-filter | `aec.h` |
 | 已有 STFT/WOLA，只需要頻域 NR | `mmse_lsa_denoiser.h` |
 | 只需要 FFT、resample、HPF、pre-gain | `audio_common/include/*.h` |
+| Align-ULCNet 加速器 handoff（hop 或頻譜） | `AIAEC/Align_ULCNet/ulcnet_prepost.h` |
+| DeepVQE-S 加速器 handoff | `AIAEC/DeepVQE_S/deepvqe_prepost.h` |
+| DeepFilterNet2 加速器 handoff | `AINR/DeepFilterNet2/dfn2_prepost.h` |
 
 產品 application 若要的是既有完整 flow，優先呼叫 pipeline API；不要在 application
 重新複製 AEC/NR gain fusion、window、OLA 或 CNG 邏輯。只有要做不同演算法組合時，才直接組
@@ -421,7 +426,255 @@ hpf_process(hpf, buf, n);                  /* in-place */
 
 ---
 
-## 6. Static-pool 共通規則
+## 6. AI 模型 pre/post 類別
+
+三個模型各有一個 pre/post 類別，把「呼叫端音訊 ↔ 加速器張量」之間的所有東西
+（framing、window、FFT/IFFT/OLA、特徵前端、遞迴 ring 與狀態交易）收成一個物件：
+
+| 模型 | Public header | 訊號輸入 |
+|---|---|---|
+| Align-ULCNet | `AIAEC/Align_ULCNet/ulcnet_prepost.h` | linear-AEC error + aligned far |
+| DeepVQE-S | `AIAEC/DeepVQE_S/deepvqe_prepost.h` | **raw microphone** + far reference |
+| DeepFilterNet2 | `AINR/DeepFilterNet2/dfn2_prepost.h` | 單路 noisy |
+
+每個類別都是**第三個 TU**：它組合的兩個檔案（`ulcnet_process.c` + `ulcnet_model_io.c`；
+`aiaec_process.c` + `deepvqe_process.c`；`dfn2_process.c` + `dfn2_model_io.c`）必須維持各自
+可獨立連結給自己的 parity 測試用，所以類別不能放進其中任何一個，而且**兩個被組合的檔案都沒有改動**。
+
+### 6.1 共通生命週期
+
+三個類別的形狀相同，只有前綴不同（`ulcnet_` / `deepvqe_` / `dfn2_`）：
+
+```text
+_config_defaults(&cfg, io_mode[, delay_depth])
+  -> _get_mem_size(&cfg, &req)
+  -> _init(pool, req.bytes, &cfg)  或  _init_ex(pool, bytes, &cfg, &expected)
+  -> 每-hop 序列（6.2）
+  -> _reset(p)（stream boundary）
+  -> _destroy(p)
+```
+
+- `io_mode` **init-time 固定**，因為它決定 pool 大小：`*_IO_TIME` 是 hop 進 hop 出
+  （類別做 framing/window/OLA，transform 呼叫**呼叫端的** `FftHandle`），
+  `*_IO_FREQ` 是頻譜進頻譜出、完全不做 transform，用來接在 AEC/GSC seam 後面串接。
+- `_get_mem_size()` 是 reject-first：NULL 引數、未知 `io_mode`、`delay_depth` 超出範圍、
+  TIME 模式沒有可用的 `fft`/`window`（DFN2 另加：缺 ERB 矩陣、非有限的 `atten_lim_db`），
+  一律回 `-1` 且 `*req` 一個 byte 都不寫。
+- `_init_ex()` 是 **stale-pool gate**：固定 32-byte 的 `*PrepostMemReq`
+  （`descriptor_version`、`layout_version`、`io_mode`、`build_flags_hash`（FNV-1a-32）、
+  `alignment`、`reserved`、`bytes`）與本 build 不符就拒絕，而不是重新解讀一塊為別的組態
+  配出來的 pool。`expected` 傳 NULL 時等同 `_init()`。
+- `_create()` 是 get_mem_size + 對齊配置 + init，給 host 工具與測試；板端走 `_init()`。
+  `_destroy()` 只釋放 `_create()` 配置的東西：對 `_init()` 實例它是**可重複呼叫的 no-op**
+  （pool 永遠是 caller 的），對 `_create()` 實例呼叫第二次就是 double free。
+- 借用而不擁有：`FftHandle`、window 表、DFN2 的 ERB 矩陣都是 caller-owned，類別從不建立或銷毀。
+  **例外：DFN2 的 window 是複製的**——`DFN2State` 以 `float window[DFN2_WIN_LEN]` 內嵌窗表，
+  所以 `cfg.window` 非 NULL 時會在 init 與每次 reset 覆蓋它（類別仍然不配置也不釋放任何東西）。
+- `_reset()` 清空所有遞迴／ring／狀態、丟掉未結束的 frame、framing 與 clock 回 init 值；
+  config、borrowed 指標與 pool 都不動。
+
+### 6.2 每-hop 序列與回傳值合約
+
+```c
+int n = ulcnet_prepost_pre_process(p, err_hop, far_hop);  /* 需要幾次推論 */
+if (n == 1) {
+    UlcnetModelIoInputs  in;
+    UlcnetModelIoOutputs out;
+    ulcnet_prepost_frame_inputs(p, &in, &out);   /* 指向本實例 pool 的 view */
+    if (accelerator_run(&in, &out) != 0 || ulcnet_prepost_frame_commit(p) != 0)
+        ulcnet_prepost_frame_skip(p);            /* 保住 framing 節奏 */
+}
+int written = 0;
+ulcnet_prepost_post_process(p, out_hop, &written);
+```
+
+- **`_pre_process()` 回的是「這一拍需要的加速器呼叫次數」，不是布林。**
+  Align-ULCNet 與 DeepVQE-S **從第 0 拍起恆為 1**（一 hop 進、一次推論、一 hop 出，兩個 io_mode 皆然）；
+  DeepFilterNet2 **第 0 拍回 0**、之後恆 1，因為它的圖吃 `[t-1, t, t+1]`，第 0 拍沒有右鄰居，
+  那一拍**不可以**呼叫加速器。
+- `_frame_inputs()` 把每個可寫輸出**預填 NaN**，所以加速器只寫一半會在 commit 被抓到，
+  而不是把上一框的值當成本框結果。回 `0`，沒有開啟中的 frame 回 `-1`。
+- `_frame_commit()` **先驗證再搬動**：確認每個 head／state 都是有限值之後才 commit。
+  失敗時**什麼都不動**——持久狀態 byte-identical、frame 維持開啟、回 `-1`。
+  接著只有兩條路：`_frame_skip()`，或重新 `_frame_inputs()` 再跑一次加速器。
+- **commit 後面一定要有一次 `_frame_inputs()`**（`prepared` 閂鎖，三個類別皆然）：
+  沒跑過的加速器不能把沒被碰過的 buffer 當成結果送出。
+
+拒絕情境整理：
+
+| 呼叫 | 情境 | 回傳 |
+|---|---|---|
+| `_pre_process` / `_pre_process_freq` | 上一個 frame 還開著（既未 commit 也未 skip） | `-1`（一拍被拒絕，不會默默疊上去） |
+| `_pre_process` / `_pre_process_freq` | 與實例的 `io_mode` 不符 | `-1` |
+| `_frame_inputs` / `_frame_commit` / `_frame_skip` | 沒有開啟中的 frame | `-1` |
+| `_frame_commit` | 沒有 `_frame_inputs()` 在前面 | `-1`，狀態不動 |
+| `dfn2_prepost_set_erb_matrices` / `_set_atten_lim` | frame 開著 | `-1` |
+
+### 6.3 skip 政策：三個模型不一樣
+
+`_frame_skip()` 是加速器跑失敗（或對齊邊界 reprime）時唯一正確的出口——它讓 framing
+節奏繼續走，而模型的遞迴狀態**不**前進。但「這一框輸出什麼」每個模型不同：
+
+| 模型 | skip 輸出 | 理由 |
+|---|---|---|
+| Align-ULCNet | error 頻譜原樣穿過（identity） | 它的 stream 0 已經是 linear AEC 之後的殘差 |
+| DeepFilterNet2 | unit ERB mask + alpha 0（identity） | `erb_inv` 是 partition of unity（每個 bin 的 band 權重和為 1），unit band mask 展開就是 unit bin gain——**精確**而非近似 |
+| DeepVQE-S | **靜音（fail closed）** | 它的 stream 0 是**原始麥克風**，pass-through 會送出**完全未消除的回音**；`deepvqe_prepost_skip_policy_name()` 回 `"mute_fail_closed"` |
+
+DeepVQE-S 的代價是 near-end 一框的缺口，上限就是一框；另一個選項的代價則是無上限的回音進遠端。
+要 graceful degradation 的呼叫端得自己跑一個 canceller 並在 pipeline 層 cross-fade——
+那不是這個類別的決定，它看不到有沒有那個 canceller。
+
+### 6.4 Align-ULCNet：`ulcnet_prepost.h`
+
+```c
+int  ulcnet_prepost_config_defaults(UlcnetPrepostConfig *cfg, int io_mode, int delay_depth);
+int  ulcnet_prepost_get_mem_size(const UlcnetPrepostConfig *cfg, UlcnetPrepostMemReq *req);
+UlcnetPrepost *ulcnet_prepost_init(void *pool, size_t bytes, const UlcnetPrepostConfig *cfg);
+UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes, const UlcnetPrepostConfig *cfg,
+                                      const UlcnetPrepostMemReq *expected);
+UlcnetPrepost *ulcnet_prepost_create(const UlcnetPrepostConfig *cfg);
+void ulcnet_prepost_destroy(UlcnetPrepost *p);
+void ulcnet_prepost_reset(UlcnetPrepost *p);
+int  ulcnet_prepost_hop_size(const UlcnetPrepost *p);
+int  ulcnet_prepost_num_bins(const UlcnetPrepost *p);
+int  ulcnet_prepost_io_mode(const UlcnetPrepost *p);
+const UlcnetModelIoDescriptor *ulcnet_prepost_descriptor(const UlcnetPrepost *p);
+
+int  ulcnet_prepost_pre_process(UlcnetPrepost *p, const float err_hop[ULCNET_HOP],
+                                const float far_hop[ULCNET_HOP]);
+int  ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
+                                     const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
+                                     const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS]);
+int  ulcnet_prepost_frame_inputs(UlcnetPrepost *p, UlcnetModelIoInputs *inputs,
+                                 UlcnetModelIoOutputs *outputs);
+int  ulcnet_prepost_frame_commit(UlcnetPrepost *p);
+int  ulcnet_prepost_frame_skip(UlcnetPrepost *p);
+int  ulcnet_prepost_post_process(UlcnetPrepost *p, float out_hop[ULCNET_HOP], int *written);
+int  ulcnet_prepost_post_process_freq(UlcnetPrepost *p, float re[ULCNET_BINS], float im[ULCNET_BINS]);
+```
+
+- `cfg` 欄位：`io_mode`、`delay_depth`（D，範圍 `ULCNET_MODEL_IO_MIN_D`=2 到
+  `ULCNET_MODEL_IO_MAX_D`=64）、`fft`、`window`（後兩者 `ULCNET_IO_TIME` 必填、borrowed，
+  window 為 `ulcnet_make_window()` 產出的 `ULCNET_N_FFT` 項；`ULCNET_IO_FREQ` 不用）。
+- **error 與 far 必須是同一個輸入 hop**：類別內部不做任何 skew。上游 WOLA 造成的落差由呼叫端先對齊。
+- `ULCNET_IO_FREQ` 收的是模型自己 framing 的未正規化 rfft（center=False，一 hop 一框）——
+  AEC 的 `AecResContext.error_spec` 已經正好是這個 framing 慣例（但它是交錯的 `Complex`，
+  要拆成 re/im 兩個陣列再傳）。
+- 加速器邊界的 `UlcnetModelIoInputs`／`UlcnetModelIoOutputs` 定義在 `ulcnet_model_io.h`。
+- 一個 build 只服務一個 grid：預設 16000/512，用 `-DULCNET_MODEL_IO_SR=48000
+  -DULCNET_MODEL_IO_N_FFT=1024` 建另一個產品 grid；其餘組合由 `#error` 擋掉。
+
+### 6.5 DeepVQE-S：`deepvqe_prepost.h`
+
+生命週期與每-hop 函式和 6.4 逐一對應（前綴 `deepvqe_prepost_`，訊號引數為
+`mic_hop`/`far_hop`、`mic_re/mic_im/far_re/far_im`，長度 `AIAEC_HOP`／`AIAEC_N_BINS`），
+`frame_inputs()` 用的是本檔自己的 `DeepVqePrepostInputs`／`DeepVqePrepostOutputs`。額外 API：
+
+```c
+const char *deepvqe_prepost_state_name(int state_id);       /* graph input 名 */
+const char *deepvqe_prepost_state_name_out(int state_id);   /* graph output 名 */
+int    deepvqe_prepost_state_shape(int state_id, int delay_depth,
+                                   int dims[DEEPVQE_STATE_MAX_RANK]);
+size_t deepvqe_prepost_state_elements(int state_id, int delay_depth);
+const char *deepvqe_prepost_skip_policy_name(void);
+int  deepvqe_prepost_descriptor_default(int delay_depth, DeepVqePrepostDescriptor *descriptor);
+int  deepvqe_prepost_descriptor_validate(const DeepVqePrepostDescriptor *descriptor);
+const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(const DeepVqePrepost *p);
+```
+
+- 圖邊界：兩個 RI 交錯的訊號 input（`mic`/`far`，`[1,1,AIAEC_N_BINS,2]`）＋
+  **16 個顯式 state**，順序就是 `DeepVqeStateId` 列舉（= exporter 的 `input_names[2:]` 逐字），
+  輸出是 CCM taps `[1,1,BINS,DEEPVQE_TIME_ORDER,DEEPVQE_FREQ_TAPS,2]` ＋ 16 個 next state。
+  按 index 綁的 adapter 必須用這個列舉，按名字綁的用 `_state_name()`。
+- DeepVQE-S 回的是**每個 state 的完整下一個值**（不是差量），所以 pool 裡有兩套 bank、
+  commit 時交換；NaN 預填與有限性檢查會走過整個狀態，這正是「失敗時什麼都不動」能被強制而不只是聲稱的原因。
+- `descriptor_validate()` 拿 ONNX/JSON metadata 裡的 13 欄 `c_descriptor` 對本 build 的 ABI 逐欄比對，
+  只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 1。
+- D 範圍 `DEEPVQE_PREPOST_MIN_D`=1 到 `DEEPVQE_PREPOST_MAX_D`=256，出貨值
+  `DEEPVQE_PREPOST_DEFAULT_D`=63（16 kHz 上的一秒搜尋範圍）。
+- grid 只有 16 kHz/512/256：`aiaec_process.h` 帶 `#error` 守衛，grid 換掉是編譯失敗而不是默默重新解讀張量。
+
+### 6.6 DeepFilterNet2：`dfn2_prepost.h`
+
+生命週期與每-hop 函式同樣對應（前綴 `dfn2_prepost_`，單路訊號 `in_hop`／`spec_re,spec_im`，
+長度 `DFN2_HOP_LEN`／`DFN2_N_BINS`，`_config_defaults(cfg, io_mode)` **沒有** `delay_depth`）。
+額外 API：
+
+```c
+int  dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p);  /* = 2 */
+int  dfn2_prepost_layout_version(const DFN2Prepost *p);
+int  dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd, const float *erb_inv);
+int  dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
+int  dfn2_prepost_post_process(DFN2Prepost *p, float out_hop[DFN2_HOP_LEN], int *written);
+int  dfn2_prepost_post_process_freq(DFN2Prepost *p, float re[DFN2_N_BINS], float im[DFN2_N_BINS],
+                                    int *valid);
+int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
+```
+
+- `cfg` 欄位：`io_mode`、`fft`（`DFN2_IO_TIME` 必填）、`window`（可選，**會被複製**，
+  NULL = 內建 sqrt-Hann，出貨路徑都用 NULL）、`erb_fwd`／`erb_inv`（**兩個模式都必填**，borrowed）、
+  `atten_lim_db`（0 = 關閉）。
+- 兩個 setter **只能在 hop 之間**呼叫，frame 開著時回 `-1`。要精確理解它買到什麼：
+  這是 **per-hop atomicity，不是 per-source-frame consistency**——`DFN2_MASK_LOOKAHEAD` = 1，
+  hop *t* 展開的 mask 屬於 source frame *t*−1，而圖的特徵視窗 `[t-1, t, t+1]` 橫跨三拍，
+  所以一次被接受的 between-hop 換手仍會有幾拍同時踩到新舊矩陣。要 per-source-frame 一致，
+  那就是一個 stream boundary：先 `_reset()`，再換。
+- `_output_frame_index()` 給出最近一次輸出屬於哪一個 source frame（自 reset 起 0 起算），
+  用來把輸出串流與其他同框時鐘的東西配對；還沒有輸出時回 `-1`。
+- 輸出前兩拍是暖機：`_post_process()` 的 `*written` = 0（`out_hop` 仍然寫滿零），
+  `_post_process_freq()` 的 `*valid` = 0。收尾 flush 要用全零 hop 再跑 2 拍，**加速器那兩拍也要照跑**。
+- **`DFN2_IO_FREQ` 的頻譜是 `torch.stft(normalized=True)` 尺度**（乘了 1/√`DFN2_N_FFT` = 1/32），
+  AIAEC 兩個模型交出的則是**未正規化**的 rfft。直接串接會剛好差 32 倍（過驅動或欠驅動），
+  而且兩邊都偵測不到——都是量綱合法的 float 頻譜，ERB 特徵又是 EMA 正規化的。
+  兩者也不同 grid（48 kHz/1024/512 對 16 kHz/512），中間本來就有 resampler，換算就放在那一層。
+  `DFN2_ANALYSIS_SCALE` **不是**這個因子（它只作用在特徵分支的拷貝上）。
+
+### 6.7 Pool 大小
+
+以現行 build 量得，供規劃用；產品一律以 resolved config 呼叫 `_get_mem_size()`，
+**不要把這裡的數字寫死**（§7 規則同樣適用）。單位 bytes。
+
+| 類別 / grid | D | `*_IO_TIME` | `*_IO_FREQ` |
+|---|---:|---:|---:|
+| Align-ULCNet 16 kHz | 4 | 69,808 | 48,208 |
+| Align-ULCNet 16 kHz | 8 | 98,992 | 77,392 |
+| Align-ULCNet 16 kHz | 16 | 157,360 | 135,760 |
+| Align-ULCNet 16 kHz | 32 | 274,096 | 252,496 |
+| Align-ULCNet 16 kHz | 64 | 507,568 | 485,968 |
+| Align-ULCNet 48 kHz | 4 | 132,272 | 89,168 |
+| Align-ULCNet 48 kHz | 8 | 188,080 | 144,976 |
+| Align-ULCNet 48 kHz | 16 | 299,696 | 256,592 |
+| Align-ULCNet 48 kHz | 32 | 522,928 | 479,824 |
+| Align-ULCNet 48 kHz | 64 | 969,392 | 926,288 |
+| DeepVQE-S 16 kHz | 63 | 1,499,408 | 1,477,808 |
+| DeepFilterNet2 48 kHz | — | 314,464 | 312,416 |
+
+DeepVQE-S 的量體由兩套 16 個 state 的 bank 主宰。DeepFilterNet2 兩個模式只差 2,048 bytes
+（輸出 hop staging）：`DFN2State` 把 analysis/window/synthesis 緩衝以值內嵌，FREQ 實例甩不掉它們，
+**不要期待 AIAEC 那種等比例節省**。
+
+### 6.8 Framing helper：一 hop 一框的 analysis
+
+兩個 AIAEC 類別在 TIME 模式下的 analysis 走的是新增的：
+
+```c
+int ulcnet_analysis_push_frame(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
+                               float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]);
+int aiaec_analysis_push_frame(AiaecAnalysis *state, const float input[AIAEC_HOP],
+                              float real[AIAEC_N_BINS], float imag[AIAEC_N_BINS]);
+```
+
+center=False，**從第一次 push 起就是一 push 一框**（恆回 1），與 AEC/GSC seam 的頻譜同一個慣例，
+所以只有一路頻譜在手的呼叫端可以用它補另一路而兩路保持 hop 對齊。它與既有的
+`ulcnet_analysis_push()`／`aiaec_analysis_push()`（center=True，第一拍 0 框、第二拍 2 框）
+對同一個 hop 產出的**最後一框 bit-identical**，差別只在 centered 版本多吐一個 reflect-prefix 開頭框。
+
+> **同一個 state 上不可混用兩個 push 函式**：它們共用 history，不共用 schedule。
+
+---
+
+## 7. Static-pool 共通規則
 
 三個 library 都遵守相同模式：
 
@@ -447,7 +700,7 @@ config
 
 ---
 
-## 7. 建置、SIMD 與連結
+## 8. 建置、SIMD 與連結
 
 從 `SE/` 根目錄做參考建置：
 
@@ -468,6 +721,22 @@ make -C NR/c_impl   lib BACKEND=ne10 SIMD=1
 不要混用不同 `BACKEND`／`SIMD` 產物。archive 路徑由 build flags hash 決定，使用各 repo
 的 `make -s ... print-lib-path` 取得，不要自行拼 `bin/` 路徑。
 
+模型 pre/post 類別（§6）另有兩個 archive，同樣是 configuration-keyed：
+
+```bash
+make -C AIAEC lib ; make -C AIAEC -s print-lib-path   # libaiaec_prepost.a
+make -C AINR  lib ; make -C AINR  -s print-lib-path   # libainr_prepost.a
+```
+
+兩者都落在自己 repo 的 `build/simd<N>-<sig>/` 下（`<sig>` 是各自 Makefile 的組態簽章 cksum：
+AIAEC 蓋 `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`，AINR 蓋 `CC`/`AR`/`CFLAGS`/`LDFLAGS`/
+`SIMD`/`SIMD_CPPFLAGS`/`BACKEND`/`WERROR`/`AC_LIB`；每個目錄另存 `config.manifest` 擋簽章碰撞），
+所以路徑一律用 `print-lib-path` 取得。成員：`libaiaec_prepost.a` = `ulcnet_process`、
+`ulcnet_model_io`、`ulcnet_prepost`、`ulcnet_accelerator_adapter`、`aiaec_process`、
+`deepvqe_process`、`deepvqe_prepost`；`libainr_prepost.a` = `dfn2_process`、`dfn2_model_io`、
+`dfn2_prepost`、`gtcrn_process`。RNNoise-ERB **不在**任何 archive 裡（自己的 Makefile，
+要用的板子把它的來源檔直接加進自己的 build）。`WERROR=1` 是 opt-in，且已納入組態簽章。
+
 消費端至少要帶：
 
 ```text
@@ -484,7 +753,7 @@ make -C NR/c_impl   lib BACKEND=ne10 SIMD=1
 
 ---
 
-## 8. 最小整合檢查清單
+## 9. 最小整合檢查清單
 
 - [ ] sample rate、frame/FFT、hop 是同一個合法 grid。
 - [ ] mic/ref 同 sample rate、同 clock；AEC ref 是實際 speaker render reference。

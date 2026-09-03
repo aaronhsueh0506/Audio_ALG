@@ -6,38 +6,37 @@
  *
  *   4x linear AEC lanes + one shared far aligner (FourAecNrRes process_pre)
  *     -> SRP-PHAT DOA -> GSC effective weights (existing spatial libraries)
- *     -> beamformed linear-error SPECTRUM (gsc_process_with_weights output)
- *     -> WOLA reconstruction to a time-domain beamformed error hop
- *     -> Align-ULCNet centered STFT chain (ulcnet_process.h) driving an
- *        external NPU runtime through the UlcnetModel per-frame callback
- *     -> enhanced mono hop
+ *     -> beamformed linear-error SPECTRUM (gsc_process_with_weights output),
+ *        handed to the model DIRECTLY as its error frame -- it is already
+ *        the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis frame the
+ *        Align-ULCNet chain would compute, so nothing is reconstructed or
+ *        re-analysed in between
+ *     -> the same hop's far source through the chain's one-frame-per-hop
+ *        analysis (ulcnet_analysis_push_frame); one inference per hop from
+ *        hop #0 through the UlcnetModel callback
+ *     -> Align-ULCNet synthesis (ulcnet_process.h) -> enhanced mono hop
  *
  * The core's own post-beam RES/NR path (four_aec_nr_res_process_post) is
  * NOT used: each pre frame is released via four_aec_nr_res_abandon_pre()
  * and the Align-ULCNet chain replaces that post stage entirely.
  *
- * TIMING CONTRACT (total added algorithmic latency = 2 compiled-grid hops;
- * 32 ms for 16 kHz/512 and 21.33 ms for 48 kHz/1024):
+ * TIMING CONTRACT (total added algorithmic latency = 1 compiled-grid hop;
+ * 16 ms for 16 kHz/512 and 10.67 ms for 48 kHz/1024):
  *
- *   1 hop  — the gsc-spectrum WOLA: the beamformed-error spectrum of hop p
- *            is only fully reconstructed in the time domain at hop p+1
- *            (sqrt-Hann analysis inside the AEC + sqrt-Hann synthesis here,
- *            50% overlap-add).
- *   1 hop  — the centered Align-ULCNet chain itself (see ulcnet_process.h:
- *            hop#0 emits nothing, hop#p output corresponds to chain input
- *            hop p-1).
+ *   1 hop  — the Align-ULCNet synthesis: frame #0's block lies inside the
+ *            trimmed half window, so hop#p's output is the beamformed error
+ *            of input hop p-1 (see ulcnet_process.h).
  *
- *   The far branch is delayed by ONE HOP inside this wrapper (a saved-hop
- *   buffer) before entering its analysis, so the model always sees
- *   error/far frame pairs of the SAME input hop: the WOLA-reconstructed
- *   beam hop pushed at hop p is the beamformed error of input hop p-1, and
- *   the far hop pushed beside it is the far source of that same hop p-1.
+ *   Nothing else adds latency. The GSC spectrum of hop p is the model's
+ *   error frame at hop p, and the far branch is analysed from the same
+ *   hop's far source (ulcnet_analysis_push_frame, one frame per hop from
+ *   hop #0), so the model always sees error/far frame pairs of the SAME
+ *   input hop with no delay buffer on either side, and every hop from
+ *   hop #0 is exactly one inference.
  *
- *   Consequently process() emits ZEROS for hop#0 AND hop#1, and the output
- *   of hop#p (p >= 2) corresponds to the beamformed linear error of input
- *   hop p-2. The last reconstructed beamformed-error hop is exposed
- *   read-only via audio_pipeline_4ch_ulcnet_last_beamformed_error() so
- *   integrators/tests can verify exactly this relation.
+ *   Consequently process() emits ZEROS for hop#0 only, and the output of
+ *   hop#p (p >= 1) corresponds to the beamformed linear error of input hop
+ *   p-1. The far-timestamp test pins this relation with a unit impulse.
  *
  * FAR-INPUT DEPLOYMENT CONTRACT: the model always receives the shared AEC
  * seam's pre.aligned_ref. On every hop the shared delay ring cannot yet serve
@@ -64,11 +63,15 @@
  *     discarded (identity frame) -- NaN/Inf never reaches the WOLA.
  *   - On a delay change event (delay.changed), or FIXED's first transition
  *     from ring-fill raw far to usable aligned far: model->reset (if set) is
- *     called so the runtime flushes its far attention ring + logit history,
- *     and the beamform WOLA accumulator AND the one-hop far buffer are
- *     cleared (the core reset its lanes' analysis history at the same
- *     boundary — mixing spectra from opposite sides of the realignment
- *     would corrupt the seam).
+ *     called so the runtime flushes its far attention ring + logit history.
+ *     The C-side framing states keep running (the core's lane analysis
+ *     behind the GSC spectrum, this wrapper's far analysis and its
+ *     synthesis); the frame that still straddles the boundary is covered by
+ *     the identity reprime below. Nothing is cleared: the layout-16 wrapper
+ *     wiped its beam-WOLA accumulator at every boundary, which emitted one
+ *     half-window-tapered hop there (measured: out_old[T+1] equals
+ *     window^2 * out_new[T] to about -50 dB); with no reconstruction stage
+ *     left there is nothing to wipe, and the boundary hop is emitted whole.
  *   - audio_pipeline_4ch_ulcnet_reset() also calls model->reset (if set).
  *
  * IDENTITY REPRIME ACROSS AN ALIGNMENT BOUNDARY (option A):
@@ -90,23 +93,21 @@
  *   the counter (it never accumulates).
  *
  *   Derivation of the constant (MEASURED by the straddle-derivation test in
- *   tests/test_audio_pipeline_4ch_ulcnet.c, never assumed here): BOTH
- *   branches of this wrapper are pushed one hop behind the input -- the beam
- *   WOLA closes one hop late, and the far branch is delayed one hop to match
- *   it -- so the hop pushed at the boundary hop T still belongs to the
- *   pre-switch input hop T-1 (and is in fact the cleared OLA / cleared far
- *   buffer). With a centered 50%-overlap analysis spanning two pushed hops, the
- *   frames emitted at hops T and T+1 both cover that slot and straddle; the
- *   frame emitted at hop T+2 covers the two post-switch hops and is clean.
- *   That is TWICE the mono wrapper's reprime (audio_pipeline_ulcnet.h: 1),
- *   which pushes both branches from the current hop. The test derives the
- *   count from a marker run that contains NO boundary at all -- so the
- *   reprime logic never participates in its own measurement -- and asserts
- *   it equals the constant below, per branch.
+ *   tests/test_audio_pipeline_4ch_ulcnet.c, never assumed here): both
+ *   branches are framed from the CURRENT input hop -- the GSC spectrum of
+ *   hop T, and the far analysis pushed with hop T -- and each 50%-overlap
+ *   frame spans two hops, so the frame at the boundary hop T still covers
+ *   the pre-switch hop T-1 and straddles; the frame at T+1 covers the two
+ *   post-switch hops and is clean. That is the same count as the mono
+ *   wrapper's (audio_pipeline_ulcnet.h: 1), which also frames both branches
+ *   from the current hop. The test derives the count from a marker run that
+ *   contains NO boundary at all -- so the reprime logic never participates
+ *   in its own measurement -- and asserts it equals the constant below, per
+ *   branch.
  *
  *   Compute: a reprime frame SKIPS inference, so per-hop compute DROPS for
- *   those frames; it never doubles. The WOLA/STFT path is untouched, so the
- *   2-hop latency contract holds unchanged across a boundary.
+ *   that frame; it never doubles. The framing path is untouched, so the
+ *   1-hop latency contract holds unchanged across a boundary.
  *
  *   Option B (keep stepping the model through the straddling frames and keep
  *   applying its output) is DEFERRED pending an audio A/B: it trades this
@@ -147,27 +148,25 @@ extern "C" {
  * i.e. the length of the identity reprime armed at every generation change
  * (see "IDENTITY REPRIME" in this header's preamble).
  *
- * = 2: both branches are pushed one hop behind the input (beam WOLA lag +
- * the matching one-hop far compensation), so the slot pushed at the boundary
- * hop still belongs to the pre-switch input hop, and the centered 50%-overlap
- * analysis spans two pushed slots. Derived and asserted branch by branch by
+ * = 1: both branches are framed from the current input hop and each
+ * 50%-overlap frame spans two hops, so only the frame at the boundary hop
+ * still covers a pre-switch hop. Derived and asserted branch by branch by
  * the straddle-derivation test; do not edit this value without re-running
  * it.
  */
-enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
+enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
 
 /* ============================================================================
  * Memory descriptor
  * ========================================================================== */
 
 #define AUDIO_PIPELINE_4CH_ULCNET_DESCRIPTOR_VERSION 1u
-/* Carve order: self, core, srp, gsc, gsc_spectrum, gsc_weights, fft, ifft,
- * ola, synth_win, beam_hop (the ULCNet analysis/synthesis states, frame
- * scratch, one-hop far buffer and the chain's shared
- * sqrt-Hann window table live inside `self`). The one carved `fft` handle
- * serves BOTH the beamform WOLA and the ULCNet chain (same compiled size;
- * strictly sequential use within a hop). Bump together with the
- * build-flags-hash token string forever after.
+/* Carve order: self, core, srp, gsc, gsc_spectrum, gsc_weights, fft (the
+ * ULCNet far-analysis/synthesis states, the one-frame err/far staging and
+ * the chain's shared sqrt-Hann window table live inside `self`). The one
+ * carved `fft` handle serves the ULCNet chain (same compiled size; strictly
+ * sequential use within a hop). Bump together with the build-flags-hash
+ * token string forever after.
  * v2: self grew the one-hop far-compensation buffer + far_input_mode.
  * v3: the ULCNet chain moved onto the shared carved FftHandle (its structs
  * embed their own FFT scratch) and self grew the shared window table
@@ -217,8 +216,15 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 2 };
  * already carves no NR state either way -- so the pool byte count alone
  * cannot say this happened, and a version-15 descriptor must be refused on
  * the counter. It is also a C struct-ABI change: a caller compiled against
- * the version-15 header must not be linked against this one. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 16u
+ * the version-15 header must not be linked against this one.
+ * Version 17: the GSC spectrum feeds the model directly. The beam WOLA's four
+ * carves (ifft, ola, synth_win, beam_hop) are gone, and inside `self` the
+ * error-branch analysis state, the two-frame staging and the one-hop far
+ * buffer were replaced by one-frame err/far staging; the carve token moved
+ * with it. The C API also lost audio_pipeline_4ch_ulcnet_last_beamformed_
+ * error() (there is no reconstructed beam hop any more), and the timing
+ * contract went from 2 hops to 1. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 17u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -320,8 +326,8 @@ int audio_pipeline_4ch_ulcnet_get_mem_requirements(
     AudioPipeline4ChUlcnetMemReq* out);
 
 /**
- * Place the complete pipeline (core + SRP-PHAT + GSC + beamform WOLA + the
- * ULCNet chain state) in caller-owned memory. mem must satisfy the freshly
+ * Place the complete pipeline (core + SRP-PHAT + GSC + the ULCNet chain
+ * state) in caller-owned memory. mem must satisfy the freshly
  * queried alignment and byte requirement. No heap allocation is performed by
  * this path. A dirty/poisoned pool is accepted. The model callback starts
  * unset (fail-open identity) -- see set_model() below.
@@ -381,9 +387,10 @@ int audio_pipeline_4ch_ulcnet_set_model(
  * freezes GSC adaptation exactly like the standard wrapper's vad_raw/vad_out
  * pair (a single flag feeds both here).
  *
- * out receives zeros for hop#0 and hop#1; from hop#2 on it carries the
- * enhanced (or fail-open identity) beamformed error, 2 hops behind the
- * input (see the timing contract above).
+ * out receives zeros for hop#0; from hop#1 on it carries the enhanced (or
+ * fail-open identity) beamformed error, 1 hop behind the input (see the
+ * timing contract above). Every hop, hop#0 included, is exactly one
+ * inference of the installed model.
  *
  * @return FOUR_AEC_NR_RES_OK on success; the core's own status codes
  *         otherwise (the wrapper resets itself on internal DSP errors, same
@@ -397,7 +404,7 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     float* out);
 
 /**
- * Reset all core/SRP/GSC/WOLA/ULCNet-chain state, restart the 2-hop timing
+ * Reset all core/SRP/GSC/ULCNet-chain state, restart the 1-hop timing
  * preamble, and call model->reset (if set). Any pending identity reprime is
  * dropped: the analysis history is zeroed here, so the frames emitted after
  * a reset straddle nothing. Never touches the model callback installation
@@ -420,17 +427,6 @@ int audio_pipeline_4ch_ulcnet_hop_size(const AudioPipeline4ChUlcnet* p);
 int audio_pipeline_4ch_ulcnet_fft_size(const AudioPipeline4ChUlcnet* p);
 int audio_pipeline_4ch_ulcnet_n_freqs(const AudioPipeline4ChUlcnet* p);
 int audio_pipeline_4ch_ulcnet_sample_rate(const AudioPipeline4ChUlcnet* p);
-
-/**
- * Read-only view of the beamformed-error hop reconstructed during the most
- * recent successful process call (hop_size samples; itself one hop behind
- * that call's input -- see the timing contract). All zeros before the first
- * process call and after reset(). Valid until the next process/reset/
- * destroy. NULL for a NULL/destroyed handle. Exposed for tests, debugging,
- * and latency verification.
- */
-const float* audio_pipeline_4ch_ulcnet_last_beamformed_error(
-    const AudioPipeline4ChUlcnet* p);
 
 /**
  * Copy the shared delay state observed by the most recent successful

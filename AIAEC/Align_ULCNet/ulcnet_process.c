@@ -62,13 +62,20 @@ int ulcnet_analysis_init(UlcnetAnalysis *st, FftHandle *fft,
     return 0;
 }
 
-int ulcnet_analysis_push(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
-                         float out_re[2][ULCNET_BINS],
-                         float out_im[2][ULCNET_BINS]) {
+/* Slide the last N_FFT samples by one hop and append the new hop. Shared by
+ * the centered push and the rolling push: they share the history, not the
+ * schedule. */
+static void history_append(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP]) {
     memmove(st->history, st->history + ULCNET_HOP,
             (size_t)(ULCNET_N_FFT - ULCNET_HOP) * sizeof(float));
     memcpy(st->history + ULCNET_N_FFT - ULCNET_HOP, hop_in,
            (size_t)ULCNET_HOP * sizeof(float));
+}
+
+int ulcnet_analysis_push(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
+                         float out_re[2][ULCNET_BINS],
+                         float out_im[2][ULCNET_BINS]) {
+    history_append(st, hop_in);
     /* Saturate at 3, guarded BEFORE the increment: every consumer only
      * distinguishes 1 / 2 / >= 3 (and flush: < 2 vs >= 2), so the clamp is
      * semantics-preserving while preventing signed overflow (UB) on
@@ -95,6 +102,17 @@ int ulcnet_analysis_push(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
     /* Steady state: frame k = window over the last N_FFT raw samples,
      * centred on hop grid point k*HOP. */
     ulcnet_rfft(st, st->history, out_re[0], out_im[0]);
+    return 1;
+}
+
+int ulcnet_analysis_push_frame(UlcnetAnalysis *st,
+                               const float hop_in[ULCNET_HOP],
+                               float out_re[ULCNET_BINS],
+                               float out_im[ULCNET_BINS]) {
+    history_append(st, hop_in);
+    /* The same windowed transform of the same history the centered push
+     * ends every hop with -- hence bit-identical to its last frame. */
+    ulcnet_rfft(st, st->history, out_re, out_im);
     return 1;
 }
 

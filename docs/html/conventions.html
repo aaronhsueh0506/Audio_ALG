@@ -175,6 +175,25 @@ push#1→2 幀（frame0 含 reflect 前綴 + frame1）、之後每 push 1 幀；
 frame#0→0 樣本（半窗 trim）、之後每幀 256 樣本——與 dfn2 的 center=False
 串流輸出排程逐 hop 相同。</li>
 </ul>
+<p><b>ULCNet 現在兩種 push 並存，出貨路徑分兩派。</b>
+<code>ulcnet_analysis_push_frame()</code>（<code>ulcnet_process.h:168</code>、
+<code>ulcnet_process.c:101</code>）是 center=False 的 rolling 分析：
+<b>從第一次 push 起每次恰好一幀</b>（第一幀的前半段是被歸零的 history），
+且與 <code>ulcnet_analysis_push()</code> 對同一個 pushed hop 所發的
+<b>最後一幀逐 bit 相同</b>——centered 排程只是多了開頭那個 reflect 前綴幀。
+上面的穩態等價性因此原封不動地成立，換掉的只是幀編號與串流開頭。
+<b>同一個 state 不可混用兩個 push 函式</b>（它們共用 history，不共用排程）。</p>
+<ul>
+<li>用 <code>_push_frame()</code>：三支前後處理 class
+（<code>ulcnet_prepost</code>／<code>deepvqe_prepost</code> 的
+<code>aiaec_analysis_push_frame()</code>／<code>dfn2_prepost</code> 本來就是
+center=False）與 <b>4ch ULCNet pipeline 的 far 分支</b>——因為它們要和
+AEC/GSC seam 自己的頻譜（一 hop 一幀、從 hop 0 起）配對，一手已經是那種幀時，
+另一手就得用同一個排程才對得上 hop。</li>
+<li>用 centered <code>_push()</code>：mono ULCNet pipeline
+（<code>audio_pipeline_ulcnet.c:506-507</code>，兩路皆是），維持既有 checkpoint 的
+feature-time contract。</li>
+</ul>
 
 <h2>延遲預算表（演算法延遲，不含排程/緩衝）</h2>
 
@@ -194,23 +213,28 @@ exactly ONE hop」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 </table>
 </div>
 
-<h3>4ch ULCNet pipeline（16 k / 512 / 256）</h3>
+<h3>4ch ULCNet pipeline（16 k / 512 / 256；48 k 為 1024 / 512）</h3>
 <div class="tbl">
 <table>
 <tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
 <tr><td>4×AEC lanes + 共享 delay matcher + SRP-PHAT DOA + GSC 權重
 （<code>four_aec_nr_res process_pre</code> → <code>gsc_process_with_weights</code>）</td>
 <td>+0 hop</td><td>同 hop 產生 beamformed 線性誤差<b>頻譜</b></td></tr>
-<tr><td>GSC 頻譜 WOLA 重建成時域 hop</td><td>+1 hop = 16 ms</td>
-<td>hop p 的 beam 頻譜要到 hop p+1 才重建完整（sqrt-Hann 分析在 AEC 內 +
-sqrt-Hann 合成 + 50% OLA）</td></tr>
-<tr><td>far 分支 1-hop 補償 buffer</td><td>+0（平行）</td>
-<td>讓 model 看到的 error/far 幀對永遠來自同一個輸入 hop</td></tr>
-<tr><td>Align-ULCNet 鏈</td><td>+1 hop = 16 ms</td><td>同 mono 變體</td></tr>
-<tr><td><b>合計（新增）</b></td><td><b>2 hops = 512 samples = 32 ms</b></td>
-<td><code>audio_pipeline_4ch_ulcnet.h</code> TIMING CONTRACT：hop#0、#1 輸出零；
-輸出 hop p（p≥2）≙ 輸入 hop p−2 的 beamformed 線性誤差
-（<code>audio_pipeline_4ch_ulcnet_last_beamformed_error()</code> 可驗證）</td></tr>
+<tr><td>GSC 頻譜<b>直送</b>模型（不重建、不再分析）</td><td>+0 hop</td>
+<td><code>gsc_spectrum</code> 已是當前 hop 的 sqrt-Hann、50% overlap、一 hop 一幀
+分析幀（各 lane 在 AEC 內分析，beamformer 只逐 bin 加權），拆成
+<code>err_re/err_im</code> 直接餵 model</td></tr>
+<tr><td>far 分支 <code>ulcnet_analysis_push_frame()</code></td><td>+0（平行）</td>
+<td>同一 hop 的 far 走同樣的一 hop 一幀 framing（center=False），
+兩路幀對恆屬同一輸入 hop；<b>沒有補償 buffer</b></td></tr>
+<tr><td>Align-ULCNet synthesis（centered WOLA 半窗 trim）</td><td>+1 hop
+（16 k: 256 smp = 16 ms；48 k: 512 smp = 10.67 ms）</td><td>同 mono 變體</td></tr>
+<tr><td><b>合計（新增）</b></td><td><b>1 hop（16 k: 256 samples = 16 ms；
+48 k: 512 samples = 10.67 ms）</b></td>
+<td><code>audio_pipeline_4ch_ulcnet.h</code> TIMING CONTRACT：<b>僅 hop#0</b> 輸出零；
+輸出 hop p（p≥1）≙ 輸入 hop p−1 的 beamformed 線性誤差。
+測試以 far 單位脈衝釘住：16 k far[2085]→out[2341]、
+48 k far[4133]→out[4645]（皆 offset +0）</td></tr>
 </table>
 </div>
 <p class="note">NN 模型本身：Align-ULCNet 演算法 lookahead = 0

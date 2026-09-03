@@ -23,7 +23,8 @@ far. The model state is reset at that boundary, including FIXED mode's first
 usable ring output. The C-side STFT keeps running across it, so the frames
 still straddling the switch emit the identity WITHOUT stepping the model:
 `AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES` = 1 frame here (both branches are
-pushed from the current hop), versus 2 in the 4ch wrapper. The constant is
+pushed from the current hop), the same as the 4ch wrapper, which since
+2026-09-03 also frames both branches from the current hop. The constant is
 derived and asserted by the straddle-derivation test, not estimated; option B
 (keep stepping through those frames) is deferred pending an audio A/B.
 
