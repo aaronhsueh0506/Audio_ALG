@@ -14,6 +14,7 @@ stem channel order, which are equally silent when they drift.
 """
 
 from .aec_dataset import (
+    ACOUSTIC_TAILS,
     ECHO_MODES,
     IMPAIRMENTS,
     NONLINEAR_MODELS,
@@ -24,6 +25,7 @@ from .aec_dataset import (
     RenderedSequence,
     SequencePlan,
     plan_sequences,
+    resolve_acoustic_tails,
     resolve_sequence_plan,
 )
 from .aec_features import (
@@ -72,6 +74,7 @@ from .model_views import (
 )
 
 __all__ = [
+    'ACOUSTIC_TAILS',
     'ACCEPTED_BEHAVIOR_HASH_MIGRATIONS',
     'ALL_SPLIT_NAMES',
     'BASE_STEM_ORDER',
@@ -114,6 +117,7 @@ __all__ = [
     'make_linear_aec_contract',
     'materialize_linear_error',
     'plan_sequences',
+    'resolve_acoustic_tails',
     'resolve_sequence_plan',
     'pools_for_split',
     'save_manifest',

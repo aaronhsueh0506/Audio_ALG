@@ -47,18 +47,17 @@ def _gate(root):
         seqs, P._collect(seqs), shipped_contract())
 
 
-# The identity of the builds the 200-hour corpus could have been materialized
-# under, and which ACCEPTED_BEHAVIOR_HASH_MIGRATIONS carries forward. Spelled
-# out here rather than read from MIGRATED_SOURCE_PROVENANCE on purpose: the
-# guard reconstructs the source fingerprint from that table, so a test that fed
-# it the same table's output would be checking the reconstruction against
-# itself. These values reproduce it independently, from the contract dataclass.
+# The identity of the builds the 200-hour corpus was materialized under.
+# ACCEPTED_BEHAVIOR_HASH_MIGRATIONS carried it forward until 2026-09-04; it is
+# now RETIRED, so a ledger from any of these revisions must be refused whether
+# it is legacy-shaped or records its contract. Spelled out rather than read
+# from the tables on purpose: a test fed its inputs from the table it checks
+# would still pass if the table were emptied.
 #
 # A behaviour hash is insensitive to comments and formatting, so it survives
 # every docs-only lib/aec commit while `aec_commit` moves under it -- four
 # revisions carried this one, measured, and each wrote a DIFFERENT ledger
-# fingerprint because `fingerprint()` folds in the commit. A corpus
-# materialized under any of them has to be recognised.
+# fingerprint because `fingerprint()` folds in the commit.
 MIGRATED_FROM_HASH = (
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061")
 _SOURCE_HASH_EARLY = (
@@ -136,52 +135,26 @@ def test_a_ledger_claiming_absent_sequences_is_refused(tmp_path):
 
 
 @pytest.mark.parametrize("commit,source_hash", MIGRATED_FROM_REVISIONS)
-def test_a_ledger_from_a_migrated_frontend_is_accepted_with_a_warning(
+def test_a_legacy_ledger_from_the_retired_corpus_frontend_is_refused(
         tmp_path, commit, source_hash):
-    """The remote flow: the corpus is rematerialized, lib/aec is then pulled to
-    a revision the migration table admits, and the operator packs. The ledger
-    still names the OLD build -- it keys on fingerprint(), which moves on any
-    lib/aec edit -- so without the bridge a COMPLETED 200-hour corpus is
-    refused with advice that cannot be followed. Accepting silently would be
-    just as wrong; the operator has to see WHICH build was let through, which
-    is why the commit is asserted and not only the behaviour hash.
-
-    Run for every revision that carried the migrated-from behaviour, because
-    each of them wrote a different fingerprint and the operator's corpus was
-    materialized under exactly one of them.
+    """The remote flow after the frontend moved: the corpus's ledger still
+    names a build whose `linear_error` this build does not reproduce. There
+    is no bridge for a retired identity -- a legacy ledger records only a
+    fingerprint, so the refusal is the generic contract mismatch, and it must
+    not carry the frontend-equivalent warning. Run for every revision that
+    carried the retired behaviour, because each wrote a different fingerprint.
     """
     root = _corpus(str(tmp_path / "c"))
     seqs = os.path.join(root, "seqs")
     save_ledger(seqs, _migrated_source_fingerprint(commit, source_hash),
                 set(range(N_SEQ)))
-    with pytest.warns(RuntimeWarning, match="frontend-equivalent migration") as caught:
-        _gate(root)
-    message = "\n".join(str(w.message) for w in caught)
-    assert commit[:12] in message, "the warning must name the build it matched"
-    assert MIGRATED_FROM_HASH[:12] in message
-
-
-@pytest.mark.parametrize("commit,source_hash", MIGRATED_FROM_REVISIONS)
-def test_a_migrated_ledger_still_has_to_be_complete(
-        tmp_path, commit, source_hash):
-    """The bridge answers WHICH contract wrote the corpus, not WHETHER it
-    finished. A half-rebuilt corpus stays refused however its ledger is
-    keyed -- that is the failure this whole file exists for."""
-    root = _corpus(str(tmp_path / "c"))
-    seqs = os.path.join(root, "seqs")
-    save_ledger(seqs, _migrated_source_fingerprint(commit, source_hash), {0})
-    with pytest.raises(ValueError, match="absent from"):
+    with pytest.raises(ValueError, match="linear-AEC contract|frontend identity"):
         _gate(root)
 
 
 def test_a_ledger_from_an_uncovered_revision_is_refused(tmp_path):
-    """The bridge stays EXACT while it widens.
-
-    This ledger carries the migrated-from behaviour hash AND a source hash the
-    table records -- everything except a commit any covered revision has. The
-    reconstruction folds `aec_commit` in, so it must not match. Drop the commit
-    from the reconstruction and this is the case that goes green.
-    """
+    """A legacy ledger from a revision no table records is refused on the
+    generic contract mismatch."""
     root = _corpus(str(tmp_path / "c"))
     seqs = os.path.join(root, "seqs")
     save_ledger(seqs,
@@ -277,14 +250,19 @@ def test_an_identity_ledger_from_a_comment_only_rebuild_is_accepted(tmp_path):
     assert UNCOVERED_COMMIT[:12] in "\n".join(str(w.message) for w in caught)
 
 
-def test_an_identity_ledger_from_the_migrated_frontend_is_accepted(tmp_path):
-    """Bridged on the behaviour hash the ledger states, not on a reconstructed
-    fingerprint -- so a revision nobody recorded is still recognised."""
+def test_an_identity_ledger_from_the_retired_corpus_frontend_is_refused(tmp_path):
+    """The identity route sees the behaviour hash the ledger states, so the
+    corpus frontend is refused by name with the rematerialize instruction --
+    not accepted through a bridge that no longer exists."""
     root = _corpus(str(tmp_path / "c"))
     _identity_ledger(root, _source_contract(UNCOVERED_COMMIT, "c" * 64),
                      set(range(N_SEQ)))
-    with pytest.warns(RuntimeWarning, match="frontend-equivalent migration"):
+    with pytest.raises(ValueError) as caught:
         _gate(root)
+    message = str(caught.value)
+    assert MIGRATED_FROM_HASH[:12] in message
+    assert "different linear_error" in message
+    assert "without --resume" in message
 
 
 def test_an_identity_ledger_from_an_unrelated_frontend_is_refused(tmp_path):
@@ -317,7 +295,7 @@ def test_an_identity_ledger_from_a_retired_frontend_is_refused(tmp_path):
     message = str(caught.value)
     # Wording only the retired branch produces, so this cannot pass on the
     # generic "different contract" refusal.
-    assert "MOVES linear_error" in message
+    assert "different linear_error" in message
     assert "without --resume" in message
 
 
@@ -415,20 +393,16 @@ def test_rematerialize_then_pack_produces_loadable_shards(tmp_path):
     assert seen == N_SEQ * N_CHUNK, f"packed {seen} clips, corpus has {N_SEQ * N_CHUNK}"
 
 
-def test_a_migrated_corpus_packs_into_shards_this_build_can_train_on(tmp_path):
-    """The remote flow end to end, not just its first gate.
+def test_a_corpus_from_the_retired_frontend_does_not_pack(tmp_path):
+    """The remote flow end to end after the frontend moved.
 
-    A corpus is rematerialized, lib/aec moves to a revision the migration
-    table admits (simulated by re-keying the ledger to the migrated-from
-    build, which is exactly what that machine's ledger holds), and the
-    operator packs and loads. Every gate between the WAVs and the training
-    loader has to agree: the shards get THIS build's contract -- correct,
-    because the migration's evidence is that both builds render the same
-    waveform -- and PackedAecDataset, which compares shard against shard and
-    never against the running build, accepts them.
+    A corpus is rematerialized, lib/aec then moves to a revision that renders
+    a different `linear_error` (simulated by re-keying the ledger to the
+    retired corpus build, which is exactly what that machine's ledger holds),
+    and the operator packs. The first gate has to refuse: shards stamped with
+    THIS build's contract over that audio would train a checkpoint on a stem
+    this build does not produce.
     """
-    from AIAEC.dataset_gen.packed_aec_dataset import PackedAecDataset
-
     root = _corpus(str(tmp_path / "c"))
     seqs = os.path.join(root, "seqs")
     shards = str(tmp_path / "shards")
@@ -436,14 +410,8 @@ def test_a_migrated_corpus_packs_into_shards_this_build_can_train_on(tmp_path):
         input=root, config=CONFIG, resume=False, wav_encoding="auto", jobs=1))
     save_ledger(seqs, _migrated_source_fingerprint(), set(range(N_SEQ)))
 
-    with pytest.warns(RuntimeWarning, match="frontend-equivalent migration"):
+    with pytest.raises(ValueError, match="linear-AEC contract|frontend identity"):
         P.pack(argparse.Namespace(
             input=root, config=CONFIG, output=shards,
             shard_clips=512, overwrite=False, dtype="float32"))
-
-    dataset = PackedAecDataset(shards, expected_sr=shipped_contract().sample_rate)
-    assert len(dataset) == N_SEQ * N_CHUNK
-    assert (dataset.linear_aec_contract_hash
-            == shipped_contract().fingerprint())
-    assert (dataset.linear_aec_contract.aec_behavior_hash
-            == shipped_contract().aec_behavior_hash)
+    assert not os.path.exists(shards) or not os.listdir(shards)

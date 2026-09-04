@@ -1,15 +1,14 @@
-"""Exactly one, rate-scoped migration connects recorded data to this frontend.
+"""No migration connects recorded data to this frontend.
 
-`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` holds the composed fresh-instance-reset and
-48-kHz FilterAnalyzer-correction pair, and nothing else. It is admitted only at
-16 kHz: measured formed-output bytes are identical there, while the live
-detector window intentionally changes at 48 kHz.
+`ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` is empty: the shadow-copy baseline retime
+and the C restart evidence clearing (2026-09-04) move `linear_error`, so the
+pair that carried the 200-hour corpus forward (37ed5ad9 -> 19dd4f90) was
+retired with the identities before it.
 
-What must NOT happen is the pre-dominant-peak entries coming back. The
-dominant-matched-filter-peak change MOVES `linear_error`, so their byte-identity
-evidence describes no frontend after it; retargeting one at a live build would
-declare an old waveform compatible with a build that does not produce it. They
-stay in `RETIRED_BEHAVIOR_HASHES` and are refused with an instruction to
+What must NOT happen is a retired entry coming back. Byte-identity evidence
+describes no frontend after a change that moves the stem; retargeting one at
+a live build would declare an old waveform compatible with a build that does
+not produce it. Retired identities are refused with an instruction to
 rematerialize rather than with a bare hash mismatch.
 
 Run:
@@ -41,13 +40,15 @@ DEPLOYED_OLD_HASH = (
 EARLIER_MIGRATED_HASH = (
     "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe")
 
-# The one identity that IS carried forward: the frontend the 200-hour corpus
-# was materialized under, before aec_reset() was made to return a fresh
-# instance. Spelled out for the same reason as the two above -- reading it
-# back out of ACCEPTED_BEHAVIOR_HASH_MIGRATIONS would make every assertion
-# below satisfied by whatever the table happens to contain.
-MIGRATED_FROM_HASH = (
+# The pair retired most recently: the frontend the 200-hour corpus was
+# materialized under and the identity it had been carried forward to. Spelled
+# out for the same reason as the two above.
+CORPUS_HASH = (
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061")
+LAST_MIGRATED_TO_HASH = (
+    "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45")
+REFUSED_HASHES = (DEPLOYED_OLD_HASH, EARLIER_MIGRATED_HASH, CORPUS_HASH,
+                  LAST_MIGRATED_TO_HASH)
 
 
 def _contract_recorded_as(hash_value):
@@ -58,13 +59,12 @@ def _contract_recorded_as(hash_value):
 def test_the_frontend_identity_actually_changed():
     """The premise. If the hash still matched the old one, every refusal below
     would be vacuous."""
-    assert aec_python_behavior_hash() != DEPLOYED_OLD_HASH
+    assert aec_python_behavior_hash() not in REFUSED_HASHES
 
 
-def test_the_migration_table_holds_exactly_the_one_admitted_pair():
-    assert ACCEPTED_BEHAVIOR_HASH_MIGRATIONS == {
-        MIGRATED_FROM_HASH: aec_python_behavior_hash()
-    }, "every pair in this table needs its own admission evidence"
+def test_the_migration_table_is_empty():
+    assert ACCEPTED_BEHAVIOR_HASH_MIGRATIONS == {}, (
+        "every pair in this table needs its own admission evidence")
 
 
 def test_no_retired_identity_migrates_to_anything():
@@ -79,39 +79,6 @@ def test_no_retired_identity_migrates_to_anything():
     assert aec_python_behavior_hash() not in RETIRED_BEHAVIOR_HASHES
 
 
-def test_the_admitted_pair_is_accepted_with_a_warning():
-    """The remote flow: a corpus materialized under the recorded identity,
-    packed and validated by a build that computes the new one. Accepting
-    SILENTLY would be as wrong as refusing -- the operator has to see which
-    frontend identity was let through."""
-    current = make_linear_aec_contract(16000, preset="balanced").as_dict()
-    with pytest.warns(RuntimeWarning, match="frontend-equivalent migration"):
-        # (actual=this build, expected=the contract the data recorded)
-        require_linear_aec_contract(
-            current, _contract_recorded_as(MIGRATED_FROM_HASH),
-            context="fixture")
-
-
-def test_the_admitted_hash_pair_is_refused_at_48khz():
-    """Hash equality evidence at 16 kHz must not pardon old 48-kHz data."""
-    current = make_linear_aec_contract(
-        48000, preset="balanced", frame_size=1024).as_dict()
-    recorded = dict(current, aec_behavior_hash=MIGRATED_FROM_HASH)
-    with pytest.raises(ValueError, match="aec_behavior_hash"):
-        require_linear_aec_contract(current, recorded, context="fixture")
-
-
-def test_the_admitted_pair_is_refused_in_reverse():
-    """One direction by construction. Data recorded under the NEW identity run
-    against the OLD build is a genuine downgrade, and the table is not
-    consulted backwards."""
-    recorded_new = _contract_recorded_as(aec_python_behavior_hash())
-    running_old = _contract_recorded_as(MIGRATED_FROM_HASH)
-    with pytest.raises(ValueError, match="contract mismatch"):
-        require_linear_aec_contract(running_old, recorded_new,
-                                    context="fixture")
-
-
 def test_an_unlisted_identity_is_still_refused():
     """The table is an explicit, per-pair exemption, not a general amnesty."""
     with pytest.raises(ValueError):
@@ -120,7 +87,7 @@ def test_an_unlisted_identity_is_still_refused():
             _contract_recorded_as("f" * 64), context="fixture")
 
 
-@pytest.mark.parametrize("recorded", (DEPLOYED_OLD_HASH, EARLIER_MIGRATED_HASH))
+@pytest.mark.parametrize("recorded", REFUSED_HASHES)
 def test_an_old_frontend_identity_is_refused_with_what_to_do(recorded):
     """Fails CLOSED, and says rematerialize -- not a bare hash mismatch."""
     current = make_linear_aec_contract(16000, preset="balanced").as_dict()
@@ -135,7 +102,7 @@ def test_an_old_frontend_identity_is_refused_with_what_to_do(recorded):
     assert "retrain" in message
 
 
-@pytest.mark.parametrize("recorded", (DEPLOYED_OLD_HASH, EARLIER_MIGRATED_HASH))
+@pytest.mark.parametrize("recorded", REFUSED_HASHES)
 def test_an_old_identity_never_warns_that_it_is_equivalent(recorded, recwarn):
     """The failure mode this forbids: passing with a 'frontend-equivalent,
     no rematerialization required' warning, which is what the table used to

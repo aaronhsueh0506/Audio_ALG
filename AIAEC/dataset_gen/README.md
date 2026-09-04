@@ -105,7 +105,8 @@ exactly).
 description — `speaker_id`, `far_speaker_id`, `noise_id`, `rir_id`, `room_id`,
 `device_id`, `ser_db`, `snr_db`, `erl_db`, `bulk_delay_samples`,
 `delay_jitter`, `sro_ppm`, `nonlinear`, `clipped`, `agc`, `talk_mode`,
-`echo_mode`, `impairments`, `scenario`, `sequence_scenario`, `sequence_seed`,
+`echo_mode`, `impairments`, `acoustic_tails`, `scenario`,
+`sequence_scenario`, `sequence_seed`,
 `split` — but it is now visible only
 in-process, on the `RenderedSequence` a worker hands back
 (`tests/test_aec_dataset.py` reads it there). None of it reaches disk, so:
@@ -139,7 +140,7 @@ pass a threshold filter.
 
 ### Layered scenes
 
-New corpora no longer choose one mutually-exclusive scenario. They draw three
+New corpora no longer choose one mutually-exclusive scenario. They draw four
 orthogonal layers:
 
 - `[talk_modes]`: `far_only`, `near_only`, `double_talk`, or
@@ -149,6 +150,10 @@ orthogonal layers:
 - `[impairments]`: independent path/capture events such as
   `echo_path_change`, `nonlinear_spk`, `clipping_agc`, `delay_jitter`, `sro`
   and `codec_mismatch`.
+- `[acoustic_tails]`: independent low-probability operating points for
+  120--300 ms bulk delay, −40 to −30 dBFS quiet references (with the ERL draw
+  capped so the echo stays above the noise floor), and −10 to 0 dB
+  strong-echo ERL. Ordinary sequences retain the original ranges.
 
 This separation is intentional. In the former categorical planner a sequence
 could be `double_talk` **or** `echo_path_change` **or** nonlinear/clipped, so
@@ -156,8 +161,14 @@ the difficult intersection never existed. `[complex_cases]
 p_dt_stress_combo` now guarantees a small measurable tail containing DT +
 path movement + nonlinear loudspeaker + clipping/AGC. Within that tail,
 `[activity] dt_force_edge_overlap` pins DT to the leading edge of the first far
-burst and trailing edge of the last, covering both a cold PBFDKF/model state
-and a mature state late in the sequence without making ordinary DT scripted.
+burst and trailing edge of the last, covering both a cold PBFDKF state and a
+mature PBFDKF state late in the parent sequence without making ordinary DT
+scripted. It does **not** create a 20--30 s carried neural state: current
+trainers reset GRU state for each shuffled 10-second chunk.
+`p_dt_acoustic_combo` independently guarantees a smaller DT tail containing
+long delay + quiet far + strong echo. The three acoustic tails are also drawn
+independently, so the corpus still contains short-delay strong-echo and
+long-delay ordinary-level examples rather than learning one artificial bundle.
 `far_active_no_echo` is a hard negative: its far scheduler covers the complete
 parent sequence — as back-to-back utterances, each drawing its own file, since
 one whole-sequence run would be zero-padded to length and go silent after the
@@ -168,7 +179,8 @@ into the already-covered silent-reference case and keep the label anyway.
 `scenario` remains a compatibility, **per-chunk** summary and cannot describe
 all simultaneous conditions. A `ref_dropout` parent is mostly *not* in
 dropout, and a path-changing parent has exactly one transition chunk. New
-diagnostics must use `talk_mode`, `echo_mode` and `impairments` in-process (or
+diagnostics must use `talk_mode`, `echo_mode`, `impairments` and
+`acoustic_tails` in-process (or
 measure the persisted separated stems). `sequence_scenario` remains only a
 legacy summary.
 
@@ -226,11 +238,12 @@ not used by any trainer.
 
 Changing only `linear_error` cannot create the newly composed acoustic scenes:
 the four source stems already encode talk activity, path movement,
-nonlinearity and capture clipping. Generate a new WAV corpus in a new output
-directory, pack it, and train a new checkpoint. Do **not** use `--resume` into
-an old corpus: WAV filenames carry no config fingerprint, so shape-compatible
-old chunks would be accepted even though they were rendered by the categorical
-planner.
+nonlinearity, capture clipping, bulk delay, far level and ERL. In particular,
+`rematerialize_linear_aec.py` cannot add the `[acoustic_tails]` mixture. Generate
+a new WAV corpus in a new output directory, pack it, and train a new checkpoint.
+Do **not** use `--resume` into an old corpus: WAV filenames carry no config
+fingerprint, so shape-compatible old chunks would be accepted even though they
+were rendered by the previous planner.
 
 ## Files
 
@@ -506,25 +519,23 @@ channel with the command below, which avoids repeating acoustic mixing:
 
 #### The one exception: verified frontend-equivalent migrations
 
-> **⚠ The table holds exactly one pair.** `aec_reset()` was made to return a
-> fresh instance (it had been carrying a converged filter's AEC3 startup gates,
-> its Kalman `H_error` and the near-end recency pair across the call), and the
-> same revision removed the dead far-end power EMA from the Python filter. Both
-> edits are under the signal scope, so the hash moved — but materialization
-> builds one engine per parent sequence and never calls `reset()`, and nothing
-> read the removed fields, so `linear_error` is byte-identical across the pair.
-> A corpus already on disk travels forward; nothing needs rematerializing.
+> **⚠ The table is empty (2026-09-04).** The pair that carried the 200-hour
+> corpus forward (the fresh-instance `aec_reset()` composed with the 48-kHz
+> FilterAnalyzer correction, 16 kHz only) was retired when lib/aec retimed
+> the shadow-copy error-baseline retention per grid (0.995 → 0.992 on this
+> corpus's 512/256 grid) and made the C hard restart clear coarse/leakage
+> evidence: both **move `linear_error`**, so no byte-identity evidence can
+> describe a frontend after them. Every identity a corpus on disk may carry
+> is now in `RETIRED_BEHAVIOR_HASHES` and is refused with an instruction to
+> rematerialize (`rematerialize_linear_aec.py`, WITHOUT `--resume`, then
+> repack, then retrain), not with a bare hash mismatch. A corpus that also
+> needs the `[acoustic_tails]` mixture must be generated afresh instead —
+> see "Migrating an existing corpus" above.
 >
-> The identities that predate the dominant-matched-filter-peak change are a
-> different matter and are **retired, not retargeted**: that change **moves
-> `linear_error`**, so their byte-identity evidence describes no frontend after
-> it, and pointing one at a live hash would declare an old waveform compatible
-> with a build that does not produce it. They are listed in
-> `RETIRED_BEHAVIOR_HASHES` and refused with an instruction to rematerialize
-> (`rematerialize_linear_aec.py`, WITHOUT `--resume`, then repack, then
-> retrain), not with a bare hash mismatch.
-> `behavior_hash_schema` stays `canon-ast-1`: these are behaviour changes, not
-> canonicalizer changes. Pinned by
+> Retired identities are **never retargeted**: pointing one at a live hash
+> would declare an old waveform compatible with a build that does not produce
+> it. `behavior_hash_schema` stays `canon-ast-1`: these are behaviour changes,
+> not canonicalizer changes. Pinned by
 > `tests/test_linear_aec_behavior_migration.py`.
 
 `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` in `linear_aec.py` is an explicit table of
@@ -553,7 +564,8 @@ before and after over a scene that actually reaches the changed code, and show
 the bytes are identical — plus a control proving the same harness *can* fail
 (render with the new mechanism enabled and confirm the bytes move). The
 byte-equality of a dead harness is worth nothing. The rationale and the numbers
-for each shipped entry live in the comment on the entry itself.
+for each admitted entry live in the comment on the entry itself; the evidence
+for retired entries stays in the history of the revision that admitted them.
 
 The one shipped entry covers the frontend the 200-hour corpus was materialized
 under. Its evidence is three complete 30 s sequences whose echo path changes

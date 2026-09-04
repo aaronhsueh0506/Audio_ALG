@@ -22,6 +22,8 @@ import pytest
 import torch
 import torchaudio
 
+from AINR.dataset_gen.dataset import active_rms
+
 from AIAEC.dataset_gen import (
     BASE_STEM_ORDER,
     PACKED_STEM_ORDER,
@@ -40,6 +42,7 @@ from AIAEC.dataset_gen import (
     stft,
 )
 from AIAEC.dataset_gen.aec_dataset import (
+    ACOUSTIC_TAILS,
     ACTIVITY_LABEL_DBFS,
     AecSequenceRenderer,
     SequencePlan,
@@ -49,6 +52,7 @@ from AIAEC.dataset_gen.aec_dataset import (
     check_rate_dependent_values,
     chunk_samples_from_config,
     plan_sequences,
+    resolve_acoustic_tails,
     resolve_sequence_plan,
     resample_by_ratio,
     stable_seed,
@@ -869,6 +873,11 @@ def test_layered_plan_rejects_invalid_probabilities(corpus):
         plan_sequences(cfg, 0.001, SEED, 'train')
 
     cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('acoustic_tails', 'p_long_delay', '-0.01')
+    with pytest.raises(ValueError, match=r'p_long_delay must be in \[0, 1\]'):
+        plan_sequences(cfg, 0.001, SEED, 'train')
+
+    cfg = copy.deepcopy(corpus['cfg'])
     for name in ('far_only', 'near_only', 'double_talk', 'duplex_random'):
         cfg.set('talk_modes', f'p_{name}', '0')
     with pytest.raises(ValueError, match='every weight is zero'):
@@ -913,6 +922,35 @@ def test_layered_plan_composes_dt_path_nonlinearity_and_capture(corpus):
         assert meta['nonlinear'] != 'linear'
 
 
+def test_layered_plan_composes_dt_acoustic_tails(corpus):
+    """The difficult DT operating points must exist in one real render."""
+    cfg = copy.deepcopy(corpus['cfg'])
+    for name in ('far_only', 'near_only', 'duplex_random'):
+        cfg.set('talk_modes', f'p_{name}', '0')
+    cfg.set('talk_modes', 'p_double_talk', '1')
+    cfg.set('echo_modes', 'p_ref_dropout', '0')
+    cfg.set('echo_modes', 'p_far_active_no_echo', '0')
+    for name in ACOUSTIC_TAILS:
+        cfg.set('acoustic_tails', f'p_{name}', '0')
+    cfg.set('complex_cases', 'p_dt_acoustic_combo', '1')
+
+    plan = plan_sequences(cfg, 0.001, SEED, 'train')[0]
+    assert set(resolve_acoustic_tails(plan)) == set(ACOUSTIC_TAILS)
+
+    rendered = AecSequenceRenderer(
+        cfg, pools_for_split(corpus['manifest'], 'train'),
+        corpus_seed=SEED).render(plan)
+    view = AecStems(rendered.stems)
+    meta = rendered.chunk_meta[0]
+    assert set(meta['acoustic_tails']) == set(ACOUSTIC_TAILS)
+    assert int(0.120 * SR) <= meta['bulk_delay_samples'] <= int(0.300 * SR)
+    assert -10.0 <= meta['erl_db'] <= 0.0
+    far_dbfs = 20.0 * math.log10(active_rms(view.far_render, SR))
+    # A common anti-clipping scale may move all stems down together, but never
+    # makes the quiet reference louder than the sampled tail ceiling.
+    assert far_dbfs <= -30.0
+
+
 def test_no_echo_plan_strips_echo_path_impairments_but_keeps_capture(corpus):
     """A no-echo sequence cannot claim an RIR/SRO/nonlinearity event."""
     cfg = copy.deepcopy(corpus['cfg'])
@@ -931,6 +969,7 @@ def test_no_echo_plan_strips_echo_path_impairments_but_keeps_capture(corpus):
     assert talk_mode == 'double_talk'
     assert echo_mode == 'far_active_no_echo'
     assert impairments == ('clipping_agc',)
+    assert resolve_acoustic_tails(plan) == ()
 
     rendered = AecSequenceRenderer(
         cfg, pools_for_split(corpus['manifest'], 'train'),
@@ -944,6 +983,21 @@ def test_no_echo_plan_strips_echo_path_impairments_but_keeps_capture(corpus):
         assert float(view.far_render[window].abs().max()) > 0.0
         assert meta['echo_mode'] == 'far_active_no_echo'
         assert meta['scenario'] == 'far_active_no_echo'
+
+
+@pytest.mark.parametrize(
+    ('talk_mode', 'echo_mode'),
+    [('near_only', 'normal'), ('double_talk', 'far_active_no_echo')],
+)
+def test_acoustic_tails_reject_a_plan_without_a_real_echo_path(
+        talk_mode, echo_mode):
+    plan = SequencePlan(
+        sequence_id=0, n_chunks=1, scenario=talk_mode, seed=7,
+        talk_mode=talk_mode, echo_mode=echo_mode,
+        acoustic_tails=('quiet_far',),
+    )
+    with pytest.raises(ValueError, match='require a real far/echo path'):
+        resolve_acoustic_tails(plan)
 
 
 def test_no_echo_far_reference_never_runs_out_on_a_long_sequence(corpus):
@@ -997,7 +1051,7 @@ def test_layered_plan_requires_every_layer_section_and_option(corpus):
     absent option, so a layered config without [impairments] would render a
     full, plausible, impairment-free corpus and say nothing about it.
     """
-    for section in ('talk_modes', 'echo_modes', 'impairments',
+    for section in ('talk_modes', 'echo_modes', 'impairments', 'acoustic_tails',
                     'complex_cases'):
         cfg = copy.deepcopy(corpus['cfg'])
         cfg.remove_section(section)
@@ -1013,7 +1067,13 @@ def test_layered_plan_requires_every_layer_section_and_option(corpus):
                              ('echo_path_change', 'nonlinear_spk',
                               'clipping_agc', 'delay_jitter', 'sro',
                               'codec_mismatch')),
-        'complex_cases': ('p_dt_stress_combo',),
+        'acoustic_tails': (
+            'p_long_delay', 'long_delay_ms_min', 'long_delay_ms_max',
+            'p_quiet_far', 'quiet_far_dbfs_min', 'quiet_far_dbfs_max',
+            'p_strong_echo', 'strong_echo_erl_db_min',
+            'strong_echo_erl_db_max', 'quiet_far_erl_db_max',
+        ),
+        'complex_cases': ('p_dt_stress_combo', 'p_dt_acoustic_combo'),
     }
     for section, options in required.items():
         for option in options:
@@ -1062,6 +1122,68 @@ def test_impairments_are_drawn_independently_of_one_another(corpus):
             for plan in plan_sequences(cfg, 0.5, SEED, 'train')}
     assert seen == {(), ('sro',), ('nonlinear_spk',),
                     ('nonlinear_spk', 'sro')}, sorted(seen)
+
+
+def test_acoustic_tails_are_drawn_independently(corpus):
+    """Tail mixtures must not collapse into one all-or-nothing profile."""
+    cfg = copy.deepcopy(corpus['cfg'])
+    for name in ('far_only', 'near_only', 'duplex_random'):
+        cfg.set('talk_modes', f'p_{name}', '0')
+    cfg.set('talk_modes', 'p_double_talk', '1')
+    cfg.set('echo_modes', 'p_ref_dropout', '0')
+    cfg.set('echo_modes', 'p_far_active_no_echo', '0')
+    cfg.set('complex_cases', 'p_dt_acoustic_combo', '0')
+    for name in ACOUSTIC_TAILS:
+        cfg.set('acoustic_tails', f'p_{name}', '0.5')
+
+    seen = {resolve_acoustic_tails(plan)
+            for plan in plan_sequences(cfg, 0.5, SEED, 'train')}
+    expected = {
+        tuple(name for bit, name in enumerate(ACOUSTIC_TAILS)
+              if mask & (1 << bit))
+        for mask in range(1 << len(ACOUSTIC_TAILS))
+    }
+    assert seen == expected, sorted(seen)
+
+
+def test_quiet_far_alone_caps_the_erl_draw(corpus):
+    """A quiet reference must not also draw a 30 dB ERL (inaudible echo)."""
+    cfg = copy.deepcopy(corpus['cfg'])
+    for name in ('far_only', 'near_only', 'duplex_random'):
+        cfg.set('talk_modes', f'p_{name}', '0')
+    cfg.set('talk_modes', 'p_double_talk', '1')
+    cfg.set('echo_modes', 'p_ref_dropout', '0')
+    cfg.set('echo_modes', 'p_far_active_no_echo', '0')
+    cfg.set('complex_cases', 'p_dt_acoustic_combo', '0')
+    for name in ACOUSTIC_TAILS:
+        cfg.set('acoustic_tails', f'p_{name}', '1' if name == 'quiet_far' else '0')
+    cfg.set('acoustic_tails', 'quiet_far_erl_db_max', '5')
+    cfg.set('levels', 'erl_db_min', '4')
+
+    plans = plan_sequences(cfg, 0.004, SEED, 'train')
+    assert all(resolve_acoustic_tails(p) == ('quiet_far',) for p in plans)
+    renderer = AecSequenceRenderer(
+        cfg, pools_for_split(corpus['manifest'], 'train'), corpus_seed=SEED)
+    for plan in plans[:3]:
+        meta = renderer.render(plan).chunk_meta[0]
+        assert 4.0 <= meta['erl_db'] <= 5.0, meta['erl_db']
+
+
+@pytest.mark.parametrize(
+    ('key', 'value', 'message'),
+    [
+        ('long_delay_ms_min', '119', 'long_delay_ms_min'),
+        ('long_delay_ms_max', '470', 'worst-case long delay'),
+        ('quiet_far_dbfs_max', '-29', 'quiet_far_dbfs_max'),
+        ('strong_echo_erl_db_max', '1', 'strong_echo_erl_db_max'),
+        ('quiet_far_erl_db_max', '31', 'quiet_far_erl_db_max'),
+    ],
+)
+def test_acoustic_tail_ranges_are_guarded(corpus, key, value, message):
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('acoustic_tails', key, value)
+    with pytest.raises(ValueError, match=message):
+        plan_sequences(cfg, 0.001, SEED, 'train')
 
 
 def test_forced_edge_overlap_survives_the_minimum_window(corpus):
@@ -1607,7 +1729,8 @@ def test_renderer_metadata_covers_the_declared_contract(corpus):
         'sequence_id', 'chunk_index', 'speaker_id', 'noise_id', 'rir_id',
         'ser_db', 'snr_db', 'erl_db', 'bulk_delay_samples', 'delay_jitter',
         'sro_ppm', 'nonlinear', 'clipped', 'scenario', 'talk_mode',
-        'echo_mode', 'impairments', 'echo_path_change', 'codec_mismatch',
+        'echo_mode', 'impairments', 'acoustic_tails', 'echo_path_change',
+        'codec_mismatch',
     }
     checked = 0
     for _plan, rendered in _render_plans(
@@ -1622,6 +1745,7 @@ def test_renderer_metadata_covers_the_declared_contract(corpus):
             assert meta['echo_mode'] in ('normal', 'ref_dropout',
                                          'far_active_no_echo')
             assert isinstance(meta['impairments'], list)
+            assert isinstance(meta['acoustic_tails'], list)
             assert isinstance(meta['sequence_seed'], int)
             assert isinstance(meta['delay_jitter'], bool)
             assert isinstance(meta['clipped'], bool)

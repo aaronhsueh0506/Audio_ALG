@@ -67,6 +67,7 @@ from AINR.dataset_gen.dataset import (
 )
 from .aec_features import BASE_STEM_ORDER, STEM_ORDER, alpha_from_tau
 from .linear_aec import (
+    MATCHED_REACH_MS,
     LinearAecContract,
     linear_aec_contract_from_config,
     materialize_linear_error,
@@ -75,6 +76,8 @@ from .manifest import SourcePools, config_hash
 
 
 __all__ = [
+    'ACOUSTIC_TAILS',
+    'ACOUSTIC_TAIL_RANGE_KEYS',
     'ECHO_MODES',
     'IMPAIRMENTS',
     'NONLINEAR_MODELS',
@@ -89,6 +92,7 @@ __all__ = [
     'chunk_samples_from_config',
     'device_for_id',
     'plan_sequences',
+    'resolve_acoustic_tails',
     'resolve_sequence_plan',
     'resample_by_ratio',
     'simulate_codec',
@@ -113,6 +117,29 @@ IMPAIRMENTS = (
     'sro',
     'codec_mismatch',
 )
+
+# Low-probability operating points that widen a scalar acoustic distribution
+# without moving the ordinary range.  These are deliberately a separate axis
+# from IMPAIRMENTS: a quiet far end and a strong echo are valid physical
+# operating points, not corruptions of the signal.
+ACOUSTIC_TAILS = (
+    'long_delay',
+    'quiet_far',
+    'strong_echo',
+)
+# Config key stem of each tail's range: `<stem>_min` / `<stem>_max` under
+# [acoustic_tails]. The planner's required-option list, the range validator
+# and the renderer's range pick all read this one mapping.
+ACOUSTIC_TAIL_RANGE_KEYS = {
+    'long_delay': 'long_delay_ms',
+    'quiet_far': 'quiet_far_dbfs',
+    'strong_echo': 'strong_echo_erl_db',
+}
+# A quiet reference with an ordinary 0--30 dB ERL puts the echo at the mic
+# down to -70 dBFS, below the local-noise floor: the sequence teaches nothing
+# and its measured per-chunk labels stop describing the audio. quiet_far
+# therefore caps the ERL draw unless strong_echo supplies its own range.
+QUIET_FAR_ERL_CAP_KEY = 'quiet_far_erl_db_max'
 
 # Derived, not restated: the label vocabulary IS the three axes projected onto
 # one string, and spelling it out again is how the two drift apart.  'normal'
@@ -141,6 +168,13 @@ ECHO_PATH_IMPAIRMENTS = frozenset({
 DT_STRESS_IMPAIRMENTS = frozenset({
     'echo_path_change', 'nonlinear_spk', 'clipping_agc',
 })
+
+# The hard acoustic DT intersection.  In addition to independently sampled
+# tails, [complex_cases] can force this set so a finite campaign contains
+# examples at both the cold-start and mature-PBFDKF DT boundaries. Trainers
+# currently reset neural state per chunk, so this does not claim to exercise a
+# 20--30 s continuously carried GRU state.
+DT_ACOUSTIC_TAILS = frozenset(ACOUSTIC_TAILS)
 
 # Scenarios whose defining event occupies the WHOLE sequence.  The others are
 # localised in time and get a per-chunk label instead -- see _chunk_scenario.
@@ -543,6 +577,7 @@ class SequencePlan:
     talk_mode: Optional[str] = None
     echo_mode: str = 'normal'
     impairments: Tuple[str, ...] = ()
+    acoustic_tails: Tuple[str, ...] = ()
 
 
 @dataclasses.dataclass
@@ -575,7 +610,7 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
         )
 
     layer_sections = ('talk_modes', 'echo_modes', 'impairments',
-                      'complex_cases')
+                      'acoustic_tails', 'complex_cases')
     present_layers = tuple(name for name in layer_sections
                            if cfg.has_section(name))
     layered = bool(present_layers)
@@ -588,7 +623,7 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
                   if not cfg.has_section(name)]
         if absent:
             raise ValueError(
-                "a layered config must carry all four planner sections; "
+                "a layered config must carry all five planner sections; "
                 f"found {', '.join('[' + name + ']' for name in present_layers)} "
                 "but not "
                 f"{', '.join('[' + name + ']' for name in absent)}; without "
@@ -597,7 +632,13 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
             'talk_modes': tuple(f'p_{name}' for name in TALK_MODES),
             'echo_modes': ('p_ref_dropout', 'p_far_active_no_echo'),
             'impairments': tuple(f'p_{name}' for name in IMPAIRMENTS),
-            'complex_cases': ('p_dt_stress_combo',),
+            'acoustic_tails': tuple(
+                key for name in ACOUSTIC_TAILS
+                for key in (f'p_{name}',
+                            f'{ACOUSTIC_TAIL_RANGE_KEYS[name]}_min',
+                            f'{ACOUSTIC_TAIL_RANGE_KEYS[name]}_max')
+            ) + (QUIET_FAR_ERL_CAP_KEY,),
+            'complex_cases': ('p_dt_stress_combo', 'p_dt_acoustic_combo'),
         }
         missing_options = [
             f'[{section}] {option}'
@@ -623,8 +664,15 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
             name: _probability(cfg, 'impairments', f'p_{name}')
             for name in IMPAIRMENTS
         }
+        acoustic_tail_p = {
+            name: _probability(cfg, 'acoustic_tails', f'p_{name}')
+            for name in ACOUSTIC_TAILS
+        }
+        _validate_acoustic_tail_ranges(cfg)
         p_dt_stress = _probability(
             cfg, 'complex_cases', 'p_dt_stress_combo')
+        p_dt_acoustic = _probability(
+            cfg, 'complex_cases', 'p_dt_acoustic_combo')
     else:
         # Compatibility for an older copied config or a focused test config.
         # It deliberately preserves the old mutually-exclusive semantics;
@@ -670,6 +718,18 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
                         sequence_seed, 'impairment', name)).random() < probability:
                     impairments.add(name)
 
+            # Acoustic tails own independent seeds just like impairments. They
+            # are only meaningful when a real echo path exists: no-echo is a
+            # separate hard negative, and near-only has no far-end operating
+            # point to widen.
+            acoustic_tails = set()
+            if has_far and echo_mode == 'normal':
+                for name, probability in acoustic_tail_p.items():
+                    if random.Random(stable_seed(
+                            sequence_seed, 'acoustic_tail', name
+                    )).random() < probability:
+                        acoustic_tails.add(name)
+
             # Echo-path impairments have no signal to act on in near-only or
             # far-active/no-echo sequences. Capture clipping/AGC remains valid
             # in both and is therefore intentionally retained.
@@ -686,6 +746,13 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
                         sequence_seed, 'dt_stress_combo')).random() < p_dt_stress):
                 impairments.update(DT_STRESS_IMPAIRMENTS)
 
+            if (talk_mode == 'double_talk'
+                    and echo_mode == 'normal'
+                    and random.Random(stable_seed(
+                        sequence_seed, 'dt_acoustic_combo'
+                    )).random() < p_dt_acoustic):
+                acoustic_tails.update(DT_ACOUSTIC_TAILS)
+
             plans.append(SequencePlan(
                 sequence_id=sequence_id,
                 n_chunks=n_chunks,
@@ -694,6 +761,7 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
                 talk_mode=talk_mode,
                 echo_mode=echo_mode,
                 impairments=tuple(sorted(impairments)),
+                acoustic_tails=tuple(sorted(acoustic_tails)),
             ))
         else:
             plans.append(SequencePlan(
@@ -737,6 +805,68 @@ def _probability(cfg: configparser.ConfigParser, section: str, key: str) -> floa
     return value
 
 
+def _finite_range(cfg: configparser.ConfigParser, section: str,
+                  low_key: str, high_key: str) -> Tuple[float, float]:
+    low = cfg.getfloat(section, low_key)
+    high = cfg.getfloat(section, high_key)
+    if not math.isfinite(low) or not math.isfinite(high) or low > high:
+        raise ValueError(
+            f"[{section}] requires finite {low_key} <= {high_key}, got "
+            f"{low:g} .. {high:g}")
+    return low, high
+
+
+def _acoustic_tail_range(cfg: configparser.ConfigParser,
+                         name: str) -> Tuple[float, float]:
+    stem = ACOUSTIC_TAIL_RANGE_KEYS[name]
+    return _finite_range(cfg, 'acoustic_tails', f'{stem}_min', f'{stem}_max')
+
+
+def _validate_acoustic_tail_ranges(cfg: configparser.ConfigParser) -> None:
+    """Keep each tail disjoint from the ordinary range and in AEC reach."""
+    long_min, long_max = _acoustic_tail_range(cfg, 'long_delay')
+    base_delay_max = cfg.getfloat('echo_path', 'bulk_delay_ms_max')
+    if long_min < base_delay_max:
+        raise ValueError(
+            "[acoustic_tails] long_delay_ms_min must be >= "
+            f"[echo_path] bulk_delay_ms_max ({base_delay_max:g}), got "
+            f"{long_min:g}")
+    reliable_reach = MATCHED_REACH_MS[max(MATCHED_REACH_MS)]
+    jitter_headroom = (cfg.getint('echo_path', 'jitter_steps_max')
+                       * cfg.getfloat('echo_path', 'jitter_ms_max'))
+    rir_headroom = cfg.getfloat('rir', 'pre_delay_keep_ms')
+    worst_case_delay = long_max + jitter_headroom + rir_headroom
+    if worst_case_delay > reliable_reach:
+        raise ValueError(
+            f"[acoustic_tails] worst-case long delay {worst_case_delay:g} ms "
+            f"(tail {long_max:g} + jitter {jitter_headroom:g} + RIR "
+            f"{rir_headroom:g}) exceeds the frozen n=5 matched-filter "
+            f"reliable reach {reliable_reach:g} ms")
+
+    _quiet_min, quiet_max = _acoustic_tail_range(cfg, 'quiet_far')
+    base_far_min = cfg.getfloat('levels', 'far_level_dbfs_min')
+    if quiet_max > base_far_min:
+        raise ValueError(
+            "[acoustic_tails] quiet_far_dbfs_max must be <= "
+            f"[levels] far_level_dbfs_min ({base_far_min:g}), got "
+            f"{quiet_max:g}")
+    base_erl_min = cfg.getfloat('levels', 'erl_db_min')
+    base_erl_max = cfg.getfloat('levels', 'erl_db_max')
+    quiet_erl_cap = cfg.getfloat('acoustic_tails', QUIET_FAR_ERL_CAP_KEY)
+    if not (math.isfinite(quiet_erl_cap)
+            and base_erl_min <= quiet_erl_cap <= base_erl_max):
+        raise ValueError(
+            f"[acoustic_tails] {QUIET_FAR_ERL_CAP_KEY} must lie within "
+            f"[levels] erl_db_min..erl_db_max ({base_erl_min:g}.."
+            f"{base_erl_max:g}), got {quiet_erl_cap:g}")
+
+    _strong_min, strong_max = _acoustic_tail_range(cfg, 'strong_echo')
+    if strong_max > base_erl_min:
+        raise ValueError(
+            "[acoustic_tails] strong_echo_erl_db_max must be <= "
+            f"[levels] erl_db_min ({base_erl_min:g}), got {strong_max:g}")
+
+
 def resolve_sequence_plan(plan: SequencePlan) -> Tuple[str, str, Tuple[str, ...]]:
     """Return ``(talk_mode, echo_mode, impairments)`` for new and old plans."""
     if plan.talk_mode is not None:
@@ -764,6 +894,20 @@ def resolve_sequence_plan(plan: SequencePlan) -> Tuple[str, str, Tuple[str, ...]
         raise ValueError(
             "far_active_no_echo cannot carry echo-path impairments")
     return talk_mode, echo_mode, tuple(sorted(set(impairments)))
+
+
+def resolve_acoustic_tails(plan: SequencePlan) -> Tuple[str, ...]:
+    """Validate and return the independent acoustic-tail axis."""
+    tails = tuple(plan.acoustic_tails)
+    unknown = sorted(set(tails) - set(ACOUSTIC_TAILS))
+    if unknown:
+        raise ValueError(f"unknown acoustic tails: {unknown}")
+    talk_mode, echo_mode, _ = resolve_sequence_plan(plan)
+    if tails and (talk_mode == 'near_only' or echo_mode != 'normal'):
+        raise ValueError(
+            f"acoustic tails require a real far/echo path, got "
+            f"talk_mode={talk_mode}, echo_mode={echo_mode}")
+    return tuple(sorted(set(tails)))
 
 
 # ============================================================
@@ -1055,6 +1199,7 @@ class AecSequenceRenderer:
         n_samples = n_chunks * self.chunk_samples
         talk_mode, echo_mode, impairments_tuple = resolve_sequence_plan(plan)
         impairments = frozenset(impairments_tuple)
+        acoustic_tails = frozenset(resolve_acoustic_tails(plan))
         legacy_scenario = plan.scenario if plan.talk_mode is None else None
 
         # --- sources -------------------------------------------------------
@@ -1126,12 +1271,20 @@ class AecSequenceRenderer:
             # Set test first: it rejects ~98% of double_talk sequences for a
             # fraction of what parsing the config value costs.
             force_edges = (
-                DT_STRESS_IMPAIRMENTS <= impairments
+                (DT_STRESS_IMPAIRMENTS <= impairments
+                 or DT_ACOUSTIC_TAILS <= acoustic_tails)
                 and cfg.getboolean(
                     'activity', 'dt_force_edge_overlap', fallback=False)
             )
+            # The forced leading edge must still overlap actual ECHO, which
+            # arrives one bulk delay after the reference: widen its floor by
+            # the tail's largest delay when this sequence draws the tail.
+            edge_floor_extra_s = (
+                cfg.getfloat('acoustic_tails', 'long_delay_ms_max') / 1000.0
+                if 'long_delay' in acoustic_tails else 0.0)
             near_runs = _force_overlap(
-                far_runs, near_runs, rng, sr, cfg, force_edges=force_edges)
+                far_runs, near_runs, rng, sr, cfg, force_edges=force_edges,
+                edge_floor_extra_s=edge_floor_extra_s)
 
         far_speech, far_paths = (
             self._render_talker(far_runs, n_samples, rng,
@@ -1142,11 +1295,20 @@ class AecSequenceRenderer:
             self._render_talker(near_runs, n_samples, rng, self.pools.speech_files)
             if has_near else (torch.zeros(n_samples), []))
 
+        def draw_range(tail: str, base_section: str, base_stem: str):
+            """(min, max) of a scalar draw: the tail's range when that tail
+            was drawn for this sequence, otherwise the ordinary range."""
+            if tail in acoustic_tails:
+                section, stem = 'acoustic_tails', ACOUSTIC_TAIL_RANGE_KEYS[tail]
+            else:
+                section, stem = base_section, base_stem
+            return (cfg.getfloat(section, f'{stem}_min'),
+                    cfg.getfloat(section, f'{stem}_max'))
+
         # --- far-end reference X -------------------------------------------
         far_render = _scale_to_active_dbfs(
             far_speech, sr,
-            rng.uniform(cfg.getfloat('levels', 'far_level_dbfs_min'),
-                        cfg.getfloat('levels', 'far_level_dbfs_max')))
+            rng.uniform(*draw_range('quiet_far', 'levels', 'far_level_dbfs')))
 
         # Reference dropout, chosen as WHOLE chunks so that a chunk labelled
         # 'ref_dropout' is unambiguously an idle chunk.
@@ -1205,9 +1367,10 @@ class AecSequenceRenderer:
             played = resample_by_ratio(played, 1.0 + sro_ppm * 1e-6, n_samples)
 
         # --- bulk delay (and jitter) ---------------------------------------
-        bulk_delay = rng.randint(
-            int(sr * cfg.getfloat('echo_path', 'bulk_delay_ms_min') / 1000),
-            int(sr * cfg.getfloat('echo_path', 'bulk_delay_ms_max') / 1000))
+        delay_ms_min, delay_ms_max = draw_range(
+            'long_delay', 'echo_path', 'bulk_delay_ms')
+        bulk_delay = rng.randint(int(sr * delay_ms_min / 1000),
+                                 int(sr * delay_ms_max / 1000))
         delay_jitter = 'delay_jitter' in impairments
         played = (_apply_jittered_delay(played, bulk_delay, sr, rng, cfg)
                   if delay_jitter else delay_signal(played, bulk_delay))
@@ -1251,8 +1414,13 @@ class AecSequenceRenderer:
 
         # Echo return loss against the STORED reference, so erl_db is a property
         # a consumer can verify directly from the shard.
-        erl_db = rng.uniform(cfg.getfloat('levels', 'erl_db_min'),
-                             cfg.getfloat('levels', 'erl_db_max'))
+        erl_db_min, erl_db_max = draw_range('strong_echo', 'levels', 'erl_db')
+        if 'quiet_far' in acoustic_tails and 'strong_echo' not in acoustic_tails:
+            # Keep the echo above the local-noise floor (see
+            # QUIET_FAR_ERL_CAP_KEY); strong_echo already draws a low ERL.
+            erl_db_max = min(
+                erl_db_max, cfg.getfloat('acoustic_tails', QUIET_FAR_ERL_CAP_KEY))
+        erl_db = rng.uniform(erl_db_min, erl_db_max)
         echo = _scale_to_ratio(echo, far_render, sr, -erl_db)
 
         if echo_mode == 'far_active_no_echo':
@@ -1402,6 +1570,7 @@ class AecSequenceRenderer:
         # positional arguments: resolve_sequence_plan is pure and O(1), and
         # this call already carries enough of them to align by eye.
         talk_mode, echo_mode, impairments = resolve_sequence_plan(plan)
+        acoustic_tails = resolve_acoustic_tails(plan)
         legacy_scenario = plan.scenario if plan.talk_mode is None else None
         # ⚠ ser_db / snr_db / erl_db are SEQUENCE-level: they describe how the
         # parent sequence was set up, measured over its whole duration.  A
@@ -1441,6 +1610,7 @@ class AecSequenceRenderer:
                 'talk_mode': talk_mode,
                 'echo_mode': echo_mode,
                 'impairments': list(impairments),
+                'acoustic_tails': list(acoustic_tails),
                 'echo_path_change': 'echo_path_change' in impairments,
                 'codec_mismatch': 'codec_mismatch' in impairments,
                 'manifest_version': self.pools.manifest_version,
@@ -1504,7 +1674,8 @@ def _chunk_scenario(echo_mode: str,
     return 'near_only'
 
 
-def _force_overlap(far_runs, near_runs, rng, sr, cfg, *, force_edges=False):
+def _force_overlap(far_runs, near_runs, rng, sr, cfg, *, force_edges=False,
+                   edge_floor_extra_s=0.0):
     """Guarantee genuine double talk instead of hoping two chains collide.
 
     The first and last far bursts are optionally load-bearing. They expose the
@@ -1517,6 +1688,9 @@ def _force_overlap(far_runs, near_runs, rng, sr, cfg, *, force_edges=False):
     frac_max = cfg.getfloat('activity', 'dt_overlap_frac_max')
     added = list(near_runs)
     floor = int(sr * 0.2)
+    # A forced edge has to cover the echo's arrival too, so its floor grows by
+    # the caller's bulk-delay allowance; random middle overlaps keep the base.
+    edge_floor = int(sr * (0.2 + edge_floor_extra_s))
     last_index = len(far_runs) - 1
     for index, (start, end) in enumerate(far_runs):
         edge = force_edges and index in (0, last_index)
@@ -1530,7 +1704,7 @@ def _force_overlap(far_runs, near_runs, rng, sr, cfg, *, force_edges=False):
             # whole instead of skipped. Applying the floor here as a `continue`
             # silently cost ~21% of stress-combo sequences at least one of
             # their two edges, while the config and README promised both.
-            window = max(window, min(length, floor))
+            window = max(window, min(length, edge_floor))
         elif window < floor:
             continue
         if edge and index == 0:

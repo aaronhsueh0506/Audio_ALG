@@ -514,117 +514,22 @@ def linear_aec_contract_from_config(
 # One direction by construction: a checkpoint recorded under the NEW hash run
 # against the OLD build is a genuine downgrade -- the mechanism it may have been
 # trained through is absent -- and stays refused.
-ACCEPTED_BEHAVIOR_HASH_MIGRATIONS = {
-    # The admission rule, all four or it does not go in:
-    #   1. the ONLY compared field that differs is `aec_behavior_hash`;
-    #   2. the lib/aec change is inert on the path this corpus is materialized
-    #      with -- typically a new mechanism defaulted OFF, never a retune of
-    #      a live one;
-    #   3. that inertness is MEASURED, not argued: the frozen frontend
-    #      (`LinearAecProcessor`, formed_output seam) renders byte-identical
-    #      before and after, over a scene that actually reaches the changed
-    #      code;
-    #   4. the same harness is shown to be capable of failing. For a rate-
-    #      scoped correction, an effective-value test may supply that control
-    #      only when the migration is explicitly restricted to unaffected
-    #      sample rates.
-    #
-    # Single hop by construction: the lookup is not applied transitively, so a
-    # value here is never re-read as a key. Two stacked migrations need the
-    # composed pair (oldest recorded -> current), re-verified end to end, not
-    # a chain. One direction by construction: a checkpoint recorded under the
-    # NEW hash run against an OLD build is a genuine downgrade -- the
-    # mechanism it may have been trained through is absent -- and stays
-    # refused.
-    #
-    # Entries this table held BEFORE the dominant-matched-filter-peak change
-    # are not here and may never be retargeted: that change MOVES
-    # `linear_error`, so their byte-identity evidence does not describe any
-    # frontend after it. They live in RETIRED_BEHAVIOR_HASHES instead, which
-    # refuses them with an instruction to rematerialize.
-
-    # aec_reset() now returns a fresh instance. The AEC's reset carried a
-    # converged filter's AEC3 startup gates, its Kalman H_error, the inst-ERLE
-    # slope ring and the near-end recency pair across the call, so a reused
-    # instance's second stream started from state a freshly built one never
-    # has; the same revision also removes the dead far-end power EMA from the
-    # Python filter. Both edits are under the signal scope, so the hash moves.
-    #
-    #   1. Verified against the recorded contract: `aec_behavior_hash` is the
-    #      only compared field that differs. Everything else in
-    #      `compatibility_dict()` is a __post_init__ literal or comes from the
-    #      same config, and `behavior_hash_schema` is unchanged at
-    #      "canon-ast-1".
-    #   2. Inert here because materialization never reaches the changed code:
-    #      `LinearAecProcessor.__init__` builds ONE engine per parent sequence
-    #      and `process_numpy` never calls `reset()`. Nothing reads the removed
-    #      `power` / `alpha_power` -- their only consumer was their own
-    #      cold-start guard.
-    #   3. MEASURED: three complete 30 s sequences at 16 kHz/512/256, each with
-    #      an echo path that CHANGES delay mid-sequence, so each one acquires,
-    #      loses and re-acquires a lock -- 2 filter-derived restarts and 3
-    #      distinct applied delays per sequence, i.e. the shared relock path
-    #      this revision also touches -- over far-end bursts, silent stretches
-    #      and a near-end talker. `linear_error` is byte-identical on all three
-    #      across the pair, 1,920,000 bytes per sequence. SHA-256:
-    #        seq0 (800 -> 1500 samples @ 12 s)
-    #          8b8e3cb8250261cb8945de9426ec032e65cd7dc5dfa709a04fdb2112b02ef437
-    #        seq1 (400 -> 2600 samples @ 17 s)
-    #          80437ca60b1cc745d2ca4be2d0cb7bf2bab9fc80de33c6976e3e1e473d80af8c
-    #        seq2 (2000 -> 650 samples @ 9 s)
-    #          c46b4b0f544e7c5be88de0daadf5fce6371d6b0943d656a9b1bd76650a59b504
-    #      The same run asserts `AEC.reset` is called zero times while
-    #      materializing, against the live class rather than by reading source.
-    #   4. The control that makes that meaningful: the same scene through the
-    #      same `LinearAecProcessor`, with one `engine.reset()` spliced into
-    #      the hop loop at hop 937 of seq0, renders DIFFERENT bytes on either
-    #      side of the pair --
-    #        recorded build 69fe3c6517e812f43410689344ce18e3bb3405e6c7d0fabeff51addb43ed8390
-    #        this build     dbdfb30a76c3cbabccf23b44055c9573bb054952470ca024cd18635e036eb9ae
-    #      A control that cannot fire proves nothing, so the harness aborts
-    #      unless the spliced reset actually happens.
-    #
-    # Composed-pair revalidation after the 48-kHz FilterAnalyzer correction:
-    # the original d5193ad source frontend and the current frontend rendered
-    # the same 12 s, 16-kHz/512/256 scene through LinearAecProcessor's exact
-    # formed-output loop. The scene contains far-end bursts, double-talk and a
-    # delay change (800 -> 1500 samples); FilterAnalyzer.update ran all 750
-    # hops. Both outputs are 768,000 bytes with SHA-256:
-    #   850ff08f8b8551f204d7ff5dbe5ac2ef80a9e68186fe04026efcf68aa5aafc56
-    # The control is the effective-value test in both AEC ports: replacing the
-    # 48-kHz 192/384-sample exclusion span with the former 64/128 literals
-    # fails, while both 16-kHz grids remain 64/128.
-    #
-    # Why 16 kHz byte-equality is not evidence that 48 kHz is also inert.
-    # Rendered at 48k/1024/512 with an echo path whose second arrival sits
-    # 200 samples after the peak -- inside the old window, outside the
-    # corrected one -- the two spans disagree on the detector itself:
-    # significant_peak on 934 of 1125 hops, consistent_estimate on 424,
-    # max_echo_path_gain on 656. That verdict reaches the formed seam only
-    # through SaturationDetector -> saturated_echo -> the over-output guard,
-    # which those scenes never tripped, so no 48-kHz `linear_error`
-    # divergence has actually been exhibited. The route exists, the corpus
-    # cannot be searched for a scene that takes it, and a false accept is
-    # unrecoverable while a false reject only costs a rematerialization --
-    # so the migration is restricted to 16 kHz below and an old 48-kHz
-    # corpus must be rematerialized.
-    #
-    # Scope note for a resumed run: this migration carries a COMPLETED corpus
-    # forward. `--resume` is keyed on `fingerprint()`, which includes the
-    # raw-text `aec_source_hash` and `aec_commit`, so an INTERRUPTED
-    # rematerialization restarts from scratch across this pair regardless --
-    # by design, since a half-rebuilt corpus must never mix two frontends.
-    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061":
-        "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45",
+ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
+    # Empty. The last admitted pair (37ed5ad9 -> 19dd4f90, the fresh-instance
+    # reset composed with the 48-kHz FilterAnalyzer correction, 16 kHz only)
+    # was retired on 2026-09-04 when the shadow-copy baseline retention was
+    # retimed per grid and C's hard restart started clearing coarse/leakage
+    # evidence: both move `linear_error`, so no byte-identity evidence can
+    # describe a frontend after them. Its admission evidence stays in git
+    # history (the revision that admitted it); it may never be retargeted.
 }
 
 # A migration pair can be frontend-equivalent at one sample rate and
 # intentionally different at another. Never infer this from the hash alone:
 # the FilterAnalyzer correction above is a no-op at 16 kHz but changes the live
 # 48-kHz detector window. Old 48-kHz material must therefore fail closed.
-_BEHAVIOR_MIGRATION_SAMPLE_RATES = {
-    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061":
-        frozenset({16000}),
+_BEHAVIOR_MIGRATION_SAMPLE_RATES: Dict[str, frozenset] = {
+    # Keyed like ACCEPTED_BEHAVIOR_HASH_MIGRATIONS; empty while it is.
 }
 
 
@@ -675,39 +580,11 @@ def _behavior_migration_applies(recorded: str, current: str,
 # reconstruct a fingerprint the guard then compares WHOLE -- an unrelated build
 # still fails. A source with no entry simply gets no legacy-ledger bridge; the
 # migration still applies to every other gate.
-MIGRATED_SOURCE_PROVENANCE = {
-    # lib/aec revisions the 200-hour corpus could have been materialized under.
-    # Introduced by 2f66c17 (its parent 070787b measures 8c615885); ends at
-    # d5193ad, the last revision before the fresh-instance reset (9dd9e78)
-    # moved the hash to this build's. Four commits, two source hashes: the
-    # three later ones differ from each other only in commit message and
-    # non-signal files, which `aec_python_source_hash` does not see.
-    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061": (
-        {
-            # scope formed capture fallback to the context seam
-            "aec_commit": "2f66c17c03b1fc2c96dd9cd74b15c543824cc757",
-            "aec_source_hash":
-                "2d5b119d8a69126b94acb98ebfe44d6982aeb12c41bdd46b51ddf0ae20843faf",
-        },
-        {
-            # docs: the formed seam's third candidate
-            "aec_commit": "fc5103cff82e7add40325bc44031a9cb0048ccf0",
-            "aec_source_hash":
-                "9380c512bca01b8da842e22426c66c016335d33ab4b232f78bafd9cd1efe39fe",
-        },
-        {
-            # perf: the hop pays for what it uses
-            "aec_commit": "631eb78665eda1e5e0d06f17e046f448e8938328",
-            "aec_source_hash":
-                "9380c512bca01b8da842e22426c66c016335d33ab4b232f78bafd9cd1efe39fe",
-        },
-        {
-            # fix: the ERLE watchdog leaks by the clock, not by the hop
-            "aec_commit": "d5193ad6b58efc54f13cbc71980a3e5659c7388d",
-            "aec_source_hash":
-                "9380c512bca01b8da842e22426c66c016335d33ab4b232f78bafd9cd1efe39fe",
-        },
-    ),
+MIGRATED_SOURCE_PROVENANCE: Dict[str, tuple] = {
+    # Empty while no migration is admitted. The four-revision range that
+    # carried 37ed5ad9 (2f66c17 .. d5193ad) is recorded in git history with
+    # the pair it served; a retired source never needs a bridge because the
+    # guard refuses it before the ledger is consulted.
 }
 
 
@@ -755,6 +632,12 @@ RETIRED_BEHAVIOR_HASHES = frozenset({
     "ffc2e044d031f06a9d685ee77159e5a8d7d3075e5e3eaea8156746c416c1dd4e",
     "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd",
     "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
+    # The 200-hour corpus's materialization frontend and the identity it had
+    # been carried forward to, retired 2026-09-04 by the shadow-copy baseline
+    # retention retime (0.995 -> 0.992 at 16 kHz/512/256) and C's restart
+    # evidence clearing; both move `linear_error`.
+    "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061",
+    "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45",
 })
 
 
@@ -812,11 +695,10 @@ def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> N
         raise ValueError(
             f"{context} linear_aec was materialized by AEC behaviour "
             f"{recorded_hash}, which this build ({current_hash}) does not "
-            "reproduce: the matched-filter aggregator now reports the dominant "
-            "peak instead of the pre-echo candidate, which MOVES linear_error. "
-            "There is no migration for this pair and none may be added -- the "
-            "byte-identity evidence the old entries carried does not describe "
-            "this frontend. Recompute the corpus's linear_error channel "
+            "reproduce. That identity is retired because it produces a "
+            "different linear_error; there is no byte-equivalent migration "
+            "for this pair and none may be added. Recompute the corpus's "
+            "linear_error channel "
             "(AIAEC.dataset_gen.rematerialize_linear_aec, without --resume), "
             "repack, and retrain any checkpoint trained on the old data."
         )

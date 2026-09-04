@@ -89,12 +89,14 @@ if __package__ in (None, ''):
     __package__ = 'AIAEC.dataset_gen'
 
 from .aec_dataset import (  # noqa: E402
+    DT_ACOUSTIC_TAILS,
     DT_STRESS_IMPAIRMENTS,
     AecSequenceRenderer,
     SequencePlan,
     check_rate_dependent_values,
     chunk_samples_from_config,
     plan_sequences,
+    resolve_acoustic_tails,
     resolve_sequence_plan,
 )
 from .aec_features import STEM_ORDER  # noqa: E402
@@ -466,6 +468,7 @@ def gen_aec_dataset(args):
     talk_counts = collections.Counter()
     echo_counts = collections.Counter()
     impairment_counts = collections.Counter()
+    acoustic_tail_counts = collections.Counter()
     # Label -> the impairment set a double_talk plan must contain to count.
     # The full combo is DT_STRESS_IMPAIRMENTS itself, so the census cannot
     # drift from what [complex_cases] p_dt_stress_combo actually forces.
@@ -475,24 +478,32 @@ def gen_aec_dataset(args):
                  'dt+path_change+nonlinear+clipping_agc':
                      DT_STRESS_IMPAIRMENTS}
     combo_counts = dict.fromkeys(dt_combos, 0)
+    dt_acoustic_combo_count = 0
     for plan in plans:
         talk_mode, echo_mode, impairments = resolve_sequence_plan(plan)
+        acoustic_tails = resolve_acoustic_tails(plan)
         impairment_set = set(impairments)
+        acoustic_tail_set = set(acoustic_tails)
         talk_counts[talk_mode] += 1
         echo_counts['not_applicable'
                     if talk_mode == 'near_only' else echo_mode] += 1
         impairment_counts.update(impairments)
+        acoustic_tail_counts.update(acoustic_tails)
         if talk_mode == 'double_talk':
             for label, needed in dt_combos.items():
                 if needed <= impairment_set:
                     combo_counts[label] += 1
+            if DT_ACOUSTIC_TAILS <= acoustic_tail_set:
+                dt_acoustic_combo_count += 1
 
     print(f"\nDone. {len(plans)} sequences ({planned_sec / 3600:.3f} h) in "
           f"{seqs_dir}/, {(time.time() - started) / 60:.1f} min this run.")
     print(f"  Talk modes       : {dict(talk_counts)}")
     print(f"  Echo modes       : {dict(echo_counts)}")
     print(f"  Impairments      : {dict(impairment_counts)}")
+    print(f"  Acoustic tails   : {dict(acoustic_tail_counts)}")
     print(f"  DT intersections : {combo_counts}")
+    print(f"  DT acoustic combo: {dt_acoustic_combo_count}")
     stale = stale_temp_files(seqs_dir)
     if stale:
         print(f"  ⚠ {len(stale)} leftover tmp.*.wav from an interrupted run "
