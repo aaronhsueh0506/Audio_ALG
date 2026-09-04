@@ -173,6 +173,13 @@ def test_inference_cli_accepts_only_real_matched_filter_banks():
         '--delay-num-filters', '2',
     ])
     assert args.delay_num_filters == 2
+    assert args.far_input_mode == 'aligned_far'
+    raw_args = parser.parse_args([
+        'checkpoint.pth', 'mic.wav', 'far.wav', 'out.wav',
+        '--delay-num-filters', '5', '--far-input-mode', 'raw_far',
+    ])
+    assert raw_args.delay_num_filters == 5
+    assert raw_args.far_input_mode == 'raw_far'
     for bad in ('0', '6', '-1', '1.5'):
         with pytest.raises(SystemExit):
             parser.parse_args([
@@ -222,10 +229,11 @@ def test_load_model_far_input_mode_default_present_and_rejected(
     # _write_synthetic_checkpoint records no far_input_mode -- exactly a
     # legacy checkpoint. It must load, defaulted to raw_far, and the loader
     # must name BOTH sides: the mode the checkpoint trained on and the
-    # aligned-far seam deployment feeds it (_streaming.py shares this loader
-    # and the same seam, so both CLIs print the same line).
+    # deployment default. _streaming.py separately prints the selected
+    # runtime seam, which may override that default.
     load_model(path, 'cpu')
-    assert ('checkpoint training far_input_mode: raw_far; deployment: aligned_far'
+    assert ('checkpoint training far_input_mode: raw_far; '
+            'deployment default: aligned_far'
             in capsys.readouterr().out)
 
     # Field present (what every new contract records): loads identically.
@@ -234,7 +242,8 @@ def test_load_model_far_input_mode_default_present_and_rejected(
     explicit_path = str(tmp_path / 'ckpt_explicit.pth')
     torch.save(ckpt, explicit_path)
     load_model(explicit_path, 'cpu')
-    assert ('checkpoint training far_input_mode: raw_far; deployment: aligned_far'
+    assert ('checkpoint training far_input_mode: raw_far; '
+            'deployment default: aligned_far'
             in capsys.readouterr().out)
 
     # Unknown mode: rejected before any weights load.
@@ -353,3 +362,57 @@ def test_inference_feeds_model_the_pbfdkf_consumed_aligned_far(
     # the far. A CLI still feeding the raw WAV would satisfy every equality
     # above only if this failed.
     assert not torch.equal(consumed_far, raw_far)
+
+
+def test_inference_raw_far_keeps_pbfdkf_error_but_feeds_original_far(
+        model, tmp_path, monkeypatch):
+    """raw_far changes only the NN reference, not the PBFDKF frontend."""
+    from AIAEC.Align_ULCNet import inference as inference_cli
+    from AIAEC.Align_ULCNet import _streaming as streaming_cli
+    from AIAEC.aiaec_streaming import StreamSTFT
+    from AIAEC.dataset_gen import make_linear_aec_contract
+    from AIAEC.inference_common import load_mic_far
+    from AIAEC.training_common import LinearAecEngine
+
+    checkpoint = str(tmp_path / 'ckpt.pth')
+    _write_synthetic_checkpoint(checkpoint, model)
+    mic_path, far_path, raw_far = _write_delayed_scene(tmp_path)
+
+    pushed = {}
+    constructed = []
+
+    class RecordingStreamSTFT(StreamSTFT):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.index = len(constructed)
+            constructed.append(self)
+            pushed[self.index] = []
+
+        def push(self, chunk):
+            pushed[self.index].append(chunk.detach().clone())
+            return super().push(chunk)
+
+    monkeypatch.setattr(streaming_cli, 'StreamSTFT', RecordingStreamSTFT)
+    inference_cli.main(inference_cli.build_parser().parse_args([
+        checkpoint, mic_path, far_path, str(tmp_path / 'raw_far_out.wav'),
+        '--device', 'cpu', '--delay-num-filters', '5',
+        '--far-input-mode', 'raw_far',
+    ]))
+    assert len(constructed) == 2
+    streaming_error = torch.cat(pushed[0], dim=-1)
+    streaming_far = torch.cat(pushed[1], dim=-1)
+
+    contract = make_linear_aec_contract(GRID.sample_rate)
+    mic_t, far_t, _rates = load_mic_far(mic_path, far_path, GRID.sample_rate)
+    engine = LinearAecEngine(
+        n_lanes=1, sample_rate=GRID.sample_rate,
+        contract=contract.as_dict(), delay_num_filters=5,
+    )
+    expected_error, _ = engine(mic_t, far_t, GRID.sample_rate)
+
+    assert engine.delay_num_filters == 5
+    assert torch.equal(streaming_error, expected_error)
+    assert torch.equal(streaming_far, raw_far)
+    # The fixture acquires a non-zero delay. Prove this test distinguishes
+    # raw far from the aligned PBFDKF tap instead of passing vacuously.
+    assert not torch.equal(streaming_far, engine.get_aligned_far())

@@ -7,11 +7,12 @@
     python3 inference.py checkpoint.pth kf_error.wav far.wav out.wav \\
         --input-is-linear-error
 
-Checkpoint loading and the audio frontend are identical to inference.py, far
-branch included: the model is fed the linear AEC's own aligned-far seam, not
-the raw far WAV.  PBFDKF, STFT, network, and ISTFT all advance one input hop at
-a time.  The Python PBFDKF is only a reference for the production C seam, but
-its state lifetime and hop cadence are the same here.
+Checkpoint loading and the audio frontend are identical to inference.py.  The
+``--far-input-mode`` switch changes only the model's far branch: PBFDKF still
+advances on raw mic/far and produces the same linear_error.  PBFDKF, STFT,
+network, and ISTFT all advance one input hop at a time.  The Python PBFDKF is
+only a reference for the production C seam, but its state lifetime and hop
+cadence are the same here.
 
 Everything after the linear AEC is strictly incremental: hop-sized sample
 chunks feed StreamSTFT, every finished frame goes through forward_stream (one
@@ -50,6 +51,8 @@ def main(args, load_model_fn=None):
     model, grid, linear_contract = load_model_fn(
         args.checkpoint, device, max_delay_frames=args.max_delay_frames
     )
+    far_input_mode = getattr(args, 'far_input_mode', 'aligned_far')
+    print(f"inference model far_input_mode: {far_input_mode}")
 
     if args.input_is_linear_error:
         primary, input_far, source_rates = load_linear_error_far(
@@ -123,16 +126,22 @@ def main(args, load_model_fn=None):
         input_far_hop = input_far[:, start:stop]
         if linear_aec is None:
             error_hop = primary_hop
-            aligned_far_hop = input_far_hop
+            model_far_hop = input_far_hop
         else:
             error_hop, _ = linear_aec(primary_hop, input_far_hop, grid.sr)
-            # Exact far hop PBFDKF consumed: raw until acquisition/ring fill,
-            # aligned afterward.  This is the production model seam.
-            aligned_far_hop = linear_aec.get_aligned_far()
+            if far_input_mode == 'raw_far':
+                # Keep the NN input on the checkpoint's training provenance;
+                # this does not bypass PBFDKF or alter its linear_error.
+                model_far_hop = input_far_hop
+            else:
+                # Exact far hop PBFDKF consumed: raw until acquisition/ring
+                # fill, aligned afterward. This is the existing deployment
+                # model seam.
+                model_far_hop = linear_aec.get_aligned_far()
         reference_error.append(error_hop)
-        reference_far.append(aligned_far_hop)
+        reference_far.append(model_far_hop)
         run_frames(stft_error.push(error_hop.to(device)),
-                   stft_far.push(aligned_far_hop.to(device)))
+                   stft_far.push(model_far_hop.to(device)))
     run_frames(stft_error.flush(), stft_far.flush())
     pieces.append(istft_out.flush(length=length, already_emitted=emitted))
     streamed = torch.cat(pieces, dim=-1)[:, :length]

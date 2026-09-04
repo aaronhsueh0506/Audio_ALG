@@ -5,8 +5,12 @@
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --device cpu
     python3 inference.py checkpoint.pth mic.wav far.wav out.wav --verify
-    python3 inference.py checkpoint.pth mic.wav far.wav out.wav \
+    python3 inference.py checkpoint.pth mic.wav far.wav out.wav \\
         --delay-num-filters 2
+    # PBFDKF still estimates delay for linear_error; only the NN far branch
+    # stays on the original raw far, matching the checkpoint's training input.
+    python3 inference.py checkpoint.pth mic.wav far.wav out.wav \\
+        --delay-num-filters 5 --far-input-mode raw_far
     python3 inference.py checkpoint.pth kf_error.wav far.wav out.wav \\
         --input-is-linear-error
 
@@ -116,7 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
         '--input-is-linear-error', action='store_true',
         help='Evaluation only: first WAV is an existing KF/AEC error Z; '
              'bypass this project\'s PBFDKF and run only the neural post-filter. '
-             'The supplied far WAV must already be aligned to that error.',
+             'The supplied far WAV is consumed unchanged; use '
+             '--far-input-mode to declare whether it is raw or aligned.',
     )
     parser.add_argument(
         '--max-delay-frames', type=int, default=None,
@@ -135,6 +140,17 @@ def build_parser() -> argparse.ArgumentParser:
              'n=1/2/3/4/5. This changes only the runtime AEC search bank; it '
              'does not alter the checkpoint or neural depth D.',
     )
+    parser.add_argument(
+        '--far-input-mode', choices=('raw_far', 'aligned_far'),
+        default='aligned_far',
+        help='Far stream presented to Align-ULCNet. raw_far keeps the original '
+             'far WAV for the NN (matching checkpoint training) while PBFDKF '
+             'still uses its matched-filter bank to produce linear_error; '
+             'aligned_far feeds the post-delay-buffer far consumed by PBFDKF '
+             '(existing deployment behavior; default). With '
+             '--input-is-linear-error, PBFDKF is bypassed and the supplied '
+             'far WAV is consumed unchanged in either mode.',
+    )
     parser.add_argument('--verify', action='store_true', help=VERIFY_HELP)
     add_directory_arguments(parser)
     return parser
@@ -149,7 +165,8 @@ def load_model(checkpoint_path: str, device: str,
     # recorded mode is rejected here, before any weights load. _streaming.py
     # shares this loader, so both CLIs print the mode at load time.
     print("checkpoint training far_input_mode: "
-          f"{checkpoint_far_input_mode(contract)}; deployment: aligned_far")
+          f"{checkpoint_far_input_mode(contract)}; "
+          "deployment default: aligned_far")
     aec_grid = AecGrid(contract['sr'], contract['n_fft'], contract['win_len'], contract['hop_len'])
     linear_aec_contract = require_checkpoint_linear_aec(contract, aec_grid)
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)

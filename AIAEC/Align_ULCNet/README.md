@@ -179,6 +179,19 @@ The default remains `n = 5`. The flag is rejected together with
 `--input-is-linear-error`, because that mode bypasses PBFDKF and therefore has
 no matched-filter bank to resize.
 
+The matched-filter bank and the NN far input are independent. To reproduce the
+checkpoint's training provenance while retaining PBFDKF delay estimation for
+the linear-error input, run:
+
+```bash
+python3 inference.py checkpoint.pth mic.wav far.wav out.wav \
+  --delay-num-filters 5 --far-input-mode raw_far
+```
+
+`raw_far` changes only the NN branch; PBFDKF still runs with `n = 5` and
+produces `linear_error`. `aligned_far` is the existing deployment behavior and
+remains the default for compatibility.
+
 ```bash
 # short-route candidate: smaller bank, aligned far, shallow attention
 python3 sweep_delay_depth.py checkpoint.pth mic.wav far.wav short_route \
