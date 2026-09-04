@@ -219,7 +219,7 @@ _CONTROL_SEMANTICS = {
     'DeepVQE_S': 'complex_ccm_taps_host_applies_spectrum_ring',
     'CAGCRN': 'complex_mask_for_microphone_spectrum',
 }
-DEEPVQE_C_LAYOUT_VERSION = 1
+DEEPVQE_C_LAYOUT_VERSION = 2
 
 
 def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
@@ -237,10 +237,16 @@ def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
         for name, tensor in zip(input_names, inputs)
     }
     head = tuple(int(size) for size in outputs[0].shape)
-    # The CCM taps: [1, 1, bins, time_order, freq_taps, 2].
-    if len(head) != 6 or head[2] != grid.n_freqs or head[5] != 2:
+    # The CCM taps cross the accelerator boundary as one rank-4 tensor.  Its
+    # packed channel keeps the model's row-major [time][frequency][RI] order,
+    # so the C postprocessor can consume it without a transpose or copy.
+    time_order = int(wrapper.model.time_order)
+    freq_taps = 2 * int(wrapper.model.freq_radius) + 1
+    packed_width = time_order * freq_taps * 2
+    if head != (1, 1, grid.n_freqs, packed_width):
         raise ValueError(
-            'DeepVQE_S head is not a [1,1,F,T,K,2] tap tensor: %r' % (head,))
+            'DeepVQE_S head is not packed [1,1,F,T*K*2]=[1,1,%d,%d]: %r'
+            % (grid.n_freqs, packed_width, head))
     h_gru = shapes['h_gru']                       # [1, layers, hidden]
     conv = shapes['state_mic1_history']           # [1, C, history, F]
     key_ring = shapes['state_align_key_ring']     # [1, sim, D, F2]
@@ -260,8 +266,8 @@ def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
         'fft_size': int(grid.n_fft),
         'hop_size': int(grid.hop_len),
         'spectrum_bins': int(grid.n_freqs),
-        'time_order': head[3],
-        'freq_taps': head[4],
+        'time_order': time_order,
+        'freq_taps': freq_taps,
         'conv_history_frames': conv[2],
         'score_history_frames': score[2],
         'gru_layers': h_gru[1],
@@ -597,7 +603,11 @@ class StatelessOneFrameAIAEC(nn.Module):
         )
         tap_real = raw[..., 0] - 0.5 * raw[..., 1] - 0.5 * raw[..., 2]
         tap_imag = (3.0 ** 0.5 / 2.0) * (raw[..., 1] - raw[..., 2])
-        return torch.stack((tap_real, tap_imag), dim=-1)
+        taps_ri = torch.stack((tap_real, tap_imag), dim=-1)
+        # [B,1,F,time,freq,RI] -> [B,1,F,time*freq*RI].  Flattening the
+        # already-contiguous trailing axes changes only boundary metadata;
+        # element order remains exactly what deepvqe_ccm_process consumes.
+        return taps_ri.flatten(start_dim=3)
 
     def _cagcrn(self, primary: Tensor, far: Tensor) -> Tensor:
         model = self.model

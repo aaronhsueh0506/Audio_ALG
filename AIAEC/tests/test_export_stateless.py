@@ -49,7 +49,7 @@ def _learned_output(name, output):
         return output.mask
     if name == 'DeepVQE_S':
         taps = output.auxiliary['ccm_taps']
-        return torch.stack((taps.real, taps.imag), dim=-1)
+        return torch.stack((taps.real, taps.imag), dim=-1).flatten(start_dim=3)
     if name == 'CAGCRN':
         return output.mask.permute(0, 2, 3, 1)
     raise AssertionError(name)
@@ -90,6 +90,23 @@ def test_external_state_round_trip_matches_streaming_reference(name, factory):
             )
     assert len(output_names) == len(actual)
     assert observed_nonzero_state
+
+
+def test_deepvqe_head_is_rank4_and_preserves_ccm_memory_order():
+    """The NPU boundary is compact without changing a single tap value."""
+    torch.manual_seed(91)
+    model = DeepVQES(GRID).eval()
+    wrapper, inputs, _names, _outputs, _split = _build('DeepVQE_S', model)
+    reference_state = model.create_stream_state()
+    primary = torch.complex(inputs[0][..., 0], inputs[0][..., 1])
+    far = torch.complex(inputs[1][..., 0], inputs[1][..., 1])
+    with torch.no_grad():
+        actual = wrapper(*inputs)[0]
+        reference = model.forward_stream(primary, far, reference_state)
+    taps = reference.auxiliary['ccm_taps']
+    unpacked = torch.stack((taps.real, taps.imag), dim=-1)
+    assert actual.shape == (1, 1, GRID.n_freqs, 18)
+    assert torch.equal(actual, unpacked.reshape(1, 1, GRID.n_freqs, 18))
 
 
 def test_align_cruse_frame_index_is_explicit_int64_state():

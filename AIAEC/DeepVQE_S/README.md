@@ -56,8 +56,10 @@ select `*_best.pth`.
 tests keep linking). The lifecycle and per-hop sequence shared by every
 class are described once, in `../README.md` ("C pre/post-processing").
 Specific to this one: the accelerator boundary is the exporter's exactly --
-raw RI `mic`/`far` in, CCM taps out, and the sixteen explicit state tensors
-in `DeepVqeStateId` order, held in two host-side banks that `frame_commit`
+raw RI `mic`/`far` in, packed CCM taps `[1,1,F,18]` out, and the sixteen
+explicit state tensors in `DeepVqeStateId` order. The last axis preserves
+`[time][frequency][RI]` row-major order, so C consumes it without a transpose
+or copy. State is held in two host-side banks that `frame_commit`
 swaps only after every tap and state element is finite -- and `frame_skip`
 FAILS CLOSED (mutes the frame): stream 0 is the raw microphone, so the
 pass-through identity a post-filter can take would emit the uncancelled

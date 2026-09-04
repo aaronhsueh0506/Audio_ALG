@@ -1515,7 +1515,7 @@ def test_export_metadata_carries_the_c_descriptor(driver, deepvqe_built,
                                                   tmp_path):
     """A shipped artifact must carry the boundary its C side binds. Both the
     ONNX metadata and the JSON written beside it must record
-    state_layout_version 1 and the measured c_descriptor -- the very dict
+    state_layout_version 2 and the measured c_descriptor -- the very dict
     test_c_descriptor_matches_the_built_graph already fed to the C
     validator, so nothing between the graph and the board restates the ABI
     by hand."""
@@ -1523,7 +1523,10 @@ def test_export_metadata_carries_the_c_descriptor(driver, deepvqe_built,
     pytest.importorskip('onnxruntime')
     torch = pytest.importorskip('torch')
     from AIAEC.dataset_gen import AecGrid
-    from AIAEC._streaming_export import export_graph
+    from AIAEC._streaming_export import (
+        DEEPVQE_C_LAYOUT_VERSION,
+        export_graph,
+    )
 
     _model, built, descriptor = deepvqe_built
     grid = AecGrid(16000, 512, 512, 256)
@@ -1535,10 +1538,12 @@ def test_export_metadata_carries_the_c_descriptor(driver, deepvqe_built,
         metadata = export_graph(grid, built, str(checkpoint), str(output),
                                 63, verify=False)
 
-    assert metadata['state_layout_version'] == 1
+    assert metadata['state_layout_version'] == DEEPVQE_C_LAYOUT_VERSION
     assert metadata['c_descriptor'] == descriptor
+    assert metadata['output_schema']['output'] == [1, 1, 257, 18]
 
     with open(str(output.with_suffix('.json')), encoding='utf-8') as stream:
         written = json.load(stream)
-    assert written['state_layout_version'] == 1
+    assert written['state_layout_version'] == DEEPVQE_C_LAYOUT_VERSION
     assert written['c_descriptor'] == descriptor
+    assert written['output_schema']['output'] == [1, 1, 257, 18]

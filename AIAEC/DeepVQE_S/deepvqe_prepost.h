@@ -98,7 +98,7 @@ extern "C" {
  * move independently, and a shared number would make one model's bump look
  * like the other's. Any rename, reshape, reorder or added/removed tensor at
  * the boundary bumps this. */
-#define DEEPVQE_PREPOST_LAYOUT_VERSION 1u
+#define DEEPVQE_PREPOST_LAYOUT_VERSION 2u
 #define DEEPVQE_PREPOST_ALIGNMENT      16u
 /* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
  * so a pool recorded by the previous carve is refused on the hash, not only
@@ -134,8 +134,9 @@ extern "C" {
 #define DEEPVQE_GRU_LAYERS      1
 #define DEEPVQE_GRU_HIDDEN      192
 
-/* Head output: CCM taps, graph shape [1,1,BINS,TIME_ORDER,FREQ_TAPS,2],
- * flat-identical to deepvqe_process.h's
+/* Head output: CCM taps, graph shape
+ * [1,1,BINS,TIME_ORDER*FREQ_TAPS*2]. The packed last axis is still ordered
+ * [time][frequency][RI], flat-identical to deepvqe_process.h's
  * taps[AIAEC_N_BINS][DEEPVQE_TIME_ORDER][DEEPVQE_FREQ_TAPS][2]. */
 #define DEEPVQE_TAPS_ELEMENTS \
     ((size_t)AIAEC_N_BINS * DEEPVQE_TIME_ORDER * DEEPVQE_FREQ_TAPS * 2u)
@@ -255,7 +256,7 @@ typedef struct DeepVqePrepostInputs {
  * an enforced property rather than a claim.
  * prepare() fills every element with NaN so commit() detects partial writes. */
 typedef struct DeepVqePrepostOutputs {
-    float *taps;   /* [1,1,BINS,TIME_ORDER,FREQ_TAPS,2] complex CCM taps */
+    float *taps;   /* [1,1,BINS,TIME_ORDER*FREQ_TAPS*2], packed CCM taps */
     size_t taps_elements;
     float *state_out[DEEPVQE_STATE_COUNT];
     size_t state_elements[DEEPVQE_STATE_COUNT];

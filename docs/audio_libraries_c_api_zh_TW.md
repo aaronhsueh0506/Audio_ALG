@@ -585,12 +585,14 @@ const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(const DeepVqePrepost 
 
 - 圖邊界：兩個 RI 交錯的訊號 input（`mic`/`far`，`[1,1,AIAEC_N_BINS,2]`）＋
   **16 個顯式 state**，順序就是 `DeepVqeStateId` 列舉（= exporter 的 `input_names[2:]` 逐字），
-  輸出是 CCM taps `[1,1,BINS,DEEPVQE_TIME_ORDER,DEEPVQE_FREQ_TAPS,2]` ＋ 16 個 next state。
+  輸出是 packed CCM taps
+  `[1,1,BINS,DEEPVQE_TIME_ORDER*DEEPVQE_FREQ_TAPS*2]`（16 kHz grid 為
+  `[1,1,257,18]`，末軸仍按 `[time][frequency][RI]` 排列）＋ 16 個 next state。
   按 index 綁的 adapter 必須用這個列舉，按名字綁的用 `_state_name()`。
 - DeepVQE-S 回的是**每個 state 的完整下一個值**（不是差量），所以 pool 裡有兩套 bank、
   commit 時交換；NaN 預填與有限性檢查會走過整個狀態，這正是「失敗時什麼都不動」能被強制而不只是聲稱的原因。
 - `descriptor_validate()` 拿 ONNX/JSON metadata 裡的 13 欄 `c_descriptor` 對本 build 的 ABI 逐欄比對，
-  只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 1。
+  只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 2。
 - D 範圍 `DEEPVQE_PREPOST_MIN_D`=1 到 `DEEPVQE_PREPOST_MAX_D`=256，出貨值
   `DEEPVQE_PREPOST_DEFAULT_D`=63（16 kHz 上的一秒搜尋範圍）。
 - grid 只有 16 kHz/512/256：`aiaec_process.h` 帶 `#error` 守衛，grid 換掉是編譯失敗而不是默默重新解讀張量。
@@ -766,4 +768,3 @@ AIAEC 蓋 `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`，AINR 蓋 `CC`/`AR`/`CF
 - [ ] application 與 static libraries 使用相同 backend、SIMD、FP flags。
 - [ ] 最終 float-to-PCM 前做 saturating conversion；需要 limiter 時只放在整條 chain 最後。
 - [ ] 完整 AEC+NR/4ch 應用優先跑 pipeline tests，而不只跑各 library unit test。
-

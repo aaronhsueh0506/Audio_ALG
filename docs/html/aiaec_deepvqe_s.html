@@ -214,8 +214,9 @@ graph state 由 host caller 保存；STFT/ISTFT 與 CCM 頻譜 ring 屬 C struct
 所以形狀不可能在某一處對、另一處錯。頻率階梯 257→129→65→33→17 是 encoder 的 stride-2 halving，
 時間深度 3 = causal conv kernel 4−1、alignment score conv 是 (5,3) 所以史深 4
 （<code>DEEPVQE_CONV_HISTORY</code> / <code>DEEPVQE_SCORE_HISTORY</code>）。head 輸出
-<code>output</code> = CCM taps <code>[1,1,257,3,3,2]</code>，與
-<code>deepvqe_process.h</code> 的 <code>taps[257][3][3][2]</code> 攤平後同一塊記憶體。</p>
+<code>output</code> = packed CCM taps <code>[1,1,257,18]</code>；末軸保持
+<code>[time][frequency][RI]</code> 次序，與 <code>deepvqe_process.h</code> 的
+<code>taps[257][3][3][2]</code> 攤平後同一塊記憶體，不需 transpose 或 copy。</p>
 <p><b>Descriptor（13 欄）</b>：<code>DeepVqePrepostDescriptor</code> =
 <code>layout_version</code>／<code>delay_depth</code>／<code>sample_rate</code>／
 <code>fft_size</code>／<code>hop_size</code>／<code>spectrum_bins</code>／<code>time_order</code>／
@@ -224,7 +225,7 @@ graph state 由 host caller 保存；STFT/ISTFT 與 CCM 頻譜 ring 屬 C struct
 <code>deepvqe_prepost_descriptor_default(D, &amp;desc)</code> 產生本 build 的值，
 <code>_descriptor_validate(&amp;desc)</code> 把<b>除 <code>delay_depth</code> 之外</b>每一欄
 都釘在本 build 的常數上（<code>delay_depth</code> 是 export 期的部署參數，只檢查範圍）。
-<code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> 現為 <b>1</b>，且刻意<b>不</b>與
+<code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> 現為 <b>2</b>，且刻意<b>不</b>與
 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 共用：兩個模型的 boundary 各走各的，共用號碼會讓
 一邊的 bump 看起來像另一邊的。D 範圍 <code>DEEPVQE_PREPOST_MIN_D</code>=1 …
 <code>MAX_D</code>=256，預設 63 ＝ 這個 grid 上的 1.0 秒搜尋範圍。</p>
