@@ -340,7 +340,6 @@ if (mmse_lsa_set_mode(nr, MMSE_LSA_NR_AGGRESSIVE) != 0) { /* 引數不合法或 
 
 /* B. 自己在 preset 之上疊了覆寫：重組整份組態，逐字交出去 */
 MmseLsaConfig target = mmse_lsa_config_for_mode_grid(sr, fft_size, MMSE_LSA_NR_AGGRESSIVE);
-target.broadband_threshold = 0.8f;                            /* 我方覆寫 */
 target.L = mmse_lsa_retime_frames(150, sr, target.hop_size);  /* 我方覆寫 */
 target.alpha_decay = target.alpha_g;                          /* 我方覆寫 */
 if (mmse_lsa_reconfigure(nr, &target) != 0) { /* grid 不符或 target 無效 */ }
@@ -349,7 +348,7 @@ if (mmse_lsa_reconfigure(nr, &target) != 0) { /* grid 不符或 target 無效 */
 > **兩者不可互換。** `mmse_lsa_reconfigure()` 逐字採用 `target`，不做 preset 查表、
 > 不做 overlay 疊加。`mmse_lsa_set_mode()` 組的是**裸的 canonical preset**，只適用於
 > standalone。兩條出貨 pipeline 的 NR 組態都是「canonical preset **加上**自己的覆寫」
-> （`broadband_threshold`、`L`、`alpha_decay`），把 canonical preset 交給
+> （`L`、`alpha_decay`），把 canonical preset 交給
 > `mmse_lsa_set_mode()` 在這種實例上會被**拒絕**（它的 `L` 不同）——這正是
 > `audio_pipeline_set_nr_mode()` / `four_aec_nr_res_set_nr_mode()` 各自重組完整組態
 > 再呼叫 `mmse_lsa_reconfigure()` 的原因。application 不要繞過 pipeline 的 setter 去

@@ -276,8 +276,7 @@ ramp 進行中再呼叫一次，會從當前的 live 值重新起走。
 `audio_pipeline_process()` 序列化；非 thread-safe。**
 
 > **不要繞過 `set_nr_mode()` 去呼叫 `mmse_lsa_set_mode()`。** 本 pipeline 的 NR
-> 組態是「canonical 強度 preset **加上**自己的覆寫」（`broadband_threshold`、`L`、
-> `alpha_decay`）。`mmse_lsa_set_mode()` 組的是裸的 canonical preset，在本 pipeline
+> 組態是「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`）。`mmse_lsa_set_mode()` 組的是裸的 canonical preset，在本 pipeline
 > 的實例上會被**拒絕**（它的 `L` 不同）——所以 `audio_pipeline_set_nr_mode()` 做的事
 > 是重組本 pipeline 的完整組態，再交給 `mmse_lsa_reconfigure()`。
 

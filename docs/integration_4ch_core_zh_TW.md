@@ -301,8 +301,7 @@ if (four_aec_nr_res_post_split_floor(p, &live, &target) == 0 && live == target) 
 **在兩個 hop 之間呼叫、與 `process_pre()`／`process_post()` 序列化；非 thread-safe。**
 
 > **不要繞過 `set_nr_mode()` 去呼叫 `mmse_lsa_set_mode()`。** 本核心的 NR 組態是
-> 「canonical 強度 preset **加上**自己的覆寫」（`broadband_threshold`、`L`、
-> `alpha_decay`）。`mmse_lsa_set_mode()` 組的是裸的 canonical preset，在本核心的
+> 「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`）。`mmse_lsa_set_mode()` 組的是裸的 canonical preset，在本核心的
 > 實例上會被**拒絕**（它的 `L` 不同）——所以 `four_aec_nr_res_set_nr_mode()` 做的
 > 事是重組本核心的完整組態，再交給 `mmse_lsa_reconfigure()`。
 

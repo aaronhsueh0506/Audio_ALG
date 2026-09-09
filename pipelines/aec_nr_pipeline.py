@@ -177,8 +177,8 @@ def _build_denoiser(sample_rate: int,
     lib/nr/c_impl/include/mmse_lsa_types.h and lib/nr/config/v3_2_config.yaml,
     which already agree with each other). Fixing that wiring gap also surfaces
     two more stale hardcoded values this file was carrying that have no
-    AEC-specific rationale anywhere in its history (unlike broadband_threshold/L
-    below, which do): alpha_xi 0.88->0.92 (this pipeline predates and never
+    AEC-specific rationale anywhere in its history (unlike L below, which
+    does): alpha_xi 0.88->0.92 (this pipeline predates and never
     picked up the 2026-07-10 musical-noise fix, shared across ALL strength
     presets in the real system -- this also closes the project's own
     long-flagged "AEC-YAML alpha_xi coupling untested" open question) and
@@ -191,14 +191,10 @@ def _build_denoiser(sample_rate: int,
     per this project's convention for NR numerical changes, treat this as
     needing a fresh 800-case bench pass before shipping.
 
-    Two -- and only two -- genuinely pipeline-specific structural overlays
-    remain on top of the canonical params, applied after apply_strength() so
-    they win regardless of preset (neither is part of NR's own strength/mode
-    axes, so there is nothing in the standalone system for them to diverge
-    from):
-      - broadband_threshold=0.8 (yaml=1.0, disabled): the broadband scene-reset
-        path is active here; on AEC residual signals this gives faster
-        adaptation after echo bursts.
+    One genuinely pipeline-specific structural overlay remains on top of the
+    canonical params, applied after apply_strength() so it wins regardless of
+    preset (it is not part of NR's own strength/mode axes, so there is nothing
+    in the standalone system for it to diverge from):
       - L=94 (see _NR_L_MINIMA_WINDOW): the MCRA minima-tracking window,
         investigated 2026-08-03. This pipeline's own L was authored as
         "150 x 10ms = 1.5s" (commit de16bce, back when NR ran a literal 10ms
@@ -226,6 +222,12 @@ def _build_denoiser(sample_rate: int,
         output either way. The "longer window improves stationarity
         estimation" rationale in the original commit only holds if/when
         `mcra_accept_external_spp=False` is also wired in.
+
+    broadband_threshold stays at the canonical 1.0 (scene-reset gate off), the
+    same value the C overlay inherits: with the denoiser's SPP gating the noise
+    update, the gate read the first speech after a silent stretch as a new
+    noise scene, and on the AEC blind corpus that cost near-end speech far more
+    than faster post-burst adaptation returned.
     """
     # When fft_size is explicitly selected (notably 512 at 16 kHz), infer the
     # matching frame/hop defaults from that grid instead of first resolving the
@@ -263,8 +265,7 @@ def _build_denoiser(sample_rate: int,
     params['strength'] = nr_preset  # retiming-provenance disambiguator; see docstring
     params['mode'] = 'full'         # no content-mode selection in this pipeline (empty overlay)
 
-    # The only two genuinely pipeline-specific overlays -- see docstring.
-    params['broadband_threshold'] = 0.8
+    # The only genuinely pipeline-specific overlay -- see docstring.
     params['L'] = _NR_L_MINIMA_WINDOW
 
     return MmseLsaDenoiser(**params)

@@ -478,8 +478,7 @@ live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、�
 > 原因（由 `4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c` 的 `test_runtime_strength()` 釘住）。
 
 > **NR：不要繞過 pipeline 的 setter 去呼叫 `mmse_lsa_set_mode()`。** 兩條 pipeline 的
-> NR 組態都是「canonical preset **加上**自己的覆寫」（`broadband_threshold`、`L`、
-> `alpha_decay`，見兩處的 `compose_nr_config()`）。`mmse_lsa_set_mode()` 組的是裸的
+> NR 組態都是「canonical preset **加上**自己的覆寫」（`L`、`alpha_decay`，見兩處的 `compose_nr_config()`）。`mmse_lsa_set_mode()` 組的是裸的
 > canonical preset，在這種實例上會被**拒絕**（它的 `L` 不同）——所以 pipeline 的
 > setter 做的事是重組完整組態再交給 `mmse_lsa_reconfigure()`。
 
