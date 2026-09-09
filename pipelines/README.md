@@ -7,8 +7,7 @@ mic/ref → linear AEC (aec_process_context(): context-only, no emit)
               ├─ E(f) ────────────────→ echo-aware NR ─→ G_nr ─┐
               └─ AecResContext {R², G_res, CNG, far power} ─────┤
                                                                 ↓
-                                  G_total = min(G_nr, G_res)
-                                  + near-end floor (enable_near_end_protect, default off) + CNG
+                                  G_total = min(G_nr, G_res) + CNG
                                                                 ↓
                                                        one iFFT/OLA
 
@@ -153,14 +152,14 @@ alternate 512/256 grid is included since it remains explicitly selectable.
 
 | Rate / Backend | AEC | FFT (OLA) | NR | Pipeline bufs | **Total** |
 |--------|-----|-----------|-----|---------------|-----------|
-| **8 kHz KISS** | 278,256 B | 8,784 B | 67,424 B | 5,696 B | **360,352 B (351.9 KB)** |
-| **8 kHz NE10** | 277,648 B | 8,176 B | 67,424 B | 5,696 B | **359,136 B (350.7 KB)** |
-| **16 kHz KISS (default, 256/128)** | 385,440 B | 8,784 B | 122,160 B | 5,696 B | **522,272 B (510.0 KB)** |
-| **16 kHz NE10 (default, 256/128)** | 384,832 B | 8,176 B | 122,160 B | 5,696 B | **521,056 B (508.8 KB)** |
-| **16 kHz KISS (alt, 512/256)** | 513,968 B | 16,976 B | 133,472 B | 11,328 B | **675,936 B (660.1 KB)** |
-| **16 kHz NE10 (alt, 512/256)** | 512,592 B | 15,600 B | 133,472 B | 11,328 B | **673,184 B (657.4 KB)** |
-| **48 kHz KISS** | 1,185,536 B | 33,360 B | 374,336 B | 22,592 B | **1,616,016 B (1,578.1 KB)** |
-| **48 kHz NE10** | 1,182,624 B | 30,448 B | 374,336 B | 22,592 B | **1,610,192 B (1,572.5 KB)** |
+| **8 kHz KISS** | 278,256 B | 8,784 B | 67,424 B | 5,168 B | **359,824 B (351.4 KB)** |
+| **8 kHz NE10** | 277,648 B | 8,176 B | 67,424 B | 5,168 B | **358,608 B (350.2 KB)** |
+| **16 kHz KISS (default, 256/128)** | 385,440 B | 8,784 B | 122,160 B | 5,168 B | **521,744 B (509.5 KB)** |
+| **16 kHz NE10 (default, 256/128)** | 384,832 B | 8,176 B | 122,160 B | 5,168 B | **520,528 B (508.3 KB)** |
+| **16 kHz KISS (alt, 512/256)** | 513,968 B | 16,976 B | 133,472 B | 10,288 B | **674,896 B (659.1 KB)** |
+| **16 kHz NE10 (alt, 512/256)** | 512,592 B | 15,600 B | 133,472 B | 10,288 B | **672,144 B (656.4 KB)** |
+| **48 kHz KISS** | 1,185,536 B | 33,360 B | 374,336 B | 20,528 B | **1,613,952 B (1,576.1 KB)** |
+| **48 kHz NE10** | 1,182,624 B | 30,448 B | 374,336 B | 20,528 B | **1,608,128 B (1,570.4 KB)** |
 
 The AEC column is owned by `lib/aec/docs/c_user_manual_zh_TW.md` §4 — re-measure from
 there rather than editing it here, and always prefer the value

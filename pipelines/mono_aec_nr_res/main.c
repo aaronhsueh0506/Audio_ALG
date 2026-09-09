@@ -11,9 +11,8 @@
  *            time output stays the linear residual (no suppression applied).
  *   Stage 2: echo-aware NR on E(f). MMSE-LSA gain G_nr(f) with R² folded into the
  *            noise floor (ξ = S²/(N²+R²), the unified Speex/Habets gain).
- *   Stage 3: external RES — g_total = min(G_nr, G_res), an optional per-bin,
- *            speech-conditional near-end floor lift (off by default), then S(f) = E(f)·g_total (+ comfort noise
- *            on the cut bins) and one sqrt-Hann OLA.
+ *   Stage 3: external RES — g_total = min(G_nr, G_res), then S(f) = E(f)·g_total
+ *            (+ comfort noise on the cut bins) and one sqrt-Hann OLA.
  *
  * All of the above now lives in audio_pipeline.c (audio_pipeline_process()) —
  * this file is arg parsing + WAV I/O + the `--debug` / `DUMP_CTX` diagnostics
@@ -22,14 +21,13 @@
  * caller-pool flavor of the same API).
  *
  * This mirrors run_aec_linear → run_nr_spectrum(inject_echo_psd) → run_res
- * (combine='min', speech_gate='nr_gain' with --near-end-protect). --legacy-amin
- * restores the prior min-only A_min_pl and, when combined with
- * --near-end-protect, its scalar ne_floor.
+ * (combine='min'). --legacy-amin restores the prior noise-only NR (no R²
+ * injection).
  *
  * Build:  make libs && make aec_nr_pipeline
  * Usage:
  *   ./aec_nr_pipeline <mic.wav> <ref.wav> <out.wav> [aec-preset]
- *                     [--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin] [--near-end-protect]
+ *                     [--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin]
  *                     [--debug]
  *
  * --debug: once per second of processed audio, print one compact status line
@@ -188,7 +186,7 @@ static uint32_t timing_now_us(void) {
 int main(int argc, char* argv[]) {
     if (argc < 4) {
         printf("Usage: %s <mic.wav> <ref.wav> <out.wav> [aec-preset] "
-               "[--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin] [--near-end-protect] "
+               "[--nr-preset mild|moderate|balanced|aggressive] [--aec-only] [--no-nr] [--no-res] [--legacy-amin] "
                "[--fft-size 256|512|1024] [--debug] [--timing]\n",
                argv[0]);
         return 1;
@@ -202,7 +200,6 @@ int main(int argc, char* argv[]) {
     MmseLsaNrMode nr_mode  = MMSE_LSA_NR_BALANCED;
     int           aec_only = 0;
     int           legacy   = 0;   /* --legacy-amin → prior min-only A_min_pl */
-    int           near_protect = 0; /* --near-end-protect → near-end floor lift */
     int           no_nr    = 0;   /* --no-nr → no denoiser, g_total is G_res */
     int           no_res   = 0;   /* --no-res → no residual gain, g_total is G_nr */
     int           no_cng   = 0;   /* --no-cng → disable comfort noise (parity) */
@@ -214,7 +211,6 @@ int main(int argc, char* argv[]) {
     for (int i = 4; i < argc; i++) {
         if      (strcmp(argv[i], "--aec-only") == 0)    aec_only = 1;
         else if (strcmp(argv[i], "--legacy-amin") == 0) legacy = 1;
-        else if (strcmp(argv[i], "--near-end-protect") == 0) near_protect = 1;
         else if (strcmp(argv[i], "--no-nr") == 0)       no_nr = 1;
         else if (strcmp(argv[i], "--no-res") == 0)      no_res = 1;
         else if (strcmp(argv[i], "--no-cng") == 0)      no_cng = 1;
@@ -256,7 +252,6 @@ int main(int argc, char* argv[]) {
     cfg.aec_only    = aec_only;
     cfg.enable_cng  = !no_cng;
     cfg.legacy_amin = legacy;
-    cfg.enable_near_end_protect = near_protect;
     cfg.enable_nr   = !no_nr;
     cfg.enable_res  = !no_res;
 

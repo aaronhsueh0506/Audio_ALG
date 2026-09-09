@@ -225,9 +225,9 @@
 
   <!-- RES block -->
   <rect x="755" y="80" width="120" height="100" rx="8" fill="#8b5cf6"/>
-  <text x="815" y="112" font-size="15" fill="white" text-anchor="middle" font-weight="700">RES floor</text>
-  <text x="815" y="131" font-size="11" fill="white" text-anchor="middle">近端保留</text>
-  <text x="815" y="148" font-size="11" fill="white" text-anchor="middle">ne_floor=0.4</text>
+  <text x="815" y="112" font-size="15" fill="white" text-anchor="middle" font-weight="700">gain fusion</text>
+  <text x="815" y="131" font-size="11" fill="white" text-anchor="middle">逐 bin 取小</text>
+  <text x="815" y="148" font-size="11" fill="white" text-anchor="middle">min(G_nr, G_res)</text>
   <text x="815" y="165" font-size="11" fill="white" text-anchor="middle">+ CNG</text>
 
   <!-- output -->
@@ -247,7 +247,7 @@
     <li>HPF <strong>只對 mic path</strong> 做；ref（far-end）<strong>不經 HPF</strong>（far-end HPF 預設 OFF，downstream Saturation / DelayEst 吃原始 ref）</li>
     <li>AEC 只做線性消除，輸出 <code>E(f)</code> + <code>AecResContext</code>（殘響回音功率 R²、res_gain、CNG、ERLE、DT 指標）</li>
     <li>NR 把 R² 折進雜訊地板：<code>ξ = S²/(N²+R²)</code>，用<strong>一個</strong> MMSE-LSA gain 同時壓雜訊＋殘響回音（無 re-FFT）</li>
-    <li>per-bin 近端保留 floor（<code>ne_floor=0.4</code>，gate <code>= res_gain·(1−R²/|E|²)</code>）在「沒有回音」的頻段把 gain 抬回 1.0 → 保住近端語音</li>
+    <li>gain fusion <code>g_total = min(G_nr, G_res)</code>：每個 bin 取兩個 gain 的較小者，沒有 near-end floor；comfort noise 只補 RES 切掉的 bin</li>
     <li>整路共享一次 sqrt-Hann FFT/OLA，三階段都是可替換的 freq-in/freq-out block（NN seam）</li>
   </ol>
 </div>

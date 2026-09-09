@@ -103,17 +103,9 @@ typedef struct {
                                    * (which fills only RES-cut bins) is skipped; both  *
                                    * 0 = the linear residual, synthesised              */
     int           enable_cng;    /* 1 = fill AEC-suppressed bins with comfort noise    */
-    int           legacy_amin;   /* 1 = prior min-only A_min_pl (--legacy-amin): NR    *
-                                   * gain computed WITHOUT folding R² into the noise    *
-                                   * floor; when near-end protect is also enabled, its   *
-                                   * strength is the prior fixed scalar 0.4 without the  *
-                                   * NR-gain speech condition                            */
-    int           enable_near_end_protect; /* 1 = per-bin near-end floor lift: blend  *
-                                   * g_total toward 1 in bins that are echo-free AND    *
-                                   * that the denoiser left speech-like (gain > 0.1),   *
-                                   * by 0.4, or 0.2 while the far end is active; noise  *
-                                   * bins keep the full NR depth.                       *
-                                   * 0 = apply min(G_nr, G_res) as computed (default)   */
+    int           legacy_amin;   /* 1 = prior min-only A_min_pl (--legacy-amin): the    *
+                                   * NR gain is computed WITHOUT folding R^2 into its   *
+                                   * noise floor. Comparison aid only; keep 0.         */
 } AudioPipelineConfig;
 
 /** Defaults: rate-default no-padding grid, balanced modes, full pipeline,
@@ -179,10 +171,10 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes,
 /**
  * Process exactly one hop (audio_pipeline_hop_size(p) samples) of mic/ref
  * into `out`. Verbatim port of the static CLI's per-hop while-loop body:
- * AEC(linear) -> echo-aware NR gain -> g_total=min(g_nr,g_res) -> far/near
- * gated near-end floor lift -> S(f)=E(f)*g_total (+ CNG on the cut bins) ->
- * irfft -> sqrt-Hann OLA. `aec_only` short-circuits to the raw linear AEC
- * residual (mirrors the CLI's `--aec-only`).
+ * AEC(linear) -> echo-aware NR gain -> g_total=min(g_nr,g_res) ->
+ * S(f)=E(f)*g_total (+ CNG on the cut bins) -> irfft -> sqrt-Hann OLA.
+ * `aec_only` short-circuits to the raw linear AEC residual (mirrors the
+ * CLI's `--aec-only`).
  *
  * `mic`/`ref` are read-only and only for the duration of this call (they are
  * copied into pool-owned scratch before use — see audio_pipeline.c); `out`
@@ -195,12 +187,12 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic,
                             const float* ref, float* out);
 
 /**
- * Re-zero all pipeline/AEC/NR state (OLA accumulator, comfort-noise RNG,
- * near-end-floor hangover counter, and each sub-module's own reset) without
- * touching the pool itself or re-validating cfg — equivalent to a fresh
- * audio_pipeline_init() on the SAME pool/cfg, but without the alignment/size
- * re-checks. Use after an echo-path change (speaker swap, AEC re-seat) or
- * between unrelated streams sharing one instance.
+ * Re-zero all pipeline/AEC/NR state (OLA accumulator, comfort-noise RNG, and
+ * each sub-module's own reset) without touching the pool itself or
+ * re-validating cfg — equivalent to a fresh audio_pipeline_init() on the
+ * SAME pool/cfg, but without the alignment/size re-checks. Use after an
+ * echo-path change (speaker swap, AEC re-seat) or between unrelated streams
+ * sharing one instance.
  */
 void audio_pipeline_reset(AudioPipeline* p);
 
@@ -349,11 +341,10 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
  *                all four, so its delay figure is the wrapper's own stage.
  *                Here it stays inside the single AEC -- same quantity,
  *                different owner.
- *   nr_us        mmse_lsa_process_gain() -- the noise-reduction gain.
- *   post_us      the gain arithmetic between the two: the r2/PSD_SCALE fold,
- *                min(G_nr, G_res), the |E|^2 hoist, the far-activity gate,
- *                the per-bin speech-conditional near-end lift, the spectral
- *                apply, and the comfort-noise loop.
+ *   nr_us        the noise-reduction gain: the r2/PSD_SCALE fold of the
+ *                residual-echo prior plus mmse_lsa_process_gain().
+ *   post_us      the gain arithmetic between the two: min(G_nr, G_res), the
+ *                spectral apply, and the comfort-noise loop.
  *   synth_us     inverse transform, windowed overlap-add, and the hop
  *                emit/shift.
  *

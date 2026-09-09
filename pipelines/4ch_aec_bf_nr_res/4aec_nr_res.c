@@ -45,16 +45,7 @@
 #define M_PI_F 3.14159265358979323846f
 #endif
 
-/* Same production NR/RES recipe names and values as audio_pipeline.c. */
-#define PROD_NE_FLOOR             0.4f
-#define PROD_NE_FLOOR_FAR_ACTIVE 0.2f
-#define PROD_FAR_GATE_THRESH      1e-4f
-/* Speech evidence for the near-end lift, read off the denoiser's own gain:
- * S = clip((G_nr - LO) / (HI - LO), 0, 1). LO is at or above every preset's
- * gain floor (mild's g_min is 0.1), so a bin parked at that floor contributes
- * no lift. */
-#define PROD_NE_SPEECH_GAIN_LO    0.1f
-#define PROD_NE_SPEECH_GAIN_HI    1.0f
+/* PSD scale and CNG RNG seed, same as audio_pipeline.c. */
 #define PSD_SCALE                 (32768.0f * 32768.0f)
 #define PIPELINE_RNG_SEED         0x9e3779b9u
 
@@ -384,7 +375,6 @@ static int derive_dims_and_configs(
     FOUR_CK_BOOL(enable_post);
     FOUR_CK_BOOL(enable_nr);
     FOUR_CK_BOOL(enable_res);
-    FOUR_CK_BOOL(enable_near_end_protect);
 
 #undef FOUR_CK_BOOL
 
@@ -810,7 +800,6 @@ FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     cfg.enable_post = 1;
     cfg.enable_res = 1;
     cfg.enable_nr = 1;
-    cfg.enable_near_end_protect = 0;
     cfg.enable_cng = 1;
     cfg.legacy_amin = 0;
     return cfg;
@@ -1733,8 +1722,7 @@ static int fuse_contexts(FourAecNrRes* p,
                          const Complex* trusted_beamformed_error,
                          int* all_converged,
                          float* max_dt,
-                         float* max_saturation,
-                         float* far_power) {
+                         float* max_saturation) {
     int n = p->n_freqs;
     int k;
     int ch;
@@ -1748,7 +1736,6 @@ static int fuse_contexts(FourAecNrRes* p,
      * all-zero weights before reaching here. */
     *max_dt = 0.0f;
     *max_saturation = 0.0f;
-    *far_power = base_far_power;
 
     if (trusted_beamformed_error) {
         if (!complex_vector_finite(trusted_beamformed_error, n)) return 0;
@@ -1827,7 +1814,7 @@ static int fuse_contexts(FourAecNrRes* p,
 }
 
 /* The shared post-beam RES: the power/reference preparation the suppression
- * gain depends on, then the gain itself. error_power is already current. */
+ * gain depends on, then the gain itself. */
 static const float* post_res_gain(FourAecNrRes* p,
                                   int all_converged,
                                   float max_dt,
@@ -1868,33 +1855,27 @@ static int run_post_res_and_nr(
     int all_converged,
     float max_dt,
     float max_saturation,
-    float far_power,
     const Complex* trusted_beamformed_error,
     float* out) {
     const float* res_gain;
     const float* nr_extra;
+    const float* nr_gain;
     const Complex* error =
         trusted_beamformed_error ? trusted_beamformed_error : p->fused_error;
     int n = p->n_freqs;
     int hop = p->hop_size;
     int fft = p->fft_size;
     int k;
-    float nf_eff;
     uint32_t t0, t1;
 
-    /* RES stage. error_power feeds the RES preparation, the lift's echo
-     * fraction and the denoiser's residual-echo prior alike, so both it and
-     * extra_noise are computed whether or not a suppressor exists. */
+    /* RES stage. error_power feeds only the RES preparation. */
     t0 = four_aec_nr_res_now_us();
-    four_aec_complex_mag2(p->error_power, error, n);
-    for (k = 0; k < n; ++k)
-        p->extra_noise[k] = p->fused_r2[k] / PSD_SCALE;
     if (p->post_sg_storage) {
+        four_aec_complex_mag2(p->error_power, error, n);
         res_gain = post_res_gain(p, all_converged, max_dt, max_saturation);
     } else {
         /* No suppressor: G_res reads as the unity vector, so min(G_nr, G_res)
-         * is the NR gain, the lift's no_echo term reduces to 1 - echo_fraction
-         * and CNG (which fills only RES-cut bins) is skipped. */
+         * is the NR gain and CNG (which fills only RES-cut bins) is skipped. */
         res_gain = p->unity_gain;
     }
     /* One stamp closes RES and opens NR: the two statements between them are
@@ -1905,7 +1886,14 @@ static int run_post_res_and_nr(
     if (!res_gain) return 0;
 
     if (p->cfg.enable_nr) {
-        nr_extra = p->cfg.legacy_amin ? NULL : p->extra_noise;
+        /* The denoiser's residual-echo prior, R^2 on the NR's power scale;
+         * legacy_amin hands it no prior, so the fill is skipped with it. */
+        nr_extra = NULL;
+        if (!p->cfg.legacy_amin) {
+            for (k = 0; k < n; ++k)
+                p->extra_noise[k] = p->fused_r2[k] / PSD_SCALE;
+            nr_extra = p->extra_noise;
+        }
         if (mmse_lsa_process_gain(
                 p->nr, error, nr_extra, NULL) != 0)
             return 0;
@@ -1914,61 +1902,14 @@ static int run_post_res_and_nr(
         p->last_timing.nr_us = 0;
     }
 
-    /* Gain fusion. A disabled source reads as the unity vector, so one loop
+    /* Gain fusion. A disabled source reads as the unity vector, so one min
      * serves every combination: min(1, G_res) is G_res and min(G_nr, 1) is
-     * G_nr. */
-    {
-        const float* nr_gain =
-            p->cfg.enable_nr ? mmse_lsa_get_gain(p->nr, NULL) : p->unity_gain;
-        for (k = 0; k < n; ++k)
-            p->total_gain[k] = fminf(nr_gain[k], res_gain[k]);
-
-        /* Near-end floor strength for this hop: PROD_NE_FLOOR, dropping to
-         * PROD_NE_FLOOR_FAR_ACTIVE while the far end is active (legacy_amin
-         * keeps the scalar). */
-        nf_eff = PROD_NE_FLOOR;
-        if (!p->cfg.legacy_amin && far_power > PROD_FAR_GATE_THRESH)
-            nf_eff = PROD_NE_FLOOR_FAR_ACTIVE;
-
-        /* Per-bin, speech-conditional near-end lift. It blends total_gain
-         * toward 1 by nf_eff, scaled by how echo-free the bin is (G_res times
-         * 1 - R^2/|E|^2) and by how speech-like the denoiser left it,
-         *   S = clip((G_nr - PROD_NE_SPEECH_GAIN_LO)
-         *            / (PROD_NE_SPEECH_GAIN_HI - PROD_NE_SPEECH_GAIN_LO), 0, 1).
-         * A bin the denoiser took down to its floor gets no lift and keeps the
-         * full NR depth; a bin it left near unity is held at the floor. The
-         * strength therefore never depends on a broadband level, so a loud
-         * background neither caps the denoiser nor makes the floor follow the
-         * far talker's rhythm. Without a denoiser nr_gain is the unity vector,
-         * S is exactly 1 and every echo-free bin is protected. */
-        if (p->cfg.enable_near_end_protect) {
-            for (k = 0; k < n; ++k) {
-                float echo_fraction =
-                    p->extra_noise[k] / (p->error_power[k] + 1e-12f);
-                float no_echo;
-                float lift;
-                float speech;
-                if (echo_fraction < 0.0f) echo_fraction = 0.0f;
-                if (echo_fraction > 1.0f) echo_fraction = 1.0f;
-                no_echo = res_gain[k] * (1.0f - echo_fraction);
-                lift = nf_eff * no_echo;
-                speech = 1.0f;
-                if (!p->cfg.legacy_amin) {
-                    speech = (nr_gain[k] - PROD_NE_SPEECH_GAIN_LO)
-                           / (PROD_NE_SPEECH_GAIN_HI - PROD_NE_SPEECH_GAIN_LO);
-                    if (speech < 0.0f) speech = 0.0f;
-                    if (speech > 1.0f) speech = 1.0f;
-                }
-                lift *= speech;
-                p->total_gain[k] =
-                    (1.0f - lift) * p->total_gain[k] + lift;
-            }
-        }
-    }
-    for (k = 0; k < n; ++k) {
-        p->output_spec[k].r = error[k].r * p->total_gain[k];
-        p->output_spec[k].i = error[k].i * p->total_gain[k];
-    }
+     * G_nr. sk_min_f32 is the mono twin's kernel: a non-finite gain
+     * propagates to the output finite gate instead of being masked the way
+     * fminf would mask it. */
+    nr_gain = p->cfg.enable_nr ? mmse_lsa_get_gain(p->nr, NULL) : p->unity_gain;
+    sk_min_f32(p->total_gain, nr_gain, res_gain, n);
+    sk_capply_gain_f32(p->output_spec, error, p->total_gain, n);
 
     if (p->cfg.enable_cng && p->post_sg_storage) {
         for (k = 1; k < n - 1; ++k) {
@@ -1990,8 +1931,8 @@ static int run_post_res_and_nr(
 
     /* Synthesis: inverse transform, windowed overlap-add, and the hop
      * emit/shift. The finite check after it is validation, not synthesis, and
-     * falls in the post-stage remainder along with the gain fusion, near-floor
-     * gate and comfort-noise loop above. */
+     * falls in the post-stage remainder along with the gain fusion and
+     * comfort-noise loop above. */
     t0 = four_aec_nr_res_now_us();
     fft_inverse(p->fft, p->output_spec, p->ifft_buffer);
     sk_wola_accumulate_f32(p->ola, p->ifft_buffer, p->synth_window, fft);
@@ -2015,7 +1956,6 @@ static int process_post_impl(
     int all_converged;
     float max_dt;
     float max_saturation;
-    float far_power;
     uint32_t t0;
 
     if (!p || p->destroyed || !token || !weights || !out ||
@@ -2038,14 +1978,14 @@ static int process_post_impl(
     if (!fuse_contexts(
             p, weights, trusted_beamformed_error,
             &all_converged, &max_dt,
-            &max_saturation, &far_power)) {
+            &max_saturation)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
     p->last_timing.fuse_us = four_aec_nr_res_now_us() - t0;
     if (!run_post_res_and_nr(
             p, all_converged, max_dt, max_saturation,
-            far_power, trusted_beamformed_error, out)) {
+            trusted_beamformed_error, out)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }

@@ -6,10 +6,8 @@ AEC-linear stage ONCE and then two suppression paths that differ ONLY in the NR
 stage, so the A/B is apples-to-apples:
 
     AEC+RES     : S(f) = E(f) · G_res             (AEC's own AEC3 residual-echo gain; no NR)
-    AEC+NR+RES  : S(f) = E(f) · min(G_nr, G_res)  (production far02_near; G_nr is the
+    AEC+NR+RES  : S(f) = E(f) · min(G_nr, G_res)  (production; G_nr is the
                   echo-aware unified gain ξ=S²/(N²+R²) by default — see --no-inject-echo-psd)
-
-both with the same ne_floor / ne_gate, so adding NR is the only change.
 
 Input WAV channels (2- or 3-channel, single file):
     ch0 = mic    — near-end mic (echo + near speech + noise)
@@ -21,30 +19,20 @@ Input WAV channels (2- or 3-channel, single file):
 Outputs (next to the input, or under --out-prefix):
     <prefix>_aec.wav                  — AEC linear only (no RES, no NR)  [reference]
     <prefix>_aec_res.wav              — AEC + RES
-    <prefix>_aec_nr_res.wav           — AEC + NR + RES  (production, ne_floor on)
-    <prefix>_aec_nr_res_unmasked.wav  — AEC + NR + RES with ne_floor=0 (NR at FULL
-                                        strength; skip with --no-unmasked)
+    <prefix>_aec_nr_res.wav           — AEC + NR + RES  (production)
     <prefix>_aec_nr_res_nocng.wav     — AEC + NR + RES with comfort noise OFF
                                         (only with --cng-ab; A/B the CNG fill that
                                         refills the echo-cancelled bins)
     <prefix>_near_clean.wav           — ch2 passthrough (only if 3-channel input)
 
 It also prints an NR-contribution diagnostic (how often / how hard G_nr cuts past
-G_res, and how many dB the ne_floor lift claws NR back). With --dnsmos it scores the
-outputs with DNSMOS (BAK = the NR noise-cleanup score AECMOS is blind to).
-
-Why NR can look weak: the production gain is min(G_nr, G_res) and a near-end floor
-(ne_floor=0.4) lifts the gain back toward 1.0 in low-echo bins — exactly where NR
-works — so NR's -15 dB floor becomes ~-6 dB. The _unmasked output (ne_floor=0) shows
-the unclawed NR. Both limits are the shipped A_min_pl operating point, not a bug:
-min hands echo bins to RES; ne_floor protects near-end speech (and, unavoidably,
-near-end noise too). Compare _aec_res vs _aec_nr_res vs _aec_nr_res_unmasked.
+G_res). Compare _aec_res vs _aec_nr_res.
 
 Usage:
     cd Audio_ALG
     python3 pipelines/tools/compare_res_vs_nr.py input_3ch.wav --dnsmos
     python3 pipelines/tools/compare_res_vs_nr.py input.wav --out-prefix /tmp/cmp --preset balanced
-    python3 pipelines/tools/compare_res_vs_nr.py input.wav --ne-floor 0.4 --ne-gate both --nr-preset balanced
+    python3 pipelines/tools/compare_res_vs_nr.py input.wav --nr-preset balanced
     python3 pipelines/tools/compare_res_vs_nr.py input.wav --cng-ab --dnsmos   # A/B comfort noise on vs off
 
 Note: uses whatever AEC is checked out in lib/aec. To test the v3.24.0 round-robin
@@ -64,7 +52,7 @@ sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python'))
 
 from pipelines.aec_nr_pipeline import (                       # noqa: E402
     run_aec_linear, run_nr_spectrum, run_res,
-    PROD_INJECT_ECHO_PSD, PROD_NE_FLOOR_FAR_ACTIVE,
+    PROD_INJECT_ECHO_PSD,
 )
 from lib.aec.python.aec import AecConfig, AecMode, AecPreset  # noqa: E402
 
@@ -91,8 +79,8 @@ def _nr_contribution(contexts, nr_gains):
 
     Returns None if the AEC was built without the freq seam (no res_gain). The
     final gain is min(G_nr, G_res), so NR only 'bites' where G_nr < G_res. We
-    also scope NR's territory to low-echo bins (echo_frac<0.1) — mirroring
-    run_res's echo_frac = (r2/psd) / |E|^2 — since that is where NR does its
+    also scope NR's territory to low-echo bins, echo_frac = (r2/psd) / |E|^2
+    < 0.1 (this diagnostic's own definition), since that is where NR does its
     stationary-noise reduction (echo bins are owned by G_res).
     """
     psd_scale = 32768.0 ** 2
@@ -178,20 +166,13 @@ def main():
                     choices=['mild', 'balanced', 'aggressive'],
                     help='NR strength preset (mild/balanced/aggressive; '
                          'g_min = -10/-15/-20 dB). Only affects the +NR path.')
-    ap.add_argument('--ne-floor', type=float, default=0.4,
-                    help='near-end preservation floor strength, applied to BOTH paths (0=off)')
-    ap.add_argument('--ne-gate', default='both',
-                    choices=['r2', 'resgain', 'both', 'both_sharp'])
     ap.add_argument('--combine', default='min', choices=['min', 'product'],
                     help='G_nr/G_res combine for the +NR path (default: min = A_min_pl)')
-    ap.add_argument('--ne-floor-far-active', type=float, default=PROD_NE_FLOOR_FAR_ACTIVE,
-                    help='near-end floor when the far end is ACTIVE (FS/DT); '
-                         'production far02_near = 0.2 (applied to the +NR path)')
     inj = ap.add_mutually_exclusive_group()
     inj.add_argument('--inject-echo-psd', dest='inject_echo_psd', action='store_true',
                      default=PROD_INJECT_ECHO_PSD,
                      help='echo-aware NR: fold residual-echo R² into the NR floor '
-                          '(ξ=S²/(N²+R²), production far02_near; default ON)')
+                          '(ξ=S²/(N²+R²), production default ON)')
     inj.add_argument('--no-inject-echo-psd', dest='inject_echo_psd', action='store_false',
                      help='plain noise-only NR (old A_min_pl) for A/B vs the unified gain')
     ap.add_argument('--no-cng', action='store_true',
@@ -201,8 +182,6 @@ def main():
                          'comfort noise OFF, so you can A/B the CNG fill on the '
                          'echo-cancelled bins (run WITHOUT --no-cng so the main output '
                          'keeps CNG to compare against)')
-    ap.add_argument('--no-unmasked', action='store_true',
-                    help='skip the ne_floor=0 NR-unmasked output')
     ap.add_argument('--dnsmos', action='store_true',
                     help='score outputs with DNSMOS (BAK = NR noise-cleanup score '
                          'AECMOS is blind to; needs speechmos+onnxruntime)')
@@ -231,8 +210,7 @@ def main():
     print("AEC+RES vs AEC+NR+RES comparison")
     print("================================")
     print(f"Input:   {args.input}  ({len(mic)} samples, {len(mic)/sr:.2f}s, {sr} Hz, {n_ch}ch)")
-    print(f"Preset:  aec={args.preset} nr={args.nr_preset}   "
-          f"ne_floor={args.ne_floor}/{args.ne_floor_far_active}(far-active) gate={args.ne_gate} "
+    print(f"Preset:  aec={args.preset} nr={args.nr_preset} "
           f"combine={args.combine} inject_echo_psd={args.inject_echo_psd} cng={enable_cng}"
           f"{' (+CNG A/B)' if args.cng_ab else ''}")
     print(f"near-clean ref: {'present (ch2)' if near_clean is not None else 'absent'}")
@@ -249,8 +227,7 @@ def main():
     dummy_gains = np.ones((len(contexts), _N_FREQS), dtype=np.float32)
     out_aec_res = run_res(
         np.zeros(len(mic), dtype=np.float32), dummy_gains, contexts, cfg_res,
-        use_nr=False, use_res=True,
-        ne_floor=args.ne_floor, ne_gate=args.ne_gate)
+        use_nr=False, use_res=True)
 
     # ---- Path B: AEC + NR + RES (production) ----
     tag = ' [echo-aware ξ=S²/(N²+R²)]' if args.inject_echo_psd else ' [plain noise-only NR]'
@@ -259,21 +236,10 @@ def main():
                                inject_echo_psd=args.inject_echo_psd)
     out_aec_nr_res = run_res(
         np.zeros(len(mic), dtype=np.float32), nr_gains, contexts, cfg_res,
-        use_nr=True, use_res=True, combine=args.combine,
-        ne_floor=args.ne_floor, ne_gate=args.ne_gate,
-        ne_floor_far_active=args.ne_floor_far_active)
-
-    # ---- Path B' : same, but ne_floor=0 → NR at full strength (unmasked) ----
-    out_unmasked = None
-    if not args.no_unmasked:
-        print("Stage 2c: AEC+NR+RES UNMASKED  (ne_floor=0 → NR at full strength)...")
-        out_unmasked = run_res(
-            np.zeros(len(mic), dtype=np.float32), nr_gains, contexts, cfg_res,
-            use_nr=True, use_res=True, combine=args.combine,
-            ne_floor=0.0, ne_gate=args.ne_gate, ne_floor_far_active=None)
+        use_nr=True, use_res=True, combine=args.combine)
 
     # ---- Path B'' : production B but comfort noise OFF (CNG A/B) ----
-    # Same gains/ne_floor as the main output — the ONLY difference is enable_cng,
+    # Same gains as the main output — the ONLY difference is enable_cng,
     # so _aec_nr_res.wav (CNG on) vs _aec_nr_res_nocng.wav isolates the comfort
     # noise that refills the echo-cancelled bins (noise_gain = sqrt(1 - g_res²)).
     out_nocng = None
@@ -282,9 +248,7 @@ def main():
         cfg_res_nocng = _build_cfg(sr, args.preset, False, False)
         out_nocng = run_res(
             np.zeros(len(mic), dtype=np.float32), nr_gains, contexts, cfg_res_nocng,
-            use_nr=True, use_res=True, combine=args.combine,
-            ne_floor=args.ne_floor, ne_gate=args.ne_gate,
-            ne_floor_far_active=args.ne_floor_far_active)
+            use_nr=True, use_res=True, combine=args.combine)
 
     # ---- Write outputs ----
     def _rms(x):
@@ -295,8 +259,6 @@ def main():
         ('_aec_res.wav', out_aec_res, 'AEC+RES'),
         ('_aec_nr_res.wav', out_aec_nr_res, 'AEC+NR+RES'),
     ]
-    if out_unmasked is not None:
-        outs.append(('_aec_nr_res_unmasked.wav', out_unmasked, 'AEC+NR+RES (ne_floor=0)'))
     if out_nocng is not None:
         outs.append(('_aec_nr_res_nocng.wav', out_nocng, 'AEC+NR+RES (CNG off)'))
     if near_clean is not None:
@@ -321,10 +283,6 @@ def main():
               f"avg {diag['extra_db_low']:+.1f} dB  (low-echo = {diag['frac_low']*100:.0f}% of all bins)")
     net_db = 20.0 * np.log10(_rms(out_aec_nr_res) / _rms(out_aec_res))
     print(f"  net NR effect (full-signal):  {net_db:+.2f} dB   (AEC+NR+RES vs AEC+RES)")
-    if out_unmasked is not None:
-        claw_db = 20.0 * np.log10(_rms(out_aec_nr_res) / _rms(out_unmasked))
-        print(f"  ne_floor={args.ne_floor:g} claw-back:       {claw_db:+.2f} dB  "
-              f"(AEC+NR+RES louder than ne_floor=0 → NR suppression the floor lifted back)")
     if out_nocng is not None:
         if enable_cng:
             n = min(len(out_aec_nr_res), len(out_nocng))
@@ -345,14 +303,11 @@ def main():
     if args.dnsmos:
         named = [('AEC linear', aec_linear), ('AEC+RES', out_aec_res),
                  ('AEC+NR+RES', out_aec_nr_res)]
-        if out_unmasked is not None:
-            named.append(('AEC+NR+RES unmasked', out_unmasked))
         if out_nocng is not None:
             named.append(('AEC+NR+RES CNG off', out_nocng))
         _run_dnsmos(named, sr)
 
-    print("\nDone. Compare _aec_res.wav vs _aec_nr_res.wav (ne_floor) vs "
-          "_aec_nr_res_unmasked.wav (ne_floor=0).")
+    print("\nDone. Compare _aec_res.wav vs _aec_nr_res.wav.")
 
 
 if __name__ == '__main__':

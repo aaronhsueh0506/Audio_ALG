@@ -484,14 +484,6 @@ static void test_invalid_configs(void) {
           "a non-boolean NR enable is rejected by create and sizing");
 
     cfg = four_aec_nr_res_default_config(16000);
-    CHECK(cfg.enable_near_end_protect == 0,
-          "the default config leaves the near-end floor lift off");
-    cfg.enable_near_end_protect = 2;
-    CHECK(four_aec_nr_res_create(&cfg) == NULL &&
-          four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0,
-          "a non-boolean near-end protect is rejected by create and sizing");
-
-    cfg = four_aec_nr_res_default_config(16000);
     CHECK(cfg.enable_res == 1, "the default config keeps the post RES on");
     cfg.enable_res = 2;
     CHECK(four_aec_nr_res_create(&cfg) == NULL &&
@@ -814,13 +806,13 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * build_flags_hash still matches and this counter is the whole signal.
      * Bump this literal with FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 16u;
+    stale.layout_version = 17u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 17u,
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 18u,
           "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(
@@ -3208,110 +3200,6 @@ static void test_nr_bypass_output_identity(void) {
     four_aec_nr_res_destroy(off);
 }
 
-/* The near-end floor lift is per bin and speech-conditional, which gives it
- * two witnesses on a silent far end. On stationary noise alone the denoiser
- * takes every bin to its floor, the speech term is 0 everywhere and the lift
- * must change nothing: protect-on equals protect-off to within rounding. When
- * that noise is raised 9.5 dB for 160 ms every 400 ms -- speech-like in the
- * one way that matters, the denoiser leaves the burst bins well above its
- * floor and its noise tracker does not absorb them -- the lift holds those
- * bins up, so protect-on carries more energy than protect-off. Together they pin both
- * halves of the recipe: a lift that ignored the speech term fails the first
- * (it would floor the noise at 0.4), a lift that never fired fails the
- * second. CNG is off in both so the ratios measure the gains alone. */
-static int protect_pair_energy(int with_bursts, int legacy_amin,
-                               double* e_on, double* e_off) {
-    FourAecNrResConfig on_cfg = four_aec_nr_res_default_config(16000);
-    FourAecNrResConfig off_cfg;
-    FourAecNrRes* on;
-    FourAecNrRes* off;
-    FourAecNrResPreFrame pre_on, pre_off;
-    float *mics, *far, *out_on, *out_off;
-    Complex* w;
-    uint32_t rng = 777u;
-    int hop = 0, n = 0, settle_hops = 0, total_hops = 0, h = 0, i, ch, k;
-    int ok;
-
-    on_cfg.enable_cng = 0;
-    on_cfg.enable_near_end_protect = 1;
-    on_cfg.legacy_amin = legacy_amin;
-    off_cfg = on_cfg;
-    off_cfg.enable_near_end_protect = 0;
-    on = four_aec_nr_res_create(&on_cfg);
-    off = four_aec_nr_res_create(&off_cfg);
-    if (on) {
-        hop = four_aec_nr_res_hop_size(on);
-        n = four_aec_nr_res_n_freqs(on);
-        settle_hops = mmse_lsa_retime_frames(20, 16000, hop) + 300;
-        total_hops = settle_hops + 200;
-    }
-    mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
-    far = (float*)calloc((size_t)hop, sizeof(float));
-    out_on = (float*)calloc((size_t)hop, sizeof(float));
-    out_off = (float*)calloc((size_t)hop, sizeof(float));
-    w = (Complex*)calloc(
-        (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n, sizeof(Complex));
-    ok = on && off && mics && far && out_on && out_off && w;
-    *e_on = 0.0; *e_off = 0.0;
-    for (k = 0; ok && k < n; ++k) w[k].r = 1.0f;
-    for (h = 0; ok && h < total_hops; ++h) {
-        /* 160 ms bursts every 400 ms: on long enough for the denoiser to see
-         * speech-like energy, off long enough that they never become the
-         * tracked noise floor. */
-        float level = (with_bursts && (h % 50) < 20) ? 0.15f : 0.05f;
-        for (i = 0; i < hop; ++i) {
-            float noise;
-            rng = rng * 1664525u + 1013904223u;
-            noise = level * ((float)((rng >> 8) & 0xFFFFu) / 32768.0f - 1.0f);
-            for (ch = 0; ch < 4; ++ch)
-                mics[(size_t)i * 4u + (size_t)ch] = noise;
-        }
-        if (four_aec_nr_res_process_pre(on, mics, far, &pre_on) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_pre(off, mics, far, &pre_off) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(on, &pre_on.token, w, out_on) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(off, &pre_off.token, w, out_off) !=
-                FOUR_AEC_NR_RES_OK) { ok = 0; break; }
-        if (h >= settle_hops)
-            for (i = 0; i < hop; ++i) {
-                *e_on += (double)out_on[i] * out_on[i];
-                *e_off += (double)out_off[i] * out_off[i];
-            }
-    }
-    free(mics); free(far); free(out_on); free(out_off); free(w);
-    four_aec_nr_res_destroy(on);
-    four_aec_nr_res_destroy(off);
-    return ok;
-}
-
-static void test_near_end_protect_switch(void) {
-    double noise_on, noise_off, burst_on, burst_off;
-    double legacy_on, legacy_off;
-    CHECK(protect_pair_energy(0, 0, &noise_on, &noise_off) &&
-          protect_pair_energy(1, 0, &burst_on, &burst_off) &&
-          protect_pair_energy(0, 1, &legacy_on, &legacy_off),
-          "protect-on and protect-off cores process both stimuli");
-    if (noise_off <= 0.0 || burst_off <= 0.0) {
-        CHECK(0, "both stimuli carry signal");
-        return;
-    }
-    printf("  near-end protect: energy on/off  noise-only=%.4f  noise+bursts=%.4f\n",
-           noise_on / noise_off, burst_on / burst_off);
-    CHECK(noise_on >= 0.999 * noise_off,
-          "the lift can only raise a gain, never lower one");
-    CHECK(noise_on <= 1.12 * noise_off,
-          "on stationary noise the speech term is 0 and the lift changes "
-          "nothing -- the background keeps the full NR depth");
-    CHECK(burst_on >= 1.15 * burst_off,
-          "speech-like bursts are held up by the lift, so it is load-bearing "
-          "where the denoiser left the signal above its floor");
-    CHECK(legacy_on >= 1.15 * legacy_off,
-          "legacy A_min restores the prior scalar floor without the NR-gain "
-          "speech condition when protection is enabled");
-}
-
 /* With RES, NR and CNG all disabled the post path has no gain source left,
  * so the core must be a transparent synthesis of the beamformed linear
  * error. That is checkable from outside: with identity weights on lane 0
@@ -3969,7 +3857,6 @@ int main(void) {
     test_runtime_strength();
     test_nr_bypass();
     test_nr_bypass_output_identity();
-    test_near_end_protect_switch();
     test_res_bypass_passthrough();
     test_stage_timing();
     test_comfort_noise_contract();

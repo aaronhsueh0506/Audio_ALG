@@ -39,7 +39,7 @@ def process_case(mic_path, lpb_path, out_path, preset, fl, nr_preset):
         sample_rate=sr, mode=AecMode.PBFDKF,
         filter_length=fl, enable_res=True, enable_cng=True)
     final_out = run_res(nr_out, nr_gains, contexts, config_res,
-                        use_res=True, combine='min', ne_floor=0.4, ne_gate='both')
+                        use_res=True, combine='min')
 
     sf.write(out_path, final_out, sr)
     return out_path

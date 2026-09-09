@@ -92,7 +92,6 @@ mic/ref
        -> E(f) + AecResContext { G_res, R², CNG N², far_power }
   -> echo-aware MMSE-LSA：以 E(f) 與 R² 計算 G_nr
   -> G_total = min(G_nr, G_res)
-  -> near-end floor lift（選配，enable_near_end_protect=1：逐 bin，強度 = far gate × 無 echo 程度 × NR 語音證據）
   -> S(f) = E(f) * G_total + optional CNG
   -> iFFT + sqrt-Hann OLA
   -> output hop
@@ -103,7 +102,7 @@ mic/ref
 1. AEC 設 `enable_res=0`，讓 time output 保持 linear residual；同時設 `return_res_context=1`，仍由 AEC3 post block 計算 frequency seam（此組態下 formed seam 另有 capture 候選，`ctx.error_spec` 不保證每個 hop 都是誤差，見 [AEC C 使用手冊](../lib/aec/docs/c_user_manual_zh_TW.md) §8.1）。
 2. `R²` 除以 `32768²` 後，作為 NR 的 `extra_noise_psd`，得到 echo-aware `G_nr`。
 3. `G_nr` 與 AEC3 `G_res` 逐 bin 取較小值，不重複跑另一個時域 RES。
-4. near-end floor 是選配（`enable_near_end_protect`，預設 `0`）。開啟時**逐 bin** 把 `g_total` 往 1 混合，強度 = `nf_eff × G_res × (1 − R²/|E|²) × S_k`：`nf_eff` 在遠端靜音時 0.4、遠端活動時 0.2；`G_res × (1 − R²/|E|²)` 讓 echo bin 不被拉；`S_k = clip((G_nr,k − 0.1) / 0.9, 0, 1)` 是 NR 自己對這個 bin 的語音證據，被 NR 壓到底的噪聲 bin 拿不到 lift、NR 留在 1 附近的語音 bin 才會被保護。強度不依賴任何廣帶能量門檻，所以環境噪聲大也不會把 NR 壓住或讓噪聲底跟著遠端起伏。預設關閉時 `g_total` 直接取 `min(G_nr, G_res)`。
+4. `g_total` 直接取 `min(G_nr, G_res)`。post 段沒有 near-end floor，也沒有任何依賴廣帶能量的 lift；一個 bin 是否被保留，完全由 NR 自己的 speech-presence 模型與 AEC3 的 `G_res` 決定，所以環境噪聲大也不會把 NR 壓住或讓噪聲底跟著遠端起伏。
 5. CNG 只依 `G_res` 填回 AEC 抑制留下的頻譜空洞，不把 NR 剛去除的背景噪聲重新灌回。
 
 ## 3. 取得 submodule 與建置
@@ -170,11 +169,8 @@ AEC library 本身使用 `-ffp-contract=off` 建置；若 application 內重做�
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --no-nr
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --no-res
 
-# 開啟 near-end floor lift（改版前的預設行為）
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --near-end-protect
-
-# 使用舊版 min-only 行為：NR 不注入 R²，near-end floor 改回 scalar（需與 --near-end-protect 併用才有作用）
-./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --near-end-protect --legacy-amin
+# 使用舊版 noise-only NR（不注入 R²）；只作比對用
+./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --legacy-amin
 
 # 不加入 comfort noise
 ./pipelines/aec_nr_pipeline mic.wav ref.wav out.wav balanced --no-cng
@@ -242,11 +238,6 @@ DUMP_CTX=/tmp/pipeline_ctx.bin \
 #endif
 
 #define PSD_SCALE                 (32768.0f * 32768.0f)
-#define PROD_NE_FLOOR             0.4f
-#define PROD_NE_FLOOR_FAR_ACTIVE  0.2f
-#define PROD_FAR_GATE_THRESH      1e-4f
-#define PROD_NE_SPEECH_GAIN_LO    0.1f
-#define PROD_NE_SPEECH_GAIN_HI    1.0f
 
 typedef struct {
     Aec *aec;
@@ -382,7 +373,6 @@ int audio_alg_process(AudioAlgPipeline *p,
 {
     AecResContext ctx;
     int k;
-    float nf_eff;
 
     if (!p || !p->aec_ready || !p->nr || !mic || !ref || !out)
         return -1;
@@ -403,36 +393,6 @@ int audio_alg_process(AudioAlgPipeline *p,
         p->g_aec[k] = ctx.res_gain[k];
         p->g_total[k] = p->g_nr[k] < ctx.res_gain[k]
                       ? p->g_nr[k] : ctx.res_gain[k];
-    }
-
-    /* 以下只在 enable_near_end_protect = 1 時執行；預設 0 時 g_total 維持
-     * min(G_nr, G_res)。nf_eff 只看遠端活動：靜音 0.4、活動 0.2。 */
-    nf_eff = ctx.far_power > PROD_FAR_GATE_THRESH
-           ? PROD_NE_FLOOR_FAR_ACTIVE : PROD_NE_FLOOR;
-
-    if (ctx.r2) {
-        for (k = 0; k < p->n_freqs; ++k) {
-            float re = ctx.error_spec[k].r;
-            float im = ctx.error_spec[k].i;
-            float e2 = re * re + im * im;
-            float r2 = ctx.r2[k] / PSD_SCALE;
-            float echo_frac = r2 / (e2 + 1e-12f);
-            float no_echo;
-            float lift;
-            float speech;
-
-            if (echo_frac < 0.0f) echo_frac = 0.0f;
-            if (echo_frac > 1.0f) echo_frac = 1.0f;
-            no_echo = ctx.res_gain[k] * (1.0f - echo_frac);
-            lift = nf_eff * no_echo;
-            /* NR 自己對這個 bin 的語音證據：被壓到底的 bin 不拉，留在 1 附近的才保護 */
-            speech = (p->g_nr[k] - PROD_NE_SPEECH_GAIN_LO)
-                   / (PROD_NE_SPEECH_GAIN_HI - PROD_NE_SPEECH_GAIN_LO);
-            if (speech < 0.0f) speech = 0.0f;
-            if (speech > 1.0f) speech = 1.0f;
-            lift *= speech;
-            p->g_total[k] = (1.0f - lift) * p->g_total[k] + lift;
-        }
     }
 
     for (k = 0; k < p->n_freqs; ++k) {
@@ -541,7 +501,7 @@ NR preset（`--nr-preset`，見 §4.1）：
 
 Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`alpha_attack=0.3`、`alpha_decay=alpha_g`，這是針對 AEC residual signal 的結構性 tuning；不要直接用 standalone NR 的所有預設取代。
 
-若要改 `PROD_NE_FLOOR`、far/near threshold、CNG 或 gain combine，這已不是單純 API integration，而是演算法 operating point 變更，應重新跑 far-end-only、near-end-only、double-talk、movement 與 noisy cases。`enable_near_end_protect` 的兩個值都屬於已量測的 operating point：在 −31 dBFS 站噪錄音上，`0`（預設）與 `1`（逐 bin 語音條件）的 noise-only 都比舊的 hop 級 floor 多降 15 dB，語音主導 bin 的 gain 兩者相差 0.4 dB 以內；`1` 多保住 5 到 10 dB local SNR 的過渡 bin 約 1 dB。
+若要改 CNG 或 gain combine（例如在 `min(G_nr, G_res)` 之外再加任何 floor），這已不是單純 API integration，而是演算法 operating point 變更，應重新跑 far-end-only、near-end-only、double-talk、movement 與 noisy cases。
 
 ## 8. Lifecycle 與 thread safety
 
@@ -563,7 +523,7 @@ Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`
 | build 找不到 library | 未初始化 submodule 或未跑 `make ... libs` | `git submodule update --init --recursive` 後重建 |
 | mic/ref 無法處理 | sample rate 不一致或 WAV format 不支援 | 先轉成同步、同 SR 的 PCM16/float32 mono 測試 |
 | 回聲未消除 | ref routing／delay／AEC 尚未 convergence | 先用 `--aec-only` 隔離 AEC 問題 |
-| AEC-only 正常，完整 pipeline 傷近端 | NR preset 或 near floor path | 先改 mild；再 A/B `--near-end-protect`（預設關） |
+| AEC-only 正常，完整 pipeline 傷近端 | NR preset 或 RES gain | 先改 mild；再用 `--no-nr` / `--no-res` 隔離是哪個 gain 來源 |
 | 背景噪聲殘留 | NR 還在 init 或 preset 太保守 | 確認開頭噪聲段，逐級試 balanced/aggressive |
 | 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`，不要以 NR gain 驅動 CNG |
 | 不同檔案結果互相影響 | state 未 reset | 每個獨立 stream reset 或重建全部 instance |

@@ -160,8 +160,16 @@ extern "C" {
  *      output differs. With enable_res = 0 the post SG storage leaves the
  *      carve, and with either enable_res or enable_nr at 0 an n-float unity
  *      gain vector joins it, so the set of possible carves changed too. C
- *      struct-ABI change as well: rebuild callers against this header. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 17u
+ *      struct-ABI change as well: rebuild callers against this header.
+ *
+ *  18: FourAecNrResConfig lost enable_near_end_protect, and the post path
+ *      lost the near-end floor lift with it: total_gain is min(G_nr, G_res)
+ *      as computed, with no state of its own. The carve is unchanged, so the
+ *      byte count cannot signal this; the embedded config shrank (C struct
+ *      ABI), every field after it in a wrapper's control block moved, and the
+ *      lifted post path a version-17 config could select no longer exists.
+ *      The default output is unchanged: the lift was off by default. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 18u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -289,13 +297,6 @@ typedef struct FourAecNrResConfig {
                                     * gain alone and CNG has nothing to fill  */
     int enable_nr;                /* bool: run shared MMSE-LSA; when 0, the
                                     * post path remains RES+CNG+iFFT/WOLA */
-    int enable_near_end_protect;  /* bool: per-bin near-end floor lift. 1
-                                    * blends total_gain toward 1 in bins that
-                                    * are echo-free (per RES and R^2) AND that
-                                    * the denoiser left speech-like (its gain
-                                    * above 0.1), by 0.4, or 0.2 while the far
-                                    * end is active; noise bins keep the full
-                                    * NR depth. 0 = min(G_nr, G_res) as is  */
     int enable_cng;               /* bool                                   */
     int legacy_amin;              /* bool: do not fold R2 into NR prior      */
 } FourAecNrResConfig;
@@ -835,7 +836,8 @@ int four_aec_nr_res_get_mem_breakdown(
  *                four lane contexts into one.
  *   res_us       the residual-echo suppression gain: the error/near power
  *                preparation it consumes plus suppression_gain_get_gain().
- *   nr_us        mmse_lsa_process_gain() -- the noise-reduction gain.
+ *   nr_us        the noise-reduction gain: the residual-echo prior it
+ *                consumes plus mmse_lsa_process_gain().
  *   synth_us     inverse transform, windowed overlap-add, and the hop
  *                emit/shift.
  *
@@ -852,8 +854,8 @@ int four_aec_nr_res_get_mem_breakdown(
  * The stages do not add up to the enclosing call: a caller presenting a full
  * breakdown must carry the remainder explicitly. The pre-side remainder holds
  * align_render(), the realign sweep, the de-interleave and input validation;
- * the post-side remainder holds the gain fusion, near-floor gate and
- * comfort-noise loop that sit between the timed calls.
+ * the post-side remainder holds the gain fusion and comfort-noise loop that
+ * sit between the timed calls.
  *
  * RESOLUTION. Microseconds, so a stage faster than 1 us reads 0. On the
  * development host clock_getres(CLOCK_MONOTONIC) is itself 1 us (measured),

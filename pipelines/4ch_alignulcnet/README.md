@@ -57,8 +57,8 @@ Removed with it: the beam WOLA carves (`ifft`, `ola`, `synth_win`,
 one-hop far compensation buffer, and the C API entry point
 `audio_pipeline_4ch_ulcnet_last_beamformed_error()` — there is no
 reconstructed beam hop to hand out any more. The layout version
-(`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION`) is **18**; a persisted
-version-16 descriptor is refused by
+(`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION`) is **19**; a persisted
+descriptor from any earlier version is refused by
 `audio_pipeline_4ch_ulcnet_init_ex()`.
 
 Spectrogram-consistency note: `gsc_spectrum` is per-bin weighted, i.e. an

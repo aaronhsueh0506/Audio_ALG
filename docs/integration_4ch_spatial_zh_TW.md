@@ -307,7 +307,6 @@ AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
 | `core.enable_res` | `int`（bool） | `1` | `0` 或 `1` | `0` = 不建 post-beam RES，只留 NR／iFFT／WOLA（CNG 略過）；與 `enable_nr` 都 `0` 即 beamform 後線性誤差直通 |
 | `core.enable_cng` | `int`（bool） | `1` | `0` 或 `1` | — |
 | `core.legacy_amin` | `int`（bool） | `0` | `0` 或 `1` | 新整合保持 `0` |
-| `core.enable_near_end_protect` | `int`（bool） | `0` | `0` 或 `1` | `1` = 逐 bin、以 NR 語音證據為條件的 near-end floor lift；兩個值下噪聲 bin 都保有完整 NR 深度 |
 
 > Quarantine 窗只對「連續符合條件的 backward episode」有界。候選轉為
 > forward／無效、confidence 中斷，或 proxy lane 的 cancellation 證據消失時

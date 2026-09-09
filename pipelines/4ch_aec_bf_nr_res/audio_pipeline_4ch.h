@@ -150,8 +150,12 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * Version 12 carries the core's layout 16 -> 17: FourAecNrResConfig gained
  * enable_near_end_protect. No carve changed, so the byte count cannot say
  * so; the embedded config grew and the default post output differs, and
- * the counter is the signal. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 12u
+ * the counter is the signal.
+ * Version 13 carries the core's layout 17 -> 18: FourAecNrResConfig lost
+ * enable_near_end_protect and the post path its near-end floor lift. No carve
+ * changed; the embedded config shrank (C ABI) and a selectable post path is
+ * gone, so the counter is the only signal. The default output is unchanged. */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 13u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

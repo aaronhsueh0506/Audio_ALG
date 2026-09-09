@@ -468,13 +468,6 @@ static void test_config_validation_rejects(void) {
     CHECK(audio_pipeline_get_mem_requirements(&bad_res, &req) == -1,
           "get_mem_requirements rejects enable_res=2 (bool must be 0/1)");
 
-    AudioPipelineConfig bad_protect = audio_pipeline_default_config(16000);
-    CHECK(bad_protect.enable_near_end_protect == 0,
-          "default config leaves the near-end floor lift off");
-    bad_protect.enable_near_end_protect = 2;
-    CHECK(audio_pipeline_get_mem_requirements(&bad_protect, &req) == -1,
-          "get_mem_requirements rejects enable_near_end_protect=2 (bool must be 0/1)");
-
     AudioPipelineConfig bad_grid = audio_pipeline_default_config(48000);
     bad_grid.fft_size = 512;
     CHECK(audio_pipeline_get_mem_requirements(&bad_grid, &req) == -1,
@@ -535,90 +528,6 @@ static void test_config_validation_rejects(void) {
     if (p_ok) audio_pipeline_destroy(p_ok);
 
     free(pool);
-}
-
-/* audio_pipeline_init_ex()'s `expected` descriptor gate. Run once (16000 Hz,
- * an arbitrary representative rate) -- like the config validation above,
- * this exercises a comparison the
- * function does against a freshly-recomputed AudioPipelineMemReq, not a
- * per-rate carve property; see audio_pipeline.h's audio_pipeline_init_ex()
- * doc for the exact seven-condition contract this drills. */
-/* The near-end floor lift is per bin and speech-conditional: on stationary
- * noise alone the denoiser floors every bin, the speech term is 0 and the lift
- * must change nothing; when that noise is raised 9.5 dB for 160 ms every
- * 400 ms (speech-like: the denoiser leaves the burst bins above its floor and
- * its noise tracker never absorbs them) the lift holds those bins up and
- * protect-on carries more energy.
- * A lift that ignored the speech term fails the first, a lift that never
- * fired fails the second. CNG is off in both so the ratios measure gains. */
-static int protect_pair_energy(int with_bursts, int legacy_amin,
-                               double* e_on, double* e_off) {
-    AudioPipelineConfig on_cfg = audio_pipeline_default_config(16000);
-    AudioPipelineConfig off_cfg;
-    AudioPipeline *on, *off;
-    float *mic, *ref, *o_on, *o_off;
-    int hop = 0, settle_hops = 0, total_hops = 0, h, i, ok;
-
-    on_cfg.enable_cng = 0;
-    on_cfg.enable_near_end_protect = 1;
-    on_cfg.legacy_amin = legacy_amin;
-    off_cfg = on_cfg;
-    off_cfg.enable_near_end_protect = 0;
-    on = audio_pipeline_create(&on_cfg);
-    off = audio_pipeline_create(&off_cfg);
-    if (on) {
-        hop = audio_pipeline_hop_size(on);
-        settle_hops = mmse_lsa_retime_frames(20, 16000, hop) + 300;
-        total_hops = settle_hops + 200;
-    }
-    mic = (float*)calloc((size_t)hop, sizeof(float));
-    ref = (float*)calloc((size_t)hop, sizeof(float));
-    o_on = (float*)calloc((size_t)hop, sizeof(float));
-    o_off = (float*)calloc((size_t)hop, sizeof(float));
-    ok = on && off && mic && ref && o_on && o_off;
-    *e_on = 0.0; *e_off = 0.0;
-    lcg_state = 777u;
-    for (h = 0; ok && h < total_hops; h++) {
-        /* 160 ms bursts every 400 ms: lcg_sample() spans +-0.25, so the
-         * scale below puts the floor at +-0.05 and the bursts at +-0.15. */
-        float scale = (with_bursts && (h % 50) < 20) ? 0.6f : 0.2f;
-        for (i = 0; i < hop; i++) mic[i] = scale * lcg_sample();
-        audio_pipeline_process(on, mic, ref, o_on);
-        audio_pipeline_process(off, mic, ref, o_off);
-        if (h >= settle_hops)
-            for (i = 0; i < hop; i++) {
-                *e_on += (double)o_on[i] * o_on[i];
-                *e_off += (double)o_off[i] * o_off[i];
-            }
-    }
-    free(mic); free(ref); free(o_on); free(o_off);
-    audio_pipeline_destroy(on); audio_pipeline_destroy(off);
-    return ok;
-}
-
-static void test_near_end_protect_switch(void) {
-    double noise_on, noise_off, burst_on, burst_off;
-    double legacy_on, legacy_off;
-    CHECK(protect_pair_energy(0, 0, &noise_on, &noise_off) &&
-          protect_pair_energy(1, 0, &burst_on, &burst_off) &&
-          protect_pair_energy(0, 1, &legacy_on, &legacy_off),
-          "protect-on and protect-off instances process both stimuli");
-    if (noise_off <= 0.0 || burst_off <= 0.0) {
-        CHECK(0, "both stimuli carry signal");
-        return;
-    }
-    printf("  near-end protect: energy on/off  noise-only=%.4f  noise+bursts=%.4f\n",
-           noise_on / noise_off, burst_on / burst_off);
-    CHECK(noise_on >= 0.999 * noise_off,
-          "the lift can only raise a gain, never lower one");
-    CHECK(noise_on <= 1.12 * noise_off,
-          "on stationary noise the speech term is 0 and the lift changes nothing");
-    CHECK(burst_on >= 1.15 * burst_off,
-          "speech-like bursts are held up by the lift, so it is load-bearing "
-          "where the denoiser left the signal above its floor");
-    CHECK(legacy_on >= 1.15 * legacy_off,
-          "legacy A_min restores the prior scalar floor without the NR-gain "
-          "speech condition when protection is enabled");
 }
 
 /* NR and RES are the post path's two gain sources. Two witnesses hold from
@@ -741,6 +650,12 @@ static void test_nr_res_switches(void) {
     audio_pipeline_destroy(thru);
 }
 
+/* audio_pipeline_init_ex()'s `expected` descriptor gate. Run once (16000 Hz,
+ * an arbitrary representative rate) -- like the config validation above,
+ * this exercises a comparison the function does against a freshly-recomputed
+ * AudioPipelineMemReq, not a per-rate carve property; see audio_pipeline.h's
+ * audio_pipeline_init_ex() doc for the exact seven-condition contract this
+ * drills. */
 static void test_init_ex_descriptor(void) {
     AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
     AudioPipelineMemReq req;
@@ -777,6 +692,16 @@ static void test_init_ex_descriptor(void) {
     AudioPipeline* p_lv = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_lv);
     CHECK(p_lv == NULL, "audio_pipeline_init_ex rejects a tampered layout_version");
     if (p_lv) audio_pipeline_destroy(p_lv);
+
+    /* The literal, not a relative tamper: a carve or ABI change that forgets
+     * the bump must fail here. A persisted layout-11 descriptor is refused on
+     * the counter alone. */
+    CHECK(req.layout_version == 12u, "AudioPipelineMemReq reports layout_version 12");
+    AudioPipelineMemReq stale_lv = req;
+    stale_lv.layout_version = 11u;
+    AudioPipeline* p_stale = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &stale_lv);
+    CHECK(p_stale == NULL, "audio_pipeline_init_ex refuses a persisted layout-11 descriptor");
+    if (p_stale) audio_pipeline_destroy(p_stale);
 
     /* Tampered backend_id: a plain wrong integer (99), never a string --
      * V2 dropped the F20 `const char* backend` field entirely, so there is
@@ -1191,7 +1116,6 @@ int main(void) {
 
     printf("\n=== AudioPipelineConfig reject-first validation ===\n");
     test_config_validation_rejects();
-    test_near_end_protect_switch();
     test_nr_res_switches();
 
     printf("\n=== audio_pipeline_init_ex descriptor gate ===\n");

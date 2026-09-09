@@ -200,16 +200,10 @@ then refuse. `enable_post` outranks both `enable_res` and `enable_nr`: with
 two select the post stage's gain sources independently, and both 0 leaves
 the beamformed linear error, synthesised.
 
-`cfg.enable_near_end_protect` (default 0) selects the per-bin near-end floor
-lift in the post path. With 1, `total_gain` is blended toward unity by 0.4
-(0.2 while the far end is active), scaled per bin by how echo-free the RES
-finds it (`G_res * (1 - R^2/|E|^2)`) and by how speech-like the denoiser
-left it (`clip((G_nr - 0.1) / 0.9, 0, 1)`). Bins the denoiser took to its
-floor get no lift and keep the full NR depth; bins it left near unity are held
-at the floor. The strength never depends on a broadband level, so a loud
-background can neither cap the denoiser nor make the floor follow the far
-talker. With `enable_nr = 0` there is no speech evidence and every echo-free
-bin is protected. The default applies `min(G_nr, G_res)` as computed.
+`total_gain` is `min(G_nr, G_res)` applied as computed. The post path has no
+near-end floor or other level-dependent lift, so a loud background cannot cap
+the denoiser or make the gain follow the far talker; which bins survive is
+decided per bin by the denoiser's own speech-presence model and by `G_res`.
 
 Caller-owned pool (static/board path):
 

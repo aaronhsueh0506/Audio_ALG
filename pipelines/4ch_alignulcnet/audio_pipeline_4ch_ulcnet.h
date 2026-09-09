@@ -226,11 +226,14 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * contract went from 2 hops to 1. */
 /* Version 18 carries the core's own layout 16 -> 17: FourAecNrResConfig
  * gained enable_near_end_protect and enable_res, which this wrapper rejects
- * unless 0. The
- * pre-only sub-pool is unchanged, but AudioPipeline4ChConfig is embedded by
- * value in the control block and grew, so a version-17 descriptor must be
- * refused on the counter. C struct-ABI change as well. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 18u
+ * unless 0. The pre-only sub-pool is unchanged, but AudioPipeline4ChConfig is
+ * embedded by value in the control block and grew, so a version-17 descriptor
+ * must be refused on the counter. C struct-ABI change as well. */
+/* Version 19 carries the core's own layout 17 -> 18: FourAecNrResConfig lost
+ * enable_near_end_protect. The pre-only sub-pool is unchanged; the embedded
+ * AudioPipeline4ChConfig shrank, so a version-18 descriptor must be refused on
+ * the counter. C struct-ABI change as well. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 19u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -303,8 +306,6 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
  *                       could not take effect)
  *   core.enable_res   = 0   (same reason as enable_nr: the core's default is
  *                       1, the pre-only profile states what is true)
- *   core.enable_near_end_protect = 0   (post-path gain shaping; nothing to
- *                       shape here)
  *   core.enable_cng   = 0
  *   core.legacy_amin  = 0
  *   core.nr_mode      = MMSE_LSA_NR_BALANCED   (the enum has no "disabled"

@@ -132,7 +132,6 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
     if (cfg->core.enable_post != 0) return 0;
     if (cfg->core.enable_nr != 0) return 0;
     if (cfg->core.enable_res != 0) return 0;
-    if (cfg->core.enable_near_end_protect != 0) return 0;
     if (cfg->core.enable_cng != 0) return 0;
     if (cfg->core.legacy_amin != 0) return 0;
     /* MmseLsaNrMode has no "disabled" value and no denoiser is created here,

@@ -201,8 +201,8 @@ audio_pipeline_get_last_timing(p, &t);
 | `frontend_us` | AEC 到主濾波器之前的**其餘**部分：mic HPF、飽和、render activity、`mu_scale`、mic-clip、RSA、shadow filter。**不含 `delay_us`**，兩者不重複計算 |
 | `linear_us` | AEC 主自適應濾波器（`pbfdkf_process`），含 far-end FFT |
 | `res_us` | AEC 自己的 AEC3 post/RES 區塊 |
-| `nr_us` | `mmse_lsa_process_gain()` |
-| `post_us` | 兩者之間的增益運算：`r2/PSD_SCALE`、`min(G_nr, G_res)`、`|E|²`、遠端活動與近端 VAD 閘、echo-gated 近端 lift、頻譜套用、comfort noise |
+| `nr_us` | `r2/PSD_SCALE` 摺入 ＋ `mmse_lsa_process_gain()` |
+| `post_us` | 兩者之間的增益運算：`min(G_nr, G_res)`、頻譜套用、comfort noise |
 | `synth_us` | 逆轉換、加窗 overlap-add、hop 送出與位移 |
 
 **實測：`delay_us` 通常是整個 hop 最大的一塊。** 16 kHz/256 ne10 上量到
@@ -317,8 +317,7 @@ AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
 | `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不套 AEC3 殘留 gain（`G_res` 視為 1），`g_total` 只剩 `G_nr`，CNG 因為沒有被 RES 挖掉的 bin 而不填。兩者都 `0` 就是線性殘差經合成直通。`aec_only=1` 時無作用 |
 | `aec_only` | `int`（bool） | `0` | 只接受 `0` 或 `1`。`2` 之類的「truthy」值會被拒絕 | `1` = 只跑 linear AEC，完全跳過 NR/RES/最終 OLA。用來隔離問題，或你自己接後級。此時 `get_nr()` 回 `NULL`，且 FFT/NR/pipeline buffer 都不配置 |
 | `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 AEC 抑制掉的 bin 填舒適噪音。實際生效值是「AEC preset 自己的 `enable_cng`」與這個欄位的 AND |
-| `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = 回到舊的 min-only 行為：NR 的 noise floor 不摺入 R²，且 near-end floor 強度固定。只用於比對舊行為，新整合請保持 `0` |
-| `enable_near_end_protect` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = 逐 bin 的 near-end floor lift：把 `g_total` 往 1 混合，強度 = （遠端靜音 0.4／活動 0.2）× `G_res·(1−R²/|E|²)` × `clip((G_nr−0.1)/0.9)`。噪聲 bin 拿不到 lift、保有完整 NR 深度；NR 留在 1 附近的語音 bin 被保護。`enable_nr=0` 時語音證據為 1、所有無 echo bin 都保護 |
+| `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = 回到舊的 noise-only NR：noise floor 不摺入 R²。只用於比對舊行為，新整合請保持 `0` |
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）
 
@@ -352,7 +351,6 @@ AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
 | `enable_res` | 見上列 |
 | `enable_cng` | 不變 |
 | `legacy_amin` | 不變 |
-| `enable_near_end_protect` | 不變 |
 
 ### 4.4 診斷用的分項
 
@@ -370,37 +368,36 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout（layout_version=11）、`BACKEND=kiss`、`pipelines/Makefile`
+以下是**本次 checkout（layout_version=12）、`BACKEND=kiss`、`pipelines/Makefile`
 預設選項**下，直接以 `--print-mem-size` 量到的值。換 backend、換編譯選項、更新
 submodule 都會變。
 
-這一輪 `sizeof(Aec)` 由 5832 變 5848 B，AEC pool 依 grid 各長一個常數
-（8 kHz +2,560 B、16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B），
-所以 `aec_bytes` 與 `req.bytes` 兩欄都動了。控制區塊另外再 +16 B：
-`AudioPipelineLastTiming` 直接內嵌 `AecStageTiming`，後者由 16 變 20 B，而
-`ALIGN16(sizeof(AudioPipeline))` 已經沒有餘裕可以吸收，於是
-**控制區塊由 176 變 192 B**。`fft_bytes`/`nr_bytes`/`pipeline_bytes` 三欄未變。
+這一輪 post 路徑拿掉 near-end floor lift，只有它讀的 `e2` scratch（`n_freqs`
+float，16-byte 對齊）跟著離開 carve：`pipeline_bytes` 依 grid 各少一個常數
+（8 kHz 與 16 kHz/256 −528 B、16 kHz/512 −1,040 B、48 kHz −2,064 B），
+`req.bytes` 同步下降；`aec_bytes`/`fft_bytes`/`nr_bytes` 未變。控制區塊為 192 B
+（`ALIGN16(sizeof(AudioPipeline))`；layout 11 的 struct 多兩個 int 而跨到 208 B，
+當時表格未重量，所以相對上表舊值的差額仍恰為 `e2` 一項）。
 
 | Config | `req.bytes` | `aec_bytes` | `fft_bytes` | `nr_bytes` | `pipeline_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 360,352 | 278,256 | 8,784 | 67,424 | 5,696 |
-| 16000，預設（256/128） | 522,272 | 385,440 | 8,784 | 122,160 | 5,696 |
-| 16000，`fft_size=512` | 675,936 | 513,968 | 16,976 | 133,472 | 11,328 |
-| 48000，預設（1024/512） | 1,616,016 | 1,185,536 | 33,360 | 374,336 | 22,592 |
+| 8000，預設 | 359,824 | 278,256 | 8,784 | 67,424 | 5,168 |
+| 16000，預設（256/128） | 521,744 | 385,440 | 8,784 | 122,160 | 5,168 |
+| 16000，`fft_size=512` | 674,896 | 513,968 | 16,976 | 133,472 | 10,288 |
+| 48000，預設（1024/512） | 1,613,952 | 1,185,536 | 33,360 | 374,336 | 20,528 |
 | 16000，`aec_only=1` | 385,632 | 385,440 | 0 | 0 | 0 |
 
 `req.bytes` 減去四個分項（各自 16-byte 對齊後）的差額，就是 `AudioPipeline`
-控制區塊，本次量測在每一組 config 都是 192 B（前一版 176 B，`AecStageTiming`
-長大帶起來的）。
+控制區塊，本次量測在每一組 config 都是 192 B。
 
 #### 4.5a delay_mode 對 16000/預設 grid 的影響（`MATCHED` n=5 為 baseline）
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 522,272 | — |
-| `MATCHED` n=1 | 499,360 | −22,912 |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 364,176 | −158,096 |
-| `EXTERNAL_ALIGNED` | 357,264 | −165,008 |
+| `MATCHED` n=5（預設） | 521,744 | — |
+| `MATCHED` n=1 | 498,832 | −22,912 |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 363,648 | −158,096 |
+| `EXTERNAL_ALIGNED` | 356,736 | −165,008 |
 
 這四列的差額全部落在 `aec_bytes`（`delay_mode`/`delay_num_filters` 不影響
 FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致

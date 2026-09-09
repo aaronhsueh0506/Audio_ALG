@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""Render the production freq pipeline over the 800-case corpus.
+"""800-case renderer for the production freq pipeline (no offline pre-align):
+  AEC(linear) -> echo-aware NR(E), ξ=S²/(N²+R²) -> g_total = min(G_nr, G_res).
+LEGACY_AMIN=1 renders the prior noise-only NR (no R² injection).
 
-  AEC(linear) -> echo-aware NR(E), ξ=S²/(N²+R²) -> g_total = min(G_nr, G_res)
-  + far-activity-gated near-end floor (0.4 far-silent+near-speech / 0.2 else).
-  This is the 2026-06-23 re-tune of A_min_pl; LEGACY_AMIN=1 renders the prior
-  min-only A_min_pl (noise-only NR, scalar ne_floor); NEAR_END_PROTECT=1 renders
-  the per-bin, speech-conditional near-end floor.
-
-Usage: python3 pipelines/tools/rebench_joint.py <out_dir> [ne_floor] [ne_gate] [limit]
-Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir> --baseline <classic>/scores.json
+Usage: python3 pipelines/tools/rebench_joint.py <out_dir> [limit]
+Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir> [--baseline ...]
 """
 import contextlib
 import io
@@ -25,27 +21,17 @@ sys.path.insert(0, os.path.join(ROOT, 'lib', 'aec', 'python'))
 from aec import AecConfig, AecMode                              # noqa: E402
 from pipelines.aec_nr_pipeline import (                         # noqa: E402
     run_aec_linear, run_nr_spectrum, run_res,
-    PROD_INJECT_ECHO_PSD, PROD_NE_FLOOR_FAR_ACTIVE,
+    PROD_INJECT_ECHO_PSD,
 )
 from pipelines.tools.rebench_sep_vs_classic import (            # noqa: E402
     CORPUS, SCENARIOS, SR, FL, NR_PRESET,
 )
 
-# NEAR_END_PROTECT=1 renders the near-end floor lift; off matches the C
-# pipelines' enable_near_end_protect default.
-_PROTECT = os.environ.get('NEAR_END_PROTECT', '0') == '1'
-NE_FLOOR = float(os.environ.get('NE_FLOOR', '0.4' if _PROTECT else '0.0'))
-NE_GATE = os.environ.get('NE_GATE', 'both')
-# Env override lets one renderer cover any NR preset (mild/balanced/aggressive);
-# defaults to the shipped 'balanced' so the production render is unchanged.
+# NR_PRESET=<mode> in the environment overrides the imported default.
 NR_PRESET = os.environ.get('NR_PRESET', NR_PRESET)
-# 2026-06-23 re-tune (unified gain + far-gated near floor). LEGACY_AMIN=1
-# restores the prior min-only A_min_pl and, with NEAR_END_PROTECT=1, its scalar
-# floor.
+# LEGACY_AMIN=1 restores the prior noise-only NR.
 _LEGACY = os.environ.get('LEGACY_AMIN', '0') == '1'
 INJECT_ECHO_PSD = (not _LEGACY) and PROD_INJECT_ECHO_PSD
-NE_FLOOR_FAR_ACTIVE = (None if _LEGACY else PROD_NE_FLOOR_FAR_ACTIVE) if _PROTECT else None
-SPEECH_GATE = _PROTECT and not _LEGACY
 
 
 def _cfg(enable_res):
@@ -71,9 +57,7 @@ def process(mic_path, lpb_path, out_path):
         g = run_nr_spectrum(ctx, sr, nr_preset=NR_PRESET,
                             inject_echo_psd=INJECT_ECHO_PSD)
         out = run_res(np.zeros(n, dtype=np.float32), g, ctx, _cfg(False),
-                      use_res=True, combine='min', ne_floor=NE_FLOOR, ne_gate=NE_GATE,
-                      ne_floor_far_active=NE_FLOOR_FAR_ACTIVE,
-                      speech_gate=SPEECH_GATE)
+                      use_res=True, combine='min')
     sf.write(out_path, out[:n], sr, subtype='FLOAT')
 
 
@@ -91,13 +75,7 @@ def _job(a):
 def main():
     from concurrent.futures import ProcessPoolExecutor, as_completed
     out_dir = sys.argv[1] if len(sys.argv) > 1 else '/tmp/joint800'
-    if len(sys.argv) > 2:
-        os.environ['NE_FLOOR'] = sys.argv[2]      # must set env before spawning workers
-        globals()['NE_FLOOR'] = float(sys.argv[2])
-    if len(sys.argv) > 3:
-        os.environ['NE_GATE'] = sys.argv[3]
-        globals()['NE_GATE'] = sys.argv[3]
-    limit = int(sys.argv[4]) if len(sys.argv) > 4 else 0
+    limit = int(sys.argv[2]) if len(sys.argv) > 2 else 0
     workers = int(os.environ.get('REBENCH_WORKERS', '8'))
     os.makedirs(out_dir, exist_ok=True)
     jobs = []
@@ -114,8 +92,7 @@ def main():
             if os.path.exists(lpb):
                 jobs.append((os.path.join(sc_dir, mf), lpb,
                              os.path.join(out_dir, stem + '_ours.wav'), stem))
-    print(f"joint render: {len(jobs)} cases, ne_floor={NE_FLOOR}, gate={NE_GATE}, "
-          f"{workers} workers", flush=True)
+    print(f"joint render: {len(jobs)} cases, {workers} workers", flush=True)
     ok = fail = skip = done = 0
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futs = {ex.submit(_job, j): j[3] for j in jobs}

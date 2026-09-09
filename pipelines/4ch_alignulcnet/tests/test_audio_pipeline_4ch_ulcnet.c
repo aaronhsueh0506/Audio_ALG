@@ -1143,13 +1143,13 @@ static int test_pool_and_descriptor_gate(void) {
      * layout this wrapper descriptor carries. Bump this literal with
      * AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 17u;
+    stale.layout_version = 18u;
     CHECK(audio_pipeline_4ch_ulcnet_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "init_ex rejects a descriptor from the superseded layout even "
           "when its byte count exactly covers the current pool");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION &&
-          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 18u,
+          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 19u,
           "the queried descriptor publishes the current carve layout");
 
     stat = audio_pipeline_4ch_ulcnet_init_ex(
@@ -2401,7 +2401,6 @@ static int run_all_tests(void) {
         invalid = audio_pipeline_4ch_ulcnet_default_config();
         CHECK(invalid.core.enable_post == 0 && invalid.core.enable_nr == 0 &&
               invalid.core.enable_res == 0 &&
-              invalid.core.enable_near_end_protect == 0 &&
               invalid.core.enable_cng == 0,
               "the default config itself states the pre-only profile");
         {
@@ -2422,8 +2421,6 @@ static int run_all_tests(void) {
         REJECT_POST_ONLY(bad.core.enable_post = 1, "enable_post");
         REJECT_POST_ONLY(bad.core.enable_nr = 1, "enable_nr");
         REJECT_POST_ONLY(bad.core.enable_res = 1, "enable_res");
-        REJECT_POST_ONLY(bad.core.enable_near_end_protect = 1,
-                         "enable_near_end_protect");
         REJECT_POST_ONLY(bad.core.enable_cng = 1, "enable_cng");
         REJECT_POST_ONLY(bad.core.legacy_amin = 1, "legacy_amin");
         REJECT_POST_ONLY(bad.core.nr_mode = MMSE_LSA_NR_AGGRESSIVE,
