@@ -4,7 +4,8 @@
   AEC(linear) -> echo-aware NR(E), ξ=S²/(N²+R²) -> g_total = min(G_nr, G_res)
   + far-activity-gated near-end floor (0.4 far-silent+near-speech / 0.2 else).
   This is the 2026-06-23 re-tune of A_min_pl; LEGACY_AMIN=1 renders the prior
-  min-only A_min_pl (noise-only NR, scalar ne_floor=0.4).
+  min-only A_min_pl (noise-only NR, scalar ne_floor); NEAR_END_PROTECT=1 renders
+  the per-bin, speech-conditional near-end floor.
 
 Usage: python3 pipelines/tools/rebench_joint.py <out_dir> [ne_floor] [ne_gate] [limit]
 Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir> --baseline <classic>/scores.json
@@ -25,23 +26,26 @@ from aec import AecConfig, AecMode                              # noqa: E402
 from pipelines.aec_nr_pipeline import (                         # noqa: E402
     run_aec_linear, run_nr_spectrum, run_res,
     PROD_INJECT_ECHO_PSD, PROD_NE_FLOOR_FAR_ACTIVE,
-    PROD_NEAR_GATE_THRESH, PROD_NEAR_HANGOVER,
 )
 from pipelines.tools.rebench_sep_vs_classic import (            # noqa: E402
     CORPUS, SCENARIOS, SR, FL, NR_PRESET,
 )
 
-NE_FLOOR = float(os.environ.get('NE_FLOOR', '0.4'))
+# NEAR_END_PROTECT=1 renders the near-end floor lift; off matches the C
+# pipelines' enable_near_end_protect default.
+_PROTECT = os.environ.get('NEAR_END_PROTECT', '0') == '1'
+NE_FLOOR = float(os.environ.get('NE_FLOOR', '0.4' if _PROTECT else '0.0'))
 NE_GATE = os.environ.get('NE_GATE', 'both')
 # Env override lets one renderer cover any NR preset (mild/balanced/aggressive);
 # defaults to the shipped 'balanced' so the production render is unchanged.
 NR_PRESET = os.environ.get('NR_PRESET', NR_PRESET)
-# 2026-06-23 re-tune (unified gain + far-gated near floor). LEGACY_AMIN=1 restores
-# the prior min-only A_min_pl.
+# 2026-06-23 re-tune (unified gain + far-gated near floor). LEGACY_AMIN=1
+# restores the prior min-only A_min_pl and, with NEAR_END_PROTECT=1, its scalar
+# floor.
 _LEGACY = os.environ.get('LEGACY_AMIN', '0') == '1'
 INJECT_ECHO_PSD = (not _LEGACY) and PROD_INJECT_ECHO_PSD
-NE_FLOOR_FAR_ACTIVE = None if _LEGACY else PROD_NE_FLOOR_FAR_ACTIVE
-NEAR_GATE_THRESH = None if _LEGACY else PROD_NEAR_GATE_THRESH
+NE_FLOOR_FAR_ACTIVE = (None if _LEGACY else PROD_NE_FLOOR_FAR_ACTIVE) if _PROTECT else None
+SPEECH_GATE = _PROTECT and not _LEGACY
 
 
 def _cfg(enable_res):
@@ -69,8 +73,7 @@ def process(mic_path, lpb_path, out_path):
         out = run_res(np.zeros(n, dtype=np.float32), g, ctx, _cfg(False),
                       use_res=True, combine='min', ne_floor=NE_FLOOR, ne_gate=NE_GATE,
                       ne_floor_far_active=NE_FLOOR_FAR_ACTIVE,
-                      near_gate_thresh=NEAR_GATE_THRESH,
-                      near_hangover_frames=PROD_NEAR_HANGOVER)
+                      speech_gate=SPEECH_GATE)
     sf.write(out_path, out[:n], sr, subtype='FLOAT')
 
 

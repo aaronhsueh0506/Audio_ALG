@@ -146,8 +146,12 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * Version 11 carries the core's layout 15 -> 16: its embedded config gained
  * enable_nr and its MMSE-LSA region can now be omitted for RES-only products.
  * This wrapper embeds that config and composes the core pool, so both its
- * control-block size and a valid sub-pool shape changed. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 11u
+ * control-block size and a valid sub-pool shape changed.
+ * Version 12 carries the core's layout 16 -> 17: FourAecNrResConfig gained
+ * enable_near_end_protect. No carve changed, so the byte count cannot say
+ * so; the embedded config grew and the default post output differs, and
+ * the counter is the signal. */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 12u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

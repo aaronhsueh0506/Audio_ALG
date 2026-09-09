@@ -93,12 +93,27 @@ typedef struct {
     int           fixed_delay_samples; /* FIXED native-rate samples; -1 otherwise       */
     AecPreset     aec_preset;    /* MILD | BALANCED | AGGRESSIVE                       */
     MmseLsaNrMode nr_mode;       /* MILD | MODERATE | BALANCED | AGGRESSIVE            */
-    int           aec_only;      /* 1 = skip NR/RES entirely (linear AEC output only)  */
+    int           aec_only;      /* 1 = skip NR/RES entirely (linear AEC output only). *
+                                   * Outranks enable_nr/enable_res: with 1 there is no *
+                                   * post path and both are inert                      */
+    int           enable_nr;     /* 1 = run MMSE-LSA (default); 0 = no denoiser state, *
+                                   * g_total is G_res alone                            */
+    int           enable_res;    /* 1 = apply the AEC3 residual gain G_res (default);  *
+                                   * 0 = G_res is unity: g_total is G_nr alone, CNG    *
+                                   * (which fills only RES-cut bins) is skipped; both  *
+                                   * 0 = the linear residual, synthesised              */
     int           enable_cng;    /* 1 = fill AEC-suppressed bins with comfort noise    */
     int           legacy_amin;   /* 1 = prior min-only A_min_pl (--legacy-amin): NR    *
                                    * gain computed WITHOUT folding R² into the noise    *
-                                   * floor, and the far/near-gated near-end floor       *
-                                   * strength collapses to the fixed scalar 0.4         */
+                                   * floor; when near-end protect is also enabled, its   *
+                                   * strength is the prior fixed scalar 0.4 without the  *
+                                   * NR-gain speech condition                            */
+    int           enable_near_end_protect; /* 1 = per-bin near-end floor lift: blend  *
+                                   * g_total toward 1 in bins that are echo-free AND    *
+                                   * that the denoiser left speech-like (gain > 0.1),   *
+                                   * by 0.4, or 0.2 while the far end is active; noise  *
+                                   * bins keep the full NR depth.                       *
+                                   * 0 = apply min(G_nr, G_res) as computed (default)   */
 } AudioPipelineConfig;
 
 /** Defaults: rate-default no-padding grid, balanced modes, full pipeline,
@@ -336,8 +351,8 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
  *                different owner.
  *   nr_us        mmse_lsa_process_gain() -- the noise-reduction gain.
  *   post_us      the gain arithmetic between the two: the r2/PSD_SCALE fold,
- *                min(G_nr, G_res), the |E|^2 hoist, the far-activity and
- *                near-VAD gate, the echo-gated near-end lift, the spectral
+ *                min(G_nr, G_res), the |E|^2 hoist, the far-activity gate,
+ *                the per-bin speech-conditional near-end lift, the spectral
  *                apply, and the comfort-noise loop.
  *   synth_us     inverse transform, windowed overlap-add, and the hop
  *                emit/shift.

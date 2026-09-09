@@ -75,6 +75,7 @@
  */
 #include "audio_pipeline.h"
 #include "aec3_balanced_config.h"   /* AEC3B_SQRT2_SIN_LUT -- the comfort-noise table */
+#include "fft_wrapper.h"           /* test-side WOLA reference for the RES/NR bypass */
 
 #include <math.h>
 #include <stdio.h>
@@ -307,10 +308,11 @@ static void reset_scene_hop(unsigned int* rng, float* mic, float* ref, int hop,
  * and OFF: reset re-seeds the comfort-noise RNG to the same construction-time
  * seed, so the CNG path is compared for real rather than excused. */
 static void test_reset_equals_fresh_instance(int sr, int fft_size,
-                                             int enable_cng) {
+                                             int enable_cng, int enable_nr) {
     enum { HIST = 8192, WARM = 600, COMPARE = 300 };
     AudioPipelineConfig cfg = grid_config(sr, fft_size);
     cfg.enable_cng = enable_cng;
+    cfg.enable_nr = enable_nr;
 
     AudioPipelineMemReq req;
     if (audio_pipeline_get_mem_requirements(&cfg, &req) != 0) {
@@ -369,9 +371,9 @@ static void test_reset_equals_fresh_instance(int sr, int fft_size,
         }
     }
     CHECK(differing == 0,
-          fmt_msg("audio_pipeline_reset == a fresh instance @ %d Hz, cng=%d: "
+          fmt_msg("audio_pipeline_reset == a fresh instance @ %d Hz, cng=%d, nr=%d: "
                   "%ld of %d post-reset hops differ (first at %d)",
-                  sr, enable_cng, differing, COMPARE, first_bad));
+                  sr, enable_cng, enable_nr, differing, COMPARE, first_bad));
 
     free(mic); free(ref); free(out_a); free(out_b);
     free(hist); free(hist_a); free(hist_b);
@@ -454,6 +456,25 @@ static void test_config_validation_rejects(void) {
     CHECK(audio_pipeline_get_mem_requirements(&bad_legacy, &req) == -1,
           "get_mem_requirements rejects legacy_amin=-1 (bool must be 0/1)");
 
+    AudioPipelineConfig bad_nr = audio_pipeline_default_config(16000);
+    CHECK(bad_nr.enable_nr == 1 && bad_nr.enable_res == 1,
+          "default config keeps NR and RES on");
+    bad_nr.enable_nr = 2;
+    CHECK(audio_pipeline_get_mem_requirements(&bad_nr, &req) == -1,
+          "get_mem_requirements rejects enable_nr=2 (bool must be 0/1)");
+
+    AudioPipelineConfig bad_res = audio_pipeline_default_config(16000);
+    bad_res.enable_res = 2;
+    CHECK(audio_pipeline_get_mem_requirements(&bad_res, &req) == -1,
+          "get_mem_requirements rejects enable_res=2 (bool must be 0/1)");
+
+    AudioPipelineConfig bad_protect = audio_pipeline_default_config(16000);
+    CHECK(bad_protect.enable_near_end_protect == 0,
+          "default config leaves the near-end floor lift off");
+    bad_protect.enable_near_end_protect = 2;
+    CHECK(audio_pipeline_get_mem_requirements(&bad_protect, &req) == -1,
+          "get_mem_requirements rejects enable_near_end_protect=2 (bool must be 0/1)");
+
     AudioPipelineConfig bad_grid = audio_pipeline_default_config(48000);
     bad_grid.fft_size = 512;
     CHECK(audio_pipeline_get_mem_requirements(&bad_grid, &req) == -1,
@@ -522,6 +543,204 @@ static void test_config_validation_rejects(void) {
  * function does against a freshly-recomputed AudioPipelineMemReq, not a
  * per-rate carve property; see audio_pipeline.h's audio_pipeline_init_ex()
  * doc for the exact seven-condition contract this drills. */
+/* The near-end floor lift is per bin and speech-conditional: on stationary
+ * noise alone the denoiser floors every bin, the speech term is 0 and the lift
+ * must change nothing; when that noise is raised 9.5 dB for 160 ms every
+ * 400 ms (speech-like: the denoiser leaves the burst bins above its floor and
+ * its noise tracker never absorbs them) the lift holds those bins up and
+ * protect-on carries more energy.
+ * A lift that ignored the speech term fails the first, a lift that never
+ * fired fails the second. CNG is off in both so the ratios measure gains. */
+static int protect_pair_energy(int with_bursts, int legacy_amin,
+                               double* e_on, double* e_off) {
+    AudioPipelineConfig on_cfg = audio_pipeline_default_config(16000);
+    AudioPipelineConfig off_cfg;
+    AudioPipeline *on, *off;
+    float *mic, *ref, *o_on, *o_off;
+    int hop = 0, settle_hops = 0, total_hops = 0, h, i, ok;
+
+    on_cfg.enable_cng = 0;
+    on_cfg.enable_near_end_protect = 1;
+    on_cfg.legacy_amin = legacy_amin;
+    off_cfg = on_cfg;
+    off_cfg.enable_near_end_protect = 0;
+    on = audio_pipeline_create(&on_cfg);
+    off = audio_pipeline_create(&off_cfg);
+    if (on) {
+        hop = audio_pipeline_hop_size(on);
+        settle_hops = mmse_lsa_retime_frames(20, 16000, hop) + 300;
+        total_hops = settle_hops + 200;
+    }
+    mic = (float*)calloc((size_t)hop, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    o_on = (float*)calloc((size_t)hop, sizeof(float));
+    o_off = (float*)calloc((size_t)hop, sizeof(float));
+    ok = on && off && mic && ref && o_on && o_off;
+    *e_on = 0.0; *e_off = 0.0;
+    lcg_state = 777u;
+    for (h = 0; ok && h < total_hops; h++) {
+        /* 160 ms bursts every 400 ms: lcg_sample() spans +-0.25, so the
+         * scale below puts the floor at +-0.05 and the bursts at +-0.15. */
+        float scale = (with_bursts && (h % 50) < 20) ? 0.6f : 0.2f;
+        for (i = 0; i < hop; i++) mic[i] = scale * lcg_sample();
+        audio_pipeline_process(on, mic, ref, o_on);
+        audio_pipeline_process(off, mic, ref, o_off);
+        if (h >= settle_hops)
+            for (i = 0; i < hop; i++) {
+                *e_on += (double)o_on[i] * o_on[i];
+                *e_off += (double)o_off[i] * o_off[i];
+            }
+    }
+    free(mic); free(ref); free(o_on); free(o_off);
+    audio_pipeline_destroy(on); audio_pipeline_destroy(off);
+    return ok;
+}
+
+static void test_near_end_protect_switch(void) {
+    double noise_on, noise_off, burst_on, burst_off;
+    double legacy_on, legacy_off;
+    CHECK(protect_pair_energy(0, 0, &noise_on, &noise_off) &&
+          protect_pair_energy(1, 0, &burst_on, &burst_off) &&
+          protect_pair_energy(0, 1, &legacy_on, &legacy_off),
+          "protect-on and protect-off instances process both stimuli");
+    if (noise_off <= 0.0 || burst_off <= 0.0) {
+        CHECK(0, "both stimuli carry signal");
+        return;
+    }
+    printf("  near-end protect: energy on/off  noise-only=%.4f  noise+bursts=%.4f\n",
+           noise_on / noise_off, burst_on / burst_off);
+    CHECK(noise_on >= 0.999 * noise_off,
+          "the lift can only raise a gain, never lower one");
+    CHECK(noise_on <= 1.12 * noise_off,
+          "on stationary noise the speech term is 0 and the lift changes nothing");
+    CHECK(burst_on >= 1.15 * burst_off,
+          "speech-like bursts are held up by the lift, so it is load-bearing "
+          "where the denoiser left the signal above its floor");
+    CHECK(legacy_on >= 1.15 * legacy_off,
+          "legacy A_min restores the prior scalar floor without the NR-gain "
+          "speech condition when protection is enabled");
+}
+
+/* NR and RES are the post path's two gain sources. Two witnesses hold from
+ * outside: (1) MMSE-LSA passes through (gain 1.0) for its first
+ * num_init_frames hops, so an enable_nr=0 instance must match an enable_nr=1
+ * instance bit for bit over that window and diverge afterwards -- a RES-only
+ * branch with any scaling of its own breaks the equality; (2) with NR, RES
+ * and CNG all off the post path applies gain 1.0 to the seam spectrum, so
+ * resynthesising that same spectrum here (read back through the AEC seam,
+ * one sqrt-Hann WOLA) must reproduce the output to float precision, while the
+ * default instance on the same stimulus must not. aec_only's time output is
+ * deliberately NOT the reference: it is the AEC's own emitted hop, not the
+ * seam spectrum, and the two differ by design. The NR-disabled build also
+ * drops the denoiser from the pool and reports no denoiser handle. */
+static void test_nr_res_switches(void) {
+    AudioPipelineConfig on_cfg = audio_pipeline_default_config(16000);
+    AudioPipelineConfig nr_off_cfg, thru_cfg;
+    AudioPipelineMemBreakdown on_mem, nr_off_mem;
+    AudioPipeline *on, *nr_off, *thru;
+    FftHandle* fft;
+    void* fft_mem;
+    int hop, frame, init_hops, total_hops, h, i;
+    int prefix_equal = 1, prefix_nonzero = 0, diverged = 0;
+    double max_abs = 0.0, err_thru = 0.0, err_on = 0.0;
+
+    lcg_state = 12345u;
+    on_cfg.enable_cng = 0;
+    nr_off_cfg = on_cfg; nr_off_cfg.enable_nr = 0;
+    thru_cfg = nr_off_cfg; thru_cfg.enable_res = 0;
+    CHECK(audio_pipeline_get_mem_breakdown(&on_cfg, &on_mem) == 0 &&
+          audio_pipeline_get_mem_breakdown(&nr_off_cfg, &nr_off_mem) == 0 &&
+          on_mem.nr_bytes > 0 && nr_off_mem.nr_bytes == 0,
+          "NR-disabled sizing omits the denoiser state");
+    on = audio_pipeline_create(&on_cfg);
+    nr_off = audio_pipeline_create(&nr_off_cfg);
+    thru = audio_pipeline_create(&thru_cfg);
+    CHECK(on && nr_off && thru, "all three switch instances create");
+    if (!on || !nr_off || !thru) {
+        audio_pipeline_destroy(on); audio_pipeline_destroy(nr_off);
+        audio_pipeline_destroy(thru);
+        return;
+    }
+    CHECK(audio_pipeline_get_nr(nr_off) == NULL &&
+          audio_pipeline_set_nr_mode(nr_off, MMSE_LSA_NR_MILD) == -1,
+          "NR-disabled instance has no denoiser and refuses a mode change");
+    hop = audio_pipeline_hop_size(on);
+    frame = 2 * hop;                     /* 50% overlap: FFT == frame == 2 hops */
+    init_hops = mmse_lsa_retime_frames(20, 16000, hop);
+    total_hops = init_hops + 120;
+    fft_mem = malloc(fft_get_mem_size(frame));
+    fft = fft_mem ? fft_init(fft_mem, fft_get_mem_size(frame), frame) : NULL;
+    CHECK(fft != NULL, "test-side synthesis FFT builds");
+    if (fft) {
+        float* mic = (float*)malloc((size_t)hop * sizeof(float));
+        float* ref = (float*)malloc((size_t)hop * sizeof(float));
+        float* o_on = (float*)malloc((size_t)hop * sizeof(float));
+        float* o_nr_off = (float*)malloc((size_t)hop * sizeof(float));
+        float* o_thru = (float*)malloc((size_t)hop * sizeof(float));
+        float* win = (float*)malloc((size_t)frame * sizeof(float));
+        float* ola = (float*)calloc((size_t)frame, sizeof(float));
+        float* ibuf = (float*)malloc((size_t)frame * sizeof(float));
+        for (i = 0; i < frame; i++)
+            win[i] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * (float)i / (float)frame)));
+        for (h = 0; h < total_hops; h++) {
+            AecResContext ctx;
+            for (i = 0; i < hop; i++) {
+                float t = (float)(h * hop + i);
+                float r = 0.6f * sinf(0.06f * t);
+                ref[i] = r;
+                /* lcg_sample() spans +-0.25: 0.08 x that is a +-0.02 broadband
+                 * term, so the denoiser has something to shape after init. */
+                mic[i] = 0.5f * r + 0.02f * sinf(0.017f * t) + 0.08f * lcg_sample();
+            }
+            audio_pipeline_process(on, mic, ref, o_on);
+            audio_pipeline_process(nr_off, mic, ref, o_nr_off);
+            audio_pipeline_process(thru, mic, ref, o_thru);
+            /* Reference: the seam spectrum the thru instance just applied gain
+             * 1.0 to, resynthesised with the same window and overlap. */
+            aec_get_res_context(audio_pipeline_get_aec(thru), &ctx);
+            fft_inverse(fft, ctx.error_spec, ibuf);
+            for (i = 0; i < frame; i++) ola[i] += ibuf[i] * win[i];
+            if (h >= 4)
+                for (i = 0; i < hop; i++) {
+                    double e_thru = fabs((double)o_thru[i] - ola[i]);
+                    double e_on = fabs((double)o_on[i] - ola[i]);
+                    if (fabs(ola[i]) > max_abs) max_abs = fabs(ola[i]);
+                    if (e_thru > err_thru) err_thru = e_thru;
+                    if (e_on > err_on) err_on = e_on;
+                }
+            memmove(ola, ola + hop, (size_t)(frame - hop) * sizeof(float));
+            memset(ola + (frame - hop), 0, (size_t)hop * sizeof(float));
+            if (h < init_hops) {
+                if (memcmp(o_on, o_nr_off, (size_t)hop * sizeof(float)) != 0)
+                    prefix_equal = 0;
+                for (i = 0; i < hop; i++) if (o_nr_off[i] != 0.0f) prefix_nonzero = 1;
+            } else if (memcmp(o_on, o_nr_off, (size_t)hop * sizeof(float)) != 0) {
+                diverged = 1;
+            }
+        }
+        free(mic); free(ref); free(o_on); free(o_nr_off); free(o_thru);
+        free(win); free(ola); free(ibuf);
+        fft_destroy(fft);
+    }
+    free(fft_mem);
+    CHECK(prefix_equal,
+          "NR-disabled output is bit-identical to NR-enabled while the denoiser "
+          "passes through -- the RES-only branch applies G_res with nothing of its own");
+    CHECK(prefix_nonzero, "that identity window carries a non-zero signal");
+    CHECK(diverged, "the two paths diverge once the denoiser starts shaping");
+    printf("  NR/RES switches: max|seam|=%.4f  err thru=%.2e  default=%.2e\n",
+           max_abs, err_thru, err_on);
+    CHECK(max_abs > 1e-3, "the seam reference carries signal");
+    CHECK(err_thru <= 1e-4 * max_abs,
+          "with NR, RES and CNG off the post path is a transparent synthesis of "
+          "the seam spectrum");
+    CHECK(err_on > 1e-2 * max_abs,
+          "the default instance shapes the same stimulus, so the identity above "
+          "constrains the bypass and not the stimulus");
+    audio_pipeline_destroy(on); audio_pipeline_destroy(nr_off);
+    audio_pipeline_destroy(thru);
+}
+
 static void test_init_ex_descriptor(void) {
     AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
     AudioPipelineMemReq req;
@@ -961,13 +1180,19 @@ int main(void) {
         test_validation(sr, fft_size, r == 0); /* 44100 rejection checked once */
         test_pool_rejection(sr, fft_size);
         test_create_vs_init_parity(sr, fft_size, hop_count);
-        test_reset_equals_fresh_instance(sr, fft_size, /*enable_cng=*/1);
-        test_reset_equals_fresh_instance(sr, fft_size, /*enable_cng=*/0);
+        test_reset_equals_fresh_instance(
+            sr, fft_size, /*enable_cng=*/1, /*enable_nr=*/1);
+        test_reset_equals_fresh_instance(
+            sr, fft_size, /*enable_cng=*/0, /*enable_nr=*/1);
+        test_reset_equals_fresh_instance(
+            sr, fft_size, /*enable_cng=*/0, /*enable_nr=*/0);
         test_destroy_idempotence(sr, fft_size);
     }
 
     printf("\n=== AudioPipelineConfig reject-first validation ===\n");
     test_config_validation_rejects();
+    test_near_end_protect_switch();
+    test_nr_res_switches();
 
     printf("\n=== audio_pipeline_init_ex descriptor gate ===\n");
     test_init_ex_descriptor();

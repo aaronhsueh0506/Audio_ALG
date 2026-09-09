@@ -457,7 +457,7 @@ static int run_static_parity(int sample_rate, int fft_size) {
     CHECK(audio_pipeline_4ch_get_mem_requirements(&cfg, &req) == 0,
           "static memory requirement query succeeds");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_LAYOUT_VERSION &&
-              AUDIO_PIPELINE_4CH_LAYOUT_VERSION == 11u,
+              AUDIO_PIPELINE_4CH_LAYOUT_VERSION == 12u,
           "the queried descriptor publishes the current carve layout");
     CHECK(req.bytes <= (uint64_t)SIZE_MAX,
           "static memory requirement fits size_t");
@@ -651,6 +651,24 @@ static int run_all_tests(void) {
         CHECK(res_only != NULL,
               "standard wrapper accepts the RES-only post profile");
         audio_pipeline_4ch_destroy(res_only);
+    }
+    invalid = audio_pipeline_4ch_default_config(16000);
+    CHECK(invalid.core.enable_near_end_protect == 0,
+          "standard wrapper default leaves the near-end floor lift off");
+    invalid.core.enable_near_end_protect = 1;
+    {
+        AudioPipeline4Ch* lifted = audio_pipeline_4ch_create(&invalid);
+        CHECK(lifted != NULL,
+              "standard wrapper accepts the near-end floor lift");
+        audio_pipeline_4ch_destroy(lifted);
+    }
+    invalid = audio_pipeline_4ch_default_config(16000);
+    invalid.core.enable_res = 0;
+    {
+        AudioPipeline4Ch* nr_only = audio_pipeline_4ch_create(&invalid);
+        CHECK(nr_only != NULL,
+              "standard wrapper accepts the NR-only post profile");
+        audio_pipeline_4ch_destroy(nr_only);
     }
     invalid = audio_pipeline_4ch_default_config(16000);
     invalid.gsc_lambda = 1.0f + 1e-6f;

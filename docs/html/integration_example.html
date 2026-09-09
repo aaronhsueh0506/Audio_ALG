@@ -227,11 +227,11 @@ if (cfg->model.io_descriptor &amp;&amp;
 <h2>6. <code>layout_version</code> 對整合者的意義</h2>
 <div class="tblwrap"><table>
 <tr><th>Pipeline</th><th>目前版本</th></tr>
-<tr><td><code>mono_aec_nr_res</code></td><td><code>AUDIO_PIPELINE_LAYOUT_VERSION</code> = 10</td></tr>
-<tr><td><code>4ch_aec_bf_nr_res</code>(核心)</td><td><code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = 16</td></tr>
-<tr><td><code>4ch_aec_bf_nr_res</code>(完整 wrapper)</td><td><code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION</code> = 11</td></tr>
+<tr><td><code>mono_aec_nr_res</code></td><td><code>AUDIO_PIPELINE_LAYOUT_VERSION</code> = 11</td></tr>
+<tr><td><code>4ch_aec_bf_nr_res</code>(核心)</td><td><code>FOUR_AEC_NR_RES_LAYOUT_VERSION</code> = 17</td></tr>
+<tr><td><code>4ch_aec_bf_nr_res</code>(完整 wrapper)</td><td><code>AUDIO_PIPELINE_4CH_LAYOUT_VERSION</code> = 12</td></tr>
 <tr><td><code>mono_alignulcnet</code></td><td><code>AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION</code> = 12</td></tr>
-<tr><td><code>4ch_alignulcnet</code></td><td><code>AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION</code> = 17</td></tr>
+<tr><td><code>4ch_alignulcnet</code></td><td><code>AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION</code> = 18</td></tr>
 </table></div>
 <div class="warn"><b>版本一動,任何持久化的 descriptor 都必須丟棄重查。</b>關鍵微妙處:<code>build_flags_hash</code> 只是 carve token 字串的 FNV-1a,<b>不含任何 sizeof／byte count</b> → 當 control block 只是<b>長大</b>而 carve 結構沒變時,hash <b>不會動</b>。所以 <code>layout_version</code> 是<b>唯一</b>訊號。<br>「a descriptor from a version-10 build must be refused, <b>including when its cached byte count still covers the current pool</b>」——descriptor 的 <code>bytes</code> 比較是下界,擋得住成長、擋不住等量語意變更。</div>
 <p class="small">4ch ULCNet 的版本會<b>純轉播</b>下層 core 的版本:core 只長 control block 時兩層 hash 都不動,只能靠本層 <code>layout_version</code> 一起 bump 來攔。</p>

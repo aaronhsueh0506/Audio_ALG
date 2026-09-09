@@ -8,7 +8,7 @@ mic/ref → linear AEC (aec_process_context(): context-only, no emit)
               └─ AecResContext {R², G_res, CNG, far power} ─────┤
                                                                 ↓
                                   G_total = min(G_nr, G_res)
-                                  + near-end floor + CNG
+                                  + near-end floor (enable_near_end_protect, default off) + CNG
                                                                 ↓
                                                        one iFFT/OLA
 

@@ -56,7 +56,7 @@ aligned (both libraries assert this).
 
 ```
 1. query    AudioPipelineConfig cfg = audio_pipeline_default_config(sample_rate);
-            cfg.aec_preset/nr_mode/aec_only/enable_cng/legacy_amin = ...;
+            cfg.aec_preset/nr_mode/aec_only/enable_nr/enable_res/enable_cng/legacy_amin/enable_near_end_protect = ...;
             AudioPipelineMemReq req;
             audio_pipeline_get_mem_requirements(&cfg, &req);   // -> req.bytes/alignment/...
             // Query THIS SAME `req`, fresh, immediately before every

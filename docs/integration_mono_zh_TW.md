@@ -313,9 +313,12 @@ AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
 | `fft_size` | `int` | `0` | `0` = 依 rate 取預設。明確指定時：8 kHz 只接受 `256`；16 kHz 接受 `256` 或 `512`；48 kHz 只接受 `1024`。其他組合拒絕 | 除非你有明確理由要 16 kHz 的 512 grid，否則留 `0` |
 | `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `AEC_PRESET_MILD`(0) / `AEC_PRESET_BALANCED`(1) / `AEC_PRESET_AGGRESSIVE`(2)。列舉以外的整數會被拒絕（**不會**默默 fallback 成 balanced） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
 | `nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED`（= 2） | `MMSE_LSA_NR_MILD`(0) / `MMSE_LSA_NR_MODERATE`(1) / `MMSE_LSA_NR_BALANCED`(2) / `MMSE_LSA_NR_AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度。四級都可用（CLI 只認得其中三個，library API 四個都能設） |
+| `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不建 MMSE-LSA（state 不進 pool、`get_nr()` 回 `NULL`），`g_total` 只剩 `G_res`。`aec_only=1` 時無作用 |
+| `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不套 AEC3 殘留 gain（`G_res` 視為 1），`g_total` 只剩 `G_nr`，CNG 因為沒有被 RES 挖掉的 bin 而不填。兩者都 `0` 就是線性殘差經合成直通。`aec_only=1` 時無作用 |
 | `aec_only` | `int`（bool） | `0` | 只接受 `0` 或 `1`。`2` 之類的「truthy」值會被拒絕 | `1` = 只跑 linear AEC，完全跳過 NR/RES/最終 OLA。用來隔離問題，或你自己接後級。此時 `get_nr()` 回 `NULL`，且 FFT/NR/pipeline buffer 都不配置 |
 | `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 AEC 抑制掉的 bin 填舒適噪音。實際生效值是「AEC preset 自己的 `enable_cng`」與這個欄位的 AND |
 | `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = 回到舊的 min-only 行為：NR 的 noise floor 不摺入 R²，且 near-end floor 強度固定。只用於比對舊行為，新整合請保持 `0` |
+| `enable_near_end_protect` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = 逐 bin 的 near-end floor lift：把 `g_total` 往 1 混合，強度 = （遠端靜音 0.4／活動 0.2）× `G_res·(1−R²/|E|²)` × `clip((G_nr−0.1)/0.9)`。噪聲 bin 拿不到 lift、保有完整 NR 深度；NR 留在 1 附近的語音 bin 被保護。`enable_nr=0` 時語音證據為 1、所有無 echo bin 都保護 |
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）
 
@@ -345,8 +348,11 @@ AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
 | `fixed_delay_samples` | 僅 `FIXED` 有效：ring 大小 = `ALIGN16((fixed_delay_samples+hop)×4)` B |
 | `aec_preset` | 實測不變 |
 | `nr_mode` | 實測不變 |
+| `enable_nr` | 會（`0` 省下整份 MMSE-LSA state；`enable_nr`／`enable_res` 任一為 `0` 多一份 `n_freqs` float 的 unity gain） |
+| `enable_res` | 見上列 |
 | `enable_cng` | 不變 |
 | `legacy_amin` | 不變 |
+| `enable_near_end_protect` | 不變 |
 
 ### 4.4 診斷用的分項
 
@@ -364,7 +370,7 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout（layout_version=10）、`BACKEND=kiss`、`pipelines/Makefile`
+以下是**本次 checkout（layout_version=11）、`BACKEND=kiss`、`pipelines/Makefile`
 預設選項**下，直接以 `--print-mem-size` 量到的值。換 backend、換編譯選項、更新
 submodule 都會變。
 
@@ -564,7 +570,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `2` |
-| 4 | `layout_version` | `uint32_t` | `10` |
+| 4 | `layout_version` | `uint32_t` | `11` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

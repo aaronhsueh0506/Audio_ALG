@@ -304,8 +304,10 @@ AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
 | `core.aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED` | `MILD` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
 | `core.nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED` | `MILD` / `MODERATE` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
 | `core.enable_nr` | `int`（bool） | `1` | `0` 或 `1` | `0` = post 級跳過 MMSE-LSA，只留 RES／CNG／iFFT／WOLA |
+| `core.enable_res` | `int`（bool） | `1` | `0` 或 `1` | `0` = 不建 post-beam RES，只留 NR／iFFT／WOLA（CNG 略過）；與 `enable_nr` 都 `0` 即 beamform 後線性誤差直通 |
 | `core.enable_cng` | `int`（bool） | `1` | `0` 或 `1` | — |
 | `core.legacy_amin` | `int`（bool） | `0` | `0` 或 `1` | 新整合保持 `0` |
+| `core.enable_near_end_protect` | `int`（bool） | `0` | `0` 或 `1` | `1` = 逐 bin、以 NR 語音證據為條件的 near-end floor lift；兩個值下噪聲 bin 都保有完整 NR 深度 |
 
 > Quarantine 窗只對「連續符合條件的 backward episode」有界。候選轉為
 > forward／無效、confidence 中斷，或 proxy lane 的 cancellation 證據消失時
@@ -479,7 +481,7 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 | `geometry` 與座標 | 不變 |
 
 `BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設下的 `req.bytes`
-（本次 checkout，`layout_version=11`；最後一欄標明每一列的來源）。本輪
+（本次 checkout，`layout_version=12`；最後一欄標明每一列的來源）。本輪
 `sizeof(Aec)` 由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數
 （16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B），四路即四倍，
 每一列都跟著移動：
@@ -728,7 +730,7 @@ Config：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `10` |
+| 4 | `layout_version` | `uint32_t` | `12` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（直接沿用核心層的值，永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，**已把核心層的 `build_flags_hash` 摺進去** |
 | 16 | `alignment` | `uint32_t` | `16` |

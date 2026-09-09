@@ -12,9 +12,8 @@
  *   - synth_win/ola/... are now per-INSTANCE (an AudioPipeline
  *     field), not per-process-invocation locals — multiple instances (or one
  *     instance across an audio_pipeline_reset()) never share state.
- *   - The comfort-noise generator and the near-end-floor hangover counter
- *     (`near_hang`) move from a file-global / a `main()` stack local into
- *     per-instance fields, so multiple instances (or one instance across a
+ *   - The comfort-noise generator moves from a file-global into a
+ *     per-instance field, so multiple instances (or one instance across a
  *     reset) never share a noise sequence. The generator itself is lib/aec's
  *     own comfort-noise recipe (see the cng_lut_index() comment below), not
  *     the CLIs' former xorshift+Box-Muller pair: the injected noise has the
@@ -89,8 +88,12 @@
 #define PROD_NE_FLOOR             0.4f
 #define PROD_NE_FLOOR_FAR_ACTIVE  0.2f
 #define PROD_FAR_GATE_THRESH      1e-4f
-#define PROD_NEAR_GATE_THRESH     1e-3f
-#define PROD_NEAR_HANGOVER        8
+/* Speech evidence for the near-end lift, read off the denoiser's own gain:
+ * S = clip((G_nr - LO) / (HI - LO), 0, 1). LO is at or above every preset's
+ * gain floor (mild's g_min is 0.1), so a bin parked at that floor contributes
+ * no lift. */
+#define PROD_NE_SPEECH_GAIN_LO    0.1f
+#define PROD_NE_SPEECH_GAIN_HI    1.0f
 #define PSD_SCALE                 (32768.0f * 32768.0f)  /* int16^2 (Python _PSD_SCALE) */
 
 /* Comfort-noise generator seed -- the constant both CLIs' old file-global
@@ -150,8 +153,12 @@
  * says why), that struct went 16 -> 20 B, and ALIGN16(sizeof(AudioPipeline))
  * had no slack left to absorb it -- 176 -> 192 B, measured through
  * `--print-mem-size`, not derived. Carve order and buffer set are unchanged,
- * so build_flags_hash does not move -- this counter is the only signal. */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 10u
+ * so build_flags_hash does not move -- this counter is the only signal.
+ * Bumped 10->11: AudioPipelineConfig gained enable_near_end_protect. No
+ * carve changed and the pool byte count is identical, so neither the count
+ * nor build_flags_hash can signal it; the config struct grew (C ABI) and the
+ * default post output differs, and this counter is the only signal. */
+#define AUDIO_PIPELINE_LAYOUT_VERSION 11u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
  * -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" or \"ne10\" to match its own
@@ -234,7 +241,10 @@ struct AudioPipeline {
     /* effective per-instance config (already resolved from AudioPipelineConfig
      * + preset -- see derive_dims_and_configs) */
     int aec_only;
+    int enable_nr;
+    int enable_res;
     int legacy_amin;
+    int enable_near_end_protect;
     int enable_cng_effective;   /* aec_cfg.enable_cng (preset, always 1 today) && cfg.enable_cng */
     int sample_rate, hop, frame_sz, fft_sz, n_freqs;
 
@@ -243,8 +253,8 @@ struct AudioPipeline {
     FftHandle*       fft;
     MmseLsaDenoiser* nr;
 
-    /* the pipeline's 7 scratch buffers (point into `pool` below; all seven
-     * are NULL when aec_only). There is no g_aec
+    /* the pipeline's scratch buffers (point into `pool` below; all NULL
+     * when aec_only). There is no g_aec
      * buffer: Stage 3a used to memcpy ctx.res_gain into one every hop purely
      * to have a stable pointer for sk_min_f32()/the CNG loop, but
      * AecResContext's own doc guarantees ctx.res_gain aliases AEC's internal
@@ -267,11 +277,11 @@ struct AudioPipeline {
     float*   extra;        /* iff !aec_only */
     float*   e2;           /* iff !aec_only */
     Complex* spec;         /* iff !aec_only */
+    float*   unity_gain;   /* iff !aec_only && unity_gain_needed(): the all-ones
+                            * gain read in place of a disabled source */
 
-    /* per-instance comfort-noise RNG + near-end-floor hangover counter */
+    /* per-instance comfort-noise RNG */
     uint32_t rng_state;
-    int      near_hang;
-    int      near_hangover_frames;  /* PROD_NEAR_HANGOVER retimed to this grid's hop */
 
     /* Per-hop wall-clock stage timing -- see AudioPipelineLastTiming's doc
      * comment (audio_pipeline.h) for the stage-boundary reference. Present
@@ -335,8 +345,11 @@ static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
             return -1;
     }
     AP_CK_BOOL(aec_only);
+    AP_CK_BOOL(enable_nr);
+    AP_CK_BOOL(enable_res);
     AP_CK_BOOL(enable_cng);
     AP_CK_BOOL(legacy_amin);
+    AP_CK_BOOL(enable_near_end_protect);
 
 #undef AP_CK_BOOL
 
@@ -368,15 +381,21 @@ static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
  * pipeline_pool_size -- same field order, same ALIGN16 bumps)
  * ========================================================================== */
 
+/* "a disabled gain source is read as the unity vector" -- named once so the
+ * sizing and the carve below cannot disagree about when that vector exists. */
+static int unity_gain_needed(int enable_nr, int enable_res) {
+    return !enable_nr || !enable_res;
+}
+
 static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* nr_cfg,
                                   int hop, int frame_sz, int fft_sz, int n_freqs,
-                                  int aec_only) {
+                                  int aec_only, int enable_nr, int enable_res) {
     (void)hop;   /* kept for signature symmetry with pipeline_build() below
                   * (same field order/call shape); no buffer here is sized
                   * from hop since aec_out (the last one that was) is gone. */
     size_t aec_sz     = aec_get_mem_size(aec_cfg);
     size_t fft_sz_mem = aec_only ? 0 : fft_get_mem_size(fft_sz);
-    size_t nr_sz      = aec_only ? 0 : mmse_lsa_get_mem_size(nr_cfg);
+    size_t nr_sz      = (aec_only || !enable_nr) ? 0 : mmse_lsa_get_mem_size(nr_cfg);
 
     size_t pipe = 0;
     if (!aec_only) {
@@ -387,6 +406,8 @@ static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* 
         pipe += ALIGN16((size_t)n_freqs  * sizeof(float));   /* extra     */
         pipe += ALIGN16((size_t)n_freqs  * sizeof(float));   /* e2        */
         pipe += ALIGN16((size_t)n_freqs  * sizeof(Complex)); /* spec      */
+        if (unity_gain_needed(enable_nr, enable_res))
+            pipe += ALIGN16((size_t)n_freqs * sizeof(float)); /* unity_gain */
     }
 
     return ALIGN16(aec_sz) + ALIGN16(fft_sz_mem) + ALIGN16(nr_sz) + pipe;
@@ -402,8 +423,9 @@ static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* 
 static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
                            const AecConfig* aec_cfg, const MmseLsaConfig* nr_cfg,
                            int hop, int frame_sz, int fft_sz, int n_freqs,
-                           int aec_only) {
-    size_t needed = pipeline_pool_size(aec_cfg, nr_cfg, hop, frame_sz, fft_sz, n_freqs, aec_only);
+                           int aec_only, int enable_nr, int enable_res) {
+    size_t needed = pipeline_pool_size(aec_cfg, nr_cfg, hop, frame_sz, fft_sz, n_freqs,
+                                        aec_only, enable_nr, enable_res);
     if (!pool || pool_size < needed) {
         AP_LOG_ERR("audio_pipeline: sub-pool too small (%zu < %zu)\n", pool_size, needed);
         return -1;
@@ -422,11 +444,13 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
         p->fft = fft_init(ptr, fft_mem, fft_sz);
         ptr += ALIGN16(fft_mem);
 
-        size_t nr_sz = mmse_lsa_get_mem_size(nr_cfg);
-        p->nr = mmse_lsa_init(ptr, nr_sz, nr_cfg);
-        ptr += ALIGN16(nr_sz);
+        if (enable_nr) {
+            size_t nr_sz = mmse_lsa_get_mem_size(nr_cfg);
+            p->nr = mmse_lsa_init(ptr, nr_sz, nr_cfg);
+            ptr += ALIGN16(nr_sz);
+        }
 
-        if (!p->fft || !p->nr) { AP_LOG_ERR("audio_pipeline: NR/FFT init failed\n"); return -1; }
+        if (!p->fft || (enable_nr && !p->nr)) { AP_LOG_ERR("audio_pipeline: NR/FFT init failed\n"); return -1; }
     }
 
     if (!aec_only) {
@@ -437,6 +461,10 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
         p->extra     = (float*)ptr;   ptr += ALIGN16((size_t)n_freqs  * sizeof(float));
         p->e2        = (float*)ptr;   ptr += ALIGN16((size_t)n_freqs  * sizeof(float));
         p->spec      = (Complex*)ptr; ptr += ALIGN16((size_t)n_freqs  * sizeof(Complex));
+        if (unity_gain_needed(enable_nr, enable_res)) {
+            p->unity_gain = (float*)ptr; ptr += ALIGN16((size_t)n_freqs * sizeof(float));
+            for (int k = 0; k < n_freqs; k++) p->unity_gain[k] = 1.0f;
+        }
 
         /* Explicit zero of every pipeline-owned STATE buffer (F20: a dirty
          * pool must be safe without the caller's blanket memset). `synth_win`
@@ -473,8 +501,8 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
     }
     if (!aec_only) {
         int fft_nf = fft_get_n_freqs(p->fft);
-        int nr_nf  = mmse_lsa_get_n_freqs(p->nr);
-        if (fft_nf != n_freqs || nr_nf != n_freqs) {
+        int nr_nf  = p->nr ? mmse_lsa_get_n_freqs(p->nr) : -1;   /* -1: no denoiser */
+        if (fft_nf != n_freqs || (p->nr && nr_nf != n_freqs)) {
             AP_LOG_ERR("audio_pipeline: FATAL grid mismatch -- pipeline n_freqs=%d, "
                             "fft n_freqs=%d, nr n_freqs=%d\n", n_freqs, fft_nf, nr_nf);
             return -1;
@@ -497,8 +525,8 @@ static uint32_t audio_pipeline_build_flags_hash(void) {
     h = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, h);
     /* Literal carve-order token list -- bump AUDIO_PIPELINE_LAYOUT_VERSION
      * (and update this string) whenever the buffer set/order changes. */
-    h = fnv1a_str("|carve:self(config-delay-v2),aec,fft,nr,synth_win,ola,"
-                  "ifft_buf,g_total,extra,e2,spec", h);
+    h = fnv1a_str("|carve:self(config-delay-v2),aec,fft,nr?,synth_win,ola,"
+                  "ifft_buf,g_total,extra,e2,spec,unity?", h);
     h = fnv1a_str("|align16", h);
     return h;
 }
@@ -519,8 +547,11 @@ AudioPipelineConfig audio_pipeline_default_config(int sample_rate) {
     cfg.aec_preset  = AEC_PRESET_BALANCED;
     cfg.nr_mode     = MMSE_LSA_NR_BALANCED;
     cfg.aec_only    = 0;
+    cfg.enable_nr   = 1;
+    cfg.enable_res  = 1;
     cfg.enable_cng  = 1;
     cfg.legacy_amin = 0;
+    cfg.enable_near_end_protect = 0;
     return cfg;
 }
 
@@ -540,9 +571,8 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
     size_t aec_sz = aec_get_mem_size(&aec_cfg);
     if (aec_sz == 0) return -1;
     if (!cfg->aec_only) {
-        size_t fft_mem = fft_get_mem_size(fft_sz);
-        size_t nr_sz   = mmse_lsa_get_mem_size(&nr_cfg);
-        if (fft_mem == 0 || nr_sz == 0) return -1;
+        if (fft_get_mem_size(fft_sz) == 0 ||
+            (cfg->enable_nr && mmse_lsa_get_mem_size(&nr_cfg) == 0)) return -1;
     }
 
     /* backend_id: reject up front (same reject-first shape as
@@ -556,7 +586,7 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
     if (backend_id == 0u) return -1;
 
     size_t sub_total = pipeline_pool_size(&aec_cfg, &nr_cfg, hop, frame_sz, fft_sz, n_freqs,
-                                           cfg->aec_only);
+                                           cfg->aec_only, cfg->enable_nr, cfg->enable_res);
     size_t self_sz   = ALIGN16(sizeof(AudioPipeline));
     /* self_sz + sub_total: both operands are bounded well under SIZE_MAX in
      * any realistic config (sub_total already went through mem_align.h's
@@ -666,7 +696,7 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
     }
     size_t sub_bytes = bytes - self_sz;
     size_t sub_needed = pipeline_pool_size(&aec_cfg, &nr_cfg, hop, frame_sz, fft_sz, n_freqs,
-                                            cfg->aec_only);
+                                            cfg->aec_only, cfg->enable_nr, cfg->enable_res);
     if (sub_needed == 0 || sub_bytes < sub_needed) {
         AP_LOG_ERR("audio_pipeline_init: pool too small (%zu available < %zu needed)\n",
                 sub_bytes, sub_needed);
@@ -678,25 +708,22 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
     void* sub_pool = (uint8_t*)mem + self_sz;
 
     if (pipeline_build(p, sub_pool, sub_bytes, &aec_cfg, &nr_cfg,
-                        hop, frame_sz, fft_sz, n_freqs, cfg->aec_only) != 0) {
+                        hop, frame_sz, fft_sz, n_freqs, cfg->aec_only,
+                        cfg->enable_nr, cfg->enable_res) != 0) {
         return NULL;
     }
 
     p->aec_only            = cfg->aec_only;
     p->legacy_amin          = cfg->legacy_amin;
-    p->enable_cng_effective = aec_cfg.enable_cng && cfg->enable_cng;
+    p->enable_near_end_protect = cfg->enable_near_end_protect;
+    p->enable_nr             = cfg->enable_nr;
+    p->enable_res            = cfg->enable_res;
+    /* Comfort noise fills only the bins the AEC3 residual gain cut, so it has
+     * nothing to fill without that gain. */
+    p->enable_cng_effective = aec_cfg.enable_cng && cfg->enable_cng && cfg->enable_res;
     p->sample_rate          = cfg->sample_rate;
     p->hop = hop; p->frame_sz = frame_sz; p->fft_sz = fft_sz; p->n_freqs = n_freqs;
     p->rng_state  = AUDIO_PIPELINE_RNG_SEED;
-    p->near_hang  = 0;
-    /* PROD_NEAR_HANGOVER (8) is a 10-ms-hop frame count (80 ms); was applied
-     * as a raw literal regardless of grid (20-60% off at every one of this
-     * pipeline's 3 real grids). Retimed the same way derive_dims_and_configs
-     * already retimes nr_cfg->L/alpha_d/alpha_attack just above, and the
-     * same way the Python reference (aec_nr_pipeline.py) already retimes
-     * this exact constant via retime_frame_count(). */
-    p->near_hangover_frames = mmse_lsa_retime_frames(
-        PROD_NEAR_HANGOVER, cfg->sample_rate, hop);
     p->pool       = sub_pool;
     p->pool_size  = sub_bytes;
     p->owned_heap = NULL;
@@ -822,9 +849,16 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
     }
     /* gain_out=NULL: mmse_lsa_get_gain() below reads the same buffer this
      * call just filled, no per-hop copy needed (layout v3). */
-    mmse_lsa_process_gain(p->nr, ctx.error_spec, nr_extra, NULL);
+    const float* nr_gain = p->unity_gain;
+    if (p->nr) {
+        mmse_lsa_process_gain(p->nr, ctx.error_spec, nr_extra, NULL);
+        nr_gain = mmse_lsa_get_gain(p->nr, NULL);
+    }
     uint32_t t1 = audio_pipeline_now_us();
-    p->last_timing.nr_us = t1 - t0;
+    p->last_timing.nr_us = p->nr ? t1 - t0 : 0;
+    /* A disabled gain source reads as the unity vector, so the fusion and the
+     * lift below need no second code path. */
+    const float* res_gain = p->enable_res ? ctx.res_gain : p->unity_gain;
 
     /* Stage 3a: g_total = min(G_nr, G_res). ctx.res_gain (= G_res, pre-min)
      * also sets the comfort-noise level below so CNG reflects AEC
@@ -837,41 +871,44 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
      * mmse_lsa_get_gain()'s buffer is stable until the next
      * mmse_lsa_process_gain()/mmse_lsa_process() call on this instance,
      * which also doesn't happen again before this hop finishes. */
-    sk_min_f32(p->g_total, mmse_lsa_get_gain(p->nr, NULL), ctx.res_gain,
-               n_freqs);
+    sk_min_f32(p->g_total, nr_gain, res_gain, n_freqs);
 
-    /* |E(f)|^2 scratch hoist: both the near-energy mean below and the
-     * echo-gated lift loop need re*re+im*im per bin. */
-    for (int k = 0; k < n_freqs; k++) {
-        float re = ctx.error_spec[k].r, im = ctx.error_spec[k].i;
-        p->e2[k] = re * re + im * im;
-    }
-
-    /* Stage 3b: far-activity + near-VAD gated near-end floor strength. */
-    float nf_eff = PROD_NE_FLOOR;
-    if (!p->legacy_amin) {
-        int far_active = ctx.far_power > PROD_FAR_GATE_THRESH;
-        float ne = 0.0f;
+    /* Stage 3b: per-bin, speech-conditional near-end lift, skipped with
+     * enable_near_end_protect = 0 (min(G_nr, G_res) is then applied as
+     * computed). Strength PROD_NE_FLOOR, dropping to PROD_NE_FLOOR_FAR_ACTIVE
+     * while the far end is active (legacy_amin keeps the scalar); per bin it
+     * is scaled by how echo-free the bin is (G_res * (1 - R^2/|E|^2)) and by
+     * how speech-like the denoiser left it,
+     *   S = clip((G_nr - PROD_NE_SPEECH_GAIN_LO)
+     *            / (PROD_NE_SPEECH_GAIN_HI - PROD_NE_SPEECH_GAIN_LO), 0, 1).
+     * A bin the denoiser took to its floor keeps the full NR depth; a bin it
+     * left near unity is held at the floor. The strength never depends on a
+     * broadband level, so a loud background neither caps the denoiser nor
+     * makes the floor follow the far talker. With enable_nr = 0, nr_gain is
+     * the unity vector and every echo-free bin is protected. */
+    if (p->enable_near_end_protect && ctx.r2) {
+        float nf_eff = PROD_NE_FLOOR;
+        if (!p->legacy_amin && ctx.far_power > PROD_FAR_GATE_THRESH)
+            nf_eff = PROD_NE_FLOOR_FAR_ACTIVE;
         for (int k = 0; k < n_freqs; k++) {
-            ne += p->e2[k];
+            float re = ctx.error_spec[k].r, im = ctx.error_spec[k].i;
+            p->e2[k] = re * re + im * im;
         }
-        ne /= (float)n_freqs;
-        if (ne > PROD_NEAR_GATE_THRESH) p->near_hang = p->near_hangover_frames;
-        int near_active = p->near_hang > 0;
-        if (p->near_hang > 0) p->near_hang--;
-        int protect = (!far_active) && near_active;
-        nf_eff = protect ? PROD_NE_FLOOR : PROD_NE_FLOOR_FAR_ACTIVE;
-    }
-
-    /* Per-bin echo-gated near-end lift (ne_gate='both': G_res*(1-echo_frac)). */
-    if (nf_eff > 0.0f && ctx.r2) {
         for (int k = 0; k < n_freqs; k++) {
             float r2_nr = p->extra[k];   /* == ctx.r2[k] / PSD_SCALE, already computed above */
             float echo_frac = r2_nr / (p->e2[k] + 1e-12f);
             if (echo_frac < 0.0f) echo_frac = 0.0f;
             if (echo_frac > 1.0f) echo_frac = 1.0f;
-            float no_echo = ctx.res_gain[k] * (1.0f - echo_frac);
+            float no_echo = res_gain[k] * (1.0f - echo_frac);
             float lift = nf_eff * no_echo;
+            float speech = 1.0f;
+            if (!p->legacy_amin) {
+                speech = (nr_gain[k] - PROD_NE_SPEECH_GAIN_LO)
+                       / (PROD_NE_SPEECH_GAIN_HI - PROD_NE_SPEECH_GAIN_LO);
+                if (speech < 0.0f) speech = 0.0f;
+                if (speech > 1.0f) speech = 1.0f;
+            }
+            lift *= speech;
             p->g_total[k] = (1.0f - lift) * p->g_total[k] + lift;   /* blend toward 1 */
         }
     }
@@ -936,8 +973,8 @@ void audio_pipeline_reset(AudioPipeline* p) {
     if (!p) return;
 
     aec_reset(p->aec);
-    if (!p->aec_only && p->nr) {
-        mmse_lsa_reset(p->nr);
+    if (!p->aec_only) {
+        if (p->nr) mmse_lsa_reset(p->nr);
 
         /* Re-zero pipeline-owned accumulator/scratch state (mirrors the
          * explicit zero at carve time). `synth_win` is a deterministic
@@ -952,7 +989,6 @@ void audio_pipeline_reset(AudioPipeline* p) {
     }
 
     p->rng_state = AUDIO_PIPELINE_RNG_SEED;
-    p->near_hang = 0;
 }
 
 void audio_pipeline_destroy(AudioPipeline* p) {
@@ -991,12 +1027,12 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
     size_t fft_mem = 0, nr_sz = 0;
     if (!cfg->aec_only) {
         fft_mem = fft_get_mem_size(fft_sz);
-        nr_sz   = mmse_lsa_get_mem_size(&nr_cfg);
-        if (fft_mem == 0 || nr_sz == 0) return -1;
+        if (cfg->enable_nr) nr_sz = mmse_lsa_get_mem_size(&nr_cfg);
+        if (fft_mem == 0 || (cfg->enable_nr && nr_sz == 0)) return -1;
     }
 
     size_t sub_total = pipeline_pool_size(&aec_cfg, &nr_cfg, hop, frame_sz, fft_sz, n_freqs,
-                                           cfg->aec_only);
+                                           cfg->aec_only, cfg->enable_nr, cfg->enable_res);
     size_t pipe_bufs = sub_total - ALIGN16(aec_sz) - ALIGN16(fft_mem) - ALIGN16(nr_sz);
 
     out->aec_bytes      = aec_sz;

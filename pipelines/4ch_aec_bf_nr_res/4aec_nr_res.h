@@ -150,8 +150,18 @@ extern "C" {
  *      possible carves changed, so persisted version-15 descriptors must be
  *      refused even when their byte count happens to be large enough. This
  *      is also a C struct-ABI change: callers must be rebuilt with this
- *      header and must not mix a version-15 object with a version-16 library. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 16u
+ *      header and must not mix a version-15 object with a version-16 library.
+ *
+ *  17: FourAecNrResConfig gained enable_near_end_protect and enable_res.
+ *      The default carve is unchanged -- the lift owns no state -- so the
+ *      byte count cannot signal this and the counter must: the embedded
+ *      config grew, every field after it in a wrapper's control block moved,
+ *      and the same descriptor now describes a post path whose default
+ *      output differs. With enable_res = 0 the post SG storage leaves the
+ *      carve, and with either enable_res or enable_nr at 0 an n-float unity
+ *      gain vector joins it, so the set of possible carves changed too. C
+ *      struct-ABI change as well: rebuild callers against this header. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 17u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -268,9 +278,24 @@ typedef struct FourAecNrResConfig {
     AecPreset aec_preset;
     MmseLsaNrMode nr_mode;
     int enable_post;              /* direct core: 1=RES/NR/iFFT, 0=pre-only;
-                                    * complete wrappers require caller value 1 */
+                                    * complete wrappers require caller value 1.
+                                    * Outranks enable_res/enable_nr: with 0 the
+                                    * post stage does not exist and both are
+                                    * inert; with 1 they select its two gain
+                                    * sources independently (both 0 = the
+                                    * beamformed linear error, synthesised). */
+    int enable_res;               /* bool: run the shared post-beam RES; when
+                                    * 0, G_res is unity, total_gain is the NR
+                                    * gain alone and CNG has nothing to fill  */
     int enable_nr;                /* bool: run shared MMSE-LSA; when 0, the
                                     * post path remains RES+CNG+iFFT/WOLA */
+    int enable_near_end_protect;  /* bool: per-bin near-end floor lift. 1
+                                    * blends total_gain toward 1 in bins that
+                                    * are echo-free (per RES and R^2) AND that
+                                    * the denoiser left speech-like (its gain
+                                    * above 0.1), by 0.4, or 0.2 while the far
+                                    * end is active; noise bins keep the full
+                                    * NR depth. 0 = min(G_nr, G_res) as is  */
     int enable_cng;               /* bool                                   */
     int legacy_amin;              /* bool: do not fold R2 into NR prior      */
 } FourAecNrResConfig;
@@ -634,7 +659,7 @@ int four_aec_nr_res_sample_rate(const FourAecNrRes* p);
 
 /* Structural audit hooks. The matcher count is 1 only in MATCHED mode and 0
  * in FIXED/EXTERNAL; the other values are 4 /
- * (enable_post && enable_nr) / enable_post. */
+ * (enable_post && enable_nr) / (enable_post && enable_res). */
 int four_aec_nr_res_matched_filter_count(const FourAecNrRes* p);
 int four_aec_nr_res_linear_aec_count(const FourAecNrRes* p);
 int four_aec_nr_res_nr_count(const FourAecNrRes* p);
@@ -719,10 +744,12 @@ unsigned long long four_aec_nr_res_duty_hops_run(const FourAecNrRes* p);
  * averages over a whole recording will therefore see a smaller move than the
  * dB step suggests, and it will also see the comfort-noise level shift.
  *
- * Requires enable_post (with enable_post = 0 there is no suppressor and no NR
- * instance at all). Call between hops, serialised with process_pre/post; not
+ * Requires enable_post and enable_res (with enable_post = 0 there is no
+ * suppressor and no NR instance at all; with enable_res = 0 the suppressor
+ * is not built). Call between hops, serialised with process_pre/post; not
  * thread-safe. Returns 0, or -1 on NULL, an out-of-enum preset, an
- * out-of-range ramp_ms, or a pre-only core. Nothing is written on -1. */
+ * out-of-range ramp_ms, or a core without a suppressor. Nothing is written
+ * on -1. */
 int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset,
                                    float ramp_ms);
 
@@ -736,7 +763,8 @@ int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset,
  * actually shapes the output (the lanes' own floors shape nothing), and the
  * pair together says whether a requested change has finished landing.
  *
- * Returns 0, or -1 on NULL or a pre-only core (no suppressor exists). */
+ * Returns 0, or -1 on NULL or a core without a suppressor (enable_post = 0 or
+ * enable_res = 0). */
 int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live,
                                      float* target);
 

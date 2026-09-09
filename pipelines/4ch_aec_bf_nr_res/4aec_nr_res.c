@@ -49,8 +49,12 @@
 #define PROD_NE_FLOOR             0.4f
 #define PROD_NE_FLOOR_FAR_ACTIVE 0.2f
 #define PROD_FAR_GATE_THRESH      1e-4f
-#define PROD_NEAR_GATE_THRESH     1e-3f
-#define PROD_NEAR_HANGOVER        8
+/* Speech evidence for the near-end lift, read off the denoiser's own gain:
+ * S = clip((G_nr - LO) / (HI - LO), 0, 1). LO is at or above every preset's
+ * gain floor (mild's g_min is 0.1), so a bin parked at that floor contributes
+ * no lift. */
+#define PROD_NE_SPEECH_GAIN_LO    0.1f
+#define PROD_NE_SPEECH_GAIN_HI    1.0f
 #define PSD_SCALE                 (32768.0f * 32768.0f)
 #define PIPELINE_RNG_SEED         0x9e3779b9u
 
@@ -197,7 +201,11 @@ struct FourAecNrRes {
     SuppressionGain post_sg;
     SuppressionGainConfig post_sg_cfg;
     SuppressionGainTuning post_sg_tun;
-    float* post_sg_storage;
+    float* post_sg_storage;     /* iff enable_post && enable_res; doubles as
+                                 * the "a suppressor exists" predicate      */
+    float* unity_gain;          /* iff enable_post && (!enable_res ||
+                                 * !enable_nr): all-ones gain read in place
+                                 * of a disabled source                     */
 
     FourAecLaneSnapshot snapshots[FOUR_AEC_NR_RES_CHANNELS];
 
@@ -244,8 +252,6 @@ struct FourAecNrRes {
     float* ola;
 
     uint32_t rng_state;
-    int near_hang;
-    int near_hangover_frames;  /* PROD_NEAR_HANGOVER retimed to this grid's hop */
 
     uint64_t next_frame;
     uint64_t generation;
@@ -377,6 +383,8 @@ static int derive_dims_and_configs(
     FOUR_CK_BOOL(legacy_amin);
     FOUR_CK_BOOL(enable_post);
     FOUR_CK_BOOL(enable_nr);
+    FOUR_CK_BOOL(enable_res);
+    FOUR_CK_BOOL(enable_near_end_protect);
 
 #undef FOUR_CK_BOOL
 
@@ -608,7 +616,8 @@ static int init_post_sg(FourAecNrRes* p,
 
 static size_t pipeline_buffer_size(
     int hop, int fft, int n, int post_ma_n, int delay_ring_size,
-    size_t delay_estimator_bytes, int enable_post) {
+    size_t delay_estimator_bytes, int enable_post, int enable_res,
+    int enable_nr) {
     size_t total = 0;
     int i;
 
@@ -633,10 +642,15 @@ static size_t pipeline_buffer_size(
      * fields are borrowed pointers into each lane's own AecResContext, not
      * pool-carved copies. See bind_lane_view()/carve_working_buffers(). */
 
-    total = ck_field_size(
-        total,
-        ck_mul_size((size_t)(10 + post_ma_n), (size_t)n),
-        sizeof(float));                                      /* post SG */
+    /* The post SG owns (10 + ma_n) x n floats. A disabled gain source is
+     * read as an n-float unity vector, carved once for either. */
+    if (enable_res)
+        total = ck_field_size(
+            total,
+            ck_mul_size((size_t)(10 + post_ma_n), (size_t)n),
+            sizeof(float));                                  /* post SG */
+    if (!enable_res || !enable_nr)
+        total = ck_field_size(total, (size_t)n, sizeof(float)); /* unity */
     }
     if (delay_estimator_bytes > 0)
         total = ck_add_size(total, ck_align16_size(delay_estimator_bytes));
@@ -656,7 +670,8 @@ static size_t pipeline_pool_size(
     int delay_ring_size,
     size_t delay_estimator_bytes,
     int enable_post,
-    int enable_nr) {
+    int enable_nr,
+    int enable_res) {
     /* "the MMSE-LSA region exists" -- NR lives only inside the post path, so
      * the pair is one fact. Named once here rather than re-spelled at each
      * of the three places below that need it. */
@@ -666,7 +681,7 @@ static size_t pipeline_pool_size(
     size_t fft_bytes = enable_post ? fft_get_mem_size(fft) : 0;
     size_t buffer_bytes = pipeline_buffer_size(
         hop, fft, n, post_ma_n, delay_ring_size, delay_estimator_bytes,
-        enable_post);
+        enable_post, enable_res, enable_nr);
     size_t total = 0;
     int ch;
 
@@ -721,8 +736,17 @@ static int pipeline_build(
         if (!p->fft) return 0;
     }
 
-    if (!carve_working_buffers(p, cursor) ||
-        (p->cfg.enable_post && !init_post_sg(p, cursor))) return 0;
+    if (!carve_working_buffers(p, cursor)) return 0;
+    if (p->cfg.enable_post) {
+        if (p->cfg.enable_res && !init_post_sg(p, cursor)) return 0;
+        if (!p->cfg.enable_res || !p->cfg.enable_nr) {
+            int k;
+            p->unity_gain = (float*)pool_carve(
+                cursor, (size_t)p->n_freqs, sizeof(float));
+            if (!p->unity_gain) return 0;
+            for (k = 0; k < p->n_freqs; ++k) p->unity_gain[k] = 1.0f;
+        }
+    }
     if (p->cfg.delay_mode == AEC_DELAY_MATCHED) {
         size_t delay_bytes = delay_aec3_get_mem_size(
             p->sample_rate, p->hop_size, p->cfg.delay_num_filters);
@@ -757,7 +781,7 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
     hash = fnv1a_str(
         "|carve:self,aec0,aec1,aec2,aec3,post?(nr?,fft),linear,hop3,"
-        "post?(hop1,complex4,float6,fftfloat3,postsg),"
+        "post?(hop1,complex4,float6,fftfloat3,res?postsg,unity?),"
         "lanebind,delayest?,delayring?",
         hash);
     hash = fnv1a_str("|align16", hash);
@@ -784,7 +808,9 @@ FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     cfg.aec_preset = AEC_PRESET_BALANCED;
     cfg.nr_mode = MMSE_LSA_NR_BALANCED;
     cfg.enable_post = 1;
+    cfg.enable_res = 1;
     cfg.enable_nr = 1;
+    cfg.enable_near_end_protect = 0;
     cfg.enable_cng = 1;
     cfg.legacy_amin = 0;
     return cfg;
@@ -812,7 +838,8 @@ int four_aec_nr_res_get_mem_requirements(
 
     pool_bytes = pipeline_pool_size(
         &aec_cfg, &nr_cfg, hop, fft, n, post_ma_n, delay_ring_size,
-        delay_estimator_bytes, cfg->enable_post, cfg->enable_nr);
+        delay_estimator_bytes, cfg->enable_post, cfg->enable_nr,
+        cfg->enable_res);
     total_bytes = ck_add_size(
         ck_align16_size(sizeof(FourAecNrRes)), pool_bytes);
     backend = four_aec_nr_res_backend_id();
@@ -911,14 +938,6 @@ FourAecNrRes* four_aec_nr_res_init_ex(
         p->duty_last_delay = -1;   /* the rest is zeroed by the pool memset */
     }
     p->rng_state = PIPELINE_RNG_SEED;
-    /* PROD_NEAR_HANGOVER (8) is a 10-ms-hop frame count (80 ms); was applied
-     * as a raw literal regardless of grid (20-60% off at every one of this
-     * pipeline's 3 real grids). Retimed the same way derive_dims_and_configs
-     * already retimes the NR config's L/alpha_d/alpha_attack, and the same
-     * way the mono pipeline's audio_pipeline.c now retimes this identical
-     * constant. */
-    p->near_hangover_frames = mmse_lsa_retime_frames(
-        PROD_NEAR_HANGOVER, cfg_copy.sample_rate, hop);
     p->pool_size = (size_t)current.bytes;
     p->construction_epoch = g_four_aec_nr_res_next_epoch++;
 
@@ -1807,6 +1826,43 @@ static int fuse_contexts(FourAecNrRes* p,
     return 1;
 }
 
+/* The shared post-beam RES: the power/reference preparation the suppression
+ * gain depends on, then the gain itself. error_power is already current. */
+static const float* post_res_gain(FourAecNrRes* p,
+                                  int all_converged,
+                                  float max_dt,
+                                  float max_saturation) {
+    int n = p->n_freqs;
+    int hop = p->hop_size;
+    int k;
+
+    four_aec_complex_mag2(p->post_near_power, p->fused_near, n);
+    for (k = 0; k < n; ++k) {
+        float e2 = p->error_power[k];
+        float n2 = p->post_near_power[k];
+        p->post_near_power[k] =
+            (all_converged ? fminf(e2, n2) : n2) *
+            PSD_SCALE;
+    }
+    for (k = 0; k < hop; ++k) {
+        p->render_i16[k] = p->aligned_ref[k] * 32768.0f;
+    }
+
+    if (p->post_sg.initial_state && all_converged)
+        suppression_gain_set_initial_state(&p->post_sg, 0);
+    p->post_sg.dt_protect_active = max_dt > 0.2f;
+    return suppression_gain_get_gain(
+        &p->post_sg,
+        p->post_near_power,
+        p->fused_r2,
+        p->fused_r2,
+        p->fused_comfort,
+        p->render_i16,
+        p->cfg.delay_mode == AEC_DELAY_MATCHED
+            ? delay_aec3_has_clockdrift(&p->shared_delay) : 0,
+        max_saturation > 0.5f);
+}
+
 static int run_post_res_and_nr(
     FourAecNrRes* p,
     int all_converged,
@@ -1826,42 +1882,26 @@ static int run_post_res_and_nr(
     float nf_eff;
     uint32_t t0, t1;
 
-    /* RES stage: the power/reference preparation this gain depends on, plus
-     * the suppression-gain computation itself. */
+    /* RES stage. error_power feeds the RES preparation, the lift's echo
+     * fraction and the denoiser's residual-echo prior alike, so both it and
+     * extra_noise are computed whether or not a suppressor exists. */
     t0 = four_aec_nr_res_now_us();
     four_aec_complex_mag2(p->error_power, error, n);
-    four_aec_complex_mag2(p->post_near_power, p->fused_near, n);
-    for (k = 0; k < n; ++k) {
-        float e2 = p->error_power[k];
-        float n2 = p->post_near_power[k];
-        p->post_near_power[k] =
-            (all_converged ? fminf(e2, n2) : n2) *
-            PSD_SCALE;
-        p->extra_noise[k] =
-            p->fused_r2[k] / PSD_SCALE;
+    for (k = 0; k < n; ++k)
+        p->extra_noise[k] = p->fused_r2[k] / PSD_SCALE;
+    if (p->post_sg_storage) {
+        res_gain = post_res_gain(p, all_converged, max_dt, max_saturation);
+    } else {
+        /* No suppressor: G_res reads as the unity vector, so min(G_nr, G_res)
+         * is the NR gain, the lift's no_echo term reduces to 1 - echo_fraction
+         * and CNG (which fills only RES-cut bins) is skipped. */
+        res_gain = p->unity_gain;
     }
-    for (k = 0; k < hop; ++k) {
-        p->render_i16[k] = p->aligned_ref[k] * 32768.0f;
-    }
-
-    if (p->post_sg.initial_state && all_converged)
-        suppression_gain_set_initial_state(&p->post_sg, 0);
-    p->post_sg.dt_protect_active = max_dt > 0.2f;
-    res_gain = suppression_gain_get_gain(
-        &p->post_sg,
-        p->post_near_power,
-        p->fused_r2,
-        p->fused_r2,
-        p->fused_comfort,
-        p->render_i16,
-        p->cfg.delay_mode == AEC_DELAY_MATCHED
-            ? delay_aec3_has_clockdrift(&p->shared_delay) : 0,
-        max_saturation > 0.5f);
     /* One stamp closes RES and opens NR: the two statements between them are
      * a branch and a ternary, so a second clock read would cost more than the
      * gap it measures and leave that gap unattributed. */
     t1 = four_aec_nr_res_now_us();
-    p->last_timing.res_us = t1 - t0;
+    p->last_timing.res_us = p->post_sg_storage ? t1 - t0 : 0;
     if (!res_gain) return 0;
 
     if (p->cfg.enable_nr) {
@@ -1874,66 +1914,63 @@ static int run_post_res_and_nr(
         p->last_timing.nr_us = 0;
     }
 
-    /* total_gain[k]=min(...) and the near_mean reduction below are mutually
-     * independent (neither reads the other's output), so they share one
-     * pass over n instead of two; the final echo_fraction/lift/output_spec
-     * loop still has to stay separate -- nf_eff is a scalar derived from
-     * near_mean plus the stateful near_hang hangover counter, so it must be
-     * fully resolved before any per-bin lift can be computed. */
+    /* Gain fusion. A disabled source reads as the unity vector, so one loop
+     * serves every combination: min(1, G_res) is G_res and min(G_nr, 1) is
+     * G_nr. */
     {
-        float near_mean = 0.0f;
-        /* Unswitched rather than a per-bin ternary: enable_nr cannot change
-         * within a hop, and at -O2 neither arm of that ternary is hoisted or
-         * if-converted -- nr_gain is NULL on the disabled path, so the load
-         * cannot be speculated and what remains is one branch per bin, 513 of
-         * them per hop on the 48 kHz grid. */
-        if (p->cfg.enable_nr) {
-            const float* nr_gain = mmse_lsa_get_gain(p->nr, NULL);
-            for (k = 0; k < n; ++k) {
-                p->total_gain[k] = fminf(nr_gain[k], res_gain[k]);
-                near_mean += p->error_power[k];
-            }
-        } else {
-            for (k = 0; k < n; ++k) {
-                p->total_gain[k] = res_gain[k];
-                near_mean += p->error_power[k];
-            }
-        }
-        near_mean /= (float)n;
+        const float* nr_gain =
+            p->cfg.enable_nr ? mmse_lsa_get_gain(p->nr, NULL) : p->unity_gain;
+        for (k = 0; k < n; ++k)
+            p->total_gain[k] = fminf(nr_gain[k], res_gain[k]);
 
+        /* Near-end floor strength for this hop: PROD_NE_FLOOR, dropping to
+         * PROD_NE_FLOOR_FAR_ACTIVE while the far end is active (legacy_amin
+         * keeps the scalar). */
         nf_eff = PROD_NE_FLOOR;
-        if (!p->cfg.legacy_amin) {
-            int far_active =
-                far_power > PROD_FAR_GATE_THRESH;
-            int near_active;
-            if (near_mean > PROD_NEAR_GATE_THRESH)
-                p->near_hang = p->near_hangover_frames;
-            near_active = p->near_hang > 0;
-            if (p->near_hang > 0) p->near_hang -= 1;
-            nf_eff = (!far_active && near_active)
-                ? PROD_NE_FLOOR
-                : PROD_NE_FLOOR_FAR_ACTIVE;
+        if (!p->cfg.legacy_amin && far_power > PROD_FAR_GATE_THRESH)
+            nf_eff = PROD_NE_FLOOR_FAR_ACTIVE;
+
+        /* Per-bin, speech-conditional near-end lift. It blends total_gain
+         * toward 1 by nf_eff, scaled by how echo-free the bin is (G_res times
+         * 1 - R^2/|E|^2) and by how speech-like the denoiser left it,
+         *   S = clip((G_nr - PROD_NE_SPEECH_GAIN_LO)
+         *            / (PROD_NE_SPEECH_GAIN_HI - PROD_NE_SPEECH_GAIN_LO), 0, 1).
+         * A bin the denoiser took down to its floor gets no lift and keeps the
+         * full NR depth; a bin it left near unity is held at the floor. The
+         * strength therefore never depends on a broadband level, so a loud
+         * background neither caps the denoiser nor makes the floor follow the
+         * far talker's rhythm. Without a denoiser nr_gain is the unity vector,
+         * S is exactly 1 and every echo-free bin is protected. */
+        if (p->cfg.enable_near_end_protect) {
+            for (k = 0; k < n; ++k) {
+                float echo_fraction =
+                    p->extra_noise[k] / (p->error_power[k] + 1e-12f);
+                float no_echo;
+                float lift;
+                float speech;
+                if (echo_fraction < 0.0f) echo_fraction = 0.0f;
+                if (echo_fraction > 1.0f) echo_fraction = 1.0f;
+                no_echo = res_gain[k] * (1.0f - echo_fraction);
+                lift = nf_eff * no_echo;
+                speech = 1.0f;
+                if (!p->cfg.legacy_amin) {
+                    speech = (nr_gain[k] - PROD_NE_SPEECH_GAIN_LO)
+                           / (PROD_NE_SPEECH_GAIN_HI - PROD_NE_SPEECH_GAIN_LO);
+                    if (speech < 0.0f) speech = 0.0f;
+                    if (speech > 1.0f) speech = 1.0f;
+                }
+                lift *= speech;
+                p->total_gain[k] =
+                    (1.0f - lift) * p->total_gain[k] + lift;
+            }
         }
     }
-
     for (k = 0; k < n; ++k) {
-        float echo_fraction =
-            p->extra_noise[k] / (p->error_power[k] + 1e-12f);
-        float no_echo;
-        float lift;
-        if (echo_fraction < 0.0f) echo_fraction = 0.0f;
-        if (echo_fraction > 1.0f) echo_fraction = 1.0f;
-        no_echo = res_gain[k] * (1.0f - echo_fraction);
-        lift = nf_eff * no_echo;
-        p->total_gain[k] =
-            (1.0f - lift) * p->total_gain[k] + lift;
-        p->output_spec[k].r =
-            error[k].r * p->total_gain[k];
-        p->output_spec[k].i =
-            error[k].i * p->total_gain[k];
+        p->output_spec[k].r = error[k].r * p->total_gain[k];
+        p->output_spec[k].i = error[k].i * p->total_gain[k];
     }
 
-    if (p->cfg.enable_cng) {
+    if (p->cfg.enable_cng && p->post_sg_storage) {
         for (k = 1; k < n - 1; ++k) {
             float n_amp =
                 p->fused_comfort[k] / PSD_SCALE;
@@ -2097,7 +2134,7 @@ static void reset_post_sg(FourAecNrRes* p) {
 
 int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live,
                                      float* target) {
-    if (!p || p->destroyed || !p->cfg.enable_post) return -1;
+    if (!p || p->destroyed || !p->post_sg_storage) return -1;
     if (live) *live = p->post_sg.split_floor_far_active_live;
     /* Report the RESET-SURVIVING copy, not post_sg.cfg: reset_post_sg()
      * rebuilds the suppressor from post_sg_cfg, so that is the value a caller
@@ -2115,7 +2152,7 @@ int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset,
      * refuses an out-of-enum value, where aec_config_from_preset() would fall
      * back to balanced. */
     if (aec_preset_floor_db(preset, &db) != 0) return -1;
-    if (!p->cfg.enable_post) return -1;  /* no post suppressor to retarget */
+    if (!p->post_sg_storage) return -1;  /* no post suppressor to retarget */
 
     /* The four lanes run with spatial_linear_context, so they never reach
      * suppression_gain_get_gain() and their own floors shape nothing. The
@@ -2238,7 +2275,6 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
     p->duty_hops_run = 0;
     memset(&p->last_delay, 0, sizeof(p->last_delay));
     p->rng_state = PIPELINE_RNG_SEED;
-    p->near_hang = 0;
     p->next_frame = 0;
     p->generation += 1;
     p->pending = 0;
@@ -2294,7 +2330,7 @@ int four_aec_nr_res_nr_count(const FourAecNrRes* p) {
 }
 
 int four_aec_nr_res_post_res_count(const FourAecNrRes* p) {
-    return p && !p->destroyed && p->cfg.enable_post ? 1 : 0;
+    return p && !p->destroyed && p->post_sg_storage ? 1 : 0;
 }
 
 long four_aec_nr_res_far_fft_real_compute_count(const FourAecNrRes* p) {
@@ -2396,7 +2432,7 @@ int four_aec_nr_res_get_mem_breakdown(
     fft_bytes = cfg->enable_post ? fft_get_mem_size(fft) : 0;
     wrapper_storage = pipeline_buffer_size(
         hop, fft, n, post_ma_n, delay_ring_size, delay_estimator_bytes,
-        cfg->enable_post);
+        cfg->enable_post, cfg->enable_res, cfg->enable_nr);
     if (aec_one == 0 || wrapper_storage == 0 ||
         (cfg->enable_post && fft_bytes == 0) ||
         (want_nr && nr_bytes == 0)) return -1;

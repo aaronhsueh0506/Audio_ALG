@@ -341,8 +341,10 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 | `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `MILD`(0) / `BALANCED`(1) / `AGGRESSIVE`(2)。列舉以外拒絕（**不會**默默 fallback） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE` |
 | `nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED`（= 2） | `MILD`(0) / `MODERATE`(1) / `BALANCED`(2) / `AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度，四級都可用 |
 | `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = post 級跳過 MMSE-LSA，`total_gain` 只由 RES 決定；RES／CNG／iFFT／WOLA 照常。給「要回聲抑制但不要降噪」的產品 |
+| `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不建 post-beam RES（state 不進 pool），`total_gain` 只由 NR 決定，CNG 沒有被 RES 挖掉的 bin 可填故略過；`set_aec_preset()`／`post_split_floor()` 回 `-1`。`enable_post` 優先於 `enable_res`／`enable_nr`：`enable_post=0` 兩者無作用，`enable_post=1` 兩者獨立組合，都 `0` 即 beamform 後線性誤差經合成直通 |
 | `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在被抑制的 bin 填舒適噪音 |
 | `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = NR 的 noise prior 不摺入 R²。只用於比對舊行為，新整合請保持 `0` |
+| `enable_near_end_protect` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = post 級逐 bin 的 near-end floor lift：把 `total_gain` 往 1 混合，強度 = （遠端靜音 0.4／活動 0.2）× `G_res·(1−R²/|E|²)` × `clip((G_nr−0.1)/0.9)`。噪聲 bin 拿不到 lift、保有完整 NR 深度；NR 留在 1 附近的語音 bin 被保護。`enable_nr=0` 時語音證據為 1 |
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）
 
@@ -426,11 +428,12 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 | `enable_post` | 會（`0` 時不配置 NR/RES/iFFT，見 4.6b；ULCNet wrapper 用這個省 post 級） |
 | `capture_proxy_channel` | 不變 |
 | `enable_nr` | 會（`enable_post=1` 時，`0` 省下對齊後的整份 MMSE-LSA state；`enable_post=0` 時無作用，那條路徑本來就不配置 NR） |
-| `aec_preset` / `nr_mode` / `enable_cng` / `legacy_amin` | 不變 |
+| `enable_res` | 會（`enable_post=1` 時，`0` 省下 post SG 的 `(10+ma_n)×n_freqs` float；`enable_res`／`enable_nr` 任一為 `0` 時多一份 `n_freqs` float 的 unity gain；`enable_post=0` 時無作用） |
+| `aec_preset` / `nr_mode` / `enable_cng` / `legacy_amin` / `enable_near_end_protect` | 不變 |
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是本次 checkout（`layout_version=16`）、`BACKEND=kiss`、`SIMD=1`、
+以下是本次 checkout（`layout_version=17`）、`BACKEND=kiss`、`SIMD=1`、
 `delay_mode=MATCHED`（預設,n=5）、`enable_post=1`（預設）下直接呼叫 API
 量到的值。換 backend、換編譯選項、更新 submodule 都會變。本輪 `sizeof(Aec)`
 由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數
@@ -703,7 +706,7 @@ pre/post 協定：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `15` |
+| 4 | `layout_version` | `uint32_t` | `17` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

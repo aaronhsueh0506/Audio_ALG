@@ -224,7 +224,13 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * with it. The C API also lost audio_pipeline_4ch_ulcnet_last_beamformed_
  * error() (there is no reconstructed beam hop any more), and the timing
  * contract went from 2 hops to 1. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 17u
+/* Version 18 carries the core's own layout 16 -> 17: FourAecNrResConfig
+ * gained enable_near_end_protect and enable_res, which this wrapper rejects
+ * unless 0. The
+ * pre-only sub-pool is unchanged, but AudioPipeline4ChConfig is embedded by
+ * value in the control block and grew, so a version-17 descriptor must be
+ * refused on the counter. C struct-ABI change as well. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 18u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte
@@ -282,7 +288,8 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
 
 /* Returns the compiled checkpoint-grid defaults for the PRE-ONLY profile
  * this wrapper is the only consumer of: core.fft_size = ULCNET_N_FFT,
- * core.enable_post = 0, core.enable_nr = 0 and core.enable_cng = 0.
+ * core.enable_post = 0, core.enable_nr = 0, core.enable_res = 0 and
+ * core.enable_cng = 0.
  *
  * Align-ULCNet replaces the post-beam RES/NR/CNG stage entirely, so with
  * enable_post = 0 the core builds no denoiser, no suppressor, no comfort
@@ -294,6 +301,10 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
  *                       profile turns it off so the field states what is
  *                       true here rather than being left at a value that
  *                       could not take effect)
+ *   core.enable_res   = 0   (same reason as enable_nr: the core's default is
+ *                       1, the pre-only profile states what is true)
+ *   core.enable_near_end_protect = 0   (post-path gain shaping; nothing to
+ *                       shape here)
  *   core.enable_cng   = 0
  *   core.legacy_amin  = 0
  *   core.nr_mode      = MMSE_LSA_NR_BALANCED   (the enum has no "disabled"

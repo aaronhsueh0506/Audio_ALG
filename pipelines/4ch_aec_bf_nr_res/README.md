@@ -191,6 +191,26 @@ instance. The static-memory requirement then excludes the NR state. This is
 independent of `enable_post`: setting `enable_post = 0` selects the pre-only
 integration seam and removes the complete post path.
 
+`cfg.enable_res` (default 1) selects the shared post-beam residual suppressor.
+With 0 no suppressor is built (its storage leaves the pool), `total_gain` is
+the denoiser's gain alone and comfort noise, which fills only RES-cut bins,
+is skipped; `four_aec_nr_res_set_aec_preset()` and `_post_split_floor()`
+then refuse. `enable_post` outranks both `enable_res` and `enable_nr`: with
+`enable_post = 0` neither has anything to switch, with `enable_post = 1` the
+two select the post stage's gain sources independently, and both 0 leaves
+the beamformed linear error, synthesised.
+
+`cfg.enable_near_end_protect` (default 0) selects the per-bin near-end floor
+lift in the post path. With 1, `total_gain` is blended toward unity by 0.4
+(0.2 while the far end is active), scaled per bin by how echo-free the RES
+finds it (`G_res * (1 - R^2/|E|^2)`) and by how speech-like the denoiser
+left it (`clip((G_nr - 0.1) / 0.9, 0, 1)`). Bins the denoiser took to its
+floor get no lift and keep the full NR depth; bins it left near unity are held
+at the floor. The strength never depends on a broadband level, so a loud
+background can neither cap the denoiser nor make the floor follow the far
+talker. With `enable_nr = 0` there is no speech evidence and every echo-free
+bin is protected. The default applies `min(G_nr, G_res)` as computed.
+
 Caller-owned pool (static/board path):
 
 ```c

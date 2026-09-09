@@ -21,7 +21,7 @@ E(f), R²(f)
   → G_nr(f)
 
 G_total(f) = min(G_nr(f), G_res(f))
-  → far/near-gated near-end floor
+  → far/near-gated near-end floor   (enable_near_end_protect, default 0 = skipped)
   → E(f) × G_total(f) + CNG
   → one final iFFT/OLA
 ```
@@ -33,7 +33,12 @@ convergence and residual-echo information that NR cannot reconstruct. Feeding
 `R²` into the NR prior allows NR to help on echo-dominated bins, but does not
 make `G_res` redundant.
 
-The near-end floor lifts suppression toward unity only when the bin appears
+The near-end floor is a switch (`enable_near_end_protect`), off by default.
+When enabled it is per bin and speech-conditional: the lift toward unity is
+scaled by the denoiser's own gain in that bin, so bins taken to the noise
+floor keep the full NR depth and only bins left speech-like are held at the
+floor (0.4, or 0.2 while the far end is active). The near-end floor lifts
+suppression toward unity only when the bin appears
 safe. Its effective strength is gated by far- and near-end activity; it is not
 a global minimum gain. Comfort noise is driven by the AEC suppression gain so
 it fills echo-removal holes rather than every bin attenuated by NR.
