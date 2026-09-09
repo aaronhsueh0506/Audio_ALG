@@ -431,7 +431,7 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是本次 checkout（`layout_version=17`）、`BACKEND=kiss`、`SIMD=1`、
+以下是本次 checkout（`layout_version=18`）、`BACKEND=kiss`、`SIMD=1`、
 `delay_mode=MATCHED`（預設,n=5）、`enable_post=1`（預設）下直接呼叫 API
 量到的值。換 backend、換編譯選項、更新 submodule 都會變。本輪 `sizeof(Aec)`
 由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數
@@ -441,11 +441,11 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 
 | Config | `req.bytes` | `aec_bytes`（四路合計） | `nr_bytes` | `fft_bytes` | `wrapper_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,136,288 | 881,728 | 122,160 | 8,784 | 123,616 |
-| 16000，`fft_size=512` | 1,689,872 | 1,395,840 | 133,472 | 16,976 | 143,584 |
-| 16000，`max_delay_ms=100` | 1,077,152 | 881,728 | 122,160 | 8,784 | 64,480 |
-| 16000，`filter_length=512` | 1,037,280 | 782,720 | 122,160 | 8,784 | 123,616 |
-| 48000，預設（1024/512） | 3,754,768 | 3,028,032 | 374,336 | 33,360 | 319,040 |
+| 16000，預設（256/128，`max_delay_ms=1024`） | 1,136,304 | 881,728 | 122,160 | 8,784 | 123,632 |
+| 16000，`fft_size=512` | 1,689,888 | 1,395,840 | 133,472 | 16,976 | 143,600 |
+| 16000，`max_delay_ms=100` | 1,077,168 | 881,728 | 122,160 | 8,784 | 64,496 |
+| 16000，`filter_length=512` | 1,037,296 | 782,720 | 122,160 | 8,784 | 123,632 |
+| 48000，預設（1024/512） | 3,754,784 | 3,028,032 | 374,336 | 33,360 | 319,056 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
@@ -457,9 +457,9 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 1,136,288 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,042,688 | −93,600 |
-| `EXTERNAL_ALIGNED` | 1,035,776 | −100,512 |
+| `MATCHED` n=5（預設） | 1,136,304 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,042,704 | −93,600 |
+| `EXTERNAL_ALIGNED` | 1,035,792 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
@@ -704,7 +704,7 @@ pre/post 協定：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `17` |
+| 4 | `layout_version` | `uint32_t` | `18` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

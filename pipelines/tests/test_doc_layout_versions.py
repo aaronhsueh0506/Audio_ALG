@@ -39,6 +39,27 @@ _SOURCES = {
 _DOC_ROOT = _REPO / 'docs'
 _DOC_SUFFIXES = ('.html', '.md')
 
+# A few integration pages publish the current value without naming the C
+# macro.  The macro-only scan below cannot distinguish those claims from
+# historical prose, so pin only the narrowly-scoped forms that explicitly say
+# "current checkout/value" (or identify the measured build in the HTML table).
+_UNQUALIFIED_CURRENT_CLAIMS = (
+    ('docs/integration_mono_zh_TW.md', 'AUDIO_PIPELINE_LAYOUT_VERSION',
+     re.compile(r'本次 checkout（layout_version=(\d+)')),
+    ('docs/integration_mono_zh_TW.md', 'AUDIO_PIPELINE_LAYOUT_VERSION',
+     re.compile(r'\| 4 \| `layout_version` \| `uint32_t` \| `(\d+)` \|')),
+    ('docs/integration_4ch_core_zh_TW.md', 'FOUR_AEC_NR_RES_LAYOUT_VERSION',
+     re.compile(r'本次 checkout（`layout_version=(\d+)`')),
+    ('docs/integration_4ch_core_zh_TW.md', 'FOUR_AEC_NR_RES_LAYOUT_VERSION',
+     re.compile(r'\| 4 \| `layout_version` \| `uint32_t` \| `(\d+)` \|')),
+    ('docs/integration_4ch_spatial_zh_TW.md',
+     'AUDIO_PIPELINE_4CH_LAYOUT_VERSION',
+     re.compile(r'本次 checkout，`layout_version=(\d+)`')),
+    ('docs/html/pipeline_4ch.html', 'AUDIO_PIPELINE_4CH_LAYOUT_VERSION',
+     re.compile(r'audio_pipeline_4ch_get_mem_requirements\(\)</code>'
+                r'\(ne10,layout_version=(\d+)\)')),
+)
+
 
 def _declared_version(macro: str) -> int:
     """讀 header 裡的 ``#define <macro> Nu``。找不到就是測試自己過時了。"""
@@ -83,6 +104,19 @@ def test_docs_publish_the_current_layout_version(macro):
     assert not stale, (
         '%s 目前是 %d，但文件仍寫著舊值：\n  %s'
         % (macro, expected, '\n  '.join(stale)))
+
+
+@pytest.mark.parametrize('relative_path,macro,pattern',
+                         _UNQUALIFIED_CURRENT_CLAIMS)
+def test_unqualified_current_layout_claims(relative_path, macro, pattern):
+    """Current-value prose must move with the corresponding C counter."""
+    path = _REPO / relative_path
+    matches = pattern.findall(path.read_text(encoding='utf-8'))
+    assert matches, '%s 的目前版號宣稱格式已改；請同步更新測試' % relative_path
+    expected = _declared_version(macro)
+    assert all(int(value) == expected for value in matches), (
+        '%s 寫 layout_version=%s，%s 實際為 %d'
+        % (relative_path, '/'.join(matches), macro, expected))
 
 
 def test_the_scan_actually_reaches_the_pages_that_publish_versions():
