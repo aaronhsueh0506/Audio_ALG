@@ -103,9 +103,16 @@ exactly).
 
 ⚠ **What that costs.** The renderer still computes a full per-chunk
 description — `speaker_id`, `far_speaker_id`, `noise_id`, `rir_id`, `room_id`,
-`device_id`, `ser_db`, `snr_db`, `erl_db`, `bulk_delay_samples`,
-`delay_jitter`, `sro_ppm`, `nonlinear`, `clipped`, `agc`, `talk_mode`,
-`echo_mode`, `impairments`, `acoustic_tails`, `scenario`,
+`room_rir_count`, `device_id`, `ser_db`, `snr_db`, `erl_db`,
+`bulk_delay_samples`, `delay_jitter`, `delay_step_samples`, `delay_step_at`, `sro_ppm`,
+`nonlinear`, `clipped`, `agc`, `talk_mode`, `echo_mode`, `impairments`,
+`acoustic_tails`, `path_motion`, `echo_path_moving`, `echo_path_waypoints`,
+`echo_path_keyframes`, `echo_path_event_at`, `echo_path_gain_walk_db`,
+`echo_path_mixture_depth`, `echo_path_position_correlation`,
+`near_path_motion`, `near_path_mixture_depth`,
+`near_path_position_correlation`, `path_position_redraws`,
+`path_position_fallbacks`, `near_path_shared_positions`, `far_active`,
+`near_active`, `scenario`,
 `sequence_scenario`, `sequence_seed`,
 `split` — but it is now visible only
 in-process, on the `RenderedSequence` a worker hands back
@@ -148,18 +155,19 @@ orthogonal layers:
 - `[echo_modes]`: normal echo, `ref_dropout`, or `far_active_no_echo`
   (conditional probabilities for far-capable sequences);
 - `[impairments]`: independent path/capture events such as
-  `echo_path_change`, `nonlinear_spk`, `clipping_agc`, `delay_jitter`, `sro`
-  and `codec_mismatch`.
+  `nonlinear_spk`, `clipping_agc`, `delay_jitter`, `delay_step`, `sro`
+  and `codec_mismatch`, plus the mutually exclusive **echo-path motion** draw
+  (`slow_drift`, `movement`, `echo_path_change`) described below.
 - `[acoustic_tails]`: independent low-probability operating points for
   120--300 ms bulk delay, −40 to −30 dBFS quiet references (with the ERL draw
   capped so the echo stays above the noise floor), and −10 to 0 dB
   strong-echo ERL. Ordinary sequences retain the original ranges.
 
-This separation is intentional. In the former categorical planner a sequence
-could be `double_talk` **or** `echo_path_change` **or** nonlinear/clipped, so
-the difficult intersection never existed. `[complex_cases]
-p_dt_stress_combo` now guarantees a small measurable tail containing DT +
-path movement + nonlinear loudspeaker + clipping/AGC. Within that tail,
+This separation is intentional. A single categorical scenario cannot express
+`double_talk` **and** nonlinear **and** clipped at once, so the difficult
+intersection never existed. `[complex_cases] p_dt_stress_combo` guarantees a
+small measurable tail containing DT + nonlinear loudspeaker + clipping/AGC —
+path motion is deliberately not in that bundle, see below. Within that tail,
 `[activity] dt_force_edge_overlap` pins DT to the leading edge of the first far
 burst and trailing edge of the last, covering both a cold PBFDKF state and a
 mature PBFDKF state late in the parent sequence without making ordinary DT
@@ -193,6 +201,360 @@ belonged to the now-retired AEC-only Align-CRUSE route, which targeted
 the loudspeaker keep playing while the reference is lost, but that asks the
 model to predict an echo from nothing, so it is **0 by default**: raising it
 trains hallucination.
+
+### The echo path moves
+
+**The path is never frozen, and that is the point.** Measured on paired
+static/movement far-end clips from the AEC-challenge blind set — 64 ms
+frequency-domain Wiener path estimates over 300–4000 Hz in 2 s windows, after
+delay compensation — the path's correlation with itself 1/2/4/8 s earlier, its
+per-second relative change and its per-second level step are
+`path_drift_metrics.CALIBRATION_TARGETS`. **That dict is the only copy of those
+numbers**: it is what the calibration test asserts against, and restating it
+here (or in a config comment) is how a re-calibration leaves five stale tables
+behind. It holds two curves, `movement` for a device being moved and
+`static_device` for one nobody touched; `CALIBRATION_TARGET_OF_MODE` says which
+rendered mode is calibrated against which. The same module measures a rendered
+pair, so the corpus and the captures are compared through one implementation —
+including the delay search, which has to be wide enough for the whole delay a
+pair can carry: outside its true delay the phase-transform peak is noise, and a
+mislocked clip reads as violent movement rather than failing.
+
+A device nobody touches still drifts — its correlation with its own path 8 s
+earlier is well below 1.0 — and a moving one has largely forgotten its path by
+then. A path that is exactly constant except at one instant is a path a filter
+has to find once and then never again.
+
+Motion is one **mutually exclusive** draw per far-capable sequence —
+`p_slow_drift` (0.5), `p_movement` (0.15), `p_echo_path_change` (0.02), the
+remainder still. Why the three cannot co-occur is on
+`aec_dataset.PATH_MOTION_MODES`.
+
+`slow_drift` and `movement` render a continuous trajectory over K = 3–4 RIRs
+of the **same room**:
+
+    echo = sum_k w_k(t) · conv(played, RIR_k),      sum_k w_k(t) = 1
+
+with raised-cosine transitions between per-position mixtures
+(`*_position_correlation` says how far a corner pulls the mixture toward one
+position — see below; `*_segment_sec_*` how long a transition takes;
+`*_dwell_*` how long it may hold still). Level is a **separate** bounded
+dB-domain walk, because a real path's gain and its shape do not move together.
+`echo_path_change` keeps the one-shot crossfade as a rare hard transition. All
+of it is in `[path_motion]`; the drawn keyframes, waypoint RIR ids, level-walk
+spread, solved mixture depth and reached path correlation are recorded per
+chunk.
+
+**⚠ The calibrated knob is a path CORRELATION, not a mixture depth.**
+`[path_motion] *_position_correlation` states the correlation the path must
+keep between the trajectory's anchor mixture and a corner, in the same
+300–4000 Hz band **and through the same 64 ms analysis frame** the estimator
+reads, and the renderer solves the depth that reaches it from the drawn room's
+responses — per sequence. Why a depth is not a quantity a corpus can be
+calibrated in is on `aec_dataset.solve_mixture_depth`. `movement`'s 0.87 solves
+to a median depth of 0.50 on a 60 ms pool, 0.38 on a 200 ms one, 0.40 at
+350 ms, 0.39 at 600 ms and 0.36 at 1 s (`slow_drift`'s 0.965 to
+0.24/0.18/0.19/0.19/0.18); all of them render the same axis to within the
+residual `RT60_POOL_TOLERANCE` records. Both numbers land in the chunk
+metadata (`echo_path_mixture_depth`, `echo_path_position_correlation`, and
+`near_path_*` for the near talker's own trajectory).
+
+**⚠ A room whose positions cannot reach the target does not host the mode.**
+Eligibility is decided before the room is drawn rather than discovered during a
+render, and `AecSequenceRenderer.can_host` owns what it asks of a room. Rooms
+that cannot host are excluded, printed as such in the preflight, and counted
+against the two-room rule below; the renderer then asserts what the draw
+guarantees, so a corpus whose movement axis is shallower than it asked for is
+impossible rather than merely visible in the metadata.
+
+**⚠ Two things bound how far a synthetic corpus can decorrelate**, and both are
+worth knowing before reading a measurement:
+
+- **the RIR pool.** Positions in one room share their direct path and early
+  reflections, so a pool whose rooms are near-anechoic has a correlation floor
+  no weight schedule can go below. The solve above is what keeps that a floor
+  rather than a silent re-calibration — it reports the correlation each room
+  actually reached — but no depth can pass it. Measure your own pool rather
+  than assuming: `path_drift_metrics.py` takes `(far, echo)` and returns the
+  table above, and `position_gram` takes the room's RIRs and returns the matrix
+  the depth is solved from.
+- **position-dependent propagation delay is not inferred from RIR file
+  offsets.** `prepare_rir` peak-aligns every waypoint, so this trajectory
+  changes path shape and level but not time of flight. The RIR files do not
+  share a guaranteed recording time origin; preserving their raw peak offsets
+  would silently turn file trimming into physical movement. Timing variation
+  is instead carried by the independent, countable `delay_jitter`,
+  `delay_step`, and `sro` axes, while `bulk_delay_samples` keeps describing the
+  audio.
+
+Measured back out of the rendered 30 s corpus the calibration test builds,
+through the **shipped loudspeaker population** and a RIR pool drawn from the
+shipped `[rir]` RT60 range — the models, drives and rooms the corpus actually
+generates with, because that is what the trajectory has to reproduce the
+measured curve through. What THIS build measures, per mode and per lag, the
+calibration tests print themselves — the `_report` rows of
+`tests/test_aec_dataset.py` under `pytest -s`, over `MOTION_SEQUENCES`
+sequences, a count the suite sizes from the bootstrapped spread of its own
+medians. A table here would be a copy that goes stale at the next
+re-calibration.
+
+Capture clipping and the AGC are *not* part of that: the estimator reads the
+echo before the microphone stage, so `p_clipping` and `p_agc` cannot move any
+of those numbers. The band each lag is held to is in the test
+(`CALIBRATION_BAND`), sized from the bootstrapped spread of the median at those
+sequence counts — one sequence reads ~0.998 at every lag with a linear
+loudspeaker and 0.4–0.9 with a hard-clipping one, and the pool's rooms differ
+in RT60 on top of that, so the median needs a hundred-odd sequences before it
+is stable to the band. The 2 s and 8 s lags are banded wider than the rest
+because their spread stops shrinking with the count: the short lags are the
+loudspeaker's rather than the trajectory's and inherit the whole device draw.
+
+**⚠ What the band can and cannot separate on that population.** The one-shot
+crossfade is NOT rejected by it: with a distorting loudspeaker it lands inside
+the band at every lag, because the device supplies decorrelation of its own. A
+drift mode whose trajectory has stopped is not rejected either — the level walk
+through the same distortion supplies most of the curve, and the mode ORDERING
+(asserted at 4 s and 8 s) puts a frozen drift mode exactly where a moving one
+belongs. So the statements about the trajectory are made with the loudspeaker
+axis removed (`nonlinear_models = linear`): still 0.991/0.980/0.979/0.979,
+one-shot 0.989/0.975/0.972/0.954, `slow_drift` 0.988/0.970/0.950/0.937,
+`movement` 0.979/0.937/0.871/0.822. There a frozen path fails the band at two
+lags against both curves and the crossfade at three against the `movement`
+curve, and the two drift modes have to clear a long-lag ceiling
+(`ISOLATED_TRAJECTORY_MAX`) that both mutations miss at both lags: a frozen
+trajectory, and a path correlation target halfway to 1.0 — a corpus whose
+positions barely differ. That is what makes "the trajectory moved" a tested
+claim rather than an inference from a curve the loudspeaker could have produced
+on its own. Every ceiling is held above the bootstrapped spread of its own
+green median by an assertion, not by a comment.
+
+**⚠ The still-path shortfall is the loudspeaker population, and the device
+axis is calibrated separately from this one.** Read the still-path row those
+tests print against `static_device` in
+`path_drift_metrics.CALIBRATION_TARGETS`, which is the curve
+`slow_drift` is held to: through the shipped drives a path that never moves
+already reads far under the estimator's own floor on the calibration pool
+itself, and at the short lags down to that curve, before the trajectory does
+anything — which is where `slow_drift`'s own remaining deviation is. With
+`nonlinear_models = linear` the same pool puts the still path back on the
+estimator floor, so the gap is the drive population and not the rooms, the
+estimator or the trajectory — and no `*_position_correlation` can close it at
+any RT60, because a trajectory can only move the path further from itself,
+never back toward the curve. The suite renders the still path both ways and
+reports the two readings side by side, the mixture one with its bootstrap
+interval (`test_a_still_path_stays_correlated_with_itself`): that population is
+bimodal — a near-linear device reads on the floor and a hard-clipping one far
+under it — so its median swings with the count and is reported rather than
+gated. Re-fitting the drive population against the untouched-device curve is a
+separate calibration and is not what the trajectory knobs are for.
+
+**⚠ The pool the axis is fitted on stops short of `[rir] rt60_max`,** because
+that floor deepens with RT60 — a tail several times the estimator's 64 ms
+analysis frame is not one frequency response — while the room-to-room spread
+out there is as large as the RT60 trend itself. Fitting there would calibrate
+the trajectory against the device floor and the room draw instead of against
+the path. A separate check (`RT60_POOLS`, 60 ms to 1 s) holds the *same* config
+to the same axis across the whole range, isolated, to within the residual
+`RT60_POOL_TOLERANCE` records,
+and reports the shipped population on one pool above the span so what it does
+there stays visible.
+
+**⚠ The loudspeaker population is stratified, not drawn per device.** A seeded
+permutation of `[devices] nonlinear_models` fills `device_ids` before the
+remainder is drawn, so every configured model reaches every corpus seed
+whenever there are at least as many ids as models. Drawing each id's model
+independently leaves a third of the seeds with no linear device at all and the
+rarer models missing from most of them, and since this axis is calibrated
+*through* that population, which models it contains is part of what the corpus
+is. What still moves between seeds is each id's **drive**: at the seeds the
+test checks, `movement`'s 4 s median spans 0.024–0.139 from its target, which
+is what the seed check's own allowance covers. The **split** is model-aware for
+the same reason: `device_split = disjoint` renders one split's ids, so a
+held-out id drawn without regard to its model takes that model out of training
+whenever it is the only id carrying it (148 of 200 seeds at the shipped 8 ids
+over 7 models, for a draw made on its own; through `build_manifest` the device
+split follows three source splits on the same generator and the count moves
+with them). Train is therefore filled with one id per model first and val
+drawn from the rest; a split too small to hold every model falls back to a
+plain permutation and is stated in the preflight instead.
+
+**⚠ What `device_split = disjoint` holds out is therefore a device IDENTITY,
+not a loudspeaker MODEL.** While train keeps every model, val's id carries its
+own EQ, drive and level draw of a nonlinearity family train also has: at the
+shipped 8 ids over 7 models the val id's model is one train holds at every
+seed. Validation still answers "an unseen loudspeaker", but not "an unseen
+distortion family" — say which one you mean when you report the score. Changing
+which id is held out changes the corpus, so `MANIFEST_VERSION` moves with it
+and an existing `manifest.json` is refused rather than reused; rebuild it with
+`--rebuild-manifest`.
+
+**⚠ The near-plateau between 2 s and 4 s in the reference curve is not
+reachable from a trajectory, and trying is a trap.** It is the signature of an
+incoherent component that fully decorrelates within 2 s and then stops
+contributing. Anything faster than the estimator's own 2 s window is *averaged*,
+not resolved, so adding a fast weight component RAISES this correlation instead
+of lowering it. That part of the real number is the device, not the path —
+which is why the calibration is run through the shipped device population
+rather than around it.
+
+**⚠ The measured per-second level step is not a pure level measurement**, so
+it is not what the level walk is tuned against — `path_drift_metrics`'s own
+`gain_step_db` says what the statistic is and what tuning against it would
+cost. `[path_motion]`'s `*_gain_sigma_db_per_sec` and `*_gain_clamp_db` are set
+by the measured level **spread** for a moving device instead, and the walk is
+mean-reverting (`gain_recentre_sec`; `aec_dataset.gain_walk_db` says why a
+merely-clipped walk is not enough). As rendered it spreads what
+`LEVEL_SPREAD_DB` records per mode, and both the step and that spread are
+banded there.
+The spread is banded separately because the step cannot stand in for it: with
+`slow_drift`'s walk turned off entirely the step barely moves against its
+`static_device` target in `path_drift_metrics.CALIBRATION_TARGETS` — it stays
+inside its own sampling spread — while the walk's p5–p95 goes to zero. (On
+`movement` the step does notice.)
+The estimator's `relative_change` is reported but deliberately not banded: no
+level or trajectory setting the axis admits moves it more than 0.13 from the
+measured 0.29, so a band loose enough to pass a green generator rejects only a
+completely frozen path, which the correlation curve already rejects on more
+evidence.
+
+**DT movement.** A sequence with a near talker moves that talker's path too,
+with the same trajectory shape at `near_slowdown` × the timescale and
+`near_gain_scale` × the level swing: a person shifts in a chair, they do not
+walk the way a hand-held loudspeaker does. `p_dt_stress_combo` forces
+`nonlinear_spk` + `clipping_agc` only — motion is its own axis on 67% of
+compatible echo paths at the shipped defaults, so bundling it there would make
+inseparable from "DT while the loudspeaker distorts", and the CLI census counts
+`dt+movement` and `dt+slow_drift` separately.
+
+The CLI also prints the path correlation the rendered mixtures reached against
+the one the config asks for, per mode: they can only differ by the solver's own
+tolerance, since a trajectory only ever renders positions that reach the
+target, so that row is the audit of the eligibility rule. Like the `Path
+motion` row below it, it covers **the sequences this run rendered** — the reach
+of a sequence an earlier run wrote is not on disk — and a fully resumed run
+prints a line saying the audit is unavailable rather than nothing. A run that
+had to draw a position set more than once to find one that reaches says so on
+its own line; frequent re-draws mean the eligible rooms hold mostly
+near-duplicate positions.
+
+A second line counts the trajectories that **ran out of draws** and rendered
+their room's certified set, and the two are separate because they cost
+different things. A re-draw costs a Gram lookup and no audio. A fallback costs
+variety: a room has one certified set per waypoint count, so every sequence
+counted there renders one of a handful of trajectories however many sequences
+the corpus holds — a pool whose eligible rooms are mostly near-duplicate
+positions can therefore be correct on every reach and still repeat itself. The
+near talker keeps its preference through that fallback (the certificate is
+taken over the room minus the loudspeaker's positions), so a fallback does not
+put the two paths on the same room response unless nothing else in the room
+reaches — and when that happens a third line counts the sequences whose near
+talker shares a position with the loudspeaker. All three position rows cover
+the sequences this run rendered, like the reach row: a fully resumed run
+prints that the position draws were not audited rather than nothing.
+
+`Loudspeakers` is the population row: how many device ids this split holds, how
+many of `[devices] nonlinear_models` they realise, and how many ids carry each
+model. It is printed because the movement axis is calibrated *through* that
+population and a source-disjoint split renders a subset of the id list, so
+which models the split realises is a property of the split rather than of
+`[devices]`. A split holding fewer ids than there are models cannot carry the
+whole population however it is drawn, and the row is followed by a warning
+naming the missing models.
+
+**⚠ The `Path motion` census counts the mode each sequence was RENDERED with —
+for the sequences this run rendered.** A sequence whose drawn motion did not
+fit renders still, so counting the plan would report an axis the audio does not
+carry; but nothing about a finished sequence is persisted beyond its chunk WAVs
+(that is the on-disk contract, see below), so a `--resume` run cannot recover
+the rendered mode of a sequence an earlier run wrote and falls back to the
+planned one for those. The printed row says which part is which, and the
+downgrade counter therefore covers this run's slice only. On the shipped values
+nothing downgrades at all (the one-shot switch always finds room for its 1 s
+window in a ≥ 20 s sequence), so the gap is zero there; a config with a large
+`far_active_after_event_sec` is where it would matter, and a single-pass run
+counts it exactly.
+
+**Delay steps are NOT movement.** Delay jumps > 20 ms were measured in 53 % of
+moving *and* 63 % of static clips: they are device/buffer events. `delay_step`
+is therefore an independent impairment — one signed re-timing of the whole
+echo at a random instant, `[echo_path] delay_step_ms_*` — so nothing in the
+corpus lets "the path moved" be inferred from "the delay jumped". Its range
+stacks on the long-delay tail and the jitter, and the sum has to stay inside
+the frozen n=5 matched-filter reach (`linear_aec.MATCHED_REACH_MS`);
+`plan_sequences()` refuses a config that breaks it. How the sign and the
+magnitude are drawn, and what floors the rendered delay end to end through
+`delay_jitter`, is on `aec_dataset._draw_delay_step`. The one thing that moves
+the rendered delay past that floor is `sro`, which pulls the two clocks apart
+by ppm × elapsed time (1.8 ms at 60 ppm over 30 s): two clocks running apart
+genuinely do move the echo.
+The instant is uniform except for a 0.5 s margin at each end
+(`aec_dataset.DELAY_STEP_EDGE_MARGIN_SEC`), so both sides of the step can be
+measured.
+
+**`echo_path_moving` is measured, not asserted.** A chunk carries the label
+when the largest within-chunk swing of any single weight reaches
+`moving_label_weight_delta` **and** the chunk's own reference is measurably
+active; `aec_dataset.moving_chunks` owns what that excursion is and why the
+level walk is deliberately not part of it.
+
+**⚠ How much that label carries depends on `chunk_sec`.** A dwell lasts at most
+`*_dwell_sec_max` (1.5 s for `movement`, 4 s for `slow_drift`), so at the
+shipped 10 s chunk the label says exactly what `path_motion` and `far_active`
+already say, and it separates travelling chunks from dwelling ones only below
+that. The label test asserts both regimes so neither claim drifts, and
+`echo_path_change` still marks the one switch chunk.
+
+**⚠ An event label displaces the activity label.** A drifting sequence's event
+covers most of its chunks, so `scenario` alone would no longer show that a
+moving chunk is double talk. Every chunk therefore also records measured
+`far_active` / `near_active` booleans; filter a DT curriculum on those, not on
+the string.
+
+**⚠ A trajectory needs a room with at least `waypoints_min` RIR files, and
+that is an inherent cue.** Every waypoint stays in the same room (a cross-room
+waypoint would leave the near talker behind in the old room — the acoustic
+"this is echo" leak the same-room invariant exists to prevent), so a moving
+sequence can only ever come from a room that holds enough positions **whose
+responses differ enough to reach `*_position_correlation`**, and a single-RIR
+room only ever renders still. No draw rule removes that: drawing
+every sequence from the whole pool and downgrading the ones that land in a
+sparse room leaves `P(moving | sparse room) = 0` exactly as before, and pays
+for it by losing most of the motion axis. So a sequence that draws a room too
+sparse for its trajectory **draws again among the rooms that can hold it**, and
+the rendered motion share is the planned one. What is done about the cue is to
+make it countable: every chunk records `room_rir_count` beside `room_id`,
+`path_motion` is the **rendered** mode, and `gen_aec_dataset.py` prints the
+eligible-room share per mode before any worker starts — with the rooms it
+excluded for too few positions and for positions too alike counted
+separately, the second measured on the set the renderer would be handed if its
+draws ran out (so it is the room's renderability, not a proof that no reaching
+set exists in it) — and **refuses** a split where fewer than two rooms can host
+a mode it *can* draw — with one, the trajectory would identify the room. A
+split holding a single room altogether is exempt: the room is then constant
+and identifies nothing. The refusal reads
+every motion probability in the config rather than only the modes a plan
+happened to draw, so a short `--hours` trial cannot pass a manifest the full
+run refuses. What the re-draw costs is the other side of the cue: on a sparse
+pool (3 of 40 rooms eligible) every moving sequence comes from those three
+while still ones stay uniform over all 40, i.e. `P(moving | eligible room)` is
+~93 %. That is the trade this design accepts — a strong forward cue on rich
+pools in exchange for the rendered motion share equalling the planned one.
+
+**⚠ The renderer** — not the planner — guarantees `far_active_after_event_sec`
+of far-end activity **inside the window** that follows the event, and both
+event kinds are placed where that window fits (`_switch_point`,
+`_ensure_far_activity_after`). What they do when nothing fits differs, and that
+is the trade: a one-shot switch that cannot be placed renders **still** and
+records no event, rather than labelling an event the audio cannot support
+(`gen_aec_dataset.py` counts those), while a trajectory reports its last
+transition anyway and the window shrinks to what is left — the sequence keeps
+its motion, which is real, and the guarantee is the part that gives. With the
+shipped values that case cannot arise (a drift sequence's first transition
+starts at most `*_dwell_sec_max` into a ≥ 20 s sequence, against a 1 s window);
+a `far_active_after_event_sec` near the sequence length reaches it. A reference
+dropout is steered away from the same window and shrinks to fit beside it
+(`_dropout_placement`), with the chunk's measured `far_active` recording what
+happened either way.
 
 Note that `p_ref_dropout` is conditional per far-capable *sequence*; the
 per-*chunk* share is smaller. If the idle term needs more, lengthen the dropouts
@@ -239,7 +601,8 @@ not used by any trainer.
 Changing only `linear_error` cannot create the newly composed acoustic scenes:
 the four source stems already encode talk activity, path movement,
 nonlinearity, capture clipping, bulk delay, far level and ERL. In particular,
-`rematerialize_linear_aec.py` cannot add the `[acoustic_tails]` mixture. Generate
+`rematerialize_linear_aec.py` cannot add the `[acoustic_tails]` mixture or the
+`[path_motion]` trajectory. Generate
 a new WAV corpus in a new output directory, pack it, and train a new checkpoint.
 Do **not** use `--resume` into an old corpus: WAV filenames carry no config
 fingerprint, so shape-compatible old chunks would be accepted even though they
@@ -258,6 +621,7 @@ were rendered by the previous planner.
 | `materialize_pair.py` | **diagnostic**: one loose mic/far pair to a `linear_error` WAV, contract taken from the runtime |
 | `pack_aec_dataset.py` | projects the five-channel WAVs into four-channel `.pt` shards (`--dtype float16` halves shard size and is safe to train on: every trainer widens to float32 at the device move, so only the stored dtype changes) |
 | `packed_aec_dataset.py` | `PackedAecDataset`, returning `(stems, meta)` |
+| `path_drift_metrics.py` | per-second Wiener path estimate and the drift statistics the movement axis is calibrated against |
 | `aec_features.py` | **the shared module the model projects import** |
 | `config.example.ini` | every knob, documented (16 kHz) |
 | `config.example.48k.ini` | the same file with the 48 kHz recipe already applied; the tests derive it from the recipe above and compare key by key, so the two cannot drift apart |
@@ -649,6 +1013,15 @@ echo really is a delayed copy of the reference at the recorded delay, that the
 split is disjoint in the *generated data* and not only in the manifest, that a
 sequence's chunks are contiguous and ordered, and that the STFT round-trips on
 both the 16 and 48 kHz grids.
+
+The movement axis is checked by measuring it back out of rendered audio with
+`path_drift_metrics.py` and comparing against the blind-set targets, so the
+test cannot pass by reading the schedule the renderer wrote down. Its RIRs are
+deliberately short enough to fit the estimator's 64 ms frame (a longer path
+cannot be written as one frequency response and would put an estimator floor of
+0.98 under every number) and deliberately reverberant enough that two positions
+in a room are not near-identical. The `echo_path_moving` label test freezes the
+weight schedule and requires the label to disappear.
 
 ## Reuse and approximations
 

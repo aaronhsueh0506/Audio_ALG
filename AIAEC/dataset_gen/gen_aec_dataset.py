@@ -89,13 +89,21 @@ if __package__ in (None, ''):
     __package__ = 'AIAEC.dataset_gen'
 
 from .aec_dataset import (  # noqa: E402
+    DRIFT_MODES,
     DT_ACOUSTIC_TAILS,
     DT_STRESS_IMPAIRMENTS,
+    PATH_MOTION_MODES,
+    STATIC_PATH,
     AecSequenceRenderer,
     SequencePlan,
     check_rate_dependent_values,
     chunk_samples_from_config,
+    configured_nonlinear_models,
+    device_for_id,
+    nonlinearity_by_id,
+    path_motion_mode,
     plan_sequences,
+    position_correlation_target,
     resolve_acoustic_tails,
     resolve_sequence_plan,
 )
@@ -212,10 +220,21 @@ class _RenderJobs(data.Dataset):
             save_chunk_atomic(
                 self.seqs_dir, plan.sequence_id, chunk_index, chunk,
                 self.cfg.getint('signal', 'sr'), write)
+        # Sequence-level fields, so chunk 0 carries all of them; what each one
+        # means is on the field itself in AecSequenceRenderer._build_meta.
+        # ⚠ RENDERED, not planned: a sequence whose drawn trajectory could not
+        # be placed renders still, and a census built from the plan would
+        # describe a corpus that was not generated.
+        meta = rendered.chunk_meta[0]
         return {
             'sequence_id': plan.sequence_id,
             'n_chunks': plan.n_chunks,
             'scenario': plan.scenario,
+            'path_motion': meta['path_motion'],
+            'path_reach': meta['echo_path_position_correlation'],
+            'path_redraws': meta['path_position_redraws'],
+            'path_fallbacks': meta['path_position_fallbacks'],
+            'near_shared': meta['near_path_shared_positions'],
         }
 
 
@@ -304,6 +323,31 @@ def _validate_existing_output(plans: List[SequencePlan], seqs_dir: str,
             "least the original total or use a new output directory; otherwise "
             "the packer would silently include this stale tail."
         )
+
+
+def _motion_modes_this_config_can_draw(cfg, plans) -> set:
+    """Every path-motion mode the run could render, drawn or not.
+
+    The room requirement below is a property of the CONFIG and the source
+    inventory, not of one plan: checking only the modes a small ``--hours``
+    happened to draw lets a five-sequence trial run pass a manifest that the
+    full run refuses hours later, which is the opposite of a preflight. Any
+    mode the config gives a probability above zero is therefore checked, and
+    the drawn modes are added because a legacy plan carries its mode without a
+    probability section to read it from.
+
+    ⚠ The probabilities are read from the ONE section the planner will read
+    them from -- [impairments] for a layered config, [scenarios] otherwise.
+    Taking both would refuse a split over a probability the active branch
+    ignores, e.g. a stale [scenarios] left in a layered file.
+    """
+    modes = {path_motion_mode(resolve_sequence_plan(plan)[2])
+             for plan in plans}
+    section = 'impairments' if cfg.has_section('impairments') else 'scenarios'
+    if cfg.has_section(section):
+        modes |= {mode for mode in PATH_MOTION_MODES
+                  if cfg.getfloat(section, f'p_{mode}', fallback=0.0) > 0}
+    return modes - {STATIC_PATH}
 
 
 def gen_aec_dataset(args):
@@ -407,22 +451,105 @@ def gen_aec_dataset(args):
             f"manifest was built at sr={manifest['sr']} but this run generates "
             f"at {generation_sr}; rebuild it with --rebuild-manifest")
 
+    # What the split this corpus is rendered from realises of the configured
+    # loudspeaker population. The models are stratified over the whole id list
+    # and a source-disjoint split renders a SUBSET of it, so the population the
+    # movement axis is calibrated through is a property of the split rather
+    # than of [devices] alone.
+    split_devices = manifest['splits'][args.split]['devices']
+    configured_models = set(configured_nonlinear_models(cfg))
+    nonlinear_of = nonlinearity_by_id(cfg, manifest['seed'])
+    realised = collections.Counter(
+        device_for_id(device_id, cfg, manifest['seed'], generation_sr,
+                      nonlinear_of=nonlinear_of).nonlinear
+        for device_id in split_devices)
+    print(f"  Loudspeakers     : {len(split_devices)} id(s) realising "
+          f"{len(realised)}/{len(configured_models)} model(s): "
+          f"{dict(sorted(realised.items()))}")
+    if len(split_devices) < len(configured_models):
+        print(f"  ⚠ this split holds fewer ids than [devices] "
+              f"nonlinear_models lists, so it cannot carry the whole "
+              f"population however the split is drawn; the missing models are "
+              f"{sorted(configured_models - set(realised))}")
+
     # --- the plan -----------------------------------------------------------
     planned_sec = sum(p.n_chunks for p in plans) * chunk_sec
 
-    if any('echo_path_change' in resolve_sequence_plan(p)[2] for p in plans):
+    motion_modes = _motion_modes_this_config_can_draw(cfg, plans)
+    motion_room_notes = []
+    if motion_modes:
         # Fail before any worker starts rendering, not partway through a
-        # multi-hour run whenever one happens to draw the first
-        # echo_path_change sequence (AecSequenceRenderer checks this too, but
-        # only once a worker actually reaches that sequence).
+        # multi-hour run whenever one happens to draw the first moving
+        # sequence (AecSequenceRenderer checks this too, but only once a
+        # worker actually reaches that sequence). Every position of a
+        # trajectory lives in the same room, so the requirement is per room --
+        # and PER MODE, because a one-shot switch needs two positions where a
+        # continuous trajectory needs waypoints_min of them AND needs those
+        # positions to differ enough to reach the configured path correlation.
+        # ⚠ Deciding the second half costs one load of every RIR in the
+        # split's rooms plus a Gram per room, and then a closed form per set of
+        # positions the mode could draw there: 0.2 s over a 200-room manifest
+        # of four 0.5 s RIRs each, and 1 ms for the 2380 sets of a 16-position
+        # room, against hours of rendering.
         rooms_to_rirs = manifest['splits'][args.split]['rooms_to_rirs']
-        if not any(len(rirs) >= 2 for rirs in rooms_to_rirs.values()):
-            raise ValueError(
-                "the plan includes 'echo_path_change' sequences but no room "
-                "in this split has >= 2 RIR files; add more RIRs per room or "
-                "set [impairments] p_echo_path_change = 0 and "
-                "[complex_cases] p_dt_stress_combo = 0"
-            )
+        prober = AecSequenceRenderer(
+            cfg, pools_for_split(manifest, args.split),
+            corpus_seed=manifest['seed'])
+        for mode in sorted(motion_modes):
+            needed = prober.waypoints_needed(mode)
+            census = prober.motion_room_census(mode)
+            eligible = len(census['eligible'])
+            unreachable = len(census['positions_too_alike'])
+            reach_note = (
+                f"; {unreachable} more hold enough positions but the most "
+                f"distinct of them share too much of their energy to reach "
+                f"[path_motion] {mode}_position_correlation"
+                if unreachable else "")
+            if not eligible:
+                raise ValueError(
+                    f"the configuration enables {mode} sequences but no room "
+                    f"in this split can host one: none has >= {needed} RIR "
+                    f"files whose responses differ enough to render the "
+                    f"configured path correlation{reach_note}. Add more RIRs "
+                    f"per room, lower [path_motion] waypoints_min, raise "
+                    f"[path_motion] {mode}_position_correlation, or set the "
+                    f"[impairments] path-motion probabilities to 0"
+                )
+            # Every position of a trajectory lives in one room, so a moving
+            # sequence can only come from a room that can host it -- the one
+            # motion cue the same-room invariant cannot remove. When the split
+            # has several rooms and only ONE of them can host the mode, that
+            # cue IS the room: every moving sequence carries one RT60 and one
+            # early-reflection signature and the mode is readable off the
+            # reverberation alone. Refused rather than warned about, because it
+            # cannot be repaired after the corpus exists. A split with a single
+            # room altogether is not that case -- there the room is constant
+            # and says nothing about any sequence.
+            if eligible < 2 and len(rooms_to_rirs) > 1:
+                raise ValueError(
+                    f"the configuration enables {mode} sequences but only 1 of "
+                    f"the {len(rooms_to_rirs)} rooms in this split can host "
+                    f"one{reach_note}; every moving sequence would come from "
+                    f"that room and the motion mode would be inferable from "
+                    f"the room. Add more RIRs per room, lower [path_motion] "
+                    f"waypoints_min, raise [path_motion] "
+                    f"{mode}_position_correlation, or set the [impairments] "
+                    f"path-motion probabilities to 0"
+                )
+            # ⚠ The second count is what the room's CERTIFICATE reaches. Below
+            # REACH_SUBSET_LIMIT sets that is the exhaustive minimum; on the
+            # constructive branch it is sufficient and not necessary: the
+            # certificate is a set the renderer can always be handed, so a
+            # room that clears it is renderable, while a room counted here may
+            # still hold a reaching set the certificate did not find. Refusing
+            # on the set that can be handed over is the direction that keeps
+            # the audio honest.
+            motion_room_notes.append(
+                f"{mode} needs {needed}: drawn from "
+                f"{eligible}/{len(rooms_to_rirs)} rooms "
+                f"({len(census['too_few_positions'])} too few positions, "
+                f"{unreachable} whose certified set does not reach the path "
+                f"correlation)")
 
     pending = _pending(
         plans, seqs_dir, args.resume,
@@ -439,6 +566,8 @@ def gen_aec_dataset(args):
     print(f"  Stems            : {len(STEM_ORDER)} x {args.wav_encoding}")
     print(f"  Estimated disk   : {disk / 1024 ** 3:.1f} GB")
     print(f"  Workers          : {args.workers}")
+    if motion_room_notes:
+        print(f"  Motion rooms     : {'; '.join(motion_room_notes)}")
     if args.resume:
         print(f"  Resume           : {len(plans) - len(pending)} already rendered, "
               f"{len(pending)} to go")
@@ -447,6 +576,11 @@ def gen_aec_dataset(args):
     jobs = _RenderJobs(cfg, manifest, args.split, pending, seqs_dir,
                        args.wav_encoding)
     started = time.time()
+    rendered_motion = {}
+    rendered_reach = {}
+    position_redraws = 0
+    position_fallbacks = 0
+    near_shared_sequences = 0
 
     if pending:
         if args.workers > 0:
@@ -458,8 +592,14 @@ def gen_aec_dataset(args):
         else:
             iterator = tqdm.tqdm((jobs[i] for i in range(len(pending))),
                                  total=len(pending), desc=f"render/{args.split}")
-        for _done in iterator:
-            pass
+        for done in iterator:
+            rendered_motion[int(done['sequence_id'])] = done['path_motion']
+            position_redraws += int(done['path_redraws'])
+            position_fallbacks += int(done['path_fallbacks'])
+            near_shared_sequences += int(done['near_shared']) > 0
+            if done['path_reach'] >= 0.0:
+                rendered_reach.setdefault(done['path_motion'], []).append(
+                    float(done['path_reach']))
 
     # Layer counts across the WHOLE plan, not just this run's pending slice, so
     # a resumed run reports the corpus and not the remainder. Reporting each
@@ -472,11 +612,17 @@ def gen_aec_dataset(args):
     # Label -> the impairment set a double_talk plan must contain to count.
     # The full combo is DT_STRESS_IMPAIRMENTS itself, so the census cannot
     # drift from what [complex_cases] p_dt_stress_combo actually forces.
-    dt_combos = {'dt+path_change': {'echo_path_change'},
+    # Path motion is its own axis and its own census row: it is drawn as one
+    # mutually exclusive choice, so counting the three modes inside
+    # `impairment_counts` alone would not show that they partition.
+    motion_counts = collections.Counter()
+    motion_downgrades = 0
+    dt_combos = {'dt+movement': {'movement'},
+                 'dt+slow_drift': {'slow_drift'},
+                 'dt+path_change': {'echo_path_change'},
                  'dt+nonlinear': {'nonlinear_spk'},
                  'dt+clipping_agc': {'clipping_agc'},
-                 'dt+path_change+nonlinear+clipping_agc':
-                     DT_STRESS_IMPAIRMENTS}
+                 'dt+nonlinear+clipping_agc': DT_STRESS_IMPAIRMENTS}
     combo_counts = dict.fromkeys(dt_combos, 0)
     dt_acoustic_combo_count = 0
     for plan in plans:
@@ -489,6 +635,20 @@ def gen_aec_dataset(args):
                     if talk_mode == 'near_only' else echo_mode] += 1
         impairment_counts.update(impairments)
         acoustic_tail_counts.update(acoustic_tails)
+        if talk_mode != 'near_only' and echo_mode != 'far_active_no_echo':
+            # Counted over FAR-CAPABLE plans only. A near-only or no-echo
+            # sequence has no path to move -- the planner stripped its motion
+            # draw -- so counting them as 'static' would inflate that share by
+            # a quarter of the corpus and hide that the three modes plus
+            # 'still' partition the sequences that do have a path.
+            # ⚠ The RENDERED mode wherever this run rendered the sequence: a
+            # trajectory the sequence could not carry renders still, and a
+            # census of the plan would report motion the corpus does not have.
+            planned_motion = path_motion_mode(impairments)
+            motion = rendered_motion.get(int(plan.sequence_id), planned_motion)
+            motion_counts[motion] += 1
+            if motion != planned_motion:
+                motion_downgrades += 1
         if talk_mode == 'double_talk':
             for label, needed in dt_combos.items():
                 if needed <= impairment_set:
@@ -501,6 +661,62 @@ def gen_aec_dataset(args):
     print(f"  Talk modes       : {dict(talk_counts)}")
     print(f"  Echo modes       : {dict(echo_counts)}")
     print(f"  Impairments      : {dict(impairment_counts)}")
+    print(f"  Path motion      : {dict(motion_counts)} "
+          f"(of {sum(motion_counts.values())} far-capable; rendered for the "
+          f"{len(rendered_motion)} sequence(s) this run rendered, planned for "
+          f"the rest)")
+    if motion_downgrades:
+        print(f"  ⚠ {motion_downgrades} sequence(s) drew a motion mode that "
+              f"did not fit the sequence and rendered still")
+    # The path correlation the rendered mixtures actually reached against the
+    # one the config asks for. They can only differ by the solver's own
+    # tolerance -- a trajectory renders positions that reach the target -- so
+    # this is the audit of that rule.
+    # ⚠ Scoped to the sequences THIS RUN rendered, like the Path motion row
+    # above and for the same reason: nothing about a finished sequence is
+    # persisted beyond its chunk WAVs, so a resumed run cannot read the reach
+    # of a sequence an earlier run wrote. A run that rendered none says so
+    # rather than printing nothing.
+    if rendered_reach:
+        for mode in sorted(rendered_reach):
+            reached = sorted(rendered_reach[mode])
+            median = reached[len(reached) // 2]
+            print(f"  Path correlation : {mode} reached {median:.4f} (median "
+                  f"of the {len(reached)} rendered this run) against the "
+                  f"configured "
+                  f"{position_correlation_target(cfg, mode):g}")
+    elif any(mode in DRIFT_MODES for mode in motion_counts):
+        print("  Path correlation : not audited -- this run rendered no "
+              "drifting sequence, and the reach of one an earlier run wrote "
+              "is not on disk")
+    # The position rows are scoped like the reach row, and say so when this
+    # run rendered nothing: a silent census reads as "no re-draw happened".
+    if not pending and any(mode in DRIFT_MODES for mode in motion_counts):
+        print("  Position draws   : not audited -- this run rendered no "
+              "sequence, and the re-draws, fallbacks and shared near positions "
+              "of the sequences an earlier run wrote are not on disk")
+    # Three counts, printed apart because they mean different things to a
+    # corpus: a re-draw costs a Gram lookup, a fallback costs variety (a room
+    # has ONE certified set per waypoint count, so every trajectory counted
+    # there repeats one of a handful of paths), and a shared near position is
+    # the one outcome the fallback exists to avoid.
+    for count, note in (
+            (position_redraws,
+             f"{position_redraws} position set(s) drawn for a trajectory "
+             f"could not reach the configured path correlation and were "
+             f"drawn again; a pool where this is common holds eligible rooms "
+             f"whose positions are mostly near-duplicates"),
+            (position_fallbacks,
+             f"{position_fallbacks} trajector(ies) exhausted their draws "
+             f"and rendered their room's certified set; those sequences "
+             f"repeat a handful of paths rather than sampling the room"),
+            (near_shared_sequences,
+             f"{near_shared_sequences} sequence(s) rendered the near "
+             f"talker on position(s) the loudspeaker also uses, because "
+             f"nothing else in the room reached the configured path "
+             f"correlation")):
+        if count:
+            print(f"  ⚠ {note}")
     print(f"  Acoustic tails   : {dict(acoustic_tail_counts)}")
     print(f"  DT intersections : {combo_counts}")
     print(f"  DT acoustic combo: {dt_acoustic_combo_count}")

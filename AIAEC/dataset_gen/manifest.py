@@ -30,13 +30,19 @@ sample is rendered:
     speaker      disjoint   (which also makes speech FILES disjoint)
     noise        disjoint
     room / RIR   disjoint   (a room is split whole; its RIRs never straddle)
-    device       disjoint   (loudspeaker EQ + nonlinearity model)
+    device       disjoint   (loudspeaker IDENTITY: its own EQ and drive)
 
-⚠ Device disjointness is the aggressive one.  It means validation is scored on
-loudspeaker nonlinearities the model has never seen, which is the honest
-question for a shipped product and a materially harder task than the usual AEC
-benchmark.  ``[split] device_split = shared`` relaxes it, and then the val
-score answers a different, easier question -- say so if you use it.
+⚠ Device disjointness holds out identities, not loudspeaker MODELS.  Train is
+filled with one id per configured nonlinearity model first, because the
+movement axis is calibrated through the population the corpus renders and a
+train split missing a model renders a different corpus; val is then drawn from
+the ids whose model train already carries.  So validation is scored on
+loudspeakers the model has never heard -- their own EQ, drive and level
+realisation -- of nonlinearity families it has heard elsewhere.  A split with
+too few spare ids to fill val that way falls back to a plain permutation, and
+then val can also carry a model train does not; the CLI prints what each split
+realises.  ``[split] device_split = shared`` drops the holdout entirely, and
+then the val score answers a different, easier question -- say so if you use it.
 
 The manifest is written to disk so that the train run and the val run, which
 are separate invocations, provably draw from the same decision.
@@ -73,7 +79,7 @@ __all__ = [
 
 # Bumped when the manifest's meaning changes, so a stale file is rejected
 # rather than reinterpreted.
-MANIFEST_VERSION = 'aec_manifest_v2'
+MANIFEST_VERSION = 'aec_manifest_v3'
 
 SPLITS = ('train', 'val')
 
@@ -100,10 +106,11 @@ DISJOINT_AXES = ('speakers', 'speech_files', 'noise_ids', 'noise_files',
 def config_hash(cfg: configparser.ConfigParser) -> str:
     """Stable hash of a config's full contents.
 
-    Recorded in the manifest and in every shard, so a corpus generated before a
-    config edit can be told apart from one generated after it.  Sorted, because
-    configparser's section order depends on file order and would otherwise make
-    two identical configs hash differently.
+    Recorded in the optional manifest and in the renderer's in-process audit
+    metadata. The WAV-only intermediate corpus and packed shards do not persist
+    it, so ``--resume`` cannot use it to identify audio from an older config.
+    Sorted, because configparser's section order depends on file order and
+    would otherwise make two identical configs hash differently.
     """
     items = []
     for section in sorted(cfg.sections()):
@@ -167,6 +174,11 @@ def _group(rel_paths: Sequence[str], pattern: Optional[str],
     return groups
 
 
+def _val_count(n_keys: int, val_fraction: float) -> int:
+    """How many of ``n_keys`` groups go to val, leaving train at least one."""
+    return min(max(1, int(round(n_keys * val_fraction))), n_keys - 1)
+
+
 def _split_groups(groups: Dict[str, List[str]], val_fraction: float,
                   rng: random.Random, axis: str) -> Dict[str, List[str]]:
     """Assign whole groups to train/val.  Never splits a group."""
@@ -178,9 +190,57 @@ def _split_groups(groups: Dict[str, List[str]], val_fraction: float,
             f"in [split], or point at a corpus with more variety."
         )
     rng.shuffle(keys)
-    n_val = max(1, int(round(len(keys) * val_fraction)))
-    n_val = min(n_val, len(keys) - 1)   # train must keep at least one group
+    n_val = _val_count(len(keys), val_fraction)
     return {'val': sorted(keys[:n_val]), 'train': sorted(keys[n_val:])}
+
+
+def _split_devices(cfg: configparser.ConfigParser, device_ids: Sequence[str],
+                   val_fraction: float, rng: random.Random,
+                   seed: int) -> Dict[str, List[str]]:
+    """Hold devices out for validation while TRAIN keeps every loudspeaker model.
+
+    The models are stratified over the whole configured id list, but a
+    source-disjoint corpus is rendered from ONE split's ids, so a val id drawn
+    without regard to its model takes that model out of training whenever it is
+    the only id carrying it -- with 8 ids over 7 models that is most seeds. The
+    movement axis is calibrated through the population the corpus actually
+    renders, so which models a split realises is not a detail of the seed.
+
+    The permutation therefore fills train with the first id of each distinct
+    model and val is drawn from the ids whose model is already covered. A split
+    that cannot hold every model -- fewer ids than models, or too few duplicate
+    models to fill val from -- falls back to the plain permutation, and the CLI
+    prints what each split realises.
+
+    ⚠ What val holds is therefore a held-out device IDENTITY: its own EQ,
+    drive and level draw of a nonlinearity model train also carries. There is
+    no unseen-MODEL guarantee on that side and none is available while train
+    keeps every model; the fallback above is the only case that can produce
+    one.
+    """
+    if len(device_ids) < 2:
+        raise ValueError(
+            f"device: only {len(device_ids)} id(s) in [devices] device_ids, so "
+            f"a source-disjoint split is impossible. Add ids, or set [split] "
+            f"device_split = shared")
+    # Imported here rather than at module scope: aec_dataset reads this module
+    # for its source pools, so the dependency only goes one way at import time.
+    from .aec_dataset import nonlinearity_by_id
+
+    model_of = nonlinearity_by_id(cfg, seed)
+    keys = sorted(device_ids)
+    rng.shuffle(keys)
+    n_val = _val_count(len(keys), val_fraction)
+
+    spare, covered = [], set()
+    for key in keys:
+        if model_of[key] in covered:
+            spare.append(key)
+        else:
+            covered.add(model_of[key])
+    val = set(spare[:n_val] if len(spare) >= n_val else keys[:n_val])
+    return {'val': sorted(val),
+            'train': sorted(key for key in keys if key not in val)}
 
 
 # ============================================================
@@ -353,8 +413,7 @@ def build_manifest(cfg: configparser.ConfigParser, seed: int,
     room_split = _split_groups(rooms, val_fraction, rng, 'room')
 
     if device_split == 'disjoint':
-        device_groups = {d: [d] for d in device_ids}
-        dev_split = _split_groups(device_groups, val_fraction, rng, 'device')
+        dev_split = _split_devices(cfg, device_ids, val_fraction, rng, seed)
     else:
         # ⚠ Sharing devices makes the val score answer "can it cancel a KNOWN
         # loudspeaker's echo in an unseen room" instead of "can it cancel an
