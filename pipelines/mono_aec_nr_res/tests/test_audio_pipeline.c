@@ -1095,6 +1095,79 @@ static void test_comfort_noise_contract(void) {
     }
 }
 
+/* The comfort noise is scaled by the denoiser gain of its bin, bounded below
+ * by CNG_NR_GAIN_FLOOR: the denoiser never sees the comfort noise, so its
+ * gain is applied at injection. Witness on an echo-plus-stationary-noise
+ * stimulus, where the denoiser settles far below the floor in every bin that
+ * carries comfort noise: the injected noise is the exact difference between
+ * a CNG-on and a CNG-off render (added after every gain, same draw
+ * sequence), so with the denoiser off (G_nr the unity vector) that difference
+ * is the unscaled reference d_ref and with it on the difference d_nr must be
+ * CNG_NR_GAIN_FLOOR * d_ref sample for sample. Two assertions pin the
+ * contract from outside: the residual d_nr - floor * d_ref carries almost no
+ * energy (an unbounded scaling or a different floor both leave a residual of
+ * (scale - floor)^2 of the reference), and the energy ratio sits at floor^2
+ * (no scaling at all would leave it at 1). */
+static void test_comfort_noise_follows_nr_gain(void) {
+    const int sr = 16000, fft_size = 256;
+    const double floor_amp = 0.31622777, floor_sq = floor_amp * floor_amp;
+    AudioPipelineConfig cfg[4];
+    AudioPipeline* p[4] = { NULL, NULL, NULL, NULL };
+    float* out[4] = { NULL, NULL, NULL, NULL };
+    float *mic, *ref;
+    int hop, settle_hops, hops, h, k, i, created = 1, finite = 1;
+    double e_nr = 0.0, e_ref = 0.0, e_res = 0.0;
+
+    /* [0] CNG off / NR on, [1] CNG on / NR on, [2] CNG off / NR off,
+     * [3] CNG on / NR off. */
+    for (i = 0; i < 4; i++) {
+        cfg[i] = grid_config(sr, fft_size);
+        cfg[i].enable_cng = (i & 1);
+        cfg[i].enable_nr = (i < 2);
+        p[i] = audio_pipeline_create(&cfg[i]);
+        if (!p[i]) created = 0;
+    }
+    CHECK(created, "cng/nr: all four instances create");
+    if (!created) { for (i = 0; i < 4; i++) audio_pipeline_destroy(p[i]); return; }
+    hop = audio_pipeline_hop_size(p[0]);
+    /* The denoiser passes through for its init window and then needs a few
+     * hops to pull the noise bins down to its gain floor. */
+    settle_hops = mmse_lsa_retime_frames(20, sr, hop) + 40;
+    hops = settle_hops + 200;
+    mic = (float*)calloc((size_t)hop, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    for (i = 0; i < 4; i++) out[i] = (float*)calloc((size_t)hop, sizeof(float));
+
+    lcg_state = 0xC0FFEEu;
+    for (h = 0; h < hops; h++) {
+        for (k = 0; k < hop; k++) {
+            ref[k] = lcg_sample();
+            mic[k] = 0.5f * ref[k] + 0.3f * lcg_sample();
+        }
+        for (i = 0; i < 4; i++) audio_pipeline_process(p[i], mic, ref, out[i]);
+        if (h < settle_hops) continue;
+        for (k = 0; k < hop; k++) {
+            double d_nr = out[1][k] - out[0][k];
+            double d_ref = out[3][k] - out[2][k];
+            double res = d_nr - floor_amp * d_ref;
+            if (!isfinite(d_nr) || !isfinite(d_ref)) finite = 0;
+            e_nr += d_nr * d_nr;
+            e_ref += d_ref * d_ref;
+            e_res += res * res;
+        }
+    }
+    CHECK(finite && e_ref > 0.0,
+          "cng/nr: the NR-off reference render injects comfort noise");
+    CHECK(e_nr > 0.0 && e_nr > 0.8 * floor_sq * e_ref && e_nr < 1.5 * floor_sq * e_ref,
+          "cng/nr: with the denoiser on, the injected noise carries floor^2 of "
+          "the NR-off energy -- the fill is scaled by G_nr down to the floor");
+    CHECK(e_res < 0.02 * e_ref,
+          "cng/nr: the injected noise is floor * reference sample for sample "
+          "-- the scaling is bounded by exactly CNG_NR_GAIN_FLOOR");
+    for (i = 0; i < 4; i++) { audio_pipeline_destroy(p[i]); free(out[i]); }
+    free(mic); free(ref);
+}
+
 int main(void) {
     for (int r = 0; r < N_GRIDS; r++) {
         int sr = GRIDS[r].sample_rate;
@@ -1126,6 +1199,7 @@ int main(void) {
 
     printf("\n=== comfort-noise contract ===\n");
     test_comfort_noise_contract();
+    test_comfort_noise_follows_nr_gain();
 
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);

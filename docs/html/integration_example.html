@@ -108,7 +108,7 @@ audio_pipeline_destroy(p);    /* 不釋放 caller pool */</pre>
     6.  sk_min_f32(g_total, mmse_lsa_get_gain(p->nr,NULL), ctx.res_gain, n_freqs)
         └ gain fusion = 逐 bin 取小
     7.  sk_capply_gain_f32(spec, ctx.error_spec, g_total, n_freqs)
-    8.  CNG(bins 1..n-2):a = sqrt(1-G_res²) * sqrt(N²/PSD_SCALE)
+    8.  CNG(bins 1..n-2):a = sqrt(1-G_res²) * sqrt(N²/PSD_SCALE) * max(G_nr, 0.316)
     9.  fft_inverse(p->fft, spec, ifft_buf)
    10.  sk_wola_accumulate_f32(ola, ifft_buf, synth_win, frame_size)
    11.  memcpy(out, ola, hop) ; memmove ; memset          ← hop emit + shift</pre>

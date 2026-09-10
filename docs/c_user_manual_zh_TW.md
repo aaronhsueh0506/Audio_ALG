@@ -103,7 +103,7 @@ mic/ref
 2. `R²` 除以 `32768²` 後，作為 NR 的 `extra_noise_psd`，得到 echo-aware `G_nr`。
 3. `G_nr` 與 AEC3 `G_res` 逐 bin 取較小值，不重複跑另一個時域 RES。
 4. `g_total` 直接取 `min(G_nr, G_res)`。post 段沒有 near-end floor，也沒有任何依賴廣帶能量的 lift；一個 bin 是否被保留，完全由 NR 自己的 speech-presence 模型與 AEC3 的 `G_res` 決定，所以環境噪聲大也不會把 NR 壓住或讓噪聲底跟著遠端起伏。
-5. CNG 只依 `G_res` 填回 AEC 抑制留下的頻譜空洞，不把 NR 剛去除的背景噪聲重新灌回。
+5. CNG 只依 `G_res` 決定填哪些 bin（AEC 抑制留下的頻譜空洞），注入位準再乘該 bin 的 `G_nr`（下限 −10 dB，`CNG_NR_GAIN_FLOOR`）：NR 看不到 comfort noise，所以它的 gain 在這裡補套，讓補進去的噪聲落在降噪後的底噪，而不是未降噪的環境噪聲。
 
 ## 3. 取得 submodule 與建置
 
@@ -525,7 +525,7 @@ Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`
 | 回聲未消除 | ref routing／delay／AEC 尚未 convergence | 先用 `--aec-only` 隔離 AEC 問題 |
 | AEC-only 正常，完整 pipeline 傷近端 | NR preset 或 RES gain | 先改 mild；再用 `--no-nr` / `--no-res` 隔離是哪個 gain 來源 |
 | 背景噪聲殘留 | NR 還在 init 或 preset 太保守 | 確認開頭噪聲段，逐級試 balanced/aggressive |
-| 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`，不要以 NR gain 驅動 CNG |
+| 輸出有洞或不自然靜音 | CNG 關閉或 gain 過深 | A/B 比較有無 `--no-cng`；CNG 只填 `G_res` 切掉的 bin，位準乘該 bin 的 NR gain（下限 −10 dB） |
 | 不同檔案結果互相影響 | state 未 reset | 每個獨立 stream reset 或重建全部 instance |
 | 尾端樣本變短 | CLI 只處理完整 hop | 上層先 padding，並在輸出後裁回原長度 |
 | 想使用 `AudioPipeline*` | 已實作 | 見 `pipelines/mono_aec_nr_res/audio_pipeline.h` + `pipelines/README.md`「Board Integration」；本手冊 wrapper 仍可用於未過渡的呼叫端 |

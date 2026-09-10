@@ -36,7 +36,11 @@ There is no near-end floor: `G_total` is applied as computed. Which bins
 survive is decided per bin by the denoiser's own speech-presence model and by
 `G_res`, so no broadband level can cap the denoiser or make the noise floor
 follow the far talker. Comfort noise is driven by the AEC suppression gain so
-it fills echo-removal holes rather than every bin attenuated by NR.
+it fills echo-removal holes rather than every bin attenuated by NR, and its
+level is scaled by the denoiser gain of the bin, bounded below at -10 dB
+(`CNG_NR_GAIN_FLOOR`): the denoiser never sees the comfort noise, so applying
+its gain here keeps the fill near the denoised floor instead of the ambient
+level, while the bound keeps enough of it to mask the residual echo.
 
 ## Signal grid
 

@@ -485,8 +485,8 @@ live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、�
 > **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
 > hop 生效：double-talk 期間套的是 DT 地板，而 DT 地板三個 preset **完全相同**；
 > far-active latch 觸發前套的是 far-silent 地板。同一個 `G_res` 還決定注入的 comfort
-> noise 量（振幅正比於 `sqrt(1 - G_res^2)`，見兩處實作的 CNG 步驟——地板越深、CNG
-> 反而越多）。所以**整段錄音的平均值移動幅度會小於 dB 落差所暗示的量**，而且只量
+> noise 量（振幅正比於 `sqrt(1 - G_res^2)`，再乘該 bin 的 `G_nr`（下限 −10 dB），見兩處實作的 CNG
+> 步驟——地板越深、CNG 反而越多）。所以**整段錄音的平均值移動幅度會小於 dB 落差所暗示的量**，而且只量
 > echo／degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或
 > degradation 對齊的條件下比較，並實際試聽。
 

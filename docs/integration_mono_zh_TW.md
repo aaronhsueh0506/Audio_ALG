@@ -283,7 +283,7 @@ ramp 進行中再呼叫一次，會從當前的 live 值重新起走。
 **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
 hop 上生效：double-talk 期間套用的是 DT 地板，而 DT 地板在三個 preset 之間**完全
 相同**；far-active latch 觸發之前套用的是 far-silent 地板。同一個 `ctx.res_gain`
-還決定注入的 comfort noise 量（振幅正比於 `sqrt(1 − G_res²)`，見
+還決定注入的 comfort noise 量（振幅正比於 `sqrt(1 − G_res²)`，再乘該 bin 的 NR gain（下限 −10 dB），見
 `mono_aec_nr_res/audio_pipeline.c` 的 CNG 步驟——地板壓得越深、CNG 反而越多）。
 因此**整段錄音的平均值移動
 幅度會小於 dB 落差所暗示的量**，而且一個只量 echo／degradation 的 A/B 會把 CNG 的
@@ -315,7 +315,7 @@ AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
 | `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不建 MMSE-LSA（state 不進 pool、`get_nr()` 回 `NULL`），`g_total` 只剩 `G_res`。`aec_only=1` 時無作用 |
 | `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不套 AEC3 殘留 gain（`G_res` 視為 1），`g_total` 只剩 `G_nr`，CNG 因為沒有被 RES 挖掉的 bin 而不填。兩者都 `0` 就是線性殘差經合成直通。`aec_only=1` 時無作用 |
 | `aec_only` | `int`（bool） | `0` | 只接受 `0` 或 `1`。`2` 之類的「truthy」值會被拒絕 | `1` = 只跑 linear AEC，完全跳過 NR/RES/最終 OLA。用來隔離問題，或你自己接後級。此時 `get_nr()` 回 `NULL`，且 FFT/NR/pipeline buffer 都不配置 |
-| `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 AEC 抑制掉的 bin 填舒適噪音。實際生效值是「AEC preset 自己的 `enable_cng`」與這個欄位的 AND |
+| `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 AEC 抑制掉的 bin 填舒適噪音，位準再乘該 bin 的 NR gain、下限 −10 dB（NR 看不到 comfort noise，在此補套）。實際生效值是「AEC preset 自己的 `enable_cng`」與這個欄位的 AND |
 | `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = 回到舊的 noise-only NR：noise floor 不摺入 R²。只用於比對舊行為，新整合請保持 `0` |
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）

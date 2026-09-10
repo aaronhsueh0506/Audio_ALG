@@ -72,7 +72,7 @@ audio_pipeline_process(p, mic, ref, out);                          /* 下一個 
 </table>
 <p><code>ramp_ms == 0</code> 下一個 hop 套用(<b>不是錯誤</b>),落點與「用該 preset 從頭建一個新實例」完全相同;<code>&gt; 0</code> 以 dB 線性走過去,上限 60 s(mild ↔ aggressive 是 18 dB 落差、地板又是硬 clamp,互動式旋鈕應給 ramp)。ramp 途中再呼叫會從當前 live 值重新起走。兩個 setter 都<b>不是重啟</b>:AEC 濾波器與延遲鎖定、NR 噪聲底與增益平滑歷史全部繼續跑(要重啟用 <code>audio_pipeline_reset()</code>)。<b>在兩個 hop 之間呼叫、與 <code>audio_pipeline_process()</code> 序列化;非 thread-safe。</b></p>
 <p class="note"><b>不要繞過 <code>set_nr_mode()</code> 去呼叫 <code>mmse_lsa_set_mode()</code>。</b>本 pipeline 的 NR 組態是「canonical 強度 preset <b>加上</b>自己的覆寫」(<code>L</code>、<code>alpha_decay</code>;見 <code>compose_nr_config()</code>)。<code>mmse_lsa_set_mode()</code> 組的是裸的 canonical preset,在本 pipeline 的實例上會被<b>拒絕</b>(它的 <code>L</code> 不同)——所以 <code>audio_pipeline_set_nr_mode()</code> 做的事是重組本 pipeline 的完整組態,再交給 <code>mmse_lsa_reconfigure()</code>。</p>
-<p class="note"><b>A/B 量測時該預期什麼。</b>far-active 地板只在 <b>far-active 且非 double-talk</b> 的 hop 生效:DT 期間套的是 DT 地板(三個 preset <b>完全相同</b>),far-active latch 觸發前套的是 far-silent 地板。同一個 <code>ctx.res_gain</code> 還決定注入的 comfort noise 量(振幅 ∝ <code>sqrt(1 − G_res²)</code>,見下方 block diagram 的 CNG 步驟——地板越深、CNG 反而越多)。所以<b>整段錄音的平均移動幅度會小於 dB 落差所暗示的量</b>,而且只量 echo/degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或 degradation 對齊的條件下比較,並實際試聽。</p>
+<p class="note"><b>A/B 量測時該預期什麼。</b>far-active 地板只在 <b>far-active 且非 double-talk</b> 的 hop 生效:DT 期間套的是 DT 地板(三個 preset <b>完全相同</b>),far-active latch 觸發前套的是 far-silent 地板。同一個 <code>ctx.res_gain</code> 還決定注入的 comfort noise 量(振幅 ∝ <code>sqrt(1 − G_res²)</code> 再乘該 bin 的 NR gain(下限 −10 dB),見下方 block diagram 的 CNG 步驟——地板越深、CNG 反而越多)。所以<b>整段錄音的平均移動幅度會小於 dB 落差所暗示的量</b>,而且只量 echo/degradation 的 A/B 會把 CNG 的變化錯記到別的機制。請在 echo 對齊或 degradation 對齊的條件下比較,並實際試聽。</p>
 
 <h3>逐階段耗時(診斷用)</h3>
 <pre>typedef struct AudioPipelineLastTiming {
@@ -110,7 +110,7 @@ void audio_pipeline_get_last_timing(const AudioPipeline* p,
  ├─ sk_min_f32(g_total, mmse_lsa_get_gain(nr,NULL), ctx.res_gain)
  ├─ sk_capply_gain_f32(spec, ctx.error_spec, g_total)
  ├─ CNG(enable_cng_effective): spec[1..n-2] += sqrt(N²/PSD_SCALE)
- │      * sqrt(1-res_gain²) * AEC3B_SQRT2_SIN_LUT[ix / (ix+8)&amp;31]
+ │      * sqrt(1-res_gain²) * max(g_nr[k], 0.316) * AEC3B_SQRT2_SIN_LUT[ix / (ix+8)&amp;31]
  │      ix = (rng_state*69069+1)&amp;0x7FFFFFFF &gt;&gt; 26, seed 0x9e3779b9
  │      (lib/aec aec3_post.c 的同一份 CNG 配方:期望功率不變、|樣本| ≤ sqrt(2))
  └─ fft_inverse(fft, spec, ifft_buf) ─► ola += ifft_buf*synth_win

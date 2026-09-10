@@ -84,6 +84,10 @@
 #endif
 
 #define PSD_SCALE                 (32768.0f * 32768.0f)  /* int16^2 (Python _PSD_SCALE) */
+/* Comfort noise is scaled by the denoiser gain of its bin, but never below
+ * this amplitude (-10 dB): the fill follows the denoised floor while enough
+ * of it remains to keep the residual echo it masks from surfacing. */
+#define CNG_NR_GAIN_FLOOR         0.31622777f
 
 /* Comfort-noise generator seed -- the constant both CLIs' old file-global
  * g_rng carried, kept so a fresh instance and a reset instance start the same
@@ -861,14 +865,16 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
 
     /* Comfort noise on the cut bins: level = sqrt(N^2/PSD_SCALE), scaled by
      * sqrt(1 - G_res^2) so it fills only what the AEC suppressed (bins
-     * 1..N-2). */
+     * 1..N-2), and by G_nr (bounded below by CNG_NR_GAIN_FLOOR) so the fill
+     * follows the denoised floor rather than the ambient level: the denoiser
+     * never sees the comfort noise, so its gain is applied to it here. */
     if (p->enable_cng_effective && ctx.comfort_noise) {
         for (int k = 1; k < n_freqs - 1; k++) {
             float n_amp = ctx.comfort_noise[k] / PSD_SCALE;
             n_amp = (n_amp > 0.0f) ? sqrtf(n_amp) : 0.0f;
             float ng2 = 1.0f - ctx.res_gain[k] * ctx.res_gain[k];
             float noise_gain = (ng2 > 0.0f) ? sqrtf(ng2) : 0.0f;
-            float a = noise_gain * n_amp;
+            float a = noise_gain * n_amp * fmaxf(nr_gain[k], CNG_NR_GAIN_FLOOR);
             uint32_t ix = cng_lut_index(p);
             p->spec[k].r += a * AEC3B_SQRT2_SIN_LUT[ix];
             p->spec[k].i += a * AEC3B_SQRT2_SIN_LUT[(ix + 8u) & 31u];

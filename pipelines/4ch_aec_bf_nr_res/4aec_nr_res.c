@@ -47,6 +47,10 @@
 
 /* PSD scale and CNG RNG seed, same as audio_pipeline.c. */
 #define PSD_SCALE                 (32768.0f * 32768.0f)
+/* Comfort noise is scaled by the denoiser gain of its bin, but never below
+ * this amplitude (-10 dB): the fill follows the denoised floor while enough
+ * of it remains to keep the residual echo it masks from surfacing. */
+#define CNG_NR_GAIN_FLOOR         0.31622777f
 #define PIPELINE_RNG_SEED         0x9e3779b9u
 
 /* Matched-filter duty cycle. The two WINDOWS are not literals here: they are
@@ -1911,6 +1915,10 @@ static int run_post_res_and_nr(
     sk_min_f32(p->total_gain, nr_gain, res_gain, n);
     sk_capply_gain_f32(p->output_spec, error, p->total_gain, n);
 
+    /* Comfort noise on the RES-cut bins, scaled by G_nr (bounded below by
+     * CNG_NR_GAIN_FLOOR) so the fill follows the denoised floor rather than
+     * the ambient level: the denoiser never sees the comfort noise, so its
+     * gain is applied to it here. */
     if (p->cfg.enable_cng && p->post_sg_storage) {
         for (k = 1; k < n - 1; ++k) {
             float n_amp =
@@ -1920,7 +1928,7 @@ static int run_post_res_and_nr(
             uint32_t ix;
             n_amp = n_amp > 0.0f ? sqrtf(n_amp) : 0.0f;
             gain2 = gain2 > 0.0f ? sqrtf(gain2) : 0.0f;
-            amplitude = n_amp * gain2;
+            amplitude = n_amp * gain2 * fmaxf(nr_gain[k], CNG_NR_GAIN_FLOOR);
             ix = cng_lut_index(p);
             p->output_spec[k].r +=
                 amplitude * AEC3B_SQRT2_SIN_LUT[ix];

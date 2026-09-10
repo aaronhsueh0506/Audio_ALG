@@ -308,7 +308,7 @@ if (four_aec_nr_res_post_split_floor(p, &live, &target) == 0 && live == target) 
 **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
 hop 上生效：double-talk 期間本核心強制套用 DT 地板，而 DT 地板在三個 preset 之間
 **完全相同**；far-active latch 觸發之前套用的是 far-silent 地板。同一個 gain 還
-決定注入的 comfort noise 量（振幅正比於 `sqrt(1 − G_res²)`——地板壓得越深、CNG
+決定注入的 comfort noise 量（振幅正比於 `sqrt(1 − G_res²)`，再乘該 bin 的 NR gain（下限 −10 dB）——地板壓得越深、CNG
 反而越多）。因此**整段錄音的平均值移動幅度會小於 dB 落差所暗示的量**，而且一個只量
 echo／degradation 的 A/B 會把 CNG 的變化錯記到別的機制頭上。請在 echo 對齊或
 degradation 對齊的條件下比較，並實際試聽。
@@ -341,7 +341,7 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 | `nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED`（= 2） | `MILD`(0) / `MODERATE`(1) / `BALANCED`(2) / `AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度，四級都可用 |
 | `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = post 級跳過 MMSE-LSA，`total_gain` 只由 RES 決定；RES／CNG／iFFT／WOLA 照常。給「要回聲抑制但不要降噪」的產品 |
 | `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不建 post-beam RES（state 不進 pool），`total_gain` 只由 NR 決定，CNG 沒有被 RES 挖掉的 bin 可填故略過；`set_aec_preset()`／`post_split_floor()` 回 `-1`。`enable_post` 優先於 `enable_res`／`enable_nr`：`enable_post=0` 兩者無作用，`enable_post=1` 兩者獨立組合，都 `0` 即 beamform 後線性誤差經合成直通 |
-| `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在被抑制的 bin 填舒適噪音 |
+| `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 RES 抑制掉的 bin 填舒適噪音，位準再乘該 bin 的 NR gain、下限 −10 dB |
 | `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = NR 的 noise prior 不摺入 R²。只用於比對舊行為，新整合請保持 `0` |
 
 ### 4.2 Grid（由 `sample_rate` + `fft_size` 唯一決定）

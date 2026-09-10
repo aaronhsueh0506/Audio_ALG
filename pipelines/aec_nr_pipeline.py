@@ -128,6 +128,9 @@ _NR_L_MINIMA_WINDOW = 94
 # g_res stays in the min. Set LEGACY_AMIN=1 (env / arg) to restore the prior
 # noise-only NR. There is no near-end floor: g_total is applied as computed.
 PROD_INJECT_ECHO_PSD = True
+# Comfort noise is scaled by the denoiser gain of its bin, never below this
+# amplitude (-10 dB); mirrors CNG_NR_GAIN_FLOOR in both C pipelines.
+CNG_NR_GAIN_FLOOR = 0.31622777
 
 
 def _project_grid(sample_rate: int, fft_size: int = None) -> Tuple[int, int, int]:
@@ -390,10 +393,14 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
 
         g_nr = nr_gains[i].astype(np.float32) if use_nr else 1.0
         g_res = ctx.res_gain.astype(np.float32) if use_res else 1.0
-        # Save AEC-only gain before combining with G_nr, for CNG noise level.
-        # CNG must reflect AEC suppression only — using g_total would re-inject
-        # noise into NR-suppressed bins (BAK ceiling).
+        # Save AEC-only gain before combining with G_nr: which bins the comfort
+        # noise fills is decided by AEC suppression alone (sqrt(1 - G_res^2)),
+        # never by g_total. Its LEVEL is then scaled by G_nr, bounded below by
+        # CNG_NR_GAIN_FLOOR, so the fill follows the denoised floor rather than
+        # the ambient level: the denoiser never sees the comfort noise, so its
+        # gain is applied to it here.
         g_aec = g_res if isinstance(g_res, np.ndarray) else np.full(n_freqs, g_res, dtype=np.float32)
+        cn_scale = np.maximum(g_nr, CNG_NR_GAIN_FLOOR) if isinstance(g_nr, np.ndarray) else 1.0
         if use_nr and use_res and combine == 'min':
             # A_min_pl: per-bin min recovers the AEC3 echo gain that v0 discarded
             # — near-end bins (g_res≈1) keep g_nr; echo bins (g_res<g_nr) cut the
@@ -414,7 +421,7 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
             cn = np.zeros(n_freqs, dtype=np.complex64)
             cn[1:-1] = (n_amp[1:-1]
                         * (rng.randn(n_freqs - 2) + 1j * rng.randn(n_freqs - 2)))
-            spec = spec + noise_gain * cn
+            spec = spec + noise_gain * cn_scale * cn
 
         e_full = np.fft.irfft(spec, n=fft).astype(np.float32)
         ola += e_full[:bs] * synth_win
