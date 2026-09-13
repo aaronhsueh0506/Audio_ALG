@@ -159,7 +159,7 @@ override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
           -I$(THIRD_PARTY_DIR)/GSC \
           $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) $(PROFILE_CFLAGS) \
           -DAUDIO_PIPELINE_BACKEND_STR=\"$(BACKEND)\" \
-          $(WERROR_CFLAGS) -ffp-contract=off
+          $(WERROR_CFLAGS) -ffp-contract=off -fno-math-errno
 LIB_CFLAGS := $(CFLAGS)
 
 LINK := $(CC)

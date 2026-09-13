@@ -75,7 +75,7 @@ endif
 override CFLAGS := -Wall -Wextra $(OPT_CFLAGS) -std=gnu99 \
                    -Iutility -Idoa -IGSC -IVAD -Igain -I$(AC_DIR_ABS)/include \
                    $(CPPFLAGS) $(EXTRA_CFLAGS) $(SIMD_CFLAGS) \
-                   $(WERROR_CFLAGS) -ffp-contract=off
+                   $(WERROR_CFLAGS) -ffp-contract=off -fno-math-errno
 
 SRCS = utility/complex.c utility/spatial_simd.c \
        doa/doa_smoother.c doa/steering.c doa/srp.c GSC/gsc.c \

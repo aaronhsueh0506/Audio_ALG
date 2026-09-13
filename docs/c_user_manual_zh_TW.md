@@ -147,7 +147,7 @@ cc -std=gnu99 -O2 -Wall -Wextra \
   ../audio_common/bin/kiss/libaudio_common.a -lm -o app
 ```
 
-AEC library 本身使用 `-ffp-contract=off` 建置；若 application 內重做同類遞迴 DSP 運算，也建議保留此選項以維持數值一致性。
+AEC library 本身使用 `-ffp-contract=off -fno-math-errno` 建置；若 application 內重做同類遞迴 DSP 運算，也應保留這兩個選項，以維持數值一致性並確保 AArch64 `sqrtf` 直接降成 `FSQRT`。
 
 ## 4. 命令列使用
 

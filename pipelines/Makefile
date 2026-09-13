@@ -509,7 +509,9 @@ endif
 # += $(FP_POLICY)`, appended LAST), so there is exactly one `:=` definition
 # of FP_POLICY in this file, just moved. Same fix audio_common/AEC/NR
 # already applied to their own Makefiles.
-FP_POLICY := -ffp-contract=off
+# Keep scalar/NEON operation ordering stable and let audio_common's guarded
+# AArch64 sqrtf calls lower to FSQRT without an errno-checking libm fallback.
+FP_POLICY := -ffp-contract=off -fno-math-errno
 
 # FP_ALLOWED_CHARS_RE (added alongside the FP-policy allow-list redesign
 # below -- replicated from audio_common's/AEC's/NR's identical fix, see the
@@ -1525,7 +1527,7 @@ DIST_LOCK         = $(DIST_ROOT)/.lock.$(BACKEND)
 #   -q  exits 1 directly (question mode's documented "needs updating"
 #       answer -- publish is phony, so it always would run -- no output);
 #   -n  exec a recursion-only path (the child make inherits -n and merely
-#       PRINTS _publish_impl's commands).
+#       PRINTS the pin check and _publish_impl commands).
 # All three are now ZERO-WRITE: no DIST_ROOT, no lock, no stage/helper/
 # MANIFEST/ATTEST writes, and no artifact mtime changes. See audio_common's
 # Makefile for the full MAKEFLAGS word-scan writeup (verified against GNU
@@ -1546,14 +1548,22 @@ publish:
 	done; \
 	if [ "$$has_t" = 1 ]; then echo "publish: -t (touch) is a no-op here -- publish is an action, not a build product; nothing was touched"; exit 0; fi; \
 	if [ "$$has_q" = 1 ]; then exit 1; fi; \
-	if [ "$$has_n" = 1 ]; then exec $(MAKE) --no-print-directory _publish_impl; fi; \
+	if [ "$$has_n" = 1 ]; then exec $(MAKE) --no-print-directory _publish_checked; fi; \
 	mkdir -p $(DIST_ROOT); \
 	if ! mkdir "$(DIST_LOCK)" 2>/dev/null; then \
 	  echo "FATAL: publish lock $(DIST_LOCK) already held (concurrent 'make publish BACKEND=$(BACKEND)'?)" >&2; \
 	  exit 1; \
 	fi; \
 	trap 'rmdir "$(DIST_LOCK)" 2>/dev/null' EXIT INT TERM; \
-	$(MAKE) --no-print-directory _publish_impl
+	$(MAKE) --no-print-directory _publish_checked
+
+# Keep dependency verification inside the publish lock and ahead of artifact
+# prerequisites. A normal prerequisite on _publish_impl would be insufficient
+# under -j because Make may build sibling prerequisites concurrently; a single
+# shell line joined with && keeps the ordering even under -i / .IGNORE.
+.PHONY: _publish_checked
+_publish_checked:
+	+$(MAKE) --no-print-directory _check_pins_impl && $(MAKE) --no-print-directory _publish_impl
 
 # _publish_impl phase-2: attest v2 records FOUR repos'
 # provenance -- this repo (Audio_ALG/pipelines) AND all three producers
@@ -1902,3 +1912,36 @@ clean-libs: clean-all
 test-grids:
 	$(MAKE) ULCNET_GRID=16k test
 	$(MAKE) ULCNET_GRID=48k test
+
+# ---------------------------------------------------------------------------
+# check-pins: verify the producer revisions this checkout expects. lib/aec
+# and lib/nr are submodules, so their gitlinks ARE the pin; audio_common is a
+# sibling checkout resolved through AC_DIR, so its expected commit is recorded
+# in audio_common.pin (bump it in the same commit that bumps the gitlinks).
+# A commit mismatch fails; tracked changes in a producer are reported but
+# allowed here (dev builds) -- `make publish` separately applies its dirty
+# policy. Publish runs this check after taking its lock and before building.
+# Submodule pins are read from the index, so a staged gitlink bump can be
+# validated before its commit; clean committed trees have index == HEAD.
+# ---------------------------------------------------------------------------
+.PHONY: check-pins _check_pins_impl
+check-pins: _check_pins_impl
+
+_check_pins_impl:
+	@pin="$$(sed -n 's/^AUDIO_COMMON_COMMIT=//p' audio_common.pin)"; \
+	 [ -n "$$pin" ] || { echo "check-pins: audio_common.pin has no AUDIO_COMMON_COMMIT" >&2; exit 1; }; \
+	 have="$$(git -C "$(AC_DIR)" rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	 if [ "$$have" != "$$pin" ]; then \
+	   echo "check-pins: FAIL audio_common at $(AC_DIR) is $$have, audio_common.pin expects $$pin" >&2; exit 1; \
+	 fi; \
+	 note=""; [ -n "$$(git -C "$(AC_DIR)" status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
+	 echo "check-pins: audio_common $$have matches audio_common.pin$$note"; \
+	 for sub in lib/aec lib/nr; do \
+	   rec="$$(git -C .. ls-files -s -- $$sub 2>/dev/null | awk '$$3 == 0 {print $$2}')"; \
+	   have="$$(git -C ../$$sub rev-parse HEAD 2>/dev/null || echo unknown)"; \
+	   if [ "$$rec" != "$$have" ]; then \
+	     echo "check-pins: FAIL $$sub checkout is $$have, gitlink records $$rec" >&2; exit 1; \
+	   fi; \
+	   note=""; [ -n "$$(git -C ../$$sub status --porcelain -uno 2>/dev/null)" ] && note=" (tracked changes present)"; \
+	   echo "check-pins: $$sub $$have matches gitlink$$note"; \
+	 done

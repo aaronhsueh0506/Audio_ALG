@@ -1,6 +1,6 @@
 CC ?= cc
 AR ?= ar
-CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -ffp-contract=off
+CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic -ffp-contract=off -fno-math-errno
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))
 

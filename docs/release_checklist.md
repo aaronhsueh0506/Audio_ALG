@@ -270,7 +270,7 @@ Pass conditions:
 - [ ] Pre-gain, resampler, WAV, invalid-input, and pool tests pass.
 - [ ] Invalid input does not modify a caller-owned pool.
 - [ ] Static processing allocates no heap after init.
-- [ ] The unified `-ffp-contract=off` policy and audit pass.
+- [ ] The unified `-ffp-contract=off -fno-math-errno` policy and FP/FSQRT audits pass.
 
 ## 4. AEC automated gate
 

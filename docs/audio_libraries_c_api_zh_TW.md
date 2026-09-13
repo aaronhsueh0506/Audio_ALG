@@ -743,6 +743,7 @@ AIAEC 蓋 `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`，AINR 蓋 `CC`/`AR`/`CF
 ```text
 -std=gnu99
 -ffp-contract=off
+-fno-math-errno
 -I<AEC>/c_impl/include
 -I<NR>/c_impl/include
 -I<audio_common>/include

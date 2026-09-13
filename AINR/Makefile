@@ -4,7 +4,7 @@ CFLAGS ?= -O2 -std=c11 -Wall -Wextra -Wpedantic
 # The floating-point contract and project include paths are invariants of the
 # C/Python parity boundary. Keep them even when a board build overrides
 # CFLAGS on the command line.
-override CFLAGS += -ffp-contract=off -I.
+override CFLAGS += -ffp-contract=off -fno-math-errno -I.
 LDFLAGS ?=
 SIMD ?= 1
 override SIMD := $(strip $(SIMD))

@@ -486,7 +486,7 @@ Guard rails (all four repos):
   skips it (participates in the config signature).
 - **`CFLAGS=`/`CXXFLAGS=`/`LDFLAGS=`/`CPPFLAGS=`/`FP_POLICY=` cannot be
   overridden on the make command line** — doing so would silently drop the
-  repo-pinned flags (`-ffp-contract=off`, backend defines, `NO_STDIO`); the
+  repo-pinned flags (`-ffp-contract=off`, `-fno-math-errno`, backend defines, `NO_STDIO`); the
   build errors out and points at `EXTRA_CFLAGS`/`EXTRA_LDFLAGS`, the two
   supported hooks. `EXTRA_CFLAGS` containing `-Ofast`/`-ffast-math`/
   `-ffp-contract=` is likewise rejected by the FP-policy conflict gate.
@@ -514,10 +514,13 @@ concurrently in the same worktree without stomping each other's objects.
 
 ## Unified FP-contraction policy
 
-`-ffp-contract=off` is a **unified policy spanning all four repos**
+`-ffp-contract=off -fno-math-errno` is a **unified policy spanning all four repos**
 (`audio_common`, `lib/nr`, `lib/aec`, the `../pipelines/` Makefile): every TU
 each Makefile compiles — own sources and vendored KISS/NE10 alike — builds
-with the flag, appended LAST in the `CFLAGS`/`LIB_CFLAGS` assembly (after
+with both flags. The second flag guarantees that guarded AArch64 `sqrtf`
+lowers to `FSQRT` without a cold errno fallback; production code does not
+read math `errno`.
+They are appended LAST in the `CFLAGS`/`LIB_CFLAGS` assembly (after
 `-DAUDIO_PIPELINE_BACKEND_STR`, `EXTRA_CFLAGS`, `WERROR`) so nothing can
 override it. `EXTRA_CFLAGS` (or a
 `CFLAGS=` override) containing `-Ofast`/`-ffast-math`/`-ffp-contract=<any>`

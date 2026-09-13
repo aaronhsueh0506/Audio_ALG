@@ -41,6 +41,7 @@ git commit -m "pin: NR to version xxx"
 |------|------|
 | `lib/nr/` | NR submodule (CVNR) |
 | `lib/aec/` | AEC submodule |
+| `../audio_common/` | 共用層，非 submodule；預期 commit 記在 `pipelines/audio_common.pin`，`make -C pipelines check-pins` 驗證；`publish` 也會在建置 artifact 前強制檢查 |
 | `AINR/` | standalone AI noise reduction models |
 | `AIAEC/` | neural AEC candidate models and dataset |
 | `shared/` | 共享工具代碼 |

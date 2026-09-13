@@ -1,0 +1,6 @@
+# Expected git commit of the sibling audio_common checkout (AC_DIR, default
+# ../../audio_common). audio_common is not a submodule, so this file plus
+# `make check-pins` is the source-level record of which audio_common
+# revision this Audio_ALG revision was built and tested against. Bump it in
+# the same commit that bumps the lib/aec and lib/nr submodule gitlinks.
+AUDIO_COMMON_COMMIT=79366c1041a70b3845b20b9e050fd2ab0a717473

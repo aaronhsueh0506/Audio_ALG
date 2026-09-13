@@ -73,7 +73,7 @@ CFLAGS += $(SIMD_CFLAGS)
 # carried -ffp-contract=fast (this repo's own pinned policy silently
 # overridden). There is exactly one `:=` definition of FP_POLICY in this
 # file, just relocated; its CFLAGS append stays exactly where it already was.
-FP_POLICY := -ffp-contract=off
+FP_POLICY := -ffp-contract=off -fno-math-errno
 # FP_ALLOWED_CHARS_RE (the FP-policy allow-list's character class, added
 # alongside the allow-list redesign further below) has the exact same
 # `make -e` exposure and is a bare literal for the same reason -- see the
