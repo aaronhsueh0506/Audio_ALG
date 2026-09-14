@@ -63,6 +63,14 @@ extern "C" {
 #define DFN_RATE_BRIDGE_DESCRIPTOR_VERSION 1u
 #define DFN_RATE_BRIDGE_LAYOUT_VERSION     1u
 
+/* GRID CONTRACT. The hop is always fft_size / 2: the hosting pipelines'
+ * 50% overlap is part of what this bridge synthesises and analyses, so it is
+ * fixed here rather than configured. The native grids are exactly 8 kHz/256,
+ * 16 kHz/256 and 16 kHz/512, the bridge's own capability gate (its
+ * resamplers, FIFO capacities, prefill calibration window and delay table
+ * are proven for these three), not a copy of the hosts' list. A further
+ * 50%-overlap grid extends that gate, the table and the tests; a different
+ * overlap is a different bridge, not a config value. */
 typedef struct DfnRateBridgeConfig {
     int sample_rate;            /* 8000 or 16000 (48000 uses the stage directly) */
     int fft_size;               /* 0 = rate default (256); 16 kHz also 512     */

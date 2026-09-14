@@ -71,14 +71,28 @@ SCALE_OUT = np.float32(2.0 ** 5)
 _DFN2_MODULES = None
 
 
+#: Bare module names every AINR project defines for itself.
+_AINR_BARE_NAMES = ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx')
+
+
 def dfn2_modules():
     """Import the DFN2 training/export modules the way they import each other
-    (bare names with their directory first on ``sys.path``)."""
+    (bare names with their directory first on ``sys.path``).
+
+    Each AINR project has its own top-level ``train.py``/``model.py``/
+    ``export_onnx.py``; in one Python session the first project imported
+    owns those names in ``sys.modules``, so a sibling's module would be
+    handed back silently. The cached names are dropped and the DFN2
+    directory moved to the front of ``sys.path`` before importing, as the
+    projects' own tests do."""
     global _DFN2_MODULES
     if _DFN2_MODULES is None:
         for path in (_AINR_DIR, _DFN2_DIR):
-            if path not in sys.path:
-                sys.path.insert(0, path)
+            while path in sys.path:
+                sys.path.remove(path)
+            sys.path.insert(0, path)
+        for stale in _AINR_BARE_NAMES:
+            sys.modules.pop(stale, None)
         import train as dfn2_train  # noqa: E402
         import model as dfn2_model  # noqa: E402
         import export_onnx as dfn2_export  # noqa: E402

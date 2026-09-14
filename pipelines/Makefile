@@ -1218,6 +1218,12 @@ test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter $(BIN_DIR)
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --delay-num-filters 1 --cng --atten-lim 12
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 48000
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 8000
+	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --delay-mode fixed --fixed-delay 64
+# Malformed numbers are refused at parse time with the documented exit code 2,
+# not merely "some failure" (a crash or a later pool rejection is nonzero too).
+	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --sample-rate 16000Hz >/dev/null 2>&1; test $$? -eq 2
+	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --delay-mode fixed --fixed-delay 12x >/dev/null 2>&1; test $$? -eq 2
+	"$(abspath $(BIN_DIR))/mono_aec_dfn_res" --atten-lim 12dB >/dev/null 2>&1; test $$? -eq 2
 
 # example-adapter: build + RUN the REFERENCE ONLY
 # board-adapter host simulation (example_board_adapter.c) standalone -- same

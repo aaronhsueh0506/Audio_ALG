@@ -105,6 +105,7 @@ static int run_grid(const Grid *g) {
     double near_energy = 0.0, total_energy = 0.0;
 
     if (!b) return 1;
+    /* hop = fft / 2 is the grid contract, not a derived value. */
     if (dfn_rate_bridge_hop_size(b) != hop ||
         dfn_rate_bridge_n_freqs(b) != g->fft / 2 + 1)
         return 2;
@@ -115,7 +116,9 @@ static int run_grid(const Grid *g) {
         return 3;
     }
 
-    /* Schedule and cumulative frame count (the count contract). */
+    /* Schedule and cumulative frame count (the count contract). The bridge
+     * calibrated its prefill over eight hops; a grid whose deficit outgrew
+     * that window would surface here as process() refusing a hop. */
     if (analyzer_init(&ae, g->fft) != 0 || analyzer_init(&ap, g->fft) != 0) return 4;
     frames = run_bridge(b, &ae, &ap, NULL, NULL, hops, g_out, schedule, 16);
     if (frames != (int)(((long long)hops * hop * 48000 / g->sr) / 512)) return 5;
@@ -213,6 +216,15 @@ static int run_rejections(void) {
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 5;
     cfg = bridge_config(16000, 0); cfg.stage.sample_rate = 16000;
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 6;
+    /* Below-set fft sizes, even where a host might one day offer them: the
+     * gate is the bridge's own (rows 13-14). Row 15 passes that gate and is
+     * refused by the stage's (1024 only), reached through the bridge. */
+    cfg = bridge_config(16000, 128);
+    if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 13;
+    cfg = bridge_config(8000, 128);
+    if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 14;
+    cfg = bridge_config(16000, 0); cfg.stage.fft_size = 512;
+    if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) == 0) return 15;
 
     cfg = bridge_config(16000, 0);
     if (dfn_rate_bridge_get_mem_requirements(&cfg, &req) != 0) return 7;

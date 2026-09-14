@@ -24,6 +24,9 @@ static int run_accelerator(void *user, const DFN2PrepostInputs *inputs,
     return -1; /* TODO(board): invoke the stateless DFN2 graph. */
 }
 
+/* Host grids this skeleton accepts at parse time (0-terminated): the core's own grids (no 8 kHz). */
+static const int HOST_RATES[] = { 16000, 48000, 0 };
+
 int main(int argc, char **argv) {
     static const char *name = "4ch_aec_bf_dfn_res";
     DfnExampleArgs args;
@@ -36,7 +39,7 @@ int main(int argc, char **argv) {
     static float output[DFN2_HOP_LEN];
     int hop, index, rc, hop_size;
 
-    rc = dfn_example_parse_args(argc, argv, name, &args);
+    rc = dfn_example_parse_args(argc, argv, name, HOST_RATES, &args);
     if (rc != 0) return rc == 1 ? 0 : rc;
     if (dfn_example_load_matrices(&args, g_erb_fwd, g_erb_inv, name) != 0)
         return 1;

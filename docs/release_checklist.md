@@ -905,28 +905,22 @@ is routinely misattributed to a real bug.
 | `AEC` `python3 -m pytest python/tests` | 289 |
 | `NR` `python3 -m pytest tests` | 56 |
 | `Audio_ALG/lib/nr` `python3 -m pytest tests` | 56 |
-| `Audio_ALG` `python3 -m pytest pipelines` | 72 |
-| `Audio_ALG` `python3 -m pytest AIAEC` | 528 |
-| `Audio_ALG` `python3 -m pytest AINR` | 221 |
-| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 821 |
+| `Audio_ALG` `python3 -m pytest pipelines` | 127 |
+| `Audio_ALG` `python3 -m pytest AIAEC` | 611 |
+| `Audio_ALG` `python3 -m pytest AINR` | 228 |
+| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 966 |
 
-The four `Audio_ALG` rows were re-measured on 2026-09-03 (same tree, same
-`SE/.venv` Python); the `AEC` and `NR` rows above them still carry their
+The four `Audio_ALG` rows were re-measured together on 2026-09-15 (same tree,
+same `SE/.venv` Python; the combined invocation ran to completion: 965 passed,
+1 skipped, 13 min 53 s). The `AEC` and `NR` rows above them still carry their
 2026-08-31 measurement and were NOT re-run. The three per-package rows sum
 exactly to the combined row, which is the check that the combined invocation
-collected everything.
-
-`python3 -m pytest pipelines` collects **126** on the current tree (same
-`SE/.venv` Python) after the DeepFilterNet2 pipeline work added
-`pipelines/tests/test_dfn2_stage.py`, `test_dfn2_stage_c_parity.py`,
-`test_dfn2_pipeline_contract.py`, `test_dfn2_4ch_contract.py`,
-`test_dfn2_rate_adapter.py`, `test_dfn2_rate_bridge_c_parity.py` and
-`test_cng_aec3.py`, and extended `test_doc_layout_versions.py` with the four
-new layout macros (`DFN_RES_STAGE_LAYOUT_VERSION`,
-`DFN_RATE_BRIDGE_LAYOUT_VERSION`, `MONO_AEC_DFN_RES_LAYOUT_VERSION`,
-`FOUR_AEC_DFN_RES_LAYOUT_VERSION`). The `AIAEC`, `AINR` and combined rows were NOT
-re-measured, so the sum check above does not hold until they are — re-measure
-all four together before using them as a gate.
+collected everything. The `pipelines` row grew from 72 with the
+DeepFilterNet2 pipeline work (`pipelines/tests/test_dfn2_stage.py`,
+`test_dfn2_stage_c_parity.py`, `test_dfn2_pipeline_contract.py`,
+`test_dfn2_4ch_contract.py`, `test_dfn2_rate_adapter.py`,
+`test_dfn2_rate_bridge_c_parity.py`, `test_cng_aec3.py`, and the four new
+layout macros in `test_doc_layout_versions.py`).
 
 The combined row is the one that matters, and it is the one that used to be
 impossible: pytest gives every `conftest.py` the same top-level module name, so
@@ -934,7 +928,16 @@ a test doing `from conftest import ...` picks up whichever package was imported
 first and the whole run dies at collection while each package on its own stays
 green. `AIAEC/tests/test_cross_package_collection.py` now drives the combined
 invocation in a subprocess, in both argument orders, so the per-package rows
-can no longer be green over a suite that cannot start.
+can no longer be green over a suite that cannot start. Collection is not the
+only place this bites: every AINR project also defines a top-level `train`,
+`model` and `export_onnx`, and a bare import made after a sibling's is cached
+in `sys.modules` is handed the sibling's module at RUN time, so the per-package
+rows stay green while the combined run errors at fixture setup (this is how
+the 2026-09-15 re-measurement found `pipelines/dfn2_stage.py` loading the
+wrong `train`). Consumers of those modules drop the cached names and front
+their own directory before importing, as the projects' tests do, and
+`pipelines/tests/test_dfn2_stage.py` pins that for the DFN2 stage. Re-run the
+combined row, not just the per-package rows, before using these as a gate.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
 (re-measured on the current working tree, KISS backend, `make clean` first):

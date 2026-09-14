@@ -76,7 +76,9 @@ static uint32_t fnv_u32(uint32_t h, uint32_t v) {
     return h;
 }
 
-/* The native grids the hosting pipelines offer below 48 kHz. */
+/* The bridge's capability gate (see GRID CONTRACT in the header): the three
+ * native grids its resamplers, FIFO capacities and calibration window are
+ * proven for, hop = fft / 2 always. */
 static int grid_dims(int sample_rate, int fft_size, int *fft, int *hop) {
     int f = fft_size == 0 ? 256 : fft_size;
     if (sample_rate == 8000) {

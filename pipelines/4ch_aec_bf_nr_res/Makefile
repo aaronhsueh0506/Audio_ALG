@@ -391,6 +391,11 @@ test: test-third-party \
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res"
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --delay-num-filters 1 --cng --atten-lim 12
 	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --sample-rate 48000
+# Malformed numbers, and the 8 kHz grid the core does not offer, are refused
+# at parse time with the documented exit code 2.
+	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --sample-rate 16000Hz >/dev/null 2>&1; test $$? -eq 2
+	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --sample-rate 8000 >/dev/null 2>&1; test $$? -eq 2
+	"$(abspath $(BIN_DIR))/4ch_aec_bf_dfn_res" --atten-lim 12dB >/dev/null 2>&1; test $$? -eq 2
 
 lib libaudio_pipeline_4ch.a: $(PIPELINE_LIB)
 lib4aec_dfn_res.a: $(DFN_PIPELINE_LIB)

@@ -101,7 +101,7 @@ HOP/BINS/TA_BINS 由 N_FFT 導出）、<code>ulcnet_process.h</code>（四個別
 做原生 WOLA → 升頻 → 48 k 分析 → stage → 48 k WOLA → 降頻。
 呼叫端<b>不</b>需要在 API 之外先 resample</td>
 <td rowspan="3"><code>pipelines/dfn_res_stage.c:120-121</code>（<code>DFN2_SR</code> / <code>DFN2_N_FFT</code>）、
-<code>pipelines/dfn_rate_bridge.c:80-92</code>、
+<code>pipelines/dfn_rate_bridge.c:82-94</code>、
 <code>pipelines/mono_aec_dfn_res/audio_pipeline_dfn.c:50-55</code>、
 <code>pipelines/4ch_aec_bf_dfn_res/4aec_dfn_res.c:50-55</code></td></tr>
 <tr><td>stage：48 k</td><td><b>1024 / 512（513）唯一格點</b></td></tr>
@@ -289,8 +289,8 @@ exactly ONE hop」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 16 k/hop 256 → 629（39.3 ms），總 885 = 55.3 ms；
 8 k/hop 128 → 330（41.3 ms），總 458 = 57.3 ms（mono 專有）。
 延遲由脈衝精確釘住，但訊號經兩顆 FIR resampler 往返，<b>不是</b>逐位元等值
-（<code>pipelines/dfn_rate_bridge.c:330-333</code>、
-<code>pipelines/tests/test_dfn_rate_bridge.c:70-74</code>）</td></tr>
+（<code>pipelines/dfn_rate_bridge.c:332-335</code>、
+<code>pipelines/tests/test_dfn_rate_bridge.c:71-75</code>）</td></tr>
 </table>
 </div>
 <p class="note">DFN2 的分析本來就是 center=False 串流（上一節），所以 48 k host 的格點與窗

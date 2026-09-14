@@ -7,6 +7,7 @@ frames, or whether a failed head evaluation leaves state untouched.
 """
 import pathlib
 import sys
+import types
 
 import numpy as np
 import pytest
@@ -28,6 +29,21 @@ from pipelines.dfn2_stage import (  # noqa: E402
 @pytest.fixture(scope='module')
 def assets():
     return load_dfn2(seed=0)
+
+
+def test_dfn2_modules_are_dfn2s_even_after_a_sibling_project_imported_first(monkeypatch):
+    """AIAEC and the other AINR projects each define a top-level ``train``,
+    ``model`` and ``export_onnx``; once a sibling's is in ``sys.modules`` a
+    bare import hands it back, and the whole stage then fails at setup. The
+    per-package run never sees that (the DFN2 modules are imported first),
+    the combined run does."""
+    for name in stage_mod._AINR_BARE_NAMES:
+        monkeypatch.setitem(sys.modules, name, types.ModuleType(name))   # a sibling's, attribute-free
+    monkeypatch.setattr(stage_mod, '_DFN2_MODULES', None)
+    train, model, export = stage_mod.dfn2_modules()
+    for module in (train, model, export):
+        assert pathlib.Path(module.__file__).parent == pathlib.Path(stage_mod._DFN2_DIR)
+    assert callable(train.read_model_config)
 
 
 def _frames(count, seed, scale=1.0):

@@ -8,6 +8,9 @@
 #ifndef DFN_EXAMPLE_ARGS_H
 #define DFN_EXAMPLE_ARGS_H
 
+#include <errno.h>
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +36,7 @@ _Static_assert(DFN_EXAMPLE_DELAY_NUM_FILTERS >= 1 &&
                "DFN_EXAMPLE_DELAY_NUM_FILTERS outside lib/aec's bank range");
 
 typedef struct DfnExampleArgs {
-    int sample_rate;         /* host grid: 8000, 16000 (default) or 48000 */
+    int sample_rate;         /* one of the skeleton's host grids (default 16000) */
     AecDelayMode delay_mode;
     int delay_num_filters;   /* MATCHED only; 1..DA_NUM_FILTERS             */
     int fixed_delay_samples; /* FIXED only; -1 otherwise                    */
@@ -43,10 +46,27 @@ typedef struct DfnExampleArgs {
     int enable_cng;
 } DfnExampleArgs;
 
-static void dfn_example_usage(const char *prog) {
+/* `rates` is the 0-terminated list of host grids THIS skeleton's host offers
+ * (the 4-channel core has no 8 kHz); "8000|16000|48000" for the texts. */
+static int dfn_example_rate_known(const int *rates, int value) {
+    for (; *rates; ++rates)
+        if (*rates == value) return 1;
+    return 0;
+}
+
+static const char *dfn_example_rates_text(const int *rates, char *buf, size_t cap) {
+    size_t used = 0;
+    buf[0] = '\0';
+    for (; *rates && used < cap; ++rates)
+        used += (size_t)snprintf(buf + used, cap - used, "%s%d",
+                                 used ? "|" : "", *rates);
+    return buf;
+}
+
+static void dfn_example_usage(const char *prog, const char *rates_text) {
     fprintf(stderr,
         "Usage: %s [options]\n"
-        "  --sample-rate {8000|16000|48000}\n"
+        "  --sample-rate {%s}\n"
         "                              host grid (default 16000); only the DFN2\n"
         "                              stage runs at 48 kHz, through the rate\n"
         "                              bridge below 48 kHz\n"
@@ -65,7 +85,7 @@ static void dfn_example_usage(const char *prog) {
         "  --cng                       enable the host's comfort-noise fill\n"
         "                              (off by default for the DFN2 variants)\n"
         "  -h, --help                  this message\n",
-        prog, DFN_EXAMPLE_DELAY_NUM_FILTERS);
+        prog, rates_text, DFN_EXAMPLE_DELAY_NUM_FILTERS);
 }
 
 static int dfn_example_parse_delay_mode(const char *s, AecDelayMode *out) {
@@ -84,15 +104,43 @@ static const char *dfn_example_delay_mode_name(AecDelayMode m) {
     }
 }
 
-/* Returns 0 on success, 1 on --help, 2 on a rejected argument. Every
+/* Whole-string decimal integer / finite float, or -1: "16000Hz", "12dB"
+ * and "" are rejections, not 16000, 12 and 0. */
+static int dfn_example_parse_int(const char *text, int *value) {
+    char *end = NULL;
+    long parsed;
+    errno = 0;
+    parsed = strtol(text, &end, 10);
+    if (errno || end == text || *end != '\0' || parsed < INT_MIN ||
+        parsed > INT_MAX)
+        return -1;
+    *value = (int)parsed;
+    return 0;
+}
+
+static int dfn_example_parse_float(const char *text, float *value) {
+    char *end = NULL;
+    float parsed;
+    errno = 0;
+    parsed = strtof(text, &end);
+    if (errno || end == text || *end != '\0' || !isfinite(parsed)) return -1;
+    *value = parsed;
+    return 0;
+}
+
+/* Returns 0 on success, 1 on --help, 2 on a rejected argument. `rates` is
+ * the 0-terminated list of host grids this skeleton's host offers. Every
  * rejection names BOTH the requested value and what this build accepts,
  * because the pipeline TUs are stdio-free and can only answer with a NULL
  * handle. */
 static int dfn_example_parse_args(int argc, char **argv, const char *name,
-                                  DfnExampleArgs *out) {
+                                  const int *rates, DfnExampleArgs *out) {
+    char rates_text[64];
     int have_num_filters = 0;
     int have_fixed = 0;
     int i;
+
+    dfn_example_rates_text(rates, rates_text, sizeof(rates_text));
 
     out->sample_rate = 16000;
     out->delay_mode = AEC_DELAY_MATCHED;
@@ -106,14 +154,14 @@ static int dfn_example_parse_args(int argc, char **argv, const char *name,
     for (i = 1; i < argc; ++i) {
         const char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
-            dfn_example_usage(argv[0]);
+            dfn_example_usage(argv[0], rates_text);
             return 1;
         } else if (!strcmp(arg, "--sample-rate") && i + 1 < argc) {
-            out->sample_rate = atoi(argv[++i]);
-            if (out->sample_rate != 8000 && out->sample_rate != 16000 &&
-                out->sample_rate != 48000) {
-                fprintf(stderr, "%s: --sample-rate %d is not a host grid "
-                        "(accepted: 8000|16000|48000)\n", name, out->sample_rate);
+            if (dfn_example_parse_int(argv[++i], &out->sample_rate) != 0 ||
+                !dfn_example_rate_known(rates, out->sample_rate)) {
+                fprintf(stderr, "%s: --sample-rate '%s' is not a host grid of "
+                        "this skeleton (accepted: %s)\n", name, argv[i],
+                        rates_text);
                 return 2;
             }
         } else if (!strcmp(arg, "--delay-mode") && i + 1 < argc) {
@@ -123,22 +171,35 @@ static int dfn_example_parse_args(int argc, char **argv, const char *name,
                 return 2;
             }
         } else if (!strcmp(arg, "--delay-num-filters") && i + 1 < argc) {
-            out->delay_num_filters = atoi(argv[++i]);
+            if (dfn_example_parse_int(argv[++i], &out->delay_num_filters) != 0) {
+                fprintf(stderr, "%s: --delay-num-filters '%s' is not an "
+                        "integer (accepted: 1..%d)\n", name, argv[i],
+                        DA_NUM_FILTERS);
+                return 2;
+            }
             have_num_filters = 1;
         } else if (!strcmp(arg, "--fixed-delay") && i + 1 < argc) {
-            out->fixed_delay_samples = atoi(argv[++i]);
+            if (dfn_example_parse_int(argv[++i], &out->fixed_delay_samples) != 0) {
+                fprintf(stderr, "%s: --fixed-delay '%s' is not an integer "
+                        "(accepted: native-rate samples >= 0)\n", name, argv[i]);
+                return 2;
+            }
             have_fixed = 1;
         } else if (!strcmp(arg, "--erb-fwd") && i + 1 < argc) {
             out->erb_fwd_path = argv[++i];
         } else if (!strcmp(arg, "--erb-inv") && i + 1 < argc) {
             out->erb_inv_path = argv[++i];
         } else if (!strcmp(arg, "--atten-lim") && i + 1 < argc) {
-            out->atten_lim_db = (float)atof(argv[++i]);
+            if (dfn_example_parse_float(argv[++i], &out->atten_lim_db) != 0) {
+                fprintf(stderr, "%s: --atten-lim '%s' is not a finite dB "
+                        "value\n", name, argv[i]);
+                return 2;
+            }
         } else if (!strcmp(arg, "--cng")) {
             out->enable_cng = 1;
         } else {
             fprintf(stderr, "%s: unknown argument '%s'\n", name, arg);
-            dfn_example_usage(argv[0]);
+            dfn_example_usage(argv[0], rates_text);
             return 2;
         }
     }
