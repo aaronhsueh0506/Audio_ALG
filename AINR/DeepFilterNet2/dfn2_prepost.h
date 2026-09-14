@@ -116,8 +116,11 @@ extern "C" {
 #define DFN2_PREPOST_DESCRIPTOR_VERSION 1u
 /* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
  * so a pool recorded by the previous carve is refused on the hash, not only
- * on `bytes`. */
-#define DFN2_PREPOST_CARVE_VERSION      1u
+ * on `bytes`.
+ *   1  the original walk
+ *   2  DFN2_IO_FREQ carves a second staging pair (apply_re/apply_im) for the
+ *      dual-input entry point, appended after every existing region */
+#define DFN2_PREPOST_CARVE_VERSION      2u
 
 /* One shared alignment for every module (audio_common mem_align.h). */
 #define DFN2_PREPOST_ALIGNMENT 16u
@@ -346,6 +349,22 @@ int dfn2_prepost_pre_process_freq(DFN2Prepost *p,
                                   const float spec_re[DFN2_N_BINS],
                                   const float spec_im[DFN2_N_BINS]);
 
+/* DFN2_IO_FREQ, dual input. `est` feeds the ESTIMATION branch (the ERB and
+ * complex features, hence the graph window and the heads); `app` feeds the
+ * APPLICATION branch (the noisy ring the mask, deep filter and attenuation
+ * limit are applied to). Both are one already-analysed frame in the model's
+ * own framing and at normalized=True scale, on the same frame clock. The two
+ * branches touch disjoint state inside dfn2_process.c, so with est == app
+ * this call is exactly dfn2_prepost_pre_process_freq(). Named est/app rather
+ * than a/b because two same-typed pairs is where an argument swap hides.
+ * Returns 0 on the first frame, 1 thereafter, or -1 on NULL arguments, in
+ * DFN2_IO_TIME, or with a frame still open. */
+int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p,
+                                       const float est_re[DFN2_N_BINS],
+                                       const float est_im[DFN2_N_BINS],
+                                       const float app_re[DFN2_N_BINS],
+                                       const float app_im[DFN2_N_BINS]);
+
 /* Publish the current frame's accelerator boundary. Every writable output is
  * NaN-prefilled, so a partial write is caught by frame_commit rather than
  * leaking the previous frame's values. Pointers are into this instance's pool
@@ -398,6 +417,43 @@ int dfn2_prepost_post_process_freq(DFN2Prepost *p, float re[DFN2_N_BINS],
  * since the last reset; -1 on NULL or before the first emission. Use it to
  * pair the output stream with anything else clocked on the same frames. */
 int dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
+
+/* ---- the accelerator callback boundary ------------------------------
+ *
+ * A pipeline that hosts this class never owns an accelerator runtime; it
+ * owns a DFN2Model, four plain pointers the board fills in. `infer` receives
+ * the published tensor views of the open frame (the same
+ * DFN2PrepostInputs/DFN2PrepostOutputs frame_inputs() hands out, so a
+ * runtime binds by name and element count and no flat argument order can
+ * drift) and returns 0 when it wrote every output. `reset` (optional) is
+ * called when the hosting stage resets. `io_descriptor` is the graph
+ * contract the runtime was built against; a model that infers must publish
+ * one, and the host refuses a descriptor dfn2_model_io_descriptor_validate()
+ * rejects, because the NaN-prefill catches an unwritten output, never a
+ * wrong-shaped one.
+ *
+ * This boundary lives here, not in dfn2_process.h: it names the class's
+ * I/O views, and dfn2_process.c must stay compilable on its own for the
+ * parity builds that link nothing else. */
+typedef struct DFN2Model {
+    void *user;
+    int (*infer)(void *user, const DFN2PrepostInputs *inputs,
+                 DFN2PrepostOutputs *outputs);
+    void (*reset)(void *user);
+    const DFN2ModelIoDescriptor *io_descriptor;   /* NULL = not published */
+} DFN2Model;
+
+/* Drive one open frame through the model: frame_inputs() (NaN-prefilled),
+ * infer(), frame_commit(); on a nonzero infer() result or a refused commit
+ * (a non-finite or unwritten output) the frame is taken with frame_skip()
+ * instead, so the framing and compose clocks always advance exactly once.
+ * The finiteness rule is not re-implemented here -- frame_commit() owns it.
+ * Returns 1 when the heads were committed, 0 when the frame was skipped,
+ * -1 on a contract error (NULL model or instance, no infer callback, or no
+ * frame open). Unlike the AIAEC identity policy, a skipped frame still emits
+ * the source frame two hops back: the identity is applied inside the
+ * cascade, the timing never changes. */
+int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);
 
 #ifdef __cplusplus
 }

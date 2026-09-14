@@ -43,6 +43,13 @@ struct DFN2Prepost {
     /* Per-hop staging. */
     float *spec_re;     /* [DFN2_N_BINS]  current frame, original scale     */
     float *spec_im;
+    /* DFN2_IO_FREQ only: the application spectrum of the dual entry point.
+     * compose_re/compose_im select what the compose stage reads this hop:
+     * spec_* on the single-input entries, apply_* on the dual one. */
+    float *apply_re;    /* [DFN2_N_BINS]                                    */
+    float *apply_im;
+    const float *compose_re;
+    const float *compose_im;
     float *feat_erb;    /* [DFN2_N_ERB]                                     */
     float *feat_spec;   /* [2][DFN2_DF_BINS], two contiguous segments       */
     float *enh_re;      /* [DFN2_N_BINS]  compose output                    */
@@ -198,6 +205,18 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
         if (pp_carve(base, &cursor, float_counts[i] * sizeof(float),
                      &ptr) != 0) return -1;
         if (base && p) *slots[i] = (float *)ptr;
+    }
+
+    /* DFN2_IO_FREQ only: the dual entry point's application spectrum.
+     * Appended AFTER every region above so no existing offset moved when it
+     * was added (DFN2_PREPOST_CARVE_VERSION 2). */
+    if (io_mode == DFN2_IO_FREQ) {
+        if (pp_carve(base, &cursor, (size_t)DFN2_N_BINS * sizeof(float),
+                     &ptr) != 0) return -1;
+        if (base && p) p->apply_re = (float *)ptr;
+        if (pp_carve(base, &cursor, (size_t)DFN2_N_BINS * sizeof(float),
+                     &ptr) != 0) return -1;
+        if (base && p) p->apply_im = (float *)ptr;
     }
 
     *total = ck_align16_size(cursor);
@@ -462,9 +481,9 @@ static int pp_begin_frame(DFN2Prepost *p) {
          * legal exactly while current < DFN2_MASK_LOOKAHEAD -- if the two
          * counters ever disagree it returns -1 and we surface it rather than
          * pairing a mask with the wrong frame. */
-        if (dfn2_compose_stream(p->dsp, p->spec_re, p->spec_im, 0, NULL, NULL,
-                                0.0f, p->atten_lim_db, p->enh_re, p->enh_im,
-                                NULL) != 0) {
+        if (dfn2_compose_stream(p->dsp, p->compose_re, p->compose_im, 0,
+                                NULL, NULL, 0.0f, p->atten_lim_db, p->enh_re,
+                                p->enh_im, NULL) != 0) {
             return -1;
         }
         return 0;
@@ -479,6 +498,8 @@ int dfn2_prepost_pre_process(DFN2Prepost *p,
     if (p->io_mode != DFN2_IO_TIME) return -1;
     if (p->frame_open) return -1;   /* previous frame never closed */
     dfn2_analysis(p->dsp, in_hop, p->spec_re, p->spec_im);
+    p->compose_re = p->spec_re;
+    p->compose_im = p->spec_im;
     return pp_begin_frame(p);
 }
 
@@ -491,6 +512,26 @@ int dfn2_prepost_pre_process_freq(DFN2Prepost *p,
     if (p->frame_open) return -1;
     memcpy(p->spec_re, spec_re, bins);
     memcpy(p->spec_im, spec_im, bins);
+    p->compose_re = p->spec_re;
+    p->compose_im = p->spec_im;
+    return pp_begin_frame(p);
+}
+
+int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p,
+                                       const float est_re[DFN2_N_BINS],
+                                       const float est_im[DFN2_N_BINS],
+                                       const float app_re[DFN2_N_BINS],
+                                       const float app_im[DFN2_N_BINS]) {
+    const size_t bins = (size_t)DFN2_N_BINS * sizeof(float);
+    if (!p || !est_re || !est_im || !app_re || !app_im) return -1;
+    if (p->io_mode != DFN2_IO_FREQ) return -1;
+    if (p->frame_open) return -1;
+    memcpy(p->spec_re, est_re, bins);
+    memcpy(p->spec_im, est_im, bins);
+    memcpy(p->apply_re, app_re, bins);
+    memcpy(p->apply_im, app_im, bins);
+    p->compose_re = p->apply_re;
+    p->compose_im = p->apply_im;
     return pp_begin_frame(p);
 }
 
@@ -570,9 +611,9 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
      * heads' finiteness and its own frame-clock alignment -- before its
      * first write, so a -1 here leaves the compose state untouched and the
      * frame OPEN for the caller to take with frame_skip(). */
-    emitted = dfn2_compose_stream(p->dsp, p->spec_re, p->spec_im, 1, erb_mask,
-                                  coefs, alpha, p->atten_lim_db, p->enh_re,
-                                  p->enh_im, &frame);
+    emitted = dfn2_compose_stream(p->dsp, p->compose_re, p->compose_im, 1,
+                                  erb_mask, coefs, alpha, p->atten_lim_db,
+                                  p->enh_re, p->enh_im, &frame);
     if (emitted < 0) return -1;
     p->frame_open = 0;
     p->prepared = 0;
@@ -665,4 +706,22 @@ int dfn2_prepost_post_process_freq(DFN2Prepost *p, float re[DFN2_N_BINS],
     memcpy(im, p->enh_im, bins);
     if (valid) *valid = p->have_output;
     return 0;
+}
+
+/* ---- the accelerator callback boundary ------------------------------ */
+
+int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p) {
+    DFN2PrepostInputs inputs;
+    DFN2PrepostOutputs outputs;
+    if (!model || !model->infer || !p || !p->frame_open) return -1;
+    if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0) return -1;
+    if (model->infer(model->user, &inputs, &outputs) != 0) {
+        return dfn2_prepost_frame_skip(p) == 0 ? 0 : -1;
+    }
+    if (dfn2_prepost_frame_commit(p) != 0) {
+        /* A refused commit leaves the frame open with nothing moved; take
+         * it as the identity so the clocks advance exactly once. */
+        return dfn2_prepost_frame_skip(p) == 0 ? 0 : -1;
+    }
+    return 1;
 }

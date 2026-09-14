@@ -39,6 +39,8 @@ instance.
 | 4-ch linear core | libaudio_pipeline_4ch.a | 4ch_aec_bf_nr_res/4aec_nr_res.h | One shared aligner + four linear AECs; the archive contains only this core |
 | Complete 4-ch spatial | application object | 4ch_aec_bf_nr_res/audio_pipeline_4ch.h | Core + reusable SRP-PHAT/GSC/NR libraries; linked into the application, not another archive |
 | Mono/4-ch Align-ULCNet | application objects | mono_alignulcnet/audio_pipeline_ulcnet.h and 4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h | Existing component libraries + C pre/post + external accelerator callback |
+| Mono DFN2 replacement | libaudio_pipeline_dfn.a (+ libaudio_pipeline.a host) | mono_aec_dfn_res/audio_pipeline_dfn.h | The conventional mono pipeline (16 kHz default, 8/16/48 kHz) with NR off as the host; DFN2 estimates from the linear-AEC error and is applied to the host's post-RES spectrum, at 48 kHz through the rate bridge below 48 kHz |
+| 4-ch DFN2 replacement | lib4aec_dfn_res.a (+ libaudio_pipeline_4ch.a core) | 4ch_aec_bf_dfn_res/4aec_dfn_res.h | The four-lane core (16 kHz default, 16/48 kHz) with NR off as the host; DFN2 estimates from the beamformed error and is applied to the core's post-RES spectrum, at 48 kHz through the rate bridge below 48 kHz |
 
 RES is not a standalone module/library — it is exposed as the `AecResContext` seam on
 the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process_context()`
@@ -77,8 +79,8 @@ their applications. Shared ULCNet model-I/O support is owned by
 
 ## Application layout
 
-The four product flows are applications that assemble existing components;
-they are not four additional libraries:
+The product flows assemble existing components; neural replacement wrappers
+are delivered as separate archives where noted:
 
 | Application | Entry directory | Composition |
 |---|---|---|
@@ -86,6 +88,8 @@ they are not four additional libraries:
 | 4-ch AEC + BF + NR/RES | `4ch_aec_bf_nr_res/` | 4-lane core + DOA/GSC + NR + audio_common |
 | Mono Align-ULCNet | `mono_alignulcnet/` | mono ULCNet wrapper + AEC + AIAEC pre/post |
 | 4-ch Align-ULCNet | `4ch_alignulcnet/` | pre-only 4-lane core + DOA/GSC + AIAEC pre/post |
+| Mono DFN2 | `mono_aec_dfn_res/` | conventional mono host (NR off) + dual-input DFN2 stage on its post-RES spectrum |
+| 4-ch DFN2 | `4ch_aec_bf_dfn_res/` | 4-lane core (NR off) + external BF/GSC + dual-input DFN2 stage on its post-RES spectrum |
 
 The ULCNet applications use `../AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.*`: CPU memory owns
 K/V, logit and GRU state, while the board implements one stateless tensor

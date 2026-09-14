@@ -1168,6 +1168,65 @@ static void test_comfort_noise_follows_nr_gain(void) {
     free(mic); free(ref);
 }
 
+/* The external post-filter seam (audio_pipeline_process_post_view +
+ * audio_pipeline_synthesize_external) must be audio_pipeline_process() with
+ * its synthesis lifted out: synthesising the returned post_spectrum has to
+ * reproduce a twin instance's output bit for bit, comfort noise ON so the
+ * fill and its RNG are part of the claim. The seam is refused on an instance
+ * that owns a denoiser and on an aec_only instance. */
+static void test_post_view_seam(void) {
+    AudioPipelineConfig cfg = grid_config(48000, 1024);
+    AudioPipelineConfig other;
+    AudioPipeline *seam, *twin, *p;
+    AudioPipelinePostView view;
+    static float mic[512], ref[512], a[512], b[512];
+    int h, i, hop, identical = 1, nonzero = 0, ok = 1;
+
+    cfg.enable_nr = 0;
+    cfg.enable_res = 1;
+    cfg.enable_cng = 1;
+    seam = audio_pipeline_create(&cfg);
+    twin = audio_pipeline_create(&cfg);
+    CHECK(seam != NULL && twin != NULL, "post-view seam: RES-only 48 kHz pipelines create");
+    if (!seam || !twin) return;
+    hop = audio_pipeline_hop_size(seam);
+    lcg_state = 0xC0FFEEu;
+    for (h = 0; h < 300; ++h) {
+        for (i = 0; i < hop; ++i) {
+            ref[i] = lcg_sample();
+            mic[i] = 0.5f * ref[i] + 0.1f * lcg_sample();
+        }
+        ok = ok && audio_pipeline_process_post_view(seam, mic, ref, &view) == 0;
+        ok = ok && view.error_spec != NULL && view.post_spectrum != NULL;
+        ok = ok && audio_pipeline_synthesize_external(seam, view.post_spectrum, a) == 0;
+        ok = ok && audio_pipeline_process(twin, mic, ref, b) == 0;
+        if (!ok) break;
+        if (memcmp(a, b, (size_t)hop * sizeof(float)) != 0) identical = 0;
+        for (i = 0; i < hop; ++i) if (b[i] != 0.0f) nonzero = 1;
+    }
+    CHECK(ok, "post-view seam: every hop of view/synthesize/process succeeds");
+    CHECK(identical && nonzero,
+          "post-view + synthesize_external reproduces audio_pipeline_process bit for bit "
+          "(NR off, CNG on, non-silent output)");
+    CHECK(audio_pipeline_process_post_view(seam, mic, ref, NULL) == -1 &&
+          audio_pipeline_synthesize_external(seam, NULL, a) == -1 &&
+          audio_pipeline_synthesize_external(NULL, view.post_spectrum, a) == -1,
+          "post-view seam: NULL arguments rejected");
+    other = cfg; other.enable_nr = 1;
+    p = audio_pipeline_create(&other);
+    CHECK(p != NULL && audio_pipeline_process_post_view(p, mic, ref, &view) == -1,
+          "post-view seam refuses a pipeline that owns a denoiser");
+    audio_pipeline_destroy(p);
+    other = cfg; other.aec_only = 1;
+    p = audio_pipeline_create(&other);
+    CHECK(p != NULL && audio_pipeline_process_post_view(p, mic, ref, &view) == -1 &&
+          audio_pipeline_synthesize_external(p, view.post_spectrum, a) == -1,
+          "post-view seam refuses an aec_only pipeline");
+    audio_pipeline_destroy(p);
+    audio_pipeline_destroy(seam);
+    audio_pipeline_destroy(twin);
+}
+
 int main(void) {
     for (int r = 0; r < N_GRIDS; r++) {
         int sr = GRIDS[r].sample_rate;
@@ -1200,6 +1259,9 @@ int main(void) {
     printf("\n=== comfort-noise contract ===\n");
     test_comfort_noise_contract();
     test_comfort_noise_follows_nr_gain();
+
+    printf("\n=== external post-filter seam ===\n");
+    test_post_view_seam();
 
     if (g_failures) {
         fprintf(stderr, "\n%d FAILURE(S)\n", g_failures);

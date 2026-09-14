@@ -58,6 +58,7 @@ _DRIVER = r'''
 #include <string.h>
 
 #include "dfn2_prepost.h"
+#include "mem_align.h"
 
 #define CHECK(x) do { if (!(x)) { \
     fprintf(stderr, "CHECK failed at line %d: %s\n", __LINE__, #x); \
@@ -567,17 +568,18 @@ static int case_freqpool(FftHandle *fft) {
     CHECK(dfn2_prepost_get_mem_size(&cfg_time, &req_time) == 0);
     CHECK(dfn2_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);
 
-    printf("pool TIME = %llu B\npool FREQ = %llu B   (saves %llu B, %.2f%%)\n",
+    printf("pool TIME = %llu B\npool FREQ = %llu B\n",
            (unsigned long long)req_time.bytes,
-           (unsigned long long)req_freq.bytes,
-           (unsigned long long)(req_time.bytes - req_freq.bytes),
-           100.0 * (double)(req_time.bytes - req_freq.bytes) /
-               (double)req_time.bytes);
+           (unsigned long long)req_freq.bytes);
 
-    /* IO_FREQ does not carve the output hop staging it never uses.  The
-     * header is honest that this is the ONLY difference -- the saving is
-     * small, but it must not be zero or negative. */
-    CHECK(req_freq.bytes < req_time.bytes);
+    /* The two modes differ in exactly two regions: IO_TIME carves the
+     * output hop staging, IO_FREQ carves the dual entry point's second
+     * staging pair instead.  Pin the difference to the byte so a region
+     * silently added to one mode fails here. */
+    CHECK(req_freq.bytes ==
+          req_time.bytes -
+              ck_align16_size((size_t)DFN2_HOP_LEN * sizeof(float)) +
+              2u * ck_align16_size((size_t)DFN2_N_BINS * sizeof(float)));
     CHECK(req_time.io_mode == (uint32_t)DFN2_IO_TIME);
     CHECK(req_freq.io_mode == (uint32_t)DFN2_IO_FREQ);
     CHECK(req_time.build_flags_hash != req_freq.build_flags_hash);
@@ -620,6 +622,375 @@ static int case_freqpool(FftHandle *fft) {
     }
     free(pool_time);
     free(pool_freq);
+    return 0;
+}
+
+/* ---- dual: the dual-input FREQ entry point ---------------------------- */
+
+/* Drive one FREQ hop: pre-stage by the caller, then the model transaction. */
+static int dual_step(DFN2Prepost *p, int n, float *out_re, float *out_im,
+                     int *valid) {
+    DFN2PrepostInputs inputs;
+    DFN2PrepostOutputs outputs;
+    if (n == 1) {
+        if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0) return -1;
+        fake_run(&inputs, &outputs);
+        if (dfn2_prepost_frame_commit(p) != 0) return -1;
+    }
+    return dfn2_prepost_post_process_freq(p, out_re, out_im, valid);
+}
+
+/* est == app must be the single-input entry, byte for byte, including the
+ * head bin gain the class publishes and the emitted frame index. */
+static int case_dual_identity(void) {
+    static float in_re[SHORT_HOPS][DFN2_N_BINS];
+    static float in_im[SHORT_HOPS][DFN2_N_BINS];
+    static float got_a_re[DFN2_N_BINS], got_a_im[DFN2_N_BINS];
+    static float got_b_re[DFN2_N_BINS], got_b_im[DFN2_N_BINS];
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req;
+    DFN2Prepost *pa, *pb;
+    void *pool_a, *pool_b;
+    int t, emitted = 0;
+
+    config_freq(&cfg);
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    pool_a = alloc_aligned(req.alignment, (size_t)req.bytes);
+    pool_b = alloc_aligned(req.alignment, (size_t)req.bytes);
+    CHECK(pool_a != NULL && pool_b != NULL);
+    pa = dfn2_prepost_init(pool_a, (size_t)req.bytes, &cfg);
+    pb = dfn2_prepost_init(pool_b, (size_t)req.bytes, &cfg);
+    CHECK(pa != NULL && pb != NULL);
+    for (t = 0; t < SHORT_HOPS; ++t) frame_spectrum(t, in_re[t], in_im[t]);
+
+    for (t = 0; t < SHORT_HOPS; ++t) {
+        int na, nb, va = -1, vb = -1;
+        long long fa = -2, fb = -2;
+        na = dfn2_prepost_pre_process_freq(pa, in_re[t], in_im[t]);
+        nb = dfn2_prepost_pre_process_freq_dual(pb, in_re[t], in_im[t],
+                                                in_re[t], in_im[t]);
+        CHECK(na == (t == 0 ? 0 : 1) && nb == na);
+        CHECK(dual_step(pa, na, got_a_re, got_a_im, &va) == 0);
+        CHECK(dual_step(pb, nb, got_b_re, got_b_im, &vb) == 0);
+        CHECK(va == vb);
+        CHECK(identical(got_a_re, got_b_re, DFN2_N_BINS));
+        CHECK(identical(got_a_im, got_b_im, DFN2_N_BINS));
+        (void)dfn2_prepost_output_frame_index(pa, &fa);
+        (void)dfn2_prepost_output_frame_index(pb, &fb);
+        CHECK(fa == fb);
+        /* The heads are a real mask, not the identity: an emitted frame must
+         * differ from the source spectrum it was composed from, otherwise
+         * single == dual would hold for a class that ignores its heads. */
+        if (va == 1)
+            CHECK(!identical(got_a_re, in_re[t - LOOKAHEAD], DFN2_N_BINS));
+        if (va == 1) ++emitted;
+    }
+    CHECK(emitted == SHORT_HOPS - LOOKAHEAD);
+    dfn2_prepost_destroy(pa);
+    dfn2_prepost_destroy(pb);
+    free(pool_a);
+    free(pool_b);
+    return 0;
+}
+
+/* The directional gate: app = est with the high band zeroed.  The emitted
+ * high band must be exactly zero (it comes from app), the low band and the
+ * published gain must equal the single-input run's (the mask follows est,
+ * and the deep filter reads only low bins, which the two spectra share).
+ * A build that swapped the two arguments would emit est's non-zero high band
+ * and, because the features would see the zeroed spectrum, a different
+ * mask. */
+static int case_dual_split(void) {
+    static float est_re[SHORT_HOPS][DFN2_N_BINS];
+    static float est_im[SHORT_HOPS][DFN2_N_BINS];
+    static float app_re[DFN2_N_BINS], app_im[DFN2_N_BINS];
+    static float got_s_re[DFN2_N_BINS], got_s_im[DFN2_N_BINS];
+    static float got_d_re[DFN2_N_BINS], got_d_im[DFN2_N_BINS];
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req;
+    DFN2Prepost *ps, *pd;
+    void *pool_s, *pool_d;
+    int t, checked = 0;
+
+    config_freq(&cfg);
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    pool_s = alloc_aligned(req.alignment, (size_t)req.bytes);
+    pool_d = alloc_aligned(req.alignment, (size_t)req.bytes);
+    CHECK(pool_s != NULL && pool_d != NULL);
+    ps = dfn2_prepost_init(pool_s, (size_t)req.bytes, &cfg);
+    pd = dfn2_prepost_init(pool_d, (size_t)req.bytes, &cfg);
+    CHECK(ps != NULL && pd != NULL);
+    for (t = 0; t < SHORT_HOPS; ++t) frame_spectrum(t, est_re[t], est_im[t]);
+
+    for (t = 0; t < SHORT_HOPS; ++t) {
+        int ns, nd, vs = -1, vd = -1;
+        memcpy(app_re, est_re[t], sizeof(app_re));
+        memcpy(app_im, est_im[t], sizeof(app_im));
+        memset(app_re + DFN2_DF_BINS, 0,
+               (size_t)(DFN2_N_BINS - DFN2_DF_BINS) * sizeof(float));
+        memset(app_im + DFN2_DF_BINS, 0,
+               (size_t)(DFN2_N_BINS - DFN2_DF_BINS) * sizeof(float));
+        ns = dfn2_prepost_pre_process_freq(ps, est_re[t], est_im[t]);
+        nd = dfn2_prepost_pre_process_freq_dual(pd, est_re[t], est_im[t],
+                                                app_re, app_im);
+        CHECK(ns == nd && ns == (t == 0 ? 0 : 1));
+        CHECK(dual_step(ps, ns, got_s_re, got_s_im, &vs) == 0);
+        CHECK(dual_step(pd, nd, got_d_re, got_d_im, &vd) == 0);
+        CHECK(vs == vd);
+        if (vs == 1) {
+            CHECK(any_nonzero(got_s_re + DFN2_DF_BINS,
+                              DFN2_N_BINS - DFN2_DF_BINS));
+            CHECK(all_zero(got_d_re + DFN2_DF_BINS,
+                           DFN2_N_BINS - DFN2_DF_BINS));
+            CHECK(all_zero(got_d_im + DFN2_DF_BINS,
+                           DFN2_N_BINS - DFN2_DF_BINS));
+            CHECK(identical(got_s_re, got_d_re, DFN2_DF_BINS));
+            CHECK(identical(got_s_im, got_d_im, DFN2_DF_BINS));
+            ++checked;
+        }
+    }
+    CHECK(checked == SHORT_HOPS - LOOKAHEAD);
+    dfn2_prepost_destroy(ps);
+    dfn2_prepost_destroy(pd);
+    free(pool_s);
+    free(pool_d);
+    return 0;
+}
+
+/* Contract gates around the dual entry and the gain accessor. */
+static int case_dual_guards(FftHandle *fft) {
+    static float re[DFN2_N_BINS], im[DFN2_N_BINS];
+    static float got_re[DFN2_N_BINS], got_im[DFN2_N_BINS];
+    DFN2PrepostConfig cfg_time, cfg_freq;
+    DFN2PrepostMemReq req_time, req_freq;
+    DFN2Prepost *pt, *pf;
+    void *pool_t, *pool_f;
+
+    CHECK(DFN2_PREPOST_CARVE_VERSION == 2u);
+
+    config_time(&cfg_time, fft);
+    config_freq(&cfg_freq);
+    CHECK(dfn2_prepost_get_mem_size(&cfg_time, &req_time) == 0);
+    CHECK(dfn2_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);
+    pool_t = alloc_aligned(req_time.alignment, (size_t)req_time.bytes);
+    pool_f = alloc_aligned(req_freq.alignment, (size_t)req_freq.bytes);
+    CHECK(pool_t != NULL && pool_f != NULL);
+    pt = dfn2_prepost_init(pool_t, (size_t)req_time.bytes, &cfg_time);
+    pf = dfn2_prepost_init(pool_f, (size_t)req_freq.bytes, &cfg_freq);
+    CHECK(pt != NULL && pf != NULL);
+    frame_spectrum(0, re, im);
+
+    /* Wrong mode: refused and no frame opened. */
+    CHECK(dfn2_prepost_pre_process_freq_dual(pt, re, im, re, im) == -1);
+    CHECK(dfn2_prepost_pre_process(pt, pcm_in) == 0);
+    /* NULL arguments. */
+    CHECK(dfn2_prepost_pre_process_freq_dual(NULL, re, im, re, im) == -1);
+    CHECK(dfn2_prepost_pre_process_freq_dual(pf, NULL, im, re, im) == -1);
+    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, NULL, re, im) == -1);
+    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, NULL, im) == -1);
+    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, NULL) == -1);
+    /* Hop 0: no heads. */
+    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == 0);
+    /* Hop 1: a frame open refuses a second pre-stage of either kind; taken
+     * as the identity the hop closes normally. */
+    frame_spectrum(1, re, im);
+    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == 1);
+    CHECK(dfn2_prepost_pre_process_freq_dual(pf, re, im, re, im) == -1);
+    CHECK(dfn2_prepost_pre_process_freq(pf, re, im) == -1);
+    CHECK(dfn2_prepost_frame_skip(pf) == 0);
+    CHECK(dfn2_prepost_post_process_freq(pf, got_re, got_im, NULL) == 0);
+
+    dfn2_prepost_destroy(pt);
+    dfn2_prepost_destroy(pf);
+    free(pool_t);
+    free(pool_f);
+    return 0;
+}
+
+/* ---- model_run: the DFN2Model callback boundary ------------------------ */
+
+typedef struct {
+    int mode;     /* 0 full write, 1 refuse (rc -1), 2 leave alpha unwritten */
+    int calls;
+    int resets;
+} StubModel;
+
+static int stub_infer(void *user, const DFN2PrepostInputs *in,
+                      DFN2PrepostOutputs *out) {
+    StubModel *m = (StubModel *)user;
+    ++m->calls;
+    if (m->mode == 1) return -1;
+    fake_run(in, out);
+    if (m->mode == 2) out->alpha[0] = (float)NAN;   /* one output unwritten */
+    return 0;
+}
+
+static void stub_reset(void *user) { ++((StubModel *)user)->resets; }
+
+/* Copy the four recurrent tensors out of the published input views. */
+static void snapshot_state(DFN2Prepost *p, float *enc, float *erb,
+                           float *df, float *convp) {
+    DFN2PrepostInputs in;
+    DFN2PrepostOutputs out;
+    (void)dfn2_prepost_frame_inputs(p, &in, &out);
+    memcpy(enc, &in.encoder_gru_hidden[0][0],
+           (size_t)DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS * sizeof(float));
+    memcpy(erb, &in.erb_gru_hidden[0][0],
+           (size_t)DFN2_PREPOST_ERB_HIDDEN_ELEMENTS * sizeof(float));
+    memcpy(df, &in.df_gru_hidden[0][0],
+           (size_t)DFN2_PREPOST_DF_HIDDEN_ELEMENTS * sizeof(float));
+    memcpy(convp, &in.df_convp_history[0][0][0],
+           (size_t)DFN2_PREPOST_CONVP_HISTORY_ELEMENTS * sizeof(float));
+}
+
+static int case_model_run(void) {
+    static float in_re[SHORT_HOPS][DFN2_N_BINS];
+    static float in_im[SHORT_HOPS][DFN2_N_BINS];
+    static float got_re[DFN2_N_BINS], got_im[DFN2_N_BINS];
+    static float ref_re[DFN2_N_BINS], ref_im[DFN2_N_BINS];
+    static float enc0[DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS];
+    static float erb0[DFN2_PREPOST_ERB_HIDDEN_ELEMENTS];
+    static float df0[DFN2_PREPOST_DF_HIDDEN_ELEMENTS];
+    static float convp0[DFN2_PREPOST_CONVP_HISTORY_ELEMENTS];
+    static float enc1[DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS];
+    static float erb1[DFN2_PREPOST_ERB_HIDDEN_ELEMENTS];
+    static float df1[DFN2_PREPOST_DF_HIDDEN_ELEMENTS];
+    static float convp1[DFN2_PREPOST_CONVP_HISTORY_ELEMENTS];
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req;
+    DFN2Prepost *p, *q;
+    void *pool_p, *pool_q;
+    StubModel stub = {0, 0, 0};
+    DFN2Model model;
+    DFN2Model bad;
+    int t, valid = -1;
+
+    config_freq(&cfg);
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    pool_p = alloc_aligned(req.alignment, (size_t)req.bytes);
+    pool_q = alloc_aligned(req.alignment, (size_t)req.bytes);
+    CHECK(pool_p != NULL && pool_q != NULL);
+    p = dfn2_prepost_init(pool_p, (size_t)req.bytes, &cfg);
+    q = dfn2_prepost_init(pool_q, (size_t)req.bytes, &cfg);
+    CHECK(p != NULL && q != NULL);
+    for (t = 0; t < SHORT_HOPS; ++t) frame_spectrum(t, in_re[t], in_im[t]);
+    memset(&model, 0, sizeof(model));
+    model.user = &stub;
+    model.infer = stub_infer;
+    model.reset = stub_reset;
+
+    /* Contract errors: no frame open, NULL model, no infer callback. */
+    CHECK(dfn2_model_run_frame(&model, p) == -1);
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[0], in_im[0]) == 0);
+    CHECK(dfn2_model_run_frame(&model, p) == -1);   /* hop 0 opens nothing */
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[1], in_im[1]) == 1);
+    CHECK(dfn2_model_run_frame(NULL, p) == -1);
+    CHECK(dfn2_model_run_frame(&model, NULL) == -1);
+    memset(&bad, 0, sizeof(bad));
+    CHECK(dfn2_model_run_frame(&bad, p) == -1);
+    CHECK(stub.calls == 0);
+    /* A full write commits and steps the recurrent state. */
+    snapshot_state(p, enc0, erb0, df0, convp0);
+    CHECK(dfn2_model_run_frame(&model, p) == 1);
+    CHECK(stub.calls == 1);
+    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    CHECK(valid == 0);   /* still inside the lookahead warm-up */
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[2], in_im[2]) == 1);
+    snapshot_state(p, enc1, erb1, df1, convp1);
+    CHECK(!identical(enc0, enc1, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
+    /* A refused inference is taken as the identity: state frozen, frame
+     * closed, the hop still emits. */
+    stub.mode = 1;
+    CHECK(dfn2_model_run_frame(&model, p) == 0);
+    CHECK(stub.calls == 2);
+    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    CHECK(valid == 1);
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[3], in_im[3]) == 1);
+    snapshot_state(p, enc0, erb0, df0, convp0);
+    CHECK(identical(enc0, enc1, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
+    CHECK(identical(erb0, erb1, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS));
+    CHECK(identical(df0, df1, DFN2_PREPOST_DF_HIDDEN_ELEMENTS));
+    CHECK(identical(convp0, convp1, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS));
+    /* A partial write (one output left unwritten) is refused by commit and
+     * taken as the identity the same way. */
+    stub.mode = 2;
+    CHECK(dfn2_model_run_frame(&model, p) == 0);
+    CHECK(stub.calls == 3);
+    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &valid) == 0);
+    CHECK(valid == 1);
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[4], in_im[4]) == 1);
+    snapshot_state(p, enc0, erb0, df0, convp0);
+    CHECK(identical(enc0, enc1, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
+    CHECK(identical(convp0, convp1, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS));
+    CHECK(dfn2_prepost_frame_skip(p) == 0);
+
+    /* A model that always refuses is exactly the all-skip stream. */
+    dfn2_prepost_reset(p);
+    dfn2_prepost_reset(q);
+    stub.mode = 1;
+    for (t = 0; t < SHORT_HOPS; ++t) {
+        int np, nq, vp = -1, vq = -1;
+        np = dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]);
+        nq = dfn2_prepost_pre_process_freq(q, in_re[t], in_im[t]);
+        CHECK(np == nq);
+        if (np == 1) {
+            CHECK(dfn2_model_run_frame(&model, p) == 0);
+            CHECK(dfn2_prepost_frame_skip(q) == 0);
+        }
+        CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &vp) == 0);
+        CHECK(dfn2_prepost_post_process_freq(q, ref_re, ref_im, &vq) == 0);
+        CHECK(vp == vq);
+        CHECK(identical(got_re, ref_re, DFN2_N_BINS));
+        CHECK(identical(got_im, ref_im, DFN2_N_BINS));
+    }
+    printf("model_run: calls=%d\n", stub.calls);
+    dfn2_prepost_destroy(p);
+    dfn2_prepost_destroy(q);
+    free(pool_p);
+    free(pool_q);
+    return 0;
+}
+
+/* ---- descriptor: the graph contract value ----------------------------- */
+
+static int case_descriptor(void) {
+    DFN2ModelIoDescriptor base, d;
+    int *fields[17];
+    int i;
+
+    CHECK(dfn2_model_io_descriptor_default(NULL) == -1);
+    CHECK(dfn2_model_io_descriptor_validate(NULL) == -1);
+    CHECK(dfn2_model_io_descriptor_default(&base) == 0);
+    CHECK(dfn2_model_io_descriptor_validate(&base) == 0);
+    CHECK(base.layout_version == (unsigned int)DFN2_MODEL_IO_LAYOUT_VERSION);
+    CHECK(base.sample_rate == DFN2_SR && base.fft_size == DFN2_N_FFT &&
+          base.hop_size == DFN2_HOP_LEN && base.spectrum_bins == DFN2_N_BINS);
+    CHECK(base.erb_bands == DFN2_N_ERB && base.df_bins == DFN2_DF_BINS &&
+          base.df_order == DFN2_DF_ORDER);
+    CHECK(base.mask_lookahead == DFN2_MASK_LOOKAHEAD &&
+          base.df_lookahead == DFN2_DF_LOOKAHEAD);
+    CHECK(base.gru_hidden == DFN2_MODEL_GRU_HIDDEN &&
+          base.state_tensor_count == 4);
+
+    d = base;
+    ++d.layout_version;
+    CHECK(dfn2_model_io_descriptor_validate(&d) == -1);
+    fields[0] = &d.sample_rate;        fields[1] = &d.fft_size;
+    fields[2] = &d.hop_size;           fields[3] = &d.spectrum_bins;
+    fields[4] = &d.erb_bands;          fields[5] = &d.df_bins;
+    fields[6] = &d.df_order;           fields[7] = &d.mask_lookahead;
+    fields[8] = &d.df_lookahead;       fields[9] = &d.input_frames;
+    fields[10] = &d.encoder_gru_layers; fields[11] = &d.erb_gru_layers;
+    fields[12] = &d.df_gru_layers;     fields[13] = &d.gru_hidden;
+    fields[14] = &d.encoder_channels;  fields[15] = &d.df_pathway_history;
+    fields[16] = &d.state_tensor_count;
+    for (i = 0; i < 17; ++i) {
+        d = base;
+        *fields[i] += 1;
+        CHECK(dfn2_model_io_descriptor_validate(&d) == -1);
+    }
+    d = base;
+    CHECK(dfn2_model_io_descriptor_validate(&d) == 0);
     return 0;
 }
 
@@ -1343,6 +1714,11 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "skip") == 0)      status = case_skip();
     else if (strcmp(argv[1], "guard") == 0)     status = case_guard(fft);
     else if (strcmp(argv[1], "txn") == 0)       status = case_txn(fft);
+    else if (strcmp(argv[1], "dual_identity") == 0) status = case_dual_identity();
+    else if (strcmp(argv[1], "dual_split") == 0)    status = case_dual_split();
+    else if (strcmp(argv[1], "dual_guards") == 0)   status = case_dual_guards(fft);
+    else if (strcmp(argv[1], "model_run") == 0)     status = case_model_run();
+    else if (strcmp(argv[1], "descriptor") == 0)    status = case_descriptor();
     else {
         fprintf(stderr, "unknown case: %s\n", argv[1]);
         status = 2;
@@ -1485,3 +1861,45 @@ def test_failed_commit_moves_nothing_and_leaves_the_frame_open(driver):
     that committed it. Swept over all seven output tensors at three
     indices."""
     assert 'txn:' in _run(driver, 'txn')
+
+
+def test_dual_entry_with_one_spectrum_is_the_single_entry(driver):
+    """pre_process_freq_dual(x, x) must be pre_process_freq(x) byte for byte:
+    every emitted spectrum, the emitted frame index and the published head
+    bin gain. Catches a dual path that perturbs the feature EMA, the graph
+    window or the compose clock; it cannot catch an est/app swap (see the
+    split case for that)."""
+    _run(driver, 'dual_identity')
+
+
+def test_dual_entry_estimates_on_est_and_applies_on_app(driver):
+    """app = est with the high band zeroed: the emitted high band is exactly
+    zero (it comes from app) while the low band and the published gain equal
+    the single-input run's (the mask follows est; the deep filter reads only
+    the low band the two share). A swapped build emits est's non-zero high
+    band and a different mask."""
+    _run(driver, 'dual_split')
+
+
+def test_dual_entry_guards_and_gain_accessor(driver):
+    """The dual entry is refused in DFN2_IO_TIME (without opening a frame),
+    on any NULL argument and with a frame open; the head bin gain is NULL
+    with a frame open and before the first hop that carried heads, and is
+    the unit gain after a frame_skip; the carve version is 2."""
+    _run(driver, 'dual_guards')
+
+
+def test_model_run_frame_commits_or_takes_the_identity(driver):
+    """dfn2_model_run_frame: contract errors (-1) for no open frame, a NULL
+    model/instance or no infer callback; a full write returns 1 and steps the
+    recurrent state; a refused inference or a partial write returns 0, leaves
+    every recurrent tensor byte-identical and still emits; a model that
+    always refuses is exactly the all-frame_skip stream."""
+    assert 'model_run:' in _run(driver, 'model_run')
+
+
+def test_model_io_descriptor_default_validates_and_every_field_is_checked(driver):
+    """validate(default()) == 0 and a +1 perturbation of every one of the 18
+    fields is refused, so a field added to the struct but omitted from
+    validate cannot pass."""
+    _run(driver, 'descriptor')

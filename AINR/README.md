@@ -21,6 +21,12 @@ Do not force-load a checkpoint from another composition into DFN2. The
 contract gate should reject it; bypassing the gate creates an invalid
 comparison even when many parameter names happen to match.
 
+The two files currently under `DeepFilterNet2/output/` predate this contract:
+`dfn2_best.pth` and `dfn2_last.pth` identify model v5 / feature v3, while the
+source above requires model v6 / feature v5. They remain historical artifacts,
+not deployable weights; the AEC/BF/RES input-placement evaluation must wait for
+a freshly trained compatible checkpoint.
+
 ## Dataset
 
 `dataset_gen/` is the single noisy/clean augmentation implementation:
@@ -183,3 +189,14 @@ The active deployment exports are stateless accelerator graphs:
 
 “Stateless” describes the accelerator, not the algorithm. The host must return
 every exported `*_out` state tensor as the matching input on the next call.
+
+DeepFilterNet2 additionally publishes the host-side callback boundary a
+pipeline binds a runtime to -- `DFN2Model` / `dfn2_model_run_frame()` in
+`DeepFilterNet2/dfn2_prepost.h`, with `DFN2ModelIoDescriptor` in
+`dfn2_model_io.h` as the graph contract a runtime must present. There is no
+separate accelerator adapter for DFN2, unlike Align-ULCNet: the feature
+windows and every recurrent cache already live inside the `DFN2Prepost`
+pool, so the class itself is the adapter. The FREQ mode also offers
+`dfn2_prepost_pre_process_freq_dual()`, which estimates the heads from one
+spectrum and applies them to another on the same frame clock; the two
+branches touch disjoint state inside `dfn2_process.c`.

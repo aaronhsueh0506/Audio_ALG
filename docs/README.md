@@ -17,6 +17,8 @@ README.
 | Frequency-domain gain fusion | [`freq_domain_pipeline_design.md`](freq_domain_pipeline_design.md) |
 | Four-channel C/Python AEC / external beamformer seam | [`../pipelines/4ch_aec_bf_nr_res/README.md`](../pipelines/4ch_aec_bf_nr_res/README.md) |
 | Four-channel Align-ULCNet application (direct GSC-spectrum path) | [`../pipelines/4ch_alignulcnet/README.md`](../pipelines/4ch_alignulcnet/README.md) |
+| Mono AEC + RES + DeepFilterNet2 application | [`../pipelines/mono_aec_dfn_res/README.md`](../pipelines/mono_aec_dfn_res/README.md) |
+| Four-channel AEC + BF + RES + DeepFilterNet2 application | [`../pipelines/4ch_aec_bf_dfn_res/README.md`](../pipelines/4ch_aec_bf_dfn_res/README.md) |
 | Standalone AINR models | [`../AINR/README.md`](../AINR/README.md) |
 | DFN2 cascade/alpha contract | [`../AINR/DeepFilterNet2/README.md`](../AINR/DeepFilterNet2/README.md) |
 | Neural AEC candidates | [`../AIAEC/README.md`](../AIAEC/README.md) |
@@ -37,6 +39,16 @@ grid and framing table and `onnx_prepost.html` for the ONNX-boundary,
 state-layout-version and PTQ-calibration status. Component pages for AEC, NR
 and audio_common live in those repositories' own `docs/html/` and are reached
 through sibling relative links.
+
+Pipeline pages: `pipeline_mono.html`, `pipeline_4ch.html`,
+`pipeline_ulcnet_mono.html`, `pipeline_ulcnet_4ch.html`, plus
+`pipeline_dfn_mono.html` and `pipeline_dfn_4ch.html` for the two DeepFilterNet2
+variants (the host runs at the product rate -- mono 8/16/48 kHz, 4ch 16/48 kHz,
+16 kHz by default -- and only the DFN2 stage runs at 48 kHz / 1024 / 512,
+reached through `pipelines/dfn_rate_bridge.{h,c}`; the shared post-RES stage
+`pipelines/dfn_res_stage.{h,c}` estimates the model from the pre-RES spectrum
+and applies it to the post-RES one). Model pages: `ainr_dfn2.html`,
+`ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, and the four `aiaec_*.html` pages.
 
 For integrator-facing C API reference, the site also carries one page per
 library -- `aec_c_api.html`, `nr_c_api.html` and `audio_common_c_api.html` in

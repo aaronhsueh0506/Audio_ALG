@@ -1164,3 +1164,32 @@ def test_fixed_batch_bin_contains_every_lane(tmp_path):
         artifact / 'h_gru' / 'h_gru_0000.bin', '<f4'
     )
     assert blob.size == 3 * 5 * 1 * 32
+
+
+def test_runtime_erb_bins_are_a_bitwise_partition_of_unity(tmp_path):
+    """The erb_inv.bin the C host loads must expand a unit band mask to
+    exactly 1.0f per bin in df_common_expand_mask's accumulation order --
+    dfn2_prepost_frame_skip's identity, and every host identity gate built
+    on it, is exact only under that property. The runtime exporter refuses
+    to write a matrix that breaks it, and the check itself must be able to
+    fail."""
+    from export_erb_matrix import require_partition_of_unity, write_runtime_bins
+
+    out_dir = write_runtime_bins(os.path.join(ROOT, 'config.ini'), str(tmp_path))
+    manifest = json.load(open(os.path.join(out_dir, 'erb_matrices.json'), encoding='utf-8'))
+    n_erb, n_bins = manifest['erb_inv.bin']['shape']
+    inverse = np.fromfile(os.path.join(out_dir, 'erb_inv.bin'), dtype='<f4').reshape(n_erb, n_bins)
+    require_partition_of_unity(inverse)
+    bin_gain = np.zeros(n_bins, np.float32)
+    for row in inverse:
+        bin_gain += row
+    assert np.array_equal(bin_gain, np.ones(n_bins, np.float32))
+
+    broken = inverse.copy()
+    broken[3] *= np.float32(1.0 + 1e-4)
+    with pytest.raises(RuntimeError):
+        require_partition_of_unity(broken)
+    shifted = inverse.copy()
+    shifted[5, 100] += np.float32(2 ** -20)
+    with pytest.raises(RuntimeError):
+        require_partition_of_unity(shifted)

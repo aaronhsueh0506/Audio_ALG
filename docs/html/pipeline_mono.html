@@ -24,6 +24,8 @@ th{background:#eef3ee}
 <a href="pipeline_4ch.html">pipeline_4ch</a>
 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>
 <a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>
+<a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>
+<a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>
 </nav>
 <h1>audio_pipeline — mono AEC(linear) → echo-aware NR → RES</h1>
 
@@ -56,6 +58,8 @@ audio_pipeline_reset(p);      /* echo-path 變更時; 不動 pool */
 audio_pipeline_destroy(p);    /* 不釋放 caller pool */
 platform_free(pool);</pre>
 <p>桌面便利路徑 <code>audio_pipeline_create(&amp;cfg)</code>(內部 posix_memalign;destroy 會 free)。診斷用唯讀 handle:<code>audio_pipeline_get_aec()</code> / <code>audio_pipeline_get_nr()</code>(aec_only 時為 NULL);byte 分解表 <code>audio_pipeline_get_mem_breakdown()</code>。</p>
+<h3>外部後濾波接縫(<code>process_post_view</code> / <code>synthesize_external</code>)</h3>
+<p>公開 API 另有兩個入口,把 <code>process()</code> 拆成「頻譜」與「合成」兩半,給要在 post-RES 之後插入外部後級的變體用(<code>pipelines/mono_aec_nr_res/audio_pipeline.h:198-220</code>)。<code>audio_pipeline_process_post_view()</code> 跑完一個 hop 到 comfort-noise fill 為止,交出 <code>AudioPipelinePostView{ error_spec, post_spectrum }</code>——<code>error_spec</code> 是 RES gain 據以估計的線性 AEC 誤差頻譜 E,<code>post_spectrum</code> 是 <code>E * G_res</code> 加 comfort noise,也就是 <code>process()</code> 本來會合成的那一個;兩者都指向實例自有的 per-hop buffer,到下一次處理呼叫前有效。這個 seam 要求 <code>!aec_only</code> 且 <code>enable_nr=0</code>(沒有 NR 實例存在,所以不可能把某個 NR 半步留在中途),其他組態一律回 -1。呼叫端處理完頻譜後以 <code>audio_pipeline_synthesize_external()</code> 收尾,它走的是 <code>process()</code> <b>同一組</b> sqrt-Hann iFFT/OLA 狀態,所以兩種收尾方式混用時 OLA 仍然連續。<code>AUDIO_PIPELINE_LAYOUT_VERSION = 12</code> 不因此變動——只加了函式,沒有 struct/carve 變更。目前的消費者是 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>。</p>
 
 <h3>執行期強度控制</h3>
 <pre>int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset, float ramp_ms);

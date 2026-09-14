@@ -478,6 +478,54 @@ Pass conditions:
 - [ ] Real recordings complete without crash, NaN, or Inf.
 - [ ] AEC-only and AEC+NR+RES examples use only public APIs and are documented.
 
+### 8.1 Mono DeepFilterNet2 variant (`mono_aec_dfn_res`)
+
+`make -C pipelines test` now also builds and runs the shared post-RES DFN2
+stage, the rate bridge that takes that stage to its 48 kHz grid from a
+product-rate host, and the mono wrapper that hosts the conventional pipeline
+with `enable_nr=0` / `enable_res=1`:
+
+```bash
+make -C pipelines BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test
+# adds: test_dfn_res_stage, test_dfn_rate_bridge, test_audio_pipeline_dfn,
+#       mono_aec_dfn_res (board skeleton at its 16 kHz default, also run with
+#       --delay-num-filters 1 --cng --atten-lim 12, and with
+#       --sample-rate 48000)
+make -C pipelines/mono_aec_dfn_res test   # scoped: test_dfn_res_stage,
+#       test_audio_pipeline_dfn and the skeleton only -- it does NOT cover
+#       test_dfn_rate_bridge or the --sample-rate 48000 run, so the top-level
+#       target above is the one that gates a release.
+```
+
+Pass conditions:
+
+- [ ] At a 48 kHz host, with no model (or a failing one), the wrapper output is
+      byte-equal to the conventional pipeline at `enable_nr=0`, delayed by
+      exactly two hops, with comfort noise OFF and ON, across an AEC delay
+      change.
+- [ ] The stimulus actually engages RES (`min G_res < 0.9`), so an
+      estimate/apply swap cannot pass unnoticed.
+- [ ] Stage counters show no mid-stream reset (`frames == hops`,
+      `commits == 0`, `skips == hops - 1` on the identity path).
+- [ ] `erb_inv` that is not a bitwise partition of unity is refused at
+      `get_mem_requirements()`.
+- [ ] Native-grid gates pass for 16 kHz/fft 256, 16 kHz/fft 512 and
+      8 kHz/fft 256: the documented per-hop 48 kHz frame schedule (0,1,1,1 at
+      16 kHz/hop 128; 1,2 on the other two), the cumulative frame count, the
+      impulse-pinned added delay (672 / 629 / 330 native samples), and a
+      pass-band tolerance against the conventional NR-off output through the
+      same 0.35 fs low-pass. The native path is a tolerance, NOT a memcmp:
+      the signal crosses two FIR resamplers.
+- [ ] `test_dfn_rate_bridge` passes on all three native grids standalone
+      (schedule, prefill/added-delay table, impulse, tolerance identity,
+      E-only silence, reset parity, rejection row).
+- [ ] The board skeleton runs at `--sample-rate 16000` (default),
+      `8000` and `48000`, and prints a pool size, hop and algorithmic latency
+      for each.
+- [ ] Publish artifacts include `libaudio_pipeline_dfn.a` (now also carrying
+      `dfn_rate_bridge.o`) and the `mono_aec_dfn_res` board skeleton alongside
+      the existing ones.
+
 ## 9. Four-channel pipeline gate
 
 From `Audio_ALG/pipelines/4ch_aec_bf_nr_res/`, run all KISS/NE10 and SIMD 0/1
@@ -507,6 +555,44 @@ Pass conditions:
 - [ ] SRP/GSC and the complete wrapper allocate no heap after static init.
 - [ ] SIMD/scalar parity passes.
 - [ ] All three product grids pass.
+
+### 9.0 Four-channel DeepFilterNet2 variant (`4ch_aec_bf_dfn_res`)
+
+`make -C pipelines/4ch_aec_bf_nr_res test` now also builds and runs the DFN2
+wrapper over the core (`enable_post=1` / `enable_res=1` / `enable_nr=0`):
+
+```bash
+make -C pipelines/4ch_aec_bf_nr_res BACKEND=<backend> SIMD=<0-or-1> WERROR=1 test
+# adds: test_4aec_dfn_res, 4ch_aec_bf_dfn_res (board skeleton at its 16 kHz
+#       default, also run with --delay-num-filters 1 --cng --atten-lim 12,
+#       and with --sample-rate 48000)
+make -C pipelines/4ch_aec_bf_dfn_res test   # scoped: test_4aec_dfn_res and the
+#       skeleton only -- it does NOT cover the --sample-rate 48000 run, and the
+#       rate bridge's own unit test lives under the mono target
+#       (`make -C pipelines test`, section 8.1). Run both before a release.
+```
+
+Pass conditions:
+
+- [ ] At a 48 kHz core, with no model (or a failing one), the wrapper output is
+      byte-equal to the conventional core at `enable_nr=0`, delayed by exactly
+      two hops, over BOTH post entries (reconstructed weights and trusted
+      spectrum) and with comfort noise OFF and ON, across an AEC delay change.
+- [ ] The stimulus actually engages the post-beam RES (a RES-off core differs).
+- [ ] Stage counters show no mid-stream reset.
+- [ ] A core config with `enable_nr=1`, `enable_res=0`, a rate the core does
+      not offer, or a non-partition-of-unity `erb_inv` is refused at
+      `get_mem_requirements()`. 8 kHz in particular must be refused: the core
+      has no 8 kHz grid, so the DFN2 wrapper cannot offer one either.
+- [ ] Native-grid gates pass for 16 kHz/fft 256 and 16 kHz/fft 512: the
+      per-hop 48 kHz frame schedule (0,1,1,1 at hop 128; 1,2 at hop 256), the
+      cumulative frame count, the impulse-pinned added delay (672 / 629 native
+      samples) and a pass-band tolerance against the conventional NR-off
+      output. The native path is a tolerance, NOT a memcmp.
+- [ ] The build produces `lib4aec_dfn_res.a` (now also carrying
+      `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` stays 18 (the new
+      `process_post_view`/`synthesize_external` entries added no struct or
+      carve change).
 
 ### 9.1 Real four-microphone validation
 
@@ -829,6 +915,18 @@ The four `Audio_ALG` rows were re-measured on 2026-09-03 (same tree, same
 2026-08-31 measurement and were NOT re-run. The three per-package rows sum
 exactly to the combined row, which is the check that the combined invocation
 collected everything.
+
+`python3 -m pytest pipelines` collects **126** on the current tree (same
+`SE/.venv` Python) after the DeepFilterNet2 pipeline work added
+`pipelines/tests/test_dfn2_stage.py`, `test_dfn2_stage_c_parity.py`,
+`test_dfn2_pipeline_contract.py`, `test_dfn2_4ch_contract.py`,
+`test_dfn2_rate_adapter.py`, `test_dfn2_rate_bridge_c_parity.py` and
+`test_cng_aec3.py`, and extended `test_doc_layout_versions.py` with the four
+new layout macros (`DFN_RES_STAGE_LAYOUT_VERSION`,
+`DFN_RATE_BRIDGE_LAYOUT_VERSION`, `MONO_AEC_DFN_RES_LAYOUT_VERSION`,
+`FOUR_AEC_DFN_RES_LAYOUT_VERSION`). The `AIAEC`, `AINR` and combined rows were NOT
+re-measured, so the sum check above does not hold until they are — re-measure
+all four together before using them as a gate.
 
 The combined row is the one that matters, and it is the one that used to be
 impossible: pytest gives every `conftest.py` the same top-level module name, so

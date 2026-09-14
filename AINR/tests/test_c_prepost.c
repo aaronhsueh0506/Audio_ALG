@@ -500,11 +500,118 @@ static int test_gtcrn_model_state(void)
     return 1;
 }
 
+/* The estimation branch (dfn2_compute_features) and the application branch
+ * (dfn2_compose_stream) of one DFN2State must be independent: the compose
+ * output is a function of the applied spectrum and the heads alone, and the
+ * features are a function of the estimated spectrum alone.  Proved by
+ * running two states that differ in only one branch's input and comparing
+ * the other branch's output byte for byte. */
+static int test_dfn_dual_state_disjoint(void)
+{
+    static DFN2State st_a, st_b;
+    static float est_re[DFN2_N_BINS], est_im[DFN2_N_BINS];
+    static float est2_re[DFN2_N_BINS], est2_im[DFN2_N_BINS];
+    static float app_re[DFN2_N_BINS], app_im[DFN2_N_BINS];
+    static float app2_re[DFN2_N_BINS], app2_im[DFN2_N_BINS];
+    static float feat_erb_a[DFN2_N_ERB], feat_spec_a[2 * DFN2_DF_BINS];
+    static float feat_erb_b[DFN2_N_ERB], feat_spec_b[2 * DFN2_DF_BINS];
+    static float out_a_re[DFN2_N_BINS], out_a_im[DFN2_N_BINS];
+    static float out_b_re[DFN2_N_BINS], out_b_im[DFN2_N_BINS];
+    float mask[DFN2_N_ERB];
+    float coef[DFN2_DF_BINS][DFN2_DF_ORDER][2] = {{{0}}};
+    int features_differed = 0;
+
+    dfn_test_build_erb();
+    dfn2_state_init(&st_a, NULL);
+    dfn2_state_init(&st_b, NULL);
+    dfn2_set_erb_matrices(&st_a, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
+    dfn2_set_erb_matrices(&st_b, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
+    for (int k = 0; k < DFN2_DF_BINS; ++k)
+        for (int tap = 0; tap < DFN2_DF_ORDER; ++tap)
+            coef[k][tap][0] = stream_tap(tap);
+
+    /* Same applied spectrum, different estimated spectra: the compose
+     * outputs must agree while the features must differ. */
+    for (int wall = 0; wall < 14; ++wall) {
+        int head = wall - DFN2_MASK_LOOKAHEAD;
+        int va, vb;
+        for (int k = 0; k < DFN2_N_BINS; ++k) {
+            est_re[k] = stream_spec_re(wall, k);
+            est_im[k] = stream_spec_im(wall, k);
+            est2_re[k] = 0.37f * est_re[k] + 0.01f;
+            est2_im[k] = -0.5f * est_im[k];
+            app_re[k] = stream_spec_re(wall + 5, k);
+            app_im[k] = stream_spec_im(wall + 5, k);
+        }
+        dfn2_compute_features(&st_a, est_re, est_im, feat_erb_a, feat_spec_a);
+        dfn2_compute_features(&st_b, est2_re, est2_im, feat_erb_b, feat_spec_b);
+        if (memcmp(feat_erb_a, feat_erb_b, sizeof(feat_erb_a)) != 0)
+            features_differed = 1;
+        for (int b = 0; b < DFN2_N_ERB; ++b)
+            mask[b] = head >= 0 ? stream_mask(head) : 0.0f;
+        va = dfn2_compose_stream(&st_a, app_re, app_im, head >= 0,
+                                 head >= 0 ? mask : NULL,
+                                 head >= 0 ? &coef[0][0][0] : NULL,
+                                 head >= 0 ? stream_alpha(head) : 0.0f,
+                                 0.0f, out_a_re, out_a_im, NULL);
+        vb = dfn2_compose_stream(&st_b, app_re, app_im, head >= 0,
+                                 head >= 0 ? mask : NULL,
+                                 head >= 0 ? &coef[0][0][0] : NULL,
+                                 head >= 0 ? stream_alpha(head) : 0.0f,
+                                 0.0f, out_b_re, out_b_im, NULL);
+        CHECK(va == vb, "DFN2 compose clocks agree across states");
+        if (va == 1) {
+            CHECK(memcmp(out_a_re, out_b_re, sizeof(out_a_re)) == 0 &&
+                  memcmp(out_a_im, out_b_im, sizeof(out_a_im)) == 0,
+                  "DFN2 compose output does not depend on the estimated spectrum");
+        }
+    }
+    CHECK(features_differed, "DFN2 features do depend on the estimated spectrum");
+
+    /* Same estimated spectrum, different applied spectra: the features must
+     * agree byte for byte. */
+    dfn2_state_init(&st_a, NULL);
+    dfn2_state_init(&st_b, NULL);
+    dfn2_set_erb_matrices(&st_a, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
+    dfn2_set_erb_matrices(&st_b, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
+    for (int wall = 0; wall < 14; ++wall) {
+        int head = wall - DFN2_MASK_LOOKAHEAD;
+        for (int k = 0; k < DFN2_N_BINS; ++k) {
+            est_re[k] = stream_spec_re(wall, k);
+            est_im[k] = stream_spec_im(wall, k);
+            app_re[k] = stream_spec_re(wall + 5, k);
+            app_im[k] = stream_spec_im(wall + 5, k);
+            app2_re[k] = 0.11f * app_re[k] - 0.02f;
+            app2_im[k] = 2.0f * app_im[k];
+        }
+        for (int b = 0; b < DFN2_N_ERB; ++b)
+            mask[b] = head >= 0 ? stream_mask(head) : 0.0f;
+        (void)dfn2_compose_stream(&st_a, app_re, app_im, head >= 0,
+                                  head >= 0 ? mask : NULL,
+                                  head >= 0 ? &coef[0][0][0] : NULL,
+                                  head >= 0 ? stream_alpha(head) : 0.0f,
+                                  0.0f, out_a_re, out_a_im, NULL);
+        (void)dfn2_compose_stream(&st_b, app2_re, app2_im, head >= 0,
+                                  head >= 0 ? mask : NULL,
+                                  head >= 0 ? &coef[0][0][0] : NULL,
+                                  head >= 0 ? stream_alpha(head) : 0.0f,
+                                  0.0f, out_b_re, out_b_im, NULL);
+        dfn2_compute_features(&st_a, est_re, est_im, feat_erb_a, feat_spec_a);
+        dfn2_compute_features(&st_b, est_re, est_im, feat_erb_b, feat_spec_b);
+        CHECK(memcmp(feat_erb_a, feat_erb_b, sizeof(feat_erb_a)) == 0 &&
+              memcmp(feat_spec_a, feat_spec_b, sizeof(feat_spec_a)) == 0,
+              "DFN2 features do not depend on the applied spectrum");
+    }
+    return 1;
+}
+
 static int run_all_tests(void)
 {
     uint64_t digest = UINT64_C(1469598103934665603);
     CHECK(test_dfn2_model_io(), "DFN2 stateless model I/O");
     CHECK(test_dfn_stream_alignment(), "DFN streaming head alignment");
+    CHECK(test_dfn_dual_state_disjoint(),
+          "DFN2 estimation/application branches are disjoint");
     CHECK(test_dfn2(&digest), "DFN2 C pre/post");
     CHECK(test_gtcrn_model_state(), "GTCRN stateless model I/O");
     CHECK(test_gtcrn(&digest), "GTCRN C pre/post");

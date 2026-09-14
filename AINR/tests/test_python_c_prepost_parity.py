@@ -234,3 +234,25 @@ def test_gtcrn_host_boundary_matches_python(c_prepost):
         _fp(mask), _fp(inv), _fp(spectrum), _fp(enhanced))
     np.testing.assert_allclose(enhanced, expected[0, :, 0].numpy(),
                                rtol=3e-5, atol=3e-6)
+
+
+def test_dfn2_process_compiles_alone_without_the_class_symbols(tmp_path):
+    """dfn2_process.c is the parity unit and must stay linkable on its own:
+    the accelerator callback boundary (DFN2Model, dfn2_model_run_frame) lives
+    in dfn2_prepost, and a future move of it into dfn2_process.h would drag
+    dfn2_model_io/dfn2_prepost into this build. The object's undefined
+    symbols must not name either sibling."""
+    cc = shutil.which('cc') or shutil.which('clang') or shutil.which('gcc')
+    if cc is None or shutil.which('nm') is None:
+        pytest.skip('C build tools are unavailable')
+    obj = tmp_path / 'dfn2_process.o'
+    subprocess.run(
+        [cc, '-c', '-O2', '-std=c11', '-ffp-contract=off', '-fno-math-errno',
+         '-I', str(DFN), '-I', str(AC / 'include'), str(DFN / 'dfn2_process.c'),
+         '-o', str(obj)],
+        check=True, capture_output=True)
+    undefined = subprocess.run(['nm', '-u', str(obj)], check=True,
+                               capture_output=True, text=True).stdout
+    assert 'dfn2_prepost' not in undefined
+    assert 'dfn2_model_io' not in undefined
+    assert 'DFN2Model' not in undefined

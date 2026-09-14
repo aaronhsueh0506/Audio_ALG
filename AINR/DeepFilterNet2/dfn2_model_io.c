@@ -8,6 +8,52 @@ void dfn2_model_io_init(DFN2ModelIOState *state)
     if (state != NULL) memset(state, 0, sizeof(*state));
 }
 
+#define DFN2_MODEL_IO_STATE_TENSORS 4
+
+/* One list of (field, contract value) drives both the default and the
+ * validator, so validate(default()) == 0 holds by construction and a new
+ * geometry constant cannot be added to one without the other. */
+#define DFN2_MODEL_IO_DESCRIPTOR_FIELDS(X)                            \
+    X(layout_version, (unsigned int)DFN2_MODEL_IO_LAYOUT_VERSION)     \
+    X(sample_rate, DFN2_SR)                                           \
+    X(fft_size, DFN2_N_FFT)                                           \
+    X(hop_size, DFN2_HOP_LEN)                                         \
+    X(spectrum_bins, DFN2_N_BINS)                                     \
+    X(erb_bands, DFN2_N_ERB)                                          \
+    X(df_bins, DFN2_DF_BINS)                                          \
+    X(df_order, DFN2_DF_ORDER)                                        \
+    X(mask_lookahead, DFN2_MASK_LOOKAHEAD)                            \
+    X(df_lookahead, DFN2_DF_LOOKAHEAD)                                \
+    X(input_frames, DFN2_MODEL_INPUT_FRAMES)                          \
+    X(encoder_gru_layers, DFN2_MODEL_ENCODER_GRU_LAYERS)              \
+    X(erb_gru_layers, DFN2_MODEL_ERB_GRU_LAYERS)                      \
+    X(df_gru_layers, DFN2_MODEL_DF_GRU_LAYERS)                        \
+    X(gru_hidden, DFN2_MODEL_GRU_HIDDEN)                              \
+    X(encoder_channels, DFN2_MODEL_ENCODER_CHANNELS)                  \
+    X(df_pathway_history, DFN2_MODEL_DF_PATHWAY_HISTORY)              \
+    X(state_tensor_count, DFN2_MODEL_IO_STATE_TENSORS)
+
+int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor)
+{
+    if (descriptor == NULL) return -1;
+    memset(descriptor, 0, sizeof(*descriptor));
+#define DFN2_SET_FIELD(field, value) descriptor->field = (value);
+    DFN2_MODEL_IO_DESCRIPTOR_FIELDS(DFN2_SET_FIELD)
+#undef DFN2_SET_FIELD
+    return 0;
+}
+
+int dfn2_model_io_descriptor_validate(
+    const DFN2ModelIoDescriptor *descriptor)
+{
+    if (descriptor == NULL) return -1;
+#define DFN2_CHECK_FIELD(field, value) \
+    if (descriptor->field != (value)) return -1;
+    DFN2_MODEL_IO_DESCRIPTOR_FIELDS(DFN2_CHECK_FIELD)
+#undef DFN2_CHECK_FIELD
+    return 0;
+}
+
 void dfn2_model_io_push_erb_window(
     float window[DFN2_MODEL_INPUT_FRAMES][DFN2_N_ERB],
     const float frame[DFN2_N_ERB])

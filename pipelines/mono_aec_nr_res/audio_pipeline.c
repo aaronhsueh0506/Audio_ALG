@@ -781,38 +781,12 @@ static void audio_pipeline_copy_aec_timing(AudioPipeline* p) {
 #define audio_pipeline_copy_aec_timing(p) ((void)(p))
 #endif
 
-int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref, float* out) {
-    if (!p || !mic || !ref || !out) return -1;
-
-    /* No per-hop clear of p->last_timing: every field a mode owns is
-     * rewritten below before this function returns, and the fields a mode
-     * does not own are written by no path at all, so they keep the zero the
-     * control block got at init. A clear here would run in every build --
-     * it cannot be gated on the timing flags without changing what a
-     * release build reports -- to guard a bail-out this function does not
-     * have. Add one if it ever gains one. */
-
-    const int hop      = p->hop;
-    const int n_freqs   = p->n_freqs;
-    const int frame_sz  = p->frame_sz;
-
-    /* Stage 1: AEC. aec_process() already copies mic/ref into its own
-     * near_hop/far_hop at the top of the call, so passing the caller's
-     * pointers straight through is exactly as safe as an extra pipeline-
-     * owned decoupling copy would have been, without paying for one.
-     *
-     * Dispatch on p->aec_only, fixed at construction. The two entry points
-     * differ only by whether the result is copied out, so this is purely a
-     * cost choice. aec_only means the AEC's own output IS the pipeline's
-     * output -- needs aec_process(), writing directly into the caller's
-     * `out` (already validated non-NULL and hop-sized above). !aec_only
-     * means downstream NR/RES reads only ctx.error_spec and never the
-     * emitted hop, so aec_process_context() skips that copy. */
-    if (p->aec_only) {
-        aec_process(p->aec, mic, ref, out);
-        audio_pipeline_copy_aec_timing(p);
-        return 0;
-    }
+/* The conventional post path from the AEC context up to and including the
+ * comfort-noise fill: leaves the spectrum to synthesise in p->spec. The
+ * caller has already handled aec_only. */
+static void prepare_post_spectrum(AudioPipeline* p, const float* mic,
+                                  const float* ref) {
+    const int n_freqs = p->n_freqs;
     aec_process_context(p->aec, mic, ref);
     audio_pipeline_copy_aec_timing(p);
     uint32_t t0 = audio_pipeline_now_us();
@@ -881,18 +855,81 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
         }
     }
 
-    /* ctx.error_spec already contains the matching sqrt-Hann analysis frame;
-     * complete the 50%-overlap WOLA with one IFFT + synthesis + OLA. */
-    uint32_t t2 = audio_pipeline_now_us();
-    p->last_timing.post_us = t2 - t1;
+    p->last_timing.post_us = audio_pipeline_now_us() - t1;
+}
 
-    fft_inverse(p->fft, p->spec, p->ifft_buf);
+/* One IFFT + sqrt-Hann synthesis + OLA, then the hop emit/shift, with the
+ * synth timing stamp. Shared by audio_pipeline_process() and
+ * audio_pipeline_synthesize_external() so both finish a hop through the one
+ * OLA with the identical operation order. */
+static void synthesize_hop(AudioPipeline* p, const Complex* spectrum,
+                           float* out) {
+    const int hop      = p->hop;
+    const int frame_sz = p->frame_sz;
+    uint32_t t2 = audio_pipeline_now_us();
+    fft_inverse(p->fft, spectrum, p->ifft_buf);
     sk_wola_accumulate_f32(p->ola, p->ifft_buf, p->synth_win, frame_sz);
     memcpy(out, p->ola, (size_t)hop * sizeof(float));
     memmove(p->ola, p->ola + hop, (size_t)(frame_sz - hop) * sizeof(float));
     memset(p->ola + (frame_sz - hop), 0, (size_t)hop * sizeof(float));
     p->last_timing.synth_us = audio_pipeline_now_us() - t2;
+}
 
+int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref, float* out) {
+    if (!p || !mic || !ref || !out) return -1;
+
+    /* No per-hop clear of p->last_timing: every field a mode owns is
+     * rewritten below before this function returns, and the fields a mode
+     * does not own are written by no path at all, so they keep the zero the
+     * control block got at init. A clear here would run in every build --
+     * it cannot be gated on the timing flags without changing what a
+     * release build reports -- to guard a bail-out this function does not
+     * have. Add one if it ever gains one. */
+
+    /* Stage 1: AEC. aec_process() already copies mic/ref into its own
+     * near_hop/far_hop at the top of the call, so passing the caller's
+     * pointers straight through is exactly as safe as an extra pipeline-
+     * owned decoupling copy would have been, without paying for one.
+     *
+     * Dispatch on p->aec_only, fixed at construction. The two entry points
+     * differ only by whether the result is copied out, so this is purely a
+     * cost choice. aec_only means the AEC's own output IS the pipeline's
+     * output -- needs aec_process(), writing directly into the caller's
+     * `out` (already validated non-NULL and hop-sized above). !aec_only
+     * means downstream NR/RES reads only ctx.error_spec and never the
+     * emitted hop, so aec_process_context() skips that copy. */
+    if (p->aec_only) {
+        aec_process(p->aec, mic, ref, out);
+        audio_pipeline_copy_aec_timing(p);
+        return 0;
+    }
+    prepare_post_spectrum(p, mic, ref);
+
+    /* p->spec sits on the matching sqrt-Hann analysis frame; complete the
+     * 50%-overlap WOLA with one IFFT + synthesis + OLA. */
+    synthesize_hop(p, p->spec, out);
+    return 0;
+}
+
+int audio_pipeline_process_post_view(AudioPipeline* p, const float* mic,
+                                     const float* ref,
+                                     AudioPipelinePostView* out) {
+    AecResContext ctx;
+    /* p->nr is NULL exactly when enable_nr=0 on a !aec_only instance. */
+    if (!p || !mic || !ref || !out || p->aec_only || p->nr) return -1;
+    prepare_post_spectrum(p, mic, ref);
+    /* The AEC's seam pointers alias its internal per-hop buffers and stay
+     * valid until the next AEC processing call (aec.h, AecResContext). */
+    aec_get_res_context(p->aec, &ctx);
+    out->error_spec = ctx.error_spec;
+    out->post_spectrum = p->spec;
+    return 0;
+}
+
+int audio_pipeline_synthesize_external(AudioPipeline* p,
+                                       const Complex* spectrum, float* out) {
+    if (!p || !spectrum || !out || p->aec_only) return -1;
+    synthesize_hop(p, spectrum, out);
     return 0;
 }
 

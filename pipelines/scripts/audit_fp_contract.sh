@@ -1,12 +1,12 @@
 #!/bin/sh
-# audit_fp_contract.sh -- disassembly check for the pipeline objects that run
-# windowed overlap-add.
+# audit_fp_contract.sh -- disassembly check for pipeline objects whose
+# multiply/add ordering is part of the numerical contract.
 #
 # Why this exists here and not in audio_common: the KERNEL those objects call
 # (sk_wola_accumulate_f32) is audited by audio_common's own script, against a
 # non-inline instantiation in that repo. The CALL SITES are a separate
-# question -- each of these translation units also carries its own per-bin
-# floating-point work, and none of them was ever disassembled. Being compiled
+# question -- these translation units carry WOLA or DFN per-bin floating-point
+# work, and none of them was ever disassembled. Being compiled
 # under -ffp-contract=off is a Makefile property; being fma-free is a property
 # of the emitted code, and only a disassembly says so. audio_common must not
 # reach up into Audio_ALG, so the audit for these objects lives with them.
@@ -38,11 +38,14 @@ AC_DIR="${AC_DIR:-../../audio_common}"
 FMA_RE="$FP_CONTRACT_FMA_RE"
 disas() { fp_contract_disas "$1"; }
 
-# One row per TU: "make-dir:build-goal:object:note". Every one of these runs
-# the WOLA accumulate and must stay fma-free, so the shared kernel's
-# multiply-then-add rounding is what the whole path performs.
+# One row per TU: "make-dir:build-goal:object:note". These either run WOLA or
+# implement the DFN spectrum/compose path, and must stay fma-free so the
+# scalar/NEON and C/Python multiply-then-add contracts remain comparable.
 ENTRIES='
 .:libaudio_pipeline.a:audio_pipeline.o:mono AEC+NR pipeline -- post-NR/RES synthesis WOLA
+.:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- 2^-5/2^5 boundary scaling
+.:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge -- native and 48 kHz WOLA, analysis windows
+.:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming compose kernels
 4ch_aec_bf_nr_res:libs:4aec_nr_res.o:4-channel core -- post-beam synthesis WOLA
 4ch_aec_bf_nr_res:4ch_alignulcnet:audio_pipeline_4ch_ulcnet.o:4-channel Align-ULCNet -- beamformed-spectrum WOLA
 '

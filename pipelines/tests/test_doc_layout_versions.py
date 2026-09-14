@@ -34,6 +34,14 @@ _SOURCES = {
         'pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h',
     'AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION':
         'pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h',
+    'DFN_RES_STAGE_LAYOUT_VERSION':
+        'pipelines/dfn_res_stage.h',
+    'DFN_RATE_BRIDGE_LAYOUT_VERSION':
+        'pipelines/dfn_rate_bridge.h',
+    'MONO_AEC_DFN_RES_LAYOUT_VERSION':
+        'pipelines/mono_aec_dfn_res/audio_pipeline_dfn.h',
+    'FOUR_AEC_DFN_RES_LAYOUT_VERSION':
+        'pipelines/4ch_aec_bf_dfn_res/4aec_dfn_res.h',
 }
 
 _DOC_ROOT = _REPO / 'docs'

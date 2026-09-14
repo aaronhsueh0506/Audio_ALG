@@ -1854,21 +1854,21 @@ static const float* post_res_gain(FourAecNrRes* p,
         max_saturation > 0.5f);
 }
 
-static int run_post_res_and_nr(
+/* The conventional post path up to and including the comfort-noise fill:
+ * leaves the spectrum to synthesise in p->output_spec. Returns 0 when the
+ * RES preparation or the denoiser refused the hop. */
+static int prepare_post_spectrum(
     FourAecNrRes* p,
     int all_converged,
     float max_dt,
     float max_saturation,
-    const Complex* trusted_beamformed_error,
-    float* out) {
+    const Complex* trusted_beamformed_error) {
     const float* res_gain;
     const float* nr_extra;
     const float* nr_gain;
     const Complex* error =
         trusted_beamformed_error ? trusted_beamformed_error : p->fused_error;
     int n = p->n_freqs;
-    int hop = p->hop_size;
-    int fft = p->fft_size;
     int k;
     uint32_t t0, t1;
 
@@ -1937,12 +1937,20 @@ static int run_post_res_and_nr(
         }
     }
 
-    /* Synthesis: inverse transform, windowed overlap-add, and the hop
-     * emit/shift. The finite check after it is validation, not synthesis, and
-     * falls in the post-stage remainder along with the gain fusion and
-     * comfort-noise loop above. */
-    t0 = four_aec_nr_res_now_us();
-    fft_inverse(p->fft, p->output_spec, p->ifft_buffer);
+    return 1;
+}
+
+/* Synthesis: inverse transform, windowed overlap-add, and the hop
+ * emit/shift, shared by the conventional post path and
+ * synthesize_external() so both finish a hop through the one OLA with the
+ * identical operation order. The finite check after it is validation, not
+ * synthesis, and falls in the post-stage remainder along with the gain
+ * fusion and comfort-noise loop above. */
+static int finish_hop(FourAecNrRes* p, const Complex* spectrum, float* out) {
+    int hop = p->hop_size;
+    int fft = p->fft_size;
+    uint32_t t0 = four_aec_nr_res_now_us();
+    fft_inverse(p->fft, spectrum, p->ifft_buffer);
     sk_wola_accumulate_f32(p->ola, p->ifft_buffer, p->synth_window, fft);
     memcpy(out, p->ola, (size_t)hop * sizeof(float));
     memmove(
@@ -1955,19 +1963,23 @@ static int run_post_res_and_nr(
     return inputs_finite(out, (size_t)hop);
 }
 
-static int process_post_impl(
+/* The post path up to the spectrum: argument and token gates, the timing
+ * clears, the fuse stage and prepare_post_spectrum(). Shared by
+ * process_post() and process_post_view() so a guard or a stamp added to the
+ * shipped path cannot miss the seam. Returns a FOUR_AEC_NR_RES_* status; on
+ * DSP_ERROR the instance has been reset. The pending token is NOT consumed
+ * here: each caller consumes it after its own last step. */
+static int post_to_spectrum(
     FourAecNrRes* p,
     const FourAecNrResFrameToken* token,
     const Complex* weights,
-    const Complex* trusted_beamformed_error,
-    float* out) {
+    const Complex* trusted_beamformed_error) {
     int all_converged;
     float max_dt;
     float max_saturation;
     uint32_t t0;
 
-    if (!p || p->destroyed || !token || !weights || !out ||
-        !p->cfg.enable_post)
+    if (!p || p->destroyed || !token || !weights || !p->cfg.enable_post)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     if (!token_matches(p, token))
         return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
@@ -1991,15 +2003,35 @@ static int process_post_impl(
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
     p->last_timing.fuse_us = four_aec_nr_res_now_us() - t0;
-    if (!run_post_res_and_nr(
+    if (!prepare_post_spectrum(
             p, all_converged, max_dt, max_saturation,
-            trusted_beamformed_error, out)) {
+            trusted_beamformed_error)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
+    return FOUR_AEC_NR_RES_OK;
+}
 
+static void consume_token(FourAecNrRes* p) {
     p->pending = 0;
     memset(&p->pending_token, 0, sizeof(p->pending_token));
+}
+
+static int process_post_impl(
+    FourAecNrRes* p,
+    const FourAecNrResFrameToken* token,
+    const Complex* weights,
+    const Complex* trusted_beamformed_error,
+    float* out) {
+    int rc;
+    if (!out) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    rc = post_to_spectrum(p, token, weights, trusted_beamformed_error);
+    if (rc != FOUR_AEC_NR_RES_OK) return rc;
+    if (!finish_hop(p, p->output_spec, out)) {
+        four_aec_nr_res_reset(p);
+        return FOUR_AEC_NR_RES_DSP_ERROR;
+    }
+    consume_token(p);
     return FOUR_AEC_NR_RES_OK;
 }
 
@@ -2020,6 +2052,40 @@ int four_aec_nr_res_process_post_trusted_spectrum(
     if (!beamformed_error) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     return process_post_impl(
         p, token, weights, beamformed_error, out);
+}
+
+int four_aec_nr_res_process_post_view(
+    FourAecNrRes* p,
+    const FourAecNrResFrameToken* token,
+    const Complex* weights,
+    const Complex* trusted_beamformed_error,
+    FourAecNrResPostView* out) {
+    int rc;
+    if (!p || p->destroyed || !out || !p->cfg.enable_res ||
+        p->cfg.enable_nr || !p->post_sg_storage)
+        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    rc = post_to_spectrum(p, token, weights, trusted_beamformed_error);
+    if (rc != FOUR_AEC_NR_RES_OK) return rc;
+    out->beamformed_error =
+        trusted_beamformed_error ? trusted_beamformed_error : p->fused_error;
+    out->post_spectrum = p->output_spec;
+    consume_token(p);
+    return FOUR_AEC_NR_RES_OK;
+}
+
+int four_aec_nr_res_synthesize_external(
+    FourAecNrRes* p,
+    const Complex* spectrum,
+    float* out) {
+    if (!p || p->destroyed || !spectrum || !out || !p->cfg.enable_post ||
+        !p->fft || !p->ifft_buffer || !p->ola || !p->synth_window)
+        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (!complex_vector_finite(spectrum, p->n_freqs) ||
+        !finish_hop(p, spectrum, out)) {
+        four_aec_nr_res_reset(p);
+        return FOUR_AEC_NR_RES_DSP_ERROR;
+    }
+    return FOUR_AEC_NR_RES_OK;
 }
 
 int four_aec_nr_res_abandon_pre(

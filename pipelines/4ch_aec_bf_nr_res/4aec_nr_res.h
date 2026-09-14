@@ -168,7 +168,12 @@ extern "C" {
  *      byte count cannot signal this; the embedded config shrank (C struct
  *      ABI), every field after it in a wrapper's control block moved, and the
  *      lifted post path a version-17 config could select no longer exists.
- *      The default output is unchanged: the lift was off by default. */
+ *      The default output is unchanged: the lift was off by default.
+ *
+ *  The external post-filter seam (process_post_view() and
+ *  synthesize_external(), consumed by the DFN2 wrapper) added public entry
+ *  points only: no struct, config or carve change, so it did not consume a
+ *  layout number. */
 #define FOUR_AEC_NR_RES_LAYOUT_VERSION 18u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
@@ -583,6 +588,45 @@ int four_aec_nr_res_process_post_trusted_spectrum(
     const FourAecNrResFrameToken* token,
     const Complex* weights,
     const Complex* beamformed_error,
+    float* out);
+
+/** External post-filter seam (the DFN2 wrapper): run one hop of the
+ * conventional post path -- fuse, post-beam RES, gain fusion and the
+ * comfort-noise fill -- and hand back the spectra instead of synthesising.
+ * `beamformed_error` is the coherent projection reconstructed from `weights`,
+ * or `trusted_beamformed_error` when one is supplied (same caller contract
+ * as process_post_trusted_spectrum()): the spectrum RES was estimated from.
+ * `post_spectrum` is beamformed_error * G_res plus comfort noise -- exactly
+ * what process_post() would have synthesised. Both alias instance-owned
+ * per-hop storage (a trusted beamformed_error stays caller-owned), are
+ * four_aec_nr_res_n_freqs() long and are valid until the next call on
+ * `p`. The pending token is consumed on
+ * success. Requires enable_post=1, enable_res=1 and enable_nr=0: with NR
+ * disabled no MMSE-LSA instance exists, so a caller mixing this seam with
+ * process_post() can never leave one half-stepped. Return codes and token
+ * rules as process_post(); on DSP_ERROR the instance has been reset. The hop
+ * is then finished with four_aec_nr_res_synthesize_external().
+ */
+typedef struct FourAecNrResPostView {
+    const Complex* beamformed_error;   /* Complex[n_freqs] */
+    const Complex* post_spectrum;      /* Complex[n_freqs] */
+} FourAecNrResPostView;
+
+int four_aec_nr_res_process_post_view(
+    FourAecNrRes* p,
+    const FourAecNrResFrameToken* token,
+    const Complex* weights,
+    const Complex* trusted_beamformed_error,
+    FourAecNrResPostView* out);
+
+/** Synthesize one externally processed spectrum through this core's own
+ * sqrt-Hann iFFT/OLA state: the identical synthesis process_post() performs,
+ * so the OLA stays continuous across hops finished either way. Follows
+ * process_post_view(). Requires enable_post=1; a non-finite spectrum or
+ * output resets the instance and returns DSP_ERROR. */
+int four_aec_nr_res_synthesize_external(
+    FourAecNrRes* p,
+    const Complex* spectrum,
     float* out);
 
 /**

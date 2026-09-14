@@ -24,6 +24,25 @@ from train import read_model_config
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def require_partition_of_unity(inverse_band_major):
+    """Refuse an inverse matrix a unit band mask does not expand to exactly
+    1.0f per bin through, accumulated band by band in float32 the way
+    ``df_common_expand_mask`` does it.  ``dfn2_prepost_frame_skip``'s identity
+    (and every host-side identity gate built on it) is exact only under this
+    property, so it is checked bitwise, not within a tolerance."""
+    inverse = np.asarray(inverse_band_major, dtype=np.float32)
+    if inverse.ndim != 2:
+        raise RuntimeError('inverse ERB matrix must be 2-D')
+    bin_gain = np.zeros(inverse.shape[1], dtype=np.float32)
+    for row in inverse:
+        bin_gain += row
+    bad = np.flatnonzero(bin_gain != np.float32(1.0))
+    if bad.size:
+        raise RuntimeError(
+            'inverse ERB matrix is not a bitwise partition of unity: %d bins, '
+            'first bin %d sums to %r' % (bad.size, int(bad[0]), float(bin_gain[bad[0]])))
+
+
 def _write_matrix(fp, name, matrix):
     rows, cols = matrix.shape
     fp.write("static const float %s[%d][%d] = {\n" % (name, rows, cols))
@@ -64,6 +83,7 @@ def write_runtime_bins(config_path, out_dir):
         forward = np.ascontiguousarray(forward.T)
     if inverse.shape[0] > inverse.shape[1]:
         inverse = np.ascontiguousarray(inverse.T)
+    require_partition_of_unity(inverse)
     os.makedirs(out_dir, exist_ok=True)
     forward.tofile(os.path.join(out_dir, 'erb_fwd.bin'))
     inverse.tofile(os.path.join(out_dir, 'erb_inv.bin'))
@@ -158,8 +178,7 @@ def main():
         print(path)
 
     unity_error = float(np.max(np.abs(inverse.sum(axis=1) - 1.0)))
-    if unity_error > 1e-6:
-        raise RuntimeError('inverse ERB matrix is not a partition of unity: %.3g' % unity_error)
+    require_partition_of_unity(inverse.T if inverse.shape[0] > inverse.shape[1] else inverse)
     print('shape=%s inverse_unity_max_error=%.3g' % (forward.shape, unity_error))
 
 

@@ -3912,6 +3912,92 @@ static void test_comfort_noise_follows_nr_gain(void) {
     free(mics); free(far); free(w);
 }
 
+/* The external post-filter seam must be the conventional post path with its
+ * synthesis lifted out: synthesising the returned post_spectrum through
+ * synthesize_external() has to reproduce process_post() on a twin instance
+ * bit for bit, comfort noise ON so the fill and its RNG are part of the
+ * claim. The rejection rows pin the configuration contract (no NR instance,
+ * RES on) and the token consumption. */
+static void test_post_view_seam(void) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(48000);
+    FourAecNrResConfig other;
+    FourAecNrRes *seam, *twin, *p;
+    static Complex weights[4 * 513];
+    static float mics[512 * 4];
+    float far[512], out_seam[512], out_twin[512];
+    FourAecNrResPreFrame sp, tp;
+    FourAecNrResPostView view;
+    uint32_t rng = 7u;
+    int h, i, k, identical = 1, nonzero = 0, ok = 1, hop, n;
+
+    cfg.fft_size = 1024;
+    cfg.enable_post = 1;
+    cfg.enable_res = 1;
+    cfg.enable_nr = 0;
+    cfg.enable_cng = 1;
+    seam = four_aec_nr_res_create(&cfg);
+    twin = four_aec_nr_res_create(&cfg);
+    CHECK(seam != NULL && twin != NULL, "post-view seam: RES-only 48 kHz cores create");
+    if (!seam || !twin) return;
+    hop = four_aec_nr_res_hop_size(seam);
+    n = four_aec_nr_res_n_freqs(seam);
+    for (i = 0; i < 4 * n; ++i) { weights[i].r = 0.25f; weights[i].i = 0.0f; }
+    for (h = 0; h < 60; ++h) {
+        synth_echo_hop(h, hop, mics, far, &rng);
+        ok = ok && four_aec_nr_res_process_pre(seam, mics, far, &sp) == FOUR_AEC_NR_RES_OK;
+        ok = ok && four_aec_nr_res_process_pre(twin, mics, far, &tp) == FOUR_AEC_NR_RES_OK;
+        ok = ok && four_aec_nr_res_process_post_view(
+                       seam, &sp.token, weights, NULL, &view) == FOUR_AEC_NR_RES_OK;
+        ok = ok && view.beamformed_error != NULL && view.post_spectrum != NULL;
+        ok = ok && four_aec_nr_res_synthesize_external(
+                       seam, view.post_spectrum, out_seam) == FOUR_AEC_NR_RES_OK;
+        ok = ok && four_aec_nr_res_process_post(
+                       twin, &tp.token, weights, out_twin) == FOUR_AEC_NR_RES_OK;
+        if (!ok) break;
+        if (memcmp(out_seam, out_twin, (size_t)hop * sizeof(float)) != 0) identical = 0;
+        for (k = 0; k < hop; ++k) if (out_twin[k] != 0.0f) nonzero = 1;
+    }
+    CHECK(ok, "post-view seam: every hop of pre/view/synthesize/post succeeds");
+    CHECK(identical && nonzero,
+          "post-view + synthesize_external reproduces process_post bit for bit "
+          "(NR off, CNG on, non-silent output)");
+    CHECK(four_aec_nr_res_process_post_view(
+              seam, &sp.token, weights, NULL, &view) == FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "post-view seam: a consumed token is refused on replay");
+    CHECK(four_aec_nr_res_process_post_view(
+              seam, &sp.token, weights, NULL, NULL) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          four_aec_nr_res_synthesize_external(seam, NULL, out_seam) ==
+              FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+          "post-view seam: NULL out/spectrum rejected");
+
+    other = cfg; other.enable_nr = 1;
+    p = four_aec_nr_res_create(&other);
+    CHECK(p != NULL, "post-view seam: NR-enabled core creates");
+    if (p) {
+        synth_echo_hop(0, hop, mics, far, &rng);
+        CHECK(four_aec_nr_res_process_pre(p, mics, far, &sp) == FOUR_AEC_NR_RES_OK &&
+              four_aec_nr_res_process_post_view(
+                  p, &sp.token, weights, NULL, &view) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+              four_aec_nr_res_abandon_pre(p, &sp.token) == FOUR_AEC_NR_RES_OK,
+              "post-view seam refuses a core that owns an NR instance (pending frame kept)");
+        four_aec_nr_res_destroy(p);
+    }
+    other = cfg; other.enable_res = 0;
+    p = four_aec_nr_res_create(&other);
+    CHECK(p != NULL, "post-view seam: RES-off core creates");
+    if (p) {
+        synth_echo_hop(0, hop, mics, far, &rng);
+        CHECK(four_aec_nr_res_process_pre(p, mics, far, &sp) == FOUR_AEC_NR_RES_OK &&
+              four_aec_nr_res_process_post_view(
+                  p, &sp.token, weights, NULL, &view) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+              four_aec_nr_res_abandon_pre(p, &sp.token) == FOUR_AEC_NR_RES_OK,
+              "post-view seam refuses a core without the post-beam RES");
+        four_aec_nr_res_destroy(p);
+    }
+    four_aec_nr_res_destroy(seam);
+    four_aec_nr_res_destroy(twin);
+}
+
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
@@ -3950,6 +4036,7 @@ int main(void) {
     test_stage_timing();
     test_comfort_noise_contract();
     test_comfort_noise_follows_nr_gain();
+    test_post_view_seam();
     test_reset_equals_fresh_instance(16000, 256, 1);
     test_reset_equals_fresh_instance(16000, 256, 0);
     test_reset_equals_fresh_instance(16000, 512, 1);

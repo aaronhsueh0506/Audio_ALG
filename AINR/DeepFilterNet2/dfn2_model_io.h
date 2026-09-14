@@ -30,6 +30,41 @@ extern "C" {
 #define DFN2_MODEL_ENCODER_CHANNELS         64
 #define DFN2_MODEL_DF_PATHWAY_HISTORY       4
 
+/* The graph contract a runtime was built against, as a value a host can
+ * compare field by field. Every field is a compiled constant of this build;
+ * there is no free deployment parameter here (unlike Align-ULCNet's
+ * delay_depth), so validate(default()) == 0 by construction and the struct's
+ * only job is refusing a graph exported against another layout version or
+ * geometry -- a mismatch the NaN-prefill and finite checks cannot see,
+ * because they catch an unwritten output, never a wrong-shaped one. */
+typedef struct DFN2ModelIoDescriptor {
+    unsigned int layout_version;   /* DFN2_MODEL_IO_LAYOUT_VERSION         */
+    int sample_rate;               /* DFN2_SR                              */
+    int fft_size;                  /* DFN2_N_FFT                           */
+    int hop_size;                  /* DFN2_HOP_LEN                         */
+    int spectrum_bins;             /* DFN2_N_BINS                          */
+    int erb_bands;                 /* DFN2_N_ERB                           */
+    int df_bins;                   /* DFN2_DF_BINS                         */
+    int df_order;                  /* DFN2_DF_ORDER                        */
+    int mask_lookahead;            /* DFN2_MASK_LOOKAHEAD                  */
+    int df_lookahead;              /* DFN2_DF_LOOKAHEAD                    */
+    int input_frames;              /* DFN2_MODEL_INPUT_FRAMES              */
+    int encoder_gru_layers;        /* DFN2_MODEL_ENCODER_GRU_LAYERS        */
+    int erb_gru_layers;            /* DFN2_MODEL_ERB_GRU_LAYERS            */
+    int df_gru_layers;             /* DFN2_MODEL_DF_GRU_LAYERS             */
+    int gru_hidden;                /* DFN2_MODEL_GRU_HIDDEN                */
+    int encoder_channels;          /* DFN2_MODEL_ENCODER_CHANNELS          */
+    int df_pathway_history;        /* DFN2_MODEL_DF_PATHWAY_HISTORY        */
+    int state_tensor_count;        /* 4: h_encoder, h_erb, h_df, df_convp  */
+} DFN2ModelIoDescriptor;
+
+/* Fill with this build's contract. Returns 0, or -1 on NULL. */
+int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor);
+/* 0 when every field equals this build's contract, -1 otherwise (NULL
+ * included). Field by field, never memcmp, so padding cannot decide. */
+int dfn2_model_io_descriptor_validate(
+    const DFN2ModelIoDescriptor *descriptor);
+
 /* Caller-owned state for a stateless accelerator. The graph receives these
  * arrays as ordinary inputs and returns their *_next values as outputs. */
 typedef struct {

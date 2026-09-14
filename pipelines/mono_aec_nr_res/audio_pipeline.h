@@ -194,6 +194,31 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic,
  * echo-path change (speaker swap, AEC re-seat) or between unrelated streams
  * sharing one instance.
  */
+/**
+ * External post-filter seam (the DFN2 wrapper): run one hop up to and
+ * including the comfort-noise fill and hand back the spectra instead of
+ * synthesising. `error_spec` is the linear-AEC error E the RES gain was
+ * estimated from; `post_spectrum` is E * G_res plus comfort noise -- exactly
+ * what audio_pipeline_process() would have synthesised. Both alias
+ * instance-owned per-hop buffers and stay valid until the next processing
+ * call on `p`. Requires !aec_only and enable_nr=0 (no denoiser instance
+ * exists, so the seam can never leave one half-stepped); -1 on NULL
+ * arguments or any other configuration. The hop is then finished with
+ * audio_pipeline_synthesize_external(), the identical sqrt-Hann iFFT/OLA
+ * audio_pipeline_process() runs, so the OLA stays continuous across hops
+ * finished either way (-1 on NULL arguments or aec_only).
+ */
+typedef struct AudioPipelinePostView {
+    const Complex* error_spec;      /* Complex[audio_pipeline_n_freqs()] */
+    const Complex* post_spectrum;   /* Complex[audio_pipeline_n_freqs()] */
+} AudioPipelinePostView;
+
+int audio_pipeline_process_post_view(AudioPipeline* p, const float* mic,
+                                     const float* ref,
+                                     AudioPipelinePostView* out);
+int audio_pipeline_synthesize_external(AudioPipeline* p,
+                                       const Complex* spectrum, float* out);
+
 void audio_pipeline_reset(AudioPipeline* p);
 
 /* ── Runtime strength control ─────────────────────────────────────────────

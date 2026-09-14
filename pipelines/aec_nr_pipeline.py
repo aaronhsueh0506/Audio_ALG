@@ -331,6 +331,13 @@ def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
     return gains.astype(np.float32)
 
 
+
+def synth_window(frame_size):
+    """The periodic sqrt-Hann synthesis window (float32), the AEC's own."""
+    idx = np.arange(frame_size, dtype=np.float64)
+    return np.sqrt(0.5 * (1.0 - np.cos(2.0 * np.pi * idx / float(frame_size)))
+                   ).astype(np.float32)
+
 def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
             aec_contexts: List[AecResContext],
             config: AecConfig,
@@ -372,8 +379,7 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
         )
     psd_scale = 32768.0 ** 2         # int16² scale of ctx.comfort_noise (AEC3)
 
-    idx = np.arange(bs, dtype=np.float64)
-    synth_win = np.sqrt(0.5 * (1.0 - np.cos(2.0 * np.pi * idx / float(bs)))).astype(np.float32)
+    synth_win = synth_window(bs)
     ola = np.zeros(bs, dtype=np.float32)
     rng = np.random.RandomState(0)   # deterministic comfort noise
 
