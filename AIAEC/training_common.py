@@ -109,7 +109,7 @@ from AIAEC.dataset_gen.linear_aec import (  # noqa: E402
     engine_delay_num_filters,
     make_linear_aec_config,
     make_linear_aec_contract,
-    require_linear_aec_contract,
+    require_inference_linear_aec_contract,
 )
 
 
@@ -398,12 +398,11 @@ FAR_INPUT_MODES = ('raw_far',)
 # rather than to an unnamed integer.
 FAR_INPUT_MODE_C_VALUES = {'raw_far': 0, 'aligned_far': 1}
 
-# The far-end signal the production seam presents to the model, fixed for
-# every deployed alignment candidate: the far the linear AEC has already
-# aligned. Deliberately NOT derived from FAR_INPUT_MODES -- that names what
-# training feeds, and the whole point of recording both is that they differ.
-# Raw/aligned comparison survives only in sweep_delay_depth.py.
-DEPLOYED_FAR_INPUT_MODE = 'aligned_far'
+# The deployed far-end contract must equal the signal used for training.
+# Align-ULCNet's own TA block learns the delay from raw far; pre-aligning that
+# branch changes the correspondence it was trained to score and regresses a
+# subset of real cases.  Keep aligned_far only as an explicit diagnostic arm.
+DEPLOYED_FAR_INPUT_MODE = 'raw_far'
 
 # Calibration-seam-only name, used when a model has no separate far seam at
 # all: the recorder fed it exactly the far its own graph consumes, so there is
@@ -879,7 +878,7 @@ class LinearAecEngine:
             frame_size=self.contract.frame_size,
             filter_length=self.contract.filter_length,
         )
-        require_linear_aec_contract(
+        require_inference_linear_aec_contract(
             runtime_contract.as_dict(), self.contract.as_dict(), "inference runtime"
         )
         self._engines: List[AEC] = [self._new_engine() for _ in range(self.n_lanes)]

@@ -39,10 +39,9 @@ def far_mode_provenance(model_name):
     describe it the same way. Returns ``(calibration, deployment)``.
     """
     if model_name == 'Align_ULCNet':
-        # The far WAVs are the raw rendered reference; deployment feeds the
-        # aligned far the linear AEC produced. Recording only one of the two
-        # would let a consumer assume the ranges were measured on the signal
-        # the board will actually present.
+        # The far WAVs and deployment both use the raw rendered reference.
+        # Keep separate fields so the report still proves the checkpoint and
+        # board contracts agree.
         return 'raw_far', DEPLOYED_FAR_INPUT_MODE
     return CALIBRATION_ONLY_FAR_INPUT_MODE, CALIBRATION_ONLY_FAR_INPUT_MODE
 
@@ -138,4 +137,3 @@ def blocks_from_pair(model_name, model, grid, primary_path, far_path,
             block[name] = tensor[tuple(slices)][0].cpu().numpy().astype(
                 np.float32, copy=False)
         yield block
-

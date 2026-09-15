@@ -173,7 +173,7 @@ def test_inference_cli_accepts_only_real_matched_filter_banks():
         '--delay-num-filters', '2',
     ])
     assert args.delay_num_filters == 2
-    assert args.far_input_mode == 'aligned_far'
+    assert args.far_input_mode == 'raw_far'
     raw_args = parser.parse_args([
         'checkpoint.pth', 'mic.wav', 'far.wav', 'out.wav',
         '--delay-num-filters', '5', '--far-input-mode', 'raw_far',
@@ -233,7 +233,7 @@ def test_load_model_far_input_mode_default_present_and_rejected(
     # runtime seam, which may override that default.
     load_model(path, 'cpu')
     assert ('checkpoint training far_input_mode: raw_far; '
-            'deployment default: aligned_far'
+            'deployment default: raw_far'
             in capsys.readouterr().out)
 
     # Field present (what every new contract records): loads identically.
@@ -243,7 +243,7 @@ def test_load_model_far_input_mode_default_present_and_rejected(
     torch.save(ckpt, explicit_path)
     load_model(explicit_path, 'cpu')
     assert ('checkpoint training far_input_mode: raw_far; '
-            'deployment default: aligned_far'
+            'deployment default: raw_far'
             in capsys.readouterr().out)
 
     # Unknown mode: rejected before any weights load.
@@ -297,18 +297,13 @@ def _write_delayed_scene(tmp_path, samples=32768, delay=1024, seed=23):
     return mic_path, far_path, far.unsqueeze(0)
 
 
-def test_inference_feeds_model_the_pbfdkf_consumed_aligned_far(
+def test_inference_default_feeds_model_the_original_raw_far(
         model, tmp_path, monkeypatch):
-    """The public streaming CLI must feed the exact far PBFDKF consumed.
+    """The public streaming CLI defaults to the checkpoint's raw-far seam.
 
-    Production feeds the model the far hop the linear AEC actually consumed
-    (raw until the alignment ring can serve the applied delay, ring-aligned
-    afterwards), so an offline CLI that fed the raw far WAV instead would be
-    evaluating a model on an input distribution deployment never produces.
-
-    The far handed to StreamSTFT is captured and compared against PBFDKF's
-    consumed far recomputed independently.  The raw-far inequality keeps this
-    from passing vacuously.
+    The far handed to StreamSTFT is captured and compared with the source WAV.
+    The scene acquires a non-zero PBFDKF delay, so inequality with the aligned
+    tap proves that this is not passing on a zero-delay fixture.
     """
     from AIAEC.Align_ULCNet import inference as inference_cli
     from AIAEC.Align_ULCNet import _streaming as streaming_cli
@@ -354,19 +349,15 @@ def test_inference_feeds_model_the_pbfdkf_consumed_aligned_far(
     engine(mic_t, far_t, GRID.sample_rate)
     consumed_far = engine.get_aligned_far()
 
-    assert streaming_far.shape == consumed_far.shape
-    assert torch.equal(streaming_far, consumed_far)
+    assert streaming_far.shape == raw_far.shape
+    assert torch.equal(streaming_far, raw_far)
     assert all(chunk.shape[-1] <= GRID.hop_len for chunk in pushed[1])
-
-    # Non-vacuous: the scene really was delayed, so the seam really did move
-    # the far. A CLI still feeding the raw WAV would satisfy every equality
-    # above only if this failed.
-    assert not torch.equal(consumed_far, raw_far)
+    assert not torch.equal(streaming_far, consumed_far)
 
 
-def test_inference_raw_far_keeps_pbfdkf_error_but_feeds_original_far(
+def test_inference_aligned_far_is_an_explicit_diagnostic_only(
         model, tmp_path, monkeypatch):
-    """raw_far changes only the NN reference, not the PBFDKF frontend."""
+    """aligned_far changes only the NN reference, not the PBFDKF frontend."""
     from AIAEC.Align_ULCNet import inference as inference_cli
     from AIAEC.Align_ULCNet import _streaming as streaming_cli
     from AIAEC.aiaec_streaming import StreamSTFT
@@ -394,9 +385,9 @@ def test_inference_raw_far_keeps_pbfdkf_error_but_feeds_original_far(
 
     monkeypatch.setattr(streaming_cli, 'StreamSTFT', RecordingStreamSTFT)
     inference_cli.main(inference_cli.build_parser().parse_args([
-        checkpoint, mic_path, far_path, str(tmp_path / 'raw_far_out.wav'),
+        checkpoint, mic_path, far_path, str(tmp_path / 'aligned_far_out.wav'),
         '--device', 'cpu', '--delay-num-filters', '5',
-        '--far-input-mode', 'raw_far',
+        '--far-input-mode', 'aligned_far',
     ]))
     assert len(constructed) == 2
     streaming_error = torch.cat(pushed[0], dim=-1)
@@ -409,10 +400,11 @@ def test_inference_raw_far_keeps_pbfdkf_error_but_feeds_original_far(
         contract=contract.as_dict(), delay_num_filters=5,
     )
     expected_error, _ = engine(mic_t, far_t, GRID.sample_rate)
+    aligned_far = engine.get_aligned_far()
 
     assert engine.delay_num_filters == 5
     assert torch.equal(streaming_error, expected_error)
-    assert torch.equal(streaming_far, raw_far)
+    assert torch.equal(streaming_far, aligned_far)
     # The fixture acquires a non-zero delay. Prove this test distinguishes
     # raw far from the aligned PBFDKF tap instead of passing vacuously.
-    assert not torch.equal(streaming_far, engine.get_aligned_far())
+    assert not torch.equal(streaming_far, raw_far)

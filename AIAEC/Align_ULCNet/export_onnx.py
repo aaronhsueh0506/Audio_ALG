@@ -56,9 +56,9 @@ beside the artifact)::
 ``--primary-dir`` and ``--far-dir`` must contain matching relative WAV
 paths; differently-tokened names (mic_001.wav vs lpb_001.wav) pair via an
 explicit ``--pair-replace mic:lpb`` rule.
-Calibration intentionally uses raw far-end audio; deployment supplies aligned
-far-end audio (the graph's ``far`` input is the AEC aligned-far seam on the
-board -- raw far before acquisition, aligned far afterward).  The calibration and ONNX commands must use the same
+Calibration and deployment both use raw far-end audio. The linear AEC aligns
+its private copy only to form ``linear_error``; the graph's TA block aligns
+raw far against that error. The calibration and ONNX commands must use the same
 ``--max-delay-frames`` value.  NPZ output writes a sibling JSON contract;
 binary output writes ``manifest.json`` inside its output directory.
 
@@ -145,13 +145,14 @@ from onnx_streaming_contract import validate_nctf_no_temporal_padding
 
 from AIAEC.Align_ULCNet.inference import load_model
 from AIAEC.training_common import (
+    DEPLOYED_FAR_INPUT_MODE,
     checkpoint_far_input_mode,
     far_input_mode_c_value,
 )
 
 
-# Version history. Version 3 fixed production wiring to aligned far while
-# retaining the checkpoint's original far-input provenance separately;
+# Version history. Version 3 introduced an explicit deployed-far descriptor
+# while retaining the checkpoint's training provenance separately;
 # version 4 renamed the tensors (error/far inputs, output head, h_gru0/h_gru1
 # hiddens, *_out states) -- runtimes bind by name; version 5 moved the fixed
 # front/back ends (signed-power compression, magnitudes, phase cos/sin,
@@ -786,7 +787,13 @@ def _write_metadata(
 ) -> Dict:
     layout = resolve_layout(layout)
     training_far_input_mode = checkpoint_far_input_mode(contract)
-    deployed_far_input_mode = 'aligned_far'
+    deployed_far_input_mode = DEPLOYED_FAR_INPUT_MODE
+    if training_far_input_mode != deployed_far_input_mode:
+        raise ValueError(
+            'checkpoint/deployment far-input mismatch: training used '
+            f'{training_far_input_mode!r}, deployment requires '
+            f'{deployed_far_input_mode!r}'
+        )
     metadata = {
         'model_family': 'Align_ULCNet',
         'boundary': 'stateless_one_frame_delta_state',
@@ -806,7 +813,7 @@ def _write_metadata(
         'training_far_input_mode': training_far_input_mode,
         'far_input_mode': deployed_far_input_mode,
         # Fixed production contract. Raw/aligned comparison remains available
-        # only in sweep_delay_depth.py.
+        # only in sweep_delay_depth.py; export refuses a training mismatch.
         'far_input_mode_c_value': far_input_mode_c_value(
             deployed_far_input_mode
         ),

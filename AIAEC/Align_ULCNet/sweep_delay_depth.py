@@ -554,7 +554,7 @@ def build_parser() -> argparse.ArgumentParser:
              'the checkpoint training provenance; aligned_far reproduces '
              'the fixed production seam and taps the far hop actually '
              'consumed by PBFDKF. This switch exists only in the sweep tool; '
-             'the production exporter and C pipelines always use aligned_far. '
+             'the production exporter and C pipelines always use raw_far. '
              'Both modes write aec_alignment.csv; '
              'with --input-is-linear-error, the supplied far WAV is assumed '
              'to be already aligned and no AEC delay trace is available.',
@@ -674,7 +674,7 @@ def main(args: argparse.Namespace) -> None:
         if args.far_input_mode == 'aligned_far':
             print("aligned_far evaluation: treating the supplied far WAV as "
                   "already aligned (no PBFDKF tap is available in bypass mode)")
-            print("NOTE: production uses aligned_far; this bypass cannot "
+            print("NOTE: production uses raw_far; this bypass cannot "
                   "verify the supplied WAV's alignment")
         if args.max_seconds is not None:
             limit = min(

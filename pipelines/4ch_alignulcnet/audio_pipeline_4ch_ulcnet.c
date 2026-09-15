@@ -9,8 +9,8 @@
  *        already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis
  *        frame of the current hop that the Align-ULCNet chain would
  *        compute, so there is no reconstruction and no re-analysis between
- *     -> far branch: the same hop's far source (the shared AEC seam's
- *        pre.aligned_ref) through ulcnet_analysis_push_frame -- the same
+ *     -> far branch: the caller's raw far from the same hop through
+ *        ulcnet_analysis_push_frame -- the same
  *        one-frame-per-hop framing -- so both branches carry the SAME
  *        input hop with no delay buffer
  *     -> UlcnetModel callback, exactly once per hop from hop #0 (skipped
@@ -283,7 +283,8 @@ static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
      * v5: the self-resident UlcnetModel copy grew io_descriptor (the
      * published model-I/O contract), so the control block is bigger even
      * though the carve ORDER is unchanged. v6 removes the obsolete runtime
-     * far-mode field and fixes production to aligned far. The existing
+     * far-mode field and fixed production to aligned far at that revision.
+     * The current signal contract is raw far (a behavior-only change). The existing
      * last_delay/frame_index fields also identify FIXED's first transition
      * from ring-fill raw far to aligned far. v7 adds the identity-reprime
      * counter. v17: the GSC spectrum feeds the model directly -- the beam
@@ -730,7 +731,7 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
      * -- the core's lanes analyse with the same sqrt-Hann window at the same
      * 50% overlap, one frame per hop from hop #0, and the beamformer only
      * weights bins -- so it is handed over as-is. Far branch: the same hop's
-     * far source through the same one-frame-per-hop framing. Both branches
+     * raw far source through the same one-frame-per-hop framing. Both branches
      * therefore carry input hop t at pipeline hop t, with no reconstruction,
      * no re-analysis and no delay buffer in between. */
     for (k = 0; k < ULCNET_BINS; ++k) {
@@ -738,7 +739,7 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
         p->err_im[k] = p->gsc_spectrum[k].i;
     }
     (void)ulcnet_analysis_push_frame(
-        &p->far_analysis, pre.aligned_ref, p->far_re, p->far_im);
+        &p->far_analysis, far_reference, p->far_re, p->far_im);
 
     /* All PreFrame pointers consumed -- release the core's pending frame
      * (no process_post() variant ever runs in this pipeline). */

@@ -326,21 +326,20 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
         {'far_input_mode': 'raw_far'}, inputs, outputs,
     )
     assert metadata['training_far_input_mode'] == 'raw_far'
-    assert metadata['far_input_mode'] == 'aligned_far'
+    assert metadata['far_input_mode'] == 'raw_far'
     assert metadata['far_input_mode_c_value'] == FAR_INPUT_MODE_C_VALUES[
-        'aligned_far'
+        'raw_far'
     ]
     assert metadata['state_layout_version'] == STATE_LAYOUT_VERSION
 
-    # Legacy checkpoints retain raw-far provenance while deployment remains
-    # fixed to aligned far.
+    # Legacy checkpoints retain the same raw-far training/deployment contract.
     legacy = _write_metadata(
         str(tmp_path / 'legacy.onnx'), str(checkpoint), model, {},
         inputs, outputs,
     )
     assert legacy['training_far_input_mode'] == 'raw_far'
-    assert legacy['far_input_mode'] == 'aligned_far'
-    assert legacy['far_input_mode_c_value'] == 1
+    assert legacy['far_input_mode'] == 'raw_far'
+    assert legacy['far_input_mode_c_value'] == 0
 
 
 def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():

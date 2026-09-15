@@ -149,10 +149,10 @@ def test_precision_policy_names_are_real_graph_inputs():
     assert policy['state_align_score_sum'] == 'float32_no_ptq'
 
 
-def test_align_ulcnet_calibration_provenance_is_not_deployment_mode():
+def test_align_ulcnet_calibration_provenance_matches_deployment_mode():
     assert 'Align_ULCNet' in CALIBRATION_MODEL_NAMES
     assert far_mode_provenance('Align_ULCNet') == (
-        'raw_far', 'aligned_far'
+        'raw_far', 'raw_far'
     )
     assert far_mode_provenance('DeepVQE_S') == (
         'model_native_far', 'model_native_far'
@@ -218,9 +218,9 @@ def test_calibration_deployment_mode_equals_the_ulcnet_exporter_literal():
     exported = metadata['far_input_mode']
     assert exported == DEPLOYED_FAR_INPUT_MODE
     assert far_mode_provenance('Align_ULCNet')[1] == exported
-    # And the calibration side must NOT claim the deployment mode describes
-    # the recorded data.
-    assert far_mode_provenance('Align_ULCNet')[0] != exported
+    # Calibration and deployment both exercise the raw-far seam the checkpoint
+    # was trained on; retaining both fields still catches future drift.
+    assert far_mode_provenance('Align_ULCNet')[0] == exported
 
 
 @pytest.mark.parametrize('name,factory', (

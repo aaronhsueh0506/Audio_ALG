@@ -61,8 +61,8 @@
  *      mid-stream delay change and after the FIXED fill completion, infer
  *      frozen for exactly those frames and resuming right after, one
  *      model->reset per generation.
- *  11. fixed deployment contract: an aligned-far descriptor is accepted and
- *      a raw-far descriptor is rejected; no runtime mode setter exists.
+ *  11. fixed deployment contract: a raw-far descriptor is accepted and an
+ *      aligned-far descriptor is rejected; no runtime mode setter exists.
  */
 
 #include "audio_pipeline_4ch_ulcnet.h"
@@ -1222,12 +1222,12 @@ static int test_pool_and_descriptor_gate(void) {
 }
 
 /* ============================================================================
- * 5. Far-timestamp before acquisition: the model's far branch must
+ * 5. Far-timestamp after fixed-delay acquisition: the model's far branch must
  *    carry the SAME input hop as its error branch. Far-passthrough model,
  *    silence on all mics, a single unit impulse in far at sample T. The
  *    expected output position is derived, not measured:
- *      + 0    applied delay (silent mics -> the shared delay never
- *             acquires; pre.aligned_ref therefore carries raw far)
+ *      + 0    model far delay: production feeds caller raw far even after
+ *             the AEC's FIXED delay has become solid
  *      + 0    the far branch is framed from the CURRENT hop, like the
  *             error branch (no compensation buffer on either side)
  *      + hop  the ULCNet synthesis (hop #p output = chain input hop p-1)
@@ -1333,7 +1333,7 @@ static int run_impulse(const AudioPipeline4ChConfig* cfg,
     return 1;
 }
 
-static int test_far_timestamp_before_acquisition(void) {
+static int test_raw_far_timestamp_after_fixed_delay_lock(void) {
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     UlcnetModel model;
     ImpulseRun r;
@@ -1342,12 +1342,14 @@ static int test_far_timestamp_before_acquisition(void) {
     cfg.gsc_fixed_doa_rad = 0.4f;
     cfg.gsc_mu = 0.02f;
     cfg.core.enable_cng = 0;
+    cfg.core.delay_mode = AEC_DELAY_FIXED;
+    cfg.core.fixed_delay_samples = 2 * ULCNET_HOP;
     memset(&model, 0, sizeof(model));
     model.infer = passthrough_far_infer;
     model.io_descriptor = test_io_descriptor();
 
     CHECK(run_impulse(&cfg, &model, 0, 0, &r), "far-timestamp run");
-    printf("far timestamp (4ch before acquisition): impulse at far[%d] -> out[%d] "
+    printf("raw-far timestamp (4ch after fixed-delay lock): impulse at far[%d] -> out[%d] "
            "(expected %d, offset %+d samples, peak %.4f)\n",
            r.imp_index, r.found_index, r.expect_index,
            r.found_index - r.expect_index, r.peak);
@@ -2305,8 +2307,8 @@ static int test_reprime_behavior(void) {
 }
 
 /* ============================================================================
- * 11. Fixed deployment contract: production accepts only the aligned-far
- * descriptor. The raw enumerator remains useful for negative ABI tests and
+ * 11. Fixed deployment contract: production accepts only the raw-far
+ * descriptor. The aligned enumerator remains useful for negative ABI tests and
  * the offline sweep, but there is no runtime far-mode setter.
  * ========================================================================== */
 static int gate_infer_identity(
@@ -2320,7 +2322,7 @@ static int gate_infer_identity(
     return 0;
 }
 
-static int test_aligned_descriptor_gate(void) {
+static int test_raw_descriptor_gate(void) {
     AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
     AudioPipeline4ChUlcnet* p;
     UlcnetModelIoDescriptor raw_desc;
@@ -2332,9 +2334,9 @@ static int test_aligned_descriptor_gate(void) {
     CHECK(ulcnet_model_io_descriptor_default(8, &raw_desc) == 0 &&
           ulcnet_model_io_descriptor_default(8, &aligned_desc) == 0,
           "build model-I/O descriptors");
-    raw_desc.far_input_mode = ULCNET_FAR_RAW;
-    CHECK(aligned_desc.far_input_mode == ULCNET_FAR_ALIGNED,
-          "descriptor_default publishes fixed aligned far");
+    aligned_desc.far_input_mode = ULCNET_FAR_ALIGNED;
+    CHECK(raw_desc.far_input_mode == ULCNET_FAR_RAW,
+          "descriptor_default publishes fixed raw far");
 
     memset(&undescribed_model, 0, sizeof(undescribed_model));
     undescribed_model.infer = gate_infer_identity;
@@ -2356,11 +2358,11 @@ static int test_aligned_descriptor_gate(void) {
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &undescribed_model) == 0,
           "a model with io_descriptor == NULL remains supported");
 
-    /* Production accepts only an aligned-far descriptor. */
-    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &raw_model) != 0,
-          "raw descriptor is rejected");
-    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &aligned_model) == 0,
-          "aligned descriptor is accepted");
+    /* Production accepts only a raw-far descriptor. */
+    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &aligned_model) != 0,
+          "aligned descriptor is rejected");
+    CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &raw_model) == 0,
+          "raw descriptor is accepted");
 
     audio_pipeline_4ch_ulcnet_destroy(p);
     return 1;
@@ -2459,8 +2461,8 @@ static int run_all_tests(void) {
           "core PreFrame aligned_ref + abandon protocol");
     CHECK(test_pool_and_descriptor_gate(),
           "pool rejection / descriptor gate / destroy idempotence");
-    CHECK(test_far_timestamp_before_acquisition(),
-          "far timestamp: err/far frame pairs are same-hop before acquisition");
+    CHECK(test_raw_far_timestamp_after_fixed_delay_lock(),
+          "far timestamp: model receives raw far after AEC alignment");
     CHECK(test_error_timestamp_and_content(),
           "error timestamp: the mic impulse lands at +1 hop, as an impulse");
     CHECK(test_model_applies_unlocked(),
@@ -2477,8 +2479,8 @@ static int run_all_tests(void) {
           "identity-reprime length derived from the straddling frames");
     CHECK(test_reprime_behavior(),
           "identity reprime: exactly REPRIME identity frames per generation");
-    CHECK(test_aligned_descriptor_gate(),
-          "production accepts only aligned-far descriptors");
+    CHECK(test_raw_descriptor_gate(),
+          "production accepts only raw-far descriptors");
     printf("All audio_pipeline_4ch_ulcnet tests passed\n");
     return 1;
 }

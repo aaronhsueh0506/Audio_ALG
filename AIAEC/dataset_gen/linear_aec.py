@@ -524,6 +524,22 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
     # history (the revision that admitted it); it may never be retargeted.
 }
 
+# One released 16-kHz Align-ULCNet checkpoint was trained with this frontend
+# immediately before the causal-half TD-constraint correction. That correction
+# moves ``linear_error`` and therefore MUST NOT enter the byte-equivalent table
+# above or make an old corpus packable. Product inference nevertheless needs a
+# deliberate transition window for the released weights. The separate gate
+# below accepts this exact one-way pair only in LinearAecEngine, emits a warning
+# that output can differ, and is never called by materialization or packing.
+RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY: Dict[str, str] = {
+    "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786":
+        "17f17abb3789be4459dcf2eb94f080284e47408a2b81587865044132cc31d65a",
+}
+_RELEASED_INFERENCE_SAMPLE_RATES: Dict[str, frozenset] = {
+    "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786":
+        frozenset({16000}),
+}
+
 # A migration pair can be frontend-equivalent at one sample rate and
 # intentionally different at another. Never infer this from the hash alone:
 # the FilterAnalyzer correction above is a no-op at 16 kHz but changes the live
@@ -638,6 +654,11 @@ RETIRED_BEHAVIOR_HASHES = frozenset({
     # evidence clearing; both move `linear_error`.
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061",
     "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45",
+    # The frontend immediately before the causal-half TD-constraint window.
+    # Its corpus is retired because the corrected window moves linear_error.
+    # A released 16-kHz checkpoint has a separate inference-only exception;
+    # this entry intentionally keeps materialization/packing strict.
+    "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786",
 })
 
 
@@ -707,6 +728,41 @@ def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> N
         for key in differing
     ]
     raise ValueError(f"{context} linear_aec contract mismatch: " + "; ".join(mismatches))
+
+
+def require_inference_linear_aec_contract(
+        actual: Dict, expected: Dict, context: str) -> None:
+    """Inference-only compatibility for an explicitly released checkpoint.
+
+    Unlike :func:`require_linear_aec_contract`, this may admit a known
+    output-changing frontend transition. It is intentionally used only by the
+    live ``LinearAecEngine``; dataset generation, packing, rematerialization and
+    training retain the strict gate above and continue to reject the old hash.
+    """
+    got = LinearAecContract.from_dict(actual)
+    want = LinearAecContract.from_dict(expected)
+    got_dict = got.compatibility_dict()
+    want_dict = want.compatibility_dict()
+    differing = [key for key in want_dict if got_dict[key] != want_dict[key]]
+    recorded_hash = want_dict["aec_behavior_hash"]
+    current_hash = got_dict["aec_behavior_hash"]
+    if (differing == ["aec_behavior_hash"]
+            and RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY.get(
+                recorded_hash) == current_hash
+            and got.sample_rate in _RELEASED_INFERENCE_SAMPLE_RATES.get(
+                recorded_hash, frozenset())):
+        warnings.warn(
+            f"{context} is loading a released {got.sample_rate}-Hz checkpoint "
+            f"trained with AEC behaviour {recorded_hash} on this build "
+            f"({current_hash}). This inference-only exception is not "
+            "frontend-equivalent: linear_error and model output may differ. "
+            "Old dataset material remains rejected and must be regenerated "
+            "before training a new checkpoint.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    require_linear_aec_contract(actual, expected, context)
 
 
 class LinearAecProcessor:
@@ -850,6 +906,7 @@ def materialize_linear_error(
 
 __all__ = [
     "ACCEPTED_BEHAVIOR_HASH_MIGRATIONS",
+    "RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY",
     "MIGRATED_SOURCE_PROVENANCE",
     "RETIRED_BEHAVIOR_HASHES",
     "BEHAVIOR_HASH_SCHEMA",
@@ -868,4 +925,5 @@ __all__ = [
     "materialize_linear_error",
     "migrated_ledger_fingerprints",
     "require_linear_aec_contract",
+    "require_inference_linear_aec_contract",
 ]

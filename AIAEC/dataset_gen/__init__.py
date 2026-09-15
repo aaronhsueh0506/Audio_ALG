@@ -47,6 +47,7 @@ from .aec_features import (
 )
 from .linear_aec import (
     ACCEPTED_BEHAVIOR_HASH_MIGRATIONS,
+    RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY,
     LINEAR_AEC_CONTRACT_VERSION,
     LinearAecContract,
     LinearAecProcessor,
@@ -54,6 +55,7 @@ from .linear_aec import (
     make_linear_aec_config,
     make_linear_aec_contract,
     materialize_linear_error,
+    require_inference_linear_aec_contract,
     require_linear_aec_contract,
 )
 from .manifest import (
@@ -79,6 +81,7 @@ from .model_views import (
 __all__ = [
     'ACOUSTIC_TAILS',
     'ACCEPTED_BEHAVIOR_HASH_MIGRATIONS',
+    'RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY',
     'ALL_SPLIT_NAMES',
     'BASE_STEM_ORDER',
     'PACKED_STEM_ORDER',
@@ -128,6 +131,7 @@ __all__ = [
     'pools_for_split',
     'save_manifest',
     'require_linear_aec_contract',
+    'require_inference_linear_aec_contract',
     'sqrt_hann_window',
     'stft',
 ]

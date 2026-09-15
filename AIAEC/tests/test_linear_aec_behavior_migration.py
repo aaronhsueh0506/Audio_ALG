@@ -24,8 +24,10 @@ from AIAEC.dataset_gen.aec_behavior_hash import aec_python_behavior_hash
 from AIAEC.dataset_gen.linear_aec import (
     ACCEPTED_BEHAVIOR_HASH_MIGRATIONS,
     BEHAVIOR_HASH_SCHEMA,
+    RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY,
     RETIRED_BEHAVIOR_HASHES,
     make_linear_aec_contract,
+    require_inference_linear_aec_contract,
     require_linear_aec_contract,
 )
 
@@ -47,8 +49,10 @@ CORPUS_HASH = (
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061")
 LAST_MIGRATED_TO_HASH = (
     "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45")
+RELEASED_CHECKPOINT_HASH = (
+    "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786")
 REFUSED_HASHES = (DEPLOYED_OLD_HASH, EARLIER_MIGRATED_HASH, CORPUS_HASH,
-                  LAST_MIGRATED_TO_HASH)
+                  LAST_MIGRATED_TO_HASH, RELEASED_CHECKPOINT_HASH)
 
 
 def _contract_recorded_as(hash_value):
@@ -77,6 +81,40 @@ def test_no_retired_identity_migrates_to_anything():
     assert not (set(RETIRED_BEHAVIOR_HASHES)
                 & set(ACCEPTED_BEHAVIOR_HASH_MIGRATIONS.values()))
     assert aec_python_behavior_hash() not in RETIRED_BEHAVIOR_HASHES
+
+
+def test_released_checkpoint_exception_is_separate_and_targets_this_build():
+    assert RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY == {
+        RELEASED_CHECKPOINT_HASH: aec_python_behavior_hash(),
+    }
+    assert RELEASED_CHECKPOINT_HASH in RETIRED_BEHAVIOR_HASHES
+    assert RELEASED_CHECKPOINT_HASH not in ACCEPTED_BEHAVIOR_HASH_MIGRATIONS
+
+
+def test_released_checkpoint_exception_is_inference_only_and_warns():
+    current = make_linear_aec_contract(16000, preset="balanced").as_dict()
+    recorded = _contract_recorded_as(RELEASED_CHECKPOINT_HASH)
+    with pytest.warns(RuntimeWarning, match="inference-only.*may differ"):
+        require_inference_linear_aec_contract(
+            current, recorded, context="released checkpoint")
+    with pytest.raises(ValueError, match="rematerialize_linear_aec"):
+        require_linear_aec_contract(
+            current, recorded, context="dataset materialization")
+
+
+def test_released_checkpoint_exception_is_16khz_and_one_way():
+    current_48k = make_linear_aec_contract(
+        48000, preset="balanced", frame_size=1024).as_dict()
+    recorded_48k = dict(current_48k, aec_behavior_hash=RELEASED_CHECKPOINT_HASH)
+    with pytest.raises(ValueError):
+        require_inference_linear_aec_contract(
+            current_48k, recorded_48k, context="48-kHz checkpoint")
+
+    current = make_linear_aec_contract(16000, preset="balanced").as_dict()
+    older_build = dict(current, aec_behavior_hash=RELEASED_CHECKPOINT_HASH)
+    with pytest.raises(ValueError):
+        require_inference_linear_aec_contract(
+            older_build, current, context="reverse direction")
 
 
 def test_an_unlisted_identity_is_still_refused():

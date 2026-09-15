@@ -177,6 +177,24 @@ trainers reset GRU state for each shuffled 10-second chunk.
 long delay + quiet far + strong echo. The three acoustic tails are also drawn
 independently, so the corpus still contains short-delay strong-echo and
 long-delay ordinary-level examples rather than learning one artificial bundle.
+
+`[activity] p_far_then_near` covers a different failure: an ordinary echo path
+adapts for several seconds before the near talker first appears. When selected,
+chunk zero contains 0.5--4 s of far-only context, followed by near speech
+through the end of that same training chunk. This spans both a relatively cold
+and a mature linear-AEC state without treating one long script as the target.
+Three equally sampled variants keep far continuously active, stop it 50--300 ms
+before near onset, or restart it 0.5--1.5 s after near onset. The stopped modes
+retain the complete 0.5--4 s active far pre-roll before that random turn-taking
+gap, so they do not trade away AEC adaptation time. The continuous mode is
+rendered as one schedule across near onset, avoiding an artificial speech-file
+fade at the event. This curriculum is independent of
+nonlinear/clipping stress and is recorded as `far_then_near_mode`,
+`far_stop_sample`, `near_onset_sample`/`near_onset_sec`, and
+`far_restart_sample`. It does not
+overwrite a forced DT edge or a first-chunk path-motion event, whose own
+guarantees would otherwise be lost.
+
 `far_active_no_echo` is a hard negative: its far scheduler covers the complete
 parent sequence — as back-to-back utterances, each drawing its own file, since
 one whole-sequence run would be zero-padded to length and go silent after the
@@ -931,15 +949,20 @@ byte-equality of a dead harness is worth nothing. The rationale and the numbers
 for each admitted entry live in the comment on the entry itself; the evidence
 for retired entries stays in the history of the revision that admitted them.
 
-The one shipped entry covers the frontend the 200-hour corpus was materialized
-under. Its evidence is three complete 30 s sequences whose echo path changes
-delay mid-sequence — so each one acquires, loses and re-acquires a lock, which
-is the shared filter-restart path the same revision touches — rendered through
-`LinearAecProcessor` on both sides of the pair and compared byte for byte, with
-the run asserting `AEC.reset` is never called while materializing. The control
-splices one `engine.reset()` into the hop loop and confirms the bytes move.
-The exact scene and digests are recorded beside the table entry. Anything that
-retunes a *live* mechanism does not qualify — rematerialize instead:
+#### Released-checkpoint inference exception
+
+The 16-kHz Align-ULCNet checkpoint released immediately before the PBFDKF
+causal-half TD-constraint correction remains loadable through
+`require_inference_linear_aec_contract`. This is deliberately a different
+allowlist from `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS`: the correction changes
+`linear_error`, so inference emits a warning that model output may differ.
+Only that exact recorded/current hash pair, at 16 kHz and in the live
+`LinearAecEngine`, is accepted. Dataset packing, rematerialization, training,
+48-kHz use, reverse use and every unlisted hash still fail closed; regenerate
+the corpus before training the next checkpoint.
+
+Anything that retunes a *live* mechanism does not qualify for the
+frontend-equivalent table — rematerialize instead:
 
 ```bash
 python3 -m AIAEC.dataset_gen.rematerialize_linear_aec \

@@ -142,12 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         '--far-input-mode', choices=('raw_far', 'aligned_far'),
-        default='aligned_far',
+        default='raw_far',
         help='Far stream presented to Align-ULCNet. raw_far keeps the original '
-             'far WAV for the NN (matching checkpoint training) while PBFDKF '
+             'far WAV for the NN (matching checkpoint training and production) while PBFDKF '
              'still uses its matched-filter bank to produce linear_error; '
              'aligned_far feeds the post-delay-buffer far consumed by PBFDKF '
-             '(existing deployment behavior; default). With '
+             '(diagnostic A/B only). With '
              '--input-is-linear-error, PBFDKF is bypassed and the supplied '
              'far WAV is consumed unchanged in either mode.',
     )
@@ -166,7 +166,7 @@ def load_model(checkpoint_path: str, device: str,
     # shares this loader, so both CLIs print the mode at load time.
     print("checkpoint training far_input_mode: "
           f"{checkpoint_far_input_mode(contract)}; "
-          "deployment default: aligned_far")
+          "deployment default: raw_far")
     aec_grid = AecGrid(contract['sr'], contract['n_fft'], contract['win_len'], contract['hop_len'])
     linear_aec_contract = require_checkpoint_linear_aec(contract, aec_grid)
     model_grid = SignalGrid(aec_grid.sr, aec_grid.n_fft, aec_grid.win_len, aec_grid.hop_len)

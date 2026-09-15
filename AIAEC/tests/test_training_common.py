@@ -233,10 +233,10 @@ def test_deployed_far_mode_is_a_real_c_enumerator():
     board rejects a descriptor whose two halves disagree.
     """
     assert DEPLOYED_FAR_INPUT_MODE in FAR_INPUT_MODE_C_VALUES
-    assert far_input_mode_c_value(DEPLOYED_FAR_INPUT_MODE) == 1
-    # Deployment feeds something training never produced; if these ever
-    # coincide the whole two-field record has stopped saying anything.
-    assert DEPLOYED_FAR_INPUT_MODE not in training_common.FAR_INPUT_MODES
+    assert far_input_mode_c_value(DEPLOYED_FAR_INPUT_MODE) == 0
+    # Training and deployment must describe the same signal.  Keeping this
+    # explicit catches a later one-sided edit to either seam.
+    assert DEPLOYED_FAR_INPUT_MODE in training_common.FAR_INPUT_MODES
 
 
 def test_calibration_only_far_mode_has_no_c_value_on_purpose():
@@ -422,8 +422,8 @@ def test_linear_aec_engine_honours_deployment_filter_bank_override():
 def test_linear_aec_engine_aligned_far_is_the_shifted_far():
     """The aligned-far tap must BE the shifted far, not merely self-consistent.
 
-    Both inference CLIs feed this tap to the model as the far branch, so what
-    it contains is a contract, not an internal detail. The scene has a known
+    Diagnostic aligned-far evaluation consumes this tap, so what it contains
+    is a contract, not an internal detail. The scene has a known
     bulk delay; the applied alignment is read from the engine's public stats
     seam and the expected content is then built INDEPENDENTLY here by shifting
     the caller's own far by that many samples -- nothing is compared against
@@ -504,6 +504,16 @@ def test_inference_rejects_a_different_linear_aec_build():
     contract = make_linear_aec_contract(16000, frame_size=512).as_dict()
     contract['aec_behavior_hash'] = '0' * 64
     with pytest.raises(ValueError, match='aec_behavior_hash'):
+        LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
+
+
+def test_inference_loads_the_released_pre_constraint_checkpoint_with_warning():
+    """The product exception is wired into the real inference engine only."""
+    contract = make_linear_aec_contract(16000, frame_size=512).as_dict()
+    contract['aec_behavior_hash'] = (
+        'c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786'
+    )
+    with pytest.warns(RuntimeWarning, match='inference-only.*may differ'):
         LinearAecEngine(n_lanes=1, sample_rate=16000, contract=contract)
 
 

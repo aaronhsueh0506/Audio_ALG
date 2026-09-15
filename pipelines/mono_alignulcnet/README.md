@@ -15,13 +15,12 @@ production board code loads the descriptor exported with its graph. Changing
 D means exporting another graph/descriptor and rebuilding its state pool, but
 does not require retraining the weights.
 
-The production far branch is fixed: it always consumes
-`AecLinearContext.aligned_far_hop`, the same hop PBFDKF consumed. Before the
-matched delay is acquired, this seam contains raw far and the model still
-runs; D handles the remaining offset. After acquisition it contains aligned
-far. The model state is reset at that boundary, including FIXED mode's first
-usable ring output. The C-side STFT keeps running across it, so the frames
-still straddling the switch emit the identity WITHOUT stepping the model:
+The production far branch is fixed: it always consumes the caller's raw
+reference, matching training and the paper. PBFDKF uses its aligned copy only
+to form the linear error; the model's TA block aligns raw far to that error.
+The model state is reset when the AEC delay regime changes, including FIXED
+mode's first usable error. The C-side STFT keeps running across it, so the
+frames still straddling the error change emit identity WITHOUT stepping the model:
 `AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES` = 1 frame here (both branches are
 pushed from the current hop), the same as the 4ch wrapper, which since
 2026-09-03 also frames both branches from the current hop. The constant is
@@ -29,8 +28,8 @@ derived and asserted by the straddle-derivation test, not estimated; option B
 (keep stepping through those frames) is deferred pending an audio A/B.
 
 Raw/aligned selection exists only in `sweep_delay_depth.py`, not in this
-runtime API. Export metadata records the checkpoint's raw-far training
-provenance separately from the aligned-far deployment contract.
+runtime API. Export metadata requires the checkpoint and deployment contracts
+to both be raw far.
 
 ## Delay profile
 

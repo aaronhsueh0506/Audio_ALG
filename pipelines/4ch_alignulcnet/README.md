@@ -9,15 +9,11 @@ The model accelerator is intentionally left as the TODO in
 `run_accelerator()`. CPU memory owns every K/V, logit and GRU state tensor.
 The default callback failure demonstrates the production fail-open path.
 
-The production far branch is fixed to the shared AEC seam's
-`pre.aligned_ref`, the same reference consumed by all four PBFDKF lanes.
-On every hop the shared ring cannot yet serve the applied offset — before
-acquisition under MATCHED, and for the whole ring-fill window under FIXED —
-this seam carries the raw far hop, so the model still runs on real reference
-audio; D handles the remaining offset. From the first hop the ring can serve
-it, the seam carries the aligned far. The switch is whole-hop and coincides
-with `pre.delay.solid`.
-At that boundary — including FIXED mode's first usable ring output — the
+The production far branch is fixed to the caller's raw reference, matching
+training and the paper. The shared AEC ring supplies aligned far only to the
+four PBFDKF lanes that form the linear-error spectra; the model's TA block
+aligns the raw far to the beamformed error.
+At an AEC delay-regime boundary — including FIXED mode's first usable error — the
 wrapper does two things and nothing else: it calls `model->reset` (so the
 runtime flushes its far attention ring and logit history) and it arms the
 identity reprime. No buffer is cleared; every C-side framing state keeps
@@ -70,8 +66,8 @@ path feeds the model the un-projected spectrum; no listening A/B has been
 done.
 
 Raw/aligned selection exists only in `sweep_delay_depth.py`, not in this
-runtime API. Export metadata keeps the checkpoint's raw-far training
-provenance separate from the aligned-far deployment contract.
+runtime API. Export metadata requires the checkpoint and deployment contracts
+to both be raw far.
 
 ## Delay profile
 

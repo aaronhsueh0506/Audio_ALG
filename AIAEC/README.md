@@ -72,7 +72,7 @@ zero-padded, but a start-time offset is not estimated here.
 
 Align-ULCNet also accepts --input-is-linear-error for evaluating a precomputed
 linear-AEC residual. Normal inference advances the checkpoint-matched PBFDKF
-one hop at a time and feeds its formed error plus consumed aligned far to the
+one hop at a time and feeds its formed error plus the original raw far to the
 model; PBFDKF is not precomputed over the whole WAV.
 
 ## Training contract
@@ -185,8 +185,8 @@ The same D must be used for the ONNX graph, calibration artifact and CPU state
 allocation. D changes state shapes, not learned weight shapes.
 
 Align-ULCNet calibration uses the available training-domain
-linear_error + raw_far WAV pair. Its report separately records that board
-deployment supplies aligned_far.
+linear_error + raw_far WAV pair. Board deployment supplies the same raw_far;
+the report records both fields so a mismatch is detectable.
 
 ## C pre/post-processing
 

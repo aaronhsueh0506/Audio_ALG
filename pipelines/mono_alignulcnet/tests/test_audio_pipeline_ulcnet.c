@@ -63,8 +63,8 @@
  *      pre-fill in audio_pipeline_ulcnet.c leaks stale finite values into
  *      the unwritten bins, the partial frames get applied, and this test
  *      goes red.
- *  10. fixed deployment contract: a model publishing an aligned-far
- *      descriptor is accepted; a raw-far descriptor is rejected by
+ *  10. fixed deployment contract: a model publishing a raw-far descriptor
+ *      is accepted; an aligned-far descriptor is rejected by
  *      get_mem_requirements/init/init_ex/create. A NULL descriptor remains
  *      supported for identity and board bring-up callbacks.
  *  11. identity-reprime straddle DERIVATION: a unit impulse in the middle of
@@ -814,7 +814,7 @@ static int gate_infer_identity(void* user,
     return 0;
 }
 
-static void test_aligned_descriptor_gate(void) {
+static void test_raw_descriptor_gate(void) {
     UlcnetModelIoDescriptor raw_desc, aligned_desc;
     AudioPipelineUlcnetMemReq req;
     void* pool = NULL;
@@ -825,9 +825,9 @@ static void test_aligned_descriptor_gate(void) {
         g_failures++;
         return;
     }
-    raw_desc.far_input_mode = ULCNET_FAR_RAW;
-    CHECK(aligned_desc.far_input_mode == ULCNET_FAR_ALIGNED,
-          "descriptor_default publishes the fixed aligned-far contract");
+    aligned_desc.far_input_mode = ULCNET_FAR_ALIGNED;
+    CHECK(raw_desc.far_input_mode == ULCNET_FAR_RAW,
+          "descriptor_default publishes the fixed raw-far contract");
 
     /* An undescribed model remains valid for the identity/test boundary. */
     AudioPipelineUlcnetConfig undescribed = audio_pipeline_ulcnet_default_config(ULCNET_SR);
@@ -850,34 +850,34 @@ static void test_aligned_descriptor_gate(void) {
     }
     undescribed.model.io_descriptor = test_io_descriptor();
 
-    AudioPipelineUlcnetConfig aligned_aligned = undescribed;
-    aligned_aligned.model.io_descriptor = &aligned_desc;
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&aligned_aligned, &req) == 0,
-          "aligned descriptor is accepted");
-
     AudioPipelineUlcnetConfig raw_model = undescribed;
     raw_model.model.io_descriptor = &raw_desc;
-    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&raw_model, &req) == -1,
-          "raw-far production descriptor is rejected");
+    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&raw_model, &req) == 0,
+          "raw descriptor is accepted");
+
+    AudioPipelineUlcnetConfig aligned_model = undescribed;
+    aligned_model.model.io_descriptor = &aligned_desc;
+    CHECK(audio_pipeline_ulcnet_get_mem_requirements(&aligned_model, &req) == -1,
+          "aligned-far descriptor is rejected");
 
     /* init/init_ex/create share the gate, so the mismatch is fail-fast on
      * every construction path, not only on the sizing query. */
-    if (audio_pipeline_ulcnet_get_mem_requirements(&aligned_aligned, &req) != 0 ||
+    if (audio_pipeline_ulcnet_get_mem_requirements(&raw_model, &req) != 0 ||
         posix_memalign(&pool, 16, (size_t)req.bytes) != 0 || !pool) {
         fprintf(stderr, "FAIL: pool alloc for far-mode gate test\n");
         g_failures++;
         return;
     }
-    CHECK(audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &raw_model) == NULL,
-          "audio_pipeline_ulcnet_init rejects raw descriptor too");
-    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &raw_model, NULL) == NULL,
-          "audio_pipeline_ulcnet_init_ex rejects raw descriptor too");
-    CHECK(audio_pipeline_ulcnet_create(&raw_model) == NULL,
-          "audio_pipeline_ulcnet_create rejects raw descriptor too");
+    CHECK(audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &aligned_model) == NULL,
+          "audio_pipeline_ulcnet_init rejects aligned descriptor too");
+    CHECK(audio_pipeline_ulcnet_init_ex(pool, (size_t)req.bytes, &aligned_model, NULL) == NULL,
+          "audio_pipeline_ulcnet_init_ex rejects aligned descriptor too");
+    CHECK(audio_pipeline_ulcnet_create(&aligned_model) == NULL,
+          "audio_pipeline_ulcnet_create rejects aligned descriptor too");
 
     AudioPipelineUlcnet* p_ok =
-        audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &aligned_aligned);
-    CHECK(p_ok != NULL, "aligned descriptor initializes in the same pool");
+        audio_pipeline_ulcnet_init(pool, (size_t)req.bytes, &raw_model);
+    CHECK(p_ok != NULL, "raw descriptor initializes in the same pool");
     if (p_ok) audio_pipeline_ulcnet_destroy(p_ok);
     free(pool);
 }
@@ -1134,16 +1134,16 @@ static void test_null_model_equals_identity_model(void) {
 }
 
 /* =========================================================================
- * 6. far-timestamp before matched-delay acquisition. Far-passthrough model
+ * 6. far-timestamp after fixed-delay acquisition. Far-passthrough model
  *    (copies far_ri -> out_ri, ignores err), silence on mic, one unit
  *    impulse in far at sample index T. The mono far tap is SAME-HOP with
  *    the error tap (this hop's raw ref feeds the far analysis beside this
  *    hop's formed error -- no wrapper-side far compensation exists or is
  *    needed), and the centered ULCNet chain output lags its input by
  *    exactly one hop (hop #p carries input hop p-1). So the reconstructed
- *    impulse must land at EXACTLY T + HOP. The model runs from the first
- *    emitted frame (no delay lock ever happens on a silent mic),
- *    which is also what makes this test able to see the far branch at all.
+ *    impulse must land at EXACTLY T + HOP. FIXED delay becomes solid several
+ *    hops before the impulse, so an implementation that feeds AEC's aligned
+ *    far moves it by FIXED_DELAY and this test fails.
  * ========================================================================= */
 static int passthrough_far_infer(void* user,
                                  const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
@@ -1155,12 +1155,14 @@ static int passthrough_far_infer(void* user,
     return 0;
 }
 
-static void test_far_timestamp_before_acquisition(void) {
-    enum { N = 40, IMP_HOP = 8, IMP_OFF = 37 };
+static void test_raw_far_timestamp_after_fixed_delay_lock(void) {
+    enum { N = 40, IMP_HOP = 8, IMP_OFF = 37, FIXED_DELAY = 2 * HOP };
     const int imp_index = IMP_HOP * HOP + IMP_OFF;
     const int expect_index = imp_index + HOP;   /* same-hop far tap + 1-hop chain */
 
     AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    cfg.delay_mode = AEC_DELAY_FIXED;
+    cfg.fixed_delay_samples = FIXED_DELAY;
     cfg.model.infer = passthrough_far_infer;
     cfg.model.io_descriptor = test_io_descriptor();
     AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
@@ -1185,7 +1187,7 @@ static void test_far_timestamp_before_acquisition(void) {
     }
 
     CHECK(found_index == expect_index,
-          fmt_msg("far timestamp before acquisition: impulse at far[%d] lands at out[%d] "
+          fmt_msg("raw-far timestamp after fixed-delay lock: impulse at far[%d] lands at out[%d] "
                   "(expected %d = impulse + 1 hop; offset %+d samples)",
                   imp_index, found_index, expect_index, found_index - expect_index));
     CHECK(peak > 0.9f,
@@ -2185,8 +2187,8 @@ int main(void) {
     printf("\n=== audio_pipeline_ulcnet: NULL model == identity model ===\n");
     test_null_model_equals_identity_model();
 
-    printf("\n=== audio_pipeline_ulcnet: far timestamp before acquisition ===\n");
-    test_far_timestamp_before_acquisition();
+    printf("\n=== audio_pipeline_ulcnet: raw-far timestamp after fixed-delay lock ===\n");
+    test_raw_far_timestamp_after_fixed_delay_lock();
 
     printf("\n=== audio_pipeline_ulcnet: model applies while UNLOCKED ===\n");
     test_model_applies_unlocked();
@@ -2197,8 +2199,8 @@ int main(void) {
     printf("\n=== audio_pipeline_ulcnet: full-write contract (partial-write guard) ===\n");
     test_partial_write_guard();
 
-    printf("\n=== audio_pipeline_ulcnet: aligned-far descriptor gate ===\n");
-    test_aligned_descriptor_gate();
+    printf("\n=== audio_pipeline_ulcnet: raw-far descriptor gate ===\n");
+    test_raw_descriptor_gate();
 
     printf("\n=== audio_pipeline_ulcnet: known-delay profile (acquisition/coverage/mislock/cost) ===\n");
     test_known_delay_profile();

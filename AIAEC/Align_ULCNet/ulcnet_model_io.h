@@ -21,8 +21,8 @@
 extern "C" {
 #endif
 
-/* Version 3 fixes the deployed far branch to AEC-aligned far.  The exported
- * metadata separately records the checkpoint's training provenance.  Kept
+/* Version 3 introduced an explicit deployed-far field.  The exported
+ * metadata separately records the checkpoint's training provenance. Kept
  * numerically equal to export_onnx.py's STATE_LAYOUT_VERSION. */
 /* Version 4 renamed the tensors and their mirrored fields (error/far
  * inputs, output head, h_gru0/h_gru1 hiddens, *_out states); runtimes
@@ -111,7 +111,7 @@ static inline float ulcnet_model_io_signed_pow(float value, float exponent) {
 }
 
 /* Stable values retained for metadata diagnostics. Production descriptors
- * validate only ULCNET_FAR_ALIGNED: raw/aligned selection belongs to the
+ * validate only ULCNET_FAR_RAW: raw/aligned selection belongs to the
  * offline sweep tool, not to the deployed pipeline API. */
 typedef enum UlcnetFarInputMode {
     ULCNET_FAR_RAW     = 0,
@@ -195,19 +195,20 @@ typedef struct UlcnetModelIoOutputs {
 typedef struct UlcnetModelIoState UlcnetModelIoState;
 
 /* Fill the compiled deployment-grid model ABI for the selected export-time D.
- * The deployed far branch is always ULCNET_FAR_ALIGNED.
+ * The deployed far branch is always ULCNET_FAR_RAW, matching training and the
+ * model's own time-alignment attention input.
  * Returns 0 on success, -1 for an unsupported D or NULL output. */
 int ulcnet_model_io_descriptor_default(int delay_depth,
                                        UlcnetModelIoDescriptor *descriptor);
 
 /* Validate a descriptor loaded from ONNX/JSON metadata against this C ABI.
- * far_input_mode must be ULCNET_FAR_ALIGNED. */
+ * far_input_mode must be ULCNET_FAR_RAW. */
 int ulcnet_model_io_descriptor_validate(
     const UlcnetModelIoDescriptor *descriptor);
 
 /* Stable name of a far-input mode, identical to the exporter's metadata
  * string: "raw_far", "aligned_far", or "unknown" for any other value.
- * Deployment accepts only ULCNET_FAR_ALIGNED, so what this is for is telling
+ * Deployment accepts only ULCNET_FAR_RAW, so what this is for is telling
  * an integrator WHY a descriptor was rejected -- naming the mode the
  * checkpoint's metadata actually carried, including a value outside the
  * enum. The returned pointer is a string literal with static lifetime, so a

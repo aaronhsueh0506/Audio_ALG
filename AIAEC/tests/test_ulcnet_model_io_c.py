@@ -109,12 +109,12 @@ int main(void) {
     ++invalid.ta_bins;
     CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
 
-    /* Production descriptors are fixed to aligned far. */
-    CHECK(d4.far_input_mode == ULCNET_FAR_ALIGNED);
-    CHECK(d8.far_input_mode == ULCNET_FAR_ALIGNED);
-    CHECK(d64.far_input_mode == ULCNET_FAR_ALIGNED);
+    /* Production descriptors are fixed to the raw far used for training. */
+    CHECK(d4.far_input_mode == ULCNET_FAR_RAW);
+    CHECK(d8.far_input_mode == ULCNET_FAR_RAW);
+    CHECK(d64.far_input_mode == ULCNET_FAR_RAW);
     invalid = d8;
-    invalid.far_input_mode = ULCNET_FAR_RAW;
+    invalid.far_input_mode = ULCNET_FAR_ALIGNED;
     CHECK(ulcnet_model_io_descriptor_validate(&invalid) != 0);
     /* The mode does not change the state size -- it selects which far
      * stream the caller feeds, not how much history is stored. */

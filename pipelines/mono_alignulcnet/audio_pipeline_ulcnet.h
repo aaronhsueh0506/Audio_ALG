@@ -28,12 +28,12 @@
  * hop #p (p >= 1) corresponds to input hop p-1.
  *
  * ── Far-input deployment contract ─────────────────────────────────────────
- *  The model always receives AecLinearContext.aligned_far_hop, the same far
- *  hop consumed by PBFDKF. Before acquisition the seam contains raw far;
- *  the model still runs and its D window handles the remaining offset.
- *  Raw/aligned selection is intentionally absent from this production API;
- *  it remains an offline sweep option only. A published model descriptor
- *  must carry ULCNET_FAR_ALIGNED.
+ *  The model always receives the caller's raw `ref` hop, matching training
+ *  and the paper architecture. PBFDKF still consumes its independently
+ *  aligned copy to form the error signal; the model's own TA block aligns
+ *  raw far against that error. Raw/aligned selection is intentionally absent
+ *  from this production API; aligned far remains an offline diagnostic only.
+ *  A published model descriptor must carry ULCNET_FAR_RAW.
  *
  * ── Model callback policy (first version) ────────────────────────────────
  *  - Fail-open identity: if the config's model has infer == NULL (including
@@ -76,7 +76,7 @@
  *  Derivation of the constant (MEASURED by the straddle-derivation test in
  *  tests/test_audio_pipeline_ulcnet.c, never assumed here): this wrapper
  *  pushes both branches from the CURRENT hop -- the error tap
- *  (AecResContext.formed_hop) and the aligned-far tap are same-hop, no
+ *  (AecResContext.formed_hop) and the raw-far tap are same-hop, no
  *  wrapper-side far compensation exists -- and the rolling 50%-overlap analysis
  *  frame at hop T spans the two pushed hops T-1 and T. A boundary at hop T therefore leaves
  *  exactly ONE emitted frame straddling (the frame emitted at hop T, whose
@@ -223,7 +223,7 @@ typedef struct AudioPipelineUlcnet AudioPipelineUlcnet;
  * must be 0 or ULCNET_N_FFT, aec_preset must be a defined enum value; then the derived
  * AecConfig must pass lib/aec's own aec_get_mem_size() validator. Model
  * callbacks may be NULL (an all-zero model is legal); when io_descriptor is
- * non-NULL it must match the fixed aligned-far model ABI.
+ * non-NULL it must match the fixed raw-far model ABI.
  *
  * @return 0 on success (*out filled), -1 on NULL args or invalid cfg.
  */
@@ -260,7 +260,7 @@ AudioPipelineUlcnet* audio_pipeline_ulcnet_init_ex(void* mem, size_t bytes,
 /**
  * Process exactly one hop (audio_pipeline_ulcnet_hop_size(p) == ULCNET_HOP)
  * of mic/ref into `out`: AEC(linear, context-only) -> error tap
- * (AecResContext.formed_hop) + AecLinearContext.aligned_far_hop -> two
+ * (AecResContext.formed_hop) + caller raw `ref` hop -> two
  * centered-STFT analyses -> per emitted frame,
  * the model callback (or the fail-open identity, or the identity reprime
  * after an alignment boundary, per the policy in this header's preamble)

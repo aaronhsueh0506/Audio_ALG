@@ -48,12 +48,14 @@ from AIAEC.dataset_gen.aec_dataset import (
     ACOUSTIC_TAILS,
     ACTIVITY_LABEL_DBFS,
     DELAY_STEP_EDGE_MARGIN_SEC,
+    FAR_THEN_NEAR_MODES,
     IMPAIRMENTS,
     PATH_MOTION_MODES,
     STATIC_PATH,
     AecSequenceRenderer,
     SequencePlan,
     _chunk_scenario,
+    _apply_far_then_near_curriculum,
     _force_overlap,
     _normalised,
     check_rate_dependent_values,
@@ -167,6 +169,16 @@ def _base_cfg(root):
     cfg.set('sequence', 'seq_sec_min', '2.048')
     cfg.set('sequence', 'seq_sec_max', '3.072')
     cfg.set('sequence', 'chunk_sec', '1.024')
+    # The fast fixture's chunk is much shorter than the shipped 8/10 s grids.
+    # Keep the new curriculum disabled for unrelated tests and give its bounds
+    # a valid miniature geometry; focused tests below exercise it explicitly.
+    cfg.set('activity', 'p_far_then_near', '0')
+    cfg.set('activity', 'far_pre_roll_sec_min', '0.2')
+    cfg.set('activity', 'far_pre_roll_sec_max', '0.6')
+    cfg.set('activity', 'far_stop_lead_sec_min', '0.05')
+    cfg.set('activity', 'far_stop_lead_sec_max', '0.1')
+    cfg.set('activity', 'far_restart_gap_sec_min', '0.1')
+    cfg.set('activity', 'far_restart_gap_sec_max', '0.2')
     cfg.set('rir', 'rt60_min', '0.05')
     cfg.set('rir', 'rt60_max', '2.0')
     return cfg
@@ -1749,6 +1761,136 @@ def test_sro_produces_sub_sample_drift():
     assert torch.equal(resample_by_ratio(signal, 1.0, SR), signal)
 
 
+@pytest.mark.parametrize('mode', FAR_THEN_NEAR_MODES)
+def test_far_then_near_curriculum_covers_each_first_chunk_phase(corpus, mode):
+    """The complete adaptation/onset event must fit one shuffled chunk."""
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('activity', 'p_far_then_near', '1')
+    cfg.set('activity', 'far_pre_roll_sec_min', '4')
+    cfg.set('activity', 'far_pre_roll_sec_max', '4')
+    cfg.set('activity', 'far_stop_lead_sec_min', '0.25')
+    cfg.set('activity', 'far_stop_lead_sec_max', '0.25')
+    cfg.set('activity', 'far_restart_gap_sec_min', '1')
+    cfg.set('activity', 'far_restart_gap_sec_max', '1')
+    chunk = 10 * SR
+    onset = 4 * SR
+
+    class FixedModeRandom(random.Random):
+        def choice(self, values):
+            assert tuple(values) == FAR_THEN_NEAR_MODES
+            return mode
+
+        def expovariate(self, lambd):
+            # Stable utterance boundaries at integer multiples of the mean;
+            # in particular, none is accidentally placed at the 4 s onset.
+            return 1.0 / lambd
+
+    far, near, event = _apply_far_then_near_curriculum(
+        [(0, 2 * chunk)], [(0, 2 * chunk)],
+        n_samples=2 * chunk, chunk_samples=chunk, sr=SR,
+        rng=FixedModeRandom(7), cfg=cfg,
+    )
+
+    def coverage(runs, start, end):
+        return sum(max(0, min(hi, end) - max(lo, start))
+                   for lo, hi in runs)
+
+    assert event.mode == mode
+    expected_onset = onset if mode == 'far_continues' else onset + SR // 4
+    assert event.near_onset_sample == expected_onset
+    assert coverage(near, 0, expected_onset) == 0
+    assert coverage(near, expected_onset, chunk) == chunk - expected_onset
+    assert coverage(far, 0, onset) == onset
+    if mode == 'far_continues':
+        assert coverage(far, onset, chunk) == chunk - onset
+        assert event.far_stop_sample == -1
+        assert event.far_restart_sample == -1
+        assert all(end != onset for _start, end in far[:-1])
+    elif mode == 'far_stops':
+        assert event.far_stop_sample == onset
+        assert coverage(far, onset, chunk) == 0
+        assert event.far_restart_sample == -1
+    else:
+        restart = expected_onset + SR
+        assert event.far_stop_sample == onset
+        assert event.far_restart_sample == restart
+        assert coverage(far, onset, restart) == 0
+        assert coverage(far, restart, chunk) == chunk - restart
+
+    # Only chunk zero is scripted; the original schedule survives afterward.
+    assert coverage(far, chunk, 2 * chunk) == chunk
+    assert coverage(near, chunk, 2 * chunk) == chunk
+
+
+def test_far_then_near_curriculum_is_not_a_stress_bundle(corpus):
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('activity', 'p_far_then_near', '1')
+    far_runs = [(0, SR)]
+    near_runs = [(2 * SR, 3 * SR)]
+
+    far, near, event = _apply_far_then_near_curriculum(
+        far_runs, near_runs,
+        n_samples=10 * SR, chunk_samples=10 * SR, sr=SR,
+        rng=random.Random(9), cfg=cfg, eligible=False,
+    )
+    assert far == far_runs
+    assert near == near_runs
+    assert event.mode == 'none'
+
+
+def test_renderer_applies_far_then_near_curriculum_to_eligible_plan(corpus):
+    """The renderer gate, not only the helper, must emit the curriculum."""
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('activity', 'p_far_then_near', '1')
+    renderer = AecSequenceRenderer(
+        cfg, pools_for_split(corpus['manifest'], 'train'), corpus_seed=SEED)
+    rendered = renderer.render(SequencePlan(
+        sequence_id=1000, n_chunks=2, scenario='double_talk',
+        seed=stable_seed(SEED, 'test', 'far-then-near-renderer'),
+    ))
+
+    meta = rendered.chunk_meta[0]
+    onset = meta['near_onset_sample']
+    stop = meta['far_stop_sample']
+    restart = meta['far_restart_sample']
+    view = AecStems(rendered.stems)
+    assert meta['far_then_near_mode'] in FAR_THEN_NEAR_MODES
+    assert 0 < onset < rendered.chunk_samples
+    near_active_peak = float(
+        view.near_speech[onset:rendered.chunk_samples].abs().max())
+    assert near_active_peak > 0.0
+    assert float(view.near_speech[:onset].abs().max()) < 1e-6 * near_active_peak
+    if meta['far_then_near_mode'] == 'far_continues':
+        assert stop == restart == -1
+    else:
+        assert 0 < stop < onset
+        silence_end = (restart if restart >= 0 else rendered.chunk_samples)
+        far_peak = float(view.X[:rendered.chunk_samples].abs().max())
+        assert float(view.X[stop:silence_end].abs().max()) < 1e-6 * far_peak
+
+
+def test_far_then_near_ranges_must_leave_room_for_restart(corpus):
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('activity', 'p_far_then_near', '1')
+    cfg.set('activity', 'far_pre_roll_sec_max', '0.9')
+    cfg.set('activity', 'far_restart_gap_sec_max', '0.2')
+    with pytest.raises(ValueError, match='restart.*observable'):
+        plan_sequences(cfg, 0.001, SEED, 'train')
+
+
+def test_disabled_far_then_near_ignores_unused_geometry(corpus):
+    """A zero-probability curriculum cannot constrain unrelated chunk sizes."""
+    cfg = copy.deepcopy(corpus['cfg'])
+    cfg.set('activity', 'p_far_then_near', '0')
+    for key in (
+        'far_pre_roll_sec_min', 'far_pre_roll_sec_max',
+        'far_stop_lead_sec_min', 'far_stop_lead_sec_max',
+        'far_restart_gap_sec_min', 'far_restart_gap_sec_max',
+    ):
+        cfg.remove_option('activity', key)
+    aec_dataset_module._validate_far_then_near_curriculum(cfg, 1.024)
+
+
 def test_echo_is_really_an_echo_of_the_reference(corpus):
     """D must be a delayed, filtered copy of X -- not noise that looks busy.
 
@@ -1800,6 +1942,8 @@ def test_renderer_metadata_covers_the_declared_contract(corpus):
         'sro_ppm', 'nonlinear', 'clipped', 'scenario', 'talk_mode',
         'echo_mode', 'impairments', 'acoustic_tails', 'echo_path_change',
         'codec_mismatch',
+        'far_then_near_mode', 'near_onset_sample', 'near_onset_sec',
+        'far_stop_sample', 'far_restart_sample',
     }
     checked = 0
     for _plan, rendered in _render_plans(

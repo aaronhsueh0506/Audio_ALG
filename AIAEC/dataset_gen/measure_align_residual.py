@@ -950,6 +950,10 @@ def _synthetic_render_config(
     cfg.set("sequence", "seq_sec_min", "2.048")
     cfg.set("sequence", "seq_sec_max", "8.192")
     cfg.set("sequence", "chunk_sec", "1.024")
+    # This tool proves the residual-lag meter on short far-only scenes; the
+    # duplex far-then-near curriculum cannot apply and its shipped 4 s bounds
+    # deliberately do not fit this 1.024 s diagnostic chunk.
+    cfg.set("activity", "p_far_then_near", "0")
     cfg.set("rir", "rt60_min", "0.05")
     cfg.set("rir", "rt60_max", "2.0")
     # Clean-case pins: the true-echo bound is only claimed for scenes the

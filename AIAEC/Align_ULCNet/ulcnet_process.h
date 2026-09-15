@@ -4,8 +4,8 @@
  * 這個檔案是「網路以外的訊號路徑」。邊界與部署 NPU graph 完全一致:
  *
  *     C   : hop(ULCNET_HOP samples) -> centered sqrt-Hann STFT -> RI 頻譜 (兩路:
- *           linear_error / AEC aligned-far seam；seam 在 acquisition 前
- *           承載 raw far，production descriptor 固定 aligned_far)
+ *           linear_error / caller raw far；production descriptor 固定
+ *           raw_far，AEC 對 far 的對齊只用來產生 linear_error)
  *     網路: (error_ri, far_ri, 顯式 states) -> enhanced_ri  <-- 只有這段是學來的
  *           (壓縮/attention/GRU/解壓縮全部在 graph 內；states 由 CPU/driver
  *           context 保存，加速器本身 stateless)
@@ -60,7 +60,7 @@
  *   - NPU graph 與其顯式 states（K/V ring / logit 史 / GRU h）—
  *     加速器視為 stateless；CPU 以 ulcnet_model_io.c/.h 的 caller-owned
  *     pool 保存並每幀傳入，graph 只回傳 delta-state outputs
- *   - PBFDKF/aligned-far seam — AEC C 的 aec_get_linear_context()
+ *   - PBFDKF linear-error seam — AEC C 的 aec_get_linear_context()
  *   - delay 狀態機（flush ring / fail-open / crossfade）— pipeline 層
  * ============================================================ */
 
@@ -242,7 +242,7 @@ int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]);
  * shapes to agree about.
  *
  * What the pipelines actually check is the grid, the state-layout version,
- * the fixed aligned-far contract, and that D is inside
+ * the fixed raw-far contract, and that D is inside
  * [ULCNET_MODEL_IO_MIN_D, ULCNET_MODEL_IO_MAX_D]. They do NOT and cannot
  * check D against the graph -- no C code reads the exported ONNX metadata or
  * its sidecar. Keeping the descriptor's delay_depth equal to the depth the

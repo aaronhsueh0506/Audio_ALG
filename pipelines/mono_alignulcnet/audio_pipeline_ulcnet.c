@@ -12,10 +12,10 @@
  *      AEC aligns far internally (delay estimation stays on, preset default).
  *   2. error tap  = AecResContext.formed_hop (the refined/coarse-selected +
  *      crossfaded linear error -- the hop the AEC's own spectra describe).
- *   3. far tap + delay status = aec_get_linear_context(): the model always
- *      receives aligned_far_hop, byte-identical to the far hop consumed by
- *      the linear filter. Before acquisition this seam deliberately carries
- *      raw far, so the model's D window can handle the remaining offset.
+ *   3. far tap = the caller's raw reference.  This is the signal used during
+ *      training; the model's own TA block, not the PBFDKF delay buffer, owns
+ *      neural far/error alignment.  AecLinearContext is still read only for
+ *      the error-branch delay-transition reset policy.
  *   4. Both hops go into two UlcnetAnalysis instances driven by the rolling
  *      center=False push (exactly one frame per hop from hop #0); on that
  *      frame pair the model callback runs once; its output is
@@ -68,9 +68,10 @@
  * separately-carved pointer. Version 4 grows the self-resident config with
  * independent filter-length and AEC delay controls. Version 5 grows the
  * self-resident UlcnetModel copy by the published model-I/O descriptor
- * pointer. Version 6 removes the obsolete runtime far-mode field, fixes
- * production to the AEC aligned-far seam, and adds delay-transition
- * bookkeeping. Version 7 adds the identity-reprime counter to the control
+ * pointer. Version 6 removes the obsolete runtime far-mode field, fixed
+ * production to the AEC aligned-far seam at that revision, and added
+ * delay-transition bookkeeping. The current signal contract is raw far (a
+ * behavior-only change). Version 7 adds the identity-reprime counter to the control
  * block. Version 8: sizeof(Aec) grew (the suppressor gained its runtime
  * far-active floor retarget state), so every AEC carved out of this pool
  * moves the total and the offsets after it. Carve order and buffer set are
@@ -152,7 +153,7 @@ struct AudioPipelineUlcnet {
      * Each embeds its own per-call FFT scratch and points at the shared
      * window table below (no per-struct window copies). */
     UlcnetAnalysis  ana_err;      /* linear-error analysis                   */
-    UlcnetAnalysis  ana_far;      /* aligned-far analysis                    */
+    UlcnetAnalysis  ana_far;      /* raw-far analysis                        */
     UlcnetSynthesis synth;        /* enhanced-spectrum WOLA                  */
     float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table; all three
                                    * chain structs point at it (self-owned) */
@@ -181,7 +182,7 @@ struct AudioPipelineUlcnet {
  * aec_config_from_preset's own balanced-default fallback). The model's
  * callbacks are deliberately NOT validated -- an all-zero model is the
  * supported identity/fail-open case. A published model-I/O descriptor must
- * match the fixed aligned-far production ABI. */
+ * match the fixed raw-far production ABI. */
 static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
                                          AecConfig* aec_cfg,
                                          int* hop, int* fft_sz, int* n_freqs) {
@@ -499,16 +500,16 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
     /* Stage 4: frame BOTH branches from the CURRENT hop with the rolling
      * (center=False) analysis: exactly one frame per hop from hop #0, over
      * the last N_FFT samples of each branch, so the two analyses stay
-     * frame-locked by construction. The far branch source is always the
-     * AEC's aligned far. */
+     * frame-locked by construction. The far branch source is the raw caller
+     * reference, matching checkpoint training; PBFDKF alignment affects only
+     * the linear-error branch. */
     (void)ulcnet_analysis_push_frame(&p->ana_err, rctx.formed_hop, p->err_re, p->err_im);
-    (void)ulcnet_analysis_push_frame(&p->ana_far, lctx.aligned_far_hop,
+    (void)ulcnet_analysis_push_frame(&p->ana_far, ref,
                                      p->far_re, p->far_im);
 
     /* Stage 5: run the model once on this hop's frame pair and synthesize.
-     * The model always receives the AEC seam's best available far: raw
-     * before acquisition, aligned afterward. Its D window handles any
-     * remaining offset. A CHANGED event resets state before this hop's
+     * The model always receives raw far and its D window owns alignment.
+     * A CHANGED event resets state before this hop's
      * inference, and the frame whose analysis window still straddles that
      * boundary emits the identity WITHOUT stepping the model (it would
      * otherwise rebuild the just-cleared state from half-stale input).

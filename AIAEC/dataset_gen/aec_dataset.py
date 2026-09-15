@@ -129,6 +129,9 @@ __all__ = [
 # ``SequencePlan(scenario=...)`` callers.
 TALK_MODES = ('far_only', 'near_only', 'double_talk', 'duplex_random')
 ECHO_MODES = ('normal', 'ref_dropout', 'far_active_no_echo')
+# Explicit first-chunk phase curricula for the deployment failure where a
+# linear AEC has adapted to far-end echo before the near talker enters.
+FAR_THEN_NEAR_MODES = ('far_continues', 'far_stops', 'far_restarts')
 IMPAIRMENTS = (
     'echo_path_change',
     'slow_drift',
@@ -788,6 +791,102 @@ def _contiguous_runs(n_samples: int, sr: int, talk_sec: float,
     return runs
 
 
+def _runs_after(runs: Sequence[Tuple[int, int]], at: int
+                ) -> List[Tuple[int, int]]:
+    """Keep the part of an activity schedule at or after ``at``."""
+    return [(max(start, at), end) for start, end in runs if end > at]
+
+
+def _filled_interval(start: int, end: int, sr: int, talk_sec: float,
+                     rng: random.Random) -> List[Tuple[int, int]]:
+    """Back-to-back utterance runs covering exactly ``[start, end)``."""
+    if end <= start:
+        return []
+    return [(start + lo, start + hi)
+            for lo, hi in _contiguous_runs(end - start, sr, talk_sec, rng)]
+
+
+def _apply_far_then_near_curriculum(
+        far_runs: Sequence[Tuple[int, int]],
+        near_runs: Sequence[Tuple[int, int]], *,
+        n_samples: int, chunk_samples: int, sr: int,
+        rng: random.Random, cfg: configparser.ConfigParser,
+        eligible: bool = True,
+        ) -> Tuple[List[Tuple[int, int]], List[Tuple[int, int]],
+                   '_ActivityCurriculum']:
+    """Optionally script one adapted-far -> near-onset event in chunk zero.
+
+    Only chunk zero is replaced; the remaining parent sequence keeps its
+    ordinary independent activity schedules.  This matters because trainers
+    shuffle chunks and reset neural state at each one: putting the complete
+    pre-roll and onset in one chunk teaches the release behaviour without
+    requiring a cross-chunk state contract first.
+    """
+    p = cfg.getfloat('activity', 'p_far_then_near', fallback=0.0)
+    if not eligible or rng.random() >= p:
+        return list(far_runs), list(near_runs), _ActivityCurriculum()
+
+    first_chunk_end = min(n_samples, chunk_samples)
+    pre_roll_sec = rng.uniform(
+        cfg.getfloat('activity', 'far_pre_roll_sec_min'),
+        cfg.getfloat('activity', 'far_pre_roll_sec_max'),
+    )
+    far_pre_roll_end = max(1, int(round(pre_roll_sec * sr)))
+    mode = rng.choice(FAR_THEN_NEAR_MODES)
+    far_talk_sec = cfg.getfloat('activity', 'far_talk_sec_mean')
+    near_talk_sec = cfg.getfloat('activity', 'near_talk_sec_mean')
+
+    # Every curriculum begins with the complete configured far-only adaptation
+    # span. A stopped mode then leaves a short, random turn-taking gap before
+    # near onset; the gap is separate so it cannot shorten AEC adaptation.
+    far_stop = -1
+    if mode == 'far_continues':
+        onset = far_pre_roll_end
+        # One call is load-bearing: splitting at ``onset`` would make
+        # _render_talker fade out and in exactly when near speech begins.
+        far_prefix = _filled_interval(
+            0, first_chunk_end, sr, far_talk_sec, rng
+        )
+    else:
+        lead_sec = rng.uniform(
+            cfg.getfloat('activity', 'far_stop_lead_sec_min'),
+            cfg.getfloat('activity', 'far_stop_lead_sec_max'),
+        )
+        lead = max(1, int(round(lead_sec * sr)))
+        far_stop = far_pre_roll_end
+        onset = far_stop + lead
+        far_prefix = _filled_interval(0, far_stop, sr, far_talk_sec, rng)
+
+    # Validation leaves at least one sample after the latest possible onset.
+    onset = min(first_chunk_end - 1, onset)
+    near_prefix = _filled_interval(
+        onset, first_chunk_end, sr, near_talk_sec, rng
+    )
+    restart = -1
+    if mode == 'far_restarts':
+        gap_sec = rng.uniform(
+            cfg.getfloat('activity', 'far_restart_gap_sec_min'),
+            cfg.getfloat('activity', 'far_restart_gap_sec_max'),
+        )
+        restart = min(
+            first_chunk_end - 1, onset + max(1, int(round(gap_sec * sr)))
+        )
+        far_prefix.extend(_filled_interval(
+            restart, first_chunk_end, sr, far_talk_sec, rng
+        ))
+    elif mode not in ('far_continues', 'far_stops'):
+        raise AssertionError(f"unhandled far-then-near mode {mode!r}")
+
+    far_out = far_prefix + _runs_after(far_runs, first_chunk_end)
+    near_out = near_prefix + _runs_after(near_runs, first_chunk_end)
+    return far_out, near_out, _ActivityCurriculum(
+        mode=mode,
+        near_onset_sample=onset,
+        far_stop_sample=far_stop,
+        far_restart_sample=restart,
+    )
+
+
 # ============================================================
 # Planning
 # ============================================================
@@ -828,6 +927,16 @@ class RenderedSequence:
     # invariants against a full, un-trimmed render.
 
 
+@dataclasses.dataclass(frozen=True)
+class _ActivityCurriculum:
+    """The optional far-pre-roll/near-onset event rendered in chunk zero."""
+
+    mode: str = 'none'
+    near_onset_sample: int = -1
+    far_stop_sample: int = -1
+    far_restart_sample: int = -1
+
+
 def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
                    split: str, start_id: int = 0) -> List[SequencePlan]:
     """Resolve ``--hours`` into a fixed list of sequences."""
@@ -842,6 +951,7 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
             f"[sequence] requires 0 < chunk_sec <= seq_sec_min <= seq_sec_max, "
             f"got chunk={chunk_sec}, min={seq_min}, max={seq_max}"
         )
+    _validate_far_then_near_curriculum(cfg, chunk_sec)
 
     # A worker renders every sequence out of [echo_path] and [path_motion],
     # and a config written against an older trajectory model carries neither
@@ -1291,6 +1401,64 @@ def _validate_renderer_sections(cfg: configparser.ConfigParser) -> None:
                 f"config.example.ini")
     _require_options(cfg, required,
                      "every option the render workers read must be set")
+
+
+def _validate_far_then_near_curriculum(
+        cfg: configparser.ConfigParser, chunk_sec: float) -> None:
+    """Validate the optional first-chunk far-pre-roll curriculum.
+
+    Old copied configs that contain none of these keys retain their previous
+    behaviour. An explicit zero disables the feature completely, so its
+    otherwise-unused geometry must not invalidate a shorter diagnostic/test
+    chunk. Once the probability is positive, every shape-defining bound is
+    required so two workers cannot silently render different curricula.
+    """
+    section = 'activity'
+    probability_key = 'p_far_then_near'
+    if not cfg.has_option(section, probability_key):
+        return
+    probability = _probability(cfg, section, probability_key)
+    if probability == 0.0:
+        return
+    required = (
+        probability_key,
+        'far_pre_roll_sec_min',
+        'far_pre_roll_sec_max',
+        'far_stop_lead_sec_min',
+        'far_stop_lead_sec_max',
+        'far_restart_gap_sec_min',
+        'far_restart_gap_sec_max',
+    )
+    _require_options(
+        cfg, {section: required},
+        "the far-then-near curriculum must explicitly set every option"
+    )
+    _pre_min, pre_max = _finite_range(
+        cfg, section, 'far_pre_roll_sec_min', 'far_pre_roll_sec_max'
+    )
+    _positive(cfg, section, 'far_pre_roll_sec_min')
+    _lead_min, lead_max = _finite_range(
+        cfg, section, 'far_stop_lead_sec_min', 'far_stop_lead_sec_max'
+    )
+    _positive(cfg, section, 'far_stop_lead_sec_min')
+    _gap_min, gap_max = _finite_range(
+        cfg, section, 'far_restart_gap_sec_min',
+        'far_restart_gap_sec_max'
+    )
+    _positive(cfg, section, 'far_restart_gap_sec_min')
+    if pre_max + lead_max >= chunk_sec:
+        raise ValueError(
+            "[activity] far_pre_roll_sec_max + far_stop_lead_sec_max "
+            f"must be < [sequence] chunk_sec ({chunk_sec:g}) so near onset "
+            f"is observable, got {pre_max + lead_max:g}"
+        )
+    if pre_max + lead_max + gap_max >= chunk_sec:
+        raise ValueError(
+            "[activity] far_pre_roll_sec_max + far_stop_lead_sec_max + "
+            "far_restart_gap_sec_max "
+            f"must be < [sequence] chunk_sec ({chunk_sec:g}) so a restarted "
+            f"far end is observable, got {pre_max + lead_max + gap_max:g}"
+        )
 
 
 def _refuse_retired_path_motion_options(cfg: configparser.ConfigParser) -> None:
@@ -2011,6 +2179,9 @@ class AecSequenceRenderer:
         )
         self.chunk_samples = chunk_samples_from_config(
             cfg, self.linear_aec_contract.hop_size)
+        _validate_far_then_near_curriculum(
+            cfg, self.chunk_samples / self.sr
+        )
 
         self.snr_values = parse_snr_values(cfg.get('levels', 'snr_values'))
         # One map for the whole population: which model an id gets is a
@@ -2687,6 +2858,7 @@ class AecSequenceRenderer:
             cfg.getfloat('activity', 'near_gap_sec_mean'),
             rng,
         ) if has_near else []
+        force_edges = False
         if talk_mode == 'double_talk' and far_runs:
             # Set test first: it rejects ~98% of double_talk sequences for a
             # fraction of what parsing the config value costs.
@@ -2705,6 +2877,29 @@ class AecSequenceRenderer:
             near_runs = _force_overlap(
                 far_runs, near_runs, rng, sr, cfg, force_edges=force_edges,
                 edge_floor_extra_s=edge_floor_extra_s)
+
+        # Ordinary DT/duplex schedules almost never produce a several-second
+        # far-only adaptation span followed by a near onset. Script that one
+        # decision independently of nonlinear/clipping stress. Do not replace
+        # a forced cold/mature DT edge or a first-chunk path-motion guarantee:
+        # those are separate scarce classes whose promised event must survive.
+        far_runs, near_runs, activity_curriculum = (
+            _apply_far_then_near_curriculum(
+                far_runs, near_runs,
+                n_samples=n_samples,
+                chunk_samples=self.chunk_samples,
+                sr=sr,
+                rng=rng,
+                cfg=cfg,
+                eligible=(
+                    has_far and has_near
+                    and echo_mode == 'normal'
+                    and not force_edges
+                    and (motion.event_sample < 0
+                         or motion.event_sample >= self.chunk_samples)
+                ),
+            )
+        )
 
         far_speech, far_paths = (
             self._render_talker(far_runs, n_samples, rng,
@@ -2993,7 +3188,7 @@ class AecSequenceRenderer:
         chunk_meta = self._build_meta(
             plan, stems, device, room, erl_db, ser_db, snr_db,
             bulk_delay, delay_jitter, sro_ppm, clipped, agc, dropout_chunks,
-            noise_ids, echo_path,
+            noise_ids, echo_path, activity_curriculum,
             near_speaker=self.pools.speaker_of.get(near_paths[0], '') if near_paths else '',
             far_speaker=self.pools.far_speaker_of.get(far_paths[0], '') if far_paths else '',
         )
@@ -3017,6 +3212,7 @@ class AecSequenceRenderer:
     def _build_meta(self, plan, stems, device, room, erl_db, ser_db,
                     snr_db, bulk_delay, delay_jitter, sro_ppm, clipped, agc,
                     dropout_chunks, noise_ids, echo_path: '_EchoPathRender',
+                    activity_curriculum: _ActivityCurriculum,
                     near_speaker, far_speaker) -> List[dict]:
         # Re-derived from `plan` rather than threaded down as four more
         # positional arguments: resolve_sequence_plan is pure and O(1), and
@@ -3121,6 +3317,19 @@ class AecSequenceRenderer:
             'echo_mode': echo_mode,
             'impairments': list(impairments),
             'acoustic_tails': list(acoustic_tails),
+            # Explicit first-chunk far-pre-roll -> near-onset curriculum.
+            # 'none'/-1 keeps every chunk self-describing without pretending
+            # that an independently drawn conversational onset was scripted.
+            'far_then_near_mode': activity_curriculum.mode,
+            'near_onset_sample': int(
+                activity_curriculum.near_onset_sample),
+            'near_onset_sec': (
+                activity_curriculum.near_onset_sample / self.sr
+                if activity_curriculum.near_onset_sample >= 0 else -1.0),
+            'far_stop_sample': int(
+                activity_curriculum.far_stop_sample),
+            'far_restart_sample': int(
+                activity_curriculum.far_restart_sample),
             # Rendered, not planned: a sequence whose drawn room could not
             # supply a second position renders a path that never changes,
             # and this field has to describe the audio. Compare it with

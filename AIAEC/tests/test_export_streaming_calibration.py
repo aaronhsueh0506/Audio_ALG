@@ -128,7 +128,7 @@ def test_calibration_and_graph_agree_on_the_d_chain(ulcnet_pair):
 
 
 def test_calibration_report_records_both_far_seams(ulcnet_pair):
-    """The recorded far and the deployed far are different signals.
+    """The report records both provenance fields even when both are raw far.
 
     Asserting this on the report dict rather than on ``far_mode_provenance``
     is the point: the helper being right does not put the fields in the file
@@ -138,7 +138,7 @@ def test_calibration_report_records_both_far_seams(ulcnet_pair):
     calibration_mode, deployment_mode = far_mode_provenance('Align_ULCNet')
     assert capture_report['calibration_far_input_mode'] == calibration_mode
     assert capture_report['deployment_far_input_mode'] == deployment_mode
-    assert calibration_mode != deployment_mode
+    assert calibration_mode == deployment_mode == 'raw_far'
     # The graph stamps the seam a board wires up; the calibration set has to
     # name the same one.
     assert capture_report['deployment_far_input_mode'] == graph_report[

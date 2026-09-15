@@ -76,9 +76,9 @@ int main(void) {
         posix_memalign(&pool, alignment, bytes) != 0) {
         return 1;
     }
-    /* A raw-far or undefined deployment descriptor is rejected. */
+    /* An aligned-far or undefined deployment descriptor is rejected. */
     invalid_descriptor = descriptor;
-    invalid_descriptor.far_input_mode = ULCNET_FAR_RAW;
+    invalid_descriptor.far_input_mode = ULCNET_FAR_ALIGNED;
     if (ulcnet_accelerator_adapter_init(
             pool, bytes, &invalid_descriptor, run, &runtime) != NULL) {
         free(pool);
@@ -94,7 +94,7 @@ int main(void) {
         pool, bytes, &descriptor, run, &runtime);
     if (!adapter ||
         ulcnet_accelerator_adapter_descriptor(adapter)->far_input_mode !=
-            ULCNET_FAR_ALIGNED) {
+            ULCNET_FAR_RAW) {
         free(pool);
         return 1;
     }
@@ -104,10 +104,10 @@ int main(void) {
          * lets a pipeline reject a far branch the checkpoint was not trained
          * on. */
         model.io_descriptor != ulcnet_accelerator_adapter_descriptor(adapter) ||
-        model.io_descriptor->far_input_mode != ULCNET_FAR_ALIGNED ||
+        model.io_descriptor->far_input_mode != ULCNET_FAR_RAW ||
         model.io_descriptor->delay_depth != 8 ||
         strcmp(ulcnet_far_input_mode_name(
-                   model.io_descriptor->far_input_mode), "aligned_far") != 0) {
+                   model.io_descriptor->far_input_mode), "raw_far") != 0) {
         free(pool);
         return 1;
     }

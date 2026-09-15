@@ -51,7 +51,7 @@ def main(args, load_model_fn=None):
     model, grid, linear_contract = load_model_fn(
         args.checkpoint, device, max_delay_frames=args.max_delay_frames
     )
-    far_input_mode = getattr(args, 'far_input_mode', 'aligned_far')
+    far_input_mode = getattr(args, 'far_input_mode', 'raw_far')
     print(f"inference model far_input_mode: {far_input_mode}")
 
     if args.input_is_linear_error:
@@ -135,8 +135,8 @@ def main(args, load_model_fn=None):
                 model_far_hop = input_far_hop
             else:
                 # Exact far hop PBFDKF consumed: raw until acquisition/ring
-                # fill, aligned afterward. This is the existing deployment
-                # model seam.
+                # fill, aligned afterward. This branch is retained only for
+                # explicit diagnostic comparison with the raw-far contract.
                 model_far_hop = linear_aec.get_aligned_far()
         reference_error.append(error_hop)
         reference_far.append(model_far_hop)

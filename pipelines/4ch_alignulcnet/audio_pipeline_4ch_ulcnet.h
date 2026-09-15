@@ -38,18 +38,13 @@
  *   hop#p (p >= 1) corresponds to the beamformed linear error of input hop
  *   p-1. The far-timestamp test pins this relation with a unit impulse.
  *
- * FAR-INPUT DEPLOYMENT CONTRACT: the model always receives the shared AEC
- * seam's pre.aligned_ref. On every hop the shared delay ring cannot yet serve
- * the applied offset -- before acquisition under MATCHED, and throughout the
- * ring-fill window under FIXED -- that seam carries the RAW far hop, so the
- * model still runs on real reference audio and D handles the remaining
- * offset; from the first hop the ring can serve it, the seam carries the
- * aligned far consumed by every PBFDKF lane. The switch is whole-hop and
- * coincides with pre.delay.solid, so a hop is never part raw and part
- * shifted. Runtime mode
- * selection is intentionally absent from this production API and remains an
- * offline sweep option only. A published model descriptor must carry
- * ULCNET_FAR_ALIGNED.
+ * FAR-INPUT DEPLOYMENT CONTRACT: the model always receives the caller's raw
+ * `far_reference` hop, matching training and the paper architecture. Every
+ * PBFDKF lane still consumes the shared delay ring's aligned copy to form its
+ * error spectrum; the model's TA block owns alignment between that error and
+ * raw far. Runtime mode selection is intentionally absent from this
+ * production API and remains an offline diagnostic only. A published model
+ * descriptor must carry ULCNET_FAR_RAW.
  *
  * MODEL CALLBACK POLICY (first version):
  *
@@ -62,7 +57,7 @@
  *     infer() whose output contains ANY non-finite value is likewise
  *     discarded (identity frame) -- NaN/Inf never reaches the WOLA.
  *   - On a delay change event (delay.changed), or FIXED's first transition
- *     from ring-fill raw far to usable aligned far: model->reset (if set) is
+ *     to a usable aligned AEC error: model->reset (if set) is
  *     called so the runtime flushes its far attention ring + logit history.
  *     The C-side framing states keep running (the core's lane analysis
  *     behind the GSC spectrum, this wrapper's far analysis and its
@@ -379,7 +374,7 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_create(
  *
  * A model that publishes a model-I/O contract (model->io_descriptor != NULL,
  * which must then outlive this pipeline) is rejected unless that descriptor
- * matches the fixed aligned-far production ABI.
+ * matches the fixed raw-far production ABI.
  *
  * Returns 0 on success, nonzero on a NULL/destroyed pipeline or a
  * invalid model-I/O descriptor.

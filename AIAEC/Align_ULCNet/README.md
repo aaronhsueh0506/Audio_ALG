@@ -189,8 +189,8 @@ python3 inference.py checkpoint.pth mic.wav far.wav out.wav \
 ```
 
 `raw_far` changes only the NN branch; PBFDKF still runs with `n = 5` and
-produces `linear_error`. `aligned_far` is the existing deployment behavior and
-remains the default for compatibility.
+produces `linear_error`. It is the training and deployment default.
+`aligned_far` remains available only as an explicit diagnostic comparison.
 
 ```bash
 # short-route candidate: smaller bank, aligned far, shallow attention
@@ -237,8 +237,7 @@ flowchart LR
         FAR["far PCM hop"]
         AEC["Matched filter + PBFDKF"]
         ERR["linear_error"]
-        AFAR["aligned_far"]
-        SEAM["AEC aligned-far seam<br/>raw until acquisition"]
+        RFAR["raw_far"]
         STFT["two sqrt-Hann STFTs<br/>compiled FFT / 50% hop"]
         FEAT["fixed front end, fp32<br/>signed power 0.3 + magnitudes<br/>+ phase cos/sin"]
         ERRF["error_mag / error_cos / error_sin<br/>each [1,1,BINS]<br/>error_ri [1,1,BINS,2] compressed"]
@@ -251,7 +250,7 @@ flowchart LR
         MIC --> AEC
         FAR --> AEC
         AEC --> ERR --> STFT
-        AEC --> AFAR --> SEAM --> STFT
+        FAR --> RFAR --> STFT
         STFT --> FEAT
         FEAT --> ERRF
         FEAT --> FARF
@@ -291,8 +290,8 @@ The fixed front end never enters the quantized domain: the host computes the
 signed-power compression (`sign(x) * |x|^0.3`), both magnitudes and the
 compressed-domain phase as cos/sin in fp32, and the graph binds the five
 feature tensors as separate inputs so each keeps its own quantization scale.
-The far branch is the AEC aligned-far seam; it carries raw far before
-acquisition and aligned far afterward.
+The far branch is the original raw reference. PBFDKF's aligned copy is private
+to formation of the linear-error branch; the model's TA block owns alignment.
 
 The two tables below are the shipped `host`/`split` boundary, the only pair
 `ulcnet_model_io.h` binds. "Graph boundary layouts" further down describes the
@@ -401,14 +400,14 @@ for example `h_gru0/h_gru0_0000.bin`. Each file is C-contiguous and
 little-endian. `manifest.json` records dtype and per-frame shape. The output
 directory must not already exist, so a shorter rerun cannot leave stale frames.
 
-Calibration deliberately uses the training-domain raw far signal; the report
-records that provenance separately from the production aligned-far seam. The
+Calibration and deployment use the same training-domain raw far signal; the
+report records both fields so a disagreement is fail-fast. The
 D value must match the exported graph because it fixes the K/V-history tensor
 shapes and CPU state allocation, not because changing D requires retraining.
 
 The exporter writes a sibling JSON descriptor containing the exact grid,
 state layout version, the `feature_layout`/`gru_state_layout` pair that
-version belongs to, D, the fixed `aligned_far` deployment contract, the
+version belongs to, D, the fixed `raw_far` deployment contract, the
 checkpoint's separate training provenance, and tensor schemas. Only the
 model-local `export_onnx.py` is a supported user entry point.
 
