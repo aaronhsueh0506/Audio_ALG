@@ -173,6 +173,25 @@ def validate_mix_probabilities(noise_only_p: float,
         )
 
 
+def validate_probability(section: str, name: str, value: float) -> None:
+    """Validate one finite probability read from the generation config."""
+    if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+        raise ValueError(f"[{section}] {name} must be in [0, 1], got {value}")
+
+
+def validate_noise_mix_range(min_noise_mix: int, max_noise_mix: int) -> None:
+    """Validate the inclusive number of independent noise lanes per sample."""
+    if min_noise_mix < 1:
+        raise ValueError(
+            f"[noise] min_noise_mix must be >= 1, got {min_noise_mix}"
+        )
+    if max_noise_mix < min_noise_mix:
+        raise ValueError(
+            "[noise] max_noise_mix must be >= min_noise_mix, got "
+            f"{max_noise_mix} < {min_noise_mix}"
+        )
+
+
 def sample_mix_mode(noise_only_p: float, speech_only_p: float) -> str:
     """Sample one mutually exclusive mode: noise-only, speech-only, or mixed."""
     draw = random.random()
@@ -181,6 +200,101 @@ def sample_mix_mode(noise_only_p: float, speech_only_p: float) -> str:
     if draw < noise_only_p + speech_only_p:
         return "speech_only"
     return "mixed"
+
+
+# ============================================================
+# Lightweight DeepFilterNet waveform augmentations
+# ============================================================
+
+def remove_dc(audio: torch.Tensor) -> torch.Tensor:
+    """Remove the whole-segment mean (DeepFilterNet ``RandRemoveDc``)."""
+    return audio - audio.mean()
+
+
+def rand_lfilt(audio: torch.Tensor,
+               coeff_min: float = -3.0 / 8.0,
+               coeff_max: float = 3.0 / 8.0) -> torch.Tensor:
+    """Apply DeepFilterNet/RNNoise's random normalized second-order filter.
+
+    The transfer function is ``(1 + b1 z^-1 + b2 z^-2) /
+    (1 + a1 z^-1 + a2 z^-2)`` with all four non-leading coefficients
+    sampled independently from ``[-3/8, 3/8]``.  ``lfilter`` keeps this
+    operation vectorized; unlike ``rand_biquad_filter`` there is deliberately
+    no RMS renormalization or peak clamp because upstream applies neither.
+    """
+    if coeff_min > coeff_max:
+        raise ValueError(
+            f"coeff_min must be <= coeff_max, got {coeff_min} > {coeff_max}"
+        )
+    a1 = random.uniform(coeff_min, coeff_max)
+    a2 = random.uniform(coeff_min, coeff_max)
+    b1 = random.uniform(coeff_min, coeff_max)
+    b2 = random.uniform(coeff_min, coeff_max)
+    a = audio.new_tensor([1.0, a1, a2])
+    b = audio.new_tensor([1.0, b1, b2])
+    return torchaudio.functional.lfilter(audio, a, b, clamp=False)
+
+
+def generate_fullband_colored_noise(num_samples: int, sr: int,
+                                    f_decay: float) -> torch.Tensor:
+    """Generate native-rate colored noise with energy through Nyquist.
+
+    ``f_decay`` follows DeepFilterNet's convention: 0 is white, 1 pink,
+    2 brown, -1 blue and -2 purple.  The FFT-bin envelope mirrors its
+    ``NoiseGenerator`` while generating the requested duration directly,
+    avoiding a repeated one-second tile in pre-generated WAV pairs.
+    """
+    if num_samples <= 0:
+        raise ValueError(f"num_samples must be positive, got {num_samples}")
+    if sr <= 0:
+        raise ValueError(f"sr must be positive, got {sr}")
+
+    noise = torch.randn(num_samples, dtype=torch.float32)
+    if f_decay != 0.0:
+        spec = torch.fft.rfft(noise)
+        mask = torch.linspace(
+            1.0,
+            math.sqrt(spec.numel()),
+            spec.numel(),
+            dtype=noise.dtype,
+            device=noise.device,
+        ).pow(f_decay)
+        noise = torch.fft.irfft(spec / mask, n=num_samples)
+
+    # Match upstream's deliberately broad random peak range. Subsequent SNR
+    # mixing still normalizes the combined lane energy against the target.
+    scale = random.uniform(0.01, 0.95) / max(noise.abs().max().item(), 1.0)
+    return noise * scale
+
+
+def prepend_speech_silence(audio: torch.Tensor, silence_samples: int,
+                           fade_samples: int) -> torch.Tensor:
+    """Delay speech inside a fixed-length segment and soften its new onset.
+
+    The tail is truncated so the returned tensor keeps the dataset contract's
+    exact segment length.  A short fade avoids teaching the model that a hard
+    splice (often from the middle of a randomly cropped phoneme) is the cue for
+    releasing noise suppression.
+    """
+    if audio.ndim != 1:
+        raise ValueError(
+            f"speech onset augmentation expects mono 1-D audio, got {audio.shape}"
+        )
+    if not 0 <= silence_samples < audio.numel():
+        raise ValueError(
+            "silence_samples must be inside the segment, got "
+            f"{silence_samples} for {audio.numel()} samples"
+        )
+    if fade_samples <= 0:
+        raise ValueError(f"fade_samples must be positive, got {fade_samples}")
+
+    shifted = torch.zeros_like(audio)
+    shifted[silence_samples:] = audio[:audio.numel() - silence_samples]
+    fade = min(fade_samples, audio.numel() - silence_samples)
+    shifted[silence_samples:silence_samples + fade] *= torch.linspace(
+        0.0, 1.0, fade, dtype=audio.dtype, device=audio.device
+    )
+    return shifted
 
 
 # ============================================================
@@ -545,11 +659,12 @@ class DNS4Dataset(Dataset):
 
     Pipeline:
     1. Select mixed / noise-only / speech-only sample mode
-    2. Load and augment speech when required
+    2. Load and augment speech when required (RemoveDC, LFilt, optional biquad,
+       and optional within-segment silence -> speech onset)
     3. RIR convolution (early for target, full for noisy)
-    4. Load and augment noise when required (pre-mix clipping distortion,
-       p_noise_clipping, applied here — DFN3-style, on the noise chain
-       before it is scaled into any mixture)
+    4. Load 2--5 real/generated full-band noise lanes and augment each real
+       lane with LFilt when required; combine lanes, then apply optional
+       biquad and pre-mix clipping distortion
     5. Discrete-SNR mixing for mixed samples
     6. Optional lower-rate source simulation (noisy + target)
     7. DNS-style target-level normalization (noisy + target scaled together
@@ -637,17 +752,88 @@ class DNS4Dataset(Dataset):
         self.drr = cfg.getfloat('rir', 'drr', fallback=0.3)
 
         # noise
+        self.min_noise_mix = cfg.getint('noise', 'min_noise_mix', fallback=2)
         self.max_noise_mix = cfg.getint('noise', 'max_noise_mix')
+        validate_noise_mix_range(self.min_noise_mix, self.max_noise_mix)
         self.noise_only_p = cfg.getfloat('noise', 'noise_only_p', fallback=0.05)
         self.speech_only_p = cfg.getfloat('noise', 'speech_only_p', fallback=0.05)
         validate_mix_probabilities(self.noise_only_p, self.speech_only_p)
 
         # augmentation
+        self.p_remove_dc = cfg.getfloat(
+            'augmentation', 'p_remove_dc', fallback=0.25
+        )
+        self.p_lfilt = cfg.getfloat('augmentation', 'p_lfilt', fallback=0.25)
+        self.p_fullband_colored_noise = cfg.getfloat(
+            'augmentation', 'p_fullband_colored_noise', fallback=0.05
+        )
+        for name, value in (
+            ('p_remove_dc', self.p_remove_dc),
+            ('p_lfilt', self.p_lfilt),
+            ('p_fullband_colored_noise', self.p_fullband_colored_noise),
+        ):
+            validate_probability('augmentation', name, value)
+        self.colored_noise_decay_min = cfg.getfloat(
+            'augmentation', 'colored_noise_decay_min', fallback=-2.0
+        )
+        self.colored_noise_decay_max = cfg.getfloat(
+            'augmentation', 'colored_noise_decay_max', fallback=2.0
+        )
+        if not (
+            math.isfinite(self.colored_noise_decay_min)
+            and math.isfinite(self.colored_noise_decay_max)
+        ):
+            raise ValueError(
+                "[augmentation] colored_noise_decay_min/"
+                "colored_noise_decay_max must be finite"
+            )
+        if self.colored_noise_decay_min >= self.colored_noise_decay_max:
+            raise ValueError(
+                "[augmentation] colored_noise_decay_min must be < "
+                "colored_noise_decay_max, got "
+                f"{self.colored_noise_decay_min} >= "
+                f"{self.colored_noise_decay_max}"
+            )
+
         self.p_biquad = cfg.getfloat('augmentation', 'p_biquad')
+        validate_probability('augmentation', 'p_biquad', self.p_biquad)
         self.n_biquad_filters = cfg.getint('augmentation', 'n_biquad_filters')
         self.biquad_gain_db = cfg.getfloat('augmentation', 'biquad_gain_db')
         self.biquad_q_min = cfg.getfloat('augmentation', 'biquad_q_min')
         self.biquad_q_max = cfg.getfloat('augmentation', 'biquad_q_max')
+        self.p_speech_onset = cfg.getfloat(
+            'augmentation', 'p_speech_onset', fallback=0.0
+        )
+        validate_probability(
+            'augmentation', 'p_speech_onset', self.p_speech_onset
+        )
+        self.speech_onset_sec_min = cfg.getfloat(
+            'augmentation', 'speech_onset_sec_min', fallback=0.5
+        )
+        self.speech_onset_sec_max = cfg.getfloat(
+            'augmentation', 'speech_onset_sec_max', fallback=2.0
+        )
+        self.speech_onset_fade_sec = cfg.getfloat(
+            'augmentation', 'speech_onset_fade_sec', fallback=0.01
+        )
+        if self.p_speech_onset > 0.0 and not (
+                math.isfinite(self.speech_onset_sec_min)
+                and math.isfinite(self.speech_onset_sec_max)
+                and 0.0 <= self.speech_onset_sec_min
+                <= self.speech_onset_sec_max < self.segment_sec):
+            raise ValueError(
+                "[augmentation] requires 0 <= speech_onset_sec_min <= "
+                "speech_onset_sec_max < [audio] segment_sec, got "
+                f"{self.speech_onset_sec_min} .. {self.speech_onset_sec_max} "
+                f"for segment_sec={self.segment_sec}"
+            )
+        if (self.p_speech_onset > 0.0
+                and (not math.isfinite(self.speech_onset_fade_sec)
+                     or self.speech_onset_fade_sec <= 0.0)):
+            raise ValueError(
+                "[augmentation] speech_onset_fade_sec must be finite and > 0, "
+                f"got {self.speech_onset_fade_sec}"
+            )
         self.p_resample = cfg.getfloat('augmentation', 'p_resample', fallback=0.0)
         if not math.isfinite(self.p_resample) or not 0.0 <= self.p_resample <= 1.0:
             raise ValueError(
@@ -986,12 +1172,20 @@ class DNS4Dataset(Dataset):
         metadata = {
             'mix_mode': mix_mode,
             'speech_file': None,
+            'remove_dc_applied_speech': False,
+            'lfilt_applied_speech': False,
             'biquad_applied_speech': False,
+            'speech_onset_applied': False,
+            'speech_onset_samples': 0,
+            'speech_onset_sec': 0.0,
             'rir_applied': False,
             'rt60': None,
             'rir_file': None,
             'n_noises_mixed': 0,
             'noise_files': [],
+            'lfilt_applied_noises': 0,
+            'n_generated_colored_noises': 0,
+            'colored_noise_f_decays': [],
             'biquad_applied_noise': False,
             'noise_clipping_applied': False,
             'noise_clip_snr_db': None,
@@ -1009,7 +1203,16 @@ class DNS4Dataset(Dataset):
             metadata['speech_file'] = self.speech_files[real_idx]
             speech = self._load_and_crop(self.speech_files[real_idx], target_len)
 
-            # Speech augmentation: RandBiquadFilter (混合前)
+            # Match DeepFilterNet's speech augmentation ordering: RemoveDC,
+            # LFilt, then the independently controlled legacy biquad.
+            if random.random() < self.p_remove_dc:
+                speech = remove_dc(speech)
+                metadata['remove_dc_applied_speech'] = True
+
+            if random.random() < self.p_lfilt:
+                speech = rand_lfilt(speech)
+                metadata['lfilt_applied_speech'] = True
+
             if random.random() < self.p_biquad:
                 speech = rand_biquad_filter(
                     speech, self.sr,
@@ -1018,6 +1221,27 @@ class DNS4Dataset(Dataset):
                     q_min=self.biquad_q_min,
                     q_max=self.biquad_q_max)
                 metadata['biquad_applied_speech'] = True
+
+            # The crop above may start in the middle of a phoneme. Delay the
+            # already-augmented speech, then fade its new boundary before any
+            # RIR is applied. This keeps dry/early/full-RIR targets aligned,
+            # while mixed-sample noise remains continuous across the onset.
+            if random.random() < self.p_speech_onset:
+                onset_sec = random.uniform(
+                    self.speech_onset_sec_min, self.speech_onset_sec_max
+                )
+                onset_samples = min(
+                    target_len - 1, int(round(onset_sec * self.sr))
+                )
+                fade_samples = max(
+                    1, int(round(self.speech_onset_fade_sec * self.sr))
+                )
+                speech = prepend_speech_silence(
+                    speech, onset_samples, fade_samples
+                )
+                metadata['speech_onset_applied'] = True
+                metadata['speech_onset_samples'] = onset_samples
+                metadata['speech_onset_sec'] = onset_samples / self.sr
 
             # 3. RIR convolution (DFN3-style: target = drr·dry + (1-drr)·early_reverb)
             if self.rir_files and random.random() < self.p_rir:
@@ -1044,11 +1268,30 @@ class DNS4Dataset(Dataset):
 
         # 4. Load/augment noise only when the selected mode needs it.
         if not speech_only:
-            n_noises = random.randint(1, self.max_noise_mix)
+            n_noises = random.randint(self.min_noise_mix, self.max_noise_mix)
             noise = torch.zeros(target_len)
             noise_paths = []
             for _ in range(n_noises):
-                one_noise, noise_path = self._load_noise(target_len)
+                # As in DeepFilterNet, this probability is per noise lane.
+                # Generated noise replaces a corpus read and already has a
+                # sampled full-band slope, so LFilt is applied only to real
+                # noise lanes (matching load_aug_noise's early return).
+                if random.random() < self.p_fullband_colored_noise:
+                    f_decay = random.uniform(
+                        self.colored_noise_decay_min,
+                        self.colored_noise_decay_max,
+                    )
+                    one_noise = generate_fullband_colored_noise(
+                        target_len, self.sr, f_decay
+                    )
+                    noise_path = None
+                    metadata['n_generated_colored_noises'] += 1
+                    metadata['colored_noise_f_decays'].append(f_decay)
+                else:
+                    one_noise, noise_path = self._load_noise(target_len)
+                    if random.random() < self.p_lfilt:
+                        one_noise = rand_lfilt(one_noise)
+                        metadata['lfilt_applied_noises'] += 1
                 noise = noise + one_noise
                 noise_paths.append(noise_path)
             metadata['n_noises_mixed'] = n_noises

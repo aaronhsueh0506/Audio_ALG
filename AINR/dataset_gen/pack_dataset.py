@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-把 WAV pair 目錄打包成單一 .pt 檔，消除訓練時的逐檔 I/O 開銷。
+把 WAV pair 目錄打包成單一 .pt 檔或固定筆數的 .pt shards，消除訓練時的
+逐檔 I/O 開銷。
 可選擇在打包當下順便 resample，這樣 48 kHz 母帶可以直接產生 16 kHz 的
 packed 檔，不需要先用 resample_dataset.py 生一份中繼 WAV 目錄。
 
@@ -8,12 +9,17 @@ packed 檔，不需要先用 resample_dataset.py 生一份中繼 WAV 目錄。
     python pack_dataset.py --input data_48k/pairs --output data_48k/packed.pt
     python pack_dataset.py --input data_48k/pairs --output data_48k/packed.pt --dtype float16
 
+    # 大資料集直接切 shard；--output 在這個模式是目錄
+    python pack_dataset.py --input data_48k/pairs --output data_48k/packed \
+        --shard-clips 512 --dtype float16
+
     # 打包時直接 resample 成另一個 rate (跳過中繼 WAV, 少一次 int16 write/read)
     python pack_dataset.py --input data_48k/pairs --output data_16k/packed.pt \
         --target-sr 16000 --dtype float16
 
 訓練:
     python train.py --config config.ini --packed-data data/packed.pt
+    python train.py --config config.ini --packed-dir data/packed --mmap
 
 輸入:
     --input 是一個裝著 2-channel (ch0=noisy, ch1=clean) WAV 的目錄，就這樣。
@@ -40,6 +46,7 @@ packed 檔，不需要先用 resample_dataset.py 生一份中繼 WAV 目錄。
 """
 
 import argparse
+import glob
 import os
 
 import torch
@@ -86,6 +93,45 @@ def _load_maybe_resampled(path, target_sr, resample_kwargs):
     return audio, sr, clipped
 
 
+def _stage_payload(clips, levels, sample_indices, temporary, header):
+    """Serialize one complete-but-unpublished payload to ``temporary``."""
+    data = torch.stack(clips)
+    effective_rms_dbfs = torch.stack(levels)
+    torch.save({
+        'data': data,          # (N, 2, T): ch0=noisy, ch1=clean
+        'effective_rms_dbfs': effective_rms_dbfs,
+        'sample_indices': list(sample_indices),
+        'n_samples': len(sample_indices),
+        **header,
+    }, temporary)
+
+
+def _shard_outputs(output_dir, overwrite):
+    """Prepare an output directory without mixing old and new shard sets."""
+    os.makedirs(output_dir, exist_ok=True)
+    all_pt = sorted(glob.glob(os.path.join(output_dir, '*.pt')))
+    existing = sorted(glob.glob(os.path.join(output_dir, 'shard_*.pt')))
+    unrelated = sorted(set(all_pt) - set(existing))
+    if unrelated:
+        raise FileExistsError(
+            f"{output_dir} contains non-shard .pt files, e.g. "
+            f"{os.path.basename(unrelated[0])}. A trainer loads every .pt in "
+            "the directory, so use an empty shard directory."
+        )
+    if existing and not overwrite:
+        raise FileExistsError(
+            f"{output_dir} already contains {len(existing)} shard(s), e.g. "
+            f"{os.path.basename(existing[0])}. Pass --overwrite to replace "
+            "them only after the new pack succeeds."
+        )
+    stale = sorted(glob.glob(os.path.join(output_dir, 'shard_*.pt.tmp')))
+    for path in stale:
+        os.remove(path)
+    if stale:
+        print(f"  removed {len(stale)} stale temporary shard(s)")
+    return existing
+
+
 def pack(args):
     # `NNNNNN.wav` only -- a stray `tmp.NNNNNN.wav` from a killed generation
     # run is invisible here, which is exactly the point of the generator
@@ -110,6 +156,10 @@ def pack(args):
 
     files = [_sample_wav_path(args.input, idx) for idx in indices]
     N = len(files)
+    shard_clips = getattr(args, 'shard_clips', None)
+    if shard_clips is not None and shard_clips <= 0:
+        raise ValueError(f"--shard-clips must be positive, got {shard_clips}")
+    sharded = shard_clips is not None
     print(f"找到 {N} 個 WAV → {args.output}")
 
     dtype = torch.float16 if args.dtype == 'float16' else torch.float32
@@ -127,9 +177,20 @@ def pack(args):
                 else f"{total_bytes / 1024**2:.0f} MB")
     print(f"  SR={out_sr}, 每段 {T} samples, dtype={args.dtype}, 預估大小: {size_str}")
 
-    data = torch.empty(N, 2, T, dtype=dtype)
+    # Collect native rates up front so every shard carries the same corpus-wide
+    # source-rate declaration. Reading headers does not load waveform payloads
+    # and keeps peak RAM bounded by --shard-clips.
+    source_srs = set()
+    for path in files:
+        try:
+            source_srs.add(int(torchaudio.info(path).sample_rate))
+        except Exception as e:
+            raise DatasetContractError(
+                f"pack refused: cannot read WAV header {path}: {e}"
+            ) from e
+
     # Measured AFTER any --target-sr resample + clip-guard AND after the
-    # cast to the packed dtype (`data[i]`) -- not on the pre-cast float32
+    # cast to the packed dtype -- not on the pre-cast float32
     # tensor: a downsample does not exactly preserve the requested level/SNR
     # (narrowband content is the worst case -- e.g. a 1 kHz-speech/12 kHz-
     # noise pair generated at ~0 dB SNR measures ~48 dB after a 48k->16k
@@ -139,41 +200,99 @@ def pack(args):
     # see README.md's "48 kHz source, 16 kHz pack" section for the full
     # caveat and when to prefer native generation instead
     # (gen_dataset.py --sample-rate 16000) for exact fidelity.
-    effective_rms_dbfs = torch.empty(N, 2, dtype=torch.float32)
-
     n_clip_guarded = 0
-    source_srs = set()
-    for i, path in enumerate(tqdm.tqdm(files, desc="Packing")):
-        try:
-            audio, sr, clipped = _load_maybe_resampled(path, args.target_sr, resample_kwargs)
-            source_srs.add(int(sr))
-            if audio.shape[0] != 2:
-                raise ValueError(f"不是 2-channel WAV (got {audio.shape[0]} channel(s))")
-            if audio.shape[1] != T:
-                raise ValueError(f"長度不符 (expected {T}, got {audio.shape[1]})")
-            if not torch.isfinite(audio).all():
-                raise ValueError("含有非 finite 值 (NaN/Inf)")
-            if args.target_sr is None and sr != source_sr:
-                # Without a forced resample every file's native rate must
-                # agree, or `out_sr` (taken from file 0 only) would silently
-                # mislabel part of `data`.
-                raise ValueError(
-                    f"sample rate {sr} Hz != 第一個檔案的 {source_sr} Hz "
-                    "(沒給 --target-sr 時所有檔案的原生取樣率必須一致)")
-        except Exception as e:
-            # Never silently exclude: a bad file means the directory is not
-            # what it looks like, and dropping it would also open an index
-            # gap the check above just closed.
-            raise DatasetContractError(
-                f"pack refused: {path}: {e}. 打包會整批停在這裡而不是靜默跳過"
-                "這一筆 —— 請修掉或刪掉這個檔案 (刪掉的話用 "
-                "--allow-index-gaps 打包剩下的)。"
-            ) from e
-        if clipped:
-            n_clip_guarded += 1
-        data[i] = audio.to(dtype)
-        effective_rms_dbfs[i, 0] = rms_dbfs(data[i, 0].float())   # noisy
-        effective_rms_dbfs[i, 1] = rms_dbfs(data[i, 1].float())   # clean
+    header = {
+        'sr': out_sr,
+        'segment_samples': T,
+        'dtype': args.dtype,
+        'source': args.input,
+    }
+    if args.target_sr is not None and source_srs != {out_sr}:
+        if len(source_srs) == 1:
+            header['source_sr'] = next(iter(source_srs))
+        else:
+            header['source_srs'] = sorted(source_srs)
+        header['resample_quality'] = args.quality
+
+    existing = []
+    if sharded:
+        existing = _shard_outputs(
+            args.output, getattr(args, 'overwrite', False)
+        )
+    else:
+        out_dir = os.path.dirname(os.path.abspath(args.output))
+        os.makedirs(out_dir, exist_ok=True)
+
+    clips = []
+    levels = []
+    packed_indices = []
+    staged = []
+    shard_index = 0
+    limit = shard_clips if sharded else N
+
+    def flush():
+        nonlocal clips, levels, packed_indices, shard_index
+        if not clips:
+            return
+        final = (os.path.join(args.output, f'shard_{shard_index:05d}.pt')
+                 if sharded else args.output)
+        temporary = final + '.tmp'
+        # Register the path before torch.save(): a disk-full/interrupted save
+        # may leave a partial file even though the call raises.
+        staged.append((temporary, final))
+        _stage_payload(
+            clips, levels, packed_indices, temporary, header
+        )
+        shard_index += 1
+        clips, levels, packed_indices = [], [], []
+
+    try:
+        for index, path in zip(indices, tqdm.tqdm(files, desc="Packing")):
+            try:
+                audio, sr, clipped = _load_maybe_resampled(
+                    path, args.target_sr, resample_kwargs
+                )
+                if audio.shape[0] != 2:
+                    raise ValueError(
+                        f"不是 2-channel WAV (got {audio.shape[0]} channel(s))"
+                    )
+                if audio.shape[1] != T:
+                    raise ValueError(
+                        f"長度不符 (expected {T}, got {audio.shape[1]})"
+                    )
+                if not torch.isfinite(audio).all():
+                    raise ValueError("含有非 finite 值 (NaN/Inf)")
+                if args.target_sr is None and sr != source_sr:
+                    raise ValueError(
+                        f"sample rate {sr} Hz != 第一個檔案的 {source_sr} Hz "
+                        "(沒給 --target-sr 時所有檔案的原生取樣率必須一致)"
+                    )
+            except Exception as e:
+                # Never silently exclude: a bad file means the directory is
+                # not what it looks like, and dropping it would also open an
+                # index gap the check above just closed.
+                raise DatasetContractError(
+                    f"pack refused: {path}: {e}. 打包會整批停在這裡而不是靜默跳過"
+                    "這一筆 —— 請修掉或刪掉這個檔案 (刪掉的話用 "
+                    "--allow-index-gaps 打包剩下的)。"
+                ) from e
+            if clipped:
+                n_clip_guarded += 1
+            packed = audio.to(dtype)
+            clips.append(packed)
+            levels.append(torch.tensor([
+                rms_dbfs(packed[0].float()),
+                rms_dbfs(packed[1].float()),
+            ], dtype=torch.float32))
+            packed_indices.append(index)
+            if len(clips) == limit:
+                flush()
+        flush()
+    except BaseException:
+        for temporary, _final in staged:
+            if os.path.exists(temporary):
+                os.remove(temporary)
+        raise
 
     if n_clip_guarded:
         print(f"\n{n_clip_guarded} 個檔案在 resample 後超過 {CLIP_GUARD} peak，"
@@ -183,50 +302,33 @@ def pack(args):
         print(f"  Resampled native rate(s) {sorted(source_srs)} → {out_sr} Hz "
               f"(quality={args.quality}) while packing")
 
-    out_dir = os.path.dirname(os.path.abspath(args.output))
-    os.makedirs(out_dir, exist_ok=True)
-
-    print(f"儲存中 ({size_str})...")
-    payload = {
-        'data': data,          # (N, 2, T): ch0=noisy, ch1=clean
-        'effective_rms_dbfs': effective_rms_dbfs,  # (N, 2): ch0=noisy, ch1=clean;
-                                                    # measured post-resample+post-cast --
-                                                    # see the comment where this is computed
-        'sample_indices': indices,  # original NNNNNN for each row of `data`,
-                                     # same order -- traces a packed row back to
-                                     # its source pairs/NNNNNN.wav
-        'sr': out_sr,
-        'n_samples': N,
-        'segment_samples': T,
-        'dtype': args.dtype,
-        'source': args.input,
-    }
-    if args.target_sr is not None and source_srs != {out_sr}:
-        # A forced target rate may legitimately reconcile manually collected
-        # WAVs from more than one native rate.  Do not label such a corpus as
-        # if every row came from the first file's rate.
-        if len(source_srs) == 1:
-            payload['source_sr'] = next(iter(source_srs))
-        else:
-            payload['source_srs'] = sorted(source_srs)
-        payload['resample_quality'] = args.quality
-    # Atomic (temp + os.replace): a payload can be many GB, and a crash/kill
-    # partway through torch.save() must never leave a truncated file that
-    # LOOKS like a complete packed dataset at the final --output path.
-    tmp_output = args.output + '.tmp'
-    torch.save(payload, tmp_output)
-    os.replace(tmp_output, args.output)
-    print(f"完成: {args.output}  ({N} pairs, {size_str})")
+    # Publish only after every source WAV validates and every shard serializes.
+    # With --overwrite, the old usable set remains in place until this point.
+    for path in existing:
+        os.remove(path)
+    for temporary, final in staged:
+        os.replace(temporary, final)
+    if sharded:
+        print(f"完成: {len(staged)} shards / {N} pairs → {args.output} "
+              f"({size_str} total)")
+    else:
+        print(f"完成: {args.output}  ({N} pairs, {size_str})")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
-        description='將 WAV pair 目錄打包成單一 .pt 檔，可選擇打包時順便 resample')
+        description='將 WAV pair 打包成單一 .pt 或固定筆數 shards，可順便 resample')
     parser.add_argument('--input', required=True,
                         help='裝著 2-channel (noisy, clean) WAV 的目錄。只認 '
                              'NNNNNN.wav，tmp.*.wav 自動略過')
     parser.add_argument('--output', required=True,
-                        help='輸出 .pt 檔案路徑')
+                        help='輸出 .pt 路徑；使用 --shard-clips 時改為輸出目錄')
+    parser.add_argument('--shard-clips', type=int, default=None,
+                        help='每個 shard 的固定 clip 上限；設定後輸出為 '
+                             'shard_00000.pt...，省略則維持單一 .pt')
+    parser.add_argument('--overwrite', action='store_true',
+                        help='shard 模式下，在新 pack 全部驗證並寫完後取代輸出'
+                             '目錄內既有的 shard_*.pt')
     parser.add_argument('--dtype', default='float32', choices=['float32', 'float16'],
                         help='儲存精度 (float16 減半大小, 預設: float32)')
     parser.add_argument('--target-sr', type=int, default=None,

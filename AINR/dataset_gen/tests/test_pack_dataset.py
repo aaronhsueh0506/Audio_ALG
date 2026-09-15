@@ -35,6 +35,7 @@ import torchaudio
 
 from dataset_gen.dataset import rms_dbfs
 from dataset_gen.gen_dataset import _sample_wav_path, _save_pair_atomic, _tmp_path
+from dataset_gen.loader import load_packed_dataset
 from dataset_gen.pack_dataset import DatasetContractError, pack
 
 
@@ -57,11 +58,13 @@ def _tone(sr, freq=200, amp=0.5, seconds=1.0):
 
 
 def _pack_args(input_dir, output_path, target_sr=None, quality='best',
-               dtype='float32', allow_index_gaps=False):
+               dtype='float32', allow_index_gaps=False, shard_clips=None,
+               overwrite=False):
     return types.SimpleNamespace(
         input=input_dir, output=output_path, dtype=dtype,
         target_sr=target_sr, quality=quality,
         allow_index_gaps=allow_index_gaps,
+        shard_clips=shard_clips, overwrite=overwrite,
     )
 
 
@@ -383,6 +386,131 @@ class AtomicPackedWriteTest(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     pack(_pack_args(in_dir, out_path))
             self.assertFalse(Path(out_path).exists())
+            self.assertFalse(Path(out_path + '.tmp').exists())
+
+
+class ShardedPackTest(unittest.TestCase):
+    def test_shard_clips_writes_ordered_shards_and_loader_reads_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            samples = [
+                (i, _tone(sr, 200 + i), _tone(sr, 300 + i), sr)
+                for i in range(5)
+            ]
+            in_dir = _make_batch(tmp, samples)
+            out_dir = os.path.join(tmp, 'packed')
+
+            pack(_pack_args(in_dir, out_dir, dtype='float16', shard_clips=2))
+
+            paths = sorted(Path(out_dir).glob('shard_*.pt'))
+            self.assertEqual(
+                [path.name for path in paths],
+                ['shard_00000.pt', 'shard_00001.pt', 'shard_00002.pt'])
+            payloads = [torch.load(path, weights_only=True) for path in paths]
+            self.assertEqual([p['n_samples'] for p in payloads], [2, 2, 1])
+            self.assertEqual(
+                [i for p in payloads for i in p['sample_indices']],
+                [0, 1, 2, 3, 4])
+            self.assertEqual(
+                [tuple(p['data'].shape[:2]) for p in payloads],
+                [(2, 2), (2, 2), (1, 2)])
+            self.assertTrue(all(p['data'].dtype == torch.float16
+                                for p in payloads))
+            self.assertTrue(all(
+                tuple(p['effective_rms_dbfs'].shape) == (p['n_samples'], 2)
+                for p in payloads))
+
+            dataset = load_packed_dataset(out_dir, expected_sr=sr, mmap=True)
+            self.assertEqual(len(dataset), 5)
+
+    def test_non_positive_shard_size_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            in_dir = _make_batch(
+                tmp, [(0, _tone(sr, 200), _tone(sr, 300), sr)])
+            with self.assertRaisesRegex(ValueError, 'must be positive'):
+                pack(_pack_args(
+                    in_dir, os.path.join(tmp, 'packed'), shard_clips=0))
+
+    def test_existing_shards_require_overwrite(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            samples = [
+                (i, _tone(sr, 200 + i), _tone(sr, 300 + i), sr)
+                for i in range(3)
+            ]
+            in_dir = _make_batch(tmp, samples)
+            out_dir = os.path.join(tmp, 'packed')
+            pack(_pack_args(in_dir, out_dir, shard_clips=1))
+
+            with self.assertRaisesRegex(FileExistsError, 'already contains'):
+                pack(_pack_args(in_dir, out_dir, shard_clips=2))
+
+    def test_failed_overwrite_keeps_old_set_and_removes_staged_temps(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            samples = [
+                (i, _tone(sr, 200 + i), _tone(sr, 300 + i), sr)
+                for i in range(3)
+            ]
+            in_dir = _make_batch(tmp, samples)
+            out_dir = os.path.join(tmp, 'packed')
+            pack(_pack_args(in_dir, out_dir, shard_clips=1))
+            old_paths = sorted(Path(out_dir).glob('shard_*.pt'))
+            old_bytes = {path.name: path.read_bytes() for path in old_paths}
+
+            # The first two clips stage a complete new shard. The third clip
+            # then fails validation, so none of the new set may be published.
+            victim = _sample_wav_path(in_dir, 2)
+            audio, _ = torchaudio.load(victim)
+            audio[0, 0] = float('nan')
+            torchaudio.save(victim, audio, sr, encoding='PCM_F', bits_per_sample=32)
+            with self.assertRaises(DatasetContractError):
+                pack(_pack_args(
+                    in_dir, out_dir, shard_clips=2, overwrite=True))
+
+            self.assertEqual(
+                {path.name: path.read_bytes() for path in old_paths}, old_bytes)
+            self.assertFalse(list(Path(out_dir).glob('shard_*.pt.tmp')))
+
+    def test_successful_overwrite_removes_obsolete_tail_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            samples = [
+                (i, _tone(sr, 200 + i), _tone(sr, 300 + i), sr)
+                for i in range(3)
+            ]
+            in_dir = _make_batch(tmp, samples)
+            out_dir = os.path.join(tmp, 'packed')
+            pack(_pack_args(in_dir, out_dir, shard_clips=1))
+            self.assertEqual(len(list(Path(out_dir).glob('shard_*.pt'))), 3)
+
+            pack(_pack_args(
+                in_dir, out_dir, shard_clips=2, overwrite=True))
+            paths = sorted(Path(out_dir).glob('shard_*.pt'))
+            self.assertEqual(
+                [path.name for path in paths],
+                ['shard_00000.pt', 'shard_00001.pt'])
+            self.assertEqual(load_packed_dataset(out_dir).__len__(), 3)
+
+    def test_partial_torch_save_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sr = 16000
+            in_dir = _make_batch(
+                tmp, [(0, _tone(sr, 200), _tone(sr, 300), sr)])
+            out_dir = os.path.join(tmp, 'packed')
+
+            def fail_after_creating_temp(_payload, path):
+                Path(path).write_bytes(b'partial')
+                raise RuntimeError('disk full')
+
+            with patch('dataset_gen.pack_dataset.torch.save',
+                       side_effect=fail_after_creating_temp):
+                with self.assertRaisesRegex(RuntimeError, 'disk full'):
+                    pack(_pack_args(in_dir, out_dir, shard_clips=1))
+
+            self.assertFalse(list(Path(out_dir).glob('shard_*.pt')))
+            self.assertFalse(list(Path(out_dir).glob('shard_*.pt.tmp')))
 
 
 if __name__ == '__main__':

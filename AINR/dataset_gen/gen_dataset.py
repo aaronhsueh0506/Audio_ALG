@@ -407,7 +407,7 @@ def gen_dataset(args):
           f"(2-channel WAV ch0=noisy/ch1=clean, one atomically-written file "
           f"per sample, no sidecars)")
     print(f"  Next: python3 pack_dataset.py --input {pairs_dir} "
-          f"--output {os.path.join(args.output, 'packed.pt')}")
+          f"--output {os.path.join(args.output, 'packed')} --shard-clips 512")
 
 
 if __name__ == '__main__':

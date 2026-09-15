@@ -163,14 +163,15 @@ python3 ../dataset_gen/gen_dataset.py \
 
 # Step 2: 打包
 python3 ../dataset_gen/pack_dataset.py \
-    --input data_16k/pairs --output data_16k/packed.pt --dtype float16
+    --input data_16k/pairs --output data_16k/packed \
+    --shard-clips 512 --dtype float16
 
 # Step 3: 訓練
-python3 train.py --config config.ini --packed-data data_16k/packed.pt
+python3 train.py --config config.ini --packed-dir data_16k/packed
 
-# 可選：指定 GPU、降低 RAM、或載入同一目錄下多個 packed files
+# 可選：指定 GPU 並用 mmap 降低 RAM
 python3 train.py --config config.ini \
-    --packed-dir data_16k/packed_shards --gpu 0 --mmap
+    --packed-dir data_16k/packed --gpu 0 --mmap
 ```
 
 `--mmap` 模式不會在 `__getitem__` 逐筆展開成 float32；FP16 batch 送到 GPU

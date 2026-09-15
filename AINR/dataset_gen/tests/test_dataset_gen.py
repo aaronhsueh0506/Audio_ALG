@@ -17,14 +17,19 @@ from dataset_gen.dataset import (
     DNS4Dataset,
     delay_signal,
     fftconvolve,
+    generate_fullband_colored_noise,
     parse_source_sr_values,
     parse_snr_values,
+    prepend_speech_silence,
     prepare_rir,
+    rand_lfilt,
+    remove_dc,
     sample_mix_mode,
     sample_snr,
     simulate_upsampled_source,
     source_sr_candidates,
     validate_mix_probabilities,
+    validate_noise_mix_range,
 )
 from dataset_gen.gen_dataset import (
     DatasetContractError,
@@ -69,11 +74,20 @@ def _stub_dataset(**overrides):
     dataset.sr = 16000
     dataset.noise_only_p = 0.0
     dataset.speech_only_p = 0.0
+    dataset.p_remove_dc = 0.0
+    dataset.p_lfilt = 0.0
+    dataset.p_fullband_colored_noise = 0.0
+    dataset.colored_noise_decay_min = -2.0
+    dataset.colored_noise_decay_max = 2.0
     dataset.p_biquad = 0.0
     dataset.n_biquad_filters = 3
     dataset.biquad_gain_db = 15.0
     dataset.biquad_q_min = 0.5
     dataset.biquad_q_max = 1.5
+    dataset.p_speech_onset = 0.0
+    dataset.speech_onset_sec_min = 0.5
+    dataset.speech_onset_sec_max = 2.0
+    dataset.speech_onset_fade_sec = 0.01
     dataset.rir_files = []
     dataset.p_rir = 0.0
     dataset.rt60_min = 0.2
@@ -81,6 +95,7 @@ def _stub_dataset(**overrides):
     dataset.early_rir_ms = 20.0
     dataset.pre_delay_keep_ms = 1.0
     dataset.drr = 0.3
+    dataset.min_noise_mix = 1
     dataset.max_noise_mix = 1
     dataset.noise_files = ["noise.wav"]
     dataset.snr_values = [0.0]
@@ -150,6 +165,16 @@ class DatasetConfigScopeTest(unittest.TestCase):
             [8000, 12000, 16000, 22050, 24000, 32000, 44100],
         )
         self.assertEqual(dataset.p_resample, 0.1)
+        self.assertEqual(dataset.min_noise_mix, 2)
+        self.assertEqual(dataset.max_noise_mix, 5)
+        self.assertEqual(dataset.p_remove_dc, 0.25)
+        self.assertEqual(dataset.p_lfilt, 0.25)
+        self.assertEqual(dataset.p_fullband_colored_noise, 0.05)
+        self.assertEqual(dataset.p_biquad, 0.0)
+        self.assertEqual(dataset.p_speech_onset, 0.15)
+        self.assertEqual(dataset.speech_onset_sec_min, 0.5)
+        self.assertEqual(dataset.speech_onset_sec_max, 2.0)
+        self.assertEqual(dataset.speech_onset_fade_sec, 0.01)
 
 
 class HoursPlanningTest(unittest.TestCase):
@@ -254,6 +279,125 @@ class MixingPolicyTest(unittest.TestCase):
                 self.assertRaises(ValueError),
             ):
                 validate_mix_probabilities(noise_p, speech_p)
+
+    def test_noise_mix_range_is_inclusive_and_validated(self):
+        validate_noise_mix_range(2, 5)
+        with self.assertRaises(ValueError):
+            validate_noise_mix_range(0, 5)
+        with self.assertRaises(ValueError):
+            validate_noise_mix_range(5, 2)
+
+    def test_getitem_samples_two_to_five_noise_lanes(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            min_noise_mix=2,
+            max_noise_mix=5,
+        )
+        with (
+            patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"),
+            patch("dataset_gen.dataset.random.randint", return_value=4) as randint,
+        ):
+            _noisy, _target, metadata = dataset._getitem_impl(0)
+        randint.assert_called_once_with(2, 5)
+        self.assertEqual(metadata['n_noises_mixed'], 4)
+
+
+class LightweightAugmentationTest(unittest.TestCase):
+    def test_prepend_speech_silence_preserves_length_and_softens_onset(self):
+        output = prepend_speech_silence(
+            torch.ones(10), silence_samples=3, fade_samples=4
+        )
+        self.assertEqual(output.numel(), 10)
+        self.assertTrue(torch.equal(output[:4], torch.zeros(4)))
+        self.assertTrue(torch.allclose(
+            output[3:7], torch.linspace(0.0, 1.0, 4)
+        ))
+        self.assertTrue(torch.equal(output[7:], torch.ones(3)))
+
+    def test_speech_onset_keeps_identity_pair_and_records_delay(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            p_speech_onset=1.0,
+            speech_onset_sec_min=0.025,
+            speech_onset_sec_max=0.025,
+            speech_onset_fade_sec=0.005,
+        )
+        with patch(
+            "dataset_gen.dataset.sample_mix_mode", return_value="speech_only"
+        ):
+            noisy, target, metadata = dataset._getitem_impl(0)
+
+        self.assertTrue(torch.equal(noisy, target))
+        self.assertTrue(torch.equal(target[:400], torch.zeros(400)))
+        self.assertTrue(metadata['speech_onset_applied'])
+        self.assertEqual(metadata['speech_onset_samples'], 400)
+        self.assertEqual(metadata['speech_onset_sec'], 0.025)
+
+    def test_remove_dc_subtracts_the_segment_mean(self):
+        audio = torch.tensor([1.0, 2.0, 6.0])
+        output = remove_dc(audio)
+        self.assertAlmostEqual(output.mean().item(), 0.0, places=7)
+        self.assertTrue(torch.equal(output, audio - 3.0))
+
+    def test_lfilt_matches_the_upstream_direct_form_recurrence(self):
+        audio = torch.tensor([1.0, -0.5, 0.25, 0.75, -1.0])
+        # rand_lfilt draws a1, a2, b1, b2 in this order.
+        coeffs = [0.1, -0.2, 0.3, -0.1]
+        with patch("dataset_gen.dataset.random.uniform", side_effect=coeffs):
+            output = rand_lfilt(audio)
+
+        a1, a2, b1, b2 = coeffs
+        mem0 = 0.0
+        mem1 = 0.0
+        expected = []
+        for x in audio.tolist():
+            y = x + mem0
+            mem0 = mem1 + b1 * x - a1 * y
+            mem1 = b2 * x - a2 * y
+            expected.append(y)
+        self.assertTrue(torch.allclose(
+            output, torch.tensor(expected), atol=2e-6, rtol=1e-6
+        ))
+
+    def test_colored_noise_is_finite_full_length_and_reaches_high_band(self):
+        torch.manual_seed(7)
+        with patch("dataset_gen.dataset.random.uniform", return_value=0.5):
+            noise = generate_fullband_colored_noise(48000, 48000, 0.0)
+        spec = torch.fft.rfft(noise)
+        self.assertEqual(noise.numel(), 48000)
+        self.assertTrue(torch.isfinite(noise).all())
+        self.assertGreater(spec[-4000:].abs().square().mean().item(), 1e-8)
+
+    def test_speech_and_real_noise_lfilt_decisions_are_recorded(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            min_noise_mix=2,
+            max_noise_mix=2,
+            p_remove_dc=1.0,
+            p_lfilt=1.0,
+        )
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"):
+            _noisy, _target, metadata = dataset._getitem_impl(0)
+        self.assertTrue(metadata['remove_dc_applied_speech'])
+        self.assertTrue(metadata['lfilt_applied_speech'])
+        self.assertEqual(metadata['lfilt_applied_noises'], 2)
+
+    def test_generated_colored_noise_replaces_corpus_noise_lane(self):
+        dataset = _stub_dataset(
+            return_metadata=True,
+            min_noise_mix=2,
+            max_noise_mix=2,
+            p_fullband_colored_noise=1.0,
+        )
+        dataset._load_noise = unittest.mock.Mock(
+            side_effect=AssertionError("generated lane must not read corpus noise")
+        )
+        with patch("dataset_gen.dataset.sample_mix_mode", return_value="mixed"):
+            _noisy, _target, metadata = dataset._getitem_impl(0)
+        dataset._load_noise.assert_not_called()
+        self.assertEqual(metadata['n_generated_colored_noises'], 2)
+        self.assertEqual(metadata['noise_files'], [None, None])
+        self.assertEqual(len(metadata['colored_noise_f_decays']), 2)
 
     def test_speech_only_pair_stays_identity_through_resampling(self):
         # p_resample=1.0 and p_mixture_clipping=1.0 (would-be certain) both
@@ -649,6 +793,38 @@ class ExampleConfigExactValuesTest(unittest.TestCase):
         cfg = _load_example_config()
         self.assertEqual(cfg.getfloat('rir', 'p_rir'), 0.5)
 
+    def test_deepfilternet_noise_augmentation_values(self):
+        cfg = _load_example_config()
+        self.assertEqual(cfg.getint('noise', 'min_noise_mix'), 2)
+        self.assertEqual(cfg.getint('noise', 'max_noise_mix'), 5)
+        self.assertEqual(cfg.getfloat('augmentation', 'p_remove_dc'), 0.25)
+        self.assertEqual(cfg.getfloat('augmentation', 'p_lfilt'), 0.25)
+        self.assertEqual(
+            cfg.getfloat('augmentation', 'p_fullband_colored_noise'), 0.05
+        )
+        self.assertEqual(cfg.getfloat('augmentation', 'p_biquad'), 0.0)
+        self.assertEqual(cfg.getfloat('augmentation', 'p_speech_onset'), 0.15)
+        self.assertEqual(
+            cfg.getfloat('augmentation', 'speech_onset_sec_min'), 0.5
+        )
+        self.assertEqual(
+            cfg.getfloat('augmentation', 'speech_onset_sec_max'), 2.0
+        )
+
+
+class SpeechOnsetConfigTest(unittest.TestCase):
+    def test_invalid_speech_onset_probability_is_rejected(self):
+        cfg = _load_example_config()
+        cfg.set('augmentation', 'p_speech_onset', '1.1')
+        with self.assertRaisesRegex(ValueError, 'p_speech_onset'):
+            _build_dataset(cfg)
+
+    def test_speech_onset_range_must_fit_inside_segment(self):
+        cfg = _load_example_config()
+        cfg.set('augmentation', 'speech_onset_sec_max', '3.0')
+        with self.assertRaisesRegex(ValueError, 'speech_onset_sec_max'):
+            _build_dataset(cfg)
+
 
 class AtomicSampleWriteTest(unittest.TestCase):
     """With the sidecar gone, the temp-file rename is the ONLY thing that
@@ -734,7 +910,8 @@ class ScanOrderingTest(unittest.TestCase):
                 "[audio]\nsegment_sec = 0.5\n[gen]\n[mixing]\n"
                 "snr_values = 0\n[rir]\np_rir = 0.0\nrt60_min = 0.2\n"
                 "rt60_max = 1.0\nearly_rir_ms = 20.0\npre_delay_keep_ms = 1.0\n"
-                "[noise]\nmax_noise_mix = 1\n[augmentation]\np_biquad = 0.0\n"
+                "[noise]\nmin_noise_mix = 1\nmax_noise_mix = 1\n"
+                "[augmentation]\np_biquad = 0.0\n"
                 "n_biquad_filters = 3\nbiquad_gain_db = 15.0\n"
                 "biquad_q_min = 0.5\nbiquad_q_max = 1.5\n"
                 "p_noise_clipping = 0.0\np_mixture_clipping = 0.0\n"
@@ -783,7 +960,8 @@ def _build_real_corpus(tmp, sr=16000, seconds=0.5):
         f"[audio]\nsegment_sec = {seconds}\n[gen]\n[mixing]\n"
         "snr_values = 0\n[rir]\np_rir = 0.0\nrt60_min = 0.2\n"
         "rt60_max = 1.0\nearly_rir_ms = 20.0\npre_delay_keep_ms = 1.0\n"
-        "[noise]\nmax_noise_mix = 1\n[augmentation]\np_biquad = 0.0\n"
+        "[noise]\nmin_noise_mix = 1\nmax_noise_mix = 1\n"
+        "[augmentation]\np_biquad = 0.0\n"
         "n_biquad_filters = 3\nbiquad_gain_db = 15.0\n"
         "biquad_q_min = 0.5\nbiquad_q_max = 1.5\n"
         "p_noise_clipping = 0.0\np_mixture_clipping = 0.0\n"

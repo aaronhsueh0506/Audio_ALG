@@ -9,7 +9,8 @@ RNNoise-ERB/GTCRN at 16 kHz and DeepFilterNet2 at 48 kHz.
 
 This package does exactly one job: take a raw speech / noise / RIR corpus
 (e.g. DNS Challenge 4) and produce augmented `(noisy, clean)` WAV pairs —
-biquad EQ, RIR/reverb, SNR mixing, optional bandwidth simulation for
+multi-noise mixing, RemoveDC/LFilt, optional biquad EQ, generated full-band
+colored noise, RIR/reverb, SNR mixing, optional bandwidth simulation for
 upsampled lower-rate sources, and clipping distortion. It does
 **not** know anything about any particular model's architecture, feature
 extraction, or training loop. Model
@@ -73,10 +74,10 @@ packed file derived from an already-generated 48 kHz batch, or extending
 a second rate's real training data:
 
 ```bash
-python3 pack_dataset.py --input data_48k/pairs --output data_48k/packed.pt \
-    --dtype float16
-python3 pack_dataset.py --input data_48k/pairs --output data_16k/packed.pt \
-    --target-sr 16000 --dtype float16
+python3 pack_dataset.py --input data_48k/pairs --output data_48k/packed \
+    --shard-clips 512 --dtype float16
+python3 pack_dataset.py --input data_48k/pairs --output data_16k/packed \
+    --shard-clips 512 --target-sr 16000 --dtype float16
 ```
 
 `pack_dataset.py --target-sr` shares the exact anti-aliasing constants and
@@ -162,6 +163,45 @@ pairs deliberately skip input-only clipping so they stay exact identity
 examples. Keeping a small speech-only share teaches the model not to alter an
 already-clean input; use a genuinely clean speech corpus, since any noise in a
 speech source file is necessarily treated as desired target content.
+
+### Noise composition and lightweight filtering
+
+Each sample that needs noise mixes an inclusive 2--5 independent noise lanes,
+matching DeepFilterNet's `uniform(2, 6)` draw. Each lane has a 5% chance of
+using generated native-rate colored noise instead of a corpus file. Its
+spectral decay is sampled from `[-2, 2]` (purple/blue through white to
+pink/brown), so a 48 kHz dataset always receives some noise with energy through
+24 kHz even when the recorded noise corpus is bandwidth-limited. The 5% is a
+**per-lane** probability: with 2--5 lanes, the probability that a sample
+contains at least one generated lane is about 9.8--22.6%.
+
+The lightweight filters follow the upstream chain ordering and probabilities:
+
+```ini
+[noise]
+min_noise_mix = 2
+max_noise_mix = 5
+
+[augmentation]
+p_remove_dc = 0.25
+p_lfilt = 0.25
+p_fullband_colored_noise = 0.05
+p_biquad = 0.0
+p_speech_onset = 0.15
+```
+
+`RemoveDC` subtracts the segment mean on speech only. `LFilt` is independently
+sampled for speech and every real noise lane; generated colored-noise lanes
+already have a sampled spectral slope and, like upstream, return before LFilt.
+The previous 50% biquad setting (up to three ±15 dB sections) is disabled: it
+was substantially stronger than the actual DeepFilterNet production setting
+and unnecessarily broadened the feature-normalizer distribution.
+
+Independently, 15% of samples containing speech delay that speech by 0.5--2.0
+seconds inside the fixed-length segment. Mixed-sample noise continues from
+sample zero, while speech and target start together after a 10 ms fade. The
+shift happens before RIR convolution, preserving dry/early/full-RIR alignment
+and explicitly teaching release from a noise-only state without a splice click.
 
 ### Target-level normalization (`level_mode`)
 
@@ -253,8 +293,9 @@ underlying speech/noise recordings.
 where `metadata` is a plain per-call dict — not a shared/stateful
 side-channel, so it is safe to read under multi-worker `DataLoader` use.
 Fields cover mix mode, source file provenance (speech/noise/RIR paths),
-which augmentations fired this sample (biquad, resample simulation, both
-clipping knobs) and their sampled parameters, and the level-normalization
+which augmentations fired this sample (RemoveDC, LFilt, generated colored
+noise, biquad, resample simulation, both clipping knobs) and their sampled
+parameters, and the level-normalization
 pair (`requested_level_dbfs` / `effective_level_dbfs`). `return_metadata=True`
 requires `return_raw=True` (raises otherwise) — it has no meaning against the
 STFT feature/gain-target return shape.
@@ -313,8 +354,8 @@ augmentation logic itself).
 | File | Role |
 |---|---|
 | `gen_dataset.py` | CLI entry point — offline pre-generation of `(noisy, clean)` WAV pairs |
-| `dataset.py` | `DNS4Dataset` — the augmentation engine (biquad filters, RIR/RT60, SNR mixing, bandwidth limiting, DNS-style target-level normalization, split pre/post-mix clipping, opt-in per-sample metadata) |
-| `pack_dataset.py` | Packs a WAV-pair directory into a single `.pt` tensor file, optionally resampling (`--target-sr`) while packing (removes per-file I/O overhead for small/medium datasets) |
+| `dataset.py` | `DNS4Dataset` — the augmentation engine (multi-noise mixing, RemoveDC/LFilt, generated colored noise, optional biquad filters, RIR/RT60, SNR mixing, bandwidth limiting, DNS-style target-level normalization, split pre/post-mix clipping, opt-in per-sample metadata) |
+| `pack_dataset.py` | Packs one WAV-pair directory into a single `.pt` file or bounded-memory `shard_*.pt` files (`--shard-clips`), optionally resampling (`--target-sr`) while packing |
 | `packed_dataset.py` | Shared mmap-capable loader for packed `(N, 2, T)` tensors |
 | `resample_dataset.py` | Optional standalone resample of an existing dataset to a WAV copy (listening/QC; `pack_dataset.py --target-sr` covers the training path) |
 | `config.example.ini` | Example config (copy to `config.ini` and edit `[paths]` for your corpus) |
@@ -428,14 +469,28 @@ hygiene, not a repair.
 
 ```bash
 python3 pack_dataset.py \
-    --input data_48k/pairs --output data_48k/packed.pt --dtype float16
+    --input data_48k/pairs --output data_48k/packed \
+    --shard-clips 512 --dtype float16
 python3 pack_dataset.py \
-    --input data_48k/pairs --output data_16k/packed.pt \
-    --target-sr 16000 --dtype float16
+    --input data_48k/pairs --output data_16k/packed \
+    --shard-clips 512 --target-sr 16000 --dtype float16
 ```
 
-Use `data_48k/packed.pt` for DeepFilterNet2 and
-`data_16k/packed.pt` for RNNoise-ERB/GTCRN. Omitting `--target-sr` packs at
+Use the `data_48k/packed` directory for DeepFilterNet2 and the
+`data_16k/packed` directory for RNNoise-ERB/GTCRN. All three trainers already
+accept a directory and load its `.pt` shards directly, so the source WAV
+directory does not need to be split or moved. The last shard may contain fewer
+than `--shard-clips` samples; every earlier shard contains exactly that many,
+and `sample_indices` preserves the original `NNNNNN.wav` ordering.
+
+The packer writes every shard under a temporary name and publishes the set only
+after all input WAVs have validated. It refuses an existing shard directory by
+default; pass `--overwrite` to replace its `shard_*.pt` only after the new set
+has serialized successfully. Because the shared loader reads every `.pt` in a
+directory, shard output also refuses unrelated `.pt` files in that directory.
+
+Omit `--shard-clips` to retain the previous single-file form, for example
+`--output data_48k/packed.pt`. Omitting `--target-sr` packs at
 the source WAVs' own rate and requires every input file to already share one
 native rate. `--target-sr` resamples everything to one output rate, so mixed
 native rates are accepted in that mode.
