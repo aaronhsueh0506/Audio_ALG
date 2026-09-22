@@ -533,7 +533,7 @@ ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
 # that output can differ, and is never called by materialization or packing.
 RELEASED_INFERENCE_BEHAVIOR_HASH_COMPATIBILITY: Dict[str, str] = {
     "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786":
-        "17f17abb3789be4459dcf2eb94f080284e47408a2b81587865044132cc31d65a",
+        "5fe64e46480c7e2a75c90718f1b64c09ca29f611d09713ea4ec2a9ef61c813f4",
 }
 _RELEASED_INFERENCE_SAMPLE_RATES: Dict[str, frozenset] = {
     "c1b1f5433fa244a2f7369938992bff95f00d1bdc394c4f21a5862f2dc547f786":
