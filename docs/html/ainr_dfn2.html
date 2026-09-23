@@ -94,13 +94,13 @@ cfg.erb_fwd = erb_fwd;   /* 兩個模式都必填 */        cfg.erb_inv = erb_in
 cfg.atten_lim_db = 0.0f; /* 0 = 關閉 */
 
 DFN2PrepostMemReq req;
-dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);        /* DFN2_IO_TIME: 314,496 bytes */
+dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);        /* DFN2_IO_TIME: 316,688 bytes */
 DFN2Prepost *p = dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;expected);
 
 for (each hop of DFN2_HOP_LEN samples) {
     if (dfn2_prepost_pre_process(p, in_hop) == 1) {   /* 第 0 拍回 0,之後恆 1 */
         DFN2PrepostInputs in; DFN2PrepostOutputs out;
-        dfn2_prepost_frame_inputs(p, &amp;in, &amp;out);      /* 指向本實例 pool 的 view */
+        dfn2_prepost_frame_inputs(p, &amp;in, &amp;out);      /* 指向本實例 pool 的 view;每幀重取 */
         if (my_npu_run(&amp;in, &amp;out) != 0 || dfn2_prepost_frame_commit(p) != 0)
             dfn2_prepost_frame_skip(p);               /* identity,保住 framing 節奏 */
     }
@@ -119,7 +119,7 @@ for (each hop of DFN2_HOP_LEN samples) {
 <tr><td><code>_pre_process(p, in_hop)</code><br><code>_pre_process_freq(p, re, im)</code></td><td>回<b>這一拍需要的加速器呼叫次數</b>:第 0 拍 0、之後 1。NULL／模式不符／frame 仍開著 → -1。<code>_freq</code> 吃已分析好的一框(見下方尺度警告),不做 transform</td></tr>
 <tr><td><code>_pre_process_freq_dual(p, est_re, est_im, app_re, app_im)</code></td><td><b>雙輸入</b>(<code>DFN2_IO_FREQ</code>):<code>est</code> 餵<b>估計</b>分支(ERB/複數特徵、EMA 正規化器、<code>[t-1,t,t+1]</code> 圖視窗,即 heads),<code>app</code> 餵<b>套用</b>分支(mask／deep filter／atten-lim 作用的 noisy ring)。同一個 frame clock,兩者在 <code>dfn2_process.c</code> 內踩<b>互斥</b>的狀態,所以 <code>est == app</code> 時<b>恰等於</b> <code>_pre_process_freq()</code>。命名為 est/app 而非 a/b:同型別的 pair 正是參數對調藏身處。回傳同 <code>_pre_process_freq</code></td></tr>
 <tr><td><code>_frame_inputs(p, &amp;in, &amp;out)</code></td><td>公開本框加速器邊界;可寫輸出全部 NaN 預填。無開啟的 frame → -1</td></tr>
-<tr><td><code>_frame_commit(p)</code></td><td>驗證每個 head 與 next-state 有限 → commit 遞迴狀態 → compose(ERB 展開、deep filter、alpha blend、atten-lim)→ TIME 模式再 synthesis</td></tr>
+<tr><td><code>_frame_commit(p)</code></td><td>驗證每個 head 與 next-state 有限 → 翻轉 live state bank(commit 遞迴狀態,不複製)→ compose(ERB 展開、deep filter、alpha blend、atten-lim)→ TIME 模式再 synthesis</td></tr>
 <tr><td><code>_frame_skip(p)</code></td><td>本框取 identity:unit ERB mask + alpha 0;遞迴狀態<b>不</b>前進,framing 與 compose clock 照走</td></tr>
 <tr><td><code>_post_process(p, out_hop, &amp;written)</code><br><code>_post_process_freq(p, re, im, &amp;valid)</code></td><td>輸出永遠寫滿,暖機兩拍補零;<code>*written</code> 是 0 或 <code>DFN2_HOP_LEN</code>,<code>*valid</code> 是 0/1。FREQ 輸出與輸入同一個 normalized=True 尺度</td></tr>
 <tr><td><code>_output_frame_index(p, &amp;frame)</code></td><td>最近一次輸出屬於哪個 source frame(自 reset 起算);尚未輸出或 NULL → -1</td></tr>
@@ -167,18 +167,29 @@ ERB 特徵又是 EMA 正規化的,mask 仍看起來合理,只有輸出電平是�
 <h3>記憶體與所有權</h3>
 <div class="tbl"><table>
 <tr><th>io_mode</th><th>pool(<code>get_mem_size</code>)</th><th>說明</th></tr>
-<tr><td><code>DFN2_IO_TIME</code></td><td>314,496 bytes</td><td>hop 進、hop 出;framing/window/OLA 由本類別做,transform 呼叫<b>呼叫端的</b> FftHandle</td></tr>
-<tr><td><code>DFN2_IO_FREQ</code></td><td>316,576 bytes</td><td>頻譜進、頻譜出,不做 transform;<code>fft</code> 可為 NULL</td></tr>
+<tr><td><code>DFN2_IO_TIME</code></td><td>316,688 bytes</td><td>hop 進、hop 出;framing/window/OLA 由本類別做,transform 呼叫<b>呼叫端的</b> FftHandle</td></tr>
+<tr><td><code>DFN2_IO_FREQ</code></td><td>318,768 bytes</td><td>頻譜進、頻譜出,不做 transform;<code>fft</code> 可為 NULL</td></tr>
 </table></div>
 <ul>
 <li><b>FREQ 現在比 TIME 大 2,080 bytes</b>(現查值):<code>DFN2State</code> 把 analysis/window/synthesis 緩衝
 以值內嵌、compose 也在同一個 struct,FREQ 實例甩不掉那些欄位,卻要多 carve 雙輸入的第二組 staging
 (<code>app_re</code>/<code>app_im</code>)——<b>不要期待 AIAEC 那種等比例節省</b>。io_mode 是 pool 的身分,
 init-time 固定,由 <code>_init_ex</code> 檢查。</li>
-<li><b><code>DFN2_PREPOST_CARVE_VERSION = 2</code></b>(<code>dfn2_prepost.h:117-123</code>):carve 走訪順序的版本,
+<li><b><code>DFN2_PREPOST_CARVE_VERSION = 3</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
 摺進 <code>build_flags_hash</code>,所以舊 carve 記下的 pool 會在 <b>hash</b> 被拒,不是只靠 <code>bytes</code>。
-版本 1 = 原始走訪;<b>版本 2 = <code>DFN2_IO_FREQ</code> 在既有每個區塊之後追加 <code>apply_re</code>/<code>apply_im</code>
-這對 staging</b>,供雙輸入入口使用。</li>
+版本 1 = 原始走訪;版本 2 = <code>DFN2_IO_FREQ</code> 在既有每個區塊之後追加 <code>apply_re</code>/<code>apply_im</code>
+這對 staging,供雙輸入入口使用;<b>版本 3 = <code>DFN2State</code> 多存兩張 ERB 矩陣的非零範圍表,控制區多一個
+遞迴 state 雙 bank 的 live 旗標</b>(兩模式各 +2,192 bytes)。</li>
+<li><b>遞迴 state 是雙 bank 輪替,不是 commit 時複製</b>:四個 state tensor(<code>h_encoder</code>/<code>h_erb</code>/<code>h_df</code>/
+<code>df_convp_history</code>,共 25,856 float)有兩組;<code>frame_inputs()</code> 把 live 那組當輸入、另一組 NaN 預填後當輸出,
+<code>frame_commit()</code> 驗證全部有限後<b>只翻 live 旗標</b>,不再複製 103 KB。<b>兩組位址每個成功 commit 互換,
+加速器 runtime 每幀都要重讀 <code>DFN2PrepostInputs</code>/<code>Outputs</code> 的指標,不可在 init 時綁死位址。</b></li>
+<li><b>ERB 特徵與 mask 展開只走矩陣的非零範圍</b>:<code>dfn2_set_erb_matrices()</code> 依矩陣<b>內容</b>記下每個 bin／band 的非零區間
+(<code>DFN2State.erb_fwd_lo/hi</code>、<code>erb_inv_lo/hi</code>),出貨矩陣 16,416 格只有 995 格非零。被略過的項都是「有限值 × ±0」,
+累加器從 +0 開始、加 ±0 不改變任何值(含 Inf/NaN),保留的項順序不變,所以結果與完整矩陣乘法逐位元相同;
+某個 bin 的 power 或某個 band 的 gain 非有限時(x × 0 會是 NaN),只有<b>那一列</b>走完整範圍。
+<code>dfn2_state_init()</code> 之後矩陣為 NULL、範圍為完整。<b>就地改寫矩陣內容後必須再呼叫一次 <code>set_erb_matrices</code></b>;
+回歸測試 <code>AINR/tests/test_c_prepost.c</code> 的 <code>test_dfn_erb_spans_exact</code> 逐位元比對稀疏與完整兩種算法(含溢位、NaN、非有限 mask、含 NaN 的矩陣)。</li>
 <li><b>window 是複製的,不是借用的</b>:<code>DFN2State</code> 以 <code>float window[DFN2_WIN_LEN]</code> 內嵌窗表,
 <code>cfg.window</code> 非 NULL 時會在 init 與每次 reset 覆蓋它(類別仍不配置也不釋放任何東西)。
 <b>出貨路徑一律留 NULL</b>,用 <code>dfn2_process.h</code> 那張帶 parity gate 的 sqrt-Hann。</li>
@@ -314,7 +325,8 @@ stateless heads graph 每次由 host 傳入 3 幀 feature window 與四個顯式
 <code>h_erb</code>、<code>h_df</code>、<code>df_convp_history</code>),取回三個 head 與四個
 <code>*_out</code>;加速器本身不保存跨次呼叫狀態。C 端
 <code>dfn2_model_io_commit_state()</code>／<code>_commit_arrays()</code> 在寫入前驗證整批 next-state,
-NULL/NaN/Inf 回 -1 且保留上一筆 state。</p>
+NULL/NaN/Inf 回 -1 且保留上一筆 state。這兩個 helper 給自帶 state struct 的外部整合者用;<code>DFN2Prepost</code>
+類別本身不複製:它把驗證過的 bank 直接翻成 live(見上方「記憶體與所有權」)。</p>
 
 <p><b>Recurrent state layout</b>(<code>--gru-state-layout</code>,<code>export_onnx.py</code> 與
 <code>inference.py calib</code> 同旗標):<b>split = state layout version 5,出貨合約</b>——每顆 GRU 一個 tensor,

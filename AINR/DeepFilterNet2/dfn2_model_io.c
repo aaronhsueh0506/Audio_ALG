@@ -3,6 +3,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "simd_kernel_nn.h"
+
 void dfn2_model_io_init(DFN2ModelIOState *state)
 {
     if (state != NULL) memset(state, 0, sizeof(*state));
@@ -80,11 +82,7 @@ void dfn2_model_io_push_spec_window(
 
 static int all_finite(const float *values, size_t count)
 {
-    size_t index;
-    for (index = 0; index < count; ++index) {
-        if (!isfinite(values[index])) return 0;
-    }
-    return 1;
+    return skn_all_finite_f32(values, count);
 }
 
 int dfn2_model_io_commit_arrays(

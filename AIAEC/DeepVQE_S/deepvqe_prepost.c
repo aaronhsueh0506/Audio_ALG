@@ -19,6 +19,7 @@
 #include "deepvqe_prepost.h"
 
 #include "mem_align.h"
+#include "simd_kernel_nn.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -585,22 +586,11 @@ const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(
 /* ---- per-hop stages -------------------------------------------------- */
 
 static void fill_nan(float *values, size_t elements) {
-    size_t index;
-
-    for (index = 0; index < elements; ++index) {
-        values[index] = NAN;
-    }
+    skn_fill_f32(values, elements, NAN);
 }
 
 static int all_finite(const float *values, size_t elements) {
-    size_t index;
-
-    for (index = 0; index < elements; ++index) {
-        if (!isfinite(values[index])) {
-            return 0;
-        }
-    }
-    return 1;
+    return skn_all_finite_f32(values, elements);
 }
 
 int deepvqe_prepost_pre_process(DeepVqePrepost *p,

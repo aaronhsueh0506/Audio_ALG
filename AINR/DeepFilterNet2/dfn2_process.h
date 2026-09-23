@@ -57,6 +57,7 @@
 #define DFN2_PROCESS_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 /* ---- 訊號格點: = config.ini [signal] ---- */
 #define DFN2_SR             48000
@@ -183,14 +184,31 @@ typedef struct {
     float scratch_power[DFN2_N_BINS];
     float scratch_erb_db[DFN2_N_ERB];
     float scratch_bin_gain[DFN2_N_BINS];
+
+    /* Where the two ERB matrices are nonzero, derived from their CONTENTS
+     * by dfn2_set_erb_matrices(): bin k's forward row is nonzero only in
+     * bands [erb_fwd_lo[k], erb_fwd_hi[k]), band b's inverse row only in
+     * bins [erb_inv_lo[b], erb_inv_hi[b]). An ERB filterbank is banded (a
+     * bin feeds one or two bands), so the feature and mask sums visit only
+     * those spans. That is exact, not approximate: a skipped term is a
+     * finite value times +-0, and adding +-0 leaves any accumulator that
+     * starts at +0 unchanged (Inf and NaN included); the kept terms keep
+     * their order. A non-finite power or band gain (x * 0 would be NaN)
+     * takes its whole row. A caller that rewrites a matrix's contents in
+     * place must re-publish it through dfn2_set_erb_matrices(). */
+    uint16_t erb_fwd_lo[DFN2_N_BINS];
+    uint16_t erb_fwd_hi[DFN2_N_BINS];
+    uint16_t erb_inv_lo[DFN2_N_ERB];
+    uint16_t erb_inv_hi[DFN2_N_ERB];
 } DFN2State;
 
 /* 初始化 (歸零 + 兩個正規化器的 linspace 初值) */
 void dfn2_state_init(DFN2State *st, FftHandle *fft);
 
 /* Point the state at the caller-loaded ERB matrices (see the struct field
- * comment for layout). Must be called before feature extraction or mask
- * expansion; the library never reads files itself. */
+ * comment for layout) and record their nonzero spans. Must be called before
+ * feature extraction or mask expansion, and again after any change to a
+ * matrix's contents; the library never reads files itself. */
 void dfn2_set_erb_matrices(DFN2State *st, const float *erb_fwd,
                              const float *erb_inv);
 

@@ -3,6 +3,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "simd_kernel_nn.h"
+
 
 /* Model-local DSP kernels (FFT / root-Hann / STFT / WOLA).
  * Deliberately NOT shared across models: porting is single-model,
@@ -198,10 +200,7 @@ void gtcrn_model_state_init(GTCRNModelState* state)
 
 static int all_finite(const float* values, size_t count)
 {
-    for (size_t i = 0; i < count; ++i) {
-        if (!isfinite(values[i])) return 0;
-    }
-    return 1;
+    return skn_all_finite_f32(values, count);
 }
 
 int gtcrn_model_state_commit(GTCRNModelState* state,

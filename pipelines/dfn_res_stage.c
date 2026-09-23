@@ -8,6 +8,7 @@
 #include <string.h>
 
 #include "dfn_res_stage.h"
+#include "simd_kernel_nn.h"
 
 #ifndef AUDIO_PIPELINE_BACKEND_STR
 #define AUDIO_PIPELINE_BACKEND_STR "unknown"
@@ -280,33 +281,25 @@ void dfn_res_stage_get_counters(const DfnResStage *s, long long *frames_in,
  * state would poison every later frame, and the class's own commit-time
  * check only covers the model outputs. */
 static int inputs_valid(const Complex *estimate, const Complex *apply) {
-    int k;
     if (!estimate || !apply) return 0;
-    for (k = 0; k < DFN2_N_BINS; ++k) {
-        if (!isfinite(estimate[k].r) || !isfinite(estimate[k].i) ||
-            !isfinite(apply[k].r) || !isfinite(apply[k].i))
-            return 0;
-    }
-    return 1;
+    return skn_all_finite_cf32(estimate, DFN2_N_BINS) &&
+           skn_all_finite_cf32(apply, DFN2_N_BINS);
 }
 
 int dfn_res_stage_process(DfnResStage *s,
                           const Complex *estimate_spec,
                           const Complex *apply_spec,
                           Complex *out_spec) {
-    int k;
     int need_heads;
     int valid = 0;
     int run_result = 0;
     if (!s || !out_spec || !inputs_valid(estimate_spec, apply_spec))
         return -1;
 
-    for (k = 0; k < DFN2_N_BINS; ++k) {
-        s->est_re[k] = estimate_spec[k].r * DFN_RES_STAGE_IN_SCALE;
-        s->est_im[k] = estimate_spec[k].i * DFN_RES_STAGE_IN_SCALE;
-        s->app_re[k] = apply_spec[k].r * DFN_RES_STAGE_IN_SCALE;
-        s->app_im[k] = apply_spec[k].i * DFN_RES_STAGE_IN_SCALE;
-    }
+    skn_deinterleave_scale_cf32(estimate_spec, s->est_re, s->est_im,
+                                DFN2_N_BINS, DFN_RES_STAGE_IN_SCALE);
+    skn_deinterleave_scale_cf32(apply_spec, s->app_re, s->app_im,
+                                DFN2_N_BINS, DFN_RES_STAGE_IN_SCALE);
 
     need_heads = dfn2_prepost_pre_process_freq_dual(
         s->prepost, s->est_re, s->est_im, s->app_re, s->app_im);
@@ -331,9 +324,7 @@ int dfn_res_stage_process(DfnResStage *s,
         memset(out_spec, 0, (size_t)DFN2_N_BINS * sizeof(Complex));
         return 0;
     }
-    for (k = 0; k < DFN2_N_BINS; ++k) {
-        out_spec[k].r = s->out_re[k] * DFN_RES_STAGE_OUT_SCALE;
-        out_spec[k].i = s->out_im[k] * DFN_RES_STAGE_OUT_SCALE;
-    }
+    skn_interleave_scale_cf32(s->out_re, s->out_im, out_spec, DFN2_N_BINS,
+                              DFN_RES_STAGE_OUT_SCALE);
     return 1;
 }

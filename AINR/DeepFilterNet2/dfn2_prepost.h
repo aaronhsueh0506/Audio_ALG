@@ -119,8 +119,10 @@ extern "C" {
  * on `bytes`.
  *   1  the original walk
  *   2  DFN2_IO_FREQ carves a second staging pair (apply_re/apply_im) for the
- *      dual-input entry point, appended after every existing region */
-#define DFN2_PREPOST_CARVE_VERSION      2u
+ *      dual-input entry point, appended after every existing region
+ *   3  DFN2State carries the ERB matrices' nonzero ranges, and the control
+ *      block the live-bank flag of the two recurrent-state banks */
+#define DFN2_PREPOST_CARVE_VERSION      3u
 
 /* One shared alignment for every module (audio_common mem_align.h). */
 #define DFN2_PREPOST_ALIGNMENT 16u
@@ -203,9 +205,12 @@ _Static_assert(sizeof(DFN2PrepostMemReq) == 32,
 typedef struct DFN2Prepost DFN2Prepost;
 
 /* Read-only accelerator inputs. All pointers are into this instance's pool
- * and stay valid until the next pre_process. Graph input names of the shipped
- * split layout (export_onnx.py, DFN2_MODEL_IO_LAYOUT_VERSION 5) are given so
- * a runtime binds by name without reading the exporter. */
+ * and stay valid until the next pre_process. Re-read them every frame: the
+ * four recurrent-state tensors live in two banks that swap roles on every
+ * committed frame (this frame's outputs become the next frame's inputs
+ * without a copy), so their addresses alternate. Graph input names of the
+ * shipped split layout (export_onnx.py, DFN2_MODEL_IO_LAYOUT_VERSION 5) are
+ * given so a runtime binds by name without reading the exporter. */
 typedef struct DFN2PrepostInputs {
     /* 'erb'  (1,1,DFN2_MODEL_INPUT_FRAMES,DFN2_N_ERB) */
     const float (*erb_window)[DFN2_N_ERB];
@@ -233,6 +238,8 @@ typedef struct DFN2PrepostInputs {
 /* Accelerator-writable outputs: the three heads and the four next-state
  * tensors. frame_inputs() fills every element with NaN so frame_commit()
  * detects a partial write instead of committing the previous frame's values.
+ * The next-state tensors are the recurrent bank that is not live this frame;
+ * never the same memory as the inputs' state tensors.
  *
  * `coefs` is (DFN2_DF_BINS, DFN2_DF_ORDER, 2) with bin outermost, tap next
  * and re/im innermost -- exactly model.py's layout and exactly what
@@ -374,7 +381,8 @@ int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
                               DFN2PrepostOutputs *outputs);
 
 /* Transactional: validates that the accelerator wrote every head and every
- * next-state tensor with finite values, commits the recurrent state, then
+ * next-state tensor with finite values, commits the recurrent state (the
+ * written bank becomes the live one; nothing is copied), then
  * runs the compose stage (ERB mask expansion, deep filter, alpha blend,
  * attenuation limit) and, in DFN2_IO_TIME, the synthesis.
  *

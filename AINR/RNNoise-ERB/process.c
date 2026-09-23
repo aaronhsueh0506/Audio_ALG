@@ -80,73 +80,83 @@ static void fft_radix2(float *re, float *im, int n, int inverse) {
         while (m >= 1 && j >= m) { j -= m; m >>= 1; }
         j += m;
     }
-    /* butterfly */
+    /* butterfly
+     * Within a stage the twiddle recurrence starts from (1, 0) for every
+     * block, so the k-th twiddle does not depend on the block: it is walked
+     * once per stage (k outer) and applied across all blocks (i inner). The
+     * butterflies of one stage touch disjoint (u, v) pairs, so their order
+     * does not change any result. */
     float sign = inverse ? 1.0f : -1.0f;
     for (int len = 2; len <= n; len <<= 1) {
+        const int half = len / 2;
         float ang = sign * 2.0f * (float)M_PI / len;
         float wre = cosf(ang);
         float wim = sinf(ang);
-        for (int i = 0; i < n; i += len) {
-            float cur_re = 1.0f, cur_im = 0.0f;
-            int k = 0;
+        float cur_re = 1.0f, cur_im = 0.0f;
+        int k = 0;
 #if RNNOISE_HAVE_NEON
-            for (; k + 4 <= len / 2; k += 4) {
-                float tw_re[4], tw_im[4];
-                for (int lane = 0; lane < 4; ++lane) {
-                    float new_re, new_im;
-                    tw_re[lane] = cur_re;
-                    tw_im[lane] = cur_im;
-                    new_re = cur_re * wre - cur_im * wim;
-                    new_im = cur_re * wim + cur_im * wre;
-                    cur_re = new_re;
-                    cur_im = new_im;
-                }
-                {
-                    int u = i + k;
-                    int v = u + len / 2;
-                    float32x4_t ur = vld1q_f32(re + u);
-                    float32x4_t ui = vld1q_f32(im + u);
-                    float32x4_t vr = vld1q_f32(re + v);
-                    float32x4_t vi = vld1q_f32(im + v);
-                    float32x4_t wr = vld1q_f32(tw_re);
-                    float32x4_t wi = vld1q_f32(tw_im);
-                    float32x4_t tre = vsubq_f32(
-                        vmulq_f32(vr, wr), vmulq_f32(vi, wi));
-                    float32x4_t tim = vaddq_f32(
-                        vmulq_f32(vr, wi), vmulq_f32(vi, wr));
-                    vst1q_f32(re + v, vsubq_f32(ur, tre));
-                    vst1q_f32(im + v, vsubq_f32(ui, tim));
-                    vst1q_f32(re + u, vaddq_f32(ur, tre));
-                    vst1q_f32(im + u, vaddq_f32(ui, tim));
-                }
+        for (; k + 4 <= half; k += 4) {
+            float tw_re[4], tw_im[4];
+            for (int lane = 0; lane < 4; ++lane) {
+                float new_re, new_im;
+                tw_re[lane] = cur_re;
+                tw_im[lane] = cur_im;
+                new_re = cur_re * wre - cur_im * wim;
+                new_im = cur_re * wim + cur_im * wre;
+                cur_re = new_re;
+                cur_im = new_im;
             }
-#endif
-            for (; k < len / 2; k++) {
+            float32x4_t wr = vld1q_f32(tw_re);
+            float32x4_t wi = vld1q_f32(tw_im);
+            for (int i = 0; i < n; i += len) {
                 int u = i + k;
-                int v = i + k + len / 2;
+                int v = u + half;
+                float32x4_t ur = vld1q_f32(re + u);
+                float32x4_t ui = vld1q_f32(im + u);
+                float32x4_t vr = vld1q_f32(re + v);
+                float32x4_t vi = vld1q_f32(im + v);
+                float32x4_t tre = vsubq_f32(
+                    vmulq_f32(vr, wr), vmulq_f32(vi, wi));
+                float32x4_t tim = vaddq_f32(
+                    vmulq_f32(vr, wi), vmulq_f32(vi, wr));
+                vst1q_f32(re + v, vsubq_f32(ur, tre));
+                vst1q_f32(im + v, vsubq_f32(ui, tim));
+                vst1q_f32(re + u, vaddq_f32(ur, tre));
+                vst1q_f32(im + u, vaddq_f32(ui, tim));
+            }
+        }
+#endif
+        for (; k < half; k++) {
+            for (int i = 0; i < n; i += len) {
+                int u = i + k;
+                int v = u + half;
                 float tre = re[v] * cur_re - im[v] * cur_im;
                 float tim = re[v] * cur_im + im[v] * cur_re;
                 re[v] = re[u] - tre;
                 im[v] = im[u] - tim;
                 re[u] += tre;
                 im[u] += tim;
-                float new_re = cur_re * wre - cur_im * wim;
-                float new_im = cur_re * wim + cur_im * wre;
-                cur_re = new_re;
-                cur_im = new_im;
             }
+            float new_re = cur_re * wre - cur_im * wim;
+            float new_im = cur_re * wim + cur_im * wre;
+            cur_re = new_re;
+            cur_im = new_im;
         }
     }
     if (inverse) {
+        /* n is a power of two, so 1/n is exact and x * (1/n) rounds to the
+         * same float as x / n for every x (subnormals and Inf/NaN included);
+         * a multiply is several times cheaper than a divide. */
+        const float inv_n = 1.0f / (float)n;
         int i = 0;
 #if RNNOISE_HAVE_NEON
-        const float32x4_t vn = vdupq_n_f32((float)n);
+        const float32x4_t vinv = vdupq_n_f32(inv_n);
         for (; i + 4 <= n; i += 4) {
-            vst1q_f32(re + i, vdivq_f32(vld1q_f32(re + i), vn));
-            vst1q_f32(im + i, vdivq_f32(vld1q_f32(im + i), vn));
+            vst1q_f32(re + i, vmulq_f32(vld1q_f32(re + i), vinv));
+            vst1q_f32(im + i, vmulq_f32(vld1q_f32(im + i), vinv));
         }
 #endif
-        for (; i < n; i++) { re[i] /= n; im[i] /= n; }
+        for (; i < n; i++) { re[i] *= inv_n; im[i] *= inv_n; }
     }
 }
 

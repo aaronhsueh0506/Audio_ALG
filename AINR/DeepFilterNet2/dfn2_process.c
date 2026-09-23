@@ -13,6 +13,8 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "simd_kernel_nn.h"
+
 #if defined(__aarch64__) && defined(__ARM_NEON) && \
     !defined(SIMD_KERNELS_FORCE_SCALAR)
 #include <arm_neon.h>
@@ -24,6 +26,9 @@
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
+
+/* The deep filter's taps before the stream start read this row. */
+static const float df_zero_row[DFN2_DF_BINS];
 
 static inline void df_common_make_root_hann(float *window, int win_len) {
     for (int i = 0; i < win_len; ++i) {
@@ -70,19 +75,24 @@ static inline void df_common_analysis(FftHandle* fft, float *analysis_buf,
  * filterbank; the loader owns the file and can swap it at runtime. */
 static inline void df_common_features(
     const float *spec_re, const float *spec_im,
-    const float *erb_fwd, int n_bins, int n_bands, int df_bins,
+    const float *erb_fwd, const uint16_t *fwd_lo, const uint16_t *fwd_hi,
+    int n_bins, int n_bands, int df_bins,
     float analysis_scale, float log_floor,
     float erb_alpha, float erb_scale, float *erb_state,
     float spec_alpha, float spec_eps, float *spec_state,
     float *power, float *erb_work, float *feat_erb, float *feat_spec) {
     float scale2 = analysis_scale * analysis_scale;
     memset(erb_work, 0, (size_t)n_bands * sizeof(float));
+    skn_power_scale_f32(power, spec_re, spec_im, (size_t)n_bins, scale2);
+    /* Each band accumulates its bins in ascending k over the row's nonzero
+     * span (see DFN2State); a non-finite power takes its whole row, since
+     * Inf/NaN times 0 is NaN. */
     for (int k = 0; k < n_bins; ++k) {
-        float p = (spec_re[k] * spec_re[k] +
-                   spec_im[k] * spec_im[k]) * scale2;
+        float p = power[k];
         const float *row = erb_fwd + (size_t)k * n_bands;
-        power[k] = p;
-        for (int b = 0; b < n_bands; ++b)
+        int finite = isfinite(p);
+        int hi = finite ? fwd_hi[k] : n_bands;
+        for (int b = finite ? fwd_lo[k] : 0; b < hi; ++b)
             erb_work[b] += p * row[b];
     }
     for (int b = 0; b < n_bands; ++b) {
@@ -126,16 +136,20 @@ static inline void df_common_features(
 
 /* erb_inv: caller-loaded exported matrix, band-major [n_bands][n_bins]
  * (the model's mask-expansion buffer); the inner loop runs contiguously
- * over bins and auto-vectorizes. */
+ * over the band's nonzero bins, or the whole row for a non-finite gain. */
 static inline void df_common_expand_mask(const float *band_gain,
                                          const float *erb_inv,
+                                         const uint16_t *inv_lo,
+                                         const uint16_t *inv_hi,
                                          int n_bins, int n_bands,
                                          float *bin_gain) {
     memset(bin_gain, 0, (size_t)n_bins * sizeof(float));
     for (int b = 0; b < n_bands; ++b) {
         float gain = band_gain[b];
         const float *row = erb_inv + (size_t)b * n_bins;
-        for (int k = 0; k < n_bins; ++k)
+        int finite = isfinite(gain);
+        int hi = finite ? inv_hi[b] : n_bins;
+        for (int k = finite ? inv_lo[b] : 0; k < hi; ++k)
             bin_gain[k] += row[k] * gain;
     }
 }
@@ -236,6 +250,23 @@ static inline void df_common_synthesis(FftHandle* fft,
     memset(synthesis_buf + n_fft - hop, 0, (size_t)hop * sizeof(float));
 }
 
+/* Per-row nonzero span [lo, hi) of a row-major matrix. An all-zero row gets
+ * the empty span; a NULL matrix gets full spans, i.e. the dense sums. */
+static void erb_row_spans(const float *matrix, int rows, int cols,
+                          uint16_t *lo, uint16_t *hi)
+{
+    for (int r = 0; r < rows; ++r) {
+        int first = 0, last = cols;
+        if (matrix) {
+            const float *row = matrix + (size_t)r * cols;
+            while (first < last && row[first] == 0.0f) ++first;
+            while (last > first && row[last - 1] == 0.0f) --last;
+        }
+        lo[r] = (uint16_t)first;
+        hi[r] = (uint16_t)last;
+    }
+}
+
 void dfn2_set_erb_matrices(DFN2State* st,
                              const float* erb_fwd,
                              const float* erb_inv)
@@ -243,6 +274,10 @@ void dfn2_set_erb_matrices(DFN2State* st,
     if (!st) return;
     st->erb_fwd = erb_fwd;
     st->erb_inv = erb_inv;
+    erb_row_spans(erb_fwd, DFN2_N_BINS, DFN2_N_ERB,
+                  st->erb_fwd_lo, st->erb_fwd_hi);
+    erb_row_spans(erb_inv, DFN2_N_ERB, DFN2_N_BINS,
+                  st->erb_inv_lo, st->erb_inv_hi);
 }
 
 void dfn2_state_init(DFN2State* st, FftHandle* fft)
@@ -251,7 +286,9 @@ void dfn2_state_init(DFN2State* st, FftHandle* fft)
     memset(st, 0, sizeof(*st));
     st->fft = fft;
     /* ERB matrices arrive via dfn2_set_erb_matrices(): caller-loaded
-     * erb_fwd.bin / erb_inv.bin from export_erb_matrix.py --runtime-bins. */
+     * erb_fwd.bin / erb_inv.bin from export_erb_matrix.py --runtime-bins.
+     * Until then the matrices are NULL and their spans full. */
+    dfn2_set_erb_matrices(st, NULL, NULL);
     df_common_make_root_hann(st->window, DFN2_WIN_LEN);
     for (int b = 0; b < DFN2_N_ERB; ++b) {
         float position = (float)b / (float)(DFN2_N_ERB - 1);
@@ -282,7 +319,7 @@ void dfn2_compute_features(DFN2State* st,
 {
     if (!st || !spec_re || !spec_im || !feat_erb || !feat_spec) return;
     df_common_features(
-        spec_re, spec_im, st->erb_fwd,
+        spec_re, spec_im, st->erb_fwd, st->erb_fwd_lo, st->erb_fwd_hi,
         DFN2_N_BINS, DFN2_N_ERB, DFN2_DF_BINS,
         DFN2_ANALYSIS_SCALE, DFN2_ERB_LOG_FLOOR,
         DFN2_ERB_NORM_ALPHA, DFN2_ERB_NORM_SCALE_DB,
@@ -312,6 +349,7 @@ int dfn2_compose(DFN2State* st,
     if (!st || !spec_re || !spec_im || !erb_mask || !coefs ||
         !out_re || !out_im || !isfinite(alpha)) return 0;
     df_common_expand_mask(erb_mask, st->erb_inv,
+                          st->erb_inv_lo, st->erb_inv_hi,
                           DFN2_N_BINS, DFN2_N_ERB,
                           st->scratch_bin_gain);
     slot = st->df_ring_idx;
@@ -389,6 +427,8 @@ int dfn2_compose_stream(DFN2State* st,
     int current_slot;
     int head_slot;
     int target_slot;
+    const float *src_re[DFN2_DF_ORDER];
+    const float *src_im[DFN2_DF_ORDER];
 
     if (!st || !current_spec_re || !current_spec_im || !out_re || !out_im)
         return -1;
@@ -417,21 +457,21 @@ int dfn2_compose_stream(DFN2State* st,
     head_frame = current - DFN2_MASK_LOOKAHEAD;
     head_slot = (int)(head_frame % DFN2_DF_RING);
     df_common_expand_mask(erb_mask, st->erb_inv,
+                          st->erb_inv_lo, st->erb_inv_hi,
                           DFN2_N_BINS, DFN2_N_ERB,
                           st->scratch_bin_gain);
-    for (int k = 0; k < DFN2_DF_BINS; ++k) {
-        st->df_ring_re[head_slot][k] =
-            st->noisy_ring_re[head_slot][k] * st->scratch_bin_gain[k];
-        st->df_ring_im[head_slot][k] =
-            st->noisy_ring_im[head_slot][k] * st->scratch_bin_gain[k];
-    }
-    for (int k = DFN2_DF_BINS; k < DFN2_N_BINS; ++k) {
-        int high = k - DFN2_DF_BINS;
-        st->hi_delay_re[head_slot][high] =
-            st->noisy_ring_re[head_slot][k] * st->scratch_bin_gain[k];
-        st->hi_delay_im[head_slot][high] =
-            st->noisy_ring_im[head_slot][k] * st->scratch_bin_gain[k];
-    }
+    skn_mul_f32(st->df_ring_re[head_slot], st->noisy_ring_re[head_slot],
+                st->scratch_bin_gain, DFN2_DF_BINS);
+    skn_mul_f32(st->df_ring_im[head_slot], st->noisy_ring_im[head_slot],
+                st->scratch_bin_gain, DFN2_DF_BINS);
+    skn_mul_f32(st->hi_delay_re[head_slot],
+                st->noisy_ring_re[head_slot] + DFN2_DF_BINS,
+                st->scratch_bin_gain + DFN2_DF_BINS,
+                DFN2_N_BINS - DFN2_DF_BINS);
+    skn_mul_f32(st->hi_delay_im[head_slot],
+                st->noisy_ring_im[head_slot] + DFN2_DF_BINS,
+                st->scratch_bin_gain + DFN2_DF_BINS,
+                DFN2_N_BINS - DFN2_DF_BINS);
     memcpy(st->coef_ring[head_slot], coefs,
            sizeof(st->coef_ring[head_slot]));
     st->alpha_ring[head_slot] = alpha;
@@ -445,25 +485,26 @@ int dfn2_compose_stream(DFN2State* st,
     if (alpha < 0.0f) alpha = 0.0f;
     if (alpha > 1.0f) alpha = 1.0f;
 
+    /* The taps' source rows are per frame, not per bin: resolve them once.
+     * A source frame before the stream start is a row of 0.0f, multiplied
+     * through like any other. */
+    for (int tap = 0; tap < DFN2_DF_ORDER; ++tap) {
+        long long source_frame = target_frame - DFN2_DF_HISTORY + tap;
+        int slot = source_frame >= 0 ? (int)(source_frame % DFN2_DF_RING)
+                                     : -1;
+        src_re[tap] = slot >= 0 ? st->df_ring_re[slot] : df_zero_row;
+        src_im[tap] = slot >= 0 ? st->df_ring_im[slot] : df_zero_row;
+    }
     for (int k = 0; k < DFN2_DF_BINS; ++k) {
         float filtered_re = 0.0f;
         float filtered_im = 0.0f;
         for (int tap = 0; tap < DFN2_DF_ORDER; ++tap) {
-            long long source_frame =
-                target_frame - DFN2_DF_HISTORY + tap;
-            float xr = 0.0f;
-            float xi = 0.0f;
-            if (source_frame >= 0) {
-                int source_slot = (int)(source_frame % DFN2_DF_RING);
-                xr = st->df_ring_re[source_slot][k];
-                xi = st->df_ring_im[source_slot][k];
-            }
-            {
-                float cr = st->coef_ring[target_slot][k][tap][0];
-                float ci = st->coef_ring[target_slot][k][tap][1];
-                filtered_re += xr * cr - xi * ci;
-                filtered_im += xi * cr + xr * ci;
-            }
+            float xr = src_re[tap][k];
+            float xi = src_im[tap][k];
+            float cr = st->coef_ring[target_slot][k][tap][0];
+            float ci = st->coef_ring[target_slot][k][tap][1];
+            filtered_re += xr * cr - xi * ci;
+            filtered_im += xi * cr + xr * ci;
         }
         out_re[k] = alpha * filtered_re +
                     (1.0f - alpha) * st->df_ring_re[target_slot][k];

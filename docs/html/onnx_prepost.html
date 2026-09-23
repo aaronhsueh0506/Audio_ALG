@@ -123,6 +123,11 @@ Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起恆為 1</b>；DFN2 在<b>第一個 h
 <code>frame_inputs</code> 墊背（<code>prepared</code> 閂，三個類別皆然），所以「加速器根本沒跑」
 不可能把未動過的緩衝區當成結果收下；幀還開著時再呼叫 <code>pre_process</code> 回 −1。</p>
 
+<p><b>遞迴 state 是交換，不是複製</b>：commit 讓加速器剛寫好的那組 state 直接成為下一幀的輸入——
+Align-ULCNet 交換 GRU 的兩個指標（<code>ulcnet_model_io.c</code> 的 commit），DeepVQE-S 與 DFN2 翻轉
+前後兩組 bank（<code>front</code>／<code>live</code>）。因此<b>state 張量的輸入與輸出位址逐幀交替</b>，
+runtime <b>每幀</b>都要依 <code>_frame_inputs()</code> 交回的指標綁定，不可在 init 時把位址綁死。</p>
+
 <p><b>生命週期</b>兩條（<code>audio_common/include/fft_wrapper.h</code>「Static memory support」）：
 板端 <code>_init</code>／<code>_init_ex</code> 建構在 caller pool 上，host 工具用
 <code>_create</code>／<code>_destroy</code>。<code>_init_ex</code> 多收一個 <b>32-byte MemReq</b>

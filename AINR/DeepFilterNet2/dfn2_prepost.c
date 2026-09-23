@@ -14,6 +14,7 @@
 #include "dfn2_prepost.h"
 
 #include "mem_align.h"
+#include "simd_kernel_nn.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -24,6 +25,14 @@
 /* Frames of end-to-end model lookahead. A cascade, so the two lookaheads add
  * rather than overlap -- see dfn2_process.h's dfn2_compose_stream() note. */
 #define PP_MODEL_LOOKAHEAD (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD)
+
+/* One set of the four recurrent-state tensors. */
+typedef struct PPStateBank {
+    float *encoder;     /* [DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS]           */
+    float *erb;         /* [DFN2_PREPOST_ERB_HIDDEN_ELEMENTS]               */
+    float *df;          /* [DFN2_PREPOST_DF_HIDDEN_ELEMENTS]                */
+    float *convp;       /* [DFN2_PREPOST_CONVP_HISTORY_ELEMENTS]            */
+} PPStateBank;
 
 struct DFN2Prepost {
     DFN2State        *dsp;
@@ -56,16 +65,16 @@ struct DFN2Prepost {
     float *enh_im;
     float *out_hop;     /* [DFN2_HOP_LEN], DFN2_IO_TIME only                */
 
-    /* Accelerator-writable boundary. The next-state tensors are a full
-     * shadow of DFN2ModelIOState: the graph writes them, and they must be
-     * validated in full before a single byte of the live state moves. */
+    /* Accelerator-writable boundary: the three heads, and the recurrent
+     * state in two banks -- bank[0] is DFN2ModelIOState's own four arrays,
+     * bank[1] a carved copy of their shape. The graph reads bank[live] and
+     * writes bank[live ^ 1]; that bank is validated in full, and only then
+     * does `live` flip. Nothing is copied back, and a refused frame leaves
+     * the live bank untouched. */
     float *head_erb_mask;   /* [DFN2_N_ERB]                                 */
     float *head_coefs;      /* [DFN2_PREPOST_COEFS_ELEMENTS]                */
     float *head_alpha;      /* [1]                                          */
-    float *next_encoder;    /* [DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS]       */
-    float *next_erb;        /* [DFN2_PREPOST_ERB_HIDDEN_ELEMENTS]           */
-    float *next_df;         /* [DFN2_PREPOST_DF_HIDDEN_ELEMENTS]            */
-    float *next_convp;      /* [DFN2_PREPOST_CONVP_HISTORY_ELEMENTS]        */
+    PPStateBank bank[2];
 
     /* Identity heads for frame_skip: a unit band mask and zero coefficients.
      * Written once at init; dfn2_compose_stream refuses NULL heads, so the
@@ -74,6 +83,7 @@ struct DFN2Prepost {
     float *skip_coefs;      /* [DFN2_PREPOST_COEFS_ELEMENTS], all 0.0f      */
 
     int       frame_open;    /* a frame awaits commit or skip               */
+    int       live;          /* the bank the graph reads: 0 or 1            */
     int       prepared;      /* frame_inputs() armed the accelerator
                               * transaction for the open frame              */
     int       have_output;   /* the compose stage emitted this hop          */
@@ -161,10 +171,10 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
         DFN2_PREPOST_ERB_MASK_ELEMENTS,          /* head_erb_mask */
         DFN2_PREPOST_COEFS_ELEMENTS,             /* head_coefs    */
         DFN2_PREPOST_ALPHA_ELEMENTS,             /* head_alpha    */
-        DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS,    /* next_encoder  */
-        DFN2_PREPOST_ERB_HIDDEN_ELEMENTS,        /* next_erb      */
-        DFN2_PREPOST_DF_HIDDEN_ELEMENTS,         /* next_df       */
-        DFN2_PREPOST_CONVP_HISTORY_ELEMENTS,     /* next_convp    */
+        DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS,    /* bank[1].encoder */
+        DFN2_PREPOST_ERB_HIDDEN_ELEMENTS,        /* bank[1].erb     */
+        DFN2_PREPOST_DF_HIDDEN_ELEMENTS,         /* bank[1].df      */
+        DFN2_PREPOST_CONVP_HISTORY_ELEMENTS,     /* bank[1].convp   */
         DFN2_PREPOST_ERB_MASK_ELEMENTS,          /* skip_mask     */
         DFN2_PREPOST_COEFS_ELEMENTS              /* skip_coefs    */
     };
@@ -180,7 +190,13 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
     if (base && p) p->dsp = (DFN2State *)ptr;
     if (pp_carve(base, &cursor, sizeof(DFN2ModelIOState), &ptr) != 0)
         return -1;
-    if (base && p) p->io = (DFN2ModelIOState *)ptr;
+    if (base && p) {
+        p->io = (DFN2ModelIOState *)ptr;
+        p->bank[0].encoder = &p->io->encoder_gru_hidden[0][0];
+        p->bank[0].erb = &p->io->erb_gru_hidden[0][0];
+        p->bank[0].df = &p->io->df_gru_hidden[0][0];
+        p->bank[0].convp = &p->io->df_convp_history[0][0][0];
+    }
 
     /* DFN2_IO_TIME only: the output hop staging. Everything else the framing
      * needs is embedded in DFN2State by value (see the header's honest note
@@ -196,9 +212,9 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
         slots[2]  = &p->feat_erb;      slots[3]  = &p->feat_spec;
         slots[4]  = &p->enh_re;        slots[5]  = &p->enh_im;
         slots[6]  = &p->head_erb_mask; slots[7]  = &p->head_coefs;
-        slots[8]  = &p->head_alpha;    slots[9]  = &p->next_encoder;
-        slots[10] = &p->next_erb;      slots[11] = &p->next_df;
-        slots[12] = &p->next_convp;    slots[13] = &p->skip_mask;
+        slots[8]  = &p->head_alpha;    slots[9]  = &p->bank[1].encoder;
+        slots[10] = &p->bank[1].erb;   slots[11] = &p->bank[1].df;
+        slots[12] = &p->bank[1].convp; slots[13] = &p->skip_mask;
         slots[14] = &p->skip_coefs;
     }
     for (i = 0; i < n_float_regions; ++i) {
@@ -281,6 +297,7 @@ static void pp_reset_states(DFN2Prepost *p) {
     }
     dfn2_set_erb_matrices(p->dsp, p->erb_fwd, p->erb_inv);
     dfn2_model_io_init(p->io);
+    p->live = 0;
 }
 
 /* Per-hop bookkeeping only. The staging buffers are deliberately NOT
@@ -447,27 +464,23 @@ int dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame) {
 /* ---- per-hop stages -------------------------------------------------- */
 
 static int pp_all_finite(const float *values, size_t count) {
-    size_t i;
-    for (i = 0; i < count; ++i) {
-        if (!isfinite(values[i])) return 0;
-    }
-    return 1;
+    return skn_all_finite_f32(values, count);
 }
 
 static void pp_fill_nan(float *values, size_t count) {
-    const float nan_value = (float)NAN;
-    size_t i;
-    for (i = 0; i < count; ++i) values[i] = nan_value;
+    skn_fill_f32(values, count, (float)NAN);
 }
 
-/* Features, graph window, compose clock. Shared by both pre_process entry
- * points so the two modes cannot drift in what they advance. Returns the
- * number of accelerator invocations this hop needs: 0 or 1. */
-static int pp_begin_frame(DFN2Prepost *p) {
+/* Features, graph window, compose clock. Shared by every pre_process entry
+ * point so the modes cannot drift in what they advance. `est_*` is the
+ * spectrum the features are taken from, read only inside this call.
+ * Returns the number of accelerator invocations this hop needs: 0 or 1. */
+static int pp_begin_frame(DFN2Prepost *p, const float *est_re,
+                          const float *est_im) {
     int heads_needed;
 
     pp_clear_frame(p);
-    dfn2_compute_features(p->dsp, p->spec_re, p->spec_im, p->feat_erb,
+    dfn2_compute_features(p->dsp, est_re, est_im, p->feat_erb,
                           p->feat_spec);
     heads_needed = dfn2_model_io_push_features(
         p->io, p->feat_erb,
@@ -500,7 +513,7 @@ int dfn2_prepost_pre_process(DFN2Prepost *p,
     dfn2_analysis(p->dsp, in_hop, p->spec_re, p->spec_im);
     p->compose_re = p->spec_re;
     p->compose_im = p->spec_im;
-    return pp_begin_frame(p);
+    return pp_begin_frame(p, p->spec_re, p->spec_im);
 }
 
 int dfn2_prepost_pre_process_freq(DFN2Prepost *p,
@@ -514,7 +527,7 @@ int dfn2_prepost_pre_process_freq(DFN2Prepost *p,
     memcpy(p->spec_im, spec_im, bins);
     p->compose_re = p->spec_re;
     p->compose_im = p->spec_im;
-    return pp_begin_frame(p);
+    return pp_begin_frame(p, p->spec_re, p->spec_im);
 }
 
 int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p,
@@ -526,18 +539,21 @@ int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p,
     if (!p || !est_re || !est_im || !app_re || !app_im) return -1;
     if (p->io_mode != DFN2_IO_FREQ) return -1;
     if (p->frame_open) return -1;
-    memcpy(p->spec_re, est_re, bins);
-    memcpy(p->spec_im, est_im, bins);
+    /* The application spectrum is read again at commit, so it is copied;
+     * the estimate feeds only this hop's features. */
     memcpy(p->apply_re, app_re, bins);
     memcpy(p->apply_im, app_im, bins);
     p->compose_re = p->apply_re;
     p->compose_im = p->apply_im;
-    return pp_begin_frame(p);
+    return pp_begin_frame(p, est_re, est_im);
 }
 
 int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
                               DFN2PrepostOutputs *outputs) {
+    const PPStateBank *live, *spare;
     if (!p || !inputs || !outputs || !p->frame_open) return -1;
+    live = &p->bank[p->live];
+    spare = &p->bank[p->live ^ 1];
 
     memset(inputs, 0, sizeof(*inputs));
     inputs->erb_window =
@@ -546,14 +562,14 @@ int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
         (const float (*)[DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS])
             p->io->spec_window;
     inputs->encoder_gru_hidden =
-        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->encoder_gru_hidden;
+        (const float (*)[DFN2_MODEL_GRU_HIDDEN])live->encoder;
     inputs->erb_gru_hidden =
-        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->erb_gru_hidden;
+        (const float (*)[DFN2_MODEL_GRU_HIDDEN])live->erb;
     inputs->df_gru_hidden =
-        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->df_gru_hidden;
+        (const float (*)[DFN2_MODEL_GRU_HIDDEN])live->df;
     inputs->df_convp_history =
         (const float (*)[DFN2_MODEL_DF_PATHWAY_HISTORY][DFN2_DF_BINS])
-            p->io->df_convp_history;
+            live->convp;
     inputs->erb_window_elements = DFN2_PREPOST_ERB_WINDOW_ELEMENTS;
     inputs->spec_window_elements = DFN2_PREPOST_SPEC_WINDOW_ELEMENTS;
     inputs->encoder_gru_hidden_elements =
@@ -568,24 +584,24 @@ int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
     pp_fill_nan(p->head_erb_mask, DFN2_PREPOST_ERB_MASK_ELEMENTS);
     pp_fill_nan(p->head_coefs, DFN2_PREPOST_COEFS_ELEMENTS);
     pp_fill_nan(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS);
-    pp_fill_nan(p->next_encoder, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS);
-    pp_fill_nan(p->next_erb, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS);
-    pp_fill_nan(p->next_df, DFN2_PREPOST_DF_HIDDEN_ELEMENTS);
-    pp_fill_nan(p->next_convp, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS);
+    pp_fill_nan(spare->encoder, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS);
+    pp_fill_nan(spare->erb, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS);
+    pp_fill_nan(spare->df, DFN2_PREPOST_DF_HIDDEN_ELEMENTS);
+    pp_fill_nan(spare->convp, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS);
 
     memset(outputs, 0, sizeof(*outputs));
     outputs->erb_mask = p->head_erb_mask;
     outputs->coefs = p->head_coefs;
     outputs->alpha = p->head_alpha;
     outputs->encoder_gru_hidden_next =
-        (float (*)[DFN2_MODEL_GRU_HIDDEN])p->next_encoder;
+        (float (*)[DFN2_MODEL_GRU_HIDDEN])spare->encoder;
     outputs->erb_gru_hidden_next =
-        (float (*)[DFN2_MODEL_GRU_HIDDEN])p->next_erb;
+        (float (*)[DFN2_MODEL_GRU_HIDDEN])spare->erb;
     outputs->df_gru_hidden_next =
-        (float (*)[DFN2_MODEL_GRU_HIDDEN])p->next_df;
+        (float (*)[DFN2_MODEL_GRU_HIDDEN])spare->df;
     outputs->df_convp_history_next =
         (float (*)[DFN2_MODEL_DF_PATHWAY_HISTORY][DFN2_DF_BINS])
-            p->next_convp;
+            spare->convp;
     outputs->erb_mask_elements = DFN2_PREPOST_ERB_MASK_ELEMENTS;
     outputs->coefs_elements = DFN2_PREPOST_COEFS_ELEMENTS;
     outputs->alpha_elements = DFN2_PREPOST_ALPHA_ELEMENTS;
@@ -633,7 +649,9 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
 }
 
 int dfn2_prepost_frame_commit(DFN2Prepost *p) {
+    const PPStateBank *spare;
     if (!p || !p->prepared) return -1;   /* prepared implies frame_open */
+    spare = &p->bank[p->live ^ 1];
 
     /* Reject-first, in full, before anything moves. Every accelerator
      * output is validated up front -- the three heads AND the four
@@ -643,31 +661,20 @@ int dfn2_prepost_frame_commit(DFN2Prepost *p) {
     if (!pp_all_finite(p->head_erb_mask, DFN2_PREPOST_ERB_MASK_ELEMENTS) ||
         !pp_all_finite(p->head_coefs, DFN2_PREPOST_COEFS_ELEMENTS) ||
         !pp_all_finite(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS) ||
-        !pp_all_finite(p->next_encoder, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS) ||
-        !pp_all_finite(p->next_erb, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS) ||
-        !pp_all_finite(p->next_df, DFN2_PREPOST_DF_HIDDEN_ELEMENTS) ||
-        !pp_all_finite(p->next_convp, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS)) {
+        !pp_all_finite(spare->encoder, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS) ||
+        !pp_all_finite(spare->erb, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS) ||
+        !pp_all_finite(spare->df, DFN2_PREPOST_DF_HIDDEN_ELEMENTS) ||
+        !pp_all_finite(spare->convp, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS)) {
         p->prepared = 0;
         return -1;
     }
 
-    /* Recoverable step first, irreversible step last. The recurrent commit
-     * touches only p->io and, after the preflight, has nothing left to
-     * refuse (dfn2_model_io_commit_state() re-validates the same four
-     * tensors and then only copies); were it ever to refuse, the frame is
-     * still open and the compose clock has not moved. The compose stage then
-     * advances that clock and closes the frame -- the one step with no undo,
-     * placed where nothing can fail after it. The two touch disjoint state,
-     * so this order is byte-identical to the reverse. */
-    if (dfn2_model_io_commit_state(
-            p->io,
-            (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->next_encoder,
-            (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->next_erb,
-            (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->next_df,
-            (const float (*)[DFN2_MODEL_DF_PATHWAY_HISTORY][DFN2_DF_BINS])
-                p->next_convp) != 0) {
-        return -1;
-    }
+    /* The validated bank becomes the live recurrent state. The compose
+     * stage then advances its clock and closes the frame -- the one step
+     * with no undo, placed where nothing can fail after it (its
+     * preconditions -- heads finite, clock aligned -- hold here). The two
+     * touch disjoint state. */
+    p->live ^= 1;
     return pp_close_frame(p, p->head_erb_mask, p->head_coefs,
                           p->head_alpha[0]);
 }

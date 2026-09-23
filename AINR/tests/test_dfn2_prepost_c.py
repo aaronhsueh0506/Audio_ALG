@@ -766,7 +766,7 @@ static int case_dual_guards(FftHandle *fft) {
     DFN2Prepost *pt, *pf;
     void *pool_t, *pool_f;
 
-    CHECK(DFN2_PREPOST_CARVE_VERSION == 2u);
+    CHECK(DFN2_PREPOST_CARVE_VERSION == 3u);
 
     config_time(&cfg_time, fft);
     config_freq(&cfg_freq);

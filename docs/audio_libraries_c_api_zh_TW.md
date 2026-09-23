@@ -498,6 +498,9 @@ ulcnet_prepost_post_process(p, out_hop, &written);
   接著只有兩條路：`_frame_skip()`，或重新 `_frame_inputs()` 再跑一次加速器。
 - **commit 後面一定要有一次 `_frame_inputs()`**（`prepared` 閂鎖，三個類別皆然）：
   沒跑過的加速器不能把沒被碰過的 buffer 當成結果送出。
+- **遞迴 state 是交換不是複製**：commit 讓加速器剛寫的那組 state 直接成為下一幀的輸入
+  （Align-ULCNet 交換 GRU 指標，DeepVQE-S 與 DeepFilterNet2 翻轉兩組 bank），所以 state 張量的
+  輸入／輸出位址**逐幀交替**——runtime 每幀都要照 `_frame_inputs()` 交回的指標綁定，不可在 init 時綁死。
 
 拒絕情境整理：
 
@@ -649,11 +652,11 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 | Align-ULCNet 48 kHz | 32 | 522,928 | 479,824 |
 | Align-ULCNet 48 kHz | 64 | 969,392 | 926,288 |
 | DeepVQE-S 16 kHz | 63 | 1,499,408 | 1,477,808 |
-| DeepFilterNet2 48 kHz | — | 314,464 | 312,416 |
+| DeepFilterNet2 48 kHz | — | 316,688 | 318,768 |
 
-DeepVQE-S 的量體由兩套 16 個 state 的 bank 主宰。DeepFilterNet2 兩個模式只差 2,048 bytes
-（輸出 hop staging）：`DFN2State` 把 analysis/window/synthesis 緩衝以值內嵌，FREQ 實例甩不掉它們，
-**不要期待 AIAEC 那種等比例節省**。
+DeepVQE-S 的量體由兩套 16 個 state 的 bank 主宰。DeepFilterNet2 的 FREQ 反而比 TIME 大 2,080 bytes：
+`DFN2State` 把 analysis/window/synthesis 緩衝以值內嵌，FREQ 實例甩不掉它們，卻要多 carve 雙輸入入口的
+第二組 staging（`apply_re`/`apply_im`）——**不要期待 AIAEC 那種等比例節省**。
 
 ### 6.8 Framing helper：一 hop 一框的 analysis
 

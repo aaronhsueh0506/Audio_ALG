@@ -11,6 +11,7 @@
 #include "audio_resampler.h"
 #include "fft_wrapper.h"
 #include "simd_kernels.h"
+#include "simd_kernel_nn.h"
 
 #define BRIDGE_ALIGN 16u
 #define B48_FFT  DFN2_N_FFT
@@ -404,9 +405,9 @@ static int push_up(DfnRateBridge *b, AudioResampler *up, const float *hop,
  * 512 of history and the next 512 pending, exactly the transform the
  * 48 kHz pipelines' AEC performs on its own hop. */
 static void analyze48(DfnRateBridge *b, const float *fifo, Complex *spec) {
-    int k;
-    for (k = 0; k < B48_FFT; ++k) b->frame48[k] = fifo[k] * b->win48[k];
-    fft_forward(b->fft48, b->frame48, spec);
+    skn_mul_f32(b->frame48, fifo, b->win48, B48_FFT);
+    /* frame48 is this call's own scratch, so the backend may clobber it. */
+    fft_forward_scratch(b->fft48, b->frame48, spec);
 }
 
 int dfn_rate_bridge_process(DfnRateBridge *b,

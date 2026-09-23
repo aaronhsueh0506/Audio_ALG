@@ -74,8 +74,11 @@ shape as the AIAEC classes, described once in `../../AIAEC/README.md`
 the first hop (the graph needs its right-hand neighbour) and 1 after; the
 spectra at the `DFN2_IO_FREQ` boundary are torch.stft normalized=True on this
 48 kHz/1024 grid, so chaining an AIAEC spectrum in is a 32x scale error (the
-header's warning block); and the window is copied rather than borrowed
-because `DFN2State` embeds its table by value. Its gate is
+header's warning block); the window is copied rather than borrowed
+because `DFN2State` embeds its table by value; and the recurrent state lives
+in two banks that swap roles on every committed frame, so the accelerator's
+state input and output addresses alternate and must be re-read from
+`dfn2_prepost_frame_inputs()` every frame. Its gate is
 `../tests/test_dfn2_prepost_c.py`; `make -C .. lib` ships it in
 `libainr_prepost.a` (`make -C .. print-lib-path` prints the configuration-keyed
 location).

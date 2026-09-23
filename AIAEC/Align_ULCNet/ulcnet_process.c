@@ -14,6 +14,8 @@
 #include <math.h>
 #include <string.h>
 
+#include "simd_kernel_nn.h"
+
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
@@ -38,14 +40,9 @@ void ulcnet_make_window(float window[ULCNET_N_FFT]) {
  * the Python parity gate compares bin by bin. */
 static void ulcnet_rfft(UlcnetAnalysis *st, const float *segment,
                         float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
-    int k;
-    for (k = 0; k < ULCNET_N_FFT; ++k)
-        st->seg[k] = segment[k] * st->window[k];
+    skn_mul_f32(st->seg, segment, st->window, ULCNET_N_FFT);
     fft_forward_scratch(st->fft, st->seg, st->spec);
-    for (k = 0; k < ULCNET_BINS; ++k) {
-        out_re[k] = st->spec[k].r;
-        out_im[k] = st->spec[k].i;
-    }
+    skn_deinterleave_cf32(st->spec, out_re, out_im, ULCNET_BINS);
 }
 
 /* ============================== analysis ============================== */
@@ -150,11 +147,8 @@ int ulcnet_synthesis_push(UlcnetSynthesis *st,
                           const float re[ULCNET_BINS],
                           const float im[ULCNET_BINS],
                           float out[ULCNET_HOP]) {
-    int i, k, emitted;
-    for (k = 0; k < ULCNET_BINS; ++k) {
-        st->spec[k].r = re[k];
-        st->spec[k].i = im[k];
-    }
+    int emitted;
+    skn_interleave_cf32(re, im, st->spec, ULCNET_BINS);
     /* IRFFT: the Hermitian upper half is implied by the real transform --
      * no explicit mirror, no full complex FFT. Both wrapper backends
      * normalise by 1/N (fft_wrapper.h contract), matching torch.istft's
@@ -164,11 +158,8 @@ int ulcnet_synthesis_push(UlcnetSynthesis *st,
     /* Every frame lands at local offset 0: after each push the leading HOP
      * samples are finalized and shifted out, so the accumulator origin
      * always advances exactly one hop per frame. */
-    for (i = 0; i < ULCNET_N_FFT; ++i) {
-        float w = st->window[i];
-        st->acc[i] += st->time[i] * w;
-        st->env[i] += w * w;
-    }
+    sk_wola_accumulate_f32(st->acc, st->time, st->window, ULCNET_N_FFT);
+    sk_wola_accumulate_f32(st->env, st->window, st->window, ULCNET_N_FFT);
     /* Saturate at 2, guarded BEFORE the increment: consumers only
      * distinguish 0 / 1 / >= 2, so the clamp is semantics-preserving while
      * preventing signed overflow (UB) on unbounded streams. */
@@ -177,10 +168,7 @@ int ulcnet_synthesis_push(UlcnetSynthesis *st,
     emitted = 0;
     if (st->frames_seen > 1) {
         /* frame 0's finalized block lies inside the trimmed half window */
-        for (i = 0; i < ULCNET_HOP; ++i) {
-            float e = st->env[i];
-            out[i] = st->acc[i] / (e > 1e-11f ? e : 1e-11f);
-        }
+        skn_div_floor_f32(out, st->acc, st->env, ULCNET_HOP, 1e-11f);
         emitted = ULCNET_HOP;
     }
     memmove(st->acc, st->acc + ULCNET_HOP,
@@ -195,35 +183,26 @@ int ulcnet_synthesis_push(UlcnetSynthesis *st,
 }
 
 int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]) {
-    int i, n;
+    int n;
     if (st->frames_seen == 0) return 0;
     n = ULCNET_N_FFT - ULCNET_HOP;
-    for (i = 0; i < n; ++i) {
-        float e = st->env[i];
-        out[i] = st->acc[i] / (e > 1e-11f ? e : 1e-11f);
-    }
+    skn_div_floor_f32(out, st->acc, st->env, (size_t)n, 1e-11f);
     return n;
 }
 
 /* ---- model callback step (shared by the pipeline wrappers) --------------- */
 
 int ulcnet_frame_is_finite(const float re[ULCNET_BINS], const float im[ULCNET_BINS]) {
-    int k;
-    for (k = 0; k < ULCNET_BINS; k++) {
-        if (!isfinite(re[k]) || !isfinite(im[k])) return 0;
-    }
-    return 1;
+    return skn_all_finite_f32(re, ULCNET_BINS) &&
+           skn_all_finite_f32(im, ULCNET_BINS);
 }
 
 int ulcnet_model_run_frame(const UlcnetModel *model,
                            const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
                            const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
                            float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
-    int k;
-    for (k = 0; k < ULCNET_BINS; k++) {
-        out_re[k] = NAN;
-        out_im[k] = NAN;
-    }
+    skn_fill_f32(out_re, ULCNET_BINS, NAN);
+    skn_fill_f32(out_im, ULCNET_BINS, NAN);
     if (model->infer(model->user, err_re, err_im, far_re, far_im, out_re, out_im) != 0)
         return 0;
     return ulcnet_frame_is_finite(out_re, out_im);

@@ -605,9 +605,86 @@ static int test_dfn_dual_state_disjoint(void)
     return 1;
 }
 
+/* The ERB feature sum and the mask expansion visit only the matrices'
+ * nonzero spans (DFN2State). Checked here against the plain dense sums,
+ * bit for bit, including the cases the spans must not change: powers that
+ * overflow to Inf, NaN spectra, non-finite band gains, and matrices with
+ * NaN/Inf entries, an all-zero row and zero holes inside a span. */
+static int test_dfn_erb_spans_exact(void)
+{
+    static DFN2State st;
+    static float fwd[513][32], inv[32][513], coefs[DFN2_DF_BINS * DFN2_DF_ORDER * 2];
+    float re[513], im[513], fe[32], fs[2 * DFN2_DF_BINS], mask[32];
+    float out_re[513], out_im[513], ref_state[32], erb[32], ref_gain[513];
+    const float scale2 = DFN2_ANALYSIS_SCALE * DFN2_ANALYSIS_SCALE;
+    uint32_t lcg = 12345u;
+
+    dfn_test_build_erb();
+    memset(coefs, 0, sizeof(coefs));
+    for (int variant = 0; variant < 3; ++variant) {
+        memcpy(fwd, dfn_test_fwd, sizeof(fwd));
+        memcpy(inv, dfn_test_inv, sizeof(inv));
+        if (variant == 1) {
+            fwd[10][5] = NAN;
+            fwd[300][0] = INFINITY;
+            memset(fwd[7], 0, sizeof(fwd[7]));
+            fwd[200][20] = 0.0f;       /* a hole inside a span */
+            inv[3][40] = -0.0f;
+            inv[20][0] = 0.5f;         /* a far outlier widens the span */
+        } else if (variant == 2) {
+            for (int k = 0; k < 513; ++k) fwd[k][(k * 7) % 32] += 0.125f;
+            inv[31][3] = 0.25f;
+        }
+        dfn2_state_init(&st, NULL);
+        dfn2_set_erb_matrices(&st, &fwd[0][0], &inv[0][0]);
+        memcpy(ref_state, st.erb_norm_state, sizeof(ref_state));
+        for (int frame = 0; frame < 24; ++frame) {
+            for (int k = 0; k < 513; ++k) {
+                lcg = lcg * 1664525u + 1013904223u;
+                re[k] = (float)(int32_t)lcg * 4.6566e-10f;
+                lcg = lcg * 1664525u + 1013904223u;
+                im[k] = (float)(int32_t)lcg * 4.6566e-10f;
+            }
+            if (frame % 4 == 1) re[37 + frame] = 1e30f;   /* power -> Inf */
+            if (frame % 6 == 3) im[250] = NAN;
+            if (frame % 5 == 2) re[512] = -INFINITY;
+
+            dfn2_compute_features(&st, re, im, fe, fs);
+            memset(erb, 0, sizeof(erb));
+            for (int k = 0; k < 513; ++k) {
+                float p = (re[k] * re[k] + im[k] * im[k]) * scale2;
+                for (int b = 0; b < 32; ++b) erb[b] += p * fwd[k][b];
+            }
+            for (int b = 0; b < 32; ++b) {
+                float db = 10.0f * log10f(erb[b] + DFN2_ERB_LOG_FLOOR);
+                float mean = DFN2_ERB_NORM_ALPHA * ref_state[b] +
+                             (1.0f - DFN2_ERB_NORM_ALPHA) * db;
+                float ref = (db - mean) / DFN2_ERB_NORM_SCALE_DB;
+                ref_state[b] = mean;
+                CHECK(memcmp(&fe[b], &ref, sizeof(ref)) == 0,
+                      "DFN2 ERB features over the nonzero spans equal the dense sum");
+            }
+
+            for (int b = 0; b < 32; ++b) mask[b] = 0.3f + 0.02f * (float)b;
+            if (frame % 3 == 0) mask[frame % 32] = (frame & 1) ? INFINITY : NAN;
+            if (frame % 7 == 2) mask[0] = -INFINITY;
+            if (frame % 10 == 9) mask[31] = -0.0f;
+            (void)dfn2_compose(&st, re, im, mask, coefs, 0.5f, out_re, out_im);
+            memset(ref_gain, 0, sizeof(ref_gain));
+            for (int b = 0; b < 32; ++b)
+                for (int k = 0; k < 513; ++k) ref_gain[k] += inv[b][k] * mask[b];
+            CHECK(memcmp(st.scratch_bin_gain, ref_gain, sizeof(ref_gain)) == 0,
+                  "DFN2 mask expansion over the nonzero spans equals the dense sum");
+        }
+    }
+    return 1;
+}
+
 static int run_all_tests(void)
 {
     uint64_t digest = UINT64_C(1469598103934665603);
+    CHECK(test_dfn_erb_spans_exact(),
+          "DFN2 ERB nonzero spans are exact");
     CHECK(test_dfn2_model_io(), "DFN2 stateless model I/O");
     CHECK(test_dfn_stream_alignment(), "DFN streaming head alignment");
     CHECK(test_dfn_dual_state_disjoint(),
