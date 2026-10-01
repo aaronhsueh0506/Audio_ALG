@@ -561,6 +561,12 @@ def _fuse_contexts(
     if weight_sum <= 1e-12:
         raise ValueError("beamformer has zero weight on all channels")
     norm_weight = channel_weight / weight_sum
+    # Match fuse_contexts() in the C core: a lane that contributes no
+    # spectrum must not steer the post-beam suppressor's three control
+    # scalars. Test coefficients directly, not normalized magnitudes, so a
+    # genuinely nonzero coefficient cannot disappear through underflow.
+    contributes = np.any((weights.real != 0.0) | (weights.imag != 0.0), axis=1)
+    contributors = [c for c, active in zip(contexts, contributes) if active]
     far_powers = np.asarray([c.far_power for c in contexts], dtype=np.float64)
     if not np.allclose(far_powers, far_powers[0], rtol=1e-6, atol=1e-9):
         raise ValueError("linear AEC lanes do not share one far-end power")
@@ -573,12 +579,12 @@ def _fuse_contexts(
         far_power=shared_far_power,
         far_spec=far_spec.astype(np.complex64),
         near_spec=near_spec.astype(np.complex64),
-        filter_converged=all(c.filter_converged for c in contexts),
+        filter_converged=all(c.filter_converged for c in contributors),
         erle_factor=float(min(c.erle_factor for c in contexts)),
-        dt_indicator=float(max(c.dt_indicator for c in contexts)),
+        dt_indicator=float(max(c.dt_indicator for c in contributors)),
         divergence=float(max(c.divergence for c in contexts)),
         over_sub=float(max(c.over_sub for c in contexts)),
-        saturation_level=float(max(c.saturation_level for c in contexts)),
+        saturation_level=float(max(c.saturation_level for c in contributors)),
         erl_estimate=float(
             sum(float(w) * float(c.erl_estimate) for w, c in zip(norm_weight, contexts))
         ),

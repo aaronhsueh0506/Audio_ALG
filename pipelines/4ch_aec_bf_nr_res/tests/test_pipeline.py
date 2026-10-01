@@ -1,5 +1,6 @@
 """Python four-channel orchestration contract tests."""
 
+from dataclasses import replace
 from importlib import import_module
 
 import numpy as np
@@ -132,6 +133,93 @@ def test_shared_far_reference_survives_zero_sum_beamformer_weights():
     result = pipeline.process_post_beamformer(pre, beamformed)
     assert float(np.linalg.norm(result.context.far_spec)) > 0.0
     assert result.context.far_power > 0.0
+
+
+def _contexts_for_scalar_fusion(sample_rate, frame_size):
+    hop = frame_size // 2
+    pipeline = FourChannelAecPipeline(
+        FourChannelAecConfig(
+            sample_rate=sample_rate, frame_size=frame_size, hop_size=hop
+        )
+    )
+    rng = np.random.default_rng(29)
+    render = (rng.standard_normal(hop) * 0.02).astype(np.float32)
+    microphones = np.stack([render * (0.2 + 0.1 * i) for i in range(4)], axis=1)
+    return pipeline.process_pre_beamformer(microphones, render)
+
+
+@pytest.mark.parametrize("sample_rate,frame_size", [(16000, 256), (16000, 512), (48000, 1024)])
+@pytest.mark.parametrize("active_lane", range(4))
+def test_zero_weight_lanes_do_not_drive_control_scalars(sample_rate, frame_size, active_lane):
+    """Match the C core's contributor mask without changing its DT policy."""
+    pre = _contexts_for_scalar_fusion(sample_rate, frame_size)
+    contexts = [
+        replace(c, filter_converged=False, dt_indicator=0.9, saturation_level=0.9)
+        for c in pre.contexts
+    ]
+    contexts[active_lane] = replace(
+        contexts[active_lane], filter_converged=True,
+        dt_indicator=0.1, saturation_level=0.2,
+    )
+    weights = np.zeros((4, frame_size // 2 + 1), dtype=np.complex64)
+    weights[active_lane] = 1.0
+    fused = _pipeline._fuse_contexts(
+        contexts, BeamformerFrame(samples=pre.linear_hops[active_lane].copy(), weights=weights)
+    )
+    assert fused.filter_converged
+    assert fused.dt_indicator == pytest.approx(0.1)
+    assert fused.saturation_level == pytest.approx(0.2)
+    np.testing.assert_array_equal(fused.error_spec, contexts[active_lane].error_spec)
+
+
+@pytest.mark.parametrize("sample_rate,frame_size", [(16000, 256), (16000, 512), (48000, 1024)])
+def test_all_contributing_lanes_keep_existing_control_reductions(sample_rate, frame_size):
+    pre = _contexts_for_scalar_fusion(sample_rate, frame_size)
+    contexts = [
+        replace(c, filter_converged=(i != 2), dt_indicator=0.1 * i,
+                saturation_level=0.2 * i)
+        for i, c in enumerate(pre.contexts)
+    ]
+    weights = np.full((4, frame_size // 2 + 1), 0.25, dtype=np.complex64)
+    fused = _pipeline._fuse_contexts(
+        contexts, BeamformerFrame(samples=pre.linear_hops.mean(axis=0), weights=weights)
+    )
+    assert fused.filter_converged == all(c.filter_converged for c in contexts)
+    assert fused.dt_indicator == max(c.dt_indicator for c in contexts)
+    assert fused.saturation_level == max(c.saturation_level for c in contexts)
+
+
+@pytest.mark.parametrize("sample_rate,frame_size", [(16000, 256), (16000, 512), (48000, 1024)])
+def test_single_nonzero_bin_still_votes_on_control_scalars(sample_rate, frame_size):
+    pre = _contexts_for_scalar_fusion(sample_rate, frame_size)
+    contexts = [
+        replace(c, filter_converged=True, dt_indicator=0.1, saturation_level=0.1)
+        for c in pre.contexts
+    ]
+    contexts[3] = replace(
+        contexts[3], filter_converged=False, dt_indicator=0.7, saturation_level=0.8
+    )
+    weights = np.zeros((4, frame_size // 2 + 1), dtype=np.complex64)
+    weights[0] = 1.0
+    # C tests the complex coefficient directly, not a normalized energy or
+    # magnitude that could underflow or round a genuine contributor to zero.
+    weights[3, -1] = complex(0.0, float(np.nextafter(np.float32(0), np.float32(1))))
+    fused = _pipeline._fuse_contexts(
+        contexts, BeamformerFrame(samples=pre.linear_hops[0].copy(), weights=weights)
+    )
+    assert not fused.filter_converged
+    assert fused.dt_indicator == pytest.approx(0.7)
+    assert fused.saturation_level == pytest.approx(0.8)
+
+
+@pytest.mark.parametrize("sample_rate,frame_size", [(16000, 256), (16000, 512), (48000, 1024)])
+def test_zero_weights_remain_rejected(sample_rate, frame_size):
+    pre = _contexts_for_scalar_fusion(sample_rate, frame_size)
+    weights = np.zeros((4, frame_size // 2 + 1), dtype=np.complex64)
+    with pytest.raises(ValueError, match="zero weight"):
+        _pipeline._fuse_contexts(
+            pre.contexts, BeamformerFrame(samples=pre.linear_hops[0].copy(), weights=weights)
+        )
 
 
 def test_default_grids_are_no_padding_power_of_two():
