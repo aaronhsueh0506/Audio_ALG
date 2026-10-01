@@ -89,6 +89,25 @@ static int fake_run(void *user, const UlcnetModelIoInputs *in,
         out->value_now[i] = (float)(0.01 * cos(acc + 2.0 + (double)i));
     for (i = 0; i < out->logit_now_elements; ++i)
         out->logit_now[i] = (float)(0.01 * sin(acc + 3.0 + (double)i));
+    if (out->key_history_out) {
+        const size_t f = ULCNET_MODEL_IO_TA_BINS;
+        const size_t depth = in->key_history_elements / (ULCNET_MODEL_IO_TA_CHANNELS * f) + 1;
+        for (i = 0; i < out->key_history_elements; ++i) {
+            size_t t = (i / f) % (depth - 1);
+            size_t now = (i / ((depth - 1) * f)) * f + i % f;
+            out->key_history_out[i] = t ? in->key_history[i - f]
+                : (float)(0.01 * sin(acc + 1.0 + (double)now));
+            out->value_history_out[i] = t ? in->value_history[i - f]
+                : (float)(0.01 * cos(acc + 2.0 + (double)now));
+        }
+        for (i = 0; i < out->logit_history_elements; ++i) {
+            size_t t = (i / depth) % ULCNET_MODEL_IO_SCORE_HISTORY;
+            size_t now = (i / (ULCNET_MODEL_IO_SCORE_HISTORY * depth)) * depth + i % depth;
+            out->logit_history_out[i] = t + 1 < ULCNET_MODEL_IO_SCORE_HISTORY
+                ? in->logit_history[i + depth]
+                : (float)(0.01 * sin(acc + 3.0 + (double)now));
+        }
+    }
     for (i = 0; i < out->gru_hidden_elements; ++i) {
         out->h_gru0_out[i] = (float)(0.5 * sin(acc + 4.0 + (double)i));
         out->h_gru1_out[i] = (float)(0.5 * cos(acc + 5.0 + (double)i));
@@ -902,6 +921,57 @@ static int case_guard(FftHandle *fft) {
     return 0;
 }
 
+static int case_full_history(FftHandle *fft) {
+    UlcnetPrepostConfig cfg;
+    UlcnetPrepostMemReq old_req, full_req;
+    UlcnetPrepost *legacy, *full;
+    void *pool;
+    int hop;
+    CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_TIME, D) == 0);
+    cfg.fft = fft;
+    cfg.window = window;
+    CHECK(ulcnet_prepost_get_mem_size(&cfg, &old_req) == 0);
+    legacy = ulcnet_prepost_create(&cfg);
+    CHECK(legacy);
+    cfg.model_layout_version = ULCNET_MODEL_IO_FULL_HISTORY_VERSION;
+    CHECK(ulcnet_prepost_get_mem_size(&cfg, &full_req) == 0);
+    CHECK(full_req.layout_version == ULCNET_MODEL_IO_FULL_HISTORY_VERSION);
+    CHECK(full_req.bytes > old_req.bytes && full_req.build_flags_hash != old_req.build_flags_hash);
+    pool = alloc_aligned(full_req.alignment, (size_t)full_req.bytes);
+    CHECK(pool);
+    CHECK(!ulcnet_prepost_init_ex(pool, (size_t)full_req.bytes, &cfg, &old_req));
+    full = ulcnet_prepost_init_ex(pool, (size_t)full_req.bytes, &cfg, &full_req);
+    CHECK(full && ulcnet_prepost_descriptor(full)->layout_version == full_req.layout_version);
+    cfg.model_layout_version = 13; /* combined GRU is not the C contract */
+    CHECK(ulcnet_prepost_get_mem_size(&cfg, &full_req) != 0);
+    for (hop = 0; hop < SHORT_HOPS; ++hop) {
+        UlcnetPrepost *p[] = {legacy, full};
+        int arm;
+        for (arm = 0; arm < 2; ++arm) {
+            UlcnetModelIoInputs in;
+            UlcnetModelIoOutputs out;
+            if (hop == 17) ulcnet_prepost_reset(p[arm]); /* odd parity reset */
+            CHECK(ulcnet_prepost_pre_process(p[arm], pcm_error + hop * ULCNET_HOP,
+                                            pcm_far + hop * ULCNET_HOP) == 1);
+            CHECK(ulcnet_prepost_frame_inputs(p[arm], &in, &out) == 0);
+            CHECK(fake_run(NULL, &in, &out) == 0);
+            if (hop == 5) {
+                out.h_gru1_out[0] = NAN;
+                CHECK(ulcnet_prepost_frame_commit(p[arm]) != 0);
+                CHECK(ulcnet_prepost_frame_skip(p[arm]) == 0);
+            } else if (hop == 7) {
+                CHECK(ulcnet_prepost_frame_skip(p[arm]) == 0);
+            } else CHECK(ulcnet_prepost_frame_commit(p[arm]) == 0);
+            CHECK(ulcnet_prepost_post_process(p[arm],
+                  (arm ? out_b : out_a) + hop * ULCNET_HOP, NULL) == 0);
+        }
+    }
+    CHECK(identical(out_a, out_b, SHORT_HOPS * ULCNET_HOP));
+    ulcnet_prepost_destroy(legacy);
+    free(pool);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     void *fft_mem = NULL;
     FftHandle *fft;
@@ -924,6 +994,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "reset") == 0)     status = case_reset(fft);
     else if (strcmp(argv[1], "skip") == 0)      status = case_skip();
     else if (strcmp(argv[1], "guard") == 0)     status = case_guard(fft);
+    else if (strcmp(argv[1], "full") == 0)      status = case_full_history(fft);
     else {
         fprintf(stderr, "unknown case: %s\n", argv[1]);
         status = 2;
@@ -953,8 +1024,8 @@ def audio_common_lib():
     return lib
 
 
-@pytest.fixture(scope='module')
-def driver(tmp_path_factory, audio_common_lib):
+@pytest.fixture(scope='module', params=[(16000, 512), (48000, 1024)])
+def driver(tmp_path_factory, audio_common_lib, request):
     """One executable for every case: the class plus the three TUs it
     composes, compiled at the house flags with -Werror."""
     cc = shutil.which('cc') or shutil.which('gcc') or shutil.which('clang')
@@ -967,6 +1038,8 @@ def driver(tmp_path_factory, audio_common_lib):
     subprocess.run(
         [cc, '-O2', '-std=c11',
          '-Wall', '-Wextra', '-Wpedantic', '-Werror', '-ffp-contract=off',
+         '-DULCNET_MODEL_IO_SR=%d' % request.param[0],
+         '-DULCNET_MODEL_IO_N_FFT=%d' % request.param[1],
          '-I', _ULCNET_DIR, '-I', _AC_INCLUDE, str(source),
          *[os.path.join(_ULCNET_DIR, name) for name in _SOURCES],
          audio_common_lib, '-lm', '-o', str(executable)],
@@ -1042,3 +1115,7 @@ def test_frame_state_machine_guards(driver):
     transaction until a fresh frame_inputs -- which NaN-refills every
     accelerator output. Skipping needs no frame_inputs at all."""
     _run(driver, 'guard')
+
+
+def test_full_history_time_mode_equivalence_skip_reset_and_stale_pool(driver):
+    _run(driver, 'full')

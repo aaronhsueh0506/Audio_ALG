@@ -21,20 +21,20 @@ struct UlcnetAcceleratorAdapter {
 
 /* The class config this descriptor deploys as.
  *
- * descriptor_validate() pins every field except delay_depth to this build's
- * compile-time grid constants, so a descriptor that validates IS
- * descriptor_default(delay_depth) field for field -- handing the class the
- * depth alone loses nothing, and the class rebuilds the same descriptor.
+ * descriptor_validate() pins geometry to this build. Preserve the graph's
+ * layout as well as D: the same inputs can require delta or full outputs.
  * Validating here also keeps the reject-first contract the header states:
- * a raw-far or out-of-range descriptor never reaches a sizing computation.
+ * an aligned-far or out-of-range descriptor never reaches sizing.
  */
 static int adapter_config(const UlcnetModelIoDescriptor *descriptor,
                           UlcnetPrepostConfig *cfg) {
     if (ulcnet_model_io_descriptor_validate(descriptor) != 0) {
         return -1;
     }
-    return ulcnet_prepost_config_defaults(cfg, ULCNET_IO_FREQ,
-                                          descriptor->delay_depth);
+    if (ulcnet_prepost_config_defaults(cfg, ULCNET_IO_FREQ,
+                                       descriptor->delay_depth) != 0) return -1;
+    cfg->model_layout_version = descriptor->layout_version;
+    return 0;
 }
 
 /* One pool: this header, then the class -- which itself contains the model

@@ -17,6 +17,10 @@ import soundfile as sf
 import torch
 
 from AIAEC.aiaec_common import SignalGrid
+from AIAEC.Align_ULCNet.export_onnx import (
+    FULL_HISTORY_STATE_LAYOUT_VERSION,
+    STATE_LAYOUT_VERSION,
+)
 from AIAEC.Align_ULCNet.model import AlignULCNet
 from AIAEC._streaming_calibration import (
     far_mode_provenance,
@@ -72,8 +76,8 @@ def _argv(*arguments):
         sys.argv = saved
 
 
-@pytest.fixture(scope='module')
-def ulcnet_pair(tmp_path_factory):
+@pytest.fixture(scope='module', params=['delta', 'full'])
+def ulcnet_pair(tmp_path_factory, request):
     """Export a tiny ULCNet graph and record calibration against it."""
     pytest.importorskip('onnx')
     from AIAEC.Align_ULCNet import export_onnx as ulcnet_export
@@ -89,6 +93,7 @@ def ulcnet_pair(tmp_path_factory):
     graph = work / 'model.onnx'
     with _argv('export_onnx.py',
                '--checkpoint', str(checkpoint),
+               '--cache-state-layout', request.param,
                '--output', str(graph)):
         ulcnet_export.main()
 
@@ -100,6 +105,7 @@ def ulcnet_pair(tmp_path_factory):
                '--primary-dir', str(primary_dir),
                '--far-dir', str(far_dir),
                '--output', str(capture),
+               '--cache-state-layout', request.param,
                '--frames', '8'):
         calibration.main('Align_ULCNet')
 
@@ -125,6 +131,11 @@ def test_calibration_and_graph_agree_on_the_d_chain(ulcnet_pair):
     assert capture_report['state_layout_version'] == graph_report[
         'state_layout_version'
     ]
+    assert capture_report['cache_state_layout'] == graph_report['cache_state_layout']
+    assert graph_report['state_layout_version'] == (
+        FULL_HISTORY_STATE_LAYOUT_VERSION
+        if graph_report['cache_state_layout'] == 'full'
+        else STATE_LAYOUT_VERSION)
 
 
 def test_calibration_report_records_both_far_seams(ulcnet_pair):

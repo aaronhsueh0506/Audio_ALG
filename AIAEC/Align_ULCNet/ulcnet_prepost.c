@@ -92,11 +92,11 @@ static uint32_t pp_fnv1a(uint32_t h, uint32_t v) {
 
 /* The build identity a pool is only valid for. io_mode is IN here because
  * the two modes carve different regions at the same total-size class. */
-static uint32_t pp_build_hash(int io_mode, int delay_depth) {
+static uint32_t pp_build_hash(int io_mode, int delay_depth, uint32_t layout) {
     uint32_t h = 2166136261u;
     h = pp_fnv1a(h, (uint32_t)ULCNET_SR);
     h = pp_fnv1a(h, (uint32_t)ULCNET_N_FFT);
-    h = pp_fnv1a(h, (uint32_t)ULCNET_MODEL_IO_LAYOUT_VERSION);
+    h = pp_fnv1a(h, layout);
     h = pp_fnv1a(h, (uint32_t)ULCNET_PREPOST_CARVE_VERSION);
     h = pp_fnv1a(h, (uint32_t)io_mode);
     h = pp_fnv1a(h, (uint32_t)delay_depth);
@@ -193,6 +193,8 @@ static int pp_descriptor_for(const UlcnetPrepostConfig *cfg,
                              UlcnetModelIoDescriptor *out) {
     if (ulcnet_model_io_descriptor_default(cfg->delay_depth, out) != 0)
         return -1;
+    if (cfg->model_layout_version)
+        out->layout_version = cfg->model_layout_version;
     return ulcnet_model_io_descriptor_validate(out);
 }
 
@@ -211,9 +213,10 @@ int ulcnet_prepost_get_mem_size(const UlcnetPrepostConfig *cfg,
 
     memset(req, 0, sizeof(*req));
     req->descriptor_version = ULCNET_PREPOST_DESCRIPTOR_VERSION;
-    req->layout_version = ULCNET_MODEL_IO_LAYOUT_VERSION;
+    req->layout_version = descriptor.layout_version;
     req->io_mode = (uint32_t)cfg->io_mode;
-    req->build_flags_hash = pp_build_hash(cfg->io_mode, cfg->delay_depth);
+    req->build_flags_hash = pp_build_hash(cfg->io_mode, cfg->delay_depth,
+                                         descriptor.layout_version);
     req->alignment = (uint32_t)(io_req.alignment > PP_ALIGN
                                 ? io_req.alignment : PP_ALIGN);
     req->bytes = (uint64_t)total;

@@ -21,6 +21,8 @@ from AIAEC.Align_ULCNet.export_onnx import (
     GRU_STATE_LAYOUTS,
     INPUT_NAMES,
     LAYOUT_VERSIONS,
+    FULL_HISTORY_LAYOUT_VERSIONS,
+    FULL_HISTORY_STATE_LAYOUT_VERSION,
     RETIRED_LAYOUT_VERSIONS,
     SIGNAL_INPUTS,
     MAX_DELAY_DEPTH,
@@ -252,6 +254,7 @@ def test_c_descriptor_constants_match_export_contract():
     ).read_text(encoding='utf-8')
     expected = {
         'ULCNET_MODEL_IO_LAYOUT_VERSION': STATE_LAYOUT_VERSION,
+        'ULCNET_MODEL_IO_FULL_HISTORY_VERSION': FULL_HISTORY_STATE_LAYOUT_VERSION,
         'ULCNET_MODEL_IO_MIN_D': MIN_DELAY_DEPTH,
         'ULCNET_MODEL_IO_MAX_D': MAX_DELAY_DEPTH,
         'ULCNET_MODEL_IO_TA_CHANNELS': TA_CHANNELS,
@@ -546,3 +549,74 @@ def test_streaming_export_rejects_a_non_verified_grid():
     off = AlignULCNet(GRID, max_delay_frames=D, gamma=4).eval()
     with pytest.raises(ValueError, match='gamma, subband_bins'):
         AlignUlcnetStreamingExport(off)
+
+
+@pytest.mark.parametrize('sample_rate,n_fft', SUPPORTED_GRIDS)
+@pytest.mark.parametrize('depth', [2, 8, 64])
+@pytest.mark.parametrize('feature,gru', sorted(LAYOUT_VERSIONS))
+def test_full_histories_match_legacy_for_every_frame(sample_rate, n_fft, depth, feature, gru):
+    torch.manual_seed(711)
+    grid = SignalGrid(sample_rate, n_fft, n_fft, n_fft // 2)
+    model = AlignULCNet(grid, max_delay_frames=depth).eval()
+    delta = AlignUlcnetStreamingExport(model, feature, gru).eval()
+    full = AlignUlcnetStreamingExport(model, feature, gru, 'full').eval()
+    ds = dummy_inputs(depth, grid.n_freqs, ta_bins_for(model), delta.layout)[delta.layout.signal_inputs:]
+    fs = tuple(value.clone() for value in ds)
+    assert full.layout.layout_version == FULL_HISTORY_LAYOUT_VERSIONS[(feature, gru)]
+    assert full.layout.layout_version not in LAYOUT_VERSIONS.values()
+    assert full.layout.output_names[1:4] == (
+        'key_history_out', 'value_history_out', 'logit_history_out')
+    with torch.no_grad():
+        for _ in range(depth + 5):
+            signals = graph_signals(model, torch.randn(1, 1, grid.n_freqs, 2),
+                                    torch.randn(1, 1, grid.n_freqs, 2), full.layout)
+            do, fo = delta(*signals, *ds), full(*signals, *fs)
+            assert torch.equal(do[0], fo[0])
+            ds = next_state(ds, do, depth, delta.layout)
+            fs = next_state(fs, fo, depth, full.layout)
+            for reference, candidate, output in zip(ds, fs, fo[1:]):
+                assert torch.equal(reference, candidate)
+                assert candidate is output  # no host shift/concat/copy
+
+
+@pytest.mark.parametrize('sample_rate,n_fft', SUPPORTED_GRIDS)
+@pytest.mark.parametrize('depth', [2, 8])
+def test_full_history_onnx_closed_loop_and_metadata(tmp_path, sample_rate, n_fft, depth):
+    onnx = pytest.importorskip('onnx')
+    ort = pytest.importorskip('onnxruntime')
+    torch.manual_seed(733)
+    grid = SignalGrid(sample_rate, n_fft, n_fft, n_fft // 2)
+    model = AlignULCNet(grid, max_delay_frames=depth).eval()
+    checkpoint = tmp_path / 'ckpt.pt'
+    torch.save({'contract': {}, 'state_dict': model.state_dict()}, checkpoint)
+    path = tmp_path / 'full.onnx'
+    wrapper, inputs, meta = export_graph(model, str(checkpoint), str(path),
+                                        verify=True, cache_state_layout='full')
+    assert meta['state_layout_version'] == FULL_HISTORY_STATE_LAYOUT_VERSION
+    assert meta['cache_state_layout'] == 'full'
+    assert not meta['cpu_delta_state_update']
+    shapes = state_shapes(depth, ta_bins_for(model))
+    for name in ('key_history', 'value_history', 'logit_history'):
+        assert meta['output_schema'][name + '_out'] == list(shapes[name])
+    graph = onnx.load(str(path))
+    for tensor in graph.graph.output:
+        assert all(dim.dim_value > 0 for dim in tensor.type.tensor_type.shape.dim)
+    session = ort.InferenceSession(str(path), providers=['CPUExecutionProvider'])
+    layout = wrapper.layout
+    assert tuple(v.name for v in session.get_outputs()) == layout.output_names
+    # The ORT sequence feeds its OWN returned full histories into the next
+    # call, not the torch histories (which would mask a recurrent mismatch).
+    state = inputs[layout.signal_inputs:]
+    ort_state = tuple(t.numpy().copy() for t in state)
+    reference = AlignUlcnetStreamingExport(model).eval()
+    with torch.no_grad():
+        for _ in range(2 * depth + 5):
+            signals = stream_features(model, torch.randn(1, 1, grid.n_freqs, 2),
+                                      torch.randn(1, 1, grid.n_freqs, 2))
+            expected = reference(*signals, *state)
+            state = next_state(state, expected, depth)
+            actual = session.run(None, dict(zip(layout.input_names,
+                                  tuple(t.numpy() for t in signals) + ort_state)))
+            for got, want in zip(actual, (expected[0],) + state):
+                np.testing.assert_allclose(got, want.numpy(), atol=3e-4, rtol=1e-5)
+            ort_state = tuple(actual[1:])

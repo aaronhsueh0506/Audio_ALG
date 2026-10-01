@@ -2,9 +2,9 @@
  *
  * The accelerator owns no persistent state.  This helper carves CPU-owned
  * K/V history, score-convolution history and temporal-GRU hidden tensors from
- * one caller-provided pool.  The ONNX graph returns only the current K/V/logit
- * entries and next GRU hidden tensors; commit() validates and incorporates
- * them into the state used by the next invocation.
+ * one caller-provided pool. Layout 8 returns current K/V/logit entries;
+ * layout 12 returns full next histories to a separate bank. commit() checks
+ * all outputs before advancing any state. No input/output alias is required.
  *
  * This file does not invoke an accelerator and does not contain STFT/WOLA.
  * Audio framing remains in ulcnet_process.c; a board adapter binds the views
@@ -54,10 +54,11 @@ extern "C" {
  * ('host','combined') = 9 stacks both subband hiddens into one h_gru tensor;
  * ('graph','split') = 10 binds the two raw RI spectra and runs the
  * front/back ends inside the graph; ('graph','combined') = 11 does both.
- * Nothing here binds anything but 8, so a board built against this header
- * refuses the other three -- which is the intent.  The next real bump of
- * this constant must therefore go to 12. */
+ * This C helper accepts host/split only: delta layout 8 and full-history
+ * layout 12. Versions 9-11 and 13-15 are different feature/GRU boundaries
+ * and are rejected. Default remains 8 for existing exported graphs. */
 #define ULCNET_MODEL_IO_LAYOUT_VERSION 8u
+#define ULCNET_MODEL_IO_FULL_HISTORY_VERSION 12u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
@@ -172,9 +173,13 @@ typedef struct UlcnetModelIoInputs {
     size_t gru_hidden_elements;
 } UlcnetModelIoInputs;
 
-/* Accelerator-writable delta-state outputs:
+/* Accelerator-writable outputs.  Layout 8 (delta):
  *   key/value now [1,32,1,TA_BINS];
  *   logit now     [1,32,1,D];
+ * layout 12 (full history), in the *_history_out fields instead:
+ *   key/value history [1,32,D-1,TA_BINS];
+ *   logit history     [1,32,4,D];
+ * both layouts:
  *   GRU next      [1,2,1,128].
  * prepare() fills every element with NaN so commit() detects partial writes.
  */
@@ -190,6 +195,16 @@ typedef struct UlcnetModelIoOutputs {
     size_t value_now_elements;
     size_t logit_now_elements;
     size_t gru_hidden_elements;
+    /* Layout 12 only: complete next states, exactly the input shapes/order.
+     * Layout 8 publishes NULL/0 here; layout 12 publishes NULL/0 in *_now.
+     * Bind these outputs to the provided spare bank, NEVER to live inputs.
+     * Re-read all bindings after each prepare (success swaps bank roles). */
+    float *key_history_out;
+    float *value_history_out;
+    float *logit_history_out;
+    size_t key_history_elements;
+    size_t value_history_elements;
+    size_t logit_history_elements;
 } UlcnetModelIoOutputs;
 
 typedef struct UlcnetModelIoState UlcnetModelIoState;
@@ -253,11 +268,11 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
                             UlcnetModelIoOutputs *outputs);
 
 /* Validate that prepare() started a transaction and that the accelerator
- * wrote every output, then advance the K/V/logit rings, swap in next GRU
- * hidden tensors, and unpack enhanced RI to separate C arrays.  One prepare
- * permits one commit attempt.  On failure
- * persistent model state and caller outputs remain unchanged, the transaction
- * is discarded, and -1 is returned. */
+ * wrote every output, then advance the K/V/logit rings (layout 8) or swap the
+ * full-history bank (layout 12), swap in the next GRU hidden tensors, and
+ * unpack enhanced RI to separate C arrays.  One prepare permits one commit
+ * attempt.  On failure persistent model state and caller outputs remain
+ * unchanged, the transaction is discarded, and -1 is returned. */
 int ulcnet_model_io_commit(UlcnetModelIoState *state,
                            float enhanced_re[ULCNET_MODEL_IO_BINS],
                            float enhanced_im[ULCNET_MODEL_IO_BINS]);

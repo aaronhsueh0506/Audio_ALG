@@ -22,6 +22,8 @@ struct UlcnetModelIoState {
     float *error_sin;
     float *error_ri;
 
+    /* Delta outputs in v8; complete spare history banks in v12. The
+     * internal *_now_elements counts follow that selected output ABI. */
     float *key_now;
     float *value_now;
     float *logit_now;
@@ -37,6 +39,7 @@ struct UlcnetModelIoState {
     size_t value_now_elements;
     size_t logit_now_elements;
     int prepared;
+    int bank; /* Successful commits since reset, modulo two. */
 };
 
 typedef struct UlcnetModelIoCounts {
@@ -102,6 +105,10 @@ static int add_float_regions(size_t count, size_t elements, size_t *bytes) {
     return 0;
 }
 
+static int is_full_history(const UlcnetModelIoDescriptor *descriptor) {
+    return descriptor->layout_version == ULCNET_MODEL_IO_FULL_HISTORY_VERSION;
+}
+
 static int compute_counts(const UlcnetModelIoDescriptor *descriptor,
                           UlcnetModelIoCounts *counts) {
     size_t channels;
@@ -139,6 +146,11 @@ static int compute_counts(const UlcnetModelIoDescriptor *descriptor,
     counts->value_history_elements = counts->key_history_elements;
     counts->key_now_elements = one_feature;
     counts->value_now_elements = one_feature;
+    if (is_full_history(descriptor)) {
+        counts->key_now_elements = counts->key_history_elements;
+        counts->value_now_elements = counts->value_history_elements;
+        counts->logit_now_elements = counts->logit_history_elements;
+    }
     return 0;
 }
 
@@ -178,7 +190,8 @@ const char *ulcnet_far_input_mode_name(int mode) {
 int ulcnet_model_io_descriptor_validate(
     const UlcnetModelIoDescriptor *descriptor) {
     if (!descriptor ||
-        descriptor->layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION ||
+        (descriptor->layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION &&
+         descriptor->layout_version != ULCNET_MODEL_IO_FULL_HISTORY_VERSION) ||
         descriptor->delay_depth < ULCNET_MODEL_IO_MIN_D ||
         descriptor->delay_depth > ULCNET_MODEL_IO_MAX_D ||
         descriptor->sample_rate != ULCNET_MODEL_IO_SR ||
@@ -302,10 +315,29 @@ UlcnetModelIoState *ulcnet_model_io_init(
     return state;
 }
 
+static void swap_buffers(float **live, float **next) {
+    float *temporary = *live;
+    *live = *next;
+    *next = temporary;
+}
+
+static void swap_state_banks(UlcnetModelIoState *state) {
+    if (is_full_history(&state->descriptor)) {
+        swap_buffers(&state->key_history, &state->key_now);
+        swap_buffers(&state->value_history, &state->value_now);
+        swap_buffers(&state->logit_history, &state->logit_now);
+    }
+    swap_buffers(&state->h_gru0, &state->h_gru0_out);
+    swap_buffers(&state->h_gru1, &state->h_gru1_out);
+    state->bank ^= 1;
+}
+
 void ulcnet_model_io_reset(UlcnetModelIoState *state) {
     if (!state) {
         return;
     }
+    /* Restore the initial bindings even after an odd number of commits. */
+    if (state->bank) swap_state_banks(state);
     memset(state->key_history, 0,
            state->key_history_elements * sizeof(float));
     memset(state->value_history, 0,
@@ -392,26 +424,51 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     inputs->logit_history_elements = state->logit_history_elements;
     inputs->gru_hidden_elements = state->gru_hidden_elements;
 
+    memset(outputs, 0, sizeof(*outputs));
     outputs->output = state->output;
-    outputs->key_now = state->key_now;
-    outputs->value_now = state->value_now;
-    outputs->logit_now = state->logit_now;
+    if (is_full_history(&state->descriptor)) {
+        outputs->key_history_out = state->key_now;
+        outputs->value_history_out = state->value_now;
+        outputs->logit_history_out = state->logit_now;
+        outputs->key_history_elements = state->key_history_elements;
+        outputs->value_history_elements = state->value_history_elements;
+        outputs->logit_history_elements = state->logit_history_elements;
+    } else {
+        outputs->key_now = state->key_now;
+        outputs->value_now = state->value_now;
+        outputs->logit_now = state->logit_now;
+        outputs->key_now_elements = state->key_now_elements;
+        outputs->value_now_elements = state->value_now_elements;
+        outputs->logit_now_elements = state->logit_now_elements;
+    }
     outputs->h_gru0_out = state->h_gru0_out;
     outputs->h_gru1_out = state->h_gru1_out;
     outputs->spectrum_ri_elements = state->spectrum_ri_elements;
-    outputs->key_now_elements = state->key_now_elements;
-    outputs->value_now_elements = state->value_now_elements;
-    outputs->logit_now_elements = state->logit_now_elements;
     outputs->gru_hidden_elements = state->gru_hidden_elements;
     state->prepared = 1;
     return 0;
 }
 
-static int all_finite(const float *values, size_t elements) {
-    size_t index;
+typedef char ulcnet_model_io_float_is_32_bit[sizeof(float) == sizeof(uint32_t) ? 1 : -1];
 
-    for (index = 0; index < elements; ++index) {
-        if (!isfinite(values[index])) {
+/* True when every value is finite. An infinity or NaN has an all-ones exponent
+ * field, so each element costs one mask-and-compare; the verdict is OR-ed
+ * across a block and tested once per block, which lets the loop vectorise.
+ * Same result as isfinite() on every element. */
+static int all_finite(const float *values, size_t elements) {
+    size_t index = 0;
+
+    while (index < elements) {
+        const size_t end = elements - index > 256u ? index + 256u : elements;
+        uint32_t bad = 0u;
+
+        for (; index < end; ++index) {
+            uint32_t bits;
+
+            memcpy(&bits, &values[index], sizeof(bits));
+            bad |= (uint32_t)((bits & 0x7f800000u) == 0x7f800000u);
+        }
+        if (bad) {
             return 0;
         }
     }
@@ -458,7 +515,6 @@ int ulcnet_model_io_commit(UlcnetModelIoState *state,
                            float enhanced_re[ULCNET_MODEL_IO_BINS],
                            float enhanced_im[ULCNET_MODEL_IO_BINS]) {
     const UlcnetModelIoDescriptor *descriptor;
-    float *temporary;
     int bin;
 
     if (!state || !state->prepared || !enhanced_re || !enhanced_im ||
@@ -475,25 +531,21 @@ int ulcnet_model_io_commit(UlcnetModelIoState *state,
     }
 
     descriptor = &state->descriptor;
-    update_feature_history(state->key_history, state->key_now,
-                           descriptor->ta_channels,
-                           descriptor->delay_depth - 1,
-                           descriptor->ta_bins);
-    update_feature_history(state->value_history, state->value_now,
-                           descriptor->ta_channels,
-                           descriptor->delay_depth - 1,
-                           descriptor->ta_bins);
-    update_logit_history(state->logit_history, state->logit_now,
-                         descriptor->ta_channels,
-                         descriptor->score_history_frames,
-                         descriptor->delay_depth);
-
-    temporary = state->h_gru0;
-    state->h_gru0 = state->h_gru0_out;
-    state->h_gru0_out = temporary;
-    temporary = state->h_gru1;
-    state->h_gru1 = state->h_gru1_out;
-    state->h_gru1_out = temporary;
+    if (!is_full_history(descriptor)) {
+        update_feature_history(state->key_history, state->key_now,
+                               descriptor->ta_channels,
+                               descriptor->delay_depth - 1,
+                               descriptor->ta_bins);
+        update_feature_history(state->value_history, state->value_now,
+                               descriptor->ta_channels,
+                               descriptor->delay_depth - 1,
+                               descriptor->ta_bins);
+        update_logit_history(state->logit_history, state->logit_now,
+                             descriptor->ta_channels,
+                             descriptor->score_history_frames,
+                             descriptor->delay_depth);
+    }
+    swap_state_banks(state);
 
     {
         /* The graph emits the COMPRESSED estimate; the fixed inverse

@@ -49,7 +49,8 @@ error</b>（<code>linear_error = mic_postclip − D_hat</code>，不是 oracle r
 0.69 M class）。<code>stream_output_delay = 0</code>。</p>
 <p><b>ONNX / NPU graph boundary</b>（<code>Align_ULCNet/export_onnx.py</code> 匯出 stateless
 one-frame graph，K/V/logit/GRU state 全部顯式 I/O，boundary 標記
-<code>stateless_one_frame_delta_state</code>；D 由 checkpoint 的
+<code>stateless_one_frame_delta_state</code>（預設；<code>--cache-state-layout full</code> 為
+<code>stateless_one_frame_full_state</code>，見下方 v12 說明）；D 由 checkpoint 的
 <code>max_delay_frames</code> 決定，export 當下固定進 ONNX shape）：graph <b>內</b> =
 <code>ChannelSampledReorientation</code>（C-SamFR reshape）、separable conv + ELU + MaxPool、
 <code>FrameDelayAttention</code>（<code>softmax</code> over D）、<code>FrequencyGRU</code>
@@ -85,8 +86,9 @@ ONNX/JSON descriptor 會在 <code>ulcnet_model_io_descriptor_validate()</code> �
 <code>layout_version</code>（v3 之前另卡 <code>far_input_mode</code>），
 <code>ulcnet_accelerator_adapter_init()</code> 回 NULL。修法只有「重新 export graph」一項：
 權重未變，checkpoint 與 dataset <b>不需要</b>重新訓練或重新生成。
-<b>9/10/11 被另外三對 boundary 佔用</b>，下一次真正 bump
-<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 要跳到 12。</div>
+<b>9/10/11 被另外三對 boundary 佔用；12（host/split）與 13–15（其餘三對）屬
+<code>--cache-state-layout full</code> 的完整歷史輸出</b>，下一次真正新增 boundary 要從 16 起算。
+預設仍是 v8，既有 v8 graph 照常可用。</div>
 
 <h2>ONNX graph boundary：兩軸開關</h2>
 <p>boundary 是<b>一對</b>互相獨立的開關，version 屬於這一對、不屬於任何一半，
@@ -127,6 +129,18 @@ host 端不需要前端，代價是那些運算進了量化域，且 <code>error
 <code>host</code>/<code>split</code>，板端拿到另外三對會被 <code>layout_version</code> 擋掉。
 換 layout 屬<b>合約變更</b>不是旗標切換：<code>ulcnet_model_io.h</code>、其 prepare/commit API
 與 graph I/O 表要一起搬。</div>
+<div class="note"><b>選用的完整歷史輸出（v12，host/split）</b>：<code>export_onnx.py</code> 與
+<code>inference.py calib</code> 都加 <code>--cache-state-layout full</code>（兩邊必須一致），
+graph 改回傳完整的下一份 <code>key_history_out</code>／<code>value_history_out</code>／
+<code>logit_history_out</code>（形狀與順序同對應輸入），權重與算術不變，預設仍是
+<code>delta</code>。C 端把 <code>UlcnetPrepostConfig.model_layout_version</code>（或
+<code>UlcnetModelIoDescriptor.layout_version</code>）設為
+<code>ULCNET_MODEL_IO_FULL_HISTORY_VERSION</code> 後再查 pool；<code>ulcnet_model_io</code>
+配置兩組 history，<code>prepare</code> 同時公布 live 輸入與另一組可寫的輸出，
+只有成功的 <code>commit</code> 才交換兩組的角色，不再逐幀搬移 ring；失敗要用
+<code>frame_skip()</code>，reset 會回到初始綁定並清零。輸入與輸出不可 in-place 共用。
+這只省掉 C 端的歷史搬移，graph 多了 Slice/Concat、輸出傳輸變大；端到端 CPU／NPU 加速
+<b>未實測</b>。pool 增量與量化限制見 <code>Align_ULCNet/README.md</code>。</div>
 
 <h2>API 用法</h2>
 <pre>from AIAEC.Align_ULCNet.inference import load_model

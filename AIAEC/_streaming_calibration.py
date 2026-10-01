@@ -81,6 +81,8 @@ from AIAEC._streaming_export import (
 )
 from AIAEC.Align_ULCNet.inference import load_model as load_ulcnet_model
 from AIAEC.Align_ULCNet.export_onnx import (
+    CACHE_STATE_LAYOUTS as ULCNET_CACHE_STATE_LAYOUTS,
+    DEFAULT_CACHE_STATE_LAYOUT as ULCNET_DEFAULT_CACHE_STATE_LAYOUT,
     FEATURE_LAYOUTS as ULCNET_FEATURE_LAYOUTS,
     export_graph as ulcnet_export_graph,
     graph_signals as ulcnet_graph_signals,
@@ -196,6 +198,11 @@ def main(model_name: str) -> None:
                              'microphone WAVs; the checkpoint-matched frozen '
                              'PBFDKF derives the linear-error stems here and '
                              'persists them beside the artifact')
+    parser.add_argument('--cache-state-layout',
+                        choices=ULCNET_CACHE_STATE_LAYOUTS,
+                        default=ULCNET_DEFAULT_CACHE_STATE_LAYOUT,
+                        help='Align_ULCNet only: delta or full next histories; '
+                             'must match the exported deployment graph')
     args = parser.parse_args()
     args.model_name = model_name
     if args.frames <= 0:
@@ -211,6 +218,10 @@ def main(model_name: str) -> None:
     if args.primary_is_mic and args.model_name != 'Align_ULCNet':
         parser.error('--primary-is-mic applies only to Align_ULCNet; the '
                      'end-to-end models take microphone WAVs natively')
+    if (args.cache_state_layout != ULCNET_DEFAULT_CACHE_STATE_LAYOUT
+            and args.model_name != 'Align_ULCNet'):
+        parser.error('--cache-state-layout applies only to Align_ULCNet; the '
+                     'other candidates have no cache-output layout')
 
     # Pairs are discovered before the model load and export, so a bad
     # --primary-dir/--far-dir fails on its own actionable error first.
@@ -236,9 +247,10 @@ def main(model_name: str) -> None:
             model, args.checkpoint, onnx_path, verify=True,
             feature_layout=args.feature_layout,
             gru_state_layout=args.gru_state_layout,
+            cache_state_layout=args.cache_state_layout,
         )
         input_names = wrapper.layout.input_names
-        # One head plus delta-state; the state slots are rebuilt by
+        # One head plus state; the state slots are rebuilt by
         # next_state() rather than sliced, so only signal_inputs is read.
         split = GraphSplit(
             signal_inputs=wrapper.layout.signal_inputs, head_outputs=1
@@ -257,7 +269,8 @@ def main(model_name: str) -> None:
             )
 
         def advance_state(state, outputs):
-            return ulcnet_next_state(state, outputs, wrapper.delay_depth)
+            return ulcnet_next_state(state, outputs, wrapper.delay_depth,
+                                     wrapper.layout)
 
         if args.primary_is_mic:
             pairs, _ = _materialize_linear_error(
@@ -366,6 +379,7 @@ def main(model_name: str) -> None:
         # layout cannot be recorded under the default layout's version. Only
         # Align-ULCNet's boundary is versioned today.
         'state_layout_version': state_layout_version,
+        'cache_state_layout': graph_metadata.get('cache_state_layout'),
         'frames': int(next(iter(arrays.values())).shape[0]),
         'seed': args.seed,
         'source_files': source_files,

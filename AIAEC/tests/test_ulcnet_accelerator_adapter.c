@@ -44,13 +44,16 @@ static int run(void *user, const UlcnetModelIoInputs *inputs,
     fill(outputs->key_now, outputs->key_now_elements, 0.0f);
     fill(outputs->value_now, outputs->value_now_elements, 0.0f);
     fill(outputs->logit_now, outputs->logit_now_elements, 0.0f);
+    fill(outputs->key_history_out, outputs->key_history_elements, 0.0f);
+    fill(outputs->value_history_out, outputs->value_history_elements, 0.0f);
+    fill(outputs->logit_history_out, outputs->logit_history_elements, 0.0f);
     fill(outputs->h_gru0_out, outputs->gru_hidden_elements,
          runtime->stamp);
     fill(outputs->h_gru1_out, outputs->gru_hidden_elements, 0.0f);
     return runtime->fail_run ? -1 : 0;
 }
 
-int main(void) {
+static int test_layout(uint32_t layout_version) {
     UlcnetAcceleratorAdapter *adapter;
     UlcnetModel model;
     TestRuntime runtime = {0, 0, 0, 0.0f, 0.0f};
@@ -70,8 +73,9 @@ int main(void) {
     float output_im[ULCNET_MODEL_IO_BINS];
     int bin;
 
-    if (ulcnet_model_io_descriptor_default(8, &descriptor) != 0 ||
-        ulcnet_accelerator_adapter_get_mem_size(
+    if (ulcnet_model_io_descriptor_default(8, &descriptor) != 0) return 1;
+    descriptor.layout_version = layout_version;
+    if (ulcnet_accelerator_adapter_get_mem_size(
             &descriptor, &bytes, &alignment) != 0 ||
         posix_memalign(&pool, alignment, bytes) != 0) {
         return 1;
@@ -106,6 +110,7 @@ int main(void) {
         model.io_descriptor != ulcnet_accelerator_adapter_descriptor(adapter) ||
         model.io_descriptor->far_input_mode != ULCNET_FAR_RAW ||
         model.io_descriptor->delay_depth != 8 ||
+        model.io_descriptor->layout_version != layout_version ||
         strcmp(ulcnet_far_input_mode_name(
                    model.io_descriptor->far_input_mode), "raw_far") != 0) {
         free(pool);
@@ -168,4 +173,9 @@ int main(void) {
     free(pool);
     puts("ulcnet_accelerator_adapter: PASS");
     return 0;
+}
+
+int main(void) {
+    if (test_layout(ULCNET_MODEL_IO_LAYOUT_VERSION) != 0) return 1;
+    return test_layout(ULCNET_MODEL_IO_FULL_HISTORY_VERSION);
 }

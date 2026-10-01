@@ -68,8 +68,9 @@ extern "C" {
 /* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes
  * (a region added, removed, resized or reordered), so a pool recorded by the
  * previous carve is refused by _init_ex on the hash, not only on `bytes`.
- * 2: the TIME analyses became two UlcnetAnalysis states (own scratch each). */
-#define ULCNET_PREPOST_CARVE_VERSION 2u
+ * 2: the TIME analyses became two UlcnetAnalysis states (own scratch each).
+ * 3: model-I/O bank bookkeeping and optional full-history spare bank. */
+#define ULCNET_PREPOST_CARVE_VERSION 3u
 
 /* Which side of the transform the caller works on. FIXED AT INIT because it
  * decides the pool size: ULCNET_IO_TIME additionally carves two analysis
@@ -94,6 +95,8 @@ typedef struct UlcnetPrepostConfig {
     const float *window;       /* ULCNET_IO_TIME: required, borrowed,
                                 * ULCNET_N_FFT entries from
                                 * ulcnet_make_window()                      */
+    uint32_t model_layout_version; /* 0/8: legacy delta; 12: full history.
+                                    * Must match exported graph metadata. */
 } UlcnetPrepostConfig;
 
 /* Fixed 32-byte shape, same staleness-gate discipline as the pipelines'
@@ -101,9 +104,9 @@ typedef struct UlcnetPrepostConfig {
  * is refused by _init_ex rather than reinterpreted. */
 typedef struct UlcnetPrepostMemReq {
     uint32_t descriptor_version;  /* ULCNET_PREPOST_DESCRIPTOR_VERSION      */
-    uint32_t layout_version;      /* ULCNET_MODEL_IO_LAYOUT_VERSION         */
+    uint32_t layout_version;      /* resolved graph layout (8 or 12)        */
     uint32_t io_mode;             /* the resolved UlcnetIoMode              */
-    uint32_t build_flags_hash;    /* FNV-1a-32 over grid + io_mode + D      */
+    uint32_t build_flags_hash;    /* FNV-1a-32: grid + layout + carve + io_mode + D */
     uint32_t alignment;
     uint32_t reserved;            /* 0 */
     uint64_t bytes;
@@ -199,8 +202,9 @@ int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
                                 UlcnetModelIoOutputs *outputs);
 
 /* Transactional: validates that the accelerator wrote every output, applies
- * the inverse compression, advances the K/V/logit rings and swaps the GRU
- * hidden tensors, then feeds the enhanced spectrum to the synthesis
+ * the inverse compression, advances the K/V/logit rings (v8) or swaps their
+ * full-history banks (v12), and swaps the GRU hidden tensors, then feeds the
+ * enhanced spectrum to the synthesis
  * (ULCNET_IO_TIME) or stages it for post_process_freq.
  *
  * Requires a frame opened by pre_process AND published by frame_inputs():

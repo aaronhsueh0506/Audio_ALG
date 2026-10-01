@@ -480,20 +480,72 @@ Adopting a different pair is a contract change, not a flag flip:
 `ulcnet_model_io.h`, its prepare/commit API and the I/O tables above all move
 with it.
 
-**Every previously exported graph must be re-exported.** The model-I/O layout
-is now v5 (v3 fixed the deployed far branch RAW -> ALIGNED, v4 renamed the
-tensors, v5 moved the fixed front/back ends to the host), so a descriptor
-written before this change fails `ulcnet_model_io_descriptor_validate()` on
-`layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION` (pre-v3 descriptors also
-fail `far_input_mode != ULCNET_FAR_ALIGNED`), and
-`ulcnet_accelerator_adapter_init()` therefore returns NULL. Re-exporting is
-the whole remedy: nothing upstream of the graph changed. Checkpoints keep their
-weights and their recorded training provenance, and datasets need no
-regeneration -- the exporter reads the checkpoint's training
-`far_input_mode` and writes it beside the fixed deployment value rather than
-requiring the two to agree. Versions 4, 6 and 7 are taken by the other three
-boundary pairs rather than free, so the next real bump of
-`ULCNET_MODEL_IO_LAYOUT_VERSION` goes to 8.
+Existing **v8 host/split graphs remain supported and the default**. Versions
+3-7 are retired. The deployment far input is `raw_far`; the exporter rejects
+a checkpoint trained for a different far-input contract.
+
+### Optional full-history outputs (v12, host/split)
+
+Use `--cache-state-layout full` with **both** `export_onnx.py` and
+`inference.py calib`. This re-exports the existing weights, not a retraining:
+all model arithmetic is unchanged, but the graph also forms the next cache.
+Keep `--feature-layout host --gru-state-layout split` for this C helper.
+The other feature/GRU pairs export full histories as versions 13-15; they
+remain experimental and are rejected by the C descriptor validator.
+
+| Output in full mode | Shape | Order |
+| --- | --- | --- |
+| `key_history_out` | `[1,32,D-1,TA_BINS]` | newest first |
+| `value_history_out` | `[1,32,D-1,TA_BINS]` | newest first |
+| `logit_history_out` | `[1,32,4,D]` | oldest first |
+
+The last is **pre-convolution logit history**, not attention probabilities.
+Each output now matches its corresponding input, but key/value and logits
+still have different shapes and must have **separate storage**. GRU output
+names and shapes do not change.
+
+Direct pre/post integration:
+
+```c
+UlcnetPrepostConfig cfg;
+ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_FREQ, 8);
+/* Only select this when the graph metadata says version 12. */
+cfg.model_layout_version = ULCNET_MODEL_IO_FULL_HISTORY_VERSION;
+/* Then query memory and init as before. During inference bind out's
+ * key_history_out/value_history_out/logit_history_out, not *_now. */
+```
+
+For the model-I/O or accelerator adapter API, call
+`ulcnet_model_io_descriptor_default(D, &desc)` and set `desc.layout_version`
+from the exported metadata (12 for host/split/full) **before sizing/init**.
+Rebuild C callers after updating the headers: output/config structs have new
+fields. Re-query pool requirements; do not reuse an old size/hash.
+
+Two banks are allocated once. Every prepare publishes the live input bank
+and the distinct writable bank. Bind the current pointers each invocation,
+or prebind two runtime binding sets and select the published one. Only a
+successful, fully finite commit swaps roles. Failed inference must use
+`frame_skip()` (or the adapter callback's nonzero return), not commit.
+Reset returns to the original bank and zeros state; call it at stream reset,
+not once for the entire device lifetime. Input/output in-place aliasing is
+**not** assumed safe.
+
+This removes C's history `memmove`/insertion, **not all CPU memory traffic**:
+NaN prefills and finite checks remain for partial-write safety, and the graph
+does Slice/Concat. At D=8, full history outputs are 49.5 KiB/frame at 16k and
+95 KiB/frame at 48k (K/V/logit only); the spare bank adds respectively 42 and
+81 KiB compared with delta outputs. End-to-end CPU/NPU speedup is unmeasured;
+graph fallback or larger transfers may negate the host-copy savings.
+
+This API still uses `float *`. Identical quantization scales alone do not
+make an int8/int16 tensor safe to bind here. A quantized direct-state binding
+also requires matching dtype, zero point, per-channel axis/scales, strides,
+alignment, runtime ownership and completion/cache-coherency rules; it needs
+a typed runtime integration. Never reinterpret integer buffers as these
+float views. State IO quantization must be checked again after re-export.
+
+The tests in `AIAEC/tests` are implementation tests, not an audio-quality or
+quantized-model validation.
 
 CPU state storage and ring updates are implemented by
 `ulcnet_model_io.c/.h`.  They use one caller-owned pool, allocate RAM according
