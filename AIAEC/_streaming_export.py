@@ -58,7 +58,7 @@ from AIAEC.aiaec_streaming import (
     StreamModuleCell,
 )
 from AIAEC.aiaec_common import fit_frequency
-from onnx_streaming_contract import validate_nctf_no_temporal_padding
+from AIAEC._onnx_contract import validate_nctf_no_temporal_padding
 from AIAEC.CAGCRN.model import (
     _stream_cata,
     _stream_decoder_block,

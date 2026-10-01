@@ -148,7 +148,7 @@ _AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
 
-from onnx_streaming_contract import validate_nctf_no_temporal_padding
+from AIAEC._onnx_contract import validate_nctf_no_temporal_padding
 
 from AIAEC.Align_ULCNet.inference import load_model
 from AIAEC.training_common import (
