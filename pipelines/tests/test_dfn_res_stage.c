@@ -170,8 +170,23 @@ static int capture_via_time_mode(ScaleCapture *cap, FftHandle *fft) {
         int need = dfn2_prepost_pre_process(p, g_pcm + (size_t)hop * DFN2_HOP_LEN);
         if (need < 0) { dfn2_prepost_destroy(p); return 3; }
         if (need == 1) {
-            if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0 ||
-                capturing_infer(cap, &inputs, &outputs) != 0 ||
+            if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0) {
+                dfn2_prepost_destroy(p);
+                return 4;
+            }
+            /* Each recurrent state output is the same buffer as its input. */
+            if ((const void *)inputs.encoder_gru_hidden !=
+                    (const void *)outputs.encoder_gru_hidden_next ||
+                (const void *)inputs.erb_gru_hidden !=
+                    (const void *)outputs.erb_gru_hidden_next ||
+                (const void *)inputs.df_gru_hidden !=
+                    (const void *)outputs.df_gru_hidden_next ||
+                (const void *)inputs.df_convp_history !=
+                    (const void *)outputs.df_convp_history_next) {
+                dfn2_prepost_destroy(p);
+                return 6;
+            }
+            if (capturing_infer(cap, &inputs, &outputs) != 0 ||
                 dfn2_prepost_frame_commit(p) != 0) {
                 dfn2_prepost_destroy(p);
                 return 4;
