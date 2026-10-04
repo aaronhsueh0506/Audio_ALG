@@ -159,8 +159,12 @@ host 前後端邊界(v5 起)只描述部署用的 stream graph。</p>
 graph；cache 尺寸由
 <code>stream_model.initial_inputs(model)</code> 從 module tree 推導（不寫死 grid：
 spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder stride），
-六個 conv history、六個 TRA hidden 與四個 DPGRNN hidden 都由 host 作為
-graph input/output 送回，加速器本身不保存跨次呼叫狀態。v6 把 v5 的 packed
+六個 conv history、六個 TRA hidden 與四個 DPGRNN hidden 都是 graph input/output，
+加速器本身不保存跨次呼叫狀態：<code>GTCRNModelState</code> 就是 state buffer，一般 runtime 把每個 state
+<code>*_out</code> 寫進自己的輸出 tensor，由 <code>gtcrn_model_state_inherit(state, conv_out, h_tra_out, h_dpgrnn_out)</code>
+先檢查再複製進 struct（任何 NaN/Inf 則都不複製、回 -1、state 不變，該幀視為失敗；指標已等於欄位者略過）。
+能把 state input 與對應 <code>*_out</code> 綁到<b>同一個欄位</b>的 runtime（綁定表在 <code>gtcrn_process.h</code>）就地寫入、省略 inherit，
+須先讀完 state 輸入才寫同位址的輸出。v6 把 v5 的 packed
 state 拆成實際的 block／GRU 槽位，總 bytes 不變，graph 不再為了拆裝 state
 而執行 Slice/Gather/Concat（conv history 與新框相接那一個 Concat 屬於運算本身）。
 匯出不再 pin 單一 grid——config 與 checkpoint 不成對時在 strict
@@ -211,7 +215,9 @@ batch 軸併成 2。實作是 <code>stream_model.CombinedStateGTCRN</code>,它<b
 <tr><td><code>h_dpgrnn1_0/1</code></td><td>各 (1,33,8)</td><td>2,112(528 f32)</td><td>host caller</td><td>第一個 grouped inter-RNN 的兩顆 GRU hidden</td></tr>
 <tr><td><code>h_dpgrnn2_0/1</code></td><td>各 (1,33,8)</td><td>2,112(528 f32)</td><td>host caller</td><td>第二個 grouped inter-RNN 的兩顆 GRU hidden；四個合計 4,224 bytes</td></tr>
 </table></div>
-<p class="note"><code>sizeof(GTCRNProcessState)</code> = 10,256 bytes(64-bit 本機量測)。
+<p class="note">就地路徑的 <code>gtcrn_model_state_validate(GTCRNModelState*)</code>:每次 invocation 後就地檢查 16 個 state 張量,
+全部有限回 0;任何 NaN/Inf 則整個 state 歸零並回 -1(前一個 state 已被覆寫;寫一半而仍有限者偵測不到;可信 runtime 可不呼叫)。
+<code>sizeof(GTCRNProcessState)</code> = 10,256 bytes(64-bit 本機量測)。
 本目錄 <code>model.py</code> 無 cache 介面;上表 NPU 狀態 shape 逐一取自
 <code>stream_model.initial_inputs()</code> 與匯出 graph schema；
 <code>sizeof(GTCRNModelState)</code> = 72,192 bytes，與 v5 相同。</p>

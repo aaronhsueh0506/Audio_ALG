@@ -62,13 +62,15 @@ raw far against that error. The calibration and ONNX commands must use the same
 ``--max-delay-frames`` value.  NPZ output writes a sibling JSON contract;
 binary output writes ``manifest.json`` inside its output directory.
 
-The accelerator retains no state.  The CPU supplies past K/V features,
-attention-score history and temporal-GRU hidden tensors on every invocation.
-By default the graph returns new K/V/logit entries plus next GRU hidden tensors;
-the CPU updates its caller-owned rings. With ``--cache-state-layout full`` it
-returns complete next histories for a success-gated, separate-bank handoff.
-STFT/WOLA and PBFDKF stay outside the graph in ``ulcnet_process.c`` and the
-AEC library respectively.  The exported
+The accelerator retains no state.  Every invocation takes the past K/V
+features, attention-score history and temporal-GRU hidden tensors as inputs
+and returns the FULL next value of each (``key_history_out``,
+``value_history_out``, ``logit_history_out``, ``h_gru0_out``, ``h_gru1_out``),
+with exactly the input shapes, so each state input and its ``*_out`` output
+can be bound to one address and the CPU shifts and copies nothing.  The ring
+shift runs inside the graph on the tensors it already builds for attention.
+STFT/WOLA and PBFDKF stay outside the
+graph in ``ulcnet_process.c`` and the AEC library respectively.  The exported
 graph boundary follows the checkpoint and supports 16 kHz / FFT-window 512 /
 hop 256 or 48 kHz / 1024 / 512.  The C pre/post must be compiled for the same
 grid; one binary serves one grid.
@@ -122,11 +124,6 @@ under all four combinations, and the exported metadata records the pair under
 No C runtime binds anything but ``host``/``split``. Adopting another pair is a
 contract change: ``ulcnet_model_io.h``, its prepare/commit API and the I/O
 tables move with it.
-
-``--cache-state-layout`` defaults to ``delta`` (versions 8-11). ``full``
-exports full next histories under new names (versions 12-15 respectively).
-The C helper binds 8 and 12. Re-export and calibrate the same chosen layout;
-this changes no learned weights.
 """
 
 from __future__ import annotations
@@ -158,7 +155,11 @@ from AIAEC.training_common import (
 )
 
 
-# Version history. Version 3 introduced an explicit deployed-far descriptor
+# Version history. Versions 8-11 returned only the new K/V/logit entries
+# (key_now/value_now/logit_now) and left the ring shift to the CPU. Versions
+# 12-15 return the full next history from the graph, so the shipped contract
+# is the in-place one; 8-11 are retired with 3-7.
+# Version 3 introduced an explicit deployed-far descriptor
 # while retaining the checkpoint's training provenance separately;
 # version 4 renamed the tensors (error/far inputs, output head, h_gru0/h_gru1
 # hiddens, *_out states) -- runtimes bind by name; version 5 moved the fixed
@@ -188,29 +189,18 @@ from AIAEC.training_common import (
 # Stated here rather than only in ulcnet_model_io.h's prose so a bump onto one
 # fails a test instead of a review. 3, 4 and 5 were shipped rank-3 boundaries;
 # 6 and 7 were rank-3 pairs reachable from the CLI and stamped into exported
-# metadata, so they were allocated, not merely reserved.
-RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 8))
+# metadata, so they were allocated, not merely reserved. 8-11 were the
+# delta-state boundaries of the four pairs; every pair moved to the full-state
+# boundary together, so the same rule retires them.
+RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 12))
 LAYOUT_VERSIONS = {
-    ('host', 'split'): 8,
-    ('host', 'combined'): 9,
-    ('graph', 'split'): 10,
-    ('graph', 'combined'): 11,
-}
-# The deployed pair's version, named because ulcnet_model_io.h pins it.
-STATE_LAYOUT_VERSION = LAYOUT_VERSIONS[('host', 'split')]
-# Full next-history outputs: same learned model and input geometry, different
-# output ABI. Never reuse delta versions, even at D=2 where K/V sizes match.
-FULL_HISTORY_LAYOUT_VERSIONS = {
     ('host', 'split'): 12,
     ('host', 'combined'): 13,
     ('graph', 'split'): 14,
     ('graph', 'combined'): 15,
 }
-# The deployed full-history version, named because ulcnet_model_io.h pins it
-# as ULCNET_MODEL_IO_FULL_HISTORY_VERSION.
-FULL_HISTORY_STATE_LAYOUT_VERSION = FULL_HISTORY_LAYOUT_VERSIONS[('host', 'split')]
-CACHE_STATE_LAYOUTS = ('delta', 'full')
-DEFAULT_CACHE_STATE_LAYOUT = 'delta'
+# The deployed pair's version, named because ulcnet_model_io.h pins it.
+STATE_LAYOUT_VERSION = LAYOUT_VERSIONS[('host', 'split')]
 # The deployed C front/back end hardcodes this exponent
 # (ULCNET_MODEL_IO_COMPRESSION_EXP); export_graph refuses any checkpoint
 # whose model carries a different value, because nothing downstream of the
@@ -255,8 +245,7 @@ GRU_STATE_NAMES = ('h_gru0', 'h_gru1')
 COMBINED_GRU_STATE_NAME = 'h_gru'
 CACHE_STATE_NAMES = ('key_history', 'value_history', 'logit_history')
 HEAD_OUTPUT_NAMES = ('output',)
-CACHE_OUTPUT_NAMES = ('key_now', 'value_now', 'logit_now')
-FULL_CACHE_OUTPUT_NAMES = tuple(name + '_out' for name in CACHE_STATE_NAMES)
+CACHE_OUTPUT_NAMES = tuple(name + '_out' for name in CACHE_STATE_NAMES)
 
 
 class FeatureLayout(object):
@@ -301,7 +290,7 @@ DEFAULT_GRU_STATE_LAYOUT = 'split'
 
 
 class GraphLayout(object):
-    """One complete graph boundary: feature, GRU and cache-output layouts.
+    """One complete graph boundary: the feature/state layout pair.
 
     The two axes are independent but the *version* is not a property of
     either half, so it is looked up for the pair. Everything downstream --
@@ -309,27 +298,16 @@ class GraphLayout(object):
     a graph cannot be written under one pair and calibrated under another.
     """
 
-    def __init__(self, feature, gru, cache=DEFAULT_CACHE_STATE_LAYOUT):
-        if cache not in CACHE_STATE_LAYOUTS:
-            raise ValueError('unknown cache state layout %r' % cache)
+    def __init__(self, feature, gru):
         self.feature = feature
         self.gru = gru
-        self.cache = cache
-        versions = (FULL_HISTORY_LAYOUT_VERSIONS if self.full_history
-                    else LAYOUT_VERSIONS)
-        self.layout_version = versions[(feature.label, gru.label)]
+        self.layout_version = LAYOUT_VERSIONS[(feature.label, gru.label)]
         self.state_names = gru.state_names
         self.input_names = feature.signal_names + gru.state_names
         self.output_names = (
-            HEAD_OUTPUT_NAMES
-            + (FULL_CACHE_OUTPUT_NAMES if self.full_history else CACHE_OUTPUT_NAMES)
+            HEAD_OUTPUT_NAMES + CACHE_OUTPUT_NAMES
             + tuple(name + '_out' for name in gru.gru_names)
         )
-
-    @property
-    def full_history(self):
-        """True when the graph returns complete next K/V/logit histories."""
-        return self.cache == 'full'
 
     @property
     def signal_inputs(self):
@@ -362,24 +340,15 @@ GRAPH_LAYOUTS = {
     pair: GraphLayout(FEATURE_LAYOUTS[pair[0]], GRU_STATE_LAYOUTS[pair[1]])
     for pair in LAYOUT_VERSIONS
 }
-FULL_HISTORY_GRAPH_LAYOUTS = {
-    pair: GraphLayout(FEATURE_LAYOUTS[pair[0]], GRU_STATE_LAYOUTS[pair[1]], 'full')
-    for pair in FULL_HISTORY_LAYOUT_VERSIONS
-}
 
 
 def resolve_layout(feature_layout=DEFAULT_FEATURE_LAYOUT,
-                   gru_state_layout=DEFAULT_GRU_STATE_LAYOUT,
-                   cache_state_layout=DEFAULT_CACHE_STATE_LAYOUT):
+                   gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
     """Accept a GraphLayout, or the two axis names, and return the pair."""
     if isinstance(feature_layout, GraphLayout):
         return feature_layout
-    if cache_state_layout not in CACHE_STATE_LAYOUTS:
-        raise ValueError('unknown cache state layout %r' % cache_state_layout)
-    layouts = (FULL_HISTORY_GRAPH_LAYOUTS if cache_state_layout == 'full'
-               else GRAPH_LAYOUTS)
     try:
-        return layouts[(feature_layout, gru_state_layout)]
+        return GRAPH_LAYOUTS[(feature_layout, gru_state_layout)]
     except KeyError:
         raise ValueError('unknown layout %r; expected one of %s'
                          % ((feature_layout, gru_state_layout),
@@ -502,16 +471,14 @@ class AlignUlcnetStreamingExport(nn.Module):
 
     def __init__(self, model: nn.Module,
                  feature_layout=DEFAULT_FEATURE_LAYOUT,
-                 gru_state_layout=DEFAULT_GRU_STATE_LAYOUT,
-                 cache_state_layout=DEFAULT_CACHE_STATE_LAYOUT):
+                 gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
         super().__init__()
         self.model = model
         # The wrapper is the single source of truth for the boundary layout:
         # every caller reads it back off the wrapper rather than re-deriving
         # one, so a graph cannot be written with one layout and calibrated
         # with the other.
-        self.layout = resolve_layout(feature_layout, gru_state_layout,
-                                     cache_state_layout)
+        self.layout = resolve_layout(feature_layout, gru_state_layout)
         self.delay_depth = int(model.max_delay_frames)
         if not MIN_DELAY_DEPTH <= self.delay_depth <= MAX_DELAY_DEPTH:
             # The common way to land here is a config that leaves
@@ -586,9 +553,13 @@ class AlignUlcnetStreamingExport(nn.Module):
         key_now = attention.key(far_feature)
         value_now = attention.value(far_feature)
 
-        # [B,C,1,D,F], delay slot zero is the current frame.
+        # [B,C,D,F], delay slot zero is the current frame. The next K/V
+        # history is the same tensor without its oldest slot, so the ring
+        # shift costs a Slice, not a second Concat.
         key_window = torch.cat((key_now, key_history), dim=2)
         value_window = torch.cat((value_now, value_history), dim=2)
+        key_history_out = key_window[:, :, :-1]
+        value_history_out = value_window[:, :, :-1]
         key_candidates = key_window.unsqueeze(2)
         value_candidates = value_window.unsqueeze(2)
         logit_now = (
@@ -598,6 +569,7 @@ class AlignUlcnetStreamingExport(nn.Module):
         # Reproduce StreamConv2dCell: four chronological history frames plus
         # current logits, frequency-axis padding only, then the raw Conv2d.
         score_input = torch.cat((logit_history, logit_now), dim=2)
+        logit_history_out = score_input[:, :, 1:]
         frequency_total = (attention.score.kf - 1) * attention.score.df
         frequency_left = frequency_total // 2
         score = attention.score.conv(F.pad(
@@ -662,17 +634,8 @@ class AlignUlcnetStreamingExport(nn.Module):
         # Otherwise a COMPRESSED-domain estimate: the fixed inverse signed
         # power runs on the host (host_output; C: ulcnet_model_io_commit).
 
-        if layout.full_history:
-            # Same ordering as the legacy host update: K/V newest first,
-            # score-convolution history oldest first. The next histories are
-            # slices of the windows already built above, so its outputs can
-            # become the next invocation's inputs without another concat.
-            heads = (output,
-                     key_window[:, :, :self.delay_depth - 1],
-                     value_window[:, :, :self.delay_depth - 1],
-                     score_input[:, :, 1:])
-        else:
-            heads = (output, key_now, value_now, logit_now)
+        heads = (output, key_history_out, value_history_out,
+                 logit_history_out)
         if layout.combined:
             # Concatenated in the order it was sliced, which is also the
             # order ulcnet_model_io.h stores the two hiddens in.
@@ -789,31 +752,15 @@ def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int,
     )
 
 
-def next_state(
-    current: Sequence[Tensor], outputs: Sequence[Tensor], delay_depth: int,
-    layout=DEFAULT_LAYOUT,
-) -> Tuple[Tensor, ...]:
-    """Advance the caller-held state one frame, in whichever layout it is in.
+def next_state(outputs: Sequence[Tensor]) -> Tuple[Tensor, ...]:
+    """The caller-held state for the next frame, in whichever layout it is in.
 
-    Full-history outputs are handed back directly, with no host concat/copy.
-    Callers must pass their wrapper.layout; shapes alone cannot identify D=2.
+    The graph returns every state tensor in full, in the order the state
+    inputs are bound, so the state is the output tail unchanged -- the same
+    assignment an in-place runtime performs by binding each ``*_out`` to its
+    input's address. Layout-agnostic: it names no tensor.
     """
-    if resolve_layout(layout).full_history:
-        return tuple(outputs[1:])
-    key_history, value_history, logit_history = current[:3]
-    _enhanced, key_now, value_now, logit_now = outputs[:4]
-    hidden_next = tuple(outputs[4:])
-    if delay_depth > 1:
-        key_history = torch.cat(
-            (key_now, key_history[:, :, :delay_depth - 2]), dim=2
-        )
-        value_history = torch.cat(
-            (value_now, value_history[:, :, :delay_depth - 2]), dim=2
-        )
-    logit_history = torch.cat(
-        (logit_history[:, :, 1:], logit_now), dim=2
-    )
-    return (key_history, value_history, logit_history) + hidden_next
+    return tuple(outputs[len(HEAD_OUTPUT_NAMES):])
 
 
 def file_sha256(path: str) -> str:
@@ -851,12 +798,10 @@ def _write_metadata(
         )
     metadata = {
         'model_family': 'Align_ULCNet',
-        'boundary': ('stateless_one_frame_full_state' if layout.full_history
-                     else 'stateless_one_frame_delta_state'),
+        'boundary': 'stateless_one_frame_full_state',
         'state_layout_version': layout.layout_version,
         'feature_layout': layout.feature.label,
         'gru_state_layout': layout.gru.label,
-        'cache_state_layout': layout.cache,
         'compression_exponent': COMPRESSION_EXPONENT,
         'checkpoint_sha256': file_sha256(checkpoint),
         'sample_rate': model.grid.sample_rate,
@@ -875,9 +820,7 @@ def _write_metadata(
             deployed_far_input_mode
         ),
         'accelerator_persistent_state': False,
-        'cpu_delta_state_update': not layout.full_history,
-        'state_handoff': ('separate_banks_successful_commit_swap'
-                          if layout.full_history else 'cpu_delta_update'),
+        'cpu_delta_state_update': False,
         'tensor_dtype': 'float32',
         'complex_tensor_policy': 'real_imag_last_dimension',
         'input_schema': _schema(layout.input_names, inputs),
@@ -933,14 +876,13 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
                 worst = max(worst, float(np.max(
                     np.abs(got - want.detach().numpy())
                 )))
-            state = next_state(state, expected, wrapper.delay_depth, layout)
+            state = next_state(expected)
     return worst
 
 
 def export_graph(model, checkpoint_path, output_path, opset=17,
                  verify=False, feature_layout=DEFAULT_FEATURE_LAYOUT,
-                 gru_state_layout=DEFAULT_GRU_STATE_LAYOUT,
-                 cache_state_layout=DEFAULT_CACHE_STATE_LAYOUT):
+                 gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
     """Write the streaming graph plus its metadata; optionally verify parity.
 
     Shared by the export CLI and the calib recorder, so the calibration
@@ -958,8 +900,7 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
         )
     wrapper = AlignUlcnetStreamingExport(
         model, feature_layout=feature_layout,
-        gru_state_layout=gru_state_layout,
-        cache_state_layout=cache_state_layout).eval()
+        gru_state_layout=gru_state_layout).eval()
     layout = wrapper.layout
     inputs = dummy_inputs(
         wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins, layout)
@@ -1033,11 +974,6 @@ def main() -> None:
              "(1, 2*layers, 1, hidden) tensor. Every recurrent state is "
              "rank-4 NCHW either way, matching the attention caches, which "
              "stay separate in both layouts.")
-    parser.add_argument(
-        '--cache-state-layout', choices=CACHE_STATE_LAYOUTS,
-        default=DEFAULT_CACHE_STATE_LAYOUT,
-        help="'full' exports complete next K/V/logit histories for bank swaps; "
-             "'delta' retains the deployed current-frame outputs.")
     args = parser.parse_args()
 
     model, _grid, _linear_contract = load_model(
@@ -1047,8 +983,7 @@ def main() -> None:
     export_graph(model, args.checkpoint, args.output,
                  opset=args.opset, verify=args.verify,
                  feature_layout=args.feature_layout,
-                 gru_state_layout=args.gru_state_layout,
-                 cache_state_layout=args.cache_state_layout)
+                 gru_state_layout=args.gru_state_layout)
     print(args.output)
 
 

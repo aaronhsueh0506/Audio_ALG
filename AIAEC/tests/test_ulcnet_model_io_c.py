@@ -1,4 +1,4 @@
-"""C contract tests for Align-ULCNet external delta-state storage."""
+"""C contract tests for Align-ULCNet in-place state storage."""
 
 import os
 import shutil
@@ -25,17 +25,18 @@ _DRIVER = r'''
 } } while (0)
 
 _Alignas(16) static unsigned char pool[1024 * 1024];
+_Alignas(16) static unsigned char pool_copy[1024 * 1024];
 
 /* Independent formulation of model.py's _signed_power (deliberately NOT
  * copysignf like the implementation, so agreement is a real check). The
  * exponent itself comes from the header contract define, which the Python
  * suite pins against export_onnx.COMPRESSION_EXPONENT. */
-__attribute__((unused)) static float signed_power_ref(float value, float exponent) {
+static float signed_power_ref(float value, float exponent) {
     float magnitude = powf(fabsf(value), exponent);
     return value < 0.0f ? -magnitude : magnitude;
 }
 
-__attribute__((unused)) static int close_fp32(float actual, float expected) {
+static int close_fp32(float actual, float expected) {
     float scale = fmaxf(1.0f, fabsf(expected));
     return fabsf(actual - expected) <= 2.0f * FLT_EPSILON * scale;
 }
@@ -47,16 +48,51 @@ static int all_zero(const float *values, size_t count) {
     return 1;
 }
 
+/* The graph's ring shift, performed by the stand-in accelerator: every
+ * state input is read (the caller stages `now` from them) before any state
+ * output is written, and each *_out is the input's own memory. K/V rings are
+ * newest-first, the logit history oldest-first. */
+static void push_history(const UlcnetModelIoOutputs *out,
+                         const float *key_now, const float *value_now,
+                         const float *logit_now, size_t ta_bins,
+                         size_t depth) {
+    const size_t channels = 32u;
+    const size_t score_frames = 4u;
+    size_t channel;
+    for (channel = 0; channel < channels; ++channel) {
+        float *key = out->key_history_out + channel * (depth - 1u) * ta_bins;
+        float *value = out->value_history_out +
+            channel * (depth - 1u) * ta_bins;
+        float *logit = out->logit_history_out +
+            channel * score_frames * depth;
+        memmove(key + ta_bins, key, (depth - 2u) * ta_bins * sizeof(float));
+        memcpy(key, key_now + channel * ta_bins, ta_bins * sizeof(float));
+        memmove(value + ta_bins, value,
+                (depth - 2u) * ta_bins * sizeof(float));
+        memcpy(value, value_now + channel * ta_bins,
+               ta_bins * sizeof(float));
+        memmove(logit, logit + depth,
+                (score_frames - 1u) * depth * sizeof(float));
+        memcpy(logit + (score_frames - 1u) * depth,
+               logit_now + channel * depth, depth * sizeof(float));
+    }
+}
+
 static void write_outputs(UlcnetModelIoOutputs *outputs, float base) {
+    static float key_now[32u * ULCNET_MODEL_IO_TA_BINS];
+    static float value_now[32u * ULCNET_MODEL_IO_TA_BINS];
+    static float logit_now[32u * 8u];
     size_t index;
     for (index = 0; index < outputs->spectrum_ri_elements; ++index)
         outputs->output[index] = base + 50000.0f + (float)index;
-    for (index = 0; index < outputs->key_now_elements; ++index)
-        outputs->key_now[index] = base + (float)index;
-    for (index = 0; index < outputs->value_now_elements; ++index)
-        outputs->value_now[index] = base + 10000.0f + (float)index;
-    for (index = 0; index < outputs->logit_now_elements; ++index)
-        outputs->logit_now[index] = base + 20000.0f + (float)index;
+    for (index = 0; index < 32u * ULCNET_MODEL_IO_TA_BINS; ++index) {
+        key_now[index] = base + (float)index;
+        value_now[index] = base + 10000.0f + (float)index;
+    }
+    for (index = 0; index < 32u * 8u; ++index)
+        logit_now[index] = base + 20000.0f + (float)index;
+    push_history(outputs, key_now, value_now, logit_now,
+                 ULCNET_MODEL_IO_TA_BINS, 8u);
     for (index = 0; index < outputs->gru_hidden_elements; ++index) {
         outputs->h_gru0_out[index] = base + 30000.0f + (float)index;
         outputs->h_gru1_out[index] = base + 40000.0f + (float)index;
@@ -75,6 +111,8 @@ int main(void) {
     float far_re[ULCNET_MODEL_IO_BINS], far_im[ULCNET_MODEL_IO_BINS];
     float enhanced_re[ULCNET_MODEL_IO_BINS];
     float enhanced_im[ULCNET_MODEL_IO_BINS];
+    const float *gru0_address;
+    const float *gru1_address;
     size_t index;
 
     for (index = 0; index < ULCNET_MODEL_IO_BINS; ++index) {
@@ -179,15 +217,24 @@ int main(void) {
     CHECK(inputs.key_history_elements ==
           32u * 7u * ULCNET_MODEL_IO_TA_BINS);
     CHECK(inputs.logit_history_elements == 32u * 4u * 8u);
-    CHECK(outputs.key_now_elements == 32u * ULCNET_MODEL_IO_TA_BINS);
-    CHECK(outputs.logit_now_elements == 32u * 8u);
+    CHECK(outputs.key_history_elements == inputs.key_history_elements);
+    CHECK(outputs.value_history_elements == inputs.value_history_elements);
+    CHECK(outputs.logit_history_elements == inputs.logit_history_elements);
     CHECK(all_zero(inputs.key_history, inputs.key_history_elements));
     CHECK(all_zero(inputs.value_history, inputs.value_history_elements));
     CHECK(all_zero(inputs.logit_history, inputs.logit_history_elements));
     CHECK(all_zero(inputs.h_gru0, inputs.gru_hidden_elements));
     CHECK(isnan(outputs.output[0]));
-    CHECK(isnan(outputs.key_now[0]));
-    CHECK(isnan(outputs.h_gru1_out[0]));
+    /* Every state tensor is in-place: each output IS its input, at an
+     * address that never moves, and prepare() does not touch the contents. */
+    CHECK(outputs.key_history_out == inputs.key_history);
+    CHECK(outputs.value_history_out == inputs.value_history);
+    CHECK(outputs.logit_history_out == inputs.logit_history);
+    CHECK(outputs.h_gru0_out == inputs.h_gru0);
+    CHECK(outputs.h_gru1_out == inputs.h_gru1);
+    CHECK(all_zero(inputs.h_gru1, inputs.gru_hidden_elements));
+    gru0_address = inputs.h_gru0;
+    gru1_address = inputs.h_gru1;
 
     write_outputs(&outputs, 1.0f);
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
@@ -213,49 +260,98 @@ int main(void) {
     CHECK(inputs.logit_history[3u * logit_frame] == 20001.0f);
     CHECK(inputs.h_gru0[0] == 30001.0f);
     CHECK(inputs.h_gru1[0] == 40001.0f);
+    CHECK(inputs.h_gru0 == gru0_address && inputs.h_gru1 == gru1_address);
 
-    /* A partial accelerator write must not advance persistent state. */
-    outputs.key_now[0] = 7.0f;
+    /* A partial estimate (one element written, the rest still NaN) is
+     * refused: the state was already written in place, so every recurrent
+     * tensor restarts from zero, and the caller's outputs stay untouched. */
+    outputs.output[0] = 7.0f;
     enhanced_re[0] = -7.0f;
     enhanced_im[0] = -8.0f;
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) != 0);
     CHECK(enhanced_re[0] == -7.0f && enhanced_im[0] == -8.0f);
-    write_outputs(&outputs, 9.0f);
+    /* One prepare permits one commit attempt. */
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) != 0);
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
-    CHECK(inputs.key_history[0] == 1.0f);
-    CHECK(inputs.h_gru0[0] == 30001.0f);
+    CHECK(all_zero(inputs.key_history, inputs.key_history_elements));
+    CHECK(all_zero(inputs.value_history, inputs.value_history_elements));
+    CHECK(all_zero(inputs.logit_history, inputs.logit_history_elements));
+    CHECK(all_zero(inputs.h_gru0, inputs.gru_hidden_elements));
+    CHECK(all_zero(inputs.h_gru1, inputs.gru_hidden_elements));
 
     write_outputs(&outputs, 2.0f);
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
-    CHECK(inputs.key_history[0] == 2.0f);
-    CHECK(inputs.key_history[feature] == 1.0f);
-    CHECK(inputs.logit_history[2u * logit_frame] == 20001.0f);
-    CHECK(inputs.logit_history[3u * logit_frame] == 20002.0f);
-    CHECK(inputs.h_gru0[0] == 30002.0f);
+    write_outputs(&outputs, 3.0f);
+    CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
+    CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
+                                  &inputs, &outputs) == 0);
+    CHECK(inputs.key_history[0] == 3.0f);
+    CHECK(inputs.key_history[feature] == 2.0f);
+    CHECK(inputs.key_history[2u * feature] == 0.0f);
+    CHECK(inputs.logit_history[2u * logit_frame] == 20002.0f);
+    CHECK(inputs.logit_history[3u * logit_frame] == 20003.0f);
+    CHECK(inputs.h_gru0[0] == 30003.0f);
+    CHECK(inputs.h_gru0 == gru0_address && inputs.h_gru1 == gru1_address);
 
-    /* A graph delta is contiguous [C,1,F], but the history is [C,H,F].
-     * Pin channel strides and both temporal orders, not just channel zero:
-     * aliasing the output to history[0] would corrupt these positions. */
-    for (size_t channel = 0; channel < 32u; ++channel) {
-        for (size_t bin = 0; bin < feature; ++bin) {
-            size_t now = channel * feature + bin;
-            size_t history = channel * 7u * feature + bin;
-            CHECK(inputs.key_history[history] == 2.0f + (float)now);
-            CHECK(inputs.key_history[history + feature] == 1.0f + (float)now);
-            CHECK(inputs.value_history[history] == 10002.0f + (float)now);
-            CHECK(inputs.value_history[history + feature] == 10001.0f + (float)now);
-        }
-        for (size_t lag = 0; lag < logit_frame; ++lag) {
-            size_t now = channel * logit_frame + lag;
-            size_t history = channel * 4u * logit_frame + lag;
-            CHECK(inputs.logit_history[history + 2u * logit_frame] == 20001.0f + (float)now);
-            CHECK(inputs.logit_history[history + 3u * logit_frame] == 20002.0f + (float)now);
+    /* A non-finite value in any ONE tensor the graph just wrote, with every
+     * other output healthy, is refused and takes the rest of the state with
+     * it: the state cannot be rolled back, so nothing recurrent may survive
+     * the frame. Newest key/value slot, newest logit frame, both hiddens and
+     * the estimate each get their own run. */
+    {
+        const size_t key_stride = 7u * feature;
+        int which;
+        for (which = 0; which < 6; ++which) {
+            CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
+                                          far_im, &inputs, &outputs) == 0);
+            write_outputs(&outputs, 4.0f);
+            switch (which) {
+            case 0: outputs.key_history_out[0] = NAN; break;
+            case 1: outputs.value_history_out[31u * key_stride] = INFINITY;
+                    break;
+            case 2: outputs.logit_history_out[31u * 4u * 8u + 3u * 8u + 7u] =
+                        NAN;
+                    break;
+            case 3: outputs.h_gru0_out[0] = NAN; break;
+            case 4: outputs.h_gru1_out[outputs.gru_hidden_elements - 1u] =
+                        INFINITY;
+                    break;
+            default: outputs.output[outputs.spectrum_ri_elements - 1u] = NAN;
+                     break;
+            }
+            enhanced_re[0] = -7.0f;
+            enhanced_im[0] = -8.0f;
+            CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) != 0);
+            CHECK(enhanced_re[0] == -7.0f && enhanced_im[0] == -8.0f);
+            CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
+                                          far_im, &inputs, &outputs) == 0);
+            CHECK(all_zero(inputs.key_history, inputs.key_history_elements));
+            CHECK(all_zero(inputs.value_history,
+                           inputs.value_history_elements));
+            CHECK(all_zero(inputs.logit_history,
+                           inputs.logit_history_elements));
+            CHECK(all_zero(inputs.h_gru0, inputs.gru_hidden_elements));
+            CHECK(all_zero(inputs.h_gru1, inputs.gru_hidden_elements));
+            /* The state keeps working after a refusal. */
+            write_outputs(&outputs, 5.0f);
+            CHECK(ulcnet_model_io_commit(state, enhanced_re,
+                                         enhanced_im) == 0);
         }
     }
+    CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
+                                  &inputs, &outputs) == 0);
+    CHECK(inputs.key_history[0] == 5.0f);
+    CHECK(inputs.h_gru0[0] == 30005.0f);
+
+    /* Only the frame the graph just wrote is checked at commit. A
+     * non-finite value left in an OLDER ring slot is not seen here; it
+     * reaches the estimate on the next frame, where it is refused. */
+    write_outputs(&outputs, 6.0f);
+    outputs.key_history_out[3u * feature] = NAN;
+    CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
 
     ulcnet_model_io_reset(state);
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
@@ -265,6 +361,159 @@ int main(void) {
     CHECK(all_zero(inputs.logit_history, inputs.logit_history_elements));
     CHECK(all_zero(inputs.h_gru0, inputs.gru_hidden_elements));
     CHECK(all_zero(inputs.h_gru1, inputs.gru_hidden_elements));
+
+    /* The copy path: a runtime with its own output tensors hands them to
+     * ulcnet_model_io_inherit().  Over a stream it must leave exactly the
+     * state the in-place binding leaves. */
+    {
+        static float p_output[2u * ULCNET_MODEL_IO_BINS];
+        static float p_key[32u * 7u * ULCNET_MODEL_IO_TA_BINS];
+        static float p_value[32u * 7u * ULCNET_MODEL_IO_TA_BINS];
+        static float p_logit[32u * 4u * 8u];
+        static float p_gru0[256];
+        static float p_gru1[256];
+        UlcnetModelIoState *copy_state;
+        UlcnetModelIoInputs copy_inputs;
+        UlcnetModelIoOutputs copy_outputs, mine;
+        float copy_re[ULCNET_MODEL_IO_BINS], copy_im[ULCNET_MODEL_IO_BINS];
+        float base;
+
+        ulcnet_model_io_reset(state);
+        copy_state = ulcnet_model_io_init(pool_copy, sizeof(pool_copy), &d8);
+        CHECK(copy_state != NULL);
+        for (base = 1.0f; base <= 6.0f; base += 1.0f) {
+            CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
+                                          far_im, &inputs, &outputs) == 0);
+            write_outputs(&outputs, base);
+            CHECK(ulcnet_model_io_commit(state, enhanced_re,
+                                         enhanced_im) == 0);
+
+            CHECK(ulcnet_model_io_prepare(copy_state, error_re, error_im,
+                                          far_re, far_im, &copy_inputs,
+                                          &copy_outputs) == 0);
+            /* The runtime's tensors start as copies of the inputs it was
+             * handed, then it computes its outputs into them. */
+            memcpy(p_key, copy_inputs.key_history, sizeof(p_key));
+            memcpy(p_value, copy_inputs.value_history, sizeof(p_value));
+            memcpy(p_logit, copy_inputs.logit_history, sizeof(p_logit));
+            mine = copy_outputs;
+            mine.output = p_output;
+            mine.key_history_out = p_key;
+            mine.value_history_out = p_value;
+            mine.logit_history_out = p_logit;
+            mine.h_gru0_out = p_gru0;
+            mine.h_gru1_out = p_gru1;
+            write_outputs(&mine, base);
+            CHECK(ulcnet_model_io_inherit(&copy_outputs, &mine) == 0);
+            CHECK(ulcnet_model_io_commit(copy_state, copy_re, copy_im) == 0);
+            CHECK(memcmp(enhanced_re, copy_re, sizeof(copy_re)) == 0);
+            CHECK(memcmp(enhanced_im, copy_im, sizeof(copy_im)) == 0);
+        }
+        CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re,
+                                      far_im, &inputs, &outputs) == 0);
+        CHECK(ulcnet_model_io_prepare(copy_state, error_re, error_im, far_re,
+                                      far_im, &copy_inputs,
+                                      &copy_outputs) == 0);
+        CHECK(memcmp(inputs.key_history, copy_inputs.key_history,
+                     sizeof(p_key)) == 0);
+        CHECK(memcmp(inputs.value_history, copy_inputs.value_history,
+                     sizeof(p_value)) == 0);
+        CHECK(memcmp(inputs.logit_history, copy_inputs.logit_history,
+                     sizeof(p_logit)) == 0);
+        CHECK(memcmp(inputs.h_gru0, copy_inputs.h_gru0, sizeof(p_gru0)) == 0);
+        CHECK(memcmp(inputs.h_gru1, copy_inputs.h_gru1, sizeof(p_gru1)) == 0);
+        CHECK(!all_zero(copy_inputs.key_history,
+                        copy_inputs.key_history_elements));
+
+        /* A runtime that wrote everything in place is not copied over
+         * itself. */
+        CHECK(ulcnet_model_io_inherit(&copy_outputs, &copy_outputs) == 0);
+        CHECK(memcmp(inputs.key_history, copy_inputs.key_history,
+                     sizeof(p_key)) == 0);
+
+        /* One non-finite value in one runtime tensor: nothing is written and
+         * the state is exactly what it was. Newest key/value slot, newest
+         * logit frame, both hiddens and the estimate each get a run. */
+        {
+            int which;
+            for (which = 0; which < 6; ++which) {
+                mine = copy_outputs;
+                mine.output = p_output;
+                mine.key_history_out = p_key;
+                mine.value_history_out = p_value;
+                mine.logit_history_out = p_logit;
+                mine.h_gru0_out = p_gru0;
+                mine.h_gru1_out = p_gru1;
+                memcpy(p_key, copy_inputs.key_history, sizeof(p_key));
+                memcpy(p_value, copy_inputs.value_history, sizeof(p_value));
+                memcpy(p_logit, copy_inputs.logit_history, sizeof(p_logit));
+                write_outputs(&mine, 7.0f);
+                switch (which) {
+                case 0: p_key[0] = NAN; break;
+                case 1: p_value[31u * 7u * ULCNET_MODEL_IO_TA_BINS] = INFINITY;
+                        break;
+                case 2: p_logit[31u * 4u * 8u + 3u * 8u + 7u] = NAN; break;
+                case 3: p_gru0[0] = NAN; break;
+                case 4: p_gru1[255] = INFINITY; break;
+                default: p_output[2u * ULCNET_MODEL_IO_BINS - 1u] = NAN; break;
+                }
+                CHECK(ulcnet_model_io_inherit(&copy_outputs, &mine) != 0);
+                CHECK(memcmp(inputs.key_history, copy_inputs.key_history,
+                             sizeof(p_key)) == 0);
+                CHECK(memcmp(inputs.value_history,
+                             copy_inputs.value_history, sizeof(p_value)) == 0);
+                CHECK(memcmp(inputs.logit_history,
+                             copy_inputs.logit_history, sizeof(p_logit)) == 0);
+                CHECK(memcmp(inputs.h_gru0, copy_inputs.h_gru0,
+                             sizeof(p_gru0)) == 0);
+                CHECK(memcmp(inputs.h_gru1, copy_inputs.h_gru1,
+                             sizeof(p_gru1)) == 0);
+            }
+        }
+
+        /* Malformed calls are refused, not half-applied. */
+        mine = copy_outputs;
+        mine.output = p_output;
+        mine.key_history_out = p_key;
+        mine.value_history_out = p_value;
+        mine.logit_history_out = p_logit;
+        mine.h_gru0_out = p_gru0;
+        mine.h_gru1_out = p_gru1;
+        write_outputs(&mine, 8.0f);
+        CHECK(ulcnet_model_io_inherit(NULL, &mine) == -1);
+        CHECK(ulcnet_model_io_inherit(&copy_outputs, NULL) == -1);
+        {
+            float **const runtime_fields[] = {
+                &mine.output, &mine.key_history_out, &mine.value_history_out,
+                &mine.logit_history_out, &mine.h_gru0_out, &mine.h_gru1_out};
+            float **const destination_fields[] = {
+                &copy_outputs.output, &copy_outputs.key_history_out,
+                &copy_outputs.value_history_out,
+                &copy_outputs.logit_history_out, &copy_outputs.h_gru0_out,
+                &copy_outputs.h_gru1_out};
+            size_t *const counts[] = {
+                &mine.spectrum_ri_elements, &mine.key_history_elements,
+                &mine.value_history_elements, &mine.logit_history_elements,
+                &mine.gru_hidden_elements};
+            size_t field;
+            for (field = 0; field < 6u; ++field) {
+                float *const kept_runtime = *runtime_fields[field];
+                float *const kept_destination = *destination_fields[field];
+                *runtime_fields[field] = NULL;
+                CHECK(ulcnet_model_io_inherit(&copy_outputs, &mine) == -1);
+                *runtime_fields[field] = kept_runtime;
+                *destination_fields[field] = NULL;
+                CHECK(ulcnet_model_io_inherit(&copy_outputs, &mine) == -1);
+                *destination_fields[field] = kept_destination;
+            }
+            for (field = 0; field < 5u; ++field) {
+                ++*counts[field];
+                CHECK(ulcnet_model_io_inherit(&copy_outputs, &mine) == -1);
+                --*counts[field];
+            }
+        }
+        CHECK(ulcnet_model_io_inherit(&copy_outputs, &mine) == 0);
+    }
     return 0;
 }
 '''
@@ -289,156 +538,3 @@ def test_ulcnet_model_io_external_state_contract(
         '-lm', '-o', str(executable),
     ], check=True, capture_output=True)
     subprocess.run([str(executable)], check=True, capture_output=True)
-
-
-# Compare complete states to the legacy host-shift implementation, not just
-# the enhanced head. Test D=2 as well: equal K/V output sizes do not make the
-# two ABIs interchangeable (the logit outputs still differ).
-_FULL_DRIVER = _DRIVER[:_DRIVER.index('int main(void)')] + r'''
-_Alignas(16) static unsigned char full_pool[2 * 1024 * 1024];
-
-static void write_full(const UlcnetModelIoInputs *in,
-                       const UlcnetModelIoOutputs *delta,
-                       UlcnetModelIoOutputs *full, int depth) {
-    int c, t, k;
-    const int f = ULCNET_MODEL_IO_TA_BINS;
-    for (c = 0; c < ULCNET_MODEL_IO_TA_CHANNELS; ++c) {
-        for (t = 0; t < depth - 1; ++t) {
-            for (k = 0; k < f; ++k) {
-                size_t dst = ((size_t)c * (depth - 1) + t) * f + k;
-                size_t src = t ? dst - f : (size_t)c * f + k;
-                full->key_history_out[dst] = t ? in->key_history[src] : delta->key_now[src];
-                full->value_history_out[dst] = t ? in->value_history[src] : delta->value_now[src];
-            }
-        }
-        for (t = 0; t < ULCNET_MODEL_IO_SCORE_HISTORY; ++t) {
-            for (k = 0; k < depth; ++k) {
-                size_t dst = ((size_t)c * ULCNET_MODEL_IO_SCORE_HISTORY + t) * depth + k;
-                full->logit_history_out[dst] = t + 1 < ULCNET_MODEL_IO_SCORE_HISTORY
-                    ? in->logit_history[dst + depth] : delta->logit_now[(size_t)c * depth + k];
-            }
-        }
-    }
-    memcpy(full->output, delta->output, full->spectrum_ri_elements * sizeof(float));
-    memcpy(full->h_gru0_out, delta->h_gru0_out, full->gru_hidden_elements * sizeof(float));
-    memcpy(full->h_gru1_out, delta->h_gru1_out, full->gru_hidden_elements * sizeof(float));
-}
-
-/* The full-history state must equal the delta-ring state, value for value. */
-static int same_state(const UlcnetModelIoInputs *a, const UlcnetModelIoInputs *b) {
-    return memcmp(a->key_history, b->key_history, b->key_history_elements * sizeof(float)) == 0 &&
-           memcmp(a->value_history, b->value_history, b->value_history_elements * sizeof(float)) == 0 &&
-           memcmp(a->logit_history, b->logit_history, b->logit_history_elements * sizeof(float)) == 0 &&
-           memcmp(a->h_gru0, b->h_gru0, b->gru_hidden_elements * sizeof(float)) == 0 &&
-           memcmp(a->h_gru1, b->h_gru1, b->gru_hidden_elements * sizeof(float)) == 0;
-}
-
-static int test_depth(int depth) {
-    UlcnetModelIoDescriptor dd, fd;
-    UlcnetModelIoMemReq dr, fr;
-    UlcnetModelIoState *ds, *fs;
-    UlcnetModelIoInputs di, fi, initial, previous;
-    UlcnetModelIoOutputs dout, fout, previous_out;
-    float input[ULCNET_MODEL_IO_BINS] = {0};
-    float dre[ULCNET_MODEL_IO_BINS], dim[ULCNET_MODEL_IO_BINS];
-    float fre[ULCNET_MODEL_IO_BINS], fim[ULCNET_MODEL_IO_BINS];
-    int hop, corrupt;
-    size_t i;
-    CHECK(ulcnet_model_io_descriptor_default(depth, &dd) == 0);
-    fd = dd;
-    fd.layout_version = ULCNET_MODEL_IO_FULL_HISTORY_VERSION;
-    CHECK(ulcnet_model_io_get_mem_requirements(&dd, &dr) == 0);
-    CHECK(ulcnet_model_io_get_mem_requirements(&fd, &fr) == 0);
-    CHECK(fr.bytes > dr.bytes && fr.bytes <= sizeof(full_pool));
-    CHECK(ulcnet_model_io_init(full_pool, fr.bytes - 1, &fd) == NULL);
-    ds = ulcnet_model_io_init(pool, sizeof(pool), &dd);
-    fs = ulcnet_model_io_init(full_pool, sizeof(full_pool), &fd);
-    CHECK(ds && fs);
-    memset(&initial, 0, sizeof(initial));
-    memset(&previous, 0, sizeof(previous));
-    memset(&previous_out, 0, sizeof(previous_out));
-    for (hop = 0; hop < depth + 5; ++hop) {
-        CHECK(ulcnet_model_io_prepare(ds, input, input, input, input, &di, &dout) == 0);
-        CHECK(ulcnet_model_io_prepare(fs, input, input, input, input, &fi, &fout) == 0);
-        if (!hop) initial = fi;
-        else {
-            CHECK(fi.key_history == previous_out.key_history_out);
-            CHECK(fi.value_history == previous_out.value_history_out);
-            CHECK(fi.logit_history == previous_out.logit_history_out);
-            CHECK(fi.h_gru0 == previous_out.h_gru0_out);
-            CHECK(fout.key_history_out == previous.key_history);
-        }
-        CHECK(!dout.key_history_out && !dout.key_history_elements);
-        CHECK(!fout.key_now && !fout.value_now && !fout.logit_now);
-        CHECK(!fout.key_now_elements && !fout.value_now_elements && !fout.logit_now_elements);
-        CHECK(fi.key_history != fout.key_history_out);
-        CHECK(fi.value_history != fout.value_history_out);
-        CHECK(fi.logit_history != fout.logit_history_out);
-        CHECK(fout.key_history_elements == fi.key_history_elements);
-        CHECK(fout.value_history_elements == fi.value_history_elements);
-        CHECK(fout.logit_history_elements == fi.logit_history_elements);
-        CHECK(same_state(&di, &fi));
-        write_outputs(&dout, (float)hop);
-        /* A partial/non-finite write to ANY output must keep all live state
-         * and caller audio untouched. Last slots catch truncated bindings. */
-        for (corrupt = 0; corrupt < 6; ++corrupt) {
-            float *bad[] = {fout.output, fout.key_history_out, fout.value_history_out,
-                            fout.logit_history_out, fout.h_gru0_out, fout.h_gru1_out};
-            size_t count[] = {fout.spectrum_ri_elements, fout.key_history_elements,
-                             fout.value_history_elements, fout.logit_history_elements,
-                             fout.gru_hidden_elements, fout.gru_hidden_elements};
-            write_full(&fi, &dout, &fout, depth);
-            bad[corrupt][count[corrupt] - 1] = corrupt % 2 ? NAN : INFINITY;
-            for (i = 0; i < ULCNET_MODEL_IO_BINS; ++i) fre[i] = fim[i] = -7.0f;
-            CHECK(ulcnet_model_io_commit(fs, fre, fim) != 0);
-            CHECK(ulcnet_model_io_commit(fs, fre, fim) != 0);
-            for (i = 0; i < ULCNET_MODEL_IO_BINS; ++i) CHECK(fre[i] == -7.0f && fim[i] == -7.0f);
-            previous = fi;
-            CHECK(ulcnet_model_io_prepare(fs, input, input, input, input, &fi, &fout) == 0);
-            CHECK(fi.key_history == previous.key_history && fi.h_gru0 == previous.h_gru0);
-            CHECK(same_state(&di, &fi));
-        }
-        previous = fi;
-        previous_out = fout;
-        write_full(&fi, &dout, &fout, depth);
-        CHECK(ulcnet_model_io_commit(ds, dre, dim) == 0);
-        CHECK(ulcnet_model_io_commit(fs, fre, fim) == 0);
-        CHECK(memcmp(dre, fre, sizeof(dre)) == 0 && memcmp(dim, fim, sizeof(dim)) == 0);
-    }
-    ulcnet_model_io_reset(fs); /* all tested depths are even -> odd commits */
-    CHECK(ulcnet_model_io_prepare(fs, input, input, input, input, &fi, &fout) == 0);
-    CHECK(fi.key_history == initial.key_history && fi.value_history == initial.value_history);
-    CHECK(fi.logit_history == initial.logit_history && fi.h_gru0 == initial.h_gru0);
-    CHECK(all_zero(fi.key_history, fi.key_history_elements));
-    CHECK(all_zero(fi.value_history, fi.value_history_elements));
-    CHECK(all_zero(fi.logit_history, fi.logit_history_elements));
-    CHECK(all_zero(fi.h_gru0, fi.gru_hidden_elements));
-    CHECK(all_zero(fi.h_gru1, fi.gru_hidden_elements));
-    return 0;
-}
-
-int main(void) {
-    CHECK(test_depth(2) == 0);
-    CHECK(test_depth(8) == 0);
-    CHECK(test_depth(64) == 0);
-    return 0;
-}
-'''
-
-
-@pytest.mark.parametrize('sample_rate,n_fft', [(16000, 512), (48000, 1024)])
-def test_full_history_bank_swap_matches_delta_and_is_transactional(tmp_path, sample_rate, n_fft):
-    cc = shutil.which('cc')
-    if cc is None:
-        pytest.skip('no C compiler available')
-    source, binary = tmp_path / 'full.c', tmp_path / 'full'
-    source.write_text(_FULL_DRIVER, encoding='utf-8')
-    subprocess.run([
-        cc, '-O2', '-std=c11', '-Wall', '-Wextra', '-Werror', '-ffp-contract=off',
-        '-DULCNET_MODEL_IO_SR=%d' % sample_rate,
-        '-DULCNET_MODEL_IO_N_FFT=%d' % n_fft,
-        '-I', _ULCNET_DIR, str(source), os.path.join(_ULCNET_DIR, 'ulcnet_model_io.c'),
-        '-lm', '-o', str(binary),
-    ], check=True, capture_output=True)
-    done = subprocess.run([str(binary)], capture_output=True, text=True)
-    assert done.returncode == 0, done.stderr

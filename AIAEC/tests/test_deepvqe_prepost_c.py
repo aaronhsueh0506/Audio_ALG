@@ -14,27 +14,38 @@ identical" one, so no gate can pass by both sides being silence.
 Cases, all in ONE driver selected by argv[1] so audio_common and the four
 model TUs are compiled once for the module:
 
-  equiv      DEEPVQE_IO_TIME vs a rolling analysis + two hand-held state
-             banks + deepvqe_ccm_process + aiaec_synthesis_push, wired up by
-             hand from ONLY the composed TUs
+  equiv      DEEPVQE_IO_TIME vs a rolling analysis + one hand-held in-place
+             state buffer set + deepvqe_ccm_process + aiaec_synthesis_push,
+             wired up by hand from ONLY the composed TUs
   freq       DEEPVQE_IO_FREQ driven by the caller's own transform vs IO_TIME
   freqpool   the FREQ pool is smaller, and the stale-pool gate both accepts
              the matching MemReq and refuses every mismatched one
   lifecycle  _create/_destroy against _init on a caller pool
   reject     _get_mem_size / _init / the stage calls, reject-first
   reset      _reset really clears state (a re-run reproduces the first run)
-  skip       _frame_skip MUTES (fail-closed) and freezes the banks AND the
-             CCM ring
+  skip       _frame_skip MUTES (fail-closed), leaves the state exactly as the
+             accelerator wrote it, and does not advance the CCM ring
+  inplace    one buffer per state tensor (input and output are the same
+             pointer, stable for the instance's life), only the head is
+             NaN-prefilled, and a non-finite write zeroes all sixteen state
+             tensors (mutation test) and leaves the next frame healthy
   guard      the three contract gates: no double pre_process, no commit
              without frame_inputs, no re-commit after a refused one
+  inherit    the COPY path: the runtime writes its own private tensors and
+             deepvqe_prepost_outputs_inherit() copies them into the pool --
+             bit-identical to the in-place run over 400 hops, a no-op when
+             the runtime wrote in place, and a refusal (pool untouched, then
+             frame_skip and a healthy next frame) on any non-finite tensor,
+             NULL or count mismatch
   boundary   the explicit state boundary -- names, shapes, element counts,
              and the descriptor validator's 12 refusable fields
   descriptor a shape/validate dump driven from argv, so the Python side can
              feed it a descriptor MEASURED from the built graph
 
 The accelerator stand-in is deterministic and input-dependent -- it sums both
-signal inputs and all sixteen state tensors -- so a bank swap that failed to
-happen, or happened when it should not have, diverges rather than agrees.
+signal inputs and all sixteen state tensors, and writes its next state back in
+place -- so a state handoff that failed to happen, or happened when it should
+not have, diverges rather than agrees.
 
 THE SKIP POLICY IS DELIBERATE. DeepVQE-S's stream 0 is the RAW microphone,
 not a residual, so the pass-through identity a post-filter takes would emit
@@ -113,8 +124,12 @@ _DRIVER = r'''
 /* Deterministic stand-in for the accelerator. It satisfies the FULL-WRITE
  * contract -- every element of `taps` and of all sixteen state_out tensors --
  * and is made input-dependent on BOTH signal inputs and EVERY state tensor,
- * so a bank swap that did not happen (or happened when it should not have)
- * changes every later frame instead of going unnoticed. */
+ * so a state handoff that did not happen (or happened when it should not
+ * have) changes every later frame instead of going unnoticed.
+ *
+ * state_out aliases state: the whole old state is reduced into `acc` before
+ * the first output element is written, so every state input is read before any
+ * state output is written, as the in-place contract requires. */
 static int fake_run(const DeepVqePrepostInputs *in,
                     DeepVqePrepostOutputs *out) {
     double acc = 0.0;
@@ -185,16 +200,79 @@ static float out_a[HOPS * AIAEC_HOP];
 static float out_b[HOPS * AIAEC_HOP];
 static float window[AIAEC_N_FFT];
 
+/* Where the stand-in accelerator writes its outputs.
+ *   RUN_IN_PLACE  the pool's own pointers (state_out == state); no inherit
+ *   RUN_SEPARATE  the runtime's PRIVATE tensors (taps and all sixteen
+ *                 state_out), then deepvqe_prepost_outputs_inherit()
+ *   RUN_MIXED     private taps and every other state tensor private, the rest
+ *                 written in place, then inherit: the aliased tensors must be
+ *                 left alone while the others are copied */
+enum { RUN_IN_PLACE = 0, RUN_SEPARATE = 1, RUN_MIXED = 2 };
+
+/* The runtime's own output tensors, sized from the instance's boundary. */
+typedef struct RuntimeTensors {
+    float *taps;
+    float *state[DEEPVQE_STATE_COUNT];
+    DeepVqePrepostOutputs view;   /* what the runtime hands to inherit */
+} RuntimeTensors;
+
+static int rt_alloc(RuntimeTensors *rt, const DeepVqePrepostOutputs *dest) {
+    int id;
+    memset(rt, 0, sizeof *rt);
+    rt->taps = (float *)calloc(dest->taps_elements, sizeof(float));
+    if (!rt->taps) return -1;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        rt->state[id] = (float *)calloc(dest->state_elements[id],
+                                        sizeof(float));
+        if (!rt->state[id]) return -1;
+    }
+    return 0;
+}
+
+static void rt_free(RuntimeTensors *rt) {
+    int id;
+    free(rt->taps);
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) free(rt->state[id]);
+    memset(rt, 0, sizeof *rt);
+}
+
+/* Point `rt->view` at the tensors a run in `mode` writes. */
+static void rt_bind(RuntimeTensors *rt, const DeepVqePrepostOutputs *dest,
+                    int mode) {
+    int id;
+    rt->view = *dest;
+    if (mode == RUN_IN_PLACE) return;
+    rt->view.taps = rt->taps;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+        if (mode == RUN_SEPARATE || (id % 2) == 0)
+            rt->view.state_out[id] = rt->state[id];
+}
+
+/* One accelerator run plus, off the in-place path, the inherit. */
+static int run_accel(const DeepVqePrepostInputs *inputs,
+                     const DeepVqePrepostOutputs *dest, RuntimeTensors *rt,
+                     int mode) {
+    rt_bind(rt, dest, mode);
+    if (fake_run(inputs, &rt->view) != 0) return -1;
+    if (mode == RUN_IN_PLACE) return 0;
+    return deepvqe_prepost_outputs_inherit(dest, &rt->view);
+}
+
 /* The canonical per-hop loop from deepvqe_prepost.h's contract block.
  * `cold` asserts the synthesis warm-up schedule: the first frame lands
  * entirely inside the trimmed half-window, so `written` is 0 on hop 0 and
  * AIAEC_HOP from then on. A run continued on a WARM instance emits a full
  * hop immediately, which is why the schedule is a parameter and not a
  * constant. */
-static int drive_time(DeepVqePrepost *p, const float *mic, const float *far,
-                      float *out, int hops, int cold) {
+static int drive_time_mode(DeepVqePrepost *p, const float *mic,
+                           const float *far, float *out, int hops, int cold,
+                           int mode) {
+    RuntimeTensors rt;
     int hop;
-    for (hop = 0; hop < hops; ++hop) {
+    int have_rt = 0;
+    int status = 0;
+    memset(&rt, 0, sizeof rt);
+    for (hop = 0; status == 0 && hop < hops; ++hop) {
         DeepVqePrepostInputs inputs;
         DeepVqePrepostOutputs outputs;
         int written = -1;
@@ -204,15 +282,29 @@ static int drive_time(DeepVqePrepost *p, const float *mic, const float *far,
          * asserted every hop rather than looped over. */
         if (deepvqe_prepost_pre_process(p, mic + (size_t)hop * AIAEC_HOP,
                                         far + (size_t)hop * AIAEC_HOP) != 1)
-            return -1;
-        if (deepvqe_prepost_frame_inputs(p, &inputs, &outputs) != 0) return -1;
-        if (fake_run(&inputs, &outputs) != 0) return -1;
-        if (deepvqe_prepost_frame_commit(p) != 0) return -1;
-        if (deepvqe_prepost_post_process(p, out + (size_t)hop * AIAEC_HOP,
-                                         &written) != 0) return -1;
-        if (written != expect) return -1;
+            status = -1;
+        else if (deepvqe_prepost_frame_inputs(p, &inputs, &outputs) != 0)
+            status = -1;
+        else if (!have_rt && mode != RUN_IN_PLACE &&
+                 rt_alloc(&rt, &outputs) != 0)
+            status = -1;
+        else {
+            have_rt = 1;
+            if (run_accel(&inputs, &outputs, &rt, mode) != 0) status = -1;
+            else if (deepvqe_prepost_frame_commit(p) != 0) status = -1;
+            else if (deepvqe_prepost_post_process(
+                         p, out + (size_t)hop * AIAEC_HOP, &written) != 0)
+                status = -1;
+            else if (written != expect) status = -1;
+        }
     }
-    return 0;
+    rt_free(&rt);
+    return status;
+}
+
+static int drive_time(DeepVqePrepost *p, const float *mic, const float *far,
+                      float *out, int hops, int cold) {
+    return drive_time_mode(p, mic, far, out, hops, cold, RUN_IN_PLACE);
 }
 
 /* center=False rolling analysis: one frame per hop over the last N_FFT
@@ -248,7 +340,8 @@ static void interleave_ri(const float *re, const float *im, float *ri) {
 /* ---- equiv: the class vs the hand-composed reference path ------------ */
 
 static int case_equiv(FftHandle *fft) {
-    /* Path A -- the two composed TUs plus two state banks held by hand.
+    /* Path A -- the two composed TUs plus one in-place state buffer set held
+     * by hand.
      * deepvqe_prepost.c contributes nothing here except the pure shape
      * helper, so this reference cannot be circular. */
     static float hist_mic[AIAEC_N_FFT], hist_far[AIAEC_N_FFT];
@@ -256,23 +349,19 @@ static int case_equiv(FftHandle *fft) {
     static DeepVqeCcmState ccm;
     static float mic_ri[2 * AIAEC_N_BINS], far_ri[2 * AIAEC_N_BINS];
     static float taps_ref[DEEPVQE_TAPS_ELEMENTS];
-    float *bank[2][DEEPVQE_STATE_COUNT];
+    float *state[DEEPVQE_STATE_COUNT];
     size_t elements[DEEPVQE_STATE_COUNT];
     DeepVqePrepostConfig cfg;
     DeepVqePrepostMemReq req;
     DeepVqePrepost *p;
     void *pool;
-    int front = 0;
-    int bank_index, id, hop;
+    int id, hop;
 
-    for (bank_index = 0; bank_index < 2; ++bank_index) {
-        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-            elements[id] = deepvqe_prepost_state_elements(id, D);
-            CHECK(elements[id] > 0u);
-            bank[bank_index][id] =
-                (float *)calloc(elements[id], sizeof(float));
-            CHECK(bank[bank_index][id] != NULL);
-        }
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        elements[id] = deepvqe_prepost_state_elements(id, D);
+        CHECK(elements[id] > 0u);
+        state[id] = (float *)calloc(elements[id], sizeof(float));
+        CHECK(state[id] != NULL);
     }
     memset(hist_mic, 0, sizeof hist_mic);
     memset(hist_far, 0, sizeof hist_far);
@@ -303,13 +392,12 @@ static int case_equiv(FftHandle *fft) {
         outputs.taps = taps_ref;
         outputs.taps_elements = DEEPVQE_TAPS_ELEMENTS;
         for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-            inputs.state[id] = bank[front][id];
+            inputs.state[id] = state[id];
             inputs.state_elements[id] = elements[id];
-            outputs.state_out[id] = bank[front ^ 1][id];
+            outputs.state_out[id] = state[id];   /* in place */
             outputs.state_elements[id] = elements[id];
         }
         CHECK(fake_run(&inputs, &outputs) == 0);
-        front ^= 1;   /* the graph returns the FULL next state: swap banks */
 
         deepvqe_ccm_process(
             &ccm, mic_re, mic_im,
@@ -350,9 +438,7 @@ static int case_equiv(FftHandle *fft) {
 
     deepvqe_prepost_destroy(p);
     free(pool);
-    for (bank_index = 0; bank_index < 2; ++bank_index)
-        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
-            free(bank[bank_index][id]);
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) free(state[id]);
     return 0;
 }
 
@@ -476,6 +562,22 @@ static int case_freqpool(FftHandle *fft) {
            (unsigned long long)(req_time63.bytes - req_freq63.bytes),
            100.0 * (double)(req_time63.bytes - req_freq63.bytes) /
                (double)req_time63.bytes);
+
+    /* ONE copy of the state per tensor: doubling D grows the pool by the
+     * state's own growth (alignment padding aside), not by twice that. */
+    {
+        size_t state_d = 0, state_2d = 0;
+        int sid;
+        for (sid = 0; sid < DEEPVQE_STATE_COUNT; ++sid) {
+            state_d += deepvqe_prepost_state_elements(sid, D) * sizeof(float);
+            state_2d +=
+                deepvqe_prepost_state_elements(sid, 2 * D) * sizeof(float);
+        }
+        CHECK(state_2d > state_d);
+        CHECK(req_deep.bytes - req_time.bytes >= state_2d - state_d);
+        CHECK(req_deep.bytes - req_time.bytes <
+              state_2d - state_d + 16u * DEEPVQE_STATE_COUNT);
+    }
 
     /* IO_FREQ must not pay for the framing machinery it never runs. */
     CHECK(req_freq.bytes < req_time.bytes);
@@ -713,6 +815,7 @@ static int case_reject(FftHandle *fft) {
         DeepVqePrepostInputs inputs;
         DeepVqePrepostOutputs outputs;
         int written = -1;
+        int id;
         CHECK(p != NULL);
         CHECK(deepvqe_prepost_pre_process(NULL, pcm_mic, pcm_far) == -1);
         CHECK(deepvqe_prepost_pre_process(p, NULL, pcm_far) == -1);
@@ -743,8 +846,15 @@ static int case_reject(FftHandle *fft) {
          * frame stays open so the caller can fail closed. */
         CHECK(fake_run(&inputs, &outputs) == 0);
         outputs.taps[DEEPVQE_TAPS_ELEMENTS / 3] = NAN;
+        /* Teeth: the state is non-zero going in, so "zero" below is the
+         * commit's doing. */
+        CHECK(!all_zero(outputs.state_out[DEEPVQE_STATE_H_GRU],
+                        (int)outputs.state_elements[DEEPVQE_STATE_H_GRU]));
         CHECK(deepvqe_prepost_frame_commit(p) == -1);
         CHECK(deepvqe_prepost_frame_skip(p) == 0);
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+            CHECK(all_zero(outputs.state_out[id],
+                           (int)outputs.state_elements[id]));
 
         /* The same refusal when the hole is in ONE state tensor rather than
          * in the taps -- the finite check walks the whole state, not just
@@ -760,6 +870,9 @@ static int case_reject(FftHandle *fft) {
         outputs.state_out[DEEPVQE_STATE_MIC3_HISTORY][5] = NAN;
         CHECK(deepvqe_prepost_frame_commit(p) == -1);
         CHECK(deepvqe_prepost_frame_skip(p) == 0);
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+            CHECK(all_zero(outputs.state_out[id],
+                           (int)outputs.state_elements[id]));
     }
 
     free(pool);
@@ -852,9 +965,11 @@ static int case_skip(void) {
     static float f3_re[AIAEC_N_BINS], f3_im[AIAEC_N_BINS];
     static float far_re[AIAEC_N_BINS], far_im[AIAEC_N_BINS];
     static float got_re[AIAEC_N_BINS], got_im[AIAEC_N_BINS];
-    float *snapshot[DEEPVQE_STATE_COUNT];
+    float *before[DEEPVQE_STATE_COUNT];    /* state the accelerator read   */
+    float *written[DEEPVQE_STATE_COUNT];   /* state the accelerator wrote  */
     size_t elements[DEEPVQE_STATE_COUNT];
     int id;
+    int moved;
     size_t i;
 
     CHECK(strcmp(deepvqe_prepost_skip_policy_name(),
@@ -873,19 +988,20 @@ static int case_skip(void) {
     p = deepvqe_prepost_init(pool, (size_t)req.bytes, &cfg);
     CHECK(p != NULL);
 
-    /* Frame 1: a real commit, so the state banks are NON-ZERO below. */
+    /* Frame 1: a real commit, so the state tensors are NON-ZERO below. */
     CHECK(commit_freq(p, f1_re, f1_im, far_re, far_im, got_re, got_im) == 0);
     /* Teeth for the mute assertion: a committed frame is NOT all zeros. */
     CHECK(!all_zero(got_re, AIAEC_N_BINS) || !all_zero(got_im, AIAEC_N_BINS));
 
-    /* Frame 2: snapshot all sixteen state views, then take the fail-closed
-     * identity even though the accelerator produced a COMPLETE, perfectly
-     * committable result.
+    /* Frame 2: the accelerator produces a COMPLETE, perfectly committable
+     * result, and the host takes the fail-closed identity anyway.
      *
      * The full write is the point. Skipping after a partial write would
      * prove nothing -- commit() refuses that frame on its own -- so a skip
      * that quietly committed would still look correct. Here the only thing
-     * standing between the banks and a swap is frame_skip's contract. */
+     * standing between the run and a commit is frame_skip's contract. The
+     * state is in place, so it is whatever the accelerator wrote: skip does
+     * not undo it. */
     CHECK(deepvqe_prepost_pre_process_freq(p, f2_re, f2_im,
                                            far_re, far_im) == 1);
     CHECK(deepvqe_prepost_frame_inputs(p, &inputs, &outputs) == 0);
@@ -894,17 +1010,26 @@ static int case_skip(void) {
         for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
             elements[id] = inputs.state_elements[id];
             CHECK(elements[id] == deepvqe_prepost_state_elements(id, D));
-            snapshot[id] = (float *)malloc(elements[id] * sizeof(float));
-            CHECK(snapshot[id] != NULL);
-            memcpy(snapshot[id], inputs.state[id],
+            before[id] = (float *)malloc(elements[id] * sizeof(float));
+            written[id] = (float *)malloc(elements[id] * sizeof(float));
+            CHECK(before[id] != NULL && written[id] != NULL);
+            memcpy(before[id], inputs.state[id],
                    elements[id] * sizeof(float));
             for (i = 0; i < elements[id]; ++i)
-                if (snapshot[id][i] != 0.0f) nonzero = 1;
+                if (before[id][i] != 0.0f) nonzero = 1;
         }
         /* "unchanged" proves nothing against an all-zero snapshot. */
         CHECK(nonzero);
     }
     CHECK(fake_run(&inputs, &outputs) == 0);
+    moved = 0;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        memcpy(written[id], outputs.state_out[id],
+               elements[id] * sizeof(float));
+        if (memcmp(written[id], before[id],
+                   elements[id] * sizeof(float)) != 0) moved = 1;
+    }
+    CHECK(moved);   /* the run really changed the state */
     CHECK(deepvqe_prepost_frame_skip(p) == 0);
     CHECK(deepvqe_prepost_post_process_freq(p, got_re, got_im) == 0);
     /* FAIL CLOSED: silence, NOT the microphone passed through. Passing the
@@ -914,13 +1039,14 @@ static int case_skip(void) {
     CHECK(all_zero(got_im, AIAEC_N_BINS));
     CHECK(!identical(got_re, f2_re, AIAEC_N_BINS));
 
-    /* Frame 3: the state banks must be exactly what frame 2 saw. */
+    /* Frame 3: the state is exactly what the accelerator wrote in frame 2
+     * -- the skip neither rolled it back nor zeroed it. */
     CHECK(deepvqe_prepost_pre_process_freq(p, f3_re, f3_im,
                                            far_re, far_im) == 1);
     CHECK(deepvqe_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
         CHECK(inputs.state_elements[id] == elements[id]);
-        CHECK(memcmp(inputs.state[id], snapshot[id],
+        CHECK(memcmp(inputs.state[id], written[id],
                      elements[id] * sizeof(float)) == 0);
     }
     /* A skip WITHOUT frame_inputs behind it is legal: the accelerator may
@@ -930,33 +1056,42 @@ static int case_skip(void) {
     CHECK(all_zero(got_re, AIAEC_N_BINS));
     CHECK(all_zero(got_im, AIAEC_N_BINS));
 
-    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) free(snapshot[id]);
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        free(before[id]);
+        free(written[id]);
+    }
     deepvqe_prepost_destroy(p);
     free(pool);
 
     /* The CCM spectrum ring is HOST state and must not advance on a skip
-     * either. Three instances fed the same frames:
-     *   A: commit(f1), skip(f2),   commit(f3)
-     *   B: commit(f1),             commit(f3)   -- f2 never presented
-     *   C: commit(f1), commit(f2), commit(f3)
-     * A must equal B (the skipped frame left no trace anywhere) and must
-     * differ from C (a committed f2 does move both the banks and the ring),
-     * so the equality is not measuring a constant. */
+     * either. Four instances fed the same frames:
+     *   A: commit(f1), run + skip(f2), commit(f3)  -- accelerator wrote f2
+     *   D: commit(f1), skip(f2),       commit(f3)  -- accelerator wrote nothing
+     *   B: commit(f1),                 commit(f3)  -- f2 never presented
+     *   C: commit(f1), commit(f2),     commit(f3)
+     * D must equal B: a skip after a failed run leaves no trace in the state
+     * or in the ring (a ring that advanced on skip would split them). A must
+     * differ from B: the state is in place, so a skip keeps what the
+     * accelerator wrote. Both must differ from C, so the equality is not
+     * measuring a constant. */
     {
-        DeepVqePrepost *a, *b, *c;
-        void *pool_a, *pool_b, *pool_c;
+        DeepVqePrepost *a, *b, *c, *d;
+        void *pool_a, *pool_b, *pool_c, *pool_d;
         static float a_re[AIAEC_N_BINS], a_im[AIAEC_N_BINS];
         static float b_re[AIAEC_N_BINS], b_im[AIAEC_N_BINS];
         static float c_re[AIAEC_N_BINS], c_im[AIAEC_N_BINS];
+        static float d_re[AIAEC_N_BINS], d_im[AIAEC_N_BINS];
 
         pool_a = alloc_aligned(req.alignment, (size_t)req.bytes);
         pool_b = alloc_aligned(req.alignment, (size_t)req.bytes);
         pool_c = alloc_aligned(req.alignment, (size_t)req.bytes);
-        CHECK(pool_a && pool_b && pool_c);
+        pool_d = alloc_aligned(req.alignment, (size_t)req.bytes);
+        CHECK(pool_a && pool_b && pool_c && pool_d);
         a = deepvqe_prepost_init(pool_a, (size_t)req.bytes, &cfg);
         b = deepvqe_prepost_init(pool_b, (size_t)req.bytes, &cfg);
         c = deepvqe_prepost_init(pool_c, (size_t)req.bytes, &cfg);
-        CHECK(a && b && c);
+        d = deepvqe_prepost_init(pool_d, (size_t)req.bytes, &cfg);
+        CHECK(a && b && c && d);
 
         CHECK(commit_freq(a, f1_re, f1_im, far_re, far_im,
                           a_re, a_im) == 0);
@@ -968,6 +1103,16 @@ static int case_skip(void) {
         CHECK(deepvqe_prepost_post_process_freq(a, a_re, a_im) == 0);
         CHECK(commit_freq(a, f3_re, f3_im, far_re, far_im,
                           a_re, a_im) == 0);
+
+        CHECK(commit_freq(d, f1_re, f1_im, far_re, far_im,
+                          d_re, d_im) == 0);
+        CHECK(deepvqe_prepost_pre_process_freq(d, f2_re, f2_im,
+                                               far_re, far_im) == 1);
+        CHECK(deepvqe_prepost_frame_inputs(d, &inputs, &outputs) == 0);
+        CHECK(deepvqe_prepost_frame_skip(d) == 0);   /* no fake_run */
+        CHECK(deepvqe_prepost_post_process_freq(d, d_re, d_im) == 0);
+        CHECK(commit_freq(d, f3_re, f3_im, far_re, far_im,
+                          d_re, d_im) == 0);
 
         CHECK(commit_freq(b, f1_re, f1_im, far_re, far_im,
                           b_re, b_im) == 0);
@@ -981,19 +1126,220 @@ static int case_skip(void) {
         CHECK(commit_freq(c, f3_re, f3_im, far_re, far_im,
                           c_re, c_im) == 0);
 
-        CHECK(!all_zero(a_re, AIAEC_N_BINS));
-        CHECK(identical(a_re, b_re, AIAEC_N_BINS));
-        CHECK(identical(a_im, b_im, AIAEC_N_BINS));
+        CHECK(!all_zero(d_re, AIAEC_N_BINS));
+        CHECK(identical(d_re, b_re, AIAEC_N_BINS));
+        CHECK(identical(d_im, b_im, AIAEC_N_BINS));
+        CHECK(!identical(a_re, b_re, AIAEC_N_BINS));
         CHECK(!identical(a_re, c_re, AIAEC_N_BINS));
         CHECK(!identical(a_im, c_im, AIAEC_N_BINS));
+        CHECK(!identical(d_re, c_re, AIAEC_N_BINS));
+        CHECK(!identical(d_im, c_im, AIAEC_N_BINS));
 
         deepvqe_prepost_destroy(a);
         deepvqe_prepost_destroy(b);
         deepvqe_prepost_destroy(c);
+        deepvqe_prepost_destroy(d);
         free(pool_a);
         free(pool_b);
         free(pool_c);
+        free(pool_d);
     }
+    return 0;
+}
+
+/* ---- inplace: one buffer per state tensor, validate-only commit ------- */
+
+static int state_all_zero(const DeepVqePrepostInputs *in) {
+    int id;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+        if (!all_zero(in->state[id], (int)in->state_elements[id])) return 0;
+    return 1;
+}
+
+static int case_inplace(FftHandle *fft) {
+    DeepVqePrepostConfig cfg_time, cfg_freq;
+    DeepVqePrepostMemReq req_time, req_freq;
+    DeepVqePrepost *p, *q;
+    void *pool_time, *pool_freq;
+    DeepVqePrepostInputs inputs, first_in;
+    DeepVqePrepostOutputs outputs, first_out;
+    static float f1_re[AIAEC_N_BINS], f1_im[AIAEC_N_BINS];
+    static float f2_re[AIAEC_N_BINS], f2_im[AIAEC_N_BINS];
+    static float far_re[AIAEC_N_BINS], far_im[AIAEC_N_BINS];
+    static float got_re[AIAEC_N_BINS], got_im[AIAEC_N_BINS];
+    float *expect[DEEPVQE_STATE_COUNT];
+    int id, hop, target;
+    size_t i;
+
+    /* (1) Stream: through a real TIME-mode stream the state input and output
+     * are one pointer per tensor, the same pointers on every frame, and the
+     * frame-t output is what frame t+1 reads. Healthy-stream numerics are the
+     * equiv/freq/reset cases above (byte-identical to the hand-composed
+     * reference); this pins the aliasing itself. */
+    CHECK(deepvqe_prepost_config_defaults(&cfg_time, DEEPVQE_IO_TIME, D) == 0);
+    cfg_time.fft = fft;
+    cfg_time.window = window;
+    CHECK(deepvqe_prepost_get_mem_size(&cfg_time, &req_time) == 0);
+    pool_time = alloc_aligned(req_time.alignment, (size_t)req_time.bytes);
+    CHECK(pool_time != NULL);
+    p = deepvqe_prepost_init(pool_time, (size_t)req_time.bytes, &cfg_time);
+    CHECK(p != NULL);
+    memset(&first_in, 0, sizeof first_in);
+    memset(&first_out, 0, sizeof first_out);
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        expect[id] = (float *)malloc(
+            deepvqe_prepost_state_elements(id, D) * sizeof(float));
+        CHECK(expect[id] != NULL);
+    }
+    for (hop = 0; hop < SHORT_HOPS; ++hop) {
+        CHECK(deepvqe_prepost_pre_process(p, pcm_mic + (size_t)hop * AIAEC_HOP,
+                                          pcm_far + (size_t)hop * AIAEC_HOP)
+              == 1);
+        CHECK(deepvqe_prepost_frame_inputs(p, &inputs, &outputs) == 0);
+        if (hop == 0) {
+            first_in = inputs;
+            first_out = outputs;
+            CHECK(state_all_zero(&inputs));      /* starts cold */
+        }
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+            CHECK(inputs.state[id] == (const float *)outputs.state_out[id]);
+            CHECK(inputs.state[id] == first_in.state[id]);
+            CHECK(outputs.state_out[id] == first_out.state_out[id]);
+            CHECK(inputs.state_elements[id] == outputs.state_elements[id]);
+            if (hop > 0)   /* the last output IS this input: no copy, no swap */
+                CHECK(memcmp(inputs.state[id], expect[id],
+                             inputs.state_elements[id] * sizeof(float)) == 0);
+        }
+        /* Only the head is NaN-prefilled; the state is left as the input. */
+        for (i = 0; i < outputs.taps_elements; ++i)
+            CHECK(isnan(outputs.taps[i]));
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+            for (i = 0; i < inputs.state_elements[id]; ++i)
+                CHECK(!isnan(inputs.state[id][i]));
+        CHECK(fake_run(&inputs, &outputs) == 0);
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+            memcpy(expect[id], outputs.state_out[id],
+                   inputs.state_elements[id] * sizeof(float));
+        CHECK(deepvqe_prepost_frame_commit(p) == 0);
+        /* commit leaves the state exactly as written. */
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+            CHECK(memcmp(first_in.state[id], expect[id],
+                         first_in.state_elements[id] * sizeof(float)) == 0);
+        CHECK(deepvqe_prepost_post_process(p, out_a, NULL) == 0);
+    }
+    CHECK(!state_all_zero(&first_in));   /* the stream really moved the state */
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) free(expect[id]);
+
+    deepvqe_prepost_destroy(p);
+    free(pool_time);
+
+    /* (2) MUTATION: one non-finite element in ONE state tensor, injected
+     * through the in-place pointer, must make commit return -1, leave ALL
+     * sixteen tensors zero, not advance the CCM ring, and leave the next
+     * healthy frame working. Every tensor takes the injection in turn (first
+     * and last element, NaN and Inf), and the same frame WITHOUT the
+     * injection commits, so the refusal is attributable to the injection. */
+    CHECK(deepvqe_prepost_config_defaults(&cfg_freq, DEEPVQE_IO_FREQ, D) == 0);
+    CHECK(deepvqe_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);
+    pool_freq = alloc_aligned(req_freq.alignment, (size_t)req_freq.bytes);
+    CHECK(pool_freq != NULL);
+    q = deepvqe_prepost_init(pool_freq, (size_t)req_freq.bytes, &cfg_freq);
+    CHECK(q != NULL);
+    make_frame(f1_re, f1_im, 0.0f);
+    make_frame(f2_re, f2_im, 0.125f);
+    make_frame(far_re, far_im, 0.0625f);
+
+    for (target = 0; target < 2 * DEEPVQE_STATE_COUNT; ++target) {
+        int tensor = target % DEEPVQE_STATE_COUNT;
+        int last = target >= DEEPVQE_STATE_COUNT;   /* first half: elem 0 */
+        float poison = (target % 2) ? INFINITY : NAN;
+        float *victim;
+        size_t index;
+
+        deepvqe_prepost_reset(q);
+        CHECK(commit_freq(q, f1_re, f1_im, far_re, far_im,
+                          got_re, got_im) == 0);
+
+        /* Control: the identical frame, uninjected, commits. */
+        CHECK(deepvqe_prepost_pre_process_freq(q, f2_re, f2_im,
+                                               far_re, far_im) == 1);
+        CHECK(deepvqe_prepost_frame_inputs(q, &inputs, &outputs) == 0);
+        CHECK(fake_run(&inputs, &outputs) == 0);
+        CHECK(!state_all_zero(&inputs));
+        CHECK(deepvqe_prepost_frame_commit(q) == 0);
+        CHECK(deepvqe_prepost_post_process_freq(q, got_re, got_im) == 0);
+        CHECK(!all_zero(got_re, AIAEC_N_BINS));
+
+        /* Same history, now poisoned. */
+        deepvqe_prepost_reset(q);
+        CHECK(commit_freq(q, f1_re, f1_im, far_re, far_im,
+                          got_re, got_im) == 0);
+        CHECK(deepvqe_prepost_pre_process_freq(q, f2_re, f2_im,
+                                               far_re, far_im) == 1);
+        CHECK(deepvqe_prepost_frame_inputs(q, &inputs, &outputs) == 0);
+        CHECK(fake_run(&inputs, &outputs) == 0);
+        index = last ? outputs.state_elements[tensor] - 1u : 0u;
+        victim = outputs.state_out[tensor];
+        victim[index] = poison;
+        CHECK(deepvqe_prepost_frame_commit(q) == -1);
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+            CHECK(all_zero(outputs.state_out[id],
+                           (int)outputs.state_elements[id]));
+        CHECK(state_all_zero(&inputs));
+        CHECK(deepvqe_prepost_frame_commit(q) == -1);   /* disarmed */
+
+        /* The next healthy frame works: retry through a fresh frame_inputs
+         * from the cold state. */
+        CHECK(deepvqe_prepost_frame_inputs(q, &inputs, &outputs) == 0);
+        CHECK(state_all_zero(&inputs));
+        CHECK(fake_run(&inputs, &outputs) == 0);
+        CHECK(deepvqe_prepost_frame_commit(q) == 0);
+        CHECK(deepvqe_prepost_post_process_freq(q, got_re, got_im) == 0);
+        CHECK(!all_zero(got_re, AIAEC_N_BINS));
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+            for (i = 0; i < outputs.state_elements[id]; ++i)
+                CHECK(isfinite(outputs.state_out[id][i]));
+    }
+
+    /* (3) A refused commit does not advance the CCM ring. X: poisoned f1
+     * refused, skipped (muted), then a healthy f2. Y: a fresh instance fed
+     * only the healthy f2. Both reach f2 from the cold state with an empty
+     * ring, so their outputs agree byte for byte -- a ring that had taken f1
+     * on the refused commit would split them. */
+    {
+        DeepVqePrepost *y;
+        void *pool_y;
+        static float x_re[AIAEC_N_BINS], x_im[AIAEC_N_BINS];
+        static float y_re[AIAEC_N_BINS], y_im[AIAEC_N_BINS];
+
+        pool_y = alloc_aligned(req_freq.alignment, (size_t)req_freq.bytes);
+        CHECK(pool_y != NULL);
+        y = deepvqe_prepost_init(pool_y, (size_t)req_freq.bytes, &cfg_freq);
+        CHECK(y != NULL);
+
+        deepvqe_prepost_reset(q);
+        CHECK(deepvqe_prepost_pre_process_freq(q, f1_re, f1_im,
+                                               far_re, far_im) == 1);
+        CHECK(deepvqe_prepost_frame_inputs(q, &inputs, &outputs) == 0);
+        CHECK(fake_run(&inputs, &outputs) == 0);
+        outputs.state_out[DEEPVQE_STATE_H_GRU][3] = NAN;
+        CHECK(deepvqe_prepost_frame_commit(q) == -1);
+        CHECK(deepvqe_prepost_frame_skip(q) == 0);
+        CHECK(deepvqe_prepost_post_process_freq(q, x_re, x_im) == 0);
+        CHECK(all_zero(x_re, AIAEC_N_BINS));
+        CHECK(commit_freq(q, f2_re, f2_im, far_re, far_im, x_re, x_im) == 0);
+
+        CHECK(commit_freq(y, f2_re, f2_im, far_re, far_im, y_re, y_im) == 0);
+        CHECK(!all_zero(y_re, AIAEC_N_BINS));
+        CHECK(identical(x_re, y_re, AIAEC_N_BINS));
+        CHECK(identical(x_im, y_im, AIAEC_N_BINS));
+
+        deepvqe_prepost_destroy(y);
+        free(pool_y);
+    }
+
+    deepvqe_prepost_destroy(q);
+    free(pool_freq);
     return 0;
 }
 
@@ -1043,9 +1389,11 @@ static int case_guard(FftHandle *fft) {
 
     /* (3) A refused commit DISARMS the transaction: re-committing without a
      * fresh frame_inputs must not succeed by the second walk happening to
-     * find the same buffers. The fresh frame_inputs then re-fills EVERY
-     * accelerator output with NaN, which is what makes the finite check a
-     * partial-write detector rather than a stale-value detector. */
+     * find the same buffers. The fresh frame_inputs then re-fills the head
+     * output with NaN, which is what makes the finite check a partial-write
+     * detector rather than a stale-value detector on the taps. The state
+     * tensors are NOT re-filled: they are the accelerator's input, and after
+     * the refused commit they are the cold (all-zero) state. */
     CHECK(deepvqe_prepost_pre_process(p, pcm_mic + 2 * AIAEC_HOP,
                                       pcm_far + 2 * AIAEC_HOP) == 1);
     CHECK(deepvqe_prepost_frame_inputs(p, &inputs, &outputs) == 0);
@@ -1058,10 +1406,11 @@ static int case_guard(FftHandle *fft) {
         size_t defined = 0;
         for (i = 0; i < outputs.taps_elements; ++i)
             if (!isnan(outputs.taps[i])) ++defined;
-        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
-            for (i = 0; i < outputs.state_elements[id]; ++i)
-                if (!isnan(outputs.state_out[id][i])) ++defined;
         CHECK(defined == 0u);
+        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+            CHECK(inputs.state[id] == outputs.state_out[id]);
+            CHECK(all_zero(inputs.state[id], (int)inputs.state_elements[id]));
+        }
     }
     CHECK(fake_run(&inputs, &outputs) == 0);
     CHECK(deepvqe_prepost_frame_commit(p) == 0);
@@ -1095,6 +1444,294 @@ static int case_guard(FftHandle *fft) {
 
     deepvqe_prepost_destroy(q);
     free(pool_freq);
+    return 0;
+}
+
+/* ---- inherit: the COPY path -------------------------------------------- */
+
+static DeepVqePrepost *new_time_instance(FftHandle *fft, void **pool_out) {
+    DeepVqePrepostConfig cfg;
+    DeepVqePrepostMemReq req;
+    void *pool;
+    if (deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_TIME, D) != 0)
+        return NULL;
+    cfg.fft = fft;
+    cfg.window = window;
+    if (deepvqe_prepost_get_mem_size(&cfg, &req) != 0) return NULL;
+    pool = alloc_aligned(req.alignment, (size_t)req.bytes);
+    if (!pool) return NULL;
+    *pool_out = pool;
+    return deepvqe_prepost_init_ex(pool, (size_t)req.bytes, &cfg, &req);
+}
+
+/* Total float count of the pool-resident boundary (taps + sixteen states). */
+static size_t boundary_floats(const DeepVqePrepostOutputs *o) {
+    size_t total = o->taps_elements;
+    int id;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) total += o->state_elements[id];
+    return total;
+}
+
+/* Flatten the pool-resident boundary (taps, then state 0..15) into `flat`. */
+static void snapshot_boundary(const DeepVqePrepostOutputs *o, float *flat) {
+    size_t at = o->taps_elements;
+    int id;
+    memcpy(flat, o->taps, o->taps_elements * sizeof(float));
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        memcpy(flat + at, o->state_out[id],
+               o->state_elements[id] * sizeof(float));
+        at += o->state_elements[id];
+    }
+}
+
+/* Open a frame on the NEXT hop of a warm instance and run the stand-in
+ * accelerator on private tensors WITHOUT inheriting. */
+static int open_and_run_private(DeepVqePrepost *p, int hop,
+                                DeepVqePrepostInputs *inputs,
+                                DeepVqePrepostOutputs *dest,
+                                RuntimeTensors *rt) {
+    if (deepvqe_prepost_pre_process(p, pcm_mic + (size_t)hop * AIAEC_HOP,
+                                    pcm_far + (size_t)hop * AIAEC_HOP) != 1)
+        return -1;
+    if (deepvqe_prepost_frame_inputs(p, inputs, dest) != 0) return -1;
+    if (rt_alloc(rt, dest) != 0) return -1;
+    rt_bind(rt, dest, RUN_SEPARATE);
+    return fake_run(inputs, &rt->view);
+}
+
+#define WARM_HOPS 5
+
+/* A refused inherit leaves the pool byte-identical, frame_skip then takes the
+ * fail-closed hop, and the next healthy frame behaves exactly like an
+ * instance whose accelerator never ran the refused frame. `target` is a state
+ * id, or -1 for the head taps; `bad` is the poisoned value. */
+static int refused_inherit_case(FftHandle *fft, int target, int which,
+                                float bad) {
+    void *pool_x = NULL, *pool_y = NULL;
+    DeepVqePrepost *x = new_time_instance(fft, &pool_x);
+    DeepVqePrepost *y = new_time_instance(fft, &pool_y);
+    DeepVqePrepostInputs in_x, in_y;
+    DeepVqePrepostOutputs dest_x, dest_y;
+    RuntimeTensors rt_x, rt_y;
+    static float hop_x[AIAEC_HOP], hop_y[AIAEC_HOP];
+    float *before, *after;
+    float *slot;
+    size_t count;
+    int written = -1;
+
+    CHECK(x != NULL && y != NULL);
+    CHECK(drive_time_mode(x, pcm_mic, pcm_far, out_a, WARM_HOPS, 1,
+                          RUN_SEPARATE) == 0);
+    CHECK(drive_time_mode(y, pcm_mic, pcm_far, out_b, WARM_HOPS, 1,
+                          RUN_SEPARATE) == 0);
+    memset(&rt_x, 0, sizeof rt_x);
+    memset(&rt_y, 0, sizeof rt_y);
+
+    /* X: private run, one poisoned element, inherit must refuse. */
+    CHECK(open_and_run_private(x, WARM_HOPS, &in_x, &dest_x, &rt_x) == 0);
+    count = boundary_floats(&dest_x);
+    before = (float *)malloc(count * sizeof(float));
+    after = (float *)malloc(count * sizeof(float));
+    CHECK(before != NULL && after != NULL);
+    snapshot_boundary(&dest_x, before);
+    /* The same runtime tensors without the poison are inherited by every
+     * healthy frame below and in case_inherit, so the refusal is
+     * attributable to the poison. */
+    slot = (target < 0) ? rt_x.taps : rt_x.state[target];
+    {
+        size_t n = (target < 0) ? dest_x.taps_elements
+                                : dest_x.state_elements[target];
+        slot[which == 0 ? 0 : n - 1] = bad;
+    }
+    CHECK(deepvqe_prepost_outputs_inherit(&dest_x, &rt_x.view) == -1);
+    snapshot_boundary(&dest_x, after);
+    CHECK(memcmp(before, after, count * sizeof(float)) == 0);
+    free(before);
+    free(after);
+
+    /* The caller reports the run failed and takes the fail-closed skip. */
+    CHECK(deepvqe_prepost_frame_skip(x) == 0);
+    CHECK(deepvqe_prepost_post_process(x, hop_x, &written) == 0);
+    CHECK(written == AIAEC_HOP);
+
+    /* Y: the accelerator never ran the frame. */
+    CHECK(deepvqe_prepost_pre_process(y, pcm_mic + (size_t)WARM_HOPS * AIAEC_HOP,
+                                      pcm_far + (size_t)WARM_HOPS * AIAEC_HOP)
+          == 1);
+    CHECK(deepvqe_prepost_frame_inputs(y, &in_y, &dest_y) == 0);
+    CHECK(deepvqe_prepost_frame_skip(y) == 0);
+    CHECK(deepvqe_prepost_post_process(y, hop_y, &written) == 0);
+    CHECK(identical(hop_x, hop_y, AIAEC_HOP));
+
+    /* Next healthy frame on both, through the copy path. */
+    {
+        const int hop = WARM_HOPS + 1;
+        static float next_x[AIAEC_HOP], next_y[AIAEC_HOP];
+        RuntimeTensors rx, ry;
+        memset(&rx, 0, sizeof rx);
+        memset(&ry, 0, sizeof ry);
+        CHECK(deepvqe_prepost_pre_process(
+                  x, pcm_mic + (size_t)hop * AIAEC_HOP,
+                  pcm_far + (size_t)hop * AIAEC_HOP) == 1);
+        CHECK(deepvqe_prepost_frame_inputs(x, &in_x, &dest_x) == 0);
+        CHECK(rt_alloc(&rx, &dest_x) == 0);
+        CHECK(run_accel(&in_x, &dest_x, &rx, RUN_SEPARATE) == 0);
+        CHECK(deepvqe_prepost_frame_commit(x) == 0);
+        CHECK(deepvqe_prepost_post_process(x, next_x, &written) == 0);
+        CHECK(deepvqe_prepost_pre_process(
+                  y, pcm_mic + (size_t)hop * AIAEC_HOP,
+                  pcm_far + (size_t)hop * AIAEC_HOP) == 1);
+        CHECK(deepvqe_prepost_frame_inputs(y, &in_y, &dest_y) == 0);
+        CHECK(rt_alloc(&ry, &dest_y) == 0);
+        CHECK(run_accel(&in_y, &dest_y, &ry, RUN_SEPARATE) == 0);
+        CHECK(deepvqe_prepost_frame_commit(y) == 0);
+        CHECK(deepvqe_prepost_post_process(y, next_y, &written) == 0);
+        CHECK(!all_zero(next_x, AIAEC_HOP));
+        CHECK(identical(next_x, next_y, AIAEC_HOP));
+        rt_free(&rx);
+        rt_free(&ry);
+    }
+    rt_free(&rt_x);
+    rt_free(&rt_y);
+    deepvqe_prepost_destroy(x);
+    deepvqe_prepost_destroy(y);
+    free(pool_x);
+    free(pool_y);
+    return 0;
+}
+
+static int case_inherit(FftHandle *fft) {
+    void *pool_a = NULL, *pool_b = NULL, *pool_c = NULL, *pool_d = NULL;
+    DeepVqePrepost *a, *b, *c, *d;
+    DeepVqePrepostInputs inputs, inputs_b;
+    DeepVqePrepostOutputs dest, dest_b, runtime;
+    RuntimeTensors rt;
+    float *before, *after;
+    size_t count;
+    int id, which, mode;
+
+    /* 1. The healthy 400-hop stream through private runtime tensors + inherit
+     *    (and the mixed aliased/private binding) is BIT-IDENTICAL, hop by hop,
+     *    to the in-place run. */
+    a = new_time_instance(fft, &pool_a);
+    b = new_time_instance(fft, &pool_b);
+    c = new_time_instance(fft, &pool_c);
+    CHECK(a != NULL && b != NULL && c != NULL);
+    CHECK(drive_time_mode(a, pcm_mic, pcm_far, out_a, HOPS, 1,
+                          RUN_IN_PLACE) == 0);
+    CHECK(drive_time_mode(b, pcm_mic, pcm_far, out_b, HOPS, 1,
+                          RUN_SEPARATE) == 0);
+    CHECK(!all_zero(out_a, HOPS * AIAEC_HOP));
+    CHECK(!identical(out_a, out_b + 1, HOPS * AIAEC_HOP - 1));
+    CHECK(identical(out_a, out_b, HOPS * AIAEC_HOP));
+    CHECK(drive_time_mode(c, pcm_mic, pcm_far, out_b, HOPS, 1,
+                          RUN_MIXED) == 0);
+    CHECK(identical(out_a, out_b, HOPS * AIAEC_HOP));
+
+    /* The pools' own state after the stream is identical too, and the
+     * separate run really used tensors that are not the pool's. */
+    CHECK(deepvqe_prepost_pre_process(a, pcm_mic, pcm_far) == 1);
+    CHECK(deepvqe_prepost_frame_inputs(a, &inputs, &dest) == 0);
+    CHECK(deepvqe_prepost_pre_process(b, pcm_mic, pcm_far) == 1);
+    CHECK(deepvqe_prepost_frame_inputs(b, &inputs_b, &dest_b) == 0);
+    count = boundary_floats(&dest);
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+        CHECK(memcmp(inputs.state[id], inputs_b.state[id],
+                     inputs.state_elements[id] * sizeof(float)) == 0);
+    CHECK(rt_alloc(&rt, &dest_b) == 0);
+    rt_bind(&rt, &dest_b, RUN_SEPARATE);
+    CHECK(rt.view.taps != dest_b.taps);
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+        CHECK(rt.view.state_out[id] != dest_b.state_out[id]);
+    CHECK(deepvqe_prepost_frame_skip(b) == 0);
+    rt_free(&rt);
+
+    /* 2. runtime == destination (everything aliased) is a no-op. */
+    CHECK(fake_run(&inputs, &dest) == 0);   /* in place, as the runtime would */
+    before = (float *)malloc(count * sizeof(float));
+    after = (float *)malloc(count * sizeof(float));
+    CHECK(before != NULL && after != NULL);
+    snapshot_boundary(&dest, before);
+    runtime = dest;
+    CHECK(deepvqe_prepost_outputs_inherit(&dest, &runtime) == 0);
+    snapshot_boundary(&dest, after);
+    CHECK(memcmp(before, after, count * sizeof(float)) == 0);
+    /* Aliased through the very same struct as well. */
+    CHECK(deepvqe_prepost_outputs_inherit(&dest, &dest) == 0);
+    snapshot_boundary(&dest, after);
+    CHECK(memcmp(before, after, count * sizeof(float)) == 0);
+    /* An aliased tensor holding a non-finite value is not inherit's to judge:
+     * frame_commit owns that check, and it zeroes the state. */
+    dest.state_out[DEEPVQE_STATE_H_GRU][0] = NAN;
+    CHECK(deepvqe_prepost_outputs_inherit(&dest, &runtime) == 0);
+    CHECK(deepvqe_prepost_frame_commit(a) == -1);
+    CHECK(all_zero(dest.state_out[DEEPVQE_STATE_H_GRU],
+                   (int)dest.state_elements[DEEPVQE_STATE_H_GRU]));
+    CHECK(deepvqe_prepost_frame_skip(a) == 0);
+    free(before);
+    free(after);
+
+    /* 3. A non-finite value in ANY one runtime tensor (first and last
+     *    element, NaN and Inf) is refused with the pool untouched, and the
+     *    next healthy frame matches an instance that skipped without running. */
+    for (id = -1; id < DEEPVQE_STATE_COUNT; ++id)
+        for (which = 0; which < 2; ++which) {
+            CHECK(refused_inherit_case(fft, id, which, NAN) == 0);
+            CHECK(refused_inherit_case(fft, id, which, INFINITY) == 0);
+        }
+
+    /* 4. NULLs, NULL tensor pointers and count mismatches are refused, the
+     *    pool untouched; the unperturbed runtime is accepted. */
+    d = new_time_instance(fft, &pool_d);
+    CHECK(d != NULL);
+    CHECK(drive_time_mode(d, pcm_mic, pcm_far, out_b, WARM_HOPS, 1,
+                          RUN_SEPARATE) == 0);
+    CHECK(open_and_run_private(d, WARM_HOPS, &inputs, &dest, &rt) == 0);
+    count = boundary_floats(&dest);
+    before = (float *)malloc(count * sizeof(float));
+    after = (float *)malloc(count * sizeof(float));
+    CHECK(before != NULL && after != NULL);
+    snapshot_boundary(&dest, before);
+    CHECK(deepvqe_prepost_outputs_inherit(NULL, &rt.view) == -1);
+    CHECK(deepvqe_prepost_outputs_inherit(&dest, NULL) == -1);
+    CHECK(deepvqe_prepost_outputs_inherit(NULL, NULL) == -1);
+    for (mode = 0; mode < 2 + 2 * DEEPVQE_STATE_COUNT; ++mode) {
+        DeepVqePrepostOutputs bad = rt.view;
+        if (mode == 0) bad.taps = NULL;
+        else if (mode == 1) bad.taps_elements += 1u;
+        else if ((mode - 2) % 2 == 0) bad.state_out[(mode - 2) / 2] = NULL;
+        else bad.state_elements[(mode - 2) / 2] += 1u;
+        CHECK(deepvqe_prepost_outputs_inherit(&dest, &bad) == -1);
+        snapshot_boundary(&dest, after);
+        CHECK(memcmp(before, after, count * sizeof(float)) == 0);
+    }
+    {
+        DeepVqePrepostOutputs bad = dest;
+        bad.state_out[DEEPVQE_STATE_UP3_HISTORY] = NULL;
+        CHECK(deepvqe_prepost_outputs_inherit(&bad, &rt.view) == -1);
+        snapshot_boundary(&dest, after);
+        CHECK(memcmp(before, after, count * sizeof(float)) == 0);
+    }
+    CHECK(deepvqe_prepost_outputs_inherit(&dest, &rt.view) == 0);
+    snapshot_boundary(&dest, after);
+    CHECK(memcmp(before, after, count * sizeof(float)) != 0);   /* it copied */
+    CHECK(memcmp(dest.taps, rt.taps, dest.taps_elements * sizeof(float)) == 0);
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+        CHECK(memcmp(dest.state_out[id], rt.state[id],
+                     dest.state_elements[id] * sizeof(float)) == 0);
+    free(before);
+    free(after);
+    rt_free(&rt);
+
+    deepvqe_prepost_destroy(a);
+    deepvqe_prepost_destroy(b);
+    deepvqe_prepost_destroy(c);
+    deepvqe_prepost_destroy(d);
+    free(pool_a);
+    free(pool_b);
+    free(pool_c);
+    free(pool_d);
+    printf("inherit: separate/mixed == in-place over %d hops\n", HOPS);
     return 0;
 }
 
@@ -1283,6 +1920,8 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "reset") == 0)     status = case_reset(fft);
     else if (strcmp(argv[1], "skip") == 0)      status = case_skip();
     else if (strcmp(argv[1], "guard") == 0)     status = case_guard(fft);
+    else if (strcmp(argv[1], "inplace") == 0)   status = case_inplace(fft);
+    else if (strcmp(argv[1], "inherit") == 0)   status = case_inherit(fft);
     else if (strcmp(argv[1], "boundary") == 0)  status = case_boundary();
     else {
         fprintf(stderr, "unknown case: %s\n", argv[1]);
@@ -1348,10 +1987,11 @@ def _run(driver, *args):
 
 
 def test_time_mode_matches_the_hand_composed_path(driver):
-    """DEEPVQE_IO_TIME vs a rolling center=False analysis, two hand-held
-    state banks, deepvqe_ccm_process and aiaec_synthesis_push wired up from
-    ONLY the composed TUs -- byte-identical over 400 hops, with `written`
-    following the synthesis half-window schedule (0, then one full hop).
+    """DEEPVQE_IO_TIME vs a rolling center=False analysis, one hand-held
+    in-place state buffer set, deepvqe_ccm_process and aiaec_synthesis_push
+    wired up from ONLY the composed TUs -- byte-identical over 400 hops, with
+    `written` following the synthesis half-window schedule (0, then one full
+    hop).
     This is the gate that folding the composition into an object changed
     nothing at all."""
     assert 'io_mode=TIME' in _run(driver, 'equiv')
@@ -1399,15 +2039,39 @@ def test_reset_clears_state(driver):
     _run(driver, 'reset')
 
 
-def test_frame_skip_mutes_and_freezes_the_state_and_the_ring(driver):
+def test_frame_skip_mutes_keeps_the_written_state_and_freezes_the_ring(driver):
     """FAIL CLOSED. DeepVQE-S's stream 0 is the RAW microphone, so the
     pass-through identity a post-filter takes would emit the full uncancelled
     echo; _frame_skip emits SILENCE instead and the policy names itself
-    "mute_fail_closed". It also freezes both halves of the model's time: the
-    sixteen state banks do not swap, and the CCM spectrum ring does not
-    advance -- proved by an instance that skipped a frame agreeing with one
-    that never saw it, and differing from one that committed it."""
+    "mute_fail_closed". The state is in place, so a skip leaves it exactly as
+    the accelerator wrote it, and the CCM spectrum ring does not advance --
+    proved by an instance whose accelerator wrote nothing agreeing with one
+    that never saw the frame, and both differing from one that committed it."""
     _run(driver, 'skip')
+
+
+def test_state_is_in_place_and_a_non_finite_write_zeroes_it(driver):
+    """One buffer per state tensor: the input and `_out` pointers are equal
+    and stable, the frame-t output is the frame-t+1 input with no copy, and
+    only the head is NaN-prefilled. MUTATION: one NaN/Inf injected into any
+    one of the sixteen tensors (first and last element) through the in-place
+    pointer makes _frame_commit return -1, zeroes ALL sixteen tensors, and
+    the next healthy frame still commits -- while the identical uninjected
+    frame commits, so the refusal is attributable to the injection. A refused
+    commit also leaves the CCM ring where it was."""
+    _run(driver, 'inplace')
+
+
+def test_inherit_copies_runtime_tensors_and_refuses_bad_ones_intact(driver):
+    """The ordinary path: the runtime owns its output tensors and
+    deepvqe_prepost_outputs_inherit() copies them into the pool. A 400-hop
+    stream through private tensors (all of them, and a mix of aliased and
+    private) is memcmp-identical to the in-place run; runtime == destination
+    is a no-op (and never memcpy's a buffer onto itself); one NaN/Inf in any
+    one runtime tensor, taps included, is refused with the pool byte-identical,
+    after which frame_skip and the next healthy frame agree with an instance
+    that never ran the refused frame; NULLs and count mismatches are refused."""
+    assert 'inherit:' in _run(driver, 'inherit')
 
 
 def test_transaction_guards(driver):
@@ -1415,8 +2079,8 @@ def test_transaction_guards(driver):
     pre_process while a frame is open is refused without damaging that frame,
     a commit with no frame_inputs behind it is refused (an accelerator that
     never ran cannot pass untouched buffers off as a result), and a refused
-    commit disarms until a fresh frame_inputs -- which re-fills every tap and
-    every state_out element with NaN."""
+    commit disarms until a fresh frame_inputs -- which re-fills every tap with
+    NaN and presents the (now cold) state tensors unfilled."""
     _run(driver, 'guard')
 
 

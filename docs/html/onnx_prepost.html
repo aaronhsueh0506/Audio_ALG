@@ -29,7 +29,7 @@ code,pre{background:#f3f3f3}code{padding:.1rem .25rem}pre{padding:.8rem;overflow
 
 <p>所有 production export 都是 stateless accelerator graph。GRU hidden、
 convolution cache、attention/KV ring 都是明確 input/output，由 CPU 或
-driver 保存並在下一次 invocation 送回。STFT、WOLA、linear AEC 與 output
+driver 保存；一般 runtime 把 state 輸出寫進自己的 tensor、由 host 的 inherit 複製回 state，能把輸出綁到輸入位址的 runtime 則省掉這個複製（下方「遞迴 state」）。STFT、WOLA、linear AEC 與 output
 composition 留在 graph 外。複數一律以 real/imag pair 表示。</p>
 
 <h2>使用者入口</h2>
@@ -68,8 +68,8 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 
 <table>
 <tr><th>Model</th><th>Graph input/state</th><th>Graph output</th><th>C 前後處理</th></tr>
-<tr><td>Align-ULCNet</td><td>host 特徵 layout(預設,layout v8;C 端只實作 host/split 這一對):五個壓縮域特徵(error_mag/far_mag/error_cos/error_sin/error_ri,host signed-pow 前端) + K/V/logit ring + two GRU states;選用 `--cache-state-layout full`(v12)時 graph 回傳完整下一份 K/V/logit history,C 端以兩組 bank 交換取代 ring 搬移。graph 特徵 layout(export 可選,layout v10):改綁 error/far 兩組 raw RI spectra,前端搬進 graph 內,無 host 前端</td>
-<td>host layout:壓縮域 output(host 逆冪) + state delta。graph layout:逆冪已在 graph 內完成的 output + state delta</td><td><code>Align_ULCNet/ulcnet_process.c/h</code>、
+<tr><td>Align-ULCNet</td><td>host 特徵 layout(預設,layout 12,C 端唯一實作):五個壓縮域特徵(error_mag/far_mag/error_cos/error_sin/error_ri,host signed-pow 前端) + K/V/logit history + two GRU states(五個 state 由 caller-owned pool 保存)。graph 特徵 layout(export 可選,layout 14):改綁 error/far 兩組 raw RI spectra,前端搬進 graph 內,無 host 前端</td>
+<td>host layout:壓縮域 output(host 逆冪) + <b>每個 state 的完整下一個值</b>(ring 位移在 graph 內)。graph layout:逆冪已在 graph 內完成的 output + 每個 state 的完整下一個值</td><td><code>Align_ULCNet/ulcnet_process.c/h</code>、
 <code>ulcnet_model_io.c/h</code>(prepare/commit 內建前後端;只綁 host layout)，
 外面包 <b><code>ulcnet_prepost.c/h</code> 類別</b></td></tr>
 <tr><td>Align-CRUSE</td><td>mic + far + conv/GRU/alignment state</td>
@@ -91,7 +91,7 @@ calibration manifest 與 CPU descriptor 必須使用相同 D。</p>
 <h2>C pre/post 類別（三個模型共用的形狀）</h2>
 
 <p>三個模型各有一個 pre/post 類別，把「caller 音訊 ↔ 加速器張量」之間的一切收進<b>一個物件</b>：
-framing、特徵前後端、recurrent ring／state bank。整合者不再自己把兩個 TU 接起來。
+framing、特徵前後端、recurrent ring／state buffer。整合者不再自己把兩個 TU 接起來。
 三個類別的 API 形狀相同，只是前綴 <code>&lt;pfx&gt;</code> 不同（<code>ulcnet</code> /
 <code>deepvqe</code> / <code>dfn2</code>）：</p>
 
@@ -100,8 +100,8 @@ framing、特徵前後端、recurrent ring／state bank。整合者不再自己�
 &lt;pfx&gt;_init(pool, bytes, &amp;cfg) | _init_ex(pool, bytes, &amp;cfg, &amp;expected) | _create(&amp;cfg)
 每 hop：
   n = &lt;pfx&gt;_pre_process(p, hop…);      /* 或 _pre_process_freq()：這一 hop 的推論次數 */
-      &lt;pfx&gt;_frame_inputs(p, &amp;in, &amp;out); /* pool 內的 view；每個可寫輸出預填 NaN */
-      加速器填 out
+      &lt;pfx&gt;_frame_inputs(p, &amp;in, &amp;out); /* pool 內的 view；非 state 輸出預填 NaN */
+      加速器填 out                          /* 一般 runtime：寫自己的 tensor，再 &lt;pfx&gt;_outputs_inherit(out, &amp;runtime_out)（Align-ULCNet 為 ulcnet_model_io_inherit）；就地綁定的 runtime 省略 inherit */
       &lt;pfx&gt;_frame_commit(p);            /* 或 &lt;pfx&gt;_frame_skip(p) */
   &lt;pfx&gt;_post_process(p, out_hop, &amp;written);   /* 或 _post_process_freq() */
 其餘：_reset / _destroy / _hop_size / _num_bins / _io_mode / _descriptor</pre>
@@ -116,17 +116,37 @@ framing、特徵前後端、recurrent ring／state bank。整合者不再自己�
 Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起恆為 1</b>；DFN2 在<b>第一個 hop 回 0</b>（它的 graph 要
 <code>[t−1, t, t+1]</code>，hop 0 沒有右鄰居，不可以呼叫），之後每 hop 1 次。</p>
 
-<p><b>交易式 frame 狀態機</b>：<code>frame_inputs</code> 把每個可寫輸出<b>預填 NaN</b>；
-<code>frame_commit</code> 先驗證加速器把每個輸出都寫成有限值，<b>之後</b>才讓任何東西移動。
-驗證失敗時<b>什麼都不動</b>——persistent state 位元不變、幀維持開啟、回 −1，呼叫端再選
-<code>frame_skip</code> 或用新的 <code>frame_inputs</code> 重跑加速器。commit 必須有
+<p><b>frame 狀態機</b>：<code>frame_inputs</code> 只把<b>非 state 的輸出</b>
+（heads：<code>output</code>／<code>taps</code>／<code>erb_mask</code>／<code>coefs</code>／<code>alpha</code>，
+Align-ULCNet 的 <code>output</code>）<b>預填 NaN</b>，
+state 不預填。<code>frame_commit</code> 是<b>純驗證</b>：heads 與 state 都有限才成功，之後 CCM ring／compose／
+synthesis 照常前進，commit 本身不複製任何 state。複製發生在 commit 之前、由 inherit 做（見下一段）。
+兩條綁定路徑的失敗語意不同。<b>複製路徑</b>：inherit 先檢查所有將被複製的 tensor，任何非有限值就一個都不複製、
+回 −1、state 與原來逐位元相同，呼叫端回報該次推論失敗、取 <code>frame_skip</code>，這一幀被跳過。
+<b>就地路徑</b>：state 已被加速器覆寫、<b>無法回滾</b>，commit 遇到任何一處非有限值時<b>所有遞迴 state 歸零</b>（冷啟動）、
+framing／CCM ring 不前進、幀維持開啟、回 −1
+（Align-ULCNet：key／value／logit 三個 history 與兩個 GRU hidden 共五個 state；DFN2：四個遞迴張量；DeepVQE-S：16 個 state），
+呼叫端再選 <code>frame_skip</code> 或用新的 <code>frame_inputs</code> 從冷 state 重跑加速器。
+<code>frame_skip</code> 取 identity（DeepVQE-S 為靜音）、ring／CCM 不步進，state 維持原樣
+（就地路徑為加速器寫完的樣子；回報失敗的 runtime 視為沒有寫入）。寫一半或混寫只有在出現非有限值時才偵測得到。commit 必須有
 <code>frame_inputs</code> 墊背（<code>prepared</code> 閂，三個類別皆然），所以「加速器根本沒跑」
 不可能把未動過的緩衝區當成結果收下；幀還開著時再呼叫 <code>pre_process</code> 回 −1。</p>
 
-<p><b>遞迴 state 是交換，不是複製</b>：commit 讓加速器剛寫好的那組 state 直接成為下一幀的輸入——
-Align-ULCNet 交換 GRU 的兩個指標（<code>ulcnet_model_io.c</code> 的 commit），DeepVQE-S 與 DFN2 翻轉
-前後兩組 bank（<code>front</code>／<code>live</code>）。因此<b>state 張量的輸入與輸出位址逐幀交替</b>，
-runtime <b>每幀</b>都要依 <code>_frame_inputs()</code> 交回的指標綁定，不可在 init 時把位址綁死。</p>
+<p><b>遞迴 state：一般路徑是複製，就地綁定是選用的省法</b>。每個 state 張量在 caller pool 裡只有一個 buffer、位址在實例壽命內不變，
+沒有交替的 bank、沒有指標交換。一般的板端流程是 ONNX 風格的 runtime，輸出寫進它自己擁有的 tensor；host 呼叫 inherit
+（<code>ulcnet_model_io_inherit</code>、<code>deepvqe_prepost_outputs_inherit</code>、<code>dfn2_prepost_outputs_inherit</code>
+／<code>dfn2_model_io_inherit_state</code>、<code>gtcrn_model_state_inherit</code>、<code>rnnoise_model_state_inherit</code>），
+先檢查再複製。能把每個 <code>*_out</code>／<code>*_next</code> 綁到對應輸入位址的 runtime（例如 NPU）直接就地寫入，
+<b>只省掉 inherit 這一個呼叫</b>，其餘（prepare／frame_inputs、commit／validate、adapter、pipeline）兩條路徑共用。
+指標等於目的位址的 tensor 不會被 inherit 複製或檢查，所以同一個呼叫兩種綁定都適用。就地時 runtime 必須<b>先讀完</b>
+某個 state 輸入、<b>才寫</b>同位址的輸出（做不到的 runtime 要自己用暫存區暫存讀取）。
+Align-ULCNet 的五個 state
+（<code>key_history</code>／<code>value_history</code>／<code>logit_history</code>／<code>h_gru0</code>／<code>h_gru1</code>
+↔ 對應的 <code>*_out</code>）：graph 回每個 state 的完整下一個值（shape 同輸入），
+K/V／logit 的 ring 位移在 graph 內完成，host 沒有 ring helper；inherit 與 commit 的有限性檢查只看 graph 這一幀新寫的那一格
+（K/V slot 0、logit 最後一幀）、<code>output</code> 與兩個 GRU，較舊的 ring 格不重查。
+成本：複製路徑下每幀要把整組 K/V＋logit 歷史複製進 state（48 kHz、D=64 時每 hop 871,424 B，約 0.87 MB）；
+全歷史邊界省下的 CPU 搬運只有在就地綁定時才成立。</p>
 
 <p><b>生命週期</b>兩條（<code>audio_common/include/fft_wrapper.h</code>「Static memory support」）：
 板端 <code>_init</code>／<code>_init_ex</code> 建構在 caller pool 上，host 工具用
@@ -152,11 +172,11 @@ parity 測試各自只編其中一個。把類別塞進任一邊，就會在另�
 <td>identity：error 頻譜原樣通過（stream 0 是 linear-AEC error）</td>
 <td><code>state_layout_version</code>（<code>Align_ULCNet/export_onnx.py</code>）</td></tr>
 <tr><td>DeepVQE-S</td><td><code>AIAEC/DeepVQE_S/deepvqe_prepost.c/h</code></td>
-<td><code>AIAEC/tests/test_deepvqe_prepost_c.py</code>（12 案例）</td>
+<td><code>AIAEC/tests/test_deepvqe_prepost_c.py</code>（14 案例）</td>
 <td><b>mute_fail_closed</b>：靜音（stream 0 是原始 mic，放行＝未消迴聲）</td>
 <td><code>state_layout_version</code> + <code>c_descriptor</code>（<code>AIAEC/_streaming_export.py</code>）</td></tr>
 <tr><td>DeepFilterNet2</td><td><code>AINR/DeepFilterNet2/dfn2_prepost.c/h</code></td>
-<td><code>AINR/tests/test_dfn2_prepost_c.py</code>（9 案例）</td>
+<td><code>AINR/tests/test_dfn2_prepost_c.py</code>（21 案例）</td>
 <td>identity：unit ERB mask + alpha 0</td>
 <td><code>state_layout_version</code>（<code>DeepFilterNet2/export_onnx.py</code>）</td></tr>
 <tr><td>Align-CRUSE</td><td><b>沒有</b>——只有共用的 <code>AIAEC/aiaec_process.c/h</code> helper</td>

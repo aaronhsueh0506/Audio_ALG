@@ -192,19 +192,18 @@ static int test_dfn_stream_alignment(void)
     return 1;
 }
 
+static int all_zero(const float* values, size_t count)
+{
+    for (size_t i = 0; i < count; ++i) {
+        if (values[i] != 0.0f) return 0;
+    }
+    return 1;
+}
+
 static int test_dfn2_model_io(void)
 {
     static DFN2ModelIOState state;
-    static DFN2ModelIOState committed;
-    static float encoder_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                             [DFN2_MODEL_GRU_HIDDEN];
-    static float erb_next[DFN2_MODEL_ERB_GRU_LAYERS]
-                         [DFN2_MODEL_GRU_HIDDEN];
-    static float df_next[DFN2_MODEL_DF_GRU_LAYERS]
-                        [DFN2_MODEL_GRU_HIDDEN];
-    static float pathway_next[DFN2_MODEL_ENCODER_CHANNELS]
-                              [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                              [DFN2_DF_BINS];
+    static DFN2ModelIOState healthy;
     float erb[DFN2_N_ERB];
     float spec[2][DFN2_DF_BINS];
 
@@ -227,47 +226,187 @@ static int test_dfn2_model_io(void)
           state.spec_window[1][2][9] == 2109.0f,
           "DFN2 complex model window preserves channel-major layout");
 
-    memset(encoder_next, 0x3c, sizeof(encoder_next));
-    memset(erb_next, 0x4d, sizeof(erb_next));
-    memset(df_next, 0x5e, sizeof(df_next));
-    memset(pathway_next, 0x6f, sizeof(pathway_next));
-    CHECK(dfn2_model_io_commit_state(&state, encoder_next,
-                                     erb_next, df_next,
-                                     pathway_next) == 0 &&
-          memcmp(state.encoder_gru_hidden, encoder_next,
-                 sizeof(encoder_next)) == 0 &&
-          memcmp(state.erb_gru_hidden, erb_next, sizeof(erb_next)) == 0 &&
-          memcmp(state.df_gru_hidden, df_next, sizeof(df_next)) == 0 &&
-          memcmp(state.df_convp_history, pathway_next,
-                 sizeof(pathway_next)) == 0,
-          "DFN2 model state outputs become the next invocation inputs");
+    /* The accelerator writes the four recurrent arrays in place. */
+    memset(state.encoder_gru_hidden, 0x3c, sizeof(state.encoder_gru_hidden));
+    memset(state.erb_gru_hidden, 0x4d, sizeof(state.erb_gru_hidden));
+    memset(state.df_gru_hidden, 0x5e, sizeof(state.df_gru_hidden));
+    memset(state.df_convp_history, 0x6f, sizeof(state.df_convp_history));
+    healthy = state;
+    CHECK(dfn2_model_io_validate_state(&state) == 0 &&
+          memcmp(&state, &healthy, sizeof(state)) == 0,
+          "DFN2 validating a finite state leaves every byte in place");
 
-    committed = state;
-    memset(encoder_next, 0x41, sizeof(encoder_next));
-    memset(erb_next, 0x41, sizeof(erb_next));
-    memset(df_next, 0x41, sizeof(df_next));
-    memset(pathway_next, 0x41, sizeof(pathway_next));
-    erb_next[1][DFN2_MODEL_GRU_HIDDEN - 1] = NAN;
-    CHECK(dfn2_model_io_commit_state(&state, encoder_next,
-                                     erb_next, df_next,
-                                     pathway_next) != 0,
-          "DFN2 commit validates the second ERB stack layer");
-    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
-          "DFN2 state refusal is transactional");
-    erb_next[1][DFN2_MODEL_GRU_HIDDEN - 1] = 1.0f;
-    pathway_next[DFN2_MODEL_ENCODER_CHANNELS - 1]
-                [DFN2_MODEL_DF_PATHWAY_HISTORY - 1]
-                [DFN2_DF_BINS - 1] = NAN;
-    CHECK(dfn2_model_io_commit_state(&state, encoder_next,
-                                     erb_next, df_next,
-                                     pathway_next) != 0,
-          "DFN2 commit refuses a non-finite state batch");
-    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
-          "DFN2 refusal preserves every previously committed state byte");
-    CHECK(dfn2_model_io_commit_state(NULL, encoder_next,
-                                     erb_next, df_next,
-                                     pathway_next) != 0,
-          "DFN2 commit refuses a null destination");
+    state.erb_gru_hidden[1][DFN2_MODEL_GRU_HIDDEN - 1] = NAN;
+    CHECK(dfn2_model_io_validate_state(&state) != 0,
+          "DFN2 validate checks the second ERB stack layer");
+    CHECK(all_zero(&state.encoder_gru_hidden[0][0],
+                   DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN) &&
+          all_zero(&state.erb_gru_hidden[0][0],
+                   DFN2_MODEL_ERB_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN) &&
+          all_zero(&state.df_gru_hidden[0][0],
+                   DFN2_MODEL_DF_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN) &&
+          all_zero(&state.df_convp_history[0][0][0],
+                   (size_t)DFN2_MODEL_ENCODER_CHANNELS *
+                       DFN2_MODEL_DF_PATHWAY_HISTORY * DFN2_DF_BINS),
+          "DFN2 non-finite state zeroes all four recurrent arrays");
+    CHECK(memcmp(state.erb_window, healthy.erb_window,
+                 sizeof(state.erb_window)) == 0 &&
+          memcmp(state.spec_window, healthy.spec_window,
+                 sizeof(state.spec_window)) == 0 &&
+          state.feature_frames_seen == healthy.feature_frames_seen,
+          "DFN2 state refusal leaves the feature windows and counter alone");
+
+    state = healthy;
+    state.df_convp_history[DFN2_MODEL_ENCODER_CHANNELS - 1]
+                          [DFN2_MODEL_DF_PATHWAY_HISTORY - 1]
+                          [DFN2_DF_BINS - 1] = INFINITY;
+    CHECK(dfn2_model_io_validate_state(&state) != 0 &&
+          all_zero(&state.encoder_gru_hidden[0][0],
+                   DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN),
+          "DFN2 refuses a non-finite pathway history and zeroes the batch");
+
+    CHECK(dfn2_model_io_validate_state(NULL) != 0,
+          "DFN2 validate refuses a null state");
+    state = healthy;
+    CHECK(dfn2_model_io_validate_arrays(NULL, state.erb_gru_hidden,
+                                        state.df_gru_hidden,
+                                        state.df_convp_history) != 0 &&
+          dfn2_model_io_validate_arrays(state.encoder_gru_hidden,
+                                        state.erb_gru_hidden,
+                                        state.df_gru_hidden, NULL) != 0 &&
+          memcmp(&state, &healthy, sizeof(state)) == 0,
+          "DFN2 validate_arrays refuses a null array and touches nothing");
+    CHECK(dfn2_model_io_validate_arrays(state.encoder_gru_hidden,
+                                        state.erb_gru_hidden,
+                                        state.df_gru_hidden,
+                                        state.df_convp_history) == 0,
+          "DFN2 validate_arrays accepts finite arrays");
+
+    /* Copy path: the runtime wrote its *_next tensors into its own buffers. */
+    {
+        static DFN2ModelIOState runtime;
+        static DFN2ModelIOState before;
+        const size_t convp_count = (size_t)DFN2_MODEL_ENCODER_CHANNELS *
+                                   DFN2_MODEL_DF_PATHWAY_HISTORY * DFN2_DF_BINS;
+
+        memset(runtime.encoder_gru_hidden, 0x11,
+               sizeof(runtime.encoder_gru_hidden));
+        memset(runtime.erb_gru_hidden, 0x22, sizeof(runtime.erb_gru_hidden));
+        memset(runtime.df_gru_hidden, 0x33, sizeof(runtime.df_gru_hidden));
+        memset(runtime.df_convp_history, 0x44,
+               sizeof(runtime.df_convp_history));
+
+        state = healthy;
+        CHECK(dfn2_model_io_inherit_state(
+                  &state, runtime.encoder_gru_hidden, runtime.erb_gru_hidden,
+                  runtime.df_gru_hidden, runtime.df_convp_history) == 0 &&
+              memcmp(state.encoder_gru_hidden, runtime.encoder_gru_hidden,
+                     sizeof(state.encoder_gru_hidden)) == 0 &&
+              memcmp(state.erb_gru_hidden, runtime.erb_gru_hidden,
+                     sizeof(state.erb_gru_hidden)) == 0 &&
+              memcmp(state.df_gru_hidden, runtime.df_gru_hidden,
+                     sizeof(state.df_gru_hidden)) == 0 &&
+              memcmp(state.df_convp_history, runtime.df_convp_history,
+                     sizeof(state.df_convp_history)) == 0,
+              "DFN2 inherit_state copies all four recurrent arrays");
+        CHECK(memcmp(state.erb_window, healthy.erb_window,
+                     sizeof(state.erb_window)) == 0 &&
+              memcmp(state.spec_window, healthy.spec_window,
+                     sizeof(state.spec_window)) == 0 &&
+              state.feature_frames_seen == healthy.feature_frames_seen,
+              "DFN2 inherit_state leaves the feature windows and counter alone");
+
+        /* One non-finite element in any one source copies nothing, including
+         * the arrays that precede it, and leaves the state intact. */
+        for (int which = 0; which < 4; ++which) {
+            float* poison =
+                which == 0 ? &runtime.encoder_gru_hidden[0][5] :
+                which == 1 ? &runtime.erb_gru_hidden[1][0] :
+                which == 2 ? &runtime.df_gru_hidden[1][DFN2_MODEL_GRU_HIDDEN - 1] :
+                             &runtime.df_convp_history
+                                   [DFN2_MODEL_ENCODER_CHANNELS - 1]
+                                   [DFN2_MODEL_DF_PATHWAY_HISTORY - 1]
+                                   [DFN2_DF_BINS - 1];
+            const float saved = *poison;
+            state = healthy;
+            before = state;
+            *poison = (which & 1) ? INFINITY : NAN;
+            CHECK(dfn2_model_io_inherit_state(
+                      &state, runtime.encoder_gru_hidden,
+                      runtime.erb_gru_hidden, runtime.df_gru_hidden,
+                      runtime.df_convp_history) == -1 &&
+                  memcmp(&state, &before, sizeof(state)) == 0,
+                  "DFN2 inherit_state refuses a non-finite source and copies nothing");
+            CHECK(dfn2_model_io_inherit_arrays(
+                      state.encoder_gru_hidden, state.erb_gru_hidden,
+                      state.df_gru_hidden, state.df_convp_history,
+                      runtime.encoder_gru_hidden, runtime.erb_gru_hidden,
+                      runtime.df_gru_hidden, runtime.df_convp_history) == -1 &&
+                  memcmp(&state, &before, sizeof(state)) == 0,
+                  "DFN2 inherit_arrays refuses a non-finite source and copies nothing");
+            *poison = saved;
+        }
+
+        /* Sources at the destination's own address were written in place:
+         * skipped, never copied onto themselves, never checked here. */
+        state = healthy;
+        before = state;
+        CHECK(dfn2_model_io_inherit_state(
+                  &state, state.encoder_gru_hidden, state.erb_gru_hidden,
+                  state.df_gru_hidden, state.df_convp_history) == 0 &&
+              memcmp(&state, &before, sizeof(state)) == 0,
+              "DFN2 inherit_state with every source aliased is a no-op");
+        state.df_gru_hidden[0][3] = NAN;
+        before = state;
+        CHECK(dfn2_model_io_inherit_state(
+                  &state, state.encoder_gru_hidden, state.erb_gru_hidden,
+                  state.df_gru_hidden, state.df_convp_history) == 0 &&
+              memcmp(&state, &before, sizeof(state)) == 0 &&
+              dfn2_model_io_validate_state(&state) == -1,
+              "DFN2 inherit leaves an in-place value to validate_state");
+
+        /* Mixed binding: only the tensors that moved are copied. */
+        state = healthy;
+        CHECK(dfn2_model_io_inherit_arrays(
+                  state.encoder_gru_hidden, state.erb_gru_hidden,
+                  state.df_gru_hidden, state.df_convp_history,
+                  state.encoder_gru_hidden, runtime.erb_gru_hidden,
+                  state.df_gru_hidden, runtime.df_convp_history) == 0 &&
+              memcmp(state.encoder_gru_hidden, healthy.encoder_gru_hidden,
+                     sizeof(state.encoder_gru_hidden)) == 0 &&
+              memcmp(state.erb_gru_hidden, runtime.erb_gru_hidden,
+                     sizeof(state.erb_gru_hidden)) == 0 &&
+              memcmp(state.df_gru_hidden, healthy.df_gru_hidden,
+                     sizeof(state.df_gru_hidden)) == 0 &&
+              memcmp(state.df_convp_history, runtime.df_convp_history,
+                     convp_count * sizeof(float)) == 0,
+              "DFN2 inherit_arrays copies only the arrays that moved");
+
+        /* NULL anywhere is refused and touches nothing. */
+        state = healthy;
+        before = state;
+        CHECK(dfn2_model_io_inherit_state(
+                  NULL, runtime.encoder_gru_hidden, runtime.erb_gru_hidden,
+                  runtime.df_gru_hidden, runtime.df_convp_history) == -1 &&
+              dfn2_model_io_inherit_state(
+                  &state, NULL, runtime.erb_gru_hidden,
+                  runtime.df_gru_hidden, runtime.df_convp_history) == -1 &&
+              dfn2_model_io_inherit_state(
+                  &state, runtime.encoder_gru_hidden, runtime.erb_gru_hidden,
+                  runtime.df_gru_hidden, NULL) == -1 &&
+              dfn2_model_io_inherit_arrays(
+                  NULL, state.erb_gru_hidden, state.df_gru_hidden,
+                  state.df_convp_history, runtime.encoder_gru_hidden,
+                  runtime.erb_gru_hidden, runtime.df_gru_hidden,
+                  runtime.df_convp_history) == -1 &&
+              dfn2_model_io_inherit_arrays(
+                  state.encoder_gru_hidden, state.erb_gru_hidden,
+                  state.df_gru_hidden, NULL, runtime.encoder_gru_hidden,
+                  runtime.erb_gru_hidden, runtime.df_gru_hidden,
+                  runtime.df_convp_history) == -1 &&
+              memcmp(&state, &before, sizeof(state)) == 0,
+              "DFN2 inherit refuses a NULL argument and touches nothing");
+    }
     return 1;
 }
 
@@ -368,27 +507,37 @@ static int test_gtcrn(uint64_t* digest)
 static int test_gtcrn_model_state(void)
 {
     static GTCRNModelState state;
-    static GTCRNModelState next;
-    static GTCRNModelState committed;
-    const float* conv[GTCRN_MODEL_CONV_STATES];
-    const float* h_tra[GTCRN_MODEL_TRA_GRUS];
-    const float* h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS];
-    const float* broken_conv[GTCRN_MODEL_CONV_STATES];
-    const float* broken[GTCRN_MODEL_TRA_GRUS];
+    static GTCRNModelState zeros;
+    static GTCRNModelState expect;
+    float* conv[GTCRN_MODEL_CONV_STATES];
+    float* h_tra[GTCRN_MODEL_TRA_GRUS];
+    float* h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS];
+    size_t conv_n[GTCRN_MODEL_CONV_STATES];
+    const size_t tra_n = sizeof(state.h_tra[0]) / sizeof(float);
+    const size_t dpgrnn_n = sizeof(state.h_dpgrnn[0]) / sizeof(float);
     int i;
+    int c;
     CHECK(sizeof(state) == 72192u,
           "GTCRN v6 keeps the v5 caller-owned state byte budget");
-    conv[0] = &next.conv_enc0[0][0][0];
-    conv[1] = &next.conv_enc1[0][0][0];
-    conv[2] = &next.conv_enc2[0][0][0];
-    conv[3] = &next.conv_dec0[0][0][0];
-    conv[4] = &next.conv_dec1[0][0][0];
-    conv[5] = &next.conv_dec2[0][0][0];
+    /* The first element of every state tensor: the board binds the graph's
+     * state input and *_out output to these addresses. */
+    conv[0] = &state.conv_enc0[0][0][0];
+    conv[1] = &state.conv_enc1[0][0][0];
+    conv[2] = &state.conv_enc2[0][0][0];
+    conv[3] = &state.conv_dec0[0][0][0];
+    conv[4] = &state.conv_dec1[0][0][0];
+    conv[5] = &state.conv_dec2[0][0][0];
+    conv_n[0] = sizeof(state.conv_enc0) / sizeof(float);
+    conv_n[1] = sizeof(state.conv_enc1) / sizeof(float);
+    conv_n[2] = sizeof(state.conv_enc2) / sizeof(float);
+    conv_n[3] = sizeof(state.conv_dec0) / sizeof(float);
+    conv_n[4] = sizeof(state.conv_dec1) / sizeof(float);
+    conv_n[5] = sizeof(state.conv_dec2) / sizeof(float);
     for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
-        h_tra[i] = &next.h_tra[i][0][0][0];
+        h_tra[i] = &state.h_tra[i][0][0][0];
     }
     for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
-        h_dpgrnn[i] = &next.h_dpgrnn[i][0][0][0];
+        h_dpgrnn[i] = &state.h_dpgrnn[i][0][0][0];
     }
     {
         static float spec_in[GTCRN_N_BINS][2];
@@ -445,58 +594,236 @@ static int test_gtcrn_model_state(void)
           state.h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS - 1][0][32]
                            [GTCRN_MODEL_DPGRNN_HIDDEN - 1] == 0.0f,
           "GTCRN model state starts at zero");
-    memset(&next, 0x5a, sizeof(next));
-    CHECK(gtcrn_model_state_commit(&state, conv, h_tra, h_dpgrnn) == 0,
-          "GTCRN commit accepts a finite state");
-    CHECK(memcmp(&state, &next, sizeof(state)) == 0,
-          "GTCRN state outputs become the next invocation inputs");
+    /* The struct is the state buffer the graph writes its *_out tensors
+     * into, so a healthy state validates in place and is left untouched. */
+    memset(&state, 0x5a, sizeof(state));
+    memset(&expect, 0x5a, sizeof(expect));
+    CHECK(gtcrn_model_state_validate(&state) == 0,
+          "GTCRN validate accepts a finite state");
+    CHECK(memcmp(&state, &expect, sizeof(state)) == 0,
+          "GTCRN validate leaves a healthy state untouched");
 
-    /* Every byte of the rejected batch DIFFERS from the committed state, so a
-     * non-transactional implementation that writes the good elements before
-     * reaching the bad one leaves a visible difference. With a byte pattern
-     * equal to what is already stored, a partial writeback would be
-     * indistinguishable from a clean refusal. */
-    committed = state;
-    memset(&next, 0x41, sizeof(next));
-    next.h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS - 1][0][32]
-                   [GTCRN_MODEL_DPGRNN_HIDDEN - 1] = NAN;
-    CHECK(gtcrn_model_state_commit(&state, conv, h_tra, h_dpgrnn) != 0,
-          "GTCRN commit refuses a NaN state");
-    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
-          "GTCRN NaN refusal leaves the previous state byte-identical");
+    CHECK(gtcrn_model_state_validate(NULL) == -1,
+          "GTCRN validate refuses a null state");
 
-    /* The bad element sits in the FIRST tensor here, so the two cases
-     * together cover refusal before and after the earlier ones validate. */
-    memset(&next, 0x41, sizeof(next));
-    next.conv_enc0[0][0][0] = INFINITY;
-    CHECK(gtcrn_model_state_commit(&state, conv, h_tra, h_dpgrnn) != 0,
-          "GTCRN commit refuses an Inf state");
-    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
-          "GTCRN Inf refusal leaves the previous state byte-identical");
-
-    for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
-        broken[i] = h_tra[i];
+    /* The sixteen tensors tile the struct exactly, so checking each one
+     * covers every state byte. */
+    {
+        size_t total = 0;
+        for (i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) total += conv_n[i];
+        total += (size_t)GTCRN_MODEL_TRA_GRUS * tra_n;
+        total += (size_t)GTCRN_MODEL_DPGRNN_GRUS * dpgrnn_n;
+        CHECK(total * sizeof(float) == sizeof(state),
+              "GTCRN state tensors tile the whole state struct");
     }
-    for (i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
-        broken_conv[i] = conv[i];
-    }
-    broken[3] = NULL;
-    broken_conv[3] = NULL;
-    CHECK(gtcrn_model_state_commit(NULL, conv, h_tra, h_dpgrnn) != 0 &&
-          gtcrn_model_state_commit(&state, NULL, h_tra, h_dpgrnn) != 0 &&
-          gtcrn_model_state_commit(&state, broken_conv,
-                                   h_tra, h_dpgrnn) != 0 &&
-          gtcrn_model_state_commit(&state, conv, broken, h_dpgrnn) != 0,
-          "GTCRN commit refuses null arguments and null h elements");
-    CHECK(memcmp(&state, &committed, sizeof(state)) == 0,
-          "GTCRN preserved state survives every refused commit");
 
-    /* A finite batch must still be accepted after the refusals, or the guard
-     * could be a permanent latch rather than a per-call check. */
-    memset(&next, 0x41, sizeof(next));
-    CHECK(gtcrn_model_state_commit(&state, conv, h_tra, h_dpgrnn) == 0 &&
-          memcmp(&state, &next, sizeof(state)) == 0,
-          "GTCRN commit still accepts a finite state after a refusal");
+    /* One NaN or Inf at the first or last element of any single tensor
+     * zeroes the WHOLE state. The state is nonzero everywhere else (0x41
+     * pattern), so a partial reset or an unchecked tensor is visible. */
+    for (c = 0; c < 4; ++c) {
+        const float bad = (c & 1) ? INFINITY : NAN;
+        int cls_ok = 1;
+        for (i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
+            memset(&state, 0x41, sizeof(state));
+            conv[i][(c < 2) ? 0 : conv_n[i] - 1] = bad;
+            cls_ok &= gtcrn_model_state_validate(&state) == -1 &&
+                      memcmp(&state, &zeros, sizeof(state)) == 0;
+        }
+        CHECK(cls_ok, "GTCRN non-finite conv element returns -1 and "
+                      "zeroes the whole state");
+        cls_ok = 1;
+        for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
+            memset(&state, 0x41, sizeof(state));
+            h_tra[i][(c < 2) ? 0 : tra_n - 1] = bad;
+            cls_ok &= gtcrn_model_state_validate(&state) == -1 &&
+                      memcmp(&state, &zeros, sizeof(state)) == 0;
+        }
+        CHECK(cls_ok, "GTCRN non-finite h_tra element returns -1 and "
+                      "zeroes the whole state");
+        cls_ok = 1;
+        for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
+            memset(&state, 0x41, sizeof(state));
+            h_dpgrnn[i][(c < 2) ? 0 : dpgrnn_n - 1] = bad;
+            cls_ok &= gtcrn_model_state_validate(&state) == -1 &&
+                      memcmp(&state, &zeros, sizeof(state)) == 0;
+        }
+        CHECK(cls_ok, "GTCRN non-finite h_dpgrnn element returns -1 and "
+                      "zeroes the whole state");
+    }
+
+    /* A finite state must still validate after a refusal, or the guard could
+     * be a permanent latch rather than a per-call check. */
+    memset(&state, 0x41, sizeof(state));
+    memset(&expect, 0x41, sizeof(expect));
+    CHECK(gtcrn_model_state_validate(&state) == 0 &&
+          memcmp(&state, &expect, sizeof(state)) == 0,
+          "GTCRN validate still accepts a finite state after a refusal");
+
+    /* Copy path: the runtime's own *_out tensors are finite-checked and
+     * copied into the state by gtcrn_model_state_inherit. */
+    {
+        enum { INHERIT_FRAMES = 24 };
+        static GTCRNModelState in_place;
+        static GTCRNModelState copied;
+        static GTCRNModelState before;
+        static GTCRNModelState source;
+        /* The runtime's private output tensors: a second struct whose
+         * fields are laid out like the state's. */
+        const float* cs[GTCRN_MODEL_CONV_STATES];
+        const float* ts[GTCRN_MODEL_TRA_GRUS];
+        const float* ds[GTCRN_MODEL_DPGRNN_GRUS];
+        const float* cself[GTCRN_MODEL_CONV_STATES];
+        const float* tself[GTCRN_MODEL_TRA_GRUS];
+        const float* dself[GTCRN_MODEL_DPGRNN_GRUS];
+        float* sc[GTCRN_MODEL_CONV_STATES];
+        float* st[GTCRN_MODEL_TRA_GRUS];
+        float* sd[GTCRN_MODEL_DPGRNN_GRUS];
+        enum { N_TENSORS = GTCRN_MODEL_CONV_STATES + GTCRN_MODEL_TRA_GRUS +
+                           GTCRN_MODEL_DPGRNN_GRUS };
+        int stream_ok = 1;
+        int alias_ok = 1;
+        int nan_ok = 1;
+        int t;
+        size_t k;
+        sc[0] = &source.conv_enc0[0][0][0];
+        sc[1] = &source.conv_enc1[0][0][0];
+        sc[2] = &source.conv_enc2[0][0][0];
+        sc[3] = &source.conv_dec0[0][0][0];
+        sc[4] = &source.conv_dec1[0][0][0];
+        sc[5] = &source.conv_dec2[0][0][0];
+        for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i)
+            st[i] = &source.h_tra[i][0][0][0];
+        for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i)
+            sd[i] = &source.h_dpgrnn[i][0][0][0];
+        cself[0] = &copied.conv_enc0[0][0][0];
+        cself[1] = &copied.conv_enc1[0][0][0];
+        cself[2] = &copied.conv_enc2[0][0][0];
+        cself[3] = &copied.conv_dec0[0][0][0];
+        cself[4] = &copied.conv_dec1[0][0][0];
+        cself[5] = &copied.conv_dec2[0][0][0];
+        for (i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) cs[i] = sc[i];
+        for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
+            ts[i] = st[i];
+            tself[i] = &copied.h_tra[i][0][0][0];
+        }
+        for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
+            ds[i] = sd[i];
+            dself[i] = &copied.h_dpgrnn[i][0][0][0];
+        }
+
+        /* In-place state A has each frame written straight into the struct;
+         * copy state B goes through the private tensors and inherit. Every
+         * frame they must be byte-identical, and B must equal the source. */
+        gtcrn_model_state_init(&in_place);
+        gtcrn_model_state_init(&copied);
+        for (t = 0; t < INHERIT_FRAMES; ++t) {
+            float* a = (float*)&in_place;
+            float* s = (float*)&source;
+            for (k = 0; k < sizeof(source) / sizeof(float); ++k) {
+                float v = sinf(0.29f * (float)(t + 1) + 0.0007f * (float)k);
+                a[k] = v;
+                s[k] = v;
+            }
+            stream_ok &= gtcrn_model_state_validate(&in_place) == 0 &&
+                         gtcrn_model_state_inherit(&copied, cs, ts, ds) == 0 &&
+                         memcmp(&in_place, &copied, sizeof(copied)) == 0 &&
+                         memcmp(&copied, &source, sizeof(copied)) == 0;
+        }
+        CHECK(stream_ok,
+              "GTCRN inherit stream is byte-identical to the in-place state");
+
+        /* Every pointer equal to its field: the runtime wrote in place, so
+         * nothing is copied or checked and the state is unchanged (a
+         * non-finite value included: validate owns that case). */
+        memset(&copied, 0x41, sizeof(copied));
+        copied.conv_enc0[0][0][0] = NAN;
+        before = copied;
+        alias_ok &= gtcrn_model_state_inherit(&copied, cself, tself, dself)
+                        == 0 &&
+                    memcmp(&copied, &before, sizeof(copied)) == 0;
+        /* Mixed: one aliased tensor is skipped, the others are copied. */
+        memset(&copied, 0x41, sizeof(copied));
+        cs[2] = cself[2];
+        expect = source;
+        memcpy(&expect.conv_enc2, &copied.conv_enc2, sizeof(expect.conv_enc2));
+        alias_ok &= gtcrn_model_state_inherit(&copied, cs, ts, ds) == 0 &&
+                    memcmp(&copied, &expect, sizeof(copied)) == 0;
+        cs[2] = sc[2];
+        CHECK(alias_ok,
+              "GTCRN inherit leaves aliased tensors alone and copies the "
+              "rest");
+
+        /* One NaN or Inf at the first or last element of any one of the
+         * sixteen tensors: -1, nothing copied, state byte-identical. Source
+         * and state differ everywhere else, so a partial copy is visible. */
+        for (c = 0; c < 4; ++c) {
+            const float bad = (c & 1) ? INFINITY : NAN;
+            for (i = 0; i < N_TENSORS; ++i) {
+                float* victim;
+                size_t n;
+                if (i < GTCRN_MODEL_CONV_STATES) {
+                    victim = sc[i];
+                    n = conv_n[i];
+                } else if (i < GTCRN_MODEL_CONV_STATES +
+                               GTCRN_MODEL_TRA_GRUS) {
+                    victim = st[i - GTCRN_MODEL_CONV_STATES];
+                    n = tra_n;
+                } else {
+                    victim = sd[i - GTCRN_MODEL_CONV_STATES -
+                                GTCRN_MODEL_TRA_GRUS];
+                    n = dpgrnn_n;
+                }
+                memset(&source, 0x3d, sizeof(source));
+                victim[(c < 2) ? 0 : n - 1] = bad;
+                memset(&copied, 0x41, sizeof(copied));
+                before = copied;
+                nan_ok &= gtcrn_model_state_inherit(&copied, cs, ts, ds)
+                              == -1 &&
+                          memcmp(&copied, &before, sizeof(copied)) == 0;
+            }
+        }
+        CHECK(nan_ok,
+              "GTCRN inherit refuses a non-finite element in any of the "
+              "sixteen tensors and leaves the state byte-identical");
+
+        memset(&source, 0x3d, sizeof(source));
+        memset(&copied, 0x41, sizeof(copied));
+        before = copied;
+        {
+            const float* null_c[GTCRN_MODEL_CONV_STATES];
+            const float* null_t[GTCRN_MODEL_TRA_GRUS];
+            const float* null_d[GTCRN_MODEL_DPGRNN_GRUS];
+            int null_ok;
+            memcpy(null_c, cs, sizeof(null_c));
+            memcpy(null_t, ts, sizeof(null_t));
+            memcpy(null_d, ds, sizeof(null_d));
+            null_ok = gtcrn_model_state_inherit(NULL, cs, ts, ds) == -1 &&
+                      gtcrn_model_state_inherit(&copied, NULL, ts, ds) == -1 &&
+                      gtcrn_model_state_inherit(&copied, cs, NULL, ds) == -1 &&
+                      gtcrn_model_state_inherit(&copied, cs, ts, NULL) == -1;
+            for (i = 0; i < N_TENSORS; ++i) {
+                const float** slot;
+                const float* saved;
+                if (i < GTCRN_MODEL_CONV_STATES) {
+                    slot = &null_c[i];
+                } else if (i < GTCRN_MODEL_CONV_STATES +
+                               GTCRN_MODEL_TRA_GRUS) {
+                    slot = &null_t[i - GTCRN_MODEL_CONV_STATES];
+                } else {
+                    slot = &null_d[i - GTCRN_MODEL_CONV_STATES -
+                                   GTCRN_MODEL_TRA_GRUS];
+                }
+                saved = *slot;
+                *slot = NULL;
+                null_ok &= gtcrn_model_state_inherit(&copied, null_c, null_t,
+                                                     null_d) == -1;
+                *slot = saved;
+            }
+            CHECK(null_ok && memcmp(&copied, &before, sizeof(copied)) == 0,
+                  "GTCRN inherit refuses a NULL state, array or element and "
+                  "leaves the state intact");
+        }
+    }
     return 1;
 }
 

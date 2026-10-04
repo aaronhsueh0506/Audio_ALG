@@ -59,7 +59,7 @@
  * 不包含（porting 時的其他件）:
  *   - NPU graph 與其顯式 states（K/V ring / logit 史 / GRU h）—
  *     加速器視為 stateless；CPU 以 ulcnet_model_io.c/.h 的 caller-owned
- *     pool 保存並每幀傳入，graph 只回傳 delta-state outputs
+ *     pool 保存並每幀傳入，graph 回傳每個 state 的完整下一個值（in-place）
  *   - PBFDKF linear-error seam — AEC C 的 aec_get_linear_context()
  *   - delay 狀態機（flush ring / fail-open / crossfade）— pipeline 層
  * ============================================================ */
@@ -216,7 +216,7 @@ int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]);
  * pipeline 不持有 NPU runtime；推論以每幀一次的 callback 進行。
  * 加速器本身不保存 state；NN 的 far K/V ring、logit 史、GRU h
  * 是 CPU/driver context 的 external state，建議使用 ulcnet_model_io.c/.h
- * 準備 ONNX inputs 並提交 delta-state outputs。reset 在 delay change /
+ * 準備 ONNX inputs 並驗證 graph 回傳的 state。reset 在 delay change /
  * pipeline reset 時被呼叫；目前 production contract 清空 K/V、logit 與
  * 兩組 GRU hidden，日後若只清 attention state 必須另做 A/B 並版本化。
  * reset callback 可為 NULL。infer 回傳 0 表成功；非 0 時 pipeline 以

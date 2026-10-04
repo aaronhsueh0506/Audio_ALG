@@ -14,9 +14,22 @@ extern "C" {
 #define GTCRN_HOP_LEN  256
 
 /* Explicit model-state tensors in export_onnx.py. The accelerator retains
- * nothing between invocations; its *_out state tensors must be committed
- * here and returned as the next call's inputs. Every stateful GRU and every
- * temporal-convolution block owns one graph tensor. */
+ * nothing between invocations. GTCRNModelState below IS the state buffer.
+ * Normal path: the runtime writes each graph state *_out into its own output
+ * tensor and gtcrn_model_state_inherit() copies the finite ones into the
+ * struct. Optimized path: bind each graph state input AND its matching *_out
+ * output to the same struct field, so the updated state is the next call's
+ * input with no copy, and call only gtcrn_model_state_validate() (optional).
+ * Every stateful GRU and every temporal-convolution block owns one graph
+ * tensor. Binding table (graph name -> field):
+ *   conv_enc0 / conv_enc0_out ... conv_dec2 / conv_dec2_out
+ *                                  -> &state->conv_enc0 ... &state->conv_dec2
+ *   h_tra_enc0..2, h_tra_dec0..2 (+ _out)
+ *                                  -> &state->h_tra[0..5]
+ *   h_dpgrnn1_0, h_dpgrnn1_1, h_dpgrnn2_0, h_dpgrnn2_1 (+ _out)
+ *                                  -> &state->h_dpgrnn[0..3]
+ * Aliasing precondition (optimized path): the runtime must read every state
+ * input before it writes any state output at the same address. */
 /* Version 3 dropped conv_cache's size-1 batch dim from the graph tensor
  * ([2,16,16,33] instead of [2,1,16,16,33]); the bytes in this struct are
  * unchanged, but the tensor rank is part of the binding contract. Version 4
@@ -122,22 +135,38 @@ void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
                         const float spectrum[GTCRN_N_BINS][2],
                         float enhanced[GTCRN_N_BINS][2]);
 
-/* Copy the accelerator's updated state outputs into the next-call inputs.
+/* Optimized path: finite-check the state in place after an invocation.
  *
- * ``conv_out`` holds conv_enc0..2 then conv_dec0..2. ``h_tra_out`` holds the
- * six TRA GRU hiddens in graph order (encoder blocks then decoder blocks),
- * and ``h_dpgrnn_out`` the four grouped inter-GRU hiddens.
+ * The graph's *_out outputs are bound to the same fields as its state
+ * inputs (see the binding table above), so the updated state is already
+ * where the next call reads it and nothing is copied. Calling this is
+ * optional for a trusted runtime. Returns 0 when every element of the six
+ * conv, six h_tra and four h_dpgrnn tensors is finite. A null argument
+ * returns -1. A single NaN or Inf anywhere zeroes the whole state (the
+ * previous value no longer exists to restore) and returns -1, so the next
+ * invocation starts from the reset state instead of replaying poison.
+ * The check is finite-only: a partial or mixed write that is still finite
+ * cannot be detected. */
+int gtcrn_model_state_validate(GTCRNModelState* state);
+
+/* Normal path: take the runtime's own state output tensors into the state.
  *
- * Transactional: every element of every state tensor is checked first, and a
- * single NaN or Inf anywhere refuses the whole commit with -1, leaving the
- * previous state byte-identical so the caller can retry or reset. Returns 0
- * on success and -1 on a null argument or a non-finite element. A caller that
- * ignores the result keeps replaying the last good state, which is the safe
- * direction; a partial write would not be. */
-int gtcrn_model_state_commit(GTCRNModelState* state,
-                             const float* const conv_out[GTCRN_MODEL_CONV_STATES],
-                             const float* const h_tra_out[GTCRN_MODEL_TRA_GRUS],
-                             const float* const h_dpgrnn_out[GTCRN_MODEL_DPGRNN_GRUS]);
+ * conv_out[i] (conv_enc0..2, conv_dec0..2), h_tra_out[i] and h_dpgrnn_out[i]
+ * point at the graph's *_out tensors, laid out as the matching struct
+ * fields. A tensor whose pointer already equals its field was written in
+ * place: it is left alone (not copied, not checked; use
+ * gtcrn_model_state_validate() for those). Every other tensor is finite-
+ * checked first, and only if all of them pass are they copied. Returns 0 on
+ * success. A null state, array or element, or a single NaN or Inf in any
+ * tensor that would be copied, returns -1 and copies nothing: a refused
+ * inherit leaves the state intact, so the caller treats the frame as failed.
+ * (The in-place path differs: gtcrn_model_state_validate() restarts the
+ * state from zero.) */
+int gtcrn_model_state_inherit(
+    GTCRNModelState* state,
+    const float* const conv_out[GTCRN_MODEL_CONV_STATES],
+    const float* const h_tra_out[GTCRN_MODEL_TRA_GRUS],
+    const float* const h_dpgrnn_out[GTCRN_MODEL_DPGRNN_GRUS]);
 
 /* HOP_LEN new samples -> one unnormalised complex RFFT frame. The network
  * input layout is bin-major [re,im], matching model.py's [F,T,2]. */

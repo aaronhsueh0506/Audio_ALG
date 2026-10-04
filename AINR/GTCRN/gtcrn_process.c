@@ -203,60 +203,85 @@ static int all_finite(const float* values, size_t count)
     return skn_all_finite_f32(values, count);
 }
 
-int gtcrn_model_state_commit(GTCRNModelState* state,
-                             const float* const conv_out[GTCRN_MODEL_CONV_STATES],
-                             const float* const h_tra_out[GTCRN_MODEL_TRA_GRUS],
-                             const float* const h_dpgrnn_out[GTCRN_MODEL_DPGRNN_GRUS])
+#define GTCRN_MODEL_STATE_TENSORS \
+    (GTCRN_MODEL_CONV_STATES + GTCRN_MODEL_TRA_GRUS + GTCRN_MODEL_DPGRNN_GRUS)
+
+/* The sixteen state tensors in graph order (conv, h_tra, h_dpgrnn) with their
+ * element counts; together they tile the struct. */
+static void state_tensors(GTCRNModelState* state,
+                          float* base[GTCRN_MODEL_STATE_TENSORS],
+                          size_t count[GTCRN_MODEL_STATE_TENSORS])
 {
-    float* conv_dest[GTCRN_MODEL_CONV_STATES];
-    size_t conv_size[GTCRN_MODEL_CONV_STATES];
+    int n = 0;
+    base[n] = &state->conv_enc0[0][0][0];
+    count[n++] = sizeof(state->conv_enc0) / sizeof(float);
+    base[n] = &state->conv_enc1[0][0][0];
+    count[n++] = sizeof(state->conv_enc1) / sizeof(float);
+    base[n] = &state->conv_enc2[0][0][0];
+    count[n++] = sizeof(state->conv_enc2) / sizeof(float);
+    base[n] = &state->conv_dec0[0][0][0];
+    count[n++] = sizeof(state->conv_dec0) / sizeof(float);
+    base[n] = &state->conv_dec1[0][0][0];
+    count[n++] = sizeof(state->conv_dec1) / sizeof(float);
+    base[n] = &state->conv_dec2[0][0][0];
+    count[n++] = sizeof(state->conv_dec2) / sizeof(float);
+    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
+        base[n] = &state->h_tra[i][0][0][0];
+        count[n++] = sizeof(state->h_tra[0]) / sizeof(float);
+    }
+    for (int i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
+        base[n] = &state->h_dpgrnn[i][0][0][0];
+        count[n++] = sizeof(state->h_dpgrnn[0]) / sizeof(float);
+    }
+}
+
+int gtcrn_model_state_validate(GTCRNModelState* state)
+{
+    float* base[GTCRN_MODEL_STATE_TENSORS];
+    size_t count[GTCRN_MODEL_STATE_TENSORS];
+    if (state == NULL) return -1;
+    state_tensors(state, base, count);
+    for (int i = 0; i < GTCRN_MODEL_STATE_TENSORS; ++i) {
+        if (!all_finite(base[i], count[i])) {
+            gtcrn_model_state_init(state);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+int gtcrn_model_state_inherit(
+    GTCRNModelState* state,
+    const float* const conv_out[GTCRN_MODEL_CONV_STATES],
+    const float* const h_tra_out[GTCRN_MODEL_TRA_GRUS],
+    const float* const h_dpgrnn_out[GTCRN_MODEL_DPGRNN_GRUS])
+{
+    float* base[GTCRN_MODEL_STATE_TENSORS];
+    size_t count[GTCRN_MODEL_STATE_TENSORS];
+    const float* src[GTCRN_MODEL_STATE_TENSORS];
+    int n = 0;
     if (state == NULL || conv_out == NULL || h_tra_out == NULL ||
         h_dpgrnn_out == NULL) return -1;
-    conv_dest[0] = &state->conv_enc0[0][0][0];
-    conv_dest[1] = &state->conv_enc1[0][0][0];
-    conv_dest[2] = &state->conv_enc2[0][0][0];
-    conv_dest[3] = &state->conv_dec0[0][0][0];
-    conv_dest[4] = &state->conv_dec1[0][0][0];
-    conv_dest[5] = &state->conv_dec2[0][0][0];
-    conv_size[0] = sizeof(state->conv_enc0);
-    conv_size[1] = sizeof(state->conv_enc1);
-    conv_size[2] = sizeof(state->conv_enc2);
-    conv_size[3] = sizeof(state->conv_dec0);
-    conv_size[4] = sizeof(state->conv_dec1);
-    conv_size[5] = sizeof(state->conv_dec2);
-    for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
-        if (conv_out[i] == NULL) return -1;
-    }
-    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
-        if (h_tra_out[i] == NULL) return -1;
-    }
+    for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) src[n++] = conv_out[i];
+    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) src[n++] = h_tra_out[i];
     for (int i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
-        if (h_dpgrnn_out[i] == NULL) return -1;
+        src[n++] = h_dpgrnn_out[i];
     }
-    /* Validate every state tensor BEFORE writing any of them. A partial
-     * commit would leave the recurrent state a mix of two invocations, which
-     * the next call cannot distinguish from a healthy state; refusing the
-     * whole batch keeps the last good state replayable. */
-    for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
-        if (!all_finite(conv_out[i], conv_size[i] / sizeof(float))) return -1;
+    for (int i = 0; i < GTCRN_MODEL_STATE_TENSORS; ++i) {
+        if (src[i] == NULL) return -1;
     }
-    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
-        if (!all_finite(h_tra_out[i],
-                        sizeof(state->h_tra[0]) / sizeof(float))) return -1;
+    state_tensors(state, base, count);
+    /* Validate every tensor that would be copied before touching any, so a
+     * refusal leaves the state byte-identical. A tensor the runtime wrote in
+     * place (same address) is skipped: it is not checked here and copying a
+     * range onto itself is undefined. */
+    for (int i = 0; i < GTCRN_MODEL_STATE_TENSORS; ++i) {
+        if (src[i] != base[i] && !all_finite(src[i], count[i])) return -1;
     }
-    for (int i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
-        if (!all_finite(h_dpgrnn_out[i],
-                        sizeof(state->h_dpgrnn[0]) / sizeof(float))) return -1;
-    }
-    for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
-        memcpy(conv_dest[i], conv_out[i], conv_size[i]);
-    }
-    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
-        memcpy(state->h_tra[i], h_tra_out[i], sizeof(state->h_tra[0]));
-    }
-    for (int i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
-        memcpy(state->h_dpgrnn[i], h_dpgrnn_out[i],
-               sizeof(state->h_dpgrnn[0]));
+    for (int i = 0; i < GTCRN_MODEL_STATE_TENSORS; ++i) {
+        if (src[i] != base[i]) {
+            memcpy(base[i], src[i], count[i] * sizeof(float));
+        }
     }
     return 0;
 }

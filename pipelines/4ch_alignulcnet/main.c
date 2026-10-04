@@ -186,7 +186,11 @@ static int parse_delay_profile(int argc, char** argv, DelayProfile* out) {
     return 0;
 }
 
-/* Replace with the product's stateless accelerator invocation. */
+/* Replace with the product's stateless accelerator invocation. Ordinary flow:
+ * run the ONNX graph into the runtime's own output tensors and
+ *     return run_ok ? ulcnet_model_io_inherit(outputs, &runtime_outputs) : -1;
+ * A runtime that binds each *_out to its input's address writes through
+ * `outputs` and leaves inherit out (see ulcnet_model_io.h). */
 static int run_accelerator(void *user,
                            const UlcnetModelIoInputs *inputs,
                            UlcnetModelIoOutputs *outputs) {

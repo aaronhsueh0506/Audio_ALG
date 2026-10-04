@@ -21,8 +21,8 @@ struct UlcnetAcceleratorAdapter {
 
 /* The class config this descriptor deploys as.
  *
- * descriptor_validate() pins geometry to this build. Preserve the graph's
- * layout as well as D: the same inputs can require delta or full outputs.
+ * descriptor_validate() pins geometry and the layout version to this build;
+ * the class then takes both from the descriptor.
  * Validating here also keeps the reject-first contract the header states:
  * an aligned-far or out-of-range descriptor never reaches sizing.
  */
@@ -141,23 +141,23 @@ static int infer(void *user,
     }
 
     if (adapter->run(adapter->run_user, &inputs, &outputs) != 0) {
-        /* A failed run must not advance the K/V, logit or GRU rings, so it
-         * must not commit: a runtime that filled every output and THEN
-         * reported failure would otherwise pass commit()'s finite check and
-         * step the persistent state off a frame the pipeline discards.
-         * frame_skip() closes the transaction WITHOUT committing -- no ring
-         * moves -- and the next prepare() re-arms it and re-fills the
-         * outputs with NaN, so the NaN-prefill plus commit()'s finite gate
-         * remain as the second line of defence against a partial write. The
-         * caller's enhanced spectra stay untouched, because -1 here means
-         * this frame produced nothing. */
+        /* A failed run must not commit: a runtime that filled every output and
+         * THEN reported failure would otherwise pass commit()'s finite check
+         * and take the frame. frame_skip() closes the transaction WITHOUT
+         * committing, and the in-place state stays as the runtime left it
+         * (a run that reported failure is taken not to have written). The
+         * next prepare() re-arms the transaction and re-fills the
+         * NaN-checked estimate, so the NaN-prefill plus commit()'s finite
+         * gate remain as the second line of defence against an unwritten
+         * frame. The caller's enhanced spectra stay untouched, because -1
+         * here means this frame produced nothing. */
         (void)ulcnet_prepost_frame_skip(adapter->prepost);
         return -1;
     }
     if (ulcnet_prepost_frame_commit(adapter->prepost) != 0) {
-        /* Same rule from the other direction: commit refused the frame (a
-         * partial or non-finite write), left the persistent state exactly as
-         * it was, and wrote nothing to the caller. */
+        /* Same rule from the other direction: commit refused the frame (an
+         * unwritten or non-finite one), restarted the recurrent state from
+         * zero, and wrote nothing to the caller. */
         (void)ulcnet_prepost_frame_skip(adapter->prepost);
         return -1;
     }

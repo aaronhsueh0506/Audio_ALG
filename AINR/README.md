@@ -187,8 +187,22 @@ The active deployment exports are stateless accelerator graphs:
 | DeepFilterNet2 | 3 feature frames -> 1 head frame | 3 GRU tensors + 4-frame DF pathway cache |
 | GTCRN | 1 complex STFT frame | conv/TRA/inter-GRU caches |
 
-“Stateless” describes the accelerator, not the algorithm. The host must return
-every exported `*_out` state tensor as the matching input on the next call.
+“Stateless” describes the accelerator, not the algorithm. Each state tensor has
+one host buffer owned by the caller. The ordinary runtime writes the graph's
+`*_out` state tensors into its own output tensors and the host takes them over
+with the model's inherit call (`rnnoise_model_state_inherit()`,
+`gtcrn_model_state_inherit()`, `dfn2_model_io_inherit_state()` /
+`dfn2_prepost_outputs_inherit()`): it finite-checks every tensor it would copy
+and only then copies, so a refused call leaves the state as it was and the
+frame is treated as failed. A runtime that can bind each `*_out` to its input's
+address (an NPU, say) writes the state in place and omits the inherit call;
+everything else is shared. A tensor whose pointer already equals its
+destination is never copied or checked by inherit. In place the runtime must
+finish reading a state input before it writes the output at that address, and
+the `*_validate` helpers (for example `gtcrn_model_state_validate()`,
+`rnnoise_model_state_validate()` and `dfn2_model_io_validate_state()`)
+finite-check the state and zero it on a non-finite value, because the previous
+state no longer exists.
 
 DeepFilterNet2 additionally publishes the host-side callback boundary a
 pipeline binds a runtime to -- `DFN2Model` / `dfn2_model_run_frame()` in

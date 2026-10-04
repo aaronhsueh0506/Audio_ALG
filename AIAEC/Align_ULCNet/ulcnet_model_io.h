@@ -1,10 +1,18 @@
 /* Align-ULCNet stateless-accelerator model I/O state.
  *
- * The accelerator owns no persistent state.  This helper carves CPU-owned
- * K/V history, score-convolution history and temporal-GRU hidden tensors from
- * one caller-provided pool. Layout 8 returns current K/V/logit entries;
- * layout 12 returns full next histories to a separate bank. commit() checks
- * all outputs before advancing any state. No input/output alias is required.
+ * The accelerator owns no persistent state.  This helper carves K/V history,
+ * score-convolution history and temporal-GRU hidden tensors from one
+ * caller-provided pool.  The graph returns the FULL next value of all five
+ * state tensors (key_history, value_history, logit_history, h_gru0, h_gru1)
+ * as *_out, with the ring shift done inside it, so the CPU never shifts a
+ * ring.  Two bindings share everything else (prepare, commit, adapter,
+ * pipeline):
+ *   - ordinary runtime: its own output tensors, handed to
+ *     ulcnet_model_io_inherit(), which validates and copies them into the
+ *     state;
+ *   - runtime that can bind each *_out to its input's address: it writes the
+ *     state in place and the inherit call is simply left out.
+ * commit() validates the frame in both cases.
  *
  * This file does not invoke an accelerator and does not contain STFT/WOLA.
  * Audio framing remains in ulcnet_process.c; a board adapter binds the views
@@ -33,32 +41,27 @@ extern "C" {
  * compressed error RI, all produced inside prepare()) and returns the
  * COMPRESSED estimate; commit() applies the inverse signed power. The
  * graph starts at the learned reorient/encoder compute. */
-/* Version 8 presents every recurrent hidden as rank-4 NCHW -- h_gru0/h_gru1
- * become [1,2,1,128] and the combined tensor [1,4,1,128] -- so all five
- * boundary states share the one convention the attention caches already
- * used.  Nothing about this file's arithmetic moves with it: the hiddens
- * cross the boundary as flat float arrays whose element count
- * (GRU_LAYERS * GRU_HIDDEN) is identical at either rank, so compute_counts(),
- * the pool carve and prepare()/commit() are byte-for-byte what they were.
- * That is exactly why the version has to move.  descriptor_validate()
- * compares gru_layers, gru_hidden and every *_elements count, and every one
- * of them is unchanged between rank-3 and rank-4 -- so the version constant
- * is the ONLY thing that can stop a board built for the rank-3 boundary from
- * silently binding a rank-4 graph. */
-/* ⚠ Versions 3-7 are RETIRED, not free.  3, 4 and 5 were shipped rank-3
- * boundaries and 6 and 7 were reserved for rank-3 pairs; a number that once
- * denoted a rank-3 boundary must never also denote a rank-4 one.
- * export_onnx.py's boundary is the pair (feature layout, GRU state layout)
- * and its LAYOUT_VERSIONS table now names all four: ('host','split') = 8,
- * the version below and the only pair this file implements;
- * ('host','combined') = 9 stacks both subband hiddens into one h_gru tensor;
- * ('graph','split') = 10 binds the two raw RI spectra and runs the
- * front/back ends inside the graph; ('graph','combined') = 11 does both.
- * This C helper accepts host/split only: delta layout 8 and full-history
- * layout 12. Versions 9-11 and 13-15 are different feature/GRU boundaries
- * and are rejected. Default remains 8 for existing exported graphs. */
-#define ULCNET_MODEL_IO_LAYOUT_VERSION 8u
-#define ULCNET_MODEL_IO_FULL_HISTORY_VERSION 12u
+/* Version 12 returns the full next K/V/logit history from the graph
+ * (key_history_out, value_history_out, logit_history_out, with exactly the
+ * input shapes), so all five state tensors are bound in place.  The state
+ * tensors keep their names, shapes and element counts, but the output set is
+ * different (no *_now, five *_out), which is why the version has to move:
+ * descriptor_validate() compares counts that did not change, so this constant
+ * is the ONLY thing that can stop a board built for one boundary from
+ * silently binding the other.
+ * ⚠ Versions 3-11 are RETIRED, not free: 3-5 were shipped rank-3 boundaries,
+ * 6 and 7 rank-3 pairs, and 8-11 the rank-4 boundaries that returned only
+ * the new K/V/logit entries.  A number that once denoted one boundary must
+ * never denote another.  export_onnx.py's LAYOUT_VERSIONS table names the
+ * four (feature layout, GRU state layout) pairs of the full-state boundary:
+ * ('host','split') = 12, the version below and the only pair this file
+ * implements; ('host','combined') = 13 stacks both subband hiddens into one
+ * h_gru tensor; ('graph','split') = 14 binds the two raw RI spectra and runs
+ * the front/back ends inside the graph; ('graph','combined') = 15 does both.
+ * Nothing here binds anything but 12, so a board built against this header
+ * refuses the other three -- which is the intent.  The next real bump of
+ * this constant must therefore go to 16. */
+#define ULCNET_MODEL_IO_LAYOUT_VERSION 12u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
@@ -149,7 +152,8 @@ typedef struct UlcnetModelIoMemReq {
  *   logit history     [1,32,4,D], oldest frame first;
  *   GRU hidden        [1,2,1,128].
  * Those are the GRAPH shapes; the pointers below stay flat, and the
- * *_elements counts are what this file actually works in.
+ * *_elements counts are what this file actually works in.  The five state
+ * tensors below are the ones the graph also returns, in full, as *_out.
  */
 typedef struct UlcnetModelIoInputs {
     /* The five feature tensors prepare() computes from the raw spectra
@@ -173,38 +177,36 @@ typedef struct UlcnetModelIoInputs {
     size_t gru_hidden_elements;
 } UlcnetModelIoInputs;
 
-/* Accelerator-writable outputs.  Layout 8 (delta):
- *   key/value now [1,32,1,TA_BINS];
- *   logit now     [1,32,1,D];
- * layout 12 (full history), in the *_history_out fields instead:
- *   key/value history [1,32,D-1,TA_BINS];
- *   logit history     [1,32,4,D];
- * both layouts:
- *   GRU next      [1,2,1,128].
- * prepare() fills every element with NaN so commit() detects partial writes.
+/* The enhanced estimate and the full next value of every state tensor (same
+ * shapes as the inputs above).  prepare() returns these pointing into the
+ * pool: each *_out is the SAME address as the input it continues and stays
+ * fixed for the life of the state.  A runtime with its own output tensors
+ * fills a struct of this type with them and calls ulcnet_model_io_inherit();
+ * a runtime that binds the pointers prepare() returned writes in place (it
+ * reads every state input before it writes any state output).  prepare()
+ * NaN-fills `output`, so an unwritten estimate is refused at commit; a
+ * partial write to the state tensors is not detectable, only a non-finite
+ * one.
+ *
+ * Failure: on the copy path a refused inherit leaves the state as it was, the
+ * accelerator callback returns non-zero (it must not report success after a
+ * refusal) and the frame is skipped; bound in place,
+ * a refused commit restarts all five state tensors from zero, and a frame the
+ * runtime ran but the caller does not commit leaves them as the runtime wrote
+ * them.
  */
 typedef struct UlcnetModelIoOutputs {
     float *output;
-    float *key_now;
-    float *value_now;
-    float *logit_now;
-    float *h_gru0_out;
-    float *h_gru1_out;
-    size_t spectrum_ri_elements;
-    size_t key_now_elements;
-    size_t value_now_elements;
-    size_t logit_now_elements;
-    size_t gru_hidden_elements;
-    /* Layout 12 only: complete next states, exactly the input shapes/order.
-     * Layout 8 publishes NULL/0 here; layout 12 publishes NULL/0 in *_now.
-     * Bind these outputs to the provided spare bank, NEVER to live inputs.
-     * Re-read all bindings after each prepare (success swaps bank roles). */
     float *key_history_out;
     float *value_history_out;
     float *logit_history_out;
+    float *h_gru0_out;
+    float *h_gru1_out;
+    size_t spectrum_ri_elements;
     size_t key_history_elements;
     size_t value_history_elements;
     size_t logit_history_elements;
+    size_t gru_hidden_elements;
 } UlcnetModelIoOutputs;
 
 typedef struct UlcnetModelIoState UlcnetModelIoState;
@@ -256,9 +258,10 @@ void ulcnet_model_io_reset(UlcnetModelIoState *state);
 
 /* Run the fixed front end (signed-power compression, magnitudes, phase
  * cos/sin) over the separate C real/imag spectra, return current input
- * views, and NaN-prefill every accelerator output.  Call once immediately
- * before every inference. commit() applies the matching inverse signed
- * power to the graph's compressed estimate. */
+ * views, and NaN-prefill the `output` estimate (the state tensors are the
+ * inputs, so they are left alone).  Call once immediately before every
+ * inference. commit() applies the matching inverse signed power to the
+ * graph's compressed estimate. */
 int ulcnet_model_io_prepare(UlcnetModelIoState *state,
                             const float error_re[ULCNET_MODEL_IO_BINS],
                             const float error_im[ULCNET_MODEL_IO_BINS],
@@ -267,12 +270,34 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
                             UlcnetModelIoInputs *inputs,
                             UlcnetModelIoOutputs *outputs);
 
+/* Copy path for a runtime that cannot bind a state output to its input's
+ * address (the ordinary case: an ONNX-style runtime with its own output
+ * tensors).  `destination` is the struct prepare() returned; `runtime` has the
+ * same type and carries the runtime's own tensor pointers and the same
+ * element counts.  Each tensor is copied into the matching destination
+ * pointer, except one whose pointer already equals it -- the runtime wrote
+ * that one in place -- which is left alone, so one call serves both bindings.
+ * The tensors about to be copied are checked first (estimate, newest K/V
+ * slot, last logit frame, both hiddens): if any is non-finite nothing is
+ * written, -1 is returned and the state is exactly as it was, so the caller
+ * reports the run as failed and the frame is skipped.  A tensor written in
+ * place cannot be restored on a bad frame; it is checked by commit(), which
+ * restarts the state from zero.  The runtime's tensors are its own: this
+ * file allocates nothing for them.  Returns 0, or -1 on NULL, a missing
+ * tensor or mismatched counts. */
+int ulcnet_model_io_inherit(const UlcnetModelIoOutputs *destination,
+                            const UlcnetModelIoOutputs *runtime);
+
 /* Validate that prepare() started a transaction and that the accelerator
- * wrote every output, then advance the K/V/logit rings (layout 8) or swap the
- * full-history bank (layout 12), swap in the next GRU hidden tensors, and
- * unpack enhanced RI to separate C arrays.  One prepare permits one commit
- * attempt.  On failure persistent model state and caller outputs remain
- * unchanged, the transaction is discarded, and -1 is returned. */
+ * wrote a finite estimate and finite state, and unpack enhanced RI to
+ * separate C arrays; the state tensors need no step.  One prepare permits one
+ * commit attempt.  Of the history rings only the frame the graph just wrote
+ * is checked (key/value slot 0, the last logit frame): the older slots were
+ * checked when they were new, and a non-finite value left in any of them
+ * reaches `output` on the next frame, where it is refused.  A non-finite
+ * value cannot be rolled back, because the state was written in place: all
+ * five state tensors are zeroed, the transaction is discarded, the caller's
+ * outputs are untouched, and -1 is returned. */
 int ulcnet_model_io_commit(UlcnetModelIoState *state,
                            float enhanced_re[ULCNET_MODEL_IO_BINS],
                            float enhanced_im[ULCNET_MODEL_IO_BINS]);

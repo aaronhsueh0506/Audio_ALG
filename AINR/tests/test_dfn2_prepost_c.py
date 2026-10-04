@@ -25,10 +25,32 @@ model TUs are compiled once for the module:
   lifecycle _create/_destroy against _init on a caller pool
   reject    _get_mem_size / _init / stage-call reject-first validation
   reset     _reset really clears state (a re-run reproduces the first run)
-  skip      _frame_skip is the exact identity and does NOT step the state
+  skip      _frame_skip is the exact identity, never steps the state itself
+            and leaves it exactly as the accelerator wrote it
   guard     the four frame-state-machine gates the contract block promises
-  txn       "on failure NOTHING moves, the frame stays open", proved for
-            every one of the seven accelerator output tensors
+  txn       a refused commit zeroes the four recurrent tensors (the state is
+            written in place, so there is nothing to roll back to), keeps the
+            frame open and leaves windows and clocks alone, proved for every
+            one of the seven accelerator output tensors
+  state_inplace  one buffer per recurrent tensor: input and `*_next` views are
+            the same address on every frame
+  inplace_nan    mutation gate: a NaN injected through the in-place pointer
+            makes commit refuse and leaves all four tensors zero
+  separate_buffers  the copy path: the accelerator stand-in writes its OWN
+            tensors and dfn2_prepost_outputs_inherit() hands them to the pool;
+            the whole stream is bit-identical to the in-place binding, for
+            both attenuation limits `equiv` covers
+  inherit_aliased   a runtime pointer equal to the destination's is skipped:
+            all-aliased is a no-op returning 0, a mixed binding copies only
+            what moved, and an in-place NaN is commit's to find
+  inherit_refused   one non-finite element in any one of the seven runtime
+            tensors -> -1, nothing copied, pool byte-identical, state intact;
+            frame_skip then a healthy frame goes through
+  inherit_guards    NULL arguments, a NULL tensor and an element-count
+            mismatch are refused with the pool untouched
+  copy_model_run    dfn2_model_run_frame with an infer() that owns its tensors
+            and inherits them: same stream as the in-place infer(), and a
+            refused inherit is a failed run with the state intact
 
 The accelerator stand-in is deterministic and input-dependent, so the two
 feature windows, the three GRU hidden tensors and the deep-filter pathway
@@ -69,9 +91,9 @@ _DRIVER = r'''
 #define SHORT_HOPS  40
 #define LOOKAHEAD   (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD)
 
-/* skip: frames driven purely on frame_skip, then four more for the freeze. */
+/* skip: frames driven purely on frame_skip, then five more for the freeze. */
 #define SKIP_FRAMES 24
-#define SKIP_TOTAL  (SKIP_FRAMES + 4)
+#define SKIP_TOTAL  (SKIP_FRAMES + 5)
 
 /* txn: K normal hops, the poisoned hop, then enough hops for the divergence
  * against the "committed at K" reference to be unmissable. */
@@ -195,19 +217,16 @@ static void fake_run(const DFN2PrepostInputs *in, DFN2PrepostOutputs *out) {
               &out->df_convp_history_next[0][0][0]);
 }
 
-/* The same seven tensors, laid out for the hand-composed reference path. */
+/* The three heads, laid out for the hand-composed reference path. */
 typedef struct {
     float erb_mask[DFN2_PREPOST_ERB_MASK_ELEMENTS];
     float coefs[DFN2_PREPOST_COEFS_ELEMENTS];
     float alpha[DFN2_PREPOST_ALPHA_ELEMENTS];
-    float encoder_next[DFN2_MODEL_ENCODER_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN];
-    float erb_next[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN];
-    float df_next[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN];
-    float convp_next[DFN2_MODEL_ENCODER_CHANNELS]
-                    [DFN2_MODEL_DF_PATHWAY_HISTORY][DFN2_DF_BINS];
 } RefHeads;
 
-static void fake_run_reference(const DFN2ModelIOState *io, RefHeads *heads) {
+/* The reference accelerator writes the recurrent state in place too: fake_acc
+ * reads every state input before fake_fill overwrites any of them. */
+static void fake_run_reference(DFN2ModelIOState *io, RefHeads *heads) {
     double acc = fake_acc(&io->erb_window[0][0],
                           &io->spec_window[0][0][0],
                           &io->encoder_gru_hidden[0][0],
@@ -215,8 +234,8 @@ static void fake_run_reference(const DFN2ModelIOState *io, RefHeads *heads) {
                           &io->df_gru_hidden[0][0],
                           &io->df_convp_history[0][0][0]);
     fake_fill(acc, heads->erb_mask, heads->coefs, heads->alpha,
-              &heads->encoder_next[0][0], &heads->erb_next[0][0],
-              &heads->df_next[0][0], &heads->convp_next[0][0][0]);
+              &io->encoder_gru_hidden[0][0], &io->erb_gru_hidden[0][0],
+              &io->df_gru_hidden[0][0], &io->df_convp_history[0][0][0]);
 }
 
 /* ---- small helpers ---------------------------------------------------- */
@@ -241,18 +260,34 @@ static int all_nan(const float *v, size_t count) {
     return 1;
 }
 
-static int outputs_all_nan(const DFN2PrepostOutputs *out) {
+/* Only the three heads are NaN-prefilled; the recurrent state is the
+ * accelerator's input and is never prefilled. */
+static int heads_all_nan(const DFN2PrepostOutputs *out) {
     return all_nan(out->erb_mask, out->erb_mask_elements) &&
            all_nan(out->coefs, out->coefs_elements) &&
-           all_nan(out->alpha, out->alpha_elements) &&
-           all_nan(&out->encoder_gru_hidden_next[0][0],
-                   out->encoder_gru_hidden_elements) &&
-           all_nan(&out->erb_gru_hidden_next[0][0],
-                   out->erb_gru_hidden_elements) &&
-           all_nan(&out->df_gru_hidden_next[0][0],
-                   out->df_gru_hidden_elements) &&
-           all_nan(&out->df_convp_history_next[0][0][0],
-                   out->df_convp_history_elements);
+           all_nan(out->alpha, out->alpha_elements);
+}
+
+/* Each recurrent state output is the same buffer as its input. */
+static int state_aliased(const DFN2PrepostInputs *in,
+                         const DFN2PrepostOutputs *out) {
+    return (const void *)in->encoder_gru_hidden ==
+               (const void *)out->encoder_gru_hidden_next &&
+           (const void *)in->erb_gru_hidden ==
+               (const void *)out->erb_gru_hidden_next &&
+           (const void *)in->df_gru_hidden ==
+               (const void *)out->df_gru_hidden_next &&
+           (const void *)in->df_convp_history ==
+               (const void *)out->df_convp_history_next;
+}
+
+static int state_all_zero(const DFN2PrepostInputs *in) {
+    return all_zero(&in->encoder_gru_hidden[0][0],
+                    in->encoder_gru_hidden_elements) &&
+           all_zero(&in->erb_gru_hidden[0][0], in->erb_gru_hidden_elements) &&
+           all_zero(&in->df_gru_hidden[0][0], in->df_gru_hidden_elements) &&
+           all_zero(&in->df_convp_history[0][0][0],
+                    in->df_convp_history_elements);
 }
 
 /* One of the seven accelerator output tensors, by index, for the txn sweep. */
@@ -327,6 +362,7 @@ static float pcm_in[HOPS * DFN2_HOP_LEN];
 static float out_a[HOPS * DFN2_HOP_LEN];
 static float out_b[HOPS * DFN2_HOP_LEN];
 static float out_c[HOPS * DFN2_HOP_LEN];
+static float out_d[HOPS * DFN2_HOP_LEN];
 static int written_log[HOPS];
 static long long frame_log[HOPS];
 
@@ -407,16 +443,7 @@ static int equiv_once(FftHandle *fft, float atten_lim_db) {
                                           heads.erb_mask, heads.coefs,
                                           heads.alpha[0], atten_lim_db,
                                           enh_re, enh_im, NULL);
-            CHECK(dfn2_model_io_commit_state(
-                      &ref_io,
-                      (const float (*)[DFN2_MODEL_GRU_HIDDEN])
-                          heads.encoder_next,
-                      (const float (*)[DFN2_MODEL_GRU_HIDDEN])
-                          heads.erb_next,
-                      (const float (*)[DFN2_MODEL_GRU_HIDDEN])
-                          heads.df_next,
-                      (const float (*)[DFN2_MODEL_DF_PATHWAY_HISTORY]
-                                      [DFN2_DF_BINS])heads.convp_next) == 0);
+            CHECK(dfn2_model_io_validate_state(&ref_io) == 0);
         }
         CHECK(emitted >= 0);
         if (emitted == 1) {
@@ -766,7 +793,7 @@ static int case_dual_guards(FftHandle *fft) {
     DFN2Prepost *pt, *pf;
     void *pool_t, *pool_f;
 
-    CHECK(DFN2_PREPOST_CARVE_VERSION == 3u);
+    CHECK(DFN2_PREPOST_CARVE_VERSION == 4u);
 
     config_time(&cfg_time, fft);
     config_freq(&cfg_freq);
@@ -810,7 +837,8 @@ static int case_dual_guards(FftHandle *fft) {
 /* ---- model_run: the DFN2Model callback boundary ------------------------ */
 
 typedef struct {
-    int mode;     /* 0 full write, 1 refuse (rc -1), 2 leave alpha unwritten */
+    int mode;     /* 0 full write, 1 refuse (rc -1), 2 leave alpha unwritten
+                   * after writing the state in place                       */
     int calls;
     int resets;
 } StubModel;
@@ -898,8 +926,8 @@ static int case_model_run(void) {
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[2], in_im[2]) == 1);
     snapshot_state(p, enc1, erb1, df1, convp1);
     CHECK(!identical(enc0, enc1, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
-    /* A refused inference is taken as the identity: state frozen, frame
-     * closed, the hop still emits. */
+    /* A refused inference (nonzero return, nothing written) is taken as the
+     * identity: state frozen, frame closed, the hop still emits. */
     stub.mode = 1;
     CHECK(dfn2_model_run_frame(&model, p) == 0);
     CHECK(stub.calls == 2);
@@ -911,8 +939,9 @@ static int case_model_run(void) {
     CHECK(identical(erb0, erb1, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS));
     CHECK(identical(df0, df1, DFN2_PREPOST_DF_HIDDEN_ELEMENTS));
     CHECK(identical(convp0, convp1, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS));
-    /* A partial write (one output left unwritten) is refused by commit and
-     * taken as the identity the same way. */
+    /* A partial write (one head left unwritten) is refused by commit and
+     * taken as the identity the same way -- but the accelerator already wrote
+     * the state in place, so the refusal zeroes all four recurrent tensors. */
     stub.mode = 2;
     CHECK(dfn2_model_run_frame(&model, p) == 0);
     CHECK(stub.calls == 3);
@@ -920,8 +949,11 @@ static int case_model_run(void) {
     CHECK(valid == 1);
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[4], in_im[4]) == 1);
     snapshot_state(p, enc0, erb0, df0, convp0);
-    CHECK(identical(enc0, enc1, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
-    CHECK(identical(convp0, convp1, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS));
+    CHECK(all_zero(enc0, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
+    CHECK(all_zero(erb0, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS));
+    CHECK(all_zero(df0, DFN2_PREPOST_DF_HIDDEN_ELEMENTS));
+    CHECK(all_zero(convp0, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS));
+    CHECK(!identical(enc0, enc1, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
     CHECK(dfn2_prepost_frame_skip(p) == 0);
 
     /* A model that always refuses is exactly the all-skip stream. */
@@ -1289,6 +1321,10 @@ static int case_skip(void) {
     static float snap_convp[DFN2_PREPOST_CONVP_HISTORY_ELEMENTS];
     static float snap_erb_window[DFN2_PREPOST_ERB_WINDOW_ELEMENTS];
     static float snap_spec_window[DFN2_PREPOST_SPEC_WINDOW_ELEMENTS];
+    static float wrote_encoder[DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS];
+    static float wrote_erb[DFN2_PREPOST_ERB_HIDDEN_ELEMENTS];
+    static float wrote_df[DFN2_PREPOST_DF_HIDDEN_ELEMENTS];
+    static float wrote_convp[DFN2_PREPOST_CONVP_HISTORY_ELEMENTS];
     DFN2PrepostConfig cfg;
     DFN2PrepostMemReq req;
     DFN2PrepostInputs inputs;
@@ -1349,7 +1385,9 @@ static int case_skip(void) {
     /* Snapshot, then skip even though the accelerator produced a COMPLETE,
      * perfectly committable result.  The full write is the point: skipping
      * after a partial write would prove nothing, because commit() would
-     * refuse that frame on its own. */
+     * refuse that frame on its own.  The accelerator writes the recurrent
+     * state in place, so the skip cannot roll it back: it keeps what the
+     * accelerator wrote. */
     ++t;
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
@@ -1366,6 +1404,19 @@ static int case_skip(void) {
     CHECK(any_nonzero(snap_df, DFN2_PREPOST_DF_HIDDEN_ELEMENTS));
     CHECK(any_nonzero(snap_convp, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS));
     fake_run(&inputs, &outputs);
+    CHECK(state_aliased(&inputs, &outputs));
+    memcpy(wrote_encoder, &inputs.encoder_gru_hidden[0][0],
+           sizeof wrote_encoder);
+    memcpy(wrote_erb, &inputs.erb_gru_hidden[0][0], sizeof wrote_erb);
+    memcpy(wrote_df, &inputs.df_gru_hidden[0][0], sizeof wrote_df);
+    memcpy(wrote_convp, &inputs.df_convp_history[0][0][0], sizeof wrote_convp);
+    /* The in-place write moved every state tensor off the snapshot. */
+    CHECK(!identical(wrote_encoder, snap_encoder,
+                     DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
+    CHECK(!identical(wrote_erb, snap_erb, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS));
+    CHECK(!identical(wrote_df, snap_df, DFN2_PREPOST_DF_HIDDEN_ELEMENTS));
+    CHECK(!identical(wrote_convp, snap_convp,
+                     DFN2_PREPOST_CONVP_HISTORY_ELEMENTS));
     CHECK(dfn2_prepost_frame_skip(p) == 0);
     CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
     /* This hop's emission is NOT the identity, and asserting the difference
@@ -1376,23 +1427,44 @@ static int case_skip(void) {
     CHECK(!identical(got_re, in_re[t - LOOKAHEAD], DFN2_N_BINS));
     CHECK(!identical(got_im, in_im[t - LOOKAHEAD], DFN2_N_BINS));
 
-    /* The four recurrent tensors are frozen; the two feature windows are
-     * NOT -- they are the framing clock and must still have slid. */
+    /* The skip left the four recurrent tensors exactly as the accelerator
+     * wrote them -- not restored to the snapshot, not zeroed -- while the two
+     * feature windows are the framing clock and must still have slid. */
     ++t;
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
-    CHECK(identical(&inputs.encoder_gru_hidden[0][0], snap_encoder,
+    CHECK(identical(&inputs.encoder_gru_hidden[0][0], wrote_encoder,
                     inputs.encoder_gru_hidden_elements));
-    CHECK(identical(&inputs.erb_gru_hidden[0][0], snap_erb,
+    CHECK(identical(&inputs.erb_gru_hidden[0][0], wrote_erb,
                     inputs.erb_gru_hidden_elements));
-    CHECK(identical(&inputs.df_gru_hidden[0][0], snap_df,
+    CHECK(identical(&inputs.df_gru_hidden[0][0], wrote_df,
                     inputs.df_gru_hidden_elements));
-    CHECK(identical(&inputs.df_convp_history[0][0][0], snap_convp,
+    CHECK(identical(&inputs.df_convp_history[0][0][0], wrote_convp,
                     inputs.df_convp_history_elements));
+    CHECK(!identical(&inputs.encoder_gru_hidden[0][0], snap_encoder,
+                     inputs.encoder_gru_hidden_elements));
+    CHECK(!identical(&inputs.df_convp_history[0][0][0], snap_convp,
+                     inputs.df_convp_history_elements));
     CHECK(!identical(&inputs.erb_window[0][0], snap_erb_window,
                      inputs.erb_window_elements));
     CHECK(!identical(&inputs.spec_window[0][0][0], snap_spec_window,
                      inputs.spec_window_elements));
+
+    /* A skip over a frame on which the accelerator never ran writes nothing,
+     * so the state stays frozen exactly as it is. */
+    CHECK(dfn2_prepost_frame_skip(p) == 0);
+    CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, NULL) == 0);
+    ++t;
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
+    CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
+    CHECK(identical(&inputs.encoder_gru_hidden[0][0], wrote_encoder,
+                    inputs.encoder_gru_hidden_elements));
+    CHECK(identical(&inputs.erb_gru_hidden[0][0], wrote_erb,
+                    inputs.erb_gru_hidden_elements));
+    CHECK(identical(&inputs.df_gru_hidden[0][0], wrote_df,
+                    inputs.df_gru_hidden_elements));
+    CHECK(identical(&inputs.df_convp_history[0][0][0], wrote_convp,
+                    inputs.df_convp_history_elements));
 
     /* ...and a commit here DOES move them, so the freeze above is not
      * measuring a constant. */
@@ -1402,13 +1474,13 @@ static int case_skip(void) {
     ++t;
     CHECK(dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]) == 1);
     CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
-    CHECK(!identical(&inputs.encoder_gru_hidden[0][0], snap_encoder,
+    CHECK(!identical(&inputs.encoder_gru_hidden[0][0], wrote_encoder,
                      inputs.encoder_gru_hidden_elements));
-    CHECK(!identical(&inputs.erb_gru_hidden[0][0], snap_erb,
+    CHECK(!identical(&inputs.erb_gru_hidden[0][0], wrote_erb,
                      inputs.erb_gru_hidden_elements));
-    CHECK(!identical(&inputs.df_gru_hidden[0][0], snap_df,
+    CHECK(!identical(&inputs.df_gru_hidden[0][0], wrote_df,
                      inputs.df_gru_hidden_elements));
-    CHECK(!identical(&inputs.df_convp_history[0][0][0], snap_convp,
+    CHECK(!identical(&inputs.df_convp_history[0][0][0], wrote_convp,
                      inputs.df_convp_history_elements));
     CHECK(dfn2_prepost_frame_skip(p) == 0);
 
@@ -1510,7 +1582,12 @@ static int case_guard(FftHandle *fft) {
         CHECK(dfn2_prepost_frame_commit(pt) == -1);
     }
     CHECK(dfn2_prepost_frame_inputs(pt, &inputs, &outputs) == 0);
-    CHECK(outputs_all_nan(&outputs));
+    /* The fresh frame_inputs NaN-refills the heads only. The state is the
+     * accelerator's input, so it is not prefilled: the refused commit left it
+     * zero, and it is the same memory as the outputs' state tensors. */
+    CHECK(heads_all_nan(&outputs));
+    CHECK(state_aliased(&inputs, &outputs));
+    CHECK(state_all_zero(&inputs));
     fake_run(&inputs, &outputs);
     CHECK(dfn2_prepost_frame_commit(pt) == 0);
 
@@ -1531,9 +1608,11 @@ static int case_guard(FftHandle *fft) {
 
 /* ---- txn: on failure NOTHING moves, the frame stays open ------------- */
 
-/* Reference stream: at hop TXN_PRE either a plain frame_skip (never running
- * the accelerator) or an ordinary commit of the un-poisoned result. */
-static int txn_reference(DFN2Prepost *p, float *out, int commit_at_k) {
+/* Reference stream. At hop TXN_PRE: mode 0 is a plain frame_skip (the
+ * accelerator never runs), mode 1 an ordinary commit of the un-poisoned
+ * result, mode 2 an accelerator run whose state is then zeroed by hand and the
+ * frame taken with frame_skip -- the stream a refused commit must reproduce. */
+static int txn_reference(DFN2Prepost *p, float *out, int mode) {
     int hop;
     for (hop = 0; hop < TXN_HOPS; ++hop) {
         DFN2PrepostInputs inputs;
@@ -1542,7 +1621,20 @@ static int txn_reference(DFN2Prepost *p, float *out, int commit_at_k) {
             p, pcm_in + (size_t)hop * DFN2_HOP_LEN);
         if (n != (hop == 0 ? 0 : 1)) return -1;
         if (n == 1) {
-            if (hop == TXN_PRE && !commit_at_k) {
+            if (hop == TXN_PRE && mode != 1) {
+                if (mode == 2) {
+                    if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0)
+                        return -1;
+                    fake_run(&inputs, &outputs);
+                    memset(&outputs.encoder_gru_hidden_next[0][0], 0,
+                           outputs.encoder_gru_hidden_elements * sizeof(float));
+                    memset(&outputs.erb_gru_hidden_next[0][0], 0,
+                           outputs.erb_gru_hidden_elements * sizeof(float));
+                    memset(&outputs.df_gru_hidden_next[0][0], 0,
+                           outputs.df_gru_hidden_elements * sizeof(float));
+                    memset(&outputs.df_convp_history_next[0][0][0], 0,
+                           outputs.df_convp_history_elements * sizeof(float));
+                }
                 if (dfn2_prepost_frame_skip(p) != 0) return -1;
             } else {
                 if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0)
@@ -1558,10 +1650,6 @@ static int txn_reference(DFN2Prepost *p, float *out, int commit_at_k) {
 }
 
 static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
-    static float snap_encoder[DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS];
-    static float snap_erb[DFN2_PREPOST_ERB_HIDDEN_ELEMENTS];
-    static float snap_df[DFN2_PREPOST_DF_HIDDEN_ELEMENTS];
-    static float snap_convp[DFN2_PREPOST_CONVP_HISTORY_ELEMENTS];
     static float snap_erb_window[DFN2_PREPOST_ERB_WINDOW_ELEMENTS];
     static float snap_spec_window[DFN2_PREPOST_SPEC_WINDOW_ELEMENTS];
     static float hop_scratch[DFN2_HOP_LEN];
@@ -1577,12 +1665,6 @@ static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
             float *target;
             size_t count = 0;
             CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
-            memcpy(snap_encoder, &inputs.encoder_gru_hidden[0][0],
-                   sizeof snap_encoder);
-            memcpy(snap_erb, &inputs.erb_gru_hidden[0][0], sizeof snap_erb);
-            memcpy(snap_df, &inputs.df_gru_hidden[0][0], sizeof snap_df);
-            memcpy(snap_convp, &inputs.df_convp_history[0][0][0],
-                   sizeof snap_convp);
             memcpy(snap_erb_window, &inputs.erb_window[0][0],
                    sizeof snap_erb_window);
             memcpy(snap_spec_window, &inputs.spec_window[0][0][0],
@@ -1597,16 +1679,13 @@ static int txn_poisoned(DFN2Prepost *p, float *out, int tensor, size_t index) {
             CHECK(dfn2_prepost_post_process(p, hop_scratch, NULL) == -1);
             CHECK(dfn2_prepost_pre_process(
                       p, pcm_in + (size_t)hop * DFN2_HOP_LEN) == -1);
-            /* (b) nothing persistent moved: the same views come back. */
+            /* (b) the accelerator overwrote the state in place, so the
+             * refusal cannot restore it: all four recurrent tensors are zero
+             * whichever of the seven outputs was poisoned. The feature
+             * windows are CPU-owned and unchanged. */
             CHECK(dfn2_prepost_frame_inputs(p, &inputs, &outputs) == 0);
-            CHECK(identical(&inputs.encoder_gru_hidden[0][0], snap_encoder,
-                            inputs.encoder_gru_hidden_elements));
-            CHECK(identical(&inputs.erb_gru_hidden[0][0], snap_erb,
-                            inputs.erb_gru_hidden_elements));
-            CHECK(identical(&inputs.df_gru_hidden[0][0], snap_df,
-                            inputs.df_gru_hidden_elements));
-            CHECK(identical(&inputs.df_convp_history[0][0][0], snap_convp,
-                            inputs.df_convp_history_elements));
+            CHECK(state_aliased(&inputs, &outputs));
+            CHECK(state_all_zero(&inputs));
             CHECK(identical(&inputs.erb_window[0][0], snap_erb_window,
                             inputs.erb_window_elements));
             CHECK(identical(&inputs.spec_window[0][0][0], snap_spec_window,
@@ -1643,10 +1722,17 @@ static int case_txn(FftHandle *fft) {
     p = dfn2_prepost_init(pool, (size_t)req.bytes, &cfg);
     CHECK(p != NULL);
     CHECK(txn_reference(p, out_b, 1) == 0);      /* committed at hop K */
-    /* The teeth: the two references must genuinely differ, otherwise
-     * "identical to the skipped run" would be satisfied by anything. */
-    CHECK(any_nonzero(out_a, stream));
+    p = dfn2_prepost_init(pool, (size_t)req.bytes, &cfg);
+    CHECK(p != NULL);
+    CHECK(txn_reference(p, out_d, 2) == 0);      /* zeroed state, skipped */
+    /* The teeth: the three references must genuinely differ, otherwise
+     * "identical to the zeroed-state run" would be satisfied by anything --
+     * in particular, zeroing the state must be observable against a skip
+     * that leaves it. */
+    CHECK(any_nonzero(out_d, stream));
     CHECK(!identical(out_a, out_b, stream));
+    CHECK(!identical(out_d, out_b, stream));
+    CHECK(!identical(out_d, out_a, stream));
 
     for (tensor = 0; tensor < N_OUT_TENSORS; ++tensor) {
         for (which = 0; which < 3; ++which) {
@@ -1672,8 +1758,9 @@ static int case_txn(FftHandle *fft) {
             p = dfn2_prepost_init(pool, (size_t)req.bytes, &cfg);
             CHECK(p != NULL);
             CHECK(txn_poisoned(p, out_c, tensor, index) == 0);
-            CHECK(identical(out_a, out_c, stream));
+            CHECK(identical(out_d, out_c, stream));
             CHECK(!identical(out_b, out_c, stream));
+            CHECK(!identical(out_a, out_c, stream));
         }
     }
 
@@ -1684,6 +1771,571 @@ static int case_txn(FftHandle *fft) {
 }
 
 /* ---------------------------------------------------------------------- */
+
+/* The recurrent state is ONE buffer per tensor: the input view and the
+ * `*_next` view are the same address, on every frame, across commit, a refused
+ * commit, skip and reset, and the accelerator's in-place write is what the
+ * next frame reads. */
+static int case_state_inplace(void) {
+    DFN2PrepostConfig cfg;
+    DFN2Prepost *p;
+    DFN2PrepostInputs in;
+    DFN2PrepostOutputs out;
+    float re[DFN2_N_BINS] = {0}, im[DFN2_N_BINS] = {0};
+    const float *a;
+    int frame;
+    config_freq(&cfg);
+    p = dfn2_prepost_create(&cfg);
+    CHECK(p != NULL);
+    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
+    a = &in.df_convp_history[0][0][0];
+    CHECK(state_aliased(&in, &out));
+    CHECK(in.df_convp_history_elements == out.df_convp_history_elements);
+    CHECK(state_all_zero(&in));
+    fake_run(&in, &out);
+    /* The write through the output view is already visible through the input
+     * view: there is no second copy to commit. */
+    CHECK(any_nonzero(a, in.df_convp_history_elements));
+    CHECK(any_nonzero(&in.encoder_gru_hidden[0][0],
+                      in.encoder_gru_hidden_elements));
+    CHECK(dfn2_prepost_frame_commit(p) == 0);
+    CHECK(any_nonzero(a, in.df_convp_history_elements));
+    for (frame = 0; frame < 3; ++frame) {
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+        CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
+        CHECK(&in.df_convp_history[0][0][0] == a);
+        CHECK(&out.df_convp_history_next[0][0][0] == a);
+        CHECK(state_aliased(&in, &out));
+        if (frame == 0) {
+            /* A refused commit zeroes the state in place; no address moves. */
+            CHECK(dfn2_prepost_frame_commit(p) == -1);
+            CHECK(state_all_zero(&in));
+            CHECK(dfn2_prepost_frame_skip(p) == 0);
+        } else if (frame == 1) {
+            fake_run(&in, &out);
+            CHECK(dfn2_prepost_frame_commit(p) == 0);
+        } else {
+            CHECK(dfn2_prepost_frame_skip(p) == 0);
+        }
+    }
+    dfn2_prepost_reset(p);
+    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+    CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+    CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
+    CHECK(&in.df_convp_history[0][0][0] == a);
+    CHECK(state_aliased(&in, &out));
+    CHECK(state_all_zero(&in));
+    dfn2_prepost_destroy(p);
+    return 0;
+}
+
+/* Mutation gate for the finite check. One NaN injected into one element of one
+ * recurrent tensor THROUGH THE IN-PLACE POINTER must make frame_commit refuse,
+ * leave all four tensors zero, and leave the instance able to run the next
+ * healthy frame. Run for each of the four tensors. */
+static int case_inplace_nan(void) {
+    DFN2PrepostConfig cfg;
+    DFN2Prepost *p;
+    DFN2PrepostInputs in;
+    DFN2PrepostOutputs out;
+    float re[DFN2_N_BINS] = {0}, im[DFN2_N_BINS] = {0};
+    int tensor;
+
+    config_freq(&cfg);
+    for (tensor = 0; tensor < 4; ++tensor) {
+        float *poison;
+        p = dfn2_prepost_create(&cfg);
+        CHECK(p != NULL);
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 0);
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+        /* A healthy frame first, so the state is non-zero going in. */
+        CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
+        fake_run(&in, &out);
+        CHECK(dfn2_prepost_frame_commit(p) == 0);
+        CHECK(!state_all_zero(&in));
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+        CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
+        fake_run(&in, &out);
+        switch (tensor) {
+        case 0: poison = &out.encoder_gru_hidden_next[0][3]; break;
+        case 1: poison = &out.erb_gru_hidden_next[1][DFN2_MODEL_GRU_HIDDEN - 1];
+                break;
+        case 2: poison = &out.df_gru_hidden_next[1][0]; break;
+        default: poison = &out.df_convp_history_next
+                       [DFN2_MODEL_ENCODER_CHANNELS - 1]
+                       [DFN2_MODEL_DF_PATHWAY_HISTORY - 1]
+                       [DFN2_DF_BINS - 1];
+                 break;
+        }
+        CHECK(isfinite(*poison));
+        *poison = (float)NAN;
+        CHECK(dfn2_prepost_frame_commit(p) == -1);
+        CHECK(state_all_zero(&in));
+        /* Zeroed through the same memory the accelerator wrote. */
+        CHECK(*poison == 0.0f);
+        /* The frame is still open, and the next healthy frame works. */
+        CHECK(dfn2_prepost_frame_skip(p) == 0);
+        CHECK(dfn2_prepost_pre_process_freq(p, re, im) == 1);
+        CHECK(dfn2_prepost_frame_inputs(p, &in, &out) == 0);
+        CHECK(state_all_zero(&in));
+        fake_run(&in, &out);
+        CHECK(dfn2_prepost_frame_commit(p) == 0);
+        CHECK(!state_all_zero(&in));
+        dfn2_prepost_destroy(p);
+    }
+    return 0;
+}
+
+/* ---- copy path: the runtime's own tensors + dfn2_prepost_outputs_inherit - */
+
+/* A runtime that owns its output tensors: its own addresses, never the
+ * pool's. */
+typedef struct {
+    float erb_mask[DFN2_PREPOST_ERB_MASK_ELEMENTS];
+    float coefs[DFN2_PREPOST_COEFS_ELEMENTS];
+    float alpha[DFN2_PREPOST_ALPHA_ELEMENTS];
+    float encoder[DFN2_MODEL_ENCODER_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN];
+    float erb[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN];
+    float df[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN];
+    float convp[DFN2_MODEL_ENCODER_CHANNELS][DFN2_MODEL_DF_PATHWAY_HISTORY]
+               [DFN2_DF_BINS];
+} OwnOutputs;
+
+static OwnOutputs own_outputs;
+
+#define SNAP_MAX (DFN2_PREPOST_ERB_MASK_ELEMENTS +                       \
+                  DFN2_PREPOST_COEFS_ELEMENTS +                          \
+                  DFN2_PREPOST_ALPHA_ELEMENTS +                          \
+                  DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS +                 \
+                  DFN2_PREPOST_ERB_HIDDEN_ELEMENTS +                     \
+                  DFN2_PREPOST_DF_HIDDEN_ELEMENTS +                      \
+                  DFN2_PREPOST_CONVP_HISTORY_ELEMENTS)
+
+/* Bind a runtime's view to its own tensors, with the pool's element counts. */
+static void own_bind(OwnOutputs *own, const DFN2PrepostOutputs *shape,
+                     DFN2PrepostOutputs *runtime) {
+    *runtime = *shape;
+    runtime->erb_mask = own->erb_mask;
+    runtime->coefs = own->coefs;
+    runtime->alpha = own->alpha;
+    runtime->encoder_gru_hidden_next = own->encoder;
+    runtime->erb_gru_hidden_next = own->erb;
+    runtime->df_gru_hidden_next = own->df;
+    runtime->df_convp_history_next = own->convp;
+}
+
+/* The seven pool tensors, byte for byte (the heads are NaN-prefilled, so the
+ * comparison is bitwise). */
+static size_t snap_outputs(DFN2PrepostOutputs *out, float *dst) {
+    size_t total = 0, count = 0;
+    int which;
+    for (which = 0; which < N_OUT_TENSORS; ++which) {
+        float *tensor = output_tensor(out, which, &count);
+        memcpy(dst + total, tensor, count * sizeof(float));
+        total += count;
+    }
+    return total;
+}
+
+static int outputs_unchanged(DFN2PrepostOutputs *out, const float *before,
+                             size_t total) {
+    static float now[SNAP_MAX];
+    return snap_outputs(out, now) == total &&
+           memcmp(now, before, total * sizeof(float)) == 0;
+}
+
+/* The pool's state tensors equal the runtime's own. */
+static int pool_state_is_own(const DFN2PrepostInputs *in,
+                             const OwnOutputs *own) {
+    return identical(&in->encoder_gru_hidden[0][0], &own->encoder[0][0],
+                     in->encoder_gru_hidden_elements) &&
+           identical(&in->erb_gru_hidden[0][0], &own->erb[0][0],
+                     in->erb_gru_hidden_elements) &&
+           identical(&in->df_gru_hidden[0][0], &own->df[0][0],
+                     in->df_gru_hidden_elements) &&
+           identical(&in->df_convp_history[0][0][0], &own->convp[0][0][0],
+                     in->df_convp_history_elements);
+}
+
+/* The canonical loop on the copy path: the accelerator stand-in writes its
+ * own tensors, inherit hands them to the pool, commit follows. */
+static int drive_time_copy(DFN2Prepost *p, const float *in, float *out,
+                           int hops) {
+    int hop;
+    for (hop = 0; hop < hops; ++hop) {
+        DFN2PrepostInputs inputs;
+        DFN2PrepostOutputs outputs, runtime;
+        int n = dfn2_prepost_pre_process(p, in + (size_t)hop * DFN2_HOP_LEN);
+        if (n != (hop == 0 ? 0 : 1)) return -1;
+        if (n == 1) {
+            if (dfn2_prepost_frame_inputs(p, &inputs, &outputs) != 0)
+                return -1;
+            own_bind(&own_outputs, &outputs, &runtime);
+            if (state_aliased(&inputs, &runtime)) return -1;
+            if (runtime.erb_mask == outputs.erb_mask) return -1;
+            fake_run(&inputs, &runtime);
+            if (dfn2_prepost_outputs_inherit(&outputs, &runtime) != 0)
+                return -1;
+            if (!pool_state_is_own(&inputs, &own_outputs)) return -1;
+            if (dfn2_prepost_frame_commit(p) != 0) return -1;
+        }
+        if (dfn2_prepost_post_process(p, out + (size_t)hop * DFN2_HOP_LEN,
+                                      NULL) != 0) return -1;
+    }
+    return 0;
+}
+
+static int separate_buffers_once(FftHandle *fft, float atten_lim_db) {
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req;
+    DFN2Prepost *in_place, *copy;
+    void *pool_a, *pool_b;
+
+    config_time(&cfg, fft);
+    cfg.atten_lim_db = atten_lim_db;
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    pool_a = alloc_aligned(req.alignment, (size_t)req.bytes);
+    pool_b = alloc_aligned(req.alignment, (size_t)req.bytes);
+    CHECK(pool_a != NULL && pool_b != NULL);
+    in_place = dfn2_prepost_init_ex(pool_a, (size_t)req.bytes, &cfg, &req);
+    copy = dfn2_prepost_init_ex(pool_b, (size_t)req.bytes, &cfg, &req);
+    CHECK(in_place != NULL && copy != NULL);
+
+    CHECK(drive_time(in_place, pcm_in, out_c, HOPS) == 0);
+    CHECK(drive_time_copy(copy, pcm_in, out_d, HOPS) == 0);
+    /* Same compare as equiv: not silence, not a constant, then byte-identity
+     * of the whole stream. */
+    CHECK(any_nonzero(out_c, (size_t)HOPS * DFN2_HOP_LEN));
+    CHECK(!identical(out_c, out_d + 1, (size_t)HOPS * DFN2_HOP_LEN - 1));
+    CHECK(identical(out_c, out_d, (size_t)HOPS * DFN2_HOP_LEN));
+    printf("separate_buffers: atten_lim_db=%.1f bit-identical over %d hops\n",
+           (double)atten_lim_db, HOPS);
+
+    dfn2_prepost_destroy(in_place);
+    dfn2_prepost_destroy(copy);
+    free(pool_a);
+    free(pool_b);
+    return 0;
+}
+
+static int case_separate_buffers(FftHandle *fft) {
+    if (separate_buffers_once(fft, 0.0f) != 0) return 1;
+    if (separate_buffers_once(fft, -20.0f) != 0) return 1;
+    return 0;
+}
+
+/* Open a freq-mode instance with one frame published and the pool state
+ * non-zero: one healthy committed frame on the copy path, then the next frame
+ * opened. Leaves `*t` at the next spectrum index. */
+static int open_second_frame(DFN2Prepost **pp, DFN2PrepostInputs *in,
+                             DFN2PrepostOutputs *out, int *t) {
+    static float re[DFN2_N_BINS], im[DFN2_N_BINS];
+    DFN2PrepostConfig cfg;
+    DFN2PrepostOutputs runtime;
+    DFN2Prepost *p;
+    config_freq(&cfg);
+    p = dfn2_prepost_create(&cfg);
+    if (!p) return -1;
+    frame_spectrum(0, re, im);
+    if (dfn2_prepost_pre_process_freq(p, re, im) != 0) return -1;
+    frame_spectrum(1, re, im);
+    if (dfn2_prepost_pre_process_freq(p, re, im) != 1) return -1;
+    if (dfn2_prepost_frame_inputs(p, in, out) != 0) return -1;
+    own_bind(&own_outputs, out, &runtime);
+    fake_run(in, &runtime);
+    if (dfn2_prepost_outputs_inherit(out, &runtime) != 0) return -1;
+    if (dfn2_prepost_frame_commit(p) != 0) return -1;
+    frame_spectrum(2, re, im);
+    if (dfn2_prepost_pre_process_freq(p, re, im) != 1) return -1;
+    if (dfn2_prepost_frame_inputs(p, in, out) != 0) return -1;
+    *t = 3;
+    *pp = p;
+    return 0;
+}
+
+static int next_frame(DFN2Prepost *p, int t, DFN2PrepostInputs *in,
+                      DFN2PrepostOutputs *out) {
+    static float re[DFN2_N_BINS], im[DFN2_N_BINS];
+    frame_spectrum(t, re, im);
+    if (dfn2_prepost_pre_process_freq(p, re, im) != 1) return -1;
+    return dfn2_prepost_frame_inputs(p, in, out);
+}
+
+/* inherit with every runtime tensor at the destination's own address is a
+ * no-op that returns 0 (and never calls memcpy with source == destination);
+ * a mixed binding copies only the tensors that moved, and a value written in
+ * place is frame_commit()'s to find, not inherit's. */
+static int case_inherit_aliased(void) {
+    static float before[SNAP_MAX];
+    DFN2Prepost *p;
+    DFN2PrepostInputs in;
+    DFN2PrepostOutputs out, runtime;
+    size_t total;
+    int t;
+
+    CHECK(open_second_frame(&p, &in, &out, &t) == 0);
+    CHECK(state_all_zero(&in) == 0);
+    fake_run(&in, &out);                 /* the in-place binding */
+    total = snap_outputs(&out, before);
+    CHECK(total == SNAP_MAX);
+    CHECK(dfn2_prepost_outputs_inherit(&out, &out) == 0);
+    CHECK(outputs_unchanged(&out, before, total));
+    runtime = out;
+    CHECK(dfn2_prepost_outputs_inherit(&out, &runtime) == 0);
+    CHECK(outputs_unchanged(&out, before, total));
+    CHECK(dfn2_prepost_frame_commit(p) == 0);
+
+    /* Heads in the runtime's own buffers, state written in place. */
+    CHECK(next_frame(p, t++, &in, &out) == 0);
+    runtime = out;
+    runtime.erb_mask = own_outputs.erb_mask;
+    runtime.coefs = own_outputs.coefs;
+    runtime.alpha = own_outputs.alpha;
+    fake_run(&in, &runtime);
+    CHECK(heads_all_nan(&out));
+    CHECK(dfn2_prepost_outputs_inherit(&out, &runtime) == 0);
+    CHECK(identical(out.erb_mask, own_outputs.erb_mask,
+                    out.erb_mask_elements));
+    CHECK(identical(out.coefs, own_outputs.coefs, out.coefs_elements));
+    CHECK(identical(out.alpha, own_outputs.alpha, out.alpha_elements));
+    CHECK(dfn2_prepost_frame_commit(p) == 0);
+
+    /* A NaN in a tensor written in place is not inherit's to check:
+     * frame_commit() refuses it and zeroes the state. */
+    CHECK(next_frame(p, t++, &in, &out) == 0);
+    runtime = out;
+    runtime.erb_mask = own_outputs.erb_mask;
+    runtime.coefs = own_outputs.coefs;
+    runtime.alpha = own_outputs.alpha;
+    fake_run(&in, &runtime);
+    out.df_gru_hidden_next[1][2] = (float)NAN;
+    CHECK(dfn2_prepost_outputs_inherit(&out, &runtime) == 0);
+    CHECK(dfn2_prepost_frame_commit(p) == -1);
+    CHECK(state_all_zero(&in));
+    CHECK(dfn2_prepost_frame_skip(p) == 0);
+    dfn2_prepost_destroy(p);
+    printf("inherit_aliased: no-op, mixed binding, in-place NaN left to commit\n");
+    return 0;
+}
+
+/* One non-finite element in ANY one of the runtime's seven tensors makes
+ * inherit refuse and copy nothing -- including the tensors that precede it --
+ * leaving the pool byte-identical; the caller takes frame_skip() and the next
+ * healthy frame goes through. */
+static int case_inherit_refused(void) {
+    static float before[SNAP_MAX];
+    static float state_before[DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS];
+    int which, where, kind;
+    int cases = 0;
+
+    for (which = 0; which < N_OUT_TENSORS; ++which) {
+        for (where = 0; where < 2; ++where) {
+            for (kind = 0; kind < 2; ++kind) {
+                DFN2Prepost *p;
+                DFN2PrepostInputs in;
+                DFN2PrepostOutputs out, runtime;
+                size_t total;
+                int t;
+
+                CHECK(open_second_frame(&p, &in, &out, &t) == 0);
+                own_bind(&own_outputs, &out, &runtime);
+                fake_run(&in, &runtime);
+                {
+                    size_t count = 0;
+                    float *tensor = output_tensor(&runtime, which, &count);
+                    tensor[where == 0 ? 0 : count - 1] =
+                        kind == 0 ? (float)NAN : -(float)INFINITY;
+                }
+                total = snap_outputs(&out, before);
+                CHECK(heads_all_nan(&out));
+                CHECK(!state_all_zero(&in));
+                memcpy(state_before, &in.encoder_gru_hidden[0][0],
+                       sizeof state_before);
+
+                CHECK(dfn2_prepost_outputs_inherit(&out, &runtime) == -1);
+                CHECK(outputs_unchanged(&out, before, total));
+                /* The state is intact, not zeroed: the run is the caller's to
+                 * report as failed. */
+                CHECK(!state_all_zero(&in));
+                CHECK(dfn2_prepost_frame_skip(p) == 0);
+
+                CHECK(next_frame(p, t++, &in, &out) == 0);
+                CHECK(identical(&in.encoder_gru_hidden[0][0], state_before,
+                                in.encoder_gru_hidden_elements));
+                own_bind(&own_outputs, &out, &runtime);
+                fake_run(&in, &runtime);
+                CHECK(dfn2_prepost_outputs_inherit(&out, &runtime) == 0);
+                CHECK(dfn2_prepost_frame_commit(p) == 0);
+                CHECK(pool_state_is_own(&in, &own_outputs));
+                CHECK(!identical(&in.encoder_gru_hidden[0][0], state_before,
+                                 in.encoder_gru_hidden_elements));
+                dfn2_prepost_destroy(p);
+                ++cases;
+            }
+        }
+    }
+    printf("inherit_refused: %d poisoned runs, pool untouched each time\n",
+           cases);
+    return 0;
+}
+
+static void null_tensor(DFN2PrepostOutputs *out, int which) {
+    switch (which) {
+    case 0: out->erb_mask = NULL; break;
+    case 1: out->coefs = NULL; break;
+    case 2: out->alpha = NULL; break;
+    case 3: out->encoder_gru_hidden_next = NULL; break;
+    case 4: out->erb_gru_hidden_next = NULL; break;
+    case 5: out->df_gru_hidden_next = NULL; break;
+    default: out->df_convp_history_next = NULL; break;
+    }
+}
+
+static void resize_tensor(DFN2PrepostOutputs *out, int which, int delta) {
+    size_t *count;
+    switch (which) {
+    case 0: count = &out->erb_mask_elements; break;
+    case 1: count = &out->coefs_elements; break;
+    case 2: count = &out->alpha_elements; break;
+    case 3: count = &out->encoder_gru_hidden_elements; break;
+    case 4: count = &out->erb_gru_hidden_elements; break;
+    case 5: count = &out->df_gru_hidden_elements; break;
+    default: count = &out->df_convp_history_elements; break;
+    }
+    *count = (size_t)((long)*count + delta);
+}
+
+static int case_inherit_guards(void) {
+    static float before[SNAP_MAX];
+    DFN2Prepost *p;
+    DFN2PrepostInputs in;
+    DFN2PrepostOutputs out, runtime, bad;
+    size_t total;
+    int t, which, delta;
+
+    CHECK(open_second_frame(&p, &in, &out, &t) == 0);
+    own_bind(&own_outputs, &out, &runtime);
+    fake_run(&in, &runtime);
+    total = snap_outputs(&out, before);
+    CHECK(dfn2_prepost_outputs_inherit(NULL, &runtime) == -1);
+    CHECK(dfn2_prepost_outputs_inherit(&out, NULL) == -1);
+    CHECK(dfn2_prepost_outputs_inherit(NULL, NULL) == -1);
+    for (which = 0; which < N_OUT_TENSORS; ++which) {
+        bad = runtime;
+        null_tensor(&bad, which);
+        CHECK(dfn2_prepost_outputs_inherit(&out, &bad) == -1);
+        CHECK(outputs_unchanged(&out, before, total));
+        for (delta = -1; delta <= 1; delta += 2) {
+            bad = runtime;
+            resize_tensor(&bad, which, delta);
+            CHECK(dfn2_prepost_outputs_inherit(&out, &bad) == -1);
+            CHECK(outputs_unchanged(&out, before, total));
+        }
+    }
+    /* The healthy view still goes through after all the refusals. */
+    CHECK(dfn2_prepost_outputs_inherit(&out, &runtime) == 0);
+    CHECK(pool_state_is_own(&in, &own_outputs));
+    CHECK(dfn2_prepost_frame_commit(p) == 0);
+    dfn2_prepost_destroy(p);
+    printf("inherit_guards: NULL, NULL tensor and count mismatch refused\n");
+    return 0;
+}
+
+/* The callback boundary on the copy path: an infer() that writes its own
+ * tensors and inherits them gives the stream an in-place infer() gives, and a
+ * refused inherit is an infer() failure that leaves the state intact. */
+typedef struct { int poison; int calls; } CopyStub;
+
+static int copy_stub_infer(void *user, const DFN2PrepostInputs *in,
+                           DFN2PrepostOutputs *out) {
+    CopyStub *m = (CopyStub *)user;
+    DFN2PrepostOutputs runtime;
+    ++m->calls;
+    own_bind(&own_outputs, out, &runtime);
+    fake_run(in, &runtime);
+    if (m->poison) own_outputs.erb[1][7] = (float)NAN;
+    return dfn2_prepost_outputs_inherit(out, &runtime) == 0 ? 0 : -1;
+}
+
+static int case_copy_model_run(void) {
+    static float in_re[SHORT_HOPS][DFN2_N_BINS];
+    static float in_im[SHORT_HOPS][DFN2_N_BINS];
+    static float got_re[DFN2_N_BINS], got_im[DFN2_N_BINS];
+    static float ref_re[DFN2_N_BINS], ref_im[DFN2_N_BINS];
+    static float enc0[DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS];
+    static float erb0[DFN2_PREPOST_ERB_HIDDEN_ELEMENTS];
+    static float df0[DFN2_PREPOST_DF_HIDDEN_ELEMENTS];
+    static float convp0[DFN2_PREPOST_CONVP_HISTORY_ELEMENTS];
+    static float enc1[DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS];
+    static float erb1[DFN2_PREPOST_ERB_HIDDEN_ELEMENTS];
+    static float df1[DFN2_PREPOST_DF_HIDDEN_ELEMENTS];
+    static float convp1[DFN2_PREPOST_CONVP_HISTORY_ELEMENTS];
+    DFN2PrepostConfig cfg;
+    DFN2PrepostMemReq req;
+    DFN2Prepost *p, *q;
+    void *pool_p, *pool_q;
+    CopyStub copy_stub = {0, 0};
+    StubModel in_place_stub = {0, 0, 0};
+    DFN2Model copy_model, in_place_model;
+    int t;
+
+    config_freq(&cfg);
+    CHECK(dfn2_prepost_get_mem_size(&cfg, &req) == 0);
+    pool_p = alloc_aligned(req.alignment, (size_t)req.bytes);
+    pool_q = alloc_aligned(req.alignment, (size_t)req.bytes);
+    CHECK(pool_p != NULL && pool_q != NULL);
+    p = dfn2_prepost_init(pool_p, (size_t)req.bytes, &cfg);
+    q = dfn2_prepost_init(pool_q, (size_t)req.bytes, &cfg);
+    CHECK(p != NULL && q != NULL);
+    for (t = 0; t < SHORT_HOPS; ++t) frame_spectrum(t, in_re[t], in_im[t]);
+    memset(&copy_model, 0, sizeof copy_model);
+    copy_model.user = &copy_stub;
+    copy_model.infer = copy_stub_infer;
+    in_place_model = copy_model;
+    in_place_model.user = &in_place_stub;
+    in_place_model.infer = stub_infer;
+
+    for (t = 0; t < SHORT_HOPS; ++t) {
+        int np, nq, vp = -1, vq = -1;
+        np = dfn2_prepost_pre_process_freq(p, in_re[t], in_im[t]);
+        nq = dfn2_prepost_pre_process_freq(q, in_re[t], in_im[t]);
+        CHECK(np == nq);
+        if (np == 1) {
+            CHECK(dfn2_model_run_frame(&copy_model, p) == 1);
+            CHECK(dfn2_model_run_frame(&in_place_model, q) == 1);
+        }
+        CHECK(dfn2_prepost_post_process_freq(p, got_re, got_im, &vp) == 0);
+        CHECK(dfn2_prepost_post_process_freq(q, ref_re, ref_im, &vq) == 0);
+        CHECK(vp == vq);
+        CHECK(identical(got_re, ref_re, DFN2_N_BINS));
+        CHECK(identical(got_im, ref_im, DFN2_N_BINS));
+    }
+    CHECK(any_nonzero(got_re, DFN2_N_BINS));
+
+    /* A refused inherit: infer() fails, the frame is the identity, and the
+     * state is exactly what it was -- not zeroed. */
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[0], in_im[0]) == 1);
+    snapshot_state(p, enc0, erb0, df0, convp0);
+    CHECK(!all_zero(enc0, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
+    copy_stub.poison = 1;
+    CHECK(dfn2_model_run_frame(&copy_model, p) == 0);
+    CHECK(dfn2_prepost_pre_process_freq(p, in_re[1], in_im[1]) == 1);
+    snapshot_state(p, enc1, erb1, df1, convp1);
+    CHECK(identical(enc0, enc1, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS));
+    CHECK(identical(erb0, erb1, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS));
+    CHECK(identical(df0, df1, DFN2_PREPOST_DF_HIDDEN_ELEMENTS));
+    CHECK(identical(convp0, convp1, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS));
+    CHECK(dfn2_prepost_frame_skip(p) == 0);
+    printf("copy_model_run: %d infer calls, stream identical to in-place\n",
+           copy_stub.calls);
+    dfn2_prepost_destroy(p);
+    dfn2_prepost_destroy(q);
+    free(pool_p);
+    free(pool_q);
+    return 0;
+}
 
 int main(int argc, char **argv) {
     void *fft_mem = NULL;
@@ -1719,6 +2371,18 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "dual_guards") == 0)   status = case_dual_guards(fft);
     else if (strcmp(argv[1], "model_run") == 0)     status = case_model_run();
     else if (strcmp(argv[1], "descriptor") == 0)    status = case_descriptor();
+    else if (strcmp(argv[1], "state_inplace") == 0) status = case_state_inplace();
+    else if (strcmp(argv[1], "inplace_nan") == 0)   status = case_inplace_nan();
+    else if (strcmp(argv[1], "separate_buffers") == 0)
+        status = case_separate_buffers(fft);
+    else if (strcmp(argv[1], "inherit_aliased") == 0)
+        status = case_inherit_aliased();
+    else if (strcmp(argv[1], "inherit_refused") == 0)
+        status = case_inherit_refused();
+    else if (strcmp(argv[1], "inherit_guards") == 0)
+        status = case_inherit_guards();
+    else if (strcmp(argv[1], "copy_model_run") == 0)
+        status = case_copy_model_run();
     else {
         fprintf(stderr, "unknown case: %s\n", argv[1]);
         status = 2;
@@ -1833,10 +2497,12 @@ def test_reset_clears_state(driver):
 
 def test_frame_skip_is_exact_identity_and_freezes_the_state(driver):
     """Driven entirely on frame_skip, the class is a bit-exact delay line of
-    MASK_LOOKAHEAD + DF_LOOKAHEAD frames. A skip taken over a COMPLETE
-    accelerator result leaves all four recurrent tensors byte-identical while
-    the two feature windows still slide, and a following commit does move
-    them -- so the freeze is not measuring a constant."""
+    MASK_LOOKAHEAD + DF_LOOKAHEAD frames. The state is written in place, so a
+    skip taken over a COMPLETE accelerator result leaves all four recurrent
+    tensors exactly as the accelerator wrote them (neither restored nor
+    zeroed) while the two feature windows still slide; a skip over a frame the
+    accelerator never ran writes nothing; and a following commit does move
+    the state -- so the freeze is not measuring a constant."""
     _run(driver, 'skip')
 
 
@@ -1847,19 +2513,21 @@ def test_frame_state_machine_guards(driver):
     accepted again after it closes; a commit with no frame_inputs behind it
     is refused; a
     commit that failed on a non-finite output disarms the transaction until
-    a fresh frame_inputs NaN-refills every writable element; and frame_skip
-    needs no frame_inputs behind it."""
+    a fresh frame_inputs NaN-refills the three heads (the state is the
+    accelerator's input and is not prefilled); and frame_skip needs no
+    frame_inputs behind it."""
     _run(driver, 'guard')
 
 
-def test_failed_commit_moves_nothing_and_leaves_the_frame_open(driver):
+def test_failed_commit_zeroes_the_state_and_leaves_the_frame_open(driver):
     """Poison one element of one accelerator output tensor and commit: the
-    refusal must leave the frame open, every recurrent tensor and both
-    feature windows byte-identical to a snapshot taken before it, and
-    frame_skip available as the documented recovery -- so the whole 61-hop
-    stream matches a run that plainly skipped that hop, and differs from one
-    that committed it. Swept over all seven output tensors at three
-    indices."""
+    accelerator wrote the recurrent state in place, so the refusal cannot roll
+    it back -- all four recurrent tensors are zero, the two feature windows are
+    byte-identical to a snapshot taken before it, the frame stays open and
+    frame_skip is the documented recovery. The whole 61-hop stream matches a
+    run that zeroed the state by hand and skipped that hop, and differs from
+    one that committed it and from one that skipped without zeroing. Swept
+    over all seven output tensors at three indices."""
     assert 'txn:' in _run(driver, 'txn')
 
 
@@ -1885,16 +2553,18 @@ def test_dual_entry_guards_and_gain_accessor(driver):
     """The dual entry is refused in DFN2_IO_TIME (without opening a frame),
     on any NULL argument and with a frame open; the head bin gain is NULL
     with a frame open and before the first hop that carried heads, and is
-    the unit gain after a frame_skip; the carve version is 2."""
+    the unit gain after a frame_skip; the carve version is 4."""
     _run(driver, 'dual_guards')
 
 
 def test_model_run_frame_commits_or_takes_the_identity(driver):
     """dfn2_model_run_frame: contract errors (-1) for no open frame, a NULL
     model/instance or no infer callback; a full write returns 1 and steps the
-    recurrent state; a refused inference or a partial write returns 0, leaves
-    every recurrent tensor byte-identical and still emits; a model that
-    always refuses is exactly the all-frame_skip stream."""
+    recurrent state; a refused inference (nothing written) returns 0, leaves
+    every recurrent tensor byte-identical and still emits; a partial write
+    (state written in place, one head unwritten) returns 0 with all four
+    recurrent tensors zeroed and still emits; a model that always refuses is
+    exactly the all-frame_skip stream."""
     assert 'model_run:' in _run(driver, 'model_run')
 
 
@@ -1903,3 +2573,55 @@ def test_model_io_descriptor_default_validates_and_every_field_is_checked(driver
     fields is refused, so a field added to the struct but omitted from
     validate cannot pass."""
     _run(driver, 'descriptor')
+
+
+def test_recurrent_state_is_one_buffer_updated_in_place(driver):
+    """The input and `*_next` views of each recurrent tensor are the same
+    address on every frame -- across commit, a refused commit, skip and reset
+    -- and the accelerator's in-place write is what the next frame reads."""
+    _run(driver, 'state_inplace')
+
+
+def test_nan_through_the_in_place_pointer_is_refused_and_zeroes_the_state(driver):
+    """Mutation gate for the finite check: one NaN written into one element of
+    each recurrent tensor through the in-place pointer makes frame_commit
+    return -1 and leaves all four tensors zero, and the next healthy frame
+    commits. Weakening the finite check makes this case fail."""
+    _run(driver, 'inplace_nan')
+
+
+def test_copy_path_stream_is_bit_identical_to_the_in_place_binding(driver):
+    """The accelerator stand-in writes its own tensors and
+    dfn2_prepost_outputs_inherit() hands them to the pool: the whole IO_TIME
+    stream equals the in-place binding byte for byte, with the attenuation
+    limit off and at -20 dB."""
+    out = _run(driver, 'separate_buffers')
+    assert 'atten_lim_db=0.0' in out and 'atten_lim_db=-20.0' in out
+
+
+def test_inherit_skips_aliased_tensors(driver):
+    """All-aliased inherit is a no-op returning 0 (no memcpy with source ==
+    destination); a mixed binding copies only the tensors that moved; a NaN
+    in an in-place tensor is refused by frame_commit, not by inherit."""
+    _run(driver, 'inherit_aliased')
+
+
+def test_inherit_refuses_non_finite_and_copies_nothing(driver):
+    """A NaN or -Inf at the first or last element of any one of the seven
+    runtime tensors makes inherit return -1 with the pool byte-identical and
+    the state intact; frame_skip then a healthy frame commits.  Dropping the
+    finite check or copying before validating makes this fail."""
+    _run(driver, 'inherit_refused')
+
+
+def test_inherit_guards(driver):
+    """NULL arguments, a NULL runtime tensor and an element-count mismatch
+    (+-1, every tensor) return -1 and leave the pool untouched."""
+    _run(driver, 'inherit_guards')
+
+
+def test_model_run_frame_with_a_copying_runtime(driver):
+    """dfn2_model_run_frame works with an infer() that owns its tensors and
+    inherits them: same stream as the in-place infer(); a refused inherit is a
+    failed run (identity frame) with the state left intact."""
+    _run(driver, 'copy_model_run')

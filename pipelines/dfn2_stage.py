@@ -23,10 +23,13 @@ emit nothing; after the last real frame the caller pushes two all-zero frames
 evaluated on them -- the same tail discipline the C class documents.
 
 Fail-open: a heads callable that raises, or returns a non-finite value in any
-head or next-state tensor, is treated exactly like ``dfn2_prepost_frame_skip``:
+head or next-state tensor, takes the compose path of ``dfn2_prepost_frame_skip``:
 unit ERB mask, zero taps, alpha 0 (an exact identity through the cascade,
-because ``erb_inv`` is a partition of unity), recurrent state NOT stepped,
-framing and compose clocks advanced.
+because ``erb_inv`` is a partition of unity), framing and compose clocks
+advanced.  The recurrent state is NOT stepped here.  In the C class a refused
+inherit on the copy path leaves the state intact, as here; on the in-place path
+a refused commit zeroes it, which this reference, with its separate state input
+and output, does not reproduce.
 
 The compose arithmetic keeps real and imaginary parts as separate float32
 arrays and performs every multiply and add as its own numpy operation, so the
@@ -191,7 +194,8 @@ class Dfn2Heads:
     C binds) and owns the four state tensors the accelerator would carry.
     A call commits the next state only when every head and every next-state
     tensor is finite; otherwise it raises and leaves the state untouched, so
-    the stage's fail-open path sees exactly what ``frame_commit`` refuses.
+    the stage's fail-open path sees the same compose-path refusal as
+    ``frame_commit``.
     """
 
     def __init__(self, model: torch.nn.Module):

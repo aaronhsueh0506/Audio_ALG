@@ -91,12 +91,11 @@ struct DeepVqePrepost {
     FftHandle   *fft;
     const float *window;
 
-    /* Two full state banks. `front` is the one the accelerator READS; the
-     * other is the one it WRITES. commit() swaps by flipping this index, so
-     * a rejected inference leaves every tensor exactly where it was. */
-    float *bank[2][DEEPVQE_STATE_COUNT];
+    /* One buffer per state tensor, bound as BOTH the accelerator's input and
+     * its `_out` output for the life of the instance: the frame-t output is
+     * already the frame-t+1 input, so nothing is copied or swapped. */
+    float *state[DEEPVQE_STATE_COUNT];
     size_t state_elements[DEEPVQE_STATE_COUNT];
-    int front;
 
     /* Head output and the interleaved RI the graph binds. */
     float *taps;        /* [DEEPVQE_TAPS_ELEMENTS]                          */
@@ -287,27 +286,23 @@ static int pp_layout(DeepVqePrepost *p, unsigned char *base,
     size_t cursor = 0;
     const size_t bins = (size_t)AIAEC_N_BINS * sizeof(float);
     void *ptr;
-    int bank;
     int id;
 
     if (pp_carve(base, &cursor, sizeof(DeepVqePrepost), &ptr) != 0) return -1;
 
-    /* Two full state banks. Read bank and write bank must not alias: the
-     * accelerator reads one while it writes the other, and a rejected write
-     * must leave the read bank intact. */
-    for (bank = 0; bank < 2; ++bank) {
-        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-            size_t elements =
-                deepvqe_prepost_state_elements(id, cfg->delay_depth);
-            size_t bytes;
-            if (elements == 0) return -1;
-            bytes = ck_mul_size(elements, sizeof(float));
-            if (MEM_SIZE_INVALID(bytes)) return -1;
-            if (pp_carve(base, &cursor, bytes, &ptr) != 0) return -1;
-            if (base && p) {
-                p->bank[bank][id] = (float *)ptr;
-                p->state_elements[id] = elements;
-            }
+    /* One buffer per state tensor: the accelerator reads it and writes its
+     * next value back to the same address. */
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        size_t elements =
+            deepvqe_prepost_state_elements(id, cfg->delay_depth);
+        size_t bytes;
+        if (elements == 0) return -1;
+        bytes = ck_mul_size(elements, sizeof(float));
+        if (MEM_SIZE_INVALID(bytes)) return -1;
+        if (pp_carve(base, &cursor, bytes, &ptr) != 0) return -1;
+        if (base && p) {
+            p->state[id] = (float *)ptr;
+            p->state_elements[id] = elements;
         }
     }
 
@@ -474,7 +469,7 @@ DeepVqePrepost *deepvqe_prepost_init_ex(void *pool, size_t bytes,
     }
 
     /* Whole control region zeroed first, so a poisoned pool initialises
-     * identically to a zeroed one -- and so both state banks start at the
+     * identically to a zeroed one -- and so every state tensor starts at the
      * model's reset value without a second pass. */
     memset(pool, 0, (size_t)req.bytes);
     p = (DeepVqePrepost *)pool;
@@ -535,18 +530,15 @@ void deepvqe_prepost_destroy(DeepVqePrepost *p) {
     if (base) free(base);
 }
 
-void deepvqe_prepost_reset(DeepVqePrepost *p) {
-    int bank;
+static void zero_state(DeepVqePrepost *p) {
     int id;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
+        memset(p->state[id], 0, p->state_elements[id] * sizeof(float));
+}
 
+void deepvqe_prepost_reset(DeepVqePrepost *p) {
     if (!p) return;
-    for (bank = 0; bank < 2; ++bank) {
-        for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-            memset(p->bank[bank][id], 0,
-                   p->state_elements[id] * sizeof(float));
-        }
-    }
-    p->front = 0;
+    zero_state(p);
     memset(p->taps, 0, DEEPVQE_TAPS_ELEMENTS * sizeof(float));
     deepvqe_ccm_init(p->ccm);
     if (p->io_mode == DEEPVQE_IO_TIME) {
@@ -634,7 +626,6 @@ int deepvqe_prepost_pre_process_freq(DeepVqePrepost *p,
 int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
                                  DeepVqePrepostInputs *inputs,
                                  DeepVqePrepostOutputs *outputs) {
-    int back;
     int id;
     int bin;
 
@@ -649,14 +640,11 @@ int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
         p->far_ri[2 * bin + 1] = p->far_im[bin];
     }
 
-    back = p->front ^ 1;
-    /* Arms the transaction and NaN-fills every accelerator output, so a
-     * caller that asks twice still gets a clean one rather than a
-     * half-written one. */
+    /* Arms the transaction and NaN-fills the head output, so a caller that
+     * asks twice still gets a clean one rather than a half-written one. The
+     * state tensors are NOT filled: each is the accelerator's input as well
+     * as its output. */
     fill_nan(p->taps, DEEPVQE_TAPS_ELEMENTS);
-    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-        fill_nan(p->bank[back][id], p->state_elements[id]);
-    }
 
     memset(inputs, 0, sizeof(*inputs));
     memset(outputs, 0, sizeof(*outputs));
@@ -666,12 +654,49 @@ int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
     outputs->taps = p->taps;
     outputs->taps_elements = DEEPVQE_TAPS_ELEMENTS;
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-        inputs->state[id] = p->bank[p->front][id];
+        inputs->state[id] = p->state[id];
         inputs->state_elements[id] = p->state_elements[id];
-        outputs->state_out[id] = p->bank[back][id];
+        outputs->state_out[id] = p->state[id];
         outputs->state_elements[id] = p->state_elements[id];
     }
     p->prepared = 1;
+    return 0;
+}
+
+int deepvqe_prepost_outputs_inherit(const DeepVqePrepostOutputs *destination,
+                                    const DeepVqePrepostOutputs *runtime) {
+    int id;
+
+    if (!destination || !runtime) return -1;
+    if (!destination->taps || !runtime->taps) return -1;
+    if (runtime->taps_elements != destination->taps_elements) return -1;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        if (!destination->state_out[id] || !runtime->state_out[id]) return -1;
+        if (runtime->state_elements[id] != destination->state_elements[id])
+            return -1;
+    }
+
+    /* Validate every tensor that would be copied before copying any, so a
+     * refused inherit leaves the pool exactly as it was. A tensor the runtime
+     * wrote at the destination's own address is not copied and not checked
+     * here: frame_commit checks it. */
+    if (runtime->taps != destination->taps &&
+        !all_finite(runtime->taps, runtime->taps_elements))
+        return -1;
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        if (runtime->state_out[id] != destination->state_out[id] &&
+            !all_finite(runtime->state_out[id], runtime->state_elements[id]))
+            return -1;
+    }
+
+    if (runtime->taps != destination->taps)
+        memcpy(destination->taps, runtime->taps,
+               destination->taps_elements * sizeof(float));
+    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
+        if (runtime->state_out[id] != destination->state_out[id])
+            memcpy(destination->state_out[id], runtime->state_out[id],
+                   destination->state_elements[id] * sizeof(float));
+    }
     return 0;
 }
 
@@ -679,8 +704,8 @@ int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
  * and close it. Cannot fail: the synthesis only ever reports 0 samples (the
  * very first frame, whose block lies inside the trimmed half window) or a
  * full AIAEC_HOP, and never reads `out`. So the only fallible step of a
- * commit is the validation that precedes the bank swap, and "on failure
- * nothing moves" is structural rather than argued. */
+ * commit is the validation that precedes the CCM ring advance, so a failed
+ * commit leaves the ring untouched structurally rather than by argument. */
 static void pp_close_frame(DeepVqePrepost *p) {
     p->frame_open = 0;
     p->prepared = 0;
@@ -691,32 +716,28 @@ static void pp_close_frame(DeepVqePrepost *p) {
 }
 
 int deepvqe_prepost_frame_commit(DeepVqePrepost *p) {
-    int back;
+    int ok;
     int id;
 
     if (!p || !p->prepared) return -1;   /* prepared implies frame_open */
 
-    back = p->front ^ 1;
-    if (!all_finite(p->taps, DEEPVQE_TAPS_ELEMENTS)) {
+    ok = all_finite(p->taps, DEEPVQE_TAPS_ELEMENTS);
+    for (id = 0; ok && id < DEEPVQE_STATE_COUNT; ++id)
+        ok = all_finite(p->state[id], p->state_elements[id]);
+    if (!ok) {
+        /* The accelerator already overwrote the state in place, so there is
+         * nothing to roll back to: restart the recurrence from the cold
+         * state. The CCM ring has not been pushed, and the frame stays open
+         * so the caller can take the fail-closed identity with frame_skip(). */
+        zero_state(p);
         p->prepared = 0;
         return -1;
     }
-    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-        if (!all_finite(p->bank[back][id], p->state_elements[id])) {
-            /* Nothing has moved yet: the banks are unswapped, the CCM ring
-             * has not been pushed, and the frame stays open so the caller
-             * can take the fail-closed identity with frame_skip(). */
-            p->prepared = 0;
-            return -1;
-        }
-    }
-    p->front = back;
 
     /* The CCM ring is host state (the exporter pops spec_ring out of the
      * graph): deepvqe_ccm_process pushes THIS frame's raw microphone
      * spectrum and convolves the taps over the resulting (t, t-1, t-2)
-     * history. It advances only here, in lockstep with the model's own
-     * state swap above. */
+     * history. It advances only here, on a frame whose outputs validated. */
     deepvqe_ccm_process(
         p->ccm, p->mic_re, p->mic_im,
         (const float (*)[DEEPVQE_TIME_ORDER][DEEPVQE_FREQ_TAPS][2])p->taps,
@@ -733,11 +754,11 @@ int deepvqe_prepost_frame_skip(DeepVqePrepost *p) {
      * uncancelled echo -- see deepvqe_prepost.h. Silence instead: bounded,
      * audible as a one-frame notch, and never echo.
      *
-     * Nothing persistent moves: the state banks do not swap and the CCM ring
-     * is not pushed, so model time and host ring time stay consistent at
-     * "this frame never happened". The armed transaction is simply not
-     * committed; the next frame_inputs() re-arms it and re-fills the
-     * accelerator outputs with NaN. */
+     * The CCM ring is not pushed, and the state tensors are left exactly as
+     * the accelerator wrote them: a runtime that reports failure did not
+     * write, so there is nothing to undo. The armed transaction is simply not
+     * committed; the next frame_inputs() re-arms it and re-fills the head
+     * output with NaN. */
     memset(p->enh_re, 0, bins);
     memset(p->enh_im, 0, bins);
     pp_close_frame(p);

@@ -1,4 +1,4 @@
-"""Explicit delta-state export contract for streaming Align-ULCNet."""
+"""Explicit full-state export contract for streaming Align-ULCNet."""
 
 import re
 import shutil
@@ -21,8 +21,6 @@ from AIAEC.Align_ULCNet.export_onnx import (
     GRU_STATE_LAYOUTS,
     INPUT_NAMES,
     LAYOUT_VERSIONS,
-    FULL_HISTORY_LAYOUT_VERSIONS,
-    FULL_HISTORY_STATE_LAYOUT_VERSION,
     RETIRED_LAYOUT_VERSIONS,
     SIGNAL_INPUTS,
     MAX_DELAY_DEPTH,
@@ -149,7 +147,7 @@ def test_c_ta_bins_matches_the_python_derivation(tmp_path, sample_rate, n_fft):
     assert c_ta_bins == ta_bins_for(model)
 
 
-def test_streaming_export_shapes_are_fixed_and_delta_only():
+def test_streaming_export_shapes_are_fixed_and_full_state():
     shapes = state_shapes(D, TA_BINS)
     assert shapes['key_history'] == (1, 32, D - 1, 26)
     assert shapes['value_history'] == (1, 32, D - 1, 26)
@@ -164,10 +162,14 @@ def test_streaming_export_shapes_are_fixed_and_delta_only():
         'error_mag', 'far_mag', 'error_cos', 'error_sin', 'error_ri',
         'key_history', 'value_history', 'logit_history', 'h_gru0', 'h_gru1',
     )
+    # Every state input has an _out partner, in the order the inputs are
+    # bound, so the next state is the output tail unchanged.
     assert OUTPUT_NAMES == (
-        'output', 'key_now', 'value_now', 'logit_now',
-        'h_gru0_out', 'h_gru1_out',
+        'output', 'key_history_out', 'value_history_out',
+        'logit_history_out', 'h_gru0_out', 'h_gru1_out',
     )
+    assert OUTPUT_NAMES[1:] == tuple(
+        name + '_out' for name in INPUT_NAMES[SIGNAL_INPUTS:])
 
 
 def test_every_boundary_pair_has_its_own_version():
@@ -180,8 +182,9 @@ def test_every_boundary_pair_has_its_own_version():
     # With every version distinct, pinning the shipped pair is enough: no
     # other pair can then carry the version ulcnet_model_io.h implements.
     assert LAYOUT_VERSIONS[('host', 'split')] == STATE_LAYOUT_VERSION
-    # 3-7 denoted rank-3 boundaries. Reusing one would make a single number
-    # mean two different contracts, which no runtime could tell apart. Tied to
+    # 3-7 denoted rank-3 boundaries and 8-11 the delta-state ones. Reusing
+    # one would make a single number mean two different contracts, which no
+    # runtime could tell apart. Tied to
     # the shipped pair rather than a literal floor, which would still pass
     # after the next bump while no longer guarding anything.
     assert not (set(LAYOUT_VERSIONS.values()) & RETIRED_LAYOUT_VERSIONS)
@@ -198,7 +201,7 @@ def test_graph_feature_layout_restores_the_pre_host_boundary():
     # Same tensor names and semantics as the pre-host boundary, but the
     # recurrent hiddens are rank-4 now, so it cannot reuse that boundary's
     # retired number.
-    assert layout.layout_version == 10
+    assert layout.layout_version == 14
 
 
 @pytest.mark.parametrize('feature', sorted(FEATURE_LAYOUTS))
@@ -242,8 +245,8 @@ def test_every_layout_pair_computes_the_same_frames(feature, gru):
                 rtol=0, atol=0)
             observed_nonzero = observed_nonzero or bool(
                 candidate_state[-1].abs().max() > 0)
-            reference_state = next_state(reference_state, expected, D)
-            candidate_state = next_state(candidate_state, actual, D)
+            reference_state = next_state(expected)
+            candidate_state = next_state(actual)
     assert observed_nonzero, 'state never left its zero initialisation'
 
 
@@ -254,7 +257,6 @@ def test_c_descriptor_constants_match_export_contract():
     ).read_text(encoding='utf-8')
     expected = {
         'ULCNET_MODEL_IO_LAYOUT_VERSION': STATE_LAYOUT_VERSION,
-        'ULCNET_MODEL_IO_FULL_HISTORY_VERSION': FULL_HISTORY_STATE_LAYOUT_VERSION,
         'ULCNET_MODEL_IO_MIN_D': MIN_DELAY_DEPTH,
         'ULCNET_MODEL_IO_MAX_D': MAX_DELAY_DEPTH,
         'ULCNET_MODEL_IO_TA_CHANNELS': TA_CHANNELS,
@@ -345,7 +347,7 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     assert legacy['far_input_mode_c_value'] == 0
 
 
-def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
+def test_full_state_wrapper_matches_forward_stream_frame_by_frame():
     torch.manual_seed(20260816)
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
@@ -367,7 +369,7 @@ def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
                 host_output(model, outputs[0]), _ri(expected.enhanced),
                 atol=5e-7, rtol=1e-6
             )
-            explicit = next_state(explicit, outputs, D)
+            explicit = next_state(outputs)
 
             align = reference['align']
             assert torch.equal(
@@ -425,11 +427,9 @@ def test_exported_onnx_state_tensors_are_rank_four(tmp_path):
         if name in shapes:
             assert dims(value) == shapes[name], value.name
             outs[name] = dims(value)
-    # The GRU hiddens are REPLACED whole, so each must have an _out partner of
-    # exactly its own shape or the recurrence cannot be fed back. The three
-    # caches are deliberately not here: their outputs are the delta-only
-    # key_now/value_now/logit_now, one frame rather than the ring.
-    assert set(outs) == {'h_gru0', 'h_gru1'}, sorted(outs)
+    # Every state is returned whole, so each must have an _out partner of
+    # exactly its own shape or the two cannot share one address.
+    assert set(outs) == set(ins), sorted(outs)
     assert all(outs[name] == ins[name] for name in outs)
     assert set(ins) == set(shapes) - {COMBINED_GRU_STATE_NAME}
 
@@ -460,8 +460,8 @@ def test_combined_state_stacks_on_the_channel_axis():
             )
             split_out = split(*(signals + split_state))
             combined_out = combined(*(signals + combined_state))
-            split_state = next_state(split_state, split_out, depth)
-            combined_state = next_state(combined_state, combined_out, depth)
+            split_state = next_state(split_out)
+            combined_state = next_state(combined_out)
 
             merged = combined_state[-1]
             assert merged.shape == (1, 2 * GRU_LAYERS, 1, GRU_HIDDEN)
@@ -521,7 +521,7 @@ def test_streaming_onnx_runtime_matches_pytorch(tmp_path):
                 worst = max(worst, float(np.max(
                     np.abs(got - want.numpy())
                 )))
-            state = next_state(state, expected, depth)
+            state = next_state(expected)
     assert worst <= 3e-4
 
 
@@ -549,74 +549,3 @@ def test_streaming_export_rejects_a_non_verified_grid():
     off = AlignULCNet(GRID, max_delay_frames=D, gamma=4).eval()
     with pytest.raises(ValueError, match='gamma, subband_bins'):
         AlignUlcnetStreamingExport(off)
-
-
-@pytest.mark.parametrize('sample_rate,n_fft', SUPPORTED_GRIDS)
-@pytest.mark.parametrize('depth', [2, 8, 64])
-@pytest.mark.parametrize('feature,gru', sorted(LAYOUT_VERSIONS))
-def test_full_histories_match_legacy_for_every_frame(sample_rate, n_fft, depth, feature, gru):
-    torch.manual_seed(711)
-    grid = SignalGrid(sample_rate, n_fft, n_fft, n_fft // 2)
-    model = AlignULCNet(grid, max_delay_frames=depth).eval()
-    delta = AlignUlcnetStreamingExport(model, feature, gru).eval()
-    full = AlignUlcnetStreamingExport(model, feature, gru, 'full').eval()
-    ds = dummy_inputs(depth, grid.n_freqs, ta_bins_for(model), delta.layout)[delta.layout.signal_inputs:]
-    fs = tuple(value.clone() for value in ds)
-    assert full.layout.layout_version == FULL_HISTORY_LAYOUT_VERSIONS[(feature, gru)]
-    assert full.layout.layout_version not in LAYOUT_VERSIONS.values()
-    assert full.layout.output_names[1:4] == (
-        'key_history_out', 'value_history_out', 'logit_history_out')
-    with torch.no_grad():
-        for _ in range(depth + 5):
-            signals = graph_signals(model, torch.randn(1, 1, grid.n_freqs, 2),
-                                    torch.randn(1, 1, grid.n_freqs, 2), full.layout)
-            do, fo = delta(*signals, *ds), full(*signals, *fs)
-            assert torch.equal(do[0], fo[0])
-            ds = next_state(ds, do, depth, delta.layout)
-            fs = next_state(fs, fo, depth, full.layout)
-            for reference, candidate, output in zip(ds, fs, fo[1:]):
-                assert torch.equal(reference, candidate)
-                assert candidate is output  # no host shift/concat/copy
-
-
-@pytest.mark.parametrize('sample_rate,n_fft', SUPPORTED_GRIDS)
-@pytest.mark.parametrize('depth', [2, 8])
-def test_full_history_onnx_closed_loop_and_metadata(tmp_path, sample_rate, n_fft, depth):
-    onnx = pytest.importorskip('onnx')
-    ort = pytest.importorskip('onnxruntime')
-    torch.manual_seed(733)
-    grid = SignalGrid(sample_rate, n_fft, n_fft, n_fft // 2)
-    model = AlignULCNet(grid, max_delay_frames=depth).eval()
-    checkpoint = tmp_path / 'ckpt.pt'
-    torch.save({'contract': {}, 'state_dict': model.state_dict()}, checkpoint)
-    path = tmp_path / 'full.onnx'
-    wrapper, inputs, meta = export_graph(model, str(checkpoint), str(path),
-                                        verify=True, cache_state_layout='full')
-    assert meta['state_layout_version'] == FULL_HISTORY_STATE_LAYOUT_VERSION
-    assert meta['cache_state_layout'] == 'full'
-    assert not meta['cpu_delta_state_update']
-    shapes = state_shapes(depth, ta_bins_for(model))
-    for name in ('key_history', 'value_history', 'logit_history'):
-        assert meta['output_schema'][name + '_out'] == list(shapes[name])
-    graph = onnx.load(str(path))
-    for tensor in graph.graph.output:
-        assert all(dim.dim_value > 0 for dim in tensor.type.tensor_type.shape.dim)
-    session = ort.InferenceSession(str(path), providers=['CPUExecutionProvider'])
-    layout = wrapper.layout
-    assert tuple(v.name for v in session.get_outputs()) == layout.output_names
-    # The ORT sequence feeds its OWN returned full histories into the next
-    # call, not the torch histories (which would mask a recurrent mismatch).
-    state = inputs[layout.signal_inputs:]
-    ort_state = tuple(t.numpy().copy() for t in state)
-    reference = AlignUlcnetStreamingExport(model).eval()
-    with torch.no_grad():
-        for _ in range(2 * depth + 5):
-            signals = stream_features(model, torch.randn(1, 1, grid.n_freqs, 2),
-                                      torch.randn(1, 1, grid.n_freqs, 2))
-            expected = reference(*signals, *state)
-            state = next_state(state, expected, depth)
-            actual = session.run(None, dict(zip(layout.input_names,
-                                  tuple(t.numpy() for t in signals) + ort_state)))
-            for got, want in zip(actual, (expected[0],) + state):
-                np.testing.assert_allclose(got, want.numpy(), atol=3e-4, rtol=1e-5)
-            ort_state = tuple(actual[1:])

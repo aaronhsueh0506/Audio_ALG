@@ -44,11 +44,12 @@
  * FAIL-OPEN. With no model (model.infer == NULL), a nonzero infer() result,
  * or an unwritten/non-finite output, the frame is taken with
  * dfn2_prepost_frame_skip(): an exact identity through the cascade (unit ERB
- * mask through a partition-of-unity erb_inv, zero taps, alpha 0), the
- * recurrent state not stepped, the clocks advanced. The stage output is then
- * P delayed by two hops: the conventional pipeline with its NR disabled,
- * byte for byte, comfort noise included. That is the backbone gate of both
- * hosting pipelines.
+ * mask through a partition-of-unity erb_inv, zero taps, alpha 0), the clocks
+ * advanced, the recurrent state left as it is (an in-place output that was
+ * non-finite zeroes it at commit; a refused inherit leaves it intact). The
+ * stage output is then P delayed by two hops: the conventional pipeline with
+ * its NR disabled, byte for byte, comfort noise included. That is the
+ * backbone gate of both hosting pipelines.
  *
  * RESET. Whole-pipeline resets only. The stage consumes no far-end, so an AEC
  * delay change leaves both of its inputs continuous and must not reset it (a

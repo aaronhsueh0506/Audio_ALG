@@ -391,9 +391,9 @@ int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
                                 UlcnetModelIoInputs *inputs,
                                 UlcnetModelIoOutputs *outputs) {
     if (!p || !inputs || !outputs || !p->frame_open) return -1;
-    /* Arms the transaction and NaN-fills every accelerator output, so a
-     * caller that asks twice still gets a clean one rather than a
-     * half-written one. */
+    /* Arms the transaction and NaN-fills the `output` estimate, so a caller
+     * that asks twice still gets a clean one rather than a half-written
+     * one. */
     if (ulcnet_model_io_prepare(p->io, p->err_re, p->err_im,
                                 p->far_re, p->far_im, inputs, outputs) != 0)
         return -1;
@@ -405,8 +405,9 @@ int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
  * and close it. Cannot fail: the synthesis only ever reports 0 samples (the
  * very first frame, whose block lies inside the trimmed half window) or a
  * full ULCNET_HOP, and never reads `out`. So the only fallible step of a
- * commit is the validation that precedes this, and "on failure nothing
- * moves" is structural rather than argued. */
+ * commit is the validation that precedes this, so a failed commit leaves the
+ * framing and synthesis state untouched structurally rather than by
+ * argument. */
 static void pp_close_frame(UlcnetPrepost *p) {
     p->frame_open = 0;
     p->prepared = 0;
@@ -423,8 +424,8 @@ int ulcnet_prepost_frame_commit(UlcnetPrepost *p) {
      * would accept them with no frame_inputs() behind it. */
     if (!p || !p->prepared) return -1;
     if (ulcnet_model_io_commit(p->io, p->enh_re, p->enh_im) != 0) {
-        /* model_io already discarded the transaction and left persistent
-         * state untouched. The frame stays open so the caller can take the
+        /* model_io already discarded the transaction and restarted its
+         * recurrent state. The frame stays open so the caller can take the
          * identity with frame_skip(), or re-arm with frame_inputs(). */
         p->prepared = 0;
         return -1;
@@ -437,8 +438,8 @@ int ulcnet_prepost_frame_skip(UlcnetPrepost *p) {
     const size_t bins = (size_t)ULCNET_BINS * sizeof(float);
     if (!p || !p->frame_open) return -1;
     /* Identity: the error spectrum passes through. The armed transaction is
-     * simply not committed, so no ring advances; the next prepare() re-arms
-     * it and re-fills the accelerator outputs with NaN. */
+     * simply not committed; the next prepare() re-arms it and re-fills the
+     * NaN-checked estimate. */
     memcpy(p->enh_re, p->err_re, bins);
     memcpy(p->enh_im, p->err_im, bins);
     pp_close_frame(p);

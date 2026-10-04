@@ -59,11 +59,22 @@ Specific to this one: the accelerator boundary is the exporter's exactly --
 raw RI `mic`/`far` in, packed CCM taps `[1,1,F,18]` out, and the sixteen
 explicit state tensors in `DeepVqeStateId` order. The last axis preserves
 `[time][frequency][RI]` row-major order, so C consumes it without a transpose
-or copy. State is held in two host-side banks that `frame_commit`
-swaps only after every tap and state element is finite -- and `frame_skip`
-FAILS CLOSED (mutes the frame): stream 0 is the raw microphone, so the
-pass-through identity a post-filter can take would emit the uncancelled
-echo here.
+or copy. The pool holds one host buffer per state tensor. The normal path is the
+runtime's own output tensors (taps and sixteen state outputs, runtime-owned,
+nothing allocated here) followed by `deepvqe_prepost_outputs_inherit(dest,
+runtime)`: it finite-checks every tensor it would copy, copies none and returns
+-1 if any is non-finite (the state is then intact, so the caller reports the
+run failed and takes `frame_skip`), and leaves alone any tensor the runtime
+wrote at the pool's own address. The optimized path binds each `*_out` output
+to the pointer `frame_inputs` returned for its state input and skips inherit,
+so the host copies and swaps nothing; the runtime must finish reading every
+state input before it writes any state output at that address. `frame_commit`
+validates (every tap and state element finite) and advances the CCM ring; on a
+non-finite value it zeroes all sixteen state tensors (in-place path: the state
+restarts from zero), since the write cannot be rolled back. `frame_skip` leaves
+the state as the accelerator wrote it and FAILS CLOSED (mutes the frame):
+stream 0 is the raw microphone, so the pass-through identity a post-filter can
+take would emit the uncancelled echo here.
 
 The exporter writes `state_layout_version` (`DEEPVQE_PREPOST_LAYOUT_VERSION`)
 and a `c_descriptor` block measured from the built graph into the ONNX

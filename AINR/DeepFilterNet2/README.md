@@ -75,10 +75,19 @@ the first hop (the graph needs its right-hand neighbour) and 1 after; the
 spectra at the `DFN2_IO_FREQ` boundary are torch.stft normalized=True on this
 48 kHz/1024 grid, so chaining an AIAEC spectrum in is a 32x scale error (the
 header's warning block); the window is copied rather than borrowed
-because `DFN2State` embeds its table by value; and the recurrent state lives
-in two banks that swap roles on every committed frame, so the accelerator's
-state input and output addresses alternate and must be re-read from
-`dfn2_prepost_frame_inputs()` every frame. Its gate is
+because `DFN2State` embeds its table by value; and the four recurrent state
+tensors live in the pool at addresses that never change. The normal path is a
+runtime that writes its own output tensors, handed to the pool with
+`dfn2_prepost_outputs_inherit()` before `frame_commit()`: it validates every
+tensor it would copy and then copies, so a refused inherit (`-1`) leaves the
+pool byte-identical and the caller reports the run as failed and takes
+`frame_skip()`. The optimized path binds the `*_next` outputs to the pointers
+`frame_inputs()` returned and skips inherit; the state input and output are
+then the same address on every frame, the runtime must read all state inputs
+before it writes any state output there, and a commit that finds a non-finite
+head or state value zeroes the four recurrent tensors, because the previous
+state was overwritten and cannot be restored. On a healthy stream both
+bindings give the same output bit for bit. Its gate is
 `../tests/test_dfn2_prepost_c.py`; `make -C .. lib` ships it in
 `libainr_prepost.a` (`make -C .. print-lib-path` prints the configuration-keyed
 location).
@@ -119,16 +128,25 @@ to one contiguous field. The extra history is required because the
 input kernel sees three frames while the DF residual path has a causal
 five-frame kernel; omitting it would silently reduce the trained receptive
 field. CPU-side window/state storage is defined by
-`dfn2_model_io.c/.h`, which also exports the window-slide and state-commit
+`dfn2_model_io.c/.h`, which also exports the window-slide and state-validate
 helpers so an external dual-input consumer with its own state struct reuses
-this window/commit discipline instead of inlining a second copy of the
-memmove/memcpy pair. `dfn2_model_io_commit_state()` and
-`dfn2_model_io_commit_arrays()` take one array per GRU stack --
-`erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN]` and
-`df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN]` -- matching
-the graph tensors element for element. State commit is transactional: a null
-or non-finite accelerator output returns `-1` before any persistent state is
-overwritten. The exported metadata carries `state_layout_version`,
+this window/validate discipline instead of inlining a second copy of the
+memmove/memcpy pair. The normal path is a runtime that writes its `*_next`
+outputs into its own buffers and the caller takes them over with
+`dfn2_model_io_inherit_state()` / `dfn2_model_io_inherit_arrays()` (the same
+alias-skip and validate-then-copy rule as the class: a refused call returns
+`-1` and leaves the state intact). The optimized path binds each state output
+to the same address as its input, so every recurrent tensor is one buffer, and
+validates it afterwards.
+`dfn2_model_io_validate_state()`, `dfn2_model_io_validate_arrays()` and
+`dfn2_model_io_inherit_arrays()` take
+one array per GRU stack --
+`erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN]` and
+`df_gru_hidden[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN]` -- matching
+the graph tensors element for element. Validation is a finite check over the
+state itself: a null argument returns `-1`, and a non-finite element zeroes the
+four arrays and returns `-1`. A finite but partial or mixed accelerator write
+is not detectable. The exported metadata carries `state_layout_version`,
 kept numerically equal to `DFN2_MODEL_IO_LAYOUT_VERSION` in that header, so an
 integrator can refuse a graph whose state layout no longer matches the struct
 it allocated. `inference.py calib --frames N` captures `N`
@@ -196,7 +214,7 @@ python3 inference.py calib --model output/dfn2_best.pth \
 ```
 
 Adopting it would be a contract change, not a flag flip: `dfn2_model_io.h`,
-its commit API, the I/O tables and the C tests would all have to move with it.
+its validate API, the I/O tables and the C tests would all have to move with it.
 
 ## Debugging excessive low-frequency suppression
 

@@ -6,11 +6,15 @@
 #include <string.h>
 
 typedef struct TestRuntime {
+    int separate_buffers; /* own output tensors + inherit, not in place */
+    int poison;           /* separate mode: one NaN in a state tensor   */
     int partial_write;
     int fail_run;         /* write every output, then report failure */
     int calls;
-    float stamp;          /* value written into h_gru0_out     */
-    float observed_gru0;  /* inputs->h_gru0[0] seen on entry    */
+    float stamp;          /* value written into every state tensor  */
+    float observed_key0;  /* inputs->key_history[0] seen on entry   */
+    float observed_gru0;  /* inputs->h_gru0[0] seen on entry        */
+    int ignore_refusal;   /* separate mode: report 0 after a refused inherit */
 } TestRuntime;
 
 /* Compression round trip (prepare's signed pow 0.3, commit's inverse) is
@@ -29,34 +33,150 @@ static void fill(float *values, size_t elements, float value) {
     for (index = 0; index < elements; ++index) values[index] = value;
 }
 
+/* The graph's ring shift for a constant frame: K/V newest-first, logit
+ * history oldest-first; D = 8, TA_BINS from the compiled grid. */
+static void push_stamp(const UlcnetModelIoOutputs *outputs, float stamp) {
+    const size_t depth = 8u;
+    const size_t ta_bins = ULCNET_MODEL_IO_TA_BINS;
+    size_t channel;
+    size_t index;
+    for (channel = 0; channel < ULCNET_MODEL_IO_TA_CHANNELS; ++channel) {
+        float *key = outputs->key_history_out +
+            channel * (depth - 1u) * ta_bins;
+        float *value = outputs->value_history_out +
+            channel * (depth - 1u) * ta_bins;
+        float *logit = outputs->logit_history_out +
+            channel * ULCNET_MODEL_IO_SCORE_HISTORY * depth;
+        memmove(key + ta_bins, key, (depth - 2u) * ta_bins * sizeof(float));
+        memmove(value + ta_bins, value,
+                (depth - 2u) * ta_bins * sizeof(float));
+        memmove(logit, logit + depth, 3u * depth * sizeof(float));
+        for (index = 0; index < ta_bins; ++index) {
+            key[index] = stamp;
+            value[index] = stamp;
+        }
+        for (index = 0; index < depth; ++index) logit[3u * depth + index] = stamp;
+    }
+}
+
+/* The runtime's own output tensors (an ONNX-style runtime that cannot bind a
+ * state output to its input's address): every state value is computed from
+ * the inputs into these, then handed to ulcnet_model_io_inherit(). D = 8. */
+#define PRIVATE_KEY_ELEMENTS \
+    (ULCNET_MODEL_IO_TA_CHANNELS * 7u * ULCNET_MODEL_IO_TA_BINS)
+#define PRIVATE_LOGIT_ELEMENTS \
+    (ULCNET_MODEL_IO_TA_CHANNELS * ULCNET_MODEL_IO_SCORE_HISTORY * 8u)
+#define PRIVATE_GRU_ELEMENTS \
+    (ULCNET_MODEL_IO_GRU_LAYERS * ULCNET_MODEL_IO_GRU_HIDDEN)
+
+static int run_separate(TestRuntime *runtime,
+                        const UlcnetModelIoInputs *inputs,
+                        UlcnetModelIoOutputs *outputs) {
+    static float output[2u * ULCNET_MODEL_IO_BINS];
+    static float key[PRIVATE_KEY_ELEMENTS];
+    static float value[PRIVATE_KEY_ELEMENTS];
+    static float logit[PRIVATE_LOGIT_ELEMENTS];
+    static float gru0[PRIVATE_GRU_ELEMENTS];
+    static float gru1[PRIVATE_GRU_ELEMENTS];
+    const size_t ta_bins = ULCNET_MODEL_IO_TA_BINS;
+    const size_t depth = 8u;
+    UlcnetModelIoOutputs mine = *outputs;
+    size_t channel;
+    size_t index;
+
+    /* Unwritten tensors read as NaN, like the in-place path's prefill. */
+    fill(output, outputs->spectrum_ri_elements, NAN);
+    for (index = 0; index < (runtime->partial_write
+                                 ? 1u : outputs->spectrum_ri_elements);
+         ++index) {
+        output[index] = inputs->error_ri[index];
+    }
+    if (runtime->partial_write) {
+        mine.output = output;
+        mine.key_history_out = key;
+        mine.value_history_out = value;
+        mine.logit_history_out = logit;
+        mine.h_gru0_out = gru0;
+        mine.h_gru1_out = gru1;
+        fill(key, PRIVATE_KEY_ELEMENTS, 0.0f);
+        fill(value, PRIVATE_KEY_ELEMENTS, 0.0f);
+        fill(logit, PRIVATE_LOGIT_ELEMENTS, 0.0f);
+        fill(gru0, PRIVATE_GRU_ELEMENTS / 2u, 0.0f);
+        fill(gru1, PRIVATE_GRU_ELEMENTS / 2u, 0.0f);
+        return ulcnet_model_io_inherit(outputs, &mine);
+    }
+    for (channel = 0; channel < ULCNET_MODEL_IO_TA_CHANNELS; ++channel) {
+        const size_t k = channel * (depth - 1u) * ta_bins;
+        const size_t l = channel * ULCNET_MODEL_IO_SCORE_HISTORY * depth;
+        for (index = 0; index < ta_bins; ++index) {
+            key[k + index] = runtime->stamp;
+            value[k + index] = runtime->stamp;
+        }
+        memcpy(key + k + ta_bins, inputs->key_history + k,
+               (depth - 2u) * ta_bins * sizeof(float));
+        memcpy(value + k + ta_bins, inputs->value_history + k,
+               (depth - 2u) * ta_bins * sizeof(float));
+        memcpy(logit + l, inputs->logit_history + l + depth,
+               3u * depth * sizeof(float));
+        for (index = 0; index < depth; ++index) {
+            logit[l + 3u * depth + index] = runtime->stamp;
+        }
+    }
+    fill(gru0, outputs->gru_hidden_elements, runtime->stamp);
+    fill(gru1, outputs->gru_hidden_elements, 0.0f);
+    if (runtime->poison) {
+        gru1[outputs->gru_hidden_elements - 1u] = NAN;
+    }
+    if (runtime->fail_run) {
+        return -1;  /* a run that reports failure is taken not to have written */
+    }
+    mine.output = output;
+    mine.key_history_out = key;
+    mine.value_history_out = value;
+    mine.logit_history_out = logit;
+    mine.h_gru0_out = gru0;
+    mine.h_gru1_out = gru1;
+    {
+        const int status = ulcnet_model_io_inherit(outputs, &mine);
+        return runtime->ignore_refusal ? 0 : status;
+    }
+}
+
 static int run(void *user, const UlcnetModelIoInputs *inputs,
                UlcnetModelIoOutputs *outputs) {
     TestRuntime *runtime = (TestRuntime *)user;
     size_t index;
     runtime->calls += 1;
+    runtime->observed_key0 = inputs->key_history[0];
     runtime->observed_gru0 = inputs->h_gru0[0];
-    for (index = 0; index < outputs->spectrum_ri_elements; ++index) {
+    if (runtime->separate_buffers) {
+        return run_separate(runtime, inputs, outputs);
+    }
+    /* A partial write leaves all but the first estimate element at NaN. */
+    for (index = 0; index < (runtime->partial_write
+                                 ? 1u : outputs->spectrum_ri_elements);
+         ++index) {
         outputs->output[index] = inputs->error_ri[index];
     }
     if (runtime->partial_write) {
         return 0;
     }
-    fill(outputs->key_now, outputs->key_now_elements, 0.0f);
-    fill(outputs->value_now, outputs->value_now_elements, 0.0f);
-    fill(outputs->logit_now, outputs->logit_now_elements, 0.0f);
-    fill(outputs->key_history_out, outputs->key_history_elements, 0.0f);
-    fill(outputs->value_history_out, outputs->value_history_elements, 0.0f);
-    fill(outputs->logit_history_out, outputs->logit_history_elements, 0.0f);
+    /* The state tensors are in place: the newest K/V slot of every channel
+     * gets the stamp and the older slots shift by one, exactly as the graph
+     * shifts them; every input was read above. */
+    push_stamp(outputs, runtime->stamp);
     fill(outputs->h_gru0_out, outputs->gru_hidden_elements,
          runtime->stamp);
     fill(outputs->h_gru1_out, outputs->gru_hidden_elements, 0.0f);
     return runtime->fail_run ? -1 : 0;
 }
 
-static int test_layout(uint32_t layout_version) {
+/* One full pass of the adapter contract; the same assertions hold for both
+ * state bindings, except where a run that reports failure is concerned. */
+static int exercise(int separate_buffers) {
     UlcnetAcceleratorAdapter *adapter;
     UlcnetModel model;
-    TestRuntime runtime = {0, 0, 0, 0.0f, 0.0f};
+    TestRuntime runtime = {0, 0, 0, 0, 0, 0.0f, 0.0f, 0.0f};
     void *pool = NULL;
     size_t bytes;
     size_t alignment;
@@ -73,9 +193,9 @@ static int test_layout(uint32_t layout_version) {
     float output_im[ULCNET_MODEL_IO_BINS];
     int bin;
 
-    if (ulcnet_model_io_descriptor_default(8, &descriptor) != 0) return 1;
-    descriptor.layout_version = layout_version;
-    if (ulcnet_accelerator_adapter_get_mem_size(
+    runtime.separate_buffers = separate_buffers;
+    if (ulcnet_model_io_descriptor_default(8, &descriptor) != 0 ||
+        ulcnet_accelerator_adapter_get_mem_size(
             &descriptor, &bytes, &alignment) != 0 ||
         posix_memalign(&pool, alignment, bytes) != 0) {
         return 1;
@@ -110,7 +230,6 @@ static int test_layout(uint32_t layout_version) {
         model.io_descriptor != ulcnet_accelerator_adapter_descriptor(adapter) ||
         model.io_descriptor->far_input_mode != ULCNET_FAR_RAW ||
         model.io_descriptor->delay_depth != 8 ||
-        model.io_descriptor->layout_version != layout_version ||
         strcmp(ulcnet_far_input_mode_name(
                    model.io_descriptor->far_input_mode), "raw_far") != 0) {
         free(pool);
@@ -143,9 +262,10 @@ static int test_layout(uint32_t layout_version) {
     }
 
     /* A run that fills every output and THEN reports failure must not
-     * advance the persistent state: the pipeline discards that frame, so
-     * committing it would step the K/V, logit and GRU rings off a frame that
-     * never reached the output. Observed through the NEXT run's inputs. */
+     * commit: the pipeline discards that frame. Bound in place, the state
+     * tensors stay as that run wrote them; with the runtime's own tensors the
+     * run never reached inherit, so the state is untouched. Observed through
+     * the NEXT run's inputs. */
     model.reset(model.user);
     runtime.fail_run = 1;
     runtime.stamp = 3.5f;
@@ -158,24 +278,74 @@ static int test_layout(uint32_t layout_version) {
     runtime.stamp = 1.25f;
     if (model.infer(model.user, error_re, error_im, far_re, far_im,
                     output_re, output_im) != 0 || runtime.calls != 5 ||
-        runtime.observed_gru0 != 0.0f) {
+        runtime.observed_key0 != (separate_buffers ? 0.0f : 3.5f) ||
+        runtime.observed_gru0 != (separate_buffers ? 0.0f : 3.5f)) {
         free(pool);
         return 1;
     }
-    /* ...and a run that succeeds still does advance it. */
+    /* ...and a run that succeeds carries its state forward the same way. */
     if (model.infer(model.user, error_re, error_im, far_re, far_im,
                     output_re, output_im) != 0 || runtime.calls != 6 ||
-        runtime.observed_gru0 != 1.25f) {
+        runtime.observed_key0 != 1.25f || runtime.observed_gru0 != 1.25f) {
         free(pool);
         return 1;
     }
 
+    if (separate_buffers) {
+        /* One NaN in one of the runtime's own state tensors: inherit refuses
+         * before writing anything, the adapter takes the skip, and the state
+         * the next run sees is exactly what the last good run left. */
+        runtime.stamp = 2.0f;
+        if (model.infer(model.user, error_re, error_im, far_re, far_im,
+                        output_re, output_im) != 0) {
+            free(pool);
+            return 1;
+        }
+        runtime.stamp = 9.0f;
+        runtime.poison = 1;
+        if (model.infer(model.user, error_re, error_im, far_re, far_im,
+                        output_re, output_im) == 0) {
+            free(pool);
+            return 1;
+        }
+        runtime.poison = 0;
+        runtime.stamp = 4.0f;
+        if (model.infer(model.user, error_re, error_im, far_re, far_im,
+                        output_re, output_im) != 0 ||
+            runtime.observed_key0 != 2.0f || runtime.observed_gru0 != 2.0f) {
+            free(pool);
+            return 1;
+        }
+        /* A callback that reports success after a refused inherit leaves
+         * `output` unwritten, so the frame is still refused -- but at commit,
+         * which restarts the state from zero instead of keeping it. */
+        runtime.stamp = 5.0f;
+        runtime.poison = 1;
+        runtime.ignore_refusal = 1;
+        if (model.infer(model.user, error_re, error_im, far_re, far_im,
+                        output_re, output_im) == 0) {
+            free(pool);
+            return 1;
+        }
+        runtime.poison = 0;
+        runtime.ignore_refusal = 0;
+        runtime.stamp = 6.0f;
+        if (model.infer(model.user, error_re, error_im, far_re, far_im,
+                        output_re, output_im) != 0 ||
+            runtime.observed_key0 != 0.0f || runtime.observed_gru0 != 0.0f) {
+            free(pool);
+            return 1;
+        }
+    }
+
     free(pool);
-    puts("ulcnet_accelerator_adapter: PASS");
     return 0;
 }
 
 int main(void) {
-    if (test_layout(ULCNET_MODEL_IO_LAYOUT_VERSION) != 0) return 1;
-    return test_layout(ULCNET_MODEL_IO_FULL_HISTORY_VERSION);
+    if (exercise(0) != 0 || exercise(1) != 0) {
+        return 1;
+    }
+    puts("ulcnet_accelerator_adapter: PASS");
+    return 0;
 }
