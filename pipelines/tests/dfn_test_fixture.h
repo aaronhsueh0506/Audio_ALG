@@ -75,22 +75,16 @@ static inline void dfn_fixture_lowpass(const float *in, float *out, int n,
 }
 
 /* A model whose heads are the exact identity: unit ERB mask, zero deep
- * filter, alpha 0, recurrent state passed through unchanged. */
+ * filter, alpha 0. The recurrent state passes through unchanged by writing
+ * nothing: each state output is the same buffer as its input. */
 static inline int dfn_fixture_identity_infer(void *user, const DFN2PrepostInputs *in,
                                       DFN2PrepostOutputs *out) {
     size_t i;
     (void)user;
+    (void)in;
     for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 1.0f;
     memset(out->coefs, 0, out->coefs_elements * sizeof(float));
     out->alpha[0] = 0.0f;
-    memcpy(out->encoder_gru_hidden_next, in->encoder_gru_hidden,
-           out->encoder_gru_hidden_elements * sizeof(float));
-    memcpy(out->erb_gru_hidden_next, in->erb_gru_hidden,
-           out->erb_gru_hidden_elements * sizeof(float));
-    memcpy(out->df_gru_hidden_next, in->df_gru_hidden,
-           out->df_gru_hidden_elements * sizeof(float));
-    memcpy(out->df_convp_history_next, in->df_convp_history,
-           out->df_convp_history_elements * sizeof(float));
     return 0;
 }
 

@@ -85,7 +85,37 @@ static int all_finite(const float *values, size_t count)
     return skn_all_finite_f32(values, count);
 }
 
-int dfn2_model_io_commit_arrays(
+int dfn2_model_io_validate_arrays(
+    float encoder_gru_hidden[DFN2_MODEL_ENCODER_GRU_LAYERS]
+                            [DFN2_MODEL_GRU_HIDDEN],
+    float erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
+    float df_gru_hidden[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
+    float df_convp_history[DFN2_MODEL_ENCODER_CHANNELS]
+                          [DFN2_MODEL_DF_PATHWAY_HISTORY]
+                          [DFN2_DF_BINS])
+{
+    const size_t encoder_count =
+        DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN;
+    const size_t erb_count = DFN2_MODEL_ERB_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN;
+    const size_t df_count = DFN2_MODEL_DF_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN;
+    const size_t convp_count = (size_t)DFN2_MODEL_ENCODER_CHANNELS *
+                               DFN2_MODEL_DF_PATHWAY_HISTORY * DFN2_DF_BINS;
+    if (encoder_gru_hidden == NULL || erb_gru_hidden == NULL ||
+        df_gru_hidden == NULL || df_convp_history == NULL) return -1;
+    if (all_finite(&encoder_gru_hidden[0][0], encoder_count) &&
+        all_finite(&erb_gru_hidden[0][0], erb_count) &&
+        all_finite(&df_gru_hidden[0][0], df_count) &&
+        all_finite(&df_convp_history[0][0][0], convp_count)) return 0;
+    /* The accelerator wrote these arrays in place, so the previous values are
+     * gone: zero is the only state a stream can restart from. */
+    memset(encoder_gru_hidden, 0, encoder_count * sizeof(float));
+    memset(erb_gru_hidden, 0, erb_count * sizeof(float));
+    memset(df_gru_hidden, 0, df_count * sizeof(float));
+    memset(df_convp_history, 0, convp_count * sizeof(float));
+    return -1;
+}
+
+int dfn2_model_io_inherit_arrays(
     float encoder_gru_hidden[DFN2_MODEL_ENCODER_GRU_LAYERS]
                             [DFN2_MODEL_GRU_HIDDEN],
     float erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
@@ -93,38 +123,46 @@ int dfn2_model_io_commit_arrays(
     float df_convp_history[DFN2_MODEL_ENCODER_CHANNELS]
                           [DFN2_MODEL_DF_PATHWAY_HISTORY]
                           [DFN2_DF_BINS],
-    const float encoder_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
+    const float encoder_gru_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
+                                       [DFN2_MODEL_GRU_HIDDEN],
+    const float erb_gru_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
                                    [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
-                               [DFN2_MODEL_GRU_HIDDEN],
-    const float df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
-                              [DFN2_MODEL_GRU_HIDDEN],
-    const float pathway_history_next[DFN2_MODEL_ENCODER_CHANNELS]
-                                    [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                                    [DFN2_DF_BINS])
+    const float df_gru_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
+                                  [DFN2_MODEL_GRU_HIDDEN],
+    const float df_convp_history_next[DFN2_MODEL_ENCODER_CHANNELS]
+                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
+                                     [DFN2_DF_BINS])
 {
-    if (encoder_gru_hidden == NULL || erb_gru_hidden == NULL ||
-        df_gru_hidden == NULL || df_convp_history == NULL ||
-        encoder_hidden_next == NULL || erb_hidden_next == NULL ||
-        df_hidden_next == NULL || pathway_history_next == NULL) return -1;
-    /* Validate the complete accelerator result before the first write. */
-    if (!all_finite(&encoder_hidden_next[0][0],
-                    DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN) ||
-        !all_finite(&erb_hidden_next[0][0],
-                    DFN2_MODEL_ERB_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN) ||
-        !all_finite(&df_hidden_next[0][0],
-                    DFN2_MODEL_DF_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN) ||
-        !all_finite(&pathway_history_next[0][0][0],
-                    DFN2_MODEL_ENCODER_CHANNELS *
-                    DFN2_MODEL_DF_PATHWAY_HISTORY * DFN2_DF_BINS)) return -1;
-    memcpy(encoder_gru_hidden, encoder_hidden_next,
-           DFN2_MODEL_ENCODER_GRU_LAYERS * sizeof(encoder_gru_hidden[0]));
-    memcpy(erb_gru_hidden, erb_hidden_next,
-           DFN2_MODEL_ERB_GRU_LAYERS * sizeof(erb_gru_hidden[0]));
-    memcpy(df_gru_hidden, df_hidden_next,
-           DFN2_MODEL_DF_GRU_LAYERS * sizeof(df_gru_hidden[0]));
-    memcpy(df_convp_history, pathway_history_next,
-           DFN2_MODEL_ENCODER_CHANNELS * sizeof(df_convp_history[0]));
+    float *const destination[DFN2_MODEL_IO_STATE_TENSORS] = {
+        (float *)encoder_gru_hidden, (float *)erb_gru_hidden,
+        (float *)df_gru_hidden, (float *)df_convp_history};
+    const float *const source[DFN2_MODEL_IO_STATE_TENSORS] = {
+        (const float *)encoder_gru_hidden_next,
+        (const float *)erb_gru_hidden_next,
+        (const float *)df_gru_hidden_next,
+        (const float *)df_convp_history_next};
+    const size_t count[DFN2_MODEL_IO_STATE_TENSORS] = {
+        DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN,
+        DFN2_MODEL_ERB_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN,
+        DFN2_MODEL_DF_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN,
+        (size_t)DFN2_MODEL_ENCODER_CHANNELS * DFN2_MODEL_DF_PATHWAY_HISTORY *
+            DFN2_DF_BINS};
+    int i;
+    for (i = 0; i < DFN2_MODEL_IO_STATE_TENSORS; ++i) {
+        if (destination[i] == NULL || source[i] == NULL) return -1;
+    }
+    /* Every source that would be copied is checked before any is, so a refusal
+     * leaves all four destination arrays as they were. A source that is its
+     * destination was written in place: skipped, because memcpy with source
+     * == destination is undefined. */
+    for (i = 0; i < DFN2_MODEL_IO_STATE_TENSORS; ++i) {
+        if (source[i] != destination[i] && !all_finite(source[i], count[i]))
+            return -1;
+    }
+    for (i = 0; i < DFN2_MODEL_IO_STATE_TENSORS; ++i) {
+        if (source[i] != destination[i])
+            memcpy(destination[i], source[i], count[i] * sizeof(float));
+    }
     return 0;
 }
 
@@ -139,22 +177,30 @@ int dfn2_model_io_push_features(DFN2ModelIOState *state,
     return state->feature_frames_seen == 2U ? 1 : 0;
 }
 
-int dfn2_model_io_commit_state(
-    DFN2ModelIOState *state,
-    const float encoder_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                                   [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
-                               [DFN2_MODEL_GRU_HIDDEN],
-    const float df_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
-                              [DFN2_MODEL_GRU_HIDDEN],
-    const float pathway_history_next[DFN2_MODEL_ENCODER_CHANNELS]
-                                    [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                                    [DFN2_DF_BINS])
+int dfn2_model_io_validate_state(DFN2ModelIOState *state)
 {
     if (state == NULL) return -1;
-    return dfn2_model_io_commit_arrays(
+    return dfn2_model_io_validate_arrays(
+        state->encoder_gru_hidden, state->erb_gru_hidden,
+        state->df_gru_hidden, state->df_convp_history);
+}
+
+int dfn2_model_io_inherit_state(
+    DFN2ModelIOState *state,
+    const float encoder_gru_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
+                                       [DFN2_MODEL_GRU_HIDDEN],
+    const float erb_gru_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
+                                   [DFN2_MODEL_GRU_HIDDEN],
+    const float df_gru_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
+                                  [DFN2_MODEL_GRU_HIDDEN],
+    const float df_convp_history_next[DFN2_MODEL_ENCODER_CHANNELS]
+                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
+                                     [DFN2_DF_BINS])
+{
+    if (state == NULL) return -1;
+    return dfn2_model_io_inherit_arrays(
         state->encoder_gru_hidden, state->erb_gru_hidden,
         state->df_gru_hidden, state->df_convp_history,
-        encoder_hidden_next, erb_hidden_next, df_hidden_next,
-        pathway_history_next);
+        encoder_gru_hidden_next, erb_gru_hidden_next, df_gru_hidden_next,
+        df_convp_history_next);
 }

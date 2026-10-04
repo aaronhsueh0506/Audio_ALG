@@ -1,4 +1,4 @@
-"""Explicit delta-state export contract for streaming Align-ULCNet."""
+"""Explicit full-state export contract for streaming Align-ULCNet."""
 
 import re
 import shutil
@@ -147,7 +147,7 @@ def test_c_ta_bins_matches_the_python_derivation(tmp_path, sample_rate, n_fft):
     assert c_ta_bins == ta_bins_for(model)
 
 
-def test_streaming_export_shapes_are_fixed_and_delta_only():
+def test_streaming_export_shapes_are_fixed_and_full_state():
     shapes = state_shapes(D, TA_BINS)
     assert shapes['key_history'] == (1, 32, D - 1, 26)
     assert shapes['value_history'] == (1, 32, D - 1, 26)
@@ -162,10 +162,14 @@ def test_streaming_export_shapes_are_fixed_and_delta_only():
         'error_mag', 'far_mag', 'error_cos', 'error_sin', 'error_ri',
         'key_history', 'value_history', 'logit_history', 'h_gru0', 'h_gru1',
     )
+    # Every state input has an _out partner, in the order the inputs are
+    # bound, so the next state is the output tail unchanged.
     assert OUTPUT_NAMES == (
-        'output', 'key_now', 'value_now', 'logit_now',
-        'h_gru0_out', 'h_gru1_out',
+        'output', 'key_history_out', 'value_history_out',
+        'logit_history_out', 'h_gru0_out', 'h_gru1_out',
     )
+    assert OUTPUT_NAMES[1:] == tuple(
+        name + '_out' for name in INPUT_NAMES[SIGNAL_INPUTS:])
 
 
 def test_every_boundary_pair_has_its_own_version():
@@ -178,8 +182,9 @@ def test_every_boundary_pair_has_its_own_version():
     # With every version distinct, pinning the shipped pair is enough: no
     # other pair can then carry the version ulcnet_model_io.h implements.
     assert LAYOUT_VERSIONS[('host', 'split')] == STATE_LAYOUT_VERSION
-    # 3-7 denoted rank-3 boundaries. Reusing one would make a single number
-    # mean two different contracts, which no runtime could tell apart. Tied to
+    # 3-7 denoted rank-3 boundaries and 8-11 the delta-state ones. Reusing
+    # one would make a single number mean two different contracts, which no
+    # runtime could tell apart. Tied to
     # the shipped pair rather than a literal floor, which would still pass
     # after the next bump while no longer guarding anything.
     assert not (set(LAYOUT_VERSIONS.values()) & RETIRED_LAYOUT_VERSIONS)
@@ -196,7 +201,7 @@ def test_graph_feature_layout_restores_the_pre_host_boundary():
     # Same tensor names and semantics as the pre-host boundary, but the
     # recurrent hiddens are rank-4 now, so it cannot reuse that boundary's
     # retired number.
-    assert layout.layout_version == 10
+    assert layout.layout_version == 14
 
 
 @pytest.mark.parametrize('feature', sorted(FEATURE_LAYOUTS))
@@ -240,8 +245,8 @@ def test_every_layout_pair_computes_the_same_frames(feature, gru):
                 rtol=0, atol=0)
             observed_nonzero = observed_nonzero or bool(
                 candidate_state[-1].abs().max() > 0)
-            reference_state = next_state(reference_state, expected, D)
-            candidate_state = next_state(candidate_state, actual, D)
+            reference_state = next_state(expected)
+            candidate_state = next_state(actual)
     assert observed_nonzero, 'state never left its zero initialisation'
 
 
@@ -342,7 +347,7 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     assert legacy['far_input_mode_c_value'] == 0
 
 
-def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
+def test_full_state_wrapper_matches_forward_stream_frame_by_frame():
     torch.manual_seed(20260816)
     model = AlignULCNet(GRID, max_delay_frames=D).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
@@ -364,7 +369,7 @@ def test_delta_state_wrapper_matches_forward_stream_frame_by_frame():
                 host_output(model, outputs[0]), _ri(expected.enhanced),
                 atol=5e-7, rtol=1e-6
             )
-            explicit = next_state(explicit, outputs, D)
+            explicit = next_state(outputs)
 
             align = reference['align']
             assert torch.equal(
@@ -422,11 +427,9 @@ def test_exported_onnx_state_tensors_are_rank_four(tmp_path):
         if name in shapes:
             assert dims(value) == shapes[name], value.name
             outs[name] = dims(value)
-    # The GRU hiddens are REPLACED whole, so each must have an _out partner of
-    # exactly its own shape or the recurrence cannot be fed back. The three
-    # caches are deliberately not here: their outputs are the delta-only
-    # key_now/value_now/logit_now, one frame rather than the ring.
-    assert set(outs) == {'h_gru0', 'h_gru1'}, sorted(outs)
+    # Every state is returned whole, so each must have an _out partner of
+    # exactly its own shape or the two cannot share one address.
+    assert set(outs) == set(ins), sorted(outs)
     assert all(outs[name] == ins[name] for name in outs)
     assert set(ins) == set(shapes) - {COMBINED_GRU_STATE_NAME}
 
@@ -457,8 +460,8 @@ def test_combined_state_stacks_on_the_channel_axis():
             )
             split_out = split(*(signals + split_state))
             combined_out = combined(*(signals + combined_state))
-            split_state = next_state(split_state, split_out, depth)
-            combined_state = next_state(combined_state, combined_out, depth)
+            split_state = next_state(split_out)
+            combined_state = next_state(combined_out)
 
             merged = combined_state[-1]
             assert merged.shape == (1, 2 * GRU_LAYERS, 1, GRU_HIDDEN)
@@ -518,7 +521,7 @@ def test_streaming_onnx_runtime_matches_pytorch(tmp_path):
                 worst = max(worst, float(np.max(
                     np.abs(got - want.numpy())
                 )))
-            state = next_state(state, expected, depth)
+            state = next_state(expected)
     assert worst <= 3e-4
 
 

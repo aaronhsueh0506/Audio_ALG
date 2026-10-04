@@ -202,7 +202,7 @@ and deepvqe_prepost, one object each.
 
 | Model | Accelerator output | Host composition |
 |---|---|---|
-| Align-ULCNet | enhanced RI spectrum + delta state | `ulcnet_prepost` class (WOLA + ulcnet_model_io_commit()) |
+| Align-ULCNet | enhanced RI spectrum + full next state (copied by `ulcnet_model_io_inherit()`, or written in place) | `ulcnet_prepost` class (WOLA + ulcnet_model_io_commit()) |
 | Align-CRUSE | real mask | aiaec_apply_real_mask() |
 | DeepVQE-S | 3x3 complex CCM taps | `deepvqe_prepost` class (deepvqe_ccm_process()) |
 | CAGCRN | complex mask | aiaec_apply_complex_mask() |
@@ -212,8 +212,8 @@ Align-ULCNet and DeepVQE-S each ship a pre/post *class*
 everything between the caller's audio and the accelerator's tensors behind
 one opaque object: `_get_mem_size`/`_init` on a caller pool or
 `_create`/`_destroy` on the heap, then per hop `pre_process` ->
-`frame_inputs` -> (accelerator) -> `frame_commit` or `frame_skip` ->
-`post_process`. Each is compiled once with the io mode fixed at init: TIME
+`frame_inputs` -> (accelerator, then `*_inherit` when the runtime writes its own
+output tensors) -> `frame_commit` or `frame_skip` -> `post_process`. Each is compiled once with the io mode fixed at init: TIME
 (hop in, hop out; the class runs the framing on the caller's `FftHandle`) or
 FREQ (spectrum in, spectrum out; for chaining behind the AEC/GSC seam, whose
 spectra are already in this center=False framing). Both AIAEC classes are one
@@ -228,8 +228,9 @@ spectra are torch.stft normalized=True on a 48 kHz/1024 grid, so chaining an
 AIAEC spectrum into it is a 32x scale error on a different grid -- see that
 header's warning block.
 
-Align-ULCNet CPU state/ring ownership is documented in
-Align_ULCNet/README.md and implemented by ulcnet_model_io.c/.h.
+Align-ULCNet state ownership (caller-owned pool, five state tensors taken over by
+inherit or bound in place, validate-only commit) is documented in Align_ULCNet/README.md and
+implemented by ulcnet_model_io.c/.h.
 
 ## Tests
 

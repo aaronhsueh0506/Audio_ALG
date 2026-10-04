@@ -26,14 +26,6 @@
  * rather than overlap -- see dfn2_process.h's dfn2_compose_stream() note. */
 #define PP_MODEL_LOOKAHEAD (DFN2_MASK_LOOKAHEAD + DFN2_DF_LOOKAHEAD)
 
-/* One set of the four recurrent-state tensors. */
-typedef struct PPStateBank {
-    float *encoder;     /* [DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS]           */
-    float *erb;         /* [DFN2_PREPOST_ERB_HIDDEN_ELEMENTS]               */
-    float *df;          /* [DFN2_PREPOST_DF_HIDDEN_ELEMENTS]                */
-    float *convp;       /* [DFN2_PREPOST_CONVP_HISTORY_ELEMENTS]            */
-} PPStateBank;
-
 struct DFN2Prepost {
     DFN2State        *dsp;
     DFN2ModelIOState *io;
@@ -65,16 +57,13 @@ struct DFN2Prepost {
     float *enh_im;
     float *out_hop;     /* [DFN2_HOP_LEN], DFN2_IO_TIME only                */
 
-    /* Accelerator-writable boundary: the three heads, and the recurrent
-     * state in two banks -- bank[0] is DFN2ModelIOState's own four arrays,
-     * bank[1] a carved copy of their shape. The graph reads bank[live] and
-     * writes bank[live ^ 1]; that bank is validated in full, and only then
-     * does `live` flip. Nothing is copied back, and a refused frame leaves
-     * the live bank untouched. */
+    /* Accelerator-writable boundary: the three heads. The recurrent state is
+     * DFN2ModelIOState's own four arrays, one buffer each, at addresses that
+     * never change: a runtime either writes its state outputs to the same
+     * addresses or hands them over through dfn2_prepost_outputs_inherit(). */
     float *head_erb_mask;   /* [DFN2_N_ERB]                                 */
     float *head_coefs;      /* [DFN2_PREPOST_COEFS_ELEMENTS]                */
     float *head_alpha;      /* [1]                                          */
-    PPStateBank bank[2];
 
     /* Identity heads for frame_skip: a unit band mask and zero coefficients.
      * Written once at init; dfn2_compose_stream refuses NULL heads, so the
@@ -83,7 +72,6 @@ struct DFN2Prepost {
     float *skip_coefs;      /* [DFN2_PREPOST_COEFS_ELEMENTS], all 0.0f      */
 
     int       frame_open;    /* a frame awaits commit or skip               */
-    int       live;          /* the bank the graph reads: 0 or 1            */
     int       prepared;      /* frame_inputs() armed the accelerator
                               * transaction for the open frame              */
     int       have_output;   /* the compose stage emitted this hop          */
@@ -171,10 +159,6 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
         DFN2_PREPOST_ERB_MASK_ELEMENTS,          /* head_erb_mask */
         DFN2_PREPOST_COEFS_ELEMENTS,             /* head_coefs    */
         DFN2_PREPOST_ALPHA_ELEMENTS,             /* head_alpha    */
-        DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS,    /* bank[1].encoder */
-        DFN2_PREPOST_ERB_HIDDEN_ELEMENTS,        /* bank[1].erb     */
-        DFN2_PREPOST_DF_HIDDEN_ELEMENTS,         /* bank[1].df      */
-        DFN2_PREPOST_CONVP_HISTORY_ELEMENTS,     /* bank[1].convp   */
         DFN2_PREPOST_ERB_MASK_ELEMENTS,          /* skip_mask     */
         DFN2_PREPOST_COEFS_ELEMENTS              /* skip_coefs    */
     };
@@ -190,13 +174,7 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
     if (base && p) p->dsp = (DFN2State *)ptr;
     if (pp_carve(base, &cursor, sizeof(DFN2ModelIOState), &ptr) != 0)
         return -1;
-    if (base && p) {
-        p->io = (DFN2ModelIOState *)ptr;
-        p->bank[0].encoder = &p->io->encoder_gru_hidden[0][0];
-        p->bank[0].erb = &p->io->erb_gru_hidden[0][0];
-        p->bank[0].df = &p->io->df_gru_hidden[0][0];
-        p->bank[0].convp = &p->io->df_convp_history[0][0][0];
-    }
+    if (base && p) p->io = (DFN2ModelIOState *)ptr;
 
     /* DFN2_IO_TIME only: the output hop staging. Everything else the framing
      * needs is embedded in DFN2State by value (see the header's honest note
@@ -212,10 +190,8 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
         slots[2]  = &p->feat_erb;      slots[3]  = &p->feat_spec;
         slots[4]  = &p->enh_re;        slots[5]  = &p->enh_im;
         slots[6]  = &p->head_erb_mask; slots[7]  = &p->head_coefs;
-        slots[8]  = &p->head_alpha;    slots[9]  = &p->bank[1].encoder;
-        slots[10] = &p->bank[1].erb;   slots[11] = &p->bank[1].df;
-        slots[12] = &p->bank[1].convp; slots[13] = &p->skip_mask;
-        slots[14] = &p->skip_coefs;
+        slots[8]  = &p->head_alpha;    slots[9]  = &p->skip_mask;
+        slots[10] = &p->skip_coefs;
     }
     for (i = 0; i < n_float_regions; ++i) {
         if (pp_carve(base, &cursor, float_counts[i] * sizeof(float),
@@ -297,7 +273,6 @@ static void pp_reset_states(DFN2Prepost *p) {
     }
     dfn2_set_erb_matrices(p->dsp, p->erb_fwd, p->erb_inv);
     dfn2_model_io_init(p->io);
-    p->live = 0;
 }
 
 /* Per-hop bookkeeping only. The staging buffers are deliberately NOT
@@ -471,6 +446,13 @@ static void pp_fill_nan(float *values, size_t count) {
     skn_fill_f32(values, count, (float)NAN);
 }
 
+static void pp_zero_state(DFN2Prepost *p) {
+    memset(p->io->encoder_gru_hidden, 0, sizeof(p->io->encoder_gru_hidden));
+    memset(p->io->erb_gru_hidden, 0, sizeof(p->io->erb_gru_hidden));
+    memset(p->io->df_gru_hidden, 0, sizeof(p->io->df_gru_hidden));
+    memset(p->io->df_convp_history, 0, sizeof(p->io->df_convp_history));
+}
+
 /* Features, graph window, compose clock. Shared by every pre_process entry
  * point so the modes cannot drift in what they advance. `est_*` is the
  * spectrum the features are taken from, read only inside this call.
@@ -550,10 +532,7 @@ int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p,
 
 int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
                               DFN2PrepostOutputs *outputs) {
-    const PPStateBank *live, *spare;
     if (!p || !inputs || !outputs || !p->frame_open) return -1;
-    live = &p->bank[p->live];
-    spare = &p->bank[p->live ^ 1];
 
     memset(inputs, 0, sizeof(*inputs));
     inputs->erb_window =
@@ -562,14 +541,14 @@ int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
         (const float (*)[DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS])
             p->io->spec_window;
     inputs->encoder_gru_hidden =
-        (const float (*)[DFN2_MODEL_GRU_HIDDEN])live->encoder;
+        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->encoder_gru_hidden;
     inputs->erb_gru_hidden =
-        (const float (*)[DFN2_MODEL_GRU_HIDDEN])live->erb;
+        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->erb_gru_hidden;
     inputs->df_gru_hidden =
-        (const float (*)[DFN2_MODEL_GRU_HIDDEN])live->df;
+        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->df_gru_hidden;
     inputs->df_convp_history =
         (const float (*)[DFN2_MODEL_DF_PATHWAY_HISTORY][DFN2_DF_BINS])
-            live->convp;
+            p->io->df_convp_history;
     inputs->erb_window_elements = DFN2_PREPOST_ERB_WINDOW_ELEMENTS;
     inputs->spec_window_elements = DFN2_PREPOST_SPEC_WINDOW_ELEMENTS;
     inputs->encoder_gru_hidden_elements =
@@ -578,30 +557,23 @@ int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
     inputs->df_gru_hidden_elements = DFN2_PREPOST_DF_HIDDEN_ELEMENTS;
     inputs->df_convp_history_elements = DFN2_PREPOST_CONVP_HISTORY_ELEMENTS;
 
-    /* NaN-fill every writable output, so a caller that asks twice still gets
-     * a clean boundary rather than a half-written one, and so a partial
-     * accelerator write fails commit instead of replaying last frame. */
+    /* NaN-fill the three heads, so a caller that asks twice still gets a
+     * clean boundary rather than a half-written one, and so a partial
+     * accelerator write fails commit instead of replaying last frame. The
+     * recurrent state is the accelerator's input as well as its output and is
+     * left as it is. */
     pp_fill_nan(p->head_erb_mask, DFN2_PREPOST_ERB_MASK_ELEMENTS);
     pp_fill_nan(p->head_coefs, DFN2_PREPOST_COEFS_ELEMENTS);
     pp_fill_nan(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS);
-    pp_fill_nan(spare->encoder, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS);
-    pp_fill_nan(spare->erb, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS);
-    pp_fill_nan(spare->df, DFN2_PREPOST_DF_HIDDEN_ELEMENTS);
-    pp_fill_nan(spare->convp, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS);
 
     memset(outputs, 0, sizeof(*outputs));
     outputs->erb_mask = p->head_erb_mask;
     outputs->coefs = p->head_coefs;
     outputs->alpha = p->head_alpha;
-    outputs->encoder_gru_hidden_next =
-        (float (*)[DFN2_MODEL_GRU_HIDDEN])spare->encoder;
-    outputs->erb_gru_hidden_next =
-        (float (*)[DFN2_MODEL_GRU_HIDDEN])spare->erb;
-    outputs->df_gru_hidden_next =
-        (float (*)[DFN2_MODEL_GRU_HIDDEN])spare->df;
-    outputs->df_convp_history_next =
-        (float (*)[DFN2_MODEL_DF_PATHWAY_HISTORY][DFN2_DF_BINS])
-            spare->convp;
+    outputs->encoder_gru_hidden_next = p->io->encoder_gru_hidden;
+    outputs->erb_gru_hidden_next = p->io->erb_gru_hidden;
+    outputs->df_gru_hidden_next = p->io->df_gru_hidden;
+    outputs->df_convp_history_next = p->io->df_convp_history;
     outputs->erb_mask_elements = DFN2_PREPOST_ERB_MASK_ELEMENTS;
     outputs->coefs_elements = DFN2_PREPOST_COEFS_ELEMENTS;
     outputs->alpha_elements = DFN2_PREPOST_ALPHA_ELEMENTS;
@@ -649,34 +621,98 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
 }
 
 int dfn2_prepost_frame_commit(DFN2Prepost *p) {
-    const PPStateBank *spare;
+    int heads_finite;
     if (!p || !p->prepared) return -1;   /* prepared implies frame_open */
-    spare = &p->bank[p->live ^ 1];
 
-    /* Reject-first, in full, before anything moves. Every accelerator
-     * output is validated up front -- the three heads AND the four
-     * next-state tensors -- and a refusal disarms the transaction: the
-     * caller either takes frame_skip() or re-runs the accelerator through
-     * a fresh frame_inputs(). Nothing persistent has been touched. */
-    if (!pp_all_finite(p->head_erb_mask, DFN2_PREPOST_ERB_MASK_ELEMENTS) ||
-        !pp_all_finite(p->head_coefs, DFN2_PREPOST_COEFS_ELEMENTS) ||
-        !pp_all_finite(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS) ||
-        !pp_all_finite(spare->encoder, DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS) ||
-        !pp_all_finite(spare->erb, DFN2_PREPOST_ERB_HIDDEN_ELEMENTS) ||
-        !pp_all_finite(spare->df, DFN2_PREPOST_DF_HIDDEN_ELEMENTS) ||
-        !pp_all_finite(spare->convp, DFN2_PREPOST_CONVP_HISTORY_ELEMENTS)) {
+    /* On the in-place path the accelerator overwrote the recurrent state, so
+     * there is nothing to roll back to: a non-finite head or state element
+     * zeroes the four recurrent tensors, disarms the transaction and leaves
+     * the frame open, and the caller either takes frame_skip() or re-runs the
+     * accelerator through a fresh frame_inputs(). Windows, compose state and
+     * clocks are not touched. */
+    heads_finite =
+        pp_all_finite(p->head_erb_mask, DFN2_PREPOST_ERB_MASK_ELEMENTS) &&
+        pp_all_finite(p->head_coefs, DFN2_PREPOST_COEFS_ELEMENTS) &&
+        pp_all_finite(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS);
+    if (dfn2_model_io_validate_state(p->io) != 0 || !heads_finite) {
+        pp_zero_state(p);   /* a head can fail while the state is finite */
         p->prepared = 0;
         return -1;
     }
 
-    /* The validated bank becomes the live recurrent state. The compose
-     * stage then advances its clock and closes the frame -- the one step
-     * with no undo, placed where nothing can fail after it (its
-     * preconditions -- heads finite, clock aligned -- hold here). The two
-     * touch disjoint state. */
-    p->live ^= 1;
+    /* The compose stage then advances its clock and closes the frame -- the
+     * one step with no undo, placed where nothing can fail after it (its
+     * preconditions -- heads finite, clock aligned -- hold here). */
     return pp_close_frame(p, p->head_erb_mask, p->head_coefs,
                           p->head_alpha[0]);
+}
+
+/* One tensor of the copy path: the pool's destination, the runtime's own
+ * source, and the destination's element count. */
+typedef struct {
+    float *destination;
+    const float *source;
+    size_t count;
+    size_t source_count;
+} PpInheritTensor;
+
+enum { PP_INHERIT_TENSORS = 7 };
+
+int dfn2_prepost_outputs_inherit(const DFN2PrepostOutputs *destination,
+                                 const DFN2PrepostOutputs *runtime) {
+    PpInheritTensor tensor[PP_INHERIT_TENSORS];
+    int i;
+    if (!destination || !runtime) return -1;
+    tensor[0] = (PpInheritTensor){destination->erb_mask, runtime->erb_mask,
+                                  destination->erb_mask_elements,
+                                  runtime->erb_mask_elements};
+    tensor[1] = (PpInheritTensor){destination->coefs, runtime->coefs,
+                                  destination->coefs_elements,
+                                  runtime->coefs_elements};
+    tensor[2] = (PpInheritTensor){destination->alpha, runtime->alpha,
+                                  destination->alpha_elements,
+                                  runtime->alpha_elements};
+    tensor[3] = (PpInheritTensor){
+        (float *)destination->encoder_gru_hidden_next,
+        (const float *)runtime->encoder_gru_hidden_next,
+        destination->encoder_gru_hidden_elements,
+        runtime->encoder_gru_hidden_elements};
+    tensor[4] = (PpInheritTensor){
+        (float *)destination->erb_gru_hidden_next,
+        (const float *)runtime->erb_gru_hidden_next,
+        destination->erb_gru_hidden_elements,
+        runtime->erb_gru_hidden_elements};
+    tensor[5] = (PpInheritTensor){
+        (float *)destination->df_gru_hidden_next,
+        (const float *)runtime->df_gru_hidden_next,
+        destination->df_gru_hidden_elements,
+        runtime->df_gru_hidden_elements};
+    tensor[6] = (PpInheritTensor){
+        (float *)destination->df_convp_history_next,
+        (const float *)runtime->df_convp_history_next,
+        destination->df_convp_history_elements,
+        runtime->df_convp_history_elements};
+
+    /* Shape and pointer checks for all seven first, then the finite check of
+     * every tensor that would be copied, so a refusal copies nothing. A
+     * tensor the runtime wrote in place is skipped throughout: it is the
+     * destination's own memory, frame_commit() checks it, and memcpy with
+     * source == destination is undefined. */
+    for (i = 0; i < PP_INHERIT_TENSORS; ++i) {
+        if (!tensor[i].destination || !tensor[i].source) return -1;
+        if (tensor[i].count == 0u ||
+            tensor[i].count != tensor[i].source_count) return -1;
+    }
+    for (i = 0; i < PP_INHERIT_TENSORS; ++i) {
+        if (tensor[i].source == tensor[i].destination) continue;
+        if (!pp_all_finite(tensor[i].source, tensor[i].count)) return -1;
+    }
+    for (i = 0; i < PP_INHERIT_TENSORS; ++i) {
+        if (tensor[i].source == tensor[i].destination) continue;
+        memcpy(tensor[i].destination, tensor[i].source,
+               tensor[i].count * sizeof(float));
+    }
+    return 0;
 }
 
 int dfn2_prepost_frame_skip(DFN2Prepost *p) {
@@ -685,8 +721,8 @@ int dfn2_prepost_frame_skip(DFN2Prepost *p) {
      * partition-of-unity erb_inv, and alpha 0 selects the masked residual
      * rather than the deep filter, so the noisy spectrum passes through and
      * the attenuation limit becomes a no-op on it. The recurrent state is not
-     * stepped -- commit_state is simply not called -- while the deep-filter
-     * and compose clocks still advance. */
+     * touched here, so it stays as the accelerator left it, while the
+     * deep-filter and compose clocks still advance. */
     return pp_close_frame(p, p->skip_mask, p->skip_coefs, 0.0f);
 }
 
@@ -726,8 +762,9 @@ int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p) {
         return dfn2_prepost_frame_skip(p) == 0 ? 0 : -1;
     }
     if (dfn2_prepost_frame_commit(p) != 0) {
-        /* A refused commit leaves the frame open with nothing moved; take
-         * it as the identity so the clocks advance exactly once. */
+        /* A refused commit leaves the frame open with the recurrent state
+         * zeroed; take it as the identity so the clocks advance exactly
+         * once. */
         return dfn2_prepost_frame_skip(p) == 0 ? 0 : -1;
     }
     return 1;

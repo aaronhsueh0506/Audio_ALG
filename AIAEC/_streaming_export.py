@@ -5,7 +5,7 @@ One new STFT frame is supplied per invocation for causal models. Every
 temporal convolution history, attention ring and recurrent hidden tensor is
 an ordinary graph input/output.
 
-Align-ULCNet keeps its specialised exporter because its delta-state ABI is
+Align-ULCNet keeps its specialised exporter because its full-state ABI is
 already paired with ``ulcnet_model_io.c``.
 
 Recurrent-state layouts

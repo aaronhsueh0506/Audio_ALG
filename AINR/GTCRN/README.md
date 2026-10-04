@@ -49,19 +49,35 @@ The deployment ONNX does not contain the fixed ERB front/back end:
 `gtcrn_model_input()` applies `erb_fwd.bin` before inference and
 `gtcrn_model_output()` applies `erb_inv.bin` plus the complex mask afterward.
 `gtcrn_process.c/.h` also owns STFT/WOLA and defines `GTCRNModelState` for
-caller-owned state handoff. The model consumes one new STFT frame per
+caller-owned state. The model consumes one new STFT frame per
 invocation; GTCRN must not be padded to an artificial three-frame input
 because its full temporal context already lives in the explicit state
 tensors.
 
-`gtcrn_model_state_commit()` is transactional and returns `int`. It validates
-every element of every state output before writing any of them, so a single
-NaN or Inf anywhere refuses the whole commit with `-1` and leaves the previous
-state byte-identical — the caller keeps replaying its last good state instead
-of continuing from a half-updated one, which the next invocation could not
-distinguish from a healthy state. Callers should check the return value; the
-safe fallback is to reuse the previous state or reset. State layout v6 — the
-`split` layout — keeps the same 72,192 state bytes as v5 but removes the
+`GTCRNModelState` is the state buffer itself, and there are two ways to feed it.
+
+- Normal path: the runtime writes each state `*_out` tensor into its own output
+  buffer and `gtcrn_model_state_inherit(state, conv_out, h_tra_out,
+  h_dpgrnn_out)` copies them into the struct (`conv_out[6]`, `h_tra_out[6]`,
+  `h_dpgrnn_out[4]`, each element laid out like the matching field). It
+  finite-checks every tensor it would copy before copying any: on success it
+  returns `0`; on a null argument or any NaN/Inf it returns `-1`, copies
+  nothing and leaves the state intact, so the caller treats the frame as
+  failed. A tensor whose pointer already equals its field is skipped (neither
+  checked nor copied).
+- Optimized path (saves the copy): bind each state input and its `*_out` output
+  to the same field (`&state->conv_enc0` ... `&state->conv_dec2`,
+  `&state->h_tra[i]`, `&state->h_dpgrnn[i]`) so the CPU copies nothing between
+  invocations. The runtime must read every state input before it writes any
+  state output at the same address. `gtcrn_model_state_validate()` is then an
+  optional finite check of the whole state in place and returns `int`: `0` when
+  every element is finite, `-1` on a null argument or on any NaN/Inf, in which
+  case the whole state is zeroed (it restarts from zero) because the previous
+  value no longer exists.
+
+A partial or mixed write that stays finite is not detectable on either path.
+
+State layout v6 — the `split` layout — keeps the same 72,192 state bytes as v5 but removes the
 graph-side slicing and packing that a shared cache tensor needed. The exported metadata
 carries `state_layout_version`, kept numerically equal to
 `GTCRN_MODEL_LAYOUT_VERSION` in `gtcrn_process.h`, so an integrator can refuse

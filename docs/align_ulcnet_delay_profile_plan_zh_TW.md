@@ -216,10 +216,12 @@ descriptor 與 pipeline config 不一致時 init 失敗，不可 clamp 或 fallb
 
 - 支援 `D=2..64`；`D=1` 只允許 Python 評估，不列入 portable ONNX ABI。
 - 每個 D 是獨立 ONNX/descriptor/profile；不可在同一 instance 中熱改。
-- CPU/DSP 擁有 K/V ring、logit history、兩組 GRU hidden；accelerator 每次
-  只處理 T=1 並回傳 delta state。
+- CPU/DSP 擁有 K/V history、logit history、兩組 GRU hidden（2026-10-04 起五個
+  state 由 inherit 複製，或就地綁定）；accelerator 每次只處理 T=1 並回傳每個 state 的完整
+  下一個值（ring 位移在 graph 內）。
 - state pool size 必須隨 D 下降；query/init/carve 必須 lockstep。
-- prepare 後 accelerator fail、NaN/Inf 或 partial write 時不得 commit state；
+- prepare 後 accelerator fail、NaN/Inf 或 partial write 時 commit 失敗
+  （2026-10-04 起：就地路徑的 state 已被覆寫、無法回滾，五個 state 歸零；複製路徑的 inherit 被拒時 state 不變）；
   output 必須 identity/fail-open，下一幀可以恢復。
 - delay generation 改變時必須 reset state，不能保留前一個 alignment 的
   K/V history。
@@ -368,9 +370,10 @@ sanity 仍獨立保留。
 ### 8.1 不需重寫的現有元件
 
 - `ulcnet_model_io_get_mem_requirements()` 已依 descriptor `delay_depth`
-  精確配置 K/V、logit 與 delta state；D=4/8 不會保留 D=64 最大陣列。
-- `ulcnet_model_io_reset/prepare/commit()` 已具備 external-state reset、NaN
-  prefill、one-prepare/one-commit 與失敗不推進 persistent state 的交易語意。
+  精確配置 K/V、logit 與 GRU state；D=4/8 不會保留 D=64 最大陣列。
+- `ulcnet_model_io_reset/prepare/commit()` 已具備 external-state reset、`output`
+  NaN prefill、one-prepare/one-commit 與 validate-only commit（失敗時五個
+  state 歸零）的交易語意。
 - mono 已有 ALIGNED unlock fail-open、RAW unlocked apply、delay-change reset、
   NaN/partial-write 與 raw far timestamp 測試。
 - 4ch 已是單一 shared delay estimator；四個 lane AEC 都以

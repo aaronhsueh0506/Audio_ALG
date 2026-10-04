@@ -193,17 +193,35 @@ void rnnoise_model_state_init(RNNoiseModelState *state) {
     if (state != NULL) memset(state, 0, sizeof(*state));
 }
 
-int rnnoise_model_state_commit(
-    RNNoiseModelState *state,
-    const float hidden_out[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]) {
+static int hidden_finite(
+    const float hidden[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]) {
     int layer;
     int index;
-    if (state == NULL || hidden_out == NULL) return -1;
     for (layer = 0; layer < RNNOISE_MODEL_GRU_COUNT; ++layer) {
         for (index = 0; index < RNNOISE_MODEL_GRU_SIZE; ++index) {
-            if (!isfinite(hidden_out[layer][index])) return -1;
+            if (!isfinite(hidden[layer][index])) return 0;
         }
     }
+    return 1;
+}
+
+int rnnoise_model_state_validate(RNNoiseModelState *state) {
+    if (state == NULL) return -1;
+    if (!hidden_finite(state->hidden)) {
+        rnnoise_model_state_init(state);
+        return -1;
+    }
+    return 0;
+}
+
+int rnnoise_model_state_inherit(
+    RNNoiseModelState *state,
+    const float hidden_out[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]) {
+    if (state == NULL || hidden_out == NULL) return -1;
+    /* The runtime wrote the whole block in place: nothing to check or copy
+     * (copying a range onto itself is undefined). */
+    if (&hidden_out[0][0] == &state->hidden[0][0]) return 0;
+    if (!hidden_finite(hidden_out)) return -1;
     memcpy(state->hidden, hidden_out, sizeof(state->hidden));
     return 0;
 }

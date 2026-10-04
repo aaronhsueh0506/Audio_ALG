@@ -102,8 +102,9 @@ extern "C" {
 #define DEEPVQE_PREPOST_ALIGNMENT      16u
 /* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
  * so a pool recorded by the previous carve is refused on the hash, not only
- * on `bytes`. 2: the TIME analyses became two AiaecAnalysis states. */
-#define DEEPVQE_PREPOST_CARVE_VERSION  2u
+ * on `bytes`. 2: the TIME analyses became two AiaecAnalysis states.
+ * 3: one state set, with no second bank. */
+#define DEEPVQE_PREPOST_CARVE_VERSION  3u
 
 /* Alignment search depth D, the exporter's max_delay_frames. It sizes the
  * attention key/value rings and the score history, so it is a pool-size
@@ -239,7 +240,7 @@ typedef struct DeepVqePrepost DeepVqePrepost;
  * compression INSIDE the graph, unlike Align-ULCNet whose front end was
  * moved to the host. Nothing is compressed, scaled or masked here.
  * `state[]`/`state_elements[]` are indexed by DeepVqeStateId. Pointers are
- * into the instance's pool and stay valid until the next pre_process. */
+ * into the instance's pool and stay valid for the life of the instance. */
 typedef struct DeepVqePrepostInputs {
     const float *mic;                            /* [1,1,BINS,2] */
     const float *far;                            /* [1,1,BINS,2] */
@@ -248,13 +249,26 @@ typedef struct DeepVqePrepostInputs {
     size_t       state_elements[DEEPVQE_STATE_COUNT];
 } DeepVqePrepostInputs;
 
-/* Accelerator-writable outputs. Unlike Align-ULCNet, whose graph returns
- * only the delta state, DeepVQE-S returns the FULL next value of every state
- * tensor -- so the pool holds two banks and commit() swaps them. That is
- * also why the NaN prefill and the finite check below each walk the whole
- * ~700 kB state at 16 kHz/D=63: it is what makes "on failure nothing moves"
- * an enforced property rather than a claim.
- * prepare() fills every element with NaN so commit() detects partial writes. */
+/* Accelerator-writable outputs. The graph returns the FULL next value of
+ * every state tensor.
+ *
+ * The pool holds ONE buffer per state tensor, and `state_out[id]` is the SAME
+ * pointer as the matching `inputs.state[id]`, stable for the life of the
+ * instance. Two ways to bind it:
+ *
+ *  - NORMAL PATH: the runtime writes its OWN output tensors (taps and sixteen
+ *    state_out), then deepvqe_prepost_outputs_inherit() copies them into the
+ *    pool. The runtime's tensors are runtime-owned; nothing is allocated here.
+ *  - OPTIMIZED PATH: bind the graph's `*_out` outputs to the pointers
+ *    frame_inputs() returned and skip inherit. The output of frame t is then
+ *    already the input of frame t+1 and nothing is copied. The runtime must
+ *    finish reading EVERY state input before it writes any state output at
+ *    that address (true of a runtime that materialises its outputs after
+ *    compute). A partial or mixed write is not detectable beyond the finite
+ *    check in frame_commit.
+ *
+ * Only `taps` is NaN-prefilled by frame_inputs(): state tensors carry the
+ * input and are left alone. */
 typedef struct DeepVqePrepostOutputs {
     float *taps;   /* [1,1,BINS,TIME_ORDER*FREQ_TAPS*2], packed CCM taps */
     size_t taps_elements;
@@ -376,36 +390,61 @@ int deepvqe_prepost_pre_process_freq(DeepVqePrepost *p,
                                      const float far_re[AIAEC_N_BINS],
                                      const float far_im[AIAEC_N_BINS]);
 
-/* Publish the current frame's accelerator boundary. Every writable output
- * is NaN-prefilled, so a partial write is caught by frame_commit rather than
- * leaking the previous frame's values. Pointers are into this instance's
- * pool and stay valid until the next pre_process. Returns 0, or -1 if no
- * frame is open. */
+/* Publish the current frame's accelerator boundary. `taps` is NaN-prefilled,
+ * so a partial head write is caught by frame_commit rather than leaking the
+ * previous frame's values; the state tensors are not touched (see
+ * DeepVqePrepostOutputs). Pointers are into this instance's pool and are the
+ * same on every call. Returns 0, or -1 if no frame is open. */
 int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
                                  DeepVqePrepostInputs *inputs,
                                  DeepVqePrepostOutputs *outputs);
 
-/* Transactional: validates that the accelerator wrote every tap and every
- * state element, swaps the state banks, then applies the CCM taps to the raw
- * microphone spectrum ring (deepvqe_ccm_process) and feeds the result to the
- * synthesis (DEEPVQE_IO_TIME) or stages it for post_process_freq.
+/* COPY PATH. Copy the runtime's own output tensors into the pool.
+ * `destination` is the struct frame_inputs() returned; `runtime` has the same
+ * type, filled by the runtime with ITS OWN tensor pointers (taps and sixteen
+ * state_out) and the same element counts. Runtime tensors are runtime-owned:
+ * nothing is allocated or retained here.
+ *
+ * A tensor whose runtime pointer equals the destination pointer was written
+ * in place and is left alone (it is never copied onto itself, and inherit does
+ * not check it; frame_commit does). Every other tensor is first checked
+ * finite; if any is not, NOTHING is copied and -1 is returned.
+ *
+ * Refused inherit (copy path): the state is exactly as before, so the caller
+ * reports the run failed and takes deepvqe_prepost_frame_skip(). Non-finite
+ * write caught at commit (in-place path): the state restarts from zero.
+ *
+ * Returns 0, or -1 on NULL arguments, a NULL tensor pointer on either side, an
+ * element-count mismatch, or a non-finite value in a tensor to be copied. */
+int deepvqe_prepost_outputs_inherit(const DeepVqePrepostOutputs *destination,
+                                    const DeepVqePrepostOutputs *runtime);
+
+/* Validate the frame's outputs and advance the CCM ring. Copies and swaps
+ * nothing itself: on the normal path deepvqe_prepost_outputs_inherit() has
+ * already put the runtime's tensors in the pool, on the optimized path the
+ * runtime wrote them there. Checks that every tap and every state element
+ * is finite, then applies the CCM taps to the raw microphone spectrum ring
+ * (deepvqe_ccm_process) and feeds the result to the synthesis
+ * (DEEPVQE_IO_TIME) or stages it for post_process_freq.
  *
  * Requires a frame opened by pre_process AND published by frame_inputs():
  * a commit with no frame_inputs() behind it is refused, so an accelerator
  * that never ran cannot pass untouched buffers off as a result.
  *
- * On failure NOTHING moves -- the state banks do not swap, the CCM ring does
- * not advance, persistent state is byte-identical, the frame stays open and
- * -1 is returned. The caller then either calls deepvqe_prepost_frame_skip()
- * to keep the framing schedule intact, or re-runs the accelerator through a
- * fresh frame_inputs(). */
+ * On a non-finite tap or state element the write cannot be rolled back, so
+ * every state tensor is ZEROED (cold recurrent state), the CCM ring does not
+ * advance, the transaction is disarmed, the frame stays open and -1 is
+ * returned. The caller then calls deepvqe_prepost_frame_skip() to keep the
+ * framing schedule intact, or re-runs the accelerator through a fresh
+ * frame_inputs() from the cold state. */
 int deepvqe_prepost_frame_commit(DeepVqePrepost *p);
 
-/* Fail CLOSED for the current frame: emit SILENCE, do not step the model's
- * state banks, and do not advance the CCM spectrum ring -- so model time and
- * host time stay consistent at "this frame never happened". Only the framing
- * schedule advances. This is what a failed accelerator run and an
- * alignment-boundary reprime both need.
+/* Fail CLOSED for the current frame: emit SILENCE and do not advance the CCM
+ * spectrum ring. The state tensors are left exactly as the accelerator wrote
+ * them: a runtime that reports failure did not write, so a skip after a
+ * failed run leaves the model state where it was; a skip after a completed
+ * run keeps that run's state. Only the framing schedule advances. This is
+ * what a failed accelerator run and an alignment-boundary reprime both need.
  *
  * It is deliberately NOT the pass-through identity Align-ULCNet takes:
  * DeepVQE-S's stream 0 is the raw microphone, so pass-through would emit the

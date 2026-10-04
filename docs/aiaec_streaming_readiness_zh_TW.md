@@ -19,7 +19,7 @@
 
 | Model | Route | Signal input | Explicit state | Accelerator output |
 |---|---|---|---|---|
-| Align-ULCNet | PBFDKF -> RES+NR | linear error + far | K/V history、logit history、兩層 GRU hidden | enhanced RI + state delta |
+| Align-ULCNet | PBFDKF -> RES+NR | linear error + far | K/V history、logit history、兩層 GRU hidden | enhanced RI + 完整下一組 state（inherit 複製，或就地綁定） |
 | Align-CRUSE | E2E AEC+RES+NR | microphone + far | convolution/GRU/alignment state、score sum、frame index | real mask + next state |
 | DeepVQE-S | E2E AEC+RES+NR | microphone + far | convolution/GRU/delay state | 3x3 complex CCM taps + next state |
 | CAGCRN | E2E AEC+RES+NR | microphone + far | convolution/GRU/delay state | complex mask + next state |
@@ -31,8 +31,9 @@
 CPU 每 hop 執行 PBFDKF，取得 formed linear error 與該 hop 實際消費的
 aligned far，再推進 STFT。
 accelerator 每次收到當前 frame，以及 CPU 保存的 K/V、logit 與 GRU
-state。graph 回傳 enhanced spectrum、當前 K/V/logit 與下一組 GRU
-state。CPU 更新 ring 後以 WOLA 合成。
+state。graph 回傳 enhanced spectrum 與每個 state 的完整下一個值（K/V/logit 的 ring
+位移在 graph 內完成；一般 runtime 的 state 輸出由 `ulcnet_model_io_inherit()` 複製進
+state；能把 `*_out` 綁到輸入位址的 runtime 就地寫入、省略這個呼叫）。CPU 的 commit 只做驗證，再以 WOLA 合成。
 
 D（max_delay_frames）是 export-time state shape。它不改變 learned weight
 shape，但 ONNX、calibration manifest 與 ulcnet_model_io 的記憶體配置必須

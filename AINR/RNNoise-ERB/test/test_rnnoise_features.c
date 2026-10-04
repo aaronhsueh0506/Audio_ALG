@@ -100,7 +100,6 @@ int main(void) {
     RNNoiseState actual;
     RNNoiseModelState model_state;
     RNNoiseModelState previous_model_state;
-    float hidden_next[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE];
     RefState ref;
     float re[RNNOISE_N_BINS], im[RNNOISE_N_BINS];
     float got_erb[3][RNNOISE_N_BANDS], want_erb[3][RNNOISE_N_BANDS];
@@ -110,48 +109,129 @@ int main(void) {
 
     rnnoise_state_init(&actual);
     rnnoise_model_state_init(&model_state);
-    memset(hidden_next, 0x3d, sizeof(hidden_next));
-    if (rnnoise_model_state_commit(&model_state, hidden_next) != 0 ||
-        memcmp(model_state.hidden, hidden_next, sizeof(hidden_next)) != 0) {
-        printf("FAIL: RNNoise model-state output/input handoff\n");
-        ok = 0;
-    }
+    /* The state struct is the buffer the graph's h*_out outputs write into,
+     * so a healthy state validates in place and is left byte-identical. */
+    memset(model_state.hidden, 0x3d, sizeof(model_state.hidden));
     previous_model_state = model_state;
-    /* Every byte of the rejected batch must DIFFER from what is already
-     * committed. Re-using the accepted 0x3d pattern made a non-transactional
-     * commit -- one that writes each element until it reaches the bad one --
-     * byte-indistinguishable from a clean refusal, so the memcmp below proved
-     * nothing about partial writeback. */
-    memset(hidden_next, 0x41, sizeof(hidden_next));
-    hidden_next[1][17] = NAN;
-    if (rnnoise_model_state_commit(&model_state, hidden_next) == 0 ||
-        memcmp(&model_state, &previous_model_state, sizeof(model_state)) != 0) {
-        printf("FAIL: RNNoise accepted or partially committed NaN GRU state\n");
+    if (rnnoise_model_state_validate(&model_state) != 0 ||
+        memcmp(&model_state, &previous_model_state,
+               sizeof(model_state)) != 0) {
+        printf("FAIL: RNNoise validate changed or rejected a finite state\n");
         ok = 0;
     }
-    memset(hidden_next, 0x41, sizeof(hidden_next));
-    hidden_next[1][17] = INFINITY;
-    if (rnnoise_model_state_commit(&model_state, hidden_next) == 0 ||
-        memcmp(&model_state, &previous_model_state, sizeof(model_state)) != 0) {
-        printf("FAIL: RNNoise accepted or partially committed Inf GRU state\n");
+    if (rnnoise_model_state_validate(NULL) != -1) {
+        printf("FAIL: RNNoise validate accepted a NULL state\n");
         ok = 0;
     }
-    /* The bad value sits in the LAST layer here, so a commit that validated
-     * only the first layer before copying would pass the cases above. */
-    memset(hidden_next, 0x41, sizeof(hidden_next));
-    hidden_next[RNNOISE_MODEL_GRU_COUNT - 1][RNNOISE_MODEL_GRU_SIZE - 1] = NAN;
-    if (rnnoise_model_state_commit(&model_state, hidden_next) == 0 ||
-        memcmp(&model_state, &previous_model_state, sizeof(model_state)) != 0) {
-        printf("FAIL: RNNoise committed a NaN in the final GRU layer\n");
+    /* A bad element in any layer, first and last position included, must
+     * zero the WHOLE state (every other element is nonzero beforehand). */
+    {
+        static const int bad_layer[] = {0, 1, RNNOISE_MODEL_GRU_COUNT - 1,
+                                        RNNOISE_MODEL_GRU_COUNT - 1};
+        static const int bad_index[] = {0, 17, 5, RNNOISE_MODEL_GRU_SIZE - 1};
+        static const float bad_value[] = {NAN, INFINITY, -INFINITY, NAN};
+        RNNoiseModelState zeros;
+        memset(&zeros, 0, sizeof(zeros));
+        for (int c = 0; c < 4; ++c) {
+            memset(model_state.hidden, 0x41, sizeof(model_state.hidden));
+            model_state.hidden[bad_layer[c]][bad_index[c]] = bad_value[c];
+            if (rnnoise_model_state_validate(&model_state) != -1 ||
+                memcmp(&model_state, &zeros, sizeof(model_state)) != 0) {
+                printf("FAIL: RNNoise non-finite hidden[%d][%d] did not "
+                       "return -1 and zero the state\n",
+                       bad_layer[c], bad_index[c]);
+                ok = 0;
+            }
+        }
+    }
+    /* A finite state must still validate after a refusal: the check is per
+     * call, not a latch. */
+    memset(model_state.hidden, 0x41, sizeof(model_state.hidden));
+    previous_model_state = model_state;
+    if (rnnoise_model_state_validate(&model_state) != 0 ||
+        memcmp(&model_state, &previous_model_state,
+               sizeof(model_state)) != 0) {
+        printf("FAIL: RNNoise refused a finite state after a refusal\n");
         ok = 0;
     }
-    /* A finite batch must still be accepted afterwards: the guard is a
-     * per-call check, not a latch that disables every later commit. */
-    memset(hidden_next, 0x41, sizeof(hidden_next));
-    if (rnnoise_model_state_commit(&model_state, hidden_next) != 0 ||
-        memcmp(model_state.hidden, hidden_next, sizeof(hidden_next)) != 0) {
-        printf("FAIL: RNNoise refused a finite GRU state after a refusal\n");
-        ok = 0;
+    /* Copy path: the runtime's own output block is finite-checked and
+     * copied into the state. */
+    {
+        enum { INHERIT_FRAMES = 64 };
+        static float out[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE];
+        const float (*cout)[RNNOISE_MODEL_GRU_SIZE] =
+            (const float (*)[RNNOISE_MODEL_GRU_SIZE])out;
+        RNNoiseModelState in_place;
+        RNNoiseModelState copied;
+        RNNoiseModelState before;
+        static const float bad_value[] = {NAN, INFINITY, -INFINITY};
+        int stream_ok = 1;
+        int refuse_ok = 1;
+
+        /* Deterministic pseudo-state: the in-place state A has the frame
+         * written straight into the struct, the copy state B goes through
+         * private tensors and inherit; they must stay byte-identical. */
+        rnnoise_model_state_init(&in_place);
+        rnnoise_model_state_init(&copied);
+        for (int t = 0; t < INHERIT_FRAMES; ++t) {
+            for (int layer = 0; layer < RNNOISE_MODEL_GRU_COUNT; ++layer) {
+                for (int index = 0; index < RNNOISE_MODEL_GRU_SIZE; ++index) {
+                    float v = sinf(0.37f * (float)(t + 1) +
+                                   0.011f * (float)(layer * 131 + index));
+                    in_place.hidden[layer][index] = v;
+                    out[layer][index] = v;
+                }
+            }
+            stream_ok &= rnnoise_model_state_validate(&in_place) == 0 &&
+                         rnnoise_model_state_inherit(&copied, cout) == 0 &&
+                         memcmp(&in_place, &copied, sizeof(in_place)) == 0 &&
+                         memcmp(copied.hidden, out, sizeof(out)) == 0;
+        }
+        if (!stream_ok) {
+            printf("FAIL: RNNoise inherit stream differs from in-place "
+                   "state\n");
+            ok = 0;
+        }
+
+        /* An aliased pointer means the runtime wrote in place: no-op, even
+         * for a value inherit does not check. */
+        memset(copied.hidden, 0x41, sizeof(copied.hidden));
+        copied.hidden[1][9] = NAN;
+        before = copied;
+        if (rnnoise_model_state_inherit(
+                &copied, (const float (*)[RNNOISE_MODEL_GRU_SIZE])
+                         copied.hidden) != 0 ||
+            memcmp(&copied, &before, sizeof(copied)) != 0) {
+            printf("FAIL: RNNoise inherit of an aliased block was not a "
+                   "no-op returning 0\n");
+            ok = 0;
+        }
+
+        /* A bad element in any layer, first or last position, returns -1
+         * and leaves the previous state untouched. */
+        for (int layer = 0; layer < RNNOISE_MODEL_GRU_COUNT; ++layer) {
+            for (int c = 0; c < 6; ++c) {
+                int index = (c & 1) ? RNNOISE_MODEL_GRU_SIZE - 1 : 0;
+                memset(out, 0x3d, sizeof(out));
+                out[layer][index] = bad_value[c / 2];
+                memset(copied.hidden, 0x41, sizeof(copied.hidden));
+                before = copied;
+                refuse_ok &= rnnoise_model_state_inherit(&copied, cout) == -1 &&
+                             memcmp(&copied, &before, sizeof(copied)) == 0;
+            }
+        }
+        if (!refuse_ok) {
+            printf("FAIL: RNNoise inherit accepted or partly copied a "
+                   "non-finite block\n");
+            ok = 0;
+        }
+
+        memset(out, 0x3d, sizeof(out));
+        if (rnnoise_model_state_inherit(NULL, cout) != -1 ||
+            rnnoise_model_state_inherit(&copied, NULL) != -1) {
+            printf("FAIL: RNNoise inherit accepted a NULL argument\n");
+            ok = 0;
+        }
     }
     ref_init(&ref);
     fill_stationary_spectrum(re, im);

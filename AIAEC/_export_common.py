@@ -27,7 +27,7 @@ from AIAEC.aiaec_common import fit_frequency
 
 # Every AIAEC candidate. ``_streaming_export.GENERIC_MODEL_NAMES`` is the
 # strict subset served by the shared stateless exporter (Align-ULCNet has its
-# own, because its delta-state ABI is paired with ulcnet_model_io.c).
+# own, because its full-state ABI is paired with ulcnet_model_io.c).
 ALL_MODEL_NAMES = (
     'Align_ULCNet', 'Align_CRUSE', 'DeepVQE_S', 'CAGCRN',
 )

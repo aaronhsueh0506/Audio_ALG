@@ -170,7 +170,7 @@ out(128 samples)    每個 hop 恰好吐 1 個 hop;內容 = 傳統核心的輸�
 <tr><td><code>view.post_spectrum</code>(P)</td><td>[n_freqs] <code>Complex</code></td><td>float32 ×2</td><td>1 幀/hop</td><td>同上;<code>E*G_res</code> + comfort noise</td></tr>
 </table>
 <h3>DFN2 模型張量(<code>model.infer</code> 的 <code>DFN2PrepostInputs</code>/<code>Outputs</code>)</h3>
-<p>與 mono 變體<b>完全相同</b>(同一個 stage、同一個 class),逐張量對照(graph 名稱 ↔ C 欄位 ↔ shape/元素數)見 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a> 的同名小節;名稱取自出貨 split layout(<code>DFN2_MODEL_IO_LAYOUT_VERSION = 5</code>),runtime 以名稱與元素數綁定。<b>不論核心走哪個格點,模型看到的一律是 48 kHz 的幀。</b>每個可寫輸出在 <code>frame_inputs()</code> 時<b>預填 NaN</b>,「只寫一半」會在 commit 被抓到;形狀不對由 18 欄位的 <code>DFN2ModelIoDescriptor</code> 擋下。詳見 <a href="ainr_dfn2.html">ainr_dfn2</a>。</p>
+<p>與 mono 變體<b>完全相同</b>(同一個 stage、同一個 class),逐張量對照(graph 名稱 ↔ C 欄位 ↔ shape/元素數)見 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a> 的同名小節;名稱取自出貨 split layout(<code>DFN2_MODEL_IO_LAYOUT_VERSION = 5</code>),runtime 以名稱與元素數綁定。<b>不論核心走哪個格點,模型看到的一律是 48 kHz 的幀。</b><code>frame_inputs()</code> 只對三個 head 輸出<b>預填 NaN</b>,「只寫一半」會在 commit 被抓到;四個 state 張量位址固定,由 inherit 複製或就地綁定(後者非有限時全歸零);形狀不對由 18 欄位的 <code>DFN2ModelIoDescriptor</code> 擋下。詳見 <a href="ainr_dfn2.html">ainr_dfn2</a>。</p>
 
 <h2>State 表</h2>
 <p>Carve 順序(<code>4aec_dfn_res.c:85-99, 148-190</code>):self 控制塊 → 核心 <code>FourAecNrRes</code> pool → 二擇一:48 kHz 是 <code>DfnResStage</code> pool + stage 輸出頻譜 [513] <code>Complex</code>,16 kHz 是<b>整個 <code>DfnRateBridge</code> pool</b>(stage 的 pool 在它裡面)。</p>
@@ -179,12 +179,12 @@ out(128 samples)    每個 hop 恰好吐 1 個 hop;內容 = 傳統核心的輸�
 <tr><td>核心全狀態:共用 far aligner + 4 條線性 AEC lane + post-beam RES</td><td>核心 pool 內</td><td>pool</td><td><code>enable_post=1</code>/<code>enable_res=1</code>/<code>enable_nr=0</code>;MMSE-LSA 實例<b>完全不存在</b>(核心的 <code>nr</code> 稽核計數為 0)</td></tr>
 <tr><td>核心合成 OLA 累加器 + sqrt-Hann 窗表</td><td>核心 pool 內</td><td>pool</td><td><code>synthesize_external()</code> 與 <code>process_post()</code> 共用同一組</td></tr>
 <tr><td>核心 comfort-noise RNG;pre/post token gate</td><td>純量</td><td>核心 pool</td><td>CNG 在核心產生並已包在 P 裡,stage 與 bridge <b>沒有任何 comfort-noise 程式碼</b>。frame 順序由核心的 token gate 管,wrapper struct <b>沒有</b>自己的 pending 閂(<code>4aec_dfn_res.c:230-242</code>)</td></tr>
-<tr><td><code>DFN2Prepost</code> pool(含遞迴狀態)</td><td><code>DFN2_IO_FREQ</code>:318,768 bytes(現查)</td><td>stage pool 內</td><td><code>DFN2State</code>(分析/合成緩衝、EMA 正規化器、df/coef/alpha/noisy/hi-delay ring)+ feature 視窗 + 四個顯式 state 陣列 + est/app 兩對 staging(<code>DFN2_PREPOST_CARVE_VERSION 3</code>)</td></tr>
+<tr><td><code>DFN2Prepost</code> pool(含遞迴狀態)</td><td><code>DFN2_IO_FREQ</code>:215,312 bytes(現查)</td><td>stage pool 內</td><td><code>DFN2State</code>(分析/合成緩衝、EMA 正規化器、df/coef/alpha/noisy/hi-delay ring)+ feature 視窗 + 四個顯式 state 陣列 + est/app 兩對 staging(<code>DFN2_PREPOST_CARVE_VERSION 4</code>)</td></tr>
 <tr><td>stage 暫存 slab</td><td>6 × 513 float = 12,312 bytes</td><td>stage pool</td><td>est_re/est_im/app_re/app_im/out_re/out_im</td></tr>
 <tr><td>stage 計數器</td><td><code>frames_in</code> / <code>commits</code> / <code>skips</code> / <code>output_frame</code></td><td>stage struct</td><td>測試用它證明「中途沒有 reset」</td></tr>
-<tr><td><b>只在 16 kHz 存在:<code>DfnRateBridge</code> pool</b>(3 顆 <code>audio_resampler</code>、原生 OLA ×2、48 kHz FIFO ×2(前 512 點即分析歷史)/ OLA、原生 out FIFO、bridge 計數器)</td><td><b>428,576 B(ne10)/ 432,096 B(kiss)</b>,<b>已含 stage 的 pool</b></td><td>核心 pool 之後</td><td>E、P 各一顆升頻器與自己的 FIFO,降頻器共用一顆;out FIFO init 預填 <code>prefill</code> 個零(fft 256 → 128、fft 512 → 85)。逐項說明與 <code>dfn_rate_bridge_reset()</code> 的語意見 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>(<code>dfn_rate_bridge.c:108-154, 209-223, 371-375, 280-335</code>)</td></tr>
+<tr><td><b>只在 16 kHz 存在:<code>DfnRateBridge</code> pool</b>(3 顆 <code>audio_resampler</code>、原生 OLA ×2、48 kHz FIFO ×2(前 512 點即分析歷史)/ OLA、原生 out FIFO、bridge 計數器)</td><td><b>325,120 B(ne10)/ 328,640 B(kiss)</b>,<b>已含 stage 的 pool</b></td><td>核心 pool 之後</td><td>E、P 各一顆升頻器與自己的 FIFO,降頻器共用一顆;out FIFO init 預填 <code>prefill</code> 個零(fft 256 → 128、fft 512 → 85)。逐項說明與 <code>dfn_rate_bridge_reset()</code> 的語意見 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>(<code>dfn_rate_bridge.c:108-154, 209-223, 371-375, 280-335</code>)</td></tr>
 <tr><td>NN 權重</td><td>—</td><td><b>不在本 pool 內</b></td><td>屬於板端 runtime</td></tr>
-<tr><td><b>合計 pool</b></td><td><b>16 kHz 預設:1,438,064 B(ne10)/ 1,444,624 B(kiss)</b><br>48 kHz:3,701,136 / 3,715,696 B</td><td>caller 擁有</td><td>matched、n=5、cng=0、atten_lim 0 現查值;換 rate/backend/編譯選項/submodule 一律以 <code>four_aec_dfn_res_get_mem_requirements()</code> 重查</td></tr>
+<tr><td><b>合計 pool</b></td><td><b>16 kHz 預設:1,336,800 B(ne10)/ 1,343,360 B(kiss)</b><br>48 kHz:3,599,872 / 3,614,432 B</td><td>caller 擁有</td><td>matched、n=5、cng=0、atten_lim 0 現查值;換 rate/backend/編譯選項/submodule 一律以 <code>four_aec_dfn_res_get_mem_requirements()</code> 重查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

@@ -68,8 +68,11 @@ extern "C" {
 /* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes
  * (a region added, removed, resized or reordered), so a pool recorded by the
  * previous carve is refused by _init_ex on the hash, not only on `bytes`.
- * 2: the TIME analyses became two UlcnetAnalysis states (own scratch each). */
-#define ULCNET_PREPOST_CARVE_VERSION 2u
+ * 2: the TIME analyses became two UlcnetAnalysis states (own scratch each).
+ * 3: the model I/O region holds one GRU hidden pair, with no second pair for
+ *    the outputs.
+ * 4: the model I/O region carries no per-frame K/V/logit staging. */
+#define ULCNET_PREPOST_CARVE_VERSION 4u
 
 /* Which side of the transform the caller works on. FIXED AT INIT because it
  * decides the pool size: ULCNET_IO_TIME additionally carves two analysis
@@ -189,34 +192,43 @@ int ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
                                     const float far_re[ULCNET_BINS],
                                     const float far_im[ULCNET_BINS]);
 
-/* Publish the current frame's accelerator boundary. Every writable output
- * is NaN-prefilled, so a partial write is caught by frame_commit rather
- * than leaking the previous frame's values. Pointers are into this
- * instance's pool and stay valid until the next pre_process. Returns 0, or
- * -1 if no frame is open. */
+/* Publish the current frame's accelerator boundary. The `output` estimate is
+ * NaN-prefilled, so an unwritten frame is caught by frame_commit rather than
+ * leaking the previous frame's values. Each state output (key/value/logit
+ * history, GRU hiddens) is the same address as its state input. A runtime
+ * with its own output tensors passes them to ulcnet_model_io_inherit() with
+ * this `outputs`; one that can bind the state outputs to these pointers
+ * writes in place and needs no inherit. Pointers are into this instance's
+ * pool and are stable for its life.
+ * Returns 0, or -1 if no frame is open. */
 int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
                                 UlcnetModelIoInputs *inputs,
                                 UlcnetModelIoOutputs *outputs);
 
-/* Transactional: validates that the accelerator wrote every output, applies
- * the inverse compression, advances the K/V/logit rings and swaps the GRU
- * hidden tensors, then feeds the enhanced spectrum to the synthesis
- * (ULCNET_IO_TIME) or stages it for post_process_freq.
+/* Validates that the accelerator wrote a finite estimate and finite state,
+ * applies the inverse compression, then feeds the enhanced spectrum to the
+ * synthesis (ULCNET_IO_TIME) or stages it for post_process_freq. The state
+ * tensors need no step: the accelerator already wrote them where the next
+ * frame reads them.
  *
  * Requires a frame opened by pre_process AND published by frame_inputs():
  * a commit with no frame_inputs() behind it is refused, so an accelerator
  * that never ran cannot pass untouched buffers off as a result.
  *
- * On failure NOTHING moves -- persistent state is byte-identical, the frame
- * stays open, and -1 is returned. The caller then either calls
- * ulcnet_prepost_frame_skip() to keep the framing schedule intact, or
- * re-runs the accelerator through a fresh frame_inputs(). */
+ * On failure the state has already been overwritten and cannot be rolled
+ * back, so the K/V/logit rings and both hiddens restart from zero;
+ * the framing state does not move, the frame stays open, and -1 is
+ * returned. The caller then either calls ulcnet_prepost_frame_skip() to
+ * keep the framing schedule intact, or re-runs the accelerator through a
+ * fresh frame_inputs(). */
 int ulcnet_prepost_frame_commit(UlcnetPrepost *p);
 
 /* Take the identity for the current frame: the error spectrum passes
- * through unenhanced, the model's recurrent state is NOT stepped, and the
- * framing schedule still advances. This is what a failed accelerator run
- * and an alignment-boundary reprime both need. Returns 0, or -1. */
+ * through unenhanced, the state tensors stay as the accelerator left them (a
+ * run that reported failure is taken not to have written), and the framing
+ * schedule still advances. This is
+ * what a failed accelerator run and an alignment-boundary reprime both
+ * need. Returns 0, or -1. */
 int ulcnet_prepost_frame_skip(UlcnetPrepost *p);
 
 /* ULCNET_IO_TIME. Emit this hop's output. `out_hop` is always fully

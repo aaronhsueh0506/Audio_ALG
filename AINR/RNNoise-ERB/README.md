@@ -265,11 +265,20 @@ python3 export_onnx.py --config config.ini --model output/rnnoise_best.pth \
 
 Streaming ONNX 輸入為 `erb_input[1,3,22]`、`spec_input[1,3,2,129]`
 與三組 GRU hidden state；輸出中心 frame 的 gains 與更新後 hidden state。
-加速器本身不保存 state：host 以 `RNNoiseModelState` 保存三組 hidden，並將
-每次的 `h1_out/h2_out/h3_out` 回送為下一次的 input。三個 feature frames
+加速器本身不保存 state：`RNNoiseModelState` 就是 state buffer，有兩種餵法。
+一般路徑：runtime 把 `h1_out/h2_out/h3_out` 寫進自己的輸出 tensor（疊成
+`hidden[3][128]`），再呼叫 `rnnoise_model_state_inherit(state, hidden_out)`
+複製進 struct；它會先檢查整塊是否 finite，全部 finite 才複製並回傳 `0`，
+參數為 NULL 或任何元素為 NaN/Inf 則回傳 `-1`、不複製且 state 維持原狀，
+呼叫端應把該 frame 視為失敗；若 `hidden_out` 已等於 `state->hidden`
+（runtime 已就地寫入）則為 no-op 回傳 `0`。最佳化路徑（省一次複製）：板端把圖的
+`h1_in/h2_in/h3_in` 輸入與 `h1_out/h2_out/h3_out` 輸出綁到同一欄位
+（`&state->hidden[0..2]`），CPU 不複製。runtime 須先讀完所有 state 輸入、
+才可寫同位址的 state 輸出。三個 feature frames
 是輸入 temporal kernel 的完整可視範圍，不代表一次輸出三個 frames。
-`rnnoise_model_state_commit()` 會先檢查三組輸出皆為 finite；失敗時回傳
-`-1` 並保留前一個 state，呼叫端應 fail-open 該 frame，不得回寫壞狀態。
+就地路徑的 `rnnoise_model_state_validate()` 是選用的就地 finite 檢查：全部 finite
+回傳 `0`；參數為 NULL 或任何元素為 NaN/Inf 則回傳 `-1`，且因前一個 state 已不存在，
+會將整個 state 歸零（從零重新開始）。仍為 finite 的部分寫入或混合寫入無法偵測。
 匯出的 metadata 帶 `state_layout_version`，數值與 `process.h` 的
 `RNNOISE_MODEL_IO_LAYOUT_VERSION` 相同，整合端可據此拒絕 state layout
 已經對不上自己配置的 struct 的圖。

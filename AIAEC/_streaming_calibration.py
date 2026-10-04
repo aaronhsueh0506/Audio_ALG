@@ -238,7 +238,7 @@ def main(model_name: str) -> None:
             gru_state_layout=args.gru_state_layout,
         )
         input_names = wrapper.layout.input_names
-        # One head plus delta-state; the state slots are rebuilt by
+        # One head plus full next-state; the state slots are taken from
         # next_state() rather than sliced, so only signal_inputs is read.
         split = GraphSplit(
             signal_inputs=wrapper.layout.signal_inputs, head_outputs=1
@@ -257,7 +257,7 @@ def main(model_name: str) -> None:
             )
 
         def advance_state(state, outputs):
-            return ulcnet_next_state(state, outputs, wrapper.delay_depth)
+            return ulcnet_next_state(outputs)
 
         if args.primary_is_mic:
             pairs, _ = _materialize_linear_error(

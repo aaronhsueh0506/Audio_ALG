@@ -24,13 +24,13 @@ model TUs are compiled once for the module:
   lifecycle _create/_destroy against _init on a caller pool
   reject    _get_mem_size / _init reject-first validation
   reset     _reset really clears state (re-run reproduces the first run)
-  skip      _frame_skip is the identity and does NOT step the rings
+  skip      _frame_skip is the identity and leaves the state as written
   guard     the frame state machine: a hop on top of an unfinished frame,
             a commit with no frame_inputs behind it, and a retry after a
             refused commit are all refused; skip needs no frame_inputs
 
 The accelerator stand-in is deterministic and input-dependent, so the K/V/
-logit rings and the GRU hidden swap genuinely influence later frames -- a
+logit rings and the in-place GRU hiddens genuinely influence later frames -- a
 class that dropped a ring advance would diverge rather than agree.
 """
 
@@ -66,12 +66,46 @@ _DRIVER = r'''
 #define HOPS       400
 #define SHORT_HOPS 40
 
+/* The graph's ring shift, performed by the stand-in accelerator: every
+ * state input is read (the caller stages `now` from them) before any state
+ * output is written, and each *_out is the input's own memory. K/V rings are
+ * newest-first, the logit history oldest-first. */
+static void push_history(const UlcnetModelIoOutputs *out,
+                         const float *key_now, const float *value_now,
+                         const float *logit_now, size_t ta_bins,
+                         size_t depth) {
+    const size_t channels = 32u;
+    const size_t score_frames = 4u;
+    size_t channel;
+    for (channel = 0; channel < channels; ++channel) {
+        float *key = out->key_history_out + channel * (depth - 1u) * ta_bins;
+        float *value = out->value_history_out +
+            channel * (depth - 1u) * ta_bins;
+        float *logit = out->logit_history_out +
+            channel * score_frames * depth;
+        memmove(key + ta_bins, key, (depth - 2u) * ta_bins * sizeof(float));
+        memcpy(key, key_now + channel * ta_bins, ta_bins * sizeof(float));
+        memmove(value + ta_bins, value,
+                (depth - 2u) * ta_bins * sizeof(float));
+        memcpy(value, value_now + channel * ta_bins,
+               ta_bins * sizeof(float));
+        memmove(logit, logit + depth,
+                (score_frames - 1u) * depth * sizeof(float));
+        memcpy(logit + (score_frames - 1u) * depth,
+               logit_now + channel * depth, depth * sizeof(float));
+    }
+}
+
 /* Deterministic stand-in for the accelerator. Satisfies the FULL-WRITE
  * contract (every element of every output tensor) and is made
- * input-dependent so the rings and the GRU swap actually influence later
- * frames. */
+ * input-dependent so the rings and the in-place GRU hiddens actually
+ * influence later frames. It reads every input into `acc` before it writes
+ * any output, which is what an in-place runtime must do. */
 static int fake_run(void *user, const UlcnetModelIoInputs *in,
                     UlcnetModelIoOutputs *out) {
+    static float key_now[32u * ULCNET_MODEL_IO_TA_BINS];
+    static float value_now[32u * ULCNET_MODEL_IO_TA_BINS];
+    static float logit_now[32u * D];
     size_t i;
     double acc = 0.0;
     (void)user;
@@ -79,20 +113,26 @@ static int fake_run(void *user, const UlcnetModelIoInputs *in,
         acc += in->error_mag[i] + 0.5 * in->far_mag[i];
     for (i = 0; i < in->key_history_elements; ++i)
         acc += 1e-3 * in->key_history[i];
+    for (i = 0; i < in->value_history_elements; ++i)
+        acc += 1e-3 * in->value_history[i];
+    for (i = 0; i < in->logit_history_elements; ++i)
+        acc += 1e-3 * in->logit_history[i];
     for (i = 0; i < in->gru_hidden_elements; ++i)
         acc += 1e-3 * in->h_gru0[i];
     for (i = 0; i < out->spectrum_ri_elements; ++i)
         out->output[i] = in->error_ri[i] * (float)(0.5 + 0.25 * sin(acc + (double)i));
-    for (i = 0; i < out->key_now_elements; ++i)
-        out->key_now[i] = (float)(0.01 * sin(acc + 1.0 + (double)i));
-    for (i = 0; i < out->value_now_elements; ++i)
-        out->value_now[i] = (float)(0.01 * cos(acc + 2.0 + (double)i));
-    for (i = 0; i < out->logit_now_elements; ++i)
-        out->logit_now[i] = (float)(0.01 * sin(acc + 3.0 + (double)i));
+    for (i = 0; i < 32u * ULCNET_MODEL_IO_TA_BINS; ++i) {
+        key_now[i] = (float)(0.01 * sin(acc + 1.0 + (double)i));
+        value_now[i] = (float)(0.01 * cos(acc + 2.0 + (double)i));
+    }
+    for (i = 0; i < 32u * D; ++i)
+        logit_now[i] = (float)(0.01 * sin(acc + 3.0 + (double)i));
     for (i = 0; i < out->gru_hidden_elements; ++i) {
         out->h_gru0_out[i] = (float)(0.5 * sin(acc + 4.0 + (double)i));
         out->h_gru1_out[i] = (float)(0.5 * cos(acc + 5.0 + (double)i));
     }
+    push_history(out, key_now, value_now, logit_now,
+                 ULCNET_MODEL_IO_TA_BINS, D);
     return 0;
 }
 
@@ -700,13 +740,13 @@ static int case_skip(void) {
     CHECK(fake_run(NULL, &inputs, &outputs) == 0);
     CHECK(ulcnet_prepost_frame_commit(p) == 0);
 
-    /* Frame 2: snapshot the rings, then take the identity even though the
-     * accelerator produced a COMPLETE, perfectly committable result.
+    /* Frame 2: take the identity even though the accelerator produced a
+     * COMPLETE, perfectly committable result.
      *
      * The full write is the point. Skipping after a partial write would
      * prove nothing -- commit() would refuse that frame on its own -- so a
      * skip that quietly committed would still look correct. Here the only
-     * thing standing between the rings and an advance is frame_skip's
+     * thing standing between the frame and the pipeline is frame_skip's
      * contract. */
     CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
                                           far_re, far_im) == 1);
@@ -722,20 +762,30 @@ static int case_skip(void) {
     gru1 = (float *)malloc(gru_n * sizeof(float));
     CHECK(key && value && logit && gru0 && gru1);
     memcpy(key, inputs.key_history, key_n * sizeof(float));
-    memcpy(value, inputs.value_history, value_n * sizeof(float));
-    memcpy(logit, inputs.logit_history, logit_n * sizeof(float));
-    memcpy(gru0, inputs.h_gru0, gru_n * sizeof(float));
-    memcpy(gru1, inputs.h_gru1, gru_n * sizeof(float));
-    /* The snapshot must not be all zeros, or "unchanged" proves nothing. */
+    /* The pre-run snapshot must not be all zeros, or "moved" proves
+     * nothing. */
     {
         size_t i;
         int nonzero = 0;
         for (i = 0; i < key_n; ++i) if (key[i] != 0.0f) nonzero = 1;
-        for (i = 0; i < gru_n; ++i) if (gru0[i] != 0.0f) nonzero = 1;
         CHECK(nonzero);
     }
 
     CHECK(fake_run(NULL, &inputs, &outputs) == 0);
+    /* Every state tensor is in-place: the run has already written it where
+     * the next frame reads it, and skip leaves it there. Snapshot it AFTER
+     * the run. */
+    CHECK(outputs.key_history_out == inputs.key_history);
+    CHECK(outputs.value_history_out == inputs.value_history);
+    CHECK(outputs.logit_history_out == inputs.logit_history);
+    CHECK(outputs.h_gru0_out == inputs.h_gru0);
+    CHECK(outputs.h_gru1_out == inputs.h_gru1);
+    CHECK(memcmp(inputs.key_history, key, key_n * sizeof(float)) != 0);
+    memcpy(key, inputs.key_history, key_n * sizeof(float));
+    memcpy(value, inputs.value_history, value_n * sizeof(float));
+    memcpy(logit, inputs.logit_history, logit_n * sizeof(float));
+    memcpy(gru0, inputs.h_gru0, gru_n * sizeof(float));
+    memcpy(gru1, inputs.h_gru1, gru_n * sizeof(float));
     CHECK(ulcnet_prepost_frame_skip(p) == 0);
     CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == 0);
     /* Identity: the error spectrum passes through UNCHANGED, bit for bit --
@@ -743,7 +793,7 @@ static int case_skip(void) {
     CHECK(identical(error_re, got_re, ULCNET_BINS));
     CHECK(identical(error_im, got_im, ULCNET_BINS));
 
-    /* Frame 3: the rings must be exactly what frame 2 saw. */
+    /* Frame 3: the state must be exactly what frame 2's run left. */
     CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
                                           far_re, far_im) == 1);
     CHECK(ulcnet_prepost_frame_inputs(p, &inputs, &outputs) == 0);
@@ -755,14 +805,14 @@ static int case_skip(void) {
     CHECK(memcmp(inputs.h_gru1, gru1, gru_n * sizeof(float)) == 0);
 
     /* The other reason to skip: the accelerator wrote NOTHING at all. Same
-     * identity, same frozen rings. */
+     * identity, same state. */
     CHECK(ulcnet_prepost_frame_skip(p) == 0);
     CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == 0);
     CHECK(identical(error_re, got_re, ULCNET_BINS));
     CHECK(identical(error_im, got_im, ULCNET_BINS));
 
-    /* Frame 4: still frozen -- and a commit here DOES move the rings, so
-     * the three comparisons above are not measuring a constant. */
+    /* Frame 4: still as written -- and a run plus commit here DOES move
+     * the state, so the comparisons above are not measuring a constant. */
     CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
                                           far_re, far_im) == 1);
     CHECK(ulcnet_prepost_frame_inputs(p, &inputs, &outputs) == 0);
@@ -851,8 +901,9 @@ static int case_guard(FftHandle *fft) {
     CHECK(ulcnet_prepost_frame_commit(p) == 0);
     /* (3) A commit refused on a non-finite output disarms the transaction:
      * a retry without a fresh frame_inputs is refused too, the frame is
-     * still open, and the fresh frame_inputs re-fills EVERY accelerator
-     * output with NaN before the accelerator is asked again. */
+     * still open, and the fresh frame_inputs re-fills the estimate with
+     * NaN before the accelerator is asked again. The in-place state is not
+     * refilled: the refusal has already restarted it from zero. */
     CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
                                           far_re, far_im) == 1);
     CHECK(ulcnet_prepost_frame_inputs(p, &inputs, &outputs) == 0);
@@ -864,15 +915,20 @@ static int case_guard(FftHandle *fft) {
     CHECK(ulcnet_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     for (i = 0; i < outputs.spectrum_ri_elements; ++i)
         CHECK(isnan(outputs.output[i]));
-    for (i = 0; i < outputs.key_now_elements; ++i)
-        CHECK(isnan(outputs.key_now[i]));
-    for (i = 0; i < outputs.value_now_elements; ++i)
-        CHECK(isnan(outputs.value_now[i]));
-    for (i = 0; i < outputs.logit_now_elements; ++i)
-        CHECK(isnan(outputs.logit_now[i]));
+    CHECK(outputs.h_gru0_out == inputs.h_gru0);
+    CHECK(outputs.h_gru1_out == inputs.h_gru1);
+    CHECK(outputs.key_history_out == inputs.key_history);
+    CHECK(outputs.value_history_out == inputs.value_history);
+    CHECK(outputs.logit_history_out == inputs.logit_history);
+    for (i = 0; i < inputs.key_history_elements; ++i)
+        CHECK(inputs.key_history[i] == 0.0f);
+    for (i = 0; i < inputs.value_history_elements; ++i)
+        CHECK(inputs.value_history[i] == 0.0f);
+    for (i = 0; i < inputs.logit_history_elements; ++i)
+        CHECK(inputs.logit_history[i] == 0.0f);
     for (i = 0; i < outputs.gru_hidden_elements; ++i) {
-        CHECK(isnan(outputs.h_gru0_out[i]));
-        CHECK(isnan(outputs.h_gru1_out[i]));
+        CHECK(inputs.h_gru0[i] == 0.0f);
+        CHECK(inputs.h_gru1[i] == 0.0f);
     }
     CHECK(fake_run(NULL, &inputs, &outputs) == 0);
     CHECK(ulcnet_prepost_frame_commit(p) == 0);

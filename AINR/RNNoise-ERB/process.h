@@ -41,7 +41,18 @@ extern "C" {
 
 /* Model-state shape from the shipped config (three GRU layers, width 128).
  * export_onnx.py exposes each hidden tensor as an input and *_out output; the
- * accelerator does not retain this state internally. */
+ * accelerator does not retain this state internally. RNNoiseModelState below
+ * IS the state buffer. Normal path: the runtime writes h1_out/h2_out/h3_out
+ * into its own output tensor and rnnoise_model_state_inherit() copies it into
+ * the struct. Optimized path: bind each hidden input AND its *_out output to
+ * the same field, so the updated state is the next call's input with no copy,
+ * and call only rnnoise_model_state_validate() (optional). Binding table
+ * (graph name -> field):
+ *   h1_in / h1_out -> &state->hidden[0]
+ *   h2_in / h2_out -> &state->hidden[1]
+ *   h3_in / h3_out -> &state->hidden[2]
+ * Aliasing precondition (optimized path): the runtime must read every state
+ * input before it writes any state output at the same address. */
 #define RNNOISE_MODEL_IO_LAYOUT_VERSION 1
 #define RNNOISE_MODEL_GRU_COUNT          3
 #define RNNOISE_MODEL_GRU_SIZE         128
@@ -133,11 +144,26 @@ void rnnoise_state_init(RNNoiseState *st);
 
 void rnnoise_model_state_init(RNNoiseModelState *state);
 
-/* Copy h1_out/h2_out/h3_out into the next invocation's h1/h2/h3 inputs.
- * Returns 0 on success. NULL or non-finite accelerator output returns -1 and
- * leaves the previous state untouched, so one bad invocation cannot poison
- * every later GRU step. */
-int rnnoise_model_state_commit(
+/* Optimized path: finite-check the state in place after an invocation.
+ * h1_out/h2_out/h3_out are bound to hidden[] (see above), so nothing is
+ * copied and calling this is optional for a trusted runtime. Returns 0 when
+ * all 3 x 128 elements are finite. NULL returns -1. Any NaN or Inf zeroes
+ * the whole state (the previous value no longer exists to restore) and
+ * returns -1, so one bad invocation cannot poison every later GRU step. The
+ * check is finite-only: a partial or mixed write that is still finite cannot
+ * be detected. */
+int rnnoise_model_state_validate(RNNoiseModelState *state);
+
+/* Normal path: take the runtime's own hidden-state output block (h1_out,
+ * h2_out, h3_out stacked as hidden[3][128]) into the state. If hidden_out
+ * already points at state->hidden the runtime wrote it in place and this is
+ * a no-op returning 0 (not checked; use rnnoise_model_state_validate()).
+ * Otherwise the block is finite-checked and only then copied. Returns 0 on
+ * success. NULL arguments or a single NaN or Inf anywhere in the block
+ * returns -1 and copies nothing: a refused inherit leaves the state intact,
+ * so the caller treats the frame as failed. (The in-place path differs:
+ * rnnoise_model_state_validate() restarts the state from zero.) */
+int rnnoise_model_state_inherit(
     RNNoiseModelState *state,
     const float hidden_out[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]);
 

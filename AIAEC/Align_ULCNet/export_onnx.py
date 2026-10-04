@@ -62,10 +62,14 @@ raw far against that error. The calibration and ONNX commands must use the same
 ``--max-delay-frames`` value.  NPZ output writes a sibling JSON contract;
 binary output writes ``manifest.json`` inside its output directory.
 
-The accelerator retains no state.  The CPU supplies past K/V features,
-attention-score history and temporal-GRU hidden tensors on every invocation.
-The graph returns only the new K/V/logit entries plus next GRU hidden tensors;
-the CPU updates its caller-owned rings.  STFT/WOLA and PBFDKF stay outside the
+The accelerator retains no state.  Every invocation takes the past K/V
+features, attention-score history and temporal-GRU hidden tensors as inputs
+and returns the FULL next value of each (``key_history_out``,
+``value_history_out``, ``logit_history_out``, ``h_gru0_out``, ``h_gru1_out``),
+with exactly the input shapes, so each state input and its ``*_out`` output
+can be bound to one address and the CPU shifts and copies nothing.  The ring
+shift runs inside the graph on the tensors it already builds for attention.
+STFT/WOLA and PBFDKF stay outside the
 graph in ``ulcnet_process.c`` and the AEC library respectively.  The exported
 graph boundary follows the checkpoint and supports 16 kHz / FFT-window 512 /
 hop 256 or 48 kHz / 1024 / 512.  The C pre/post must be compiled for the same
@@ -151,7 +155,11 @@ from AIAEC.training_common import (
 )
 
 
-# Version history. Version 3 introduced an explicit deployed-far descriptor
+# Version history. Versions 8-11 returned only the new K/V/logit entries
+# (key_now/value_now/logit_now) and left the ring shift to the CPU. Versions
+# 12-15 return the full next history from the graph, so the shipped contract
+# is the in-place one; 8-11 are retired with 3-7.
+# Version 3 introduced an explicit deployed-far descriptor
 # while retaining the checkpoint's training provenance separately;
 # version 4 renamed the tensors (error/far inputs, output head, h_gru0/h_gru1
 # hiddens, *_out states) -- runtimes bind by name; version 5 moved the fixed
@@ -181,13 +189,15 @@ from AIAEC.training_common import (
 # Stated here rather than only in ulcnet_model_io.h's prose so a bump onto one
 # fails a test instead of a review. 3, 4 and 5 were shipped rank-3 boundaries;
 # 6 and 7 were rank-3 pairs reachable from the CLI and stamped into exported
-# metadata, so they were allocated, not merely reserved.
-RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 8))
+# metadata, so they were allocated, not merely reserved. 8-11 were the
+# delta-state boundaries of the four pairs; every pair moved to the full-state
+# boundary together, so the same rule retires them.
+RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 12))
 LAYOUT_VERSIONS = {
-    ('host', 'split'): 8,
-    ('host', 'combined'): 9,
-    ('graph', 'split'): 10,
-    ('graph', 'combined'): 11,
+    ('host', 'split'): 12,
+    ('host', 'combined'): 13,
+    ('graph', 'split'): 14,
+    ('graph', 'combined'): 15,
 }
 # The deployed pair's version, named because ulcnet_model_io.h pins it.
 STATE_LAYOUT_VERSION = LAYOUT_VERSIONS[('host', 'split')]
@@ -235,7 +245,7 @@ GRU_STATE_NAMES = ('h_gru0', 'h_gru1')
 COMBINED_GRU_STATE_NAME = 'h_gru'
 CACHE_STATE_NAMES = ('key_history', 'value_history', 'logit_history')
 HEAD_OUTPUT_NAMES = ('output',)
-CACHE_OUTPUT_NAMES = ('key_now', 'value_now', 'logit_now')
+CACHE_OUTPUT_NAMES = tuple(name + '_out' for name in CACHE_STATE_NAMES)
 
 
 class FeatureLayout(object):
@@ -543,11 +553,15 @@ class AlignUlcnetStreamingExport(nn.Module):
         key_now = attention.key(far_feature)
         value_now = attention.value(far_feature)
 
-        # [B,C,1,D,F], delay slot zero is the current frame.
-        key_candidates = torch.cat((key_now, key_history), dim=2).unsqueeze(2)
-        value_candidates = torch.cat(
-            (value_now, value_history), dim=2
-        ).unsqueeze(2)
+        # [B,C,D,F], delay slot zero is the current frame. The next K/V
+        # history is the same tensor without its oldest slot, so the ring
+        # shift costs a Slice, not a second Concat.
+        key_window = torch.cat((key_now, key_history), dim=2)
+        value_window = torch.cat((value_now, value_history), dim=2)
+        key_history_out = key_window[:, :, :-1]
+        value_history_out = value_window[:, :, :-1]
+        key_candidates = key_window.unsqueeze(2)
+        value_candidates = value_window.unsqueeze(2)
         logit_now = (
             query_now.unsqueeze(3) * key_candidates
         ).sum(dim=-1)
@@ -555,6 +569,7 @@ class AlignUlcnetStreamingExport(nn.Module):
         # Reproduce StreamConv2dCell: four chronological history frames plus
         # current logits, frequency-axis padding only, then the raw Conv2d.
         score_input = torch.cat((logit_history, logit_now), dim=2)
+        logit_history_out = score_input[:, :, 1:]
         frequency_total = (attention.score.kf - 1) * attention.score.df
         frequency_left = frequency_total // 2
         score = attention.score.conv(F.pad(
@@ -619,7 +634,8 @@ class AlignUlcnetStreamingExport(nn.Module):
         # Otherwise a COMPRESSED-domain estimate: the fixed inverse signed
         # power runs on the host (host_output; C: ulcnet_model_io_commit).
 
-        heads = (output, key_now, value_now, logit_now)
+        heads = (output, key_history_out, value_history_out,
+                 logit_history_out)
         if layout.combined:
             # Concatenated in the order it was sliced, which is also the
             # order ulcnet_model_io.h stores the two hiddens in.
@@ -736,29 +752,15 @@ def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int,
     )
 
 
-def next_state(
-    current: Sequence[Tensor], outputs: Sequence[Tensor], delay_depth: int
-) -> Tuple[Tensor, ...]:
-    """Advance the caller-held state one frame, in whichever layout it is in.
+def next_state(outputs: Sequence[Tensor]) -> Tuple[Tensor, ...]:
+    """The caller-held state for the next frame, in whichever layout it is in.
 
-    Layout-agnostic by construction: the caches are always the first three
-    entries and the recurrent tail is whatever the graph returned, so this
-    needs no branch and cannot fall out of step with GRU_STATE_LAYOUTS.
+    The graph returns every state tensor in full, in the order the state
+    inputs are bound, so the state is the output tail unchanged -- the same
+    assignment an in-place runtime performs by binding each ``*_out`` to its
+    input's address. Layout-agnostic: it names no tensor.
     """
-    key_history, value_history, logit_history = current[:3]
-    _enhanced, key_now, value_now, logit_now = outputs[:4]
-    hidden_next = tuple(outputs[4:])
-    if delay_depth > 1:
-        key_history = torch.cat(
-            (key_now, key_history[:, :, :delay_depth - 2]), dim=2
-        )
-        value_history = torch.cat(
-            (value_now, value_history[:, :, :delay_depth - 2]), dim=2
-        )
-    logit_history = torch.cat(
-        (logit_history[:, :, 1:], logit_now), dim=2
-    )
-    return (key_history, value_history, logit_history) + hidden_next
+    return tuple(outputs[len(HEAD_OUTPUT_NAMES):])
 
 
 def file_sha256(path: str) -> str:
@@ -796,7 +798,7 @@ def _write_metadata(
         )
     metadata = {
         'model_family': 'Align_ULCNet',
-        'boundary': 'stateless_one_frame_delta_state',
+        'boundary': 'stateless_one_frame_full_state',
         'state_layout_version': layout.layout_version,
         'feature_layout': layout.feature.label,
         'gru_state_layout': layout.gru.label,
@@ -818,7 +820,7 @@ def _write_metadata(
             deployed_far_input_mode
         ),
         'accelerator_persistent_state': False,
-        'cpu_delta_state_update': True,
+        'cpu_delta_state_update': False,
         'tensor_dtype': 'float32',
         'complex_tensor_policy': 'real_imag_last_dimension',
         'input_schema': _schema(layout.input_names, inputs),
@@ -874,7 +876,7 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
                 worst = max(worst, float(np.max(
                     np.abs(got - want.detach().numpy())
                 )))
-            state = next_state(state, expected, wrapper.delay_depth)
+            state = next_state(expected)
     return worst
 
 

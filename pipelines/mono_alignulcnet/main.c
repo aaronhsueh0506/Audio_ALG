@@ -180,8 +180,15 @@ static int parse_delay_profile(int argc, char** argv, DelayProfile* out) {
     return 0;
 }
 
-/* Replace this body with the board runtime call. `inputs` contains spectra
- * plus CPU-owned state; the runtime must fill every tensor in `outputs`. */
+/* Replace this body with the board runtime call. `inputs` holds the spectra
+ * and the state tensors. Ordinary flow: run the ONNX graph into the runtime's
+ * own output tensors, put their pointers in a UlcnetModelIoOutputs (same
+ * element counts as `outputs`), then
+ *     return run_ok ? ulcnet_model_io_inherit(outputs, &runtime_outputs) : -1;
+ * Inherit validates and copies them into the state; a refusal must be
+ * returned as failure. A runtime that binds each *_out to its input's address
+ * writes the state through `outputs` directly and leaves inherit out; it must
+ * read every state input before writing any state output. */
 static int run_accelerator(void *user,
                            const UlcnetModelIoInputs *inputs,
                            UlcnetModelIoOutputs *outputs) {
