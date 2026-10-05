@@ -164,9 +164,9 @@ out: erb_mask -&gt; erb_mask [32]=32 | df_coefs -&gt; coefs [96][5][2]=960(bin �
 <tr><td colspan="4"><b>以下只在 8/16 kHz host 存在:<code>DfnRateBridge</code> pool(<code>dfn_rate_bridge.c:108-154, 280-335</code>);<code>dfn_rate_bridge_reset()</code> 連同 stage 一起清乾淨並重新預填(<code>:209-223, 371-375</code>)</b></td></tr>
 <tr><td>3 顆 <code>audio_resampler</code>;原生 OLA ×2 + 窗表;48 kHz FIFO ×2、OLA + 窗表</td><td>各自 pool;2×fft_n;2×2048 + 2×1024 float</td><td>bridge pool</td><td>E、P 各一顆升頻(→ 48 kHz)、共用一顆降頻(每顆自帶相位與 FIR 歷史)。<code>ola_e</code>/<code>ola_p</code> 各走一份 host 同款 sqrt-Hann WOLA 還原成時域;<code>fifo_e</code>/<code>fifo_p</code>(<code>FIFO48_CAP</code>:前 512 點是上一幀的分析歷史,其後是未湊滿 512 的餘量加一個 hop 的升頻量;每消耗一幀就左移 512,被消耗的 512 點成為下一幀的歷史)、<code>ola48</code>/<code>win48</code></td></tr>
 <tr><td>原生 out FIFO</td><td>1024 float(<code>OUT_FIFO_CAP</code>)</td><td>bridge pool</td><td>init 預填 <code>prefill</code> 個零(16 k/hop 128 → 128、16 k/hop 256 → 85、8 k/hop 128 → 42),之後每 hop 取走一個 hop</td></tr>
-<tr><td>bridge 計數器;<b>bridge pool 小計</b></td><td><b>325,120 B(ne10)/ 328,640 B(kiss)</b></td><td>bridge struct / 含在上層 pool 內</td><td><code>frames_48k</code>/<code>last_hop_frames</code>(<code>dfn_rate_bridge_get_counters()</code>,測試用 <code>last_hop_frames</code> 驗證排程)。小計為 16 kHz / fft 256 現查,<b>已含 stage 的 pool</b></td></tr>
+<tr><td>bridge 計數器;<b>bridge pool 小計</b></td><td><b>326,768 B(ne10)/ 330,288 B(kiss)</b></td><td>bridge struct / 含在上層 pool 內</td><td><code>frames_48k</code>/<code>last_hop_frames</code>(<code>dfn_rate_bridge_get_counters()</code>,測試用 <code>last_hop_frames</code> 驗證排程)。小計為 16 kHz / fft 256 現查,<b>已含 stage 的 pool</b></td></tr>
 <tr><td>NN 權重</td><td>—</td><td><b>不在本 pool 內</b></td><td>屬板端 runtime;本 pool 只含 host DSP 與前後處理</td></tr>
-<tr><td><b>合計 pool</b></td><td><b>16 kHz 預設:724,064 B(ne10)/ 728,800 B(kiss)</b><br>48 kHz:1,467,776 / 1,473,600 B<br>8 kHz:618,448 B(ne10)</td><td>caller 擁有</td><td>matched、n=5、cng=0、atten_lim 0 現查值;換 rate/backend/編譯選項/submodule 一律以 <code>mono_aec_dfn_res_get_mem_requirements()</code> 重查</td></tr>
+<tr><td><b>合計 pool</b></td><td><b>16 kHz 預設:725,712 B(ne10)/ 730,448 B(kiss)</b><br>48 kHz:1,467,776 / 1,473,600 B<br>8 kHz:620,160 B(ne10)</td><td>caller 擁有</td><td>matched、n=5、cng=0、atten_lim 0 現查值;換 rate/backend/編譯選項/submodule 一律以 <code>mono_aec_dfn_res_get_mem_requirements()</code> 重查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

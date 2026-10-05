@@ -90,13 +90,15 @@ runtime. Weight storage is about 2.04 MiB int8, 4.07 MiB fp16 or 8.14 MiB
 fp32.
 
 At a 16-kHz product boundary, two input resamplers (mic and render) plus the
-mono output resampler add about 4.720 MMAC/s. Whole-front-end conversion also
+mono output resampler add about 4.720 MMAC/s (counted over the real taps; the
+NEON build pads each phase to a multiple of 4 taps and runs about 9% more).
+Whole-front-end conversion also
 moves the AEC itself to 48 kHz; that extra AEC cost is separate from this
 resampler count and must be included in the board measurement.
 
 Host DSP pool (`mono_aec_dfn_res_get_mem_requirements`, matched delay,
-five-filter bank, NE10): 724,064 bytes at the 16 kHz default (host plus the
-rate bridge, whose own pool is 325,120 bytes including the stage) and
+five-filter bank, NE10): 725,712 bytes at the 16 kHz default (host plus the
+rate bridge, whose own pool is 326,768 bytes including the stage) and
 1,467,776 bytes at 48 kHz (the conventional MMSE-LSA pipeline on the 48 kHz
 grid needs 1,608,128 bytes). Model weights and accelerator activation/
 workspace memory are external to this descriptor; adding int8 weights alone

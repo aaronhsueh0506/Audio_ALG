@@ -7,7 +7,9 @@ phase, and the ``next_output_tick`` machine that decides how many outputs each
 input frame produces.  This port keeps the same design, the same float32
 arithmetic and the same tap order, so it is the reference the non-48 kHz DFN2
 path (and Experiment 0's resampler round trip) is measured against; it is not
-a generic resampler.
+a generic resampler.  It is bit-exact against the C code built with ``SIMD=0``;
+the NEON build sums each output in a different (four-lane) order, so it agrees
+with this twin to float rounding, not bit for bit.
 
 Group delay is ``(filter_length - 1) / (2 * up)`` input frames -- 16 frames at
 every 8 k / 16 k / 48 k pairing -- so a native -> 48 k -> native round trip is
@@ -119,7 +121,7 @@ class AudioResampler:
 
     def _dot(self) -> np.float32:
         """Scalar tap-order accumulation, newest to oldest, as the C scalar
-        kernel does it (``audio_resampler_dot`` without NEON)."""
+        kernel does it (``audio_resampler.c`` built with ``SIMD=0``)."""
         taps = self.taps_per_phase
         phase = int(self.next_output_tick % self.up)
         coefficients = self.coefficients[phase]
@@ -257,7 +259,7 @@ class Dfn2RateBridge:
 
     Per native hop: the two native spectra (E, P) are synthesised with the
     host's sqrt-Hann WOLA, upsampled through the C ``audio_resampler``
-    (:class:`CResampler`, bit-exact with the product kernel), analysed on
+    (:class:`CResampler`, bit-exact with the ``SIMD=0`` product kernel), analysed on
     the 48 kHz 1024/512 grid every 512 new samples, pushed through the stage
     (silence for its two warm-up frames, as in C), synthesised at 48 kHz,
     downsampled, and emitted one native hop at a time from an output FIFO

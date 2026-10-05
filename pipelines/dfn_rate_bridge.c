@@ -164,6 +164,10 @@ static void fill_descriptor(const DfnRateBridgeConfig *cfg, const Resolved *r,
     h = fnv_u32(h, r->stage_req.build_flags_hash);
     h = fnv_u32(h, (uint32_t)FIFO48_CAP);
     h = fnv_u32(h, (uint32_t)OUT_FIFO_CAP);
+    /* The resamplers' own pool sizes: a pool recorded against another
+     * resampler layout is refused on the hash, not only on `bytes`. */
+    h = fnv_u32(h, (uint32_t)r->up_bytes);
+    h = fnv_u32(h, (uint32_t)r->down_bytes);
     memset(out, 0, sizeof(*out));
     out->descriptor_version = DFN_RATE_BRIDGE_DESCRIPTOR_VERSION;
     out->layout_version = DFN_RATE_BRIDGE_LAYOUT_VERSION;

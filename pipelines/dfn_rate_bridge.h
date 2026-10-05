@@ -81,7 +81,7 @@ typedef struct {
     uint32_t descriptor_version;  /* DFN_RATE_BRIDGE_DESCRIPTOR_VERSION      */
     uint32_t layout_version;      /* DFN_RATE_BRIDGE_LAYOUT_VERSION          */
     uint32_t backend_id;          /* the stage's backend id                  */
-    uint32_t build_flags_hash;    /* FNV-1a-32, folds the stage's hash       */
+    uint32_t build_flags_hash;    /* FNV-1a-32: the stage's hash, FIFO caps, resampler pool sizes */
     uint32_t alignment;           /* 16                                      */
     uint32_t reserved;            /* 0                                       */
     uint64_t bytes;
