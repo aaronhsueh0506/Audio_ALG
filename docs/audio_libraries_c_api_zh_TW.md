@@ -683,7 +683,7 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 | Align-ULCNet 48 kHz | 32 | 503,408 | 460,304 |
 | Align-ULCNet 48 kHz | 64 | 945,776 | 902,672 |
 | DeepVQE-S 16 kHz | 32 | 550,528 | 528,928 |
-| DeepFilterNet2 48 kHz | — | 213,232 | 215,312 |
+| DeepFilterNet2 48 kHz | — | 213,360 | 215,440 |
 
 DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 反而比 TIME 大 2,080 bytes：
 `DFN2State` 把 analysis/window/synthesis 緩衝以值內嵌，FREQ 實例甩不掉它們，卻要多 carve 雙輸入入口的

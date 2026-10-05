@@ -94,7 +94,7 @@ cfg.erb_fwd = erb_fwd;   /* 兩個模式都必填 */        cfg.erb_inv = erb_in
 cfg.atten_lim_db = 0.0f; /* 0 = 關閉 */
 
 DFN2PrepostMemReq req;
-dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);        /* DFN2_IO_TIME: 213,232 bytes */
+dfn2_prepost_get_mem_size(&amp;cfg, &amp;req);        /* DFN2_IO_TIME: 213,360 bytes */
 DFN2Prepost *p = dfn2_prepost_init_ex(pool, req.bytes, &amp;cfg, &amp;expected);
 
 for (each hop of DFN2_HOP_LEN samples) {
@@ -171,25 +171,26 @@ ERB 特徵又是 EMA 正規化的,mask 仍看起來合理,只有輸出電平是�
 <h3>記憶體與所有權</h3>
 <div class="tbl"><table>
 <tr><th>io_mode</th><th>pool(<code>get_mem_size</code>)</th><th>說明</th></tr>
-<tr><td><code>DFN2_IO_TIME</code></td><td>213,232 bytes</td><td>hop 進、hop 出;framing/window/OLA 由本類別做,transform 呼叫<b>呼叫端的</b> FftHandle</td></tr>
-<tr><td><code>DFN2_IO_FREQ</code></td><td>215,312 bytes</td><td>頻譜進、頻譜出,不做 transform;<code>fft</code> 可為 NULL</td></tr>
+<tr><td><code>DFN2_IO_TIME</code></td><td>213,360 bytes</td><td>hop 進、hop 出;framing/window/OLA 由本類別做,transform 呼叫<b>呼叫端的</b> FftHandle</td></tr>
+<tr><td><code>DFN2_IO_FREQ</code></td><td>215,440 bytes</td><td>頻譜進、頻譜出,不做 transform;<code>fft</code> 可為 NULL</td></tr>
 </table></div>
 <ul>
 <li><b>FREQ 比 TIME 大 2,080 bytes</b>:<code>DFN2State</code> 把 analysis/window/synthesis 緩衝
 以值內嵌、compose 也在同一個 struct,FREQ 實例甩不掉那些欄位,卻要多 carve 雙輸入的第二組 staging
 (<code>app_re</code>/<code>app_im</code>)——<b>不要期待 AIAEC 那種等比例節省</b>。io_mode 是 pool 的身分,
 init-time 固定,由 <code>_init_ex</code> 檢查。</li>
-<li><b><code>DFN2_PREPOST_CARVE_VERSION = 4</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
+<li><b><code>DFN2_PREPOST_CARVE_VERSION = 5</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
 摺進 <code>build_flags_hash</code>,所以舊 carve 的 pool 會在 <b>hash</b> 被拒。
-<b>版本 4:遞迴 state 就是 <code>DFN2ModelIOState</code> 自己的四個陣列,別無其他</b>。</li>
+<b>版本 4:遞迴 state 就是 <code>DFN2ModelIOState</code> 自己的四個陣列,別無其他</b>;<b>版本 5:<code>DFN2State</code> 另帶每個 ERB band 的非零 bin 範圍</b>。</li>
 <li><b>遞迴 state:一般路徑是複製,就地綁定是選用的省法</b>:四個 state tensor(<code>h_encoder</code>/<code>h_erb</code>/<code>h_df</code>/
 <code>df_convp_history</code>,共 25,856 float = 103,424 bytes)各只有一份 buffer、位址固定。一般 runtime 寫自己的 <code>*_next</code>,
 由 <code>dfn2_prepost_outputs_inherit()</code> 在 commit 前複製;能把 <code>*_next</code> 綁到輸入位址的 runtime 就地寫入、省略 inherit,
 其餘共用。就地時必須先讀完所有 state 輸入、才寫同位址的輸出(做不到者自行用暫存區暫存讀取)。</li>
 <li><b>ERB 特徵與 mask 展開只走矩陣的非零範圍</b>:<code>dfn2_set_erb_matrices()</code> 依矩陣<b>內容</b>記下每個 bin／band 的非零區間
-(<code>DFN2State.erb_fwd_lo/hi</code>、<code>erb_inv_lo/hi</code>),出貨矩陣 16,416 格只有 995 格非零。被略過的項都是「有限值 × ±0」,
+(<code>DFN2State.erb_fwd_lo/hi</code>、<code>erb_inv_lo/hi</code>,以及正向矩陣每個 band 的 bin 範圍 <code>erb_fwd_k0/k1</code>),出貨矩陣 16,416 格只有 995 格非零。被略過的項都是「有限值 × ±0」,
 累加器從 +0 開始、加 ±0 不改變任何值(含 Inf/NaN),保留的項順序不變,所以結果與完整矩陣乘法逐位元相同;
 某個 bin 的 power 或某個 band 的 gain 非有限時(x × 0 會是 NaN),只有<b>那一列</b>走完整範圍。
+power 全有限時正向和依 <code>erb_fwd_k0/k1</code> 逐 band 算(相鄰四個 band 並行、暫存器累加,band 內仍是 bin 遞增順序,逐位元不變;每個 48 kHz frame 1.88→0.23 µs,Apple M4),任何 power 非有限時退回逐 bin 走法。
 <code>dfn2_state_init()</code> 之後矩陣為 NULL、範圍為完整。<b>就地改寫矩陣內容後必須再呼叫一次 <code>set_erb_matrices</code></b>;
 回歸測試 <code>AINR/tests/test_c_prepost.c</code> 的 <code>test_dfn_erb_spans_exact</code> 逐位元比對稀疏與完整兩種算法(含溢位、NaN、非有限 mask、含 NaN 的矩陣)。</li>
 <li><b>window 是複製的,不是借用的</b>:<code>DFN2State</code> 以 <code>float window[DFN2_WIN_LEN]</code> 內嵌窗表,

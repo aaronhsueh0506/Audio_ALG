@@ -124,8 +124,9 @@ extern "C" {
  *      dual-input entry point, appended after every existing region
  *   3  DFN2State carries the ERB matrices' nonzero ranges
  *   4  the recurrent state is DFN2ModelIOState's own four arrays and nothing
- *      else */
-#define DFN2_PREPOST_CARVE_VERSION      4u
+ *      else
+ *   5  DFN2State also carries each ERB band's nonzero bin range */
+#define DFN2_PREPOST_CARVE_VERSION      5u
 
 /* One shared alignment for every module (audio_common mem_align.h). */
 #define DFN2_PREPOST_ALIGNMENT 16u

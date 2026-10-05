@@ -195,9 +195,16 @@ typedef struct {
      * starts at +0 unchanged (Inf and NaN included); the kept terms keep
      * their order. A non-finite power or band gain (x * 0 would be NaN)
      * takes its whole row. A caller that rewrites a matrix's contents in
-     * place must re-publish it through dfn2_set_erb_matrices(). */
+     * place must re-publish it through dfn2_set_erb_matrices().
+     * The forward matrix's columns have the same structure the other way
+     * round: band b is fed only by bins [erb_fwd_k0[b], erb_fwd_k1[b]). The
+     * feature sum runs band by band over that range (four bands at a time,
+     * each in ascending bin order, so every band's sum is formed exactly as
+     * the bin-major walk forms it). */
     uint16_t erb_fwd_lo[DFN2_N_BINS];
     uint16_t erb_fwd_hi[DFN2_N_BINS];
+    uint16_t erb_fwd_k0[DFN2_N_ERB];
+    uint16_t erb_fwd_k1[DFN2_N_ERB];
     uint16_t erb_inv_lo[DFN2_N_ERB];
     uint16_t erb_inv_hi[DFN2_N_ERB];
 } DFN2State;

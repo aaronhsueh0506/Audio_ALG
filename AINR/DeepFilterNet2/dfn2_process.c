@@ -69,6 +69,47 @@ static inline void df_common_analysis(FftHandle* fft, float *analysis_buf,
     }
 }
 
+/* erb_work[b] = sum over bins k in [k0[b], k1[b]) ascending of
+ * power[k] * erb_fwd[k * n_bands + b]; erb_work is zeroed on entry and
+ * n_bands is a multiple of 4. Four adjacent bands (their ranges are about the
+ * same length) advance together, each with its own register accumulator: the
+ * bin-major walk updates the accumulators in memory and every update waits for
+ * the previous one's store. Every power must be finite (a zero weight outside
+ * a range then adds nothing). */
+static inline void erb_forward_banded(const float *power, const float *erb_fwd,
+                                      const uint16_t *k0, const uint16_t *k1,
+                                      int n_bands, float *erb_work) {
+    for (int b = 0; b < n_bands; b += 4) {
+        const int a0 = k0[b], a1 = k0[b + 1], a2 = k0[b + 2], a3 = k0[b + 3];
+        const int n0 = k1[b] - a0, n1 = k1[b + 1] - a1;
+        const int n2 = k1[b + 2] - a2, n3 = k1[b + 3] - a3;
+        int common = n0 < n1 ? n0 : n1;
+        const float *w0 = erb_fwd + (size_t)a0 * n_bands + b;
+        const float *w1 = erb_fwd + (size_t)a1 * n_bands + b + 1;
+        const float *w2 = erb_fwd + (size_t)a2 * n_bands + b + 2;
+        const float *w3 = erb_fwd + (size_t)a3 * n_bands + b + 3;
+        float s0 = erb_work[b], s1 = erb_work[b + 1];
+        float s2 = erb_work[b + 2], s3 = erb_work[b + 3];
+        if (n2 < common) common = n2;
+        if (n3 < common) common = n3;
+        int j;
+        for (j = 0; j < common; ++j) {
+            s0 += power[a0 + j] * w0[(size_t)j * n_bands];
+            s1 += power[a1 + j] * w1[(size_t)j * n_bands];
+            s2 += power[a2 + j] * w2[(size_t)j * n_bands];
+            s3 += power[a3 + j] * w3[(size_t)j * n_bands];
+        }
+        for (j = common; j < n0; ++j) s0 += power[a0 + j] * w0[(size_t)j * n_bands];
+        for (j = common; j < n1; ++j) s1 += power[a1 + j] * w1[(size_t)j * n_bands];
+        for (j = common; j < n2; ++j) s2 += power[a2 + j] * w2[(size_t)j * n_bands];
+        for (j = common; j < n3; ++j) s3 += power[a3 + j] * w3[(size_t)j * n_bands];
+        erb_work[b] = s0;
+        erb_work[b + 1] = s1;
+        erb_work[b + 2] = s2;
+        erb_work[b + 3] = s3;
+    }
+}
+
 /* erb_fwd: caller-loaded exported matrix, raw float32, bin-major
  * [n_bins][n_bands] -- the exact buffer the model trained with (see
  * export_erb_matrix.py --runtime-bins). The library never derives a
@@ -76,6 +117,7 @@ static inline void df_common_analysis(FftHandle* fft, float *analysis_buf,
 static inline void df_common_features(
     const float *spec_re, const float *spec_im,
     const float *erb_fwd, const uint16_t *fwd_lo, const uint16_t *fwd_hi,
+    const uint16_t *band_k0, const uint16_t *band_k1,
     int n_bins, int n_bands, int df_bins,
     float analysis_scale, float log_floor,
     float erb_alpha, float erb_scale, float *erb_state,
@@ -84,16 +126,24 @@ static inline void df_common_features(
     float scale2 = analysis_scale * analysis_scale;
     memset(erb_work, 0, (size_t)n_bands * sizeof(float));
     skn_power_scale_f32(power, spec_re, spec_im, (size_t)n_bins, scale2);
-    /* Each band accumulates its bins in ascending k over the row's nonzero
-     * span (see DFN2State); a non-finite power takes its whole row, since
-     * Inf/NaN times 0 is NaN. */
-    for (int k = 0; k < n_bins; ++k) {
-        float p = power[k];
-        const float *row = erb_fwd + (size_t)k * n_bands;
-        int finite = isfinite(p);
-        int hi = finite ? fwd_hi[k] : n_bands;
-        for (int b = finite ? fwd_lo[k] : 0; b < hi; ++b)
-            erb_work[b] += p * row[b];
+    /* Each band accumulates its bins in ascending k over its nonzero range
+     * (see DFN2State). A non-finite power takes its whole row, since Inf/NaN
+     * times 0 is NaN; that case walks bin by bin, every other frame runs
+     * band by band with the accumulators in registers. Both add each band's
+     * nonzero products in the same order. */
+    if (skn_all_finite_f32(power, (size_t)n_bins)) {
+        _Static_assert(DFN2_N_ERB % 4 == 0, "erb_forward_banded runs bands in fours");
+        erb_forward_banded(power, erb_fwd, band_k0, band_k1, n_bands,
+                           erb_work);
+    } else {
+        for (int k = 0; k < n_bins; ++k) {
+            float p = power[k];
+            const float *row = erb_fwd + (size_t)k * n_bands;
+            int finite = isfinite(p);
+            int hi = finite ? fwd_hi[k] : n_bands;
+            for (int b = finite ? fwd_lo[k] : 0; b < hi; ++b)
+                erb_work[b] += p * row[b];
+        }
     }
     for (int b = 0; b < n_bands; ++b) {
         float db = 10.0f * log10f(erb_work[b] + log_floor);
@@ -252,18 +302,26 @@ static inline void df_common_synthesis(FftHandle* fft,
 
 /* Per-row nonzero span [lo, hi) of a row-major matrix. An all-zero row gets
  * the empty span; a NULL matrix gets full spans, i.e. the dense sums. */
-static void erb_row_spans(const float *matrix, int rows, int cols,
-                          uint16_t *lo, uint16_t *hi)
+/* Where each of `lines` lines of a matrix is nonzero: line i holds
+ * m[i * line_step + j * elem_step] for j < len, and its span is the first nonzero j
+ * and one past the last (an all-zero line is the empty range [0, 0); without
+ * a matrix every line is full). Rows of a [rows][cols] matrix: (rows, cols,
+ * cols, 1); columns: (cols, rows, 1, cols). */
+static void erb_spans(const float *m, int lines, int len, int line_step,
+                      int elem_step, uint16_t *lo, uint16_t *hi)
 {
-    for (int r = 0; r < rows; ++r) {
-        int first = 0, last = cols;
-        if (matrix) {
-            const float *row = matrix + (size_t)r * cols;
-            while (first < last && row[first] == 0.0f) ++first;
-            while (last > first && row[last - 1] == 0.0f) --last;
+    for (int i = 0; i < lines; ++i) {
+        int first = 0, last = len;
+        if (m) {
+            const float *line = m + (size_t)i * line_step;
+            while (first < last && line[(size_t)first * elem_step] == 0.0f)
+                ++first;
+            while (last > first && line[(size_t)(last - 1) * elem_step] == 0.0f)
+                --last;
+            if (first == last) first = last = 0;
         }
-        lo[r] = (uint16_t)first;
-        hi[r] = (uint16_t)last;
+        lo[i] = (uint16_t)first;
+        hi[i] = (uint16_t)last;
     }
 }
 
@@ -274,10 +332,12 @@ void dfn2_set_erb_matrices(DFN2State* st,
     if (!st) return;
     st->erb_fwd = erb_fwd;
     st->erb_inv = erb_inv;
-    erb_row_spans(erb_fwd, DFN2_N_BINS, DFN2_N_ERB,
-                  st->erb_fwd_lo, st->erb_fwd_hi);
-    erb_row_spans(erb_inv, DFN2_N_ERB, DFN2_N_BINS,
-                  st->erb_inv_lo, st->erb_inv_hi);
+    erb_spans(erb_fwd, DFN2_N_BINS, DFN2_N_ERB, DFN2_N_ERB, 1,
+              st->erb_fwd_lo, st->erb_fwd_hi);
+    erb_spans(erb_fwd, DFN2_N_ERB, DFN2_N_BINS, 1, DFN2_N_ERB,
+              st->erb_fwd_k0, st->erb_fwd_k1);
+    erb_spans(erb_inv, DFN2_N_ERB, DFN2_N_BINS, DFN2_N_BINS, 1,
+              st->erb_inv_lo, st->erb_inv_hi);
 }
 
 void dfn2_state_init(DFN2State* st, FftHandle* fft)
@@ -320,7 +380,7 @@ void dfn2_compute_features(DFN2State* st,
     if (!st || !spec_re || !spec_im || !feat_erb || !feat_spec) return;
     df_common_features(
         spec_re, spec_im, st->erb_fwd, st->erb_fwd_lo, st->erb_fwd_hi,
-        DFN2_N_BINS, DFN2_N_ERB, DFN2_DF_BINS,
+        st->erb_fwd_k0, st->erb_fwd_k1, DFN2_N_BINS, DFN2_N_ERB, DFN2_DF_BINS,
         DFN2_ANALYSIS_SCALE, DFN2_ERB_LOG_FLOOR,
         DFN2_ERB_NORM_ALPHA, DFN2_ERB_NORM_SCALE_DB,
         st->erb_norm_state,

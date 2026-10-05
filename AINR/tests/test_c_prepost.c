@@ -955,11 +955,14 @@ static int test_dfn_erb_spans_exact(void)
             fwd[10][5] = NAN;
             fwd[300][0] = INFINITY;
             memset(fwd[7], 0, sizeof(fwd[7]));
+            for (int k = 0; k < 513; ++k) fwd[k][12] = 0.0f;   /* an empty band */
             fwd[200][20] = 0.0f;       /* a hole inside a span */
             inv[3][40] = -0.0f;
             inv[20][0] = 0.5f;         /* a far outlier widens the span */
         } else if (variant == 2) {
             for (int k = 0; k < 513; ++k) fwd[k][(k * 7) % 32] += 0.125f;
+            for (int k = 0; k < 513; ++k) fwd[k][3] = 0.0f;
+            fwd[512][3] = 0.5f;        /* a band fed by the last bin only */
             inv[31][3] = 0.25f;
         }
         dfn2_state_init(&st, NULL);

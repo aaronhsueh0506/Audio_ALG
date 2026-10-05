@@ -793,7 +793,7 @@ static int case_dual_guards(FftHandle *fft) {
     DFN2Prepost *pt, *pf;
     void *pool_t, *pool_f;
 
-    CHECK(DFN2_PREPOST_CARVE_VERSION == 4u);
+    CHECK(DFN2_PREPOST_CARVE_VERSION == 5u);
 
     config_time(&cfg_time, fft);
     config_freq(&cfg_freq);
@@ -2553,7 +2553,7 @@ def test_dual_entry_guards_and_gain_accessor(driver):
     """The dual entry is refused in DFN2_IO_TIME (without opening a frame),
     on any NULL argument and with a frame open; the head bin gain is NULL
     with a frame open and before the first hop that carried heads, and is
-    the unit gain after a frame_skip; the carve version is 4."""
+    the unit gain after a frame_skip; the carve version is 5."""
     _run(driver, 'dual_guards')
 
 
