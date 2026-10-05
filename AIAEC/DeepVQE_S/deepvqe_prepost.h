@@ -108,11 +108,11 @@ extern "C" {
 
 /* Alignment search depth D, the exporter's max_delay_frames. It sizes the
  * attention key/value rings and the score history, so it is a pool-size
- * parameter. 63 is grid.delay_frames(1.0) on this grid -- ceil(1.0 s *
- * 16000/256), i.e. the shipped one-second search range. */
+ * parameter. 32 is grid.delay_frames(0.5) on this grid -- ceil(0.5 s *
+ * 16000/256), i.e. the shipped half-second search range. */
 #define DEEPVQE_PREPOST_MIN_D      1
 #define DEEPVQE_PREPOST_MAX_D      256
-#define DEEPVQE_PREPOST_DEFAULT_D  63
+#define DEEPVQE_PREPOST_DEFAULT_D  32
 
 /* ---- DeepVQE-S topology constants (mirrors of DeepVQE_S/model.py) -------
  * These are NOT tunables. They are the checkpoint's fixed channel schedule

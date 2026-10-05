@@ -623,11 +623,11 @@ const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(const DeepVqePrepost 
   `[1,1,257,18]`，末軸仍按 `[time][frequency][RI]` 排列）＋ 16 個 next state。
   按 index 綁的 adapter 必須用這個列舉，按名字綁的用 `_state_name()`。
 - DeepVQE-S 回的是**每個 state 的完整下一個值**（不是差量），pool 裡每個 state 只有一份 buffer，
-  一般 runtime 的輸出由 `deepvqe_prepost_outputs_inherit()` 複製進來、就地綁定者省略它；commit 的有限性檢查每幀走過整個狀態（約 700 KB），就地路徑遇非有限值時整組 state 歸零。
+  一般 runtime 的輸出由 `deepvqe_prepost_outputs_inherit()` 複製進來、就地綁定者省略它；commit 的有限性檢查每幀走過整個狀態（約 480 KB），就地路徑遇非有限值時整組 state 歸零。
 - `descriptor_validate()` 拿 ONNX/JSON metadata 裡的 13 欄 `c_descriptor` 對本 build 的 ABI 逐欄比對，
   只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 2。
 - D 範圍 `DEEPVQE_PREPOST_MIN_D`=1 到 `DEEPVQE_PREPOST_MAX_D`=256，出貨值
-  `DEEPVQE_PREPOST_DEFAULT_D`=63（16 kHz 上的一秒搜尋範圍）。
+  `DEEPVQE_PREPOST_DEFAULT_D`=32（16 kHz 上的半秒搜尋範圍；D 是 export 期參數，圖 shape 與 C 傳入的 `delay_depth` 必須相同，descriptor 只檢查範圍，抓不到不一致）。
 - grid 只有 16 kHz/512/256：`aiaec_process.h` 帶 `#error` 守衛，grid 換掉是編譯失敗而不是默默重新解讀張量。
 
 ### 6.6 DeepFilterNet2：`dfn2_prepost.h`
@@ -682,7 +682,7 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 | Align-ULCNet 48 kHz | 16 | 282,224 | 239,120 |
 | Align-ULCNet 48 kHz | 32 | 503,408 | 460,304 |
 | Align-ULCNet 48 kHz | 64 | 945,776 | 902,672 |
-| DeepVQE-S 16 kHz | 63 | 778,192 | 756,592 |
+| DeepVQE-S 16 kHz | 32 | 550,528 | 528,928 |
 | DeepFilterNet2 48 kHz | — | 213,232 | 215,312 |
 
 DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 反而比 TIME 大 2,080 bytes：

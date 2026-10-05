@@ -523,9 +523,9 @@ static int case_freq(FftHandle *fft) {
 
 static int case_freqpool(FftHandle *fft) {
     DeepVqePrepostConfig cfg_time, cfg_freq, cfg_deep;
-    DeepVqePrepostConfig cfg_time63, cfg_freq63;
+    DeepVqePrepostConfig cfg_time_default, cfg_freq_default;
     DeepVqePrepostMemReq req_time, req_freq, req_deep;
-    DeepVqePrepostMemReq req_time63, req_freq63;
+    DeepVqePrepostMemReq req_time_default, req_freq_default;
     void *pool_time, *pool_freq;
 
     CHECK(deepvqe_prepost_config_defaults(&cfg_time, DEEPVQE_IO_TIME, D) == 0);
@@ -536,17 +536,17 @@ static int case_freqpool(FftHandle *fft) {
                                           2 * D) == 0);
     cfg_deep.fft = fft;
     cfg_deep.window = window;
-    CHECK(deepvqe_prepost_config_defaults(&cfg_time63, DEEPVQE_IO_TIME,
+    CHECK(deepvqe_prepost_config_defaults(&cfg_time_default, DEEPVQE_IO_TIME,
                                           DEEPVQE_PREPOST_DEFAULT_D) == 0);
-    cfg_time63.fft = fft;
-    cfg_time63.window = window;
-    CHECK(deepvqe_prepost_config_defaults(&cfg_freq63, DEEPVQE_IO_FREQ,
+    cfg_time_default.fft = fft;
+    cfg_time_default.window = window;
+    CHECK(deepvqe_prepost_config_defaults(&cfg_freq_default, DEEPVQE_IO_FREQ,
                                           DEEPVQE_PREPOST_DEFAULT_D) == 0);
     CHECK(deepvqe_prepost_get_mem_size(&cfg_time, &req_time) == 0);
     CHECK(deepvqe_prepost_get_mem_size(&cfg_freq, &req_freq) == 0);
     CHECK(deepvqe_prepost_get_mem_size(&cfg_deep, &req_deep) == 0);
-    CHECK(deepvqe_prepost_get_mem_size(&cfg_time63, &req_time63) == 0);
-    CHECK(deepvqe_prepost_get_mem_size(&cfg_freq63, &req_freq63) == 0);
+    CHECK(deepvqe_prepost_get_mem_size(&cfg_time_default, &req_time_default) == 0);
+    CHECK(deepvqe_prepost_get_mem_size(&cfg_freq_default, &req_freq_default) == 0);
 
     printf("pool TIME D=%d  = %llu B\n"
            "pool FREQ D=%d  = %llu B   (saves %llu B, %.2f%%)\n"
@@ -557,11 +557,11 @@ static int case_freqpool(FftHandle *fft) {
            (unsigned long long)(req_time.bytes - req_freq.bytes),
            100.0 * (double)(req_time.bytes - req_freq.bytes) /
                (double)req_time.bytes,
-           DEEPVQE_PREPOST_DEFAULT_D, (unsigned long long)req_time63.bytes,
-           DEEPVQE_PREPOST_DEFAULT_D, (unsigned long long)req_freq63.bytes,
-           (unsigned long long)(req_time63.bytes - req_freq63.bytes),
-           100.0 * (double)(req_time63.bytes - req_freq63.bytes) /
-               (double)req_time63.bytes);
+           DEEPVQE_PREPOST_DEFAULT_D, (unsigned long long)req_time_default.bytes,
+           DEEPVQE_PREPOST_DEFAULT_D, (unsigned long long)req_freq_default.bytes,
+           (unsigned long long)(req_time_default.bytes - req_freq_default.bytes),
+           100.0 * (double)(req_time_default.bytes - req_freq_default.bytes) /
+               (double)req_time_default.bytes);
 
     /* ONE copy of the state per tensor: doubling D grows the pool by the
      * state's own growth (alignment padding aside), not by twice that. */
@@ -581,9 +581,9 @@ static int case_freqpool(FftHandle *fft) {
 
     /* IO_FREQ must not pay for the framing machinery it never runs. */
     CHECK(req_freq.bytes < req_time.bytes);
-    CHECK(req_freq63.bytes < req_time63.bytes);
+    CHECK(req_freq_default.bytes < req_time_default.bytes);
     /* D is a pool-size parameter: the attention rings scale with it. */
-    CHECK(req_time63.bytes > req_time.bytes);
+    CHECK(req_time_default.bytes > req_time.bytes);
     CHECK(req_freq.io_mode == (uint32_t)DEEPVQE_IO_FREQ);
     CHECK(req_time.io_mode == (uint32_t)DEEPVQE_IO_TIME);
     CHECK(req_freq.build_flags_hash != req_time.build_flags_hash);
@@ -2115,6 +2115,28 @@ def test_layout_version_matches_c_header():
     assert int(found[0]) == DEEPVQE_C_LAYOUT_VERSION
 
 
+def test_shipped_delay_depth_agrees_across_header_config_and_grid():
+    """The half-second search range is stated three times: the C default
+    (DEEPVQE_PREPOST_DEFAULT_D), the trainer config's max_delay_seconds and the
+    grid's frame conversion. They must name the same D, or a board built with
+    the default asks for a pool the shipped graph does not fit."""
+    import configparser
+
+    from AIAEC.aiaec_common import SignalGrid
+
+    with open(_PREPOST_HEADER, encoding='utf-8') as stream:
+        found = re.findall(
+            r'^#define\s+DEEPVQE_PREPOST_DEFAULT_D\s+(\d+)\s*$',
+            stream.read(), re.MULTILINE)
+    assert len(found) == 1, found
+    config = configparser.ConfigParser()
+    assert config.read(os.path.join(_DEEPVQE_DIR, 'config.ini'))
+    seconds = config.getfloat('model', 'max_delay_seconds')
+    assert seconds == pytest.approx(0.5)
+    grid = SignalGrid(16000, 512, 512, 256)
+    assert grid.delay_frames(seconds) == int(found[0]) == 32
+
+
 @pytest.fixture(scope='module')
 def deepvqe_built():
     """The streaming export wrapper for a freshly constructed DeepVQE-S, plus
@@ -2127,7 +2149,7 @@ def deepvqe_built():
 
     grid = SignalGrid(16000, 512, 512, 256)
     torch.manual_seed(0)
-    model = DeepVQES(grid).eval()
+    model = DeepVQES(grid, max_delay_seconds=0.5).eval()
     built = _build('DeepVQE_S', model)
     with torch.no_grad():
         outputs = built[0](*built[1])
@@ -2171,7 +2193,7 @@ def test_c_descriptor_matches_the_built_graph(driver, deepvqe_built):
         assert name == state_names[index], (index, name, state_names[index])
         assert dims[:rank] == tuple(inputs[2 + index].shape)
 
-    assert descriptor['delay_depth'] == model.max_delay_frames == 63
+    assert descriptor['delay_depth'] == model.max_delay_frames == 32
     assert descriptor['state_tensor_count'] == 16
 
 
@@ -2200,7 +2222,7 @@ def test_export_metadata_carries_the_c_descriptor(driver, deepvqe_built,
 
     with torch.no_grad():
         metadata = export_graph(grid, built, str(checkpoint), str(output),
-                                63, verify=False)
+                                32, verify=False)
 
     assert metadata['state_layout_version'] == DEEPVQE_C_LAYOUT_VERSION
     assert metadata['c_descriptor'] == descriptor

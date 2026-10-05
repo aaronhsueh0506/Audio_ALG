@@ -30,14 +30,14 @@ th{background:#eef0f2}
 ratio mask：是 3×3（3 個時間位置 × 3 個頻率位置）的因果複數 convolving mask（CCM），
 以論文的三個 120° 向量（<code>three_vector_complex</code>）表示；<code>AecOutput.mask</code>
 為 <code>None</code>。</p>
-<p>16k grid 下 <code>max_delay_frames = 63</code>。參數量實測 <b>632,069</b> trainable
+<p>16k grid 下 <code>max_delay_frames = 32</code>（出貨模型以 <code>max_delay_seconds = 0.5</code> 訓練；建構子預設仍是 1.0 s ＝ 63）。參數量實測 <b>632,069</b> trainable
 （16k power-of-two 改編約 0.63 M，README 記載對應論文 0.59 M class）。
 <code>stream_output_delay = 0</code>——四候選中時間軸最乾淨（readiness §3.3）。</p>
 <p><b>ONNX / NPU graph boundary</b>（已交付：
 <code>AIAEC/DeepVQE_S/export_onnx.py</code>）：
 graph <b>內</b> = <code>compressed_ri_feature</code>（power-law <code>pow(0.3)</code>）、
 causal conv + BatchNorm + ELU 編碼、<code>FrameDelayAttention</code>（<code>softmax</code>
-over D=63，每幀獨立、無累積 state）、GRU(192)、<code>FreqUpsample</code>（頻率 sub-pixel
+over D=32，每幀獨立、無累積 state）、GRU(192)、<code>FreqUpsample</code>（頻率 sub-pixel
 shuffle，<b>無 deconv</b>）、殘差塊與 <code>three_vector_complex</code> 產生複數 taps。
 graph <b>外</b>（C 前後處理，現由 <code>deepvqe_prepost.c/h</code> 這個類別統一持有）=
 sqrt-Hann STFT/ISTFT（<code>aiaec_process.c/h</code>，center=False 每 hop 一幀）、complex↔RI，
@@ -107,7 +107,7 @@ pool 裡每個 state 只有一份 buffer、位址在實例壽命內固定，沒�
 （<code>state_out[id]</code> 與 <code>inputs.state[id]</code> 同指標）就地寫入、省略 inherit，其餘共用；
 就地時必須先讀完所有 state 輸入、才寫同位址的 state 輸出。指標等於目的位址的 tensor 不被 inherit 複製或檢查。
 <code>frame_inputs</code> 只對 <code>taps</code> 預填 NaN，state 不預填。<code>frame_commit</code> 是純驗證：
-每幀走過每個 tap 與整組約 700 KB 的 state 元素檢查有限性，通過後把 CCM taps 套到 raw mic 頻譜 ring 上
+每幀走過每個 tap 與整組約 480 KB 的 state 元素檢查有限性，通過後把 CCM taps 套到 raw mic 頻譜 ring 上
 （<code>deepvqe_ccm_process</code>）；就地路徑遇非有限值時 state 無法回滾，<b>16 個 state 全部歸零</b>、CCM ring 不前進、
 幀維持開啟、回 −1。寫一半或混寫只有在非有限值時才偵測得到。</p>
 <p><b>Framing</b>：<code>aiaec_analysis_push_frame()</code>（<code>aiaec_process.h</code>，
@@ -117,8 +117,8 @@ pool 裡每個 state 只有一份 buffer、位址在實例壽命內固定，沒�
 centered 只是在開頭多發一幀 reflect 前綴），所以這是<b>換標籤不是換訊號</b>，也讓類別和
 center=False 的 AEC/GSC seam 對得上。<b>演算法延遲仍是 1 個 hop</b>：它來自 synthesis 的
 半窗 trim，不是分析排程。</p>
-<p><b>Pool</b>（<code>deepvqe_prepost_get_mem_size</code>，16 kHz、D=63）：
-<code>DEEPVQE_IO_TIME</code> <b>778,192 B</b>、<code>DEEPVQE_IO_FREQ</code> <b>756,592 B</b>
+<p><b>Pool</b>（<code>deepvqe_prepost_get_mem_size</code>，16 kHz、D=32）：
+<code>DEEPVQE_IO_TIME</code> <b>550,528 B</b>、<code>DEEPVQE_IO_FREQ</code> <b>528,928 B</b>
 （差額 21,600 B ＝ 兩路 rolling 分析歷史＋共用 transform scratch＋一個 synthesis＋輸出 hop
 staging）。16 個 state 張量佔掉絕大部分。</p>
 
@@ -130,8 +130,8 @@ staging）。16 個 state 張量佔掉絕大部分。</p>
   state["mic1"].step (16ch) → state["mic2"]   state["far1"].step (8ch) → state["far2"]
         │ m2 [B,40,1,65]                           │ f2 [B,24,1,65]
         └────────► state["align"].step(m2, f2) ◄───┘
-                    (FrameDelayAttentionCell：key/value ring 63、score conv 史 4 幀)
-                    │ aligned [B,24,1,65], delay [B,1,63]
+                    (FrameDelayAttentionCell：key/value ring 32、score conv 史 4 幀)
+                    │ aligned [B,24,1,65], delay [B,1,32]
         ┌───────────┘ cat(m2, aligned) [B,64,1,65]
         ▼
   state["mic3"].step (56ch) → state["mic4"].step (24ch)  m4 [B,24,1,17]
@@ -170,11 +170,11 @@ hop#0 無輸出（呼叫端補零）。Python reference 的 StreamSTFT/StreamIST
 <tr><td>mic</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
 <tr><td>far</td><td>in</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>256 新樣本</td></tr>
 <tr><td>output</td><td>out</td><td>(1, 1, 257)</td><td>complex64</td><td>1</td><td>WOLA 後 256</td></tr>
-<tr><td>delay_distribution</td><td>out</td><td>(1, 1, 63)</td><td>float32</td><td>1</td><td>—</td></tr>
+<tr><td>delay_distribution</td><td>out</td><td>(1, 1, 32)</td><td>float32</td><td>1</td><td>—</td></tr>
 <tr><td>aux ccm_taps</td><td>out</td><td>(1, 1, 257, 3, 3)</td><td>complex64</td><td>1</td><td>—</td></tr>
 </table>
 <p>Offline <code>forward(microphone, far_end)</code>：complex <code>[B,T,257]</code> in/out、
-delay <code>[B,T,63]</code>、ccm_taps <code>[B,T,257,3,3]</code>；<code>mask = None</code>。</p>
+delay <code>[B,T,32]</code>、ccm_taps <code>[B,T,257,3,3]</code>；<code>mask = None</code>。</p>
 
 <h2>State 表</h2>
 <p><code>state_report</code> 實測（B=1 fp32，含 host CCM ring 共 <b>710.2 KB</b>——
@@ -182,9 +182,9 @@ delay <code>[B,T,63]</code>、ccm_taps <code>[B,T,257,3,3]</code>；<code>mask =
 graph state 由 host caller 保存；STFT/ISTFT 與 CCM 頻譜 ring 屬 C struct 層：</p>
 <table>
 <tr><th>state</th><th>shape</th><th>size</th><th>保存者（部署契約）</th></tr>
-<tr><td>align.key_ring</td><td>(1, 4, 63, 65)</td><td>64.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
-<tr><td>align.value_ring</td><td>(1, 24, 63, 65)</td><td>383.9 KB</td><td>host caller（顯式 graph I/O）</td></tr>
-<tr><td>align.score_history</td><td>(1, 4, 4, 63)</td><td>3.9 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>align.key_ring</td><td>(1, 4, 32, 65)</td><td>32.5 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>align.value_ring</td><td>(1, 24, 32, 65)</td><td>195.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
+<tr><td>align.score_history</td><td>(1, 4, 4, 32)</td><td>2.0 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>mic1..mic4.history</td><td>(1,2,3,257) / (1,16,3,129) / (1,64,3,65) / (1,56,3,33)</td><td>6.0 / 24.2 / 48.8 / 21.7 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>far1 / far2.history</td><td>(1,2,3,257) / (1,8,3,129)</td><td>6.0 / 12.1 KB</td><td>host caller（顯式 graph I/O）</td></tr>
 <tr><td>h_gru（gru.hidden）</td><td>(1, 1, 192)</td><td>0.8 KB</td><td>host caller（顯式 graph I/O）</td></tr>
@@ -233,7 +233,7 @@ graph state 由 host caller 保存；STFT/ISTFT 與 CCM 頻譜 ring 屬 C struct
 <code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> 現為 <b>2</b>，且刻意<b>不</b>與
 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 共用：兩個模型的 boundary 各走各的，共用號碼會讓
 一邊的 bump 看起來像另一邊的。D 範圍 <code>DEEPVQE_PREPOST_MIN_D</code>=1 …
-<code>MAX_D</code>=256，預設 63 ＝ 這個 grid 上的 1.0 秒搜尋範圍。</p>
+<code>MAX_D</code>=256，預設 32 ＝ 這個 grid 上的 0.5 秒搜尋範圍（<code>ceil(0.5 × 16000/256)</code>）。</p>
 <p><b>Exporter metadata</b>：<code>AIAEC/_streaming_export.py</code> 的
 <code>_C_DESCRIPTORS</code> 把 <code>DeepVQE_S</code> 映到
 <code>_deepvqe_c_descriptor()</code>，它<b>從剛建好的 graph 量</b>這 13 欄（tap 軸、conv／score
