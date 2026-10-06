@@ -1193,3 +1193,44 @@ def test_runtime_erb_bins_are_a_bitwise_partition_of_unity(tmp_path):
     shifted[5, 100] += np.float32(2 ** -20)
     with pytest.raises(RuntimeError):
         require_partition_of_unity(shifted)
+
+
+def test_batch1_cleanup_keeps_the_graph_exact_and_rank_four(tmp_path):
+    """The grouped linears' rank-5 MatMuls and their Squeeze/Unsqueeze chains
+    are batch-1 artefacts: onnx_batch1_optimizer.py (run on the exported graph)
+    removes them without changing one output bit."""
+    onnx = pytest.importorskip('onnx')
+    ort = pytest.importorskip('onnxruntime')
+    import copy
+
+    # The cleanup lives at the Audio_ALG root, outside this release unit; the
+    # exporter does not call it, so the check skips when AINR is released alone.
+    sys.path.append(os.fspath(pathlib.Path(__file__).resolve().parents[3]))
+    b1 = pytest.importorskip('onnx_batch1_optimizer')
+
+    torch.manual_seed(74)
+    model = DeepFilterNet2(
+        n_fft=512, sr=16000, n_erb=32, df_bins=64,
+        enc_ch=8, emb_size=32, df_hidden=32,
+        lin_groups=4, enc_lin_groups=4,
+    ).eval()
+    wrapper = StatelessDFN2Heads(model).eval()
+    layout = wrapper.gru_state_layout
+    path = tmp_path / 'raw.onnx'
+    torch.onnx.export(wrapper, wrapper.initial_inputs(), str(path),
+                      input_names=layout.input_names,
+                      output_names=layout.output_names, opset_version=17,
+                      do_constant_folding=True)
+    options = ort.SessionOptions()
+    options.graph_optimization_level = (
+        ort.GraphOptimizationLevel.ORT_ENABLE_BASIC)
+    options.optimized_model_filepath = str(path) + '.fold'
+    options.log_severity_level = 3
+    ort.InferenceSession(str(path), options,
+                         providers=['CPUExecutionProvider'])
+    graph = onnx.load(str(path) + '.fold')
+    original = copy.deepcopy(graph)
+    report = b1.optimize_batch1(graph)
+    assert report['high_rank_left'] == [] and report['blocked'] == []
+    assert report['nodes_after'] < report['nodes_before']
+    assert b1.verify_identical(original, graph) == 0.0

@@ -237,6 +237,30 @@ mic + far。Align-ULCNet 使用已產生的 error + raw far（或
 manifest 會另外記錄產品部署輸入是 aligned far，避免把校正資料來源與
 board wiring 混為一談。</p>
 
+<h2>Batch-1 圖整理（onnx_batch1_optimizer.py）</h2>
+
+<p>串流圖固定 batch 1、單幀，追蹤器因此產生大量只增減大小為 1 的軸的 op，以及 5～6 維的中間
+tensor（目標平台量化工具鏈要求 rank-4）。<code>onnx_batch1_optimizer.py</code>（放在
+Audio_ALG 根目錄，不屬於任何單一模型；測試在
+<code>AIAEC/tests/test_onnx_batch1_optimizer.py</code>）在 DeepVQE-S、Align-ULCNet 的匯出器
+<code>optimize_graph_file</code> 裡自動執行；AINR 要能單獨釋出，DFN2 匯出器不依賴上層目錄，需要時對匯出的 .onnx 執行下列指令。它可用在任何靜態形狀的 ONNX：</p>
+<pre>python3 onnx_batch1_optimizer.py model.onnx -o model_b1.onnx --verify</pre>
+<p>三道 pass 都只重新標記軸、不改任何算術，因此結果必須與原圖在 onnxruntime 逐位元相同
+（<code>--verify</code> 要求差 0）：</p>
+<ul>
+<li><b>fold_frequency_pad_into_conv</b>：餵給單一 Conv 的頻率軸零 Pad 折進 Conv 的 <code>pads</code>
+（時間軸不 pad；ConvTranspose 不動）。</li>
+<li><b>merge_views</b>：Squeeze／Unsqueeze／Flatten／Reshape、只搬動大小為 1 的軸的 Transpose、
+作用在大小為 1 的軸上的 Gather 都視為 view，連續的 view 併成一個 Reshape，進出形狀相同者直接移除。</li>
+<li><b>lower_rank</b>：高於 4 維的 tensor 以去掉最前面的大小為 1 的軸降到 4 維（逐元素 op、Transpose、
+MatMul、ReduceSum/Mean/Max/Min、Softmax；其他 op 會列在 <code>blocked</code>），再由
+merge_views 抵消成對的 Reshape。</li>
+</ul>
+<p>實測節點數（ONNX Runtime 常數折疊後 → 整理後）：DeepVQE-S 121 → 101、Align-ULCNet 115 → 96、
+DFN2 128 → 103（DFN2 以命令列對匯出檔執行），三者都不再有 rank &gt; 4 的 tensor，輸出差 0。
+這些 op 在目標平台上是否有成本、rank-4 限制是否涵蓋中間 tensor，尚待工具鏈的算子報告確認。
+改變算式的重寫（例如把 attention 的 Mul＋ReduceSum 改成 MatMul）不在此工具範圍，由各模型的匯出器決定。</p>
+
 <h2>Release checks</h2>
 
 <ol>

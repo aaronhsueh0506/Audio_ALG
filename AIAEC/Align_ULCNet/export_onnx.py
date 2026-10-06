@@ -153,6 +153,7 @@ if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
 
 from AIAEC._onnx_contract import validate_nctf_no_temporal_padding
+from onnx_batch1_optimizer import format_report, optimize_batch1
 
 from AIAEC.Align_ULCNet.inference import load_model
 from AIAEC.training_common import (
@@ -377,62 +378,6 @@ SIGNAL_INPUTS = DEFAULT_LAYOUT.signal_inputs
 OUTPUT_NAMES = DEFAULT_LAYOUT.output_names
 
 
-def fuse_freq_pad_into_conv(model):
-    """Fold an explicit zero Pad that feeds exactly one Conv into the Conv's
-    own ``pads`` attribute, so the padding costs no accelerator op.
-
-    The graphs pad the frequency axis explicitly (the temporal axis carries
-    its history as a tensor and is never padded). A zero Pad followed by an
-    unpadded Conv and the same Conv with ``pads`` are the same arithmetic.
-    Only constant-mode, zero-valued, non-negative frequency pads with static
-    amounts qualify; anything else is left as it is. Returns the number of
-    Pad nodes removed.
-    """
-    from onnx import helper, numpy_helper
-
-    graph = model.graph
-    initializers = {item.name: item for item in graph.initializer}
-    consumers = {}
-    for node in graph.node:
-        for name in node.input:
-            consumers.setdefault(name, []).append(node)
-    graph_outputs = {value.name for value in graph.output}
-    removed = 0
-    for pad in list(graph.node):
-        if (pad.op_type != 'Pad' or pad.output[0] in graph_outputs
-                or len(pad.input) < 2 or pad.input[1] not in initializers
-                or (len(pad.input) > 2 and pad.input[2])):
-            continue
-        mode = next((helper.get_attribute_value(a) for a in pad.attribute
-                     if a.name == 'mode'), b'constant')
-        amounts = numpy_helper.to_array(initializers[pad.input[1]]).tolist()
-        # [N, C, T, F] begins then ends: only frequency may be padded.
-        if (mode != b'constant' or len(amounts) != 8 or min(amounts) < 0
-                or any(amounts[i] for i in (0, 1, 2, 4, 5, 6))):
-            continue
-        users = consumers.get(pad.output[0], [])
-        if (len(users) != 1 or users[0].op_type != 'Conv'
-                or users[0].input[0] != pad.output[0]):
-            continue
-        conv = users[0]
-        existing = {a.name: helper.get_attribute_value(a)
-                    for a in conv.attribute}
-        if (existing.get('auto_pad', b'NOTSET') not in (b'NOTSET', b'')
-                or any(existing.get('pads', (0, 0, 0, 0)))):
-            continue
-        conv.input[0] = pad.input[0]
-        kept = [a for a in conv.attribute if a.name != 'pads']
-        del conv.attribute[:]
-        conv.attribute.extend(kept)
-        conv.attribute.append(
-            helper.make_attribute('pads', [0, amounts[3], 0, amounts[7]]))
-        graph.node.remove(pad)
-        if len(consumers.get(pad.input[1], [])) == 1:
-            graph.initializer.remove(initializers[pad.input[1]])
-        removed += 1
-    return removed
-
-
 def optimize_graph_file(path):
     """onnxoptimizer cleanup: drop the tracer's Identity/Constant/dead-end
     noise so the deployed graph carries only real ops. Skipped when the
@@ -482,9 +427,9 @@ def optimize_graph_file(path):
     os.replace(folded, path)
     graph = onnx.load(path)
     print('[ort-fold] -> %d nodes' % len(graph.graph.node))
-    if fuse_freq_pad_into_conv(graph):
-        onnx.save(graph, path)
-        print('[pad-fuse] -> %d nodes' % len(graph.graph.node))
+    report = optimize_batch1(graph, verify=True)
+    onnx.save(graph, path)
+    print('[batch1] ' + format_report(report))
 
 
 def _pin_static_output_shapes(graph, output_names, outputs):
