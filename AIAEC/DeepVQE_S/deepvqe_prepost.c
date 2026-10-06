@@ -9,8 +9,8 @@
  * builds keep linking.
  *
  * It deliberately does NOT use ulcnet_model_io.c: DeepVQE-S's boundary is a
- * different one (compressed planar spectra in, full next state out) and pulling that TU in would
- * bind this model to Align-ULCNet's layout version. The small amount of pool
+ * different one (compressed planar spectra in, full next state out) and
+ * pulling that TU in would bind this model to Align-ULCNet's layout version. The small amount of pool
  * arithmetic it would have shared is duplicated below instead.
  *
  * Constraint inherited from both: -ffp-contract=off. No heap in _init, no
@@ -624,10 +624,10 @@ int deepvqe_prepost_pre_process_freq(DeepVqePrepost *p,
 }
 
 /* x * |x|^(e-1) with |x| = sqrt(re^2 + im^2 + 1e-12), the model's
- * compressed_ri_feature (aiaec_common.py), written as separate passes over
- * the planes so the sqrt and the scaling are plain vector loops; only the
- * powf is per element. The imaginary output plane is the scratch for |x|
- * and then the scale. Products stay unfused (-ffp-contract=off). */
+ * compressed_ri_feature (aiaec_common.py), as passes over the planes so the
+ * sqrt and the scaling are vector loops; only the powf is per element. The
+ * imaginary output plane is the scratch for |x| and then the scale.
+ * Products stay unfused (-ffp-contract=off). */
 static void compress_planar(const float *re, const float *im, float *out) {
     float *out_re = out;
     float *out_im = out + AIAEC_N_BINS;
@@ -638,11 +638,8 @@ static void compress_planar(const float *re, const float *im, float *out) {
         out_im[k] = sqrtf(re[k] * re[k] + im[k] * im[k] + 1e-12f);
     for (k = 0; k < AIAEC_N_BINS; ++k)
         out_im[k] = powf(out_im[k], exponent);
-    for (k = 0; k < AIAEC_N_BINS; ++k) {
-        const float scale = out_im[k];
-        out_re[k] = re[k] * scale;
-        out_im[k] = im[k] * scale;
-    }
+    skn_mul_f32(out_re, re, out_im, AIAEC_N_BINS);
+    skn_mul_f32(out_im, im, out_im, AIAEC_N_BINS);
 }
 
 int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,

@@ -272,7 +272,7 @@ int main(void) {
     CHECK(inputs.h_gru1[0] == 40001.0f);
     CHECK(inputs.h_gru0 == gru0_address && inputs.h_gru1 == gru1_address);
 
-    /* A partial estimate (one element written, the rest still NaN) is
+    /* A partial mask (one element written, the rest still NaN) is
      * refused: the state was already written in place, so every recurrent
      * tensor restarts from zero, and the caller's outputs stay untouched. */
     outputs.output[0] = 7.0f;
@@ -310,7 +310,7 @@ int main(void) {
      * other output healthy, is refused and takes the rest of the state with
      * it: the state cannot be rolled back, so nothing recurrent may survive
      * the frame. Newest key/value slot, newest logit frame, both hiddens and
-     * the estimate each get their own run. */
+     * the mask each get their own run. */
     {
         const size_t key_stride = 7u * feature;
         int which;
@@ -358,7 +358,7 @@ int main(void) {
 
     /* Only the frame the graph just wrote is checked at commit. A
      * non-finite value left in an OLDER ring slot is not seen here; it
-     * reaches the estimate on the next frame, where it is refused. */
+     * reaches the mask on the next frame, where it is refused. */
     write_outputs(&outputs, 6.0f);
     outputs.key_history_out[3u * feature] = NAN;
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
@@ -443,7 +443,7 @@ int main(void) {
 
         /* One non-finite value in one runtime tensor: nothing is written and
          * the state is exactly what it was. Newest key/value slot, newest
-         * logit frame, both hiddens and the estimate each get a run. */
+         * logit frame, both hiddens and the mask each get a run. */
         {
             int which;
             for (which = 0; which < 6; ++which) {
@@ -540,7 +540,8 @@ def test_ulcnet_model_io_external_state_contract(
     driver.write_text(_DRIVER, encoding='utf-8')
     subprocess.run([
         compiler,
-        '-O2', '-ffp-contract=off', '-std=c11', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
+        '-O2', '-ffp-contract=off', '-std=c11',
+        '-Wall', '-Wextra', '-Wpedantic', '-Werror',
         '-DULCNET_MODEL_IO_SR=%d' % sample_rate,
         '-DULCNET_MODEL_IO_N_FFT=%d' % n_fft,
         '-I', _ULCNET_DIR,

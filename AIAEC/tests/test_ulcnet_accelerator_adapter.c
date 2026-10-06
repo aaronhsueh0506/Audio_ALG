@@ -161,7 +161,7 @@ static int run(void *user, const UlcnetModelIoInputs *inputs,
     if (runtime->separate_buffers) {
         return run_separate(runtime, inputs, outputs);
     }
-    /* A partial write leaves all but the first estimate element at NaN. */
+    /* A partial write leaves all but the first mask element at NaN. */
     write_identity_mask(outputs->output, inputs, runtime->partial_write);
     if (runtime->partial_write) {
         return 0;

@@ -906,7 +906,7 @@ static int case_guard(FftHandle *fft) {
     CHECK(ulcnet_prepost_frame_commit(p) == 0);
     /* (3) A commit refused on a non-finite output disarms the transaction:
      * a retry without a fresh frame_inputs is refused too, the frame is
-     * still open, and the fresh frame_inputs re-fills the estimate with
+     * still open, and the fresh frame_inputs re-fills the mask with
      * NaN before the accelerator is asked again. The in-place state is not
      * refilled: the refusal has already restarted it from zero. */
     CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,

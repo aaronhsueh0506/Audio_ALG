@@ -29,49 +29,30 @@
 extern "C" {
 #endif
 
-/* Version 3 introduced an explicit deployed-far field.  The exported
- * metadata separately records the checkpoint's training provenance. Kept
- * numerically equal to export_onnx.py's STATE_LAYOUT_VERSION. */
-/* Version 4 renamed the tensors and their mirrored fields (error/far
- * inputs, output head, h_gru0/h_gru1 hiddens, *_out states); runtimes
- * bind by name, so the rename is a contract change even though every
- * shape stayed identical. */
-/* Version 5 moves the fixed front/back ends to the host: the graph binds
- * five feature inputs (error_mag/far_mag/error_cos/error_sin +
- * compressed error RI, all produced inside prepare()) and returns the
- * COMPRESSED estimate; commit() applies the inverse signed power. The
- * graph starts at the learned reorient/encoder compute. */
-/* Version 12 returns the full next K/V/logit history from the graph
- * (key_history_out, value_history_out, logit_history_out, with exactly the
- * input shapes), so all five state tensors are bound in place.  The state
- * tensors keep their names, shapes and element counts, but the output set is
- * different (no *_now, five *_out), which is why the version has to move:
- * descriptor_validate() compares counts that did not change, so this constant
- * is the ONLY thing that can stop a board built for one boundary from
- * silently binding the other.
- * ⚠ Versions 3-11 are RETIRED, not free: 3-5 were shipped rank-3 boundaries,
- * 6 and 7 rank-3 pairs, and 8-11 the rank-4 boundaries that returned only
- * the new K/V/logit entries.  A number that once denoted one boundary must
- * never denote another.  export_onnx.py's LAYOUT_VERSIONS table names the
- * four (feature layout, GRU state layout) pairs of the full-state boundary:
- * ('host','split') = 12, the version below and the only pair this file
- * implements; ('host','combined') = 13 stacks both subband hiddens into one
- * h_gru tensor; ('graph','split') = 14 binds the two raw RI spectra and runs
- * the front/back ends inside the graph; ('graph','combined') = 15 does both.
- * Version 16 ends the host graph at the complex_mask 1x1 Conv: `output` is
- * the raw mask, planar [1,2,1,BINS] (plane 0 real, plane 1 imaginary), no
- * longer the compressed estimate [1,1,BINS,2].  commit() multiplies the
- * compressed error prepare() kept by that mask before the inverse signed
- * power, so the graph carries no tail of small elementwise ops.  The element
- * count (2*BINS) is the same as before and the name stays `output`, so this
- * constant is the only thing that separates the two boundaries.  `error_ri`
- * is no longer a graph input: only that multiply read it.
- * ⚠ 12 and 13 (the host pairs whose graph still multiplied) are RETIRED;
- * ('host','split') is now 16 and ('host','combined') 17.  ('graph',*) = 14/15
- * keep returning the estimate, which this file does not implement.  Nothing
- * here binds anything but 16, so a board built against this header refuses
- * the other three -- which is the intent.  The next real bump of this
- * constant must therefore go to 18. */
+/* The deployed boundary and its version.  This constant is the ONLY thing
+ * that stops a board built for one boundary from silently binding another:
+ * descriptor_validate() compares counts, and the tensor names and element
+ * counts of different boundaries coincide.  It is kept numerically equal to
+ * export_onnx.py's STATE_LAYOUT_VERSION, whose LAYOUT_VERSIONS table names
+ * the four (feature layout, GRU state layout) pairs:
+ *   ('host','split')    = 16  the only pair this file implements
+ *   ('host','combined') = 17  both subband hiddens stacked into one h_gru
+ *   ('graph','split')   = 14  binds the raw RI spectra and runs the fixed
+ *   ('graph','combined')= 15  front/back ends (and the mask) in the graph
+ * A board built against this header refuses the other three.  3-13 are
+ * RETIRED, not free: a number that once denoted one boundary must never
+ * denote another.  The next real bump of this constant goes to 18.
+ *
+ * The version-16 boundary:
+ *   - inputs: error_mag, far_mag, error_cos, error_sin (each [1,1,BINS],
+ *     computed by prepare()), the K/V/logit histories and the two GRU hiddens;
+ *   - outputs: `output`, the learned complex mask, planar [1,2,1,BINS]
+ *     (plane 0 real, plane 1 imaginary), and the FULL next value of all five
+ *     state tensors as *_out, so each is bound in place;
+ *   - the graph ends at the complex_mask 1x1 Conv.  prepare() keeps the
+ *     compressed error spectrum, and commit() multiplies it by the mask and
+ *     applies the inverse signed power; the graph carries no elementwise tail.
+ * Runtimes bind by name, so a rename is a contract change too. */
 #define ULCNET_MODEL_IO_LAYOUT_VERSION 16u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2

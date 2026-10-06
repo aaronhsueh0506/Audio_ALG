@@ -91,8 +91,8 @@ extern "C" {
 
 #define DEEPVQE_PREPOST_DESCRIPTOR_VERSION 1u
 
-/* The accelerator boundary this file binds: the two compressed planar signal inputs,
- * the CCM-tap head output and the sixteen explicit state tensors emitted by
+/* The accelerator boundary this file binds: the two compressed planar signal
+ * inputs, the CCM-tap head output and the sixteen explicit state tensors emitted by
  * _streaming_export.py for DeepVQE_S. Unrelated to (and deliberately not
  * aliased from) ULCNET_MODEL_IO_LAYOUT_VERSION: the two models' boundaries
  * move independently, and a shared number would make one model's bump look
