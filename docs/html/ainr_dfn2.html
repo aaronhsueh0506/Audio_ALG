@@ -382,7 +382,7 @@ per-layer,<code>h_erb</code> 兩層共用同一個 input tensor 與同一個量�
 <li>模型 / 訓練 / 推論 / 匯出:<code>AINR/DeepFilterNet2/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>export_onnx.py</code>、<code>config.ini</code></li>
 <li>文件:<a href="../../AINR/DeepFilterNet2/README.md">README.md</a>、<a href="../../AINR/DeepFilterNet2/UPSTREAM_ALIGNMENT.md">UPSTREAM_ALIGNMENT.md</a></li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code> — <code>make -C AINR test-simd</code>
-實測 NEON/scalar digest 皆 <code>de7e511600d05a10</code>(bit 相同)</li>
+實測 NEON/scalar digest 皆 <code>de7e511600d05a10</code>(bit 相同);deep filter 的 96 bin×5 tap 複數乘加走共用 NEON 核心 <code>skn_ctaps_mac_f32</code>(不依賴編譯器自動向量化)</li>
 <li>Python 合約測試:<code>AINR/DeepFilterNet2/tests/test_dfn2_contract.py</code>(layout version 互鎖、
 split/combined 等價、per-GRU state 各自抵達自己的 GRU node);<code>AINR/tests/</code> 另有
 <code>test_python_c_prepost_parity.py</code>;全樹基準數見 <code>docs/release_checklist.md</code>。</li>

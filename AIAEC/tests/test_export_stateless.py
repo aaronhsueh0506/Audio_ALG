@@ -92,8 +92,8 @@ def test_external_state_round_trip_matches_streaming_reference(name, factory):
     assert observed_nonzero_state
 
 
-def test_deepvqe_head_is_rank4_and_preserves_ccm_memory_order():
-    """The NPU boundary is compact without changing a single tap value."""
+def test_deepvqe_head_is_rank4_and_matches_ccm_taps():
+    """The three-vector map is folded into the last conv, not run in-graph."""
     torch.manual_seed(91)
     model = DeepVQES(GRID).eval()
     wrapper, inputs, _names, _outputs, _split = _build('DeepVQE_S', model)
@@ -106,7 +106,39 @@ def test_deepvqe_head_is_rank4_and_preserves_ccm_memory_order():
     taps = reference.auxiliary['ccm_taps']
     unpacked = torch.stack((taps.real, taps.imag), dim=-1)
     assert actual.shape == (1, 1, GRID.n_freqs, 18)
-    assert torch.equal(actual, unpacked.reshape(1, 1, GRID.n_freqs, 18))
+    # Folding changes only float rounding, never the tap order or values.
+    torch.testing.assert_close(
+        actual, unpacked.reshape(1, 1, GRID.n_freqs, 18),
+        rtol=0.0, atol=2e-6,
+    )
+    # The wrapper must not have touched the model's own conv.
+    assert model.ccm_up.conv.conv.weight.shape[0] == 54
+
+
+def test_deepvqe_graph_ends_in_conv_and_reshapes_only(tmp_path):
+    """No Gather, no rank>4 tensor and no arithmetic after the last conv."""
+    onnx = pytest.importorskip('onnx')
+    from AIAEC._streaming_export import optimize_graph_file
+
+    torch.manual_seed(92)
+    wrapper, inputs, names, outputs, _split = _build(
+        'DeepVQE_S', DeepVQES(GRID).eval())
+    path = str(tmp_path / 'deepvqe_s.onnx')
+    torch.onnx.export(wrapper, inputs, path, input_names=names,
+                      output_names=outputs, opset_version=17,
+                      do_constant_folding=True)
+    optimize_graph_file(path)
+    graph = onnx.shape_inference.infer_shapes(onnx.load(path))
+    nodes = list(graph.graph.node)
+    last_conv = max(i for i, node in enumerate(nodes)
+                    if node.op_type == 'Conv')
+    tail = [node.op_type for node in nodes[last_conv + 1:]
+            if node.op_type != 'Constant']
+    assert set(tail) <= {'Transpose', 'Reshape', 'Slice', 'Pad'}, tail
+    ranks = {info.name: len(info.type.tensor_type.shape.dim)
+             for info in list(graph.graph.value_info) + list(graph.graph.output)}
+    assert all(ranks.get(node.output[0], 0) <= 4
+               for node in nodes[last_conv + 1:])
 
 
 def test_align_cruse_frame_index_is_explicit_int64_state():

@@ -300,8 +300,22 @@ static inline void df_common_synthesis(FftHandle* fft,
     memset(synthesis_buf + n_fft - hop, 0, (size_t)hop * sizeof(float));
 }
 
-/* Per-row nonzero span [lo, hi) of a row-major matrix. An all-zero row gets
- * the empty span; a NULL matrix gets full spans, i.e. the dense sums. */
+/* One frame of the deep filter on bins [0, DFN2_DF_BINS): each bin sums
+ * DFN2_DF_ORDER complex taps over the source rows (one per tap, oldest
+ * first), then mixes the filtered value with the unfiltered `mix` frame by
+ * alpha. out_* must not alias a source row or the coefficients. */
+static inline void df_common_deep_filter(
+    const float *const *src_re, const float *const *src_im,
+    const float *coefs, float alpha,
+    const float *mix_re, const float *mix_im,
+    float *out_re, float *out_im) {
+    const float beta = 1.0f - alpha;
+    skn_ctaps_mac_f32(out_re, out_im, DFN2_DF_BINS, DFN2_DF_ORDER,
+                      src_re, src_im, coefs);
+    sk_ema_f32(out_re, mix_re, alpha, beta, DFN2_DF_BINS);
+    sk_ema_f32(out_im, mix_im, alpha, beta, DFN2_DF_BINS);
+}
+
 /* Where each of `lines` lines of a matrix is nonzero: line i holds
  * m[i * line_step + j * elem_step] for j < len, and its span is the first nonzero j
  * and one past the last (an all-zero line is the empty range [0, 0); without
@@ -406,6 +420,8 @@ int dfn2_compose(DFN2State* st,
 {
     int slot;
     int target;
+    const float *src_re[DFN2_DF_ORDER];
+    const float *src_im[DFN2_DF_ORDER];
     if (!st || !spec_re || !spec_im || !erb_mask || !coefs ||
         !out_re || !out_im || !isfinite(alpha)) return 0;
     df_common_expand_mask(erb_mask, st->erb_inv,
@@ -439,24 +455,15 @@ int dfn2_compose(DFN2State* st,
     alpha = st->alpha_ring[target];
     if (alpha < 0.0f) alpha = 0.0f;
     if (alpha > 1.0f) alpha = 1.0f;
-    for (int k = 0; k < DFN2_DF_BINS; ++k) {
-        float filtered_re = 0.0f;
-        float filtered_im = 0.0f;
-        for (int tap = 0; tap < DFN2_DF_ORDER; ++tap) {
-            int source = (slot + tap - (DFN2_DF_ORDER - 1) +
-                          DFN2_DF_RING) % DFN2_DF_RING;
-            float xr = st->df_ring_re[source][k];
-            float xi = st->df_ring_im[source][k];
-            float cr = st->coef_ring[target][k][tap][0];
-            float ci = st->coef_ring[target][k][tap][1];
-            filtered_re += xr * cr - xi * ci;
-            filtered_im += xi * cr + xr * ci;
-        }
-        out_re[k] = alpha * filtered_re +
-                    (1.0f - alpha) * st->df_ring_re[target][k];
-        out_im[k] = alpha * filtered_im +
-                    (1.0f - alpha) * st->df_ring_im[target][k];
+    for (int tap = 0; tap < DFN2_DF_ORDER; ++tap) {
+        int source = (slot + tap - (DFN2_DF_ORDER - 1) +
+                      DFN2_DF_RING) % DFN2_DF_RING;
+        src_re[tap] = st->df_ring_re[source];
+        src_im[tap] = st->df_ring_im[source];
     }
+    df_common_deep_filter(src_re, src_im, &st->coef_ring[target][0][0][0],
+                          alpha, st->df_ring_re[target],
+                          st->df_ring_im[target], out_re, out_im);
     for (int k = DFN2_DF_BINS; k < DFN2_N_BINS; ++k) {
         int high = k - DFN2_DF_BINS;
         out_re[k] = st->hi_delay_re[target][high];
@@ -555,22 +562,10 @@ int dfn2_compose_stream(DFN2State* st,
         src_re[tap] = slot >= 0 ? st->df_ring_re[slot] : df_zero_row;
         src_im[tap] = slot >= 0 ? st->df_ring_im[slot] : df_zero_row;
     }
-    for (int k = 0; k < DFN2_DF_BINS; ++k) {
-        float filtered_re = 0.0f;
-        float filtered_im = 0.0f;
-        for (int tap = 0; tap < DFN2_DF_ORDER; ++tap) {
-            float xr = src_re[tap][k];
-            float xi = src_im[tap][k];
-            float cr = st->coef_ring[target_slot][k][tap][0];
-            float ci = st->coef_ring[target_slot][k][tap][1];
-            filtered_re += xr * cr - xi * ci;
-            filtered_im += xi * cr + xr * ci;
-        }
-        out_re[k] = alpha * filtered_re +
-                    (1.0f - alpha) * st->df_ring_re[target_slot][k];
-        out_im[k] = alpha * filtered_im +
-                    (1.0f - alpha) * st->df_ring_im[target_slot][k];
-    }
+    df_common_deep_filter(src_re, src_im,
+                          &st->coef_ring[target_slot][0][0][0], alpha,
+                          st->df_ring_re[target_slot],
+                          st->df_ring_im[target_slot], out_re, out_im);
     for (int k = DFN2_DF_BINS; k < DFN2_N_BINS; ++k) {
         int high = k - DFN2_DF_BINS;
         out_re[k] = st->hi_delay_re[target_slot][high];

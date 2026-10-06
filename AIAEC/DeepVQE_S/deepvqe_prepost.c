@@ -627,18 +627,15 @@ int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
                                  DeepVqePrepostInputs *inputs,
                                  DeepVqePrepostOutputs *outputs) {
     int id;
-    int bin;
 
     if (!p || !inputs || !outputs || !p->frame_open) return -1;
 
     /* Interleave to the graph's [.,.,BINS,2] RI layout. No compression:
      * DeepVQE-S applies its own power law inside the graph. */
-    for (bin = 0; bin < AIAEC_N_BINS; ++bin) {
-        p->mic_ri[2 * bin] = p->mic_re[bin];
-        p->mic_ri[2 * bin + 1] = p->mic_im[bin];
-        p->far_ri[2 * bin] = p->far_re[bin];
-        p->far_ri[2 * bin + 1] = p->far_im[bin];
-    }
+    skn_interleave_cf32(p->mic_re, p->mic_im, (Complex *)p->mic_ri,
+                        AIAEC_N_BINS);
+    skn_interleave_cf32(p->far_re, p->far_im, (Complex *)p->far_ri,
+                        AIAEC_N_BINS);
 
     /* Arms the transaction and NaN-fills the head output, so a caller that
      * asks twice still gets a clean one rather than a half-written one. The

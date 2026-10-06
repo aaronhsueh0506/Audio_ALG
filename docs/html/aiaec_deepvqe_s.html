@@ -38,7 +38,7 @@ ratio mask：是 3×3（3 個時間位置 × 3 個頻率位置）的因果複數
 graph <b>內</b> = <code>compressed_ri_feature</code>（power-law <code>pow(0.3)</code>）、
 causal conv + BatchNorm + ELU 編碼、<code>FrameDelayAttention</code>（<code>softmax</code>
 over D=32，每幀獨立、無累積 state）、GRU(192)、<code>FreqUpsample</code>（頻率 sub-pixel
-shuffle，<b>無 deconv</b>）、殘差塊與 <code>three_vector_complex</code> 產生複數 taps。
+shuffle，<b>無 deconv</b>）、殘差塊；最後一層 <code>ccm_up</code> 之後的「3 向量→複數」換算（<code>three_vector_complex</code>）在<b>匯出時折進該 conv 的權重</b>——graph 在最後一個 Conv 之後只剩 Transpose／Reshape／Slice，沒有 Gather／Mul／Sub、也沒有 rank&gt;4 的張量，直接輸出 <code>[1,1,257,18]</code> taps（與 Python reference 的差異僅浮點捨入，約 1e-6；量化校正資料須以此 graph 產生）。
 graph <b>外</b>（C 前後處理，現由 <code>deepvqe_prepost.c/h</code> 這個類別統一持有）=
 sqrt-Hann STFT/ISTFT（<code>aiaec_process.c/h</code>，center=False 每 hop 一幀）、complex↔RI，
 以及 <code>deepvqe_process.c/h</code> 保存 3 幀 raw mic 複數譜 ring 並套用 CCM taps
@@ -67,7 +67,7 @@ for s in range(0, n, grid.hop_len):
 <h2>C pre/post 類別（<code>deepvqe_prepost.c/h</code>）</h2>
 <p>板端整合點：<b>一個物件</b>包住 caller 音訊與加速器張量之間的一切（framing、RI staging、
 CCM 頻譜 ring、16 個 state buffer）。它組合 <code>aiaec_process.c</code> ＋
-<code>DeepVQE_S/deepvqe_process.c</code>，兩個被組合的檔<b>都沒有改</b>。生命週期、32-byte
+<code>DeepVQE_S/deepvqe_process.c</code>。<code>deepvqe_ccm_process</code> 的 CCM 內圈（bin 1..N-2，每 bin 9 個 tap）走共用 NEON 核心 <code>skn_ctaps_mac_f32</code>（audio_common，與標量 twin 逐位元相同）；兩個邊界 bin 走標量路徑，略過落在頻譜外的 tap。<code>frame_inputs</code> 的 re/im 交錯用 <code>skn_interleave_cf32</code>。生命週期、32-byte
 <code>DeepVqePrepostMemReq</code> 陳舊 pool 閘、交易式 frame 狀態機與「為何是第三個 TU」是三個
 模型<b>共用的形狀</b>，寫在 <a href="onnx_prepost.html">onnx_prepost</a>；以下只記 DeepVQE-S
 自己的部分。grid 只支援 16 kHz/512/256——<code>aiaec_process.h</code> 帶 <code>#error</code>
@@ -141,9 +141,10 @@ staging）。16 個 state 張量佔掉絕大部分。</p>
   state["up3"] → state["res3"] → state["up2"] → state["res2"] → state["up1"]
   （FreqUpsample＝causal conv + 頻率 sub-pixel shuffle；ResidualBlock (4,3)）
         ▼
-  state["ccm_up"].step → raw [B,27,1,257] → reshape (…,3,3,3)
-        ▼
-  three_vector_complex → taps [B,1,257,3,3] cplx
+  Python reference：state["ccm_up"].step → raw [B,27,1,257] → reshape (…,3,3,3)
+                    → three_vector_complex → taps [B,1,257,3,3] cplx
+  匯出 graph：ccm_up conv 已折入換算（36 通道，phase 為主序）→ Transpose → Reshape
+                    → Slice → taps [1,1,257,18]（RI 實數，與上面同一塊記憶體次序）
         ▼
   state["spec_ring"].step(microphone)（3 幀 raw 譜史）
         ▼

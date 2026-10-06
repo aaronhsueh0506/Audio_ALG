@@ -34,6 +34,7 @@ presented at the graph boundary. The graph maths is identical either way.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import re
@@ -57,7 +58,7 @@ from AIAEC.aiaec_streaming import (
     StreamGRUCell,
     StreamModuleCell,
 )
-from AIAEC.aiaec_common import fit_frequency
+from AIAEC.aiaec_common import fit_frequency, three_vector_complex
 from AIAEC._onnx_contract import validate_nctf_no_temporal_padding
 from AIAEC.CAGCRN.model import (
     _stream_cata,
@@ -400,6 +401,37 @@ def _hidden_name(path: str) -> str:
     return 'h_' + _sanitize(path)
 
 
+def _fold_three_vector_conv(conv: nn.Conv2d, pairs: int) -> nn.Conv2d:
+    """Fold DeepVQE's three-vector -> complex map into the last conv.
+
+    ``conv`` is the bias-free conv under ``ccm_up`` whose output channel
+    ``(p * 3 + v) * 2 + s`` carries tap ``p``, vector component ``v`` and
+    sub-pixel phase ``s``. Everything between that conv and the CCM taps
+    (sub-pixel shuffle, frequency fit, ``re = w0 - w1/2 - w2/2``,
+    ``im = sqrt(3)/2 * (w1 - w2)``) is linear and per position, so the map
+    is applied to the weights once. The folded conv emits channel
+    ``(s * pairs + p) * 2 + ri``: phase-major, so one reshape recovers
+    the shuffled bin order. The model's own conv is left untouched.
+    """
+    weight = conv.weight.detach()
+    if conv.bias is not None or weight.shape[0] != pairs * 3 * 2:
+        raise ValueError('ccm_up conv does not have the three-vector layout')
+    tail = weight.shape[1:]
+    weight = weight.reshape(pairs, 3, 2, *tail)
+    # The map itself is three_vector_complex's: row r of `fold` is its
+    # (re, im) response to each unit vector.
+    unit = three_vector_complex(torch.eye(3, dtype=weight.dtype))
+    fold = torch.stack((unit.real, unit.imag))
+    folded = torch.einsum('rv,pvs...->spr...', fold, weight)
+    out = copy.deepcopy(conv)
+    out.out_channels = 2 * pairs * 2
+    out.weight = nn.Parameter(
+        folded.reshape(out.out_channels, *tail).contiguous(),
+        requires_grad=False,
+    )
+    return out
+
+
 class StatelessOneFrameAIAEC(nn.Module):
     """Bind explicit tensors to an existing model's streaming reference."""
 
@@ -426,6 +458,7 @@ class StatelessOneFrameAIAEC(nn.Module):
             # The deployment graph emits CCM taps; the host applies them and
             # owns the raw-spectrum ring. It is not model-internal state.
             self.stream_state.pop('spec_ring')
+            self._fold_ccm_head()
         self.slots = _state_slots(self.stream_state)
         for slot in self.slots:
             slot.get()
@@ -457,6 +490,27 @@ class StatelessOneFrameAIAEC(nn.Module):
         # once the slots are; the per-frame forward() must not redo it.
         self._state_names = self._regroup(
             self._split_state_names(), self.COMBINED_GRU_STATE_NAME)
+
+    def _fold_ccm_head(self) -> None:
+        """Make the DeepVQE graph end in one conv plus a rank-4 reshape.
+
+        Every size the head uses is read here, as a Python int, so the traced
+        graph carries no shape arithmetic.
+        """
+        model = self.model
+        block = model.ccm_up
+        if not (isinstance(block.norm, nn.Identity)
+                and isinstance(block.act, nn.Identity)):
+            raise ValueError('ccm_up must be a bare conv plus sub-pixel '
+                             'shuffle to fold the three-vector map into it')
+        cell = self.stream_state['ccm_up'].conv_cell
+        if cell._history.shape[0] != 1:
+            raise ValueError('the one-frame graph is exported at batch 1')
+        pairs = model.time_order * (2 * model.freq_radius + 1)
+        cell.conv = _fold_three_vector_conv(cell.conv, pairs)
+        # The history holds the conv's input frames: its width is the width
+        # of the pre-shuffle frequency axis.
+        self._ccm_pre_shuffle_width = int(cell._history.shape[-1])
 
     @property
     def combines_gru_state(self) -> bool:
@@ -594,20 +648,17 @@ class StatelessOneFrameAIAEC(nn.Module):
         value = state['up1'].step(
             state['res2'].step(value + model.skip2(m2)), m1.shape[-1]
         )
-        raw = state['ccm_up'].step(
-            value + model.skip1(m1), model.grid.n_freqs
+        packed = state['ccm_up'].conv_cell.step(value + model.skip1(m1))
+        # [1,36,1,W] -> [1,W,1,36] -> [1,1,2W,18]: phase-major channels make
+        # the flatten of (W, phase) the shuffled bin order, so the layout is
+        # exactly the CCM memory order deepvqe_ccm_process consumes.
+        taps = packed.permute(0, 3, 2, 1).reshape(
+            1, 1, 2 * self._ccm_pre_shuffle_width, -1
         )
-        raw = raw.permute(0, 2, 3, 1).reshape(
-            batch, time, model.grid.n_freqs,
-            model.time_order, 2 * model.freq_radius + 1, 3,
-        )
-        tap_real = raw[..., 0] - 0.5 * raw[..., 1] - 0.5 * raw[..., 2]
-        tap_imag = (3.0 ** 0.5 / 2.0) * (raw[..., 1] - raw[..., 2])
-        taps_ri = torch.stack((tap_real, tap_imag), dim=-1)
-        # [B,1,F,time,freq,RI] -> [B,1,F,time*freq*RI].  Flattening the
-        # already-contiguous trailing axes changes only boundary metadata;
-        # element order remains exactly what deepvqe_ccm_process consumes.
-        return taps_ri.flatten(start_dim=3)
+        extra = 2 * self._ccm_pre_shuffle_width - model.grid.n_freqs
+        if extra > 0:
+            return taps[:, :, :model.grid.n_freqs]
+        return torch.nn.functional.pad(taps, (0, 0, 0, -extra))
 
     def _cagcrn(self, primary: Tensor, far: Tensor) -> Tensor:
         model = self.model

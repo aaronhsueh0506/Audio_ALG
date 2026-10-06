@@ -14,7 +14,10 @@ Implemented paper details:
 - sub-pixel frequency decoder `40,32,32,27`;
 - residual blocks only in the two middle decoder blocks;
 - causal complex convolving mask with `3` past/current time positions and
-  `3` frequency positions, using the paper's three 120-degree vectors.
+  `3` frequency positions, using the paper's three 120-degree vectors. The
+  exported graph folds the three-vector-to-complex map into the last
+  convolution's weights, so it ends in that conv plus a rank-4 reshape and
+  emits the `[1, 1, bins, 18]` taps directly.
 
 The paper used 24 kHz, `480/480/240`, and `dmax=100`. This project adaptation
 uses selectable 16/48 kHz power-of-two grids and the constructor default

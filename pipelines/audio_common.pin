@@ -3,4 +3,4 @@
 # `make check-pins` is the source-level record of which audio_common
 # revision this Audio_ALG revision was built and tested against. Bump it in
 # the same commit that bumps the lib/aec and lib/nr submodule gitlinks.
-AUDIO_COMMON_COMMIT=23fadea85d9196a7f9dadb3271e39f88f510e242
+AUDIO_COMMON_COMMIT=0b4c3a15e20a6ff29fabf3b178731cca275834df
