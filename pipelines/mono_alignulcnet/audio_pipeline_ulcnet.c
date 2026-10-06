@@ -229,14 +229,17 @@ static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
         cfg->delay_mode == AEC_DELAY_MATCHED ? 1 : 0;
     aec_cfg->enable_res         = 0;   /* linear AEC + external NN post seam */
     aec_cfg->return_res_context = 1;   /* fills formed_hop/error_spec/...    */
+    /* Only formed_hop and the linear context are read; r2, comfort noise and
+     * G_res are not, so the AEC stops after its AecState update. The linear
+     * outputs are bit-identical either way. */
+    aec_cfg->spatial_linear_context = AEC_CONTEXT_LINEAR_ONLY;
     /* delay_backward_quarantine_enabled stays at lib/aec's default (OFF).
      * The guard holds backward candidates only, for a bounded window after
      * which it accepts -- so a pre-echo mis-lock is DELAYED by the window,
      * not cured. Enabling it here is therefore a policy decision, and it
      * waits on a real-audio spot check with the deployed checkpoint. */
-    /* spatial_linear_context stays 0: this is the single-lane seam, and the
-     * res context (formed_hop) must be populated. Delay estimation stays on
-     * (preset default) -- the AEC aligns far internally. */
+    /* Delay estimation stays on (preset default) -- the AEC aligns far
+     * internally. */
     return 0;
 }
 

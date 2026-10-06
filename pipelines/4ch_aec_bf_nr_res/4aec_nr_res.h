@@ -290,7 +290,9 @@ typedef struct FourAecNrResConfig {
     float max_delay_ms;           /* MATCHED reference delay-line capacity   */
     AecPreset aec_preset;
     MmseLsaNrMode nr_mode;
-    int enable_post;              /* direct core: 1=RES/NR/iFFT, 0=pre-only;
+    int enable_post;              /* direct core: 1=RES/NR/iFFT, 0=pre-only (its
+                                    * lanes then keep only the linear half of the
+                                    * AEC context: AEC_CONTEXT_LINEAR_ONLY);
                                     * complete wrappers require caller value 1.
                                     * Outranks enable_res/enable_nr: with 0 the
                                     * post stage does not exist and both are

@@ -475,8 +475,11 @@ static int derive_dims_and_configs(
     /* Every lane's own G_res is never read (see FourAecLaneSnapshot / this
      * file's fuse_contexts()+run_post_res_and_nr(), which recompute an
      * equivalent gain once from fused multi-lane data) -- skip computing it
-     * per lane. */
-    aec_cfg->spatial_linear_context = 1;
+     * per lane. A pre-only core (enable_post == 0) has no post stage at all,
+     * so nothing reads a lane's R^2 or comfort noise either: its lanes keep
+     * only the linear half of the context. */
+    aec_cfg->spatial_linear_context =
+        cfg->enable_post ? AEC_CONTEXT_NO_GAIN : AEC_CONTEXT_LINEAR_ONLY;
 
     *nr_cfg = pipelines_compose_nr_config(cfg->sample_rate, *fft_size, *hop_size,
                                 cfg->nr_mode);
@@ -1459,10 +1462,12 @@ static int align_render(FourAecNrRes* p, const float* render,
  * pre-frames in flight simultaneously and requires true copy semantics. */
 static int bind_lane_view(FourAecLaneSnapshot* dst,
                           const AecResContext* src,
-                          int n_freqs) {
+                          int n_freqs, int residual_half) {
     if (!dst || !src || src->n_freqs != n_freqs ||
         !src->error_spec || !src->echo_spec || !src->far_spec ||
-        !src->near_spec || !src->r2 || !src->comfort_noise) return 0;
+        !src->near_spec) return 0;
+    /* R^2 and comfort noise exist only for a core that has a post stage. */
+    if (residual_half && (!src->r2 || !src->comfort_noise)) return 0;
 
     dst->error_spec = src->error_spec;
     dst->echo_spec = src->echo_spec;
@@ -1614,7 +1619,8 @@ int four_aec_nr_res_process_pre(
         aec_get_res_context(p->lanes[ch], &context);
         if (ch == 0) shared_far_spec = context.far_spec;
         if (!context.formed_hop || !bind_lane_view(
-                &p->snapshots[ch], &context, p->n_freqs)) {
+                &p->snapshots[ch], &context, p->n_freqs,
+                p->cfg.enable_post)) {
             four_aec_nr_res_reset(p);
             return FOUR_AEC_NR_RES_DSP_ERROR;
         }

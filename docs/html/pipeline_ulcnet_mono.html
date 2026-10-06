@@ -162,7 +162,7 @@ out             全零 256          hop#0 內容            hop p-1 內容
 <p>Carve 順序(layout v12):self 控制塊(內嵌 ULCNet 狀態、delay-transition bookkeeping、reprime 計數器、共用視窗表與幀 scratch)→ AEC pool → 共用 compiled-grid <code>FftHandle</code>。build hash 含 sample rate 與 FFT size，16/48 kHz descriptor 不可互用。2026-09-03 改用 rolling push 後幀 scratch 由 2 幀縮為 1 幀,16 kHz/ne10/n=5 build 現查為 557,104 B(舊 layout v11 為 561,216 B);48 kHz/ne10/n=5 現查為 1,270,656 B(舊 1,278,864 B)。48 kHz/kiss 後端 16 kHz 559,856 B、48 kHz 1,276,480 B(2026-09-03 執行檔 banner)(舊 layout v11 為 1,284,688 B)。<b>換 grid/backend/編譯選項/submodule 都必須以 <code>audio_pipeline_ulcnet_get_mem_requirements()</code> 現查並重新 init。</b></p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
-<tr><td><code>Aec</code> 全狀態</td><td>compiled-grid pool 內</td><td>pool(C struct)</td><td><code>enable_res=0 / return_res_context=1</code>;delay estimation 開</td></tr>
+<tr><td><code>Aec</code> 全狀態</td><td>compiled-grid pool 內</td><td>pool(C struct)</td><td><code>enable_res=0 / return_res_context=1 / spatial_linear_context=AEC_CONTEXT_LINEAR_ONLY</code>(只留線性半邊,線性輸出與完整 context 逐位元相同,省約 11–14 % 的 AEC 時間);delay estimation 開</td></tr>
 <tr><td><code>FftHandle</code>(共用)</td><td>ULCNET_N_FFT</td><td>pool</td><td>chain 三個 struct 共用一支</td></tr>
 <tr><td><code>ana_err/ana_far.history</code></td><td>各 [ULCNET_N_FFT] f32</td><td>C struct(self)</td><td>rolling 原始樣本;跨 hop 必要狀態</td></tr>
 <tr><td><code>ana_*.seg/spec</code>(scratch)</td><td>[ULCNET_N_FFT] f32 / [ULCNET_BINS] Complex</td><td>C struct(self)</td><td>per-call FFT scratch,刻意不放 stack</td></tr>
