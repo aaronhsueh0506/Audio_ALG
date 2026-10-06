@@ -372,7 +372,7 @@ sanity 仍獨立保留。
 - `ulcnet_model_io_get_mem_requirements()` 已依 descriptor `delay_depth`
   精確配置 K/V、logit 與 GRU state；D=4/8 不會保留 D=64 最大陣列。
 - `ulcnet_model_io_reset/prepare/commit()` 已具備 external-state reset、`output`
-  NaN prefill、one-prepare/one-commit 與 validate-only commit（失敗時五個
+  NaN prefill、one-prepare/one-commit 與 commit（先驗證，再做 mask 乘法與逆冪；失敗時五個
   state 歸零）的交易語意。
 - mono 已有 ALIGNED unlock fail-open、RAW unlocked apply、delay-change reset、
   NaN/partial-write 與 raw far timestamp 測試。

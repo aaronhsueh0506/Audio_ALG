@@ -391,7 +391,7 @@ int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
                                 UlcnetModelIoInputs *inputs,
                                 UlcnetModelIoOutputs *outputs) {
     if (!p || !inputs || !outputs || !p->frame_open) return -1;
-    /* Arms the transaction and NaN-fills the `output` estimate, so a caller
+    /* Arms the transaction and NaN-fills the `output` mask, so a caller
      * that asks twice still gets a clean one rather than a half-written
      * one. */
     if (ulcnet_model_io_prepare(p->io, p->err_re, p->err_im,
@@ -439,7 +439,7 @@ int ulcnet_prepost_frame_skip(UlcnetPrepost *p) {
     if (!p || !p->frame_open) return -1;
     /* Identity: the error spectrum passes through. The armed transaction is
      * simply not committed; the next prepare() re-arms it and re-fills the
-     * NaN-checked estimate. */
+     * NaN-checked mask. */
     memcpy(p->enh_re, p->err_re, bins);
     memcpy(p->enh_im, p->err_im, bins);
     pp_close_frame(p);

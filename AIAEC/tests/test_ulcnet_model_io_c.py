@@ -12,7 +12,6 @@ _ULCNET_DIR = os.path.join(os.path.dirname(_THIS_DIR), 'Align_ULCNet')
 
 _DRIVER = r'''
 #include <math.h>
-#include <float.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <string.h>
@@ -34,11 +33,6 @@ _Alignas(16) static unsigned char pool_copy[1024 * 1024];
 static float signed_power_ref(float value, float exponent) {
     float magnitude = powf(fabsf(value), exponent);
     return value < 0.0f ? -magnitude : magnitude;
-}
-
-static int close_fp32(float actual, float expected) {
-    float scale = fmaxf(1.0f, fabsf(expected));
-    return fabsf(actual - expected) <= 2.0f * FLT_EPSILON * scale;
 }
 
 static int all_zero(const float *values, size_t count) {
@@ -78,13 +72,26 @@ static void push_history(const UlcnetModelIoOutputs *out,
     }
 }
 
+/* The planar mask the fake accelerator writes: plane 0 real, plane 1
+ * imaginary. Dyadic steps keep the values exact; both planes change with
+ * `base`, so two frames never share a mask. */
+static float mask_re(float base, size_t bin) {
+    return 0.5f + 0.0625f * base + 0.0078125f * (float)bin;
+}
+
+static float mask_im(float base, size_t bin) {
+    return -0.25f + 0.03125f * base + 0.00390625f * (float)bin;
+}
+
 static void write_outputs(UlcnetModelIoOutputs *outputs, float base) {
     static float key_now[32u * ULCNET_MODEL_IO_TA_BINS];
     static float value_now[32u * ULCNET_MODEL_IO_TA_BINS];
     static float logit_now[32u * 8u];
     size_t index;
-    for (index = 0; index < outputs->spectrum_ri_elements; ++index)
-        outputs->output[index] = base + 50000.0f + (float)index;
+    for (index = 0; index < ULCNET_MODEL_IO_BINS; ++index) {
+        outputs->output[index] = mask_re(base, index);
+        outputs->output[ULCNET_MODEL_IO_BINS + index] = mask_im(base, index);
+    }
     for (index = 0; index < 32u * ULCNET_MODEL_IO_TA_BINS; ++index) {
         key_now[index] = base + (float)index;
         value_now[index] = base + 10000.0f + (float)index;
@@ -182,7 +189,6 @@ int main(void) {
 
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
-    CHECK(inputs.spectrum_ri_elements == 2u * ULCNET_MODEL_IO_BINS);
     CHECK(inputs.spectrum_bins_elements == ULCNET_MODEL_IO_BINS);
     CHECK(outputs.spectrum_ri_elements == 2u * ULCNET_MODEL_IO_BINS);
     {
@@ -201,8 +207,6 @@ int main(void) {
          * equal normalized direction, so a small tolerance makes this a
          * cross-formulation agreement gate, not an identity. */
         float phase = atan2f(c_im, c_re);
-        CHECK(inputs.error_ri[2u * 17u] == c_re);
-        CHECK(inputs.error_ri[2u * 17u + 1u] == c_im);
         CHECK(inputs.error_mag[17] ==
               sqrtf(c_re * c_re + c_im * c_im + 1e-12f));
         CHECK(inputs.far_mag[31] ==
@@ -238,18 +242,24 @@ int main(void) {
 
     write_outputs(&outputs, 1.0f);
     CHECK(ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0);
-    /* commit() applies the inverse signed power to the graph's compressed
-     * estimate (layout v5). */
-    CHECK(close_fp32(enhanced_re[0], signed_power_ref(
-        50001.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP)));
-    CHECK(close_fp32(enhanced_im[0], signed_power_ref(
-        50002.0f, 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP)));
-    CHECK(close_fp32(enhanced_re[ULCNET_MODEL_IO_BINS - 1], signed_power_ref(
-        50001.0f + 2.0f * (ULCNET_MODEL_IO_BINS - 1),
-        1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP)));
-    CHECK(close_fp32(enhanced_im[ULCNET_MODEL_IO_BINS - 1], signed_power_ref(
-        50002.0f + 2.0f * (ULCNET_MODEL_IO_BINS - 1),
-        1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP)));
+    /* The compressed error is not handed to the graph; prepare() keeps it for
+     * commit(), which multiplies it by the planar mask, then
+     * applies the inverse signed power. The reference spells the complex
+     * multiply out with unfused fp32 products, as export_onnx.apply_mask_ri
+     * does, so every bin must match bit for bit. */
+    for (index = 0; index < ULCNET_MODEL_IO_BINS; ++index) {
+        const float c_re = signed_power_ref(
+            error_re[index], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        const float c_im = signed_power_ref(
+            error_im[index], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        const float m_re = mask_re(1.0f, index);
+        const float m_im = mask_im(1.0f, index);
+        const float p_rr = c_re * m_re, p_ii = c_im * m_im;
+        const float p_ri = c_re * m_im, p_ir = c_im * m_re;
+        const float inverse = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
+        CHECK(enhanced_re[index] == signed_power_ref(p_rr - p_ii, inverse));
+        CHECK(enhanced_im[index] == signed_power_ref(p_ri + p_ir, inverse));
+    }
     CHECK(ulcnet_model_io_prepare(state, error_re, error_im, far_re, far_im,
                                   &inputs, &outputs) == 0);
     CHECK(inputs.key_history[0] == 1.0f);
@@ -530,7 +540,7 @@ def test_ulcnet_model_io_external_state_contract(
     driver.write_text(_DRIVER, encoding='utf-8')
     subprocess.run([
         compiler,
-        '-O2', '-std=c11', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
+        '-O2', '-ffp-contract=off', '-std=c11', '-Wall', '-Wextra', '-Wpedantic', '-Werror',
         '-DULCNET_MODEL_IO_SR=%d' % sample_rate,
         '-DULCNET_MODEL_IO_N_FFT=%d' % n_fft,
         '-I', _ULCNET_DIR,

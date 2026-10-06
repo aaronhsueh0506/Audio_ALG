@@ -68,8 +68,8 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 
 <table>
 <tr><th>Model</th><th>Graph input/state</th><th>Graph output</th><th>C 前後處理</th></tr>
-<tr><td>Align-ULCNet</td><td>host 特徵 layout(預設,layout 12,C 端唯一實作):五個壓縮域特徵(error_mag/far_mag/error_cos/error_sin/error_ri,host signed-pow 前端) + K/V/logit history + two GRU states(五個 state 由 caller-owned pool 保存)。graph 特徵 layout(export 可選,layout 14):改綁 error/far 兩組 raw RI spectra,前端搬進 graph 內,無 host 前端</td>
-<td>host layout:壓縮域 output(host 逆冪) + <b>每個 state 的完整下一個值</b>(ring 位移在 graph 內)。graph layout:逆冪已在 graph 內完成的 output + 每個 state 的完整下一個值</td><td><code>Align_ULCNet/ulcnet_process.c/h</code>、
+<tr><td>Align-ULCNet</td><td>host 特徵 layout(預設,layout 16,C 端唯一實作):四個壓縮域特徵(error_mag/far_mag/error_cos/error_sin,host signed-pow 前端;壓縮域 error 頻譜留在 model_io state,不進 graph) + K/V/logit history + two GRU states(五個 state 由 caller-owned pool 保存)。graph 特徵 layout(export 可選,layout 14):改綁 error/far 兩組 raw RI spectra,前端搬進 graph 內,無 host 前端</td>
+<td>host layout:graph 止於 complex_mask 1×1 Conv,output = 複數 mask(planar <code>[1,2,1,K]</code>;host 以壓縮域 error 乘它再逆冪) + <b>每個 state 的完整下一個值</b>(ring 位移在 graph 內)。graph layout:逆冪已在 graph 內完成的 output + 每個 state 的完整下一個值</td><td><code>Align_ULCNet/ulcnet_process.c/h</code>、
 <code>ulcnet_model_io.c/h</code>(prepare/commit 內建前後端;只綁 host layout)，
 外面包 <b><code>ulcnet_prepost.c/h</code> 類別</b></td></tr>
 <tr><td>Align-CRUSE</td><td>mic + far + conv/GRU/alignment state</td>

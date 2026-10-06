@@ -240,11 +240,11 @@ flowchart LR
         RFAR["raw_far"]
         STFT["two sqrt-Hann STFTs<br/>compiled FFT / 50% hop"]
         FEAT["fixed front end, fp32<br/>signed power 0.3 + magnitudes<br/>+ phase cos/sin"]
-        ERRF["error_mag / error_cos / error_sin<br/>each [1,1,BINS]<br/>error_ri [1,1,BINS,2] compressed"]
+        ERRF["error_mag / error_cos / error_sin<br/>each [1,1,BINS]<br/>compressed error RI kept in model_io state"]
         FARF["far_mag<br/>[1,1,BINS]"]
         STATE["state tensors, caller-owned pool<br/>K/V history + logit history<br/>two GRU hidden tensors"]
         CHECK["ulcnet_model_io_inherit(): copy path<br/>(omitted when bound in place)<br/>commit(): validate"]
-        INV["inverse signed power<br/>fp32"]
+        INV["complex multiply by the mask<br/>+ inverse signed power, fp32<br/>(commit)"]
         WOLA["WOLA / IFFT"]
         OUT["enhanced PCM hop"]
         MIC --> AEC
@@ -263,8 +263,8 @@ flowchart LR
         QKV["Q_now / K_now / V_now"]
         TA["TA over current + history<br/>score conv + softmax"]
         BODY["joint conv + FGRU<br/>temporal GRUs"]
-        MASK["mask + composition<br/>signed expansion"]
-        ENH["output, compressed domain<br/>[1,1,BINS,2]"]
+        MASK["complex_mask 1x1 Conv<br/>(last op of the graph)"]
+        ENH["output = complex mask, planar<br/>[1,2,1,BINS]"]
         NEXT["full next state, same shapes as the inputs<br/>key/value/logit_history_out<br/>h_gru0_out / h_gru1_out"]
         ENC --> QKV --> TA --> BODY --> MASK --> ENH
         QKV --> NEXT
@@ -288,8 +288,12 @@ not portable across target runtimes and is therefore evaluation-only.
 
 The fixed front end never enters the quantized domain: the host computes the
 signed-power compression (`sign(x) * |x|^0.3`), both magnitudes and the
-compressed-domain phase as cos/sin in fp32, and the graph binds the five
+compressed-domain phase as cos/sin in fp32, and the graph binds the four
 feature tensors as separate inputs so each keeps its own quantization scale.
+The graph ends at the `complex_mask` 1x1 Conv and returns the learned mask
+itself; the fixed back end (complex multiply of the compressed error spectrum,
+which `prepare()` keeps in the model-I/O state, by that mask, then the inverse
+signed power) runs on the host.
 The far branch is the original raw reference. PBFDKF's aligned copy is private
 to formation of the linear-error branch; the model's TA block owns alignment.
 
@@ -305,7 +309,6 @@ Inputs per invocation:
 | `far_mag` | `[1,1,BINS]` | compressed-domain magnitude of the far branch |
 | `error_cos` | `[1,1,BINS]` | cos of the compressed-domain error phase |
 | `error_sin` | `[1,1,BINS]` | sin of the compressed-domain error phase |
-| `error_ri` | `[1,1,BINS,2]` | COMPRESSED real/imag, last dim |
 | `key_history` | `[1,32,D-1,TA_BINS]` | newest first, beginning at t-1 |
 | `value_history` | `[1,32,D-1,TA_BINS]` | newest first, beginning at t-1 |
 | `logit_history` | `[1,32,4,D]` | chronological, t-4 through t-1 |
@@ -316,7 +319,7 @@ Outputs per invocation:
 
 | tensor | float32 shape | CPU action |
 |---|---:|---|
-| `output` | `[1,1,BINS,2]` | compressed-domain estimate; apply the inverse signed power (`sign(x) * |x|^(1/0.3)`), then WOLA/IFFT |
+| `output` | `[1,2,1,BINS]` | the learned complex mask, planar (plane 0 real, plane 1 imaginary); multiply the compressed error spectrum by it, apply the inverse signed power (`sign(x) * |x|^(1/0.3)`), then WOLA/IFFT. `ulcnet_model_io_commit()` does all of this |
 | `key_history_out` | `[1,32,D-1,TA_BINS]` | `ulcnet_model_io_inherit` copy (skipped when bound in place) |
 | `value_history_out` | `[1,32,D-1,TA_BINS]` | `ulcnet_model_io_inherit` copy (skipped when bound in place) |
 | `logit_history_out` | `[1,32,4,D]` | `ulcnet_model_io_inherit` copy (skipped when bound in place) |
@@ -330,7 +333,7 @@ The five state tensors have two bindings, and everything else (`prepare()`,
   an `UlcnetModelIoOutputs` with the runtime's own pointers and the same
   element counts, then call `ulcnet_model_io_inherit(outputs, &runtime_outputs)`
   (`outputs` is the struct `prepare()` returned). It finite-checks the
-  estimate, the newest K/V slot, the last logit frame and both GRU hiddens,
+  mask, the newest K/V slot, the last logit frame and both GRU hiddens,
   and only then copies the five state tensors into the state. Any non-finite
   value copies nothing and returns `-1`; the state is byte-identical to
   before, the callback reports failure and the frame is skipped.
@@ -453,28 +456,33 @@ than exporting twice.
 
 | `--feature-layout` | `--gru-state-layout` | version | signal inputs | graph inputs | status |
 | --- | --- | ---: | --- | ---: | --- |
-| `host` (default) | `split` (default) | 12 | `error_mag`, `far_mag`, `error_cos`, `error_sin`, `error_ri` | 10 | shipped; `ulcnet_model_io.h` binds it |
-| `host` | `combined` | 13 | the same five | 9 | experimental |
+| `host` (default) | `split` (default) | 16 | `error_mag`, `far_mag`, `error_cos`, `error_sin` | 9 | shipped; `ulcnet_model_io.h` binds it |
+| `host` | `combined` | 17 | the same four | 8 | experimental |
 | `graph` | `split` | 14 | `error`, `far` | 7 | experimental |
 | `graph` | `combined` | 15 | `error`, `far` | 6 | experimental |
 
 Every recurrent hidden crosses the boundary as rank-4 NCHW, matching the three
 attention caches, and every pair returns the full next value of all state
 tensors (`boundary: stateless_one_frame_full_state`, `cpu_delta_state_update:
-false` in the exported metadata). Versions 3-11 are retired (`RETIRED_LAYOUT_VERSIONS`
-in `export_onnx.py`): 3-7 denoted rank-3 boundaries and 8-11 the boundaries that
-returned only the new K/V/logit entries. A number that once meant one boundary
+false` in the exported metadata). Versions 3-13 are retired (`RETIRED_LAYOUT_VERSIONS`
+in `export_onnx.py`): 3-7 denoted rank-3 boundaries, 8-11 the boundaries that
+returned only the new K/V/logit entries, and 12-13 the `host` pairs whose graph
+still multiplied the error by the mask in-graph. A number that once meant one boundary
 must never also mean another, because the state element counts are identical
 across them and nothing but the version can tell them apart.
 
 `--feature-layout` chooses where the fixed front and back ends run. `host`
 leaves the signed-power compression, both magnitudes and the compressed-domain
-phase outside the graph (`stream_features`; C: `ulcnet_model_io_prepare`), and
-the inverse power on the way back (`host_output`; C:
-`ulcnet_model_io_commit`). `graph` binds the two raw RI spectra
-`(1, 1, BINS, 2)` instead and runs that same fixed math inside the graph. That
-reproduces the pre-host-front-end boundary in every respect except the
-recurrent-state rank, which is why it carries its own version.
+phase outside the graph (`stream_features`; C: `ulcnet_model_io_prepare`). The
+graph ends at the `complex_mask` 1x1 Conv and returns the mask, planar
+`[1, 2, 1, BINS]`; the complex multiply of the compressed error by it and the
+inverse power run on the host (`host_back_end`; C: `ulcnet_model_io_commit`).
+`graph` binds the two raw RI spectra `(1, 1, BINS, 2)` instead and runs that
+same fixed math inside the graph, so its `output` stays the final estimate
+`[1, 1, BINS, 2]`: the compressed error the multiply needs is computed inside
+that graph and the host never holds it. That reproduces the
+pre-host-front-end boundary in every respect except the recurrent-state rank,
+which is why it carries its own version.
 
 The trade is quantization, not arithmetic. `host` keeps a separate scale per
 feature and keeps the unlearned `sqrt`/`atan2`/`pow` out of the quantized
@@ -482,8 +490,7 @@ domain; `graph` binds fewer tensors and needs no host front end, paid for by
 moving that math into the quantized domain and by `error_cos`/`error_sin`
 sharing whatever scale the compiler derives for them. Measured on the exported
 graphs, the `graph` layout adds `Sign` x6, `Abs` x6, `Pow` x6, `Sqrt` x2,
-`Atan`, `Cos` and `Sin`, plus the elementwise and indexing nodes around them:
-121 nodes become 177 after `onnxoptimizer` and constant folding.
+`Atan`, `Cos` and `Sin`, plus the elementwise and indexing nodes around them.
 
 `--gru-state-layout` chooses how the two subband GRU hiddens are presented.
 `split` exports `h_gru0` and `h_gru1`, each `(1, GRU_LAYERS, 1, GRU_HIDDEN)`.
@@ -515,27 +522,34 @@ Adopting a different pair is a contract change, not a flag flip:
 with it.
 
 **Every previously exported graph must be re-exported.** The deployed
-model-I/O layout is 12 (`ULCNET_MODEL_IO_LAYOUT_VERSION`), so a descriptor
+model-I/O layout is 16 (`ULCNET_MODEL_IO_LAYOUT_VERSION`), so a descriptor
 written for any earlier layout fails `ulcnet_model_io_descriptor_validate()` on
 `layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION` (pre-v3 descriptors also
 fail `far_input_mode != ULCNET_FAR_ALIGNED`), and
 `ulcnet_accelerator_adapter_init()` therefore returns NULL. The state tensors
 keep their names, shapes and element counts, so the version is the only thing
-that stops a board built for the old output set (`key_now`/`value_now`/
-`logit_now`) from binding the new one. Re-exporting is
-the whole remedy: nothing upstream of the graph changed. Checkpoints keep their
+that stops a board built for an older output set (`key_now`/`value_now`/
+`logit_now`, or the compressed estimate that layouts 12-13 returned as
+`output`) from binding the new one. The mask is a new quantization target: the
+`complex_mask` 1x1 Conv has no activation, so its range comes from
+calibration. Existing calibration data and quantization results must be
+regenerated and the accelerator program recompiled, and existing ONNX/JSON
+exports must be redone (the `error_ri` input is gone and `output` changed
+shape). The fp32 results are unchanged -- the tests require bit-for-bit
+equality across layouts and an exact match of the C `commit()` against the
+Python reference -- and nothing upstream of the graph changed. Checkpoints keep their
 weights and their recorded training provenance, and datasets need no
 regeneration -- the exporter reads the checkpoint's training
 `far_input_mode` and writes it beside the fixed deployment value rather than
-requiring the two to agree. Versions 13-15 are taken by the other three
+requiring the two to agree. Versions 14, 15 and 17 are taken by the other three
 boundary pairs rather than free, so the next real bump of
-`ULCNET_MODEL_IO_LAYOUT_VERSION` goes to 16.
+`ULCNET_MODEL_IO_LAYOUT_VERSION` goes to 18.
 
 CPU state storage is implemented by `ulcnet_model_io.c/.h`.  They use one
 caller-owned pool and allocate RAM according to D.  `prepare()` NaN-fills only
 `output` (the state tensors are the inputs and are not prefilled) and binds
-each `*_out` to its input address.  `commit()` is validate-only and performs no
-ring update: it checks that `output` is finite, the newest frame the graph
+each `*_out` to its input address.  `commit()` performs no
+ring update: it checks that `output` (the mask) is finite, the newest frame the graph
 wrote in each ring (K/V slot 0, the last logit frame) and both GRU hiddens.  On
 any non-finite value all five state tensors are zeroed (cold start), the
 transaction is discarded, the caller's outputs are untouched and -1 is
@@ -543,11 +557,12 @@ returned.  Older ring slots are not re-checked: a non-finite value left there
 reaches `output` on the next frame and is refused then, and a partial write to
 state is detectable only as a non-finite value.  `frame_skip` leaves every
 state tensor as the accelerator wrote it (a runtime that reported failure is
-taken not to have written).  `prepare()` keeps its raw-spectra signature and
-computes the five feature tensors internally; `commit()` applies the inverse
-signed power before unpacking `enhanced_re/im`.  The queried pool size is the
-five state tensors plus the feature-input and output staging; the state
-figure alone is not a sufficient allocation.
+taken not to have written).  `prepare()` keeps its raw-spectra signature,
+computes the four feature tensors internally and keeps the compressed error
+spectrum in the state; `commit()` multiplies that spectrum by the graph's mask
+and applies the inverse signed power before unpacking `enhanced_re/im`.  The
+queried pool size is the five state tensors plus the feature-input and output
+staging; the state figure alone is not a sufficient allocation.
 `ulcnet_process.c/.h`
 continues to own only STFT/WOLA and the high-level model callback.  Vendor NPU
 drivers and mono/4ch pipeline wiring are intentionally outside this model-side

@@ -58,10 +58,21 @@ extern "C" {
  * implements; ('host','combined') = 13 stacks both subband hiddens into one
  * h_gru tensor; ('graph','split') = 14 binds the two raw RI spectra and runs
  * the front/back ends inside the graph; ('graph','combined') = 15 does both.
- * Nothing here binds anything but 12, so a board built against this header
- * refuses the other three -- which is the intent.  The next real bump of
- * this constant must therefore go to 16. */
-#define ULCNET_MODEL_IO_LAYOUT_VERSION 12u
+ * Version 16 ends the host graph at the complex_mask 1x1 Conv: `output` is
+ * the raw mask, planar [1,2,1,BINS] (plane 0 real, plane 1 imaginary), no
+ * longer the compressed estimate [1,1,BINS,2].  commit() multiplies the
+ * compressed error prepare() kept by that mask before the inverse signed
+ * power, so the graph carries no tail of small elementwise ops.  The element
+ * count (2*BINS) is the same as before and the name stays `output`, so this
+ * constant is the only thing that separates the two boundaries.  `error_ri`
+ * is no longer a graph input: only that multiply read it.
+ * ⚠ 12 and 13 (the host pairs whose graph still multiplied) are RETIRED;
+ * ('host','split') is now 16 and ('host','combined') 17.  ('graph',*) = 14/15
+ * keep returning the estimate, which this file does not implement.  Nothing
+ * here binds anything but 16, so a board built against this header refuses
+ * the other three -- which is the intent.  The next real bump of this
+ * constant must therefore go to 18. */
+#define ULCNET_MODEL_IO_LAYOUT_VERSION 16u
 #define ULCNET_MODEL_IO_ALIGNMENT      16u
 #define ULCNET_MODEL_IO_MIN_D          2
 #define ULCNET_MODEL_IO_MAX_D          64
@@ -156,20 +167,19 @@ typedef struct UlcnetModelIoMemReq {
  * tensors below are the ones the graph also returns, in full, as *_out.
  */
 typedef struct UlcnetModelIoInputs {
-    /* The five feature tensors prepare() computes from the raw spectra
-     * (model layout v5): magnitudes/cos/sin are [1,1,BINS] and error_ri is
-     * the COMPRESSED [1,1,BINS,2]. */
+    /* The four feature tensors prepare() computes from the raw spectra
+     * (model layout v5), each [1,1,BINS].  The compressed error spectrum is
+     * not among them (layout v16): only commit() reads it, so the state
+     * keeps it and the graph does not bind it. */
     const float *error_mag;
     const float *far_mag;
     const float *error_cos;
     const float *error_sin;
-    const float *error_ri;
     const float *key_history;
     const float *value_history;
     const float *logit_history;
     const float *h_gru0;
     const float *h_gru1;
-    size_t spectrum_ri_elements;
     size_t spectrum_bins_elements;
     size_t key_history_elements;
     size_t value_history_elements;
@@ -177,14 +187,16 @@ typedef struct UlcnetModelIoInputs {
     size_t gru_hidden_elements;
 } UlcnetModelIoInputs;
 
-/* The enhanced estimate and the full next value of every state tensor (same
- * shapes as the inputs above).  prepare() returns these pointing into the
+/* The graph's mask and the full next value of every state tensor (same
+ * shapes as the inputs above).  `output` is the learned complex mask, planar:
+ * BINS real values then BINS imaginary values; commit() applies it.
+ * prepare() returns these pointing into the
  * pool: each *_out is the SAME address as the input it continues and stays
  * fixed for the life of the state.  A runtime with its own output tensors
  * fills a struct of this type with them and calls ulcnet_model_io_inherit();
  * a runtime that binds the pointers prepare() returned writes in place (it
  * reads every state input before it writes any state output).  prepare()
- * NaN-fills `output`, so an unwritten estimate is refused at commit; a
+ * NaN-fills `output`, so an unwritten mask is refused at commit; a
  * partial write to the state tensors is not detectable, only a non-finite
  * one.
  *
@@ -258,10 +270,10 @@ void ulcnet_model_io_reset(UlcnetModelIoState *state);
 
 /* Run the fixed front end (signed-power compression, magnitudes, phase
  * cos/sin) over the separate C real/imag spectra, return current input
- * views, and NaN-prefill the `output` estimate (the state tensors are the
+ * views, and NaN-prefill the `output` mask (the state tensors are the
  * inputs, so they are left alone).  Call once immediately before every
- * inference. commit() applies the matching inverse signed power to the
- * graph's compressed estimate. */
+ * inference. commit() multiplies the compressed error kept here by the
+ * graph's mask and applies the matching inverse signed power. */
 int ulcnet_model_io_prepare(UlcnetModelIoState *state,
                             const float error_re[ULCNET_MODEL_IO_BINS],
                             const float error_im[ULCNET_MODEL_IO_BINS],
@@ -277,7 +289,7 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
  * element counts.  Each tensor is copied into the matching destination
  * pointer, except one whose pointer already equals it -- the runtime wrote
  * that one in place -- which is left alone, so one call serves both bindings.
- * The tensors about to be copied are checked first (estimate, newest K/V
+ * The tensors about to be copied are checked first (mask, newest K/V
  * slot, last logit frame, both hiddens): if any is non-finite nothing is
  * written, -1 is returned and the state is exactly as it was, so the caller
  * reports the run as failed and the frame is skipped.  A tensor written in
@@ -289,8 +301,9 @@ int ulcnet_model_io_inherit(const UlcnetModelIoOutputs *destination,
                             const UlcnetModelIoOutputs *runtime);
 
 /* Validate that prepare() started a transaction and that the accelerator
- * wrote a finite estimate and finite state, and unpack enhanced RI to
- * separate C arrays; the state tensors need no step.  One prepare permits one
+ * wrote a finite mask and finite state, multiply the compressed error by the
+ * mask, apply the inverse signed power and unpack enhanced RI to separate C
+ * arrays; the state tensors need no step.  One prepare permits one
  * commit attempt.  Of the history rings only the frame the graph just wrote
  * is checked (key/value slot 0, the last logit frame): the older slots were
  * checked when they were new, and a non-finite value left in any of them

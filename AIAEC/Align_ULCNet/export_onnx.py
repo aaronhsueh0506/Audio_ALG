@@ -86,13 +86,18 @@ under all four combinations, and the exported metadata records the pair under
 ``--feature-layout`` -- where the fixed front/back ends run.
 
 ``host`` (default, the shipped contract)
-    Five signal inputs: ``error_mag``, ``far_mag``, ``error_cos``,
-    ``error_sin``, ``error_ri``. Signed-power compression, magnitudes and the
+    Four signal inputs: ``error_mag``, ``far_mag``, ``error_cos``,
+    ``error_sin``. Signed-power compression, magnitudes and the
     compressed-domain phase run outside the graph (``stream_features``;
-    C: ``ulcnet_model_io_prepare``), the inverse power on the way back
-    (``host_output``; C: ``ulcnet_model_io_commit``). Each feature keeps its
-    own quantization scale, and the unlearned sqrt/atan2/pow never enter the
-    quantized domain. This is what ``ulcnet_model_io.h`` binds.
+    C: ``ulcnet_model_io_prepare``). The graph ends at the ``complex_mask``
+    1x1 Conv and returns the learned mask itself, ``output`` =
+    ``[1, 2, 1, n_freqs]`` (plane 0 real, plane 1 imaginary), so no
+    elementwise op follows the last Conv. The fixed back end -- complex
+    multiply of the compressed error by that mask, then the inverse power --
+    runs on the host (``host_back_end``; C: ``ulcnet_model_io_commit``).
+    Each feature keeps its own quantization scale, and the unlearned
+    sqrt/atan2/pow never enter the quantized domain. This is what
+    ``ulcnet_model_io.h`` binds.
 
 ``graph``
     Two signal inputs: ``error`` and ``far``, the raw RI spectra, with that
@@ -102,7 +107,9 @@ under all four combinations, and the exported metadata records the pair under
     derives for them. It exists to measure that trade. It reproduces the
     pre-host-front-end boundary in every respect except the recurrent-state
     rank, so it carries its own version rather than the retired one that
-    boundary once had.
+    boundary once had. Its ``output`` stays the final estimate, because the
+    compressed error the multiply needs is computed inside the graph there
+    and the host never holds it.
 
 ``--gru-state-layout`` -- how the two subband GRU hiddens are presented.
 
@@ -159,6 +166,13 @@ from AIAEC.training_common import (
 # (key_now/value_now/logit_now) and left the ring shift to the CPU. Versions
 # 12-15 return the full next history from the graph, so the shipped contract
 # is the in-place one; 8-11 are retired with 3-7.
+# The host boundaries then stopped multiplying in the graph: ``output`` became
+# the raw complex mask, planar ``[1, 2, 1, n_freqs]``, the complex multiply
+# and inverse power moved to the host, and ``error_ri`` (which only that
+# multiply read) left the graph's inputs. Same element count as the estimate
+# it replaced, so only the version separates the two. Host pairs 12 and 13
+# became 16 and 17 and are retired; the graph pairs (14, 15) still return the
+# estimate and keep their numbers.
 # Version 3 introduced an explicit deployed-far descriptor
 # while retaining the checkpoint's training provenance separately;
 # version 4 renamed the tensors (error/far inputs, output head, h_gru0/h_gru1
@@ -171,10 +185,10 @@ from AIAEC.training_common import (
 # quantization toolchain requires rank-4 tensors; element count, row-major
 # order and the per-tensor quantization scales are all unchanged by the rank,
 # so this costs a version number and nothing else.
-# The five SIGNAL inputs are deliberately not touched here: error_mag/far_mag/
-# error_cos/error_sin are [1,1,n_freqs] and only error_ri is rank-4. If the
-# toolchain turns out to reject those too, they move in their own bump --
-# folding them in here would not have made that re-export any cheaper.
+# The SIGNAL inputs are deliberately not touched here: error_mag/far_mag/
+# error_cos/error_sin are [1,1,n_freqs] and error_ri was the only rank-4 one.
+# If the toolchain turns out to reject those too, they move in their own bump
+# -- folding them in here would not have made that re-export any cheaper.
 #
 # The boundary is the PAIR (feature layout, recurrent-state layout), so the
 # version belongs to the pair and is written down once rather than derived
@@ -192,10 +206,10 @@ from AIAEC.training_common import (
 # metadata, so they were allocated, not merely reserved. 8-11 were the
 # delta-state boundaries of the four pairs; every pair moved to the full-state
 # boundary together, so the same rule retires them.
-RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 12))
+RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 14))
 LAYOUT_VERSIONS = {
-    ('host', 'split'): 12,
-    ('host', 'combined'): 13,
+    ('host', 'split'): 16,
+    ('host', 'combined'): 17,
     ('graph', 'split'): 14,
     ('graph', 'combined'): 15,
 }
@@ -219,17 +233,18 @@ SCORE_HISTORY_FRAMES = 4
 GRU_LAYERS = 2
 GRU_HIDDEN = 128
 
-# Five separate feature inputs so every tensor keeps its own quantization
+# Four separate feature inputs so every tensor keeps its own quantization
 # scale; the fixed front end (signed-power compression, magnitude, phase
 # cos/sin) runs on the HOST -- see stream_features, mirrored in C by
 # ulcnet_model_io_prepare() --
-# and the graph starts at the learned reorient/encoder compute.
+# and the graph starts at the learned reorient/encoder compute. The compressed
+# error spectrum stream_features also returns is not a graph input: only the
+# host back end (host_back_end) multiplies by it.
 HOST_SIGNAL_INPUT_NAMES = (
     'error_mag',
     'far_mag',
     'error_cos',
     'error_sin',
-    'error_ri',
 )
 # The raw RI spectra the host front end consumes. Binding these instead makes
 # the graph run that same fixed math itself, so there is no host front end and
@@ -537,9 +552,7 @@ class AlignUlcnetStreamingExport(nn.Module):
                 stream_features(model, *signals)
             )
         else:
-            error_mag, far_mag, error_cos, error_sin, error_ri = signals
-        error_real = error_ri[..., 0]
-        error_imag = error_ri[..., 1]
+            error_mag, far_mag, error_cos, error_sin = signals
 
         error_feature = model.error_encoder(
             model.reorient(error_mag.unsqueeze(1))
@@ -622,17 +635,12 @@ class AlignUlcnetStreamingExport(nn.Module):
         stage2 = model.stage2_act(model.stage2_norm2(
             model.stage2_conv2(stage2)
         ))
-        mask = model.complex_mask(stage2)
-
-        mask_real = mask[:, 0]
-        mask_imag = mask[:, 1]
-        estimate_real = error_real * mask_real - error_imag * mask_imag
-        estimate_imag = error_real * mask_imag + error_imag * mask_real
-        output = torch.stack((estimate_real, estimate_imag), dim=-1)
+        output = model.complex_mask(stage2)
         if layout.in_graph_features:
-            output = host_output(model, output)
-        # Otherwise a COMPRESSED-domain estimate: the fixed inverse signed
-        # power runs on the host (host_output; C: ulcnet_model_io_commit).
+            output = host_output(model, apply_mask_ri(error_ri, output))
+        # Otherwise the graph ends at the mask Conv: the host multiplies the
+        # compressed error by it and applies the inverse signed power
+        # (host_back_end; C: ulcnet_model_io_commit).
 
         heads = (output, key_history_out, value_history_out,
                  logit_history_out)
@@ -684,9 +692,10 @@ def stream_features(model, error_ri: Tensor, far_ri: Tensor):
 
     Signed-power compression, magnitudes, and the compressed-domain phase as
     cos/sin -- everything unlearned, in fp32 (C: ulcnet_model_io_prepare).
-    Returns
-    the five graph signal inputs in INPUT_NAMES order; the graph starts at
-    the learned reorient/encoder compute.
+    Returns ``(error_mag, far_mag, error_cos, error_sin, error_ri)``: the
+    first four are the host layout's graph inputs in INPUT_NAMES order, and
+    ``error_ri`` is the compressed error spectrum the host keeps for
+    host_back_end (``graph_signals`` slices it off).
     """
     exponent = model.compression_exponent
     e_re = _signed_power(error_ri[..., 0], exponent)
@@ -700,14 +709,30 @@ def stream_features(model, error_ri: Tensor, far_ri: Tensor):
             torch.stack((e_re, e_im), dim=-1))
 
 
+def apply_mask_ri(error_ri: Tensor, mask: Tensor) -> Tensor:
+    """Complex multiply of the compressed error ``[1,1,F,2]`` by the planar
+    mask ``[1,2,1,F]``, giving the compressed estimate ``[1,1,F,2]``."""
+    error_real, error_imag = error_ri[..., 0], error_ri[..., 1]
+    mask_real, mask_imag = mask[:, 0], mask[:, 1]
+    return torch.stack((
+        error_real * mask_real - error_imag * mask_imag,
+        error_real * mask_imag + error_imag * mask_real,
+    ), dim=-1)
+
+
 def host_output(model, compressed_ri: Tensor) -> Tensor:
-    """Host-side fixed back end: the inverse signed power the graph no
-    longer applies (C: ulcnet_model_io_commit)."""
+    """The inverse signed power of a compressed estimate."""
     inverse = 1.0 / model.compression_exponent
     return torch.stack((
         _signed_power(compressed_ri[..., 0], inverse),
         _signed_power(compressed_ri[..., 1], inverse),
     ), dim=-1)
+
+
+def host_back_end(model, error_ri: Tensor, mask: Tensor) -> Tensor:
+    """Host-side fixed back end of the ``host`` layouts: mask multiply, then
+    inverse signed power (C: ulcnet_model_io_commit)."""
+    return host_output(model, apply_mask_ri(error_ri, mask))
 
 
 def graph_signals(model, error_ri: Tensor, far_ri: Tensor,
@@ -720,7 +745,7 @@ def graph_signals(model, error_ri: Tensor, far_ri: Tensor,
     """
     if layout.in_graph_features:
         return (error_ri, far_ri)
-    return stream_features(model, error_ri, far_ri)
+    return stream_features(model, error_ri, far_ri)[:layout.signal_inputs]
 
 
 def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int,
@@ -741,7 +766,6 @@ def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int,
             torch.randn(1, 1, n_freqs).abs(),          # far_mag
             torch.randn(1, 1, n_freqs).clamp(-1, 1),   # error_cos
             torch.randn(1, 1, n_freqs).clamp(-1, 1),   # error_sin
-            torch.randn(1, 1, n_freqs, 2),             # error_ri (compressed)
         )
     return signals + (
         torch.zeros(shapes['key_history']),

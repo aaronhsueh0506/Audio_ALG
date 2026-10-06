@@ -11,7 +11,7 @@ import torch
 
 from AIAEC.Align_ULCNet.export_onnx import (
     AlignUlcnetStreamingExport,
-    host_output,
+    host_back_end,
     stream_features,
     GRU_HIDDEN,
     GRU_LAYERS,
@@ -159,7 +159,7 @@ def test_streaming_export_shapes_are_fixed_and_full_state():
     # state cannot be added at the wrong rank without failing here.
     assert all(len(shape) == 4 for shape in shapes.values())
     assert INPUT_NAMES == (
-        'error_mag', 'far_mag', 'error_cos', 'error_sin', 'error_ri',
+        'error_mag', 'far_mag', 'error_cos', 'error_sin',
         'key_history', 'value_history', 'logit_history', 'h_gru0', 'h_gru1',
     )
     # Every state input has an _out partner, in the order the inputs are
@@ -182,13 +182,14 @@ def test_every_boundary_pair_has_its_own_version():
     # With every version distinct, pinning the shipped pair is enough: no
     # other pair can then carry the version ulcnet_model_io.h implements.
     assert LAYOUT_VERSIONS[('host', 'split')] == STATE_LAYOUT_VERSION
-    # 3-7 denoted rank-3 boundaries and 8-11 the delta-state ones. Reusing
-    # one would make a single number mean two different contracts, which no
-    # runtime could tell apart. Tied to
-    # the shipped pair rather than a literal floor, which would still pass
-    # after the next bump while no longer guarding anything.
+    # 3-7 denoted rank-3 boundaries, 8-11 the delta-state ones and 12/13 the
+    # host boundaries whose graph still multiplied by the mask. Reusing one
+    # would make a single number mean two different contracts, which no
+    # runtime could tell apart. The shipped pair must sit above every retired
+    # number rather than above a literal floor, which would still pass after
+    # the next bump while no longer guarding anything.
     assert not (set(LAYOUT_VERSIONS.values()) & RETIRED_LAYOUT_VERSIONS)
-    assert min(LAYOUT_VERSIONS.values()) == STATE_LAYOUT_VERSION
+    assert STATE_LAYOUT_VERSION > max(RETIRED_LAYOUT_VERSIONS)
 
 
 def test_graph_feature_layout_restores_the_pre_host_boundary():
@@ -220,12 +221,15 @@ def test_every_layout_pair_computes_the_same_frames(feature, gru):
                      dummy_inputs(D, N_FREQS, TA_BINS, wrapper.layout)[
                          wrapper.layout.signal_inputs:])
 
-    def head(wrapper, outputs):
-        # Compare in one domain: the host layout leaves the inverse signed
-        # power to host_output(), the graph layout has already applied it.
+    def head(wrapper, error_ri, far_ri, outputs):
+        # Compare in one domain: the host layout leaves the mask multiply and
+        # the inverse signed power to host_back_end(), the graph layout has
+        # already applied both. The compressed error is the host's own, not
+        # a graph input.
         if wrapper.layout.in_graph_features:
             return outputs[0]
-        return host_output(model, outputs[0])
+        return host_back_end(
+            model, stream_features(model, error_ri, far_ri)[4], outputs[0])
 
     reference_state, candidate_state = start(reference), start(candidate)
     generator = torch.Generator().manual_seed(11)
@@ -234,14 +238,15 @@ def test_every_layout_pair_computes_the_same_frames(feature, gru):
         for _ in range(2 * D + 5):
             error_ri = _ri(_complex_frame(generator))
             far_ri = _ri(_complex_frame(generator))
-            expected = reference(*(
-                graph_signals(model, error_ri, far_ri, reference.layout)
-                + reference_state))
-            actual = candidate(*(
-                graph_signals(model, error_ri, far_ri, candidate.layout)
-                + candidate_state))
+            reference_signals = graph_signals(
+                model, error_ri, far_ri, reference.layout)
+            candidate_signals = graph_signals(
+                model, error_ri, far_ri, candidate.layout)
+            expected = reference(*(reference_signals + reference_state))
+            actual = candidate(*(candidate_signals + candidate_state))
             torch.testing.assert_close(
-                head(candidate, actual), head(reference, expected),
+                head(candidate, error_ri, far_ri, actual),
+                head(reference, error_ri, far_ri, expected),
                 rtol=0, atol=0)
             observed_nonzero = observed_nonzero or bool(
                 candidate_state[-1].abs().max() > 0)
@@ -359,15 +364,17 @@ def test_full_state_wrapper_matches_forward_stream_frame_by_frame():
         for _ in range(2 * D + 5):
             error = _complex_frame(generator)
             far = _complex_frame(generator)
-            signals = stream_features(model, _ri(error), _ri(far))
-            outputs = wrapper(*signals, *explicit)
+            features = stream_features(model, _ri(error), _ri(far))
+            outputs = wrapper(*features[:SIGNAL_INPUTS], *explicit)
             expected = model.forward_stream(error, far, reference)
 
-            # The graph output is the COMPRESSED estimate; the host applies
-            # the inverse signed power (host_output), completing the chain.
+            # The graph output is the raw mask; the host multiplies the
+            # compressed error by it and applies the inverse signed power
+            # (host_back_end), completing the chain.
+            assert outputs[0].shape == (1, 2, 1, GRID.n_freqs)
             assert torch.allclose(
-                host_output(model, outputs[0]), _ri(expected.enhanced),
-                atol=5e-7, rtol=1e-6
+                host_back_end(model, features[4], outputs[0]),
+                _ri(expected.enhanced), atol=5e-7, rtol=1e-6
             )
             explicit = next_state(outputs)
 
@@ -434,6 +441,36 @@ def test_exported_onnx_state_tensors_are_rank_four(tmp_path):
     assert set(ins) == set(shapes) - {COMBINED_GRU_STATE_NAME}
 
 
+def test_host_graph_ends_at_the_mask_conv(tmp_path):
+    """The shipped graph's last compute is the ``complex_mask`` Conv.
+
+    A multiply, gather or concat after it is a chain of tiny elementwise and
+    data-movement ops on 2 x n_freqs elements: negligible arithmetic, but each
+    is a separate accelerator op. The mask multiply belongs to the host, so
+    the exported graph (after the exporter's own optimisation) must have the
+    mask Conv as the producer of ``output`` -- no node between them.
+    """
+    onnx = pytest.importorskip('onnx')
+    model = AlignULCNet(GRID, max_delay_frames=4).eval()
+    checkpoint = tmp_path / 'ckpt.pth'
+    torch.save({'contract': {}, 'state_dict': model.state_dict()}, checkpoint)
+    path = tmp_path / 'tail.onnx'
+    export_graph(model, str(checkpoint), str(path))
+
+    graph = onnx.load(str(path)).graph
+    producer = {name: node for node in graph.node for name in node.output}
+    head = producer['output']
+    assert head.op_type == 'Conv'
+    weight = {init.name: init for init in graph.initializer}[head.input[1]]
+    assert tuple(weight.dims) == (2, 32, 1, 1)
+    shape = next(v for v in graph.output if v.name == 'output')
+    assert tuple(d.dim_value for d in shape.type.tensor_type.shape.dim) == (
+        1, 2, 1, N_FREQS)
+    assert not {'Gather', 'Mul', 'Sub', 'Concat'} & {
+        node.op_type for node in graph.node
+        if node.name.startswith('/complex_mask')}
+
+
 def test_combined_state_stacks_on_the_channel_axis():
     """Pins WHICH axis the combined layout stacks on.
 
@@ -457,7 +494,7 @@ def test_combined_state_stacks_on_the_channel_axis():
                 model,
                 torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
                 torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
-            )
+            )[:SIGNAL_INPUTS]
             split_out = split(*(signals + split_state))
             combined_out = combined(*(signals + combined_state))
             split_state = next_state(split_out)
@@ -511,7 +548,7 @@ def test_streaming_onnx_runtime_matches_pytorch(tmp_path):
                 model,
                 torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
                 torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
-            ) + state
+            )[:SIGNAL_INPUTS] + state
             expected = wrapper(*current)
             actual = session.run(None, {
                 name: value.numpy()

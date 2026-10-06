@@ -202,7 +202,7 @@ and deepvqe_prepost, one object each.
 
 | Model | Accelerator output | Host composition |
 |---|---|---|
-| Align-ULCNet | enhanced RI spectrum + full next state (copied by `ulcnet_model_io_inherit()`, or written in place) | `ulcnet_prepost` class (WOLA + ulcnet_model_io_commit()) |
+| Align-ULCNet | complex mask (planar) + full next state (copied by `ulcnet_model_io_inherit()`, or written in place) | `ulcnet_prepost` class (ulcnet_model_io_commit() multiplies the compressed error by the mask and inverts the power, then WOLA) |
 | Align-CRUSE | real mask | aiaec_apply_real_mask() |
 | DeepVQE-S | 3x3 complex CCM taps | `deepvqe_prepost` class (deepvqe_ccm_process()) |
 | CAGCRN | complex mask | aiaec_apply_complex_mask() |
@@ -229,7 +229,7 @@ AIAEC spectrum into it is a 32x scale error on a different grid -- see that
 header's warning block.
 
 Align-ULCNet state ownership (caller-owned pool, five state tensors taken over by
-inherit or bound in place, validate-only commit) is documented in Align_ULCNet/README.md and
+inherit or bound in place, commit that validates and applies the mask) is documented in Align_ULCNet/README.md and
 implemented by ulcnet_model_io.c/.h.
 
 ## Tests

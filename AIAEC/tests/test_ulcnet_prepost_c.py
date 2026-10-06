@@ -119,8 +119,13 @@ static int fake_run(void *user, const UlcnetModelIoInputs *in,
         acc += 1e-3 * in->logit_history[i];
     for (i = 0; i < in->gru_hidden_elements; ++i)
         acc += 1e-3 * in->h_gru0[i];
-    for (i = 0; i < out->spectrum_ri_elements; ++i)
-        out->output[i] = in->error_ri[i] * (float)(0.5 + 0.25 * sin(acc + (double)i));
+    /* The graph's output is the planar complex mask: real plane, then
+     * imaginary plane. */
+    for (i = 0; i < ULCNET_MODEL_IO_BINS; ++i) {
+        out->output[i] = (float)(0.5 + 0.25 * sin(acc + (double)i));
+        out->output[ULCNET_MODEL_IO_BINS + i] =
+            (float)(0.125 * cos(acc + (double)i));
+    }
     for (i = 0; i < 32u * ULCNET_MODEL_IO_TA_BINS; ++i) {
         key_now[i] = (float)(0.01 * sin(acc + 1.0 + (double)i));
         value_now[i] = (float)(0.01 * cos(acc + 2.0 + (double)i));

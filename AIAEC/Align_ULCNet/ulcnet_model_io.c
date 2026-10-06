@@ -15,7 +15,8 @@ struct UlcnetModelIoState {
     float *h_gru0;
     float *h_gru1;
 
-    /* The five graph feature tensors prepare() computes. */
+    /* The four graph feature tensors prepare() computes, and the compressed
+     * error spectrum it keeps for commit(). */
     float *error_mag;
     float *far_mag;
     float *error_cos;
@@ -345,13 +346,11 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     inputs->far_mag = state->far_mag;
     inputs->error_cos = state->error_cos;
     inputs->error_sin = state->error_sin;
-    inputs->error_ri = state->error_ri;
     inputs->key_history = state->key_history;
     inputs->value_history = state->value_history;
     inputs->logit_history = state->logit_history;
     inputs->h_gru0 = state->h_gru0;
     inputs->h_gru1 = state->h_gru1;
-    inputs->spectrum_ri_elements = state->spectrum_ri_elements;
     inputs->spectrum_bins_elements = (size_t)state->descriptor.spectrum_bins;
     inputs->key_history_elements = state->key_history_elements;
     inputs->value_history_elements = state->value_history_elements;
@@ -523,14 +522,22 @@ int ulcnet_model_io_commit(UlcnetModelIoState *state,
     }
 
     {
-        /* The graph emits the COMPRESSED estimate; the fixed inverse
-         * signed power runs here. */
+        /* The graph emits the planar complex mask.  The fixed back end runs
+         * here: the compressed error prepare() kept times the mask, then the
+         * inverse signed power.  Products stay unfused (the build keeps
+         * -ffp-contract=off), matching export_onnx.apply_mask_ri. */
         const float inverse_exponent = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
+        const float *mask_re = state->output;
+        const float *mask_im = state->output + descriptor->spectrum_bins;
         for (bin = 0; bin < descriptor->spectrum_bins; ++bin) {
+            const float err_re = state->error_ri[2 * bin];
+            const float err_im = state->error_ri[2 * bin + 1];
             enhanced_re[bin] = ulcnet_model_io_signed_pow(
-                state->output[2 * bin], inverse_exponent);
+                err_re * mask_re[bin] - err_im * mask_im[bin],
+                inverse_exponent);
             enhanced_im[bin] = ulcnet_model_io_signed_pow(
-                state->output[2 * bin + 1], inverse_exponent);
+                err_re * mask_im[bin] + err_im * mask_re[bin],
+                inverse_exponent);
         }
     }
     state->prepared = 0;

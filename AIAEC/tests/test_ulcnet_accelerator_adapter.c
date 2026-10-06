@@ -33,6 +33,19 @@ static void fill(float *values, size_t elements, float value) {
     for (index = 0; index < elements; ++index) values[index] = value;
 }
 
+/* The graph's output is the planar complex mask. The identity mask (real
+ * plane 1, imaginary plane 0) hands the error spectrum back, so the test
+ * model is a pass-through; a partial write sets only the first element. */
+static void write_identity_mask(float *mask, const UlcnetModelIoInputs *inputs,
+                                int partial) {
+    const size_t bins = inputs->spectrum_bins_elements;
+    size_t index;
+    for (index = 0; index < (partial ? 1u : bins); ++index) {
+        mask[index] = 1.0f;
+        if (!partial) mask[bins + index] = 0.0f;
+    }
+}
+
 /* The graph's ring shift for a constant frame: K/V newest-first, logit
  * history oldest-first; D = 8, TA_BINS from the compiled grid. */
 static void push_stamp(const UlcnetModelIoOutputs *outputs, float stamp) {
@@ -86,11 +99,7 @@ static int run_separate(TestRuntime *runtime,
 
     /* Unwritten tensors read as NaN, like the in-place path's prefill. */
     fill(output, outputs->spectrum_ri_elements, NAN);
-    for (index = 0; index < (runtime->partial_write
-                                 ? 1u : outputs->spectrum_ri_elements);
-         ++index) {
-        output[index] = inputs->error_ri[index];
-    }
+    write_identity_mask(output, inputs, runtime->partial_write);
     if (runtime->partial_write) {
         mine.output = output;
         mine.key_history_out = key;
@@ -153,11 +162,7 @@ static int run(void *user, const UlcnetModelIoInputs *inputs,
         return run_separate(runtime, inputs, outputs);
     }
     /* A partial write leaves all but the first estimate element at NaN. */
-    for (index = 0; index < (runtime->partial_write
-                                 ? 1u : outputs->spectrum_ri_elements);
-         ++index) {
-        outputs->output[index] = inputs->error_ri[index];
-    }
+    write_identity_mask(outputs->output, inputs, runtime->partial_write);
     if (runtime->partial_write) {
         return 0;
     }

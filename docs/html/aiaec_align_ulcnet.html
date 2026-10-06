@@ -57,12 +57,14 @@ delay 對齊（AEC C 端 seam）、sqrt-Hann STFT/ISTFT 與 complex↔RI 轉換
 （C 實作 <code>ulcnet_process.c</code>，出貨 seam 走 center=False 逐 hop 一幀，見下方
 「C pre/post 類別」；Python reference <code>StreamSTFT/StreamISTFT</code>），
 以及 <code>host</code> layout 的<b>固定前後端</b>（C 實作封在 <code>ulcnet_model_io.c</code> 的
-prepare/commit；Python reference <code>export_onnx.stream_features/host_output</code>）：
+prepare/commit；Python reference <code>export_onnx.stream_features/host_back_end</code>）：
 <code>_signed_power</code>（signed <code>pow(0.3)</code> 壓縮）、兩路 magnitude、
 <code>atan2/cos/sin</code>（<b>壓縮域</b>相位——對 0.3 次方後分量取角，板端不可用原始相位替代），
-graph 綁五個特徵輸入 <code>error_mag/far_mag/error_cos/error_sin</code>（各
-<code>[1,1,K]</code>）＋壓縮域 <code>error_ri</code>（<code>[1,1,K,2]</code>），
-各自持量化 scale；graph 輸出為<b>壓縮域</b> estimate，host 做逆冪還原。以上是
+graph 綁四個特徵輸入 <code>error_mag/far_mag/error_cos/error_sin</code>（各
+<code>[1,1,K]</code>），各自持量化 scale。graph <b>止於 <code>complex_mask</code> 1×1 Conv</b>，
+<code>output</code> 是學到的複數 mask（planar <code>[1,2,1,K]</code>，plane 0 實部、plane 1 虛部）；
+host（<code>commit()</code>）用 <code>prepare()</code> 留在 state 的<b>壓縮域</b> error 頻譜乘上 mask，
+再逆冪還原。以上是
 <b>出貨的 <code>host</code>/<code>split</code> 這一對</b>；另外三對見下節。</p>
 <div class="note"><b>far branch 契約</b>：checkpoint contract 的 <code>far_input_mode</code>
 只記錄訓練 provenance（legacy 預設 <code>raw_far</code>）。production 固定用 AEC aligned-far
@@ -74,16 +76,20 @@ pipeline 沒有 runtime far-mode setter，raw/aligned 比較只留在 sweep 工�
 report 會把 <code>calibration_far_input_mode=raw_far</code> 與
 <code>deployment_far_input_mode=aligned_far</code> 分開記錄。D 不改權重，但會改 K/V history
 shape 與 host RAM，所以 calibration 的 D 必須和該份 ONNX export 相同。</div>
-<div class="note"><b>既有匯出必須全部重跑</b>：model-I/O layout 現為 v12
+<div class="note"><b>既有匯出必須全部重跑</b>：model-I/O layout 現為 v16
 （<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code>；五個 state 的 <code>*_out</code> 由 inherit 複製，或就地綁定；
-<code>RETIRED_LAYOUT_VERSIONS</code> = 3–11，不得重用），舊 layout 產出的每一份
+<code>RETIRED_LAYOUT_VERSIONS</code> = 3–13，不得重用），舊 layout 產出的每一份
 ONNX/JSON descriptor 會在 <code>ulcnet_model_io_descriptor_validate()</code> 卡在
 <code>layout_version</code>（v3 之前另卡 <code>far_input_mode</code>），
 <code>ulcnet_accelerator_adapter_init()</code> 回 NULL。修法只有「重新 export graph」一項：
 權重未變，checkpoint 與 dataset <b>不需要</b>重新訓練或重新生成。
-state 的名稱、shape 與元素數不變，所以版本號是唯一能攔下舊板綁新圖的閘門。
-<b>13/14/15 被另外三對 boundary 佔用</b>，下一次真正 bump
-<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 要跳到 16。</div>
+<code>output</code> 元素數不變（2·K），所以版本號是唯一能攔下舊板綁新圖的閘門。
+fp32 結果不變（各 layout 逐位元相同、C <code>commit()</code> 與參考實作精確一致），
+但 mask 是<b>新的量化目標</b>（<code>complex_mask</code> 1×1 Conv 無 activation，range 由 calibration 決定）：
+既有 calibration 資料與量化結果須重做、加速器程式重新編譯，ONNX/JSON 須重匯
+（<code>error_ri</code> 輸入已移除、<code>output</code> shape 改變）。
+<b>14/15/17 被另外三對 boundary 佔用</b>，下一次真正 bump
+<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 要跳到 18。</div>
 
 <h2>ONNX graph boundary：兩軸開關</h2>
 <p>boundary 是<b>一對</b>互相獨立的開關，version 屬於這一對、不屬於任何一半，
@@ -91,22 +97,23 @@ state 的名稱、shape 與元素數不變，所以版本號是唯一能攔下�
 <code>inference.py calib</code> 收同樣兩個旗標，同一個 process 用同一個 model instance 匯出。</p>
 <table>
 <tr><th><code>--feature-layout</code></th><th><code>--gru-state-layout</code></th><th>version</th><th>signal inputs</th><th>graph inputs</th><th>狀態</th></tr>
-<tr><td><code>host</code>（預設）</td><td><code>split</code>（預設）</td><td>12</td><td><code>error_mag/far_mag/error_cos/error_sin/error_ri</code></td><td>10</td><td><b>出貨合約</b>；<code>ulcnet_model_io.h</code> 只綁這一對</td></tr>
-<tr><td><code>host</code></td><td><code>combined</code></td><td>13</td><td>同上五個</td><td>9</td><td>實驗用</td></tr>
+<tr><td><code>host</code>（預設）</td><td><code>split</code>（預設）</td><td>16</td><td><code>error_mag/far_mag/error_cos/error_sin</code></td><td>9</td><td><b>出貨合約</b>；<code>ulcnet_model_io.h</code> 只綁這一對</td></tr>
+<tr><td><code>host</code></td><td><code>combined</code></td><td>17</td><td>同上四個</td><td>8</td><td>實驗用</td></tr>
 <tr><td><code>graph</code></td><td><code>split</code></td><td>14</td><td><code>error/far</code>（raw RI，各 <code>[1,1,K,2]</code>）</td><td>7</td><td>實驗用</td></tr>
 <tr><td><code>graph</code></td><td><code>combined</code></td><td>15</td><td>同上兩個</td><td>6</td><td>實驗用</td></tr>
 </table>
 <p><b><code>--feature-layout</code></b>＝固定前後端跑在哪裡。<code>host</code> 把 signed
 <code>pow(0.3)</code> 壓縮、兩路 magnitude、壓縮域相位 cos/sin 留在 graph 外
-（<code>stream_features</code>；C <code>ulcnet_model_io_prepare</code>），回程逆冪也在外
-（<code>host_output</code>；C <code>ulcnet_model_io_commit</code>）。<code>graph</code> 改綁兩個
-raw RI 頻譜、把同一份固定數學搬回 graph 內；除了 recurrent state 的 rank 之外它重現了前後端搬到
+（<code>stream_features</code>；C <code>ulcnet_model_io_prepare</code>），graph 止於 mask Conv（<code>output</code>＝planar mask），
+mask 乘法與逆冪也在外（<code>host_back_end</code>；C <code>ulcnet_model_io_commit</code>）。<code>graph</code> 改綁兩個
+raw RI 頻譜、把同一份固定數學搬回 graph 內，<code>output</code> 仍是最終 estimate <code>[1,1,K,2]</code>
+（host 沒有 graph 內才算出的壓縮域 error）；除了 recurrent state 的 rank 之外它重現了前後端搬到
 host 之前的 boundary，所以自帶版本號。</p>
-<p>差別在<b>量化</b>不在算術：<code>host</code> 讓五個特徵各持自己的 scale，且
+<p>差別在<b>量化</b>不在算術：<code>host</code> 讓四個特徵各持自己的 scale，且
 <code>sqrt/atan2/pow</code> 這些非學習運算不進量化域；<code>graph</code> 少綁 tensor、
 host 端不需要前端，代價是那些運算進了量化域，且 <code>error_cos</code>/<code>error_sin</code>
 共用編譯器替它們推出來的同一個 scale。實測 <code>graph</code> 多出的非學習運算為 <code>Sign</code>/<code>Abs</code>/<code>Pow</code>
-各 6、<code>Sqrt</code>×2、<code>Atan</code>/<code>Cos</code>/<code>Sin</code> 各 1；經 onnxoptimizer + 常數摺疊後節點數 <b>121 → 177</b>。</p>
+各 6、<code>Sqrt</code>×2、<code>Atan</code>/<code>Cos</code>/<code>Sin</code> 各 1。</p>
 <p><b><code>--gru-state-layout</code></b>＝兩顆 subband GRU hidden 怎麼呈現。<code>split</code>
 出 <code>h_gru0</code>/<code>h_gru1</code>，各 <code>(1, GRU_LAYERS, 1, GRU_HIDDEN)</code>；
 <code>combined</code> 沿 dim 1（dim 0 是 singleton N）把 <code>h_gru0</code> 排在前疊成單一
@@ -177,7 +184,7 @@ framing／加窗／overlap-add 由類別做、但呼叫的是 <b>caller 的 <cod
 一般 runtime 把 <code>*_out</code> 寫進自己的 tensor，再呼叫 <code>ulcnet_model_io_inherit(outputs, &amp;runtime_outputs)</code>：
 全部有限才複製；否則不複製、回 −1、state 不變，該幀被跳過。
 能把 <code>*_out</code> 綁到輸入位址的 runtime（NPU）就地寫入、省略 inherit，其餘共用；就地時須先讀完所有 state 輸入才寫輸出。
-<code>frame_inputs</code> 只對 <code>output</code> 預填 NaN；commit 只驗證、不更新 ring：<code>output</code>、
+<code>frame_inputs</code> 只對 <code>output</code> 預填 NaN；commit 不更新 ring，先驗證：<code>output</code>（mask）、
 K/V slot 0、logit 最後一幀與兩顆 GRU 皆有限才成功（較舊的 ring 格不重查，殘留的非有限值會在下一幀進到 <code>output</code> 被擋下）；
 就地路徑遇非有限值無法回滾，五個 state <b>全部歸零</b>、幀維持開啟、回 −1。
 <b><code>frame_skip</code> 在本模型 = identity</b>——error 頻譜原樣通過、state 維持原樣、
@@ -286,7 +293,7 @@ tensor，無隱藏 state；五個 state 都由 CPU/DSP caller-owned pool 傳入�
 <tr><td>h_gru1（subband_gru1.hidden）</td><td>(1, 2, 1, 128)</td><td>1.00 KB</td><td>1.00 KB</td><td>1.00 KB</td><td>1.00 KB</td></tr>
 <tr><td><b>boundary 小計</b></td><td></td><td><b>51.50 KB</b></td><td><b>97.00 KB</b></td><td><b>443.50 KB</b></td><td><b>853.00 KB</b></td></tr>
 </table>
-<p>上表是<b>過邊界的 state tensor</b>。C 端 pool 另含五個特徵輸入與 <code>output</code> 的 staging
+<p>上表是<b>過邊界的 state tensor</b>。C 端 pool 另含四個特徵輸入、壓縮域 error 頻譜與 <code>output</code> 的 staging
 （每個 state 只有一份 buffer），所以實測 pool 比小計大：</p>
 <table>
 <tr><th><code>get_mem_size</code> pool（byte）</th><th>grid</th><th>D=4</th><th>D=8</th><th>D=16</th><th>D=32</th><th>D=64</th></tr>

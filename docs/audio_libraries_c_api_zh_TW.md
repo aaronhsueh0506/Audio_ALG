@@ -524,7 +524,7 @@ ulcnet_prepost_post_process(p, out_hop, &written);
   非有限值以外的「寫一半／混寫」兩條路徑都偵測不到。
 - **Align-ULCNet 的五個 state**（`key_history`／`value_history`／`logit_history`／`h_gru0`／
   `h_gru1` ↔ 對應的 `*_out`）：graph 回每個 state 的**完整下一個值**、shape 與輸入完全相同，K/V（newest-first）
-  與 logit（oldest-first）的 ring 位移在 graph 內完成（丟掉最舊一格），沒有 CPU 端的 ring helper；commit 只做驗證。
+  與 logit（oldest-first）的 ring 位移在 graph 內完成（丟掉最舊一格），沒有 CPU 端的 ring helper；`output` 是學到的複數 mask（planar `[1,2,1,BINS]`），commit 驗證後以壓縮域 error 乘上它並逆冪。
   成本：複製路徑每幀把整組 K/V＋logit 歷史複製進 state（48 kHz、D=64 時每 hop 871,424 B：K/V 838,656 B＋
   logit 32,768 B）；全歷史邊界省下的 CPU 搬運只有就地綁定時才成立。
 - **Align-ULCNet 的 commit 有限性檢查只看「這一幀 graph 新寫的那一格」**：`output`、K/V 的 slot 0、logit 的

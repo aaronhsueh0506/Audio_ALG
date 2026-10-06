@@ -195,7 +195,7 @@ int ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
                                     const float far_re[ULCNET_BINS],
                                     const float far_im[ULCNET_BINS]);
 
-/* Publish the current frame's accelerator boundary. The `output` estimate is
+/* Publish the current frame's accelerator boundary. The `output` mask is
  * NaN-prefilled, so an unwritten frame is caught by frame_commit rather than
  * leaking the previous frame's values. Each state output (key/value/logit
  * history, GRU hiddens) is the same address as its state input. A runtime
@@ -208,8 +208,8 @@ int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
                                 UlcnetModelIoInputs *inputs,
                                 UlcnetModelIoOutputs *outputs);
 
-/* Validates that the accelerator wrote a finite estimate and finite state,
- * applies the inverse compression, then feeds the enhanced spectrum to the
+/* Validates that the accelerator wrote a finite mask and finite state,
+ * applies it to the compressed error and the inverse compression, then feeds the enhanced spectrum to the
  * synthesis (ULCNET_IO_TIME) or stages it for post_process_freq. The state
  * tensors need no step: the accelerator already wrote them where the next
  * frame reads them.

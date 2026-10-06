@@ -4,7 +4,9 @@
 `ulcnet_prepost` class 與 adapter pool 三處改寫，2026-10-03 就 GRU hidden
 in-place 與 pool 數字改寫，2026-10-04 就 full-state graph 邊界改寫：graph 回五個
 state 的完整下一個值；一般路徑是 `ulcnet_model_io_inherit()` 複製、能就地綁定的
-runtime 省略它，見 §10.2.1）。第 10 節的單幀 ONNX boundary
+runtime 省略它，見 §10.2.1；2026-10-06 就 `host` graph 止於 `complex_mask` 1×1 Conv 改寫：
+`output` 改為 planar mask，mask 乘法與逆冪移到 host `commit()`，`error_ri`
+不再是 graph 輸入，layout 12/13 → 16/17，見 §10.2）。第 10 節的單幀 ONNX boundary
 （`AIAEC/Align_ULCNet/export_onnx.py`）、CPU external-state
 helper（`ulcnet_model_io.c/h`、`ulcnet_accelerator_adapter.c/h`）與 C
 STFT/WOLA（`ulcnet_process.c/h`）已實作；§8 的 delay 狀態機/fail-open 邏輯
@@ -23,23 +25,29 @@ application 依 descriptor 配置（移除手寫 D=8）、各產品 route 的 n 
 量測。FIXED 首次由 raw ring-fill 切到 aligned far 的 reset 已在兩個 wrapper
 補齊；4ch 的 solid 時序亦已與實際可讀 hop 對齊。
 
-**既有 ONNX/JSON 必須全部重新匯出。** model-I/O layout 現為 **v12**
+**既有 ONNX/JSON 必須全部重新匯出。** model-I/O layout 現為 **v16**
 （`ULCNET_MODEL_IO_LAYOUT_VERSION`；v3 把 deployed far branch 由 RAW 改為
 ALIGNED，v4 更名 tensor，v5 把固定前後端搬到 host，v8 把兩顆 GRU hidden 由
 rank-3 改為 rank-4 NCHW，**2026-10-04 起 graph 回每個 state 的完整下一個值**，
 輸出集合由 `key_now`/`value_now`/`logit_now` 改為 `key_history_out`/
-`value_history_out`/`logit_history_out`，四對 boundary 換為 12–15）。state
-tensor 的名稱、shape 與元素數在新舊兩代完全相同，
+`value_history_out`/`logit_history_out`，四對 boundary 換為 12–15；v16 起 `host`
+graph 止於 `complex_mask` 1×1 Conv、`output` 為 planar mask `[1,2,1,K]`，兩個
+`host` 對換為 16／17）。state tensor 的名稱、shape 與元素數在新舊兩代完全相同，
+`output` 的元素數（2·K）也相同，
 `descriptor_validate()` 比對的每個欄位也相同，**版本號是唯一能攔下舊板綁新圖
-的閘門**。3–11 一律退役不得重用（8–11 是只回新 K/V/logit 一格的 delta-state
-boundary）。更早產出的每一份 descriptor 在
+的閘門**。3–13 一律退役不得重用（8–11 是只回新 K/V/logit 一格的 delta-state
+boundary，12–13 是 graph 內仍做 mask 乘法與逆冪前的 `host` 對）。更早產出的每一份 descriptor 在
 `ulcnet_model_io_descriptor_validate()` 會卡在 `layout_version`（v3 之前另外
 卡 `far_input_mode`），`ulcnet_accelerator_adapter_init()` 直接回 NULL。
-補救動作只有重新匯出 graph 一項：checkpoint 與 dataset 都**不需要**重新訓練
+補救動作只有重新匯出 graph：checkpoint 與 dataset 都**不需要**重新訓練
 或重新生成——權重未變，exporter 會把 checkpoint 原本的 training
 `far_input_mode` 與固定的 aligned-far deployment 值分開寫入，兩者不需一致。
-版號 13–15 已被另外三對 graph boundary 佔用（見 §10.2），不是空號；
-`ULCNET_MODEL_IO_LAYOUT_VERSION` 下一次真正 bump 要跳到 16。
+fp32 結果不變（各 layout 逐位元相同、C `commit()` 與參考實作精確一致），但
+mask 是**新的量化目標**（`complex_mask` 1×1 Conv 無 activation，range 由
+calibration 決定）：既有 calibration 資料與量化結果必須重做、加速器程式重新
+編譯，既有 ONNX/JSON 須重匯（`error_ri` 輸入已移除、`output` shape 改變）。
+版號 14、15、17 已被另外三對 graph boundary 佔用（見 §10.2），不是空號；
+`ULCNET_MODEL_IO_LAYOUT_VERSION` 下一次真正 bump 要跳到 18。
 
 本文件供實作者評估如何將現有 PBFDKF + Align-ULCNet 路徑放到記憶體與
 算力受限的 embedded system。產品測試一律使用本專案 PBFDKF 的 linear
@@ -739,14 +747,14 @@ flowchart LR
         ESTFT["sqrt-Hann STFT<br/>512 / 256"]
         FSTFT["sqrt-Hann STFT<br/>512 / 256"]
         FEAT["固定前端 fp32<br/>signed pow(0.3) + magnitude<br/>+ 壓縮域相位 cos/sin"]
-        ERRI["error_mag / error_cos / error_sin<br/>各 [1,1,K]<br/>error_ri [1,1,K,2] 壓縮域"]
+        ERRI["error_mag / error_cos / error_sin<br/>各 [1,1,K]<br/>壓縮域 error RI 留在 model_io state"]
         FARRI["far_mag<br/>[1,1,K]"]
         KH["key_history<br/>[1,32,D-1,TA]<br/>caller pool；*_out 經 inherit 複製或就地綁定"]
         VH["value_history<br/>[1,32,D-1,TA]<br/>caller pool；*_out 經 inherit 複製或就地綁定"]
         LH["logit_history<br/>[1,32,4,D]<br/>caller pool；*_out 經 inherit 複製或就地綁定"]
         GH["gru0/gru1 hidden<br/>each [1,2,1,128]<br/>caller pool；*_out 經 inherit 複製或就地綁定"]
-        CHECK["inherit()（就地綁定者省略）<br/>commit()：只驗證"]
-        INV["逆冪 fp32"]
+        CHECK["inherit()（就地綁定者省略）<br/>commit()：驗證 state"]
+        INV["commit()：壓縮域 error × mask<br/>＋逆冪 fp32"]
         WOLA["WOLA / IFFT"]
         PCM["enhanced PCM hop"]
 
@@ -767,8 +775,8 @@ flowchart LR
         QKV["Q_now / K_now / V_now"]
         TA["TA: current + history<br/>score conv + softmax"]
         BODY["joint conv + FGRU<br/>two temporal GRUs"]
-        MASK["mask + compressed-domain compose"]
-        ENH["output(壓縮域)<br/>[1,1,K,2]"]
+        MASK["complex_mask 1x1 Conv<br/>（graph 最後一個 op）"]
+        ENH["output = 複數 mask（planar）<br/>[1,2,1,K]"]
         NEXT["完整下一個 state（shape 同輸入）<br/>key/value/logit_history_out<br/>h_gru0_out / h_gru1_out"]
 
         ENC --> QKV --> TA --> BODY --> MASK --> ENH
@@ -804,8 +812,11 @@ portable model-I/O ABI 限制 `2 <= D <= 64`；D=1 會產生長度為零的
 history input，多數版端 runtime 無法穩定支援，只保留為 Python 評測模式。
 
 固定前後端（layout v5 起）在 host fp32 執行：signed `pow(0.3)` 壓縮、兩路
-magnitude、壓縮域相位 cos/sin 由 `ulcnet_model_io_prepare()` 內算，逆冪由
-`ulcnet_model_io_commit()` 內做；graph 只綁五個特徵輸入，各自持 PTQ scale。
+magnitude、壓縮域相位 cos/sin 由 `ulcnet_model_io_prepare()` 內算，並把壓縮域
+error 頻譜留在 model_io state；graph 只綁四個特徵輸入，各自持 PTQ scale，止於
+`complex_mask` 1×1 Conv、輸出學到的 mask。壓縮域 error 乘 mask 與逆冪由
+`ulcnet_model_io_commit()` 內做（fp32 乘積不融合，`-ffp-contract=off`；Python
+對照 `export_onnx.host_back_end`）。
 
 下面兩張表是**出貨的 `host`/`split` 這一對 boundary**。boundary 實際上是一對
 互相獨立的開關，version 屬於這一對而不屬於任何一半；四種組合列在
@@ -813,21 +824,22 @@ magnitude、壓縮域相位 cos/sin 由 `ulcnet_model_io_prepare()` 內算，逆
 
 | `--feature-layout` | `--gru-state-layout` | version | signal inputs | graph inputs | 狀態 |
 |---|---|---:|---|---:|---|
-| `host`（預設） | `split`（預設） | 12 | `error_mag`/`far_mag`/`error_cos`/`error_sin`/`error_ri` | 10 | 出貨合約；`ulcnet_model_io.h` 只綁這一對 |
-| `host` | `combined` | 13 | 同上五個 | 9 | 實驗用 |
+| `host`（預設） | `split`（預設） | 16 | `error_mag`/`far_mag`/`error_cos`/`error_sin` | 9 | 出貨合約；`ulcnet_model_io.h` 只綁這一對 |
+| `host` | `combined` | 17 | 同上四個 | 8 | 實驗用 |
 | `graph` | `split` | 14 | `error`/`far`（raw RI，各 `[1,1,K,2]`） | 7 | 實驗用 |
 | `graph` | `combined` | 15 | 同上兩個 | 6 | 實驗用 |
 
   四對的 recurrent hidden 都是 rank-4 NCHW，且都回完整下一個 state，所以
   boundary 改動時四對一起換號；3–7 是 rank-3 世代、8–11 是 delta-state 世代，
-  一律退役不得重用。
+  12–13 是 graph 內仍做 mask 乘法的 `host` 對，一律退役不得重用。`graph` 兩對
+  （14、15）的 `output` 仍是最終 estimate `[1,1,K,2]`：它要乘的壓縮域 error
+  在 graph 內才算出，host 沒有。
 
 - `--feature-layout=graph` 把上一段那份固定數學搬回 graph 內，graph 改綁兩個
   raw RI 頻譜，host 端不需要前後端。代價是 `sqrt`/`atan2`/`pow` 進了量化域，
   且 `error_cos`/`error_sin` 共用編譯器替它們推出的同一個 scale；實測多出
   `Sign`×6、`Abs`×6、`Pow`×6、`Sqrt`×2、`Atan`/`Cos`/`Sin` 各 1（另有隨之
-  增加的 elementwise 與索引節點），經 onnxoptimizer + 常數摺疊後節點數
-  121 → 177。除了 recurrent state 的 rank 之外，它重現的正是固定前後端搬到
+  增加的 elementwise 與索引節點）。除了 recurrent state 的 rank 之外，它重現的正是固定前後端搬到
   host 之前的 boundary，因此自帶版本號，而不是沿用那個 boundary 當年、如今
   已退役的號碼。
 - `--gru-state-layout=combined` 把 `h_gru0`/`h_gru1` 沿 dim 1（dim 0 是
@@ -853,7 +865,6 @@ Inputs（K = `n_fft/2+1`，16k: 257、48k: 513；TA = `ta_bins` = `ceil(K/10)`�
 | `far_mag` | `[1,1,K]` | 壓縮域 far magnitude；far 固定取 AEC aligned-far seam（acquisition 前為 raw far，之後為 aligned far） |
 | `error_cos` | `[1,1,K]` | 壓縮域 error 相位 cos |
 | `error_sin` | `[1,1,K]` | 壓縮域 error 相位 sin |
-| `error_ri` | `[1,1,K,2]` | 壓縮域 error real/imag |
 | `key_history` | `[1,32,D-1,TA]` | 過去 D-1 幀 encoded far keys |
 | `value_history` | `[1,32,D-1,TA]` | 過去 D-1 幀 encoded far values |
 | `logit_history` | `[1,32,4,D]` | TA `(5,3)` score conv 的前 4 幀 raw logits |
@@ -864,7 +875,7 @@ Outputs：
 
 | tensor | float32 shape | CPU 操作 |
 |---|---:|---|
-| `output` | `[1,1,K,2]` | 壓縮域 estimate；host 逆冪還原後送 WOLA/IFFT |
+| `output` | `[1,2,1,K]` | 學到的複數 mask，planar（plane 0 實部、plane 1 虛部）；host 以壓縮域 error 頻譜乘上它、逆冪還原後送 WOLA/IFFT（`ulcnet_model_io_commit()`） |
 | `key_history_out` | `[1,32,D-1,TA]` | `ulcnet_model_io_inherit` 複製進 state（就地綁定時與 `key_history` 同一位址，略過） |
 | `value_history_out` | `[1,32,D-1,TA]` | `ulcnet_model_io_inherit` 複製進 state（就地綁定時與 `value_history` 同一位址，略過） |
 | `logit_history_out` | `[1,32,4,D]` | `ulcnet_model_io_inherit` 複製進 state（就地綁定時與 `logit_history` 同一位址，略過） |
@@ -890,10 +901,10 @@ tensor 做一次 Slice。匯出 metadata 為 `boundary: stateless_one_frame_full
   prepare／commit、adapter、pipeline 兩條路徑共用。指標等於目的位址的 tensor
   不複製也不由 inherit 檢查，所以同一個呼叫兩種綁定都適用。就地時 runtime 必須先讀完**所有**
   state 輸入、才寫任何 state 輸出。CPU 端沒有 ring helper。
-- **layout**：`ULCNET_MODEL_IO_LAYOUT_VERSION` = 12，`ULCNET_PREPOST_CARVE_VERSION`
-  = 4；3–11 退役，下一次真正 bump 要到 16。
+- **layout**：`ULCNET_MODEL_IO_LAYOUT_VERSION` = 16，`ULCNET_PREPOST_CARVE_VERSION`
+  = 4；3–13 退役，下一次真正 bump 要到 18。
 - **`prepare()`** 只對 `output` 預填 NaN，state 不預填（它同時是下一幀的輸入）。
-- **`commit()` 只做驗證、不更新 ring**：檢查 `output` 有限、每個 ring 中 graph
+- **`commit()` 不更新 ring**：先檢查 `output`（mask）有限、每個 ring 中 graph
   這一幀新寫的那一格（K/V 的 slot 0、logit 的最後一幀）有限，以及兩個 GRU hidden
   有限。就地路徑遇到任何一處非有限值時 state 已被覆寫、無法回滾，所以五個 state 全部歸零
   （冷啟動）、transaction 丟棄、呼叫端的輸出不動、回 -1；複製路徑則由 inherit 先擋下
@@ -905,7 +916,7 @@ tensor 做一次 Slice。匯出 metadata 為 `boundary: stateless_one_frame_full
   = 871,424 B，與 CPU 端 ring 位移搬的量相當；graph 輸出的也是整組歷史而非一格。
   全歷史邊界省下的 CPU 搬運只有就地綁定時成立（那時沒有複製也沒有位移）。
 - **最終決定（2026-10-04，使用者裁定）**：Align-ULCNet 維持「graph 正常輸出整個
-  history」的邊界（layout 12–15；3–11 退役），不再為省複製而改回 delta 邊界。
+  history」的邊界（full-state boundary，現行 layout 14–17；3–13 退役），不再為省複製而改回 delta 邊界。
   NPU 端可直接省掉繼承（inherit）那個函式，其餘共用。驗證：400-hop 串流經私有
   tensor＋inherit，與就地綁定的輸出 hash 相同（16 kHz `5d71d216a2302282`、
   48 kHz `9ffa1a48569f7c7d`），pool 大小不變（D=8：16 kHz 89,200 B、48 kHz 171,632 B）；
@@ -947,7 +958,7 @@ pipeline 端的 identity reprime 擋掉（不 step 模型），見 5.x 的
   4ch direct path 的 far 路，以及兩個 AIAEC pre/post class 的 TIME 模式都在用，
   mono 是同一天稍後跟進的）。同一個 state 不可混用兩種推入函式。
 - model-I/O/state `c/.h`：caller-owned memory requirement/init/reset、五個
-  state tensor 的保存、inherit（複製路徑）、validate-only commit、descriptor/layout
+  state tensor 的保存、inherit（複製路徑）、commit（驗證 state、壓縮域 error × mask、逆冪；不更新 ring）、descriptor/layout
   validation（2026-10-04 起沒有 CPU ring update）。RAM 必須隨 D 縮小。
 - streaming ONNX exporter：單幀 stateless graph，explicit state inputs +
   full-state outputs（2026-10-04 起；先前為 delta-state），同時生成
@@ -1025,7 +1036,7 @@ v5 起由 `ulcnet_model_io_prepare()`/`ulcnet_model_io_commit()` 以 host fp32
    `SIMD=0/1` 與 scalar/NEON parity。
 2. 新增 model-I/O/state `c/.h`：D-dependent caller-owned RAM、reset、
    state 保存與 descriptor validation（初版含 K/V/logit CPU ring update；
-   2026-10-04 起 ring 位移改在 graph 內，commit 只驗證）。
+   2026-10-04 起 ring 位移改在 graph 內，commit 不更新 ring；2026-10-06 起 commit 另做 mask 乘法與逆冪）。
 3. 新增 `T=1` stateless streaming exporter：explicit state inputs +
    full-state outputs（初版為 delta-state outputs；2026-10-04 改現制）；現有 fixed-block exporter 保留供 offline/debug，不得冒稱
    production streaming equivalent。

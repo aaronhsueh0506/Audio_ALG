@@ -147,7 +147,7 @@ static int infer(void *user,
          * committing, and the in-place state stays as the runtime left it
          * (a run that reported failure is taken not to have written). The
          * next prepare() re-arms the transaction and re-fills the
-         * NaN-checked estimate, so the NaN-prefill plus commit()'s finite
+         * NaN-checked mask, so the NaN-prefill plus commit()'s finite
          * gate remain as the second line of defence against an unwritten
          * frame. The caller's enhanced spectra stay untouched, because -1
          * here means this frame produced nothing. */
