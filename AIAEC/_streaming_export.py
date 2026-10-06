@@ -496,6 +496,36 @@ def _fold_three_vector_conv(conv: nn.Conv2d, pairs: int) -> nn.Conv2d:
     return out
 
 
+def _fold_batch_norm_into_upsample_conv(conv: nn.Conv2d,
+                                        norm: nn.BatchNorm2d) -> nn.Conv2d:
+    """Fold an eval-mode BatchNorm that follows a sub-pixel shuffle into the
+    bias-free conv before it.
+
+    The conv emits ``2 * C`` channels and the shuffle reads them as
+    ``(c, phase)``, so channel ``2c + phase`` lands in post-shuffle channel
+    ``c``. The norm is a per-``c`` affine map, which commutes with the
+    shuffle and with a frequency crop: every phase of channel ``c`` gets the
+    same scale on its weights and the same shift as its new bias. The
+    model's own conv is left untouched.
+    """
+    if conv.bias is not None or norm.training or not norm.track_running_stats:
+        raise ValueError('upsample norm cannot be folded: need a bias-free '
+                         'conv and an eval-mode BatchNorm with running stats')
+    channels = norm.num_features
+    if conv.out_channels != 2 * channels:
+        raise ValueError('upsample conv is not the 2 x C sub-pixel layout')
+    gain = norm.weight.detach() / (norm.running_var + norm.eps).sqrt()
+    shift = norm.bias.detach() - norm.running_mean * gain
+    gain = gain.repeat_interleave(2)
+    shift = shift.repeat_interleave(2)
+    out = copy.deepcopy(conv)
+    out.weight = nn.Parameter(
+        (conv.weight.detach() * gain.reshape(-1, 1, 1, 1)).contiguous(),
+        requires_grad=False)
+    out.bias = nn.Parameter(shift.contiguous(), requires_grad=False)
+    return out
+
+
 class StatelessOneFrameAIAEC(nn.Module):
     """Bind explicit tensors to an existing model's streaming reference."""
 
@@ -523,6 +553,7 @@ class StatelessOneFrameAIAEC(nn.Module):
             # owns the raw-spectrum ring. It is not model-internal state.
             self.stream_state.pop('spec_ring')
             self._fold_ccm_head()
+            self._fold_upsample_norms()
         self.slots = _state_slots(self.stream_state)
         for slot in self.slots:
             slot.get()
@@ -575,6 +606,33 @@ class StatelessOneFrameAIAEC(nn.Module):
         # The history holds the conv's input frames: its width is the width
         # of the pre-shuffle frequency axis.
         self._ccm_pre_shuffle_width = int(cell._history.shape[-1])
+
+    _UPSAMPLE_NAMES = ('up3', 'up2', 'up1')
+
+    def _fold_upsample_norms(self) -> None:
+        """Move each decoder upsample's BatchNorm into its conv, so the graph
+        carries no BatchNorm after a Slice (see _up_step)."""
+        for name in self._UPSAMPLE_NAMES:
+            cell = self.stream_state[name]
+            cell.conv_cell.conv = _fold_batch_norm_into_upsample_conv(
+                cell.conv_cell.conv, cell.block.norm)
+
+    def _up_step(self, name: str, value: Tensor, target: int) -> Tensor:
+        """``_StreamFreqUpsampleCell.step`` with the norm already folded into
+        the conv: shuffle, frequency crop, activation. The crop must not pad,
+        because the norm's shift is only exact on real columns."""
+        cell = self.stream_state[name]
+        block = cell.block
+        value = cell.conv_cell.step(value)
+        batch, _, time, frequency = value.shape
+        value = value.reshape(batch, block.out_channels, 2, time, frequency)
+        value = value.permute(0, 1, 3, 4, 2).reshape(
+            batch, block.out_channels, time, 2 * frequency)
+        if value.shape[-1] < target:
+            raise ValueError('%s would zero-pad %d -> %d bins: the folded '
+                             'norm shift is not exact there'
+                             % (name, value.shape[-1], target))
+        return block.act(value[..., :target])
 
     @property
     def combines_gru_state(self) -> bool:
@@ -701,14 +759,12 @@ class StatelessOneFrameAIAEC(nn.Module):
         value = model.gru_out(value).reshape(
             batch, time, channels, frequency
         ).permute(0, 2, 1, 3)
-        value = state['up3'].step(
-            value + model.skip4(m4), m3.shape[-1]
+        value = self._up_step('up3', value + model.skip4(m4), m3.shape[-1])
+        value = self._up_step(
+            'up2', state['res3'].step(value + model.skip3(m3)), m2.shape[-1]
         )
-        value = state['up2'].step(
-            state['res3'].step(value + model.skip3(m3)), m2.shape[-1]
-        )
-        value = state['up1'].step(
-            state['res2'].step(value + model.skip2(m2)), m1.shape[-1]
+        value = self._up_step(
+            'up1', state['res2'].step(value + model.skip2(m2)), m1.shape[-1]
         )
         packed = state['ccm_up'].conv_cell.step(value + model.skip1(m1))
         # [1,36,1,W] -> [1,W,1,36] -> [1,1,2W,18]: phase-major channels make

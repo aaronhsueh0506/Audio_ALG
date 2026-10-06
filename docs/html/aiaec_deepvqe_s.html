@@ -46,7 +46,7 @@ sqrt-Hann STFT/ISTFT（<code>aiaec_process.c/h</code>，center=False 每 hop 一
 <code>deepvqe_prepost_frame_inputs()</code> 算出，類別遞給加速器的
 <code>mic</code>/<code>far</code> 是<b>壓縮後</b>的 planar 頻譜（<code>[1,2,1,257]</code>，
 先 real 平面、再 imaginary 平面），graph 自第一個 conv 起（前面只有 history 的
-Concat／Slice，沒有 Sqrt／Pow／Clip）；各 conv 的頻率軸零填補寫在 conv 的 <code>pads</code> 屬性，圖內沒有獨立 Pad op（<code>fuse_freq_pad_into_conv</code>）；3 幀 raw mic 譜 ring 另存於類別內供 CCM 使用。
+Concat／Slice，沒有 Sqrt／Pow／Clip）；各 conv 的頻率軸零填補寫在 conv 的 <code>pads</code> 屬性，圖內沒有獨立 Pad op（<code>fuse_freq_pad_into_conv</code>）；解碼端三個 upsample 的 BatchNorm（在 sub-pixel shuffle 之後）折進前一個 conv 的權重與 bias（<code>_fold_batch_norm_into_upsample_conv</code>），圖內不再有 BatchNormalization；3 幀 raw mic 譜 ring 另存於類別內供 CCM 使用。
 壓縮指數 0.3 編進 host（<code>DEEPVQE_COMPRESSION_EXP</code>），匯出器拒絕
 <code>compression_exponent</code> 不是 0.3 的 checkpoint。全部 recurrent state 為顯式 I/O tensor；
 頻譜 ring 是 host state，不在 NPU graph 內。

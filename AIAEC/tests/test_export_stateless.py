@@ -233,6 +233,52 @@ def test_deepvqe_frequency_pads_are_conv_attributes_and_replay_exactly(tmp_path)
             state = tuple(expected[split.head_outputs:])
 
 
+def test_deepvqe_upsample_norms_fold_into_their_convs(tmp_path):
+    """The decoder's BatchNorms (after the sub-pixel shuffle) become conv
+    weights and a bias: no BatchNormalization node is left, and the result
+    matches the model's own streaming reference with NON-trivial statistics
+    (a default-initialised norm is the identity and would prove nothing)."""
+    onnx = pytest.importorskip('onnx')
+    from AIAEC._streaming_export import optimize_graph_file
+
+    torch.manual_seed(96)
+    model = DeepVQES(GRID).eval()
+    generator = torch.Generator().manual_seed(3)
+    for block in (model.up3, model.up2, model.up1):
+        width = block.norm.num_features
+        block.norm.weight.data = 0.5 + torch.rand(width, generator=generator)
+        block.norm.bias.data = torch.randn(width, generator=generator)
+        block.norm.running_mean = torch.randn(width, generator=generator)
+        block.norm.running_var = 0.5 + torch.rand(width, generator=generator)
+    original = model.up3.conv.conv.weight.clone()
+    wrapper, dummy, names, outputs, split = _build('DeepVQE_S', model)
+    assert torch.equal(model.up3.conv.conv.weight, original)
+
+    state = dummy[split.signal_inputs:]
+    reference_state = model.create_stream_state()
+    with torch.no_grad():
+        for _ in range(6):
+            raw = torch.randn(2, 1, 1, GRID.n_freqs, 2)
+            actual = wrapper(*host_signal_inputs(
+                'DeepVQE_S', model, tuple(raw)), *state)
+            reference = model.forward_stream(
+                torch.complex(raw[0][..., 0], raw[0][..., 1]),
+                torch.complex(raw[1][..., 0], raw[1][..., 1]),
+                reference_state)
+            torch.testing.assert_close(
+                actual[0], _learned_output('DeepVQE_S', reference),
+                rtol=1e-5, atol=5e-6)
+            state = actual[split.head_outputs:]
+
+    path = str(tmp_path / 'deepvqe_s.onnx')
+    torch.onnx.export(wrapper, dummy, path, input_names=names,
+                      output_names=outputs, opset_version=17,
+                      do_constant_folding=True)
+    optimize_graph_file(path)
+    assert 'BatchNormalization' not in {
+        node.op_type for node in onnx.load(path).graph.node}
+
+
 def test_align_cruse_frame_index_is_explicit_int64_state():
     model = AlignCRUSE(GRID).eval()
     _wrapper, inputs, names, _outputs, _split = _build('Align_CRUSE', model)
