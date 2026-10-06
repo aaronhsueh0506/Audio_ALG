@@ -471,6 +471,47 @@ def test_host_graph_ends_at_the_mask_conv(tmp_path):
         if node.name.startswith('/complex_mask')}
 
 
+def test_optimized_graph_has_no_conv_pad_op_and_replays_the_wrapper(tmp_path):
+    """Frequency padding of the convolutions lives in their attributes in the
+    shipped graph, and the optimized file still reproduces the wrapper."""
+    onnx = pytest.importorskip('onnx')
+    ort = pytest.importorskip('onnxruntime')
+    depth = 4
+    torch.manual_seed(19)
+    model = AlignULCNet(GRID, max_delay_frames=depth).eval()
+    checkpoint = tmp_path / 'ckpt.pth'
+    torch.save({'contract': {}, 'state_dict': model.state_dict()}, checkpoint)
+    path = tmp_path / 'pads.onnx'
+    wrapper, initial, _meta = export_graph(
+        model, str(checkpoint), str(path))
+
+    graph = onnx.load(str(path)).graph
+    # Any Pad left (the reorientation's width fit) feeds no Conv.
+    conv_inputs = {name for node in graph.node if node.op_type == 'Conv'
+                   for name in node.input}
+    assert not [node for node in graph.node
+                if node.op_type == 'Pad' and node.output[0] in conv_inputs]
+    session = ort.InferenceSession(
+        str(path), providers=['CPUExecutionProvider'])
+    state = tuple(value.clone() for value in initial[SIGNAL_INPUTS:])
+    generator = torch.Generator().manual_seed(29)
+    with torch.no_grad():
+        for _ in range(2 * depth + 2):
+            current = graph_signals(
+                model,
+                torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
+                torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
+                wrapper.layout,
+            ) + state
+            expected = wrapper(*current)
+            actual = session.run(None, {
+                name: value.numpy()
+                for name, value in zip(wrapper.layout.input_names, current)})
+            for got, want in zip(actual, expected):
+                assert abs(got - want.numpy()).max() <= 3e-4
+            state = next_state(expected)
+
+
 def test_combined_state_stacks_on_the_channel_axis():
     """Pins WHICH axis the combined layout stacks on.
 

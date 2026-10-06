@@ -35,16 +35,20 @@ ratio mask：是 3×3（3 個時間位置 × 3 個頻率位置）的因果複數
 <code>stream_output_delay = 0</code>——四候選中時間軸最乾淨（readiness §3.3）。</p>
 <p><b>ONNX / NPU graph boundary</b>（已交付：
 <code>AIAEC/DeepVQE_S/export_onnx.py</code>）：
-graph <b>內</b> = <code>compressed_ri_feature</code>（power-law <code>pow(0.3)</code>）、
-causal conv + BatchNorm + ELU 編碼、<code>FrameDelayAttention</code>（<code>softmax</code>
+graph <b>內</b> = causal conv + BatchNorm + ELU 編碼、<code>FrameDelayAttention</code>（<code>softmax</code>
 over D=32，每幀獨立、無累積 state）、GRU(192)、<code>FreqUpsample</code>（頻率 sub-pixel
 shuffle，<b>無 deconv</b>）、殘差塊；最後一層 <code>ccm_up</code> 之後的「3 向量→複數」換算（<code>three_vector_complex</code>）在<b>匯出時折進該 conv 的權重</b>——graph 在最後一個 Conv 之後只剩 Transpose／Reshape／Slice，沒有 Gather／Mul／Sub、也沒有 rank&gt;4 的張量，直接輸出 <code>[1,1,257,18]</code> taps（與 Python reference 的差異僅浮點捨入，約 1e-6；量化校正資料須以此 graph 產生）。
 graph <b>外</b>（C 前後處理，現由 <code>deepvqe_prepost.c/h</code> 這個類別統一持有）=
 sqrt-Hann STFT/ISTFT（<code>aiaec_process.c/h</code>，center=False 每 hop 一幀）、complex↔RI，
 以及 <code>deepvqe_process.c/h</code> 保存 3 幀 raw mic 複數譜 ring 並套用 CCM taps
-（<code>deepvqe_ccm_process</code>）。<b>壓縮在 graph 內</b>：類別遞給加速器的
-<code>mic</code>/<code>far</code> 是<b>未壓縮</b>的 raw RI（<code>[1,1,257,2]</code>），
-這一點與 Align-ULCNet（前端搬到 host）相反。全部 recurrent state 為顯式 I/O tensor；
+（<code>deepvqe_ccm_process</code>）。<b>壓縮在 host</b>：power-law
+<code>x·|x|^(0.3−1)</code>（<code>|x| = sqrt(re²+im²+1e-12)</code>）由
+<code>deepvqe_prepost_frame_inputs()</code> 算出，類別遞給加速器的
+<code>mic</code>/<code>far</code> 是<b>壓縮後</b>的 planar 頻譜（<code>[1,2,1,257]</code>，
+先 real 平面、再 imaginary 平面），graph 自第一個 conv 起（前面只有 history 的
+Concat／Slice，沒有 Sqrt／Pow／Clip）；各 conv 的頻率軸零填補寫在 conv 的 <code>pads</code> 屬性，圖內沒有獨立 Pad op（<code>fuse_freq_pad_into_conv</code>）；3 幀 raw mic 譜 ring 另存於類別內供 CCM 使用。
+壓縮指數 0.3 編進 host（<code>DEEPVQE_COMPRESSION_EXP</code>），匯出器拒絕
+<code>compression_exponent</code> 不是 0.3 的 checkpoint。全部 recurrent state 為顯式 I/O tensor；
 頻譜 ring 是 host state，不在 NPU graph 內。
 NPU 注意（readiness）：<code>FrameDelayAttention</code> 的 <code>[B,C,T,D,F]</code>
 broadcast 必須逐幀化；輸出是 9 complex MAC/bin 的 CCM，不是 ratio mask。</p>
@@ -67,7 +71,7 @@ for s in range(0, n, grid.hop_len):
 <h2>C pre/post 類別（<code>deepvqe_prepost.c/h</code>）</h2>
 <p>板端整合點：<b>一個物件</b>包住 caller 音訊與加速器張量之間的一切（framing、RI staging、
 CCM 頻譜 ring、16 個 state buffer）。它組合 <code>aiaec_process.c</code> ＋
-<code>DeepVQE_S/deepvqe_process.c</code>。<code>deepvqe_ccm_process</code> 的 CCM 內圈（bin 1..N-2，每 bin 9 個 tap）走共用 NEON 核心 <code>skn_ctaps_mac_f32</code>（audio_common，與標量 twin 逐位元相同）；兩個邊界 bin 走標量路徑，略過落在頻譜外的 tap。<code>frame_inputs</code> 的 re/im 交錯用 <code>skn_interleave_cf32</code>。生命週期、32-byte
+<code>DeepVQE_S/deepvqe_process.c</code>。<code>deepvqe_ccm_process</code> 的 CCM 內圈（bin 1..N-2，每 bin 9 個 tap）走共用 NEON 核心 <code>skn_ctaps_mac_f32</code>（audio_common，與標量 twin 逐位元相同）；兩個邊界 bin 走標量路徑，略過落在頻譜外的 tap。<code>frame_inputs</code> 的壓縮（<code>compress_planar</code>）是 sqrtf／逐元素 libm <code>powf</code>／縮放三段迴圈。生命週期、32-byte
 <code>DeepVqePrepostMemReq</code> 陳舊 pool 閘、交易式 frame 狀態機與「為何是第三個 TU」是三個
 模型<b>共用的形狀</b>，寫在 <a href="onnx_prepost.html">onnx_prepost</a>；以下只記 DeepVQE-S
 自己的部分。grid 只支援 16 kHz/512/256——<code>aiaec_process.h</code> 帶 <code>#error</code>
@@ -126,6 +130,7 @@ staging）。16 個 state 張量佔掉絕大部分。</p>
 <pre>mic ──► StreamSTFT ──► [B,1,257] cplx      far ──► StreamSTFT ──► [B,1,257] cplx
         │                                          │
   compressed_ri_feature(0.3) [B,2,1,257]     compressed_ri_feature(0.3)
+  （C：host 的 compress_planar；匯出 graph 的 mic/far 輸入即此 tensor）
         ▼                                          ▼
   state["mic1"].step (16ch) → state["mic2"]   state["far1"].step (8ch) → state["far2"]
         │ m2 [B,40,1,65]                           │ f2 [B,24,1,65]
@@ -231,7 +236,7 @@ graph state 由 host caller 保存；STFT/ISTFT 與 CCM 頻譜 ring 屬 C struct
 <code>deepvqe_prepost_descriptor_default(D, &amp;desc)</code> 產生本 build 的值，
 <code>_descriptor_validate(&amp;desc)</code> 把<b>除 <code>delay_depth</code> 之外</b>每一欄
 都釘在本 build 的常數上（<code>delay_depth</code> 是 export 期的部署參數，只檢查範圍）。
-<code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> 現為 <b>2</b>，且刻意<b>不</b>與
+<code>DEEPVQE_PREPOST_LAYOUT_VERSION</code> 現為 <b>3</b>（<code>mic</code>/<code>far</code> 的名稱與元素數 2×257 與舊 layout 相同，只有版號區分 boundary；舊 layout 產生的 ONNX／JSON 與 calibration 資料須重新匯出、加速器程式須重編），且刻意<b>不</b>與
 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 共用：兩個模型的 boundary 各走各的，共用號碼會讓
 一邊的 bump 看起來像另一邊的。D 範圍 <code>DEEPVQE_PREPOST_MIN_D</code>=1 …
 <code>MAX_D</code>=256，預設 32 ＝ 這個 grid 上的 0.5 秒搜尋範圍（<code>ceil(0.5 × 16000/256)</code>）。</p>

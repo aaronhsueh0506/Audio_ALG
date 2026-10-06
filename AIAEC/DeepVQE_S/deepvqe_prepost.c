@@ -9,7 +9,7 @@
  * builds keep linking.
  *
  * It deliberately does NOT use ulcnet_model_io.c: DeepVQE-S's boundary is a
- * different one (raw RI in, full next state out) and pulling that TU in would
+ * different one (compressed planar spectra in, full next state out) and pulling that TU in would
  * bind this model to Align-ULCNet's layout version. The small amount of pool
  * arithmetic it would have shared is duplicated below instead.
  *
@@ -97,10 +97,10 @@ struct DeepVqePrepost {
     float *state[DEEPVQE_STATE_COUNT];
     size_t state_elements[DEEPVQE_STATE_COUNT];
 
-    /* Head output and the interleaved RI the graph binds. */
+    /* Head output and the compressed planar spectra the graph binds. */
     float *taps;        /* [DEEPVQE_TAPS_ELEMENTS]                          */
-    float *mic_ri;      /* [2 * AIAEC_N_BINS] interleaved                   */
-    float *far_ri;      /* [2 * AIAEC_N_BINS] interleaved                   */
+    float *mic_ri;      /* [2 * AIAEC_N_BINS] real plane, imaginary plane   */
+    float *far_ri;      /* [2 * AIAEC_N_BINS] real plane, imaginary plane   */
 
     /* Host-owned raw-microphone spectrum ring the CCM taps convolve over.
      * The exporter pops it out of the graph's state on purpose
@@ -623,6 +623,28 @@ int deepvqe_prepost_pre_process_freq(DeepVqePrepost *p,
     return 1;
 }
 
+/* x * |x|^(e-1) with |x| = sqrt(re^2 + im^2 + 1e-12), the model's
+ * compressed_ri_feature (aiaec_common.py), written as separate passes over
+ * the planes so the sqrt and the scaling are plain vector loops; only the
+ * powf is per element. The imaginary output plane is the scratch for |x|
+ * and then the scale. Products stay unfused (-ffp-contract=off). */
+static void compress_planar(const float *re, const float *im, float *out) {
+    float *out_re = out;
+    float *out_im = out + AIAEC_N_BINS;
+    const float exponent = DEEPVQE_COMPRESSION_EXP - 1.0f;
+    int k;
+
+    for (k = 0; k < AIAEC_N_BINS; ++k)
+        out_im[k] = sqrtf(re[k] * re[k] + im[k] * im[k] + 1e-12f);
+    for (k = 0; k < AIAEC_N_BINS; ++k)
+        out_im[k] = powf(out_im[k], exponent);
+    for (k = 0; k < AIAEC_N_BINS; ++k) {
+        const float scale = out_im[k];
+        out_re[k] = re[k] * scale;
+        out_im[k] = im[k] * scale;
+    }
+}
+
 int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
                                  DeepVqePrepostInputs *inputs,
                                  DeepVqePrepostOutputs *outputs) {
@@ -630,12 +652,11 @@ int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
 
     if (!p || !inputs || !outputs || !p->frame_open) return -1;
 
-    /* Interleave to the graph's [.,.,BINS,2] RI layout. No compression:
-     * DeepVQE-S applies its own power law inside the graph. */
-    skn_interleave_cf32(p->mic_re, p->mic_im, (Complex *)p->mic_ri,
-                        AIAEC_N_BINS);
-    skn_interleave_cf32(p->far_re, p->far_im, (Complex *)p->far_ri,
-                        AIAEC_N_BINS);
+    /* The graph's fixed front end, run on the host: the power-law
+     * compression of both spectra into [1,2,1,BINS] planar tensors. The raw
+     * mic spectrum stays in mic_re/mic_im for the CCM ring. */
+    compress_planar(p->mic_re, p->mic_im, p->mic_ri);
+    compress_planar(p->far_re, p->far_im, p->far_ri);
 
     /* Arms the transaction and NaN-fills the head output, so a caller that
      * asks twice still gets a clean one rather than a half-written one. The

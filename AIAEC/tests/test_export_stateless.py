@@ -16,6 +16,7 @@ from AIAEC._streaming_export import (
     GRU_STATE_LAYOUTS,
     StatelessOneFrameAIAEC,
     _build,
+    host_signal_inputs,
     requires_contiguous_calibration,
     state_precision_policy,
 )
@@ -70,9 +71,12 @@ def test_external_state_round_trip_matches_streaming_reference(name, factory):
     observed_nonzero_state = False
     with torch.no_grad():
         for _ in range(6):
-            primary_ri = torch.randn_like(dummy[0])
-            far_ri = torch.randn_like(dummy[1])
-            actual = wrapper(primary_ri, far_ri, *external_state)
+            # RAW spectra [1,1,F,2]; the graph's own inputs are whatever the
+            # host front end leaves for this model.
+            primary_ri = torch.randn(1, 1, model.grid.n_freqs, 2)
+            far_ri = torch.randn(1, 1, model.grid.n_freqs, 2)
+            actual = wrapper(*host_signal_inputs(
+                name, model, (primary_ri, far_ri)), *external_state)
             reference = model.forward_stream(
                 torch.complex(primary_ri[..., 0], primary_ri[..., 1]),
                 torch.complex(far_ri[..., 0], far_ri[..., 1]),
@@ -96,12 +100,14 @@ def test_deepvqe_head_is_rank4_and_matches_ccm_taps():
     """The three-vector map is folded into the last conv, not run in-graph."""
     torch.manual_seed(91)
     model = DeepVQES(GRID).eval()
-    wrapper, inputs, _names, _outputs, _split = _build('DeepVQE_S', model)
+    wrapper, inputs, _names, _outputs, split = _build('DeepVQE_S', model)
     reference_state = model.create_stream_state()
-    primary = torch.complex(inputs[0][..., 0], inputs[0][..., 1])
-    far = torch.complex(inputs[1][..., 0], inputs[1][..., 1])
+    raw = torch.randn(2, 1, 1, GRID.n_freqs, 2)
+    primary = torch.complex(raw[0][..., 0], raw[0][..., 1])
+    far = torch.complex(raw[1][..., 0], raw[1][..., 1])
     with torch.no_grad():
-        actual = wrapper(*inputs)[0]
+        signals = host_signal_inputs('DeepVQE_S', model, tuple(raw))
+        actual = wrapper(*signals, *inputs[split.signal_inputs:])[0]
         reference = model.forward_stream(primary, far, reference_state)
     taps = reference.auxiliary['ccm_taps']
     unpacked = torch.stack((taps.real, taps.imag), dim=-1)
@@ -139,6 +145,92 @@ def test_deepvqe_graph_ends_in_conv_and_reshapes_only(tmp_path):
              for info in list(graph.graph.value_info) + list(graph.graph.output)}
     assert all(ranks.get(node.output[0], 0) <= 4
                for node in nodes[last_conv + 1:])
+
+
+def test_deepvqe_host_front_end_is_the_models_own_compression():
+    """The host feeds the graph exactly what the model compresses itself."""
+    from AIAEC.aiaec_common import compressed_ri_feature
+
+    torch.manual_seed(93)
+    model = DeepVQES(GRID).eval()
+    raw = torch.randn(1, 1, GRID.n_freqs, 2)
+    complex_spec = torch.complex(raw[..., 0], raw[..., 1])
+    host, = host_signal_inputs('DeepVQE_S', model, (raw,))
+    assert host.shape == (1, 2, 1, GRID.n_freqs)
+    torch.testing.assert_close(
+        host, compressed_ri_feature(complex_spec, model.compression_exponent),
+        rtol=1e-6, atol=1e-7)
+
+
+def test_deepvqe_graph_starts_at_the_first_conv(tmp_path):
+    """No power-law front end left in the graph.
+
+    The compression is a handful of Gather/Mul/Sqrt/Pow ops on 257 values;
+    in the graph each is a separate accelerator op, and the negative-exponent
+    Pow has an enormous quantization range. The host computes it, so the
+    only ops ahead of the first Conv are history Concat/Slice/Pad.
+    """
+    onnx = pytest.importorskip('onnx')
+    from AIAEC._streaming_export import optimize_graph_file
+
+    torch.manual_seed(94)
+    wrapper, inputs, names, outputs, _split = _build(
+        'DeepVQE_S', DeepVQES(GRID).eval())
+    path = str(tmp_path / 'deepvqe_s.onnx')
+    torch.onnx.export(wrapper, inputs, path, input_names=names,
+                      output_names=outputs, opset_version=17,
+                      do_constant_folding=True)
+    optimize_graph_file(path)
+    graph = onnx.load(path).graph
+    nodes = [node for node in graph.node if node.op_type != 'Constant']
+    shapes = {value.name: tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
+              for value in graph.input}
+    assert shapes['mic'] == shapes['far'] == (1, 2, 1, GRID.n_freqs)
+    first_conv = next(i for i, node in enumerate(nodes)
+                      if node.op_type == 'Conv')
+    assert {node.op_type for node in nodes[:first_conv]} <= {
+        'Concat', 'Slice', 'Pad'}, [n.op_type for n in nodes[:first_conv]]
+    assert not {'Sqrt', 'Pow', 'Clip'} & {node.op_type for node in nodes}
+
+
+def test_deepvqe_frequency_pads_are_conv_attributes_and_replay_exactly(tmp_path):
+    """The explicit zero Pads are folded into their Convs: no Pad op left,
+    and the optimized graph still reproduces the wrapper."""
+    onnx = pytest.importorskip('onnx')
+    ort = pytest.importorskip('onnxruntime')
+    from AIAEC._streaming_export import optimize_graph_file
+
+    torch.manual_seed(95)
+    wrapper, inputs, names, outputs, split = _build(
+        'DeepVQE_S', DeepVQES(GRID).eval())
+    path = str(tmp_path / 'deepvqe_s.onnx')
+    torch.onnx.export(wrapper, inputs, path, input_names=names,
+                      output_names=outputs, opset_version=17,
+                      do_constant_folding=True)
+    optimize_graph_file(path)
+    graph = onnx.load(path).graph
+    assert not [node for node in graph.node if node.op_type == 'Pad']
+    padded = [node for node in graph.node if node.op_type == 'Conv' and any(
+        a.name == 'pads' and any(a.ints) for a in node.attribute)]
+    assert padded
+    for node in padded:
+        pads = next(list(a.ints) for a in node.attribute if a.name == 'pads')
+        assert pads[0] == pads[2] == 0, 'temporal padding appeared'
+
+    session = ort.InferenceSession(path, providers=['CPUExecutionProvider'])
+    state = tuple(value.clone() for value in inputs[split.signal_inputs:])
+    generator = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        for _ in range(4):
+            signals = tuple(torch.randn(value.shape, generator=generator)
+                            for value in inputs[:split.signal_inputs])
+            expected = wrapper(*signals, *state)
+            actual = session.run(None, {
+                name: value.numpy()
+                for name, value in zip(names, signals + state)})
+            for got, want in zip(actual, expected):
+                assert abs(got - want.numpy()).max() <= 3e-5
+            state = tuple(expected[split.head_outputs:])
 
 
 def test_align_cruse_frame_index_is_explicit_int64_state():

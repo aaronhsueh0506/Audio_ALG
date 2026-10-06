@@ -616,7 +616,10 @@ int  deepvqe_prepost_descriptor_validate(const DeepVqePrepostDescriptor *descrip
 const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(const DeepVqePrepost *p);
 ```
 
-- 圖邊界：兩個 RI 交錯的訊號 input（`mic`/`far`，`[1,1,AIAEC_N_BINS,2]`）＋
+- 圖邊界：兩個 power-law 壓縮後的 planar 訊號 input（`mic`/`far`，`[1,2,1,AIAEC_N_BINS]`，
+  先 real 平面、再 imaginary 平面；壓縮 `x·|x|^(DEEPVQE_COMPRESSION_EXP−1)` 由
+  `frame_inputs()` 在 host 端做，圖自第一個 conv 起；`DeepVqePrepostInputs.mic`/`.far` 即這兩個 tensor，
+  CCM 用的 raw mic 頻譜另存於類別內）＋
   **16 個顯式 state**，順序就是 `DeepVqeStateId` 列舉（= exporter 的 `input_names[2:]` 逐字），
   輸出是 packed CCM taps
   `[1,1,BINS,DEEPVQE_TIME_ORDER*DEEPVQE_FREQ_TAPS*2]`（16 kHz grid 為
@@ -625,7 +628,7 @@ const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(const DeepVqePrepost 
 - DeepVQE-S 回的是**每個 state 的完整下一個值**（不是差量），pool 裡每個 state 只有一份 buffer，
   一般 runtime 的輸出由 `deepvqe_prepost_outputs_inherit()` 複製進來、就地綁定者省略它；commit 的有限性檢查每幀走過整個狀態（約 480 KB），就地路徑遇非有限值時整組 state 歸零。
 - `descriptor_validate()` 拿 ONNX/JSON metadata 裡的 13 欄 `c_descriptor` 對本 build 的 ABI 逐欄比對，
-  只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 2。
+  只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 3（舊 layout 產生的 ONNX／JSON 與 calibration 資料須重新匯出，加速器程式須重編）。
 - D 範圍 `DEEPVQE_PREPOST_MIN_D`=1 到 `DEEPVQE_PREPOST_MAX_D`=256，出貨值
   `DEEPVQE_PREPOST_DEFAULT_D`=32（16 kHz 上的半秒搜尋範圍；D 是 export 期參數，圖 shape 與 C 傳入的 `delay_depth` 必須相同，descriptor 只檢查範圍，抓不到不一致）。
 - grid 只有 16 kHz/512/256：`aiaec_process.h` 帶 `#error` 守衛，grid 換掉是編譯失敗而不是默默重新解讀張量。

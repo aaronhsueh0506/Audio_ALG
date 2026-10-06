@@ -329,12 +329,75 @@ static void ref_roll(FftHandle *fft, float *history, const float *hop_in,
     }
 }
 
-static void interleave_ri(const float *re, const float *im, float *ri) {
+/* The model's compressed_ri_feature for one spectrum, bin by bin and in the
+ * same fp32 operations the class runs, planar [real plane, imaginary plane].
+ * case_compression checks the formula itself against double precision. */
+static void compress_ref(const float *re, const float *im, float *ri) {
     int bin;
     for (bin = 0; bin < AIAEC_N_BINS; ++bin) {
-        ri[2 * bin] = re[bin];
-        ri[2 * bin + 1] = im[bin];
+        const float mag = sqrtf(re[bin] * re[bin] + im[bin] * im[bin] + 1e-12f);
+        const float scale = powf(mag, DEEPVQE_COMPRESSION_EXP - 1.0f);
+        ri[bin] = re[bin] * scale;
+        ri[AIAEC_N_BINS + bin] = im[bin] * scale;
     }
+}
+
+/* ---- compression: the host front end vs double precision -------------- */
+
+static int case_compression(void) {
+    static float mic_re[AIAEC_N_BINS], mic_im[AIAEC_N_BINS];
+    static float far_re[AIAEC_N_BINS], far_im[AIAEC_N_BINS];
+    DeepVqePrepostConfig cfg;
+    DeepVqePrepostMemReq req;
+    DeepVqePrepostInputs inputs;
+    DeepVqePrepostOutputs outputs;
+    DeepVqePrepost *p;
+    void *pool;
+    int bin, stream;
+
+    /* Zero, denormal-scale, ordinary, negative and very large bins: the
+     * 1e-12 floor under the sqrt is what keeps a silent bin finite. */
+    for (bin = 0; bin < AIAEC_N_BINS; ++bin) {
+        const float sign = (bin % 3 == 0) ? -1.0f : 1.0f;
+        mic_re[bin] = sign * (float)bin * 0.37f;
+        mic_im[bin] = -sign * (float)(AIAEC_N_BINS - bin) * 0.011f;
+        far_re[bin] = (bin % 5 == 0) ? 0.0f : sign * 1e-7f * (float)bin;
+        far_im[bin] = (bin % 7 == 0) ? 0.0f : sign * 3000.0f / (float)(bin + 1);
+    }
+    mic_re[10] = mic_im[10] = 0.0f;
+    far_re[3] = 1.0e4f;
+
+    CHECK(deepvqe_prepost_config_defaults(&cfg, DEEPVQE_IO_FREQ, D) == 0);
+    CHECK(deepvqe_prepost_get_mem_size(&cfg, &req) == 0);
+    pool = alloc_aligned(req.alignment, (size_t)req.bytes);
+    CHECK(pool != NULL);
+    p = deepvqe_prepost_init(pool, (size_t)req.bytes, &cfg);
+    CHECK(p != NULL);
+    CHECK(deepvqe_prepost_pre_process_freq(p, mic_re, mic_im, far_re,
+                                           far_im) == 1);
+    CHECK(deepvqe_prepost_frame_inputs(p, &inputs, &outputs) == 0);
+    CHECK(inputs.spectrum_ri_elements == 2u * (size_t)AIAEC_N_BINS);
+
+    for (stream = 0; stream < 2; ++stream) {
+        const float *re = stream ? far_re : mic_re;
+        const float *im = stream ? far_im : mic_im;
+        const float *got = stream ? inputs.far : inputs.mic;
+        for (bin = 0; bin < AIAEC_N_BINS; ++bin) {
+            const double power = (double)re[bin] * (double)re[bin] +
+                                 (double)im[bin] * (double)im[bin] + 1e-12;
+            const double scale = pow(sqrt(power),
+                                     (double)DEEPVQE_COMPRESSION_EXP - 1.0);
+            const double want_re = (double)re[bin] * scale;
+            const double want_im = (double)im[bin] * scale;
+            CHECK(fabs((double)got[bin] - want_re) <=
+                  4e-6 * fabs(want_re) + 1e-30);
+            CHECK(fabs((double)got[AIAEC_N_BINS + bin] - want_im) <=
+                  4e-6 * fabs(want_im) + 1e-30);
+        }
+    }
+    deepvqe_prepost_destroy(p);
+    free(pool);
+    return 0;
 }
 
 /* ---- equiv: the class vs the hand-composed reference path ------------ */
@@ -381,8 +444,8 @@ static int case_equiv(FftHandle *fft) {
                  mic_re, mic_im);
         ref_roll(fft, hist_far, pcm_far + (size_t)hop * AIAEC_HOP,
                  far_re, far_im);
-        interleave_ri(mic_re, mic_im, mic_ri);
-        interleave_ri(far_re, far_im, far_ri);
+        compress_ref(mic_re, mic_im, mic_ri);
+        compress_ref(far_re, far_im, far_ri);
 
         memset(&inputs, 0, sizeof inputs);
         memset(&outputs, 0, sizeof outputs);
@@ -1914,6 +1977,8 @@ int main(int argc, char **argv) {
 
     if (strcmp(argv[1], "equiv") == 0)          status = case_equiv(fft);
     else if (strcmp(argv[1], "freq") == 0)      status = case_freq(fft);
+    else if (strcmp(argv[1], "compression") == 0)
+                                                status = case_compression();
     else if (strcmp(argv[1], "freqpool") == 0)  status = case_freqpool(fft);
     else if (strcmp(argv[1], "lifecycle") == 0) status = case_lifecycle(fft);
     else if (strcmp(argv[1], "reject") == 0)    status = case_reject(fft);
@@ -1995,6 +2060,26 @@ def test_time_mode_matches_the_hand_composed_path(driver):
     This is the gate that folding the composition into an object changed
     nothing at all."""
     assert 'io_mode=TIME' in _run(driver, 'equiv')
+
+
+def test_host_front_end_is_the_models_compression(driver):
+    """The planar tensors the class hands the graph are x * |x|^(e-1) with
+    |x| = sqrt(re^2 + im^2 + 1e-12), the model's compressed_ri_feature, for
+    zero, tiny, negative and large bins -- checked against double precision,
+    so the equivalence cases (which mirror the fp32 expression) cannot hide a
+    wrong formula."""
+    _run(driver, 'compression')
+
+
+def test_compression_exponent_matches_the_exporter():
+    from AIAEC._streaming_export import DEEPVQE_COMPRESSION_EXPONENT
+
+    with open(_PREPOST_HEADER, encoding='utf-8') as stream:
+        text = stream.read()
+    found = re.findall(r'^#define\s+DEEPVQE_COMPRESSION_EXP\s+([0-9.]+)f\s*$',
+                       text, re.MULTILINE)
+    assert len(found) == 1, found
+    assert float(found[0]) == DEEPVQE_COMPRESSION_EXPONENT
 
 
 def test_freq_mode_matches_time_mode(driver):

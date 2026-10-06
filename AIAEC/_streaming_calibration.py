@@ -75,6 +75,7 @@ from AIAEC._streaming_export import (
     GRU_STATE_LAYOUTS,
     GraphSplit,
     _build,
+    host_signal_inputs,
     export_graph,
     requires_contiguous_calibration,
     state_precision_policy,
@@ -278,10 +279,10 @@ def main(model_name: str) -> None:
         state_layout_version = None
 
         def make_signal(block):
-            return tuple(
+            return host_signal_inputs(args.model_name, model, tuple(
                 torch.from_numpy(block[name]).unsqueeze(0)
                 for name in signal_names
-            )
+            ))
 
         def advance_state(state, outputs):
             return tuple(outputs[split.head_outputs:])

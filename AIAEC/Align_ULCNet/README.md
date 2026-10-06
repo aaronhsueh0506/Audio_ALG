@@ -230,6 +230,10 @@ code owns every K/V, score-convolution and GRU tensor in caller-provided
 memory.  Align-ULCNet is a postfilter, so microphone PCM first enters the
 linear AEC; the learned graph consumes `linear_error`, not raw microphone.
 
+The exported graph carries each convolution's frequency-axis zero padding in the Conv
+`pads` attribute (`fuse_freq_pad_into_conv`), so no separate Pad op feeds a Conv; the
+temporal axis is never padded (its history is a tensor).
+
 ```mermaid
 flowchart LR
     subgraph CPU["CPU / DSP / external SRAM"]

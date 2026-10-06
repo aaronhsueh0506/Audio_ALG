@@ -75,7 +75,7 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 <tr><td>Align-CRUSE</td><td>mic + far + conv/GRU/alignment state</td>
 <td>real mask + next state</td><td><code>AIAEC/aiaec_process.c/h</code> 的共用 helper
 <b>而已，沒有 C 類別</b></td></tr>
-<tr><td>DeepVQE-S</td><td>mic + far(raw RI，壓縮在 graph 內) + 16 個顯式 state</td>
+<tr><td>DeepVQE-S</td><td>mic + far(host 壓縮後的 planar 頻譜 <code>[1,2,1,257]</code>，graph 自第一個 conv 起) + 16 個顯式 state</td>
 <td>3x3 complex CCM taps + <b>每個 state 的完整下一個值</b></td>
 <td><code>AIAEC/aiaec_process.c/h</code> + <code>DeepVQE_S/deepvqe_process.c/h</code>，
 外面包 <b><code>deepvqe_prepost.c/h</code> 類別</b></td></tr>
@@ -204,7 +204,8 @@ parity 測試各自只編其中一個。把類別塞進任一邊，就會在另�
 <code>fft_size</code>、<code>hop_size</code>、<code>spectrum_bins</code>、
 <code>time_order</code>、<code>freq_taps</code>、<code>conv_history_frames</code>、
 <code>score_history_frames</code>、<code>gru_layers</code>、<code>gru_hidden</code>、
-<code>state_tensor_count</code>），而且是<b>從剛建好的 graph 量出來</b>而不是手寫重述，
+<code>state_tensor_count</code>），而且是<b>從剛建好的 graph 量出來</b>而不是手寫重述
+（<code>layout_version</code> 目前為 3，signal input 是 host 壓縮後的 planar 頻譜），
 板端用 <code>deepvqe_prepost_descriptor_validate()</code> 比對。
 Align-CRUSE 與 CAGCRN 只有共用的 <code>aiaec_process.c</code> helper，沒有這一層。</p>
 

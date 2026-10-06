@@ -61,10 +61,16 @@ select `*_best.pth`.
 tests keep linking). The lifecycle and per-hop sequence shared by every
 class are described once, in `../README.md` ("C pre/post-processing").
 Specific to this one: the accelerator boundary is the exporter's exactly --
-raw RI `mic`/`far` in, packed CCM taps `[1,1,F,18]` out, and the sixteen
-explicit state tensors in `DeepVqeStateId` order. The last axis preserves
-`[time][frequency][RI]` row-major order, so C consumes it without a transpose
-or copy. The pool holds one host buffer per state tensor. The normal path is the
+power-law compressed `mic`/`far` in (planar `[1,2,1,F]`, real plane then
+imaginary plane), packed CCM taps `[1,1,F,18]` out, and the sixteen explicit
+state tensors in `DeepVqeStateId` order. The compression
+(`x * |x|^(0.3-1)`, `|x| = sqrt(re^2 + im^2 + 1e-12)`) runs on the host in
+`deepvqe_prepost_frame_inputs()`, so the graph starts at its first convolution;
+the class keeps the raw microphone spectrum separately for the CCM ring. The
+exponent is compiled into the host (`DEEPVQE_COMPRESSION_EXP`) and the
+exporter refuses a checkpoint whose `compression_exponent` differs. The taps'
+last axis preserves `[time][frequency][RI]` row-major order, so C consumes it
+without a transpose or copy. The pool holds one host buffer per state tensor. The normal path is the
 runtime's own output tensors (taps and sixteen state outputs, runtime-owned,
 nothing allocated here) followed by `deepvqe_prepost_outputs_inherit(dest,
 runtime)`: it finite-checks every tensor it would copy, copies none and returns
@@ -81,8 +87,9 @@ the state as the accelerator wrote it and FAILS CLOSED (mutes the frame):
 stream 0 is the raw microphone, so the pass-through identity a post-filter can
 take would emit the uncancelled echo here.
 
-The exporter writes `state_layout_version` (`DEEPVQE_PREPOST_LAYOUT_VERSION`)
-and a `c_descriptor` block measured from the built graph into the ONNX
+The exporter writes `state_layout_version` (`DEEPVQE_PREPOST_LAYOUT_VERSION`,
+currently 3; the exporter's `DEEPVQE_C_LAYOUT_VERSION` is the same number) and
+a `c_descriptor` block measured from the built graph into the ONNX
 metadata and the sidecar JSON; a board feeds that block to
 `deepvqe_prepost_descriptor_validate()` before binding. The class gate is
 `../tests/test_deepvqe_prepost_c.py`, which also pins the header, the exporter
@@ -100,4 +107,7 @@ python3 inference.py calib --checkpoint checkpoint.pth \
 
 Use `--format npz --output calib/deepvqe_s.npz` for a NumPy archive. BIN
 output contains one directory per graph input and one numbered file per
-streaming invocation.
+streaming invocation. The `mic`/`far` tensors it records are the host-compressed
+planar spectra the graph binds (layout version 3); an ONNX file, JSON sidecar
+or calibration set from an earlier layout must be regenerated and the
+accelerator program recompiled.

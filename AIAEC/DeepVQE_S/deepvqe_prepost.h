@@ -91,14 +91,20 @@ extern "C" {
 
 #define DEEPVQE_PREPOST_DESCRIPTOR_VERSION 1u
 
-/* The accelerator boundary this file binds: the two raw RI signal inputs,
+/* The accelerator boundary this file binds: the two compressed planar signal inputs,
  * the CCM-tap head output and the sixteen explicit state tensors emitted by
  * _streaming_export.py for DeepVQE_S. Unrelated to (and deliberately not
  * aliased from) ULCNET_MODEL_IO_LAYOUT_VERSION: the two models' boundaries
  * move independently, and a shared number would make one model's bump look
  * like the other's. Any rename, reshape, reorder or added/removed tensor at
  * the boundary bumps this. */
-#define DEEPVQE_PREPOST_LAYOUT_VERSION 2u
+#define DEEPVQE_PREPOST_LAYOUT_VERSION 3u
+
+/* The power-law exponent of the model's input compression
+ * (model.compression_exponent). prepare runs the compression on the host, so
+ * this is a deployment contract: _streaming_export.py refuses a checkpoint
+ * with any other value, and the Python suite pins the two together. */
+#define DEEPVQE_COMPRESSION_EXP 0.3f
 #define DEEPVQE_PREPOST_ALIGNMENT      16u
 /* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
  * so a pool recorded by the previous carve is refused on the hash, not only
@@ -235,15 +241,15 @@ _Static_assert(sizeof(DeepVqePrepostMemReq) == 32,
 
 typedef struct DeepVqePrepost DeepVqePrepost;
 
-/* Read-only views the accelerator binds. `mic`/`far` are the RAW RI spectra
- * interleaved [bin][re,im] -- DeepVQE-S applies its own power-law
- * compression INSIDE the graph, unlike Align-ULCNet whose front end was
- * moved to the host. Nothing is compressed, scaled or masked here.
+/* Read-only views the accelerator binds. `mic`/`far` are the power-law
+ * COMPRESSED spectra, planar [1,2,1,BINS]: the real plane, then the
+ * imaginary plane (layout version 3; the graph starts at its first
+ * convolution). The raw mic spectrum the CCM convolves is kept separately.
  * `state[]`/`state_elements[]` are indexed by DeepVqeStateId. Pointers are
  * into the instance's pool and stay valid for the life of the instance. */
 typedef struct DeepVqePrepostInputs {
-    const float *mic;                            /* [1,1,BINS,2] */
-    const float *far;                            /* [1,1,BINS,2] */
+    const float *mic;                            /* [1,2,1,BINS] */
+    const float *far;                            /* [1,2,1,BINS] */
     size_t       spectrum_ri_elements;           /* 2 * BINS     */
     const float *state[DEEPVQE_STATE_COUNT];
     size_t       state_elements[DEEPVQE_STATE_COUNT];

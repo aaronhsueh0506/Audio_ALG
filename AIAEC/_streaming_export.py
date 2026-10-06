@@ -99,6 +99,62 @@ def set_onnx_metadata(graph, metadata):
     })
 
 
+def fuse_freq_pad_into_conv(model):
+    """Fold an explicit zero Pad that feeds exactly one Conv into the Conv's
+    own ``pads`` attribute, so the padding costs no accelerator op.
+
+    The graphs pad the frequency axis explicitly (the temporal axis carries
+    its history as a tensor and is never padded). A zero Pad followed by an
+    unpadded Conv and the same Conv with ``pads`` are the same arithmetic.
+    Only constant-mode, zero-valued, non-negative frequency pads with static
+    amounts qualify; anything else is left as it is. Returns the number of
+    Pad nodes removed.
+    """
+    from onnx import helper, numpy_helper
+
+    graph = model.graph
+    initializers = {item.name: item for item in graph.initializer}
+    consumers = {}
+    for node in graph.node:
+        for name in node.input:
+            consumers.setdefault(name, []).append(node)
+    graph_outputs = {value.name for value in graph.output}
+    removed = 0
+    for pad in list(graph.node):
+        if (pad.op_type != 'Pad' or pad.output[0] in graph_outputs
+                or len(pad.input) < 2 or pad.input[1] not in initializers
+                or (len(pad.input) > 2 and pad.input[2])):
+            continue
+        mode = next((helper.get_attribute_value(a) for a in pad.attribute
+                     if a.name == 'mode'), b'constant')
+        amounts = numpy_helper.to_array(initializers[pad.input[1]]).tolist()
+        # [N, C, T, F] begins then ends: only frequency may be padded.
+        if (mode != b'constant' or len(amounts) != 8 or min(amounts) < 0
+                or any(amounts[i] for i in (0, 1, 2, 4, 5, 6))):
+            continue
+        users = consumers.get(pad.output[0], [])
+        if (len(users) != 1 or users[0].op_type != 'Conv'
+                or users[0].input[0] != pad.output[0]):
+            continue
+        conv = users[0]
+        existing = {a.name: helper.get_attribute_value(a)
+                    for a in conv.attribute}
+        if (existing.get('auto_pad', b'NOTSET') not in (b'NOTSET', b'')
+                or any(existing.get('pads', (0, 0, 0, 0)))):
+            continue
+        conv.input[0] = pad.input[0]
+        kept = [a for a in conv.attribute if a.name != 'pads']
+        del conv.attribute[:]
+        conv.attribute.extend(kept)
+        conv.attribute.append(
+            helper.make_attribute('pads', [0, amounts[3], 0, amounts[7]]))
+        graph.node.remove(pad)
+        if len(consumers.get(pad.input[1], [])) == 1:
+            graph.initializer.remove(initializers[pad.input[1]])
+        removed += 1
+    return removed
+
+
 def optimize_graph_file(path):
     """onnxoptimizer cleanup: drop the tracer's Identity/Constant/dead-end
     noise so the deployed graph carries only real ops. Skipped when the
@@ -148,6 +204,9 @@ def optimize_graph_file(path):
     os.replace(folded, path)
     graph = onnx.load(path)
     print('[ort-fold] -> %d nodes' % len(graph.graph.node))
+    if fuse_freq_pad_into_conv(graph):
+        onnx.save(graph, path)
+        print('[pad-fuse] -> %d nodes' % len(graph.graph.node))
 
 
 def _pin_static_output_shapes(graph, output_names, outputs):
@@ -220,7 +279,12 @@ _CONTROL_SEMANTICS = {
     'DeepVQE_S': 'complex_ccm_taps_host_applies_spectrum_ring',
     'CAGCRN': 'complex_mask_for_microphone_spectrum',
 }
-DEEPVQE_C_LAYOUT_VERSION = 2
+# 3: the graph's `mic`/`far` inputs are the host-compressed [1,2,1,F] planar
+# spectra (see host_signal_inputs), no longer raw [1,1,F,2] RI.
+DEEPVQE_C_LAYOUT_VERSION = 3
+# The host compresses the inputs with this exponent (C:
+# DEEPVQE_COMPRESSION_EXP); a checkpoint trained with another is refused.
+DEEPVQE_COMPRESSION_EXPONENT = 0.3
 
 
 def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
@@ -569,6 +633,8 @@ class StatelessOneFrameAIAEC(nn.Module):
 
     def forward(self, primary_ri: Tensor, far_end_ri: Tensor,
                 *state_tensors: Tensor):
+        # DeepVQE_S takes the two signal inputs already compressed
+        # (host_signal_inputs); the other models take raw RI.
         if len(state_tensors) != len(self._state_names):
             raise ValueError('wrong number of explicit stream-state tensors')
         for slot, value in zip(self.slots, self._expand_state(state_tensors)):
@@ -620,13 +686,9 @@ class StatelessOneFrameAIAEC(nn.Module):
     def _deepvqe(self, primary: Tensor, far: Tensor) -> Tensor:
         model = self.model
         state = self.stream_state
-        m1 = state['mic1'].step(_compressed_ri(
-            primary, model.compression_exponent
-        ))
+        m1 = state['mic1'].step(primary)
         m2 = state['mic2'].step(m1)
-        f1 = state['far1'].step(_compressed_ri(
-            far, model.compression_exponent
-        ))
+        f1 = state['far1'].step(far)
         f2 = state['far2'].step(f1)
         aligned, _delay = state['align'].step(m2, f2)
         m3 = state['mic3'].step(torch.cat((m2, aligned), dim=1))
@@ -739,11 +801,33 @@ class GraphSplit(NamedTuple):
     head_outputs: int
 
 
+def host_signal_inputs(model_name: str, model, signals):
+    """The graph's signal inputs for one frame, from RAW RI spectra
+    ``[1,1,F,2]``.
+
+    DeepVQE_S's power-law compression runs on the host (C:
+    deepvqe_prepost_frame_inputs), so its graph starts at the first
+    convolution and binds ``[1,2,1,F]`` planar tensors (real plane, then
+    imaginary plane). The other models bind the raw spectra unchanged.
+    """
+    if model_name == 'DeepVQE_S':
+        return tuple(_compressed_ri(signal, model.compression_exponent)
+                     for signal in signals)
+    return tuple(signals)
+
+
 def _build(model_name: str, model,
            gru_state_layout: str = DEFAULT_GRU_STATE_LAYOUT):
+    if (model_name == 'DeepVQE_S'
+            and model.compression_exponent != DEEPVQE_COMPRESSION_EXPONENT):
+        raise ValueError(
+            'DeepVQE_S host front end is compiled for compression exponent '
+            '%r, checkpoint has %r'
+            % (DEEPVQE_COMPRESSION_EXPONENT, model.compression_exponent))
     wrapper = StatelessOneFrameAIAEC(
         model_name, model, gru_state_layout=gru_state_layout).eval()
-    shape = (1, 1, model.grid.n_freqs, 2)
+    shape = ((1, 2, 1, model.grid.n_freqs) if model_name == 'DeepVQE_S'
+             else (1, 1, model.grid.n_freqs, 2))
     inputs = (torch.randn(shape), torch.randn(shape)) + wrapper.initial_state()
     input_names = ('mic', 'far') + wrapper.state_names
     output_names = ('output',) + tuple(
