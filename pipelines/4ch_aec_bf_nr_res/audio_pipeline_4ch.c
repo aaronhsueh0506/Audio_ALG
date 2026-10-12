@@ -238,8 +238,7 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
  * own build_flags_hash, so a change to the core's CARVE TOKEN propagates
  * here. A core LAYOUT VERSION bump does not: the core's hash is taken over
  * its backend string, carve token and alignment only, so a control-block-only
- * growth leaves it -- and therefore this hash -- unchanged. Verified: the core
- * went 12 -> 13 with this hash unmoved. Only bumping
+ * growth leaves it -- and therefore this hash -- unchanged. Only bumping
  * AUDIO_PIPELINE_4CH_LAYOUT_VERSION by hand invalidates a persisted composite
  * descriptor -- see AudioPipeline4ChMemReq's doc comment, which states this
  * correctly. */
@@ -260,9 +259,9 @@ static uint32_t audio_pipeline_4ch_build_flags_hash(
  *
  * Fill formulas copied verbatim from third_party/doa/steering.c's
  * array_geometry_create_uca/_ula/_custom() so a stack-local ArrayGeometry
- * here produces bit-identical x/y coordinates to what the old heap path's
- * malloc-based geometry produced -- calling that malloc-based helper (even
- * though it was freed immediately after use) would otherwise be a hidden
+ * here produces bit-identical x/y coordinates to what the malloc-based
+ * geometry helper produces -- calling that helper (even though its result
+ * would be freed immediately after use) would otherwise be a hidden
  * allocation inside what is supposed to be a zero-allocator init_ex() path.
  * M is kept as a local int matching the originals' own locals, so the
  * float/double promotion sequence in the UCA phi expression stays identical.
@@ -332,10 +331,9 @@ static int fill_stack_geometry(
 /*
  * Builds srp_cfg/gsc_cfg from cfg plus the core's own already-derived
  * hop/fft/n_freqs -- mirrors 4aec_nr_res.c's derive_dims_and_configs()'s role
- * of "compute once, reuse in both sizing and init". Extracted from what used
- * to be audio_pipeline_4ch_create()'s inline SRP_Config/GSC_Config
- * construction so audio_pipeline_4ch_get_mem_requirements() and
- * audio_pipeline_4ch_init_ex() can never silently diverge on this logic.
+ * of "compute once, reuse in both sizing and init", so
+ * audio_pipeline_4ch_get_mem_requirements() and audio_pipeline_4ch_init_ex()
+ * can never silently diverge on this logic.
  */
 static int derive_spatial_configs(
     const AudioPipeline4ChConfig* cfg,
@@ -368,9 +366,9 @@ static int derive_spatial_configs(
      * Derive that SAME effective value here, once, and feed it into both the
      * lambda retime scaling below and gsc_cfg->adapt_interval, so the
      * cadence lambda is calibrated for and the cadence GSC actually runs at
-     * can never silently diverge (a prior bug scaled lambda by the raw
-     * pre-forced gsc_adapt_interval while gsc_create() silently forced the
-     * real cadence to 1). */
+     * can never silently diverge (scaling lambda by the raw pre-forced
+     * gsc_adapt_interval while gsc_create() forces the real cadence to 1
+     * would mis-calibrate it). */
     gsc_effective_interval = gsc_effective_adapt_interval(
         cfg->gsc_fixed_mode, cfg->gsc_fixed_align_notebook,
         cfg->gsc_adapt_interval);
@@ -593,7 +591,7 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     p->srp = srp_init(srp_region, srp_bytes, &srp_cfg, &geom);
     if (!p->srp) return NULL;
     /* Same borrow relationship as the heap path: GSC never owns/frees
-     * a_array. It now points into pool memory with a lifetime tied to p
+     * a_array. It points into pool memory with a lifetime tied to p
      * itself, rather than to a separately heap-managed SRP. */
     p->gsc_steering = p->srp->a_array;
     if (!p->gsc_steering) return NULL;
@@ -651,13 +649,12 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
     p->fft_size = fft;
     p->n_freqs = n_freqs;
 
-    /* auto_vad_hangover_frames + the speech/silence noise-EMA pairs were raw
-     * literals (8 frames; 0.999/0.001; 0.95/0.05) applied regardless of grid
-     * -- same class of bug as gsc_lambda in derive_spatial_configs(), fixed
-     * the same way. The EMA pairs are retention/new-weight complements
-     * (old_weight + new_weight == 1 by construction); retime the retention
-     * factor and derive new_weight from it so that invariant still holds
-     * post-retime. */
+    /* auto_vad_hangover_frames + the speech/silence noise-EMA pairs are
+     * authored literals (8 frames; 0.999/0.001; 0.95/0.05) and are retimed to
+     * the actual grid, as gsc_lambda is in derive_spatial_configs(). The EMA pairs
+     * are retention/new-weight complements (old_weight + new_weight == 1 by
+     * construction); retime the retention factor and derive new_weight from
+     * it so that invariant still holds post-retime. */
     p->vad_hangover_frames = anr_retime_frames(
         cfg_copy.auto_vad_hangover_frames, cfg_copy.core.sample_rate, hop);
     p->vad_speech_noise_keep = anr_retime_alpha(

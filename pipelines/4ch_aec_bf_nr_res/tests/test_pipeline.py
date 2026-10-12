@@ -262,7 +262,7 @@ def test_48k_wrapper_feeds_inner_estimator_raw_native_rate_hops(monkeypatch):
     estimator.accumulate(x0, x0)
     estimator.accumulate(x1, x1)
     joined = np.concatenate([pair[0] for pair in seen])
-    # No decimation at this wrapper layer any more: every raw 48kHz sample
+    # No decimation at this wrapper layer: every raw 48kHz sample
     # reaches the inner estimator unchanged.
     np.testing.assert_array_equal(joined, np.arange(0, 1024, dtype=np.float32))
 
@@ -353,7 +353,7 @@ def test_pre_frame_cannot_resume_on_a_different_pipeline_instance():
 
 # ---------------------------------------------------------------------------
 # An admitted shared-delay change REALIGNS the four lanes; it does not reset
-# them.  A reset per lane -- what this used to be -- wipes four converged
+# them.  A reset per lane would wipe four converged
 # filters and restarts four WOLA sequences on one hop: the echo comes back for
 # dozens of hops and the output drops a near-silent one.  See
 # lib/aec ``AEC.apply_external_realign`` and its test_external_realign.py.

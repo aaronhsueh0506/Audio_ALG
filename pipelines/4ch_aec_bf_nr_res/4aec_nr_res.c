@@ -53,7 +53,7 @@
  *
  * The watchdog's LEAK does carry one, and is the only number here that is not
  * used as written. It is lib/aec's literal, and lib/aec calibrated it on the
- * 10 ms hop its config defaulted to when the watchdog was written: 0.001 dB
+ * 10 ms hop its config defaults to: 0.001 dB
  * per hop there means 0.1 dB per SECOND, i.e. 60 s to leak the whole
  * DUTY_ERLE_COLLAPSE_DB threshold. Applied as a per-hop literal it would be
  * 0.125 dB/s on this pipeline's 8 ms grid and 0.0625 dB/s on its 16 ms one --
@@ -208,7 +208,7 @@ struct FourAecNrRes {
      * record itself rather than eight private twins, so the accessor is one
      * assignment and a new stage cannot be added to one side only. Appended
      * at the end, the same precedent as aec.h's Aec additions: every field
-     * above keeps its pre-existing offset. */
+     * above keeps its offset. */
     FourAecNrResLastTiming last_timing;
 
     /* This hop's answer to "did all four lanes consume ONE far spectrum",
@@ -344,7 +344,7 @@ static int derive_dims_and_configs(
      * re-decides an alignment, so they are simply inert. The window is
      * range-checked (and NaN-rejected) even while the enable is 0: a config
      * that would misbehave the moment someone flips one field must not pass
-     * validation today. */
+     * validation. */
     if (cfg->delay_backward_quarantine_enabled != 0 &&
         cfg->delay_backward_quarantine_enabled != 1) return 0;
     if (!isfinite(cfg->delay_backward_quarantine_s) ||
@@ -884,7 +884,7 @@ static FourAecNrResDelayState update_shared_delay(
     }
 
     /* Raw, un-decimated hops: delay_aec3_init() constructed p->shared_delay
-     * at this pipeline's real native sample_rate, so DelayAec3 itself now
+     * at this pipeline's real native sample_rate, so DelayAec3 itself
      * anti-alias-filters + decimates internally at 48kHz (see delay_aec3.c's
      * DaResample48) and delay_aec3_estimated_delay() below returns the
      * result already rescaled back to this pipeline's native domain. */
@@ -1038,7 +1038,7 @@ static FourAecNrResDelayState update_shared_delay(
      *     disturb four converged filters at all. DelayAec3 publishes on a
      *     16-downsampled-sample grid -- 64 native samples at 16 kHz, 192 at
      *     48 kHz, since its answer is a block index shifted left -- so
-     *     against today's estimator this term is the floor under a finer
+     *     with this estimator this term is the floor under a finer
      *     source rather than an active filter.
      *   - the held candidate is the operative half: a value that is not
      *     offered again before it ages out never reaches the lanes.
@@ -1259,11 +1259,11 @@ int four_aec_front_process(
         /* Realign instead of reset: aec_apply_external_realign() shifts each
          * converged filter by the alignment delta (warm tap-transfer when the
          * evidence gate holds, a filter-only reset otherwise), so the
-         * cancellation survives and the WOLA sequences continue. The old full
-         * aec_reset() + OLA wipe produced one near-zero output hop plus
-         * dozens of hops of re-exposed echo -- the spectrogram vertical line
-         * (regression: lib/aec test_external_realign.c and
-         * tests/test_4aec_nr_res.c's realign continuity rows). */
+         * cancellation survives and the WOLA sequences continue. A full
+         * aec_reset() + OLA wipe would produce one near-zero output hop plus
+         * dozens of hops of re-exposed echo (covered by lib/aec
+         * test_external_realign.c and tests/test_4aec_nr_res.c's realign
+         * continuity rows). */
         for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
             int outcome = aec_apply_external_realign(
                 p->lanes[ch], delay.delay_samples - old_align);
@@ -1338,7 +1338,7 @@ int four_aec_front_process(
             aec_get_last_timing(p->lanes[ch], &lane_time);
             /* Lane-internal delay work folds into the same delay_us the
              * shared estimator reports, because it is the same quantity:
-             * time spent aligning the far end. It is structurally ZERO today
+             * time spent aligning the far end. It is structurally ZERO
              * -- every lane is built AEC_DELAY_EXTERNAL_ALIGNED, so no lane
              * owns a ring or an estimator -- and is summed anyway so that a
              * future lane-mode change cannot silently drop its cost out of
@@ -1453,8 +1453,8 @@ static int fuse_contexts(FourAecNrRes* p,
          * so it must not vote on the three scalars that steer the post stage
          * either -- those govern a spectrum this lane is absent from. The
          * degenerate case is real: with the external beamformer disabled the
-         * bypass emits identity weights [1,0,0,0], and lanes 1-3 were still
-         * driving max_dt, which selects the residual suppressor's floor.
+         * bypass emits identity weights [1,0,0,0], and lanes 1-3 would still
+         * drive max_dt, which selects the residual suppressor's floor.
          *
          * With a beamformer that actually beamforms, every lane carries
          * weight somewhere and this skips nothing: the reductions see the
@@ -1605,8 +1605,8 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
     /* A reset abandons the alignment the quarantine was protecting, so a
      * countdown armed against it must not survive. The WINDOW
      * (delay_quarantine_hops) is config-derived and stays. Same for a held
-     * change candidate and the life left on it: it was a movement away from
-     * an alignment that no longer exists, and the next acquisition is
+     * change candidate and the life left on it: it describes a movement away
+     * from an alignment the reset abandoned, and the next acquisition is
      * immediate anyway. */
     p->delay_quarantine_left = -1;
     p->delay_admission.candidate = 0;

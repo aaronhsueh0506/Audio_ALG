@@ -3,7 +3,7 @@
  * projection.
  *
  * Keep these kernels local to the four-channel integration layer: unlike the
- * AEC filter's fmaf-based complex MAC, projection historically uses separate
+ * AEC filter's fmaf-based complex MAC, projection uses separate
  * multiply/subtract/add operations under -ffp-contract=off.  The NEON path
  * deliberately preserves that operation sequence so SIMD=1 and SIMD=0 stay
  * byte-identical for finite inputs.
@@ -101,7 +101,7 @@ static inline void four_aec_complex_mag2(
  * without atan2/sincos EXCEPT on the phase floor, which only this side has:
  * for 0 < |echo|^2 <= phase_floor2 (the mic-path HPF routinely puts the DC
  * bin there) C pins the result to the +real axis while Python follows
- * np.angle. That divergence predates the range handling below.
+ * np.angle. That divergence is independent of the range handling below.
  *
  * There is deliberately no fixed upper bound on `scale`. r2 arrives
  * int16^2-scaled (aec.h) while echo_spec is audio-scaled, so

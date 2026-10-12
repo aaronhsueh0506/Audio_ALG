@@ -477,9 +477,9 @@ $(BIN_DIR)/test_4aec_dfn_res: $(OBJ_DIR)/test_4aec_dfn_res.o $(DFN_PIPELINE_LIB)
 $(BIN_DIR)/dump_delay_parity: $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/dump_delay_parity.o $(PIPELINE_LIB) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDLIBS)
 
-# The spatial dependencies test themselves now: their sources, their
-# GSC_TESTING build and their deployable-archive audit all live in
-# third_party/, so this directory only has to invoke them.
+# The spatial dependencies test themselves: their sources, their GSC_TESTING
+# build and their deployable-archive audit all live in third_party/, so this
+# directory only has to invoke them.
 test-third-party: FORCE
 	+$(MAKE) -C $(THIRD_PARTY_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) test
 

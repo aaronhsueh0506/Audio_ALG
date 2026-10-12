@@ -93,25 +93,22 @@ _DELAY_HEADROOM = 32              # native samples at _SAMPLE_RATE
 _RELOCK_SCENE = dict(mode="matched", delay=64, fft=512, hops=200,
                      shift_at=60, shift_delay=3000)
 
-# The scene that USED to be the pre-echo mis-lock: a true bulk delay of 6400
-# where the estimator acquired correctly and then re-locked 1600 samples
-# (100 ms) EARLY and held that answer to the end. It is kept, inverted, as the
-# end-to-end guard that the fix at the selection seam -- lib/aec's aggregator
-# reports the dominant peak and never the pre-echo candidate -- still holds
-# through this pipeline's own acquisition and admission rules, which an
-# aggregator-level test cannot see. Asserted with the quarantine OFF, the
+# The pre-echo mis-lock scene: a true bulk delay of 6400 where the estimator
+# must acquire correctly and must not re-lock 1600 samples (100 ms) EARLY. It
+# is the end-to-end guard that lib/aec's aggregator reports the dominant peak
+# and never the pre-echo candidate, through this pipeline's own acquisition
+# and admission rules, which an aggregator-level test cannot see. Asserted with the quarantine OFF, the
 # shipped default, so the subject is the estimator and not the guard.
 _MISLOCK_SCENE = dict(mode="matched", delay=6400, fft=512, hops=260)
 _MISLOCK_PRE_ECHO_DELAY = 4800    # 6400 - 1600: the answer that must not return
 
-# The backward MOVE, which is the only scene left that offers the quarantine a
-# backward candidate at all: the echo path jumps from 3000 samples to 64 at
+# The backward MOVE, the scene that offers the quarantine a backward
+# candidate: the echo path jumps from 3000 samples to 64 at
 # hop 375, so the shared estimate moves EARLIER and the direction test fires.
 # Measured, both sides: acquisition hop 29, unguarded adoption hop 444, and --
 # with the guard on -- release by the EXPIRY while the old alignment is still
 # cancelling, or by that cancellation collapsing at hop 482 for any window
-# that outlasts it. Both release paths on one scene, which the pre-echo
-# fixture could only show one of.
+# that outlasts it. Both release paths are shown on one scene.
 _BACKWARD_SCENE = dict(mode="matched", delay=3000, fft=512, hops=560,
                        shift_at=375, shift_delay=64)
 _BACKWARD_UNHELD_HOP = 444
@@ -513,13 +510,9 @@ def test_an_acquisition_at_applied_delay_zero_still_sets_changed():
     and a value-only comparison (``estimated != accepted_delay`` with
     ``accepted_delay`` starting at 0) drops exactly that case in silence.
 
-    Scripted rather than driven from a scene, and that demotion is itself part
-    of the contract this file tracks. It used to be _RELOCK_SCENE's own first
-    event, because the aggregator reported the pre-echo candidate and on a
-    64-sample path that candidate fell below the estimator's headroom and
-    clamped to 0. The dominant peak sits on the echo itself, so reaching an
-    applied delay of 0 now takes a bulk delay no larger than _DELAY_HEADROOM
-    -- and measured on this harness, bulk delays of 0, 16 and 32 samples
+    Scripted rather than driven from a scene: the dominant peak sits on the
+    echo itself, so reaching an applied delay of 0 takes a bulk delay no
+    larger than _DELAY_HEADROOM -- and measured on this harness, bulk delays of 0, 16 and 32 samples
     produce no estimate at all while 40 upwards produce one. Applied delay 0
     is therefore not reachable from any scene this harness can build, and the
     wrapper's acceptance rule is the only thing left that can be asked.
@@ -532,15 +525,15 @@ def test_an_acquisition_at_applied_delay_zero_still_sets_changed():
 
 
 def test_the_pre_echo_mislock_scene_no_longer_mislocks(dumper):
-    """The scene this file's quarantine rows used to be built on, inverted.
+    """The pre-echo mis-lock scene must not mis-lock.
 
-    A true bulk delay of 6400 samples used to be acquired correctly and then
-    re-locked to 4800 -- exactly 1600 samples (100 ms) EARLY -- and held
-    there, and no consecutive-confirmation rule could reject it because the
-    aggregator qualified the estimate with the DOMINANT peak's histogram and
-    then reported the PRE-ECHO candidate: the wrong answer carried confidence
-    1.0 by construction. That is fixed at the selection seam in lib/aec, which
-    has its own aggregator-level coverage.
+    A true bulk delay of 6400 samples must be acquired correctly and stay
+    there. Re-locking to 4800 -- exactly 1600 samples (100 ms) EARLY -- is what
+    an aggregator that qualified the estimate with the DOMINANT peak's
+    histogram but reported the PRE-ECHO candidate would produce, with
+    confidence 1.0 by construction, and no consecutive-confirmation rule could
+    reject it. The selection seam in lib/aec has its own aggregator-level
+    coverage.
 
     What this row adds is the end-to-end half: the aggregator test cannot see
     this pipeline's acquisition gate, two-step admission or shared ring, so a
@@ -573,12 +566,9 @@ def test_backward_quarantine_holds_a_backward_move_and_matches_c_per_hop(dumper)
 
     The scene is a backward MOVE: the echo path jumps from 3000 samples to 64
     at hop 375, so the shared estimate moves EARLIER and the direction test
-    fires. It replaces the pre-echo mis-lock fixture, which was this
-    mechanism's original subject and is now cured at the estimator (see the
-    row above) -- a guard whose only engaging scene was a defect has no
-    coverage once the defect is gone. A real echo-path change is a better
-    subject anyway: the guard was always about how long to withhold a
-    backward estimate, never about whether that estimate was wrong.
+    fires. A real echo-path change is the subject: the guard is about how
+    long to withhold a backward estimate, not about whether that estimate is
+    wrong.
 
     What is asserted, and deliberately NOT asserted: adoption is DELAYED, not
     prevented, and there are two ways it is released. Sweeping the window is
@@ -692,9 +682,8 @@ def test_only_the_capture_proxy_lane_gates_the_quarantine(dumper):
 
     The shared estimator is fed from ``capture_proxy_channel``, so that lane
     is the only one whose cancellation is evidence about the estimate being
-    judged. Reading ANY lane instead is what the previous version did, and it
-    let one microphone's surviving old reflection veto the shared update for
-    the whole array.
+    judged. Reading ANY lane instead would let one microphone's surviving old
+    reflection veto the shared update for the whole array.
 
     Every scene above hands all four microphones identical audio, which makes
     the two rules indistinguishable -- so this one does not: the backward-move

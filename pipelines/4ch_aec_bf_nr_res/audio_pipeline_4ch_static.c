@@ -5,7 +5,7 @@
  * Thin host reference over audio_pipeline_4ch.h. Follows the same
  * query -> allocate -> init_ex -> process -> destroy -> release sequence as
  * 4aec_nr_res_static.c (the core-only demo) and pipelines/
- * aec_nr_pipeline_static.c (the mono demo), but drives the COMPLETE wrapper
+ * mono_aec_nr_res/static_main.c (the mono demo), but drives the COMPLETE wrapper
  * -- the real SRP-PHAT DOA + GSC beamformer run inside this process, not an
  * externally-supplied fixed-weight stand-in. This is the full end-to-end
  * static-memory smoke reference; audio_pipeline_4ch_raw.c (the

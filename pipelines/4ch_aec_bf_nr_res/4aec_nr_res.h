@@ -97,8 +97,7 @@ extern "C" {
  * over AecConfig/AnrConfig tunable values; reserved = always 0, VALIDATED
  * not assumed, because `expected` may originate from persisted/transmitted
  * bytes) -- see that header's own doc comment for the full rationale
- * (four problems the old size_t/pointer/strcmp shape had that this fixed
- * layout fixes) rather than repeating it here.
+ * rather than repeating it here.
  */
 typedef struct FourAecNrResMemReq {
     uint32_t descriptor_version;
@@ -164,8 +163,8 @@ typedef struct FourAecNrResConfig {
      * never re-decide an alignment, so there is nothing to quarantine.
      *
      * Same mechanism as lib/aec's own delay_backward_quarantine_* (see
-     * aec.h for the full derivation, the measured pre-echo scene, and the
-     * unbounded-veto defect this replaced), applied to the SHARED estimate:
+     * aec.h for the full derivation and the measured pre-echo scene),
+     * applied to the SHARED estimate:
      * a shared estimate strictly EARLIER than the accepted delay is held for
      * delay_backward_quarantine_s worth of hops while the estimator's own
      * capture lane still cancels at the applied alignment, and is ADOPTED at
@@ -358,12 +357,9 @@ FourAecNrRes* four_aec_nr_res_init(
  *
  * Only once all eight hold does this proceed exactly as
  * four_aec_nr_res_init() would. Returns NULL on the first failing check
- * (no diagnostic is printed today -- unlike the mono pipeline's
- * AP_LOG_ERR()-per-field messages, this module currently returns NULL
- * silently on every rejection path, mono or four-channel; it links no stdio
- * symbols as a result. Naming the failed field on stderr, gated the same
- * NO_STDIO-safe way audio_pipeline.c does, is a reasonable follow-up but is
- * not implemented here yet).
+ * (no diagnostic is printed -- unlike the mono pipeline's
+ * AP_LOG_ERR()-per-field messages, this module returns NULL silently on
+ * every rejection path, mono or four-channel; it links no stdio symbols).
  */
 FourAecNrRes* four_aec_nr_res_init_ex(
     void* mem,

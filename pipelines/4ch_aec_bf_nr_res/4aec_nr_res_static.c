@@ -227,7 +227,7 @@ int main(int argc, char* argv[]) {
     if (print_mem_budget(&cfg) != 0) return 1;
 
     /* Query -> allocate -> init: same caller-pool sequence as the mono
-     * aec_nr_pipeline_static.c. malloc is a host stand-in for the board
+     * static_main.c. malloc is a host stand-in for the board
      * memory manager; the pipeline owns none of this memory. */
     FourAecNrResMemReq req;
     FourAecNrResMemBreakdown bd;

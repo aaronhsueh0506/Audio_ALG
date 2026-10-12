@@ -125,7 +125,7 @@ static int run_grid(int sample_rate, int fft_size) {
     return 1;
 }
 
-/* Regression test: in fixed-notebook mode
+/* Contract test: in fixed-notebook mode
  * (gsc_fixed_mode && gsc_fixed_align_notebook), gsc_create() forces the
  * actual GSC RLS update cadence to 1 hop regardless of the configured
  * gsc_adapt_interval -- kept for baseline-matching against the reference
@@ -163,16 +163,15 @@ static int test_gsc_fixed_notebook_lambda_matches_forced_cadence(void) {
 
     /* Lambda must be retimed assuming that SAME forced interval (1), i.e.
      * exactly anr_retime_alpha(gsc_lambda, sr, hop_size*1) -- not
-     * hop_size*4, which is what the pre-fix code effectively assumed by
-     * scaling with the raw pre-forced gsc_adapt_interval. */
+     * hop_size*4, which scaling with the raw pre-forced gsc_adapt_interval
+     * would give. */
     expected_lambda = anr_retime_alpha(
         cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 1);
     CHECK(fabsf(actual_lambda - expected_lambda) < 1e-9f,
           "lambda retime uses the forced (not the requested) adapt_interval");
 
-    /* Sanity check that this test would actually have caught the original
-     * bug: the mis-scaled lambda (computed against the pre-forced interval
-     * of 4) must visibly differ from the correct one. */
+    /* Sanity check that this test can fail: the lambda scaled against the
+     * pre-forced interval of 4 must visibly differ from the correct one. */
     buggy_lambda = anr_retime_alpha(
         cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 4);
     CHECK(fabsf(actual_lambda - buggy_lambda) > 1e-4f,
@@ -214,14 +213,12 @@ static int test_gsc_auto_mode_respects_configured_interval(void) {
 }
 
 /*
- * Regression for a release-correctness bug: audio_pipeline_4ch_process()
- * used to call auto_vad() -- which unconditionally folds its input into the
- * noise_power EMA -- before validating far_reference/output for NULL, and
- * auto_vad() itself had no isfinite guard, so a NaN-poisoned mic buffer left
- * noise_power permanently NaN even though the frame was later rejected deep
- * in the pipeline. Once noise_power is NaN, `power >= noise_power * ratio`
- * is false for every future frame (any comparison against NaN is false),
- * silently disabling VAD forever. Proven here by running two identically-fed
+ * audio_pipeline_4ch_process() must reject a bad call before auto_vad() --
+ * which unconditionally folds its input into the noise_power EMA -- can see
+ * it: NULL far_reference/output and non-finite input must not reach the VAD
+ * state. A NaN noise_power would make `power >= noise_power * ratio` false
+ * for every future frame (any comparison against NaN is false), silently
+ * disabling VAD forever. Checked here by running two identically-fed
  * pipeline instances side by side: only one ("attacked") also receives a
  * batch of calls that must be rejected (NULL far_reference, NULL output, a
  * NaN mic buffer); if any of those leaks into VAD state, "attacked" diverges
@@ -282,10 +279,9 @@ static int test_rejected_calls_preserve_vad_state(void) {
 
     /* One loud frame on BOTH instances arms vad_hangover to the same
      * nonzero value on each -- a quiet warm-up alone never exercises the
-     * `if (speech) p->vad_hangover -= 1;` branch a prior version of the
-     * non-finite guard used to still execute (hangover stays 0 the whole
-     * time otherwise, so `speech` there is always false and that line never
-     * runs -- exactly why that regression shipped unnoticed). */
+     * `if (speech) p->vad_hangover -= 1;` branch a leaking rejected call
+     * would still execute (hangover stays 0 the whole time otherwise, so
+     * `speech` there is always false and that line never runs). */
     for (int i = 0; i < hop; ++i) {
         float v = 0.05f * sinf(phase);
         far[i] = 0.0f;
@@ -325,20 +321,19 @@ static int test_rejected_calls_preserve_vad_state(void) {
           "NaN mic input is rejected, not silently processed");
     /* far_reference is never read by auto_vad() itself (only
      * microphones_interleaved is), so on perfectly finite mic data a
-     * non-finite far used to sail through auto_vad()'s own guard entirely
-     * and only get caught by the deeper finite check inside
-     * four_aec_front_process() -- by which point auto_vad() had
-     * already mutated noise_power/vad_hangover from real, finite mic
-     * energy. Both NaN and Inf are exercised since they're rejected by
-     * different mechanisms downstream (isfinite() catches both, but this
-     * pins the fix at the source rather than relying on that).
+     * non-finite far passes auto_vad()'s own guard entirely and would only
+     * be caught by the deeper finite check inside four_aec_front_process()
+     * -- by which point auto_vad() would already have mutated
+     * noise_power/vad_hangover from real, finite mic energy. Both NaN and
+     * Inf are exercised since they're rejected by different mechanisms
+     * downstream (isfinite() catches both, but this pins the check at the
+     * source rather than relying on that).
      *
      * Deliberately QUIET mic content for these two calls, NOT the loud
      * arming signal still sitting in `mic`: auto_vad() on the loud signal
      * would just re-arm vad_hangover to the exact value it already has
-     * (indistinguishable from not running at all), which is precisely why
-     * an earlier version of this test failed to catch the missing
-     * far_reference check -- the mutation was a same-value no-op. Quiet
+     * (indistinguishable from not running at all), so a missing
+     * far_reference check would go unnoticed. Quiet
      * content instead takes the EMA's "silence" branch, a real, different
      * noise_power update if auto_vad() incorrectly runs. */
     for (int i = 0; i < hop; ++i) {
@@ -362,7 +357,7 @@ static int test_rejected_calls_preserve_vad_state(void) {
      * since `speech` re-arms hangover unconditionally on the speech
      * branch). A leak in any of the three rejected calls above -- including
      * a hangover off-by-one -- desyncs "attacked" from "clean" somewhere in
-     * this walk-down, even though both now see exactly the same frames. */
+     * this walk-down, even though both see exactly the same frames. */
     for (int frame = 0; frame < 40; ++frame) {
         for (int i = 0; i < hop; ++i) {
             float v = 0.002f * sinf(phase);

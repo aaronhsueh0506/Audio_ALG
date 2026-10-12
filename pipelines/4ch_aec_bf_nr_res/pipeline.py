@@ -102,9 +102,9 @@ class SharedMatchedDelayEstimator:
     already rescales the delay it returns back to the true native sample
     domain (see its ``_process_inner_block``'s
     ``* _DOWN_SAMPLING_FACTOR * self._rate_factor`` line) -- so this wrapper
-    must NOT decimate or rescale a second time. No external decimation, no
+    must NOT decimate or rescale a second time: no external decimation, no
     decimation-phase bookkeeping, and no manual rate-factor rescale live
-    here anymore.
+    here.
     """
 
     def __init__(self, sample_rate: int, hop_size: int,
@@ -123,7 +123,7 @@ class SharedMatchedDelayEstimator:
         self.quarantine_hops = max(
             1, int(round(float(quarantine_s) / (self.hop_size / self.sample_rate))))
         self._quarantine_left = -1   # -1 = disarmed, the only re-armable state
-        # LegacyDelayShim -> EchoPathDelayEstimator now owns 48kHz anti-alias
+        # LegacyDelayShim -> EchoPathDelayEstimator owns 48kHz anti-alias
         # + decimation internally (and rescales its returned delay back to
         # native samples), so it is constructed with the TRUE native rate --
         # never a hardcoded 16000 -- and fed raw hops directly (see
@@ -942,9 +942,8 @@ class FourChannelAecPipeline:
             # converged filter by the alignment delta (warm tap-transfer when
             # the evidence gate holds, a filter-only restart otherwise), so the
             # cancellation survives the move and the WOLA sequences continue.
-            # A ``reset()`` per lane -- what this used to be -- cost one
-            # near-zero output hop plus dozens of hops of re-exposed echo: the
-            # spectrogram vertical line.  ``_last_delay`` is the alignment the
+            # A ``reset()`` per lane would cost one near-zero output hop plus
+            # dozens of hops of re-exposed echo: the spectrogram vertical line.  ``_last_delay`` is the alignment the
             # lanes were served BEFORE this hop's decision (0 until the
             # estimate first turns solid), so the delta is exactly the movement
             # they have to absorb.  Same call, same delta and same per-lane

@@ -852,7 +852,7 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
             valid = 0;
             break;
         }
-        /* A delay realignment no longer restarts any WOLA sequence: the
+        /* A delay realignment does not restart any WOLA sequence: the
          * lanes realign their filters in place, so the external mirror keeps
          * its OLA running too and this identity proves the seams stay
          * continuous ACROSS the realign boundary, not merely after both
@@ -929,10 +929,9 @@ cleanup:
  *
  * "At most 1", not "exactly 1": four_aec_front_process() resets all four lanes
  * (aec_reset(), which also zeroes this counter) whenever the shared delay
- * estimator's estimate changes -- expected, unrelated pre-existing
- * behavior during the synthetic signal's initial delay-acquisition hops,
- * confirmed empirically while writing this test (the total visibly drops
- * back down before climbing again). A drop is fine; the one invariant
+ * estimator's estimate changes -- expected behavior during the synthetic
+ * signal's initial delay-acquisition hops (the total visibly drops back down
+ * before climbing again). A drop is fine; the one invariant
  * that must never break is the total never jumping by MORE than 1 in a
  * single call, which is exactly what "lanes 1-3 silently stopped sharing
  * and went back to computing their own FFT" would look like. */
@@ -1353,7 +1352,7 @@ static void test_known_delay_mislock_is_detectable(void) {
     char label[224];
 
     known_delay_run(5, 200, dominant, 0.6f, early, 0.5f, &mislock);
-    /* Control: same two paths, but the dominant one now inside the ceiling.
+    /* Control: same two paths, but the dominant one inside the ceiling.
      * The estimator must prefer the dominant path, and the ground-truth
      * check must stay quiet -- otherwise the check below is just "always
      * flags", which would prove nothing. */
@@ -1595,7 +1594,7 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
             } else {
                 out->later_changes += 1;
                 /* The candidate must have been HELD on the previous hop and
-                 * must be the value now applied: that pair is the whole
+                 * must be the value applied: that pair is the whole
                  * two-step rule, and it is what disappears if acceptance
                  * moves back to the first sighting. */
                 if (previous_pending < 0 ||
@@ -3089,8 +3088,7 @@ static void test_stage_timing(void) {
  * LCG step per bin whose top five bits index kCngTable, the
  * imaginary part reading a quarter turn (+8 of 32) ahead of the real one.
  * What the injected noise owes the caller is bounded samples, the same
- * expected per-bin power as the unit-variance Gaussian pair the recipe
- * replaced, and a sequence that advances -- not one fixed sample stream, so
+ * expected per-bin power as the unit-variance Gaussian pair, and a sequence that advances -- not one fixed sample stream, so
  * nothing here pins output bytes. The pipeline half differences a CNG-on run
  * against a byte-identical CNG-off one; comfort noise is added after every
  * gain, so that difference is the injected noise and nothing else. */
