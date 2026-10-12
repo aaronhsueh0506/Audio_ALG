@@ -275,4 +275,62 @@ static inline void four_aec_comfort_accumulate(
 }
 #endif
 
+/* Weight-matrix gate: 1 when every component is finite and the sequential sum
+ * of |re| + |im| is finite and above 1e-12, else 0.
+ *
+ * The vector screen answers the common case without forming the sum: with
+ * every term finite and at most 2^100 and fewer than 2^24 of them, the
+ * sequential sum cannot overflow, and it is at least its largest term (a sum
+ * of non-negative floats never falls below an addend), so one term above 1e-12
+ * decides the gate. Any other input -- a non-finite component, a larger
+ * term, only small terms -- runs the sequential loop, so the result equals
+ * the scalar twin's for every input. */
+static inline int four_aec_weights_valid_scalar(
+    const Complex* weights, size_t count) {
+    size_t i;
+    float sum = 0.0f;
+    for (i = 0; i < count; ++i) {
+        if (!isfinite(weights[i].r) || !isfinite(weights[i].i)) return 0;
+        sum += fabsf(weights[i].r) + fabsf(weights[i].i);
+    }
+    return isfinite(sum) && sum > 1e-12f;
+}
+
+#if SK_HAVE_NEON
+static inline int four_aec_weights_valid(
+    const Complex* weights, size_t count) {
+    const float32x4_t bound = vdupq_n_f32(0x1p100f);
+    const float32x4_t floor_value = vdupq_n_f32(1e-12f);
+    uint32x4_t bounded = vdupq_n_u32(~0u);
+    uint32x4_t above = vdupq_n_u32(0u);
+    size_t i = 0;
+    if (count >= ((size_t)1 << 24))
+        return four_aec_weights_valid_scalar(weights, count);
+    for (; i + 4 <= count; i += 4) {
+        float32x4x2_t w = sk__cquad_load(weights + i);
+        float32x4_t term =
+            vaddq_f32(vabsq_f32(w.val[0]), vabsq_f32(w.val[1]));
+        bounded = vandq_u32(bounded, vcleq_f32(term, bound));
+        above = vorrq_u32(above, vcgtq_f32(term, floor_value));
+    }
+    if (vminvq_u32(bounded) == ~0u) {
+        int tail_above = 0;
+        int tail_bounded = 1;
+        for (; i < count; ++i) {
+            float term = fabsf(weights[i].r) + fabsf(weights[i].i);
+            tail_bounded &= term <= 0x1p100f;
+            tail_above |= term > 1e-12f;
+        }
+        if (tail_bounded && (tail_above || vmaxvq_u32(above) != 0u))
+            return 1;
+    }
+    return four_aec_weights_valid_scalar(weights, count);
+}
+#else
+static inline int four_aec_weights_valid(
+    const Complex* weights, size_t count) {
+    return four_aec_weights_valid_scalar(weights, count);
+}
+#endif
+
 #endif /* FOUR_AEC_PROJECTION_KERNELS_H */

@@ -1387,18 +1387,10 @@ int four_aec_front_process(
 
 static int validate_weights(const FourAecNrRes* p,
                                  const Complex* weights) {
-    size_t count;
-    size_t i;
-    float sum = 0.0f;
     if (!p || !weights) return 0;
-    count = (size_t)FOUR_AEC_NR_RES_CHANNELS *
-            (size_t)p->n_freqs;
-    for (i = 0; i < count; ++i) {
-        if (!isfinite(weights[i].r) || !isfinite(weights[i].i))
-            return 0;
-        sum += fabsf(weights[i].r) + fabsf(weights[i].i);
-    }
-    return isfinite(sum) && sum > 1e-12f;
+    return four_aec_weights_valid(
+        weights,
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)p->n_freqs);
 }
 
 static int complex_vector_finite(const Complex* values, int count) {

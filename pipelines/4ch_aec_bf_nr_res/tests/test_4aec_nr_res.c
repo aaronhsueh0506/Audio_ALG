@@ -224,6 +224,125 @@ static void test_projection_kernels(void) {
     CHECK(1, "projection kernels accept an empty range");
 }
 
+/* The weight-matrix gate against its sequential definition, written out here
+ * rather than taken from the header. */
+static int weights_gate_reference(const Complex* w, size_t count) {
+    size_t i;
+    float sum = 0.0f;
+    for (i = 0; i < count; ++i) {
+        if (!isfinite(w[i].r) || !isfinite(w[i].i)) return 0;
+        sum += fabsf(w[i].r) + fabsf(w[i].i);
+    }
+    return isfinite(sum) && sum > 1e-12f;
+}
+
+static float weights_float_from_bits(uint32_t bits) {
+    float f;
+    memcpy(&f, &bits, sizeof f);
+    return f;
+}
+
+static int weights_gate_agrees(const Complex* w, size_t count) {
+    int want = weights_gate_reference(w, count);
+    return four_aec_weights_valid_scalar(w, count) == want &&
+           four_aec_weights_valid(w, count) == want;
+}
+
+static void test_weights_gate(void) {
+    enum { MAXC = 40 };
+    Complex w[MAXC];
+    const float specials[] = {
+        0.0f, -0.0f, 1.0f, -1.0f, 1e-13f, 1e-12f, 1.0000001e-12f,
+        FLT_MIN, FLT_MIN * 0.5f, 1.0e-40f, -1.0e-45f, 1e30f, 0x1p100f,
+        0x1.000002p100f, 0x1p101f, FLT_MAX, -FLT_MAX, INFINITY, -INFINITY,
+        NAN, weights_float_from_bits(0x7fc00001u),
+        weights_float_from_bits(0xffa00000u)};
+    const int n_special = (int)(sizeof specials / sizeof specials[0]);
+    uint32_t seed = 20240611u;
+    int ok = 1, ok_tiny = 1, ok_tail = 1, ok_big = 1, ok_edge = 1;
+    int trial, c, i;
+    size_t count;
+
+    /* Random vectors: mostly ordinary values, a few special entries. */
+    for (trial = 0; trial < 60000 && ok; ++trial) {
+        seed = seed * 1664525u + 1013904223u;
+        count = (size_t)(seed >> 8) % (MAXC + 1);
+        for (i = 0; i < (int)count; ++i) {
+            seed = seed * 1664525u + 1013904223u;
+            w[i].r = (float)((int32_t)seed >> 8) / (float)(1 << 23);
+            seed = seed * 1664525u + 1013904223u;
+            w[i].i = (float)((int32_t)seed >> 8) / (float)(1 << 23);
+            seed = seed * 1664525u + 1013904223u;
+            if ((seed >> 24) < 6u) {
+                w[i].r = specials[(seed >> 4) % (uint32_t)n_special];
+                seed = seed * 1664525u + 1013904223u;
+                if ((seed >> 24) < 128u)
+                    w[i].i = specials[(seed >> 4) % (uint32_t)n_special];
+            }
+        }
+        ok = weights_gate_agrees(w, count);
+    }
+
+    /* Every special in every position of every length, against zeros and
+     * against ones. */
+    for (c = 0; c <= 12 && ok_edge; ++c) {
+        int s, pos, comp, fill;
+        for (fill = 0; fill < 2 && ok_edge; ++fill)
+            for (s = 0; s < n_special && ok_edge; ++s)
+                for (pos = 0; pos < c && ok_edge; ++pos)
+                    for (comp = 0; comp < 2 && ok_edge; ++comp) {
+                        for (i = 0; i < c; ++i) {
+                            w[i].r = fill ? 1.0f : 0.0f;
+                            w[i].i = 0.0f;
+                        }
+                        if (comp) w[pos].i = specials[s];
+                        else w[pos].r = specials[s];
+                        ok_edge = weights_gate_agrees(w, (size_t)c);
+                    }
+    }
+    CHECK(ok && ok_edge,
+          "weight gate: dispatch and scalar twin equal the sequential definition");
+
+    /* Only small terms: the sequential sum decides, and it crosses the floor
+     * after enough of them. */
+    for (c = 1; c <= MAXC && ok_tiny; ++c) {
+        for (i = 0; i < c; ++i) { w[i].r = 3e-14f; w[i].i = 0.0f; }
+        ok_tiny = weights_gate_agrees(w, (size_t)c);
+    }
+    for (i = 0; i < 40; ++i) { w[i].r = 3e-14f; w[i].i = 0.0f; }
+    CHECK(ok_tiny && four_aec_weights_valid(w, 40) == 1 &&
+          four_aec_weights_valid(w, 8) == 0,
+          "weight gate: small terms that only add up past 1e-12 pass");
+
+    /* The single qualifying term sits in the scalar tail. */
+    for (c = 1; c <= 11 && ok_tail; ++c) {
+        for (i = 0; i < c; ++i) { w[i].r = 0.0f; w[i].i = 0.0f; }
+        w[c - 1].i = 2e-12f;
+        ok_tail = weights_gate_agrees(w, (size_t)c) &&
+                  four_aec_weights_valid(w, (size_t)c) == 1;
+        w[c - 1].i = 1e-12f;
+        ok_tail = ok_tail && four_aec_weights_valid(w, (size_t)c) == 0;
+    }
+    CHECK(ok_tail, "weight gate: a lone term above 1e-12 in the tail decides");
+
+    /* Terms above the screen bound and sums that overflow. */
+    for (i = 0; i < MAXC; ++i) { w[i].r = 0x1p100f; w[i].i = 0.0f; }
+    ok_big = weights_gate_agrees(w, MAXC) &&
+             four_aec_weights_valid(w, MAXC) == 1;
+    for (i = 0; i < MAXC; ++i) { w[i].r = 0x1p127f; w[i].i = 0.0f; }
+    ok_big = ok_big && weights_gate_agrees(w, MAXC) &&
+             four_aec_weights_valid(w, MAXC) == 0;
+    for (i = 0; i < MAXC; ++i) { w[i].r = FLT_MAX; w[i].i = FLT_MAX; }
+    ok_big = ok_big && four_aec_weights_valid(w, MAXC) == 0;
+    for (i = 0; i < MAXC; ++i) { w[i].r = 0x1.000002p100f; w[i].i = 0.0f; }
+    ok_big = ok_big && weights_gate_agrees(w, MAXC) &&
+             four_aec_weights_valid(w, MAXC) == 1;
+    CHECK(ok_big, "weight gate: large terms and an overflowing sum");
+
+    CHECK(four_aec_weights_valid(w, 0) == 0,
+          "weight gate: an empty matrix is refused");
+}
+
 static void test_trusted_spectrum_path(void) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
     ConvChain* reconstructed = NULL;
@@ -3625,6 +3744,7 @@ static void test_fuse_frame_contract(void) {
 
 int main(void) {
     test_projection_kernels();
+    test_weights_gate();
     test_trusted_spectrum_path();
     test_invalid_configs();
     run_grid(16000, 256);

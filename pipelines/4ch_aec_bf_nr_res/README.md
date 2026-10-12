@@ -117,7 +117,8 @@ The deployable C seam is:
   `aec_res.h`), the MMSE-LSA instance and the inverse transform are carved and
   chained by the applications below;
 - [`4aec_projection_kernels.h`](4aec_projection_kernels.h): byte-equivalent
-  scalar/NEON complex projection, residual-vector, and comfort-noise kernels;
+  scalar/NEON complex projection, residual-vector, comfort-noise and
+  weight-matrix gate kernels;
 - [`4aec_nr_res_internal.h`](4aec_nr_res_internal.h): private delay-admission
   helpers;
 - [`4aec_nr_res_static.c`](4aec_nr_res_static.c): caller-owned-pool example
