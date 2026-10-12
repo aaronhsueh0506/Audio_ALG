@@ -53,6 +53,7 @@
 
 #include "audio_pipeline_ulcnet.h"
 #include "mem_align.h"       /* ALIGN16 / MEM_IS_ALIGNED16 */
+#include "common/se_config.h"  /* se_derive(): grid + AecConfig, shared by every application */
 
 /* This wrapper's own carve-layout version (see AudioPipelineUlcnetMemReq's
  * doc). History starts at 1 (2026-08: first version); 2 adds the
@@ -170,32 +171,38 @@ struct AudioPipelineUlcnet {
 
 /* ============================================================================
  * Config -> AEC config + dims (the one reject-first gate every entry point
- * funnels through, mirroring audio_pipeline.c's derive_dims_and_configs)
+ * funnels through)
  * ========================================================================== */
+
+_Static_assert(ULCNET_HOP == ULCNET_N_FFT / 2 && ULCNET_BINS == ULCNET_N_FFT / 2 + 1,
+               "the compiled grid is a no-padding 50 % overlap grid");
 
 /* Returns 0 and fills every out-param, or -1: NULL cfg; sample_rate differs
  * from ULCNET_SR; fft_size is neither 0 nor ULCNET_N_FFT (0 resolves to the
- * compiled checkpoint grid); or aec_preset lies outside
- * its defined enum values (rather than silently falling through
- * aec_config_from_preset's own balanced-default fallback). The model's
- * callbacks are deliberately NOT validated -- an all-zero model is the
- * supported identity/fail-open case. A published model-I/O descriptor must
- * match the fixed raw-far production ABI. */
+ * compiled checkpoint grid); aec_preset lies outside its defined enum values
+ * (rather than silently falling through aec_config_from_preset's own
+ * balanced-default fallback); or filter_length is outside
+ * [0, SE_FILTER_LENGTH_MAX]. The model's callbacks are deliberately NOT
+ * validated -- an all-zero model is the supported identity/fail-open case. A
+ * published model-I/O descriptor must match the fixed raw-far production ABI.
+ *
+ * The delay settings are passed through to the AEC, which aligns the far
+ * reference itself and validates them when it sizes its pool. The seam keeps
+ * only the linear context (formed_hop and the linear spectra); r2, comfort
+ * noise and G_res are not read here, and the linear outputs are bit-identical
+ * either way. delay_backward_quarantine keeps lib/aec's default (off). */
 static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
                                          AecConfig* aec_cfg,
                                          int* hop, int* fft_sz, int* n_freqs) {
-    if (!cfg) return -1;
-    if (cfg->sample_rate != ULCNET_SR) return -1;
-    if (cfg->fft_size != 0 && cfg->fft_size != ULCNET_N_FFT) return -1;
+    static const SeRules rules = {
+        /* allow_8k */ 0, /* fixed_rate */ ULCNET_SR, /* fixed_fft */ ULCNET_N_FFT,
+        /* check_delay */ 0, /* lane_aligned */ 0,
+        /* spatial_context */ AEC_CONTEXT_LINEAR_ONLY, /* with_nr */ 0
+    };
+    SeRequest req;
+    SeGrid grid;
 
-    switch (cfg->aec_preset) {
-        case AEC_PRESET_MILD:
-        case AEC_PRESET_BALANCED:
-        case AEC_PRESET_AGGRESSIVE:
-            break;
-        default:
-            return -1;
-    }
+    if (!cfg) return -1;
 
     /* A model that actually infers MUST publish a descriptor. Its delay depth,
      * attention geometry and history shapes are what the host-side rings are
@@ -209,35 +216,19 @@ static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
         ulcnet_model_io_descriptor_validate(cfg->model.io_descriptor) != 0)
         return -1;
 
-    *hop = ULCNET_HOP;
-    *fft_sz = ULCNET_N_FFT;
-    *n_freqs = ULCNET_BINS;
+    req.sample_rate = cfg->sample_rate;
+    req.fft_size = cfg->fft_size;
+    req.filter_length = cfg->filter_length;
+    req.delay_mode = cfg->delay_mode;
+    req.delay_num_filters = cfg->delay_num_filters;
+    req.fixed_delay_samples = cfg->fixed_delay_samples;
+    req.aec_preset = cfg->aec_preset;
+    req.nr_mode = ANR_MODE_BALANCED;   /* unused: no NR stage */
+    if (se_derive(&req, &rules, &grid, aec_cfg) != 0) return -1;
 
-    aec_config_from_preset(aec_cfg, cfg->aec_preset, cfg->sample_rate);
-    aec_cfg->fft_size           = *fft_sz;
-    /* Bound kept in sync with mono_aec_nr_res/audio_pipeline.c and
-     * 4ch_aec_bf_nr_res/4aec_nr_res.c (each app is self-contained). */
-    if (cfg->filter_length < 0 || cfg->filter_length > 4096) return -1;
-    if (cfg->filter_length > 0)
-        aec_cfg->filter_length = cfg->filter_length;
-    aec_cfg->delay_mode = cfg->delay_mode;
-    aec_cfg->delay_num_filters = cfg->delay_num_filters;
-    aec_cfg->fixed_delay_samples = cfg->fixed_delay_samples;
-    aec_cfg->enable_delay_est =
-        cfg->delay_mode == AEC_DELAY_MATCHED ? 1 : 0;
-    aec_cfg->enable_res         = 0;   /* linear AEC + external NN post seam */
-    aec_cfg->return_res_context = 1;   /* fills formed_hop/error_spec/...    */
-    /* Only formed_hop and the linear context are read; r2, comfort noise and
-     * G_res are not, so the AEC stops after its AecState update. The linear
-     * outputs are bit-identical either way. */
-    aec_cfg->spatial_linear_context = AEC_CONTEXT_LINEAR_ONLY;
-    /* delay_backward_quarantine_enabled stays at lib/aec's default (OFF).
-     * The guard holds backward candidates only, for a bounded window after
-     * which it accepts -- so a pre-echo mis-lock is DELAYED by the window,
-     * not cured. Enabling it here is therefore a policy decision, and it
-     * waits on a real-audio spot check with the deployed checkpoint. */
-    /* Delay estimation stays on (preset default) -- the AEC aligns far
-     * internally. */
+    *hop = grid.hop_size;
+    *fft_sz = grid.fft_size;
+    *n_freqs = grid.n_freqs;
     return 0;
 }
 
