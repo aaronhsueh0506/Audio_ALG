@@ -110,11 +110,11 @@ static float stream_tap(int tap)
 }
 
 /* Reference ERB matrices for the DFN tests, built from the shipped
- * 48-kHz/1024/32 border table with the exact triangular construction the
- * runtime used to derive on-device. The runtime now only consumes
- * caller-loaded matrices (erb_fwd.bin/erb_inv.bin); reproducing the
- * construction HERE keeps every existing golden value valid while pinning
- * the new pointer plumbing. */
+ * 48-kHz/1024/32 border table with the exact triangular construction.
+ * The runtime consumes only caller-loaded matrices (erb_fwd.bin/erb_inv.bin);
+ * the tests build them here and hand them in through the same pointers,
+ * so each golden value is reproduced from the table, not from a stored
+ * copy of the matrices. */
 static const int dfn_test_borders[32] = {
     0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 25, 30, 36, 42,
     50, 59, 69, 81, 94, 110, 129, 151, 176, 205, 239, 279,

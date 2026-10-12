@@ -634,10 +634,9 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
     p->output_frame = frame;
     if (p->io_mode == DFN2_IO_TIME) {
         /* One synthesis push per emitted frame, and none on the warm-up hops.
-         * Pushing the warm-up's zero spectrum would happen to be harmless
-         * today -- a zero block leaves the OLA buffer zero -- but the
-         * invariant worth keeping is the one-to-one pairing, not that
-         * accident. */
+         * Pushing the warm-up's zero spectrum would be harmless (a zero block
+         * leaves the OLA buffer zero), but the invariant is the one-to-one
+         * pairing, not that accident. */
         dfn2_synthesis(p->dsp, p->enh_re, p->enh_im, p->out_hop);
     }
     return 0;

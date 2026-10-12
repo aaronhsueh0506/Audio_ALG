@@ -147,7 +147,7 @@ void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
  * where the next call reads it and nothing is copied. Returns 0 when every
  * element of the six conv windows, h_tra and h_dpgrnn is finite. A null
  * argument returns -1. A single NaN or Inf anywhere zeroes the whole state
- * (the previous value no longer exists to restore), advances the generation
+ * (the previous value cannot be restored), advances the generation
  * and returns -1, so the next invocation starts from the reset state instead
  * of replaying poison. The check is finite-only: a partial or mixed write
  * that is still finite cannot be detected. */

@@ -279,34 +279,22 @@ static uint32_t fnv1a_str(const char* text, uint32_t hash) {
 static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
     uint32_t core_build_flags_hash) {
     uint32_t hash = 2166136261u;
-    /* v2: `self` grew the one-hop far-compensation buffer + far_input_mode
-     * (self(...) names the state embedded in the control block -- part of
-     * the carve even though it is not separately carved).
-     * v3: `self` grew the shared window table (ulcnet_window; the chain
-     * structs dropped their window copies and embed FFT scratch instead)
-     * and the carved `fft` handle is now shared by the beam WOLA AND the
-     * ULCNet chain.
-     * v5: the self-resident UlcnetModel copy grew io_descriptor (the
-     * published model-I/O contract), so the control block is bigger even
-     * though the carve ORDER is unchanged. v6 removes the obsolete runtime
-     * far-mode field and fixed production to aligned far at that revision.
-     * The current signal contract is raw far (a behavior-only change). The existing
-     * last_delay/frame_index fields also identify FIXED's first transition
-     * from ring-fill raw far to aligned far. v7 adds the identity-reprime
-     * counter. v17: the GSC spectrum feeds the model directly -- the beam
-     * WOLA (ifft, ola, synth_win, beam_hop), the error-branch analysis, the
-     * two-frame staging and the one-hop far buffer are gone, and `self`
-     * carries one-frame err/far staging instead. Bump
+    /* The token names the regions of the pool: `self` (the state embedded in
+     * the control block -- core-config delay fields, the direct ULCNet chain,
+     * the UlcnetModel copy with its io_descriptor, the identity-reprime
+     * counter, the shared window table and the one-frame err/far staging) and
+     * the carved objects, in carve order. The one carved FFT handle serves
+     * the far analysis and the synthesis. Any change to this layout bumps
      * AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION together with this string,
-     * always both, forever. */
+     * always both. */
     hash = fnv1a_str(
         "|carve:self(corecfg-delay-v2,ulcnet-direct,model(io_descriptor),"
         "reprime,ulcnet_window,frame),"
         "core,srp,gsc,gsc_spectrum,gsc_weights,fft,far_analysis,synthesis",
         hash);
-    /* The grid is a build parameter now, so it cannot be spelled into the
-     * token as a literal: stringify the macros instead, or two builds on
-     * different grids would share one descriptor hash. */
+    /* The grid is a build parameter, so it cannot be spelled into the token
+     * as a literal: stringify the macros instead, or two builds on different
+     * grids would share one descriptor hash. */
     hash = fnv1a_str("|align|ulcnet" ULCNET_GRID_TOKEN "|sharedfft", hash);
     hash ^= core_build_flags_hash;
     hash *= 16777619u;
@@ -676,7 +664,7 @@ int audio_pipeline_4ch_ulcnet_set_model(
     const UlcnetModel* model) {
     if (!p || p->destroyed) return -1;
     if (model) {
-        /* Reject-first: the previously installed model stays in place. */
+        /* Reject-first: a refused model leaves the installed one in place. */
         /* A model that actually infers MUST publish a descriptor. Its delay depth,
          * attention geometry and history shapes are what the host-side rings are
          * carved from, and nothing downstream can detect a mismatch: the finite
