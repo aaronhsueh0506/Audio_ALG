@@ -118,7 +118,7 @@ def _canon_ast(node) -> str:
     ``ast.dump()`` cannot be used here. Python 3.13 changed it to omit fields
     that equal their default, so the same source hashes differently before and
     after: the 48 signal-path files digest to 89b866cd on 3.9 and 402acc1a on
-    3.14 with no code difference at all (verified 2026-08-06). A dataset built
+    3.14 with no code difference at all. A dataset built
     under one interpreter would then be refused by training under another.
 
     The rule here is that same omission -- drop a field whose value is ``None``
@@ -199,7 +199,7 @@ def aec_python_behavior_hash() -> str:
     ``__post_init__`` or echoed out of the recorded contract by both call sites,
     so a version integer would be the same constant on both sides of every
     comparison and could never differ. That is exactly the tautology that made
-    this check vacuous once already (2026-08-06). A mechanical hash cannot be
+    this check vacuous once already. A mechanical hash cannot be
     forgotten the way a manual bump can.
 
     Conservative by construction: a pure refactor (renaming a local, reordering

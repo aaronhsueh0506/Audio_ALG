@@ -129,7 +129,7 @@ def test_calibration_and_graph_agree_on_the_d_chain(ulcnet_pair):
 
 def test_calibration_records_the_full_window_inputs(ulcnet_pair):
     """The recorded state tensors are the graph's full windows, not the
-    history one frame short of them that earlier boundaries carried."""
+    history one frame short of them."""
     graph_report, capture_report = ulcnet_pair
     assert capture_report['state_layout_version'] == 18
     schema = graph_report['input_schema']

@@ -8,8 +8,8 @@ of torch.stft/istft(center=True).
 
 The C side now transforms through audio_common's fft_wrapper (caller-owned
 FftHandle, real RFFT/IRFFT, backend-switched by BACKEND=kiss/ne10), so the
-fixture first builds audio_common's NE10 static lib (the default backend
-everywhere since 2026-08-18) the way the AEC C tests document it
+fixture first builds audio_common's NE10 static lib (the default backend)
+the way the AEC C tests document it
 (make -s -C ../audio_common BACKEND=ne10 lib + print-lib-path) and links it
 into the driver. The driver deliberately shares ONE FftHandle across the
 analysis and the synthesis (strictly sequential use), exercising the same

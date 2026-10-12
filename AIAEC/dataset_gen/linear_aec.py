@@ -517,7 +517,7 @@ def linear_aec_contract_from_config(
 ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
     # Empty. The last admitted pair (37ed5ad9 -> 19dd4f90, the fresh-instance
     # reset composed with the 48-kHz FilterAnalyzer correction, 16 kHz only)
-    # was retired on 2026-09-04 when the shadow-copy baseline retention was
+    # was retired when the shadow-copy baseline retention was
     # retimed per grid and C's hard restart started clearing coarse/leakage
     # evidence: both move `linear_error`, so no byte-identity evidence can
     # describe a frontend after them. Its admission evidence stays in git
@@ -649,7 +649,7 @@ RETIRED_BEHAVIOR_HASHES = frozenset({
     "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd",
     "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
     # The 200-hour corpus's materialization frontend and the identity it had
-    # been carried forward to, retired 2026-09-04 by the shadow-copy baseline
+    # been carried forward to, retired by the shadow-copy baseline
     # retention retime (0.995 -> 0.992 at 16 kHz/512/256) and C's restart
     # evidence clearing; both move `linear_error`.
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061",
@@ -673,7 +673,7 @@ def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> N
     the comparison becomes a tautology that cannot fail -- a changed PBFDKF step
     size, delay tolerance or formed-output crossfade would then feed inference a
     ``linear_error`` from a different filter than the one the checkpoint was
-    trained on, silently. That regression shipped once (2026-08-06); the
+    trained on, silently. That regression has shipped once; the
     ``test_contract_comparison_is_not_vacuous`` test exists to stop it
     recurring.
 

@@ -48,8 +48,8 @@ def _gate(root):
 
 
 # The identity of the builds the 200-hour corpus was materialized under.
-# ACCEPTED_BEHAVIOR_HASH_MIGRATIONS carried it forward until 2026-09-04; it is
-# now RETIRED, so a ledger from any of these revisions must be refused whether
+# ACCEPTED_BEHAVIOR_HASH_MIGRATIONS carried it forward; it is
+# RETIRED, so a ledger from any of these revisions must be refused whether
 # it is legacy-shaped or records its contract. Spelled out rather than read
 # from the tables on purpose: a test fed its inputs from the table it checks
 # would still pass if the table were emptied.

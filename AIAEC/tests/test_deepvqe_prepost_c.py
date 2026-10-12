@@ -1846,8 +1846,8 @@ int main(int argc, char **argv) {
 
 @pytest.fixture(scope='module')
 def audio_common_lib():
-    """audio_common's NE10 static lib (the default backend since
-    2026-08-18), built and located the way the other C tests document it."""
+    """audio_common's NE10 static lib (the default backend),
+    built and located the way the other C tests document it."""
     if shutil.which('make') is None:
         pytest.skip('no make available')
     subprocess.run(
@@ -2189,8 +2189,8 @@ def _fnv1a(values):
 
 def test_pool_identity_moved_with_the_full_window_carve(driver):
     """The stale-pool gate keys on (grid, layout, carve version, mode, D).
-    The conv and score regions grew a frame and h_gru changed rank, so a pool
-    recorded by the previous carve (layout 3, carve 3) must hash differently;
+    A pool requested under layout 3 / carve 3 (conv and score windows one
+    frame shorter, rank-3 h_gru) must hash differently from the shipped one;
     the hash is recomputed here from the published constants."""
     out = _run(driver, 'hash')
     c_hash = int(re.search(r'hash=(\d+)', out).group(1))

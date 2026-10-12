@@ -181,12 +181,12 @@ def test_streaming_export_shapes_are_fixed_and_full_window():
 
 def test_layout_version_is_new_and_retired_numbers_stay_retired():
     assert LAYOUT_VERSION == STATE_LAYOUT_VERSION == 18
-    # 3-13 denoted earlier boundaries, 14-17 the previous history-window
-    # ones (split hiddens, in-graph front end, one frame short of a window).
+    # 3-17 each denoted a boundary that is not implemented (split hiddens,
+    # in-graph front end, windows one frame short).
     # Reusing one would make a single number mean two different contracts,
     # which no runtime could tell apart. The shipped version must sit above
     # every retired number rather than above a literal floor, which would
-    # still pass after the next bump while no longer guarding anything.
+    # stay green after the next bump while guarding nothing.
     assert RETIRED_LAYOUT_VERSIONS == frozenset(range(3, 18))
     assert LAYOUT_VERSION not in RETIRED_LAYOUT_VERSIONS
     assert LAYOUT_VERSION > max(RETIRED_LAYOUT_VERSIONS)

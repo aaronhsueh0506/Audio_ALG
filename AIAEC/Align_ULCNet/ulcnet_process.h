@@ -40,9 +40,9 @@
  *
  * Memory contract: all state is caller-owned plain structs -- zero heap,
  * zero global state, and NO big stack frames: the per-call FFT scratch is
- * embedded in the structs (the old stack-local scratch was ~6.2 KB in the
- * analysis push and ~4.2 KB in the synthesis push -- unsafe headroom for an
- * embedded RTOS task stack). The FftHandle and the sqrt-Hann window table
+ * embedded in the structs (a stack-local scratch would take ~6.2 KB in the
+ * analysis push and ~4.2 KB in the synthesis push, too much for an embedded
+ * RTOS task stack). The FftHandle and the sqrt-Hann window table
  * are caller-owned and SHARED: one ULCNET_N_FFT-point handle may serve
  * err-analysis + far-analysis + synthesis, whose transforms are strictly
  * sequential within a hop (the handle is never used concurrently), and one
@@ -110,8 +110,7 @@ extern "C" {
  * caller-owned storage and pass the pointer to every *_init below.
  * Ownership: the caller keeps the array alive AND unchanged for the
  * lifetime of every struct initialized with it -- the structs store only
- * the const pointer, never a copy (the old per-struct duplicate window
- * arrays are gone). Formula matches the Python reference's periodic
+ * the const pointer, never a copy. Formula matches the Python reference's periodic
  * sqrt-Hann bit-for-bit at f32. */
 void ulcnet_make_window(float window[ULCNET_N_FFT]);
 

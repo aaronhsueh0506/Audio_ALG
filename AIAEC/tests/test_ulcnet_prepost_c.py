@@ -1054,8 +1054,8 @@ int main(int argc, char **argv) {
 
 @pytest.fixture(scope='module')
 def audio_common_lib():
-    """audio_common's NE10 static lib (the default backend since
-    2026-08-18), built and located the way the other C tests document it."""
+    """audio_common's NE10 static lib (the default backend),
+    built and located the way the other C tests document it."""
     if shutil.which('make') is None:
         pytest.skip('no make available')
     subprocess.run(
@@ -1164,8 +1164,7 @@ def test_frame_state_machine_guards(driver):
 
 def test_model_layout_version_field_accepts_only_the_built_layout(driver):
     """0 means this build's layout and an explicit match is the identical
-    pool; every other number -- retired delta layouts, the combined-GRU
-    layout the C contract does not bind, unassigned numbers -- is refused
+    pool; every other number -- retired layouts, unassigned numbers -- is refused
     before sizing and by a pool-init that is handed a stale request."""
     _run(driver, 'layout')
 
@@ -1184,10 +1183,10 @@ def _fnv1a(values):
 def test_pool_identity_moved_with_the_full_window_carve(driver):
     """The stale-pool gate keys on (grid, layout, carve version, mode, D).
 
-    The window carve changed size and meaning, so a pool recorded by the
-    previous carve must hash differently. The hash is recomputed here from
-    the published constants and compared with what the C returns, then
-    compared with what the previous carve (layout 16, carve 4) would have
+    The window carve sets the size and meaning of the pool, so a pool
+    requested under another carve (layout 16, carve 4) must hash differently.
+    The hash is recomputed here from the published constants and compared
+    with what the C returns, then with what that carve would have
     produced."""
     out = _run(driver, 'hash')
     c_hash = int(re.search(r'hash=(\d+)', out).group(1))

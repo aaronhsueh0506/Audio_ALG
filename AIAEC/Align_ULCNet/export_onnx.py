@@ -137,7 +137,7 @@ from AIAEC.training_common import (
 # The state boundary's version.  ULCNET_MODEL_IO_LAYOUT_VERSION in
 # ulcnet_model_io.h carries the same number; test_export_streaming_ulcnet.py
 # pins the two together.  Versions 3-17 are RETIRED: each denoted a boundary
-# this exporter and ulcnet_model_io.c no longer implement, and a number that
+# this exporter and ulcnet_model_io.c do not implement, and a number that
 # once denoted one boundary must never denote another.
 LAYOUT_VERSION = 18
 RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 18))

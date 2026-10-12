@@ -1,7 +1,7 @@
 """No migration connects recorded data to this frontend.
 
 `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` is empty: the shadow-copy baseline retime
-and the C restart evidence clearing (2026-09-04) move `linear_error`, so the
+and the C restart evidence clearing move `linear_error`, so the
 pair that carried the 200-hour corpus forward (37ed5ad9 -> 19dd4f90) was
 retired with the identities before it.
 
