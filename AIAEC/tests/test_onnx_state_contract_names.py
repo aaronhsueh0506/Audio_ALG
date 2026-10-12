@@ -1,4 +1,4 @@
-"""validate_inplace_state_contract on hand-built graphs.
+"""validate_inplace_state_contract (the name-list wrapper) on hand-built graphs.
 
 The exporters call the validator on every file they write, so a gate that
 could not fail would let a regressed boundary ship. Each violation below is

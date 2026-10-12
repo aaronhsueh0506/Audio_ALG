@@ -37,8 +37,8 @@ def _ints(name, values):
 def build(window_shape=(1, 2, K, 3), out_window_shape=None,
           rows_shape=(1, 5, 1, 4), rows_out_shape=None,
           start=1, end=K, step=1, axis=2, extra_window_user=None,
-          rows=((0, 1), (1, 3), (3, 5)), rows_axis=1, output_slice=False,
-          binding=STATE_BINDING, window_user_op='Slice',
+          rows=((0, 1), (1, 3), (3, 5)), rows_axis=1, head_slice=False,
+          state_slice=False, binding=STATE_BINDING, window_user_op='Slice',
           row_user_extra=False, dynamic_window=False):
     """A small graph shaped like the exporters' state handling."""
     frames = window_shape[2]
@@ -56,8 +56,14 @@ def build(window_shape=(1, 2, K, 3), out_window_shape=None,
             name='drop_oldest'))
     else:
         nodes.append(helper.make_node('Identity', ['win'], ['hist']))
-    nodes.append(helper.make_node('Concat', ['hist', 'new'], ['win_out'],
+    appended = 'win_long' if state_slice else 'win_out'
+    nodes.append(helper.make_node('Concat', ['hist', 'new'], [appended],
                                   axis=2, name='append'))
+    if state_slice:
+        initializers += [_ints('s_s', [0]), _ints('s_e', [window_shape[2]]),
+                         _ints('s_a', [2])]
+        nodes.append(helper.make_node(
+            'Slice', ['win_long', 's_s', 's_e', 's_a'], ['win_out']))
     if extra_window_user:
         nodes.append(helper.make_node('Neg', ['win'], ['unused_neg']))
     pieces = []
@@ -80,7 +86,7 @@ def build(window_shape=(1, 2, K, 3), out_window_shape=None,
             'rows_out', TensorProto.FLOAT,
             list(rows_out_shape or rows_shape)),
     ]
-    if output_slice:
+    if head_slice:
         initializers += [_ints('o_s', [0]), _ints('o_e', [1]),
                          _ints('o_a', [2])]
         nodes.append(helper.make_node(
@@ -135,7 +141,7 @@ def test_well_formed_graph_passes():
     (dict(out_window_shape=(1, 2, K - 1, 3)), 'changes shape'),
     (dict(rows_out_shape=(1, 5, 2, 4)), 'changes shape'),
     (dict(rows_shape=(5, 1, 4), rows_out_shape=(5, 1, 4)), 'rank'),
-    (dict(output_slice=True), 'produced by a Slice'),
+    (dict(state_slice=True), 'produced by a Slice'),
     (dict(binding=None), 'state_binding'),
     (dict(binding='ping_pong'), 'state_binding'),
     (dict(rows=((0, 1), (1, 3))), 'tile'),
@@ -147,6 +153,12 @@ def test_well_formed_graph_passes():
 def test_each_rule_has_a_graph_that_breaks_only_it(kwargs, message):
     with pytest.raises(RuntimeError, match=message):
         check(build(**kwargs))
+
+
+def test_a_head_output_may_be_a_slice():
+    """Only state outputs are restricted; a head cut from a state by a Slice
+    does not break the in-place binding."""
+    assert check(build(head_slice=True)) == 2
 
 
 def test_a_missing_state_pair_is_refused():

@@ -181,8 +181,8 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
     * ``slices`` maps a state input to the axis along which it is cut into
       per-GRU rows. Every consumer is a Slice of that axis with an explicit
       range and step 1, and the ranges tile the axis exactly once;
-    * no graph output is produced by a Slice, no state output is a graph
-      input, and every state output has a producer;
+    * no state output is produced by a Slice or is a graph input, and every
+      state output has a producer (other outputs are unrestricted);
     * the metadata records ``state_binding = in_place_same_address``.
 
     Returns the number of state pairs checked. Raises RuntimeError on the
@@ -268,16 +268,14 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
                 'state input %s: Slices do not tile axis %d exactly once '
                 '(coverage %s)' % (name, axis, covered))
 
-    for item in graph.graph.output:
-        producer = producers.get(item.name)
-        if producer is not None and producer.op_type == 'Slice':
-            raise RuntimeError('graph output %s is produced by a Slice'
-                               % item.name)
     for back in state_handoff.values():
         if back in inputs:
             raise RuntimeError('state output %s is a graph input' % back)
         if back not in producers:
             raise RuntimeError('state output %s has no producer' % back)
+        if producers[back].op_type == 'Slice':
+            raise RuntimeError('state output %s is produced by a Slice'
+                               % back)
 
     props = {prop.key: prop.value for prop in graph.metadata_props}
     if props.get('state_binding') != STATE_BINDING:
