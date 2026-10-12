@@ -707,7 +707,7 @@ class PostBeamResidualSuppressor:
         This -- not the four lanes -- is what shapes the four-channel output:
         the lanes run with spatial_linear_context and never compute a gain of
         their own, so a preset pushed at them does nothing. Mirrors the C
-        core's four_aec_nr_res_set_aec_preset().
+        wrapper's audio_pipeline_4ch_set_aec_preset().
 
         The stored value is what a later reset() rebuilds from, so the change
         survives one.

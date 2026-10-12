@@ -232,7 +232,8 @@ int aec_res_split_floor(const AecRes *res, float *live, float *target);
 >
 > 4ch 產品另有一條：四條 lane 以 `spatial_linear_context` 建立，從不走到自己的
 > suppression-gain 路徑，對 lane 呼叫 `aec_set_preset()` 依建構方式即為無效操作。
-> 請改用 `four_aec_nr_res_set_aec_preset()`，它針對的是那個共用的 post 級抑制器。
+> 請改用 `audio_pipeline_4ch_set_aec_preset()`（完整 wrapper；自己串後級時用自己 carve 的
+> `aec_res_set_preset()`），它針對的是那個共用的 post 級抑制器。
 > pipeline 層的對應入口見 [4ch 核心整合手冊 §3.2](integration_4ch_core_zh_TW.md)
 > 與 [mono 整合手冊 §3.2](integration_mono_zh_TW.md)。
 
@@ -351,7 +352,7 @@ if (anr_reconfigure(nr, &target) != 0) { /* grid 不符或 target 無效 */ }
 > standalone。兩條出貨 pipeline 的 NR 組態都是「canonical preset **加上**自己的覆寫」
 > （`L`、`alpha_decay`），把 canonical preset 交給
 > `anr_set_mode()` 在這種實例上會被**拒絕**（它的 `L` 不同）——這正是
-> `audio_pipeline_set_nr_mode()` / `four_aec_nr_res_set_nr_mode()` 經 `se_anr_stage_set_mode()` 重組完整組態
+> `audio_pipeline_set_nr_mode()` / `audio_pipeline_4ch_set_nr_mode()` 經 `se_anr_stage_set_mode()` 重組完整組態
 > 再呼叫 `anr_reconfigure()` 的原因。application 不要繞過 pipeline 的 setter 去
 > 呼叫便利包裝。
 

@@ -631,10 +631,10 @@ differ in exactly one field:
 |---|---|
 | `audio_pipeline_set_aec_preset(p, preset, ramp_ms)` | mono：底層 `Aec` 的 far-active 地板 |
 | `audio_pipeline_set_nr_mode(p, mode)` | mono：共用降噪器（`aec_only` 建置無降噪器，回 `-1`） |
-| `four_aec_nr_res_set_aec_preset(p, preset, ramp_ms)` | 4ch 核心：**共用 post 級抑制器** |
-| `four_aec_nr_res_set_nr_mode(p, mode)` | 4ch 核心：那**一個**共用降噪器 |
-| `four_aec_nr_res_post_split_floor(p, &live, &target)` | 4ch 核心：唯讀，線性功率。`live == target` 代表 ramp 已走完 |
-| `audio_pipeline_4ch_set_aec_preset()` / `_set_nr_mode()` | 4ch 完整 wrapper：轉呼叫核心的薄殼 |
+| `audio_pipeline_4ch_set_aec_preset(p, preset, ramp_ms)` | 4ch wrapper：**共用 post 級抑制器** |
+| `audio_pipeline_4ch_set_nr_mode(p, mode)` | 4ch wrapper：那**一個**共用降噪器 |
+| `audio_pipeline_4ch_post_split_floor(p, &live, &target)` | 4ch wrapper：唯讀，線性功率。`live == target` 代表 ramp 已走完 |
+| `aec_res_set_preset()` / `se_anr_stage_set_mode()` / `aec_res_split_floor()` | 4ch 前端 `FourAecNrRes` 沒有 setter；自己串後級的應用直接對自己 carve 的 stage 呼叫 |
 
 `ramp_ms == 0` 代表下一個 hop 套用（**不是錯誤**），落點與「用該 preset 從頭建一個新
 實例」完全相同；`> 0` 則以 dB 為單位線性走過去，上限 60 秒（mild ↔ aggressive 是
@@ -645,8 +645,8 @@ live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、�
 > **4ch：對四條 lane 重新指定 preset 是無效操作。** 四條 lane 都以
 > `spatial_linear_context` 建立，從不走到自己的殘留抑制器，它們的地板
 > 什麼都不塑形。真正乘上輸出的 gain 來自**唯一一個**共用的 post 級抑制器，這就是
-> `four_aec_nr_res_set_aec_preset()` 存在、而不是要你迴圈呼叫 `aec_set_preset()` 的
-> 原因（由 `4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c` 的 `test_runtime_strength()` 釘住）。
+> `audio_pipeline_4ch_set_aec_preset()` 存在、而不是要你迴圈呼叫 `aec_set_preset()` 的
+> 原因（由 `4ch_aec_bf_nr_res/tests/test_audio_pipeline_4ch.c` 的 `test_runtime_strength()` 釘住）。
 
 > **NR：不要繞過 pipeline 的 setter 去呼叫 `anr_set_mode()`。** 兩條 pipeline 的
 > NR 組態都是「canonical preset **加上**自己的覆寫」（`L`、`alpha_decay`，組成見 `common/se_anr_stage.h` 的 `se_anr_compose_config()`）。`anr_set_mode()` 組的是裸的
