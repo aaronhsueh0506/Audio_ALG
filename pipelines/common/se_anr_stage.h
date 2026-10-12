@@ -18,6 +18,7 @@
 #include <stddef.h>
 
 #include "anr.h"
+#include "se_stage.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -40,15 +41,14 @@ size_t se_anr_stage_mem_size(const AnrConfig* cfg);
  * se_anr_stage_mem_size(cfg) bytes. NULL on failure. */
 AnrDenoiser* se_anr_stage_init(void* mem, size_t bytes, const AnrConfig* cfg);
 
-/* One hop. `r2` (n_freqs residual-echo powers on the AEC power scale) folds
- * into the denoiser's noise floor as r2 / SE_PSD_SCALE through `scratch`
- * (n_freqs floats); NULL r2 or NULL scratch selects plain noise reduction.
- * Returns 0, or -1 for a NULL denoiser or spectrum. */
-int se_anr_stage_process_gain(AnrDenoiser* nr, const Complex* error_spec,
-                              const float* r2, float* scratch, int n_freqs);
-
-/* The gain of the last processed hop; borrowed until the next call. */
-const float* se_anr_stage_gain(const AnrDenoiser* nr);
+/* One hop over `frame` (needs e). With use_r2 the residual-echo powers frame->r2
+ * (n_freqs, AEC power scale) fold into the denoiser's noise floor as
+ * r2 / SE_PSD_SCALE through `scratch` (n_freqs floats); use_r2 = 0, a NULL r2 or
+ * a NULL scratch selects plain noise reduction. Returns the gain, n_freqs floats
+ * owned by the denoiser and valid until its next call; NULL for a NULL
+ * denoiser, frame or spectrum, or a refused hop. */
+const float* se_anr_stage_gain(AnrDenoiser* nr, const SeSpecFrame* frame,
+                               float* scratch, int use_r2);
 
 /* Re-targets the strength: recomposes the configuration on the instance's own
  * grid and reconfigures. Returns 0, or -1 for a NULL denoiser, an invalid

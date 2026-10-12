@@ -230,7 +230,13 @@ static void test_stage(void) {
     Complex spec[129];
     float r2[129], scratch[129], extra[129];
     const float *ga, *gb;
+    SeSpecFrame f;
     int k, m, frame;
+
+    memset(&f, 0, sizeof(f));
+    f.n_freqs = n;
+    f.e = spec;
+    f.r2 = r2;
 
     CHECK(bytes > 0 && pool && pool2, "stage size");
     CHECK(se_anr_stage_mem_size(&(AnrConfig){0}) == 0, "invalid config has no size");
@@ -259,9 +265,9 @@ static void test_stage(void) {
             r2[k] = (float)((k + 1) * (frame + 3)) * 4.0e5f;
             extra[k] = r2[k] / (32768.0f * 32768.0f);
         }
-        CHECK(se_anr_stage_process_gain(a, spec, r2, scratch, n) == 0, "stage process");
+        ga = se_anr_stage_gain(a, &f, scratch, 1);
+        CHECK(ga != NULL, "stage process");
         CHECK(anr_process_gain(b, spec, extra, NULL) == 0, "direct process");
-        ga = se_anr_stage_gain(a);
         gb = anr_get_gain(b, NULL);
         CHECK(ga && gb && memcmp(ga, gb, (size_t)n * sizeof(float)) == 0, "stage gain equals the direct call");
         CHECK(memcmp(scratch, extra, (size_t)n * sizeof(float)) == 0, "scratch holds r2 / SE_PSD_SCALE");
@@ -271,13 +277,16 @@ static void test_stage(void) {
     anr_reset(b);
     for (frame = 0; frame < 10; ++frame) {
         for (k = 0; k < n; ++k) { spec[k].r = (float)(k + frame); spec[k].i = (float)(frame - k); }
-        CHECK(se_anr_stage_process_gain(a, spec, NULL, scratch, n) == 0, "no prior");
+        ga = se_anr_stage_gain(a, &f, scratch, 0);
+        CHECK(ga != NULL, "no prior");
         CHECK(anr_process_gain(b, spec, NULL, NULL) == 0, "direct no prior");
-        CHECK(memcmp(se_anr_stage_gain(a), anr_get_gain(b, NULL), (size_t)n * sizeof(float)) == 0, "no-prior gain");
-        CHECK(se_anr_stage_process_gain(a, spec, r2, NULL, n) == 0, "no scratch");
+        CHECK(memcmp(ga, anr_get_gain(b, NULL), (size_t)n * sizeof(float)) == 0, "no-prior gain");
+        CHECK(se_anr_stage_gain(a, &f, NULL, 1) != NULL, "no scratch selects plain NR");
     }
-    CHECK(se_anr_stage_process_gain(NULL, spec, NULL, NULL, n) == -1, "NULL denoiser");
-    CHECK(se_anr_stage_process_gain(a, NULL, NULL, NULL, n) == -1, "NULL spectrum");
+    CHECK(se_anr_stage_gain(NULL, &f, NULL, 0) == NULL, "NULL denoiser");
+    CHECK(se_anr_stage_gain(a, NULL, NULL, 0) == NULL, "NULL frame");
+    f.e = NULL;
+    CHECK(se_anr_stage_gain(a, &f, NULL, 0) == NULL, "NULL spectrum");
 
     se_anr_stage_destroy(a);
     se_anr_stage_destroy(b);

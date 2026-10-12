@@ -38,6 +38,7 @@
 
 #include "audio_pipeline.h"
 #include "common/se_config.h"     /* se_derive(): grid + AecConfig, shared by every application */
+#include "common/se_stage.h"      /* SeSpecFrame                                                  */
 #include "common/se_anr_stage.h"  /* NR configuration, init, per-hop gain, strength setter       */
 #include "fft_wrapper.h"       /* fft_get_mem_size, Complex, ALIGN16 */
 #include "audio_stft.h"        /* AcIstft: inverse FFT + sqrt-Hann OLA                */
@@ -78,15 +79,6 @@
 #endif
 
 #define PSD_SCALE                 SE_PSD_SCALE  /* int16^2 (Python _PSD_SCALE) */
-/* Comfort noise is scaled by the denoiser gain of its bin, but never below
- * this amplitude (-10 dB): the fill follows the denoised floor while enough
- * of it remains to keep the residual echo it masks from surfacing. */
-#define CNG_NR_GAIN_FLOOR         0.31622777f
-
-/* Comfort-noise generator seed -- the constant both CLIs' old file-global
- * g_rng carried, kept so a fresh instance and a reset instance start the same
- * noise sequence. */
-#define AUDIO_PIPELINE_RNG_SEED 0x9e3779b9u
 
 /* This file's own carve-layout version (see audio_pipeline.h's
  * AudioPipelineMemReq doc for the bump rule). Bumped 1->2: g_aec (a per-hop
@@ -664,7 +656,7 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
     p->enable_cng_effective = aec_cfg.enable_cng && cfg->enable_cng && cfg->enable_res;
     p->sample_rate          = cfg->sample_rate;
     p->hop = hop; p->frame_sz = frame_sz; p->fft_sz = fft_sz; p->n_freqs = n_freqs;
-    p->rng_state  = AUDIO_PIPELINE_RNG_SEED;
+    p->rng_state  = SE_CNG_RNG_SEED;
     p->pool       = sub_pool;
     p->pool_size  = sub_bytes;
     p->owned_heap = NULL;
@@ -712,71 +704,43 @@ static void audio_pipeline_copy_aec_timing(AudioPipeline* p) {
 #define audio_pipeline_copy_aec_timing(p) ((void)(p))
 #endif
 
-/* The conventional post path from the AEC context up to and including the
- * comfort-noise fill: leaves the spectrum to synthesise in p->spec. The
- * caller has already handled aec_only. */
-static void prepare_post_spectrum(AudioPipeline* p, const float* mic,
-                                  const float* ref) {
-    const int n_freqs = p->n_freqs;
+/* The analysis stage of a hop: the context-only linear AEC, then the borrowed
+ * view of its spectra. The frame aliases the AEC's per-hop buffers and is
+ * valid until the next AEC processing call on this instance. */
+static void analyse_hop(AudioPipeline* p, const float* mic, const float* ref,
+                        SeSpecFrame* f) {
+    AecResContext ctx;
+    AecLinearContext lin;
     aec_process_context(p->aec, mic, ref);
     audio_pipeline_copy_aec_timing(p);
-    uint32_t t0 = audio_pipeline_now_us();
-
-    AecResContext ctx;
     aec_get_res_context(p->aec, &ctx);
+    aec_get_linear_context(p->aec, &lin);
     /* enable_res=0/return_res_context=1 is set unconditionally for every
-     * !aec_only instance (derive_dims_and_configs() above), so
-     * ctx.error_spec/ctx.res_gain are always non-NULL here -- there is no
-     * live "seam unavailable" case to fall back from. */
-
-    /* Stage 2: echo-aware NR gain. The residual-echo power r2 folds into the
-     * noise floor (xi = S^2/(N^2+R^2)) through p->extra; legacy_amin hands the
-     * denoiser no prior. The gain is read from the denoiser's own buffer, no
-     * per-hop copy. */
-    const float* nr_gain = p->unity_gain;
-    if (p->nr) {
-        se_anr_stage_process_gain(p->nr, ctx.error_spec,
-                                  p->legacy_amin ? NULL : ctx.r2, p->extra, n_freqs);
-        nr_gain = se_anr_stage_gain(p->nr);
-    }
-    uint32_t t1 = audio_pipeline_now_us();
-    p->last_timing.nr_us = p->nr ? t1 - t0 : 0;
-    /* A disabled gain source reads as the unity vector, so the fusion below
-     * needs no second code path. */
-    const float* res_gain = p->enable_res ? ctx.res_gain : p->unity_gain;
-
-    /* Stage 3: g_total = min(G_nr, G_res). ctx.res_gain (= G_res, pre-min)
-     * also sets the comfort-noise level below so CNG reflects AEC
-     * suppression only. Read directly from the AEC's own seam buffer rather
-     * than a local copy -- aec.h's AecResContext doc guarantees these seam
-     * pointers alias AEC's internal per-hop buffers and stay valid until the
-     * next aec_process() call, which doesn't happen again before this hop
-     * finishes (verified below: ctx.res_gain is read again, unchanged, at
-     * the CNG loop further down). Likewise anr_get_gain()'s buffer is
-     * stable until the next anr_process_gain()/anr_process() call
-     * on this instance, which also doesn't happen again before this hop
-     * finishes. */
-    sk_min_f32(p->g_total, nr_gain, res_gain, n_freqs);
-
-    /* S(f) = E(f) . g_total */
-    sk_capply_gain_f32(p->spec, ctx.error_spec, p->g_total, n_freqs);
-
-    /* Comfort noise on the cut bins: level = sqrt(N^2/PSD_SCALE), scaled by
-     * sqrt(1 - G_res^2) so it fills only what the AEC suppressed (bins
-     * 1..N-2), and by G_nr (bounded below by CNG_NR_GAIN_FLOOR) so the fill
-     * follows the denoised floor rather than the ambient level: the denoiser
-     * never sees the comfort noise, so its gain is applied to it here. */
-    if (p->enable_cng_effective && ctx.comfort_noise)
-        aec_cng_fill(&p->rng_state, p->spec, ctx.comfort_noise, ctx.res_gain,
-                     nr_gain, CNG_NR_GAIN_FLOOR, n_freqs);
-
-    p->last_timing.post_us = audio_pipeline_now_us() - t1;
+     * !aec_only instance (derive_dims_and_configs() above), so the seam
+     * pointers are always non-NULL here. */
+    f->n_freqs = p->n_freqs;
+    f->hop = p->hop;
+    f->e = ctx.error_spec;
+    f->y = ctx.near_spec;
+    f->x = ctx.far_spec;
+    f->r2 = ctx.r2;
+    f->cn = ctx.comfort_noise;
+    f->g_res_ctx = ctx.res_gain;
+    f->far_hop = lin.aligned_far_hop;
+    f->formed_hop = ctx.formed_hop;
+    f->far_power = ctx.far_power;
+    f->max_dt = ctx.dt_indicator;
+    f->max_sat = ctx.saturation_level;
+    f->all_converged = ctx.filter_converged;
+    f->clock_drift = 0;
+    f->delay_changed = lin.delay_state == AEC_LINEAR_DELAY_CHANGED;
+    f->delay_locked = lin.delay_state != AEC_LINEAR_DELAY_UNLOCKED;
 }
 
 /* One IFFT + sqrt-Hann synthesis + OLA, then the hop emit/shift, with the
  * synth timing stamp. Shared by audio_pipeline_process() and
- * audio_pipeline_synthesize_external() so both finish a hop through the one
- * OLA with the identical operation order. */
+ * audio_pipeline_synthesize() so both finish a hop through the one OLA with
+ * the identical operation order. */
 static void synthesize_hop(AudioPipeline* p, const Complex* spectrum,
                            float* out) {
     uint32_t t2 = audio_pipeline_now_us();
@@ -785,34 +749,63 @@ static void synthesize_hop(AudioPipeline* p, const Complex* spectrum,
 }
 
 int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref, float* out) {
+    SeSpecFrame f;
+    const float *nr_gain, *res_gain;
+    uint32_t t0, t1;
+
     if (!p || !mic || !ref || !out) return -1;
 
     /* No per-hop clear of p->last_timing: every field a mode owns is
      * rewritten below before this function returns, and the fields a mode
      * does not own are written by no path at all, so they keep the zero the
-     * control block got at init. A clear here would run in every build --
-     * it cannot be gated on the timing flags without changing what a
-     * release build reports -- to guard a bail-out this function does not
-     * have. Add one if it ever gains one. */
+     * control block got at init. */
 
-    /* Stage 1: AEC. aec_process() already copies mic/ref into its own
-     * near_hop/far_hop at the top of the call, so passing the caller's
-     * pointers straight through is exactly as safe as an extra pipeline-
-     * owned decoupling copy would have been, without paying for one.
-     *
-     * Dispatch on p->aec_only, fixed at construction. The two entry points
-     * differ only by whether the result is copied out, so this is purely a
-     * cost choice. aec_only means the AEC's own output IS the pipeline's
-     * output -- needs aec_process(), writing directly into the caller's
-     * `out` (already validated non-NULL and hop-sized above). !aec_only
-     * means downstream NR/RES reads only ctx.error_spec and never the
-     * emitted hop, so aec_process_context() skips that copy. */
+    /* aec_only means the AEC's own output IS the pipeline's output: it needs
+     * aec_process(), writing directly into the caller's `out`. Otherwise the
+     * downstream stages read only the frame and never the emitted hop, so
+     * aec_process_context() skips that copy. The caller's mic/ref go straight
+     * into the AEC, which copies them into its own buffers. */
     if (p->aec_only) {
         aec_process(p->aec, mic, ref, out);
         audio_pipeline_copy_aec_timing(p);
         return 0;
     }
-    prepare_post_spectrum(p, mic, ref);
+    analyse_hop(p, mic, ref, &f);
+    t0 = audio_pipeline_now_us();
+
+    /* Noise-reduction gain. The residual-echo power r2 folds into the noise
+     * floor (xi = S^2/(N^2+R^2)) through p->extra; legacy_amin hands the
+     * denoiser no prior. */
+    nr_gain = p->unity_gain;
+    if (p->nr) {
+        nr_gain = se_anr_stage_gain(p->nr, &f, p->extra, !p->legacy_amin);
+        if (!nr_gain) return -1;
+    }
+    t1 = audio_pipeline_now_us();
+    p->last_timing.nr_us = p->nr ? t1 - t0 : 0;
+    /* A disabled gain source reads as the unity vector, so the fusion below
+     * needs no second code path. */
+    res_gain = p->enable_res ? f.g_res_ctx : p->unity_gain;
+
+    /* g_total = min(G_nr, G_res). G_res (pre-min) also sets the comfort-noise
+     * level so the fill reflects AEC suppression only. Both gain vectors stay
+     * valid until their producer runs again, which does not happen before
+     * this hop finishes. */
+    sk_min_f32(p->g_total, nr_gain, res_gain, p->n_freqs);
+
+    /* S(f) = E(f) . g_total */
+    sk_capply_gain_f32(p->spec, f.e, p->g_total, p->n_freqs);
+
+    /* Comfort noise on the cut bins: level = sqrt(N^2/PSD_SCALE), scaled by
+     * sqrt(1 - G_res^2) so it fills only what the AEC suppressed (bins
+     * 1..N-2), and by G_nr (bounded below by SE_CNG_NR_GAIN_FLOOR) so the fill
+     * follows the denoised floor: the denoiser never sees the comfort noise,
+     * so its gain is applied to it here. */
+    if (p->enable_cng_effective && f.cn)
+        aec_cng_fill(&p->rng_state, p->spec, f.cn, f.g_res_ctx,
+                     nr_gain, SE_CNG_NR_GAIN_FLOOR, p->n_freqs);
+
+    p->last_timing.post_us = audio_pipeline_now_us() - t1;
 
     /* p->spec sits on the matching sqrt-Hann analysis frame; complete the
      * 50%-overlap WOLA with one IFFT + synthesis + OLA. */
@@ -820,23 +813,15 @@ int audio_pipeline_process(AudioPipeline* p, const float* mic, const float* ref,
     return 0;
 }
 
-int audio_pipeline_process_post_view(AudioPipeline* p, const float* mic,
-                                     const float* ref,
-                                     AudioPipelinePostView* out) {
-    AecResContext ctx;
-    /* p->nr is NULL exactly when enable_nr=0 on a !aec_only instance. */
-    if (!p || !mic || !ref || !out || p->aec_only || p->nr) return -1;
-    prepare_post_spectrum(p, mic, ref);
-    /* The AEC's seam pointers alias its internal per-hop buffers and stay
-     * valid until the next AEC processing call (aec.h, AecResContext). */
-    aec_get_res_context(p->aec, &ctx);
-    out->error_spec = ctx.error_spec;
-    out->post_spectrum = p->spec;
+int audio_pipeline_process_spec(AudioPipeline* p, const float* mic,
+                                const float* ref, SeSpecFrame* frame) {
+    if (!p || !mic || !ref || !frame || p->aec_only) return -1;
+    analyse_hop(p, mic, ref, frame);
     return 0;
 }
 
-int audio_pipeline_synthesize_external(AudioPipeline* p,
-                                       const Complex* spectrum, float* out) {
+int audio_pipeline_synthesize(AudioPipeline* p, const Complex* spectrum,
+                              float* out) {
     if (!p || !spectrum || !out || p->aec_only) return -1;
     synthesize_hop(p, spectrum, out);
     return 0;
@@ -873,7 +858,7 @@ void audio_pipeline_reset(AudioPipeline* p) {
         memset(p->spec,     0, (size_t)p->n_freqs  * sizeof(Complex));
     }
 
-    p->rng_state = AUDIO_PIPELINE_RNG_SEED;
+    p->rng_state = SE_CNG_RNG_SEED;
 }
 
 void audio_pipeline_destroy(AudioPipeline* p) {

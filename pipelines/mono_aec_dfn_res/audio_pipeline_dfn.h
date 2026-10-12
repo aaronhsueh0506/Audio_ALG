@@ -5,10 +5,11 @@
  * disabled, and DFN2 inserted between its post-RES spectrum and its
  * synthesis. Per hop:
  *
- *   audio_pipeline_process_post_view()   E (linear-AEC error), P = E*G_res
+ *   audio_pipeline_process_spec()        E (linear-AEC error), G_res, comfort noise;
+ *                                        the application forms P = E*G_res
  *                                        (+ comfort noise when enabled)
  *   48 kHz:  dfn_res_stage_process(E, P) DFN2 estimated on E, applied on P,
- *            audio_pipeline_synthesize_external()   the host's own WOLA
+ *            audio_pipeline_synthesize()   the host's own WOLA
  *   8/16 kHz: dfn_rate_bridge_process(E, P)  the same stage on its 48 kHz
  *            grid: native WOLA of E and P, resample up, 48 kHz analysis,
  *            stage, 48 kHz WOLA, resample down (dfn_rate_bridge.h)

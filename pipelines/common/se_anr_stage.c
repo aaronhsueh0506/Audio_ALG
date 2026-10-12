@@ -16,18 +16,16 @@ AnrDenoiser* se_anr_stage_init(void* mem, size_t bytes, const AnrConfig* cfg) {
     return anr_init(mem, bytes, cfg);
 }
 
-int se_anr_stage_process_gain(AnrDenoiser* nr, const Complex* error_spec,
-                              const float* r2, float* scratch, int n_freqs) {
+const float* se_anr_stage_gain(AnrDenoiser* nr, const SeSpecFrame* frame,
+                               float* scratch, int use_r2) {
     const float* extra = NULL;
-    if (r2 && scratch) {
+    if (!nr || !frame || !frame->e) return NULL;
+    if (use_r2 && frame->r2 && scratch) {
         int k;
-        for (k = 0; k < n_freqs; ++k) scratch[k] = r2[k] / SE_PSD_SCALE;
+        for (k = 0; k < frame->n_freqs; ++k) scratch[k] = frame->r2[k] / SE_PSD_SCALE;
         extra = scratch;
     }
-    return anr_process_gain(nr, error_spec, extra, NULL);
-}
-
-const float* se_anr_stage_gain(const AnrDenoiser* nr) {
+    if (anr_process_gain(nr, frame->e, extra, NULL) != 0) return NULL;
     return anr_get_gain(nr, NULL);
 }
 

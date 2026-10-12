@@ -4,11 +4,18 @@
 #include <string.h>
 
 #include "audio_pipeline_dfn.h"
+#include "simd_kernels.h"   /* sk_min_f32 / sk_capply_gain_f32 */
 
 #define MONO_ALIGN 16u
 
 struct MonoAecDfnRes {
     AudioPipeline *host;
+    float *g_total;             /* min(unity, G_res)                     */
+    float *unity;               /* all-ones gain read for the absent NR  */
+    Complex *post;              /* P = E * g_total (+ comfort noise)     */
+    uint32_t rng;               /* comfort-noise generator state         */
+    int cng;                    /* comfort-noise fill enabled            */
+    int n_freqs;
     DfnResStage *stage;         /* 48 kHz: the stage, driven directly */
     Complex *stage_output;      /* 48 kHz: its output spectrum          */
     DfnRateBridge *bridge;      /* 8/16 kHz: the stage inside the bridge */
@@ -42,10 +49,12 @@ typedef struct Resolved {
     uint32_t sub_layout;            /* the stage's or the bridge's */
     uint32_t sub_hash;
     uint32_t backend_id;
+    int n_freqs;
     size_t bytes;
 } Resolved;
 
 static int resolve(const MonoAecDfnResConfig *cfg, Resolved *r) {
+    AudioPipelineMemBreakdown bd;
     size_t value;
     if (!cfg || !r ||
         (cfg->host.sample_rate != 8000 && cfg->host.sample_rate != 16000 &&
@@ -61,6 +70,8 @@ static int resolve(const MonoAecDfnResConfig *cfg, Resolved *r) {
     r->scfg.model = cfg->model;
     if (audio_pipeline_get_mem_requirements(&cfg->host, &r->host_req) != 0)
         return -1;
+    if (audio_pipeline_get_mem_breakdown(&cfg->host, &bd) != 0) return -1;
+    r->n_freqs = bd.n_freqs;
     if (r->use_bridge) {
         r->bcfg = dfn_rate_bridge_default_config(cfg->host.sample_rate);
         r->bcfg.fft_size = cfg->host.fft_size;
@@ -87,6 +98,9 @@ static int resolve(const MonoAecDfnResConfig *cfg, Resolved *r) {
         value += add_; \
     } while (0)
     ADD_REGION(r->host_req.bytes);
+    ADD_REGION((size_t)r->n_freqs * sizeof(float));     /* g_total */
+    ADD_REGION((size_t)r->n_freqs * sizeof(float));     /* unity   */
+    ADD_REGION((size_t)r->n_freqs * sizeof(Complex));   /* post    */
     if (r->use_bridge) {
         ADD_REGION(r->bridge_req.bytes);
     } else {
@@ -162,6 +176,20 @@ MonoAecDfnRes *mono_aec_dfn_res_init_ex(void *mem, size_t bytes,
                                      &cfg->host, &r.host_req);
     if (!p->host) return NULL;
     cursor += align_up((size_t)r.host_req.bytes);
+    p->n_freqs = r.n_freqs;
+    p->g_total = (float *)cursor;
+    cursor += align_up((size_t)r.n_freqs * sizeof(float));
+    p->unity = (float *)cursor;
+    cursor += align_up((size_t)r.n_freqs * sizeof(float));
+    p->post = (Complex *)cursor;
+    cursor += align_up((size_t)r.n_freqs * sizeof(Complex));
+    {
+        int k;
+        for (k = 0; k < r.n_freqs; ++k) p->unity[k] = 1.0f;
+    }
+    p->rng = SE_CNG_RNG_SEED;
+    /* The comfort-noise fill is the host config's switch (the AEC preset keeps it on). */
+    p->cng = cfg->host.enable_cng;
     /* The host resolves fft_size 0 to its rate default; the stage's grid
      * (48 kHz) or the bridge's native grid must be the host's, checked once
      * here. */
@@ -206,6 +234,7 @@ MonoAecDfnRes *mono_aec_dfn_res_create(const MonoAecDfnResConfig *cfg) {
 void mono_aec_dfn_res_reset(MonoAecDfnRes *p) {
     if (!p) return;
     audio_pipeline_reset(p->host);
+    p->rng = SE_CNG_RNG_SEED;
     if (p->bridge) {
         dfn_rate_bridge_reset(p->bridge);   /* resets its stage too */
         return;
@@ -227,18 +256,26 @@ void mono_aec_dfn_res_destroy(MonoAecDfnRes *p) {
 
 int mono_aec_dfn_res_process(MonoAecDfnRes *p, const float *mic,
                              const float *ref, float *out) {
-    AudioPipelinePostView view;
+    SeSpecFrame f;
     int ok;
     if (!p || !mic || !ref || !out) return -1;
-    ok = audio_pipeline_process_post_view(p->host, mic, ref, &view) == 0;
+    ok = audio_pipeline_process_spec(p->host, mic, ref, &f) == 0;
+    if (ok) {
+        /* P = E * min(1, G_res), plus comfort noise on the cut bins. The
+         * absent denoiser reads as the unity vector, so the same four calls
+         * as the NR pipeline serve. */
+        sk_min_f32(p->g_total, p->unity, f.g_res_ctx, p->n_freqs);
+        sk_capply_gain_f32(p->post, f.e, p->g_total, p->n_freqs);
+        if (p->cng && f.cn)
+            aec_cng_fill(&p->rng, p->post, f.cn, f.g_res_ctx, p->unity,
+                         SE_CNG_NR_GAIN_FLOOR, p->n_freqs);
+    }
     if (ok && p->bridge) {
-        ok = dfn_rate_bridge_process(p->bridge, view.error_spec,
-                                     view.post_spectrum, out) == 0;
+        ok = dfn_rate_bridge_process(p->bridge, f.e, p->post, out) == 0;
     } else if (ok) {
-        ok = dfn_res_stage_process(p->stage, view.error_spec,
-                                   view.post_spectrum, p->stage_output) >= 0 &&
-             audio_pipeline_synthesize_external(p->host, p->stage_output,
-                                                out) == 0;
+        ok = dfn_res_stage_process(p->stage, f.e, p->post,
+                                   p->stage_output) >= 0 &&
+             audio_pipeline_synthesize(p->host, p->stage_output, out) == 0;
     }
     if (!ok) {
         mono_aec_dfn_res_reset(p);

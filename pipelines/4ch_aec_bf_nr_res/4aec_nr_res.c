@@ -1741,13 +1741,18 @@ static int prepare_post_spectrum(
     p->last_timing.res_us = p->res ? t1 - t0 : 0;
     if (!res_gain) return 0;
 
+    nr_gain = p->unity_gain;
     if (p->cfg.enable_nr) {
         /* The denoiser's residual-echo prior is the fused R^2 (the stage
          * rescales it into extra_noise); legacy_amin hands it no prior. */
-        if (se_anr_stage_process_gain(
-                p->nr, error, p->cfg.legacy_amin ? NULL : p->fused_r2,
-                p->extra_noise, n) != 0)
-            return 0;
+        SeSpecFrame nf;
+        memset(&nf, 0, sizeof(nf));
+        nf.n_freqs = n;
+        nf.e = error;
+        nf.r2 = p->fused_r2;
+        nr_gain = se_anr_stage_gain(p->nr, &nf, p->extra_noise,
+                                    !p->cfg.legacy_amin);
+        if (!nr_gain) return 0;
         p->last_timing.nr_us = four_aec_nr_res_now_us() - t1;
     } else {
         p->last_timing.nr_us = 0;
@@ -1758,7 +1763,6 @@ static int prepare_post_spectrum(
      * G_nr. sk_min_f32 is the mono twin's kernel: a non-finite gain
      * propagates to the output finite gate instead of being masked the way
      * fminf would mask it. */
-    nr_gain = p->cfg.enable_nr ? se_anr_stage_gain(p->nr) : p->unity_gain;
     sk_min_f32(p->total_gain, nr_gain, res_gain, n);
     sk_capply_gain_f32(p->output_spec, error, p->total_gain, n);
 
