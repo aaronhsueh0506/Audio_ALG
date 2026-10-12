@@ -33,18 +33,18 @@
  *    邊界用 reflect padding。這個 C 是串流實現 (等價 center=False，零填暖機)。
  *    後果只在 clip 起點: Python 的 frame 0 含有訊號的時間反轉拷貝，這裡是靜音。
  *    穩態下 center=True 只是固定的半窗時序偏移，串流可精確重現。
- *    ⚠ 實測: torch.istft 在 win=1024/hop=512 下直接拒絕 center=False
+ *    ⚠ torch.istft 在 win=1024/hop=512 下直接拒絕 center=False
  *    ("window overlap add min: 1")，因為首尾框 OLA 覆蓋不足。所以要對齊得照
  *    libDF 做「零填暖機 + 丟掉暖機框」的 framing，不是翻一個 flag。
  *    ⚠ 這件事對 causal EMA 尤其要緊: 它的狀態從 frame 0 起累積，而 3 秒
  *    segment 全程都在暖機期 (3*tau = 273 frames vs 281 frames/segment)，所以
  *    frame 0 的差異會一路傳播。
  *
- * 2) spec_norm_eps。trainer 已經把它移除以對齊 libDF 的裸 sqrt，但這裡
+ * 2) spec_norm_eps。trainer 沒有它，以對齊 libDF 的裸 sqrt，但這裡
  *    保留 (DFN2_SPEC_NORM_EPS)。這不是不一致，是刻意的:
  *    fp32 + 次正規數下 mu 永不為 0，所以 trainer 不需要它；但在 FTZ /
  *    denormals-are-zero 的目標上 mu 可以真的到 0，x/sqrt(0) = NaN。
- *    ⚠ 這正是「trainer 拿掉、C 保留」的理由，precedent 見 RNNoise-ERB 的
+ *    ⚠ 這正是「trainer 拿掉、C 保留」的理由，同樣做法見 RNNoise-ERB 的
  *    process.c: sqrtf(state + RNNOISE_SPEC_NORM_EPS)。
  *    代價是與 Python 差 ~1e-9 相對，遠小於 float32 ULP 級的其他差異。
  *
