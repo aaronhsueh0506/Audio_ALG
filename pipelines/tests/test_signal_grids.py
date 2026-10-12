@@ -27,9 +27,9 @@ from pipelines.aec_nr_pipeline import _build_denoiser, _project_grid
 @pytest.mark.parametrize(
     "sample_rate,fft_size,expected",
     [
-        # 16kHz default flipped 512/256 (16ms hop) -> 256/128 (8ms hop) on
-        # 2026-08-02/03 (NR CHANGELOG [4.5.0]); 512/256 remains a supported,
-        # explicit alternate grid (see the fft_size=512 case below).
+        # 16kHz default is 256/128 (8ms hop) (NR CHANGELOG [4.5.0]); 512/256
+        # remains a supported, explicit alternate grid (see the fft_size=512
+        # case below).
         (16000, None, (256, 128, 256)),
         (16000, 512, (512, 256, 512)),
         (48000, None, (1024, 512, 1024)),
@@ -42,9 +42,9 @@ def test_nr_project_grid(sample_rate, fft_size, expected):
 @pytest.mark.parametrize(
     "sample_rate,fft_size,expected",
     [
-        # 16kHz default flipped 512/256 (16ms hop) -> 256/128 (8ms hop) on
-        # 2026-08-02/03 (NR CHANGELOG [4.5.0]); 512/256 remains a supported,
-        # explicit alternate grid (see the fft_size=512 case below).
+        # 16kHz default is 256/128 (8ms hop) (NR CHANGELOG [4.5.0]); 512/256
+        # remains a supported, explicit alternate grid (see the fft_size=512
+        # case below).
         (16000, None, (256, 128, 256)),
         (16000, 512, (512, 256, 512)),
         (48000, None, (1024, 512, 1024)),
@@ -186,7 +186,7 @@ def test_mmse_lsa_outer_model_retimes_all_frame_domain_state(sample_rate, fft_si
     hop = denoiser.processor.frame_shift
     # L=32 is documented in config/v3_2_config.yaml as authored directly against
     # a 16ms hop ("32 幀 x 16ms/hop = 512ms"); v3_2_mmse_lsa.py's L retime call
-    # applies that basis unconditionally (NR CHANGELOG [4.5.0], 2026-08-03) --
+    # applies that basis unconditionally (NR CHANGELOG [4.5.0]) --
     # unlike num_init_frames/scene_change_min_frames below, which stay on the
     # generic 10ms reference (no equivalent hop-basis evidence for them).
     assert denoiser.noise_estimator.L == retime_frame_count(

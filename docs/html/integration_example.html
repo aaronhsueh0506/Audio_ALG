@@ -193,7 +193,7 @@ ac_istft_push(istft, spec, out);</pre>
 <pre>aec_process_context(p->aec, mic, ref);
 aec_get_res_context(p->aec, &rctx);      /* rctx.formed_hop     ← 時域線性誤差 */
 aec_get_linear_context(p->aec, &lctx);   /* lctx.aligned_far_hop ← 對齊後的 far  */</pre>
-<p><b>注意 mono 拿的是「時域」兩個 tap,不是頻譜</b>——它有自己的 STFT,AEC 的 <code>error_spec</code> 完全不用;兩路都走 rolling <code>push_frame()</code>(2026-09-03 起,先前 centered)。4ch<b>不做 error 分析</b>:<code>gsc_spectrum</code> 直接當 error 幀,far 分支走同一個 push_frame。<b>不可與 centered <code>push()</code> 混用同一 state</b>(共用 history、不共用排程;現只剩 Python parity gate 用 centered 版)。</p>
+<p><b>注意 mono 拿的是「時域」兩個 tap,不是頻譜</b>——它有自己的 STFT,AEC 的 <code>error_spec</code> 完全不用;兩路都走 rolling <code>push_frame()</code>(不是 centered)。4ch<b>不做 error 分析</b>:<code>gsc_spectrum</code> 直接當 error 幀,far 分支走同一個 push_frame。<b>不可與 centered <code>push()</code> 混用同一 state</b>(共用 history、不共用排程;現只剩 Python parity gate 用 centered 版)。</p>
 <h3>邊界偵測與 reprime</h3>
 <pre>if (lctx.delay_state == AEC_LINEAR_DELAY_CHANGED
     || (FIXED 模式下 UNLOCKED→LOCKED 的首次轉換)) {

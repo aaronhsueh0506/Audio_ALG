@@ -78,7 +78,7 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <tr><td>48 k</td><td>1024 / 512（513）</td><td>預設（唯一）</td></tr>
 <tr><td>mono pipeline（<code>pipelines/</code>）</td><td>8/16/48 k</td>
 <td>同 AEC 白名單；16 k 接受 256 或 512</td>
-<td>16k 預設 256/128（2026-08-02/03 起）</td>
+<td>16k 預設 256/128</td>
 <td><code>pipelines/common/se_config.c</code> <code>se_grid_resolve()</code>（<code>allow_8k</code> 由應用的規則給）</td></tr>
 <tr><td>4ch core（<code>4ch_aec_bf_nr_res/</code>）</td><td>16/48 k</td>
 <td>只有三個 grid：16k/256、16k/512、48k/1024（<b>無 8 k</b>）</td><td>16k 預設 256</td>
@@ -219,7 +219,7 @@ push#1→2 幀（frame0 含 reflect 前綴 + frame1）、之後每 push 1 幀；
 <ul>
 <li>用 <code>center</code> 0：三支前後處理 class
 （<code>ulcnet_prepost</code>／<code>deepvqe_prepost</code>／<code>dfn2_prepost</code> 本來就是
-center=False）、<b>4ch ULCNet pipeline 的 far 分支</b>，以及自 2026-09-03 起
+center=False）、<b>4ch ULCNet pipeline 的 far 分支</b>，以及
 <b>mono ULCNet pipeline 兩路皆是</b>
 （<code>audio_pipeline_ulcnet.c</code> 的 <code>ac_stft_push_planar(p->ana_err / p->ana_far, …)</code>）——因為它們要和
 AEC/GSC seam 自己的頻譜（一 hop 一幀、從 hop 0 起）配對，一手已經是那種幀時，

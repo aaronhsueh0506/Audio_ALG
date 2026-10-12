@@ -140,8 +140,8 @@ target and reverberant mixture do not acquire a pre-delay mismatch.
 
 ### SNR and clean/noise edge cases
 
-Mixed samples uniformly draw from a discrete SNR set (extended 2026-08 with
-two lower, harsher values beyond DeepFilterNet's original
+Mixed samples uniformly draw from a discrete SNR set (two
+lower, harsher values beyond DeepFilterNet's original
 `-5, 0, 5, 10, 20, 40 dB`):
 `-15, -10, -5, 0, 5, 10, 20, 40 dB`. DeepFilterNet3 puts `-100` in that list
 as a sentinel for a noise-only sample; this generator represents the edge

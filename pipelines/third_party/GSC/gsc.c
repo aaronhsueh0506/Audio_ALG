@@ -50,9 +50,9 @@
 #define GSC_WA_LEAK 0.99999f
 
 /*
- * RLS per-bin divergence guard + diagonal loading (2026-08-04, real recording
- * repro: pipeline_failed at frame ~2800-3300, ~20-27s in, at every checked-in
- * grid and both scalar/SIMD -- see AEC/NR/Audio_ALG review notes).
+ * RLS per-bin divergence guard + diagonal loading (real recording repro:
+ * pipeline_failed at frame ~2800-3300, ~20-27s in, at every checked-in grid
+ * and both scalar/SIMD).
  *
  * The per-bin covariance downdate below, P = (P - gain*q) / lambda, has no
  * compensating floor/ceiling: dividing by lambda < 1 every adapted frame

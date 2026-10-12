@@ -89,9 +89,9 @@ def evaluate_case(
         timeline_lag,
         near_corr,
     ) = _load_case(case_dir)
-    # 16 kHz rate default is 256/128 (8ms hop) as of 2026-08-02/03 (AEC's
+    # 16 kHz rate default is 256/128 (8ms hop) (AEC's
     # python/modules/config.py and NR's core/signal_grid.py both default
-    # here now); 512/256 remains a supported, explicit alternate grid.
+    # here); 512/256 remains a supported, explicit alternate grid.
     selected_fft = fft_size or (256 if sample_rate == 16000 else 1024)
     if (
         sample_rate == 16000
@@ -168,13 +168,13 @@ def evaluate_case(
     # least 5 ms of tolerance so choosing the smaller 128-sample hop does not
     # turn the same physical delay estimate into a false failure.
     #
-    # 2026-08-04: confirmed this is the right call, not a cover for a real
+    # This is the right call, not a cover for a real
     # online-estimator bug -- measured far_corr/near_corr (this same
     # estimate_file_offset()'s own correlation strength) on both checked-in
     # recordings: 0.05-0.24, i.e. close to noise-floor for a ~40-60s real
     # recording with near-end speech mixed in. evaluate_recordings.py's
-    # validate_recording_contract() picked up this exact tolerance formula
-    # for the same reason (it previously used half-hop only).
+    # validate_recording_contract() uses this same tolerance formula for the
+    # same reason.
     delay_tolerance = max(hop // 2, sample_rate // 200)
     result = {
         "case": case_dir.name,

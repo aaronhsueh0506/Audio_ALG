@@ -88,19 +88,13 @@ class SharedDelayState:
 class SharedMatchedDelayEstimator:
     """One matched filter driven by one configurable array capture proxy.
 
-    Anti-alias status (fixed 2026-08-03): this wrapper used to do its OWN
-    external 48 kHz decimation -- a bare stride-pick with NO anti-alias
-    filter, real aliasing at 48 kHz -- ahead of an inner ``LegacyDelayShim``
-    that it hardcoded to ``sample_rate=16000`` regardless of this wrapper's
-    real rate, then manually rescaled the returned delay by
-    ``_rate_factor``. That duplicated (and, at 48 kHz, aliased) a decimation
-    path the estimator now owns correctly, and diverged from the same class
-    of fix already applied to the mono AEC's C port
-    (``delay_aec3.c``'s ``DaResample48`` sidechain, 2026-08-02) and to
-    Python's own ``EchoPathDelayEstimator`` (its ``_Resample48`` sidechain,
-    2026-08-03).
+    Anti-alias status: this wrapper does no decimation of its own. The inner
+    estimator owns the 48 kHz anti-alias + decimate-by-3 sidechain, the same
+    way the mono AEC's C port does (``delay_aec3.c``'s ``DaResample48``
+    sidechain) and Python's own ``EchoPathDelayEstimator`` (its
+    ``_Resample48`` sidechain).
 
-    This wrapper now constructs its inner ``LegacyDelayShim`` with this
+    This wrapper constructs its inner ``LegacyDelayShim`` with this
     wrapper's TRUE native ``sample_rate`` (8000/16000/48000) and feeds it
     every hop RAW and un-decimated. At 48 kHz, ``EchoPathDelayEstimator``
     internally anti-alias-filters (order-7 elliptic, 4 SOS sections) and
@@ -433,7 +427,7 @@ class FourChannelAecConfig:
                 f"four-channel path supports {_SUPPORTED_SAMPLE_RATES}, got {self.sample_rate}"
             )
         # 16 kHz default is 256/128 (8ms hop), matching the C core's own
-        # derive_dims_and_configs default (4aec_nr_res.c) as of 2026-08-02/03.
+        # derive_dims_and_configs default (4aec_nr_res.c).
         # 512/256 remains a supported, explicit alternate (see whitelist below).
         default_frame = 256 if self.sample_rate == 16000 else 1024
         frame = default_frame if self.frame_size is None else int(self.frame_size)

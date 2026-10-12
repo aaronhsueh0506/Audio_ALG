@@ -242,9 +242,9 @@ def test_default_grids_are_no_padding_power_of_two():
 
 
 def test_48k_wrapper_feeds_inner_estimator_raw_native_rate_hops(monkeypatch):
-    """2026-08-03 fix: the wrapper no longer does its own external 48kHz
-    stride-pick decimation (which had no anti-alias filter and aliased).
-    The inner estimator is now constructed at the TRUE native sample_rate
+    """The wrapper does no external 48kHz stride-pick decimation of its own
+    (it would have no anti-alias filter and alias).
+    The inner estimator is constructed at the TRUE native sample_rate
     and fed every raw sample; EchoPathDelayEstimator owns the anti-alias +
     decimate-by-3 sidechain internally (mirrors delay_aec3.c's
     DaResample48)."""

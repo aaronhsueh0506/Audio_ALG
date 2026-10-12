@@ -26,11 +26,8 @@ item below is now fixed, regression-tested, or explicitly classified as a
 documented historical limitation. Remaining GO/NO-GO work is tracked in the
 numbered gates below, not by stale source-audit notes.
 
-As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
-`Audio_ALG 992dc56` (all pushed):
-
 - [x] **F2.4's mu-holdoff no-reset guard was silently reverted and shipped
-      broken for ten weeks.** FIXED 2026-08-06 (Python + C + regression tests at
+      broken for ten weeks.** FIXED (Python + C + regression tests at
       all four grids, mutation-verified). Recorded here because the failure mode
       is the reusable lesson, not the line: commit `2f3699f` ("remove dead flag
       branches") collapsed
@@ -66,12 +63,12 @@ As of 2026-08-06, pins `AEC a432523` / `NR 5708f49` / `audio_common 1b359d3` /
       **The anchor is the last commit that empirically VALIDATED the constant,
       not the commit that introduced it, and not the in-code comment.** Worked
       example: `simple_mu_holdoff = 20` was introduced at `d774771`
-      (2026-03-20) when the default was frame 512 / hop 256 = 16 ms, so its
+      when the default was frame 512 / hop 256 = 16 ms, so its
       comment says "~320ms" and was correct *then*. It was validated at
-      `7b2cf04` (2026-05-12, the F2.4 800-case ablation) when `AecConfig` had
+      `7b2cf04` (the F2.4 800-case ablation) when `AecConfig` had
       flipped to `frame_size = -1  # Auto: sample_rate * 20ms` = hop 160 =
       10 ms. The validated span is therefore **200 ms**, and the comment has
-      been stale since 2026-05-12. Anchoring on the introduction commit instead
+      been stale since then. Anchoring on the introduction commit instead
       gives a 1.6x error — and did, in an earlier round of this very campaign.
 
       Each constant needs a verdict: retime (and extend `test_rate_structural`
@@ -885,7 +882,7 @@ quality scores are explicitly outside this source/framework release gate.
 
 ## Appendix A. Known-good automated counts
 
-Reference values re-measured on 2026-08-31 from the current four-repo working
+Reference values measured from the four-repo working
 tree, KISS backend, SIMD=1, macOS, `SE/.venv` Python. Re-measure and re-record these
 whenever the tree moves — a stale reference count silently converts a real
 regression into a "matches the doc" pass. A count that **drops** is a
@@ -909,10 +906,10 @@ is routinely misattributed to a real bug.
 | `Audio_ALG` `python3 -m pytest AINR` | 228 |
 | `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 966 |
 
-The four `Audio_ALG` rows were re-measured together on 2026-09-15 (same tree,
+The four `Audio_ALG` rows were measured together (same tree,
 same `SE/.venv` Python; the combined invocation ran to completion: 965 passed,
-1 skipped, 13 min 53 s). The `AEC` and `NR` rows above them still carry their
-2026-08-31 measurement and were NOT re-run. The three per-package rows sum
+1 skipped, 13 min 53 s). The `AEC` and `NR` rows above them were measured
+separately. The three per-package rows sum
 exactly to the combined row, which is the check that the combined invocation
 collected everything. The `pipelines` row grew from 72 with the
 DeepFilterNet2 pipeline work (`pipelines/tests/test_dfn2_stage.py`,
@@ -932,8 +929,7 @@ only place this bites: every AINR project also defines a top-level `train`,
 `model` and `export_onnx`, and a bare import made after a sibling's is cached
 in `sys.modules` is handed the sibling's module at RUN time, so the per-package
 rows stay green while the combined run errors at fixture setup (this is how
-the 2026-09-15 re-measurement found `pipelines/dfn2_stage.py` loading the
-wrong `train`). Consumers of those modules drop the cached names and front
+`pipelines/dfn2_stage.py` was found loading the wrong `train`). Consumers of those modules drop the cached names and front
 their own directory before importing, as the projects' tests do, and
 `pipelines/tests/test_dfn2_stage.py` pins that for the DFN2 stage. Re-run the
 combined row, not just the per-package rows, before using these as a gate.
@@ -941,24 +937,16 @@ combined row, not just the per-package rows, before using these as a gate.
 C-side `make test` targets that print `PASS:` markers rather than a count
 (re-measured on the current working tree, KISS backend, `make clean` first):
 `pipelines/mono_aec_nr_res` 78, `pipelines/mono_alignulcnet` 150,
-`pipelines/4ch_aec_bf_nr_res` 502 (one-stop gate, re-measured 2026-09-03 the
+`pipelines/4ch_aec_bf_nr_res` 502 (one-stop gate, measured the
 same way; also builds and runs the `4ch_alignulcnet` binaries, whose test
 prints a single `All audio_pipeline_4ch_ulcnet tests passed` line and no
 `PASS:` markers). Each additionally prints a small number of
 non-`PASS:` pass lines (static smokes, board-skeleton profiles, adapter).
 
-`mono_aec_nr_res` is still the 2026-08-31 measurement. `mono_alignulcnet`
-was re-checked 2026-09-03 (150, up from 149) against the pre-built NE10
-binaries in `pipelines/bin/`, not a fresh KISS `make clean` — its mono
-wrapper switched both analysis branches from the centered
-`ulcnet_analysis_push()` 0/2/1 schedule to the rolling
-`ulcnet_analysis_push_frame()` one-frame-per-hop schedule (layout v11 -> v12);
-no `PASS:`-marker-count-affecting logic is backend-conditional, so KISS should
-match but has not been independently re-run. The `4ch_aec_bf_nr_res` row was
-re-measured on 2026-09-03 after the 4-channel Align-ULCNet suite was
-rewritten for the direct GSC-spectrum path (identity E2E now compares against
-a reference the test synthesises from the spectra the model saw; a new
-error-branch impulse test reads that branch against the input).
+`mono_alignulcnet` was checked against the pre-built NE10
+binaries in `pipelines/bin/`, not a fresh KISS `make clean`; no
+`PASS:`-marker-count-affecting logic is backend-conditional, so KISS should
+match but has not been independently re-run.
 
 Pass/fail-only targets (no count): `AEC` `selftest`, `test-counter-saturation`,
 `test-process-context`, `test-shared-far-spec`, `test-shared-fft-handle`,

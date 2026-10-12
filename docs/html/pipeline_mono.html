@@ -34,7 +34,7 @@ th{background:#eef3ee}
 <table>
 <tr><th>訊號格點</th><th>fft/hop/bins</th><th>備註</th></tr>
 <tr><td>8 kHz</td><td>256 / 128 / 129</td><td><code>fft_size=0</code> 的 rate default</td></tr>
-<tr><td>16 kHz(預設)</td><td>256 / 128 / 129</td><td>2026-08 起的 rate default</td></tr>
+<tr><td>16 kHz(預設)</td><td>256 / 128 / 129</td><td>rate default</td></tr>
 <tr><td>16 kHz(替代)</td><td>512 / 256 / 257</td><td>需明示 <code>fft_size=512</code></td></tr>
 <tr><td>48 kHz</td><td>1024 / 512 / 513</td><td>rate default</td></tr>
 </table>
@@ -155,7 +155,7 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 
 <h2>State 表</h2>
 <p>全部 cross-call state 都住在 caller 的單一 pool(C struct 持有;host 只擁有 pool 記憶體本身)。carve 順序 = <code>self, aec, istft(含 fft、窗、acc、time、spec 暫存), nr, g_total, extra, spec</code>(layout v13;pool 大小、carve 順序或 descriptor 內容任一改變,該模組的版本加一)。實測 bytes 為 16 kHz/256 KISS,<code>aec_nr_pipeline_static --print-mem-size</code>(本次 <code>lib/aec</code> pin 重跑):</p>
-<p class="note">2026-08-18 起 FFT backend 預設已由 kiss 轉為 ne10(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>);下表分項仍以 kiss backend 列出。同格點的 ne10 實測合計為 <b>521,696 B</b>(<code>Aec</code> 384,832 B、<code>FftHandle</code> 8,176 B,其餘與 kiss 相同)。本輪 post 路徑拿掉 near-end floor lift,只有它讀的 <code>e2</code> scratch 跟著離開 carve:<b>pipeline bufs 由 5,696 變 5,168 B(16 kHz/256,−528 B),合計同步下降</b>;Aec/FftHandle/NR 分項不變,控制塊為 192 B(layout 11 的 struct 多兩個 int 而跨到 208 B,當時表格未重量,所以相對舊表的差額仍恰為 e2 一項)。</p>
+<p class="note">FFT backend 預設是 ne10(<code>audio_common</code> 對 NEON 目標自動偵測;見 <code>audio_common.html</code>);下表分項以 kiss backend 列出。同格點的 ne10 實測合計為 <b>521,696 B</b>(<code>Aec</code> 384,832 B、<code>FftHandle</code> 8,176 B,其餘與 kiss 相同);pipeline bufs 為 5,168 B(16 kHz/256),控制塊為 192 B。</p>
 <table>
 <tr><th>state</th><th>shape / size</th><th>存放者</th><th>備註</th></tr>
 <tr><td><code>Aec</code> 全狀態</td><td>385,440 B</td><td>pool(C struct)</td><td>HPF、PBFDKF×2(main+shadow)、delay estimator(<code>delay_mode=MATCHED</code> n=5)、RES context、AEC 內部 FFT</td></tr>

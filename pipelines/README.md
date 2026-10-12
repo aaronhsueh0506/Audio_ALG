@@ -136,10 +136,9 @@ selectable grids; the others have exactly one:
 | **RTF** | < 0.05 | 遠低於即時要求 |
 
 上表是 conventional mono pipeline 的數字。兩條 Align-ULCNet application 的
-加總額外延遲同樣是 **1 hop**（唯一來源是 ULCNet synthesis WOLA）：mono 一直
-如此，4ch 變體自 2026-09-03 起由 2 hop 降為 1 hop——GSC 的 beamformed error
-頻譜直接當成模型的分析幀，中間的 beam WOLA→再 analysis 來回與配套的 one-hop
-far 補償都已移除。細節見
+加總額外延遲同樣是 **1 hop**（唯一來源是 ULCNet synthesis WOLA）：mono 與
+4ch 變體都是——4ch 把 GSC 的 beamformed error 頻譜直接當成模型的分析幀，
+沒有中間的 beam WOLA→再 analysis 來回，也沒有 one-hop far 補償。細節見
 [`4ch_alignulcnet/README.md`](4ch_alignulcnet/README.md)。
 
 ### Memory Budget
@@ -603,8 +602,7 @@ publish flow, and the on-target verification checklist — is in
 
 ### AEC (`AecConfig`, see `aec.h`)
 
-**Presets**: `AEC_PRESET_MILD` / `AEC_PRESET_BALANCED`（default）/ `AEC_PRESET_AGGRESSIVE`（`MILD` 在
-2026-07-15 前叫 `GENTLE`，同一組 −20dB 參數，只是改名，數值未變）
+**Presets**: `AEC_PRESET_MILD` / `AEC_PRESET_BALANCED`（default）/ `AEC_PRESET_AGGRESSIVE`
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -675,8 +673,8 @@ post-beam 抑制器）。
 **Modes**: `ANR_MODE_MILD` / `ANR_MODE_MODERATE` / `ANR_MODE_BALANCED`（default）/ `ANR_MODE_AGGRESSIVE`
 
 > These are the library's mode enum. Both C pipeline CLIs' `parse_nr_mode()` —
-> `mono_aec_nr_res/main.c` and `4ch_aec_bf_nr_res/4aec_nr_res_static.c` — now also recognize
-> `"moderate"` (`--nr-preset mild|moderate|balanced|aggressive`, since 2026-09-03); anything else
+> `mono_aec_nr_res/main.c` and `4ch_aec_bf_nr_res/4aec_nr_res_static.c` — also recognize
+> `"moderate"` (`--nr-preset mild|moderate|balanced|aggressive`); anything else
 > still silently falls back to `ANR_MODE_BALANCED` — no error. The Python `aec_nr_pipeline.py`
 > CLI has not been updated and still restricts `--nr-preset` to `choices=['mild', 'balanced',
 > 'aggressive']`; `MODERATE` there is only reachable by calling `anr_config_for_mode()`
@@ -698,8 +696,8 @@ older power-dB (`/10`) convention.
 > stated grid is meaningless.
 >
 > The reference duration is **not the same for every field** — mixing them up when
-> hand-deriving a value for a different grid silently reintroduces the exact regression the
-> 2026-07-10 musical-noise fix and the 2026-08-02/03 strength-mode fix both corrected:
+> hand-deriving a value for a different grid silently reintroduces the musical-noise and strength-mode
+> regressions:
 > - **16 ms-authored** (retimed off a 16 ms/hop reference): `alpha_xi`, `L`, `alpha_attack`
 >   (all modes), and `alpha_d`/`alpha_g`/`alpha_decay` **in MILD/MODERATE/AGGRESSIVE only**.
 > - **10 ms-authored** (retimed off the legacy 10 ms/hop reference): `alpha_s`, `alpha_p`,
@@ -716,7 +714,7 @@ older power-dB (`/10`) convention.
 | `g_min_db` | -20 | -25 | -30 | -40 | 最小增益 dB（最大抑制量，amplitude dB, /20） |
 | `q` | 0.60 | 0.55 | 0.50 | 0.35 | 語音先驗機率（低→積極抑噪） |
 | `xi_min_db` | -15 | -18 | -20 | -25 | 先驗 SNR 下限 dB |
-| `alpha_d` | 0.85 | 0.85 | 0.903414 (10 ms 基準 = 0.85 @16 ms) | 0.50 | 噪聲追蹤 IIR 係數（authored 常數，見上方 retime 說明；BALANCED 2026-09-03 調慢） |
+| `alpha_d` | 0.85 | 0.85 | 0.903414 (10 ms 基準 = 0.85 @16 ms) | 0.50 | 噪聲追蹤 IIR 係數（authored 常數，見上方 retime 說明；BALANCED 取較慢的值） |
 | `alpha_g` | 0.92 | 0.92 | 0.88 | 0.85 | 增益時間平滑（高→平滑；authored 常數） |
 | `alpha_attack` | 0.40 | 0.40 | 0.30 | 0.15 | Attack 平滑（語音起始追蹤；authored 常數，四個 preset 皆 16ms 基準） |
 | `alpha_decay` | 0.92 | 0.92 | 0.88 | 0.88 | Decay 平滑（噪聲釋放；authored 常數） |
@@ -726,7 +724,7 @@ older power-dB (`/10`) convention.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `alpha_s` | 0.95 | 功率譜時間平滑（authored 常數，10ms 基準） |
-| `alpha_d` | 0.903414 | 噪聲更新速率（authored 常數，10ms 基準 = 0.85 @16 ms；BALANCED 值，2026-09-03 由 0.70 調慢，見上方 retime 說明） |
+| `alpha_d` | 0.903414 | 噪聲更新速率（authored 常數，10ms 基準 = 0.85 @16 ms；BALANCED 值，見上方 retime 說明） |
 | `L` | 64 | 最小值追蹤視窗（幀數；**已 retime**；authored 值為 32 hops @ 16 ms，16 kHz 預設 256/128 grid 的實際 hop 為 8 ms，因此 effective 值為 64；其他 grid 請由設定 API 讀回） |
 | `num_init_frames` | 25 | 初始化靜默幀數（**已 retime**；常數以 10 ms 為 authored basis，16 kHz 預設 256/128 的實際 hop 是 8 ms，因此 25 hops ≈200 ms） |
 | `scene_change_threshold_db` | 10.0 | 場景轉換偵測閾值（純 dB 常數，不 retime） |
@@ -735,7 +733,7 @@ older power-dB (`/10`) convention.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `alpha_xi` | 0.92 | Decision Directed 先驗 SNR 平滑（authored 常數，16ms 基準；2026-07-10 musical-noise fix 由 0.88 調高，所有 preset 共用） |
+| `alpha_xi` | 0.92 | Decision Directed 先驗 SNR 平滑（authored 常數，16ms 基準；所有 preset 共用） |
 
 ---
 

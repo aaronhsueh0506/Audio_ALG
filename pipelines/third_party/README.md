@@ -104,7 +104,7 @@ per-frame processing.
 There is currently no separate/optional 16 kHz DOA mode: this paragraph
 previously described one, but no corresponding config field, flag, or
 second steering table exists anywhere in this directory or
-`audio_pipeline_4ch.c` (confirmed by grep, 2026-08-02) -- treat the two
+`audio_pipeline_4ch.c` (confirmed by grep) -- treat the two
 paragraphs below as aspirational, not implemented. `4ch_aec_bf_nr_res/README.md`'s
 "There is no legacy/downsample grid entry" is the accurate statement of the
 current design. If a real 16 kHz-DOA-at-48-kHz-pipeline requirement ever

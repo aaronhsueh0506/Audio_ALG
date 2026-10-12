@@ -772,7 +772,7 @@ flowchart LR
 rolling 分析（`AcStft`，`center` 0；mono wrapper、4ch direct path、pre/post
 class 的 TIME 模式全走這個）從第一次推入起就固定一幀一次 inference，沒有
 priming 例外。centered 分析（`center` 1，0/2/1 幀發射，priming 期間的
-第二次 push 會連續產生兩幀）自 2026-09-03 起不再有出貨 pipeline 呼叫，只剩
+第二次 push 會連續產生兩幀）不再有出貨 pipeline 呼叫，只剩
 Python parity gate 使用。（組幀實作已由 `ulcnet_process.c` 內的 `UlcnetAnalysis`／`UlcnetSynthesis`
 換成 audio_common 的 `AcStft`／`AcIstft`，函式名稱見 `ulcnet_framing_config()`；本節其餘敘述是當時的紀錄。）model graph 不收 PCM、不包 STFT/WOLA、不包 PBFDKF
 或 delay state machine。
@@ -885,11 +885,11 @@ identity reprime。
 本專案交付：
 
 - `ulcnet_process.c/.h`：`ulcnet_framing_config()` 描述 audio_common 的 sqrt-Hann `AcStft`／`AcIstft`
-  （RI frame）。兩種 analysis 排程：`center` 1（centered、0/2/1 出幀排程，2026-09-03
-  起不再有出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
-  `center` 0（2026-09-03 加入；rolling、每次推入固定出一幀，與同一 hop 的 centered
+  （RI frame）。兩種 analysis 排程：`center` 1（centered、0/2/1 出幀排程，
+  不再有出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
+  `center` 0（rolling、每次推入固定出一幀，與同一 hop 的 centered
   最後一幀逐 bit 相同；mono wrapper 兩路、4ch direct path 的 far 路，以及兩個 AIAEC
-  pre/post class 的 TIME 模式都在用，mono 是同一天稍後跟進的）。同一個 `AcStft` 不可混用兩種 `center`。
+  pre/post class 的 TIME 模式都在用）。同一個 `AcStft` 不可混用兩種 `center`。
 - model-I/O/state `c/.h`：caller-owned memory requirement/init/reset、四個
   state tensor 的保存、commit（驗證 state、壓縮域 error × mask、逆冪；不更新 state）、
   state generation、descriptor/layout validation。沒有 CPU ring update，也沒有複製路徑。

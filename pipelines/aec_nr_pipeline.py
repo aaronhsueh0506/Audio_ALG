@@ -110,17 +110,10 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
     return output, contexts
 
 
-# 2026-08-03: the standalone hand-rolled NR_PRESETS dict (mild/balanced/aggressive
-# {g_min,q,xi_min,alpha_g}) that used to live here was removed. It duplicated and
-# diverged from NR's own single source of truth (NR/python/config/v3_2_config.yaml +
-# NR/python/core/nr_strength.py's apply_strength(), the same composition
-# NR/python/process_audio.py's create_denoiser_from_config() uses) -- most visibly,
-# 'balanced'.g_min_db was -15.0 here vs the real NR balanced's -30.0
-# (lib/nr/c_impl/include/anr_types.h / lib/nr/python/config/v3_2_config.yaml), an
-# amplitude-dB(/20) floor mismatch, not just a naming coincidence. It also never
-# wired `strength=` into MmseLsaDenoiser, so mild/aggressive never touched the
-# real temporal-smoothing knobs (alpha_noise/alpha_g/alpha_attack/alpha_decay) --
-# only g_min_db (via this dict) changed. See _build_denoiser() for the fix.
+# NR parameters come from NR's single source of truth
+# (NR/python/config/v3_2_config.yaml with NR/python/core/nr_strength.py's
+# apply_strength() overlaid); this module keeps no preset table of its own.
+# See _build_denoiser().
 _NR_YAML_CONFIG = os.path.join(_ROOT, 'lib', 'nr', 'python', 'config', 'v3_2_config.yaml')
 
 # MCRA minima-tracking window (MmseLsaDenoiser's `L`): this pipeline's own ~1.5s
@@ -142,7 +135,7 @@ CNG_NR_GAIN_FLOOR = 0.31622777
 def _project_grid(sample_rate: int, fft_size: int = None) -> Tuple[int, int, int]:
     """Resolve an integrated-pipeline no-padding ``(frame, hop, fft)`` grid."""
     allowed = {16000: (256, 512), 48000: (1024,)}
-    # 16 kHz default is 256/128 (8ms hop) as of 2026-08-02/03, matching
+    # 16 kHz default is 256/128 (8ms hop), matching
     # AEC/NR/the 4-channel pipeline's own defaults; 512 remains a
     # supported, explicit alternate.
     defaults = {16000: 256, 48000: 1024}
@@ -177,60 +170,20 @@ def _build_denoiser(sample_rate: int,
     retime mild/aggressive's post-16ms-grid overlay values as if they were
     pre-16ms-grid, corrupting them at any non-16ms-hop grid.
 
-    2026-08-03 fix: this replaces a standalone, hand-rolled NR_PRESETS dict that
-    only touched {g_min, q, xi_min, alpha_g} (so mild/aggressive never affected
-    alpha_noise/alpha_attack/alpha_decay -- a real functional gap, not just a
-    naming coincidence) and whose 'balanced' used g_min_db=-15.0 against the real
-    NR balanced's -30.0 (both are the amplitude-dB/20 convention -- an actual
-    2x-in-dB floor mismatch, confirmed against both
-    lib/nr/c_impl/include/anr_types.h and lib/nr/python/config/v3_2_config.yaml,
-    which already agree with each other). Fixing that wiring gap also surfaces
-    two more stale hardcoded values this file was carrying that have no
-    AEC-specific rationale anywhere in its history (unlike L below, which
-    does): alpha_xi 0.88->0.92 (this pipeline predates and never
-    picked up the 2026-07-10 musical-noise fix, shared across ALL strength
-    presets in the real system -- this also closes the project's own
-    long-flagged "AEC-YAML alpha_xi coupling untested" open question) and
-    alpha_noise/alpha_d 0.95->0.7 for the `balanced` preset specifically (0.95
-    was only ever the side effect of never passing alpha_d at all, never a
-    validated choice -- mild/aggressive already need real alpha_noise deltas per
-    the fix above, so there is no consistent way to keep 'balanced' pinned at
-    0.95 without that pin also silently damping mild/aggressive's own tuning).
-    This is a real, intended change to the pipeline's default numerical output --
-    per this project's convention for NR numerical changes, treat this as
-    needing a fresh 800-case bench pass before shipping.
-
     One genuinely pipeline-specific structural overlay remains on top of the
     canonical params, applied after apply_strength() so it wins regardless of
     preset (it is not part of NR's own strength/mode axes, so there is nothing
     in the standalone system for it to diverge from):
       - L=94 (see _NR_L_MINIMA_WINDOW): the MCRA minima-tracking window,
-        investigated 2026-08-03. This pipeline's own L was authored as
-        "150 x 10ms = 1.5s" (commit de16bce, back when NR ran a literal 10ms
-        hop with no retiming abstraction at all -- an independent AEC-residual
-        stationarity design, unrelated to NR's own L=32/512ms tuning). NR's own
-        L retiming call (lib/nr/python/denoisers/v3_2_mmse_lsa.py) was just changed
-        (NR CHANGELOG [4.5.0]) from a generic 10ms-authored assumption to an
-        UNCONDITIONAL 16ms-authored one, because NR's own L=32 is genuinely
-        16ms-authored and the shared retime call has no way to tell this
-        pipeline's L apart from NR's. Left as the literal 150, this pipeline's
-        window would have silently grown from 1.5s to 2.4s (150 x 16ms instead
-        of 150 x 10ms) the moment lib/nr picked up that fix -- with no code
-        change or comment update on this side to explain why. 94 (x16ms =
-        1.504s) is the 16ms-authored count that reproduces the *exact* retimed
-        frame counts (188 / 94 / 141 at the 16k-8ms-hop, 16k-16ms-hop, and
-        48k-10.67ms-hop grids respectively) the old literal 150 gave under the
-        pre-fix 10ms-authored retiming -- i.e. this is a compensating fix that
-        restores the original 1.5s behavior, not a new tuning choice.
-        Caveat found in the same investigation, NOT acted on here (out of
-        scope, flagged for follow-up): per NR CHANGELOG [4.5.0]'s own 824-case
-        measurement, L only affects noise_psd when
-        `mcra_accept_external_spp=False`; this pipeline never sets that flag
-        (stays at the MmseLsaDenoiser default `True`), so today L's value --
-        1.5s, 2.4s, or NR's own 512ms -- has NO effect on this pipeline's
-        output either way. The "longer window improves stationarity
-        estimation" rationale in the original commit only holds if/when
-        `mcra_accept_external_spp=False` is also wired in.
+        94 frames x 16ms = 1.504s. This pipeline's window is authored as
+        1.5s of wall clock, independent of NR's own L=32 (512ms); NR's L
+        retiming is an unconditional 16ms-authored one, and 94 reproduces the
+        retimed frame counts of a 1.5s window (188 / 94 / 141 at the
+        16k-8ms-hop, 16k-16ms-hop and 48k-10.67ms-hop grids respectively).
+        L only affects noise_psd when `mcra_accept_external_spp=False`; this
+        pipeline never sets that flag (it stays at the MmseLsaDenoiser
+        default `True`), so today L's value has no effect on this pipeline's
+        output.
 
     broadband_threshold stays at the canonical 1.0 (scene-reset gate off), the
     same value the C overlay inherits: with the denoiser's SPP gating the noise

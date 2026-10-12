@@ -170,7 +170,7 @@ out               全零                enh(input hop#0)    enh(input hop#1)    
 <tr><td><code>far_analysis</code>(<code>AcStft</code>，<code>center</code> 0)</td><td>結構 + <code>history</code>／<code>seg</code> 各 [<code>ULCNET_N_FFT</code>] f32 + 頻譜暫存</td><td>pool(core 之後,借用共用 handle 與視窗表)</td><td>far 分支的 rolling 分析;<b>error 分支沒有對應物</b></td></tr>
 <tr><td><code>synthesis</code>(<code>AcIstft</code>，<code>AC_OLA_ENV_NORM</code>)</td><td>結構 + <code>acc</code>／<code>env</code>／<code>time</code> 各 [<code>ULCNET_N_FFT</code>] f32 + 頻譜暫存</td><td>pool(core 之後,借用共用 handle 與視窗表)</td><td>centered WOLA 跨 hop 累加(scratch 在物件內,不佔 stack)</td></tr>
 <tr><td><code>ulcnet_window</code></td><td>[<code>ULCNET_N_FFT</code>] f32</td><td>C struct(self)</td><td>兩個 chain 物件共用的 sqrt-Hann 表(<code>ac_window_build()</code>)</td></tr>
-<tr><td><code>err_re/im</code>、<code>far_re/im</code>、<code>enh_re/im</code></td><td>各 [<code>ULCNET_BINS</code>] f32(共 6 條)</td><td>C struct(self)</td><td><b>一幀</b> staging(舊版的兩幀 staging 已移除)</td></tr>
+<tr><td><code>err_re/im</code>、<code>far_re/im</code>、<code>enh_re/im</code></td><td>各 [<code>ULCNET_BINS</code>] f32(共 6 條)</td><td>C struct(self)</td><td><b>一幀</b> staging</td></tr>
 <tr><td><code>phase</code>、<code>nn_wanted</code>、<code>nn_accepted</code></td><td>int ×3</td><td>C struct(self)</td><td>phase:0 閒置、3 front 已做、1 beam 已做、2 模型幀開著;<code>process_end()</code> 只接受 1／2</td></tr>
 <tr><td><code>reprime_frames</code></td><td>int</td><td>C struct(self)</td><td>邊界武裝 = 1,每發射幀減一;重新武裝不累加</td></tr>
 <tr><td><code>model</code> + <code>last_delay</code> + <code>frame_index</code></td><td>純量級</td><td>C struct(self)</td><td>model 安裝 survive reset;delay history 用來偵測 FIXED 首次可用</td></tr>
