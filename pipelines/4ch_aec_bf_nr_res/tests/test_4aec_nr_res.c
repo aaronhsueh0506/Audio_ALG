@@ -1284,11 +1284,11 @@ cleanup:
 
 /* ============================================================================
  * Known-delay profile verification (product delay gate, NOT an audio-quality
- * run -- see docs/align_ulcnet_delay_profile_plan_zh_TW.md §5.1/§6).
+ * run).
  *
  * Everything here is driven by a SYNTHESISED echo whose bulk delay is known
  * exactly, so every claim is checked against ground truth instead of against
- * a score. Four questions, in the order the plan asks them:
+ * a score. Four questions:
  *
  *   acquisition  Does each bank size acquire the delays it is supposed to
  *                cover, how fast, and how accurately?

@@ -1917,7 +1917,7 @@ static void test_reprime_behavior(void) {
 
 /* =========================================================================
  * Known-delay profile verification (product delay gate, NOT an audio-quality
- * run -- see docs/align_ulcnet_delay_profile_plan_zh_TW.md §5.1/§6).
+ * run).
  *
  * The mono twin of test_4aec_nr_res.c's known-delay block: same synthetic
  * two-path echo with an exactly known bulk delay, same four questions
