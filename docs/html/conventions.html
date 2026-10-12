@@ -62,7 +62,7 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <table>
 <tr><th>元件</th><th>SR</th><th>FFT=frame / hop（bins）</th><th>預設？</th><th>出處</th></tr>
 <tr><td rowspan="4">AEC（<code>lib/aec/c_impl</code>）<br>
-<span class="note">hop=fft/2、block=fft、K=fft/2+1（<code>aec.c:676-678</code>）</span></td>
+<span class="note">hop=fft/2、block=fft、K=fft/2+1（<code>aec.c:199-204</code>）</span></td>
 <td>8 k</td><td>256 / 128（129）</td><td>預設（唯一）</td>
 <td rowspan="4"><code>aec.c</code> <code>aec_config_defaults()</code>
 （48k→1024、16k→256、8k→256）與 <code>aec_validate_config()</code> 白名單；
@@ -82,7 +82,7 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <td><code>pipelines/common/se_config.c</code> <code>se_grid_resolve()</code>（<code>allow_8k</code> 由應用的規則給）</td></tr>
 <tr><td>4ch core（<code>4ch_aec_bf_nr_res/</code>）</td><td>16/48 k</td>
 <td>只有三個 grid：16k/256、16k/512、48k/1024（<b>無 8 k</b>）</td><td>16k 預設 256</td>
-<td><code>pipelines/common/se_config.c</code> <code>se_grid_resolve()</code>（<code>allow_8k = 0</code>）；<code>aec.c:150-160</code> 註解</td></tr>
+<td><code>pipelines/common/se_config.c</code> <code>se_grid_resolve()</code>（<code>allow_8k = 0</code>）；<code>aec.c:196-198</code> 註解</td></tr>
 <tr><td rowspan="2">ULCNet 變體（mono + 4ch）</td><td>16 k</td>
 <td><b>512 / 256（257）</b>；ta_bins 26</td>
 <td rowspan="2">編譯期固定：<code>make ULCNET_GRID=16k|48k</code>
@@ -177,8 +177,8 @@ vs 上游 4800 Hz）</td><td>編譯期固定</td>
 <h3>PBFDKF far_spec 矩形窗例外</h3>
 <p><b>線性濾波路徑沒有分析窗。</b>PBFDAF/PBFDKF 是 overlap-save 結構：
 far/near 的 block（= 2×hop 原始樣本）直接進 RFFT——
-<code>pbfdkf.c:458</code> <code>rfft_padded(p, p->far_buffer, blk, p->far_spec)</code>、
-<code>:450</code> 同樣的 near_spec——等效矩形窗。輸出取
+<code>pbfdkf.c:444</code> <code>rfft_padded(p, p->far_buffer, blk, p->far_spec)</code>、
+<code>:436</code> 同樣的 near_spec——等效矩形窗。輸出取
 <code>echo_time[hop:block]</code> 有效半段、error_spec 由 zero-pad 的有效 hop 重建
 （<code>:542-545</code>），全程無窗。sqrt-Hann 只出現在<b>供 RES/後級分析用</b>的
 <code>error_spec_windowed</code>（<code>:552-553</code>：sqrt-Hann×near − echo_spec）。
