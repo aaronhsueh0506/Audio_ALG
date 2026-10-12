@@ -123,8 +123,10 @@ test: $(TEST_BIN)
 	"$(TEST_BIN)"
 
 test-simd: $(TEST_BIN) $(SCALAR_BIN)
-	@auto_output="$$($(TEST_BIN))"; \
-	scalar_output="$$($(SCALAR_BIN))"; \
+	@auto_output="$$($(TEST_BIN))" || { \
+		echo "FAIL: $(TEST_BIN) failed" >&2; exit 1; }; \
+	scalar_output="$$($(SCALAR_BIN))" || { \
+		echo "FAIL: $(SCALAR_BIN) failed" >&2; exit 1; }; \
 	auto_digest="$${auto_output##*digest=}"; \
 	scalar_digest="$${scalar_output##*digest=}"; \
 	printf '%s\n%s\n' "$$auto_output" "$$scalar_output"; \
