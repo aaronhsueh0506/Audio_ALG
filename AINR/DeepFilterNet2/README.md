@@ -74,8 +74,9 @@ shape as the AIAEC classes, described once in `../../AIAEC/README.md`
 the first hop (the graph needs its right-hand neighbour) and 1 after; the
 spectra at the `DFN2_IO_FREQ` boundary are torch.stft normalized=True on this
 48 kHz/1024 grid, so chaining an AIAEC spectrum in is a 32x scale error (the
-header's warning block); the window is copied rather than borrowed
-because `DFN2State` embeds its table by value; and the two recurrent state
+header's warning block); the window is borrowed (a `cfg.window` of NULL
+makes the pool carve the sqrt-Hann table once for the analysis and
+synthesis objects); and the two recurrent state
 tensors (`h_gru`, `df_convp_history`) live in the pool at addresses that never
 change. The runtime binds each state output (`gru_hidden_next`,
 `df_convp_window_next`) to the same address as its input, so the output of one

@@ -65,9 +65,9 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 <td>gain + next h1/h2/h3</td><td><code>RNNoise-ERB/process.c/h</code></td></tr>
 <tr><td>DeepFilterNet2</td><td>3-frame ERB/complex feature + <code>h_gru</code> (1,5,1,256) + 5-frame <code>df_convp_history</code> window</td>
 <td>mask/DF/alpha heads + <code>h_gru_out</code>／<code>df_convp_history_out</code>（同位址就地）</td><td><code>DeepFilterNet2/dfn2_process.c/h</code> +
-<code>dfn2_model_io.c/h</code>，外面包 <b><code>dfn2_prepost.c/h</code> 類別</b></td></tr>
+<code>dfn2_model_io.c/h</code>，外面包 <b><code>dfn2_prepost.c/h</code> 類別</b>（TIME 模式在 pool 內建 <code>AcStft</code>／<code>AcIstft</code>）</td></tr>
 <tr><td>GTCRN</td><td>mag/real/imag 三個 ERB 域特徵(host ERB 前向) + 六個 conv window + <code>h_tra</code> + <code>h_dpgrnn</code></td>
-<td>ERB 域 complex mask + 同形狀的 <code>*_out</code> state（同位址就地；host ERB 逆矩陣＋CRM）</td><td><code>GTCRN/gtcrn_process.c/h</code> + <code>erb_fwd/erb_inv.bin</code></td></tr>
+<td>ERB 域 complex mask + 同形狀的 <code>*_out</code> state（同位址就地；host ERB 逆矩陣＋CRM）</td><td><code>GTCRN/gtcrn_process.c/h</code>（組幀為 audio_common 的 <code>AcStft</code>／<code>AcIstft</code>，由呼叫端建立）+ <code>erb_fwd/erb_inv.bin</code></td></tr>
 </table>
 
 <h2>AIAEC</h2>
@@ -115,8 +115,8 @@ framing、特徵前後端、recurrent ring／state buffer。整合者不再自�
 
 <p><b><code>io_mode</code> 在 init 固定</b>（它決定 pool 大小，不是可切換的旗標）：
 <code>*_IO_TIME</code> hop 進 hop 出，framing／加窗／overlap-add 由類別做，但呼叫的是
-<b>caller 自己的 <code>FftHandle</code> 與 window 表</b>（借用，類別不建也不毀）；
-<code>*_IO_FREQ</code> 頻譜進頻譜出、完全不做 transform，<code>fft</code>/<code>window</code>
+<b>caller 自己的 <code>FftHandle</code> 與 window 表</b>（借用，類別不建也不毀；DFN2 的 window 可為 NULL，此時由分析物件在 pool 內自帶）；
+<code>*_IO_FREQ</code> 頻譜進頻譜出、完全不做 transform、不 carve 任何 <code>AcStft</code>／<code>AcIstft</code>，<code>fft</code>/<code>window</code>
 可為 NULL，是<b>串接</b>用的模式（Align-ULCNet 的 accelerator adapter 就是開一個 FREQ 實例）。</p>
 
 <p><b>一 hop = 一次推論</b>：<code>pre_process</code> 回傳這一 hop 需要的加速器呼叫次數。

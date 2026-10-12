@@ -467,8 +467,8 @@ _config_defaults(&cfg, io_mode[, delay_depth])
   `_destroy()` 只釋放 `_create()` 配置的東西：對 `_init()` 實例它是**可重複呼叫的 no-op**
   （pool 永遠是 caller 的），對 `_create()` 實例呼叫第二次就是 double free。
 - 借用而不擁有：`FftHandle`、window 表、DFN2 的 ERB 矩陣都是 caller-owned，類別從不建立或銷毀。
-  **例外：DFN2 的 window 是複製的**——`DFN2State` 以 `float window[DFN2_WIN_LEN]` 內嵌窗表，
-  所以 `cfg.window` 非 NULL 時會在 init 與每次 reset 覆蓋它（類別仍然不配置也不釋放任何東西）。
+  組幀物件（`AcStft`／`AcIstft`）是 `*_IO_TIME` 的 pool 內物件，借用這些表；DFN2 的 `cfg.window` 為 NULL 時，
+  由分析物件在 pool 內自帶 sqrt-Hann 表、合成物件借用同一張。
 - `_reset()` 清空所有遞迴／ring／狀態、丟掉未結束的 frame、framing 與 clock 回 init 值；
   config、borrowed 指標與 pool 都不動。
 
@@ -591,7 +591,7 @@ int  ulcnet_prepost_post_process_freq(UlcnetPrepost *p, float re[ULCNET_BINS], f
 
 - `cfg` 欄位：`io_mode`、`delay_depth`（D，範圍 `ULCNET_MODEL_IO_MIN_D`=2 到
   `ULCNET_MODEL_IO_MAX_D`=64）、`fft`、`window`（後兩者 `ULCNET_IO_TIME` 必填、borrowed，
-  window 為 `ulcnet_make_window()` 產出的 `ULCNET_N_FFT` 項；`ULCNET_IO_FREQ` 不用）。
+  window 為 `ac_window_build()` 產出的 `ULCNET_N_FFT` 項；`ULCNET_IO_FREQ` 不用）。
 - **error 與 far 必須是同一個輸入 hop**：類別內部不做任何 skew。上游 WOLA 造成的落差由呼叫端先對齊。
 - `ULCNET_IO_FREQ` 收的是模型自己 framing 的未正規化 rfft（center=False，一 hop 一框）——
   AEC 的 `AecResContext.error_spec` 已經正好是這個 framing 慣例（但它是交錯的 `Complex`，
@@ -680,40 +680,38 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 
 | 類別 / grid | D | `*_IO_TIME` | `*_IO_FREQ` |
 |---|---:|---:|---:|
-| Align-ULCNet 16 kHz | 4 | 67,680 | 46,080 |
-| Align-ULCNet 16 kHz | 8 | 96,864 | 75,264 |
-| Align-ULCNet 16 kHz | 16 | 155,232 | 133,632 |
-| Align-ULCNet 16 kHz | 32 | 271,968 | 250,368 |
-| Align-ULCNet 16 kHz | 64 | 505,440 | 483,840 |
-| Align-ULCNet 48 kHz | 4 | 130,144 | 87,040 |
-| Align-ULCNet 48 kHz | 8 | 185,952 | 142,848 |
-| Align-ULCNet 48 kHz | 16 | 297,568 | 254,464 |
-| Align-ULCNet 48 kHz | 32 | 520,800 | 477,696 |
-| Align-ULCNet 48 kHz | 64 | 967,264 | 924,160 |
-| DeepVQE-S 16 kHz | 32 | 636,896 | 615,296 |
-| DeepFilterNet2 48 kHz | — | 237,936 | 240,016 |
+| Align-ULCNet 16 kHz | 4 | 67,856 | 46,064 |
+| Align-ULCNet 16 kHz | 8 | 97,040 | 75,248 |
+| Align-ULCNet 16 kHz | 16 | 155,408 | 133,616 |
+| Align-ULCNet 16 kHz | 32 | 272,144 | 250,352 |
+| Align-ULCNet 16 kHz | 64 | 505,616 | 483,824 |
+| Align-ULCNet 48 kHz | 4 | 130,320 | 87,024 |
+| Align-ULCNet 48 kHz | 8 | 186,128 | 142,832 |
+| Align-ULCNet 48 kHz | 16 | 297,744 | 254,448 |
+| Align-ULCNet 48 kHz | 32 | 520,976 | 477,680 |
+| Align-ULCNet 48 kHz | 64 | 967,440 | 924,144 |
+| DeepVQE-S 16 kHz | 32 | 637,072 | 615,280 |
+| DeepFilterNet2 48 kHz | — | 246,320 | 219,536 |
 
-DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 反而比 TIME 大 2,080 bytes：
-`DFN2State` 把 analysis/window/synthesis 緩衝以值內嵌，FREQ 實例甩不掉它們，卻要多 carve 雙輸入入口的
-第二組 staging（`apply_re`/`apply_im`）——**不要期待 AIAEC 那種等比例節省**。
+DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 比 TIME 小 26,784 bytes：
+`DFN2State` 不內嵌 analysis/window/synthesis 緩衝，TIME 另 carve 分析與合成兩個 audio_common 物件
+（16,480 B 與 12,384 B），FREQ 只多 carve 雙輸入入口的第二組 staging（`apply_re`/`apply_im`）。
 
-### 6.8 Framing helper：一 hop 一框的 analysis
+### 6.8 Framing：一 hop 一框的 analysis
 
-兩個 AIAEC 類別在 TIME 模式下的 analysis 走的是新增的：
+兩個 AIAEC 類別在 TIME 模式下的 analysis 是 audio_common `audio_stft.h` 的 `AcStft`，`center` = 0：
 
 ```c
-int ulcnet_analysis_push_frame(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
-                               float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]);
-int aiaec_analysis_push_frame(AiaecAnalysis *state, const float input[AIAEC_HOP],
-                              float real[AIAEC_N_BINS], float imag[AIAEC_N_BINS]);
+void ulcnet_framing_config(AcStftConfig *cfg, FftHandle *fft, const float *window, int center);
+int  ac_stft_push_planar(AcStft *s, const float *hop_in, float *re, float *im);
 ```
 
 center=False，**從第一次 push 起就是一 push 一框**（恆回 1），與 AEC/GSC seam 的頻譜同一個慣例，
-所以只有一路頻譜在手的呼叫端可以用它補另一路而兩路保持 hop 對齊。它與既有的
-`ulcnet_analysis_push()`／`aiaec_analysis_push()`（center=True，第一拍 0 框、第二拍 2 框）
-對同一個 hop 產出的**最後一框 bit-identical**，差別只在 centered 版本多吐一個 reflect-prefix 開頭框。
+所以只有一路頻譜在手的呼叫端可以用它補另一路而兩路保持 hop 對齊。它與 `center` = 1（center=True，
+第一拍 0 框、第二拍 2 框）對同一個 hop 產出的**最後一框 bit-identical**，差別只在 centered 版本多吐一個 reflect-prefix 開頭框。
+DeepVQE-S 在 AIAEC 16 kHz／512 邊界上自建同組態的物件。
 
-> **同一個 state 上不可混用兩個 push 函式**：它們共用 history，不共用 schedule。
+> **同一個 `AcStft` 不可混用兩種 `center`**：`center` 在建立時固定，兩種排程不共用物件。
 
 ---
 

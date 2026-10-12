@@ -71,8 +71,8 @@ pre code{background:none;padding:0}
 <tr><th></th><th>forward FFT</th><th>analysis window</th><th>NR gain 怎麼套</th><th>inverse + WOLA</th></tr>
 <tr><td><code>mono_aec_nr_res</code></td><td><b>AEC 內部</b>(<code>ctx.error_spec</code> 就是它的 50% overlap periodic-sqrt-Hann STFT)</td><td>AEC 擁有</td><td>NR <b>只算 gain 不套</b>,pipeline <code>sk_min_f32</code> 融合後一次套</td><td><b>pipeline 自己</b>(獨立的 <code>FftHandle</code>)</td></tr>
 <tr><td><code>4ch_aec_bf_nr_res</code></td><td><b>每條 lane 的 AEC 內部</b>,pipeline <b>借指標不複製</b></td><td>各 lane 的 AEC</td><td>同上,但 RES gain 來自<b>一個共用 <code>SuppressionGain</code></b>(不屬於任何 <code>Aec</code>)</td><td>pipeline 自己</td></tr>
-<tr><td><code>mono_alignulcnet</code></td><td class="dead"><b>AEC 的 FFT 完全不用</b>——ULCNet 自己的 centered STFT 做 forward</td><td>ULCNet(centered sqrt-Hann)</td><td class="dead"><b>沒有 NR</b>(沒有 <code>AnrDenoiser</code> 實例)</td><td><code>ulcnet_synthesis_push()</code></td></tr>
-<tr><td><code>4ch_alignulcnet</code></td><td colspan="4"><b>頻域直送</b>:① 每 lane AEC 的 STFT → SRP-PHAT + GSC;② GSC 的 mono 頻譜<b>直接</b>當 model 的 error 幀(<b>不重建、不再分析</b>),far 分支用 <code>ulcnet_analysis_push_frame()</code> 取同一 hop;③ model → <code>ulcnet_synthesis_push()</code>(<b>吃掉 1 hop</b>)</td></tr>
+<tr><td><code>mono_alignulcnet</code></td><td class="dead"><b>AEC 的 FFT 完全不用</b>——ULCNet 自己的 STFT（<code>AcStft</code>，<code>center</code> 0，一 hop 一幀）做 forward</td><td>ULCNet(rolling sqrt-Hann)</td><td class="dead"><b>沒有 NR</b>(沒有 <code>AnrDenoiser</code> 實例)</td><td><code>ac_istft_push_planar()</code>（<code>AcIstft</code>）</td></tr>
+<tr><td><code>4ch_alignulcnet</code></td><td colspan="4"><b>頻域直送</b>:① 每 lane AEC 的 STFT → SRP-PHAT + GSC;② GSC 的 mono 頻譜<b>直接</b>當 model 的 error 幀(<b>不重建、不再分析</b>),far 分支用 <code>ac_stft_push_planar()</code>（<code>center</code> 0）取同一 hop;③ model → <code>ac_istft_push_planar()</code>(<b>吃掉 1 hop</b>)</td></tr>
 </table></div>
 <div class="warn"><b><code>4ch_alignulcnet</code> 的總演算法延遲 = 1 hop</b>(16 k 256 smp/16 ms、48 k 512 smp/10.67 ms),只來自 synthesis 的半窗 trim。<b>兩個 branch 都從當前 input hop 取幀,所以不可以有 far 補償 buffer</b>——加回去就是 <code>error[t]</code> 配 <code>far[t-1]</code> 的一 hop 偏斜,而這種對齊細節<b>沒有任何自動檢查</b>。</div>
 
@@ -109,16 +109,14 @@ audio_pipeline_destroy(p);    /* 不釋放 caller pool */</pre>
         └ gain fusion = 逐 bin 取小
     7.  sk_capply_gain_f32(spec, ctx.error_spec, g_total, n_freqs)
     8.  CNG(bins 1..n-2):a = sqrt(1-G_res²) * sqrt(N²/PSD_SCALE) * max(G_nr, 0.316)
-    9.  fft_inverse(p->fft, spec, ifft_buf)
-   10.  sk_wola_accumulate_f32(ola, ifft_buf, synth_win, frame_size)
-   11.  memcpy(out, ola, hop) ; memmove ; memset          ← hop emit + shift</pre>
+    9.  ac_istft_push(p->istft, spec, out)
+        └ AcIstft(ACCUMULATE):fft_inverse → acc += ifft*w → hop emit + shift</pre>
 <div class="note"><b>為什麼是 <code>aec_process_context()</code> 而不是 <code>aec_process()</code>:</b>兩個入口只差「要不要把結果複製出來」,所以純粹是成本選擇。<code>aec_only=1</code> 時 AEC 的輸出<b>就是</b> pipeline 的輸出 → 用 <code>aec_process()</code> 直寫 caller 的 <code>out</code>;<code>aec_only=0</code> 時下游只讀 <code>ctx.error_spec</code>、從不碰 AEC 吐出的 hop → <code>aec_process_context()</code> 省掉那次複製。</div>
 <h3>Init 期的接線順序</h3>
 <pre>aec_get_mem_size → aec_init
-fft_get_mem_size → fft_init                 ← 獨立於 AEC 內部的 FFT
+ac_istft_get_mem_size → ac_istft_init     ← AcIstft 自帶 FFT 與 sqrt periodic-Hann 窗,獨立於 AEC 內部的 FFT
 anr_get_mem_size → anr_init
-六個 scratch(＋選配 unity gain)逐一 carve + memset
-synth_win = sqrt periodic-Hann
+三個 scratch(＋選配 unity gain)逐一 carve + memset
 grid agreement guard:
    aec_get_res_context(p->aec, &ctx0)  → 比對 n_freqs / hop
    fft_get_n_freqs() / anr_get_n_freqs() → 再比對一次</pre>
@@ -190,7 +188,7 @@ aec_get_linear_context(p->aec, &lctx);   /* lctx.aligned_far_hop ← 對齊後�
     if (rc == 0 && ulcnet_frame_is_finite(mdl_re, mdl_im)) { /* 採用 */ }
     /* 否則 identity */
 }
-ulcnet_synthesis_push(&synth, sre, sim, out + wrote);</pre>
+ac_istft_push_planar(synth, sre, sim, out + wrote);</pre>
 <div class="tblwrap"><table>
 <tr><th>Fallback 條件</th><th>行為</th></tr>
 <tr><td><code>infer == NULL</code></td><td>identity</td></tr>

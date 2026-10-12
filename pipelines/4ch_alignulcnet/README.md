@@ -36,8 +36,8 @@ The GSC's beamformed linear-error SPECTRUM is handed to the model directly:
 it is already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis frame
 the Align-ULCNet chain would otherwise compute, so nothing is reconstructed
 or re-analysed in between. The far branch pushes the SAME hop's
-`pre.aligned_ref` through `ulcnet_analysis_push_frame()` (`ulcnet_process.h`;
-center=False, exactly one frame per push from the first push). Both branches
+`pre.aligned_ref` through a rolling `AcStft` (`ulcnet_framing_config`,
+`ulcnet_process.h`; `center` 0, exactly one frame per push from the first push). Both branches
 therefore carry input hop t at pipeline hop t with no delay buffer on either
 side, and every hop from hop #0 is exactly one inference.
 
@@ -50,7 +50,7 @@ impulse: far at sample 2085 comes out at 2341, i.e. impulse + 256 exactly.
 This replaced a path that reconstructed a beam hop by WOLA and re-analysed
 it, which cost one IFFT plus one RFFT and one extra hop of latency per hop.
 Removed with it: the beam WOLA carves (`ifft`, `ola`, `synth_win`,
-`beam_hop`), the error-branch `UlcnetAnalysis`, the two-frame staging, the
+`beam_hop`), the error-branch analysis state, the two-frame staging, the
 one-hop far compensation buffer, and the C API entry point
 `audio_pipeline_4ch_ulcnet_last_beamformed_error()` — there is no
 reconstructed beam hop to hand out any more. The layout version

@@ -196,8 +196,8 @@ graph 只含 heads。</td></tr>
 <tr><th>頁面</th><th>一行描述</th></tr>
 <tr><td><a href="aiaec_align_ulcnet.html">aiaec_align_ulcnet</a></td>
 <td>Align-ULCNet：16k/512/256；具有完整產品 pipeline 的候選
-（<code>ulcnet_process.c</code>，centered STFT 與 center=False 的
-<code>ulcnet_analysis_push_frame()</code>（一 hop 一幀）兩種分析並存 + WOLA + NPU
+（<code>ulcnet_process.c</code>：<code>ulcnet_framing_config()</code> 描述 audio_common 的 <code>AcStft</code>／<code>AcIstft</code>，
+centered（<code>center</code> 1）與一 hop 一幀（<code>center</code> 0）兩種分析並存 + WOLA + NPU
 callback 邊界；每幀交易封在 <code>ulcnet_prepost.c</code> class）。</td></tr>
 <tr><td><a href="aiaec_align_cruse.html">aiaec_align_cruse</a></td>
 <td>Align-CRUSE：16k/512/256；cumsum 無衰減積分器與 paper_global 非因果

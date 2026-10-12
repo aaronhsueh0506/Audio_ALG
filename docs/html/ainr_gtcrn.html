@@ -61,10 +61,15 @@ vendored 於 <code>AINR/gtcrn_github/</code>。</p>
 <h2>API 用法</h2>
 <pre>#include "GTCRN/gtcrn_process.h"
 
-GTCRNProcessState st;               /* 10,256 bytes, 呼叫端配置 */
+GTCRNProcessState st;               /* 16 bytes, 呼叫端配置 */
 FftHandle *fft = fft_init(caller_fft_pool, caller_fft_pool_bytes,
                           GTCRN_N_FFT);
-gtcrn_process_init(&amp;st, fft);       /* state 只借用 caller-owned handle */
+AcStftConfig fc;
+gtcrn_framing_config(&amp;fc, fft, NULL);            /* 512 點、hop 256、未縮放 */
+AcStft  *stft  = ac_stft_init(mem_a, ac_stft_get_mem_size(&amp;fc), &amp;fc);   /* 窗表由它自帶 */
+gtcrn_framing_config(&amp;fc, fft, ac_stft_window(stft));   /* 合成物件借用同一張窗 */
+AcIstft *istft = ac_istft_init(mem_s, ac_istft_get_mem_size(&amp;fc), &amp;fc);
+gtcrn_process_init(&amp;st, stft, istft);   /* state 只借用 caller-owned 物件 */
 
 float spec[GTCRN_N_BINS][2];        /* bin-major [re, im] */
 float mag[GTCRN_MODEL_ERB_BANDS], re_b[GTCRN_MODEL_ERB_BANDS],
@@ -90,8 +95,8 @@ for (each hop of 256 new samples) {
 caller (256 samples/hop)
    |
    v
-gtcrn_analysis                      st.analysis_buf (512) 滑窗
-   |  df_common_analysis: root-Hann + FFT512, norm=1.0 (未正規化)
+gtcrn_analysis                      AcStft 的 history (512) 滑窗
+   |  ac_stft_push: root-Hann + FFT512, spec_scale=1.0 (未正規化)
    v
 spec [257][2]  ------------------------------------------+
    |                                                     |
@@ -116,8 +121,8 @@ spec [257][2]  ------------------------------------------+
 output [257][2]
    |
    v
-gtcrn_synthesis                     st.synthesis_buf OLA
-   |  df_common_synthesis: IFFT, root-Hann, 50% OLA (norm=1.0)
+gtcrn_synthesis                     AcIstft 的 acc OLA
+   |  ac_istft_push: IFFT, root-Hann, 50% OLA (ispec_scale=1.0)
    v
 256 output samples
 </pre>
@@ -195,12 +200,9 @@ decoder 的 window 深度與 encoder 反向(11、5、3)。</li>
 Slice 沿 axis 2 的起點在 int8 下落在 33 byte 的整數倍(window 一列 33 個元素),不是 16 byte 對齊;對齊處理由量化工具鏈決定,尚未在板上驗證。</p>
 <div class="tbl"><table>
 <tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
-<tr><td><code>analysis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct <code>GTCRNProcessState</code></td><td>分析滑窗</td></tr>
-<tr><td><code>synthesis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>OLA(有效 256)</td></tr>
-<tr><td><code>window</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>root-Hann,init 後不變</td></tr>
-<tr><td><code>scratch_time</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>FFT 時域 scratch，非跨呼叫</td></tr>
-<tr><td><code>scratch_freq</code></td><td>[257] complex</td><td>2,056</td><td>C struct</td><td>FFT 頻域 scratch，非跨呼叫</td></tr>
-<tr><td><code>fft</code></td><td>pointer</td><td>8</td><td>host caller</td><td>借用的 caller-owned <code>FftHandle</code></td></tr>
+<tr><td><code>AcStft</code>：history／seg／頻譜暫存、窗表</td><td>[512] f32 ×3 + [257] Complex</td><td>8,288（含窗）</td><td>pool(<code>AcStft</code>,呼叫端配置)</td><td>分析滑窗；窗表 root-Hann,init 後不變,借給合成物件；seg／頻譜暫存非跨呼叫</td></tr>
+<tr><td><code>AcIstft</code>：acc／time／頻譜暫存</td><td>[512] f32 ×2 + [257] Complex</td><td>6,240（借用窗與 FFT）</td><td>pool(<code>AcIstft</code>,呼叫端配置)</td><td>OLA 累加器（有效 256，跨 hop）與 IFFT 輸出</td></tr>
+<tr><td><code>stft</code>／<code>istft</code></td><td>2 pointers</td><td>16</td><td>C struct <code>GTCRNProcessState</code></td><td>借用 caller-owned 的 <code>AcStft</code>／<code>AcIstft</code>（它們再借用 caller-owned 的 <code>FftHandle</code>）</td></tr>
 <tr><td><code>conv_enc0/1/2</code></td><td>(1,16,3/5/11,33)</td><td>40,128(10,032 f32)</td><td>host caller</td><td>三個 encoder depth-conv 的完整 window,<code>*_out</code> 與輸入同位址</td></tr>
 <tr><td><code>conv_dec0/1/2</code></td><td>(1,16,11/5/3,33)</td><td>40,128(10,032 f32)</td><td>host caller</td><td>三個 decoder depth-conv 的完整 window,<code>*_out</code> 與輸入同位址</td></tr>
 <tr><td><code>h_tra</code></td><td>(1,6,1,16)</td><td>384(96 f32)</td><td>host caller</td><td>顯式 graph I/O,六顆 TRA <code>att_gru</code> hidden:列 0–2 encoder、列 3–5 decoder;C: <code>h_tra[6][1][16]</code></td></tr>
@@ -210,7 +212,7 @@ Slice 沿 axis 2 的起點在 int8 下落在 33 byte 的整數倍(window 一列 
 全部有限回 0;任何 NaN/Inf 則整個 state 歸零、state generation 加 1 並回 -1(前一個 state 已被覆寫;寫一半而仍有限者偵測不到;可信 runtime 可不呼叫)。
 <code>gtcrn_model_state_generation()</code> 回傳 generation:<code>gtcrn_model_state_init()</code> 後為 1,每次 <code>gtcrn_model_state_reset()</code> 與每次被拒的 validate 加 1(mod 2^32);
 加速器那份定點 state 看不到這兩件事,runtime 發現數值與上一幀不同就把自己的 state tensor 填成量化後的零。
-<code>sizeof(GTCRNProcessState)</code> = 10,256 bytes(64-bit 本機量測)。
+<code>sizeof(GTCRNProcessState)</code> = 16 bytes(兩個物件指標;64-bit 本機量測);物件大小用 <code>ac_stft_get_mem_size()</code>／<code>ac_istft_get_mem_size()</code> 現查。
 本目錄 <code>model.py</code> 無 cache 介面;上表 NPU 狀態 shape 逐一取自
 <code>stream_model.initial_inputs()</code> 與匯出 graph schema；
 <code>sizeof(GTCRNModelState)</code> = 84,868 bytes(84,864 bytes 的八個 state tensor ＋ 4 bytes 的 generation)。</p>

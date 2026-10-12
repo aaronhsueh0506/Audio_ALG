@@ -184,10 +184,10 @@ framing 照常前進（stream 0 已是 linear-AEC error，放行安全；DeepVQE
 <code>*_state_generation()</code>）是 C 端清零 state 的次數計數器：<code>reset</code> 與被拒絕的 commit 各加一，
 新建的實例為 0，成功的 commit、skip 與再次呼叫被拒的 commit 都不動它。定點 accelerator 的 state 緩衝在 C 清零時不會
 跟著變，板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。</p>
-<p><b>rolling 分析</b> <code>ulcnet_analysis_push_frame()</code>（<code>ulcnet_process.h</code>；
-<code>aiaec_process.h</code> 有同語意的 <code>aiaec_analysis_push_frame()</code>）：center=False，
+<p><b>rolling 分析</b> <code>AcStft</code> 的 <code>center</code> 0（<code>ulcnet_framing_config()</code> 的 <code>center</code> 參數，
+<code>ulcnet_process.h</code>；DeepVQE-S 自建同組態的物件）：center=False，
 <b>第一次 push 起每次恰一幀</b>（首幀前半段是歸零的歷史），與 centered
-<code>ulcnet_analysis_push()</code> 對同一個 hop 吐出的<b>最後一幀位元相同</b>——這個幾何下
+<code>center</code> 1 的 <code>AcStft</code> 對同一個 hop 吐出的<b>最後一幀位元相同</b>——這個幾何下
 （win = n_fft、hop = n_fft/2、共用同一張 sqrt-Hann 表）centered 第 k 幀與 non-centered 第 k−1 幀
 蓋的是同一段樣本、同一個窗，centered 排程只是<b>在開頭多發一幀 reflect 前綴</b>。
 <code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例逐 hop memcmp 釘住這件事
@@ -248,11 +248,11 @@ concat 恆為 256，所以 mask_fc1/fc2 的輸入寬度與 grid 無關，只有�
 <h2>訊號泳道圖</h2>
 <pre>hop（16k: 256 smp = 16 ms；48k: 512 smp = 10.67 ms）    h0        h1        h2        h3   …
 caller（送樣本）                       err/far H        H         H         H
-C pre：ulcnet_analysis_push_frame      F0        F1        F2        F3      每 hop 恰 1 幀
+C pre：ac_stft_push_planar(center 0) F0        F1        F2        F3      每 hop 恰 1 幀
 （err/far 各一路 center=False rolling）
 NN：一次 invocation                    out(F0)   out(F1)   out(F2)   out(F3) 每幀 1 out
 （delay 0：同 invocation 出幀）
-C post：ulcnet_synthesis_push          0 smp     H smp     H smp     H smp   半窗 trim
+C post：ac_istft_push_planar         0 smp     H smp     H smp     H smp   半窗 trim
 輸出樣本對應輸入區間                    —         [0,H)     [H,2H)    [2H,3H)
 hop-lag：端到端 1 個 hop（H samples）＝ synthesis 的<b>半窗 trim</b>（不是分析排程）；NN 本身 0 hop。
 時間上 16 kHz 是 16 ms、48 kHz 是 10.67 ms——hop 數相同，毫秒數不同。
@@ -290,21 +290,21 @@ tensor，無隱藏 state；四個 state 都由 CPU/DSP caller-owned pool 傳入�
 <table>
 <tr><th><code>get_mem_size</code> pool（byte）</th><th>grid</th><th>D=4</th><th>D=8</th><th>D=16</th><th>D=32</th><th>D=64</th></tr>
 <tr><td><code>ulcnet_model_io</code>（只有 state）</td><td>16 kHz（TA=26）</td><td>39,696</td><td>68,880</td><td>127,248</td><td>243,984</td><td>477,456</td></tr>
-<tr><td>class <code>ULCNET_IO_FREQ</code></td><td>16 kHz</td><td>46,080</td><td>75,264</td><td>133,632</td><td>250,368</td><td>483,840</td></tr>
-<tr><td><code>ulcnet_accelerator_adapter</code></td><td>16 kHz</td><td>46,112</td><td>75,296</td><td>133,664</td><td>250,400</td><td>483,872</td></tr>
+<tr><td>class <code>ULCNET_IO_FREQ</code></td><td>16 kHz</td><td>46,064</td><td>75,248</td><td>133,616</td><td>250,352</td><td>483,824</td></tr>
+<tr><td><code>ulcnet_accelerator_adapter</code></td><td>16 kHz</td><td>46,096</td><td>75,280</td><td>133,648</td><td>250,384</td><td>483,856</td></tr>
 <tr><td><code>ulcnet_model_io</code>（只有 state）</td><td>48 kHz（TA=52）</td><td>74,512</td><td>130,320</td><td>241,936</td><td>465,168</td><td>911,632</td></tr>
-<tr><td>class <code>ULCNET_IO_FREQ</code></td><td>48 kHz</td><td>87,040</td><td>142,848</td><td>254,464</td><td>477,696</td><td>924,160</td></tr>
-<tr><td><code>ulcnet_accelerator_adapter</code></td><td>48 kHz</td><td>87,072</td><td>142,880</td><td>254,496</td><td>477,728</td><td>924,192</td></tr>
+<tr><td>class <code>ULCNET_IO_FREQ</code></td><td>48 kHz</td><td>87,024</td><td>142,832</td><td>254,448</td><td>477,680</td><td>924,144</td></tr>
+<tr><td><code>ulcnet_accelerator_adapter</code></td><td>48 kHz</td><td>87,056</td><td>142,864</td><td>254,480</td><td>477,712</td><td>924,176</td></tr>
 </table>
 <p>本機量測。adapter = class FREQ pool + 32 B header（adapter 自己只存三個欄位）。
-<code>ULCNET_IO_TIME</code> 在 FREQ 之上再加一份<b>與 D 無關</b>的 framing（兩路 rolling 分析歷史、
-共用 transform scratch、一個 synthesis、輸出 hop staging）：16 kHz +21,600 B、48 kHz +43,104 B，
-所以 D=8 的 TIME pool 是 96,864 B（16 kHz）／185,952 B（48 kHz）。
+<code>ULCNET_IO_TIME</code> 在 FREQ 之上再加一份<b>與 D 無關</b>的 framing（兩個 rolling <code>AcStft</code>、
+一個 <code>AcIstft</code>——各自帶 transform scratch，借用呼叫端的 FFT handle 與視窗表——以及輸出 hop staging）：16 kHz +21,792 B、48 kHz +43,296 B，
+所以 D=8 的 TIME pool 是 97,040 B（16 kHz）／186,128 B（48 kHz）。
 <code>logit_history</code> 只隨 D 走、不隨 grid 走，所以 48 kHz 的 pool 不是 16 kHz 的
 兩倍——FREQ pool 在 D=8 時是 1.90×，D=64 時是 1.91×。</p>
 <table>
 <tr><th>其他 state</th><th>內容</th><th>保存者</th></tr>
-<tr><td>STFT×2 / ISTFT 狀態</td><td>UlcnetAnalysis×2 + UlcnetSynthesis</td><td>C struct（<code>ulcnet_process.h</code>）、caller-owned、zero heap</td></tr>
+<tr><td>STFT×2 / ISTFT 狀態</td><td><code>AcStft</code>×2 + <code>AcIstft</code>（<code>ulcnet_framing_config()</code>）</td><td>pool 內物件（<code>audio_stft.h</code>）、借用呼叫端的 FFT handle 與視窗表、zero heap</td></tr>
 <tr><td>PBFDKF / delay 對齊</td><td>—</td><td>AEC C 端 static pool</td></tr>
 </table>
 <p>Python reference 把全部 state 存在 <code>create_stream_state()</code> 回傳的 host dict；
@@ -331,7 +331,7 @@ double twiddles），非 bit-exact（<code>test_ulcnet_process_c.py</code> 檔�
 <ul>
 <li><code>AIAEC/Align_ULCNet/model.py</code>（<code>AlignULCNet</code>：forward / create_stream_state / forward_stream）</li>
 <li><code>AIAEC/Align_ULCNet/inference.py</code>（逐 hop 推論、calibration、<code>--max-delay-frames</code> / <code>--input-is-linear-error</code>）與 <code>export_onnx.py</code></li>
-<li><code>AIAEC/Align_ULCNet/ulcnet_process.c / .h</code>（C 前後處理：sqrt-Hann STFT/WOLA；centered <code>ulcnet_analysis_push</code> 與 center=False <code>ulcnet_analysis_push_frame</code> 兩條排程）、<code>ulcnet_prepost.c / .h</code>（pre/post 類別；<code>AIAEC/Makefile</code> 收進 <code>libaiaec_prepost.a</code>）</li>
+<li><code>AIAEC/Align_ULCNet/ulcnet_process.c / .h</code>（C 前後處理：<code>ulcnet_framing_config()</code> 描述 audio_common 的 sqrt-Hann <code>AcStft</code>／<code>AcIstft</code>，<code>center</code> 1 與 <code>center</code> 0 兩條分析排程）、<code>ulcnet_prepost.c / .h</code>（pre/post 類別；<code>AIAEC/Makefile</code> 收進 <code>libaiaec_prepost.a</code>）</li>
 <li><code>AIAEC/Align_ULCNet/export_onnx.py</code>、<code>inference.py calib</code>（BIN/NPZ calibration 放在該 model 的 <code>calib/</code>；分開記錄 training provenance 與 aligned-far deployment metadata；calib 同 process 一併匯出並 parity-check 對應 graph）；<code>ulcnet_accelerator_adapter.c/h</code>、<code>ulcnet_model_io.c/h</code>（見 <a href="pipeline_ulcnet_mono.html">pipeline_ulcnet_mono</a>）</li>
 <li><code>AIAEC/aiaec_streaming.py</code>（cells、StreamSTFT/StreamISTFT、state_report）；<code>AIAEC/dataset_gen/model_views.py</code>（task/輸入 mapping）</li>
 <li>tests：<code>AIAEC/tests/</code> 的 <code>test_streaming_align_ulcnet.py</code>、<code>test_ulcnet_process_c.py</code>、<code>test_candidate_models.py</code>、<code>test_export_streaming_ulcnet.py</code>（ONNX runtime vs PyTorch parity、layout-version 互鎖、window 位移方向、被丟掉的那一格不被讀取）、<code>test_onnx_state_contract_names.py</code>（同位址 state 合約驗證器，逐項違規）、<code>test_stream_conv_cell.py</code>、<code>test_ulcnet_model_io_c.py</code>（就地 fake runtime 對照直接索引的 window 內容、generation 計數器）、<code>test_ulcnet_prepost_c.py</code>（案例：對 hand-composed 路徑 memcmp 位元相同、TIME/FREQ 一致、陳舊 pool 閘與 carve 版本、skip=identity、狀態機守衛）；全樹基準數見 <code>docs/release_checklist.md</code>。</li>

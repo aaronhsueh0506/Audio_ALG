@@ -502,8 +502,8 @@ staging、工作區）：
 
 | adapter pool | D=4 | D=8 | D=16 | D=32 | D=64 |
 |---|---:|---:|---:|---:|---:|
-| 16 kHz（TA=26） | 46,112 B | 75,296 B | 133,664 B | 250,400 B | 483,872 B |
-| 48 kHz（TA=52） | 87,072 B | 142,880 B | 254,496 B | 477,728 B | 924,192 B |
+| 16 kHz（TA=26） | 46,096 B | 75,280 B | 133,648 B | 250,384 B | 483,856 B |
+| 48 kHz（TA=52） | 87,056 B | 142,864 B | 254,480 B | 477,712 B | 924,176 B |
 
 只要 model_io 的 K/V／logit／GRU state（`ulcnet_model_io_get_mem_requirements()`，
 不含 class 的前後處理 scratch）：
@@ -769,11 +769,12 @@ flowchart LR
 ```
 
 每個 256-sample hop 產生一個 model frame，且每 hop 至多一次 inference。
-`ulcnet_analysis_push_frame()`（mono wrapper、4ch direct path、pre/post
+rolling 分析（`AcStft`，`center` 0；mono wrapper、4ch direct path、pre/post
 class 的 TIME 模式全走這個）從第一次推入起就固定一幀一次 inference，沒有
-priming 例外。centered `ulcnet_analysis_push()`（0/2/1 幀發射，priming 期間的
-第二次 push 會連續產生兩幀）沒有出貨 pipeline 呼叫，只剩
-Python parity gate 使用。model graph 不收 PCM、不包 STFT/WOLA、不包 PBFDKF
+priming 例外。centered 分析（`center` 1，0/2/1 幀發射，priming 期間的
+第二次 push 會連續產生兩幀）自 2026-09-03 起不再有出貨 pipeline 呼叫，只剩
+Python parity gate 使用。（組幀實作已由 `ulcnet_process.c` 內的 `UlcnetAnalysis`／`UlcnetSynthesis`
+換成 audio_common 的 `AcStft`／`AcIstft`，函式名稱見 `ulcnet_framing_config()`；本節其餘敘述是當時的紀錄。）model graph 不收 PCM、不包 STFT/WOLA、不包 PBFDKF
 或 delay state machine。
 
 ### 10.2 ONNX input/output contract（方案 B）
@@ -883,13 +884,12 @@ identity reprime。
 
 本專案交付：
 
-- `ulcnet_process.c/.h`：sqrt-Hann STFT/WOLA 與 RI frame。兩種 analysis
-  推入方式：`ulcnet_analysis_push()`（centered、0/2/1 出幀排程，沒有
-  出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
-  `ulcnet_analysis_push_frame()`（center=False、每次推入
-  固定出一幀，與同一 hop 的 centered 最後一幀逐 bit 相同；mono wrapper 兩路、
-  4ch direct path 的 far 路，以及兩個 AIAEC pre/post class 的 TIME 模式都在用）。
-  同一個 state 不可混用兩種推入函式。
+- `ulcnet_process.c/.h`：`ulcnet_framing_config()` 描述 audio_common 的 sqrt-Hann `AcStft`／`AcIstft`
+  （RI frame）。兩種 analysis 排程：`center` 1（centered、0/2/1 出幀排程，2026-09-03
+  起不再有出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
+  `center` 0（2026-09-03 加入；rolling、每次推入固定出一幀，與同一 hop 的 centered
+  最後一幀逐 bit 相同；mono wrapper 兩路、4ch direct path 的 far 路，以及兩個 AIAEC
+  pre/post class 的 TIME 模式都在用，mono 是同一天稍後跟進的）。同一個 `AcStft` 不可混用兩種 `center`。
 - model-I/O/state `c/.h`：caller-owned memory requirement/init/reset、四個
   state tensor 的保存、commit（驗證 state、壓縮域 error × mask、逆冪；不更新 state）、
   state generation、descriptor/layout validation。沒有 CPU ring update，也沒有複製路徑。

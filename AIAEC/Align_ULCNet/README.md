@@ -380,7 +380,7 @@ ulcnet_model_io_prepare(state, err_re, err_im, far_re, far_im, &in, &out);
  * reads all state inputs before it writes any state output. */
 if (run_accelerator(&in, &out) == 0 &&
     ulcnet_model_io_commit(state, enhanced_re, enhanced_im) == 0) {
-    /* enhanced_re/im may now be sent to ulcnet_synthesis_push(). */
+    /* enhanced_re/im may now be sent to the synthesis (ac_istft_push_planar). */
 } else {
     /* Output the linear-error hop. A refused commit zeroed all four state
      * tensors (cold start) and advanced the state generation; a frame that
