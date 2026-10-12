@@ -327,9 +327,9 @@ AnrDenoiser* audio_pipeline_get_nr(const AudioPipeline* p);   /* NULL iff cfg.ae
  * this is purely for the human-readable table. */
 typedef struct {
     size_t aec_bytes;
-    size_t fft_bytes;         /* 0 when cfg.aec_only */
+    size_t fft_bytes;         /* the FFT handle inside the synthesis object (counted in the pool once); 0 when cfg.aec_only */
     size_t nr_bytes;          /* 0 when cfg.aec_only */
-    size_t pipeline_bytes;    /* the 7 scratch buffers (0 when aec_only) */
+    size_t pipeline_bytes;    /* the synthesis object without its FFT plus the gain and spectrum scratch (0 when aec_only) */
     int    hop, frame_sz, fft_sz, n_freqs;
 } AudioPipelineMemBreakdown;
 

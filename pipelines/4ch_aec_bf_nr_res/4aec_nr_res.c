@@ -35,15 +35,12 @@
  * reads from it is that table; a regeneration that drops or renames it
  * fails loudly here at compile time, which is the intended signal. */
 #include "fft_wrapper.h"
+#include "audio_stft.h"
 #include "mem_align.h"
 #include "suppression_gain.h"
 #include "4aec_projection_kernels.h"
 #include "simd_kernels.h"
 #include "nr_overlay.h"
-
-#ifndef M_PI_F
-#define M_PI_F 3.14159265358979323846f
-#endif
 
 /* PSD scale and CNG RNG seed, same as audio_pipeline.c. */
 #define PSD_SCALE                 (32768.0f * 32768.0f)
@@ -191,7 +188,7 @@ struct FourAecNrRes {
     Aec* lanes[FOUR_AEC_NR_RES_CHANNELS];
     DelayAec3 shared_delay;
     AnrDenoiser* nr;
-    FftHandle* fft;
+    AcIstft* istft;             /* iff enable_post: inverse FFT, sqrt-Hann window, overlap-add */
 
     SuppressionGain post_sg;
     SuppressionGainConfig post_sg_cfg;
@@ -241,10 +238,6 @@ struct FourAecNrRes {
     float* total_gain;
     float* extra_noise;
     float* error_power;
-
-    float* synth_window;
-    float* ifft_buffer;
-    float* ola;
 
     uint32_t rng_state;
 
@@ -510,7 +503,6 @@ static int carve_working_buffers(FourAecNrRes* p,
                                  PoolCursor* cursor) {
     int n = p->n_freqs;
     int hop = p->hop_size;
-    int fft = p->fft_size;
     size_t linear_count = (size_t)hop * FOUR_AEC_NR_RES_CHANNELS;
 
     p->linear_interleaved =
@@ -548,13 +540,6 @@ static int carve_working_buffers(FourAecNrRes* p,
     p->error_power =
         (float*)pool_carve(cursor, (size_t)n, sizeof(float));
 
-    p->synth_window =
-        (float*)pool_carve(cursor, (size_t)fft, sizeof(float));
-    p->ifft_buffer =
-        (float*)pool_carve(cursor, (size_t)fft, sizeof(float));
-    p->ola =
-        (float*)pool_carve(cursor, (size_t)fft, sizeof(float));
-
     /* p->snapshots[ch]'s Complex- and float-pointer fields are no longer
      * pool-carved -- bind_lane_view() (formerly snapshot_context()) points
      * them directly at each lane's own AecResContext buffers every hop
@@ -567,8 +552,7 @@ static int carve_working_buffers(FourAecNrRes* p,
            p->residual_work && p->output_spec &&
            p->fused_r2 && p->fused_comfort && p->post_near_power &&
            p->total_gain && p->extra_noise &&
-           p->error_power && p->synth_window && p->ifft_buffer &&
-           p->ola;
+           p->error_power;
 }
 
 static int init_post_sg(FourAecNrRes* p,
@@ -611,8 +595,16 @@ static int init_post_sg(FourAecNrRes* p,
     return 1;
 }
 
+/* The synthesis object: inverse FFT, sqrt-Hann window and overlap-add state.
+ * It carves its own FFT handle; 0 for an invalid size. */
+static size_t synthesis_mem_size(int fft_size) {
+    AcStftConfig scfg;
+    ac_stft_config_default(&scfg, fft_size);
+    return ac_istft_get_mem_size(&scfg);
+}
+
 static size_t pipeline_buffer_size(
-    int hop, int fft, int n, int post_ma_n, int delay_ring_size,
+    int hop, int n, int post_ma_n, int delay_ring_size,
     size_t delay_estimator_bytes, int enable_post, int enable_res,
     int enable_nr) {
     size_t total = 0;
@@ -632,9 +624,6 @@ static size_t pipeline_buffer_size(
         total = ck_field_size(total, (size_t)n, sizeof(Complex));
     for (i = 0; i < 6; ++i)
         total = ck_field_size(total, (size_t)n, sizeof(float));
-    for (i = 0; i < 3; ++i)
-        total = ck_field_size(total, (size_t)fft, sizeof(float));
-
     /* No per-lane snapshot buffers here: FourAecLaneSnapshot's spectrum/PSD
      * fields are borrowed pointers into each lane's own AecResContext, not
      * pool-carved copies. See bind_lane_view()/carve_working_buffers(). */
@@ -675,15 +664,15 @@ static size_t pipeline_pool_size(
     const int want_nr = enable_post && enable_nr;
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
     size_t nr_bytes = want_nr ? anr_get_mem_size(nr_cfg) : 0;
-    size_t fft_bytes = enable_post ? fft_get_mem_size(fft) : 0;
+    size_t synth_bytes = enable_post ? synthesis_mem_size(fft) : 0;
     size_t buffer_bytes = pipeline_buffer_size(
-        hop, fft, n, post_ma_n, delay_ring_size, delay_estimator_bytes,
+        hop, n, post_ma_n, delay_ring_size, delay_estimator_bytes,
         enable_post, enable_res, enable_nr);
     size_t total = 0;
     int ch;
 
     if (aec_bytes == 0 || buffer_bytes == 0 ||
-        (enable_post && fft_bytes == 0) ||
+        (enable_post && synth_bytes == 0) ||
         (want_nr && nr_bytes == 0)) return 0;
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
@@ -691,7 +680,7 @@ static size_t pipeline_pool_size(
     if (want_nr)
         total = ck_add_size(total, ck_align16_size(nr_bytes));
     if (enable_post)
-        total = ck_add_size(total, ck_align16_size(fft_bytes));
+        total = ck_add_size(total, ck_align16_size(synth_bytes));
     total = ck_add_size(total, buffer_bytes);
     return MEM_SIZE_INVALID(total) ? 0 : total;
 }
@@ -708,7 +697,7 @@ static int pipeline_build(
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
     size_t nr_bytes = p->cfg.enable_post && p->cfg.enable_nr
         ? anr_get_mem_size(nr_cfg) : 0;
-    size_t fft_bytes = p->cfg.enable_post ? fft_get_mem_size(p->fft_size) : 0;
+    size_t synth_bytes = p->cfg.enable_post ? synthesis_mem_size(p->fft_size) : 0;
     int ch;
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
@@ -720,17 +709,19 @@ static int pipeline_build(
     }
 
     if (p->cfg.enable_post) {
-        void* fft_pool;
+        void* synth_pool;
+        AcStftConfig scfg;
         if (p->cfg.enable_nr) {
             void* nr_pool = pool_carve(cursor, 1, nr_bytes);
             if (!nr_pool) return 0;
             p->nr = anr_init(nr_pool, nr_bytes, nr_cfg);
             if (!p->nr) return 0;
         }
-        fft_pool = pool_carve(cursor, 1, fft_bytes);
-        if (!fft_pool) return 0;
-        p->fft = fft_init(fft_pool, fft_bytes, p->fft_size);
-        if (!p->fft) return 0;
+        synth_pool = pool_carve(cursor, 1, synth_bytes);
+        if (!synth_pool) return 0;
+        ac_stft_config_default(&scfg, p->fft_size);
+        p->istft = ac_istft_init(synth_pool, synth_bytes, &scfg);
+        if (!p->istft) return 0;
     }
 
     if (!carve_working_buffers(p, cursor)) return 0;
@@ -944,21 +935,12 @@ FourAecNrRes* four_aec_nr_res_init_ex(
             p, &cursor, &aec_cfg, &nr_cfg) ||
         cursor.remaining != 0) return NULL;
 
-    if (p->cfg.enable_post) {
-        for (k = 0; k < fft; ++k) {
-            p->synth_window[k] = sqrtf(
-                0.5f * (1.0f - cosf(
-                    2.0f * M_PI_F * (float)k / (float)fft)));
-        }
-    }
-
     for (k = 0; k < FOUR_AEC_NR_RES_CHANNELS; ++k) {
         AecResContext context;
         aec_get_res_context(p->lanes[k], &context);
         if (context.hop_size != hop || context.n_freqs != n)
             return NULL;
     }
-    if (p->cfg.enable_post && fft_get_n_freqs(p->fft) != n) return NULL;
     /* p->nr is non-NULL exactly when the NR region was carved (the whole
      * pool is memset before build), so it answers the same question the two
      * config fields do -- and it is the pointer about to be dereferenced. */
@@ -1954,17 +1936,8 @@ static int prepare_post_spectrum(
  * fusion and comfort-noise loop above. */
 static int finish_hop(FourAecNrRes* p, const Complex* spectrum, float* out) {
     int hop = p->hop_size;
-    int fft = p->fft_size;
     uint32_t t0 = four_aec_nr_res_now_us();
-    fft_inverse(p->fft, spectrum, p->ifft_buffer);
-    sk_wola_accumulate_f32(p->ola, p->ifft_buffer, p->synth_window, fft);
-    memcpy(out, p->ola, (size_t)hop * sizeof(float));
-    memmove(
-        p->ola, p->ola + hop,
-        (size_t)(fft - hop) * sizeof(float));
-    memset(
-        p->ola + (fft - hop), 0,
-        (size_t)hop * sizeof(float));
+    ac_istft_push(p->istft, spectrum, out);
     p->last_timing.synth_us = four_aec_nr_res_now_us() - t0;
     return inputs_finite(out, (size_t)hop);
 }
@@ -2084,7 +2057,7 @@ int four_aec_nr_res_synthesize_external(
     const Complex* spectrum,
     float* out) {
     if (!p || p->destroyed || !spectrum || !out || !p->cfg.enable_post ||
-        !p->fft || !p->ifft_buffer || !p->ola || !p->synth_window)
+        !p->istft)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     if (!complex_vector_finite(spectrum, p->n_freqs) ||
         !finish_hop(p, spectrum, out)) {
@@ -2256,13 +2229,7 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
         memset(p->aligned_ref, 0,
                (size_t)p->hop_size * sizeof(float));
     }
-    if (p->ola) {
-        memset(p->ola, 0, (size_t)p->fft_size * sizeof(float));
-    }
-    if (p->ifft_buffer) {
-        memset(p->ifft_buffer, 0,
-               (size_t)p->fft_size * sizeof(float));
-    }
+    if (p->istft) ac_istft_reset(p->istft);
 
     p->delay_samples_seen = 0;
     p->accepted_delay =
@@ -2307,7 +2274,6 @@ void four_aec_nr_res_destroy(FourAecNrRes* p) {
     if (!p || p->destroyed) return;
 
     if (p->nr) anr_destroy(p->nr);
-    if (p->fft) fft_destroy(p->fft);
     for (ch = 0; ch < p->initialized_lanes; ++ch) {
         aec_destroy(p->lanes[ch]);
     }
@@ -2429,6 +2395,7 @@ int four_aec_nr_res_get_mem_breakdown(
     size_t aec_total = 0;
     size_t nr_bytes;
     size_t fft_bytes;
+    size_t synth_bytes;
     size_t wrapper_storage;
     size_t wrapper_bytes;
     size_t total;
@@ -2450,17 +2417,23 @@ int four_aec_nr_res_get_mem_breakdown(
     want_nr = cfg->enable_post && cfg->enable_nr;
     nr_bytes = want_nr ? anr_get_mem_size(&nr_cfg) : 0;
     fft_bytes = cfg->enable_post ? fft_get_mem_size(fft) : 0;
+    synth_bytes = cfg->enable_post ? synthesis_mem_size(fft) : 0;
     wrapper_storage = pipeline_buffer_size(
-        hop, fft, n, post_ma_n, delay_ring_size, delay_estimator_bytes,
+        hop, n, post_ma_n, delay_ring_size, delay_estimator_bytes,
         cfg->enable_post, cfg->enable_res, cfg->enable_nr);
     if (aec_one == 0 || wrapper_storage == 0 ||
-        (cfg->enable_post && fft_bytes == 0) ||
+        (cfg->enable_post && (fft_bytes == 0 || synth_bytes == 0)) ||
         (want_nr && nr_bytes == 0)) return -1;
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
         aec_total = ck_add_size(aec_total, ck_align16_size(aec_one));
     wrapper_bytes = ck_add_size(
         ck_align16_size(sizeof(FourAecNrRes)), wrapper_storage);
+    /* The synthesis object holds the FFT counted on its own line above; its
+     * remainder (window, overlap state, staging) belongs to the wrapper. */
+    if (cfg->enable_post && synth_bytes > ck_align16_size(fft_bytes))
+        wrapper_bytes = ck_add_size(
+            wrapper_bytes, synth_bytes - ck_align16_size(fft_bytes));
     total = wrapper_bytes;
     total = ck_add_size(total, aec_total);
     if (want_nr)
