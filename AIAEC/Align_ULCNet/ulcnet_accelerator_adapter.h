@@ -3,6 +3,7 @@
 #define ULCNET_ACCELERATOR_ADAPTER_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "ulcnet_model_io.h"
 #include "ulcnet_process.h"
@@ -30,7 +31,7 @@ int ulcnet_accelerator_adapter_get_mem_size(
 /* Board integrators: the descriptor's delay_depth MUST equal the delay depth
  * the ONNX graph was exported with. Nothing verifies that -- the validator
  * only bounds-checks the range, and no C code here reads the model's metadata
- * -- and a mismatch is silent: the host rings are carved from the descriptor
+ * -- and a mismatch is silent: the host windows are carved from the descriptor
  * while the runtime reads and writes the graph's shapes. There is no
  * exporter-generated descriptor header yet; populate it from the exported
  * model's own recorded depth. */
@@ -40,6 +41,13 @@ UlcnetAcceleratorAdapter *ulcnet_accelerator_adapter_init(
     const UlcnetModelIoDescriptor *descriptor,
     UlcnetAcceleratorRun run,
     void *run_user);
+
+/* Restart counter of the adapter's state tensors: it advances when the state
+ * is reset or a refused frame zeroed it (ulcnet_prepost_state_generation).
+ * A board with a fixed-point accelerator state refills it with quantized
+ * zeros whenever the value changed. 0 for a NULL adapter. */
+uint32_t ulcnet_accelerator_adapter_state_generation(
+    const UlcnetAcceleratorAdapter *adapter);
 
 /* The compiled model-I/O contract of this adapter's state, for a board
  * comparing it against the ONNX metadata it loaded. Valid for the adapter's

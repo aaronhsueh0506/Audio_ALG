@@ -3,7 +3,7 @@
  *
  * ONE object owning everything between the caller's audio and the
  * accelerator's tensors, so an integrator never touches the framing
- * states, the feature front end or the recurrent rings directly:
+ * states, the feature front end or the recurrent windows directly:
  *
  *     ulcnet_prepost_pre_process(p, err_hop, far_hop);
  *     ulcnet_prepost_frame_inputs(p, &in, &out);   // views into the pool
@@ -71,8 +71,10 @@ extern "C" {
  * 2: the TIME analyses became two UlcnetAnalysis states (own scratch each).
  * 3: the model I/O region holds one GRU hidden pair, with no second pair for
  *    the outputs.
- * 4: the model I/O region carries no per-frame K/V/logit staging. */
-#define ULCNET_PREPOST_CARVE_VERSION 4u
+ * 4: the model I/O region carries no per-frame K/V/logit staging.
+ * 5: the K/V and logit regions hold full windows (D and 5 frames) and the
+ *    model I/O region holds one combined GRU hidden. */
+#define ULCNET_PREPOST_CARVE_VERSION 5u
 
 /* Which side of the transform the caller works on. FIXED AT INIT because it
  * decides the pool size: ULCNET_IO_TIME additionally carves two analysis
@@ -158,9 +160,16 @@ UlcnetPrepost *ulcnet_prepost_create(const UlcnetPrepostConfig *cfg);
  * touches the caller's fft or window. */
 void ulcnet_prepost_destroy(UlcnetPrepost *p);
 
-/* Zero every recurrent/ring/hidden tensor, drop any open frame, and reset
+/* Zero every recurrent window/hidden tensor, drop any open frame, and reset
  * the framing states. Config and pool are untouched. */
 void ulcnet_prepost_reset(UlcnetPrepost *p);
+
+/* Counter of state restarts (ulcnet_model_io_state_generation): it advances
+ * whenever the C side zeroed the state tensors, in ulcnet_prepost_reset() and
+ * when frame_commit() refused a frame; 0 for a fresh instance. A board with a
+ * fixed-point accelerator state refills it with quantized zeros when the
+ * value differs from the one it last saw. 0 for NULL. */
+uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p);
 
 int ulcnet_prepost_hop_size(const UlcnetPrepost *p);   /* or -1 */
 int ulcnet_prepost_num_bins(const UlcnetPrepost *p);   /* or -1 */
@@ -198,11 +207,10 @@ int ulcnet_prepost_pre_process_freq(UlcnetPrepost *p,
 /* Publish the current frame's accelerator boundary. The `output` mask is
  * NaN-prefilled, so an unwritten frame is caught by frame_commit rather than
  * leaking the previous frame's values. Each state output (key/value/logit
- * history, GRU hiddens) is the same address as its state input. A runtime
- * with its own output tensors passes them to ulcnet_model_io_inherit() with
- * this `outputs`; one that can bind the state outputs to these pointers
- * writes in place and needs no inherit. Pointers are into this instance's
- * pool and are stable for its life.
+ * window, GRU hidden) is the same address as its state input: the runtime
+ * binds the pointers returned here, reads every state input before it writes
+ * any state output, and the state advances with no copy. Pointers are into
+ * this instance's pool and are stable for its life.
  * Returns 0, or -1 if no frame is open. */
 int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
                                 UlcnetModelIoInputs *inputs,
@@ -220,7 +228,8 @@ int ulcnet_prepost_frame_inputs(UlcnetPrepost *p,
  * that never ran cannot pass untouched buffers off as a result.
  *
  * On failure the state has already been overwritten and cannot be rolled
- * back, so the K/V/logit rings and both hiddens restart from zero;
+ * back, so the K/V/logit windows and the hidden restart from zero and
+ * ulcnet_prepost_state_generation() advances;
  * the framing state does not move, the frame stays open, and -1 is
  * returned. The caller then either calls ulcnet_prepost_frame_skip() to
  * keep the framing schedule intact, or re-runs the accelerator through a

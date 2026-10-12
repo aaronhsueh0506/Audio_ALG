@@ -128,6 +128,8 @@ struct DeepVqePrepost {
     float *enh_re;      /* [AIAEC_N_BINS] commit/skip staging */
     float *enh_im;
 
+    uint32_t state_generation;  /* advances whenever the state is zeroed */
+
     int frame_open;     /* a frame is armed and awaiting commit/skip */
     int prepared;       /* frame_inputs() armed the accelerator transaction */
     int written;        /* samples the last closed frame put in out_hop:
@@ -146,7 +148,6 @@ static int dv_valid_depth(int delay_depth) {
 
 int deepvqe_prepost_state_shape(int state_id, int delay_depth,
                                 int dims[DEEPVQE_STATE_MAX_RANK]) {
-    int rank = 4;
     int c = 0;
     int t = 0;
     int f = 0;
@@ -163,40 +164,39 @@ int deepvqe_prepost_state_shape(int state_id, int delay_depth,
     case DEEPVQE_STATE_ALIGN_VALUE_RING:
         c = DEEPVQE_VALUE_CHANNELS; t = delay_depth; f = DEEPVQE_F2; break;
     case DEEPVQE_STATE_ALIGN_SCORE_HISTORY:
-        c = DEEPVQE_SIM_CHANNELS;   t = DEEPVQE_SCORE_HISTORY;
+        c = DEEPVQE_SIM_CHANNELS;   t = DEEPVQE_SCORE_WINDOW;
         f = delay_depth; break;
     case DEEPVQE_STATE_CCM_UP_HISTORY:
-        c = 32; t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F1; break;
+        c = 32; t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F1; break;
     case DEEPVQE_STATE_FAR1_HISTORY:
-        c = 2;  t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F0; break;
+        c = 2;  t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F0; break;
     case DEEPVQE_STATE_FAR2_HISTORY:
-        c = 8;  t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F1; break;
+        c = 8;  t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F1; break;
     case DEEPVQE_STATE_H_GRU:
-        /* The one rank-3 tensor at this boundary: [1,1,GRU_HIDDEN]. */
-        rank = 3;
+        /* [1,GRU_LAYERS,1,GRU_HIDDEN] */
         dims[0] = 1;
         dims[1] = DEEPVQE_GRU_LAYERS;
-        dims[2] = DEEPVQE_GRU_HIDDEN;
-        dims[3] = 0;
-        return rank;
+        dims[2] = 1;
+        dims[3] = DEEPVQE_GRU_HIDDEN;
+        return DEEPVQE_STATE_MAX_RANK;
     case DEEPVQE_STATE_MIC1_HISTORY:
-        c = 2;  t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F0; break;
+        c = 2;  t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F0; break;
     case DEEPVQE_STATE_MIC2_HISTORY:
-        c = 16; t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F1; break;
+        c = 16; t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F1; break;
     case DEEPVQE_STATE_MIC3_HISTORY:
-        c = 64; t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F2; break;
+        c = 64; t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F2; break;
     case DEEPVQE_STATE_MIC4_HISTORY:
-        c = 56; t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F3; break;
+        c = 56; t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F3; break;
     case DEEPVQE_STATE_RES2_HISTORY:
-        c = 32; t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F2; break;
+        c = 32; t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F2; break;
     case DEEPVQE_STATE_RES3_HISTORY:
-        c = 40; t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F3; break;
+        c = 40; t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F3; break;
     case DEEPVQE_STATE_UP1_HISTORY:
-        c = 32; t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F2; break;
+        c = 32; t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F2; break;
     case DEEPVQE_STATE_UP2_HISTORY:
-        c = 40; t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F3; break;
+        c = 40; t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F3; break;
     case DEEPVQE_STATE_UP3_HISTORY:
-        c = 24; t = DEEPVQE_CONV_HISTORY; f = DEEPVQE_F4; break;
+        c = 24; t = DEEPVQE_CONV_WINDOW; f = DEEPVQE_F4; break;
     default:
         return -1;
     }
@@ -204,7 +204,7 @@ int deepvqe_prepost_state_shape(int state_id, int delay_depth,
     dims[1] = c;
     dims[2] = t;
     dims[3] = f;
-    return rank;
+    return DEEPVQE_STATE_MAX_RANK;
 }
 
 size_t deepvqe_prepost_state_elements(int state_id, int delay_depth) {
@@ -373,8 +373,8 @@ int deepvqe_prepost_descriptor_default(int delay_depth,
     descriptor->spectrum_bins = AIAEC_N_BINS;
     descriptor->time_order = DEEPVQE_TIME_ORDER;
     descriptor->freq_taps = DEEPVQE_FREQ_TAPS;
-    descriptor->conv_history_frames = DEEPVQE_CONV_HISTORY;
-    descriptor->score_history_frames = DEEPVQE_SCORE_HISTORY;
+    descriptor->conv_window_frames = DEEPVQE_CONV_WINDOW;
+    descriptor->score_window_frames = DEEPVQE_SCORE_WINDOW;
     descriptor->gru_layers = DEEPVQE_GRU_LAYERS;
     descriptor->gru_hidden = DEEPVQE_GRU_HIDDEN;
     descriptor->state_tensor_count = DEEPVQE_STATE_COUNT;
@@ -402,8 +402,8 @@ int deepvqe_prepost_descriptor_validate(
         descriptor->spectrum_bins != AIAEC_N_BINS ||
         descriptor->time_order != DEEPVQE_TIME_ORDER ||
         descriptor->freq_taps != DEEPVQE_FREQ_TAPS ||
-        descriptor->conv_history_frames != DEEPVQE_CONV_HISTORY ||
-        descriptor->score_history_frames != DEEPVQE_SCORE_HISTORY ||
+        descriptor->conv_window_frames != DEEPVQE_CONV_WINDOW ||
+        descriptor->score_window_frames != DEEPVQE_SCORE_WINDOW ||
         descriptor->gru_layers != DEEPVQE_GRU_LAYERS ||
         descriptor->gru_hidden != DEEPVQE_GRU_HIDDEN ||
         descriptor->state_tensor_count != DEEPVQE_STATE_COUNT) {
@@ -534,6 +534,7 @@ static void zero_state(DeepVqePrepost *p) {
     int id;
     for (id = 0; id < DEEPVQE_STATE_COUNT; ++id)
         memset(p->state[id], 0, p->state_elements[id] * sizeof(float));
+    ++p->state_generation;
 }
 
 void deepvqe_prepost_reset(DeepVqePrepost *p) {
@@ -557,6 +558,10 @@ void deepvqe_prepost_reset(DeepVqePrepost *p) {
 }
 
 /* ---- accessors ------------------------------------------------------- */
+
+uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p) {
+    return p ? p->state_generation : 0u;
+}
 
 int deepvqe_prepost_hop_size(const DeepVqePrepost *p) {
     return p ? AIAEC_HOP : -1;
@@ -678,43 +683,6 @@ int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
     return 0;
 }
 
-int deepvqe_prepost_outputs_inherit(const DeepVqePrepostOutputs *destination,
-                                    const DeepVqePrepostOutputs *runtime) {
-    int id;
-
-    if (!destination || !runtime) return -1;
-    if (!destination->taps || !runtime->taps) return -1;
-    if (runtime->taps_elements != destination->taps_elements) return -1;
-    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-        if (!destination->state_out[id] || !runtime->state_out[id]) return -1;
-        if (runtime->state_elements[id] != destination->state_elements[id])
-            return -1;
-    }
-
-    /* Validate every tensor that would be copied before copying any, so a
-     * refused inherit leaves the pool exactly as it was. A tensor the runtime
-     * wrote at the destination's own address is not copied and not checked
-     * here: frame_commit checks it. */
-    if (runtime->taps != destination->taps &&
-        !all_finite(runtime->taps, runtime->taps_elements))
-        return -1;
-    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-        if (runtime->state_out[id] != destination->state_out[id] &&
-            !all_finite(runtime->state_out[id], runtime->state_elements[id]))
-            return -1;
-    }
-
-    if (runtime->taps != destination->taps)
-        memcpy(destination->taps, runtime->taps,
-               destination->taps_elements * sizeof(float));
-    for (id = 0; id < DEEPVQE_STATE_COUNT; ++id) {
-        if (runtime->state_out[id] != destination->state_out[id])
-            memcpy(destination->state_out[id], runtime->state_out[id],
-                   destination->state_elements[id] * sizeof(float));
-    }
-    return 0;
-}
-
 /* Push the finished frame through the synthesis (TIME) or stage it (FREQ)
  * and close it. Cannot fail: the synthesis only ever reports 0 samples (the
  * very first frame, whose block lies inside the trimmed half window) or a
@@ -730,6 +698,37 @@ static void pp_close_frame(DeepVqePrepost *p) {
     }
 }
 
+/* The finite predicate over what the graph just wrote into one state tensor.
+ * Every window is written back whole, but only its newest frame is new: slot
+ * 0 of an attention ring (newest first), the last frame of a conv or score
+ * window (oldest first); h_gru is checked whole. The older frames were
+ * checked when they were new, and a non-finite value left in any of them
+ * reaches `taps` on a later frame, where it is refused. */
+static int newest_frame_finite(const DeepVqePrepost *p, int id) {
+    int dims[DEEPVQE_STATE_MAX_RANK];
+    size_t channels;
+    size_t frames;
+    size_t width;
+    size_t newest;
+    size_t channel;
+
+    if (id == DEEPVQE_STATE_H_GRU)
+        return all_finite(p->state[id], p->state_elements[id]);
+    if (deepvqe_prepost_state_shape(id, p->descriptor.delay_depth, dims) < 0)
+        return 0;
+    channels = (size_t)dims[1];
+    frames = (size_t)dims[2];
+    width = (size_t)dims[3];
+    newest = (id == DEEPVQE_STATE_ALIGN_KEY_RING ||
+              id == DEEPVQE_STATE_ALIGN_VALUE_RING) ? 0u : frames - 1u;
+    for (channel = 0; channel < channels; ++channel) {
+        if (!all_finite(p->state[id] + (channel * frames + newest) * width,
+                        width))
+            return 0;
+    }
+    return 1;
+}
+
 int deepvqe_prepost_frame_commit(DeepVqePrepost *p) {
     int ok;
     int id;
@@ -738,7 +737,7 @@ int deepvqe_prepost_frame_commit(DeepVqePrepost *p) {
 
     ok = all_finite(p->taps, DEEPVQE_TAPS_ELEMENTS);
     for (id = 0; ok && id < DEEPVQE_STATE_COUNT; ++id)
-        ok = all_finite(p->state[id], p->state_elements[id]);
+        ok = newest_frame_finite(p, id);
     if (!ok) {
         /* The accelerator already overwrote the state in place, so there is
          * nothing to roll back to: restart the recurrence from the cold

@@ -1,8 +1,10 @@
 """Explicit full-state export contract for streaming Align-ULCNet."""
 
+import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -15,20 +17,22 @@ from AIAEC.Align_ULCNet.export_onnx import (
     stream_features,
     GRU_HIDDEN,
     GRU_LAYERS,
-    COMBINED_GRU_STATE_NAME,
+    GRU_STATE_NAME,
+    GRU_SUBBANDS,
     COMPRESSION_EXPONENT,
-    FEATURE_LAYOUTS,
-    GRU_STATE_LAYOUTS,
     INPUT_NAMES,
-    LAYOUT_VERSIONS,
+    LAYOUT_VERSION,
     RETIRED_LAYOUT_VERSIONS,
     SIGNAL_INPUTS,
     MAX_DELAY_DEPTH,
     MIN_DELAY_DEPTH,
     OUTPUT_NAMES,
-    SCORE_HISTORY_FRAMES,
+    SCORE_WINDOW_FRAMES,
     STATE_LAYOUT_VERSION,
+    STATE_NAMES,
+    STATE_OUTPUT_NAMES,
     SUPPORTED_GRIDS,
+    WINDOW_STATE_NAMES,
     ta_bins_for,
     TA_CHANNELS,
     _write_metadata,
@@ -36,7 +40,6 @@ from AIAEC.Align_ULCNet.export_onnx import (
     export_graph,
     graph_signals,
     next_state,
-    resolve_layout,
     state_shapes,
 )
 from AIAEC.Align_ULCNet.model import AlignULCNet
@@ -52,10 +55,10 @@ TA_BINS = 26
 D = 8
 
 
-def _complex_frame(generator):
+def _complex_frame(generator, n_freqs=GRID.n_freqs):
     return torch.complex(
-        torch.randn(1, 1, GRID.n_freqs, generator=generator),
-        torch.randn(1, 1, GRID.n_freqs, generator=generator),
+        torch.randn(1, 1, n_freqs, generator=generator),
+        torch.randn(1, 1, n_freqs, generator=generator),
     )
 
 
@@ -147,112 +150,66 @@ def test_c_ta_bins_matches_the_python_derivation(tmp_path, sample_rate, n_fft):
     assert c_ta_bins == ta_bins_for(model)
 
 
-def test_streaming_export_shapes_are_fixed_and_full_state():
+def test_streaming_export_shapes_are_fixed_and_full_window():
     shapes = state_shapes(D, TA_BINS)
-    assert shapes['key_history'] == (1, 32, D - 1, 26)
-    assert shapes['value_history'] == (1, 32, D - 1, 26)
-    assert shapes['logit_history'] == (1, 32, 4, D)
-    assert shapes['h_gru0'] == (1, 2, 1, 128)
-    assert shapes['h_gru1'] == (1, 2, 1, 128)
+    assert shapes['key_history'] == (1, 32, D, 26)
+    assert shapes['value_history'] == (1, 32, D, 26)
+    assert shapes['logit_history'] == (1, 32, 5, D)
     assert shapes['h_gru'] == (1, 4, 1, 128)
     # Every boundary state is rank-4 NCHW. Written once, as a rule, so a new
     # state cannot be added at the wrong rank without failing here.
     assert all(len(shape) == 4 for shape in shapes.values())
     assert INPUT_NAMES == (
         'error_mag', 'far_mag', 'error_cos', 'error_sin',
-        'key_history', 'value_history', 'logit_history', 'h_gru0', 'h_gru1',
+        'key_history', 'value_history', 'logit_history', 'h_gru',
     )
     # Every state input has an _out partner, in the order the inputs are
     # bound, so the next state is the output tail unchanged.
     assert OUTPUT_NAMES == (
         'output', 'key_history_out', 'value_history_out',
-        'logit_history_out', 'h_gru0_out', 'h_gru1_out',
+        'logit_history_out', 'h_gru_out',
     )
     assert OUTPUT_NAMES[1:] == tuple(
         name + '_out' for name in INPUT_NAMES[SIGNAL_INPUTS:])
+    assert STATE_NAMES == INPUT_NAMES[SIGNAL_INPUTS:]
+    assert STATE_OUTPUT_NAMES == OUTPUT_NAMES[1:]
+    assert WINDOW_STATE_NAMES == ('key_history', 'value_history',
+                                  'logit_history')
+    assert GRU_SUBBANDS * GRU_LAYERS == shapes['h_gru'][1]
+    assert SCORE_WINDOW_FRAMES == shapes['logit_history'][2]
 
 
-def test_every_boundary_pair_has_its_own_version():
-    pairs = {(feature, gru)
-             for feature in FEATURE_LAYOUTS for gru in GRU_STATE_LAYOUTS}
-    assert set(LAYOUT_VERSIONS) == pairs
-    assert len(set(LAYOUT_VERSIONS.values())) == len(LAYOUT_VERSIONS)
-    # ulcnet_model_io.h implements exactly one pair; every other pair must
-    # therefore carry a version the header rejects.
-    # With every version distinct, pinning the shipped pair is enough: no
-    # other pair can then carry the version ulcnet_model_io.h implements.
-    assert LAYOUT_VERSIONS[('host', 'split')] == STATE_LAYOUT_VERSION
-    # 3-7 denoted rank-3 boundaries, 8-11 the delta-state ones and 12/13 the
-    # host boundaries whose graph still multiplied by the mask. Reusing one
-    # would make a single number mean two different contracts, which no
-    # runtime could tell apart. The shipped pair must sit above every retired
-    # number rather than above a literal floor, which would still pass after
-    # the next bump while no longer guarding anything.
-    assert not (set(LAYOUT_VERSIONS.values()) & RETIRED_LAYOUT_VERSIONS)
-    assert STATE_LAYOUT_VERSION > max(RETIRED_LAYOUT_VERSIONS)
+def test_layout_version_is_new_and_retired_numbers_stay_retired():
+    assert LAYOUT_VERSION == STATE_LAYOUT_VERSION == 18
+    # 3-13 denoted earlier boundaries, 14-17 the previous history-window
+    # ones (split hiddens, in-graph front end, one frame short of a window).
+    # Reusing one would make a single number mean two different contracts,
+    # which no runtime could tell apart. The shipped version must sit above
+    # every retired number rather than above a literal floor, which would
+    # still pass after the next bump while no longer guarding anything.
+    assert RETIRED_LAYOUT_VERSIONS == frozenset(range(3, 18))
+    assert LAYOUT_VERSION not in RETIRED_LAYOUT_VERSIONS
+    assert LAYOUT_VERSION > max(RETIRED_LAYOUT_VERSIONS)
 
 
-def test_graph_feature_layout_restores_the_pre_host_boundary():
-    layout = resolve_layout('graph', 'split')
-    assert layout.input_names == (
-        'error', 'far',
-        'key_history', 'value_history', 'logit_history', 'h_gru0', 'h_gru1',
+def test_retired_boundary_switches_are_gone():
+    """The in-graph front end and the split hiddens are not selectable."""
+    import AIAEC.Align_ULCNet.export_onnx as module
+    for name in ('FEATURE_LAYOUTS', 'GRU_STATE_LAYOUTS', 'resolve_layout',
+                 'GRAPH_LAYOUTS', 'LAYOUT_VERSIONS'):
+        assert not hasattr(module, name), name
+    result = subprocess.run(
+        [sys.executable, module.__file__, '--help'],
+        capture_output=True, text=True,
+        env={'PYTHONDONTWRITEBYTECODE': '1', 'PATH': os.environ['PATH']},
     )
-    assert layout.output_names == OUTPUT_NAMES
-    # Same tensor names and semantics as the pre-host boundary, but the
-    # recurrent hiddens are rank-4 now, so it cannot reuse that boundary's
-    # retired number.
-    assert layout.layout_version == 14
-
-
-@pytest.mark.parametrize('feature', sorted(FEATURE_LAYOUTS))
-@pytest.mark.parametrize('gru', sorted(GRU_STATE_LAYOUTS))
-def test_every_layout_pair_computes_the_same_frames(feature, gru):
-    """The four boundaries differ only in where tensors are cut, so a run
-    through any of them must reproduce the shipped pair bit for bit."""
-    torch.manual_seed(7)
-    model = AlignULCNet(GRID, max_delay_frames=D).eval()
-    reference = AlignUlcnetStreamingExport(model).eval()
-    candidate = AlignUlcnetStreamingExport(
-        model, feature_layout=feature, gru_state_layout=gru).eval()
-
-    def start(wrapper):
-        return tuple(value.clone() for value in
-                     dummy_inputs(D, N_FREQS, TA_BINS, wrapper.layout)[
-                         wrapper.layout.signal_inputs:])
-
-    def head(wrapper, error_ri, far_ri, outputs):
-        # Compare in one domain: the host layout leaves the mask multiply and
-        # the inverse signed power to host_back_end(), the graph layout has
-        # already applied both. The compressed error is the host's own, not
-        # a graph input.
-        if wrapper.layout.in_graph_features:
-            return outputs[0]
-        return host_back_end(
-            model, stream_features(model, error_ri, far_ri)[4], outputs[0])
-
-    reference_state, candidate_state = start(reference), start(candidate)
-    generator = torch.Generator().manual_seed(11)
-    observed_nonzero = False
-    with torch.no_grad():
-        for _ in range(2 * D + 5):
-            error_ri = _ri(_complex_frame(generator))
-            far_ri = _ri(_complex_frame(generator))
-            reference_signals = graph_signals(
-                model, error_ri, far_ri, reference.layout)
-            candidate_signals = graph_signals(
-                model, error_ri, far_ri, candidate.layout)
-            expected = reference(*(reference_signals + reference_state))
-            actual = candidate(*(candidate_signals + candidate_state))
-            torch.testing.assert_close(
-                head(candidate, error_ri, far_ri, actual),
-                head(reference, error_ri, far_ri, expected),
-                rtol=0, atol=0)
-            observed_nonzero = observed_nonzero or bool(
-                candidate_state[-1].abs().max() > 0)
-            reference_state = next_state(expected)
-            candidate_state = next_state(actual)
-    assert observed_nonzero, 'state never left its zero initialisation'
+    assert result.returncode == 0, result.stderr
+    assert '--feature-layout' not in result.stdout
+    assert '--gru-state-layout' not in result.stdout
+    with pytest.raises(TypeError):
+        AlignUlcnetStreamingExport(
+            AlignULCNet(GRID, max_delay_frames=D).eval(),
+            gru_state_layout='split')
 
 
 def test_c_descriptor_constants_match_export_contract():
@@ -265,7 +222,8 @@ def test_c_descriptor_constants_match_export_contract():
         'ULCNET_MODEL_IO_MIN_D': MIN_DELAY_DEPTH,
         'ULCNET_MODEL_IO_MAX_D': MAX_DELAY_DEPTH,
         'ULCNET_MODEL_IO_TA_CHANNELS': TA_CHANNELS,
-        'ULCNET_MODEL_IO_SCORE_HISTORY': SCORE_HISTORY_FRAMES,
+        'ULCNET_MODEL_IO_SCORE_WINDOW': SCORE_WINDOW_FRAMES,
+        'ULCNET_MODEL_IO_GRU_SUBBANDS': GRU_SUBBANDS,
         'ULCNET_MODEL_IO_GRU_LAYERS': GRU_LAYERS,
         'ULCNET_MODEL_IO_GRU_HIDDEN': GRU_HIDDEN,
     }
@@ -341,6 +299,8 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
         'raw_far'
     ]
     assert metadata['state_layout_version'] == STATE_LAYOUT_VERSION
+    assert metadata['state_binding'] == 'in_place_same_address'
+    assert metadata['score_window_frames'] == SCORE_WINDOW_FRAMES
 
     # Legacy checkpoints retain the same raw-far training/deployment contract.
     legacy = _write_metadata(
@@ -352,18 +312,24 @@ def test_metadata_separates_training_provenance_from_deployment(tmp_path):
     assert legacy['far_input_mode_c_value'] == 0
 
 
-def test_full_state_wrapper_matches_forward_stream_frame_by_frame():
+@pytest.mark.parametrize('sample_rate,n_fft,ta_bins',
+                         [(16000, 512, 26), (48000, 1024, 52)])
+def test_full_window_wrapper_matches_forward_stream_frame_by_frame(
+        sample_rate, n_fft, ta_bins):
+    grid = SignalGrid(sample_rate, n_fft, n_fft, n_fft // 2)
     torch.manual_seed(20260816)
-    model = AlignULCNet(GRID, max_delay_frames=D).eval()
+    model = AlignULCNet(grid, max_delay_frames=D).eval()
     wrapper = AlignUlcnetStreamingExport(model).eval()
-    explicit = tuple(value.clone() for value in dummy_inputs(D, N_FREQS, TA_BINS)[SIGNAL_INPUTS:])
+    assert wrapper.ta_bins == ta_bins
+    explicit = tuple(value.clone() for value in dummy_inputs(
+        D, grid.n_freqs, ta_bins)[SIGNAL_INPUTS:])
     reference = model.create_stream_state()
     generator = torch.Generator().manual_seed(73)
 
     with torch.no_grad():
         for _ in range(2 * D + 5):
-            error = _complex_frame(generator)
-            far = _complex_frame(generator)
+            error = _complex_frame(generator, grid.n_freqs)
+            far = _complex_frame(generator, grid.n_freqs)
             features = stream_features(model, _ri(error), _ri(far))
             outputs = wrapper(*features[:SIGNAL_INPUTS], *explicit)
             expected = model.forward_stream(error, far, reference)
@@ -371,7 +337,7 @@ def test_full_state_wrapper_matches_forward_stream_frame_by_frame():
             # The graph output is the raw mask; the host multiplies the
             # compressed error by it and applies the inverse signed power
             # (host_back_end), completing the chain.
-            assert outputs[0].shape == (1, 2, 1, GRID.n_freqs)
+            assert outputs[0].shape == (1, 2, 1, grid.n_freqs)
             assert torch.allclose(
                 host_back_end(model, features[4], outputs[0]),
                 _ri(expected.enhanced), atol=5e-7, rtol=1e-6
@@ -379,29 +345,92 @@ def test_full_state_wrapper_matches_forward_stream_frame_by_frame():
             explicit = next_state(outputs)
 
             align = reference['align']
-            assert torch.equal(
-                explicit[0], align.key_ring._ring[:, :, :D - 1]
-            )
-            assert torch.equal(
-                explicit[1], align.value_ring._ring[:, :, :D - 1]
-            )
-            assert torch.equal(
-                explicit[2], align.score_cell._history
-            )
+            # The boundary carries the cells' own windows whole.
+            assert torch.equal(explicit[0], align.key_ring._ring)
+            assert torch.equal(explicit[1], align.value_ring._ring)
+            assert torch.equal(explicit[2], align.score_cell._window)
             # The boundary carries rank-4 NCHW; the streaming reference holds
             # nn.GRU's rank-3 hidden. Lift the reference rather than squeezing
-            # the boundary, so this still pins where the new axis sits.
-            assert explicit[3].shape == (1, GRU_LAYERS, 1, GRU_HIDDEN)
-            assert explicit[4].shape == (1, GRU_LAYERS, 1, GRU_HIDDEN)
+            # the boundary, so this still pins where the new axis sits, and
+            # the two subband hiddens stack on dim 1 in subband order.
+            assert explicit[3].shape == (
+                1, GRU_SUBBANDS * GRU_LAYERS, 1, GRU_HIDDEN)
             assert torch.equal(
-                explicit[3], reference['subband_gru0']._hidden.unsqueeze(0)
+                explicit[3][:, :GRU_LAYERS],
+                reference['subband_gru0']._hidden.unsqueeze(0)
             )
             assert torch.equal(
-                explicit[4], reference['subband_gru1']._hidden.unsqueeze(0)
+                explicit[3][:, GRU_LAYERS:],
+                reference['subband_gru1']._hidden.unsqueeze(0)
             )
 
 
-def test_exported_onnx_state_tensors_are_rank_four(tmp_path):
+def _run_wrapper(wrapper, model, state, generator):
+    error_ri = torch.randn(1, 1, N_FREQS, 2, generator=generator)
+    far_ri = torch.randn(1, 1, N_FREQS, 2, generator=generator)
+    with torch.no_grad():
+        return wrapper(*graph_signals(model, error_ri, far_ri), *state)
+
+
+def test_window_shift_directions():
+    """K/V windows are newest-first, the logit window oldest-first.
+
+    The shift is the whole contract of the in-place binding: a window that
+    moved the wrong way would still be finite, same-shaped and plausible, and
+    only change which frames the attention reads.
+    """
+    torch.manual_seed(31)
+    model = AlignULCNet(GRID, max_delay_frames=D).eval()
+    wrapper = AlignUlcnetStreamingExport(model).eval()
+    state = dummy_inputs(D, N_FREQS, TA_BINS)[SIGNAL_INPUTS:]
+    generator = torch.Generator().manual_seed(32)
+    previous = None
+    for _ in range(D + 3):
+        outputs = _run_wrapper(wrapper, model, state, generator)
+        state = next_state(outputs)
+        key, value, logit, _hidden = state
+        if previous is not None:
+            old_key, old_value, old_logit = previous
+            assert torch.equal(key[:, :, 1:], old_key[:, :, :-1])
+            assert torch.equal(value[:, :, 1:], old_value[:, :, :-1])
+            assert torch.equal(logit[:, :, :-1], old_logit[:, :, 1:])
+        previous = (key, value, logit)
+    # Sensitivity: the relations above are not vacuous.
+    assert key[:, :, 0].abs().max() > 0 and logit[:, :, -1].abs().max() > 0
+    assert not torch.equal(key[:, :, 0], key[:, :, 1])
+
+
+def test_dropped_window_slot_is_never_read():
+    """The slot a window drops only keeps the in and out shapes identical.
+
+    Poisoning it with NaN must change neither the mask nor the next state;
+    a graph that read it (or a Slice cutting the wrong end) would not pass.
+    """
+    torch.manual_seed(33)
+    model = AlignULCNet(GRID, max_delay_frames=D).eval()
+    wrapper = AlignUlcnetStreamingExport(model).eval()
+    state = dummy_inputs(D, N_FREQS, TA_BINS)[SIGNAL_INPUTS:]
+    generator = torch.Generator().manual_seed(34)
+    for _ in range(D + 2):
+        outputs = _run_wrapper(wrapper, model, state, generator)
+        state = next_state(outputs)
+    key, value, logit, hidden = (value.clone() for value in state)
+    signals = graph_signals(
+        model,
+        torch.randn(1, 1, N_FREQS, 2, generator=generator),
+        torch.randn(1, 1, N_FREQS, 2, generator=generator))
+    with torch.no_grad():
+        reference = wrapper(*signals, key, value, logit, hidden)
+        key[:, :, D - 1] = float('nan')
+        value[:, :, D - 1] = float('nan')
+        logit[:, :, 0] = float('nan')
+        poisoned = wrapper(*signals, key, value, logit, hidden)
+    for got, want in zip(poisoned, reference):
+        assert torch.equal(got, want)
+    assert all(torch.isfinite(t).all() for t in poisoned)
+
+
+def test_exported_onnx_state_contract(tmp_path):
     """The declared table is not the contract -- the shipped graph is.
 
     Goes through export_graph rather than torch.onnx.export directly: the
@@ -410,6 +439,7 @@ def test_exported_onnx_state_tensors_are_rank_four(tmp_path):
     that pinning step fixes. Reading the raw graph would pin the wrong thing.
     """
     onnx = pytest.importorskip('onnx')
+    from AIAEC._onnx_contract import validate_inplace_state_contract
     depth = 4
     model = AlignULCNet(GRID, max_delay_frames=depth).eval()
     checkpoint = tmp_path / 'ckpt.pth'
@@ -417,7 +447,8 @@ def test_exported_onnx_state_tensors_are_rank_four(tmp_path):
     path = tmp_path / 'rank.onnx'
     export_graph(model, str(checkpoint), str(path))
 
-    graph = onnx.load(str(path)).graph
+    loaded = onnx.load(str(path))
+    graph = loaded.graph
     shapes = state_shapes(depth, TA_BINS)
 
     def dims(value):
@@ -436,9 +467,23 @@ def test_exported_onnx_state_tensors_are_rank_four(tmp_path):
             outs[name] = dims(value)
     # Every state is returned whole, so each must have an _out partner of
     # exactly its own shape or the two cannot share one address.
-    assert set(outs) == set(ins), sorted(outs)
+    assert set(outs) == set(ins) == set(shapes)
     assert all(outs[name] == ins[name] for name in outs)
-    assert set(ins) == set(shapes) - {COMBINED_GRU_STATE_NAME}
+
+    # The structure that lets the shift run in the graph: each window input
+    # has one consumer, a Slice; no state output is produced by a Slice.
+    producer = {name: node for node in graph.node for name in node.output}
+    for name in WINDOW_STATE_NAMES:
+        users = [node for node in graph.node if name in node.input]
+        assert [node.op_type for node in users] == ['Slice'], name
+        assert producer[name + '_out'].op_type == 'Concat', name
+    assert producer['h_gru_out'].op_type != 'Slice'
+    assert validate_inplace_state_contract(
+        loaded, STATE_NAMES, STATE_OUTPUT_NAMES,
+        window_inputs=WINDOW_STATE_NAMES) == len(WINDOW_STATE_NAMES)
+    props = {p.key: p.value for p in loaded.metadata_props}
+    assert props['state_binding'] == 'in_place_same_address'
+    assert props['state_layout_version'] == str(LAYOUT_VERSION)
 
 
 def test_host_graph_ends_at_the_mask_conv(tmp_path):
@@ -501,50 +546,46 @@ def test_optimized_graph_has_no_conv_pad_op_and_replays_the_wrapper(tmp_path):
                 model,
                 torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
                 torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
-                wrapper.layout,
             ) + state
             expected = wrapper(*current)
             actual = session.run(None, {
                 name: value.numpy()
-                for name, value in zip(wrapper.layout.input_names, current)})
+                for name, value in zip(INPUT_NAMES, current)})
             for got, want in zip(actual, expected):
                 assert abs(got - want.numpy()).max() <= 3e-4
             state = next_state(expected)
 
 
-def test_combined_state_stacks_on_the_channel_axis():
-    """Pins WHICH axis the combined layout stacks on.
+def test_hidden_stacks_on_the_channel_axis():
+    """Pins WHICH axis the two subband hiddens stack on.
 
     dim 0 is the singleton N. Slicing it returns the whole tensor and an
-    empty one without raising, so a wrong axis is silent -- and the
-    all-pairs equivalence test only compares the audio head, not the state.
+    empty one without raising, so a wrong axis is silent -- and the audio
+    head alone would not show it.
     """
     depth = 4
     torch.manual_seed(5)
     model = AlignULCNet(GRID, max_delay_frames=depth).eval()
-    split = AlignUlcnetStreamingExport(model, gru_state_layout='split').eval()
-    combined = AlignUlcnetStreamingExport(
-        model, gru_state_layout='combined').eval()
-
-    split_state = dummy_inputs(depth, N_FREQS, TA_BINS, split.layout)[SIGNAL_INPUTS:]
-    combined_state = dummy_inputs(depth, N_FREQS, TA_BINS, combined.layout)[SIGNAL_INPUTS:]
+    wrapper = AlignUlcnetStreamingExport(model).eval()
+    reference = model.create_stream_state()
+    state = dummy_inputs(depth, N_FREQS, TA_BINS)[SIGNAL_INPUTS:]
     generator = torch.Generator().manual_seed(11)
     with torch.no_grad():
         for _ in range(2 * depth + 2):
-            signals = stream_features(
-                model,
-                torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
-                torch.randn(1, 1, GRID.n_freqs, 2, generator=generator),
-            )[:SIGNAL_INPUTS]
-            split_out = split(*(signals + split_state))
-            combined_out = combined(*(signals + combined_state))
-            split_state = next_state(split_out)
-            combined_state = next_state(combined_out)
+            error = _complex_frame(generator)
+            far = _complex_frame(generator)
+            signals = stream_features(model, _ri(error), _ri(far))[
+                :SIGNAL_INPUTS]
+            state = next_state(wrapper(*signals, *state))
+            model.forward_stream(error, far, reference)
 
-            merged = combined_state[-1]
+            merged = state[-1]
             assert merged.shape == (1, 2 * GRU_LAYERS, 1, GRU_HIDDEN)
-            assert torch.equal(merged[:, :GRU_LAYERS], split_state[-2])
-            assert torch.equal(merged[:, GRU_LAYERS:], split_state[-1])
+            assert torch.equal(merged[:, :GRU_LAYERS],
+                               reference['subband_gru0']._hidden.unsqueeze(0))
+            assert torch.equal(merged[:, GRU_LAYERS:],
+                               reference['subband_gru1']._hidden.unsqueeze(0))
+    assert merged.abs().max() > 0
 
 
 def test_reset_is_all_zero_external_state():

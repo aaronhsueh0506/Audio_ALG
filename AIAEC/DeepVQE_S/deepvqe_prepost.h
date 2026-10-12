@@ -93,12 +93,13 @@ extern "C" {
 
 /* The accelerator boundary this file binds: the two compressed planar signal
  * inputs, the CCM-tap head output and the sixteen explicit state tensors emitted by
- * _streaming_export.py for DeepVQE_S. Unrelated to (and deliberately not
- * aliased from) ULCNET_MODEL_IO_LAYOUT_VERSION: the two models' boundaries
- * move independently, and a shared number would make one model's bump look
- * like the other's. Any rename, reshape, reorder or added/removed tensor at
- * the boundary bumps this. */
-#define DEEPVQE_PREPOST_LAYOUT_VERSION 3u
+ * _streaming_export.py for DeepVQE_S, all rank 4 and each returned in full
+ * with its input's shape. Unrelated to (and deliberately not aliased from)
+ * ULCNET_MODEL_IO_LAYOUT_VERSION: the two models' boundaries move
+ * independently, and a shared number would make one model's bump look like
+ * the other's. Any rename, reshape, reorder or added/removed tensor at the
+ * boundary bumps this. Versions 1-3 are RETIRED. */
+#define DEEPVQE_PREPOST_LAYOUT_VERSION 4u
 
 /* The power-law exponent of the model's input compression
  * (model.compression_exponent). prepare runs the compression on the host, so
@@ -109,11 +110,13 @@ extern "C" {
 /* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
  * so a pool recorded by the previous carve is refused on the hash, not only
  * on `bytes`. 2: the TIME analyses became two AiaecAnalysis states.
- * 3: one state set, with no second bank. */
-#define DEEPVQE_PREPOST_CARVE_VERSION  3u
+ * 3: one state set, with no second bank.
+ * 4: the conv and score regions hold full windows (4 and 5 frames) and h_gru
+ *    is rank 4. */
+#define DEEPVQE_PREPOST_CARVE_VERSION  4u
 
 /* Alignment search depth D, the exporter's max_delay_frames. It sizes the
- * attention key/value rings and the score history, so it is a pool-size
+ * attention key/value rings and the score window, so it is a pool-size
  * parameter. 32 is grid.delay_frames(0.5) on this grid -- ceil(0.5 s *
  * 16000/256), i.e. the shipped half-second search range. */
 #define DEEPVQE_PREPOST_MIN_D      1
@@ -132,10 +135,11 @@ extern "C" {
 #define DEEPVQE_F3              DEEPVQE_HALF_(DEEPVQE_F2) /*  33 */
 #define DEEPVQE_F4              DEEPVQE_HALF_(DEEPVQE_F3) /*  17 */
 
-/* Causal conv history depth = time kernel 4 - 1; the alignment score conv
- * uses a (5,3) kernel, so its history is 4. */
-#define DEEPVQE_CONV_HISTORY    3
-#define DEEPVQE_SCORE_HISTORY   4
+/* Causal conv window = time kernel 4 (the three previous frames plus the
+ * current one); the alignment score conv uses a (5,3) kernel, so its window
+ * is 5. Windows are oldest frame first. */
+#define DEEPVQE_CONV_WINDOW     4
+#define DEEPVQE_SCORE_WINDOW    5
 #define DEEPVQE_SIM_CHANNELS    4     /* FrameDelayAttention similarity     */
 #define DEEPVQE_VALUE_CHANNELS  24    /* FrameDelayAttention value          */
 #define DEEPVQE_GRU_LAYERS      1
@@ -173,9 +177,8 @@ typedef enum DeepVqeStateId {
     DEEPVQE_STATE_COUNT
 } DeepVqeStateId;
 
-/* Maximum rank any boundary tensor has, so a caller can size a dims array
- * without allocating. Every state is rank 4 (NCHW) except h_gru, which the
- * exporter emits rank 3 as [1,1,GRU_HIDDEN]. */
+/* Rank of every boundary state tensor (NCHW), so a caller can size a dims
+ * array without allocating. h_gru is [1,GRU_LAYERS,1,GRU_HIDDEN]. */
 #define DEEPVQE_STATE_MAX_RANK 4
 
 /* Which side of the transform the caller works on. FIXED AT INIT because it
@@ -212,8 +215,8 @@ typedef struct DeepVqePrepostDescriptor {
     int spectrum_bins;
     int time_order;
     int freq_taps;
-    int conv_history_frames;
-    int score_history_frames;
+    int conv_window_frames;
+    int score_window_frames;
     int gru_layers;
     int gru_hidden;
     int state_tensor_count;
@@ -256,22 +259,18 @@ typedef struct DeepVqePrepostInputs {
 } DeepVqePrepostInputs;
 
 /* Accelerator-writable outputs. The graph returns the FULL next value of
- * every state tensor.
+ * every state tensor: a window is cut on the graph input by a Slice and the
+ * new frame is concatenated, so no state output is produced by a Slice.
  *
  * The pool holds ONE buffer per state tensor, and `state_out[id]` is the SAME
  * pointer as the matching `inputs.state[id]`, stable for the life of the
- * instance. Two ways to bind it:
- *
- *  - NORMAL PATH: the runtime writes its OWN output tensors (taps and sixteen
- *    state_out), then deepvqe_prepost_outputs_inherit() copies them into the
- *    pool. The runtime's tensors are runtime-owned; nothing is allocated here.
- *  - OPTIMIZED PATH: bind the graph's `*_out` outputs to the pointers
- *    frame_inputs() returned and skip inherit. The output of frame t is then
- *    already the input of frame t+1 and nothing is copied. The runtime must
- *    finish reading EVERY state input before it writes any state output at
- *    that address (true of a runtime that materialises its outputs after
- *    compute). A partial or mixed write is not detectable beyond the finite
- *    check in frame_commit.
+ * instance. The runtime binds each `*_out` to the pointer frame_inputs()
+ * returned for the input of the same name; the output of frame t is then
+ * already the input of frame t+1 and nothing is copied. The runtime must
+ * finish reading EVERY state input before it writes any state output at that
+ * address (true of a runtime that materialises its outputs after compute). A
+ * partial or mixed write is not detectable beyond the finite check in
+ * frame_commit.
  *
  * Only `taps` is NaN-prefilled by frame_inputs(): state tensors carry the
  * input and are left alone. */
@@ -293,8 +292,8 @@ const char *deepvqe_prepost_state_name_out(int state_id);  /* graph output */
 #define DEEPVQE_PREPOST_OUTPUT_NAME "output"
 
 /* Row-major graph shape of one state tensor. Writes the dimensions into
- * `dims`, zeroes the entries beyond the shape, and returns the rank (3 for
- * h_gru, 4 for the rest), or -1 on NULL / an unknown id / a D out of range.
+ * `dims` and returns the rank (always 4), or -1 on NULL / an unknown id / a D
+ * out of range.
  * `delay_depth` is taken explicitly so a tool can check a graph's schema
  * before it has an instance. */
 int deepvqe_prepost_state_shape(int state_id, int delay_depth,
@@ -361,6 +360,13 @@ void deepvqe_prepost_destroy(DeepVqePrepost *p);
  * Config and pool are untouched. */
 void deepvqe_prepost_reset(DeepVqePrepost *p);
 
+/* Counter of state restarts: it advances whenever the C side zeroed the state
+ * tensors, in deepvqe_prepost_reset() and when frame_commit() refused a
+ * frame; 0 for a fresh instance. A board whose accelerator state is fixed
+ * point refills it with the quantized representation of zero when the value
+ * differs from the one it last saw. 0 for NULL; wraps at 2^32. */
+uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p);
+
 int deepvqe_prepost_hop_size(const DeepVqePrepost *p);   /* or -1 */
 int deepvqe_prepost_num_bins(const DeepVqePrepost *p);   /* or -1 */
 int deepvqe_prepost_io_mode(const DeepVqePrepost *p);    /* or -1 */
@@ -405,31 +411,12 @@ int deepvqe_prepost_frame_inputs(DeepVqePrepost *p,
                                  DeepVqePrepostInputs *inputs,
                                  DeepVqePrepostOutputs *outputs);
 
-/* COPY PATH. Copy the runtime's own output tensors into the pool.
- * `destination` is the struct frame_inputs() returned; `runtime` has the same
- * type, filled by the runtime with ITS OWN tensor pointers (taps and sixteen
- * state_out) and the same element counts. Runtime tensors are runtime-owned:
- * nothing is allocated or retained here.
- *
- * A tensor whose runtime pointer equals the destination pointer was written
- * in place and is left alone (it is never copied onto itself, and inherit does
- * not check it; frame_commit does). Every other tensor is first checked
- * finite; if any is not, NOTHING is copied and -1 is returned.
- *
- * Refused inherit (copy path): the state is exactly as before, so the caller
- * reports the run failed and takes deepvqe_prepost_frame_skip(). Non-finite
- * write caught at commit (in-place path): the state restarts from zero.
- *
- * Returns 0, or -1 on NULL arguments, a NULL tensor pointer on either side, an
- * element-count mismatch, or a non-finite value in a tensor to be copied. */
-int deepvqe_prepost_outputs_inherit(const DeepVqePrepostOutputs *destination,
-                                    const DeepVqePrepostOutputs *runtime);
-
 /* Validate the frame's outputs and advance the CCM ring. Copies and swaps
- * nothing itself: on the normal path deepvqe_prepost_outputs_inherit() has
- * already put the runtime's tensors in the pool, on the optimized path the
- * runtime wrote them there. Checks that every tap and every state element
- * is finite, then applies the CCM taps to the raw microphone spectrum ring
+ * nothing: the runtime wrote the state in place. Checks that every tap and
+ * the whole h_gru are finite, and, of each window, only the frame the graph
+ * just wrote (the newest slot of every channel: slot 0 of a ring, the last
+ * frame of a conv or score window); older frames were checked when they were
+ * new. Then applies the CCM taps to the raw microphone spectrum ring
  * (deepvqe_ccm_process) and feeds the result to the synthesis
  * (DEEPVQE_IO_TIME) or stages it for post_process_freq.
  *
@@ -437,12 +424,13 @@ int deepvqe_prepost_outputs_inherit(const DeepVqePrepostOutputs *destination,
  * a commit with no frame_inputs() behind it is refused, so an accelerator
  * that never ran cannot pass untouched buffers off as a result.
  *
- * On a non-finite tap or state element the write cannot be rolled back, so
- * every state tensor is ZEROED (cold recurrent state), the CCM ring does not
- * advance, the transaction is disarmed, the frame stays open and -1 is
- * returned. The caller then calls deepvqe_prepost_frame_skip() to keep the
- * framing schedule intact, or re-runs the accelerator through a fresh
- * frame_inputs() from the cold state. */
+ * On a non-finite tap or checked state element the write cannot be rolled
+ * back, so every state tensor is ZEROED (cold recurrent state), the state
+ * generation advances, the CCM ring does not advance, the transaction is
+ * disarmed, the frame stays open and -1 is returned. The caller then calls
+ * deepvqe_prepost_frame_skip() to keep the framing schedule intact, or
+ * re-runs the accelerator through a fresh frame_inputs() from the cold
+ * state. */
 int deepvqe_prepost_frame_commit(DeepVqePrepost *p);
 
 /* Fail CLOSED for the current frame: emit SILENCE and do not advance the CCM

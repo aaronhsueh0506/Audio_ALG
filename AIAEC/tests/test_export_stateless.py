@@ -13,8 +13,8 @@ from AIAEC.Align_CRUSE import AlignCRUSE
 from AIAEC.CAGCRN import CAGCRN
 from AIAEC.DeepVQE_S import DeepVQES
 from AIAEC._streaming_export import (
-    GRU_STATE_LAYOUTS,
     StatelessOneFrameAIAEC,
+    _deepvqe_c_descriptor,
     _build,
     host_signal_inputs,
     requires_contiguous_calibration,
@@ -284,7 +284,7 @@ def test_align_cruse_frame_index_is_explicit_int64_state():
     _wrapper, inputs, names, _outputs, _split = _build('Align_CRUSE', model)
     index = names.index('state_align_frame_index')
     assert inputs[index].dtype == torch.int64
-    assert inputs[index].ndim == 0
+    assert tuple(inputs[index].shape) == (1, 1, 1, 1)
 
 
 def test_align_cruse_cumulative_state_is_excluded_from_integer_ptq():
@@ -422,58 +422,115 @@ def test_stateless_graph_really_lowers_to_onnx_and_replays_state(
     ) < 3e-4
 
 
-@pytest.mark.parametrize('name,factory,combinable', (
-    ('CAGCRN', lambda: CAGCRN(GRID), True),
-    ('Align_CRUSE', lambda: AlignCRUSE(GRID), False),
-    ('DeepVQE_S', lambda: DeepVQES(GRID), False),
+@pytest.mark.parametrize('name,factory', (
+    ('Align_CRUSE', lambda: AlignCRUSE(GRID)),
+    ('DeepVQE_S', lambda: DeepVQES(GRID)),
+    ('CAGCRN', lambda: CAGCRN(GRID)),
 ))
-def test_combined_gru_state_layout_only_regroups_the_boundary(
-        name, factory, combinable):
-    """The combined layout must change where tensors are cut, nothing else.
-
-    It also must not claim to combine a model that has one GRU hidden: those
-    are served the split layout whatever was asked for, and the wrapper --
-    not the request -- is what the exported metadata records.
-    """
-    assert 'combined' in GRU_STATE_LAYOUTS
-    torch.manual_seed(81)
+def test_every_state_is_rank_four_and_returns_in_full(name, factory):
+    """One rule for the whole boundary: rank 4, and each state comes back
+    with exactly its input's shape and dtype, so it can share one address."""
+    torch.manual_seed(82)
     model = factory().eval()
-    split, split_inputs, split_names, _outs, graph = _build(name, model)
-    combined, combined_inputs, combined_names, _o, _g = _build(
-        name, model, 'combined')
-
-    assert combined.gru_state_layout == ('combined' if combinable else 'split')
-    if not combinable:
-        assert combined_names == split_names
-        return
-
-    hidden = len(combined._gru_slots)
-    assert hidden > 1
-    assert len(combined_names) == len(split_names) - hidden + 1
-    assert combined_names[-1] == combined.COMBINED_GRU_STATE_NAME
-    # Regrouping must not change how many state values cross the boundary.
-    assert sum(value.numel() for value in combined_inputs[graph.signal_inputs:]) \
-        == sum(value.numel() for value in split_inputs[graph.signal_inputs:])
-
-    split_state = tuple(value.clone()
-                        for value in split_inputs[graph.signal_inputs:])
-    combined_state = tuple(value.clone()
-                           for value in combined_inputs[graph.signal_inputs:])
-    generator = torch.Generator().manual_seed(11)
-    observed_nonzero = False
+    wrapper, inputs, input_names, output_names, split = _build(name, model)
+    state = inputs[split.signal_inputs:]
+    assert all(value.ndim == 4 for value in state), [
+        (n, tuple(v.shape)) for n, v in zip(
+            input_names[split.signal_inputs:], state) if v.ndim != 4]
+    generator = torch.Generator().manual_seed(7)
     with torch.no_grad():
-        for _ in range(5):
-            signals = tuple(
-                torch.randn(value.shape, generator=generator)
-                for value in split_inputs[:graph.signal_inputs]
-            )
-            expected = split(*(signals + split_state))
-            actual = combined(*(signals + combined_state))
-            torch.testing.assert_close(actual[0], expected[0],
-                                       rtol=0, atol=0)
-            split_state = expected[1:]
-            combined_state = actual[1:]
-            observed_nonzero = observed_nonzero or bool(
-                combined_state[-1].abs().max() > 0)
-    # Written so it can FAIL: zero state would satisfy every comparison above.
-    assert observed_nonzero, 'state never left its zero initialisation'
+        for _ in range(4):
+            signals = tuple(torch.randn(v.shape, generator=generator)
+                            for v in inputs[:split.signal_inputs])
+            outputs = wrapper(*signals, *state)
+            state = outputs[split.head_outputs:]
+    assert output_names[split.head_outputs:] == tuple(
+        n + '_out' for n in input_names[split.signal_inputs:])
+    initial = inputs[split.signal_inputs:]
+    assert [tuple(v.shape) for v in state] == [tuple(v.shape) for v in initial]
+    assert [v.dtype for v in state] == [v.dtype for v in initial]
+
+
+@pytest.mark.parametrize('name,factory', (
+    ('Align_CRUSE', lambda: AlignCRUSE(GRID)),
+    ('DeepVQE_S', lambda: DeepVQES(GRID)),
+    ('CAGCRN', lambda: CAGCRN(GRID)),
+))
+def test_exported_graph_satisfies_the_in_place_state_contract(
+        name, factory, tmp_path):
+    """The file export_graph writes passes the validator it ran, and each
+    time-extended state is a Slice-then-Concat window."""
+    onnx = pytest.importorskip('onnx')
+    pytest.importorskip('onnxruntime')
+    from types import SimpleNamespace
+    from AIAEC._onnx_contract import validate_inplace_state_contract
+    from AIAEC._streaming_export import export_graph
+
+    torch.manual_seed(83)
+    model = factory().eval()
+    built = _build(name, model)
+    wrapper, _inputs, input_names, output_names, split = built
+    checkpoint = tmp_path / 'ckpt.bin'
+    checkpoint.write_bytes(b'hashed only')
+    path = str(tmp_path / (name + '.onnx'))
+    grid = SimpleNamespace(sr=16000, n_fft=512, win_len=512, hop_len=256)
+    metadata = export_graph(grid, built, str(checkpoint), path, 0,
+                            verify=True)
+    assert metadata['state_binding'] == 'in_place_same_address'
+    loaded = onnx.load(path)
+    assert validate_inplace_state_contract(
+        loaded, input_names[split.signal_inputs:],
+        output_names[split.head_outputs:],
+        window_inputs=wrapper.window_state_names) == len(
+            wrapper.window_state_names)
+    assert len(wrapper.window_state_names) >= 4
+    producer = {o: n for n in loaded.graph.node for o in n.output}
+    for window in wrapper.window_state_names:
+        assert producer[window + '_out'].op_type == 'Concat', window
+
+
+def test_cagcrn_hiddens_stack_on_dim_one_in_slot_order():
+    torch.manual_seed(84)
+    model = CAGCRN(GRID).eval()
+    wrapper, inputs, names, _outputs, split = _build('CAGCRN', model)
+    assert names[-1] == 'h_gru'
+    reference = model.create_stream_state()
+    state = inputs[split.signal_inputs:]
+    generator = torch.Generator().manual_seed(9)
+    with torch.no_grad():
+        for _ in range(3):
+            raw = torch.randn(2, 1, 1, GRID.n_freqs, 2, generator=generator)
+            out = wrapper(*raw, *state)
+            model.forward_stream(
+                torch.complex(raw[0][..., 0], raw[0][..., 1]),
+                torch.complex(raw[1][..., 0], raw[1][..., 1]), reference)
+            state = out[split.head_outputs:]
+    merged = state[-1]
+    # Slots follow the sorted cell names, so the far GRU comes first.
+    order = [wrapper.slots[i].path for i in wrapper._gru_slots]
+    assert order == ['far_tfgru_time.hidden', 'mic_tfgru_time.hidden']
+    first = reference['far_tfgru_time']._hidden
+    second = reference['mic_tfgru_time']._hidden
+    assert merged.shape == (1, 2, first.shape[1], first.shape[2])
+    assert torch.equal(merged[:, 0], first)
+    assert torch.equal(merged[:, 1], second)
+    assert merged.abs().max() > 0
+
+
+def test_deepvqe_descriptor_reads_the_rank_four_boundary():
+    torch.manual_seed(85)
+    model = DeepVQES(GRID, max_delay_seconds=0.5).eval()
+    built = _build('DeepVQE_S', model)
+    wrapper, inputs, input_names, _outputs, split = built
+    with torch.no_grad():
+        outputs = wrapper(*inputs)
+    descriptor = _deepvqe_c_descriptor(built, outputs)
+    shapes = {n: tuple(v.shape) for n, v in zip(input_names, inputs)}
+    assert shapes['h_gru'] == (1, 1, 1, 192)
+    assert descriptor['gru_layers'] == 1 and descriptor['gru_hidden'] == 192
+    assert descriptor['conv_window_frames'] == 4
+    assert descriptor['score_window_frames'] == 5
+    assert descriptor['delay_depth'] == 32
+    assert descriptor['layout_version'] == 4
+    assert descriptor['state_tensor_count'] == len(input_names) - 2
+    assert 'conv_history_frames' not in descriptor

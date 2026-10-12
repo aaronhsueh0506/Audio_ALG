@@ -8,27 +8,26 @@ an ordinary graph input/output.
 Align-ULCNet keeps its specialised exporter because its full-state ABI is
 already paired with ``ulcnet_model_io.c``.
 
-Recurrent-state layouts
------------------------
+State boundary
+--------------
 
-``--gru-state-layout`` selects how each model's GRU hidden states are
-presented at the graph boundary. The graph maths is identical either way.
+Every state tensor is rank 4 and comes back from the graph in full with its
+input's shape, so each ``*_out`` can be bound to the address of its input.
 
-``split`` (default, the shipped contract)
-    One tensor per GRU hidden, interleaved with the structural caches in
-    slot order.
+* Time-extended convolutions keep their whole input window (oldest first).
+  The graph cuts the history off the window input with a Slice and
+  concatenates the new frame behind it; the Concat result is the output.
+* Delay rings (newest first) keep slots ``0..D-2`` through a Slice and
+  concatenate the new frame in front.
+* A GRU hidden ``[layers, N, H]`` crosses the boundary as ``[1, layers, N, H]``.
+  A model with several GRU hiddens stacks them on dim 1 into one ``h_gru``
+  tensor placed after the other states (they must share one shape); a model
+  with a single hidden already has one tensor called ``h_gru``.
+* Vector and scalar accumulators are lifted to ``[1, 1, N, D]`` / ``[1, 1, 1, 1]``.
 
-``combined`` (EXPERIMENTAL -- no C runtime binds it)
-    The GRU hiddens stacked along dim 0 into one ``h_gru`` tensor placed
-    after the caches, which keep their own tensors and their relative order.
-    Caches are structural histories, not recurrent hidden state, and do not
-    share a distribution with the hiddens.
-
-    Only models with more than one GRU hidden are affected. Align_CRUSE and
-    DeepVQE_S each have exactly one -- already a single tensor named
-    ``h_gru`` -- so they stay split rather than reorder the boundary for no
-    gain; CAGCRN's two ``(1, width, hidden)`` hiddens stack. A model whose
-    hiddens do not share a shape is refused rather than padded.
+``export_graph`` validates the written file with
+``validate_inplace_state_contract`` and records ``state_binding`` in its
+metadata.
 """
 
 from __future__ import annotations
@@ -59,7 +58,11 @@ from AIAEC.aiaec_streaming import (
     StreamModuleCell,
 )
 from AIAEC.aiaec_common import fit_frequency, three_vector_complex
-from AIAEC._onnx_contract import validate_nctf_no_temporal_padding
+from AIAEC._onnx_contract import (
+    STATE_BINDING,
+    validate_inplace_state_contract,
+    validate_nctf_no_temporal_padding,
+)
 from onnx_batch1_optimizer import format_report, optimize_batch1
 from AIAEC.CAGCRN.model import (
     _stream_cata,
@@ -206,12 +209,6 @@ GENERIC_MODEL_NAMES = (
     'CAGCRN',
 )
 
-# The recurrent-state layouts this exporter can present, described in the
-# module docstring. One table so the constructor guard, both CLIs and any
-# consumer agree on the set.
-GRU_STATE_LAYOUTS = ('split', 'combined')
-DEFAULT_GRU_STATE_LAYOUT = 'split'
-
 _C_BOUNDARIES = {
     'Align_CRUSE': 'aiaec_process.c/aiaec_process.h',
     'DeepVQE_S': ('aiaec_process.c/aiaec_process.h+'
@@ -224,9 +221,10 @@ _CONTROL_SEMANTICS = {
     'DeepVQE_S': 'complex_ccm_taps_host_applies_spectrum_ring',
     'CAGCRN': 'complex_mask_for_microphone_spectrum',
 }
-# 3: the graph's `mic`/`far` inputs are the host-compressed [1,2,1,F] planar
-# spectra (see host_signal_inputs), no longer raw [1,1,F,2] RI.
-DEEPVQE_C_LAYOUT_VERSION = 3
+# The graph's `mic`/`far` inputs are the host-compressed [1,2,1,F] planar
+# spectra (see host_signal_inputs). DEEPVQE_PREPOST_LAYOUT_VERSION in
+# deepvqe_prepost.h carries the same number. Versions 1-3 are RETIRED.
+DEEPVQE_C_LAYOUT_VERSION = 4
 # The host compresses the inputs with this exponent (C:
 # DEEPVQE_COMPRESSION_EXP); a checkpoint trained with another is refused.
 DEEPVQE_COMPRESSION_EXPONENT = 0.3
@@ -235,7 +233,7 @@ DEEPVQE_COMPRESSION_EXPONENT = 0.3
 def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
     """DeepVqePrepostDescriptor (DeepVQE_S/deepvqe_prepost.h), MEASURED off
     the graph just built rather than restated by hand: the head's tap axes,
-    the conv and score history depths, the GRU shape, the alignment depth and
+    the conv and score window depths, the GRU shape, the alignment depth and
     the state count all come from the boundary tensors, and the grid from the
     model's own. A topology change therefore surfaces as a
     deepvqe_prepost_descriptor_validate() refusal on the board, never as a
@@ -257,10 +255,10 @@ def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
         raise ValueError(
             'DeepVQE_S head is not packed [1,1,F,T*K*2]=[1,1,%d,%d]: %r'
             % (grid.n_freqs, packed_width, head))
-    h_gru = shapes['h_gru']                       # [1, layers, hidden]
-    conv = shapes['state_mic1_history']           # [1, C, history, F]
+    h_gru = shapes['h_gru']                       # [1, layers, 1, hidden]
+    conv = shapes['state_mic1_history']           # [1, C, window, F]
     key_ring = shapes['state_align_key_ring']     # [1, sim, D, F2]
-    score = shapes['state_align_score_history']   # [1, sim, history, D]
+    score = shapes['state_align_score_history']   # [1, sim, window, D]
     # D is the one deployment parameter: both rings must agree on it, and
     # with the depth the export was asked for.
     depth = key_ring[2]
@@ -278,10 +276,10 @@ def _deepvqe_c_descriptor(built, outputs) -> Dict[str, int]:
         'spectrum_bins': int(grid.n_freqs),
         'time_order': time_order,
         'freq_taps': freq_taps,
-        'conv_history_frames': conv[2],
-        'score_history_frames': score[2],
+        'conv_window_frames': conv[2],
+        'score_window_frames': score[2],
         'gru_layers': h_gru[1],
-        'gru_hidden': h_gru[2],
+        'gru_hidden': h_gru[3],
         'state_tensor_count': len(input_names) - split.signal_inputs,
     }
 
@@ -338,10 +336,31 @@ def requires_contiguous_calibration(model_name: str) -> bool:
 
 
 class _StateSlot:
-    def __init__(self, path: str, owner, attribute: str):
+    """One cell tensor and how it crosses the graph boundary.
+
+    ``kind`` decides the boundary form: windows and rings are already rank 4;
+    a GRU hidden ``[layers, N, H]`` is lifted to ``[1, layers, N, H]``; a
+    vector accumulator ``[N, D]`` to ``[1, 1, N, D]``; a scalar counter to
+    ``[1, 1, 1, 1]``. ``lift``/``lower`` convert between the cell's own tensor
+    and the boundary tensor.
+    """
+
+    WINDOW = 'window'
+    RING = 'ring'
+    GRU = 'gru'
+    VECTOR = 'vector'
+    SCALAR = 'scalar'
+
+    def __init__(self, path: str, owner, attribute: str, kind: str):
         self.path = path
         self.owner = owner
         self.attribute = attribute
+        self.kind = kind
+
+    @property
+    def is_window(self) -> bool:
+        """Whether the graph shifts it with a Slice on the input."""
+        return self.kind in (self.WINDOW, self.RING)
 
     def get(self) -> Tensor:
         value = getattr(self.owner, self.attribute)
@@ -352,17 +371,38 @@ class _StateSlot:
     def set(self, value: Tensor) -> None:
         setattr(self.owner, self.attribute, value)
 
+    def lift(self, value: Tensor) -> Tensor:
+        if self.kind == self.GRU:
+            return value.unsqueeze(0)
+        if self.kind == self.VECTOR:
+            return value.reshape(1, 1, *value.shape)
+        if self.kind == self.SCALAR:
+            return value.reshape(1, 1, 1, 1)
+        return value
+
+    def lower(self, value: Tensor) -> Tensor:
+        if self.kind == self.GRU:
+            return value.squeeze(0)
+        if self.kind == self.VECTOR:
+            return value.reshape(value.shape[2:])
+        if self.kind == self.SCALAR:
+            return value.reshape(())
+        return value
+
 
 def _state_slots(state: Dict[str, object]) -> List[_StateSlot]:
     slots: List[_StateSlot] = []
 
     def visit(path: str, cell) -> None:
         if isinstance(cell, StreamConv2dCell):
-            slots.append(_StateSlot(path + '.history', cell, '_history'))
+            slots.append(_StateSlot(path + '.history', cell, '_window',
+                                    _StateSlot.WINDOW))
         elif isinstance(cell, StreamGRUCell):
-            slots.append(_StateSlot(path + '.hidden', cell, '_hidden'))
+            slots.append(_StateSlot(path + '.hidden', cell, '_hidden',
+                                    _StateSlot.GRU))
         elif isinstance(cell, DelayRingCell):
-            slots.append(_StateSlot(path + '.ring', cell, '_ring'))
+            slots.append(_StateSlot(path + '.ring', cell, '_ring',
+                                    _StateSlot.RING))
         elif isinstance(cell, StreamModuleCell):
             visit(path, cell.conv_cell)
         elif isinstance(cell, FrameDelayAttentionCell):
@@ -372,9 +412,10 @@ def _state_slots(state: Dict[str, object]) -> List[_StateSlot]:
         elif isinstance(cell, GlobalDelayAttentionCell):
             visit(path + '.key', cell.key_ring)
             visit(path + '.value', cell.value_ring)
-            slots.append(_StateSlot(path + '.score_sum', cell, '_score_sum'))
+            slots.append(_StateSlot(path + '.score_sum', cell, '_score_sum',
+                                    _StateSlot.VECTOR))
             slots.append(_StateSlot(path + '.frame_index', cell,
-                                    'frame_index'))
+                                    'frame_index', _StateSlot.SCALAR))
         elif hasattr(cell, 'conv_cell'):
             # DeepVQE frequency-upsample and residual streaming cells.
             visit(path, cell.conv_cell)
@@ -474,17 +515,12 @@ def _fold_batch_norm_into_upsample_conv(conv: nn.Conv2d,
 class StatelessOneFrameAIAEC(nn.Module):
     """Bind explicit tensors to an existing model's streaming reference."""
 
-    #: Name the combined recurrent tensor takes in the 'combined' layout.
+    #: Name of the stacked recurrent tensor of a model with several hiddens.
     COMBINED_GRU_STATE_NAME = 'h_gru'
 
-    def __init__(self, model_name: str, model: nn.Module,
-                 gru_state_layout: str = DEFAULT_GRU_STATE_LAYOUT):
+    def __init__(self, model_name: str, model: nn.Module):
         super().__init__()
-        if gru_state_layout not in GRU_STATE_LAYOUTS:
-            raise ValueError('unknown gru_state_layout %r; expected one of %s'
-                             % (gru_state_layout, list(GRU_STATE_LAYOUTS)))
         self.model_name = model_name
-        self.gru_state_layout = gru_state_layout
         self.model = model
         self.stream_state = model.create_stream_state()
         frequency = model.grid.n_freqs
@@ -504,21 +540,17 @@ class StatelessOneFrameAIAEC(nn.Module):
             slot.get()
         self._gru_slots = [
             index for index, slot in enumerate(self.slots)
-            if isinstance(slot.owner, StreamGRUCell)
+            if slot.kind == _StateSlot.GRU
         ]
         gru_slots = set(self._gru_slots)
         self._other_slots = [
             index for index in range(len(self.slots))
             if index not in gru_slots
         ]
-        # Combining one tensor with itself would only reorder the boundary for
-        # no gain, so a model with a single recurrent state keeps the split
-        # layout. Align_CRUSE and DeepVQE_S are in that position: their one
-        # GRU hidden is already a single tensor called h_gru.
-        if len(self._gru_slots) < 2:
-            self.gru_state_layout = 'split'
+        # Several hiddens are stacked on dim 1 into one tensor. One hidden
+        # already is one tensor (Align_CRUSE and DeepVQE_S: h_gru).
         if self.combines_gru_state:
-            widths = {tuple(self.slots[i].get().shape)
+            widths = {tuple(self.slots[i].lift(self.slots[i].get()).shape)
                       for i in self._gru_slots}
             if len(widths) != 1:
                 raise ValueError(
@@ -528,8 +560,12 @@ class StatelessOneFrameAIAEC(nn.Module):
                 )
         # Sanitizing every slot path is regex work, and the boundary is fixed
         # once the slots are; the per-frame forward() must not redo it.
+        slot_names = self._split_state_names()
         self._state_names = self._regroup(
-            self._split_state_names(), self.COMBINED_GRU_STATE_NAME)
+            slot_names, self.COMBINED_GRU_STATE_NAME)
+        self._window_state_names = tuple(
+            name for name, slot in zip(slot_names, self.slots)
+            if slot.is_window)
 
     def _fold_ccm_head(self) -> None:
         """Make the DeepVQE graph end in one conv plus a rank-4 reshape.
@@ -544,13 +580,13 @@ class StatelessOneFrameAIAEC(nn.Module):
             raise ValueError('ccm_up must be a bare conv plus sub-pixel '
                              'shuffle to fold the three-vector map into it')
         cell = self.stream_state['ccm_up'].conv_cell
-        if cell._history.shape[0] != 1:
+        if cell._window.shape[0] != 1:
             raise ValueError('the one-frame graph is exported at batch 1')
         pairs = model.time_order * (2 * model.freq_radius + 1)
         cell.conv = _fold_three_vector_conv(cell.conv, pairs)
-        # The history holds the conv's input frames: its width is the width
+        # The window holds the conv's input frames: its width is the width
         # of the pre-shuffle frequency axis.
-        self._ccm_pre_shuffle_width = int(cell._history.shape[-1])
+        self._ccm_pre_shuffle_width = int(cell._window.shape[-1])
 
     _UPSAMPLE_NAMES = ('up3', 'up2', 'up1')
 
@@ -581,24 +617,24 @@ class StatelessOneFrameAIAEC(nn.Module):
 
     @property
     def combines_gru_state(self) -> bool:
-        return self.gru_state_layout == 'combined'
+        return len(self._gru_slots) > 1
 
     def _split_state_names(self) -> Tuple[str, ...]:
         return tuple(
             _hidden_name(slot.path)
-            if isinstance(slot.owner, StreamGRUCell)
+            if slot.kind == _StateSlot.GRU
             else _onnx_name(slot.path)
             for slot in self.slots
         )
 
     def _regroup(self, per_slot, combined_tail):
-        """Slot-ordered values -> this layout's boundary order.
+        """Slot-ordered values -> the boundary order.
 
-        Caches keep their original order; the one recurrent entry goes last,
-        so the boundary stays readable and the caches' positions are unchanged
-        relative to each other. The rule lives here alone -- names, initial
-        state and per-frame state must all use it, or a graph would be written
-        in one order and fed in another.
+        Caches keep their original order; with several hiddens the one
+        stacked recurrent entry goes last, so the boundary stays readable and
+        the caches' positions are unchanged relative to each other. The rule
+        lives here alone -- names, initial state and per-frame state must all
+        use it, or a graph would be written in one order and fed in another.
         """
         if not self.combines_gru_state:
             return tuple(per_slot)
@@ -610,29 +646,41 @@ class StatelessOneFrameAIAEC(nn.Module):
     def state_names(self) -> Tuple[str, ...]:
         return self._state_names
 
+    @property
+    def state_output_names(self) -> Tuple[str, ...]:
+        return tuple(name + '_out' for name in self._state_names)
+
+    @property
+    def window_state_names(self) -> Tuple[str, ...]:
+        """State inputs the graph shifts with a Slice (windows and rings)."""
+        return self._window_state_names
+
     def initial_state(self) -> Tuple[Tensor, ...]:
         return self._collapse_state(
             [torch.zeros_like(slot.get()) for slot in self.slots])
 
     def _expand_state(self, state_tensors):
-        """Combined-layout tensors -> one per slot, in slot order."""
+        """Boundary tensors -> one cell tensor per slot, in slot order."""
         if not self.combines_gru_state:
-            return state_tensors
-        *others, combined = state_tensors
-        expanded = [None] * len(self.slots)
-        for position, index in enumerate(self._other_slots):
-            expanded[index] = others[position]
-        step = combined.shape[0] // len(self._gru_slots)
-        for position, index in enumerate(self._gru_slots):
-            expanded[index] = combined[position * step:(position + 1) * step]
-        return tuple(expanded)
+            lifted = state_tensors
+        else:
+            *others, combined = state_tensors
+            lifted = [None] * len(self.slots)
+            for position, index in enumerate(self._other_slots):
+                lifted[index] = others[position]
+            step = combined.shape[1] // len(self._gru_slots)
+            for position, index in enumerate(self._gru_slots):
+                lifted[index] = combined[:, position * step:(position + 1) * step]
+        return tuple(slot.lower(value)
+                     for slot, value in zip(self.slots, lifted))
 
     def _collapse_state(self, per_slot):
-        """One per slot -> combined-layout tensors."""
+        """One cell tensor per slot -> boundary tensors."""
+        lifted = [slot.lift(value) for slot, value in zip(self.slots, per_slot)]
         if not self.combines_gru_state:
-            return tuple(per_slot)
-        return self._regroup(per_slot, torch.cat(
-            [per_slot[i] for i in self._gru_slots], dim=0))
+            return tuple(lifted)
+        return self._regroup(lifted, torch.cat(
+            [lifted[i] for i in self._gru_slots], dim=1))
 
     def forward(self, primary_ri: Tensor, far_end_ri: Tensor,
                 *state_tensors: Tensor):
@@ -817,16 +865,14 @@ def host_signal_inputs(model_name: str, model, signals):
     return tuple(signals)
 
 
-def _build(model_name: str, model,
-           gru_state_layout: str = DEFAULT_GRU_STATE_LAYOUT):
+def _build(model_name: str, model):
     if (model_name == 'DeepVQE_S'
             and model.compression_exponent != DEEPVQE_COMPRESSION_EXPONENT):
         raise ValueError(
             'DeepVQE_S host front end is compiled for compression exponent '
             '%r, checkpoint has %r'
             % (DEEPVQE_COMPRESSION_EXPONENT, model.compression_exponent))
-    wrapper = StatelessOneFrameAIAEC(
-        model_name, model, gru_state_layout=gru_state_layout).eval()
+    wrapper = StatelessOneFrameAIAEC(model_name, model).eval()
     shape = ((1, 2, 1, model.grid.n_freqs) if model_name == 'DeepVQE_S'
              else (1, 1, model.grid.n_freqs, 2))
     inputs = (torch.randn(shape), torch.randn(shape)) + wrapper.initial_state()
@@ -913,10 +959,8 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
         'accelerator_persistent_state': False,
         'c_prepost': _C_BOUNDARIES[model_name],
         'learned_control_semantics': _CONTROL_SEMANTICS[model_name],
-        # The wrapper's own answer, not the requested one: a model with a
-        # single GRU hidden is served the split layout whatever was asked for,
-        # and an artifact must record the boundary it actually has.
-        'gru_state_layout': wrapper.gru_state_layout,
+        'gru_state_layout': 'combined',
+        'state_binding': STATE_BINDING,
         'input_schema': _schema(input_names, inputs),
         'output_schema': _schema(output_names, outputs),
         'max_delay_frames': alignment_depth(model),
@@ -944,6 +988,10 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
     set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, output_names, outputs)
     graph = _resolve_internal_shapes(graph)
+    validate_inplace_state_contract(
+        graph, input_names[split.signal_inputs:],
+        output_names[split.head_outputs:],
+        window_inputs=wrapper.window_state_names)
     onnx.save(graph, output_path)
     with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as stream:
@@ -973,15 +1021,6 @@ def main(model_name: str) -> None:
     parser.add_argument('--max-delay-frames', type=int, default=None)
     parser.add_argument('--opset', type=int, default=17)
     parser.add_argument('--verify', action='store_true')
-    parser.add_argument(
-        '--gru-state-layout', choices=GRU_STATE_LAYOUTS,
-        default=DEFAULT_GRU_STATE_LAYOUT,
-        help="'split' (default, the shipped contract) exports one tensor per "
-             "GRU hidden; 'combined' (EXPERIMENTAL, no C runtime binds it) "
-             "stacks them into one h_gru tensor placed after the caches, "
-             "which keep their own tensors. A model with a single GRU hidden "
-             "(Align_CRUSE, DeepVQE_S) stays split -- there is nothing to "
-             "combine.")
     args = parser.parse_args()
     args.model_name = model_name
 
@@ -990,7 +1029,7 @@ def main(model_name: str) -> None:
     if args.max_delay_frames is not None:
         set_alignment_depth(model, args.max_delay_frames)
     model.eval()
-    built = _build(args.model_name, model, args.gru_state_layout)
+    built = _build(args.model_name, model)
     export_graph(grid, built, args.checkpoint, args.output, checkpoint_depth,
                  opset=args.opset, verify=args.verify)
     print(args.output)

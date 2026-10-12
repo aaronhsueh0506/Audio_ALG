@@ -4,7 +4,7 @@
  * parity-tested translation units -- ulcnet_process.c (sqrt-Hann STFT/WOLA,
  * driven here in its one-frame-per-hop rolling form) and ulcnet_model_io.c
  * (feature front end, accelerator tensor
- * views, recurrent rings) -- and adds only the object lifecycle, the pool
+ * views, recurrent windows) -- and adds only the object lifecycle, the pool
  * carve and the per-hop frame state machine. Neither file's existing entry
  * points change, so both of their standalone parity builds keep linking.
  *
@@ -330,6 +330,10 @@ void ulcnet_prepost_reset(UlcnetPrepost *p) {
 }
 
 /* ---- accessors ------------------------------------------------------- */
+
+uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p) {
+    return p ? ulcnet_model_io_state_generation(p->io) : 0u;
+}
 
 int ulcnet_prepost_hop_size(const UlcnetPrepost *p) {
     return p ? ULCNET_HOP : -1;

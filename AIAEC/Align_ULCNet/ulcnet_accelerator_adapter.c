@@ -172,6 +172,11 @@ static void reset(void *user) {
     }
 }
 
+uint32_t ulcnet_accelerator_adapter_state_generation(
+    const UlcnetAcceleratorAdapter *adapter) {
+    return adapter ? ulcnet_prepost_state_generation(adapter->prepost) : 0u;
+}
+
 const UlcnetModelIoDescriptor *ulcnet_accelerator_adapter_descriptor(
     const UlcnetAcceleratorAdapter *adapter) {
     /* Lives in the model I/O state inside the caller's pool, so it outlives

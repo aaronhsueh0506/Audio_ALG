@@ -35,6 +35,7 @@ class that dropped a ring advance would diverge rather than agree.
 """
 
 import os
+import re
 import shutil
 import subprocess
 
@@ -66,27 +67,27 @@ _DRIVER = r'''
 #define HOPS       400
 #define SHORT_HOPS 40
 
-/* The graph's ring shift, performed by the stand-in accelerator: every
+/* The graph's window shift, performed by the stand-in accelerator: every
  * state input is read (the caller stages `now` from them) before any state
- * output is written, and each *_out is the input's own memory. K/V rings are
- * newest-first, the logit history oldest-first. */
+ * output is written, and each *_out is the input's own memory. K/V windows
+ * are newest-first (X = cat(new, W[0:D-1])), the logit window oldest-first
+ * (X = cat(W[1:5], new)). */
 static void push_history(const UlcnetModelIoOutputs *out,
                          const float *key_now, const float *value_now,
                          const float *logit_now, size_t ta_bins,
                          size_t depth) {
     const size_t channels = 32u;
-    const size_t score_frames = 4u;
+    const size_t score_frames = 5u;
     size_t channel;
     for (channel = 0; channel < channels; ++channel) {
-        float *key = out->key_history_out + channel * (depth - 1u) * ta_bins;
-        float *value = out->value_history_out +
-            channel * (depth - 1u) * ta_bins;
+        float *key = out->key_history_out + channel * depth * ta_bins;
+        float *value = out->value_history_out + channel * depth * ta_bins;
         float *logit = out->logit_history_out +
             channel * score_frames * depth;
-        memmove(key + ta_bins, key, (depth - 2u) * ta_bins * sizeof(float));
+        memmove(key + ta_bins, key, (depth - 1u) * ta_bins * sizeof(float));
         memcpy(key, key_now + channel * ta_bins, ta_bins * sizeof(float));
         memmove(value + ta_bins, value,
-                (depth - 2u) * ta_bins * sizeof(float));
+                (depth - 1u) * ta_bins * sizeof(float));
         memcpy(value, value_now + channel * ta_bins,
                ta_bins * sizeof(float));
         memmove(logit, logit + depth,
@@ -118,7 +119,7 @@ static int fake_run(void *user, const UlcnetModelIoInputs *in,
     for (i = 0; i < in->logit_history_elements; ++i)
         acc += 1e-3 * in->logit_history[i];
     for (i = 0; i < in->gru_hidden_elements; ++i)
-        acc += 1e-3 * in->h_gru0[i];
+        acc += 1e-3 * in->h_gru[i];
     /* The graph's output is the planar complex mask: real plane, then
      * imaginary plane. */
     for (i = 0; i < ULCNET_MODEL_IO_BINS; ++i) {
@@ -133,8 +134,8 @@ static int fake_run(void *user, const UlcnetModelIoInputs *in,
     for (i = 0; i < 32u * D; ++i)
         logit_now[i] = (float)(0.01 * sin(acc + 3.0 + (double)i));
     for (i = 0; i < out->gru_hidden_elements; ++i) {
-        out->h_gru0_out[i] = (float)(0.5 * sin(acc + 4.0 + (double)i));
-        out->h_gru1_out[i] = (float)(0.5 * cos(acc + 5.0 + (double)i));
+        out->h_gru_out[i] = (float)(0.5 * ((i & 1u) ?
+            cos(acc + 5.0 + (double)i) : sin(acc + 4.0 + (double)i)));
     }
     push_history(out, key_now, value_now, logit_now,
                  ULCNET_MODEL_IO_TA_BINS, D);
@@ -678,10 +679,14 @@ static int case_reset(FftHandle *fft) {
     CHECK(drive_time(p, pcm_error, pcm_far, out_b, SHORT_HOPS) == 0);
     CHECK(!identical(out_a, out_b, SHORT_HOPS * ULCNET_HOP));
 
+    CHECK(ulcnet_prepost_state_generation(p) == 0u);
+    CHECK(ulcnet_prepost_state_generation(NULL) == 0u);
     ulcnet_prepost_reset(p);
+    CHECK(ulcnet_prepost_state_generation(p) == 1u);
     /* One inference per hop, from the very first hop. */
     CHECK(ulcnet_prepost_pre_process(p, pcm_error, pcm_far) == 1);
     ulcnet_prepost_reset(p);
+    CHECK(ulcnet_prepost_state_generation(p) == 2u);
     CHECK(drive_time(p, pcm_error, pcm_far, out_b, SHORT_HOPS) == 0);
     CHECK(identical(out_a, out_b, SHORT_HOPS * ULCNET_HOP));
 
@@ -719,7 +724,7 @@ static int case_skip(void) {
     static float far_re[ULCNET_BINS], far_im[ULCNET_BINS];
     static float got_re[ULCNET_BINS], got_im[ULCNET_BINS];
     float *key = NULL, *value = NULL, *logit = NULL;
-    float *gru0 = NULL, *gru1 = NULL;
+    float *gru = NULL;
     size_t key_n, value_n, logit_n, gru_n;
     int bin;
 
@@ -763,9 +768,8 @@ static int case_skip(void) {
     key = (float *)malloc(key_n * sizeof(float));
     value = (float *)malloc(value_n * sizeof(float));
     logit = (float *)malloc(logit_n * sizeof(float));
-    gru0 = (float *)malloc(gru_n * sizeof(float));
-    gru1 = (float *)malloc(gru_n * sizeof(float));
-    CHECK(key && value && logit && gru0 && gru1);
+    gru = (float *)malloc(gru_n * sizeof(float));
+    CHECK(key && value && logit && gru);
     memcpy(key, inputs.key_history, key_n * sizeof(float));
     /* The pre-run snapshot must not be all zeros, or "moved" proves
      * nothing. */
@@ -783,14 +787,12 @@ static int case_skip(void) {
     CHECK(outputs.key_history_out == inputs.key_history);
     CHECK(outputs.value_history_out == inputs.value_history);
     CHECK(outputs.logit_history_out == inputs.logit_history);
-    CHECK(outputs.h_gru0_out == inputs.h_gru0);
-    CHECK(outputs.h_gru1_out == inputs.h_gru1);
+    CHECK(outputs.h_gru_out == inputs.h_gru);
     CHECK(memcmp(inputs.key_history, key, key_n * sizeof(float)) != 0);
     memcpy(key, inputs.key_history, key_n * sizeof(float));
     memcpy(value, inputs.value_history, value_n * sizeof(float));
     memcpy(logit, inputs.logit_history, logit_n * sizeof(float));
-    memcpy(gru0, inputs.h_gru0, gru_n * sizeof(float));
-    memcpy(gru1, inputs.h_gru1, gru_n * sizeof(float));
+    memcpy(gru, inputs.h_gru, gru_n * sizeof(float));
     CHECK(ulcnet_prepost_frame_skip(p) == 0);
     CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == 0);
     /* Identity: the error spectrum passes through UNCHANGED, bit for bit --
@@ -806,8 +808,7 @@ static int case_skip(void) {
     CHECK(memcmp(inputs.key_history, key, key_n * sizeof(float)) == 0);
     CHECK(memcmp(inputs.value_history, value, value_n * sizeof(float)) == 0);
     CHECK(memcmp(inputs.logit_history, logit, logit_n * sizeof(float)) == 0);
-    CHECK(memcmp(inputs.h_gru0, gru0, gru_n * sizeof(float)) == 0);
-    CHECK(memcmp(inputs.h_gru1, gru1, gru_n * sizeof(float)) == 0);
+    CHECK(memcmp(inputs.h_gru, gru, gru_n * sizeof(float)) == 0);
 
     /* The other reason to skip: the accelerator wrote NOTHING at all. Same
      * identity, same state. */
@@ -822,7 +823,7 @@ static int case_skip(void) {
                                           far_re, far_im) == 1);
     CHECK(ulcnet_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     CHECK(memcmp(inputs.key_history, key, key_n * sizeof(float)) == 0);
-    CHECK(memcmp(inputs.h_gru0, gru0, gru_n * sizeof(float)) == 0);
+    CHECK(memcmp(inputs.h_gru, gru, gru_n * sizeof(float)) == 0);
     CHECK(fake_run(NULL, &inputs, &outputs) == 0);
     CHECK(ulcnet_prepost_frame_commit(p) == 0);
     CHECK(ulcnet_prepost_pre_process_freq(p, error_re, error_im,
@@ -833,8 +834,7 @@ static int case_skip(void) {
     free(key);
     free(value);
     free(logit);
-    free(gru0);
-    free(gru1);
+    free(gru);
     ulcnet_prepost_destroy(p);
     free(pool);
     return 0;
@@ -854,6 +854,7 @@ static int case_guard(FftHandle *fft) {
     static float got_re[ULCNET_BINS], got_im[ULCNET_BINS];
     size_t i;
     int bin;
+    uint32_t generation;
 
     /* (1) TIME: a hop on top of an unfinished one is refused, and the open
      * frame is still the caller's to finish. */
@@ -913,15 +914,17 @@ static int case_guard(FftHandle *fft) {
                                           far_re, far_im) == 1);
     CHECK(ulcnet_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     CHECK(fake_run(NULL, &inputs, &outputs) == 0);
-    outputs.h_gru1_out[outputs.gru_hidden_elements - 1u] = NAN;
+    outputs.h_gru_out[outputs.gru_hidden_elements - 1u] = NAN;
+    generation = ulcnet_prepost_state_generation(p);
     CHECK(ulcnet_prepost_frame_commit(p) == -1);
+    CHECK(ulcnet_prepost_state_generation(p) == generation + 1u);
     CHECK(ulcnet_prepost_frame_commit(p) == -1);
+    CHECK(ulcnet_prepost_state_generation(p) == generation + 1u);
     CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == -1);
     CHECK(ulcnet_prepost_frame_inputs(p, &inputs, &outputs) == 0);
     for (i = 0; i < outputs.spectrum_ri_elements; ++i)
         CHECK(isnan(outputs.output[i]));
-    CHECK(outputs.h_gru0_out == inputs.h_gru0);
-    CHECK(outputs.h_gru1_out == inputs.h_gru1);
+    CHECK(outputs.h_gru_out == inputs.h_gru);
     CHECK(outputs.key_history_out == inputs.key_history);
     CHECK(outputs.value_history_out == inputs.value_history);
     CHECK(outputs.logit_history_out == inputs.logit_history);
@@ -931,10 +934,8 @@ static int case_guard(FftHandle *fft) {
         CHECK(inputs.value_history[i] == 0.0f);
     for (i = 0; i < inputs.logit_history_elements; ++i)
         CHECK(inputs.logit_history[i] == 0.0f);
-    for (i = 0; i < outputs.gru_hidden_elements; ++i) {
-        CHECK(inputs.h_gru0[i] == 0.0f);
-        CHECK(inputs.h_gru1[i] == 0.0f);
-    }
+    for (i = 0; i < outputs.gru_hidden_elements; ++i)
+        CHECK(inputs.h_gru[i] == 0.0f);
     CHECK(fake_run(NULL, &inputs, &outputs) == 0);
     CHECK(ulcnet_prepost_frame_commit(p) == 0);
     CHECK(ulcnet_prepost_post_process_freq(p, got_re, got_im) == 0);
@@ -993,9 +994,9 @@ static int case_layout(FftHandle *fft) {
           ULCNET_MODEL_IO_LAYOUT_VERSION);
     ulcnet_prepost_destroy(p);
 
-    /* A retired delta layout, an unimplemented combined-GRU layout and a
-     * number that was never assigned are all refused. */
-    for (refused = 8u; refused <= 16u; ++refused) {
+    /* Every retired layout (3-17) and a number that was never assigned are
+     * refused. */
+    for (refused = 3u; refused <= 19u; ++refused) {
         if (refused == ULCNET_MODEL_IO_LAYOUT_VERSION) continue;
         cfg.model_layout_version = refused;
         CHECK(ulcnet_prepost_get_mem_size(&cfg, &other) != 0);
@@ -1003,6 +1004,17 @@ static int case_layout(FftHandle *fft) {
                                      &explicit_match) == NULL);
     }
     free(pool);
+    return 0;
+}
+
+/* ---- hash: the stale-pool identity of this build ---------------------- */
+
+static int case_hash(void) {
+    UlcnetPrepostConfig cfg;
+    UlcnetPrepostMemReq req;
+    CHECK(ulcnet_prepost_config_defaults(&cfg, ULCNET_IO_FREQ, D) == 0);
+    CHECK(ulcnet_prepost_get_mem_size(&cfg, &req) == 0);
+    printf("hash=%u layout=%u\n", req.build_flags_hash, req.layout_version);
     return 0;
 }
 
@@ -1029,6 +1041,7 @@ int main(int argc, char **argv) {
     else if (strcmp(argv[1], "skip") == 0)      status = case_skip();
     else if (strcmp(argv[1], "guard") == 0)     status = case_guard(fft);
     else if (strcmp(argv[1], "layout") == 0)    status = case_layout(fft);
+    else if (strcmp(argv[1], "hash") == 0)      status = case_hash();
     else {
         fprintf(stderr, "unknown case: %s\n", argv[1]);
         status = 2;
@@ -1155,3 +1168,39 @@ def test_model_layout_version_field_accepts_only_the_built_layout(driver):
     layout the C contract does not bind, unassigned numbers -- is refused
     before sizing and by a pool-init that is handed a stale request."""
     _run(driver, 'layout')
+
+
+def _fnv1a(values):
+    """FNV-1a-32 over the little-endian bytes of each 32-bit value, as the
+    class's pp_build_hash folds them."""
+    h = 2166136261
+    for value in values:
+        for shift in (0, 8, 16, 24):
+            h ^= (value >> shift) & 0xff
+            h = (h * 16777619) & 0xffffffff
+    return h
+
+
+def test_pool_identity_moved_with_the_full_window_carve(driver):
+    """The stale-pool gate keys on (grid, layout, carve version, mode, D).
+
+    The window carve changed size and meaning, so a pool recorded by the
+    previous carve must hash differently. The hash is recomputed here from
+    the published constants and compared with what the C returns, then
+    compared with what the previous carve (layout 16, carve 4) would have
+    produced."""
+    out = _run(driver, 'hash')
+    c_hash = int(re.search(r'hash=(\d+)', out).group(1))
+    layout = int(re.search(r'layout=(\d+)', out).group(1))
+    assert layout == 18
+    with open(os.path.join(_ULCNET_DIR, 'ulcnet_prepost.h'),
+              encoding='utf-8') as stream:
+        carve = int(re.search(
+            r'^#define\s+ULCNET_PREPOST_CARVE_VERSION\s+(\d+)u',
+            stream.read(), re.MULTILINE).group(1))
+    assert carve == 5
+    # io_mode FREQ == 0, D == 8, grid 16000 / 512 (this driver's build).
+    expected = _fnv1a([16000, 512, layout, carve, 0, 8])
+    previous = _fnv1a([16000, 512, 16, 4, 0, 8])
+    assert c_hash == expected
+    assert c_hash != previous

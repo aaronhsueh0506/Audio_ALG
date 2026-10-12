@@ -1,5 +1,7 @@
 #include "ulcnet_model_io.h"
 
+#include "simd_kernel_nn.h"
+
 #include <math.h>
 #include <stdint.h>
 #include <string.h>
@@ -12,8 +14,7 @@ struct UlcnetModelIoState {
     float *key_history;
     float *value_history;
     float *logit_history;
-    float *h_gru0;
-    float *h_gru1;
+    float *h_gru;
 
     /* The four graph feature tensors prepare() computes, and the compressed
      * error spectrum it keeps for commit(). */
@@ -28,6 +29,7 @@ struct UlcnetModelIoState {
     size_t value_history_elements;
     size_t logit_history_elements;
     size_t gru_hidden_elements;
+    uint32_t state_generation;
     int prepared;
 };
 
@@ -96,7 +98,6 @@ static int compute_counts(const UlcnetModelIoDescriptor *descriptor,
     size_t channels;
     size_t bins;
     size_t depth;
-    size_t history_depth;
     size_t one_feature;
 
     if (!descriptor || !counts ||
@@ -107,20 +108,21 @@ static int compute_counts(const UlcnetModelIoDescriptor *descriptor,
     channels = (size_t)descriptor->ta_channels;
     bins = (size_t)descriptor->ta_bins;
     depth = (size_t)descriptor->delay_depth;
-    history_depth = depth - 1u;
 
     counts->spectrum_bins_elements = (size_t)descriptor->spectrum_bins;
     if (checked_mul((size_t)descriptor->spectrum_bins, 2u,
                     &counts->spectrum_ri_elements) != 0 ||
         checked_mul(channels, bins, &one_feature) != 0 ||
-        checked_mul(one_feature, history_depth,
-                    &counts->key_history_elements) != 0 ||
-        checked_mul(channels, (size_t)descriptor->score_history_frames,
+        checked_mul(one_feature, depth, &counts->key_history_elements) != 0 ||
+        checked_mul(channels, (size_t)descriptor->score_window_frames,
                     &counts->logit_history_elements) != 0 ||
         checked_mul(counts->logit_history_elements, depth,
                     &counts->logit_history_elements) != 0 ||
         checked_mul((size_t)descriptor->gru_layers,
                     (size_t)descriptor->gru_hidden,
+                    &counts->gru_hidden_elements) != 0 ||
+        checked_mul(counts->gru_hidden_elements,
+                    (size_t)ULCNET_MODEL_IO_GRU_SUBBANDS,
                     &counts->gru_hidden_elements) != 0) {
         return -1;
     }
@@ -142,7 +144,7 @@ int ulcnet_model_io_descriptor_default(int delay_depth,
     descriptor->spectrum_bins = ULCNET_MODEL_IO_BINS;
     descriptor->ta_channels = ULCNET_MODEL_IO_TA_CHANNELS;
     descriptor->ta_bins = ULCNET_MODEL_IO_TA_BINS;
-    descriptor->score_history_frames = ULCNET_MODEL_IO_SCORE_HISTORY;
+    descriptor->score_window_frames = ULCNET_MODEL_IO_SCORE_WINDOW;
     descriptor->gru_layers = ULCNET_MODEL_IO_GRU_LAYERS;
     descriptor->gru_hidden = ULCNET_MODEL_IO_GRU_HIDDEN;
     descriptor->far_input_mode = ULCNET_FAR_RAW;
@@ -173,7 +175,7 @@ int ulcnet_model_io_descriptor_validate(
         descriptor->spectrum_bins != ULCNET_MODEL_IO_BINS ||
         descriptor->ta_channels != ULCNET_MODEL_IO_TA_CHANNELS ||
         descriptor->ta_bins != ULCNET_MODEL_IO_TA_BINS ||
-        descriptor->score_history_frames != ULCNET_MODEL_IO_SCORE_HISTORY ||
+        descriptor->score_window_frames != ULCNET_MODEL_IO_SCORE_WINDOW ||
         descriptor->gru_layers != ULCNET_MODEL_IO_GRU_LAYERS ||
         descriptor->gru_hidden != ULCNET_MODEL_IO_GRU_HIDDEN ||
         descriptor->far_input_mode != ULCNET_FAR_RAW) {
@@ -198,8 +200,7 @@ int ulcnet_model_io_get_mem_requirements(
         add_float_region(counts.key_history_elements, &bytes) != 0 ||
         add_float_region(counts.value_history_elements, &bytes) != 0 ||
         add_float_region(counts.logit_history_elements, &bytes) != 0 ||
-        /* h_gru0, h_gru1 */
-        add_float_regions(2u, counts.gru_hidden_elements, &bytes) != 0) {
+        add_float_region(counts.gru_hidden_elements, &bytes) != 0) {
         return -1;
     }
     requirements->bytes = bytes;
@@ -260,20 +261,19 @@ UlcnetModelIoState *ulcnet_model_io_init(
     state->key_history = carve_float(&cursor, counts.key_history_elements);
     state->value_history = carve_float(&cursor, counts.value_history_elements);
     state->logit_history = carve_float(&cursor, counts.logit_history_elements);
-    state->h_gru0 = carve_float(&cursor, counts.gru_hidden_elements);
-    state->h_gru1 = carve_float(&cursor, counts.gru_hidden_elements);
+    state->h_gru = carve_float(&cursor, counts.gru_hidden_elements);
 
     if (!state->error_mag || !state->far_mag || !state->error_cos ||
         !state->error_sin || !state->error_ri ||
         !state->output || !state->key_history || !state->value_history ||
-        !state->logit_history || !state->h_gru0 || !state->h_gru1 ||
+        !state->logit_history || !state->h_gru ||
         (size_t)(cursor - (unsigned char *)pool) != requirements.bytes) {
         return NULL;
     }
     return state;
 }
 
-/* Zero every recurrent tensor: the K/V/logit rings and both GRU hiddens. */
+/* Zero every recurrent tensor: the K/V/logit windows and the GRU hidden. */
 static void clear_recurrent_state(UlcnetModelIoState *state) {
     memset(state->key_history, 0,
            state->key_history_elements * sizeof(float));
@@ -281,10 +281,8 @@ static void clear_recurrent_state(UlcnetModelIoState *state) {
            state->value_history_elements * sizeof(float));
     memset(state->logit_history, 0,
            state->logit_history_elements * sizeof(float));
-    memset(state->h_gru0, 0,
-           state->gru_hidden_elements * sizeof(float));
-    memset(state->h_gru1, 0,
-           state->gru_hidden_elements * sizeof(float));
+    memset(state->h_gru, 0, state->gru_hidden_elements * sizeof(float));
+    ++state->state_generation;
 }
 
 void ulcnet_model_io_reset(UlcnetModelIoState *state) {
@@ -295,12 +293,8 @@ void ulcnet_model_io_reset(UlcnetModelIoState *state) {
     state->prepared = 0;
 }
 
-static void fill_nan(float *values, size_t elements) {
-    size_t index;
-
-    for (index = 0; index < elements; ++index) {
-        values[index] = NAN;
-    }
+uint32_t ulcnet_model_io_state_generation(const UlcnetModelIoState *state) {
+    return state ? state->state_generation : 0u;
 }
 
 int ulcnet_model_io_prepare(UlcnetModelIoState *state,
@@ -340,7 +334,7 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
         state->error_ri[2 * bin + 1] = c_im;
     }
 
-    fill_nan(state->output, state->spectrum_ri_elements);
+    skn_fill_f32(state->output, state->spectrum_ri_elements, NAN);
 
     inputs->error_mag = state->error_mag;
     inputs->far_mag = state->far_mag;
@@ -349,8 +343,7 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     inputs->key_history = state->key_history;
     inputs->value_history = state->value_history;
     inputs->logit_history = state->logit_history;
-    inputs->h_gru0 = state->h_gru0;
-    inputs->h_gru1 = state->h_gru1;
+    inputs->h_gru = state->h_gru;
     inputs->spectrum_bins_elements = (size_t)state->descriptor.spectrum_bins;
     inputs->key_history_elements = state->key_history_elements;
     inputs->value_history_elements = state->value_history_elements;
@@ -361,8 +354,7 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     outputs->key_history_out = state->key_history;
     outputs->value_history_out = state->value_history;
     outputs->logit_history_out = state->logit_history;
-    outputs->h_gru0_out = state->h_gru0;
-    outputs->h_gru1_out = state->h_gru1;
+    outputs->h_gru_out = state->h_gru;
     outputs->spectrum_ri_elements = state->spectrum_ri_elements;
     outputs->key_history_elements = state->key_history_elements;
     outputs->value_history_elements = state->value_history_elements;
@@ -372,150 +364,52 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     return 0;
 }
 
-static int all_finite(const float *values, size_t elements) {
-    size_t index;
+/* The finite predicate over the tensors one frame wrote.  The graph writes a
+ * whole window back, but only the frame it just produced is new -- key/value
+ * slot 0 of every channel (newest first) and the last logit frame (oldest
+ * first); the older frames were checked when they were new, and a non-finite
+ * value left in any of them reaches `output` on the next frame, where this
+ * same check refuses it.  The window geometry follows from the element counts
+ * and the compiled grid. */
+static int frame_is_finite(const UlcnetModelIoState *state) {
+    const size_t channels = ULCNET_MODEL_IO_TA_CHANNELS;
+    const size_t key_stride = state->key_history_elements / channels;
+    const size_t logit_stride = state->logit_history_elements / channels;
+    const size_t depth = logit_stride / ULCNET_MODEL_IO_SCORE_WINDOW;
+    const size_t newest_logit = logit_stride - depth;
+    size_t channel;
 
-    for (index = 0; index < elements; ++index) {
-        if (!isfinite(values[index])) {
-            return 0;
-        }
+    if (!skn_all_finite_f32(state->output, state->spectrum_ri_elements) ||
+        !skn_all_finite_f32(state->h_gru, state->gru_hidden_elements)) {
+        return 0;
     }
-    return 1;
-}
-
-/* Finite check of the `length` floats at `offset` inside each of `channels`
- * per-channel blocks of `stride` floats. */
-static int all_finite_per_channel(const float *base, int channels,
-                                  size_t stride, size_t offset,
-                                  size_t length) {
-    int channel;
-
     for (channel = 0; channel < channels; ++channel) {
-        if (!all_finite(base + (size_t)channel * stride + offset, length)) {
+        if (!skn_all_finite_f32(state->key_history + channel * key_stride,
+                                ULCNET_MODEL_IO_TA_BINS) ||
+            !skn_all_finite_f32(state->value_history + channel * key_stride,
+                                ULCNET_MODEL_IO_TA_BINS) ||
+            !skn_all_finite_f32(state->logit_history +
+                                    channel * logit_stride + newest_logit,
+                                depth)) {
             return 0;
         }
     }
     return 1;
-}
-
-/* The finite predicate over the tensors one frame wrote, shared by commit()
- * (the state's own buffers) and inherit() (the runtime's).  A NULL tensor is
- * skipped.  The graph shifts each ring by one frame, so only the frame it
- * just wrote needs a check -- key/value slot 0 (newest first) and the last
- * logit frame (oldest first); the older slots were checked when they were
- * new, and a non-finite value left in any of them reaches `output` on the
- * next frame, where this same check refuses it.  The ring geometry follows
- * from the element counts and the compiled grid. */
-static int frame_is_finite(const float *output, const float *key_history,
-                           const float *value_history,
-                           const float *logit_history, const float *h_gru0,
-                           const float *h_gru1,
-                           const UlcnetModelIoOutputs *counts) {
-    const size_t key_stride = counts->key_history_elements /
-        ULCNET_MODEL_IO_TA_CHANNELS;
-    const size_t logit_stride = counts->logit_history_elements /
-        ULCNET_MODEL_IO_TA_CHANNELS;
-    const size_t depth = logit_stride / ULCNET_MODEL_IO_SCORE_HISTORY;
-
-    return (!output || all_finite(output, counts->spectrum_ri_elements)) &&
-        (!key_history ||
-         all_finite_per_channel(key_history, ULCNET_MODEL_IO_TA_CHANNELS,
-                                key_stride, 0u, ULCNET_MODEL_IO_TA_BINS)) &&
-        (!value_history ||
-         all_finite_per_channel(value_history, ULCNET_MODEL_IO_TA_CHANNELS,
-                                key_stride, 0u, ULCNET_MODEL_IO_TA_BINS)) &&
-        (!logit_history ||
-         all_finite_per_channel(logit_history, ULCNET_MODEL_IO_TA_CHANNELS,
-                                logit_stride, logit_stride - depth, depth)) &&
-        (!h_gru0 || all_finite(h_gru0, counts->gru_hidden_elements)) &&
-        (!h_gru1 || all_finite(h_gru1, counts->gru_hidden_elements));
-}
-
-static int counts_match(const UlcnetModelIoOutputs *left,
-                        const UlcnetModelIoOutputs *right) {
-    return left->spectrum_ri_elements == right->spectrum_ri_elements &&
-        left->key_history_elements == right->key_history_elements &&
-        left->value_history_elements == right->value_history_elements &&
-        left->logit_history_elements == right->logit_history_elements &&
-        left->gru_hidden_elements == right->gru_hidden_elements;
-}
-
-/* Copy `elements` floats unless the runtime already wrote them in place. */
-static void inherit_tensor(float *destination, const float *source,
-                           size_t elements) {
-    if (destination != source) {
-        memcpy(destination, source, elements * sizeof(float));
-    }
-}
-
-int ulcnet_model_io_inherit(const UlcnetModelIoOutputs *destination,
-                            const UlcnetModelIoOutputs *runtime) {
-    if (!destination || !runtime || !destination->output ||
-        !destination->key_history_out || !destination->value_history_out ||
-        !destination->logit_history_out || !destination->h_gru0_out ||
-        !destination->h_gru1_out ||
-        !runtime->output || !runtime->key_history_out ||
-        !runtime->value_history_out || !runtime->logit_history_out ||
-        !runtime->h_gru0_out || !runtime->h_gru1_out ||
-        !counts_match(destination, runtime) ||
-        destination->key_history_elements % ULCNET_MODEL_IO_TA_CHANNELS != 0u ||
-        destination->logit_history_elements %
-            (ULCNET_MODEL_IO_TA_CHANNELS * ULCNET_MODEL_IO_SCORE_HISTORY) !=
-            0u) {
-        return -1;
-    }
-    /* Refuse before writing anything: a non-finite frame leaves the state
-     * as it was.  A tensor the runtime wrote in place is the state itself,
-     * so it is neither copied nor checked here; commit() checks it. */
-#define ULCNET_COPIED(field) \
-    (runtime->field != destination->field ? runtime->field : NULL)
-    if (!frame_is_finite(ULCNET_COPIED(output),
-                         ULCNET_COPIED(key_history_out),
-                         ULCNET_COPIED(value_history_out),
-                         ULCNET_COPIED(logit_history_out),
-                         ULCNET_COPIED(h_gru0_out),
-                         ULCNET_COPIED(h_gru1_out), runtime)) {
-        return -1;
-    }
-#undef ULCNET_COPIED
-    inherit_tensor(destination->output, runtime->output,
-                   destination->spectrum_ri_elements);
-    inherit_tensor(destination->key_history_out, runtime->key_history_out,
-                   destination->key_history_elements);
-    inherit_tensor(destination->value_history_out,
-                   runtime->value_history_out,
-                   destination->value_history_elements);
-    inherit_tensor(destination->logit_history_out,
-                   runtime->logit_history_out,
-                   destination->logit_history_elements);
-    inherit_tensor(destination->h_gru0_out, runtime->h_gru0_out,
-                   destination->gru_hidden_elements);
-    inherit_tensor(destination->h_gru1_out, runtime->h_gru1_out,
-                   destination->gru_hidden_elements);
-    return 0;
 }
 
 int ulcnet_model_io_commit(UlcnetModelIoState *state,
                            float enhanced_re[ULCNET_MODEL_IO_BINS],
                            float enhanced_im[ULCNET_MODEL_IO_BINS]) {
     const UlcnetModelIoDescriptor *descriptor;
-    UlcnetModelIoOutputs counts;
     int bin;
 
     if (!state || !state->prepared || !enhanced_re || !enhanced_im) {
         return -1;
     }
     descriptor = &state->descriptor;
-    counts.spectrum_ri_elements = state->spectrum_ri_elements;
-    counts.key_history_elements = state->key_history_elements;
-    counts.value_history_elements = state->value_history_elements;
-    counts.logit_history_elements = state->logit_history_elements;
-    counts.gru_hidden_elements = state->gru_hidden_elements;
     /* Every state tensor was written in place, so a bad frame cannot leave
      * them as they were: refuse it and restart the recurrent state cold. */
-    if (!frame_is_finite(state->output, state->key_history,
-                         state->value_history, state->logit_history,
-                         state->h_gru0, state->h_gru1, &counts)) {
+    if (!frame_is_finite(state)) {
         clear_recurrent_state(state);
         state->prepared = 0;
         return -1;

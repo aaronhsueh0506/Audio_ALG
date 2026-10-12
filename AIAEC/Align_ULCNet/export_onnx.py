@@ -62,75 +62,42 @@ raw far against that error. The calibration and ONNX commands must use the same
 ``--max-delay-frames`` value.  NPZ output writes a sibling JSON contract;
 binary output writes ``manifest.json`` inside its output directory.
 
-The accelerator retains no state.  Every invocation takes the past K/V
-features, attention-score history and temporal-GRU hidden tensors as inputs
-and returns the FULL next value of each (``key_history_out``,
-``value_history_out``, ``logit_history_out``, ``h_gru0_out``, ``h_gru1_out``),
-with exactly the input shapes, so each state input and its ``*_out`` output
-can be bound to one address and the CPU shifts and copies nothing.  The ring
-shift runs inside the graph on the tensors it already builds for attention.
-STFT/WOLA and PBFDKF stay outside the
-graph in ``ulcnet_process.c`` and the AEC library respectively.  The exported
-graph boundary follows the checkpoint and supports 16 kHz / FFT-window 512 /
-hop 256 or 48 kHz / 1024 / 512.  The C pre/post must be compiled for the same
-grid; one binary serves one grid.
+STFT/WOLA and PBFDKF stay outside the graph in ``ulcnet_process.c`` and the AEC
+library respectively.  The exported graph boundary follows the checkpoint and
+supports 16 kHz / FFT-window 512 / hop 256 or 48 kHz / 1024 / 512.  The C
+pre/post must be compiled for the same grid; one binary serves one grid.
 
-Graph boundary layouts
-----------------------
+Graph boundary (state layout version ``LAYOUT_VERSION``)
+--------------------------------------------------------
 
-Two independent switches choose the boundary; the graph maths is identical
-under all four combinations, and the exported metadata records the pair under
-``feature_layout``/``gru_state_layout`` plus the version in
-``LAYOUT_VERSIONS``.
+The accelerator retains no state.  Four host-computed signal inputs
+(``error_mag``, ``far_mag``, ``error_cos``, ``error_sin``, each ``[1,1,F]``;
+signed-power compression, magnitudes and the compressed-domain phase run on
+the host, see ``stream_features``) are followed by four rank-4 state inputs,
+and every state input has an ``*_out`` output of exactly the same shape:
 
-``--feature-layout`` -- where the fixed front/back ends run.
+    key_history    [1, 32, D, TA]   newest frame first (slot 0 is the newest)
+    value_history  [1, 32, D, TA]   newest frame first
+    logit_history  [1, 32, 5, D]    oldest frame first (slot 4 is the newest)
+    h_gru          [1, 4, 1, 128]   subband GRU 0 layers, then subband GRU 1
 
-``host`` (default, the shipped contract)
-    Four signal inputs: ``error_mag``, ``far_mag``, ``error_cos``,
-    ``error_sin``. Signed-power compression, magnitudes and the
-    compressed-domain phase run outside the graph (``stream_features``;
-    C: ``ulcnet_model_io_prepare``). The graph ends at the ``complex_mask``
-    1x1 Conv and returns the learned mask itself, ``output`` =
-    ``[1, 2, 1, n_freqs]`` (plane 0 real, plane 1 imaginary), so no
-    elementwise op follows the last Conv. The fixed back end -- complex
-    multiply of the compressed error by that mask, then the inverse power --
-    runs on the host (``host_back_end``; C: ``ulcnet_model_io_commit``).
-    Each feature keeps its own quantization scale, and the unlearned
-    sqrt/atan2/pow never enter the quantized domain. This is what
-    ``ulcnet_model_io.h`` binds.
+Each ``*_out`` is the FULL next window.  The shift runs in the graph, on the
+tensors attention already builds: the history is cut by a Slice on the graph
+input (K/V keep slots ``0..D-2``, the logit window keeps frames ``1..4``) and
+the new frame is concatenated behind or in front of it, so the Concat result
+is the output and no output is produced by a Slice.  The dropped slot only
+keeps the input and output shapes identical.  A runtime can therefore bind
+each ``*_out`` to the address of its input; it must finish reading every
+state input before it writes any state output.  The graph ends at the
+``complex_mask`` 1x1 Conv and returns the learned mask itself,
+``output`` = ``[1, 2, 1, n_freqs]`` (plane 0 real, plane 1 imaginary); the
+fixed back end -- complex multiply of the compressed error by that mask, then
+the inverse power -- runs on the host (``host_back_end``; C:
+``ulcnet_model_io_commit``).
 
-``graph``
-    Two signal inputs: ``error`` and ``far``, the raw RI spectra, with that
-    same fixed math back inside the graph. Fewer tensors to bind and no host
-    front end, paid for by putting sqrt/atan2/pow into the quantized domain
-    and by ``error_cos``/``error_sin`` sharing whatever scale the compiler
-    derives for them. It exists to measure that trade. It reproduces the
-    pre-host-front-end boundary in every respect except the recurrent-state
-    rank, so it carries its own version rather than the retired one that
-    boundary once had. Its ``output`` stays the final estimate, because the
-    compressed error the multiply needs is computed inside the graph there
-    and the host never holds it.
-
-``--gru-state-layout`` -- how the two subband GRU hiddens are presented.
-
-``split`` (default, the shipped contract)
-    ``h_gru0``/``h_gru1``, one tensor per subband GRU, each
-    ``(1, GRU_LAYERS, 1, GRU_HIDDEN)``.
-
-``combined``
-    One ``(1, 2*GRU_LAYERS, 1, GRU_HIDDEN)`` tensor named ``h_gru``, h_gru0
-    then h_gru1, stacked along dim 1. The attention caches (key/value/logit history) stay separate in
-    both layouts: they are structural histories, not recurrent hidden state,
-    and they do not share a distribution with the hiddens.
-
-    It exists to measure what a single shared quantization scale costs. As on
-    DFN2, the two hiddens reach their GRUs through Slices off one input, so
-    an integer compiler may assign them one scale -- which is the whole
-    question.
-
-No C runtime binds anything but ``host``/``split``. Adopting another pair is a
-contract change: ``ulcnet_model_io.h``, its prepare/commit API and the I/O
-tables move with it.
+``export_graph`` validates the written file with
+``validate_inplace_state_contract`` and records ``state_binding`` in its
+metadata.
 """
 
 from __future__ import annotations
@@ -152,7 +119,11 @@ _AUDIO_ALG_ROOT = os.path.dirname(os.path.dirname(_THIS_DIR))
 if _AUDIO_ALG_ROOT not in sys.path:
     sys.path.insert(0, _AUDIO_ALG_ROOT)
 
-from AIAEC._onnx_contract import validate_nctf_no_temporal_padding
+from AIAEC._onnx_contract import (
+    STATE_BINDING,
+    validate_inplace_state_contract,
+    validate_nctf_no_temporal_padding,
+)
 from onnx_batch1_optimizer import format_report, optimize_batch1
 
 from AIAEC.Align_ULCNet.inference import load_model
@@ -163,59 +134,14 @@ from AIAEC.training_common import (
 )
 
 
-# Version history. Versions 8-11 returned only the new K/V/logit entries
-# (key_now/value_now/logit_now) and left the ring shift to the CPU. Versions
-# 12-15 return the full next history from the graph, so the shipped contract
-# is the in-place one; 8-11 are retired with 3-7.
-# The host boundaries then stopped multiplying in the graph: ``output`` became
-# the raw complex mask, planar ``[1, 2, 1, n_freqs]``, the complex multiply
-# and inverse power moved to the host, and ``error_ri`` (which only that
-# multiply read) left the graph's inputs. Same element count as the estimate
-# it replaced, so only the version separates the two. Host pairs 12 and 13
-# became 16 and 17 and are retired; the graph pairs (14, 15) still return the
-# estimate and keep their numbers.
-# Version 3 introduced an explicit deployed-far descriptor
-# while retaining the checkpoint's training provenance separately;
-# version 4 renamed the tensors (error/far inputs, output head, h_gru0/h_gru1
-# hiddens, *_out states) -- runtimes bind by name; version 5 moved the fixed
-# front/back ends (signed-power compression, magnitudes, phase cos/sin,
-# inverse power) out of the graph onto the host.
-#
-# Versions 8-11 present every recurrent hidden as rank-4 NCHW, matching the
-# three attention caches, which were already NCHW. The target platform's
-# quantization toolchain requires rank-4 tensors; element count, row-major
-# order and the per-tensor quantization scales are all unchanged by the rank,
-# so this costs a version number and nothing else.
-# The SIGNAL inputs are deliberately not touched here: error_mag/far_mag/
-# error_cos/error_sin are [1,1,n_freqs] and error_ri was the only rank-4 one.
-# If the toolchain turns out to reject those too, they move in their own bump
-# -- folding them in here would not have made that re-export any cheaper.
-#
-# The boundary is the PAIR (feature layout, recurrent-state layout), so the
-# version belongs to the pair and is written down once rather than derived
-# from either half. The rank change reaches every pair -- both split hiddens
-# and the combined tensor -- so all four boundaries moved together and
-# versions 3-7 are retired. No later contract may reclaim them: a number that
-# denoted a rank-3 boundary must never also denote a rank-4 one.
-#
-# ULCNET_MODEL_IO_LAYOUT_VERSION in ulcnet_model_io.h is the deployed pair's
-# version; test_export_streaming_ulcnet.py pins the two together. The other
-# three are reserved there so a later C-side bump cannot take their numbers.
-# Stated here rather than only in ulcnet_model_io.h's prose so a bump onto one
-# fails a test instead of a review. 3, 4 and 5 were shipped rank-3 boundaries;
-# 6 and 7 were rank-3 pairs reachable from the CLI and stamped into exported
-# metadata, so they were allocated, not merely reserved. 8-11 were the
-# delta-state boundaries of the four pairs; every pair moved to the full-state
-# boundary together, so the same rule retires them.
-RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 14))
-LAYOUT_VERSIONS = {
-    ('host', 'split'): 16,
-    ('host', 'combined'): 17,
-    ('graph', 'split'): 14,
-    ('graph', 'combined'): 15,
-}
-# The deployed pair's version, named because ulcnet_model_io.h pins it.
-STATE_LAYOUT_VERSION = LAYOUT_VERSIONS[('host', 'split')]
+# The state boundary's version.  ULCNET_MODEL_IO_LAYOUT_VERSION in
+# ulcnet_model_io.h carries the same number; test_export_streaming_ulcnet.py
+# pins the two together.  Versions 3-17 are RETIRED: each denoted a boundary
+# this exporter and ulcnet_model_io.c no longer implement, and a number that
+# once denoted one boundary must never denote another.
+LAYOUT_VERSION = 18
+RETIRED_LAYOUT_VERSIONS = frozenset(range(3, 18))
+STATE_LAYOUT_VERSION = LAYOUT_VERSION
 # The deployed C front/back end hardcodes this exponent
 # (ULCNET_MODEL_IO_COMPRESSION_EXP); export_graph refuses any checkpoint
 # whose model carries a different value, because nothing downstream of the
@@ -230,7 +156,8 @@ COMPRESSION_EXPONENT = 0.3
 MIN_DELAY_DEPTH = 2
 MAX_DELAY_DEPTH = 64
 TA_CHANNELS = 32
-SCORE_HISTORY_FRAMES = 4
+SCORE_WINDOW_FRAMES = 5
+GRU_SUBBANDS = 2
 GRU_LAYERS = 2
 GRU_HIDDEN = 128
 
@@ -241,141 +168,24 @@ GRU_HIDDEN = 128
 # and the graph starts at the learned reorient/encoder compute. The compressed
 # error spectrum stream_features also returns is not a graph input: only the
 # host back end (host_back_end) multiplies by it.
-HOST_SIGNAL_INPUT_NAMES = (
+SIGNAL_INPUT_NAMES = (
     'error_mag',
     'far_mag',
     'error_cos',
     'error_sin',
 )
-# The raw RI spectra the host front end consumes. Binding these instead makes
-# the graph run that same fixed math itself, so there is no host front end and
-# nothing to keep in step with ulcnet_model_io_prepare().
-GRAPH_SIGNAL_INPUT_NAMES = ('error', 'far')
-# The two subband GRU hiddens. Both are (1, GRU_LAYERS, 1, GRU_HIDDEN), so
-# they stack along dim 1 into one (1, 2*GRU_LAYERS, 1, GRU_HIDDEN) tensor --
-# see GRU_STATE_LAYOUTS. dim 0 is the singleton N of the shared NCHW
-# convention, so it is never the stacking axis. The attention caches stay
-# separate in both layouts: they are structural histories, not recurrent
-# hidden state.
-GRU_STATE_NAMES = ('h_gru0', 'h_gru1')
-COMBINED_GRU_STATE_NAME = 'h_gru'
-CACHE_STATE_NAMES = ('key_history', 'value_history', 'logit_history')
+# The two subband GRU hiddens are stacked along dim 1 of one rank-4 tensor,
+# h_gru0 then h_gru1; dim 0 is the singleton N of the shared NCHW convention,
+# so it is never the stacking axis.
+GRU_STATE_NAME = 'h_gru'
+WINDOW_STATE_NAMES = ('key_history', 'value_history', 'logit_history')
+STATE_NAMES = WINDOW_STATE_NAMES + (GRU_STATE_NAME,)
 HEAD_OUTPUT_NAMES = ('output',)
-CACHE_OUTPUT_NAMES = tuple(name + '_out' for name in CACHE_STATE_NAMES)
+STATE_OUTPUT_NAMES = tuple(name + '_out' for name in STATE_NAMES)
 
-
-class FeatureLayout(object):
-    """Which signal tensors the graph binds, and hence where the fixed
-    front/back ends run. See the module docstring for the trade."""
-
-    def __init__(self, label, signal_names, in_graph):
-        self.label = label
-        self.signal_names = signal_names
-        self.in_graph = in_graph
-
-
-FEATURE_LAYOUTS = {
-    'host': FeatureLayout('host', HOST_SIGNAL_INPUT_NAMES, in_graph=False),
-    'graph': FeatureLayout('graph', GRAPH_SIGNAL_INPUT_NAMES, in_graph=True),
-}
-DEFAULT_FEATURE_LAYOUT = 'host'
-
-
-class GruStateLayout(object):
-    """One way of presenting the recurrent state at the graph boundary.
-
-    Named rather than boolean for the same reason as DFN2's: the models in
-    this stack do not all stack the same way (GTCRN's ten hiddens carry two
-    different shapes), so a third layout is foreseeable and a second boolean
-    would be a 2x2 of impossible states.
-    """
-
-    def __init__(self, label, gru_names, combined):
-        self.label = label
-        self.gru_names = gru_names
-        self.combined = combined
-        self.state_names = CACHE_STATE_NAMES + gru_names
-
-
-GRU_STATE_LAYOUTS = {
-    'split': GruStateLayout('split', GRU_STATE_NAMES, combined=False),
-    'combined': GruStateLayout(
-        'combined', (COMBINED_GRU_STATE_NAME,), combined=True),
-}
-DEFAULT_GRU_STATE_LAYOUT = 'split'
-
-
-class GraphLayout(object):
-    """One complete graph boundary: the feature/state layout pair.
-
-    The two axes are independent but the *version* is not a property of
-    either half, so it is looked up for the pair. Everything downstream --
-    tensor names, arity, metadata, the C version pin -- reads it off here, so
-    a graph cannot be written under one pair and calibrated under another.
-    """
-
-    def __init__(self, feature, gru):
-        self.feature = feature
-        self.gru = gru
-        self.layout_version = LAYOUT_VERSIONS[(feature.label, gru.label)]
-        self.state_names = gru.state_names
-        self.input_names = feature.signal_names + gru.state_names
-        self.output_names = (
-            HEAD_OUTPUT_NAMES + CACHE_OUTPUT_NAMES
-            + tuple(name + '_out' for name in gru.gru_names)
-        )
-
-    @property
-    def signal_inputs(self):
-        return len(self.feature.signal_names)
-
-    def unpack(self, tensors):
-        """One flat ``input_names``-ordered tuple -> its three groups.
-
-        The only place the boundary's arity is turned back into structure, so
-        adding a cache or a feature moves one name tuple and nothing else.
-        """
-        caches = self.signal_inputs + len(CACHE_STATE_NAMES)
-        return (tensors[:self.signal_inputs],
-                tensors[self.signal_inputs:caches],
-                tensors[caches:])
-
-    @property
-    def in_graph_features(self):
-        return self.feature.in_graph
-
-    @property
-    def combined(self):
-        return self.gru.combined
-
-
-# Built once from the version table, so the set of valid boundaries is
-# enumerated in exactly one place and every caller that resolves the same pair
-# gets the same object.
-GRAPH_LAYOUTS = {
-    pair: GraphLayout(FEATURE_LAYOUTS[pair[0]], GRU_STATE_LAYOUTS[pair[1]])
-    for pair in LAYOUT_VERSIONS
-}
-
-
-def resolve_layout(feature_layout=DEFAULT_FEATURE_LAYOUT,
-                   gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
-    """Accept a GraphLayout, or the two axis names, and return the pair."""
-    if isinstance(feature_layout, GraphLayout):
-        return feature_layout
-    try:
-        return GRAPH_LAYOUTS[(feature_layout, gru_state_layout)]
-    except KeyError:
-        raise ValueError('unknown layout %r; expected one of %s'
-                         % ((feature_layout, gru_state_layout),
-                            sorted(GRAPH_LAYOUTS)))
-
-
-DEFAULT_LAYOUT = resolve_layout()
-INPUT_NAMES = DEFAULT_LAYOUT.input_names
-SIGNAL_INPUTS = DEFAULT_LAYOUT.signal_inputs
-
-OUTPUT_NAMES = DEFAULT_LAYOUT.output_names
+INPUT_NAMES = SIGNAL_INPUT_NAMES + STATE_NAMES
+OUTPUT_NAMES = HEAD_OUTPUT_NAMES + STATE_OUTPUT_NAMES
+SIGNAL_INPUTS = len(SIGNAL_INPUT_NAMES)
 
 
 def optimize_graph_file(path):
@@ -483,21 +293,20 @@ def _signed_power(value: Tensor, exponent: float) -> Tensor:
 class AlignUlcnetStreamingExport(nn.Module):
     """Functional, explicit-state twin of ``AlignULCNet.forward_stream``.
 
-    K/V history is newest-first: slot zero is t-1.  Logit history is
-    chronological: slot zero is t-4 and slot three is t-1, matching the
-    causal score convolution's input order.
+    K/V windows are newest-first: slot zero is the current frame, slot ``d`` is
+    ``t - d``.  The logit window is chronological: slot four is the current
+    frame and slot zero is ``t - 4``, matching the causal score convolution's
+    input order.
     """
 
-    def __init__(self, model: nn.Module,
-                 feature_layout=DEFAULT_FEATURE_LAYOUT,
-                 gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
+    input_names = INPUT_NAMES
+    output_names = OUTPUT_NAMES
+    signal_inputs = SIGNAL_INPUTS
+    layout_version = LAYOUT_VERSION
+
+    def __init__(self, model: nn.Module):
         super().__init__()
         self.model = model
-        # The wrapper is the single source of truth for the boundary layout:
-        # every caller reads it back off the wrapper rather than re-deriving
-        # one, so a graph cannot be written with one layout and calibrated
-        # with the other.
-        self.layout = resolve_layout(feature_layout, gru_state_layout)
         self.delay_depth = int(model.max_delay_frames)
         if not MIN_DELAY_DEPTH <= self.delay_depth <= MAX_DELAY_DEPTH:
             # The common way to land here is a config that leaves
@@ -533,30 +342,17 @@ class AlignUlcnetStreamingExport(nn.Module):
         self.n_freqs = int(model.grid.n_freqs)
         self.ta_bins = ta_bins_for(model)
 
-    def forward(self, *tensors: Tensor) -> Tuple[Tensor, ...]:
-        layout = self.layout
+    def forward(self, error_mag: Tensor, far_mag: Tensor, error_cos: Tensor,
+                error_sin: Tensor, key_history: Tensor,
+                value_history: Tensor, logit_history: Tensor,
+                h_gru: Tensor) -> Tuple[Tensor, ...]:
         model = self.model
-        signals, caches, hidden = layout.unpack(tensors)
-        key_history, value_history, logit_history = caches
-        if layout.combined:
-            # One Slice per subband GRU off the shared input, in
-            # GRU_STATE_NAMES order. Views, not copies.
-            combined_hidden, = hidden
-            # dim 1, not dim 0: dim 0 is the singleton N. Slicing dim 0 here
-            # would return the whole tensor and an empty one WITHOUT raising.
-            h_gru0 = combined_hidden[:, :GRU_LAYERS]
-            h_gru1 = combined_hidden[:, GRU_LAYERS:]
-        else:
-            h_gru0, h_gru1 = hidden
-
-        if layout.in_graph_features:
-            # The same fixed math the host layout runs outside, run here
-            # instead -- one implementation, so the two layouts cannot drift.
-            error_mag, far_mag, error_cos, error_sin, error_ri = (
-                stream_features(model, *signals)
-            )
-        else:
-            error_mag, far_mag, error_cos, error_sin = signals
+        depth = self.delay_depth
+        # One Slice per subband GRU off the shared input. dim 1, not dim 0:
+        # dim 0 is the singleton N. Slicing dim 0 here would return the whole
+        # tensor and an empty one WITHOUT raising.
+        h_gru0 = h_gru[:, :GRU_LAYERS]
+        h_gru1 = h_gru[:, GRU_LAYERS:GRU_SUBBANDS * GRU_LAYERS]
 
         error_feature = model.error_encoder(
             model.reorient(error_mag.unsqueeze(1))
@@ -570,23 +366,23 @@ class AlignUlcnetStreamingExport(nn.Module):
         key_now = attention.key(far_feature)
         value_now = attention.value(far_feature)
 
-        # [B,C,D,F], delay slot zero is the current frame. The next K/V
-        # history is the same tensor without its oldest slot, so the ring
-        # shift costs a Slice, not a second Concat.
-        key_window = torch.cat((key_now, key_history), dim=2)
-        value_window = torch.cat((value_now, value_history), dim=2)
-        key_history_out = key_window[:, :, :-1]
-        value_history_out = value_window[:, :, :-1]
+        # [B,C,D,F], delay slot zero is the current frame. The Slice keeps
+        # the D-1 newest slots of the input window and the Concat result is
+        # both the attention candidates and the next window.
+        key_window = torch.cat((key_now, key_history[:, :, :depth - 1]), dim=2)
+        value_window = torch.cat(
+            (value_now, value_history[:, :, :depth - 1]), dim=2)
         key_candidates = key_window.unsqueeze(2)
         value_candidates = value_window.unsqueeze(2)
         logit_now = (
             query_now.unsqueeze(3) * key_candidates
         ).sum(dim=-1)
 
-        # Reproduce StreamConv2dCell: four chronological history frames plus
-        # current logits, frequency-axis padding only, then the raw Conv2d.
-        score_input = torch.cat((logit_history, logit_now), dim=2)
-        logit_history_out = score_input[:, :, 1:]
+        # Reproduce StreamConv2dCell: the four newest chronological frames of
+        # the window plus current logits, frequency-axis padding only, then
+        # the raw Conv2d. The Concat result is the next window.
+        score_input = torch.cat(
+            (logit_history[:, :, 1:SCORE_WINDOW_FRAMES], logit_now), dim=2)
         frequency_total = (attention.score.kf - 1) * attention.score.df
         frequency_left = frequency_total // 2
         score = attention.score.conv(F.pad(
@@ -639,20 +435,15 @@ class AlignUlcnetStreamingExport(nn.Module):
         stage2 = model.stage2_act(model.stage2_norm2(
             model.stage2_conv2(stage2)
         ))
+        # The graph ends at the mask Conv: the host multiplies the compressed
+        # error by it and applies the inverse signed power (host_back_end; C:
+        # ulcnet_model_io_commit).
         output = model.complex_mask(stage2)
-        if layout.in_graph_features:
-            output = host_output(model, apply_mask_ri(error_ri, output))
-        # Otherwise the graph ends at the mask Conv: the host multiplies the
-        # compressed error by it and applies the inverse signed power
-        # (host_back_end; C: ulcnet_model_io_commit).
 
-        heads = (output, key_history_out, value_history_out,
-                 logit_history_out)
-        if layout.combined:
-            # Concatenated in the order it was sliced, which is also the
-            # order ulcnet_model_io.h stores the two hiddens in.
-            return heads + (torch.cat(tuple(hidden_next), dim=1),)
-        return heads + tuple(hidden_next)
+        # Concatenated in the order it was sliced, which is also the order
+        # ulcnet_model_io.h stores the two hiddens in.
+        return (output, key_window, value_window, score_input,
+                torch.cat(tuple(hidden_next), dim=1))
 
 
 def ta_bins_for(model) -> int:
@@ -680,14 +471,12 @@ def state_shapes(delay_depth: int, ta_bins: int) -> Dict[str, Tuple[int, ...]]:
             (MIN_DELAY_DEPTH, MAX_DELAY_DEPTH)
         )
     return {
-        'key_history': (1, TA_CHANNELS, delay_depth - 1, ta_bins),
-        'value_history': (1, TA_CHANNELS, delay_depth - 1, ta_bins),
+        'key_history': (1, TA_CHANNELS, delay_depth, ta_bins),
+        'value_history': (1, TA_CHANNELS, delay_depth, ta_bins),
         'logit_history': (
-            1, TA_CHANNELS, SCORE_HISTORY_FRAMES, delay_depth
+            1, TA_CHANNELS, SCORE_WINDOW_FRAMES, delay_depth
         ),
-        'h_gru0': (1, GRU_LAYERS, 1, GRU_HIDDEN),
-        'h_gru1': (1, GRU_LAYERS, 1, GRU_HIDDEN),
-        COMBINED_GRU_STATE_NAME: (1, 2 * GRU_LAYERS, 1, GRU_HIDDEN),
+        GRU_STATE_NAME: (1, GRU_SUBBANDS * GRU_LAYERS, 1, GRU_HIDDEN),
     }
 
 
@@ -697,7 +486,7 @@ def stream_features(model, error_ri: Tensor, far_ri: Tensor):
     Signed-power compression, magnitudes, and the compressed-domain phase as
     cos/sin -- everything unlearned, in fp32 (C: ulcnet_model_io_prepare).
     Returns ``(error_mag, far_mag, error_cos, error_sin, error_ri)``: the
-    first four are the host layout's graph inputs in INPUT_NAMES order, and
+    first four are the graph's signal inputs in INPUT_NAMES order, and
     ``error_ri`` is the compressed error spectrum the host keeps for
     host_back_end (``graph_signals`` slices it off).
     """
@@ -734,59 +523,41 @@ def host_output(model, compressed_ri: Tensor) -> Tensor:
 
 
 def host_back_end(model, error_ri: Tensor, mask: Tensor) -> Tensor:
-    """Host-side fixed back end of the ``host`` layouts: mask multiply, then
-    inverse signed power (C: ulcnet_model_io_commit)."""
+    """Host-side fixed back end: mask multiply, then inverse signed power
+    (C: ulcnet_model_io_commit)."""
     return host_output(model, apply_mask_ri(error_ri, mask))
 
 
-def graph_signals(model, error_ri: Tensor, far_ri: Tensor,
-                  layout) -> Tuple[Tensor, ...]:
-    """The graph's signal inputs for one frame, from RAW RI spectra.
-
-    The single place that knows how much of the fixed front end a layout
-    leaves outside the graph, so the parity check and the calibration
-    recorder cannot disagree about it.
-    """
-    if layout.in_graph_features:
-        return (error_ri, far_ri)
-    return stream_features(model, error_ri, far_ri)[:layout.signal_inputs]
+def graph_signals(model, error_ri: Tensor, far_ri: Tensor) -> Tuple[Tensor, ...]:
+    """The graph's four signal inputs for one frame, from RAW RI spectra
+    ``(1, 1, n_freqs, 2)``: the part of ``stream_features`` the graph binds.
+    The single place the parity check and the calibration recorder derive
+    them, so the two cannot disagree."""
+    return stream_features(model, error_ri, far_ri)[:SIGNAL_INPUTS]
 
 
-def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int,
-                 layout=DEFAULT_LAYOUT) -> Tuple[Tensor, ...]:
+def dummy_inputs(delay_depth: int, n_freqs: int, ta_bins: int
+                 ) -> Tuple[Tensor, ...]:
     """Trace inputs for one frame. n_freqs and ta_bins have no defaults on
     purpose: a default would let a caller that forgot them trace one grid's
     graph while believing it had another."""
-    layout = resolve_layout(layout)
     shapes = state_shapes(delay_depth, ta_bins)
-    if layout.in_graph_features:
-        signals = (
-            torch.randn(1, 1, n_freqs, 2),         # error (raw RI)
-            torch.randn(1, 1, n_freqs, 2),         # far (raw RI)
-        )
-    else:
-        signals = (
-            torch.randn(1, 1, n_freqs).abs(),          # error_mag
-            torch.randn(1, 1, n_freqs).abs(),          # far_mag
-            torch.randn(1, 1, n_freqs).clamp(-1, 1),   # error_cos
-            torch.randn(1, 1, n_freqs).clamp(-1, 1),   # error_sin
-        )
-    return signals + (
-        torch.zeros(shapes['key_history']),
-        torch.zeros(shapes['value_history']),
-        torch.zeros(shapes['logit_history']),
-    ) + tuple(
-        torch.zeros(shapes[name]) for name in layout.gru.gru_names
+    signals = (
+        torch.randn(1, 1, n_freqs).abs(),          # error_mag
+        torch.randn(1, 1, n_freqs).abs(),          # far_mag
+        torch.randn(1, 1, n_freqs).clamp(-1, 1),   # error_cos
+        torch.randn(1, 1, n_freqs).clamp(-1, 1),   # error_sin
     )
+    return signals + tuple(torch.zeros(shapes[name]) for name in STATE_NAMES)
 
 
 def next_state(outputs: Sequence[Tensor]) -> Tuple[Tensor, ...]:
-    """The caller-held state for the next frame, in whichever layout it is in.
+    """The caller-held state for the next frame.
 
     The graph returns every state tensor in full, in the order the state
     inputs are bound, so the state is the output tail unchanged -- the same
     assignment an in-place runtime performs by binding each ``*_out`` to its
-    input's address. Layout-agnostic: it names no tensor.
+    input's address. It names no tensor.
     """
     return tuple(outputs[len(HEAD_OUTPUT_NAMES):])
 
@@ -813,9 +584,7 @@ def _write_metadata(
     contract: Dict,
     inputs: Sequence[Tensor],
     outputs: Sequence[Tensor],
-    layout=DEFAULT_LAYOUT,
 ) -> Dict:
-    layout = resolve_layout(layout)
     training_far_input_mode = checkpoint_far_input_mode(contract)
     deployed_far_input_mode = DEPLOYED_FAR_INPUT_MODE
     if training_far_input_mode != deployed_far_input_mode:
@@ -827,9 +596,10 @@ def _write_metadata(
     metadata = {
         'model_family': 'Align_ULCNet',
         'boundary': 'stateless_one_frame_full_state',
-        'state_layout_version': layout.layout_version,
-        'feature_layout': layout.feature.label,
-        'gru_state_layout': layout.gru.label,
+        'state_layout_version': LAYOUT_VERSION,
+        'state_binding': STATE_BINDING,
+        'feature_layout': 'host',
+        'gru_state_layout': 'combined',
         'compression_exponent': COMPRESSION_EXPONENT,
         'checkpoint_sha256': file_sha256(checkpoint),
         'sample_rate': model.grid.sample_rate,
@@ -851,10 +621,11 @@ def _write_metadata(
         'cpu_delta_state_update': False,
         'tensor_dtype': 'float32',
         'complex_tensor_policy': 'real_imag_last_dimension',
-        'input_schema': _schema(layout.input_names, inputs),
-        'output_schema': _schema(layout.output_names, outputs),
+        'input_schema': _schema(INPUT_NAMES, inputs),
+        'output_schema': _schema(OUTPUT_NAMES, outputs),
         'k_v_history_order': 'newest_first',
         'logit_history_order': 'oldest_first',
+        'score_window_frames': SCORE_WINDOW_FRAMES,
         'production_streaming_equivalent': True,
         'c_frontend_postprocess': 'Align_ULCNet/ulcnet_process.c',
         'c_model_io_state': 'Align_ULCNet/ulcnet_model_io.c',
@@ -882,8 +653,7 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
     session = ort.InferenceSession(
         output_path, providers=['CPUExecutionProvider']
     )
-    layout = wrapper.layout
-    state = tuple(value.clone() for value in inputs[layout.signal_inputs:])
+    state = tuple(value.clone() for value in inputs[SIGNAL_INPUTS:])
     worst = 0.0
     generator = torch.Generator().manual_seed(20260816)
     with torch.no_grad():
@@ -892,13 +662,12 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
                 wrapper.model,
                 torch.randn(1, 1, wrapper.n_freqs, 2, generator=generator),
                 torch.randn(1, 1, wrapper.n_freqs, 2, generator=generator),
-                layout,
             )
             torch_inputs = signals + state
             expected = wrapper(*torch_inputs)
             actual = session.run(None, {
                 name: value.numpy()
-                for name, value in zip(layout.input_names, torch_inputs)
+                for name, value in zip(INPUT_NAMES, torch_inputs)
             })
             for got, want in zip(actual, expected):
                 worst = max(worst, float(np.max(
@@ -909,8 +678,7 @@ def _verify_onnx(output_path: str, wrapper: nn.Module,
 
 
 def export_graph(model, checkpoint_path, output_path, opset=17,
-                 verify=False, feature_layout=DEFAULT_FEATURE_LAYOUT,
-                 gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
+                 verify=False):
     """Write the streaming graph plus its metadata; optionally verify parity.
 
     Shared by the export CLI and the calib recorder, so the calibration
@@ -926,12 +694,9 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
             'exponent would deploy silently wrong'
             % (float(model.compression_exponent), COMPRESSION_EXPONENT)
         )
-    wrapper = AlignUlcnetStreamingExport(
-        model, feature_layout=feature_layout,
-        gru_state_layout=gru_state_layout).eval()
-    layout = wrapper.layout
+    wrapper = AlignUlcnetStreamingExport(model).eval()
     inputs = dummy_inputs(
-        wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins, layout)
+        wrapper.delay_depth, wrapper.n_freqs, wrapper.ta_bins)
     with torch.no_grad():
         outputs = wrapper(*inputs)
     if not all(torch.isfinite(value).all() for value in outputs):
@@ -942,8 +707,8 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
         wrapper,
         inputs,
         output_path,
-        input_names=list(layout.input_names),
-        output_names=list(layout.output_names),
+        input_names=list(INPUT_NAMES),
+        output_names=list(OUTPUT_NAMES),
         opset_version=opset,
         do_constant_folding=True,
     )
@@ -963,11 +728,13 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
         checkpoint_data['contract'],
         inputs,
         outputs,
-        layout=layout,
     )
     _set_onnx_metadata(graph, metadata)
-    _pin_static_output_shapes(graph, layout.output_names, outputs)
+    _pin_static_output_shapes(graph, OUTPUT_NAMES, outputs)
     graph = _resolve_internal_shapes(graph)
+    validate_inplace_state_contract(
+        graph, STATE_NAMES, STATE_OUTPUT_NAMES,
+        window_inputs=WINDOW_STATE_NAMES)
     onnx.save(graph, output_path)
 
     if verify:
@@ -987,21 +754,6 @@ def main() -> None:
     parser.add_argument('--max-delay-frames', type=int, default=None)
     parser.add_argument('--opset', type=int, default=17)
     parser.add_argument('--verify', action='store_true')
-    parser.add_argument(
-        '--feature-layout', choices=sorted(FEATURE_LAYOUTS),
-        default=DEFAULT_FEATURE_LAYOUT,
-        help="'host' (default, the shipped contract) binds the five "
-             "features the host front end computes; 'graph' binds the two "
-             "raw RI spectra and runs that front end inside the graph "
-             "instead. See LAYOUT_VERSIONS for the resulting version.")
-    parser.add_argument(
-        '--gru-state-layout', choices=sorted(GRU_STATE_LAYOUTS),
-        default=DEFAULT_GRU_STATE_LAYOUT,
-        help="'split' (default, the shipped contract) exports one tensor "
-             "per subband GRU; 'combined' stacks both into one "
-             "(1, 2*layers, 1, hidden) tensor. Every recurrent state is "
-             "rank-4 NCHW either way, matching the attention caches, which "
-             "stay separate in both layouts.")
     args = parser.parse_args()
 
     model, _grid, _linear_contract = load_model(
@@ -1009,9 +761,7 @@ def main() -> None:
     )
     model.eval()
     export_graph(model, args.checkpoint, args.output,
-                 opset=args.opset, verify=args.verify,
-                 feature_layout=args.feature_layout,
-                 gru_state_layout=args.gru_state_layout)
+                 opset=args.opset, verify=args.verify)
     print(args.output)
 
 

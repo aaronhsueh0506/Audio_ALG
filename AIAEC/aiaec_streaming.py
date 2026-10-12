@@ -55,33 +55,35 @@ def assert_streaming_ready(model: nn.Module) -> None:
 class StreamConv2dCell:
     """Streaming context for one time-extended Conv2d.
 
-    Wraps a conv whose offline call pads ``time_left = (kt - 1) * dt`` zeros on
-    the left (and, when ``lookahead > 0``, ``lookahead`` frames on the right).
-    The cell keeps the ``time_left`` most recent *input* frames; ``step``
-    accepts ``[B, C, T_new, F]`` and returns the outputs that become
-    computable.  With ``lookahead == 0`` that is exactly ``T_new`` frames; with
-    ``lookahead == k`` the first ``k`` pushed frames produce nothing and every
-    later push yields the output for ``k`` frames earlier.
+    Wraps a conv whose offline call pads ``(kt - 1) * dt`` zeros on the left.
+    The cell state is the FULL input window of ``retain + 1`` frames, oldest
+    first, with ``retain = (kt - 1) * dt``.  ``step`` takes ``[B, C, T_new, F]``
+    and returns exactly ``T_new`` output frames: the conv input is the state
+    without its oldest frame followed by the new frames, and the next state is
+    the last ``retain + 1`` frames of that input.  For ``T_new == 1`` the next
+    state is therefore the conv input itself, so a graph built from this cell
+    has a Slice on the state input and a Concat producing the state output.
+    The oldest state frame only keeps the in and out shapes identical; it is
+    never read by the conv.
     """
 
     def __init__(self, conv: nn.Conv2d, kt: int, dt: int,
                  freq_left: int, freq_right: int, lookahead: int = 0):
         if conv.stride[0] != 1:
             raise ValueError("streaming cells support time stride 1 only")
-        if lookahead < 0 or lookahead > kt - 1:
-            raise ValueError("lookahead must lie in [0, kt-1]")
+        if lookahead != 0:
+            raise ValueError("streaming cells support causal convs only "
+                             "(lookahead must be 0)")
+        if (kt - 1) * dt < 1:
+            raise ValueError("a conv without temporal context needs no cell")
         self.conv = conv
         self.kt = kt
         self.dt = dt
         self.freq_left = freq_left
         self.freq_right = freq_right
-        self.lookahead = lookahead
-        # Offline pads `time_left` zeros before the first frame -- that is the
-        # initial history.  Between steps the cell must retain the full kernel
-        # span minus one, which is larger than `time_left` when lookahead > 0.
-        self.time_left = (kt - 1) * dt - lookahead
         self.retain = (kt - 1) * dt
-        self._history: Optional[Tensor] = None
+        self.window = self.retain + 1
+        self._window: Optional[Tensor] = None
 
     @classmethod
     def from_causal(cls, module: CausalConv2d) -> "StreamConv2dCell":
@@ -91,37 +93,25 @@ class StreamConv2dCell:
                    freq_left, freq_total - freq_left)
 
     def reset(self) -> None:
-        self._history = None
+        self._window = None
 
     def step(self, x: Tensor) -> Tensor:
         if x.ndim != 4:
             raise ValueError("StreamConv2dCell expects [B,C,T,F]")
-        if self._history is None:
+        if self._window is None:
             b, c, _, f = x.shape
-            self._history = x.new_zeros(b, c, self.time_left, f)
-        window = torch.cat((self._history, x), dim=2)
-        if self.retain > 0:
-            self._history = window[:, :, -self.retain:]
+            self._window = x.new_zeros(b, c, self.window, f)
+        conv_input = torch.cat(
+            (self._window[:, :, 1:self.window], x), dim=2)
+        if conv_input.shape[2] == self.window:
+            self._window = conv_input
         else:
-            self._history = window[:, :, :0]
-        span = (self.kt - 1) * self.dt
-        if window.shape[2] <= span:
-            # Not enough context yet (possible only while lookahead frames
-            # are still pending at stream start).
-            b = x.shape[0]
-            return x.new_zeros(b, self.conv.out_channels, 0,
-                               self._out_freq(x.shape[-1]))
-        padded = F.pad(window, (self.freq_left, self.freq_right, 0, 0))
+            self._window = conv_input[:, :, -self.window:]
+        padded = F.pad(conv_input, (self.freq_left, self.freq_right, 0, 0))
         return self.conv(padded)
 
-    def _out_freq(self, f: int) -> int:
-        eff = f + self.freq_left + self.freq_right
-        kf = self.conv.kernel_size[1]
-        df = self.conv.dilation[1]
-        return (eff - (kf - 1) * df - 1) // self.conv.stride[1] + 1
-
     def state_tensors(self) -> Dict[str, Tensor]:
-        return {} if self._history is None else {"history": self._history}
+        return {} if self._window is None else {"window": self._window}
 
 
 class StreamModuleCell:
@@ -217,9 +207,10 @@ class DelayRingCell:
 class FrameDelayAttentionCell:
     """Streaming twin of :class:`aiaec_common.FrameDelayAttention`.
 
-    State: key ring, value ring (``max_delay_frames`` frames each) and the
-    score conv's four-frame logit history.  The per-frame arithmetic keeps the
-    offline multiply-then-sum order, so outputs match ``forward`` exactly.
+    State: key ring, value ring (``max_delay_frames`` frames each, newest
+    first) and the score conv's five-frame logit window (oldest first).  The
+    per-frame arithmetic keeps the offline multiply-then-sum order, so
+    outputs match ``forward`` exactly.
     """
 
     def __init__(self, attention: FrameDelayAttention):

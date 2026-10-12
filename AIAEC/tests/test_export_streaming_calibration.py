@@ -127,6 +127,19 @@ def test_calibration_and_graph_agree_on_the_d_chain(ulcnet_pair):
     ]
 
 
+def test_calibration_records_the_full_window_inputs(ulcnet_pair):
+    """The recorded state tensors are the graph's full windows, not the
+    history one frame short of them that earlier boundaries carried."""
+    graph_report, capture_report = ulcnet_pair
+    assert capture_report['state_layout_version'] == 18
+    schema = graph_report['input_schema']
+    assert schema['key_history'][2] == DEPTH
+    assert schema['logit_history'][2] == 5
+    assert schema['h_gru'] == [1, 4, 1, 128]
+    for name, shape in schema.items():
+        assert capture_report['inputs'][name]['shape'][1:] == shape, name
+
+
 def test_calibration_report_records_both_far_seams(ulcnet_pair):
     """The report records both provenance fields even when both are raw far.
 
