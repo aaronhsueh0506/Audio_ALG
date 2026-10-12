@@ -372,32 +372,27 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 預設選項**下，直接以 `--print-mem-size` 量到的值。換 backend、換編譯選項、更新
 submodule 都會變。
 
-這一輪 post 路徑拿掉 near-end floor lift，只有它讀的 `e2` scratch（`n_freqs`
-float，16-byte 對齊）跟著離開 carve：`pipeline_bytes` 依 grid 各少一個常數
-（8 kHz 與 16 kHz/256 −528 B、16 kHz/512 −1,040 B、48 kHz −2,064 B），
-`req.bytes` 同步下降；`aec_bytes`/`fft_bytes`/`nr_bytes` 未變。控制區塊為 192 B
-（`ALIGN16(sizeof(AudioPipeline))`；layout 11 的 struct 多兩個 int 而跨到 208 B，
-當時表格未重量，所以相對上表舊值的差額仍恰為 `e2` 一項）。
+控制區塊為 160 B（`ALIGN16(sizeof(AudioPipeline))`）。
 
 | Config | `req.bytes` | `aec_bytes` | `fft_bytes` | `nr_bytes` | `pipeline_bytes` |
 |---|---:|---:|---:|---:|---:|
-| 8000，預設 | 359,824 | 278,256 | 8,784 | 67,424 | 5,168 |
-| 16000，預設（256/128） | 521,744 | 385,440 | 8,784 | 122,160 | 5,168 |
-| 16000，`fft_size=512` | 674,896 | 513,968 | 16,976 | 133,472 | 10,288 |
-| 48000，預設（1024/512） | 1,613,952 | 1,185,536 | 33,360 | 374,336 | 20,528 |
-| 16000，`aec_only=1` | 385,632 | 385,440 | 0 | 0 | 0 |
+| 8000，預設 | 360,992 | 278,256 | 8,784 | 67,504 | 6,288 |
+| 16000，預設（256/128） | 522,912 | 385,440 | 8,784 | 122,240 | 6,288 |
+| 16000，`fft_size=512` | 677,088 | 513,968 | 16,976 | 133,552 | 12,432 |
+| 48000，預設（1024/512） | 1,618,192 | 1,185,536 | 33,360 | 374,416 | 24,720 |
+| 16000，`aec_only=1` | 385,600 | 385,440 | 0 | 0 | 0 |
 
 `req.bytes` 減去四個分項（各自 16-byte 對齊後）的差額，就是 `AudioPipeline`
-控制區塊，本次量測在每一組 config 都是 192 B。
+控制區塊，本次量測在每一組 config 都是 160 B。
 
 #### 4.5a delay_mode 對 16000/預設 grid 的影響（`MATCHED` n=5 為 baseline）
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 521,744 | — |
-| `MATCHED` n=1 | 498,832 | −22,912 |
+| `MATCHED` n=5（預設） | 522,912 | — |
+| `MATCHED` n=1 | 500,000 | −22,912 |
 | `FIXED`，`fixed_delay_samples=1600`（100 ms） | 363,648 | −158,096 |
-| `EXTERNAL_ALIGNED` | 356,736 | −165,008 |
+| `EXTERNAL_ALIGNED` | 357,904 | −165,008 |
 
 這四列的差額全部落在 `aec_bytes`（`delay_mode`/`delay_num_filters` 不影響
 FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` 一致

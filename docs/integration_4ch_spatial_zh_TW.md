@@ -479,17 +479,14 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 | `geometry` 與座標 | 不變 |
 
 `BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設下的 `req.bytes`
-（本次 checkout，`layout_version=14`；最後一欄標明每一列的來源）。本輪
-`sizeof(Aec)` 由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數
-（16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B），四路即四倍，
-每一列都跟著移動：
+（本次 checkout，`layout_version=14`；最後一欄標明每一列的來源）：
 
 | Config | `req.bytes` | 來源 |
 |---|---:|---|
-| 16000，全預設（256/128，`num_angles=72`） | 1,928,608 | 實測 |
-| 16000，`core.fft_size = 512` | 3,259,920 | 實測 |
-| 16000，`num_angles = 360` | 4,930,720 | 實測（直接呼叫 `get_mem_requirements()`）|
-| 48000，全預設（1024/512，`num_angles=72`） | 6,880,272 | 實測 |
+| 16000，全預設（256/128，`num_angles=72`） | 1,928,224 | 實測 |
+| 16000，`core.fft_size = 512` | 3,259,024 | 實測 |
+| 16000，`num_angles = 360` | 4,930,336 | 實測（直接呼叫 `get_mem_requirements()`）|
+| 48000，全預設（1024/512，`num_angles=72`） | 6,878,352 | 實測 |
 
 ⚠ 覆蓋差異：只有 `num_angles = 72` 的 16 kHz/256 與 48 kHz/1024 兩組會被
 C 關卡自動驗證（static smoke 各印一次 `Total:` bytes）。`core.fft_size = 512`
