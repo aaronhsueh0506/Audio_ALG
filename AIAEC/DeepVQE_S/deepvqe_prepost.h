@@ -15,9 +15,9 @@
  * in both I/O modes. There is no variable emission count to loop over.
  *
  * FRAMING: this class analyses at center=False -- a plain rolling window over
- * the last AIAEC_N_FFT samples, one frame per hop. It is NOT
- * aiaec_analysis_push's centered (center=True) schedule, which emits 0 frames
- * on the first hop and TWO on the second to carry a reflect prefix.
+ * the last AIAEC_N_FFT samples, one frame per hop (AcStft with center 0). It
+ * is NOT the centered (center 1) schedule, which emits 0 frames on the first
+ * hop and TWO on the second to carry a reflect prefix.
  *
  * That is a re-labelling, not a change of signal. At this geometry
  * (win == n_fft, hop == n_fft/2, one shared sqrt-Hann table) centered frame k
@@ -82,8 +82,8 @@
 
 #include "deepvqe_process.h"   /* DeepVqeCcmState, DEEPVQE_TIME_ORDER,
                                 * DEEPVQE_FREQ_TAPS and (transitively)
-                                * aiaec_process.h: the grid, AiaecAnalysis/
-                                * AiaecSynthesis and FftHandle             */
+                                * aiaec_process.h: the grid, AcStft/AcIstft
+                                * and FftHandle                           */
 
 #ifdef __cplusplus
 extern "C" {
@@ -109,7 +109,7 @@ extern "C" {
 #define DEEPVQE_PREPOST_ALIGNMENT      16u
 /* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
  * so a pool recorded by the previous carve is refused on the hash, not only
- * on `bytes`. 2: the TIME analyses became two AiaecAnalysis states.
+ * on `bytes`. 2: the TIME analyses became two analysis states.
  * 3: one state set, with no second bank.
  * 4: the conv and score regions hold full windows (4 and 5 frames) and h_gru
  *    is rank 4. */
@@ -201,7 +201,7 @@ typedef struct DeepVqePrepostConfig {
     FftHandle   *fft;          /* DEEPVQE_IO_TIME: required, borrowed       */
     const float *window;       /* DEEPVQE_IO_TIME: required, borrowed,
                                 * AIAEC_N_FFT entries from
-                                * aiaec_make_window()                       */
+                                * ac_window_build()                          */
 } DeepVqePrepostConfig;
 
 /* The compiled model ABI, for validating against a graph's ONNX/JSON

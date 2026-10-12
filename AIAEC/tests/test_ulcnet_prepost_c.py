@@ -202,6 +202,24 @@ static float out_a[HOPS * ULCNET_HOP];
 static float out_b[HOPS * ULCNET_HOP];
 static float window[ULCNET_N_FFT];
 
+/* The reference framing objects, built the way a host builds them: the
+ * shared handle and window table in the config, one aligned block each. */
+static AcStft *make_centered(FftHandle *fft) {
+    AcStftConfig sc;
+    size_t bytes;
+    ulcnet_framing_config(&sc, fft, window, 1);
+    bytes = ac_stft_get_mem_size(&sc);
+    return bytes ? ac_stft_init(alloc_aligned(16u, bytes), bytes, &sc) : NULL;
+}
+
+static AcIstft *make_synthesis(FftHandle *fft) {
+    AcStftConfig sc;
+    size_t bytes;
+    ulcnet_framing_config(&sc, fft, window, 0);
+    bytes = ac_istft_get_mem_size(&sc);
+    return bytes ? ac_istft_init(alloc_aligned(16u, bytes), bytes, &sc) : NULL;
+}
+
 
 /* center=False rolling analysis: one frame per hop, over the last N_FFT
  * samples. Deliberately expression-for-expression the same as
@@ -232,8 +250,8 @@ static int case_equiv(FftHandle *fft) {
     UlcnetModelIoState *state;
     void *state_mem, *pool;
     static float hist_error[ULCNET_N_FFT], hist_far[ULCNET_N_FFT];
-    static UlcnetSynthesis synthesis;
-    static UlcnetAnalysis centered;
+    AcIstft *synthesis;
+    AcStft *centered;
     UlcnetPrepostConfig cfg;
     UlcnetPrepostMemReq req;
     UlcnetPrepost *p;
@@ -249,8 +267,9 @@ static int case_equiv(FftHandle *fft) {
     CHECK(state != NULL);
     memset(hist_error, 0, sizeof hist_error);
     memset(hist_far, 0, sizeof hist_far);
-    CHECK(ulcnet_synthesis_init(&synthesis, fft, window) == 0);
-    CHECK(ulcnet_analysis_init(&centered, fft, window) == 0);
+    synthesis = make_synthesis(fft);
+    centered = make_centered(fft);
+    CHECK(synthesis != NULL && centered != NULL);
     for (hop = 0; hop < HOPS; ++hop) {
         static float error_re[ULCNET_BINS], error_im[ULCNET_BINS];
         static float far_re[ULCNET_BINS], far_im[ULCNET_BINS];
@@ -270,9 +289,10 @@ static int case_equiv(FftHandle *fft) {
          * bit-identical to non-centered frame k-1"), pinned here rather
          * than asserted: the centered analysis's LAST frame on every hop is
          * memcmp-equal to the rolling frame of the same hop, on the real
-         * ulcnet_analysis_push and its documented 0 / 2 / 1 schedule. */
-        centered_frames = ulcnet_analysis_push(
-            &centered, pcm_error + (size_t)hop * ULCNET_HOP, c_re, c_im);
+         * centered AcStft and its documented 0 / 2 / 1 schedule. */
+        centered_frames = ac_stft_push_planar(
+            centered, pcm_error + (size_t)hop * ULCNET_HOP,
+            &c_re[0][0], &c_im[0][0]);
         CHECK(centered_frames == (hop == 0 ? 0 : hop == 1 ? 2 : 1));
         if (centered_frames > 0) {
             CHECK(identical(c_re[centered_frames - 1], error_re, ULCNET_BINS));
@@ -292,8 +312,8 @@ static int case_equiv(FftHandle *fft) {
         }
         /* One frame per hop: nothing on hop 0 (its block lies inside the
          * trimmed half window), a full hop from hop 1 on. */
-        wrote = ulcnet_synthesis_push(&synthesis, enhanced_re,
-                                      enhanced_im, slot);
+        wrote = ac_istft_push_planar(synthesis, enhanced_re,
+                                     enhanced_im, slot);
         CHECK(wrote == (hop == 0 ? 0 : ULCNET_HOP));
         if (wrote == 0) memset(slot, 0, (size_t)ULCNET_HOP * sizeof(float));
     }
@@ -334,7 +354,7 @@ static int case_freq(FftHandle *fft) {
     UlcnetPrepost *p_time, *p_freq;
     void *pool_time, *pool_freq;
     static float hist_error[ULCNET_N_FFT], hist_far[ULCNET_N_FFT];
-    static UlcnetSynthesis synthesis;
+    AcIstft *synthesis;
     int hop;
 
     CHECK(ulcnet_prepost_config_defaults(&cfg_time, ULCNET_IO_TIME, D) == 0);
@@ -357,7 +377,8 @@ static int case_freq(FftHandle *fft) {
      * one frame per hop, the same center=False convention the class uses. */
     memset(hist_error, 0, sizeof hist_error);
     memset(hist_far, 0, sizeof hist_far);
-    CHECK(ulcnet_synthesis_init(&synthesis, fft, window) == 0);
+    synthesis = make_synthesis(fft);
+    CHECK(synthesis != NULL);
     for (hop = 0; hop < HOPS; ++hop) {
         static float error_re[ULCNET_BINS], error_im[ULCNET_BINS];
         static float far_re[ULCNET_BINS], far_im[ULCNET_BINS];
@@ -379,8 +400,8 @@ static int case_freq(FftHandle *fft) {
                                                enhanced_im) == 0);
         /* One frame per hop: nothing on hop 0 (its block lies inside the
          * trimmed half window), a full hop from hop 1 on. */
-        wrote = ulcnet_synthesis_push(&synthesis, enhanced_re,
-                                      enhanced_im, slot);
+        wrote = ac_istft_push_planar(synthesis, enhanced_re,
+                                     enhanced_im, slot);
         CHECK(wrote == (hop == 0 ? 0 : ULCNET_HOP));
         if (wrote == 0) memset(slot, 0, (size_t)ULCNET_HOP * sizeof(float));
     }
@@ -426,8 +447,23 @@ static int case_freqpool(FftHandle *fft) {
            100.0 * (double)(req_time.bytes - req_freq.bytes) /
                (double)req_time.bytes);
 
-    /* IO_FREQ must not pay for the framing machinery it never runs. */
+    /* IO_FREQ must not pay for the framing machinery it never runs: the
+     * difference is exactly the output hop staging and the three framing
+     * objects, sized here by audio_common with the caller's handle and
+     * window. */
     CHECK(req_freq.bytes < req_time.bytes);
+    {
+        AcStftConfig sc;
+        size_t a, s;
+        ulcnet_framing_config(&sc, fft, window, 0);
+        a = ac_stft_get_mem_size(&sc);
+        s = ac_istft_get_mem_size(&sc);
+        CHECK(a != 0 && s != 0);
+#define A16(x) (((size_t)(x) + 15u) / 16u * 16u)
+        CHECK(req_time.bytes - req_freq.bytes ==
+              A16((size_t)ULCNET_HOP * sizeof(float)) + 2u * A16(a) + A16(s));
+#undef A16
+    }
     CHECK(req_freq.io_mode == (uint32_t)ULCNET_IO_FREQ);
     CHECK(req_time.io_mode == (uint32_t)ULCNET_IO_TIME);
     CHECK(req_freq.build_flags_hash != req_time.build_flags_hash);
@@ -1043,7 +1079,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <case>\n", argv[0]);
         return 2;
     }
-    ulcnet_make_window(window);
+    ac_window_build(window, ULCNET_N_FFT);
     fill_pcm(pcm_error, pcm_far, HOPS * ULCNET_HOP);
     fft = make_fft(ULCNET_N_FFT, &fft_mem);
     CHECK(fft != NULL);

@@ -7,52 +7,6 @@ static float aiaec_signed_pow(float value, float exponent) {
     return value < 0.0f ? -magnitude : magnitude;
 }
 
-void aiaec_make_window(float window[AIAEC_N_FFT]) {
-    ulcnet_make_window(window);
-}
-
-int aiaec_analysis_init(AiaecAnalysis *state, FftHandle *fft,
-                        const float *window) {
-    return ulcnet_analysis_init(state, fft, window);
-}
-
-int aiaec_analysis_push(AiaecAnalysis *state,
-                        const float input[AIAEC_HOP],
-                        float real[2][AIAEC_N_BINS],
-                        float imag[2][AIAEC_N_BINS]) {
-    return ulcnet_analysis_push(state, input, real, imag);
-}
-
-int aiaec_analysis_flush(AiaecAnalysis *state,
-                         float real[2][AIAEC_N_BINS],
-                         float imag[2][AIAEC_N_BINS]) {
-    return ulcnet_analysis_flush(state, real, imag);
-}
-
-int aiaec_analysis_push_frame(AiaecAnalysis *state,
-                              const float input[AIAEC_HOP],
-                              float real[AIAEC_N_BINS],
-                              float imag[AIAEC_N_BINS]) {
-    return ulcnet_analysis_push_frame(state, input, real, imag);
-}
-
-int aiaec_synthesis_init(AiaecSynthesis *state, FftHandle *fft,
-                         const float *window) {
-    return ulcnet_synthesis_init(state, fft, window);
-}
-
-int aiaec_synthesis_push(AiaecSynthesis *state,
-                         const float real[AIAEC_N_BINS],
-                         const float imag[AIAEC_N_BINS],
-                         float output[AIAEC_HOP]) {
-    return ulcnet_synthesis_push(state, real, imag, output);
-}
-
-int aiaec_synthesis_flush(AiaecSynthesis *state,
-                          float output[AIAEC_N_FFT]) {
-    return ulcnet_synthesis_flush(state, output);
-}
-
 void aiaec_apply_complex_mask(const float input_re[AIAEC_N_BINS],
                               const float input_im[AIAEC_N_BINS],
                               const float mask_re[AIAEC_N_BINS],

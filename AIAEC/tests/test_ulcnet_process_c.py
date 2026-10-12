@@ -1,7 +1,9 @@
 """Parity gate for the Align-ULCNet C pre/post-processing.
 
 Compiles AIAEC/Align_ULCNet/ulcnet_process.c with a tiny file-driven test
-main (written to a temp dir, never to the repo), runs it on random audio and
+main (written to a temp dir, never to the repo) that drives audio_common's
+AcStft / AcIstft in the ulcnet configuration (ulcnet_framing_config: centered
+analysis, envelope-normalised synthesis), runs it on random audio and
 compares, frame by frame and sample by sample, against the Python reference
 (aiaec_streaming.StreamSTFT/StreamISTFT), which is itself the bit-exact twin
 of torch.stft/istft(center=True).
@@ -50,48 +52,59 @@ _DRIVER = r'''
 /* argv: mode in.f32 out.f32
  * mode "analysis":  in = raw samples -> out = frames (re[257] im[257] each)
  * mode "roundtrip": in = raw samples -> out = analysis->synthesis samples
- * One shared FftHandle drives BOTH the analysis and the synthesis (their
- * use is strictly sequential), matching the pipelines' sharing contract. */
+ * One shared FftHandle and window table drive BOTH the centered analysis
+ * and the synthesis (their use is strictly sequential), matching the
+ * pipelines' sharing contract. */
+static void *block(size_t bytes) {
+    void *mem = NULL;
+    if (posix_memalign(&mem, 16, bytes) != 0) exit(6);
+    return mem;
+}
+
 int main(int argc, char **argv) {
     if (argc != 4) return 2;
     FILE *fi = fopen(argv[2], "rb"), *fo = fopen(argv[3], "wb");
     if (!fi || !fo) return 3;
-    static UlcnetAnalysis an;
-    static UlcnetSynthesis sy;
-    static float win[ULCNET_N_FFT];
     FftHandle *fft = fft_create(ULCNET_N_FFT);  /* heap OK in a test driver */
+    static float win[ULCNET_N_FFT];
+    AcStftConfig cfg;
     if (!fft) return 4;
-    ulcnet_make_window(win);
-    if (ulcnet_analysis_init(&an, fft, win) != 0) return 5;
-    if (ulcnet_synthesis_init(&sy, fft, win) != 0) return 5;
+    ac_window_build(win, ULCNET_N_FFT);
+    ulcnet_framing_config(&cfg, fft, win, 1);
+    size_t an_bytes = ac_stft_get_mem_size(&cfg);
+    size_t sy_bytes = ac_istft_get_mem_size(&cfg);
+    if (an_bytes == 0 || sy_bytes == 0) return 5;
+    AcStft *an = ac_stft_init(block(an_bytes), an_bytes, &cfg);
+    AcIstft *sy = ac_istft_init(block(sy_bytes), sy_bytes, &cfg);
+    if (!an || !sy) return 5;
     int roundtrip = argv[1][0] == 'r';
     float hop[ULCNET_HOP];
-    float fre[2][ULCNET_BINS], fim[2][ULCNET_BINS];
+    float fre[2 * ULCNET_BINS], fim[2 * ULCNET_BINS];
     float out[ULCNET_N_FFT];
     while (fread(hop, sizeof(float), ULCNET_HOP, fi) == ULCNET_HOP) {
-        int n = ulcnet_analysis_push(&an, hop, fre, fim);
+        int n = ac_stft_push_planar(an, hop, fre, fim);
         for (int f = 0; f < n; ++f) {
+            const float *re = fre + f * ULCNET_BINS, *im = fim + f * ULCNET_BINS;
             if (roundtrip) {
-                int m = ulcnet_synthesis_push(&sy, fre[f], fim[f], out);
+                int m = ac_istft_push_planar(sy, re, im, out);
                 fwrite(out, sizeof(float), (size_t)m, fo);
             } else {
-                fwrite(fre[f], sizeof(float), ULCNET_BINS, fo);
-                fwrite(fim[f], sizeof(float), ULCNET_BINS, fo);
+                fwrite(re, sizeof(float), ULCNET_BINS, fo);
+                fwrite(im, sizeof(float), ULCNET_BINS, fo);
             }
         }
     }
-    int n = ulcnet_analysis_flush(&an, fre, fim);
-    for (int f = 0; f < n; ++f) {
+    if (ac_stft_flush_planar(an, fre, fim) == 1) {
         if (roundtrip) {
-            int m = ulcnet_synthesis_push(&sy, fre[f], fim[f], out);
+            int m = ac_istft_push_planar(sy, fre, fim, out);
             fwrite(out, sizeof(float), (size_t)m, fo);
         } else {
-            fwrite(fre[f], sizeof(float), ULCNET_BINS, fo);
-            fwrite(fim[f], sizeof(float), ULCNET_BINS, fo);
+            fwrite(fre, sizeof(float), ULCNET_BINS, fo);
+            fwrite(fim, sizeof(float), ULCNET_BINS, fo);
         }
     }
     if (roundtrip) {
-        int m = ulcnet_synthesis_flush(&sy, out);
+        int m = ac_istft_flush(sy, out);
         fwrite(out, sizeof(float), (size_t)m, fo);
     }
     fclose(fi); fclose(fo);

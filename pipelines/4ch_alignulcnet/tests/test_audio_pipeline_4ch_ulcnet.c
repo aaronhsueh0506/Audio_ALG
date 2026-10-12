@@ -147,7 +147,7 @@ static int reprime_take(int* armed, int frames) {
  * 1. Identity E2E: direct GSC -> model -> synthesis chain + 1-hop latency
  *    contract. The reference is synthesised by the TEST from the spectra the
  *    pipeline hands the model (a capture model that also returns the
- *    identity), through the test's own UlcnetSynthesis: a bit-identical
+ *    identity), through the test's own AcIstft: a bit-identical
  *    output proves the chain adds nothing between the model's frame and the
  *    WOLA, and the call count proves every hop from hop #0 is exactly one
  *    inference. FIXED delay 0 keeps the run boundary-free (asserted), so no
@@ -185,9 +185,8 @@ static int test_identity_e2e(void) {
     AudioPipeline4ChUlcnet* p;
     CaptureModel m;
     UlcnetModel model;
-    UlcnetSynthesis ref_synth;
-    FftHandle* ref_fft;
-    float ref_window[ULCNET_N_FFT];
+    AcIstft* ref_synth;
+    void* ref_mem = NULL;
     float* microphones;
     float* far;
     float* out;
@@ -225,12 +224,17 @@ static int test_identity_e2e(void) {
     CHECK(audio_pipeline_4ch_ulcnet_set_model(p, &model) == 0,
           "install capture model");
 
-    /* The test's own synthesis: the same window table, its own handle. */
-    ref_fft = fft_create(ULCNET_N_FFT);
-    CHECK(ref_fft != NULL, "create reference FFT handle");
-    ulcnet_make_window(ref_window);
-    CHECK(ulcnet_synthesis_init(&ref_synth, ref_fft, ref_window) == 0,
-          "init reference synthesis");
+    /* The test's own synthesis: its own handle and window table. */
+    {
+        AcStftConfig sc;
+        size_t ref_bytes;
+        ulcnet_framing_config(&sc, NULL, NULL, 0);
+        ref_bytes = ac_istft_get_mem_size(&sc);
+        CHECK(ref_bytes != 0 && posix_memalign(&ref_mem, 16, ref_bytes) == 0,
+              "allocate reference synthesis");
+        ref_synth = ac_istft_init(ref_mem, ref_bytes, &sc);
+        CHECK(ref_synth != NULL, "init reference synthesis");
+    }
 
     microphones = (float*)malloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
@@ -268,7 +272,7 @@ static int test_identity_e2e(void) {
 
         /* The reference: the frame the model saw, through the test's own
          * synthesis. Same arithmetic on the same history -> bit-identical. */
-        ref_wrote = ulcnet_synthesis_push(&ref_synth, m.re, m.im, ref);
+        ref_wrote = ac_istft_push_planar(ref_synth, m.re, m.im, ref);
         if (frame == 0) {
             CHECK(ref_wrote == 0, "reference emits nothing on hop #0");
             for (int i = 0; i < hop; ++i) {
@@ -299,7 +303,7 @@ static int test_identity_e2e(void) {
     CHECK(max_ref > 1e-3f, "beamformed error is non-trivial");
 
     audio_pipeline_4ch_ulcnet_destroy(p);
-    fft_destroy(ref_fft);
+    free(ref_mem);
     free(ref);
     free(out);
     free(far);

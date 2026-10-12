@@ -9,14 +9,13 @@
  *        already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis
  *        frame of the current hop that the Align-ULCNet chain would
  *        compute, so there is no reconstruction and no re-analysis between
- *     -> far branch: the caller's raw far from the same hop through
- *        ulcnet_analysis_push_frame -- the same
- *        one-frame-per-hop framing -- so both branches carry the SAME
+ *     -> far branch: the caller's raw far from the same hop through a
+ *        rolling AcStft -- the same one-frame-per-hop framing -- so both branches carry the SAME
  *        input hop with no delay buffer
  *     -> UlcnetModel callback, exactly once per hop from hop #0 (skipped
  *        only during the post-boundary identity reprime; fail-open identity
  *        when unset/error/non-finite)
- *     -> UlcnetSynthesis -> out
+ *     -> AcIstft synthesis -> out
  *
  * The core's pending pre frame is released with four_aec_nr_res_abandon_pre;
  * no process_post() variant ever runs (the ULCNet chain replaces it).
@@ -73,15 +72,16 @@ struct AudioPipeline4ChUlcnet {
      * per ulcnet_process.h's sharing contract). */
     FftHandle* fft;
 
-    /* Align-ULCNet chain state + per-hop frame scratch (fixed-size structs,
-     * part of `self` in the carve). The chain structs embed their own
-     * per-call FFT scratch and point at the shared window table below.
-     * There is no error-branch analysis: the GSC spectrum IS the error
-     * frame, de-interleaved into err_re/err_im for the model callback. */
-    UlcnetAnalysis far_analysis;
-    UlcnetSynthesis synthesis;
+    /* Align-ULCNet chain: two framing objects carved from the pool (each
+     * with its own per-call FFT scratch, borrowing the shared handle above
+     * and the window table below) plus the per-hop frame scratch, which is
+     * part of `self` in the carve. There is no error-branch analysis: the
+     * GSC spectrum IS the error frame, de-interleaved into err_re/err_im for
+     * the model callback. */
+    AcStft  *far_analysis;
+    AcIstft *synthesis;
     float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table for both
-                                         * chain structs (self-owned) */
+                                         * framing objects (self-owned) */
     float err_re[ULCNET_BINS];
     float err_im[ULCNET_BINS];
     float far_re[ULCNET_BINS];
@@ -296,7 +296,7 @@ static uint32_t audio_pipeline_4ch_ulcnet_build_flags_hash(
     hash = fnv1a_str(
         "|carve:self(corecfg-delay-v2,ulcnet-direct,model(io_descriptor),"
         "reprime,ulcnet_window,frame),"
-        "core,srp,gsc,gsc_spectrum,gsc_weights,fft",
+        "core,srp,gsc,gsc_spectrum,gsc_weights,fft,far_analysis,synthesis",
         hash);
     /* The grid is a build parameter now, so it cannot be spelled into the
      * token as a literal: stringify the macros instead, or two builds on
@@ -414,6 +414,20 @@ static int derive_spatial_configs(
  * Memory sizing -- compute once, reuse in get_mem_requirements()/init_ex()
  * ========================================================================== */
 
+/* Bytes of the far analysis (is_synthesis 0) or the synthesis (1) object on
+ * the shared handle and window table: the size of the object that carves its
+ * own, less those two regions. The shared handle exists only after the pool
+ * does, so the size cannot be asked for it directly. */
+static size_t framing_bytes(int is_synthesis) {
+    AcStftConfig sc;
+    size_t own, shared;
+    ulcnet_framing_config(&sc, NULL, NULL, 0);
+    own = is_synthesis ? ac_istft_get_mem_size(&sc) : ac_stft_get_mem_size(&sc);
+    shared = ck_align16_size(fft_get_mem_size(ULCNET_N_FFT)) +
+             ck_align16_size((size_t)ULCNET_N_FFT * sizeof(float));
+    return own > shared ? own - shared : 0;
+}
+
 static int derive_pipeline_layout(
     const AudioPipeline4ChConfig* cfg,
     AudioPipeline4ChConfig* cfg_forced,
@@ -482,6 +496,9 @@ int audio_pipeline_4ch_ulcnet_get_mem_requirements(
     total = ck_field_size(
         total, spectral_count, sizeof(Complex));        /* gsc_weights */
     total = ck_add_size(total, ck_align16_size(fft_bytes));  /* fft */
+    if (framing_bytes(0) == 0 || framing_bytes(1) == 0) return -1;
+    total = ck_add_size(total, ck_align16_size(framing_bytes(0)));  /* far_analysis */
+    total = ck_add_size(total, ck_align16_size(framing_bytes(1)));  /* synthesis */
 
     if (MEM_SIZE_INVALID(total)) return -1;
 
@@ -521,6 +538,8 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     void* srp_region;
     void* gsc_region;
     void* fft_region;
+    void* region;
+    AcStftConfig sc;
     size_t spectral_count;
 
     if (!mem || !cfg) return NULL;
@@ -595,10 +614,15 @@ AudioPipeline4ChUlcnet* audio_pipeline_4ch_ulcnet_init_ex(
     /* The chain uses the handle carved above (same compiled grid; strictly
      * sequential use per hop). Reject-first: the inits re-check the
      * handle's bin count against the compiled ULCNet grid. */
-    ulcnet_make_window(p->ulcnet_window);
-    if (ulcnet_analysis_init(&p->far_analysis, p->fft, p->ulcnet_window) != 0 ||
-        ulcnet_synthesis_init(&p->synthesis, p->fft, p->ulcnet_window) != 0)
-        return NULL;
+    ac_window_build(p->ulcnet_window, ULCNET_N_FFT);
+    ulcnet_framing_config(&sc, p->fft, p->ulcnet_window, 0);
+    region = pool_carve(&cursor, 1, framing_bytes(0));
+    if (!region) return NULL;
+    p->far_analysis = ac_stft_init(region, framing_bytes(0), &sc);
+    region = pool_carve(&cursor, 1, framing_bytes(1));
+    if (!region) return NULL;
+    p->synthesis = ac_istft_init(region, framing_bytes(1), &sc);
+    if (!p->far_analysis || !p->synthesis) return NULL;
 
     memset(&p->model, 0, sizeof(p->model));   /* fail-open until set_model */
     memset(&p->last_delay, 0, sizeof(p->last_delay));
@@ -738,8 +762,8 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
         p->err_re[k] = p->gsc_spectrum[k].r;
         p->err_im[k] = p->gsc_spectrum[k].i;
     }
-    (void)ulcnet_analysis_push_frame(
-        &p->far_analysis, far_reference, p->far_re, p->far_im);
+    (void)ac_stft_push_planar(
+        p->far_analysis, far_reference, p->far_re, p->far_im);
 
     /* All PreFrame pointers consumed -- release the core's pending frame
      * (no process_post() variant ever runs in this pipeline). */
@@ -769,7 +793,7 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
             spec_im = p->enh_im;
         }
     }
-    written = ulcnet_synthesis_push(&p->synthesis, spec_re, spec_im, out);
+    written = ac_istft_push_planar(p->synthesis, spec_re, spec_im, out);
     if (written == 0) {
         /* hop#0: frame #0's block lies inside the synthesis's trimmed half
          * window; the caller-facing contract is zeros. */
@@ -794,11 +818,10 @@ void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p) {
     four_aec_nr_res_reset(p->core);   /* invalidates any pending pre frame */
     srp_reset(p->srp);
     gsc_reset(p->gsc);
-    /* Re-init keeps the same shared handle/window (pool/instance resident,
-     * untouched by reset); cannot fail for a handle already validated at
-     * init time. */
-    (void)ulcnet_analysis_init(&p->far_analysis, p->fft, p->ulcnet_window);
-    (void)ulcnet_synthesis_init(&p->synthesis, p->fft, p->ulcnet_window);
+    /* The objects keep the shared handle and window (pool/instance resident,
+     * untouched by reset); reset clears their history. */
+    ac_stft_reset(p->far_analysis);
+    ac_istft_reset(p->synthesis);
     memset(&p->last_delay, 0, sizeof(p->last_delay));
     p->frame_index = 0;
     /* The analysis history is zeroed above, so nothing emitted after this

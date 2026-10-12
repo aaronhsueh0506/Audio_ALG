@@ -35,26 +35,19 @@
  * full complex FFT), and twiddles are precomputed once inside the handle,
  * never per call. Agreement vs Python is float-ULP class (~1e-5 absolute at
  * ULCNET_N_FFT points), not bit-exact. Regression gate:
- * AIAEC/tests/test_ulcnet_process_c.py (compiles this file with cc, links
- * libaudio_common.a BACKEND=kiss, compares frame by frame vs Python).
+ * AIAEC/tests/test_ulcnet_process_c.py (drives AcStft / AcIstft in the
+ * ulcnet configuration, links libaudio_common.a, compares frame by frame vs
+ * Python).
  *
- * Memory contract: all state is caller-owned plain structs -- zero heap,
- * zero global state, and NO big stack frames: the per-call FFT scratch is
- * embedded in the structs (a stack-local scratch would take ~6.2 KB in the
- * analysis push and ~4.2 KB in the synthesis push, too much for an embedded
- * RTOS task stack). The FftHandle and the sqrt-Hann window table
- * are caller-owned and SHARED: one ULCNET_N_FFT-point handle may serve
- * err-analysis + far-analysis + synthesis, whose transforms are strictly
- * sequential within a hop (the handle is never used concurrently), and one
- * window table serves every struct (structs store const pointers only; the
- * caller keeps handle and table alive, and the table unchanged, for the
- * structs' whole lifetime).
- *
- * Standalone compile (the pytest harness uses these same lines):
- *   make -s -C ../audio_common BACKEND=kiss lib
- *   cc -O2 -std=c99 -ffp-contract=off -I AIAEC/Align_ULCNet \
- *      -I ../audio_common/include -c AIAEC/Align_ULCNet/ulcnet_process.c
- *   (link: $(make -s -C ../audio_common BACKEND=kiss print-lib-path) -lm)
+ * Memory contract: the framing state lives in AcStft / AcIstft objects built
+ * on caller memory -- zero heap, zero global state, and no big stack frames
+ * (the per-call FFT scratch is inside the objects). The FftHandle and the
+ * sqrt-Hann window table are caller-owned and SHARED: one ULCNET_N_FFT-point
+ * handle serves err-analysis + far-analysis + synthesis, whose transforms are
+ * strictly sequential within a hop (the handle is never used concurrently),
+ * and one window table serves every object (objects store const pointers
+ * only; the caller keeps handle and table alive, and the table unchanged, for
+ * the objects' whole lifetime).
  *
  * 不包含（porting 時的其他件）:
  *   - NPU graph 與其顯式 states（K/V ring / logit 史 / GRU h）—
@@ -67,7 +60,7 @@
 #ifndef ULCNET_PROCESS_H
 #define ULCNET_PROCESS_H
 
-#include "fft_wrapper.h"     /* FftHandle, Complex (audio_common)          */
+#include "audio_stft.h"      /* AcStft, AcIstft, FftHandle, Complex (audio_common) */
 #include "ulcnet_model_io.h" /* UlcnetModelIoDescriptor + UlcnetFarInputMode
                               * -- a stddef/stdint-only leaf header; the
                               * UlcnetModel boundary below publishes the
@@ -105,111 +98,25 @@ extern "C" {
  * ulcnet_model_io.h 的部署契約常數;此名稱保留給既有呼叫端。 */
 #define ULCNET_COMPRESSION_EXP ULCNET_MODEL_IO_COMPRESSION_EXP
 
-/* ---- Shared sqrt-Hann window ----
- * Both analyses and the synthesis use the SAME table; build it once into
- * caller-owned storage and pass the pointer to every *_init below.
- * Ownership: the caller keeps the array alive AND unchanged for the
- * lifetime of every struct initialized with it -- the structs store only
- * the const pointer, never a copy. Formula matches the Python reference's periodic
- * sqrt-Hann bit-for-bit at f32. */
-void ulcnet_make_window(float window[ULCNET_N_FFT]);
-
-/* ---- Analysis: centered sqrt-Hann STFT, 每 hop 進 ULCNET_HOP 樣本 ---- */
-typedef struct UlcnetAnalysis {
-    const float *window;           /* caller-owned shared sqrt-Hann table */
-    FftHandle   *fft;              /* caller-owned ULCNET_N_FFT-point handle; may be
-                                    * shared with the other analysis and the
-                                    * synthesis (strictly sequential use
-                                    * within a hop -- never concurrent)   */
-    float history[ULCNET_N_FFT];   /* 最近 N_FFT 個 raw 樣本 (rolling) */
-    long  hops_seen;               /* SATURATES at 3 (guarded before the
-                                    * increment). Consumers only distinguish
-                                    * 1 (first hop, no frame yet), 2 (the
-                                    * reflect-prefix double emission) and
-                                    * >= 3 steady state (flush: < 2 vs
-                                    * >= 2), so the clamp is semantics-
-                                    * preserving; it exists to prevent
-                                    * signed overflow (UB) on unbounded
-                                    * streams. */
-    /* Per-call FFT scratch: caller-owned via this struct, NOT the stack
-     * (embedded task stacks cannot absorb multi-KB frames). Contents are
-     * undefined between calls. */
-    float   seg[ULCNET_N_FFT];     /* windowed segment; clobbered by FFT  */
-    Complex spec[ULCNET_BINS];     /* RFFT output staging                 */
-} UlcnetAnalysis;
-
-/* fft must be an ULCNET_N_FFT-point handle (fft_get_n_freqs(fft) == ULCNET_BINS);
- * window must be a ULCNET_N_FFT sqrt-Hann table from ulcnet_make_window().
- * Both stay caller-owned (see the window/handle sharing contract above).
- * Returns 0, or -1 on NULL args / a wrong-size handle. Re-init on the same
- * struct (same or different handle/window) is the reset. */
-int ulcnet_analysis_init(UlcnetAnalysis *st, FftHandle *fft,
-                         const float *window);
-
-/* 推入一個 hop。回傳本次產出的幀數 (0 / 2 / 1)，幀依序寫入
- * out_re/out_im[frame][bin]（呼叫端保證至少容納 2 幀）。
- * 第一次 push 產出 0 幀（centered 前綴要等第 ULCNET_HOP+1 個樣本）；第二次 push 一次
- * 產出 frame0（含 reflect 前綴）與 frame1；之後每 push 產出 1 幀。 */
-int ulcnet_analysis_push(UlcnetAnalysis *st, const float hop_in[ULCNET_HOP],
-                         float out_re[2][ULCNET_BINS],
-                         float out_im[2][ULCNET_BINS]);
-
-/* center=False rolling analysis: append one hop and transform the last
- * ULCNET_N_FFT samples. Exactly ONE frame per push, from the very first push
- * (the first frame's leading half is the zeroed history). Bit-identical to
- * the LAST frame ulcnet_analysis_push() emits for the same pushed hop: the
- * centered schedule differs only by the reflect-prefix frame it adds at the
- * head. This is the framing of the AEC/GSC seam's own spectra (one frame per
- * hop from hop 0), so a consumer that already holds such a spectrum for one
- * stream uses this for the other and the pair stays hop-aligned. Do not mix
- * the two push functions on one state: they share the history, not the
- * schedule. Always returns 1. */
-int ulcnet_analysis_push_frame(UlcnetAnalysis *st,
-                               const float hop_in[ULCNET_HOP],
-                               float out_re[ULCNET_BINS],
-                               float out_im[ULCNET_BINS]);
-
-/* 檔尾 flush：套 reflect 後綴，產出剩餘幀（總幀數 = L/HOP + 1，L 為總樣本
- * 數、hop 的整數倍時）。回傳幀數（0..2），寫入同樣的 out 佈局。連續串流
- * 部署用不到；離線 parity 對齊 torch 幀數時才需要。flush 後須 init 重來。 */
-int ulcnet_analysis_flush(UlcnetAnalysis *st,
-                          float out_re[2][ULCNET_BINS],
-                          float out_im[2][ULCNET_BINS]);
-
-/* ---- Synthesis: centered WOLA (sqrt-Hann, 包絡正規化, 半窗 trim) ---- */
-typedef struct UlcnetSynthesis {
-    const float *window;           /* caller-owned shared sqrt-Hann table */
-    FftHandle   *fft;              /* caller-owned ULCNET_N_FFT-point handle; same
-                                    * sharing contract as UlcnetAnalysis  */
-    float acc[ULCNET_N_FFT];       /* overlap-add 累加器 (局部原點 = 下一段輸出) */
-    float env[ULCNET_N_FFT];       /* 窗平方包絡累加器 (torch.istft 語意) */
-    long  frames_seen;             /* SATURATES at 2 (guarded before the
-                                    * increment). Consumers only distinguish
-                                    * 0 (nothing accumulated), 1 (frame #0,
-                                    * inside the trimmed half window) and
-                                    * >= 2 (steady one-hop emission), so the
-                                    * clamp is semantics-preserving; it
-                                    * exists to prevent signed overflow (UB)
-                                    * on unbounded streams. */
-    /* Per-call FFT scratch -- same off-stack rationale as UlcnetAnalysis. */
-    Complex spec[ULCNET_BINS];     /* IRFFT input staging; clobbered by FFT */
-    float   time[ULCNET_N_FFT];    /* IRFFT time-domain output              */
-} UlcnetSynthesis;
-
-/* Same argument/ownership/return contract as ulcnet_analysis_init. */
-int ulcnet_synthesis_init(UlcnetSynthesis *st, FftHandle *fft,
-                          const float *window);
-
-/* 推入一幀 enhanced 頻譜。回傳寫入 out 的樣本數：frame#0 回 0（半窗 trim），
- * 之後每幀回 ULCNET_HOP。 */
-int ulcnet_synthesis_push(UlcnetSynthesis *st,
-                          const float re[ULCNET_BINS],
-                          const float im[ULCNET_BINS],
-                          float out[ULCNET_HOP]);
-
-/* 檔尾 flush：輸出尚未 finalize 的尾巴（最多 N_FFT-HOP 樣本；呼叫端用
- * total_samples 截到原始長度）。連續串流部署用不到。 */
-int ulcnet_synthesis_flush(UlcnetSynthesis *st, float out[ULCNET_N_FFT]);
+/* ---- Framing: audio_common's AcStft / AcIstft ----
+ * Analysis is a sqrt-Hann STFT with `center` 1 (centered, reflect-padded:
+ * push#0 yields no frame, push#1 yields two, later pushes one; ac_stft_flush
+ * adds the trailing frame) or 0 (rolling: exactly one frame per push from the
+ * first push, the framing of the AEC/GSC seam's own spectra). Synthesis is
+ * AC_OLA_ENV_NORM: overlap-add with the squared-window envelope divided out
+ * (torch.istft semantics); the first frame lies in the trimmed half window
+ * and emits nothing.
+ *
+ * `fft` is a ULCNET_N_FFT-point handle (fft_get_n_freqs(fft) == ULCNET_BINS)
+ * and `window` a ULCNET_N_FFT sqrt-Hann table (ac_window_build). Both may be
+ * shared by every object of a pipeline -- the err and far analyses and the
+ * synthesis run strictly sequentially within a hop -- and both stay
+ * caller-owned, alive and unchanged as long as the objects. Pass them in the
+ * config to every ac_stft_get_mem_size / ac_stft_init /
+ * ac_istft_get_mem_size / ac_istft_init call; a NULL `fft` or `window` makes
+ * the object carve its own. */
+void ulcnet_framing_config(AcStftConfig *cfg, FftHandle *fft,
+                           const float *window, int center);
 
 /* ---- NPU model callback 邊界（兩個 pipeline 變體共用） ----
  * pipeline 不持有 NPU runtime；推論以每幀一次的 callback 進行。

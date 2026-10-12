@@ -1,8 +1,9 @@
 /* DeepVQE-S pre/post class. Contract: see deepvqe_prepost.h.
  *
  * This file OWNS no signal processing of its own. It composes the two
- * parity-tested translation units -- aiaec_process.c (the centered sqrt-Hann
- * STFT/WOLA it shares with Align-ULCNet) and deepvqe_process.c (the CCM
+ * parity-tested translation units -- aiaec_process.c (the complex-mask
+ * helpers; the sqrt-Hann STFT/WOLA it shares with Align-ULCNet is
+ * audio_common's AcStft / AcIstft) and deepvqe_process.c (the CCM
  * kernel) -- and adds only the object lifecycle, the pool carve, the
  * accelerator tensor views and the per-hop frame state machine. Neither
  * file's existing entry points change, so both of their standalone parity
@@ -87,10 +88,6 @@ struct DeepVqePrepost {
 
     int io_mode;
 
-    /* Borrowed, never created or destroyed here. NULL in DEEPVQE_IO_FREQ. */
-    FftHandle   *fft;
-    const float *window;
-
     /* One buffer per state tensor, bound as BOTH the accelerator's input and
      * its `_out` output for the life of the instance: the frame-t output is
      * already the frame-t+1 input, so nothing is copied or swapped. */
@@ -109,13 +106,13 @@ struct DeepVqePrepost {
 
     /* DEEPVQE_IO_TIME only; NULL in DEEPVQE_IO_FREQ.
      *
-     * Both analyses are driven with aiaec_analysis_push_frame -- the plain
-     * one-frame-per-hop rolling window, NOT aiaec_analysis_push's centered
-     * schedule -- see the header's FRAMING note. The structs embed their
-     * own transform scratch (struct-owned, never stack). */
-    AiaecAnalysis  *ana_mic;
-    AiaecAnalysis  *ana_far;
-    AiaecSynthesis *synth;
+     * Both analyses are rolling (center 0) -- the plain one-frame-per-hop
+     * window, NOT the centered schedule -- see the header's FRAMING note.
+     * The three objects borrow the caller's FftHandle and window table and
+     * carry their own transform scratch (object-owned, never stack). */
+    AcStft         *ana_mic;
+    AcStft         *ana_far;
+    AcIstft        *synth;
     float          *out_hop;    /* [AIAEC_HOP] the synthesis output. Zero
                                  * from init/reset, then only ever written
                                  * wholesale by the synthesis. */
@@ -278,6 +275,16 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth) {
     return h;
 }
 
+/* The framing objects of the TIME configuration: rolling analyses and the
+ * envelope-normalised synthesis, on the AIAEC grid. */
+static void pp_framing_config(AcStftConfig *sc,
+                              const DeepVqePrepostConfig *cfg) {
+    ac_stft_config_default(sc, AIAEC_N_FFT);
+    sc->ola = AC_OLA_ENV_NORM;
+    sc->fft = cfg->fft;
+    sc->window = cfg->window;
+}
+
 /* Walk the layout once. base==NULL sizes it; base!=NULL also carves it.
  * get_mem_size and init MUST walk in this same order -- that is the whole
  * reason it is one function. */
@@ -318,13 +325,27 @@ static int pp_layout(DeepVqePrepost *p, unsigned char *base,
     if (base && p) p->ccm = (DeepVqeCcmState *)ptr;
 
     if (cfg->io_mode == DEEPVQE_IO_TIME) {
-        if (pp_carve(base, &cursor, sizeof(AiaecAnalysis), &ptr) != 0) return -1;
-        if (base && p) p->ana_mic = (AiaecAnalysis *)ptr;
-        if (pp_carve(base, &cursor, sizeof(AiaecAnalysis), &ptr) != 0) return -1;
-        if (base && p) p->ana_far = (AiaecAnalysis *)ptr;
-        if (pp_carve(base, &cursor, sizeof(AiaecSynthesis), &ptr) != 0)
-            return -1;
-        if (base && p) p->synth = (AiaecSynthesis *)ptr;
+        AcStftConfig sc;
+        size_t stft_bytes, istft_bytes;
+        pp_framing_config(&sc, cfg);
+        stft_bytes = ac_stft_get_mem_size(&sc);
+        istft_bytes = ac_istft_get_mem_size(&sc);
+        if (stft_bytes == 0 || istft_bytes == 0) return -1;
+        if (pp_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        if (base && p) {
+            p->ana_mic = ac_stft_init(ptr, stft_bytes, &sc);
+            if (!p->ana_mic) return -1;
+        }
+        if (pp_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        if (base && p) {
+            p->ana_far = ac_stft_init(ptr, stft_bytes, &sc);
+            if (!p->ana_far) return -1;
+        }
+        if (pp_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
+        if (base && p) {
+            p->synth = ac_istft_init(ptr, istft_bytes, &sc);
+            if (!p->synth) return -1;
+        }
         if (pp_carve(base, &cursor, (size_t)AIAEC_HOP * sizeof(float),
                      &ptr) != 0) return -1;
         if (base && p) p->out_hop = (float *)ptr;
@@ -418,8 +439,8 @@ static int pp_check_config(const DeepVqePrepostConfig *cfg) {
         return -1;
     if (!dv_valid_depth(cfg->delay_depth)) return -1;
     if (cfg->io_mode == DEEPVQE_IO_TIME) {
-        /* Reject-first, same rule as aiaec_analysis_init: a handle of the
-         * wrong size would silently break the feature-time contract. */
+        /* Reject-first: a handle of the wrong size would silently break the
+         * feature-time contract. */
         if (!cfg->fft || !cfg->window) return -1;
         if (fft_get_n_freqs(cfg->fft) != AIAEC_N_BINS) return -1;
     }
@@ -478,19 +499,11 @@ DeepVqePrepost *deepvqe_prepost_init_ex(void *pool, size_t bytes,
         return NULL;
     }
     p->io_mode = cfg->io_mode;
-    p->fft = (cfg->io_mode == DEEPVQE_IO_TIME) ? cfg->fft : NULL;
-    p->window = (cfg->io_mode == DEEPVQE_IO_TIME) ? cfg->window : NULL;
 
     if (pp_layout(p, (unsigned char *)pool, cfg, &total) != 0) return NULL;
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
 
     deepvqe_ccm_init(p->ccm);
-    if (cfg->io_mode == DEEPVQE_IO_TIME &&
-        (aiaec_analysis_init(p->ana_mic, p->fft, p->window) != 0 ||
-         aiaec_analysis_init(p->ana_far, p->fft, p->window) != 0 ||
-         aiaec_synthesis_init(p->synth, p->fft, p->window) != 0)) {
-        return NULL;
-    }
     return p;
 }
 
@@ -543,11 +556,11 @@ void deepvqe_prepost_reset(DeepVqePrepost *p) {
     memset(p->taps, 0, DEEPVQE_TAPS_ELEMENTS * sizeof(float));
     deepvqe_ccm_init(p->ccm);
     if (p->io_mode == DEEPVQE_IO_TIME) {
-        /* Re-init IS the reset for all three framing states (see
-         * aiaec_process.h); the handle and window are unchanged. */
-        aiaec_analysis_init(p->ana_mic, p->fft, p->window);
-        aiaec_analysis_init(p->ana_far, p->fft, p->window);
-        aiaec_synthesis_init(p->synth, p->fft, p->window);
+        /* The objects keep their handle and window; reset clears the history
+         * and overlap state. */
+        ac_stft_reset(p->ana_mic);
+        ac_stft_reset(p->ana_far);
+        ac_istft_reset(p->synth);
         memset(p->out_hop, 0, (size_t)AIAEC_HOP * sizeof(float));
     }
     memset(p->enh_re, 0, (size_t)AIAEC_N_BINS * sizeof(float));
@@ -598,11 +611,11 @@ int deepvqe_prepost_pre_process(DeepVqePrepost *p,
     if (p->frame_open) return -1;   /* previous frame neither committed nor skipped */
 
     /* center=False rolling analysis, one frame per hop from the very first
-     * hop (see aiaec_process.h). Both streams are transformed from the SAME
+     * hop (see deepvqe_prepost.h). Both streams are transformed from the SAME
      * hop index -- this class applies no internal skew -- so they cannot
      * desynchronise. */
-    (void)aiaec_analysis_push_frame(p->ana_mic, mic_hop, p->mic_re, p->mic_im);
-    (void)aiaec_analysis_push_frame(p->ana_far, far_hop, p->far_re, p->far_im);
+    (void)ac_stft_push_planar(p->ana_mic, mic_hop, p->mic_re, p->mic_im);
+    (void)ac_stft_push_planar(p->ana_far, far_hop, p->far_re, p->far_im);
 
     p->frame_open = 1;
     return 1;   /* invariant: exactly one accelerator invocation per hop */
@@ -693,8 +706,8 @@ static void pp_close_frame(DeepVqePrepost *p) {
     p->frame_open = 0;
     p->prepared = 0;
     if (p->io_mode == DEEPVQE_IO_TIME) {
-        p->written = aiaec_synthesis_push(p->synth, p->enh_re, p->enh_im,
-                                          p->out_hop);
+        p->written = ac_istft_push_planar(p->synth, p->enh_re, p->enh_im,
+                                         p->out_hop);
     }
 }
 

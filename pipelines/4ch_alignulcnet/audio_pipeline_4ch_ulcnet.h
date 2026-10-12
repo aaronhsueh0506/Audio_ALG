@@ -12,7 +12,7 @@
  *        Align-ULCNet chain would compute, so nothing is reconstructed or
  *        re-analysed in between
  *     -> the same hop's far source through the chain's one-frame-per-hop
- *        analysis (ulcnet_analysis_push_frame); one inference per hop from
+ *        analysis (a rolling AcStft); one inference per hop from
  *        hop #0 through the UlcnetModel callback
  *     -> Align-ULCNet synthesis (ulcnet_process.h) -> enhanced mono hop
  *
@@ -29,7 +29,7 @@
  *
  *   Nothing else adds latency. The GSC spectrum of hop p is the model's
  *   error frame at hop p, and the far branch is analysed from the same
- *   hop's far source (ulcnet_analysis_push_frame, one frame per hop from
+ *   hop's far source (a rolling AcStft, one frame per hop from
  *   hop #0), so the model always sees error/far frame pairs of the SAME
  *   input hop with no delay buffer on either side, and every hop from
  *   hop #0 is exactly one inference.

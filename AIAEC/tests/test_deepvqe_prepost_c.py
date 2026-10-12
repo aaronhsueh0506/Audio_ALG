@@ -15,7 +15,7 @@ Cases, all in ONE driver selected by argv[1] so audio_common and the four
 model TUs are compiled once for the module:
 
   equiv      DEEPVQE_IO_TIME vs a rolling analysis + one hand-held in-place
-             state buffer set + deepvqe_ccm_process + aiaec_synthesis_push,
+             state buffer set + deepvqe_ccm_process + a hand-built AcIstft,
              wired up by hand from ONLY the composed TUs
   freq       DEEPVQE_IO_FREQ driven by the caller's own transform vs IO_TIME
   freqpool   the FREQ pool is smaller, and the stale-pool gate both accepts
@@ -203,6 +203,19 @@ static float out_a[HOPS * AIAEC_HOP];
 static float out_b[HOPS * AIAEC_HOP];
 static float window[AIAEC_N_FFT];
 
+/* The reference synthesis object, built the way a host builds it: the shared
+ * handle and window table in the config, one aligned block. */
+static AcIstft *make_synthesis(FftHandle *fft) {
+    AcStftConfig sc;
+    size_t bytes;
+    ac_stft_config_default(&sc, AIAEC_N_FFT);
+    sc.ola = AC_OLA_ENV_NORM;
+    sc.fft = fft;
+    sc.window = window;
+    bytes = ac_istft_get_mem_size(&sc);
+    return bytes ? ac_istft_init(alloc_aligned(16u, bytes), bytes, &sc) : NULL;
+}
+
 /* The canonical per-hop loop from deepvqe_prepost.h's contract block.
  * `cold` asserts the synthesis warm-up schedule: the first frame lands
  * entirely inside the trimmed half-window, so `written` is 0 on hop 0 and
@@ -280,9 +293,9 @@ static size_t dropped_element(int id) {
 
 /* center=False rolling analysis: one frame per hop over the last N_FFT
  * samples. Deliberately expression-for-expression the same as
- * ulcnet_process.c's ulcnet_rfft (the transform behind the
- * aiaec_analysis_push_frame the class drives), so this reference is
- * independent of deepvqe_prepost.c yet bit-comparable with it. */
+ * audio_stft.c's rolling analysis (the transform behind the AcStft the class
+ * drives), so this reference is independent of deepvqe_prepost.c yet
+ * bit-comparable with it. */
 static void ref_roll(FftHandle *fft, float *history, const float *hop_in,
                      float *out_re, float *out_im) {
     static float seg[AIAEC_N_FFT];
@@ -379,7 +392,7 @@ static int case_equiv(FftHandle *fft) {
      * deepvqe_prepost.c contributes nothing here except the pure shape
      * helper, so this reference cannot be circular. */
     static float hist_mic[AIAEC_N_FFT], hist_far[AIAEC_N_FFT];
-    static AiaecSynthesis synthesis;
+    AcIstft *synthesis;
     static DeepVqeCcmState ccm;
     static float mic_ri[2 * AIAEC_N_BINS], far_ri[2 * AIAEC_N_BINS];
     static float taps_ref[DEEPVQE_TAPS_ELEMENTS];
@@ -400,7 +413,8 @@ static int case_equiv(FftHandle *fft) {
     memset(hist_mic, 0, sizeof hist_mic);
     memset(hist_far, 0, sizeof hist_far);
     deepvqe_ccm_init(&ccm);
-    CHECK(aiaec_synthesis_init(&synthesis, fft, window) == 0);
+    synthesis = make_synthesis(fft);
+    CHECK(synthesis != NULL);
 
     for (hop = 0; hop < HOPS; ++hop) {
         static float mic_re[AIAEC_N_BINS], mic_im[AIAEC_N_BINS];
@@ -438,7 +452,7 @@ static int case_equiv(FftHandle *fft) {
             (const float (*)[DEEPVQE_TIME_ORDER][DEEPVQE_FREQ_TAPS][2])
                 taps_ref,
             enh_re, enh_im);
-        wrote = aiaec_synthesis_push(&synthesis, enh_re, enh_im, slot);
+        wrote = ac_istft_push_planar(synthesis, enh_re, enh_im, slot);
         /* The synthesis half-window trim, restated on the reference side. */
         CHECK(wrote == (hop == 0 ? 0 : AIAEC_HOP));
         if (wrote < AIAEC_HOP)
@@ -484,7 +498,7 @@ static int case_freq(FftHandle *fft) {
     DeepVqePrepost *p_time, *p_freq;
     void *pool_time, *pool_freq;
     static float hist_mic[AIAEC_N_FFT], hist_far[AIAEC_N_FFT];
-    static AiaecSynthesis synthesis;
+    AcIstft *synthesis;
     int hop;
 
     CHECK(deepvqe_prepost_config_defaults(&cfg_time, DEEPVQE_IO_TIME, D) == 0);
@@ -509,7 +523,8 @@ static int case_freq(FftHandle *fft) {
      * one frame per hop, the same center=False convention the class uses. */
     memset(hist_mic, 0, sizeof hist_mic);
     memset(hist_far, 0, sizeof hist_far);
-    CHECK(aiaec_synthesis_init(&synthesis, fft, window) == 0);
+    synthesis = make_synthesis(fft);
+    CHECK(synthesis != NULL);
     for (hop = 0; hop < HOPS; ++hop) {
         static float mic_re[AIAEC_N_BINS], mic_im[AIAEC_N_BINS];
         static float far_re[AIAEC_N_BINS], far_im[AIAEC_N_BINS];
@@ -528,7 +543,7 @@ static int case_freq(FftHandle *fft) {
         CHECK(fake_run(&inputs, &outputs) == 0);
         CHECK(deepvqe_prepost_frame_commit(p_freq) == 0);
         CHECK(deepvqe_prepost_post_process_freq(p_freq, enh_re, enh_im) == 0);
-        wrote = aiaec_synthesis_push(&synthesis, enh_re, enh_im, slot);
+        wrote = ac_istft_push_planar(synthesis, enh_re, enh_im, slot);
         CHECK(wrote == (hop == 0 ? 0 : AIAEC_HOP));
         if (wrote < AIAEC_HOP)
             memset(slot + wrote, 0,
@@ -596,6 +611,26 @@ static int case_freqpool(FftHandle *fft) {
            (unsigned long long)(req_time_default.bytes - req_freq_default.bytes),
            100.0 * (double)(req_time_default.bytes - req_freq_default.bytes) /
                (double)req_time_default.bytes);
+
+    /* IO_FREQ must not pay for the framing machinery it never runs: the
+     * difference is exactly the output hop staging and the three framing
+     * objects, sized here by audio_common with the caller's handle and
+     * window. */
+    {
+        AcStftConfig sc;
+        size_t a, s;
+        ac_stft_config_default(&sc, AIAEC_N_FFT);
+        sc.ola = AC_OLA_ENV_NORM;
+        sc.fft = fft;
+        sc.window = window;
+        a = ac_stft_get_mem_size(&sc);
+        s = ac_istft_get_mem_size(&sc);
+        CHECK(a != 0 && s != 0);
+#define A16(x) (((size_t)(x) + 15u) / 16u * 16u)
+        CHECK(req_time.bytes - req_freq.bytes ==
+              A16((size_t)AIAEC_HOP * sizeof(float)) + 2u * A16(a) + A16(s));
+#undef A16
+    }
 
     /* ONE copy of the state per tensor: doubling D grows the pool by the
      * state's own growth (alignment padding aside), not by twice that. */
@@ -1808,7 +1843,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: %s <case> [descriptor fields...]\n", argv[0]);
         return 2;
     }
-    aiaec_make_window(window);
+    ac_window_build(window, AIAEC_N_FFT);
     fill_pcm(pcm_mic, pcm_far, HOPS * AIAEC_HOP);
 
     if (strcmp(argv[1], "hash") == 0) return case_hash();
@@ -1903,7 +1938,7 @@ def _run(driver, *args):
 
 def test_time_mode_matches_the_hand_composed_path(driver):
     """DEEPVQE_IO_TIME vs a rolling center=False analysis, one hand-held
-    in-place state buffer set, deepvqe_ccm_process and aiaec_synthesis_push
+    in-place state buffer set, deepvqe_ccm_process and a hand-built AcIstft
     wired up from ONLY the composed TUs -- byte-identical over 400 hops, with
     `written` following the synthesis half-window schedule (0, then one full
     hop).

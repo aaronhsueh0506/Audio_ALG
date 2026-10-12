@@ -15,9 +15,9 @@
  * in both I/O modes. There is no variable emission count to loop over.
  *
  * FRAMING: this class analyses at center=False -- a plain rolling window over
- * the last ULCNET_N_FFT samples, one frame per hop. It is NOT
- * ulcnet_analysis_push's centered (center=True) schedule, which emits 0
- * frames on the first hop and TWO on the second to carry a reflect prefix.
+ * the last ULCNET_N_FFT samples, one frame per hop (AcStft with center 0). It
+ * is NOT the centered (center 1) schedule, which emits 0 frames on the first
+ * hop and TWO on the second to carry a reflect prefix.
  *
  * That is a re-labelling, not a change of signal. At this geometry
  * (win == n_fft, hop == n_fft/2, one shared sqrt-Hann table) centered frame k
@@ -57,7 +57,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "ulcnet_process.h"   /* grid, UlcnetAnalysis/Synthesis, FftHandle,
+#include "ulcnet_process.h"   /* grid, AcStft/AcIstft, FftHandle, ulcnet_framing_config
                                * and (transitively) ulcnet_model_io.h       */
 
 #ifdef __cplusplus
@@ -68,7 +68,7 @@ extern "C" {
 /* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes
  * (a region added, removed, resized or reordered), so a pool recorded by the
  * previous carve is refused by _init_ex on the hash, not only on `bytes`.
- * 2: the TIME analyses became two UlcnetAnalysis states (own scratch each).
+ * 2: the TIME analyses became two analysis states (own scratch each).
  * 3: the model I/O region holds one GRU hidden pair, with no second pair for
  *    the outputs.
  * 4: the model I/O region carries no per-frame K/V/logit staging.
@@ -98,7 +98,7 @@ typedef struct UlcnetPrepostConfig {
     FftHandle   *fft;          /* ULCNET_IO_TIME: required, borrowed        */
     const float *window;       /* ULCNET_IO_TIME: required, borrowed,
                                 * ULCNET_N_FFT entries from
-                                * ulcnet_make_window()                      */
+                                * ac_window_build()                         */
     uint32_t model_layout_version; /* 0 = ULCNET_MODEL_IO_LAYOUT_VERSION; any
                                     * other value must equal it. Must match
                                     * the exported graph metadata.           */

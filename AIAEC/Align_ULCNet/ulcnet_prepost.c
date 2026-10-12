@@ -27,19 +27,15 @@ struct UlcnetPrepost {
 
     int io_mode;
 
-    /* Borrowed, never created or destroyed here. NULL in ULCNET_IO_FREQ. */
-    FftHandle   *fft;
-    const float *window;
-
     /* ULCNET_IO_TIME only; NULL in ULCNET_IO_FREQ.
      *
-     * Both analyses are driven with ulcnet_analysis_push_frame -- the plain
-     * one-frame-per-hop rolling window, NOT ulcnet_analysis_push's centered
-     * schedule -- see the header's FRAMING note. The structs embed their
-     * own transform scratch (struct-owned, never stack). */
-    UlcnetAnalysis  *ana_err;
-    UlcnetAnalysis  *ana_far;
-    UlcnetSynthesis *synth;
+     * Both analyses are rolling (center 0) -- the plain one-frame-per-hop
+     * window, NOT the centered schedule -- see the header's FRAMING note.
+     * The three objects borrow the caller's FftHandle and window table and
+     * carry their own transform scratch (object-owned, never stack). */
+    AcStft  *ana_err;
+    AcStft  *ana_far;
+    AcIstft *synth;
 
     /* Per-hop frame staging: one frame, in both I/O modes. */
     float *err_re;      /* [ULCNET_BINS] */
@@ -103,6 +99,17 @@ static uint32_t pp_build_hash(int io_mode, int delay_depth, uint32_t layout) {
     return h;
 }
 
+/* TIME requires the caller's handle and window in the config, so the
+ * framing objects are sized exactly. */
+static int pp_framing_sizes(const UlcnetPrepostConfig *cfg, size_t *stft_bytes,
+                            size_t *istft_bytes) {
+    AcStftConfig sc;
+    ulcnet_framing_config(&sc, cfg->fft, cfg->window, 0);
+    *stft_bytes = ac_stft_get_mem_size(&sc);
+    *istft_bytes = ac_istft_get_mem_size(&sc);
+    return (*stft_bytes != 0 && *istft_bytes != 0) ? 0 : -1;
+}
+
 /* Walk the layout once. base==NULL sizes it; base!=NULL also carves it.
  * get_mem_size and init MUST walk in this same order -- that is the whole
  * reason it is one function. */
@@ -132,12 +139,25 @@ static int pp_layout(UlcnetPrepost *p, unsigned char *base,
     }
 
     if (cfg->io_mode == ULCNET_IO_TIME) {
-        if (pp_carve(base, &cursor, sizeof(UlcnetAnalysis), &ptr) != 0) return -1;
-        if (base && p) p->ana_err = (UlcnetAnalysis *)ptr;
-        if (pp_carve(base, &cursor, sizeof(UlcnetAnalysis), &ptr) != 0) return -1;
-        if (base && p) p->ana_far = (UlcnetAnalysis *)ptr;
-        if (pp_carve(base, &cursor, sizeof(UlcnetSynthesis), &ptr) != 0) return -1;
-        if (base && p) p->synth = (UlcnetSynthesis *)ptr;
+        size_t stft_bytes, istft_bytes;
+        AcStftConfig sc;
+        if (pp_framing_sizes(cfg, &stft_bytes, &istft_bytes) != 0) return -1;
+        ulcnet_framing_config(&sc, cfg->fft, cfg->window, 0);
+        if (pp_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        if (base && p) {
+            p->ana_err = ac_stft_init(ptr, stft_bytes, &sc);
+            if (!p->ana_err) return -1;
+        }
+        if (pp_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        if (base && p) {
+            p->ana_far = ac_stft_init(ptr, stft_bytes, &sc);
+            if (!p->ana_far) return -1;
+        }
+        if (pp_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
+        if (base && p) {
+            p->synth = ac_istft_init(ptr, istft_bytes, &sc);
+            if (!p->synth) return -1;
+        }
         if (pp_carve(base, &cursor, (size_t)ULCNET_HOP * sizeof(float),
                      &ptr) != 0) return -1;
         if (base && p) p->out_hop = (float *)ptr;
@@ -181,8 +201,8 @@ static int pp_check_config(const UlcnetPrepostConfig *cfg) {
     if (cfg->delay_depth < ULCNET_MODEL_IO_MIN_D ||
         cfg->delay_depth > ULCNET_MODEL_IO_MAX_D) return -1;
     if (cfg->io_mode == ULCNET_IO_TIME) {
-        /* Reject-first, same rule as ulcnet_analysis_init: a handle of the
-         * wrong size would silently break the feature-time contract. */
+        /* Reject-first: a handle of the wrong size would silently break the
+         * feature-time contract. */
         if (!cfg->fft || !cfg->window) return -1;
         if (fft_get_n_freqs(cfg->fft) != ULCNET_BINS) return -1;
     }
@@ -258,20 +278,12 @@ UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes,
     memset(pool, 0, (size_t)req.bytes);
     p = (UlcnetPrepost *)pool;
     p->io_mode = cfg->io_mode;
-    p->fft = (cfg->io_mode == ULCNET_IO_TIME) ? cfg->fft : NULL;
-    p->window = (cfg->io_mode == ULCNET_IO_TIME) ? cfg->window : NULL;
 
     if (pp_layout(p, (unsigned char *)pool, cfg, &descriptor, &io_req,
                   &total) != 0)
         return NULL;
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
 
-    if (cfg->io_mode == ULCNET_IO_TIME &&
-        (ulcnet_analysis_init(p->ana_err, p->fft, p->window) != 0 ||
-         ulcnet_analysis_init(p->ana_far, p->fft, p->window) != 0 ||
-         ulcnet_synthesis_init(p->synth, p->fft, p->window) != 0)) {
-        return NULL;
-    }
     return p;
 }
 
@@ -315,11 +327,11 @@ void ulcnet_prepost_reset(UlcnetPrepost *p) {
     if (!p) return;
     ulcnet_model_io_reset(p->io);
     if (p->io_mode == ULCNET_IO_TIME) {
-        /* Re-init IS the reset for all three framing states (see
-         * ulcnet_process.h); the handle and window are unchanged. */
-        ulcnet_analysis_init(p->ana_err, p->fft, p->window);
-        ulcnet_analysis_init(p->ana_far, p->fft, p->window);
-        ulcnet_synthesis_init(p->synth, p->fft, p->window);
+        /* The objects keep their handle and window; reset clears the history
+         * and overlap state. */
+        ac_stft_reset(p->ana_err);
+        ac_stft_reset(p->ana_far);
+        ac_istft_reset(p->synth);
         memset(p->out_hop, 0, (size_t)ULCNET_HOP * sizeof(float));
     }
     memset(p->enh_re, 0, (size_t)ULCNET_BINS * sizeof(float));
@@ -364,8 +376,8 @@ int ulcnet_prepost_pre_process(UlcnetPrepost *p,
      * hop (see ulcnet_process.h). Both streams are transformed from the
      * SAME hop index -- this class applies no internal skew -- so they
      * cannot desynchronise. */
-    (void)ulcnet_analysis_push_frame(p->ana_err, err_hop, p->err_re, p->err_im);
-    (void)ulcnet_analysis_push_frame(p->ana_far, far_hop, p->far_re, p->far_im);
+    (void)ac_stft_push_planar(p->ana_err, err_hop, p->err_re, p->err_im);
+    (void)ac_stft_push_planar(p->ana_far, far_hop, p->far_re, p->far_im);
 
     p->frame_open = 1;
     return 1;   /* invariant: exactly one accelerator invocation per hop */
@@ -416,8 +428,8 @@ static void pp_close_frame(UlcnetPrepost *p) {
     p->frame_open = 0;
     p->prepared = 0;
     if (p->io_mode == ULCNET_IO_TIME) {
-        p->written = ulcnet_synthesis_push(p->synth, p->enh_re, p->enh_im,
-                                           p->out_hop);
+        p->written = ac_istft_push_planar(p->synth, p->enh_re, p->enh_im,
+                                          p->out_hop);
     }
 }
 

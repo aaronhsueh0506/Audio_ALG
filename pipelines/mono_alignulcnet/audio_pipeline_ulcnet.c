@@ -16,12 +16,11 @@
  *      training; the model's own TA block, not the PBFDKF delay buffer, owns
  *      neural far/error alignment.  AecLinearContext is still read only for
  *      the error-branch delay-transition reset policy.
- *   4. Both hops go into two UlcnetAnalysis instances driven by the rolling
- *      center=False push (exactly one frame per hop from hop #0); on that
+ *   4. Both hops go into two rolling (center 0) AcStft analysis objects (exactly one frame per hop from hop #0); on that
  *      frame pair the model callback runs once; its output is
  *      applied only when infer() returned 0 and the output frame is fully
  *      finite; otherwise the error passes unchanged (fail-open); the chosen
- *      frame goes into UlcnetSynthesis
+ *      frame goes into the AcIstft synthesis
  *      (WOLA). hop #0 emits nothing -> zeros; hop #p output corresponds to
  *      input hop p-1 (one-hop latency).
  *   5. On a CHANGED event, or FIXED's first UNLOCKED->LOCKED transition,
@@ -36,12 +35,12 @@
  * Constraints: C99, -ffp-contract=off (pipelines/Makefile appends it last),
  * no stdio in this TU (all failures are signalled by NULL/-1 returns only),
  * no heap on the init/init_ex path (create() is the explicit heap
- * convenience). The Ulcnet analysis/synthesis structs (which embed their
- * own per-call FFT scratch), the per-frame spectrum scratch, and the one
- * shared sqrt-Hann window table are plain fixed-size arrays kept INSIDE
- * the instance struct (part of the `self` carve) rather than stack locals
- * -- multi-KB frame scratch would be unsafe headroom for an embedded RTOS
- * task stack (same rationale as lib/aec's Tier-1 stack-safety fix). The
+ * convenience). The per-frame spectrum scratch and the one shared sqrt-Hann
+ * window table are plain fixed-size arrays kept INSIDE the instance struct
+ * (part of the `self` carve) rather than stack locals, and the analysis /
+ * synthesis objects carry their own per-call FFT scratch in the pool --
+ * multi-KB frame scratch would be unsafe headroom for an embedded RTOS task
+ * stack (same rationale as lib/aec's Tier-1 stack-safety fix). The
  * chain's FFT is ONE pool-carved compiled-grid fft_wrapper handle shared by
  * err-analysis + far-analysis + synthesis (strictly sequential use within
  * a hop, per ulcnet_process.h's sharing contract), so BACKEND=kiss/ne10
@@ -148,15 +147,14 @@ struct AudioPipelineUlcnet {
                                    * handle for the whole ULCNet chain
                                    * (strictly sequential use per hop)      */
 
-    /* Ulcnet C pre/post state -- plain fixed-size structs, part of the
-     * `self` carve (listed as self(...) tokens in the build-flags hash).
-     * Each embeds its own per-call FFT scratch and points at the shared
-     * window table below (no per-struct window copies). */
-    UlcnetAnalysis  ana_err;      /* linear-error analysis                   */
-    UlcnetAnalysis  ana_far;      /* raw-far analysis                        */
-    UlcnetSynthesis synth;        /* enhanced-spectrum WOLA                  */
+    /* Ulcnet framing objects, carved from `pool`. Each carries its own
+     * per-call FFT scratch and borrows the shared handle above and the
+     * window table below. */
+    AcStft  *ana_err;             /* linear-error analysis                   */
+    AcStft  *ana_far;             /* raw-far analysis                        */
+    AcIstft *synth;               /* enhanced-spectrum WOLA                  */
     float ulcnet_window[ULCNET_N_FFT];  /* shared sqrt-Hann table; all three
-                                   * chain structs point at it (self-owned) */
+                                   * framing objects borrow it (self-owned) */
 
     /* Per-hop frame scratch (one frame per hop). Kept in the instance, not
      * the stack -- see the header comment of this file. */
@@ -245,26 +243,48 @@ static int ulcnet_derive_dims_and_config(const AudioPipelineUlcnetConfig* cfg,
 
 /* ============================================================================
  * Pool sizing / carve. Carve order: self control block (which embeds the
- * Ulcnet analysis/synthesis/frame-scratch state and the shared window
- * table), then the AEC pool, then the chain's shared FFT handle.
+ * frame scratch and the shared window table), then the AEC pool, the
+ * chain's shared FFT handle, the two analysis objects and the synthesis
+ * object.
  * ========================================================================== */
+
+/* Bytes of an analysis (is_synthesis 0) or synthesis (1) object on the shared
+ * handle and window table: the size of the object that carves its own, less
+ * those two regions. The shared handle exists only after the pool does, so
+ * the size cannot be asked for it directly. */
+static size_t ulcnet_framing_bytes(int is_synthesis) {
+    AcStftConfig sc;
+    size_t own, shared;
+    ulcnet_framing_config(&sc, NULL, NULL, 0);
+    own = is_synthesis ? ac_istft_get_mem_size(&sc) : ac_stft_get_mem_size(&sc);
+    shared = ALIGN16(fft_get_mem_size(ULCNET_N_FFT)) +
+             ALIGN16((size_t)ULCNET_N_FFT * sizeof(float));
+    return own > shared ? own - shared : 0;
+}
 
 static size_t ulcnet_sub_pool_size(const AecConfig* aec_cfg) {
     size_t aec_sz = aec_get_mem_size(aec_cfg);
     size_t fft_sz = fft_get_mem_size(ULCNET_N_FFT);
-    if (aec_sz == 0 || fft_sz == 0) return 0;   /* validator rejected it */
-    return ALIGN16(aec_sz) + ALIGN16(fft_sz);
+    size_t ana_sz = ulcnet_framing_bytes(0);
+    size_t syn_sz = ulcnet_framing_bytes(1);
+    if (aec_sz == 0 || fft_sz == 0 || ana_sz == 0 || syn_sz == 0)
+        return 0;   /* validator rejected it */
+    return ALIGN16(aec_sz) + ALIGN16(fft_sz) + 2 * ALIGN16(ana_sz) +
+           ALIGN16(syn_sz);
 }
 
 static int ulcnet_pipeline_build(AudioPipelineUlcnet* p, void* pool, size_t pool_size,
                                  const AecConfig* aec_cfg) {
     size_t aec_sz = aec_get_mem_size(aec_cfg);
     size_t fft_sz = fft_get_mem_size(ULCNET_N_FFT);
+    size_t ana_sz = ulcnet_framing_bytes(0);
+    size_t syn_sz = ulcnet_framing_bytes(1);
     uint8_t* ptr = (uint8_t*)pool;
     AecResContext ctx0;
+    AcStftConfig sc;
 
-    if (!pool || aec_sz == 0 || fft_sz == 0 ||
-        pool_size < ALIGN16(aec_sz) + ALIGN16(fft_sz)) return -1;
+    if (!pool || aec_sz == 0 || fft_sz == 0 || ana_sz == 0 || syn_sz == 0 ||
+        pool_size < ulcnet_sub_pool_size(aec_cfg)) return -1;
 
     p->aec = aec_init(ptr, aec_sz, aec_cfg);
     if (!p->aec) return -1;
@@ -276,17 +296,21 @@ static int ulcnet_pipeline_build(AudioPipelineUlcnet* p, void* pool, size_t pool
      * Separate from the AEC's own internal FFT instance. */
     p->fft = fft_init(ptr, fft_sz, ULCNET_N_FFT);
     if (!p->fft || fft_get_n_freqs(p->fft) != ULCNET_BINS) return -1;
+    ptr += ALIGN16(fft_sz);
 
     /* Grid-agreement guard, readable right after aec_init (before any frame
      * is processed) -- same shape as audio_pipeline.c's pipeline_build. */
     aec_get_res_context(p->aec, &ctx0);
     if (ctx0.n_freqs != ULCNET_BINS || ctx0.hop_size != ULCNET_HOP) return -1;
 
-    ulcnet_make_window(p->ulcnet_window);
-    if (ulcnet_analysis_init(&p->ana_err, p->fft, p->ulcnet_window) != 0 ||
-        ulcnet_analysis_init(&p->ana_far, p->fft, p->ulcnet_window) != 0 ||
-        ulcnet_synthesis_init(&p->synth, p->fft, p->ulcnet_window) != 0)
-        return -1;
+    ac_window_build(p->ulcnet_window, ULCNET_N_FFT);
+    ulcnet_framing_config(&sc, p->fft, p->ulcnet_window, 0);
+    p->ana_err = ac_stft_init(ptr, ana_sz, &sc);
+    ptr += ALIGN16(ana_sz);
+    p->ana_far = ac_stft_init(ptr, ana_sz, &sc);
+    ptr += ALIGN16(ana_sz);
+    p->synth = ac_istft_init(ptr, syn_sz, &sc);
+    if (!p->ana_err || !p->ana_far || !p->synth) return -1;
     return 0;
 }
 
@@ -320,8 +344,9 @@ static uint32_t audio_pipeline_ulcnet_build_flags_hash(void) {
      * push emits exactly one frame per hop; the 0/2/1 centered schedule and
      * its two-frame staging are gone). */
     h = ulcnet_fnv1a_str("|carve:self(model(io_descriptor),"
-                         "aec_delay_cfg,delay_transition,reprime,ana_err,"
-                         "ana_far,synth,frame_scratch[1],ulcnet_window),aec,fft", h);
+                         "aec_delay_cfg,delay_transition,reprime,"
+                         "frame_scratch[1],ulcnet_window),aec,fft,"
+                         "ana_err,ana_far,synth", h);
     h = ulcnet_fnv1a_str("|align|ulcnet" ULCNET_GRID_TOKEN, h);
     return h;
 }
@@ -506,9 +531,8 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
      * frame-locked by construction. The far branch source is the raw caller
      * reference, matching checkpoint training; PBFDKF alignment affects only
      * the linear-error branch. */
-    (void)ulcnet_analysis_push_frame(&p->ana_err, rctx.formed_hop, p->err_re, p->err_im);
-    (void)ulcnet_analysis_push_frame(&p->ana_far, ref,
-                                     p->far_re, p->far_im);
+    (void)ac_stft_push_planar(p->ana_err, rctx.formed_hop, p->err_re, p->err_im);
+    (void)ac_stft_push_planar(p->ana_far, ref, p->far_re, p->far_im);
 
     /* Stage 5: run the model once on this hop's frame pair and synthesize.
      * The model always receives raw far and its D window owns alignment.
@@ -531,7 +555,7 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
             sim = p->mdl_im;
         }
     }
-    wrote = ulcnet_synthesis_push(&p->synth, sre, sim, out);
+    wrote = ac_istft_push_planar(p->synth, sre, sim, out);
 
     /* hop #0: the synthesis holds its first frame back (that frame's
      * first half is the trimmed half window), so nothing is emitted and the
@@ -546,12 +570,11 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
 void audio_pipeline_ulcnet_reset(AudioPipelineUlcnet* p) {
     if (!p) return;
     aec_reset(p->aec);
-    /* Re-init with the SAME shared handle/window (both pool/instance
-     * resident and untouched by reset); cannot fail for a handle already
-     * validated at build time. */
-    (void)ulcnet_analysis_init(&p->ana_err, p->fft, p->ulcnet_window);
-    (void)ulcnet_analysis_init(&p->ana_far, p->fft, p->ulcnet_window);
-    (void)ulcnet_synthesis_init(&p->synth, p->fft, p->ulcnet_window);
+    /* The objects keep the shared handle and window (both pool/instance
+     * resident and untouched by reset); reset clears their history. */
+    ac_stft_reset(p->ana_err);
+    ac_stft_reset(p->ana_far);
+    ac_istft_reset(p->synth);
     p->last_delay_state = AEC_LINEAR_DELAY_UNLOCKED;
     p->processed_hops = 0;
     /* The analysis history is zeroed above, so nothing emitted after this
