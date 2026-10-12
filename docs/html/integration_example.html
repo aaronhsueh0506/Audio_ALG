@@ -229,6 +229,7 @@ if (audio_pipeline_ulcnet_nn_begin(p, &amp;job) &gt; 0) {            /* 1 = 有�
 }
 audio_pipeline_ulcnet_process_end(p, out);                     /* 合成剛好一個 hop */</pre>
 <p>DFN 應用的 <code>nn_begin</code> 在迴圈裡(<code>while (nn_begin(p, &amp;job) &gt; 0) { rc = run_npu(&amp;job); nn_end(p, rc); }</code>),因為 rate bridge 在一個 native hop 內可能開 0..2 個 48 kHz 幀。</p>
+<p>4 聲道 ULCNet 應用若要用「由同一 hop 的 lane 頻譜算出」的 mask 與 VAD(例如 masker 讀 lane 0),把 <code>process_begin()</code> 拆成 <code>audio_pipeline_4ch_ulcnet_process_front(p, mics, far, &amp;front)</code> 與 <code>audio_pipeline_4ch_ulcnet_process_beam(p, &amp;front, vad_raw, vad_out, mask)</code>:呼叫端在兩者之間讀 <code>front.lane_spectra[0]</code>,<code>mask</code> 可為 NULL;<code>audio_pipeline_4ch_ulcnet_beam_state()</code> 回 DOA(rad,NaN = 無)與 GSC 適應旗標。<code>process_begin(v)</code> 等於 <code>process_front</code> 加 <code>process_beam(front, v, v, NULL)</code>(見 <a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a>)。</p>
 <h3>Model I/O descriptor 是必要的,不是選配</h3>
 <pre>if (cfg->model.infer &amp;&amp; !cfg->model.io_descriptor) return -1;
 if (cfg->model.io_descriptor &amp;&amp;

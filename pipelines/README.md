@@ -220,7 +220,7 @@ read straight from each application's `process` function
 |---|---|---|---|
 | Mono AEC + NR/RES | `audio_pipeline_process_spec()` | `se_anr_stage_gain`, `g_res_ctx`, min, apply, `aec_cng_fill` | `audio_pipeline_synthesize()` |
 | 4-ch AEC + BF + NR/RES | `four_aec_front_process()` → SRP/GSC → `four_aec_fuse()` | `se_res_stage_gain`, `se_anr_stage_gain`, min, apply, `aec_cng_fill` | `ac_istft_push()` |
-| Mono / 4-ch Align-ULCNet | `*_process_begin()` | the network (`nn_begin` / `nn_end`) | `*_process_end()` |
+| Mono / 4-ch Align-ULCNet | `*_process_begin()` (4-ch: or `process_front()` + `process_beam()`) | the network (`nn_begin` / `nn_end`) | `*_process_end()` |
 | Mono / 4-ch DFN2 | `mono_aec_dfn_res_process_begin()`, `four_aec_dfn_res_front_process()` + `_process_begin()` | RES gain, min with the unity gain, apply, `aec_cng_fill`, then the DFN2 stage | `*_process_end()` |
 
 ### How do I chain a new frequency-domain stage?
@@ -325,6 +325,15 @@ while (mono_aec_dfn_res_nn_begin(p, &job) == 1)                /* job: DFN2Prepo
     mono_aec_dfn_res_nn_end(p, run_npu(&job));
 mono_aec_dfn_res_process_end(p, out);
 ```
+
+The 4-ch Align-ULCNet application can also be split before the beamformer, for a
+caller whose mask and VAD come from the lane spectra of the same hop (the masker
+reads lane 0): `audio_pipeline_4ch_ulcnet_process_front()` returns the read-only lane
+spectra, the caller computes mask, `vad_raw` and `vad_out`,
+`audio_pipeline_4ch_ulcnet_process_beam()` runs SRP and GSC with them, and
+`audio_pipeline_4ch_ulcnet_beam_state()` reads the DOA and GSC adaptation state.
+`process_begin()` is `process_front()` + `process_beam(front, v, v, NULL)`; see
+[`4ch_alignulcnet/README.md`](4ch_alignulcnet/README.md).
 
 Fail-open is part of the contract, not an option: a non-zero result, an output
 with any non-finite value, a frame left open and a frame never fetched all take

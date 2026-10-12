@@ -127,6 +127,14 @@ while (nn_begin(p, &job) > 0) {   // 1 = a frame is open (UlcnetNnJob / DfnResSt
 process_end(p, out);         // synthesis, exactly one hop
 ```
 
+The 4-channel Align-ULCNet application splits `process_begin` once more for a
+board that derives a per-bin mask and a VAD from the lane spectra of the same
+hop: `process_front(p, mics, far, &front)` (lanes, far analysis), the caller reads
+`front.lane_spectra[0]`, then `process_beam(p, &front, vad_raw, vad_out, mask)`
+(SRP, GSC; `mask` may be NULL). `beam_state(p, &st)` returns the DOA (radians, NaN
+when none) and the GSC adaptation flag. `process_begin(v)` is `process_front` plus
+`process_beam(front, v, v, NULL)`.
+
 A frame that is never fetched, or left open at `process_end`, takes the
 identity, so latency does not depend on the model. Every application's pool is
 still sized by its own `get_mem_requirements()` and carved from one

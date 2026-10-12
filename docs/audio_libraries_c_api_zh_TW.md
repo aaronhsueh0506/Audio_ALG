@@ -734,6 +734,10 @@ mono_aec_dfn_res_process_end(p, out);                    /* 合成剛好一個 h
 
 `job` 是 `UlcnetNnJob`（ULCNet）或 `DfnResStageJob`（DFN2，內含本章 `DFN2PrepostInputs`／`Outputs`）；
 輸出預填 NaN，必須寫滿。DFN 應用經 rate bridge 時一個 native hop 可能開 0..2 個 48 kHz 幀，所以 `nn_begin` 放在迴圈裡。
+4 聲道 Align-ULCNet 若要用同一 hop 的 lane 頻譜算出的 mask 與 VAD（例如 masker 讀 lane 0），把 `process_begin` 拆成
+`audio_pipeline_4ch_ulcnet_process_front()`（回傳唯讀 lane 頻譜）與 `audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, mask)`
+（`mask` 可為 NULL）；`audio_pipeline_4ch_ulcnet_beam_state()` 回 DOA（rad，NaN = 無）與 GSC 適應旗標。`process_begin(v)` 等於
+`process_front` 加 `process_beam(front, v, v, NULL)`。
 沒被取走或沒被關閉的幀走 identity，輸出時序不隨模型健康度改變。範例與記憶體規則見
 `pipelines/README.md` 的 Call flow 與 [`integration_example.html`](html/integration_example.html)。
 ---

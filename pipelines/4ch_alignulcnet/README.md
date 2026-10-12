@@ -89,6 +89,31 @@ audio_pipeline_4ch_ulcnet_process_end(p, out);               /* WOLA, one hop */
 A frame left open or never fetched is the identity (fail-open); the reprime
 frame after an alignment boundary has no model frame (`nn_begin` returns 0).
 
+### Mask and VAD derived from the lane spectra
+
+A caller that owns a per-bin mask and a VAD computed from the lane spectra of
+the same hop (a masker over lane 0, for example) cannot hand them to
+`process_begin()`: they exist only after the lanes ran. It splits
+`process_begin()` into two calls; `process_begin(p, mics, far, v)` is
+`process_front()` followed by `process_beam(p, &front, v, v, NULL)`:
+
+```c
+AudioPipeline4ChUlcnetFront front;
+audio_pipeline_4ch_ulcnet_process_front(p, mics, far, &front);   /* lanes, alignment bookkeeping, far analysis */
+/* mask (n_freqs ints), vad_raw, vad_out from front.lane_spectra[0] */
+audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, mask);   /* SRP-PHAT, GSC */
+AudioPipeline4ChUlcnetBeamState st;
+audio_pipeline_4ch_ulcnet_beam_state(p, &st);   /* doa_raw/smooth/used in radians (NaN = none), gsc_adaptive */
+/* then nn_begin / nn_end / process_end as above */
+```
+
+`mask[f]` nonzero: SRP uses bin `f`, GSC freezes its adaptation on bin `f`;
+NULL means all bins used and none frozen. `vad_raw` gates SRP, `vad_out` feeds the
+DOA smoother and freezes GSC adaptation. `front.lane_spectra` are read-only views
+valid until the next `process_front()`, `process_begin()`, `reset()` or
+`destroy()`. Between the two calls only `process_beam()` is valid. The split adds
+no state to the instance: the pool size and the layout version are unchanged.
+
 ## Delay profile
 
 The matched-filter bank size `n` is a product deployment decision, so it is a
