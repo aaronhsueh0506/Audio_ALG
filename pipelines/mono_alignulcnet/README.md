@@ -5,11 +5,12 @@ library. The executable directly links the pipeline wrapper object, the
 Align-ULCNet C pre/post-processing object, and the existing AEC/audio_common
 libraries.
 
-`main.c` shows the board boundary. CPU memory owns the K/V history, logit
-history and GRU hidden states through `ulcnet_accelerator_adapter`; only the
-stateless tensor invocation in `run_accelerator()` remains a board TODO. An ordinary
-runtime runs into its own output tensors and calls `ulcnet_model_io_inherit(outputs, &runtime_outputs)`
-before returning; a runtime that binds each `*_out` to its input's address omits that call.
+`main.c` shows the board boundary. CPU memory owns the K/V windows, logit
+window and GRU hidden state through `ulcnet_accelerator_adapter`; only the
+stateless tensor invocation in `run_accelerator()` remains a board TODO. The
+runtime binds each `*_out` to the address of the state input of the same name
+(the graph shifts the windows itself, so nothing is copied) and reads every state
+input before it writes any state output.
 Returning an error is intentionally fail-open and emits the linear error.
 
 The exported graph fixes `D`. The example constructs a `D=8` descriptor;

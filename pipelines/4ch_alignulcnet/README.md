@@ -7,8 +7,7 @@ mode, so the unused conventional NR/RES post path is not allocated.
 
 The model accelerator is intentionally left as the TODO in
 `run_accelerator()`. CPU memory owns every K/V, logit and GRU state tensor.
-An ordinary runtime copies its state outputs in with `ulcnet_model_io_inherit()`; one that binds
-each `*_out` to its input's address omits that call.
+The runtime binds each `*_out` to the address of the state input of the same name; the graph shifts the windows itself, so the CPU neither copies nor shifts them.
 The default callback failure demonstrates the production fail-open path.
 
 The production far branch is fixed to the caller's raw reference, matching
