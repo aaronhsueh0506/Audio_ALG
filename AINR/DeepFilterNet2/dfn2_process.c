@@ -144,15 +144,19 @@ static inline void df_common_features(
     }
 }
 
+/* A scalar twin is the reference of its NEON kernel and the whole kernel in a
+ * SIMD=0 build; a NEON build keeps it only for the differential test. */
+#define DFN2_TWIN static inline __attribute__((unused))
+
 /* erb_inv: caller-loaded exported matrix, band-major [n_bands][n_bins]
  * (the model's mask-expansion buffer); the inner loop runs contiguously
  * over the band's nonzero bins, or the whole row for a non-finite gain. */
-static inline void df_common_expand_mask(const float *band_gain,
-                                         const float *erb_inv,
-                                         const uint16_t *inv_lo,
-                                         const uint16_t *inv_hi,
-                                         int n_bins, int n_bands,
-                                         float *bin_gain) {
+DFN2_TWIN void df_common_expand_mask_scalar(const float *band_gain,
+                                            const float *erb_inv,
+                                            const uint16_t *inv_lo,
+                                            const uint16_t *inv_hi,
+                                            int n_bins, int n_bands,
+                                            float *bin_gain) {
     memset(bin_gain, 0, (size_t)n_bins * sizeof(float));
     for (int b = 0; b < n_bands; ++b) {
         float gain = band_gain[b];
@@ -162,6 +166,50 @@ static inline void df_common_expand_mask(const float *band_gain,
         for (int k = finite ? inv_lo[b] : 0; k < hi; ++k)
             bin_gain[k] += row[k] * gain;
     }
+}
+
+#if DF_COMMON_HAVE_NEON
+/* The same sums with four bins per step. A band's last step may run up to
+ * three bins past its span: the weights there are zero, and adding a zero
+ * product to a bin that is never -0 changes nothing for a finite gain (a
+ * non-finite gain takes the whole row, as in the twin). */
+static inline void df_common_expand_mask_neon(const float *band_gain,
+                                              const float *erb_inv,
+                                              const uint16_t *inv_lo,
+                                              const uint16_t *inv_hi,
+                                              int n_bins, int n_bands,
+                                              float *bin_gain) {
+    memset(bin_gain, 0, (size_t)n_bins * sizeof(float));
+    for (int b = 0; b < n_bands; ++b) {
+        float gain = band_gain[b];
+        const float *row = erb_inv + (size_t)b * n_bins;
+        int finite = isfinite(gain);
+        int hi = finite ? inv_hi[b] : n_bins;
+        int k = finite ? inv_lo[b] : 0;
+        float32x4_t g = vdupq_n_f32(gain);
+        for (; k < hi && k + 4 <= n_bins; k += 4)
+            vst1q_f32(bin_gain + k,
+                      vaddq_f32(vld1q_f32(bin_gain + k),
+                                vmulq_f32(vld1q_f32(row + k), g)));
+        for (; k < hi; ++k)
+            bin_gain[k] += row[k] * gain;
+    }
+}
+#endif
+
+static inline void df_common_expand_mask(const float *band_gain,
+                                         const float *erb_inv,
+                                         const uint16_t *inv_lo,
+                                         const uint16_t *inv_hi,
+                                         int n_bins, int n_bands,
+                                         float *bin_gain) {
+#if DF_COMMON_HAVE_NEON
+    df_common_expand_mask_neon(band_gain, erb_inv, inv_lo, inv_hi, n_bins,
+                               n_bands, bin_gain);
+#else
+    df_common_expand_mask_scalar(band_gain, erb_inv, inv_lo, inv_hi, n_bins,
+                                 n_bands, bin_gain);
+#endif
 }
 
 static inline void df_common_atten_lim(const float *noisy_re,

@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "DeepFilterNet2/dfn2_process.c"
 #include "GTCRN/gtcrn_process.c"
 
 #define CHECK(condition, message) do {                                      \
@@ -228,9 +229,89 @@ static int test_gtcrn_kernels(void)
     return 1;
 }
 
+
+/* Mask expansion: the contract is the dense sum over every band in
+ * ascending order. Skipping a band's zero weights is exact for a finite
+ * gain, and a non-finite gain takes the whole row. */
+static void ref_expand(const float* gain, const float* inv, float* out)
+{
+    for (int k = 0; k < DFN2_N_BINS; ++k) {
+        float sum = 0.0f;
+        for (int b = 0; b < DFN2_N_ERB; ++b) {
+            float product = inv[(size_t)b * DFN2_N_BINS + k] * gain[b];
+            sum = sum + product;
+        }
+        out[k] = sum;
+    }
+}
+
+static int test_dfn2_expand_mask(void)
+{
+    static float inv[DFN2_N_ERB * DFN2_N_BINS];
+    uint16_t lo[DFN2_N_ERB], hi[DFN2_N_ERB];
+    float gain[DFN2_N_ERB];
+    static const unsigned rates[] = { 0, 0, 0, 0, 40, 5 };
+
+    for (int round = 0; round < 120; ++round) {
+        float want[DFN2_N_BINS], twin[DFN2_N_BINS], got[DFN2_N_BINS];
+        unsigned rate = rates[round % (int)(sizeof(rates) / sizeof(rates[0]))];
+        memset(inv, 0, sizeof(inv));
+        for (int b = 0; b < DFN2_N_ERB; ++b) {
+            int first, width;
+            switch (round % 4) {
+            case 0:  /* triangular, ERB-like: widths grow with the band */
+                first = b * b * 13 / 31 / 2 + b;
+                width = 2 + b * 3 + (int)(rng() % 3);
+                break;
+            case 1:  /* arbitrary spans, including empty and edge-touching */
+                first = (int)(rng() % DFN2_N_BINS);
+                width = (int)(rng() % 9);
+                break;
+            case 2:  /* spans ending exactly at the last bin */
+                width = 1 + (int)(rng() % 12);
+                first = DFN2_N_BINS - width;
+                break;
+            default: /* wide, overlapping */
+                first = (int)(rng() % 300);
+                width = 1 + (int)(rng() % 200);
+                break;
+            }
+            for (int k = first; k < first + width && k < DFN2_N_BINS; ++k)
+                inv[(size_t)b * DFN2_N_BINS + k] =
+                    (rng() % 11 == 0) ? 0.0f : uniform();
+            if (rng() % 7 == 0 && first < DFN2_N_BINS)
+                inv[(size_t)b * DFN2_N_BINS + first] = -0.0f;
+        }
+        if (rate != 0) {
+            for (int i = 0; i < 24; ++i)
+                inv[rng() % (DFN2_N_ERB * DFN2_N_BINS)] = special();
+        }
+        erb_spans(inv, DFN2_N_ERB, DFN2_N_BINS, DFN2_N_BINS, 1, lo, hi);
+        fill(gain, DFN2_N_ERB, 1.0f, rate);
+
+        ref_expand(gain, inv, want);
+        df_common_expand_mask_scalar(gain, inv, lo, hi, DFN2_N_BINS, DFN2_N_ERB,
+                                     twin);
+        CHECK(same_bits(twin, want, DFN2_N_BINS),
+              "DFN2 scalar mask expansion equals the dense contract");
+        df_common_expand_mask(gain, inv, lo, hi, DFN2_N_BINS, DFN2_N_ERB, got);
+        CHECK(same_bits(got, want, DFN2_N_BINS),
+              "DFN2 mask expansion equals the dense contract");
+#if DF_COMMON_HAVE_NEON
+        df_common_expand_mask_neon(gain, inv, lo, hi, DFN2_N_BINS, DFN2_N_ERB,
+                                   got);
+        CHECK(same_bits(got, twin, DFN2_N_BINS),
+              "DFN2 NEON mask expansion equals its scalar twin");
+#endif
+    }
+    return 1;
+}
+
 int main(void)
 {
+    CHECK(test_dfn2_expand_mask(), "DFN2 kernels");
     CHECK(test_gtcrn_kernels(), "GTCRN kernels");
-    printf("nn kernels: backend=%s ok\n", gtcrn_simd_backend());
+    printf("nn kernels: backend=%s/%s ok\n", dfn2_simd_backend(),
+           gtcrn_simd_backend());
     return EXIT_SUCCESS;
 }

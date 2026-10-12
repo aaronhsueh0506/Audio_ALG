@@ -123,7 +123,7 @@ $(SCALAR_BIN): $(SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(SOURCES) "$(AC_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
-KERNEL_SOURCES := GTCRN/gtcrn_process.c
+KERNEL_SOURCES := DeepFilterNet2/dfn2_process.c GTCRN/gtcrn_process.c
 
 $(KERNEL_TEST_BIN): tests/test_nn_kernels.c $(KERNEL_SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) tests/test_nn_kernels.c "$(AC_LIB)" \
