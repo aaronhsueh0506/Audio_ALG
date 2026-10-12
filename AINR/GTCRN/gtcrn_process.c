@@ -118,13 +118,9 @@ void gtcrn_model_input(const float spectrum[GTCRN_N_BINS][2],
     const float* const full[3] = { full_mag, full_re, full_im };
     float* const banded[3] = { mag, real_part, imag_part };
     if (!spectrum || !erb_fwd || !mag || !real_part || !imag_part) return;
-    for (int k = 0; k < GTCRN_N_BINS; ++k) {
-        float re = spectrum[k][0];
-        float im = spectrum[k][1];
-        full_mag[k] = sqrtf(re * re + im * im + 1e-12f);
-        full_re[k] = re;
-        full_im[k] = im;
-    }
+    skn_deinterleave_cf32((const Complex*)(const void*)spectrum, full_re,
+                          full_im, GTCRN_N_BINS);
+    skn_mag_eps_f32(full_mag, full_re, full_im, GTCRN_N_BINS, 1e-12f);
     erb_band3(full, erb_fwd, banded);
 }
 
