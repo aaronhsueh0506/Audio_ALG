@@ -102,8 +102,6 @@ def validate_nctf_no_temporal_padding(graph, require_static=False):
 
 STATE_BINDING = 'in_place_same_address'
 
-_INT32_MAX = 2 ** 31 - 1
-
 
 def _dims(value_info):
     """Static dims of a graph input/output, or None when any is symbolic."""
@@ -154,7 +152,7 @@ def _single_axis_slice(node, constants, name, axis, size):
             '%s: Slice must be one range with step 1, got starts=%s ends=%s '
             'steps=%s' % (where, starts, ends, steps))
     start, stop = starts[0], ends[0]
-    if not 0 <= start < stop <= size or stop >= _INT32_MAX:
+    if not 0 <= start < stop <= size:
         raise RuntimeError(
             '%s: Slice range [%d:%d) is not an explicit range inside the '
             'axis of %d' % (where, start, stop, size))
@@ -256,3 +254,33 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
         raise RuntimeError('metadata state_binding must be %r, got %r'
                            % (STATE_BINDING, props.get('state_binding')))
     return len(state_handoff)
+
+
+def validate_inplace_state_from_metadata(graph):
+    """Run ``validate_inplace_state_graph`` with the parameters the exporter
+    wrote into the graph's own metadata.
+
+    ``state_handoff`` maps each state input to its output and
+    ``state_slicing`` maps it to ``{"kind": "window" | "rows", "axis": n}``.
+    A graph without both entries is refused: the check cannot be run from a
+    graph that does not describe its state boundary.
+    """
+    import json
+
+    props = {prop.key: prop.value for prop in graph.metadata_props}
+    for key in ('state_handoff', 'state_slicing'):
+        if key not in props:
+            raise RuntimeError('metadata lacks %s' % key)
+    handoff = json.loads(props['state_handoff'])
+    slicing = json.loads(props['state_slicing'])
+    if set(slicing) != set(handoff):
+        raise RuntimeError('state_slicing and state_handoff name different '
+                           'tensors')
+    windows = {name: int(item['axis']) for name, item in slicing.items()
+               if item['kind'] == 'window'}
+    rows = {name: int(item['axis']) for name, item in slicing.items()
+            if item['kind'] == 'rows'}
+    if len(windows) + len(rows) != len(slicing):
+        raise RuntimeError('state_slicing kind must be window or rows')
+    return validate_inplace_state_graph(graph, handoff, windows=windows,
+                                        slices=rows)

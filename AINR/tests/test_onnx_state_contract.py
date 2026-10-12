@@ -6,6 +6,7 @@ breaks only that rule, and the well-formed graph passes, so a rule that
 stopped being checked would turn one of these red.
 """
 
+import json
 import os
 import sys
 
@@ -18,8 +19,10 @@ import numpy as np  # noqa: E402
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from onnx_streaming_contract import (  # noqa: E402
     STATE_BINDING,
+    validate_inplace_state_from_metadata,
     validate_inplace_state_graph,
 )
+import check_state_quantization as quant  # noqa: E402
 
 K = 5
 HANDOFF = {'win': 'win_out', 'rows': 'rows_out'}
@@ -98,8 +101,16 @@ def build(window_shape=(1, 2, K, 3), out_window_shape=None,
     del frames
     model = helper.make_model(
         graph, opset_imports=[helper.make_opsetid('', 17)])
+    props = {
+        'state_handoff': json.dumps(HANDOFF),
+        'state_slicing': json.dumps({
+            'win': {'kind': 'window', 'axis': 2},
+            'rows': {'kind': 'rows', 'axis': 1},
+        }),
+    }
     if binding is not None:
-        helper.set_model_props(model, {'state_binding': binding})
+        props['state_binding'] = binding
+    helper.set_model_props(model, props)
     return model
 
 
@@ -178,3 +189,80 @@ def test_repo_root_copy_carries_the_same_validators():
         return ast.dump(tree)
 
     assert code(ainr) == code(root)
+
+
+def test_metadata_entry_point_runs_the_same_check():
+    assert validate_inplace_state_from_metadata(build()) == 2
+    with pytest.raises(RuntimeError, match='tile'):
+        validate_inplace_state_from_metadata(build(rows=((0, 1), (1, 3))))
+    model = build()
+    kept = [prop for prop in model.metadata_props
+            if prop.key != 'state_slicing']
+    del model.metadata_props[:]
+    model.metadata_props.extend(kept)
+    with pytest.raises(RuntimeError, match='state_slicing'):
+        validate_inplace_state_from_metadata(model)
+
+
+def _report(overrides=None):
+    entry = {'dtype': 'int8', 'scale': 0.0125, 'zero_point': 0}
+    tensors = {
+        'win': dict(entry, shape=[1, 2, K, 3]),
+        'win_out': dict(entry, shape=[1, 2, K, 3]),
+        'rows': dict(entry, scale=[0.1, 0.2], zero_point=[0, 0],
+                     shape=[1, 5, 1, 4]),
+        'rows_out': dict(entry, scale=[0.1, 0.2], zero_point=[0, 0],
+                         shape=[1, 5, 1, 4]),
+    }
+    for (name, field), value in (overrides or {}).items():
+        tensors[name][field] = value
+    return tensors
+
+
+def test_quantized_pairs_that_agree_pass():
+    assert quant.check_quantized_state_pairs(HANDOFF, _report()) == []
+
+
+@pytest.mark.parametrize('override', [
+    {('win_out', 'scale'): 0.025},
+    {('win_out', 'zero_point'): 3},
+    {('win_out', 'dtype'): 'uint8'},
+    {('win_out', 'shape'): [1, 2, K - 1, 3]},
+    {('rows_out', 'scale'): [0.1, 0.25]},
+    {('rows', 'scale'): 0.1},
+])
+def test_each_quantized_property_that_differs_is_reported(override):
+    problems = quant.check_quantized_state_pairs(HANDOFF, _report(override))
+    assert len(problems) == 1, problems
+
+
+def test_a_state_tensor_missing_from_the_report_is_reported():
+    tensors = _report()
+    del tensors['rows_out']
+    problems = quant.check_quantized_state_pairs(HANDOFF, tensors)
+    assert problems and 'missing' in problems[0]
+    tensors = _report()
+    del tensors['win']['zero_point']
+    assert 'lacks zero_point' in quant.check_quantized_state_pairs(
+        HANDOFF, tensors)[0]
+
+
+def test_command_line_exit_codes(tmp_path, capsys):
+    graph = tmp_path / 'g.onnx'
+    onnx.save(build(), str(graph))
+    good = tmp_path / 'good.json'
+    good.write_text(json.dumps({'tensors': _report()}))
+    bad = tmp_path / 'bad.json'
+    bad.write_text(json.dumps({'tensors': _report(
+        {('win_out', 'scale'): 0.5})}))
+    broken = tmp_path / 'broken.json'
+    broken.write_text('{"tensors": ')
+    assert quant.main([str(graph)]) == 0
+    assert 'NOT_RUN' in capsys.readouterr().out
+    assert quant.main([str(graph), '--report', str(good)]) == 0
+    assert quant.main([str(graph), '--report', str(bad)]) == 1
+    assert 'scale differs' in capsys.readouterr().out
+    assert quant.main([str(graph), '--report', str(broken)]) == 2
+    bad_graph = tmp_path / 'bad_graph.onnx'
+    onnx.save(build(window_user_op='Identity'), str(bad_graph))
+    assert quant.main([str(bad_graph), '--report', str(good)]) == 1

@@ -38,7 +38,7 @@ if _AINR_ROOT not in sys.path:
     sys.path.insert(0, _AINR_ROOT)
 
 from onnx_streaming_contract import (
-    validate_inplace_state_graph,
+    validate_inplace_state_from_metadata,
     validate_nctf_no_temporal_padding,
 )
 
@@ -90,6 +90,13 @@ STATE_HANDOFF = dict(zip(STATE_NAMES, OUTPUT_NAMES[1:]))
 
 # Every state tensor is read and written at one address.
 STATE_BINDING = 'in_place_same_address'
+
+# How each state input is consumed inside the graph (see the module
+# docstring); the post-quantization check reads this back from the metadata.
+STATE_SLICING = dict(
+    [(name, {'kind': 'window', 'axis': 2}) for name in CONV_STATE_NAMES] +
+    [(name, {'kind': 'rows', 'axis': 1}) for name in GRU_STATE_NAMES]
+)
 
 
 def _schema(names, tensors):
@@ -266,6 +273,7 @@ def build_metadata(checkpoint_path, grid, inputs, outputs):
         'recurrent_state': 'per_block_conv_window_plus_stacked_gru_rows',
         'state_binding': STATE_BINDING,
         'state_handoff': STATE_HANDOFF,
+        'state_slicing': STATE_SLICING,
         'input_schema': _schema(INPUT_NAMES, inputs),
         'output_schema': _schema(OUTPUT_NAMES, outputs),
     }
@@ -301,11 +309,7 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
     set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, OUTPUT_NAMES, outputs)
     graph = _resolve_internal_shapes(graph)
-    validate_inplace_state_graph(
-        graph, STATE_HANDOFF,
-        windows={name: 2 for name in CONV_STATE_NAMES},
-        slices={name: 1 for name in GRU_STATE_NAMES},
-    )
+    validate_inplace_state_from_metadata(graph)
     onnx.save(graph, output_path)
     with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as fp:
