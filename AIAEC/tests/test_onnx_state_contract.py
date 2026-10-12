@@ -105,20 +105,20 @@ def test_recurrent_state_that_is_not_a_window_needs_no_slice():
 
 @pytest.mark.parametrize('kwargs,message', [
     (dict(extra_consumer='tap'), 'has 2 consumers'),
-    (dict(extra_consumer='split'), 'not Slice'),
-    (dict(extra_consumer='gather'), 'not Slice'),
-    (dict(axes=(1,)), 'must cut axis 2'),
+    (dict(extra_consumer='split'), 'must be a Slice'),
+    (dict(extra_consumer='gather'), 'must be a Slice'),
+    (dict(axes=(1,)), 'axis 2'),
     (dict(steps=(2,)), 'step 1'),
     (dict(steps=(-1,), start=3, end=0), 'step 1'),
-    (dict(end=INT64_MAX), 'outside the extent'),
+    (dict(end=INT64_MAX), 'explicit range'),
     (dict(start=1, end=3), 'drops exactly one'),
     (dict(start=0, end=4), 'drops exactly one'),
-    (dict(start=-1, end=3), 'outside the extent'),
+    (dict(start=-1, end=3), 'explicit range'),
     (dict(out_producer='slice'), 'produced by a Slice'),
     (dict(out_shape=(1, 2, 5, 3)), 'changes shape'),
     (dict(binding=None), 'state_binding'),
     (dict(binding='copy'), 'state_binding'),
-    (dict(dynamic_starts=True), 'non-constant starts'),
+    (dict(dynamic_starts=True), 'not constants'),
     (dict(out_is_input=True), 'is a graph input'),
 ])
 def test_each_violation_is_named(kwargs, message):

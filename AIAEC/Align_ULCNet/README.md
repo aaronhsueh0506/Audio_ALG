@@ -343,7 +343,8 @@ frames `1..4` (end 5) and the new row is concatenated behind. The Concat result
 is the attention input and also the output, so no state output is produced by a
 Slice, and the one slot a window drops only keeps the input and output shapes
 equal. `export_graph` checks the written file with
-`validate_inplace_state_contract` (`AIAEC/_onnx_contract.py`): identical rank-4
+`validate_inplace_state_contract` (`AIAEC/_onnx_contract.py`, a wrapper over
+`validate_inplace_state_graph` in `AINR/onnx_streaming_contract.py`): identical rank-4
 shapes per state pair, exactly one Slice consumer per window input, no state
 output produced by a Slice, and `state_binding = in_place_same_address` in the
 metadata. `query_now` is not state and is not returned. Delay distribution is

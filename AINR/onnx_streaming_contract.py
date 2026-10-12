@@ -8,8 +8,9 @@ supplies the complete temporal kernel window or carries older frames as an
 explicit state tensor, so an exported graph must never add time-axis padding.
 Frequency padding remains valid and is deliberately not restricted here.
 
-This module lives inside ``AINR`` because that directory is a standalone
-release unit used on training and quantization machines.
+This is the only implementation. It lives inside ``AINR`` because that
+directory is a standalone release unit used on training and quantization
+machines; the AIAEC exporters import it through ``AIAEC/_onnx_contract.py``.
 """
 
 from __future__ import annotations
@@ -160,27 +161,35 @@ def _single_axis_slice(node, constants, name, axis, size):
 
 
 def validate_inplace_state_graph(graph, state_handoff, windows=None,
-                                 slices=None):
+                                 slices=None, require_rank4=True,
+                                 window_drop='oldest'):
     """Check that a graph's state boundary can be bound in place.
 
     ``state_handoff`` maps each state input name to the output that hands it
     back. The runtime reads every input before it writes any output at the
     same address, so the pair must be interchangeable byte for byte.
 
-    * every state input and its output exist, are rank 4, fully static, and
-      have the same shape and element type;
+    * every state input and its output exist, have the same static shape and
+      element type, and are rank 4 when ``require_rank4``;
     * ``windows`` maps a state input to the axis of its sliding window. The
-      input has exactly one consumer, a Slice of that axis with an explicit
-      range ``[start:size)`` (start >= 1) and step 1: it drops the oldest
-      slot, and the new slot is concatenated after it;
+      input has exactly one consumer, a Slice of that axis that reads it as
+      the data input, with constant bounds, an explicit range inside the
+      axis, step 1, and one slot fewer kept than the window holds. With
+      ``window_drop='oldest'`` the range must be ``[1:size)`` (the oldest
+      slot goes, the new one is concatenated after); with ``'either'`` the
+      range may instead be ``[0:size-1)`` (newest-first rings);
     * ``slices`` maps a state input to the axis along which it is cut into
       per-GRU rows. Every consumer is a Slice of that axis with an explicit
       range and step 1, and the ranges tile the axis exactly once;
-    * no graph output is produced by a Slice;
+    * no graph output is produced by a Slice, no state output is a graph
+      input, and every state output has a producer;
     * the metadata records ``state_binding = in_place_same_address``.
 
-    Returns the number of state pairs checked.
+    Returns the number of state pairs checked. Raises RuntimeError on the
+    first violation.
     """
+    if window_drop not in ('oldest', 'either'):
+        raise ValueError('window_drop must be "oldest" or "either"')
     windows = dict(windows or {})
     slices = dict(slices or {})
     inputs = {item.name: item for item in graph.graph.input}
@@ -196,14 +205,14 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
 
     for name, back in state_handoff.items():
         if name not in inputs or back not in outputs:
-            raise RuntimeError('state pair %s -> %s is not in the graph'
-                               % (name, back))
+            raise RuntimeError('state pair %s -> %s is not a graph input and '
+                               'output' % (name, back))
         shape_in, shape_out = _dims(inputs[name]), _dims(outputs[back])
         if shape_in is None or shape_out is None:
             raise RuntimeError('state pair %s -> %s has a non-static shape'
                                % (name, back))
-        if len(shape_in) != 4:
-            raise RuntimeError('state %s has rank %d, expected 4'
+        if require_rank4 and len(shape_in) != 4:
+            raise RuntimeError('state %s has rank %d, not 4'
                                % (name, len(shape_in)))
         if shape_in != shape_out:
             raise RuntimeError('state pair %s -> %s changes shape: %s vs %s'
@@ -213,18 +222,34 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
             raise RuntimeError('state pair %s -> %s changes element type'
                                % (name, back))
 
+    unknown = (set(windows) | set(slices)) - set(state_handoff)
+    if unknown:
+        raise RuntimeError(
+            'windows or slices name inputs that are not state inputs: %s'
+            % sorted(unknown))
+
     for name, axis in windows.items():
         size = _dims(inputs[name])[axis]
         users = consumers.get(name, [])
         if len(users) != 1 or users[0].op_type != 'Slice':
             raise RuntimeError(
-                'window input %s must have exactly one consumer and it must '
-                'be a Slice, got %s' % (name, [u.op_type for u in users]))
+                'window input %s has %d consumers; it must have exactly one '
+                'consumer and it must be a Slice, got %s'
+                % (name, len(users), [u.op_type for u in users]))
+        if list(users[0].input).count(name) != 1 or users[0].input[0] != name:
+            raise RuntimeError('window input %s is not the Slice data input'
+                               % name)
         start, stop = _single_axis_slice(users[0], constants, name, axis, size)
-        if start < 1 or stop != size:
+        if window_drop == 'oldest':
+            if start != 1 or stop != size:
+                raise RuntimeError(
+                    'window input %s: Slice [%d:%d) of %d does not drop the '
+                    'oldest slot' % (name, start, stop, size))
+        elif stop - start != size - 1:
             raise RuntimeError(
-                'window input %s: Slice [%d:%d) of %d does not drop the '
-                'oldest slot' % (name, start, stop, size))
+                'window input %s: Slice [%d:%d) of %d keeps %d slots; a '
+                'window drops exactly one' % (name, start, stop, size,
+                                              stop - start))
 
     for name, axis in slices.items():
         size = _dims(inputs[name])[axis]
@@ -248,6 +273,11 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
         if producer is not None and producer.op_type == 'Slice':
             raise RuntimeError('graph output %s is produced by a Slice'
                                % item.name)
+    for back in state_handoff.values():
+        if back in inputs:
+            raise RuntimeError('state output %s is a graph input' % back)
+        if back not in producers:
+            raise RuntimeError('state output %s has no producer' % back)
 
     props = {prop.key: prop.value for prop in graph.metadata_props}
     if props.get('state_binding') != STATE_BINDING:

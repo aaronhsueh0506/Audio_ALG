@@ -150,7 +150,7 @@ def test_each_rule_has_a_graph_that_breaks_only_it(kwargs, message):
 
 
 def test_a_missing_state_pair_is_refused():
-    with pytest.raises(RuntimeError, match='not in the graph'):
+    with pytest.raises(RuntimeError, match='not a graph input and output'):
         validate_inplace_state_graph(
             build(), {'win': 'nope'}, windows=WINDOWS, slices=SLICES)
 
@@ -168,27 +168,26 @@ def test_attribute_style_slice_is_read_too():
     assert check(model) == 2
 
 
-def test_repo_root_copy_carries_the_same_validators():
-    """AINR is a standalone release unit, so it keeps its own copy of this
-    module next to the one at the repository root; either may be the one
-    ``import onnx_streaming_contract`` finds. The code (not the module
-    docstring) must therefore be identical."""
-    import ast
-    from pathlib import Path
+def test_newest_first_window_needs_the_either_order():
+    """A ring that keeps slots 0..K-2 is a valid in-place window only when
+    the caller allows either end to be dropped."""
+    model = build(start=0, end=K - 1)
+    with pytest.raises(RuntimeError, match='does not drop the oldest'):
+        validate_inplace_state_graph(model, HANDOFF, windows=WINDOWS,
+                                     slices=SLICES)
+    assert validate_inplace_state_graph(
+        model, HANDOFF, windows=WINDOWS, slices=SLICES,
+        window_drop='either') == 2
+    with pytest.raises(RuntimeError, match='drops exactly one'):
+        validate_inplace_state_graph(
+            build(start=0, end=K), HANDOFF, windows=WINDOWS, slices=SLICES,
+            window_drop='either')
 
-    ainr = Path(__file__).resolve().parents[1] / 'onnx_streaming_contract.py'
-    root = ainr.parents[1] / 'onnx_streaming_contract.py'
-    if not root.is_file():
-        pytest.skip('AINR released without the repository root')
 
-    def code(path):
-        tree = ast.parse(path.read_text(encoding='utf-8'))
-        if (tree.body and isinstance(tree.body[0], ast.Expr)
-                and isinstance(tree.body[0].value, ast.Constant)):
-            tree.body = tree.body[1:]
-        return ast.dump(tree)
-
-    assert code(ainr) == code(root)
+def test_window_and_row_names_must_be_state_inputs():
+    with pytest.raises(RuntimeError, match='not state inputs'):
+        validate_inplace_state_graph(
+            build(), {'win': 'win_out'}, windows=WINDOWS, slices=SLICES)
 
 
 def test_metadata_entry_point_runs_the_same_check():
