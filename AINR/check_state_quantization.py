@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 
@@ -52,6 +53,27 @@ def _as_list(value):
     return list(value) if isinstance(value, (list, tuple)) else [value]
 
 
+def _number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value))
+
+
+def _invalid_encoding(entry):
+    """Describe what makes one tensor's fixed-point encoding unusable."""
+    problems = []
+    if 'scale' in entry:
+        for value in _as_list(entry['scale']):
+            if not _number(value) or value <= 0:
+                problems.append('scale %r is not a finite positive number'
+                                % (value,))
+    if 'zero_point' in entry:
+        for value in _as_list(entry['zero_point']):
+            if not _number(value):
+                problems.append('zero_point %r is not a finite number'
+                                % (value,))
+    return problems
+
+
 def check_quantized_state_pairs(handoff, tensors):
     """Return the list of differences between each state input and output.
 
@@ -66,6 +88,9 @@ def check_quantized_state_pairs(handoff, tensors):
                             % (name, back, ', '.join(missing)))
             continue
         left, right = tensors[name], tensors[back]
+        for tensor_name, entry in ((name, left), (back, right)):
+            for reason in _invalid_encoding(entry):
+                problems.append('%s: %s' % (tensor_name, reason))
         for field in _FIELDS:
             if field not in left or field not in right:
                 problems.append('%s -> %s: report lacks %s'
@@ -91,7 +116,7 @@ def main(argv=None):
     graph = onnx.load(args.graph)
     try:
         pairs = validate_inplace_state_from_metadata(graph)
-    except RuntimeError as error:
+    except (RuntimeError, ValueError, KeyError, TypeError) as error:
         print('FAIL graph: %s' % error)
         return 1
     print('PASS graph: %d state pairs are bindable in place' % pairs)

@@ -277,3 +277,37 @@ def test_command_line_exit_codes(tmp_path, capsys):
     bad_graph = tmp_path / 'bad_graph.onnx'
     onnx.save(build(window_user_op='Identity'), str(bad_graph))
     assert quant.main([str(bad_graph), '--report', str(good)]) == 1
+
+
+@pytest.mark.parametrize('scale', [float('nan'), float('inf'), 0.0, -0.5])
+def test_an_unusable_scale_is_reported_even_when_both_sides_agree(scale):
+    tensors = _report({('win', 'scale'): scale, ('win_out', 'scale'): scale})
+    problems = quant.check_quantized_state_pairs(HANDOFF, tensors)
+    assert any('finite positive' in item for item in problems), problems
+
+
+def test_a_non_numeric_zero_point_is_reported():
+    tensors = _report({('win', 'zero_point'): 'x',
+                       ('win_out', 'zero_point'): 'x'})
+    problems = quant.check_quantized_state_pairs(HANDOFF, tensors)
+    assert any('zero_point' in item for item in problems), problems
+
+
+@pytest.mark.parametrize('damage', ['bad_json', 'missing_axis', 'bad_kind'])
+def test_malformed_state_metadata_fails_the_graph_check(tmp_path, capsys,
+                                                       damage):
+    model = build()
+    slicing = {'win': {'kind': 'window', 'axis': 2},
+               'rows': {'kind': 'rows', 'axis': 1}}
+    if damage == 'missing_axis':
+        del slicing['win']['axis']
+    if damage == 'bad_kind':
+        slicing['win']['kind'] = 'ring'
+    text = '{"win": ' if damage == 'bad_json' else json.dumps(slicing)
+    for prop in model.metadata_props:
+        if prop.key == 'state_slicing':
+            prop.value = text
+    graph = tmp_path / 'g.onnx'
+    onnx.save(model, str(graph))
+    assert quant.main([str(graph)]) == 1
+    assert 'FAIL graph' in capsys.readouterr().out
