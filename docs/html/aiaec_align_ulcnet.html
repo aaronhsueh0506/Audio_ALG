@@ -19,7 +19,7 @@ th{background:#eef0f2}
 </style>
 </head>
 <body>
-<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html"><b>Align-ULCNet</b></a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a></nav>
+<nav><a href="index.html">index</a><a href="aiaec_align_ulcnet.html"><b>Align-ULCNet</b></a><a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a><a href="aiaec_align_cruse.html">Align-CRUSE</a><a href="aiaec_deepvqe_s.html">DeepVQE-S</a><a href="aiaec_cagcrn.html">CAGCRN</a></nav>
 <h1>Align-ULCNet（linear AEC → RES+NR post-filter，paper reference）</h1>
 
 <h2>概要</h2>
@@ -67,29 +67,7 @@ graph 綁四個特徵輸入 <code>error_mag/far_mag/error_cos/error_sin</code>�
 <code>output</code> 是學到的複數 mask（planar <code>[1,2,1,K]</code>，plane 0 實部、plane 1 虛部）；
 host（<code>commit()</code>）用 <code>prepare()</code> 留在 state 的<b>壓縮域</b> error 頻譜乘上 mask，
 再逆冪還原。以上是唯一的 boundary（layout 18；graph 內前後端與分開的 GRU hidden 都已移除）。</p>
-<div class="note"><b>far branch 契約</b>：checkpoint contract 的 <code>far_input_mode</code>
-只記錄訓練 provenance（legacy 預設 <code>raw_far</code>）。production 固定用 AEC aligned-far
-seam；未取得 alignment 時 seam 暫時承載 raw far，模型仍執行，取得後切成 aligned far 並 reset
-recurrent state。<code>export_onnx.py</code> 因此分開寫 <code>training_far_input_mode</code>
-與部署用 <code>far_input_mode=aligned_far</code>；C descriptor 只接受 ALIGNED，production
-pipeline 沒有 runtime far-mode setter，raw/aligned 比較只留在 sweep 工具。</div>
-<div class="note"><b>PTQ calibration</b>：可直接用訓練域的 <code>linear_error + raw_far</code>；
-report 會把 <code>calibration_far_input_mode=raw_far</code> 與
-<code>deployment_far_input_mode=aligned_far</code> 分開記錄。D 不改權重，但會改 K/V window
-shape 與 host RAM，所以 calibration 的 D 必須和該份 ONNX export 相同。</div>
-<div class="note"><b>既有匯出必須全部重跑</b>：model-I/O layout 現為 v18
-（<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> = 18；四個 state 是完整 window，每個 <code>*_out</code> 就地綁定到輸入位址；
-<code>RETIRED_LAYOUT_VERSIONS</code> = 3–17，不得重用），舊 layout 產出的每一份
-ONNX/JSON descriptor 會在 <code>ulcnet_model_io_descriptor_validate()</code> 卡在
-<code>layout_version</code>，<code>ulcnet_accelerator_adapter_init()</code> 回 NULL。
-state shape 變了：K/V 是 <code>(1,32,D,TA)</code>、logit 是 <code>(1,32,5,D)</code>、兩顆 GRU hidden 併成單一
-<code>h_gru (1,4,1,128)</code>；<code>output</code> 元素數不變（2·K），所以版本號是唯一能攔下舊板綁新圖的閘門。
-修法只有「重新 export graph」：權重未變，checkpoint 與 dataset <b>不需要</b>重新訓練或重新生成；
-calibration 資料（state 輸入 shape 變了）與量化結果須重做、加速器程式重新編譯。
-以 seeded 隨機權重、D=4/8 的舊 trace 實測：新 graph 的 mask 對舊 trace 逐位元相同（最大絕對差 0），
-新 <code>*_out</code> 等於舊圖的 window 接上新一幀（Concat 結果）、舊 <code>*_out</code> 等於新 <code>*_out</code> 去掉被丟掉的那一格；
-真實 checkpoint 與板端量化尚未驗證。下一次真正 bump
-<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 要跳到 19。</div>
+<div class="note"><b>far branch 契約</b>:production 固定用 AEC aligned-far seam,C descriptor 只接受 ALIGNED,<code>export_onnx.py</code> 分開寫 <code>training_far_input_mode</code> 與部署用 <code>far_input_mode=aligned_far</code>;PTQ calibration 的 D 必須和該份 ONNX export 相同。<b>既有匯出必須全部重跑</b>:model-I/O layout 現為 v18(<code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> = 18;<code>RETIRED_LAYOUT_VERSIONS</code> = 3–17,不得重用),舊 layout 的 ONNX/JSON descriptor 會在 <code>ulcnet_model_io_descriptor_validate()</code> 卡在 <code>layout_version</code>。三項的完整說明(含實測與尚未驗證的部分)收在 <a href="aiaec_align_ulcnet_detail.html">aiaec_align_ulcnet_detail</a>。</div>
 
 <h2>ONNX graph boundary（layout 18）</h2>
 <p>boundary 只有一種：四個 host 特徵輸入加四個 rank-4 state，每個 state 都有同 shape 的 <code>*_out</code>。
@@ -103,17 +81,7 @@ calibration 資料（state 輸入 shape 變了）與量化結果須重做、加�
 <tr><td><code>logit_history</code></td><td><code>(1,32,5,D)</code></td><td>oldest-first：frame 4 是最新一幀；score conv 的 5 幀輸入</td></tr>
 <tr><td><code>h_gru</code></td><td><code>(1,4,1,128)</code></td><td>subband GRU 0 的兩層，接著 subband GRU 1 的兩層（沿 dim 1 疊；dim 0 是 singleton N，不是疊的軸）</td></tr>
 </table>
-<p>輸出是 <code>output</code>（planar mask <code>(1,2,1,K)</code>）加 <code>key_history_out</code>/<code>value_history_out</code>/
-<code>logit_history_out</code>/<code>h_gru_out</code>，每個 <code>*_out</code> 與同名輸入 shape 完全相同。
-<b>位移在 graph 內、用輸入端的 Slice</b>：K/V 取輸入的 slot <code>0..D−2</code>（Slice axis 2，start 0、end D−1，step 1）
-再把新一幀 Concat 在<b>前面</b>；logit 取輸入的 frame <code>1..4</code>（start 1、end 5）再把新的一列 Concat 在<b>後面</b>。
-Concat 的結果同時是 attention 的候選與 <code>*_out</code>，沒有任何 state 輸出由 Slice 產生；被丟掉的那一格
-（K/V 的 slot D−1、logit 的 frame 0）只用來讓輸入與輸出 shape 相同，graph 不讀它。</p>
-<p>因此 runtime 可以把每個 <code>*_out</code> 綁到同名輸入的位址（維護者的板端驗證確認 NPU 先讀完全部輸入才寫輸出），
-CPU 不搬、不複製。<code>export_graph</code> 對寫出的檔案呼叫 <code>validate_inplace_state_contract</code>
-（<code>AIAEC/_onnx_contract.py</code>）：每對 state 的 shape 相同且 rank 為 4、每個 window 輸入恰有一個 Slice 消費者
-（axis 2、step 1、end 為窗內整數、保留 N−1 幀）、沒有 state 輸出由 Slice 產生，metadata 帶
-<code>state_binding = in_place_same_address</code>；任何一項不成立匯出直接失敗。</p>
+<p>輸出是 <code>output</code>（planar mask <code>(1,2,1,K)</code>）加四個 <code>*_out</code>，每個與同名輸入 shape 完全相同。位移在 graph 內、用輸入端的 Slice 再把新一幀 Concat 進去（K/V 放前面、logit 放後面），沒有 state 輸出由 Slice 產生，所以 runtime 可把每個 <code>*_out</code> 綁到同名輸入的位址、CPU 不搬不複製;<code>export_graph</code> 以 <code>validate_inplace_state_contract</code>（<code>AIAEC/_onnx_contract.py</code>）檢查,任何一項不成立匯出直接失敗。Slice 參數與檢查項目逐條收在 <a href="aiaec_align_ulcnet_detail.html">aiaec_align_ulcnet_detail</a>。</p>
 <pre>python3 AIAEC/Align_ULCNet/export_onnx.py --checkpoint ckpt.pth \
     --max-delay-frames 8 --output output/align_ulcnet_d8.onnx --verify</pre>
 <div class="note">boundary 沒有可選開關：前後端固定在 host，GRU hidden 固定併成單一 <code>h_gru</code>，
@@ -184,18 +152,7 @@ framing 照常前進（stream 0 已是 linear-AEC error，放行安全；DeepVQE
 <code>*_state_generation()</code>）是 C 端清零 state 的次數計數器：<code>reset</code> 與被拒絕的 commit 各加一，
 新建的實例為 0，成功的 commit、skip 與再次呼叫被拒的 commit 都不動它。定點 accelerator 的 state 緩衝在 C 清零時不會
 跟著變，板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。</p>
-<p><b>rolling 分析</b> <code>AcStft</code> 的 <code>center</code> 0（<code>ulcnet_framing_config()</code> 的 <code>center</code> 參數，
-<code>ulcnet_process.h</code>；DeepVQE-S 自建同組態的物件）：center=False，
-<b>第一次 push 起每次恰一幀</b>（首幀前半段是歸零的歷史），與 centered
-<code>center</code> 1 的 <code>AcStft</code> 對同一個 hop 吐出的<b>最後一幀位元相同</b>——這個幾何下
-（win = n_fft、hop = n_fft/2、共用同一張 sqrt-Hann 表）centered 第 k 幀與 non-centered 第 k−1 幀
-蓋的是同一段樣本、同一個窗，centered 排程只是<b>在開頭多發一幀 reflect 前綴</b>。
-<code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例逐 hop memcmp 釘住這件事
-（400 hop，真的跑 0/2/1 排程），所以是<b>實測</b>；hop 0 的 centered 排程 0 幀，兩者<b>自第二個
-hop 起</b>對得起來。<b>排程由建立 <code>AcStft</code> 時的 <code>center</code> 決定</b>，同一個物件不會混用兩種排程。
-centered（<code>center</code> 1）<b>沒有出貨 pipeline 使用</b>：mono wrapper
-（<code>audio_pipeline_ulcnet.c:497-498</code>）以 <code>center</code> 0 的 <code>AcStft</code> 呼叫
-<code>ac_stft_push_planar()</code>，與 4ch 的 far 分支同排程；只剩上述 parity 測試還在用 <code>center</code> 1 當比對基準。</p>
+<p><b>rolling 分析</b>:出貨 seam 的 <code>AcStft</code> 用 <code>center</code> 0(<code>ulcnet_framing_config()</code>),第一次 push 起每次恰一幀;與 centered(<code>center</code> 1)對同一個 hop 吐出的最後一幀位元相同(<code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例實測),自第二個 hop 起對得起來。完整說明收在 <a href="aiaec_align_ulcnet_detail.html">aiaec_align_ulcnet_detail</a>。</p>
 <p><b>adapter 改為驅動類別</b>：<code>ulcnet_accelerator_adapter.c</code> 不再自己接 per-frame
 transaction，而是開一個 <code>ULCNET_IO_FREQ</code> 實例（不 carve framing state、完全不牽涉
 FftHandle/window，framing 時鐘歸呼叫端）；adapter pool = 類別 FREQ pool + 32 B header。

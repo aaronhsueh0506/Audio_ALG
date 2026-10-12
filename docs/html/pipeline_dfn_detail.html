@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DFN2 pipeline 細節(入口語意、rate bridge pool、測試內容)</title>
+<style>
+body{font-family:-apple-system,"PingFang TC","Noto Sans TC",sans-serif;max-width:960px;margin:0 auto;padding:16px;line-height:1.55;color:#222;background:#fff}
+nav{border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:16px;font-size:14px}
+nav a{margin-right:12px;text-decoration:none;color:#0645ad}
+h1{font-size:22px}h2{font-size:17px;border-left:4px solid #47a;padding-left:8px;margin-top:28px}
+h3{font-size:15px}
+pre{background:#f6f6f4;border:1px solid #ddd;padding:10px;overflow-x:auto;font-size:12px;line-height:1.35}
+code{background:#f0f0ee;padding:1px 3px;font-size:0.92em}
+table{border-collapse:collapse;font-size:13px;margin:8px 0;display:block;overflow-x:auto}
+th,td{border:1px solid #bbb;padding:4px 8px;text-align:left;vertical-align:top}
+th{background:#eef2f8}
+.note{background:#fff8e0;border:1px solid #e0d090;padding:8px;font-size:13px}
+</style>
+</head>
+<body>
+<nav>
+<a href="index.html">index</a>
+<a href="pipeline_mono.html">pipeline_mono</a>
+<a href="pipeline_4ch.html">pipeline_4ch</a>
+<a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>
+<a href="pipeline_dfn_detail.html"><b>pipeline_dfn_detail</b></a>
+<a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>
+<a href="ainr_dfn2.html">DFN2</a>
+<a href="conventions.html">慣例</a>
+</nav>
+<h1>DFN2 pipeline 細節 — 入口語意、rate bridge pool 與測試內容</h1>
+
+<h2>概要</h2>
+<p>本頁收兩條 DFN2 pipeline(<a href="pipeline_dfn_mono.html">mono</a>、<a href="pipeline_dfn_4ch.html">4ch</a>)會把單頁撐過 30 KB 的細節:(1) 兩個 wrapper 的公開入口逐項語意與 stage／bridge 的 reject-first 清單,(2) 16 kHz／8 kHz 原生格點才存在的 <code>DfnRateBridge</code> pool 逐項說明(兩個 wrapper 共用同一份 bridge),(3) 各測試檔實際檢查的內容。API 範例、block diagram、泳道圖、I/O 表、State 表主表、延遲與 warm-up、檔案清單仍各自留在原頁。</p>
+
+<h2>mono wrapper:入口語意(<code>mono_aec_dfn_res_*</code>)</h2>
+<table>
+<tr><th>入口</th><th>語意</th></tr>
+<tr><td><code>_get_mem_requirements</code></td><td>Reject-first:NULL、<code>host.sample_rate</code> 不是 8000/16000/48000、<code>aec_only≠0</code>、<code>enable_nr≠0</code>、<code>enable_res≠1</code>、非有限 <code>atten_lim_db</code>、48 kHz 時 fft_size 不是 0/1024,以及 host、stage 或 bridge 的任何拒絕都回 -1。<code>build_flags_hash</code> 摺入 host 與「stage 或 bridge」的 layout/hash,任一端 carve 改變即作廢。</td></tr>
+<tr><td><code>_init</code> / <code>_init_ex</code></td><td>在呼叫端記憶體建構;<code>_init_ex</code> 多一道 8 點 stale-pool gate。<code>_destroy</code> 只釋放 <code>_create</code> 配置的記憶體。</td></tr>
+<tr><td><code>_process_begin</code></td><td>要求 phase 0。<code>audio_pipeline_process_spec()</code> 取得 <code>SeSpecFrame</code>,再 <code>sk_min_f32</code>(unity 與 <code>g_res_ctx</code>)→ <code>sk_capply_gain_f32</code> →(<code>enable_cng</code> 時)<code>aec_cng_fill()</code> 組出 P,交給 stage(48 kHz)或 bridge(8/16 kHz)。任一步失敗即<b>整條 pipeline reset</b> 並回 -1。</td></tr>
+<tr><td><code>_nn_begin</code> / <code>_nn_end</code></td><td><code>nn_begin</code> 回 1(job 已開,<code>*job</code> 借用到 <code>nn_end</code>)、0(本 hop 沒有了)或 -1;一個 job 開著時不得再 <code>nn_begin</code>。<code>nn_end(rc)</code>:rc=0 且輸出寫滿、有限才提交,否則該幀走 identity,時鐘照樣各前進一次。48 kHz 每 hop 最多 1 個 job,原生格點經 bridge 最多 2 個,所以用迴圈。</td></tr>
+<tr><td><code>_process_end</code></td><td>沒被取走或沒被關閉的 job 走 identity(fail-open),然後合成剛好一個 host hop(48 kHz 走 <code>audio_pipeline_synthesize()</code>,原生格點走 <code>dfn_rate_bridge_finish()</code>,bridge 自己合成)。</td></tr>
+<tr><td><code>_process</code></td><td>上面四個呼叫的序列,模型由 <code>cfg.model.infer</code>(<code>dfn_res_stage_infer()</code>)執行。</td></tr>
+<tr><td><code>_set_aec_preset</code> / <code>_set_atten_lim</code></td><td>執行期強度:host 的 AEC preset dB 域 ramp、stage 的 DFN2 attenuation limit(非有限值回 -1)。只能在 hop 之間。</td></tr>
+<tr><td><code>_get_host</code> / <code>_get_aec</code> / <code>_get_stage</code> / <code>_get_bridge</code></td><td>唯讀診斷 handle(<code>audio_pipeline_get_last_timing</code>、<code>aec_get_res_context</code>、<code>dfn_res_stage_get_counters</code>、<code>dfn_rate_bridge_get_counters</code>/<code>_added_delay_samples</code>);<code>_get_bridge()</code> 在 48 kHz 回 NULL。<b>不可</b>經由它們 reset/destroy。</td></tr>
+<tr><td><code>_hop_size</code> / <code>_lookahead_samples</code></td><td>host hop / 總演算法延遲:48 kHz 為 512 與 1536(=3 hop);原生格點為 hop 與「hop + bridge added delay」(16 k/256 = 128 與 800)。NULL 回 -1。</td></tr>
+</table>
+<p class="note"><b>Stage 的 reject-first 清單</b>(<code>dfn_res_stage.h</code>、<code>.c</code>):非 48000、fft_size 非 0/1024、缺 ERB 矩陣、<b><code>erb_inv</code> 不是 partition of unity</b>、非有限 <code>atten_lim_db</code>、有 <code>infer</code> 卻沒 descriptor(或被 <code>dfn2_model_io_descriptor_validate()</code> 拒絕)、以及不是從 <code>pipelines/Makefile</code> 建置(backend id 0)。unity 檢查照 <code>df_common_expand_mask</code> 的展開順序逐 band 累加後<b>逐位元</b>比對 <code>1.0f</code>——fail-open identity 的精確性就建立在此(<code>dfn_res_stage.c</code>)。Bridge 另有拒絕列:取樣率非 8000/16000、該取樣率沒有的 fft_size,以及 stage 的任何拒絕(<code>dfn_rate_bridge.h</code>)。</p>
+
+<h2>4ch wrapper:入口語意(<code>four_aec_dfn_res_*</code>)</h2>
+<table>
+<tr><th>入口</th><th>語意</th></tr>
+<tr><td><code>_get_mem_requirements</code></td><td>Reject-first:<code>sample_rate</code> 不是 16000/48000(含 8 kHz)、48 kHz 時 fft_size 非 0/1024、<code>enable_post≠1</code>、<code>enable_res≠1</code>、<code>enable_nr≠0</code>、非有限 <code>atten_lim_db</code>,以及核心、stage 或 bridge 的任何拒絕。<code>build_flags_hash</code> 摺入核心與「stage 或 bridge」的 layout/hash(<code>4aec_dfn_res.c:145-160</code>)。</td></tr>
+<tr><td><code>_init</code> / <code>_init_ex</code> / <code>_create</code> / <code>_destroy</code></td><td>同房規:<code>_init_ex</code> 多一道 8 點 stale-pool gate(<code>4aec_dfn_res.c:181-203</code>);<code>destroy</code> 只釋放 <code>create</code> 配置的記憶體。</td></tr>
+<tr><td><code>_front_process</code></td><td>轉呼叫前端的 <code>four_aec_front_process()</code>,交出借用的 <code>FourAecFront</code>。<code>out-&gt;delay.changed</code> 照舊回報給<b>外部</b> STFT/OLA 的 far-end 消費者;stage 與 bridge 都不消費 far-end,所以<b>不因此 reset</b>。</td></tr>
+<tr><td><code>_process_begin</code></td><td>要求 phase 0(否則 <code>SEQUENCE_ERROR</code>)。<code>four_aec_fuse()</code> → <code>se_res_stage_gain()</code> → <code>sk_min_f32</code> → <code>sk_capply_gain_f32</code> →(<code>enable_cng</code> 時)<code>aec_cng_fill()</code> 組出 P,再交給 stage(48 kHz)或 bridge(16 kHz)。<code>beamformed_error</code> 為 NULL 時由權重重建;非 NULL 時採用它(契約同 <code>four_aec_fuse()</code>)。前端回 <code>DSP_ERROR</code>、stage 或 bridge 拒絕,都會 <b>reset 整個 wrapper</b> 並回 <code>FOUR_AEC_NR_RES_DSP_ERROR</code>。</td></tr>
+<tr><td><code>_nn_begin</code> / <code>_nn_end</code></td><td><code>nn_begin</code> 回 1(job 已開,<code>*job</code> 借用到 <code>nn_end</code>)、0(本 hop 沒有了)或負的狀態碼;一個 job 開著時不得再 <code>nn_begin</code>。<code>nn_end(rc)</code>:rc=0 且輸出寫滿、有限才提交,否則該幀走 identity,時鐘照樣各前進一次。48 kHz 每 hop 最多 1 個 job,16 kHz 經 bridge 最多 2 個,所以用迴圈。</td></tr>
+<tr><td><code>_process_end</code></td><td>沒被取走或沒被關閉的 job 走 identity(fail-open),然後合成剛好一個 hop(48 kHz 本應用的 <code>ac_istft_push()</code>、16 kHz <code>dfn_rate_bridge_finish()</code>)。輸出含非有限值則 reset 並回 <code>DSP_ERROR</code>。</td></tr>
+<tr><td><code>_process</code></td><td>上面四個呼叫的序列,模型由 <code>cfg.model.infer</code>(<code>dfn_res_stage_infer()</code>)執行。</td></tr>
+<tr><td><code>_set_aec_preset</code> / <code>_set_atten_lim</code></td><td>執行期強度:核心的 AEC preset dB 域 ramp,以及 stage 的 DFN2 attenuation limit。只能在 hop 之間。</td></tr>
+<tr><td><code>_hop_size</code> / <code>_lookahead_samples</code></td><td>核心 hop / 總演算法延遲:48 kHz 為 512 與 1536(=3 hop);16 kHz 為 hop 與「hop + bridge added delay」(fft 256 → 128 與 800)。NULL 回 -1(<code>4aec_dfn_res.c:441-452</code>)。</td></tr>
+<tr><td><code>_get_front_end</code> / <code>_get_stage</code> / <code>_get_bridge</code></td><td>唯讀診斷 handle(核心的結構稽核 <code>*_count()</code>、duty census、<code>dfn_res_stage_get_counters()</code>、<code>dfn_rate_bridge_get_counters()</code>);<code>_get_bridge()</code> 在 48 kHz 回 NULL。<b>不可</b>經由它們 reset 或 destroy。</td></tr>
+</table>
+<p class="note">Stage 的 reject-first 清單(<code>pipelines/dfn_res_stage.h</code>)在這裡一字不差地適用,其中最容易踩到的是 <code><b>erb_inv</b></code> 必須是 partition of unity:檢查照 <code>df_common_expand_mask</code> 的展開順序(band 外、bin 內)逐 band 累加後<b>逐位元</b>比對 <code>1.0f</code>,因為 fail-open identity 的精確性建立在這個性質上(<code>pipelines/dfn_res_stage.c</code>)。</p>
+
+<h2><code>DfnRateBridge</code> pool 逐項(原生格點才存在)</h2>
+<p>兩個 wrapper 在 8/16 kHz 核心時都 carve <b>整個</b> <code>DfnRateBridge</code> pool(<code>pipelines/dfn_rate_bridge.{h,c}</code>),stage 的 pool 含在其中;48 kHz 沒有 bridge。<code>dfn_rate_bridge_reset()</code> 連同 stage 一起清乾淨並重新預填。</p>
+<table>
+<tr><th>state</th><th>大小</th><th>存放者</th><th>備註</th></tr>
+<tr><td>3 顆 <code>audio_resampler</code>;原生 <code>AcIstft</code> ×2、48 kHz <code>AcStft</code> ×2 與 <code>AcIstft</code> ×1;兩個 FFT handle、兩張窗表;48 kHz FIFO ×2</td><td>各自 pool;2×<code>AcIstft</code>(fft_n)+ 3×1024 點物件;<code>FIFO48_CAP</code> = 1,536 float ×2</td><td>bridge pool</td><td>E、P 各一顆升頻(→ 48 kHz)、共用一顆降頻(每顆自帶相位與 FIR 歷史)。<code>synth_e</code>/<code>synth_p</code> 各走一份 host 同款 sqrt-Hann WOLA 還原成時域;<code>fifo_e</code>/<code>fifo_p</code>(<code>FIFO48_CAP</code>:只放未湊滿 512 的餘量加一個 hop 的升頻量,每消耗一幀就左移 512;分析歷史由 <code>stft_e</code>/<code>stft_p</code> 持有)。五個 STFT/ISTFT 物件借用 bridge 的兩支 FFT handle 與兩張窗表（<code>win_n</code>、<code>win48</code>）,bridge 以「自帶 FFT 與窗的物件大小減去那兩段」估算借用物件大小</td></tr>
+<tr><td>原生 out FIFO</td><td>1024 float(<code>OUT_FIFO_CAP</code>)</td><td>bridge pool</td><td>init 預填 <code>prefill</code> 個零(16 k/hop 128 → 128、16 k/hop 256 → 85、8 k/hop 128 → 42),之後每 hop 取走一個 hop</td></tr>
+<tr><td>bridge 計數器;<b>bridge pool 小計</b></td><td><b>355,008 B(ne10)</b></td><td>bridge struct / 含在上層 pool 內</td><td><code>frames_48k</code>/<code>last_hop_frames</code>(<code>dfn_rate_bridge_get_counters()</code>,測試用 <code>last_hop_frames</code> 驗證排程)。小計為 16 kHz / fft 256 現查,<b>已含 stage 的 pool</b></td></tr>
+</table>
+<p>4ch wrapper 在 16 kHz／fft 256 的 bridge pool 小計同為 <b>355,008 B(ne10)</b>(已含 stage 的 pool);4ch 的 bridge 另有一個 <code>phase</code> 欄位供 begin/nn_begin/nn_end/finish 序列閘使用(struct 大小不變)。</p>
+
+<h2>4ch wrapper:估計用 E、套用在 P</h2>
+
+<p><b>E</b> = <code>frame.e</code>(<code>SeSpecFrame</code>):beamformed 線性誤差頻譜(由 <code>weights</code> 重建的 coherent projection,或呼叫端交出的 <code>beamformed_error</code>),也就是 RES gain <b>據以估計</b>的那個 pre-RES 頻譜,只送進網路做<b>估計</b>。<b>P</b> = 本應用的 <code>post</code> 緩衝:<code>E * min(1, G_res)</code> + comfort noise,才是三個 head <b>套用</b>的對象。理由與 mono 相同:DFN2 是以未經處理的 noisy speech 訓練的,不能讓它看見 RES 挖出的頻譜洞;像語音的 far-end 殘留由 DFN 保留、留給 RES 處理,不像語音的兩級都壓。本應用的 comfort-noise fill(<code>front_end.enable_cng</code>)是開關但<b>預設關閉</b>:關閉時 E 與 P 逐 bin 同相位,複數 deep-filter tap 不會相位錯配;開啟時 CNG 在 RES 挖掉的 bin 改變 P 的相位,estimate/apply 一致性在那裡不成立(<code>dfn_res_stage.h</code> 開頭)。開啟時它包在 P 裡、過同一張 mask,<code>atten_lim_db</code> 限制任何一個 bin 最多被壓多少。</p>
+
+<h2>4ch wrapper:fail-open 等值</h2>
+<p class="note"><b>Fail-open = 傳統核心的等值(延後)。</b>沒有模型、<code>infer()</code> 回非 0、或輸出有未寫/非有限值時,該幀走 <code>dfn2_prepost_frame_skip()</code>(unit ERB mask 經 partition-of-unity 的 <code>erb_inv</code> 展開成 unit bin gain、zero taps、alpha 0),輸出即「<code>enable_nr=0</code> 的傳統核心延後兩個 hop」,comfort noise 一併保留。這是本 wrapper 的 backbone gate,48 kHz 由 C 測試在權重重建／trusted 兩種來源 × CNG 關/開共四輪逐 byte 釘死;16 kHz 因為多了 resampler 往返,gate 改為「延後 added delay 後的通帶容差」。</p>
+
+<h2>測試內容</h2>
+<table>
+<tr><th>測試檔</th><th>檢查內容</th></tr>
+<tr><td><code>pipelines/mono_aec_dfn_res/tests/test_audio_pipeline_dfn.c</code></td><td>48 kHz backbone gate:對「<code>enable_nr=0</code> 的傳統 pipeline 延後兩個 hop」逐 byte 相同(CNG 與 phased 序列各列),CNG 關與開各一輪,且<b>跨一次真實的 delay 改變</b>;另檢查 <code>min G_res &lt; 0.9</code>(否則 P≡E、estimate/apply 對調無法被看見)、計數器 <code>frames=64 / commits=0 / skips=63</code>、拒絕列。現查兩輪皆 <code>identity over 64 hops, 1 delay change(s), min G_res 0.040</code>。另有 phased 列(<code>process_begin</code>／<code>nn_begin</code>／<code>nn_end</code>／<code>process_end</code> 序列對 <code>process()</code> 逐位元相同,含失敗模型、未取走的 job、序列錯誤)。另有三個原生格點閘(16 k/256、16 k/512、8 k/256):排程、累計幀數、脈衝釘住的 added delay(672/629/330)、對 NR-off 輸出的通帶容差</td></tr>
+<tr><td><code>pipelines/tests/test_dfn_rate_bridge.c</code>、<code>pipelines/tests/test_dfn2_rate_bridge_c_parity.py</code></td><td>bridge 自身(不含 AEC),三個格點各一輪:幀排程與累計幀數、prefill/added-delay 表、脈衝釘延遲、容差 identity、E 單獨進不得出現在輸出、reset parity、拒絕列(48 kHz、44.1 kHz、8 k/512、16 k/1024、缺矩陣、stage 非 48 kHz、壞 descriptor、pool 太小)。Parity 測試把 Python <code>Dfn2RateBridge</code> 經 ctypes shim 對 C:同一組 delay 整數、輸出在 float32 捨入內</td></tr>
+<tr><td><code>pipelines/4ch_aec_bf_dfn_res/tests/test_4aec_dfn_res.c</code></td><td>Backbone gate:對「<code>enable_nr=0</code> 的傳統鏈(前端＋明寫 stage 串接,<code>conv_chain_4ch.h</code>)延後兩個 hop」逐 byte 相同,<b>reconstructed × trusted × CNG 關/開共四輪</b>,且跨一次真實的 delay 改變;另有 RES-active 見證(同一刺激下 RES 關的核心必須與 RES 開的不同,否則 P≡E)、計數器 <code>frames=64 / commits=0 / skips=63</code>、以及 config/pool/descriptor 的拒絕列(含 <code>enable_nr=1</code>、<code>enable_res=0</code>、16 kHz、破壞 <code>erb_inv</code> unity)。現查輸出:四輪皆 <code>identity over 64 hops, 1 delay change(s)</code>;另有 phased 列(<code>process_begin</code>／<code>nn_begin</code>／<code>nn_end</code>／<code>process_end</code> 序列對 <code>process()</code> 逐位元相同,含失敗模型、未取走的 job、序列錯誤各列)。另有兩個原生格點閘(16 k/256、16 k/512):排程、累計幀數、脈衝釘住的 added delay(672/629)、對傳統 NR-off 輸出的通帶容差,以及<b>對 8 kHz 的拒絕</b></td></tr>
+</table>
+
+<h2>相關檔案與測試路徑</h2>
+<ul>
+<li><code>pipelines/dfn_res_stage.h / .c</code>、<code>pipelines/dfn_rate_bridge.h / .c</code>、<code>pipelines/mono_aec_dfn_res/audio_pipeline_dfn.h / .c</code>、<code>pipelines/4ch_aec_bf_dfn_res/4aec_dfn_res.h / .c</code></li>
+<li>其餘檔案與測試清單見 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>、<a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a>。</li>
+</ul>
+</body>
+</html>

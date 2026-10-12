@@ -28,6 +28,7 @@ th{background:#eef1f5}
 <nav>
 <a href="index.html">index</a>
 <a href="ainr_dfn2.html"><b>DFN2</b></a>
+<a href="ainr_dfn2_detail.html">DFN2 細節</a>
 <a href="ainr_gtcrn.html">GTCRN</a>
 <a href="ainr_rnnoise_erb.html">RNNoise-ERB</a>
 <a href="pipeline_dfn_mono.html">mono-DFN2</a>
@@ -147,13 +148,7 @@ for (each hop of DFN2_HOP_LEN samples) {
 </li>
 <li><b>commit 前一定要有一次 <code>frame_inputs</code></b>(<code>prepared</code> 閂鎖):沒跑過的加速器不能把
 沒被碰過的 buffer 當結果。frame 開著時 <code>pre_process</code> 回 -1,一拍被拒絕而不是默默疊上去。</li>
-<li><b>skip 是精確的 identity,不是近似</b>:<code>erb_inv</code> 是 partition of unity
-(每個 bin 的 band 權重和為 1),unit band mask 展開後就是 unit bin gain,noisy 頻譜原樣穿過 cascade。
-<b>兩條匯出路徑都會擋</b>:一般路徑查 <code>inverse_unity_max_error</code>(1e-6),<code>--runtime-bins</code>
-在寫檔前呼叫 <code>require_partition_of_unity()</code>——照 <code>df_common_expand_mask</code> 的順序逐 band
-以 float32 累加後<b>逐位元</b>比對 <code>1.0f</code>(<code>export_erb_matrix.py</code>)。C 側 host
-(<code>pipelines/dfn_res_stage.c</code>)在 <code>get_mem_requirements()</code> 再驗一次,所以載到一份
-不是 partition of unity 的 <code>erb_inv.bin</code> 會被 init 擋下,而不是讓 identity 悄悄變成近似。</li>
+<li><b>skip 是精確的 identity,不是近似</b>:unit band mask 展開後就是 unit bin gain;<code>erb_inv</code> 必須是 partition of unity,匯出與 host 都會擋(推導與檢查點見 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>)。</li>
 <li><code>pre_process</code> 回的是<b>次數</b>不是布林:analysis 是 center=False,一拍就是一框,但圖吃
 <code>[t-1, t, t+1]</code>,第 0 拍沒有右鄰居、<b>不可以</b>呼叫加速器,所以回 0;之後每拍恰好一次推論。</li>
 </ul>
@@ -177,86 +172,10 @@ ERB 特徵又是 EMA 正規化的,mask 仍看起來合理,只有輸出電平是�
 <b><code>DFN2_ANALYSIS_SCALE</code> 不是這個因子</b>——那是特徵分支內部(libDF wnorm 殘留),
 只作用在餵給正規化器的那份拷貝,從不碰 masking/ISTFT 路徑上的頻譜。</p>
 
-<h3>記憶體與所有權</h3>
-<div class="tbl"><table>
-<tr><th>io_mode</th><th>pool(<code>get_mem_size</code>)</th><th>說明</th></tr>
-<tr><td><code>DFN2_IO_TIME</code></td><td>246,320 bytes</td><td>hop 進、hop 出;framing/window/OLA 由本類別做(pool 內一個 <code>AcStft</code> 與一個 <code>AcIstft</code>),transform 呼叫<b>呼叫端的</b> FftHandle</td></tr>
-<tr><td><code>DFN2_IO_FREQ</code></td><td>219,536 bytes</td><td>頻譜進、頻譜出,不做 transform,不 carve 任何 framing 物件;<code>fft</code> 可為 NULL</td></tr>
-</table></div>
-<ul>
-<li><b>FREQ 比 TIME 小 26,784 bytes</b>:<code>DFN2State</code> 不內嵌 analysis/window/synthesis 緩衝
-與 scratch,TIME 的 <code>AcStft</code>（16,480 B,含窗表）與 <code>AcIstft</code>（12,384 B,借用窗表）只在 TIME carve;FREQ 多 carve 雙輸入的第二組 staging
-(<code>app_re</code>/<code>app_im</code>)。io_mode 是 pool 的身分,init-time 固定,由 <code>_init_ex</code> 檢查。</li>
-<li><b><code>DFN2_PREPOST_CARVE_VERSION = 7</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
-摺進 <code>build_flags_hash</code>,所以舊 carve 的 pool 會在 <b>hash</b> 被拒。
-版本 4:遞迴 state 就是 <code>DFN2ModelIOState</code> 自己的陣列,別無其他;版本 5:<code>DFN2State</code> 另帶每個 ERB band 的非零 bin 範圍;<b>版本 6:遞迴 state 是 5 列 <code>h_gru</code> 與 5 幀 pathway window(graph layout 8)</b>;<b>版本 7:STFT／ISTFT 物件借用呼叫端的 <code>FftHandle</code> 與視窗表(pool 大小改變)</b>。</li>
-<li><b>遞迴 state:只有就地綁定</b>:兩個 state tensor(<code>h_gru (1,5,1,256)</code> 與 <code>df_convp_history (1,64,5,96)</code>,
-共 32,000 float = 128,000 bytes)各只有一份 buffer、位址固定;每個 state 的輸入與 <code>*_out</code> 輸出 shape 完全相同並綁到<b>同一個位址</b>,
-下一次呼叫的輸入就是這次的輸出,沒有第二份 buffer 也沒有複製。runtime 必須先讀完所有 state 輸入、才寫同位址的輸出
-(目標平台已確認 NPU 先讀完所有輸入再寫輸出)。<code>DFN2PrepostOutputs</code> 的 <code>*_next</code> 指標就是輸入的同一個位址。</li>
-<li><b>ERB 特徵與 mask 展開只走矩陣的非零範圍</b>:<code>dfn2_set_erb_matrices()</code> 依矩陣<b>內容</b>記下每個 bin／band 的非零區間
-(<code>DFN2State.erb_fwd_lo/hi</code>、<code>erb_inv_lo/hi</code>,以及正向矩陣每個 band 的 bin 範圍 <code>erb_fwd_k0/k1</code>),出貨矩陣 16,416 格只有 995 格非零。被略過的項都是「有限值 × ±0」,
-累加器從 +0 開始、加 ±0 不改變任何值(含 Inf/NaN),保留的項順序不變,所以結果與完整矩陣乘法逐位元相同;
-某個 bin 的 power 或某個 band 的 gain 非有限時(x × 0 會是 NaN),只有<b>那一列</b>走完整範圍。
-power 全有限時正向和依 <code>erb_fwd_k0/k1</code> 逐 band 算(相鄰四個 band 並行、暫存器累加,band 內仍是 bin 遞增順序,逐位元不變;每個 48 kHz frame 1.88→0.23 µs,Apple M4),任何 power 非有限時退回逐 bin 走法。
-<code>dfn2_state_init()</code> 之後矩陣為 NULL、範圍為完整。<b>就地改寫矩陣內容後必須再呼叫一次 <code>set_erb_matrices</code></b>;
-回歸測試 <code>AINR/tests/test_c_prepost.c</code> 的 <code>test_dfn_erb_spans_exact</code> 逐位元比對稀疏與完整兩種算法(含溢位、NaN、非有限 mask、含 NaN 的矩陣)。</li>
-<li><b>window 是借用的</b>:<code>cfg.window</code> 非 NULL 時,分析與合成物件都借用它(須與物件同壽命、內容不變);
-NULL 時由分析物件在 pool 內自帶 sqrt-Hann 表、合成物件借用同一張。<b>出貨路徑一律留 NULL</b>。</li>
-<li><b>FftHandle 與 ERB 矩陣是借用的</b>,從不建立或銷毀。ERB 矩陣<b>兩個模式都必填</b>,<code>fft</code> 只有 TIME 需要。</li>
-<li>32-byte <code>DFN2PrepostMemReq</code> 七欄:<code>descriptor_version</code>(=1)、<code>layout_version</code>
-(<code>DFN2_MODEL_IO_LAYOUT_VERSION</code>)、<code>io_mode</code>、<code>build_flags_hash</code>
-(FNV-1a-32 蓋 grid + geometry + feature version + io_mode)、<code>alignment</code>(16)、<code>reserved</code>、<code>bytes</code>。</li>
-</ul>
-
+<h3>記憶體、callback 邊界與建置</h3>
+<p>pool 大小(<code>DFN2_IO_TIME</code> 246,320 bytes、<code>DFN2_IO_FREQ</code> 219,536 bytes)與所有權規則、<code>DFN2PrepostMemReq</code> 七欄、<code>DFN2_PREPOST_CARVE_VERSION</code>、ERB 非零範圍、<code>DFN2Model</code> callback 與 18 欄 <code>DFN2ModelIoDescriptor</code>、<code>make -C AINR lib</code> 建置,收在 <a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a>。</p>
 <p class="note"><b>延遲:類別不改變模型自己的 2 hop lookahead。</b>identity 路徑(unit mask、alpha 0)實測輸出落後輸入
 <b>3 hops = 1536 samples = 32.0 ms @48 kHz</b>(WOLA 1 hop + 模型 2 hops);見下「延遲與 warm-up」。</p>
-
-<h3>加速器 callback 邊界:<code>DFN2Model</code></h3>
-<p>host 不擁有 runtime,只擁有<b>四個指標</b>;邊界放在 prepost 而非
-<code>dfn2_process.h</code>,因為 <code>dfn2_process.c</code> 必須能單獨編給 parity build。</p>
-<pre>typedef struct DFN2Model {
-    void *user;
-    int (*infer)(void *user, const DFN2PrepostInputs *inputs,
-                 DFN2PrepostOutputs *outputs);   /* 回 0 = 每個輸出都寫了 */
-    void (*reset)(void *user);                   /* 可選;hosting stage reset 時呼叫 */
-    const DFN2ModelIoDescriptor *io_descriptor;  /* NULL = 未發布 */
-} DFN2Model;
-
-int dfn2_model_run_frame(const DFN2Model *model, DFN2Prepost *p);</pre>
-<p><code>dfn2_model_run_frame()</code> 把一個已開啟的 frame 走完:<code>frame_inputs()</code>(head 預填 NaN)→ <code>infer()</code> →
-<code>frame_commit()</code>;<code>infer()</code> 回非 0 或 commit 被拒時改走 <code>frame_skip()</code>,
-所以 framing 與 compose 兩個時鐘<b>永遠恰好前進一次</b>。有限性規則不在這裡重寫一份——那是
-<code>frame_commit()</code> 的責任。回 1 = heads 已 commit、0 = 該幀被 skip、-1 = 契約錯誤(model/instance 為 NULL、
-沒有 <code>infer</code>、或沒有開啟中的 frame)。<b>與 AIAEC 的 identity 政策不同</b>:被 skip 的幀仍然吐出兩拍前的 source frame
-——identity 是<b>在 cascade 內部</b>套用的,時序從不改變。</p>
-<p><b>有 <code>infer</code> 就必須發布 descriptor。</b><code>DFN2ModelIoDescriptor</code>是
-<b>18 個欄位</b>的圖合約:<code>layout_version</code>、<code>sample_rate</code>、<code>fft_size</code>、<code>hop_size</code>、
-<code>spectrum_bins</code>、<code>erb_bands</code>、<code>df_bins</code>、<code>df_order</code>、<code>mask_lookahead</code>、
-<code>df_lookahead</code>、<code>input_frames</code>、<code>encoder_gru_layers</code>、<code>erb_gru_layers</code>、
-<code>df_gru_layers</code>、<code>gru_hidden</code>、<code>encoder_channels</code>、<code>df_pathway_window</code>(=5)、
-<code>state_tensor_count</code>(=2)。<code>_descriptor_default()</code> 填本 build 的值,<code>_descriptor_validate()</code>
-<b>逐欄位</b>比對(不是 memcmp,padding 不得參與決定),不合即 -1。欄位全是編譯期常數(沒有 Align-ULCNet
-<code>delay_depth</code> 那種部署自由度),所以 <code>validate(default())==0</code> 恆真,它唯一的工作是<b>擋掉對著另一個
-layout 版本或另一組幾何匯出的圖</b>——那正是 NaN 預填看不見的一類錯誤(抓得到「沒寫」,抓不到「形狀不對」)。</p>
-<p class="note">實際消費者:<code>pipelines/dfn_res_stage.c</code>。它在 <code>get_mem_requirements()</code> 就把
-「有 <code>infer</code> 卻沒 descriptor」「descriptor 被 <code>validate()</code> 拒絕」「有 <code>reset</code>／descriptor 卻沒
-<code>infer</code>」三種組合一併拒掉,再由 <a href="pipeline_dfn_mono.html">mono</a> 與
-<a href="pipeline_dfn_4ch.html">4ch</a> 兩支 DFN2 pipeline 使用;它們走的是雙輸入入口(估計用 pre-RES 頻譜、
-套用在 post-RES 頻譜)。</p>
-
-<h3>建置</h3>
-<pre>make -C AINR lib                 # 產出 libainr_prepost.a
-make -C AINR -s print-lib-path   # 印出本組態的 archive 絕對路徑</pre>
-<ul>
-<li>archive 落在 <code>build/simd&lt;N&gt;-&lt;sig&gt;/libainr_prepost.a</code>(<code>&lt;sig&gt;</code> = 工具鏈/旗標的 cksum,
-另有 <code>config.manifest</code> 擋碰撞)。<b>不要自己拼路徑</b>,用 <code>print-lib-path</code>。</li>
-<li>成員 = <code>dfn2_process.o</code>、<code>dfn2_model_io.o</code>、<code>dfn2_prepost.o</code>、
-<code>gtcrn_process.o</code>。<b>RNNoise-ERB 不在裡面</b>(它有自己的 Makefile、沒有 archive)。
-<code>WERROR=1</code> 會傳到 compiler 並進組態簽章。對應的 AIAEC archive 是 <code>libaiaec_prepost.a</code>。</li>
-<li>兩支 DFN2 pipeline<b>不</b>連這個 archive:<code>pipelines/Makefile</code> 直接把三個 DFN2 TU 編進
-<code>libaudio_pipeline_dfn.a</code>／<code>lib4aec_dfn_res.a</code>。</li>
-</ul>
 
 <h2>Block diagram</h2>
 <pre>

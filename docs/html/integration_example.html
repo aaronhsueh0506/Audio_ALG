@@ -38,6 +38,7 @@ pre code{background:none;padding:0}
 <a href="../../../NR/docs/html/nr_c_api.html">NR API</a>
 <a href="../../../audio_common/docs/html/audio_common_c_api.html">audio_common API</a>
 <a href="integration_example.html"><b>串接範例</b></a>
+<a href="integration_example_detail.html">串接範例細節</a>
 </nav>
 
 <h1>串接範例:四條 pipeline 怎麼組三個 lib</h1>
@@ -263,61 +264,7 @@ if (cfg->model.io_descriptor &amp;&amp;
 <p class="small">4ch ULCNet 的版本會<b>純轉播</b>下層 core 的版本:core 只長 control block 時兩層 hash 都不動,只能靠本層 <code>layout_version</code> 一起 bump 來攔。</p>
 
 <h2>7. DEBUG:出貨板上還剩什麼</h2>
-<p>這一節只描述<b>現況</b>。要新增哪些 DEBUG 資訊的評估與提案,見 <code>docs/debug_observability_zh_TW.md</code>。</p>
-<h3>7.1 Release build 的實測結論</h3>
-<p>以 <code>NO_STDIO=1</code> 建出 archive 後用 <code>nm</code> 檢查,結果是一個很乾淨的分界:</p>
-<div class="tblwrap"><table>
-<tr><th>類別</th><th class="ok">存活</th><th class="dead">消失</th></tr>
-<tr><td><b>狀態快照(pull)</b></td><td><code>aec_debug_status</code>、<code>aec_get_res_context</code>、<code>aec_get_linear_context</code>、<code>aec_linear_is_cancelling</code>、<code>aec_far_fft_real_compute_count</code>、<code>aec_get_mem_breakdown</code>、<code>anr_debug_status</code>、<code>anr_get_gain/_spp/_noise_psd</code>、4ch 的全部 census/counter accessor</td><td>—</td></tr>
-<tr><td><b>耗時</b></td><td>函式在(<b>回 0</b>)</td><td><b>全部數值</b>(<code>AecStageTiming</code>／<code>AudioPipelineLastTiming</code>／<code>FourAecNrResLastTiming</code>)</td></tr>
-<tr><td><b>Log / trace(push)</b></td><td>—</td><td><b>全部</b>:<code>aec_debug_logf</code>、<code>aec_debug_set_level/_log/_frame</code>、<code>aec_debug_set_trace</code>、<code>AecDebugTraceRow</code> 的 14 欄;mono 的 init 期 stderr 診斷</td></tr>
-<tr><td><b>錯誤碼</b></td><td>全部</td><td>—</td></tr>
-<tr><td><b>Finite guards</b></td><td>全部(不受任何開關影響)</td><td>—</td></tr>
-</table></div>
-<div class="note"><b>一句話:出貨板上唯一還活著的診斷面,是「主動 poll 的結構化狀態快照」。</b>所有<b>事件式</b>(log／trace／buffering event)與所有<b>時間式</b>(stage timing)觀測在 release 組態下歸零。任何 DEBUG 設計都必須建立在 pull 型快照上,而不是 printf。</div>
-
-<h3>7.2 可以直接照抄的板端監看迴圈</h3>
-<pre>/* 每秒一次即可;三個 API 都是免費的(只讀引擎已維護的欄位) */
-AecDebugStatus      a;  aec_debug_status(audio_pipeline_get_aec(p), &amp;a);
-AnrDebugStatus  n;  anr_debug_status(audio_pipeline_get_nr(p), &amp;n);
-
-log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
-    "near=%.4f out=%.4f duty=%llu/%llu | nr_init=%d gain=%.1f/%.1fdB "
-    "spp=%.2f noise=%.1fdB",
-    a.delay_samples, a.delay_confidence, a.delay_updates,
-    a.erle_windowed_db, a.usable_linear, a.filter_converged,
-    a.near_power, a.out_power, a.duty_hops_run, a.duty_hops_total,
-    n.initialized, n.mean_gain_db, n.min_gain_db, n.mean_spp, n.noise_floor_db);</pre>
-<div class="tblwrap"><table>
-<tr><th>讀到這樣</th><th>通常代表</th></tr>
-<tr><td><code>delay=-1</code> 一直不變</td><td>從未鎖定。檢查 ref 是否真的是送往喇叭的訊號、電平是否過低</td></tr>
-<tr><td><code>erle</code> 低但 <code>conv=1</code></td><td>濾波器收斂了但 echo 仍在 → 懷疑鎖到錯的 delay(早期反射),或非線性失真超出線性模型</td></tr>
-<tr><td><code>duty_run/duty_total</code> 接近 1.0 且長時間不降</td><td>duty-cycle 從未進入省電抽樣 → delay 一直不穩定</td></tr>
-<tr><td><code>nr_init=0</code> 持續</td><td>還在啟動 pass-through(前 <code>num_init_frames</code> 個 frame),此時完全不降噪是正常的</td></tr>
-<tr><td><code>mean_spp</code> 長期接近 0</td><td>判定沒有語音 → 檢查電平或噪聲底是否估過高</td></tr>
-<tr><td><code>noise_floor_db</code> 隨語音一起爬升</td><td>噪聲估計正在吸收語音 → 檢查 <code>delta_db</code>／<code>alpha_d</code></td></tr>
-</table></div>
-<div class="warn"><b>三個常見誤判,先看這裡再懷疑演算法:</b>
-<ul>
-<li><code>aec_get_last_timing()</code> 回全 0 <b>不代表很快</b>——代表沒有用 <code>PROFILE=1</code> 建 library。而且函式<b>不會告訴你</b>它沒被啟用。</li>
-<li><code>delay_updates</code> 是 matched-filter 的<b>更新總數</b>,<b>不區分</b>「同一值重複確認」與「跳到新值」,不能當成 lock 穩定度指標。</li>
-<li><code>near_power</code>／<code>out_power</code> 是 <b>EMA(alpha=0.95)</b>,不是瞬時值;<code>duty_*</code> 會被 <code>reset()</code> 清零。</li>
-</ul></div>
-
-<h3>7.3 現況的已知盲點(整合前先知道)</h3>
-<div class="tblwrap"><table>
-<tr><th>盲點</th><th>實情</th></tr>
-<tr><td class="dead">per-hop CSV trace <b>四條 pipeline 全部不可達</b></td><td><code>AecDebugTraceRow</code> 的唯一填寫點要求 <code>cfg.enable_res == 1</code> <b>且</b>走 <code>aec_process()</code>。四條 pipeline <b>全部</b>設 <code>enable_res = 0</code> → <code>dominant_nearend</code>／<code>saturated_echo</code>／<code>usable_linear</code>／<code>fullband_erle</code>／<code>gain_mean</code> 這些沒有第二個出口的量,在產品組態下<b>永遠取不到</b>。只有 CLI <code>aec_wav --debug-trace</code> 拿得到</td></tr>
-<tr><td class="dead">層級式 log 是<b>死碼</b></td><td><code>AEC_DEBUG_LOG</code> 在整個 library 的 <code>src/</code> 有 <b>0 個呼叫點</b>(唯一命中是一句註解)。level 1/2/3、<code>aec_debug_logf</code>、時間/frame 前綴——整套四層基礎設施沒有任何 emit 端</td></tr>
-<tr><td class="dead"><code>assert()</code> 在出貨板上是<b>活的</b></td><td>四個 Makefile <b>沒有任何一個</b>設 <code>-DNDEBUG</code>。<code>suppression_gain.c</code> 的 table-length assert <b>沒有 release-path fallback</b>,失敗即 <code>abort()</code>——沒有回傳碼、沒有 log、沒有 hook 可攔</td></tr>
-<tr><td class="dead">self-reset 不計數</td><td><code>DSP_ERROR</code> 路徑會內部呼叫 <code>reset()</code>,而 <code>reset()</code> 本身<b>清掉所有 instrumentation</b>(realign counters／duty census 全歸零)→ 一次 self-reset 之後「之前發生過什麼」在計數器上完全消失</td></tr>
-<tr><td class="dead">delay lock 遺失不計數</td><td><code>AecLinearContext.delay_state</code> 與 <code>generation</code> 每 hop 可讀,但 <code>AecDebugStatus</code> <b>兩者都沒有</b> → 只 poll <code>aec_debug_status()</code> 的整合者<b>看不到 lock 的丟失與重獲</b></td></tr>
-<tr><td class="dead">NN fail-open 是靜默的</td><td>三種 fallback 走<b>同一條 else 分支、無區別、無計數</b> → 「NPU 掛了整段跑 identity」與「NPU 正常但某幾 frame 吐 NaN」<b>從外部無法區分</b></td></tr>
-<tr><td class="dead">4ch init 失敗<b>一個字都不說</b></td><td><code>init_ex()</code> 的 8 項檢查任一失敗都<b>靜默回 NULL</b>。mono 有逐欄位 stderr,但 <code>NO_STDIO=1</code>(正是板端組態)一開就沒了</td></tr>
-<tr><td class="dead">沒有 frame counter</td><td>四條 pipeline <b>都沒有</b> frame counter 的 public accessor → 「這條 stream 到目前為止處理了幾個 hop」都答不出來,遑論 xrun</td></tr>
-<tr><td class="dead">mono pipeline 沒有 finite 守衛</td><td><code>audio_pipeline_process()</code> 輸入不檢、輸出不檢。<b>只有 4ch 有</b>(輸入與輸出各一道)</td></tr>
-<tr><td class="dead">兩條 ULCNet pipeline 幾乎沒有觀測面</td><td>mono ULCNet 只有 <code>_get_aec()</code>;4ch ULCNet <b>只剩</b> <code>_last_delay()</code> 與尺寸查詢(沒有 <code>_last_beamformed_error()</code>)。兩條都<b>沒有暴露 core handle</b> → core 的 duty census、realign counters、timing、post floor 對整合者全部不可達</td></tr>
-</table></div>
+<p>出貨板上唯一還活著的診斷面是「主動 poll 的結構化狀態快照」;事件式(log／trace)與時間式(stage timing)觀測在 release 組態下歸零,<code>assert()</code> 仍是活的,mono pipeline 沒有 finite 守衛。Release build 的 <code>nm</code> 實測、可照抄的板端監看迴圈與完整盲點表收在 <a href="integration_example_detail.html">integration_example_detail</a>;新增哪些 DEBUG 資訊的提案見 <code>docs/debug_observability_zh_TW.md</code>。</p>
 
 <h2>8. 整合檢查清單</h2>
 <ul>

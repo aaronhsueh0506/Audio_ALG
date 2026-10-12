@@ -79,7 +79,8 @@ audio_common,Audio_ALG}`）**：
 ## 頁面清單（現行；新增元件時擴充）
 
 **元件頁（各自 repo 的 `docs/html/`，見上面存放結構一節）**：
-`AEC/docs/html/aec.html`、`NR/docs/html/nr.html`、
+`AEC/docs/html/aec.html`、`AEC/docs/html/aec_detail.html`（aec 的 API 細節）、
+`NR/docs/html/nr.html`、
 `audio_common/docs/html/audio_common.html`
 
 **`Audio_ALG/docs/html/`（本站；index/conventions/onnx_prepost +
@@ -88,10 +89,14 @@ Audio_ALG 自有 pipelines/AINR/AIAEC）**：
 `index.html`（總覽+導覽）、`conventions.html`（全鏈 grid/window/framing/
 延遲對照）、`onnx_prepost.html`（ONNX 邊界與前後處理現況/缺口表）、
 `pipeline_mono.html`、`pipeline_4ch.html`、
+`pipeline_4ch_detail.html`（4ch 的執行期強度控制與逐階段耗時）、
 `pipeline_ulcnet_mono.html`、`pipeline_ulcnet_4ch.html`、
 `pipeline_ulcnet_detail.html`（兩條 ULCNet pipeline 共用的 adapter 與 reprime 細節）、
-`ainr_dfn2.html`、`ainr_gtcrn.html`、`ainr_rnnoise_erb.html`、
-`aiaec_align_ulcnet.html`、`aiaec_align_cruse.html`、`aiaec_deepvqe_s.html`、
+`pipeline_dfn_mono.html`、`pipeline_dfn_4ch.html`、
+`pipeline_dfn_detail.html`（兩支 DFN2 pipeline 共用的入口語意、rate bridge 與測試內容）、
+`integration_example.html`、`integration_example_detail.html`（release build 的 DEBUG 觀測面）、
+`ainr_dfn2.html`、`ainr_dfn2_detail.html`（pool、callback 邊界、建置）、`ainr_gtcrn.html`、`ainr_rnnoise_erb.html`、
+`aiaec_align_ulcnet.html`、`aiaec_align_ulcnet_detail.html`（far branch、PTQ、layout 重匯出）、`aiaec_align_cruse.html`、`aiaec_deepvqe_s.html`、
 `aiaec_cagcrn.html`
 
 ## 硬規則

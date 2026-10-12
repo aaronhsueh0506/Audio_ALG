@@ -37,24 +37,28 @@ state table / latency / file paths), plus `conventions.html` for the chain-wide
 grid and framing table and `onnx_prepost.html` for the ONNX-boundary,
 state-layout-version and PTQ-calibration status. Component pages for AEC, NR
 and audio_common live in those repositories' own `docs/html/` and are reached
-through sibling relative links.
+through sibling relative links. The AEC component page
+has a companion detail page, `aec_detail.html`, in the AEC repository.
 
-Pipeline pages: `pipeline_mono.html`, `pipeline_4ch.html`,
-`pipeline_ulcnet_mono.html`, `pipeline_ulcnet_4ch.html` (with the shared
+Pipeline pages: `pipeline_mono.html`, `pipeline_4ch.html` (runtime-strength and per-stage timing
+detail in `pipeline_4ch_detail.html`), `pipeline_ulcnet_mono.html`, `pipeline_ulcnet_4ch.html` (with the shared
 adapter and identity-reprime detail in `pipeline_ulcnet_detail.html`), plus
 `pipeline_dfn_mono.html` and `pipeline_dfn_4ch.html` for the two DeepFilterNet2
-variants (the host runs at the product rate -- mono 8/16/48 kHz, 4ch 16/48 kHz,
+variants (shared entry-point, rate-bridge and test detail in
+`pipeline_dfn_detail.html`; the host runs at the product rate -- mono 8/16/48 kHz, 4ch 16/48 kHz,
 16 kHz by default -- and only the DFN2 stage runs at 48 kHz / 1024 / 512,
 reached through `pipelines/dfn_rate_bridge.{h,c}`; the shared post-RES stage
 `pipelines/dfn_res_stage.{h,c}` estimates the model from the pre-RES spectrum
-and applies it to the post-RES one). Model pages: `ainr_dfn2.html`,
-`ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, and the four `aiaec_*.html` pages.
+and applies it to the post-RES one). Model pages: `ainr_dfn2.html` (pool, callback and build detail in
+`ainr_dfn2_detail.html`), `ainr_gtcrn.html`, `ainr_rnnoise_erb.html`, and the four
+`aiaec_*.html` pages (Align-ULCNet far-branch, PTQ and layout detail in
+`aiaec_align_ulcnet_detail.html`).
 
 For integrator-facing C API reference, the site also carries one page per
 library -- `aec_c_api.html`, `nr_c_api.html` and `audio_common_c_api.html` in
 those repositories' own `docs/html/` -- plus `integration_example.html` here,
-which uses the four pipelines as the worked wiring example and records what
-remains observable in a release build.
+which uses the four pipelines as the worked wiring example (the release-build
+observability detail is in `integration_example_detail.html`).
 
 ## Maintenance rule
 

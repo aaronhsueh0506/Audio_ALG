@@ -29,6 +29,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="conventions.html">慣例</a> ·
 <a href="onnx_prepost.html">ONNX 邊界</a> ·
 <a href="../../../AEC/docs/html/aec.html">AEC</a> ·
+<a href="../../../AEC/docs/html/aec_detail.html">AEC 細節</a> ·
 <a href="../../../NR/docs/html/nr.html">NR</a> ·
 <a href="../../../audio_common/docs/html/audio_common.html">audio_common</a> ·
 <a href="../../../AEC/docs/html/aec_c_api.html">AEC API</a> ·
@@ -36,17 +37,22 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="../../../NR/docs/html/nr_c_api.html">NR API</a> ·
 <a href="../../../audio_common/docs/html/audio_common_c_api.html">audio_common API</a> ·
 <a href="integration_example.html">串接範例</a> ·
+<a href="integration_example_detail.html">串接範例細節</a> ·
 <a href="pipeline_mono.html">mono</a> ·
 <a href="pipeline_ulcnet_mono.html">mono-ULCNet</a> ·
 <a href="pipeline_4ch.html">4ch</a> ·
+<a href="pipeline_4ch_detail.html">4ch 細節</a> ·
 <a href="pipeline_ulcnet_4ch.html">4ch-ULCNet</a> ·
 <a href="pipeline_ulcnet_detail.html">ULCNet 細節</a> ·
 <a href="pipeline_dfn_mono.html">mono-DFN2</a> ·
 <a href="pipeline_dfn_4ch.html">4ch-DFN2</a> ·
+<a href="pipeline_dfn_detail.html">DFN2 pipeline 細節</a> ·
 <a href="ainr_dfn2.html">DFN2</a> ·
+<a href="ainr_dfn2_detail.html">DFN2 細節</a> ·
 <a href="ainr_gtcrn.html">GTCRN</a> ·
 <a href="ainr_rnnoise_erb.html">RNNoise-ERB</a> ·
 <a href="aiaec_align_ulcnet.html">Align-ULCNet</a> ·
+<a href="aiaec_align_ulcnet_detail.html">Align-ULCNet 細節</a> ·
 <a href="aiaec_align_cruse.html">Align-CRUSE</a> ·
 <a href="aiaec_deepvqe_s.html">DeepVQE-S</a> ·
 <a href="aiaec_cagcrn.html">CAGCRN</a>
@@ -136,6 +142,8 @@ PBFDKF 矩形窗例外、centered vs 串流 framing 等價性、ULCNet pipeline 
 <tr><td><a href="integration_example.html">integration_example</a></td>
 <td><b>怎麼把三個 lib 接起來</b>：四條 pipeline 的逐 hop 呼叫序列、誰做 FFT／誰擁有 window／
 WOLA 在哪的三種答案、4ch pre/post 協定、接 NN 的做法、以及 release build 還剩什麼可 DEBUG。</td></tr>
+<tr><td><a href="integration_example_detail.html">integration_example_detail</a></td>
+<td>串接範例第 7 節的完整內容：release build 的 <code>nm</code> 實測結論、板端監看迴圈、現況的已知盲點。</td></tr>
 </table>
 
 <h3>核心程式庫</h3>
@@ -144,6 +152,8 @@ WOLA 在哪的三種答案、4ch pre/post 協定、接 NN 的做法、以及 rel
 <tr><td><a href="../../../AEC/docs/html/aec.html">aec</a></td>
 <td><code>lib/aec/c_impl</code>：PBFDKF main/shadow 線性濾波 + AEC3 matched-filter
 delay estimator + AEC3 post（RES/CNG/suppression）；grid 8k/256、16k/256|512、48k/1024。</td></tr>
+<tr><td><a href="../../../AEC/docs/html/aec_detail.html">aec_detail</a></td>
+<td>aec 的 API 細節：delay backward-jump quarantine、記憶體拆解、<code>aec_set_preset()</code> 的 ramp 語意與量測注意事項、逐階段耗時與 debug 狀態。</td></tr>
 <tr><td><a href="../../../NR/docs/html/nr.html">nr</a></td>
 <td><code>lib/nr/c_impl</code>：OM-LSA 核心（MCRA 噪聲估計 + SPP + LSA gain），
 4 檔強度 preset；呼叫端持有 FFT/窗/OLA。</td></tr>
@@ -165,6 +175,8 @@ NN post-filter（per-frame callback）；一個 build 一個編譯期格點（16
 <tr><td><a href="pipeline_4ch.html">pipeline_4ch</a></td>
 <td><code>pipelines/4ch_aec_bf_nr_res/</code>：4×AEC lanes + 共享 delay + SRP-PHAT DOA +
 GSC beamforming + post RES/NR（<code>4aec_nr_res.c</code> 核心）。</td></tr>
+<tr><td><a href="pipeline_4ch_detail.html">pipeline_4ch_detail</a></td>
+<td>4ch pipeline 的執行期強度控制（<code>audio_pipeline_4ch_set_aec_preset()</code>／<code>_set_nr_mode()</code>／<code>_post_split_floor()</code>）與逐階段耗時診斷。</td></tr>
 <tr><td><a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a></td>
 <td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c</code>：GSC 的 beamformed 誤差<b>頻譜直送</b>
 Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>
@@ -180,6 +192,8 @@ Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲
 <code>4aec_nr_res</code> 之後（<code>enable_post=1</code>/<code>enable_res=1</code>/<code>enable_nr=0</code>），
 前端 front_process／外部 beamformer／fuse 接縫相同，RES 與合成由應用自己串；前端跑 16 k（預設）或 48 k，16 k 經同一支 rate bridge；
 演算法延遲 16 k/256 為 800 samples = 50 ms、48 k 為 3 hop = 32 ms。</td></tr>
+<tr><td><a href="pipeline_dfn_detail.html">pipeline_dfn_detail</a></td>
+<td>兩支 DFN2 pipeline 共用的細節：公開入口逐項語意與 reject-first 清單、<code>DfnRateBridge</code> pool 逐項、各測試檔檢查的內容。</td></tr>
 </table>
 <p class="note">兩支 DFN2 變體共用 <code>pipelines/dfn_res_stage.{h,c}</code> 與 <code>dfn_rate_bridge.{h,c}</code>；
 沒有模型或模型失敗時輸出即「<code>enable_nr=0</code> 的傳統路徑延後」（fail-open）：48 k 是逐位元等值、
@@ -192,6 +206,8 @@ Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲
 <td>DeepFilterNet2：48k、1024/512（非上游 960/480）；stateless ONNX exporter + C 前後處理
 <code>dfn2_process.c</code>（STFT/ERB+complex 特徵/EMA 正規化/compose/ISTFT），
 graph 只含 heads。</td></tr>
+<tr><td><a href="ainr_dfn2_detail.html">ainr_dfn2_detail</a></td>
+<td>DFN2 prepost 類別的 pool 大小與所有權、<code>DFN2Model</code> callback 與 descriptor、<code>libainr_prepost.a</code> 建置、skip identity 的 partition-of-unity 檢查。</td></tr>
 <tr><td><a href="ainr_gtcrn.html">ainr_gtcrn</a></td>
 <td>GTCRN：16k、512/256；C 端 <code>gtcrn_process.c</code> 只做 STFT/ISTFT，
 頻譜之間全部在網路；stateless ONNX 以三組 cache 作顯式 I/O。</td></tr>
@@ -208,6 +224,8 @@ graph 只含 heads。</td></tr>
 （<code>ulcnet_process.c</code>：<code>ulcnet_framing_config()</code> 描述 audio_common 的 <code>AcStft</code>／<code>AcIstft</code>，
 centered（<code>center</code> 1）與一 hop 一幀（<code>center</code> 0）兩種分析並存 + WOLA + NPU
 callback 邊界；每幀交易封在 <code>ulcnet_prepost.c</code> class）。</td></tr>
+<tr><td><a href="aiaec_align_ulcnet_detail.html">aiaec_align_ulcnet_detail</a></td>
+<td>Align-ULCNet 的 far branch 契約、PTQ calibration、layout 18 重匯出、graph 內 Slice 位移的就地綁定檢查與 rolling 分析等價性。</td></tr>
 <tr><td><a href="aiaec_align_cruse.html">aiaec_align_cruse</a></td>
 <td>Align-CRUSE：16k/512/256；cumsum 無衰減積分器與 paper_global 非因果
 mode 是 streaming 語意風險。</td></tr>
