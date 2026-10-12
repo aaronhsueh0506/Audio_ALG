@@ -282,8 +282,8 @@ exactly ONE hop」；輸出 hop p ≙ 輸入 hop p−1</td></tr>
 <table>
 <tr><th>階段</th><th>新增延遲</th><th>說明</th></tr>
 <tr><td>傳統前級（線性 AEC → RES gain → comfort noise；4ch 另含共用 delay、4 lane、外部 BF 的逐 bin 加權）</td>
-<td>+0 hop</td><td>同 hop 交出兩個頻譜：<code>error_spec</code>/<code>beamformed_error</code>（E，pre-RES）與
-<code>post_spectrum</code>（P = E·G_res，開啟 CNG 時再加 comfort noise；DFN2 變體預設關）</td></tr>
+<td>+0 hop</td><td>同 hop 交出兩個頻譜：<code>error_spec</code>/<code>beamformed_error</code>（E，pre-RES，即 <code>dfn_res_stage_begin()</code> 的 <code>estimate_spec</code>）與
+post-RES 頻譜（P = E·G_res，開啟 CNG 時再加 comfort noise；DFN2 變體預設關；即 <code>apply_spec</code>）</td></tr>
 <tr><td><code>dfn_res_stage</code> 的尺度換算</td><td>+0 hop</td>
 <td>入 <code>2^-5</code>（<code>0x1p-5f</code>）、出 <code>2^5</code>（<code>0x1p5f</code>）：pipeline 頻譜是 audio-scale
 未正規化 STFT，DFN2 邊界要 <code>torch.stft(normalized=True)</code>。兩者都是精確的 2 的次方，
