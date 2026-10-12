@@ -168,14 +168,14 @@ GSC beamforming + post RES/NR（<code>4aec_nr_res.c</code> 核心）。</td></tr
 <td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c</code>：GSC 的 beamformed 誤差<b>頻譜直送</b>
 Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>
 <tr><td><a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a></td>
-<td><code>pipelines/mono_aec_dfn_res/audio_pipeline_dfn.c</code>：<b>內含</b>傳統 mono pipeline（<code>enable_nr=0</code>/<code>enable_res=1</code>），
+<td><code>pipelines/mono_aec_dfn_res/audio_pipeline_dfn.c</code>：<b>內含</b>傳統 mono pipeline（<code>enable_nr=0</code>/<code>enable_res=1</code>，經 <code>audio_pipeline_process_spec()</code>），
 以 DeepFilterNet2 取代 MMSE-LSA——估計用 pre-RES 頻譜 E、套用在 post-RES 頻譜 P。host 跑產品自己的取樣率
 （8/16/48 k，預設 16 k），只有 DFN2 stage 在 48 k，由 <code>dfn_rate_bridge.c</code> 來回；演算法延遲
 16 k/256 為 800 samples = 50 ms、48 k 為 3 hop = 32 ms。</td></tr>
 <tr><td><a href="pipeline_dfn_4ch.html">pipeline_dfn_4ch</a></td>
-<td><code>pipelines/4ch_aec_bf_dfn_res/4aec_dfn_res.c</code>：同一個 DFN2 stage 包在四聲道核心
-<code>4aec_nr_res</code> 外（<code>enable_post=1</code>/<code>enable_res=1</code>/<code>enable_nr=0</code>），
-pre/post token 接縫與核心相同；核心跑 16 k（預設）或 48 k，16 k 經同一支 rate bridge；
+<td><code>pipelines/4ch_aec_bf_dfn_res/4aec_dfn_res.c</code>：同一個 DFN2 stage 接在四聲道前端
+<code>4aec_nr_res</code> 之後（<code>enable_post=1</code>/<code>enable_res=1</code>/<code>enable_nr=0</code>），
+前端 front_process／外部 beamformer／fuse 接縫相同，RES 與合成由應用自己串；前端跑 16 k（預設）或 48 k，16 k 經同一支 rate bridge；
 演算法延遲 16 k/256 為 800 samples = 50 ms、48 k 為 3 hop = 32 ms。</td></tr>
 </table>
 <p class="note">兩支 DFN2 變體共用 <code>pipelines/dfn_res_stage.{h,c}</code> 與 <code>dfn_rate_bridge.{h,c}</code>；

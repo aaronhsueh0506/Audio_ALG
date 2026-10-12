@@ -58,8 +58,15 @@ audio_pipeline_reset(p);      /* echo-path 變更時; 不動 pool */
 audio_pipeline_destroy(p);    /* 不釋放 caller pool */
 platform_free(pool);</pre>
 <p>桌面便利路徑 <code>audio_pipeline_create(&amp;cfg)</code>(內部 posix_memalign;destroy 會 free)。診斷用唯讀 handle:<code>audio_pipeline_get_aec()</code> / <code>audio_pipeline_get_nr()</code>(aec_only 時為 NULL);byte 分解表 <code>audio_pipeline_get_mem_breakdown()</code>。</p>
-<h3>外部後濾波接縫(<code>process_post_view</code> / <code>synthesize_external</code>)</h3>
-<p>公開 API 另有兩個入口,把 <code>process()</code> 拆成「頻譜」與「合成」兩半,給要在 post-RES 之後插入外部後級的變體用(<code>pipelines/mono_aec_nr_res/audio_pipeline.h:198-220</code>)。<code>audio_pipeline_process_post_view()</code> 跑完一個 hop 到 comfort-noise fill 為止,交出 <code>AudioPipelinePostView{ error_spec, post_spectrum }</code>——<code>error_spec</code> 是 RES gain 據以估計的線性 AEC 誤差頻譜 E,<code>post_spectrum</code> 是 <code>E * G_res</code> 加 comfort noise,也就是 <code>process()</code> 本來會合成的那一個;兩者都指向實例自有的 per-hop buffer,到下一次處理呼叫前有效。這個 seam 要求 <code>!aec_only</code> 且 <code>enable_nr=0</code>(沒有 NR 實例存在,所以不可能把某個 NR 半步留在中途),其他組態一律回 -1。呼叫端處理完頻譜後以 <code>audio_pipeline_synthesize_external()</code> 收尾,它走的是 <code>process()</code> <b>同一組</b> sqrt-Hann iFFT/OLA 狀態,所以兩種收尾方式混用時 OLA 仍然連續。<code>AUDIO_PIPELINE_LAYOUT_VERSION = 12</code> 不因此變動——只加了函式,沒有 struct/carve 變更。目前的消費者是 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>。</p>
+<h3>接進外部後級(<code>audio_pipeline_process_spec</code> / <code>audio_pipeline_synthesize</code>)</h3>
+<p>公開 API 另有兩個入口,把 <code>process()</code> 拆成「分析」與「合成」兩半,給要在線性 AEC 之後串自己頻域 stage 的變體用(<code>pipelines/mono_aec_nr_res/audio_pipeline.h</code>)。<code>audio_pipeline_process_spec(p, mic, ref, &amp;frame)</code> 只跑線性 AEC(context-only),交出一個 <code>SeSpecFrame</code>(<code>pipelines/common/se_stage.h</code>):<code>e</code>=線性 AEC 誤差頻譜 E、<code>y</code>=近端頻譜、<code>x</code>=far 頻譜、<code>r2</code>=殘餘回音 PSD、<code>cn</code>=comfort-noise PSD、<code>g_res_ctx</code>=AEC 自己的 G_res、<code>far_hop</code>／<code>formed_hop</code> 與 delay 旗標;全部是借用視圖,指向 AEC 的 per-hop buffer,到下一次處理呼叫或 reset 前有效,任何 stage 都不得寫入。呼叫端自己串後級,然後以 <code>audio_pipeline_synthesize(p, spectrum, out)</code> 收尾,它走的是 <code>process()</code> <b>同一組</b> sqrt-Hann iFFT/OLA 狀態。要求 <code>!aec_only</code>,否則回 -1。<code>process()</code> 本身就是用同一個內部 <code>analyse_hop()</code> 加下列明寫的鏈,逐位元相同(<code>test_stage_seam_chain</code> 在 <code>enable_nr</code> 0／1 兩種組態下以 <code>memcmp</code> 釘住):</p>
+<pre>audio_pipeline_process_spec(p, mic, ref, &amp;f);
+nr_gain  = se_anr_stage_gain(nr, &amp;f, extra, 1);        /* 無 NR 實例時用 unity 全 1 向量 */
+sk_min_f32(g_total, nr_gain, f.g_res_ctx, f.n_freqs);
+sk_capply_gain_f32(spec, f.e, g_total, f.n_freqs);
+aec_cng_fill(&amp;rng, spec, f.cn, f.g_res_ctx, nr_gain, SE_CNG_NR_GAIN_FLOOR, f.n_freqs);
+audio_pipeline_synthesize(p, spec, out);</pre>
+<p>沒有函式指標表:每個應用把自己的幾行寫出來。<code>AUDIO_PIPELINE_LAYOUT_VERSION = 12</code> 不因此變動——沒有 struct／carve 變更。目前的消費者是 <a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a>(自己 carve 增益暫存與 CNG 狀態,不用本實例的 <code>enable_nr</code> 路徑)。</p>
 
 <h3>執行期強度控制</h3>
 <pre>int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset, float ramp_ms);
@@ -105,21 +112,21 @@ void audio_pipeline_get_last_timing(const AudioPipeline* p,
  │
  ├─ aec_only ──► aec_process(aec, mic, ref, out) ──► return        (0-hop lag)
  │
- ├─ aec_process_context(aec, mic, ref)         沒有時域輸出 copy
- ├─ aec_get_res_context(aec, &amp;ctx)             seam: error_spec/res_gain/r2/
- │                                              comfort_noise/far_power
- ├─ extra[k] = ctx.r2[k]/PSD_SCALE             PSD_SCALE = 32768^2
- ├─ anr_process_gain(nr, ctx.error_spec, nr_extra, NULL)
- │      nr_extra = legacy_amin ? NULL : extra  (R² 折進噪聲底)
- ├─ sk_min_f32(g_total, anr_get_gain(nr,NULL), ctx.res_gain)
- ├─ sk_capply_gain_f32(spec, ctx.error_spec, g_total)
- ├─ aec_cng_fill(&amp;rng_state, spec, ctx.comfort_noise, ctx.res_gain, g_nr, 0.316, n)
+ ├─ analyse_hop(): aec_process_context(aec, mic, ref)  沒有時域輸出 copy
+ │      aec_get_res_context() + aec_get_linear_context() → SeSpecFrame f
+ │      f.e / y / x / r2 / cn / g_res_ctx / far_hop / formed_hop / delay 旗標(借用)
+ ├─ nr_gain = se_anr_stage_gain(nr, &amp;f, extra, !legacy_amin)
+ │      extra[k] = f.r2[k]/PSD_SCALE (PSD_SCALE = 32768^2) 折進噪聲底;無 NR 時 nr_gain = unity
+ ├─ sk_min_f32(g_total, nr_gain, res_gain)     res_gain = enable_res ? f.g_res_ctx : unity
+ ├─ sk_capply_gain_f32(spec, f.e, g_total)
+ ├─ aec_cng_fill(&amp;rng_state, spec, f.cn, f.g_res_ctx, nr_gain, SE_CNG_NR_GAIN_FLOOR=0.316, n)
  │      (enable_cng_effective): spec[1..n-2] += sqrt(N²/PSD_SCALE)
  │      * sqrt(1-res_gain²) * max(g_nr[k], 0.316) * AEC3B_SQRT2_SIN_LUT[ix / (ix+8)&amp;31]
- │      ix = (rng_state*69069+1)&amp;0x7FFFFFFF &gt;&gt; 26, seed 0x9e3779b9
+ │      ix = (rng_state*69069+1)&amp;0x7FFFFFFF &gt;&gt; 26, seed SE_CNG_RNG_SEED = 0x9e3779b9
  │      (aec_res.h 的函式,與 lib/aec aec3_post.c 同一份 CNG 配方:期望功率不變、|樣本| ≤ sqrt(2))
- └─ ac_istft_push(istft, spec, out)   (AcIstft, ACCUMULATE):
-        fft_inverse ─► acc += ifft*w ─► emit hop ─► shift acc    (1-hop lag)</pre>
+ └─ synthesize_hop(): ac_istft_push(istft, spec, out)   (AcIstft, ACCUMULATE):
+        fft_inverse ─► acc += ifft*w ─► emit hop ─► shift acc    (1-hop lag)
+        (audio_pipeline_synthesize() 走的是同一個函式)</pre>
 
 <h2>訊號泳道圖</h2>
 <pre>lane \ hop      #0              #1              #p (穩態)
@@ -186,10 +193,11 @@ WOLA (C)        out=frame0 前半 out=hop#0 重建   out = hop p-1 的重建
 <tr><td><code>pipelines/common/se_anr_stage.h / .c</code></td><td>NR 級:組態組成、init、逐 hop gain、強度 setter(<code>se_anr_stage_set_mode()</code>)、reset、destroy;與 <code>se_config.o</code> 同為 <code>libaudio_pipeline.a</code> 成員</td></tr>
 <tr><td><code>pipelines/mono_aec_nr_res/main.c</code> / <code>pipelines/mono_aec_nr_res/static_main.c</code></td><td>malloc / static CLI 薄殼(WAV I/O、--debug、--timing、--print-mem-size)</td></tr>
 <tr><td><code>pipelines/mono_aec_nr_res/example_board_adapter.c</code></td><td>板端 adapter 參考(REFERENCE ONLY)</td></tr>
-<tr><td><code>pipelines/mono_aec_nr_res/tests/test_audio_pipeline.c</code></td><td>API 驗收:poisoned-pool create-vs-init byte parity、descriptor 8 點閘、reject-first 驗證,8k/16k/48k 各跑一輪</td></tr>
+<tr><td><code>pipelines/mono_aec_nr_res/tests/test_audio_pipeline.c</code></td><td>API 驗收:poisoned-pool create-vs-init byte parity、descriptor 8 點閘、reject-first 驗證,8k/16k/48k 各跑一輪,以及 <code>test_stage_seam_chain</code>(process_spec ＋ 明寫鏈 ＋ synthesize 對 process 逐位元相同,aec_only 被拒)</td></tr>
 <tr><td><code>pipelines/Makefile</code></td><td>targets:<code>all</code>/<code>test</code>/<code>libaudio_pipeline.a</code>/<code>audit-no-stdio</code>/<code>publish</code>;-ffp-contract=off 最後附加</td></tr>
-<tr><td><code>pipelines/aec_nr_pipeline.py</code></td><td>Python reference(PROD_* 常數同源)</td></tr>
+<tr><td><code>pipelines/common/se_stage.h</code></td><td><code>SeSpecFrame</code>、<code>SE_CNG_NR_GAIN_FLOOR</code>、<code>SE_CNG_RNG_SEED</code>、<code>se_res_stage_gain()</code></td></tr>
+<tr><td><code>pipelines/aec_nr_pipeline.py</code>、<code>pipelines/se_stage.py</code></td><td>Python reference(PROD_* 常數同源;<code>total_gain</code>／<code>apply_gain</code>／<code>comfort_noise_fill</code>／<code>synthesize_hop</code> 與 C 的 stage 一一對應)</td></tr>
 </table>
-<p>測試實測(2026-08-18 重跑, BACKEND=ne10 預設):<code>mono_aec_nr_res/</code> 目錄 <code>make test</code>(= <code>test_audio_pipeline</code> + 建置 <code>example_board_adapter</code>,不含 ULCNet——已移到 <code>mono_alignulcnet/</code>)共 <b>78 PASS / 0 FAIL</b>(<code>PROFILE=1</code> 下 80 —— 逐階段計時的兩個 <code>#if</code> 分支各多一列),結尾 <code>ALL PASS</code>。</p>
+<p>測試實測(BACKEND=ne10 預設):<code>mono_aec_nr_res/</code> 目錄 <code>make test</code>(= <code>test_audio_pipeline</code> + 建置 <code>example_board_adapter</code>,不含 ULCNet——已移到 <code>mono_alignulcnet/</code>)共 <b>136 行 PASS: / 0 FAIL</b>,結尾 <code>ALL PASS</code>。</p>
 </body>
 </html>

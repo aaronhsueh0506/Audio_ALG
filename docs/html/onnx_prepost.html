@@ -123,6 +123,12 @@ framing、特徵前後端、recurrent ring／state buffer。整合者不再自�
 Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起恆為 1</b>；DFN2 在<b>第一個 hop 回 0</b>（它的 graph 要
 <code>[t−1, t, t+1]</code>，hop 0 沒有右鄰居，不可以呼叫），之後每 hop 1 次。</p>
 
+<p><b>pipeline 層的對應</b>：四個應用（<code>mono_alignulcnet</code>、<code>4ch_alignulcnet</code>、<code>mono_aec_dfn_res</code>、<code>4ch_aec_bf_dfn_res</code>）把同一個 hop 拆成
+<code>_process_begin</code>（AEC／分析，備好第一個模型幀）→ <code>_nn_begin</code>（回 1 並交出 job：<code>UlcnetNnJob</code> 或 <code>DfnResStageJob</code>，輸出預填 NaN；回 0 表示本 hop 無模型幀）→
+呼叫端在 NPU 上推論 → <code>_nn_end(rc)</code>（<code>rc==0</code> 且輸出有限才提交，否則走 <code>_frame_skip</code> 的 identity）→ <code>_process_end</code>（合成剛好一個 hop）。
+DFN 應用經 rate bridge 時一個 native hop 可能有 0..2 個幀，所以 <code>_nn_begin</code> 放在迴圈裡。
+呼叫序列與範例見 <a href="integration_example.html">integration_example</a> 與 <code>pipelines/README.md</code> 的 Call flow。</p>
+
 <p><b>frame 狀態機</b>：<code>frame_inputs</code> 只把<b>非 state 的輸出</b>
 （heads：<code>output</code>／<code>taps</code>／<code>erb_mask</code>／<code>coefs</code>／<code>alpha</code>，
 Align-ULCNet 的 <code>output</code>）<b>預填 NaN</b>，
