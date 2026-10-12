@@ -32,9 +32,11 @@
  *     ...
  *     audio_pipeline_4ch_destroy(p);  // releases create()'s one pool
  *
- * This adds the spatial stage between the core's process_pre() and
- * process_post() calls; both construction paths use the same composition
- * and must be byte-identical for the same inputs/config/backend.
+ * This adds the spatial stage between the core's four_aec_front_process() and
+ * four_aec_fuse() calls and chains the post-beam stages itself (RES gain, NR
+ * gain, min, apply, comfort noise, synthesis); both construction paths use the
+ * same composition and must be byte-identical for the same inputs/config/
+ * backend.
  */
 #ifndef AUDIO_PIPELINE_4CH_H
 #define AUDIO_PIPELINE_4CH_H
@@ -293,21 +295,39 @@ int audio_pipeline_4ch_process_with_activity(
 
 void audio_pipeline_4ch_reset(AudioPipeline4Ch* p);
 
-/* Runtime strength control -- thin pass-throughs to the shared core.
+/* Runtime strength control.
  *
  * The four AEC lanes run with spatial_linear_context and never reach their own
  * suppression-gain path, so the strength that shapes this product's output
- * lives in the core's single shared post-stage suppressor; likewise there is
- * one shared denoiser, not one per lane. Both setters target those, which is
- * why they exist rather than leaving the caller to loop over lanes.
+ * lives in this pipeline's single post-beam suppressor (AecRes); likewise there
+ * is one denoiser, not one per lane. Both setters target those, which is why
+ * they exist rather than leaving the caller to loop over lanes.
  *
- * See 4aec_nr_res.h for the full contract, including what to expect when
- * A/B-ing a preset change (the far-active floor only binds on far-active,
- * non-double-talk hops, and the same gain also scales the comfort noise).
+ * set_aec_preset retargets the far-active gain floor on the post-beam
+ * suppressor: ramp_ms 0 applies on the next hop and lands on exactly the floor
+ * a fresh instance would hold, a positive value walks there linearly in dB.
+ * The floor only binds on far-active, non-double-talk hops (during double-talk
+ * the DT floor, identical across presets, applies), and the same gain also
+ * scales the comfort noise, so an average over a whole recording moves less
+ * than the dB step implies. Requires core.enable_res.
+ *
+ * set_nr_mode recomposes this pipeline's own NR configuration -- the canonical
+ * strength preset plus the overrides it always applies -- and hands it to
+ * anr_reconfigure(); the noise floor, the min-tracking ring and the gain
+ * smoothing history carry on. anr_set_mode() would be refused (its L differs)
+ * or revert the overrides. Requires core.enable_nr.
  *
  * Call between hops. Return 0, or -1 with nothing written. */
 int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset,
                                       float ramp_ms);
+
+/* The post-beam suppressor's far-active split floor as a linear power ratio:
+ * `live` is what it applies now (it differs from `target` only while a ramp
+ * walks), `target` the reset-surviving configured value; either pointer may
+ * be NULL. The one strength quantity worth logging from a board. Returns 0, or
+ * -1 on NULL or an instance without a suppressor. */
+int audio_pipeline_4ch_post_split_floor(const AudioPipeline4Ch* p,
+                                        float* live, float* target);
 int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, AnrMode mode);
 void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p);
 

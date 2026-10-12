@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
     cfg = four_aec_nr_res_default_config(sample_rate);
     cfg.fft_size = fft_size;
     cfg.enable_cng = 0;
-    cfg.enable_post = 0;          /* the alignment seam lives in process_pre */
+    cfg.enable_post = 0;          /* the alignment seam lives in front_process */
     cfg.delay_backward_quarantine_enabled = quarantine;
     if (quarantine_s >= 0.0f) cfg.delay_backward_quarantine_s = quarantine_s;
     if (strcmp(mode, "fixed") == 0) {
@@ -209,7 +209,7 @@ int main(int argc, char** argv) {
     printf("hop,delay_samples,solid,changed,far_hash,aligned_hash,"
            "aligned_first\n");
     for (h = 0; h < hops; ++h) {
-        FourAecNrResPreFrame pre;
+        FourAecFront pre;
         int base = pad + h * hop;
         int echo_delay = (shift_at >= 0 && h >= shift_at) ? shift_delay : delay;
         for (i = 0; i < hop; ++i) {
@@ -221,9 +221,9 @@ int main(int argc, char** argv) {
                 mic[i * FOUR_AEC_NR_RES_CHANNELS + cfg.capture_proxy_channel] +=
                     proxy_hist[base + i];
         }
-        if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+        if (four_aec_front_process(p, mic, far, &pre) !=
             FOUR_AEC_NR_RES_OK) {
-            fprintf(stderr, "process_pre failed at hop %d\n", h);
+            fprintf(stderr, "front_process failed at hop %d\n", h);
             status = 5;
             goto cleanup;
         }
@@ -233,12 +233,6 @@ int main(int argc, char** argv) {
                (unsigned long long)hash_hop(far, hop),
                (unsigned long long)hash_hop(pre.aligned_ref, hop),
                (double)pre.aligned_ref[0]);
-        if (four_aec_nr_res_abandon_pre(p, &pre.token) !=
-            FOUR_AEC_NR_RES_OK) {
-            fprintf(stderr, "abandon_pre failed at hop %d\n", h);
-            status = 6;
-            goto cleanup;
-        }
     }
 
 cleanup:

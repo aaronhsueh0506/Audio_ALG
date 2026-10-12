@@ -4,11 +4,21 @@
 #include <string.h>
 
 #include "4aec_dfn_res.h"
+#include "audio_stft.h"
+#include "simd_kernels.h"
 
 #define WRAP_ALIGN 16u
 
 struct FourAecDfnRes {
     FourAecNrRes *front;
+    AecRes *res;                /* post-beam residual-echo suppressor      */
+    float *g_total;             /* min(unity, G_res)                       */
+    float *unity;               /* all-ones gain read for the absent NR    */
+    Complex *post;              /* P = E * g_total (+ comfort noise)       */
+    AcIstft *istft;             /* 48 kHz: this application's own synthesis */
+    uint32_t rng;               /* comfort-noise generator state           */
+    int cng;                    /* comfort-noise fill enabled              */
+    int n_freqs;
     DfnResStage *stage;         /* 48 kHz: the stage, driven directly */
     Complex *stage_output;      /* 48 kHz: its output spectrum          */
     DfnRateBridge *bridge;      /* 8/16 kHz: the stage inside the bridge */
@@ -30,8 +40,8 @@ static uint32_t fnv_u32(uint32_t h, uint32_t v) {
 }
 
 /* Everything init needs, derived from the config exactly once: the stage
- * config, both sub-descriptors and this pool's total. The core validates
- * its own config; only the seam invariants are checked here. */
+ * config, the sub-descriptors and this pool's total. The core validates its
+ * own config; only the seam invariants are checked here. */
 typedef struct Resolved {
     int use_bridge;                 /* core below 48 kHz */
     DfnResStageConfig scfg;
@@ -39,13 +49,27 @@ typedef struct Resolved {
     FourAecNrResMemReq front_req;
     DfnResStageMemReq stage_req;    /* 48 kHz */
     DfnRateBridgeMemReq bridge_req; /* 8/16 kHz */
+    AecConfig res_cfg;
+    size_t res_bytes;
+    size_t synth_bytes;             /* 48 kHz */
+    int n_freqs;
+    int fft_size;
     uint32_t sub_layout;            /* the stage's or the bridge's */
     uint32_t sub_hash;
     uint32_t backend_id;
     size_t bytes;
 } Resolved;
 
+static int add_region(size_t *total, size_t bytes) {
+    size_t add = align_up(bytes);
+    if (!add || *total > SIZE_MAX - add) return -1;
+    *total += add;
+    return 0;
+}
+
 static int resolve(const FourAecDfnResConfig *cfg, Resolved *r) {
+    FourAecNrResMemBreakdown bd;
+    AnrConfig nr_cfg;
     size_t total;
     if (!cfg || !r ||
         (cfg->front_end.sample_rate != 16000 &&
@@ -60,8 +84,15 @@ static int resolve(const FourAecDfnResConfig *cfg, Resolved *r) {
     r->scfg.erb_inv = cfg->erb_inv;
     r->scfg.model = cfg->model;
     if (four_aec_nr_res_get_mem_requirements(&cfg->front_end,
-                                             &r->front_req) != 0)
+                                             &r->front_req) != 0 ||
+        four_aec_nr_res_get_mem_breakdown(&cfg->front_end, &bd) != 0 ||
+        four_aec_nr_res_stage_configs(&cfg->front_end, &r->res_cfg,
+                                      &nr_cfg) != 0)
         return -1;
+    r->n_freqs = bd.n_freqs;
+    r->fft_size = bd.fft_size;
+    r->res_bytes = aec_res_get_mem_size(&r->res_cfg);
+    if (r->res_bytes == 0) return -1;
     if (r->use_bridge) {
         r->bcfg = dfn_rate_bridge_default_config(cfg->front_end.sample_rate);
         r->bcfg.fft_size = cfg->front_end.fft_size;
@@ -71,7 +102,9 @@ static int resolve(const FourAecDfnResConfig *cfg, Resolved *r) {
         r->sub_layout = r->bridge_req.layout_version;
         r->sub_hash = r->bridge_req.build_flags_hash;
         r->backend_id = r->bridge_req.backend_id;
+        r->synth_bytes = 0;
     } else {
+        AcStftConfig scfg;
         if (cfg->front_end.fft_size != 0 &&
             cfg->front_end.fft_size != DFN2_N_FFT)
             return -1;
@@ -80,19 +113,26 @@ static int resolve(const FourAecDfnResConfig *cfg, Resolved *r) {
         r->sub_layout = r->stage_req.layout_version;
         r->sub_hash = r->stage_req.build_flags_hash;
         r->backend_id = r->stage_req.backend_id;
+        ac_stft_config_default(&scfg, r->fft_size);
+        r->synth_bytes = ac_istft_get_mem_size(&scfg);
+        if (r->synth_bytes == 0) return -1;
     }
     if (r->front_req.backend_id != r->backend_id) return -1;
     total = align_up(sizeof(FourAecDfnRes));
-    if (!total || r->front_req.bytes > SIZE_MAX - total) return -1;
-    total += align_up((size_t)r->front_req.bytes);
+    if (!total ||
+        add_region(&total, (size_t)r->front_req.bytes) ||
+        add_region(&total, r->res_bytes) ||
+        add_region(&total, (size_t)r->n_freqs * sizeof(float)) ||    /* g_total */
+        add_region(&total, (size_t)r->n_freqs * sizeof(float)) ||    /* unity   */
+        add_region(&total, (size_t)r->n_freqs * sizeof(Complex)))    /* post    */
+        return -1;
     if (r->use_bridge) {
-        if (r->bridge_req.bytes > SIZE_MAX - total) return -1;
-        total += align_up((size_t)r->bridge_req.bytes);
+        if (add_region(&total, (size_t)r->bridge_req.bytes)) return -1;
     } else {
-        if (r->stage_req.bytes > SIZE_MAX - total) return -1;
-        total += align_up((size_t)r->stage_req.bytes);
-        if ((size_t)DFN2_N_BINS * sizeof(Complex) > SIZE_MAX - total) return -1;
-        total += align_up((size_t)DFN2_N_BINS * sizeof(Complex));
+        if (add_region(&total, r->synth_bytes) ||
+            add_region(&total, (size_t)r->stage_req.bytes) ||
+            add_region(&total, (size_t)DFN2_N_BINS * sizeof(Complex)))
+            return -1;
     }
     r->bytes = total;
     return 0;
@@ -152,6 +192,7 @@ FourAecDfnRes *four_aec_dfn_res_init_ex(void *mem, size_t bytes,
     FourAecDfnResMemReq req;
     unsigned char *cursor;
     FourAecDfnRes *p;
+    int k;
     if (!mem || (uintptr_t)mem % WRAP_ALIGN != 0u || resolve(cfg, &r) != 0)
         return NULL;
     fill_descriptor(&r, &req);
@@ -164,6 +205,22 @@ FourAecDfnRes *four_aec_dfn_res_init_ex(void *mem, size_t bytes,
                                         &cfg->front_end, &r.front_req);
     if (!p->front) return NULL;
     cursor += align_up((size_t)r.front_req.bytes);
+    p->res = aec_res_init(cursor, r.res_bytes, &r.res_cfg);
+    if (!p->res || aec_res_n_bins(p->res) != r.n_freqs ||
+        aec_res_hop_size(p->res) != four_aec_nr_res_hop_size(p->front))
+        return NULL;
+    cursor += align_up(r.res_bytes);
+    p->n_freqs = r.n_freqs;
+    p->g_total = (float *)cursor;
+    cursor += align_up((size_t)r.n_freqs * sizeof(float));
+    p->unity = (float *)cursor;
+    cursor += align_up((size_t)r.n_freqs * sizeof(float));
+    p->post = (Complex *)cursor;
+    cursor += align_up((size_t)r.n_freqs * sizeof(Complex));
+    for (k = 0; k < r.n_freqs; ++k) p->unity[k] = 1.0f;
+    p->rng = SE_CNG_RNG_SEED;
+    /* The comfort-noise fill is the front end's own switch. */
+    p->cng = cfg->front_end.enable_cng;
     /* The core resolves fft_size 0 to its rate default; the stage's grid
      * (48 kHz) or the bridge's native grid must be the core's, checked once
      * here. */
@@ -180,6 +237,13 @@ FourAecDfnRes *four_aec_dfn_res_init_ex(void *mem, size_t bytes,
     if (four_aec_nr_res_n_freqs(p->front) != DFN2_N_BINS ||
         four_aec_nr_res_hop_size(p->front) != DFN2_HOP_LEN)
         return NULL;
+    {
+        AcStftConfig scfg;
+        ac_stft_config_default(&scfg, r.fft_size);
+        p->istft = ac_istft_init(cursor, r.synth_bytes, &scfg);
+        if (!p->istft) return NULL;
+        cursor += align_up(r.synth_bytes);
+    }
     p->stage = dfn_res_stage_init_ex(cursor, (size_t)r.stage_req.bytes,
                                      &r.scfg, &r.stage_req);
     if (!p->stage) return NULL;
@@ -208,11 +272,14 @@ FourAecDfnRes *four_aec_dfn_res_create(const FourAecDfnResConfig *cfg) {
 void four_aec_dfn_res_reset(FourAecDfnRes *p) {
     if (!p) return;
     four_aec_nr_res_reset(p->front);
+    aec_res_reset(p->res);
+    p->rng = SE_CNG_RNG_SEED;
     if (p->bridge) {
         dfn_rate_bridge_reset(p->bridge);   /* resets its stage too */
         return;
     }
     dfn_res_stage_reset(p->stage);
+    ac_istft_reset(p->istft);
     memset(p->stage_output, 0, (size_t)DFN2_N_BINS * sizeof(Complex));
 }
 
@@ -227,42 +294,58 @@ void four_aec_dfn_res_destroy(FourAecDfnRes *p) {
     if (owned) free(owned);
 }
 
-/* The core owns the frame sequencing: its token gate refuses a second pre
- * while a frame is pending and a post without one, so this wrapper passes
- * both calls straight through. */
-int four_aec_dfn_res_process_pre(FourAecDfnRes *p,
-                                 const float *microphones_interleaved,
-                                 const float *ref,
-                                 FourAecNrResPreFrame *out) {
+/* out->delay.changed is reported for external STFT/OLA consumers of the
+ * far-end; the stage consumes no far-end and is left running. */
+int four_aec_dfn_res_front_process(FourAecDfnRes *p,
+                                   const float *microphones_interleaved,
+                                   const float *ref,
+                                   FourAecFront *out) {
     if (!p) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    /* out->delay.changed is reported for external STFT/OLA consumers of the
-     * far-end; the stage consumes no far-end and is left running. */
-    return four_aec_nr_res_process_pre(p->front, microphones_interleaved,
-                                       ref, out);
+    return four_aec_front_process(p->front, microphones_interleaved, ref, out);
 }
 
-static int process_post(FourAecDfnRes *p,
-                        const FourAecNrResFrameToken *token,
-                        const Complex *weights,
-                        const Complex *trusted,
-                        float *out) {
-    FourAecNrResPostView view;
-    int rc, ok;
+static int spectrum_finite(const Complex *s, int n) {
+    int k;
+    for (k = 0; k < n; ++k)
+        if (!isfinite(s[k].r) || !isfinite(s[k].i)) return 0;
+    return 1;
+}
+
+int four_aec_dfn_res_process(FourAecDfnRes *p, const Complex *weights,
+                             const Complex *beamformed_error, float *out) {
+    SeSpecFrame f;
+    const float *res_gain;
+    int rc, ok, k;
     if (!p || !out) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    rc = four_aec_nr_res_process_post_view(p->front, token, weights,
-                                            trusted, &view);
+    rc = four_aec_fuse(p->front, weights, beamformed_error, &f);
     if (rc != FOUR_AEC_NR_RES_OK) {
         if (rc == FOUR_AEC_NR_RES_DSP_ERROR) four_aec_dfn_res_reset(p);
         return rc;
     }
+    res_gain = se_res_stage_gain(p->res, &f);
+    if (!res_gain) {
+        four_aec_dfn_res_reset(p);
+        return FOUR_AEC_NR_RES_DSP_ERROR;
+    }
+    /* P = E * min(1, G_res), plus comfort noise on the cut bins. The absent
+     * denoiser reads as the unity vector, so the same four calls as the NR
+     * pipeline serve. */
+    sk_min_f32(p->g_total, p->unity, res_gain, p->n_freqs);
+    sk_capply_gain_f32(p->post, f.e, p->g_total, p->n_freqs);
+    if (p->cng)
+        aec_cng_fill(&p->rng, p->post, f.cn, res_gain, p->unity,
+                     SE_CNG_NR_GAIN_FLOOR, p->n_freqs);
     if (p->bridge) {
-        ok = dfn_rate_bridge_process(p->bridge, view.beamformed_error,
-                                     view.post_spectrum, out) == 0;
+        ok = dfn_rate_bridge_process(p->bridge, f.e, p->post, out) == 0;
     } else {
-        ok = dfn_res_stage_process(p->stage, view.beamformed_error,
-                                   view.post_spectrum, p->stage_output) >= 0 &&
-             four_aec_nr_res_synthesize_external(
-                 p->front, p->stage_output, out) == FOUR_AEC_NR_RES_OK;
+        ok = dfn_res_stage_process(p->stage, f.e, p->post,
+                                   p->stage_output) >= 0 &&
+             spectrum_finite(p->stage_output, p->n_freqs);
+        if (ok) {
+            ac_istft_push(p->istft, p->stage_output, out);
+            for (k = 0; k < DFN2_HOP_LEN; ++k)
+                if (!isfinite(out[k])) { ok = 0; break; }
+        }
     }
     if (!ok) {
         four_aec_dfn_res_reset(p);
@@ -271,26 +354,9 @@ static int process_post(FourAecDfnRes *p,
     return FOUR_AEC_NR_RES_OK;
 }
 
-int four_aec_dfn_res_process_post(FourAecDfnRes *p,
-                                  const FourAecNrResFrameToken *token,
-                                  const Complex *weights,
-                                  float *out) {
-    return process_post(p, token, weights, NULL, out);
-}
-
-int four_aec_dfn_res_process_post_trusted_spectrum(
-    FourAecDfnRes *p,
-    const FourAecNrResFrameToken *token,
-    const Complex *weights,
-    const Complex *beamformed_error,
-    float *out) {
-    if (!beamformed_error) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    return process_post(p, token, weights, beamformed_error, out);
-}
-
 int four_aec_dfn_res_set_aec_preset(FourAecDfnRes *p, AecPreset preset,
                                     float ramp_ms) {
-    return p ? four_aec_nr_res_set_aec_preset(p->front, preset, ramp_ms) : -1;
+    return p ? aec_res_set_preset(p->res, preset, ramp_ms) : -1;
 }
 
 int four_aec_dfn_res_set_atten_lim(FourAecDfnRes *p, float atten_lim_db) {

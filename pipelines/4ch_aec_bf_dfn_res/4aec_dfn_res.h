@@ -3,17 +3,17 @@
  * The conventional four-channel core on the product's own grid (16 or
  * 48 kHz, the core's rates; 16 kHz by default) with its post-beam MMSE-LSA
  * replaced by DFN2.
- * The external beamformer seam is identical to FourAecNrRes: process_pre()
- * exposes the four linear lanes, then process_post() accepts the effective
- * weights and the optional trusted GSC spectrum. The core's
- * process_post_view() then yields the beamformed error E and the post-RES
- * spectrum P = E * G_res (+ comfort noise when enabled). At 48 kHz the
- * shared dfn_res_stage is applied to P directly and the core's
- * synthesize_external() finishes the hop; at 16 kHz the dfn_rate_bridge
+ * The external beamformer seam is the FourAecNrRes front end's: front_process()
+ * exposes the four linear lanes, then process() accepts the effective weights
+ * and the optional trusted GSC spectrum, fuses the lanes into the beamformed
+ * error E, and forms the post-RES spectrum P = E * G_res (+ comfort noise when
+ * enabled) from this pipeline's own post-beam RES. At 48 kHz the shared
+ * dfn_res_stage is applied to P directly and this pipeline's own synthesis
+ * finishes the hop; at 16 kHz the dfn_rate_bridge
  * runs the same stage on its 48 kHz grid (native WOLA, resample up, 48 kHz
  * analysis, stage, 48 kHz WOLA, resample down) so only DFN2 leaves the
  * product rate. With no model (or a failing one) the output is the
- * conventional core with enable_nr=0 delayed: bit for bit by two hops at
+ * conventional 4-channel chain with the denoiser off delayed: bit for bit by two hops at
  * 48 kHz, and through the resampler round trip by
  * dfn_rate_bridge_added_delay_samples() otherwise.
  */
@@ -73,20 +73,20 @@ FourAecDfnRes *four_aec_dfn_res_create(const FourAecDfnResConfig *cfg);
 void four_aec_dfn_res_destroy(FourAecDfnRes *p);
 void four_aec_dfn_res_reset(FourAecDfnRes *p);
 
-int four_aec_dfn_res_process_pre(FourAecDfnRes *p,
-                                 const float *microphones_interleaved,
-                                 const float *ref,
-                                 FourAecNrResPreFrame *out);
-int four_aec_dfn_res_process_post(FourAecDfnRes *p,
-                                  const FourAecNrResFrameToken *token,
-                                  const Complex *weights,
-                                  float *out);
-int four_aec_dfn_res_process_post_trusted_spectrum(
-    FourAecDfnRes *p,
-    const FourAecNrResFrameToken *token,
-    const Complex *weights,
-    const Complex *beamformed_error,
-    float *out);
+/* One hop in two calls around the external SRP-PHAT/GSC. front_process() is
+ * four_aec_front_process() on the front end: it exposes the four linear lanes
+ * (FourAecFront.linear_spectra). process() then takes the effective weights
+ * and, optionally, the beamformed error from the same beamformer call (NULL
+ * reconstructs it from the weights), projects the lanes (four_aec_fuse()),
+ * chains RES gain -> min -> apply -> comfort noise, runs the DFN2 stage on
+ * (E, P) and synthesises. FOUR_AEC_NR_RES_* status as the front end; a stage
+ * contract error resets the pipeline and returns DSP_ERROR. */
+int four_aec_dfn_res_front_process(FourAecDfnRes *p,
+                                   const float *microphones_interleaved,
+                                   const float *ref,
+                                   FourAecFront *out);
+int four_aec_dfn_res_process(FourAecDfnRes *p, const Complex *weights,
+                             const Complex *beamformed_error, float *out);
 
 /* Runtime strength: the core's AEC preset ramp and the stage's attenuation
  * limit. Between hops only; -1 on NULL or a refused value. */

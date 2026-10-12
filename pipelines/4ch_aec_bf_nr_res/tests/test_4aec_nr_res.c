@@ -9,6 +9,7 @@
 #include "4aec_nr_res_internal.h"
 #include "4aec_projection_kernels.h"
 #include "aec_res.h"
+#include "conv_chain_4ch.h"
 #include "fft_wrapper.h"
 
 #include <float.h>
@@ -51,6 +52,13 @@ static int all_finite(const float* values, int count) {
 
 static void fill_inputs(float* microphones, float* ref, int hop,
                         int sample_rate, int frame_index);
+
+/* The fuse on the front frame just processed, for tests that only need the
+ * lanes advanced through a complete hop. */
+static int fuse_only(FourAecNrRes* p, const Complex* weights) {
+    SeSpecFrame view;
+    return four_aec_fuse(p, weights, NULL, &view);
+}
 
 /* Production-scale seed shared by the two residual-projection blocks: an
  * audio-domain echo estimate against an int16^2-domain residual PSD. */
@@ -218,10 +226,8 @@ static void test_projection_kernels(void) {
 
 static void test_trusted_spectrum_path(void) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
-    FourAecNrRes* reconstructed = NULL;
-    FourAecNrRes* trusted = NULL;
-    FourAecNrResPreFrame reconstructed_pre;
-    FourAecNrResPreFrame trusted_pre;
+    ConvChain* reconstructed = NULL;
+    ConvChain* trusted = NULL;
     float* microphones = NULL;
     float* ref = NULL;
     float* reconstructed_out = NULL;
@@ -236,14 +242,14 @@ static void test_trusted_spectrum_path(void) {
 
     cfg.fft_size = 256;
     cfg.enable_cng = 0;
-    reconstructed = four_aec_nr_res_create(&cfg);
-    trusted = four_aec_nr_res_create(&cfg);
+    reconstructed = conv_create(&cfg);
+    trusted = conv_create(&cfg);
     CHECK(reconstructed && trusted,
           "trusted-spectrum parity instances create");
     if (!reconstructed || !trusted) goto cleanup;
 
-    hop = four_aec_nr_res_hop_size(reconstructed);
-    n_freqs = four_aec_nr_res_n_freqs(reconstructed);
+    hop = reconstructed->hop;
+    n_freqs = reconstructed->n_freqs;
     microphones = (float*)calloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
     ref = (float*)calloc((size_t)hop, sizeof(float));
@@ -270,13 +276,13 @@ static void test_trusted_spectrum_path(void) {
 
     for (frame = 0; frame < 4; ++frame) {
         fill_inputs(microphones, ref, hop, 16000, frame);
-        CHECK(four_aec_nr_res_process_pre(
-                  reconstructed, microphones, ref, &reconstructed_pre) ==
+        CHECK(four_aec_front_process(
+                  reconstructed->core, microphones, ref, &reconstructed->front) ==
                   FOUR_AEC_NR_RES_OK &&
-              four_aec_nr_res_process_pre(
-                  trusted, microphones, ref, &trusted_pre) ==
+              four_aec_front_process(
+                  trusted->core, microphones, ref, &trusted->front) ==
                   FOUR_AEC_NR_RES_OK,
-              "trusted-spectrum parity pre stages succeed");
+              "trusted-spectrum parity front stages succeed");
         memset(
             trusted_spectrum, 0,
             (size_t)n_freqs * sizeof(Complex));
@@ -284,15 +290,16 @@ static void test_trusted_spectrum_path(void) {
             four_aec_projection_cmac_scalar(
                 trusted_spectrum,
                 weights + (size_t)ch * n_freqs,
-                trusted_pre.linear_spectra[ch], n_freqs);
+                trusted->front.linear_spectra[ch], n_freqs);
         }
-        CHECK(four_aec_nr_res_process_post(
-                  reconstructed, &reconstructed_pre.token,
-                  weights, reconstructed_out) == FOUR_AEC_NR_RES_OK &&
-              four_aec_nr_res_process_post_trusted_spectrum(
-                  trusted, &trusted_pre.token, weights,
-                  trusted_spectrum, trusted_out) == FOUR_AEC_NR_RES_OK,
-              "trusted and reconstructed post stages succeed");
+        CHECK(conv_post(reconstructed, weights, NULL, reconstructed_out) ==
+                  FOUR_AEC_NR_RES_OK &&
+              conv_post(trusted, weights, trusted_spectrum, trusted_out) ==
+                  FOUR_AEC_NR_RES_OK,
+              "trusted and reconstructed fuse stages succeed");
+        CHECK(trusted->frame.e == trusted_spectrum &&
+              reconstructed->frame.e != trusted_spectrum,
+              "a supplied spectrum is used in place, a missing one rebuilt");
         CHECK(memcmp(
                   reconstructed_out, trusted_out,
                   (size_t)hop * sizeof(float)) == 0,
@@ -306,8 +313,8 @@ cleanup:
     free(reconstructed_out);
     free(ref);
     free(microphones);
-    four_aec_nr_res_destroy(trusted);
-    four_aec_nr_res_destroy(reconstructed);
+    conv_destroy(trusted);
+    conv_destroy(reconstructed);
 }
 
 static void fill_inputs(float* microphones, float* ref, int hop,
@@ -332,8 +339,9 @@ static void fill_inputs(float* microphones, float* ref, int hop,
 static int run_grid(int sample_rate, int fft_size) {
     FourAecNrResConfig cfg;
     FourAecNrRes* p;
-    FourAecNrResPreFrame pre;
-    FourAecNrResFrameToken stale;
+    ConvChain* chain;
+    FourAecFront pre;
+    SeSpecFrame frame_view;
     float* microphones;
     float* ref;
     float* out;
@@ -365,10 +373,6 @@ static int run_grid(int sample_rate, int fft_size) {
     CHECK(four_aec_nr_res_linear_aec_count(p) ==
               FOUR_AEC_NR_RES_CHANNELS,
           "four linear AEC filters");
-    CHECK(four_aec_nr_res_nr_count(p) == 1,
-          "one mono NR");
-    CHECK(four_aec_nr_res_post_res_count(p) == 1,
-          "one post-beam RES");
 
     microphones = (float*)calloc(
         (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
@@ -377,12 +381,15 @@ static int run_grid(int sample_rate, int fft_size) {
     weights = (Complex*)calloc(
         (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs,
         sizeof(Complex));
-    CHECK(microphones && ref && out && weights, "test buffers allocate");
-    if (!microphones || !ref || !out || !weights) {
+    chain = conv_attach(p, &cfg);
+    CHECK(microphones && ref && out && weights && chain,
+          "test buffers and post stages allocate");
+    if (!microphones || !ref || !out || !weights || !chain) {
         free(microphones);
         free(ref);
         free(out);
         free(weights);
+        conv_destroy(chain);
         four_aec_nr_res_destroy(p);
         return 0;
     }
@@ -393,60 +400,49 @@ static int run_grid(int sample_rate, int fft_size) {
         }
     }
 
+    /* The fuse needs a front frame processed since construction. */
+    CHECK(four_aec_fuse(p, weights, NULL, &frame_view) ==
+              FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "fuse before any front frame is a sequence error");
+
     for (frame = 0; frame < 3; ++frame) {
         fill_inputs(microphones, ref, hop, sample_rate, frame);
-        rc = four_aec_nr_res_process_pre(
+        rc = four_aec_front_process(
             p, microphones, ref, &pre);
-        CHECK(rc == FOUR_AEC_NR_RES_OK, "pre stage succeeds");
+        CHECK(rc == FOUR_AEC_NR_RES_OK, "front stage succeeds");
         if (rc != FOUR_AEC_NR_RES_OK) break;
-        CHECK(pre.linear_interleaved != NULL &&
-              pre.hop_size == hop &&
-              pre.n_channels == FOUR_AEC_NR_RES_CHANNELS,
-              "pre frame shape contract");
-        CHECK(all_finite(
-                  pre.linear_interleaved,
-                  hop * FOUR_AEC_NR_RES_CHANNELS),
-              "four linear outputs finite");
-
-        if (frame == 0) {
-            FourAecNrResPreFrame duplicate;
-            CHECK(four_aec_nr_res_process_pre(
-                      p, microphones, ref, &duplicate) ==
-                      FOUR_AEC_NR_RES_SEQUENCE_ERROR,
-                  "second pre frame is rejected while one is pending");
+        CHECK(pre.hop_size == hop && pre.n_freqs == n_freqs &&
+              pre.n_channels == FOUR_AEC_NR_RES_CHANNELS &&
+              pre.aligned_ref != NULL,
+              "front view shape contract");
+        for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+            CHECK(pre.linear_spectra[ch] != NULL &&
+                  all_finite(pre.formed_hop[ch], hop),
+                  "lane spectrum and finite formed hop");
         }
 
-        stale = pre.token;
-        rc = four_aec_nr_res_process_post(
-            p, &pre.token, weights, out);
-        CHECK(rc == FOUR_AEC_NR_RES_OK, "post NR/RES stage succeeds");
+        rc = conv_post(chain, weights, NULL, out);
+        CHECK(rc == FOUR_AEC_NR_RES_OK, "fuse + NR/RES stages succeed");
         CHECK(all_finite(out, hop), "mono output is finite");
-        CHECK(four_aec_nr_res_process_post(
-                  p, &stale, weights, out) ==
-                  FOUR_AEC_NR_RES_SEQUENCE_ERROR,
-              "post token cannot be replayed");
     }
 
     fill_inputs(microphones, ref, hop, sample_rate, 4);
-    CHECK(four_aec_nr_res_process_pre(
+    CHECK(four_aec_front_process(
               p, microphones, ref, &pre) == FOUR_AEC_NR_RES_OK,
-          "pre before reset succeeds");
-    stale = pre.token;
+          "front before reset succeeds");
     four_aec_nr_res_reset(p);
-    CHECK(four_aec_nr_res_process_post(
-              p, &stale, weights, out) ==
+    CHECK(four_aec_fuse(p, weights, NULL, &frame_view) ==
               FOUR_AEC_NR_RES_SEQUENCE_ERROR,
-          "reset invalidates in-flight token");
+          "reset invalidates the front frame");
 
     fill_inputs(microphones, ref, hop, sample_rate, 5);
-    CHECK(four_aec_nr_res_process_pre(
+    CHECK(four_aec_front_process(
               p, microphones, ref, &pre) == FOUR_AEC_NR_RES_OK,
-          "pre after reset succeeds");
+          "front after reset succeeds");
     memset(weights, 0,
            (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs *
            sizeof(Complex));
-    CHECK(four_aec_nr_res_process_post(
-              p, &pre.token, weights, out) ==
+    CHECK(four_aec_fuse(p, weights, NULL, &frame_view) ==
               FOUR_AEC_NR_RES_INVALID_ARGUMENT,
           "all-zero beamformer weights are rejected");
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
@@ -454,15 +450,27 @@ static int run_grid(int sample_rate, int fft_size) {
             weights[(size_t)ch * n_freqs + k].r = 0.25f;
         }
     }
-    CHECK(four_aec_nr_res_process_post(
-              p, &pre.token, weights, out) ==
+    CHECK(four_aec_fuse(p, weights, NULL, &frame_view) ==
               FOUR_AEC_NR_RES_OK,
-          "pending frame may retry after invalid weights");
+          "the front frame may retry after invalid weights");
+    CHECK(four_aec_fuse(NULL, weights, NULL, &frame_view) ==
+              FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          four_aec_fuse(p, NULL, NULL, &frame_view) ==
+              FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          four_aec_fuse(p, weights, NULL, NULL) ==
+              FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+          "fuse rejects NULL arguments");
+    CHECK(frame_view.n_freqs == n_freqs && frame_view.hop == hop &&
+          frame_view.e != NULL && frame_view.r2 != NULL &&
+          frame_view.cn != NULL && frame_view.g_res_ctx == NULL &&
+          frame_view.far_hop == pre.aligned_ref,
+          "fused frame carries E, R^2, comfort noise and the aligned far");
 
     free(microphones);
     free(ref);
     free(out);
     free(weights);
+    conv_destroy(chain);
     four_aec_nr_res_destroy(p);
     return 1;
 }
@@ -531,201 +539,17 @@ static void test_invalid_configs(void) {
           "are a real check, not an identity)");
 }
 
-/* A frame token is stamped with the owning instance's pointer
- * (owner_cookie); process_post() must reject a token minted by a different
- * live instance, and doing so must not disturb either instance's own
- * pending frame. */
-static void test_cross_instance_token(void) {
-    FourAecNrResConfig cfg;
-    FourAecNrRes* a = NULL;
-    FourAecNrRes* b = NULL;
-    FourAecNrResPreFrame pre_a;
-    FourAecNrResPreFrame pre_b;
-    float* microphones = NULL;
-    float* ref = NULL;
-    float* out = NULL;
-    Complex* weights = NULL;
-    int hop;
-    int n_freqs;
-    int ch;
-    int k;
-
-    cfg = four_aec_nr_res_default_config(16000);
-    cfg.enable_cng = 0;
-    a = four_aec_nr_res_create(&cfg);
-    b = four_aec_nr_res_create(&cfg);
-    CHECK(a != NULL && b != NULL, "cross-instance test: two instances create");
-    if (!a || !b) goto cleanup;
-
-    hop = four_aec_nr_res_hop_size(a);
-    n_freqs = four_aec_nr_res_n_freqs(a);
-    microphones = (float*)calloc(
-        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
-    ref = (float*)calloc((size_t)hop, sizeof(float));
-    out = (float*)calloc((size_t)hop, sizeof(float));
-    weights = (Complex*)calloc(
-        (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
-    CHECK(microphones && ref && out && weights,
-          "cross-instance test: buffers allocate");
-    if (!microphones || !ref || !out || !weights) goto cleanup;
-    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-        for (k = 0; k < n_freqs; ++k) {
-            weights[(size_t)ch * n_freqs + k].r = 0.25f;
-        }
-    }
-
-    fill_inputs(microphones, ref, hop, 16000, 0);
-    CHECK(four_aec_nr_res_process_pre(a, microphones, ref, &pre_a) ==
-              FOUR_AEC_NR_RES_OK,
-          "cross-instance test: instance A pre succeeds");
-    fill_inputs(microphones, ref, hop, 16000, 1);
-    CHECK(four_aec_nr_res_process_pre(b, microphones, ref, &pre_b) ==
-              FOUR_AEC_NR_RES_OK,
-          "cross-instance test: instance B pre succeeds");
-
-    CHECK(four_aec_nr_res_process_post(
-              b, &pre_a.token, weights, out) ==
-              FOUR_AEC_NR_RES_SEQUENCE_ERROR,
-          "post rejects a token minted by a different instance");
-
-    CHECK(four_aec_nr_res_process_post(
-              b, &pre_b.token, weights, out) == FOUR_AEC_NR_RES_OK,
-          "instance B's own pending frame survives the rejected cross-use");
-    CHECK(four_aec_nr_res_process_post(
-              a, &pre_a.token, weights, out) == FOUR_AEC_NR_RES_OK,
-          "instance A's own pending frame survives the rejected cross-use");
-
-cleanup:
-    four_aec_nr_res_destroy(a);
-    four_aec_nr_res_destroy(b);
-    free(weights);
-    free(out);
-    free(ref);
-    free(microphones);
-}
-
-/* destroy() never releases caller-owned pool memory (documented contract),
- * so a caller may init() a brand-new instance into the exact same pool
- * bytes right after destroying the old one. init() memsets that pool to
- * zero, so the new instance's frame_index/generation restart at 0 and its
- * owner_cookie (the instance pointer) is identical to the destroyed
- * instance's, since it is literally the same memory -- a pre-destroy token
- * would be bit-identical to the new instance's own first-frame token if
- * instance_epoch did not also distinguish them. This reproduces that ABA
- * scenario directly and confirms process_post() still rejects the stale
- * pre-destroy token against the new instance. */
-static void test_pool_reinit_token_rejected(void) {
-    FourAecNrResConfig cfg;
-    FourAecNrResMemReq req;
-    FourAecNrRes* old_instance = NULL;
-    FourAecNrRes* new_instance = NULL;
-    FourAecNrResPreFrame pre_old;
-    FourAecNrResPreFrame pre_new;
-    unsigned char* pool = NULL;
-    float* microphones = NULL;
-    float* ref = NULL;
-    float* out = NULL;
-    Complex* weights = NULL;
-    int hop;
-    int n_freqs;
-    int ch;
-    int k;
-
-    cfg = four_aec_nr_res_default_config(16000);
-    cfg.enable_cng = 0;
-    if (four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0 ||
-        req.bytes > (uint64_t)SIZE_MAX) {
-        CHECK(0, "pool-reinit test: memory requirement query succeeds");
-        return;
-    }
-    if (posix_memalign(
-            (void**)&pool, (size_t)req.alignment, (size_t)req.bytes) != 0)
-        pool = NULL;
-    CHECK(pool != NULL, "pool-reinit test: pool allocates");
-    if (!pool) return;
-
-    old_instance = four_aec_nr_res_init(pool, (size_t)req.bytes, &cfg);
-    CHECK(old_instance != NULL, "pool-reinit test: first instance inits");
-    if (!old_instance) { free(pool); return; }
-
-    hop = four_aec_nr_res_hop_size(old_instance);
-    n_freqs = four_aec_nr_res_n_freqs(old_instance);
-    microphones = (float*)calloc(
-        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
-    ref = (float*)calloc((size_t)hop, sizeof(float));
-    out = (float*)calloc((size_t)hop, sizeof(float));
-    weights = (Complex*)calloc(
-        (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
-    CHECK(microphones && ref && out && weights,
-          "pool-reinit test: buffers allocate");
-    if (!microphones || !ref || !out || !weights) {
-        four_aec_nr_res_destroy(old_instance);
-        free(pool);
-        goto cleanup;
-    }
-    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
-        for (k = 0; k < n_freqs; ++k) {
-            weights[(size_t)ch * n_freqs + k].r = 0.25f;
-        }
-    }
-
-    fill_inputs(microphones, ref, hop, 16000, 0);
-    CHECK(four_aec_nr_res_process_pre(
-              old_instance, microphones, ref, &pre_old) ==
-              FOUR_AEC_NR_RES_OK,
-          "pool-reinit test: first instance pre succeeds");
-
-    /* destroy() does not release or clear caller-owned pool memory. */
-    four_aec_nr_res_destroy(old_instance);
-
-    new_instance = four_aec_nr_res_init(pool, (size_t)req.bytes, &cfg);
-    CHECK(new_instance != NULL,
-          "pool-reinit test: second instance inits into the same pool");
-    if (!new_instance) { free(pool); goto cleanup; }
-
-    CHECK((void*)new_instance == (void*)old_instance,
-          "pool-reinit test: second instance reuses the exact same address");
-
-    fill_inputs(microphones, ref, hop, 16000, 0);
-    CHECK(four_aec_nr_res_process_pre(
-              new_instance, microphones, ref, &pre_new) ==
-              FOUR_AEC_NR_RES_OK,
-          "pool-reinit test: second instance pre succeeds");
-    CHECK(pre_old.token.frame_index == pre_new.token.frame_index &&
-              pre_old.token.generation == pre_new.token.generation &&
-              pre_old.token.owner_cookie == pre_new.token.owner_cookie &&
-              pre_old.token.instance_epoch != pre_new.token.instance_epoch,
-          "pool-reinit test: only instance_epoch differs between the two "
-          "tokens");
-
-    CHECK(four_aec_nr_res_process_post(
-              new_instance, &pre_old.token, weights, out) ==
-              FOUR_AEC_NR_RES_SEQUENCE_ERROR,
-          "post rejects a pre-destroy token reused after same-pool re-init");
-    CHECK(four_aec_nr_res_process_post(
-              new_instance, &pre_new.token, weights, out) ==
-              FOUR_AEC_NR_RES_OK,
-          "the new instance's own token is still accepted");
-
-    four_aec_nr_res_destroy(new_instance);
-    free(pool);
-
-cleanup:
-    free(weights);
-    free(out);
-    free(ref);
-    free(microphones);
-}
-
 static void run_static_parity(int sample_rate, int fft_size) {
     FourAecNrResConfig cfg;
+    ConvChain* heap_chain = NULL;
+    ConvChain* stat_chain = NULL;
     FourAecNrResMemReq req;
     FourAecNrResMemReq stale;
     FourAecNrResMemBreakdown breakdown;
     FourAecNrRes* heap = NULL;
     FourAecNrRes* stat = NULL;
-    FourAecNrResPreFrame heap_pre;
-    FourAecNrResPreFrame stat_pre;
+    FourAecFront heap_pre;
+    FourAecFront stat_pre;
     unsigned char* pool = NULL;
     float* microphones = NULL;
     float* ref = NULL;
@@ -746,7 +570,7 @@ static void run_static_parity(int sample_rate, int fft_size) {
     CHECK(
         four_aec_nr_res_get_mem_breakdown(&cfg, &breakdown) == 0 &&
         req.bytes == (uint64_t)breakdown.total_bytes &&
-        breakdown.aec_bytes > breakdown.nr_bytes &&
+        breakdown.aec_bytes > 0 &&
         breakdown.wrapper_bytes > 0,
         "static memory breakdown reconciles with descriptor");
     if (rc != 0 || req.bytes > (uint64_t)SIZE_MAX) return;
@@ -831,6 +655,10 @@ static void run_static_parity(int sample_rate, int fft_size) {
     CHECK(stat != NULL && heap != NULL,
           "poisoned caller pool and heap construction both succeed");
     if (!stat || !heap) goto cleanup;
+    heap_chain = conv_attach(heap, &cfg);
+    stat_chain = conv_attach(stat, &cfg);
+    CHECK(heap_chain && stat_chain, "post stages for both instances build");
+    if (!heap_chain || !stat_chain) goto cleanup;
 
     for (k = 0; k < 32; ++k) {
         if (pool[(size_t)req.bytes + (size_t)k] != 0xa5) break;
@@ -859,27 +687,25 @@ static void run_static_parity(int sample_rate, int fft_size) {
 
     for (frame = 0; frame < 4; ++frame) {
         fill_inputs(microphones, ref, hop, sample_rate, frame);
-        if (four_aec_nr_res_process_pre(
+        if (four_aec_front_process(
                 heap, microphones, ref, &heap_pre) !=
                 FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_pre(
+            four_aec_front_process(
                 stat, microphones, ref, &stat_pre) !=
                 FOUR_AEC_NR_RES_OK) {
             CHECK(0, "heap/static pre stages both succeed");
             break;
         }
-        CHECK(memcmp(
-                  heap_pre.linear_interleaved,
-                  stat_pre.linear_interleaved,
-                  (size_t)hop * FOUR_AEC_NR_RES_CHANNELS *
-                  sizeof(float)) == 0,
-              "heap/static linear outputs are byte-identical");
+        for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+            CHECK(memcmp(
+                      heap_pre.formed_hop[ch],
+                      stat_pre.formed_hop[ch],
+                      (size_t)hop * sizeof(float)) == 0,
+                  "heap/static linear outputs are byte-identical");
 
-        if (four_aec_nr_res_process_post(
-                heap, &heap_pre.token, weights, heap_out) !=
+        if (conv_post(heap_chain, weights, NULL, heap_out) !=
                 FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(
-                stat, &stat_pre.token, weights, stat_out) !=
+            conv_post(stat_chain, weights, NULL, stat_out) !=
                 FOUR_AEC_NR_RES_OK) {
             CHECK(0, "heap/static post stages both succeed");
             break;
@@ -901,6 +727,8 @@ static void run_static_parity(int sample_rate, int fft_size) {
     CHECK(stat != NULL, "caller pool is reusable after destroy");
 
 cleanup:
+    conv_destroy(stat_chain);
+    conv_destroy(heap_chain);
     four_aec_nr_res_destroy(stat);
     four_aec_nr_res_destroy(heap);
     free(weights);
@@ -945,7 +773,7 @@ static void fill_delayed_echo(float* microphones, float* ref, int hop,
 static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(sample_rate);
     FourAecNrRes* pipeline = NULL;
-    FourAecNrResPreFrame pre;
+    FourAecFront pre;
     FftHandle* fft = NULL;
     float* microphones = NULL;
     float* ref = NULL;
@@ -1019,7 +847,7 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
         fill_delayed_echo(
             microphones, ref, hop, history, frame * hop + WOLA_SCENE_PAD,
             frame >= WOLA_SHIFT_HOP ? moved_delay : base_delay);
-        if (four_aec_nr_res_process_pre(
+        if (four_aec_front_process(
                 pipeline, microphones, ref, &pre) != FOUR_AEC_NR_RES_OK) {
             valid = 0;
             break;
@@ -1049,24 +877,18 @@ static void test_pre_frame_wola_identity(int sample_rate, int fft_size) {
             for (int i = 0; i < hop; ++i) {
                 float d = fabsf(channel_ola[i] - channel_previous[i]);
                 if (d > max_error) max_error = d;
-                channel_previous[i] = pre.linear_interleaved[
-                    i * FOUR_AEC_NR_RES_CHANNELS + ch];
+                channel_previous[i] = pre.formed_hop[ch][i];
             }
             memmove(channel_ola, channel_ola + hop,
                     (size_t)(fft_size - hop) * sizeof(float));
             memset(channel_ola + (fft_size - hop), 0,
                    (size_t)hop * sizeof(float));
         }
-        if (four_aec_nr_res_process_post(
-                pipeline, &pre.token, weights, out) != FOUR_AEC_NR_RES_OK) {
-            valid = 0;
-            break;
-        }
     }
 
 check_result:
     snprintf(label, sizeof(label),
-             "4ch pre time/spectrum seams share one reconstructing WOLA grid "
+             "4ch front time/spectrum seams share one reconstructing WOLA grid "
              "sr=%d/fft=%d (max error %.3g across %d alignment moves)",
              sample_rate, fft_size, (double)max_error, moving_realigns);
     CHECK(valid && max_error <= 1e-4f, label);
@@ -1099,7 +921,7 @@ cleanup:
  * via aec_process_context_shared_far() instead of each recomputing an
  * identical transform. Proves the total (four_aec_nr_res_far_fft_real_
  * compute_count(), summed across all four lanes) increases by AT MOST 1
- * per four_aec_nr_res_process_pre() call, never 4 -- the actual, measured
+ * per four_aec_front_process() call, never 4 -- the actual, measured
  * consequence of the sharing, not just "the code compiles and still
  * produces plausible output" (already covered by run_grid()'s finite-
  * output checks and the byte-equal WAV/raw-f32 gates run outside this
@@ -1118,7 +940,8 @@ static void test_far_fft_sharing_reduces_four_to_one(
         int sample_rate, int fft_size) {
     FourAecNrResConfig cfg;
     FourAecNrRes* p;
-    FourAecNrResPreFrame pre;
+    FourAecFront pre;
+    SeSpecFrame fused;
     float* microphones;
     float* ref;
     float* out;
@@ -1165,7 +988,7 @@ static void test_far_fft_sharing_reduces_four_to_one(
     for (frame = 0; frame < 40; ++frame) {
         fill_inputs(microphones, ref, hop, sample_rate, frame);
         before = four_aec_nr_res_far_fft_real_compute_count(p);
-        if (four_aec_nr_res_process_pre(p, microphones, ref, &pre) !=
+        if (four_aec_front_process(p, microphones, ref, &pre) !=
                 FOUR_AEC_NR_RES_OK) {
             CHECK(0, "far-FFT sharing test: pre stage succeeds");
             break;
@@ -1174,16 +997,16 @@ static void test_far_fft_sharing_reduces_four_to_one(
         if (after - before > max_single_hop_increment)
             max_single_hop_increment = (int)(after - before);
         if (after == before + 1) saw_a_plus_one_increment = 1;
-        if (four_aec_nr_res_process_post(p, &pre.token, weights, out) !=
+        if (four_aec_fuse(p, weights, NULL, &fused) !=
                 FOUR_AEC_NR_RES_OK) {
-            CHECK(0, "far-FFT sharing test: post stage succeeds");
+            CHECK(0, "far-FFT sharing test: fuse stage succeeds");
             break;
         }
     }
 
     snprintf(label, sizeof(label),
              "far-FFT sharing sr=%d/fft=%d: total never jumps by more than "
-             "1 in a single process_pre() call across 40 hops (max seen: %d)",
+             "1 in a single front_process() call across 40 hops (max seen: %d)",
              sample_rate, fft_size, max_single_hop_increment);
     CHECK(max_single_hop_increment <= 1, label);
     snprintf(label, sizeof(label),
@@ -1215,7 +1038,7 @@ static void test_delay_modes_and_bank_sizing(void) {
     FourAecNrResConfig pre_only;
     FourAecNrResMemReq r5, r2, rf, re, rp;
     FourAecNrRes *pf = NULL, *pe = NULL;
-    FourAecNrResPreFrame pre;
+    FourAecFront pre;
     float *mic = NULL, *far = NULL;
     int hop;
 
@@ -1241,7 +1064,7 @@ static void test_delay_modes_and_bank_sizing(void) {
           "FIXED keeps only its exact reference ring; EXTERNAL has no matcher/ring");
     CHECK(four_aec_nr_res_get_mem_requirements(&pre_only, &rp) == 0 &&
           rp.bytes < re.bytes,
-          "pre-only core omits NR, post-RES, FFT/WOLA and post scratch RAM");
+          "front-only core omits the fuse buffers");
 
     external.delay_num_filters = 2;
     CHECK(four_aec_nr_res_get_mem_requirements(&external, &re) != 0,
@@ -1258,9 +1081,6 @@ static void test_delay_modes_and_bank_sizing(void) {
     CHECK(four_aec_nr_res_matched_filter_count(pf) == 0 &&
           four_aec_nr_res_matched_filter_count(pe) == 0,
           "FIXED and EXTERNAL allocate no matched-filter instance");
-    CHECK(four_aec_nr_res_nr_count(pe) == 0 &&
-          four_aec_nr_res_post_res_count(pe) == 0,
-          "pre-only core exposes no post NR/RES instances");
     if (!pf || !pe) goto cleanup;
     hop = four_aec_nr_res_hop_size(pe);
     mic = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS,
@@ -1270,20 +1090,14 @@ static void test_delay_modes_and_bank_sizing(void) {
     if (!mic || !far) goto cleanup;
 
     fill_inputs(mic, far, hop, 16000, 0);
-    CHECK(four_aec_nr_res_process_pre(pe, mic, far, &pre) ==
+    CHECK(four_aec_front_process(pe, mic, far, &pre) ==
               FOUR_AEC_NR_RES_OK && pre.delay.solid &&
               pre.delay.delay_samples == 0,
           "EXTERNAL consumes caller-aligned far without acquisition");
-    CHECK(four_aec_nr_res_abandon_pre(pe, &pre.token) ==
-              FOUR_AEC_NR_RES_OK,
-          "EXTERNAL pre frame releases");
-    CHECK(four_aec_nr_res_process_pre(pf, mic, far, &pre) ==
+    CHECK(four_aec_front_process(pf, mic, far, &pre) ==
               FOUR_AEC_NR_RES_OK && !pre.delay.solid &&
               pre.delay.delay_samples == 320,
           "FIXED reports the configured delay and ring warm-up state");
-    CHECK(four_aec_nr_res_abandon_pre(pf, &pre.token) ==
-              FOUR_AEC_NR_RES_OK,
-          "FIXED pre frame releases");
 
 cleanup:
     free(mic);
@@ -1383,7 +1197,7 @@ static void known_delay_run(int num_filters, int hops,
 
     t0 = clock();
     for (hop = 0; hop < hops; ++hop) {
-        FourAecNrResPreFrame pre;
+        FourAecFront pre;
         int base = hop * KD_HOP + KD_PAD;
         for (i = 0; i < KD_HOP; ++i) {
             int t = base + i;
@@ -1393,7 +1207,7 @@ static void known_delay_run(int num_filters, int hops,
             for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
                 mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo;
         }
-        if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+        if (four_aec_front_process(p, mic, far, &pre) !=
             FOUR_AEC_NR_RES_OK) break;
         /* The published `solid` must be exactly "a usable accepted alignment
          * generation exists", recomputed here from the OTHER published
@@ -1429,7 +1243,6 @@ static void known_delay_run(int num_filters, int hops,
             out->applied_delay = pre.delay.delay_samples;
             out->confidence = pre.delay.confidence;
         }
-        four_aec_nr_res_abandon_pre(p, &pre.token);
     }
     t1 = clock();
     out->us_per_hop = hops > 0
@@ -1759,7 +1572,7 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
     realign_scene_history(far_hist, hops * RA_HOP + RA_PAD);
 
     for (hop = 0; hop < hops; ++hop) {
-        FourAecNrResPreFrame pre;
+        FourAecFront pre;
         int base = hop * RA_HOP + RA_PAD;
         int dominant = delay_a;
         int pending;
@@ -1768,7 +1581,7 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
         if (wander_hops > 0 && ((hop / wander_hops) % 2)) dominant = delay_b;
         realign_scene_hop(far_hist, base, RA_HOP, dominant, second_gain,
                           delay_b, mic, far);
-        if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+        if (four_aec_front_process(p, mic, far, &pre) !=
             FOUR_AEC_NR_RES_OK) break;
 
         sweeps = four_aec_nr_res_realign_warm_lane_count(p) +
@@ -1802,7 +1615,6 @@ static void realign_run(int hops, int delay_a, int delay_b, float second_gain,
         previous_pending = pending;
         previous_sweeps = sweeps;
         out->applied_at_end = pre.delay.delay_samples;
-        four_aec_nr_res_abandon_pre(p, &pre.token);
     }
 
     out->warm = four_aec_nr_res_realign_warm_lane_count(p);
@@ -2027,14 +1839,13 @@ static void test_delay_change_candidate_ttl(void) {
         if (far_hist) {
             realign_scene_history(far_hist, TR_HOPS * TR_HOP + TR_PAD);
             for (hop = 0; hop < TR_HOPS && held_hop < 0; ++hop) {
-                FourAecNrResPreFrame pre;
+                FourAecFront pre;
                 int base = hop * TR_HOP + TR_PAD;
                 int dominant = ((hop / 400) % 2) ? 1024 : 512;
                 realign_scene_hop(far_hist, base, TR_HOP, dominant, 0.0f, 0,
                                   mic, far);
-                if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+                if (four_aec_front_process(p, mic, far, &pre) !=
                     FOUR_AEC_NR_RES_OK) break;
-                four_aec_nr_res_abandon_pre(p, &pre.token);
                 candidate_before_reset =
                     four_aec_nr_res_pending_delay_candidate(p);
                 if (candidate_before_reset >= 0) {
@@ -2071,7 +1882,7 @@ static void test_delay_change_candidate_ttl(void) {
 
 /* Drives `hops` hops of the shared strength/timing stimulus. When
  * last_pre_us/last_post_us are non-NULL they receive the wall-clock cost of
- * the FINAL hop's process_pre/process_post, which is what lets the timing
+ * the FINAL hop's front_process/fuse, which is what lets the timing
  * test bracket the same workload this drives without a second copy of the
  * stimulus. */
 static uint32_t elapsed_us(const struct timespec* a, const struct timespec* b) {
@@ -2092,7 +1903,7 @@ static int feed_strength_hops(FourAecNrRes* p, int hops,
      * three channels past the end. */
     Complex* w = (Complex*)calloc(
         (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n, sizeof(Complex));
-    FourAecNrResPreFrame pre;
+    FourAecFront pre;
     int h, i, ch, k;
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
         for (k = 0; k < n; ++k) {
@@ -2109,14 +1920,13 @@ static int feed_strength_hops(FourAecNrRes* p, int hops,
                 mics[(size_t)i * 4u + (size_t)ch] = 0.5f * r + 0.02f * sinf(0.017f * t);
         }
         clock_gettime(CLOCK_MONOTONIC, &a);
-        if (four_aec_nr_res_process_pre(p, mics, far, &pre) != FOUR_AEC_NR_RES_OK)
+        if (four_aec_front_process(p, mics, far, &pre) != FOUR_AEC_NR_RES_OK)
             break;
         clock_gettime(CLOCK_MONOTONIC, &b);
         if (last_pre_us) *last_pre_us = elapsed_us(&a, &b);
 
         clock_gettime(CLOCK_MONOTONIC, &a);
-        if (four_aec_nr_res_process_post(p, &pre.token, w, out) !=
-            FOUR_AEC_NR_RES_OK) break;
+        if (fuse_only(p, w) != FOUR_AEC_NR_RES_OK) break;
         clock_gettime(CLOCK_MONOTONIC, &b);
         if (last_post_us) *last_post_us = elapsed_us(&a, &b);
     }
@@ -2202,7 +2012,7 @@ static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
     realign_scene_history(far_hist, hops * DU_HOP + DU_PAD);
 
     for (hop = 0; hop < hops; ++hop) {
-        FourAecNrResPreFrame pre;
+        FourAecFront pre;
         int base = hop * DU_HOP + DU_PAD;
         int dominant = (shift_at >= 0 && hop >= shift_at) ? delay_b : delay_a;
         unsigned long long total_now, run_now;
@@ -2210,7 +2020,7 @@ static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
         float peak_before = four_aec_nr_res_duty_erle_peak(p);
         realign_scene_hop(far_hist, base, DU_HOP, dominant, 0.0f, delay_b,
                           mic, far);
-        if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+        if (four_aec_front_process(p, mic, far, &pre) !=
             FOUR_AEC_NR_RES_OK) break;
         out->hops_seen += 1;
 
@@ -2271,7 +2081,6 @@ static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
         previous_total = total_now;
         previous_run = run_now;
         previous_updates = pre.delay.estimator_updates;
-        four_aec_nr_res_abandon_pre(p, &pre.token);
     }
 
     out->total = four_aec_nr_res_duty_hops_total(p);
@@ -2404,7 +2213,6 @@ static void test_duty_cycle_machine(void) {
         for (mode = 0; mode < 2; ++mode) {
             float mic[128 * FOUR_AEC_NR_RES_CHANNELS];
             float far[128];
-            float out[128];
             Complex* weights;
             int hop, i, n_freqs;
             cfg = four_aec_nr_res_default_config(16000);
@@ -2425,11 +2233,11 @@ static void test_duty_cycle_machine(void) {
             for (i = 0; i < FOUR_AEC_NR_RES_CHANNELS * n_freqs; ++i)
                 weights[i].r = 0.25f;
             for (i = 0; i < 20; ++i) {
-                FourAecNrResPreFrame pre;
+                FourAecFront pre;
                 fill_inputs(mic, far, hop, 16000, i);
-                if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+                if (four_aec_front_process(p, mic, far, &pre) !=
                     FOUR_AEC_NR_RES_OK) break;
-                four_aec_nr_res_process_post(p, &pre.token, weights, out);
+                fuse_only(p, weights);
             }
             snprintf(label, sizeof(label),
                      "%s builds no matched filter, so its duty census stays "
@@ -2458,11 +2266,10 @@ static void test_duty_cycle_machine(void) {
         if (p) {
             hop = four_aec_nr_res_hop_size(p);
             for (i = 0; i < 12; ++i) {
-                FourAecNrResPreFrame pre;
+                FourAecFront pre;
                 fill_inputs(mic, far, hop, 16000, i);
-                if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+                if (four_aec_front_process(p, mic, far, &pre) !=
                     FOUR_AEC_NR_RES_OK) break;
-                four_aec_nr_res_abandon_pre(p, &pre.token);
             }
             CHECK(four_aec_nr_res_duty_hops_total(p) == 12ull,
                   "duty census counts the hops before a reset");
@@ -2471,11 +2278,10 @@ static void test_duty_cycle_machine(void) {
                   four_aec_nr_res_duty_hops_run(p) == 0ull,
                   "four_aec_nr_res_reset() zeroes the duty census");
             for (i = 0; i < 5; ++i) {
-                FourAecNrResPreFrame pre;
+                FourAecFront pre;
                 fill_inputs(mic, far, hop, 16000, i);
-                if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+                if (four_aec_front_process(p, mic, far, &pre) !=
                     FOUR_AEC_NR_RES_OK) break;
-                four_aec_nr_res_abandon_pre(p, &pre.token);
             }
             after_reset = four_aec_nr_res_duty_hops_total(p);
             snprintf(label, sizeof(label),
@@ -2708,7 +2514,7 @@ static void low_erle_run(int pin_full_rate, LowErleRun* out) {
     realign_scene_history(far_hist, LE_HOPS * LE_HOP + LE_PAD);
 
     for (hop = 0; hop < LE_HOPS; ++hop) {
-        FourAecNrResPreFrame pre;
+        FourAecFront pre;
         int base = hop * LE_HOP + LE_PAD;
         int dominant = (hop >= LE_SHIFT_AT) ? LE_DELAY_B : LE_DELAY_A;
         double hop_best = -1.0e30;
@@ -2731,7 +2537,7 @@ static void low_erle_run(int pin_full_rate, LowErleRun* out) {
             for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
                 mic[i * FOUR_AEC_NR_RES_CHANNELS + ch] = echo + noise;
         }
-        if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+        if (four_aec_front_process(p, mic, far, &pre) !=
             FOUR_AEC_NR_RES_OK) break;
 
         run_now = four_aec_nr_res_duty_hops_run(p);
@@ -2745,8 +2551,7 @@ static void low_erle_run(int pin_full_rate, LowErleRun* out) {
             double err_power = 0.0;
             for (i = 0; i < LE_HOP; ++i) {
                 double m = (double)mic[i * FOUR_AEC_NR_RES_CHANNELS + ch];
-                double e = (double)pre.linear_interleaved[
-                    i * FOUR_AEC_NR_RES_CHANNELS + ch];
+                double e = (double)pre.formed_hop[ch][i];
                 mic_power += m * m;
                 err_power += e * e;
             }
@@ -2776,7 +2581,6 @@ static void low_erle_run(int pin_full_rate, LowErleRun* out) {
                 out->relock_delay = pre.delay.delay_samples;
             }
         }
-        four_aec_nr_res_abandon_pre(p, &pre.token);
     }
 
     out->settled_erle_db = (settled_err > 0.0)
@@ -2942,7 +2746,6 @@ static void test_far_spec_provenance_guard(void) {
     if (p) {
         float mic[128 * FOUR_AEC_NR_RES_CHANNELS];
         float far[128];
-        float out[128];
         Complex* weights;
         int hop = four_aec_nr_res_hop_size(p);
         int n_freqs = four_aec_nr_res_n_freqs(p);
@@ -2954,14 +2757,13 @@ static void test_far_spec_provenance_guard(void) {
         for (i = 0; i < FOUR_AEC_NR_RES_CHANNELS * n_freqs; ++i)
             weights[i].r = 0.25f;
         for (i = 0; i < 40; ++i) {
-            FourAecNrResPreFrame pre;
+            FourAecFront pre;
             fill_inputs(mic, far, hop, 16000, i);
-            if (four_aec_nr_res_process_pre(p, mic, far, &pre) !=
+            if (four_aec_front_process(p, mic, far, &pre) !=
                 FOUR_AEC_NR_RES_OK) break;
             hops += 1;
             established += four_aec_nr_res_far_spec_provenance(p) ? 1 : 0;
-            if (four_aec_nr_res_process_post(p, &pre.token, weights, out) !=
-                FOUR_AEC_NR_RES_OK) break;
+            if (fuse_only(p, weights) != FOUR_AEC_NR_RES_OK) break;
         }
         snprintf(label, sizeof(label),
                  "every hop establishes the shared-far provenance (%d of %d), "
@@ -2973,154 +2775,6 @@ static void test_far_spec_provenance_guard(void) {
               label);
         free(weights);
         four_aec_nr_res_destroy(p);
-    }
-}
-
-static void test_runtime_strength(void) {
-    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
-    FourAecNrRes* p = four_aec_nr_res_create(&cfg);
-    float live0 = 0.0f, target0 = 0.0f, live1 = 0.0f, target1 = 0.0f;
-
-    CHECK(p != NULL, "strength: core created");
-    if (!p) return;
-    feed_strength_hops(p, 30, NULL, NULL);
-    CHECK(four_aec_nr_res_post_split_floor(p, &live0, &target0) == 0,
-          "strength: the shared post floor is readable");
-
-    /* 1. The setter moves the SHARED post suppressor -- the gain that
-     *    actually multiplies this core's output. */
-    CHECK(four_aec_nr_res_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 0.0f) == 0,
-          "strength: aggressive accepted");
-    CHECK(four_aec_nr_res_post_split_floor(p, &live1, &target1) == 0 &&
-              live1 != live0 && live1 == target1,
-          "strength: the shared post floor moved and landed immediately");
-
-    /* 2. It SURVIVES a reset: the reset rebuilds the suppressor from its
-     *    stored configuration, so a setter that changed only the live floor
-     *    would be silently reverted right here. */
-    four_aec_nr_res_reset(p);
-    {
-        float live2 = 0.0f, target2 = 0.0f;
-        CHECK(four_aec_nr_res_post_split_floor(p, &live2, &target2) == 0 &&
-                  live2 == live1 && target2 == target1,
-              "strength: the new floor survives a reset (a one-copy setter "
-              "would have reverted it here)");
-    }
-
-    /* 3. A ramp is genuinely in flight before it lands. */
-    feed_strength_hops(p, 20, NULL, NULL);
-    CHECK(four_aec_nr_res_set_aec_preset(p, AEC_PRESET_MILD, 100.0f) == 0,
-          "strength: ramped retarget accepted");
-    {
-        float lv = 0.0f, tg = 0.0f;
-        feed_strength_hops(p, 2, NULL, NULL);
-        four_aec_nr_res_post_split_floor(p, &lv, &tg);
-        CHECK(lv != tg, "strength: the ramp is mid-flight after 2 hops");
-        feed_strength_hops(p, 60, NULL, NULL);
-        four_aec_nr_res_post_split_floor(p, &lv, &tg);
-        CHECK(lv == tg, "strength: the ramp lands");
-    }
-
-    /* 4. Refusal. */
-    CHECK(four_aec_nr_res_set_aec_preset(NULL, AEC_PRESET_MILD, 0.0f) == -1,
-          "strength: NULL core refused");
-    CHECK(four_aec_nr_res_set_aec_preset(p, (AecPreset)77, 0.0f) == -1,
-          "strength: out-of-enum preset refused");
-    CHECK(four_aec_nr_res_set_aec_preset(p, AEC_PRESET_MILD, 60001.0f) == -1,
-          "strength: out-of-range ramp_ms refused");
-    CHECK(four_aec_nr_res_set_nr_mode(p, (AnrMode)42) == -1,
-          "strength: out-of-enum NR mode refused");
-
-    /* 5. The NR setter recomposes THIS pipeline's configuration. The
-     *    canonical convenience wrapper must be REFUSED on this instance --
-     *    its L differs -- which is precisely why recomposing is required and
-     *    not merely tidier. */
-    CHECK(four_aec_nr_res_set_nr_mode(p, ANR_MODE_AGGRESSIVE) == 0,
-          "strength: NR mode change accepted through the recomposed target");
-
-    four_aec_nr_res_destroy(p);
-}
-
-static void test_nr_bypass(void) {
-    FourAecNrResConfig enabled = four_aec_nr_res_default_config(16000);
-    FourAecNrResConfig disabled = enabled;
-    FourAecNrResMemBreakdown on_mem, off_mem;
-    FourAecNrRes* p;
-    FourAecNrResLastTiming timing;
-
-    disabled.enable_nr = 0;
-    CHECK(four_aec_nr_res_get_mem_breakdown(&enabled, &on_mem) == 0 &&
-          four_aec_nr_res_get_mem_breakdown(&disabled, &off_mem) == 0 &&
-          on_mem.nr_bytes > 0 && off_mem.nr_bytes == 0 &&
-          on_mem.total_bytes - off_mem.total_bytes ==
-              ((on_mem.nr_bytes + 15u) & ~(size_t)15u) -
-              (((size_t)on_mem.n_freqs * sizeof(float) + 15u) & ~(size_t)15u),
-          "NR-disabled sizing omits exactly the aligned MMSE-LSA state and "
-          "adds the unity gain vector read in its place");
-
-    p = four_aec_nr_res_create(&disabled);
-    CHECK(p != NULL, "RES-only core creates without an NR state");
-    if (!p) return;
-    CHECK(four_aec_nr_res_nr_count(p) == 0 &&
-          four_aec_nr_res_post_res_count(p) == 1,
-          "NR-disabled core still owns the shared RES/post path");
-    CHECK(four_aec_nr_res_set_nr_mode(
-              p, ANR_MODE_AGGRESSIVE) == -1,
-          "runtime NR mode changes are refused when NR is disabled");
-
-    CHECK(feed_strength_hops(p, 40, NULL, NULL) == 40,
-          "NR-disabled core processes the complete RES-only stimulus");
-    four_aec_nr_res_get_last_timing(p, &timing);
-#if FOUR_AEC_NR_RES_STAGE_TIMING
-    /* Both rows belong inside the guard. With the timers compiled out every
-     * field reads zero whatever enable_nr is, so `nr_us == 0` outside this
-     * branch would be an identity rather than evidence. */
-    CHECK(timing.nr_us == 0,
-          "NR-disabled processing completes without entering MMSE-LSA");
-    CHECK(timing.res_us > 0,
-          "NR-disabled processing retains the RES stage");
-#else
-    CHECK(timing.nr_us == 0 && timing.res_us == 0,
-          "NR-disabled build reports compiled-out stage timing as zero");
-#endif
-    four_aec_nr_res_destroy(p);
-}
-
-/* The residual suppressor is one AecRes block carved from the core's pool:
- * disabling it removes exactly that aligned block and adds the unity gain
- * vector read in its place; with no post stage it is absent altogether. */
-static void test_res_sizing(void) {
-    static const int grids[3][2] = {{16000, 256}, {16000, 512}, {48000, 1024}};
-    int g;
-
-    for (g = 0; g < 3; ++g) {
-        FourAecNrResConfig on = four_aec_nr_res_default_config(grids[g][0]);
-        FourAecNrResConfig off = on;
-        FourAecNrResConfig pre_only = on;
-        FourAecNrResMemBreakdown on_mem, off_mem, pre_mem;
-        AecConfig aec_cfg;
-        size_t res_bytes, unity_bytes;
-
-        on.fft_size = off.fft_size = pre_only.fft_size = grids[g][1];
-        off.enable_res = 0;
-        pre_only.enable_post = 0;
-        aec_config_from_preset(&aec_cfg, AEC_PRESET_BALANCED, grids[g][0]);
-        aec_cfg.fft_size = grids[g][1];
-        res_bytes = aec_res_get_mem_size(&aec_cfg);
-
-        CHECK(four_aec_nr_res_get_mem_breakdown(&on, &on_mem) == 0 &&
-              four_aec_nr_res_get_mem_breakdown(&off, &off_mem) == 0 &&
-              four_aec_nr_res_get_mem_breakdown(&pre_only, &pre_mem) == 0 &&
-              res_bytes > 0,
-              "res sizing: the three configurations are sized");
-        unity_bytes = (((size_t)on_mem.n_freqs * sizeof(float)) + 15u) &
-                      ~(size_t)15u;
-        CHECK(on_mem.total_bytes - off_mem.total_bytes ==
-                  ((res_bytes + 15u) & ~(size_t)15u) - unity_bytes,
-              "res sizing: a RES-disabled core omits exactly the aligned "
-              "AecRes block and adds the unity gain vector");
-        CHECK(pre_mem.total_bytes < off_mem.total_bytes,
-              "res sizing: a pre-only core carries no post buffers");
     }
 }
 
@@ -3161,9 +2815,8 @@ static void synth_echo_hop(int h, int hop, float* mics, float* far,
 static void test_nr_bypass_output_identity(void) {
     FourAecNrResConfig on_cfg = four_aec_nr_res_default_config(16000);
     FourAecNrResConfig off_cfg = on_cfg;
-    FourAecNrRes* on;
-    FourAecNrRes* off;
-    FourAecNrResPreFrame pre_on, pre_off;
+    ConvChain* on;
+    ConvChain* off;
     float *mics, *far, *out_on, *out_off;
     Complex* w;
     uint32_t rng = 12345u;
@@ -3171,19 +2824,18 @@ static void test_nr_bypass_output_identity(void) {
     int prefix_equal = 1, prefix_nonzero = 0, diverged_after_init = 0;
 
     off_cfg.enable_nr = 0;
-    on = four_aec_nr_res_create(&on_cfg);
-    off = four_aec_nr_res_create(&off_cfg);
+    on = conv_create(&on_cfg);
+    off = conv_create(&off_cfg);
     CHECK(on != NULL && off != NULL,
           "NR-enabled and NR-disabled instances both create");
     if (!on || !off) {
-        four_aec_nr_res_destroy(on);
-        four_aec_nr_res_destroy(off);
+        conv_destroy(on);
+        conv_destroy(off);
         return;
     }
-    hop = four_aec_nr_res_hop_size(on);
-    n = four_aec_nr_res_n_freqs(on);
-    CHECK(four_aec_nr_res_hop_size(off) == hop &&
-          four_aec_nr_res_n_freqs(off) == n,
+    hop = on->hop;
+    n = on->n_freqs;
+    CHECK(off->hop == hop && off->n_freqs == n,
           "the two instances resolve the same grid");
 
     /* The canonical noise-init length: the pipeline's NR overlay retimes L,
@@ -3200,8 +2852,8 @@ static void test_nr_bypass_output_identity(void) {
         (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n, sizeof(Complex));
     if (!mics || !far || !out_on || !out_off || !w) {
         free(mics); free(far); free(out_on); free(out_off); free(w);
-        four_aec_nr_res_destroy(on);
-        four_aec_nr_res_destroy(off);
+        conv_destroy(on);
+        conv_destroy(off);
         CHECK(0, "NR bypass identity stimulus allocates");
         return;
     }
@@ -3213,14 +2865,9 @@ static void test_nr_bypass_output_identity(void) {
 
     for (h = 0; h < total_hops; ++h) {
         synth_echo_hop(h, hop, mics, far, &rng);
-        if (four_aec_nr_res_process_pre(on, mics, far, &pre_on) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_pre(off, mics, far, &pre_off) !=
-                FOUR_AEC_NR_RES_OK) break;
-        if (four_aec_nr_res_process_post(on, &pre_on.token, w, out_on) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(off, &pre_off.token, w, out_off) !=
-                FOUR_AEC_NR_RES_OK) break;
+        if (conv_hop(on, mics, far, w, NULL, out_on) != FOUR_AEC_NR_RES_OK ||
+            conv_hop(off, mics, far, w, NULL, out_off) != FOUR_AEC_NR_RES_OK)
+            break;
 
         if (h < init_hops) {
             if (memcmp(out_on, out_off, (size_t)hop * sizeof(float)) != 0)
@@ -3244,28 +2891,25 @@ static void test_nr_bypass_output_identity(void) {
           "identity above is a constraint and not a silent no-op");
 
     free(mics); free(far); free(out_on); free(out_off); free(w);
-    four_aec_nr_res_destroy(on);
-    four_aec_nr_res_destroy(off);
+    conv_destroy(on);
+    conv_destroy(off);
 }
 
 /* With RES, NR and CNG all disabled the post path has no gain source left,
  * so the core must be a transparent synthesis of the beamformed linear
  * error. That is checkable from outside: with identity weights on lane 0
  * the fused error is lane 0's analysis spectrum, whose underlying time-domain
- * hop the core hands out as linear_interleaved, and a sqrt-Hann WOLA round
+ * hop the front end hands out as formed_hop[0], and a sqrt-Hann WOLA round
  * trip reconstructs the previous hop of that stream to float precision. A
  * RES-only branch that applied anything of its own would break the identity;
  * the default core on the same stimulus must NOT satisfy it, or the identity
  * would be proving nothing about the switch. Structural rows: no suppressor
- * is built (smaller wrapper storage, audit count 0) and the two suppressor
- * entry points refuse. */
+ * is built. */
 static void test_res_bypass_passthrough(void) {
     FourAecNrResConfig def_cfg = four_aec_nr_res_default_config(16000);
     FourAecNrResConfig off_cfg = def_cfg;
-    FourAecNrResMemBreakdown def_mem, off_mem;
-    FourAecNrRes* off;
-    FourAecNrRes* def;
-    FourAecNrResPreFrame pre_off, pre_def;
+    ConvChain* off;
+    ConvChain* def;
     float *mics, *far, *out_off, *out_def, *prev_lin;
     Complex* w;
     uint32_t rng = 4242u;
@@ -3276,26 +2920,18 @@ static void test_res_bypass_passthrough(void) {
     off_cfg.enable_cng = 0;
     off_cfg.enable_res = 0;
     off_cfg.enable_nr = 0;
-    CHECK(four_aec_nr_res_get_mem_breakdown(&def_cfg, &def_mem) == 0 &&
-          four_aec_nr_res_get_mem_breakdown(&off_cfg, &off_mem) == 0 &&
-          off_mem.wrapper_bytes < def_mem.wrapper_bytes,
-          "RES-disabled sizing drops the suppressor storage");
-    off = four_aec_nr_res_create(&off_cfg);
-    def = four_aec_nr_res_create(&def_cfg);
-    CHECK(off != NULL && def != NULL, "RES-disabled and default cores create");
+    off = conv_create(&off_cfg);
+    def = conv_create(&def_cfg);
+    CHECK(off != NULL && def != NULL, "RES-disabled and default chains create");
     if (!off || !def) {
-        four_aec_nr_res_destroy(off);
-        four_aec_nr_res_destroy(def);
+        conv_destroy(off);
+        conv_destroy(def);
         return;
     }
-    CHECK(four_aec_nr_res_post_res_count(off) == 0 &&
-          four_aec_nr_res_post_res_count(def) == 1,
-          "the audit count reports the missing suppressor");
-    CHECK(four_aec_nr_res_set_aec_preset(off, AEC_PRESET_MILD, 0.0f) == -1 &&
-          four_aec_nr_res_post_split_floor(off, NULL, NULL) == -1,
-          "suppressor entry points refuse on a RES-disabled core");
-    hop = four_aec_nr_res_hop_size(off);
-    n = four_aec_nr_res_n_freqs(off);
+    CHECK(off->res == NULL && def->res != NULL,
+          "the RES-disabled chain builds no suppressor");
+    hop = off->hop;
+    n = off->n_freqs;
     mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
     far = (float*)calloc((size_t)hop, sizeof(float));
     out_off = (float*)calloc((size_t)hop, sizeof(float));
@@ -3306,22 +2942,17 @@ static void test_res_bypass_passthrough(void) {
     if (!mics || !far || !out_off || !out_def || !prev_lin || !w) {
         free(mics); free(far); free(out_off); free(out_def); free(prev_lin);
         free(w);
-        four_aec_nr_res_destroy(off);
-        four_aec_nr_res_destroy(def);
+        conv_destroy(off);
+        conv_destroy(def);
         CHECK(0, "RES bypass stimulus allocates");
         return;
     }
     for (k = 0; k < n; ++k) w[k].r = 1.0f;
     for (h = 0; h < total_hops; ++h) {
         synth_echo_hop(h, hop, mics, far, &rng);
-        if (four_aec_nr_res_process_pre(off, mics, far, &pre_off) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_pre(def, mics, far, &pre_def) !=
-                FOUR_AEC_NR_RES_OK) break;
-        if (four_aec_nr_res_process_post(off, &pre_off.token, w, out_off) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(def, &pre_def.token, w, out_def) !=
-                FOUR_AEC_NR_RES_OK) break;
+        if (conv_hop(off, mics, far, w, NULL, out_off) != FOUR_AEC_NR_RES_OK ||
+            conv_hop(def, mics, far, w, NULL, out_def) != FOUR_AEC_NR_RES_OK)
+            break;
         /* out(h) reconstructs lane 0's hop h-1; the two lanes see the same
          * input, so either instance's copy of it is the reference. */
         if (h >= 4)
@@ -3334,7 +2965,7 @@ static void test_res_bypass_passthrough(void) {
                 if (e_def > max_err_def) max_err_def = e_def;
             }
         for (i = 0; i < hop; ++i)
-            prev_lin[i] = pre_off.linear_interleaved[(size_t)i * 4u];
+            prev_lin[i] = off->front.formed_hop[0][i];
     }
     CHECK(h == total_hops, "both cores process the whole stimulus");
     printf("  RES bypass: max|lin|=%.4f  max err off=%.2e  def=%.2e\n",
@@ -3347,8 +2978,8 @@ static void test_res_bypass_passthrough(void) {
           "the default core shapes the same stimulus, so the identity above "
           "is a constraint on the bypass and not on the stimulus");
     free(mics); free(far); free(out_off); free(out_def); free(prev_lin); free(w);
-    four_aec_nr_res_destroy(off);
-    four_aec_nr_res_destroy(def);
+    conv_destroy(off);
+    conv_destroy(def);
 }
 
 /* Per-stage timing: the numbers must be REAL measurements, not just present.
@@ -3413,11 +3044,11 @@ static void test_stage_timing(void) {
      * distinguishes a measurement from a number: a stray or uninitialised
      * value would almost certainly exceed its enclosing call. */
     pre_sum = t.delay_us + t.frontend_us + t.linear_us + t.lane_res_us;
-    post_sum = t.fuse_us + t.res_us + t.nr_us + t.synth_us;
+    post_sum = t.fuse_us;
     CHECK(pre_sum <= pre_wall_us,
-          "timing: pre stages must fit inside process_pre's wall time");
+          "timing: lane stages must fit inside front_process's wall time");
     CHECK(post_sum <= post_wall_us,
-          "timing: post stages must fit inside process_post's wall time");
+          "timing: the fuse stage must fit inside four_aec_fuse's wall time");
 
     /* A hop that is accepted and then bails out must report zeros for the
      * stages it never reached, not the previous hop's numbers. The non-finite
@@ -3427,13 +3058,13 @@ static void test_stage_timing(void) {
         int hop = four_aec_nr_res_hop_size(p);
         float* nan_mics = (float*)malloc((size_t)hop * 4u * sizeof(float));
         float* far = (float*)calloc((size_t)hop, sizeof(float));
-        FourAecNrResPreFrame pre;
+        FourAecFront pre;
         FourAecNrResLastTiming after_bail;
         int i;
         CHECK(nan_mics && far, "timing: allocation");
         if (nan_mics && far) {
             for (i = 0; i < hop * 4; ++i) nan_mics[i] = (float)NAN;
-            CHECK(four_aec_nr_res_process_pre(p, nan_mics, far, &pre) ==
+            CHECK(four_aec_front_process(p, nan_mics, far, &pre) ==
                       FOUR_AEC_NR_RES_INVALID_ARGUMENT,
                   "timing: a non-finite hop is rejected");
             /* Read into its own record: `t` still holds the good hop the
@@ -3449,10 +3080,9 @@ static void test_stage_timing(void) {
 
     four_aec_nr_res_destroy(p);
     printf("timing: delay=%u frontend=%u linear=%u lane_res=%u "
-           "(pre wall %uus) | fuse=%u res=%u nr=%u synth=%u "
-           "(post wall %uus)\n",
+           "(pre wall %uus) | fuse=%u (fuse wall %uus)\n",
            t.delay_us, t.frontend_us, t.linear_us, t.lane_res_us, pre_wall_us,
-           t.fuse_us, t.res_us, t.nr_us, t.synth_us, post_wall_us);
+           t.fuse_us, post_wall_us);
 }
 
 /* Comfort noise fills the AEC-suppressed bins from lib/aec's own recipe: an
@@ -3467,8 +3097,8 @@ static void test_stage_timing(void) {
 static void test_comfort_noise_contract(void) {
     FourAecNrResConfig on = four_aec_nr_res_default_config(16000);
     FourAecNrResConfig off = four_aec_nr_res_default_config(16000);
-    FourAecNrRes* p_on;
-    FourAecNrRes* p_off;
+    ConvChain* p_on;
+    ConvChain* p_off;
     float* mics;
     float* far;
     float* out_on;
@@ -3512,16 +3142,16 @@ static void test_comfort_noise_contract(void) {
           "bin's injected power is exactly 2*amplitude^2");
 
     off.enable_cng = 0;
-    p_on = four_aec_nr_res_create(&on);
-    p_off = four_aec_nr_res_create(&off);
-    CHECK(p_on != NULL && p_off != NULL, "cng: both cores create");
+    p_on = conv_create(&on);
+    p_off = conv_create(&off);
+    CHECK(p_on != NULL && p_off != NULL, "cng: both chains create");
     if (!p_on || !p_off) {
-        four_aec_nr_res_destroy(p_on);
-        four_aec_nr_res_destroy(p_off);
+        conv_destroy(p_on);
+        conv_destroy(p_off);
         return;
     }
-    hop = four_aec_nr_res_hop_size(p_on);
-    n = four_aec_nr_res_n_freqs(p_on);
+    hop = p_on->hop;
+    n = p_on->n_freqs;
     mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
     far = (float*)calloc((size_t)hop, sizeof(float));
     out_on = (float*)calloc((size_t)hop, sizeof(float));
@@ -3534,17 +3164,9 @@ static void test_comfort_noise_contract(void) {
         for (k = 0; k < n; ++k) w[(size_t)ch * (size_t)n + (size_t)k].r = 0.25f;
 
     for (h = 0; h < hops; ++h) {
-        FourAecNrResPreFrame pre_on;
-        FourAecNrResPreFrame pre_off;
         fill_inputs(mics, far, hop, 16000, h);
-        if (four_aec_nr_res_process_pre(p_on, mics, far, &pre_on) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(p_on, &pre_on.token, w, out_on) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_pre(p_off, mics, far, &pre_off) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(p_off, &pre_off.token, w, out_off) !=
-                FOUR_AEC_NR_RES_OK) {
+        if (conv_hop(p_on, mics, far, w, NULL, out_on) != FOUR_AEC_NR_RES_OK ||
+            conv_hop(p_off, mics, far, w, NULL, out_off) != FOUR_AEC_NR_RES_OK) {
             finite = 0;
             break;
         }
@@ -3588,22 +3210,14 @@ static void test_comfort_noise_contract(void) {
      * same input must inject the byte-identical stream. A process-wide
      * generator state would fail here. */
     {
-        FourAecNrRes* q_on = four_aec_nr_res_create(&on);
-        FourAecNrRes* q_off = four_aec_nr_res_create(&off);
+        ConvChain* q_on = conv_create(&on);
+        ConvChain* q_off = conv_create(&off);
         int same = 1;
         if (q_on && q_off) {
             for (h = 0; h < hops && same; ++h) {
-                FourAecNrResPreFrame a;
-                FourAecNrResPreFrame b;
                 fill_inputs(mics, far, hop, 16000, h);
-                if (four_aec_nr_res_process_pre(q_on, mics, far, &a) !=
-                        FOUR_AEC_NR_RES_OK ||
-                    four_aec_nr_res_process_post(q_on, &a.token, w, out_on) !=
-                        FOUR_AEC_NR_RES_OK ||
-                    four_aec_nr_res_process_pre(q_off, mics, far, &b) !=
-                        FOUR_AEC_NR_RES_OK ||
-                    four_aec_nr_res_process_post(q_off, &b.token, w, out_off) !=
-                        FOUR_AEC_NR_RES_OK) {
+                if (conv_hop(q_on, mics, far, w, NULL, out_on) != FOUR_AEC_NR_RES_OK ||
+                    conv_hop(q_off, mics, far, w, NULL, out_off) != FOUR_AEC_NR_RES_OK) {
                     same = 0;
                     break;
                 }
@@ -3616,8 +3230,8 @@ static void test_comfort_noise_contract(void) {
         CHECK(q_on && q_off && same,
               "cng: a second, independently created core injects the identical "
               "noise stream (the seed is per-instance)");
-        four_aec_nr_res_destroy(q_on);
-        four_aec_nr_res_destroy(q_off);
+        conv_destroy(q_on);
+        conv_destroy(q_off);
     }
 
     printf("cng: %d hops, injected RMS %.3e, hop-to-hop |corr| %.4f over %d "
@@ -3626,8 +3240,8 @@ static void test_comfort_noise_contract(void) {
            corr_n ? corr_sum / corr_n : -1.0, corr_n, bound);
     free(mics); free(far); free(out_on); free(out_off);
     free(prev_noise); free(noise_stream); free(w);
-    four_aec_nr_res_destroy(p_on);
-    four_aec_nr_res_destroy(p_off);
+    conv_destroy(p_on);
+    conv_destroy(p_off);
 }
 
 /* ---------------------------------------------------------------------------
@@ -3693,7 +3307,8 @@ static void test_pool_placement_invariance(int sample_rate, int fft_size) {
         unsigned char* block = NULL;
         unsigned char* pool;
         FourAecNrRes* p;
-        FourAecNrResPreFrame pre;
+        ConvChain* chain;
+        FourAecFront pre;
         float* destination;
         size_t i;
         int frame;
@@ -3706,6 +3321,8 @@ static void test_pool_placement_invariance(int sample_rate, int fft_size) {
 
         p = four_aec_nr_res_init_ex(pool, (size_t)req.bytes, &cfg, &req);
         if (!p) { free(block); break; }
+        chain = conv_attach(p, &cfg);
+        if (!chain) { four_aec_nr_res_destroy(p); free(block); break; }
         built += 1;
 
         if (built == 1) {
@@ -3725,6 +3342,7 @@ static void test_pool_placement_invariance(int sample_rate, int fft_size) {
                   "pool placement buffers allocate");
             if (!reference || !current || !microphones || !ref || !out ||
                 !weights) {
+                conv_destroy(chain);
                 four_aec_nr_res_destroy(p);
                 free(block);
                 break;
@@ -3736,10 +3354,9 @@ static void test_pool_placement_invariance(int sample_rate, int fft_size) {
         destination = (built == 1) ? reference : current;
         for (frame = 0; frame < POOL_PLACEMENT_FRAMES; ++frame) {
             fill_inputs(microphones, ref, hop, sample_rate, frame);
-            if (four_aec_nr_res_process_pre(
+            if (four_aec_front_process(
                     p, microphones, ref, &pre) != FOUR_AEC_NR_RES_OK ||
-                four_aec_nr_res_process_post(
-                    p, &pre.token, weights, out) != FOUR_AEC_NR_RES_OK)
+                conv_post(chain, weights, NULL, out) != FOUR_AEC_NR_RES_OK)
                 break;
             memcpy(destination + (size_t)frame * hop, out,
                    (size_t)hop * sizeof(float));
@@ -3756,6 +3373,7 @@ static void test_pool_placement_invariance(int sample_rate, int fft_size) {
         if (built > 1 && memcmp(reference, current, stream_bytes) != 0)
             identical = 0;
 
+        conv_destroy(chain);
         four_aec_nr_res_destroy(p);
         free(block);
     }
@@ -3791,8 +3409,8 @@ static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
                                              int enable_cng) {
     enum { WARM = 400, WARM_OFFSET = 100000, COMPARE = 200 };
     FourAecNrResConfig cfg;
-    FourAecNrRes* fresh;
-    FourAecNrRes* warmed;
+    ConvChain* fresh;
+    ConvChain* warmed;
     float* mics;
     float* far;
     float* out_a;
@@ -3805,17 +3423,17 @@ static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
     cfg = four_aec_nr_res_default_config(sample_rate);
     cfg.fft_size = fft_size;
     cfg.enable_cng = enable_cng;
-    fresh = four_aec_nr_res_create(&cfg);
-    warmed = four_aec_nr_res_create(&cfg);
-    CHECK(fresh != NULL && warmed != NULL, "reset parity: both cores create");
+    fresh = conv_create(&cfg);
+    warmed = conv_create(&cfg);
+    CHECK(fresh != NULL && warmed != NULL, "reset parity: both chains create");
     if (!fresh || !warmed) {
-        four_aec_nr_res_destroy(fresh);
-        four_aec_nr_res_destroy(warmed);
+        conv_destroy(fresh);
+        conv_destroy(warmed);
         return;
     }
 
-    hop = four_aec_nr_res_hop_size(fresh);
-    n_freqs = four_aec_nr_res_n_freqs(fresh);
+    hop = fresh->hop;
+    n_freqs = fresh->n_freqs;
     mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
     far = (float*)calloc((size_t)hop, sizeof(float));
     out_a = (float*)calloc((size_t)hop, sizeof(float));
@@ -3827,29 +3445,17 @@ static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
             w[(size_t)ch * (size_t)n_freqs + (size_t)k].r = 0.25f;
 
     for (h = 0; h < WARM && ok; ++h) {
-        FourAecNrResPreFrame pre;
         fill_inputs(mics, far, hop, sample_rate, WARM_OFFSET + h);
-        if (four_aec_nr_res_process_pre(warmed, mics, far, &pre) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(warmed, &pre.token, w, out_b) !=
-                FOUR_AEC_NR_RES_OK)
+        if (conv_hop(warmed, mics, far, w, NULL, out_b) != FOUR_AEC_NR_RES_OK)
             ok = 0;
     }
     CHECK(ok, "reset parity: the warm phase runs to completion");
-    four_aec_nr_res_reset(warmed);
+    conv_reset(warmed);
 
     for (h = 0; h < COMPARE && ok; ++h) {
-        FourAecNrResPreFrame pre_a;
-        FourAecNrResPreFrame pre_b;
         fill_inputs(mics, far, hop, sample_rate, h);
-        if (four_aec_nr_res_process_pre(fresh, mics, far, &pre_a) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(fresh, &pre_a.token, w, out_a) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_pre(warmed, mics, far, &pre_b) !=
-                FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(warmed, &pre_b.token, w, out_b) !=
-                FOUR_AEC_NR_RES_OK) {
+        if (conv_hop(fresh, mics, far, w, NULL, out_a) != FOUR_AEC_NR_RES_OK ||
+            conv_hop(warmed, mics, far, w, NULL, out_b) != FOUR_AEC_NR_RES_OK) {
             ok = 0;
             break;
         }
@@ -3867,8 +3473,8 @@ static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
           "four_aec_nr_res_reset leaves a core byte-identical to a fresh one");
 
     free(mics); free(far); free(out_a); free(out_b); free(w);
-    four_aec_nr_res_destroy(fresh);
-    four_aec_nr_res_destroy(warmed);
+    conv_destroy(fresh);
+    conv_destroy(warmed);
 }
 
 /* The comfort noise is scaled by the denoiser gain of its bin, bounded below
@@ -3887,7 +3493,7 @@ static void test_reset_equals_fresh_instance(int sample_rate, int fft_size,
 static void test_comfort_noise_follows_nr_gain(void) {
     const double floor_amp = 0.31622777, floor_sq = floor_amp * floor_amp;
     FourAecNrResConfig cfg[4];
-    FourAecNrRes* p[4] = { NULL, NULL, NULL, NULL };
+    ConvChain* p[4] = { NULL, NULL, NULL, NULL };
     float* out[4] = { NULL, NULL, NULL, NULL };
     float *mics, *far;
     Complex* w;
@@ -3901,13 +3507,13 @@ static void test_comfort_noise_follows_nr_gain(void) {
         cfg[i] = four_aec_nr_res_default_config(16000);
         cfg[i].enable_cng = (i & 1);
         cfg[i].enable_nr = (i < 2);
-        p[i] = four_aec_nr_res_create(&cfg[i]);
+        p[i] = conv_create(&cfg[i]);
         if (!p[i]) created = 0;
     }
-    CHECK(created, "cng/nr: all four cores create");
-    if (!created) { for (i = 0; i < 4; ++i) four_aec_nr_res_destroy(p[i]); return; }
-    hop = four_aec_nr_res_hop_size(p[0]);
-    n = four_aec_nr_res_n_freqs(p[0]);
+    CHECK(created, "cng/nr: all four chains create");
+    if (!created) { for (i = 0; i < 4; ++i) conv_destroy(p[i]); return; }
+    hop = p[0]->hop;
+    n = p[0]->n_freqs;
     settle_hops = anr_retime_frames(20, 16000, hop) + 40;
     hops = settle_hops + 200;
     mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
@@ -3930,11 +3536,7 @@ static void test_comfort_noise_follows_nr_gain(void) {
                 mics[(size_t)k * FOUR_AEC_NR_RES_CHANNELS + (size_t)ch] = 0.5f * r + noise;
         }
         for (i = 0; i < 4; ++i) {
-            FourAecNrResPreFrame pre;
-            if (four_aec_nr_res_process_pre(p[i], mics, far, &pre) !=
-                    FOUR_AEC_NR_RES_OK ||
-                four_aec_nr_res_process_post(p[i], &pre.token, w, out[i]) !=
-                    FOUR_AEC_NR_RES_OK)
+            if (conv_hop(p[i], mics, far, w, NULL, out[i]) != FOUR_AEC_NR_RES_OK)
                 finite = 0;
         }
         if (h < settle_hops) continue;
@@ -3956,102 +3558,77 @@ static void test_comfort_noise_follows_nr_gain(void) {
     CHECK(e_res < 0.02 * e_ref,
           "cng/nr: the injected noise is floor * reference sample for sample "
           "-- the scaling is bounded by exactly CNG_NR_GAIN_FLOOR");
-    for (i = 0; i < 4; ++i) { four_aec_nr_res_destroy(p[i]); free(out[i]); }
+    for (i = 0; i < 4; ++i) { conv_destroy(p[i]); free(out[i]); }
     free(mics); free(far); free(w);
 }
 
-/* The external post-filter seam must be the conventional post path with its
- * synthesis lifted out: synthesising the returned post_spectrum through
- * synthesize_external() has to reproduce process_post() on a twin instance
- * bit for bit, comfort noise ON so the fill and its RNG are part of the
- * claim. The rejection rows pin the configuration contract (no NR instance,
- * RES on) and the token consumption. */
-static void test_post_view_seam(void) {
+/* The frame four_aec_fuse() returns is the contract every stage reads: its
+ * fields carry the projected near spectrum, residual power and comfort noise,
+ * the aligned far, the shared aligner's flags, and no lane-level gain. A
+ * front-only core (enable_post = 0) has nothing to fuse and refuses. */
+static void test_fuse_frame_contract(void) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(48000);
-    FourAecNrResConfig other;
-    FourAecNrRes *seam, *twin, *p;
+    FourAecNrResConfig front_only;
+    FourAecNrRes *p, *q;
     static Complex weights[4 * 513];
     static float mics[512 * 4];
-    float far[512], out_seam[512], out_twin[512];
-    FourAecNrResPreFrame sp, tp;
-    FourAecNrResPostView view;
+    float far[512];
+    FourAecFront front;
+    SeSpecFrame fr;
     uint32_t rng = 7u;
-    int h, i, k, identical = 1, nonzero = 0, ok = 1, hop, n;
+    int h, i, hop, n, ok = 1, flags_match = 1, finite = 1;
 
     cfg.fft_size = 1024;
-    cfg.enable_post = 1;
-    cfg.enable_res = 1;
-    cfg.enable_nr = 0;
-    cfg.enable_cng = 1;
-    seam = four_aec_nr_res_create(&cfg);
-    twin = four_aec_nr_res_create(&cfg);
-    CHECK(seam != NULL && twin != NULL, "post-view seam: RES-only 48 kHz cores create");
-    if (!seam || !twin) return;
-    hop = four_aec_nr_res_hop_size(seam);
-    n = four_aec_nr_res_n_freqs(seam);
+    p = four_aec_nr_res_create(&cfg);
+    CHECK(p != NULL, "fuse frame: 48 kHz core creates");
+    if (!p) return;
+    hop = four_aec_nr_res_hop_size(p);
+    n = four_aec_nr_res_n_freqs(p);
     for (i = 0; i < 4 * n; ++i) { weights[i].r = 0.25f; weights[i].i = 0.0f; }
     for (h = 0; h < 60; ++h) {
         synth_echo_hop(h, hop, mics, far, &rng);
-        ok = ok && four_aec_nr_res_process_pre(seam, mics, far, &sp) == FOUR_AEC_NR_RES_OK;
-        ok = ok && four_aec_nr_res_process_pre(twin, mics, far, &tp) == FOUR_AEC_NR_RES_OK;
-        ok = ok && four_aec_nr_res_process_post_view(
-                       seam, &sp.token, weights, NULL, &view) == FOUR_AEC_NR_RES_OK;
-        ok = ok && view.beamformed_error != NULL && view.post_spectrum != NULL;
-        ok = ok && four_aec_nr_res_synthesize_external(
-                       seam, view.post_spectrum, out_seam) == FOUR_AEC_NR_RES_OK;
-        ok = ok && four_aec_nr_res_process_post(
-                       twin, &tp.token, weights, out_twin) == FOUR_AEC_NR_RES_OK;
+        ok = ok && four_aec_front_process(p, mics, far, &front) == FOUR_AEC_NR_RES_OK;
+        ok = ok && four_aec_fuse(p, weights, NULL, &fr) == FOUR_AEC_NR_RES_OK;
         if (!ok) break;
-        if (memcmp(out_seam, out_twin, (size_t)hop * sizeof(float)) != 0) identical = 0;
-        for (k = 0; k < hop; ++k) if (out_twin[k] != 0.0f) nonzero = 1;
+        if (fr.n_freqs != n || fr.hop != hop || fr.e == NULL || fr.y == NULL ||
+            fr.r2 == NULL || fr.cn == NULL || fr.g_res_ctx != NULL ||
+            fr.far_hop != front.aligned_ref)
+            ok = 0;
+        if (fr.delay_changed != front.delay.changed ||
+            fr.delay_locked != front.delay.solid)
+            flags_match = 0;
+        if (!(fr.max_dt >= 0.0f) || !(fr.max_sat >= 0.0f) ||
+            !all_finite(fr.r2, n) || !all_finite(fr.cn, n))
+            finite = 0;
     }
-    CHECK(ok, "post-view seam: every hop of pre/view/synthesize/post succeeds");
-    CHECK(identical && nonzero,
-          "post-view + synthesize_external reproduces process_post bit for bit "
-          "(NR off, CNG on, non-silent output)");
-    CHECK(four_aec_nr_res_process_post_view(
-              seam, &sp.token, weights, NULL, &view) == FOUR_AEC_NR_RES_SEQUENCE_ERROR,
-          "post-view seam: a consumed token is refused on replay");
-    CHECK(four_aec_nr_res_process_post_view(
-              seam, &sp.token, weights, NULL, NULL) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
-          four_aec_nr_res_synthesize_external(seam, NULL, out_seam) ==
-              FOUR_AEC_NR_RES_INVALID_ARGUMENT,
-          "post-view seam: NULL out/spectrum rejected");
+    CHECK(ok, "fuse frame: shape, pointers and no lane-level gain on every hop");
+    CHECK(flags_match,
+          "fuse frame: delay flags follow the shared aligner");
+    CHECK(finite, "fuse frame: R^2, comfort noise and the worst-lane scalars are valid");
+    CHECK(four_aec_fuse(p, weights, NULL, &fr) == FOUR_AEC_NR_RES_OK,
+          "fuse frame: a second fuse on the same front frame is allowed");
 
-    other = cfg; other.enable_nr = 1;
-    p = four_aec_nr_res_create(&other);
-    CHECK(p != NULL, "post-view seam: NR-enabled core creates");
-    if (p) {
+    front_only = cfg;
+    front_only.enable_post = 0;
+    front_only.enable_res = 0;
+    front_only.enable_nr = 0;
+    front_only.enable_cng = 0;
+    q = four_aec_nr_res_create(&front_only);
+    CHECK(q != NULL, "fuse frame: front-only core creates");
+    if (q) {
         synth_echo_hop(0, hop, mics, far, &rng);
-        CHECK(four_aec_nr_res_process_pre(p, mics, far, &sp) == FOUR_AEC_NR_RES_OK &&
-              four_aec_nr_res_process_post_view(
-                  p, &sp.token, weights, NULL, &view) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
-              four_aec_nr_res_abandon_pre(p, &sp.token) == FOUR_AEC_NR_RES_OK,
-              "post-view seam refuses a core that owns an NR instance (pending frame kept)");
-        four_aec_nr_res_destroy(p);
+        CHECK(four_aec_front_process(q, mics, far, &front) == FOUR_AEC_NR_RES_OK &&
+              four_aec_fuse(q, weights, NULL, &fr) == FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+              "fuse frame: a front-only core refuses to fuse");
+        four_aec_nr_res_destroy(q);
     }
-    other = cfg; other.enable_res = 0;
-    p = four_aec_nr_res_create(&other);
-    CHECK(p != NULL, "post-view seam: RES-off core creates");
-    if (p) {
-        synth_echo_hop(0, hop, mics, far, &rng);
-        CHECK(four_aec_nr_res_process_pre(p, mics, far, &sp) == FOUR_AEC_NR_RES_OK &&
-              four_aec_nr_res_process_post_view(
-                  p, &sp.token, weights, NULL, &view) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
-              four_aec_nr_res_abandon_pre(p, &sp.token) == FOUR_AEC_NR_RES_OK,
-              "post-view seam refuses a core without the post-beam RES");
-        four_aec_nr_res_destroy(p);
-    }
-    four_aec_nr_res_destroy(seam);
-    four_aec_nr_res_destroy(twin);
+    four_aec_nr_res_destroy(p);
 }
 
 int main(void) {
     test_projection_kernels();
     test_trusted_spectrum_path();
     test_invalid_configs();
-    test_cross_instance_token();
-    test_pool_reinit_token_rejected();
     run_grid(16000, 256);
     run_grid(16000, 512);
     run_grid(48000, 1024);
@@ -4077,15 +3654,12 @@ int main(void) {
     test_duty_watchdog_leak_is_a_rate();
     test_duty_low_erle_delay_change();
     test_far_spec_provenance_guard();
-    test_runtime_strength();
-    test_nr_bypass();
-    test_res_sizing();
     test_nr_bypass_output_identity();
     test_res_bypass_passthrough();
     test_stage_timing();
     test_comfort_noise_contract();
     test_comfort_noise_follows_nr_gain();
-    test_post_view_seam();
+    test_fuse_frame_contract();
     test_reset_equals_fresh_instance(16000, 256, 1);
     test_reset_equals_fresh_instance(16000, 256, 0);
     test_reset_equals_fresh_instance(16000, 512, 1);

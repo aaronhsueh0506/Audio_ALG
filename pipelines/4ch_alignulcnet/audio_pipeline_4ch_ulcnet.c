@@ -4,7 +4,7 @@
  *
  * Per-hop flow (see the header's timing contract):
  *
- *   four_aec_nr_res_process_pre -> SRP-PHAT DOA -> GSC effective weights
+ *   four_aec_front_process -> SRP-PHAT DOA -> GSC effective weights
  *     -> gsc_spectrum, taken DIRECTLY as the model's error frame: it is
  *        already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis
  *        frame of the current hop that the Align-ULCNet chain would
@@ -17,8 +17,8 @@
  *        when unset/error/non-finite)
  *     -> AcIstft synthesis -> out
  *
- * The core's pending pre frame is released with four_aec_nr_res_abandon_pre;
- * no process_post() variant ever runs (the ULCNet chain replaces it).
+ * The core runs front-only (cfg.core.enable_post = 0): no fuse, RES, NR or
+ * core synthesis exists; the ULCNet chain replaces that post stage.
  *
  * The file follows audio_pipeline_4ch.c's order: instance, config
  * validation, default config, pool-first construction, heap convenience,
@@ -701,7 +701,7 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     const float* far_reference,
     int vad_external,
     float* out) {
-    FourAecNrResPreFrame pre;
+    FourAecFront pre;
     const float* spec_re;
     const float* spec_im;
     int status;
@@ -714,14 +714,14 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     hop = p->hop_size;
 
-    status = four_aec_nr_res_process_pre(
+    status = four_aec_front_process(
         p->core, microphones_interleaved, far_reference, &pre);
     if (status != FOUR_AEC_NR_RES_OK) return status;
     if (pre.n_channels != FOUR_AEC_NR_RES_CHANNELS ||
         pre.hop_size != hop ||
         pre.n_freqs != p->n_freqs ||
         !pre.aligned_ref) {
-        audio_pipeline_4ch_ulcnet_reset(p);   /* also releases the frame */
+        audio_pipeline_4ch_ulcnet_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
 
@@ -765,14 +765,7 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     (void)ac_stft_push_planar(
         p->far_analysis, far_reference, p->far_re, p->far_im);
 
-    /* All PreFrame pointers consumed -- release the core's pending frame
-     * (no process_post() variant ever runs in this pipeline). */
-    status = four_aec_nr_res_abandon_pre(p->core, &pre.token);
     p->last_delay = pre.delay;
-    if (status != FOUR_AEC_NR_RES_OK) {
-        audio_pipeline_4ch_ulcnet_reset(p);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
-    }
 
     /* One frame, one inference: step the model and apply its output, EXCEPT
      * while the identity reprime armed at the last boundary is still
@@ -815,7 +808,7 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
 
 void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p) {
     if (!p || p->destroyed) return;
-    four_aec_nr_res_reset(p->core);   /* invalidates any pending pre frame */
+    four_aec_nr_res_reset(p->core);
     srp_reset(p->srp);
     gsc_reset(p->gsc);
     /* The objects keep the shared handle and window (pool/instance resident,

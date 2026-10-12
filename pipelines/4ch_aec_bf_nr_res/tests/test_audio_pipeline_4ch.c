@@ -6,6 +6,7 @@
  */
 
 #include "audio_pipeline_4ch.h"
+#include "conv_chain_4ch.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -630,6 +631,213 @@ static int run_static_parity(int sample_rate, int fft_size) {
  * into a nonzero process exit -- instead of returning 0 from main() itself,
  * which the C runtime reports to the shell as a SUCCESSFUL exit despite the
  * "FAIL: ..." line already printed to stderr. */
+/* ---------------------------------------------------------------------------
+ * Post-beam stages carved by this wrapper: strength setters, sizing, and the
+ * equivalence of the wrapper's chain with the reference chain written over the
+ * front end (conv_chain_4ch.h), on a bypassed GSC so both see the same error
+ * spectrum (lane 0) and the identity weights.
+ * ------------------------------------------------------------------------ */
+
+static void feed_hops(AudioPipeline4Ch* p, int hops, int first, float* out_last) {
+    int hop = audio_pipeline_4ch_hop_size(p);
+    int sr = audio_pipeline_4ch_sample_rate(p);
+    float* mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    float* far = (float*)calloc((size_t)hop, sizeof(float));
+    float* out = (float*)calloc((size_t)hop, sizeof(float));
+    int h, i, ch;
+    for (h = 0; h < hops; ++h) {
+        for (i = 0; i < hop; ++i) {
+            float t = (float)((first + h) * hop + i);
+            float r = 0.6f * sinf(0.06f * t);
+            far[i] = r;
+            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+                mics[(size_t)i * FOUR_AEC_NR_RES_CHANNELS + (size_t)ch] =
+                    0.5f * r + 0.02f * sinf(0.017f * t);
+        }
+        (void)sr;
+        if (audio_pipeline_4ch_process_with_activity(p, mics, far, 0, 0, NULL, out, NULL) !=
+            FOUR_AEC_NR_RES_OK)
+            break;
+    }
+    if (out_last) memcpy(out_last, out, (size_t)hop * sizeof(float));
+    free(mics); free(far); free(out);
+}
+
+static int test_runtime_strength(void) {
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
+    AudioPipeline4Ch* p = audio_pipeline_4ch_create(&cfg);
+    float live0 = 0.0f, target0 = 0.0f, live1 = 0.0f, target1 = 0.0f;
+
+    CHECK(p != NULL, "strength: pipeline created");
+    feed_hops(p, 30, 0, NULL);
+    CHECK(audio_pipeline_4ch_post_split_floor(p, &live0, &target0) == 0,
+          "strength: the post-beam floor is readable");
+
+    /* The setter moves the post-beam suppressor -- the gain that actually
+     * multiplies this pipeline's output. */
+    CHECK(audio_pipeline_4ch_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 0.0f) == 0,
+          "strength: aggressive accepted");
+    CHECK(audio_pipeline_4ch_post_split_floor(p, &live1, &target1) == 0 &&
+              live1 != live0 && live1 == target1,
+          "strength: the post-beam floor moved and landed immediately");
+
+    /* It survives a reset: a setter that changed only the live floor would be
+     * silently reverted right here. */
+    audio_pipeline_4ch_reset(p);
+    {
+        float live2 = 0.0f, target2 = 0.0f;
+        CHECK(audio_pipeline_4ch_post_split_floor(p, &live2, &target2) == 0 &&
+                  live2 == live1 && target2 == target1,
+              "strength: the new floor survives a reset");
+    }
+
+    /* A ramp is genuinely in flight before it lands. */
+    feed_hops(p, 20, 0, NULL);
+    CHECK(audio_pipeline_4ch_set_aec_preset(p, AEC_PRESET_MILD, 100.0f) == 0,
+          "strength: ramped retarget accepted");
+    {
+        float lv = 0.0f, tg = 0.0f;
+        feed_hops(p, 2, 20, NULL);
+        audio_pipeline_4ch_post_split_floor(p, &lv, &tg);
+        CHECK(lv != tg, "strength: the ramp is mid-flight after 2 hops");
+        feed_hops(p, 60, 22, NULL);
+        audio_pipeline_4ch_post_split_floor(p, &lv, &tg);
+        CHECK(lv == tg, "strength: the ramp lands");
+    }
+
+    CHECK(audio_pipeline_4ch_set_aec_preset(NULL, AEC_PRESET_MILD, 0.0f) == -1,
+          "strength: NULL pipeline refused");
+    CHECK(audio_pipeline_4ch_set_aec_preset(p, (AecPreset)77, 0.0f) == -1,
+          "strength: out-of-enum preset refused");
+    CHECK(audio_pipeline_4ch_set_aec_preset(p, AEC_PRESET_MILD, 60001.0f) == -1,
+          "strength: out-of-range ramp_ms refused");
+    CHECK(audio_pipeline_4ch_set_nr_mode(p, (AnrMode)42) == -1,
+          "strength: out-of-enum NR mode refused");
+    /* The NR setter recomposes THIS pipeline's configuration: the canonical
+     * convenience setter would be refused on this instance (its L differs). */
+    CHECK(audio_pipeline_4ch_set_nr_mode(p, ANR_MODE_AGGRESSIVE) == 0,
+          "strength: NR mode change accepted through the recomposed target");
+    audio_pipeline_4ch_destroy(p);
+    return 1;
+}
+
+static size_t pool_bytes(const AudioPipeline4ChConfig* cfg) {
+    AudioPipeline4ChMemReq req;
+    return audio_pipeline_4ch_get_mem_requirements(cfg, &req) == 0 ? (size_t)req.bytes : 0;
+}
+
+static int test_stage_sizing_and_switches(void) {
+    static const int grids[3][2] = {{16000, 256}, {16000, 512}, {48000, 1024}};
+    int g;
+    for (g = 0; g < 3; ++g) {
+        AudioPipeline4ChConfig both = audio_pipeline_4ch_default_config(grids[g][0]);
+        AudioPipeline4ChConfig no_nr, no_res, neither;
+        AecConfig res_cfg;
+        AnrConfig nr_cfg;
+        size_t full, res_b, nr_b, unity_b;
+        int n_freqs;
+        AudioPipeline4Ch *p;
+
+        both.core.fft_size = grids[g][1];
+        no_nr = both; no_nr.core.enable_nr = 0;
+        no_res = both; no_res.core.enable_res = 0;
+        neither = both; neither.core.enable_nr = 0; neither.core.enable_res = 0;
+        CHECK(four_aec_nr_res_stage_configs(&both.core, &res_cfg, &nr_cfg) == 0,
+              "sizing: the stage configurations derive");
+        res_b = (aec_res_get_mem_size(&res_cfg) + 15u) & ~(size_t)15u;
+        nr_b = (se_anr_stage_mem_size(&nr_cfg) + 15u) & ~(size_t)15u;
+        n_freqs = grids[g][1] / 2 + 1;
+        unity_b = (((size_t)n_freqs * sizeof(float)) + 15u) & ~(size_t)15u;
+        full = pool_bytes(&both);
+        CHECK(full > 0 && full - pool_bytes(&no_nr) == nr_b - unity_b,
+              "sizing: NR off omits exactly the aligned denoiser and adds the unity gain vector");
+        CHECK(full - pool_bytes(&no_res) == res_b - unity_b,
+              "sizing: RES off omits exactly the aligned AecRes and adds the unity gain vector");
+        CHECK(full - pool_bytes(&neither) == res_b + nr_b - unity_b,
+              "sizing: both off omit both blocks and carve the unity gain vector once");
+
+        p = audio_pipeline_4ch_create(&no_nr);
+        CHECK(p && audio_pipeline_4ch_nr_count(p) == 0 && audio_pipeline_4ch_post_res_count(p) == 1 &&
+              audio_pipeline_4ch_set_nr_mode(p, ANR_MODE_AGGRESSIVE) == -1,
+              "switches: NR off leaves the RES and refuses the NR setter");
+        audio_pipeline_4ch_destroy(p);
+        p = audio_pipeline_4ch_create(&no_res);
+        CHECK(p && audio_pipeline_4ch_nr_count(p) == 1 && audio_pipeline_4ch_post_res_count(p) == 0 &&
+              audio_pipeline_4ch_set_aec_preset(p, AEC_PRESET_MILD, 0.0f) == -1 &&
+              audio_pipeline_4ch_post_split_floor(p, NULL, NULL) == -1,
+              "switches: RES off leaves the denoiser and refuses the suppressor entry points");
+        audio_pipeline_4ch_destroy(p);
+    }
+    return 1;
+}
+
+/* With the GSC bypassed the beamformed error is lane 0's error spectrum and
+ * the effective weights are [1,0,0,0]; the reference chain fed the same two
+ * must reproduce the wrapper bit for bit, for every combination of the three
+ * switches the post stages offer. */
+static int test_wrapper_equals_reference_chain(void) {
+    int mode, grid;
+    static const int grids[3][2] = {{16000, 256}, {16000, 512}, {48000, 1024}};
+    for (grid = 0; grid < 3; ++grid) {
+        for (mode = 0; mode < 8; ++mode) {
+            AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(grids[grid][0]);
+            AudioPipeline4Ch* wrap;
+            ConvChain* ref;
+            Complex* weights;
+            float *mics, *far, *out_w, *out_r;
+            int hop, n, h, i, ch, k, identical = 1, nonzero = 0, ok = 1;
+            char label[128];
+
+            cfg.core.fft_size = grids[grid][1];
+            cfg.core.enable_nr = mode & 1;
+            cfg.core.enable_res = (mode >> 1) & 1;
+            cfg.core.enable_cng = (mode >> 2) & 1;
+            cfg.gsc_enable = 0;
+            wrap = audio_pipeline_4ch_create(&cfg);
+            ref = conv_create(&cfg.core);
+            snprintf(label, sizeof(label), "reference chain: %d Hz/%d nr=%d res=%d cng=%d build",
+                     grids[grid][0], grids[grid][1], mode & 1, (mode >> 1) & 1, (mode >> 2) & 1);
+            CHECK(wrap && ref, label);
+            if (!wrap || !ref) { audio_pipeline_4ch_destroy(wrap); conv_destroy(ref); continue; }
+            hop = audio_pipeline_4ch_hop_size(wrap);
+            n = audio_pipeline_4ch_n_freqs(wrap);
+            mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+            far = (float*)calloc((size_t)hop, sizeof(float));
+            out_w = (float*)calloc((size_t)hop, sizeof(float));
+            out_r = (float*)calloc((size_t)hop, sizeof(float));
+            weights = (Complex*)calloc((size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n, sizeof(Complex));
+            for (k = 0; k < n; ++k) weights[k].r = 1.0f;
+            for (h = 0; h < 120 && ok; ++h) {
+                for (i = 0; i < hop; ++i) {
+                    float t = (float)(h * hop + i);
+                    float r = 0.5f * sinf(0.05f * t) + 0.1f * sinf(0.31f * t);
+                    far[i] = r;
+                    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+                        mics[(size_t)i * FOUR_AEC_NR_RES_CHANNELS + (size_t)ch] =
+                            0.4f * r + 0.03f * sinf(0.017f * t + (float)ch);
+                }
+                if (audio_pipeline_4ch_process_with_activity(wrap, mics, far, 0, 0, NULL, out_w, NULL) !=
+                        FOUR_AEC_NR_RES_OK ||
+                    four_aec_front_process(ref->core, mics, far, &ref->front) != FOUR_AEC_NR_RES_OK ||
+                    conv_post(ref, weights, ref->front.linear_spectra[0], out_r) != FOUR_AEC_NR_RES_OK) {
+                    ok = 0;
+                    break;
+                }
+                if (memcmp(out_w, out_r, (size_t)hop * sizeof(float)) != 0) identical = 0;
+                for (i = 0; i < hop; ++i) if (out_r[i] != 0.0f) nonzero = 1;
+            }
+            snprintf(label, sizeof(label),
+                     "reference chain: %d Hz/%d nr=%d res=%d cng=%d wrapper output is bit-identical",
+                     grids[grid][0], grids[grid][1], mode & 1, (mode >> 1) & 1, (mode >> 2) & 1);
+            CHECK(ok && identical && nonzero, label);
+            free(mics); free(far); free(out_w); free(out_r); free(weights);
+            audio_pipeline_4ch_destroy(wrap);
+            conv_destroy(ref);
+        }
+    }
+    return 1;
+}
+
 static int run_all_tests(void) {
     AudioPipeline4ChConfig invalid =
         audio_pipeline_4ch_default_config(16000);
@@ -689,6 +897,11 @@ static int run_all_tests(void) {
           "16 kHz 512/256 static-memory pool parity");
     CHECK(run_static_parity(48000, 1024),
           "48 kHz 1024/512 static-memory pool parity");
+    CHECK(test_runtime_strength(), "post-beam strength setters");
+    CHECK(test_stage_sizing_and_switches(),
+          "post-beam stage sizing and switch behaviour");
+    CHECK(test_wrapper_equals_reference_chain(),
+          "wrapper chain equals the reference chain over the front end");
     printf("All audio_pipeline_4ch tests passed (spatial=%s)\n",
            audio_pipeline_4ch_spatial_backend());
     return 1;

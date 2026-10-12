@@ -1,25 +1,24 @@
 /**
  * 4aec_nr_res.c — implementation of 4aec_nr_res.h.
  *
- * Four-channel counterpart of pipelines/mono_aec_nr_res/audio_pipeline.c:
+ * Four-channel front end of pipelines/mono_aec_nr_res/audio_pipeline.c:
  *
  *   one shared DelayAec3 -> one aligned render
- *   -> four independent linear AEC filters
+ *   -> four independent linear AEC filters (four_aec_front_process)
  *   -> externally supplied effective beamformer weights
- *   -> one coherent post-beam RES + one NR + one iFFT/OLA
+ *   -> the coherent projection of the four lane contexts (four_aec_fuse)
  *
- * It follows the same pool-first layout and lifecycle as AudioPipeline:
+ * The residual-echo, noise-reduction, comfort-noise and synthesis stages are
+ * not here: the application carves them and chains them over the frame the
+ * fuse returns (pipelines/common/se_stage.h).
+ *
+ * Same pool-first layout and lifecycle as AudioPipeline:
  *
  *   four_aec_nr_res_get_mem_requirements() + four_aec_nr_res_init_ex()
  *       caller-owned pool; zero heap from init through destroy
  *
  *   four_aec_nr_res_create()
  *       heap convenience wrapper over that same pool-first implementation
- *
- * The only structural difference is the external beamformer seam: the mono
- * audio_pipeline_process() call is split into process_pre() and process_post().
- * Both construction paths use those same functions and neither allocates
- * while processing.
  */
 
 #include <stdlib.h>
@@ -30,21 +29,11 @@
 
 #include "4aec_nr_res.h"
 #include "4aec_nr_res_internal.h"
-#include "aec_res.h"
 #include "fft_wrapper.h"
-#include "audio_stft.h"
 #include "mem_align.h"
 #include "4aec_projection_kernels.h"
-#include "simd_kernels.h"
 #include "common/se_config.h"     /* se_derive(): grid + AecConfig, shared by every application */
-#include "common/se_anr_stage.h"  /* NR configuration, init, per-hop gain, strength setter       */
-
-/* CNG RNG seed, same as audio_pipeline.c. */
-/* Comfort noise is scaled by the denoiser gain of its bin, but never below
- * this amplitude (-10 dB): the fill follows the denoised floor while enough
- * of it remains to keep the residual echo it masks from surfacing. */
-#define CNG_NR_GAIN_FLOOR         0.31622777f
-#define PIPELINE_RNG_SEED         0x9e3779b9u
+#include "common/se_anr_stage.h"  /* se_anr_compose_config()                                     */
 
 /* Matched-filter duty cycle. The two WINDOWS are not literals here: they are
  * read from the lane AecConfig this file already builds at init --
@@ -139,17 +128,6 @@ static uint32_t four_aec_nr_res_now_us(void) { return FOUR_AEC_NR_RES_NOW_US(); 
 #define four_aec_nr_res_now_us() 0u
 #endif
 
-/* Process-wide monotonic construction counter -- see FourAecNrResFrameToken's
- * instance_epoch doc comment in the header for why this cannot be derived
- * from anything stored inside a (possibly reused, always-zeroed-at-init)
- * caller-owned pool. Not atomic: construction is assumed single-threaded,
- * consistent with the rest of this file (no locks/atomics anywhere else);
- * concurrent construction from multiple threads is out of scope here, same
- * as it already was before this counter existed. Starts at 1 so a
- * zero-initialized (never-constructed) token's instance_epoch of 0 can never
- * collide with a real instance's epoch. */
-static uint64_t g_four_aec_nr_res_next_epoch = 1;
-
 /* ============================================================================
  * Instance
  * ========================================================================== */
@@ -166,6 +144,7 @@ typedef struct FourAecLaneSnapshot {
     const Complex* near_spec;
     const float* r2;
     const float* comfort_noise;
+    const float* formed_hop;
 
     float far_power;
     float dt_indicator;
@@ -183,19 +162,9 @@ struct FourAecNrRes {
 
     Aec* lanes[FOUR_AEC_NR_RES_CHANNELS];
     DelayAec3 shared_delay;
-    AnrDenoiser* nr;
-    AcIstft* istft;             /* iff enable_post: inverse FFT, sqrt-Hann window, overlap-add */
-
-    AecRes* res;                /* iff enable_post && enable_res: the post-beam
-                                 * residual-echo suppressor; also the "a
-                                 * suppressor exists" predicate             */
-    float* unity_gain;          /* iff enable_post && (!enable_res ||
-                                 * !enable_nr): all-ones gain read in place
-                                 * of a disabled source                     */
 
     FourAecLaneSnapshot snapshots[FOUR_AEC_NR_RES_CHANNELS];
 
-    float* linear_interleaved;
     float* mic_lane;
     float* aligned_ref;
 
@@ -224,19 +193,11 @@ struct FourAecNrRes {
     Complex* fused_error;
     Complex* fused_near;
     Complex* residual_work;
-    Complex* output_spec;
+    Complex* residual_proj;    /* coherent residual vector, then its power in fused_r2 */
     float* fused_r2;
     float* fused_comfort;
-    float* total_gain;
-    float* extra_noise;
 
-    uint32_t rng_state;
-
-    uint64_t next_frame;
-    uint64_t generation;
-    uint64_t construction_epoch;
-    int pending;
-    FourAecNrResFrameToken pending_token;
+    int front_valid;            /* a front frame was processed since the last reset */
 
     void* owned_heap;
     size_t pool_size;
@@ -333,7 +294,6 @@ static float duty_leak_db_for_grid(int hop_size, int sample_rate) {
 static int derive_dims_and_configs(
     const FourAecNrResConfig* cfg,
     AecConfig* aec_cfg,
-    AnrConfig* nr_cfg,
     int* fft_size,
     int* hop_size,
     int* n_freqs,
@@ -343,7 +303,7 @@ static int derive_dims_and_configs(
     SeRequest req;
     SeGrid grid;
     int max_delay_samples;
-    if (!cfg || !aec_cfg || !nr_cfg || !fft_size || !hop_size ||
+    if (!cfg || !aec_cfg || !fft_size || !hop_size ||
         !n_freqs || !delay_ring_size ||
         !delay_estimator_bytes) return 0;
 
@@ -411,8 +371,6 @@ static int derive_dims_and_configs(
         *delay_ring_size = 0;
     }
 
-    *nr_cfg = se_anr_compose_config(cfg->sample_rate, *fft_size, *hop_size,
-                                    cfg->nr_mode);
     return 1;
 }
 
@@ -440,17 +398,14 @@ static int carve_working_buffers(FourAecNrRes* p,
                                  PoolCursor* cursor) {
     int n = p->n_freqs;
     int hop = p->hop_size;
-    size_t linear_count = (size_t)hop * FOUR_AEC_NR_RES_CHANNELS;
 
-    p->linear_interleaved =
-        (float*)pool_carve(cursor, linear_count, sizeof(float));
     p->mic_lane =
         (float*)pool_carve(cursor, (size_t)hop, sizeof(float));
     p->aligned_ref =
         (float*)pool_carve(cursor, (size_t)hop, sizeof(float));
 
     if (!p->cfg.enable_post)
-        return p->linear_interleaved && p->mic_lane && p->aligned_ref;
+        return p->mic_lane && p->aligned_ref;
 
     p->fused_error =
         (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
@@ -458,84 +413,45 @@ static int carve_working_buffers(FourAecNrRes* p,
         (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
     p->residual_work =
         (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
-    p->output_spec =
+    p->residual_proj =
         (Complex*)pool_carve(cursor, (size_t)n, sizeof(Complex));
 
     p->fused_r2 =
         (float*)pool_carve(cursor, (size_t)n, sizeof(float));
     p->fused_comfort =
         (float*)pool_carve(cursor, (size_t)n, sizeof(float));
-    p->total_gain =
-        (float*)pool_carve(cursor, (size_t)n, sizeof(float));
-    p->extra_noise =
-        (float*)pool_carve(cursor, (size_t)n, sizeof(float));
 
-    /* p->snapshots[ch]'s Complex- and float-pointer fields are no longer
-     * pool-carved -- bind_lane_view() (formerly snapshot_context()) points
-     * them directly at each lane's own AecResContext buffers every hop
-     * instead of owning a private copy. See bind_lane_view()'s doc comment
-     * for the lifetime contract this depends on. */
+    /* p->snapshots[ch]'s Complex- and float-pointer fields are not
+     * pool-carved -- bind_lane_view() points them directly at each lane's own
+     * AecResContext buffers every hop instead of owning a private copy. See
+     * bind_lane_view()'s doc comment for the lifetime contract this depends
+     * on. */
 
-    return p->linear_interleaved && p->mic_lane &&
-           p->aligned_ref &&
+    return p->mic_lane && p->aligned_ref &&
            p->fused_error && p->fused_near &&
-           p->residual_work && p->output_spec &&
-           p->fused_r2 && p->fused_comfort &&
-           p->total_gain && p->extra_noise;
-}
-
-static int init_post_res(FourAecNrRes* p,
-                         PoolCursor* pool_cursor,
-                         const AecConfig* aec_cfg) {
-    size_t bytes = aec_res_get_mem_size(aec_cfg);
-    void* mem = pool_carve(pool_cursor, 1, bytes);
-
-    if (!mem) return 0;
-    p->res = aec_res_init(mem, bytes, aec_cfg);
-    return p->res && aec_res_n_bins(p->res) == p->n_freqs &&
-           aec_res_hop_size(p->res) == p->hop_size;
-}
-
-/* The synthesis object: inverse FFT, sqrt-Hann window and overlap-add state.
- * It carves its own FFT handle; 0 for an invalid size. */
-static size_t synthesis_mem_size(int fft_size) {
-    AcStftConfig scfg;
-    ac_stft_config_default(&scfg, fft_size);
-    return ac_istft_get_mem_size(&scfg);
+           p->residual_work && p->residual_proj &&
+           p->fused_r2 && p->fused_comfort;
 }
 
 static size_t pipeline_buffer_size(
-    int hop, int n, size_t res_bytes, int delay_ring_size,
-    size_t delay_estimator_bytes, int enable_post, int enable_res,
-    int enable_nr) {
+    int hop, int n, int delay_ring_size,
+    size_t delay_estimator_bytes, int enable_post) {
     size_t total = 0;
     int i;
 
-    total = ck_field_size(
-        total,
-        ck_mul_size((size_t)hop, FOUR_AEC_NR_RES_CHANNELS),
-        sizeof(float));                                      /* linear */
-    /* mic_lane + aligned_ref are always required; the frequency-domain post
-     * buffers exist only for the RES/NR post path. */
+    /* mic_lane + aligned_ref are always required; the frequency-domain
+     * buffers exist only for a core that fuses. */
     for (i = 0; i < 2; ++i)
         total = ck_field_size(total, (size_t)hop, sizeof(float));
 
     if (enable_post) {
-    for (i = 0; i < 4; ++i)
-        total = ck_field_size(total, (size_t)n, sizeof(Complex));
-    for (i = 0; i < 4; ++i)
-        total = ck_field_size(total, (size_t)n, sizeof(float));
-    /* No per-lane snapshot buffers here: FourAecLaneSnapshot's spectrum/PSD
-     * fields are borrowed pointers into each lane's own AecResContext, not
-     * pool-carved copies. See bind_lane_view()/carve_working_buffers(). */
-
-    /* The residual suppressor is one AecRes block, which owns its scratch.
-     * A disabled gain source is read as an n-float unity vector, carved once
-     * for either. */
-    if (enable_res)
-        total = ck_add_size(total, ck_align16_size(res_bytes));
-    if (!enable_res || !enable_nr)
-        total = ck_field_size(total, (size_t)n, sizeof(float)); /* unity */
+        for (i = 0; i < 4; ++i)
+            total = ck_field_size(total, (size_t)n, sizeof(Complex));
+        for (i = 0; i < 2; ++i)
+            total = ck_field_size(total, (size_t)n, sizeof(float));
+        /* No per-lane snapshot buffers here: FourAecLaneSnapshot's
+         * spectrum/PSD fields are borrowed pointers into each lane's own
+         * AecResContext, not pool-carved copies. See bind_lane_view(). */
     }
     if (delay_estimator_bytes > 0)
         total = ck_add_size(total, ck_align16_size(delay_estimator_bytes));
@@ -547,41 +463,21 @@ static size_t pipeline_buffer_size(
 
 static size_t pipeline_pool_size(
     const AecConfig* aec_cfg,
-    const AnrConfig* nr_cfg,
     int hop,
-    int fft,
     int n,
     int delay_ring_size,
     size_t delay_estimator_bytes,
-    int enable_post,
-    int enable_nr,
-    int enable_res) {
-    /* "the MMSE-LSA region exists" -- NR lives only inside the post path, so
-     * the pair is one fact. Named once here rather than re-spelled at each
-     * of the three places below that need it. */
-    const int want_nr = enable_post && enable_nr;
+    int enable_post) {
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
-    size_t nr_bytes = want_nr ? se_anr_stage_mem_size(nr_cfg) : 0;
-    size_t res_bytes =
-        enable_post && enable_res ? aec_res_get_mem_size(aec_cfg) : 0;
-    size_t synth_bytes = enable_post ? synthesis_mem_size(fft) : 0;
     size_t buffer_bytes = pipeline_buffer_size(
-        hop, n, res_bytes, delay_ring_size, delay_estimator_bytes,
-        enable_post, enable_res, enable_nr);
+        hop, n, delay_ring_size, delay_estimator_bytes, enable_post);
     size_t total = 0;
     int ch;
 
-    if (aec_bytes == 0 || buffer_bytes == 0 ||
-        (enable_post && synth_bytes == 0) ||
-        (want_nr && nr_bytes == 0) ||
-        (enable_post && enable_res && res_bytes == 0)) return 0;
+    if (aec_bytes == 0 || buffer_bytes == 0) return 0;
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
         total = ck_add_size(total, ck_align16_size(aec_bytes));
-    if (want_nr)
-        total = ck_add_size(total, ck_align16_size(nr_bytes));
-    if (enable_post)
-        total = ck_add_size(total, ck_align16_size(synth_bytes));
     total = ck_add_size(total, buffer_bytes);
     return MEM_SIZE_INVALID(total) ? 0 : total;
 }
@@ -593,12 +489,8 @@ static size_t pipeline_pool_size(
 static int pipeline_build(
     FourAecNrRes* p,
     PoolCursor* cursor,
-    const AecConfig* aec_cfg,
-    const AnrConfig* nr_cfg) {
+    const AecConfig* aec_cfg) {
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
-    size_t nr_bytes = p->cfg.enable_post && p->cfg.enable_nr
-        ? se_anr_stage_mem_size(nr_cfg) : 0;
-    size_t synth_bytes = p->cfg.enable_post ? synthesis_mem_size(p->fft_size) : 0;
     int ch;
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
@@ -609,33 +501,7 @@ static int pipeline_build(
         p->initialized_lanes += 1;
     }
 
-    if (p->cfg.enable_post) {
-        void* synth_pool;
-        AcStftConfig scfg;
-        if (p->cfg.enable_nr) {
-            void* nr_pool = pool_carve(cursor, 1, nr_bytes);
-            if (!nr_pool) return 0;
-            p->nr = se_anr_stage_init(nr_pool, nr_bytes, nr_cfg);
-            if (!p->nr) return 0;
-        }
-        synth_pool = pool_carve(cursor, 1, synth_bytes);
-        if (!synth_pool) return 0;
-        ac_stft_config_default(&scfg, p->fft_size);
-        p->istft = ac_istft_init(synth_pool, synth_bytes, &scfg);
-        if (!p->istft) return 0;
-    }
-
     if (!carve_working_buffers(p, cursor)) return 0;
-    if (p->cfg.enable_post) {
-        if (p->cfg.enable_res && !init_post_res(p, cursor, aec_cfg)) return 0;
-        if (!p->cfg.enable_res || !p->cfg.enable_nr) {
-            int k;
-            p->unity_gain = (float*)pool_carve(
-                cursor, (size_t)p->n_freqs, sizeof(float));
-            if (!p->unity_gain) return 0;
-            for (k = 0; k < p->n_freqs; ++k) p->unity_gain[k] = 1.0f;
-        }
-    }
     if (p->cfg.delay_mode == AEC_DELAY_MATCHED) {
         size_t delay_bytes = delay_aec3_get_mem_size(
             p->sample_rate, p->hop_size, p->cfg.delay_num_filters);
@@ -669,8 +535,8 @@ static uint32_t four_aec_nr_res_build_flags_hash(void) {
     uint32_t hash = 2166136261u;
     hash = fnv1a_str(AUDIO_PIPELINE_BACKEND_STR, hash);
     hash = fnv1a_str(
-        "|carve:self,aec0,aec1,aec2,aec3,post?(nr?,fft),linear,hop2,"
-        "post?(complex4,float4,res?aecres,unity?),"
+        "|carve:self,aec0,aec1,aec2,aec3,hop2,"
+        "fuse?(complex4,float2),"
         "lanebind,delayest?,delayring?",
         hash);
     hash = fnv1a_str("|align16", hash);
@@ -708,7 +574,6 @@ int four_aec_nr_res_get_mem_requirements(
     const FourAecNrResConfig* cfg,
     FourAecNrResMemReq* out) {
     AecConfig aec_cfg;
-    AnrConfig nr_cfg;
     size_t pool_bytes;
     size_t total_bytes;
     uint32_t backend;
@@ -719,14 +584,13 @@ int four_aec_nr_res_get_mem_requirements(
     size_t delay_estimator_bytes;
 
     if (!out || !derive_dims_and_configs(
-            cfg, &aec_cfg, &nr_cfg, &fft, &hop, &n,
+            cfg, &aec_cfg, &fft, &hop, &n,
             &delay_ring_size,
             &delay_estimator_bytes)) return -1;
 
     pool_bytes = pipeline_pool_size(
-        &aec_cfg, &nr_cfg, hop, fft, n, delay_ring_size,
-        delay_estimator_bytes, cfg->enable_post, cfg->enable_nr,
-        cfg->enable_res);
+        &aec_cfg, hop, n, delay_ring_size,
+        delay_estimator_bytes, cfg->enable_post);
     total_bytes = ck_add_size(
         ck_align16_size(sizeof(FourAecNrRes)), pool_bytes);
     backend = four_aec_nr_res_backend_id();
@@ -757,7 +621,6 @@ FourAecNrRes* four_aec_nr_res_init_ex(
     FourAecNrRes* p;
     PoolCursor cursor;
     AecConfig aec_cfg;
-    AnrConfig nr_cfg;
     int fft;
     int hop;
     int n;
@@ -784,7 +647,7 @@ FourAecNrRes* four_aec_nr_res_init_ex(
         current.bytes > (uint64_t)SIZE_MAX ||
         (uint64_t)bytes < current.bytes) return NULL;
     if (!derive_dims_and_configs(
-            &cfg_copy, &aec_cfg, &nr_cfg, &fft, &hop, &n,
+            &cfg_copy, &aec_cfg, &fft, &hop, &n,
             &delay_ring_size,
             &delay_estimator_bytes)) return NULL;
     (void)delay_estimator_bytes;  /* pipeline_build re-queries the same tuple */
@@ -823,16 +686,13 @@ FourAecNrRes* four_aec_nr_res_init_ex(
         }
         p->duty_last_delay = -1;   /* the rest is zeroed by the pool memset */
     }
-    p->rng_state = PIPELINE_RNG_SEED;
     p->pool_size = (size_t)current.bytes;
-    p->construction_epoch = g_four_aec_nr_res_next_epoch++;
 
     cursor.ptr = (uint8_t*)mem + ALIGN16(sizeof(*p));
     cursor.remaining =
         (size_t)current.bytes - ALIGN16(sizeof(*p));
-    if (!pipeline_build(
-            p, &cursor, &aec_cfg, &nr_cfg) ||
-        cursor.remaining != 0) return NULL;
+    if (!pipeline_build(p, &cursor, &aec_cfg) || cursor.remaining != 0)
+        return NULL;
 
     for (k = 0; k < FOUR_AEC_NR_RES_CHANNELS; ++k) {
         AecResContext context;
@@ -840,11 +700,6 @@ FourAecNrRes* four_aec_nr_res_init_ex(
         if (context.hop_size != hop || context.n_freqs != n)
             return NULL;
     }
-    /* p->nr is non-NULL exactly when the NR region was carved (the whole
-     * pool is memset before build), so it answers the same question the two
-     * config fields do -- and it is the pointer about to be dereferenced. */
-    if (p->nr && (anr_get_hop_size(p->nr) != hop ||
-                  anr_get_n_freqs(p->nr) != n)) return NULL;
     return p;
 }
 
@@ -1298,32 +1153,19 @@ static int align_render(FourAecNrRes* p, const float* render,
 }
 
 /* Points dst's spectrum/PSD fields (error_spec, echo_spec, far_spec,
- * near_spec, r2, comfort_noise -- these back out->linear_spectra and the
- * internal fuse_contexts() inputs) directly at src's own buffers instead of
- * copying them. Does NOT touch linear_interleaved, which is a separate,
- * genuinely pipeline-owned buffer filled by a per-sample copy loop in the
- * caller (four_aec_nr_res_process_pre()) -- only the fields bound here
- * alias a lane's own memory.
+ * near_spec, r2, comfort_noise, formed_hop -- these back the front view and
+ * the fuse inputs) directly at src's own buffers instead of copying them.
  *
- * Safe only because AecResContext's pointers are documented to "alias the
- * AEC's internal per-hop buffers -- read before the next aec_process()
- * call" (aec.h), and this file's own pending-token gate
- * (four_aec_nr_res_process_pre()'s `if (p->pending) return ...`, plus
- * token_matches() at the top of process_post_impl()) structurally prevents
- * any lane's aec_process() from running again before the borrowed pointers
- * are consumed. four_aec_nr_res_reset() does NOT guarantee this memory is
- * cleared or overwritten -- aec_reset() carries no such promise for a
- * lane's spectrum buffers, so a stale value may simply be left in place at
- * the same address. What actually keeps this safe is the API contract
- * (linear_spectra is valid only until process_post(), reset(), or
- * destroy() -- see FourAecNrResPreFrame's doc comment) combined with the
- * pending/token gate, which is what stops THIS file's own process_post()
- * from ever reading post-reset lane memory; an external caller must
- * independently honor the same contract rather than assume reset() will
- * make a violation visible. Do not port this borrow-pointer design to
- * pipeline.py's FourChannelAecPipeline: that reference implementation's
- * contract (tests/test_pipeline.py's queued-pre-frames test) allows multiple
- * pre-frames in flight simultaneously and requires true copy semantics. */
+ * Safe because AecResContext's pointers are documented to "alias the AEC's
+ * internal per-hop buffers -- read before the next aec_process() call"
+ * (aec.h): a lane runs again only inside four_aec_front_process() or after a
+ * reset, and the front view is documented valid until exactly then.
+ * four_aec_nr_res_reset() does not clear or overwrite this memory -- aec_reset()
+ * makes no such promise for a lane's spectrum buffers -- so a caller that
+ * keeps reading a view past a reset reads undefined content, and fuse refuses
+ * to run on one (front_valid). pipeline.py's FourChannelAecPipeline keeps
+ * several frames in flight and copies; this borrow design is deliberately
+ * not mirrored there. */
 static int bind_lane_view(FourAecLaneSnapshot* dst,
                           const AecResContext* src,
                           int n_freqs, int residual_half) {
@@ -1339,6 +1181,7 @@ static int bind_lane_view(FourAecLaneSnapshot* dst,
     dst->near_spec = src->near_spec;
     dst->r2 = src->r2;
     dst->comfort_noise = src->comfort_noise;
+    dst->formed_hop = src->formed_hop;
 
     dst->far_power = src->far_power;
     dst->dt_indicator = src->dt_indicator;
@@ -1347,11 +1190,11 @@ static int bind_lane_view(FourAecLaneSnapshot* dst,
     return 1;
 }
 
-int four_aec_nr_res_process_pre(
+int four_aec_front_process(
     FourAecNrRes* p,
     const float* microphones_interleaved,
     const float* ref,
-    FourAecNrResPreFrame* out) {
+    FourAecFront* out) {
     FourAecNrResDelayState delay;
     int hop;
     int ch;
@@ -1365,8 +1208,6 @@ int four_aec_nr_res_process_pre(
     if (!p || p->destroyed ||
         !microphones_interleaved || !ref || !out)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    if (p->pending) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
-
     /* Cleared once the call is accepted: a hop that then bails out part-way
      * reports zero for the stages it never reached rather than the previous
      * hop's numbers. The three AEC-side fields are ACCUMULATED over the four
@@ -1380,6 +1221,7 @@ int four_aec_nr_res_process_pre(
      * before the lane loop has established nothing, and "nothing established"
      * is what makes fuse_contexts() fall back to the full comparison. */
     p->far_spec_shared_hop = 0;
+    p->front_valid = 0;
 
     hop = p->hop_size;
     if (!inputs_finite(
@@ -1488,12 +1330,6 @@ int four_aec_nr_res_process_pre(
             four_aec_nr_res_reset(p);
             return FOUR_AEC_NR_RES_DSP_ERROR;
         }
-        for (i = 0; i < hop; ++i) {
-            p->linear_interleaved[
-                i * FOUR_AEC_NR_RES_CHANNELS + ch] =
-                context.formed_hop[i];
-        }
-
         /* Sum this lane's own stage split into the hop's record. The four
          * lanes run sequentially, so summing gives the wall-clock cost of
          * each stage across the whole loop -- see FourAecNrResLastTiming. */
@@ -1529,25 +1365,17 @@ int four_aec_nr_res_process_pre(
      * about some other arrangement. */
     p->far_spec_shared_hop = lanes_borrowed && shared_far_spec != NULL;
 
-    p->pending_token.frame_index = p->next_frame;
-    p->pending_token.generation = p->generation;
-    p->pending_token.owner_cookie = (uintptr_t)p;
-    p->pending_token.instance_epoch = p->construction_epoch;
-    p->next_frame += 1;
-    p->pending = 1;
+    p->front_valid = 1;
 
-    out->token = p->pending_token;
     out->delay = delay;
     out->hop_size = p->hop_size;
     out->n_channels = FOUR_AEC_NR_RES_CHANNELS;
     out->n_freqs = p->n_freqs;
-    out->linear_interleaved = p->linear_interleaved;
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
         out->linear_spectra[ch] = p->snapshots[ch].error_spec;
+        out->formed_hop[ch] = p->snapshots[ch].formed_hop;
     }
-    /* Pipeline-owned per-hop output of align_render() above -- the exact
-     * delay-aligned far every lane consumed this hop. Same one-frame
-     * lifetime contract as linear_interleaved (see the header). */
+    /* The exact delay-aligned far every lane consumed this hop. */
     out->aligned_ref = p->aligned_ref;
     return FOUR_AEC_NR_RES_OK;
 }
@@ -1556,15 +1384,6 @@ int four_aec_nr_res_process_pre(
  * Per-hop processing — Stages 2/3: external beamformer -> NR/RES -> OLA
  * ========================================================================== */
 
-static int token_matches(const FourAecNrRes* p,
-                              const FourAecNrResFrameToken* token) {
-    return p && token && p->pending &&
-           token->frame_index == p->pending_token.frame_index &&
-           token->generation == p->pending_token.generation &&
-           token->owner_cookie == p->pending_token.owner_cookie &&
-           token->owner_cookie == (uintptr_t)p &&
-           token->instance_epoch == p->construction_epoch;
-}
 
 static int validate_weights(const FourAecNrRes* p,
                                  const Complex* weights) {
@@ -1621,16 +1440,16 @@ static int fuse_contexts(FourAecNrRes* p,
         memset(p->fused_error, 0, (size_t)n * sizeof(Complex));
     }
     memset(p->fused_near, 0, (size_t)n * sizeof(Complex));
-    /* output_spec is scratch for the coherent residual vector until
+    /* residual_proj is scratch for the coherent residual vector until
      * run_post_res_and_nr() overwrites every bin with the final spectrum. */
-    memset(p->output_spec, 0, (size_t)n * sizeof(Complex));
+    memset(p->residual_proj, 0, (size_t)n * sizeof(Complex));
     memset(p->fused_comfort, 0, (size_t)n * sizeof(float));
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
         const Complex* lane_weights =
             weights + (size_t)ch * (size_t)n;
         /* A lane the beamformer has zeroed in every bin contributes exactly
-         * nothing to fused_error/fused_near/output_spec/fused_comfort below,
+         * nothing to fused_error/fused_near/residual_proj/fused_comfort below,
          * so it must not vote on the three scalars that steer the post stage
          * either -- those govern a spectrum this lane is absent from. The
          * degenerate case is real: with the external beamformer disabled the
@@ -1677,312 +1496,90 @@ static int fuse_contexts(FourAecNrRes* p,
             p->residual_work, p->snapshots[ch].echo_spec,
             p->snapshots[ch].r2, n);
         four_aec_projection_cmac(
-            p->output_spec, lane_weights, p->residual_work, n);
+            p->residual_proj, lane_weights, p->residual_work, n);
         four_aec_comfort_accumulate(
             p->fused_comfort, lane_weights,
             p->snapshots[ch].comfort_noise, n);
     }
 
-    four_aec_complex_mag2(p->fused_r2, p->output_spec, n);
+    four_aec_complex_mag2(p->fused_r2, p->residual_proj, n);
     return 1;
 }
 
-/* The shared post-beam RES on the fused spectra: one AecRes hop. */
-static const float* post_res_gain(FourAecNrRes* p,
-                                  const Complex* error,
-                                  int all_converged,
-                                  float max_dt,
-                                  float max_saturation) {
-    AecResInput in;
+/* ============================================================================
+ * Per-hop processing — Stage 2: the beamformer-weighted projection
+ * ========================================================================== */
 
-    in.error_spec = error;
-    in.near_spec = p->fused_near;
-    in.r2 = p->fused_r2;
-    in.comfort_noise = p->fused_comfort;
-    in.render_hop = p->aligned_ref;
-    in.all_converged = all_converged;
-    in.max_dt = max_dt;
-    in.max_saturation = max_saturation;
-    in.clock_drift = p->cfg.delay_mode == AEC_DELAY_MATCHED
-        ? delay_aec3_has_clockdrift(&p->shared_delay) : 0;
-    return aec_res_process(p->res, &in);
-}
-
-/* The conventional post path up to and including the comfort-noise fill:
- * leaves the spectrum to synthesise in p->output_spec. Returns 0 when the
- * RES preparation or the denoiser refused the hop. */
-static int prepare_post_spectrum(
+int four_aec_fuse(
     FourAecNrRes* p,
-    int all_converged,
-    float max_dt,
-    float max_saturation,
-    const Complex* trusted_beamformed_error) {
-    const float* res_gain;
-    const float* nr_gain;
-    const Complex* error =
-        trusted_beamformed_error ? trusted_beamformed_error : p->fused_error;
-    int n = p->n_freqs;
-    uint32_t t0, t1;
-
-    /* RES stage. */
-    t0 = four_aec_nr_res_now_us();
-    if (p->res) {
-        res_gain = post_res_gain(
-            p, error, all_converged, max_dt, max_saturation);
-    } else {
-        /* No suppressor: G_res reads as the unity vector, so min(G_nr, G_res)
-         * is the NR gain and CNG (which fills only RES-cut bins) is skipped. */
-        res_gain = p->unity_gain;
-    }
-    /* One stamp closes RES and opens NR: the two statements between them are
-     * a branch and a ternary, so a second clock read would cost more than the
-     * gap it measures and leave that gap unattributed. */
-    t1 = four_aec_nr_res_now_us();
-    p->last_timing.res_us = p->res ? t1 - t0 : 0;
-    if (!res_gain) return 0;
-
-    nr_gain = p->unity_gain;
-    if (p->cfg.enable_nr) {
-        /* The denoiser's residual-echo prior is the fused R^2 (the stage
-         * rescales it into extra_noise); legacy_amin hands it no prior. */
-        SeSpecFrame nf;
-        memset(&nf, 0, sizeof(nf));
-        nf.n_freqs = n;
-        nf.e = error;
-        nf.r2 = p->fused_r2;
-        nr_gain = se_anr_stage_gain(p->nr, &nf, p->extra_noise,
-                                    !p->cfg.legacy_amin);
-        if (!nr_gain) return 0;
-        p->last_timing.nr_us = four_aec_nr_res_now_us() - t1;
-    } else {
-        p->last_timing.nr_us = 0;
-    }
-
-    /* Gain fusion. A disabled source reads as the unity vector, so one min
-     * serves every combination: min(1, G_res) is G_res and min(G_nr, 1) is
-     * G_nr. sk_min_f32 is the mono twin's kernel: a non-finite gain
-     * propagates to the output finite gate instead of being masked the way
-     * fminf would mask it. */
-    sk_min_f32(p->total_gain, nr_gain, res_gain, n);
-    sk_capply_gain_f32(p->output_spec, error, p->total_gain, n);
-
-    /* Comfort noise on the RES-cut bins, scaled by G_nr (bounded below by
-     * CNG_NR_GAIN_FLOOR) so the fill follows the denoised floor rather than
-     * the ambient level: the denoiser never sees the comfort noise, so its
-     * gain is applied to it here. */
-    if (p->cfg.enable_cng && p->res)
-        aec_cng_fill(&p->rng_state, p->output_spec, p->fused_comfort,
-                     res_gain, nr_gain, CNG_NR_GAIN_FLOOR, n);
-
-    return 1;
-}
-
-/* Synthesis: inverse transform, windowed overlap-add, and the hop
- * emit/shift, shared by the conventional post path and
- * synthesize_external() so both finish a hop through the one OLA with the
- * identical operation order. The finite check after it is validation, not
- * synthesis, and falls in the post-stage remainder along with the gain
- * fusion and comfort-noise loop above. */
-static int finish_hop(FourAecNrRes* p, const Complex* spectrum, float* out) {
-    int hop = p->hop_size;
-    uint32_t t0 = four_aec_nr_res_now_us();
-    ac_istft_push(p->istft, spectrum, out);
-    p->last_timing.synth_us = four_aec_nr_res_now_us() - t0;
-    return inputs_finite(out, (size_t)hop);
-}
-
-/* The post path up to the spectrum: argument and token gates, the timing
- * clears, the fuse stage and prepare_post_spectrum(). Shared by
- * process_post() and process_post_view() so a guard or a stamp added to the
- * shipped path cannot miss the seam. Returns a FOUR_AEC_NR_RES_* status; on
- * DSP_ERROR the instance has been reset. The pending token is NOT consumed
- * here: each caller consumes it after its own last step. */
-static int post_to_spectrum(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token,
     const Complex* weights,
-    const Complex* trusted_beamformed_error) {
+    const Complex* beamformed_error,
+    SeSpecFrame* frame) {
     int all_converged;
     float max_dt;
     float max_saturation;
     uint32_t t0;
 
-    if (!p || p->destroyed || !token || !weights || !p->cfg.enable_post)
+    if (!p || p->destroyed || !weights || !frame || !p->cfg.enable_post)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    if (!token_matches(p, token))
-        return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+    if (!p->front_valid) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
     if (!validate_weights(p, weights))
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
 
-    /* Post half cleared here for the same reason process_pre() clears the
-     * pre half: a hop that bails out reports zeros, not stale numbers. */
     p->last_timing.fuse_us = 0;
-    p->last_timing.res_us = 0;
-    p->last_timing.nr_us = 0;
-    p->last_timing.synth_us = 0;
-
-    /* Fuse stage: the beamformer-weighted projection of the four lanes. */
     t0 = four_aec_nr_res_now_us();
     if (!fuse_contexts(
-            p, weights, trusted_beamformed_error,
-            &all_converged, &max_dt,
-            &max_saturation)) {
+            p, weights, beamformed_error,
+            &all_converged, &max_dt, &max_saturation)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
     p->last_timing.fuse_us = four_aec_nr_res_now_us() - t0;
-    if (!prepare_post_spectrum(
-            p, all_converged, max_dt, max_saturation,
-            trusted_beamformed_error)) {
-        four_aec_nr_res_reset(p);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
-    }
+
+    memset(frame, 0, sizeof(*frame));
+    frame->n_freqs = p->n_freqs;
+    frame->hop = p->hop_size;
+    frame->e = beamformed_error ? beamformed_error : p->fused_error;
+    frame->y = p->fused_near;
+    frame->x = p->snapshots[0].far_spec;
+    frame->r2 = p->fused_r2;
+    frame->cn = p->fused_comfort;
+    frame->g_res_ctx = NULL;     /* the lanes compute no gain of their own */
+    frame->far_hop = p->aligned_ref;
+    frame->formed_hop = NULL;    /* one hop per lane: FourAecFront.formed_hop */
+    frame->far_power = p->snapshots[0].far_power;
+    frame->max_dt = max_dt;
+    frame->max_sat = max_saturation;
+    frame->all_converged = all_converged;
+    frame->clock_drift = p->cfg.delay_mode == AEC_DELAY_MATCHED
+        ? delay_aec3_has_clockdrift(&p->shared_delay) : 0;
+    frame->delay_changed = p->last_delay.changed;
+    frame->delay_locked = p->last_delay.solid;
     return FOUR_AEC_NR_RES_OK;
 }
 
-static void consume_token(FourAecNrRes* p) {
-    p->pending = 0;
-    memset(&p->pending_token, 0, sizeof(p->pending_token));
-}
-
-static int process_post_impl(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token,
-    const Complex* weights,
-    const Complex* trusted_beamformed_error,
-    float* out) {
-    int rc;
-    if (!out) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    rc = post_to_spectrum(p, token, weights, trusted_beamformed_error);
-    if (rc != FOUR_AEC_NR_RES_OK) return rc;
-    if (!finish_hop(p, p->output_spec, out)) {
-        four_aec_nr_res_reset(p);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
-    }
-    consume_token(p);
-    return FOUR_AEC_NR_RES_OK;
-}
-
-int four_aec_nr_res_process_post(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token,
-    const Complex* weights,
-    float* out) {
-    return process_post_impl(p, token, weights, NULL, out);
-}
-
-int four_aec_nr_res_process_post_trusted_spectrum(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token,
-    const Complex* weights,
-    const Complex* beamformed_error,
-    float* out) {
-    if (!beamformed_error) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    return process_post_impl(
-        p, token, weights, beamformed_error, out);
-}
-
-int four_aec_nr_res_process_post_view(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token,
-    const Complex* weights,
-    const Complex* trusted_beamformed_error,
-    FourAecNrResPostView* out) {
-    int rc;
-    if (!p || p->destroyed || !out || !p->cfg.enable_res ||
-        p->cfg.enable_nr || !p->res)
-        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    rc = post_to_spectrum(p, token, weights, trusted_beamformed_error);
-    if (rc != FOUR_AEC_NR_RES_OK) return rc;
-    out->beamformed_error =
-        trusted_beamformed_error ? trusted_beamformed_error : p->fused_error;
-    out->post_spectrum = p->output_spec;
-    consume_token(p);
-    return FOUR_AEC_NR_RES_OK;
-}
-
-int four_aec_nr_res_synthesize_external(
-    FourAecNrRes* p,
-    const Complex* spectrum,
-    float* out) {
-    if (!p || p->destroyed || !spectrum || !out || !p->cfg.enable_post ||
-        !p->istft)
-        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    if (!complex_vector_finite(spectrum, p->n_freqs) ||
-        !finish_hop(p, spectrum, out)) {
-        four_aec_nr_res_reset(p);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
-    }
-    return FOUR_AEC_NR_RES_OK;
-}
-
-int four_aec_nr_res_abandon_pre(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token) {
-    if (!p || p->destroyed || !token)
-        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    if (!token_matches(p, token))
-        return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
-    /* Same token-consumption epilogue as process_post_impl(), with none of
-     * its RES/NR/synthesis work: releasing the frame is the whole job. */
-    p->pending = 0;
-    memset(&p->pending_token, 0, sizeof(p->pending_token));
-    return FOUR_AEC_NR_RES_OK;
+int four_aec_nr_res_stage_configs(
+    const FourAecNrResConfig* cfg,
+    AecConfig* res_cfg,
+    AnrConfig* nr_cfg) {
+    int fft, hop, n, delay_ring_size;
+    size_t delay_estimator_bytes;
+    if (!res_cfg || !nr_cfg || !derive_dims_and_configs(
+            cfg, res_cfg, &fft, &hop, &n, &delay_ring_size,
+            &delay_estimator_bytes)) return -1;
+    *nr_cfg = se_anr_compose_config(cfg->sample_rate, fft, hop, cfg->nr_mode);
+    return 0;
 }
 
 /* ============================================================================
  * Reset and teardown
  * ========================================================================== */
 
-int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live,
-                                     float* target) {
-    if (!p || p->destroyed || !p->res) return -1;
-    return aec_res_split_floor(p->res, live, target);
-}
-
-int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset,
-                                   float ramp_ms) {
-    if (!p || p->destroyed || !p->res) return -1;
-
-    /* The four lanes run with spatial_linear_context, so they never reach
-     * their own suppressor and their floors shape nothing. The gain that
-     * actually multiplies the output -- and scales the comfort noise -- comes
-     * from the shared post-stage suppressor, so that is what a preset change
-     * has to move. aec_res_set_preset() validates the preset and the ramp
-     * before it writes, so a rejected call leaves the instance unchanged.
-     *
-     * The lanes are deliberately left alone. Retargeting them would be inert
-     * but not free: a ramped call would park all four permanently mid-ramp,
-     * with live != target forever. The mono pipeline and the Python twin take
-     * the same position. */
-    if (aec_res_set_preset(p->res, preset, ramp_ms) != 0) return -1;
-    p->cfg.aec_preset = preset;
-    return 0;
-}
-
-int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, AnrMode mode) {
-    if (!p || p->destroyed) return -1;
-    if (!p->cfg.enable_post || !p->nr) return -1;
-    if (se_anr_stage_set_mode(p->nr, p->cfg.sample_rate, p->fft_size,
-                              p->hop_size, mode) != 0) return -1;
-    p->cfg.nr_mode = mode;
-    return 0;
-}
-
-/* Legal to call while a pre-frame is pending (e.g. align_render()'s error
- * path above). If a caller is still holding a FourAecNrResPreFrame from that
- * pending frame, its linear_spectra[channel] pointers alias the per-lane
- * AecResContext buffers reset below (linear_interleaved is a separate,
- * pipeline-owned copy, memset below, not an alias). This file's own
- * token-generation bump (see the end of this function) is what keeps
- * process_post_impl() from reading linear_spectra afterward through this
- * instance's own API; it does not protect an external caller who kept a raw
- * pointer past this call -- aec_reset() carries no promise that a lane's old
- * spectrum content gets cleared or overwritten, so there is nothing for such
- * a caller to visibly notice going wrong. This is why FourAecNrResPreFrame's
- * doc comment requires callers to stop reading on reset() as an API-contract
- * rule, not on token rejection or on any memory-safety symptom.
- * Covered by tests/test_4aec_nr_res.c's reset-while-pending test. */
+/* Legal at any time. A caller still holding a FourAecFront must stop reading
+ * its pointers the instant this is called: they alias per-lane AecResContext
+ * buffers that aec_reset() does not clear, so a violation shows as stale
+ * content, not as a fault. four_aec_fuse() refuses to run until a new front
+ * frame has been processed. */
 void four_aec_nr_res_reset(FourAecNrRes* p) {
     int ch;
     if (!p || p->destroyed) return;
@@ -1992,23 +1589,14 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
     for (ch = 0; ch < p->initialized_lanes; ++ch) {
         aec_reset(p->lanes[ch]);
     }
-    if (p->nr) se_anr_stage_reset(p->nr);
-    if (p->res) aec_res_reset(p->res);
-
     if (p->delay_ring) {
         memset(p->delay_ring, 0,
                (size_t)p->delay_ring_size * sizeof(float));
-    }
-    if (p->linear_interleaved) {
-        memset(p->linear_interleaved, 0,
-               (size_t)p->hop_size * FOUR_AEC_NR_RES_CHANNELS *
-               sizeof(float));
     }
     if (p->aligned_ref) {
         memset(p->aligned_ref, 0,
                (size_t)p->hop_size * sizeof(float));
     }
-    if (p->istft) ac_istft_reset(p->istft);
 
     p->delay_samples_seen = 0;
     p->accepted_delay =
@@ -2040,11 +1628,7 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
     p->duty_erle_peak = 0.0f;
     p->duty_hops_run = 0;
     memset(&p->last_delay, 0, sizeof(p->last_delay));
-    p->rng_state = PIPELINE_RNG_SEED;
-    p->next_frame = 0;
-    p->generation += 1;
-    p->pending = 0;
-    memset(&p->pending_token, 0, sizeof(p->pending_token));
+    p->front_valid = 0;
 }
 
 void four_aec_nr_res_destroy(FourAecNrRes* p) {
@@ -2052,7 +1636,6 @@ void four_aec_nr_res_destroy(FourAecNrRes* p) {
     void* owned_heap;
     if (!p || p->destroyed) return;
 
-    if (p->nr) se_anr_stage_destroy(p->nr);
     for (ch = 0; ch < p->initialized_lanes; ++ch) {
         aec_destroy(p->lanes[ch]);
     }
@@ -2088,14 +1671,6 @@ int four_aec_nr_res_matched_filter_count(const FourAecNrRes* p) {
 
 int four_aec_nr_res_linear_aec_count(const FourAecNrRes* p) {
     return p && !p->destroyed ? FOUR_AEC_NR_RES_CHANNELS : 0;
-}
-
-int four_aec_nr_res_nr_count(const FourAecNrRes* p) {
-    return p && !p->destroyed && p->nr ? 1 : 0;
-}
-
-int four_aec_nr_res_post_res_count(const FourAecNrRes* p) {
-    return p && !p->destroyed && p->res ? 1 : 0;
 }
 
 long four_aec_nr_res_far_fft_real_compute_count(const FourAecNrRes* p) {
@@ -2169,13 +1744,8 @@ int four_aec_nr_res_get_mem_breakdown(
     const FourAecNrResConfig* cfg,
     FourAecNrResMemBreakdown* out) {
     AecConfig aec_cfg;
-    AnrConfig nr_cfg;
     size_t aec_one;
     size_t aec_total = 0;
-    size_t nr_bytes;
-    size_t res_bytes;
-    size_t fft_bytes;
-    size_t synth_bytes;
     size_t wrapper_storage;
     size_t wrapper_bytes;
     size_t total;
@@ -2185,49 +1755,26 @@ int four_aec_nr_res_get_mem_breakdown(
     int delay_ring_size;
     size_t delay_estimator_bytes;
     int ch;
-    int want_nr;
 
     if (!out || !derive_dims_and_configs(
-            cfg, &aec_cfg, &nr_cfg, &fft, &hop, &n,
+            cfg, &aec_cfg, &fft, &hop, &n,
             &delay_ring_size,
             &delay_estimator_bytes)) return -1;
 
     aec_one = aec_get_mem_size(&aec_cfg);
-    want_nr = cfg->enable_post && cfg->enable_nr;
-    nr_bytes = want_nr ? se_anr_stage_mem_size(&nr_cfg) : 0;
-    fft_bytes = cfg->enable_post ? fft_get_mem_size(fft) : 0;
-    synth_bytes = cfg->enable_post ? synthesis_mem_size(fft) : 0;
-    res_bytes = cfg->enable_post && cfg->enable_res
-        ? aec_res_get_mem_size(&aec_cfg) : 0;
     wrapper_storage = pipeline_buffer_size(
-        hop, n, res_bytes, delay_ring_size, delay_estimator_bytes,
-        cfg->enable_post, cfg->enable_res, cfg->enable_nr);
-    if (aec_one == 0 || wrapper_storage == 0 ||
-        (cfg->enable_post && cfg->enable_res && res_bytes == 0) ||
-        (cfg->enable_post && (fft_bytes == 0 || synth_bytes == 0)) ||
-        (want_nr && nr_bytes == 0)) return -1;
+        hop, n, delay_ring_size, delay_estimator_bytes, cfg->enable_post);
+    if (aec_one == 0 || wrapper_storage == 0) return -1;
 
     for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
         aec_total = ck_add_size(aec_total, ck_align16_size(aec_one));
     wrapper_bytes = ck_add_size(
         ck_align16_size(sizeof(FourAecNrRes)), wrapper_storage);
-    /* The synthesis object holds the FFT counted on its own line above; its
-     * remainder (window, overlap state, staging) belongs to the wrapper. */
-    if (cfg->enable_post && synth_bytes > ck_align16_size(fft_bytes))
-        wrapper_bytes = ck_add_size(
-            wrapper_bytes, synth_bytes - ck_align16_size(fft_bytes));
-    total = wrapper_bytes;
-    total = ck_add_size(total, aec_total);
-    if (want_nr)
-        total = ck_add_size(total, ck_align16_size(nr_bytes));
-    if (cfg->enable_post)
-        total = ck_add_size(total, ck_align16_size(fft_bytes));
+    total = ck_add_size(wrapper_bytes, aec_total);
     if (MEM_SIZE_INVALID(total)) return -1;
 
     memset(out, 0, sizeof(*out));
     out->aec_bytes = aec_total;
-    out->nr_bytes = nr_bytes;
-    out->fft_bytes = fft_bytes;
     out->wrapper_bytes = wrapper_bytes;
     out->total_bytes = total;
     out->hop_size = hop;

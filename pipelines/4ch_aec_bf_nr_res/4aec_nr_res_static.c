@@ -1,16 +1,22 @@
 /**
  * 4aec_nr_res_static.c — 4x AEC(linear) -> beamformer -> NR/RES
- *                        (Version B: static memory)
+ *                        (static memory, stages chained by the caller)
  *
- * Thin host reference over 4aec_nr_res.h. It intentionally follows
- * pipelines/mono_aec_nr_res/static_main.c:
+ * Minimal example of the frequency-domain stage chain over 4aec_nr_res.h.
+ * It follows pipelines/mono_aec_nr_res/static_main.c:
  *
  *   default config -> get_mem_requirements -> caller allocation
  *                  -> init -> process -> destroy -> caller release
  *
- * The four-channel-only difference is the split process boundary. This
- * executable supplies fixed equal weights between process_pre() and
- * process_post() because the real SRP-PHAT/GSC is externally owned. Equal
+ * The front end (four_aec_front_process / four_aec_fuse) owns the shared
+ * aligner and the four lanes; this file carves the post-beam stages from the
+ * same caller pool and chains them itself:
+ *
+ *   front_process -> (weights) -> fuse -> se_res_stage_gain, se_anr_stage_gain
+ *     -> sk_min_f32 -> sk_capply_gain_f32 -> aec_cng_fill -> ac_istft_push
+ *
+ * The beamformer is externally owned in a real product (SRP-PHAT/GSC); this
+ * executable supplies fixed equal weights between the two front calls. Equal
  * weights are a deterministic smoke adapter, not a production beamformer.
  *
  * Build:
@@ -31,6 +37,11 @@
 #include <math.h>
 
 #include "4aec_nr_res.h"
+#include "audio_stft.h"
+#include "mem_align.h"
+#include "simd_kernels.h"
+#include "common/se_anr_stage.h"
+#include "common/se_stage.h"
 
 /* ------------------------------------------------------------------ */
 
@@ -67,12 +78,41 @@ static const char* backend_id_name(uint32_t backend_id) {
     }
 }
 
+/* The post-beam stages this example carves behind the front end. */
+typedef struct Stages {
+    AecConfig res_cfg;
+    AnrConfig nr_cfg;
+    size_t res_bytes, nr_bytes, synth_bytes, fft_bytes;
+    size_t vec_bytes;                     /* one float[n_freqs], 16-byte padded */
+    size_t cvec_bytes;                    /* one Complex[n_freqs], padded       */
+    size_t total;                         /* pool: front end + every stage       */
+} Stages;
+
+static int plan_stages(const FourAecNrResConfig* cfg, const FourAecNrResMemReq* req,
+                       const FourAecNrResMemBreakdown* b, Stages* s) {
+    AcStftConfig scfg;
+    if (four_aec_nr_res_stage_configs(cfg, &s->res_cfg, &s->nr_cfg) != 0) return -1;
+    s->res_bytes = aec_res_get_mem_size(&s->res_cfg);
+    s->nr_bytes = se_anr_stage_mem_size(&s->nr_cfg);
+    ac_stft_config_default(&scfg, b->fft_size);
+    s->synth_bytes = ac_istft_get_mem_size(&scfg);
+    s->fft_bytes = fft_get_mem_size(b->fft_size);
+    s->vec_bytes = ALIGN16((size_t)b->n_freqs * sizeof(float));
+    s->cvec_bytes = ALIGN16((size_t)b->n_freqs * sizeof(Complex));
+    if (!s->res_bytes || !s->nr_bytes || !s->synth_bytes) return -1;
+    s->total = (size_t)req->bytes + ALIGN16(s->res_bytes) + ALIGN16(s->nr_bytes) +
+               ALIGN16(s->synth_bytes) + 2 * s->vec_bytes + s->cvec_bytes;
+    return 0;
+}
+
 static int print_mem_budget(const FourAecNrResConfig* cfg) {
     FourAecNrResMemReq req;
     FourAecNrResMemBreakdown b;
+    Stages s;
 
     if (four_aec_nr_res_get_mem_requirements(cfg, &req) != 0 ||
-        four_aec_nr_res_get_mem_breakdown(cfg, &b) != 0) {
+        four_aec_nr_res_get_mem_breakdown(cfg, &b) != 0 ||
+        plan_stages(cfg, &req, &b, &s) != 0) {
         fprintf(stderr, "Error: invalid 4-channel config\n");
         return -1;
     }
@@ -84,16 +124,17 @@ static int print_mem_budget(const FourAecNrResConfig* cfg) {
     printf("  AEC x4:         %9zu bytes (%7.1f KB)\n",
            b.aec_bytes, (float)b.aec_bytes / 1024.0f);
     printf("  FFT (OLA):      %9zu bytes (%7.1f KB)\n",
-           b.fft_bytes, (float)b.fft_bytes / 1024.0f);
+           s.fft_bytes, (float)s.fft_bytes / 1024.0f);
     printf("  NR (MMSE-LSA):  %9zu bytes (%7.1f KB)\n",
-           b.nr_bytes, (float)b.nr_bytes / 1024.0f);
+           s.nr_bytes, (float)s.nr_bytes / 1024.0f);
     printf("  Pipeline bufs:  %9zu bytes (%7.1f KB)\n",
-           b.wrapper_bytes,
-           (float)b.wrapper_bytes / 1024.0f);
+           s.total - b.aec_bytes - ALIGN16(s.fft_bytes) - ALIGN16(s.nr_bytes),
+           (float)(s.total - b.aec_bytes - ALIGN16(s.fft_bytes) -
+                   ALIGN16(s.nr_bytes)) / 1024.0f);
     printf("  --------------------------------------\n");
     printf("  Total:          %9llu bytes (%7.1f KB)\n",
-           (unsigned long long)req.bytes,
-           (float)req.bytes / 1024.0f);
+           (unsigned long long)s.total,
+           (float)s.total / 1024.0f);
     printf("  Descriptor:     descriptor_version=%u alignment=%u "
            "layout_version=%u backend_id=%u (%s) "
            "build_flags_hash=0x%08x\n\n",
@@ -189,15 +230,18 @@ int main(int argc, char* argv[]) {
      * aec_nr_pipeline_static.c. malloc is a host stand-in for the board
      * memory manager; the pipeline owns none of this memory. */
     FourAecNrResMemReq req;
-    if (four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0) {
+    FourAecNrResMemBreakdown bd;
+    Stages st;
+    if (four_aec_nr_res_get_mem_requirements(&cfg, &req) != 0 ||
+        four_aec_nr_res_get_mem_breakdown(&cfg, &bd) != 0 ||
+        plan_stages(&cfg, &req, &bd, &st) != 0) {
         fprintf(stderr, "Error: invalid config\n");
         return 1;
     }
 
-    void* pool = malloc((size_t)req.bytes);
+    void* pool = malloc(st.total);
     if (!pool) {
-        fprintf(stderr, "Error: malloc failed (%llu bytes)\n",
-                (unsigned long long)req.bytes);
+        fprintf(stderr, "Error: malloc failed (%zu bytes)\n", st.total);
         return 1;
     }
     if (((uintptr_t)pool) % req.alignment != 0) {
@@ -207,9 +251,27 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    FourAecNrRes* pipe =
-        four_aec_nr_res_init(pool, (size_t)req.bytes, &cfg);
+    /* Carve: front end, then the stages. */
+    uint8_t* cur = (uint8_t*)pool;
+    FourAecNrRes* pipe = four_aec_nr_res_init(pool, (size_t)req.bytes, &cfg);
+    cur += (size_t)req.bytes;
     if (!pipe) {
+        free(pool);
+        return 1;
+    }
+    AecRes* res = aec_res_init(cur, st.res_bytes, &st.res_cfg);
+    cur += ALIGN16(st.res_bytes);
+    AnrDenoiser* nr = se_anr_stage_init(cur, st.nr_bytes, &st.nr_cfg);
+    cur += ALIGN16(st.nr_bytes);
+    AcStftConfig scfg;
+    ac_stft_config_default(&scfg, bd.fft_size);
+    AcIstft* istft = ac_istft_init(cur, st.synth_bytes, &scfg);
+    cur += ALIGN16(st.synth_bytes);
+    float* total_gain = (float*)cur; cur += st.vec_bytes;
+    float* extra_noise = (float*)cur; cur += st.vec_bytes;
+    Complex* spec = (Complex*)cur;
+    if (!res || !nr || !istft) {
+        four_aec_nr_res_destroy(pipe);
         free(pool);
         return 1;
     }
@@ -248,17 +310,21 @@ int main(int argc, char* argv[]) {
         for (k = 0; k < n_freqs; ++k)
             weights[(size_t)ch * n_freqs + k].r = 0.25f;
     }
+    uint32_t rng = SE_CNG_RNG_SEED;
 
     /* === Processing loop === */
     int frame;
     for (frame = 0; frame < 6; ++frame) {
-        FourAecNrResPreFrame pre;
+        FourAecFront front;
+        SeSpecFrame f;
+        const float* res_gain;
+        const float* nr_gain;
         fill_hop(mic_buf, ref_buf, hop, sample_rate, frame);
-        if (four_aec_nr_res_process_pre(
-                pipe, mic_buf, ref_buf, &pre) != FOUR_AEC_NR_RES_OK ||
-            four_aec_nr_res_process_post(
-                pipe, &pre.token, weights, out_buf) !=
-                FOUR_AEC_NR_RES_OK) {
+        if (four_aec_front_process(
+                pipe, mic_buf, ref_buf, &front) != FOUR_AEC_NR_RES_OK ||
+            four_aec_fuse(pipe, weights, NULL, &f) != FOUR_AEC_NR_RES_OK ||
+            !(res_gain = se_res_stage_gain(res, &f)) ||
+            !(nr_gain = se_anr_stage_gain(nr, &f, extra_noise, !legacy))) {
             fprintf(stderr, "Error: 4AEC pipeline process failed\n");
             four_aec_nr_res_destroy(pipe);
             free(pool);
@@ -268,6 +334,12 @@ int main(int argc, char* argv[]) {
             free(weights);
             return 1;
         }
+        sk_min_f32(total_gain, nr_gain, res_gain, n_freqs);
+        sk_capply_gain_f32(spec, f.e, total_gain, n_freqs);
+        if (!no_cng)
+            aec_cng_fill(&rng, spec, f.cn, res_gain, nr_gain,
+                         SE_CNG_NR_GAIN_FLOOR, n_freqs);
+        ac_istft_push(istft, spec, out_buf);
         for (k = 0; k < hop; ++k) {
             if (!isfinite(out_buf[k])) {
                 fprintf(stderr, "Error: non-finite output\n");

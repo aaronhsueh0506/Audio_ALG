@@ -1,19 +1,27 @@
 /**
  * 4ch_aec_bf_nr_res/4aec_nr_res.h
  *
- * Four-microphone linear-AEC front end with one shared far aligner and one
- * post-beam NR/RES path.
+ * Four-microphone linear-AEC front end with one shared far aligner.
  *
- * The external owner supplies SRP-PHAT/GSC. This module deliberately owns:
+ * The external owner supplies SRP-PHAT/GSC. This module owns:
  *
  *   1 shared DelayAec3 matcher
  *   4 independent linear AEC adaptive filters
- *   1 coherent post-beam residual suppressor (an AecRes from aec_res.h)
- *   1 mono MMSE-LSA denoiser
- *   1 final inverse FFT / overlap-add path
+ *   the coherent projection of the four lane contexts onto one mono frame
  *
- * It does not select one microphone's RES gain and does not replicate NR/RES
- * per channel.
+ * It does not select one microphone's RES gain and does not replicate the
+ * residual-echo, noise-reduction or synthesis stages per channel. Those are
+ * not part of this module: the application carves them and chains them, once,
+ * over the SeSpecFrame that four_aec_fuse() returns
+ * (pipelines/common/se_stage.h). Per hop:
+ *
+ *   four_aec_front_process()   shared delay + four linear AEC lanes; the lane
+ *                              spectra go to the external SRP-PHAT/GSC
+ *   (SRP-PHAT, GSC)            effective weights and the beamformed error
+ *   four_aec_fuse()            project near / R^2 / comfort noise with those
+ *                              weights -> SeSpecFrame
+ *   stages                     se_res_stage_gain(), se_anr_stage_gain(), ...
+ *   sk_min_f32 -> sk_capply_gain_f32 -> aec_cng_fill -> ac_istft_push
  *
  * The file layout, lifecycle, and naming intentionally mirror
  * pipelines/mono_aec_nr_res/audio_pipeline.h:
@@ -37,14 +45,8 @@
  *     ...
  *     four_aec_nr_res_destroy(p);  // releases create()'s one pool
  *
- * The only API-shape difference from the mono pipeline is that its one
- * process() call becomes process_pre() -> external beamformer ->
- * process_post(). Both construction paths use that same core and must be
- * byte-identical for the same inputs, weights, config, and backend.
- *
- * See pipelines/README.md ("4-ch integration") for the module table and
- * pipelines/4ch_aec_bf_nr_res/README.md for the full architecture writeup, the
- * pre/post hand-off contract with an external SRP-PHAT/GSC, and the
+ * See pipelines/README.md for the call flow and
+ * pipelines/4ch_aec_bf_nr_res/README.md for the architecture writeup and the
  * parity-limitation note on bounded vs unbounded R2 in the post-beam RES.
  */
 #ifndef FOUR_AEC_NR_RES_H
@@ -55,6 +57,7 @@
 
 #include "aec.h"
 #include "anr.h"
+#include "common/se_stage.h"    /* SeSpecFrame */
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,113 +70,14 @@ extern "C" {
  * ========================================================================== */
 
 #define FOUR_AEC_NR_RES_DESCRIPTOR_VERSION 1u
-/* Current layout: three hop-sized working buffers. Per-lane RES spectra are
- * borrowed from each AEC instance and are valid only until that lane is
- * processed or reset again. Query a fresh descriptor for every build; do not
- * persist or synthesize one from this version number.
- *
- * 2026-08-13 PreFrame ABI note: FourAecNrResPreFrame gained a trailing
- * `aligned_ref` field (see its doc comment). That struct is a caller-stack
- * hand-off, not part of the pool carve, so this layout_version is
- * deliberately NOT bumped -- the pool byte layout is unchanged. It is still
- * a recompile-the-world struct change for out-of-tree callers embedding
- * FourAecNrResPreFrame by value.
- *
- * 7 -> 9 is +2 because this revision carries TWO independent carve changes,
- * each of which alone would have required a bump (see the token string in
- * four_aec_nr_res_build_flags_hash()):
- *   8: the post-beam stage became conditional on the new cfg.enable_post --
- *      the NR/iFFT/hop1/complex4/float6/fftfloat3/postsg regions are no
- *      longer carved at all for a pre-only instance, which the token now
- *      spells as post?(...).
- *   9: the delay estimator and the shared reference delay ring became
- *      conditional on the new cfg.delay_mode -- carved for MATCHED only,
- *      spelled delayest?,delayring? (both were unconditional before).
- *  10: cfg gained delay_backward_quarantine_enabled + _s, and the control
- *      block gained the quarantine countdown pair. No new REGION and no
- *      change to the carve ORDER -- but FourAecNrResConfig is embedded in
- *      the control block, so the pool total moves (query
- *      four_aec_nr_res_get_mem_requirements() for the current figure rather
- *      than trusting a number restated here, which rots on the next bump). A
- *      descriptor captured from an older build therefore no longer sizes
- *      this one, which is exactly what this counter exists to say out loud;
- *      contrast the 2026-08-13 PreFrame note above, which did NOT bump
- *      because that struct lives on the caller's stack.
- *  11: the control block gained the shared-delay change admission (held
- *      candidate + its remaining life) and the two realign lane counters.
- *      Again no new REGION and no carve-order change, and again the control
- *      block is the first thing carved out of the pool, so the pool total
- *      moves and every offset after it with it. build_flags_hash is computed
- *      over the carve TOKEN and so does not move on a control-block-only
- *      change: this counter is the whole signal that a descriptor from a
- *      version-10 build must be refused, including when its cached byte
- *      count still covers the current pool.
- *  12: sizeof(Aec) grew (the suppressor gained its runtime far-active floor
- *      retarget state), and every lane plus the shared post suppressor is
- *      carved out of this pool, so the total and every offset after the first
- *      lane move. No new REGION and no carve-order change, so the token --
- *      and therefore build_flags_hash -- is unchanged again; this counter is
- *      the only signal.
- *  13: the control block gained the per-hop stage-timing record
- *      (FourAecNrResLastTiming, 32 B -- see four_aec_nr_res_get_last_timing()
- *      below). Control-block-only again: no new REGION, no carve-order
- *      change, build_flags_hash unmoved, so this counter is once more the
- *      whole signal. The size was not a choice: the pre-change control block
- *      was 2848 B = 16 x 178 exactly, so ALIGN16 had zero slack and ANY added
- *      state moves the pool -- measured, a 24 B record rounds to the same
- *      +32 B pool growth as the 32 B one, so nothing smaller would have
- *      avoided this bump.
- *  14: sizeof(Aec) grew (each lane gained its own per-hop stage-timing
- *      record -- aec_get_last_timing(), aec.h -- which is what turns
- *      frontend_us/lane_res_us from documented zeros into measurements), so
- *      all four lanes move the total and every offset after the first lane.
- *      Carve token unchanged, so build_flags_hash is again blind and this
- *      counter is the only signal.
- *  15: the control block gained the fuse stage's per-hop far-end provenance
- *      flag and the matched-filter duty-cycle machine's state and census
- *      (see four_aec_nr_res_duty_hops_total() below). Control-block-only
- *      again -- no new REGION, no carve-order change, build_flags_hash
- *      unmoved -- so this counter is once more the whole signal.
- *
- *      The same release pins lib/aec at the hop-cost revision, where
- *      sizeof(Aec) grew 5832 -> 5848 B and the per-instance pool grew by a
- *      per-grid constant (+5,664 B @16 kHz/256, +5,120 B @16 kHz/512,
- *      +18,464 B @48 kHz/1024 -- four lanes here, so four times that). That
- *      moves the total and every offset after the first lane as well. Two
- *      reasons to refuse a version-14 descriptor, one release unit, one
- *      bump: this counter is not incremented twice for the same ship.
- *
- *  16: FourAecNrResConfig gained enable_nr and the MMSE-LSA region became
- *      conditional on it. The default (enable_nr=1) retains the prior carve,
- *      while RES-only instances omit the NR state but retain the shared RES,
- *      FFT and WOLA regions. Both the embedded config size and the set of
- *      possible carves changed, so persisted version-15 descriptors must be
- *      refused even when their byte count happens to be large enough. This
- *      is also a C struct-ABI change: callers must be rebuilt with this
- *      header and must not mix a version-15 object with a version-16 library.
- *
- *  17: FourAecNrResConfig gained enable_near_end_protect and enable_res.
- *      The default carve is unchanged -- the lift owns no state -- so the
- *      byte count cannot signal this and the counter must: the embedded
- *      config grew, every field after it in a wrapper's control block moved,
- *      and the same descriptor now describes a post path whose default
- *      output differs. With enable_res = 0 the post SG storage leaves the
- *      carve, and with either enable_res or enable_nr at 0 an n-float unity
- *      gain vector joins it, so the set of possible carves changed too. C
- *      struct-ABI change as well: rebuild callers against this header.
- *
- *  18: FourAecNrResConfig lost enable_near_end_protect, and the post path
- *      lost the near-end floor lift with it: total_gain is min(G_nr, G_res)
- *      as computed, with no state of its own. The carve is unchanged, so the
- *      byte count cannot signal this; the embedded config shrank (C struct
- *      ABI), every field after it in a wrapper's control block moved, and the
- *      lifted post path a version-17 config could select no longer exists.
- *      The default output is unchanged: the lift was off by default.
- *
- *  The external post-filter seam (process_post_view() and
- *  synthesize_external(), consumed by the DFN2 wrapper) added public entry
- *  points only: no struct, config or carve change, so it did not consume a
- *  layout number. */
+/* Carve layout version of the pool: the control block, the four lane pools,
+ * the working buffers (mic lane, aligned reference and, when cfg.enable_post,
+ * the fuse buffers) and the shared delay estimator and ring. Per-lane spectra
+ * are borrowed from each AEC instance and are valid only until that lane is
+ * processed or reset again. The residual-echo, noise-reduction and synthesis
+ * stages are carved by the application, not here. Query a fresh descriptor
+ * for every build; do not persist or synthesize one from this version
+ * number. */
 #define FOUR_AEC_NR_RES_LAYOUT_VERSION 18u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
@@ -290,20 +194,20 @@ typedef struct FourAecNrResConfig {
     float max_delay_ms;           /* MATCHED reference delay-line capacity   */
     AecPreset aec_preset;
     AnrMode nr_mode;
-    int enable_post;              /* direct core: 1=RES/NR/iFFT, 0=pre-only (its
-                                    * lanes then keep only the linear half of the
-                                    * AEC context: AEC_CONTEXT_LINEAR_ONLY);
-                                    * complete wrappers require caller value 1.
-                                    * Outranks enable_res/enable_nr: with 0 the
-                                    * post stage does not exist and both are
-                                    * inert; with 1 they select its two gain
-                                    * sources independently (both 0 = the
-                                    * beamformed linear error, synthesised). */
-    int enable_res;               /* bool: run the shared post-beam RES; when
-                                    * 0, G_res is unity, total_gain is the NR
-                                    * gain alone and CNG has nothing to fill  */
-    int enable_nr;                /* bool: run shared MMSE-LSA; when 0, the
-                                    * post path remains RES+CNG+iFFT/WOLA */
+    int enable_post;              /* 1 = the frequency-domain post context is kept:
+                                    * the lanes compute R^2 and comfort noise and
+                                    * the core carves the fuse buffers
+                                    * four_aec_fuse() needs; 0 = front only (the
+                                    * lanes keep the linear half of the AEC
+                                    * context: AEC_CONTEXT_LINEAR_ONLY). The
+                                    * complete 4-channel pipelines require 1,
+                                    * the neural 4-channel pipeline 0.        */
+    /* The next four fields configure the application's own post-beam stages
+     * (stage sizes and configurations: four_aec_nr_res_stage_configs()). The
+     * core validates them and reads none. */
+    int enable_res;               /* bool: run the post-beam RES; when 0, G_res
+                                    * is unity and CNG has nothing to fill    */
+    int enable_nr;                /* bool: run the MMSE-LSA denoiser         */
     int enable_cng;               /* bool                                   */
     int legacy_amin;              /* bool: do not fold R2 into NR prior      */
 } FourAecNrResConfig;
@@ -362,93 +266,45 @@ typedef struct FourAecNrResDelayState {
 } FourAecNrResDelayState;
 
 /**
- * Opaque ownership/ordering token returned by process_pre().
- * Callers must copy it without modification and return it to process_post().
- *
- * instance_epoch guards a caller-owned-pool ABA case that frame_index/
- * generation/owner_cookie alone cannot: destroy() never releases caller
- * memory, so a caller may init_ex() a brand-new instance into the exact same
- * pool bytes. init_ex() memsets that pool to zero, so the new instance's
- * frame_index/generation start at 0 again and owner_cookie (the instance
- * pointer) is identical to the destroyed instance's -- a token captured
- * before destroy() would otherwise be bit-identical to a token the new
- * instance mints for its own first frame. instance_epoch is stamped from a
- * process-wide monotonic counter at construction time (never read back from
- * the -- possibly reused -- pool bytes themselves), so it differs across any
- * two constructions even when every other field coincides.
+ * What the front end returns for one hop (see four_aec_front_process()). Every
+ * pointer is a read-only view into a lane's or the core's own per-hop buffer;
+ * nothing is copied. The view is valid until the next four_aec_front_process(),
+ * four_aec_nr_res_reset() or four_aec_nr_res_destroy() on the same instance --
+ * the lanes overwrite these buffers in place on their next hop, and a reset does
+ * not clear them.
  */
-typedef struct FourAecNrResFrameToken {
-    uint64_t frame_index;
-    uint64_t generation;
-    uintptr_t owner_cookie;
-    uint64_t instance_epoch;
-} FourAecNrResFrameToken;
-
-typedef struct FourAecNrResPreFrame {
-    FourAecNrResFrameToken token;
+typedef struct FourAecFront {
     FourAecNrResDelayState delay;
     int hop_size;
     int n_channels;               /* always FOUR_AEC_NR_RES_CHANNELS        */
     int n_freqs;
 
     /**
-     * Read-only interleaved formed linear-AEC output [hop_size][4]:
-     * linear_interleaved[sample * 4 + channel].
-     * Each channel is the exact selected/crossfaded time-domain hop
-     * underlying linear_spectra[channel], before the downstream WOLA
-     * synthesis. An external time-domain beamformer that performs its own
-     * sqrt-Hann analysis must consume this signal rather than the standalone
-     * AEC's separately limited return value.
-     *
-     * This is a pipeline-owned scratch buffer (each lane's formed_hop is
-     * copied into it, not aliased) -- unlike linear_spectra below, it is not
-     * a view into any lane's own memory. Still only safe to read for one
-     * frame: valid until process_post(), reset(), or destroy(), same as the
-     * rest of this struct. Only one pre frame may be in flight.
-     */
-    const float* linear_interleaved;
-
-    /**
-     * Read-only channel pointers to the exact linear-AEC error spectra used
-     * later by process_post(). Shape: linear_spectra[channel][n_freqs].
-     *
-     * This lets an external SRP-PHAT/GSC consume the existing analysis
-     * transform instead of performing a duplicate STFT. Unlike
-     * linear_interleaved above, these pointers alias each lane's own live
-     * per-hop AEC buffer rather than a pipeline-owned copy -- reset() does
-     * NOT guarantee the underlying memory is cleared or overwritten (a
-     * lane's old spectrum may simply be left in place), so there is no
-     * memory-corruption tripwire to rely on. What actually makes these safe
-     * to use is the pending/token gate (this file rejects a stale token, so
-     * process_post() itself can never read them after an intervening
-     * reset()) plus the API lifetime contract every caller must honor:
-     * valid until process_post(), reset(), or destroy(), identical to
-     * linear_interleaved above -- a caller that keeps reading these past
-     * reset()/destroy() is relying on undefined content, not "the old
-     * hop's data, still correct by coincidence".
+     * The exact linear-AEC error spectra of this hop, one per channel
+     * (n_freqs bins, audio scale). An external SRP-PHAT/GSC consumes these
+     * instead of performing a duplicate STFT.
      */
     const Complex* linear_spectra[FOUR_AEC_NR_RES_CHANNELS];
 
     /**
-     * Read-only view of the delay-aligned time-domain far reference actually
-     * fed to every AEC lane this hop: aligned_ref[hop_size]. Content is the
-     * caller's ref stream shifted by delay.delay_samples on every hop the
-     * shared ring can serve that offset, and the caller's RAW ref hop on the
-     * hops before it can (lib/aec's rule: while the seam is not aligned, the
-     * content is the raw far). The switch is whole-hop and coincides with
-     * `delay.solid` under FIXED, so this buffer never splices raw and shifted
-     * audio inside one hop.
-     *
-     * Like linear_interleaved above, this is a pipeline-owned buffer (the
-     * shared delay line's per-hop output, not a lane alias) and follows the
-     * exact same lifetime contract: only safe to read for one frame -- valid
-     * until process_post(), abandon_pre(), reset(), or destroy(); only one
-     * pre frame may be in flight. Intended consumer: an external neural
-     * post-filter that needs the SAME aligned far the linear filters
-     * consumed (e.g. the Align-ULCNet post stage's far branch).
+     * The time-domain hop underlying each linear_spectra[channel] (hop_size
+     * samples, before any synthesis). An external time-domain beamformer that
+     * performs its own sqrt-Hann analysis consumes this rather than the
+     * standalone AEC's separately limited return value.
+     */
+    const float* formed_hop[FOUR_AEC_NR_RES_CHANNELS];
+
+    /**
+     * The delay-aligned far reference actually fed to every AEC lane this hop
+     * (hop_size samples): the caller's ref stream shifted by
+     * delay.delay_samples on every hop the shared ring can serve that offset,
+     * and the caller's RAW ref hop on the hops before it can. The switch is
+     * whole-hop and coincides with `delay.solid` under FIXED. Intended
+     * consumer: an external neural post-filter that needs the SAME aligned far
+     * the linear filters consumed.
      */
     const float* aligned_ref;
-} FourAecNrResPreFrame;
+} FourAecFront;
 
 typedef struct FourAecNrRes FourAecNrRes;
 
@@ -520,160 +376,89 @@ FourAecNrRes* four_aec_nr_res_init_ex(
  * ========================================================================== */
 
 /**
- * Run the shared aligner and four linear
- * AEC filters.
+ * Stage 1: the shared aligner and the four linear AEC filters.
  *
- * microphones_interleaved is [hop][4], ref is [hop]. Both are read only.
- * A second pre() before the matching post() returns SEQUENCE_ERROR.
+ * microphones_interleaved is [hop][4], ref is [hop]. Both are read only. On
+ * OK, *out is the borrowed front view of this hop (see FourAecFront). The
+ * previous hop's view and every SeSpecFrame fused from it are invalidated.
  *
- * @return FOUR_AEC_NR_RES_OK on success (*out filled, token valid until the
- *         matching process_post()/reset()/destroy()); FOUR_AEC_NR_RES_INVALID_ARGUMENT
- *         on a NULL p/microphones_interleaved/ref/out; FOUR_AEC_NR_RES_SEQUENCE_ERROR
- *         if a pre frame is already pending.
+ * @return FOUR_AEC_NR_RES_OK on success; FOUR_AEC_NR_RES_INVALID_ARGUMENT on a
+ *         NULL p/microphones_interleaved/ref/out or a non-finite sample;
+ *         FOUR_AEC_NR_RES_DSP_ERROR when a lane refused the hop (the instance
+ *         has been reset).
  */
-int four_aec_nr_res_process_pre(
+int four_aec_front_process(
     FourAecNrRes* p,
     const float* microphones_interleaved,
     const float* ref,
-    FourAecNrResPreFrame* out);
+    FourAecFront* out);
 
 /**
- * Resume one pre frame after the external SRP-PHAT/GSC has updated its
- * effective frequency-domain weights.
+ * Stage 2: project the front frame with the beamformer's effective weights and
+ * return the frame the frequency-domain stages consume.
  *
- * weights is channel-major Complex[4][n_freqs] and uses:
+ * weights is channel-major Complex[4][n_freqs] and uses
  *
  *   output[bin] = sum(weights[channel,bin] * input[channel,bin])
  *
- * without conjugation. The module coherently projects the four AEC spectra,
- * calculates one post-beam RES gain, fuses it with one NR gain, and writes
- * one final mono hop to out.
+ * without conjugation. The module projects the four lanes' near spectra,
+ * residual-echo powers and comfort noise with those weights, and fills *frame
+ * (pipelines/common/se_stage.h): e = the beamformed error, y = the projected
+ * near spectrum, x = lane 0's far spectrum, r2 and cn = the projected
+ * residual-echo and comfort-noise PSDs, far_hop = the aligned far, max_dt /
+ * max_sat / all_converged taken over the lanes the weights give a nonzero
+ * response, clock_drift and the delay flags of the shared aligner;
+ * g_res_ctx is NULL (the lanes compute no gain of their own).
  *
- * The external beamformer does not need to return a duplicate mono hop:
- * synthesis is performed from the coherently weighted spectra here. For a
- * multi-frame/time-domain GSC, weights must be its exact effective response
- * for this frame.
+ * beamformed_error is the mono error spectrum produced by the SAME external
+ * beamformer invocation as `weights` (the bundled gsc_process_with_weights()
+ * returns both atomically). Both arrays are checked for finite values, but
+ * their semantic equality cannot be inferred from samples alone and is a
+ * caller contract. Pass NULL to have the error reconstructed from `weights`;
+ * the reconstruction cannot disagree with them. The frame's e then aliases an
+ * instance-owned buffer; a supplied spectrum stays caller-owned and must
+ * outlive the frame.
  *
- * @return FOUR_AEC_NR_RES_OK on success (*out fully written, token
- *         consumed); FOUR_AEC_NR_RES_INVALID_ARGUMENT on a NULL
- *         p/token/weights/out or all-zero weights (the pending frame is
- *         left intact so the caller may correct and retry -- see
- *         "process_pre"/"process_post" ordering above); FOUR_AEC_NR_RES_SEQUENCE_ERROR
- *         if token does not match the pending frame (replay, cross-instance
- *         use, or a token invalidated by an intervening reset()).
+ * All pointers in *frame alias instance-owned per-hop storage (a supplied
+ * beamformed_error excepted) and are valid until the next
+ * four_aec_front_process(), reset or destroy. Requires cfg.enable_post.
+ *
+ * @return FOUR_AEC_NR_RES_OK on success; FOUR_AEC_NR_RES_INVALID_ARGUMENT on a
+ *         NULL p/weights/frame, an all-zero or non-finite weight set, or a
+ *         core with enable_post = 0 (nothing is changed, the caller may
+ *         correct and retry); FOUR_AEC_NR_RES_SEQUENCE_ERROR when no front
+ *         frame has been processed since construction or the last reset;
+ *         FOUR_AEC_NR_RES_DSP_ERROR when the lanes do not share one far-end
+ *         spectrum or a spectrum is non-finite (the instance has been reset).
  */
-int four_aec_nr_res_process_post(
+int four_aec_fuse(
     FourAecNrRes* p,
-    const FourAecNrResFrameToken* token,
-    const Complex* weights,
-    float* out);
-
-/**
- * Resume one pre frame using a mono error spectrum already produced by the
- * same external beamformer invocation as `weights`.
- *
- * This is the zero-reconstruction form of process_post(): beamformed_error is
- * Complex[n_freqs] and must equal the weighted sum represented by the supplied
- * channel-major Complex[4][n_freqs] weights for this pending frame. Both
- * arrays are checked for finite values, but their semantic equality cannot be
- * inferred from samples alone and is therefore a caller contract. Use this
- * entry point when one atomic beamformer API returns both objects (the bundled
- * gsc_process_with_weights() does); otherwise use process_post(), which
- * reconstructs the mono error from weights and cannot accept a mismatched
- * spectrum. The remaining near/R2/comfort projections and the mono
- * NR/RES/IFFT/OLA path are identical between the two entry points.
- *
- * Return codes and token-consumption rules are identical to process_post().
- */
-int four_aec_nr_res_process_post_trusted_spectrum(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token,
     const Complex* weights,
     const Complex* beamformed_error,
-    float* out);
-
-/** External post-filter seam (the DFN2 wrapper): run one hop of the
- * conventional post path -- fuse, post-beam RES, gain fusion and the
- * comfort-noise fill -- and hand back the spectra instead of synthesising.
- * `beamformed_error` is the coherent projection reconstructed from `weights`,
- * or `trusted_beamformed_error` when one is supplied (same caller contract
- * as process_post_trusted_spectrum()): the spectrum RES was estimated from.
- * `post_spectrum` is beamformed_error * G_res plus comfort noise -- exactly
- * what process_post() would have synthesised. Both alias instance-owned
- * per-hop storage (a trusted beamformed_error stays caller-owned), are
- * four_aec_nr_res_n_freqs() long and are valid until the next call on
- * `p`. The pending token is consumed on
- * success. Requires enable_post=1, enable_res=1 and enable_nr=0: with NR
- * disabled no MMSE-LSA instance exists, so a caller mixing this seam with
- * process_post() can never leave one half-stepped. Return codes and token
- * rules as process_post(); on DSP_ERROR the instance has been reset. The hop
- * is then finished with four_aec_nr_res_synthesize_external().
- */
-typedef struct FourAecNrResPostView {
-    const Complex* beamformed_error;   /* Complex[n_freqs] */
-    const Complex* post_spectrum;      /* Complex[n_freqs] */
-} FourAecNrResPostView;
-
-int four_aec_nr_res_process_post_view(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token,
-    const Complex* weights,
-    const Complex* trusted_beamformed_error,
-    FourAecNrResPostView* out);
-
-/** Synthesize one externally processed spectrum through this core's own
- * sqrt-Hann iFFT/OLA state: the identical synthesis process_post() performs,
- * so the OLA stays continuous across hops finished either way. Follows
- * process_post_view(). Requires enable_post=1; a non-finite spectrum or
- * output resets the instance and returns DSP_ERROR. */
-int four_aec_nr_res_synthesize_external(
-    FourAecNrRes* p,
-    const Complex* spectrum,
-    float* out);
+    SeSpecFrame* frame);
 
 /**
- * Release one pending pre frame WITHOUT running this module's post-beam
- * RES/NR/synthesis path. Companion to process_pre() for pipeline variants
- * whose post stage is external (e.g. the Align-ULCNet neural post-filter
- * wrapper, which consumes linear_spectra/aligned_ref and replaces
- * process_post() entirely).
- *
- * Consumes the token exactly like a successful process_post() would (the
- * next process_pre() is legal again; all PreFrame pointers become invalid),
- * but advances NO downstream state: the mono NR, the post-beam RES, and this
- * module's own synthesis OLA are untouched. A stream that interleaves
- * abandoned and posted frames therefore resumes process_post() with a
- * synthesis OLA that is missing the abandoned hops -- this call is intended
- * for pipelines that never call any process_post() variant at all, not for
- * per-hop mixing.
- *
- * @return FOUR_AEC_NR_RES_OK on success; FOUR_AEC_NR_RES_INVALID_ARGUMENT on
- *         a NULL p/token; FOUR_AEC_NR_RES_SEQUENCE_ERROR if token does not
- *         match the pending frame (no frame pending, replay, cross-instance
- *         use, or a token invalidated by an intervening reset()).
+ * The configurations the application's own post-beam stages need, derived on
+ * the core's grid exactly as the core derived its lane configuration: res_cfg
+ * sizes and initialises the AecRes (aec_res_get_mem_size / aec_res_init) and
+ * nr_cfg the denoiser (se_anr_stage_mem_size / se_anr_stage_init). Returns 0,
+ * or -1 for a NULL argument or a config the core would reject.
  */
-int four_aec_nr_res_abandon_pre(
-    FourAecNrRes* p,
-    const FourAecNrResFrameToken* token);
+int four_aec_nr_res_stage_configs(
+    const FourAecNrResConfig* cfg,
+    AecConfig* res_cfg,
+    AnrConfig* nr_cfg);
 
 /**
- * Reset all delay/AEC/NR/RES/OLA state. Invalidates a pending pre-frame token.
+ * Reset all delay/AEC state. Invalidates the front view and every frame fused
+ * from it.
  *
- * A caller holding an outstanding FourAecNrResPreFrame from a still-pending
- * process_pre() must stop reading its linear_interleaved/linear_spectra
- * pointers the instant this is called, not just once a later process_post()
- * call would reject the now-stale token. This is an API-contract rule, not a
- * memory-safety guarantee enforced by this call: linear_interleaved is a
- * pipeline-owned copy that IS overwritten by the explicit memset below (not
- * by aec_reset()'s own per-lane resets, which touch each Aec's own internal
- * state, not this wrapper's buffer), but linear_spectra[channel]
- * aliases a lane's own AecResContext buffer, and aec_reset() does NOT
- * guarantee that buffer's old content is cleared or overwritten -- a lane's
- * stale spectrum may simply be left in place at the same address. Do not
- * rely on reading garbage/zeroed data as a way to detect a missed
- * invalidation; the pending/token gate is what keeps this file's own
- * process_post() from ever reading post-reset lane memory, and external
- * callers must independently honor the same rule.
+ * A caller holding an outstanding FourAecFront must stop reading its pointers
+ * the instant this is called. This is an API-contract rule, not a
+ * memory-safety guarantee enforced by this call: formed_hop and
+ * linear_spectra[channel] alias lane buffers that aec_reset() does not clear or
+ * overwrite, so a violation shows as stale content, not as a fault.
+ * four_aec_fuse() refuses to run until a new front frame has been processed.
  */
 void four_aec_nr_res_reset(FourAecNrRes* p);
 
@@ -690,7 +475,7 @@ void four_aec_nr_res_destroy(FourAecNrRes* p);
 
 /**
  * Heap convenience wrapper over get_mem_requirements() + init(). All memory
- * is allocated here; process_pre/post perform no allocation. Returns NULL for
+ * is allocated here; front_process/fuse perform no allocation. Returns NULL for
  * an invalid config or allocation failure.
  */
 FourAecNrRes* four_aec_nr_res_create(const FourAecNrResConfig* cfg);
@@ -705,19 +490,16 @@ int four_aec_nr_res_n_freqs(const FourAecNrRes* p);
 int four_aec_nr_res_sample_rate(const FourAecNrRes* p);
 
 /* Structural audit hooks. The matcher count is 1 only in MATCHED mode and 0
- * in FIXED/EXTERNAL; the other values are 4 /
- * (enable_post && enable_nr) / (enable_post && enable_res). */
+ * in FIXED/EXTERNAL; the linear AEC count is 4. */
 int four_aec_nr_res_matched_filter_count(const FourAecNrRes* p);
 int four_aec_nr_res_linear_aec_count(const FourAecNrRes* p);
-int four_aec_nr_res_nr_count(const FourAecNrRes* p);
-int four_aec_nr_res_post_res_count(const FourAecNrRes* p);
 
 /* Group 6 instrumentation, read-only: sum of aec_far_fft_real_compute_count()
  * across all four lanes (cumulative since construction or the last
  * four_aec_nr_res_reset()). Lane 0 runs its own far-end FFT every hop
  * (aec_process_context()); lanes 1-3 borrow lane 0's spectrum instead of
  * recomputing it (aec_process_context_shared_far()) -- so this total
- * increments by exactly 1 per four_aec_nr_res_process_pre() call, not 4.
+ * increments by exactly 1 per four_aec_front_process() call, not 4.
  * Intended for tests/instrumentation proving the cross-lane far-FFT
  * sharing is genuinely active; has no effect on any processing. */
 long four_aec_nr_res_far_fft_real_compute_count(const FourAecNrRes* p);
@@ -768,81 +550,13 @@ int four_aec_nr_res_pending_delay_candidate(const FourAecNrRes* p);
 unsigned long long four_aec_nr_res_duty_hops_total(const FourAecNrRes* p);
 unsigned long long four_aec_nr_res_duty_hops_run(const FourAecNrRes* p);
 
-/* ── Runtime strength control ─────────────────────────────────────────────
- *
- * Retarget the residual-echo strength on a RUNNING core.
- *
- * IMPORTANT, and the reason this exists rather than the caller looping over
- * the lanes: the four AEC lanes are built with spatial_linear_context, so
- * none of them ever reaches its own suppression-gain path. Their floors shape
- * nothing. The gain that multiplies this core's output -- and that scales the
- * injected comfort noise -- comes from the single shared post-stage
- * suppressor, so that is what this retargets. Calling aec_set_preset() on the
- * lanes instead is a provable no-op.
- *
- * ramp_ms is forwarded to the suppressor: 0 applies on the next hop, a
- * positive value walks there linearly in dB. See aec.h for why that matters
- * (mild <-> aggressive is an 18 dB step into a hard clamp).
- *
- * What to expect when measuring: the far-active floor is only in force on
- * far-active, non-double-talk hops. During double-talk this core forces the
- * DT floor, which is identical across all three presets, and before the
- * far-active latch fires the far-silent floor applies instead. An A/B that
- * averages over a whole recording will therefore see a smaller move than the
- * dB step suggests, and it will also see the comfort-noise level shift.
- *
- * Requires enable_post and enable_res (with enable_post = 0 there is no
- * suppressor and no NR instance at all; with enable_res = 0 the suppressor
- * is not built). Call between hops, serialised with process_pre/post; not
- * thread-safe. Returns 0, or -1 on NULL, an out-of-enum preset, an
- * out-of-range ramp_ms, or a core without a suppressor. Nothing is written
- * on -1. */
-int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset,
-                                   float ramp_ms);
-
-/* Read the shared post-stage far-active split floor, in linear power.
- *
- * `live` is what the suppressor applies right now -- it differs from `target`
- * only while a ramp is walking. `target` is the reset-surviving configured
- * value. Either pointer may be NULL.
- *
- * This is the one strength quantity worth logging from a board: it is what
- * actually shapes the output (the lanes' own floors shape nothing), and the
- * pair together says whether a requested change has finished landing.
- *
- * Returns 0, or -1 on NULL or a core without a suppressor (enable_post = 0 or
- * enable_res = 0). */
-int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live,
-                                     float* target);
-
-/* Retarget the noise-reduction strength on the ONE shared denoiser this core
- * owns (there is a single NR instance operating on the beamformed signal, not
- * one per lane).
- *
- * This recomposes THIS pipeline's own NR configuration -- the canonical
- * strength preset plus the overrides it has always applied on top -- and hands
- * the result to anr_reconfigure(). It deliberately does not call
- * anr_set_mode(), which composes the bare canonical preset and would
- * either be refused (its L differs from this pipeline's) or revert those
- * overrides.
- *
- * The noise floor, the min-tracking ring and the gain smoothing history all
- * carry on across the change; use four_aec_nr_res_reset() for a restart.
- *
- * Requires enable_post and enable_nr. Call between hops. Returns 0, or -1 on
- * NULL, an out-of-enum mode, a pre-only/NR-disabled core, or a rejected
- * target. */
-int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, AnrMode mode);
-
 /* ============================================================================
  * Diagnostic memory breakdown
  * ========================================================================== */
 
 typedef struct FourAecNrResMemBreakdown {
     size_t aec_bytes;       /* four AEC pools combined */
-    size_t nr_bytes;
-    size_t fft_bytes;
-    size_t wrapper_bytes;   /* control block + shared/post-beam state */
+    size_t wrapper_bytes;   /* control block + shared aligner and fuse buffers */
     size_t total_bytes;
     int hop_size;
     int fft_size;
@@ -858,86 +572,52 @@ int four_aec_nr_res_get_mem_breakdown(
  * Per-stage wall-clock cost of the most recent hop, in microseconds.
  *
  * Diagnostic only: nothing in the pipeline reads these back, and they do not
- * affect processing. The stamp is described at the end of this comment,
- * along with what a build that must carry no clock dependency at all
- * substitutes it with.
- *
- * WHICH STAGE EACH FIELD COVERS
+ * affect processing.
  *
  *   delay_us     update_shared_delay() -- the shared delay estimator only.
  *                align_render()'s ring-buffer copy and the realign sweep are
  *                deliberately outside it; they are not delay estimation.
  *   frontend_us  summed over the four lanes: each lane's work from entry up
  *                to its main filter (mic HPF, saturation, mu/RSA prep,
- *                shadow filter). Lane-internal delay work is NOT here -- it
- *                is added to delay_us above, where it is structurally zero
- *                because every lane is AEC_DELAY_EXTERNAL_ALIGNED.
+ *                shadow filter). Lane-internal delay work is added to
+ *                delay_us instead, where it is structurally zero because
+ *                every lane is AEC_DELAY_EXTERNAL_ALIGNED.
  *   linear_us    summed over the four lanes: each lane's main adaptive
  *                filter, including the far-end FFT on the lane that computes
  *                it (lanes 1-3 borrow it and pay less here).
  *   lane_res_us  summed over the four lanes: each lane's AEC3 post/RES block,
  *                which runs because the lanes set return_res_context even
- *                though enable_res is 0.
- *   fuse_us      fuse_contexts(): the beamformer-weighted projection of the
+ *                though no lane applies a gain.
+ *   fuse_us      four_aec_fuse(): the beamformer-weighted projection of the
  *                four lane contexts into one.
- *   res_us       the residual-echo suppression gain: one aec_res_process()
- *                call on the fused spectra.
- *   nr_us        the noise-reduction gain: the residual-echo prior it
- *                consumes plus anr_process_gain().
- *   synth_us     inverse transform, windowed overlap-add, and the hop
- *                emit/shift.
  *
- * WHERE THE FOUR AEC-SIDE FIGURES COME FROM
+ * The four AEC-side figures come from aec_get_last_timing() (aec.h), read once
+ * per lane and summed here. The lanes run sequentially inside one loop, so the
+ * sums are wall-clock costs of each stage across the whole loop. The stages do
+ * not add up to the enclosing call: align_render(), the realign sweep, the
+ * de-interleave, input validation and the AEC stages between the main filter
+ * and the post block fall in the caller's remainder. The stages the
+ * application chains after the fuse are timed by the application.
  *
- * aec_get_last_timing() (aec.h), read once per lane and summed here. The four
- * lanes run sequentially inside one loop, so the sums are wall-clock costs of
- * each stage across the whole loop, not averages. The lane loop's own
- * remainder -- the context bind and the hop copy into linear_interleaved,
- * plus the AEC stages between the main filter and the post block -- is not
- * attributed and falls into the caller's pre-stage remainder along with
- * align_render().
+ * RESOLUTION. Microseconds, so a stage faster than 1 us reads 0.
  *
- * The stages do not add up to the enclosing call: a caller presenting a full
- * breakdown must carry the remainder explicitly. The pre-side remainder holds
- * align_render(), the realign sweep, the de-interleave and input validation;
- * the post-side remainder holds the gain fusion and comfort-noise loop that
- * sit between the timed calls.
- *
- * RESOLUTION. Microseconds, so a stage faster than 1 us reads 0. On the
- * development host clock_getres(CLOCK_MONOTONIC) is itself 1 us (measured),
- * which puts fuse/res/synth at 0-2 us -- readable as an order of magnitude,
- * not as a precise figure. The stage this exists to find (linear_us, measured
- * at ~74% of the hop) is far above that floor. Storing nanoseconds in the same
- * uint32_t would give 1000x the resolution and still take 4.29 s to wrap, if
- * the fine end ever matters.
- *
- * ⚠ OFF BY DEFAULT, IN TWO HALVES. This record costs 37 clock reads per hop
- * -- nine here plus seven inside each of the four lanes -- so a release build
- * takes none of them and every field reads 0. Build with
- * -DFOUR_AEC_NR_RES_STAGE_TIMING=1 for the wrapper's own stages
- * (delay/fuse/res/nr/synth) and -DAEC_STAGE_TIMING=1 for the four summed off
- * the lanes (delay/frontend/linear/lane_res); `make PROFILE=1` sets both, which is
- * what a profile build should use. Setting one alone is legible rather than
- * broken: the other half simply reads 0.
- *
- * A display-side flag in the CONSUMER does not enable any of this. It decides
- * whether a breakdown is printed; these decide whether there is anything to
- * print. Built one way and read the other, the report renders zeros.
+ * OFF BY DEFAULT, IN TWO HALVES. A release build takes no clock reads and
+ * every field reads 0. Build with -DFOUR_AEC_NR_RES_STAGE_TIMING=1 for
+ * delay/fuse and -DAEC_STAGE_TIMING=1 for the four summed off the lanes
+ * (delay/frontend/linear/lane_res); `make PROFILE=1` sets both. Setting one
+ * alone is legible rather than broken: the other half simply reads 0.
  *
  * A target whose libc has no POSIX CLOCK_MONOTONIC combines the flags with
  * -DFOUR_AEC_NR_RES_NOW_US=<fn> (and lib/aec's own -DAEC_NOW_US=<fn>) to name
- * its microsecond timer -- see the stamp's comment in 4aec_nr_res.c. A
- * substitute that returns a constant keeps the flags on and reads 0 here,
- * which this record cannot distinguish from a build without them.
+ * its microsecond timer. A substitute that returns a constant keeps the flags
+ * on and reads 0 here, which this record cannot distinguish from a build
+ * without them.
  *
- * LIFETIME. The values describe the last hop that reached each stage. Each
- * half is cleared once its own call has been ACCEPTED -- after the argument
- * and token checks -- so a hop that starts and then bails out (a non-finite
- * input, a DSP error) reports zero for the stages it never reached rather
- * than the previous hop's numbers. A call rejected outright by those checks
- * leaves the whole record untouched. Read the record after process_post*()
- * returns; after process_pre() alone the post half still holds whatever the
- * previous completed hop left there.
+ * LIFETIME. The lane-side half is cleared once four_aec_front_process() has
+ * accepted its arguments, so a hop that then bails out reports zero for the
+ * stages it never reached; fuse_us is cleared by four_aec_fuse() the same
+ * way. A call rejected outright by its argument checks leaves the record
+ * untouched.
  */
 typedef struct FourAecNrResLastTiming {
      uint32_t delay_us;
@@ -945,9 +625,6 @@ typedef struct FourAecNrResLastTiming {
      uint32_t linear_us;
      uint32_t lane_res_us;
      uint32_t fuse_us;
-     uint32_t res_us;
-     uint32_t nr_us;
-     uint32_t synth_us;
 } FourAecNrResLastTiming;
 
 /* Copies the last hop's stage timings into `out`. A NULL/destroyed pipeline

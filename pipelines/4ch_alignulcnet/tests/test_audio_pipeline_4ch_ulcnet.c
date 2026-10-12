@@ -17,9 +17,9 @@
  *      hop. Applied delay 0 is the one value a value-only `changed` test
  *      cannot tell apart from "nothing accepted yet"; see the test's own
  *      header for the mutation that turns it red.
- *   3. core PreFrame extension: pre.aligned_ref non-NULL, byte-exact against
- *      an independently maintained delayed-far reference, delay lock on a
- *      delayed far, and the abandon_pre token protocol.
+ *   3. core front view: front.aligned_ref non-NULL, byte-exact against
+ *      an independently maintained delayed-far reference, and the delay lock
+ *      on a delayed far.
  *   4. pool rejection / 8-point descriptor gate / destroy idempotence /
  *      pool reuse, plus a short heap-vs-pool byte-equal run.
  *   5. far-timestamp before acquisition: far-passthrough model,
@@ -633,7 +633,7 @@ static int test_fixed_first_alignment_resets_model(void) {
 static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(FIXED_SEAM_SR);
     FourAecNrRes* core;
-    FourAecNrResPreFrame pre;
+    FourAecFront pre;
     float* microphones;
     float* far;
     float* far_hist;
@@ -669,7 +669,7 @@ static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) 
             far[i] = noise;
         }
         memset(&pre, 0, sizeof(pre));
-        CHECK(four_aec_nr_res_process_pre(
+        CHECK(four_aec_front_process(
                   core, microphones, far, &pre) == FOUR_AEC_NR_RES_OK,
               "FIXED seam hop processes");
         CHECK(pre.aligned_ref != NULL, "FIXED seam exposes aligned_ref");
@@ -704,9 +704,6 @@ static int fixed_seam_case(int fixed_delay, int frames, int expect_first_solid) 
             }
             aligned_hops += 1;
         }
-        CHECK(four_aec_nr_res_abandon_pre(core, &pre.token) ==
-                  FOUR_AEC_NR_RES_OK,
-              "FIXED seam pre frame releases");
     }
 
     snprintf(label, sizeof(label),
@@ -955,22 +952,20 @@ static int test_relock_same_delay_resets_model(void) {
 }
 
 /* ============================================================================
- * 3. Core PreFrame extension: aligned_ref + delay lock + abandon protocol
+ * 3. Core front view: aligned_ref + delay lock
  * ========================================================================== */
 
-static int test_core_aligned_ref_and_abandon(void) {
+static int test_core_aligned_ref(void) {
     enum { FRAMES = 240, TRUE_DELAY = 400 };
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
     FourAecNrRes* core;
-    FourAecNrResPreFrame pre;
-    FourAecNrResFrameToken first_token;
+    FourAecFront pre;
     float* microphones;
     float* far;
     float* far_hist;
     int hop;
     int locked = 0;
     int aligned_checked = 0;
-    int have_first_token = 0;
 
     cfg.fft_size = 512;
     cfg.enable_cng = 0;
@@ -985,22 +980,13 @@ static int test_core_aligned_ref_and_abandon(void) {
     far_hist = (float*)calloc((size_t)FRAMES * hop, sizeof(float));
     CHECK(microphones && far && far_hist, "allocate core-test buffers");
 
-    /* No frame pending yet: abandoning must be a sequence error. */
-    memset(&first_token, 0, sizeof(first_token));
-    CHECK(four_aec_nr_res_abandon_pre(core, &first_token) ==
-              FOUR_AEC_NR_RES_SEQUENCE_ERROR,
-          "abandon with no pending frame is rejected");
-    CHECK(four_aec_nr_res_abandon_pre(core, NULL) ==
-              FOUR_AEC_NR_RES_INVALID_ARGUMENT,
-          "abandon with NULL token is rejected");
-
     for (int frame = 0; frame < FRAMES; ++frame) {
         fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
-        /* Zero the whole out-struct first: if process_pre ever stopped
+        /* Zero the whole out-struct first: if four_aec_front_process ever stopped
          * assigning aligned_ref, the non-NULL check below would fail
          * instead of reading leftover stack garbage. */
         memset(&pre, 0, sizeof(pre));
-        CHECK(four_aec_nr_res_process_pre(
+        CHECK(four_aec_front_process(
                   core, microphones, far, &pre) == FOUR_AEC_NR_RES_OK,
               "core pre processes");
         CHECK(pre.aligned_ref != NULL,
@@ -1030,21 +1016,6 @@ static int test_core_aligned_ref_and_abandon(void) {
 
         if (pre.delay.solid && pre.delay.delay_samples > 0) locked = 1;
 
-        if (!have_first_token) {
-            first_token = pre.token;
-            have_first_token = 1;
-        } else {
-            /* A stale (older-frame) token must not release this frame. */
-            CHECK(four_aec_nr_res_abandon_pre(core, &first_token) ==
-                      FOUR_AEC_NR_RES_SEQUENCE_ERROR,
-                  "stale token cannot abandon the pending frame");
-        }
-        CHECK(four_aec_nr_res_abandon_pre(core, &pre.token) ==
-                  FOUR_AEC_NR_RES_OK,
-              "abandon releases the pending frame");
-        CHECK(four_aec_nr_res_abandon_pre(core, &pre.token) ==
-                  FOUR_AEC_NR_RES_SEQUENCE_ERROR,
-              "double abandon is rejected");
     }
 
     CHECK(locked,
@@ -2461,8 +2432,8 @@ static int run_all_tests(void) {
           "FIXED pre-lock seam serves the raw far byte for byte");
     CHECK(test_relock_same_delay_resets_model(),
           "relock on the same delay still resets the model (ALIGNED)");
-    CHECK(test_core_aligned_ref_and_abandon(),
-          "core PreFrame aligned_ref + abandon protocol");
+    CHECK(test_core_aligned_ref(),
+          "core front view aligned_ref");
     CHECK(test_pool_and_descriptor_gate(),
           "pool rejection / descriptor gate / destroy idempotence");
     CHECK(test_raw_far_timestamp_after_fixed_delay_lock(),

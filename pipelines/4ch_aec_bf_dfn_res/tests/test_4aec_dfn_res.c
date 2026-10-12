@@ -1,8 +1,9 @@
 /* 4aec_dfn_res acceptance test.
  *
  * Backbone gate: with the identity model (no callback) the wrapper must be
- * the conventional core with enable_nr=0, delayed by exactly two hops, byte
- * for byte, over both post entries (reconstructed and trusted spectrum) and
+ * the conventional chain with the denoiser off (ConvChain: the front end and
+ * the stages written out), delayed by exactly two hops, byte for byte, over
+ * both beamformed-error entries (reconstructed and trusted spectrum) and
  * with comfort noise OFF and ON. The stimulus is an echo delayed by 384
  * samples under the shared matched delay estimator; the test asserts the
  * estimator reported a delay change during the run (the "no reset on a
@@ -16,6 +17,7 @@
 
 #include "4aec_dfn_res.h"
 #include "tests/dfn_test_fixture.h"
+#include "../../4ch_aec_bf_nr_res/tests/conv_chain_4ch.h"
 
 #define TEST_FRAMES 64
 #define ECHO_DELAY 384
@@ -59,7 +61,7 @@ static void make_hop(float *mics, float *ref, int frame) {
     }
 }
 
-static void form_trusted(const FourAecNrResPreFrame *pre,
+static void form_trusted(const FourAecFront *pre,
                          const Complex *weights, Complex *out) {
     int ch, k;
     memset(out, 0, (size_t)DFN2_N_BINS * sizeof(*out));
@@ -88,7 +90,7 @@ static int run_identity(int trusted_mode, int enable_cng) {
     FourAecDfnResConfig dcfg = four_aec_dfn_res_default_config();
     FourAecNrResConfig ccfg = core_config(1, enable_cng);
     FourAecDfnRes *dfn;
-    FourAecNrRes *conventional;
+    ConvChain *conventional;
     Complex weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
     float mics[DFN2_HOP_LEN * FOUR_AEC_NR_RES_CHANNELS];
     float ref[DFN2_HOP_LEN];
@@ -107,33 +109,24 @@ static int run_identity(int trusted_mode, int enable_cng) {
         four_aec_dfn_res_lookahead_samples(dfn) != 3 * DFN2_HOP_LEN ||
         four_aec_dfn_res_get_bridge(dfn) != NULL)
         return 1;
-    conventional = four_aec_nr_res_create(&ccfg);
+    conventional = conv_create(&ccfg);
     if (!conventional) return 2;
     make_weights(weights);
 
     for (frame = 0; frame < TEST_FRAMES; ++frame) {
-        FourAecNrResPreFrame dp, cp;
+        FourAecFront dp;
         int any = 0;
         make_hop(mics, ref, frame);
-        if (four_aec_dfn_res_process_pre(dfn, mics, ref, &dp) != 0 ||
+        if (four_aec_dfn_res_front_process(dfn, mics, ref, &dp) != 0 ||
             !dp.linear_spectra[0])
             return 10 + frame;
         if (dp.delay.changed) ++delay_changes;
         if (trusted_mode) form_trusted(&dp, weights, trusted);
-        if ((trusted_mode
-             ? four_aec_dfn_res_process_post_trusted_spectrum(
-                   dfn, &dp.token, weights, trusted, dfn_out)
-             : four_aec_dfn_res_process_post(
-                   dfn, &dp.token, weights, dfn_out)) != 0)
+        if (four_aec_dfn_res_process(dfn, weights, trusted_mode ? trusted : NULL,
+                                     dfn_out) != 0)
             return 100 + frame;
-        if (four_aec_nr_res_process_pre(conventional, mics, ref, &cp) != 0 ||
-            (trusted_mode
-             ? four_aec_nr_res_process_post_trusted_spectrum(
-                   conventional, &cp.token, weights, trusted,
-                   conventional_out[frame])
-             : four_aec_nr_res_process_post(
-                   conventional, &cp.token, weights,
-                   conventional_out[frame])) != 0)
+        if (conv_hop(conventional, mics, ref, weights,
+                     trusted_mode ? trusted : NULL, conventional_out[frame]) != 0)
             return 200 + frame;
         for (i = 0; i < DFN2_HOP_LEN; ++i) {
             float expected = frame < 2 ? 0.0f : conventional_out[frame - 2][i];
@@ -156,7 +149,7 @@ static int run_identity(int trusted_mode, int enable_cng) {
     printf("4aec_dfn_res: trusted=%d cng=%d identity over %d hops, "
            "%d delay change(s)\n", trusted_mode, enable_cng, TEST_FRAMES,
            delay_changes);
-    four_aec_nr_res_destroy(conventional);
+    conv_destroy(conventional);
     four_aec_dfn_res_destroy(dfn);
     return 0;
 }
@@ -166,8 +159,8 @@ static int run_identity(int trusted_mode, int enable_cng) {
 static int run_res_is_active(void) {
     FourAecNrResConfig on_cfg = core_config(1, 0);
     FourAecNrResConfig off_cfg = core_config(0, 0);
-    FourAecNrRes *on = four_aec_nr_res_create(&on_cfg);
-    FourAecNrRes *off = four_aec_nr_res_create(&off_cfg);
+    ConvChain *on = conv_create(&on_cfg);
+    ConvChain *off = conv_create(&off_cfg);
     Complex weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
     float mics[DFN2_HOP_LEN * FOUR_AEC_NR_RES_CHANNELS];
     float ref[DFN2_HOP_LEN], a[DFN2_HOP_LEN], b[DFN2_HOP_LEN];
@@ -175,22 +168,19 @@ static int run_res_is_active(void) {
     if (!on || !off) return 1;
     make_weights(weights);
     for (frame = 0; frame < TEST_FRAMES; ++frame) {
-        FourAecNrResPreFrame pa, pb;
         make_hop(mics, ref, frame);
-        if (four_aec_nr_res_process_pre(on, mics, ref, &pa) != 0 ||
-            four_aec_nr_res_process_post(on, &pa.token, weights, a) != 0 ||
-            four_aec_nr_res_process_pre(off, mics, ref, &pb) != 0 ||
-            four_aec_nr_res_process_post(off, &pb.token, weights, b) != 0)
+        if (conv_hop(on, mics, ref, weights, NULL, a) != 0 ||
+            conv_hop(off, mics, ref, weights, NULL, b) != 0)
             return 2;
         if (memcmp(a, b, sizeof(a)) != 0) ++differing;
     }
-    four_aec_nr_res_destroy(on);
-    four_aec_nr_res_destroy(off);
+    conv_destroy(on);
+    conv_destroy(off);
     return differing > 0 ? 0 : 3;
 }
 
 /* Native grid (the 16 kHz default and 8 kHz): the core on its own grid, the
- * stage through the bridge. The conventional core's NR-off output delayed by
+ * stage through the bridge. The conventional chain's NR-off output delayed by
  * the bridge's added delay must match within the resampler round-trip error;
  * a near-end impulse pins the delay; the 48 kHz schedule is the documented
  * one. Reconstructed post entry, weights uniform. */
@@ -198,7 +188,7 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
     FourAecDfnResConfig dcfg = four_aec_dfn_res_default_config();
     FourAecNrResConfig ccfg = four_aec_nr_res_default_config(sample_rate);
     FourAecDfnRes *dfn;
-    FourAecNrRes *conventional;
+    ConvChain *conventional;
     Complex weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
     static float mics[512 * FOUR_AEC_NR_RES_CHANNELS];
     static float ref[512], out[512];
@@ -224,14 +214,14 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
         return 2;
     ccfg.fft_size = fft_size;
     ccfg.enable_post = 1; ccfg.enable_res = 1; ccfg.enable_nr = 0; ccfg.enable_cng = 0;
-    conventional = four_aec_nr_res_create(&ccfg);
-    if (!conventional || four_aec_nr_res_hop_size(conventional) != hop) return 3;
+    conventional = conv_create(&ccfg);
+    if (!conventional || conventional->hop != hop) return 3;
     make_weights(weights);
     n = frames * hop;
     dfn_fixture_multitone(far_tones, (size_t)n, sample_rate);
     imp = (frames * 3 / 4) * hop + 5;
     for (frame = 0; frame < frames; ++frame) {
-        FourAecNrResPreFrame dp, cp;
+        FourAecFront dp;
         for (i = 0; i < hop; ++i) {
             int t = frame * hop + i;
             ref[i] = far_tones[t];
@@ -243,11 +233,9 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
                     (t == imp ? 1.0f : 0.0f);
             }
         }
-        if (four_aec_dfn_res_process_pre(dfn, mics, ref, &dp) != 0 ||
-            four_aec_dfn_res_process_post(dfn, &dp.token, weights, out) != 0 ||
-            four_aec_nr_res_process_pre(conventional, mics, ref, &cp) != 0 ||
-            four_aec_nr_res_process_post(conventional, &cp.token, weights,
-                                         conv + frame * hop) != 0)
+        if (four_aec_dfn_res_front_process(dfn, mics, ref, &dp) != 0 ||
+            four_aec_dfn_res_process(dfn, weights, NULL, out) != 0 ||
+            conv_hop(conventional, mics, ref, weights, NULL, conv + frame * hop) != 0)
             return 10 + frame;
         memcpy(mine + frame * hop, out, (size_t)hop * sizeof(float));
         dfn_rate_bridge_get_counters(four_aec_dfn_res_get_bridge(dfn),
@@ -282,7 +270,7 @@ static int run_native(int sample_rate, int fft_size, int expected_added) {
            n, imp, (double)max_sig, peak - imp - hop);
     if (peak != imp + hop + added) return 6;
     if (!(max_err < 1e-3f)) return 7;
-    four_aec_nr_res_destroy(conventional);
+    conv_destroy(conventional);
     four_aec_dfn_res_destroy(dfn);
     return 0;
 }

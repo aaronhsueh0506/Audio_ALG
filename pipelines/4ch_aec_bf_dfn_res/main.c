@@ -90,10 +90,9 @@ int main(int argc, char **argv) {
     printf("%s: hop %d samples, algorithmic latency %d samples\n", name,
            hop_size, four_aec_dfn_res_lookahead_samples(pipeline));
     for (hop = 0; hop < 8; ++hop) {
-        FourAecNrResPreFrame pre;
-        if (four_aec_dfn_res_process_pre(pipeline, microphones, far, &pre) != 0 ||
-            four_aec_dfn_res_process_post(pipeline, &pre.token, g_weights,
-                                          output) != 0) {
+        FourAecFront front;
+        if (four_aec_dfn_res_front_process(pipeline, microphones, far, &front) != 0 ||
+            four_aec_dfn_res_process(pipeline, g_weights, NULL, output) != 0) {
             four_aec_dfn_res_destroy(pipeline);
             return 1;
         }

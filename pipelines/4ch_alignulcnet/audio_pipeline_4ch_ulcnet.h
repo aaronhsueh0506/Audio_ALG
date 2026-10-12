@@ -4,7 +4,7 @@
  *
  * Architecture per hop (compile-time ULCNET_HOP samples):
  *
- *   4x linear AEC lanes + one shared far aligner (FourAecNrRes process_pre)
+ *   4x linear AEC lanes + one shared far aligner (FourAecNrRes four_aec_front_process)
  *     -> SRP-PHAT DOA -> GSC effective weights (existing spatial libraries)
  *     -> beamformed linear-error SPECTRUM (gsc_process_with_weights output),
  *        handed to the model DIRECTLY as its error frame -- it is already
@@ -16,9 +16,9 @@
  *        hop #0 through the UlcnetModel callback
  *     -> Align-ULCNet synthesis (ulcnet_process.h) -> enhanced mono hop
  *
- * The core's own post-beam RES/NR path (four_aec_nr_res_process_post) is
- * NOT used: each pre frame is released via four_aec_nr_res_abandon_pre()
- * and the Align-ULCNet chain replaces that post stage entirely.
+ * The core runs front-only (cfg.core.enable_post = 0): its fuse and the
+ * post-beam stages do not exist here, and the Align-ULCNet chain replaces
+ * them entirely.
  *
  * TIMING CONTRACT (total added algorithmic latency = 1 compiled-grid hop;
  * 16 ms for 16 kHz/512 and 10.67 ms for 48 kHz/1024):
