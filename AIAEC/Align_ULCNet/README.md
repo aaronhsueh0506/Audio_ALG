@@ -451,6 +451,14 @@ that once meant one boundary must never also mean another, because state
 element counts can coincide across boundaries and nothing but the version can
 tell them apart. The next real bump goes to 19.
 
+Removed with layout 18: the exporter options `--feature-layout` and
+`--gru-state-layout` (export and calibration CLI), the C function
+`ulcnet_model_io_inherit()` (the runtime binds each `*_out` to its input
+address instead), the macro `ULCNET_MODEL_IO_SCORE_HISTORY` (replaced by
+`ULCNET_MODEL_IO_SCORE_WINDOW`), the descriptor field `score_history_frames`
+(replaced by `score_window_frames`), and the `h_gru0`/`h_gru1` pairs of
+`UlcnetModelIoInputs`/`UlcnetModelIoOutputs` (replaced by `h_gru`/`h_gru_out`).
+
 The fixed front end never enters the quantized domain: each of the four feature
 inputs keeps its own quantization scale, and `sqrt`/`atan2`/`pow` stay out of
 the graph.

@@ -7,6 +7,12 @@
 # Layout 18 / layout 4 graphs are required to reproduce the recorded heads and
 # states exactly (new *_out == the old Concat, old *_out == new minus the
 # dropped slot).
+# The C replay feeds the recorded heads to the prepost class (FREQ mode) and
+# compares the enhanced spectra bit for bit. A 1-ulp change of one head element
+# is not reliably seen there: it left the output unchanged for 149-157 of the
+# 514 mask elements (Align-ULCNet D=4, one hop) and for 429-436 of 600 sampled
+# taps (DeepVQE-S D=32, one hop). A 1-ulp change of every head element of a hop
+# changed the output in all three runs.
 92c20ca390ac335f4d9e6b5e64287cb92b9ebcb1d8b52c708eadaa96397b39a4  deepvqe_s_d32_trace.npz
 8a6ccfd9f5b0ac42650acb2b81f9f2604fd17cc022fcdafd10b26ef3dd327492  old_deepvqe_s_d32_v3.onnx
 ff91c8e89fa3c714eda4826105ae23b6f562ba0057b8d6fd89d2799eeb930933  old_metadata.json

@@ -868,6 +868,12 @@ Concat 的結果同時是 attention 的候選與 `*_out`，沒有任何 state �
   不會跟著變，板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。第一個 hop 的
   state 為 reset 值 0；定點 runtime 的 0 是否等於量化後的 0 由量化工具鏈確認，尚未驗證。
 - **Python reference**：`export_onnx.py` 的 `next_state(outputs)` 只是輸出的尾段。
+- **已移除的介面**：匯出器選項 `--feature-layout`（`export_onnx.py` 與 `inference.py calib`）
+  與 `--gru-state-layout`（同兩處，及共用的 `_streaming_export.py`）；C 的
+  `ulcnet_model_io_inherit()` 與 `deepvqe_prepost_outputs_inherit()`、
+  `ULCNET_MODEL_IO_SCORE_HISTORY`、`DEEPVQE_CONV_HISTORY`／`DEEPVQE_SCORE_HISTORY`、
+  descriptor 欄位 `score_history_frames`／`conv_history_frames`，以及
+  `h_gru0`／`h_gru1`（輸入與 `*_out`）兩組欄位（由單一 `h_gru`／`h_gru_out` 取代）。
 
 `query_now` 與 error-encoder feature 下一幀不再使用，不列為 output。
 `delay_distribution [1,1,D]` 只能作 debug output，production graph 預設不輸出。
@@ -975,15 +981,15 @@ v5 起由 `ulcnet_model_io_prepare()`/`ulcnet_model_io_commit()` 以 host fp32
 1. 保留 `ulcnet_process.c/.h` 的 caller-owned STFT/WOLA，統一
    `SIMD=0/1` 與 scalar/NEON parity。
 2. 新增 model-I/O/state `c/.h`：D-dependent caller-owned RAM、reset、
-   state 保存與 descriptor validation（初版含 K/V/logit CPU ring update；
-   2026-10-04 起 ring 位移改在 graph 內，commit 不更新 ring；2026-10-06 起 commit 另做 mask 乘法與逆冪）。
+   四個 state tensor 的保存（pool 內各一份、就地綁定，沒有 CPU ring 更新也沒有複製路徑）、
+   commit（驗證輸出、壓縮域 error × mask、逆冪）、state generation 與 descriptor validation。
 3. 新增 `T=1` stateless streaming exporter：explicit state inputs +
-   full-state outputs（初版為 delta-state outputs；2026-10-04 改現制）；現有 fixed-block exporter 保留供 offline/debug，不得冒稱
+   full-window outputs（各 state 同 shape，輸入端 Slice 加 Concat，見 §10.2.1）；
+   現有 fixed-block exporter 保留供 offline/debug，不得冒稱
    production streaming equivalent。
 4. metadata 已產生；generated C descriptor header 尚待完成，並需將
-   D、far-input mode、grid、tensor shape、layout version（連同它所屬的
-   `feature_layout`/`gru_state_layout` 這一對）與 checkpoint hash
-   固定在同一份部署 contract。
+   D、far-input mode、grid、tensor shape、layout version（`LAYOUT_VERSION`，
+   與 `ulcnet_model_io.h` 互鎖）與 checkpoint hash 固定在同一份部署 contract。
 5. 驗證 PyTorch `forward_stream()` vs ONNX Runtime 多幀輸出與每個
    state 的完整下一個值；本 phase 不實作特定 NPU driver，不整合 mono/4ch pipeline。
 

@@ -97,6 +97,13 @@ metadata and the sidecar JSON; a board feeds that block to
 `../tests/test_deepvqe_prepost_c.py`, which also pins the header, the exporter
 table and the graph's state shapes to each other.
 
+Removed with layout 4: the exporter option `--gru-state-layout`,
+`deepvqe_prepost_outputs_inherit()` (the runtime binds each `*_out` to its input
+address), `DEEPVQE_CONV_HISTORY`/`DEEPVQE_SCORE_HISTORY` (replaced by
+`DEEPVQE_CONV_WINDOW`/`DEEPVQE_SCORE_WINDOW`) and the descriptor fields
+`conv_history_frames`/`score_history_frames` (replaced by `conv_window_frames`/
+`score_window_frames`).
+
 ## ONNX and calibration
 
 ```bash
