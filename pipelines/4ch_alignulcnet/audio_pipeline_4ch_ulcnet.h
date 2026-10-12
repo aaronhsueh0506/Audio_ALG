@@ -475,7 +475,8 @@ typedef struct AudioPipeline4ChUlcnetFront {
  * First half of the hop: shared delay and the four AEC lanes, the model-reset
  * and identity-reprime bookkeeping of an alignment boundary, and the far
  * analysis of the same hop. Fills *front. After a success only
- * process_beam() (or reset/destroy) is valid.
+ * process_beam() (or reset/destroy) advances the hop; the read-only accessors
+ * stay valid.
  *
  * @return FOUR_AEC_NR_RES_OK, FOUR_AEC_NR_RES_INVALID_ARGUMENT,
  *         FOUR_AEC_NR_RES_SEQUENCE_ERROR (a hop is already in flight), or the
