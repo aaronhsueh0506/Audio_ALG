@@ -5,7 +5,7 @@
 extern "C" {
 #endif
 
-#include "fft_wrapper.h"
+#include "audio_stft.h"
 
 #define GTCRN_SR       16000
 #define GTCRN_N_FFT    512
@@ -79,19 +79,27 @@ typedef struct {
     unsigned int state_generation;
 } GTCRNModelState;
 
+/* Framing objects, caller-owned and borrowed like the .bin matrix pointers:
+ * the loader owns every resource. */
 typedef struct {
-    float analysis_buf[GTCRN_WIN_LEN];
-    float synthesis_buf[GTCRN_WIN_LEN];
-    float window[GTCRN_WIN_LEN];
-    float scratch_time[GTCRN_N_FFT];
-    Complex scratch_freq[GTCRN_N_BINS];
-    /* Caller-owned audio_common FFT handle (fft_create/fft_init for
-     * GTCRN_N_FFT); the state only borrows it, mirroring the .bin matrix
-     * pointers -- the loader owns every resource. */
-    FftHandle* fft;
+    AcStft*  stft;
+    AcIstft* istft;
 } GTCRNProcessState;
 
-void gtcrn_process_init(GTCRNProcessState* state, FftHandle* fft);
+/* Configuration of the two framing objects, for ac_stft_get_mem_size /
+ * ac_istft_get_mem_size and the matching init calls: 512-point sqrt-Hann,
+ * hop 256, no centering, unscaled spectra. `fft` is a GTCRN_N_FFT handle
+ * shared by both objects; `window` is a shared GTCRN_WIN_LEN table, or NULL
+ * for the analysis object to carve one that the synthesis object then
+ * borrows from ac_stft_window(). Borrowed tables stay unchanged and alive as
+ * long as the objects. */
+void gtcrn_framing_config(AcStftConfig* cfg, FftHandle* fft,
+                          const float* window);
+
+/* Bind the objects (either may be NULL where only the other direction is
+ * used) and reset them. */
+void gtcrn_process_init(GTCRNProcessState* state, AcStft* stft,
+                        AcIstft* istft);
 
 /* First construction: zero the state and start the generation at 1. A state
  * already in use goes through gtcrn_model_state_reset(). The caller fills the

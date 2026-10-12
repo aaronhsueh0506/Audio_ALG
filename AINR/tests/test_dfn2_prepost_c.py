@@ -304,6 +304,25 @@ static FftHandle *make_fft(int fft_size, void **mem_out) {
     return fft_init(mem, bytes, fft_size);
 }
 
+/* The framing objects of a hand-wired DFN2State: one shared FFT handle, the
+ * window table carved by the analysis object and borrowed by the synthesis
+ * object. */
+static int make_framing(FftHandle *fft, AcStft **stft, AcIstft **istft) {
+    AcStftConfig cfg;
+    size_t bytes;
+    void *mem;
+    dfn2_framing_config(&cfg, fft, NULL);
+    bytes = ac_stft_get_mem_size(&cfg);
+    mem = alloc_aligned(16u, bytes);
+    *stft = mem ? ac_stft_init(mem, bytes, &cfg) : NULL;
+    if (!*stft) return -1;
+    dfn2_framing_config(&cfg, fft, ac_stft_window(*stft));
+    bytes = ac_istft_get_mem_size(&cfg);
+    mem = alloc_aligned(16u, bytes);
+    *istft = mem ? ac_istft_init(mem, bytes, &cfg) : NULL;
+    return *istft ? 0 : -1;
+}
+
 static void config_time(DFN2PrepostConfig *cfg, FftHandle *fft) {
     (void)dfn2_prepost_config_defaults(cfg, DFN2_IO_TIME);
     cfg->fft = fft;
@@ -364,6 +383,8 @@ static int drive_time(DFN2Prepost *p, const float *in, float *out, int hops) {
 
 static int equiv_once(FftHandle *fft, float atten_lim_db) {
     static DFN2State ref_st;
+    AcStft *ref_stft;
+    AcIstft *ref_istft;
     static DFN2ModelIOState ref_io;
     static RefHeads heads;
     static float spec_re[DFN2_N_BINS], spec_im[DFN2_N_BINS];
@@ -378,7 +399,8 @@ static int equiv_once(FftHandle *fft, float atten_lim_db) {
     /* path A -- analysis, features, the model-I/O transaction, the compose
      * stage and the synthesis, wired by hand from the two TUs the class
      * merely orchestrates.  dfn2_prepost.c is deliberately not involved. */
-    dfn2_state_init(&ref_st, fft);
+    CHECK(make_framing(fft, &ref_stft, &ref_istft) == 0);
+    dfn2_state_init(&ref_st, ref_stft, ref_istft);
     dfn2_set_erb_matrices(&ref_st, &erb_fwd[0][0], &erb_inv[0][0]);
     dfn2_model_io_init(&ref_io);
     for (hop = 0; hop < HOPS; ++hop) {
@@ -468,6 +490,8 @@ static int case_equiv(FftHandle *fft) {
 
 static int case_freq(FftHandle *fft) {
     static DFN2State caller_st;
+    AcStft *caller_stft;
+    AcIstft *caller_istft;
     static float spec_re[DFN2_N_BINS], spec_im[DFN2_N_BINS];
     static float enh_re[DFN2_N_BINS], enh_im[DFN2_N_BINS];
     DFN2PrepostConfig cfg_time, cfg_freq;
@@ -493,7 +517,8 @@ static int case_freq(FftHandle *fft) {
     /* In DFN2_IO_FREQ the CALLER owns the transform on both sides: one
      * dfn2_analysis per hop into the class, one dfn2_synthesis per emitted
      * frame out of it, on the same DFN2State the class would have used. */
-    dfn2_state_init(&caller_st, fft);
+    CHECK(make_framing(fft, &caller_stft, &caller_istft) == 0);
+    dfn2_state_init(&caller_st, caller_stft, caller_istft);
     dfn2_set_erb_matrices(&caller_st, &erb_fwd[0][0], &erb_inv[0][0]);
     for (hop = 0; hop < HOPS; ++hop) {
         DFN2PrepostInputs inputs;
@@ -558,14 +583,31 @@ static int case_freqpool(FftHandle *fft) {
            (unsigned long long)req_time.bytes,
            (unsigned long long)req_freq.bytes);
 
-    /* The two modes differ in exactly two regions: IO_TIME carves the
-     * output hop staging, IO_FREQ carves the dual entry point's second
-     * staging pair instead.  Pin the difference to the byte so a region
+    /* The two modes differ in exactly these regions: IO_TIME carves the
+     * output hop staging and the two framing objects (the analysis object
+     * with its own window table, the synthesis object borrowing it; both
+     * share the caller's FFT handle), IO_FREQ carves the dual entry point's
+     * second staging pair instead.  The framing sizes come from audio_common
+     * with a real window table for the borrowing object, independent of the
+     * sizing path under test.  Pin the difference to the byte so a region
      * silently added to one mode fails here. */
-    CHECK(req_freq.bytes ==
-          req_time.bytes -
-              ck_align16_size((size_t)DFN2_HOP_LEN * sizeof(float)) +
-              2u * ck_align16_size((size_t)DFN2_N_BINS * sizeof(float)));
+    {
+        static float real_window[DFN2_WIN_LEN];
+        AcStftConfig sc;
+        size_t stft_bytes, istft_bytes;
+        ac_window_build(real_window, DFN2_WIN_LEN);
+        dfn2_framing_config(&sc, fft, NULL);
+        stft_bytes = ac_stft_get_mem_size(&sc);
+        dfn2_framing_config(&sc, fft, real_window);
+        istft_bytes = ac_istft_get_mem_size(&sc);
+        CHECK(stft_bytes != 0 && istft_bytes != 0);
+        CHECK(req_freq.bytes ==
+              req_time.bytes -
+                  ck_align16_size((size_t)DFN2_HOP_LEN * sizeof(float)) -
+                  ck_align16_size(stft_bytes) -
+                  ck_align16_size(istft_bytes) +
+                  2u * ck_align16_size((size_t)DFN2_N_BINS * sizeof(float)));
+    }
     CHECK(req_time.io_mode == (uint32_t)DFN2_IO_TIME);
     CHECK(req_freq.io_mode == (uint32_t)DFN2_IO_FREQ);
     CHECK(req_time.build_flags_hash != req_freq.build_flags_hash);
@@ -1997,7 +2039,8 @@ def test_freq_mode_matches_time_mode(driver):
 
 
 def test_freq_pool_is_smaller_and_stale_pool_gate_holds(driver):
-    """DFN2_IO_FREQ must not carve the output hop staging it never uses, the
+    """DFN2_IO_FREQ must not carve the output hop staging or the framing
+    objects it never uses, the
     MemReq must carry this build's identity, and _init_ex must accept the
     matching descriptor while refusing the other mode's and any single-field
     perturbation of its own."""

@@ -52,9 +52,9 @@
  * ============================================================ */
 
 #ifndef DFN2_PROCESS_H
-#include "fft_wrapper.h"
-
 #define DFN2_PROCESS_H
+
+#include "audio_stft.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -134,18 +134,17 @@
  * 狀態 (呼叫端分配，跨 frame 保持)
  * ============================================================ */
 typedef struct {
-    /* Analysis overlap and instance-owned immutable-after-init tables. */
-    float analysis_buf[DFN2_WIN_LEN];
-    float window[DFN2_WIN_LEN];
+    /* Framing objects, caller-owned and borrowed (see dfn2_framing_config).
+     * NULL where the caller works on spectra and never calls
+     * dfn2_analysis / dfn2_synthesis. */
+    AcStft  *stft;
+    AcIstft *istft;
     /* Caller-loaded exported ERB matrices (never derived here):
      * erb_fwd bin-major [DFN2_N_BINS][DFN2_N_ERB], erb_inv band-major
      * [DFN2_N_ERB][DFN2_N_BINS]; raw float32 from erb_fwd.bin/erb_inv.bin.
      * The loader owns the memory and may swap it between hops. */
     const float *erb_fwd;
     const float *erb_inv;
-
-    /* OLA 緩衝 (長度 = WIN_LEN, 只用前 OVL_LEN) */
-    float synthesis_buf[DFN2_WIN_LEN];
 
     /* 逐 band 的 causal log-ERB mean EMA */
     float erb_norm_state[DFN2_N_ERB];
@@ -176,11 +175,6 @@ typedef struct {
     float hi_delay_im[DFN2_DF_RING][DFN2_N_BINS - DFN2_DF_BINS];
 
     /* --- scratch: 非跨 frame 狀態，每次使用前完整覆寫 --- */
-    float scratch_time[DFN2_N_FFT];
-    Complex scratch_freq[DFN2_N_BINS];
-    /* Caller-owned audio_common FFT handle (fft_create/fft_init for
-     * DFN2_N_FFT); borrowed like the .bin matrix pointers. */
-    FftHandle* fft;
     float scratch_power[DFN2_N_BINS];
     float scratch_erb_db[DFN2_N_ERB];
     float scratch_bin_gain[DFN2_N_BINS];
@@ -209,8 +203,21 @@ typedef struct {
     uint16_t erb_inv_hi[DFN2_N_ERB];
 } DFN2State;
 
-/* 初始化 (歸零 + 兩個正規化器的 linspace 初值) */
-void dfn2_state_init(DFN2State *st, FftHandle *fft);
+/* Configuration of the two framing objects, for ac_stft_get_mem_size /
+ * ac_istft_get_mem_size and the matching init calls: 1024-point sqrt-Hann,
+ * hop 512, no centering, torch normalized=True scaling (analysis x
+ * DFN2_N_FFT^-0.5, synthesis x DFN2_N_FFT^+0.5). `fft` is a DFN2_N_FFT
+ * handle shared by both objects; `window` is a shared DFN2_WIN_LEN table, or
+ * NULL for the analysis object to carve one that the synthesis object then
+ * borrows from ac_stft_window(). Borrowed tables stay unchanged and alive as
+ * long as the objects. */
+void dfn2_framing_config(AcStftConfig *cfg, FftHandle *fft,
+                         const float *window);
+
+/* 初始化 (歸零 + 兩個正規化器的 linspace 初值)。stft / istft 是依
+ * dfn2_framing_config 建立的物件(可為 NULL: 只走頻譜入口時);本函式把兩者
+ * 一併 reset,所以對已在使用的 state 再呼叫即是 reset。 */
+void dfn2_state_init(DFN2State *st, AcStft *stft, AcIstft *istft);
 
 /* Point the state at the caller-loaded ERB matrices (see the struct field
  * comment for layout) and record their nonzero spans. Must be called before

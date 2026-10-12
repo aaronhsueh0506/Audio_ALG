@@ -83,20 +83,13 @@
  * used, and this class will not fabricate heads on its behalf.
  *
  * ============================================================
- * ⚠ WINDOW OWNERSHIP -- a documented deviation from the house rule
+ * BORROWED TABLES
  * ============================================================
- * The FftHandle and the ERB matrices are CALLER-OWNED and BORROWED: this
- * class never creates or destroys either, and the ERB pointers may be swapped
- * between hops with dfn2_prepost_set_erb_matrices().
- *
- * The analysis/synthesis window CANNOT be borrowed here. DFN2State embeds its
- * window as `float window[DFN2_WIN_LEN]` BY VALUE and dfn2_state_init() fills
- * it with the sqrt-Hann table (dfn2_process.h, which carries a live parity
- * gate and is not ours to change). So `cfg.window`, when non-NULL, is COPIED
- * over that table at init and at every reset. The class still allocates and
- * frees nothing: the caller's table stays the caller's. Leave it NULL to use
- * the parity-tested built-in sqrt-Hann, which is what every shipped path
- * wants; override it only to share a table you have proved identical.
+ * The FftHandle, the window table and the ERB matrices are CALLER-OWNED and
+ * BORROWED: this class never creates or destroys them, a borrowed window must
+ * stay unchanged and alive as long as the class, and the ERB pointers may be
+ * swapped between hops with dfn2_prepost_set_erb_matrices(). Leave `window`
+ * NULL to let the analysis object carve the sqrt-Hann table in the pool.
  * ============================================================ */
 
 #ifndef DFN2_PREPOST_H
@@ -118,9 +111,9 @@ extern "C" {
  * changes, so a pool recorded by another carve is refused on the hash, not
  * only on `bytes`. The carve covers DFN2State (including the ERB matrices'
  * nonzero ranges and each band's nonzero bin range), the recurrent state of
- * DFN2ModelIOState (h_gru and the pathway window) and, in
- * DFN2_IO_FREQ, the second staging pair (apply_re/apply_im) of the dual-input
- * entry point. */
+ * DFN2ModelIOState (h_gru and the pathway window) and, in DFN2_IO_TIME, the
+ * output hop staging and the STFT / ISTFT objects; in DFN2_IO_FREQ the second
+ * staging pair (apply_re/apply_im) of the dual-input entry point. */
 #define DFN2_PREPOST_CARVE_VERSION      6u
 
 /* One shared alignment for every module (audio_common mem_align.h). */
@@ -143,15 +136,8 @@ extern "C" {
 #define DFN2_PREPOST_ALPHA_ELEMENTS      1
 
 /* Which side of the transform the caller works on. FIXED AT INIT because it
- * decides the pool size.
- *
- * ⚠ Honest note on how much it decides: DFN2State embeds its analysis
- * overlap, window and synthesis OLA buffers by value, and the compose stage
- * lives in the same struct, so a DFN2_IO_FREQ instance cannot shed them
- * without editing dfn2_process.h. The two modes therefore differ by only the
- * output hop staging. The enum is still fixed at init -- it is the pool's
- * identity, checked by _init_ex -- but do not expect the AIAEC models'
- * proportional saving here. */
+ * decides the pool size: DFN2_IO_TIME also carves the output hop staging and
+ * the two framing objects (STFT, ISTFT), DFN2_IO_FREQ carves none of them. */
 typedef enum DFN2IoMode {
     /* Spectrum in, spectrum out. NO framing, windowing, FFT, iFFT or
      * overlap-add -- the caller owns the transform. This is the mode for
@@ -167,8 +153,9 @@ typedef struct DFN2PrepostConfig {
     int          io_mode;       /* a DFN2IoMode                             */
     FftHandle   *fft;           /* DFN2_IO_TIME: required, borrowed, sized
                                  * for DFN2_N_FFT                           */
-    const float *window;        /* optional, DFN2_WIN_LEN entries, COPIED;
-                                 * NULL = built-in sqrt-Hann (see header)   */
+    const float *window;        /* optional, DFN2_WIN_LEN entries, BORROWED
+                                 * (DFN2_IO_TIME); NULL = a sqrt-Hann table
+                                 * carved in the pool                        */
     const float *erb_fwd;       /* required, borrowed, bin-major
                                  * [DFN2_N_BINS][DFN2_N_ERB]                */
     const float *erb_inv;       /* required, borrowed, band-major

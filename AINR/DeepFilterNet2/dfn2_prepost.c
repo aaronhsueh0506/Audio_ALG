@@ -1,9 +1,10 @@
 /* DeepFilterNet2 pre/post class. Contract: see dfn2_prepost.h.
  *
  * This file OWNS no signal processing of its own. It composes the two
- * parity-tested translation units -- dfn2_process.c (streaming center=False
- * sqrt-Hann STFT/WOLA, ERB and complex features, mask expansion, deep filter,
- * attenuation limit) and dfn2_model_io.c (graph feature windows and recurrent
+ * parity-tested translation units -- dfn2_process.c (ERB and complex
+ * features, mask expansion, deep filter, attenuation limit; the streaming
+ * center=False sqrt-Hann framing is audio_common's AcStft / AcIstft) and
+ * dfn2_model_io.c (graph feature windows and recurrent
  * caches) -- and adds only the object lifecycle, the pool carve and the
  * per-hop frame state machine. Neither of those files changes, so both of
  * their standalone parity builds keep linking.
@@ -33,13 +34,15 @@ struct DFN2Prepost {
     int   io_mode;
     float atten_lim_db;
 
+    /* Framing objects, carved from the pool in DFN2_IO_TIME (NULL in
+     * DFN2_IO_FREQ). They borrow the caller's FftHandle and, when given, the
+     * caller's window table. */
+    AcStft      *stft;
+    AcIstft     *istft;
+
     /* Borrowed, never created or destroyed here. */
-    FftHandle   *fft;        /* NULL in DFN2_IO_FREQ                        */
     const float *erb_fwd;
     const float *erb_inv;
-    /* Copied into DFN2State's embedded table at init and at every reset;
-     * kept here only so reset can reapply it. See the header's window note. */
-    const float *window;
 
     /* Per-hop staging. */
     float *spec_re;     /* [DFN2_N_BINS]  current frame, original scale     */
@@ -145,11 +148,32 @@ static uint32_t pp_build_hash(int io_mode) {
     return h;
 }
 
-/* Walk the layout once. base==NULL sizes it; base!=NULL also carves it.
- * get_mem_size and init MUST walk in this same order -- that is the whole
- * reason it is one function. */
-static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
-                     size_t *total) {
+/* Sizing a borrowed table needs a table pointer, but only whether it is NULL:
+ * ac_stft_get_mem_size / ac_istft_get_mem_size never read it. */
+static const float pp_sizing_window[1];
+
+/* DFN2_IO_TIME: bytes of the two framing objects. Both share the caller's
+ * FFT handle and one window table: the caller's when given, else the one the
+ * analysis object carves and the synthesis object borrows. */
+static int pp_framing_sizes(const DFN2PrepostConfig *cfg, size_t *stft_bytes,
+                            size_t *istft_bytes) {
+    AcStftConfig sc;
+    dfn2_framing_config(&sc, cfg->fft, cfg->window);
+    *stft_bytes = ac_stft_get_mem_size(&sc);
+    dfn2_framing_config(&sc, cfg->fft,
+                        cfg->window ? cfg->window : pp_sizing_window);
+    *istft_bytes = ac_istft_get_mem_size(&sc);
+    return (*stft_bytes != 0 && *istft_bytes != 0) ? 0 : -1;
+}
+
+/* Walk the layout once. base==NULL sizes it; base!=NULL also carves it
+ * (the framing objects' blocks are returned through stft_block /
+ * istft_block, NULL in DFN2_IO_FREQ). get_mem_size and init MUST walk in
+ * this same order -- that is the whole reason it is one function. */
+static int pp_layout(DFN2Prepost *p, unsigned char *base,
+                     const DFN2PrepostConfig *cfg, size_t *total,
+                     void **stft_block, void **istft_block) {
+    const int io_mode = cfg->io_mode;
     static const size_t float_counts[] = {
         DFN2_N_BINS,                             /* spec_re       */
         DFN2_N_BINS,                             /* spec_im       */
@@ -177,13 +201,17 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
         return -1;
     if (base && p) p->io = (DFN2ModelIOState *)ptr;
 
-    /* DFN2_IO_TIME only: the output hop staging. Everything else the framing
-     * needs is embedded in DFN2State by value (see the header's honest note
-     * on how little the two modes differ). */
+    /* DFN2_IO_TIME only: the output hop staging and the two framing objects. */
     if (io_mode == DFN2_IO_TIME) {
+        size_t stft_bytes, istft_bytes;
+        if (pp_framing_sizes(cfg, &stft_bytes, &istft_bytes) != 0) return -1;
         if (pp_carve(base, &cursor, (size_t)DFN2_HOP_LEN * sizeof(float),
                      &ptr) != 0) return -1;
         if (base && p) p->out_hop = (float *)ptr;
+        if (pp_carve(base, &cursor, stft_bytes, &ptr) != 0) return -1;
+        if (stft_block) *stft_block = ptr;
+        if (pp_carve(base, &cursor, istft_bytes, &ptr) != 0) return -1;
+        if (istft_block) *istft_block = ptr;
     }
 
     if (p) {
@@ -249,7 +277,7 @@ int dfn2_prepost_get_mem_size(const DFN2PrepostConfig *cfg,
     size_t total = 0;
 
     if (!req || pp_check_config(cfg) != 0) return -1;
-    if (pp_layout(NULL, NULL, cfg->io_mode, &total) != 0) return -1;
+    if (pp_layout(NULL, NULL, cfg, &total, NULL, NULL) != 0) return -1;
 
     memset(req, 0, sizeof(*req));
     req->descriptor_version = DFN2_PREPOST_DESCRIPTOR_VERSION;
@@ -263,15 +291,10 @@ int dfn2_prepost_get_mem_size(const DFN2PrepostConfig *cfg,
 
 /* ---- lifecycle ------------------------------------------------------- */
 
-/* Bring DFN2State and DFN2ModelIOState to their init values and reapply the
- * borrowed tables. dfn2_state_init() memsets and rebuilds the window, so the
- * caller's window override has to be replayed after it, every time. */
+/* Bring DFN2State (with the framing objects) and DFN2ModelIOState to their
+ * init values and reapply the borrowed ERB matrices. */
 static void pp_reset_states(DFN2Prepost *p) {
-    dfn2_state_init(p->dsp, p->fft);
-    if (p->window) {
-        memcpy(p->dsp->window, p->window,
-               (size_t)DFN2_WIN_LEN * sizeof(float));
-    }
+    dfn2_state_init(p->dsp, p->stft, p->istft);
     dfn2_set_erb_matrices(p->dsp, p->erb_fwd, p->erb_inv);
     dfn2_model_io_reset(p->io);
 }
@@ -300,6 +323,8 @@ DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
     DFN2PrepostMemReq req;
     DFN2Prepost *p;
     size_t total = 0;
+    void *stft_block = NULL;
+    void *istft_block = NULL;
     int i;
 
     if (!pool || dfn2_prepost_get_mem_size(cfg, &req) != 0) return NULL;
@@ -324,14 +349,26 @@ DFN2Prepost *dfn2_prepost_init_ex(void *pool, size_t bytes,
     p = (DFN2Prepost *)pool;
     p->io_mode = cfg->io_mode;
     p->atten_lim_db = cfg->atten_lim_db;
-    p->fft = (cfg->io_mode == DFN2_IO_TIME) ? cfg->fft : NULL;
-    p->window = cfg->window;
     p->erb_fwd = cfg->erb_fwd;
     p->erb_inv = cfg->erb_inv;
 
-    if (pp_layout(p, (unsigned char *)pool, cfg->io_mode, &total) != 0)
+    if (pp_layout(p, (unsigned char *)pool, cfg, &total, &stft_block,
+                  &istft_block) != 0)
         return NULL;
     if (total != (size_t)req.bytes) return NULL;   /* sizing/carve agreement */
+
+    if (cfg->io_mode == DFN2_IO_TIME) {
+        size_t stft_bytes, istft_bytes;
+        AcStftConfig sc;
+        if (pp_framing_sizes(cfg, &stft_bytes, &istft_bytes) != 0)
+            return NULL;
+        dfn2_framing_config(&sc, cfg->fft, cfg->window);
+        p->stft = ac_stft_init(stft_block, stft_bytes, &sc);
+        if (!p->stft) return NULL;
+        dfn2_framing_config(&sc, cfg->fft, ac_stft_window(p->stft));
+        p->istft = ac_istft_init(istft_block, istft_bytes, &sc);
+        if (!p->istft) return NULL;
+    }
 
     for (i = 0; i < DFN2_N_ERB; ++i) p->skip_mask[i] = 1.0f;
     memset(p->skip_coefs, 0,

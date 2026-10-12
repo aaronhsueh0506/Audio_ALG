@@ -17,6 +17,47 @@
     }                                                                       \
 } while (0)
 
+/* Framing objects the way a host builds them: one FFT handle, one window
+ * table (carved by the analysis object, borrowed by the synthesis object),
+ * each object in its own 16-byte aligned block. */
+static void* aligned_block(size_t bytes)
+{
+    void* block = NULL;
+    if (posix_memalign(&block, 16, bytes) != 0) return NULL;
+    memset(block, 0xA5, bytes);
+    return block;
+}
+
+static int dfn2_framing(AcStft** stft, AcIstft** istft)
+{
+    AcStftConfig cfg;
+    size_t bytes;
+    FftHandle* fft = fft_create(DFN2_N_FFT);
+    if (!fft) return 0;
+    dfn2_framing_config(&cfg, fft, NULL);
+    bytes = ac_stft_get_mem_size(&cfg);
+    *stft = ac_stft_init(aligned_block(bytes), bytes, &cfg);
+    dfn2_framing_config(&cfg, fft, *stft ? ac_stft_window(*stft) : NULL);
+    bytes = ac_istft_get_mem_size(&cfg);
+    *istft = ac_istft_init(aligned_block(bytes), bytes, &cfg);
+    return *stft != NULL && *istft != NULL;
+}
+
+static int gtcrn_framing(AcStft** stft, AcIstft** istft)
+{
+    AcStftConfig cfg;
+    size_t bytes;
+    FftHandle* fft = fft_create(GTCRN_N_FFT);
+    if (!fft) return 0;
+    gtcrn_framing_config(&cfg, fft, NULL);
+    bytes = ac_stft_get_mem_size(&cfg);
+    *stft = ac_stft_init(aligned_block(bytes), bytes, &cfg);
+    gtcrn_framing_config(&cfg, fft, *stft ? ac_stft_window(*stft) : NULL);
+    bytes = ac_istft_get_mem_size(&cfg);
+    *istft = ac_istft_init(aligned_block(bytes), bytes, &cfg);
+    return *stft != NULL && *istft != NULL;
+}
+
 static uint64_t hash_bytes(uint64_t h, const void* data, size_t bytes)
 {
     const unsigned char* p = (const unsigned char*)data;
@@ -117,11 +158,7 @@ static int test_dfn_stream_alignment(void)
     long long output_frame = -1;
 
     dfn_test_build_erb();
-    {
-        static FftHandle* fft2;
-        if (!fft2) fft2 = fft_create(DFN2_N_FFT);
-        dfn2_state_init(&dfn2, fft2);
-    }
+    dfn2_state_init(&dfn2, NULL, NULL);
     dfn2_set_erb_matrices(&dfn2, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int k = 0; k < DFN2_DF_BINS; ++k)
         for (int tap = 0; tap < DFN2_DF_ORDER; ++tap)
@@ -346,9 +383,10 @@ static int test_dfn2(uint64_t* digest)
 
     dfn_test_build_erb();
     {
-        static FftHandle* fft_handle;
-        if (!fft_handle) fft_handle = fft_create(DFN2_N_FFT);
-        dfn2_state_init(&state, fft_handle);
+        AcStft* stft;
+        AcIstft* istft;
+        CHECK(dfn2_framing(&stft, &istft), "DFN2 framing objects");
+        dfn2_state_init(&state, stft, istft);
     }
     dfn2_set_erb_matrices(&state, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int b = 0; b < DFN2_N_ERB; ++b) mask[b] = 1.0f;
@@ -398,9 +436,10 @@ static int test_gtcrn(uint64_t* digest)
     float max_error = 0.0f;
 
     {
-        static FftHandle* fft_handle;
-        if (!fft_handle) fft_handle = fft_create(GTCRN_N_FFT);
-        gtcrn_process_init(&state, fft_handle);
+        AcStft* stft;
+        AcIstft* istft;
+        CHECK(gtcrn_framing(&stft, &istft), "GTCRN framing objects");
+        gtcrn_process_init(&state, stft, istft);
     }
     for (int frame = 0; frame < 24; ++frame) {
         for (int i = 0; i < GTCRN_HOP_LEN; ++i)
@@ -620,8 +659,8 @@ static int test_dfn_dual_state_disjoint(void)
     int features_differed = 0;
 
     dfn_test_build_erb();
-    dfn2_state_init(&st_a, NULL);
-    dfn2_state_init(&st_b, NULL);
+    dfn2_state_init(&st_a, NULL, NULL);
+    dfn2_state_init(&st_b, NULL, NULL);
     dfn2_set_erb_matrices(&st_a, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     dfn2_set_erb_matrices(&st_b, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int k = 0; k < DFN2_DF_BINS; ++k)
@@ -668,8 +707,8 @@ static int test_dfn_dual_state_disjoint(void)
 
     /* Same estimated spectrum, different applied spectra: the features must
      * agree byte for byte. */
-    dfn2_state_init(&st_a, NULL);
-    dfn2_state_init(&st_b, NULL);
+    dfn2_state_init(&st_a, NULL, NULL);
+    dfn2_state_init(&st_b, NULL, NULL);
     dfn2_set_erb_matrices(&st_a, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     dfn2_set_erb_matrices(&st_b, &dfn_test_fwd[0][0], &dfn_test_inv[0][0]);
     for (int wall = 0; wall < 14; ++wall) {
@@ -736,7 +775,7 @@ static int test_dfn_erb_spans_exact(void)
             fwd[512][3] = 0.5f;        /* a band fed by the last bin only */
             inv[31][3] = 0.25f;
         }
-        dfn2_state_init(&st, NULL);
+        dfn2_state_init(&st, NULL, NULL);
         dfn2_set_erb_matrices(&st, &fwd[0][0], &inv[0][0]);
         memcpy(ref_state, st.erb_norm_state, sizeof(ref_state));
         for (int frame = 0; frame < 24; ++frame) {

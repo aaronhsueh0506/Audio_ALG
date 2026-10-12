@@ -60,7 +60,7 @@ _WRAPPER = r'''
 void *parity_dfn_create(const float *fwd, const float *inv) {
     DFN2State *state = (DFN2State *)calloc(1, sizeof(*state));
     if (!state) return NULL;
-    dfn2_state_init(state, NULL);
+    dfn2_state_init(state, NULL, NULL);
     dfn2_set_erb_matrices(state, fwd, inv);
     return state;
 }
