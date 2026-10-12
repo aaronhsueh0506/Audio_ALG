@@ -645,13 +645,13 @@ C 側 STFT 狀態仍連續，緊接著發射的幀其 512 樣本分析窗**跨�
 **4ch direct path**：4ch 的 reprime 常數是 1，與 mono 同值。GSC 的
 beamformed error **頻譜**直接當成模型的 error frame（它本來就是本 hop 的
 sqrt-Hann 50%-overlap 單幀），far 路用同一個 hop 的
-`ulcnet_analysis_push_frame()`，中間沒有 beam WOLA、沒有 error 路的二次
+`ac_stft_push_planar()`（`center` 0 的 `AcStft`），中間沒有 beam WOLA、沒有 error 路的二次
 analysis，也沒有 one-hop far buffer。兩路因此都從**當前** input hop 成幀，
 跨界幀只剩邊界 hop 那一幀。邊界處理只做 `model->reset` ＋ arm reprime，
 不清任何 buffer（C 側成幀狀態一路連續）。
 
 **mono 的 rolling push**：mono wrapper 的兩路 analysis 用 rolling
-center=False `ulcnet_analysis_push_frame()`（自 hop#0 起每 hop 恰一幀、
+center=False 的 `AcStft`（`ac_stft_push_planar()`）（自 hop#0 起每 hop 恰一幀、
 每 hop 至多一次推論），排程與 AEC/GSC seam 一致。
 `AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES` 是 1（每 hop 遞減，與每發射幀
 遞減相等），1 hop 端到端延遲來自 synthesis 半窗 trim，幀 scratch 為 1 幀。

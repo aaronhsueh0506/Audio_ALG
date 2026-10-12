@@ -117,6 +117,6 @@ python3 inference.py calib --checkpoint checkpoint.pth \
 Use `--format npz --output calib/deepvqe_s.npz` for a NumPy archive. BIN
 output contains one directory per graph input and one numbered file per
 streaming invocation. The `mic`/`far` tensors it records are the host-compressed
-planar spectra the graph binds (layout version 3); an ONNX file, JSON sidecar
+planar spectra the graph binds (layout version 4); an ONNX file, JSON sidecar
 or calibration set from an earlier layout must be regenerated and the
 accelerator program recompiled.
