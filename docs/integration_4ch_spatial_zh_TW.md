@@ -48,7 +48,7 @@ mic hop [hop][4] + ref hop [hop]
 #include "audio_pipeline_4ch.h"
 ```
 
-一行就夠。它會拉進 `4aec_nr_res.h`，後者再拉進 `aec.h` / `mmse_lsa_denoiser.h` /
+一行就夠。它會拉進 `4aec_nr_res.h`，後者再拉進 `aec.h` / `anr.h` /
 `fft_wrapper.h`。你**不需要** include `gsc.h`、`srp.h` 或任何 `third_party` 的 header。
 
 ### 1.3 `Complex` type 從哪來
@@ -85,7 +85,7 @@ libdoa.a
 libgsc.a
 libspatial_common.a
 libaec.a
-libmmse_lsa.a
+libanr.a
 libaudio_common.a
 -lm
 ```
@@ -165,7 +165,7 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
   <4ch-bin>/libaudio_pipeline_4ch.a \
   <spatial-bin>/libdoa.a <spatial-bin>/libgsc.a <spatial-bin>/libspatial_common.a \
   <aec-bin>/libaec.a \
-  <nr-bin>/libmmse_lsa.a \
+  <nr-bin>/libanr.a \
   <audio_common-bin>/libaudio_common.a \
   -lm
 ```
@@ -238,7 +238,7 @@ AEC、DOA、GSC、NR、RES 全部**共用同一組格點**，`frame == fft_size`
 
 ```c
 int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset, float ramp_ms);
-int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, MmseLsaNrMode mode);
+int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, AnrMode mode);
 ```
 
 兩者都是**轉呼叫核心的薄殼**（`p`／已 destroy／`p->core` 為 NULL 時回 `-1`，
@@ -255,7 +255,7 @@ int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, MmseLsaNrMode mode);
 
 ```c
 if (audio_pipeline_4ch_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { /* 引數不合法 */ }
-if (audio_pipeline_4ch_set_nr_mode(p, MMSE_LSA_NR_MILD) != 0)                  { /* 同上 */ }
+if (audio_pipeline_4ch_set_nr_mode(p, ANR_MODE_MILD) != 0)                  { /* 同上 */ }
 ```
 
 本層**不轉出**核心的 handle，所以核心那個唯讀的
@@ -302,7 +302,7 @@ AudioPipeline4ChConfig cfg = audio_pipeline_4ch_default_config(16000);
 | `core.delay_backward_quarantine_s` | `float` | `1.0` | 有限值，`[0.0, 3600.0]` | 上一列的隔離窗長（秒），在 `init` 時按解析後的 hop／取樣率換算成 hop 數（最小 1；要關閉請用上一列的 enable）。enable 為 0 時無作用，但仍會被驗證——設定檔今天就要是「翻一個旗標也不會壞」的狀態。實測（multipath 場景，舊路徑不消失所以消除能力不崩、只有到期能釋放）：窗 1.0 s = 62 hops，採用點精確等於「未隔離 hop ＋ 窗長」。（先前這一列引用的 true 6400 → 4800 場景是 pre-echo 誤鎖，已在估計器端根治、不再重現） |
 | `core.max_delay_ms` | `float` | `1024.0f` | 有限值，`[0.0, 4096.0]` | 設成略大於系統真實最大 mic↔ref 延遲。設太大只是白吃記憶體 |
 | `core.aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED` | `MILD` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
-| `core.nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED` | `MILD` / `MODERATE` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
+| `core.nr_mode` | `AnrMode` | `ANR_MODE_BALANCED` | `MILD` / `MODERATE` / `BALANCED` / `AGGRESSIVE`，列舉以外拒絕 | — |
 | `core.enable_nr` | `int`（bool） | `1` | `0` 或 `1` | `0` = post 級跳過 MMSE-LSA，只留 RES／CNG／iFFT／WOLA |
 | `core.enable_res` | `int`（bool） | `1` | `0` 或 `1` | `0` = 不建 post-beam RES，只留 NR／iFFT／WOLA（CNG 略過）；與 `enable_nr` 都 `0` 即 beamform 後線性誤差直通 |
 | `core.enable_cng` | `int`（bool） | `1` | `0` 或 `1` | — |
@@ -533,7 +533,7 @@ config 上呼叫 `audio_pipeline_4ch_get_mem_requirements()`，所以它們不�
 
 > **注意慣例不一致**：`get_mem_requirements()` 用 **0 = 成功 / −1 = 失敗**；
 > 下層模組的 `srp_get_mem_size()` / `gsc_get_mem_size()` /
-> `aec_get_mem_size()` / `mmse_lsa_get_mem_size()` / `fft_get_mem_size()`
+> `aec_get_mem_size()` / `anr_get_mem_size()` / `fft_get_mem_size()`
 > 是**回傳 0 代表失敗**。形狀 accessor 用 `-1`、結構稽核 accessor 用 `0`、
 > 而 `gsc_lambda()` 用 `NaN`。三種都不一樣，寫錯誤處理時請逐一對照本表。
 
@@ -656,7 +656,7 @@ destroy 之後不要再呼叫任何 accessor。
 建置與連結：
 
 - [ ] 七個 archive（`libaudio_pipeline_4ch.a` / `libdoa.a` / `libgsc.a` /
-      `libspatial_common.a` / `libaec.a` / `libmmse_lsa.a` / `libaudio_common.a`）
+      `libspatial_common.a` / `libaec.a` / `libanr.a` / `libaudio_common.a`）
       **加上**獨立 object `audio_pipeline_4ch.o`（不在任何 archive 裡,見 §1.5）
       全部是用**同一組** backend、`SIMD` 與編譯選項建出來的
 - [ ] link 命令裡有把 `audio_pipeline_4ch.o` 當獨立 object 加進去(只連七個

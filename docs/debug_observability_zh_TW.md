@@ -16,7 +16,7 @@
 
 | | 結果 |
 |---|---|
-| **pull 型結構化快照** | **全部存活**（`aec_debug_status`、`aec_get_res_context`、`aec_get_linear_context`、`aec_get_mem_breakdown`、`aec_linear_is_cancelling`、`aec_far_fft_real_compute_count`、`mmse_lsa_debug_status`、4ch 的全部 counter accessor） |
+| **pull 型結構化快照** | **全部存活**（`aec_debug_status`、`aec_get_res_context`、`aec_get_linear_context`、`aec_get_mem_breakdown`、`aec_linear_is_cancelling`、`aec_far_fft_real_compute_count`、`anr_debug_status`、4ch 的全部 counter accessor） |
 | **push 型 log / trace** | **全部消失**（沒有 `aec_debug_logf`、沒有 `aec_debug_set_trace`、archive 內連 `fprintf`/`vfprintf` 的引用都沒有） |
 | **stage timing** | 函式存活但**數值全為 0**（`AEC_STAGE_TIMING` 預設 0） |
 | **finite guards / 錯誤碼** | 全部存活，不受任何開關影響 |
@@ -34,7 +34,7 @@
 | 面向 | 現況 |
 |---|---|
 | AEC 狀態快照 | `AecDebugStatus` 10 欄，零 per-hop 成本（只讀引擎本來就每 hop 維護的欄位） |
-| NR 狀態快照 | `MmseLsaDebugStatus` 5 欄 |
+| NR 狀態快照 | `AnrDebugStatus` 5 欄 |
 | 4ch 計數器 | duty census、realign warm/soft、pending delay candidate、far-FFT 實跑次數、post split floor（live vs target） |
 | 記憶體 | `aec_get_mem_breakdown()` / `audio_pipeline_get_mem_breakdown()` |
 | 錯誤分級 | 4ch core 的 `FourAecNrResStatus` 四值（唯一有語意分級的） |
@@ -88,7 +88,7 @@ T0.3 之所以關鍵：`dominant_nearend`、`saturated_echo`、`usable_linear`�
 | `erl_estimate` | 同上 | 回聲路徑增益的合理性檢查 |
 | `frames_processed` | **新增一個 `++`** | **解 G8**。所有比率型判讀的分母 |
 
-`MmseLsaDebugStatus` 建議新增 `frames_processed`（header 自承目前被拿掉了）
+`AnrDebugStatus` 建議新增 `frames_processed`（header 自承目前被拿掉了）
 與一個 `scene_change_count`（MCRA 已經在內部維護）。
 
 ### T2 — 事件計數器，並區分兩級生命週期

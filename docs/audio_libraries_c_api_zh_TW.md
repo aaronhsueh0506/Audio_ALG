@@ -27,7 +27,7 @@
 | 完整 4ch `4×linear AEC -> BF -> mono NR+RES` | `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` |
 | 4ch linear AEC 與外部 beamformer seam | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` |
 | 只做單路 AEC，或自行組合 NN／其他 post-filter | `aec.h` |
-| 已有 STFT/WOLA，只需要頻域 NR | `mmse_lsa_denoiser.h` |
+| 已有 STFT/WOLA，只需要頻域 NR | `anr.h` |
 | 只需要 FFT、resample、HPF、pre-gain | `audio_common/include/*.h` |
 | Align-ULCNet 加速器 handoff（hop 或頻譜） | `AIAEC/Align_ULCNet/ulcnet_prepost.h` |
 | DeepVQE-S 加速器 handoff | `AIAEC/DeepVQE_S/deepvqe_prepost.h` |
@@ -242,7 +242,7 @@ int suppression_gain_set_split_floor_far_active_db(SuppressionGain *sg,
 ### 4.1 Public header 與責任邊界
 
 ```c
-#include "mmse_lsa_denoiser.h" /* 已 include mmse_lsa_types.h/fft_wrapper.h */
+#include "anr.h" /* 已 include anr_types.h/fft_wrapper.h */
 ```
 
 NR 是 mono frequency-domain MMSE-LSA。呼叫端必須準備正確 WOLA/STFT；若 application
@@ -252,34 +252,34 @@ NR 是 mono frequency-domain MMSE-LSA。呼叫端必須準備正確 WOLA/STFT；
 ### 4.2 Config 與建立
 
 ```c
-MmseLsaConfig cfg = mmse_lsa_config_for_mode_grid(
-    16000, 256, MMSE_LSA_NR_BALANCED);
+AnrConfig cfg = anr_config_for_mode_grid(
+    16000, 256, ANR_MODE_BALANCED);
 
-if (!mmse_lsa_validate_config(&cfg)) {
+if (!anr_validate_config(&cfg)) {
     /* 不支援的 grid 或參數 */
 }
 ```
 
-只傳 sample rate 的 `mmse_lsa_config_for_mode()` 會選該 rate 的預設 grid；16 kHz 要選
+只傳 sample rate 的 `anr_config_for_mode()` 會選該 rate 的預設 grid；16 kHz 要選
 512/256 時，應明確使用 `_for_mode_grid()`。
 
 Heap 路徑：
 
 ```c
-MmseLsaDenoiser *nr = mmse_lsa_create(&cfg);
+AnrDenoiser *nr = anr_create(&cfg);
 /* ... process ... */
-mmse_lsa_destroy(nr);
+anr_destroy(nr);
 ```
 
 Static pool 路徑：
 
 ```c
-size_t bytes = mmse_lsa_get_mem_size(&cfg);
+size_t bytes = anr_get_mem_size(&cfg);
 void *pool = board_alloc_aligned(16, bytes);
-MmseLsaDenoiser *nr = pool ? mmse_lsa_init(pool, bytes, &cfg) : NULL;
+AnrDenoiser *nr = pool ? anr_init(pool, bytes, &cfg) : NULL;
 
 /* ... process ... */
-mmse_lsa_destroy(nr);  /* 不釋放 caller pool */
+anr_destroy(nr);  /* 不釋放 caller pool */
 board_free(pool);
 ```
 
@@ -288,7 +288,7 @@ board_free(pool);
 直接套 NR gain，可 in-place：
 
 ```c
-if (mmse_lsa_process(nr, spectrum, spectrum) != 0) {
+if (anr_process(nr, spectrum, spectrum) != 0) {
     /* invalid handle/buffer */
 }
 ```
@@ -299,7 +299,7 @@ AEC + NR + RES gain fusion 應只算 gain、不先改 spectrum：
 float gain[n_freqs];
 const float *extra_r2 = aec_r2_on_audio_power_scale;
 
-if (mmse_lsa_process_gain(nr, error_spec, extra_r2, gain) != 0) {
+if (anr_process_gain(nr, error_spec, extra_r2, gain) != 0) {
     /* error */
 }
 ```
@@ -311,47 +311,47 @@ AEC 的 `AecResContext.r2` 是 int16-square scale，直接交給 NR 前必須除
 
 | API | 用途 |
 |---|---|
-| `mmse_lsa_reset()` | 清除 noise/SPP/gain state；WOLA history 仍由 caller 自己清 |
-| `mmse_lsa_get_gain()` | 最近一 frame 的 gain；borrowed pointer |
-| `mmse_lsa_get_spp()` | 最近一 frame 的 SPP；borrowed pointer |
-| `mmse_lsa_get_noise_psd()` | noise PSD；borrowed pointer |
-| `mmse_lsa_debug_status()` | initialized、mean/min gain、SPP、noise floor |
+| `anr_reset()` | 清除 noise/SPP/gain state；WOLA history 仍由 caller 自己清 |
+| `anr_get_gain()` | 最近一 frame 的 gain；borrowed pointer |
+| `anr_get_spp()` | 最近一 frame 的 SPP；borrowed pointer |
+| `anr_get_noise_psd()` | noise PSD；borrowed pointer |
+| `anr_debug_status()` | initialized、mean/min gain、SPP、noise floor |
 
 切 stream 時必須同時 reset NR 與 caller 的 analysis/OLA buffers，不能只 reset 其中一邊。
 
 ### 4.5 執行期改降噪強度
 
 ```c
-int mmse_lsa_reconfigure(MmseLsaDenoiser *nr, const MmseLsaConfig *target);
-int mmse_lsa_set_mode(MmseLsaDenoiser *nr, MmseLsaNrMode mode);
+int anr_reconfigure(AnrDenoiser *nr, const AnrConfig *target);
+int anr_set_mode(AnrDenoiser *nr, AnrMode mode);
 ```
 
 不重新配置任何記憶體，所以 grid（`sample_rate`／`frame_size`／`hop_size`／`fft_size`）
 與兩個決定 pool 大小的欄位（`L`、`num_init_frames`）**必須等於實例當下的值**，
-`target` 另外要完整通過 `mmse_lsa_validate_config()`。回 `0` 或 `-1`；`-1` 時什麼都
+`target` 另外要完整通過 `anr_validate_config()`。回 `0` 或 `-1`；`-1` 時什麼都
 不寫。**在 frame 之間呼叫、與 process 序列化；非 thread-safe。**
 
 狀態是刻意保留的：追蹤中的 noise floor、MCRA 最小值追蹤環、SPP 歷史與 gain 平滑歷史
-全部繼續跑。換強度不是重啟——要重啟請用 `mmse_lsa_reset()`。
+全部繼續跑。換強度不是重啟——要重啟請用 `anr_reset()`。
 
 ```c
-/* A. standalone：直接換 mode。stationary overlay 會被重新套上 */
-if (mmse_lsa_set_mode(nr, MMSE_LSA_NR_AGGRESSIVE) != 0) { /* 引數不合法或 target 被拒 */ }
+/* A. standalone：直接換 mode */
+if (anr_set_mode(nr, ANR_MODE_AGGRESSIVE) != 0) { /* 引數不合法或 target 被拒 */ }
 
 /* B. 自己在 preset 之上疊了覆寫：重組整份組態，逐字交出去 */
-MmseLsaConfig target = mmse_lsa_config_for_mode_grid(sr, fft_size, MMSE_LSA_NR_AGGRESSIVE);
-target.L = mmse_lsa_retime_frames(150, sr, target.hop_size);  /* 我方覆寫 */
+AnrConfig target = anr_config_for_mode_grid(sr, fft_size, ANR_MODE_AGGRESSIVE);
+target.L = anr_retime_frames(150, sr, target.hop_size);  /* 我方覆寫 */
 target.alpha_decay = target.alpha_g;                          /* 我方覆寫 */
-if (mmse_lsa_reconfigure(nr, &target) != 0) { /* grid 不符或 target 無效 */ }
+if (anr_reconfigure(nr, &target) != 0) { /* grid 不符或 target 無效 */ }
 ```
 
-> **兩者不可互換。** `mmse_lsa_reconfigure()` 逐字採用 `target`，不做 preset 查表、
-> 不做 overlay 疊加。`mmse_lsa_set_mode()` 組的是**裸的 canonical preset**，只適用於
+> **兩者不可互換。** `anr_reconfigure()` 逐字採用 `target`，不做 preset 查表、
+> 不做 overlay 疊加。`anr_set_mode()` 組的是**裸的 canonical preset**，只適用於
 > standalone。兩條出貨 pipeline 的 NR 組態都是「canonical preset **加上**自己的覆寫」
 > （`L`、`alpha_decay`），把 canonical preset 交給
-> `mmse_lsa_set_mode()` 在這種實例上會被**拒絕**（它的 `L` 不同）——這正是
+> `anr_set_mode()` 在這種實例上會被**拒絕**（它的 `L` 不同）——這正是
 > `audio_pipeline_set_nr_mode()` / `four_aec_nr_res_set_nr_mode()` 各自重組完整組態
-> 再呼叫 `mmse_lsa_reconfigure()` 的原因。application 不要繞過 pipeline 的 setter 去
+> 再呼叫 `anr_reconfigure()` 的原因。application 不要繞過 pipeline 的 setter 去
 > 呼叫便利包裝。
 
 ---
@@ -789,7 +789,7 @@ AIAEC 蓋 `CC`/`AR`/`CFLAGS`/`CPPFLAGS`/`SIMD`/`WERROR`，AINR 蓋 `CC`/`AR`/`CF
 -I<AEC>/c_impl/include
 -I<NR>/c_impl/include
 -I<audio_common>/include
-<libaec.a> <libmmse_lsa.a> <libaudio_common.a> -lm
+<libaec.a> <libanr.a> <libaudio_common.a> -lm
 ```
 
 `SIMD_KERNELS_FORCE_SCALAR` 必須在 library 與 include header-only kernels 的 application TU

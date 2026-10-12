@@ -25,16 +25,16 @@ for AEC; MCRA + SPP for NR) inside its single pool segment:
 
 ```c
 size_t aec_sz = aec_get_mem_size(&aec_cfg);          /* lib/aec           */
-size_t nr_sz  = mmse_lsa_get_mem_size(&nr_cfg);      /* lib/nr            */
+size_t nr_sz  = anr_get_mem_size(&nr_cfg);      /* lib/nr            */
 size_t fft_sz = fft_get_mem_size(fft_size);          /* audio_common (OLA) */
 /* + pipeline buffers; every segment 16-byte aligned (ALIGN16)            */
 
 Aec*             aec = aec_init(mem_aec, aec_sz, &aec_cfg);
-MmseLsaDenoiser* nr  = mmse_lsa_init(mem_nr, nr_sz, &nr_cfg);
+AnrDenoiser* nr  = anr_init(mem_nr, nr_sz, &nr_cfg);
 FftHandle*       fft = fft_init(mem_fft, fft_sz, fft_size);
 /* destroy() on static instances frees no pool memory (runtime is_static)
  * and, since P0001, releases no backend-owned handle OUTSIDE the pool
- * either: on BOTH backends every one of aec_destroy/mmse_lsa_destroy/
+ * either: on BOTH backends every one of aec_destroy/anr_destroy/
  * fft_destroy above is a genuine no-op for a pool-resident instance --
  * nothing lives outside mem_aec/mem_nr/mem_fft to leak or double-free, so
  * each is safe to call any number of times (including never, if the caller
@@ -147,7 +147,7 @@ aligned (both libraries assert this).
 - **Mixing `_create()` and pool APIs per submodule is not supported.**
   Don't hand-carve one of AEC/NR/the FFT backend into a pool segment
   yourself while letting `audio_pipeline_create()` heap-allocate another,
-  and don't call `aec_create()`/`mmse_lsa_create()`/`fft_create()` directly
+  and don't call `aec_create()`/`anr_create()`/`fft_create()` directly
   alongside this library's own carve. `audio_pipeline_init()`/`_init_ex()`
   own the ENTIRE pool layout (control block + AEC + FFT + NR + the 8
   pipeline scratch buffers) as one unit — there is no supported way to substitute

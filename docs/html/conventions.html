@@ -71,7 +71,7 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <tr><td>48 k</td><td>1024 / 512（513）</td><td>預設（唯一）</td></tr>
 <tr><td rowspan="3">NR（<code>lib/nr/c_impl</code>）</td>
 <td>8 k</td><td>128 / 64（65）；替代 256 / 128</td><td>預設 128</td>
-<td rowspan="3"><code>mmse_lsa_types.h</code> <code>mmse_lsa_default_fft_size()</code>
+<td rowspan="3"><code>anr_types.h</code> <code>anr_default_fft_size()</code>
 （48k→1024、16k→256、8k→128；註明 16 ms-hop 替代 grid 8k/256、16k/512）</td></tr>
 <tr><td>16 k</td><td>256 / 128（129）；替代 512 / 256</td><td>預設 256</td></tr>
 <tr><td>48 k</td><td>1024 / 512（513）</td><td>預設（唯一）</td></tr>
@@ -303,10 +303,10 @@ sqrt-Hann 1024/512 分析。AEC delay 改變<b>不</b>重置 stage 或 bridge：
 <li>AEC 的時間常數多以 legacy 10 ms hop（hop=160@16k）撰寫，於
 <code>aec_carve()</code>/<code>aec3_growth_rehop()</code> 對實際 grid 即時 retime
 （<code>aec.h</code> 各欄位註解）；<b>不要</b>在程式碼裡寫入已 retime 的字面值。</li>
-<li>NR 有兩個 authoring 基準並存：10 ms 參考（<code>mmse_lsa_retime_alpha</code>）
-與 16 ms 撰寫（<code>mmse_lsa_retime_alpha_ref(..., 0.016)</code>，如
+<li>NR 有兩個 authoring 基準並存：10 ms 參考（<code>anr_retime_alpha</code>）
+與 16 ms 撰寫（<code>anr_retime_alpha_ref(..., 0.016)</code>，如
 alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
-從錯的基準 retime 會 double-correct（<code>mmse_lsa_types.h</code> 註解）。</li>
+從錯的基準 retime 會 double-correct（<code>anr_types.h</code> 註解）。</li>
 <li>換 grid（如 16k 256↔512）時這些機制讓行為以 wall-clock 不變；
 但 <b>alpha 值本身會不同</b>，比對常數要先問「authoring grid 是哪個」。</li>
 </ul>
@@ -315,7 +315,7 @@ alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
 <table>
 <tr><th>類別</th><th>路徑</th></tr>
 <tr><td>Grid 定義</td><td><code>lib/aec/c_impl/src/aec.c</code>（defaults/validate/676-678）、
-<code>lib/nr/c_impl/include/mmse_lsa_types.h</code>、<code>pipelines/mono_aec_nr_res/pipeline_dims.h</code></td></tr>
+<code>lib/nr/c_impl/include/anr_types.h</code>、<code>pipelines/mono_aec_nr_res/pipeline_dims.h</code></td></tr>
 <tr><td>視窗</td><td><code>lib/aec/c_impl/src/pbfdkf.c</code>、
 <code>lib/aec/c_impl/include/aec3_balanced_config.h</code>、
 <code>pipelines/mono_aec_nr_res/audio_pipeline.c</code>、<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c</code>、

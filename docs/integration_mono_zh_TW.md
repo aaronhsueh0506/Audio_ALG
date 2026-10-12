@@ -35,7 +35,7 @@ mic hop + ref hop  ──►  linear AEC  ──►  echo-aware NR  ──►  R
 #include "audio_pipeline.h"
 ```
 
-`audio_pipeline.h` 自己會拉進 `aec.h` 與 `mmse_lsa_denoiser.h`，後者再拉進 `fft_wrapper.h` 等。
+`audio_pipeline.h` 自己會拉進 `aec.h` 與 `anr.h`，後者再拉進 `fft_wrapper.h` 等。
 你不需要、也不應該自己 include 那些下游 header。
 
 ### 1.3 `Complex` type 從哪來
@@ -70,7 +70,7 @@ link 順序有意義（單向相依，由上而下）：
 你的 .o
 libaudio_pipeline.a
 libaec.a
-libmmse_lsa.a
+libanr.a
 libaudio_common.a
 -lm
 ```
@@ -132,7 +132,7 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
   -I <audio_common>/include \
   <pipelines-bin>/libaudio_pipeline.a \
   <aec-bin>/libaec.a \
-  <nr-bin>/libmmse_lsa.a \
+  <nr-bin>/libanr.a \
   <audio_common-bin>/libaudio_common.a \
   -lm
 ```
@@ -176,7 +176,7 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
 | `audio_pipeline_n_freqs(p)` | 頻域 bin 數（`fft_size/2 + 1`） |
 | `audio_pipeline_sample_rate(p)` | 實際生效的取樣率 |
 | `audio_pipeline_get_aec(p)` | 取得底層 `Aec*`，**只**用來做你自己的診斷讀取 |
-| `audio_pipeline_get_nr(p)` | 取得底層 `MmseLsaDenoiser*`，同上；`cfg.aec_only` 時為 `NULL` |
+| `audio_pipeline_get_nr(p)` | 取得底層 `AnrDenoiser*`，同上；`cfg.aec_only` 時為 `NULL` |
 
 `get_aec()` / `get_nr()` 拿到的 handle **不可**直接呼叫任何 `_reset` / `_destroy` /
 會改狀態的 entry point —— 一定要走 `audio_pipeline_reset()` / `audio_pipeline_destroy()`，
@@ -201,7 +201,7 @@ audio_pipeline_get_last_timing(p, &t);
 | `frontend_us` | AEC 到主濾波器之前的**其餘**部分：mic HPF、飽和、render activity、`mu_scale`、mic-clip、RSA、shadow filter。**不含 `delay_us`**，兩者不重複計算 |
 | `linear_us` | AEC 主自適應濾波器（`pbfdkf_process`），含 far-end FFT |
 | `res_us` | AEC 自己的 AEC3 post/RES 區塊 |
-| `nr_us` | `r2/PSD_SCALE` 摺入 ＋ `mmse_lsa_process_gain()` |
+| `nr_us` | `r2/PSD_SCALE` 摺入 ＋ `anr_process_gain()` |
 | `post_us` | 兩者之間的增益運算：`min(G_nr, G_res)`、頻譜套用、comfort noise |
 | `synth_us` | 逆轉換、加窗 overlap-add、hop 送出與位移 |
 
@@ -250,13 +250,13 @@ offset。
 
 ```c
 int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset, float ramp_ms);
-int audio_pipeline_set_nr_mode(AudioPipeline* p, MmseLsaNrMode mode);
+int audio_pipeline_set_nr_mode(AudioPipeline* p, AnrMode mode);
 ```
 
 ```c
 /* 使用者把回音抑制轉到 aggressive、降噪轉到 mild */
 if (audio_pipeline_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { /* 引數不合法 */ }
-if (audio_pipeline_set_nr_mode(p, MMSE_LSA_NR_MILD) != 0)                   { /* 同上 */ }
+if (audio_pipeline_set_nr_mode(p, ANR_MODE_MILD) != 0)                   { /* 同上 */ }
 
 audio_pipeline_process(p, mic, ref, out);   /* 下一個 hop 起生效 */
 ```
@@ -275,10 +275,10 @@ ramp 進行中再呼叫一次，會從當前的 live 值重新起走。
 全部繼續跑。要重啟請用 `audio_pipeline_reset()`。**在兩個 hop 之間呼叫、與
 `audio_pipeline_process()` 序列化；非 thread-safe。**
 
-> **不要繞過 `set_nr_mode()` 去呼叫 `mmse_lsa_set_mode()`。** 本 pipeline 的 NR
-> 組態是「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`）。`mmse_lsa_set_mode()` 組的是裸的 canonical preset，在本 pipeline
+> **不要繞過 `set_nr_mode()` 去呼叫 `anr_set_mode()`。** 本 pipeline 的 NR
+> 組態是「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`）。`anr_set_mode()` 組的是裸的 canonical preset，在本 pipeline
 > 的實例上會被**拒絕**（它的 `L` 不同）——所以 `audio_pipeline_set_nr_mode()` 做的事
-> 是重組本 pipeline 的完整組態，再交給 `mmse_lsa_reconfigure()`。
+> 是重組本 pipeline 的完整組態，再交給 `anr_reconfigure()`。
 
 **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
 hop 上生效：double-talk 期間套用的是 DT 地板，而 DT 地板在三個 preset 之間**完全
@@ -311,7 +311,7 @@ AudioPipelineConfig cfg = audio_pipeline_default_config(16000);
 | `sample_rate` | `int` | 你傳給 `default_config()` 的值 | `8000` / `16000` / `48000`。其他一律拒絕（例如 `44100` 會在任何 size 運算之前就被擋掉） | 設成你音訊實際的取樣率。這個值同時決定預設 grid |
 | `fft_size` | `int` | `0` | `0` = 依 rate 取預設。明確指定時：8 kHz 只接受 `256`；16 kHz 接受 `256` 或 `512`；48 kHz 只接受 `1024`。其他組合拒絕 | 除非你有明確理由要 16 kHz 的 512 grid，否則留 `0` |
 | `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `AEC_PRESET_MILD`(0) / `AEC_PRESET_BALANCED`(1) / `AEC_PRESET_AGGRESSIVE`(2)。列舉以外的整數會被拒絕（**不會**默默 fallback 成 balanced） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE`；不確定就留預設 |
-| `nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED`（= 2） | `MMSE_LSA_NR_MILD`(0) / `MMSE_LSA_NR_MODERATE`(1) / `MMSE_LSA_NR_BALANCED`(2) / `MMSE_LSA_NR_AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度。四級都可用（CLI 只認得其中三個，library API 四個都能設） |
+| `nr_mode` | `AnrMode` | `ANR_MODE_BALANCED`（= 2） | `ANR_MODE_MILD`(0) / `ANR_MODE_MODERATE`(1) / `ANR_MODE_BALANCED`(2) / `ANR_MODE_AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度。四級都可用（CLI 只認得其中三個，library API 四個都能設） |
 | `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不建 MMSE-LSA（state 不進 pool、`get_nr()` 回 `NULL`），`g_total` 只剩 `G_res`。`aec_only=1` 時無作用 |
 | `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不套 AEC3 殘留 gain（`G_res` 視為 1），`g_total` 只剩 `G_nr`，CNG 因為沒有被 RES 挖掉的 bin 而不填。兩者都 `0` 就是線性殘差經合成直通。`aec_only=1` 時無作用 |
 | `aec_only` | `int`（bool） | `0` | 只接受 `0` 或 `1`。`2` 之類的「truthy」值會被拒絕 | `1` = 只跑 linear AEC，完全跳過 NR/RES/最終 OLA。用來隔離問題，或你自己接後級。此時 `get_nr()` 回 `NULL`，且 FFT/NR/pipeline buffer 都不配置 |
@@ -431,7 +431,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 | `audio_pipeline_get_nr()` | 非 NULL | `NULL`（`p == NULL`，或 `cfg.aec_only == 1`） | 無 |
 
 > **注意慣例不一致**：本層的 `get_mem_requirements()` / `get_mem_breakdown()` 用 **0 = 成功 / −1 = 失敗**；
-> 但底下模組的 `aec_get_mem_size()` / `mmse_lsa_get_mem_size()` / `fft_get_mem_size()` 是
+> 但底下模組的 `aec_get_mem_size()` / `anr_get_mem_size()` / `fft_get_mem_size()` 是
 > **回傳 0 代表失敗**。如果你直接呼叫那些下層 function，判斷式要反過來寫。
 
 ### 5.2 `audio_pipeline_init()` 的完整拒絕清單
@@ -444,7 +444,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 4. `bytes` 連 `AudioPipeline` 控制區塊都放不下 → `NULL` + stderr
 5. 扣掉控制區塊後的 sub-pool 太小 → `NULL` + stderr
 6. `aec_init()` 失敗 → `NULL` + stderr
-7. `fft_init()` 或 `mmse_lsa_init()` 失敗（非 `aec_only` 時）→ `NULL` + stderr
+7. `fft_init()` 或 `anr_init()` 失敗（非 `aec_only` 時）→ `NULL` + stderr
 8. pipeline 與 AEC 的 `n_freqs`/`hop` 不一致，或與 FFT/NR 的 `n_freqs` 不一致 → `NULL` + stderr
 
 ### 5.3 `audio_pipeline_init_ex()` 額外的 8 項 descriptor 檢查
@@ -518,7 +518,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 
 建置與連結：
 
-- [ ] 四個 archive（`libaudio_pipeline.a` / `libaec.a` / `libmmse_lsa.a` / `libaudio_common.a`）
+- [ ] 四個 archive（`libaudio_pipeline.a` / `libaec.a` / `libanr.a` / `libaudio_common.a`）
       是用**同一組** backend 與編譯選項建出來的
 - [ ] link 順序照 §1.5
 - [ ] `BACKEND=ne10` 時最終 link 用 C++ driver
@@ -586,7 +586,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
   sizing 公式改變時遞增。AEC / NR / FFT backend 各自內部佈局的改變**不會**動這個版本 ——
   那些改變本來就會改到 `bytes`，會被 pool 過小的檢查抓到。
 * `build_flags_hash`：涵蓋 backend 身分、本檔案自己 7 個 scratch buffer 的 carve 順序、
-  以及對齊粒度。**不涵蓋** `AecConfig` / `MmseLsaConfig` 的 preset 與 tunable 數值
+  以及對齊粒度。**不涵蓋** `AecConfig` / `AnrConfig` 的 preset 與 tunable 數值
   （那些是 config 不是 layout，且已經反映在 `bytes` 上）、也不涵蓋 compiler / ABI / toolchain。
 
 ### 8.4 相容性規則（給整合者的三條）

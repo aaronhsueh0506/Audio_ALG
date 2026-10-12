@@ -14,7 +14,7 @@
 目前 C 端可用產物是：
 
 - AEC static library：`lib/aec/c_impl/bin/libaec.a`
-- NR static library：`lib/nr/c_impl/bin/libmmse_lsa.a`
+- NR static library：`lib/nr/c_impl/bin/libanr.a`
 - 共用層 library（FFT/fast_math/hpf）：`../audio_common/bin/<backend>/libaudio_common.a`
 - malloc reference executable：config-keyed `pipelines/bin/.../aec_nr_pipeline`
   （source：`pipelines/mono_aec_nr_res/main.c`）
@@ -143,7 +143,7 @@ cc -std=gnu99 -O2 -Wall -Wextra \
   -I../audio_common/include \
   app.c \
   -Llib/aec/c_impl/bin -laec \
-  -Llib/nr/c_impl/bin -lmmse_lsa \
+  -Llib/nr/c_impl/bin -lanr \
   ../audio_common/bin/kiss/libaudio_common.a -lm -o app
 ```
 
@@ -230,8 +230,8 @@ DUMP_CTX=/tmp/pipeline_ctx.bin \
 
 #include "aec.h"
 #include "fft_wrapper.h"
-#include "mmse_lsa_denoiser.h"
-#include "mmse_lsa_types.h"
+#include "anr.h"
+#include "anr_types.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -242,7 +242,7 @@ DUMP_CTX=/tmp/pipeline_ctx.bin \
 typedef struct {
     Aec *aec;
     int aec_ready;
-    MmseLsaDenoiser *nr;
+    AnrDenoiser *nr;
     FftHandle *fft;
     int hop;
     int frame_size;
@@ -283,7 +283,7 @@ void audio_alg_destroy(AudioAlgPipeline *p)
     if (!p) return;
     if (p->aec_ready) aec_destroy(p->aec);
     free(p->aec);
-    mmse_lsa_destroy(p->nr);
+    anr_destroy(p->nr);
     fft_destroy(p->fft);
     free(p->linear);
     free(p->window);
@@ -298,11 +298,11 @@ void audio_alg_destroy(AudioAlgPipeline *p)
 }
 
 int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
-                   AecPreset aec_preset, MmseLsaNrMode nr_mode,
+                   AecPreset aec_preset, AnrMode nr_mode,
                    int enable_cng)
 {
     AecConfig aec_cfg;
-    MmseLsaConfig nr_cfg;
+    AnrConfig nr_cfg;
     int k;
 
     if (!p) return -1;
@@ -325,16 +325,16 @@ int audio_alg_init(AudioAlgPipeline *p, int sample_rate,
 
     /* Use the grid-explicit entry point (matching pipelines/mono_aec_nr_res/audio_pipeline.c)
      * so NR resolves the SAME fft_size the AEC instance above just picked --
-     * the 2-arg mmse_lsa_config_for_mode() instead resolves NR's OWN
+     * the 2-arg anr_config_for_mode() instead resolves NR's OWN
      * independent per-rate default grid, which is not the AEC default at
      * every rate (e.g. NR defaults to 128 at 8 kHz, AEC to 256) and would
      * silently create an NR instance sized for the wrong n_freqs.
      * L/alpha_d/alpha_attack are already correctly wall-clock-retimed for
-     * this grid by mmse_lsa_config_for_mode_grid() -- do not override them
+     * this grid by anr_config_for_mode_grid() -- do not override them
      * with fixed literals authored for a different (10 ms/16 ms) grid. */
-    nr_cfg = mmse_lsa_config_for_mode_grid(sample_rate, p->fft_size, nr_mode);
+    nr_cfg = anr_config_for_mode_grid(sample_rate, p->fft_size, nr_mode);
 
-    p->nr = mmse_lsa_create(&nr_cfg);
+    p->nr = anr_create(&nr_cfg);
     p->fft = fft_create(p->fft_size);
     p->linear = (float *)malloc((size_t)p->hop * sizeof(float));
     p->window = (float *)malloc((size_t)p->frame_size * sizeof(float));
@@ -385,7 +385,7 @@ int audio_alg_process(AudioAlgPipeline *p,
     for (k = 0; k < p->n_freqs; ++k)
         p->extra[k] = ctx.r2 ? ctx.r2[k] / PSD_SCALE : 0.0f;
 
-    if (mmse_lsa_process_gain(p->nr, ctx.error_spec,
+    if (anr_process_gain(p->nr, ctx.error_spec,
                               ctx.r2 ? p->extra : NULL, p->g_nr) < 0)
         return -1;
 
@@ -427,7 +427,7 @@ void audio_alg_reset(AudioAlgPipeline *p)
 {
     if (!p || !p->aec_ready || !p->nr) return;
     aec_reset(p->aec);
-    mmse_lsa_reset(p->nr);
+    anr_reset(p->nr);
     memset(p->ola, 0, (size_t)p->frame_size * sizeof(float));
     p->rng = 0x9e3779b9u;
 }
@@ -440,7 +440,7 @@ void audio_alg_reset(AudioAlgPipeline *p)
 AudioAlgPipeline pipeline;
 if (audio_alg_init(&pipeline, 16000,
                    AEC_PRESET_BALANCED,
-                   MMSE_LSA_NR_BALANCED, 1) != 0)
+                   ANR_MODE_BALANCED, 1) != 0)
     return -1;
 
 int hop = audio_alg_hop_size(&pipeline);
@@ -497,7 +497,7 @@ NR preset（`--nr-preset`，見 §4.1）：
 | balanced | 預設平衡 |
 | aggressive | 最強背景降噪 |
 
-> `mmse_lsa_config_for_mode()` 底層其實有第四級 `moderate`（介於 mild 與 balanced 之間，`g_min_db -25`，standalone NR 的 `denoise_wav --nr-mode` 可直接選用），但 `aec_nr_pipeline` 的 `parse_nr_mode()`（`pipelines/mono_aec_nr_res/main.c`）只認得 `"mild"`／`"aggressive"` 字串，其餘（含 `"moderate"`）一律 silently 落回 `balanced`，不會報錯。也就是說目前這條 pipeline 的 `--nr-preset` 實際只有三個可達 preset；要用 moderate 必須自己呼叫 library API。
+> `anr_config_for_mode()` 底層其實有第四級 `moderate`（介於 mild 與 balanced 之間，`g_min_db -25`，standalone NR 的 `denoise_wav --nr-mode` 可直接選用），但 `aec_nr_pipeline` 的 `parse_nr_mode()`（`pipelines/mono_aec_nr_res/main.c`）只認得 `"mild"`／`"aggressive"` 字串，其餘（含 `"moderate"`）一律 silently 落回 `balanced`，不會報錯。也就是說目前這條 pipeline 的 `--nr-preset` 實際只有三個可達 preset；要用 moderate 必須自己呼叫 library API。
 
 Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`alpha_attack=0.3`、`alpha_decay=alpha_g`，這是針對 AEC residual signal 的結構性 tuning；不要直接用 standalone NR 的所有預設取代。
 
@@ -511,7 +511,7 @@ Audio_ALG pipeline 會在 preset 之上固定套用 `L=150`、`alpha_d=0.95`、`
 - create 失敗時必須釋放已成功建立的子模組與 buffer。
 - malloc reference path（`aec_nr_pipeline`）在初始化時使用 malloc/calloc；process loop 本身不應配置記憶體。
 - 單一 caller-owned pool 的 static-memory 版本已完整支援：`aec_nr_pipeline_static` 用三個複合 API
-  （`aec_get_mem_size`/`aec_init`、`mmse_lsa_get_mem_size`/`mmse_lsa_init`、`fft_get_mem_size`/`fft_init`）
+  （`aec_get_mem_size`/`aec_init`、`anr_get_mem_size`/`anr_init`、`fft_get_mem_size`/`fft_init`）
   從一塊 16-byte 對齊的 pool 切出全部記憶體，init 後零 malloc，輸出與 malloc 版 byte-identical。
   NR 與 AEC 的 static API 都在各自的 `main` branch（runtime 選擇，同一份 `.a` 兩套
   API 並存；`.gitmodules` 兩個 submodule 均釘 `main`）。

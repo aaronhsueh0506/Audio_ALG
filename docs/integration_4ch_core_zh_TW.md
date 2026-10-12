@@ -49,7 +49,7 @@ mic hop [hop][4] + ref hop [hop]
 #include "4aec_nr_res.h"
 ```
 
-一行就夠。它自己會拉進 `aec.h` 與 `mmse_lsa_denoiser.h`，後者再拉進 `fft_wrapper.h`。
+一行就夠。它自己會拉進 `aec.h` 與 `anr.h`，後者再拉進 `fft_wrapper.h`。
 
 ### 1.3 `Complex` type 從哪來
 
@@ -82,7 +82,7 @@ mic hop [hop][4] + ref hop [hop]
 你的 .o
 libaudio_pipeline_4ch.a
 libaec.a
-libmmse_lsa.a
+libanr.a
 libaudio_common.a
 -lm
 ```
@@ -160,7 +160,7 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
   -I <audio_common>/include \
   <4ch-bin>/libaudio_pipeline_4ch.a \
   <aec-bin>/libaec.a \
-  <nr-bin>/libmmse_lsa.a \
+  <nr-bin>/libanr.a \
   <audio_common-bin>/libaudio_common.a \
   -lm
 ```
@@ -220,7 +220,7 @@ pipeline 自己不回讀，也不影響處理。`p` 為 NULL 或已 destroy 時�
 不是失敗；`out` 不得為 NULL。
 
 **八個欄位分成兩個來源。** 本層自己量的是 `fuse_us`、`res_us`（功率準備 ＋
-抑制增益）、`nr_us`（R² prior 摺入 ＋ `mmse_lsa_process_gain()`）、`synth_us`（逆轉換 ＋ 加窗 overlap-add ＋ hop 送出），以及
+抑制增益）、`nr_us`（R² prior 摺入 ＋ `anr_process_gain()`）、`synth_us`（逆轉換 ＋ 加窗 overlap-add ＋ hop 送出），以及
 `delay_us` 的共用延遲估計部分（不含 `align_render()` 的 ring-buffer 複製與
 realign 掃描）。
 
@@ -256,7 +256,7 @@ wall-clock 成本。lane 內部的 `delay_us` 也一併加進上面的 `delay_us
 
 ```c
 int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset, float ramp_ms);
-int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, MmseLsaNrMode mode);
+int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, AnrMode mode);
 int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live, float* target);
 ```
 
@@ -272,7 +272,7 @@ int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live, float* 
 ```c
 /* 使用者把回音抑制轉到 aggressive、降噪轉到 mild */
 if (four_aec_nr_res_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { /* 引數不合法 */ }
-if (four_aec_nr_res_set_nr_mode(p, MMSE_LSA_NR_MILD) != 0)                  { /* 同上 */ }
+if (four_aec_nr_res_set_nr_mode(p, ANR_MODE_MILD) != 0)                  { /* 同上 */ }
 
 /* 想確認要求有沒有落地，就讀這一對（單位是線性功率，不是 dB） */
 float live, target;
@@ -300,10 +300,10 @@ if (four_aec_nr_res_post_split_floor(p, &live, &target) == 0 && live == target) 
 **撐得過 reset**（目標值另存一份，reset 會重新套用），但 ramp 進度會被丟掉。
 **在兩個 hop 之間呼叫、與 `process_pre()`／`process_post()` 序列化；非 thread-safe。**
 
-> **不要繞過 `set_nr_mode()` 去呼叫 `mmse_lsa_set_mode()`。** 本核心的 NR 組態是
-> 「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`）。`mmse_lsa_set_mode()` 組的是裸的 canonical preset，在本核心的
+> **不要繞過 `set_nr_mode()` 去呼叫 `anr_set_mode()`。** 本核心的 NR 組態是
+> 「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`）。`anr_set_mode()` 組的是裸的 canonical preset，在本核心的
 > 實例上會被**拒絕**（它的 `L` 不同）——所以 `four_aec_nr_res_set_nr_mode()` 做的
-> 事是重組本核心的完整組態，再交給 `mmse_lsa_reconfigure()`。
+> 事是重組本核心的完整組態，再交給 `anr_reconfigure()`。
 
 **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
 hop 上生效：double-talk 期間本核心強制套用 DT 地板，而 DT 地板在三個 preset 之間
@@ -338,7 +338,7 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 | `capture_proxy_channel` | `int` | `0` | `[0, 3]`。其他值拒絕 | 共用 delay matcher 要用哪一支麥克風當輸入。挑訊噪比最穩定、離喇叭關係最典型的那一支 |
 | `max_delay_ms` | `float` | `1024.0f` | 必須是有限值，且落在 `[0.0, 4096.0]` | 共用 reference delay line 的容量上限（毫秒）。實際的 ring 大小 = `ceil(max_delay_ms * sample_rate / 1000) + 2 * hop + 1` 個 sample。設得比你系統真實最大 mic↔ref 延遲**略大**即可；設太大只是白白吃記憶體 |
 | `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `MILD`(0) / `BALANCED`(1) / `AGGRESSIVE`(2)。列舉以外拒絕（**不會**默默 fallback） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE` |
-| `nr_mode` | `MmseLsaNrMode` | `MMSE_LSA_NR_BALANCED`（= 2） | `MILD`(0) / `MODERATE`(1) / `BALANCED`(2) / `AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度，四級都可用 |
+| `nr_mode` | `AnrMode` | `ANR_MODE_BALANCED`（= 2） | `MILD`(0) / `MODERATE`(1) / `BALANCED`(2) / `AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度，四級都可用 |
 | `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = post 級跳過 MMSE-LSA，`total_gain` 只由 RES 決定；RES／CNG／iFFT／WOLA 照常。給「要回聲抑制但不要降噪」的產品 |
 | `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不建 post-beam RES（state 不進 pool），`total_gain` 只由 NR 決定，CNG 沒有被 RES 挖掉的 bin 可填故略過；`set_aec_preset()`／`post_split_floor()` 回 `-1`。`enable_post` 優先於 `enable_res`／`enable_nr`：`enable_post=0` 兩者無作用，`enable_post=1` 兩者獨立組合，都 `0` 即 beamform 後線性誤差經合成直通 |
 | `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 RES 抑制掉的 bin 填舒適噪音，位準再乘該 bin 的 NR gain、下限 −10 dB |
@@ -588,7 +588,7 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 
 > **注意慣例不一致**：本層的 `get_mem_requirements()` / `get_mem_breakdown()` 用
 > **0 = 成功 / −1 = 失敗**；但下層模組的 `aec_get_mem_size()` /
-> `mmse_lsa_get_mem_size()` / `fft_get_mem_size()` 是**回傳 0 代表失敗**。
+> `anr_get_mem_size()` / `fft_get_mem_size()` 是**回傳 0 代表失敗**。
 > 另外，形狀 accessor 用 `-1` 表示無效 handle，而結構稽核 accessor 用 `0`。
 
 ### 5.5 診斷輸出去向
@@ -651,7 +651,7 @@ destroy 之後不要再呼叫任何 accessor。
 
 建置與連結：
 
-- [ ] 四個 archive（`libaudio_pipeline_4ch.a` / `libaec.a` / `libmmse_lsa.a` /
+- [ ] 四個 archive（`libaudio_pipeline_4ch.a` / `libaec.a` / `libanr.a` /
       `libaudio_common.a`）是用**同一組** backend 與編譯選項建出來的
 - [ ] link 順序照 §1.5；沒有多連 `libdoa.a` / `libgsc.a` / `libspatial_common.a`
 - [ ] `BACKEND=ne10` 時最終 link 用 C++ driver
