@@ -894,29 +894,31 @@ is routinely misattributed to a real bug.
 
 | Suite | Count |
 |---|---:|
-| `AEC` `make test-rate-structural` | 370 |
-| `AEC` `make test-config-validation` | 388 |
+| `AEC` `make test-rate-structural` | 382 |
+| `AEC` `make test-config-validation` | 404 |
 | `AEC` `make test-delay-reset` | 16 |
 | `AEC` `make test-delay-backward-quarantine` | 22 |
-| `AEC` `python3 -m pytest python/tests` | 289 |
-| `NR` `python3 -m pytest tests` | 56 |
-| `Audio_ALG/lib/nr` `python3 -m pytest tests` | 56 |
-| `Audio_ALG` `python3 -m pytest pipelines` | 127 |
-| `Audio_ALG` `python3 -m pytest AIAEC` | 611 |
-| `Audio_ALG` `python3 -m pytest AINR` | 228 |
-| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 966 |
+| `AEC` `make test-aec-res` | 264 |
+| `AEC` `make test-linear-context` | 201 |
+| `AEC` `python3 -m pytest python/tests` | 308 |
+| `NR` / `Audio_ALG/lib/nr` `python3 -m pytest python/tests` | 76 |
+| `Audio_ALG` `python3 -m pytest pipelines` | 157 |
+| `Audio_ALG` `python3 -m pytest AIAEC` | 702 |
+| `Audio_ALG` `python3 -m pytest AINR` | 301 |
+| `Audio_ALG` `python3 -m pytest AIAEC AINR pipelines` | 1160 |
 
-The four `Audio_ALG` rows were measured together (same tree,
-same `SE/.venv` Python; the combined invocation ran to completion: 965 passed,
-1 skipped, 13 min 53 s). The `AEC` and `NR` rows above them were measured
-separately. The three per-package rows sum
-exactly to the combined row, which is the check that the combined invocation
-collected everything. The `pipelines` row grew from 72 with the
-DeepFilterNet2 pipeline work (`pipelines/tests/test_dfn2_stage.py`,
-`test_dfn2_stage_c_parity.py`, `test_dfn2_pipeline_contract.py`,
-`test_dfn2_4ch_contract.py`, `test_dfn2_rate_adapter.py`,
-`test_dfn2_rate_bridge_c_parity.py`, `test_cng_aec3.py`, and the four new
-layout macros in `test_doc_layout_versions.py`).
+The `AEC` rows were measured on the AEC repository tip and the `NR` row on the
+revision pinned in `Audio_ALG/lib/nr`; the NR repository tip carries the same
+`python/` tree. The three per-package `Audio_ALG` rows are collection counts
+(`--collect-only`) and sum exactly to the combined row, which is the check that
+the combined invocation collects everything. The combined invocation itself ran
+to completion: 1158 passed, 1 skipped, 1 failed, in 13 min 59 s. The failure is
+`AIAEC/tests/test_training_common.py::test_the_mps_stft_backward_bound_is_where_the_backend_actually_breaks`,
+which probes the host's MPS backend and expects it to still diverge from the CPU
+past a recorded sample bound; on this macOS version the backend agrees with the
+CPU, so the probe reports that the guard constant may be raised. It depends on
+the host's backend, not on this tree, and it is the only red test in the
+combined run.
 
 The combined row is the one that matters, and it is the one that used to be
 impossible: pytest gives every `conftest.py` the same top-level module name, so
@@ -935,25 +937,27 @@ their own directory before importing, as the projects' tests do, and
 combined row, not just the per-package rows, before using these as a gate.
 
 C-side `make test` targets that print `PASS:` markers rather than a count
-(re-measured on the current working tree, KISS backend, `make clean` first):
-`pipelines/mono_aec_nr_res` 78, `pipelines/mono_alignulcnet` 150,
-`pipelines/4ch_aec_bf_nr_res` 502 (one-stop gate, measured the
-same way; also builds and runs the `4ch_alignulcnet` binaries, whose test
-prints a single `All audio_pipeline_4ch_ulcnet tests passed` line and no
-`PASS:` markers). Each additionally prints a small number of
-non-`PASS:` pass lines (static smokes, board-skeleton profiles, adapter).
-
-`mono_alignulcnet` was checked against the pre-built NE10
-binaries in `pipelines/bin/`, not a fresh KISS `make clean`; no
-`PASS:`-marker-count-affecting logic is backend-conditional, so KISS should
-match but has not been independently re-run.
+(KISS backend, `make clean` first, `^PASS:` lines counted):
+`pipelines` (all applications) 306, `pipelines/mono_aec_nr_res` 136,
+`pipelines/mono_alignulcnet` 162 (the same count on the 16 kHz and the
+`ULCNET_GRID=48k` build), `pipelines/4ch_aec_bf_nr_res` 543 (one-stop gate; also
+builds and runs the `4ch_alignulcnet` binaries, whose test prints a single
+`All audio_pipeline_4ch_ulcnet tests passed` line and no `PASS:` markers, and the
+`4ch_aec_bf_dfn_res` command-line runs; the same count on the `ULCNET_GRID=48k`
+build). Each
+additionally prints a small number of non-`PASS:` pass lines (static smokes,
+board-skeleton profiles, adapter).
 
 Pass/fail-only targets (no count): `AEC` `selftest`, `test-counter-saturation`,
 `test-process-context`, `test-shared-far-spec`, `test-shared-fft-handle`,
-`test-static-aec`, `test-zero-heap`, `test-detectors-parity-all`;
-`audio_common` `selftest`, `test_audio_utils`, `test_pool`, `test_wav`,
-`test_wav_nr_style`, `test_zero_heap`, `test_ne10_force_c`; `NR/c_impl` `test`,
-`test-config`; both pipeline `make test` targets.
+`test-static-aec` (needs the doubletalk blind-test wav pair, overridable with
+`TEST_STATIC_MIC` / `TEST_STATIC_REF`), `test-zero-heap`,
+`test-detectors-parity-all`; `audio_common` `selftest` (includes `test_stft` and
+`test_stft_guard`), `test_audio_utils`, `test_pool`, `test_wav`,
+`test_wav_nr_style`, `test_zero_heap`, `test_ne10_force_c`; `NR/c_impl`
+`test-config`, `test-reconfigure`, `test-noise-restart`, `test-scene-change`,
+`test-config-parity`, `test-bit-exact` (plain `make test` there only runs the
+denoiser when a `test.wav` sits next to it, so it is not a gate).
 
 ## Appendix B. Benchmark protocol
 
