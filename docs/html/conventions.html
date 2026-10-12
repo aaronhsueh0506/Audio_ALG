@@ -79,10 +79,10 @@ centered 與串流（center=False）framing 在穩態逐 bit 等價。</p>
 <tr><td>mono pipeline（<code>pipelines/</code>）</td><td>8/16/48 k</td>
 <td>同 AEC 白名單；16 k 接受 256 或 512</td>
 <td>16k 預設 256/128（2026-08-02/03 起）</td>
-<td><code>pipelines/mono_aec_nr_res/pipeline_dims.h</code> <code>compute_frame_dims()</code></td></tr>
+<td><code>pipelines/common/se_config.c</code> <code>se_grid_resolve()</code>（<code>allow_8k</code> 由應用的規則給）</td></tr>
 <tr><td>4ch core（<code>4ch_aec_bf_nr_res/</code>）</td><td>16/48 k</td>
 <td>只有三個 grid：16k/256、16k/512、48k/1024（<b>無 8 k</b>）</td><td>16k 預設 256</td>
-<td><code>4aec_nr_res.c</code> sample_rate 檢查；<code>aec.c:150-160</code> 註解</td></tr>
+<td><code>pipelines/common/se_config.c</code> <code>se_grid_resolve()</code>（<code>allow_8k = 0</code>）；<code>aec.c:150-160</code> 註解</td></tr>
 <tr><td rowspan="2">ULCNet 變體（mono + 4ch）</td><td>16 k</td>
 <td><b>512 / 256（257）</b>；ta_bins 26</td>
 <td rowspan="2">編譯期固定：<code>make ULCNET_GRID=16k|48k</code>
@@ -334,7 +334,7 @@ alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
 <table>
 <tr><th>類別</th><th>路徑</th></tr>
 <tr><td>Grid 定義</td><td><code>lib/aec/c_impl/src/aec.c</code>（defaults/validate/676-678）、
-<code>lib/nr/c_impl/include/anr_types.h</code>、<code>pipelines/mono_aec_nr_res/pipeline_dims.h</code></td></tr>
+<code>lib/nr/c_impl/include/anr_types.h</code>、<code>pipelines/common/se_config.c</code></td></tr>
 <tr><td>視窗</td><td><code>lib/aec/c_impl/src/pbfdkf.c</code>、
 <code>lib/aec/c_impl/include/aec3_balanced_config.h</code>、
 <code>pipelines/mono_aec_nr_res/audio_pipeline.c</code>、<code>pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c</code>、

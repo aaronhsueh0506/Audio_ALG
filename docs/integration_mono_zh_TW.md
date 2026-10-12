@@ -75,7 +75,8 @@ libaudio_common.a
 -lm
 ```
 
-* `libaudio_pipeline.a` **只含一個 object**（`audio_pipeline.o`），不是把 AEC/NR/audio_common
+* `libaudio_pipeline.a` 只含三個 object（`audio_pipeline.o`、`se_config.o`、`se_anr_stage.o`；後兩者是
+  `pipelines/common/` 的共用組態與 NR 級），不是把 AEC/NR/audio_common
   打包進去的 fat archive。上面四個 archive 你都要自己連。
 * 四個 archive 的實際路徑是 config-keyed 的（`bin/<backend>-<hash>/`），不是固定名稱。
   用各自 Makefile 的 `make -s print-lib-path` 取得，不要硬寫路徑。
@@ -276,7 +277,7 @@ ramp 進行中再呼叫一次，會從當前的 live 值重新起走。
 `audio_pipeline_process()` 序列化；非 thread-safe。**
 
 > **不要繞過 `set_nr_mode()` 去呼叫 `anr_set_mode()`。** 本 pipeline 的 NR
-> 組態是「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`）。`anr_set_mode()` 組的是裸的 canonical preset，在本 pipeline
+> 組態是「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`；組成見 `pipelines/common/se_anr_stage.h` 的 `se_anr_compose_config()`）。`anr_set_mode()` 組的是裸的 canonical preset，在本 pipeline
 > 的實例上會被**拒絕**（它的 `L` 不同）——所以 `audio_pipeline_set_nr_mode()` 做的事
 > 是重組本 pipeline 的完整組態，再交給 `anr_reconfigure()`。
 
@@ -492,9 +493,10 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 
 | Source | 產出 | 說明 |
 |---|---|---|
-| `pipelines/mono_aec_nr_res/audio_pipeline.c` | `libaudio_pipeline.a` | archive 內**只有這一個 object**。這是本手冊的主體 |
+| `pipelines/mono_aec_nr_res/audio_pipeline.c` | `libaudio_pipeline.a` | archive 內的主體 object（另兩個是下面 `common/` 的共用碼）。這是本手冊的主體 |
 | `pipelines/mono_aec_nr_res/audio_pipeline.h` | — | 公開 API |
-| `pipelines/mono_aec_nr_res/pipeline_dims.h` | — | grid 解析用的 `static inline` header，被 `audio_pipeline.c` 與兩個 CLI 共用 |
+| `pipelines/common/se_config.c` / `.h` | `libaudio_pipeline.a` | 三個 pipeline 共用的格點解析與 `AecConfig` 推導（`se_derive()`）；各應用的規則（rate 集合、delay 檢查、lane 對齊、seam context）以 `SeRules` 傳入 |
+| `pipelines/common/se_anr_stage.c` / `.h` | `libaudio_pipeline.a` | NR 級：組態組成（canonical preset + `L`/`alpha_decay` 覆寫）、init、逐 hop gain、強度 setter、reset、destroy |
 
 ### 6.2 參考執行檔（全部都有 `main()`，**沒有任何一個會進產品**）
 

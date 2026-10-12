@@ -91,7 +91,7 @@ libaudio_common.a
 ```
 
 * **`audio_pipeline_4ch.o` 不是 archive 成員，必須自己編。**
-  `libaudio_pipeline_4ch.a` 的 `PIPELINE_OBJS` 只含 `4aec_nr_res.o`（見核心版
+  `libaudio_pipeline_4ch.a` 的 `PIPELINE_OBJS` 只含 `4aec_nr_res.o`、`se_config.o`、`se_anr_stage.o`（見核心版
   手冊 §1.5）——本手冊這層的公開 API(`audio_pipeline_4ch_*`)是從
   `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` 編出來的獨立 object,不在
   任何 archive 裡。只連七個 archive、漏了這個 object 會在 link 階段報

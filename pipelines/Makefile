@@ -531,8 +531,8 @@ FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 # prerequisite list / command line, in the fixed order the old hardcoded
 # LIBS variable used: pipeline.o, libaudio_pipeline.a, libaec.a,
 # libanr.a, libaudio_common.a, -lm. libaudio_pipeline.a
-# holds ONLY the pipeline TU (audio_pipeline.o) -- it is not a bundled/fat
-# archive, so it still needs libaec.a/libanr.a/libaudio_common.a linked
+# holds only this repo's own TUs (audio_pipeline.o plus the shared se_config.o and
+# se_anr_stage.o) -- it is not a bundled/fat archive, so it still needs libaec.a/libanr.a/libaudio_common.a linked
 # after it, same as when audio_pipeline.c's logic was file-local code inside
 # each CLI's own .o.
 #
@@ -1059,8 +1059,8 @@ $(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/static_main.c mono_aec_nr_r
 
 # audio_pipeline.o / libaudio_pipeline.a: the pool-sizing/
 # carving/per-hop-processing library TU, linkable independently of either
-# CLI -- see audio_pipeline.h. The archive holds ONLY this one object (not a
-# fat archive bundling libaec/libanr/libaudio_common); those stay
+# CLI -- see audio_pipeline.h. The archive holds this object and the two shared
+# common/ objects below (not a fat archive bundling libaec/libanr/libaudio_common); those stay
 # separate libraries a consumer links alongside it, same as both CLIs do.
 # Compiled with $(LIB_CFLAGS) (not the shared $(CFLAGS)) so NO_STDIO=1 only
 # ever affects THIS object -- see the NO_STDIO comment near CFLAGS above.
@@ -1424,8 +1424,8 @@ test-fp-contract:
 # __stderrp made it into it -- plus that the NO_STDIO=1
 # archive's resolved path actually differs from the default (NO_STDIO=0)
 # config's path, i.e. the two configs cannot silently collide/alias. `ar -t`
-# confirms the archive still holds exactly the one member (audio_pipeline.o)
-# nm's hits are attributed to. Pattern/style mirrors
+# confirms the archive holds its three members (audio_pipeline.o, se_config.o,
+# se_anr_stage.o) nm's hits are attributed to. Pattern/style mirrors
 # ../../audio_common/scripts/audit_alloc_symbols.sh (leading-underscore-
 # tolerant regex, last-whitespace-field match against nm's NAME column, so
 # it works the same under macOS/BSD nm and GNU nm). This IS a pass/fail gate
@@ -1444,7 +1444,9 @@ audit-no-stdio:
 	   echo "FAIL: $$lib_nostdio not found after building libaudio_pipeline.a with NO_STDIO=1"; \
 	   exit 1; \
 	 fi; \
-	 ar -t "$$lib_nostdio" | grep -q '^audio_pipeline\.o$$' || { echo "FAIL: $$lib_nostdio missing audio_pipeline.o member"; exit 1; }; \
+	 for m in audio_pipeline se_config se_anr_stage; do \
+	   ar -t "$$lib_nostdio" | grep -q "^$$m\.o$$" || { echo "FAIL: $$lib_nostdio missing $$m.o member"; exit 1; }; \
+	 done; \
 	 echo "audit-no-stdio: nm -A $$lib_nostdio | grep -E '^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$' (NAME column)"; \
 	 hits=$$(nm -A "$$lib_nostdio" | awk '{ name = $$NF; if (name ~ /^_?(fprintf|printf|puts|fputs|stderr|__stderrp)$$/) print }'); \
 	 if [ -n "$$hits" ]; then \

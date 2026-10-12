@@ -274,7 +274,8 @@ make NO_STDIO=1 audit-no-stdio
 "$(make -s print-bin-dir)/audio_pipeline_4ch_static" --print-mem-size --sample-rate 48000
 ```
 
-`libaudio_pipeline_4ch.a` contains only `4aec_nr_res.o`. Standard and ULCNet
+`libaudio_pipeline_4ch.a` contains `4aec_nr_res.o` and the shared
+`se_config.o` / `se_anr_stage.o` of `pipelines/common`. Standard and ULCNet
 wrapper objects are linked directly into their application binaries; no
 per-application archive is produced. A standard consumer links the core with
 `audio_pipeline_4ch.o`, `libdoa.a`, `libgsc.a`,

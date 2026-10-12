@@ -43,10 +43,12 @@ disas() { fp_contract_disas "$1"; }
 # scalar/NEON and C/Python multiply-then-add contracts remain comparable.
 ENTRIES='
 .:libaudio_pipeline.a:audio_pipeline.o:mono AEC+NR pipeline -- post-NR/RES synthesis WOLA
+.:libaudio_pipeline.a:se_anr_stage.o:NR stage -- retimed configuration and the residual-echo prior scaling
 .:libaudio_pipeline_dfn.a:dfn_res_stage.o:shared DFN post-RES stage -- 2^-5/2^5 boundary scaling
 .:libaudio_pipeline_dfn.a:dfn_rate_bridge.o:DFN rate bridge -- native and 48 kHz WOLA, analysis windows
 .:libaudio_pipeline_dfn.a:dfn2_process.o:DFN feature and streaming compose kernels
 4ch_aec_bf_nr_res:libs:4aec_nr_res.o:4-channel core -- post-beam synthesis WOLA
+4ch_aec_bf_nr_res:libs:se_anr_stage.o:NR stage -- retimed configuration and the residual-echo prior scaling
 4ch_aec_bf_nr_res:4ch_alignulcnet:audio_pipeline_4ch_ulcnet.o:4-channel Align-ULCNet -- beamformed-spectrum WOLA
 '
 

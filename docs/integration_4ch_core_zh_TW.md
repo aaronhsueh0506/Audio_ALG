@@ -87,8 +87,8 @@ libaudio_common.a
 -lm
 ```
 
-* `libaudio_pipeline_4ch.a` 只含**一個** object：`4aec_nr_res.o`（Makefile
-  `PIPELINE_OBJS` 只列這一個 `.o`）。`audio_pipeline_4ch.o`（完整 spatial
+* `libaudio_pipeline_4ch.a` 含三個 object：`4aec_nr_res.o`、`se_config.o`、`se_anr_stage.o`（Makefile
+  `PIPELINE_OBJS`；後兩者是 `pipelines/common/` 的共用組態與 NR 級）。`audio_pipeline_4ch.o`（完整 spatial
   wrapper）**不在這個 archive 裡**——需要它的每個執行檔（`audio_pipeline_4ch_raw`
   等）各自把 `audio_pipeline_4ch.o` 當獨立 object 加進自己的 link 命令，不是
   從 archive 帶出來的。只用本手冊這套 API 時，你的 link 命令根本不提
@@ -301,7 +301,7 @@ if (four_aec_nr_res_post_split_floor(p, &live, &target) == 0 && live == target) 
 **在兩個 hop 之間呼叫、與 `process_pre()`／`process_post()` 序列化；非 thread-safe。**
 
 > **不要繞過 `set_nr_mode()` 去呼叫 `anr_set_mode()`。** 本核心的 NR 組態是
-> 「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`）。`anr_set_mode()` 組的是裸的 canonical preset，在本核心的
+> 「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`；組成見 `pipelines/common/se_anr_stage.h` 的 `se_anr_compose_config()`）。`anr_set_mode()` 組的是裸的 canonical preset，在本核心的
 > 實例上會被**拒絕**（它的 `L` 不同）——所以 `four_aec_nr_res_set_nr_mode()` 做的
 > 事是重組本核心的完整組態，再交給 `anr_reconfigure()`。
 

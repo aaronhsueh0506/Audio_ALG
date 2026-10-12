@@ -87,6 +87,8 @@ SE/                                (同層四個 repo)
       │     ├── 4ch_aec_bf_nr_res/    4ch AEC + BF + NR/RES（並擁有共用 4-lane core）
       │     ├── 4ch_alignulcnet/      4ch AEC + BF + Align-ULCNet
       │     ├── 4ch_aec_bf_dfn_res/   4ch AEC + BF + RES + DFN2（包住上面的核心）
+      │     ├── common/               se_config（格點 + AecConfig 推導）、se_anr_stage（NR 級）：
+      │     │                         mono / 4ch / mono ULCNet 共用
       │     ├── dfn_res_stage.{h,c}   兩支 DFN2 變體共用的 post-RES stage
       │     └── dfn_rate_bridge.{h,c} 原生格點 host ↔ stage 的 48 kHz 格點
       │                               （tests/test_dfn_rate_bridge.c）

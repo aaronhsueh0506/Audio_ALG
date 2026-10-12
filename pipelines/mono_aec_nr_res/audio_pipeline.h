@@ -129,8 +129,9 @@ typedef struct AudioPipeline AudioPipeline;
  * (aec_validate_config / anr_validate_config, both invalid-config ->
  * return 0) PLUS an explicit reject-first check up front, in
  * derive_dims_and_configs() (the one place every entry point in this file
- * funnels through): sample_rate against the {8000,16000,48000} whitelist
- * (aec_is_valid_sample_rate — e.g. sample_rate=44100 is rejected before any
+ * funnels through; the grid and AecConfig come from pipelines/common/
+ * se_config): sample_rate against the {8000,16000,48000} whitelist
+ * (e.g. sample_rate=44100 is rejected before any
  * size arithmetic runs, not just left to a downstream 0), aec_preset/nr_mode
  * against their defined enum values (rather than silently falling through
  * aec_config_from_preset's/anr_config_for_mode's own balanced-default

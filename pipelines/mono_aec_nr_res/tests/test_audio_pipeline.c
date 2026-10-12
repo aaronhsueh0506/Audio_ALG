@@ -22,7 +22,7 @@
  * 48 kHz runs a REDUCED hop count (HOP_COUNT_48K, see below) — AEC's
  * filter_length (and therefore n_partitions/convolution cost) and the
  * pipeline's own hop/n_freqs all scale up substantially above 16 kHz
- * (pipeline_dims.h), so 1000 hops there is materially slower for no added
+ * (the 48 kHz grid), so 1000 hops there is materially slower for no added
  * coverage value versus 8k/16k's 1000; the byte-equal parity check is
  * exactly as conclusive at 300 hops (same LCG-seeded stream, same
  * poisoned-pool-vs-heap comparison, just fewer of them).
@@ -96,7 +96,7 @@ static const float kCngTable[32] = {
 
 #define HOP_COUNT      1000   /* 8 kHz / 16 kHz */
 #define HOP_COUNT_48K   300   /* 48 kHz: filter_length/hop/n_freqs all scale up
-                                * substantially (pipeline_dims.h) -- 300 hops
+                                * substantially (48 kHz grid) -- 300 hops
                                 * keeps runtime sane without weakening the
                                 * byte-equal parity proof (see file header). */
 

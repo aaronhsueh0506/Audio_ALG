@@ -351,7 +351,7 @@ if (anr_reconfigure(nr, &target) != 0) { /* grid 不符或 target 無效 */ }
 > standalone。兩條出貨 pipeline 的 NR 組態都是「canonical preset **加上**自己的覆寫」
 > （`L`、`alpha_decay`），把 canonical preset 交給
 > `anr_set_mode()` 在這種實例上會被**拒絕**（它的 `L` 不同）——這正是
-> `audio_pipeline_set_nr_mode()` / `four_aec_nr_res_set_nr_mode()` 各自重組完整組態
+> `audio_pipeline_set_nr_mode()` / `four_aec_nr_res_set_nr_mode()` 經 `se_anr_stage_set_mode()` 重組完整組態
 > 再呼叫 `anr_reconfigure()` 的原因。application 不要繞過 pipeline 的 setter 去
 > 呼叫便利包裝。
 

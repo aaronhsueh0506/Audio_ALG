@@ -91,6 +91,15 @@ are delivered as separate archives where noted:
 | Mono DFN2 | `mono_aec_dfn_res/` | conventional mono host (NR off) + dual-input DFN2 stage on its post-RES spectrum |
 | 4-ch DFN2 | `4ch_aec_bf_dfn_res/` | 4-lane core (NR off) + external BF/GSC + dual-input DFN2 stage on its post-RES spectrum |
 
+The mono, 4-channel and mono ULCNet applications take their signal grid, AEC
+configuration and delay-request rules from `common/se_config.{h,c}`
+(`se_derive()`; each application passes its own `SeRules`: rate set, strict
+delay check, lane alignment, seam context). The two NR applications also share
+`common/se_anr_stage.{h,c}`: the NR configuration (canonical strength preset
+plus the `L` / `alpha_decay` overrides), init, per-hop gain, the strength setter
+and reset/destroy. NR itself does not carry the overrides, so its own
+`anr_set_mode()` cannot replace the stage's setter.
+
 The ULCNet applications use `../AIAEC/Align_ULCNet/ulcnet_accelerator_adapter.*`: CPU memory owns
 K/V, logit and GRU state, while the board implements one stateless tensor
 invocation callback. An absent/failing accelerator is fail-open. The adapter
@@ -287,7 +296,8 @@ make audit-no-stdio
 `libaudio_pipeline.a` is the pool-sizing/carving/processing library that both
 mono CLIs wrap; see "Board Integration" below for its firmware API,
 `NO_STDIO=1` knob, and `audit-no-stdio` target. The independent
-`4ch_aec_bf_nr_res/libaudio_pipeline_4ch.a` contains only the shared linear core.
+`4ch_aec_bf_nr_res/libaudio_pipeline_4ch.a` contains the shared linear core and
+`common/`'s `se_config.o` / `se_anr_stage.o`.
 The standard and ULCNet 4-ch applications link their wrapper objects directly
 with that core and the existing algorithm libraries. `four_aec_nr_res_create()` is the heap convenience
 path, while `four_aec_nr_res_get_mem_requirements()` +
@@ -482,7 +492,7 @@ live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、�
 > 原因（由 `4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c` 的 `test_runtime_strength()` 釘住）。
 
 > **NR：不要繞過 pipeline 的 setter 去呼叫 `anr_set_mode()`。** 兩條 pipeline 的
-> NR 組態都是「canonical preset **加上**自己的覆寫」（`L`、`alpha_decay`，見兩處的 `compose_nr_config()`）。`anr_set_mode()` 組的是裸的
+> NR 組態都是「canonical preset **加上**自己的覆寫」（`L`、`alpha_decay`，組成見 `common/se_anr_stage.h` 的 `se_anr_compose_config()`）。`anr_set_mode()` 組的是裸的
 > canonical preset，在這種實例上會被**拒絕**（它的 `L` 不同）——所以 pipeline 的
 > setter 做的事是重組完整組態再交給 `anr_reconfigure()`。
 

@@ -261,7 +261,7 @@ include entirely — the resulting `libaudio_pipeline.a` references none of
 make BACKEND=ne10 audit-no-stdio   # PASS/FAIL, non-zero exit on FAIL
 ```
 
-builds exactly that and asserts it with `nm` over `audio_pipeline.o` itself
+builds exactly that and asserts it with `nm` over the delivered archive (members `audio_pipeline.o`, `se_config.o`, `se_anr_stage.o`)
 (pattern/style follows `audio_common/scripts/audit_alloc_symbols.sh`) — run
 it after touching any diagnostic in `../pipelines/mono_aec_nr_res/audio_pipeline.c` to
 confirm the gate still holds.
