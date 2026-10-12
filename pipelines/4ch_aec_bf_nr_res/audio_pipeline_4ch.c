@@ -379,7 +379,7 @@ static int derive_spatial_configs(
      * -- so when the effective interval > 1 the real wall-clock update
      * period is that many hops, and the retime call must scale hop by it
      * (no-op at the shipped default of 1). */
-    gsc_cfg->lambda = mmse_lsa_retime_alpha(
+    gsc_cfg->lambda = anr_retime_alpha(
         cfg->gsc_lambda, cfg->core.sample_rate,
         hop * gsc_effective_interval);
     gsc_cfg->mu = cfg->gsc_mu;
@@ -566,12 +566,12 @@ AudioPipeline4Ch* audio_pipeline_4ch_init_ex(
      * (old_weight + new_weight == 1 by construction); retime the retention
      * factor and derive new_weight from it so that invariant still holds
      * post-retime. */
-    p->vad_hangover_frames = mmse_lsa_retime_frames(
+    p->vad_hangover_frames = anr_retime_frames(
         cfg_copy.auto_vad_hangover_frames, cfg_copy.core.sample_rate, hop);
-    p->vad_speech_noise_keep = mmse_lsa_retime_alpha(
+    p->vad_speech_noise_keep = anr_retime_alpha(
         0.999f, cfg_copy.core.sample_rate, hop);
     p->vad_speech_new_weight = 1.0f - p->vad_speech_noise_keep;
-    p->vad_silence_noise_keep = mmse_lsa_retime_alpha(
+    p->vad_silence_noise_keep = anr_retime_alpha(
         0.95f, cfg_copy.core.sample_rate, hop);
     p->vad_silence_new_weight = 1.0f - p->vad_silence_noise_keep;
     p->vad_power_threshold =
@@ -793,7 +793,7 @@ int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset,
     return four_aec_nr_res_set_aec_preset(p->core, preset, ramp_ms);
 }
 
-int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, MmseLsaNrMode mode) {
+int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, AnrMode mode) {
     if (!p || p->destroyed || !p->core) return -1;
     return four_aec_nr_res_set_nr_mode(p->core, mode);
 }

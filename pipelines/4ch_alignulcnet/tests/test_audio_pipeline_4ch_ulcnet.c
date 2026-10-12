@@ -2425,7 +2425,7 @@ static int run_all_tests(void) {
         REJECT_POST_ONLY(bad.core.enable_res = 1, "enable_res");
         REJECT_POST_ONLY(bad.core.enable_cng = 1, "enable_cng");
         REJECT_POST_ONLY(bad.core.legacy_amin = 1, "legacy_amin");
-        REJECT_POST_ONLY(bad.core.nr_mode = MMSE_LSA_NR_AGGRESSIVE,
+        REJECT_POST_ONLY(bad.core.nr_mode = ANR_MODE_AGGRESSIVE,
                          "nr_mode (BALANCED is a required sentinel)");
         REJECT_POST_ONLY(bad.auto_vad_threshold_dbfs = -40.0f,
                          "auto_vad_threshold_dbfs");

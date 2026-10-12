@@ -190,7 +190,7 @@ struct FourAecNrRes {
 
     Aec* lanes[FOUR_AEC_NR_RES_CHANNELS];
     DelayAec3 shared_delay;
-    MmseLsaDenoiser* nr;
+    AnrDenoiser* nr;
     FftHandle* fft;
 
     SuppressionGain post_sg;
@@ -339,7 +339,7 @@ static float duty_leak_db_for_grid(int hop_size, int sample_rate) {
 static int derive_dims_and_configs(
     const FourAecNrResConfig* cfg,
     AecConfig* aec_cfg,
-    MmseLsaConfig* nr_cfg,
+    AnrConfig* nr_cfg,
     int* fft_size,
     int* hop_size,
     int* n_freqs,
@@ -366,10 +366,10 @@ static int derive_dims_and_configs(
             return 0;
     }
     switch (cfg->nr_mode) {
-        case MMSE_LSA_NR_MILD:
-        case MMSE_LSA_NR_MODERATE:
-        case MMSE_LSA_NR_BALANCED:
-        case MMSE_LSA_NR_AGGRESSIVE:
+        case ANR_MODE_MILD:
+        case ANR_MODE_MODERATE:
+        case ANR_MODE_BALANCED:
+        case ANR_MODE_AGGRESSIVE:
             break;
         default:
             return 0;
@@ -386,7 +386,7 @@ static int derive_dims_and_configs(
     if (selected_fft == 0)
         /* 16 kHz rate default is 256/128 (8ms hop) as of 2026-08-02/03,
          * matching both AEC's (python/modules/config.py, c_impl aec.c) and
-         * NR's (core/signal_grid.py, mmse_lsa_types.h) own per-library
+         * NR's (core/signal_grid.py, anr_types.h) own per-library
          * defaults -- this pipeline-level default was previously
          * independent of both and had drifted to the old 512/256 (16ms)
          * value. 512 remains a supported, explicit alternate (line below). */
@@ -659,7 +659,7 @@ static size_t pipeline_buffer_size(
 
 static size_t pipeline_pool_size(
     const AecConfig* aec_cfg,
-    const MmseLsaConfig* nr_cfg,
+    const AnrConfig* nr_cfg,
     int hop,
     int fft,
     int n,
@@ -674,7 +674,7 @@ static size_t pipeline_pool_size(
      * of the three places below that need it. */
     const int want_nr = enable_post && enable_nr;
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
-    size_t nr_bytes = want_nr ? mmse_lsa_get_mem_size(nr_cfg) : 0;
+    size_t nr_bytes = want_nr ? anr_get_mem_size(nr_cfg) : 0;
     size_t fft_bytes = enable_post ? fft_get_mem_size(fft) : 0;
     size_t buffer_bytes = pipeline_buffer_size(
         hop, fft, n, post_ma_n, delay_ring_size, delay_estimator_bytes,
@@ -704,10 +704,10 @@ static int pipeline_build(
     FourAecNrRes* p,
     PoolCursor* cursor,
     const AecConfig* aec_cfg,
-    const MmseLsaConfig* nr_cfg) {
+    const AnrConfig* nr_cfg) {
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
     size_t nr_bytes = p->cfg.enable_post && p->cfg.enable_nr
-        ? mmse_lsa_get_mem_size(nr_cfg) : 0;
+        ? anr_get_mem_size(nr_cfg) : 0;
     size_t fft_bytes = p->cfg.enable_post ? fft_get_mem_size(p->fft_size) : 0;
     int ch;
 
@@ -724,7 +724,7 @@ static int pipeline_build(
         if (p->cfg.enable_nr) {
             void* nr_pool = pool_carve(cursor, 1, nr_bytes);
             if (!nr_pool) return 0;
-            p->nr = mmse_lsa_init(nr_pool, nr_bytes, nr_cfg);
+            p->nr = anr_init(nr_pool, nr_bytes, nr_cfg);
             if (!p->nr) return 0;
         }
         fft_pool = pool_carve(cursor, 1, fft_bytes);
@@ -803,7 +803,7 @@ FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     cfg.delay_backward_quarantine_s = 1.0f;
     cfg.max_delay_ms = 1024.0f;
     cfg.aec_preset = AEC_PRESET_BALANCED;
-    cfg.nr_mode = MMSE_LSA_NR_BALANCED;
+    cfg.nr_mode = ANR_MODE_BALANCED;
     cfg.enable_post = 1;
     cfg.enable_res = 1;
     cfg.enable_nr = 1;
@@ -816,7 +816,7 @@ int four_aec_nr_res_get_mem_requirements(
     const FourAecNrResConfig* cfg,
     FourAecNrResMemReq* out) {
     AecConfig aec_cfg;
-    MmseLsaConfig nr_cfg;
+    AnrConfig nr_cfg;
     size_t pool_bytes;
     size_t total_bytes;
     uint32_t backend;
@@ -866,7 +866,7 @@ FourAecNrRes* four_aec_nr_res_init_ex(
     FourAecNrRes* p;
     PoolCursor cursor;
     AecConfig aec_cfg;
-    MmseLsaConfig nr_cfg;
+    AnrConfig nr_cfg;
     int fft;
     int hop;
     int n;
@@ -962,8 +962,8 @@ FourAecNrRes* four_aec_nr_res_init_ex(
     /* p->nr is non-NULL exactly when the NR region was carved (the whole
      * pool is memset before build), so it answers the same question the two
      * config fields do -- and it is the pointer about to be dereferenced. */
-    if (p->nr && (mmse_lsa_get_hop_size(p->nr) != hop ||
-                  mmse_lsa_get_n_freqs(p->nr) != n)) return NULL;
+    if (p->nr && (anr_get_hop_size(p->nr) != hop ||
+                  anr_get_n_freqs(p->nr) != n)) return NULL;
     return p;
 }
 
@@ -1904,7 +1904,7 @@ static int prepare_post_spectrum(
                 p->extra_noise[k] = p->fused_r2[k] / PSD_SCALE;
             nr_extra = p->extra_noise;
         }
-        if (mmse_lsa_process_gain(
+        if (anr_process_gain(
                 p->nr, error, nr_extra, NULL) != 0)
             return 0;
         p->last_timing.nr_us = four_aec_nr_res_now_us() - t1;
@@ -1917,7 +1917,7 @@ static int prepare_post_spectrum(
      * G_nr. sk_min_f32 is the mono twin's kernel: a non-finite gain
      * propagates to the output finite gate instead of being masked the way
      * fminf would mask it. */
-    nr_gain = p->cfg.enable_nr ? mmse_lsa_get_gain(p->nr, NULL) : p->unity_gain;
+    nr_gain = p->cfg.enable_nr ? anr_get_gain(p->nr, NULL) : p->unity_gain;
     sk_min_f32(p->total_gain, nr_gain, res_gain, n);
     sk_capply_gain_f32(p->output_spec, error, p->total_gain, n);
 
@@ -2200,19 +2200,19 @@ int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset,
     return 0;
 }
 
-int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, MmseLsaNrMode mode) {
-    MmseLsaConfig target;
+int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, AnrMode mode) {
+    AnrConfig target;
 
     if (!p || p->destroyed) return -1;
     if (!p->cfg.enable_post || !p->nr) return -1;
-    if (!mmse_lsa_nr_mode_is_valid(mode)) return -1;
+    if (!anr_nr_mode_is_valid(mode)) return -1;
     /* Recompose exactly what build_nr_config() composes -- the preset plus
      * this pipeline's own overrides. Handing the canonical preset to
-     * mmse_lsa_set_mode() instead would either be refused (its L differs) or
+     * anr_set_mode() instead would either be refused (its L differs) or
      * silently revert those overrides. */
     target = pipelines_compose_nr_config(p->cfg.sample_rate, p->fft_size,
                                p->hop_size, mode);
-    if (mmse_lsa_reconfigure(p->nr, &target) != 0) return -1;
+    if (anr_reconfigure(p->nr, &target) != 0) return -1;
     p->cfg.nr_mode = mode;
     return 0;
 }
@@ -2240,7 +2240,7 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
     for (ch = 0; ch < p->initialized_lanes; ++ch) {
         aec_reset(p->lanes[ch]);
     }
-    if (p->nr) mmse_lsa_reset(p->nr);
+    if (p->nr) anr_reset(p->nr);
     reset_post_sg(p);
 
     if (p->delay_ring) {
@@ -2306,7 +2306,7 @@ void four_aec_nr_res_destroy(FourAecNrRes* p) {
     void* owned_heap;
     if (!p || p->destroyed) return;
 
-    if (p->nr) mmse_lsa_destroy(p->nr);
+    if (p->nr) anr_destroy(p->nr);
     if (p->fft) fft_destroy(p->fft);
     for (ch = 0; ch < p->initialized_lanes; ++ch) {
         aec_destroy(p->lanes[ch]);
@@ -2424,7 +2424,7 @@ int four_aec_nr_res_get_mem_breakdown(
     const FourAecNrResConfig* cfg,
     FourAecNrResMemBreakdown* out) {
     AecConfig aec_cfg;
-    MmseLsaConfig nr_cfg;
+    AnrConfig nr_cfg;
     size_t aec_one;
     size_t aec_total = 0;
     size_t nr_bytes;
@@ -2448,7 +2448,7 @@ int four_aec_nr_res_get_mem_breakdown(
 
     aec_one = aec_get_mem_size(&aec_cfg);
     want_nr = cfg->enable_post && cfg->enable_nr;
-    nr_bytes = want_nr ? mmse_lsa_get_mem_size(&nr_cfg) : 0;
+    nr_bytes = want_nr ? anr_get_mem_size(&nr_cfg) : 0;
     fft_bytes = cfg->enable_post ? fft_get_mem_size(fft) : 0;
     wrapper_storage = pipeline_buffer_size(
         hop, fft, n, post_ma_n, delay_ring_size, delay_estimator_bytes,

@@ -308,7 +308,7 @@ void audio_pipeline_4ch_reset(AudioPipeline4Ch* p);
  * Call between hops. Return 0, or -1 with nothing written. */
 int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset,
                                       float ramp_ms);
-int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, MmseLsaNrMode mode);
+int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, AnrMode mode);
 void audio_pipeline_4ch_destroy(AudioPipeline4Ch* p);
 
 /* ============================================================================

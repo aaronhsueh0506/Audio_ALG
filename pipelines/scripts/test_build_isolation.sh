@@ -7,7 +7,7 @@
 # one does NOT repeat).
 #
 # pipelines/Makefile is a THREE-producer consumer (audio_common's
-# libaudio_common.a, lib/aec's libaec.a, lib/nr's libmmse_lsa.a), each
+# libaudio_common.a, lib/aec's libaec.a, lib/nr's libanr.a), each
 # resolved via the two-phase recursive-make dispatch described in that
 # Makefile's own header comment. This script exercises the scenarios specific
 # to that three-producer design plus this repo's own audit-no-stdio/publish
@@ -950,7 +950,7 @@ grep -q "^aec_nr_pipeline \[kiss\] ->" "$SP2_LOG_HPF" && pass "SP2: touching the
 
 # touch include/fast_math.h -> NR/AEC objects that include it
 # (aec3_post.c/suppression_gain.c in lib/aec, mcra_noise_estimator.c/
-# spp_estimator.c/mmse_lsa_denoiser.c in lib/nr) recompile, AND the pipeline
+# spp_estimator.c/anr.c in lib/nr) recompile, AND the pipeline
 # binary relinks -- the full transitive header chain. Again mtime-only, and
 # again against the CLONE's copy: no tracked file's content OR mtime changes
 # in any real repo. Same log-based verification + backdating as above --
@@ -1815,7 +1815,7 @@ SP17_NR_CLONE="$PSHARED_NR_CLONE"
 # this is the FIRST real content edit either clone sees.)
 echo "/* sp17 disposable dirty probe */" >> "$SP17_AC_CLONE/src/hpf.c"
 echo "/* sp17 disposable dirty probe */" >> "$SP17_AEC_CLONE/c_impl/src/aec_debug.c"
-echo "/* sp17 disposable dirty probe */" >> "$SP17_NR_CLONE/c_impl/src/mmse_lsa_denoiser.c"
+echo "/* sp17 disposable dirty probe */" >> "$SP17_NR_CLONE/c_impl/src/anr.c"
 
 SP17_OBJ_ROOT="$SCRATCH_ROOT/sp17/obj"
 SP17_BIN_ROOT="$SCRATCH_ROOT/sp17/bin"

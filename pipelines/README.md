@@ -33,7 +33,7 @@ instance.
 | Module | Library | Header | Function |
 |--------|---------|--------|----------|
 | AEC | libaec.a | aec.h | PBFDKF adaptive filter + shadow filter |
-| NR | libmmse_lsa.a | mmse_lsa_denoiser.h | MMSE-LSA + MCRA noise est + SPP |
+| NR | libanr.a | anr.h | MMSE-LSA + MCRA noise est + SPP |
 | RES | libaec.a (included) | aec.h (`AecResContext`) | Residual echo suppression, folded into AEC's freq-domain seam |
 | Mono integration | libaudio_pipeline.a | mono_aec_nr_res/audio_pipeline.h | One-mic AEC + NR/RES, heap or caller-owned pool |
 | 4-ch linear core | libaudio_pipeline_4ch.a | 4ch_aec_bf_nr_res/4aec_nr_res.h | One shared aligner + four linear AECs; the archive contains only this core |
@@ -189,14 +189,14 @@ control block directly, not derived from the struct.)
 1. **AEC (linear)**: Set `enable_res=0` and `return_res_context=1`, call `aec_process()` (or the
    streaming `aec_analyze_render()` / `aec_process_capture()` pair), then `aec_get_res_context(a, &ctx)`
    to read the `AecResContext` seam
-2. **NR**: `mmse_lsa_process()` for denoising, `mmse_lsa_get_gain()` for per-bin gain
+2. **NR**: `anr_process()` for denoising, `anr_get_gain()` for per-bin gain
 3. **RES**: Correct echo PSD with `echo_spec *= nr_gain`, then apply `ctx.res_gain` (AEC3
    `SuppressionGain` G_res(f)) to the NR output — there is no separate `res_process()` call
 
 ### Echo PSD Correction
 
 ```c
-const float* gain = mmse_lsa_get_gain(nr, NULL);
+const float* gain = anr_get_gain(nr, NULL);
 for (int k = 0; k < n_freqs; k++) {
     corrected_echo[k].r = ctx.echo_spec[k].r * gain[k];
     corrected_echo[k].i = ctx.echo_spec[k].i * gain[k];
@@ -336,7 +336,7 @@ matched-filter arithmetic and delay-estimator duty-cycling are built into
 ### `--debug`
 
 Once per second of processed audio, prints one compact status line to stderr
-combining `aec_debug_status()` (lib/aec) and `mmse_lsa_debug_status()` (lib/nr) —
+combining `aec_debug_status()` (lib/aec) and `anr_debug_status()` (lib/nr) —
 both are read-only snapshots of state the engines already maintain, so this adds
 no per-frame cost when the flag is off and doesn't perturb the DSP output when on
 (stdout/the output WAV are unaffected either way).
@@ -351,7 +351,7 @@ no per-frame cost when the flag is off and doesn't perturb the DSP output when o
 `aec:` fields are `AecDebugStatus` (delay in samples, `-1` = not yet acquired;
 `conf`/`upd` = delay-estimator confidence/update count; `erle` = windowed ERLE dB;
 `lin`/`conv` = usable-linear-estimate / filter-converged gates; `near`/`out` = EMA
-power). `nr:` fields are `MmseLsaDebugStatus` (`init` = noise-floor initialized;
+power). `nr:` fields are `AnrDebugStatus` (`init` = noise-floor initialized;
 `gain` = mean/min linear gain dB; `spp` = mean speech-presence probability;
 `noise` = mean noise-floor dB). With `--aec-only` the `nr:` half prints `n/a`
 (no denoiser exists in that mode).
@@ -481,10 +481,10 @@ live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、�
 > `four_aec_nr_res_set_aec_preset()` 存在、而不是要你迴圈呼叫 `aec_set_preset()` 的
 > 原因（由 `4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c` 的 `test_runtime_strength()` 釘住）。
 
-> **NR：不要繞過 pipeline 的 setter 去呼叫 `mmse_lsa_set_mode()`。** 兩條 pipeline 的
-> NR 組態都是「canonical preset **加上**自己的覆寫」（`L`、`alpha_decay`，見兩處的 `compose_nr_config()`）。`mmse_lsa_set_mode()` 組的是裸的
+> **NR：不要繞過 pipeline 的 setter 去呼叫 `anr_set_mode()`。** 兩條 pipeline 的
+> NR 組態都是「canonical preset **加上**自己的覆寫」（`L`、`alpha_decay`，見兩處的 `compose_nr_config()`）。`anr_set_mode()` 組的是裸的
 > canonical preset，在這種實例上會被**拒絕**（它的 `L` 不同）——所以 pipeline 的
-> setter 做的事是重組完整組態再交給 `mmse_lsa_reconfigure()`。
+> setter 做的事是重組完整組態再交給 `anr_reconfigure()`。
 
 > **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
 > hop 生效：double-talk 期間套的是 DT 地板，而 DT 地板三個 preset **完全相同**；
@@ -503,16 +503,16 @@ Python 對應：`AEC.set_preset(preset, ramp_ms=0.0)` 與
 `FourChannelAecPipeline.set_aec_preset(preset, ramp_ms=0.0)`（後者同樣只動共用的
 post-beam 抑制器）。
 
-### NR (`MmseLsaConfig`, see `mmse_lsa_types.h`)
+### NR (`AnrConfig`, see `anr_types.h`)
 
-**Modes**: `MMSE_LSA_NR_MILD` / `MMSE_LSA_NR_MODERATE` / `MMSE_LSA_NR_BALANCED`（default）/ `MMSE_LSA_NR_AGGRESSIVE`
+**Modes**: `ANR_MODE_MILD` / `ANR_MODE_MODERATE` / `ANR_MODE_BALANCED`（default）/ `ANR_MODE_AGGRESSIVE`
 
 > These are the library's mode enum. Both C pipeline CLIs' `parse_nr_mode()` —
 > `mono_aec_nr_res/main.c` and `4ch_aec_bf_nr_res/4aec_nr_res_static.c` — now also recognize
 > `"moderate"` (`--nr-preset mild|moderate|balanced|aggressive`, since 2026-09-03); anything else
-> still silently falls back to `MMSE_LSA_NR_BALANCED` — no error. The Python `aec_nr_pipeline.py`
+> still silently falls back to `ANR_MODE_BALANCED` — no error. The Python `aec_nr_pipeline.py`
 > CLI has not been updated and still restricts `--nr-preset` to `choices=['mild', 'balanced',
-> 'aggressive']`; `MODERATE` there is only reachable by calling `mmse_lsa_config_for_mode()`
+> 'aggressive']`; `MODERATE` there is only reachable by calling `anr_config_for_mode()`
 > directly.
 
 `g_min_db` is in the amplitude-dB convention (`/20`, i.e. `g_min = 10^(g_min_db/20)`), not the
@@ -521,11 +521,11 @@ older power-dB (`/10`) convention.
 > **Retime basis — read before hand-editing any `alpha_*`/`L`/`num_init_frames` below.**
 > Every `alpha_*` (except `q`/`g_min_db`/`xi_min_db`, which are plain dB/probability
 > constants) and `L`/`num_init_frames`/`scene_change_min_frames` is **not** used as-authored —
-> `mmse_lsa_types.h`'s `mmse_lsa_config_for_mode_grid()` retimes each one from its authored
+> `anr_types.h`'s `anr_config_for_mode_grid()` retimes each one from its authored
 > reference duration to the actual `hop_size` of the grid you construct it for
-> (`mmse_lsa_retime_alpha()`/`mmse_lsa_retime_alpha_ref()`/`mmse_lsa_retime_frames[_ref]()`).
+> (`anr_retime_alpha()`/`anr_retime_alpha_ref()`/`anr_retime_frames[_ref]()`).
 > The tables below list the **authored constants exactly as they appear as literals in
-> source** (what you'd override via `MmseLsaConfig` before construction, or diff against in
+> source** (what you'd override via `AnrConfig` before construction, or diff against in
 > code) — **not** the realized runtime value at any particular grid; `L`/`num_init_frames`
 > are the one exception, called out per-row below, since a plain frame count without a
 > stated grid is meaningless.
@@ -538,10 +538,10 @@ older power-dB (`/10`) convention.
 > - **10 ms-authored** (retimed off the legacy 10 ms/hop reference): `alpha_s`, `alpha_p`,
 >   `num_init_frames`, `scene_change_min_frames`, and `alpha_d`/`alpha_g`/`alpha_decay`
 >   **in BALANCED only** (BALANCED inherits these three straight from
->   `mmse_lsa_default_config_for_grid()`, which predates the 16 ms-hop grid switch).
+>   `anr_default_config_for_grid()`, which predates the 16 ms-hop grid switch).
 >
 > Don't hand-scale one of these numbers by a grid's sample-rate/hop ratio and expect it to
-> match the library's own value — call `mmse_lsa_default_config()`/`mmse_lsa_config_for_mode()`
+> match the library's own value — call `anr_default_config()`/`anr_config_for_mode()`
 > (or the Python `core/nr_strength.py` equivalent) and read the field back instead.
 
 | Parameter | Mild | Moderate | Balanced | Aggressive | Description |

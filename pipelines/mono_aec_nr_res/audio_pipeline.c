@@ -99,10 +99,10 @@
  * memcpy'd duplicate of AecResContext.res_gain) was removed from the carve --
  * both call sites that used to read p->g_aec now read ctx.res_gain directly
  * (that pointer is already stable for the whole hop per aec.h's own doc).
- * Bumped 2->3 (2026-08-05): g_nr is gone the same way -- mmse_lsa_get_gain()
+ * Bumped 2->3 (2026-08-05): g_nr is gone the same way -- anr_get_gain()
  * already exposes the denoiser's own gain buffer with no copy, so
- * mmse_lsa_process_gain() is now called with gain_out=NULL and both former
- * p->g_nr readers call mmse_lsa_get_gain(p->nr, NULL) instead.
+ * anr_process_gain() is now called with gain_out=NULL and both former
+ * p->g_nr readers call anr_get_gain(p->nr, NULL) instead.
  * Bumped 3->4 (2026-08-05): mic_buf/ref_buf/out_buf are gone -- aec_process()
  * already copies mic/ref into its own buffers, so this pipeline's own copy
  * was a redundant second layer; the caller's mic/ref pointers now go
@@ -249,7 +249,7 @@ struct AudioPipeline {
     /* sub-modules (point into `pool` below; NULL fft/nr iff aec_only) */
     Aec*             aec;
     FftHandle*       fft;
-    MmseLsaDenoiser* nr;
+    AnrDenoiser* nr;
 
     /* the pipeline's scratch buffers (point into `pool` below; all NULL
      * when aec_only). There is no g_aec
@@ -258,7 +258,7 @@ struct AudioPipeline {
      * AecResContext's own doc guarantees ctx.res_gain aliases AEC's internal
      * buffer for the whole hop (until the next AEC processing call) -- so
      * both call sites now read ctx.res_gain directly instead (layout v2).
-     * There is likewise no g_nr buffer (layout v3): mmse_lsa_get_gain()
+     * There is likewise no g_nr buffer (layout v3): anr_get_gain()
      * exposes the denoiser's own gain buffer directly, no copy needed.
      * There is likewise no mic_buf/ref_buf/out_buf (layout v4): aec_process()
      * already copies mic/ref into its own near_hop/far_hop at the top of the
@@ -303,20 +303,20 @@ struct AudioPipeline {
  * aec_only/enable_cng/legacy_amin holding anything but 0/1)
  * -- ALL checked HERE, up front, before a single module config is derived,
  * so an invalid AudioPipelineConfig never reaches aec_config_from_preset/
- * mmse_lsa_config_for_mode. This is the one reject-first gate every entry
+ * anr_config_for_mode. This is the one reject-first gate every entry
  * point (get_mem_requirements, init, get_mem_breakdown, and create() via
  * get_mem_requirements+init) already funnels through.
  *
  * Without this, an out-of-enum aec_preset/nr_mode would silently fall
- * through aec_config_from_preset's/mmse_lsa_config_for_mode's own internal
+ * through aec_config_from_preset's/anr_config_for_mode's own internal
  * `default:` case (a documented fallback to balanced, not an error -- see
- * aec.c/mmse_lsa_types.h), and an out-of-{0,1} bool would just be treated as
+ * aec.c/anr_types.h), and an out-of-{0,1} bool would just be treated as
  * truthy by every `if (cfg->x)` downstream in audio_pipeline_process --
  * neither is a loud failure on its own, so a caller passing a garbage/
  * adversarial config would never find out short of this explicit check.
  * Mirrors the derivation both CLIs' main() used to do inline. */
 static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
-                                    AecConfig* aec_cfg, MmseLsaConfig* nr_cfg,
+                                    AecConfig* aec_cfg, AnrConfig* nr_cfg,
                                     int* hop, int* frame_sz, int* fft_sz, int* n_freqs) {
     if (!cfg) return -1;
     if (!aec_is_valid_sample_rate(cfg->sample_rate)) return -1;
@@ -333,10 +333,10 @@ static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
             return -1;
     }
     switch (cfg->nr_mode) {
-        case MMSE_LSA_NR_MILD:
-        case MMSE_LSA_NR_MODERATE:
-        case MMSE_LSA_NR_BALANCED:
-        case MMSE_LSA_NR_AGGRESSIVE:
+        case ANR_MODE_MILD:
+        case ANR_MODE_MODERATE:
+        case ANR_MODE_BALANCED:
+        case ANR_MODE_AGGRESSIVE:
             break;
         default:
             return -1;
@@ -383,7 +383,7 @@ static int unity_gain_needed(int enable_nr, int enable_res) {
     return !enable_nr || !enable_res;
 }
 
-static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* nr_cfg,
+static size_t pipeline_pool_size(const AecConfig* aec_cfg, const AnrConfig* nr_cfg,
                                   int hop, int frame_sz, int fft_sz, int n_freqs,
                                   int aec_only, int enable_nr, int enable_res) {
     (void)hop;   /* kept for signature symmetry with pipeline_build() below
@@ -391,7 +391,7 @@ static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* 
                   * from hop since aec_out (the last one that was) is gone. */
     size_t aec_sz     = aec_get_mem_size(aec_cfg);
     size_t fft_sz_mem = aec_only ? 0 : fft_get_mem_size(fft_sz);
-    size_t nr_sz      = (aec_only || !enable_nr) ? 0 : mmse_lsa_get_mem_size(nr_cfg);
+    size_t nr_sz      = (aec_only || !enable_nr) ? 0 : anr_get_mem_size(nr_cfg);
 
     size_t pipe = 0;
     if (!aec_only) {
@@ -416,7 +416,7 @@ static size_t pipeline_pool_size(const AecConfig* aec_cfg, const MmseLsaConfig* 
  * ========================================================================== */
 
 static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
-                           const AecConfig* aec_cfg, const MmseLsaConfig* nr_cfg,
+                           const AecConfig* aec_cfg, const AnrConfig* nr_cfg,
                            int hop, int frame_sz, int fft_sz, int n_freqs,
                            int aec_only, int enable_nr, int enable_res) {
     size_t needed = pipeline_pool_size(aec_cfg, nr_cfg, hop, frame_sz, fft_sz, n_freqs,
@@ -440,8 +440,8 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
         ptr += ALIGN16(fft_mem);
 
         if (enable_nr) {
-            size_t nr_sz = mmse_lsa_get_mem_size(nr_cfg);
-            p->nr = mmse_lsa_init(ptr, nr_sz, nr_cfg);
+            size_t nr_sz = anr_get_mem_size(nr_cfg);
+            p->nr = anr_init(ptr, nr_sz, nr_cfg);
             ptr += ALIGN16(nr_sz);
         }
 
@@ -494,7 +494,7 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
     }
     if (!aec_only) {
         int fft_nf = fft_get_n_freqs(p->fft);
-        int nr_nf  = p->nr ? mmse_lsa_get_n_freqs(p->nr) : -1;   /* -1: no denoiser */
+        int nr_nf  = p->nr ? anr_get_n_freqs(p->nr) : -1;   /* -1: no denoiser */
         if (fft_nf != n_freqs || (p->nr && nr_nf != n_freqs)) {
             AP_LOG_ERR("audio_pipeline: FATAL grid mismatch -- pipeline n_freqs=%d, "
                             "fft n_freqs=%d, nr n_freqs=%d\n", n_freqs, fft_nf, nr_nf);
@@ -538,7 +538,7 @@ AudioPipelineConfig audio_pipeline_default_config(int sample_rate) {
     cfg.delay_num_filters = 5;
     cfg.fixed_delay_samples = -1;
     cfg.aec_preset  = AEC_PRESET_BALANCED;
-    cfg.nr_mode     = MMSE_LSA_NR_BALANCED;
+    cfg.nr_mode     = ANR_MODE_BALANCED;
     cfg.aec_only    = 0;
     cfg.enable_nr   = 1;
     cfg.enable_res  = 1;
@@ -551,20 +551,20 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
                                          AudioPipelineMemReq* out) {
     if (!cfg || !out) return -1;
 
-    AecConfig aec_cfg; MmseLsaConfig nr_cfg;
+    AecConfig aec_cfg; AnrConfig nr_cfg;
     int hop, frame_sz, fft_sz, n_freqs;
     if (derive_dims_and_configs(cfg, &aec_cfg, &nr_cfg, &hop, &frame_sz, &fft_sz, &n_freqs) != 0)
         return -1;
 
-    /* Module validators (F05-style): aec_get_mem_size/mmse_lsa_get_mem_size
+    /* Module validators (F05-style): aec_get_mem_size/anr_get_mem_size
      * both return 0 for a config their own aec_validate_config/
-     * mmse_lsa_validate_config rejects -- catch that explicitly here (rather
+     * anr_validate_config rejects -- catch that explicitly here (rather
      * than let it silently fold into a too-small `pipe`-only total below). */
     size_t aec_sz = aec_get_mem_size(&aec_cfg);
     if (aec_sz == 0) return -1;
     if (!cfg->aec_only) {
         if (fft_get_mem_size(fft_sz) == 0 ||
-            (cfg->enable_nr && mmse_lsa_get_mem_size(&nr_cfg) == 0)) return -1;
+            (cfg->enable_nr && anr_get_mem_size(&nr_cfg) == 0)) return -1;
     }
 
     /* backend_id: reject up front (same reject-first shape as
@@ -675,7 +675,7 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes, const AudioPipeli
         return NULL;
     }
 
-    AecConfig aec_cfg; MmseLsaConfig nr_cfg;
+    AecConfig aec_cfg; AnrConfig nr_cfg;
     int hop, frame_sz, fft_sz, n_freqs;
     if (derive_dims_and_configs(cfg, &aec_cfg, &nr_cfg, &hop, &frame_sz, &fft_sz, &n_freqs) != 0)
         return NULL;
@@ -808,12 +808,12 @@ static void prepare_post_spectrum(AudioPipeline* p, const float* mic,
             p->extra[k] = ctx.r2[k] / PSD_SCALE;
         nr_extra = p->extra;
     }
-    /* gain_out=NULL: mmse_lsa_get_gain() below reads the same buffer this
+    /* gain_out=NULL: anr_get_gain() below reads the same buffer this
      * call just filled, no per-hop copy needed (layout v3). */
     const float* nr_gain = p->unity_gain;
     if (p->nr) {
-        mmse_lsa_process_gain(p->nr, ctx.error_spec, nr_extra, NULL);
-        nr_gain = mmse_lsa_get_gain(p->nr, NULL);
+        anr_process_gain(p->nr, ctx.error_spec, nr_extra, NULL);
+        nr_gain = anr_get_gain(p->nr, NULL);
     }
     uint32_t t1 = audio_pipeline_now_us();
     p->last_timing.nr_us = p->nr ? t1 - t0 : 0;
@@ -828,8 +828,8 @@ static void prepare_post_spectrum(AudioPipeline* p, const float* mic,
      * pointers alias AEC's internal per-hop buffers and stay valid until the
      * next aec_process() call, which doesn't happen again before this hop
      * finishes (verified below: ctx.res_gain is read again, unchanged, at
-     * the CNG loop further down). Likewise mmse_lsa_get_gain()'s buffer is
-     * stable until the next mmse_lsa_process_gain()/mmse_lsa_process() call
+     * the CNG loop further down). Likewise anr_get_gain()'s buffer is
+     * stable until the next anr_process_gain()/anr_process() call
      * on this instance, which also doesn't happen again before this hop
      * finishes. */
     sk_min_f32(p->g_total, nr_gain, res_gain, n_freqs);
@@ -942,17 +942,17 @@ int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset,
     return aec_set_preset(p->aec, preset, ramp_ms);
 }
 
-int audio_pipeline_set_nr_mode(AudioPipeline* p, MmseLsaNrMode mode) {
-    MmseLsaConfig target;
+int audio_pipeline_set_nr_mode(AudioPipeline* p, AnrMode mode) {
+    AnrConfig target;
     if (!p || !p->nr) return -1;   /* aec_only builds have no denoiser */
-    if (!mmse_lsa_nr_mode_is_valid(mode)) return -1;
+    if (!anr_nr_mode_is_valid(mode)) return -1;
     /* Recompose THIS pipeline's configuration, not the canonical preset:
-     * mmse_lsa_set_mode() would refuse it (its L differs) or revert the
+     * anr_set_mode() would refuse it (its L differs) or revert the
      * overrides pipelines_compose_nr_config() applies. */
     target = pipelines_compose_nr_config(p->sample_rate, p->fft_sz, p->hop, mode);
-    /* mmse_lsa_reconfigure updates the denoiser's own MmseLsaConfig, which is
+    /* anr_reconfigure updates the denoiser's own AnrConfig, which is
      * the authoritative copy; this instance keeps no config of its own. */
-    return mmse_lsa_reconfigure(p->nr, &target);
+    return anr_reconfigure(p->nr, &target);
 }
 
 void audio_pipeline_reset(AudioPipeline* p) {
@@ -960,7 +960,7 @@ void audio_pipeline_reset(AudioPipeline* p) {
 
     aec_reset(p->aec);
     if (!p->aec_only) {
-        if (p->nr) mmse_lsa_reset(p->nr);
+        if (p->nr) anr_reset(p->nr);
 
         /* Re-zero pipeline-owned accumulator/scratch state (mirrors the
          * explicit zero at carve time). `synth_win` is a deterministic
@@ -981,7 +981,7 @@ void audio_pipeline_destroy(AudioPipeline* p) {
     /* Reverse carve order: NR -> pipeline FFT -> AEC. Each call is a genuine
      * no-op for a pool-resident (audio_pipeline_init'd) instance today; kept
      * for the heap path and forward-compat -- see audio_pipeline.h's doc. */
-    if (p->nr)  mmse_lsa_destroy(p->nr);
+    if (p->nr)  anr_destroy(p->nr);
     if (p->fft) fft_destroy(p->fft);
     if (p->aec) aec_destroy(p->aec);
 
@@ -996,13 +996,13 @@ int audio_pipeline_n_freqs(const AudioPipeline* p)     { return p ? p->n_freqs  
 int audio_pipeline_sample_rate(const AudioPipeline* p) { return p ? p->sample_rate: -1; }
 
 Aec* audio_pipeline_get_aec(const AudioPipeline* p) { return p ? p->aec : NULL; }
-MmseLsaDenoiser* audio_pipeline_get_nr(const AudioPipeline* p) { return p ? p->nr : NULL; }
+AnrDenoiser* audio_pipeline_get_nr(const AudioPipeline* p) { return p ? p->nr : NULL; }
 
 int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
                                       AudioPipelineMemBreakdown* out) {
     if (!cfg || !out) return -1;
 
-    AecConfig aec_cfg; MmseLsaConfig nr_cfg;
+    AecConfig aec_cfg; AnrConfig nr_cfg;
     int hop, frame_sz, fft_sz, n_freqs;
     if (derive_dims_and_configs(cfg, &aec_cfg, &nr_cfg, &hop, &frame_sz, &fft_sz, &n_freqs) != 0)
         return -1;
@@ -1012,7 +1012,7 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
     size_t fft_mem = 0, nr_sz = 0;
     if (!cfg->aec_only) {
         fft_mem = fft_get_mem_size(fft_sz);
-        if (cfg->enable_nr) nr_sz = mmse_lsa_get_mem_size(&nr_cfg);
+        if (cfg->enable_nr) nr_sz = anr_get_mem_size(&nr_cfg);
         if (fft_mem == 0 || (cfg->enable_nr && nr_sz == 0)) return -1;
     }
 

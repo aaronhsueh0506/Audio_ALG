@@ -303,7 +303,7 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
  *                       1, the pre-only profile states what is true)
  *   core.enable_cng   = 0
  *   core.legacy_amin  = 0
- *   core.nr_mode      = MMSE_LSA_NR_BALANCED   (the enum has no "disabled"
+ *   core.nr_mode      = ANR_MODE_BALANCED   (the enum has no "disabled"
  *                       value and no denoiser exists, so this is a required
  *                       sentinel, not a strength choice)
  *   auto_vad_*        = the audio_pipeline_4ch defaults (the built-in energy

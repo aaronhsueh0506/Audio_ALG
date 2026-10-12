@@ -20,7 +20,7 @@
 # Build isolation — the fourth and last of four repos
 # =============================================================================
 # This repo is a CONSUMER of THREE producer archives (audio_common's
-# libaudio_common.a, lib/aec's libaec.a, lib/nr's libmmse_lsa.a), each of
+# libaudio_common.a, lib/aec's libaec.a, lib/nr's libanr.a), each of
 # which is itself CFG_SIG-keyed (see those repos' own Makefiles). The design
 # here is the same two-phase recursive-make dispatch AEC/NR already use for
 # their ONE producer (audio_common), extended to resolve THREE:
@@ -530,9 +530,9 @@ FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 # two-phase dispatch below) and appended directly to each link recipe's own
 # prerequisite list / command line, in the fixed order the old hardcoded
 # LIBS variable used: pipeline.o, libaudio_pipeline.a, libaec.a,
-# libmmse_lsa.a, libaudio_common.a, -lm. libaudio_pipeline.a
+# libanr.a, libaudio_common.a, -lm. libaudio_pipeline.a
 # holds ONLY the pipeline TU (audio_pipeline.o) -- it is not a bundled/fat
-# archive, so it still needs libaec.a/libmmse_lsa.a/libaudio_common.a linked
+# archive, so it still needs libaec.a/libanr.a/libaudio_common.a linked
 # after it, same as when audio_pipeline.c's logic was file-local code inside
 # each CLI's own .o.
 #
@@ -894,7 +894,7 @@ endif
 # =============================================================================
 # Problem this replaces: the old Makefile hardcoded
 #   LIBS = ./libaudio_pipeline.a $(AEC_DIR)/bin/libaec.a \
-#          $(NR_DIR)/bin/libmmse_lsa.a $(AC_DIR)/bin/$(BACKEND)/libaudio_common.a
+#          $(NR_DIR)/bin/libanr.a $(AC_DIR)/bin/$(BACKEND)/libaudio_common.a
 # and a `libs:` phony that unconditionally ran three sub-makes with only
 # BACKEND/EXTRA_CFLAGS/WERROR forwarded. Two problems: (1) all three
 # producers' own bin/ dirs are now CFG_SIG-keyed, so there is no fixed path
@@ -1060,7 +1060,7 @@ $(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/static_main.c mono_aec_nr_r
 # audio_pipeline.o / libaudio_pipeline.a: the pool-sizing/
 # carving/per-hop-processing library TU, linkable independently of either
 # CLI -- see audio_pipeline.h. The archive holds ONLY this one object (not a
-# fat archive bundling libaec/libmmse_lsa/libaudio_common); those stay
+# fat archive bundling libaec/libanr/libaudio_common); those stay
 # separate libraries a consumer links alongside it, same as both CLIs do.
 # Compiled with $(LIB_CFLAGS) (not the shared $(CFLAGS)) so NO_STDIO=1 only
 # ever affects THIS object -- see the NO_STDIO comment near CFLAGS above.
@@ -1286,7 +1286,7 @@ $(NR_LIB): FORCE
 # Compile with $(CC) (always a plain-C driver, -std=gnu99 valid) then link
 # with $(LINK) (c++ for BACKEND=ne10 -- the NE10 archive's one C++ TU needs
 # it). Link order matters (see the LDFLAGS comment above): pipeline.o,
-# libaudio_pipeline.a, libaec.a, libmmse_lsa.a, libaudio_common.a, -lm.
+# libaudio_pipeline.a, libaec.a, libanr.a, libaudio_common.a, -lm.
 $(BIN_DIR)/aec_nr_pipeline: $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/aec_nr_pipeline.o $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
 	@echo "aec_nr_pipeline [$(BACKEND)] -> $@"

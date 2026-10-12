@@ -48,15 +48,15 @@ static const char* preset_name(AecPreset p) {
     }
 }
 
-/* Name table lives beside the enum (lib/nr mmse_lsa_types.h); an unknown
+/* Name table lives beside the enum (lib/nr anr_types.h); an unknown
  * name keeps this tool's long-standing fallback to balanced. */
-static MmseLsaNrMode parse_nr_mode(const char* s) {
-    int m = mmse_lsa_nr_mode_from_name(s);
-    return m < 0 ? MMSE_LSA_NR_BALANCED : (MmseLsaNrMode)m;
+static AnrMode parse_nr_mode(const char* s) {
+    int m = anr_nr_mode_from_name(s);
+    return m < 0 ? ANR_MODE_BALANCED : (AnrMode)m;
 }
 
-static const char* nr_mode_name(MmseLsaNrMode mode) {
-    return mmse_lsa_nr_mode_name(mode);
+static const char* nr_mode_name(AnrMode mode) {
+    return anr_nr_mode_name(mode);
 }
 
 static const char* backend_id_name(uint32_t backend_id) {
@@ -124,7 +124,7 @@ static void fill_hop(float* microphones, float* reference,
 
 int main(int argc, char* argv[]) {
     AecPreset preset = AEC_PRESET_BALANCED;
-    MmseLsaNrMode nr_mode = MMSE_LSA_NR_BALANCED;
+    AnrMode nr_mode = ANR_MODE_BALANCED;
     int sample_rate = 16000;
     int fft_size = 0;
     int capture_proxy = 0;

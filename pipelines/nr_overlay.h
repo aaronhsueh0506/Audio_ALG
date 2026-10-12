@@ -3,7 +3,7 @@
  * Canonical strength preset plus the two overrides these pipelines have always
  * applied on top. It lives here rather than in either pipeline because BOTH
  * construct it and BOTH now recompose it at runtime (their strength setters
- * hand the result to mmse_lsa_reconfigure), so a tuning decision on this
+ * hand the result to anr_reconfigure), so a tuning decision on this
  * overlay has to land in one place or the two products drift apart between
  * releases.
  *
@@ -14,7 +14,7 @@
 #ifndef PIPELINES_NR_OVERLAY_H
 #define PIPELINES_NR_OVERLAY_H
 
-#include "mmse_lsa_types.h"
+#include "anr_types.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -23,27 +23,27 @@ extern "C" {
 /* This pipeline's NR configuration: the canonical strength preset plus the two
  * overrides it has always applied on top. Extracted so the runtime strength
  * setter can rebuild the SAME composition -- handing the bare preset to
- * mmse_lsa_set_mode() instead would either be refused (its L differs from the
+ * anr_set_mode() instead would either be refused (its L differs from the
  * override below) or silently revert these. Single source of truth for both
  * construction and reconfiguration. */
-static inline MmseLsaConfig pipelines_compose_nr_config(int sample_rate, int fft_size,
-                                       int hop_size, MmseLsaNrMode mode) {
-    MmseLsaConfig nr_cfg =
-        mmse_lsa_config_for_mode_grid(sample_rate, fft_size, mode);
+static inline AnrConfig pipelines_compose_nr_config(int sample_rate, int fft_size,
+                                       int hop_size, AnrMode mode) {
+    AnrConfig nr_cfg =
+        anr_config_for_mode_grid(sample_rate, fft_size, mode);
     /* broadband_threshold stays at the canonical 1.0 (scene-reset gate off).
      * With the denoiser's own SPP gating the noise update, the gate read the
      * first speech after a silent stretch as a new noise scene and reset the
      * estimate onto it; on the AEC blind corpus that cost near-end speech far
      * more than the faster post-burst adaptation returned. */
     /* 2026-08-03 A/B decision (824-case VCTK+DEMAND + 90-case AEC blind
-     * manifest, see NR/CHANGELOG.md): take mmse_lsa_config_for_mode_grid()'s
+     * manifest, see NR/CHANGELOG.md): take anr_config_for_mode_grid()'s
      * canonical alpha_d/alpha_attack as-is instead of overriding them back
      * to the old L=150/alpha_d=0.95/alpha_attack=0.3-old-retime tuning --
      * that legacy tuning measured worse on the AEC-residual/double-talk
      * angle that matters for this pipeline. L and alpha_decay are untouched:
      * they already coincide with Python's canonical composition (see
      * audio_pipeline.c's mono twin for the full rationale). */
-    nr_cfg.L = mmse_lsa_retime_frames(150, sample_rate, hop_size);
+    nr_cfg.L = anr_retime_frames(150, sample_rate, hop_size);
     nr_cfg.alpha_decay = nr_cfg.alpha_g;
     return nr_cfg;
 }

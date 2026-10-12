@@ -4,7 +4,7 @@
  * audio_pipeline_init_ex -> one hop of audio_pipeline_process -> reset ->
  * destroy -- while itself using NO stdio whatsoever: the exit code is the
  * only output. `make audit-no-stdio-stack` links this against the four
- * NO_STDIO=1 archives (libaudio_pipeline.a + libaec.a + libmmse_lsa.a +
+ * NO_STDIO=1 archives (libaudio_pipeline.a + libaec.a + libanr.a +
  * libaudio_common.a) and then `nm`-gates the resulting EXECUTABLE, so a
  * stdio symbol smuggled in by ANY archive (not just the pipeline's own TU)
  * fails the audit -- a per-object gate alone can pass while the delivered

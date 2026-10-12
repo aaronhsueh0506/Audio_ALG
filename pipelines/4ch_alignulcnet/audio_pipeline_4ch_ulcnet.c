@@ -134,9 +134,9 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
     if (cfg->core.enable_res != 0) return 0;
     if (cfg->core.enable_cng != 0) return 0;
     if (cfg->core.legacy_amin != 0) return 0;
-    /* MmseLsaNrMode has no "disabled" value and no denoiser is created here,
+    /* AnrMode has no "disabled" value and no denoiser is created here,
      * so the default is a required sentinel rather than a strength choice. */
-    if (cfg->core.nr_mode != MMSE_LSA_NR_BALANCED) return 0;
+    if (cfg->core.nr_mode != ANR_MODE_BALANCED) return 0;
     /* The built-in energy VAD is unreachable too: this wrapper exposes only
      * _process_with_activity(), which takes the caller's VAD. Compared against
      * a freshly built default rather than transcribed literals, so a change to
@@ -399,7 +399,7 @@ static int derive_spatial_configs(
 
     memset(gsc_cfg, 0, sizeof(*gsc_cfg));
     gsc_cfg->enable = cfg->gsc_enable;
-    gsc_cfg->lambda = mmse_lsa_retime_alpha(
+    gsc_cfg->lambda = anr_retime_alpha(
         cfg->gsc_lambda, cfg->core.sample_rate,
         hop * gsc_effective_interval);
     gsc_cfg->mu = cfg->gsc_mu;

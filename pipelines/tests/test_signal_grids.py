@@ -6,14 +6,14 @@ import numpy as np
 import pytest
 
 from lib.aec.python.modules.config import AecConfig
-from lib.nr.core.frame_processor import FrameProcessor
-from lib.nr.core.signal_grid import (
+from lib.nr.python.core.frame_processor import FrameProcessor
+from lib.nr.python.core.signal_grid import (
     _SIXTEEN_MS_HOP_SECONDS,
     resolve_signal_grid,
     retime_ema_alpha,
     retime_frame_count,
 )
-from lib.nr.denoisers import (
+from lib.nr.python.denoisers import (
     MmseLsaDenoiser,
     PmmseDenoiser,
     SpectralSubtractionDenoiser,

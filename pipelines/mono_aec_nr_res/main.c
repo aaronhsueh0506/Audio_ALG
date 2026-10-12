@@ -31,7 +31,7 @@
  *                     [--debug]
  *
  * --debug: once per second of processed audio, print one compact status line
- *   to stderr combining aec_debug_status() (lib/aec) + mmse_lsa_debug_status()
+ *   to stderr combining aec_debug_status() (lib/aec) + anr_debug_status()
  *   (lib/nr) — read-only snapshots, no DSP-state or output changes.
  */
 
@@ -60,19 +60,19 @@ static const char* preset_name(AecPreset p) {
     }
 }
 
-/* Name table lives beside the enum (lib/nr mmse_lsa_types.h); an unknown
+/* Name table lives beside the enum (lib/nr anr_types.h); an unknown
  * name keeps this tool's long-standing fallback to balanced. */
-static MmseLsaNrMode parse_nr_mode(const char* s) {
-    int m = mmse_lsa_nr_mode_from_name(s);
-    return m < 0 ? MMSE_LSA_NR_BALANCED : (MmseLsaNrMode)m;
+static AnrMode parse_nr_mode(const char* s) {
+    int m = anr_nr_mode_from_name(s);
+    return m < 0 ? ANR_MODE_BALANCED : (AnrMode)m;
 }
 
-static const char* nr_mode_name(MmseLsaNrMode m) {
-    return mmse_lsa_nr_mode_name(m);
+static const char* nr_mode_name(AnrMode m) {
+    return anr_nr_mode_name(m);
 }
 
 /* --debug: one compact status line/sec to stderr, combining both libraries'
- * read-only diagnostic queries (aec_debug_status() / mmse_lsa_debug_status())
+ * read-only diagnostic queries (aec_debug_status() / anr_debug_status())
  * via the handles audio_pipeline_get_aec()/audio_pipeline_get_nr() expose.
  * Neither call mutates DSP state or fast_math-approximates anything (both
  * use standard logf/log10f), so this is safe to call every second regardless
@@ -88,7 +88,7 @@ static const char* nr_mode_name(MmseLsaNrMode m) {
 static void print_debug_status(const AudioPipeline* pipe, int aec_only, float seconds) {
     AecDebugStatus a;
     aec_debug_status(audio_pipeline_get_aec(pipe), &a);
-    const MmseLsaDenoiser* nr = audio_pipeline_get_nr(pipe);
+    const AnrDenoiser* nr = audio_pipeline_get_nr(pipe);
     if (aec_only || !nr) {
         fprintf(stderr,
             "[dbg %5.1fs] aec: delay=%d conf=%.1f upd=%d erle=%.1fdB lin=%d conv=%d "
@@ -98,8 +98,8 @@ static void print_debug_status(const AudioPipeline* pipe, int aec_only, float se
             a.near_power, a.out_power);
         return;
     }
-    MmseLsaDebugStatus n;
-    mmse_lsa_debug_status(nr, &n);
+    AnrDebugStatus n;
+    anr_debug_status(nr, &n);
     fprintf(stderr,
         "[dbg %5.1fs] aec: delay=%d conf=%.1f upd=%d erle=%.1fdB lin=%d conv=%d "
         "near=%.2e out=%.2e | nr: init=%d gain=%.1f/%.1fdB spp=%.2f noise=%.1fdB\n",
@@ -197,7 +197,7 @@ int main(int argc, char* argv[]) {
     const char* out_path = argv[3];
 
     AecPreset     preset   = AEC_PRESET_BALANCED;
-    MmseLsaNrMode nr_mode  = MMSE_LSA_NR_BALANCED;
+    AnrMode nr_mode  = ANR_MODE_BALANCED;
     int           aec_only = 0;
     int           legacy   = 0;   /* --legacy-amin → prior min-only A_min_pl */
     int           no_nr    = 0;   /* --no-nr → no denoiser, g_total is G_res */
@@ -305,7 +305,7 @@ int main(int argc, char* argv[]) {
     }
 
     Aec* aec_handle = audio_pipeline_get_aec(pipe);
-    MmseLsaDenoiser* nr_handle = audio_pipeline_get_nr(pipe);
+    AnrDenoiser* nr_handle = audio_pipeline_get_nr(pipe);
 
     /* === Processing loop === */
     int processed = 0;
@@ -331,7 +331,7 @@ int main(int argc, char* argv[]) {
             AecResContext ctx;
             aec_get_res_context(aec_handle, &ctx);
             if (ctx.error_spec && ctx.res_gain) {
-                const float* g_nr = mmse_lsa_get_gain(nr_handle, NULL);
+                const float* g_nr = anr_get_gain(nr_handle, NULL);
                 fwrite(ctx.error_spec, sizeof(Complex), n_freqs, dctx);
                 fwrite(ctx.res_gain, sizeof(float), n_freqs, dctx);
                 fwrite(ctx.r2, sizeof(float), n_freqs, dctx);

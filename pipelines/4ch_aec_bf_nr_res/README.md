@@ -278,7 +278,7 @@ make NO_STDIO=1 audit-no-stdio
 wrapper objects are linked directly into their application binaries; no
 per-application archive is produced. A standard consumer links the core with
 `audio_pipeline_4ch.o`, `libdoa.a`, `libgsc.a`,
-`libspatial_common.a`, `libaec.a`, `libmmse_lsa.a`, `libaudio_common.a`, and
+`libspatial_common.a`, `libaec.a`, `libanr.a`, `libaudio_common.a`, and
 `-lm`, in the order demonstrated by this directory's Makefile.
 
 ## Python reference seam

@@ -61,7 +61,7 @@ make BACKEND=kiss WERROR=1 test        # includes test_4aec_dfn_res and the skel
 
 `lib4aec_dfn_res.a` holds the wrapper, the shared stage and the DFN2 host
 pre/post objects; link it with `libaudio_pipeline_4ch.a` (the core), `libaec`,
-`libmmse_lsa` and `libaudio_common`. The board supplies the stateless model
+`libanr` and `libaudio_common`. The board supplies the stateless model
 callback (`DFN2Model`) and the exported ERB matrices. `main.c` is the board
 skeleton (delay-profile flags, `--sample-rate` (default 16000), `--erb-fwd`
 / `--erb-inv`, `--atten-lim`, `--cng`, uniform weights standing in for the

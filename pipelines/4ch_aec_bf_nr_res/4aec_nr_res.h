@@ -54,7 +54,7 @@
 #include <stdint.h>
 
 #include "aec.h"
-#include "mmse_lsa_denoiser.h"
+#include "anr.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -190,7 +190,7 @@ extern "C" {
  * file's carve order/buffer-set version; backend_id = compile-time FFT
  * backend as a small integer, compared with plain `==`, never `strcmp`;
  * build_flags_hash = FNV-1a-32 over this file's own carve structure, NOT
- * over AecConfig/MmseLsaConfig tunable values; reserved = always 0, VALIDATED
+ * over AecConfig/AnrConfig tunable values; reserved = always 0, VALIDATED
  * not assumed, because `expected` may originate from persisted/transmitted
  * bytes) -- see that header's own doc comment for the full rationale
  * (four problems the old size_t/pointer/strcmp shape had that this fixed
@@ -289,7 +289,7 @@ typedef struct FourAecNrResConfig {
     float delay_backward_quarantine_s;      /* window, seconds; default 1.0 */
     float max_delay_ms;           /* MATCHED reference delay-line capacity   */
     AecPreset aec_preset;
-    MmseLsaNrMode nr_mode;
+    AnrMode nr_mode;
     int enable_post;              /* direct core: 1=RES/NR/iFFT, 0=pre-only (its
                                     * lanes then keep only the linear half of the
                                     * AEC context: AEC_CONTEXT_LINEAR_ONLY);
@@ -821,8 +821,8 @@ int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live,
  *
  * This recomposes THIS pipeline's own NR configuration -- the canonical
  * strength preset plus the overrides it has always applied on top -- and hands
- * the result to mmse_lsa_reconfigure(). It deliberately does not call
- * mmse_lsa_set_mode(), which composes the bare canonical preset and would
+ * the result to anr_reconfigure(). It deliberately does not call
+ * anr_set_mode(), which composes the bare canonical preset and would
  * either be refused (its L differs from this pipeline's) or revert those
  * overrides.
  *
@@ -832,7 +832,7 @@ int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live,
  * Requires enable_post and enable_nr. Call between hops. Returns 0, or -1 on
  * NULL, an out-of-enum mode, a pre-only/NR-disabled core, or a rejected
  * target. */
-int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, MmseLsaNrMode mode);
+int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, AnrMode mode);
 
 /* ============================================================================
  * Diagnostic memory breakdown
@@ -883,7 +883,7 @@ int four_aec_nr_res_get_mem_breakdown(
  *   res_us       the residual-echo suppression gain: the error/near power
  *                preparation it consumes plus suppression_gain_get_gain().
  *   nr_us        the noise-reduction gain: the residual-echo prior it
- *                consumes plus mmse_lsa_process_gain().
+ *                consumes plus anr_process_gain().
  *   synth_us     inverse transform, windowed overlap-add, and the hop
  *                emit/shift.
  *

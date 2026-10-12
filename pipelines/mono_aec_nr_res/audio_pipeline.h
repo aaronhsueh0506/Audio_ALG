@@ -24,7 +24,7 @@
 #include <stdint.h>
 
 #include "aec.h"                /* AecConfig/AecPreset, Aec (non-opaque)      */
-#include "mmse_lsa_denoiser.h"  /* MmseLsaConfig/MmseLsaNrMode, MmseLsaDenoiser (opaque) */
+#include "anr.h"  /* AnrConfig/AnrMode, AnrDenoiser (opaque) */
 
 #ifdef __cplusplus
 extern "C" {
@@ -92,7 +92,7 @@ typedef struct {
     int           delay_num_filters;   /* MATCHED bank size [1,5]                       */
     int           fixed_delay_samples; /* FIXED native-rate samples; -1 otherwise       */
     AecPreset     aec_preset;    /* MILD | BALANCED | AGGRESSIVE                       */
-    MmseLsaNrMode nr_mode;       /* MILD | MODERATE | BALANCED | AGGRESSIVE            */
+    AnrMode nr_mode;       /* MILD | MODERATE | BALANCED | AGGRESSIVE            */
     int           aec_only;      /* 1 = skip NR/RES entirely (linear AEC output only). *
                                    * Outranks enable_nr/enable_res: with 1 there is no *
                                    * post path and both are inert                      */
@@ -125,15 +125,15 @@ typedef struct AudioPipeline AudioPipeline;
 /**
  * Query the memory descriptor for `cfg` WITHOUT allocating or touching any
  * audio state. Validates `cfg` via the same module validators
- * aec_get_mem_size()/mmse_lsa_get_mem_size() already gate on internally
- * (aec_validate_config / mmse_lsa_validate_config, both invalid-config ->
+ * aec_get_mem_size()/anr_get_mem_size() already gate on internally
+ * (aec_validate_config / anr_validate_config, both invalid-config ->
  * return 0) PLUS an explicit reject-first check up front, in
  * derive_dims_and_configs() (the one place every entry point in this file
  * funnels through): sample_rate against the {8000,16000,48000} whitelist
  * (aec_is_valid_sample_rate — e.g. sample_rate=44100 is rejected before any
  * size arithmetic runs, not just left to a downstream 0), aec_preset/nr_mode
  * against their defined enum values (rather than silently falling through
- * aec_config_from_preset's/mmse_lsa_config_for_mode's own balanced-default
+ * aec_config_from_preset's/anr_config_for_mode's own balanced-default
  * fallback), and aec_only/enable_cng/legacy_amin against {0,1} (rather than
  * being treated as truthy by a stray nonzero value downstream).
  *
@@ -245,8 +245,8 @@ int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset,
  *
  * This recomposes THIS pipeline's own NR configuration -- the canonical
  * strength preset plus the overrides it has always applied on top -- and hands
- * the result to mmse_lsa_reconfigure(). It deliberately does not call
- * mmse_lsa_set_mode(), which composes the bare canonical preset and would
+ * the result to anr_reconfigure(). It deliberately does not call
+ * anr_set_mode(), which composes the bare canonical preset and would
  * either be refused (its L differs) or revert those overrides.
  *
  * The tracked noise floor and the gain smoothing history survive the change;
@@ -254,14 +254,14 @@ int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset,
  *
  * Returns 0, or -1 on NULL, an aec_only build (no denoiser exists), an
  * out-of-enum mode, or a rejected target. */
-int audio_pipeline_set_nr_mode(AudioPipeline* p, MmseLsaNrMode mode);
+int audio_pipeline_set_nr_mode(AudioPipeline* p, AnrMode mode);
 
 /**
  * Tear down in reverse carve order: NR -> pipeline FFT (the OLA irfft
  * instance) -> AEC. This is the mirror image of audio_pipeline_init's carve
  * order (AEC -> FFT -> NR -> scratch) and matches the teardown order
  * pipelines/README.md's "Two Versions" section already documents for the
- * static CLI (`mmse_lsa_destroy` / `fft_destroy` / `aec_destroy`, in that
+ * static CLI (`anr_destroy` / `fft_destroy` / `aec_destroy`, in that
  * order) — kept even though every one of those three calls is a genuine
  * no-op on a pool-resident (audio_pipeline_init'd) instance today: it is
  * forward-compat insurance (a future backend/module MAY hold something
@@ -304,8 +304,8 @@ int audio_pipeline_sample_rate(const AudioPipeline* p);  /* -1 if p is NULL */
 
 /**
  * Read-only access to the underlying module handles, for a caller's OWN
- * diagnostics (aec_debug_status/aec_get_res_context/mmse_lsa_debug_status/
- * mmse_lsa_get_gain/...) — this is how both CLIs keep their existing
+ * diagnostics (aec_debug_status/aec_get_res_context/anr_debug_status/
+ * anr_get_gain/...) — this is how both CLIs keep their existing
  * `--debug` status line and `DUMP_CTX` per-hop dump working as thin
  * wrappers, without this header re-exposing every intermediate signal
  * itself. Do not call any _reset/_destroy/mutating entry point on these
@@ -313,7 +313,7 @@ int audio_pipeline_sample_rate(const AudioPipeline* p);  /* -1 if p is NULL */
  * pipeline-owned state (OLA, RNG, hangover counter) stays in sync.
  */
 Aec*             audio_pipeline_get_aec(const AudioPipeline* p);  /* never NULL for a valid p */
-MmseLsaDenoiser* audio_pipeline_get_nr(const AudioPipeline* p);   /* NULL iff cfg.aec_only     */
+AnrDenoiser* audio_pipeline_get_nr(const AudioPipeline* p);   /* NULL iff cfg.aec_only     */
 
 /* ============================================================================
  * Diagnostic breakdown (backs --print-mem-size in both CLIs)
@@ -322,7 +322,7 @@ MmseLsaDenoiser* audio_pipeline_get_nr(const AudioPipeline* p);   /* NULL iff cf
 /** Per-module byte breakdown, mirroring the static CLI's original
  * `print_mem_budget()` table (AEC / FFT / NR / pipeline-buffer columns) so
  * that diagnostic stays available without either CLI re-deriving
- * AecConfig/MmseLsaConfig/frame-dims itself. NOT part of
+ * AecConfig/AnrConfig/frame-dims itself. NOT part of
  * AudioPipelineMemReq: those bytes are already folded into `bytes` there;
  * this is purely for the human-readable table. */
 typedef struct {
@@ -367,7 +367,7 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
  *                Here it stays inside the single AEC -- same quantity,
  *                different owner.
  *   nr_us        the noise-reduction gain: the r2/PSD_SCALE fold of the
- *                residual-echo prior plus mmse_lsa_process_gain().
+ *                residual-echo prior plus anr_process_gain().
  *   post_us      the gain arithmetic between the two: min(G_nr, G_res), the
  *                spectral apply, and the comfort-noise loop.
  *   synth_us     inverse transform, windowed overlap-add, and the hop

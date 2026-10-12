@@ -28,13 +28,14 @@ import soundfile as sf
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)                                       # lib.* + pipelines.*
 sys.path.insert(0, os.path.join(_ROOT, 'lib', 'aec', 'python')) # aec + modules
+sys.path.insert(0, os.path.join(_ROOT, 'lib', 'nr', 'python'))  # NR modules
 
 from lib.aec.python.aec import (
     AEC, AecConfig, AecMode, AecPreset, AecResContext,
 )
-from lib.nr.denoisers import MmseLsaDenoiser
-from lib.nr.core.nr_strength import apply_strength
-from lib.nr.process_audio import build_v3_2_base_params, load_config
+from lib.nr.python.denoisers import MmseLsaDenoiser
+from lib.nr.python.core.nr_strength import apply_strength
+from lib.nr.python.process_audio import build_v3_2_base_params, load_config
 
 # The standalone ResFilter was retired in AEC v3.21; the separated
 # `--pipeline-mode linear` (AEC-linear -> NR -> RES) is now rebuilt on the
@@ -106,16 +107,16 @@ def run_aec_linear(mic_signal: np.ndarray, ref_signal: np.ndarray,
 
 # 2026-08-03: the standalone hand-rolled NR_PRESETS dict (mild/balanced/aggressive
 # {g_min,q,xi_min,alpha_g}) that used to live here was removed. It duplicated and
-# diverged from NR's own single source of truth (NR/config/v3_2_config.yaml +
-# NR/core/nr_strength.py's apply_strength(), the same composition
-# NR/process_audio.py's create_denoiser_from_config() uses) -- most visibly,
+# diverged from NR's own single source of truth (NR/python/config/v3_2_config.yaml +
+# NR/python/core/nr_strength.py's apply_strength(), the same composition
+# NR/python/process_audio.py's create_denoiser_from_config() uses) -- most visibly,
 # 'balanced'.g_min_db was -15.0 here vs the real NR balanced's -30.0
-# (lib/nr/c_impl/include/mmse_lsa_types.h / lib/nr/config/v3_2_config.yaml), an
+# (lib/nr/c_impl/include/anr_types.h / lib/nr/python/config/v3_2_config.yaml), an
 # amplitude-dB(/20) floor mismatch, not just a naming coincidence. It also never
 # wired `strength=` into MmseLsaDenoiser, so mild/aggressive never touched the
 # real temporal-smoothing knobs (alpha_noise/alpha_g/alpha_attack/alpha_decay) --
 # only g_min_db (via this dict) changed. See _build_denoiser() for the fix.
-_NR_YAML_CONFIG = os.path.join(_ROOT, 'lib', 'nr', 'config', 'v3_2_config.yaml')
+_NR_YAML_CONFIG = os.path.join(_ROOT, 'lib', 'nr', 'python', 'config', 'v3_2_config.yaml')
 
 # MCRA minima-tracking window (MmseLsaDenoiser's `L`): this pipeline's own ~1.5s
 # wall-clock design, independent of NR's own L=32 (512ms, tuned for standalone
@@ -158,9 +159,9 @@ def _build_denoiser(sample_rate: int,
                     fft_size: int = None) -> MmseLsaDenoiser:
     """MMSE-LSA denoiser on a power-of-two, no-padding 50%-overlap grid.
 
-    Routed through NR's own single source of truth: NR/config/v3_2_config.yaml's
-    base params (via NR/process_audio.py's build_v3_2_base_params(), the same
-    helper create_denoiser_from_config() uses) with NR/core/nr_strength.py's
+    Routed through NR's own single source of truth: NR/python/config/v3_2_config.yaml's
+    base params (via NR/python/process_audio.py's build_v3_2_base_params(), the same
+    helper create_denoiser_from_config() uses) with NR/python/core/nr_strength.py's
     apply_strength(nr_preset) overlaid -- i.e. exactly the base-YAML -> strength
     composition create_denoiser_from_config() does, minus the mode overlay (this
     pipeline has no content-mode selection, so `mode='full'`, itself an empty
@@ -177,7 +178,7 @@ def _build_denoiser(sample_rate: int,
     naming coincidence) and whose 'balanced' used g_min_db=-15.0 against the real
     NR balanced's -30.0 (both are the amplitude-dB/20 convention -- an actual
     2x-in-dB floor mismatch, confirmed against both
-    lib/nr/c_impl/include/mmse_lsa_types.h and lib/nr/config/v3_2_config.yaml,
+    lib/nr/c_impl/include/anr_types.h and lib/nr/python/config/v3_2_config.yaml,
     which already agree with each other). Fixing that wiring gap also surfaces
     two more stale hardcoded values this file was carrying that have no
     AEC-specific rationale anywhere in its history (unlike L below, which
@@ -203,7 +204,7 @@ def _build_denoiser(sample_rate: int,
         "150 x 10ms = 1.5s" (commit de16bce, back when NR ran a literal 10ms
         hop with no retiming abstraction at all -- an independent AEC-residual
         stationarity design, unrelated to NR's own L=32/512ms tuning). NR's own
-        L retiming call (lib/nr/denoisers/v3_2_mmse_lsa.py) was just changed
+        L retiming call (lib/nr/python/denoisers/v3_2_mmse_lsa.py) was just changed
         (NR CHANGELOG [4.5.0]) from a generic 10ms-authored assumption to an
         UNCONDITIONAL 16ms-authored one, because NR's own L=32 is genuinely
         16ms-authored and the shared retime call has no way to tell this

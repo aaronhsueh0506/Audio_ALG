@@ -3018,14 +3018,14 @@ static void test_runtime_strength(void) {
           "strength: out-of-enum preset refused");
     CHECK(four_aec_nr_res_set_aec_preset(p, AEC_PRESET_MILD, 60001.0f) == -1,
           "strength: out-of-range ramp_ms refused");
-    CHECK(four_aec_nr_res_set_nr_mode(p, (MmseLsaNrMode)42) == -1,
+    CHECK(four_aec_nr_res_set_nr_mode(p, (AnrMode)42) == -1,
           "strength: out-of-enum NR mode refused");
 
     /* 5. The NR setter recomposes THIS pipeline's configuration. The
      *    canonical convenience wrapper must be REFUSED on this instance --
      *    its L differs -- which is precisely why recomposing is required and
      *    not merely tidier. */
-    CHECK(four_aec_nr_res_set_nr_mode(p, MMSE_LSA_NR_AGGRESSIVE) == 0,
+    CHECK(four_aec_nr_res_set_nr_mode(p, ANR_MODE_AGGRESSIVE) == 0,
           "strength: NR mode change accepted through the recomposed target");
 
     four_aec_nr_res_destroy(p);
@@ -3055,7 +3055,7 @@ static void test_nr_bypass(void) {
           four_aec_nr_res_post_res_count(p) == 1,
           "NR-disabled core still owns the shared RES/post path");
     CHECK(four_aec_nr_res_set_nr_mode(
-              p, MMSE_LSA_NR_AGGRESSIVE) == -1,
+              p, ANR_MODE_AGGRESSIVE) == -1,
           "runtime NR mode changes are refused when NR is disabled");
 
     CHECK(feed_strength_hops(p, 40, NULL, NULL) == 40,
@@ -3141,7 +3141,7 @@ static void test_nr_bypass_output_identity(void) {
     /* The canonical noise-init length: the pipeline's NR overlay retimes L,
      * not num_init_frames, so the denoiser's pass-through window is the
      * canonical one for this grid. */
-    init_hops = mmse_lsa_retime_frames(20, 16000, hop);
+    init_hops = anr_retime_frames(20, 16000, hop);
     total_hops = init_hops + 80;
 
     mics = (float*)calloc((size_t)hop * 4u, sizeof(float));
@@ -3860,7 +3860,7 @@ static void test_comfort_noise_follows_nr_gain(void) {
     if (!created) { for (i = 0; i < 4; ++i) four_aec_nr_res_destroy(p[i]); return; }
     hop = four_aec_nr_res_hop_size(p[0]);
     n = four_aec_nr_res_n_freqs(p[0]);
-    settle_hops = mmse_lsa_retime_frames(20, 16000, hop) + 40;
+    settle_hops = anr_retime_frames(20, 16000, hop) + 40;
     hops = settle_hops + 200;
     mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
     far = (float*)calloc((size_t)hop, sizeof(float));

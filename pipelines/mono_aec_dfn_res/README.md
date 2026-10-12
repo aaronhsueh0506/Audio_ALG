@@ -69,7 +69,7 @@ make BACKEND=kiss WERROR=1 test        # includes test_dfn_res_stage,
 
 `libaudio_pipeline_dfn.a` holds the wrapper, the shared stage and the DFN2
 host pre/post objects. It is linked together with `libaudio_pipeline.a` (the
-host), `libaec`, `libmmse_lsa` (referenced by the host archive) and
+host), `libaec`, `libanr` (referenced by the host archive) and
 `libaudio_common`; the board supplies the stateless model callback
 (`DFN2Model`) and the exported ERB matrices (`erb_fwd.bin` / `erb_inv.bin`
 from `AINR/DeepFilterNet2/export_erb_matrix.py`). `main.c` is the board

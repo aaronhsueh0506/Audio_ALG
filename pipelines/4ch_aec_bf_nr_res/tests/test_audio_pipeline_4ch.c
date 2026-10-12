@@ -161,10 +161,10 @@ static int test_gsc_fixed_notebook_lambda_matches_forced_cadence(void) {
           "fixed-notebook mode forces the actual GSC cadence to 1");
 
     /* Lambda must be retimed assuming that SAME forced interval (1), i.e.
-     * exactly mmse_lsa_retime_alpha(gsc_lambda, sr, hop_size*1) -- not
+     * exactly anr_retime_alpha(gsc_lambda, sr, hop_size*1) -- not
      * hop_size*4, which is what the pre-fix code effectively assumed by
      * scaling with the raw pre-forced gsc_adapt_interval. */
-    expected_lambda = mmse_lsa_retime_alpha(
+    expected_lambda = anr_retime_alpha(
         cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 1);
     CHECK(fabsf(actual_lambda - expected_lambda) < 1e-9f,
           "lambda retime uses the forced (not the requested) adapt_interval");
@@ -172,7 +172,7 @@ static int test_gsc_fixed_notebook_lambda_matches_forced_cadence(void) {
     /* Sanity check that this test would actually have caught the original
      * bug: the mis-scaled lambda (computed against the pre-forced interval
      * of 4) must visibly differ from the correct one. */
-    buggy_lambda = mmse_lsa_retime_alpha(
+    buggy_lambda = anr_retime_alpha(
         cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 4);
     CHECK(fabsf(actual_lambda - buggy_lambda) > 1e-4f,
           "forced-cadence lambda differs from the old mis-scaled lambda");
@@ -203,7 +203,7 @@ static int test_gsc_auto_mode_respects_configured_interval(void) {
     CHECK(audio_pipeline_4ch_gsc_effective_adapt_interval(p) == 4,
           "auto mode keeps the requested adapt_interval unforced");
 
-    expected_lambda = mmse_lsa_retime_alpha(
+    expected_lambda = anr_retime_alpha(
         cfg.gsc_lambda, cfg.core.sample_rate, hop_size * 4);
     CHECK(fabsf(audio_pipeline_4ch_gsc_lambda(p) - expected_lambda) < 1e-9f,
           "lambda retime uses the requested adapt_interval in auto mode");

@@ -47,7 +47,7 @@
  *      -I../lib/nr/c_impl/include -I../../audio_common/include \
  *      -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" \
  *      tests/test_audio_pipeline.c audio_pipeline.c \
- *      ../lib/aec/c_impl/bin/libaec.a ../lib/nr/c_impl/bin/libmmse_lsa.a \
+ *      ../lib/aec/c_impl/bin/libaec.a ../lib/nr/c_impl/bin/libanr.a \
  *      ../../audio_common/bin/kiss/libaudio_common.a -lm -o /tmp/tap && /tmp/tap
  *
  * Cases (each run once per rate in RATES[] below, unless noted "once"):
@@ -437,7 +437,7 @@ static void test_config_validation_rejects(void) {
           "get_mem_requirements rejects an out-of-enum aec_preset");
 
     AudioPipelineConfig bad_nr_mode = audio_pipeline_default_config(16000);
-    bad_nr_mode.nr_mode = (MmseLsaNrMode)99;
+    bad_nr_mode.nr_mode = (AnrMode)99;
     CHECK(audio_pipeline_get_mem_requirements(&bad_nr_mode, &req) == -1,
           "get_mem_requirements rejects an out-of-enum nr_mode");
 
@@ -510,7 +510,7 @@ static void test_config_validation_rejects(void) {
     }
 
     AudioPipelineConfig bad_init_enum = good;
-    bad_init_enum.nr_mode = (MmseLsaNrMode)99;
+    bad_init_enum.nr_mode = (AnrMode)99;
     AudioPipeline* p1 = audio_pipeline_init(pool, good_req.bytes, &bad_init_enum);
     CHECK(p1 == NULL, "audio_pipeline_init rejects an out-of-enum nr_mode");
     if (p1) audio_pipeline_destroy(p1);
@@ -571,11 +571,11 @@ static void test_nr_res_switches(void) {
         return;
     }
     CHECK(audio_pipeline_get_nr(nr_off) == NULL &&
-          audio_pipeline_set_nr_mode(nr_off, MMSE_LSA_NR_MILD) == -1,
+          audio_pipeline_set_nr_mode(nr_off, ANR_MODE_MILD) == -1,
           "NR-disabled instance has no denoiser and refuses a mode change");
     hop = audio_pipeline_hop_size(on);
     frame = 2 * hop;                     /* 50% overlap: FFT == frame == 2 hops */
-    init_hops = mmse_lsa_retime_frames(20, 16000, hop);
+    init_hops = anr_retime_frames(20, 16000, hop);
     total_hops = init_hops + 120;
     fft_mem = malloc(fft_get_mem_size(frame));
     fft = fft_mem ? fft_init(fft_mem, fft_get_mem_size(frame), frame) : NULL;
@@ -1132,7 +1132,7 @@ static void test_comfort_noise_follows_nr_gain(void) {
     hop = audio_pipeline_hop_size(p[0]);
     /* The denoiser passes through for its init window and then needs a few
      * hops to pull the noise bins down to its gain floor. */
-    settle_hops = mmse_lsa_retime_frames(20, sr, hop) + 40;
+    settle_hops = anr_retime_frames(20, sr, hop) + 40;
     hops = settle_hops + 200;
     mic = (float*)calloc((size_t)hop, sizeof(float));
     ref = (float*)calloc((size_t)hop, sizeof(float));
