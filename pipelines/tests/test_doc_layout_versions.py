@@ -69,6 +69,18 @@ _UNQUALIFIED_CURRENT_CLAIMS = (
     ('docs/html/pipeline_4ch.html', 'AUDIO_PIPELINE_4CH_LAYOUT_VERSION',
      re.compile(r'audio_pipeline_4ch_get_mem_requirements\(\)</code>'
                 r'\(ne10,layout_version=(\d+)\)')),
+    ('docs/html/pipeline_4ch.html', 'AUDIO_PIPELINE_4CH_LAYOUT_VERSION',
+     re.compile(r'run_post_stages\(\)</code>;layout v(\d+)\)')),
+    ('docs/html/pipeline_mono.html', 'AUDIO_PIPELINE_LAYOUT_VERSION',
+     re.compile(r'本頁 API 與實作\(layout v(\d+)\)')),
+    ('docs/html/pipeline_ulcnet_mono.html', 'AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION',
+     re.compile(r'descriptor v1 / layout v(\d+)\)')),
+    ('docs/html/pipeline_ulcnet_4ch.html',
+     'AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION',
+     re.compile(r'descriptor v1 / <b>layout v(\d+)</b>')),
+    ('pipelines/4ch_alignulcnet/README.md',
+     'AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION',
+     re.compile(r'LAYOUT_VERSION`\) is \*\*(\d+)\*\*')),
 )
 
 

@@ -316,7 +316,7 @@ log("delay=%d conf=%.1f upd=%d erle=%.1fdB usable=%d conv=%d "
 <tr><td class="dead">4ch init 失敗<b>一個字都不說</b></td><td><code>init_ex()</code> 的 8 項檢查任一失敗都<b>靜默回 NULL</b>。mono 有逐欄位 stderr,但 <code>NO_STDIO=1</code>(正是板端組態)一開就沒了</td></tr>
 <tr><td class="dead">沒有 frame counter</td><td>四條 pipeline <b>都沒有</b> frame counter 的 public accessor → 「這條 stream 到目前為止處理了幾個 hop」都答不出來,遑論 xrun</td></tr>
 <tr><td class="dead">mono pipeline 沒有 finite 守衛</td><td><code>audio_pipeline_process()</code> 輸入不檢、輸出不檢。<b>只有 4ch 有</b>(輸入與輸出各一道)</td></tr>
-<tr><td class="dead">兩條 ULCNet pipeline 幾乎沒有觀測面</td><td>mono ULCNet 只有 <code>_get_aec()</code>;4ch ULCNet <b>只剩</b> <code>_last_delay()</code> 與尺寸查詢(<code>_last_beamformed_error()</code> 已隨 layout v17 移除)。兩條都<b>沒有暴露 core handle</b> → core 的 duty census、realign counters、timing、post floor 對整合者全部不可達</td></tr>
+<tr><td class="dead">兩條 ULCNet pipeline 幾乎沒有觀測面</td><td>mono ULCNet 只有 <code>_get_aec()</code>;4ch ULCNet <b>只剩</b> <code>_last_delay()</code> 與尺寸查詢(沒有 <code>_last_beamformed_error()</code>)。兩條都<b>沒有暴露 core handle</b> → core 的 duty census、realign counters、timing、post floor 對整合者全部不可達</td></tr>
 </table></div>
 
 <h2>8. 整合檢查清單</h2>
