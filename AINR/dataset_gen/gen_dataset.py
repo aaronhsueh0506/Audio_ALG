@@ -61,12 +61,12 @@ except ImportError:
 # batch stays packable after being copied, resampled, filtered by hand, or
 # produced by something other than this script.
 #
-# What that costs, stated plainly, because these WERE real checks:
-#   * A config.ini/--sample-rate edit between two --resume runs is no longer
+# What that costs, stated plainly:
+#   * A config.ini/--sample-rate edit between two --resume runs is not
 #     detected -- nothing records which config produced which sample, so two
 #     distributions can be mixed into one directory with no error. Resume into
 #     a directory only with the config that started it.
-#   * The generation seed is printed, not persisted, so a batch is no longer
+#   * The generation seed is printed, not persisted, so a batch is not
 #     self-describing enough to reproduce.
 # What survives without any JSON, because it never depended on one:
 #   * A visible `NNNNNN.wav` is always complete -- every write goes to

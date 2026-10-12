@@ -283,7 +283,7 @@ int dfn2_compose_stream(DFN2State *st,
 /* Valin post-filter (上游 deepfilternet3.py:388-394 的形式)。
  * ⚠ 作用在最終複數頻譜，mask 是從 |spec_e|/|spec| 推導出來的實際增益，不是
  *   網路輸出的那個 mask。分子沒有 mask 因子。上游不用 training 閘門。
- *   DFN2 舊版是在 ERB mask 上做、只在推論、beta 寫死 — 兩者不可互換。 */
+ *   不要在 ERB mask 上套這個式子 — 兩者不可互換。 */
 void dfn2_post_filter(const float *spec_re, const float *spec_im,
                       float *enh_re, float *enh_im, float beta);
 

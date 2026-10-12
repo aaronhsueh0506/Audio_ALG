@@ -15,9 +15,9 @@ from training_common import (  # noqa: E402
     scan_non_finite,
 )
 
-#: Every trainer that runs per-step warmup->cosine.  GTCRN joined when its
-#: ReduceLROnPlateau was replaced: on a real run that schedule never fired once
-#: in 32 epochs, because it compares against the best epoch ever seen.
+#: Every trainer that runs per-step warmup->cosine.  GTCRN does not use
+#: ReduceLROnPlateau: that schedule can stay unfired for 32 epochs, because it
+#: compares against the best epoch ever seen.
 _COSINE_TRAINERS = (
     "RNNoise-ERB/train.py",
     "GTCRN/train.py",

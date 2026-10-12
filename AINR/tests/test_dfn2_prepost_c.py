@@ -1926,8 +1926,7 @@ int main(int argc, char **argv) {
 
 @pytest.fixture(scope='module')
 def audio_common_lib():
-    """audio_common's NE10 static lib (the default backend since
-    2026-08-18), built and located the way the other AINR C tests do it."""
+    """audio_common's NE10 static lib (the default backend), built and located the way the other AINR C tests do it."""
     if shutil.which('make') is None:
         pytest.skip('no make available')
     subprocess.run(

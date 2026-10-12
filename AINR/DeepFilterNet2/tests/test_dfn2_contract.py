@@ -670,9 +670,9 @@ def test_enc_concat_true_still_emits_a_single_width_bus():
     Upstream keeps emb_in_dim and emb_out_dim separate: concatenating the two
     encoder branches doubles what the embedding GRU CONSUMES while what it EMITS
     stays one bus wide, because the decoders downstream are built for one bus.
-    The port previously used a single attribute, so enc_concat=True emitted a
-    double-width bus the ERB decoder could not accept.  Since enc_concat is an
-    exposed config knob, that failure was reachable.
+    A single shared width attribute would make enc_concat=True emit a
+    double-width bus the ERB decoder cannot accept.  Since enc_concat is an
+    exposed config knob, that failure is reachable.
     """
     cfg = load_config()
     model = build_shipped_model(cfg, enc_concat=True)
@@ -852,11 +852,11 @@ def test_squeezed_gru_skip_closes_over_the_raw_input():
 
 
 def test_emb_num_layers_one_fails_loudly_instead_of_building_two():
-    """The max(1, emb_num_layers - 1) clamp was removed to match upstream.
+    """There is no max(1, emb_num_layers - 1) clamp, matching upstream.
 
-    ⚠ With the clamp, emb_num_layers=1 silently built 1 + 1 = 2 GRU layers while
-    the config said 1, breaking the total-depth invariant config.ini documents.
-    Upstream is a bare subtraction and nn.GRU rejects num_layers=0.
+    ⚠ With a clamp, emb_num_layers=1 would silently build 1 + 1 = 2 GRU layers
+    while the config said 1, breaking the total-depth invariant config.ini
+    documents. Upstream is a bare subtraction and nn.GRU rejects num_layers=0.
     """
     cfg = load_config()
     with pytest.raises(ValueError, match='num_layers'):

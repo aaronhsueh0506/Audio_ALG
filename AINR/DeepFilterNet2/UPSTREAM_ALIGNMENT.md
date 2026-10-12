@@ -1,6 +1,6 @@
 # DeepFilterNet2 cascade/alpha fork — architecture and alignment record
 
-> **Current architecture (2026-07-31):** this folder intentionally restores
+> **Current architecture:** this folder intentionally restores
 > DFN2's parameter-count-invisible output composition: full-band ERB mask →
 > low-band deep filter on that masked spectrum → learned sigmoid-alpha residual
 > blend. The v5 band-split implementation audited below is no longer built
@@ -14,7 +14,7 @@
 > historical record of the shared base and of that earlier band-split
 > architecture, not a claim that this folder still composes that way.
 
-**Audited 2026-07-30.** 34 independent agents across five areas (feature
+**Audited.** 34 independent agents across five areas (feature
 normalisation, GRU/embedding architecture, conv stack, loss, training schedule),
 every claimed divergence then handed to an adversarial verifier whose default was
 to refute. Only claims that survived verification appear below, at their

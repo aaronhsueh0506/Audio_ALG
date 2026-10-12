@@ -1,9 +1,9 @@
 """AINR trainer 共用機制：非有限值攔截、權重塌陷攔截、梯度範數追蹤、LR schedule。
 
 這裡放的是「每個 trainer 都需要、而且必須完全一致」的東西。理由與
-``dataset_gen`` 相同：sampler / seeder / train-val split 曾經被各個 trainer 各
-自複製一份，然後就漂移了——GTCRN 留 5% 驗證而 RNNoise-ERB 留 10%，兩個被拿來
-互相比較的模型其實訓練在不同的語料上。非有限值的處置與 LR 軌跡同樣是比較協定
+``dataset_gen`` 相同：sampler / seeder / train-val split 若被各個 trainer 各
+自複製一份就會漂移——例如一個留 5% 驗證、另一個留 10%，被拿來互相比較的
+兩個模型就訓練在不同的語料上。非有限值的處置與 LR 軌跡同樣是比較協定
 的一部分：兩個模型若一個在第 32 個 epoch 還停在初始 lr、另一個早已 cosine 退火
 到底，那「跑滿 100 epochs」在兩邊不是同一件事。
 
