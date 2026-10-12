@@ -64,6 +64,10 @@ HEADERS := \
 	GTCRN/gtcrn_process.h
 TEST_BIN := $(OBJ_DIR)/test_c_prepost
 SCALAR_BIN := $(OBJ_DIR)/test_c_prepost_scalar
+# Bit-exactness of the model-local kernels against their scalar twins; the
+# test includes the kernel sources, so it links only audio_common.
+KERNEL_TEST_BIN := $(OBJ_DIR)/test_nn_kernels
+KERNEL_TEST_SCALAR_BIN := $(OBJ_DIR)/test_nn_kernels_scalar
 
 # The AINR release archive, the counterpart of AIAEC's libaiaec_prepost.a:
 # DeepFilterNet2 (including its pre/post class) and GTCRN. RNNoise-ERB is
@@ -119,10 +123,23 @@ $(SCALAR_BIN): $(SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
 	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR $(SOURCES) "$(AC_LIB)" \
 		$(LDFLAGS) -lm -o "$@"
 
-test: $(TEST_BIN)
-	"$(TEST_BIN)"
+KERNEL_SOURCES := GTCRN/gtcrn_process.c
 
-test-simd: $(TEST_BIN) $(SCALAR_BIN)
+$(KERNEL_TEST_BIN): tests/test_nn_kernels.c $(KERNEL_SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) $(SIMD_CPPFLAGS) tests/test_nn_kernels.c "$(AC_LIB)" \
+		$(LDFLAGS) -lm -o "$@"
+
+$(KERNEL_TEST_SCALAR_BIN): tests/test_nn_kernels.c $(KERNEL_SOURCES) $(HEADERS) $(AC_LIB) $(AC_HEADERS) | _cfg_guard
+	$(CC) $(CFLAGS) -DSIMD_KERNELS_FORCE_SCALAR tests/test_nn_kernels.c \
+		"$(AC_LIB)" $(LDFLAGS) -lm -o "$@"
+
+test: $(TEST_BIN) $(KERNEL_TEST_BIN)
+	"$(TEST_BIN)"
+	"$(KERNEL_TEST_BIN)"
+
+test-simd: $(TEST_BIN) $(SCALAR_BIN) $(KERNEL_TEST_BIN) $(KERNEL_TEST_SCALAR_BIN)
+	@"$(KERNEL_TEST_BIN)" && "$(KERNEL_TEST_SCALAR_BIN)" || { \
+		echo "FAIL: kernel test" >&2; exit 1; }
 	@auto_output="$$($(TEST_BIN))" || { \
 		echo "FAIL: $(TEST_BIN) failed" >&2; exit 1; }; \
 	scalar_output="$$($(SCALAR_BIN))" || { \
