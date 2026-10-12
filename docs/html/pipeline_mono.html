@@ -113,10 +113,11 @@ void audio_pipeline_get_last_timing(const AudioPipeline* p,
  │      nr_extra = legacy_amin ? NULL : extra  (R² 折進噪聲底)
  ├─ sk_min_f32(g_total, anr_get_gain(nr,NULL), ctx.res_gain)
  ├─ sk_capply_gain_f32(spec, ctx.error_spec, g_total)
- ├─ CNG(enable_cng_effective): spec[1..n-2] += sqrt(N²/PSD_SCALE)
+ ├─ aec_cng_fill(&amp;rng_state, spec, ctx.comfort_noise, ctx.res_gain, g_nr, 0.316, n)
+ │      (enable_cng_effective): spec[1..n-2] += sqrt(N²/PSD_SCALE)
  │      * sqrt(1-res_gain²) * max(g_nr[k], 0.316) * AEC3B_SQRT2_SIN_LUT[ix / (ix+8)&amp;31]
  │      ix = (rng_state*69069+1)&amp;0x7FFFFFFF &gt;&gt; 26, seed 0x9e3779b9
- │      (lib/aec aec3_post.c 的同一份 CNG 配方:期望功率不變、|樣本| ≤ sqrt(2))
+ │      (aec_res.h 的函式,與 lib/aec aec3_post.c 同一份 CNG 配方:期望功率不變、|樣本| ≤ sqrt(2))
  └─ ac_istft_push(istft, spec, out)   (AcIstft, ACCUMULATE):
         fft_inverse ─► acc += ifft*w ─► emit hop ─► shift acc    (1-hop lag)</pre>
 

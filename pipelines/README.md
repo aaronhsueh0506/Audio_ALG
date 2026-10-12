@@ -476,7 +476,7 @@ live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、�
 跑；要重啟請用對應的 `_reset()`。
 
 > **4ch：對四條 lane 重新指定 preset 是無效操作。** 四條 lane 都以
-> `spatial_linear_context` 建立，從不走到 `suppression_gain_get_gain()`，它們的地板
+> `spatial_linear_context` 建立，從不走到自己的殘留抑制器，它們的地板
 > 什麼都不塑形。真正乘上輸出的 gain 來自**唯一一個**共用的 post 級抑制器，這就是
 > `four_aec_nr_res_set_aec_preset()` 存在、而不是要你迴圈呼叫 `aec_set_preset()` 的
 > 原因（由 `4ch_aec_bf_nr_res/tests/test_4aec_nr_res.c` 的 `test_runtime_strength()` 釘住）。

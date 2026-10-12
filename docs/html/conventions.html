@@ -32,6 +32,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="../../../AEC/docs/html/aec.html">AEC</a> ·
 <a href="../../../NR/docs/html/nr.html">NR</a> ·
 <a href="../../../audio_common/docs/html/audio_common.html">audio_common</a> ·
+<a href="../../../AEC/docs/html/aec_res.html">AEC RES 級</a> ·
 <a href="pipeline_mono.html">mono</a> ·
 <a href="pipeline_ulcnet_mono.html">mono-ULCNet</a> ·
 <a href="pipeline_4ch.html">4ch</a> ·
@@ -324,6 +325,9 @@ alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
 從錯的基準 retime 會 double-correct（<code>anr_types.h</code> 註解）。</li>
 <li>換 grid（如 16k 256↔512）時這些機制讓行為以 wall-clock 不變；
 但 <b>alpha 值本身會不同</b>，比對常數要先問「authoring grid 是哪個」。</li>
+<li>獨立 RES 級 <code>aec_res</code>（<a href="../../../AEC/docs/html/aec_res.html">AEC RES 級</a>）用與 lane 相同的建構函式，
+所以抑制器設定（含上述 retime）逐位元相同；輸入尺度：<code>error_spec</code>/<code>near_spec</code> 為 audio 尺度，
+<code>r2</code>/<code>comfort_noise</code> 為 int16² 尺度，render 在內部乘 32768 換算。</li>
 </ul>
 
 <h2>相關檔案與測試路徑</h2>
@@ -342,6 +346,7 @@ alpha_xi=0.92、L=32、strength overlay 的 alpha_d/g/attack/decay）。
 <code>pipelines/4ch_alignulcnet/tests/test_audio_pipeline_4ch_ulcnet.c</code>（timing contract）、
 <code>AIAEC/tests/test_ulcnet_process_c.py</code>（C↔Python 逐幀 parity）、
 <code>lib/aec/c_impl/test/test_rate_structural.c</code>（retime 結構檢查）、
+<code>lib/aec/c_impl/test/test_aec_res.c</code>（<code>aec_res</code>：設定、增益、舒適噪音的位元一致檢查）、
 <code>lib/nr/c_impl/test/test_config_parity.c</code></td></tr>
 </table>
 

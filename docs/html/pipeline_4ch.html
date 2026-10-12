@@ -77,7 +77,7 @@ four_aec_nr_res_set_nr_mode(core, ANR_MODE_MILD);
 
 float live, target;                                    /* 線性功率,不是 dB */
 four_aec_nr_res_post_split_floor(core, &amp;live, &amp;target); /* live == target ⇒ ramp 已走完 */</pre>
-<p class="note"><b>本節最重要的一件事:對四條 lane 重新指定 preset 是無效操作。</b>四條 lane 都以 <code>spatial_linear_context</code> 建立,因此<b>沒有任何一條</b>會走到自己的 <code>suppression_gain_get_gain()</code>;它們各自的地板什麼都不塑形。真正乘上本產品輸出、也真正決定 comfort noise 量的那個 gain,來自<b>唯一一個</b>共用的 post 級抑制器——上面兩個 preset setter 針對的就是它,這也是它們存在、而不是要呼叫端自己對四條 lane 迴圈呼叫 <code>aec_set_preset()</code> 的原因。同理 NR 也只有一個共用實例(對 beamform 後的訊號跑),不是每條 lane 一個。這一點由 <code>tests/test_4aec_nr_res.c</code> 的 <code>test_runtime_strength()</code> 釘住,不是推測。</p>
+<p class="note"><b>本節最重要的一件事:對四條 lane 重新指定 preset 是無效操作。</b>四條 lane 都以 <code>spatial_linear_context</code> 建立,因此<b>沒有任何一條</b>會走到自己的殘留抑制器;它們各自的地板什麼都不塑形。真正乘上本產品輸出、也真正決定 comfort noise 量的那個 gain,來自<b>唯一一個</b>共用的 post 級抑制器——上面兩個 preset setter 針對的就是它,這也是它們存在、而不是要呼叫端自己對四條 lane 迴圈呼叫 <code>aec_set_preset()</code> 的原因。同理 NR 也只有一個共用實例(對 beamform 後的訊號跑),不是每條 lane 一個。這一點由 <code>tests/test_4aec_nr_res.c</code> 的 <code>test_runtime_strength()</code> 釘住,不是推測。</p>
 <table>
 <tr><th>呼叫</th><th>改／讀什麼</th><th>回 −1 的情況(−1 時什麼都不寫)</th></tr>
 <tr><td><code>four_aec_nr_res_set_aec_preset()</code></td><td><b>共用 post 級抑制器</b>的 far-active split floor</td><td><code>p</code> NULL／已 destroy;<code>preset</code> 超出 enum;<code>ramp_ms</code> 非有限值或超出 [0, 60000];<code>enable_post == 0</code>(pre-only 核心沒有抑制器)</td></tr>
@@ -137,9 +137,10 @@ void four_aec_nr_res_get_last_timing(const FourAecNrRes* p, FourAecNrResLastTimi
       │       契約 |residual_vec[k]|² == max(r2[k],0);scale 刻意無上界
       │     fused_r2 = |Σ_ch w·residual_vec|²  (coherent)
       ├─ run_post_res_and_nr():
-      │     suppression_gain_get_gain(post_sg, ...)      1 個 post-beam RES
+      │     aec_res_process(res, &amp;in)                  1 個 post-beam RES(AecRes)
       │     anr_process_gain(nr, beam_error, extra) 1 個 mono NR
-      │     total_gain=min(nr,res) → CNG(sqrt(1-res²)·sqrt(N²)·max(nr,0.316))
+      │     total_gain=min(nr,res) → aec_cng_fill(&amp;rng, spec, fused_comfort, res, nr, 0.316)
+      │       (sqrt(1-res²)·sqrt(N²)·max(nr,0.316) × 隨機相位)
       └─ ac_istft_push(istft, …) (AcIstft: fft_inverse + sqrt-Hann OLA) → out[hop]</pre>
 
 <h2>訊號泳道圖</h2>
@@ -178,14 +179,14 @@ core post (C)     out=半窗 ramp≈0   out=hop#0 重建    out = hop p-1 的重
 <tr><td><code>DelayAec3 shared_delay</code></td><td>struct 內嵌</td><td>C struct(core)</td><td>48k 時內建 anti-alias 降頻 sidechain</td></tr>
 <tr><td><code>delay_ring</code></td><td>[ring] f32;ring=ceil(max_delay_ms×sr/1000)+2·hop+1</td><td>pool(core)</td><td>預設 1024 ms → 16,641 samples @16k/128</td></tr>
 <tr><td><code>AnrDenoiser</code>(×1)</td><td>133,472 B(@16k/512)</td><td>pool(core)</td><td>mono NR</td></tr>
-<tr><td><code>SuppressionGain post_sg</code></td><td>storage 內嵌於 wrapper_bytes</td><td>pool(core)</td><td>post-beam RES(AEC3 樣式)</td></tr>
+<tr><td><code>AecRes</code>(×1)</td><td>由 <code>aec_res_get_mem_size()</code> 決定,內嵌於 wrapper_bytes;抑制器狀態與近端功率／render 暫存都在其內</td><td>pool(core)</td><td>post-beam RES(<code>aec_res.h</code>;設定與 lane 內抑制器出自同一個建構函式)</td></tr>
 <tr><td><code>AcIstft</code>（含 <code>FftHandle</code>）</td><td>FFT 16,976 B（kiss；ne10 15,600 B）+ 其餘 [fft]×3 f32 + 結構與頻譜暫存</td><td>pool(core)</td><td>最終合成；<code>FourAecNrResMemBreakdown.fft_bytes</code> 仍報 FFT 那一段，其餘併入 <code>wrapper_bytes</code></td></tr>
 <tr><td><code>rng_state</code>/token/pending</td><td>純量</td><td>C struct(core)</td><td>CNG seed 0x9e3779b9;instance_epoch 由 process-wide 計數器發</td></tr>
 <tr><td><code>SRP</code>(含 steering table)</td><td>num_angles=72 預設</td><td>pool(wrapper)</td><td>GSC 借用 <code>srp-&gt;a_array</code></td></tr>
 <tr><td><code>GSC</code>(RLS P/weights)</td><td>P:16×n_freqs Complex;wa:4×n_freqs Complex</td><td>pool(wrapper)</td><td>內部排列 <code>P[M][M][F]</code>;AArch64 每次更新 4 bins，逐 hop 對 scalar oracle 做 P/wa/output byte-exact 測試。lambda 0.995 經 <code>anr_retime_alpha</code> 依 hop×adapt_interval retime;mu 0.1</td></tr>
 <tr><td>auto-VAD(<code>noise_power/vad_hangover</code>)</td><td>純量</td><td>C struct(wrapper)</td><td>-55 dBFS / SNR 3.0 / hangover 8(retimed);EMA 0.999/0.95(retimed)</td></tr>
-<tr><td>核心合計 @16k/512</td><td>1,685,200 B(ne10;kiss 1,692,080 B)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,500,944 B(kiss 1,506,448 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
-<tr><td>完整 wrapper 合計</td><td>1,926,736 B @16k/256(預設)/ 6,869,952 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,layout_version=13);由 static smoke 的 <code>Total:</code> 行印出(kiss:1,929,776 B @16k/256 / 6,884,512 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
+<tr><td>核心合計 @16k/512</td><td>1,684,176 B(ne10;kiss 1,691,056 B)</td><td>—</td><td>實測 <code>four_aec_nr_res_get_mem_requirements()</code>(<code>enable_post=1</code> 預設核心 config——本頁 <code>audio_pipeline_4ch.c</code> 強制 <code>core.enable_post==1</code>。ULCNet wrapper 走的是 <b>不同</b>的 <code>enable_post=0</code> pre-only 核心;ne10 下實測 1,500,944 B(kiss 1,506,448 B),見 <code>pipeline_ulcnet_4ch.html</code>)</td></tr>
+<tr><td>完整 wrapper 合計</td><td>1,926,224 B @16k/256(預設)/ 6,867,904 B @48k/1024</td><td>—</td><td>實測 <code>audio_pipeline_4ch_get_mem_requirements()</code>(ne10,layout_version=13);由 static smoke 的 <code>Total:</code> 行印出(kiss:1,929,264 B @16k/256 / 6,882,464 B @48k/1024)。換 backend／編譯選項／submodule 即失效,一律現查</td></tr>
 </table>
 
 <h2>延遲與 warm-up</h2>

@@ -152,10 +152,10 @@ st = four_aec_nr_res_process_post(core, &amp;pre.token, weights, out);
 2. validate_weights():逐元 isfinite + Σ|.| > 1e-12
 3. fuse_contexts():coherent projection,四 lane far_power 一致性檢查
 4. run_post_res_and_nr():
-     suppression_gain_get_gain(&post_sg, ...)      ← 共用 post 抑制器
+     aec_res_process(p->res, &in)                      ← 共用 post 抑制器(AecRes)
      anr_process_gain(p->nr, error, nr_extra, NULL)   ← 僅 enable_nr=1
      total_gain[k] = min(nr_gain, res_gain)                ← enable_nr=0 時 = res_gain
-     CNG → fft_inverse → sk_wola_accumulate_f32 → hop emit
+     aec_cng_fill(&rng_state, ...) → fft_inverse → sk_wola_accumulate_f32 → hop emit
 5. return inputs_finite(out, hop)          ← 唯一的輸出 NaN gate</pre>
 <div class="tblwrap"><table>
 <tr><th><code>FourAecNrResStatus</code></th><th>意義</th><th>pending frame</th></tr>

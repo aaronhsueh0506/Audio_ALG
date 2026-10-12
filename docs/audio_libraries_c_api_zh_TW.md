@@ -79,11 +79,10 @@ AEC 與 NR 另保留 8 kHz legacy grid，但 4ch product pipeline 不接受它�
 只有自行在 AEC 外建立 post-beam RES 時，才額外使用：
 
 ```c
-#include "suppression_gain.h"
-#include "aec3_balanced_config.h"
+#include "aec_res.h"   /* AecRes、aec_cng_fill */
 ```
 
-`pbfdkf.h`、`delay_aec3.h`、`aec3_post.h` 等是內部 header，不是 application API。
+`pbfdkf.h`、`delay_aec3.h`、`aec3_post.h`、`suppression_gain.h` 等是內部 header，不是 application API。
 
 ### 3.2 Config 與建立
 
@@ -210,18 +209,20 @@ if (aec_set_preset(aec, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) {
 `aec_reset()` 保留目標值、丟棄 ramp 進度。**在 hop 之間呼叫、與 process 序列化；
 非 thread-safe。**
 
-自己在 beamformer 之後跑 RES 的整合（4ch 就是這樣）改用底層 primitive，因為那個
-共用抑制器不屬於任何 `Aec`：
+自己在 beamformer 之後跑 RES 的整合（4ch 就是這樣）改用 `AecRes`（`aec_res.h`），
+因為那個共用抑制器不屬於任何 `Aec`：
 
 ```c
-#include "suppression_gain.h"
+#include "aec_res.h"
 
-int suppression_gain_set_split_floor_far_active_db(SuppressionGain *sg,
-                                                   float db, float ramp_ms);
+int aec_res_set_preset(AecRes *res, AecPreset preset, float ramp_ms);
+int aec_res_split_floor(const AecRes *res, float *live, float *target);
 ```
 
-`db` 是與 `AecConfig.min_gain_floor_far_active_db` 相同的 dB-power 量，以**驗證器
-自己的**範圍 `[-300, 50]` 檢查——執行期不可能裝進 init 當初會拒絕的值。
+語意與 `aec_set_preset()` 相同：只改 far-active 地板、`ramp_ms` 範圍 `[0, 60000]`、
+失敗時什麼都不寫；`aec_res_reset()` 保留目標值。地板是與
+`AecConfig.min_gain_floor_far_active_db` 相同的 dB-power 量換成的功率比；`live` 是現行
+值、`target` 是正走向的值。
 
 > **量測前務必知道**：far-active 地板只在 **far-active 且非 double-talk** 的 hop 生效
 > （DT 地板三個 preset 完全相同，far-active latch 觸發前用的是 far-silent 地板），

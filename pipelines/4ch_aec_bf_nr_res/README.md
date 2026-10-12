@@ -105,7 +105,7 @@ The deployable C seam is:
 - [`4aec_nr_res.h`](4aec_nr_res.h): public config, lifecycle, pre/post
   calls, frame token, and structural audit accessors;
 - [`4aec_nr_res.c`](4aec_nr_res.c): one shared `DelayAec3`, four linear
-  `Aec` instances, coherent context projection, one `SuppressionGain`, one
+  `Aec` instances, coherent context projection, one `AecRes` (`aec_res.h`), one
   MMSE-LSA instance, and one final iFFT/OLA;
 - [`4aec_projection_kernels.h`](4aec_projection_kernels.h): byte-equivalent
   scalar/NEON complex projection, residual-vector, and comfort-noise kernels;
