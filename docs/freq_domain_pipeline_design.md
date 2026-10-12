@@ -76,3 +76,26 @@ CLI executables are reference wrappers around this implementation.
 Low-level details, backend/release rules, memory sizing, presets, and tests are
 maintained in [`../pipelines/README.md`](../pipelines/README.md). Superseded
 pre-implementation proposals are retained in Git history.
+
+## Stage chain
+
+Each application writes its frequency-domain chain explicitly over a borrowed
+view of the analysis frame (`pipelines/common/se_stage.h`, `SeSpecFrame`):
+
+```text
+frame = analysis stage           (mono: audio_pipeline_process_spec,
+                                  4ch: four_aec_front_process -> beamformer -> four_aec_fuse)
+res_gain = se_res_stage_gain(res, frame)        gain stages return const float*
+nr_gain  = se_anr_stage_gain(nr, frame, scratch, use_r2)
+total    = sk_min_f32(nr_gain, res_gain)        a disabled source reads as the unity vector
+spec     = sk_capply_gain_f32(frame.e, total)
+spec    += aec_cng_fill(...)                    comfort noise on the cut bins
+out      = ac_istft_push(spec)                  one iFFT/OLA per hop
+```
+
+The frame is valid until its producer runs again and is never written through.
+Stages that run a neural model are split around the model call
+(`_process_begin`, `_nn_begin`, caller runs the NPU, `_nn_end`, `_process_end`);
+a failed, non-finite or never-fetched model frame takes the identity, so the
+output timing does not depend on the model's health. There is no function-pointer
+table: the call order is part of each application's source.

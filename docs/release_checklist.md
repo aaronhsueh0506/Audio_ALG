@@ -590,9 +590,8 @@ Pass conditions:
       samples) and a pass-band tolerance against the conventional NR-off
       output. The native path is a tolerance, NOT a memcmp.
 - [ ] The build produces `lib4aec_dfn_res.a` (now also carrying
-      `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` stays 18 (the new
-      `process_post_view`/`synthesize_external` entries added no struct or
-      carve change).
+      `dfn_rate_bridge.o`); `FOUR_AEC_NR_RES_LAYOUT_VERSION` stays 18 (the `four_aec_front_process`/`four_aec_fuse` split moved the post-beam
+      stages into the applications; the carve version is deliberately unchanged).
 
 ### 9.1 Real four-microphone validation
 

@@ -111,6 +111,27 @@ aligned (both libraries assert this).
             //                        audio_pipeline_init_ex/destroy have run on it.
 ```
 
+### Running the model on the NPU (NN applications)
+
+The ULCNet and DFN2 applications split the hop around the model call so the
+accelerator runs between `nn_begin` and `nn_end` (the model config then needs
+no `infer` callback; a `reset` callback is still called on an alignment
+boundary and by the application's `reset`):
+
+```
+process_begin(p, ...)        // analysis, first model frame prepared
+while (nn_begin(p, &job) > 0) {   // 1 = a frame is open (UlcnetNnJob / DfnResStageJob)
+    rc = run_npu(&job);           // job outputs are NaN-prefilled; write every one
+    nn_end(p, rc);                // rc != 0 or a non-finite output => identity
+}
+process_end(p, out);         // synthesis, exactly one hop
+```
+
+A frame that is never fetched, or left open at `process_end`, takes the
+identity, so latency does not depend on the model. Every application's pool is
+still sized by its own `get_mem_requirements()` and carved from one
+caller-owned block; the stage chain adds no heap use in the hop path.
+
 ## Warnings
 
 - **`audio_pipeline_create()` ALWAYS uses the heap** (`posix_memalign`

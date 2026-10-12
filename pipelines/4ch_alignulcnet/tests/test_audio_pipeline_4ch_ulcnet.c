@@ -2513,7 +2513,7 @@ static int run_all_tests(void) {
                  "core fft %d is rejected (ULCNet grid is %d/%d)",
                  foreign_fft, ULCNET_N_FFT, ULCNET_HOP);
         CHECK(audio_pipeline_4ch_ulcnet_create(&invalid) == NULL, label);
-        /* The pre-only contract: every post-only field must keep the value
+        /* The front-only contract: every post-only field must keep the value
          * the default config returns, and is REJECTED otherwise. With
          * enable_post = 0 the core builds no denoiser, no suppressor, no
          * comfort noise and no post iFFT, so any of these having been
@@ -2523,7 +2523,7 @@ static int run_all_tests(void) {
         CHECK(invalid.core.enable_post == 0 && invalid.core.enable_nr == 0 &&
               invalid.core.enable_res == 0 &&
               invalid.core.enable_cng == 0,
-              "the default config itself states the pre-only profile");
+              "the default config itself states the front-only profile");
         {
             AudioPipeline4ChUlcnet* ok_default =
                 audio_pipeline_4ch_ulcnet_create(&invalid);

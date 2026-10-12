@@ -87,7 +87,7 @@ are delivered as separate archives where noted:
 | Mono AEC + NR/RES | `mono_aec_nr_res/` | `audio_pipeline` + AEC + NR + audio_common |
 | 4-ch AEC + BF + NR/RES | `4ch_aec_bf_nr_res/` | 4-lane front end + DOA/GSC + post-beam RES/NR stages + audio_common |
 | Mono Align-ULCNet | `mono_alignulcnet/` | mono ULCNet wrapper + AEC + AIAEC pre/post |
-| 4-ch Align-ULCNet | `4ch_alignulcnet/` | pre-only 4-lane core + DOA/GSC + AIAEC pre/post |
+| 4-ch Align-ULCNet | `4ch_alignulcnet/` | front-only 4-lane core + DOA/GSC + AIAEC pre/post |
 | Mono DFN2 | `mono_aec_dfn_res/` | mono host (`process_spec`) + the application's post-RES spectrum + dual-input DFN2 stage |
 | 4-ch DFN2 | `4ch_aec_bf_dfn_res/` | 4-lane front end + external BF/GSC + post-beam RES + dual-input DFN2 stage |
 
@@ -654,7 +654,7 @@ live 值重新起走。兩者都**不是重啟**：濾波器、延遲鎖定、�
 
 兩條 Align-ULCNet pipeline（`mono_alignulcnet/`、`4ch_alignulcnet/`）**刻意不提供**
 這些 setter：mono 變體沒有 NR 實例、且算出的 `G_res` 沒有任何消費者（輸出由 ULCNet
-mask 塑形）；4ch 變體用的是 `core.enable_post = 0` 的 pre-only 核心，抑制器與降噪器
+mask 塑形）；4ch 變體用的是 `core.enable_post = 0` 的 front-only 核心，抑制器與降噪器
 根本不存在。強度是模型的性質，不是 runtime 旋鈕。
 
 Python 對應：`AEC.set_preset(preset, ramp_ms=0.0)` 與

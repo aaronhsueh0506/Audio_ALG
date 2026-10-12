@@ -1,12 +1,13 @@
-# 四麥克風核心 Pipeline 整合手冊（`libaudio_pipeline_4ch.a` / `4aec_nr_res.h`）
+# 四麥克風前端整合手冊（`libaudio_pipeline_4ch.a` / `4aec_nr_res.h`）
 
 適用對象：**已經擁有自己的 beamformer（SRP-PHAT / GSC 或任何等效方案）**，
-只想要四路 linear AEC 前端 + 單路 post-beam NR/RES 後端的函式庫使用者。
+想要四路 linear AEC 前端，並自己串接後級頻域 stage（RES / NR / CNG / ISTFT，或自己的 NN）的函式庫使用者。
 
 如果你**沒有**自己的 beamformer、想要含 direction finding 與 beamformer 的完整
 pipeline，請看 `docs/integration_4ch_spatial_zh_TW.md`。
 
 本文只講「什麼時候呼叫哪個 function」「每個參數怎麼設」。演算法內部推導不在本文範圍。
+頻域 stage 串接的總覽（任何 pipeline 都適用）見 `pipelines/README.md` 的 Call flow。
 
 > **路徑慣例**：本文所有路徑都相對於 Audio_ALG repository 根目錄。
 > `audio_common` 是與 Audio_ALG 平行的另一個 checkout，本文寫成 `<audio_common>/`；
@@ -21,24 +22,29 @@ pipeline，請看 `docs/integration_4ch_spatial_zh_TW.md`。
 
 ### 1.1 這是什麼
 
-`4aec_nr_res.h` 提供的是一條**中間被切開**的處理鏈：
+`4aec_nr_res.h` 提供的是四路 linear AEC **前端**，每 hop 兩個呼叫，中間是你的 beamformer：
 
 ```
 mic hop [hop][4] + ref hop [hop]
    │
-   ├─► process_pre()   1 個共用 delay matcher → 1 條共用對齊後 reference → 4 條獨立 linear AEC
-   │                    回傳：4 路 linear 頻譜 + 1 份 interleaved 時域輸出 + 1 個 token
-   │
+   ├─► four_aec_front_process()   1 個共用 delay matcher → 1 條共用對齊後 reference → 4 條獨立 linear AEC
+   │                               回傳：借用的 FourAecFront（4 路 linear 頻譜、4 路時域 hop、aligned_ref、delay 狀態）
    ▼
  【你的 beamformer】    讀那 4 路頻譜，算出這一幀的「有效權重」Complex[4][n_freqs]
    │
+   ├─► four_aec_fuse()            以那組權重同調投影 near / 殘餘回音 / comfort noise
+   │                               回傳：SeSpecFrame（e, y, x, r2, cn, far_hop, max_dt, …）
    ▼
-   └─► process_post()  以那組權重同調投影 → 1 次 post-beam RES gain → 1 次 NR → 1 次 iFFT/OLA
-                        回傳：1 個 hop 的 mono 輸出
+ 【你的後級 stage】     se_res_stage_gain → se_anr_stage_gain → sk_min_f32 → sk_capply_gain_f32
+                        → aec_cng_fill → ac_istft_push → 1 個 hop 的 mono 輸出
 ```
 
 這個模組**明確擁有**：1 個共用 delay matcher、4 個獨立 linear AEC adaptive filter、
-1 個 post-beam residual suppressor、1 個 mono MMSE-LSA denoiser、1 條最終 iFFT/OLA。
+beamformer 權重的同調投影。post-beam residual suppressor（`AecRes`）、mono MMSE-LSA
+denoiser（`AnrDenoiser`）與最終 iFFT/OLA（`AcIstft`）**不在**前端內：由應用 carve 並明寫串接
+（`four_aec_nr_res_stage_configs()` 給出它們的 config；完整範例見 §2 與
+`4aec_nr_res_static.c`、`tests/conv_chain_4ch.h`）。完整 wrapper `audio_pipeline_4ch.c`
+就是這樣一個應用。
 
 它**明確不做**：beamformer、DOA、VAD。它也不會挑某一支麥克風的 RES gain，
 更不會每聲道各跑一份 NR/RES。
@@ -49,7 +55,8 @@ mic hop [hop][4] + ref hop [hop]
 #include "4aec_nr_res.h"
 ```
 
-一行就夠。它自己會拉進 `aec.h` 與 `anr.h`，後者再拉進 `fft_wrapper.h`。
+一行就夠前端本身用。它自己會拉進 `aec.h`、`anr.h` 與 `common/se_stage.h`（`SeSpecFrame`）。
+要串後級 stage 時另外 include `common/se_anr_stage.h`、`audio_stft.h`、`simd_kernels.h`。
 
 ### 1.3 `Complex` type 從哪來
 
@@ -57,8 +64,8 @@ mic hop [hop][4] + ref hop [hop]
 透過 `4aec_nr_res.h` → `aec.h` → `fft_wrapper.h` 傳遞進來。
 **你會直接用到它**：
 
-* `FourAecNrResPreFrame.linear_spectra[ch]` 是 `const Complex*`
-* `four_aec_nr_res_process_post()` 的 `weights` 是 `const Complex*`
+* `FourAecFront.linear_spectra[ch]` 是 `const Complex*`
+* `four_aec_fuse()` 的 `weights` 是 `const Complex*`
 
 不需要另外 include `fft_wrapper.h`。
 
@@ -66,12 +73,14 @@ mic hop [hop][4] + ref hop [hop]
 
 ```
 -I pipelines/4ch_aec_bf_nr_res
+-I pipelines
 -I lib/aec/c_impl/include
 -I lib/nr/c_impl/include
 -I <audio_common>/include
 ```
 
-四個就夠（已實測）。**注意：不需要 `third_party/doa`、`third_party/GSC`、`third_party/utility`**
+五個就夠（已實測）。`-I pipelines` 讓 `common/se_stage.h`、`common/se_anr_stage.h` 找得到。
+**注意：不需要 `third_party/doa`、`third_party/GSC`、`third_party/utility`**
 —— 那三個是完整 spatial wrapper 才需要的（見另一份手冊）。
 
 語言標準：`-std=gnu99`（或以上的 GNU 方言）。
@@ -105,47 +114,79 @@ libaudio_common.a
 
 ## 2. Quick start
 
-完整、可編譯、已實際跑過的最小整合（heap 路徑，權重先用固定值佔位）：
+完整、可編譯、已實際跑過的最小整合（heap 路徑，權重先用固定值佔位；後級 stage 由應用 carve 一整塊 16-byte 對齊記憶體）：
 
 ```c
 #include <stdio.h>
+#include <stdlib.h>
 #include "4aec_nr_res.h"
+#include "audio_stft.h"
+#include "mem_align.h"
+#include "simd_kernels.h"
+#include "common/se_anr_stage.h"
+#include "common/se_stage.h"
 
 int main(void) {
     FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    AecConfig res_cfg; AnrConfig nr_cfg; AcStftConfig scfg;
+    FourAecNrRes* p = four_aec_nr_res_create(&cfg);          /* heap path */
+    if (!p || four_aec_nr_res_stage_configs(&cfg, &res_cfg, &nr_cfg) != 0) return 1;
 
-    FourAecNrRes* p = four_aec_nr_res_create(&cfg);   /* heap path */
-    if (!p) { fprintf(stderr, "create failed\n"); return 1; }
+    const int hop = four_aec_nr_res_hop_size(p);
+    const int n = four_aec_nr_res_n_freqs(p);
+    ac_stft_config_default(&scfg, four_aec_nr_res_fft_size(p));
 
-    const int hop     = four_aec_nr_res_hop_size(p);
-    const int n_freqs = four_aec_nr_res_n_freqs(p);
+    /* The application owns the post-beam stages: one 16-byte-aligned block. */
+    size_t res_b = ALIGN16(aec_res_get_mem_size(&res_cfg));
+    size_t nr_b = ALIGN16(se_anr_stage_mem_size(&nr_cfg));
+    size_t sy_b = ALIGN16(ac_istft_get_mem_size(&scfg));
+    size_t vec = ALIGN16((size_t)n * sizeof(float));
+    size_t cvec = ALIGN16((size_t)n * sizeof(Complex));
+    void* mem;
+    if (posix_memalign(&mem, 16, res_b + nr_b + sy_b + 2 * vec + cvec) != 0) return 1;
+    unsigned char* cur = (unsigned char*)mem;
+    AecRes* res = aec_res_init(cur, aec_res_get_mem_size(&res_cfg), &res_cfg); cur += res_b;
+    AnrDenoiser* nr = se_anr_stage_init(cur, se_anr_stage_mem_size(&nr_cfg), &nr_cfg); cur += nr_b;
+    AcIstft* istft = ac_istft_init(cur, ac_istft_get_mem_size(&scfg), &scfg); cur += sy_b;
+    float* total_gain = (float*)cur; cur += vec;
+    float* extra_noise = (float*)cur; cur += vec;
+    Complex* spec = (Complex*)cur;
+    if (!res || !nr || !istft) return 1;
+    uint32_t rng = SE_CNG_RNG_SEED;
+
     float mics[4 * 1024], ref[1024], out[1024];
     Complex weights[FOUR_AEC_NR_RES_CHANNELS * 1024];
-
     for (int frame = 0; frame < 100; frame++) {
-        for (int i = 0; i < hop; i++) {                    /* 換成你自己的擷取來源 */
+        for (int i = 0; i < hop; i++) {                  /* replace with your capture */
             for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ch++)
                 mics[i * FOUR_AEC_NR_RES_CHANNELS + ch] = 0.01f * (float)((i % 61) - 30);
             ref[i] = 0.02f * (float)((i % 37) - 18);
         }
+        FourAecFront front;
+        if (four_aec_front_process(p, mics, ref, &front) != FOUR_AEC_NR_RES_OK) break;
 
-        FourAecNrResPreFrame pre;
-        if (four_aec_nr_res_process_pre(p, mics, ref, &pre) != FOUR_AEC_NR_RES_OK) break;
-
-        /* 你的 beamformer 在這裡讀 pre.linear_spectra[ch][bin] / pre.linear_interleaved，
-         * 並寫出它這一幀的有效權重，channel-major：[ch * n_freqs + bin] */
+        /* Your beamformer reads front.linear_spectra[ch][bin] and writes this
+         * frame's effective weights, channel-major: [ch * n + bin]. */
         for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ch++)
-            for (int k = 0; k < n_freqs; k++) {
-                weights[ch * n_freqs + k].r = 0.25f;
-                weights[ch * n_freqs + k].i = 0.0f;
+            for (int k = 0; k < n; k++) {
+                weights[ch * n + k].r = 0.25f;
+                weights[ch * n + k].i = 0.0f;
             }
 
-        if (four_aec_nr_res_process_post(p, &pre.token, weights, out) != FOUR_AEC_NR_RES_OK) break;
-        /* 消費 out：hop 個 float，已增強的 mono 音訊 */
+        SeSpecFrame f;
+        if (four_aec_fuse(p, weights, NULL, &f) != FOUR_AEC_NR_RES_OK) break;
+        const float* res_gain = se_res_stage_gain(res, &f);
+        const float* nr_gain = se_anr_stage_gain(nr, &f, extra_noise, 1);
+        if (!res_gain || !nr_gain) break;
+        sk_min_f32(total_gain, nr_gain, res_gain, n);
+        sk_capply_gain_f32(spec, f.e, total_gain, n);
+        aec_cng_fill(&rng, spec, f.cn, res_gain, nr_gain, SE_CNG_NR_GAIN_FLOOR, n);
+        ac_istft_push(istft, spec, out);
+        /* consume out: hop floats of enhanced mono audio */
     }
-
+    free(mem);
     four_aec_nr_res_destroy(p);
-    printf("ok hop=%d n_freqs=%d\n", hop, n_freqs);
+    printf("ok hop=%d n_freqs=%d\n", hop, n);
     return 0;
 }
 ```
@@ -155,6 +196,7 @@ int main(void) {
 ```sh
 cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
   -I pipelines/4ch_aec_bf_nr_res \
+  -I pipelines \
   -I lib/aec/c_impl/include \
   -I lib/nr/c_impl/include \
   -I <audio_common>/include \
@@ -165,6 +207,8 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
   -lm
 ```
 
+只要回音抑制、不要降噪的產品：不建 `AnrDenoiser`，把 `nr_gain` 換成全 1 的 unity 向量即可（`sk_min_f32` 涵蓋所有組合）。
+
 ---
 
 ## 3. Lifecycle
@@ -174,10 +218,12 @@ cc -std=gnu99 -O2 -Wall -Wextra -o app app.c \
 | 1 | query | `four_aec_nr_res_get_mem_requirements(&cfg, &req)` | **每次 init 之前**都要重查，不可跨 build / backend / config 快取 | 回傳 `-1`：`out` 為 NULL；`cfg` 未通過驗證（§4）；此 TU 編譯時沒帶 `-DAUDIO_PIPELINE_BACKEND_STR="kiss"` 或 `"ne10"` |
 | 2 | allocate | 你自己的配置器，取得 `req.bytes` 且對齊 `req.alignment`（16）的記憶體 | 拿到 `req` 之後 | pool **不需要**預先清零（poison pattern 可接受，已實測）。`init_ex()` 自己會把整塊 memset 成 0 |
 | 3 | init | `four_aec_nr_res_init_ex(pool, req.bytes, &cfg, &req)` | 拿到 pool 之後，處理第一個 hop 之前 | 回傳 `NULL`：8 項 descriptor 檢查任一不符；pool 未 16-byte 對齊；pool 太小；config 無效；子模組 init 失敗。**沒有任何診斷輸出**（見 §5.5） |
-| 4a | process_pre | `four_aec_nr_res_process_pre(p, mics, ref, &pre)` | 每收到一個 hop 呼叫一次。**必須**在對應的 `process_post()` 之後才能再呼叫 | `-1` / `-2` / `-3`，見 §5.2 |
-| 4b | 你的 beamformer | — | 在 pre 與 post 之間 | 由你負責 |
-| 4c | process_post | `four_aec_nr_res_process_post(p, &pre.token, weights, out)` | 緊接著同一幀的 `process_pre()` | `-1` / `-2` / `-3`，見 §5.3 |
-| 5 | reset | `four_aec_nr_res_reset(p)` | 換回聲路徑、切換串流時 | 不會失敗。`p == NULL` 或已 destroy 時是 no-op。**會作廢尚未完成的 pre-frame token** |
+| 3b | stage 配置 | `four_aec_nr_res_stage_configs(&cfg, &res_cfg, &nr_cfg)`，再 `aec_res_init()`／`se_anr_stage_init()`／`ac_istft_init()` | 你的後級 stage 要用時 | `-1`：NULL 引數或前端會拒絕的 config。stage 的記憶體由你自己查大小、自己 carve（§2 的範例） |
+| 4a | front_process | `four_aec_front_process(p, mics, ref, &front)` | 每收到一個 hop 呼叫一次 | `-1` / `-3`，見 §5.2 |
+| 4b | 你的 beamformer | — | 在 front 與 fuse 之間 | 由你負責 |
+| 4c | fuse | `four_aec_fuse(p, weights, beamformed_error, &frame)` | 緊接著同一幀的 `front_process()` | `-1` / `-2` / `-3`，見 §5.3 |
+| 4d | 你的後級 stage | `se_res_stage_gain` … `ac_istft_push` | fuse 之後、下一次 `front_process()` 之前 | 由你負責 |
+| 5 | reset | `four_aec_nr_res_reset(p)` | 換回聲路徑、切換串流時 | 不會失敗。`p == NULL` 或已 destroy 時是 no-op。**會作廢目前的 front 視圖與 `SeSpecFrame`**；你的 stage 要各自 reset（`aec_res_reset`／`se_anr_stage_reset`／`ac_istft_reset`，並把 CNG 的 rng 設回 `SE_CNG_RNG_SEED`） |
 | 6 | destroy | `four_aec_nr_res_destroy(p)` | 不再處理任何 hop 之後、釋放 pool 之前 | 不會失敗。NULL 安全。pool instance 冪等；`create()` instance 只能呼叫一次 |
 | 7 | release | 你自己的釋放器 | **一定要在第 6 步之後** | 順序顛倒 = use-after-free |
 
@@ -188,43 +234,38 @@ heap 便利路徑：`four_aec_nr_res_create(&cfg)` 把第 1~3 步合成一步，
 
 | 呼叫 | 回傳 | NULL / 已 destroy 時 |
 |---|---|---|
-| `four_aec_nr_res_hop_size(p)` | 每次 pre 要餵幾個 sample（per channel） | `-1` |
+| `four_aec_nr_res_hop_size(p)` | 每次 front_process 要餵幾個 sample（per channel） | `-1` |
 | `four_aec_nr_res_fft_size(p)` | FFT 長度 | `-1` |
 | `four_aec_nr_res_n_freqs(p)` | 頻域 bin 數 | `-1` |
 | `four_aec_nr_res_sample_rate(p)` | 實際生效的取樣率 | `-1` |
-| `four_aec_nr_res_matched_filter_count(p)` | 恆為 `1` | `0` |
+| `four_aec_nr_res_matched_filter_count(p)` | `MATCHED` 時為 `1`，`FIXED`／`EXTERNAL_ALIGNED` 時為 `0` | `0` |
 | `four_aec_nr_res_duty_hops_run(p)` | 共用 estimator 實跑 matched-filter 分析的 hop 數（duty-cycle census 分子；分母用 `estimator_calls`，`duty_hops_total()` 是其別名） | `0` |
 | `four_aec_nr_res_linear_aec_count(p)` | 恆為 `4` | `0` |
-| `four_aec_nr_res_nr_count(p)` | 恆為 `1` | `0` |
-| `four_aec_nr_res_post_res_count(p)` | 恆為 `1` | `0` |
-| `four_aec_nr_res_far_fft_real_compute_count(p)` | 累計計數（`long`），每次 `process_pre()` **+1**（不是 +4）；`reset()` 會歸零 | `0` |
+| `four_aec_nr_res_far_fft_real_compute_count(p)` | 累計計數（`long`），每次 `front_process()` **+1**（不是 +4）；`reset()` 會歸零 | `0` |
 
-後面五個是**結構稽核用**的：前四個對有效 handle 永遠回傳固定常數（1 / 4 / 1 / 1），
-用來在整合測試裡證明拓撲沒有被改掉；最後一個用來證明跨聲道的 far-end 共用真的生效。
-它們對處理結果沒有任何影響。
+後面的計數是**結構稽核用**的：前兩個對有效 handle 回傳固定常數（`linear_aec_count` 恆 4），
+用來在整合測試裡證明拓撲沒有被改掉；`far_fft_real_compute_count` 用來證明跨聲道的 far-end 共用真的生效。
+它們對處理結果沒有任何影響。`nr` 與 `post_res` 的稽核計數屬於擁有它們的應用：
+完整 wrapper 提供 `audio_pipeline_4ch_nr_count()`／`audio_pipeline_4ch_post_res_count()`。
 
 ### 3.1b 逐階段耗時（診斷用）
 
 ```c
 typedef struct FourAecNrResLastTiming {
-    uint32_t delay_us, frontend_us, linear_us, lane_res_us;   /* process_pre  */
-    uint32_t fuse_us,  res_us,      nr_us,     synth_us;      /* process_post */
+    uint32_t delay_us, frontend_us, linear_us, lane_res_us;   /* four_aec_front_process */
+    uint32_t fuse_us;                                         /* four_aec_fuse          */
 } FourAecNrResLastTiming;
 
 void four_aec_nr_res_get_last_timing(const FourAecNrRes* p,
                                      FourAecNrResLastTiming* out);
 ```
 
-最近一個 hop 每個階段的 wall-clock 成本（微秒，`CLOCK_MONOTONIC`）。純診斷：
+最近一個 hop 前端每個階段的 wall-clock 成本（微秒，`CLOCK_MONOTONIC`）。純診斷：
 pipeline 自己不回讀，也不影響處理。`p` 為 NULL 或已 destroy 時把 `out` 清零而
-不是失敗；`out` 不得為 NULL。
+不是失敗；`out` 不得為 NULL。RES／NR／CNG／逆轉換由你的應用串接，耗時由你自己量。
 
-**八個欄位分成兩個來源。** 本層自己量的是 `fuse_us`、`res_us`（功率準備 ＋
-抑制增益）、`nr_us`（R² prior 摺入 ＋ `anr_process_gain()`）、`synth_us`（逆轉換 ＋ 加窗 overlap-add ＋ hop 送出），以及
-`delay_us` 的共用延遲估計部分（不含 `align_render()` 的 ring-buffer 複製與
-realign 掃描）。
-
-`frontend_us`、`linear_us`、`lane_res_us` 來自 `aec_get_last_timing()`
+本層自己量的是 `fuse_us` 與 `delay_us` 的共用延遲估計部分（不含 `align_render()` 的 ring-buffer 複製與
+realign 掃描）。`frontend_us`、`linear_us`、`lane_res_us` 來自 `aec_get_last_timing()`
 （`aec.h`）：四條 lane 各讀一次再相加，所以得到的是該階段在整個 lane 迴圈上的
 wall-clock 成本。lane 內部的 `delay_us` 也一併加進上面的 `delay_us`——它是同一
 個量（對齊遠端所花的時間），且**結構上恆為 0**，因為四條 lane 都是
@@ -234,13 +275,11 @@ wall-clock 成本。lane 內部的 `delay_us` 也一併加進上面的 `delay_us
 這三欄由**另一半旗標** `-DAEC_STAGE_TIMING=1` 管轄。只建本層那半，這三欄讀 0
 而其餘照常量測，是可讀的狀態而非壞掉；`make PROFILE=1` 兩半一起開。
 
-各階段**加起來不等於**整個呼叫的時間，呼叫端要自己用減法補餘額：pre 側餘額涵蓋
-輸入去交錯／有限值檢查、`align_render()` 與 realign 掃描；post 側餘額涵蓋 gain
-融合與 comfort-noise 迴圈。
+各階段**加起來不等於**整個呼叫的時間，呼叫端要自己用減法補餘額：front 側餘額涵蓋
+輸入去交錯／有限值檢查、`align_render()` 與 realign 掃描。
 
-兩半各自在自己的呼叫被**接受之後**清零，所以中途 bail-out 的 hop 會回報 0 而不是
-上一個 hop 的數字；被引數／token 檢查直接拒絕的呼叫則整份記錄不動。在
-`process_post*()` 回傳後讀才是完整的。
+前半在 `four_aec_front_process()` 接受引數**之後**清零，`fuse_us` 在 `four_aec_fuse()` 接受之後清零，所以中途 bail-out 的 hop 會回報 0 而不是
+上一個 hop 的數字；被引數檢查直接拒絕的呼叫則整份記錄不動。
 
 解析度是微秒，所以低於 1 µs 的階段會讀到 0。
 
@@ -254,38 +293,33 @@ wall-clock 成本。lane 內部的 `delay_us` 也一併加進上面的 `delay_us
 
 ### 3.2 執行期強度控制
 
+強度面屬於擁有 RES 與 NR 的那一層。前端 `FourAecNrRes` **沒有** preset／mode setter；
+你自己串後級時，直接對你 carve 的 stage 呼叫：
+
 ```c
-int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset, float ramp_ms);
-int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, AnrMode mode);
-int four_aec_nr_res_post_split_floor(const FourAecNrRes* p, float* live, float* target);
+aec_res_set_preset(res, AEC_PRESET_AGGRESSIVE, 100.0f);          /* 回 0 成功 */
+se_anr_stage_set_mode(nr, sample_rate, fft_size, hop, ANR_MODE_MILD);
+float live, target;
+aec_res_split_floor(res, &live, &target);                        /* 唯讀，線性功率 */
 ```
+
+完整 wrapper 把這三個包成 `audio_pipeline_4ch_set_aec_preset()`／`_set_nr_mode()`／`_post_split_floor()`
+（見 `docs/integration_4ch_spatial_zh_TW.md`）。
 
 > **本節最重要的一件事：對四條 lane 重新指定 preset 是無效操作。**
 >
 > 四條 AEC lane 都以 `spatial_linear_context` 建立，因此**沒有任何一條**會走到
-> 自己的 suppression-gain 路徑；它們各自的地板什麼都不塑形。真正乘上本核心輸出、
-> 也真正決定 comfort noise 量的那個 gain，來自**唯一一個**共用的 post 級抑制器。
-> `four_aec_nr_res_set_aec_preset()` 針對的就是它——這也是它存在、而不是要你自己
-> 對四條 lane 迴圈呼叫 `aec_set_preset()` 的原因。這一點由測試釘住
-> （`tests/test_4aec_nr_res.c` 的 `test_runtime_strength()`），不是推測。
+> 自己的 suppression-gain 路徑；它們各自的地板什麼都不塑形。真正乘上輸出、
+> 也真正決定 comfort noise 量的那個 gain，來自**唯一一個**共用的 post 級抑制器
+> （`AecRes`，由你的應用擁有）。這也是為什麼 preset setter 要作用在它上面，而不是要你自己
+> 對四條 lane 迴圈呼叫 `aec_set_preset()`。這一點由測試釘住
+> （`tests/test_audio_pipeline_4ch.c` 的 runtime strength 測試），不是推測。
 
-```c
-/* 使用者把回音抑制轉到 aggressive、降噪轉到 mild */
-if (four_aec_nr_res_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { /* 引數不合法 */ }
-if (four_aec_nr_res_set_nr_mode(p, ANR_MODE_MILD) != 0)                  { /* 同上 */ }
-
-/* 想確認要求有沒有落地，就讀這一對（單位是線性功率，不是 dB） */
-float live, target;
-if (four_aec_nr_res_post_split_floor(p, &live, &target) == 0 && live == target) {
-    /* ramp 已經走完 */
-}
-```
-
-| 呼叫 | 改／讀什麼 | 回 `-1` 的情況（`-1` 時**什麼都不寫**） |
+| 呼叫 | 改／讀什麼 | 失敗（回 `-1`，**什麼都不寫**） |
 |---|---|---|
-| `four_aec_nr_res_set_aec_preset()` | **共用 post 級抑制器**的 far-active split floor | `p` 為 NULL 或已 destroy；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]`；`cfg.enable_post == 0`（pre-only 核心根本沒有抑制器） |
-| `four_aec_nr_res_set_nr_mode()` | 本核心擁有的**那一個**降噪器（NR 是對 beamform 後的訊號跑，不是每條 lane 一個） | `p` 為 NULL 或已 destroy；`cfg.enable_post == 0` **或 `cfg.enable_nr == 0`**（兩者都代表沒有降噪器實例）；`mode` 超出 enum；重組出的 target 被拒 |
-| `four_aec_nr_res_post_split_floor()` | 唯讀。`live` = 抑制器**當下**套用的值，`target` = 撐得過 reset 的已設定值；兩者只有在 ramp 走到一半時才不同。任一指標可為 NULL | `p` 為 NULL 或已 destroy；`cfg.enable_post == 0` |
+| `aec_res_set_preset(res, preset, ramp_ms)` | **共用 post 級抑制器**的 far-active split floor | `res` 為 NULL；`preset` 超出 enum；`ramp_ms` 非有限值或超出 `[0, 60000]` |
+| `se_anr_stage_set_mode(nr, …, mode)` | 你擁有的**那一個**降噪器（NR 是對 beamform 後的訊號跑，不是每條 lane 一個） | `nr` 為 NULL；`mode` 超出 enum；重組出的 target 被拒 |
+| `aec_res_split_floor(res, &live, &target)` | 唯讀。`live` = 抑制器**當下**套用的值，`target` = 撐得過 reset 的已設定值；兩者只有在 ramp 走到一半時才不同。任一指標可為 NULL | `res` 為 NULL |
 
 `live` / `target` 這一對是**板端唯一值得記錄的強度量**：它是真正塑形輸出的東西
 （lane 自己的地板什麼都不塑形），而兩個值合在一起就回答了「我要求的改動落地了沒有」。
@@ -296,17 +330,16 @@ if (four_aec_nr_res_post_split_floor(p, &live, &target) == 0 && live == target) 
 一次，會從當前的 live 值重新起走。
 
 兩個 setter 都**不是重啟**：四條 lane 的濾波器、共用延遲鎖定、NR 的噪聲底與增益
-平滑歷史全部繼續跑。要重啟請用 `four_aec_nr_res_reset()`——注意 preset 的改動
-**撐得過 reset**（目標值另存一份，reset 會重新套用），但 ramp 進度會被丟掉。
-**在兩個 hop 之間呼叫、與 `process_pre()`／`process_post()` 序列化；非 thread-safe。**
+平滑歷史全部繼續跑。preset 的改動**撐得過**該 stage 的 reset（目標值另存一份，reset 會重新套用），但 ramp 進度會被丟掉。
+**在兩個 hop 之間呼叫、與 `front_process()`／`fuse()` 序列化；非 thread-safe。**
 
-> **不要繞過 `set_nr_mode()` 去呼叫 `anr_set_mode()`。** 本核心的 NR 組態是
-> 「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`；組成見 `pipelines/common/se_anr_stage.h` 的 `se_anr_compose_config()`）。`anr_set_mode()` 組的是裸的 canonical preset，在本核心的
-> 實例上會被**拒絕**（它的 `L` 不同）——所以 `four_aec_nr_res_set_nr_mode()` 做的
-> 事是重組本核心的完整組態，再交給 `anr_reconfigure()`。
+> **不要繞過 `se_anr_stage_set_mode()` 去呼叫 `anr_set_mode()`。** 本管線的 NR 組態是
+> 「canonical 強度 preset **加上**自己的覆寫」（`L`、`alpha_decay`；組成見 `pipelines/common/se_anr_stage.h` 的 `se_anr_compose_config()`）。`anr_set_mode()` 組的是裸的 canonical preset，在這個
+> 實例上會被**拒絕**（它的 `L` 不同）——所以 `se_anr_stage_set_mode()` 做的
+> 事是重組完整組態，再交給 `anr_reconfigure()`。
 
 **A/B 量測時該預期什麼。** far-active 地板只在 **far-active 且非 double-talk** 的
-hop 上生效：double-talk 期間本核心強制套用 DT 地板，而 DT 地板在三個 preset 之間
+hop 上生效：double-talk 期間強制套用 DT 地板，而 DT 地板在三個 preset 之間
 **完全相同**；far-active latch 觸發之前套用的是 far-silent 地板。同一個 gain 還
 決定注入的 comfort noise 量（振幅正比於 `sqrt(1 − G_res²)`，再乘該 bin 的 NR gain（下限 −10 dB）——地板壓得越深、CNG
 反而越多）。因此**整段錄音的平均值移動幅度會小於 dB 落差所暗示的量**，而且一個只量
@@ -317,7 +350,7 @@ degradation 對齊的條件下比較，並實際試聽。
 
 ## 4. Config 完整參考
 
-`FourAecNrResConfig` 共 9 個欄位。取得預設值的唯一正確方式：
+`FourAecNrResConfig` 的欄位如下表。取得預設值的唯一正確方式：
 
 ```c
 FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
@@ -335,12 +368,16 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 | `sample_rate` | `int` | 你傳給 `default_config()` 的值 | **只有 `16000` 或 `48000`**。`8000` 會被拒絕（這點和單聲道 pipeline 不同） | 設成你音訊實際的取樣率 |
 | `fft_size` | `int` | `0` | `0` = 依 rate 取預設（16 kHz → 256，48 kHz → 1024）。明確指定時：16 kHz 接受 `256` 或 `512`；48 kHz 只接受 `1024` | 除非有明確理由要 16 kHz 的 512 grid，否則留 `0` |
 | `filter_length` | `int` | `0` | `[0, 4096]`。負數或 > 4096 拒絕 | `0` = 沿用 AEC 依取樣率算出的預設（16 kHz → 832 taps，48 kHz → 3072 taps）。回聲尾巴短、記憶體吃緊時可調小；這是四路 AEC 記憶體最主要的旋鈕 |
+| `delay_mode` | `AecDelayMode` | `AEC_DELAY_MATCHED` | `MATCHED` / `FIXED` / `EXTERNAL_ALIGNED` | 四條 lane 共用同一個決策。`MATCHED` 建共用 estimator 與對齊 ring；`FIXED` 只用固定延遲 ring；`EXTERNAL_ALIGNED` 由呼叫端給已對齊的 far，不建 matcher 也不建 ring（記憶體差異見 4.6a） |
+| `delay_num_filters` | `int` | `5` | 僅 `MATCHED`：`[1, 5]`；其餘模式須為預設 | matched-filter bank 大小，每少一個省 5,728 B |
+| `fixed_delay_samples` | `int` | `-1` | 僅 `FIXED`：原生取樣點數；其餘模式須為 `-1` | 決定共用 delay ring 大小 |
 | `capture_proxy_channel` | `int` | `0` | `[0, 3]`。其他值拒絕 | 共用 delay matcher 要用哪一支麥克風當輸入。挑訊噪比最穩定、離喇叭關係最典型的那一支 |
 | `max_delay_ms` | `float` | `1024.0f` | 必須是有限值，且落在 `[0.0, 4096.0]` | 共用 reference delay line 的容量上限（毫秒）。實際的 ring 大小 = `ceil(max_delay_ms * sample_rate / 1000) + 2 * hop + 1` 個 sample。設得比你系統真實最大 mic↔ref 延遲**略大**即可；設太大只是白白吃記憶體 |
 | `aec_preset` | `AecPreset` | `AEC_PRESET_BALANCED`（= 1） | `MILD`(0) / `BALANCED`(1) / `AGGRESSIVE`(2)。列舉以外拒絕（**不會**默默 fallback） | 近端保留優先 → `MILD`；回聲抑制優先 → `AGGRESSIVE` |
-| `nr_mode` | `AnrMode` | `ANR_MODE_BALANCED`（= 2） | `MILD`(0) / `MODERATE`(1) / `BALANCED`(2) / `AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度，四級都可用 |
-| `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = post 級跳過 MMSE-LSA，`total_gain` 只由 RES 決定；RES／CNG／iFFT／WOLA 照常。給「要回聲抑制但不要降噪」的產品 |
-| `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `0` = 不建 post-beam RES（state 不進 pool），`total_gain` 只由 NR 決定，CNG 沒有被 RES 挖掉的 bin 可填故略過；`set_aec_preset()`／`post_split_floor()` 回 `-1`。`enable_post` 優先於 `enable_res`／`enable_nr`：`enable_post=0` 兩者無作用，`enable_post=1` 兩者獨立組合，都 `0` 即 beamform 後線性誤差經合成直通 |
+| `nr_mode` | `AnrMode` | `ANR_MODE_BALANCED`（= 2） | `MILD`(0) / `MODERATE`(1) / `BALANCED`(2) / `AGGRESSIVE`(3)。列舉以外拒絕 | 降噪強度，四級都可用；前端不讀它，`four_aec_nr_res_stage_configs()` 用它推導 `AnrConfig` |
+| `enable_nr` | `int`（bool） | `1` | 只接受 `0` 或 `1` | 前端自己不讀；它與 `enable_res`／`enable_cng`／`legacy_amin` 配置的是**你的後級**（`four_aec_nr_res_stage_configs()` 據此導出 `AecConfig`／`AnrConfig`；完整 wrapper 用它們決定 carve 哪些 stage）。`0` = 不建 MMSE-LSA，`total_gain` 只由 RES 決定。給「要回聲抑制但不要降噪」的產品 |
+| `enable_res` | `int`（bool） | `1` | 只接受 `0` 或 `1` | 同上，後級的設定。`0` = 不建 post-beam RES，`total_gain` 只由 NR 決定，CNG 沒有被 RES 挖掉的 bin 可填故略過；缺席的增益來源讀 unity 全 1 向量。`enable_post` 優先：`enable_post=0` 時前端不 carve fuse 緩衝（見 4.6b）；`enable_post=1` 時兩者獨立組合，都 `0` 即 beamform 後線性誤差經合成直通 |
+| `enable_post` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 前端 carve fuse 緩衝，可呼叫 `four_aec_fuse()`；`0` = front-only 前端（只有 `four_aec_front_process()`，`four_aec_fuse()` 回 `INVALID_ARGUMENT`），給從不 fuse 的應用（例如 ULCNet）。見 4.6b |
 | `enable_cng` | `int`（bool） | `1` | 只接受 `0` 或 `1` | `1` = 在 RES 抑制掉的 bin 填舒適噪音，位準再乘該 bin 的 NR gain、下限 −10 dB |
 | `legacy_amin` | `int`（bool） | `0` | 只接受 `0` 或 `1` | `1` = NR 的 noise prior 不摺入 R²。只用於比對舊行為，新整合請保持 `0` |
 
@@ -356,41 +393,60 @@ FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
 
 **不要把 hop / n_freqs 寫死。** 用 `four_aec_nr_res_hop_size()` / `four_aec_nr_res_n_freqs()` 查。
 
-### 4.3 Buffer 形狀（每次 `process_pre` / `process_post`）
+
+### 4.3 Buffer 形狀（每次 `front_process` / `fuse`）
 
 | Buffer | 誰擁有 | 形狀 | 說明 |
 |---|---|---|---|
 | `microphones_interleaved` | 你 | `float[hop * 4]`，`[sample * 4 + channel]` | 唯讀，只在該次呼叫期間被讀取。所有元素必須是有限值 |
 | `ref` | 你 | `float[hop]` | 唯讀。所有元素必須是有限值 |
 | `weights` | 你 | `Complex[4 * n_freqs]`，**channel-major**：`[channel * n_freqs + bin]` | 唯讀 |
-| `out` | 你 | `float[hop]` | 由 `process_post()` 完整覆寫 |
-| `pre.linear_interleaved` | 函式庫 | `const float[hop * 4]`，`[sample * 4 + channel]` | 見 §4.4 |
-| `pre.linear_spectra[ch]` | 函式庫 | `const Complex[n_freqs]` | 見 §4.4 |
+| `beamformed_error` | 你（可為 NULL） | `Complex[n_freqs]` | 與 `weights` 同一次 beamformer 呼叫產生的 mono 誤差頻譜；NULL 則由權重重建。供應時 `frame.e` 別名這份陣列，它必須活過 frame |
+| `out` | 你 | `float[hop]` | 由你的 `ac_istft_push()` 寫入 |
+| `front.formed_hop[ch]` | 函式庫 | `const float[hop]` | 見 §4.4 |
+| `front.linear_spectra[ch]` | 函式庫 | `const Complex[n_freqs]` | 見 §4.4 |
 
 **權重約定**：`output[bin] = Σ_channel weights[channel][bin] * input[channel][bin]`，
 **不做共軛**。多幀 / 時域型 GSC 請把它「這一幀的有效頻率響應」填進來。
 
-**一條在每個 bin 權重都是 0 的 lane 不會投票。** `process_post()` 除了投影頻譜，還會把四條
-lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個純量去操縱那個共用的
-post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一條在每個 bin 權重都是 0 的 lane 對
+**一條在每個 bin 權重都是 0 的 lane 不會投票。** `four_aec_fuse()` 除了投影頻譜，還會把四條
+lane 的 `filter_converged` / `dt_indicator` / `saturation_level` 縮成三個純量（`frame.all_converged`／`max_dt`／`max_sat`）
+去操縱那個共用的 post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一條在每個 bin 權重都是 0 的 lane 對
 融合後的頻譜貢獻恰好為零，所以也不參與這三個縮減——縮減從中性值起算，lane 0 一樣受檢。整組
 全零權重會先被 `-1` 擋掉（見 §5.3），所以至少有一條 lane 會通過這個檢查；真正在 beamform 的
 權重每條 lane 都有非零 bin，這條規則不會跳過任何東西。
 
-外部 beamformer**不需要**再回傳一份 mono hop —— 合成是在 `process_post()` 內部
+外部 beamformer**不需要**再回傳一份 mono hop —— 合成是在你自己的 `ac_istft_push()` 內
 以那組權重加權後的頻譜完成的。
 
-### 4.4 `FourAecNrResPreFrame` 各欄位
+### 4.4 `FourAecFront` 與 `SeSpecFrame` 各欄位
+
+`FourAecFront`（`four_aec_front_process()` 填）：
 
 | 欄位 | 型別 | 內容 |
 |---|---|---|
-| `token` | `FourAecNrResFrameToken` | 交還給 `process_post()` 的排序權杖。見 §5.1 |
 | `delay` | `FourAecNrResDelayState` | 共用 matcher 這一幀的狀態，見下 |
 | `hop_size` | `int` | 這一幀的 hop |
 | `n_channels` | `int` | 恆為 `FOUR_AEC_NR_RES_CHANNELS`（4） |
 | `n_freqs` | `int` | 這一幀的 bin 數 |
-| `linear_interleaved` | `const float*` | 四路 linear AEC 的**時域** hop，interleaved。做自己的 sqrt-Hann 分析的時域 beamformer 要吃這個。這是 pipeline 自己的 buffer（有拷貝，不是別名） |
-| `linear_spectra[ch]` | `const Complex*` | 四路 linear AEC 的**頻譜**，就是 `process_post()` 稍後會用的同一份。讓外部 beamformer 直接沿用既有的分析轉換，不必重做一次 STFT。**這是別名**，直接指向各 lane 自己的 buffer |
+| `linear_spectra[ch]` | `const Complex*` | 四路 linear AEC 的**頻譜**，就是 `four_aec_fuse()` 稍後會用的同一份。讓外部 beamformer 直接沿用既有的分析轉換，不必重做一次 STFT。**這是別名**，直接指向各 lane 自己的 buffer |
+| `formed_hop[ch]` | `const float*` | 各 lane 與 `linear_spectra[ch]` 同一次選擇的**時域** hop（`hop_size` 個 sample）。做自己的 sqrt-Hann 分析的時域 beamformer 要吃這個。**這也是借用的**，不再有 interleaved 拷貝 |
+| `aligned_ref` | `const float*` | 這一 hop 實際餵給四條 lane 的對齊後 far（`hop_size` 個 sample）；給需要「與線性濾波器吃到同一份 far」的外部 NN 後級用 |
+
+`SeSpecFrame`（`four_aec_fuse()` 填，定義在 `pipelines/common/se_stage.h`）：
+
+| 欄位 | 內容 |
+|---|---|
+| `n_freqs`, `hop` | 這一幀的 bin 數與 hop |
+| `e` | beamformed 誤差頻譜（pre-RES；RES 與 NR 據以估計，也是增益套用的對象） |
+| `y` | 投影後的近端頻譜 |
+| `x` | lane 0 的 far 頻譜（四條 lane 已驗證吃同一份） |
+| `r2` | 投影後的殘餘回音 PSD（audio scale，餵 NR 前由 stage 除以 `32768²`） |
+| `cn` | 投影後的 comfort-noise PSD |
+| `far_hop` | 對齊後的 far（同 `aligned_ref`） |
+| `max_dt`, `max_sat`, `all_converged` | 對權重有非零響應的 lane 取的 double-talk／飽和／收斂縮減 |
+| `clock_drift`, `delay_changed`, `delay_locked` | 共用 aligner 的旗標 |
+| `g_res_ctx` | 恆為 NULL（四條 lane 都不算自己的增益） |
 
 `FourAecNrResDelayState` 欄位：
 
@@ -399,13 +455,14 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 | `delay_samples` | `int` | 目前採用的延遲（sample） |
 | `confidence` | `float` | 估計信心值 |
 | `solid` | `int` | 估計是否已穩定 |
-| `changed` | `int` | 非 0 表示這一幀延遲值改變了 —— **你外部的 STFT / OLA 歷史必須跟著清掉** |
+| `changed` | `int` | 非 0 表示這一幀延遲值改變了 —— **你外部的 STFT / OLA 歷史必須跟著清掉**（前端自己對四條 lane 做 realign，不重置也不清合成 OLA） |
 | `estimator_calls` | `uint64_t` | 累計呼叫次數 |
 | `estimator_updates` | `int` | 累計更新次數 |
 
-**兩個 pre-frame 指標的生命週期（重要）**：
-`linear_interleaved` 與 `linear_spectra[ch]` **只在下列任一事件發生之前有效**：
-對應的 `process_post()`、`four_aec_nr_res_reset()`、`four_aec_nr_res_destroy()`。
+**front 視圖與 frame 的生命週期（重要）**：
+`FourAecFront` 的所有指標與 `SeSpecFrame` 的所有指標，**只在下列任一事件發生之前有效**：
+下一次 `four_aec_front_process()`、`four_aec_nr_res_reset()`、`four_aec_nr_res_destroy()`。
+所有 stage 對它們都是**唯讀**。
 
 這是 **API 約定，不是記憶體安全保證**。
 `reset()` 不保證那些記憶體被清掉或覆寫 —— lane 的舊頻譜可能就原地留著。
@@ -423,33 +480,31 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 | `delay_num_filters` | 僅 `MATCHED` 有效，每少一個固定省 5,728 B |
 | `fixed_delay_samples` | 僅 `FIXED` 有效，決定共用 delay ring 大小 |
 | `max_delay_ms` | 會（僅 `MATCHED` 用於 sizing delay ring） |
-| `enable_post` | 會（`0` 時不配置 NR/RES/iFFT，見 4.6b；ULCNet wrapper 用這個省 post 級） |
+| `enable_post` | 會（`0` 時不 carve fuse 緩衝，見 4.6b；ULCNet wrapper 用這個） |
 | `capture_proxy_channel` | 不變 |
-| `enable_nr` | 會（`enable_post=1` 時，`0` 省下對齊後的整份 MMSE-LSA state；`enable_post=0` 時無作用，那條路徑本來就不配置 NR） |
-| `enable_res` | 會（`enable_post=1` 時，`0` 省下 post SG 的 `(10+ma_n)×n_freqs` float；`enable_res`／`enable_nr` 任一為 `0` 時多一份 `n_freqs` float 的 unity gain；`enable_post=0` 時無作用） |
-| `aec_preset` / `nr_mode` / `enable_cng` / `legacy_amin` | 不變 |
+| `enable_nr` / `enable_res` / `enable_cng` / `legacy_amin` / `aec_preset` / `nr_mode` | 前端記憶體不變；它們決定你的後級 stage 的 config 與大小（`four_aec_nr_res_stage_configs()`，再用 `se_anr_stage_mem_size()`／`aec_res_get_mem_size()` 查） |
+
+後級 stage 的記憶體（`AecRes`、`AnrDenoiser`、`AcIstft` 與暫存向量）由應用自己加總；
+完整 wrapper 的 `audio_pipeline_4ch_get_mem_requirements()` 已把它們算進總量。
 
 ### 4.6 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是本次 checkout（`layout_version=18`）、`BACKEND=kiss`、`SIMD=1`、
+以下是本次 checkout（`layout_version=18`）、`BACKEND=ne10`、`SIMD=1`、
 `delay_mode=MATCHED`（預設,n=5）、`enable_post=1`（預設）下直接呼叫 API
-量到的值。換 backend、換編譯選項、更新 submodule 都會變。本輪 `sizeof(Aec)`
-由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數
-（16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B），四路即四倍，
-所以 `aec_bytes` 與 `req.bytes` 兩欄一起移動；`nr_bytes`／`fft_bytes`／
-`wrapper_bytes` 不動，所有差額不變。
+量到的前端值。換 backend、換編譯選項、更新 submodule 都會變。前端不含 RES／NR／iFFT，
+所以 `FourAecNrResMemBreakdown` 只有 `aec_bytes`、`wrapper_bytes`（控制區塊、共用 aligner 與 fuse 緩衝）與 `total_bytes`。
 
-| Config | `req.bytes` | `aec_bytes`（四路合計） | `nr_bytes` | `fft_bytes` | `wrapper_bytes` |
-|---|---:|---:|---:|---:|---:|
-| 16000，預設（256/128，`max_delay_ms=1024`） | 1,136,304 | 881,728 | 122,160 | 8,784 | 123,632 |
-| 16000，`fft_size=512` | 1,689,888 | 1,395,840 | 133,472 | 16,976 | 143,600 |
-| 16000，`max_delay_ms=100` | 1,077,168 | 881,728 | 122,160 | 8,784 | 64,496 |
-| 16000，`filter_length=512` | 1,037,296 | 782,720 | 122,160 | 8,784 | 123,632 |
-| 48000，預設（1024/512） | 3,754,784 | 3,028,032 | 374,336 | 33,360 | 319,056 |
+| Config | `req.bytes` | `aec_bytes`（四路合計） | `wrapper_bytes` |
+|---|---:|---:|---:|
+| 16000，預設（256/128，`max_delay_ms=1024`） | 988,208 | 879,296 | 108,912 |
+| 16000，`fft_size=512` | 1,506,416 | 1,390,336 | 116,080 |
+| 16000，`max_delay_ms=100` | 929,072 | 879,296 | 49,776 |
+| 16000，`filter_length=512` | 889,200 | 780,288 | 108,912 |
+| 48000，預設（1024/512） | 3,279,248 | 3,016,384 | 262,864 |
 
 `four_aec_nr_res_get_mem_breakdown()` 的 `total_bytes` 與 `get_mem_requirements()` 的
 `req.bytes` 在上述每一組都相等；`wrapper_bytes` 已包含控制區塊。四路合計的
-`aec_bytes` 除以 4 得單路 220,432 B（@16k/256）——與 `lib/aec` 的
+`aec_bytes` 除以 4 得單路 219,824 B（@16k/256）——與 `lib/aec` 的
 `AEC_DELAY_EXTERNAL_ALIGNED` 單體大小完全相同,因為每路內部本來就是
 `EXTERNAL_ALIGNED`（delay 由本層共用估計器提供,不建自己的 estimator/ring）。
 
@@ -457,116 +512,67 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 
 | `delay_mode` | `req.bytes` | 相對 `MATCHED n=5` |
 |---|---:|---:|
-| `MATCHED` n=5（預設） | 1,136,304 | — |
-| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 1,042,704 | −93,600 |
-| `EXTERNAL_ALIGNED` | 1,035,792 | −100,512 |
+| `MATCHED` n=5（預設） | 988,208 | — |
+| `FIXED`，`fixed_delay_samples=1600`（100 ms） | 894,608 | −93,600 |
+| `EXTERNAL_ALIGNED` | 887,696 | −100,512 |
 
 省下的量比單聲道版本小，因為這裡只省**一份共用**的 estimator/ring（四路
 共用一個 aligner），不是四份各自的——與本頁「單一共用 aligner」的結構
 一致。
 
-#### 4.6b `enable_post=0`（ULCNet wrapper 用的 pre-only 核心）
+#### 4.6b `enable_post=0`（ULCNet wrapper 用的 front-only 前端）
 
 | Config | `req.bytes` |
 |---|---:|
-| 16000，`fft_size=512`，`enable_post=0` | 1,506,448 |
+| 16000，`fft_size=512`，`enable_post=0` | 1,496,080 |
+| 48000，`enable_post=0` | 3,258,672 |
 
 即 [`pipeline_ulcnet_4ch.html`](html/pipeline_ulcnet_4ch.html) 記載的 ULCNet
-4ch wrapper私有核心大小；比同格點 `enable_post=1` 少 183,424 B（NR/RES/iFFT
-的 `nr_bytes+fft_bytes` 加上一部分 `wrapper_bytes`）。本輪同樣是四路各長
-5,120 B（@16 kHz/512；`enable_post=0` 的 wrapper 為 110,608 B，與後端無關），
-兩側同幅移動，所以差額維持實測的 183,424 B。
+4ch wrapper 私有前端大小；比同格點 `enable_post=1` 少的是 fuse 緩衝（16 kHz/512：10,336 B，48 kHz：20,576 B）。
 **實際配置一律以 `req.bytes` 為準。**
 
 ---
 
 ## 5. 錯誤處理
 
-### 5.1 pre/post 交接是本 API 面上**唯一**的有狀態協定
+### 5.1 front → fuse 的次序規則
 
-把它當成一台狀態機來實作，不要當成兩個獨立的 function call。
-
-```
-                     ┌──────────────────────────────────────────────┐
-                     │                                              │
-                     ▼                                              │
-              ┌─────────────┐                                       │
-   init ────► │    IDLE     │                                       │
-              │ (無 pending)│                                       │
-              └──────┬──────┘                                       │
-                     │  process_pre()  → OK                         │
-                     ▼                                              │
-              ┌─────────────┐                                       │
-              │   PENDING   │  持有 1 個有效 token                  │
-              │  (剛好 1 幀)│  linear_* 指標在此期間有效            │
-              └──┬───┬───┬──┘                                       │
-                 │   │   │                                          │
-   process_pre() │   │   │ process_post(正確 token, 合法 weights)   │
-   → SEQUENCE_   │   │   └──────────► OK，token 消耗 ───────────────┘
-     ERROR (-2)  │   │
-     狀態不變 ───┘   │ reset()  → 回到 IDLE，token 立刻作廢
-                     │           （你必須同時停止讀 linear_* 指標）
-                     └──────────► IDLE
-```
-
-**規則（全部已實測驗證）**：
+前端沒有 token，只有一個「front frame 有效」旗標。次序規則很短：
 
 | 情境 | 回傳 | 之後的狀態 |
 |---|---|---|
-| 正常 `pre()` → `post()` | 兩者皆 `OK`(0) | token 被消耗，回到 IDLE |
-| PENDING 中再次 `pre()` | `SEQUENCE_ERROR`(-2) | **狀態完全不變**，原本那一幀仍然 pending。你可以繼續用原 token 做 `post()` |
-| 同一個 token 重播（`post()` 兩次） | 第二次 `SEQUENCE_ERROR`(-2) | 不變 |
-| 把 A instance 的 token 拿去 B instance 的 `post()` | `SEQUENCE_ERROR`(-2) | 不變 |
-| PENDING 中呼叫 `reset()`，之後再 `post()` | `SEQUENCE_ERROR`(-2) | reset 已把狀態清乾淨 |
-| `post()` 傳入全零 / 非有限的 weights | `INVALID_ARGUMENT`(-1) | **pending 幀保留**，你可以修正 weights 後用同一個 token 重試（已實測重試成功） |
-| `pre()` 或 `post()` 內部一致性檢查失敗 | `DSP_ERROR`(-3) | **instance 已被自動 `reset()`**，pending 幀消失，token 作廢 |
+| 正常 `front_process()` → `fuse()` | 兩者皆 `OK`(0) | front 視圖與 frame 有效至下一次 `front_process()`／`reset()`／`destroy()` |
+| 連續兩次 `front_process()`（不 fuse） | 兩次皆 `OK` | 前一幀的視圖作廢，這是正常用法（從不 fuse 的 front-only 應用每 hop 都這樣） |
+| 建構或 `reset()` 之後、尚未 `front_process()` 就 `fuse()` | `SEQUENCE_ERROR`(-2) | 不變 |
+| `front_process()` 在接受引數後失敗（非有限輸入、`DSP_ERROR`），之後 `fuse()` | `SEQUENCE_ERROR`(-2) | 該次失敗清掉 front 有效旗標；沒有可 fuse 的幀 |
+| `fuse()` 傳入全零 / 非有限的 weights | `INVALID_ARGUMENT`(-1) | **front 幀保留**，你可以修正 weights 後重試 |
+| `enable_post = 0` 的前端呼叫 `fuse()` | `INVALID_ARGUMENT`(-1) | 不變（沒有 fuse 緩衝） |
+| `front_process()` 或 `fuse()` 內部一致性檢查失敗 | `DSP_ERROR`(-3) | **instance 已被自動 `reset()`**，front 幀消失 |
 
-**Token 怎麼傳**：`process_post()` 的第二個參數型別是 `const FourAecNrResFrameToken*`，
-但比對是**逐欄位按值**做的。你要做的是：把 `pre.token` **原封不動**保存下來
-（整個 struct 拷貝即可，32 bytes），然後把指向那份拷貝的指標傳進去。
-**不要修改任何欄位。**
+**同一個 front frame 可以 fuse 多次**（例如以不同權重比較），每次都重新填 frame；但每次 fuse 都會覆寫上一次的 frame 內容。
+想要 pipeline 化（beamformer 在另一顆核心上跑、排隊多幀）在這個 API 上是做不到的：視圖借用 lane 的 buffer，下一次 `front_process()` 就被覆寫。
 
-`FourAecNrResFrameToken` 有 4 個欄位，`process_post()` 全部都會比對：
-
-| 欄位 | 型別 | 作用 |
-|---|---|---|
-| `frame_index` | `uint64_t` | 擋重播（同一幀不能 post 兩次） |
-| `generation` | `uint64_t` | 擋 `reset()` 之後的舊 token（每次 reset 遞增） |
-| `owner_cookie` | `uintptr_t` | 擋跨 instance 使用（同時比對「是否等於這個 instance 的位址」） |
-| `instance_epoch` | `uint64_t` | 擋 caller-owned pool 的 ABA：`destroy()` 不釋放你的 pool，你可以把新 instance init 在**完全相同的位址**上，此時前三個欄位可能完全重合。`instance_epoch` 由一個 process 內的單調計數器在建構時蓋章（從 1 開始，永不從 pool bytes 讀回），所以任兩次建構必不相同 |
-
-> 這個 epoch 計數器**不是 atomic**：建構被假設為單執行緒。多執行緒同時建構 instance
-> 不在支援範圍。
-
-**同時只能有一幀在飛。** 想要 pipeline 化（beamformer 在另一顆核心上跑、
-排隊多幀）在這個 API 上是做不到的。
-
-### 5.2 `four_aec_nr_res_process_pre()` 的完整拒絕清單（依實際檢查順序）
+### 5.2 `four_aec_front_process()` 的完整拒絕清單（依實際檢查順序）
 
 | # | 條件 | 回傳 | 副作用 |
 |---|---|---|---|
 | 1 | `p` 為 NULL、`p` 已 destroy、`microphones_interleaved` / `ref` / `out` 任一為 NULL | `INVALID_ARGUMENT`(-1) | 無 |
-| 2 | 已有 pending 幀 | `SEQUENCE_ERROR`(-2) | 無 |
-| 3 | `microphones_interleaved`（`hop*4` 個）或 `ref`（`hop` 個）含非有限值 | `INVALID_ARGUMENT`(-1) | 無 |
-| 4 | 內部 render 對齊失敗 | `DSP_ERROR`(-3) | **instance 已被自動 reset** |
-| 5 | 某條 lane 的輸出 context 不完整 | `DSP_ERROR`(-3) | **instance 已被自動 reset** |
+| 2 | `microphones_interleaved`（`hop*4` 個）或 `ref`（`hop` 個）含非有限值 | `INVALID_ARGUMENT`(-1) | 逐階段耗時的前半已清零；front 有效旗標已清 |
+| 3 | 內部 render 對齊失敗 | `DSP_ERROR`(-3) | **instance 已被自動 reset** |
+| 4 | 某條 lane 的輸出 context 不完整 | `DSP_ERROR`(-3) | **instance 已被自動 reset** |
 
-注意順序：NULL 檢查在 pending 檢查**之前**。所以在 PENDING 狀態下傳 NULL `out`
-會拿到 `-1`（不是 `-2`），且不改變狀態。
+`front_process()` **不會**檢查 buffer 長度 —— `hop*4` 與 `hop` 是你的責任。
 
-`process_pre()` **不會**檢查 buffer 長度 —— `hop*4` 與 `hop` 是你的責任。
-
-### 5.3 `four_aec_nr_res_process_post()` 的完整拒絕清單（依實際檢查順序）
+### 5.3 `four_aec_fuse()` 的完整拒絕清單（依實際檢查順序）
 
 | # | 條件 | 回傳 | 副作用 |
 |---|---|---|---|
-| 1 | `p` 為 NULL、`p` 已 destroy、`token` / `weights` / `out` 任一為 NULL | `INVALID_ARGUMENT`(-1) | 無 |
-| 2 | token 不匹配（重播 / 跨 instance / 被 `reset()` 作廢 / 根本沒有 pending 幀） | `SEQUENCE_ERROR`(-2) | 無 |
-| 3 | `weights` 含非有限值，或 `Σ(|re| + |im|)` ≤ `1e-12`（等同全零） | `INVALID_ARGUMENT`(-1) | **pending 幀保留**，可修正後重試 |
-| 4 | 內部融合/一致性檢查失敗 | `DSP_ERROR`(-3) | **instance 已被自動 reset** |
-| 5 | 內部 RES/NR 階段失敗 | `DSP_ERROR`(-3) | **instance 已被自動 reset** |
+| 1 | `p` 為 NULL、`p` 已 destroy、`weights` / `frame` 任一為 NULL，或 `cfg.enable_post == 0` | `INVALID_ARGUMENT`(-1) | 無 |
+| 2 | 之前沒有有效的 front frame | `SEQUENCE_ERROR`(-2) | 無 |
+| 3 | `weights` 含非有限值，或 `Σ(|re| + |im|)` ≤ `1e-12`（等同全零） | `INVALID_ARGUMENT`(-1) | **front 幀保留**，可修正後重試 |
+| 4 | 內部融合/一致性檢查失敗（含 `beamformed_error` 非有限、四條 lane 的 far 頻譜不一致） | `DSP_ERROR`(-3) | **instance 已被自動 reset** |
 
-**token 檢查排在 weights 檢查之前**：token 壞掉 + weights 也壞掉 → 你拿到的是 `-2`。
+**序列檢查排在 weights 檢查之前**：沒有 front frame + weights 也壞掉 → 你拿到的是 `-2`。
 
 ### 5.4 錯誤語意總表
 
@@ -575,15 +581,16 @@ post 級抑制器（其中 `dt_indicator` 決定它套哪一個地板）。一�
 | `four_aec_nr_res_default_config()` | 回傳填好的 struct | 不會失敗，**也不驗證** | 傳入非法 `sample_rate` 也照填，之後才會被拒 |
 | `four_aec_nr_res_get_mem_requirements()` | `0`，`*out` 填妥 | `-1` | — |
 | `four_aec_nr_res_get_mem_breakdown()` | `0`，`*out` 填妥 | `-1` | — |
+| `four_aec_nr_res_stage_configs()` | `0`，`*res_cfg`／`*nr_cfg` 填妥 | `-1` | NULL 引數或前端會拒絕的 config |
 | `four_aec_nr_res_init()` | 非 NULL handle | `NULL` | 等同 `init_ex(..., NULL)` |
 | `four_aec_nr_res_init_ex()` | 非 NULL handle | `NULL` | 8 項檢查任一不符即 NULL |
 | `four_aec_nr_res_create()` | 非 NULL handle | `NULL` | config 無效或配置失敗 |
-| `four_aec_nr_res_process_pre()` | `FOUR_AEC_NR_RES_OK`(0) | `-1` / `-2` / `-3` | 見 §5.2 |
-| `four_aec_nr_res_process_post()` | `FOUR_AEC_NR_RES_OK`(0) | `-1` / `-2` / `-3` | 見 §5.3 |
+| `four_aec_front_process()` | `FOUR_AEC_NR_RES_OK`(0) | `-1` / `-3` | 見 §5.2 |
+| `four_aec_fuse()` | `FOUR_AEC_NR_RES_OK`(0) | `-1` / `-2` / `-3` | 見 §5.3 |
 | `four_aec_nr_res_reset()` | `void` | 不會失敗 | `p == NULL` 或已 destroy → 靜默 no-op |
 | `four_aec_nr_res_destroy()` | `void` | 不會失敗 | 見 §5.6 |
 | `*_hop_size` / `*_fft_size` / `*_n_freqs` / `*_sample_rate` | 正值 | `-1` | `p == NULL` 或已 destroy |
-| `*_matched_filter_count` / `*_linear_aec_count` / `*_nr_count` / `*_post_res_count` | `1` / `4` / `1` / `1` | `0` | `p == NULL` 或已 destroy |
+| `*_matched_filter_count` / `*_linear_aec_count` | `0`／`1` / `4` | `0` | `p == NULL` 或已 destroy |
 | `four_aec_nr_res_far_fft_real_compute_count()` | 累計值（`long`） | `0` | `p == NULL` 或已 destroy |
 
 > **注意慣例不一致**：本層的 `get_mem_requirements()` / `get_mem_breakdown()` 用
@@ -622,7 +629,8 @@ destroy 之後不要再呼叫任何 accessor。
 | Source | 產出 | 說明 |
 |---|---|---|
 | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.c` | `libaudio_pipeline_4ch.a`（object 之一） | **本手冊的主體** |
-| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` | `libaudio_pipeline_4ch.a`（object 之二） | 完整 spatial wrapper。只用本手冊 API 時 linker 不會拉進來 |
+| `pipelines/common/se_config.c`、`se_anr_stage.c` | `libaudio_pipeline_4ch.a`（object 之二、三） | 共用組態與 NR 級；`se_stage.h` / `se_res_stage_gain()` 為 header-only |
+| `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.c` | 獨立 object | 完整 spatial wrapper（擁有 RES／NR／ISTFT 並串接）。只用本手冊 API 時不會被拉進來 |
 | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res.h` | — | 本手冊的公開 API |
 | `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch.h` | — | 另一份手冊的公開 API |
 | `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_internal.h`、`4aec_projection_kernels.h` | — | 內部 header，**不是**公開 API，不要 include |
@@ -631,7 +639,7 @@ destroy 之後不要再呼叫任何 accessor。
 
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
-| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` | caller-owned pool 路徑的主機參考程式 | 示範 query → allocate → init → process_pre/post → destroy → release。它在 pre/post 之間塞的是**固定等權重**，那是決定性的 smoke adapter，**不是** production beamformer |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` | caller-owned pool 路徑的主機參考程式 | 示範 query → allocate → init → front_process → fuse → 明寫的 stage 鏈 → destroy → release。它在 front/fuse 之間塞的是**固定等權重**，那是決定性的 smoke adapter，**不是** production beamformer |
 | `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c` | 完整 spatial pipeline 的 pool 路徑主機參考程式 | 屬於另一份手冊；列在這裡是為了讓目錄內容一目了然 |
 | `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner | 主機一次性工具，走 heap `create()` 路徑 |
 
@@ -640,8 +648,8 @@ destroy 之後不要再呼叫任何 accessor。
 
 ### 6.3 其他（不出貨）
 
-* `pipelines/4ch_aec_bf_nr_res/tests/` —— 測試。
-* `pipelines/4ch_aec_bf_nr_res/third_party/` —— DOA / GSC / spatial kernel 函式庫。
+* `pipelines/4ch_aec_bf_nr_res/tests/` —— 測試；`tests/conv_chain_4ch.h` 是把後級串接寫在前端之上的參考鏈。
+* `pipelines/third_party/` —— DOA / GSC / spatial kernel 函式庫。
   **只用本手冊這套 API 的話完全不需要它們。**
 * `.py` 檔 —— 主機端評估與參考實作，不是 C 產品的一部分。
 
@@ -666,18 +674,17 @@ destroy 之後不要再呼叫任何 accessor。
 - [ ] `init_ex()` 回 `NULL` 時你的程式會停下來 —— 而且你**自己**在呼叫端印出了
       是哪一個欄位不符（函式庫不會告訴你）
 - [ ] `sample_rate` 沒有設成 8000
+- [ ] 後級 stage 的記憶體以 `four_aec_nr_res_stage_configs()` 導出的 config 查大小，16-byte 對齊
 
-pre/post 協定：
+front / fuse 協定：
 
-- [ ] 你的程式結構保證「一個 `pre()` 對應一個 `post()`」，中間不會插入第二個 `pre()`
-- [ ] `pre.token` 是整份拷貝保存的，沒有被修改
+- [ ] 每 hop 先 `front_process()` 再 `fuse()`；`fuse()` 之前沒有 front frame 會得到 `-2`
 - [ ] `weights` 是 channel-major `[ch * n_freqs + bin]`，不是 bin-major
-- [ ] `weights` 不會全零（會被 `-1` 拒絕）
-- [ ] 有處理 `-2`（順序錯）與 `-3`（instance 已被自動 reset，你的外部狀態也要跟著清）
-- [ ] `pre.delay.changed` 非 0 時，你外部 beamformer 的 STFT / OLA 歷史有跟著清掉
-- [ ] `linear_interleaved` / `linear_spectra` 只在 `post()` / `reset()` / `destroy()`
-      之前讀取，沒有跨幀保存指標
-- [ ] `reset()` 之後你的 beamformer 立刻停止讀那些指標（不要等 token 被拒才反應）
+- [ ] `weights` 不會全零（會被 `-1` 拒絕；front 幀保留，可重試）
+- [ ] 有處理 `-3`（instance 已被自動 reset，你的外部狀態與後級 stage 也要跟著 reset）
+- [ ] `front.delay.changed` 非 0 時，你外部 beamformer 的 STFT / OLA 歷史有跟著清掉
+- [ ] `FourAecFront` 與 `SeSpecFrame` 的指標只在下一次 `front_process()`／`reset()`／`destroy()` 之前讀取，沒有跨幀保存，也沒有寫入
+- [ ] `reset()` 之後你的 beamformer 立刻停止讀那些指標
 
 執行期：
 
@@ -685,6 +692,7 @@ pre/post 協定：
 - [ ] mic / ref 內容都是有限值（NaN/Inf 會被 `-1` 拒絕）
 - [ ] hop / n_freqs 是查來的，不是寫死的
 - [ ] 同一個 instance 沒有被多 thread 同時處理
+- [ ] 鏈的順序：`se_res_stage_gain` → `se_anr_stage_gain` → `sk_min_f32` → `sk_capply_gain_f32` → `aec_cng_fill` → `ac_istft_push`；缺席的增益來源用 unity 全 1 向量
 
 收尾：
 

@@ -26,15 +26,15 @@ mic hop [hop][4] + ref hop [hop]
    ├─► 1 個共用 delay matcher → 4 條獨立 linear AEC
    ├─► SRP-PHAT direction finding（DOA）
    ├─► GSC beamformer（產生這一幀的有效權重）
-   ├─► 1 次 post-beam RES gain + 1 次 NR
+   ├─► four_aec_fuse → 1 次 post-beam RES gain + 1 次 NR（wrapper 明寫串接）
    └─► 1 次 iFFT / OLA
    │
    ▼
  out hop [hop]（mono）+ 一份唯讀的 frame telemetry
 ```
 
-這一層**擁有** SRP-PHAT 與 GSC 的生命週期，並把它們接在核心的
-`process_pre()` 與 `process_post()` 之間。對你而言只有**一個** process 呼叫。
+這一層**擁有** SRP-PHAT 與 GSC 的生命週期，並把它們接在前端的
+`four_aec_front_process()` 與 `four_aec_fuse()` 之間，再自己串接後級 stage（RES、NR、CNG、ISTFT）。對你而言只有**一個** process 呼叫。
 
 兩種入口：
 
@@ -191,7 +191,7 @@ heap 便利路徑：`audio_pipeline_4ch_create(&cfg)` 把第 1~3 步合成一步
 
 ### 3.1 `reset()` 到底重置了什麼
 
-* 核心層（delay matcher、四路 AEC、NR、post-beam RES、OLA、pending frame token）
+* 前端（delay matcher、四路 AEC、front 有效旗標）與本層擁有的後級（NR、post-beam RES、OLA、CNG rng）
 * SRP-PHAT 狀態
 * GSC 狀態
 * 本層的內建 VAD 狀態（`noise_power` 回到門檻值、hangover 歸零）
@@ -241,28 +241,27 @@ int audio_pipeline_4ch_set_aec_preset(AudioPipeline4Ch* p, AecPreset preset, flo
 int audio_pipeline_4ch_set_nr_mode(AudioPipeline4Ch* p, AnrMode mode);
 ```
 
-兩者都是**轉呼叫核心的薄殼**（`p`／已 destroy／`p->core` 為 NULL 時回 `-1`，
-其餘直接轉給 `four_aec_nr_res_set_aec_preset()` / `four_aec_nr_res_set_nr_mode()`）。
-完整契約在核心手冊
+兩者都直接作用在本層自己 carve 的 `AecRes` 與 `AnrDenoiser` 上（`p`／已 destroy 或對應實例不存在時回 `-1`）。
+唯讀的 `audio_pipeline_4ch_post_split_floor(p, &live, &target)` 回報抑制器的當下值與撐得過 reset 的目標值。
+完整契約見核心手冊
 [`integration_4ch_core_zh_TW.md` §3.2](integration_4ch_core_zh_TW.md)，這裡只重述
 整合時最容易踩到的一點：
 
 > **不要自己對四條 lane 迴圈呼叫 `aec_set_preset()`。** 四條 lane 都以
 > `spatial_linear_context` 建立，永遠不會走到自己的 suppression-gain 路徑，
-> 它們的地板什麼都不塑形。真正乘上本 pipeline 輸出的 gain 來自核心裡**唯一一個**
+> 它們的地板什麼都不塑形。真正乘上本 pipeline 輸出的 gain 來自本層**唯一一個**
 > 共用的 post 級抑制器；同樣地，NR 也只有一個共用實例，不是每條 lane 一個。
 > 上面兩個 setter 針對的就是那兩個共用實例——這就是它們存在的理由。
 
 ```c
 if (audio_pipeline_4ch_set_aec_preset(p, AEC_PRESET_AGGRESSIVE, 100.0f) != 0) { /* 引數不合法 */ }
 if (audio_pipeline_4ch_set_nr_mode(p, ANR_MODE_MILD) != 0)                  { /* 同上 */ }
-```
 
-本層**不轉出**核心的 handle，所以核心那個唯讀的
-`four_aec_nr_res_post_split_floor()`（`live`／`target`，可看出 ramp 走完了沒有）
-在這一層拿不到。需要那組讀數（例如板端要記錄「要求的強度改動落地了沒有」）的部署，
-請直接整合核心層並自備 beamformer，見
-[`integration_4ch_core_zh_TW.md` §3.2](integration_4ch_core_zh_TW.md)。
+float live, target;                                        /* 線性功率 */
+if (audio_pipeline_4ch_post_split_floor(p, &live, &target) == 0 && live == target) {
+    /* ramp 已經走完 */
+}
+```
 
 `ramp_ms == 0` 代表下一個 hop 就套用（**不是錯誤**），`> 0` 則以 dB 為單位線性走
 過去，上限 60 秒。兩個 setter 都不是重啟：AEC、SRP、GSC、NR 的狀態全部繼續跑；
@@ -544,9 +543,9 @@ config 上呼叫 `audio_pipeline_4ch_get_mem_requirements()`，所以它們不�
 | # | 條件 | 回傳 | 副作用 |
 |---|---|---|---|
 | 1 | `p` 為 NULL、`p` 已 destroy、`microphones_interleaved` / `far_reference` / `output` 任一為 NULL、`vad_raw` 或 `vad_out` 不是 0 或 1 | `INVALID_ARGUMENT`(-1) | 無 |
-| 2 | 核心層 `process_pre()` 失敗（含 mic/ref 含非有限值 → `-1`） | 原樣傳回核心層的碼 | `-3` 時核心層已自動 reset |
+| 2 | 前端 `four_aec_front_process()` 失敗（含 mic/ref 含非有限值 → `-1`） | 原樣傳回核心層的碼 | `-3` 時核心層已自動 reset |
 | 3 | 核心層回報的形狀與本層記錄的不一致 | `DSP_ERROR`(-3) | **整條 pipeline 已被自動 reset** |
-| 4 | 核心層 `process_post()` 失敗 | 原樣傳回核心層的碼 | **整條 pipeline 已被自動 reset** |
+| 4 | 前端 `four_aec_fuse()` 失敗 | 原樣傳回核心層的碼 | **整條 pipeline 已被自動 reset** |
 
 `audio_pipeline_4ch_process()` 在上述之前，額外先做兩件事：
 
@@ -637,7 +636,7 @@ destroy 之後不要再呼叫任何 accessor。
 | Source | 是什麼 | 為什麼存在 |
 |---|---|---|
 | `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_static.c` | caller-owned pool 路徑的主機參考程式 | 示範完整 wrapper 的 query → allocate → init_ex → process → destroy → release。真正的 SRP-PHAT + GSC 在這個 process 裡跑，不是固定權重的替身 |
-| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` | **核心層**（外部 beamformer seam）的 pool 路徑參考程式 | 屬於另一份手冊。它在 pre/post 之間塞的是固定等權重的 smoke adapter，不是 production beamformer |
+| `pipelines/4ch_aec_bf_nr_res/4aec_nr_res_static.c` | **核心層**（外部 beamformer seam）的 pool 路徑參考程式 | 屬於另一份手冊。它在 front/fuse 之間塞的是固定等權重的 smoke adapter，不是 production beamformer |
 | `pipelines/4ch_aec_bf_nr_res/audio_pipeline_4ch_raw.c` | raw-float 錄音驗證 runner | 主機一次性工具，刻意走 heap `create()` 路徑（不是板端佈署示範） |
 
 單聲道的 library 與參考程式（`pipelines/mono_aec_nr_res/main.c`、

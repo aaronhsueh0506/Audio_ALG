@@ -714,6 +714,28 @@ DeepVQE-S 在 AIAEC 16 kHz／512 邊界上自建同組態的物件。
 
 > **同一個 `AcStft` 不可混用兩種 `center`**：`center` 在建立時固定，兩種排程不共用物件。
 
+
+### 6.9 Pipeline 層：頻域 stage 串接與 NN 的 begin / nn_begin / nn_end / end
+
+四個 pipeline 應用把三個 library 與這些類別串成一條鏈；接縫是 `pipelines/common/se_stage.h` 的
+`SeSpecFrame`（借用視圖，有效至其產生者下一次執行；任何 stage 都不得寫入）。增益類 stage 回傳
+`const float*`（`se_res_stage_gain()`、`se_anr_stage_gain()`），應用自己明寫
+`sk_min_f32 → sk_capply_gain_f32 → aec_cng_fill → ac_istft_push`；沒有函式指標表。
+
+跑 NN 的應用把一個 hop 拆成四個呼叫，加速器夾在中間，模型 config 的 `infer` 回呼因此可以不設：
+
+```c
+mono_aec_dfn_res_process_begin(p, mic, ref);             /* 或 audio_pipeline_ulcnet_／…_4ch_ulcnet_／four_aec_dfn_res_ */
+while (mono_aec_dfn_res_nn_begin(p, &job) > 0) {         /* 1 = 有一幀；0 = 沒有（warm-up／reprime） */
+    mono_aec_dfn_res_nn_end(p, run_npu(&job));           /* rc != 0 或輸出非有限 ⇒ identity（fail-open） */
+}
+mono_aec_dfn_res_process_end(p, out);                    /* 合成剛好一個 hop */
+```
+
+`job` 是 `UlcnetNnJob`（ULCNet）或 `DfnResStageJob`（DFN2，內含本章 `DFN2PrepostInputs`／`Outputs`）；
+輸出預填 NaN，必須寫滿。DFN 應用經 rate bridge 時一個 native hop 可能開 0..2 個 48 kHz 幀，所以 `nn_begin` 放在迴圈裡。
+沒被取走或沒被關閉的幀走 identity，輸出時序不隨模型健康度改變。範例與記憶體規則見
+`pipelines/README.md` 的 Call flow 與 [`integration_example.html`](html/integration_example.html)。
 ---
 
 ## 7. Static-pool 共通規則

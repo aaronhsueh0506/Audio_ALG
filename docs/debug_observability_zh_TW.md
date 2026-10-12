@@ -35,7 +35,7 @@
 |---|---|
 | AEC 狀態快照 | `AecDebugStatus` 10 欄，零 per-hop 成本（只讀引擎本來就每 hop 維護的欄位） |
 | NR 狀態快照 | `AnrDebugStatus` 5 欄 |
-| 4ch 計數器 | duty census、realign warm/soft、pending delay candidate、far-FFT 實跑次數、post split floor（live vs target） |
+| 4ch 計數器 | duty census、realign warm/soft、pending delay candidate、far-FFT 實跑次數、post split floor（live vs target；經 `audio_pipeline_4ch_post_split_floor()`，抑制器由 wrapper 擁有） |
 | 記憶體 | `aec_get_mem_breakdown()` / `audio_pipeline_get_mem_breakdown()` |
 | 錯誤分級 | 4ch core 的 `FourAecNrResStatus` 四值（唯一有語意分級的） |
 | Finite guards | 4ch 的輸入與輸出各一道；兩條 ULCNet 的 model 輸出 guard（含先填 `NAN` 的 FULL-WRITE CONTRACT） |
@@ -46,16 +46,16 @@
 |---|---|---|
 | **G1** | **`assert()` 在出貨板上是活的**。四個 Makefile 沒有任何一個設 `-DNDEBUG`；`suppression_gain.c` 的 table-length assert **沒有 release-path fallback**，失敗即 `abort()`——沒有回傳碼、沒有 log、沒有 hook 可攔 | 全樹 grep `-DNDEBUG` = 0 命中 |
 | **G2** | **層級式 log 是死碼**。`AEC_DEBUG_LOG` 在整個 `src/` 有 **0 個呼叫點**（唯一命中是一句註解） | grep `AEC_DEBUG_LOG src/` |
-| **G3** | **per-hop CSV trace 在四條 pipeline 全部不可達**。唯一填寫點要求 `cfg.enable_res == 1` 且走 `aec_process()`；四條 pipeline **全部**無條件設 `enable_res = 0` | `audio_pipeline.c:358`、`audio_pipeline_ulcnet.c:229`、`4aec_nr_res.c:471` |
+| **G3** | **per-hop CSV trace 在四條 pipeline 全部不可達**。唯一填寫點要求 `cfg.enable_res == 1` 且走 `aec_process()`；四條 pipeline **全部**無條件設 `enable_res = 0` | `audio_pipeline.c`、`audio_pipeline_ulcnet.c`、`4aec_nr_res.c` 的 `derive_dims_and_configs()` |
 | **G4** | **self-reset 不計數，而且會抹掉證據**。`DSP_ERROR` 路徑內部呼叫 `reset()`，而 `reset()` 把 realign counters / duty census 全部歸零 → 事後完全看不出發生過 | `4aec_nr_res.c` 的 reset 實作 |
 | **G5** | **delay lock 遺失不可見**。`delay_state` 與 `generation` 每 hop 可讀，但 `AecDebugStatus` **兩者都沒有** → 只 poll 快照的整合者看不到 lock 的丟失與重獲 | `aec.h` 的 `AecDebugStatus` 欄位表 |
 | **G6** | **mis-lock 連代理指標都沒有**。`delay_updates` 是更新總數，**不區分**「同一值重複確認」與「跳到新值」 | — |
 | **G7** | **realign 第三種落點不計數**。只累加 `outcome==1`（warm）與 `==0`（soft）；`-1`（wiring fault）不計 | `4aec_nr_res.c` realign sweep |
 | **G8** | **沒有任何 frame counter 的 public accessor**。四條 pipeline 都答不出「處理了幾個 hop」，遑論 xrun | grep 四個 header |
 | **G9** | **init 失敗一個字都不說**。4ch core `init_ex()` 的 8 項檢查任一失敗都靜默回 NULL；mono 有逐欄位 stderr，但 `NO_STDIO=1`（正是板端組態）一開就沒了 | `4aec_nr_res.h` 自承「not implemented here yet」 |
-| **G10** | **NN fail-open 靜默且不可區分**。三種 fallback（`infer==NULL` / 回非 0 / 輸出非有限）走同一條 else 分支、無計數 → 「NPU 掛了」與「偶發 NaN」外部無法分辨 | 兩條 ULCNet 的 infer 分支 |
+| **G10** | **NN fail-open 靜默且不可區分**。三種 fallback（`infer==NULL` / 回非 0 / 輸出非有限）走同一條 else 分支、無計數 → 「NPU 掛了」與「偶發 NaN」外部無法分辨 | 兩條 ULCNet 的 infer／`nn_end` 分支 |
 
-另有三個次要盲點：backward quarantine 開火不可見；`far_spec_shared_hop` 退化到昂貴路徑不可見（provenance 函式只在 internal header）；mono pipeline 完全沒有 finite 守衛（輸入輸出都不檢）。
+另有四個次要盲點：4ch 前端的 `FourAecNrResLastTiming` 只涵蓋前端（delay／frontend／linear／lane_res／fuse），後級 stage（RES、NR、CNG、ISTFT）由應用串接，其耗時必須由應用自己量；backward quarantine 開火不可見；`far_spec_shared_hop` 退化到昂貴路徑不可見（provenance 函式只在 internal header）；mono pipeline 完全沒有 finite 守衛（輸入輸出都不檢）。
 
 ---
 

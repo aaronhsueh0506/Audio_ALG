@@ -108,7 +108,7 @@ static void test_derive_fields(void) {
         CHECK(a.spatial_linear_context == AEC_CONTEXT_NO_GAIN, "post context level");
         four = four_channel_rules(0);
         CHECK(se_derive(&q, &four, &g, &a) == 0 && a.spatial_linear_context == AEC_CONTEXT_LINEAR_ONLY,
-              "pre-only context level");
+              "front-only context level");
     }
     {   /* compiled grid, linear-only seam, no NR */
         SeRules u = {0, 16000, 512, 0, 0, AEC_CONTEXT_LINEAR_ONLY, 0};

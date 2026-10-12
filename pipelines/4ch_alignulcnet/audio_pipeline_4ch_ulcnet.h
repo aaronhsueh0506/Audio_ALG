@@ -167,7 +167,7 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * embed their own FFT scratch) and self grew the shared window table
  * (ulcnet_window) replacing the per-struct window copies.
  * v4 grows the self-resident core config with explicit delay controls and
- * the pre-only selector.
+ * the front-only selector.
  * v5 grows the self-resident UlcnetModel copy by the published model-I/O
  * descriptor pointer. v6 removes the obsolete runtime far-mode field.
  * v7 adds the identity-reprime counter to self.
@@ -188,7 +188,7 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * signal.
  * Version 12 carries the core's own layout 12 -> 13 (its control block gained
  * the per-hop stage-timing record). Nothing in THIS layer's carve changed;
- * the composed pre-only core sub-pool simply grew, and build_flags_hash
+ * the composed front-only core sub-pool simply grew, and build_flags_hash
  * cannot say so for the same carve-token reason as v9.
  * Version 13 carries the core's own layout 13 -> 14 (sizeof(Aec) grew: each
  * lane gained its per-hop stage-timing record). Same carve-token reason.
@@ -197,7 +197,7 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * state and census). Same carve-token reason. It also carries the lib/aec pin
  * that shipped with it: sizeof(Aec) grew 5832 -> 5848 B and the per-instance
  * pool grew by a per-grid constant, so the four lanes inside the composed
- * pre-only core sub-pool move this layer's total too. One release unit, one
+ * front-only core sub-pool move this layer's total too. One release unit, one
  * bump -- a version-13 descriptor is refused for either reason. */
 /* v15: the ULCNet deployment grid became a build parameter, so the
  * build-flags-hash token no longer spells it as a literal -- it folds in
@@ -207,7 +207,7 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * Version 16 carries the core's own layout 15 -> 16: FourAecNrResConfig
  * gained enable_nr. This wrapper embeds AudioPipeline4ChConfig by value in
  * its control block, so that struct grew 176 -> 180 B and every field after
- * it moved. The composed pre-only sub-pool is unchanged -- enable_post = 0
+ * it moved. The composed front-only sub-pool is unchanged -- enable_post = 0
  * already carves no NR state either way -- so the pool byte count alone
  * cannot say this happened, and a version-15 descriptor must be refused on
  * the counter. It is also a C struct-ABI change: a caller compiled against
@@ -221,11 +221,11 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * contract went from 2 hops to 1. */
 /* Version 18 carries the core's own layout 16 -> 17: FourAecNrResConfig
  * gained enable_near_end_protect and enable_res, which this wrapper rejects
- * unless 0. The pre-only sub-pool is unchanged, but AudioPipeline4ChConfig is
+ * unless 0. The front-only sub-pool is unchanged, but AudioPipeline4ChConfig is
  * embedded by value in the control block and grew, so a version-17 descriptor
  * must be refused on the counter. C struct-ABI change as well. */
 /* Version 19 carries the core's own layout 17 -> 18: FourAecNrResConfig lost
- * enable_near_end_protect. The pre-only sub-pool is unchanged; the embedded
+ * enable_near_end_protect. The front-only sub-pool is unchanged; the embedded
  * AudioPipeline4ChConfig shrank, so a version-18 descriptor must be refused on
  * the counter. C struct-ABI change as well. */
 #define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 19u
@@ -295,12 +295,12 @@ typedef struct AudioPipeline4ChUlcnet AudioPipeline4ChUlcnet;
  * this function returns, and is REJECTED otherwise rather than ignored:
  *
  *   core.enable_post  = 0
- *   core.enable_nr    = 0   (the core's own default is 1; the pre-only
+ *   core.enable_nr    = 0   (the core's own default is 1; the front-only
  *                       profile turns it off so the field states what is
  *                       true here rather than being left at a value that
  *                       could not take effect)
  *   core.enable_res   = 0   (same reason as enable_nr: the core's default is
- *                       1, the pre-only profile states what is true)
+ *                       1, the front-only profile states what is true)
  *   core.enable_cng   = 0
  *   core.legacy_amin  = 0
  *   core.nr_mode      = ANR_MODE_BALANCED   (the enum has no "disabled"

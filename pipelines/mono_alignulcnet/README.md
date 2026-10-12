@@ -33,6 +33,25 @@ Raw/aligned selection exists only in `sweep_delay_depth.py`, not in this
 runtime API. Export metadata requires the checkpoint and deployment contracts
 to both be raw far.
 
+## One hop in phases
+
+`audio_pipeline_ulcnet_process()` is the sequence below with the config's model
+callback. A board that runs the network itself (the NPU between `nn_begin` and
+`nn_end`) calls the phases directly and needs no `infer` callback:
+
+```c
+UlcnetNnJob job;
+audio_pipeline_ulcnet_process_begin(p, mic, ref);        /* AEC, both analyses */
+if (audio_pipeline_ulcnet_nn_begin(p, &job) > 0) {       /* 1 = a frame to run */
+    int rc = run_network(&job);                          /* write every bin of job.out_re/out_im */
+    audio_pipeline_ulcnet_nn_end(p, rc);                 /* accepted only if rc == 0 and finite */
+}
+audio_pipeline_ulcnet_process_end(p, out);               /* WOLA, one hop */
+```
+
+A frame left open or never fetched is the identity (fail-open); the reprime
+frame after an alignment boundary has no model frame (`nn_begin` returns 0).
+
 ## Delay profile
 
 The matched-filter bank size `n` is a product deployment decision, so it is a

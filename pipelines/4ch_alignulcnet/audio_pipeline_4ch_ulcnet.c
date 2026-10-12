@@ -212,7 +212,7 @@ AudioPipeline4ChConfig audio_pipeline_4ch_ulcnet_default_config(void) {
     AudioPipeline4ChConfig cfg =
         audio_pipeline_4ch_default_config(ULCNET_SR);
     cfg.core.fft_size = ULCNET_N_FFT;
-    /* Align-ULCNet REPLACES the post-beam RES/NR/CNG stage, so the pre-only
+    /* Align-ULCNet REPLACES the post-beam RES/NR/CNG stage, so the front-only
      * profile is what this function returns rather than something the wrapper
      * quietly rewrites afterwards. Every post-only core field must keep the
      * value set here; validate_config() rejects any other, so a caller who
@@ -450,7 +450,7 @@ static int derive_pipeline_layout(
     *cfg_forced = *cfg;
     cfg_forced->core.fft_size = ULCNET_N_FFT;
     /* enable_post is already 0: validate_config() refuses anything else, so
-     * the caller has declared the pre-only profile rather than had it
+     * the caller has declared the front-only profile rather than had it
      * rewritten underneath. Nothing to force here. */
     if (four_aec_nr_res_get_mem_requirements(
             &cfg_forced->core, core_req) != 0)

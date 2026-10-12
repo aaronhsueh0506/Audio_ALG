@@ -52,12 +52,12 @@ AEC／NR 直接 wrapper 僅保留給尚未過渡的既有呼叫端。
 | 16 kHz | 512 | 512 | 256 | 257 | 同上（可選） |
 | 48 kHz | 1024 | 1024 | 512 | 513 | 同上（唯一合法 48 kHz 格點） |
 
-呼叫端先用 `four_aec_nr_res_process_pre()` 取得 interleaved `[hop][4]`
-linear output 與 token，交由外部 SRP-PHAT/GSC 更新 channel-major
-`Complex[4][n_freqs]` 有效權重，再用同一 token 呼叫
-`four_aec_nr_res_process_post()` 取得 mono hop。模組不實作 beamformer，
-但會以該組權重一致地投影 error／near／echo／R2 context，再只執行一次
-NR、RES gain fusion 與 iFFT/OLA。
+呼叫端先用 `four_aec_front_process()` 取得借用的 `FourAecFront`
+（四路 linear 頻譜與時域 hop），交由外部 SRP-PHAT/GSC 更新 channel-major
+`Complex[4][n_freqs]` 有效權重，再呼叫 `four_aec_fuse()` 取得 `SeSpecFrame`。
+模組不實作 beamformer，但會以該組權重一致地投影 error／near／echo／R2 context；
+之後由應用明寫串接一次 RES 增益、一次 NR 增益、`sk_min_f32`、`sk_capply_gain_f32`、
+CNG 與 iFFT/OLA（完整 wrapper `AudioPipeline4Ch*` 已串好）。
 
 `FourAecNrRes*` core 本身不實作 beamformer；若要直接包入現有的第三方
 SRP-PHAT/GSC，使用 `AudioPipeline4Ch*`。完整 wrapper 的 AEC、DOA、GSC、
@@ -65,13 +65,13 @@ NR、RES 都繼承同一個格點，`frame == FFT`、`hop == frame/2`，不能�
 指定互相矛盾的 frame/hop/FFT。`audio_pipeline_4ch_*_size()` accessors 可
 分別查詢 main、DOA 與 GSC 實際格點；預設三組設定中三者必須一致。
 
-目前只允許一個 in-flight frame。建立方式比照 mono `AudioPipeline`：
+目前只允許一個 in-flight front frame（下一次 `four_aec_front_process()` 會使上一幀的視圖失效）。建立方式比照 mono `AudioPipeline`：
 
 - `four_aec_nr_res_create()`：desktop／測試用 heap convenience；
 - `four_aec_nr_res_get_mem_requirements()` →
   caller 配置 16-byte aligned pool →
   `four_aec_nr_res_init_ex()`：board/static 路徑；
-- 兩種建立方式共用完全相同的 `process_pre()`／`process_post()` 核心，
+- 兩種建立方式共用完全相同的 `four_aec_front_process()`／`four_aec_fuse()` 核心，
   process 不配置記憶體，16／48 kHz 皆有 byte-identical parity test。
 
 `four_aec_nr_res_destroy()` 對 static handle 不釋放 caller 的 pool；caller
