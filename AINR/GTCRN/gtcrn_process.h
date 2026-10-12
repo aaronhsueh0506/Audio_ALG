@@ -105,7 +105,7 @@ void gtcrn_model_state_reset(GTCRNModelState* state);
  * validation, modulo 2^32. 0 for NULL. */
 unsigned int gtcrn_model_state_generation(const GTCRNModelState* state);
 
-/* The three model-input frames from one analysis frame (model layout v5):
+/* The three model-input frames from one analysis frame:
  * [sqrt(re^2 + im^2 + 1e-12), re, im] each banded through the exported ERB
  * forward matrix -- low bins pass through, high bins compress to bands.
  * Everything fixed runs HERE in fp32; the quantized graph concatenates the
@@ -122,7 +122,7 @@ void gtcrn_model_input(const float spectrum[GTCRN_N_BINS][2],
                        float real_part[GTCRN_MODEL_ERB_BANDS],
                        float imag_part[GTCRN_MODEL_ERB_BANDS]);
 
-/* The fixed back end (model layout v5): expand the graph's ERB-domain
+/* The fixed back end: expand the graph's ERB-domain
  * complex mask through the caller-loaded inverse matrix (erb_inv.bin: raw
  * float32 little-endian, band-major
  * [GTCRN_MODEL_ERB_HIGH_BANDS][GTCRN_MODEL_ERB_HIGH_BINS]) and apply the

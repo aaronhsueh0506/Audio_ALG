@@ -76,8 +76,8 @@ INPUT_FRAMES = 3
 # this contract: runtimes bind by name.
 STATE_LAYOUT_VERSION = 8
 
-# Numbers no layout may claim again. Stated here rather than only in
-# dfn2_model_io.h so a bump onto one fails a test instead of a review.
+# Layout numbers that are never reused. test_dfn2_contract.py rejects a
+# STATE_LAYOUT_VERSION (and the header constant) that lands on one of them.
 RETIRED_LAYOUT_VERSIONS = frozenset({4, 5, 6, 7})
 
 # The stateful GRUs, in row order of the combined tensor. Names label the

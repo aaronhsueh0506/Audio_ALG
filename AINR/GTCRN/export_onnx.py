@@ -65,7 +65,8 @@ except ImportError:
 # tests/test_gtcrn_export_contract.py pins the two together.
 STATE_LAYOUT_VERSION = 8
 
-# Numbers no layout may claim again.
+# Layout numbers that are never reused. test_gtcrn_export_contract.py rejects
+# a STATE_LAYOUT_VERSION (and the header constant) that lands on one of them.
 RETIRED_LAYOUT_VERSIONS = frozenset({3, 4, 5, 6, 7})
 
 # Three separate ERB-domain feature inputs so the positive magnitude and the

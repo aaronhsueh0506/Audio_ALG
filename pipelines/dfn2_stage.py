@@ -189,9 +189,9 @@ class IdentityHeads:
 class Dfn2Heads:
     """The exported graph, stepped one frame at a time with explicit state.
 
-    Wraps ``export_onnx.StatelessDFN2Heads`` (the split, batch-one layout the
-    C binds) and owns the four state tensors the accelerator would carry.
-    A call commits the next state only when every head and every next-state
+    Wraps ``export_onnx.StatelessDFN2Heads`` (batch one, the graph the C binds)
+    and owns the two state tensors the accelerator would carry: ``h_gru`` and
+    ``df_convp_history``.  A call commits the next state only when every head and every next-state
     tensor is finite; otherwise it raises and leaves the state untouched, so
     the stage's fail-open path sees the same compose-path refusal as
     ``frame_commit``.
