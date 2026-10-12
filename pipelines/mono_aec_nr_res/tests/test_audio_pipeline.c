@@ -74,7 +74,6 @@
  *      each independently rejected; the pool remains usable afterward.
  */
 #include "audio_pipeline.h"
-#include "aec3_balanced_config.h"   /* AEC3B_SQRT2_SIN_LUT -- the comfort-noise table */
 #include "fft_wrapper.h"           /* test-side WOLA reference for the RES/NR bypass */
 
 #include <math.h>
@@ -84,6 +83,16 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdarg.h>
+
+/* sqrt(2)*sin(2*pi*i/32): the phase table aec_cng_fill indexes (aec_res.h). */
+static const float kCngTable[32] = {
+    0.0f, 0.27589938f, 0.541196108f, 0.785694957f, 1.0f, 1.17587554f,
+    1.30656302f, 1.3870399f, 1.41421354f, 1.3870399f, 1.30656302f,
+    1.17587554f, 1.0f, 0.785694957f, 0.541196108f, 0.27589938f,
+    1.73191212e-16f, -0.27589938f, -0.541196108f, -0.785694957f, -1.0f,
+    -1.17587554f, -1.30656302f, -1.3870399f, -1.41421354f, -1.3870399f,
+    -1.30656302f, -1.17587554f, -1.0f, -0.785694957f, -0.541196108f,
+    -0.27589938f};
 
 #define HOP_COUNT      1000   /* 8 kHz / 16 kHz */
 #define HOP_COUNT_48K   300   /* 48 kHz: filter_length/hop/n_freqs all scale up
@@ -953,7 +962,7 @@ static void test_stage_timing(void) {
 /* ---- comfort-noise contract ----------------------------------------------
  *
  * The pipeline fills AEC-suppressed bins from lib/aec's own comfort-noise
- * recipe: an LCG step per bin whose top five bits index AEC3B_SQRT2_SIN_LUT,
+ * recipe: an LCG step per bin whose top five bits index kCngTable,
  * the imaginary part reading a quarter turn (+8 of 32) ahead of the real one.
  * The three properties the injected noise is required to have -- bounded
  * samples, the same expected power as the unit-variance Gaussian pair the
@@ -974,8 +983,8 @@ static void test_comfort_noise_contract(void) {
     int i;
 
     for (i = 0; i < 32; i++) {
-        float v = AEC3B_SQRT2_SIN_LUT[i];
-        float q = AEC3B_SQRT2_SIN_LUT[(i + 8) & 31];
+        float v = kCngTable[i];
+        float q = kCngTable[(i + 8) & 31];
         double power = (double)v * v + (double)q * q;
         if (fabsf(v) > bound) bound = fabsf(v);
         sum += v;

@@ -8,7 +8,7 @@
 #include "4aec_nr_res.h"
 #include "4aec_nr_res_internal.h"
 #include "4aec_projection_kernels.h"
-#include "aec3_balanced_config.h"   /* AEC3B_SQRT2_SIN_LUT -- the comfort-noise table */
+#include "aec_res.h"
 #include "fft_wrapper.h"
 
 #include <float.h>
@@ -18,6 +18,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/* sqrt(2)*sin(2*pi*i/32): the phase table aec_cng_fill indexes (aec_res.h). */
+static const float kCngTable[32] = {
+    0.0f, 0.27589938f, 0.541196108f, 0.785694957f, 1.0f, 1.17587554f,
+    1.30656302f, 1.3870399f, 1.41421354f, 1.3870399f, 1.30656302f,
+    1.17587554f, 1.0f, 0.785694957f, 0.541196108f, 0.27589938f,
+    1.73191212e-16f, -0.27589938f, -0.541196108f, -0.785694957f, -1.0f,
+    -1.17587554f, -1.30656302f, -1.3870399f, -1.41421354f, -1.3870399f,
+    -1.30656302f, -1.17587554f, -1.0f, -0.785694957f, -0.541196108f,
+    -0.27589938f};
 
 static int failures = 0;
 
@@ -3076,6 +3086,44 @@ static void test_nr_bypass(void) {
     four_aec_nr_res_destroy(p);
 }
 
+/* The residual suppressor is one AecRes block carved from the core's pool:
+ * disabling it removes exactly that aligned block and adds the unity gain
+ * vector read in its place; with no post stage it is absent altogether. */
+static void test_res_sizing(void) {
+    static const int grids[3][2] = {{16000, 256}, {16000, 512}, {48000, 1024}};
+    int g;
+
+    for (g = 0; g < 3; ++g) {
+        FourAecNrResConfig on = four_aec_nr_res_default_config(grids[g][0]);
+        FourAecNrResConfig off = on;
+        FourAecNrResConfig pre_only = on;
+        FourAecNrResMemBreakdown on_mem, off_mem, pre_mem;
+        AecConfig aec_cfg;
+        size_t res_bytes, unity_bytes;
+
+        on.fft_size = off.fft_size = pre_only.fft_size = grids[g][1];
+        off.enable_res = 0;
+        pre_only.enable_post = 0;
+        aec_config_from_preset(&aec_cfg, AEC_PRESET_BALANCED, grids[g][0]);
+        aec_cfg.fft_size = grids[g][1];
+        res_bytes = aec_res_get_mem_size(&aec_cfg);
+
+        CHECK(four_aec_nr_res_get_mem_breakdown(&on, &on_mem) == 0 &&
+              four_aec_nr_res_get_mem_breakdown(&off, &off_mem) == 0 &&
+              four_aec_nr_res_get_mem_breakdown(&pre_only, &pre_mem) == 0 &&
+              res_bytes > 0,
+              "res sizing: the three configurations are sized");
+        unity_bytes = (((size_t)on_mem.n_freqs * sizeof(float)) + 15u) &
+                      ~(size_t)15u;
+        CHECK(on_mem.total_bytes - off_mem.total_bytes ==
+                  ((res_bytes + 15u) & ~(size_t)15u) - unity_bytes,
+              "res sizing: a RES-disabled core omits exactly the aligned "
+              "AecRes block and adds the unity gain vector");
+        CHECK(pre_mem.total_bytes < off_mem.total_bytes,
+              "res sizing: a pre-only core carries no post buffers");
+    }
+}
+
 /* One hop of the echo stimulus the bypass tests share: a far-end tone, its
  * half-level echo on every microphone, a weak near-end tone and a
  * deterministic broadband term so the denoiser has something to shape once
@@ -3408,7 +3456,7 @@ static void test_stage_timing(void) {
 }
 
 /* Comfort noise fills the AEC-suppressed bins from lib/aec's own recipe: an
- * LCG step per bin whose top five bits index AEC3B_SQRT2_SIN_LUT, the
+ * LCG step per bin whose top five bits index kCngTable, the
  * imaginary part reading a quarter turn (+8 of 32) ahead of the real one.
  * What the injected noise owes the caller is bounded samples, the same
  * expected per-bin power as the unit-variance Gaussian pair the recipe
@@ -3444,8 +3492,8 @@ static void test_comfort_noise_contract(void) {
     int finite = 1;
 
     for (i = 0; i < 32; ++i) {
-        float v = AEC3B_SQRT2_SIN_LUT[i];
-        float q = AEC3B_SQRT2_SIN_LUT[(i + 8) & 31];
+        float v = kCngTable[i];
+        float q = kCngTable[(i + 8) & 31];
         double power = (double)v * v + (double)q * q;
         if (fabsf(v) > bound) bound = fabsf(v);
         sum += v;
@@ -4031,6 +4079,7 @@ int main(void) {
     test_far_spec_provenance_guard();
     test_runtime_strength();
     test_nr_bypass();
+    test_res_sizing();
     test_nr_bypass_output_identity();
     test_res_bypass_passthrough();
     test_stage_timing();
