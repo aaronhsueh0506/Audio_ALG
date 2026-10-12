@@ -473,8 +473,9 @@ Conv has no activation, so its range comes from calibration. Existing
 calibration data and quantization results must be regenerated, the accelerator
 program recompiled, and the ONNX/JSON re-exported; the checkpoint and the
 dataset do not change. Checked on seeded random weights (no checkpoint exists
-for this model here): the new graph's mask and every state match the retired
-graph bit for bit.
+for this model here): the new graph's mask equals the retired
+graph's mask bit for bit, each new `*_out` equals the retired window extended by
+the new frame, and each retired `*_out` equals the new one without the dropped slot.
 
 CPU state storage is implemented by `ulcnet_model_io.c/.h`.  They use one
 caller-owned pool and allocate RAM according to D.  `prepare()` NaN-fills only

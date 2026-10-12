@@ -86,8 +86,8 @@ state shape 變了：K/V 是 <code>(1,32,D,TA)</code>、logit 是 <code>(1,32,5,
 <code>h_gru (1,4,1,128)</code>；<code>output</code> 元素數不變（2·K），所以版本號是唯一能攔下舊板綁新圖的閘門。
 修法只有「重新 export graph」：權重未變，checkpoint 與 dataset <b>不需要</b>重新訓練或重新生成；
 calibration 資料（state 輸入 shape 變了）與量化結果須重做、加速器程式重新編譯。
-以 seeded 隨機權重、D=4/8 的舊 trace 實測：新 graph 的 mask 與每個 state 對舊 trace 逐位元相同（最大絕對差 0），
-新 <code>*_out</code> 等於舊圖的 Concat 結果、舊 <code>*_out</code> 等於新 <code>*_out</code> 去掉被丟掉的那一格；
+以 seeded 隨機權重、D=4/8 的舊 trace 實測：新 graph 的 mask 對舊 trace 逐位元相同（最大絕對差 0），
+新 <code>*_out</code> 等於舊圖的 window 接上新一幀（Concat 結果）、舊 <code>*_out</code> 等於新 <code>*_out</code> 去掉被丟掉的那一格；
 真實 checkpoint 與板端量化尚未驗證。下一次真正 bump
 <code>ULCNET_MODEL_IO_LAYOUT_VERSION</code> 要跳到 19。</div>
 

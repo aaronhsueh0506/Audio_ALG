@@ -32,8 +32,8 @@ window：K/V 由 `[1,32,D-1,TA]` 變 `[1,32,D,TA]`、logit 由 `[1,32,4,D]` 變
 補救動作只有重新匯出 graph：checkpoint 與 dataset 都**不需要**重新訓練
 或重新生成——權重未變，exporter 會把 checkpoint 原本的 training
 `far_input_mode` 與固定的 aligned-far deployment 值分開寫入，兩者不需一致。
-以 seeded 隨機權重（D=4/8）對舊 trace 實測，新 graph 的 mask 與每個 state
-逐位元相同；真實 checkpoint 與板端量化尚未驗證。mask 是**新的量化目標**
+以 seeded 隨機權重（D=4/8）對舊 trace 實測，新 graph 的 mask 與舊圖逐位元相同，
+新 `*_out` 等於舊圖的 window 接上新一幀、舊 `*_out` 等於新 `*_out` 去掉被丟掉的那一格；真實 checkpoint 與板端量化尚未驗證。mask 是**新的量化目標**
 （`complex_mask` 1×1 Conv 無 activation，range 由 calibration 決定）：既有
 calibration 資料（state 輸入 shape 變了）與量化結果必須重做、加速器程式重新
 編譯。`ULCNET_MODEL_IO_LAYOUT_VERSION` 下一次真正 bump 要跳到 19。
