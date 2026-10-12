@@ -9,21 +9,20 @@ Export a batch graph::
 
     python3 inference_batch.py export \
         --model output/dfn2_best.pth --batch-size 4 \
-        --gru-state-layout combined \
         --output output/dfn2_stream_b4.onnx --verify
 
 Generate the matching ONNX graph and per-invocation calibration BIN files::
 
     python3 inference_batch.py calib \
         --model output/dfn2_best.pth --wav-dir /path/to/noisy_wavs \
-        --batch-size 4 --batches 1000 --gru-state-layout combined \
+        --batch-size 4 --batches 1000 \
         --format bin --output calib/dfn2_b4
 
 Every BIN file contains one complete NPU invocation, including all batch
 elements, and keeps the exact static shape declared by the ONNX input.  For
-example, combined GRU state uses ``(B, 5, 1, hidden)``.  ``--format npz`` is
-also supported.  The shipped C runtime remains a batch-one/split-state API;
-this tool is for NPU profiling and compiler evaluation.
+example, the GRU state uses ``(B, 5, 1, hidden)`` and the pathway window
+``(B, 64, 5, 96)``.  ``--format npz`` is also supported.  The shipped C runtime
+is a batch-one API; this tool is for NPU profiling and compiler evaluation.
 """
 
 import argparse
@@ -47,10 +46,7 @@ try:
     from .inference import load_model
     from .train import extract_dfn2_features
     from .export_onnx import (
-        COMBINED_GRU_STATE_NAME,
-        DEFAULT_GRU_STATE_LAYOUT,
-        GRU_STATE_LAYOUTS,
-        GRU_STATE_NAMES,
+        GRU_STATE_NAME,
         HEAD_OUTPUT_NAMES,
         INPUT_FRAMES,
         StatelessDFN2Heads,
@@ -69,10 +65,7 @@ except ImportError:  # direct ``python inference_batch.py`` execution
     from inference import load_model
     from train import extract_dfn2_features
     from export_onnx import (
-        COMBINED_GRU_STATE_NAME,
-        DEFAULT_GRU_STATE_LAYOUT,
-        GRU_STATE_LAYOUTS,
-        GRU_STATE_NAMES,
+        GRU_STATE_NAME,
         HEAD_OUTPUT_NAMES,
         INPUT_FRAMES,
         StatelessDFN2Heads,
@@ -108,22 +101,20 @@ def _tensor_stats(value):
     }
 
 
-def _merge_independent_samples(names, samples, combined):
+def _merge_independent_samples(names, samples):
     """Merge batch-one state snapshots into one fixed-batch invocation.
 
-    Feature tensors, convolution history, and combined state carry their
-    graph batch on axis 0.  Split GRU states stay in PyTorch's native
-    ``(layers, batch, hidden)`` order and therefore concatenate on axis 1.
+    Feature tensors, convolution windows and the combined GRU state all carry
+    their graph batch on axis 0.
     """
     if not samples:
         raise ValueError('cannot merge an empty batch')
     if any(len(sample) != len(names) for sample in samples):
         raise ValueError('sample tensor count disagrees with graph inputs')
     merged = []
-    for index, name in enumerate(names):
-        axis = 1 if not combined and name in GRU_STATE_NAMES else 0
+    for index, _name in enumerate(names):
         merged.append(torch.cat(
-            tuple(sample[index] for sample in samples), dim=axis
+            tuple(sample[index] for sample in samples), dim=0
         ))
     return tuple(merged)
 
@@ -156,11 +147,7 @@ def _wav_feature_stream(path, model, params):
 
 def _capture_fixed_batches(model, params, files, batch_wrapper, batches):
     """Capture valid state snapshots, then pack them into independent lanes."""
-    single = StatelessDFN2Heads(
-        model,
-        gru_state_layout=batch_wrapper.gru_state_layout,
-        batch_size=1,
-    ).eval()
+    single = StatelessDFN2Heads(model, batch_size=1).eval()
     names = batch_wrapper.input_names
     captured = {name: [] for name in names}
     pending = []
@@ -183,10 +170,7 @@ def _capture_fixed_batches(model, params, files, batch_wrapper, batches):
                 state = tuple(outputs[len(HEAD_OUTPUT_NAMES):])
                 used = True
                 if len(pending) == batch_wrapper.batch_size:
-                    merged = _merge_independent_samples(
-                        names, pending,
-                        batch_wrapper.gru_state_layout.combined,
-                    )
+                    merged = _merge_independent_samples(names, pending)
                     capture_calibration_inputs(captured, names, merged)
                     pending = []
                     if len(captured[names[0]]) >= batches:
@@ -211,11 +195,7 @@ def _load(args):
 
 def export_main(args):
     model, params = _load(args)
-    wrapper = StatelessDFN2Heads(
-        model,
-        gru_state_layout=args.gru_state_layout,
-        batch_size=args.batch_size,
-    ).eval()
+    wrapper = StatelessDFN2Heads(model, batch_size=args.batch_size).eval()
     export_graph(
         wrapper,
         params,
@@ -242,11 +222,7 @@ def calibration_main(args):
     random.Random(args.seed).shuffle(files)
 
     model, params = _load(args)
-    wrapper = StatelessDFN2Heads(
-        model,
-        gru_state_layout=args.gru_state_layout,
-        batch_size=args.batch_size,
-    ).eval()
+    wrapper = StatelessDFN2Heads(model, batch_size=args.batch_size).eval()
     onnx_path = sibling_onnx_path(args.output, args.onnx)
     graph_metadata = export_graph(
         wrapper,
@@ -266,8 +242,8 @@ def calibration_main(args):
         for name, values in captured.items()
     }
     report = {
-        'schema': 'dfn2-fixed-batch-stream-calibration-v1',
-        'gru_state_layout': graph_metadata['gru_state_layout'],
+        'schema': 'dfn2-fixed-batch-stream-calibration-v2',
+        'state_layout_version': graph_metadata['state_layout_version'],
         'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
         'graph': os.path.basename(onnx_path),
         'sample_rate': params['SR'],
@@ -289,12 +265,9 @@ def calibration_main(args):
         'inputs': {name: _tensor_stats(value)
                    for name, value in arrays.items()},
     }
-    if wrapper.gru_state_layout.combined:
-        report['gru_state_slices'] = gru_state_slice_report(
-            arrays[COMBINED_GRU_STATE_NAME],
-            _tensor_stats,
-            wrapper.gru_state_slices,
-        )
+    report['gru_state_slices'] = gru_state_slice_report(
+        arrays[GRU_STATE_NAME], _tensor_stats, wrapper.gru_state_slices,
+    )
     write_calibration_artifact(
         args.output, arrays, report, artifact_format
     )
@@ -310,10 +283,6 @@ def _common_parser(parser):
     parser.add_argument('--model', required=True)
     parser.add_argument('--batch-size', type=_positive_int, required=True)
     parser.add_argument('--opset', type=int, default=17)
-    parser.add_argument(
-        '--gru-state-layout', choices=sorted(GRU_STATE_LAYOUTS),
-        default=DEFAULT_GRU_STATE_LAYOUT,
-    )
 
 
 def cli():

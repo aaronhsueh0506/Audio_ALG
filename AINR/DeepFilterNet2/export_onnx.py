@@ -2,53 +2,33 @@
 """Export DFN2 heads as a stateless streaming ONNX graph.
 
 The accelerator owns no persistent state. Each invocation receives the three
-feature frames required by the input kernel, the GRU hidden state, and the
-four-frame causal history used by ``df_convp``. It emits the heads for the
-centre feature frame together with every updated state tensor.
+feature frames required by the input kernel, one combined recurrent-state
+tensor and the five-frame deep-filter pathway window. It emits the heads for
+the centre feature frame together with every updated state tensor.
 
 STFT, feature normalisation, the three-frame feature window, deep-filter
 composition and WOLA remain in the host C code.
 
-Recurrent-state layouts
------------------------
+State boundary
+--------------
 
-``--gru-state-layout`` selects how the five GRU hidden states are presented at
-the graph boundary. The graph maths is identical either way; only the boundary
-differs, and the exported metadata records which layout a file uses.
+Every state tensor is rank 4 and has the same shape at its input and at its
+``*_out`` output, so a runtime binds both to one address and the updated state
+is the next call's input with no copy (``state_binding`` in the metadata).
 
-``split`` (default, state layout version 5, the shipped contract)
-    One tensor per GRU in its native stacked form: ``h_encoder`` (1 layer),
-    ``h_erb`` (2) and ``h_df`` (2), each ``(layers, 1, hidden)``. This is
-    PyTorch's own hidden shape, and it matches ``DFN2ModelIOState``'s three
-    ``[layers][hidden]`` arrays one for one, so a runtime binds each tensor
-    to one contiguous field. It is what ``dfn2_model_io.h`` binds and what a
-    board runs.
+``h_gru`` ``(1, 5, 1, 256)``
+    The five GRU hidden rows in ``dfn2_model_io.h`` order: encoder (row 0),
+    ERB decoder (rows 1-2), deep-filter decoder (rows 3-4). Each GRU reads its
+    rows through a Slice on dim 1 of the graph input followed by a squeeze,
+    and the next state leaves as one Concat on dim 1. ONNX has no stacked GRU
+    op, so the two-layer stacks are still two GRU nodes each.
 
-    ONNX has no stacked GRU op, so each two-layer stack still becomes two GRU
-    nodes fed by per-layer Slices off its own input -- five GRU nodes in all.
-    The trade this layout makes is therefore per-GRU, not per-layer, PTQ
-    scales: the two layers of ``h_erb`` share one input tensor and one scale.
-    Layout version 3 bought per-layer scales instead, by cloning the stacks
-    into one-layer modules and publishing five tensors; this contract chooses
-    the native shape and the exact match to the C struct.
-
-``combined`` (state layout version 7, EXPERIMENTAL -- no C runtime binds it)
-    All three as one ``(1, 5, 1, hidden)`` tensor named ``h_gru``, ordered
-    encoder, erb, df -- ``DFN2ModelIOState``'s own memory order, since those
-    three arrays are adjacent and equally wide, so a runtime binds the
-    combined tensor to the same bytes with no gather.
-
-    It exists to answer one question with numbers instead of argument: what
-    does a single shared quantization scale cost? ``inference.py calib``
-    publishes that per GRU under ``gru_state_slices``. One caveat before
-    reading a verdict off it: the three states now reach their GRU nodes
-    through Slices off one input, so an integer compiler may assign all three
-    one scale -- which is precisely what the split layout keeps it from
-    doing.
-
-    Adopting it is a contract change, not a flag flip: it contradicts the
-    one-tensor-per-GRU naming convention, and ``dfn2_model_io.h``, its commit
-    API, the I/O tables and the C tests would all have to move with it.
+``df_convp_history`` ``(1, 64, 5, 96)``
+    The full causal window of the deep-filter pathway convolution. The graph
+    drops the oldest frame with a Slice on the input, concatenates the new
+    frame, convolves, and returns the whole concatenation as the next window.
+    The Slice is the only consumer of the input, has explicit integer bounds
+    and step 1, and no state output is produced by a Slice.
 
 Run from ``AINR/DeepFilterNet2``::
 
@@ -62,7 +42,7 @@ Generate deployment calibration beside this model with::
         --output calib/dfn2
 
 ``calib`` exports the graph itself, from the same model instance in the same
-process, so pass ``--gru-state-layout`` there rather than exporting twice.
+process.
 """
 
 import argparse
@@ -83,7 +63,10 @@ _AINR_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _AINR_ROOT not in sys.path:
     sys.path.insert(0, _AINR_ROOT)
 
-from onnx_streaming_contract import validate_nctf_no_temporal_padding
+from onnx_streaming_contract import (
+    validate_inplace_state_graph,
+    validate_nctf_no_temporal_padding,
+)
 
 INPUT_FRAMES = 3
 
@@ -91,104 +74,35 @@ INPUT_FRAMES = 3
 # which declares the caller-owned state struct this graph consumes and emits.
 # tests/test_dfn2_contract.py pins the two together. Tensor names are part of
 # this contract: runtimes bind by name.
-#
-# Version 3 published one tensor per recurrent LAYER, which needed the stacked
-# GRUs cloned into one-layer modules; version 5 publishes one tensor per GRU in
-# PyTorch's native stacked shape instead, which is also DFN2ModelIOState's own
-# layout. ONNX has no stacked GRU op, so a two-layer stack still traces to two
-# GRU nodes fed by per-layer Slices -- what moved is the PTQ scale, now one per
-# GRU rather than one per layer. Version 4 was burned by the layout below.
-STATE_LAYOUT_VERSION = 5
+STATE_LAYOUT_VERSION = 8
 
-# EXPERIMENTAL, no C implementation: the combined-GRU-state layout below
-# publishes a different state layout, so it must not claim version 5. Version 7
-# is reserved for it in dfn2_model_io.h so a later C-side bump cannot take the
-# same number. It exists to measure what a single recurrent tensor costs in PTQ
-# accuracy before the contract is committed to.
-COMBINED_STATE_LAYOUT_VERSION = 7
+# Numbers no layout may claim again. Stated here rather than only in
+# dfn2_model_io.h so a bump onto one fails a test instead of a review.
+RETIRED_LAYOUT_VERSIONS = frozenset({4, 5, 6, 7})
 
-# Numbers no layout may claim again. 4 was the first combined layout, published
-# before the split layout moved to per-GRU tensors; 6 was the combined
-# ``(5,1,hidden)`` layout. Graphs exist that carry both.
-# Stated here rather than only in dfn2_model_io.h's prose so a bump onto one
-# fails a test instead of a review.
-RETIRED_LAYOUT_VERSIONS = frozenset({4, 6})
-
-# One entry per GRU, not per layer: each is that GRU's native stacked hidden
-# ``(num_layers, 1, hidden)``, the shape PyTorch and DFN2ModelIOState both
-# already use. The deep-filter pathway history stays a separate cache in every
-# layout because it is one convolutional state with one distribution. See the
-# module docstring for what each layout trades.
+# The stateful GRUs, in row order of the combined tensor. Names label the
+# calibration slices; the graph itself publishes only GRU_STATE_NAME.
 GRU_STATE_NAMES = (
     'h_encoder',
     'h_erb',
     'h_df',
 )
 
-COMBINED_GRU_STATE_NAME = 'h_gru'
+GRU_STATE_NAME = 'h_gru'
+PATHWAY_STATE_NAME = 'df_convp_history'
 
 CONTENT_INPUT_NAMES = ('erb', 'spec')
 HEAD_OUTPUT_NAMES = ('erb_mask', 'df_coefs', 'df_alpha')
-PATHWAY_STATE_NAME = 'df_convp_history'
+STATE_NAMES = (GRU_STATE_NAME, PATHWAY_STATE_NAME)
 
+INPUT_NAMES = CONTENT_INPUT_NAMES + STATE_NAMES
+OUTPUT_NAMES = HEAD_OUTPUT_NAMES + tuple(name + '_out' for name in STATE_NAMES)
 
-class GruStateLayout(object):
-    """One way of presenting the recurrent state at the graph boundary.
+# Which output hands each state input back. Zipped, not indexed.
+STATE_HANDOFF = dict(zip(STATE_NAMES, OUTPUT_NAMES[len(HEAD_OUTPUT_NAMES):]))
 
-    A named layout rather than a boolean because a third one is already
-    foreseeable: DFN2's five hidden states happen to share a shape, so they
-    stack, but GTCRN's ten do not (six (1,1,16) plus four (1,33,8)), and a
-    rollout there needs a flatten or a per-group scheme rather than a second
-    boolean and a 2x2 of impossible states.
-
-    The layout owns its own version, so a name set and the version that
-    describes it cannot be passed separately and disagree.
-    """
-
-    def __init__(self, label, state_names, layout_version, combined):
-        self.label = label
-        self.state_names = state_names
-        self.layout_version = layout_version
-        self.combined = combined
-        state = state_names + (PATHWAY_STATE_NAME,)
-        self.input_names = CONTENT_INPUT_NAMES + state
-        self.output_names = HEAD_OUTPUT_NAMES + tuple(
-            name + '_out' for name in state
-        )
-
-    @property
-    def state_handoff(self):
-        """Which output hands each state input back. Zipped, not indexed."""
-        return dict(zip(
-            self.input_names[len(CONTENT_INPUT_NAMES):],
-            self.output_names[len(HEAD_OUTPUT_NAMES):],
-        ))
-
-
-GRU_STATE_LAYOUTS = {
-    'split': GruStateLayout(
-        'split', GRU_STATE_NAMES, STATE_LAYOUT_VERSION, combined=False),
-    'combined': GruStateLayout(
-        'combined', (COMBINED_GRU_STATE_NAME,),
-        COMBINED_STATE_LAYOUT_VERSION, combined=True),
-}
-
-DEFAULT_GRU_STATE_LAYOUT = 'split'
-
-
-def resolve_gru_state_layout(layout):
-    """Accept a layout, or its name, and return the layout."""
-    if isinstance(layout, GruStateLayout):
-        return layout
-    try:
-        return GRU_STATE_LAYOUTS[layout]
-    except KeyError:
-        raise ValueError('unknown gru_state_layout %r; expected one of %s'
-                         % (layout, sorted(GRU_STATE_LAYOUTS)))
-
-
-INPUT_NAMES = GRU_STATE_LAYOUTS[DEFAULT_GRU_STATE_LAYOUT].input_names
-OUTPUT_NAMES = GRU_STATE_LAYOUTS[DEFAULT_GRU_STATE_LAYOUT].output_names
+# Both state tensors are read and written at one address.
+STATE_BINDING = 'in_place_same_address'
 
 
 def _schema(names, tensors):
@@ -347,19 +261,24 @@ def _squeezed_gru(module, value, hidden):
     return value, hidden_next
 
 
-def _df_pathway_step(module, current, history):
-    """Run the causal kernel-5 DF residual and return its next history."""
+def _df_pathway_step(module, current, window):
+    """Run the causal kernel-5 DF residual and return its next window.
+
+    ``window`` is the previous call's full concatenation. Its oldest frame is
+    dropped by a Slice on the graph input with explicit integer bounds, the
+    new frame is appended, and the whole result is the next window.
+    """
     kernel = module.conv.kernel_size[0]
-    if history.shape[2] != kernel - 1:
+    if window.shape[2] != kernel:
         raise ValueError('df_convp_history has the wrong temporal depth')
-    combined = torch.cat((history, current), dim=2)
+    combined = torch.cat((window[:, :, 1:kernel], current), dim=2)
     output = module.conv(combined)
     output = module.pw(output)
     output = module.bn(output)
     output = module.act(output)
     if output.shape[2] != 1:
         raise RuntimeError('DF pathway did not emit one frame')
-    return output, combined[:, :, 1:]
+    return output, combined
 
 
 def feature_windows(feature):
@@ -386,8 +305,7 @@ class StatelessDFN2Heads(nn.Module):
     one; ``inference_batch.py`` uses larger values for NPU profiling.
     """
 
-    def __init__(self, model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT,
-                 batch_size=1):
+    def __init__(self, model, batch_size=1):
         super().__init__()
         self.model = model
         if isinstance(batch_size, bool) or not isinstance(batch_size, int):
@@ -395,11 +313,6 @@ class StatelessDFN2Heads(nn.Module):
         if batch_size <= 0:
             raise ValueError('batch_size must be positive')
         self.batch_size = batch_size
-        # The wrapper is the single source of truth for which recurrent-state
-        # layout this instance exports: every caller reads the layout back off
-        # it rather than re-deriving one, so a graph cannot be written with one
-        # layout and calibrated with the other.
-        self.gru_state_layout = resolve_gru_state_layout(gru_state_layout)
         if model.mask_lookahead != 1:
             raise ValueError(
                 'this three-frame export requires mask_lookahead=1'
@@ -411,61 +324,39 @@ class StatelessDFN2Heads(nn.Module):
         if model.df_dec.df_gru.gru.num_layers != 2:
             raise ValueError('this exporter requires two DF decoder GRU layers')
         self.gru_state_slices = gru_state_slices(model)
-        if self.gru_state_layout.combined:
-            # Checked here beside the other constructor preconditions, not at
-            # first use: a wrapper that cannot export must not construct.
-            widths = {gru.hidden_size for gru in _state_grus(model)}
-            if len(widths) != 1:
-                raise ValueError(
-                    'the combined recurrent state requires one hidden width '
-                    'for every GRU; got %s' % sorted(widths)
-                )
-            self.combined_gru_state_shape = (
-                self.batch_size,
-                sum(gru.num_layers for gru in _state_grus(model)),
-                1,
-                widths.pop(),
-            )
+        self.gru_state_shape = gru_state_shape(model, self.batch_size)
 
     @property
     def input_names(self):
-        return self.gru_state_layout.input_names
+        return INPUT_NAMES
 
     @property
     def output_names(self):
-        return self.gru_state_layout.output_names
+        return OUTPUT_NAMES
 
     @property
     def state_layout_version(self):
-        return self.gru_state_layout.layout_version
+        return STATE_LAYOUT_VERSION
 
     def initial_inputs(self):
-        """This instance's dummy inputs, in its own layout."""
-        return initial_inputs(
-            self.model, self.gru_state_layout, batch_size=self.batch_size
-        )
+        """This instance's dummy inputs."""
+        return initial_inputs(self.model, batch_size=self.batch_size)
 
-    def forward(self, feat_erb_window, feat_spec_window, *state):
-        if self.gru_state_layout.combined:
-            combined_hidden, df_convp_history = state
-            # Preserve the published batch-one graph exactly.  A profiling
-            # graph with B>1 uses (batch, layers, 1, hidden), whereas the
-            # existing B=1 ABI is also naturally read as
-            # (1, layers, gru_batch, hidden).
-            if self.batch_size == 1:
-                native_hidden = combined_hidden.squeeze(0)
-            else:
-                native_hidden = combined_hidden.squeeze(2).permute(1, 0, 2)
-            # One Slice per GRU off the shared input, in GRU_STATE_NAMES
-            # order. Views, not copies: each still arrives at its own GRU node
-            # carrying that GRU's whole stack.
+    def forward(self, feat_erb_window, feat_spec_window, gru_state,
+                df_convp_history):
+        # One Slice per GRU off the shared rank-4 input, on dim 1 (the layer
+        # axis), then the layer rows become nn.GRU's own (layers, batch,
+        # hidden). A profiling graph with B>1 carries the lanes on dim 0.
+        if self.batch_size == 1:
             encoder_gru_hidden, erb_gru_hidden, df_gru_hidden = (
-                native_hidden[start:stop]
+                gru_state[:, start:stop].squeeze(0)
                 for _name, start, stop in self.gru_state_slices
             )
         else:
-            (encoder_gru_hidden, erb_gru_hidden, df_gru_hidden,
-             df_convp_history) = state
+            encoder_gru_hidden, erb_gru_hidden, df_gru_hidden = (
+                gru_state[:, start:stop].squeeze(2).permute(1, 0, 2)
+                for _name, start, stop in self.gru_state_slices
+            )
         model = self.model
         enc = model.encoder
 
@@ -506,7 +397,7 @@ class StatelessDFN2Heads(nn.Module):
         )
         if decoder.df_skip is not None:
             df_value = df_value + decoder.df_skip(embedding)
-        c0_residual, pathway_history_next = _df_pathway_step(
+        c0_residual, pathway_window_next = _df_pathway_step(
             decoder.df_convp, c0, df_convp_history
         )
         c0_residual = c0_residual.permute(0, 2, 3, 1)
@@ -515,25 +406,20 @@ class StatelessDFN2Heads(nn.Module):
             batch, 1, decoder.df_bins, decoder.df_order * 2
         )
         coefficients = coefficients + c0_residual
-        hidden_next = (encoder_hidden_next, erb_hidden_next, df_hidden_next)
         heads = (erb_mask, coefficients, alpha)
-        if self.gru_state_layout.combined:
-            # Concatenated in the same order the input was sliced, which is
-            # also DFN2ModelIOState's memory order. Restore the graph batch
-            # dimension at the boundary.
-            if self.batch_size == 1:
-                combined_next = torch.cat(hidden_next, dim=0).reshape(
-                    self.combined_gru_state_shape
-                )
-            else:
-                combined_next = (
-                    torch.cat(hidden_next, dim=0)
-                    .permute(1, 0, 2)
-                    .unsqueeze(2)
-                    .reshape(self.combined_gru_state_shape)
-                )
-            return heads + (combined_next, pathway_history_next)
-        return heads + hidden_next + (pathway_history_next,)
+        hidden_next = (encoder_hidden_next, erb_hidden_next, df_hidden_next)
+        # Concatenated in the order the input was sliced, which is also
+        # DFN2ModelIOState's memory order.
+        if self.batch_size == 1:
+            gru_state_next = torch.cat(
+                [hidden.unsqueeze(0) for hidden in hidden_next], dim=1
+            )
+        else:
+            gru_state_next = torch.cat(
+                [hidden.permute(1, 0, 2).unsqueeze(2)
+                 for hidden in hidden_next], dim=1
+            )
+        return heads + (gru_state_next, pathway_window_next)
 
 
 def _state_grus(model):
@@ -560,46 +446,49 @@ def gru_state_slices(model):
     return tuple(slices)
 
 
-def _split_hidden_inputs(model, batch_size=1):
-    """One native stacked zero hidden per GRU, in GRU_STATE_NAMES order."""
-    return tuple(
-        torch.zeros(gru.num_layers, batch_size, gru.hidden_size)
-        for gru in _state_grus(model)
-    )
+def gru_state_shape(model, batch_size=1):
+    """Shape of the combined recurrent state: ``(B, layers, 1, hidden)``.
+
+    With one lane this is ``(1, layers, gru_batch, hidden)`` read the other
+    way round, so the batch-one tensor is nn.GRU's own hidden stack with a
+    leading singleton.
+    """
+    grus = _state_grus(model)
+    widths = {gru.hidden_size for gru in grus}
+    if len(widths) != 1:
+        raise ValueError(
+            'the combined recurrent state requires one hidden width '
+            'for every GRU; got %s' % sorted(widths)
+        )
+    return (batch_size, sum(gru.num_layers for gru in grus), 1,
+            widths.pop())
 
 
-def initial_inputs(model, gru_state_layout=DEFAULT_GRU_STATE_LAYOUT,
-                   batch_size=1):
+def initial_inputs(model, batch_size=1):
     if isinstance(batch_size, bool) or not isinstance(batch_size, int):
         raise TypeError('batch_size must be an integer')
     if batch_size <= 0:
         raise ValueError('batch_size must be positive')
     enc_ch = model.encoder.erb_conv0[1].out_channels
-    pathway_history = model.df_dec.df_convp.conv.kernel_size[0] - 1
-    hidden = _split_hidden_inputs(model, batch_size=batch_size)
-    if resolve_gru_state_layout(gru_state_layout).combined:
-        hidden = (
-            torch.cat(hidden, dim=0).permute(1, 0, 2).unsqueeze(2),
-        )
+    pathway_window = model.df_dec.df_convp.conv.kernel_size[0]
     return (
         torch.randn(batch_size, 1, INPUT_FRAMES, model.n_erb),
         torch.randn(batch_size, 2, INPUT_FRAMES, model.df_bins),
-        *hidden,
+        torch.zeros(gru_state_shape(model, batch_size)),
         torch.zeros(
-            batch_size, enc_ch, pathway_history, model.df_bins
+            batch_size, enc_ch, pathway_window, model.df_bins
         ),
     )
 
 
 def gru_state_slice_report(combined, stats, slices):
-    """What one shared PTQ scale costs each GRU of a combined state tensor.
+    """What the single shared PTQ scale of ``h_gru`` costs each GRU.
 
     ``combined`` is the captured
     ``(frames, graph_batch, layers, gru_batch, hidden)`` array,
     ``stats`` produces one per-tensor range dict and ``slices`` comes from
-    ``gru_state_slices``, so the per-slice entries are the same shape the
-    calibration report publishes for every other input -- in the split layout
-    those three entries exist already, and this restores them.
+    ``gru_state_slices``, so the per-slice entries have the same shape as
+    those the calibration report publishes for every other input.
 
     The bits figure is named for the policy it assumes. A symmetric max-abs
     int8 scale is set by the widest slice, so a narrower one keeps only
@@ -637,25 +526,17 @@ def gru_state_slice_report(combined, stats, slices):
     }
 
 
-def build_metadata(checkpoint_path, params, inputs, outputs,
-                   gru_state_layout=DEFAULT_GRU_STATE_LAYOUT):
+def build_metadata(checkpoint_path, params, inputs, outputs):
     """The exported graph's metadata.
 
     Separate from ``main`` so the contract test can compare
     ``state_layout_version`` against dfn2_model_io.h without an ONNX export.
-
-    Takes the layout, not its parts: names, version and label all come from
-    one object, so metadata that names ``h_gru`` while claiming the split
-    version -- exactly the lying descriptor dfn2_model_io.h's version check
-    exists to make a board refuse -- is unrepresentable.
     """
-    layout = resolve_gru_state_layout(gru_state_layout)
     return {
         'model_family': 'DeepFilterNet2',
         'checkpoint_sha256': file_sha256(checkpoint_path),
         'boundary': 'stateless_streaming_heads_explicit_state',
-        'state_layout_version': layout.layout_version,
-        'gru_state_layout': layout.label,
+        'state_layout_version': STATE_LAYOUT_VERSION,
         'sample_rate': params['SR'],
         'n_fft': params['N_FFT'],
         'win_len': params['WIN_LEN'],
@@ -669,11 +550,12 @@ def build_metadata(checkpoint_path, params, inputs, outputs,
         'frequency_padding_inside_graph': True,
         'accelerator_persistent_state': False,
         'host_updates_feature_window': True,
-        'state_handoff': layout.state_handoff,
+        'state_binding': STATE_BINDING,
+        'state_handoff': STATE_HANDOFF,
         'c_prepost': 'dfn2_process.c/dfn2_process.h',
         'c_model_io': 'dfn2_model_io.c/dfn2_model_io.h',
-        'input_schema': _schema(layout.input_names, inputs),
-        'output_schema': _schema(layout.output_names, outputs),
+        'input_schema': _schema(INPUT_NAMES, inputs),
+        'output_schema': _schema(OUTPUT_NAMES, outputs),
     }
 
 
@@ -685,9 +567,8 @@ def export_graph(wrapper, params, checkpoint_path, output_path,
     tensors and the graph they bind to always come from the same model
     instance in the same process.
     """
-    layout = wrapper.gru_state_layout
-    input_names = layout.input_names
-    output_names = layout.output_names
+    input_names = INPUT_NAMES
+    output_names = OUTPUT_NAMES
     inputs = wrapper.initial_inputs()
     with torch.no_grad():
         outputs = wrapper(*inputs)
@@ -707,11 +588,14 @@ def export_graph(wrapper, params, checkpoint_path, output_path,
     graph = onnx.shape_inference.infer_shapes(onnx.load(output_path))
     onnx.checker.check_model(graph)
     validate_nctf_no_temporal_padding(graph, require_static=verify)
-    metadata = build_metadata(checkpoint_path, params, inputs, outputs,
-                              gru_state_layout=layout)
+    metadata = build_metadata(checkpoint_path, params, inputs, outputs)
     set_onnx_metadata(graph, metadata)
     _pin_static_output_shapes(graph, output_names, outputs)
     graph = _resolve_internal_shapes(graph)
+    validate_inplace_state_graph(
+        graph, STATE_HANDOFF,
+        windows={PATHWAY_STATE_NAME: 2}, slices={GRU_STATE_NAME: 1},
+    )
     onnx.save(graph, output_path)
     with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as stream:
@@ -747,16 +631,6 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--opset', type=int, default=17)
     parser.add_argument('--verify', action='store_true')
-    parser.add_argument(
-        '--gru-state-layout', choices=sorted(GRU_STATE_LAYOUTS),
-        default=DEFAULT_GRU_STATE_LAYOUT,
-        help="'split' (default, layout version %d, the shipped contract) "
-             "exports one tensor per GRU in its native stacked shape; "
-             "'combined' (EXPERIMENTAL, layout version %d, no C runtime "
-             "binds it) exports all three as one (1,5,1,hidden) tensor, "
-             "so the three share one quantization scale. See the module "
-             "docstring for the trade."
-             % (STATE_LAYOUT_VERSION, COMBINED_STATE_LAYOUT_VERSION))
     args = parser.parse_args()
 
     try:
@@ -766,8 +640,7 @@ def main():
     model, params = load_model(SimpleNamespace(
         config=args.config, model=args.model
     ))
-    wrapper = StatelessDFN2Heads(
-        model, gru_state_layout=args.gru_state_layout).eval()
+    wrapper = StatelessDFN2Heads(model).eval()
     export_graph(wrapper, params, args.model, args.output,
                  opset=args.opset, verify=args.verify)
     print(args.output)

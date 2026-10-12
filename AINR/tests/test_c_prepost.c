@@ -226,187 +226,90 @@ static int test_dfn2_model_io(void)
           state.spec_window[1][2][9] == 2109.0f,
           "DFN2 complex model window preserves channel-major layout");
 
-    /* The accelerator writes the four recurrent arrays in place. */
-    memset(state.encoder_gru_hidden, 0x3c, sizeof(state.encoder_gru_hidden));
-    memset(state.erb_gru_hidden, 0x4d, sizeof(state.erb_gru_hidden));
-    memset(state.df_gru_hidden, 0x5e, sizeof(state.df_gru_hidden));
-    memset(state.df_convp_history, 0x6f, sizeof(state.df_convp_history));
+    CHECK(dfn2_model_io_state_generation(&state) == 1u &&
+          dfn2_model_io_state_generation(NULL) == 0u,
+          "DFN2 init starts the state generation at 1");
+    CHECK(DFN2_MODEL_GRU_ROW_ERB == DFN2_MODEL_GRU_ROW_ENCODER +
+              DFN2_MODEL_ENCODER_GRU_LAYERS &&
+          DFN2_MODEL_GRU_ROW_DF == DFN2_MODEL_GRU_ROW_ERB +
+              DFN2_MODEL_ERB_GRU_LAYERS &&
+          DFN2_MODEL_GRU_ROWS == DFN2_MODEL_GRU_ROW_DF +
+              DFN2_MODEL_DF_GRU_LAYERS &&
+          sizeof(state.gru_hidden) ==
+              (size_t)DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN *
+                  sizeof(float),
+          "DFN2 h_gru rows tile the three stacks in order");
+    CHECK(sizeof(state.df_convp_window) ==
+              (size_t)DFN2_MODEL_ENCODER_CHANNELS *
+                  DFN2_MODEL_DF_PATHWAY_WINDOW * DFN2_DF_BINS * sizeof(float),
+          "DFN2 pathway window is the full kernel depth");
+
+    /* The accelerator writes the two recurrent arrays in place. */
+    memset(state.gru_hidden, 0x3c, sizeof(state.gru_hidden));
+    memset(state.df_convp_window, 0x6f, sizeof(state.df_convp_window));
     healthy = state;
     CHECK(dfn2_model_io_validate_state(&state) == 0 &&
           memcmp(&state, &healthy, sizeof(state)) == 0,
           "DFN2 validating a finite state leaves every byte in place");
 
-    state.erb_gru_hidden[1][DFN2_MODEL_GRU_HIDDEN - 1] = NAN;
+    state.gru_hidden[DFN2_MODEL_GRU_ROW_ERB + 1][DFN2_MODEL_GRU_HIDDEN - 1] =
+        NAN;
     CHECK(dfn2_model_io_validate_state(&state) != 0,
           "DFN2 validate checks the second ERB stack layer");
-    CHECK(all_zero(&state.encoder_gru_hidden[0][0],
-                   DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN) &&
-          all_zero(&state.erb_gru_hidden[0][0],
-                   DFN2_MODEL_ERB_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN) &&
-          all_zero(&state.df_gru_hidden[0][0],
-                   DFN2_MODEL_DF_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN) &&
-          all_zero(&state.df_convp_history[0][0][0],
+    CHECK(all_zero(&state.gru_hidden[0][0],
+                   (size_t)DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN) &&
+          all_zero(&state.df_convp_window[0][0][0],
                    (size_t)DFN2_MODEL_ENCODER_CHANNELS *
-                       DFN2_MODEL_DF_PATHWAY_HISTORY * DFN2_DF_BINS),
-          "DFN2 non-finite state zeroes all four recurrent arrays");
+                       DFN2_MODEL_DF_PATHWAY_WINDOW * DFN2_DF_BINS),
+          "DFN2 non-finite state zeroes both recurrent arrays");
     CHECK(memcmp(state.erb_window, healthy.erb_window,
                  sizeof(state.erb_window)) == 0 &&
           memcmp(state.spec_window, healthy.spec_window,
                  sizeof(state.spec_window)) == 0 &&
           state.feature_frames_seen == healthy.feature_frames_seen,
           "DFN2 state refusal leaves the feature windows and counter alone");
+    CHECK(dfn2_model_io_state_generation(&state) ==
+              healthy.state_generation + 1u,
+          "DFN2 a refused validation advances the state generation once");
 
     state = healthy;
-    state.df_convp_history[DFN2_MODEL_ENCODER_CHANNELS - 1]
-                          [DFN2_MODEL_DF_PATHWAY_HISTORY - 1]
-                          [DFN2_DF_BINS - 1] = INFINITY;
+    state.df_convp_window[DFN2_MODEL_ENCODER_CHANNELS - 1]
+                         [DFN2_MODEL_DF_PATHWAY_WINDOW - 1]
+                         [DFN2_DF_BINS - 1] = INFINITY;
     CHECK(dfn2_model_io_validate_state(&state) != 0 &&
-          all_zero(&state.encoder_gru_hidden[0][0],
-                   DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN),
-          "DFN2 refuses a non-finite pathway history and zeroes the batch");
+          all_zero(&state.gru_hidden[0][0],
+                   (size_t)DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN),
+          "DFN2 refuses a non-finite pathway window and zeroes the batch");
 
     CHECK(dfn2_model_io_validate_state(NULL) != 0,
           "DFN2 validate refuses a null state");
     state = healthy;
-    CHECK(dfn2_model_io_validate_arrays(NULL, state.erb_gru_hidden,
-                                        state.df_gru_hidden,
-                                        state.df_convp_history) != 0 &&
-          dfn2_model_io_validate_arrays(state.encoder_gru_hidden,
-                                        state.erb_gru_hidden,
-                                        state.df_gru_hidden, NULL) != 0 &&
+    CHECK(dfn2_model_io_validate_arrays(NULL, state.df_convp_window) != 0 &&
+          dfn2_model_io_validate_arrays(state.gru_hidden, NULL) != 0 &&
           memcmp(&state, &healthy, sizeof(state)) == 0,
           "DFN2 validate_arrays refuses a null array and touches nothing");
-    CHECK(dfn2_model_io_validate_arrays(state.encoder_gru_hidden,
-                                        state.erb_gru_hidden,
-                                        state.df_gru_hidden,
-                                        state.df_convp_history) == 0,
+    CHECK(dfn2_model_io_validate_arrays(state.gru_hidden,
+                                        state.df_convp_window) == 0,
           "DFN2 validate_arrays accepts finite arrays");
 
-    /* Copy path: the runtime wrote its *_next tensors into its own buffers. */
-    {
-        static DFN2ModelIOState runtime;
-        static DFN2ModelIOState before;
-        const size_t convp_count = (size_t)DFN2_MODEL_ENCODER_CHANNELS *
-                                   DFN2_MODEL_DF_PATHWAY_HISTORY * DFN2_DF_BINS;
-
-        memset(runtime.encoder_gru_hidden, 0x11,
-               sizeof(runtime.encoder_gru_hidden));
-        memset(runtime.erb_gru_hidden, 0x22, sizeof(runtime.erb_gru_hidden));
-        memset(runtime.df_gru_hidden, 0x33, sizeof(runtime.df_gru_hidden));
-        memset(runtime.df_convp_history, 0x44,
-               sizeof(runtime.df_convp_history));
-
-        state = healthy;
-        CHECK(dfn2_model_io_inherit_state(
-                  &state, runtime.encoder_gru_hidden, runtime.erb_gru_hidden,
-                  runtime.df_gru_hidden, runtime.df_convp_history) == 0 &&
-              memcmp(state.encoder_gru_hidden, runtime.encoder_gru_hidden,
-                     sizeof(state.encoder_gru_hidden)) == 0 &&
-              memcmp(state.erb_gru_hidden, runtime.erb_gru_hidden,
-                     sizeof(state.erb_gru_hidden)) == 0 &&
-              memcmp(state.df_gru_hidden, runtime.df_gru_hidden,
-                     sizeof(state.df_gru_hidden)) == 0 &&
-              memcmp(state.df_convp_history, runtime.df_convp_history,
-                     sizeof(state.df_convp_history)) == 0,
-              "DFN2 inherit_state copies all four recurrent arrays");
-        CHECK(memcmp(state.erb_window, healthy.erb_window,
-                     sizeof(state.erb_window)) == 0 &&
-              memcmp(state.spec_window, healthy.spec_window,
-                     sizeof(state.spec_window)) == 0 &&
-              state.feature_frames_seen == healthy.feature_frames_seen,
-              "DFN2 inherit_state leaves the feature windows and counter alone");
-
-        /* One non-finite element in any one source copies nothing, including
-         * the arrays that precede it, and leaves the state intact. */
-        for (int which = 0; which < 4; ++which) {
-            float* poison =
-                which == 0 ? &runtime.encoder_gru_hidden[0][5] :
-                which == 1 ? &runtime.erb_gru_hidden[1][0] :
-                which == 2 ? &runtime.df_gru_hidden[1][DFN2_MODEL_GRU_HIDDEN - 1] :
-                             &runtime.df_convp_history
-                                   [DFN2_MODEL_ENCODER_CHANNELS - 1]
-                                   [DFN2_MODEL_DF_PATHWAY_HISTORY - 1]
-                                   [DFN2_DF_BINS - 1];
-            const float saved = *poison;
-            state = healthy;
-            before = state;
-            *poison = (which & 1) ? INFINITY : NAN;
-            CHECK(dfn2_model_io_inherit_state(
-                      &state, runtime.encoder_gru_hidden,
-                      runtime.erb_gru_hidden, runtime.df_gru_hidden,
-                      runtime.df_convp_history) == -1 &&
-                  memcmp(&state, &before, sizeof(state)) == 0,
-                  "DFN2 inherit_state refuses a non-finite source and copies nothing");
-            CHECK(dfn2_model_io_inherit_arrays(
-                      state.encoder_gru_hidden, state.erb_gru_hidden,
-                      state.df_gru_hidden, state.df_convp_history,
-                      runtime.encoder_gru_hidden, runtime.erb_gru_hidden,
-                      runtime.df_gru_hidden, runtime.df_convp_history) == -1 &&
-                  memcmp(&state, &before, sizeof(state)) == 0,
-                  "DFN2 inherit_arrays refuses a non-finite source and copies nothing");
-            *poison = saved;
-        }
-
-        /* Sources at the destination's own address were written in place:
-         * skipped, never copied onto themselves, never checked here. */
-        state = healthy;
-        before = state;
-        CHECK(dfn2_model_io_inherit_state(
-                  &state, state.encoder_gru_hidden, state.erb_gru_hidden,
-                  state.df_gru_hidden, state.df_convp_history) == 0 &&
-              memcmp(&state, &before, sizeof(state)) == 0,
-              "DFN2 inherit_state with every source aliased is a no-op");
-        state.df_gru_hidden[0][3] = NAN;
-        before = state;
-        CHECK(dfn2_model_io_inherit_state(
-                  &state, state.encoder_gru_hidden, state.erb_gru_hidden,
-                  state.df_gru_hidden, state.df_convp_history) == 0 &&
-              memcmp(&state, &before, sizeof(state)) == 0 &&
-              dfn2_model_io_validate_state(&state) == -1,
-              "DFN2 inherit leaves an in-place value to validate_state");
-
-        /* Mixed binding: only the tensors that moved are copied. */
-        state = healthy;
-        CHECK(dfn2_model_io_inherit_arrays(
-                  state.encoder_gru_hidden, state.erb_gru_hidden,
-                  state.df_gru_hidden, state.df_convp_history,
-                  state.encoder_gru_hidden, runtime.erb_gru_hidden,
-                  state.df_gru_hidden, runtime.df_convp_history) == 0 &&
-              memcmp(state.encoder_gru_hidden, healthy.encoder_gru_hidden,
-                     sizeof(state.encoder_gru_hidden)) == 0 &&
-              memcmp(state.erb_gru_hidden, runtime.erb_gru_hidden,
-                     sizeof(state.erb_gru_hidden)) == 0 &&
-              memcmp(state.df_gru_hidden, healthy.df_gru_hidden,
-                     sizeof(state.df_gru_hidden)) == 0 &&
-              memcmp(state.df_convp_history, runtime.df_convp_history,
-                     convp_count * sizeof(float)) == 0,
-              "DFN2 inherit_arrays copies only the arrays that moved");
-
-        /* NULL anywhere is refused and touches nothing. */
-        state = healthy;
-        before = state;
-        CHECK(dfn2_model_io_inherit_state(
-                  NULL, runtime.encoder_gru_hidden, runtime.erb_gru_hidden,
-                  runtime.df_gru_hidden, runtime.df_convp_history) == -1 &&
-              dfn2_model_io_inherit_state(
-                  &state, NULL, runtime.erb_gru_hidden,
-                  runtime.df_gru_hidden, runtime.df_convp_history) == -1 &&
-              dfn2_model_io_inherit_state(
-                  &state, runtime.encoder_gru_hidden, runtime.erb_gru_hidden,
-                  runtime.df_gru_hidden, NULL) == -1 &&
-              dfn2_model_io_inherit_arrays(
-                  NULL, state.erb_gru_hidden, state.df_gru_hidden,
-                  state.df_convp_history, runtime.encoder_gru_hidden,
-                  runtime.erb_gru_hidden, runtime.df_gru_hidden,
-                  runtime.df_convp_history) == -1 &&
-              dfn2_model_io_inherit_arrays(
-                  state.encoder_gru_hidden, state.erb_gru_hidden,
-                  state.df_gru_hidden, NULL, runtime.encoder_gru_hidden,
-                  runtime.erb_gru_hidden, runtime.df_gru_hidden,
-                  runtime.df_convp_history) == -1 &&
-              memcmp(&state, &before, sizeof(state)) == 0,
-              "DFN2 inherit refuses a NULL argument and touches nothing");
-    }
+    /* reset and zero_recurrent each advance the generation exactly once. */
+    state = healthy;
+    dfn2_model_io_zero_recurrent(&state);
+    CHECK(all_zero(&state.gru_hidden[0][0],
+                   (size_t)DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN) &&
+          memcmp(state.erb_window, healthy.erb_window,
+                 sizeof(state.erb_window)) == 0 &&
+          state.state_generation == healthy.state_generation + 1u,
+          "DFN2 zero_recurrent clears the recurrent arrays and counts");
+    state = healthy;
+    dfn2_model_io_reset(&state);
+    CHECK(all_zero(&state.erb_window[0][0],
+                   (size_t)DFN2_MODEL_INPUT_FRAMES * DFN2_N_ERB) &&
+          state.feature_frames_seen == 0u &&
+          state.state_generation == healthy.state_generation + 1u,
+          "DFN2 reset returns to init values and counts");
+    dfn2_model_io_reset(NULL);
+    dfn2_model_io_zero_recurrent(NULL);
     return 1;
 }
 

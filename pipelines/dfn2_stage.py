@@ -27,9 +27,8 @@ head or next-state tensor, takes the compose path of ``dfn2_prepost_frame_skip``
 unit ERB mask, zero taps, alpha 0 (an exact identity through the cascade,
 because ``erb_inv`` is a partition of unity), framing and compose clocks
 advanced.  The recurrent state is NOT stepped here.  In the C class a refused
-inherit on the copy path leaves the state intact, as here; on the in-place path
-a refused commit zeroes it, which this reference, with its separate state input
-and output, does not reproduce.
+commit zeroes the state in place, which this reference, with its separate state
+input and output, does not reproduce.
 
 The compose arithmetic keeps real and imaginary parts as separate float32
 arrays and performs every multiply and add as its own numpy operation, so the

@@ -214,10 +214,7 @@ def calibration_main():
     )
     try:
         from .export_onnx import (
-            COMBINED_GRU_STATE_NAME,
-            DEFAULT_GRU_STATE_LAYOUT,
-            GRU_STATE_LAYOUTS,
-            GRU_STATE_NAMES,
+            GRU_STATE_NAME,
             HEAD_OUTPUT_NAMES,
             INPUT_FRAMES,
             StatelessDFN2Heads,
@@ -227,10 +224,7 @@ def calibration_main():
         )
     except ImportError:
         from export_onnx import (
-            COMBINED_GRU_STATE_NAME,
-            DEFAULT_GRU_STATE_LAYOUT,
-            GRU_STATE_LAYOUTS,
-            GRU_STATE_NAMES,
+            GRU_STATE_NAME,
             HEAD_OUTPUT_NAMES,
             INPUT_FRAMES,
             StatelessDFN2Heads,
@@ -253,11 +247,6 @@ def calibration_main():
     parser.add_argument('--onnx', default=None,
                         help='where to write the graph these tensors bind to '
                              '(default: <output>.onnx)')
-    parser.add_argument(
-        '--gru-state-layout', choices=sorted(GRU_STATE_LAYOUTS),
-        default=DEFAULT_GRU_STATE_LAYOUT,
-        help='recurrent-state layout for the graph exported beside these '
-             'tensors; see export_onnx.py --gru-state-layout')
     args = parser.parse_args()
     if args.frames <= 0:
         parser.error('--frames must be positive')
@@ -278,13 +267,10 @@ def calibration_main():
     model, params = load_model(SimpleNamespace(
         config=args.config, model=args.model
     ))
-    wrapper = StatelessDFN2Heads(
-        model, gru_state_layout=args.gru_state_layout).eval()
+    wrapper = StatelessDFN2Heads(model).eval()
     # The graph is exported (and parity-checked) in the same process, from the
     # same model instance the tensors below are recorded against, so the two
-    # deployment artifacts cannot drift apart. The recurrent-state layout comes
-    # off that same wrapper below, so the recorded tensor set is the graph's
-    # input set by construction rather than by a second reading of the flag.
+    # deployment artifacts cannot drift apart.
     onnx_path = sibling_onnx_path(args.output, args.onnx)
     graph_metadata = export_graph(wrapper, params, args.model, onnx_path,
                                   verify=True)
@@ -355,11 +341,9 @@ def calibration_main():
 
     report = {
         # The report FORMAT version, deliberately not the graph's state
-        # layout version: the two are independent axes elsewhere in this repo
-        # (GTCRN is layout 6 / schema v2, ULCNet layout 5 / schema v1), and
-        # the layout is already published on its own line below.
-        'schema': 'dfn2-stateless-stream-calibration-v3',
-        'gru_state_layout': graph_metadata['gru_state_layout'],
+        # layout version; the layout is published on its own line below.
+        'schema': 'dfn2-stateless-stream-calibration-v4',
+        'state_layout_version': graph_metadata['state_layout_version'],
         'checkpoint_sha256': graph_metadata['checkpoint_sha256'],
         'graph': os.path.basename(onnx_path),
         'sample_rate': params['SR'],
@@ -372,22 +356,18 @@ def calibration_main():
         'source_files': source_files,
         'inputs': {name: _stats(value) for name, value in arrays.items()},
     }
-    if wrapper.gru_state_layout.combined:
-        report['gru_state_slices'] = gru_state_slice_report(
-            arrays[COMBINED_GRU_STATE_NAME], _stats,
-            wrapper.gru_state_slices,
-        )
+    report['gru_state_slices'] = gru_state_slice_report(
+        arrays[GRU_STATE_NAME], _stats, wrapper.gru_state_slices,
+    )
 
     write_calibration_artifact(
         args.output, arrays, report, artifact_format
     )
     print('%s: %d streaming frames, graph %s' %
           (args.output, report['frames'], onnx_path))
-    if wrapper.gru_state_layout.combined:
-        worst = report['gru_state_slices']['worst_bits_lost']
-        print('combined GRU state: one symmetric max-abs int8 scale costs '
-              'the narrowest layer %s bits'
-              % ('%.2f' % worst if worst is not None else 'n/a'))
+    worst = report['gru_state_slices']['worst_bits_lost']
+    print('h_gru: one symmetric max-abs int8 scale costs the narrowest GRU '
+          '%s bits' % ('%.2f' % worst if worst is not None else 'n/a'))
 
 
 def cli():

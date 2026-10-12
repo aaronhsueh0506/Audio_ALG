@@ -37,7 +37,7 @@ extern "C" {
 #endif
 
 #define MONO_AEC_DFN_RES_DESCRIPTOR_VERSION 1u
-#define MONO_AEC_DFN_RES_LAYOUT_VERSION 1u
+#define MONO_AEC_DFN_RES_LAYOUT_VERSION 2u
 
 /* `host` is the conventional pipeline's own config, validated by it. This
  * wrapper only pins the invariants the seam needs: sample_rate 8000, 16000

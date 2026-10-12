@@ -58,9 +58,9 @@ struct DFN2Prepost {
     float *out_hop;     /* [DFN2_HOP_LEN], DFN2_IO_TIME only                */
 
     /* Accelerator-writable boundary: the three heads. The recurrent state is
-     * DFN2ModelIOState's own four arrays, one buffer each, at addresses that
-     * never change: a runtime either writes its state outputs to the same
-     * addresses or hands them over through dfn2_prepost_outputs_inherit(). */
+     * DFN2ModelIOState's own two arrays, one buffer each, at addresses that
+     * never change: a runtime writes its state outputs to the same addresses
+     * as the matching inputs. */
     float *head_erb_mask;   /* [DFN2_N_ERB]                                 */
     float *head_coefs;      /* [DFN2_PREPOST_COEFS_ELEMENTS]                */
     float *head_alpha;      /* [1]                                          */
@@ -138,7 +138,8 @@ static uint32_t pp_build_hash(int io_mode) {
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_INPUT_FRAMES);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_GRU_HIDDEN);
     h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_ENCODER_CHANNELS);
-    h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_DF_PATHWAY_HISTORY);
+    h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_GRU_ROWS);
+    h = pp_fnv1a_u32(h, (uint32_t)DFN2_MODEL_DF_PATHWAY_WINDOW);
     h = pp_fnv1a_str(h, DFN2_FEATURE_VERSION);
     h = pp_fnv1a_u32(h, (uint32_t)io_mode);
     return h;
@@ -272,7 +273,7 @@ static void pp_reset_states(DFN2Prepost *p) {
                (size_t)DFN2_WIN_LEN * sizeof(float));
     }
     dfn2_set_erb_matrices(p->dsp, p->erb_fwd, p->erb_inv);
-    dfn2_model_io_init(p->io);
+    dfn2_model_io_reset(p->io);
 }
 
 /* Per-hop bookkeeping only. The staging buffers are deliberately NOT
@@ -386,6 +387,10 @@ void dfn2_prepost_reset(DFN2Prepost *p) {
     p->output_frame = -1;
 }
 
+unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p) {
+    return p ? dfn2_model_io_state_generation(p->io) : 0u;
+}
+
 /* ---- accessors ------------------------------------------------------- */
 
 int dfn2_prepost_hop_size(const DFN2Prepost *p) {
@@ -444,13 +449,6 @@ static int pp_all_finite(const float *values, size_t count) {
 
 static void pp_fill_nan(float *values, size_t count) {
     skn_fill_f32(values, count, (float)NAN);
-}
-
-static void pp_zero_state(DFN2Prepost *p) {
-    memset(p->io->encoder_gru_hidden, 0, sizeof(p->io->encoder_gru_hidden));
-    memset(p->io->erb_gru_hidden, 0, sizeof(p->io->erb_gru_hidden));
-    memset(p->io->df_gru_hidden, 0, sizeof(p->io->df_gru_hidden));
-    memset(p->io->df_convp_history, 0, sizeof(p->io->df_convp_history));
 }
 
 /* Features, graph window, compose clock. Shared by every pre_process entry
@@ -540,22 +538,15 @@ int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
     inputs->spec_window =
         (const float (*)[DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS])
             p->io->spec_window;
-    inputs->encoder_gru_hidden =
-        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->encoder_gru_hidden;
-    inputs->erb_gru_hidden =
-        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->erb_gru_hidden;
-    inputs->df_gru_hidden =
-        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->df_gru_hidden;
-    inputs->df_convp_history =
-        (const float (*)[DFN2_MODEL_DF_PATHWAY_HISTORY][DFN2_DF_BINS])
-            p->io->df_convp_history;
+    inputs->gru_hidden =
+        (const float (*)[DFN2_MODEL_GRU_HIDDEN])p->io->gru_hidden;
+    inputs->df_convp_window =
+        (const float (*)[DFN2_MODEL_DF_PATHWAY_WINDOW][DFN2_DF_BINS])
+            p->io->df_convp_window;
     inputs->erb_window_elements = DFN2_PREPOST_ERB_WINDOW_ELEMENTS;
     inputs->spec_window_elements = DFN2_PREPOST_SPEC_WINDOW_ELEMENTS;
-    inputs->encoder_gru_hidden_elements =
-        DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS;
-    inputs->erb_gru_hidden_elements = DFN2_PREPOST_ERB_HIDDEN_ELEMENTS;
-    inputs->df_gru_hidden_elements = DFN2_PREPOST_DF_HIDDEN_ELEMENTS;
-    inputs->df_convp_history_elements = DFN2_PREPOST_CONVP_HISTORY_ELEMENTS;
+    inputs->gru_hidden_elements = DFN2_PREPOST_GRU_HIDDEN_ELEMENTS;
+    inputs->df_convp_window_elements = DFN2_PREPOST_CONVP_WINDOW_ELEMENTS;
 
     /* NaN-fill the three heads, so a caller that asks twice still gets a
      * clean boundary rather than a half-written one, and so a partial
@@ -570,18 +561,13 @@ int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
     outputs->erb_mask = p->head_erb_mask;
     outputs->coefs = p->head_coefs;
     outputs->alpha = p->head_alpha;
-    outputs->encoder_gru_hidden_next = p->io->encoder_gru_hidden;
-    outputs->erb_gru_hidden_next = p->io->erb_gru_hidden;
-    outputs->df_gru_hidden_next = p->io->df_gru_hidden;
-    outputs->df_convp_history_next = p->io->df_convp_history;
+    outputs->gru_hidden_next = p->io->gru_hidden;
+    outputs->df_convp_window_next = p->io->df_convp_window;
     outputs->erb_mask_elements = DFN2_PREPOST_ERB_MASK_ELEMENTS;
     outputs->coefs_elements = DFN2_PREPOST_COEFS_ELEMENTS;
     outputs->alpha_elements = DFN2_PREPOST_ALPHA_ELEMENTS;
-    outputs->encoder_gru_hidden_elements =
-        DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS;
-    outputs->erb_gru_hidden_elements = DFN2_PREPOST_ERB_HIDDEN_ELEMENTS;
-    outputs->df_gru_hidden_elements = DFN2_PREPOST_DF_HIDDEN_ELEMENTS;
-    outputs->df_convp_history_elements = DFN2_PREPOST_CONVP_HISTORY_ELEMENTS;
+    outputs->gru_hidden_elements = DFN2_PREPOST_GRU_HIDDEN_ELEMENTS;
+    outputs->df_convp_window_elements = DFN2_PREPOST_CONVP_WINDOW_ELEMENTS;
     p->prepared = 1;
     return 0;
 }
@@ -622,20 +608,24 @@ static int pp_close_frame(DFN2Prepost *p, const float *erb_mask,
 
 int dfn2_prepost_frame_commit(DFN2Prepost *p) {
     int heads_finite;
+    int state_finite;
     if (!p || !p->prepared) return -1;   /* prepared implies frame_open */
 
-    /* On the in-place path the accelerator overwrote the recurrent state, so
-     * there is nothing to roll back to: a non-finite head or state element
-     * zeroes the four recurrent tensors, disarms the transaction and leaves
-     * the frame open, and the caller either takes frame_skip() or re-runs the
-     * accelerator through a fresh frame_inputs(). Windows, compose state and
-     * clocks are not touched. */
+    /* The accelerator overwrote the recurrent state in place, so there is
+     * nothing to roll back to: a non-finite head or state element zeroes the
+     * two recurrent tensors, advances the state generation, disarms the
+     * transaction and leaves the frame open, and the caller either takes
+     * frame_skip() or re-runs the accelerator through a fresh frame_inputs().
+     * Windows, compose state and clocks are not touched. */
     heads_finite =
         pp_all_finite(p->head_erb_mask, DFN2_PREPOST_ERB_MASK_ELEMENTS) &&
         pp_all_finite(p->head_coefs, DFN2_PREPOST_COEFS_ELEMENTS) &&
         pp_all_finite(p->head_alpha, DFN2_PREPOST_ALPHA_ELEMENTS);
-    if (dfn2_model_io_validate_state(p->io) != 0 || !heads_finite) {
-        pp_zero_state(p);   /* a head can fail while the state is finite */
+    state_finite = dfn2_model_io_validate_state(p->io) == 0;
+    if (!state_finite || !heads_finite) {
+        /* validate_state already zeroed and counted a bad state; a bad head
+         * with a finite state still restarts the recurrent state. */
+        if (state_finite) dfn2_model_io_zero_recurrent(p->io);
         p->prepared = 0;
         return -1;
     }
@@ -645,74 +635,6 @@ int dfn2_prepost_frame_commit(DFN2Prepost *p) {
      * preconditions -- heads finite, clock aligned -- hold here). */
     return pp_close_frame(p, p->head_erb_mask, p->head_coefs,
                           p->head_alpha[0]);
-}
-
-/* One tensor of the copy path: the pool's destination, the runtime's own
- * source, and the destination's element count. */
-typedef struct {
-    float *destination;
-    const float *source;
-    size_t count;
-    size_t source_count;
-} PpInheritTensor;
-
-enum { PP_INHERIT_TENSORS = 7 };
-
-int dfn2_prepost_outputs_inherit(const DFN2PrepostOutputs *destination,
-                                 const DFN2PrepostOutputs *runtime) {
-    PpInheritTensor tensor[PP_INHERIT_TENSORS];
-    int i;
-    if (!destination || !runtime) return -1;
-    tensor[0] = (PpInheritTensor){destination->erb_mask, runtime->erb_mask,
-                                  destination->erb_mask_elements,
-                                  runtime->erb_mask_elements};
-    tensor[1] = (PpInheritTensor){destination->coefs, runtime->coefs,
-                                  destination->coefs_elements,
-                                  runtime->coefs_elements};
-    tensor[2] = (PpInheritTensor){destination->alpha, runtime->alpha,
-                                  destination->alpha_elements,
-                                  runtime->alpha_elements};
-    tensor[3] = (PpInheritTensor){
-        (float *)destination->encoder_gru_hidden_next,
-        (const float *)runtime->encoder_gru_hidden_next,
-        destination->encoder_gru_hidden_elements,
-        runtime->encoder_gru_hidden_elements};
-    tensor[4] = (PpInheritTensor){
-        (float *)destination->erb_gru_hidden_next,
-        (const float *)runtime->erb_gru_hidden_next,
-        destination->erb_gru_hidden_elements,
-        runtime->erb_gru_hidden_elements};
-    tensor[5] = (PpInheritTensor){
-        (float *)destination->df_gru_hidden_next,
-        (const float *)runtime->df_gru_hidden_next,
-        destination->df_gru_hidden_elements,
-        runtime->df_gru_hidden_elements};
-    tensor[6] = (PpInheritTensor){
-        (float *)destination->df_convp_history_next,
-        (const float *)runtime->df_convp_history_next,
-        destination->df_convp_history_elements,
-        runtime->df_convp_history_elements};
-
-    /* Shape and pointer checks for all seven first, then the finite check of
-     * every tensor that would be copied, so a refusal copies nothing. A
-     * tensor the runtime wrote in place is skipped throughout: it is the
-     * destination's own memory, frame_commit() checks it, and memcpy with
-     * source == destination is undefined. */
-    for (i = 0; i < PP_INHERIT_TENSORS; ++i) {
-        if (!tensor[i].destination || !tensor[i].source) return -1;
-        if (tensor[i].count == 0u ||
-            tensor[i].count != tensor[i].source_count) return -1;
-    }
-    for (i = 0; i < PP_INHERIT_TENSORS; ++i) {
-        if (tensor[i].source == tensor[i].destination) continue;
-        if (!pp_all_finite(tensor[i].source, tensor[i].count)) return -1;
-    }
-    for (i = 0; i < PP_INHERIT_TENSORS; ++i) {
-        if (tensor[i].source == tensor[i].destination) continue;
-        memcpy(tensor[i].destination, tensor[i].source,
-               tensor[i].count * sizeof(float));
-    }
-    return 0;
 }
 
 int dfn2_prepost_frame_skip(DFN2Prepost *p) {

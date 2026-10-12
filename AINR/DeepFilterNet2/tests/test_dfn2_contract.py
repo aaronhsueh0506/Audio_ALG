@@ -53,14 +53,18 @@ from train import (  # noqa: E402
 )
 from export_onnx import (  # noqa: E402
     INPUT_FRAMES,
-    COMBINED_STATE_LAYOUT_VERSION,
+    GRU_STATE_NAME,
     GRU_STATE_NAMES,
     INPUT_NAMES,
     OUTPUT_NAMES,
+    PATHWAY_STATE_NAME,
     RETIRED_LAYOUT_VERSIONS,
+    STATE_BINDING,
+    STATE_HANDOFF,
     STATE_LAYOUT_VERSION,
     StatelessDFN2Heads,
     build_metadata,
+    export_graph,
     feature_windows,
     gru_state_slice_report,
     initial_inputs as streaming_export_inputs,
@@ -362,24 +366,41 @@ def test_c_model_io_layout_constants_match_the_shipped_export_shapes():
     assert frames == INPUT_FRAMES, (
         'the C window depth and the exporter window depth are one contract'
     )
-    assert c_macro(header, 'DFN2_MODEL_ERB_GRU_LAYERS') == 2
-    assert c_macro(header, 'DFN2_MODEL_DF_GRU_LAYERS') == 2
+    layers = (c_macro(header, 'DFN2_MODEL_ENCODER_GRU_LAYERS'),
+              c_macro(header, 'DFN2_MODEL_ERB_GRU_LAYERS'),
+              c_macro(header, 'DFN2_MODEL_DF_GRU_LAYERS'))
+    assert layers == (1, 2, 2)
+    rows = c_macro(header, 'DFN2_MODEL_GRU_ROWS')
+    assert rows == sum(layers)
+    assert (c_macro(header, 'DFN2_MODEL_GRU_ROW_ENCODER'),
+            c_macro(header, 'DFN2_MODEL_GRU_ROW_ERB'),
+            c_macro(header, 'DFN2_MODEL_GRU_ROW_DF')) == (
+        0, layers[0], layers[0] + layers[1]), (
+        'row offsets are the exporter slice starts')
 
     model = build_shipped_model(load_config()).eval()
     expected = (
         (1, 1, frames, n_erb),
         (1, 2, frames, df_bins),
-        (c_macro(header, 'DFN2_MODEL_ENCODER_GRU_LAYERS'), 1, hidden),
-        (c_macro(header, 'DFN2_MODEL_ERB_GRU_LAYERS'), 1, hidden),
-        (c_macro(header, 'DFN2_MODEL_DF_GRU_LAYERS'), 1, hidden),
+        (1, rows, 1, hidden),
         (1, c_macro(header, 'DFN2_MODEL_ENCODER_CHANNELS'),
-         c_macro(header, 'DFN2_MODEL_DF_PATHWAY_HISTORY'), df_bins),
+         c_macro(header, 'DFN2_MODEL_DF_PATHWAY_WINDOW'), df_bins),
     )
     actual = tuple(
         tuple(int(size) for size in value.shape)
         for value in streaming_export_inputs(model)
     )
     assert actual == expected
+    wrapper = StatelessDFN2Heads(model)
+    assert tuple(
+        (name, start, stop) for name, start, stop in wrapper.gru_state_slices
+    ) == (
+        ('h_encoder', c_macro(header, 'DFN2_MODEL_GRU_ROW_ENCODER'),
+         c_macro(header, 'DFN2_MODEL_GRU_ROW_ERB')),
+        ('h_erb', c_macro(header, 'DFN2_MODEL_GRU_ROW_ERB'),
+         c_macro(header, 'DFN2_MODEL_GRU_ROW_DF')),
+        ('h_df', c_macro(header, 'DFN2_MODEL_GRU_ROW_DF'), rows),
+    )
 
 
 def _small_dfn2():
@@ -426,36 +447,6 @@ def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
         for value in graph.graph.input
     }
     assert set(graph_shapes) == set(INPUT_NAMES)
-    consumers = {}
-    for node in graph.graph.node:
-        for input_name in node.input:
-            consumers.setdefault(input_name, []).append(node)
-    # Each hidden stack must reach its own GRU nodes without ever meeting
-    # another state tensor. ONNX has no stacked GRU op, so a two-layer stack
-    # legitimately arrives through per-layer Slices; what must never appear is
-    # a Concat, which would hand two states one quantization scale.
-    def _grus_reached(name):
-        reached = set()
-        for node in consumers.get(name, []):
-            if node.op_type == 'GRU':
-                reached.add(node.name)
-            elif node.op_type == 'Slice':
-                for produced in node.output:
-                    reached |= _grus_reached(produced)
-            else:
-                raise AssertionError(
-                    '%s reaches a %s before its GRU; only per-layer Slices '
-                    'may sit in between' % (name, node.op_type)
-                )
-        return reached
-
-    per_state = {name: _grus_reached(name) for name in GRU_STATE_NAMES}
-    for name, reached in per_state.items():
-        assert reached, name
-    merged = set().union(*per_state.values())
-    assert len(merged) == sum(len(value) for value in per_state.values()), (
-        'two states reached the same GRU node: %r' % per_state
-    )
 
     # Two invocations, recorded exactly the way calibration_main records them.
     captured = {}
@@ -508,15 +499,20 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
                              'DFN2_MODEL_IO_LAYOUT_VERSION')
     assert metadata['state_layout_version'] == header_version
     assert STATE_LAYOUT_VERSION == metadata['state_layout_version']
-    # The header's prose says versions 4, 6 and the current experimental
-    # combined version are taken. Stated as an
-    # assertion so a C-side bump onto one fails here rather than shipping a
-    # header that means two different things to two different graphs.
-    taken = RETIRED_LAYOUT_VERSIONS | {COMBINED_STATE_LAYOUT_VERSION}
-    assert header_version not in taken, (
-        'DFN2_MODEL_IO_LAYOUT_VERSION %d collides with a published layout'
+    # Retired numbers are never reused: a C-side bump onto one must fail here
+    # rather than ship a header that means two different things to two
+    # different graphs.
+    assert RETIRED_LAYOUT_VERSIONS == frozenset({4, 5, 6, 7})
+    assert header_version not in RETIRED_LAYOUT_VERSIONS, (
+        'DFN2_MODEL_IO_LAYOUT_VERSION %d collides with a retired layout'
         % header_version
     )
+    assert header_version == 8
+    assert metadata['state_binding'] == STATE_BINDING == 'in_place_same_address'
+    assert metadata['state_handoff'] == STATE_HANDOFF == {
+        'h_gru': 'h_gru_out',
+        'df_convp_history': 'df_convp_history_out',
+    }
 
 
 if __name__ == '__main__':
@@ -903,110 +899,161 @@ def test_runtime_erb_bins_match_the_model(tmp_path):
     assert np.array_equal(inv, ref_inv)
 
 
-def test_combined_gru_state_is_the_split_state_stacked_in_struct_order():
-    """The experimental single-tensor recurrent state must change nothing.
+def test_gru_state_rows_are_routed_to_their_own_gru():
+    """Each slice of ``h_gru`` must land on the GRU the C header names.
 
-    Both layouts run the same graph maths; the combined one only slices its
-    three hidden stacks off one input and concatenates them back. Heads and
-    state must therefore be bit-identical, and the concatenation order must be
-    DFN2ModelIOState's memory order (encoder, erb, df) or a runtime binding
-    the combined tensor to those bytes would silently transpose the stacks.
+    The rows are ``dfn2_model_io.h``'s memory order (encoder, ERB decoder, DF
+    decoder), and the DF and ERB decoders read only the encoder's embedding,
+    never each other's hidden state. So perturbing one decoder's rows may move
+    only that decoder's rows of ``h_gru_out``; perturbing the encoder row moves
+    the embedding and therefore both decoders. A slice that landed on the wrong
+    GRU, or a reversed row order, breaks the first property.
     """
     torch.manual_seed(73)
     model = _small_dfn2()
-    split = StatelessDFN2Heads(model).eval()
-    combined = StatelessDFN2Heads(model, gru_state_layout='combined').eval()
-
-    assert combined.input_names == (
+    wrapper = StatelessDFN2Heads(model).eval()
+    assert wrapper.input_names == (
         'erb', 'spec', 'h_gru', 'df_convp_history')
-    assert combined.output_names[3:] == ('h_gru_out', 'df_convp_history_out')
-    assert combined.state_layout_version == COMBINED_STATE_LAYOUT_VERSION
-    assert combined.state_layout_version != STATE_LAYOUT_VERSION, (
-        'a different state layout must not claim the shipped version'
-    )
-    assert tuple(combined.initial_inputs()[2].shape) == (1, 5, 1, 32)
+    assert wrapper.output_names[3:] == ('h_gru_out', 'df_convp_history_out')
+    assert wrapper.state_layout_version == STATE_LAYOUT_VERSION
+    assert tuple(wrapper.initial_inputs()[2].shape) == (1, 5, 1, 32)
+    assert tuple(wrapper.initial_inputs()[3].shape) == (
+        1, model.encoder.erb_conv0[1].out_channels, 5, model.df_bins)
 
-    frames = 7
+    erb = torch.randn(1, 1, INPUT_FRAMES, model.n_erb)
+    spec = torch.randn(1, 2, INPUT_FRAMES, model.df_bins)
+    window = torch.randn_like(wrapper.initial_inputs()[3])
+    base = torch.randn(1, 5, 1, 32)
+    rows = {name: (start, stop) for name, start, stop
+            in wrapper.gru_state_slices}
+
+    def moved(perturbed):
+        with torch.no_grad():
+            first = wrapper(erb, spec, base, window)[3]
+            second = wrapper(erb, spec, perturbed, window)[3]
+        return [row for row in range(5)
+                if not torch.equal(first[0, row], second[0, row])]
+
+    def bump(name):
+        start, stop = rows[name]
+        bumped = base.clone()
+        bumped[:, start:stop] += 0.5
+        return bumped
+
+    assert moved(bump('h_erb')) == [1, 2], 'ERB rows must move only themselves'
+    assert moved(bump('h_df')) == [3, 4], 'DF rows must move only themselves'
+    assert set(moved(bump('h_encoder'))) >= {0, 1, 2, 3, 4}, (
+        'the encoder row feeds the embedding both decoders read')
+
+
+def test_stateless_graph_chain_is_the_offline_stream_in_both_state_tensors():
+    """The window the graph returns is the next call's input, unchanged.
+
+    ``h_gru_out`` and ``df_convp_history_out`` are fed straight back for
+    several hops; the heads must equal the offline model's, so nothing is lost
+    by returning the whole pathway window instead of its tail, and the window
+    returned at hop t is exactly the last five frames the pathway has seen.
+    """
+    torch.manual_seed(74)
+    model = _small_dfn2()
+    wrapper = StatelessDFN2Heads(model).eval()
+    frames = 12
     erb = torch.randn(1, 1, frames, model.n_erb)
     spec = torch.randn(1, 2, frames, model.df_bins)
-
-    def replay(wrapper):
+    with torch.no_grad():
+        reference = model.heads(erb, spec)
         state = wrapper.initial_inputs()[2:]
-        heads = [[], [], []]
-        with torch.no_grad():
-            for erb_window, spec_window in zip(
-                    feature_windows(erb), feature_windows(spec)):
-                output = wrapper(erb_window, spec_window, *state)
-                for index in range(3):
-                    heads[index].append(output[index])
-                state = output[3:]
-        return heads, state
-
-    split_heads, split_state = replay(split)
-    combined_heads, combined_state = replay(combined)
-
-    for left, right in zip(split_heads, combined_heads):
-        for a, b in zip(left, right):
-            assert torch.equal(a, b), 'combined layout changed a head'
-
-    # ⚠ Written so it can FAIL: a driver whose states stayed at their zero
-    # initial value would satisfy every comparison above trivially.
-    assert float(combined_state[0].abs().max()) > 0.0
-
-    assert len(combined_state) == 2, 'combined state is one GRU tensor + cache'
-    assert tuple(combined_state[0].shape) == (1, 5, 1, 32)
-    hidden_count = len(GRU_STATE_NAMES)
-    stacked = torch.cat(split_state[:hidden_count], dim=0).unsqueeze(0)
-    assert torch.equal(stacked, combined_state[0])
-    for name, start, stop in split.gru_state_slices:
-        assert torch.equal(
-            split_state[GRU_STATE_NAMES.index(name)],
-            combined_state[0][0, start:stop]
-        ), '%s landed at the wrong offset' % name
-    assert torch.equal(split_state[hidden_count], combined_state[1])
+        heads = []
+        windows = []
+        for erb_window, spec_window in zip(
+                feature_windows(erb), feature_windows(spec)):
+            output = wrapper(erb_window, spec_window, *state)
+            heads.append(output[1])
+            windows.append(output[4])
+            state = output[3:]
+    torch.testing.assert_close(
+        torch.cat(heads, dim=1), reference[1], rtol=1e-5, atol=1e-6)
+    # Consecutive windows overlap by four frames: window[t][1:] == window[t+1][:-1]
+    for before, after in zip(windows, windows[1:]):
+        assert torch.equal(before[:, :, 1:], after[:, :, :-1])
+    assert float(windows[-1].abs().max()) > 0.0
 
 
-def test_combined_gru_state_reaches_every_gru_through_slices(tmp_path):
-    """What the PTQ A/B is actually about: the graph, not the torch maths.
-
-    The three hidden stacks now arrive on ONE input, so the thing worth
-    pinning is that each still reaches its own GRU nodes through its own
-    Slice -- if a later change let them meet at a Cat first, the shared-scale
-    hazard would be worse, not merely present. ONNX has no stacked GRU op, so
-    a two-layer stack legitimately becomes two GRU nodes fed by a further
-    internal Slice; the count below is nodes, not state tensors.
-    """
-    onnx = pytest.importorskip('onnx')
+def _export_small_graph(tmp_path, batch_size=1):
+    """Run the real export path (optimiser, folding, validator, metadata)."""
+    pytest.importorskip('onnx')
+    pytest.importorskip('onnxruntime')
+    checkpoint = tmp_path / ('ckpt%d.pth' % batch_size)
+    checkpoint.write_bytes(b'only hashed')
     torch.manual_seed(73)
     model = _small_dfn2()
-    wrapper = StatelessDFN2Heads(model, gru_state_layout='combined').eval()
-    inputs = wrapper.initial_inputs()
-    path = tmp_path / 'combined.onnx'
-    torch.onnx.export(
-        wrapper, inputs, str(path),
-        input_names=list(wrapper.input_names),
-        output_names=list(wrapper.output_names),
-        opset_version=17, do_constant_folding=True,
+    wrapper = StatelessDFN2Heads(model, batch_size=batch_size).eval()
+    path = tmp_path / ('small_b%d.onnx' % batch_size)
+    metadata = export_graph(
+        wrapper,
+        {'SR': 16000, 'N_FFT': 512, 'WIN_LEN': 512, 'HOP_LEN': 256},
+        str(checkpoint), str(path), verify=True,
     )
+    return wrapper, path, metadata
+
+
+@pytest.mark.parametrize('batch_size', [1, 3])
+def test_exported_state_boundary_is_in_place_and_sliced_on_the_input(
+        tmp_path, batch_size):
+    """What the board binds: rank-4 state pairs of equal shape, the pathway
+    window consumed only by one explicit Slice, the GRU rows only by Slices
+    on dim 1 that tile it, and no graph output produced by a Slice."""
+    import onnx
+    from onnx import numpy_helper
+
+    wrapper, path, metadata = _export_small_graph(tmp_path, batch_size)
     graph = onnx.load(str(path))
-    declared = [entry.name for entry in graph.graph.input]
-    assert 'h_gru' in declared
-    for name in GRU_STATE_NAMES:
-        assert name not in declared, 'combined layout must not also declare %s' % name
+    shapes = {value.name: [dim.dim_value
+                           for dim in value.type.tensor_type.shape.dim]
+              for value in list(graph.graph.input) + list(graph.graph.output)}
+    for state, back in STATE_HANDOFF.items():
+        assert len(shapes[state]) == 4
+        assert shapes[state] == shapes[back], (state, back)
+    assert shapes[GRU_STATE_NAME] == [batch_size, 5, 1, 32]
+    assert shapes[PATHWAY_STATE_NAME][2] == 5
+    props = {prop.key: prop.value for prop in graph.metadata_props}
+    assert props['state_binding'] == 'in_place_same_address'
+    assert metadata['state_binding'] == 'in_place_same_address'
+    assert props['state_layout_version'] == str(STATE_LAYOUT_VERSION)
 
-    def _shape(value_info):
-        return [dim.dim_value
-                for dim in value_info.type.tensor_type.shape.dim]
+    constants = {item.name: numpy_helper.to_array(item).tolist()
+                 for item in graph.graph.initializer}
+    users = [node for node in graph.graph.node
+             if PATHWAY_STATE_NAME in node.input]
+    assert [node.op_type for node in users] == ['Slice']
+    starts, ends, axes, steps = (constants[name] for name in users[0].input[1:])
+    assert (starts, ends, axes, steps) == ([1], [5], [2], [1])
+    gru_users = [node for node in graph.graph.node
+                 if GRU_STATE_NAME in node.input]
+    assert gru_users and all(node.op_type == 'Slice' for node in gru_users)
+    ranges = sorted((constants[node.input[1]][0], constants[node.input[2]][0])
+                    for node in gru_users)
+    assert ranges == [(0, 1), (1, 3), (3, 5)]
+    assert all(constants[node.input[3]] == [1] for node in gru_users)
+    produced = {name: node for node in graph.graph.node
+                for name in node.output}
+    for output in graph.graph.output:
+        assert produced[output.name].op_type != 'Slice', output.name
 
-    h_gru_in = next(value for value in graph.graph.input
-                    if value.name == 'h_gru')
-    h_gru_out = next(value for value in graph.graph.output
-                     if value.name == 'h_gru_out')
-    assert _shape(h_gru_in) == [1, 5, 1, 32]
-    assert _shape(h_gru_out) == [1, 5, 1, 32]
+
+def test_gru_state_reaches_every_gru_through_slices(tmp_path):
+    """Each recurrent row block reaches its own GRU nodes and nothing merges
+    them first: if a later change let the rows meet at a Concat before the
+    GRUs, the three stacks would share a quantization scale in a worse way
+    than the single input tensor already makes them. ONNX has no stacked GRU
+    op, so a two-layer stack legitimately becomes two GRU nodes fed by a
+    further internal Slice; the count below is nodes, not state tensors."""
+    import onnx
+
+    wrapper, path, _metadata = _export_small_graph(tmp_path)
+    graph = onnx.load(str(path))
 
     def _reaches_gru(name, depth=0):
-        """Walk forward from h_gru to the GRU nodes that consume its slices."""
         found = []
         for node in graph.graph.node:
             if name not in node.input:
@@ -1019,12 +1066,10 @@ def test_combined_gru_state_reaches_every_gru_through_slices(tmp_path):
                     found.extend(_reaches_gru(output_name, depth + 1))
             elif node.op_type == 'Concat':
                 raise AssertionError(
-                    'h_gru reaches a Concat before its GRUs -- the three '
-                    'stacks would share one quantization scale'
-                )
+                    'h_gru reaches a Concat before its GRUs')
         return found
 
-    reached = _reaches_gru('h_gru')
+    reached = _reaches_gru(GRU_STATE_NAME)
     expected = sum(stop - start for _name, start, stop
                    in wrapper.gru_state_slices)
     assert len(set(reached)) == expected, (
@@ -1059,8 +1104,7 @@ def test_combined_gru_calibration_report_slices_the_layer_axis():
     assert report['per_layer']['h_df']['max'] == 3.0
 
 
-@pytest.mark.parametrize('layout', ['split', 'combined'])
-def test_fixed_batch_graph_matches_independent_streaming_lanes(layout):
+def test_fixed_batch_graph_matches_independent_streaming_lanes():
     """Batch profiling must not turn adjacent frames into shared state.
 
     Run three independent batch-one invocations, merge exactly the tensor
@@ -1071,12 +1115,8 @@ def test_fixed_batch_graph_matches_independent_streaming_lanes(layout):
 
     torch.manual_seed(809)
     model = _small_dfn2().eval()
-    single = StatelessDFN2Heads(
-        model, gru_state_layout=layout, batch_size=1
-    ).eval()
-    batch = StatelessDFN2Heads(
-        model, gru_state_layout=layout, batch_size=3
-    ).eval()
+    single = StatelessDFN2Heads(model, batch_size=1).eval()
+    batch = StatelessDFN2Heads(model, batch_size=3).eval()
     samples = []
     expected = []
     with torch.no_grad():
@@ -1085,28 +1125,17 @@ def test_fixed_batch_graph_matches_independent_streaming_lanes(layout):
                            for value in single.initial_inputs())
             samples.append(values)
             expected.append(single(*values))
-        merged = _merge_independent_samples(
-            batch.input_names, samples, batch.gru_state_layout.combined
-        )
+        merged = _merge_independent_samples(batch.input_names, samples)
         actual = batch(*merged)
 
     assert tuple(merged[0].shape[:2]) == (3, 1)
-    if layout == 'combined':
-        assert tuple(merged[2].shape) == (3, 5, 1, 32)
-    else:
-        assert tuple(merged[2].shape) == (1, 3, 32)
-        assert tuple(merged[3].shape) == (2, 3, 32)
-        assert tuple(merged[4].shape) == (2, 3, 32)
+    assert tuple(merged[2].shape) == (3, 5, 1, 32)
+    assert merged[3].shape[0] == 3 and merged[3].shape[2] == 5
 
     for output_index, got in enumerate(actual):
-        if layout == 'split' and 3 <= output_index < 6:
-            want = torch.cat(
-                tuple(value[output_index] for value in expected), dim=1
-            )
-        else:
-            want = torch.cat(
-                tuple(value[output_index] for value in expected), dim=0
-            )
+        want = torch.cat(
+            tuple(value[output_index] for value in expected), dim=0
+        )
         torch.testing.assert_close(got, want, rtol=2e-5, atol=2e-6)
 
 
@@ -1123,12 +1152,11 @@ def test_fixed_batch_metadata_publishes_static_lane_count(tmp_path):
         {'SR': 16000, 'N_FFT': 512, 'WIN_LEN': 512, 'HOP_LEN': 256},
         inputs,
         outputs,
-        gru_state_layout=wrapper.gru_state_layout,
     )
     assert metadata['fixed_batch_size'] == 4
     assert metadata['batch_semantics'] == 'independent_streaming_lanes'
     assert metadata['input_schema']['erb'][0] == 4
-    assert metadata['input_schema']['h_encoder'] == [1, 4, 32]
+    assert metadata['input_schema']['h_gru'] == [4, 5, 1, 32]
 
 
 def test_fixed_batch_bin_contains_every_lane(tmp_path):
@@ -1139,16 +1167,10 @@ def test_fixed_batch_bin_contains_every_lane(tmp_path):
     from inference_batch import _merge_independent_samples
 
     model = _small_dfn2().eval()
-    single = StatelessDFN2Heads(
-        model, gru_state_layout='combined', batch_size=1
-    ).eval()
-    batch = StatelessDFN2Heads(
-        model, gru_state_layout='combined', batch_size=3
-    ).eval()
+    single = StatelessDFN2Heads(model, batch_size=1).eval()
+    batch = StatelessDFN2Heads(model, batch_size=3).eval()
     samples = [single.initial_inputs() for _ in range(3)]
-    merged = _merge_independent_samples(
-        batch.input_names, samples, combined=True
-    )
+    merged = _merge_independent_samples(batch.input_names, samples)
     captured = {}
     capture_calibration_inputs(captured, batch.input_names, merged)
     arrays = {name: np.stack(values).astype(np.float32, copy=False)
@@ -1215,11 +1237,10 @@ def test_batch1_cleanup_keeps_the_graph_exact_and_rank_four(tmp_path):
         lin_groups=4, enc_lin_groups=4,
     ).eval()
     wrapper = StatelessDFN2Heads(model).eval()
-    layout = wrapper.gru_state_layout
     path = tmp_path / 'raw.onnx'
     torch.onnx.export(wrapper, wrapper.initial_inputs(), str(path),
-                      input_names=layout.input_names,
-                      output_names=layout.output_names, opset_version=17,
+                      input_names=list(INPUT_NAMES),
+                      output_names=list(OUTPUT_NAMES), opset_version=17,
                       do_constant_folding=True)
     options = ort.SessionOptions()
     options.graph_optimization_level = (

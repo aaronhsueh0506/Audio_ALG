@@ -7,28 +7,47 @@
 extern "C" {
 #endif
 
-/* Must match export_onnx.py and the shipped DFN2 config. Version 3 exposed
- * one graph tensor per recurrent LAYER (h_erb_0/h_erb_1, h_df_0/h_df_1) so
- * PTQ could scale each layer independently; version 5 exposes one per GRU in
- * its native stacked shape (h_erb, h_df, each (layers, 1, hidden)), which is
- * exactly how the arrays below are already laid out, so a runtime binds each
- * tensor to one contiguous field. The graph still holds one GRU node per
- * layer -- ONNX has no stacked GRU op -- so the layers of one stack now
- * share that stack's quantization scale.
+/* Must match export_onnx.py and the shipped DFN2 config.
  *
- * ⚠ Versions 4, 6 and 7 are TAKEN, not free -- see export_onnx.py's
- * RETIRED_LAYOUT_VERSIONS and COMBINED_STATE_LAYOUT_VERSION, which
- * test_dfn2_contract.py asserts this constant against. Nothing here binds the
- * combined layout, so a board built against this header refuses such a graph:
- * that is the intent, not an oversight. */
-#define DFN2_MODEL_IO_LAYOUT_VERSION       5
+ * Graph state tensors (all rank 4, input and *_out output of one tensor have
+ * the same shape and are bound to the same address):
+ *   h_gru             [1, DFN2_MODEL_GRU_ROWS, 1, DFN2_MODEL_GRU_HIDDEN]
+ *                     rows: encoder GRU, ERB decoder GRU (2 layers), DF
+ *                     decoder GRU (2 layers), see the DFN2_MODEL_GRU_ROW_*
+ *                     offsets
+ *   df_convp_history  [1, DFN2_MODEL_ENCODER_CHANNELS,
+ *                      DFN2_MODEL_DF_PATHWAY_WINDOW, DFN2_DF_BINS]
+ *                     the full causal window of the pathway convolution: the
+ *                     graph drops the oldest frame, appends the new one and
+ *                     returns the whole window
+ *
+ * Layout versions 4, 5, 6 and 7 are retired (RETIRED_LAYOUT_VERSIONS in
+ * export_onnx.py); test_dfn2_contract.py asserts this constant against it. */
+#define DFN2_MODEL_IO_LAYOUT_VERSION       8
 #define DFN2_MODEL_INPUT_FRAMES            3
 #define DFN2_MODEL_ENCODER_GRU_LAYERS      1
 #define DFN2_MODEL_ERB_GRU_LAYERS          2
 #define DFN2_MODEL_DF_GRU_LAYERS           2
+#define DFN2_MODEL_GRU_ROWS                5   /* 1 + 2 + 2                */
+#define DFN2_MODEL_GRU_ROW_ENCODER         0
+#define DFN2_MODEL_GRU_ROW_ERB             1
+#define DFN2_MODEL_GRU_ROW_DF              3
 #define DFN2_MODEL_GRU_HIDDEN               256
 #define DFN2_MODEL_ENCODER_CHANNELS         64
-#define DFN2_MODEL_DF_PATHWAY_HISTORY       4
+#define DFN2_MODEL_DF_PATHWAY_WINDOW        5
+
+#ifdef __STDC_VERSION__
+#if __STDC_VERSION__ >= 201112L
+_Static_assert(DFN2_MODEL_GRU_ROWS == DFN2_MODEL_ENCODER_GRU_LAYERS +
+                   DFN2_MODEL_ERB_GRU_LAYERS + DFN2_MODEL_DF_GRU_LAYERS,
+               "h_gru rows are the sum of the three GRU stacks");
+_Static_assert(DFN2_MODEL_GRU_ROW_ERB == DFN2_MODEL_GRU_ROW_ENCODER +
+                   DFN2_MODEL_ENCODER_GRU_LAYERS &&
+               DFN2_MODEL_GRU_ROW_DF == DFN2_MODEL_GRU_ROW_ERB +
+                   DFN2_MODEL_ERB_GRU_LAYERS,
+               "row offsets follow the stack order");
+#endif
+#endif
 
 /* The graph contract a runtime was built against, as a value a host can
  * compare field by field. Every field is a compiled constant of this build;
@@ -54,8 +73,8 @@ typedef struct DFN2ModelIoDescriptor {
     int df_gru_layers;             /* DFN2_MODEL_DF_GRU_LAYERS             */
     int gru_hidden;                /* DFN2_MODEL_GRU_HIDDEN                */
     int encoder_channels;          /* DFN2_MODEL_ENCODER_CHANNELS          */
-    int df_pathway_history;        /* DFN2_MODEL_DF_PATHWAY_HISTORY        */
-    int state_tensor_count;        /* 4: h_encoder, h_erb, h_df, df_convp  */
+    int df_pathway_window;         /* DFN2_MODEL_DF_PATHWAY_WINDOW         */
+    int state_tensor_count;        /* 2: h_gru, df_convp_history           */
 } DFN2ModelIoDescriptor;
 
 /* Fill with this build's contract. Returns 0, or -1 on NULL. */
@@ -65,33 +84,35 @@ int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor);
 int dfn2_model_io_descriptor_validate(
     const DFN2ModelIoDescriptor *descriptor);
 
-/* Caller-owned state for a stateless accelerator. The graph receives the four
- * recurrent arrays as inputs. Normal path: the runtime writes its *_out
- * tensors into its own buffers and the caller takes them over with
- * dfn2_model_io_inherit_state(). Optimized path: bind each *_out tensor to
- * the SAME address as its input, so every array is a single buffer and the
- * output of one invocation is the input of the next with no copy; skip
- * inherit, and the runtime must read every state input before it writes any
- * state output at the same address (one that cannot guarantee that order
- * stages the reads in a temporary of its own).
+/* Caller-owned state for a stateless accelerator. The graph reads the two
+ * state arrays as inputs and writes the updated ones to outputs bound to the
+ * SAME addresses, so the output of one invocation is the input of the next
+ * with no copy. The runtime must read every state input before it writes any
+ * state output.
  *
  * The two feature windows and feature_frames_seen are CPU-owned: the
- * accelerator reads the windows and never writes them. */
+ * accelerator reads the windows and never writes them.
+ *
+ * state_generation advances each time this library zeroes the recurrent
+ * arrays (reset, or a refused validation). The accelerator's fixed-point copy of the
+ * state is not visible here, so a runtime refills it with quantized zeros
+ * whenever dfn2_model_io_state_generation() differs from the value it saw
+ * last. */
 typedef struct {
     float erb_window[DFN2_MODEL_INPUT_FRAMES][DFN2_N_ERB];
     float spec_window[2][DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS];
-    float encoder_gru_hidden[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                            [DFN2_MODEL_GRU_HIDDEN];
-    float erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS]
-                        [DFN2_MODEL_GRU_HIDDEN];
-    float df_gru_hidden[DFN2_MODEL_DF_GRU_LAYERS]
-                       [DFN2_MODEL_GRU_HIDDEN];
-    float df_convp_history[DFN2_MODEL_ENCODER_CHANNELS]
-                           [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                           [DFN2_DF_BINS];
+    float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN];
+    float df_convp_window[DFN2_MODEL_ENCODER_CHANNELS]
+                         [DFN2_MODEL_DF_PATHWAY_WINDOW]
+                         [DFN2_DF_BINS];
     unsigned long long feature_frames_seen;
+    unsigned int state_generation;
 } DFN2ModelIOState;
 
+/* First construction: zero the whole object and start the generation at 1.
+ * Not a reset -- a state that is already in use goes through
+ * dfn2_model_io_reset() so its generation keeps advancing. The caller fills
+ * the accelerator's state with zeros once after this. */
 void dfn2_model_io_init(DFN2ModelIOState *state);
 
 /* Slide a [t-1,t,t+1] feature window by one frame and write the newest frame
@@ -106,53 +127,21 @@ void dfn2_model_io_push_spec_window(
     float window[2][DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS],
     const float frame[2][DFN2_DF_BINS]);
 
-/* In-place path: validate the four recurrent arrays after the accelerator
- * wrote them in place. Takes the arrays instead of a state struct so an
- * external dual-input consumer whose struct differs reuses this discipline
- * without changing its own field layout.
+/* Validate the two recurrent arrays after the accelerator wrote them in
+ * place. Takes the arrays instead of a state struct so an external dual-input
+ * consumer whose struct differs reuses this discipline without changing its
+ * own field layout.
  *
  * Returns 0 when every element is finite. On any non-finite element it zeroes
- * all four arrays and returns -1: the previous values were overwritten by the
+ * both arrays and returns -1: the previous values were overwritten by the
  * accelerator and cannot be restored, so a stream restarts from zero state.
  * NULL returns -1 and touches nothing. A partial or mixed write that is still
  * finite is not detectable here. */
 int dfn2_model_io_validate_arrays(
-    float encoder_gru_hidden[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                            [DFN2_MODEL_GRU_HIDDEN],
-    float erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
-    float df_gru_hidden[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
-    float df_convp_history[DFN2_MODEL_ENCODER_CHANNELS]
-                          [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                          [DFN2_DF_BINS]);
-
-/* Copy path: take over the four `*_next` arrays the runtime wrote into its
- * own buffers. Symmetric with dfn2_model_io_validate_arrays(): the first four
- * arguments are the destination recurrent arrays, the last four the sources,
- * with the same shapes. A source whose address equals its destination is left
- * alone (written in place, and memcpy with source == destination is
- * undefined); every other source must be finite.
- *
- * Validate-then-copy: if any source that would be copied holds a non-finite
- * element, nothing is copied and -1 is returned with all four destination
- * arrays untouched, so the caller reports the run as failed and the state
- * stays intact. NULL returns -1 and touches nothing. 0 otherwise. */
-int dfn2_model_io_inherit_arrays(
-    float encoder_gru_hidden[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                            [DFN2_MODEL_GRU_HIDDEN],
-    float erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
-    float df_gru_hidden[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
-    float df_convp_history[DFN2_MODEL_ENCODER_CHANNELS]
-                          [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                          [DFN2_DF_BINS],
-    const float encoder_gru_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                                       [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_gru_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
-                                   [DFN2_MODEL_GRU_HIDDEN],
-    const float df_gru_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
-                                  [DFN2_MODEL_GRU_HIDDEN],
-    const float df_convp_history_next[DFN2_MODEL_ENCODER_CHANNELS]
-                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                                     [DFN2_DF_BINS]);
+    float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN],
+    float df_convp_window[DFN2_MODEL_ENCODER_CHANNELS]
+                         [DFN2_MODEL_DF_PATHWAY_WINDOW]
+                         [DFN2_DF_BINS]);
 
 /* Push one newly computed feature frame. Returns 1 when [t-1,t,t+1] is
  * available and the graph may emit heads[t], or 0 after the first frame.
@@ -161,27 +150,24 @@ int dfn2_model_io_push_features(DFN2ModelIOState *state,
                                 const float erb[DFN2_N_ERB],
                                 const float spec[2][DFN2_DF_BINS]);
 
-/* validate_arrays() over the state's own four recurrent arrays; call it after
+/* validate_arrays() over the state's own recurrent arrays; call it after
  * each invocation. Returns 0 when they are all finite; NULL or a non-finite
- * element returns -1, and in the non-finite case the four arrays are zeroed.
- * The feature windows and feature_frames_seen are never touched. */
+ * element returns -1, and in the non-finite case the arrays are zeroed and the
+ * generation advances. The feature windows and feature_frames_seen are never
+ * touched. */
 int dfn2_model_io_validate_state(DFN2ModelIOState *state);
 
-/* inherit_arrays() over the state's own four recurrent arrays as the
- * destination; call it after each invocation on the copy path. The same
- * validate-then-copy rule: a refused call (-1) leaves the state intact. The
- * feature windows and feature_frames_seen are never touched. */
-int dfn2_model_io_inherit_state(
-    DFN2ModelIOState *state,
-    const float encoder_gru_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                                       [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_gru_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
-                                   [DFN2_MODEL_GRU_HIDDEN],
-    const float df_gru_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
-                                  [DFN2_MODEL_GRU_HIDDEN],
-    const float df_convp_history_next[DFN2_MODEL_ENCODER_CHANNELS]
-                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                                     [DFN2_DF_BINS]);
+/* Back to the init values (windows, recurrent arrays, frame count); the
+ * generation advances. NULL is ignored. */
+void dfn2_model_io_reset(DFN2ModelIOState *state);
+
+/* Zero the two recurrent arrays only; the generation advances. NULL is
+ * ignored. */
+void dfn2_model_io_zero_recurrent(DFN2ModelIOState *state);
+
+/* The generation: 1 after init, plus one for each reset, refused validation
+ * and zero_recurrent, modulo 2^32. 0 for NULL. */
+unsigned int dfn2_model_io_state_generation(const DFN2ModelIOState *state);
 
 #ifdef __cplusplus
 }

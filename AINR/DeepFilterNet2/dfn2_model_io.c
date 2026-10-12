@@ -7,10 +7,12 @@
 
 void dfn2_model_io_init(DFN2ModelIOState *state)
 {
-    if (state != NULL) memset(state, 0, sizeof(*state));
+    if (state == NULL) return;
+    memset(state, 0, sizeof(*state));
+    state->state_generation = 1u;
 }
 
-#define DFN2_MODEL_IO_STATE_TENSORS 4
+#define DFN2_MODEL_IO_STATE_TENSORS 2
 
 /* One list of (field, contract value) drives both the default and the
  * validator, so validate(default()) == 0 holds by construction and a new
@@ -32,7 +34,7 @@ void dfn2_model_io_init(DFN2ModelIOState *state)
     X(df_gru_layers, DFN2_MODEL_DF_GRU_LAYERS)                        \
     X(gru_hidden, DFN2_MODEL_GRU_HIDDEN)                              \
     X(encoder_channels, DFN2_MODEL_ENCODER_CHANNELS)                  \
-    X(df_pathway_history, DFN2_MODEL_DF_PATHWAY_HISTORY)              \
+    X(df_pathway_window, DFN2_MODEL_DF_PATHWAY_WINDOW)              \
     X(state_tensor_count, DFN2_MODEL_IO_STATE_TENSORS)
 
 int dfn2_model_io_descriptor_default(DFN2ModelIoDescriptor *descriptor)
@@ -86,84 +88,23 @@ static int all_finite(const float *values, size_t count)
 }
 
 int dfn2_model_io_validate_arrays(
-    float encoder_gru_hidden[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                            [DFN2_MODEL_GRU_HIDDEN],
-    float erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
-    float df_gru_hidden[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
-    float df_convp_history[DFN2_MODEL_ENCODER_CHANNELS]
-                          [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                          [DFN2_DF_BINS])
+    float gru_hidden[DFN2_MODEL_GRU_ROWS][DFN2_MODEL_GRU_HIDDEN],
+    float df_convp_window[DFN2_MODEL_ENCODER_CHANNELS]
+                         [DFN2_MODEL_DF_PATHWAY_WINDOW]
+                         [DFN2_DF_BINS])
 {
-    const size_t encoder_count =
-        DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN;
-    const size_t erb_count = DFN2_MODEL_ERB_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN;
-    const size_t df_count = DFN2_MODEL_DF_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN;
+    const size_t gru_count = (size_t)DFN2_MODEL_GRU_ROWS *
+                             DFN2_MODEL_GRU_HIDDEN;
     const size_t convp_count = (size_t)DFN2_MODEL_ENCODER_CHANNELS *
-                               DFN2_MODEL_DF_PATHWAY_HISTORY * DFN2_DF_BINS;
-    if (encoder_gru_hidden == NULL || erb_gru_hidden == NULL ||
-        df_gru_hidden == NULL || df_convp_history == NULL) return -1;
-    if (all_finite(&encoder_gru_hidden[0][0], encoder_count) &&
-        all_finite(&erb_gru_hidden[0][0], erb_count) &&
-        all_finite(&df_gru_hidden[0][0], df_count) &&
-        all_finite(&df_convp_history[0][0][0], convp_count)) return 0;
+                               DFN2_MODEL_DF_PATHWAY_WINDOW * DFN2_DF_BINS;
+    if (gru_hidden == NULL || df_convp_window == NULL) return -1;
+    if (all_finite(&gru_hidden[0][0], gru_count) &&
+        all_finite(&df_convp_window[0][0][0], convp_count)) return 0;
     /* The accelerator wrote these arrays in place, so the previous values are
      * gone: zero is the only state a stream can restart from. */
-    memset(encoder_gru_hidden, 0, encoder_count * sizeof(float));
-    memset(erb_gru_hidden, 0, erb_count * sizeof(float));
-    memset(df_gru_hidden, 0, df_count * sizeof(float));
-    memset(df_convp_history, 0, convp_count * sizeof(float));
+    memset(gru_hidden, 0, gru_count * sizeof(float));
+    memset(df_convp_window, 0, convp_count * sizeof(float));
     return -1;
-}
-
-int dfn2_model_io_inherit_arrays(
-    float encoder_gru_hidden[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                            [DFN2_MODEL_GRU_HIDDEN],
-    float erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
-    float df_gru_hidden[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN],
-    float df_convp_history[DFN2_MODEL_ENCODER_CHANNELS]
-                          [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                          [DFN2_DF_BINS],
-    const float encoder_gru_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                                       [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_gru_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
-                                   [DFN2_MODEL_GRU_HIDDEN],
-    const float df_gru_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
-                                  [DFN2_MODEL_GRU_HIDDEN],
-    const float df_convp_history_next[DFN2_MODEL_ENCODER_CHANNELS]
-                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                                     [DFN2_DF_BINS])
-{
-    float *const destination[DFN2_MODEL_IO_STATE_TENSORS] = {
-        (float *)encoder_gru_hidden, (float *)erb_gru_hidden,
-        (float *)df_gru_hidden, (float *)df_convp_history};
-    const float *const source[DFN2_MODEL_IO_STATE_TENSORS] = {
-        (const float *)encoder_gru_hidden_next,
-        (const float *)erb_gru_hidden_next,
-        (const float *)df_gru_hidden_next,
-        (const float *)df_convp_history_next};
-    const size_t count[DFN2_MODEL_IO_STATE_TENSORS] = {
-        DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN,
-        DFN2_MODEL_ERB_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN,
-        DFN2_MODEL_DF_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN,
-        (size_t)DFN2_MODEL_ENCODER_CHANNELS * DFN2_MODEL_DF_PATHWAY_HISTORY *
-            DFN2_DF_BINS};
-    int i;
-    for (i = 0; i < DFN2_MODEL_IO_STATE_TENSORS; ++i) {
-        if (destination[i] == NULL || source[i] == NULL) return -1;
-    }
-    /* Every source that would be copied is checked before any is, so a refusal
-     * leaves all four destination arrays as they were. A source that is its
-     * destination was written in place: skipped, because memcpy with source
-     * == destination is undefined. */
-    for (i = 0; i < DFN2_MODEL_IO_STATE_TENSORS; ++i) {
-        if (source[i] != destination[i] && !all_finite(source[i], count[i]))
-            return -1;
-    }
-    for (i = 0; i < DFN2_MODEL_IO_STATE_TENSORS; ++i) {
-        if (source[i] != destination[i])
-            memcpy(destination[i], source[i], count[i] * sizeof(float));
-    }
-    return 0;
 }
 
 int dfn2_model_io_push_features(DFN2ModelIOState *state,
@@ -180,27 +121,31 @@ int dfn2_model_io_push_features(DFN2ModelIOState *state,
 int dfn2_model_io_validate_state(DFN2ModelIOState *state)
 {
     if (state == NULL) return -1;
-    return dfn2_model_io_validate_arrays(
-        state->encoder_gru_hidden, state->erb_gru_hidden,
-        state->df_gru_hidden, state->df_convp_history);
+    if (dfn2_model_io_validate_arrays(state->gru_hidden,
+                                      state->df_convp_window) == 0)
+        return 0;
+    ++state->state_generation;
+    return -1;
 }
 
-int dfn2_model_io_inherit_state(
-    DFN2ModelIOState *state,
-    const float encoder_gru_hidden_next[DFN2_MODEL_ENCODER_GRU_LAYERS]
-                                       [DFN2_MODEL_GRU_HIDDEN],
-    const float erb_gru_hidden_next[DFN2_MODEL_ERB_GRU_LAYERS]
-                                   [DFN2_MODEL_GRU_HIDDEN],
-    const float df_gru_hidden_next[DFN2_MODEL_DF_GRU_LAYERS]
-                                  [DFN2_MODEL_GRU_HIDDEN],
-    const float df_convp_history_next[DFN2_MODEL_ENCODER_CHANNELS]
-                                     [DFN2_MODEL_DF_PATHWAY_HISTORY]
-                                     [DFN2_DF_BINS])
+void dfn2_model_io_reset(DFN2ModelIOState *state)
 {
-    if (state == NULL) return -1;
-    return dfn2_model_io_inherit_arrays(
-        state->encoder_gru_hidden, state->erb_gru_hidden,
-        state->df_gru_hidden, state->df_convp_history,
-        encoder_gru_hidden_next, erb_gru_hidden_next, df_gru_hidden_next,
-        df_convp_history_next);
+    unsigned int generation;
+    if (state == NULL) return;
+    generation = state->state_generation + 1u;
+    memset(state, 0, sizeof(*state));
+    state->state_generation = generation;
+}
+
+void dfn2_model_io_zero_recurrent(DFN2ModelIOState *state)
+{
+    if (state == NULL) return;
+    memset(state->gru_hidden, 0, sizeof(state->gru_hidden));
+    memset(state->df_convp_window, 0, sizeof(state->df_convp_window));
+    ++state->state_generation;
+}
+
+unsigned int dfn2_model_io_state_generation(const DFN2ModelIOState *state)
+{
+    return state == NULL ? 0u : state->state_generation;
 }

@@ -45,8 +45,8 @@
  * or an unwritten/non-finite output, the frame is taken with
  * dfn2_prepost_frame_skip(): an exact identity through the cascade (unit ERB
  * mask through a partition-of-unity erb_inv, zero taps, alpha 0), the clocks
- * advanced, the recurrent state left as it is (an in-place output that was
- * non-finite zeroes it at commit; a refused inherit leaves it intact). The
+ * advanced, the recurrent state left as it is (an output that was non-finite
+ * zeroes it at commit and advances the state generation). The
  * stage output is then P delayed by two hops: the conventional pipeline with
  * its NR disabled, byte for byte, comfort noise included. That is the
  * backbone gate of both hosting pipelines.
@@ -80,7 +80,7 @@ extern "C" {
 #endif
 
 #define DFN_RES_STAGE_DESCRIPTOR_VERSION 1u
-#define DFN_RES_STAGE_LAYOUT_VERSION     1u
+#define DFN_RES_STAGE_LAYOUT_VERSION     2u
 #define DFN_RES_STAGE_BACKEND_KISS       1u
 #define DFN_RES_STAGE_BACKEND_NE10       2u
 

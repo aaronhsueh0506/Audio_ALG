@@ -8,9 +8,7 @@
  *
  *     if (dfn2_prepost_pre_process(p, in_hop) == 1) {
  *         dfn2_prepost_frame_inputs(p, &in, &out);   // views into the pool
- *         my_npu_run(&in, &out);                     // NPU fills `out`, or
- *                                                    // its own tensors, then
- *                                                    // _outputs_inherit()
+ *         my_npu_run(&in, &out);                     // NPU fills `out`
  *         dfn2_prepost_frame_commit(p);              // or _frame_skip()
  *     }
  *     dfn2_prepost_post_process(p, out_hop, &written);
@@ -123,10 +121,11 @@ extern "C" {
  *   2  DFN2_IO_FREQ carves a second staging pair (apply_re/apply_im) for the
  *      dual-input entry point, appended after every existing region
  *   3  DFN2State carries the ERB matrices' nonzero ranges
- *   4  the recurrent state is DFN2ModelIOState's own four arrays and nothing
- *      else
- *   5  DFN2State also carries each ERB band's nonzero bin range */
-#define DFN2_PREPOST_CARVE_VERSION      5u
+ *   4  the recurrent state is DFN2ModelIOState's own arrays and nothing else
+ *   5  DFN2State also carries each ERB band's nonzero bin range
+ *   6  the recurrent state is the 5-row h_gru and the 5-frame pathway window
+ *      of graph layout 8 */
+#define DFN2_PREPOST_CARVE_VERSION      6u
 
 /* One shared alignment for every module (audio_common mem_align.h). */
 #define DFN2_PREPOST_ALIGNMENT 16u
@@ -138,14 +137,10 @@ extern "C" {
     (DFN2_MODEL_INPUT_FRAMES * DFN2_N_ERB)
 #define DFN2_PREPOST_SPEC_WINDOW_ELEMENTS \
     (2 * DFN2_MODEL_INPUT_FRAMES * DFN2_DF_BINS)
-#define DFN2_PREPOST_ENCODER_HIDDEN_ELEMENTS \
-    (DFN2_MODEL_ENCODER_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN)
-#define DFN2_PREPOST_ERB_HIDDEN_ELEMENTS \
-    (DFN2_MODEL_ERB_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN)
-#define DFN2_PREPOST_DF_HIDDEN_ELEMENTS \
-    (DFN2_MODEL_DF_GRU_LAYERS * DFN2_MODEL_GRU_HIDDEN)
-#define DFN2_PREPOST_CONVP_HISTORY_ELEMENTS \
-    (DFN2_MODEL_ENCODER_CHANNELS * DFN2_MODEL_DF_PATHWAY_HISTORY * \
+#define DFN2_PREPOST_GRU_HIDDEN_ELEMENTS \
+    (DFN2_MODEL_GRU_ROWS * DFN2_MODEL_GRU_HIDDEN)
+#define DFN2_PREPOST_CONVP_WINDOW_ELEMENTS \
+    (DFN2_MODEL_ENCODER_CHANNELS * DFN2_MODEL_DF_PATHWAY_WINDOW * \
      DFN2_DF_BINS)
 #define DFN2_PREPOST_ERB_MASK_ELEMENTS   DFN2_N_ERB
 #define DFN2_PREPOST_COEFS_ELEMENTS      (DFN2_DF_BINS * DFN2_DF_ORDER * 2)
@@ -209,52 +204,40 @@ _Static_assert(sizeof(DFN2PrepostMemReq) == 32,
 typedef struct DFN2Prepost DFN2Prepost;
 
 /* Accelerator inputs. All pointers are into this instance's pool and stay
- * valid for the life of the instance; the four recurrent-state tensors never
- * change address. They are the accelerator's inputs, and the outputs'
- * `*_next` tensors point at the same memory (see DFN2PrepostOutputs) for a
- * runtime that binds them there. The feature windows are read-only: the
- * accelerator must not write them. Graph input
- * names of the shipped split layout (export_onnx.py,
- * DFN2_MODEL_IO_LAYOUT_VERSION 5) are given so a runtime binds by name
- * without reading the exporter. */
+ * valid for the life of the instance; the two recurrent-state tensors never
+ * change address. The outputs' `*_next` state tensors point at the same
+ * memory (see DFN2PrepostOutputs): the runtime binds each state input and its
+ * output to one address and reads every state input before it writes any
+ * state output. The feature windows are read-only: the accelerator must not
+ * write them. Graph input names of the current layout (export_onnx.py,
+ * DFN2_MODEL_IO_LAYOUT_VERSION) are given so a runtime binds by name without
+ * reading the exporter. */
 typedef struct DFN2PrepostInputs {
     /* 'erb'  (1,1,DFN2_MODEL_INPUT_FRAMES,DFN2_N_ERB) */
     const float (*erb_window)[DFN2_N_ERB];
     /* 'spec' (1,2,DFN2_MODEL_INPUT_FRAMES,DFN2_DF_BINS) */
     const float (*spec_window)[DFN2_MODEL_INPUT_FRAMES][DFN2_DF_BINS];
-    /* 'h_encoder' (DFN2_MODEL_ENCODER_GRU_LAYERS,1,DFN2_MODEL_GRU_HIDDEN) */
-    const float (*encoder_gru_hidden)[DFN2_MODEL_GRU_HIDDEN];
-    /* 'h_erb' */
-    const float (*erb_gru_hidden)[DFN2_MODEL_GRU_HIDDEN];
-    /* 'h_df' */
-    const float (*df_gru_hidden)[DFN2_MODEL_GRU_HIDDEN];
+    /* 'h_gru' (1,DFN2_MODEL_GRU_ROWS,1,DFN2_MODEL_GRU_HIDDEN); rows start at
+     * DFN2_MODEL_GRU_ROW_ENCODER / _ERB / _DF */
+    const float (*gru_hidden)[DFN2_MODEL_GRU_HIDDEN];
     /* 'df_convp_history'
-     * (1,DFN2_MODEL_ENCODER_CHANNELS,DFN2_MODEL_DF_PATHWAY_HISTORY,
+     * (1,DFN2_MODEL_ENCODER_CHANNELS,DFN2_MODEL_DF_PATHWAY_WINDOW,
      *  DFN2_DF_BINS) */
-    const float (*df_convp_history)[DFN2_MODEL_DF_PATHWAY_HISTORY]
-                                   [DFN2_DF_BINS];
+    const float (*df_convp_window)[DFN2_MODEL_DF_PATHWAY_WINDOW]
+                                  [DFN2_DF_BINS];
     size_t erb_window_elements;
     size_t spec_window_elements;
-    size_t encoder_gru_hidden_elements;
-    size_t erb_gru_hidden_elements;
-    size_t df_gru_hidden_elements;
-    size_t df_convp_history_elements;
+    size_t gru_hidden_elements;
+    size_t df_convp_window_elements;
 } DFN2PrepostInputs;
 
-/* Accelerator-writable outputs: the three heads and the four next-state
+/* Accelerator-writable outputs: the three heads and the two next-state
  * tensors. frame_inputs() fills every head element with NaN so frame_commit()
  * detects a partial write instead of committing the previous frame's values.
- * Two ways to bind them:
- *   - Normal path: the runtime writes its own output tensors, which have
- *     their own addresses, and passes them to dfn2_prepost_outputs_inherit()
- *     with this struct as the destination; the pool takes the values over
- *     there, before frame_commit().
- *   - Optimized path: bind the runtime's outputs to the pointers in this
- *     struct and skip inherit. The next-state tensors then alias the inputs'
- *     state tensors -- the same four buffers at the same addresses on every
- *     frame, nothing copied -- so the runtime must read every state input
- *     before it writes any state output at that address (one that cannot
- *     guarantee the order stages its reads in a temporary of its own).
+ * The runtime binds its outputs to the pointers in this struct. The
+ * next-state tensors alias the inputs' state tensors -- the same two buffers
+ * at the same addresses on every frame, nothing copied -- so the runtime must
+ * read every state input before it writes any state output at that address.
  * The next-state tensors are not NaN-prefilled: a partial or mixed state
  * write is not detectable, only a non-finite value is.
  *
@@ -266,18 +249,14 @@ typedef struct DFN2PrepostOutputs {
     float *erb_mask;                /* 'erb_mask'  [DFN2_N_ERB]             */
     float *coefs;                   /* 'df_coefs'  [bins][order][2]         */
     float *alpha;                   /* 'df_alpha'  [1]                      */
-    float (*encoder_gru_hidden_next)[DFN2_MODEL_GRU_HIDDEN];  /* h_encoder_out */
-    float (*erb_gru_hidden_next)[DFN2_MODEL_GRU_HIDDEN];      /* h_erb_out     */
-    float (*df_gru_hidden_next)[DFN2_MODEL_GRU_HIDDEN];       /* h_df_out      */
-    float (*df_convp_history_next)[DFN2_MODEL_DF_PATHWAY_HISTORY]
-                                  [DFN2_DF_BINS];   /* df_convp_history_out */
+    float (*gru_hidden_next)[DFN2_MODEL_GRU_HIDDEN];          /* h_gru_out */
+    float (*df_convp_window_next)[DFN2_MODEL_DF_PATHWAY_WINDOW]
+                                 [DFN2_DF_BINS];  /* df_convp_history_out  */
     size_t erb_mask_elements;
     size_t coefs_elements;
     size_t alpha_elements;
-    size_t encoder_gru_hidden_elements;
-    size_t erb_gru_hidden_elements;
-    size_t df_gru_hidden_elements;
-    size_t df_convp_history_elements;
+    size_t gru_hidden_elements;
+    size_t df_convp_window_elements;
 } DFN2PrepostOutputs;
 
 /* ---- config / sizing ------------------------------------------------- */
@@ -317,8 +296,16 @@ void dfn2_prepost_destroy(DFN2Prepost *p);
 
 /* Zero every recurrent/ring/hidden tensor, drop any open frame, and reset the
  * framing, normaliser and compose-clock states to their init values. Config,
- * borrowed pointers and pool are untouched. */
+ * borrowed pointers and pool are untouched. Advances the state generation. */
 void dfn2_prepost_reset(DFN2Prepost *p);
+
+/* Generation of the recurrent state (h_gru and the pathway window): 1 after
+ * init, plus one for each dfn2_prepost_reset() and each refused
+ * dfn2_prepost_frame_commit(), modulo 2^32; 0 for NULL. The accelerator keeps
+ * its own fixed-point copy of the state, which neither of those events
+ * reaches: a runtime compares this value with the one it saw at the previous
+ * frame and refills its state tensors with quantized zeros when it changed. */
+unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p);
 
 /* ---- accessors ------------------------------------------------------- */
 
@@ -398,43 +385,20 @@ int dfn2_prepost_pre_process_freq_dual(DFN2Prepost *p,
 int dfn2_prepost_frame_inputs(DFN2Prepost *p, DFN2PrepostInputs *inputs,
                               DFN2PrepostOutputs *outputs);
 
-/* Copy path. Takes over the runtime's own output tensors into the pool, so a
- * runtime that cannot bind a state output to its input's address needs no
- * second set of buffers here. `destination` is the DFN2PrepostOutputs that
- * frame_inputs() returned; `runtime` is the same type holding the runtime's
- * OWN pointers (the three heads and the four `*_next` state tensors) and the
- * same element counts. Per tensor: a runtime pointer equal to the
- * destination's is left alone (it was written in place and frame_commit()
- * checks it); any other is copied, destination's element count.
- *
- * Validate-then-copy: every tensor that would be copied must be finite, or
- * nothing is copied and -1 is returned with the pool byte-identical. -1 also
- * on a NULL argument, a NULL tensor pointer or an element-count mismatch.
- * Returns 0 otherwise.
- *
- * A refused inherit leaves the state intact, so the caller reports the run as
- * failed and takes dfn2_prepost_frame_skip(). On the in-place path, where
- * there is nothing to refuse, a bad value is found at frame_commit() and the
- * state restarts from zero there. */
-int dfn2_prepost_outputs_inherit(const DFN2PrepostOutputs *destination,
-                                 const DFN2PrepostOutputs *runtime);
-
-/* Validates the result -- the three heads and the four recurrent-state
+/* Validates the result -- the three heads and the two recurrent-state
  * tensors must be finite -- then runs the compose stage (ERB mask expansion,
  * deep filter, alpha blend, attenuation limit) and, in DFN2_IO_TIME, the
  * synthesis. Nothing is copied here: the state is the pool's own tensors, as
- * written in place or taken over by dfn2_prepost_outputs_inherit().
+ * written in place.
  *
  * Requires a frame opened by pre_process AND published by frame_inputs():
  * a commit with no frame_inputs() behind it is refused, so an accelerator
  * that never ran cannot pass untouched buffers off as a result.
  *
- * A non-finite head or state element cannot be rolled back on the in-place
- * path, because the accelerator overwrote the previous state: the four
- * recurrent tensors are zeroed, the transaction is disarmed without
- * composing, and -1 is returned. (The copy path catches a bad value in
- * dfn2_prepost_outputs_inherit() first and leaves the state intact.)
- * The frame stays open and the framing, compose state and feature windows are
+ * A non-finite head or state element cannot be rolled back, because the
+ * accelerator overwrote the previous state: the two recurrent tensors are
+ * zeroed, the state generation advances, the transaction is disarmed without
+ * composing, and -1 is returned. The frame stays open and the framing, compose state and feature windows are
  * untouched. The caller then either calls dfn2_prepost_frame_skip() to keep
  * the framing schedule intact, or re-runs the accelerator through a fresh
  * frame_inputs(). A finite but partial or mixed state write passes the check;
@@ -450,8 +414,8 @@ int dfn2_prepost_frame_commit(DFN2Prepost *p);
  * failed accelerator run needs.
  *
  * The recurrent state is left exactly as it is: a runtime that reports
- * failure is trusted not to have written it in place, and a refused inherit
- * copied nothing, so nothing is zeroed or restored here. Returns 0, or -1 if
+ * failure is trusted not to have written it, so nothing is zeroed or restored
+ * here. Returns 0, or -1 if
  * no frame is open. */
 int dfn2_prepost_frame_skip(DFN2Prepost *p);
 
@@ -478,7 +442,7 @@ int dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 /* ---- the accelerator callback boundary ------------------------------
  *
  * A pipeline that hosts this class never owns an accelerator runtime; it
- * owns a DFN2Model, four plain pointers the board fills in. `infer` receives
+ * owns a DFN2Model, four plain fields the board fills in. `infer` receives
  * the published tensor views of the open frame (the same
  * DFN2PrepostInputs/DFN2PrepostOutputs frame_inputs() hands out, so a
  * runtime binds by name and element count and no flat argument order can
@@ -504,12 +468,9 @@ typedef struct DFN2Model {
  * prefilled), infer(), frame_commit(); on a nonzero infer() result or a
  * refused commit (a non-finite or unwritten output) the frame is taken with
  * frame_skip() instead, so the framing and compose clocks always advance
- * exactly once. A callback runtime works with either binding of `outputs`:
- * one that writes its own tensors calls dfn2_prepost_outputs_inherit() on
- * them inside infer() and returns nonzero when that refuses; one that binds
- * `outputs` directly writes in place. A nonzero infer() result is trusted
- * not to have written the state, which stays as it was; a refused commit has
- * already zeroed it.
+ * exactly once. The callback binds `outputs` directly and writes in place. A
+ * nonzero infer() result is trusted not to have written the state, which
+ * stays as it was; a refused commit has already zeroed it.
  * The finiteness rule is not re-implemented here -- frame_commit() owns it.
  * Returns 1 when the heads were committed, 0 when the frame was skipped,
  * -1 on a contract error (NULL model or instance, no infer callback, or no

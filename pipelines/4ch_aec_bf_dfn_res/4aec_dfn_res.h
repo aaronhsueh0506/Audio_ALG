@@ -32,7 +32,7 @@ extern "C" {
 #endif
 
 #define FOUR_AEC_DFN_RES_DESCRIPTOR_VERSION 1u
-#define FOUR_AEC_DFN_RES_LAYOUT_VERSION 1u
+#define FOUR_AEC_DFN_RES_LAYOUT_VERSION 2u
 
 /* front_end must carry enable_post=1, enable_res=1, enable_nr=0; its
  * enable_cng is the core's own comfort-noise fill, which lands in the
