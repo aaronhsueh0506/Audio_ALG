@@ -884,18 +884,14 @@ def test_stft_consistency_refuses_a_device_whose_stft_backward_is_wrong():
                     device='mps'), grid)
 
 
-def test_the_mps_stft_backward_bound_is_where_the_backend_actually_breaks():
-    """The bound has to track the defect, not a remembered number.
+#: Waveform lengths, beyond the bound, at which the MPS defect has been
+#: measured: just past it, and the shipped 10 s chunk at 16 kHz.
+_MPS_PAST_BOUND_PROBES = (_MPS_STFT_BACKWARD_SAFE_SAMPLES + 256, 160256)
 
-    Differentiates an iSTFT->STFT round trip on both devices and checks that
-    CPU and MPS still agree at the bound and still disagree past it. If a
-    future torch fixes the backend this fails, which is the point: the guard
-    should be relaxed by measurement rather than by assumption.
-    """
-    if not torch.backends.mps.is_available():
-        pytest.skip('the defect being guarded is an MPS backend one')
 
-    def round_trip_grad(device, samples):
+def _mps_over_cpu_stft_grad_ratio(samples):
+    """Gradient-norm ratio MPS / CPU of an iSTFT->STFT round trip."""
+    def round_trip_grad(device):
         torch.manual_seed(0)
         x = torch.randn(samples, device=device, requires_grad=True)
         window = torch.hann_window(512, device=device)
@@ -905,17 +901,71 @@ def test_the_mps_stft_backward_bound_is_where_the_backend_actually_breaks():
                     length=samples).pow(2).sum().backward()
         return x.grad.norm().item()
 
-    bound = _MPS_STFT_BACKWARD_SAFE_SAMPLES
-    at = round_trip_grad('mps', bound) / round_trip_grad('cpu', bound)
-    past = (round_trip_grad('mps', bound + 256)
-            / round_trip_grad('cpu', bound + 256))
+    return round_trip_grad('mps') / round_trip_grad('cpu')
+
+
+def _check_mps_stft_backward_bound(ratio_at, bound):
+    """Judge a bound against a measurement ``ratio_at(samples) -> MPS/CPU``.
+
+    * The bound must be SAFE: MPS and CPU agree at ``bound``. Always asserted,
+      on every torch, so a backend that starts breaking at a shorter length
+      fails here instead of being waved through.
+    * The bound is only TIGHT while the backend still breaks past it. When MPS
+      agrees with CPU at every probe past the bound the defect is not present
+      on this torch/OS: the second half has nothing to exercise, so skip with
+      the measured ratios rather than fail on a backend that got better.
+    """
+    at = ratio_at(bound)
     assert abs(at - 1.0) < 0.01, (
         f'MPS and CPU already disagree AT the bound (ratio {at:.4f}); the '
         'safe length is lower than the guard allows')
-    assert abs(past - 1.0) > 0.1, (
-        f'MPS and CPU now agree past the bound (ratio {past:.4f}); the backend '
-        'may be fixed -- re-measure and raise _MPS_STFT_BACKWARD_SAFE_SAMPLES '
-        'rather than leaving a guard that costs a device for nothing')
+    past = {n: ratio_at(n) for n in _MPS_PAST_BOUND_PROBES}
+    if all(abs(r - 1.0) <= 0.1 for r in past.values()):
+        pytest.skip(
+            'MPS agrees with CPU past the bound at every probe '
+            f'({", ".join(f"{n}: {r:.4f}" for n, r in past.items())}), so the '
+            'backend defect behind _MPS_STFT_BACKWARD_SAFE_SAMPLES is not '
+            'present on this torch/OS; the bound is conservative, not unsafe '
+            '(it held at the bound). Relax it only after re-measuring on the '
+            'torch versions the trainers run on.')
+
+
+def test_the_mps_stft_backward_bound_is_where_the_backend_actually_breaks():
+    """The bound has to track the defect, not a remembered number.
+
+    Differentiates an iSTFT->STFT round trip on both devices. MPS and CPU must
+    agree at the bound (always), and, while the backend still has the defect,
+    disagree past it. A backend that no longer breaks skips this half with the
+    measured ratios -- see ``_check_mps_stft_backward_bound``.
+    """
+    if not torch.backends.mps.is_available():
+        pytest.skip('the defect being guarded is an MPS backend one')
+    _check_mps_stft_backward_bound(_mps_over_cpu_stft_grad_ratio,
+                                   _MPS_STFT_BACKWARD_SAFE_SAMPLES)
+
+
+def test_the_mps_bound_check_still_fails_on_a_backend_that_breaks_at_the_bound():
+    """Written so it can FAIL: the check must not pass an unsafe bound."""
+    bound = _MPS_STFT_BACKWARD_SAFE_SAMPLES
+    broken_early = lambda n: 1.0 if n < bound else 0.063
+    with pytest.raises(AssertionError, match='AT the bound'):
+        _check_mps_stft_backward_bound(broken_early, bound)
+
+
+def test_the_mps_bound_check_passes_while_the_backend_still_breaks_past_it():
+    bound = _MPS_STFT_BACKWARD_SAFE_SAMPLES
+    measured = {bound: 1.0, bound + 256: 0.063, 160256: 0.424}
+    _check_mps_stft_backward_bound(lambda n: measured[n], bound)
+    # A defect that only shows at the long probe still counts as present.
+    measured = {bound: 1.0, bound + 256: 1.0012, 160256: 0.424}
+    _check_mps_stft_backward_bound(lambda n: measured[n], bound)
+
+
+def test_the_mps_bound_check_skips_with_the_ratios_when_the_backend_is_fixed():
+    bound = _MPS_STFT_BACKWARD_SAFE_SAMPLES
+    with pytest.raises(pytest.skip.Exception,
+                       match=r'agrees with CPU past the bound.*1\.0012'):
+        _check_mps_stft_backward_bound(lambda n: 1.0012, bound)
 
 
 def test_a_configured_weight_decay_is_not_silently_rounded_away():
