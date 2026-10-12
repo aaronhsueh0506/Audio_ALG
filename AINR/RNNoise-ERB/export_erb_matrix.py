@@ -111,7 +111,7 @@ def export_c_header(W_fwd, W_inv, nfftborder, output_path, sr, n_fft):
 
 
 def sanity_check(W_fwd, W_inv, nfftborder):
-    """三角 ERB 特性檢查 (取代舊矩形版的 for-loop 對照)。"""
+    """三角 ERB 特性檢查。"""
     lo, hi = int(nfftborder[0]), int(nfftborder[-1])
     # mode=1: 每個被覆蓋的 bin 列和 ≈ 1 (partition of unity, mask=1 → bin_gain=1)
     row_sum = W_inv[lo:hi].sum(axis=1)

@@ -44,7 +44,7 @@ static void compute_erb_tables(void) {
     const double high_lim = sr / 2.0;
     const double bw = high_lim / ((double)RNNOISE_N_FFT / 2.0);  /* = sr/n_fft */
 
-    /* erb_bandborder (v5): cutoffs = erb2freq(linspace(freq2erb(0), freq2erb(sr/2), N)),
+    /* erb_bandborder: cutoffs = erb2freq(linspace(freq2erb(0), freq2erb(sr/2), N)),
      * ideal border = round((cutoff + bw/2) / bw), 再用嚴格 greedy-forward
      * 「每個 band 至少 MIN_BINS_PER_BAND bin」保證 (逐一往前推進, 從不後退),
      * 端點釘在 DC / Nyquist+1。逐一往前推進的規則對每一對相鄰 border 都

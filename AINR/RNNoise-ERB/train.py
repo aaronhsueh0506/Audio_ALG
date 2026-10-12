@@ -30,8 +30,7 @@ sys.path.insert(0, _AINR_ROOT)
 
 # The sampler, seeder and train/val split live in dataset_gen because GTCRN
 # trains on the same packed corpus and the two are compared directly -- which
-# samples each model gets is part of that protocol.  The copies that used to
-# live here had already drifted to a 10% held-out fraction against GTCRN's 5%.
+# samples each model gets is part of that protocol, so there is one copy.
 from dataset_gen import (  # noqa: E402
     BlockShuffleSampler,
     PackedDataset,
@@ -55,37 +54,32 @@ from training_common import (
 )
 
 
-# Feature semantics are intentionally versioned.  v3 keeps the two input shapes
-# from v2, but aligns their causal normalisation with the original DeepFilterNet:
-# per-band EMA mean-normalised log-ERB and per-bin EMA-normalised complex bins.
-# It is incompatible with all earlier checkpoints even though both input/output
-# dimensions are unchanged.
-# v4 removes the erb_norm_clip/spec_clip deployment safety clamp that v3 kept
-# on top of the DeepFilterNet formula: verified against both the upstream
-# Rikorose/DeepFilterNet libDF/src/lib.rs (band_mean_norm_erb/band_unit_norm,
-# neither clips) and this repo's own AINR/DeepFilterNet2 port (same formulas,
-# no clip either) that no clip is part of the original algorithm at all.
-# v5 fixes erb_bandborder()'s minimum-band-width enforcement: the previous
-# "every-OTHER-band-pair >= 2 bins" rule (ported verbatim from
-# aaronhsueh0506/DeepFilterNet-Keras's ERBBand() notebook) did not actually
-# guarantee every individual band is >= 2 bins wide (a genuine 1-bin band
-# was verified to occur at this file's own sr/n_fft/n_bands). Replaced with
-# a strict greedy-forward minimum, same style as this file's own
-# compute_erb_bands(). This changes the ERB filterbank matrices
-# (erb_fwd/erb_inv / nfftborder), hence the resulting features, even though
-# input/output dimensions are unchanged.
+# Feature semantics are versioned: FEATURE_VERSION names the contract below,
+# and a checkpoint trained under another version is incompatible even when its
+# input/output dimensions match.
+# The causal normalisation follows the original DeepFilterNet: per-band EMA
+# mean-normalised log-ERB and per-bin EMA-normalised complex bins, with no
+# erb_norm_clip/spec_clip clamp (neither upstream Rikorose/DeepFilterNet
+# libDF/src/lib.rs band_mean_norm_erb/band_unit_norm nor this repo's
+# AINR/DeepFilterNet2 port clips).
+# erb_bandborder() enforces a strict greedy-forward minimum band width, same
+# style as this file's own compute_erb_bands().  (The "every-OTHER-band-pair
+# >= 2 bins" rule of aaronhsueh0506/DeepFilterNet-Keras's ERBBand() notebook
+# does not guarantee every individual band is >= 2 bins wide: a genuine 1-bin
+# band occurs at this file's own sr/n_fft/n_bands.)  The rule fixes the ERB
+# filterbank matrices (erb_fwd/erb_inv / nfftborder), hence the features.
 FEATURE_VERSION = 'log_erb_dfn_mean_cplx_unit_0_4k_v8'
 LOSS_VERSION = 'erb_irm_only_v4'
-# The current IRM-only contract evolved from v2; these signal/framing changes
-# still invalidate the older checkpoint families:
-#   * fft_sizes 256,512,1024,2048 -> 128,256,512,1024, i.e. {n_fft/4, n_fft/2,
-#     n_fft, n_fft*2} for THIS model's 512-point FFT.  The old integers were
-#     upstream's, chosen against its own 960-point FFT, and applying them here
-#     shifted every resolution one octave up (16/32/64/128 ms).
-#   * direct ERB IRM supervision was restored. MRSL and the provisional
-#     pseudo-VAD weighting are now disabled; see config.ini for the measured
-#     gradient-scale reason and the pure-noise classification bug.
-#   * training STFT moved to center=False so framing matches deployment.
+# Signal/framing contract (checkpoints trained under another contract are not
+# compatible):
+#   * fft_sizes 128,256,512,1024, i.e. {n_fft/4, n_fft/2, n_fft, n_fft*2} for
+#     THIS model's 512-point FFT.  Upstream's integers (256,512,1024,2048) were
+#     chosen against its own 960-point FFT; applying them here would shift
+#     every resolution one octave up (16/32/64/128 ms).
+#   * direct ERB IRM supervision.  MRSL and the pseudo-VAD weighting are
+#     disabled; see config.ini for the measured gradient-scale reason and the
+#     pure-noise classification problem.
+#   * training STFT uses center=False so framing matches deployment.
 
 
 
@@ -112,10 +106,10 @@ def require_checkpoint_feature_config(ckpt, feature_cfg, context='checkpoint'):
         'lookahead_frames': feature_cfg['lookahead_frames'],
         'n_bands': feature_cfg['n_bands'],
         # min_bins_per_band moves the ERB band borders, hence the whole
-        # filterbank and the generated C tables.  config.ini and process.h were
-        # guarded against each other but nothing tied a CHECKPOINT to the
-        # borders it was trained on, so old weights could be paired with new
-        # tables silently.
+        # filterbank and the generated C tables.  config.ini and process.h are
+        # guarded against each other; recording it here ties a CHECKPOINT to
+        # the borders it was trained on, so weights cannot be paired with
+        # different tables silently.
         'min_bins_per_band': feature_cfg['min_bins_per_band'],
         'feature_erb_norm_tau_sec': feature_cfg['erb_tau_sec'],
         'feature_erb_norm_alpha': feature_cfg['erb_alpha'],
@@ -188,9 +182,9 @@ def require_checkpoint_loss_config(ckpt, loss_cfg, irm_cfg, context='checkpoint'
         'loss_gamma': loss_cfg['gamma'],
         'loss_factor': loss_cfg['factor'],
         'loss_factor_complex': loss_cfg['factor_complex'],
-        # The IRM term is the whole objective now, so its settings are at
-        # least as load-bearing as MRSL's.  They were absent entirely: a
-        # checkpoint trained at gamma=0.25 resumed happily at gamma=0.5.
+        # The IRM term can be the whole objective, so its settings are as
+        # load-bearing as MRSL's: without them a checkpoint trained at
+        # gamma=0.25 would resume at gamma=0.5.
         'irm_factor': irm_cfg['factor'],
         'irm_gamma': irm_cfg['gamma'],
         'irm_energy_floor': irm_cfg['energy_floor'],
@@ -232,8 +226,7 @@ def read_loss_config(cfg):
             loss_cfg['factor_complex'] < 0):
         raise ValueError('invalid DeepFilterNet MultiResSpecLoss configuration')
     # factor == factor_complex == 0 is legal and means "MRSL off": the ERB-IRM
-    # term is then the whole objective.  It used to raise, which is why the
-    # imbalanced MRSL+IRM mix was the only reachable configuration.
+    # term is then the whole objective.
     # (The dict stays exactly MultiResSpecLoss's kwargs -- callers ask
     # mrsl_is_enabled() rather than reading a non-kwarg flag out of it.)
     return loss_cfg
@@ -834,15 +827,15 @@ class ErbIrmLoss(nn.Module):
     target  g* = sqrt(clamp(E_clean / E_noisy, 0, 1))   per band, amplitude domain
     loss    mean( (g^gamma - g*^gamma)^2 )  over DEFINED bands only
 
-    NO speech-activity weighting.  A ``(1 + 5*vad)`` term used to sit here by
-    analogy with xiph/rnnoise, but xiph computes it from a real VAD *output
-    head* trained against a VAD target; this model has no such head and emits
-    nothing but 22 band gains, so the term was weighting a loss for a quantity
-    the network never predicts.  It was also inverted in the case that matters
-    most: for a noise-only example ``clean_frame_e`` is 0 and the peak
-    reference clamps to 1e-12, so ``10*log10(0/1e-12)`` evaluated to 0 dB --
-    above any sane threshold -- and every pure-noise frame was scored as
-    speech-active and up-weighted 6x.
+    NO speech-activity weighting.  A ``(1 + 5*vad)`` term (as in xiph/rnnoise)
+    would weight a loss by a quantity the network never predicts: xiph
+    computes it from a real VAD *output head* trained against a VAD target,
+    while this model has no such head and emits nothing but 22 band gains.  It
+    would also be inverted in the case that matters most: for a noise-only
+    example ``clean_frame_e`` is 0 and the peak reference clamps to 1e-12, so
+    ``10*log10(0/1e-12)`` evaluates to 0 dB -- above any sane threshold -- and
+    every pure-noise frame would be scored as speech-active and up-weighted
+    6x.
 
     The undefined-band mask is kept: a band with essentially no energy in the
     MIXTURE has no defined ratio at all, so its gradient is pure noise rather

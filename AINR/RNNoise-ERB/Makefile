@@ -54,9 +54,9 @@ CFLAGS += $(EXTRA_CFLAGS)
 CFLAGS += $(SIMD_CFLAGS)
 
 # --- Bare-literal policy flags, defined early (`make -e` environment-override
-# gap; same fix already applied in the sibling C-library Makefiles
-# Makefiles for the identical bug -- see audio_common's Makefile "Bare-literal
-# policy flags" comment for the general mechanism). FP_POLICY and
+# gap; same treatment as the sibling C-library Makefiles -- see audio_common's
+# Makefile "Bare-literal policy flags" comment for the general mechanism).
+# FP_POLICY and
 # FP_ALLOWED_CHARS_RE are both plain, dependency-free `:=` literals (no
 # reference to CFLAGS or anything computed above) that MUST be assigned
 # before the "Command-line override rejection" foreach below queries
@@ -85,12 +85,12 @@ $(foreach v,CFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently drop this Makefile's own flag appends (FP policy) or neuter the FP-policy allow-list; use EXTRA_CFLAGS instead)))
 
-# --- FP-policy allow-list (character-based; same redesign as audio_common's
-# Makefile -- see its "REDESIGN" comment for the full writeup of the
+# --- FP-policy allow-list (character-based; same as audio_common's Makefile --
+# see its allow-list comment for the full writeup of the
 # quote/glob/tilde/redirect/process-substitution bypass class a
-# character-by-character deny-list structurally cannot keep up with). This
-# file never had ANY character-based check before this -- only the three raw
-# -Ofast/-ffast-math/-ffp-contract= findstring conflict checks further below.
+# character-by-character deny-list structurally cannot keep up with). It
+# complements the -Ofast/-ffast-math/-ffp-contract= conflict check further
+# below.
 #
 # Single-quote rejection MUST run first, as a pure $(findstring) Make-native
 # check with zero shell involvement: the allow-list below embeds $(CFLAGS)
@@ -99,8 +99,8 @@ $(foreach v,CFLAGS FP_POLICY FP_ALLOWED_CHARS_RE,\
 # the shell as live syntax. Inside a single-quoted POSIX shell string every
 # OTHER character is literal (double quote, backslash, backtick, "$(",
 # semicolon, pipe, ampersand all inert there), so a lone single quote is the
-# only character that can break this embedding -- kept as the sole survivor
-# of the old-style deny-list check for that structural reason, not merely
+# only character that can break this embedding -- kept as a separate pre-check
+# for that structural reason, not merely
 # because it's also outside the allow-list below (it is rejected by the
 # allow-list too).
 ifneq ($(findstring ',$(CFLAGS)),)
@@ -138,25 +138,19 @@ $(foreach v,FP_ALLOWLIST_RC,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently defeat the FP-policy allow-list check above, leaving the real CFLAGS content unvalidated; this variable is internal to that check and has no supported external use)))
 
-# FP-policy conflict detection + last-position append, hardened to
-# EXACT-TOKEN matching -- same fix as audio_common's Makefile's
-# FP_CONFLICT_FLAGS, see its comment for the full writeup. The original
-# three $(findstring -Ofast,...)/$(findstring -ffast-math,...)/
-# $(findstring -ffp-contract=,...) checks matched on SUBSTRING, not whole
-# compiler argv token: a legitimate flag value that merely CONTAINS one of
-# these substrings without BEING the flag -- e.g. -DROUND9_NOTE=-Ofastness,
-# a harmless macro definition -- was incorrectly rejected as a policy
-# conflict. Confirmed empirically: `env
-# EXTRA_CFLAGS='-DROUND9_NOTE=-Ofastness' make -n test-features` used to
-# fail with "FP policy conflict: EXTRA_CFLAGS contains -Ofast" even though
-# -Ofast never appears as its own argv token anywhere in CFLAGS.
+# FP-policy conflict detection + last-position append, with EXACT-TOKEN
+# matching -- same as audio_common's Makefile's FP_CONFLICT_FLAGS, see its
+# comment for the full writeup. A SUBSTRING match ($(findstring -Ofast,...)
+# etc.) would reject a legitimate flag value that merely CONTAINS one of these
+# substrings without BEING the flag -- e.g. -DROUND9_NOTE=-Ofastness, a
+# harmless macro definition (`env EXTRA_CFLAGS='-DROUND9_NOTE=-Ofastness' make
+# -n test-features` must not fail with "FP policy conflict").
 #
 # $(filter PATTERN...,TEXT) instead splits CFLAGS on whitespace and matches
-# each PATTERN against a WHOLE word only (% is $(filter)'s own single
-# wildcard, used here for -ffp-contract=<anything>) -- it can never match a
-# flag value that merely embeds one of these substrings inside a longer
-# token, while a real bare -Ofast / -ffast-math / -ffp-contract=<x> token is
-# still caught exactly as before.
+# each PATTERN against a WHOLE word only (% is $(filter)'s own single wildcard,
+# used here for -ffp-contract=<anything>) -- it can never match a flag value
+# that merely embeds one of these substrings inside a longer token, while a
+# real bare -Ofast / -ffast-math / -ffp-contract=<x> token is still caught.
 FP_CONFLICT_FLAGS := $(filter -Ofast -ffast-math -ffp-contract=%,$(CFLAGS))
 ifneq ($(FP_CONFLICT_FLAGS),)
 $(error FP policy conflict: CFLAGS/EXTRA_CFLAGS contains $(FP_CONFLICT_FLAGS); this repo pins -ffp-contract=off; remove $(FP_CONFLICT_FLAGS) from CFLAGS/EXTRA_CFLAGS)
@@ -164,16 +158,15 @@ endif
 
 # Command-line/`-e` override rejection for FP_CONFLICT_FLAGS itself (same gap
 # class as FP_ALLOWLIST_RC above, and the same one audio_common's Makefile
-# closes for its own FP_CONFLICT_FLAGS): confirmed empirically that, without
-# this guard, `make FP_CONFLICT_FLAGS= EXTRA_CFLAGS=-Ofast -n test-features`
-# sails straight through with no error, and the printed compile line
-# genuinely carries -Ofast -- this file's own pinned FP policy silently
-# defeated by overriding the check's OWN internal variable rather than
-# CFLAGS/EXTRA_CFLAGS directly. FP_CONFLICT_FLAGS is computed from the
-# fully-assembled CFLAGS via $(filter), so (like FP_ALLOWLIST_RC) it cannot
-# be relocated to the early bare-literal foreach; this check must run AFTER
-# its real assignment so the origin-flip has already happened by the time
-# $(origin ...) is queried here.
+# closes for its own FP_CONFLICT_FLAGS): without this guard, `make
+# FP_CONFLICT_FLAGS= EXTRA_CFLAGS=-Ofast -n test-features` sails straight
+# through with no error, and the printed compile line genuinely carries -Ofast
+# -- this file's own pinned FP policy silently defeated by overriding the
+# check's OWN internal variable rather than CFLAGS/EXTRA_CFLAGS directly.
+# FP_CONFLICT_FLAGS is computed from the fully-assembled CFLAGS via $(filter),
+# so (like FP_ALLOWLIST_RC) it cannot be relocated to the early bare-literal
+# foreach; this check must run AFTER its real assignment so the origin-flip has
+# already happened by the time $(origin ...) is queried here.
 $(foreach v,FP_CONFLICT_FLAGS,\
   $(if $(findstring command,$(origin $(v)))$(findstring override,$(origin $(v))),\
     $(error $(v) cannot be overridden (origin: $(origin $(v))) -- it would silently defeat the FP-policy conflict check above, leaving the real CFLAGS content unvalidated; this variable is internal to that check and has no supported external use)))
@@ -188,15 +181,14 @@ CFLAGS    += $(FP_POLICY)
 # EXECUTE a built binary (test-tables/test-features) must resolve it via
 # $(abspath $(BUILD_DIR)) rather than a hardcoded `./$(BUILD_DIR)/<binary>`
 # prefix: when BUILD_DIR is already absolute, `./$(BUILD_DIR)/binary` becomes
-# `.//tmp/abs_test_dir/binary` -- since the leading path component is `.`,
-# not `/`, that doubled slash collapses to a path RELATIVE to cwd
+# `.//tmp/abs_test_dir/binary` -- since the leading path component is `.`, not
+# `/`, that doubled slash collapses to a path RELATIVE to cwd
 # (`./tmp/abs_test_dir/...`), not the absolute path the binary was actually
-# built at, causing "No such file or directory" at real (non-dry-run)
-# execution (`make -n` alone never surfaces this -- it only prints the
-# broken recipe text without running it). $(abspath ...) is correct for
-# BOTH a relative and an already-absolute BUILD_DIR, and the result is kept
-# double-quoted in the recipe since this checkout's own path may contain
-# spaces.
+# built at, causing "No such file or directory" at real (non-dry-run) execution
+# (`make -n` alone never surfaces this -- it only prints the recipe text
+# without running it). $(abspath ...) is correct for BOTH a relative and an
+# already-absolute BUILD_DIR, and the result is kept double-quoted in the
+# recipe since the checkout's path may contain spaces.
 CFG_SIG_PAYLOAD := CC=$(CC) CFLAGS=$(CFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) SIMD=$(SIMD)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 BUILD_DIR = build/$(CFG_SIG)

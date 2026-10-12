@@ -14,7 +14,7 @@
  *
  * 第二層 (`-DRNN_TABLES_PORTABLE`, opt-out): 逐 byte memcmp 在不同 libm/
  * 工具鏈/交叉編譯目標下不保證成立 (跨工具鏈不規定 1 ULP)，
- * 所以這個 mode 改成檢查表格的「數學性質」而非精確位元:
+ * 所以這個 mode 檢查表格的「數學性質」而非精確位元:
  *   - 四張表都是有限值 (finite)
  *   - nfftborder 嚴格遞增, 兩端點釘死在 0 與 257
  *   - erb_inv 每一列 (每個 frequency bin) 對 band 求和是

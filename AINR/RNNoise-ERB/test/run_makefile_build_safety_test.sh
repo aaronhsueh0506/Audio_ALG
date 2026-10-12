@@ -1,95 +1,69 @@
 #!/bin/sh
-# run_makefile_build_safety_test.sh - permanent regression test for four
-# Makefile build-safety fixes in ../Makefile (this component has no build
-# dependency on sibling projects -- these are RNNoise-ERB's OWN Makefile
-# mechanics, fixed to match the pattern already shipped in the four main
-# repos' Makefiles):
+# run_makefile_build_safety_test.sh - Makefile build-safety test for
+# ../Makefile (this component has no build dependency on sibling projects --
+# these are RNNoise-ERB's OWN Makefile mechanics, matching the pattern of the
+# sibling C-library Makefiles). It checks:
 #
-# 1. `make -e` FP_POLICY origin-check-ordering bug: the bare
-#    `FP_POLICY := -ffp-contract=off` literal used to be defined AFTER the
-#    "Command-line override rejection" $(foreach) that checks
-#    $(origin FP_POLICY) -- GNU Make only flips a variable's origin from
-#    plain "environment" to "environment override" at the point THAT
-#    SAME-NAME assignment is actually parsed (and, under `-e`, silently
-#    voided in the environment's favor), so checking before the assignment
-#    ever ran meant the check could never observe the flipped state.
-#    Reproduced: `env FP_POLICY=-ffp-contract=fast make -e -n test-features`
-#    used to succeed, with the printed compile line actually carrying
-#    -ffp-contract=fast (this repo's own pinned FP policy silently
-#    overridden). Fixed by moving only the bare literal ahead of the
-#    foreach; the later `CFLAGS += $(FP_POLICY)` append (after conflict
-#    detection) is untouched.
+# 1. `make -e` FP_POLICY origin-check ordering: the bare `FP_POLICY :=
+#    -ffp-contract=off` literal is defined BEFORE the "Command-line override
+#    rejection" $(foreach) that checks $(origin FP_POLICY) -- GNU Make only
+#    flips a variable's origin from plain "environment" to "environment
+#    override" at the point THAT SAME-NAME assignment is actually parsed (and,
+#    under `-e`, silently voids it in the environment's favor), so a check
+#    placed before the assignment can never observe the flipped state. `env
+#    FP_POLICY=-ffp-contract=fast make -e -n test-features` must be rejected,
+#    rather than printing a compile line carrying -ffp-contract=fast. The later
+#    `CFLAGS += $(FP_POLICY)` append (after conflict detection) is a separate
+#    step.
 #
-# 2. BUILD_DIR=/absolute/path execution-path bug: the test-tables/
-#    test-features recipes used to invoke the built binary as
-#    `./$(BUILD_DIR)/binary_name`. When BUILD_DIR is already absolute (e.g.
-#    BUILD_DIR=/tmp/abs_test_dir), `./$(BUILD_DIR)/binary` becomes
-#    `.//tmp/abs_test_dir/binary` -- the leading component is `.`, not `/`,
-#    so the doubled slash collapses to a path RELATIVE to cwd
-#    (`./tmp/abs_test_dir/...`), not the absolute path the binary was
-#    actually built at, producing "No such file or directory" at real
-#    (non-dry-run) execution -- `make -n` alone never surfaces this, since
-#    it only prints the broken recipe text without running it. Fixed by
-#    invoking `$(abspath $(BUILD_DIR))/binary_name` instead, which is
-#    correct whether BUILD_DIR is relative or already absolute.
+# 2. BUILD_DIR=/absolute/path execution path: the test-tables/test-features
+#    recipes invoke the built binary as `$(abspath $(BUILD_DIR))/binary_name`,
+#    correct whether BUILD_DIR is relative or already absolute. A
+#    `./$(BUILD_DIR)/binary` form would turn BUILD_DIR=/tmp/abs_test_dir into
+#    `.//tmp/abs_test_dir/binary` -- the leading component is `.`, not `/`, so
+#    the doubled slash collapses to a path RELATIVE to cwd
+#    (`./tmp/abs_test_dir/...`), not the absolute path the binary was actually
+#    built at, giving "No such file or directory" at real (non-dry-run)
+#    execution (`make -n` alone never surfaces this, since it only prints the
+#    recipe text without running it).
 #
-# 3. FP-policy allow-list (this Makefile had ZERO character-based
-#    protection before this fix -- not even an old deny-list): a
-#    quote/glob/tilde/redirect/process-substitution bypass of the plain
-#    -Ofast/-ffast-math/-ffp-contract= findstring conflict checks could
-#    reach a real shell unrejected. Fixed by adding the same
-#    character-class ALLOW-list mechanism already shipped in
-#    the sibling C-library Makefiles (adapted for this
+# 3. FP-policy allow-list: a quote/glob/tilde/redirect/process-substitution
+#    bypass of the plain -Ofast/-ffast-math/-ffp-contract= conflict checks must
+#    not reach a real shell. The Makefile has the same character-class
+#    ALLOW-list mechanism as the sibling C-library Makefiles (adapted for this
 #    file's simpler CFLAGS-only variable set): a Make-native single-quote
-#    rejection (protects the allow-list's own single-quote-embedded
-#    $(shell) call), then a `grep -E` allow-list over
-#    [A-Za-z0-9_./=,+ -], with the specific disallowed character(s) named
-#    in the error.
+#    rejection (protects the allow-list's own single-quote-embedded $(shell)
+#    call), then a `grep -E` allow-list over [A-Za-z0-9_./=,+ -], with the
+#    specific disallowed character(s) named in the error.
 #
-# 4. -Ofast/-ffast-math/-ffp-contract= SUBSTRING false-positive: the three
-#    conflict checks used $(findstring <flag>,$(CFLAGS)), which matches
-#    <flag> as a SUBSTRING anywhere in the text, not as a whole compiler
-#    argv token. A legitimate flag whose VALUE merely CONTAINS one of these
-#    substrings without BEING the flag -- e.g. EXTRA_CFLAGS=
-#    -DROUND9_NOTE=-Ofastness, a harmless macro definition -- was
-#    incorrectly rejected as a policy conflict. Reproduced: `env
-#    EXTRA_CFLAGS='-DROUND9_NOTE=-Ofastness' make -n test-features` used to
-#    fail with "FP policy conflict: EXTRA_CFLAGS contains -Ofast" even
-#    though -Ofast never appears as its own argv token. Fixed by switching
-#    to $(filter -Ofast -ffast-math -ffp-contract=%,$(CFLAGS)) (same design
-#    as audio_common's Makefile's FP_CONFLICT_FLAGS): $(filter) splits on
-#    whitespace and matches each pattern against a WHOLE word only, so it
-#    can never match a flag value that merely embeds one of these
-#    substrings inside a longer token, while a real bare -Ofast/
-#    -ffast-math/-ffp-contract=<x> token is still caught exactly as before.
-#    The new FP_CONFLICT_FLAGS variable this introduces got the same
-#    command-line/`-e` override-rejection guard as FP_ALLOWLIST_RC above
-#    (found live during this same fix: without it, `make FP_CONFLICT_FLAGS=
-#    EXTRA_CFLAGS=-Ofast` silently defeated the whole conflict check).
+# 4. -Ofast/-ffast-math/-ffp-contract= exact-token matching: the conflict check
+#    is $(filter -Ofast -ffast-math -ffp-contract=%,$(CFLAGS)) (same design as
+#    audio_common's Makefile's FP_CONFLICT_FLAGS), which splits on whitespace
+#    and matches each pattern against a WHOLE word only. A SUBSTRING match
+#    ($(findstring)) would reject a legitimate flag whose VALUE merely CONTAINS
+#    one of these substrings without BEING the flag -- e.g.
+#    EXTRA_CFLAGS=-DROUND9_NOTE=-Ofastness, a harmless macro definition --
+#    while a real bare -Ofast/-ffast-math/-ffp-contract=<x> token must still be
+#    caught. FP_CONFLICT_FLAGS has the same command-line/`-e`
+#    override-rejection guard as FP_ALLOWLIST_RC (without it, `make
+#    FP_CONFLICT_FLAGS= EXTRA_CFLAGS=-Ofast` would silently defeat the whole
+#    conflict check).
 #
 # Style/convention follows the repository's other C-library policy tests.
-# (this repo has no test/ directory of its own before this file; tests/
-# already exists here but holds the Python feature/loss tests, a different
-# thing).
 #
-# Scratch-isolated throughout (real fix, not just documentation): this
-# script rsync's the ENTIRE RNNoise-ERB directory tree (Makefile + all .c/.h
-# sources this Makefile depends on) into a fresh mktemp scratch working
-# copy at startup, cd's into THAT copy, and runs every single test case
-# below -- default BUILD_DIR, relative BUILD_DIR, absolute BUILD_DIR, and
-# all the character-bypass cases -- only inside the scratch copy. The real
-# checkout this script was invoked from is never cd'd into for any recipe
-# invocation and has no file created, modified, or deleted by any scenario
-# below, period (verified by a before/after directory-tree snapshot diff --
-# see the component's review notes). `build/` is excluded from the copy on
-# purpose: excluding it forces every scratch run to genuinely (re)compile
-# from source rather than silently reusing a config.manifest/binary that
-# happened to get copied over, and it means there is no real build/<sig>
-# directory in the checkout for this script to ever land in even by
-# accident. A single `rm -rf "$SCRATCH"` cleanup covers the whole scratch
-# tree (working copy included), so there is no separate throwaway-directory
-# special case left to get the "does it already exist for a real reason"
-# check wrong.
+# Scratch-isolated throughout: this script rsync's the ENTIRE RNNoise-ERB
+# directory tree (Makefile + all .c/.h sources this Makefile depends on) into a
+# fresh mktemp scratch working copy at startup, cd's into THAT copy, and runs
+# every test case below -- default BUILD_DIR, relative BUILD_DIR, absolute
+# BUILD_DIR, and all the character-bypass cases -- only inside the scratch
+# copy. The real checkout this script was invoked from is never cd'd into for
+# any recipe invocation and has no file created, modified, or deleted by any
+# scenario below. `build/` is excluded from the copy on purpose: excluding it
+# forces every scratch run to genuinely (re)compile from source rather than
+# silently reusing a config.manifest/binary that happened to get copied over,
+# and it means there is no real build/<sig> directory in the checkout for this
+# script to land in even by accident. A single `rm -rf "$SCRATCH"` cleanup
+# covers the whole scratch tree (working copy included).
 #
 # Usage: ./test/run_makefile_build_safety_test.sh
 #   (from anywhere; locates this component's root via the script's own
@@ -146,10 +120,9 @@ fail() { FAIL_COUNT=$((FAIL_COUNT + 1)); echo "  FAIL: $1"; }
 
 echo "=== Section 1: make -e FP_POLICY origin-check-ordering bug ==="
 
-# The exact repro from the bug report. `-n` (dry run) is sufficient and
-# side-effect-free: the origin-check foreach is parse-time Makefile text
-# ($(error ...)), evaluated before any recipe (even a dry-run-printed one)
-# would run.
+# The repro for item 1. `-n` (dry run) is sufficient and side-effect-free: the
+# origin-check foreach is parse-time Makefile text ($(error ...)), evaluated
+# before any recipe (even a dry-run-printed one) would run.
 LOG1="$SCRATCH/log_e_fp_policy"
 if env FP_POLICY=-ffp-contract=fast "$MAKE_BIN" -e -n test-features >"$LOG1" 2>&1; then
     fail "1a: env FP_POLICY=-ffp-contract=fast make -e -n test-features unexpectedly SUCCEEDED (must be rejected)"
@@ -163,10 +136,9 @@ else
     fi
 fi
 
-# Prior behaviour must not regress: a plain command-line
-# CFLAGS=/FP_POLICY= override was already rejected before this fix (a
-# different Make origin, "command line", which is position-independent and
-# was never the bug) -- confirm both still fail.
+# A plain command-line CFLAGS=/FP_POLICY= override is also rejected (a
+# different Make origin, "command line", which is position-independent) --
+# confirm both fail.
 LOG2="$SCRATCH/log_cmdline_cflags"
 if "$MAKE_BIN" CFLAGS=-O3 -n test-features >"$LOG2" 2>&1; then
     fail "1b: make CFLAGS=-O3 -n test-features unexpectedly SUCCEEDED (command-line override rejection regressed)"
@@ -189,7 +161,7 @@ fi
 
 echo "=== Section 2: BUILD_DIR=/absolute/path real (non-dry-run) execution ==="
 
-# The exact repro's dry-run form, to confirm the recipe TEXT is now
+# The dry-run form of the item 2 repro, to confirm the recipe TEXT is
 # unambiguous (no bare `./$(BUILD_DIR)` anywhere).
 ABS_BUILD_DIR="$SCRATCH/abs_test_dir"
 LOG4="$SCRATCH/log_dryrun_absdir"
@@ -205,7 +177,7 @@ else
 fi
 
 # The real thing: actually build AND run (not a dry run) with an absolute
-# BUILD_DIR, since the bug specifically only manifests at real execution.
+# BUILD_DIR, since the problem only manifests at real execution.
 LOG5="$SCRATCH/log_real_absdir"
 if "$MAKE_BIN" BUILD_DIR="$ABS_BUILD_DIR" test-tables >"$LOG5" 2>&1; then
     if grep -q "PASS: rnnoise_tables_gen.h byte-identical" "$LOG5" && grep -q "PASS (portable)" "$LOG5"; then
@@ -247,8 +219,7 @@ else
     cat "$LOG6" >&2
 fi
 
-# Regression: a RELATIVE BUILD_DIR override (never buggy, but must keep
-# working after the abspath rewrite) still resolves and runs correctly.
+# A RELATIVE BUILD_DIR override must still resolve and run correctly.
 rm -rf "$RELATIVE_BUILD_DIR"
 LOG7="$SCRATCH/log_real_relativedir"
 if "$MAKE_BIN" BUILD_DIR="$RELATIVE_BUILD_DIR" test-tables >"$LOG7" 2>&1; then
@@ -260,10 +231,10 @@ else
     cat "$LOG7" >&2
 fi
 
-# Plain, unmodified invocation (no BUILD_DIR override at all) must still
-# work exactly as before -- uses the default build/<cfg-sig>/ directory
-# resolved relative to cwd, which by this point is the scratch WORKDIR
-# copy (cd'd into above), never the real checkout's own build/ directory.
+# Plain, unmodified invocation (no BUILD_DIR override at all) must work -- uses
+# the default build/<cfg-sig>/ directory resolved relative to cwd, which by
+# this point is the scratch WORKDIR copy (cd'd into above), never the real
+# checkout's own build/ directory.
 LOG8="$SCRATCH/log_plain_test_tables"
 if "$MAKE_BIN" test-tables >"$LOG8" 2>&1; then
     grep -q "PASS: rnnoise_tables_gen.h byte-identical" "$LOG8" && grep -q "PASS (portable)" "$LOG8" \
@@ -366,9 +337,8 @@ check_override_rejected "FP_ALLOWED_CHARS_RE" ".*" "-O2;rm" dashe
 check_override_rejected "FP_ALLOWLIST_RC"     "0"  "-O2;rm" cmdline
 check_override_rejected "FP_ALLOWLIST_RC"     "0"  "-O2;rm" dashe
 
-# Prior (pre-allow-list) behaviour must not regress: a real, unquoted
-# -Ofast/-ffast-math/-ffp-contract=<x> token is still rejected by the
-# original three findstring conflict checks.
+# A real, unquoted -Ofast/-ffast-math/-ffp-contract=<x> token is rejected by
+# the exact-token conflict check.
 LOG10="$SCRATCH/log_plain_ofast"
 if env EXTRA_CFLAGS=-Ofast "$MAKE_BIN" -n test-features >"$LOG10" 2>&1; then
     fail "3.regression: env EXTRA_CFLAGS=-Ofast make -n test-features unexpectedly SUCCEEDED (must be rejected)"
@@ -381,13 +351,13 @@ fi
 
 echo "=== Section 4: -Ofast/-ffast-math/-ffp-contract= exact-token matching (no substring false positives) ==="
 
-# A false-positive case: a legitimate flag whose VALUE
-# merely CONTAINS "-Ofast" as a substring (a macro definition, not the
-# compiler flag itself) must build successfully now that the conflict check
-# is $(filter)-based (whole-word match) instead of $(findstring)-based
-# (substring match). Real (non-dry-run) build with a scratch BUILD_DIR, so
-# this also proves the allow-list/exact-token fix doesn't merely let parsing
-# continue but actually still produces a correct binary.
+# A false-positive case: a legitimate flag whose VALUE merely CONTAINS "-Ofast"
+# as a substring (a macro definition, not the compiler flag itself) must build
+# successfully, since the conflict check is $(filter)-based (whole-word match),
+# not $(findstring)-based (substring match). Real (non-dry-run) build with a
+# scratch BUILD_DIR, so this also proves the allow-list/exact-token check
+# doesn't merely let parsing continue but actually still produces a correct
+# binary.
 FIND2_BUILD_DIR="$SCRATCH/find2_build"
 LOG11="$SCRATCH/log_ofast_substring_false_positive"
 if env EXTRA_CFLAGS='-DROUND9_NOTE=-Ofastness' "$MAKE_BIN" BUILD_DIR="$FIND2_BUILD_DIR" test-features >"$LOG11" 2>&1; then
@@ -399,10 +369,8 @@ else
     cat "$LOG11" >&2
 fi
 
-# Regression: a real, bare -Ofast / -ffast-math / -ffp-contract=<x> token
-# (the exact-token match's true positives) must still be rejected -- one
-# case per conflicting flag (the pre-existing 3.regression case above only
-# ever covered -Ofast).
+# A real, bare -Ofast / -ffast-math / -ffp-contract=<x> token (the exact-token
+# match's true positives) must be rejected -- one case per conflicting flag.
 check_real_conflict_rejected() {
     label="$1"; flag="$2"
     log="$SCRATCH/log_real_conflict_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_')"
@@ -422,12 +390,10 @@ check_real_conflict_rejected "ofast"          "-Ofast"
 check_real_conflict_rejected "fast-math"      "-ffast-math"
 check_real_conflict_rejected "fp-contract"    "-ffp-contract=fast"
 
-# The exact-token check's own internal variable (FP_CONFLICT_FLAGS) must
-# itself be immune to a command-line/`-e` override -- otherwise `make
+# The exact-token check's own internal variable (FP_CONFLICT_FLAGS) must itself
+# be immune to a command-line/`-e` override -- otherwise `make
 # FP_CONFLICT_FLAGS= EXTRA_CFLAGS=-Ofast` would silently defeat the whole
-# conflict check while a real -Ofast still reaches the compiler (confirmed
-# empirically as a genuine gap before the matching override-rejection guard
-# was added alongside FP_CONFLICT_FLAGS itself).
+# conflict check while a real -Ofast still reaches the compiler.
 check_override_rejected "FP_CONFLICT_FLAGS" "" "-Ofast" cmdline
 check_override_rejected "FP_CONFLICT_FLAGS" "" "-Ofast" dashe
 

@@ -28,10 +28,10 @@ def c_float(text):
     """Parse a C float macro, rejecting literals a C compiler would not accept.
 
     The `f` suffix requires a FLOATING constant, so `-20f` is a syntax error
-    while `-20.0f` is fine.  This check used to just strip the suffix and call
-    float(), which accepts both -- so a header that could not compile still
-    passed the contract test.  Only the builds that #include process.h caught
-    it, and those are not what this file is guarding.
+    while `-20.0f` is fine.  Stripping the suffix and calling float() accepts
+    both, so a header that could not compile would still pass the contract
+    test; only the builds that #include process.h would catch it, and those are
+    not what this file is guarding.
     """
     body = text.strip().strip('()').strip()
     if not _C_FLOAT.match(body):
@@ -112,9 +112,8 @@ def main():
     assert int(macro(header, 'RNNOISE_LOOKAHEAD').split()[0]) == cfg.getint(
         'signal', 'lookahead_frames')
     # Changing min_bins_per_band moves the ERB band borders, which changes the
-    # filterbank matrices and invalidates every checkpoint and generated table.
-    # It used to be a bare literal in train.py and gen_rnnoise_tables.c with no
-    # guard at all.
+    # filterbank matrices and invalidates every checkpoint and generated table,
+    # so config.ini, train.py and gen_rnnoise_tables.c must agree on it.
     assert int(macro(header, 'RNNOISE_MIN_BINS_PER_BAND').split()[0]) == cfg.getint(
         'signal', 'min_bins_per_band', fallback=2)
 
@@ -124,10 +123,10 @@ def main():
 def test_main():
     """Expose main() to pytest.
 
-    This file is script-shaped (Makefile runs it directly), so without a
-    ``test_``-prefixed entry point pytest collected ZERO items from it and
-    still reported the run green -- the C/Python parity and feature-contract
-    guards were simply absent from any `pytest` invocation.
+    This file is script-shaped (Makefile runs it directly); without a
+    ``test_``-prefixed entry point pytest would collect ZERO items from it and
+    still report the run green, leaving the C/Python parity and
+    feature-contract guards absent from any `pytest` invocation.
     """
     main()
 

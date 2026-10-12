@@ -63,37 +63,27 @@ typedef struct {
 
 /* log_erb_dfn_mean_cplx_unit_0_4k_v8 constants.  Keep byte-for-byte aligned with
  * config.ini [feature] and checkpoint validation in train.py.
- * v4 removes the erb_norm_clip/spec_clip deployment safety clamp v3 kept on
- * top of the DeepFilterNet formula -- verified against upstream
- * Rikorose/DeepFilterNet libDF/src/lib.rs (band_mean_norm_erb/band_unit_norm)
- * and this repo's own AINR/DeepFilterNet2 port that neither clips.
- * v5 fixes the ERB band-border minimum-width enforcement in
- * gen_rnnoise_tables.c (see that file for the algorithm; train.py's
- * erb_bandborder() is the Python side of the same fix) -- changes the
- * erb_fwd/erb_inv tables below.
- * v8 replaces libDF's imported normaliser init with values measured on this
- *     project's own 16 kHz corpus.  -60/-90 dB and 0.001/0.0001 are calibrated
- *     for libDF's rectangular, energy-MEAN filterbank; this port sums over a
- *     triangular overlapping bank, so those constants started the EMA
- *     +35..+48 dB away from where the features actually sit.  The ERB pair is
- *     rounded (fit gave -24.5/-41.9, costing 0.67 dB RMS) because it is in dB;
- *     the spec pair is NOT rounded past one significant figure because it is a
- *     linear magnitude the model divides by as x/sqrt(state), where 0.001 vs
- *     the measured 0.008161 would put features 2.86x out at the top bin.
- * v7 reverts to deriving the decay from tau (1 s), matching upstream libDF's
- *     _calculate_norm_alpha(sr, hop, tau): 16k/hop256 -> 0.984.  Pinning alpha
- *     at 0.99 gave a 1.59 s memory, so a 3 s training segment ended with ~15%
- *     of the init value still present -- every frame the model saw was in the
- *     init-dominated transient.
- * v6 pinned the normaliser decay directly (RNNOISE_*_NORM_ALPHA = 0.99) instead
- * of deriving it from tau.  alpha is the per-FRAME decay, so pinning it keeps
- * the normaliser's memory at 1/(1-alpha) = 100 frames under any sr/hop, which
- * is the invariant the GRU's learned time constants actually depend on;
- * deriving from tau pins it in seconds and lets the frame count drift.
- * ⚠ The longer decay stays harmless only while the INIT values match the
- * steady-state distribution -- see calibrate_norm_init.py.  Changing alpha
- * without recalibrating the init reintroduces a warm-up transient that now
- * spans 1.6x the training segment. */
+ * Feature formulas follow upstream Rikorose/DeepFilterNet libDF/src/lib.rs
+ * (band_mean_norm_erb/band_unit_norm) and this repo's AINR/DeepFilterNet2
+ * port; neither applies an erb_norm_clip/spec_clip clamp, and neither does this.
+ * ERB band borders: the minimum-width enforcement is in gen_rnnoise_tables.c
+ * (algorithm described there); train.py's erb_bandborder() is its Python
+ * counterpart. Both define the erb_fwd/erb_inv tables.
+ * Normaliser init values are measured on this project's 16 kHz corpus.
+ *     libDF's -60/-90 dB and 0.001/0.0001 are calibrated for its rectangular,
+ *     energy-MEAN filterbank; this port sums over a triangular overlapping
+ *     bank, which would start the EMA +35..+48 dB away from where the
+ *     features sit. The ERB pair is rounded because it is in dB; the spec
+ *     pair is NOT rounded past one significant figure because it is a linear
+ *     magnitude the model divides by as x/sqrt(state), where 0.001 vs the
+ *     measured 0.008161 would put features 2.86x out at the top bin.
+ * Normaliser decay is derived from tau (1 s) as in upstream libDF
+ *     _calculate_norm_alpha(sr, hop, tau): 16k/hop256 -> 0.984. alpha is the
+ *     per-FRAME decay, so the memory is 1/(1-alpha) frames.
+ * ⚠ The decay stays harmless only while the INIT values match the
+ * steady-state distribution -- see calibrate_norm_init.py. Changing alpha
+ * requires recalibrating the init, otherwise the warm-up transient grows
+ * with the memory length. */
 #define RNNOISE_FEATURE_VERSION       "log_erb_dfn_mean_cplx_unit_0_4k_v8"
 #define RNNOISE_ERB_NORM_TAU_SEC          1.0f
 #define RNNOISE_ERB_NORM_ALPHA            0.984f
@@ -137,7 +127,7 @@ typedef struct {
 } RNNoiseState;
 
 /* 初始化狀態 (歸零 + ERB/complex norm 初值; 內部亦會呼叫
- * rnnoise_tables_init() — 見下方說明, 現為 no-op) */
+ * rnnoise_tables_init() — 見下方說明, 為 no-op) */
 void rnnoise_state_init(RNNoiseState *st);
 
 void rnnoise_model_state_init(RNNoiseModelState *state);
@@ -146,7 +136,7 @@ void rnnoise_model_state_init(RNNoiseModelState *state);
  * h1_out/h2_out/h3_out are bound to hidden[] (see above), so nothing is
  * copied and calling this is optional for a trusted runtime. Returns 0 when
  * all 3 x 128 elements are finite. NULL returns -1. Any NaN or Inf zeroes
- * the whole state (the previous value no longer exists to restore) and
+ * the whole state (there is no previous value to restore) and
  * returns -1, so one bad invocation cannot poison every later GRU step. The
  * check is finite-only: a partial or mixed write that is still finite cannot
  * be detected. */
@@ -213,7 +203,7 @@ int rnnoise_compute_features(RNNoiseState *st,
  * 也等價於直接對 spectrum 做同樣的線性混合, 但成本只需 N_BANDS(22) 次而非
  * N_BINS(257) 次。
  * atten_lim_db <= 0 (或呼叫端選擇不呼叫這個函式) 為 no-op/停用, 行為與
- * 拿掉這個功能前完全相同。
+ * 未呼叫本函式時完全相同。
  * band_gains: 長度 RNNOISE_N_BANDS, 就地修改。 */
 /* band_gains 必須有 RNNOISE_N_BANDS 個元素：本函式無條件寫滿整段。 */
 void rnnoise_apply_atten_lim(float band_gains[RNNOISE_N_BANDS],

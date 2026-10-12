@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Regression tests for the DeepFilterNet 3 MultiResSpecLoss training objective."""
+"""Tests for the DeepFilterNet 3 MultiResSpecLoss training objective."""
 
 import configparser
 import pathlib
@@ -131,10 +131,10 @@ def test_erb_irm_loss_is_configured_and_well_behaved():
 def test_pure_erb_model_accepts_the_training_loop_call():
     """The training loop passes spec_features=None when use_complex_input=False.
 
-    forward() used to dereference .ndim before checking the flag, so the
-    default configuration crashed on the first batch.  Nothing covered this:
-    the end-to-end test below builds its own features and always passes a real
-    tensor.  The argument must stay accepted (ONNX/C signature stability) while
+    forward() must check the flag before dereferencing .ndim, otherwise the
+    default configuration crashes on the first batch.  The end-to-end test
+    below builds its own features and always passes a real tensor, so this
+    case needs its own test.  The argument must stay accepted (ONNX/C signature stability) while
     None must also work.
     """
     cfg = configparser.ConfigParser()
@@ -288,9 +288,9 @@ def test_pure_noise_end_to_end_model_backward():
     """The CONFIGURED objective, through the model, on a pure-noise target.
 
     This mirrors train.py's batch_loss: pure-ERB features (spec_features=None),
-    the configured ERB-IRM term, and MRSL added only when it is enabled.  It
-    used to hardcode MRSL, so it kept passing while the configured objective
-    was something else entirely.
+    the configured ERB-IRM term, and MRSL added only when it is enabled (a
+    hardcoded MRSL would keep passing while the configured objective was
+    something else entirely).
     """
     cfg = configparser.ConfigParser()
     assert cfg.read(ROOT / 'config.ini')

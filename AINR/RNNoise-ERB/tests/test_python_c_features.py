@@ -84,11 +84,10 @@ _BRIDGE = {}
 def build_bridge():
     """Compile the C bridge once per process and keep it mapped.
 
-    It used to be built inside a ``TemporaryDirectory`` that was torn down
-    while the .dylib was still loaded through ctypes.  Running this file
-    directly hid the problem -- the process exited immediately afterwards --
-    but under pytest the process lives on and the next module import crashed
-    with SIGTRAP.  The build directory now survives until interpreter exit.
+    The build directory survives until interpreter exit: tearing it down while
+    the .dylib is still loaded through ctypes would crash the next module
+    import with SIGTRAP under pytest, where the process lives on (run directly,
+    the process exits immediately and hides the problem).
     """
     if 'lib' not in _BRIDGE:
         tmpdir = tempfile.mkdtemp(prefix='rnnoise-feature-parity-')
@@ -128,10 +127,10 @@ def deterministic_spectra(n_frames=12):
 
 
 def main():
-    # Read the feature constants rather than restating them.  This file used to
-    # hardcode alpha and the four init values, so pinning erb_norm_alpha in
-    # config.ini + process.h left the test comparing C-at-0.99 against
-    # Python-at-0.984 and reporting a parity failure that was purely its own.
+    # Read the feature constants rather than restating them: hardcoding alpha
+    # and the four init values would make a change of erb_norm_alpha in
+    # config.ini + process.h show up as a parity failure that is purely this
+    # test's own.
     # C-vs-Python parity is what this test exists to check; the constants both
     # sides use are test_feature_contract.py's job.
     cfg = configparser.ConfigParser()
@@ -211,11 +210,10 @@ def main():
     # enhance.py) bit-for-bit-equivalent within float32 tolerance, both
     # for the disabled (<=0) no-op path and the active-mixing path.
     # MUST be N_BANDS long: rnnoise_apply_atten_lim writes
-    # RNNOISE_N_BANDS entries unconditionally.  This used to pass a
-    # 5-element array, overflowing the heap by 17 floats on every call
-    # with atten_lim_db > 0.  The process exited before anything noticed;
-    # under pytest the corruption surfaced later as a malloc abort inside
-    # an unrelated torch op.
+    # RNNOISE_N_BANDS entries unconditionally; a shorter array would overflow
+    # the heap on every call with atten_lim_db > 0, and under pytest the
+    # corruption would surface later as a malloc abort inside an unrelated
+    # torch op.
     py_gains = torch.linspace(0.0, 1.0, N_BANDS, dtype=torch.float32)
     for atten_lim_db in (0.0, -3.0, 6.0, 12.0, 40.0):
         c_gains = py_gains.numpy().copy().astype(np.float32)
@@ -231,10 +229,10 @@ def main():
 def test_main():
     """Expose main() to pytest.
 
-    This file is script-shaped (Makefile runs it directly), so without a
-    ``test_``-prefixed entry point pytest collected ZERO items from it and
-    still reported the run green -- the C/Python parity and feature-contract
-    guards were simply absent from any `pytest` invocation.
+    This file is script-shaped (Makefile runs it directly); without a
+    ``test_``-prefixed entry point pytest would collect ZERO items from it and
+    still report the run green, leaving the C/Python parity and
+    feature-contract guards absent from any `pytest` invocation.
     """
     main()
 
