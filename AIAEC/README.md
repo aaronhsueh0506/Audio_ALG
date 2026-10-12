@@ -142,9 +142,14 @@ already generated dataset or silently redefine an epoch.
 
 ## ONNX export and calibration
 
-The accelerator graphs are stateless: convolution history, attention rings
-and recurrent state are explicit graph inputs and outputs. Complex values use
-real/imaginary pairs.
+The accelerator graphs are stateless: convolution windows, attention rings
+and recurrent state are explicit rank-4 graph inputs and outputs. Each output
+has exactly the shape of the input it continues: a window input is cut by a
+Slice on the input side and the new frame is concatenated, so a runtime can
+bind every `*_out` to the address of its input (`state_binding =
+in_place_same_address`). `export_graph` checks that structure on every file it
+writes (`validate_inplace_state_contract` in `_onnx_contract.py`). Complex
+values use real/imaginary pairs.
 
 One calibration run produces both deployment artifacts: it exports and
 parity-checks the ONNX graph the tensors bind to (default `<output>.onnx`,
@@ -202,7 +207,7 @@ and deepvqe_prepost, one object each.
 
 | Model | Accelerator output | Host composition |
 |---|---|---|
-| Align-ULCNet | complex mask (planar) + full next state (copied by `ulcnet_model_io_inherit()`, or written in place) | `ulcnet_prepost` class (ulcnet_model_io_commit() multiplies the compressed error by the mask and inverts the power, then WOLA) |
+| Align-ULCNet | complex mask (planar) + full next state windows (written in place) | `ulcnet_prepost` class (ulcnet_model_io_commit() multiplies the compressed error by the mask and inverts the power, then WOLA) |
 | Align-CRUSE | real mask | aiaec_apply_real_mask() |
 | DeepVQE-S | 3x3 complex CCM taps | `deepvqe_prepost` class (deepvqe_ccm_process()) |
 | CAGCRN | complex mask | aiaec_apply_complex_mask() |
@@ -212,8 +217,11 @@ Align-ULCNet and DeepVQE-S each ship a pre/post *class*
 everything between the caller's audio and the accelerator's tensors behind
 one opaque object: `_get_mem_size`/`_init` on a caller pool or
 `_create`/`_destroy` on the heap, then per hop `pre_process` ->
-`frame_inputs` -> (accelerator, then `*_inherit` when the runtime writes its own
-output tensors) -> `frame_commit` or `frame_skip` -> `post_process`. Each is compiled once with the io mode fixed at init: TIME
+`frame_inputs` -> (accelerator, with every state output bound to the address of
+its input) -> `frame_commit` or `frame_skip` -> `post_process`. Both classes
+also expose `*_state_generation()`, which counts the times the C side zeroed the
+state (reset, refused commit) so a board with fixed-point accelerator state can
+refill it with quantized zeros. Each is compiled once with the io mode fixed at init: TIME
 (hop in, hop out; the class runs the framing on the caller's `FftHandle`) or
 FREQ (spectrum in, spectrum out; for chaining behind the AEC/GSC seam, whose
 spectra are already in this center=False framing). Both AIAEC classes are one
@@ -228,8 +236,8 @@ spectra are torch.stft normalized=True on a 48 kHz/1024 grid, so chaining an
 AIAEC spectrum into it is a 32x scale error on a different grid -- see that
 header's warning block.
 
-Align-ULCNet state ownership (caller-owned pool, five state tensors taken over by
-inherit or bound in place, commit that validates and applies the mask) is documented in Align_ULCNet/README.md and
+Align-ULCNet state ownership (caller-owned pool, four state tensors bound in place,
+commit that validates and applies the mask) is documented in Align_ULCNet/README.md and
 implemented by ulcnet_model_io.c/.h.
 
 ## Tests

@@ -480,10 +480,9 @@ if (n == 1) {
     UlcnetModelIoInputs  in;
     UlcnetModelIoOutputs out;
     ulcnet_prepost_frame_inputs(p, &in, &out);   /* 指向本實例 pool 的 view */
-    /* 一般 runtime：輸出寫進它自己的 tensor（runtime_out），再複製回 state。
-     * 能把 *_out 綁到輸入位址的 runtime（NPU）直接寫 out，省略 inherit。 */
-    if (accelerator_run(&in, &runtime_out) != 0 ||
-        ulcnet_model_io_inherit(&out, &runtime_out) != 0 ||
+    /* 每個 out.*_out 綁到 in 的同名位址；先讀完所有 state 輸入、才寫輸出。
+     * （DFN2 的 runtime 寫自己的 tensor，再用 inherit 複製回 state，見下。） */
+    if (accelerator_run(&in, &out) != 0 ||
         ulcnet_prepost_frame_commit(p) != 0)
         ulcnet_prepost_frame_skip(p);            /* 保住 framing 節奏 */
 }
@@ -501,33 +500,37 @@ ulcnet_prepost_post_process(p, out_hop, &written);
   回 `0`，沒有開啟中的 frame 回 `-1`。
 - `_frame_commit()` 是**純驗證**：heads 與 state 都是有限值就成功（CCM ring／compose／synthesis 照常前進，
   commit 本身不複製 state）。就地路徑遇到任何一處非有限值時 state 已被加速器覆寫、**無法回滾**，
-  所以**所有遞迴 state 歸零**（冷啟動），framing／CCM ring 不前進、frame 維持開啟、回 `-1`（Align-ULCNet：key／value／logit 三個
-  history 與兩個 GRU hidden 共五個 state 全歸零；DeepFilterNet2：`h_gru` 與 pathway window 兩個遞迴張量，同時 `dfn2_prepost_state_generation()` 加 1；DeepVQE-S：16 個 state）。
+  所以**所有遞迴 state 歸零**（冷啟動）、state generation 加一，framing／CCM ring 不前進、frame 維持開啟、回 `-1`（Align-ULCNet：key／value／logit 三個
+  window 與 h_gru 共四個 state 全歸零；DeepFilterNet2：`h_gru` 與 pathway window 兩個遞迴張量；DeepVQE-S：16 個 state）。
   接著只有兩條路：`_frame_skip()`，或重新 `_frame_inputs()` 再從冷 state 跑一次加速器。
 - **commit 後面一定要有一次 `_frame_inputs()`**（`prepared` 閂鎖，三個類別皆然）：
   沒跑過的加速器不能把沒被碰過的 buffer 當成結果送出。
-- **遞迴 state 有兩種綁定，其餘（prepare／`_frame_inputs`、commit／validate、adapter、pipeline）共用。**
-  每個 state 張量在 pool 裡只有一個 buffer，位址在實例壽命內固定（沒有交替的 bank、沒有指標交換）。
-  - **一般路徑（複製）**：板端通常是 ONNX 風格的 runtime，輸出寫進它自己擁有的 tensor；host 呼叫該類別的
-    inherit 把它們複製進 state，然後才 commit：Align-ULCNet 用 `ulcnet_model_io_inherit(destination, runtime)`
-    （destination 是 `_frame_inputs()` 回的 `UlcnetModelIoOutputs`，runtime 是同型別、裝 runtime 自己的指標與相同元素數），
-    DeepVQE-S 用 `deepvqe_prepost_outputs_inherit()`（taps＋16 個 state 輸出）。DFN2 與 GTCRN 沒有複製路徑，
-    只有下面的就地綁定。所有 inherit 都是**先檢查再複製**：
+- **遞迴 state 的綁定。** 每個 state 張量在 pool 裡只有一個 buffer，位址在實例壽命內固定（沒有交替的 bank、沒有指標交換）。
+  - **Align-ULCNet、DeepVQE-S、DFN2、GTCRN：就地綁定，沒有複製路徑。** runtime 把每個 `*_out`（C 端欄位名 `*_next`）綁到
+    `_frame_inputs()` 回傳的同名輸入位址，**先讀完**所有 state 輸入、**才寫**輸出；graph 回完整的下一個 window
+    （位移在 graph 內），CPU 不搬、不複製。commit／validate 被拒時無法回滾：遞迴 state 從零重來、state generation 加一；
+    回報失敗的 runtime 視為沒有寫入。
+  - **RNNoise-ERB（複製路徑）**：runtime 把 `h1_out`／`h2_out`／`h3_out` 寫進自己擁有的 tensor，host 呼叫
+    `rnnoise_model_state_inherit()` 複製進 state。inherit 是**先檢查再複製**：
     任何將被複製的 tensor 有非有限值，就一個都不複製、回 `-1`、state 與原來逐位元相同，
     回呼回傳非 0、類別取 `_frame_skip()`，這一幀被跳過。指標等於目的位址的 tensor 視為已就地寫入，
     不複製也不由 inherit 檢查，所以同一個呼叫兩種綁定都適用。
-  - **就地綁定（選用的省法）**：能把每個 `*_out`／`*_next` 綁到對應輸入位址的 runtime（例如 NPU）直接寫 state，
-    **只省掉 inherit 這一個呼叫**。runtime 必須**先讀完**某個 state 輸入、**才寫**同位址的輸出；做不到這個順序的
-    runtime 要自己用暫存區暫存讀取。這條路徑的 commit／validate 被拒時無法回滾：遞迴 state 從零重來；
-    回報失敗的 runtime 視為沒有寫入。
-  非有限值以外的「寫一半／混寫」兩條路徑都偵測不到。
-- **Align-ULCNet 的五個 state**（`key_history`／`value_history`／`logit_history`／`h_gru0`／
-  `h_gru1` ↔ 對應的 `*_out`）：graph 回每個 state 的**完整下一個值**、shape 與輸入完全相同，K/V（newest-first）
-  與 logit（oldest-first）的 ring 位移在 graph 內完成（丟掉最舊一格），沒有 CPU 端的 ring helper；`output` 是學到的複數 mask（planar `[1,2,1,BINS]`），commit 驗證後以壓縮域 error 乘上它並逆冪。
-  成本：複製路徑每幀把整組 K/V＋logit 歷史複製進 state（48 kHz、D=64 時每 hop 871,424 B：K/V 838,656 B＋
-  logit 32,768 B）；全歷史邊界省下的 CPU 搬運只有就地綁定時才成立。
-- **Align-ULCNet 的 commit 有限性檢查只看「這一幀 graph 新寫的那一格」**：`output`、K/V 的 slot 0、logit 的
-  最後一幀，以及兩個 GRU hidden 全部；較舊的 ring 格不重查，留在那裡的非有限值會在下一幀進到 `output` 被擋下。
+  - 複製路徑的模型也可就地綁定（把每個 `*_next` 綁到輸入位址、省略 inherit）；做法與上面相同。
+  非有限值以外的「寫一半／混寫」都偵測不到。
+- **state generation（Align-ULCNet、DeepVQE-S）**：`ulcnet_model_io_state_generation()`、
+  `ulcnet_prepost_state_generation()`、`ulcnet_accelerator_adapter_state_generation()`、
+  `deepvqe_prepost_state_generation()` 回傳 C 端把 state 清零的次數：`_reset()` 與被拒絕的 `_frame_commit()` 各加一，
+  新建實例為 0，成功的 commit、`_frame_skip()` 與再次呼叫被拒的 commit 都不動它；`NULL` 回 0，數值回繞於 2^32。
+  定點 accelerator 的 state 緩衝在 C 清零時不會跟著變，板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。
+- **Align-ULCNet 的四個 state**（`key_history`／`value_history`／`logit_history`／`h_gru`
+  ↔ 對應的 `*_out`）：輸入是完整 window、graph 回每個 state 的**完整下一個 window**，shape 與輸入完全相同：
+  K/V `[1,32,D,TA]`（newest-first）取輸入 slot `0..D-2` 再把新一幀接在前面，logit `[1,32,5,D]`（oldest-first）
+  取輸入 frame `1..4` 再把新的一列接在後面（輸入端 Slice 加 Concat，沒有 state 輸出由 Slice 產生），`h_gru`
+  `[1,4,1,128]` 是兩顆 subband GRU 的 hidden 疊在一起；沒有 CPU 端的 ring helper。`output` 是學到的複數 mask
+  （planar `[1,2,1,BINS]`），commit 驗證後以壓縮域 error 乘上它並逆冪。
+- **Align-ULCNet 的 commit 有限性檢查只看「這一幀 graph 新寫的那一格」**：`output`、每個 channel 的 K/V slot 0
+  與 logit 最後一幀，以及 `h_gru` 全部；較舊的格子與被丟掉的那一格不重查，留在那裡的非有限值會在下一幀進到 `output` 被擋下。
+  DeepVQE-S 同理：每個 tap、`h_gru` 全部，以及每個 window 的最新一幀（attention ring 的 slot 0、conv／score window 的最後一幀）。
   `_frame_skip()` 不動任何 state（維持它當下的樣子；就地路徑視同回報失敗的 runtime 沒寫）。
 
 拒絕情境整理：
@@ -538,7 +541,7 @@ ulcnet_prepost_post_process(p, out_hop, &written);
 | `_pre_process` / `_pre_process_freq` | 與實例的 `io_mode` 不符 | `-1` |
 | `_frame_inputs` / `_frame_commit` / `_frame_skip` | 沒有開啟中的 frame | `-1` |
 | `_frame_commit` | 沒有 `_frame_inputs()` 在前面 | `-1`，狀態不動 |
-| `*_inherit` | 任何將被複製的 tensor 非有限、NULL、缺 tensor 或元素數不符 | `-1`，不複製任何東西，state 逐位元不變 |
+| `dfn2_*_inherit` 等複製路徑 | 任何將被複製的 tensor 非有限、NULL、缺 tensor 或元素數不符 | `-1`，不複製任何東西，state 逐位元不變 |
 | `dfn2_prepost_set_erb_matrices` / `_set_atten_lim` | frame 開著 | `-1` |
 
 ### 6.3 skip 政策：三個模型不一樣
@@ -568,6 +571,7 @@ UlcnetPrepost *ulcnet_prepost_init_ex(void *pool, size_t bytes, const UlcnetPrep
 UlcnetPrepost *ulcnet_prepost_create(const UlcnetPrepostConfig *cfg);
 void ulcnet_prepost_destroy(UlcnetPrepost *p);
 void ulcnet_prepost_reset(UlcnetPrepost *p);
+uint32_t ulcnet_prepost_state_generation(const UlcnetPrepost *p);
 int  ulcnet_prepost_hop_size(const UlcnetPrepost *p);
 int  ulcnet_prepost_num_bins(const UlcnetPrepost *p);
 int  ulcnet_prepost_io_mode(const UlcnetPrepost *p);
@@ -624,10 +628,12 @@ const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(const DeepVqePrepost 
   `[1,1,BINS,DEEPVQE_TIME_ORDER*DEEPVQE_FREQ_TAPS*2]`（16 kHz grid 為
   `[1,1,257,18]`，末軸仍按 `[time][frequency][RI]` 排列）＋ 16 個 next state。
   按 index 綁的 adapter 必須用這個列舉，按名字綁的用 `_state_name()`。
-- DeepVQE-S 回的是**每個 state 的完整下一個值**（不是差量），pool 裡每個 state 只有一份 buffer，
-  一般 runtime 的輸出由 `deepvqe_prepost_outputs_inherit()` 複製進來、就地綁定者省略它；commit 的有限性檢查每幀走過整個狀態（約 480 KB），就地路徑遇非有限值時整組 state 歸零。
+- DeepVQE-S 回的是**每個 state 的完整下一個 window**（不是差量；shape 與輸入相同，全部 rank 4，`h_gru` 為
+  `[1,1,1,192]`，conv window 4 幀、score window 5 幀），pool 裡每個 state 只有一份 buffer，runtime 把 `*_out` 就地綁定到輸入位址；
+  commit 的有限性檢查只走每個 tap、`h_gru` 與各 window 的最新一幀，遇非有限值時整組 state 歸零、
+  `deepvqe_prepost_state_generation()` 加一（`uint32_t deepvqe_prepost_state_generation(const DeepVqePrepost *p)`）。
 - `descriptor_validate()` 拿 ONNX/JSON metadata 裡的 13 欄 `c_descriptor` 對本 build 的 ABI 逐欄比對，
-  只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 3（舊 layout 產生的 ONNX／JSON 與 calibration 資料須重新匯出，加速器程式須重編）。
+  只有 `delay_depth` 是 export-time 部署參數、僅做範圍檢查；`DEEPVQE_PREPOST_LAYOUT_VERSION` = 4（1–3 退役；舊 layout 產生的 ONNX／JSON 與 calibration 資料須重新匯出，加速器程式須重編）。
 - D 範圍 `DEEPVQE_PREPOST_MIN_D`=1 到 `DEEPVQE_PREPOST_MAX_D`=256，出貨值
   `DEEPVQE_PREPOST_DEFAULT_D`=32（16 kHz 上的半秒搜尋範圍；D 是 export 期參數，圖 shape 與 C 傳入的 `delay_depth` 必須相同，descriptor 只檢查範圍，抓不到不一致）。
 - grid 只有 16 kHz/512/256：`aiaec_process.h` 帶 `#error` 守衛，grid 換掉是編譯失敗而不是默默重新解讀張量。

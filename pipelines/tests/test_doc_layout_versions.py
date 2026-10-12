@@ -11,8 +11,9 @@ C 測試早就把字面值釘死在 header 上（``test_4aec_nr_res.c`` 的
 ``FOUR_AEC_NR_RES_LAYOUT_VERSION == 16u`` 那一列），文件端在此補上對稱的閘。
 
 只檢查**具名巨集**的宣稱（``FOUR_AEC_NR_RES_LAYOUT_VERSION = 16``）。文件裡另有
-「layout v6 起新增四個 delay 欄位」這類**沿革**敘述，以及 AINR/AIAEC 各模型自有的
-layout 版號；那些不是在陳述目前值，刻意不納入。
+「layout v6 起新增四個 delay 欄位」這類**沿革**敘述不是在陳述目前值，刻意不納入；
+AIAEC 兩個 C 類別的版號（``ULCNET_MODEL_IO_LAYOUT_VERSION``、
+``DEEPVQE_PREPOST_LAYOUT_VERSION``）以具名巨集形式納入，AINR 各模型自有的版號則不在此表。
 """
 
 import pathlib
@@ -42,6 +43,10 @@ _SOURCES = {
         'pipelines/mono_aec_dfn_res/audio_pipeline_dfn.h',
     'FOUR_AEC_DFN_RES_LAYOUT_VERSION':
         'pipelines/4ch_aec_bf_dfn_res/4aec_dfn_res.h',
+    'ULCNET_MODEL_IO_LAYOUT_VERSION':
+        'AIAEC/Align_ULCNet/ulcnet_model_io.h',
+    'DEEPVQE_PREPOST_LAYOUT_VERSION':
+        'AIAEC/DeepVQE_S/deepvqe_prepost.h',
 }
 
 _DOC_ROOT = _REPO / 'docs'
