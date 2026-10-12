@@ -136,8 +136,9 @@ typedef struct AudioPipeline AudioPipeline;
  * size arithmetic runs, not just left to a downstream 0), aec_preset/nr_mode
  * against their defined enum values (rather than silently falling through
  * aec_config_from_preset's/anr_config_for_mode's own balanced-default
- * fallback), and aec_only/enable_cng/legacy_amin against {0,1} (rather than
- * being treated as truthy by a stray nonzero value downstream).
+ * fallback), and aec_only/enable_nr/enable_res/enable_cng/legacy_amin
+ * against {0,1} (rather than being treated as truthy by a stray nonzero
+ * value downstream).
  *
  * @return 0 on success (*out filled), -1 on NULL args or invalid cfg.
  */
