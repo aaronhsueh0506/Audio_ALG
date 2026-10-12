@@ -1147,7 +1147,7 @@ $(OBJ_DIR)/test_se_common.o: tests/test_se_common.c common/se_config.h common/se
 	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_readme_flow.o: tests/test_readme_flow.c mono_aec_nr_res/audio_pipeline.h mono_aec_dfn_res/audio_pipeline_dfn.h mono_alignulcnet/audio_pipeline_ulcnet.h common/se_stage.h common/se_anr_stage.h tests/dfn_test_fixture.h | _cfg_guard
-	$(CC) $(CFLAGS) -Imono_aec_dfn_res -MD -MP -c -o $@ $<
+	$(CC) $(CFLAGS) -Imono_aec_dfn_res -I$(ULCNET_DIR) $(ULCNET_GRID_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/test_dfn_res_stage.o: tests/test_dfn_res_stage.c dfn_res_stage.h tests/dfn_test_fixture.h dfn_unit_partition.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
