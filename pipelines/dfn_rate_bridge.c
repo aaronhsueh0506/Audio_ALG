@@ -2,7 +2,6 @@
  * 48 kHz grid; see dfn_rate_bridge.h for the signal, clock and delay
  * contract. */
 
-#include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,18 +9,16 @@
 #include "dfn_rate_bridge.h"
 #include "audio_resampler.h"
 #include "fft_wrapper.h"
-#include "simd_kernels.h"
-#include "simd_kernel_nn.h"
+#include "audio_stft.h"
 
 #define BRIDGE_ALIGN 16u
 #define B48_FFT  DFN2_N_FFT
 #define B48_HOP  DFN2_HOP_LEN
 #define B48_BINS DFN2_N_BINS
-/* Each 48 kHz FIFO keeps the previous 512 samples (the analysis history)
- * in front of at most 511 leftover plus one native hop upsampled (<= 768);
- * the native output FIFO holds the prefill (<= one hop) plus one hop of
- * surplus plus two downsampled 48 kHz frames (<= 2 * 171). */
-#define FIFO48_CAP   2048
+/* Each 48 kHz FIFO holds at most 511 leftover samples plus one native hop
+ * upsampled (<= 768); the native output FIFO holds the prefill (<= one hop)
+ * plus one hop of surplus plus two downsampled 48 kHz frames (<= 2 * 171). */
+#define FIFO48_CAP   1536
 #define OUT_FIFO_CAP 1024
 /* Hops simulated at init to find the schedule's largest emitted-minus-
  * produced deficit; every supported grid repeats within four hops, so eight
@@ -39,24 +36,23 @@ struct DfnRateBridge {
     AudioResampler *up_e;
     AudioResampler *up_p;
     AudioResampler *down;
-    float *win_n;
-    float *win48;
-    float *ola_e;
-    float *ola_p;
-    float *ola48;
-    float *ifft_n;
-    float *ifft48;
+    float *win_n;           /* shared by the native synthesis objects */
+    float *win48;           /* shared by the 48 kHz analysis and synthesis objects */
+    AcIstft *synth_e;       /* native grid, estimate lane */
+    AcIstft *synth_p;       /* native grid, apply lane */
+    AcIstft *synth48;       /* 48 kHz stage output */
+    AcStft *stft_e;         /* 48 kHz analysis, estimate lane (owns its history) */
+    AcStft *stft_p;         /* 48 kHz analysis, apply lane */
     float *e_hop;
     float *p_hop;
-    float *fifo_e;          /* [512 history | pending 48 kHz samples] */
+    float *fifo_e;          /* pending 48 kHz samples */
     float *fifo_p;
-    float *frame48;
     float *chunk48;
     float *out_fifo;
     Complex *spec_e48;
     Complex *spec_p48;
     Complex *out48;
-    int fill;               /* pending samples beyond the history, both lanes */
+    int fill;               /* pending samples in each 48 kHz FIFO */
     int out_fill;
     long long frames48;
     int last_hop_frames;
@@ -100,11 +96,24 @@ typedef struct Resolved {
     int hop_n;
     size_t fft_n_bytes;
     size_t fft48_bytes;
+    size_t synth_n_bytes;
+    size_t synth48_bytes;
+    size_t stft48_bytes;
     size_t up_bytes;
     size_t down_bytes;
     DfnResStageMemReq stage_req;
     size_t bytes;
 } Resolved;
+
+/* Bytes of an STFT or ISTFT object that borrows the bridge's FFT handle and
+ * window table: the size of the object that carves its own, less those two
+ * regions. A borrowed handle exists only after the pool does, so the size
+ * cannot be asked for it directly. */
+static size_t borrowed_bytes(size_t own_bytes, int fft_size) {
+    size_t shared = align_up(fft_get_mem_size(fft_size)) +
+                    align_up((size_t)fft_size * sizeof(float));
+    return own_bytes > shared ? align_up(own_bytes - shared) : 0u;
+}
 
 static int resolve(const DfnRateBridgeConfig *cfg, Resolved *r) {
     size_t value;
@@ -116,9 +125,19 @@ static int resolve(const DfnRateBridgeConfig *cfg, Resolved *r) {
         return -1;
     r->fft_n_bytes = fft_get_mem_size(r->fft_n);
     r->fft48_bytes = fft_get_mem_size(B48_FFT);
+    {
+        AcStftConfig sc;
+        ac_stft_config_default(&sc, r->fft_n);
+        r->synth_n_bytes = borrowed_bytes(ac_istft_get_mem_size(&sc), r->fft_n);
+        ac_stft_config_default(&sc, B48_FFT);
+        r->synth48_bytes = borrowed_bytes(ac_istft_get_mem_size(&sc), B48_FFT);
+        r->stft48_bytes = borrowed_bytes(ac_stft_get_mem_size(&sc), B48_FFT);
+    }
     r->up_bytes = audio_resampler_get_mem_size(cfg->sample_rate, DFN2_SR, 1);
     r->down_bytes = audio_resampler_get_mem_size(DFN2_SR, cfg->sample_rate, 1);
-    if (!r->fft_n_bytes || !r->fft48_bytes || !r->up_bytes || !r->down_bytes)
+    if (!r->fft_n_bytes || !r->fft48_bytes || !r->synth_n_bytes ||
+        !r->synth48_bytes || !r->stft48_bytes || !r->up_bytes ||
+        !r->down_bytes)
         return -1;
     value = align_up(sizeof(DfnRateBridge));
 #define ADD_REGION(bytes_) do { \
@@ -134,16 +153,15 @@ static int resolve(const DfnRateBridgeConfig *cfg, Resolved *r) {
     ADD_REGION(r->down_bytes);
     ADD_REGION((size_t)r->fft_n * sizeof(float));        /* win_n   */
     ADD_REGION((size_t)B48_FFT * sizeof(float));         /* win48   */
-    ADD_REGION((size_t)r->fft_n * sizeof(float));        /* ola_e   */
-    ADD_REGION((size_t)r->fft_n * sizeof(float));        /* ola_p   */
-    ADD_REGION((size_t)B48_FFT * sizeof(float));         /* ola48   */
-    ADD_REGION((size_t)r->fft_n * sizeof(float));        /* ifft_n  */
-    ADD_REGION((size_t)B48_FFT * sizeof(float));         /* ifft48  */
+    ADD_REGION(r->synth_n_bytes);                        /* synth_e */
+    ADD_REGION(r->synth_n_bytes);                        /* synth_p */
+    ADD_REGION(r->synth48_bytes);                        /* synth48 */
+    ADD_REGION(r->stft48_bytes);                         /* stft_e  */
+    ADD_REGION(r->stft48_bytes);                         /* stft_p  */
     ADD_REGION((size_t)r->hop_n * sizeof(float));        /* e_hop   */
     ADD_REGION((size_t)r->hop_n * sizeof(float));        /* p_hop   */
     ADD_REGION((size_t)FIFO48_CAP * sizeof(float));      /* fifo_e  */
     ADD_REGION((size_t)FIFO48_CAP * sizeof(float));      /* fifo_p  */
-    ADD_REGION((size_t)B48_FFT * sizeof(float));         /* frame48 */
     ADD_REGION((size_t)B48_HOP * sizeof(float));         /* chunk48 */
     ADD_REGION((size_t)OUT_FIFO_CAP * sizeof(float));    /* out_fifo*/
     ADD_REGION((size_t)B48_BINS * sizeof(Complex));      /* spec_e48*/
@@ -204,22 +222,15 @@ static int descriptor_matches(const DfnRateBridgeMemReq *a,
         a->bytes >= b->bytes;
 }
 
-static void make_root_hann(float *window, int n) {
-    int i;
-    for (i = 0; i < n; ++i)
-        window[i] = sqrtf(0.5f - 0.5f * cosf(
-            2.0f * (float)M_PI * (float)i / (float)n));
-}
-
 static void clear_streams(DfnRateBridge *b) {
     audio_resampler_reset(b->up_e);
     audio_resampler_reset(b->up_p);
     audio_resampler_reset(b->down);
-    memset(b->ola_e, 0, (size_t)b->fft_n * sizeof(float));
-    memset(b->ola_p, 0, (size_t)b->fft_n * sizeof(float));
-    memset(b->ola48, 0, (size_t)B48_FFT * sizeof(float));
-    memset(b->fifo_e, 0, (size_t)B48_HOP * sizeof(float));   /* history */
-    memset(b->fifo_p, 0, (size_t)B48_HOP * sizeof(float));
+    ac_istft_reset(b->synth_e);
+    ac_istft_reset(b->synth_p);
+    ac_istft_reset(b->synth48);
+    ac_stft_reset(b->stft_e);
+    ac_stft_reset(b->stft_p);
     memset(b->out_fifo, 0, (size_t)OUT_FIFO_CAP * sizeof(float));
     b->fill = 0;
     b->out_fill = b->prefill;
@@ -241,8 +252,8 @@ static int calibrate_prefill(DfnRateBridge *b) {
     audio_resampler_reset(b->down);
     for (t = 0; t < PREFILL_SIM_HOPS; ++t) {
         if (audio_resampler_process(b->up_e, b->e_hop, b->hop_n,
-                                    b->fifo_e + B48_HOP + fill,
-                                    FIFO48_CAP - B48_HOP - fill,
+                                    b->fifo_e + fill,
+                                    FIFO48_CAP - fill,
                                     &consumed, &produced) != 0 ||
             consumed != b->hop_n)
             return -1;
@@ -308,24 +319,40 @@ DfnRateBridge *dfn_rate_bridge_init_ex(void *mem, size_t bytes,
         return NULL;
     TAKE(b->win_n, float *, (size_t)r.fft_n * sizeof(float));
     TAKE(b->win48, float *, (size_t)B48_FFT * sizeof(float));
-    TAKE(b->ola_e, float *, (size_t)r.fft_n * sizeof(float));
-    TAKE(b->ola_p, float *, (size_t)r.fft_n * sizeof(float));
-    TAKE(b->ola48, float *, (size_t)B48_FFT * sizeof(float));
-    TAKE(b->ifft_n, float *, (size_t)r.fft_n * sizeof(float));
-    TAKE(b->ifft48, float *, (size_t)B48_FFT * sizeof(float));
+    ac_window_build(b->win_n, r.fft_n);
+    ac_window_build(b->win48, B48_FFT);
+    {
+        AcStftConfig nc, wc;
+        void *region;
+        ac_stft_config_default(&nc, r.fft_n);
+        nc.fft = b->fft_n_handle;
+        nc.window = b->win_n;
+        ac_stft_config_default(&wc, B48_FFT);
+        wc.fft = b->fft48;
+        wc.window = b->win48;
+        TAKE(region, void *, r.synth_n_bytes);
+        b->synth_e = ac_istft_init(region, r.synth_n_bytes, &nc);
+        TAKE(region, void *, r.synth_n_bytes);
+        b->synth_p = ac_istft_init(region, r.synth_n_bytes, &nc);
+        TAKE(region, void *, r.synth48_bytes);
+        b->synth48 = ac_istft_init(region, r.synth48_bytes, &wc);
+        TAKE(region, void *, r.stft48_bytes);
+        b->stft_e = ac_stft_init(region, r.stft48_bytes, &wc);
+        TAKE(region, void *, r.stft48_bytes);
+        b->stft_p = ac_stft_init(region, r.stft48_bytes, &wc);
+    }
+    if (!b->synth_e || !b->synth_p || !b->synth48 || !b->stft_e || !b->stft_p)
+        return NULL;
     TAKE(b->e_hop, float *, (size_t)r.hop_n * sizeof(float));
     TAKE(b->p_hop, float *, (size_t)r.hop_n * sizeof(float));
     TAKE(b->fifo_e, float *, (size_t)FIFO48_CAP * sizeof(float));
     TAKE(b->fifo_p, float *, (size_t)FIFO48_CAP * sizeof(float));
-    TAKE(b->frame48, float *, (size_t)B48_FFT * sizeof(float));
     TAKE(b->chunk48, float *, (size_t)B48_HOP * sizeof(float));
     TAKE(b->out_fifo, float *, (size_t)OUT_FIFO_CAP * sizeof(float));
     TAKE(b->spec_e48, Complex *, (size_t)B48_BINS * sizeof(Complex));
     TAKE(b->spec_p48, Complex *, (size_t)B48_BINS * sizeof(Complex));
     TAKE(b->out48, Complex *, (size_t)B48_BINS * sizeof(Complex));
 #undef TAKE
-    make_root_hann(b->win_n, r.fft_n);
-    make_root_hann(b->win48, B48_FFT);
 
     b->prefill = calibrate_prefill(b);
     lat_up = audio_resampler_latency_input_frames(b->up_e);
@@ -379,39 +406,17 @@ void dfn_rate_bridge_reset(DfnRateBridge *b) {
     clear_streams(b);
 }
 
-/* Spectrum -> one hop through the given lane's WOLA: the sequence the
- * hosting pipelines' own synthesis performs, used for E and P on the native
- * grid and for the stage output on the 48 kHz grid. */
-static void synth_hop(FftHandle *fft, const Complex *spec, float *ifft_buf,
-                      float *ola, const float *win, int n_fft, int hop,
-                      float *hop_out) {
-    fft_inverse(fft, spec, ifft_buf);
-    sk_wola_accumulate_f32(ola, ifft_buf, win, n_fft);
-    memcpy(hop_out, ola, (size_t)hop * sizeof(float));
-    memmove(ola, ola + hop, (size_t)(n_fft - hop) * sizeof(float));
-    memset(ola + (n_fft - hop), 0, (size_t)hop * sizeof(float));
-}
-
 /* Upsample one native hop into the FIFO's pending region; the count
  * produced, or -1. */
 static int push_up(DfnRateBridge *b, AudioResampler *up, const float *hop,
                    float *fifo) {
     int consumed, produced;
-    if (audio_resampler_process(up, hop, b->hop_n, fifo + B48_HOP + b->fill,
-                                FIFO48_CAP - B48_HOP - b->fill, &consumed,
+    if (audio_resampler_process(up, hop, b->hop_n, fifo + b->fill,
+                                FIFO48_CAP - b->fill, &consumed,
                                 &produced) != 0 ||
         consumed != b->hop_n)
         return -1;
     return produced;
-}
-
-/* 48 kHz sqrt-Hann 1024/512 analysis of the FIFO's first 1024 samples: the
- * 512 of history and the next 512 pending, exactly the transform the
- * 48 kHz pipelines' AEC performs on its own hop. */
-static void analyze48(DfnRateBridge *b, const float *fifo, Complex *spec) {
-    skn_mul_f32(b->frame48, fifo, b->win48, B48_FFT);
-    /* frame48 is this call's own scratch, so the backend may clobber it. */
-    fft_forward_scratch(b->fft48, b->frame48, spec);
 }
 
 int dfn_rate_bridge_process(DfnRateBridge *b,
@@ -420,29 +425,28 @@ int dfn_rate_bridge_process(DfnRateBridge *b,
                             float *out_hop) {
     int consumed, produced, produced_e, produced_p;
     if (!b || !estimate_spec || !apply_spec || !out_hop) return -1;
-    synth_hop(b->fft_n_handle, estimate_spec, b->ifft_n, b->ola_e, b->win_n,
-              b->fft_n, b->hop_n, b->e_hop);
-    synth_hop(b->fft_n_handle, apply_spec, b->ifft_n, b->ola_p, b->win_n,
-              b->fft_n, b->hop_n, b->p_hop);
+    ac_istft_push(b->synth_e, estimate_spec, b->e_hop);
+    ac_istft_push(b->synth_p, apply_spec, b->p_hop);
     produced_e = push_up(b, b->up_e, b->e_hop, b->fifo_e);
     produced_p = push_up(b, b->up_p, b->p_hop, b->fifo_p);
     if (produced_e < 0 || produced_p != produced_e) return -1;
     b->fill += produced_e;
     b->last_hop_frames = 0;
     while (b->fill >= B48_HOP) {
-        analyze48(b, b->fifo_e, b->spec_e48);
-        analyze48(b, b->fifo_p, b->spec_p48);
-        /* The consumed 512 become the next frame's history. */
+        /* The 48 kHz sqrt-Hann 1024/512 analysis the 48 kHz pipelines' AEC
+         * performs on its own hop: each STFT object keeps its lane's
+         * 512-sample history. */
+        ac_stft_push(b->stft_e, b->fifo_e, b->spec_e48);
+        ac_stft_push(b->stft_p, b->fifo_p, b->spec_p48);
         b->fill -= B48_HOP;
         memmove(b->fifo_e, b->fifo_e + B48_HOP,
-                (size_t)(B48_HOP + b->fill) * sizeof(float));
+                (size_t)b->fill * sizeof(float));
         memmove(b->fifo_p, b->fifo_p + B48_HOP,
-                (size_t)(B48_HOP + b->fill) * sizeof(float));
+                (size_t)b->fill * sizeof(float));
         if (dfn_res_stage_process(b->stage, b->spec_e48, b->spec_p48,
                                   b->out48) < 0)
             return -1;
-        synth_hop(b->fft48, b->out48, b->ifft48, b->ola48, b->win48, B48_FFT,
-                  B48_HOP, b->chunk48);
+        ac_istft_push(b->synth48, b->out48, b->chunk48);
         if (audio_resampler_process(b->down, b->chunk48, B48_HOP,
                                     b->out_fifo + b->out_fill,
                                     OUT_FIFO_CAP - b->out_fill,
