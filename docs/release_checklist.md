@@ -69,7 +69,7 @@ numbered gates below, not by stale source-audit notes.
       flipped to `frame_size = -1  # Auto: sample_rate * 20ms` = hop 160 =
       10 ms. The validated span is therefore **200 ms**, and the comment has
       been stale since then. Anchoring on the introduction commit instead
-      gives a 1.6x error — and did, in an earlier round of this very campaign.
+      gives a 1.6x error.
 
       Each constant needs a verdict: retime (and extend `test_rate_structural`
       check (d2) + the Python effective-value suite), or classify as a genuine

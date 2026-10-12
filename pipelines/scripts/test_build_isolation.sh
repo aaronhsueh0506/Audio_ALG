@@ -124,9 +124,7 @@
 #            check's own distinct code path, the FP-policy check's OWN
 #            internal variables (FP_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/
 #            FP_CONFLICT_FLAGS/FP_ALLOWED_CHARS_RE -- SHELL_SAFE_ALLOWLIST_RC
-#            is this round's rename of what was FP_ALLOWLIST_RC when this
-#            test was first written, broadened by the SP-S9c fix below to
-#            also gate LDFLAGS content) command-line/`-e` override rejection,
+#            also gates LDFLAGS content, see SP-S9c below) command-line/`-e` override rejection,
 #            and the positive control (a plain override-free build succeeds,
 #            including the internal -DAUDIO_PIPELINE_BACKEND_STR define
 #            reaching the compile line)
@@ -1079,9 +1077,7 @@ unset SP9B_R11_FLAG
 
 # The FP-policy check's OWN internal variables (FP_INPUT_FLAGS/
 # SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS/FP_ALLOWED_CHARS_RE --
-# SHELL_SAFE_ALLOWLIST_RC is this round's rename of what was FP_ALLOWLIST_RC
-# when this test was first written, broadened by the SP-S9c fix below to
-# also gate LDFLAGS content) must themselves be rejected as command-line/`-e`
+# SHELL_SAFE_ALLOWLIST_RC also gates LDFLAGS content, see SP-S9c below) must themselves be rejected as command-line/`-e`
 # overrides -- otherwise a caller could silently defeat every check above
 # while the REAL CFLAGS/CXXFLAGS/CPPFLAGS used in actual compile recipes
 # still carry the dangerous content. Both plain command-line and
