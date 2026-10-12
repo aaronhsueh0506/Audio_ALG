@@ -8,7 +8,7 @@
  *
  *   1 shared DelayAec3 matcher
  *   4 independent linear AEC adaptive filters
- *   1 coherent post-beam residual suppressor
+ *   1 coherent post-beam residual suppressor (an AecRes from aec_res.h)
  *   1 mono MMSE-LSA denoiser
  *   1 final inverse FFT / overlap-add path
  *
@@ -880,8 +880,8 @@ int four_aec_nr_res_get_mem_breakdown(
  *                though enable_res is 0.
  *   fuse_us      fuse_contexts(): the beamformer-weighted projection of the
  *                four lane contexts into one.
- *   res_us       the residual-echo suppression gain: the error/near power
- *                preparation it consumes plus suppression_gain_get_gain().
+ *   res_us       the residual-echo suppression gain: one aec_res_process()
+ *                call on the fused spectra.
  *   nr_us        the noise-reduction gain: the residual-echo prior it
  *                consumes plus anr_process_gain().
  *   synth_us     inverse transform, windowed overlap-add, and the hop
