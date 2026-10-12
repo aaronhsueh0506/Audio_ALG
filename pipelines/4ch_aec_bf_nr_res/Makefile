@@ -216,6 +216,7 @@ SPATIAL_PRODUCER_SIG := $(notdir $(patsubst %/,%,$(dir $(SPATIAL_COMMON_LIB))))
 endif
 
 SRCS := 4aec_nr_res.c audio_pipeline_4ch.c \
+        ../common/se_config.c ../common/se_anr_stage.c \
         ../4ch_aec_bf_dfn_res/4aec_dfn_res.c ../dfn_res_stage.c ../dfn_rate_bridge.c \
         $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c \
         $(DFN2_DIR)/dfn2_prepost.c \
@@ -241,9 +242,10 @@ BIN_DIR := $(BIN_ROOT)/$(BACKEND)-$(CFG_SIG)
 PIPELINE_LIB := $(BIN_DIR)/libaudio_pipeline_4ch.a
 DFN_PIPELINE_LIB := $(BIN_DIR)/lib4aec_dfn_res.a
 
-# Only the reusable 4-lane linear core is archived. Standard and ULCNet
-# application wrappers are linked as objects into their respective binaries.
-PIPELINE_OBJS := $(OBJ_DIR)/4aec_nr_res.o
+# Only the reusable 4-lane linear core and the shared configuration/NR stage
+# code it uses are archived. Standard and ULCNet application wrappers are
+# linked as objects into their respective binaries.
+PIPELINE_OBJS := $(OBJ_DIR)/4aec_nr_res.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o
 DFN_PIPELINE_OBJS := $(OBJ_DIR)/4aec_dfn_res.o \
                      $(OBJ_DIR)/dfn_res_stage.o \
                      $(OBJ_DIR)/dfn_rate_bridge.o \
@@ -273,7 +275,13 @@ _cfg_guard:
 	  fi; \
 	done
 
-$(OBJ_DIR)/4aec_nr_res.o: 4aec_nr_res.c 4aec_nr_res.h 4aec_nr_res_internal.h | _cfg_guard
+$(OBJ_DIR)/4aec_nr_res.o: 4aec_nr_res.c 4aec_nr_res.h 4aec_nr_res_internal.h ../common/se_config.h ../common/se_anr_stage.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/se_config.o: ../common/se_config.c ../common/se_config.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/se_anr_stage.o: ../common/se_anr_stage.c ../common/se_anr_stage.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
 $(OBJ_DIR)/4aec_dfn_res.o: ../4ch_aec_bf_dfn_res/4aec_dfn_res.c ../4ch_aec_bf_dfn_res/4aec_dfn_res.h 4aec_nr_res.h ../dfn_res_stage.h ../dfn_rate_bridge.h | _cfg_guard

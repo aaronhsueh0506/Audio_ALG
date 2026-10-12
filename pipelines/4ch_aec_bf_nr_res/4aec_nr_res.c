@@ -36,10 +36,10 @@
 #include "mem_align.h"
 #include "4aec_projection_kernels.h"
 #include "simd_kernels.h"
-#include "nr_overlay.h"
+#include "common/se_config.h"     /* se_derive(): grid + AecConfig, shared by every application */
+#include "common/se_anr_stage.h"  /* NR configuration, init, per-hop gain, strength setter       */
 
-/* PSD scale and CNG RNG seed, same as audio_pipeline.c. */
-#define PSD_SCALE                 (32768.0f * 32768.0f)
+/* CNG RNG seed, same as audio_pipeline.c. */
 /* Comfort noise is scaled by the denoiser gain of its bin, but never below
  * this amplitude (-10 dB): the fill follows the denoised floor while enough
  * of it remains to keep the residual echo it masks from surfacing. */
@@ -320,6 +320,16 @@ static float duty_leak_db_for_grid(int hop_size, int sample_rate) {
 /* ============================================================================
  * Config -> module configs + frame dimensions
  * ========================================================================== */
+
+/* Returns 1 and fills every out-param, or 0 (NULL argument; a rate outside
+ * {16000, 48000}; a grid, preset, mode, flag, filter length or delay setting
+ * outside its range; or a MATCHED/FIXED request whose delay ring or estimator
+ * cannot be sized). Grid, AecConfig and the delay-request rules come from
+ * se_derive(); what only this core has -- the capture proxy, the quarantine
+ * and delay-line ranges, the shared ring and estimator sizes -- is checked
+ * here. The wrapper owns alignment once for all four lanes, so each lane's
+ * AEC consumes an already-aligned reference and carries neither a private
+ * estimator nor a ring. */
 static int derive_dims_and_configs(
     const FourAecNrResConfig* cfg,
     AecConfig* aec_cfg,
@@ -329,77 +339,41 @@ static int derive_dims_and_configs(
     int* n_freqs,
     int* delay_ring_size,
     size_t* delay_estimator_bytes) {
-    int selected_fft;
+    SeRules rules;
+    SeRequest req;
+    SeGrid grid;
     int max_delay_samples;
     if (!cfg || !aec_cfg || !nr_cfg || !fft_size || !hop_size ||
         !n_freqs || !delay_ring_size ||
         !delay_estimator_bytes) return 0;
-    if (cfg->sample_rate != 16000 && cfg->sample_rate != 48000) return 0;
 
-#define FOUR_CK_BOOL(field) \
-    do { if (cfg->field != 0 && cfg->field != 1) return 0; } while (0)
+    if (!se_flag_valid(cfg->enable_cng) || !se_flag_valid(cfg->legacy_amin) ||
+        !se_flag_valid(cfg->enable_post) || !se_flag_valid(cfg->enable_nr) ||
+        !se_flag_valid(cfg->enable_res)) return 0;
 
-    switch (cfg->aec_preset) {
-        case AEC_PRESET_MILD:
-        case AEC_PRESET_BALANCED:
-        case AEC_PRESET_AGGRESSIVE:
-            break;
-        default:
-            return 0;
-    }
-    switch (cfg->nr_mode) {
-        case ANR_MODE_MILD:
-        case ANR_MODE_MODERATE:
-        case ANR_MODE_BALANCED:
-        case ANR_MODE_AGGRESSIVE:
-            break;
-        default:
-            return 0;
-    }
-    FOUR_CK_BOOL(enable_cng);
-    FOUR_CK_BOOL(legacy_amin);
-    FOUR_CK_BOOL(enable_post);
-    FOUR_CK_BOOL(enable_nr);
-    FOUR_CK_BOOL(enable_res);
+    rules.allow_8k = 0;
+    rules.fixed_rate = 0;
+    rules.fixed_fft = 0;
+    rules.check_delay = 1;
+    rules.lane_aligned = 1;
+    /* A pre-only core has no post stage, so nothing reads a lane's R^2 or
+     * comfort noise: its lanes keep only the linear half of the context. With
+     * a post stage the lanes' own G_res is still never read (the gain is
+     * computed once from fused multi-lane data), so it is skipped too. */
+    rules.spatial_context =
+        cfg->enable_post ? AEC_CONTEXT_NO_GAIN : AEC_CONTEXT_LINEAR_ONLY;
+    rules.with_nr = 1;
 
-#undef FOUR_CK_BOOL
+    req.sample_rate = cfg->sample_rate;
+    req.fft_size = cfg->fft_size;
+    req.filter_length = cfg->filter_length;
+    req.delay_mode = cfg->delay_mode;
+    req.delay_num_filters = cfg->delay_num_filters;
+    req.fixed_delay_samples = cfg->fixed_delay_samples;
+    req.aec_preset = cfg->aec_preset;
+    req.nr_mode = cfg->nr_mode;
+    if (se_derive(&req, &rules, &grid, aec_cfg) != 0) return 0;
 
-    selected_fft = cfg->fft_size;
-    if (selected_fft == 0)
-        /* 16 kHz rate default is 256/128 (8ms hop) as of 2026-08-02/03,
-         * matching both AEC's (python/modules/config.py, c_impl aec.c) and
-         * NR's (core/signal_grid.py, anr_types.h) own per-library
-         * defaults -- this pipeline-level default was previously
-         * independent of both and had drifted to the old 512/256 (16ms)
-         * value. 512 remains a supported, explicit alternate (line below). */
-        selected_fft = cfg->sample_rate == 16000 ? 256 : 1024;
-    if (cfg->sample_rate == 16000) {
-        if (selected_fft != 256 && selected_fft != 512) return 0;
-    } else if (selected_fft != 1024) {
-        return 0;
-    }
-    /* Bound kept in sync with the two mono apps' audio_pipeline*.c
-     * (each app is self-contained). */
-    if (cfg->filter_length < 0 || cfg->filter_length > 4096) return 0;
-    switch (cfg->delay_mode) {
-        case AEC_DELAY_MATCHED:
-            if (cfg->delay_num_filters < 1 ||
-                cfg->delay_num_filters > DA_NUM_FILTERS ||
-                cfg->fixed_delay_samples != -1) return 0;
-            break;
-        case AEC_DELAY_FIXED:
-            if (cfg->delay_num_filters != DA_NUM_FILTERS ||
-                cfg->fixed_delay_samples < 0 ||
-                (long)cfg->fixed_delay_samples >
-                    120L * (long)cfg->sample_rate) return 0;
-            break;
-        case AEC_DELAY_EXTERNAL_ALIGNED:
-            if (cfg->delay_num_filters != DA_NUM_FILTERS ||
-                cfg->fixed_delay_samples != -1) return 0;
-            break;
-        default:
-            return 0;
-    }
     if (cfg->capture_proxy_channel < 0 ||
         cfg->capture_proxy_channel >= FOUR_AEC_NR_RES_CHANNELS) return 0;
     /* Range only. Unlike delay_num_filters, these are pure policy knobs with
@@ -418,10 +392,9 @@ static int derive_dims_and_configs(
         cfg->delay_backward_quarantine_s > 3600.0f) return 0;
     if (!isfinite(cfg->max_delay_ms) ||
         cfg->max_delay_ms < 0.0f || cfg->max_delay_ms > 4096.0f) return 0;
-    *fft_size = selected_fft;
-
-    *hop_size = *fft_size / 2;
-    *n_freqs = *fft_size / 2 + 1;
+    *fft_size = grid.fft_size;
+    *hop_size = grid.hop_size;
+    *n_freqs = grid.n_freqs;
 
     *delay_estimator_bytes = 0;
     if (cfg->delay_mode == AEC_DELAY_MATCHED) {
@@ -438,30 +411,8 @@ static int derive_dims_and_configs(
         *delay_ring_size = 0;
     }
 
-    aec_config_from_preset(aec_cfg, cfg->aec_preset, cfg->sample_rate);
-    aec_cfg->fft_size = *fft_size;
-    if (cfg->filter_length > 0)
-        aec_cfg->filter_length = cfg->filter_length;
-    /* The wrapper owns alignment once for all four lanes. Each lane therefore
-     * consumes an already-aligned reference and must not allocate or run a
-     * private estimator/ring. */
-    aec_cfg->delay_mode = AEC_DELAY_EXTERNAL_ALIGNED;
-    aec_cfg->delay_num_filters = DA_NUM_FILTERS;
-    aec_cfg->fixed_delay_samples = -1;
-    aec_cfg->enable_delay_est = 0;
-    aec_cfg->enable_res = 0;
-    aec_cfg->return_res_context = 1;
-    /* Every lane's own G_res is never read (see FourAecLaneSnapshot / this
-     * file's fuse_contexts()+run_post_res_and_nr(), which recompute an
-     * equivalent gain once from fused multi-lane data) -- skip computing it
-     * per lane. A pre-only core (enable_post == 0) has no post stage at all,
-     * so nothing reads a lane's R^2 or comfort noise either: its lanes keep
-     * only the linear half of the context. */
-    aec_cfg->spatial_linear_context =
-        cfg->enable_post ? AEC_CONTEXT_NO_GAIN : AEC_CONTEXT_LINEAR_ONLY;
-
-    *nr_cfg = pipelines_compose_nr_config(cfg->sample_rate, *fft_size, *hop_size,
-                                cfg->nr_mode);
+    *nr_cfg = se_anr_compose_config(cfg->sample_rate, *fft_size, *hop_size,
+                                    cfg->nr_mode);
     return 1;
 }
 
@@ -610,7 +561,7 @@ static size_t pipeline_pool_size(
      * of the three places below that need it. */
     const int want_nr = enable_post && enable_nr;
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
-    size_t nr_bytes = want_nr ? anr_get_mem_size(nr_cfg) : 0;
+    size_t nr_bytes = want_nr ? se_anr_stage_mem_size(nr_cfg) : 0;
     size_t res_bytes =
         enable_post && enable_res ? aec_res_get_mem_size(aec_cfg) : 0;
     size_t synth_bytes = enable_post ? synthesis_mem_size(fft) : 0;
@@ -646,7 +597,7 @@ static int pipeline_build(
     const AnrConfig* nr_cfg) {
     size_t aec_bytes = aec_get_mem_size(aec_cfg);
     size_t nr_bytes = p->cfg.enable_post && p->cfg.enable_nr
-        ? anr_get_mem_size(nr_cfg) : 0;
+        ? se_anr_stage_mem_size(nr_cfg) : 0;
     size_t synth_bytes = p->cfg.enable_post ? synthesis_mem_size(p->fft_size) : 0;
     int ch;
 
@@ -664,7 +615,7 @@ static int pipeline_build(
         if (p->cfg.enable_nr) {
             void* nr_pool = pool_carve(cursor, 1, nr_bytes);
             if (!nr_pool) return 0;
-            p->nr = anr_init(nr_pool, nr_bytes, nr_cfg);
+            p->nr = se_anr_stage_init(nr_pool, nr_bytes, nr_cfg);
             if (!p->nr) return 0;
         }
         synth_pool = pool_carve(cursor, 1, synth_bytes);
@@ -1767,12 +1718,10 @@ static int prepare_post_spectrum(
     float max_saturation,
     const Complex* trusted_beamformed_error) {
     const float* res_gain;
-    const float* nr_extra;
     const float* nr_gain;
     const Complex* error =
         trusted_beamformed_error ? trusted_beamformed_error : p->fused_error;
     int n = p->n_freqs;
-    int k;
     uint32_t t0, t1;
 
     /* RES stage. */
@@ -1793,16 +1742,11 @@ static int prepare_post_spectrum(
     if (!res_gain) return 0;
 
     if (p->cfg.enable_nr) {
-        /* The denoiser's residual-echo prior, R^2 on the NR's power scale;
-         * legacy_amin hands it no prior, so the fill is skipped with it. */
-        nr_extra = NULL;
-        if (!p->cfg.legacy_amin) {
-            for (k = 0; k < n; ++k)
-                p->extra_noise[k] = p->fused_r2[k] / PSD_SCALE;
-            nr_extra = p->extra_noise;
-        }
-        if (anr_process_gain(
-                p->nr, error, nr_extra, NULL) != 0)
+        /* The denoiser's residual-echo prior is the fused R^2 (the stage
+         * rescales it into extra_noise); legacy_amin hands it no prior. */
+        if (se_anr_stage_process_gain(
+                p->nr, error, p->cfg.legacy_amin ? NULL : p->fused_r2,
+                p->extra_noise, n) != 0)
             return 0;
         p->last_timing.nr_us = four_aec_nr_res_now_us() - t1;
     } else {
@@ -1814,7 +1758,7 @@ static int prepare_post_spectrum(
      * G_nr. sk_min_f32 is the mono twin's kernel: a non-finite gain
      * propagates to the output finite gate instead of being masked the way
      * fminf would mask it. */
-    nr_gain = p->cfg.enable_nr ? anr_get_gain(p->nr, NULL) : p->unity_gain;
+    nr_gain = p->cfg.enable_nr ? se_anr_stage_gain(p->nr) : p->unity_gain;
     sk_min_f32(p->total_gain, nr_gain, res_gain, n);
     sk_capply_gain_f32(p->output_spec, error, p->total_gain, n);
 
@@ -2013,18 +1957,10 @@ int four_aec_nr_res_set_aec_preset(FourAecNrRes* p, AecPreset preset,
 }
 
 int four_aec_nr_res_set_nr_mode(FourAecNrRes* p, AnrMode mode) {
-    AnrConfig target;
-
     if (!p || p->destroyed) return -1;
     if (!p->cfg.enable_post || !p->nr) return -1;
-    if (!anr_nr_mode_is_valid(mode)) return -1;
-    /* Recompose exactly what build_nr_config() composes -- the preset plus
-     * this pipeline's own overrides. Handing the canonical preset to
-     * anr_set_mode() instead would either be refused (its L differs) or
-     * silently revert those overrides. */
-    target = pipelines_compose_nr_config(p->cfg.sample_rate, p->fft_size,
-                               p->hop_size, mode);
-    if (anr_reconfigure(p->nr, &target) != 0) return -1;
+    if (se_anr_stage_set_mode(p->nr, p->cfg.sample_rate, p->fft_size,
+                              p->hop_size, mode) != 0) return -1;
     p->cfg.nr_mode = mode;
     return 0;
 }
@@ -2052,7 +1988,7 @@ void four_aec_nr_res_reset(FourAecNrRes* p) {
     for (ch = 0; ch < p->initialized_lanes; ++ch) {
         aec_reset(p->lanes[ch]);
     }
-    if (p->nr) anr_reset(p->nr);
+    if (p->nr) se_anr_stage_reset(p->nr);
     if (p->res) aec_res_reset(p->res);
 
     if (p->delay_ring) {
@@ -2112,7 +2048,7 @@ void four_aec_nr_res_destroy(FourAecNrRes* p) {
     void* owned_heap;
     if (!p || p->destroyed) return;
 
-    if (p->nr) anr_destroy(p->nr);
+    if (p->nr) se_anr_stage_destroy(p->nr);
     for (ch = 0; ch < p->initialized_lanes; ++ch) {
         aec_destroy(p->lanes[ch]);
     }
@@ -2254,7 +2190,7 @@ int four_aec_nr_res_get_mem_breakdown(
 
     aec_one = aec_get_mem_size(&aec_cfg);
     want_nr = cfg->enable_post && cfg->enable_nr;
-    nr_bytes = want_nr ? anr_get_mem_size(&nr_cfg) : 0;
+    nr_bytes = want_nr ? se_anr_stage_mem_size(&nr_cfg) : 0;
     fft_bytes = cfg->enable_post ? fft_get_mem_size(fft) : 0;
     synth_bytes = cfg->enable_post ? synthesis_mem_size(fft) : 0;
     res_bytes = cfg->enable_post && cfg->enable_res
