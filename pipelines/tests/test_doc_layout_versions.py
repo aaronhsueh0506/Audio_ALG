@@ -141,3 +141,87 @@ def test_the_scan_actually_reaches_the_pages_that_publish_versions():
     assert hits >= 2, (
         '只在 %d 個檔案裡找到具名版號宣稱；至少 integration_example 與 '
         'pipeline_4ch 兩頁應該有，比對式可能失效了' % hits)
+
+
+# Carve versions live with the pre/post classes they version.  A pool carved
+# by another walk is refused on the build-flags hash, so a doc that quotes a
+# stale carve version sends integrators looking for a mismatch that is not
+# there.
+_CARVE_SOURCES = {
+    'DFN2_PREPOST_CARVE_VERSION': 'AINR/DeepFilterNet2/dfn2_prepost.h',
+    'ULCNET_PREPOST_CARVE_VERSION': 'AIAEC/Align_ULCNet/ulcnet_prepost.h',
+    'DEEPVQE_PREPOST_CARVE_VERSION': 'AIAEC/DeepVQE_S/deepvqe_prepost.h',
+}
+
+# Every spelling that mentions a carve version: the macro name, optionally
+# closed by </code> or a backtick, then an optional "=" and a number.  The
+# name part is deliberately loose (\w*) so a shortened or misspelled macro
+# is found and rejected instead of skipped.
+_CARVE_MENTION = re.compile(
+    r'\b(\w*CARVE_VERSION)\b(?:</code>|`)*\s*(?:=\s*)?(\d+)?')
+
+
+def _declared_carve_version(macro: str) -> int:
+    text = (_REPO / _CARVE_SOURCES[macro]).read_text(encoding='utf-8')
+    match = re.search(r'^#define\s+%s\s+(\d+)u?\b' % re.escape(macro),
+                      text, re.MULTILINE)
+    assert match is not None, (
+        '%s has no #define in %s; the table above is out of date'
+        % (macro, _CARVE_SOURCES[macro]))
+    return int(match.group(1))
+
+
+def _carve_mentions(files=None):
+    """Yield (path, line number, macro name, claimed number or None)."""
+    for path in (_doc_files() if files is None else files):
+        text = path.read_text(encoding='utf-8')
+        for match in _CARVE_MENTION.finditer(text):
+            lineno = text.count('\n', 0, match.start()) + 1
+            claimed = match.group(2)
+            shown = path.relative_to(_REPO) if _REPO in path.parents else path
+            yield (shown, lineno, match.group(1),
+                   None if claimed is None else int(claimed))
+
+
+def _carve_problems(mentions, declared):
+    problems = []
+    for path, lineno, macro, claimed in mentions:
+        if macro not in declared:
+            problems.append('%s:%d names %s, which is not a carve version '
+                            'macro (write the full macro name)'
+                            % (path, lineno, macro))
+        elif claimed is not None and claimed != declared[macro]:
+            problems.append('%s:%d says %s = %d, the header has %d'
+                            % (path, lineno, macro, claimed, declared[macro]))
+    return problems
+
+
+def test_docs_publish_the_current_carve_versions():
+    declared = {m: _declared_carve_version(m) for m in _CARVE_SOURCES}
+    problems = _carve_problems(_carve_mentions(), declared)
+    assert not problems, '\n  '.join(['stale carve version claims:'] + problems)
+
+
+def test_carve_scan_sees_the_dfn_pipeline_pages_and_rejects_stale_forms(
+        tmp_path):
+    """The scan has to reach the pipeline pages that quote the DFN2 carve
+    version, and the checker has to fail on stale forms."""
+    pages = [_REPO / 'docs/html/pipeline_dfn_mono.html',
+             _REPO / 'docs/html/pipeline_dfn_4ch.html']
+    declared = {m: _declared_carve_version(m) for m in _CARVE_SOURCES}
+    for page in pages:
+        mentions = list(_carve_mentions([page]))
+        assert [(m, c) for _p, _l, m, c in mentions] == [
+            ('DFN2_PREPOST_CARVE_VERSION', declared[
+                'DFN2_PREPOST_CARVE_VERSION'])], page
+    stale = tmp_path / 'stale.html'
+    for text in ('<code>CARVE_VERSION 5</code>',
+                 '<code>DFN2_PREPOST_CARVE_VERSION 5</code>',
+                 '<code>DFN2_PREPOST_CARVE_VERSION = 5</code>',
+                 '`ULCNET_PREPOST_CARVE_VERSION`\n  = 9'):
+        stale.write_text(text, encoding='utf-8')
+        assert _carve_problems(_carve_mentions([stale]), declared), text
+    stale.write_text('<code>DFN2_PREPOST_CARVE_VERSION = %d</code>'
+                     % declared['DFN2_PREPOST_CARVE_VERSION'],
+                     encoding='utf-8')
+    assert not _carve_problems(_carve_mentions([stale]), declared)
