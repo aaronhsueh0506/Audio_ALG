@@ -2061,12 +2061,12 @@ static void test_delay_change_candidate_ttl(void) {
  * Runtime strength control
  *
  * The load-bearing property: the four lanes run with spatial_linear_context
- * and therefore never reach suppression_gain_get_gain(). A preset change
+ * and therefore never reach their own residual suppressor. A preset change
  * pushed at them is a provable no-op, so this core's setter has to move the
- * SHARED post-stage suppressor -- and both of its config copies, because
- * post_sg_cfg is a separate by-value snapshot that reset_post_sg() re-applies.
- * A setter that updated only post_sg.cfg would work until the first reset and
- * then silently revert, which is exactly what test 3 below pins.
+ * SHARED post-stage suppressor (the AecRes), and the retargeted floor has to
+ * survive a reset. A setter that updated only the live floor would work until
+ * the first reset and then silently revert, which is exactly what test 3
+ * below pins.
  * ========================================================================== */
 
 /* Drives `hops` hops of the shared strength/timing stimulus. When
@@ -2995,9 +2995,9 @@ static void test_runtime_strength(void) {
               live1 != live0 && live1 == target1,
           "strength: the shared post floor moved and landed immediately");
 
-    /* 2. It SURVIVES a reset. reset_post_sg() rebuilds the suppressor from
-     *    the separate post_sg_cfg snapshot, so a setter that wrote only
-     *    post_sg.cfg would be silently reverted right here. */
+    /* 2. It SURVIVES a reset: the reset rebuilds the suppressor from its
+     *    stored configuration, so a setter that changed only the live floor
+     *    would be silently reverted right here. */
     four_aec_nr_res_reset(p);
     {
         float live2 = 0.0f, target2 = 0.0f;
