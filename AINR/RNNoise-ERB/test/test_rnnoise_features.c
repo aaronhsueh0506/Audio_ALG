@@ -1,4 +1,4 @@
-/* Independent C reference test for log_erb_dfn_mean_cplx_unit_0_4k_v3. */
+/* Independent C reference test for the RNNOISE_FEATURE_VERSION feature contract. */
 
 #include "process.h"
 #include "rnnoise_tables_gen.h"

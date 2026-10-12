@@ -77,6 +77,16 @@
 set -u
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
+# test-features prints "PASS: <RNNOISE_FEATURE_VERSION> matches ..." where the
+# version tag comes from process.h; read it from there so the expected line
+# follows the feature contract instead of a hard-coded copy.
+FEATURE_VERSION="$(sed -n 's/^#define RNNOISE_FEATURE_VERSION[[:space:]]*"\([^"]*\)".*/\1/p' "$REPO_ROOT/process.h")"
+[ -n "$FEATURE_VERSION" ] || {
+    echo "FATAL: RNNOISE_FEATURE_VERSION not found in process.h" >&2
+    exit 1
+}
+FEATURES_PASS_RE="^PASS: $FEATURE_VERSION matches independent reference"
+
 # Explicit template (same fix applied throughout the sibling repos' other
 # test/run_*.sh scripts): a bare `mktemp -d` with no template argument
 # ignores $TMPDIR on some hosts, silently defeating any caller that sets
@@ -211,7 +221,7 @@ fi
 ABS_BUILD_DIR2="$SCRATCH/abs_test_dir_features"
 LOG6="$SCRATCH/log_real_absdir_features"
 if "$MAKE_BIN" BUILD_DIR="$ABS_BUILD_DIR2" test-features >"$LOG6" 2>&1; then
-    grep -q "PASS: log_erb_dfn_mean_cplx_unit_0_4k_v3" "$LOG6" \
+    grep -qE "$FEATURES_PASS_RE" "$LOG6" \
         && pass "2e: make BUILD_DIR=$ABS_BUILD_DIR2 test-features (real execution) succeeds and reports PASS" \
         || { fail "2e: make BUILD_DIR=$ABS_BUILD_DIR2 test-features (real execution) exited 0 but did not report the expected PASS line"; cat "$LOG6" >&2; }
 else
@@ -247,7 +257,7 @@ fi
 
 LOG9="$SCRATCH/log_plain_test_features"
 if "$MAKE_BIN" test-features >"$LOG9" 2>&1; then
-    grep -q "PASS: log_erb_dfn_mean_cplx_unit_0_4k_v3" "$LOG9" \
+    grep -qE "$FEATURES_PASS_RE" "$LOG9" \
         && pass "2h: plain 'make test-features' (no BUILD_DIR override) still succeeds" \
         || { fail "2h: plain 'make test-features' exited 0 but did not report the expected PASS line"; cat "$LOG9" >&2; }
 else
@@ -297,7 +307,7 @@ check_rejected "process-subst"      '<(echo hi)'      'found: "()<"'
 POS_BUILD_DIR="$SCRATCH/pos_ctrl_build"
 LOG_POS="$SCRATCH/log_positive_control"
 if env EXTRA_CFLAGS=-DSCRATCH_TEST_DEFINE=1 "$MAKE_BIN" BUILD_DIR="$POS_BUILD_DIR" test-features >"$LOG_POS" 2>&1; then
-    grep -q "PASS: log_erb_dfn_mean_cplx_unit_0_4k_v3" "$LOG_POS" \
+    grep -qE "$FEATURES_PASS_RE" "$LOG_POS" \
         && pass "3.positive-control: EXTRA_CFLAGS=-DSCRATCH_TEST_DEFINE=1 (allowed characters only) builds and runs correctly" \
         || { fail "3.positive-control: EXTRA_CFLAGS=-DSCRATCH_TEST_DEFINE=1 build succeeded but did not report the expected PASS line"; cat "$LOG_POS" >&2; }
 else
@@ -361,7 +371,7 @@ echo "=== Section 4: -Ofast/-ffast-math/-ffp-contract= exact-token matching (no 
 FIND2_BUILD_DIR="$SCRATCH/find2_build"
 LOG11="$SCRATCH/log_ofast_substring_false_positive"
 if env EXTRA_CFLAGS='-DROUND9_NOTE=-Ofastness' "$MAKE_BIN" BUILD_DIR="$FIND2_BUILD_DIR" test-features >"$LOG11" 2>&1; then
-    grep -q "PASS: log_erb_dfn_mean_cplx_unit_0_4k_v3" "$LOG11" \
+    grep -qE "$FEATURES_PASS_RE" "$LOG11" \
         && pass "4a: EXTRA_CFLAGS='-DROUND9_NOTE=-Ofastness' (contains \"-Ofast\" as a substring, not the flag) builds and runs correctly (false positive fixed)" \
         || { fail "4a: EXTRA_CFLAGS='-DROUND9_NOTE=-Ofastness' build succeeded but did not report the expected PASS line"; cat "$LOG11" >&2; }
 else
