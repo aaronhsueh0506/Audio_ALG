@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "dfn_rate_bridge.h"
+#include "audio_stft.h"
 #include "fft_wrapper.h"
 #include "tests/dfn_test_fixture.h"
 
@@ -243,9 +244,62 @@ static int run_rejections(void) {
     return 0;
 }
 
+/* The bridge and both ULCNet pipelines size their STFT/ISTFT objects before
+ * any FFT handle exists, as the object that carves its own handle and window
+ * less those two regions. Pin that accounting against the size audio_common
+ * reports for an object that really borrows them, for AcStft and AcIstft in
+ * both synthesis modes, and show that a block one alignment unit short is
+ * refused. */
+static int run_borrowed_sizes(void) {
+    static const int sizes[] = { 256, 512, 1024 };
+    size_t i;
+    for (i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i) {
+        const int n = sizes[i];
+        AcStftConfig own, borrowed;
+        FftHandle *fft = fft_create(n);
+        float *window = (float *)malloc((size_t)n * sizeof(float));
+        size_t shared, a_own, a_b, s_own, s_b;
+        void *mem = NULL;
+        int mode, rc = 0;
+        if (!fft || !window) return 1;
+        ac_window_build(window, n);
+        shared = ALIGN16(fft_get_mem_size(n)) + ALIGN16((size_t)n * sizeof(float));
+        for (mode = 0; mode < 2 && !rc; ++mode) {
+            ac_stft_config_default(&own, n);
+            own.ola = mode ? AC_OLA_ENV_NORM : AC_OLA_ACCUMULATE;
+            borrowed = own;
+            borrowed.fft = fft;
+            borrowed.window = window;
+            a_own = ac_stft_get_mem_size(&own);
+            a_b = ac_stft_get_mem_size(&borrowed);
+            s_own = ac_istft_get_mem_size(&own);
+            s_b = ac_istft_get_mem_size(&borrowed);
+            if (!a_own || !a_b || !s_own || !s_b) rc = 2;
+            else if (a_own - shared != a_b) rc = 3;
+            else if (s_own - shared != s_b) rc = 4;
+            else {
+                if (posix_memalign(&mem, 16, s_b + 16) != 0) rc = 5;
+                else {
+                    if (!ac_istft_init(mem, s_b, &borrowed)) rc = 6;
+                    else if (ac_istft_init(mem, s_b - 16, &borrowed)) rc = 7;
+                    else if (!ac_stft_init(mem, a_b, &borrowed)) rc = 8;
+                    else if (ac_stft_init(mem, a_b - 16, &borrowed)) rc = 9;
+                    free(mem);
+                }
+            }
+        }
+        free(window);
+        fft_destroy(fft);
+        if (rc) return 100 * (int)(i + 1) + rc;
+    }
+    return 0;
+}
+
 int main(void) {
     int rc, i;
     dfn_unit_partition(erb_fwd, erb_inv);
+    rc = run_borrowed_sizes();
+    if (rc) { fprintf(stderr, "borrowed STFT/ISTFT sizing row failed: %d\n", rc); return 1; }
     rc = run_rejections();
     if (rc) { fprintf(stderr, "rate bridge rejection row failed: %d\n", rc); return 1; }
     for (i = 0; i < N_GRIDS; ++i) {
