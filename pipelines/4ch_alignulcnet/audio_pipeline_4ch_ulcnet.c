@@ -36,6 +36,7 @@
 #include "gsc.h"
 #include "srp.h"
 #include "mem_align.h"
+#include "simd_kernel_nn.h"    /* skn_fill_f32 */
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -99,6 +100,11 @@ struct AudioPipeline4ChUlcnet {
      * takes the identity path and the model is not stepped. Re-armed, never
      * accumulated, by a boundary that lands inside a reprime. */
     int reprime_frames;
+
+    /* The hop in flight (process_begin .. process_end). */
+    int phase;                    /* 0 idle, 1 begun, 2 model frame open */
+    int nn_wanted;                /* the frame has not been fetched and is not reprime */
+    int nn_accepted;              /* the model output replaces the error frame */
 
     /* Non-NULL only on the create() heap path (same convention as
      * audio_pipeline_4ch.c's owned_heap). */
@@ -695,30 +701,25 @@ int audio_pipeline_4ch_ulcnet_set_model(
 
 /* NaN/Inf guard: a model frame with ANY non-finite value must never reach
  * the WOLA (the synthesis accumulator would poison every later hop). */
-int audio_pipeline_4ch_ulcnet_process_with_activity(
+int audio_pipeline_4ch_ulcnet_process_begin(
     AudioPipeline4ChUlcnet* p,
     const float* microphones_interleaved,
     const float* far_reference,
-    int vad_external,
-    float* out) {
+    int vad_external) {
     FourAecFront pre;
-    const float* spec_re;
-    const float* spec_im;
     int status;
-    int hop;
-    int written;
     int k;
 
     if (!p || p->destroyed || !microphones_interleaved || !far_reference ||
-        !out || !is_bool(vad_external))
+        !is_bool(vad_external))
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    hop = p->hop_size;
+    if (p->phase != 0) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
 
     status = four_aec_front_process(
         p->core, microphones_interleaved, far_reference, &pre);
     if (status != FOUR_AEC_NR_RES_OK) return status;
     if (pre.n_channels != FOUR_AEC_NR_RES_CHANNELS ||
-        pre.hop_size != hop ||
+        pre.hop_size != p->hop_size ||
         pre.n_freqs != p->n_freqs ||
         !pre.aligned_ref) {
         audio_pipeline_4ch_ulcnet_reset(p);
@@ -764,28 +765,61 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     }
     (void)ac_stft_push_planar(
         p->far_analysis, far_reference, p->far_re, p->far_im);
-
     p->last_delay = pre.delay;
 
-    /* One frame, one inference: step the model and apply its output, EXCEPT
-     * while the identity reprime armed at the last boundary is still
+    /* One frame, one inference: the model steps and its output is applied,
+     * EXCEPT while the identity reprime armed at the last boundary is still
      * running -- that frame's window still covers the pre-switch hop, and
      * stepping it would rebuild the just-flushed recurrent state from
-     * half-stale input. Skipping inference lowers the cost of that frame;
-     * it never doubles it. */
-    spec_re = p->err_re;
-    spec_im = p->err_im;
-    if (p->reprime_frames > 0) {
-        p->reprime_frames -= 1;   /* identity; model deliberately idle */
-    } else if (p->model.infer) {
-        /* FULL-WRITE CONTRACT (NaN prefill + finite guard, fail-open
-         * identity on any failure) lives in ulcnet_model_run_frame(). */
-        if (ulcnet_model_run_frame(&p->model, p->err_re, p->err_im,
-                                   p->far_re, p->far_im, p->enh_re, p->enh_im)) {
-            spec_re = p->enh_re;
-            spec_im = p->enh_im;
-        }
-    }
+     * half-stale input. Skipping inference lowers the cost of that frame; it
+     * never doubles it. */
+    p->nn_wanted = 0;
+    p->nn_accepted = 0;
+    if (p->reprime_frames > 0) p->reprime_frames -= 1;   /* identity; model idle */
+    else p->nn_wanted = 1;
+    p->phase = 1;
+    return FOUR_AEC_NR_RES_OK;
+}
+
+int audio_pipeline_4ch_ulcnet_nn_begin(AudioPipeline4ChUlcnet* p,
+                                       UlcnetNnJob* job) {
+    if (!p || p->destroyed || !job) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase != 1) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+    if (!p->nn_wanted) return 0;
+    p->nn_wanted = 0;
+    /* FULL-WRITE CONTRACT: the staging is NaN, so a model that reports
+     * success without writing every bin is caught by nn_end's finite guard. */
+    skn_fill_f32(p->enh_re, ULCNET_BINS, NAN);
+    skn_fill_f32(p->enh_im, ULCNET_BINS, NAN);
+    job->err_re = p->err_re; job->err_im = p->err_im;
+    job->far_re = p->far_re; job->far_im = p->far_im;
+    job->out_re = p->enh_re; job->out_im = p->enh_im;
+    p->phase = 2;
+    return 1;
+}
+
+int audio_pipeline_4ch_ulcnet_nn_end(AudioPipeline4ChUlcnet* p, int model_rc) {
+    if (!p || p->destroyed) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase != 2) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+    /* Fail-open: a failed run, or any non-finite bin, leaves the identity. */
+    p->nn_accepted = model_rc == 0 && ulcnet_frame_is_finite(p->enh_re, p->enh_im);
+    p->phase = 1;
+    return FOUR_AEC_NR_RES_OK;
+}
+
+int audio_pipeline_4ch_ulcnet_process_end(AudioPipeline4ChUlcnet* p, float* out) {
+    const float* spec_re;
+    const float* spec_im;
+    int hop, written;
+
+    if (!p || p->destroyed || !out) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase == 0) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+    hop = p->hop_size;
+    /* A frame left open or never fetched is the identity. */
+    if (p->phase == 2) p->nn_accepted = 0;
+    spec_re = p->nn_accepted ? p->enh_re : p->err_re;
+    spec_im = p->nn_accepted ? p->enh_im : p->err_im;
+    p->phase = 0;
     written = ac_istft_push_planar(p->synthesis, spec_re, spec_im, out);
     if (written == 0) {
         /* hop#0: frame #0's block lies inside the synthesis's trimmed half
@@ -800,6 +834,26 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
 
     p->frame_index += 1;
     return FOUR_AEC_NR_RES_OK;
+}
+
+int audio_pipeline_4ch_ulcnet_process_with_activity(
+    AudioPipeline4ChUlcnet* p,
+    const float* microphones_interleaved,
+    const float* far_reference,
+    int vad_external,
+    float* out) {
+    UlcnetNnJob job;
+    int status;
+    if (!p || p->destroyed || !out) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    status = audio_pipeline_4ch_ulcnet_process_begin(
+        p, microphones_interleaved, far_reference, vad_external);
+    if (status != FOUR_AEC_NR_RES_OK) return status;
+    /* No runtime attached: the frame stays unfetched and is the identity. */
+    if (p->model.infer && audio_pipeline_4ch_ulcnet_nn_begin(p, &job) == 1)
+        (void)audio_pipeline_4ch_ulcnet_nn_end(
+            p, p->model.infer(p->model.user, job.err_re, job.err_im,
+                              job.far_re, job.far_im, job.out_re, job.out_im));
+    return audio_pipeline_4ch_ulcnet_process_end(p, out);
 }
 
 /* ============================================================================
@@ -817,6 +871,9 @@ void audio_pipeline_4ch_ulcnet_reset(AudioPipeline4ChUlcnet* p) {
     ac_istft_reset(p->synthesis);
     memset(&p->last_delay, 0, sizeof(p->last_delay));
     p->frame_index = 0;
+    p->phase = 0;
+    p->nn_wanted = 0;
+    p->nn_accepted = 0;
     /* The analysis history is zeroed above, so nothing emitted after this
      * point straddles anything: drop any pending reprime. */
     p->reprime_frames = 0;

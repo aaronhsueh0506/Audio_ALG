@@ -91,10 +91,33 @@ void mono_aec_dfn_res_destroy(MonoAecDfnRes *p);
  * change does not reset the stage (dfn_res_stage.h, RESET). */
 void mono_aec_dfn_res_reset(MonoAecDfnRes *p);
 
-/* Consume and produce exactly one host hop (mono_aec_dfn_res_hop_size()).
- * The first hops of output are zero: two hops at 48 kHz (the model
- * lookahead), the bridge's added delay otherwise. -1 on NULL arguments or a
- * stage contract error (the pipeline is then reset). */
+/* Consume and produce exactly one host hop (mono_aec_dfn_res_hop_size()). The
+ * first hops of output are zero: two hops at 48 kHz (the model lookahead), the
+ * bridge's added delay otherwise. The model is the DFN2Model of the config
+ * (an all-zero model keeps the identity). -1 on NULL arguments or a stage
+ * contract error (the pipeline is then reset).
+ *
+ * The same hop in phases, for a caller that runs the model itself (the NPU
+ * sits between nn_begin and nn_end):
+ *
+ *     mono_aec_dfn_res_process_begin(p, mic, ref);     // AEC, RES, P, stage input
+ *     while (mono_aec_dfn_res_nn_begin(p, &job) > 0) { // a model frame is open
+ *         rc = run_npu(&job);                          // 0 = every output written
+ *         mono_aec_dfn_res_nn_end(p, rc);              // commit, or the identity
+ *     }
+ *     mono_aec_dfn_res_process_end(p, out);            // synthesis, one host hop
+ *
+ * A hop carries at most one model frame at 48 kHz and at most two on a native
+ * grid through the bridge (dfn_rate_bridge.h), hence the loop. A frame left
+ * open or never fetched takes the identity (fail-open) in process_end().
+ * process() is this sequence with the configured model callback. All
+ * functions return 0 (nn_begin: 1 when a frame is open, 0 when none is left)
+ * or -1; any contract error resets the pipeline. */
+int mono_aec_dfn_res_process_begin(MonoAecDfnRes *p, const float *mic,
+                                   const float *ref);
+int mono_aec_dfn_res_nn_begin(MonoAecDfnRes *p, DfnResStageJob *job);
+int mono_aec_dfn_res_nn_end(MonoAecDfnRes *p, int model_rc);
+int mono_aec_dfn_res_process_end(MonoAecDfnRes *p, float *out);
 int mono_aec_dfn_res_process(MonoAecDfnRes *p, const float *mic,
                              const float *ref, float *out);
 

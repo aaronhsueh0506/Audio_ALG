@@ -157,16 +157,48 @@ int dfn_res_stage_output_frame_index(const DfnResStage *s, long long *frame);
 void dfn_res_stage_get_counters(const DfnResStage *s, long long *frames_in,
                                 long long *commits, long long *skips);
 
-/* One hop. `estimate_spec` is the pre-RES spectrum the model estimates from
- * (E); `apply_spec` is the post-RES spectrum the heads are applied to (P).
- * Keeping the two pointers distinct is the contract of this class: the
- * estimate/apply split is visible at the seam and testable with distinct
- * inputs. Both are borrowed for the duration of the call (they may alias the
- * hosting pipeline's per-hop buffers). `out_spec` is ALWAYS fully written:
- * zeros on the two warm-up hops. Returns 1 when out_spec carries an emitted
- * frame, 0 during warm-up, -1 on a contract error (NULL or non-finite
- * arguments, or the DFN2 class refusing the frame), in which case out_spec
- * is untouched. */
+/* The model's tensor views of one open frame: the same DFN2PrepostInputs /
+ * DFN2PrepostOutputs the DFN2 class publishes, so a runtime binds by name and
+ * element count (dfn2_prepost.h documents the layout, the NaN-prefilled heads
+ * and the in-place recurrent state). Valid until dfn_res_stage_end(). */
+typedef struct DfnResStageJob {
+    DFN2PrepostInputs  inputs;
+    DFN2PrepostOutputs outputs;
+} DfnResStageJob;
+
+/* One hop in two calls around the model. `estimate_spec` is the pre-RES
+ * spectrum the model estimates from (E); `apply_spec` is the post-RES spectrum
+ * the heads are applied to (P). Keeping the two pointers distinct is the
+ * contract of this class: the estimate/apply split is visible at the seam and
+ * testable with distinct inputs. Both are borrowed for the duration of the
+ * begin call only (they may alias the hosting pipeline's per-hop buffers).
+ *
+ * dfn_res_stage_begin() feeds the hop and returns 1 when the model has a frame
+ * to run (*job holds its views; the caller runs the model, then calls
+ * dfn_res_stage_end()), 0 during the two warm-up hops (nothing to run;
+ * dfn_res_stage_end() still produces the output), -1 on a contract error (NULL
+ * or non-finite arguments, a hop already begun, or the DFN2 class refusing the
+ * frame).
+ *
+ * dfn_res_stage_end() closes the hop. model_rc is the model's result (0 = it
+ * wrote every output); anything else, or an unwritten or non-finite output,
+ * takes the frame as the identity (fail-open commit/skip), so the clocks
+ * advance exactly once either way. model_rc is ignored when begin returned 0.
+ * `out_spec` is ALWAYS fully written: zeros on the two warm-up hops. Returns 1
+ * when out_spec carries an emitted frame, 0 during warm-up, -1 on a contract
+ * error (no hop begun, or the DFN2 class refusing the frame). */
+int dfn_res_stage_begin(DfnResStage *s,
+                        const Complex *estimate_spec,
+                        const Complex *apply_spec,
+                        DfnResStageJob *job);
+int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec);
+
+/* Runs the configured model callback (DfnResStageConfig.model) on an open
+ * frame: its return value (0 = success), or -1 when no callback is set. */
+int dfn_res_stage_infer(const DfnResStage *s, DfnResStageJob *job);
+
+/* begin -> configured model callback (when set; otherwise the frame is the
+ * identity) -> end, in one call; arguments and results as above. */
 int dfn_res_stage_process(DfnResStage *s,
                           const Complex *estimate_spec,
                           const Complex *apply_spec,

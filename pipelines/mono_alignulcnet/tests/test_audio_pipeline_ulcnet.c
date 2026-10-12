@@ -2142,6 +2142,121 @@ static void test_known_delay_profile(void) {
                   cost.us_per_hop, hop_budget_us));
 }
 
+/* The phased hop (process_begin / nn_begin / nn_end / process_end) is
+ * audio_pipeline_ulcnet_process() with the model call moved out: a twin driven
+ * phase by phase, with the same network run by the caller, reproduces the
+ * callback-driven instance byte for byte -- across an alignment boundary (the
+ * echo path is delayed, so the reprime hops are part of the claim). The
+ * fail-open rows pin the ways a frame ends as the identity: a failed run, an
+ * output with a non-finite bin (only nn_end's finite guard can catch it), a
+ * frame left open, a frame never fetched. */
+enum { PH_RUN, PH_FAIL, PH_NAN, PH_OPEN, PH_UNFETCHED };
+
+static int phased_twin_matches(int mode, int hops) {
+    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    AudioPipelineUlcnetConfig cb_cfg = cfg;
+    NanModelState nan_state;
+    FailModelState fail_state;
+    AudioPipelineUlcnet *ph, *cb;
+    EchoSim sim;
+    float mic[ULCNET_HOP], ref[ULCNET_HOP], a[ULCNET_HOP], b[ULCNET_HOP];
+    UlcnetNnJob job;
+    int h, ok = 1, nonzero = 0, ran = 0;
+
+    memset(&nan_state, 0, sizeof(nan_state));
+    nan_state.poison_now = 1;
+    memset(&fail_state, 0, sizeof(fail_state));
+    fail_state.fail_now = 1;
+    if (mode == PH_RUN || mode == PH_FAIL || mode == PH_NAN) {
+        cb_cfg.model.infer = mode == PH_RUN ? halving_infer
+                           : mode == PH_FAIL ? failing_infer : nan_infer;
+        cb_cfg.model.user = mode == PH_NAN ? (void*)&nan_state
+                          : mode == PH_FAIL ? (void*)&fail_state : NULL;
+        cb_cfg.model.io_descriptor = test_io_descriptor();
+    }
+    ph = audio_pipeline_ulcnet_create(&cfg);
+    cb = audio_pipeline_ulcnet_create(&cb_cfg);
+    if (!ph || !cb) {
+        audio_pipeline_ulcnet_destroy(ph);
+        audio_pipeline_ulcnet_destroy(cb);
+        return 0;
+    }
+    echo_sim_init(&sim, ECHO_DELAY, 0xBEEFu + (uint32_t)mode);
+    for (h = 0; h < hops && ok; ++h) {
+        int r = 0;
+        echo_sim_hop(&sim, mic, ref);
+        ok = audio_pipeline_ulcnet_process(cb, mic, ref, b) == 0 &&
+             audio_pipeline_ulcnet_process_begin(ph, mic, ref) == 0;
+        if (!ok) break;
+        if (mode != PH_UNFETCHED) {
+            r = audio_pipeline_ulcnet_nn_begin(ph, &job);
+            if (r < 0) { ok = 0; break; }
+        }
+        if (r == 1) {
+            ran++;
+            if (mode == PH_RUN)
+                ok = halving_infer(NULL, job.err_re, job.err_im, job.far_re, job.far_im,
+                                   job.out_re, job.out_im) == 0 &&
+                     audio_pipeline_ulcnet_nn_end(ph, 0) == 0;
+            else if (mode == PH_FAIL)
+                ok = audio_pipeline_ulcnet_nn_end(ph, -1) == 0;
+            else if (mode == PH_NAN)
+                ok = nan_infer(&nan_state, job.err_re, job.err_im, job.far_re, job.far_im,
+                               job.out_re, job.out_im) == 0 &&
+                     audio_pipeline_ulcnet_nn_end(ph, 0) == 0;
+            /* PH_OPEN: the frame stays open into process_end */
+        }
+        ok = ok && audio_pipeline_ulcnet_process_end(ph, a) == 0;
+        if (!ok) break;
+        if (memcmp(a, b, sizeof(a)) != 0) ok = 0;
+        for (int i = 0; i < ULCNET_HOP; ++i) if (a[i] != 0.0f) nonzero = 1;
+    }
+    audio_pipeline_ulcnet_destroy(ph);
+    audio_pipeline_ulcnet_destroy(cb);
+    /* mode PH_UNFETCHED never fetches; every other mode must have run frames
+     * (the first hops after the boundary are reprime and run none). */
+    return ok && nonzero && (mode == PH_UNFETCHED || ran > 0);
+}
+
+static void test_phased_hop(void) {
+    AudioPipelineUlcnetConfig cfg = audio_pipeline_ulcnet_default_config(ULCNET_SR);
+    AudioPipelineUlcnet* p = audio_pipeline_ulcnet_create(&cfg);
+    UlcnetNnJob job;
+    float mic[ULCNET_HOP] = {0}, ref[ULCNET_HOP] = {0}, out[ULCNET_HOP];
+
+    CHECK(phased_twin_matches(PH_RUN, 120),
+          "phased hop with the caller's network equals the callback-driven pipeline byte for byte");
+    CHECK(phased_twin_matches(PH_FAIL, 120), "phased: a failed run is the identity");
+    CHECK(phased_twin_matches(PH_NAN, 120), "phased: a non-finite output bin is the identity");
+    CHECK(phased_twin_matches(PH_OPEN, 120), "phased: a frame left open is the identity");
+    CHECK(phased_twin_matches(PH_UNFETCHED, 120), "phased: a frame never fetched is the identity");
+
+    CHECK(p != NULL, "phased: instance creates");
+    if (!p) return;
+    CHECK(audio_pipeline_ulcnet_nn_begin(p, &job) == -1 &&
+          audio_pipeline_ulcnet_nn_end(p, 0) == -1 &&
+          audio_pipeline_ulcnet_process_end(p, out) == -1,
+          "phased: nn/end calls before process_begin are refused");
+    CHECK(audio_pipeline_ulcnet_process_begin(NULL, mic, ref) == -1 &&
+          audio_pipeline_ulcnet_process_begin(p, NULL, ref) == -1 &&
+          audio_pipeline_ulcnet_process_begin(p, mic, NULL) == -1,
+          "phased: NULL arguments are refused");
+    CHECK(audio_pipeline_ulcnet_process_begin(p, mic, ref) == 0 &&
+          audio_pipeline_ulcnet_process_begin(p, mic, ref) == -1,
+          "phased: a second process_begin before process_end is refused");
+    CHECK(audio_pipeline_ulcnet_nn_begin(p, &job) == 1 &&
+          audio_pipeline_ulcnet_nn_begin(p, &job) == -1,
+          "phased: one frame per hop; a second nn_begin is refused while it is open");
+    CHECK(audio_pipeline_ulcnet_nn_end(p, 0) == 0 &&
+          audio_pipeline_ulcnet_nn_end(p, 0) == -1 &&
+          audio_pipeline_ulcnet_nn_begin(p, &job) == 0,
+          "phased: nn_end closes the frame; none is left in this hop");
+    CHECK(audio_pipeline_ulcnet_process_end(p, out) == 0 &&
+          audio_pipeline_ulcnet_process_end(p, out) == -1,
+          "phased: process_end closes the hop; a second one is refused");
+    audio_pipeline_ulcnet_destroy(p);
+}
+
 int main(void) {
     printf("=== audio_pipeline_ulcnet: identity E2E (one-hop latency) ===\n");
     test_identity_e2e();
@@ -2198,6 +2313,9 @@ int main(void) {
 
     printf("\n=== audio_pipeline_ulcnet: full-write contract (partial-write guard) ===\n");
     test_partial_write_guard();
+
+    printf("\n=== audio_pipeline_ulcnet: phased hop (begin / nn / end) ===\n");
+    test_phased_hop();
 
     printf("\n=== audio_pipeline_ulcnet: raw-far descriptor gate ===\n");
     test_raw_descriptor_gate();

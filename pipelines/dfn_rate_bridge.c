@@ -56,6 +56,7 @@ struct DfnRateBridge {
     int out_fill;
     long long frames48;
     int last_hop_frames;
+    int phase;              /* 0 idle, 1 hop begun, 2 stage frame open */
     void *owned_heap;
 };
 
@@ -236,6 +237,7 @@ static void clear_streams(DfnRateBridge *b) {
     b->out_fill = b->prefill;
     b->frames48 = 0;
     b->last_hop_frames = 0;
+    b->phase = 0;
 }
 
 /* Walk the count schedule with the real resamplers on silence: how many
@@ -419,12 +421,11 @@ static int push_up(DfnRateBridge *b, AudioResampler *up, const float *hop,
     return produced;
 }
 
-int dfn_rate_bridge_process(DfnRateBridge *b,
-                            const Complex *estimate_spec,
-                            const Complex *apply_spec,
-                            float *out_hop) {
-    int consumed, produced, produced_e, produced_p;
-    if (!b || !estimate_spec || !apply_spec || !out_hop) return -1;
+int dfn_rate_bridge_begin(DfnRateBridge *b,
+                          const Complex *estimate_spec,
+                          const Complex *apply_spec) {
+    int produced_e, produced_p;
+    if (!b || !estimate_spec || !apply_spec || b->phase != 0) return -1;
     ac_istft_push(b->synth_e, estimate_spec, b->e_hop);
     ac_istft_push(b->synth_p, apply_spec, b->p_hop);
     produced_e = push_up(b, b->up_e, b->e_hop, b->fifo_e);
@@ -432,7 +433,32 @@ int dfn_rate_bridge_process(DfnRateBridge *b,
     if (produced_e < 0 || produced_p != produced_e) return -1;
     b->fill += produced_e;
     b->last_hop_frames = 0;
+    b->phase = 1;
+    return 0;
+}
+
+/* Closes the open (or warm-up) stage frame: stage output -> 48 kHz WOLA ->
+ * resample down into the native FIFO. */
+static int finish_frame(DfnRateBridge *b, int model_rc) {
+    int consumed, produced;
+    if (dfn_res_stage_end(b->stage, model_rc, b->out48) < 0) return -1;
+    ac_istft_push(b->synth48, b->out48, b->chunk48);
+    if (audio_resampler_process(b->down, b->chunk48, B48_HOP,
+                                b->out_fifo + b->out_fill,
+                                OUT_FIFO_CAP - b->out_fill,
+                                &consumed, &produced) != 0 ||
+        consumed != B48_HOP)
+        return -1;
+    b->out_fill += produced;
+    ++b->frames48;
+    ++b->last_hop_frames;
+    return 0;
+}
+
+int dfn_rate_bridge_nn_begin(DfnRateBridge *b, DfnResStageJob *job) {
+    if (!b || !job || b->phase != 1) return -1;
     while (b->fill >= B48_HOP) {
+        int r;
         /* The 48 kHz sqrt-Hann 1024/512 analysis the 48 kHz pipelines' AEC
          * performs on its own hop: each STFT object keeps its lane's
          * 512-sample history. */
@@ -443,26 +469,54 @@ int dfn_rate_bridge_process(DfnRateBridge *b,
                 (size_t)b->fill * sizeof(float));
         memmove(b->fifo_p, b->fifo_p + B48_HOP,
                 (size_t)b->fill * sizeof(float));
-        if (dfn_res_stage_process(b->stage, b->spec_e48, b->spec_p48,
-                                  b->out48) < 0)
-            return -1;
-        ac_istft_push(b->synth48, b->out48, b->chunk48);
-        if (audio_resampler_process(b->down, b->chunk48, B48_HOP,
-                                    b->out_fifo + b->out_fill,
-                                    OUT_FIFO_CAP - b->out_fill,
-                                    &consumed, &produced) != 0 ||
-            consumed != B48_HOP)
-            return -1;
-        b->out_fill += produced;
-        ++b->frames48;
-        ++b->last_hop_frames;
+        r = dfn_res_stage_begin(b->stage, b->spec_e48, b->spec_p48, job);
+        if (r < 0) return -1;
+        if (r == 1) {
+            b->phase = 2;
+            return 1;
+        }
+        if (finish_frame(b, 0) != 0) return -1;   /* warm-up: nothing to run */
     }
+    return 0;
+}
+
+int dfn_rate_bridge_nn_end(DfnRateBridge *b, int model_rc) {
+    if (!b || b->phase != 2) return -1;
+    b->phase = 1;
+    return finish_frame(b, model_rc);
+}
+
+int dfn_rate_bridge_finish(DfnRateBridge *b, float *out_hop) {
+    DfnResStageJob job;
+    int r;
+    if (!b || !out_hop || b->phase == 0) return -1;
+    /* Frames the caller left open or never fetched take the identity. */
+    if (b->phase == 2 && dfn_rate_bridge_nn_end(b, -1) != 0) return -1;
+    while ((r = dfn_rate_bridge_nn_begin(b, &job)) == 1)
+        if (dfn_rate_bridge_nn_end(b, -1) != 0) return -1;
+    if (r < 0) return -1;
+    b->phase = 0;
     if (b->out_fill < b->hop_n) return -1;   /* excluded by the prefill */
     memcpy(out_hop, b->out_fifo, (size_t)b->hop_n * sizeof(float));
     b->out_fill -= b->hop_n;
     memmove(b->out_fifo, b->out_fifo + b->hop_n,
             (size_t)b->out_fill * sizeof(float));
     return 0;
+}
+
+int dfn_rate_bridge_process(DfnRateBridge *b,
+                            const Complex *estimate_spec,
+                            const Complex *apply_spec,
+                            float *out_hop) {
+    DfnResStageJob job;
+    int r;
+    if (!b || !out_hop) return -1;
+    if (dfn_rate_bridge_begin(b, estimate_spec, apply_spec) != 0) return -1;
+    while ((r = dfn_rate_bridge_nn_begin(b, &job)) == 1)
+        if (dfn_rate_bridge_nn_end(b, dfn_res_stage_infer(b->stage, &job)) != 0)
+            return -1;
+    if (r < 0) return -1;
+    return dfn_rate_bridge_finish(b, out_hop);
 }
 
 int dfn_rate_bridge_hop_size(const DfnRateBridge *b) {

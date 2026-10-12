@@ -166,6 +166,18 @@ typedef struct UlcnetModel {
     const UlcnetModelIoDescriptor *io_descriptor;  /* NULL = not published */
 } UlcnetModel;
 
+/* One model frame of a hop in flight, for a caller that runs the model itself
+ * (the *_nn_begin / *_nn_end pair of the ULCNet pipelines). The error and far
+ * spectra are the frame the pipeline would hand to UlcnetModel.infer(); the
+ * output staging is pre-filled with NaN, and the model must write all
+ * ULCNET_BINS entries of BOTH out_re and out_im (the FULL-WRITE CONTRACT above).
+ * Valid until the matching *_nn_end(). */
+typedef struct UlcnetNnJob {
+    const float *err_re, *err_im;   /* [ULCNET_BINS] linear-error spectrum        */
+    const float *far_re, *far_im;   /* [ULCNET_BINS] raw far spectrum, same frame */
+    float *out_re, *out_im;         /* [ULCNET_BINS] enhanced spectrum, NaN-prefilled */
+} UlcnetNnJob;
+
 /* 1 when every bin of (re, im) is finite. */
 int ulcnet_frame_is_finite(const float re[ULCNET_BINS], const float im[ULCNET_BINS]);
 

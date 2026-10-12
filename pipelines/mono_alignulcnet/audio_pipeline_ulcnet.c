@@ -47,6 +47,7 @@
  * genuinely selects the ULCNet FFT backend too.
  */
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -54,6 +55,7 @@
 #include "audio_pipeline_ulcnet.h"
 #include "mem_align.h"       /* ALIGN16 / MEM_IS_ALIGNED16 */
 #include "common/se_config.h"  /* se_derive(): grid + AecConfig, shared by every application */
+#include "simd_kernel_nn.h"    /* skn_fill_f32 */
 
 /* This wrapper's own carve-layout version (see AudioPipelineUlcnetMemReq's
  * doc). History starts at 1 (2026-08: first version); 2 adds the
@@ -142,6 +144,11 @@ struct AudioPipelineUlcnet {
      * While nonzero the frame takes the identity path and the model is not
      * stepped. Re-armed, never accumulated, by a boundary during a reprime. */
     int reprime_frames;
+
+    /* The hop in flight (process_begin .. process_end). */
+    int phase;                    /* 0 idle, 1 begun, 2 model frame open */
+    int nn_wanted;                /* the frame has not been fetched and is not reprime */
+    int nn_accepted;              /* the model output replaces the error frame */
 
     Aec* aec;                     /* points into `pool` below                */
     FftHandle* fft;               /* points into `pool`; ONE shared compiled-grid
@@ -475,15 +482,12 @@ AudioPipelineUlcnet* audio_pipeline_ulcnet_create(const AudioPipelineUlcnetConfi
     return p;
 }
 
-int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
-                                  const float* ref, float* out) {
+int audio_pipeline_ulcnet_process_begin(AudioPipelineUlcnet* p, const float* mic,
+                                        const float* ref) {
     AecResContext rctx;
     AecLinearContext lctx;
-    int wrote;
-    const float* sre;
-    const float* sim;
 
-    if (!p || !mic || !ref || !out) return -1;
+    if (!p || !mic || !ref || p->phase != 0) return -1;
 
     /* Stage 1: context-only linear AEC (no time-output copy; downstream
      * reads only the seam taps). */
@@ -525,27 +529,53 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
     (void)ac_stft_push_planar(p->ana_err, rctx.formed_hop, p->err_re, p->err_im);
     (void)ac_stft_push_planar(p->ana_far, ref, p->far_re, p->far_im);
 
-    /* Stage 5: run the model once on this hop's frame pair and synthesize.
-     * The model always receives raw far and its D window owns alignment.
-     * A CHANGED event resets state before this hop's
-     * inference, and the frame whose analysis window still straddles that
-     * boundary emits the identity WITHOUT stepping the model (it would
-     * otherwise rebuild the just-cleared state from half-stale input).
-     * Skipping inference lowers the cost of that frame; it never doubles
-     * it: at most ONE inference per hop, always. */
-    sre = p->err_re;
-    sim = p->err_im;
-    if (p->reprime_frames > 0) {
-        p->reprime_frames--;          /* identity; model deliberately idle */
-    } else if (p->model.infer) {
-        /* FULL-WRITE CONTRACT (NaN prefill + finite guard, fail-open
-         * identity on any failure) lives in ulcnet_model_run_frame(). */
-        if (ulcnet_model_run_frame(&p->model, p->err_re, p->err_im,
-                                   p->far_re, p->far_im, p->mdl_re, p->mdl_im)) {
-            sre = p->mdl_re;
-            sim = p->mdl_im;
-        }
-    }
+    /* Stage 5 decision: the model runs once on this hop's frame pair, EXCEPT
+     * while the identity reprime armed at the last boundary is still running:
+     * that frame's window still covers the pre-switch hop, and stepping it
+     * would rebuild the just-cleared state from half-stale input. Skipping
+     * inference lowers the cost of that frame; it never doubles it: at most
+     * ONE inference per hop, always. */
+    p->nn_wanted = 0;
+    p->nn_accepted = 0;
+    if (p->reprime_frames > 0) p->reprime_frames--;   /* identity; model idle */
+    else p->nn_wanted = 1;
+    p->phase = 1;
+    return 0;
+}
+
+int audio_pipeline_ulcnet_nn_begin(AudioPipelineUlcnet* p, UlcnetNnJob* job) {
+    if (!p || !job || p->phase != 1) return -1;
+    if (!p->nn_wanted) return 0;
+    p->nn_wanted = 0;
+    /* FULL-WRITE CONTRACT: the staging is NaN, so a model that reports
+     * success without writing every bin is caught by nn_end's finite guard. */
+    skn_fill_f32(p->mdl_re, ULCNET_BINS, NAN);
+    skn_fill_f32(p->mdl_im, ULCNET_BINS, NAN);
+    job->err_re = p->err_re; job->err_im = p->err_im;
+    job->far_re = p->far_re; job->far_im = p->far_im;
+    job->out_re = p->mdl_re; job->out_im = p->mdl_im;
+    p->phase = 2;
+    return 1;
+}
+
+int audio_pipeline_ulcnet_nn_end(AudioPipelineUlcnet* p, int model_rc) {
+    if (!p || p->phase != 2) return -1;
+    /* Fail-open: a failed run, or any non-finite bin, leaves the identity. */
+    p->nn_accepted = model_rc == 0 && ulcnet_frame_is_finite(p->mdl_re, p->mdl_im);
+    p->phase = 1;
+    return 0;
+}
+
+int audio_pipeline_ulcnet_process_end(AudioPipelineUlcnet* p, float* out) {
+    int wrote;
+    const float* sre;
+    const float* sim;
+    if (!p || !out || p->phase == 0) return -1;
+    /* A frame left open or never fetched is the identity. */
+    if (p->phase == 2) p->nn_accepted = 0;
+    sre = p->nn_accepted ? p->mdl_re : p->err_re;
+    sim = p->nn_accepted ? p->mdl_im : p->err_im;
+    p->phase = 0;
     wrote = ac_istft_push_planar(p->synth, sre, sim, out);
 
     /* hop #0: the synthesis holds its first frame back (that frame's
@@ -558,6 +588,19 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
     return 0;
 }
 
+int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
+                                  const float* ref, float* out) {
+    UlcnetNnJob job;
+    if (!p || !mic || !ref || !out) return -1;
+    if (audio_pipeline_ulcnet_process_begin(p, mic, ref) != 0) return -1;
+    /* No runtime attached: the frame stays unfetched and is the identity. */
+    if (p->model.infer && audio_pipeline_ulcnet_nn_begin(p, &job) == 1)
+        (void)audio_pipeline_ulcnet_nn_end(
+            p, p->model.infer(p->model.user, job.err_re, job.err_im,
+                              job.far_re, job.far_im, job.out_re, job.out_im));
+    return audio_pipeline_ulcnet_process_end(p, out);
+}
+
 void audio_pipeline_ulcnet_reset(AudioPipelineUlcnet* p) {
     if (!p) return;
     aec_reset(p->aec);
@@ -568,6 +611,9 @@ void audio_pipeline_ulcnet_reset(AudioPipelineUlcnet* p) {
     ac_istft_reset(p->synth);
     p->last_delay_state = AEC_LINEAR_DELAY_UNLOCKED;
     p->processed_hops = 0;
+    p->phase = 0;
+    p->nn_wanted = 0;
+    p->nn_accepted = 0;
     /* The analysis history is zeroed above, so nothing emitted after this
      * point straddles anything: drop any pending reprime. */
     p->reprime_frames = 0;

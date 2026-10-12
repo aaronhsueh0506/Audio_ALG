@@ -2347,6 +2347,150 @@ static int test_raw_descriptor_gate(void) {
  * Driver
  * ========================================================================== */
 
+/* The phased hop (process_begin / nn_begin / nn_end / process_end) is
+ * process_with_activity() with the model call moved out: a twin driven phase
+ * by phase, with the same network run by the caller, reproduces the
+ * callback-driven instance byte for byte (an echo path appears mid-run, so
+ * the alignment boundary and its reprime hops are part of the claim). The
+ * fail-open rows pin the ways a frame ends as the identity: a failed run, an
+ * output with a non-finite bin, a frame left open, a frame never fetched. */
+enum { PH_RUN, PH_FAIL, PH_NAN, PH_OPEN, PH_UNFETCHED };
+
+static int phased_half_infer(void* user,
+                             const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
+                             const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
+                             float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+    int poison = user != NULL;
+    (void)far_re; (void)far_im;
+    for (int k = 0; k < ULCNET_BINS; ++k) {
+        out_re[k] = 0.5f * err_re[k];
+        out_im[k] = 0.5f * err_im[k];
+    }
+    if (poison) { out_re[100] = (float)NAN; out_im[200] = (float)INFINITY; }
+    return 0;
+}
+
+static int phased_fail_infer(void* user,
+                             const float err_re[ULCNET_BINS], const float err_im[ULCNET_BINS],
+                             const float far_re[ULCNET_BINS], const float far_im[ULCNET_BINS],
+                             float out_re[ULCNET_BINS], float out_im[ULCNET_BINS]) {
+    (void)user; (void)far_re; (void)far_im;
+    for (int k = 0; k < ULCNET_BINS; ++k) { out_re[k] = 2.0f * err_re[k]; out_im[k] = 2.0f * err_im[k]; }
+    return 1;   /* garbage written, failure reported: the pipeline must discard it */
+}
+
+static int phased_twin_matches(int mode, int frames) {
+    enum { TRUE_DELAY = 400 };
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    AudioPipeline4ChUlcnet *ph, *cb;
+    UlcnetModel model;
+    UlcnetNnJob job;
+    float *mics, *far, *far_hist, *a, *b;
+    int hop, ran = 0, nonzero = 0, ok = 1;
+    int poison_tag = 1;
+
+    cfg.gsc_fixed_mode = 1;
+    cfg.gsc_fixed_doa_rad = 0.3f;
+    cfg.gsc_mu = 0.02f;
+    cfg.core.enable_cng = 0;
+    ph = audio_pipeline_4ch_ulcnet_create(&cfg);
+    cb = audio_pipeline_4ch_ulcnet_create(&cfg);
+    if (!ph || !cb) return 0;
+    memset(&model, 0, sizeof(model));
+    if (mode == PH_RUN || mode == PH_FAIL || mode == PH_NAN) {
+        model.infer = mode == PH_FAIL ? phased_fail_infer : phased_half_infer;
+        model.user = mode == PH_NAN ? &poison_tag : NULL;
+        model.io_descriptor = test_io_descriptor();
+        if (audio_pipeline_4ch_ulcnet_set_model(cb, &model) != 0) return 0;
+    }
+    hop = audio_pipeline_4ch_ulcnet_hop_size(ph);
+    mics = (float*)malloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
+    far = (float*)malloc((size_t)hop * sizeof(float));
+    far_hist = (float*)calloc((size_t)frames * hop, sizeof(float));
+    a = (float*)malloc((size_t)hop * sizeof(float));
+    b = (float*)malloc((size_t)hop * sizeof(float));
+    for (int f = 0; f < frames && ok; ++f) {
+        int r = 0;
+        fill_echo_hop(f, hop, TRUE_DELAY, far_hist, far, mics);
+        ok = audio_pipeline_4ch_ulcnet_process_with_activity(cb, mics, far, 0, b) == FOUR_AEC_NR_RES_OK &&
+             audio_pipeline_4ch_ulcnet_process_begin(ph, mics, far, 0) == FOUR_AEC_NR_RES_OK;
+        if (!ok) break;
+        if (mode != PH_UNFETCHED) {
+            r = audio_pipeline_4ch_ulcnet_nn_begin(ph, &job);
+            if (r < 0) { ok = 0; break; }
+        }
+        if (r == 1) {
+            ran++;
+            if (mode == PH_RUN)
+                ok = phased_half_infer(NULL, job.err_re, job.err_im, job.far_re, job.far_im,
+                                       job.out_re, job.out_im) == 0 &&
+                     audio_pipeline_4ch_ulcnet_nn_end(ph, 0) == FOUR_AEC_NR_RES_OK;
+            else if (mode == PH_FAIL)
+                ok = audio_pipeline_4ch_ulcnet_nn_end(ph, -1) == FOUR_AEC_NR_RES_OK;
+            else if (mode == PH_NAN)
+                ok = phased_half_infer(&poison_tag, job.err_re, job.err_im, job.far_re, job.far_im,
+                                       job.out_re, job.out_im) == 0 &&
+                     audio_pipeline_4ch_ulcnet_nn_end(ph, 0) == FOUR_AEC_NR_RES_OK;
+        }
+        ok = ok && audio_pipeline_4ch_ulcnet_process_end(ph, a) == FOUR_AEC_NR_RES_OK;
+        if (!ok) break;
+        if (memcmp(a, b, (size_t)hop * sizeof(float)) != 0) ok = 0;
+        for (int i = 0; i < hop; ++i) if (a[i] != 0.0f) nonzero = 1;
+    }
+    free(mics); free(far); free(far_hist); free(a); free(b);
+    audio_pipeline_4ch_ulcnet_destroy(ph);
+    audio_pipeline_4ch_ulcnet_destroy(cb);
+    return ok && nonzero && (mode == PH_UNFETCHED || ran > 0);
+}
+
+static int test_phased_hop(void) {
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    AudioPipeline4ChUlcnet* p;
+    UlcnetNnJob job;
+    float* mics;
+    float* far;
+    float* out;
+    int hop;
+
+    CHECK(phased_twin_matches(PH_RUN, 80),
+          "phased hop with the caller's network equals the callback-driven pipeline byte for byte");
+    CHECK(phased_twin_matches(PH_FAIL, 80), "phased: a failed run is the identity");
+    CHECK(phased_twin_matches(PH_NAN, 80), "phased: a non-finite output bin is the identity");
+    CHECK(phased_twin_matches(PH_OPEN, 80), "phased: a frame left open is the identity");
+    CHECK(phased_twin_matches(PH_UNFETCHED, 80), "phased: a frame never fetched is the identity");
+
+    p = audio_pipeline_4ch_ulcnet_create(&cfg);
+    CHECK(p != NULL, "phased: instance creates");
+    hop = audio_pipeline_4ch_ulcnet_hop_size(p);
+    mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    CHECK(audio_pipeline_4ch_ulcnet_nn_begin(p, &job) == FOUR_AEC_NR_RES_SEQUENCE_ERROR &&
+          audio_pipeline_4ch_ulcnet_nn_end(p, 0) == FOUR_AEC_NR_RES_SEQUENCE_ERROR &&
+          audio_pipeline_4ch_ulcnet_process_end(p, out) == FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "phased: nn/end calls before process_begin are sequence errors");
+    CHECK(audio_pipeline_4ch_ulcnet_process_begin(NULL, mics, far, 0) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          audio_pipeline_4ch_ulcnet_process_begin(p, NULL, far, 0) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, 2) == FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+          "phased: NULL arguments and a non-boolean VAD are refused");
+    CHECK(audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, 0) == FOUR_AEC_NR_RES_OK &&
+          audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, 0) == FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "phased: a second process_begin before process_end is a sequence error");
+    CHECK(audio_pipeline_4ch_ulcnet_nn_begin(p, &job) == 1 &&
+          audio_pipeline_4ch_ulcnet_nn_begin(p, &job) == FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "phased: one frame per hop; a second nn_begin is refused while it is open");
+    CHECK(audio_pipeline_4ch_ulcnet_nn_end(p, 0) == FOUR_AEC_NR_RES_OK &&
+          audio_pipeline_4ch_ulcnet_nn_end(p, 0) == FOUR_AEC_NR_RES_SEQUENCE_ERROR &&
+          audio_pipeline_4ch_ulcnet_nn_begin(p, &job) == 0,
+          "phased: nn_end closes the frame; none is left in this hop");
+    CHECK(audio_pipeline_4ch_ulcnet_process_end(p, out) == FOUR_AEC_NR_RES_OK &&
+          audio_pipeline_4ch_ulcnet_process_end(p, out) == FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "phased: process_end closes the hop; a second one is refused");
+    free(mics); free(far); free(out);
+    audio_pipeline_4ch_ulcnet_destroy(p);
+    return 1;
+}
+
 static int run_all_tests(void) {
     /* Grid gate. Both rejected values below are legal on the OTHER supported
      * grid, so they prove the gate reads the compiled grid rather than merely
@@ -2456,6 +2600,7 @@ static int run_all_tests(void) {
           "identity reprime: exactly REPRIME identity frames per generation");
     CHECK(test_raw_descriptor_gate(),
           "production accepts only raw-far descriptors");
+    CHECK(test_phased_hop(), "phased hop (process_begin / nn / process_end)");
     printf("All audio_pipeline_4ch_ulcnet tests passed\n");
     return 1;
 }

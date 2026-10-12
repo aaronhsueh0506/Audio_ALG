@@ -312,6 +312,128 @@ static int run_rejections(void) {
     return 0;
 }
 
+/* The phased hop (process_begin / nn_begin ... nn_end / process_end) against
+ * process(): a non-identity model (a uniform 0.5 band mask) run by the caller
+ * reproduces the configured callback byte for byte at 48 kHz and through the
+ * rate bridge, comfort noise on, reconstructed and trusted error spectra; a
+ * failed run, a frame left open and a frame never fetched equal the
+ * model-free pipeline. */
+static int half_mask_infer(void *user, const DFN2PrepostInputs *in,
+                           DFN2PrepostOutputs *out) {
+    size_t i;
+    (void)user; (void)in;
+    for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 0.5f;
+    memset(out->coefs, 0, out->coefs_elements * sizeof(float));
+    out->alpha[0] = 0.0f;
+    return 0;
+}
+
+enum { BP_RUN, BP_FAIL, BP_OPEN, BP_UNFETCHED };
+
+static int run_phased(int sample_rate, int fft_size, int behaviour, int trusted_mode) {
+    FourAecDfnResConfig ph_cfg = four_aec_dfn_res_default_config();
+    FourAecDfnResConfig cb_cfg;
+    DFN2ModelIoDescriptor descriptor;
+    FourAecDfnRes *ph, *cb;
+    Complex weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
+    static Complex trusted[DFN2_N_BINS];
+    static float mics[512 * FOUR_AEC_NR_RES_CHANNELS], ref[512], oa[512], ob[512];
+    static float tones[100 * 512];
+    FourAecFront fa, fb;
+    DfnResStageJob job;
+    int hop, frame, i, ch, r, nonzero = 0, ran = 0, frames = 80;
+
+    ph_cfg.front_end.sample_rate = sample_rate;
+    ph_cfg.front_end.fft_size = fft_size;
+    ph_cfg.front_end.enable_cng = 1;
+    ph_cfg.erb_fwd = erb_fwd;
+    ph_cfg.erb_inv = erb_inv;
+    cb_cfg = ph_cfg;
+    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    if (behaviour == BP_RUN) {
+        cb_cfg.model.infer = half_mask_infer;
+        cb_cfg.model.io_descriptor = &descriptor;
+    }
+    ph = four_aec_dfn_res_create(&ph_cfg);
+    cb = four_aec_dfn_res_create(&cb_cfg);
+    if (!ph || !cb) return 2;
+    hop = four_aec_dfn_res_hop_size(ph);
+    make_weights(weights);
+    dfn_fixture_multitone(tones, (size_t)frames * hop, sample_rate);
+    for (frame = 0; frame < frames; ++frame) {
+        int e = (ECHO_DELAY * sample_rate) / DFN2_SR;
+        for (i = 0; i < hop; ++i) {
+            int t = frame * hop + i;
+            ref[i] = tones[t];
+            for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+                mics[(size_t)i * FOUR_AEC_NR_RES_CHANNELS + (size_t)ch] =
+                    (t >= e ? 0.5f * tones[t - e] : 0.0f) +
+                    0.01f * sinf((float)t * 0.071f + (float)ch);
+        }
+        if (four_aec_dfn_res_front_process(cb, mics, ref, &fb) != 0) return 3;
+        if (four_aec_dfn_res_front_process(ph, mics, ref, &fa) != 0) return 4;
+        if (trusted_mode) {
+            form_trusted(&fb, weights, trusted);
+            if (four_aec_dfn_res_process(cb, weights, trusted, ob) != 0) return 5;
+            form_trusted(&fa, weights, trusted);
+            if (four_aec_dfn_res_process_begin(ph, weights, trusted) != 0) return 6;
+        } else {
+            if (four_aec_dfn_res_process(cb, weights, NULL, ob) != 0) return 5;
+            if (four_aec_dfn_res_process_begin(ph, weights, NULL) != 0) return 6;
+        }
+        if (behaviour != BP_UNFETCHED) {
+            while ((r = four_aec_dfn_res_nn_begin(ph, &job)) == 1) {
+                int rc;
+                ++ran;
+                if (behaviour == BP_OPEN) break;
+                rc = behaviour == BP_RUN ? half_mask_infer(NULL, &job.inputs, &job.outputs) : -1;
+                if (four_aec_dfn_res_nn_end(ph, rc) != 0) return 7;
+            }
+            if (r < 0) return 8;
+        }
+        if (four_aec_dfn_res_process_end(ph, oa) != 0) return 9;
+        if (memcmp(oa, ob, (size_t)hop * sizeof(float)) != 0) return 100 + frame;
+        for (i = 0; i < hop; ++i) if (oa[i] != 0.0f) nonzero = 1;
+    }
+    if (!nonzero) return 10;
+    if (behaviour != BP_UNFETCHED && ran == 0) return 11;
+    four_aec_dfn_res_destroy(ph);
+    four_aec_dfn_res_destroy(cb);
+    return 0;
+}
+
+static int run_phased_sequence(void) {
+    FourAecDfnResConfig cfg = four_aec_dfn_res_default_config();
+    FourAecDfnRes *p;
+    Complex weights[FOUR_AEC_NR_RES_CHANNELS * DFN2_N_BINS];
+    static float mics[DFN2_HOP_LEN * FOUR_AEC_NR_RES_CHANNELS], ref[DFN2_HOP_LEN], out[DFN2_HOP_LEN];
+    FourAecFront front;
+    DfnResStageJob job;
+    cfg.front_end.sample_rate = DFN2_SR;
+    cfg.front_end.fft_size = DFN2_N_FFT;
+    cfg.erb_fwd = erb_fwd; cfg.erb_inv = erb_inv;
+    p = four_aec_dfn_res_create(&cfg);
+    if (!p) return 1;
+    make_weights(weights);
+    if (four_aec_dfn_res_process_begin(p, weights, NULL) != FOUR_AEC_NR_RES_SEQUENCE_ERROR)
+        return 2;                                   /* no front frame yet */
+    if (four_aec_dfn_res_nn_begin(p, &job) != FOUR_AEC_NR_RES_SEQUENCE_ERROR ||
+        four_aec_dfn_res_nn_end(p, 0) != FOUR_AEC_NR_RES_SEQUENCE_ERROR ||
+        four_aec_dfn_res_process_end(p, out) != FOUR_AEC_NR_RES_SEQUENCE_ERROR)
+        return 3;
+    if (four_aec_dfn_res_front_process(p, mics, ref, &front) != 0) return 4;
+    if (four_aec_dfn_res_process_begin(NULL, weights, NULL) != FOUR_AEC_NR_RES_INVALID_ARGUMENT)
+        return 5;
+    if (four_aec_dfn_res_process_begin(p, weights, NULL) != 0 ||
+        four_aec_dfn_res_process_begin(p, weights, NULL) != FOUR_AEC_NR_RES_SEQUENCE_ERROR)
+        return 6;
+    if (four_aec_dfn_res_process_end(p, out) != 0 ||
+        four_aec_dfn_res_process_end(p, out) != FOUR_AEC_NR_RES_SEQUENCE_ERROR)
+        return 7;
+    four_aec_dfn_res_destroy(p);
+    return 0;
+}
+
 int main(void) {
     int rc, trusted, cng;
     make_partition();
@@ -344,6 +466,22 @@ int main(void) {
             return 1;
         }
     }
+    {
+        static const int grids[3][2] = {{48000, 1024}, {16000, 256}, {16000, 512}};
+        int g, b, t;
+        for (g = 0; g < 3; ++g)
+            for (b = 0; b < 4; ++b)
+                for (t = 0; t <= 1; ++t) {
+                    rc = run_phased(grids[g][0], grids[g][1], b, t);
+                    if (rc) {
+                        fprintf(stderr, "4ch DFN phased %d Hz/%d behaviour %d trusted %d failed: %d\n",
+                                grids[g][0], grids[g][1], b, t, rc);
+                        return 1;
+                    }
+                }
+    }
+    rc = run_phased_sequence();
+    if (rc) { fprintf(stderr, "4ch DFN phased sequence row failed: %d\n", rc); return 1; }
     puts("4aec_dfn_res: PASS");
     return 0;
 }

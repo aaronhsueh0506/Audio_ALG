@@ -295,6 +295,103 @@ static int run_borrowed_sizes(void) {
     return 0;
 }
 
+/* The phased hop (begin / nn_begin ... nn_end / finish) against the one-call
+ * process(): with a non-identity model (a uniform 0.5 band mask) the loop the
+ * caller writes reproduces the configured callback byte for byte on every
+ * native grid, including the hops that carry two stage frames. The model-free
+ * rows: a frame the caller reports as failed, and a frame it leaves open or
+ * never fetches (finish takes it as the identity), equal a bridge with no
+ * model. Sequence errors are refused. */
+static int bridge_half_mask(void *user, const DFN2PrepostInputs *in,
+                            DFN2PrepostOutputs *out) {
+    size_t i;
+    (void)user; (void)in;
+    for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 0.5f;
+    memset(out->coefs, 0, out->coefs_elements * sizeof(float));
+    out->alpha[0] = 0.0f;
+    return 0;
+}
+
+/* behaviour of the caller in the phased twin */
+enum { BP_RUN, BP_FAIL, BP_OPEN, BP_UNFETCHED };
+
+static int run_phased_grid(const Grid *g, int behaviour) {
+    DFN2ModelIoDescriptor descriptor;
+    DfnRateBridgeConfig ph_cfg = bridge_config(g->sr, g->fft);
+    DfnRateBridgeConfig cb_cfg = bridge_config(g->sr, g->fft);
+    DfnRateBridge *ph, *cb;
+    Analyzer ae, ap;
+    static Complex se[MAX_FFT / 2 + 1], sa[MAX_FFT / 2 + 1];
+    static float est[MAX_HOPS * (MAX_FFT / 2)], app[MAX_HOPS * (MAX_FFT / 2)];
+    static float oa[MAX_FFT / 2], ob[MAX_FFT / 2];
+    int hop = g->fft / 2, hops = 120, t, k, max_frames = 0, nonzero = 0;
+    DfnResStageJob job;
+
+    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    if (behaviour == BP_RUN) {
+        cb_cfg.stage.model.infer = bridge_half_mask;
+        cb_cfg.stage.model.io_descriptor = &descriptor;
+    }
+    ph = dfn_rate_bridge_create(&ph_cfg);
+    cb = dfn_rate_bridge_create(&cb_cfg);
+    if (!ph || !cb || analyzer_init(&ae, g->fft) != 0 || analyzer_init(&ap, g->fft) != 0)
+        return 2;
+    dfn_fixture_multitone(est, (size_t)hops * hop, g->sr);
+    for (k = 0; k < hops * hop; ++k) app[k] = 0.7f * est[k];
+    for (t = 0; t < hops; ++t) {
+        int r, frames_this_hop = 0;
+        analyzer_push(&ae, est + t * hop, se);
+        analyzer_push(&ap, app + t * hop, sa);
+        if (dfn_rate_bridge_process(cb, se, sa, ob) != 0) return 3;
+        if (dfn_rate_bridge_begin(ph, se, sa) != 0) return 4;
+        if (behaviour != BP_UNFETCHED) {
+            while ((r = dfn_rate_bridge_nn_begin(ph, &job)) == 1) {
+                int rc = 0;
+                ++frames_this_hop;
+                if (behaviour == BP_OPEN) break;       /* left open: finish takes the identity */
+                if (behaviour == BP_RUN) rc = bridge_half_mask(NULL, &job.inputs, &job.outputs);
+                else rc = -1;
+                if (dfn_rate_bridge_nn_end(ph, rc) != 0) return 5;
+            }
+            if (r < 0) return 6;
+        }
+        if (dfn_rate_bridge_finish(ph, oa) != 0) return 7;
+        if (frames_this_hop > max_frames) max_frames = frames_this_hop;
+        if (memcmp(oa, ob, (size_t)hop * sizeof(float)) != 0) return 10 + t;
+        for (k = 0; k < hop; ++k) if (oa[k] != 0.0f) nonzero = 1;
+    }
+    if (!nonzero) return 8;
+    /* the 1,2 schedules (and 0,1,1,1) are walked by the run above */
+    if (behaviour == BP_RUN && max_frames < 1) return 9;
+    dfn_rate_bridge_destroy(ph);
+    dfn_rate_bridge_destroy(cb);
+    return 0;
+}
+
+static int run_phased_sequence(void) {
+    DfnRateBridgeConfig cfg = bridge_config(16000, 256);
+    DfnRateBridge *b = dfn_rate_bridge_create(&cfg);
+    Analyzer ae, ap;
+    static Complex se[129], sa[129];
+    static float hopbuf[128], out[128];
+    DfnResStageJob job;
+    if (!b || analyzer_init(&ae, 256) != 0 || analyzer_init(&ap, 256) != 0) return 1;
+    memset(hopbuf, 0, sizeof(hopbuf));
+    analyzer_push(&ae, hopbuf, se);
+    analyzer_push(&ap, hopbuf, sa);
+    if (dfn_rate_bridge_nn_begin(b, &job) != -1 || dfn_rate_bridge_nn_end(b, 0) != -1 ||
+        dfn_rate_bridge_finish(b, out) != -1)
+        return 2;                                    /* nothing begun */
+    if (dfn_rate_bridge_begin(b, se, sa) != 0 || dfn_rate_bridge_begin(b, se, sa) != -1)
+        return 3;                                    /* a second begin */
+    if (dfn_rate_bridge_nn_end(b, 0) != -1) return 4;  /* no frame open */
+    if (dfn_rate_bridge_finish(b, NULL) != -1) return 5;
+    if (dfn_rate_bridge_finish(b, out) != 0 || dfn_rate_bridge_finish(b, out) != -1)
+        return 6;
+    dfn_rate_bridge_destroy(b);
+    return 0;
+}
+
 int main(void) {
     int rc, i;
     dfn_unit_partition(erb_fwd, erb_inv);
@@ -310,6 +407,19 @@ int main(void) {
             return 1;
         }
     }
+    for (i = 0; i < N_GRIDS; ++i) {
+        int b;
+        for (b = 0; b < 4; ++b) {
+            rc = run_phased_grid(&GRIDS[i], b);
+            if (rc) {
+                fprintf(stderr, "rate bridge phased grid %d/%d behaviour %d failed: %d\n",
+                        GRIDS[i].sr, GRIDS[i].fft, b, rc);
+                return 1;
+            }
+        }
+    }
+    rc = run_phased_sequence();
+    if (rc) { fprintf(stderr, "rate bridge phased sequence row failed: %d\n", rc); return 1; }
     puts("dfn_rate_bridge: PASS");
     return 0;
 }

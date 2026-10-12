@@ -266,6 +266,98 @@ static int run_rejections(void) {
     return 0;
 }
 
+/* The phased hop (process_begin / nn_begin ... nn_end / process_end) against
+ * process(): a non-identity model (a uniform 0.5 band mask) run by the caller
+ * reproduces the configured callback byte for byte at 48 kHz and through the
+ * rate bridge, with comfort noise on; a failed run, a frame left open and a
+ * frame never fetched equal the model-free pipeline. */
+static int half_mask_infer(void *user, const DFN2PrepostInputs *in,
+                           DFN2PrepostOutputs *out) {
+    size_t i;
+    (void)user; (void)in;
+    for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 0.5f;
+    memset(out->coefs, 0, out->coefs_elements * sizeof(float));
+    out->alpha[0] = 0.0f;
+    return 0;
+}
+
+enum { BP_RUN, BP_FAIL, BP_OPEN, BP_UNFETCHED };
+
+static int run_phased(int sample_rate, int fft_size, int behaviour) {
+    MonoAecDfnResConfig ph_cfg = dfn_config(1);
+    MonoAecDfnResConfig cb_cfg;
+    DFN2ModelIoDescriptor descriptor;
+    MonoAecDfnRes *ph, *cb;
+    static float mic[512], ref[512], oa[512], ob[512];
+    static float tones[TEST_FRAMES * 4 * 256 * 2];
+    DfnResStageJob job;
+    int hop, frame, i, r, nonzero = 0, ran = 0, frames = 80;
+
+    ph_cfg.host.sample_rate = sample_rate;
+    ph_cfg.host.fft_size = fft_size;
+    cb_cfg = ph_cfg;
+    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    if (behaviour == BP_RUN) {
+        cb_cfg.model.infer = half_mask_infer;
+        cb_cfg.model.io_descriptor = &descriptor;
+    }
+    ph = mono_aec_dfn_res_create(&ph_cfg);
+    cb = mono_aec_dfn_res_create(&cb_cfg);
+    if (!ph || !cb) return 2;
+    hop = mono_aec_dfn_res_hop_size(ph);
+    dfn_fixture_multitone(tones, (size_t)frames * hop, sample_rate);
+    for (frame = 0; frame < frames; ++frame) {
+        int e = (ECHO_DELAY * sample_rate) / DFN2_SR;
+        for (i = 0; i < hop; ++i) {
+            int t = frame * hop + i;
+            ref[i] = tones[t];
+            mic[i] = (t >= e ? 0.5f * tones[t - e] : 0.0f) + 0.01f * sinf((float)t * 0.071f);
+        }
+        if (mono_aec_dfn_res_process(cb, mic, ref, ob) != 0) return 3;
+        if (mono_aec_dfn_res_process_begin(ph, mic, ref) != 0) return 4;
+        if (behaviour != BP_UNFETCHED) {
+            while ((r = mono_aec_dfn_res_nn_begin(ph, &job)) == 1) {
+                int rc;
+                ++ran;
+                if (behaviour == BP_OPEN) break;
+                rc = behaviour == BP_RUN ? half_mask_infer(NULL, &job.inputs, &job.outputs) : -1;
+                if (mono_aec_dfn_res_nn_end(ph, rc) != 0) return 5;
+            }
+            if (r < 0) return 6;
+        }
+        if (mono_aec_dfn_res_process_end(ph, oa) != 0) return 7;
+        if (memcmp(oa, ob, (size_t)hop * sizeof(float)) != 0) return 10 + frame;
+        for (i = 0; i < hop; ++i) if (oa[i] != 0.0f) nonzero = 1;
+    }
+    if (!nonzero) return 8;
+    if (behaviour != BP_UNFETCHED && ran == 0) return 9;
+    mono_aec_dfn_res_destroy(ph);
+    mono_aec_dfn_res_destroy(cb);
+    return 0;
+}
+
+static int run_phased_sequence(void) {
+    MonoAecDfnResConfig cfg = dfn_config(0);
+    MonoAecDfnRes *p = mono_aec_dfn_res_create(&cfg);
+    static float mic[DFN2_HOP_LEN], ref[DFN2_HOP_LEN], out[DFN2_HOP_LEN];
+    DfnResStageJob job;
+    if (!p) return 1;
+    if (mono_aec_dfn_res_nn_begin(p, &job) != -1 || mono_aec_dfn_res_nn_end(p, 0) != -1 ||
+        mono_aec_dfn_res_process_end(p, out) != -1)
+        return 2;
+    if (mono_aec_dfn_res_process_begin(NULL, mic, ref) != -1 ||
+        mono_aec_dfn_res_process_begin(p, NULL, ref) != -1)
+        return 3;
+    if (mono_aec_dfn_res_process_begin(p, mic, ref) != 0 ||
+        mono_aec_dfn_res_process_begin(p, mic, ref) != -1)
+        return 4;
+    if (mono_aec_dfn_res_process_end(p, out) != 0 ||
+        mono_aec_dfn_res_process_end(p, out) != -1)
+        return 5;
+    mono_aec_dfn_res_destroy(p);
+    return 0;
+}
+
 int main(void) {
     int rc;
     make_partition();
@@ -282,6 +374,21 @@ int main(void) {
     if (rc) { fprintf(stderr, "mono DFN 16 kHz/512 bridge gate failed: %d\n", rc); return 1; }
     rc = run_native(8000, 256, 330);
     if (rc) { fprintf(stderr, "mono DFN 8 kHz/256 bridge gate failed: %d\n", rc); return 1; }
+    {
+        static const int grids[4][2] = {{48000, 1024}, {16000, 256}, {16000, 512}, {8000, 256}};
+        int g, b;
+        for (g = 0; g < 4; ++g)
+            for (b = 0; b < 4; ++b) {
+                rc = run_phased(grids[g][0], grids[g][1], b);
+                if (rc) {
+                    fprintf(stderr, "mono DFN phased %d Hz/%d behaviour %d failed: %d\n",
+                            grids[g][0], grids[g][1], b, rc);
+                    return 1;
+                }
+            }
+    }
+    rc = run_phased_sequence();
+    if (rc) { fprintf(stderr, "mono DFN phased sequence row failed: %d\n", rc); return 1; }
     puts("mono_aec_dfn_res: PASS");
     return 0;
 }

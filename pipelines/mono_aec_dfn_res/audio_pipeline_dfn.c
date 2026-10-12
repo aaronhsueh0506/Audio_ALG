@@ -16,6 +16,11 @@ struct MonoAecDfnRes {
     uint32_t rng;               /* comfort-noise generator state         */
     int cng;                    /* comfort-noise fill enabled            */
     int n_freqs;
+    int phase;                  /* 0 idle, 1 hop begun, 2 model frame open */
+    const Complex *err_spec;    /* E of the hop in flight                  */
+    DfnResStageJob job;         /* 48 kHz: the frame begun, until fetched  */
+    int job_pending;            /* 48 kHz: job holds an unfetched frame    */
+    int stage_ended;            /* 48 kHz: the stage frame is closed       */
     DfnResStage *stage;         /* 48 kHz: the stage, driven directly */
     Complex *stage_output;      /* 48 kHz: its output spectrum          */
     DfnRateBridge *bridge;      /* 8/16 kHz: the stage inside the bridge */
@@ -233,6 +238,8 @@ MonoAecDfnRes *mono_aec_dfn_res_create(const MonoAecDfnResConfig *cfg) {
 
 void mono_aec_dfn_res_reset(MonoAecDfnRes *p) {
     if (!p) return;
+    p->phase = 0;
+    p->job_pending = 0;
     audio_pipeline_reset(p->host);
     p->rng = SE_CNG_RNG_SEED;
     if (p->bridge) {
@@ -254,34 +261,103 @@ void mono_aec_dfn_res_destroy(MonoAecDfnRes *p) {
     if (owned) free(owned);
 }
 
-int mono_aec_dfn_res_process(MonoAecDfnRes *p, const float *mic,
-                             const float *ref, float *out) {
+/* A contract error anywhere in a hop resets the pipeline, as for process(). */
+static int fail(MonoAecDfnRes *p) {
+    mono_aec_dfn_res_reset(p);
+    return -1;
+}
+
+int mono_aec_dfn_res_process_begin(MonoAecDfnRes *p, const float *mic,
+                                   const float *ref) {
     SeSpecFrame f;
-    int ok;
-    if (!p || !mic || !ref || !out) return -1;
-    ok = audio_pipeline_process_spec(p->host, mic, ref, &f) == 0;
-    if (ok) {
-        /* P = E * min(1, G_res), plus comfort noise on the cut bins. The
-         * absent denoiser reads as the unity vector, so the same four calls
-         * as the NR pipeline serve. */
-        sk_min_f32(p->g_total, p->unity, f.g_res_ctx, p->n_freqs);
-        sk_capply_gain_f32(p->post, f.e, p->g_total, p->n_freqs);
-        if (p->cng && f.cn)
-            aec_cng_fill(&p->rng, p->post, f.cn, f.g_res_ctx, p->unity,
-                         SE_CNG_NR_GAIN_FLOOR, p->n_freqs);
+    int r;
+    if (!p || !mic || !ref || p->phase != 0) return -1;
+    if (audio_pipeline_process_spec(p->host, mic, ref, &f) != 0) return fail(p);
+    /* P = E * min(1, G_res), plus comfort noise on the cut bins. The absent
+     * denoiser reads as the unity vector, so the same four calls as the NR
+     * pipeline serve. */
+    sk_min_f32(p->g_total, p->unity, f.g_res_ctx, p->n_freqs);
+    sk_capply_gain_f32(p->post, f.e, p->g_total, p->n_freqs);
+    if (p->cng && f.cn)
+        aec_cng_fill(&p->rng, p->post, f.cn, f.g_res_ctx, p->unity,
+                     SE_CNG_NR_GAIN_FLOOR, p->n_freqs);
+    p->err_spec = f.e;
+    p->job_pending = 0;
+    p->stage_ended = 0;
+    if (p->bridge) {
+        if (dfn_rate_bridge_begin(p->bridge, f.e, p->post) != 0) return fail(p);
+    } else {
+        r = dfn_res_stage_begin(p->stage, f.e, p->post, &p->job);
+        if (r < 0) return fail(p);
+        p->job_pending = r == 1;
     }
-    if (ok && p->bridge) {
-        ok = dfn_rate_bridge_process(p->bridge, f.e, p->post, out) == 0;
-    } else if (ok) {
-        ok = dfn_res_stage_process(p->stage, f.e, p->post,
-                                   p->stage_output) >= 0 &&
-             audio_pipeline_synthesize(p->host, p->stage_output, out) == 0;
+    p->phase = 1;
+    return 0;
+}
+
+int mono_aec_dfn_res_nn_begin(MonoAecDfnRes *p, DfnResStageJob *job) {
+    int r;
+    if (!p || !job || p->phase != 1) return -1;
+    if (p->bridge) {
+        r = dfn_rate_bridge_nn_begin(p->bridge, job);
+        if (r < 0) return fail(p);
+    } else if (p->job_pending) {
+        *job = p->job;
+        p->job_pending = 0;
+        r = 1;
+    } else {
+        r = 0;
     }
-    if (!ok) {
-        mono_aec_dfn_res_reset(p);
-        return -1;
+    if (r == 1) p->phase = 2;
+    return r;
+}
+
+int mono_aec_dfn_res_nn_end(MonoAecDfnRes *p, int model_rc) {
+    if (!p || p->phase != 2) return -1;
+    p->phase = 1;
+    if (p->bridge) {
+        if (dfn_rate_bridge_nn_end(p->bridge, model_rc) != 0) return fail(p);
+    } else {
+        if (dfn_res_stage_end(p->stage, model_rc, p->stage_output) < 0)
+            return fail(p);
+        p->stage_ended = 1;
     }
     return 0;
+}
+
+int mono_aec_dfn_res_process_end(MonoAecDfnRes *p, float *out) {
+    if (!p || !out || p->phase == 0) return -1;
+    if (p->bridge) {
+        p->phase = 0;
+        if (dfn_rate_bridge_finish(p->bridge, out) != 0) return fail(p);
+        return 0;
+    }
+    /* A frame left open or unfetched takes the identity (fail-open). */
+    if (!p->stage_ended) {
+        int open = p->job_pending || p->phase == 2;
+        if (dfn_res_stage_end(p->stage, open ? -1 : 0, p->stage_output) < 0) {
+            p->phase = 0;
+            return fail(p);
+        }
+    }
+    p->phase = 0;
+    p->job_pending = 0;
+    if (audio_pipeline_synthesize(p->host, p->stage_output, out) != 0)
+        return fail(p);
+    return 0;
+}
+
+int mono_aec_dfn_res_process(MonoAecDfnRes *p, const float *mic,
+                             const float *ref, float *out) {
+    DfnResStageJob job;
+    int r;
+    if (!p || !mic || !ref || !out) return -1;
+    if (mono_aec_dfn_res_process_begin(p, mic, ref) != 0) return -1;
+    while ((r = mono_aec_dfn_res_nn_begin(p, &job)) == 1)
+        if (mono_aec_dfn_res_nn_end(p, dfn_res_stage_infer(p->stage, &job)) != 0)
+            return -1;
+    if (r < 0) return -1;
+    return mono_aec_dfn_res_process_end(p, out);
 }
 
 int mono_aec_dfn_res_set_aec_preset(MonoAecDfnRes *p, AecPreset preset,

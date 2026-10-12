@@ -112,9 +112,32 @@ void dfn_rate_bridge_destroy(DfnRateBridge *b);   /* frees only create()'s heap 
  * only, as for the stage. */
 void dfn_rate_bridge_reset(DfnRateBridge *b);
 
-/* One native hop: the two native spectra in (n_freqs each), one native hop
- * of output. Returns 0, or -1 on NULL arguments or a stage contract error
- * (the bridge is then in an undefined state and must be reset). */
+/* One native hop: the two native spectra in (n_freqs each), one native hop of
+ * output. Returns 0, or -1 on NULL arguments or a stage contract error (the
+ * bridge is then in an undefined state and must be reset).
+ *
+ * The hop in phases, for a caller that runs the model itself. A native hop
+ * carries 0, 1 or 2 stage frames (the schedule above), so the model phase is a
+ * loop:
+ *
+ *     dfn_rate_bridge_begin(b, E, P);                  // WOLA + resample up
+ *     while (dfn_rate_bridge_nn_begin(b, &job) > 0) {  // 48 kHz frame open
+ *         rc = run_model(&job);                        // 0 = every output written
+ *         dfn_rate_bridge_nn_end(b, rc);               // commit, or the identity
+ *     }
+ *     dfn_rate_bridge_finish(b, out_hop);              // emit one native hop
+ *
+ * nn_begin returns 1 with the open frame's views in *job (warm-up frames are
+ * taken inside it), 0 when the hop has no further frame, -1 on a contract error.
+ * finish takes any frame left open or unfetched as the identity (fail-open),
+ * then emits the hop. dfn_rate_bridge_process() is this loop with the
+ * configured model callback. */
+int dfn_rate_bridge_begin(DfnRateBridge *b,
+                          const Complex *estimate_spec,
+                          const Complex *apply_spec);
+int dfn_rate_bridge_nn_begin(DfnRateBridge *b, DfnResStageJob *job);
+int dfn_rate_bridge_nn_end(DfnRateBridge *b, int model_rc);
+int dfn_rate_bridge_finish(DfnRateBridge *b, float *out_hop);
 int dfn_rate_bridge_process(DfnRateBridge *b,
                             const Complex *estimate_spec,
                             const Complex *apply_spec,

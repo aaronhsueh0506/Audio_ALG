@@ -30,6 +30,7 @@ struct DfnResStage {
     long long frames_in;
     long long commits;
     long long skips;
+    int phase;                /* 0 idle, 1 hop begun (no model frame), 2 model frame open */
     void *owned_heap;
 };
 
@@ -257,6 +258,7 @@ void dfn_res_stage_reset(DfnResStage *s) {
     s->frames_in = 0;
     s->commits = 0;
     s->skips = 0;
+    s->phase = 0;
     if (s->model.reset) s->model.reset(s->model.user);
 }
 
@@ -286,14 +288,12 @@ static int inputs_valid(const Complex *estimate, const Complex *apply) {
            skn_all_finite_cf32(apply, DFN2_N_BINS);
 }
 
-int dfn_res_stage_process(DfnResStage *s,
-                          const Complex *estimate_spec,
-                          const Complex *apply_spec,
-                          Complex *out_spec) {
+int dfn_res_stage_begin(DfnResStage *s,
+                        const Complex *estimate_spec,
+                        const Complex *apply_spec,
+                        DfnResStageJob *job) {
     int need_heads;
-    int valid = 0;
-    int run_result = 0;
-    if (!s || !out_spec || !inputs_valid(estimate_spec, apply_spec))
+    if (!s || !job || s->phase != 0 || !inputs_valid(estimate_spec, apply_spec))
         return -1;
 
     skn_deinterleave_scale_cf32(estimate_spec, s->est_re, s->est_im,
@@ -304,17 +304,30 @@ int dfn_res_stage_process(DfnResStage *s,
     need_heads = dfn2_prepost_pre_process_freq_dual(
         s->prepost, s->est_re, s->est_im, s->app_re, s->app_im);
     if (need_heads < 0) return -1;
-    if (need_heads) {
-        if (s->model.infer) {
-            run_result = dfn2_model_run_frame(&s->model, s->prepost);
-            if (run_result < 0) return -1;
-        } else {
-            if (dfn2_prepost_frame_skip(s->prepost) != 0) return -1;
-            run_result = 0;
+    if (need_heads &&
+        dfn2_prepost_frame_inputs(s->prepost, &job->inputs, &job->outputs) != 0)
+        return -1;
+    s->phase = need_heads ? 2 : 1;
+    return need_heads ? 1 : 0;
+}
+
+int dfn_res_stage_end(DfnResStage *s, int model_rc, Complex *out_spec) {
+    int valid = 0;
+    if (!s || !out_spec || s->phase == 0) return -1;
+    if (s->phase == 2) {
+        /* A failed run, an unwritten or non-finite output (the commit refuses
+         * it) all take the frame as the identity: the clocks advance exactly
+         * once. */
+        int committed = model_rc == 0 &&
+                        dfn2_prepost_frame_commit(s->prepost) == 0;
+        if (!committed && dfn2_prepost_frame_skip(s->prepost) != 0) {
+            s->phase = 0;
+            return -1;
         }
-        if (run_result) ++s->commits;
+        if (committed) ++s->commits;
         else ++s->skips;
     }
+    s->phase = 0;
 
     if (dfn2_prepost_post_process_freq(s->prepost, s->out_re, s->out_im,
                                        &valid) != 0)
@@ -327,4 +340,22 @@ int dfn_res_stage_process(DfnResStage *s,
     skn_interleave_scale_cf32(s->out_re, s->out_im, out_spec, DFN2_N_BINS,
                               DFN_RES_STAGE_OUT_SCALE);
     return 1;
+}
+
+int dfn_res_stage_infer(const DfnResStage *s, DfnResStageJob *job) {
+    if (!s || !job || !s->model.infer) return -1;
+    return s->model.infer(s->model.user, &job->inputs, &job->outputs);
+}
+
+int dfn_res_stage_process(DfnResStage *s,
+                          const Complex *estimate_spec,
+                          const Complex *apply_spec,
+                          Complex *out_spec) {
+    DfnResStageJob job;
+    int rc;
+    if (!out_spec) return -1;
+    rc = dfn_res_stage_begin(s, estimate_spec, apply_spec, &job);
+    if (rc < 0) return -1;
+    return dfn_res_stage_end(s, rc == 1 ? dfn_res_stage_infer(s, &job) : 0,
+                             out_spec);
 }

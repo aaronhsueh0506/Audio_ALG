@@ -411,6 +411,39 @@ int audio_pipeline_4ch_ulcnet_process_with_activity(
     float* out);
 
 /**
+ * The same hop in phases, for a caller that runs the network itself (the
+ * accelerator sits between nn_begin and nn_end; the installed model then needs
+ * no infer callback -- a reset callback, if set, is still called on an
+ * alignment boundary and by audio_pipeline_4ch_ulcnet_reset()):
+ *
+ *     audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, vad);  // lanes, DOA, GSC, far analysis
+ *     if (audio_pipeline_4ch_ulcnet_nn_begin(p, &job) > 0) {       // a frame to run
+ *         rc = run_network(&job);                                  // 0 = all bins written
+ *         audio_pipeline_4ch_ulcnet_nn_end(p, rc);                 // accept, or the identity
+ *     }
+ *     audio_pipeline_4ch_ulcnet_process_end(p, out);               // WOLA, one hop
+ *
+ * nn_begin returns 1 with the frame in *job (the GSC spectrum as the error
+ * frame, the same hop's raw far), 0 when this hop has no model frame (the
+ * identity reprime after an alignment boundary), or a negative
+ * FOUR_AEC_NR_RES_* status. nn_end accepts the output only when rc == 0 and
+ * every output bin is finite; otherwise the error frame passes unchanged
+ * (fail-open). A frame left open or never fetched is the identity.
+ * process_end writes the hop exactly as process_with_activity() does. All
+ * return FOUR_AEC_NR_RES_OK or the core's status codes (nn_begin: see above);
+ * process_with_activity() is this sequence with the installed model callback.
+ */
+int audio_pipeline_4ch_ulcnet_process_begin(
+    AudioPipeline4ChUlcnet* p,
+    const float* microphones_interleaved,
+    const float* far_reference,
+    int vad_external);
+int audio_pipeline_4ch_ulcnet_nn_begin(AudioPipeline4ChUlcnet* p,
+                                       UlcnetNnJob* job);
+int audio_pipeline_4ch_ulcnet_nn_end(AudioPipeline4ChUlcnet* p, int model_rc);
+int audio_pipeline_4ch_ulcnet_process_end(AudioPipeline4ChUlcnet* p, float* out);
+
+/**
  * Reset all core/SRP/GSC/ULCNet-chain state, restart the 1-hop timing
  * preamble, and call model->reset (if set). Any pending identity reprime is
  * dropped: the analysis history is zeroed here, so the frames emitted after

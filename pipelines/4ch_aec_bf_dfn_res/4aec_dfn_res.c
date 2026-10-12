@@ -19,6 +19,10 @@ struct FourAecDfnRes {
     uint32_t rng;               /* comfort-noise generator state           */
     int cng;                    /* comfort-noise fill enabled              */
     int n_freqs;
+    int phase;                  /* 0 idle, 1 hop begun, 2 model frame open */
+    DfnResStageJob job;         /* 48 kHz: the frame begun, until fetched  */
+    int job_pending;            /* 48 kHz: job holds an unfetched frame    */
+    int stage_ended;            /* 48 kHz: the stage frame is closed       */
     DfnResStage *stage;         /* 48 kHz: the stage, driven directly */
     Complex *stage_output;      /* 48 kHz: its output spectrum          */
     DfnRateBridge *bridge;      /* 8/16 kHz: the stage inside the bridge */
@@ -271,6 +275,8 @@ FourAecDfnRes *four_aec_dfn_res_create(const FourAecDfnResConfig *cfg) {
 
 void four_aec_dfn_res_reset(FourAecDfnRes *p) {
     if (!p) return;
+    p->phase = 0;
+    p->job_pending = 0;
     four_aec_nr_res_reset(p->front);
     aec_res_reset(p->res);
     p->rng = SE_CNG_RNG_SEED;
@@ -311,22 +317,26 @@ static int spectrum_finite(const Complex *s, int n) {
     return 1;
 }
 
-int four_aec_dfn_res_process(FourAecDfnRes *p, const Complex *weights,
-                             const Complex *beamformed_error, float *out) {
+/* A stage contract error resets the pipeline and reports DSP_ERROR. */
+static int fail(FourAecDfnRes *p) {
+    four_aec_dfn_res_reset(p);
+    return FOUR_AEC_NR_RES_DSP_ERROR;
+}
+
+int four_aec_dfn_res_process_begin(FourAecDfnRes *p, const Complex *weights,
+                                   const Complex *beamformed_error) {
     SeSpecFrame f;
     const float *res_gain;
-    int rc, ok, k;
-    if (!p || !out) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    int rc, r;
+    if (!p) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase != 0) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
     rc = four_aec_fuse(p->front, weights, beamformed_error, &f);
     if (rc != FOUR_AEC_NR_RES_OK) {
         if (rc == FOUR_AEC_NR_RES_DSP_ERROR) four_aec_dfn_res_reset(p);
         return rc;
     }
     res_gain = se_res_stage_gain(p->res, &f);
-    if (!res_gain) {
-        four_aec_dfn_res_reset(p);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
-    }
+    if (!res_gain) return fail(p);
     /* P = E * min(1, G_res), plus comfort noise on the cut bins. The absent
      * denoiser reads as the unity vector, so the same four calls as the NR
      * pipeline serve. */
@@ -335,23 +345,88 @@ int four_aec_dfn_res_process(FourAecDfnRes *p, const Complex *weights,
     if (p->cng)
         aec_cng_fill(&p->rng, p->post, f.cn, res_gain, p->unity,
                      SE_CNG_NR_GAIN_FLOOR, p->n_freqs);
+    p->job_pending = 0;
+    p->stage_ended = 0;
     if (p->bridge) {
-        ok = dfn_rate_bridge_process(p->bridge, f.e, p->post, out) == 0;
+        if (dfn_rate_bridge_begin(p->bridge, f.e, p->post) != 0) return fail(p);
     } else {
-        ok = dfn_res_stage_process(p->stage, f.e, p->post,
-                                   p->stage_output) >= 0 &&
-             spectrum_finite(p->stage_output, p->n_freqs);
-        if (ok) {
-            ac_istft_push(p->istft, p->stage_output, out);
-            for (k = 0; k < DFN2_HOP_LEN; ++k)
-                if (!isfinite(out[k])) { ok = 0; break; }
-        }
+        r = dfn_res_stage_begin(p->stage, f.e, p->post, &p->job);
+        if (r < 0) return fail(p);
+        p->job_pending = r == 1;
     }
-    if (!ok) {
-        four_aec_dfn_res_reset(p);
-        return FOUR_AEC_NR_RES_DSP_ERROR;
+    p->phase = 1;
+    return FOUR_AEC_NR_RES_OK;
+}
+
+int four_aec_dfn_res_nn_begin(FourAecDfnRes *p, DfnResStageJob *job) {
+    int r;
+    if (!p || !job) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase != 1) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+    if (p->bridge) {
+        r = dfn_rate_bridge_nn_begin(p->bridge, job);
+        if (r < 0) return fail(p);
+    } else if (p->job_pending) {
+        *job = p->job;
+        p->job_pending = 0;
+        r = 1;
+    } else {
+        r = 0;
+    }
+    if (r == 1) p->phase = 2;
+    return r;
+}
+
+int four_aec_dfn_res_nn_end(FourAecDfnRes *p, int model_rc) {
+    if (!p) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase != 2) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+    p->phase = 1;
+    if (p->bridge) {
+        if (dfn_rate_bridge_nn_end(p->bridge, model_rc) != 0) return fail(p);
+    } else {
+        if (dfn_res_stage_end(p->stage, model_rc, p->stage_output) < 0)
+            return fail(p);
+        p->stage_ended = 1;
     }
     return FOUR_AEC_NR_RES_OK;
+}
+
+int four_aec_dfn_res_process_end(FourAecDfnRes *p, float *out) {
+    int k;
+    if (!p || !out) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase == 0) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+    if (p->bridge) {
+        p->phase = 0;
+        if (dfn_rate_bridge_finish(p->bridge, out) != 0) return fail(p);
+        return FOUR_AEC_NR_RES_OK;
+    }
+    /* A frame left open or unfetched takes the identity (fail-open). */
+    if (!p->stage_ended) {
+        int open = p->job_pending || p->phase == 2;
+        if (dfn_res_stage_end(p->stage, open ? -1 : 0, p->stage_output) < 0)
+            return fail(p);
+    }
+    p->phase = 0;
+    p->job_pending = 0;
+    if (!spectrum_finite(p->stage_output, p->n_freqs)) return fail(p);
+    ac_istft_push(p->istft, p->stage_output, out);
+    for (k = 0; k < DFN2_HOP_LEN; ++k)
+        if (!isfinite(out[k])) return fail(p);
+    return FOUR_AEC_NR_RES_OK;
+}
+
+int four_aec_dfn_res_process(FourAecDfnRes *p, const Complex *weights,
+                             const Complex *beamformed_error, float *out) {
+    DfnResStageJob job;
+    int rc;
+    if (!p || !out) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    rc = four_aec_dfn_res_process_begin(p, weights, beamformed_error);
+    if (rc != FOUR_AEC_NR_RES_OK) return rc;
+    while ((rc = four_aec_dfn_res_nn_begin(p, &job)) == 1) {
+        int nr = four_aec_dfn_res_nn_end(p, dfn_res_stage_infer(p->stage, &job));
+        if (nr != FOUR_AEC_NR_RES_OK) return nr;
+    }
+    if (rc < 0) return rc;
+    return four_aec_dfn_res_process_end(p, out);
 }
 
 int four_aec_dfn_res_set_aec_preset(FourAecDfnRes *p, AecPreset preset,

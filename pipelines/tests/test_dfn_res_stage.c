@@ -426,6 +426,122 @@ static int run_non_finite_input(void) {
     return 0;
 }
 
+/* The phased hop (begin / model / end) against the one-call process(): a
+ * non-identity model (a uniform 0.5 band mask, so the output differs from the
+ * input) run by the caller between begin and end reproduces the configured
+ * callback byte for byte. The fail-open rows: a nonzero model result, a frame
+ * left open (end without a model result is fed -1 by the caller), and a
+ * non-finite head all take the identity; the counters follow. */
+static int half_mask_infer(void *user, const DFN2PrepostInputs *in,
+                           DFN2PrepostOutputs *out) {
+    size_t i;
+    (void)user; (void)in;
+    for (i = 0; i < out->erb_mask_elements; ++i) out->erb_mask[i] = 0.5f;
+    memset(out->coefs, 0, out->coefs_elements * sizeof(float));
+    out->alpha[0] = 0.0f;
+    return 0;
+}
+
+static int nan_head_infer(void *user, const DFN2PrepostInputs *in,
+                          DFN2PrepostOutputs *out) {
+    half_mask_infer(user, in, out);
+    out->erb_mask[3] = (float)NAN;
+    return 0;
+}
+
+/* mode 0: caller runs half_mask_infer; 1: caller reports -1; 2: the model
+ * writes a NaN head and reports success; 3: no model at all (config) and the
+ * caller reports 0 on a frame it never ran (the commit refuses it). */
+static int run_phased_case(int mode) {
+    DFN2ModelIoDescriptor descriptor;
+    DfnResStageConfig phased_cfg = base_config();
+    DfnResStageConfig cb_cfg = base_config();
+    DfnResStage *ph, *cb;
+    static Complex est[DFN2_N_BINS], app[DFN2_N_BINS], a[DFN2_N_BINS], b[DFN2_N_BINS];
+    DfnResStageJob job;
+    long long fa, ca, sa, fb, cb_commits, sb;
+    int frame, differs = 0, any = 0;
+
+    if (dfn2_model_io_descriptor_default(&descriptor) != 0) return 1;
+    cb_cfg.model.io_descriptor = &descriptor;
+    cb_cfg.model.infer = mode == 0 ? half_mask_infer
+                       : mode == 1 ? failing_infer
+                       : mode == 2 ? nan_head_infer : NULL;
+    if (mode == 3) cb_cfg.model.io_descriptor = NULL;
+    ph = dfn_res_stage_create(&phased_cfg);
+    cb = dfn_res_stage_create(&cb_cfg);
+    if (!ph || !cb) return 2;
+    for (frame = 0; frame < FRAMES + 4; ++frame) {
+        int rc_b, rc_a;
+        fill_frame(est, app, frame);
+        rc_b = dfn_res_stage_process(cb, est, app, b);
+        rc_a = dfn_res_stage_begin(ph, est, app, &job);
+        if (rc_a < 0 || rc_b < 0) return 3;
+        if (rc_a == 1) {
+            int model_rc = 0;
+            if (mode == 0) model_rc = half_mask_infer(NULL, &job.inputs, &job.outputs);
+            else if (mode == 1) model_rc = -1;
+            else if (mode == 2) model_rc = nan_head_infer(NULL, &job.inputs, &job.outputs);
+            else model_rc = 0;   /* nothing was written: the NaN heads refuse the commit */
+            if (dfn_res_stage_end(ph, model_rc, a) != rc_b) return 4;
+        } else if (dfn_res_stage_end(ph, 0, a) != rc_b) {
+            return 5;
+        }
+        if (memcmp(a, b, sizeof(a)) != 0) return 10 + frame;
+        if (frame >= 2) {
+            int k;
+            for (k = 0; k < DFN2_N_BINS; ++k) {
+                if (a[k].r != 0.0f) any = 1;
+                if (a[k].r != app[k].r && frame == FRAMES + 3) differs = 1;
+            }
+        }
+    }
+    dfn_res_stage_get_counters(ph, &fa, &ca, &sa);
+    dfn_res_stage_get_counters(cb, &fb, &cb_commits, &sb);
+    if (fa != fb || ca != cb_commits || sa != sb) return 6;
+    if (!any) return 7;
+    if (mode == 0 && (ca == 0 || !differs)) return 8;   /* the model really shaped it */
+    if (mode != 0 && ca != 0) return 9;                 /* every other row is the identity */
+    dfn_res_stage_destroy(ph);
+    dfn_res_stage_destroy(cb);
+    return 0;
+}
+
+static int run_phased_sequence(void) {
+    DfnResStageConfig cfg = base_config();
+    DfnResStage *s = dfn_res_stage_create(&cfg);
+    static Complex est[DFN2_N_BINS], app[DFN2_N_BINS], out[DFN2_N_BINS];
+    DfnResStageJob job;
+    int frame;
+    if (!s) return 1;
+    fill_frame(est, app, 0);
+    if (dfn_res_stage_end(s, 0, out) != -1) return 2;           /* end before begin */
+    if (dfn_res_stage_begin(NULL, est, app, &job) != -1 ||
+        dfn_res_stage_begin(s, est, app, NULL) != -1)
+        return 3;
+    if (dfn_res_stage_begin(s, est, app, &job) != 0) return 4;  /* warm-up: no model frame */
+    if (dfn_res_stage_begin(s, est, app, &job) != -1) return 5; /* a hop is already begun */
+    if (dfn_res_stage_end(s, 0, NULL) != -1) return 6;
+    if (dfn_res_stage_end(s, 0, out) != 0) return 7;
+    if (dfn_res_stage_end(s, 0, out) != -1) return 8;          /* already closed */
+    for (frame = 1; frame < 4; ++frame) {
+        int r;
+        fill_frame(est, app, frame);
+        r = dfn_res_stage_begin(s, est, app, &job);
+        if (r < 0) return 9;
+        if (r == 1) {
+            if (job.inputs.erb_window == NULL || job.outputs.erb_mask == NULL) return 10;
+            half_mask_infer(NULL, &job.inputs, &job.outputs);
+        }
+        if (dfn_res_stage_end(s, 0, out) < 0) return 11;
+    }
+    dfn_res_stage_reset(s);
+    fill_frame(est, app, 0);
+    if (dfn_res_stage_begin(s, est, app, &job) != 0) return 12; /* reset restarts the warm-up */
+    dfn_res_stage_destroy(s);
+    return 0;
+}
+
 int main(void) {
     int rc;
     make_partition();
@@ -445,6 +561,12 @@ int main(void) {
     if (rc) { fprintf(stderr, "stale-pool gate failed: %d\n", rc); return 1; }
     rc = run_non_finite_input();
     if (rc) { fprintf(stderr, "non-finite input row failed: %d\n", rc); return 1; }
+    for (rc = 0; rc < 4; ++rc) {
+        int r = run_phased_case(rc);
+        if (r) { fprintf(stderr, "phased case %d failed: %d\n", rc, r); return 1; }
+    }
+    rc = run_phased_sequence();
+    if (rc) { fprintf(stderr, "phased sequence row failed: %d\n", rc); return 1; }
     puts("dfn_res_stage: PASS");
     return 0;
 }

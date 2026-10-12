@@ -73,18 +73,40 @@ FourAecDfnRes *four_aec_dfn_res_create(const FourAecDfnResConfig *cfg);
 void four_aec_dfn_res_destroy(FourAecDfnRes *p);
 void four_aec_dfn_res_reset(FourAecDfnRes *p);
 
-/* One hop in two calls around the external SRP-PHAT/GSC. front_process() is
+/* One hop around the external SRP-PHAT/GSC. front_process() is
  * four_aec_front_process() on the front end: it exposes the four linear lanes
- * (FourAecFront.linear_spectra). process() then takes the effective weights
- * and, optionally, the beamformed error from the same beamformer call (NULL
- * reconstructs it from the weights), projects the lanes (four_aec_fuse()),
- * chains RES gain -> min -> apply -> comfort noise, runs the DFN2 stage on
- * (E, P) and synthesises. FOUR_AEC_NR_RES_* status as the front end; a stage
- * contract error resets the pipeline and returns DSP_ERROR. */
+ * (FourAecFront.linear_spectra). The beamformer then supplies the effective
+ * weights and, optionally, the beamformed error from the same call (NULL
+ * reconstructs it from the weights); process() projects the lanes
+ * (four_aec_fuse()), chains RES gain -> min -> apply -> comfort noise, runs
+ * the DFN2 stage on (E, P) and synthesises one hop. FOUR_AEC_NR_RES_* status
+ * as the front end; a stage contract error resets the pipeline and returns
+ * DSP_ERROR.
+ *
+ * The same second half in phases, for a caller that runs the model itself (the
+ * NPU sits between nn_begin and nn_end):
+ *
+ *     four_aec_dfn_res_process_begin(p, weights, error);   // fuse, RES, P, stage input
+ *     while (four_aec_dfn_res_nn_begin(p, &job) > 0) {     // a model frame is open
+ *         rc = run_npu(&job);                              // 0 = every output written
+ *         four_aec_dfn_res_nn_end(p, rc);                  // commit, or the identity
+ *     }
+ *     four_aec_dfn_res_process_end(p, out);                // synthesis, one hop
+ *
+ * A hop carries at most one model frame at 48 kHz and at most two on a native
+ * grid through the bridge (dfn_rate_bridge.h), hence the loop. A frame left
+ * open or never fetched takes the identity (fail-open) in process_end().
+ * nn_begin returns 1 (a frame is open), 0 (none left) or a negative status;
+ * process() is this sequence with the configured model callback. */
 int four_aec_dfn_res_front_process(FourAecDfnRes *p,
                                    const float *microphones_interleaved,
                                    const float *ref,
                                    FourAecFront *out);
+int four_aec_dfn_res_process_begin(FourAecDfnRes *p, const Complex *weights,
+                                   const Complex *beamformed_error);
+int four_aec_dfn_res_nn_begin(FourAecDfnRes *p, DfnResStageJob *job);
+int four_aec_dfn_res_nn_end(FourAecDfnRes *p, int model_rc);
+int four_aec_dfn_res_process_end(FourAecDfnRes *p, float *out);
 int four_aec_dfn_res_process(FourAecDfnRes *p, const Complex *weights,
                              const Complex *beamformed_error, float *out);
 

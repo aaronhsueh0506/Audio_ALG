@@ -278,6 +278,36 @@ int audio_pipeline_ulcnet_process(AudioPipelineUlcnet* p, const float* mic,
                                   const float* ref, float* out);
 
 /**
+ * The same hop in phases, for a caller that runs the network itself (the
+ * accelerator sits between nn_begin and nn_end; the config's model then needs
+ * no infer callback -- a reset callback, if set, is still called on an
+ * alignment boundary and by audio_pipeline_ulcnet_reset()):
+ *
+ *     audio_pipeline_ulcnet_process_begin(p, mic, ref);   // AEC, both analyses
+ *     if (audio_pipeline_ulcnet_nn_begin(p, &job) > 0) {  // a frame to run
+ *         rc = run_network(&job);                         // 0 = all bins written
+ *         audio_pipeline_ulcnet_nn_end(p, rc);            // accept, or the identity
+ *     }
+ *     audio_pipeline_ulcnet_process_end(p, out);          // WOLA, one hop
+ *
+ * nn_begin returns 1 with the frame in *job, 0 when this hop has no model
+ * frame (the identity reprime after an alignment boundary), -1 on a sequence
+ * error. nn_end accepts the output only when rc == 0 and every output bin is
+ * finite; otherwise the error frame passes unchanged (fail-open). A frame
+ * left open or never fetched is the identity. process_end writes the hop
+ * exactly as audio_pipeline_ulcnet_process() does: zeros at hop #0, then one
+ * hop of the previous call's input. Each function returns 0 (nn_begin: see
+ * above) or -1 on NULL arguments or a call out of sequence.
+ * audio_pipeline_ulcnet_process() is this sequence with the config's model
+ * callback.
+ */
+int audio_pipeline_ulcnet_process_begin(AudioPipelineUlcnet* p, const float* mic,
+                                        const float* ref);
+int audio_pipeline_ulcnet_nn_begin(AudioPipelineUlcnet* p, UlcnetNnJob* job);
+int audio_pipeline_ulcnet_nn_end(AudioPipelineUlcnet* p, int model_rc);
+int audio_pipeline_ulcnet_process_end(AudioPipelineUlcnet* p, float* out);
+
+/**
  * Re-zero all pipeline state: AEC reset, both analysis states, the synthesis
  * state, and model->reset (if set) so the external runtime flushes its own
  * explicit states too. Any pending identity reprime is dropped: the analysis
