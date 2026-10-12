@@ -1,0 +1,19 @@
+# sha256 of the reference artifacts the full-window state boundaries are
+# checked against (kept outside git; files are not part of this repository):
+#   ulcnet_d4 / ulcnet_d8     Align-ULCNet D=4 / D=8, layout 17 graph (combined hidden)
+#   deepvqe_s_d32             DeepVQE-S D=32, layout 3 graph
+# Weights are seeded random (stub checkpoints, no trained model); each trace is
+# 2*D+5 hops of seeded random spectra with every graph input and output stored.
+# Layout 18 / layout 4 graphs are required to reproduce the recorded heads and
+# states exactly (new *_out == the old Concat, old *_out == new minus the
+# dropped slot).
+92c20ca390ac335f4d9e6b5e64287cb92b9ebcb1d8b52c708eadaa96397b39a4  deepvqe_s_d32_trace.npz
+8a6ccfd9f5b0ac42650acb2b81f9f2604fd17cc022fcdafd10b26ef3dd327492  old_deepvqe_s_d32_v3.onnx
+ff91c8e89fa3c714eda4826105ae23b6f562ba0057b8d6fd89d2799eeb930933  old_metadata.json
+80f4dea8399e9e672519c671daaebed7c2467a149b41da94485feedcf41825b8  old_ulcnet_d4_v17_combined.onnx
+16d974e34e75d48866203e2310f14d911229a524d1d0398f8c46736c4c9b8e85  old_ulcnet_d8_v17_combined.onnx
+fd3a93ed9b470e2eabe1b806cfeaf1c58c075f47fcce4c887299dd5ffb93fea2  stub_deepvqe_s.pth
+4b1796b7afe0300b61c98518e73d791ef5ab3c669c4eaf9ff4c021da941249a4  stub_ulcnet_d4.pth
+67676949f530e47c23f628aa80dfbef1d87be38518854974a2e010907eb5b042  stub_ulcnet_d8.pth
+bfb956e4a9e95c011fac5599f84c73d37000e28024dc065255ad824773a59b82  ulcnet_d4_trace.npz
+629e9372e37419d9ce1722b7cf5e0014368b56646768e6183e7009195b106356  ulcnet_d8_trace.npz
