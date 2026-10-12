@@ -62,7 +62,7 @@ pre code{background:none;padding:0}
 <tr><th>面向</th><th>四條一致的事實</th></tr>
 <tr><td>AEC 一律 linear-seam</td><td><b>四條全部無條件設 <code>enable_res = 0</code>、<code>return_res_context = 1</code></b>。AEC 只當線性前級,殘留抑制由 pipeline 自己(或 NN)做</td></tr>
 <tr><td>沒有一條用 streaming API</td><td><code>aec_analyze_render()</code>／<code>aec_process_capture()</code> 在 <code>pipelines/</code> 下<b>零引用</b> → <code>AecBufferingEvent</code> 在出貨路徑上結構性不可達</td></tr>
-<tr><td>audio_common 只用到少數符號</td><td><code>fft_*</code>、<code>sk_min_f32</code>、<code>sk_capply_gain_f32</code>、<code>sk_wola_accumulate_f32</code>、<code>ALIGN16</code>/<code>ck_*</code>。<b>沒有任何一條用 <code>hpf_*</code>／<code>audio_pre_gain_*</code>／<code>audio_resampler_*</code></b>——HPF 在 AEC 內部,gain 與 resample 是 pipeline <b>之外</b>的前級</td></tr>
+<tr><td>audio_common 只用到少數符號</td><td><code>fft_*</code>、<code>ac_stft_*</code>／<code>ac_istft_*</code>、<code>sk_min_f32</code>、<code>sk_capply_gain_f32</code>、<code>ALIGN16</code>/<code>ck_*</code>。<b>沒有任何一條用 <code>hpf_*</code>／<code>audio_pre_gain_*</code>／<code>audio_resampler_*</code></b>——HPF 在 AEC 內部,gain 與 resample 是 pipeline <b>之外</b>的前級</td></tr>
 <tr><td>32-byte 固定寬度 descriptor</td><td>四條的 <code>*MemReq</code> 形狀一致,都走 <code>get_mem_requirements()</code> → <code>init_ex()</code> 的 descriptor gate</td></tr>
 </table></div>
 

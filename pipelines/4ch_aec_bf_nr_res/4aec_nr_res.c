@@ -1434,14 +1434,14 @@ static int fuse_contexts(FourAecNrRes* p,
         if (!complex_vector_finite(trusted_beamformed_error, n)) return 0;
         /* No copy into p->fused_error: its lifetime (owned by the caller,
          * e.g. audio_pipeline_4ch.c's p->gsc_spectrum) already covers every
-         * read run_post_res_and_nr() does this call -- it reads
+         * read the post-beam stages make this call -- they read
          * trusted_beamformed_error directly instead. */
     } else {
         memset(p->fused_error, 0, (size_t)n * sizeof(Complex));
     }
     memset(p->fused_near, 0, (size_t)n * sizeof(Complex));
-    /* residual_proj is scratch for the coherent residual vector until
-     * run_post_res_and_nr() overwrites every bin with the final spectrum. */
+    /* residual_proj accumulates the coherent residual vector below;
+     * fused_r2 takes its power. */
     memset(p->residual_proj, 0, (size_t)n * sizeof(Complex));
     memset(p->fused_comfort, 0, (size_t)n * sizeof(float));
 

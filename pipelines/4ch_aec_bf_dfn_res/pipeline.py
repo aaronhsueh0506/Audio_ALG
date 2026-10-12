@@ -7,8 +7,8 @@ reference, unchanged.  This module adds the post half that has no Python twin
 today -- the spectrum-to-hop tail after ``res_gain`` -- in two flavours:
 
 * ``post_conventional``: MMSE-LSA on the fused pre-RES spectrum,
-  ``min(G_nr, G_res)``, comfort noise, WOLA -- the C core's
-  ``run_post_res_and_nr`` (``4aec_nr_res.c``), giving evaluation variant (a)
+  ``min(G_nr, G_res)``, comfort noise, WOLA -- the post chain of the C
+  application (``4aec_nr_res_static.c``), giving evaluation variant (a)
   a 4-channel Python counterpart;
 * ``post_dfn2``: ``P = E * G_res`` plus comfort noise (the conventional
   post spectrum with the denoiser off), the dual-input DFN2 stage estimated
