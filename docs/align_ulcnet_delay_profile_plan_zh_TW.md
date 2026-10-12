@@ -2,11 +2,11 @@
 
 ## 0. 最終範圍裁定
 
-使用者已用既有 checkpoint 完成 raw/aligned far 與 small-D sweep，並判定
-輸出無實質差異。這份證據在本專案中視為接受：D 可於 export 時直接調整，
+既有 checkpoint 的 raw/aligned far 與 small-D sweep 顯示輸出無實質差異，
+這份證據視為接受：D 可於 export 時直接調整，
 aligned far 可作為部署輸入；兩者不再重跑泛用分數，也不再改訓練 contract。
 
-本輪唯一新增功能是 **matched-filter n 的產品化調整**：依產品 bulk-delay
+新增功能只有 **matched-filter n 的產品化調整**：依產品 bulk-delay
 範圍選 n，讓 AEC init/pool、mono/4ch wrapper 與診斷工具真正使用該值。
 dataset generation 固定維持既有 n=5 contract，既有 WAV、packed data、
 checkpoint 與 weights 全部不動。
@@ -35,14 +35,14 @@ checkpoint 與 weights 全部不動。
    尚存的整幀差異與短期變動。
 3. 三個範圍不能相加成一個「總 delay coverage」。每一層都必須各自滿足
    前一層交付的輸入條件。
-4. checkpoint 的 `raw_far` 是 training provenance。使用者完成 sweep 後已
-   決定 production 固定讀 aligned-far seam；export descriptor 因此固定
+4. checkpoint 的 `raw_far` 是 training provenance。production 固定讀
+   aligned-far seam；export descriptor 因此固定
    `aligned_far`，pipeline 不提供 runtime mode；不需為此重訓。
 5. `n` 與 `D` 都是 init/export profile，不允許逐 hop 熱切換。切換 profile
    必須停止串流、重建 AEC/model state，並清除 STFT/WOLA、K/V、logit、GRU
    與 delay-generation 相關狀態。
 6. `n` 與 `D` 都不要求重新訓練：n 不屬於 NN graph；Align-ULCNet 的
-   trainable weight shapes 也不依賴 D。只要使用者明確選定 deployment
+   trainable weight shapes 也不依賴 D。只要明確選定 deployment
    profile，相同 checkpoint weights 可以建立不同 n 的 frontend，並 export
    成不同 D 的 ONNX。這是允許的行為變更，不是 contract error。
 
@@ -96,8 +96,8 @@ far branch 看見的 raw far-to-error lag，因此不能用 `n` 的範圍補足�
 1. **基準**：`n=5 + raw_far + D=64`，固定 16 kHz/512/256。
 2. **只縮 n**：維持 `raw_far + D=64`，逐一驗證 `n=4/3/2/1` 的 delay
    acquisition、steady-state linear output、path-change 與 memory/CPU。
-3. **既有結論（不重跑）**：raw/aligned far 與 small-D sweep 已完成並由
-   使用者接受；本輪只保留 C descriptor、時間戳、lock gate、reset 與輸入
+3. **既有結論（不重跑）**：raw/aligned far 與 small-D sweep 已完成並已接受；
+   只保留 C descriptor、時間戳、lock gate、reset 與輸入
    接線的結構驗證。
 4. **只縮 D**：已完成，不再以泛用分數重跑；export 時建立選定 D 的 graph、
    descriptor 與 state pool。
@@ -109,12 +109,12 @@ far branch 看見的 raw far-to-error lag，因此不能用 `n` 的範圍補足�
 
 ### 3.1 既有證據與尚缺證據
 
-先前的 `sweep_delay_depth.py` 已經用同一份 checkpoint 測過
+`sweep_delay_depth.py` 用同一份 checkpoint 測過
 `D=64/32/16/8/4/2/1`，也跑過 `raw_far` 與 `aligned_far` 路徑；這可作為
-「相同權重能以較小 D 執行」及 D-only 波形差異的既有證據，不需在本輪
+「相同權重能以較小 D 執行」及 D-only 波形差異的既有證據，不需
 重複執行。
 
-工具現已支援 `--delay-num-filters`，並從 live AEC instance 讀回 resolved n；
+工具支援 `--delay-num-filters`，並從 live AEC instance 讀回 resolved n；
 checkpoint linear contract 維持不記錄 n，dataset generation 固定 n=5。
 
 因此目前狀態是：
@@ -321,7 +321,7 @@ descriptor 與 pipeline config 不一致時 init 失敗，不可 clamp 或 fallb
 
 - **單純改 n/D**：少量真實錄音做 finite、fail-open、無明顯爆音/斷裂與
   waveform sanity；不是用平均 MOS 決定 coverage。
-- **`raw_far -> aligned_far`**：既有 sweep 已完成且使用者接受結果，本輪
+- **`raw_far -> aligned_far`**：既有 sweep 已完成且結果已接受，
   不再重跑；只保留 descriptor/pipeline mode 一致性測試。
 - **4ch BF input**：另做少量真實 SRP/GSC flow sanity，因為它與 mono
   training input 分佈不同；同樣不以泛用 NR corpus 代替 delay 驗證。
@@ -429,9 +429,9 @@ sanity 仍獨立保留。
 
 ### 8.4 修正 4ch unlock→same-delay relock reset
 
-此問題已修正。舊版 4ch 的 `changed` 僅由
-`eligible && estimated != accepted_delay` 產生，會漏掉首次鎖在 0 及失鎖後
-同值重鎖；現行實作改以「新的可用 alignment generation」判斷。
+4ch 的 `changed` 不能只由 `eligible && estimated != accepted_delay`
+產生（會漏掉首次鎖在 0 及失鎖後同值重鎖）；實作以「新的可用 alignment
+generation」判斷。
 
 修正語意：
 
@@ -448,7 +448,7 @@ changed = now_usable && (!was_usable || estimated != accepted_delay)
   delay generation 無關。
 - 新增 deterministic 測試：LOCKED(A) → UNLOCKED 多 hop → LOCKED(A)，確認
   model 在 unlock 期間只 step 不 apply，重鎖 hop inference 前 reset 恰一次。
-- mutation 回舊的 `estimated != accepted_delay` 判斷必須失敗。
+- mutation 回 `estimated != accepted_delay` 判斷必須失敗。
 
 ### 8.5 補 aligned-far timestamp coverage
 
@@ -507,5 +507,5 @@ make test         # 可用環境下合併執行
 不得靠重生 dataset 或更新 golden 掩蓋。上述全部通過後可放行結構與部署
 ABI；產品 n/D 由 §6 的應用 delay 量測裁決，不以泛用音質分數代替。
 
-本節的執行順序現已完成；legacy raw-far 只保留為 checkpoint provenance 與
+本節的執行順序已完成；legacy raw-far 只保留為 checkpoint provenance 與
 `sweep_delay_depth.py` 的診斷基準，不再是 production pipeline 選項。

@@ -5,10 +5,8 @@ descriptor 的 ``bytes`` 只是下界，擋得住成長、擋不住等量的語�
 ``build_flags_hash`` 是 carve token 字串的 FNV-1a，對結構單純長大是盲的。
 所以文件把版號寫錯，整合者會沿用一份 ``init_ex()`` 其實會拒絕的 descriptor。
 
-這件事已經漂移過：一次改版同時留下六個檔、十三處過期版號，其中一處
-（``pipeline_mono.html`` 的來源檔對照表）甚至和同一頁另外兩處自相矛盾。
-C 測試早就把字面值釘死在 header 上（``test_4aec_nr_res.c`` 的
-``FOUR_AEC_NR_RES_LAYOUT_VERSION == 16u`` 那一列），文件端在此補上對稱的閘。
+C 測試把字面值釘死在 header 上（``test_4aec_nr_res.c`` 的
+``FOUR_AEC_NR_RES_LAYOUT_VERSION == 16u`` 那一列），這裡是文件端對稱的閘。
 
 只檢查**具名巨集**的宣稱（``FOUR_AEC_NR_RES_LAYOUT_VERSION = 16``）。文件裡另有
 「layout v6 起新增四個 delay 欄位」這類**沿革**敘述不是在陳述目前值，刻意不納入；

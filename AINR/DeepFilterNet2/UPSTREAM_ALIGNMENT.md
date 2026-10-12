@@ -14,11 +14,9 @@
 > historical record of the shared base and of that earlier band-split
 > architecture, not a claim that this folder still composes that way.
 
-**Audited.** 34 independent agents across five areas (feature
-normalisation, GRU/embedding architecture, conv stack, loss, training schedule),
-every claimed divergence then handed to an adversarial verifier whose default was
-to refute. Only claims that survived verification appear below, at their
-**post-verification** severity.
+**Audited** against upstream across five areas (feature normalisation,
+GRU/embedding architecture, conv stack, loss, training schedule). Only
+divergences that were verified appear below, at their verified severity.
 
 This file exists because "align the port to upstream" is not a mechanical
 operation here. Roughly a third of the differences are deliberate, and several of

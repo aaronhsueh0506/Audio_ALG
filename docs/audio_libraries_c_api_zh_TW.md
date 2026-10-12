@@ -519,7 +519,7 @@ ulcnet_prepost_post_process(p, out_hop, &written);
   `ulcnet_prepost_state_generation()`、`ulcnet_accelerator_adapter_state_generation()`、
   `deepvqe_prepost_state_generation()`、`dfn2_prepost_state_generation()`、`dfn2_model_io_state_generation()`、
   `gtcrn_model_state_generation()` 回傳 C 端把 state 清零的次數：`_reset()` 與被拒絕的 `_frame_commit()` 各加一，
-  新建實例為 0，成功的 commit、`_frame_skip()` 與再次呼叫被拒的 commit 都不動它；`NULL` 回 0，數值回繞於 2^32。
+  新建實例的起始值：Align-ULCNet、DeepVQE-S 為 0，DFN2、GTCRN 為 1；成功的 commit、`_frame_skip()` 與再次呼叫被拒的 commit 都不動它；`NULL` 回 0，數值回繞於 2^32。
   定點 accelerator 的 state 緩衝在 C 清零時不會跟著變，板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。
 - **Align-ULCNet 的四個 state**（`key_history`／`value_history`／`logit_history`／`h_gru`
   ↔ 對應的 `*_out`）：輸入是完整 window、graph 回每個 state 的**完整下一個 window**，shape 與輸入完全相同：
