@@ -652,8 +652,7 @@ static void compress_planar(const float *re, const float *im, float *out) {
     const float exponent = DEEPVQE_COMPRESSION_EXP - 1.0f;
     int k;
 
-    for (k = 0; k < AIAEC_N_BINS; ++k)
-        out_im[k] = sqrtf(re[k] * re[k] + im[k] * im[k] + 1e-12f);
+    skn_mag_eps_f32(out_im, re, im, AIAEC_N_BINS, 1e-12f);
     for (k = 0; k < AIAEC_N_BINS; ++k)
         out_im[k] = powf(out_im[k], exponent);
     skn_mul_f32(out_re, re, out_im, AIAEC_N_BINS);
@@ -711,6 +710,61 @@ static void pp_close_frame(DeepVqePrepost *p) {
     }
 }
 
+/* 1 when every element of `rows` rows of `width` floats, `stride` floats
+ * apart, is finite: skn_all_finite_f32 applied to each row. */
+static inline __attribute__((unused)) int rows_all_finite_scalar(const float *base, size_t rows,
+                                     size_t stride, size_t width) {
+    size_t row;
+    for (row = 0; row < rows; ++row)
+        if (!skn_all_finite_f32_scalar(base + row * stride, width)) return 0;
+    return 1;
+}
+
+#if SK_HAVE_NEON
+/* The same predicate for all rows at once: the largest masked exponent field
+ * seen reaches 0x7f800000 only for Inf or NaN. A row's last quad is read again
+ * from its end when the width is no multiple of four, which a maximum does not
+ * mind. */
+static inline int rows_all_finite_neon(const float *base, size_t rows,
+                                       size_t stride, size_t width) {
+    const uint32x4_t exponent = vdupq_n_u32(0x7f800000u);
+    uint32x4_t a0 = vdupq_n_u32(0u), a1 = a0, a2 = a0, a3 = a0;
+    size_t row, i;
+
+    if (width < 4) return rows_all_finite_scalar(base, rows, stride, width);
+    for (row = 0; row < rows; ++row) {
+        const float *p = base + row * stride;
+        for (i = 0; i + 16 <= width; i += 16) {
+            a0 = vmaxq_u32(a0, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i)), exponent));
+            a1 = vmaxq_u32(a1, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i + 4)), exponent));
+            a2 = vmaxq_u32(a2, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i + 8)), exponent));
+            a3 = vmaxq_u32(a3, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i + 12)), exponent));
+        }
+        for (; i + 4 <= width; i += 4)
+            a0 = vmaxq_u32(a0, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i)), exponent));
+        if (i < width)
+            a1 = vmaxq_u32(a1, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + width - 4)), exponent));
+    }
+    return vmaxvq_u32(vmaxq_u32(vmaxq_u32(a0, a1), vmaxq_u32(a2, a3))) <
+           0x7f800000u;
+}
+#endif
+
+static inline int rows_all_finite(const float *base, size_t rows,
+                                  size_t stride, size_t width) {
+#if SK_HAVE_NEON
+    return rows_all_finite_neon(base, rows, stride, width);
+#else
+    return rows_all_finite_scalar(base, rows, stride, width);
+#endif
+}
+
 /* The finite predicate over what the graph just wrote into one state tensor.
  * Every window is written back whole, but only its newest frame is new: slot
  * 0 of an attention ring (newest first), the last frame of a conv or score
@@ -723,7 +777,6 @@ static int newest_frame_finite(const DeepVqePrepost *p, int id) {
     size_t frames;
     size_t width;
     size_t newest;
-    size_t channel;
 
     if (id == DEEPVQE_STATE_H_GRU)
         return all_finite(p->state[id], p->state_elements[id]);
@@ -734,12 +787,8 @@ static int newest_frame_finite(const DeepVqePrepost *p, int id) {
     width = (size_t)dims[3];
     newest = (id == DEEPVQE_STATE_ALIGN_KEY_RING ||
               id == DEEPVQE_STATE_ALIGN_VALUE_RING) ? 0u : frames - 1u;
-    for (channel = 0; channel < channels; ++channel) {
-        if (!all_finite(p->state[id] + (channel * frames + newest) * width,
-                        width))
-            return 0;
-    }
-    return 1;
+    return rows_all_finite(p->state[id] + newest * width, channels,
+                           frames * width, width);
 }
 
 int deepvqe_prepost_frame_commit(DeepVqePrepost *p) {

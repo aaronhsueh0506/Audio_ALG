@@ -6,6 +6,10 @@
 #include <stdint.h>
 #include <string.h>
 
+/* A scalar twin is the reference of its NEON kernel and the whole kernel in a
+ * SIMD=0 build; a NEON build keeps it only for the differential test. */
+#define ULCNET_TWIN static inline __attribute__((unused))
+
 struct UlcnetModelIoState {
     UlcnetModelIoDescriptor descriptor;
 
@@ -297,21 +301,17 @@ uint32_t ulcnet_model_io_state_generation(const UlcnetModelIoState *state) {
     return state ? state->state_generation : 0u;
 }
 
-int ulcnet_model_io_prepare(UlcnetModelIoState *state,
-                            const float error_re[ULCNET_MODEL_IO_BINS],
-                            const float error_im[ULCNET_MODEL_IO_BINS],
-                            const float far_re[ULCNET_MODEL_IO_BINS],
-                            const float far_im[ULCNET_MODEL_IO_BINS],
-                            UlcnetModelIoInputs *inputs,
-                            UlcnetModelIoOutputs *outputs) {
+/* The fixed front end: signed-power compression, magnitudes and the
+ * compressed-domain phase direction, all in fp32 on the host. cos/sin of
+ * atan2(c_im, c_re) are the normalized direction: hypotf avoids underflow for
+ * tiny components, and the zero-vector case follows atan2(0,0) == 0 (cos 1,
+ * sin 0), matching the torch reference in export_onnx.stream_features to fp32
+ * rounding. */
+ULCNET_TWIN void front_end_scalar(UlcnetModelIoState *state,
+                                  const float *error_re, const float *error_im,
+                                  const float *far_re, const float *far_im) {
     int bin;
 
-    if (!state || !error_re || !error_im || !far_re || !far_im || !inputs ||
-        !outputs) {
-        return -1;
-    }
-    /* The fixed front end: signed-power compression, magnitudes and the
-     * compressed-domain phase direction, all in fp32 on the host. */
     for (bin = 0; bin < state->descriptor.spectrum_bins; ++bin) {
         float c_re = ulcnet_model_io_signed_pow(
             error_re[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
@@ -321,10 +321,6 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
             far_re[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
         float f_im = ulcnet_model_io_signed_pow(
             far_im[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
-        /* cos/sin of atan2(c_im, c_re) as the normalized direction: hypotf
-         * avoids underflow for tiny components, and the zero-vector case
-         * follows atan2(0,0) == 0 (cos 1, sin 0), matching the torch
-         * reference in export_onnx.stream_features to fp32 rounding. */
         float norm = hypotf(c_re, c_im);
         state->error_mag[bin] = sqrtf(c_re * c_re + c_im * c_im + 1e-12f);
         state->far_mag[bin] = sqrtf(f_re * f_re + f_im * f_im + 1e-12f);
@@ -333,6 +329,93 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
         state->error_ri[2 * bin] = c_re;
         state->error_ri[2 * bin + 1] = c_im;
     }
+}
+
+#if SK_HAVE_NEON
+/* The same front end in two passes. The libm calls run per bin and leave
+ * their results in planes that the frame owns anyway (the compressed error in
+ * error_ri, the compressed far spectrum in the not yet filled output planes,
+ * the norm in error_cos); the square roots, divides and the direction are
+ * then taken four bins at a time. Each lane performs the scalar twin's
+ * operations in its order, with the correctly rounded vsqrtq/vdivq. */
+static inline void front_end_tail_one(UlcnetModelIoState *state, int bin) {
+    const float c_re = state->error_ri[2 * bin];
+    const float c_im = state->error_ri[2 * bin + 1];
+    const float f_re = state->output[bin];
+    const float f_im = state->output[state->descriptor.spectrum_bins + bin];
+    const float norm = state->error_cos[bin];
+    state->error_mag[bin] = sqrtf(c_re * c_re + c_im * c_im + 1e-12f);
+    state->far_mag[bin] = sqrtf(f_re * f_re + f_im * f_im + 1e-12f);
+    state->error_cos[bin] = norm > 0.0f ? c_re / norm : 1.0f;
+    state->error_sin[bin] = norm > 0.0f ? c_im / norm : 0.0f;
+}
+
+static inline void front_end_neon(UlcnetModelIoState *state,
+                                  const float *error_re, const float *error_im,
+                                  const float *far_re, const float *far_im) {
+    const int bins = state->descriptor.spectrum_bins;
+    float *far_plane_re = state->output;
+    float *far_plane_im = state->output + bins;
+    const float32x4_t eps = vdupq_n_f32(1e-12f);
+    const float32x4_t zero = vdupq_n_f32(0.0f);
+    const float32x4_t one = vdupq_n_f32(1.0f);
+    int bin;
+
+    for (bin = 0; bin < bins; ++bin) {
+        float c_re = ulcnet_model_io_signed_pow(
+            error_re[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        float c_im = ulcnet_model_io_signed_pow(
+            error_im[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        far_plane_re[bin] = ulcnet_model_io_signed_pow(
+            far_re[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        far_plane_im[bin] = ulcnet_model_io_signed_pow(
+            far_im[bin], ULCNET_MODEL_IO_COMPRESSION_EXP);
+        state->error_cos[bin] = hypotf(c_re, c_im);
+        state->error_ri[2 * bin] = c_re;
+        state->error_ri[2 * bin + 1] = c_im;
+    }
+    for (bin = 0; bin + 4 <= bins; bin += 4) {
+        const float32x4x2_t c = vld2q_f32(state->error_ri + 2 * bin);
+        const float32x4_t f_re = vld1q_f32(far_plane_re + bin);
+        const float32x4_t f_im = vld1q_f32(far_plane_im + bin);
+        const float32x4_t norm = vld1q_f32(state->error_cos + bin);
+        const uint32x4_t positive = vcgtq_f32(norm, zero);
+        vst1q_f32(state->error_mag + bin, vsqrtq_f32(vaddq_f32(
+            vaddq_f32(vmulq_f32(c.val[0], c.val[0]),
+                      vmulq_f32(c.val[1], c.val[1])), eps)));
+        vst1q_f32(state->far_mag + bin, vsqrtq_f32(vaddq_f32(
+            vaddq_f32(vmulq_f32(f_re, f_re), vmulq_f32(f_im, f_im)), eps)));
+        vst1q_f32(state->error_cos + bin,
+                  vbslq_f32(positive, vdivq_f32(c.val[0], norm), one));
+        vst1q_f32(state->error_sin + bin,
+                  vbslq_f32(positive, vdivq_f32(c.val[1], norm), zero));
+    }
+    for (; bin < bins; ++bin) front_end_tail_one(state, bin);
+}
+#endif
+
+static inline void front_end(UlcnetModelIoState *state, const float *error_re,
+                             const float *error_im, const float *far_re,
+                             const float *far_im) {
+#if SK_HAVE_NEON
+    front_end_neon(state, error_re, error_im, far_re, far_im);
+#else
+    front_end_scalar(state, error_re, error_im, far_re, far_im);
+#endif
+}
+
+int ulcnet_model_io_prepare(UlcnetModelIoState *state,
+                            const float error_re[ULCNET_MODEL_IO_BINS],
+                            const float error_im[ULCNET_MODEL_IO_BINS],
+                            const float far_re[ULCNET_MODEL_IO_BINS],
+                            const float far_im[ULCNET_MODEL_IO_BINS],
+                            UlcnetModelIoInputs *inputs,
+                            UlcnetModelIoOutputs *outputs) {
+    if (!state || !error_re || !error_im || !far_re || !far_im || !inputs ||
+        !outputs) {
+        return -1;
+    }
+    front_end(state, error_re, error_im, far_re, far_im);
 
     skn_fill_f32(state->output, state->spectrum_ri_elements, NAN);
 
@@ -364,6 +447,61 @@ int ulcnet_model_io_prepare(UlcnetModelIoState *state,
     return 0;
 }
 
+/* 1 when every element of `rows` rows of `width` floats, `stride` floats
+ * apart, is finite: skn_all_finite_f32 applied to each row. */
+ULCNET_TWIN int rows_all_finite_scalar(const float *base, size_t rows,
+                                     size_t stride, size_t width) {
+    size_t row;
+    for (row = 0; row < rows; ++row)
+        if (!skn_all_finite_f32_scalar(base + row * stride, width)) return 0;
+    return 1;
+}
+
+#if SK_HAVE_NEON
+/* The same predicate for all rows at once: the largest masked exponent field
+ * seen reaches 0x7f800000 only for Inf or NaN. A row's last quad is read again
+ * from its end when the width is no multiple of four, which a maximum does not
+ * mind. */
+static inline int rows_all_finite_neon(const float *base, size_t rows,
+                                       size_t stride, size_t width) {
+    const uint32x4_t exponent = vdupq_n_u32(0x7f800000u);
+    uint32x4_t a0 = vdupq_n_u32(0u), a1 = a0, a2 = a0, a3 = a0;
+    size_t row, i;
+
+    if (width < 4) return rows_all_finite_scalar(base, rows, stride, width);
+    for (row = 0; row < rows; ++row) {
+        const float *p = base + row * stride;
+        for (i = 0; i + 16 <= width; i += 16) {
+            a0 = vmaxq_u32(a0, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i)), exponent));
+            a1 = vmaxq_u32(a1, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i + 4)), exponent));
+            a2 = vmaxq_u32(a2, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i + 8)), exponent));
+            a3 = vmaxq_u32(a3, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i + 12)), exponent));
+        }
+        for (; i + 4 <= width; i += 4)
+            a0 = vmaxq_u32(a0, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + i)), exponent));
+        if (i < width)
+            a1 = vmaxq_u32(a1, vandq_u32(vreinterpretq_u32_f32(
+                vld1q_f32(p + width - 4)), exponent));
+    }
+    return vmaxvq_u32(vmaxq_u32(vmaxq_u32(a0, a1), vmaxq_u32(a2, a3))) <
+           0x7f800000u;
+}
+#endif
+
+static inline int rows_all_finite(const float *base, size_t rows,
+                                  size_t stride, size_t width) {
+#if SK_HAVE_NEON
+    return rows_all_finite_neon(base, rows, stride, width);
+#else
+    return rows_all_finite_scalar(base, rows, stride, width);
+#endif
+}
+
 /* The finite predicate over the tensors one frame wrote.  The graph writes a
  * whole window back, but only the frame it just produced is new -- key/value
  * slot 0 of every channel (newest first) and the last logit frame (oldest
@@ -377,36 +515,90 @@ static int frame_is_finite(const UlcnetModelIoState *state) {
     const size_t logit_stride = state->logit_history_elements / channels;
     const size_t depth = logit_stride / ULCNET_MODEL_IO_SCORE_WINDOW;
     const size_t newest_logit = logit_stride - depth;
-    size_t channel;
 
-    if (!skn_all_finite_f32(state->output, state->spectrum_ri_elements) ||
-        !skn_all_finite_f32(state->h_gru, state->gru_hidden_elements)) {
-        return 0;
+    return skn_all_finite_f32(state->output, state->spectrum_ri_elements) &&
+           skn_all_finite_f32(state->h_gru, state->gru_hidden_elements) &&
+           rows_all_finite(state->key_history, channels, key_stride,
+                           ULCNET_MODEL_IO_TA_BINS) &&
+           rows_all_finite(state->value_history, channels, key_stride,
+                           ULCNET_MODEL_IO_TA_BINS) &&
+           rows_all_finite(state->logit_history + newest_logit, channels,
+                           logit_stride, depth);
+}
+
+/* The fixed back end: the compressed error prepare() kept times the graph's
+ * planar complex mask (plane 0 real, plane 1 imaginary), then the inverse
+ * signed power. Products stay unfused (the build keeps -ffp-contract=off),
+ * matching export_onnx.apply_mask_ri. */
+ULCNET_TWIN void back_end_scalar(const UlcnetModelIoState *state,
+                                 float *enhanced_re, float *enhanced_im) {
+    const float inverse_exponent = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
+    const float *mask_re = state->output;
+    const float *mask_im = state->output + state->descriptor.spectrum_bins;
+    int bin;
+
+    for (bin = 0; bin < state->descriptor.spectrum_bins; ++bin) {
+        const float err_re = state->error_ri[2 * bin];
+        const float err_im = state->error_ri[2 * bin + 1];
+        enhanced_re[bin] = ulcnet_model_io_signed_pow(
+            err_re * mask_re[bin] - err_im * mask_im[bin], inverse_exponent);
+        enhanced_im[bin] = ulcnet_model_io_signed_pow(
+            err_re * mask_im[bin] + err_im * mask_re[bin], inverse_exponent);
     }
-    for (channel = 0; channel < channels; ++channel) {
-        if (!skn_all_finite_f32(state->key_history + channel * key_stride,
-                                ULCNET_MODEL_IO_TA_BINS) ||
-            !skn_all_finite_f32(state->value_history + channel * key_stride,
-                                ULCNET_MODEL_IO_TA_BINS) ||
-            !skn_all_finite_f32(state->logit_history +
-                                    channel * logit_stride + newest_logit,
-                                depth)) {
-            return 0;
-        }
+}
+
+#if SK_HAVE_NEON
+/* The complex products four bins at a time into the caller's planes, then the
+ * libm pass over them in place; the same operations as the scalar twin. */
+static inline void back_end_neon(const UlcnetModelIoState *state,
+                                 float *enhanced_re, float *enhanced_im) {
+    const float inverse_exponent = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
+    const int bins = state->descriptor.spectrum_bins;
+    const float *mask_re = state->output;
+    const float *mask_im = state->output + bins;
+    int bin;
+
+    for (bin = 0; bin + 4 <= bins; bin += 4) {
+        const float32x4x2_t err = vld2q_f32(state->error_ri + 2 * bin);
+        const float32x4_t m_re = vld1q_f32(mask_re + bin);
+        const float32x4_t m_im = vld1q_f32(mask_im + bin);
+        vst1q_f32(enhanced_re + bin,
+                  vsubq_f32(vmulq_f32(err.val[0], m_re),
+                            vmulq_f32(err.val[1], m_im)));
+        vst1q_f32(enhanced_im + bin,
+                  vaddq_f32(vmulq_f32(err.val[0], m_im),
+                            vmulq_f32(err.val[1], m_re)));
     }
-    return 1;
+    for (; bin < bins; ++bin) {
+        const float err_re = state->error_ri[2 * bin];
+        const float err_im = state->error_ri[2 * bin + 1];
+        enhanced_re[bin] = err_re * mask_re[bin] - err_im * mask_im[bin];
+        enhanced_im[bin] = err_re * mask_im[bin] + err_im * mask_re[bin];
+    }
+    for (bin = 0; bin < bins; ++bin) {
+        enhanced_re[bin] = ulcnet_model_io_signed_pow(enhanced_re[bin],
+                                                      inverse_exponent);
+        enhanced_im[bin] = ulcnet_model_io_signed_pow(enhanced_im[bin],
+                                                      inverse_exponent);
+    }
+}
+#endif
+
+static inline void back_end(const UlcnetModelIoState *state,
+                            float *enhanced_re, float *enhanced_im) {
+#if SK_HAVE_NEON
+    back_end_neon(state, enhanced_re, enhanced_im);
+#else
+    back_end_scalar(state, enhanced_re, enhanced_im);
+#endif
 }
 
 int ulcnet_model_io_commit(UlcnetModelIoState *state,
                            float enhanced_re[ULCNET_MODEL_IO_BINS],
                            float enhanced_im[ULCNET_MODEL_IO_BINS]) {
-    const UlcnetModelIoDescriptor *descriptor;
-    int bin;
-
     if (!state || !state->prepared || !enhanced_re || !enhanced_im) {
         return -1;
     }
-    descriptor = &state->descriptor;
     /* Every state tensor was written in place, so a bad frame cannot leave
      * them as they were: refuse it and restart the recurrent state cold. */
     if (!frame_is_finite(state)) {
@@ -415,25 +607,7 @@ int ulcnet_model_io_commit(UlcnetModelIoState *state,
         return -1;
     }
 
-    {
-        /* The graph emits the planar complex mask.  The fixed back end runs
-         * here: the compressed error prepare() kept times the mask, then the
-         * inverse signed power.  Products stay unfused (the build keeps
-         * -ffp-contract=off), matching export_onnx.apply_mask_ri. */
-        const float inverse_exponent = 1.0f / ULCNET_MODEL_IO_COMPRESSION_EXP;
-        const float *mask_re = state->output;
-        const float *mask_im = state->output + descriptor->spectrum_bins;
-        for (bin = 0; bin < descriptor->spectrum_bins; ++bin) {
-            const float err_re = state->error_ri[2 * bin];
-            const float err_im = state->error_ri[2 * bin + 1];
-            enhanced_re[bin] = ulcnet_model_io_signed_pow(
-                err_re * mask_re[bin] - err_im * mask_im[bin],
-                inverse_exponent);
-            enhanced_im[bin] = ulcnet_model_io_signed_pow(
-                err_re * mask_im[bin] + err_im * mask_re[bin],
-                inverse_exponent);
-        }
-    }
+    back_end(state, enhanced_re, enhanced_im);
     state->prepared = 0;
     return 0;
 }
