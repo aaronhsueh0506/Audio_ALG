@@ -436,6 +436,94 @@ cleanup:
     conv_destroy(reconstructed);
 }
 
+/* A beamformed spectrum handed to the fuse must be finite in every bin and
+ * component: one NaN or infinity anywhere is a DSP error. */
+static void test_trusted_spectrum_finite_gate(void) {
+    FourAecNrResConfig cfg = four_aec_nr_res_default_config(16000);
+    FourAecNrRes* p;
+    float* microphones;
+    float* ref;
+    Complex* weights;
+    Complex* trusted_spectrum;
+    int n_freqs;
+    int hop;
+    int ch;
+    int k;
+    int ok_clean = 1;
+    int ok_bad = 1;
+    const float bad_values[4] = {
+        (float)NAN, INFINITY, -INFINITY, -(float)NAN};
+    const int bin_count_offsets[9] = {0, 1, 2, 3, 4, 5, 64, 127, 128};
+    int frame = 0;
+    int v;
+    int comp;
+    int b;
+
+    cfg.fft_size = 256;
+    cfg.enable_cng = 0;
+    p = four_aec_nr_res_create(&cfg);
+    CHECK(p != NULL, "finite gate: core creates");
+    if (!p) return;
+    hop = four_aec_nr_res_hop_size(p);
+    n_freqs = four_aec_nr_res_n_freqs(p);
+    microphones = (float*)calloc(
+        (size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    ref = (float*)calloc((size_t)hop, sizeof(float));
+    weights = (Complex*)calloc(
+        (size_t)FOUR_AEC_NR_RES_CHANNELS * n_freqs, sizeof(Complex));
+    trusted_spectrum = (Complex*)calloc((size_t)n_freqs, sizeof(Complex));
+    if (!microphones || !ref || !weights || !trusted_spectrum) {
+        CHECK(0, "finite gate: buffers allocate");
+        goto cleanup;
+    }
+    for (ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch)
+        for (k = 0; k < n_freqs; ++k) {
+            weights[(size_t)ch * n_freqs + k].r = 0.25f;
+            weights[(size_t)ch * n_freqs + k].i = 0.0f;
+        }
+    for (k = 0; k < n_freqs; ++k) {
+        trusted_spectrum[k].r = 1e-3f * (float)(k % 5);
+        trusted_spectrum[k].i = -1e-3f * (float)(k % 3);
+    }
+    {
+        FourAecFront front;
+        SeSpecFrame view;
+        fill_inputs(microphones, ref, hop, 16000, frame++);
+        ok_clean = four_aec_front_process(p, microphones, ref, &front) ==
+                       FOUR_AEC_NR_RES_OK &&
+                   four_aec_fuse(p, weights, trusted_spectrum, &view) ==
+                       FOUR_AEC_NR_RES_OK;
+        for (v = 0; v < 4 && ok_bad; ++v)
+            for (comp = 0; comp < 2 && ok_bad; ++comp)
+                for (b = 0; b < 9 && ok_bad; ++b) {
+                    Complex saved;
+                    int bin = bin_count_offsets[b];
+                    if (bin >= n_freqs) bin = n_freqs - 1;
+                    saved = trusted_spectrum[bin];
+                    if (comp) trusted_spectrum[bin].i = bad_values[v];
+                    else trusted_spectrum[bin].r = bad_values[v];
+                    fill_inputs(microphones, ref, hop, 16000, frame++);
+                    ok_bad = four_aec_front_process(
+                                 p, microphones, ref, &front) ==
+                                 FOUR_AEC_NR_RES_OK &&
+                             four_aec_fuse(
+                                 p, weights, trusted_spectrum, &view) ==
+                                 FOUR_AEC_NR_RES_DSP_ERROR;
+                    trusted_spectrum[bin] = saved;
+                }
+    }
+    CHECK(ok_clean, "finite gate: a finite beamformed spectrum is accepted");
+    CHECK(ok_bad,
+          "finite gate: a NaN or infinity in any component is a DSP error");
+
+cleanup:
+    free(trusted_spectrum);
+    free(weights);
+    free(ref);
+    free(microphones);
+    four_aec_nr_res_destroy(p);
+}
+
 static void fill_inputs(float* microphones, float* ref, int hop,
                         int sample_rate, int frame_index) {
     int i;
@@ -3745,6 +3833,7 @@ static void test_fuse_frame_contract(void) {
 int main(void) {
     test_projection_kernels();
     test_weights_gate();
+    test_trusted_spectrum_finite_gate();
     test_trusted_spectrum_path();
     test_invalid_configs();
     run_grid(16000, 256);

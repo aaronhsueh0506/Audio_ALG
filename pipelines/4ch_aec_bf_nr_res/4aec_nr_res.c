@@ -32,6 +32,7 @@
 #include "fft_wrapper.h"
 #include "mem_align.h"
 #include "4aec_projection_kernels.h"
+#include "simd_kernel_nn.h"        /* skn_all_finite_cf32 */
 #include "common/se_config.h"     /* se_derive(): grid + AecConfig, shared by every application */
 #include "common/se_anr_stage.h"  /* se_anr_compose_config()                                     */
 
@@ -1394,12 +1395,8 @@ static int validate_weights(const FourAecNrRes* p,
 }
 
 static int complex_vector_finite(const Complex* values, int count) {
-    int i;
     if (!values || count < 0) return 0;
-    for (i = 0; i < count; ++i) {
-        if (!isfinite(values[i].r) || !isfinite(values[i].i)) return 0;
-    }
-    return 1;
+    return skn_all_finite_cf32(values, (size_t)count);
 }
 
 static int fuse_contexts(FourAecNrRes* p,
