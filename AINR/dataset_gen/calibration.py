@@ -42,8 +42,8 @@ def fit_ramp(x, axis_name='band', unit='', verbose=True, require_positive=False)
 
     ``init_lo``/``init_hi`` are the two ends of a ramp ACROSS FREQUENCY, so they
     have to be fitted along that axis.  Pooling every column and every frame
-    into one distribution and reporting its median and 5th percentile -- which
-    is what these calibrators originally did -- measures how levels vary over
+    into one distribution and reporting its median and 5th percentile -- the
+    naive approach -- measures how levels vary over
     TIME and LOUDNESS instead, and yields two numbers that describe no ramp at
     all.  On a synthetic case with a known 16 dB frequency ramp and 12 dB of
     frequency-flat level jitter, the pooled version reports a 20.8 dB span and

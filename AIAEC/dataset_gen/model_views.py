@@ -56,10 +56,9 @@ def build_model_view(stems: AecStems, model_name: str,
         ) from None
 
     if task == "end_to_end_aec_res_nr_dereverb":
-        # Align-CRUSE previously ran under its own "direct_aec_preserve_noise"
-        # task (echo cancellation only, noise left untouched for a later
-        # independent NR stage) -- that route was retired in favour of this
-        # one joint AEC+RES+NR+dereverberation task.
+        # Align-CRUSE has no AEC-only task (echo cancellation with noise left
+        # untouched for a later independent NR stage): it shares this one joint
+        # AEC+RES+NR+dereverberation task.
         return ModelView(
             model_name, task,
             {"microphone": stems.mic_postclip, "far_end": stems.far_render},

@@ -38,11 +38,10 @@ dataset:
 task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['Align_CRUSE']):
     mic + unaligned far-end in; near_target (early/dereverberated, denoised,
-    echo-cancelled near speech) out. This candidate previously ran its own
-    AEC/RES-only route -- background noise deliberately preserved for a
-    later, independent NR stage -- but that route was retired: there is no
-    more standalone AEC-only candidate, so Align-CRUSE now shares the same
-    joint end-to-end AEC+RES+NR dereverb task and target as DeepVQE-S.
+    echo-cancelled near speech) out. There is no standalone AEC-only
+    candidate (one that preserves background noise for a later, independent
+    NR stage): Align-CRUSE shares the joint end-to-end AEC+RES+NR dereverb
+    task and target with DeepVQE-S.
 
 inference: see inference.py's own top-of-file usage comment.
 """

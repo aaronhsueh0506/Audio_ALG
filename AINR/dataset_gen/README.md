@@ -308,10 +308,10 @@ audio a consumer actually trains on is `pack_dataset.py`'s own
 `effective_rms_dbfs` (see the design section above), measured after any
 `--target-sr` resample and after the cast to the packed dtype.
 
-### Where the working rate actually comes from (honest finding)
+### Where the working rate comes from
 
-Before this extraction, there was **no explicit "generate at X Hz" contract**
-— the working rate was an implicit side effect of `config.ini`'s
+There is **no separate "generate at X Hz" setting**
+— the working rate is `config.ini`'s
 `[signal] sr` key, read once in `DNS4Dataset.__init__` (`dataset.py`):
 
 ```python
@@ -326,28 +326,20 @@ whenever a source file's native rate differs), STFT parameters, and ERB band
 edges. The **source corpus itself has no fixed rate** — DNS4 speech/noise/RIR
 files are typically 48 kHz already but are not required to be; whatever rate
 they're at gets resampled to `self.sr` on load, so `self.sr` is the *sole*
-place the working rate is pinned. The pre-extraction default in
-`config.ini` was `sr = 16000` — i.e. the generator was implicitly
-RNNoise-ERB-shaped (16 kHz) even though nothing about the augmentation logic
-requires that.
+place the working rate is pinned. `config.ini` ships `sr = 16000`;
+nothing about the augmentation logic requires that rate. The command line
+can set it explicitly:
 
-This extraction makes that contract **explicit** instead of implicit:
 - `gen_dataset.py --sample-rate` overrides config.ini's `[signal] sr`.
 - Omitting the CLI flag genuinely uses the config value.
 - `config.example.ini` uses 48000 as its example; change it to 16000 or pass
   `--sample-rate 16000` for RNNoise-ERB/GTCRN.
 
-One additional coupling was found and removed: `DNS4Dataset._compute_erb_bands`
-used to lazily `from train import compute_hybrid_bands, compute_erb_bands` —
-a hard dependency on the RNNoise-ERB model repo's `train.py`, pulled in
-**unconditionally** at `DNS4Dataset.__init__` time (even in
-`return_raw=True` / WAV-pair-generation mode, where ERB bands are never
-actually used). Those two functions plus their `erb_rate`/`erb_inv` helpers
-are pure NumPy math with no model-specific dependencies, so they were
-inlined directly into `dataset.py` here. This is the only code change beyond
-path/CLI wiring — everything else in `dataset.py` was already fully
-sample-rate-parameterized (no hardcoded 16000/48000 anywhere in the
-augmentation logic itself).
+`DNS4Dataset._compute_erb_bands` has no dependency on a model repo's
+`train.py`: `compute_hybrid_bands`, `compute_erb_bands` and their
+`erb_rate`/`erb_inv` helpers are pure NumPy math kept in `dataset.py`. Everything
+else in `dataset.py` is sample-rate-parameterized as well (no hardcoded
+16000/48000 anywhere in the augmentation logic itself).
 
 ## Files
 
