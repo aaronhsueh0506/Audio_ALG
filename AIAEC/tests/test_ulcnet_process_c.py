@@ -6,7 +6,7 @@ compares, frame by frame and sample by sample, against the Python reference
 (aiaec_streaming.StreamSTFT/StreamISTFT), which is itself the bit-exact twin
 of torch.stft/istft(center=True).
 
-The C side now transforms through audio_common's fft_wrapper (caller-owned
+The C side transforms through audio_common's fft_wrapper (caller-owned
 FftHandle, real RFFT/IRFFT, backend-switched by BACKEND=kiss/ne10), so the
 fixture first builds audio_common's NE10 static lib (the default backend)
 the way the AEC C tests document it

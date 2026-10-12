@@ -25,7 +25,7 @@
  *   端到端演算法延遲 = ULCNET_HOP samples，即 centered 分析的半窗
  *   (16 kHz build: 256 samples / 16 ms; 48 kHz build: 512 samples / 10.67 ms)
  *   lookahead 本身——hop#0 無輸出(呼叫端補零)，hop#p(p>=1) 輸出的內容對應
- *   輸入樣本 [(p-1)*ULCNET_HOP, p*ULCNET_HOP)。WOLA 收尾不再另加延遲(被半窗 trim 吸收)。
+ *   輸入樣本 [(p-1)*ULCNET_HOP, p*ULCNET_HOP)。WOLA 收尾不另加延遲(被半窗 trim 吸收)。
  *   與 Python reference 的 StreamSTFT/StreamISTFT 相同。
  *
  * Parity expectations: the Python reference (AIAEC/aiaec_streaming.py) is

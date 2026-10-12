@@ -259,8 +259,8 @@ def test_c_descriptor_constants_match_export_contract():
         assert int(match.group(1)) == value, enumerator
     assert 'int far_input_mode;' in header
 
-    # v5 moved the compression exponent out of the graph; the C define and
-    # the exporter constant can now drift silently, so pin them here (the
+    # The compression exponent is applied outside the graph; the C define and
+    # the exporter constant could drift silently, so pin them here (the
     # exporter separately refuses checkpoints with any other exponent).
     match = re.search(
         r'^#define\s+ULCNET_MODEL_IO_COMPRESSION_EXP\s+([0-9.]+)f\s*$',

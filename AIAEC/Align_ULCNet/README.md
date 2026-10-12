@@ -451,8 +451,9 @@ that once meant one boundary must never also mean another, because state
 element counts can coincide across boundaries and nothing but the version can
 tell them apart. The next real bump goes to 19.
 
-Removed with layout 18: the exporter options `--feature-layout` and
-`--gru-state-layout` (export and calibration CLI), the C function
+Removed with layout 18: the exporter options `--feature-layout` (Align-ULCNet
+exporter and calibration CLI) and `--gru-state-layout` (the same two and the
+shared streaming exporter), the C function
 `ulcnet_model_io_inherit()` (the runtime binds each `*_out` to its input
 address instead), the macro `ULCNET_MODEL_IO_SCORE_HISTORY` (replaced by
 `ULCNET_MODEL_IO_SCORE_WINDOW`), the descriptor field `score_history_frames`
