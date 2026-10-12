@@ -23,8 +23,7 @@ mic.wav / far.wav must be mono. Both are resampled to the checkpoint's sample
 rate before inference when needed; output stays at that model rate. Output is
 the joint end-to-end AEC+RES+NR estimate of near_target --
 denoised, dereverberated and echo-cancelled near speech (see ../README.md's
-decision matrix). This candidate's earlier AEC-only, noise-preserving route
-was retired.
+decision matrix).
 
 config.ini is not read here: every shape-relevant setting (grid, model
 kwargs) is recovered from the checkpoint's own contract (see train.py /

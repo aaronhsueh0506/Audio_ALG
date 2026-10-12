@@ -6,10 +6,9 @@ holding two looks exactly like a correct one.
 
 ⚠ The cases below that call the guard DIRECTLY are testing the guard's own
 logic and nothing else. They will pass whether or not pack() actually calls
-it -- which is not hypothetical: renaming the guard once left the call site
-pointing at the old name, and every one of these stayed green while any real
-pack raised NameError. test_pack_itself_runs_the_guard is the one that closes
-that gap, and it is the reason to reach for pack() rather than the helper
+it -- a call site pointing at a stale guard name would leave every one of
+these green while any real pack raised NameError.
+test_pack_itself_runs_the_guard is the one that closes that gap, and it is the reason to reach for pack() rather than the helper
 whenever a test can afford to.
 """
 import argparse
@@ -47,8 +46,7 @@ def _gate(root):
         seqs, P._collect(seqs), shipped_contract())
 
 
-# The identity of the builds the 200-hour corpus was materialized under.
-# ACCEPTED_BEHAVIOR_HASH_MIGRATIONS carried it forward; it is
+# The identity of the builds the shipped corpus was materialized under. It is
 # RETIRED, so a ledger from any of these revisions must be refused whether
 # it is legacy-shaped or records its contract. Spelled out rather than read
 # from the tables on purpose: a test fed its inputs from the table it checks
@@ -137,7 +135,7 @@ def test_a_ledger_claiming_absent_sequences_is_refused(tmp_path):
 @pytest.mark.parametrize("commit,source_hash", MIGRATED_FROM_REVISIONS)
 def test_a_legacy_ledger_from_the_retired_corpus_frontend_is_refused(
         tmp_path, commit, source_hash):
-    """The remote flow after the frontend moved: the corpus's ledger still
+    """The remote flow when the frontend has moved: the corpus's ledger
     names a build whose `linear_error` this build does not reproduce. There
     is no bridge for a retired identity -- a legacy ledger records only a
     fingerprint, so the refusal is the generic contract mismatch, and it must
@@ -221,7 +219,7 @@ def test_rematerialize_records_the_producing_frontend(tmp_path):
 
 
 def test_a_legacy_shaped_ledger_is_still_honoured(tmp_path):
-    """⚠ The in-flight 200-hour run is writing this shape right now.
+    """⚠ A run that predates the identity field writes this shape.
 
     A ledger with only `contract` and `sequences` -- no identity -- must keep
     passing every reader unchanged. Adding the identity field may not
@@ -253,7 +251,7 @@ def test_an_identity_ledger_from_a_comment_only_rebuild_is_accepted(tmp_path):
 def test_an_identity_ledger_from_the_retired_corpus_frontend_is_refused(tmp_path):
     """The identity route sees the behaviour hash the ledger states, so the
     corpus frontend is refused by name with the rematerialize instruction --
-    not accepted through a bridge that no longer exists."""
+    not accepted through a bridge."""
     root = _corpus(str(tmp_path / "c"))
     _identity_ledger(root, _source_contract(UNCOVERED_COMMIT, "c" * 64),
                      set(range(N_SEQ)))

@@ -6,7 +6,7 @@ sqrt-Hann STFT/WOLA, ``ulcnet_model_io.c`` for the feature front end and the
 recurrent rings) behind one object. So the gate that matters is not a
 tolerance against a Python reference -- the parity of the parts is covered by
 test_ulcnet_process_c.py and test_ulcnet_model_io_c.py -- but that the class
-reproduces the hand-composed legacy path SAMPLE FOR SAMPLE. Every comparison
+reproduces the hand-composed path SAMPLE FOR SAMPLE. Every comparison
 here is therefore ``memcmp`` on fp32, never a tolerance: the class is only
 allowed to reorder nothing.
 

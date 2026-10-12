@@ -108,7 +108,7 @@ from .seq_layout import scan_chunks
 # Defaults for the residual meter itself (not part of the data contract).
 DEFAULT_WINDOW_S = 1.0
 # +-2048 samples = +-128 ms at 16 kHz: wide enough to bound a D=8 hop
-# (8 * 256 = 2048 samples = 128 ms) attention span. The old +-512 could not.
+# (8 * 256 = 2048 samples = 128 ms) attention span.
 DEFAULT_MAX_LAG = 2048
 # Locked-window gate: minimum time since the last applied-delay change.
 DEFAULT_SETTLE_S = 0.5

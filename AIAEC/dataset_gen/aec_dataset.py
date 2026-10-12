@@ -124,8 +124,8 @@ __all__ = [
 # these, so a downstream filter such as `meta['scenario'] == 'double_talk'`
 # never silently matches nothing because of a typo.
 # New corpora plan speech activity, echo availability, and physical
-# impairments independently.  ``SCENARIOS`` below remains the public label
-# vocabulary and the compatibility vocabulary for old hand-built
+# impairments independently.  ``SCENARIOS`` below is the public label
+# vocabulary and the compatibility vocabulary for hand-built
 # ``SequencePlan(scenario=...)`` callers.
 TALK_MODES = ('far_only', 'near_only', 'double_talk', 'duplex_random')
 ECHO_MODES = ('normal', 'ref_dropout', 'far_active_no_echo')
@@ -205,7 +205,7 @@ class _OptionSpec:
     """What one config key means to the three checks that read it.
 
     ``check`` names what the value may BE, ``pair`` is the ``..._max`` key a
-    floor is bounded against, and ``retired`` is the key this one replaced.
+    floor is bounded against, and ``retired`` is the retired name of this key.
     ``check=None`` is a key the renderer reads but holds to no range.
     """
 
@@ -904,7 +904,7 @@ class SequencePlan:
     n_chunks: int
     scenario: str
     seed: int
-    # Layered planner fields. ``None`` keeps old direct callers source- and
+    # Layered planner fields. ``None`` keeps direct callers source- and
     # behaviour-compatible: their single scenario is resolved below into one
     # talk mode / echo mode / impairment tuple.
     talk_mode: Optional[str] = None
@@ -1026,8 +1026,8 @@ def plan_sequences(cfg: configparser.ConfigParser, hours: float, seed: int,
         p_dt_acoustic = _probability(
             cfg, 'complex_cases', 'p_dt_acoustic_combo')
     else:
-        # Compatibility for an older copied config or a focused test config.
-        # It deliberately preserves the old mutually-exclusive semantics;
+        # Compatibility for a config without the layered sections or a focused
+        # test config. It deliberately keeps the mutually-exclusive semantics;
         # shipped configs use the layered sections above.
         # ⚠ Without CHUNK_EVENT_LABELS: those describe WHEN inside a sequence
         # something happened, so they are not sequences anybody can plan. A
@@ -1407,8 +1407,7 @@ def _validate_far_then_near_curriculum(
         cfg: configparser.ConfigParser, chunk_sec: float) -> None:
     """Validate the optional first-chunk far-pre-roll curriculum.
 
-    Old copied configs that contain none of these keys retain their previous
-    behaviour. An explicit zero disables the feature completely, so its
+    Configs that contain none of these keys keep the feature off. An explicit zero disables the feature completely, so its
     otherwise-unused geometry must not invalidate a shorter diagnostic/test
     chunk. Once the probability is positive, every shape-defining bound is
     required so two workers cannot silently render different curricula.
@@ -1530,7 +1529,7 @@ def _validate_path_motion_ranges(cfg: configparser.ConfigParser) -> None:
 
 
 def resolve_sequence_plan(plan: SequencePlan) -> Tuple[str, str, Tuple[str, ...]]:
-    """Return ``(talk_mode, echo_mode, impairments)`` for new and old plans."""
+    """Return ``(talk_mode, echo_mode, impairments)`` for layered and single-scenario plans."""
     if plan.talk_mode is not None:
         talk_mode = plan.talk_mode
         echo_mode = plan.echo_mode
@@ -3459,7 +3458,7 @@ def _chunk_scenario(echo_mode: str,
     # 'ref_dropout' chunk, and contradicting it.
     if echo_mode == 'far_active_no_echo' and far_active:
         return 'far_active_no_echo'
-    # Preserve old direct-plan diagnostics exactly. In a layered corpus the
+    # A direct plan keeps its single-scenario label. In a layered corpus the
     # physical conditions live in ``impairments`` and this label is reserved
     # for the actual speech activity of the chunk.
     if legacy_scenario in WHOLE_SEQUENCE_SCENARIOS:
@@ -3478,7 +3477,7 @@ def _force_overlap(far_runs, near_runs, rng, sr, cfg, *, force_edges=False,
     The first and last far bursts are optionally load-bearing. They expose the
     model to DT while the frozen linear AEC is cold and again after its state
     has matured, matching the two failure positions that random middle-only
-    overlap used to miss.
+    overlap can miss.
     """
     overlap_p = cfg.getfloat('activity', 'dt_overlap_p')
     frac_min = cfg.getfloat('activity', 'dt_overlap_frac_min')

@@ -47,13 +47,13 @@ those filenames, the WAV headers and config.ini. ``--manifest PATH`` is an
 explicit opt-in for persisting a source-disjoint split; the packer never reads
 that control file.
 
-What that costs, stated plainly, because these WERE real checks:
-  * --resume no longer detects a config.ini/--seed edit between runs. It
+What that costs, stated plainly:
+  * --resume does not detect a config.ini/--seed edit between runs. It
     checks that each planned sequence's chunks exist with the right rate,
     length and channel count -- not that they were rendered by the config now
     in effect. Resume into a directory only with the config that started it.
   * The renderer's per-chunk labels (scenario, ser_db, snr_db, rir_id, ...) are
-    no longer persisted. No trainer read them; a curriculum that needs them
+    not persisted. No trainer reads them; a curriculum that needs them
     must measure the stems, which is possible precisely because they are
     stored separately.
 What survives without any JSON, because it never depended on one:
@@ -253,7 +253,7 @@ def _sequence_is_complete(plan: SequencePlan, seqs_dir: str, *,
     (a leftover from a longer earlier render, which the packer would otherwise
     pack as a real chunk).
 
-    ⚠ What this cannot check, now that nothing records how a chunk was made:
+    ⚠ What this cannot check, since nothing records how a chunk was made:
     whether the audio on disk was rendered by the config and --seed now in
     effect. A config.ini edit, or a --seed change that reshuffles which
     scenario each sequence_id draws, leaves same-shaped chunks that resume
@@ -299,8 +299,9 @@ def _validate_existing_output(plans: List[SequencePlan], seqs_dir: str,
     """Prevent a rerun from silently mixing two WAV inventories.
 
     Without a persisted run record, the filenames are the complete inventory.
-    A plain rerun used to overwrite the planned prefix but leave any old
-    higher sequence ids in place, and the packer would then include both.
+    A plain rerun would overwrite the planned prefix but leave any higher
+    sequence ids from an earlier run in place, and the packer would then
+    include both.
     Resume may extend a corpus, but every existing sequence id must be part of
     the current plan so lowering ``--hours`` cannot leave an invisible tail.
     """
@@ -366,8 +367,8 @@ def gen_aec_dataset(args):
     if generation_sr <= 0:
         raise ValueError(f"Sample rate must be positive, got {generation_sr}")
     print(f"Sample rate: {generation_sr} Hz (config.ini [signal] sr)")
-    # Only the manifest-reuse comparison needs this now (the --resume check has
-    # no config record to compare against any more).
+    # Only the manifest-reuse comparison needs this (the --resume check has no
+    # config record to compare against).
     cfg_hash = config_hash(cfg)
 
     # --- config-only preflight ---------------------------------------------

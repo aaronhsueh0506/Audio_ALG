@@ -24,7 +24,7 @@ after being copied, rsynced or trimmed by hand.
 linear-AEC contract that produced the ``linear_error`` stem cannot be recovered
 from a WAV, and inference has to construct the SAME one to reproduce ``D_hat``
 (see ``AIAEC.training_common.LinearAecEngine``). Pass the config the corpus was
-generated with. Nothing cross-checks that claim any more, so passing a
+generated with. Nothing cross-checks that claim, so passing a
 different one silently mislabels the corpus.
 
 ⚠ Chunks are packed in ``(sequence_id, chunk_index)`` order and a sequence is
@@ -82,7 +82,7 @@ def _resolve_seqs_dir(input_dir: str) -> str:
     """Accept either a split directory or its seqs/ subdirectory.
 
     gen_aec_dataset.py prints the split directory in its "Next:" line, but
-    pointing straight at seqs/ is just as sensible now that there is nothing
+    pointing straight at seqs/ is just as sensible since there is nothing
     else in the split directory to read.
     """
     if os.path.isdir(os.path.join(input_dir, 'seqs')):
@@ -343,7 +343,7 @@ def pack(args):
     if stale_pack_temps:
         print(f"  removed {len(stale_pack_temps)} stale temporary shard(s)")
 
-    # Geometry comes from the audio, since nothing declares it any more.
+    # Geometry comes from the audio, since nothing declares it.
     first = sequences[min(sequences)][0]
     info = torchaudio.info(first)
     sr = int(info.sample_rate)

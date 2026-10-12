@@ -1,9 +1,8 @@
 """No migration connects recorded data to this frontend.
 
 `ACCEPTED_BEHAVIOR_HASH_MIGRATIONS` is empty: the shadow-copy baseline retime
-and the C restart evidence clearing move `linear_error`, so the
-pair that carried the 200-hour corpus forward (37ed5ad9 -> 19dd4f90) was
-retired with the identities before it.
+and the C restart evidence clearing move `linear_error`, so every earlier
+identity pair (including 37ed5ad9 -> 19dd4f90) is retired.
 
 What must NOT happen is a retired entry coming back. Byte-identity evidence
 describes no frontend after a change that moves the stem; retargeting one at
@@ -42,7 +41,7 @@ DEPLOYED_OLD_HASH = (
 EARLIER_MIGRATED_HASH = (
     "eda3c3be25b4bb69762572b22447db7e004f870a395d7cf84ad1ce02ddd28cfe")
 
-# The pair retired most recently: the frontend the 200-hour corpus was
+# The pair retired most recently: the frontend the shipped corpus was
 # materialized under and the identity it had been carried forward to. Spelled
 # out for the same reason as the two above.
 CORPUS_HASH = (
@@ -143,8 +142,7 @@ def test_an_old_frontend_identity_is_refused_with_what_to_do(recorded):
 @pytest.mark.parametrize("recorded", REFUSED_HASHES)
 def test_an_old_identity_never_warns_that_it_is_equivalent(recorded, recwarn):
     """The failure mode this forbids: passing with a 'frontend-equivalent,
-    no rematerialization required' warning, which is what the table used to
-    emit for exactly these hashes."""
+    no rematerialization required' warning."""
     current = make_linear_aec_contract(16000, preset="balanced").as_dict()
     with pytest.raises(ValueError):
         # (actual=this build, expected=the contract the data recorded)

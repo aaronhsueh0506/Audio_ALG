@@ -93,7 +93,7 @@ def save_chunk_atomic(seqs_dir: str, sequence_id: int, chunk_index: int,
                       chunk, sample_rate: int, encoding: dict) -> str:
     """Write one chunk through a temp name and rename it into place.
 
-    With the sidecar gone this rename is the ONLY completion marker a chunk
+    With no sidecar this rename is the ONLY completion marker a chunk
     has: a run killed mid-write leaves a `tmp.` file that no scan sees, rather
     than a truncated WAV that looks like a finished chunk.
     """

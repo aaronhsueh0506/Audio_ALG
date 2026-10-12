@@ -17,7 +17,7 @@ Two independent properties are pinned here, and both are needed:
     that returned a constant would be perfectly stable and completely useless,
     so stability is only meaningful next to a mutation test.
 
-The stability test also runs a CONTROL that reproduces the old ``ast.dump``
+The stability test also runs a CONTROL that reproduces plain ``ast.dump``
 behaviour under the same interpreters and asserts it DISAGREES. Without that,
 the test would pass vacuously on a machine with only one Python installed, and
 would keep passing if the canonicalizer were quietly reverted.

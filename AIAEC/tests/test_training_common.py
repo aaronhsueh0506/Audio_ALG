@@ -1146,7 +1146,7 @@ def test_the_checkpoint_contract_records_the_training_recipe(
     ``require_checkpoint_contract`` compares the contract and nothing else, so
     if the recipe is absent those two runs are indistinguishable -- same model,
     same grid, same ``loss_version`` -- and a checkpoint trained at one LR
-    silently continues under another.  The four candidates now carry different
+    silently continues under another.  The four candidates carry different
     optimizers and different numbers, which is exactly when this stops being
     hypothetical.
     """
@@ -1208,7 +1208,7 @@ def test_the_checkpoint_contract_records_the_training_recipe(
 def test_align_ulcnet_plateau_reductions_have_a_floor(monkeypatch, tmp_path):
     """The plateau schedule must not be able to anneal the LR to nothing.
 
-    ``reduce_on_plateau`` remains an optional legacy comparison. PyTorch's
+    ``reduce_on_plateau`` is an optional comparison schedule. PyTorch's
     default ``min_lr`` is 0, so the project floor must stay wired explicitly.
     """
     shipped = (pathlib.Path(training_common.__file__).parent
@@ -1395,15 +1395,14 @@ def test_other_step_schedules_advance_per_batch(
         model_name, monkeypatch, tmp_path):
     """The cosine horizon has to be advanced once per optimizer step.
 
-    The previous version of this test asserted ``'scheduler.step()' in
-    inspect.getsource(run_epoch)`` plus a bound on the LR after ``max_epochs``
-    advances.  Measured, a mutant that keeps ``scheduler.step()`` inside
-    ``run_epoch`` but moves it OUT of the batch loop -- so the schedule
-    advances once per epoch, a 4050x re-timing -- passes both assertions: the
-    string is still there, and ``main()`` still builds a step-sized horizon so
-    the numeric bound still holds.  The whole suite stayed green under it.
+    Asserting ``'scheduler.step()' in inspect.getsource(run_epoch)`` plus a
+    bound on the LR after ``max_epochs`` advances is not enough: a mutant that
+    keeps ``scheduler.step()`` inside ``run_epoch`` but moves it OUT of the
+    batch loop -- so the schedule advances once per epoch, a 4050x re-timing --
+    passes both assertions (the string is still there, and ``main()`` still
+    builds a step-sized horizon so the numeric bound still holds).
 
-    So count the scheduler's own advances over one real epoch instead, exactly
+    So this counts the scheduler's own advances over one real epoch, exactly
     as the Align-ULCNet twin does. Anything but one advance per training batch
     fails.
     """
@@ -1702,7 +1701,7 @@ def test_coupled_decay_is_what_walks_a_quiet_weight_into_denormals():
     where it started and still falling.  Decoupled, the same number is a
     ``(1 - lr * weight_decay)`` shrink and costs the weight 0.06%.
 
-    ⚠ Written so it can FAIL: if AdamW's decay ever became coupled again, the
+    ⚠ Written so it can FAIL: if AdamW's decay became coupled, the
     second branch would land on the first branch's value and the final
     assertion would say so instead of this test passing vacuously.
     """

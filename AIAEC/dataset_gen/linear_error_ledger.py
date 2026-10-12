@@ -14,7 +14,7 @@ corpus by hand and the ledger over-claims; delete it and nothing is claimed at
 all. Both are handled -- ``--resume`` re-checks every claim against the chunks
 on disk, and the packer treats an absent ledger as "no claim" rather than an
 error -- but neither would be necessary if each chunk carried its own
-provenance. See the packer's gate for what that costs today.
+provenance. See the packer's gate for what that costs.
 """
 from __future__ import annotations
 
@@ -67,9 +67,9 @@ def recorded_identity(seqs_dir: str):
     name the build that wrote the corpus and compare field by field.
 
     ``None`` also covers a LEGACY ledger, written before this was recorded.
-    That is not an error and must never be treated as one: the in-flight runs
-    this shipped into are writing legacy-shaped ledgers right now, and they
-    stay readable by every path here. A caller that needs the distinction
+    That is not an error and must never be treated as one: a run that predates
+    the field writes legacy-shaped ledgers, which stay readable by every path
+    here. A caller that needs the distinction
     tells the operator so explicitly rather than guessing an identity.
     """
     data = _read(seqs_dir)

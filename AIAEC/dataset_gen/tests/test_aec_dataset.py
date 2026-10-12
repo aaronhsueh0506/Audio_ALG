@@ -235,9 +235,9 @@ def _pack(corpus, input_dir, output_dir, **overrides):
 def _render_plans(cfg, manifest, split, hours=0.012):
     """Render this split's plans in-process, yielding (plan, RenderedSequence).
 
-    The renderer's per-chunk metadata is no longer persisted anywhere (see
+    The renderer's per-chunk metadata is not persisted anywhere (see
     gen_aec_dataset.py), so tests about WHAT was rendered read it here, at the
-    only place it still exists.
+    only place it exists.
     """
     renderer = AecSequenceRenderer(
         cfg, pools_for_split(manifest, split), corpus_seed=manifest['seed'])
@@ -480,7 +480,7 @@ def test_rematerialize_upgrades_legacy_and_resumes_mixed_channel_sequence(
         packed, corpus, tmp_path):
     """A four-channel corpus is upgraded from the audio alone.
 
-    Nothing declares the channel count, the rate or the chunk count any more,
+    Nothing declares the channel count, the rate or the chunk count,
     so this also covers the re-materializer discovering all three from the
     files themselves -- including a half-finished directory where one chunk is
     already five-channel and the rest are still legacy four. That mixture is
@@ -790,7 +790,7 @@ def test_generated_clips_only_use_their_split_sources(corpus):
     """The claim must hold in what the RENDERER draws, not only in the manifest.
 
     A manifest can be perfectly disjoint while the renderer reaches past it.
-    Read at the renderer, since the packed corpus no longer carries source ids.
+    Read at the renderer, since the packed corpus carries no source ids.
     """
     manifest = corpus['manifest']
     for split, hours in (('train', 0.012), ('val', 0.004)):
@@ -937,9 +937,9 @@ def test_layered_plan_rejects_invalid_probabilities(corpus):
 def test_layered_plan_composes_dt_nonlinearity_and_capture(corpus):
     """The difficult intersection must be constructible, not three labels.
 
-    The old categorical planner could draw exactly one of double_talk,
-    nonlinear_spk and clipping_agc.  Forcing only the conditional combo here
-    pins the new contract and its metadata together.
+    A categorical planner draws exactly one of double_talk, nonlinear_spk and
+    clipping_agc.  Forcing only the conditional combo here pins the layered
+    contract and its metadata together.
 
     ⚠ Path motion is deliberately NOT part of the bundle: it is its own axis
     on 67% of compatible echo paths at the shipped defaults, so bundling it
@@ -1255,9 +1255,10 @@ def test_acoustic_tail_ranges_are_guarded(corpus, key, value, message):
 def test_forced_edge_overlap_survives_the_minimum_window(corpus):
     """A forced edge is a guarantee, so a short draw widens instead of skipping.
 
-    The 0.2 s floor is applied before the edge branch and used to `continue`,
-    which silently cost ~21% of stress-combo sequences at least one of their
-    two edges while the config and README promised both unconditionally.
+    The 0.2 s floor is applied before the edge branch; skipping (`continue`)
+    on a short draw would silently cost ~21% of stress-combo sequences at least
+    one of their two edges while the config and README promise both
+    unconditionally.
     Here every draw lands under the floor, so only the clamp can save them.
     """
     cfg = copy.deepcopy(corpus['cfg'])
@@ -1663,11 +1664,11 @@ def test_chunk_geometry_refusal_names_the_key_the_rate_and_a_working_value(
 
 def test_gen_refuses_an_inexact_chunk_sec_before_touching_the_sources(
         corpus, tmp_path, monkeypatch):
-    """The [signal]-only 48 kHz change -- the recipe this config used to give.
+    """The [signal]-only 48 kHz change (sr alone, without the rest of the grid).
 
-    Two things: that it is refused at all, and that the refusal is free. This
-    check used to live in the renderer, so it arrived as a worker traceback,
-    after the sequence plan, the manifest and the full RIR RT60 scan.
+    Two things: that it is refused at all, and that the refusal is free. The
+    check runs before the sequence plan, the manifest and the full RIR RT60
+    scan, rather than arriving as a worker traceback after them.
     """
     cfg = copy.deepcopy(corpus['cfg'])
     cfg.set('signal', 'sr', '48000')
@@ -1932,7 +1933,7 @@ def test_echo_is_really_an_echo_of_the_reference(corpus):
 def test_renderer_metadata_covers_the_declared_contract(corpus):
     """The renderer still describes every chunk it makes.
 
-    Nothing persists this any more (the corpus is WAVs only), so it is checked
+    Nothing persists this (the corpus is WAVs only), so it is checked
     where it exists: on the RenderedSequence a worker hands back.
     """
     from AIAEC.dataset_gen.aec_dataset import SCENARIOS
@@ -1999,7 +2000,7 @@ def test_packed_fingerprint_tracks_geometry_and_inventory(packed, tmp_path):
 
     It covers the corpus's shape and its (sequence, chunk) inventory. It does
     NOT cover which config or seed rendered the audio: nothing on disk records
-    that any more, so two same-shaped corpora from different runs fingerprint
+    that, so two same-shaped corpora from different runs fingerprint
     identically. A checkpoint resumed against the wrong one is not caught here.
     """
     original = PackedAecDataset(packed['train'].paths[0], verbose=False)
@@ -2116,7 +2117,7 @@ def test_far_speech_pool_never_overlaps_the_near_pool_when_configured(corpus, tm
 
 def test_resume_rerenders_a_sequence_whose_chunks_are_missing_or_reshaped(
         corpus, tmp_path):
-    """What --resume can still see, now that nothing records how audio was made.
+    """What --resume can see, since nothing records how audio was made.
 
     A sequence counts as done only if chunks 0..n-1 are all present with the
     expected rate, length and channel count -- and a chunk BEYOND that range
@@ -2224,7 +2225,7 @@ def test_reusing_manifest_with_a_different_seed_is_rejected(corpus, tmp_path):
 def test_pack_takes_the_whole_directory_and_only_chunk_files(corpus, tmp_path):
     """Whatever chunk WAVs are there get packed -- and nothing else does.
 
-    There is no declared inventory any more, so the directory IS the corpus.
+    There is no declared inventory, so the directory IS the corpus.
     A `tmp.` file from a killed write, and anything that is not named
     SSSSSS_CCC.wav, must stay out of the shard.
     """
@@ -2272,7 +2273,7 @@ def test_pack_fails_loudly_when_a_sequence_is_missing_some_chunk_wavs(
 def test_pack_rejects_a_chunk_of_the_wrong_length(corpus, tmp_path):
     """Every chunk must match the geometry the first one sets.
 
-    Nothing declares T any more, so a short chunk (a truncated copy, a file
+    Nothing declares T, so a short chunk (a truncated copy, a file
     from another run) would otherwise be stacked into a shard of the wrong
     shape -- or crash torch.stack with no idea which file caused it.
     """
@@ -2683,8 +2684,8 @@ def test_a_room_whose_positions_are_too_alike_cannot_host_a_trajectory(
             meta = rendered.chunk_meta[0]
             assert meta['room_id'] != 'room_02'
             assert meta['path_motion'] == 'movement'
-            # The invariant the eligibility rule buys: a render can no longer
-            # reach less far than it was configured to.
+            # The invariant the eligibility rule buys: a render cannot reach
+            # less far than it was configured to.
             assert meta['echo_path_position_correlation'] <= target + 1e-3, meta
             assert meta['near_path_position_correlation'] <= target + 1e-3, meta
 

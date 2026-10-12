@@ -291,7 +291,7 @@ def _scan_sources(cfg: configparser.ConfigParser, progress: bool):
     """Everything build_manifest and build_unified_manifest both need:
     scan speech/noise/rir, filter RIRs by RT60, and group each axis into ids.
 
-    Extracted so the two manifest shapes cannot drift on how a source turns
+    Shared so the two manifest shapes cannot drift on how a source turns
     into a group id -- they call the exact same grouping call with the exact
     same patterns.
     """
@@ -581,8 +581,8 @@ class SourcePools:
 
         # Source-id lookups are materialised once, in the manifest builder,
         # from the exact groups used for the split.  Consuming those maps here
-        # is O(files); the old substring reconstruction was O(files * ids) and
-        # was repeated independently by every render worker.
+        # is O(files); a substring reconstruction would be O(files * ids) and
+        # repeated independently by every render worker.
         speech_rel = entry['speech_files']
         noise_rel = entry['noise_files']
         speaker_of_rel = entry['speaker_of']

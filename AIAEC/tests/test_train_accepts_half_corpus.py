@@ -80,8 +80,8 @@ def test_forward_batch_accepts_the_packed_dtype(name, model_cls, dtype):
     """Both storage dtypes must reach the model at single precision.
 
     float32 is exercised alongside float16 on purpose: it is what proves the
-    cast is a widening rather than something that only happens to work for the
-    dtype the bug was about.
+    cast is a widening rather than something that only happens to work for
+    float16.
     """
     train = importlib.import_module(f'AIAEC.{name}.train')
     model = model_cls(GRID).eval()

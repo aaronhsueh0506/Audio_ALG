@@ -883,7 +883,7 @@ def main(args: argparse.Namespace) -> None:
             metrics['target_snr_db'] = _snr_db(target_cpu, waveform)
             metrics['target_si_sdr_db'] = _si_sdr_db(target_cpu, waveform)
         metrics_by_depth[depth] = metrics
-        # WAV/trace/summary are now materialised on the host.  Do not retain
+        # WAV/trace/summary are materialised on the host here.  Do not retain
         # one full complex spectrum and delay matrix per D on the accelerator.
         del result, waveform
         if depth != checkpoint_depth:

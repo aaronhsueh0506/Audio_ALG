@@ -5,11 +5,9 @@ for acoustic echo cancellation", arXiv:2208.11308.
 
 The model consumes unaligned microphone/reference complex spectra.  It emits a
 real magnitude mask and preserves microphone phase, exactly as the paper's
-prediction contract specifies.  The project target is now the joint
+prediction contract specifies.  The project target is the joint
 end-to-end AEC+RES+NR task (early/dereverberated near speech, denoised and
-echo-cancelled) -- this candidate's original AEC-only, noise-preserving route
-was retired and folded into that shared task (see
-../dataset_gen/model_views.py's MODEL_TASKS).
+echo-cancelled); see ../dataset_gen/model_views.py's MODEL_TASKS.
 """
 
 from __future__ import annotations

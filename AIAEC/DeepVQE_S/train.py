@@ -39,7 +39,7 @@ task (see ../README.md's decision matrix and
 ../dataset_gen/model_views.py MODEL_TASKS['DeepVQE_S']):
     mic + unaligned far-end in; the EARLY/DEREVERBERATED near-speech target
     (``near_target``, not ``near_speech``) out -- DeepVQE's published task
-    includes dereverberation. ``build_model_view`` now selects this same
+    includes dereverberation. ``build_model_view`` selects this same
     product target for every candidate, so this file has no private target
     branch.
 

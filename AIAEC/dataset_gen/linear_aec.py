@@ -54,28 +54,24 @@ from .aec_behavior_hash import (  # noqa: E402
 
 
 LINEAR_AEC_CONTRACT_VERSION = "aiaec-linear-error-v3"
-# v2 uses get_formed_output(): the shadow/main-selected, crossfaded,
+# The signal is get_formed_output(): the shadow/main-selected, crossfaded,
 # WOLA-formed residual. It keeps RES/CNG disabled and is independent of any
-# product-level output dynamics applied after the AEC chain.
-# v1 data was materialized from a different seam. Old (v1) linear_error/ch5
-# data must be regenerated, not mixed with later output in the same packed
-# dataset.
-# v2 -> v3: split provenance from compatibility. v2 compared the raw-text
-# `aec_source_hash`, so reflowing a comment in lib/aec invalidated
-# byte-identical shards AND refused already-trained checkpoints that no
-# rematerialization could repair. v3 adds `aec_behavior_hash` (normalized AST,
-# comment/format insensitive) as the compatibility condition and demotes
-# `aec_commit`/`aec_source_hash` to provenance. The signal contract itself is
-# unchanged, so v2 DATA is still valid -- but v2 contract dicts lack the new
-# field and are rejected by from_dict; rerun the contract stamp, not the audio.
+# product-level output dynamics applied after the AEC chain. (v1 data was
+# materialized from a different seam and must be regenerated, not mixed with
+# later output in the same packed dataset.)
+# v3 compatibility condition: `aec_behavior_hash` (normalized AST,
+# comment/format insensitive); `aec_commit`/`aec_source_hash` are provenance
+# only. v2 compared the raw-text `aec_source_hash`; v2 DATA is still valid,
+# but v2 contract dicts lack the new field and are rejected by from_dict --
+# rerun the contract stamp, not the audio.
 
 # The linear-AEC frontend is a frozen, versioned contract: its (frame_size,
 # hop_size) per sample rate is a deliberate, pinned choice of this dataset,
 # not meant to track whatever lib/aec's own production preset currently
-# defaults to -- that default has already changed once (512/256 -> 256/128)
-# and will again. Every caller that resolves a frame_size (the contract
-# validator below, the config-driven path, and the factories' own fallback
-# when a caller omits frame_size) reads this one map, so the frontend cannot
+# defaults to -- that default may change independently. Every caller that
+# resolves a frame_size (the contract validator below, the config-driven
+# path, and the factories' own fallback when a caller omits frame_size) reads
+# this one map, so the frontend cannot
 # silently drift with an unrelated upstream default change.
 FROZEN_FRAME_HOP_BY_SR = {16000: (512, 256), 48000: (1024, 512)}
 
@@ -288,9 +284,9 @@ class LinearAecContract:
         extra = sorted(set(value) - expected)
         # A v2 contract lacks both v3 compatibility fields. `behavior_hash_schema`
         # alone missing is NOT v2 -- it is a v3 dict written before the schema
-        # field existed, which never left this repo (no stamped artifact has ever
-        # carried a v3 contract), so it falls through to the generic error rather
-        # than getting a migration path built for a state that cannot exist.
+        # field existed; no stamped artifact carries one, so it falls through to the
+        # generic error rather than getting a migration path built for a state
+        # that cannot exist.
         if "aec_behavior_hash" in missing and not extra and set(missing) <= {
                 "aec_behavior_hash", "behavior_hash_schema"}:
             # v2 contract. There is deliberately NO automatic migration: a v2
@@ -367,9 +363,7 @@ def make_linear_aec_config(
         # the analyzer never updates and the guard sees a permanent "unusable",
         # degrading to a bare energy comparison. This is also the mode the
         # shipped C pipeline uses (enable_res=0 with the context seam on), so
-        # the training signal and the deployed one now come off the same
-        # branch. Byte-identical to the previous FORM-only setting on material
-        # where the guard does not fire.
+        # the training signal and the deployed one come off the same branch.
         "return_res_context": True,
         "enable_shadow": True,
         "enable_delay_est": True,
@@ -515,13 +509,12 @@ def linear_aec_contract_from_config(
 # against the OLD build is a genuine downgrade -- the mechanism it may have been
 # trained through is absent -- and stays refused.
 ACCEPTED_BEHAVIOR_HASH_MIGRATIONS: Dict[str, str] = {
-    # Empty. The last admitted pair (37ed5ad9 -> 19dd4f90, the fresh-instance
+    # Empty: no pair is admitted. 37ed5ad9 -> 19dd4f90 (the fresh-instance
     # reset composed with the 48-kHz FilterAnalyzer correction, 16 kHz only)
-    # was retired when the shadow-copy baseline retention was
-    # retimed per grid and C's hard restart started clearing coarse/leakage
-    # evidence: both move `linear_error`, so no byte-identity evidence can
-    # describe a frontend after them. Its admission evidence stays in git
-    # history (the revision that admitted it); it may never be retargeted.
+    # is retired: the shadow-copy baseline retention is retimed per grid and
+    # C's hard restart clears coarse/leakage evidence, and both move
+    # `linear_error`, so no byte-identity evidence can describe a frontend
+    # after them. A retired pair may never be retargeted.
 }
 
 # One released 16-kHz Align-ULCNet checkpoint was trained with this frontend
@@ -597,9 +590,8 @@ def _behavior_migration_applies(recorded: str, current: str,
 # still fails. A source with no entry simply gets no legacy-ledger bridge; the
 # migration still applies to every other gate.
 MIGRATED_SOURCE_PROVENANCE: Dict[str, tuple] = {
-    # Empty while no migration is admitted. The four-revision range that
-    # carried 37ed5ad9 (2f66c17 .. d5193ad) is recorded in git history with
-    # the pair it served; a retired source never needs a bridge because the
+    # Empty while no migration is admitted; a retired source never needs a
+    # bridge because the
     # guard refuses it before the ledger is consulted.
 }
 
@@ -648,10 +640,10 @@ RETIRED_BEHAVIOR_HASHES = frozenset({
     "ffc2e044d031f06a9d685ee77159e5a8d7d3075e5e3eaea8156746c416c1dd4e",
     "8198bd0e29e4530f16a1ada6eafb86148e09ec749d10e84771bf2c86598143cd",
     "7c9249dee507f31837e6025c91ca855c05c59febcdee1cad5189cba7ce49cf88",
-    # The 200-hour corpus's materialization frontend and the identity it had
-    # been carried forward to, retired by the shadow-copy baseline
+    # The shipped corpus's materialization frontend and the identity it was
+    # carried forward to, retired because the shadow-copy baseline
     # retention retime (0.995 -> 0.992 at 16 kHz/512/256) and C's restart
-    # evidence clearing; both move `linear_error`.
+    # evidence clearing both move `linear_error`.
     "37ed5ad9b75ce42902361d8195fcf04a650b940744ec036a16c8736dec9d5061",
     "19dd4f90f482e15072d535964ac9816cdc21cae2c350b98de12a0e9ab561ff45",
     # The frontend immediately before the causal-half TD-constraint window.
@@ -673,9 +665,8 @@ def require_linear_aec_contract(actual: Dict, expected: Dict, context: str) -> N
     the comparison becomes a tautology that cannot fail -- a changed PBFDKF step
     size, delay tolerance or formed-output crossfade would then feed inference a
     ``linear_error`` from a different filter than the one the checkpoint was
-    trained on, silently. That regression has shipped once; the
-    ``test_contract_comparison_is_not_vacuous`` test exists to stop it
-    recurring.
+    trained on, silently. ``test_contract_comparison_is_not_vacuous`` guards
+    against this.
 
     ``aec_commit``/``aec_source_hash`` are deliberately NOT compared here: they
     are raw-text provenance and would reject byte-identical data over a comment

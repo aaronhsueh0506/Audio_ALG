@@ -215,9 +215,9 @@ class PackedAecDataset(Dataset):
     def indices_where(self, **conditions) -> List[int]:
         """Dataset indices whose metadata matches every keyword.
 
-        Only ``sequence_id``/``chunk_index`` are recorded, so this now answers
+        Only ``sequence_id``/``chunk_index`` are recorded, so this answers
         "which chunks belong to sequence N", not "which chunks are dropouts" --
-        the renderer's per-chunk labels are no longer persisted (see
+        the renderer's per-chunk labels are not persisted (see
         pack_aec_dataset.py). A subset that needs an acoustic property has to
         measure the stems, which is possible precisely because they are stored
         separately.
@@ -243,7 +243,7 @@ class PackedAecDataset(Dataset):
         ⚠ This identifies the packed corpus's SHAPE and inventory -- rate,
         geometry, dtype, linear-AEC contract, and every (sequence, chunk) it
         contains -- not the audio itself. Two corpora rendered from different
-        configs or seeds into the same shape now fingerprint identically,
+        configs or seeds into the same shape fingerprint identically,
         because nothing on disk records which config rendered a chunk. A
         checkpoint resumed against the wrong corpus of the same shape will not
         be caught here.

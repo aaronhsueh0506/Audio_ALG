@@ -8,10 +8,10 @@ grid, the window convention, the channel order of the stem tensor, and how
 consecutive chunks of one sequence reach a batch -- is therefore part of the
 comparison protocol, not an implementation detail of any one trainer.
 
-``AINR/dataset_gen/loader.py`` already records what happens when such things
-are copied into each ``train.py``: the held-out fraction drifted from 5% to
-10% and the two models being compared were silently trained on different
-corpora.  The same failure mode is available here and is worse, because a
+``AINR/dataset_gen/loader.py`` records what happens when such things are
+copied into each ``train.py``: a held-out fraction that drifts (5% vs 10%)
+trains the two models being compared on different corpora.  The same failure
+mode is available here and is worse, because a
 channel-order or window mismatch does not look like a bug -- it looks like a
 model that is merely worse.
 
@@ -60,7 +60,7 @@ __all__ = [
 #
 # ``echo`` (D), ``local_noise`` (N) and ``mic_preclip`` (S+N+D before
 # clipping/AGC) remain audit signals only -- no model task targets echo
-# cancellation without denoising any more, so N never needs to reach a
+# cancellation without denoising, so N never needs to reach a
 # trainer as its own channel (see ``RenderedSequence.audit`` in
 # aec_dataset.py). ``linear_error`` is different: it is the real frozen
 # PBFDKF output E=Y-D_hat consumed by the three RES+NR candidates. It is
@@ -77,7 +77,7 @@ STEM_ORDER = BASE_STEM_ORDER + ('linear_error',)
 # Training keeps only the four signals required by the two selected product
 # paths.  Generated WAVs deliberately retain ``near_speech`` so an existing
 # corpus remains auditable and can be repacked without rerendering acoustics;
-# packed shards omit it because every selected model now targets the common
+# packed shards omit it because every selected model targets the common
 # denoised, echo-free, early-RIR signal ``near_target``.
 PACKED_STEM_ORDER = (
     'far_render',
@@ -346,7 +346,7 @@ class AecStems:
     #
     # ``D`` (true echo), ``N`` (local noise) and ``R`` (oracle residual echo)
     # deliberately have no accessor: no model task targets echo cancellation
-    # without denoising any more, so N is audit-only (see
+    # without denoising, so N is audit-only (see
     # ``RenderedSequence.audit`` in aec_dataset.py) like D and R always were.
     # E is the materialized *linear error*, not R. D_hat is derived exactly
     # from the two persisted waveforms rather than stored twice.

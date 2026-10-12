@@ -250,7 +250,7 @@ def split_dataset_by_sample(dataset, val_fraction: float,
     """Deterministically random-split individual materialized chunks.
 
     The frozen PBFDKF has already run over each complete parent sequence before
-    the `linear_error` stem was cut into chunks. Consequently each stored item is now a fixed
+    the `linear_error` stem was cut into chunks. Consequently each stored item is a fixed
     model sample: the trainer may place any chunk on either side and shuffle
     train order without changing adaptive-filter state. Sharing a sequence,
     speaker or RIR across train/validation is an explicit in-distribution
@@ -776,11 +776,11 @@ DEFAULT_OPTIMIZER = 'adamw'
 
 
 def make_optimizer(cfg, params, *, lr: float) -> torch.optim.Optimizer:
-    """Build the legacy configurable optimizer used by older experiments.
+    """Build the configurable optimizer named by the config.
 
     New paper-reference trainers construct the optimizer named by their own
-    recipe directly.  This selector remains for checkpoint reproduction and
-    for candidates without a published optimizer; an unknown name is refused.
+    recipe directly.  This selector serves candidates without a published
+    optimizer; an unknown name is refused.
 
     ``weight_decay`` keeps its nominal 1e-4 across the switch.  Decoupled, that
     number is a much gentler regulariser than the same number was coupled, and
@@ -818,8 +818,8 @@ def halt_on_non_finite(reason: str, *, model, mic: Tensor, target: Tensor,
     tries ``torchaudio.save`` on a complex tensor); the ``batch.pt`` tensor
     dump and ``lanes.txt`` per-lane summary, which do not assume a waveform
     dtype, still capture full evidence. Threading the pre-STFT waveform
-    through for a real audio dump is a straightforward follow-up, not done
-    here to avoid a seventh per-trainer plumbing path.
+    through for a real audio dump would add a per-trainer plumbing path and is
+    not provided.
 
     """
     _halt_on_non_finite(
