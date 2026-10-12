@@ -17,11 +17,10 @@ extern "C" {
  *   - Band gain → bin gain: gains @ ERB_inv^T (mode=1, partition of unity)
  *   - ISTFT: normalized=True (× N_FFT^+0.5) + root-Hann + 50% OLA (COLA)
  *
- * 框對齊: train.py 已改用 center=False, 與這個 streaming 實作一致。
- * (先前訓練用 center=True, 兩邊差 N_FFT/2 = 256 sample 的框偏移。舊註解稱
- *  該偏移「僅影響首尾邊界 frame」—— 對頻譜成立, 但對 causal EMA 正規化器
- *  不成立: 它的狀態從 frame 0 起累積, 而 3 秒 segment 全程都在暖機, 所以
- *  frame 0 的差異會一路傳播到整段。)
+ * 框對齊: train.py 用 center=False, 與這個 streaming 實作一致。
+ * (center=True 會讓兩邊差 N_FFT/2 = 256 sample 的框偏移。這個偏移對頻譜
+ *  只影響首尾邊界 frame, 但 causal EMA 正規化器的狀態從 frame 0 起累積,
+ *  而 3 秒 segment 全程都在暖機, 所以 frame 0 的差異會一路傳播到整段。)
  * 合成端同樣不做 window-envelope 除法: root-Hann 分析 × root-Hann 合成
  * = Hann, 50% overlap 下 COLA 自動成立。train.py 的 istft() 亦然。
  * 特徵/增益的數學與 Python 逐式對齊, 但 matmul 的累加順序依實作而異
@@ -127,8 +126,7 @@ typedef struct {
     float spec_norm_state[RNNOISE_SPEC_BINS];
 
     /* --- 以下為每次呼叫用的暫存區 (scratch), 非跨 frame 狀態 ---
-     * 原本配置在各函式的 stack 上 (F13: embedded hot-path stack 偏高);
-     * 搬到 state 內以降低單次呼叫的 stack 佔用。呼叫間不需要清零,
+     * 放在 state 內, 呼叫端 stack 不佔用這些暫存區。呼叫間不需要清零,
      * 每次使用前都會被完整覆寫。 */
     float scratch_buf_re[RNNOISE_N_FFT];   /* rnnoise_analysis 用 */
     float scratch_buf_im[RNNOISE_N_FFT];
@@ -167,17 +165,13 @@ int rnnoise_model_state_inherit(
     RNNoiseModelState *state,
     const float hidden_out[RNNOISE_MODEL_GRU_COUNT][RNNOISE_MODEL_GRU_SIZE]);
 
-/* F09 修正 (2026-07): ERB filterbank + root-Hann window 表格已改為編譯期
- * `static const` (由 gen_rnnoise_tables.c 產生 rnnoise_tables_gen.h,
- * process.c 直接 #include), 不再有任何執行期查表初始化。舊版用「ready
- * flag + __atomic acquire/release」的 lazy once-guard, 但外部審查指出:
- * 即使 flag 是 atomic, 兩個執行緒仍可能同時看到 flag==0、並行寫入同一組
- * non-atomic 表格陣列 — 依 C memory model 仍是 data race (即使寫入相同
- * 常數值, 也是未定義行為)。編譯期常數表格從根本上移除了這個共享可變
- * 狀態, 因此執行緒安全是「設計上就沒有可競爭的寫入」, 不是靠同步保證。
+/* ERB filterbank + root-Hann window 表格是編譯期 `static const`
+ * (由 gen_rnnoise_tables.c 產生 rnnoise_tables_gen.h, process.c 直接
+ * #include), 沒有任何執行期查表初始化。表格沒有共享可變狀態, 執行緒
+ * 安全是「設計上就沒有可競爭的寫入」, 不是靠同步保證。
  *
- * 這個函式本體現在是刻意留空的 no-op, 純粹保留 API 相容 (舊呼叫端不需要
- * 修改), 呼叫與否都不影響任何 rnnoise_* API 的行為或正確性。 */
+ * 這個函式本體是刻意留空的 no-op, 純粹保留 API 相容, 呼叫與否都不影響
+ * 任何 rnnoise_* API 的行為或正確性。 */
 void rnnoise_tables_init(void);
 
 /* --- 前處理 (每 frame 呼叫) --- */

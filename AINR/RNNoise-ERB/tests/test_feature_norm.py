@@ -196,10 +196,10 @@ class DualFeatureTest(unittest.TestCase):
             require_checkpoint_feature_config({'state_dict': {}}, self.checkpoint_cfg())
 
     def test_erb_bandborder_guarantees_min_bins_per_band(self):
-        # v5 regression: the previous "every-OTHER-band-pair >= 2" rule did
-        # not actually guarantee every individual band was >= 2 bins wide
-        # (a genuine 1-bin band existed at this exact config). Check every
-        # consecutive border gap directly, not just every-other one.
+        # An "every-OTHER-band-pair >= 2" rule does not guarantee that every
+        # individual band is >= 2 bins wide (a 1-bin band exists at the
+        # first config below). Check every consecutive border gap directly,
+        # not just every-other one.
         for n_bands, sr, n_fft in [(22, 16000, 512), (32, 48000, 1024),
                                    (10, 8000, 256), (7, 16000, 512)]:
             border = erb_bandborder(n_bands, sr, n_fft, 2)

@@ -5,10 +5,8 @@
  *   cc -O2 -ffp-contract=off gen_rnnoise_tables.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h
  *
  * 編譯期常數版 ERB filterbank (forward/inverse) + root-Hann window,
- * 取代原本 process.c 的執行期 lazy-init 全域查表 (ensure_erb()/
- * ensure_window(), 已移除)。數值由 gen_rnnoise_tables.c 逐字複製
- * 舊有算式算出; test_rnnoise_tables.c 另外用獨立複製的原始演算法
- * 在執行期重算並逐 byte 比對這份表格, 當作 drift-guard。
+ * 由 gen_rnnoise_tables.c 算出; test_rnnoise_tables.c 另外用獨立
+ * 複製的演算法在執行期重算並逐 byte 比對這份表格, 當作 drift-guard。
  * ============================================================ */
 #ifndef RNNOISE_TABLES_GEN_H
 #define RNNOISE_TABLES_GEN_H

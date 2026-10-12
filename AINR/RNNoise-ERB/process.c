@@ -34,19 +34,12 @@
  * 忠實移植 train.py erb_bandborder() / compute_erb_matrix()
  * (DeepFilterNet(-Keras) 常數: 24.7 * 9.265)
  *
- * F09 修正: 這四張表格 (rnn_nfftborder/rnn_erb_fwd/rnn_erb_inv/
- * rnn_hann_win) 原本是執行期 lazy-init 的全域可變狀態 (ensure_erb()/
- * ensure_window(), 見 git history)。外部審查指出即使 ready flag 用
- * __atomic acquire/release, 多個執行緒仍可能同時看到 ready==0、
- * 並行寫入同一組 non-atomic 陣列 — 依 C memory model 仍是 data race
- * (即使寫入的是相同常數值, 也是未定義行為)。
- *
- * 這些表格的輸入 (RNNOISE_SR/N_BANDS/N_BINS/N_FFT/WIN_LEN) 全部是編譯期
- * 常數, 因此改為編譯期 `static const` 表格: 由 gen_rnnoise_tables.c
- * (host-only 工具, 逐字複製原本 ensure_erb()/ensure_window() 的算式)
- * 產生 rnnoise_tables_gen.h 並直接 #include。從此表格在編譯期就固定,
- * 沒有共享可變狀態, 執行期不再有任何 race 可言, 也不需要 once-guard。
- * test_rnnoise_tables.c 用獨立複製的原始演算法在執行期重算並逐 byte
+ * 這四張表格 (rnn_nfftborder/rnn_erb_fwd/rnn_erb_inv/rnn_hann_win) 的
+ * 輸入 (RNNOISE_SR/N_BANDS/N_BINS/N_FFT/WIN_LEN) 全部是編譯期常數, 所以
+ * 是編譯期 `static const` 表格: 由 gen_rnnoise_tables.c (host-only 工具)
+ * 產生 rnnoise_tables_gen.h 並直接 #include。表格沒有共享可變狀態, 執行
+ * 期沒有 race, 也不需要 once-guard。
+ * test_rnnoise_tables.c 用獨立複製的演算法在執行期重算並逐 byte
  * 比對這份表格, 當作 drift-guard。
  *
  * nfftborder: N_BANDS 個邊界 → N_BANDS-1 個 block, N_BANDS 個矩陣欄
@@ -164,10 +157,9 @@ static void fft_radix2(float *re, float *im, int n, int inverse) {
  * 公開 API
  * ============================================================ */
 
-/* F09 修正後: ERB filterbank + root-Hann window 已是編譯期 `static const`
- * 表格 (rnnoise_tables_gen.h), 沒有執行期初始化可做。這個函式保留下來
- * 純粹是為了 API 相容 (呼叫端不必刪掉既有的 rnnoise_tables_init() 呼叫),
- * 本體是刻意留空的 no-op。見 process.h 對這個變更的說明。 */
+/* ERB filterbank + root-Hann window 是編譯期 `static const` 表格
+ * (rnnoise_tables_gen.h), 沒有執行期初始化可做。這個函式純粹是為了
+ * API 相容, 本體是刻意留空的 no-op。見 process.h。 */
 void rnnoise_tables_init(void) {
     /* no-op: 表格在編譯期已就緒, 見上方 #include "rnnoise_tables_gen.h" */
 }
@@ -230,7 +222,7 @@ int rnnoise_model_state_inherit(
 
 void rnnoise_analysis(RNNoiseState *st, const float *frame, float *out_re, float *out_im) {
     /* Root Hann windowed frame + zero-pad to N_FFT
-     * (F13: 暫存區搬到 st->scratch_buf_re/im, 不佔用呼叫端 stack) */
+     * (暫存區在 st->scratch_buf_re/im, 不佔用呼叫端 stack) */
     float *buf_re = st->scratch_buf_re;
     float *buf_im = st->scratch_buf_im;
     memset(buf_im, 0, sizeof(float) * RNNOISE_N_FFT);
@@ -280,7 +272,7 @@ int rnnoise_compute_features(RNNoiseState *st,
                              float out_erb[3][RNNOISE_N_BANDS],
                              float out_spec[3][2][RNNOISE_SPEC_BINS]) {
     /* power spectrum (normalized 域)
-     * (F13: 暫存區搬到 st->scratch_power, 不佔用呼叫端 stack) */
+     * (暫存區在 st->scratch_power, 不佔用呼叫端 stack) */
     float *power = st->scratch_power;
     int i = 0;
 #if RNNOISE_HAVE_NEON
@@ -297,7 +289,7 @@ int rnnoise_compute_features(RNNoiseState *st,
 
     /* 三角 ERB band energy → dB
      * energy = power @ erb_fwd; erb_db = 10*log10(energy + 1e-10)
-     * (F13: 暫存區搬到 st->scratch_erb_db) */
+     * (暫存區在 st->scratch_erb_db) */
     float *erb_db = st->scratch_erb_db;
     int b = 0;
 #if RNNOISE_HAVE_NEON
@@ -482,7 +474,7 @@ void rnnoise_synthesis(RNNoiseState *st,
     }
 
     /* 還原負頻率 (共軛對稱)
-     * (F13: 暫存區搬到 st->scratch_full_re/im, 不佔用呼叫端 stack) */
+     * (暫存區在 st->scratch_full_re/im, 不佔用呼叫端 stack) */
     float *full_re = st->scratch_full_re;
     float *full_im = st->scratch_full_im;
     memcpy(full_re, spec_re, sizeof(float) * RNNOISE_N_BINS);

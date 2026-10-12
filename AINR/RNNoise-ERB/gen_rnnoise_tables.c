@@ -1,20 +1,11 @@
 /* ============================================================
  * RNNoise-ERB 編譯期查表產生器 (host-only 工具, 不進 production build)
  *
- * 背景: process.c 原本用「lazy global 查表 + once-guard」在執行期算好
- * ERB filterbank 與 root-Hann window 後快取進全域陣列 (g_erb_fwd/
- * g_erb_inv/g_hann_win, 見 git history commit 56a35b7 與其後的
- * F09 atomic once-guard 補丁)。外部審查指出: 就算 ready flag 用
- * __atomic acquire/release, 兩個執行緒仍可能同時看到 ready==0、
- * 並行寫入同一組 non-atomic 陣列 — 依 C memory model 仍是 data race
- * (即使寫入的是相同常數值, 也是未定義行為)。
- *
- * 修正方式: 這些表格的輸入 (RNNOISE_SR/N_BANDS/N_BINS/N_FFT/WIN_LEN)
- * 全部是編譯期常數, 沒有理由留到執行期才算。本檔把原本 ensure_erb()/
- * ensure_window() 的迴圈「逐字複製」搬進這個獨立 host 工具, 算出四張
- * 表格後印成一份 C header (rnnoise_tables_gen.h), 內含 `static const`
- * 陣列, 讓 process.c 直接 #include。表格從此在編譯期就固定, 沒有共享
- * 可變狀態, 執行期不再有任何 race 可言。
+ * 這些表格的輸入 (RNNOISE_SR/N_BANDS/N_BINS/N_FFT/WIN_LEN) 全部是編譯期
+ * 常數, 所以表格不在執行期計算。本檔算出四張表格 (ERB forward/inverse
+ * filterbank、nfftborder、root-Hann window) 後印成一份 C header
+ * (rnnoise_tables_gen.h), 內含 `static const` 陣列, 讓 process.c 直接
+ * #include。表格在編譯期就固定, 沒有共享可變狀態, 執行期沒有 race。
  *
  * 重新產生 rnnoise_tables_gen.h:
  *   cc -O2 -ffp-contract=off gen_rnnoise_tables.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h
@@ -45,8 +36,8 @@ static float erb_fwd[RNNOISE_N_BINS][RNNOISE_N_BANDS];
 static float erb_inv[RNNOISE_N_BINS][RNNOISE_N_BANDS];
 static float hann_win[RNNOISE_WIN_LEN];
 
-/* 逐字複製自 process.c 舊 ensure_erb() 的計算本體 (只把寫入目標從
- * file-scope global 換成本檔的 static 陣列, 數學運算完全相同)。 */
+/* ERB filterbank 與 nfftborder 的計算本體; test_rnnoise_tables.c 的
+ * ref_compute_erb_tables() 是它的獨立複本。 */
 static void compute_erb_tables(void) {
     const int    N  = RNNOISE_N_BANDS;
     const double sr = (double)RNNOISE_SR;
@@ -56,9 +47,9 @@ static void compute_erb_tables(void) {
     /* erb_bandborder (v5): cutoffs = erb2freq(linspace(freq2erb(0), freq2erb(sr/2), N)),
      * ideal border = round((cutoff + bw/2) / bw), 再用嚴格 greedy-forward
      * 「每個 band 至少 MIN_BINS_PER_BAND bin」保證 (逐一往前推進, 從不後退),
-     * 端點釘在 DC / Nyquist+1。取代舊版「每隔一個 band 補 2」規則
-     * (nb[i+2]-nb[i]>=2, 只檢查 i, i+2, 不檢查 i, i+1) —— 該規則實測在
-     * sr=16000/n_fft=512/N=22 時仍會產生寬度僅 1 bin 的 band。 */
+     * 端點釘在 DC / Nyquist+1。逐一往前推進的規則對每一對相鄰 border 都
+     * 成立 (只檢查 i, i+2 的規則在 sr=16000/n_fft=512/N=22 時仍會產生
+     * 寬度僅 1 bin 的 band)。 */
     {
         /* Single source of truth: process.h mirrors config.ini's
          * [signal] min_bins_per_band, and tests/test_feature_contract.py
@@ -109,7 +100,7 @@ static void compute_erb_tables(void) {
     }
 }
 
-/* 逐字複製自 process.c 舊 ensure_window() 的計算本體。 */
+/* root-Hann window 的計算本體; test_rnnoise_tables.c 有獨立複本。 */
 static void compute_window_table(void) {
     for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
         hann_win[i] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / RNNOISE_WIN_LEN)));
@@ -133,10 +124,8 @@ static void print_header(void) {
     printf(" *   cc -O2 -ffp-contract=off gen_rnnoise_tables.c -lm -o gen_rnnoise_tables && ./gen_rnnoise_tables > rnnoise_tables_gen.h\n");
     printf(" *\n");
     printf(" * 編譯期常數版 ERB filterbank (forward/inverse) + root-Hann window,\n");
-    printf(" * 取代原本 process.c 的執行期 lazy-init 全域查表 (ensure_erb()/\n");
-    printf(" * ensure_window(), 已移除)。數值由 gen_rnnoise_tables.c 逐字複製\n");
-    printf(" * 舊有算式算出; test_rnnoise_tables.c 另外用獨立複製的原始演算法\n");
-    printf(" * 在執行期重算並逐 byte 比對這份表格, 當作 drift-guard。\n");
+    printf(" * 由 gen_rnnoise_tables.c 算出; test_rnnoise_tables.c 另外用獨立\n");
+    printf(" * 複製的演算法在執行期重算並逐 byte 比對這份表格, 當作 drift-guard。\n");
     printf(" * ============================================================ */\n");
     printf("#ifndef RNNOISE_TABLES_GEN_H\n");
     printf("#define RNNOISE_TABLES_GEN_H\n\n");

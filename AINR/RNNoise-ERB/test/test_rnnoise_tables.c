@@ -2,19 +2,18 @@
  * Drift-guard (兩層 contract):
  *
  * 第一層 (預設, 未定義 RNN_TABLES_PORTABLE 時): 確保 rnnoise_tables_gen.h
- * 裡的編譯期常數表格，跟原始演算法 (process.c 舊版 ensure_erb()/
- * ensure_window() 的算式, F09 修正前) 逐 byte 相同 -- 這是「本機 + pinned
- * CI 工具鏈」的 canonical/bit-exact 檢查, 預設啟用 (即: canonical/
- * bit-exact 是預設值, portable mode 才是 opt-out)。
+ * 裡的編譯期常數表格，跟下面獨立寫出的 ERB/window 演算法逐 byte 相同 --
+ * 這是「本機 + pinned CI 工具鏈」的 canonical/bit-exact 檢查, 預設啟用
+ * (即: canonical/bit-exact 是預設值, portable mode 才是 opt-out)。
  *
- * 這個測試「獨立複製」一份原始迴圈 (不是呼叫 gen_rnnoise_tables.c 裡的
+ * 這個測試「獨立複製」一份演算法迴圈 (不是呼叫 gen_rnnoise_tables.c 裡的
  * 函式, 而是自己再寫一次), 執行期重新算出四張表格, 跟 header 裡的
  * `static const` 表格 memcmp。這樣就算日後有人手動改壞了
  * rnnoise_tables_gen.h、或者 gen 工具本身的算式跟這裡「本來該有」的
  * 演算法不小心分岔了, 這個測試都能抓到 (只要這份獨立複製沒有跟著錯)。
  *
  * 第二層 (`-DRNN_TABLES_PORTABLE`, opt-out): 逐 byte memcmp 在不同 libm/
- * 工具鏈/交叉編譯目標下不保證成立 (user 明確拒絕跨工具鏈硬性規定 1 ULP)，
+ * 工具鏈/交叉編譯目標下不保證成立 (跨工具鏈不規定 1 ULP)，
  * 所以這個 mode 改成檢查表格的「數學性質」而非精確位元:
  *   - 四張表都是有限值 (finite)
  *   - nfftborder 嚴格遞增, 兩端點釘死在 0 與 257
@@ -23,12 +22,10 @@
  *   - erb_fwd 除了頭尾兩個 band 欄位是 erb_inv 的兩倍以外, 其餘逐一相同
  *   - hann window 落在 [0,1], 且滿足公式本身要求的對稱關係
  *     (w[i]==w[WIN_LEN-i]), 端點 w[0]==0
- * 外加一個 recompute-vs-table 的 max-ULP 量測報告, 用一個「本機實測後
- * 留了大量餘裕」的門檻 (目前 256 ULP) 當作 garbage-detector -- 這不是
- * 位元契約, 只是抓「整個算式錯掉/表格對調/regen 損毀」這種明顯錯誤,
- * 門檻大小由實測值決定 (這台機器上實測是 0, 跟 Layer 1 的逐 byte memcmp
- * 互相印證) 並在程式碼裡註記為「量測校準過的 garbage-detector, 不是
- * 位元契約」。
+ * 外加一個 recompute-vs-table 的 max-ULP 量測報告, 用一個留了大量餘裕的
+ * 門檻 (256 ULP) 當作 garbage-detector -- 這不是位元契約, 只是抓「整個
+ * 算式錯掉/表格對調/regen 損毀」這種明顯錯誤 (pinned 工具鏈上的量測值
+ * 是 0, 跟 Layer 1 的逐 byte memcmp 一致)。
  *
  * 建置 (兩個 mode 都要在這台機器上跑過, 都要 PASS):
  *   cc -O2 -ffp-contract=off -Wall -Wextra -I. test/test_rnnoise_tables.c -lm -o test_rnnoise_tables && ./test_rnnoise_tables
@@ -58,7 +55,7 @@ static float ref_erb_fwd[RNNOISE_N_BINS][RNNOISE_N_BANDS];
 static float ref_erb_inv[RNNOISE_N_BINS][RNNOISE_N_BANDS];
 static float ref_hann_win[RNNOISE_WIN_LEN];
 
-/* 獨立複製自原始 ensure_erb() 的計算本體 (F09 修正前的 process.c)。 */
+/* ERB filterbank 的獨立複本 (與 gen_rnnoise_tables.c 的算式分開寫)。 */
 static void ref_compute_erb_tables(void) {
     const int    N  = RNNOISE_N_BANDS;
     const double sr = (double)RNNOISE_SR;
@@ -113,7 +110,7 @@ static void ref_compute_erb_tables(void) {
     }
 }
 
-/* 獨立複製自原始 ensure_window() 的計算本體。 */
+/* root-Hann window 的獨立複本。 */
 static void ref_compute_window_table(void) {
     for (int i = 0; i < RNNOISE_WIN_LEN; i++) {
         ref_hann_win[i] = sqrtf(0.5f * (1.0f - cosf(2.0f * (float)M_PI * i / RNNOISE_WIN_LEN)));
@@ -242,7 +239,7 @@ static int check_erb_fwd_matches_inv_except_ends(void) {
  * `2.0f*(float)M_PI*(WIN_LEN-i)/WIN_LEN` are DIFFERENT float expressions
  * (different multiply, different rounding) that only happen to evaluate to
  * the same real angle mod 2*pi -- so this is NOT bit-exact in practice
- * (measured on this host: up to 434 ULP / ~8.1e-7 absolute between a pair,
+ * (measured on the pinned toolchain: up to 434 ULP / ~8.1e-7 absolute between a pair,
  * from cosf/sqrtf rounding a several-ULP-different argument). This checks
  * the formula-derived relationship (mirror index WIN_LEN-i, not e.g. the
  * wrong-but-plausible WIN_LEN-1-i) with a generous, measured-then-margined
@@ -299,10 +296,10 @@ static uint32_t max_ulp_over_tables(void) {
     return worst;
 }
 
-/* Generous margin around what's actually MEASURED on this host/toolchain
+/* Generous margin around what's actually MEASURED on the pinned toolchain
  * (0, per the PASS below -- matching Layer 1's exact memcmp). This is
- * deliberately NOT tightened to a small bound like 1 ULP: the user
- * explicitly rejected hard-coding a 1-ULP cross-toolchain contract, since a
+ * deliberately NOT tightened to a small bound like 1 ULP: a 1-ULP
+ * cross-toolchain contract is not required, since a
  * different libm/compiler/target is free to round transcendental functions
  * (log/exp/cos/sqrt, all used by ref_compute_*) differently while still
  * being a perfectly correct implementation. 256 ULP is loose enough to

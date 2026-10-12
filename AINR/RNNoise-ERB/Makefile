@@ -64,19 +64,15 @@ CFLAGS += $(SIMD_CFLAGS)
 # "environment" to "environment override" at the point THIS SAME-NAME
 # assignment is actually parsed (and, under `-e`, silently voided in the
 # environment's favor) -- checking before that assignment ever runs means the
-# check can never observe the flipped state. Confirmed empirically: with
-# FP_POLICY's bare literal previously sitting AFTER this foreach (its only
-# OTHER job -- folding it into CFLAGS, LAST, after conflict detection --
-# stays exactly at its original position below), `env
-# FP_POLICY=-ffp-contract=fast make -e -n test-features` used to sail
-# straight through with no error, and the printed compile line genuinely
-# carried -ffp-contract=fast (this repo's own pinned policy silently
-# overridden). There is exactly one `:=` definition of FP_POLICY in this
-# file, just relocated; its CFLAGS append stays exactly where it already was.
+# check can never observe the flipped state. With FP_POLICY's bare literal
+# AFTER the foreach, `env FP_POLICY=-ffp-contract=fast make -e -n
+# test-features` would pass with no error and the printed compile line would
+# carry -ffp-contract=fast (the pinned policy silently overridden). There is
+# exactly one `:=` definition of FP_POLICY in this file; its CFLAGS append
+# (folded in LAST, after conflict detection) stays below.
 FP_POLICY := -ffp-contract=off -fno-math-errno
-# FP_ALLOWED_CHARS_RE (the FP-policy allow-list's character class, added
-# alongside the allow-list redesign further below) has the exact same
-# `make -e` exposure and is a bare literal for the same reason -- see the
+# FP_ALLOWED_CHARS_RE (the FP-policy allow-list's character class) has the
+# exact same `make -e` exposure and is a bare literal for the same reason -- see the
 # allow-list block below for what it's used for.
 FP_ALLOWED_CHARS_RE := ^[A-Za-z0-9_./=,+ -]*$$
 
