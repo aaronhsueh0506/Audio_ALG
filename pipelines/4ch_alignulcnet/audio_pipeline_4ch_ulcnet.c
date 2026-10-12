@@ -102,7 +102,7 @@ struct AudioPipeline4ChUlcnet {
     int reprime_frames;
 
     /* The hop in flight (process_begin .. process_end). */
-    int phase;                    /* 0 idle, 1 begun, 2 model frame open */
+    int phase;                    /* 0 idle, 3 front done, 1 beam done, 2 model frame open */
     int nn_wanted;                /* the frame has not been fetched and is not reprime */
     int nn_accepted;              /* the model output replaces the error frame */
 
@@ -699,19 +699,17 @@ int audio_pipeline_4ch_ulcnet_set_model(
  * Per-hop processing
  * ========================================================================== */
 
-/* NaN/Inf guard: a model frame with ANY non-finite value must never reach
- * the WOLA (the synthesis accumulator would poison every later hop). */
-int audio_pipeline_4ch_ulcnet_process_begin(
+int audio_pipeline_4ch_ulcnet_process_front(
     AudioPipeline4ChUlcnet* p,
     const float* microphones_interleaved,
     const float* far_reference,
-    int vad_external) {
+    AudioPipeline4ChUlcnetFront* front) {
     FourAecFront pre;
     int status;
-    int k;
+    int m;
 
     if (!p || p->destroyed || !microphones_interleaved || !far_reference ||
-        !is_bool(vad_external))
+        !front)
         return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
     if (p->phase != 0) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
 
@@ -725,14 +723,6 @@ int audio_pipeline_4ch_ulcnet_process_begin(
         audio_pipeline_4ch_ulcnet_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
-
-    doa_step(
-        p->srp, pre.linear_spectra, NULL,
-        vad_external, vad_external);
-    gsc_process_with_weights(
-        p->gsc, pre.linear_spectra, doa_get_smooth(p->srp),
-        vad_external ? 0 : 1, NULL, p->gsc_spectrum,
-        p->gsc_weights);
 
     /* MATCHED exposes generation changes directly. FIXED has no estimator
      * generation, so detect the first raw-to-aligned ring transition from
@@ -751,21 +741,17 @@ int audio_pipeline_4ch_ulcnet_process_begin(
         if (p->model.reset) p->model.reset(p->model.user);
         p->reprime_frames = AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES;
     }
+    p->last_delay = pre.delay;
 
-    /* Error branch: the GSC spectrum is already the model's analysis frame
-     * -- the core's lanes analyse with the same sqrt-Hann window at the same
-     * 50% overlap, one frame per hop from hop #0, and the beamformer only
-     * weights bins -- so it is handed over as-is. Far branch: the same hop's
-     * raw far source through the same one-frame-per-hop framing. Both branches
-     * therefore carry input hop t at pipeline hop t, with no reconstruction,
-     * no re-analysis and no delay buffer in between. */
-    for (k = 0; k < ULCNET_BINS; ++k) {
-        p->err_re[k] = p->gsc_spectrum[k].r;
-        p->err_im[k] = p->gsc_spectrum[k].i;
-    }
+    /* Far branch: the same hop's raw far source through the one-frame-per-hop
+     * framing. The error branch is the GSC spectrum (process_beam), which is
+     * already the model's analysis frame -- the core's lanes analyse with the
+     * same sqrt-Hann window at the same 50% overlap, one frame per hop from
+     * hop #0, and the beamformer only weights bins -- so it is handed over
+     * as-is. Both branches therefore carry input hop t at pipeline hop t, with
+     * no reconstruction, no re-analysis and no delay buffer in between. */
     (void)ac_stft_push_planar(
         p->far_analysis, far_reference, p->far_re, p->far_im);
-    p->last_delay = pre.delay;
 
     /* One frame, one inference: the model steps and its output is applied,
      * EXCEPT while the identity reprime armed at the last boundary is still
@@ -777,8 +763,55 @@ int audio_pipeline_4ch_ulcnet_process_begin(
     p->nn_accepted = 0;
     if (p->reprime_frames > 0) p->reprime_frames -= 1;   /* identity; model idle */
     else p->nn_wanted = 1;
+
+    front->n_freqs = pre.n_freqs;
+    for (m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m)
+        front->lane_spectra[m] = pre.linear_spectra[m];
+    p->phase = 3;
+    return FOUR_AEC_NR_RES_OK;
+}
+
+int audio_pipeline_4ch_ulcnet_process_beam(
+    AudioPipeline4ChUlcnet* p,
+    const AudioPipeline4ChUlcnetFront* front,
+    int vad_raw,
+    int vad_out,
+    const int* mask) {
+    int k, m;
+
+    if (!p || p->destroyed || !front || !is_bool(vad_raw) ||
+        !is_bool(vad_out) || front->n_freqs != p->n_freqs)
+        return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    for (m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m)
+        if (!front->lane_spectra[m]) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    if (p->phase != 3) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+
+    doa_step(p->srp, front->lane_spectra, mask, vad_raw, vad_out);
+    gsc_process_with_weights(
+        p->gsc, front->lane_spectra, doa_get_smooth(p->srp),
+        vad_out ? 0 : 1, mask, p->gsc_spectrum, p->gsc_weights);
+
+    for (k = 0; k < ULCNET_BINS; ++k) {
+        p->err_re[k] = p->gsc_spectrum[k].r;
+        p->err_im[k] = p->gsc_spectrum[k].i;
+    }
     p->phase = 1;
     return FOUR_AEC_NR_RES_OK;
+}
+
+int audio_pipeline_4ch_ulcnet_process_begin(
+    AudioPipeline4ChUlcnet* p,
+    const float* microphones_interleaved,
+    const float* far_reference,
+    int vad_external) {
+    AudioPipeline4ChUlcnetFront front;
+    int status;
+    if (!is_bool(vad_external)) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
+    status = audio_pipeline_4ch_ulcnet_process_front(
+        p, microphones_interleaved, far_reference, &front);
+    if (status != FOUR_AEC_NR_RES_OK) return status;
+    return audio_pipeline_4ch_ulcnet_process_beam(
+        p, &front, vad_external, vad_external, NULL);
 }
 
 int audio_pipeline_4ch_ulcnet_nn_begin(AudioPipeline4ChUlcnet* p,
@@ -813,7 +846,7 @@ int audio_pipeline_4ch_ulcnet_process_end(AudioPipeline4ChUlcnet* p, float* out)
     int hop, written;
 
     if (!p || p->destroyed || !out) return FOUR_AEC_NR_RES_INVALID_ARGUMENT;
-    if (p->phase == 0) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
+    if (p->phase != 1 && p->phase != 2) return FOUR_AEC_NR_RES_SEQUENCE_ERROR;
     hop = p->hop_size;
     /* A frame left open or never fetched is the identity. */
     if (p->phase == 2) p->nn_accepted = 0;
@@ -916,6 +949,28 @@ int audio_pipeline_4ch_ulcnet_n_freqs(const AudioPipeline4ChUlcnet* p) {
 int audio_pipeline_4ch_ulcnet_sample_rate(const AudioPipeline4ChUlcnet* p) {
     return (p && !p->destroyed)
         ? four_aec_nr_res_sample_rate(p->core) : -1;
+}
+
+int audio_pipeline_4ch_ulcnet_beam_state(
+    const AudioPipeline4ChUlcnet* p,
+    AudioPipeline4ChUlcnetBeamState* out) {
+    if (!p || p->destroyed || !out) return -1;
+    out->doa_raw_rad = doa_get_raw(p->srp);
+    out->doa_smooth_rad = doa_get_smooth(p->srp);
+    out->doa_used_rad = gsc_get_doa_used(p->gsc);
+    out->gsc_adaptive = gsc_get_adaptive(p->gsc);
+    return 0;
+}
+
+void audio_pipeline_4ch_ulcnet_last_core_timing(
+    const AudioPipeline4ChUlcnet* p,
+    FourAecNrResLastTiming* out) {
+    if (!out) return;
+    if (!p || p->destroyed) {
+        memset(out, 0, sizeof(*out));
+        return;
+    }
+    four_aec_nr_res_get_last_timing(p->core, out);
 }
 
 int audio_pipeline_4ch_ulcnet_last_delay(

@@ -63,9 +63,15 @@
  *      model->reset per generation.
  *  11. fixed deployment contract: a raw-far descriptor is accepted and an
  *      aligned-far descriptor is rejected; no runtime mode setter exists.
+ *  12. split beam half: process_front + process_beam(v, v, NULL) equals
+ *      process_begin byte for byte; a non-NULL mask and a separate
+ *      vad_raw/vad_out reach SRP and GSC; beam_state equals the lower-level
+ *      SRP/GSC getters on the same spectra; sequence and argument guards.
  */
 
 #include "audio_pipeline_4ch_ulcnet.h"
+#include "gsc.h"
+#include "srp.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -2491,6 +2497,366 @@ static int test_phased_hop(void) {
     return 1;
 }
 
+
+/* ============================================================================
+ * 12. Split beam half (process_front / process_beam / beam_state)
+ * ========================================================================== */
+
+/* The echo scene of fill_echo_hop plus a directional near source: one noise
+ * stream reaches microphone ch ch*2 samples later than microphone 0, so SRP
+ * has a bearing to find. */
+static void fill_split_hop(int frame, int hop, float* far_hist,
+                           float* near_hist, float* far, float* microphones) {
+    enum { TRUE_DELAY = 400 };
+    fill_echo_hop(frame, hop, TRUE_DELAY, far_hist, far, microphones);
+    for (int i = 0; i < hop; ++i) {
+        int64_t t = (int64_t)frame * hop + i;
+        near_hist[t] = 0.2f * frand();
+        for (int ch = 0; ch < FOUR_AEC_NR_RES_CHANNELS; ++ch) {
+            int64_t u = t - 2 * ch;
+            microphones[i * FOUR_AEC_NR_RES_CHANNELS + ch] +=
+                u >= 0 ? near_hist[u] : 0.0f;
+        }
+    }
+}
+
+typedef struct SplitScene {
+    int hop, frames;
+    float *far_hist, *near_hist, *mics, *far;
+} SplitScene;
+
+static int scene_open(SplitScene* s, int hop, int frames) {
+    s->hop = hop;
+    s->frames = frames;
+    s->far_hist = (float*)calloc((size_t)frames * hop, sizeof(float));
+    s->near_hist = (float*)calloc((size_t)frames * hop, sizeof(float));
+    s->mics = (float*)malloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS * sizeof(float));
+    s->far = (float*)malloc((size_t)hop * sizeof(float));
+    return s->far_hist && s->near_hist && s->mics && s->far;
+}
+
+static void scene_close(SplitScene* s) {
+    free(s->far_hist); free(s->near_hist); free(s->mics); free(s->far);
+}
+
+/* The state words compare bitwise: NaN is a legal value in them. */
+static int same_state(const AudioPipeline4ChUlcnetBeamState* a,
+                      const AudioPipeline4ChUlcnetBeamState* b) {
+    return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+static AudioPipeline4ChConfig split_config(void) {
+    AudioPipeline4ChConfig cfg = audio_pipeline_4ch_ulcnet_default_config();
+    cfg.gsc_mu = 0.02f;
+    cfg.doa_update_interval = 1;
+    return cfg;
+}
+
+/* Run one hop of the whole split sequence with the half-gain model run by the
+ * caller. Returns 1 when every call succeeded. */
+static int split_hop(AudioPipeline4ChUlcnet* p, const float* mics, const float* far,
+                     int vad_raw, int vad_out, const int* mask, float* out) {
+    AudioPipeline4ChUlcnetFront front;
+    UlcnetNnJob job;
+    int r;
+    if (audio_pipeline_4ch_ulcnet_process_front(p, mics, far, &front) != FOUR_AEC_NR_RES_OK) return 0;
+    if (audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, mask) != FOUR_AEC_NR_RES_OK) return 0;
+    r = audio_pipeline_4ch_ulcnet_nn_begin(p, &job);
+    if (r < 0) return 0;
+    if (r == 1) {
+        if (phased_half_infer(NULL, job.err_re, job.err_im, job.far_re, job.far_im,
+                              job.out_re, job.out_im) != 0 ||
+            audio_pipeline_4ch_ulcnet_nn_end(p, 0) != FOUR_AEC_NR_RES_OK) return 0;
+    }
+    return audio_pipeline_4ch_ulcnet_process_end(p, out) == FOUR_AEC_NR_RES_OK;
+}
+
+/* process_with_activity (the old call sequence) against front + beam(v, v,
+ * NULL): the null mask and the single flag are exactly today's behaviour. */
+static int test_split_null_mask_equals_begin(void) {
+    AudioPipeline4ChConfig cfg = split_config();
+    AudioPipeline4ChUlcnet *a, *b;
+    UlcnetModel model;
+    SplitScene s;
+    float *oa, *ob;
+    int hop, ok = 1, nonzero = 0;
+    const int frames = 90;
+
+    a = audio_pipeline_4ch_ulcnet_create(&cfg);
+    b = audio_pipeline_4ch_ulcnet_create(&cfg);
+    CHECK(a && b, "split twin: instances create");
+    memset(&model, 0, sizeof(model));
+    model.infer = phased_half_infer;
+    model.io_descriptor = test_io_descriptor();
+    CHECK(audio_pipeline_4ch_ulcnet_set_model(a, &model) == 0, "split twin: model installs");
+    hop = audio_pipeline_4ch_ulcnet_hop_size(a);
+    CHECK(scene_open(&s, hop, frames), "split twin: scene allocates");
+    oa = (float*)malloc((size_t)hop * sizeof(float));
+    ob = (float*)malloc((size_t)hop * sizeof(float));
+    for (int f = 0; f < frames && ok; ++f) {
+        AudioPipeline4ChUlcnetBeamState sa, sb;
+        int vad = (f / 7) % 2;
+        fill_split_hop(f, hop, s.far_hist, s.near_hist, s.far, s.mics);
+        ok = audio_pipeline_4ch_ulcnet_process_with_activity(a, s.mics, s.far, vad, oa) == FOUR_AEC_NR_RES_OK &&
+             split_hop(b, s.mics, s.far, vad, vad, NULL, ob) &&
+             audio_pipeline_4ch_ulcnet_beam_state(a, &sa) == 0 &&
+             audio_pipeline_4ch_ulcnet_beam_state(b, &sb) == 0 &&
+             memcmp(oa, ob, (size_t)hop * sizeof(float)) == 0 && same_state(&sa, &sb);
+        for (int i = 0; i < hop; ++i) if (oa[i] != 0.0f) nonzero = 1;
+    }
+    CHECK(ok, "split twin: front + beam(v, v, NULL) matches process_with_activity byte for byte, state included");
+    CHECK(nonzero, "split twin: the compared output is not silence");
+    scene_close(&s); free(oa); free(ob);
+    audio_pipeline_4ch_ulcnet_destroy(a);
+    audio_pipeline_4ch_ulcnet_destroy(b);
+    return 1;
+}
+
+/* A mask and a separate vad_raw / vad_out change what SRP and GSC see. */
+static int test_split_mask_and_vad_reach_srp_gsc(void) {
+    AudioPipeline4ChConfig cfg = split_config();
+    enum { NP = 5 };   /* NULL, all-zero, all-one, even bins, NULL with vad_raw 0 */
+    AudioPipeline4ChUlcnet* p[NP];
+    int* mask[NP] = {0};
+    SplitScene s;
+    float* out[NP];
+    int hop, nf, differs_doa[NP] = {0}, differs_out[NP] = {0};
+    int raw_finite[NP] = {0}, adaptive_seen[NP] = {0};
+    const int frames = 80;
+
+    for (int i = 0; i < NP; ++i) {
+        p[i] = audio_pipeline_4ch_ulcnet_create(&cfg);
+        CHECK(p[i] != NULL, "split mask: instances create");
+    }
+    hop = audio_pipeline_4ch_ulcnet_hop_size(p[0]);
+    nf = audio_pipeline_4ch_ulcnet_n_freqs(p[0]);
+    CHECK(scene_open(&s, hop, frames), "split mask: scene allocates");
+    for (int i = 1; i < 4; ++i) {
+        mask[i] = (int*)malloc((size_t)nf * sizeof(int));
+        for (int k = 0; k < nf; ++k)
+            mask[i][k] = i == 1 ? 0 : (i == 2 ? 1 : (k % 2 == 0));
+    }
+    for (int i = 0; i < NP; ++i) out[i] = (float*)malloc((size_t)hop * sizeof(float));
+    for (int f = 0; f < frames; ++f) {
+        AudioPipeline4ChUlcnetBeamState st[NP];
+        fill_split_hop(f, hop, s.far_hist, s.near_hist, s.far, s.mics);
+        for (int i = 0; i < NP; ++i) {
+            /* Speech (vad_out 1) lets the DOA smoother settle; the quiet
+             * stretches (vad_out 0) are where GSC adapts. */
+            int vad_raw = i == 4 ? 0 : 1;
+            int vad_out = (f % 20) < 10;
+            CHECK(split_hop(p[i], s.mics, s.far, vad_raw, vad_out, mask[i], out[i]),
+                  "split mask: hop runs");
+            CHECK(audio_pipeline_4ch_ulcnet_beam_state(p[i], &st[i]) == 0, "split mask: state reads");
+            if (isfinite(st[i].doa_raw_rad)) raw_finite[i] = 1;
+            if (st[i].gsc_adaptive) adaptive_seen[i] = 1;
+        }
+        for (int i = 1; i < NP; ++i) {
+            if (!same_state(&st[0], &st[i])) differs_doa[i] = 1;
+            if (memcmp(out[0], out[i], (size_t)hop * sizeof(float)) != 0) differs_out[i] = 1;
+        }
+    }
+    CHECK(raw_finite[0], "split mask: with vad_raw 1 SRP produces a finite raw DOA");
+    CHECK(adaptive_seen[0], "split mask: GSC adapts on some quiet hop once a DOA exists");
+    CHECK(differs_doa[1], "split mask: an all-zero mask changes the SRP result (bins are read)");
+    CHECK(differs_doa[3], "split mask: a half-bin mask changes the SRP result");
+    CHECK(differs_out[2], "split mask: an all-one mask freezes GSC adaptation, the output changes");
+    CHECK(differs_out[3], "split mask: a half-bin mask changes the beamformed output");
+    CHECK(!raw_finite[4], "split vad: vad_raw 0 never runs SRP");
+    CHECK(differs_doa[4], "split vad: vad_raw reaches SRP independently of vad_out");
+    for (int i = 0; i < NP; ++i) {
+        audio_pipeline_4ch_ulcnet_destroy(p[i]);
+        free(out[i]);
+        free(mask[i]);
+    }
+    scene_close(&s);
+    return 1;
+}
+
+static int bits_equal_f(float a, float b) {
+    return memcmp(&a, &b, sizeof(float)) == 0;
+}
+
+/* beam_state against SRP and GSC objects built here from the same derivation
+ * and fed the same lane spectra: every field, and the model's error frame. */
+static int split_state_case(int fixed_gsc) {
+    AudioPipeline4ChConfig cfg = split_config();
+    AudioPipeline4ChUlcnet* p;
+    cfg.gsc_fixed_mode = fixed_gsc;
+    cfg.gsc_fixed_doa_rad = 0.3f;
+    p = audio_pipeline_4ch_ulcnet_create(&cfg);
+    SRP_Config sc;
+    GSC_Config gc;
+    float gx[FOUR_AEC_NR_RES_CHANNELS], gy[FOUR_AEC_NR_RES_CHANNELS];
+    ArrayGeometry geom = { FOUR_AEC_NR_RES_CHANNELS, gx, gy };
+    SRP* srp;
+    GSC* gsc;
+    Complex *spec, *weights;
+    SplitScene s;
+    int *mask;
+    float* out;
+    int hop, nf, interval, finite_smooth = 0, finite_used = 0, frames_compared = 0;
+    int fixed_used_seen = 0;
+    const int frames = 70;
+
+    CHECK(p != NULL, "split state: instance creates");
+    hop = audio_pipeline_4ch_ulcnet_hop_size(p);
+    nf = audio_pipeline_4ch_ulcnet_n_freqs(p);
+    for (int m = 0; m < FOUR_AEC_NR_RES_CHANNELS; ++m) {
+        float phi = 2.0f * M_PI * m / FOUR_AEC_NR_RES_CHANNELS;
+        gx[m] = cfg.uca_radius_m * cosf(phi);
+        gy[m] = cfg.uca_radius_m * sinf(phi);
+    }
+    memset(&sc, 0, sizeof(sc));
+    sc.M = FOUR_AEC_NR_RES_CHANNELS;
+    sc.F = nf;
+    sc.num_angles = cfg.num_angles;
+    sc.sr = (float)cfg.core.sample_rate;
+    sc.NFFT = (float)audio_pipeline_4ch_ulcnet_fft_size(p);
+    sc.c = cfg.speed_of_sound_m_s;
+    sc.low_freq = cfg.doa_low_freq_hz;
+    sc.high_freq = cfg.doa_high_freq_hz;
+    sc.enable_smoothing = cfg.doa_enable_smoothing;
+    sc.switch_consec = cfg.doa_switch_consecutive;
+    sc.angle_tol = cfg.doa_angle_tolerance_rad;
+    sc.update_interval = cfg.doa_update_interval;
+    srp = srp_create_from_geometry(&sc, &geom);
+    CHECK(srp != NULL, "split state: lower-level SRP creates");
+    interval = gsc_effective_adapt_interval(cfg.gsc_fixed_mode,
+                                            cfg.gsc_fixed_align_notebook,
+                                            cfg.gsc_adapt_interval);
+    memset(&gc, 0, sizeof(gc));
+    gc.enable = cfg.gsc_enable;
+    gc.lambda = anr_retime_alpha(cfg.gsc_lambda, cfg.core.sample_rate, hop * interval);
+    gc.mu = cfg.gsc_mu;
+    gc.enable_fix_mode = cfg.gsc_fixed_mode;
+    gc.fixed_doa_rad = cfg.gsc_fixed_doa_rad;
+    gc.fixed_align_notebook = cfg.gsc_fixed_align_notebook;
+    gc.adapt_interval = interval;
+    gsc = gsc_create(FOUR_AEC_NR_RES_CHANNELS, nf, srp->num_angles, srp->a_array, &gc);
+    CHECK(gsc != NULL, "split state: lower-level GSC creates");
+    spec = (Complex*)calloc((size_t)nf, sizeof(Complex));
+    weights = (Complex*)calloc((size_t)nf * FOUR_AEC_NR_RES_CHANNELS, sizeof(Complex));
+    mask = (int*)malloc((size_t)nf * sizeof(int));
+    for (int k = 0; k < nf; ++k) mask[k] = (k % 3) != 0;
+    CHECK(scene_open(&s, hop, frames), "split state: scene allocates");
+    out = (float*)malloc((size_t)hop * sizeof(float));
+    for (int f = 0; f < frames; ++f) {
+        AudioPipeline4ChUlcnetFront front;
+        AudioPipeline4ChUlcnetBeamState st;
+        UlcnetNnJob job;
+        int vad_raw = (f / 5) % 3 != 0, vad_out = (f / 9) % 2;
+        const int* m = (f % 4) == 3 ? NULL : mask;
+        int r;
+        fill_split_hop(f, hop, s.far_hist, s.near_hist, s.far, s.mics);
+        CHECK(audio_pipeline_4ch_ulcnet_process_front(p, s.mics, s.far, &front) == FOUR_AEC_NR_RES_OK,
+              "split state: front runs");
+        CHECK(front.n_freqs == nf && front.lane_spectra[0] && front.lane_spectra[3],
+              "split state: front publishes the four lane spectra");
+        doa_step(srp, front.lane_spectra, m, vad_raw, vad_out);
+        gsc_process_with_weights(gsc, front.lane_spectra, doa_get_smooth(srp),
+                                 vad_out ? 0 : 1, m, spec, weights);
+        CHECK(audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, m) == FOUR_AEC_NR_RES_OK,
+              "split state: beam runs");
+        CHECK(audio_pipeline_4ch_ulcnet_beam_state(p, &st) == 0, "split state: state reads");
+        CHECK(bits_equal_f(st.doa_raw_rad, doa_get_raw(srp)) &&
+              bits_equal_f(st.doa_smooth_rad, doa_get_smooth(srp)) &&
+              bits_equal_f(st.doa_used_rad, gsc_get_doa_used(gsc)) &&
+              st.gsc_adaptive == gsc_get_adaptive(gsc),
+              "split state: getters equal the lower-level SRP/GSC getters");
+        CHECK(!isinf(st.doa_raw_rad) && !isinf(st.doa_smooth_rad) && !isinf(st.doa_used_rad),
+              "split state: no infinite angle");
+        if (isfinite(st.doa_smooth_rad)) finite_smooth = 1;
+        if (isfinite(st.doa_used_rad)) finite_used = 1;
+        if (fixed_gsc && st.doa_used_rad == 0.3f && !bits_equal_f(st.doa_used_rad, st.doa_smooth_rad))
+            fixed_used_seen = 1;
+        r = audio_pipeline_4ch_ulcnet_nn_begin(p, &job);
+        CHECK(r >= 0, "split state: nn_begin succeeds");
+        if (r == 1) {
+            int same = 1;
+            for (int k = 0; k < nf; ++k)
+                same = same && bits_equal_f(job.err_re[k], spec[k].r) &&
+                       bits_equal_f(job.err_im[k], spec[k].i);
+            CHECK(same, "split state: the error frame is the lower-level GSC spectrum");
+            frames_compared++;
+        }
+        CHECK(audio_pipeline_4ch_ulcnet_process_end(p, out) == FOUR_AEC_NR_RES_OK, "split state: end runs");
+    }
+    CHECK(frames_compared > frames / 2, "split state: most hops carried a model frame");
+    CHECK(finite_smooth && finite_used, "split state: the smoothed and used DOA become finite");
+    CHECK(!fixed_gsc || fixed_used_seen, "split state: a fixed beamformer reports its fixed angle as the used DOA");
+    {
+        AudioPipeline4ChUlcnetBeamState dummy;
+        CHECK(audio_pipeline_4ch_ulcnet_beam_state(NULL, &dummy) != 0 &&
+              audio_pipeline_4ch_ulcnet_beam_state(p, NULL) != 0,
+              "split state: NULL arguments are refused");
+    }
+    gsc_destroy(gsc);
+    srp_destroy(srp);
+    free(spec); free(weights); free(mask); free(out);
+    scene_close(&s);
+    audio_pipeline_4ch_ulcnet_destroy(p);
+    return 1;
+}
+
+static int test_split_beam_state_matches_lower_level(void) {
+    return split_state_case(0) && split_state_case(1);
+}
+
+static int test_split_sequence_guards(void) {
+    AudioPipeline4ChConfig cfg = split_config();
+    AudioPipeline4ChUlcnet* p = audio_pipeline_4ch_ulcnet_create(&cfg);
+    AudioPipeline4ChUlcnetFront front, bad;
+    UlcnetNnJob job;
+    float *mics, *far, *out;
+    int hop, nf;
+
+    CHECK(p != NULL, "split guards: instance creates");
+    hop = audio_pipeline_4ch_ulcnet_hop_size(p);
+    nf = audio_pipeline_4ch_ulcnet_n_freqs(p);
+    mics = (float*)calloc((size_t)hop * FOUR_AEC_NR_RES_CHANNELS, sizeof(float));
+    far = (float*)calloc((size_t)hop, sizeof(float));
+    out = (float*)calloc((size_t)hop, sizeof(float));
+    memset(&bad, 0, sizeof(bad));
+    CHECK(audio_pipeline_4ch_ulcnet_process_beam(p, &bad, 0, 0, NULL) == FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+          "split guards: a front with the wrong bin count or NULL spectra is refused");
+    CHECK(audio_pipeline_4ch_ulcnet_process_front(p, mics, far, NULL) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          audio_pipeline_4ch_ulcnet_process_front(NULL, mics, far, &front) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          audio_pipeline_4ch_ulcnet_process_front(p, NULL, far, &front) == FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+          "split guards: NULL arguments of process_front are refused");
+    CHECK(audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, 2) == FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+          "split guards: a non-boolean flag in process_begin is refused before any state moves");
+    CHECK(audio_pipeline_4ch_ulcnet_process_front(p, mics, far, &front) == FOUR_AEC_NR_RES_OK,
+          "split guards: front runs after the refused calls");
+    bad = front;
+    CHECK(audio_pipeline_4ch_ulcnet_process_front(p, mics, far, &bad) == FOUR_AEC_NR_RES_SEQUENCE_ERROR &&
+          audio_pipeline_4ch_ulcnet_process_begin(p, mics, far, 0) == FOUR_AEC_NR_RES_SEQUENCE_ERROR &&
+          audio_pipeline_4ch_ulcnet_nn_begin(p, &job) == FOUR_AEC_NR_RES_SEQUENCE_ERROR &&
+          audio_pipeline_4ch_ulcnet_nn_end(p, 0) == FOUR_AEC_NR_RES_SEQUENCE_ERROR &&
+          audio_pipeline_4ch_ulcnet_process_end(p, out) == FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "split guards: between front and beam only the beam half is valid");
+    bad.n_freqs = nf + 1;
+    CHECK(audio_pipeline_4ch_ulcnet_process_beam(p, &bad, 0, 0, NULL) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          audio_pipeline_4ch_ulcnet_process_beam(p, &front, 2, 0, NULL) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          audio_pipeline_4ch_ulcnet_process_beam(p, &front, 0, 2, NULL) == FOUR_AEC_NR_RES_INVALID_ARGUMENT &&
+          audio_pipeline_4ch_ulcnet_process_beam(p, NULL, 0, 0, NULL) == FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+          "split guards: a refused beam call changes nothing");
+    CHECK(audio_pipeline_4ch_ulcnet_process_beam(p, &front, 0, 0, NULL) == FOUR_AEC_NR_RES_OK &&
+          audio_pipeline_4ch_ulcnet_process_beam(p, &front, 0, 0, NULL) == FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "split guards: the beam half runs once per hop");
+    CHECK(audio_pipeline_4ch_ulcnet_nn_begin(p, &job) == 1 &&
+          audio_pipeline_4ch_ulcnet_process_end(p, out) == FOUR_AEC_NR_RES_OK,
+          "split guards: the rest of the hop is the unchanged phased sequence");
+    CHECK(audio_pipeline_4ch_ulcnet_process_front(p, mics, far, &front) == FOUR_AEC_NR_RES_OK,
+          "split guards: front runs again");
+    audio_pipeline_4ch_ulcnet_reset(p);
+    CHECK(audio_pipeline_4ch_ulcnet_process_beam(p, &front, 0, 0, NULL) == FOUR_AEC_NR_RES_SEQUENCE_ERROR,
+          "split guards: a reset drops the pending front half");
+    free(mics); free(far); free(out);
+    audio_pipeline_4ch_ulcnet_destroy(p);
+    return 1;
+}
+
 static int run_all_tests(void) {
     /* Grid gate. Both rejected values below are legal on the OTHER supported
      * grid, so they prove the gate reads the compiled grid rather than merely
@@ -2601,6 +2967,13 @@ static int run_all_tests(void) {
     CHECK(test_raw_descriptor_gate(),
           "production accepts only raw-far descriptors");
     CHECK(test_phased_hop(), "phased hop (process_begin / nn / process_end)");
+    CHECK(test_split_null_mask_equals_begin(),
+          "split: front + beam(v, v, NULL) equals process_begin");
+    CHECK(test_split_mask_and_vad_reach_srp_gsc(),
+          "split: mask and vad_raw/vad_out reach SRP and GSC");
+    CHECK(test_split_beam_state_matches_lower_level(),
+          "split: beam_state equals the lower-level SRP/GSC values");
+    CHECK(test_split_sequence_guards(), "split: sequence and argument guards");
     printf("All audio_pipeline_4ch_ulcnet tests passed\n");
     return 1;
 }

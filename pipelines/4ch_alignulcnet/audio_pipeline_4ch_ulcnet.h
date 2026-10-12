@@ -113,7 +113,9 @@
  * The conservative auto-VAD fallback stays with the standard wrapper
  * (audio_pipeline_4ch.h's audio_pipeline_4ch_process()); the
  * auto_vad_threshold_dbfs/auto_vad_snr_ratio/auto_vad_hangover_frames
- * config fields are validated but never used here.
+ * config fields are validated but never used here. A caller that owns a
+ * per-bin mask and a VAD derived from the lane spectra of the same hop
+ * splits process_begin() into process_front() / process_beam() (below).
  *
  * GRID: one build serves one compile-time ULCNet grid. Supported builds are
  * 16 kHz / fft 512 / hop 256 and 48 kHz / fft 1024 / hop 512. A config for
@@ -442,6 +444,94 @@ int audio_pipeline_4ch_ulcnet_nn_begin(AudioPipeline4ChUlcnet* p,
                                        UlcnetNnJob* job);
 int audio_pipeline_4ch_ulcnet_nn_end(AudioPipeline4ChUlcnet* p, int model_rc);
 int audio_pipeline_4ch_ulcnet_process_end(AudioPipeline4ChUlcnet* p, float* out);
+
+/* ============================================================================
+ * Split process_begin: caller-owned mask and VAD between the lanes and the beam
+ * ========================================================================== */
+
+/**
+ * A caller that derives the beamformer's per-bin mask and VAD from the lane
+ * spectra of the SAME hop (a masker over lane 0, say) cannot pass them to
+ * process_begin(): they exist only after the lanes ran. process_begin() is
+ * therefore two calls, which such a caller makes itself:
+ *
+ *     audio_pipeline_4ch_ulcnet_process_front(p, mics, far, &front);   // lanes, far analysis
+ *     ... mask, vad_raw, vad_out from front.lane_spectra[0] ...
+ *     audio_pipeline_4ch_ulcnet_process_beam(p, &front, vad_raw, vad_out, mask);  // DOA, GSC
+ *     audio_pipeline_4ch_ulcnet_nn_begin / nn_end / process_end        // unchanged
+ *
+ * process_begin(p, mics, far, v) is process_front followed by
+ * process_beam(front, v, v, NULL).
+ */
+typedef struct AudioPipeline4ChUlcnetFront {
+    int n_freqs;
+    /* Read-only AEC error spectra of this hop, one per channel, n_freqs bins.
+     * Valid until the next process_front()/process_begin()/reset()/destroy()
+     * on the same pipeline. */
+    const Complex* lane_spectra[FOUR_AEC_NR_RES_CHANNELS];
+} AudioPipeline4ChUlcnetFront;
+
+/**
+ * First half of the hop: shared delay and the four AEC lanes, the model-reset
+ * and identity-reprime bookkeeping of an alignment boundary, and the far
+ * analysis of the same hop. Fills *front. After a success only
+ * process_beam() (or reset/destroy) is valid.
+ *
+ * @return FOUR_AEC_NR_RES_OK, FOUR_AEC_NR_RES_INVALID_ARGUMENT,
+ *         FOUR_AEC_NR_RES_SEQUENCE_ERROR (a hop is already in flight), or the
+ *         core's status codes (the wrapper resets itself on internal DSP errors).
+ */
+int audio_pipeline_4ch_ulcnet_process_front(
+    AudioPipeline4ChUlcnet* p,
+    const float* microphones_interleaved,
+    const float* far_reference,
+    AudioPipeline4ChUlcnetFront* front);
+
+/**
+ * Second half of the hop: SRP-PHAT DOA and the GSC beamformer on the lane
+ * spectra of `front`, whose GSC output becomes the model's error frame.
+ *
+ *   vad_raw  0/1  SRP analyses this hop only when it is 1 (and the update
+ *                 interval allows it).
+ *   vad_out  0/1  the DOA smoother's activity input; 1 freezes GSC adaptation.
+ *   mask     NULL, or n_freqs ints indexed by bin (the pipeline's n_freqs;
+ *                 read during this call only): SRP uses the bins where mask[f]
+ *                 is nonzero, GSC freezes its adaptation on those bins.
+ *                 NULL = every bin is used by SRP and none is frozen.
+ *
+ * @return FOUR_AEC_NR_RES_OK, FOUR_AEC_NR_RES_INVALID_ARGUMENT (nothing
+ *         changed), or FOUR_AEC_NR_RES_SEQUENCE_ERROR (no front half pending).
+ */
+int audio_pipeline_4ch_ulcnet_process_beam(
+    AudioPipeline4ChUlcnet* p,
+    const AudioPipeline4ChUlcnetFront* front,
+    int vad_raw,
+    int vad_out,
+    const int* mask);
+
+/**
+ * DOA and GSC state of the most recent process_beam()/process_begin(). Valid
+ * until the next hop's beam half; read from the live SRP and GSC objects.
+ */
+typedef struct AudioPipeline4ChUlcnetBeamState {
+    float doa_raw_rad;      /* fresh SRP result of that hop; NaN when SRP did not run  */
+    float doa_smooth_rad;   /* smoothed, held DOA given to GSC; NaN until the first valid one */
+    float doa_used_rad;     /* DOA the GSC steered to; NaN when it used none          */
+    int   gsc_adaptive;     /* 1 when GSC adapted its weights on that hop, else 0      */
+} AudioPipeline4ChUlcnetBeamState;
+
+/** Returns 0 on success, nonzero on a NULL out or NULL/destroyed handle. */
+int audio_pipeline_4ch_ulcnet_beam_state(
+    const AudioPipeline4ChUlcnet* p,
+    AudioPipeline4ChUlcnetBeamState* out);
+
+/**
+ * Stage timings (microseconds) of the core's most recent hop, for a board
+ * profiler. A NULL/destroyed handle zeroes *out. `out` must not be NULL.
+ */
+void audio_pipeline_4ch_ulcnet_last_core_timing(
+    const AudioPipeline4ChUlcnet* p,
+    FourAecNrResLastTiming* out);
 
 /**
  * Reset all core/SRP/GSC/ULCNet-chain state, restart the 1-hop timing
