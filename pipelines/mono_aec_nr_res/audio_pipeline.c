@@ -15,7 +15,7 @@
  *   - The comfort-noise generator moves from a file-global into a
  *     per-instance field, so multiple instances (or one instance across a
  *     reset) never share a noise sequence. The generator itself is lib/aec's
- *     own comfort-noise recipe (see the cng_lut_index() comment below), not
+ *     own comfort-noise recipe (aec_cng_fill() in aec_res.h), not
  *     the CLIs' former xorshift+Box-Muller pair: the injected noise has the
  *     same expected per-bin power but a different, bounded sample sequence,
  *     so a CNG-enabled render is statistically — not bit-for-bit — the same
@@ -41,10 +41,7 @@
 #include "fft_wrapper.h"       /* fft_get_mem_size, Complex, ALIGN16 */
 #include "audio_stft.h"        /* AcIstft: inverse FFT + sqrt-Hann OLA                */
 #include "simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32                                     */
-#include "aec3_balanced_config.h" /* AEC3B_SQRT2_SIN_LUT: the lib's own CNG
- * table. Generated header -- the ONE cross-boundary symbol this pipeline
- * reads from it is that table; a regeneration that drops or renames it
- * fails loudly here at compile time, which is the intended signal. */ /* AEC3B_SQRT2_SIN_LUT -- shared comfort-noise table                */
+#include "aec_res.h"          /* aec_cng_fill                                                        */
 #include "pipeline_dims.h"     /* compute_frame_dims() -- shared with both CLIs                       */
 
 /* Deliberately NO "wav_io.h" here: this TU takes raw float* mic/ref/out
@@ -725,26 +722,6 @@ AudioPipeline* audio_pipeline_create(const AudioPipelineConfig* cfg) {
     return p;
 }
 
-/* ---- comfort-noise generator ----
- *
- * Same recipe lib/aec generates ITS comfort noise with (c_impl/src/
- * aec3_post.c's enable_cng block): one multiplicative-congruential step per
- * bin, whose top five bits index the shared sqrt(2)*sin(2*pi*i/32) table
- * (AEC3B_SQRT2_SIN_LUT), with the imaginary part reading a quarter turn
- * (+8 of 32) ahead of the real one.
- *
- * Contract vs. the Gaussian pair this replaces: the table has mean 0 and
- * mean square 1 over a uniform index, so a bin's EXPECTED noise power is
- * unchanged -- what changes is that each bin now draws a random phase on a
- * circle of radius sqrt(2) instead of two independent unbounded normals, so
- * every sample is bounded by sqrt(2)*amplitude and no per-bin log/sqrt/cos
- * is evaluated. Same per-instance rng_state field, same seed.
- */
-static uint32_t cng_lut_index(AudioPipeline* p) {
-    p->rng_state = (p->rng_state * 69069u + 1u) & 0x7FFFFFFFu;
-    return p->rng_state >> 26;                          /* top 5 bits: 0..31 */
-}
-
 /* The AEC block is not measured here -- the AEC measures them
  * itself and this copies them through. They are governed by AEC_STAGE_TIMING,
  * not by AUDIO_PIPELINE_STAGE_TIMING, which is why this is not inside the
@@ -825,18 +802,9 @@ static void prepare_post_spectrum(AudioPipeline* p, const float* mic,
      * 1..N-2), and by G_nr (bounded below by CNG_NR_GAIN_FLOOR) so the fill
      * follows the denoised floor rather than the ambient level: the denoiser
      * never sees the comfort noise, so its gain is applied to it here. */
-    if (p->enable_cng_effective && ctx.comfort_noise) {
-        for (int k = 1; k < n_freqs - 1; k++) {
-            float n_amp = ctx.comfort_noise[k] / PSD_SCALE;
-            n_amp = (n_amp > 0.0f) ? sqrtf(n_amp) : 0.0f;
-            float ng2 = 1.0f - ctx.res_gain[k] * ctx.res_gain[k];
-            float noise_gain = (ng2 > 0.0f) ? sqrtf(ng2) : 0.0f;
-            float a = noise_gain * n_amp * fmaxf(nr_gain[k], CNG_NR_GAIN_FLOOR);
-            uint32_t ix = cng_lut_index(p);
-            p->spec[k].r += a * AEC3B_SQRT2_SIN_LUT[ix];
-            p->spec[k].i += a * AEC3B_SQRT2_SIN_LUT[(ix + 8u) & 31u];
-        }
-    }
+    if (p->enable_cng_effective && ctx.comfort_noise)
+        aec_cng_fill(&p->rng_state, p->spec, ctx.comfort_noise, ctx.res_gain,
+                     nr_gain, CNG_NR_GAIN_FLOOR, n_freqs);
 
     p->last_timing.post_us = audio_pipeline_now_us() - t1;
 }

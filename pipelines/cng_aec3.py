@@ -1,12 +1,13 @@
 """AEC3 comfort-noise generator, ported bit-for-bit from the C pipelines.
 
-Both C pipelines (``mono_aec_nr_res/audio_pipeline.c`` ``cng_lut_index`` and
-``4ch_aec_bf_nr_res/4aec_nr_res.c``) fill the residual-suppressed bins with
-comfort noise drawn from one multiplicative-congruential step per bin whose top
-five bits index ``AEC3B_SQRT2_SIN_LUT`` (``lib/aec/c_impl/include/
-aec3_balanced_config.h``), the imaginary part reading a quarter turn (+8 of 32)
-ahead of the real one.  This module reproduces that generator exactly so a
-Python reference can be compared with the C output with comfort noise ON.
+Both C pipelines (``mono_aec_nr_res/audio_pipeline.c`` and
+``4ch_aec_bf_nr_res/4aec_nr_res.c``) fill the residual-suppressed bins through
+``aec_cng_fill`` (``lib/aec/c_impl/include/aec_res.h``) with comfort noise drawn
+from one multiplicative-congruential step per bin whose top five bits index
+``AEC3B_SQRT2_SIN_LUT`` (``lib/aec/c_impl/include/aec3_balanced_config.h``), the
+imaginary part reading a quarter turn (+8 of 32) ahead of the real one.  This
+module reproduces that generator exactly so a Python reference can be compared
+with the C output with comfort noise ON.
 
 The generator is advanced only when a caller adds noise to a frame; a stage
 that emits nothing on a hop must not draw, so the draw count stays paired with
