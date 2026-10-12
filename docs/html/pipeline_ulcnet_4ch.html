@@ -127,7 +127,7 @@ out               全零                enh(input hop#0)    enh(input hop#1)    
 <tr><td><code>far_re/far_im</code>(infer in)</td><td>各 [ULCNET_BINS]</td><td>float32</td><td><b>1 幀/hop</b></td><td><code>ulcnet_analysis_push_frame</code>(center=False,一 hop 一幀,回傳恆 1)</td></tr>
 <tr><td><code>enh_re/enh_im</code>(infer out)</td><td>各 [ULCNET_BINS]</td><td>float32</td><td>每 infer 1 幀</td><td>呼叫前全填 NaN;經 WOLA → ULCNET_HOP/幀</td></tr>
 </table>
-<p>從 hop #0 起<b>每個 hop 恰好一次推論</b>(reprime 期間跳過),沒有舊版 centered 排程的 0/2/1 幀爆發。</p>
+<p>從 hop #0 起<b>每個 hop 恰好一次推論</b>(reprime 期間跳過),沒有 centered 排程的 0/2/1 幀爆發。</p>
 
 <h2>State 表</h2>
 <p>Carve 順序(layout v17,<code>audio_pipeline_4ch_ulcnet.h:160</code>、<code>.c:294-296</code>):<code>self, core, srp, gsc, gsc_spectrum, gsc_weights, fft</code>。<b>beam WOLA 的四個 carve(<code>ifft</code>／<code>ola</code>／<code>synth_win</code>／<code>beam_hop</code>)已全部移除</b>,error-branch 的分析狀態、兩幀 staging 與 one-hop far buffer 也一併消失;唯一一支 compiled-grid <code>FftHandle</code> 現在只服務 ULCNet chain(far 分析 + synthesis,同 hop 內嚴格循序使用)。build hash 含 sample rate/FFT,跨 grid descriptor 會被拒絕。</p>
@@ -140,7 +140,7 @@ out               全零                enh(input hop#0)    enh(input hop#1)    
 <tr><td><code>far_analysis</code>(<code>UlcnetAnalysis</code>)</td><td><code>history[ULCNET_N_FFT]</code> + 內嵌 scratch</td><td>C struct(self)</td><td>far 分支的 rolling 分析;<b>error 分支沒有對應物</b></td></tr>
 <tr><td><code>synthesis</code>(<code>UlcnetSynthesis</code>)</td><td><code>acc</code>/<code>env</code> 各 [<code>ULCNET_N_FFT</code>]</td><td>C struct(self)</td><td>centered WOLA 跨 hop 累加(scratch 內嵌,不佔 stack)</td></tr>
 <tr><td><code>ulcnet_window</code></td><td>[<code>ULCNET_N_FFT</code>] f32</td><td>C struct(self)</td><td>兩個 chain 結構共用的 sqrt-Hann 表</td></tr>
-<tr><td><code>err_re/im</code>、<code>far_re/im</code>、<code>enh_re/im</code></td><td>各 [<code>ULCNET_BINS</code>] f32(共 6 條)</td><td>C struct(self)</td><td><b>一幀</b> staging(舊版的兩幀 staging 已移除)</td></tr>
+<tr><td><code>err_re/im</code>、<code>far_re/im</code>、<code>enh_re/im</code></td><td>各 [<code>ULCNET_BINS</code>] f32(共 6 條)</td><td>C struct(self)</td><td><b>一幀</b> staging</td></tr>
 <tr><td><code>reprime_frames</code></td><td>int</td><td>C struct(self)</td><td>邊界武裝 = 1,每發射幀減一;重新武裝不累加</td></tr>
 <tr><td><code>model</code> + <code>last_delay</code> + <code>frame_index</code></td><td>純量級</td><td>C struct(self)</td><td>model 安裝 survive reset;delay history 用來偵測 FIXED 首次可用</td></tr>
 <tr><td>NN 顯式 states(far K/V window、logit window、GRU h)</td><td>依 exported D;參考 adapter D=8 為 75,296 B(16 kHz)/142,880 B(48 kHz)</td><td><b>CPU/DSP caller-owned pool</b></td><td><b>不在</b>本 pool 內;NPU 單次呼叫無狀態;<code>model.reset</code> 時 K/V、logit 與 GRU hidden 全部清除(state generation 加一)</td></tr>
@@ -148,11 +148,11 @@ out               全零                enh(input hop#0)    enh(input hop#1)    
 </table>
 
 <h2>頻譜一致性註記(直送路徑的已知取捨)</h2>
-<p class="note"><code>gsc_spectrum</code> 是<b>逐 bin 加權</b>的頻譜,一般不對應任何時域訊號的 STFT(即所謂 inconsistent spectrogram);舊的 WOLA 來回一趟等於把它<b>投影</b>到一個 consistent 的頻譜上,直送路徑則<b>不做這個投影</b>,模型看到的是未投影的 GSC 頻譜。這個投影殘差是<b>模型輸入端</b>的差異:先前在真實 4ch 錄音上量過 round-trip residual 約 <b>−30 dB</b> complex(−33 dB magnitude),語音帶 750–4000 Hz 為 −36..−43 dB,該組錄音最差在 DC 約 −22 dB;合成場景(噪聲 far＋0.6× 回音＋近端單音)量到 −44 dB complex,最差落在 Nyquist(−16 dB)與 bin 126–130(約 −20 dB),DC 反而最好(−51 dB)——最差頻段是場景相關的,不能一概而論。輸出端則不受影響:identity model 下新舊兩版的輸出只差浮點雜訊(−137 dB,錯一個 hop 對齊後),因為 WOLA∘STFT∘WOLA 等於 WOLA。<b>目前尚未做聽感 A/B</b>,所以「模型對未投影頻譜的反應」只有這個量級佐證,沒有主觀驗證。</p><p class="note"><b>邊界行為也和 v16 不同</b>:v16 在每個對齊邊界會清掉 beam WOLA 的 OLA 累加器(與 far 補償 buffer),等於在邊界 hop 送出一個<b>半窗衰減</b>的 hop(實測 out_old[T+1] ≈ window² × out_new[T],擬合殘差約 −50 dB);v17 沒有重建階段、不清任何 buffer,邊界 hop 完整送出。模型 stepping 也隨 REPRIME 2→1 改變:v16 在 T、T+1 兩幀不推論,v17 只在 T 那一幀不推論。</p>
+<p class="note"><code>gsc_spectrum</code> 是<b>逐 bin 加權</b>的頻譜,一般不對應任何時域訊號的 STFT(即所謂 inconsistent spectrogram);經 WOLA 來回一趟會把它<b>投影</b>到一個 consistent 的頻譜上,直送路徑則<b>不做這個投影</b>,模型看到的是未投影的 GSC 頻譜。這個投影殘差是<b>模型輸入端</b>的差異:先前在真實 4ch 錄音上量過 round-trip residual 約 <b>−30 dB</b> complex(−33 dB magnitude),語音帶 750–4000 Hz 為 −36..−43 dB,該組錄音最差在 DC 約 −22 dB;合成場景(噪聲 far＋0.6× 回音＋近端單音)量到 −44 dB complex,最差落在 Nyquist(−16 dB)與 bin 126–130(約 −20 dB),DC 反而最好(−51 dB)——最差頻段是場景相關的,不能一概而論。輸出端則不受影響:identity model 下新舊兩版的輸出只差浮點雜訊(−137 dB,錯一個 hop 對齊後),因為 WOLA∘STFT∘WOLA 等於 WOLA。<b>目前尚未做聽感 A/B</b>,所以「模型對未投影頻譜的反應」只有這個量級佐證,沒有主觀驗證。</p><p class="note"><b>邊界行為也和 v16 不同</b>:v16 在每個對齊邊界會清掉 beam WOLA 的 OLA 累加器(與 far 補償 buffer),等於在邊界 hop 送出一個<b>半窗衰減</b>的 hop(實測 out_old[T+1] ≈ window² × out_new[T],擬合殘差約 −50 dB);v17 沒有重建階段、不清任何 buffer,邊界 hop 完整送出。模型 stepping 也隨 REPRIME 2→1 改變:v16 在 T、T+1 兩幀不推論,v17 只在 T 那一幀不推論。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>
-<li>總附加演算法延遲 = <b>1 compiled-grid hop</b>:16 kHz 為 256 samples / 16 ms,48 kHz 為 512 samples / 10.67 ms(舊的直送前路徑是 2 hops)。組成只有 ULCNet synthesis 的半窗 trim;GSC 頻譜與 far 分析都在同一個 hop 完成,不加延遲。</li>
+<li>總附加演算法延遲 = <b>1 compiled-grid hop</b>:16 kHz 為 256 samples / 16 ms,48 kHz 為 512 samples / 10.67 ms。組成只有 ULCNet synthesis 的半窗 trim;GSC 頻譜與 far 分析都在同一個 hop 完成,不加延遲。</li>
 <li>測試佐證:pre-acquisition seam 的 far 脈衝落點 = 脈衝 + 1 hop。16 kHz:far[2085] → out[2341](expected 2341,offset +0,peak 1.0000);48 kHz:far[4133] → out[4645](offset +0,peak 1.0000)。identity E2E:hop#0 全零,之後 out[hop p] 逐 byte 等於測試<b>自己</b>從「模型實際看到的頻譜」合成的參考(capture model,FIXED delay 0、無邊界;混合規則:hop 0 零、hop p≥1 混 p−1 與 p 兩幀)。</li>
 <li>delay change(<code>pre.delay.changed</code>)或 FIXED 首次由 ring-fill raw far 轉為可用 aligned far:呼叫 <code>model-&gt;reset</code> 並武裝 identity reprime,<b>不清任何 buffer</b>(核心自行 reset 四條 lane;本層的 far 分析與 synthesis 連續跑)。跨界的 1 幀改走 identity 且<b>不 step</b> 模型(見上節)。<code>changed</code> 涵蓋 unlock 後<b>同值重鎖</b>(新的可用 alignment generation),因此 unlocked 期間累積的 recurrent state 會在重新套用前被 flush。</li>
 <li>delay lock 不閘控模型:ring 尚無法供應該 offset 時 seam 整 hop 傳 raw far(FIXED 的 ring-fill 窗也是 raw,不是靜音),模型照常步進並套用;可供應後 reset state,再改用 aligned far。切換是整 hop 的,不會有半 raw 半 shifted 的 hop。</li>

@@ -12,7 +12,7 @@ window 進出，每個 `*_out` 就地綁定到同名輸入的位址（§10.2）�
 raw/aligned 選擇只留在 sweep 工具。
 實際 board/NPU driver 尚未完成（目前 `main.c` 的 `run_accelerator()`
 仍是回 -1 的 TODO 佔位）。
-raw/aligned 與 small-D sweep 現已完成，release 裁定：
+release 裁定（raw/aligned 與 small-D sweep 已完成）：
 **部署固定使用 aligned-far seam**，不提供 runtime far-mode switch；exporter
 分開記錄 checkpoint 的 raw-far training provenance 與 aligned-far deployment
 contract。目前真正未完成的是 board/NPU driver、exporter 產
@@ -161,18 +161,13 @@ C 端用 `make ULCNET_GRID=16k|48k` 選 grid（底層就是那兩個 `-D`），�
 2. **duty-cycle 數字已驗證**：0.3 s（16k/hop256 = 19 hops ≈ 304 ms）進
    duty、之後每 6 hops（96 ms）分析一次（`aec.c:1711-1741`）；
    ring/decimator 每 hop 連續餵（`delay_aec3.c:1043-1046`）。
-3. **ERLE 相關保護在本案組態下全部有效**（先前版本記錄的 C/Python
-   分歧已修復，見下）。`enable_res=0 && return_res_context=1`（NN seam
+3. **ERLE 相關保護在本案組態下全部有效**（C/Python 一致，見下）。`enable_res=0 && return_res_context=1`（NN seam
    與 4ch pipeline 的實際組態）時：
    - windowed-ERLE duty watchdog 與 `delay_acquire_protect_converged`
-     讀 `last_erle_windowed`。C 端原本**只在 `enable_res` 時快取**它，
-     所以這兩者在 seam 組態下是死的，而 Python 在
-     `(enable_res or return_res_context)` 下就計算並快取
-     `erle_windowed`（orchestrator）——這是一個真的 C/Python 分歧。
-     **已修**：C 的快取條件改成與 Python 相同（`aec.c` 步驟 19 之後的
-     `last_erle_windowed` 快取），兩端語意一致，seam 組態下保護是活的。
-     此修正只填一個快取值、不進訊號路徑，**音訊輸出逐位元不變**
-     （seam 組態渲染 512,000 bytes 前後相同）。
+     讀 `last_erle_windowed`。C 在 `(enable_res or return_res_context)` 下
+     計算並快取它（`aec.c` 步驟 19 之後），與 Python 的 `erle_windowed`
+     （orchestrator）條件相同，所以 seam 組態下保護是活的。
+     這個快取值不進訊號路徑。
    - warm tap-transfer gate 讀的是 inst-ERLE ring，該 ring 無條件每 hop
      填充（aec.c 註解明寫 "works even with enable_res=0"），本來就有效。
 
@@ -698,7 +693,7 @@ E. aligned far + no attention, if graph permits
 因此：
 
 1. 縮小 D 不需重訓，但 export graph 的 shape 與 state pool 必須重產；
-2. raw/aligned far 的 zero-shot A/B 已完成，本輪不重跑泛用品質分數；
+2. raw/aligned far 的 zero-shot A/B 已完成，不重跑泛用品質分數；
 3. inference/export contract 必須記錄實際 D 與 far mode，不可靜默覆寫。
 
 ## 10. NPU Model Boundary
