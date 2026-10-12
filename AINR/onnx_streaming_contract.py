@@ -103,6 +103,11 @@ def validate_nctf_no_temporal_padding(graph, require_static=False):
 
 STATE_BINDING = 'in_place_same_address'
 
+# Which end of a window the graph drops before it appends the new frame.
+# A time-ordered window (oldest first, ``cat(W[1:K], new)``) drops the first
+# slot; a newest-first ring (``cat(new, W[0:K-1])``) drops the last one.
+WINDOW_DROPS = ('first', 'last')
+
 
 def _dims(value_info):
     """Static dims of a graph input/output, or None when any is symbolic."""
@@ -161,8 +166,7 @@ def _single_axis_slice(node, constants, name, axis, size):
 
 
 def validate_inplace_state_graph(graph, state_handoff, windows=None,
-                                 slices=None, require_rank4=True,
-                                 window_drop='oldest'):
+                                 slices=None, require_rank4=True):
     """Check that a graph's state boundary can be bound in place.
 
     ``state_handoff`` maps each state input name to the output that hands it
@@ -171,13 +175,14 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
 
     * every state input and its output exist, have the same static shape and
       element type, and are rank 4 when ``require_rank4``;
-    * ``windows`` maps a state input to the axis of its sliding window. The
-      input has exactly one consumer, a Slice of that axis that reads it as
-      the data input, with constant bounds, an explicit range inside the
-      axis, step 1, and one slot fewer kept than the window holds. With
-      ``window_drop='oldest'`` the range must be ``[1:size)`` (the oldest
-      slot goes, the new one is concatenated after); with ``'either'`` the
-      range may instead be ``[0:size-1)`` (newest-first rings);
+    * ``windows`` maps a state input to ``(axis, drop)``: the axis of its
+      sliding window and the end the graph drops, one of ``WINDOW_DROPS``.
+      The input has exactly one consumer, a Slice of that axis that reads it
+      as the data input, with constant bounds, an explicit range inside the
+      axis and step 1. The range must be exactly ``[1:size)`` for ``'first'``
+      (oldest-first window, the new frame is concatenated after) or
+      ``[0:size-1)`` for ``'last'`` (newest-first ring, the new frame is
+      concatenated before); the other end is refused;
     * ``slices`` maps a state input to the axis along which it is cut into
       per-GRU rows. Every consumer is a Slice of that axis with an explicit
       range and step 1, and the ranges tile the axis exactly once;
@@ -188,9 +193,11 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
     Returns the number of state pairs checked. Raises RuntimeError on the
     first violation.
     """
-    if window_drop not in ('oldest', 'either'):
-        raise ValueError('window_drop must be "oldest" or "either"')
     windows = dict(windows or {})
+    for name, (axis, drop) in windows.items():
+        if drop not in WINDOW_DROPS:
+            raise ValueError('window %s: drop must be one of %s, got %r'
+                             % (name, WINDOW_DROPS, drop))
     slices = dict(slices or {})
     inputs = {item.name: item for item in graph.graph.input}
     outputs = {item.name: item for item in graph.graph.output}
@@ -228,7 +235,7 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
             'windows or slices name inputs that are not state inputs: %s'
             % sorted(unknown))
 
-    for name, axis in windows.items():
+    for name, (axis, drop) in windows.items():
         size = _dims(inputs[name])[axis]
         users = consumers.get(name, [])
         if len(users) != 1 or users[0].op_type != 'Slice':
@@ -240,16 +247,12 @@ def validate_inplace_state_graph(graph, state_handoff, windows=None,
             raise RuntimeError('window input %s is not the Slice data input'
                                % name)
         start, stop = _single_axis_slice(users[0], constants, name, axis, size)
-        if window_drop == 'oldest':
-            if start != 1 or stop != size:
-                raise RuntimeError(
-                    'window input %s: Slice [%d:%d) of %d does not drop the '
-                    'oldest slot' % (name, start, stop, size))
-        elif stop - start != size - 1:
+        expected = (1, size) if drop == 'first' else (0, size - 1)
+        if (start, stop) != expected:
             raise RuntimeError(
-                'window input %s: Slice [%d:%d) of %d keeps %d slots; a '
-                'window drops exactly one' % (name, start, stop, size,
-                                              stop - start))
+                'window input %s: Slice [%d:%d) of %d does not drop the %s '
+                'slot (expected [%d:%d))'
+                % (name, start, stop, size, drop, expected[0], expected[1]))
 
     for name, axis in slices.items():
         size = _dims(inputs[name])[axis]
@@ -289,9 +292,10 @@ def validate_inplace_state_from_metadata(graph):
     wrote into the graph's own metadata.
 
     ``state_handoff`` maps each state input to its output and
-    ``state_slicing`` maps it to ``{"kind": "window" | "rows", "axis": n}``.
-    A graph without both entries is refused: the check cannot be run from a
-    graph that does not describe its state boundary.
+    ``state_slicing`` maps it to ``{"kind": "window", "axis": n, "drop":
+    "first" | "last"}`` or ``{"kind": "rows", "axis": n}``. A graph without
+    both entries, or a window without its ``drop``, is refused: the check
+    cannot be run from a graph that does not describe its state boundary.
     """
     import json
 
@@ -304,8 +308,14 @@ def validate_inplace_state_from_metadata(graph):
     if set(slicing) != set(handoff):
         raise RuntimeError('state_slicing and state_handoff name different '
                            'tensors')
-    windows = {name: int(item['axis']) for name, item in slicing.items()
-               if item['kind'] == 'window'}
+    windows = {}
+    for name, item in slicing.items():
+        if item['kind'] == 'window':
+            if item.get('drop') not in WINDOW_DROPS:
+                raise RuntimeError(
+                    'state_slicing of %s: a window declares drop as one of '
+                    '%s, got %r' % (name, WINDOW_DROPS, item.get('drop')))
+            windows[name] = (int(item['axis']), item['drop'])
     rows = {name: int(item['axis']) for name, item in slicing.items()
             if item['kind'] == 'rows'}
     if len(windows) + len(rows) != len(slicing):

@@ -84,10 +84,10 @@ def _model(*, window=(1, 2, 4, 3), start=1, end=4, axes=(2,), steps=(1,),
     return model
 
 
-def _validate(model, **kwargs):
+def _validate(model, drop='first', **kwargs):
     return validate_inplace_state_contract(
         model, ['w'], kwargs.pop('outputs', ['w_out']),
-        window_inputs=kwargs.pop('window', ['w']), **kwargs)
+        window_drops=kwargs.pop('window', {'w': drop}), **kwargs)
 
 
 def test_good_graph_passes_and_counts_its_windows():
@@ -96,11 +96,29 @@ def test_good_graph_passes_and_counts_its_windows():
 
 def test_newest_first_window_slice_is_accepted():
     # K/V rings keep slots 0..K-2: start 0, end K-1.
-    assert _validate(_model(start=0, end=3)) == 1
+    assert _validate(_model(start=0, end=3), drop='last') == 1
+
+
+def test_each_window_accepts_only_its_declared_end():
+    oldest_first = _model(start=1, end=4)
+    newest_first = _model(start=0, end=3)
+    assert _validate(oldest_first, drop='first') == 1
+    assert _validate(newest_first, drop='last') == 1
+    with pytest.raises(RuntimeError, match='does not drop the first slot'):
+        _validate(newest_first, drop='first')
+    with pytest.raises(RuntimeError, match='does not drop the last slot'):
+        _validate(oldest_first, drop='last')
+
+
+def test_an_undeclared_or_unknown_drop_is_refused():
+    with pytest.raises(ValueError, match='drop must be one of'):
+        _validate(_model(), drop='either')
+    with pytest.raises(ValueError, match='drop must be one of'):
+        _validate(_model(), drop=None)
 
 
 def test_recurrent_state_that_is_not_a_window_needs_no_slice():
-    assert _validate(_model(extra_consumer='tap'), window=[]) == 0
+    assert _validate(_model(extra_consumer='tap'), window={}) == 0
 
 
 @pytest.mark.parametrize('kwargs,message', [
@@ -111,8 +129,8 @@ def test_recurrent_state_that_is_not_a_window_needs_no_slice():
     (dict(steps=(2,)), 'step 1'),
     (dict(steps=(-1,), start=3, end=0), 'step 1'),
     (dict(end=INT64_MAX), 'explicit range'),
-    (dict(start=1, end=3), 'drops exactly one'),
-    (dict(start=0, end=4), 'drops exactly one'),
+    (dict(start=1, end=3), 'does not drop the first slot'),
+    (dict(start=0, end=4), 'does not drop the first slot'),
     (dict(start=-1, end=3), 'explicit range'),
     (dict(out_producer='slice'), 'produced by a Slice'),
     (dict(out_shape=(1, 2, 5, 3)), 'changes shape'),
@@ -122,10 +140,10 @@ def test_recurrent_state_that_is_not_a_window_needs_no_slice():
     (dict(out_is_input=True), 'is a graph input'),
 ])
 def test_each_violation_is_named(kwargs, message):
-    window = kwargs.pop('window', ['w'])
+    window = kwargs.pop('window', {'w': 'first'})
     if kwargs.get('out_producer') == 'slice':
         # the output rule is checked independently of the window rule
-        window = []
+        window = {}
     outputs = ['w'] if kwargs.get('out_is_input') else ['w_out']
     model = _model(**kwargs)
     with pytest.raises(RuntimeError, match=message):
@@ -135,8 +153,8 @@ def test_each_violation_is_named(kwargs, message):
 def test_rank_three_state_is_refused_unless_allowed():
     model = _model(window=(4, 2, 3), rank=3, start=1, end=4, axes=(0,))
     with pytest.raises(RuntimeError, match='rank 3, not 4'):
-        _validate(model, window=[])
-    assert _validate(model, window=[], require_rank4=False) == 0
+        _validate(model, window={})
+    assert _validate(model, window={}, require_rank4=False) == 0
 
 
 def test_element_type_change_is_refused():
@@ -152,4 +170,4 @@ def test_unknown_names_are_refused():
         validate_inplace_state_contract(model, ['nope'], ['w_out'])
     with pytest.raises(RuntimeError, match='not state inputs'):
         validate_inplace_state_contract(model, ['w'], ['w_out'],
-                                        window_inputs=['x'])
+                                        window_drops={'x': 'first'})

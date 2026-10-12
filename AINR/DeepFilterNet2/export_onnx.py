@@ -106,9 +106,10 @@ STATE_BINDING = 'in_place_same_address'
 
 # How each state input is consumed inside the graph (see the module
 # docstring); the post-quantization check reads this back from the metadata.
+# A window drops its first (oldest) frame and the new frame is appended.
 STATE_SLICING = {
     GRU_STATE_NAME: {'kind': 'rows', 'axis': 1},
-    PATHWAY_STATE_NAME: {'kind': 'window', 'axis': 2},
+    PATHWAY_STATE_NAME: {'kind': 'window', 'axis': 2, 'drop': 'first'},
 }
 
 

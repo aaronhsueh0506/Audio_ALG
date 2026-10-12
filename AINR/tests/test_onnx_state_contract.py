@@ -26,7 +26,7 @@ import check_state_quantization as quant  # noqa: E402
 
 K = 5
 HANDOFF = {'win': 'win_out', 'rows': 'rows_out'}
-WINDOWS = {'win': 2}
+WINDOWS = {'win': (2, 'first')}
 SLICES = {'rows': 1}
 
 
@@ -110,13 +110,23 @@ def build(window_shape=(1, 2, K, 3), out_window_shape=None,
     props = {
         'state_handoff': json.dumps(HANDOFF),
         'state_slicing': json.dumps({
-            'win': {'kind': 'window', 'axis': 2},
+            'win': {'kind': 'window', 'axis': 2, 'drop': 'first'},
             'rows': {'kind': 'rows', 'axis': 1},
         }),
     }
     if binding is not None:
         props['state_binding'] = binding
     helper.set_model_props(model, props)
+    return model
+
+
+def _declare_drop(model, drop):
+    """The same graph with its window declared to drop the other end."""
+    for prop in model.metadata_props:
+        if prop.key == 'state_slicing':
+            slicing = json.loads(prop.value)
+            slicing['win']['drop'] = drop
+            prop.value = json.dumps(slicing)
     return model
 
 
@@ -133,8 +143,9 @@ def test_well_formed_graph_passes():
     (dict(extra_window_user=True), 'exactly one consumer'),
     (dict(window_user_op='Identity'), 'exactly one consumer'),
     (dict(end=2 ** 31 - 1), 'explicit range'),
-    (dict(end=4), 'does not drop the oldest'),
-    (dict(start=0), 'does not drop the oldest'),
+    (dict(end=4), 'does not drop the first slot'),
+    (dict(start=0), 'does not drop the first slot'),
+    (dict(start=0, end=K - 1), 'does not drop the first slot'),
     (dict(step=2), 'step 1'),
     (dict(step=-1), 'step 1'),
     (dict(axis=1), 'axis 2'),
@@ -180,20 +191,30 @@ def test_attribute_style_slice_is_read_too():
     assert check(model) == 2
 
 
-def test_newest_first_window_needs_the_either_order():
-    """A ring that keeps slots 0..K-2 is a valid in-place window only when
-    the caller allows either end to be dropped."""
-    model = build(start=0, end=K - 1)
-    with pytest.raises(RuntimeError, match='does not drop the oldest'):
-        validate_inplace_state_graph(model, HANDOFF, windows=WINDOWS,
-                                     slices=SLICES)
+def test_each_window_accepts_only_its_declared_end():
+    """An oldest-first window drops its first slot, a newest-first ring its
+    last; a graph that drops the other end is refused for either one."""
+    oldest_first = build()
+    newest_first = build(start=0, end=K - 1)
+    ring = {'win': (2, 'last')}
+    assert check(oldest_first) == 2
     assert validate_inplace_state_graph(
-        model, HANDOFF, windows=WINDOWS, slices=SLICES,
-        window_drop='either') == 2
-    with pytest.raises(RuntimeError, match='drops exactly one'):
+        newest_first, HANDOFF, windows=ring, slices=SLICES) == 2
+    with pytest.raises(RuntimeError, match='does not drop the last slot'):
         validate_inplace_state_graph(
-            build(start=0, end=K), HANDOFF, windows=WINDOWS, slices=SLICES,
-            window_drop='either')
+            oldest_first, HANDOFF, windows=ring, slices=SLICES)
+    with pytest.raises(RuntimeError, match='does not drop the first slot'):
+        check(newest_first)
+    with pytest.raises(RuntimeError, match='does not drop the last slot'):
+        validate_inplace_state_graph(
+            build(start=0, end=K), HANDOFF, windows=ring, slices=SLICES)
+
+
+def test_a_window_without_a_known_drop_is_refused():
+    for drop in ('either', 'oldest', None):
+        with pytest.raises(ValueError, match='drop must be one of'):
+            validate_inplace_state_graph(
+                build(), HANDOFF, windows={'win': (2, drop)}, slices=SLICES)
 
 
 def test_window_and_row_names_must_be_state_inputs():
@@ -204,6 +225,8 @@ def test_window_and_row_names_must_be_state_inputs():
 
 def test_metadata_entry_point_runs_the_same_check():
     assert validate_inplace_state_from_metadata(build()) == 2
+    with pytest.raises(RuntimeError, match='does not drop the last slot'):
+        validate_inplace_state_from_metadata(_declare_drop(build(), 'last'))
     with pytest.raises(RuntimeError, match='tile'):
         validate_inplace_state_from_metadata(build(rows=((0, 1), (1, 3))))
     model = build()
@@ -293,14 +316,19 @@ def test_a_non_numeric_zero_point_is_reported():
     assert any('zero_point' in item for item in problems), problems
 
 
-@pytest.mark.parametrize('damage', ['bad_json', 'missing_axis', 'bad_kind'])
+@pytest.mark.parametrize('damage', ['bad_json', 'missing_axis', 'bad_kind',
+                                    'missing_drop', 'bad_drop'])
 def test_malformed_state_metadata_fails_the_graph_check(tmp_path, capsys,
                                                        damage):
     model = build()
-    slicing = {'win': {'kind': 'window', 'axis': 2},
+    slicing = {'win': {'kind': 'window', 'axis': 2, 'drop': 'first'},
                'rows': {'kind': 'rows', 'axis': 1}}
     if damage == 'missing_axis':
         del slicing['win']['axis']
+    if damage == 'missing_drop':
+        del slicing['win']['drop']
+    if damage == 'bad_drop':
+        slicing['win']['drop'] = 'either'
     if damage == 'bad_kind':
         slicing['win']['kind'] = 'ring'
     text = '{"win": ' if damage == 'bad_json' else json.dumps(slicing)

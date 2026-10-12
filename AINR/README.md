@@ -195,7 +195,8 @@ input and at its `*_out` output; the runtime binds both to the same address, so
 the updated state is the next call's input and nothing is copied. A sliding
 window (DFN2 `df_convp_history`, the six GTCRN conv windows) is the full window:
 the graph drops the oldest frame with a Slice on the input, appends the new
-frame and returns the whole concatenation. Recurrent states are stacked into
+frame and returns the whole concatenation; `state_slicing` declares
+`drop = first` for it and the validator accepts only that range. Recurrent states are stacked into
 one tensor per model (`h_gru`, `h_tra`, `h_dpgrnn`), cut with Slices on dim 1
 and joined with one Concat. `onnx_streaming_contract.py`
 (`validate_inplace_state_graph`) checks this at export time and

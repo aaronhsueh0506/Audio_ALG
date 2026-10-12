@@ -149,8 +149,11 @@ Slice on the input side and the new frame is concatenated, so a runtime can
 bind every `*_out` to the address of its input (`state_binding =
 in_place_same_address`). `export_graph` checks that structure on every file it
 writes (`validate_inplace_state_contract` in `_onnx_contract.py`, a wrapper over
-`validate_inplace_state_graph` in `AINR/onnx_streaming_contract.py`). Complex
-values use real/imaginary pairs.
+`validate_inplace_state_graph` in `AINR/onnx_streaming_contract.py`). Each
+window declares the end it drops in the graph metadata (`state_window_drop`:
+`first` for a time-ordered window, `last` for a newest-first ring) and the
+validator accepts exactly that Slice range. Complex values use real/imaginary
+pairs.
 
 One calibration run produces both deployment artifacts: it exports and
 parity-checks the ONNX graph the tensors bind to (default `<output>.onnx`,

@@ -1041,6 +1041,51 @@ def test_exported_state_boundary_is_in_place_and_sliced_on_the_input(
         assert produced[output.name].op_type != 'Slice', output.name
 
 
+def _drop_the_other_end(model, name):
+    """Point the Slice that reads window ``name`` at the opposite end of the
+    window, keeping its length: [1:K) becomes [0:K-1) and back."""
+    from onnx import numpy_helper
+
+    constants = {item.name: numpy_helper.to_array(item)
+                 for item in model.graph.initializer}
+    node = next(item for item in model.graph.node if name in item.input)
+    start, end = (int(constants[node.input[index]].reshape(-1)[0])
+                  for index in (1, 2))
+    new = (0, end - 1) if start == 1 else (1, end + 1)
+    for index, value in ((1, new[0]), (2, new[1])):
+        label = 'flipped_%s_%d' % (name, index)
+        model.graph.initializer.append(numpy_helper.from_array(
+            np.array([value], dtype=np.int64), label))
+        node.input[index] = label
+    return model
+
+
+def test_a_window_that_drops_the_wrong_end_is_refused(tmp_path):
+    """The pathway window is time ordered: the graph drops its first frame,
+    the metadata says so, and a graph (or a declaration) with the other end
+    is refused by the validator the exporter ran."""
+    import onnx
+    from onnx_streaming_contract import validate_inplace_state_from_metadata
+
+    _wrapper, path, _metadata = _export_small_graph(tmp_path)
+    graph = onnx.load(str(path))
+    props = {prop.key: prop.value for prop in graph.metadata_props}
+    slicing = json.loads(props['state_slicing'])
+    assert slicing[PATHWAY_STATE_NAME]['drop'] == 'first'
+    assert validate_inplace_state_from_metadata(graph) == len(STATE_HANDOFF)
+    mutant = _drop_the_other_end(onnx.load(str(path)), PATHWAY_STATE_NAME)
+    with pytest.raises(RuntimeError, match='does not drop the first slot'):
+        validate_inplace_state_from_metadata(mutant)
+    mutant = onnx.load(str(path))
+    for prop in mutant.metadata_props:
+        if prop.key == 'state_slicing':
+            declared = json.loads(prop.value)
+            declared[PATHWAY_STATE_NAME]['drop'] = 'last'
+            prop.value = json.dumps(declared)
+    with pytest.raises(RuntimeError, match='does not drop the last slot'):
+        validate_inplace_state_from_metadata(mutant)
+
+
 def test_gru_state_reaches_every_gru_through_slices(tmp_path):
     """Each recurrent row block reaches its own GRU nodes and nothing merges
     them first: if a later change let the rows meet at a Concat before the

@@ -145,7 +145,8 @@ framing／CCM ring 不前進、幀維持開啟、回 −1
 graph 回每個 state 的<b>完整下一個 window</b>，shape 與輸入完全相同：位移在 graph 內，用輸入端的 Slice 切掉一幀、
 再把新一幀 Concat 上去（time-ordered window 取 frame <code>1..N−1</code> 再接在後面；newest-first 的 K/V 與 attention ring 取 slot <code>0..D−2</code> 再接在前面），
 Concat 的結果就是輸出，沒有 state 輸出由 Slice 產生；被丟掉的那一格只讓輸入與輸出 shape 相同。
-匯出時 <code>validate_inplace_state_graph</code>（<code>AINR/onnx_streaming_contract.py</code>，AIAEC 匯出器經 <code>validate_inplace_state_contract</code> 呼叫同一份實作）逐檔檢查這個結構，metadata 帶 <code>state_binding = in_place_same_address</code>。
+匯出時 <code>validate_inplace_state_graph</code>（<code>AINR/onnx_streaming_contract.py</code>，AIAEC 匯出器經 <code>validate_inplace_state_contract</code> 呼叫同一份實作）逐檔檢查這個結構，metadata 帶 <code>state_binding = in_place_same_address</code>，
+並為每個 window 宣告丟哪一端（AINR 的 <code>state_slicing</code> 內 <code>drop</code>、AIAEC 的 <code>state_window_drop</code>：time-ordered window 為 <code>first</code>，newest-first ring 為 <code>last</code>），驗證器只接受那一端的 Slice 範圍。
 host 沒有 ring helper，commit 的有限性檢查只看 graph 這一幀新寫的那一格（K/V／attention ring 的 slot 0、conv／score／logit window 的最後一幀）、
 head 與 <code>h_gru</code> 全部，較舊的格子不重查。</p>
 <p>RNNoise-ERB 仍是複製路徑：runtime 把 <code>h1_out</code>／<code>h2_out</code>／<code>h3_out</code> 寫進自己的 tensor，host 呼叫 <code>rnnoise_model_state_inherit</code>，

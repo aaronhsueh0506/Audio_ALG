@@ -481,7 +481,7 @@ def test_exported_graph_satisfies_the_in_place_state_contract(
     assert validate_inplace_state_contract(
         loaded, input_names[split.signal_inputs:],
         output_names[split.head_outputs:],
-        window_inputs=wrapper.window_state_names) == len(
+        window_drops=wrapper.window_state_drops) == len(
             wrapper.window_state_names)
     assert len(wrapper.window_state_names) >= 4
     producer = {o: n for n in loaded.graph.node for o in n.output}

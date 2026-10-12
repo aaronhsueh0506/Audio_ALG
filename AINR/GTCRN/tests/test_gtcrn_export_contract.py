@@ -411,3 +411,54 @@ def test_exported_state_boundary_is_in_place_and_sliced_on_the_input(tmp_path):
                 for out in node.output}
     for output in graph.graph.output:
         assert produced[output.name].op_type != 'Slice', output.name
+
+
+def _drop_the_other_end(model, name):
+    """Point the Slice that reads window ``name`` at the opposite end of the
+    window, keeping its length: [1:K) becomes [0:K-1) and back."""
+    from onnx import numpy_helper
+
+    constants = {item.name: numpy_helper.to_array(item)
+                 for item in model.graph.initializer}
+    node = next(item for item in model.graph.node if name in item.input)
+    start, end = (int(constants[node.input[index]].reshape(-1)[0])
+                  for index in (1, 2))
+    new = (0, end - 1) if start == 1 else (1, end + 1)
+    for index, value in ((1, new[0]), (2, new[1])):
+        label = 'flipped_%s_%d' % (name, index)
+        model.graph.initializer.append(numpy_helper.from_array(
+            np.array([value], dtype=np.int64), label))
+        node.input[index] = label
+    return model
+
+
+def test_a_window_that_drops_the_wrong_end_is_refused(tmp_path):
+    """Every conv window is time ordered: the graph drops its first frame, the
+    metadata says so, and a graph (or a declaration) with the other end is
+    refused by the validator the exporter ran."""
+    onnx = pytest.importorskip('onnx')
+    pytest.importorskip('onnxruntime')
+    from onnx_streaming_contract import validate_inplace_state_from_metadata
+
+    checkpoint = _checkpoint(tmp_path)
+    stream, grid = build_stream_model(_grid_config(tmp_path, 512), checkpoint)
+    path = os.fspath(tmp_path / 'gtcrn_direction.onnx')
+    export_graph(stream, grid, checkpoint, path)
+    graph = onnx.load(path)
+    props = {prop.key: prop.value for prop in graph.metadata_props}
+    slicing = json.loads(props['state_slicing'])
+    assert {name: slicing[name]['drop'] for name in CONV_STATE_NAMES} == {
+        name: 'first' for name in CONV_STATE_NAMES}
+    assert validate_inplace_state_from_metadata(graph) == len(STATE_HANDOFF)
+    for name in CONV_STATE_NAMES:
+        mutant = _drop_the_other_end(onnx.load(path), name)
+        with pytest.raises(RuntimeError, match='does not drop the first slot'):
+            validate_inplace_state_from_metadata(mutant)
+        mutant = onnx.load(path)
+        for prop in mutant.metadata_props:
+            if prop.key == 'state_slicing':
+                declared = json.loads(prop.value)
+                declared[name]['drop'] = 'last'
+                prop.value = json.dumps(declared)
+        with pytest.raises(RuntimeError, match='does not drop the last slot'):
+            validate_inplace_state_from_metadata(mutant)

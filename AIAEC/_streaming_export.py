@@ -26,8 +26,8 @@ input's shape, so each ``*_out`` can be bound to the address of its input.
 * Vector and scalar accumulators are lifted to ``[1, 1, N, D]`` / ``[1, 1, 1, 1]``.
 
 ``export_graph`` validates the written file with
-``validate_inplace_state_contract`` and records ``state_binding`` in its
-metadata.
+``validate_inplace_state_contract`` and records ``state_binding`` and
+``state_window_drop`` in its metadata.
 """
 
 from __future__ import annotations
@@ -335,6 +335,9 @@ def requires_contiguous_calibration(model_name: str) -> bool:
     return model_name == 'Align_CRUSE'
 
 
+_WINDOW_DROP = {'window': 'first', 'ring': 'last'}
+
+
 class _StateSlot:
     """One cell tensor and how it crosses the graph boundary.
 
@@ -361,6 +364,13 @@ class _StateSlot:
     def is_window(self) -> bool:
         """Whether the graph shifts it with a Slice on the input."""
         return self.kind in (self.WINDOW, self.RING)
+
+    @property
+    def window_drop(self) -> Optional[str]:
+        """The end a window drops per frame: a time-ordered conv window
+        keeps its oldest frame first and drops ``'first'``; a newest-first
+        delay ring drops ``'last'``. None for a state that is no window."""
+        return _WINDOW_DROP.get(self.kind)
 
     def get(self) -> Tensor:
         value = getattr(self.owner, self.attribute)
@@ -563,9 +573,9 @@ class StatelessOneFrameAIAEC(nn.Module):
         slot_names = self._split_state_names()
         self._state_names = self._regroup(
             slot_names, self.COMBINED_GRU_STATE_NAME)
-        self._window_state_names = tuple(
-            name for name, slot in zip(slot_names, self.slots)
-            if slot.is_window)
+        self._window_state_drops = {
+            name: slot.window_drop
+            for name, slot in zip(slot_names, self.slots) if slot.is_window}
 
     def _fold_ccm_head(self) -> None:
         """Make the DeepVQE graph end in one conv plus a rank-4 reshape.
@@ -651,9 +661,14 @@ class StatelessOneFrameAIAEC(nn.Module):
         return tuple(name + '_out' for name in self._state_names)
 
     @property
+    def window_state_drops(self) -> Dict[str, str]:
+        """State inputs the graph shifts with a Slice (windows and rings),
+        each with the end it drops: ``'first'`` or ``'last'``."""
+        return dict(self._window_state_drops)
+
+    @property
     def window_state_names(self) -> Tuple[str, ...]:
-        """State inputs the graph shifts with a Slice (windows and rings)."""
-        return self._window_state_names
+        return tuple(self._window_state_drops)
 
     def initial_state(self) -> Tuple[Tensor, ...]:
         return self._collapse_state(
@@ -978,6 +993,7 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
             output_names[split.head_outputs:],
         )
     }
+    metadata['state_window_drop'] = wrapper.window_state_drops
     metadata['state_dtypes'] = {
         name: str(value.detach().cpu().numpy().dtype)
         for name, value in zip(
@@ -991,7 +1007,7 @@ def export_graph(grid, built, checkpoint_path, output_path, checkpoint_depth,
     validate_inplace_state_contract(
         graph, input_names[split.signal_inputs:],
         output_names[split.head_outputs:],
-        window_inputs=wrapper.window_state_names)
+        window_drops=metadata['state_window_drop'])
     onnx.save(graph, output_path)
     with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as stream:

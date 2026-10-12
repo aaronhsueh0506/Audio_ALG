@@ -32,6 +32,7 @@ from AIAEC.Align_ULCNet.export_onnx import (
     STATE_NAMES,
     STATE_OUTPUT_NAMES,
     SUPPORTED_GRIDS,
+    WINDOW_STATE_DROPS,
     WINDOW_STATE_NAMES,
     ta_bins_for,
     TA_CHANNELS,
@@ -480,7 +481,7 @@ def test_exported_onnx_state_contract(tmp_path):
     assert producer['h_gru_out'].op_type != 'Slice'
     assert validate_inplace_state_contract(
         loaded, STATE_NAMES, STATE_OUTPUT_NAMES,
-        window_inputs=WINDOW_STATE_NAMES) == len(WINDOW_STATE_NAMES)
+        window_drops=WINDOW_STATE_DROPS) == len(WINDOW_STATE_NAMES)
     props = {p.key: p.value for p in loaded.metadata_props}
     assert props['state_binding'] == 'in_place_same_address'
     assert props['state_layout_version'] == str(LAYOUT_VERSION)

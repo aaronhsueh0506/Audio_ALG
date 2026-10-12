@@ -96,8 +96,8 @@ the inverse power -- runs on the host (``host_back_end``; C:
 ``ulcnet_model_io_commit``).
 
 ``export_graph`` validates the written file with
-``validate_inplace_state_contract`` and records ``state_binding`` in its
-metadata.
+``validate_inplace_state_contract`` and records ``state_binding`` and
+``state_window_drop`` in its metadata.
 """
 
 from __future__ import annotations
@@ -178,7 +178,14 @@ SIGNAL_INPUT_NAMES = (
 # h_gru0 then h_gru1; dim 0 is the singleton N of the shared NCHW convention,
 # so it is never the stacking axis.
 GRU_STATE_NAME = 'h_gru'
-WINDOW_STATE_NAMES = ('key_history', 'value_history', 'logit_history')
+# The end each window drops before the new frame joins: the key and value
+# histories are newest first, the logit history is time ordered.
+WINDOW_STATE_DROPS = {
+    'key_history': 'last',
+    'value_history': 'last',
+    'logit_history': 'first',
+}
+WINDOW_STATE_NAMES = tuple(WINDOW_STATE_DROPS)
 STATE_NAMES = WINDOW_STATE_NAMES + (GRU_STATE_NAME,)
 HEAD_OUTPUT_NAMES = ('output',)
 STATE_OUTPUT_NAMES = tuple(name + '_out' for name in STATE_NAMES)
@@ -598,6 +605,7 @@ def _write_metadata(
         'boundary': 'stateless_one_frame_full_state',
         'state_layout_version': LAYOUT_VERSION,
         'state_binding': STATE_BINDING,
+        'state_window_drop': WINDOW_STATE_DROPS,
         'feature_layout': 'host',
         'gru_state_layout': 'combined',
         'compression_exponent': COMPRESSION_EXPONENT,
@@ -734,7 +742,7 @@ def export_graph(model, checkpoint_path, output_path, opset=17,
     graph = _resolve_internal_shapes(graph)
     validate_inplace_state_contract(
         graph, STATE_NAMES, STATE_OUTPUT_NAMES,
-        window_inputs=WINDOW_STATE_NAMES)
+        window_drops=metadata['state_window_drop'])
     onnx.save(graph, output_path)
 
     if verify:
