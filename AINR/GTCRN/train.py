@@ -47,11 +47,11 @@ from training_common import (  # noqa: E402
 
 
 # ``PackedDataset``, the sampler, the seeder and the train/val split all live
-# in ``dataset_gen`` and are shared by all three models.  They used to be
-# copied into each trainer, and they drifted: GTCRN held out 5% while
-# RNNoise-ERB held out 10%, so the two models being compared were trained on
-# different corpora.  Which samples each model gets is part of the comparison
-# protocol, so there is exactly one definition of it.
+# in ``dataset_gen`` and are shared by all three models.  Which samples each
+# model gets is part of the comparison protocol, so there is exactly one
+# definition of it: per-trainer copies could drift (for example different
+# held-out fractions), and the compared models would train on different
+# corpora.
 
 
 # ============================================================
@@ -59,8 +59,8 @@ from training_common import (  # noqa: E402
 # ============================================================
 #
 # Bumped whenever a change makes previously-trained weights invalid or
-# meaningless to resume.  Mirrors the gates in RNNoise-ERB/train.py:53-54 and
-# DeepFilterNet2/train.py:39-40, which GTCRN previously lacked entirely.
+# meaningless to resume.  Mirrors the gates in RNNoise-ERB/train.py and
+# DeepFilterNet2/train.py.
 MODEL_VERSION = 'gtcrn_upstream_bitexact_v1'
 LOSS_VERSION = 'gtcrn_hybrid_30spec_70mag_sisnr_istft_both_v1'
 
@@ -91,7 +91,7 @@ def require_checkpoint_contract(ckpt, contract, context='checkpoint',
 
     Upstream ships no trainer, so this is our own hygiene — but without it a
     resume across an n_fft or erb_subband change silently succeeds and trains
-    garbage, which is exactly what the old code did.
+    garbage.
 
     ``allow_missing=True`` skips the version gate for checkpoints that predate
     it -- the vendored upstream tars carry no contract at all, so inference
@@ -163,10 +163,10 @@ class HybridLoss(nn.Module):
         30 * (mag_norm_re_mse + mag_norm_im_mse) + 70 * mag^0.3_mse + SI-SNR
 
     Both waveforms are obtained by ISTFT of the two spectra, matching upstream
-    gtcrn_github/loss.py:24-25.  This repo previously compared an ISTFT'd
-    prediction against the RAW clean waveform; because sqrt-Hann WOLA does not
-    reconstruct the first/last half-frame exactly, that put a floor on the
-    SI-SNR term that the model could never reach.
+    gtcrn_github/loss.py:24-25.  Comparing an ISTFT'd prediction against the
+    RAW clean waveform would put a floor on the SI-SNR term that the model
+    could never reach, because sqrt-Hann WOLA does not reconstruct the
+    first/last half-frame exactly.
     """
 
     def __init__(self, n_fft=512, hop_len=256, win_len=512):
@@ -211,8 +211,8 @@ def train(args):
     cfg.read(args.config)
 
     # Seed before anything that draws randomness.  Without this the train/val
-    # split was redrawn every run, so two runs of the same config were not
-    # comparable and --resume leaked training data into validation.
+    # split would be redrawn every run, so two runs of the same config would
+    # not be comparable and --resume would leak training data into validation.
     set_seed(args.seed)
 
     SR      = cfg.getint('signal', 'sr')

@@ -42,7 +42,7 @@ def scan_non_finite(module, include_buffers=False):
     ⚠ Buffers are EXCLUDED by default, and that default is load-bearing.
     ``BatchNorm2d`` updates ``running_mean``/``running_var`` inside ``forward()``
     in train mode, so a forward-side fault poisons all 30 BN buffers before the
-    loss is even evaluated.  Scanning them made every forward-side halt report
+    loss is even evaluated.  Scanning them would make every forward-side halt report
     "an earlier step already wrote NaN into the weights" at global step 0, which
     is the opposite of the truth.  Only PARAMETERS carry the optimizer's history,
     so only parameters answer the first-hit question.

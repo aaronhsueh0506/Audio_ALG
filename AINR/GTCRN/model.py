@@ -2,9 +2,9 @@
 GTCRN: ShuffleNetV2 + SFE + TRA + 2 DPGRNN
 Ultra tiny, 33.0 MMACs, 23.67 K params
 
-Adapted from gtcrn/gtcrn.py:
-  - Removed einops dependency; shuffle() uses reshape instead of rearrange
-  - Added erb_subband_1 / erb_subband_2 constructor params
+Adapted from gtcrn/gtcrn.py, with these differences:
+  - No einops dependency; shuffle() uses reshape instead of rearrange
+  - erb_subband_1 / erb_subband_2 constructor params
   - DPGRNN width derived dynamically from encoder conv strides
 """
 import numpy as np

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Export GTCRN's exact ERB compression/expansion matrices.
 
-Since model layout v5 the ERB maps run on the HOST: gtcrn_process.c takes
+The ERB maps run on the HOST: gtcrn_process.c takes
 POINTERS to the matrices, and ``--runtime-bins`` writes the raw float32
 ``erb_fwd.bin``/``erb_inv.bin`` (plus a json manifest) in exactly the layouts
 the C loops consume -- the deployment loader owns the files and can swap
-them at any time without recompiling. The bin/npy formats remain for
+them at any time without recompiling. The bin/npy formats are for
 toolchain validation.
 
     python3 export_erb_matrix.py --runtime-bins output/erb
