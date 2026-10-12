@@ -62,14 +62,11 @@
  *     The C-side framing states keep running (the core's lane analysis
  *     behind the GSC spectrum, this wrapper's far analysis and its
  *     synthesis); the frame that still straddles the boundary is covered by
- *     the identity reprime below. Nothing is cleared: the layout-16 wrapper
- *     wiped its beam-WOLA accumulator at every boundary, which emitted one
- *     half-window-tapered hop there (measured: out_old[T+1] equals
- *     window^2 * out_new[T] to about -50 dB); with no reconstruction stage
- *     left there is nothing to wipe, and the boundary hop is emitted whole.
+ *     the identity reprime below. Nothing is cleared: there is no
+ *     reconstruction stage to wipe, and the boundary hop is emitted whole.
  *   - audio_pipeline_4ch_ulcnet_reset() also calls model->reset (if set).
  *
- * IDENTITY REPRIME ACROSS AN ALIGNMENT BOUNDARY (option A):
+ * IDENTITY REPRIME ACROSS AN ALIGNMENT BOUNDARY:
  *
  *   The reset above flushes the runtime's recurrent state, but the C-side
  *   ULCNet STFT states keep running, so the analysis windows already in
@@ -104,10 +101,8 @@
  *   that frame; it never doubles. The framing path is untouched, so the
  *   1-hop latency contract holds unchanged across a boundary.
  *
- *   Option B (keep stepping the model through the straddling frames and keep
- *   applying its output) is DEFERRED pending an audio A/B: it trades this
- *   version's short identity stretch for recurrent state built on half-stale
- *   frames. Do not switch policies without that A/B.
+ *   The model is not stepped through straddling frames with its output
+ *   applied: that would build recurrent state on half-stale frames.
  *
  * VAD: this wrapper provides process_with_activity() ONLY (external VAD).
  * The conservative auto-VAD fallback stays with the standard wrapper

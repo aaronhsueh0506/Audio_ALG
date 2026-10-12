@@ -74,7 +74,7 @@
  * alloc, and a free — that surface is what the rest of this file (and
  * audio_pipeline.h) actually depends on.
  *
- * The arena is sized from the LARGEST configuration this repo currently
+ * The arena is sized from the LARGEST configuration this repo
  * supports — 48 kHz, either FFT backend — plus headroom, per
  * pipelines/README.md's "Memory Budget" table (measured: 1,597,536 B KISS
  * / 1,591,712 B NE10 @ 48 kHz, balanced presets). 2 MiB leaves a comfortable

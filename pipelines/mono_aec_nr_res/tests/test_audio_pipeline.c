@@ -716,9 +716,8 @@ static void test_init_ex_descriptor(void) {
     if (p_stale) audio_pipeline_destroy(p_stale);
 
     /* Tampered backend_id: a plain wrong integer (99), never a string --
-     * V2 dropped the F20 `const char* backend` field entirely, so there is
-     * no string to tamper any more (see AudioPipelineMemReq.backend_id's
-     * doc for why that hazard is gone). */
+     * the descriptor carries no `const char* backend` field, so there is no
+     * string to tamper (see AudioPipelineMemReq.backend_id's doc). */
     AudioPipelineMemReq bad_backend_id = req;
     bad_backend_id.backend_id = 99;
     AudioPipeline* p_be = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &bad_backend_id);
@@ -879,11 +878,11 @@ static void test_stage_timing(void) {
     CHECK(t.aec.delay_us > 0,  "timing: the delay estimator reports a real cost");
     CHECK(t.aec.linear_us > 0, "timing: the AEC main filter reports a real cost");
     CHECK(t.aec.res_us > 0,    "timing: the AEC post/RES block reports a real cost");
-    /* frontend_us is deliberately NOT asserted nonzero. Once delay_us was
-     * split out of it, what remains -- mic HPF, saturation, render activity,
+    /* frontend_us is deliberately NOT asserted nonzero. delay_us is
+     * reported separately, so what remains -- mic HPF, saturation, render activity,
      * mu_scale, mic-clip, RSA, shadow filter -- measures ~1 us on this grid,
      * i.e. at the clock floor. Asserting it would be asserting that the host
-     * is slow. That it can now read 0 while delay_us is large IS the
+     * is slow. That it can read 0 while delay_us is large IS the
      * measurement this split exists to make. */
     CHECK(t.aec.delay_us > t.aec.frontend_us,
           "timing: the delay estimator dominates what is left of the frontend");

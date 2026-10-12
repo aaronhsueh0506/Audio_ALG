@@ -1,20 +1,18 @@
 /**
- * aec_nr_pipeline_static.c — AEC(linear) -> echo-aware NR -> RES  (Version B: static memory)
+ * static_main.c (binary aec_nr_pipeline_static) — AEC(linear) -> echo-aware NR -> RES  (Version B: static memory)
  *
  * Thin CLI shell over mono_aec_nr_res/audio_pipeline.h. All
- * pool-sizing/carving/per-hop-processing logic that used to live here as
- * file-local `static` functions (`pipeline_pool_size`, `pipeline_build`,
- * `pipeline_destroy`, and the processing while-loop body inlined in
- * `main()`) has moved into audio_pipeline.c, which is now linkable on its
- * own (see pipelines/README.md "Board Integration"). This file keeps
- * exactly what a CLI is actually responsible for: argv parsing, WAV I/O,
+ * pool-sizing/carving/per-hop-processing logic lives in audio_pipeline.c,
+ * which is linkable on its own (see pipelines/README.md "Board
+ * Integration"). This file keeps exactly what a CLI is actually
+ * responsible for: argv parsing, WAV I/O,
  * the explicit caller-owned-pool dance (`malloc` here standing in for a
  * platform allocator — see audio_pipeline.h's audio_pipeline_init doc), and
  * the `--debug` / `DUMP_CTX` / `--print-mem-size` diagnostics.
  *
  * `aec_nr_pipeline_static out.wav` must be BYTE-IDENTICAL to
  * `aec_nr_pipeline out.wav` for the same inputs/options/backend (both are
- * now the SAME audio_pipeline_process() call underneath — one reached via
+ * the SAME audio_pipeline_process() call underneath — one reached via
  * an explicit caller pool, the other via audio_pipeline_create()'s heap
  * convenience wrapper).
  *
@@ -27,7 +25,7 @@
  *                     [--sample-rate <hz>]
  *
  * --debug: identical semantics to the malloc pipeline (see
- *   aec_nr_pipeline.c's header) — prints one combined AEC+NR status
+ *   main.c's header) — prints one combined AEC+NR status
  *   line/sec to stderr.
  */
 
@@ -105,7 +103,7 @@ static void print_debug_status(const AudioPipeline* pipe, int aec_only, float se
 /* Human-readable name for a descriptor backend_id -- CLI-side convenience
  * only (this is trusted local code turning OUR OWN integer back into a
  * string for a diagnostic table; not the caller-data %s/strcmp hazard the
- * library itself now avoids -- see audio_pipeline.h's AudioPipelineMemReq.
+ * library itself avoids -- see audio_pipeline.h's AudioPipelineMemReq.
  * backend_id doc). */
 static const char* backend_id_name(uint32_t backend_id) {
     switch (backend_id) {
@@ -117,10 +115,9 @@ static const char* backend_id_name(uint32_t backend_id) {
 
 /* --print-mem-size diagnostic table. Backed by audio_pipeline_get_mem_breakdown
  * (per-module AEC/FFT/NR/pipeline-buffer split) + audio_pipeline_get_mem_requirements
- * (the descriptor V2 struct: total bytes incl. the AudioPipeline
+ * (the descriptor struct: total bytes incl. the AudioPipeline
  * control block itself, descriptor_version, layout_version, backend_id,
- * build_flags_hash, alignment). Same table shape as the pre-F20 static CLI,
- * plus the descriptor fields the old bare size_t couldn't carry. */
+ * build_flags_hash, alignment). */
 static void print_mem_budget(const AudioPipelineConfig* cfg) {
     AudioPipelineMemBreakdown b;
     AudioPipelineMemReq req;
@@ -227,8 +224,8 @@ static uint32_t timing_now_us(void) {
 
 int main(int argc, char* argv[]) {
     /* --print-mem-size diagnostic mode: report the pool byte budget (and
-     * exercise a real audio_pipeline_init(), same guard coverage the old
-     * pipeline_build() had) without any WAV I/O. */
+     * exercise a real audio_pipeline_init(), so the init guards are covered)
+     * without any WAV I/O. */
     if (argc >= 2 && strcmp(argv[1], "--print-mem-size") == 0) {
         AecPreset     preset      = AEC_PRESET_BALANCED;
         AnrMode nr_mode     = ANR_MODE_BALANCED;
@@ -294,7 +291,7 @@ int main(int argc, char* argv[]) {
     AecPreset     preset   = AEC_PRESET_BALANCED;
     AnrMode nr_mode  = ANR_MODE_BALANCED;
     int           aec_only = 0;
-    int           legacy   = 0;   /* --legacy-amin → prior min-only A_min_pl */
+    int           legacy   = 0;   /* --legacy-amin → min-only A_min_pl */
     int           no_nr    = 0;   /* --no-nr → no denoiser, g_total is G_res */
     int           no_res   = 0;   /* --no-res → no residual gain, g_total is G_nr */
     int           no_cng   = 0;   /* --no-cng → disable comfort noise (parity) */

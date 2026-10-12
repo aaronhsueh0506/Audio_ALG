@@ -55,7 +55,7 @@
  *    first UNLOCKED->LOCKED ring transition and performs the same reset.
  *  - audio_pipeline_ulcnet_reset() also calls model->reset (if set).
  *
- * ── Identity reprime across an alignment boundary (option A) ─────────────
+ * ── Identity reprime across an alignment boundary ─────────────────────
  *  A generation change flushes the runtime's recurrent state, but the C
  *  STFT states keep running: the analysis windows already in flight still
  *  STRADDLE the boundary -- their two-hop spans cover one hop pushed
@@ -90,10 +90,8 @@
  *  those frames; it never doubles. The STFT/WOLA path is untouched, so the
  *  one-hop latency contract holds unchanged across a boundary.
  *
- *  Option B (keep stepping the model through the straddling frames and keep
- *  applying its output) is DEFERRED pending an audio A/B: it trades this
- *  version's short identity stretch for recurrent state built on half-stale
- *  frames. Do not switch policies without that A/B.
+ *  The model is not stepped through straddling frames with its output
+ *  applied: that would build recurrent state on half-stale frames.
  */
 #ifndef AUDIO_PIPELINE_ULCNET_H
 #define AUDIO_PIPELINE_ULCNET_H
@@ -130,7 +128,7 @@ enum { AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES = 1 };
  * ========================================================================== */
 
 /** AudioPipelineUlcnetMemReq ABI version; independent of the pool layout
- * version below. This variant's descriptor history starts at 1. */
+ * version below. */
 #define AUDIO_PIPELINE_ULCNET_DESCRIPTOR_VERSION 1u
 
 /** Stable FFT backend identifiers (same values as audio_pipeline.h's, so a
@@ -320,7 +318,7 @@ void audio_pipeline_ulcnet_reset(AudioPipelineUlcnet* p);
 
 /**
  * Tear down. For a pool-resident (init/init_ex) instance every underlying
- * destroy is a no-op today (kept for forward-compat, mirroring
+ * destroy is a no-op (kept for forward-compat, mirroring
  * audio_pipeline_destroy's rationale) and the call is NULL-safe and
  * idempotent; the caller keeps its pool. For a heap instance obtained via
  * audio_pipeline_ulcnet_create(), this frees the owned pool -- call exactly

@@ -51,9 +51,9 @@ extern "C" {
  */
 typedef struct {
     uint32_t descriptor_version;  /* = AUDIO_PIPELINE_DESCRIPTOR_VERSION (2) */
-    uint32_t layout_version;      /* carve-layout version (unchanged meaning) */
+    uint32_t layout_version;      /* carve-layout version                    */
     uint32_t backend_id;          /* AUDIO_PIPELINE_BACKEND_KISS=1 / _NE10=2 */
-    uint32_t build_flags_hash;    /* FNV-1a-32, unchanged meaning */
+    uint32_t build_flags_hash;    /* FNV-1a-32 */
     uint32_t alignment;           /* 16 */
     uint32_t reserved;            /* 0; keeps 8-byte alignment for bytes */
     uint64_t bytes;               /* total pool size */
@@ -104,7 +104,7 @@ typedef struct {
                                    * (which fills only RES-cut bins) is skipped; both  *
                                    * 0 = the linear residual, synthesised              */
     int           enable_cng;    /* 1 = fill AEC-suppressed bins with comfort noise    */
-    int           legacy_amin;   /* 1 = prior min-only A_min_pl (--legacy-amin): the    *
+    int           legacy_amin;   /* 1 = min-only A_min_pl (--legacy-amin): the          *
                                    * NR gain is computed WITHOUT folding R^2 into its   *
                                    * noise floor. Comparison aid only; keep 0.         */
 } AudioPipelineConfig;
@@ -173,7 +173,7 @@ AudioPipeline* audio_pipeline_init_ex(void* mem, size_t bytes,
 
 /**
  * Process exactly one hop (audio_pipeline_hop_size(p) samples) of mic/ref
- * into `out`. Verbatim port of the static CLI's per-hop while-loop body:
+ * into `out`. Per hop:
  * AEC(linear) -> echo-aware NR gain -> g_total=min(g_nr,g_res) ->
  * S(f)=E(f)*g_total (+ CNG on the cut bins) -> irfft -> sqrt-Hann OLA.
  * `aec_only` short-circuits to the raw linear AEC residual (mirrors the
@@ -249,7 +249,7 @@ int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset,
 /* Retarget the noise-reduction strength on a RUNNING pipeline.
  *
  * This recomposes THIS pipeline's own NR configuration -- the canonical
- * strength preset plus the overrides it has always applied on top -- and hands
+ * strength preset plus the overrides it applies on top -- and hands
  * the result to anr_reconfigure(). It deliberately does not call
  * anr_set_mode(), which composes the bare canonical preset and would
  * either be refused (its L differs) or revert those overrides.
@@ -265,11 +265,11 @@ int audio_pipeline_set_nr_mode(AudioPipeline* p, AnrMode mode);
  * Tear down in reverse carve order: NR -> pipeline FFT (the OLA irfft
  * instance) -> AEC. This is the mirror image of audio_pipeline_init's carve
  * order (AEC -> FFT -> NR -> scratch) and matches the teardown order
- * pipelines/README.md's "Two Versions" section already documents for the
+ * pipelines/README.md's "Two Versions" section documents for the
  * static CLI (`anr_destroy` / `fft_destroy` / `aec_destroy`, in that
  * order) — kept even though every one of those three calls is a genuine
- * no-op on a pool-resident (audio_pipeline_init'd) instance today: it is
- * forward-compat insurance (a future backend/module MAY hold something
+ * no-op on a pool-resident (audio_pipeline_init'd) instance: it is
+ * forward-compat insurance (a backend/module MAY hold something
  * outside the pool that a destroy call needs to release — see the NE10
  * twiddle-config caveat in aec.h/fft_wrapper.h) and is exactly what the
  * heap convenience path (audio_pipeline_create) needs for real.

@@ -184,8 +184,8 @@ static AecLinearDelayState pipeline_delay_state(const AudioPipelineUlcnet* p) {
 }
 
 /* Frames emitted at hop index h: the rolling (center=False) analysis emits
- * exactly one frame per hop from hop #0 (the centered 0/2/1 schedule is
- * gone; kept as a function so the schedule stays in one place). */
+ * exactly one frame per hop from hop #0 (kept as a function so the
+ * schedule stays in one place). */
 static int frames_at_hop(int h) { (void)h; return 1; }
 
 /* Spend an armed identity-reprime budget over one hop's `frames` emitted

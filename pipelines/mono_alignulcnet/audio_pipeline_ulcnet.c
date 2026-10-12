@@ -30,7 +30,7 @@
  *      AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES emitted frames still straddle
  *      the boundary and are emitted as identity WITHOUT stepping the model
  *      (header: "Identity reprime"; the constant is measured by the
- *      straddle-derivation test, and option B is deferred).
+ *      straddle-derivation test).
  *
  * Constraints: C99, -ffp-contract=off (pipelines/Makefile appends it last),
  * no stdio in this TU (all failures are signalled by NULL/-1 returns only),
@@ -40,7 +40,7 @@
  * (part of the `self` carve) rather than stack locals, and the analysis /
  * synthesis objects carry their own per-call FFT scratch in the pool --
  * multi-KB frame scratch would be unsafe headroom for an embedded RTOS task
- * stack (same rationale as lib/aec's Tier-1 stack-safety fix). The
+ * stack (same rationale as lib/aec's stack-safety rule). The
  * chain's FFT is ONE pool-carved compiled-grid fft_wrapper handle shared by
  * err-analysis + far-analysis + synthesis (strictly sequential use within
  * a hop, per ulcnet_process.h's sharing contract), so BACKEND=kiss/ne10
@@ -296,19 +296,10 @@ static uint32_t audio_pipeline_ulcnet_build_flags_hash(void) {
      * name the Ulcnet state embedded in the control block -- it is part of
      * the carve even though it is not separately carved. Bump
      * AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION (and update this string)
-     * whenever this structure changes -- always both, forever.
-     * v2: far_input_mode joined the control block.
-     * v3: ulcnet_window joined the control block (shared table replacing
-     * the per-struct copies; the chain structs also grew embedded FFT
-     * scratch) and the carve grew a trailing shared `fft` handle region.
-     * v5: the self-resident `model` copy grew io_descriptor, so the token
-     * names it explicitly -- the control block is bigger even though the
-     * carve ORDER is unchanged. v6 removes the runtime far-mode field and
-     * adds delay-transition bookkeeping. v7 adds the identity-reprime
-     * counter beside it. */
-    /* v12: the frame scratch shrinks to one frame per branch (the rolling
-     * push emits exactly one frame per hop; the 0/2/1 centered schedule and
-     * its two-frame staging are gone). */
+     * whenever this structure changes -- always both. The self-resident
+     * `model` copy carries io_descriptor, the delay-transition bookkeeping
+     * and the identity-reprime counter; the frame scratch is one frame per
+     * branch (the rolling push emits exactly one frame per hop). */
     h = ulcnet_fnv1a_str("|carve:self(model(io_descriptor),"
                          "aec_delay_cfg,delay_transition,reprime,"
                          "frame_scratch[1],ulcnet_window),aec,fft,"
@@ -475,7 +466,7 @@ int audio_pipeline_ulcnet_process_begin(AudioPipelineUlcnet* p, const float* mic
      * that bumps the generation. FIXED has no estimator event, so its first
      * UNLOCKED->LOCKED transition is detected locally. The C STFT states
      * keep running across the change; the reprime, not a crossfade, is what
-     * covers the straddling frames in this version. The counter is armed
+     * covers the straddling frames. The counter is armed
      * whether or not a runtime is attached, so the frame policy does not
      * depend on the model's presence. */
     if (lctx.delay_state == AEC_LINEAR_DELAY_CHANGED ||
@@ -593,7 +584,7 @@ void audio_pipeline_ulcnet_reset(AudioPipelineUlcnet* p) {
 void audio_pipeline_ulcnet_destroy(AudioPipelineUlcnet* p) {
     if (!p) return;
     /* Reverse carve order (AEC then the shared FFT handle sit in the
-     * sub-pool). Genuine no-ops for a pool-resident instance today; kept
+     * sub-pool). Genuine no-ops for a pool-resident instance; kept
      * for the heap path and forward-compat, mirroring
      * audio_pipeline_destroy's rationale. */
     if (p->fft) fft_destroy(p->fft);

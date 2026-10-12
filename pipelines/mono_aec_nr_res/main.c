@@ -1,5 +1,5 @@
 /**
- * aec_nr_pipeline.c — AEC(linear) → echo-aware NR → RES  (Version A: malloc)
+ * main.c (binary aec_nr_pipeline) — AEC(linear) → echo-aware NR → RES  (Version A: malloc)
  *
  * Thin CLI shell over mono_aec_nr_res/audio_pipeline.h. Freq-domain
  * A_min_pl pipeline, a C port of pipelines/aec_nr_pipeline.py. Per hop:
@@ -13,14 +13,14 @@
  *   Stage 3: external RES — g_total = min(G_nr, G_res), then S(f) = E(f)·g_total
  *            (+ comfort noise on the cut bins) and one sqrt-Hann OLA.
  *
- * All of the above now lives in audio_pipeline.c (audio_pipeline_process()) —
+ * All of the above lives in audio_pipeline.c (audio_pipeline_process()) —
  * this file is arg parsing + WAV I/O + the `--debug` / `DUMP_CTX` diagnostics
  * around a single audio_pipeline_create()/destroy() pair (the heap
  * convenience path; see mono_aec_nr_res/static_main.c for the explicit
  * caller-pool flavor of the same API).
  *
  * This mirrors run_aec_linear → run_nr_spectrum(inject_echo_psd) → run_res
- * (combine='min'). --legacy-amin restores the prior noise-only NR (no R²
+ * (combine='min'). --legacy-amin selects the noise-only NR (no R²
  * injection).
  *
  * Build:  make libs && make aec_nr_pipeline
@@ -198,7 +198,7 @@ int main(int argc, char* argv[]) {
     AecPreset     preset   = AEC_PRESET_BALANCED;
     AnrMode nr_mode  = ANR_MODE_BALANCED;
     int           aec_only = 0;
-    int           legacy   = 0;   /* --legacy-amin → prior min-only A_min_pl */
+    int           legacy   = 0;   /* --legacy-amin → min-only A_min_pl */
     int           no_nr    = 0;   /* --no-nr → no denoiser, g_total is G_res */
     int           no_res   = 0;   /* --no-res → no residual gain, g_total is G_nr */
     int           no_cng   = 0;   /* --no-cng → disable comfort noise (parity) */
