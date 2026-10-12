@@ -36,11 +36,11 @@ instance.
 | NR | libanr.a | anr.h | MMSE-LSA + MCRA noise est + SPP |
 | RES | libaec.a (included) | aec.h (`AecResContext`) | Residual echo suppression, folded into AEC's freq-domain seam |
 | Mono integration | libaudio_pipeline.a | mono_aec_nr_res/audio_pipeline.h | One-mic AEC + NR/RES, heap or caller-owned pool |
-| 4-ch linear core | libaudio_pipeline_4ch.a | 4ch_aec_bf_nr_res/4aec_nr_res.h | One shared aligner + four linear AECs; the archive contains only this core |
-| Complete 4-ch spatial | application object | 4ch_aec_bf_nr_res/audio_pipeline_4ch.h | Core + reusable SRP-PHAT/GSC/NR libraries; linked into the application, not another archive |
+| 4-ch front end | libaudio_pipeline_4ch.a | 4ch_aec_bf_nr_res/4aec_nr_res.h | One shared aligner + four linear AECs + the fuse (`four_aec_front_process()`, `four_aec_fuse()`); the post-beam stages are the application's; the archive contains only this core |
+| Complete 4-ch spatial | application object | 4ch_aec_bf_nr_res/audio_pipeline_4ch.h | Front end + reusable SRP-PHAT/GSC libraries + the post-beam RES, NR, comfort noise and synthesis chained in `audio_pipeline_4ch.c`; linked into the application, not another archive |
 | Mono/4-ch Align-ULCNet | application objects | mono_alignulcnet/audio_pipeline_ulcnet.h and 4ch_alignulcnet/audio_pipeline_4ch_ulcnet.h | Existing component libraries + C pre/post + external accelerator callback |
-| Mono DFN2 replacement | libaudio_pipeline_dfn.a (+ libaudio_pipeline.a host) | mono_aec_dfn_res/audio_pipeline_dfn.h | The conventional mono pipeline (16 kHz default, 8/16/48 kHz) with NR off as the host; DFN2 estimates from the linear-AEC error and is applied to the host's post-RES spectrum, at 48 kHz through the rate bridge below 48 kHz |
-| 4-ch DFN2 replacement | lib4aec_dfn_res.a (+ libaudio_pipeline_4ch.a core) | 4ch_aec_bf_dfn_res/4aec_dfn_res.h | The four-lane core (16 kHz default, 16/48 kHz) with NR off as the host; DFN2 estimates from the beamformed error and is applied to the core's post-RES spectrum, at 48 kHz through the rate bridge below 48 kHz |
+| Mono DFN2 replacement | libaudio_pipeline_dfn.a (+ libaudio_pipeline.a host) | mono_aec_dfn_res/audio_pipeline_dfn.h | The conventional mono pipeline (16 kHz default, 8/16/48 kHz) as the host (`audio_pipeline_process_spec()`); the application forms P = E.G_res (+ comfort noise); DFN2 estimates from the linear-AEC error and is applied to P, at 48 kHz directly, below 48 kHz through the rate bridge; phased hop `process_begin` / `nn_begin` / `nn_end` / `process_end` |
+| 4-ch DFN2 replacement | lib4aec_dfn_res.a (+ libaudio_pipeline_4ch.a core) | 4ch_aec_bf_dfn_res/4aec_dfn_res.h | The four-lane front end (16 kHz default, 16/48 kHz); the application carves the post-beam RES, forms P = E.G_res (+ comfort noise) from `four_aec_fuse()`, and runs DFN2 on (E, P), at 48 kHz directly, at 16 kHz through the rate bridge; phased hop as above |
 
 RES is not a standalone module/library — it is exposed as the `AecResContext` seam on
 the AEC object. With `AecConfig.return_res_context=1` and `enable_res=0`, `aec_process_context()`
@@ -68,8 +68,8 @@ rather than cancelling. `aec_process()`'s own emitted audio is unaffected.
 
 The four-channel API is a separate zero-padding-free grid and does not use
 `AudioPipeline`. See [the 4-channel contract](4ch_aec_bf_nr_res/README.md) and
-[`4ch_aec_bf_nr_res/4aec_nr_res.h`](4ch_aec_bf_nr_res/4aec_nr_res.h) for its synchronous
-pre/post boundary.
+[`4ch_aec_bf_nr_res/4aec_nr_res.h`](4ch_aec_bf_nr_res/4aec_nr_res.h) for its two
+front calls (`four_aec_front_process()`, `four_aec_fuse()`) around the external beamformer.
 
 The directory root contains only the aggregate build, documentation,
 requirements and the public Python reference module. C sources live with
@@ -85,11 +85,11 @@ are delivered as separate archives where noted:
 | Application | Entry directory | Composition |
 |---|---|---|
 | Mono AEC + NR/RES | `mono_aec_nr_res/` | `audio_pipeline` + AEC + NR + audio_common |
-| 4-ch AEC + BF + NR/RES | `4ch_aec_bf_nr_res/` | 4-lane core + DOA/GSC + NR + audio_common |
+| 4-ch AEC + BF + NR/RES | `4ch_aec_bf_nr_res/` | 4-lane front end + DOA/GSC + post-beam RES/NR stages + audio_common |
 | Mono Align-ULCNet | `mono_alignulcnet/` | mono ULCNet wrapper + AEC + AIAEC pre/post |
 | 4-ch Align-ULCNet | `4ch_alignulcnet/` | pre-only 4-lane core + DOA/GSC + AIAEC pre/post |
-| Mono DFN2 | `mono_aec_dfn_res/` | conventional mono host (NR off) + dual-input DFN2 stage on its post-RES spectrum |
-| 4-ch DFN2 | `4ch_aec_bf_dfn_res/` | 4-lane core (NR off) + external BF/GSC + dual-input DFN2 stage on its post-RES spectrum |
+| Mono DFN2 | `mono_aec_dfn_res/` | mono host (`process_spec`) + the application's post-RES spectrum + dual-input DFN2 stage |
+| 4-ch DFN2 | `4ch_aec_bf_dfn_res/` | 4-lane front end + external BF/GSC + post-beam RES + dual-input DFN2 stage |
 
 The mono, 4-channel and mono ULCNet applications take their signal grid, AEC
 configuration and delay-request rules from `common/se_config.{h,c}`
@@ -193,29 +193,177 @@ control block directly, not derived from the struct.)
 > 512/256 grid（見上表）。並在 init 以 grid assert 驗證 pipeline/AEC/FFT/NR
 > 四方一致。
 
-## Integration Flow
+## Call flow
 
-1. **AEC (linear)**: Set `enable_res=0` and `return_res_context=1`, call `aec_process()` (or the
-   streaming `aec_analyze_render()` / `aec_process_capture()` pair), then `aec_get_res_context(a, &ctx)`
-   to read the `AecResContext` seam
-2. **NR**: `anr_process()` for denoising, `anr_get_gain()` for per-bin gain
-3. **RES**: Correct echo PSD with `echo_spec *= nr_gain`, then apply `ctx.res_gain` (AEC3
-   `SuppressionGain` G_res(f)) to the NR output — there is no separate `res_process()` call
+Every application analyses once per hop. The AEC takes time-domain `mic`/`ref`
+and returns its context spectra as one borrowed view, `SeSpecFrame`
+([`common/se_stage.h`](common/se_stage.h)). Each later stage is a plain
+function over that frame, and the application writes the combination itself:
 
-### Echo PSD Correction
-
-```c
-const float* gain = anr_get_gain(nr, NULL);
-for (int k = 0; k < n_freqs; k++) {
-    corrected_echo[k].r = ctx.echo_spec[k].r * gain[k];
-    corrected_echo[k].i = ctx.echo_spec[k].i * gain[k];
-}
-/* apply ctx.res_gain[k] (G_res(f)) to nr_out[k] to get the final RES-suppressed output */
+```
+mic/ref ─► AEC ─► SeSpecFrame { e, y, x, r2, cn, g_res_ctx, far_hop, ... }
+                      │
+        gain stages   ├─ se_anr_stage_gain(nr, &f, scratch, use_r2)  → G_nr
+                      ├─ se_res_stage_gain(res, &f)                  → G_res   (4-ch: post-beam AecRes)
+                      │                                                 (mono: the AEC's own, f.g_res_ctx)
+        combination   └─ sk_min_f32 → sk_capply_gain_f32 → aec_cng_fill → ac_istft_push → out
 ```
 
-NR already attenuated certain frequency bins. The echo PSD estimate must
-reflect this, otherwise RES will over-suppress (seeing echo that NR already
-removed). Multiplying by the NR gain corrects for this.
+There is no independent time-domain RES filter after NR and no function-pointer
+table of stages: `G_res` comes with the linear residual, is fused with `G_nr` by
+`sk_min_f32` and applied once to `E(f)`. Which stages exist, in which order, is
+read straight from each application's `process` function
+([`audio_pipeline.c`](mono_aec_nr_res/audio_pipeline.c) `audio_pipeline_process()`,
+[`audio_pipeline_4ch.c`](4ch_aec_bf_nr_res/audio_pipeline_4ch.c) `run_post_stages()`).
+
+| Application | Analysis call | Stages written out | Synthesis |
+|---|---|---|---|
+| Mono AEC + NR/RES | `audio_pipeline_process_spec()` | `se_anr_stage_gain`, `g_res_ctx`, min, apply, `aec_cng_fill` | `audio_pipeline_synthesize()` |
+| 4-ch AEC + BF + NR/RES | `four_aec_front_process()` → SRP/GSC → `four_aec_fuse()` | `se_res_stage_gain`, `se_anr_stage_gain`, min, apply, `aec_cng_fill` | `ac_istft_push()` |
+| Mono / 4-ch Align-ULCNet | `*_process_begin()` | the network (`nn_begin` / `nn_end`) | `*_process_end()` |
+| Mono / 4-ch DFN2 | `mono_aec_dfn_res_process_begin()`, `four_aec_dfn_res_front_process()` + `_process_begin()` | RES gain, min with the unity gain, apply, `aec_cng_fill`, then the DFN2 stage | `*_process_end()` |
+
+### How do I chain a new frequency-domain stage?
+
+Write it as a gain-type function over the frame and put its result into the
+`sk_min_f32` chain. The example below is compiled and run by
+[`tests/test_readme_flow.c`](tests/test_readme_flow.c) (`make test_readme_flow`):
+with a unity stage the chain is bit-identical to `audio_pipeline_process()`.
+
+```c
+typedef struct HfTilt { int bin_hi; float amount; float* g; } HfTilt;   /* g: n_freqs floats, caller memory */
+
+static const float* hf_tilt_gain(HfTilt* s, const SeSpecFrame* f) {
+    for (int k = 0; k < f->n_freqs; ++k) s->g[k] = k > s->bin_hi ? s->amount : 1.0f;
+    return s->g;                     /* valid until the next call, like every gain stage */
+}
+
+int chain_hop(Chain* c, const float* mic, const float* ref, float* out) {
+    SeSpecFrame f;
+    if (audio_pipeline_process_spec(c->p, mic, ref, &f) != 0) return -1;          /* the one analysis */
+    const float* nr_gain = se_anr_stage_gain(audio_pipeline_get_nr(c->p), &f, c->g_nr_scratch, 1);
+    const float* tilt    = hf_tilt_gain(c->tilt, &f);                              /* the new stage */
+    sk_min_f32(c->g_min,   nr_gain,  f.g_res_ctx, f.n_freqs);                      /* min of the gains */
+    sk_min_f32(c->g_total, c->g_min, tilt,        f.n_freqs);
+    sk_capply_gain_f32(c->spec, f.e, c->g_total, f.n_freqs);                       /* S(f) = E(f) . g */
+    aec_cng_fill(&c->rng, c->spec, f.cn, f.g_res_ctx, nr_gain,                     /* comfort noise on the cut bins */
+                 SE_CNG_NR_GAIN_FLOOR, f.n_freqs);
+    return audio_pipeline_synthesize(c->p, c->spec, out);                          /* the one inverse transform */
+}
+```
+
+Rules the chain relies on:
+
+- A disabled gain source reads as the **unity vector** (all ones), so one
+  `sk_min_f32` serves every combination. `sk_min_f32` propagates a non-finite gain
+  to the output gate instead of masking it the way `fminf` would.
+- `aec_cng_fill` is told the AEC's own gain (`g_res`), which alone decides *which*
+  bins are filled, and the denoiser gain (floored at `SE_CNG_NR_GAIN_FLOOR`),
+  which scales the *level*; it advances the caller's `rng` state, so one RNG word
+  per generator, reset to `SE_CNG_RNG_SEED`.
+- A spectrum-type stage (the 4-channel beamformer) is a function that takes the
+  lane spectra and returns a spectrum; it replaces `f.e` in the chain. The
+  4-channel applications feed the GSC spectrum straight into `four_aec_fuse()`.
+- Every pointer in the frame is borrowed from the producer. It is valid until the
+  producer runs again (the next `process_spec` / `four_aec_front_process`, a
+  reset) and is never written through.
+
+### Where do I call the inverse transform?
+
+Once per hop, last: `audio_pipeline_synthesize()` (mono) or `ac_istft_push()`
+(audio_common) on the spectrum that has all gains applied and comfort noise added.
+It performs the inverse FFT, the sqrt-Hann window and the overlap-add, and emits
+exactly one hop; the half-window it holds back is the pipeline's one hop of
+algorithmic latency. The spectrum must sit on the analysis frame of the same hop
+(the AEC's `error_spec` is the exact 50 %-overlap sqrt-Hann STFT); calling it
+twice in a hop, or skipping a hop, breaks the overlap-add. Applications that end in
+a neural stage call it inside `*_process_end()`.
+
+### What memory do I provide?
+
+Static memory only: each object is `get_mem_requirements()` (or
+`<x>_mem_size()`), one caller block that is 16-byte aligned, then `init_ex()`.
+Nothing allocates inside `process`.
+
+```c
+AudioPipelineMemReq req;
+audio_pipeline_get_mem_requirements(&cfg, &req);        /* pool bytes, alignment 16, layout + hash */
+void* pool = board_alloc(req.bytes + my_stage_bytes, 16);
+AudioPipeline* p = audio_pipeline_init_ex(pool, req.bytes, &cfg, &req);
+HfTilt* tilt = hf_tilt_init((uint8_t*)pool + ALIGN16(req.bytes), n_freqs, 8, 0.0f);   /* your stage, after it */
+```
+
+- A stage keeps no state of its own when its functions take the object the
+  application carved (`se_anr_stage_*` take the `AnrDenoiser`, `se_res_stage_gain`
+  the `AecRes`). Gain vectors the chain needs (`g_total`, the NR prior scratch, the
+  spectrum buffer) are `n_freqs` floats / bins each, also from the caller's block.
+- The 4-channel core (`FourAecNrRes`) now owns only the shared aligner, the four
+  lanes and the fuse buffers. The wrappers carve the post-beam stages behind it
+  from their own pool: `four_aec_nr_res_stage_configs()` returns the `AecConfig`
+  for `aec_res_init()` and the `AnrConfig` for `se_anr_stage_init()`.
+- Re-query the descriptor after any library, backend, build-option or config
+  change; `init_ex()` refuses a stale one (8-point gate).
+
+### How do I run the NN stage on the NPU?
+
+The network sits between two calls. The pipeline does everything before (AEC,
+analyses, delay policy) and after (accept or fail open, overlap-add); you run the
+accelerator on the views it hands out. The loop is the same for the four neural
+applications; the examples are compiled by `tests/test_readme_flow.c`.
+
+```c
+/* Align-ULCNet (mono or 4-ch): at most one frame per hop */
+audio_pipeline_ulcnet_process_begin(p, mic, ref);              /* AEC, both analyses              */
+if (audio_pipeline_ulcnet_nn_begin(p, &job) > 0) {             /* job: err/far spectra, NaN-prefilled out_re/out_im */
+    audio_pipeline_ulcnet_nn_end(p, run_ulcnet_npu(&job));     /* 0 = all bins written; else the identity */
+}
+audio_pipeline_ulcnet_process_end(p, out);                     /* WOLA: one hop, zeros at hop 0   */
+
+/* DFN2 (mono or 4-ch): up to two frames per hop through the 8/16 kHz rate bridge */
+mono_aec_dfn_res_process_begin(p, mic, ref);                   /* AEC, RES, P = E.G_res (+ comfort noise) */
+while (mono_aec_dfn_res_nn_begin(p, &job) == 1)                /* job: DFN2PrepostInputs / Outputs */
+    mono_aec_dfn_res_nn_end(p, run_npu(&job));
+mono_aec_dfn_res_process_end(p, out);
+```
+
+Fail-open is part of the contract, not an option: a non-zero result, an output
+with any non-finite value, a frame left open and a frame never fetched all take
+the identity for that frame (ULCNet: the error spectrum passes; DFN2: a unit band
+mask), the framing and the clocks advance exactly once, and the latency never
+changes. `process()` is this same sequence driven by the model callback in the
+config, so a board with no callback and a host with one produce identical bytes.
+The model's `reset` callback (if set) is still called on an alignment boundary and
+by the pipeline's `reset()`, so the board keeps its recurrent state in step.
+
+### How do the 4-channel applications split the hop?
+
+```c
+FourAecFront front;
+four_aec_front_process(core, mics_interleaved, ref, &front);   /* shared aligner + 4 lanes; front.linear_spectra[4] */
+gsc_process_with_weights(gsc, front.linear_spectra, doa, adapt, mask, gsc_spectrum, gsc_weights);   /* external SRP/GSC */
+SeSpecFrame f;
+four_aec_fuse(core, gsc_weights, gsc_spectrum, &f);            /* project near, R^2, comfort noise with those weights */
+/* then the same chain: se_res_stage_gain(res, &f), se_anr_stage_gain(nr, &f, ...), sk_min_f32, ... */
+```
+
+`four_aec_fuse()` needs a front frame processed since the last reset (otherwise
+`FOUR_AEC_NR_RES_SEQUENCE_ERROR`), refuses an all-zero or non-finite weight set
+and resets the core on a lane disagreement. The front view lives until the next
+`four_aec_front_process()` or `four_aec_nr_res_reset()`; there is no token to
+return. The Align-ULCNet application never fuses: it takes the GSC spectrum as
+its error frame directly.
+
+### What is in the frame?
+
+| Field | Meaning | Mono | 4-ch |
+|---|---|---|---|
+| `e` | linear-AEC error E(f) | AEC error | beamformed error |
+| `y`, `x` | matching capture / far spectra | AEC | projected near / lane 0 far |
+| `r2`, `cn` | residual-echo and comfort-noise PSD (int16²) | AEC | projected |
+| `g_res_ctx` | the AEC's own residual gain | `G_res` | NULL (the lanes compute none) |
+| `far_hop`, `formed_hop` | aligned far, time-domain hop under `e` | AEC | aligned far / NULL |
+| `max_dt`, `max_sat`, `all_converged`, `clock_drift` | control scalars | AEC | worst contributing lane |
+| `delay_changed`, `delay_locked` | alignment generation flags | AEC | shared aligner |
 
 ## NR OLA Delay
 

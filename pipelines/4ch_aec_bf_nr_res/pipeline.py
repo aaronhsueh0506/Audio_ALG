@@ -954,7 +954,7 @@ class FourChannelAecPipeline:
             # lanes were served BEFORE this hop's decision (0 until the
             # estimate first turns solid), so the delta is exactly the movement
             # they have to absorb.  Same call, same delta and same per-lane
-            # sweep as the C core's process_pre (4aec_nr_res.c).
+            # sweep as the C core's four_aec_front_process (4aec_nr_res.c).
             delta = int(delay.delay_samples) - int(self._last_delay)
             for lane in self._lanes:
                 outcome = lane.apply_external_realign(delta)

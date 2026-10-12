@@ -9,11 +9,12 @@ and the synthesis WOLA. It does so by *hosting* the conventional pipeline
 spectrum and the host's synthesis:
 
 ```text
-mic/ref -> audio_pipeline_process_post_view()
+mic/ref -> mono_aec_dfn_res_process_begin()
              E = linear-AEC error spectrum        -> DFN2 feature input
              P = E * G_res + comfort noise        -> DFN2 applied here
-           dfn_res_stage_process(E, P)            -> enhanced P, frame t-2
-           audio_pipeline_synthesize_external()   -> sqrt-Hann iFFT / OLA
+         -> while (nn_begin(&job) > 0) { run the model on the job; nn_end(rc) }
+         -> mono_aec_dfn_res_process_end(out)     -> enhanced P, frame t-2,
+                                                     sqrt-Hann iFFT / OLA
 ```
 
 The network estimates from the pre-RES spectrum because it was trained on

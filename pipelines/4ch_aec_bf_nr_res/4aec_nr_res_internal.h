@@ -54,7 +54,7 @@ int four_aec_nr_res_admission_offer(
  *
  * Exposed for the same reason the admission machine is: the rejecting half
  * is unreachable from a stream. This file's own lanes always share one far
- * spectrum by construction, so a test driving process_pre()/process_post()
+ * spectrum by construction, so a test driving four_aec_front_process()/four_aec_fuse()
  * can only ever exercise the accepting branch -- the divergent case, which
  * is what the rejection exists for, has to be handed to the predicate
  * directly.
@@ -64,14 +64,14 @@ int four_aec_nr_res_admission_offer(
  * far-end spectrum and the fuse must reject the frame.
  *
  * shared_far_provenance is the per-hop evidence that the four lanes consumed
- * ONE spectrum (see four_aec_nr_res_process_pre()); with it the answer is
+ * ONE spectrum (see four_aec_front_process()); with it the answer is
  * immediate, without it every bin is compared. */
 int four_aec_nr_res_far_spec_agrees(int shared_far_provenance,
                                     const Complex* lane_far_spec,
                                     const Complex* reference_far_spec,
                                     int n_freqs);
 
-/* The provenance the LAST accepted process_pre() established, so a test can
+/* The provenance the LAST accepted four_aec_front_process() established, so a test can
  * assert that the cheap path is the one production actually takes (and that
  * a bailed-out hop leaves the expensive one). Read-only. */
 int four_aec_nr_res_far_spec_provenance(const FourAecNrRes* p);

@@ -4,23 +4,28 @@ This wrapper replaces the post-beam MMSE-LSA denoiser of the four-channel
 core (`4ch_aec_bf_nr_res/4aec_nr_res.h`) with DeepFilterNet2 while keeping
 the shared delay estimator, the four linear AEC lanes, the external BF/GSC
 seam, the post-beam AEC3 residual suppressor, the comfort-noise recipe and
-the synthesis WOLA. The core is hosted with `enable_post=1`, `enable_res=1`,
-`enable_nr=0`, and the network is inserted between the core's post-RES
-spectrum and the core's synthesis:
+the synthesis WOLA. The front end is configured with `enable_post=1`,
+`enable_res=1`, `enable_nr=0`; this application chains its own RES and
+synthesis and inserts the network between the post-RES spectrum and the
+synthesis:
 
 ```text
-mics/ref -> four_aec_dfn_res_process_pre()         four lanes, token
+mics/ref -> four_aec_dfn_res_front_process()         four lanes, front view
             (external BF/GSC -> effective weights, optional trusted spectrum)
-         -> four_aec_nr_res_process_post_view()
+         -> four_aec_dfn_res_process_begin(weights, error)
               E = beamformed error spectrum         -> DFN2 feature input
               P = E * G_res + comfort noise         -> DFN2 applied here
-            dfn_res_stage_process(E, P)             -> enhanced P, frame t-2
-            four_aec_nr_res_synthesize_external()   -> the core's iFFT / OLA
+         -> while (nn_begin(&job) > 0) { run the model on the job; nn_end(rc) }
+         -> four_aec_dfn_res_process_end(out)       -> enhanced P, frame t-2,
+                                                       this app's iFFT / OLA
 ```
 
-The pre/post token contract and the external beamformer seam are the same as
-`FourAecNrRes`: `process_post()` reconstructs the beamformed error from the
-weights, `process_post_trusted_spectrum()` takes the GSC's own spectrum. The
+The external beamformer seam is the same as `FourAecNrRes`'s: `process_begin()`
+reconstructs the beamformed error from the weights, or takes the GSC's own
+spectrum when one is passed (`four_aec_fuse()`). `four_aec_dfn_res_process()`
+is the sequence of the four calls with `dfn_res_stage_infer()` as the model
+runner. This application owns its RES, gain scratch, comfort-noise state and
+ISTFT: the front end carries none of them. The
 network estimates from the beamformed error and is applied to the post-RES
 spectrum. The core's comfort-noise fill is kept as a switch but is OFF by
 default in this variant: with it on, the additive fill perturbs P's phase in

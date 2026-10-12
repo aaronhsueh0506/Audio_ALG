@@ -3,8 +3,8 @@
  *
  * This is the deployable orchestrator around 4aec_nr_res.c:
  *
- *   4AEC process_pre -> SRP-PHAT DOA -> GSC effective weights
- *                    -> 4AEC process_post -> mono NR/RES
+ *   four_aec_front_process -> SRP-PHAT DOA -> GSC effective weights
+ *   -> four_aec_fuse -> RES/NR gains -> CNG -> ISTFT
  *
  * It follows the same pool-first layout and lifecycle as 4aec_nr_res.c
  * (descriptor-tier: get_mem_requirements()/init_ex() compose the core's own
@@ -105,7 +105,7 @@ static int validate_config(const AudioPipeline4ChConfig* cfg) {
     if (!cfg) return 0;
     if (cfg->core.sample_rate != 16000 &&
         cfg->core.sample_rate != 48000) return 0;
-    /* The standard wrapper always resumes process_post(). Pre-only is a
+    /* The standard wrapper always runs four_aec_fuse(). Front-only is a
      * direct-core/internal ULCNet profile, not a valid standard-wrapper cfg. */
     if (cfg->core.enable_post != 1) return 0;
     nyquist = 0.5f * (float)cfg->core.sample_rate;
@@ -904,7 +904,7 @@ int audio_pipeline_4ch_process(
      * through unnoticed here and still reaches auto_vad() below -- on
      * perfectly finite mic data, auto_vad() runs its normal (state-
      * mutating) path and only the deeper finite check inside
-     * four_aec_nr_res_process_pre() ever notices far_reference was bad,
+     * four_aec_front_process() ever notices far_reference was bad,
      * by which point noise_power/vad_hangover have already moved. Reject
      * before that call, not just via a NULL check, so this invalid call
      * touches no VAD state at all -- same contract as the mic-NaN case. */

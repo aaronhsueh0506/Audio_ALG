@@ -213,7 +213,7 @@ struct FourAecNrRes {
 
     /* This hop's answer to "did all four lanes consume ONE far spectrum",
      * established from the lanes' own far-FFT counters in
-     * four_aec_nr_res_process_pre() and consumed by fuse_contexts() through
+     * four_aec_front_process() and consumed by fuse_contexts() through
      * four_aec_nr_res_far_spec_agrees(). 0 (the value every bail-out path
      * leaves behind) means "not established", which costs the full per-bin
      * comparison rather than skipping it. */
@@ -316,7 +316,7 @@ static int derive_dims_and_configs(
     rules.fixed_fft = 0;
     rules.check_delay = 1;
     rules.lane_aligned = 1;
-    /* A pre-only core has no post stage, so nothing reads a lane's R^2 or
+    /* A front-only core has no post stage, so nothing reads a lane's R^2 or
      * comfort noise: its lanes keep only the linear half of the context. With
      * a post stage the lanes' own G_res is still never read (the gain is
      * computed once from fused multi-lane data), so it is skipped too. */
@@ -1212,7 +1212,7 @@ int four_aec_front_process(
      * reports zero for the stages it never reached rather than the previous
      * hop's numbers. The three AEC-side fields are ACCUMULATED over the four
      * lanes below, so this is also what makes each hop start from zero. The
-     * post half is cleared the same way in process_post_impl(). */
+     * post half is cleared the same way in four_aec_fuse(). */
     p->last_timing.delay_us = 0;
     p->last_timing.frontend_us = 0;
     p->last_timing.linear_us = 0;
@@ -1425,7 +1425,7 @@ static int fuse_contexts(FourAecNrRes* p,
     /* Seeded neutral rather than from lane 0, so lane 0 is subject to the
      * same contributes-to-the-output test as every other lane below. Both
      * quantities are non-negative, so 0 is the identity for the max. At
-     * least one lane always survives that test: process_post*() rejects
+     * least one lane always survives that test: four_aec_fuse() rejects
      * all-zero weights before reaching here. */
     *max_dt = 0.0f;
     *max_saturation = 0.0f;

@@ -927,7 +927,7 @@ cleanup:
  * output checks and the byte-equal WAV/raw-f32 gates run outside this
  * suite).
  *
- * "At most 1", not "exactly 1": process_pre() resets all four lanes
+ * "At most 1", not "exactly 1": four_aec_front_process() resets all four lanes
  * (aec_reset(), which also zeroes this counter) whenever the shared delay
  * estimator's estimate changes -- expected, unrelated pre-existing
  * behavior during the synthetic signal's initial delay-acquisition hops,
@@ -1899,7 +1899,7 @@ static int feed_strength_hops(FourAecNrRes* p, int hops,
     float* far = (float*)calloc((size_t)hop, sizeof(float));
     float* out = (float*)calloc((size_t)hop, sizeof(float));
     /* Channel-major Complex[4][n_freqs] -- the weights contract in
-     * 4aec_nr_res.h. Sizing this as [n_freqs] would have process_post() read
+     * 4aec_nr_res.h. Sizing this as [n_freqs] would have four_aec_fuse() read
      * three channels past the end. */
     Complex* w = (Complex*)calloc(
         (size_t)FOUR_AEC_NR_RES_CHANNELS * (size_t)n, sizeof(Complex));
@@ -2726,7 +2726,7 @@ static void test_far_spec_provenance_guard(void) {
     /* MUTATION, asserted rather than described: the provenance flag is what
      * licenses skipping the comparison, so a flag that says "shared" when the
      * lanes are not lets exactly this frame through. That is why nothing sets
-     * it except the counter evidence in process_pre(), and why every bail-out
+     * it except the counter evidence in four_aec_front_process(), and why every bail-out
      * path leaves it 0. Make four_aec_nr_res_far_spec_agrees() ignore its
      * first argument and the row above goes red. */
     CHECK(four_aec_nr_res_far_spec_agrees(1, lane, reference, FS_N) == 1,

@@ -327,7 +327,7 @@ static int test_rejected_calls_preserve_vad_state(void) {
      * microphones_interleaved is), so on perfectly finite mic data a
      * non-finite far used to sail through auto_vad()'s own guard entirely
      * and only get caught by the deeper finite check inside
-     * four_aec_nr_res_process_pre() -- by which point auto_vad() had
+     * four_aec_front_process() -- by which point auto_vad() had
      * already mutated noise_power/vad_hangover from real, finite mic
      * energy. Both NaN and Inf are exercised since they're rejected by
      * different mechanisms downstream (isfinite() catches both, but this
