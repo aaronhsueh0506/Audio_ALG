@@ -30,7 +30,7 @@ each 50%-overlap frame spans two hops. The constant is derived and asserted
 by the straddle-derivation test, not estimated; option B (keep stepping
 through those frames) is deferred pending an audio A/B.
 
-## Signal path and timing (direct path, 2026-09-03)
+## Signal path and timing (direct path)
 
 The GSC's beamformed linear-error SPECTRUM is handed to the model directly:
 it is already the sqrt-Hann, 50%-overlap, one-frame-per-hop analysis frame

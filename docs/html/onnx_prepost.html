@@ -141,7 +141,7 @@ framing／CCM ring 不前進、幀維持開啟、回 −1
 
 <p><b>遞迴 state：Align-ULCNet、DeepVQE-S、DFN2、GTCRN 就地綁定，沒有複製路徑</b>。每個 state 張量在 caller pool 裡只有一個 buffer、位址在實例壽命內不變，
 沒有交替的 bank、沒有指標交換。runtime 把每個 <code>*_out</code> 綁到 <code>frame_inputs()</code> 回傳的同名輸入位址，
-<b>先讀完</b>所有 state 輸入、<b>才寫</b>輸出（做不到的 runtime 要自己用暫存區暫存讀取）；板端已確認 NPU 以這個順序工作。
+<b>先讀完</b>所有 state 輸入、<b>才寫</b>輸出（做不到的 runtime 要自己用暫存區暫存讀取）；維護者的板端驗證確認 NPU 以這個順序工作。
 graph 回每個 state 的<b>完整下一個 window</b>，shape 與輸入完全相同：位移在 graph 內，用輸入端的 Slice 切掉一幀、
 再把新一幀 Concat 上去（time-ordered window 取 frame <code>1..N−1</code> 再接在後面；newest-first 的 K/V 與 attention ring 取 slot <code>0..D−2</code> 再接在前面），
 Concat 的結果就是輸出，沒有 state 輸出由 Slice 產生；被丟掉的那一格只讓輸入與輸出 shape 相同。

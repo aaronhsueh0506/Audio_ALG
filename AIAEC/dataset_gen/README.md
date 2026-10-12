@@ -771,8 +771,7 @@ stability claim would otherwise pass vacuously on a single-interpreter machine.
 It is a hash rather than a hand-maintained `behavior_version` on purpose: every
 other compared field is either a `__post_init__` literal or echoed out of the
 recorded contract by both call sites, so a version integer would be the same
-constant on both sides and could never differ. That tautology shipped once
-(2026-08-06) and `test_contract_comparison_is_not_vacuous` now guards it.
+constant on both sides and could never differ. `test_contract_comparison_is_not_vacuous` guards against that tautology.
 
 Scope: `aec_behavior_hash` covers `aec.py` plus everything under `modules/` —
 the code `LinearAecProcessor` can actually reach. `diag/`, `tests/` and the
@@ -901,7 +900,7 @@ channel with the command below, which avoids repeating acoustic mixing:
 
 #### The one exception: verified frontend-equivalent migrations
 
-> **⚠ The table is empty (2026-09-04).** The pair that carried the 200-hour
+> **⚠ The table is empty.** The pair that carried the 200-hour
 > corpus forward (the fresh-instance `aec_reset()` composed with the 48-kHz
 > FilterAnalyzer correction, 16 kHz only) was retired when lib/aec retimed
 > the shadow-copy error-baseline retention per grid (0.995 → 0.992 on this

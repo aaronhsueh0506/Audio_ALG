@@ -109,7 +109,7 @@ calibration 資料（state 輸入 shape 變了）與量化結果須重做、加�
 再把新一幀 Concat 在<b>前面</b>；logit 取輸入的 frame <code>1..4</code>（start 1、end 5）再把新的一列 Concat 在<b>後面</b>。
 Concat 的結果同時是 attention 的候選與 <code>*_out</code>，沒有任何 state 輸出由 Slice 產生；被丟掉的那一格
 （K/V 的 slot D−1、logit 的 frame 0）只用來讓輸入與輸出 shape 相同，graph 不讀它。</p>
-<p>因此 runtime 可以把每個 <code>*_out</code> 綁到同名輸入的位址（板端已確認 NPU 先讀完全部輸入才寫輸出），
+<p>因此 runtime 可以把每個 <code>*_out</code> 綁到同名輸入的位址（維護者的板端驗證確認 NPU 先讀完全部輸入才寫輸出），
 CPU 不搬、不複製。<code>export_graph</code> 對寫出的檔案呼叫 <code>validate_inplace_state_contract</code>
 （<code>AIAEC/_onnx_contract.py</code>）：每對 state 的 shape 相同且 rank 為 4、每個 window 輸入恰有一個 Slice 消費者
 （axis 2、step 1、end 為窗內整數、保留 N−1 幀）、沒有 state 輸出由 Slice 產生，metadata 帶
@@ -193,9 +193,9 @@ framing 照常前進（stream 0 已是 linear-AEC error，放行安全；DeepVQE
 <code>test_ulcnet_prepost_c.py</code> 的 <code>equiv</code> 案例逐 hop memcmp 釘住這件事
 （400 hop，真的跑 0/2/1 排程），所以是<b>實測</b>；hop 0 的 centered 排程 0 幀，兩者<b>自第二個
 hop 起</b>對得起來。<b>同一個 state 上不可混用兩個 push 函式</b>（共用歷史、不共用排程）。
-centered push <b>仍在</b> <code>ulcnet_process.c</code>，但自 2026-09-03 起<b>不再有出貨
+centered push <b>仍在</b> <code>ulcnet_process.c</code>，但<b>沒有出貨
 pipeline 呼叫它</b>：mono wrapper
-（<code>audio_pipeline_ulcnet.c:513-514</code>）已改走 <code>_push_frame()</code>，與 4ch 的
+（<code>audio_pipeline_ulcnet.c:513-514</code>）走 <code>_push_frame()</code>，與 4ch 的
 far 分支同排程；只剩上述 parity 測試還在用 centered <code>_push()</code> 當比對基準。</p>
 <p><b>adapter 改為驅動類別</b>：<code>ulcnet_accelerator_adapter.c</code> 不再自己接 per-frame
 transaction，而是開一個 <code>ULCNET_IO_FREQ</code> 實例（不 carve framing state、完全不牽涉
@@ -320,7 +320,7 @@ Python reference 仍是兩個 <code>(2, 1, 128)</code> 的 nn.GRU hidden，測�
 實測 stream-vs-offline 最差差異：enhanced 4.1e-8 / mask 1.2e-7 / magnitude_mask 6.0e-8 /
 delay 4.0e-7（test 檔頭記載；tolerances 以 ~10x headroom 釘在 5e-7 / 2e-6 / 1e-6 / 5e-6）。</li>
 <li>Framing：類別與 AEC/GSC seam 用 <b>center=False、每 hop 一幀</b>的 rolling 分析；centered
-push 自 2026-09-03 起只剩 Python parity gate 使用（mono wrapper 已改用同一套排程）。端到端
+push 只剩 Python parity gate 使用（mono wrapper 用同一套排程）。端到端
 演算法延遲仍是 <b>HOP samples</b>＝16 kHz 256 smp（16 ms）、48 kHz 512 smp（10.67 ms），但它來自
 <b>synthesis 的半窗 trim</b>、不是分析排程（<code>ulcnet_prepost.h</code> 明文）。</li>
 <li>C 前後處理 vs Python：float-ULP 級（實測 ~2e-5 絕對值，KISS f32 FFT vs torch

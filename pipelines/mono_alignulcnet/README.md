@@ -25,8 +25,7 @@ The model state is reset when the AEC delay regime changes, including FIXED
 mode's first usable error. The C-side STFT keeps running across it, so the
 frames still straddling the error change emit identity WITHOUT stepping the model:
 `AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES` = 1 frame here (both branches are
-pushed from the current hop), the same as the 4ch wrapper, which since
-2026-09-03 also frames both branches from the current hop. The constant is
+pushed from the current hop), the same as the 4ch wrapper, which also frames both branches from the current hop. The constant is
 derived and asserted by the straddle-derivation test, not estimated; option B
 (keep stepping through those frames) is deferred pending an audio A/B.
 

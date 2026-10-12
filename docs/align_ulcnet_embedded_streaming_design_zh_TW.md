@@ -73,7 +73,7 @@ output；論文展示頁提供的 KF residual 只作研究診斷，不是產品 
 
 `REPRIME_FRAMES` 由測試量出，但**只有 far 一路是推導**：脈衝標記在 far 路
 未經濾波抵達 analysis，量到的鏈記憶就是窗跨界本身，兩個 grid 都精確等於常數
-（mono 1、4ch 1；4ch 由 2 改為 1 的原因見 §8 的 2026-09-03 更新）。
+（mono 1、4ch 1；4ch 的原因見 §7 的 latency contract 與 §8 的 direct path）。
 **error 一路不是**：標記先過 AEC 線性濾波器，量到的是
 跨界**加上**濾波器因果尾音，所以只能給上界。尾音長度隨 grid 變（16 kHz 的
 `filter_length` 是 52 ms = 3.25 hops，48 kHz 是 64 ms = 6.00 hops），這就是
@@ -152,7 +152,7 @@ C 端用 `make ULCNET_GRID=16k|48k` 選 grid（底層就是那兩個 `-D`），�
 
 第一版應保留這套既有策略，先量測後再決定是否改 duty cycle。
 
-已查證的三個注意事項（2026-08-13 逐行對照 C 實作）：
+已逐行對照 C 實作查證的三個注意事項：
 
 1. **grid 不是預設**：16 kHz 的 library 預設是 fft/hop = `256/128`（8 ms，
    `aec.c:44-46`）；本文件要求的 `512/512/256` 是合法可選 grid
@@ -558,10 +558,10 @@ samples lookahead/time origin 與末尾 flush。若產品改採純 past-only fra
 屬於 feature-time contract 變更，必須做 checkpoint A/B，不能只以「同樣是
 512/256」視為等價。
 
-**決策（2026-08-13）**：第一版重現 center=True timing；past-only 留待量測
+**決策**：第一版重現 center=True timing；past-only 留待量測
 完成後另行 A/B。
 
-**釐清（2026-08-13 稍晚，推導+實作驗證）**：在本 grid（win=n_fft、
+**釐清（推導+實作驗證）**：在本 grid（win=n_fft、
 hop=win/2、同一 sqrt-Hann 窗）下，centered 第 k 幀與 non-centered 第
 k-1 幀覆蓋**完全相同的樣本**（逐 bit 同頻譜）——兩種 framing 的穩態特徵
 相同、且 STFT→NN→ISTFT 鏈的穩態 I/O 延遲都是同一個 1 hop（16 ms，WOLA
@@ -569,17 +569,17 @@ k-1 幀覆蓋**完全相同的樣本**（逐 bit 同頻譜）——兩種 framin
 `ulcnet_process.c` 與 dfn2 的 center=False 串流輸出排程逐 hop 相同可佐
 證）。所以 center 是**邊界與編號慣例**：真實差異只有 (a) 串流開頭第一幀
 （reflect 前綴 vs 冷啟動）造成的 recurrent-state start transient、(b) 檔
-案級評測的幀數/邊界、(c) 幀時間戳語意。維持 center=True 的理由據此修正
-為：**改 past-only 拿不到任何延遲收益，卻要重寫全部 parity 測試的幀對齊
-簿記**——不是原先寫的「板端支付 16 ms 換 parity」（那 16 ms 兩種 framing
-都要付，是鏈路下限）。要真正壓延遲屬重訓等級手段（非對稱窗、縮 hop）。
+案級評測的幀數/邊界、(c) 幀時間戳語意。維持 center=True 的理由是：
+**改 past-only 拿不到任何延遲收益，卻要重寫全部 parity 測試的幀對齊
+簿記**；板端支付的 16 ms 不是拿來換 parity——那 16 ms 兩種 framing
+都要付，是鏈路下限。要真正壓延遲屬重訓等級手段（非對稱窗、縮 hop）。
 
-**2026-09-03 更新（4ch 的實際 latency contract）**：4ch Align-ULCNet pipeline
+**4ch 的 latency contract**：4ch Align-ULCNet pipeline
 的「加總後額外演算法延遲」是 **1 hop**（16 kHz 256 samples = 16 ms、48 kHz
-512 samples = 10.67 ms），與 mono wrapper 相同，而不是曾經的 2 hop。GSC 產出的
+512 samples = 10.67 ms），與 mono wrapper 相同。GSC 產出的
 beamformed error **頻譜**直接餵給模型（它已經是本 hop 的 sqrt-Hann 50%-overlap
-單幀），中間不再插入 beam WOLA→再 analysis 的來回，far 路也不再需要配一個
-one-hop 補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WOLA。
+單幀），中間沒有 beam WOLA→再 analysis 的來回，far 路也沒有 one-hop
+補償 buffer；唯一的延遲來源就是本節的 ULCNet synthesis WOLA。
 `process()` 只有 hop #0 輸出零，之後 hop p 的輸出是 input hop p-1 的
 beamformed error；實測 far 脈衝落在 `far[2085]` 時輸出峰值在 `out[2341]`
 （＝脈衝 + 256，偏差 0）。每個 hop 從 hop #0 起都恰好一次 inference。
@@ -625,21 +625,21 @@ stateDiagram-v2
 以上 policy 必須與 AEC 現有 first-acquisition、pending delay、soft/hard
 recovery 語意整合，避免同一個 delay event在 AEC 與 NN 被重複 reset。
 
-現況注記（2026-08-13 更新）：`delay_state` 與 `generation` 已在 AEC
+現況注記：`delay_state` 與 `generation` 已在 AEC
 standalone 實作（見 5.1 節實作狀態）；out-of-range 偵測仍不存在（超出
 約 509 ms 可靠搜尋上界時狀態停在 UNLOCKED，與冷啟動不可區分）。第一版
 reset/fail-open 已落在兩個 pipeline 變體
 （`pipelines/mono_alignulcnet/audio_pipeline_ulcnet` 與
-`pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet`），且**兩個變體現在行為一致**：
+`pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet`），且**兩個變體行為一致**：
 UNLOCKED→模型照步進並套用成功輸出（seam 此時為 raw far）；CHANGED 或
 FIXED 首次 UNLOCKED→LOCKED→`model->reset`；infer 失敗或輸出含非有限值
 （NaN/Inf）→該 frame 走
 identity，永不進 WOLA；HOLD/REACQUIRE 細分與 crossfade 仍待做。4ch 側的
 先例實作在 `4aec_nr_res.c:778-794, 901-914`。
 
-2026-08-17 更新（identity reprime，option A）：邊界的 `model->reset` 之後，
+identity reprime（option A）：邊界的 `model->reset` 之後，
 C 側 STFT 狀態仍連續，緊接著發射的幀其 512 樣本分析窗**跨在邊界上**（一半
-是切換前推入的 hop）。這一版對那些幀改走 identity 且**完全不呼叫 infer**
+是切換前推入的 hop）。這一版對那些幀走 identity 且**完全不呼叫 infer**
 （K/V、logit、GRU 都不前進），等 err 與 far 兩路窗都只含切換後的 hop 才
 同時恢復 step 與 apply：mono `AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES=1`、
 4ch `AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES=1`。兩個常數由各自 test suite 的
@@ -647,27 +647,19 @@ C 側 STFT 狀態仍連續，緊接著發射的幀其 512 樣本分析窗**跨�
 斷言，不是寫死的估計值。option B（邊界後照常 step、只是輸出仍套用）暫緩，
 需先做音檔 A/B；crossfade 仍是更後面的 phase。
 
-**2026-09-03 更新（4ch 走 direct path，本節上面那段的 4ch 數字已隨之改寫）**：
-4ch 常數原本是 2，理由是「兩路都比輸入慢一 hop：beam WOLA 一 hop ＋ 對應的
-far 一 hop 補償」。那條 round trip 已經移除——GSC 的 beamformed error
-**頻譜**直接當成模型的 error frame（它本來就是本 hop 的 sqrt-Hann 50%-overlap
-單幀），far 路改用同一個 hop 的 `ulcnet_analysis_push_frame()`，中間不再有
-beam WOLA、不再有 error 路的二次 analysis，也不再有 one-hop far buffer。
-兩路因此都從**當前** input hop 成幀，跨界幀只剩邊界 hop 那一幀，常數變成 1，
-與 mono 同值；`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION` 同時由 16 推到 17。
-邊界處理也簡化為「只做 `model->reset` ＋ arm reprime」，不再清任何 buffer
-（C 側成幀狀態一路連續）。
+**4ch direct path**：4ch 的 reprime 常數是 1，與 mono 同值。GSC 的
+beamformed error **頻譜**直接當成模型的 error frame（它本來就是本 hop 的
+sqrt-Hann 50%-overlap 單幀），far 路用同一個 hop 的
+`ulcnet_analysis_push_frame()`，中間沒有 beam WOLA、沒有 error 路的二次
+analysis，也沒有 one-hop far buffer。兩路因此都從**當前** input hop 成幀，
+跨界幀只剩邊界 hop 那一幀。邊界處理只做 `model->reset` ＋ arm reprime，
+不清任何 buffer（C 側成幀狀態一路連續）。
 
-**2026-09-03 追加更新（mono 也走 rolling push，上面「mono wrapper 不受影響」已過時）**：
-mono wrapper 的兩路 analysis 同一天稍後也從 centered `ulcnet_analysis_push()`
-（0/2/1 幀發射）改用 rolling center=False `ulcnet_analysis_push_frame()`（自
-hop#0 起每 hop 恰一幀、每 hop 至多一次推論）。這不是像 4ch 那樣移除一段
-round trip——mono 兩路本來就同 hop 推入、無 wrapper 端 far 補償——純粹是把
-排程換成與 AEC/GSC seam 一致的每 hop 一幀。`AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES`
-仍是 1（含義從「每發射幀遞減」變成「每 hop 遞減」，因為兩者現在相等），
-1 hop 端到端延遲不變（來源從「centered 分析半窗 lookahead」正名為
-「synthesis 半窗 trim」），幀 scratch 由 2 幀縮為 1 幀，
-`AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION` 由 11 推到 12。
+**mono 的 rolling push**：mono wrapper 的兩路 analysis 用 rolling
+center=False `ulcnet_analysis_push_frame()`（自 hop#0 起每 hop 恰一幀、
+每 hop 至多一次推論），排程與 AEC/GSC seam 一致。
+`AUDIO_PIPELINE_ULCNET_REPRIME_FRAMES` 是 1（每 hop 遞減，與每發射幀
+遞減相等），1 hop 端到端延遲來自 synthesis 半窗 trim，幀 scratch 為 1 幀。
 
 兩個變體的 production far branch 固定讀 AEC aligned-far seam，沒有 runtime
 mode。checkpoint 的 raw-far 欄位僅作 training provenance；export descriptor
@@ -785,7 +777,7 @@ flowchart LR
 `ulcnet_analysis_push_frame()`（mono wrapper、4ch direct path、pre/post
 class 的 TIME 模式全走這個）從第一次推入起就固定一幀一次 inference，沒有
 priming 例外。centered `ulcnet_analysis_push()`（0/2/1 幀發射，priming 期間的
-第二次 push 會連續產生兩幀）自 2026-09-03 起不再有出貨 pipeline 呼叫，只剩
+第二次 push 會連續產生兩幀）沒有出貨 pipeline 呼叫，只剩
 Python parity gate 使用。model graph 不收 PCM、不包 STFT/WOLA、不包 PBFDKF
 或 delay state machine。
 
@@ -851,7 +843,7 @@ Concat 的結果同時是 attention 的候選與 `*_out`，沒有任何 state �
   `h_gru` 在 caller pool 內各一份、位址在實例壽命內固定
   （`ulcnet_model_io_prepare()` 把 `outputs->*_out` 指到同一個 pool 位置）。runtime
   把每個 `*_out` 綁到同名輸入的位址，必須先讀完**所有** state 輸入、才寫任何 state
-  輸出（板端已確認 NPU 以這個順序工作）。沒有複製路徑，也沒有 ping-pong；CPU 端沒有
+  輸出（維護者的板端驗證確認 NPU 以這個順序工作）。沒有複製路徑，也沒有 ping-pong；CPU 端沒有
   ring helper。
 - **layout**：`ULCNET_MODEL_IO_LAYOUT_VERSION` = 18，`ULCNET_PREPOST_CARVE_VERSION`
   = 5；3–17 退役，下一次真正 bump 要到 19。
@@ -889,20 +881,20 @@ key_history_out      = K candidates at t                D 幀，是下一個 hop
 stream start/pipeline reset 必須清空所有 state。`delay_state=CHANGED`
 至少清空 K/V ring 與 logit history；第一版為降低風險，連兩組 GRU
 hidden 一起清空，之後才 A/B 「只清 TA」。清空後仍跨在邊界上的分析幀由
-pipeline 端的 identity reprime 擋掉（不 step 模型），見 5.x 的
-2026-08-17 更新。
+pipeline 端的 identity reprime 擋掉（不 step 模型），見 §8 的
+identity reprime。
 
 ### 10.3 C 交付邊界
 
 本專案交付：
 
 - `ulcnet_process.c/.h`：sqrt-Hann STFT/WOLA 與 RI frame。兩種 analysis
-  推入方式：`ulcnet_analysis_push()`（centered、0/2/1 出幀排程，2026-09-03
-  起不再有出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
-  `ulcnet_analysis_push_frame()`（2026-09-03 新增；center=False、每次推入
+  推入方式：`ulcnet_analysis_push()`（centered、0/2/1 出幀排程，沒有
+  出貨 pipeline 呼叫，只剩 Python parity gate 使用）與
+  `ulcnet_analysis_push_frame()`（center=False、每次推入
   固定出一幀，與同一 hop 的 centered 最後一幀逐 bit 相同；mono wrapper 兩路、
-  4ch direct path 的 far 路，以及兩個 AIAEC pre/post class 的 TIME 模式都在用，
-  mono 是同一天稍後跟進的）。同一個 state 不可混用兩種推入函式。
+  4ch direct path 的 far 路，以及兩個 AIAEC pre/post class 的 TIME 模式都在用）。
+  同一個 state 不可混用兩種推入函式。
 - model-I/O/state `c/.h`：caller-owned memory requirement/init/reset、四個
   state tensor 的保存、commit（驗證 state、壓縮域 error × mask、逆冪；不更新 state）、
   state generation、descriptor/layout validation。沒有 CPU ring update，也沒有複製路徑。
@@ -1070,7 +1062,7 @@ v5 起由 `ulcnet_model_io_prepare()`/`ulcnet_model_io_commit()` 以 host fp32
 
 未回答第 1、3、6、8、9 點前，不應把 `aligned+D8` 宣告為 release-ready。
 
-2026-08-13 查證後的回答：
+查證後的回答：
 
 1. **Q1 = yes，帶三個例外**。四個 process entry point 全部收斂到同一個
    core，`far_hop` 都會被填好；例外：(a) `enable_delay_est=0` 時 far_hop
