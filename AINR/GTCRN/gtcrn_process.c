@@ -195,7 +195,23 @@ void gtcrn_model_output(const float mask_erb[GTCRN_MODEL_ERB_BANDS][2],
 
 void gtcrn_model_state_init(GTCRNModelState* state)
 {
-    if (state != NULL) memset(state, 0, sizeof(*state));
+    if (state == NULL) return;
+    memset(state, 0, sizeof(*state));
+    state->state_generation = 1u;
+}
+
+void gtcrn_model_state_reset(GTCRNModelState* state)
+{
+    unsigned int generation;
+    if (state == NULL) return;
+    generation = state->state_generation + 1u;
+    memset(state, 0, sizeof(*state));
+    state->state_generation = generation;
+}
+
+unsigned int gtcrn_model_state_generation(const GTCRNModelState* state)
+{
+    return state == NULL ? 0u : state->state_generation;
 }
 
 static int all_finite(const float* values, size_t count)
@@ -203,11 +219,11 @@ static int all_finite(const float* values, size_t count)
     return skn_all_finite_f32(values, count);
 }
 
-#define GTCRN_MODEL_STATE_TENSORS \
-    (GTCRN_MODEL_CONV_STATES + GTCRN_MODEL_TRA_GRUS + GTCRN_MODEL_DPGRNN_GRUS)
+#define GTCRN_MODEL_STATE_TENSORS (GTCRN_MODEL_CONV_STATES + 2)
 
-/* The sixteen state tensors in graph order (conv, h_tra, h_dpgrnn) with their
- * element counts; together they tile the struct. */
+/* The eight state tensors in graph order (six conv windows, h_tra,
+ * h_dpgrnn) with their element counts; together they tile the struct up to
+ * state_generation. */
 static void state_tensors(GTCRNModelState* state,
                           float* base[GTCRN_MODEL_STATE_TENSORS],
                           size_t count[GTCRN_MODEL_STATE_TENSORS])
@@ -225,14 +241,10 @@ static void state_tensors(GTCRNModelState* state,
     count[n++] = sizeof(state->conv_dec1) / sizeof(float);
     base[n] = &state->conv_dec2[0][0][0];
     count[n++] = sizeof(state->conv_dec2) / sizeof(float);
-    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
-        base[n] = &state->h_tra[i][0][0][0];
-        count[n++] = sizeof(state->h_tra[0]) / sizeof(float);
-    }
-    for (int i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
-        base[n] = &state->h_dpgrnn[i][0][0][0];
-        count[n++] = sizeof(state->h_dpgrnn[0]) / sizeof(float);
-    }
+    base[n] = &state->h_tra[0][0][0];
+    count[n++] = sizeof(state->h_tra) / sizeof(float);
+    base[n] = &state->h_dpgrnn[0][0][0];
+    count[n++] = sizeof(state->h_dpgrnn) / sizeof(float);
 }
 
 int gtcrn_model_state_validate(GTCRNModelState* state)
@@ -243,44 +255,8 @@ int gtcrn_model_state_validate(GTCRNModelState* state)
     state_tensors(state, base, count);
     for (int i = 0; i < GTCRN_MODEL_STATE_TENSORS; ++i) {
         if (!all_finite(base[i], count[i])) {
-            gtcrn_model_state_init(state);
+            gtcrn_model_state_reset(state);
             return -1;
-        }
-    }
-    return 0;
-}
-
-int gtcrn_model_state_inherit(
-    GTCRNModelState* state,
-    const float* const conv_out[GTCRN_MODEL_CONV_STATES],
-    const float* const h_tra_out[GTCRN_MODEL_TRA_GRUS],
-    const float* const h_dpgrnn_out[GTCRN_MODEL_DPGRNN_GRUS])
-{
-    float* base[GTCRN_MODEL_STATE_TENSORS];
-    size_t count[GTCRN_MODEL_STATE_TENSORS];
-    const float* src[GTCRN_MODEL_STATE_TENSORS];
-    int n = 0;
-    if (state == NULL || conv_out == NULL || h_tra_out == NULL ||
-        h_dpgrnn_out == NULL) return -1;
-    for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) src[n++] = conv_out[i];
-    for (int i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) src[n++] = h_tra_out[i];
-    for (int i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
-        src[n++] = h_dpgrnn_out[i];
-    }
-    for (int i = 0; i < GTCRN_MODEL_STATE_TENSORS; ++i) {
-        if (src[i] == NULL) return -1;
-    }
-    state_tensors(state, base, count);
-    /* Validate every tensor that would be copied before touching any, so a
-     * refusal leaves the state byte-identical. A tensor the runtime wrote in
-     * place (same address) is skipped: it is not checked here and copying a
-     * range onto itself is undefined. */
-    for (int i = 0; i < GTCRN_MODEL_STATE_TENSORS; ++i) {
-        if (src[i] != base[i] && !all_finite(src[i], count[i])) return -1;
-    }
-    for (int i = 0; i < GTCRN_MODEL_STATE_TENSORS; ++i) {
-        if (src[i] != base[i]) {
-            memcpy(base[i], src[i], count[i] * sizeof(float));
         }
     }
     return 0;

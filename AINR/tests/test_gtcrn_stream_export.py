@@ -44,17 +44,17 @@ def test_stream_wrapper_matches_offline_random_weights(nfft, bins):
         offline = model(spectrum)
     online, state = _run_stream(model, spectrum)
     assert (offline - online).abs().max().item() < 2e-5
-    conv, h_tra, h_dpgrnn = state[:6], state[6:12], state[12:]
-    assert [cache.shape for cache in conv] == [
-        (1, 16, 2, 33), (1, 16, 4, 33), (1, 16, 10, 33),
-        (1, 16, 10, 33), (1, 16, 4, 33), (1, 16, 2, 33),
+    conv, h_tra, h_dpgrnn = state[:6], state[6], state[7]
+    assert [window.shape for window in conv] == [
+        (1, 16, 3, 33), (1, 16, 5, 33), (1, 16, 11, 33),
+        (1, 16, 11, 33), (1, 16, 5, 33), (1, 16, 3, 33),
     ]
-    assert [h.shape for h in h_tra] == [(1, 1, 16)] * 6
-    assert [h.shape for h in h_dpgrnn] == [(1, 33, 8)] * 4
+    assert h_tra.shape == (1, 6, 1, 16)
+    assert h_dpgrnn.shape == (1, 4, 33, 8)
 
 
-def test_equivalence_gate_fails_on_a_mispositioned_cache():
-    """The comparison above must bite: a cache rolled by one slot between
+def test_equivalence_gate_fails_on_a_mispositioned_window():
+    """The comparison above must bite: a window rolled by one slot between
     frames has to break parity, or the gate proves nothing."""
     torch.manual_seed(41)
     model = GTCRN(65, 64, nfft=512, fs=16000).eval()

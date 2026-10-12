@@ -1,6 +1,15 @@
 #!/usr/bin/env python3
 """Export GTCRN as a one-frame explicit-state streaming ONNX graph.
 
+Every state tensor is rank 4 and has the same shape at its input and at its
+``*_out`` output, so a runtime binds both to one address (``state_binding`` in
+the metadata). The six depthwise-convolution windows ``conv_enc0..2`` /
+``conv_dec0..2`` ``(1, 16, 3|5|11, 33)`` are consumed by one Slice each that
+drops the oldest frame, and leave as the full concatenation. ``h_tra``
+``(1, 6, 1, 16)`` and ``h_dpgrnn`` ``(1, 4, 33, 8)`` stack the recurrent
+states, cut with Slices on dim 1 and joined with one Concat on dim 1. See
+``stream_model.py``.
+
 Run from ``AINR/GTCRN``::
 
     python3 export_onnx.py --model output/gtcrn_best.pth \
@@ -28,7 +37,10 @@ _AINR_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _AINR_ROOT not in sys.path:
     sys.path.insert(0, _AINR_ROOT)
 
-from onnx_streaming_contract import validate_nctf_no_temporal_padding
+from onnx_streaming_contract import (
+    validate_inplace_state_graph,
+    validate_nctf_no_temporal_padding,
+)
 
 # Relative imports FIRST: when this module is loaded package-qualified
 # (``import AINR.GTCRN.export_onnx`` from a quantization script) the flat
@@ -39,32 +51,22 @@ try:
     from .checkpoint_utils import extract_state_dict
     from .model import GTCRN
     from .train import build_contract, require_checkpoint_contract
-    from .stream_model import (
-        CombinedStateGTCRN, StreamGTCRN, initial_inputs, pack_state,
-        stream_features,
-    )
+    from .stream_model import StreamGTCRN, initial_inputs, stream_features
 except ImportError:
     if _SCRIPT_DIR not in sys.path:
         sys.path.insert(0, _SCRIPT_DIR)
     from checkpoint_utils import extract_state_dict
     from model import GTCRN
     from train import build_contract, require_checkpoint_contract
-    from stream_model import (
-        CombinedStateGTCRN, StreamGTCRN, initial_inputs, pack_state,
-        stream_features,
-    )
-
-
+    from stream_model import StreamGTCRN, initial_inputs, stream_features
 
 # Kept numerically equal to GTCRN_MODEL_LAYOUT_VERSION in gtcrn_process.h,
-# which declares the caller-owned cache struct this graph consumes and emits.
+# which declares the caller-owned state struct this graph consumes and emits.
 # tests/test_gtcrn_export_contract.py pins the two together.
-STATE_LAYOUT_VERSION = 6
-# EXPERIMENTAL, no C implementation: the 'combined' state layout below
-# publishes a different boundary, so it must not claim version 6. Version 7 is
-# reserved for it in gtcrn_process.h so a later C-side bump cannot take the
-# same number.
-COMBINED_STATE_LAYOUT_VERSION = 7
+STATE_LAYOUT_VERSION = 8
+
+# Numbers no layout may claim again.
+RETIRED_LAYOUT_VERSIONS = frozenset({3, 4, 5, 6, 7})
 
 # Three separate ERB-domain feature inputs so the positive magnitude and the
 # signed real/imag keep independent quantization scales; the graph
@@ -72,103 +74,22 @@ COMBINED_STATE_LAYOUT_VERSION = 7
 # ends -- magnitude, ERB forward/inverse, CRM -- run on the host).
 SIGNAL_INPUT_NAMES = ('mag', 'real', 'imag')
 
-# One tensor per convolution history and per stateful GRU, so the graph never
-# slices or reassembles external state. Encoder cache/TRA slots come first,
-# then decoder, then the four grouped DPGRNN inter GRUs (whose hidden batches
-# are the frequency lanes).
-SPLIT_STATE_NAMES = (
+# Encoder windows first, then decoder, then the stacked recurrent tensors.
+CONV_STATE_NAMES = (
     'conv_enc0', 'conv_enc1', 'conv_enc2',
     'conv_dec0', 'conv_dec1', 'conv_dec2',
-    'h_tra_enc0', 'h_tra_enc1', 'h_tra_enc2',
-    'h_tra_dec0', 'h_tra_dec1', 'h_tra_dec2',
-    'h_dpgrnn1_0', 'h_dpgrnn1_1',
-    'h_dpgrnn2_0', 'h_dpgrnn2_1',
 )
+GRU_STATE_NAMES = ('h_tra', 'h_dpgrnn')
+STATE_NAMES = CONV_STATE_NAMES + GRU_STATE_NAMES
 
-# The same sixteen tensors grouped by shape: the six convolution histories
-# (equal channels and frequency width, differing only in depth), the six TRA
-# attention hiddens, and the four DPGRNN inter hiddens. Each group is
-# concatenated along an axis it already has, so nothing gains a dimension.
-COMBINED_STATE_NAMES = ('conv_cache', 'h_tra', 'h_dpgrnn')
+INPUT_NAMES = SIGNAL_INPUT_NAMES + STATE_NAMES
+OUTPUT_NAMES = ('output',) + tuple(name + '_out' for name in STATE_NAMES)
 
+# Which output hands each state input back. Zipped, not indexed.
+STATE_HANDOFF = dict(zip(STATE_NAMES, OUTPUT_NAMES[1:]))
 
-class StateLayout(object):
-    """One way of presenting the explicit state at the graph boundary.
-
-    Owns its own version and its own module class, so a name set, the version
-    describing it and the graph that produces it cannot disagree.
-    """
-
-    def __init__(self, label, state_names, layout_version, module, pack):
-        self.label = label
-        self.state_names = state_names
-        self.layout_version = layout_version
-        self.module = module
-        # How the sixteen per-slot tensors are regrouped for this boundary --
-        # the identity for 'split'. Carried here rather than branched on by
-        # label, so no caller has to test which layout it holds.
-        self.pack = pack
-        self.input_names = SIGNAL_INPUT_NAMES + state_names
-        self.output_names = ('output',) + tuple(
-            name + '_out' for name in state_names
-        )
-
-    def build(self, model):
-        return self.module(model)
-
-    def graph_inputs(self, model):
-        """Dummy inputs for this boundary, in ``input_names`` order."""
-        values = initial_inputs(model)
-        signals = len(SIGNAL_INPUT_NAMES)
-        return values[:signals] + self.pack(model, values[signals:])
-
-
-def _keep_state(_model, state):
-    return tuple(state)
-
-
-STATE_LAYOUTS = {
-    'split': StateLayout(
-        'split', SPLIT_STATE_NAMES, STATE_LAYOUT_VERSION, StreamGTCRN,
-        _keep_state),
-    'combined': StateLayout(
-        'combined', COMBINED_STATE_NAMES, COMBINED_STATE_LAYOUT_VERSION,
-        CombinedStateGTCRN, pack_state),
-}
-DEFAULT_STATE_LAYOUT = 'split'
-# Inverted once from the table above: a module class identifies exactly one
-# boundary, and an unknown one is an error rather than a silent 'split'.
-_LAYOUT_BY_MODULE = {
-    layout.module: layout for layout in STATE_LAYOUTS.values()
-}
-
-
-def resolve_state_layout(layout):
-    """Accept a layout, or its name, and return the layout."""
-    if isinstance(layout, StateLayout):
-        return layout
-    try:
-        return STATE_LAYOUTS[layout]
-    except (KeyError, TypeError):
-        raise ValueError('unknown state_layout %r; expected one of %s'
-                         % (layout, sorted(STATE_LAYOUTS)))
-
-
-def layout_of(stream):
-    """The boundary a built stream module presents.
-
-    Derived from the module rather than carried alongside it, so an exporter
-    cannot name one layout while tracing the other.
-    """
-    try:
-        return _LAYOUT_BY_MODULE[type(stream)]
-    except KeyError:
-        raise ValueError('%s presents no known state layout'
-                         % type(stream).__name__)
-
-
-INPUT_NAMES = STATE_LAYOUTS[DEFAULT_STATE_LAYOUT].input_names
-OUTPUT_NAMES = STATE_LAYOUTS[DEFAULT_STATE_LAYOUT].output_names
+# Every state tensor is read and written at one address.
+STATE_BINDING = 'in_place_same_address'
 
 
 def _schema(names, tensors):
@@ -296,8 +217,7 @@ def file_sha256(path):
     return digest.hexdigest()
 
 
-def build_stream_model(config_path, checkpoint_path,
-                       state_layout=DEFAULT_STATE_LAYOUT):
+def build_stream_model(config_path, checkpoint_path):
     cfg = configparser.ConfigParser()
     if not cfg.read(config_path):
         raise FileNotFoundError(config_path)
@@ -318,29 +238,21 @@ def build_stream_model(config_path, checkpoint_path,
     offline = GTCRN(sub1, sub2, nfft=n_fft, fs=sr).eval()
     offline.load_state_dict(extract_state_dict(checkpoint, checkpoint_path), strict=True)
 
-    stream = resolve_state_layout(state_layout).build(offline).eval()
+    stream = StreamGTCRN(offline).eval()
     return stream, {'sr': sr, 'n_fft': n_fft, 'win_len': win_len,
                     'hop_len': hop_len, 'sub1': sub1, 'sub2': sub2}
 
 
-def build_metadata(checkpoint_path, grid, inputs, outputs,
-                   state_layout=DEFAULT_STATE_LAYOUT):
+def build_metadata(checkpoint_path, grid, inputs, outputs):
     """The exported graph's metadata.
 
     Separate from ``main`` so the contract test can compare
     ``state_layout_version`` against gtcrn_process.h without an ONNX export.
-
-    Takes the layout, not its parts: names, version and label all come from
-    one object, so metadata that names ``conv_cache`` while claiming the split
-    version -- exactly the lying descriptor gtcrn_process.h's version check
-    exists to make a board refuse -- is unrepresentable.
     """
-    layout = resolve_state_layout(state_layout)
     return {
         'model_family': 'GTCRN',
         'boundary': 'stateless_streaming_explicit_state',
-        'state_layout_version': layout.layout_version,
-        'state_layout': layout.label,
+        'state_layout_version': STATE_LAYOUT_VERSION,
         'checkpoint_sha256': file_sha256(checkpoint_path),
         'sample_rate': grid['sr'], 'n_fft': grid['n_fft'],
         'win_len': grid['win_len'], 'hop_len': grid['hop_len'],
@@ -349,13 +261,13 @@ def build_metadata(checkpoint_path, grid, inputs, outputs,
         'input_feature_frames': 1,
         'output_frames_per_invocation': 1,
         'temporal_padding_inside_graph': False,
-        'temporal_context': 'block_local_conv_cache_and_per_gru_state',
+        'temporal_context': 'block_local_conv_window_and_stacked_gru_state',
         'accelerator_persistent_state': False,
-        'recurrent_state': 'per_block_conv_plus_per_gru_explicit_input_output',
-        'state_handoff': dict(zip(layout.state_names,
-                                  layout.output_names[1:])),
-        'input_schema': _schema(layout.input_names, inputs),
-        'output_schema': _schema(layout.output_names, outputs),
+        'recurrent_state': 'per_block_conv_window_plus_stacked_gru_rows',
+        'state_binding': STATE_BINDING,
+        'state_handoff': STATE_HANDOFF,
+        'input_schema': _schema(INPUT_NAMES, inputs),
+        'output_schema': _schema(OUTPUT_NAMES, outputs),
     }
 
 
@@ -367,8 +279,7 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
     tensors and the graph they bind to always come from the same model
     instance in the same process.
     """
-    layout = layout_of(stream)
-    inputs = layout.graph_inputs(stream.model)
+    inputs = initial_inputs(stream.model)
     # Cloned so the schema comes from the real graph tensors without the
     # traced export seeing anything this forward pass touched.
     with torch.no_grad():
@@ -376,8 +287,8 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     torch.onnx.export(
         stream, inputs, output_path,
-        input_names=list(layout.input_names),
-        output_names=list(layout.output_names),
+        input_names=list(INPUT_NAMES),
+        output_names=list(OUTPUT_NAMES),
         opset_version=opset, do_constant_folding=True,
     )
     optimize_graph_file(output_path)
@@ -386,10 +297,15 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
     onnx.checker.check_model(graph)
     graph = onnx.shape_inference.infer_shapes(graph)
     validate_nctf_no_temporal_padding(graph, require_static=verify)
-    metadata = build_metadata(checkpoint_path, grid, inputs, outputs, layout)
+    metadata = build_metadata(checkpoint_path, grid, inputs, outputs)
     set_onnx_metadata(graph, metadata)
-    _pin_static_output_shapes(graph, layout.output_names, outputs)
+    _pin_static_output_shapes(graph, OUTPUT_NAMES, outputs)
     graph = _resolve_internal_shapes(graph)
+    validate_inplace_state_graph(
+        graph, STATE_HANDOFF,
+        windows={name: 2 for name in CONV_STATE_NAMES},
+        slices={name: 1 for name in GRU_STATE_NAMES},
+    )
     onnx.save(graph, output_path)
     with open(os.path.splitext(output_path)[0] + '.json', 'w',
               encoding='utf-8') as fp:
@@ -402,15 +318,14 @@ def export_graph(stream, grid, checkpoint_path, output_path, opset=17,
         # run through the SAME host feature rule (positive magnitude,
         # consistent channels), not raw noise in every channel.
         generator = torch.Generator().manual_seed(20260818)
-        verify_inputs = list(layout.graph_inputs(stream.model))
+        verify_inputs = list(initial_inputs(stream.model))
         erb = stream.model.erb
         bins = erb.erb_subband_1 + erb.erb_fc.in_features
         spectrum_ri = torch.randn(1, bins, 1, 2, generator=generator)
         signals = len(SIGNAL_INPUT_NAMES)
         verify_inputs[:signals] = stream_features(stream.model, spectrum_ri)
         ort_feed = {name: tensor.detach().numpy().copy()
-                    for name, tensor in zip(layout.input_names,
-                                            verify_inputs)}
+                    for name, tensor in zip(INPUT_NAMES, verify_inputs)}
         with torch.no_grad():
             expected = stream(*(tensor.clone() for tensor in verify_inputs))
         session = ort.InferenceSession(output_path,
@@ -438,18 +353,8 @@ def main():
     parser.add_argument('--output', required=True)
     parser.add_argument('--opset', type=int, default=17)
     parser.add_argument('--verify', action='store_true')
-    parser.add_argument(
-        '--state-layout', choices=sorted(STATE_LAYOUTS),
-        default=DEFAULT_STATE_LAYOUT,
-        help="'split' (default, layout version %d, the shipped contract) "
-             'exports one tensor per convolution history and per GRU; '
-             "'combined' (EXPERIMENTAL, layout version %d, no C runtime "
-             'binds it) groups them by shape into conv_cache, h_tra and '
-             'h_dpgrnn.'
-             % (STATE_LAYOUT_VERSION, COMBINED_STATE_LAYOUT_VERSION))
     args = parser.parse_args()
-    model, grid = build_stream_model(args.config, args.model,
-                                     state_layout=args.state_layout)
+    model, grid = build_stream_model(args.config, args.model)
     export_graph(model, grid, args.model, args.output,
                  opset=args.opset, verify=args.verify)
     print(args.output)

@@ -25,24 +25,23 @@ for _stale in ('train', 'inference', 'model', 'checkpoint_utils', 'export_onnx')
 
 from model import GTCRN, SFE  # noqa: E402
 from stream_model import (  # noqa: E402
-    CombinedStateGTCRN,
     StreamGTCRN,
     _FrequencyNeighborhood,
     initial_inputs,
-    pack_state,
 )
 from export_onnx import (  # noqa: E402
-    COMBINED_STATE_LAYOUT_VERSION,
+    CONV_STATE_NAMES,
+    GRU_STATE_NAMES,
     INPUT_NAMES,
     OUTPUT_NAMES,
+    RETIRED_LAYOUT_VERSIONS,
     SIGNAL_INPUT_NAMES,
-    STATE_LAYOUTS,
+    STATE_BINDING,
+    STATE_HANDOFF,
     STATE_LAYOUT_VERSION,
     build_metadata,
     build_stream_model,
     export_graph,
-    layout_of,
-    resolve_state_layout,
 )
 
 
@@ -96,19 +95,23 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
     header_version = c_macro('GTCRN_MODEL_LAYOUT_VERSION')
     assert metadata['state_layout_version'] == header_version
     assert STATE_LAYOUT_VERSION == metadata['state_layout_version']
-    # gtcrn_process.h's prose reserves the combined layout's number. Stated as
-    # an assertion so a C-side bump onto it fails here rather than shipping a
-    # header that means two different things to two different graphs.
-    assert header_version != COMBINED_STATE_LAYOUT_VERSION, (
-        'GTCRN_MODEL_LAYOUT_VERSION %d collides with the combined layout'
+    # Retired numbers are never reused: a C-side bump onto one must fail here
+    # rather than ship a header that means two different things to two
+    # different graphs.
+    assert RETIRED_LAYOUT_VERSIONS == frozenset({3, 4, 5, 6, 7})
+    assert header_version not in RETIRED_LAYOUT_VERSIONS, (
+        'GTCRN_MODEL_LAYOUT_VERSION %d collides with a retired layout'
         % header_version
     )
+    assert header_version == 8
+    assert metadata['state_binding'] == STATE_BINDING == 'in_place_same_address'
+    assert metadata['state_handoff'] == STATE_HANDOFF
 
 
 def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
     """The schema must come from the real tensors, not a typed-in string.
 
-    gtcrn_process.h sizes its three caches from these extents. While the
+    gtcrn_process.h sizes its state from these extents. While the
     schema was a hand-written literal, a stream-model cache-shape change would
     have left the metadata describing the old graph and nothing would have
     disagreed.
@@ -116,39 +119,36 @@ def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
     metadata = _metadata(tmp_path)
     schema = metadata['input_schema']
     assert set(schema) == set(INPUT_NAMES)
-    conv = [name for name in INPUT_NAMES if name.startswith('conv_')]
+    conv = list(CONV_STATE_NAMES)
     assert conv == [
         'conv_enc0', 'conv_enc1', 'conv_enc2',
         'conv_dec0', 'conv_dec1', 'conv_dec2',
     ]
-    times = [
-        c_macro('GTCRN_MODEL_CONV_TIME_0'),
-        c_macro('GTCRN_MODEL_CONV_TIME_1'),
-        c_macro('GTCRN_MODEL_CONV_TIME_2'),
+    windows = [
+        c_macro('GTCRN_MODEL_CONV_WINDOW_0'),
+        c_macro('GTCRN_MODEL_CONV_WINDOW_1'),
+        c_macro('GTCRN_MODEL_CONV_WINDOW_2'),
     ]
     for index, name in enumerate(conv[:3]):
         assert schema[name] == [
-            1, c_macro('GTCRN_MODEL_CONV_CHANNELS'), times[index],
+            1, c_macro('GTCRN_MODEL_CONV_CHANNELS'), windows[index],
             c_macro('GTCRN_MODEL_CONV_FREQ'),
         ], name
     for index, name in enumerate(conv[3:]):
         assert schema[name] == [
-            1, c_macro('GTCRN_MODEL_CONV_CHANNELS'), times[2 - index],
+            1, c_macro('GTCRN_MODEL_CONV_CHANNELS'), windows[2 - index],
             c_macro('GTCRN_MODEL_CONV_FREQ'),
         ], name
-    h_tra = [name for name in INPUT_NAMES if name.startswith('h_tra_')]
-    assert len(h_tra) == c_macro('GTCRN_MODEL_TRA_GRUS')
-    for name in h_tra:
-        assert schema[name] == [
-            1, 1, c_macro('GTCRN_MODEL_TRA_HIDDEN'),
-        ], name
-    h_dpgrnn = [name for name in INPUT_NAMES if name.startswith('h_dpgrnn')]
-    assert len(h_dpgrnn) == c_macro('GTCRN_MODEL_DPGRNN_GRUS')
-    for name in h_dpgrnn:
-        assert schema[name] == [
-            1, c_macro('GTCRN_MODEL_DPGRNN_FREQ'),
-            c_macro('GTCRN_MODEL_DPGRNN_HIDDEN'),
-        ], name
+    assert list(GRU_STATE_NAMES) == ['h_tra', 'h_dpgrnn']
+    assert schema['h_tra'] == [
+        1, c_macro('GTCRN_MODEL_TRA_GRUS'), 1,
+        c_macro('GTCRN_MODEL_TRA_HIDDEN'),
+    ]
+    assert schema['h_dpgrnn'] == [
+        1, c_macro('GTCRN_MODEL_DPGRNN_GRUS'),
+        c_macro('GTCRN_MODEL_DPGRNN_FREQ'),
+        c_macro('GTCRN_MODEL_DPGRNN_HIDDEN'),
+    ]
 
     # Every state output must hand back exactly the shape its input slot
     # expects, or the caller cannot copy one into the other.
@@ -156,6 +156,7 @@ def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
     assert set(output_schema) == set(OUTPUT_NAMES)
     for state_in, state_out in metadata['state_handoff'].items():
         assert output_schema[state_out] == schema[state_in]
+        assert len(schema[state_in]) == 4, state_in
 
 
 def test_calibration_frame_shapes_equal_the_exported_graph_inputs(tmp_path):
@@ -306,93 +307,107 @@ def test_runtime_erb_bins_match_the_constructor(tmp_path):
     assert np.array_equal(inv, ref_inv)
 
 
-def test_combined_state_groups_the_sixteen_slots_by_shape():
-    """The combined boundary must regroup state without reshaping it.
+def test_state_rows_follow_the_graph_order():
+    """Each row of ``h_tra`` / ``h_dpgrnn`` must reach its own GRU.
 
-    Every group is concatenated along an axis its members already have -- the
-    convolution histories along depth, the hiddens along their layer axis --
-    so no tensor gains a dimension and the four-dimensional ceiling holds.
+    The recurrent state of block i feeds block i's attention and everything
+    computed after it, never anything before it, so perturbing row i moves row
+    i and possibly later rows, never an earlier one. The two DPGRNN inter GRUs
+    of one layer run in parallel: neither sees the other's hidden state. A
+    slice landing on the wrong GRU, or a reversed row order, breaks this.
     """
-    layout = resolve_state_layout('combined')
-    assert layout.state_names == ('conv_cache', 'h_tra', 'h_dpgrnn')
-    assert layout.input_names == ('mag', 'real', 'imag') + layout.state_names
-    assert layout.output_names == (
-        'output', 'conv_cache_out', 'h_tra_out', 'h_dpgrnn_out')
-    assert layout.layout_version == COMBINED_STATE_LAYOUT_VERSION
-    assert layout.layout_version != STATE_LAYOUT_VERSION, (
-        'a different state layout must not claim the shipped version'
-    )
+    torch.manual_seed(31)
+    stream = _stream_model()
+    start = initial_inputs(stream.model)
+    signals = tuple(torch.randn_like(value) for value in start[:3])
+    windows = tuple(torch.randn_like(value) for value in start[3:9])
+    base_tra = torch.randn_like(start[9])
+    base_dp = torch.randn_like(start[10])
 
-    model = _stream_model().model
-    packed = layout.graph_inputs(model)
-    assert len(packed) == len(layout.input_names)
-    split = initial_inputs(model)
-    assert [tuple(value.shape) for value in packed[:3]] == [
-        tuple(value.shape) for value in split[:3]
-    ], 'the feature inputs are untouched by the state regrouping'
-    conv_cache, h_tra, h_dpgrnn = packed[len(SIGNAL_INPUT_NAMES):]
-    # Two rows (encoder, decoder) x channels x summed depth x frequency.
-    assert conv_cache.shape == (2, 16, 16, 33)
-    assert h_tra.shape == (6, 1, 16)
-    assert h_dpgrnn.shape == (4, 33, 8)
-    for tensor in packed[len(SIGNAL_INPUT_NAMES):]:
-        assert tensor.dim() <= 4
-    assert sum(tensor.numel() for tensor in packed[len(SIGNAL_INPUT_NAMES):]) == sum(
-        tensor.numel() for tensor in split[len(SIGNAL_INPUT_NAMES):]
-    ), 'regrouping must not change the number of state values'
+    def run(tra, dp):
+        with torch.no_grad():
+            return stream(*signals, *windows, tra, dp)
+
+    reference = run(base_tra, base_dp)
+
+    def moved(output_index, rows_changed):
+        return [row for row in range(reference[output_index].shape[1])
+                if not torch.equal(reference[output_index][0, row],
+                                   rows_changed[output_index][0, row])]
+
+    for row in range(6):
+        bumped = base_tra.clone()
+        bumped[:, row] += 0.5
+        rows = moved(len(OUTPUT_NAMES) - 2, run(bumped, base_dp))
+        assert row in rows and min(rows) == row, (row, rows)
+    for row, forbidden in ((0, {1}), (1, {0}), (2, {0, 1, 3}),
+                           (3, {0, 1, 2})):
+        bumped = base_dp.clone()
+        bumped[:, row] += 0.5
+        rows = moved(len(OUTPUT_NAMES) - 1, run(base_tra, bumped))
+        assert row in rows and not (set(rows) & forbidden), (row, rows)
 
 
-def test_combined_and_split_state_layouts_compute_the_same_frames():
-    """Both boundaries wrap one streaming graph, so they must agree exactly."""
-    torch.manual_seed(19)
-    split = _stream_model()
-    model = split.model
-    combined = CombinedStateGTCRN(model).eval()
-    assert layout_of(split) is STATE_LAYOUTS['split']
-    assert layout_of(combined) is STATE_LAYOUTS['combined']
-
-    start = initial_inputs(model)
-    bands = start[0].shape[1]
-    split_state = start[len(SIGNAL_INPUT_NAMES):]
-    combined_state = pack_state(model, split_state)
-    generator = torch.Generator().manual_seed(23)
-    observed_nonzero = False
+def test_stream_replay_keeps_state_windows_overlapping():
+    """The window the graph returns is the next call's input, unchanged: the
+    newest four frames of one window are the oldest four of the next."""
+    torch.manual_seed(37)
+    stream = _stream_model()
+    state = list(initial_inputs(stream.model))
+    generator = torch.Generator().manual_seed(5)
+    previous = None
     with torch.no_grad():
-        for _ in range(5):
-            signals = (
-                torch.randn(1, bands, 1, generator=generator).abs(),
-                torch.randn(1, bands, 1, generator=generator),
-                torch.randn(1, bands, 1, generator=generator),
-            )
-            expected = split(*(signals + split_state))
-            actual = combined(*(signals + combined_state))
-            assert torch.equal(actual[0], expected[0])
-            split_state = expected[1:]
-            combined_state = actual[1:]
-            for packed, reference in zip(combined_state,
-                                         pack_state(model, split_state)):
-                assert torch.equal(packed, reference)
-            observed_nonzero = observed_nonzero or bool(
-                combined_state[0].abs().max() > 0)
-    # Written so it can FAIL: zero state would satisfy every comparison above.
-    assert observed_nonzero, 'state never left its zero initialisation'
+        for _ in range(14):
+            signals = [torch.randn(1, 129, 1, generator=generator).abs(),
+                       torch.randn(1, 129, 1, generator=generator),
+                       torch.randn(1, 129, 1, generator=generator)]
+            outputs = stream(*signals, *state[3:])
+            windows = outputs[1:7]
+            if previous is not None:
+                for before, after in zip(previous, windows):
+                    assert torch.equal(before[:, :, 1:], after[:, :, :-1])
+            previous = windows
+            state[3:] = list(outputs[1:])
+    assert previous is not None and float(previous[0].abs().max()) > 0.0
 
 
-def test_combined_state_graph_exports_and_matches_the_runtime(tmp_path):
+def test_exported_state_boundary_is_in_place_and_sliced_on_the_input(tmp_path):
+    """What the board binds: rank-4 state pairs of equal shape, every window
+    consumed only by one explicit Slice, the stacked GRU states only by Slices
+    on dim 1 that tile them, and no graph output produced by a Slice."""
     onnx = pytest.importorskip('onnx')
     pytest.importorskip('onnxruntime')
+    from onnx import numpy_helper
+
     checkpoint = _checkpoint(tmp_path)
-    stream, grid = build_stream_model(
-        _grid_config(tmp_path, 512), checkpoint, state_layout='combined')
-    path = tmp_path / 'gtcrn_combined.onnx'
-    metadata = export_graph(stream, grid, checkpoint, os.fspath(path),
-                            verify=True)
-    assert metadata['state_layout'] == 'combined'
-    assert metadata['state_layout_version'] == COMBINED_STATE_LAYOUT_VERSION
-    graph = onnx.load(os.fspath(path))
-    declared = [entry.name for entry in graph.graph.input]
-    assert declared == list(STATE_LAYOUTS['combined'].input_names)
-    for name in INPUT_NAMES[len(SIGNAL_INPUT_NAMES):]:
-        assert name not in declared, (
-            'combined layout must not also declare %s' % name
-        )
+    stream, grid = build_stream_model(_grid_config(tmp_path, 512), checkpoint)
+    path = os.fspath(tmp_path / 'gtcrn_boundary.onnx')
+    metadata = export_graph(stream, grid, checkpoint, path, verify=True)
+    assert metadata['state_binding'] == 'in_place_same_address'
+    graph = onnx.load(path)
+    shapes = {value.name: [dim.dim_value
+                           for dim in value.type.tensor_type.shape.dim]
+              for value in list(graph.graph.input) + list(graph.graph.output)}
+    for state, back in STATE_HANDOFF.items():
+        assert len(shapes[state]) == 4
+        assert shapes[state] == shapes[back], (state, back)
+    assert shapes['h_tra'] == [1, 6, 1, 16]
+    assert shapes['h_dpgrnn'] == [1, 4, 33, 8]
+    constants = {item.name: numpy_helper.to_array(item).tolist()
+                 for item in graph.graph.initializer}
+    for name in CONV_STATE_NAMES:
+        users = [node for node in graph.graph.node if name in node.input]
+        assert [node.op_type for node in users] == ['Slice'], name
+        starts, ends, axes, steps = (constants[x] for x in users[0].input[1:])
+        assert (starts, ends, axes, steps) == (
+            [1], [shapes[name][2]], [2], [1]), name
+    for name, rows in (('h_tra', 6), ('h_dpgrnn', 4)):
+        users = [node for node in graph.graph.node if name in node.input]
+        assert len(users) == rows
+        assert all(node.op_type == 'Slice' for node in users)
+        assert sorted(constants[node.input[1]][0] for node in users) == (
+            list(range(rows)))
+    produced = {out: node for node in graph.graph.node
+                for out in node.output}
+    for output in graph.graph.output:
+        assert produced[output.name].op_type != 'Slice', output.name

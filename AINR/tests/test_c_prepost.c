@@ -1,5 +1,6 @@
 /* C pre/post-processing contract test. */
 #include <math.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -413,15 +414,15 @@ static int test_gtcrn_model_state(void)
     static GTCRNModelState zeros;
     static GTCRNModelState expect;
     float* conv[GTCRN_MODEL_CONV_STATES];
-    float* h_tra[GTCRN_MODEL_TRA_GRUS];
-    float* h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS];
+    const size_t tra_n = sizeof(state.h_tra) / sizeof(float);
+    const size_t dpgrnn_n = sizeof(state.h_dpgrnn) / sizeof(float);
+    float* tensor[GTCRN_MODEL_CONV_STATES + 2];
+    size_t tensor_n[GTCRN_MODEL_CONV_STATES + 2];
     size_t conv_n[GTCRN_MODEL_CONV_STATES];
-    const size_t tra_n = sizeof(state.h_tra[0]) / sizeof(float);
-    const size_t dpgrnn_n = sizeof(state.h_dpgrnn[0]) / sizeof(float);
     int i;
     int c;
-    CHECK(sizeof(state) == 72192u,
-          "GTCRN v6 keeps the v5 caller-owned state byte budget");
+    CHECK(sizeof(state) == 84864u + sizeof(unsigned int),
+          "GTCRN caller-owned state is the eight tensors plus the counter");
     /* The first element of every state tensor: the board binds the graph's
      * state input and *_out output to these addresses. */
     conv[0] = &state.conv_enc0[0][0][0];
@@ -436,12 +437,18 @@ static int test_gtcrn_model_state(void)
     conv_n[3] = sizeof(state.conv_dec0) / sizeof(float);
     conv_n[4] = sizeof(state.conv_dec1) / sizeof(float);
     conv_n[5] = sizeof(state.conv_dec2) / sizeof(float);
-    for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
-        h_tra[i] = &state.h_tra[i][0][0][0];
+    for (i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
+        tensor[i] = conv[i];
+        tensor_n[i] = conv_n[i];
     }
-    for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
-        h_dpgrnn[i] = &state.h_dpgrnn[i][0][0][0];
-    }
+    tensor[GTCRN_MODEL_CONV_STATES] = &state.h_tra[0][0][0];
+    tensor_n[GTCRN_MODEL_CONV_STATES] = tra_n;
+    tensor[GTCRN_MODEL_CONV_STATES + 1] = &state.h_dpgrnn[0][0][0];
+    tensor_n[GTCRN_MODEL_CONV_STATES + 1] = dpgrnn_n;
+    CHECK(tra_n == (size_t)GTCRN_MODEL_TRA_GRUS * GTCRN_MODEL_TRA_HIDDEN &&
+          dpgrnn_n == (size_t)GTCRN_MODEL_DPGRNN_GRUS *
+                          GTCRN_MODEL_DPGRNN_FREQ * GTCRN_MODEL_DPGRNN_HIDDEN,
+          "GTCRN h_tra and h_dpgrnn are the rank-4 graph tensors");
     {
         static float spec_in[GTCRN_N_BINS][2];
         static float mag[GTCRN_MODEL_ERB_BANDS];
@@ -492,11 +499,14 @@ static int test_gtcrn_model_state(void)
               "caller-loaded inverse matrix");
     }
     gtcrn_model_state_init(&state);
-    CHECK(state.conv_dec0[15][GTCRN_MODEL_CONV_TIME_2 - 1][32] == 0.0f &&
-          state.h_tra[GTCRN_MODEL_TRA_GRUS - 1][0][0][15] == 0.0f &&
-          state.h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS - 1][0][32]
-                           [GTCRN_MODEL_DPGRNN_HIDDEN - 1] == 0.0f,
+    CHECK(state.conv_dec0[15][GTCRN_MODEL_CONV_WINDOW_2 - 1][32] == 0.0f &&
+          state.h_tra[GTCRN_MODEL_TRA_GRUS - 1][0][15] == 0.0f &&
+          state.h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS - 1][32]
+                        [GTCRN_MODEL_DPGRNN_HIDDEN - 1] == 0.0f,
           "GTCRN model state starts at zero");
+    CHECK(gtcrn_model_state_generation(&state) == 1u &&
+          gtcrn_model_state_generation(NULL) == 0u,
+          "GTCRN init starts the state generation at 1");
     /* The struct is the state buffer the graph writes its *_out tensors
      * into, so a healthy state validates in place and is left untouched. */
     memset(&state, 0x5a, sizeof(state));
@@ -509,224 +519,54 @@ static int test_gtcrn_model_state(void)
     CHECK(gtcrn_model_state_validate(NULL) == -1,
           "GTCRN validate refuses a null state");
 
-    /* The sixteen tensors tile the struct exactly, so checking each one
-     * covers every state byte. */
+    /* The eight tensors tile the struct up to the counter, so checking each
+     * one covers every state byte. */
     {
         size_t total = 0;
-        for (i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) total += conv_n[i];
-        total += (size_t)GTCRN_MODEL_TRA_GRUS * tra_n;
-        total += (size_t)GTCRN_MODEL_DPGRNN_GRUS * dpgrnn_n;
-        CHECK(total * sizeof(float) == sizeof(state),
+        for (i = 0; i < GTCRN_MODEL_CONV_STATES + 2; ++i) total += tensor_n[i];
+        CHECK(total * sizeof(float) + sizeof(unsigned int) == sizeof(state),
               "GTCRN state tensors tile the whole state struct");
     }
 
     /* One NaN or Inf at the first or last element of any single tensor
-     * zeroes the WHOLE state. The state is nonzero everywhere else (0x41
-     * pattern), so a partial reset or an unchecked tensor is visible. */
+     * zeroes the WHOLE state and advances the generation by one. The state is
+     * nonzero everywhere else (0x41 pattern), so a partial reset or an
+     * unchecked tensor is visible. */
     for (c = 0; c < 4; ++c) {
         const float bad = (c & 1) ? INFINITY : NAN;
         int cls_ok = 1;
-        for (i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
+        for (i = 0; i < GTCRN_MODEL_CONV_STATES + 2; ++i) {
+            const unsigned int generation = 7u;
             memset(&state, 0x41, sizeof(state));
-            conv[i][(c < 2) ? 0 : conv_n[i] - 1] = bad;
+            state.state_generation = generation;
+            tensor[i][(c < 2) ? 0 : tensor_n[i] - 1] = bad;
             cls_ok &= gtcrn_model_state_validate(&state) == -1 &&
-                      memcmp(&state, &zeros, sizeof(state)) == 0;
+                      state.state_generation == generation + 1u &&
+                      memcmp(&state, &zeros, offsetof(GTCRNModelState,
+                                                      state_generation)) == 0;
         }
-        CHECK(cls_ok, "GTCRN non-finite conv element returns -1 and "
-                      "zeroes the whole state");
-        cls_ok = 1;
-        for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
-            memset(&state, 0x41, sizeof(state));
-            h_tra[i][(c < 2) ? 0 : tra_n - 1] = bad;
-            cls_ok &= gtcrn_model_state_validate(&state) == -1 &&
-                      memcmp(&state, &zeros, sizeof(state)) == 0;
-        }
-        CHECK(cls_ok, "GTCRN non-finite h_tra element returns -1 and "
-                      "zeroes the whole state");
-        cls_ok = 1;
-        for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
-            memset(&state, 0x41, sizeof(state));
-            h_dpgrnn[i][(c < 2) ? 0 : dpgrnn_n - 1] = bad;
-            cls_ok &= gtcrn_model_state_validate(&state) == -1 &&
-                      memcmp(&state, &zeros, sizeof(state)) == 0;
-        }
-        CHECK(cls_ok, "GTCRN non-finite h_dpgrnn element returns -1 and "
-                      "zeroes the whole state");
+        CHECK(cls_ok, "GTCRN non-finite element in any tensor returns -1, "
+                      "zeroes the whole state and counts once");
     }
 
     /* A finite state must still validate after a refusal, or the guard could
-     * be a permanent latch rather than a per-call check. */
+     * be a permanent latch rather than a per-call check, and a healthy
+     * validation must not touch the generation. */
     memset(&state, 0x41, sizeof(state));
     memset(&expect, 0x41, sizeof(expect));
     CHECK(gtcrn_model_state_validate(&state) == 0 &&
           memcmp(&state, &expect, sizeof(state)) == 0,
           "GTCRN validate still accepts a finite state after a refusal");
 
-    /* Copy path: the runtime's own *_out tensors are finite-checked and
-     * copied into the state by gtcrn_model_state_inherit. */
-    {
-        enum { INHERIT_FRAMES = 24 };
-        static GTCRNModelState in_place;
-        static GTCRNModelState copied;
-        static GTCRNModelState before;
-        static GTCRNModelState source;
-        /* The runtime's private output tensors: a second struct whose
-         * fields are laid out like the state's. */
-        const float* cs[GTCRN_MODEL_CONV_STATES];
-        const float* ts[GTCRN_MODEL_TRA_GRUS];
-        const float* ds[GTCRN_MODEL_DPGRNN_GRUS];
-        const float* cself[GTCRN_MODEL_CONV_STATES];
-        const float* tself[GTCRN_MODEL_TRA_GRUS];
-        const float* dself[GTCRN_MODEL_DPGRNN_GRUS];
-        float* sc[GTCRN_MODEL_CONV_STATES];
-        float* st[GTCRN_MODEL_TRA_GRUS];
-        float* sd[GTCRN_MODEL_DPGRNN_GRUS];
-        enum { N_TENSORS = GTCRN_MODEL_CONV_STATES + GTCRN_MODEL_TRA_GRUS +
-                           GTCRN_MODEL_DPGRNN_GRUS };
-        int stream_ok = 1;
-        int alias_ok = 1;
-        int nan_ok = 1;
-        int t;
-        size_t k;
-        sc[0] = &source.conv_enc0[0][0][0];
-        sc[1] = &source.conv_enc1[0][0][0];
-        sc[2] = &source.conv_enc2[0][0][0];
-        sc[3] = &source.conv_dec0[0][0][0];
-        sc[4] = &source.conv_dec1[0][0][0];
-        sc[5] = &source.conv_dec2[0][0][0];
-        for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i)
-            st[i] = &source.h_tra[i][0][0][0];
-        for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i)
-            sd[i] = &source.h_dpgrnn[i][0][0][0];
-        cself[0] = &copied.conv_enc0[0][0][0];
-        cself[1] = &copied.conv_enc1[0][0][0];
-        cself[2] = &copied.conv_enc2[0][0][0];
-        cself[3] = &copied.conv_dec0[0][0][0];
-        cself[4] = &copied.conv_dec1[0][0][0];
-        cself[5] = &copied.conv_dec2[0][0][0];
-        for (i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) cs[i] = sc[i];
-        for (i = 0; i < GTCRN_MODEL_TRA_GRUS; ++i) {
-            ts[i] = st[i];
-            tself[i] = &copied.h_tra[i][0][0][0];
-        }
-        for (i = 0; i < GTCRN_MODEL_DPGRNN_GRUS; ++i) {
-            ds[i] = sd[i];
-            dself[i] = &copied.h_dpgrnn[i][0][0][0];
-        }
-
-        /* In-place state A has each frame written straight into the struct;
-         * copy state B goes through the private tensors and inherit. Every
-         * frame they must be byte-identical, and B must equal the source. */
-        gtcrn_model_state_init(&in_place);
-        gtcrn_model_state_init(&copied);
-        for (t = 0; t < INHERIT_FRAMES; ++t) {
-            float* a = (float*)&in_place;
-            float* s = (float*)&source;
-            for (k = 0; k < sizeof(source) / sizeof(float); ++k) {
-                float v = sinf(0.29f * (float)(t + 1) + 0.0007f * (float)k);
-                a[k] = v;
-                s[k] = v;
-            }
-            stream_ok &= gtcrn_model_state_validate(&in_place) == 0 &&
-                         gtcrn_model_state_inherit(&copied, cs, ts, ds) == 0 &&
-                         memcmp(&in_place, &copied, sizeof(copied)) == 0 &&
-                         memcmp(&copied, &source, sizeof(copied)) == 0;
-        }
-        CHECK(stream_ok,
-              "GTCRN inherit stream is byte-identical to the in-place state");
-
-        /* Every pointer equal to its field: the runtime wrote in place, so
-         * nothing is copied or checked and the state is unchanged (a
-         * non-finite value included: validate owns that case). */
-        memset(&copied, 0x41, sizeof(copied));
-        copied.conv_enc0[0][0][0] = NAN;
-        before = copied;
-        alias_ok &= gtcrn_model_state_inherit(&copied, cself, tself, dself)
-                        == 0 &&
-                    memcmp(&copied, &before, sizeof(copied)) == 0;
-        /* Mixed: one aliased tensor is skipped, the others are copied. */
-        memset(&copied, 0x41, sizeof(copied));
-        cs[2] = cself[2];
-        expect = source;
-        memcpy(&expect.conv_enc2, &copied.conv_enc2, sizeof(expect.conv_enc2));
-        alias_ok &= gtcrn_model_state_inherit(&copied, cs, ts, ds) == 0 &&
-                    memcmp(&copied, &expect, sizeof(copied)) == 0;
-        cs[2] = sc[2];
-        CHECK(alias_ok,
-              "GTCRN inherit leaves aliased tensors alone and copies the "
-              "rest");
-
-        /* One NaN or Inf at the first or last element of any one of the
-         * sixteen tensors: -1, nothing copied, state byte-identical. Source
-         * and state differ everywhere else, so a partial copy is visible. */
-        for (c = 0; c < 4; ++c) {
-            const float bad = (c & 1) ? INFINITY : NAN;
-            for (i = 0; i < N_TENSORS; ++i) {
-                float* victim;
-                size_t n;
-                if (i < GTCRN_MODEL_CONV_STATES) {
-                    victim = sc[i];
-                    n = conv_n[i];
-                } else if (i < GTCRN_MODEL_CONV_STATES +
-                               GTCRN_MODEL_TRA_GRUS) {
-                    victim = st[i - GTCRN_MODEL_CONV_STATES];
-                    n = tra_n;
-                } else {
-                    victim = sd[i - GTCRN_MODEL_CONV_STATES -
-                                GTCRN_MODEL_TRA_GRUS];
-                    n = dpgrnn_n;
-                }
-                memset(&source, 0x3d, sizeof(source));
-                victim[(c < 2) ? 0 : n - 1] = bad;
-                memset(&copied, 0x41, sizeof(copied));
-                before = copied;
-                nan_ok &= gtcrn_model_state_inherit(&copied, cs, ts, ds)
-                              == -1 &&
-                          memcmp(&copied, &before, sizeof(copied)) == 0;
-            }
-        }
-        CHECK(nan_ok,
-              "GTCRN inherit refuses a non-finite element in any of the "
-              "sixteen tensors and leaves the state byte-identical");
-
-        memset(&source, 0x3d, sizeof(source));
-        memset(&copied, 0x41, sizeof(copied));
-        before = copied;
-        {
-            const float* null_c[GTCRN_MODEL_CONV_STATES];
-            const float* null_t[GTCRN_MODEL_TRA_GRUS];
-            const float* null_d[GTCRN_MODEL_DPGRNN_GRUS];
-            int null_ok;
-            memcpy(null_c, cs, sizeof(null_c));
-            memcpy(null_t, ts, sizeof(null_t));
-            memcpy(null_d, ds, sizeof(null_d));
-            null_ok = gtcrn_model_state_inherit(NULL, cs, ts, ds) == -1 &&
-                      gtcrn_model_state_inherit(&copied, NULL, ts, ds) == -1 &&
-                      gtcrn_model_state_inherit(&copied, cs, NULL, ds) == -1 &&
-                      gtcrn_model_state_inherit(&copied, cs, ts, NULL) == -1;
-            for (i = 0; i < N_TENSORS; ++i) {
-                const float** slot;
-                const float* saved;
-                if (i < GTCRN_MODEL_CONV_STATES) {
-                    slot = &null_c[i];
-                } else if (i < GTCRN_MODEL_CONV_STATES +
-                               GTCRN_MODEL_TRA_GRUS) {
-                    slot = &null_t[i - GTCRN_MODEL_CONV_STATES];
-                } else {
-                    slot = &null_d[i - GTCRN_MODEL_CONV_STATES -
-                                   GTCRN_MODEL_TRA_GRUS];
-                }
-                saved = *slot;
-                *slot = NULL;
-                null_ok &= gtcrn_model_state_inherit(&copied, null_c, null_t,
-                                                     null_d) == -1;
-                *slot = saved;
-            }
-            CHECK(null_ok && memcmp(&copied, &before, sizeof(copied)) == 0,
-                  "GTCRN inherit refuses a NULL state, array or element and "
-                  "leaves the state intact");
-        }
-    }
+    memset(&state, 0x41, sizeof(state));
+    state.state_generation = 41u;
+    gtcrn_model_state_reset(&state);
+    CHECK(memcmp(&state, &zeros, offsetof(GTCRNModelState,
+                                          state_generation)) == 0 &&
+          state.state_generation == 42u &&
+          gtcrn_model_state_generation(&state) == 42u,
+          "GTCRN reset zeroes the tensors and advances the generation");
+    gtcrn_model_state_reset(NULL);
     return 1;
 }
 
