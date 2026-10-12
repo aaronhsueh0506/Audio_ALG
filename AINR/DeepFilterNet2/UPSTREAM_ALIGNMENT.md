@@ -1,18 +1,17 @@
 # DeepFilterNet2 cascade/alpha fork — architecture and alignment record
 
-> **Current architecture:** this folder intentionally restores
-> DFN2's parameter-count-invisible output composition: full-band ERB mask →
-> low-band deep filter on that masked spectrum → learned sigmoid-alpha residual
-> blend. The v5 band-split implementation audited below is no longer built
-> here.
+> **Current architecture:** this folder uses DFN2's parameter-count-invisible
+> output composition: full-band ERB mask → low-band deep filter on that masked
+> spectrum → learned sigmoid-alpha residual blend. The band-split (v5)
+> implementation audited below is not built here.
 >
-> The current folder retains the audited v5 encoder/decoder widths, frequency-
-> major flattening, pathway-add skips, triangular ERB bank, 1/1 lookahead,
+> The folder carries the audited encoder/decoder widths, frequency-major
+> flattening, pathway-add skips, triangular ERB bank, 1/1 lookahead,
 > libDF-normalisation constants, AdamW/AMSGrad, MRSL, checkpoint contract and
-> non-finite guards. `MODEL_VERSION` v6 separates new cascade/alpha checkpoints
-> from the old band-split checkpoints. The long audit below is therefore a
-> historical record of the shared base and of that earlier band-split
-> architecture, not a claim that this folder still composes that way.
+> non-finite guards. `MODEL_VERSION` v6 identifies cascade/alpha checkpoints
+> and rejects band-split ones. The audit below covers the shared base and the
+> band-split architecture; it does not describe how this folder composes its
+> output.
 
 **Audited** against upstream across five areas (feature normalisation,
 GRU/embedding architecture, conv stack, loss, training schedule). Only
@@ -40,9 +39,8 @@ checkpoint (`make_checkpoint_contract`) and gated by `FEATURE_VERSION`
 (`require_checkpoint_contract`), so a numeric change invalidates existing
 checkpoints — as the v5 bump did.
 
-⚠ **Citations are by SYMBOL, not by line.** An earlier revision cited
-`file:line` throughout and every one of ~25 citations was invalidated by a single
-day's edits. If a claim below still carries a line number, distrust it.
+⚠ **Citations are by SYMBOL, not by line.** Line numbers go
+stale with any edit. If a claim below still carries a line number, distrust it.
 
 ---
 
@@ -403,16 +401,13 @@ deliberate, verified divergence.
 
 ### Normalisation
 
-4. ⚠ **SUPERSEDED — this item now says the opposite of what the code does.**
-   It used to read: *"`erb_norm_init = -15/-60` and `spec_norm_init = 0.06/0.012`;
-   do not restore libDF's `-60/-90` and `0.001/0.0001`."*
+4. **Norm-init literals are libDF's: `erb_norm_init = -60/-90` and
+   `spec_norm_init = 0.001/0.0001`.** The calibrated pair (`-15/-60` and
+   `0.06/0.012`) is not used: training diverged under it and converged under
+   libDF's literals, on an identical corpus, both runs from scratch, with the
+   norm-init pair as the only difference.
 
-   **The calibrated values were reverted.** Training diverged under them and
-   converged under libDF's literals, on an identical corpus, both runs from
-   scratch, with `37db9df` (norm-init only) as the sole behavioural change
-   between them. The code now carries libDF's `-60/-90` and `0.001/0.0001`.
-
-   The calibration measurements all still reproduce — STFT power ratio +29.82 dB /
+   The calibration measurements reproduce — STFT power ratio +29.82 dB /
    magnitude 30.98×, filterbank tilt +3.01…+18.58 dB, composite mean +38.97 dB,
    482 of 513 shared bins, endpoint-rounding cost 0.13 dB RMS — so the calibrated
    pair is *more accurate* and *less trainable*. That is a result, not a mistake to
@@ -426,8 +421,7 @@ deliberate, verified divergence.
    Correcting the floor for this port's +39 dB scale would restore the bound *and*
    keep the calibration. Until that is measured, the literals stand.
 
-   ⚠ What survives from the original item: if the calibrated pair is ever
-   restored, it is tied to `normalized=True`, the triangular sum bank, **and this
+   ⚠ If the calibrated pair is ever used, it is tied to `normalized=True`, the triangular sum bank, **and this
    corpus's `target_rms_min/max` level regime** — all three. Do not port those
    numbers to another rate, bank, or corpus.
 5. **`erb_norm_tau_sec` / `spec_norm_tau_sec = 1.0`** — keep **τ in seconds** and
@@ -499,18 +493,16 @@ deliberate, verified divergence.
     time-scale resample. Same key, same probability, different augmentation. Do
     not repurpose it without noting the port then loses its bandwidth-limiting
     aug.
-21. ⚠ **SUPERSEDED — `target_rms_min/max` no longer exists in dataset_gen.**
-    It used to read: *"`target_rms_min/max = -35/-15 dBFS` — coupled to item 4.
-    Changing the level regime invalidates the norm-init calibration."* That
-    range was traced to the DNS-Challenge `noisyspeech_synthesizer` convention,
-    not a DeepFilterNet setting, and was removed from `AINR/dataset_gen`
+21. ⚠ **`target_rms_min/max` does not exist in dataset_gen.** The
+    `-35/-15 dBFS` range the calibration of item 4 assumed was traced to the
+    DNS-Challenge `noisyspeech_synthesizer` convention, not a DeepFilterNet
+    setting, so `AINR/dataset_gen` has no such step
     (verified against libDF's actual `dataset.rs`/`augmentations.rs`, which use
-    discrete `[-6, 0, 6]` dB gains and no continuous target-level step). Since
-    the calibrated norm-init pair is already reverted (item 4) this does not
-    change today's active config, but if the calibrated pair is ever restored,
-    `calibrate_norm_init.py` must be re-run against a corpus generated *without*
-    `target_rms` — its old measurements assumed the −35/−15 dBFS bound and are
-    now stale.
+    discrete `[-6, 0, 6]` dB gains and no continuous target-level step). The active
+    config uses libDF's literals (item 4), so nothing depends on this; if the
+    calibrated pair is ever used, `calibrate_norm_init.py` must be re-run
+    against a corpus generated *without* `target_rms`, because its existing
+    measurements assumed the −35/−15 dBFS bound.
 22. **`FEATURE_VERSION` / `MODEL_VERSION` gating and the checkpoint contract.**
     Every "align" row that touches numerics — `spec_norm_eps` removal, the
     `1e-10` ERB floor, `erb_power`'s expression, the calibrator's floor — goes

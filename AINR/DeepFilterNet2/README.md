@@ -1,6 +1,6 @@
 # DeepFilterNet2
 
-Current 48 kHz DFN2 branch with restored cascade/alpha output composition.
+48 kHz DFN2 branch with cascade/alpha output composition.
 
 ## Architecture contract
 
@@ -39,9 +39,8 @@ Current model version:
 dfn2_fmajor_pathway_cascade_alpha_no_lsnr_v6
 ```
 
-The feature version is unchanged from the earlier v5 band-split lineage, but
-the model version is not. Old v5 band-split checkpoints must not be renamed or
-force-loaded here.
+v5 band-split checkpoints share this feature version but not the model
+version; they must not be renamed or force-loaded here.
 
 `train.py --resume` and `inference.py --model` validate the serialized signal,
 feature, and model contract before loading.

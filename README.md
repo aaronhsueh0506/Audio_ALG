@@ -40,9 +40,8 @@ are not interchangeable between them.
 - linear-AEC-conditioned RES+NR: `Align_ULCNet`;
 - end-to-end AEC+RES+NR: `Align_CRUSE`, `DeepVQE_S`, `CAGCRN`.
 
-(`Align_CRUSE` previously ran its own AEC-only, noise-preserving route; that
-route was retired and folded into the end-to-end task above — see
-`AIAEC/README.md`.)
+Every AIAEC candidate is a joint AEC+RES+NR route; there is no AEC-only
+candidate (see `AIAEC/README.md`).
 
 These candidates use clip-level PyTorch APIs. The 4-channel conventional AEC
 shell is a separate integration boundary and does not replicate any neural
@@ -61,9 +60,8 @@ model per microphone.
 
 The conventional mono path, the 4-channel shell, and AIAEC all use explicit,
 zero-padding-free 50%-overlap grids (frame == FFT, hop == FFT/2) — they
-remain separate integration surfaces, but none of them derive a 20 ms
-frame/10 ms hop any more (that legacy derivation predates the 16 kHz default
-grid change; see AEC's CHANGELOG "16 kHz default signal grid" entry).
+remain separate integration surfaces, but none of them derives a 20 ms
+frame/10 ms hop.
 Standalone AINR follows each model's own config; see the table above.
 
 ## Clone and build
@@ -114,9 +112,8 @@ README inside the corresponding model directory.
 - [Frequency-domain pipeline design](docs/freq_domain_pipeline_design.md)
 - [AIAEC current candidate matrix](docs/ai_aec_candidate_matrix.md)
 - [Development and submodule workflow](docs/development.md)
-- Dated audits are historical structural sign-offs, not current references;
-  retired audits remain recoverable from Git history. See
-  [docs/README.md](docs/README.md#dated-audits).
+- Dated audits are structural sign-offs for the revision they name, not current
+  references. See [docs/README.md](docs/README.md#dated-audits).
 
 ## Repository structure
 

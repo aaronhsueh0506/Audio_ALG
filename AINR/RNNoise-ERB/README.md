@@ -35,10 +35,9 @@ complex feature 約放大 `sqrt(a)` 倍。只有啟用 complex 分支時，模�
 資訊。同一 stream 分 chunk 處理時必須傳遞 ERB EMA 與 GRU state；若 complex
 分支啟用，還要傳遞 complex EMA。不同 WAV 之間必須重置。
 兩路公式、state 初始值與先更新再輸出的順序精確對齊原作 `libDF`——
-v3 曾額外保留 ERB `±5` 與 complex `±10` clip 作為部署數值安全界線，v4 拿掉了
-這個 clip：對照 upstream `libDF::band_mean_norm_erb`/`band_unit_norm` 與本
-repo 自己的 `AINR/DeepFilterNet2` port 皆確認兩者都不 clip，v4 起兩路皆是
-byte-for-byte 忠實移植，沒有額外的安全界線。
+兩路都沒有 ERB 或 complex clip：upstream `libDF::band_mean_norm_erb`/`band_unit_norm`
+與本 repo 自己的 `AINR/DeepFilterNet2` port 皆不 clip，兩路是 byte-for-byte
+忠實移植，沒有額外的安全界線。
 公式來源：[Rikorose/DeepFilterNet `libDF/src/lib.rs`](https://github.com/Rikorose/DeepFilterNet/blob/main/libDF/src/lib.rs)。
 
 Feature 常數在 `config.ini [feature]`，C 部署常數固定於 `process.h`。
@@ -133,19 +132,18 @@ output_dir = ./output
 都會拒絕缺少版本的舊 checkpoint，或拒絕與 runtime config 不一致的 checkpoint。
 匯出的 ONNX model metadata 也會帶上相同 feature contract，供部署端檢查。
 
-> v1/legacy ERB-only 與 v2 absolute-ERB checkpoint/ONNX 都無法沿用。v3、v4、v5
-> 雖然 input shape 不變，normalization semantics 已改變，必須重訓後重新匯出
-> (v4 拿掉了 v3 的 erb_norm_clip/spec_clip；v5 修正 erb_bandborder() 的最小
-> band 寬度保證，改變 erb_fwd/erb_inv 矩陣本身，同樣是 semantics 改變)。
+> 只有 `feature_version` 等於上述 `..._v8` 的 checkpoint/ONNX 可用；其他版本
+> (含早期 ERB-only 與 absolute-ERB 版本) 即使 input shape 相同，normalization
+> semantics 或 erb_fwd/erb_inv 矩陣也不同，必須重訓後重新匯出。
 
 ## 訓練
 
 目前訓練只接受共用 `../dataset_gen/pack_dataset.py` 產生的 raw
 noisy/clean WAV tensor；STFT、log-ERB 與 runtime normalization 會在訓練時
 即時計算。資料增強、指定 sample-rate 的 WAV generation、resample 與
-packing 全部由 `../dataset_gen/` 維護，RNNoise-ERB 不再保存重複版本。
+packing 全部由 `../dataset_gen/` 維護，RNNoise-ERB 不保存重複版本。
 
-訓練 objective 已改回直接 ERB IRM：對 22 個 band gain 與 ideal ratio
+訓練 objective 是直接 ERB IRM：對 22 個 band gain 與 ideal ratio
 mask 在 `gamma=0.5` 的壓縮域做 MSE，對齊原始 RNNoise 論文採用的 perceptual
 compromise。目前 MRSL 的兩個 factor 都是 0；
 沒有假 VAD/activity 加權。低於 `energy_floor` 的 mixture band 無法定義
@@ -205,7 +203,7 @@ python3 train.py --config config.ini --packed-data data_16k/packed.pt \
 `T_max` 帶回來蓋掉為現在這輪重建的值——實測從 100-epoch 的 checkpoint 續訓到 120
 epochs，終端 lr 是 1.02e-04 而非 min_lr 1e-06（102 倍）。正確做法是照新的 epochs
 重建，再用 `global_step` 快轉，這也是 `training_common.fast_forward_scheduler()` 做的事。
-Checkpoint 同時檢查 loss contract；舊的 MRSL+IRM checkpoint 不能直接 resume，
+Checkpoint 同時檢查 loss contract；以 MRSL+IRM 為 loss 的 checkpoint 不能 resume，
 必須從新初始化的訓練開始。
 
 ### 訓練輸出

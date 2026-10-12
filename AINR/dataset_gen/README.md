@@ -245,15 +245,15 @@ config surface — see the comment in `config.example.ini`):
 ```ini
 [augmentation]
 p_noise_clipping = 0.10     ; pre-mix, on the noise chain itself
-p_mixture_clipping = 0.0    ; post-mix, post-level-normalization (old p_clipping)
+p_mixture_clipping = 0.0    ; post-mix, post-level-normalization
 clip_snr_min = 0
 clip_snr_max = 20
 ```
 
 `p_noise_clipping` distorts the noise signal before it is scaled into any
 mixture — including `noise_only` samples, where `noisy` *is* that noise.
-`p_mixture_clipping` is the old `p_clipping`'s exact behavior/semantics
-(post-mix, `target` unaffected), just renamed for symmetry. Both are skipped
+`p_mixture_clipping` clips the mixture (post-mix, `target` unaffected), the
+mixture-side counterpart of `p_noise_clipping`. Both are skipped
 for `speech_only` pairs, which stay exact identity pairs.
 
 By default this project has no train/val split concept at generation time
@@ -300,9 +300,8 @@ pair (`requested_level_dbfs` / `effective_level_dbfs`). `return_metadata=True`
 requires `return_raw=True` (raises otherwise) — it has no meaning against the
 STFT feature/gain-target return shape.
 
-⚠ **`gen_dataset.py` does not persist this.** It used to write a
-`NNNNNN.json` sidecar beside every `NNNNNN.wav`; the on-disk corpus is now
-WAV only, so this dict exists solely for a caller that constructs
+⚠ **`gen_dataset.py` does not persist this.** The on-disk corpus is WAV only
+(no `NNNNNN.json` sidecar beside each `NNNNNN.wav`), so this dict exists solely for a caller that constructs
 `DNS4Dataset` itself and reads it in-process. The field that describes the
 audio a consumer actually trains on is `pack_dataset.py`'s own
 `effective_rms_dbfs` (see the design section above), measured after any
@@ -435,7 +434,7 @@ exits immediately rather than after paying for both. What it checks:
   without the flag being repeated, and passing a conflicting `--start-idx` is
   refused rather than silently renumbering the batch.
 
-**⚠ What is no longer checked, because nothing records it.** There is no
+**⚠ What is not checked, because nothing records it.** There is no
 `meta.json`, so a `config.ini` edit (`snr_values`, `p_rir`, `level_mode`, the
 clipping knobs, `generation_split`, …) or a `--sample-rate` change between two
 `--resume` runs is **not detected**: both distributions land in one directory
@@ -445,15 +444,15 @@ sample is likewise absorbed — the next-lowest index simply becomes the start.
 
 **Without `--resume`, any sample already present in `pairs/` is a hard
 refusal — regardless of `--start-idx`.** A plain re-run into a non-empty
-`--output` used to be silently accepted: for `--start-idx 0` it validated
-nothing at all, and for `--start-idx N > 0` it only warned about a single
-exact-index collision. Both let a config change get generated over part of an
-existing batch while the rest stayed behind. Extending an existing batch goes
+`--output` is never silently accepted: for `--start-idx 0` it would validate
+nothing at all, and for `--start-idx N > 0` it would only warn about a single
+exact-index collision. Both would let a config change get generated over part
+of an existing batch while the rest stayed behind. Extending an existing batch goes
 through `--resume --hours <new TOTAL, not an increment>`; `--start-idx` is only
 for numbering a genuinely fresh, empty `--output` directory (e.g. a separate
 shard).
 
-`--repair-resume` now does one thing: delete leftover `tmp.*.wav` files from an
+`--repair-resume` does one thing: delete leftover `tmp.*.wav` files from an
 interrupted run. They are invisible to every scan either way, so this is disk
 hygiene, not a repair.
 
@@ -506,7 +505,7 @@ What still stops a pack, because it is checkable from the audio itself:
   so and reopen an index gap the scan just checked. `--target-sr` resamples
   every file to one output rate, so mixed native rates are legitimate then.
 
-⚠ **What the packer cannot check any more.** Nothing records which config, seed
+⚠ **What the packer cannot check.** Nothing records which config, seed
 or generation run produced a directory, so two runs' output merged into one
 directory packs cleanly, and the packed payload carries no
 `contract_version`/`config_hash` — it does not claim a provenance it cannot

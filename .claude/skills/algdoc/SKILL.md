@@ -10,7 +10,7 @@ description: 演算法改動後同步文件與使用者說明 — 更新 Audio_A
 
 ## 存放結構
 
-文件站**拆散在各自 repo**，不再全部集中在 `Audio_ALG/docs/html/`：
+文件站**拆散在各自 repo**，不集中在 `Audio_ALG/docs/html/`：
 
 - **元件頁在各自 repo 的 `docs/html/`**：
   - `AEC/docs/html/aec.html`

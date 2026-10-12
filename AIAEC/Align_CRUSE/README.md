@@ -6,9 +6,8 @@ output is a real magnitude mask applied to the microphone spectrum, preserving
 microphone phase. This project runs it as an **end-to-end AEC+RES+NR**
 candidate: the training target is `near_target` (denoised, dereverberated,
 echo-cancelled near speech), the same joint task and target DeepVQE-S uses.
-This candidate's earlier standalone AEC-only route (target `near_speech +
-local_noise`, noise deliberately preserved) was retired -- there is no more
-AEC-only candidate in this project.
+This project has no AEC-only candidate (a target of `near_speech + local_noise`,
+with noise deliberately preserved, is not trained here).
 
 Paper-aligned details:
 

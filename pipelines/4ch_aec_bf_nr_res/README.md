@@ -33,7 +33,7 @@ mic 3 ──> linear AEC 3 ─┘ (borrows lane 0's far_spec: aec_process_contex
 Each `linear AEC` box still runs its own PBFDKF/shadow filter, residual-echo
 (R2) estimate, and `DominantNearend` hold-state update every hop -- the echo
 path genuinely differs per microphone, and the next hop's onset-gated R2
-depends on that lane's own hold-state. What it no longer does is compute its
+depends on that lane's own hold-state. What it does not do is compute its
 own mono suppression gain: `AecConfig.spatial_linear_context=1` (set
 internally by this pipeline, not caller-configurable) skips straight to the
 `DominantNearend` update and leaves `res_gain` `NULL`, so the post-beam RES
@@ -372,10 +372,10 @@ recovery cases.
 One parity limitation remains explicit: `AecResContext` does not yet export
 the complete stationarity/AecState surface, so the post-beam RES omits the
 stationary mask. R2 itself is **not** bounded. The phase-bearing residual
-vector's intermediate used to be clamped, which broke the projection's
+vector's intermediate is not clamped: a clamp would break the projection's
 `|out|^2 == r2` contract — `r2` arrives int16^2-scaled while `echo_spec` is
-audio-scaled, so the honest scale routinely exceeds any fixed bound and the
-clamp simply understated residual echo. The bound is gone; only the overflow
+audio-scaled, so the honest scale routinely exceeds any fixed bound and a
+clamp would simply understate residual echo. Only the overflow
 fallback guards the intermediates, and it preserves the same magnitude
 contract for every finite float32 input.
 This is structurally correct but **not bit-exact** to a future fully extracted

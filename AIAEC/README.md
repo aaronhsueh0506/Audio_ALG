@@ -1,8 +1,7 @@
 # AIAEC models
 
-AIAEC keeps four candidates. The older GTCRN- and DeepFilterNet2-derived AENR
-variants were removed because Align-ULCNet now covers the linear-AEC + RES/NR
-route.
+AIAEC has four candidates. There are no GTCRN- or DeepFilterNet2-derived AENR
+variants: Align-ULCNet covers the linear-AEC + RES/NR route.
 
 | Route | Model | Model inputs | Training target | Status |
 |---|---|---|---|---|
@@ -105,8 +104,8 @@ learning rates and published training durations differ. Sharing the shape of
 the schedule does not equalise update count or audio exposure, so a win by one
 model is not attributable to architecture alone.
 
-This is a deliberate trade: per-paper fidelity was chosen over a shared
-protocol at d2c272f, and the two cannot both hold in one campaign. Whichever is
+This is a deliberate trade: per-paper fidelity is chosen over a shared
+protocol, and the two cannot both hold in one campaign. Whichever is
 wanted, it should be an explicit decision rather than an artefact:
 
 - **To rank architectures**, put all four on one optimiser, one schedule and
@@ -121,8 +120,8 @@ Align-ULCNet paper uses 64; DeepVQE-S and Align-CRUSE both publish batch 400
 Early stopping is disabled for all four shipped 50-epoch runs; validation still
 selects the best checkpoint. The common cosine schedule is a project decision,
 not a claim that all four papers published that schedule.
-Changing a loss recipe changes `loss_version`, so a checkpoint from the old
-generic recipe is rejected instead of silently resuming under a new objective.
+Changing a loss recipe changes `loss_version`, so a checkpoint trained under a different
+recipe is rejected instead of silently resuming under a new objective.
 The checkpoint contract also records the resolved training recipe -- optimizer
 name, learning rate, weight decay, amsgrad, schedule and the schedule's own
 scalars -- read once and used both to build the optimizer and to write the

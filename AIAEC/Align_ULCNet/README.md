@@ -465,7 +465,7 @@ The fixed front end never enters the quantized domain: each of the four feature
 inputs keeps its own quantization scale, and `sqrt`/`atan2`/`pow` stay out of
 the graph.
 
-**Every previously exported graph must be re-exported.** A descriptor written
+**Every graph exported under another layout must be re-exported.** A descriptor written
 for any other layout fails `ulcnet_model_io_descriptor_validate()` on
 `layout_version != ULCNET_MODEL_IO_LAYOUT_VERSION`, and
 `ulcnet_accelerator_adapter_init()` therefore returns NULL. The K/V and logit

@@ -131,7 +131,7 @@ selectable grids; the others have exactly one:
 |------|------|------|
 | **AEC linear path** | 0 samples | PBFDKF overlap-save 的當前 hop 線性誤差可立即取得 |
 | **Synthesis WOLA delay** | 1 hop | NR/RES 頻譜由 sqrt-Hann WOLA 重建；這就是 full-chain 的演算法延遲 |
-| **Pipeline total latency** | 1 hop — 16 ms @ 8 kHz, 8 ms @ 16 kHz default, 16 ms @ 16 kHz alt, ~10.7 ms @ 48 kHz | 不再額外保存上一個 AEC context；AEC-only 為 0 samples |
+| **Pipeline total latency** | 1 hop — 16 ms @ 8 kHz, 8 ms @ 16 kHz default, 16 ms @ 16 kHz alt, ~10.7 ms @ 48 kHz | 不額外保存上一個 AEC context；AEC-only 為 0 samples |
 | **Processing (per hop)** | < 0.5 ms | AEC + NR + RES 合計(ARM Cortex-A53 @ 1GHz 估計) |
 | **RTF** | < 0.05 | 遠低於即時要求 |
 
@@ -187,8 +187,8 @@ control block directly, not derived from the struct.)
 > filter_length 是 ms-derived（52 ms；≥44.1 kHz 用 64 ms → 48 kHz 為 3072
 > taps、6 partitions at hop=512），加長會等比增加 AEC 記憶體；記憶體吃緊時先縮
 > `filter_length` 與 NR 的 `L`（48 kHz 也可用 `n_partitions` override 換較短
-> 尾巴）。三個 rate 現在是各自 grid 的 hop=fft_size/2 規則自動推導
-> (`aec_derive_dims()`），不再是統一的 10 ms 規則；16 kHz 另外還有一個可選的
+> 尾巴）。三個 rate 各自依 grid 的 hop=fft_size/2 規則自動推導
+> (`aec_derive_dims()`），不是統一的 10 ms 規則；16 kHz 另外還有一個可選的
 > 512/256 grid（見上表）。並在 init 以 grid assert 驗證 pipeline/AEC/FFT/NR
 > 四方一致。
 
@@ -700,7 +700,7 @@ older power-dB (`/10`) convention.
 > regressions:
 > - **16 ms-authored** (retimed off a 16 ms/hop reference): `alpha_xi`, `L`, `alpha_attack`
 >   (all modes), and `alpha_d`/`alpha_g`/`alpha_decay` **in MILD/MODERATE/AGGRESSIVE only**.
-> - **10 ms-authored** (retimed off the legacy 10 ms/hop reference): `alpha_s`, `alpha_p`,
+> - **10 ms-authored** (retimed off a 10 ms/hop reference): `alpha_s`, `alpha_p`,
 >   `num_init_frames`, `scene_change_min_frames`, and `alpha_d`/`alpha_g`/`alpha_decay`
 >   **in BALANCED only** (BALANCED inherits these three straight from
 >   `anr_default_config_for_grid()`, which predates the 16 ms-hop grid switch).

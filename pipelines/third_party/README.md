@@ -101,11 +101,10 @@ values -- see `audio_pipeline_4ch.c`'s `..._doa_sample_rate()`/`..._doa_fft_size
 getters, which are pure pass-throughs). No allocation occurs in SRP/GSC
 per-frame processing.
 
-There is currently no separate/optional 16 kHz DOA mode: this paragraph
-previously described one, but no corresponding config field, flag, or
-second steering table exists anywhere in this directory or
-`audio_pipeline_4ch.c` (confirmed by grep) -- treat the two
-paragraphs below as aspirational, not implemented. `4ch_aec_bf_nr_res/README.md`'s
+There is no separate/optional 16 kHz DOA mode: no corresponding config field,
+flag, or second steering table exists anywhere in this directory or
+`audio_pipeline_4ch.c` -- the two paragraphs below describe a design that is
+not implemented. `4ch_aec_bf_nr_res/README.md`'s
 "There is no legacy/downsample grid entry" is the accurate statement of the
 current design. If a real 16 kHz-DOA-at-48-kHz-pipeline requirement ever
 lands, prefer first restricting SRP-PHAT's per-bin PHAT/pair-steering/scratch
@@ -120,11 +119,9 @@ mono/4ch AEC delay-estimator gap documented elsewhere in this repo.
 The gain stages are shaped by the same shared kernels as everything else here:
 `fix_gain` scales through `sk_scale_f32` and clips through `sk_clip_f32`,
 `nr_gain` scales through `sk_scale_f32`, and `post_gain` clamps and applies its
-per-bin gain through `sk_clip_f32`/`sk_capply_gain_f32`. `sk_scale_f32` is new,
-added for this integration: the broadcast multiply had three open-coded
-implementations, one of them a hand-written NEON loop in `audio_common`'s own
-`audio_pre_gain.c` guarded by a private copy of the `SK_HAVE_NEON` predicate.
-That copy is gone and all three sites now share one kernel.
+per-bin gain through `sk_clip_f32`/`sk_capply_gain_f32`. `sk_scale_f32` is the
+shared broadcast-multiply kernel; the gain stages call it instead of carrying
+their own loops.
 
 Two loops stay open-coded, each for a stated reason rather than by omission:
 `post_gain`'s box-average frequency smoother (a running accumulator would
@@ -154,5 +151,4 @@ make -C Audio_ALG/pipelines/4ch_aec_bf_nr_res test
 The complete pipeline supports `16k/256/128`, `16k/512/256`, and
 `48k/1024/512` (`sample-rate/frame/hop`, with frame equal to FFT), one grid
 at a time -- DOA, GSC and AEC/NR/RES all run at the same selected tuple
-(see `4ch_aec_bf_nr_res/README.md`). There is no DOA-downsample flag; the
-sentence that used to describe one above is corrected.
+(see `4ch_aec_bf_nr_res/README.md`). There is no DOA-downsample flag.

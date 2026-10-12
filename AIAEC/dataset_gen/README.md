@@ -17,9 +17,9 @@ Every generated WAV is a `(5, T)` tensor in `STEM_ORDER`:
 | 3 | `mic_postclip` | **Y** — what a model actually receives, after capture clipping/AGC. |
 | 4 | `linear_error` | **E** — frozen PBFDKF output, `Y - D_hat`. This is not oracle residual echo, and it is not unconditionally the filter's residual: the frontend runs the AEC3 post chain on the context seam, so a hop whose linear estimate the quality analyzer has not declared usable and whose residual carries more energy than the capture publishes the capture instead (`E == Y` there, crossfaded over 30 samples). |
 
-**N** (`local_noise`, ambient noise at the mic) is no longer a persisted
-stem: no current model task targets echo cancellation without denoising, so
-it is audit-only now, like `echo` and `mic_preclip` always were (see below).
+**N** (`local_noise`, ambient noise at the mic) is not a persisted stem: no
+current model task targets echo cancellation without denoising, so it is
+audit-only, like `echo` and `mic_preclip` (see below).
 
 The signal model the corpus exists to serve:
 
@@ -121,13 +121,13 @@ in-process, on the `RenderedSequence` a worker hands back
 - a curriculum keyed on `scenario` has to measure the chunk instead, which the
   separated stems make possible;
 - source-disjointness is audited at the renderer, not on the packed corpus;
-- the packer can no longer tell WHICH config, seed or manifest
+- the packer cannot tell WHICH config, seed or manifest
   produced a chunk. They check shape — chunk count, rate, length, channels,
   encoding — and nothing else. Resume into a directory only with the run that
   started it.
 
-The clip-level facts below still hold of the audio itself, they are simply no
-longer written down:
+The clip-level facts below describe the audio itself; they are not written
+down:
 
 `clipped` and `agc` are separate distortions — one memoryless and
 instantaneous, one a slow gain with memory — and a model that confuses them
@@ -147,8 +147,8 @@ pass a threshold filter.
 
 ### Layered scenes
 
-New corpora no longer choose one mutually-exclusive scenario. They draw four
-orthogonal layers:
+A corpus does not choose one mutually-exclusive scenario. Each sequence draws
+four orthogonal layers:
 
 - `[talk_modes]`: `far_only`, `near_only`, `double_talk`, or
   `duplex_random` (relative categorical weights);
@@ -207,15 +207,14 @@ all simultaneous conditions. A `ref_dropout` parent is mostly *not* in
 dropout, and a path-changing parent has exactly one transition chunk. New
 diagnostics must use `talk_mode`, `echo_mode`, `impairments` and
 `acoustic_tails` in-process (or
-measure the persisted separated stems). `sequence_scenario` remains only a
-legacy summary.
+measure the persisted separated stems). `sequence_scenario` is only a coarse
+summary.
 
 **`ref_dropout` is load-bearing.** During a dropout the far end is genuinely
 silent — `X == 0` **and** `D == 0` — so no model may hallucinate echo removal.
 Every current candidate is a joint AEC+NR route and may still suppress `N`, so
 `ref == 0 -> output == mic` is **not** a universal gate (that expectation
-belonged to the now-retired AEC-only Align-CRUSE route, which targeted
-`S+N`). `[dropout] ref_dropout_echo_continues_p` can make
+holds only for an AEC-only model whose target keeps `N`, i.e. `S+N`). `[dropout] ref_dropout_echo_continues_p` can make
 the loudspeaker keep playing while the reference is lost, but that asks the
 model to predict an echo from nothing, so it is **0 by default**: raising it
 trains hallucination.
@@ -700,7 +699,7 @@ python3 -m AIAEC.dataset_gen.pack_aec_dataset \
 ⚠ The packer needs `--config` because the frozen linear-AEC contract that
 produced the `linear_error` stem cannot be recovered from a WAV, and inference
 has to construct the same one. Pass the config the corpus was generated with;
-nothing cross-checks that claim any more.
+nothing cross-checks that claim.
 
 ⚠ `--output` must not already contain `shard_*.pt`. Loading a packed directory
 takes every `shard_*.pt` in it and there is no index file naming this pack's own
@@ -900,14 +899,12 @@ channel with the command below, which avoids repeating acoustic mixing:
 
 #### The one exception: verified frontend-equivalent migrations
 
-> **⚠ The table is empty.** The pair that carried the 200-hour
-> corpus forward (the fresh-instance `aec_reset()` composed with the 48-kHz
-> FilterAnalyzer correction, 16 kHz only) was retired when lib/aec retimed
-> the shadow-copy error-baseline retention per grid (0.995 → 0.992 on this
-> corpus's 512/256 grid) and made the C hard restart clear coarse/leakage
-> evidence: both **move `linear_error`**, so no byte-identity evidence can
-> describe a frontend after them. Every identity a corpus on disk may carry
-> is now in `RETIRED_BEHAVIOR_HASHES` and is refused with an instruction to
+> **⚠ The table is empty.** The current frontend (per-grid shadow-copy
+> error-baseline retention, C hard restart clearing coarse/leakage evidence)
+> **moves `linear_error`** relative to every earlier build, so no
+> byte-identity evidence can describe a corpus rendered by an earlier
+> frontend. Every identity a corpus on disk may carry is in
+> `RETIRED_BEHAVIOR_HASHES` and is refused with an instruction to
 > rematerialize (`rematerialize_linear_aec.py`, WITHOUT `--resume`, then
 > repack, then retrain), not with a bare hash mismatch. A corpus that also
 > needs the `[acoustic_tails]` mixture must be generated afresh instead —
@@ -945,8 +942,7 @@ before and after over a scene that actually reaches the changed code, and show
 the bytes are identical — plus a control proving the same harness *can* fail
 (render with the new mechanism enabled and confirm the bytes move). The
 byte-equality of a dead harness is worth nothing. The rationale and the numbers
-for each admitted entry live in the comment on the entry itself; the evidence
-for retired entries stays in the history of the revision that admitted them.
+for each admitted entry live in the comment on the entry itself.
 
 #### Released-checkpoint inference exception
 

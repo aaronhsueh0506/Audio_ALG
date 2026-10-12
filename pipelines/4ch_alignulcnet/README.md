@@ -47,21 +47,20 @@ nothing else. `process()` emits zeros for hop #0 only; the output of hop p
 (p >= 1) is the beamformed error of input hop p-1. Measured with a unit
 impulse: far at sample 2085 comes out at 2341, i.e. impulse + 256 exactly.
 
-This replaced a path that reconstructed a beam hop by WOLA and re-analysed
-it, which cost one IFFT plus one RFFT and one extra hop of latency per hop.
-Removed with it: the beam WOLA carves (`ifft`, `ola`, `synth_win`,
-`beam_hop`), the error-branch analysis state, the two-frame staging, the
+The beam hop is not reconstructed by WOLA and re-analysed (that would cost one
+IFFT plus one RFFT and one extra hop of latency per hop). The pipeline has none of: the beam WOLA carves
+(`ifft`, `ola`, `synth_win`, `beam_hop`), the error-branch analysis state, the two-frame staging, the
 one-hop far compensation buffer, and the C API entry point
 `audio_pipeline_4ch_ulcnet_last_beamformed_error()` — there is no
-reconstructed beam hop to hand out any more. The layout version
+reconstructed beam hop to hand out. The layout version
 (`AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION`) is **20**; a persisted
 descriptor from any earlier version is refused by
 `audio_pipeline_4ch_ulcnet_init_ex()`.
 
 Spectrogram-consistency note: `gsc_spectrum` is per-bin weighted, i.e. an
-inconsistent spectrogram, and the removed round trip projected it onto a
-consistent one. Measured earlier on real 4-channel recordings, that
-projection moved about -30 dB complex (-33 dB magnitude), -36..-43 dB over
+inconsistent spectrogram, and a WOLA round trip would project it onto a
+consistent one. Measured on real 4-channel recordings, that
+projection moves about -30 dB complex (-33 dB magnitude), -36..-43 dB over
 the 750-4000 Hz speech band and -22 dB at DC in the worst case. The direct
 path feeds the model the un-projected spectrum; no listening A/B has been
 done.

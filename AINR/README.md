@@ -42,7 +42,7 @@ WAV-only; optional sample metadata exists only in the in-process API. See
 
 ## Current DFN interpretation
 
-`DeepFilterNet2` is the branch to use for the restored DFN2 cascade/alpha
+`DeepFilterNet2` is the branch to use for the DFN2 cascade/alpha
 experiment. If it suppresses steady low-frequency speech, compare the output
 composition, target/loss behavior, normalization state, and low-frequency
 training coverage before attributing the result to the shared dataset.
