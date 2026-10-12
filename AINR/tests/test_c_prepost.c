@@ -311,6 +311,23 @@ static int test_dfn2_model_io(void)
           "DFN2 reset returns to init values and counts");
     dfn2_model_io_reset(NULL);
     dfn2_model_io_zero_recurrent(NULL);
+
+    /* The generation counts modulo 2^32, whichever call zeroes the state. */
+    state = healthy;
+    state.state_generation = 0xffffffffu;
+    dfn2_model_io_reset(&state);
+    CHECK(dfn2_model_io_state_generation(&state) == 0u,
+          "DFN2 reset wraps the generation modulo 2^32");
+    state.state_generation = 0xffffffffu;
+    dfn2_model_io_zero_recurrent(&state);
+    CHECK(dfn2_model_io_state_generation(&state) == 0u,
+          "DFN2 zero_recurrent wraps the generation modulo 2^32");
+    state = healthy;
+    state.state_generation = 0xffffffffu;
+    state.gru_hidden[0][0] = NAN;
+    CHECK(dfn2_model_io_validate_state(&state) != 0 &&
+          dfn2_model_io_state_generation(&state) == 0u,
+          "DFN2 a refused validation wraps the generation modulo 2^32");
     return 1;
 }
 
@@ -567,6 +584,17 @@ static int test_gtcrn_model_state(void)
           gtcrn_model_state_generation(&state) == 42u,
           "GTCRN reset zeroes the tensors and advances the generation");
     gtcrn_model_state_reset(NULL);
+
+    /* The generation counts modulo 2^32. */
+    state.state_generation = 0xffffffffu;
+    gtcrn_model_state_reset(&state);
+    CHECK(gtcrn_model_state_generation(&state) == 0u,
+          "GTCRN reset wraps the generation modulo 2^32");
+    state.state_generation = 0xffffffffu;
+    state.h_tra[0][0][0] = NAN;
+    CHECK(gtcrn_model_state_validate(&state) == -1 &&
+          gtcrn_model_state_generation(&state) == 0u,
+          "GTCRN a refused validation wraps the generation modulo 2^32");
     return 1;
 }
 

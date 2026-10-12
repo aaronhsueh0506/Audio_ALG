@@ -666,7 +666,11 @@ static int case_freqpool(FftHandle *fft) {
         ++stale.alignment;
         CHECK(deepvqe_prepost_init_ex(pool_time, (size_t)req_time.bytes,
                                       &cfg_time, &stale) == NULL);
-        /* Unperturbed again, so the five refusals above are attributable to
+        stale = req_time;
+        stale.io_mode = (uint32_t)DEEPVQE_IO_FREQ;
+        CHECK(deepvqe_prepost_init_ex(pool_time, (size_t)req_time.bytes,
+                                      &cfg_time, &stale) == NULL);
+        /* Unperturbed again, so the six refusals above are attributable to
          * the perturbation and not to the pool going stale on its own. */
         CHECK(deepvqe_prepost_init_ex(pool_time, (size_t)req_time.bytes,
                                       &cfg_time, &req_time) != NULL);

@@ -463,6 +463,22 @@ static int case_freqpool(FftHandle *fft) {
         ++stale.build_flags_hash;
         CHECK(ulcnet_prepost_init_ex(pool_time, (size_t)req_time.bytes,
                                      &cfg_time, &stale) == NULL);
+        stale = req_time;
+        ++stale.bytes;
+        CHECK(ulcnet_prepost_init_ex(pool_time, (size_t)req_time.bytes,
+                                     &cfg_time, &stale) == NULL);
+        stale = req_time;
+        stale.alignment *= 2u;
+        CHECK(ulcnet_prepost_init_ex(pool_time, (size_t)req_time.bytes,
+                                     &cfg_time, &stale) == NULL);
+        stale = req_time;
+        stale.io_mode = (uint32_t)ULCNET_IO_FREQ;
+        CHECK(ulcnet_prepost_init_ex(pool_time, (size_t)req_time.bytes,
+                                     &cfg_time, &stale) == NULL);
+        /* Unperturbed again, so the refusals above are attributable to the
+         * perturbation and not to the pool going stale on its own. */
+        CHECK(ulcnet_prepost_init_ex(pool_time, (size_t)req_time.bytes,
+                                     &cfg_time, &req_time) != NULL);
     }
     free(pool_time);
     free(pool_freq);

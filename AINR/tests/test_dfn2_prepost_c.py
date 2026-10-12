@@ -605,6 +605,12 @@ static int case_freqpool(FftHandle *fft) {
         stale = req_time; ++stale.bytes;
         CHECK(dfn2_prepost_init_ex(pool_time, (size_t)req_time.bytes,
                                    &cfg_time, &stale) == NULL);
+        stale = req_time; stale.alignment *= 2u;
+        CHECK(dfn2_prepost_init_ex(pool_time, (size_t)req_time.bytes,
+                                   &cfg_time, &stale) == NULL);
+        stale = req_time; stale.io_mode = (uint32_t)DFN2_IO_FREQ;
+        CHECK(dfn2_prepost_init_ex(pool_time, (size_t)req_time.bytes,
+                                   &cfg_time, &stale) == NULL);
     }
     free(pool_time);
     free(pool_freq);
