@@ -53,8 +53,8 @@ def test_one_hop_is_finite_and_exports_post_beam_context():
     microphones = np.stack(
         [np.roll(render, channel + 1) for channel in range(4)], axis=1
     )
-    pre = pipeline.process_pre_beamformer(microphones, render)
-    result = pipeline.process_post_beamformer(pre, _external_equal_weight(pre))
+    pre = pipeline.front_process(microphones, render)
+    result = pipeline.fuse(pre, _external_equal_weight(pre))
     assert pre.linear_channels.shape == (128, 4)
     assert len(pre.contexts) == 4
     assert pre.aligned_render.shape == (128,)
@@ -99,7 +99,7 @@ def test_pre_beamformer_context_is_reconstructing_wola(sample_rate, frame_size):
             ],
             axis=1,
         ).astype(np.float32)
-        pre = pipeline.process_pre_beamformer(microphones, render)
+        pre = pipeline.front_process(microphones, render)
         if pre.delay.changed:
             previous.fill(0.0)
         for channel, context in enumerate(pre.contexts):
@@ -128,9 +128,9 @@ def test_shared_far_reference_survives_zero_sum_beamformer_weights():
     rng = np.random.default_rng(11)
     render = (rng.standard_normal(128) * 0.05).astype(np.float32)
     microphones = np.stack([render * (0.2 + 0.1 * i) for i in range(4)], axis=1)
-    pre = pipeline.process_pre_beamformer(microphones, render)
+    pre = pipeline.front_process(microphones, render)
     beamformed = _ZeroSumBeamformer().process(pre.linear_hops, pre.contexts)
-    result = pipeline.process_post_beamformer(pre, beamformed)
+    result = pipeline.fuse(pre, beamformed)
     assert float(np.linalg.norm(result.context.far_spec)) > 0.0
     assert result.context.far_power > 0.0
 
@@ -145,7 +145,7 @@ def _contexts_for_scalar_fusion(sample_rate, frame_size):
     rng = np.random.default_rng(29)
     render = (rng.standard_normal(hop) * 0.02).astype(np.float32)
     microphones = np.stack([render * (0.2 + 0.1 * i) for i in range(4)], axis=1)
-    return pipeline.process_pre_beamformer(microphones, render)
+    return pipeline.front_process(microphones, render)
 
 
 @pytest.mark.parametrize("sample_rate,frame_size", [(16000, 256), (16000, 512), (48000, 1024)])
@@ -272,20 +272,20 @@ def test_shape_and_nonfinite_rejection():
         FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
     with pytest.raises(ValueError, match="shape"):
-        pipeline.process_pre_beamformer(
+        pipeline.front_process(
             np.zeros((128, 3), np.float32), np.zeros(128, np.float32)
         )
     bad = np.zeros((128, 4), np.float32)
     bad[0, 0] = np.nan
     with pytest.raises(ValueError, match="non-finite"):
-        pipeline.process_pre_beamformer(bad, np.zeros(128, np.float32))
+        pipeline.front_process(bad, np.zeros(128, np.float32))
 
 
 def test_one_call_path_requires_an_explicit_test_or_offline_adapter():
     pipeline = FourChannelAecPipeline(
         FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
-    with pytest.raises(RuntimeError, match="process_pre_beamformer"):
+    with pytest.raises(RuntimeError, match="front_process"):
         pipeline.process(np.zeros((128, 4), np.float32), np.zeros(128, np.float32))
     with pytest.raises(RuntimeError, match="explicit test/offline beamformer"):
         pipeline.process_signal(
@@ -315,15 +315,15 @@ def test_queued_pre_frames_are_snapshots_and_post_results_must_be_ordered():
     mics0 = np.stack([np.roll(render0, i + 1) for i in range(4)], axis=1)
     mics1 = np.stack([np.roll(render1, i + 2) for i in range(4)], axis=1)
 
-    pre0 = pipeline.process_pre_beamformer(mics0, render0)
+    pre0 = pipeline.front_process(mics0, render0)
     saved = pre0.contexts[0].error_spec.copy()
-    pre1 = pipeline.process_pre_beamformer(mics1, render1)
+    pre1 = pipeline.front_process(mics1, render1)
     np.testing.assert_array_equal(pre0.contexts[0].error_spec, saved)
 
     with pytest.raises(ValueError, match="out of order"):
-        pipeline.process_post_beamformer(pre1, _external_equal_weight(pre1))
-    result0 = pipeline.process_post_beamformer(pre0, _external_equal_weight(pre0))
-    result1 = pipeline.process_post_beamformer(pre1, _external_equal_weight(pre1))
+        pipeline.fuse(pre1, _external_equal_weight(pre1))
+    result0 = pipeline.fuse(pre0, _external_equal_weight(pre0))
+    result1 = pipeline.fuse(pre1, _external_equal_weight(pre1))
     assert (result0.frame_index, result1.frame_index) == (0, 1)
 
 
@@ -331,24 +331,24 @@ def test_reset_invalidates_external_frames_that_are_still_in_flight():
     pipeline = FourChannelAecPipeline(
         FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
     )
-    pre = pipeline.process_pre_beamformer(
+    pre = pipeline.front_process(
         np.zeros((128, 4), np.float32), np.zeros(128, np.float32)
     )
     beamformed = _external_equal_weight(pre)
     pipeline.reset()
     with pytest.raises(ValueError, match="invalidated by reset"):
-        pipeline.process_post_beamformer(pre, beamformed)
+        pipeline.fuse(pre, beamformed)
 
 
 def test_pre_frame_cannot_resume_on_a_different_pipeline_instance():
     config = FourChannelAecConfig(sample_rate=16000, frame_size=256, hop_size=128)
     source = FourChannelAecPipeline(config)
     other = FourChannelAecPipeline(config)
-    pre = source.process_pre_beamformer(
+    pre = source.front_process(
         np.zeros((128, 4), np.float32), np.zeros(128, np.float32)
     )
     with pytest.raises(ValueError, match="different pipeline"):
-        other.process_post_beamformer(pre, _external_equal_weight(pre))
+        other.fuse(pre, _external_equal_weight(pre))
 
 
 # ---------------------------------------------------------------------------
@@ -390,7 +390,7 @@ def _run_realign_scene():
     for index in range(len(script)):
         lo, hi = index * _REALIGN_HOP, (index + 1) * _REALIGN_HOP
         mics = np.repeat(mic[lo:hi, None], 4, axis=1)
-        pre = pipeline.process_pre_beamformer(mics, far[lo:hi])
+        pre = pipeline.front_process(mics, far[lo:hi])
         rows.append({
             "changed": bool(pre.delay.changed),
             "delay": int(pre.delay.delay_samples),

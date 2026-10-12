@@ -137,10 +137,10 @@ def evaluate(case_dir: Path, checkpoint: Path, seconds: float,
     candidates = {name: [] for name in VARIANTS}
     linear = np.zeros(count, np.float32)
     for start in range(0, count, hop):
-        pre = front.process_pre_beamformer(mics[start:start + hop],
+        pre = front.front_process(mics[start:start + hop],
                                            far_native[start:start + hop])
         bf = beamformer.process(pre.linear_hops, pre.contexts)
-        frame = front.process_post_beamformer(pre, bf)
+        frame = front.fuse(pre, bf)
         contexts.append(frame.context)
         candidates['raw_capture'].append(
             np.asarray(pre.contexts[config.capture_proxy_channel].near_spec).copy())

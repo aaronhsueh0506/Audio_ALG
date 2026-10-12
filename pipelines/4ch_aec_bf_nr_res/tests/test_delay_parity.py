@@ -317,7 +317,7 @@ def _python_matched_rows(delay, fft, hops, shift_at=None, shift_delay=None,
             mics = mics.copy()
             mics[:, config.capture_proxy_channel] += (
                 proxy_extra[index * hop:(index + 1) * hop])
-        pre = pipeline.process_pre_beamformer(mics, far_hop)
+        pre = pipeline.front_process(mics, far_hop)
         rows.append(_row(index, pre.delay.delay_samples, pre.delay.solid,
                          pre.delay.changed, far_hop, pre.aligned_render))
     return hop, far, rows

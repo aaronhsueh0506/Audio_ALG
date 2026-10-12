@@ -1,11 +1,16 @@
 """Shared-delay, four-linear-filter AEC front end for microphone arrays.
 
 This Python reference deliberately does not implement SRP-PHAT or GSC.  Its
-production API is split at that ownership boundary::
+production API is split at that ownership boundary, with the stage names of the
+C core (four_aec_front_process / four_aec_fuse)::
 
-    pre = pipeline.process_pre_beamformer(mics, render)
-    bf = external_srp_gsc(pre.linear_channels)
-    post = pipeline.process_post_beamformer(pre, bf)
+    front = pipeline.front_process(mics, render)
+    bf = external_srp_gsc(front.linear_channels)
+    post = pipeline.fuse(front, bf)     # projection + post-beam RES gain
+    spec = post.spec_frame()            # the SeSpecFrame the later stages read
+
+The stages after the fuse (NR gain, min, apply, comfort noise, synthesis) are
+the functions of pipelines/aec_nr_pipeline.py over that frame.
 
 The optional ``Beamformer`` object and ``EqualWeightBeamformer`` exist only for
 integration tests and offline fixtures.  Requiring the external stage to return
@@ -21,6 +26,10 @@ from typing import Optional, Protocol, Sequence
 
 import numpy as np
 
+try:                                    # imported as pipelines.4ch_aec_bf_nr_res
+    from pipelines.se_stage import SeSpecFrame, frame_from_context
+except ImportError:                     # run from the pipelines directory
+    from se_stage import SeSpecFrame, frame_from_context
 from lib.aec.python.modules.config import AecConfig
 from lib.aec.python.modules.dataclasses import AecResContext
 from lib.aec.python.modules.delay.legacy_compat import LegacyDelayShim
@@ -347,7 +356,7 @@ class BeamformerFrame:
 
 
 @dataclass(frozen=True)
-class PreBeamformerFrame:
+class FrontFrame:
     """Owned handoff from four linear AEC lanes to external SRP-PHAT/GSC.
 
     ``linear_channels`` is ``[hop, 4]``.  ``contexts`` and ``aligned_render``
@@ -458,6 +467,15 @@ class FourChannelFrame:
     beamformed: np.ndarray
     context: AecResContext
     delay: SharedDelayState
+
+    def spec_frame(self) -> SeSpecFrame:
+        """The borrowed-view equivalent of the C ``four_aec_fuse`` result: E is
+        the beamformed error, y / r2 / comfort noise the projected context.  The
+        post-beam residual gain is ``context.res_gain`` (the C stage returns it
+        from ``se_res_stage_gain`` rather than carrying it in the frame)."""
+        frame = frame_from_context(self.context, self.beamformed.shape[0])
+        return replace(frame, g_res_ctx=None, delay_changed=self.delay.changed,
+                       delay_locked=bool(self.delay.solid))
 
 
 # ---------------------------------------------------------------------------
@@ -886,9 +904,9 @@ class FourChannelAecPipeline:
         self._next_pre_frame = 0
         self._next_post_frame = 0
 
-    def process_pre_beamformer(
+    def front_process(
         self, microphones: np.ndarray, render: np.ndarray
-    ) -> PreBeamformerFrame:
+    ) -> FrontFrame:
         """Run only shared alignment and four independent linear AEC lanes."""
         microphones = np.asarray(microphones, dtype=np.float32)
         render = np.asarray(render, dtype=np.float32)
@@ -960,7 +978,7 @@ class FourChannelAecPipeline:
             )
             contexts.append(_snapshot_context(context))
 
-        frame = PreBeamformerFrame(
+        frame = FrontFrame(
             frame_index=self._next_pre_frame,
             generation=self._generation,
             _owner_token=self._owner_token,
@@ -972,8 +990,8 @@ class FourChannelAecPipeline:
         self._next_pre_frame += 1
         return frame
 
-    def process_post_beamformer(
-        self, pre: PreBeamformerFrame, beamformed: BeamformerFrame
+    def fuse(
+        self, pre: FrontFrame, beamformed: BeamformerFrame
     ) -> FourChannelFrame:
         """Resume with one external mono/weight result and calculate mono RES.
 
@@ -982,8 +1000,8 @@ class FourChannelAecPipeline:
         the one stateful post-beam residual-gain calculator.  Results must be
         returned in order because that RES state is temporal.
         """
-        if not isinstance(pre, PreBeamformerFrame):
-            raise TypeError("pre must be a PreBeamformerFrame from this pipeline")
+        if not isinstance(pre, FrontFrame):
+            raise TypeError("pre must be a FrontFrame from this pipeline")
         if pre._owner_token is not self._owner_token:
             raise ValueError("pre-beamformer frame belongs to a different pipeline")
         if pre.generation != self._generation:
@@ -1016,13 +1034,13 @@ class FourChannelAecPipeline:
         """Test/offline convenience path using an explicitly configured adapter."""
         if self._beamformer is None:
             raise RuntimeError(
-                "no beamformer is configured: call process_pre_beamformer(), "
+                "no beamformer is configured: call front_process(), "
                 "run the external SRP-PHAT/GSC, then call "
-                "process_post_beamformer()"
+                "fuse()"
             )
-        pre = self.process_pre_beamformer(microphones, render)
+        pre = self.front_process(microphones, render)
         beamformed = self._beamformer.process(pre.linear_hops, pre.contexts)
-        return self.process_post_beamformer(pre, beamformed)
+        return self.fuse(pre, beamformed)
 
     def process_signal(
         self, microphones: np.ndarray, render: np.ndarray

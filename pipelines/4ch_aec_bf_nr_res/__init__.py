@@ -21,7 +21,7 @@ EqualWeightBeamformer = _pipeline.EqualWeightBeamformer
 FourChannelAecConfig = _pipeline.FourChannelAecConfig
 FourChannelAecPipeline = _pipeline.FourChannelAecPipeline
 FourChannelFrame = _pipeline.FourChannelFrame
-PreBeamformerFrame = _pipeline.PreBeamformerFrame
+FrontFrame = _pipeline.FrontFrame
 SharedDelayState = _pipeline.SharedDelayState
 SharedMatchedDelayEstimator = _pipeline.SharedMatchedDelayEstimator
 
@@ -32,7 +32,7 @@ __all__ = [
     "FourChannelAecConfig",
     "FourChannelAecPipeline",
     "FourChannelFrame",
-    "PreBeamformerFrame",
+    "FrontFrame",
     "SharedDelayState",
     "SharedMatchedDelayEstimator",
 ]

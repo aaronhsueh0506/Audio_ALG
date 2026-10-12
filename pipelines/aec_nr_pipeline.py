@@ -37,6 +37,11 @@ from lib.nr.python.denoisers import MmseLsaDenoiser
 from lib.nr.python.core.nr_strength import apply_strength
 from lib.nr.python.process_audio import build_v3_2_base_params, load_config
 
+try:                                    # imported as pipelines.aec_nr_pipeline
+    from pipelines.se_stage import SeSpecFrame, frame_from_context
+except ImportError:                     # run from the pipelines directory
+    from se_stage import SeSpecFrame, frame_from_context
+
 # The standalone ResFilter was retired in AEC v3.21; the separated
 # `--pipeline-mode linear` (AEC-linear -> NR -> RES) is now rebuilt on the
 # AEC3 freq-domain seam (AecConfig.return_res_context exposes the linear
@@ -339,6 +344,59 @@ def synth_window(frame_size):
     return np.sqrt(0.5 * (1.0 - np.cos(2.0 * np.pi * idx / float(frame_size)))
                    ).astype(np.float32)
 
+def total_gain(g_nr, g_res, use_nr: bool, use_res: bool, combine: str,
+               n_freqs: int) -> np.ndarray:
+    """Per-bin gain applied to E(f): the Python twin of ``sk_min_f32``.
+
+    A_min_pl (``combine='min'``, both gains on): the per-bin min recovers the
+    AEC3 echo gain that v0 discarded -- near-end bins (g_res~1) keep g_nr; echo
+    bins (g_res<g_nr) cut the leak -- WITHOUT the product's double-cut on
+    double-talk near-end.  A disabled source reads as the unity gain.
+    """
+    if use_nr and use_res and combine == 'min':
+        return np.minimum(g_nr, g_res).astype(np.float32)
+    return (g_nr * g_res).astype(np.float32) if (use_nr or use_res) \
+        else np.ones(n_freqs, dtype=np.float32)
+
+
+def apply_gain(frame: SeSpecFrame, g_total: np.ndarray) -> np.ndarray:
+    """S(f) = E(f) . g_total: the Python twin of ``sk_capply_gain_f32``."""
+    return frame.e.astype(np.complex64) * g_total
+
+
+def comfort_noise_fill(spec: np.ndarray, frame: SeSpecFrame, g_aec, cn_scale,
+                       rng: np.random.RandomState) -> np.ndarray:
+    """Comfort noise on the cut bins: the Python twin of ``aec_cng_fill``.
+
+    Port of AEC3 RES CNG; the AEC3 sin-LUT/LCG source is approximated with
+    deterministic Gaussian noise at the same per-bin level -- this is a
+    separated-pipeline baseline, not bit-identical to the internal RES.  The
+    level is sqrt(N^2/PSD_SCALE) * sqrt(1 - G_res^2) * cn_scale; which bins it
+    fills is decided by AEC suppression alone, never by g_total.
+    """
+    n_freqs = frame.n_freqs
+    psd_scale = 32768.0 ** 2         # int16² scale of ctx.comfort_noise (AEC3)
+    n_amp = np.sqrt(np.maximum(frame.cn / psd_scale, 0.0)).astype(np.float32)
+    noise_gain = np.sqrt(np.maximum(1.0 - g_aec ** 2, 0.0)).astype(np.float32)
+    cn = np.zeros(n_freqs, dtype=np.complex64)
+    cn[1:-1] = (n_amp[1:-1]
+                * (rng.randn(n_freqs - 2) + 1j * rng.randn(n_freqs - 2)))
+    return spec + noise_gain * cn_scale * cn
+
+
+def synthesize_hop(spec: np.ndarray, ola: np.ndarray, synth_win: np.ndarray,
+                   fft: int, bs: int, hop: int) -> np.ndarray:
+    """Inverse transform, windowed overlap-add and the hop emit/shift: the
+    Python twin of ``ac_istft_push``.  Updates ``ola`` in place and returns the
+    emitted hop."""
+    e_full = np.fft.irfft(spec, n=fft).astype(np.float32)
+    ola += e_full[:bs] * synth_win
+    emitted = ola[:hop].copy()
+    ola[:-hop] = ola[hop:]
+    ola[-hop:] = 0.0
+    return emitted
+
+
 def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
             aec_contexts: List[AecResContext],
             config: AecConfig,
@@ -355,7 +413,10 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
 
     then one sqrt-Hann OLA — no standalone ResFilter, no extra FFT round-trip.
     The sqrt-Hann synthesis window matches the AEC's ``_aec3_synth_window`` exactly
-    (periodic Hann, denom = block_size) for perfect reconstruction.
+    (periodic Hann, denom = block_size) for perfect reconstruction.  Per hop
+    the steps are those of the C applications, in the same order:
+    ``total_gain`` (min) -> ``apply_gain`` -> ``comfort_noise_fill`` ->
+    ``synthesize_hop``.
 
     Frame alignment: ``ctx[i].error_spec`` spans [(i-1)*hop, (i+1)*hop) (AEC
     analysis window ends at the current hop). In ``--pipeline-mode freq`` NR
@@ -378,7 +439,6 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
         raise ValueError(
             f"50% overlap invariant violated: frame_size={bs}, hop_size={hop}"
         )
-    psd_scale = 32768.0 ** 2         # int16² scale of ctx.comfort_noise (AEC3)
 
     synth_win = synth_window(bs)
     ola = np.zeros(bs, dtype=np.float32)
@@ -398,8 +458,9 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
             n_frames = i
             break
 
+        frame = frame_from_context(ctx, hop)
         g_nr = nr_gains[i].astype(np.float32) if use_nr else 1.0
-        g_res = ctx.res_gain.astype(np.float32) if use_res else 1.0
+        g_res = frame.g_res_ctx.astype(np.float32) if use_res else 1.0
         # Save AEC-only gain before combining with G_nr: which bins the comfort
         # noise fills is decided by AEC suppression alone (sqrt(1 - G_res^2)),
         # never by g_total. Its LEVEL is then scaled by G_nr, bounded below by
@@ -408,33 +469,11 @@ def run_res(nr_output: np.ndarray, nr_gains: np.ndarray,
         # gain is applied to it here.
         g_aec = g_res if isinstance(g_res, np.ndarray) else np.full(n_freqs, g_res, dtype=np.float32)
         cn_scale = np.maximum(g_nr, CNG_NR_GAIN_FLOOR) if isinstance(g_nr, np.ndarray) else 1.0
-        if use_nr and use_res and combine == 'min':
-            # A_min_pl: per-bin min recovers the AEC3 echo gain that v0 discarded
-            # — near-end bins (g_res≈1) keep g_nr; echo bins (g_res<g_nr) cut the
-            # leak — WITHOUT the product's double-cut on double-talk near-end.
-            g_total = np.minimum(g_nr, g_res).astype(np.float32)
-        else:
-            g_total = (g_nr * g_res).astype(np.float32) if (use_nr or use_res) \
-                else np.ones(n_freqs, dtype=np.float32)
-        spec = ctx.error_spec.astype(np.complex64) * g_total
-
-        # Comfort noise fills the suppressed bins (port of AEC3 RES CNG; the
-        # AEC3 sin-LUT/LCG source is approximated with deterministic Gaussian
-        # noise at the same per-bin level — this is a separated-pipeline
-        # baseline, not bit-identical to the internal RES).
-        if config.enable_cng and ctx.comfort_noise is not None:
-            n_amp = np.sqrt(np.maximum(ctx.comfort_noise / psd_scale, 0.0)).astype(np.float32)
-            noise_gain = np.sqrt(np.maximum(1.0 - g_aec ** 2, 0.0)).astype(np.float32)
-            cn = np.zeros(n_freqs, dtype=np.complex64)
-            cn[1:-1] = (n_amp[1:-1]
-                        * (rng.randn(n_freqs - 2) + 1j * rng.randn(n_freqs - 2)))
-            spec = spec + noise_gain * cn_scale * cn
-
-        e_full = np.fft.irfft(spec, n=fft).astype(np.float32)
-        ola += e_full[:bs] * synth_win
-        output[start:end] = ola[:hop]
-        ola[:-hop] = ola[hop:]
-        ola[-hop:] = 0.0
+        g_total = total_gain(g_nr, g_res, use_nr, use_res, combine, n_freqs)
+        spec = apply_gain(frame, g_total)
+        if config.enable_cng and frame.cn is not None:
+            spec = comfort_noise_fill(spec, frame, g_aec, cn_scale, rng)
+        output[start:end] = synthesize_hop(spec, ola, synth_win, fft, bs, hop)
 
     # Copy tail (frames beyond AEC/NR context)
     tail_start = n_frames * hop

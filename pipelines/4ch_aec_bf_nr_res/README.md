@@ -294,7 +294,7 @@ FourChannelAecPipeline = aec4.FourChannelAecPipeline
 pipeline = FourChannelAecPipeline()      # no beamformer is created
 
 # 1. Our code: one shared aligner + four linear AEC lanes.
-pre = pipeline.process_pre_beamformer(microphones_hop, far_hop)
+pre = pipeline.front_process(microphones_hop, far_hop)
 
 # 2. External Python owner: SRP-PHAT + GSC. The complete C wrapper supplies
 #    this stage, but the Python reference intentionally keeps the seam open.
@@ -303,7 +303,7 @@ mono_hop, effective_weights = external_srp_gsc.process(pre.linear_channels)
 # 3. Our code again: project AEC context with those exact weights and calculate
 #    one mono residual-suppression gain. The existing mono NR+RES seam consumes
 #    post.beamformed and post.context.
-post = pipeline.process_post_beamformer(
+post = pipeline.fuse(
     pre,
     BeamformerFrame(samples=mono_hop, weights=effective_weights),
 )
@@ -317,7 +317,7 @@ Python shapes and ordering are contractual:
   `out[f] = sum(weights[ch,f] * in[ch,f])`;
 - external results must resume in `frame_index` order because post-BF RES has
   temporal state;
-- a queued Python `PreBeamformerFrame` owns snapshots of all four contexts, so
+- a queued Python `FrontFrame` owns snapshots of all four contexts, so
   later linear-AEC calls cannot overwrite it;
 - a queued frame is bound to the pipeline instance that created it and cannot
   resume on another instance;

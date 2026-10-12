@@ -22,10 +22,10 @@ def _c_lut_literals():
 
 
 def _c_seed():
-    source = (ROOT / 'pipelines' / 'mono_aec_nr_res' / 'audio_pipeline.c'
+    source = (ROOT / 'pipelines' / 'common' / 'se_stage.h'
               ).read_text(encoding='utf-8')
-    match = re.search(r'#define\s+AUDIO_PIPELINE_RNG_SEED\s+0x([0-9a-fA-F]+)u', source)
-    assert match, 'AUDIO_PIPELINE_RNG_SEED not found'
+    match = re.search(r'#define\s+SE_CNG_RNG_SEED\s+0x([0-9a-fA-F]+)u', source)
+    assert match, 'SE_CNG_RNG_SEED not found'
     return int(match.group(1), 16)
 
 

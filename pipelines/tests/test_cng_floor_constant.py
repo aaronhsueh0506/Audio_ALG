@@ -1,9 +1,9 @@
-"""The comfort-noise scaling floor is one value in five places.
+"""The comfort-noise scaling floor is one value in four places.
 
-Each pipeline keeps its own copy of ``CNG_NR_GAIN_FLOOR`` (the pipelines are
-deliberately self-contained), the Python twin mirrors it, and the two C
-witnesses pin the contract with a literal of their own. Nothing in the build
-ties them together, so this reads all five straight from the source text and
+The C pipelines share ``SE_CNG_NR_GAIN_FLOOR`` (pipelines/common/se_stage.h),
+the Python twin mirrors it, and the two C witnesses pin the contract with a
+literal of their own. Nothing in the build ties the mirror and the witnesses
+to the header, so this reads all four straight from the source text and
 refuses a retune that reaches only some of them.
 """
 import pathlib
@@ -12,10 +12,8 @@ import re
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 SITES = {
-    'mono pipeline': (ROOT / 'mono_aec_nr_res' / 'audio_pipeline.c',
-                      r'^#define\s+CNG_NR_GAIN_FLOOR\s+([0-9.]+)f\s*$'),
-    '4ch core': (ROOT / '4ch_aec_bf_nr_res' / '4aec_nr_res.c',
-                 r'^#define\s+CNG_NR_GAIN_FLOOR\s+([0-9.]+)f\s*$'),
+    'shared C header': (ROOT / 'common' / 'se_stage.h',
+                        r'^#define\s+SE_CNG_NR_GAIN_FLOOR\s+([0-9.]+)f\s*$'),
     'python twin': (ROOT / 'aec_nr_pipeline.py',
                     r'^CNG_NR_GAIN_FLOOR\s*=\s*([0-9.]+)\s*$'),
     'mono witness': (ROOT / 'mono_aec_nr_res' / 'tests' / 'test_audio_pipeline.c',
@@ -37,5 +35,5 @@ def test_cng_floor_is_one_value_everywhere():
 
 
 def test_cng_floor_is_minus_ten_db():
-    value = float(_declared(*SITES['mono pipeline']))
+    value = float(_declared(*SITES['shared C header']))
     assert abs(value - 10.0 ** (-10.0 / 20.0)) < 1e-7

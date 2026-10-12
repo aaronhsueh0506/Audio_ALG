@@ -114,7 +114,7 @@ def evaluate_case(case_dir: Path, output_dir: Optional[Path] = None) -> dict:
 
     config = FourChannelAecConfig(sample_rate=sample_rate)
     # Explicit fixture adapter. Production leaves the beamformer unset and
-    # drives process_pre_beamformer()/process_post_beamformer() around the
+    # drives front_process()/fuse() around the
     # externally owned SRP-PHAT/GSC implementation.
     pipeline = FourChannelAecPipeline(config)
     fixture_beamformer = EqualWeightBeamformer()
@@ -125,14 +125,14 @@ def evaluate_case(case_dir: Path, output_dir: Optional[Path] = None) -> dict:
     for frame_index in range(n_complete):
         start = frame_index * pipeline.hop_size
         stop = start + pipeline.hop_size
-        pre = pipeline.process_pre_beamformer(
+        pre = pipeline.front_process(
             microphones[start:stop], far_aligned[start:stop]
         )
         # Deliberately cross the same ownership seam the external algorithm
         # will use.  The adapter supplies no SRP/GSC behavior; it only makes
         # both sides of our contract executable in this repository.
         external = fixture_beamformer.process(pre.linear_hops, pre.contexts)
-        result = pipeline.process_post_beamformer(pre, external)
+        result = pipeline.fuse(pre, external)
         linear[start:stop] = result.beamformed
         contexts.append(result.context)
         delays.append(result.delay)
