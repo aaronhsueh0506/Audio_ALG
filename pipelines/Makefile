@@ -946,8 +946,8 @@ endif
 FWD = BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) CC='$(CC)' CXX='$(CXX)' EXTRA_CFLAGS='$(EXTRA_CFLAGS)' NO_STDIO=$(NO_STDIO) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) DEBUG=$(DEBUG)
 
 ifeq ($(AC_LIB),)
-.PHONY: all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a
-all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a:
+.PHONY: all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a
+all test libs _publish_impl aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common example-adapter libaudio_pipeline.a libaudio_pipeline_dfn.a:
 	+@ac="$$($(MAKE) -s --no-print-directory -C $(AC_DIR) $(FWD) print-lib-path)"; \
 	 test -n "$$ac" || { echo "FATAL: could not resolve audio_common archive path (AC_DIR=$(AC_DIR) -- is audio_common present as a sibling of Audio_ALG?)" >&2; exit 1; }; \
 	 aec="$$($(MAKE) -s --no-print-directory -C $(AEC_DIR) $(FWD) AC_DIR=$(abspath $(AC_DIR)) AC_LIB="$$ac" print-lib-path)"; \
@@ -994,7 +994,7 @@ endif
 # guard-skip knob must not alias a guarded build), SRCS (this
 # Makefile's own compiled sources -- the archive's one member TU plus the
 # CLI/test TUs -- so a source-set change keys to a fresh directory).
-CFG_SIG_PAYLOAD := ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c dfn_res_stage.c dfn_rate_bridge.c tests/test_dfn_res_stage.c tests/test_dfn_rate_bridge.c mono_aec_dfn_res/audio_pipeline_dfn.c mono_aec_dfn_res/tests/test_audio_pipeline_dfn.c mono_aec_dfn_res/main.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c)
+CFG_SIG_PAYLOAD := ULCNET_GRID=$(ULCNET_GRID) CC=$(CC) CXX=$(CXX) AR=$(AR) RANLIB=$(RANLIB) LINK=$(LINK) CFLAGS=$(CFLAGS) CXXFLAGS=$(CXXFLAGS) CPPFLAGS=$(CPPFLAGS) LDFLAGS=$(LDFLAGS) EXTRA_CFLAGS=$(EXTRA_CFLAGS) EXTRA_LDFLAGS=$(EXTRA_LDFLAGS) BACKEND=$(BACKEND) SIMD=$(SIMD) PROFILE=$(PROFILE) WERROR=$(WERROR) NO_STDIO=$(NO_STDIO) DEBUG=$(DEBUG) TOOLCHAIN_CHECK=$(TOOLCHAIN_CHECK) AC_PRODUCER_SIG=$(AC_PRODUCER_SIG) AEC_PRODUCER_SIG=$(AEC_PRODUCER_SIG) NR_PRODUCER_SIG=$(NR_PRODUCER_SIG) SRCS=$(sort common/se_anr_stage.c common/se_config.c mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/main.c mono_aec_nr_res/static_main.c mono_aec_nr_res/tests/test_audio_pipeline.c mono_aec_nr_res/example_board_adapter.c mono_alignulcnet/audio_pipeline_ulcnet.c mono_alignulcnet/tests/test_audio_pipeline_ulcnet.c $(ULCNET_DIR)/ulcnet_accelerator_adapter.c $(ULCNET_DIR)/ulcnet_prepost.c $(ULCNET_DIR)/ulcnet_process.c $(ULCNET_DIR)/ulcnet_model_io.c $(AIAEC_DIR)/tests/test_ulcnet_accelerator_adapter.c mono_alignulcnet/main.c dfn_res_stage.c dfn_rate_bridge.c tests/test_dfn_res_stage.c tests/test_dfn_rate_bridge.c tests/test_se_common.c mono_aec_dfn_res/audio_pipeline_dfn.c mono_aec_dfn_res/tests/test_audio_pipeline_dfn.c mono_aec_dfn_res/main.c $(DFN2_DIR)/dfn2_process.c $(DFN2_DIR)/dfn2_model_io.c $(DFN2_DIR)/dfn2_prepost.c)
 CFG_SIG := $(shell printf '%s' "$(CFG_SIG_PAYLOAD)" | cksum | cut -d' ' -f1)
 
 # OBJ_ROOT / BIN_ROOT: where THIS repo's own keyed
@@ -1064,7 +1064,17 @@ $(OBJ_DIR)/aec_nr_pipeline_static.o: mono_aec_nr_res/static_main.c mono_aec_nr_r
 # separate libraries a consumer links alongside it, same as both CLIs do.
 # Compiled with $(LIB_CFLAGS) (not the shared $(CFLAGS)) so NO_STDIO=1 only
 # ever affects THIS object -- see the NO_STDIO comment near CFLAGS above.
-$(OBJ_DIR)/audio_pipeline.o: mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/audio_pipeline.h mono_aec_nr_res/pipeline_dims.h | _cfg_guard
+$(OBJ_DIR)/audio_pipeline.o: mono_aec_nr_res/audio_pipeline.c mono_aec_nr_res/audio_pipeline.h common/se_config.h common/se_anr_stage.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+# se_config.o / se_anr_stage.o: the configuration and noise-reduction stage code
+# shared by the AEC pipelines. Members of libaudio_pipeline.a; the ULCNet
+# application, which has no NR, links se_config.o directly. LIB_CFLAGS for the
+# same NO_STDIO reason as audio_pipeline.o.
+$(OBJ_DIR)/se_config.o: common/se_config.c common/se_config.h | _cfg_guard
+	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
+
+$(OBJ_DIR)/se_anr_stage.o: common/se_anr_stage.c common/se_anr_stage.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -MD -MP -c -o $@ $<
 
 # test_audio_pipeline: standalone acceptance test for audio_pipeline.h itself
@@ -1133,6 +1143,9 @@ $(OBJ_DIR)/dfn2_prepost.o: $(DFN2_DIR)/dfn2_prepost.c $(DFN2_DIR)/dfn2_prepost.h
 $(OBJ_DIR)/dfn_res_stage.o: dfn_res_stage.c dfn_res_stage.h $(DFN2_DIR)/dfn2_prepost.h | _cfg_guard
 	$(CC) $(LIB_CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
+$(OBJ_DIR)/test_se_common.o: tests/test_se_common.c common/se_config.h common/se_anr_stage.h | _cfg_guard
+	$(CC) $(CFLAGS) -MD -MP -c -o $@ $<
+
 $(OBJ_DIR)/test_dfn_res_stage.o: tests/test_dfn_res_stage.c dfn_res_stage.h tests/dfn_test_fixture.h dfn_unit_partition.h | _cfg_guard
 	$(CC) $(CFLAGS) -I$(DFN2_DIR) -MD -MP -c -o $@ $<
 
@@ -1180,7 +1193,7 @@ libaudio_pipeline.a: $(LIB_TARGET)
 # One chained shell line with a PID-suffixed temp: two
 # same-config processes racing this rule each write their OWN temp, final mv
 # is atomic last-writer-wins. See audio_common's Makefile.
-$(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o | _cfg_guard
+$(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o | _cfg_guard
 	t="$@.tmp.$$$$" && rm -f "$$t" && $(AR) rcs "$$t" $^ && $(RANLIB) "$$t" && mv -f "$$t" $@
 	@echo "libaudio_pipeline.a [$(BACKEND)] -> $@"
 
@@ -1189,7 +1202,7 @@ $(LIB_TARGET): $(OBJ_DIR)/audio_pipeline.o | _cfg_guard
 # NR_LIB, always set together by phase 1's re-invoke) is known.
 # =============================================================================
 ifneq ($(AC_LIB),)
-.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn example-adapter example_board_adapter libaudio_pipeline_dfn.a FORCE
+.PHONY: all test libs aec_nr_pipeline aec_nr_pipeline_static mono_alignulcnet mono_aec_dfn_res test_audio_pipeline test_audio_pipeline_ulcnet test_ulcnet_accelerator_adapter test_dfn_res_stage test_dfn_rate_bridge test_audio_pipeline_dfn test_se_common example-adapter example_board_adapter libaudio_pipeline_dfn.a FORCE
 all: $(BIN_DIR)/aec_nr_pipeline $(BIN_DIR)/aec_nr_pipeline_static $(BIN_DIR)/mono_alignulcnet $(DFN_LIB_TARGET) $(BIN_DIR)/mono_aec_dfn_res
 
 libaudio_pipeline_dfn.a: $(DFN_LIB_TARGET)
@@ -1204,7 +1217,7 @@ $(DFN_LIB_TARGET): $(DFN_PIPELINE_OBJS) | _cfg_guard
 # its own failure modes (a positive-flow step or negative-demonstration
 # check failing) are exactly the kind of regression this gate exists to
 # catch. `make example-adapter` (below) remains available standalone too.
-test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter $(BIN_DIR)/test_audio_pipeline_ulcnet $(BIN_DIR)/test_ulcnet_accelerator_adapter $(BIN_DIR)/test_dfn_res_stage $(BIN_DIR)/test_dfn_rate_bridge $(BIN_DIR)/test_audio_pipeline_dfn $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
+test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter $(BIN_DIR)/test_audio_pipeline_ulcnet $(BIN_DIR)/test_ulcnet_accelerator_adapter $(BIN_DIR)/test_dfn_res_stage $(BIN_DIR)/test_dfn_rate_bridge $(BIN_DIR)/test_audio_pipeline_dfn $(BIN_DIR)/test_se_common $(BIN_DIR)/mono_alignulcnet $(BIN_DIR)/mono_aec_dfn_res
 	"$(abspath $(BIN_DIR))/test_audio_pipeline"
 	"$(abspath $(BIN_DIR))/example_board_adapter"
 	"$(abspath $(BIN_DIR))/test_audio_pipeline_ulcnet"
@@ -1212,6 +1225,7 @@ test: $(BIN_DIR)/test_audio_pipeline $(BIN_DIR)/example_board_adapter $(BIN_DIR)
 	"$(abspath $(BIN_DIR))/test_dfn_res_stage"
 	"$(abspath $(BIN_DIR))/test_dfn_rate_bridge"
 	"$(abspath $(BIN_DIR))/test_audio_pipeline_dfn"
+	"$(abspath $(BIN_DIR))/test_se_common"
 	"$(abspath $(BIN_DIR))/mono_alignulcnet"
 	"$(abspath $(BIN_DIR))/mono_alignulcnet" --delay-num-filters 1
 	"$(abspath $(BIN_DIR))/mono_aec_dfn_res"
@@ -1259,6 +1273,7 @@ test_ulcnet_accelerator_adapter: $(BIN_DIR)/test_ulcnet_accelerator_adapter
 test_dfn_res_stage: $(BIN_DIR)/test_dfn_res_stage
 test_dfn_rate_bridge: $(BIN_DIR)/test_dfn_rate_bridge
 test_audio_pipeline_dfn: $(BIN_DIR)/test_audio_pipeline_dfn
+test_se_common: $(BIN_DIR)/test_se_common
 
 FORCE:
 
@@ -1301,7 +1316,7 @@ $(BIN_DIR)/test_audio_pipeline: $(OBJ_DIR)/test_audio_pipeline.o $(LIB_TARGET) $
 
 # ULCNet applications link their wrapper/pre-post objects directly. They are
 # applications, not additional libraries layered over the component libs.
-ULCNET_PIPELINE_OBJS = $(OBJ_DIR)/audio_pipeline_ulcnet.o $(OBJ_DIR)/ulcnet_process.o
+ULCNET_PIPELINE_OBJS = $(OBJ_DIR)/audio_pipeline_ulcnet.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/ulcnet_process.o
 
 # The wrapper itself needs no ulcnet_model_io symbol (it only READS the
 # descriptor a runtime published, so a board integrating the wrapper alone
@@ -1334,6 +1349,10 @@ $(BIN_DIR)/test_ulcnet_accelerator_adapter: $(OBJ_DIR)/test_ulcnet_accelerator_a
 $(BIN_DIR)/mono_aec_dfn_res: $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/mono_aec_dfn_res_main.o $(DFN_LIB_TARGET) $(LIB_TARGET) $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
 	@echo "mono_aec_dfn_res [$(BACKEND)] -> $@"
+
+$(BIN_DIR)/test_se_common: $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o $(AEC_LIB) $(NR_LIB) $(AC_LIB) | _cfg_guard
+	$(LINK) -o $@ $(OBJ_DIR)/test_se_common.o $(OBJ_DIR)/se_config.o $(OBJ_DIR)/se_anr_stage.o $(AEC_LIB) $(NR_LIB) $(AC_LIB) $(LDFLAGS)
+	@echo "test_se_common [$(BACKEND)] -> $@"
 
 $(BIN_DIR)/test_dfn_res_stage: $(OBJ_DIR)/test_dfn_res_stage.o $(DFN_STAGE_OBJS) $(AC_LIB) | _cfg_guard
 	$(LINK) -o $@ $(OBJ_DIR)/test_dfn_res_stage.o $(DFN_STAGE_OBJS) $(AC_LIB) $(LDFLAGS)
