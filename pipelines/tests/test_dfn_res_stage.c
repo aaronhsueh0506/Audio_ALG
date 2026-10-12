@@ -449,9 +449,18 @@ static int nan_head_infer(void *user, const DFN2PrepostInputs *in,
     return 0;
 }
 
+/* Writes every output validly, then reports failure: the result code alone
+ * must send the frame down the identity path. */
+static int half_mask_then_fail(void *user, const DFN2PrepostInputs *in,
+                               DFN2PrepostOutputs *out) {
+    half_mask_infer(user, in, out);
+    return -1;
+}
+
 /* mode 0: caller runs half_mask_infer; 1: caller reports -1; 2: the model
  * writes a NaN head and reports success; 3: no model at all (config) and the
- * caller reports 0 on a frame it never ran (the commit refuses it). */
+ * caller reports 0 on a frame it never ran (the commit refuses it); 4: the model
+ * writes finite outputs and reports -1. */
 static int run_phased_case(int mode) {
     DFN2ModelIoDescriptor descriptor;
     DfnResStageConfig phased_cfg = base_config();
@@ -466,7 +475,8 @@ static int run_phased_case(int mode) {
     cb_cfg.model.io_descriptor = &descriptor;
     cb_cfg.model.infer = mode == 0 ? half_mask_infer
                        : mode == 1 ? failing_infer
-                       : mode == 2 ? nan_head_infer : NULL;
+                       : mode == 2 ? nan_head_infer
+                       : mode == 4 ? half_mask_then_fail : NULL;
     if (mode == 3) cb_cfg.model.io_descriptor = NULL;
     ph = dfn_res_stage_create(&phased_cfg);
     cb = dfn_res_stage_create(&cb_cfg);
@@ -482,6 +492,7 @@ static int run_phased_case(int mode) {
             if (mode == 0) model_rc = half_mask_infer(NULL, &job.inputs, &job.outputs);
             else if (mode == 1) model_rc = -1;
             else if (mode == 2) model_rc = nan_head_infer(NULL, &job.inputs, &job.outputs);
+            else if (mode == 4) model_rc = half_mask_then_fail(NULL, &job.inputs, &job.outputs);
             else model_rc = 0;   /* nothing was written: the NaN heads refuse the commit */
             if (dfn_res_stage_end(ph, model_rc, a) != rc_b) return 4;
         } else if (dfn_res_stage_end(ph, 0, a) != rc_b) {
@@ -561,7 +572,7 @@ int main(void) {
     if (rc) { fprintf(stderr, "stale-pool gate failed: %d\n", rc); return 1; }
     rc = run_non_finite_input();
     if (rc) { fprintf(stderr, "non-finite input row failed: %d\n", rc); return 1; }
-    for (rc = 0; rc < 4; ++rc) {
+    for (rc = 0; rc < 5; ++rc) {
         int r = run_phased_case(rc);
         if (r) { fprintf(stderr, "phased case %d failed: %d\n", rc, r); return 1; }
     }
