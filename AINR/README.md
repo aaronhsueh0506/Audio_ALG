@@ -142,8 +142,10 @@ make lib                # libainr_prepost.a: DeepFilterNet2 + GTCRN C pre/post c
                         # (RNNoise-ERB is built from RNNoise-ERB/ directly, no
                         # archive); outputs are keyed by configuration --
                         # `make print-lib-path` prints the absolute path
-make test-simd          # NEON and forced-scalar digest must match, and the
-                        # model-local NEON kernels equal their scalar twins
+make test-simd          # NEON and forced-scalar digest must match, the
+                        # model-local NEON kernels equal their scalar twins,
+                        # and the DFN2/GTCRN chains reproduce their recorded
+                        # digests in both builds (tests/test_nn_golden.c)
 make SIMD=0 test        # scalar-only build
 make -C RNNoise-ERB SIMD=0 test
 ```
