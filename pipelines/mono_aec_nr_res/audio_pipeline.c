@@ -37,12 +37,12 @@
 #include <math.h>
 
 #include "audio_pipeline.h"
-#include "nr_overlay.h"
+#include "common/se_config.h"     /* se_derive(): grid + AecConfig, shared by every application */
+#include "common/se_anr_stage.h"  /* NR configuration, init, per-hop gain, strength setter       */
 #include "fft_wrapper.h"       /* fft_get_mem_size, Complex, ALIGN16 */
 #include "audio_stft.h"        /* AcIstft: inverse FFT + sqrt-Hann OLA                */
 #include "simd_kernels.h"      /* sk_min_f32 / sk_capply_gain_f32                                     */
 #include "aec_res.h"          /* aec_cng_fill                                                        */
-#include "pipeline_dims.h"     /* compute_frame_dims() -- shared with both CLIs                       */
 
 /* Deliberately NO "wav_io.h" here: this TU takes raw float* mic/ref/out
  * buffers only (audio_pipeline_process) -- no WAV path, no stdio-based I/O.
@@ -77,7 +77,7 @@
 #define AP_LOG_ERR(...) ((void)0)
 #endif
 
-#define PSD_SCALE                 (32768.0f * 32768.0f)  /* int16^2 (Python _PSD_SCALE) */
+#define PSD_SCALE                 SE_PSD_SCALE  /* int16^2 (Python _PSD_SCALE) */
 /* Comfort noise is scaled by the denoiser gain of its bin, but never below
  * this amplitude (-10 dB): the fill follows the denoised floor while enough
  * of it remains to keep the residual echo it masks from surfacing. */
@@ -289,77 +289,48 @@ struct AudioPipeline {
  * ========================================================================== */
 
 /* Returns 0 and fills every out-param, or -1 (NULL cfg; sample_rate outside
- * the {8000,16000,48000} whitelist; aec_preset/nr_mode outside their defined
- * enum values; invalid filter/delay settings; or
- * aec_only/enable_cng/legacy_amin holding anything but 0/1)
- * -- ALL checked HERE, up front, before a single module config is derived,
- * so an invalid AudioPipelineConfig never reaches aec_config_from_preset/
- * anr_config_for_mode. This is the one reject-first gate every entry
- * point (get_mem_requirements, init, get_mem_breakdown, and create() via
- * get_mem_requirements+init) already funnels through.
+ * {8000,16000,48000}; fft_size outside the rate's grids; aec_preset/nr_mode
+ * outside their enum values; filter_length outside [0, SE_FILTER_LENGTH_MAX];
+ * or aec_only/enable_nr/enable_res/enable_cng/legacy_amin holding anything but
+ * 0/1).
  *
- * Without this, an out-of-enum aec_preset/nr_mode would silently fall
- * through aec_config_from_preset's/anr_config_for_mode's own internal
- * `default:` case (a documented fallback to balanced, not an error -- see
- * aec.c/anr_types.h), and an out-of-{0,1} bool would just be treated as
- * truthy by every `if (cfg->x)` downstream in audio_pipeline_process --
- * neither is a loud failure on its own, so a caller passing a garbage/
- * adversarial config would never find out short of this explicit check.
- * Mirrors the derivation both CLIs' main() used to do inline. */
+ * This is the one reject-first gate every entry point funnels through
+ * (get_mem_requirements, init, get_mem_breakdown, and create() via the
+ * first two): an out-of-enum preset or mode would otherwise fall into the
+ * modules' documented balanced fallback, and a stray non-0/1 flag would be
+ * read as true downstream, so neither would ever fail loudly. The delay
+ * settings are passed through; lib/aec validates them when it sizes the AEC. */
 static int derive_dims_and_configs(const AudioPipelineConfig* cfg,
                                     AecConfig* aec_cfg, AnrConfig* nr_cfg,
                                     int* hop, int* frame_sz, int* fft_sz, int* n_freqs) {
+    static const SeRules rules = {
+        /* allow_8k */ 1, /* fixed_rate */ 0, /* fixed_fft */ 0, /* check_delay */ 0,
+        /* lane_aligned */ 0, /* spatial_context */ SE_CONTEXT_PRESET, /* with_nr */ 1
+    };
+    SeRequest req;
+    SeGrid grid;
+
     if (!cfg) return -1;
-    if (!aec_is_valid_sample_rate(cfg->sample_rate)) return -1;
+    if (!se_flag_valid(cfg->aec_only) || !se_flag_valid(cfg->enable_nr) ||
+        !se_flag_valid(cfg->enable_res) || !se_flag_valid(cfg->enable_cng) ||
+        !se_flag_valid(cfg->legacy_amin)) return -1;
 
-#define AP_CK_BOOL(field) \
-    do { if (cfg->field != 0 && cfg->field != 1) return -1; } while (0)
+    req.sample_rate = cfg->sample_rate;
+    req.fft_size = cfg->fft_size;
+    req.filter_length = cfg->filter_length;
+    req.delay_mode = cfg->delay_mode;
+    req.delay_num_filters = cfg->delay_num_filters;
+    req.fixed_delay_samples = cfg->fixed_delay_samples;
+    req.aec_preset = cfg->aec_preset;
+    req.nr_mode = cfg->nr_mode;
+    if (se_derive(&req, &rules, &grid, aec_cfg) != 0) return -1;
 
-    switch (cfg->aec_preset) {
-        case AEC_PRESET_MILD:
-        case AEC_PRESET_BALANCED:
-        case AEC_PRESET_AGGRESSIVE:
-            break;
-        default:
-            return -1;
-    }
-    switch (cfg->nr_mode) {
-        case ANR_MODE_MILD:
-        case ANR_MODE_MODERATE:
-        case ANR_MODE_BALANCED:
-        case ANR_MODE_AGGRESSIVE:
-            break;
-        default:
-            return -1;
-    }
-    AP_CK_BOOL(aec_only);
-    AP_CK_BOOL(enable_nr);
-    AP_CK_BOOL(enable_res);
-    AP_CK_BOOL(enable_cng);
-    AP_CK_BOOL(legacy_amin);
-
-#undef AP_CK_BOOL
-
-    if (compute_frame_dims(cfg->sample_rate, cfg->fft_size,
-                           hop, frame_sz, fft_sz, n_freqs) != 0) return -1;
-
-    aec_config_from_preset(aec_cfg, cfg->aec_preset, cfg->sample_rate);
-    aec_cfg->fft_size          = *fft_sz;
-    /* Bound kept in sync with mono_alignulcnet/audio_pipeline_ulcnet.c and
-     * 4ch_aec_bf_nr_res/4aec_nr_res.c (each app is self-contained). */
-    if (cfg->filter_length < 0 || cfg->filter_length > 4096) return -1;
-    if (cfg->filter_length > 0)
-        aec_cfg->filter_length = cfg->filter_length;
-    aec_cfg->delay_mode = cfg->delay_mode;
-    aec_cfg->delay_num_filters = cfg->delay_num_filters;
-    aec_cfg->fixed_delay_samples = cfg->fixed_delay_samples;
-    aec_cfg->enable_delay_est =
-        cfg->delay_mode == AEC_DELAY_MATCHED ? 1 : 0;
-    aec_cfg->enable_res         = 0;   /* linear AEC + external NR/RES seam */
-    aec_cfg->return_res_context = 1;
-
-    *nr_cfg = pipelines_compose_nr_config(cfg->sample_rate, *fft_sz, *hop,
-                                cfg->nr_mode);
+    *hop = grid.hop_size;
+    *frame_sz = grid.fft_size;
+    *fft_sz = grid.fft_size;
+    *n_freqs = grid.n_freqs;
+    *nr_cfg = se_anr_compose_config(cfg->sample_rate, grid.fft_size, grid.hop_size,
+                                    cfg->nr_mode);
     return 0;
 }
 
@@ -389,7 +360,7 @@ static size_t pipeline_pool_size(const AecConfig* aec_cfg, const AnrConfig* nr_c
     (void)frame_sz;
     size_t aec_sz     = aec_get_mem_size(aec_cfg);
     size_t synth_sz   = aec_only ? 0 : synthesis_mem_size(fft_sz);
-    size_t nr_sz      = (aec_only || !enable_nr) ? 0 : anr_get_mem_size(nr_cfg);
+    size_t nr_sz      = (aec_only || !enable_nr) ? 0 : se_anr_stage_mem_size(nr_cfg);
 
     size_t pipe = 0;
     if (!aec_only) {
@@ -437,8 +408,8 @@ static int pipeline_build(AudioPipeline* p, void* pool, size_t pool_size,
         ptr += ALIGN16(synth_sz);
 
         if (enable_nr) {
-            size_t nr_sz = anr_get_mem_size(nr_cfg);
-            p->nr = anr_init(ptr, nr_sz, nr_cfg);
+            size_t nr_sz = se_anr_stage_mem_size(nr_cfg);
+            p->nr = se_anr_stage_init(ptr, nr_sz, nr_cfg);
             ptr += ALIGN16(nr_sz);
         }
 
@@ -544,7 +515,7 @@ int audio_pipeline_get_mem_requirements(const AudioPipelineConfig* cfg,
     if (aec_sz == 0) return -1;
     if (!cfg->aec_only) {
         if (synthesis_mem_size(fft_sz) == 0 ||
-            (cfg->enable_nr && anr_get_mem_size(&nr_cfg) == 0)) return -1;
+            (cfg->enable_nr && se_anr_stage_mem_size(&nr_cfg) == 0)) return -1;
     }
 
     /* backend_id: reject up front (same reject-first shape as
@@ -758,22 +729,15 @@ static void prepare_post_spectrum(AudioPipeline* p, const float* mic,
      * ctx.error_spec/ctx.res_gain are always non-NULL here -- there is no
      * live "seam unavailable" case to fall back from. */
 
-    /* Stage 2: echo-aware NR gain. extra = R^2/PSD_SCALE folds the residual
-     * echo into the noise floor (xi = S^2/(N^2+R^2)). The denoiser is its
-     * only reader, so the fill is skipped when there is no denoiser or when
-     * legacy_amin hands it no prior. */
-    const float* nr_extra = NULL;
-    if (p->nr && ctx.r2 && !p->legacy_amin) {
-        for (int k = 0; k < n_freqs; k++)
-            p->extra[k] = ctx.r2[k] / PSD_SCALE;
-        nr_extra = p->extra;
-    }
-    /* gain_out=NULL: anr_get_gain() below reads the same buffer this
-     * call just filled, no per-hop copy needed (layout v3). */
+    /* Stage 2: echo-aware NR gain. The residual-echo power r2 folds into the
+     * noise floor (xi = S^2/(N^2+R^2)) through p->extra; legacy_amin hands the
+     * denoiser no prior. The gain is read from the denoiser's own buffer, no
+     * per-hop copy. */
     const float* nr_gain = p->unity_gain;
     if (p->nr) {
-        anr_process_gain(p->nr, ctx.error_spec, nr_extra, NULL);
-        nr_gain = anr_get_gain(p->nr, NULL);
+        se_anr_stage_process_gain(p->nr, ctx.error_spec,
+                                  p->legacy_amin ? NULL : ctx.r2, p->extra, n_freqs);
+        nr_gain = se_anr_stage_gain(p->nr);
     }
     uint32_t t1 = audio_pipeline_now_us();
     p->last_timing.nr_us = p->nr ? t1 - t0 : 0;
@@ -888,16 +852,10 @@ int audio_pipeline_set_aec_preset(AudioPipeline* p, AecPreset preset,
 }
 
 int audio_pipeline_set_nr_mode(AudioPipeline* p, AnrMode mode) {
-    AnrConfig target;
     if (!p || !p->nr) return -1;   /* aec_only builds have no denoiser */
-    if (!anr_nr_mode_is_valid(mode)) return -1;
-    /* Recompose THIS pipeline's configuration, not the canonical preset:
-     * anr_set_mode() would refuse it (its L differs) or revert the
-     * overrides pipelines_compose_nr_config() applies. */
-    target = pipelines_compose_nr_config(p->sample_rate, p->fft_sz, p->hop, mode);
-    /* anr_reconfigure updates the denoiser's own AnrConfig, which is
-     * the authoritative copy; this instance keeps no config of its own. */
-    return anr_reconfigure(p->nr, &target);
+    /* The denoiser's own AnrConfig is the authoritative copy; this instance
+     * keeps none. */
+    return se_anr_stage_set_mode(p->nr, p->sample_rate, p->fft_sz, p->hop, mode);
 }
 
 void audio_pipeline_reset(AudioPipeline* p) {
@@ -905,7 +863,7 @@ void audio_pipeline_reset(AudioPipeline* p) {
 
     aec_reset(p->aec);
     if (!p->aec_only) {
-        if (p->nr) anr_reset(p->nr);
+        if (p->nr) se_anr_stage_reset(p->nr);
 
         /* Re-zero pipeline-owned accumulator/scratch state (mirrors the
          * explicit zero at carve time). */
@@ -923,7 +881,7 @@ void audio_pipeline_destroy(AudioPipeline* p) {
     /* Reverse carve order: NR -> synthesis -> AEC. Each call is a genuine
      * no-op for a pool-resident (audio_pipeline_init'd) instance today; kept
      * for the heap path and forward-compat -- see audio_pipeline.h's doc. */
-    if (p->nr)  anr_destroy(p->nr);
+    if (p->nr)  se_anr_stage_destroy(p->nr);
     if (p->aec) aec_destroy(p->aec);
 
     if (p->owned_heap) {
@@ -953,7 +911,7 @@ int audio_pipeline_get_mem_breakdown(const AudioPipelineConfig* cfg,
     size_t fft_mem = 0, nr_sz = 0;
     if (!cfg->aec_only) {
         fft_mem = fft_get_mem_size(fft_sz);
-        if (cfg->enable_nr) nr_sz = anr_get_mem_size(&nr_cfg);
+        if (cfg->enable_nr) nr_sz = se_anr_stage_mem_size(&nr_cfg);
         if (fft_mem == 0 || (cfg->enable_nr && nr_sz == 0)) return -1;
     }
 
