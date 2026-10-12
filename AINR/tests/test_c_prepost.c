@@ -753,17 +753,283 @@ static int test_dfn_erb_spans_exact(void)
     return 1;
 }
 
+/* State evolution through the in-place boundary.
+ *
+ * A deterministic stand-in for the accelerator advances the caller-owned state
+ * the way the graph does: recurrent rows are rewritten from their own previous
+ * values (all state inputs are read before any is written), conv windows drop
+ * their oldest frame and append the new one. The stand-in addresses the arrays
+ * through the struct's typed fields; the reference below addresses plain float
+ * vectors with explicit strides, so a field whose extents or order differ from
+ * the graph tensors makes the two disagree. After every hop (commit, a refused
+ * commit, a reset) the arrays are compared byte for byte with the reference
+ * and hashed into the digest that test-simd compares across builds. */
+
+static float standin_row(float previous, int hop, int row, int column)
+{
+    return previous * 0.5f + 0.003f * (float)(hop + 1) +
+           0.001f * (float)(row + 1) + 0.00001f * (float)column;
+}
+
+static float standin_frame(int hop, int tensor, int channel, int column)
+{
+    return 0.02f * (float)(hop + 1) + 0.001f * (float)(tensor + 1) +
+           0.0001f * (float)channel + 0.000001f * (float)column;
+}
+
+/* Reference window update on a flat [channels][k][width] vector. */
+static void reference_window(float* flat, int channels, int k, int width,
+                             int hop, int tensor)
+{
+    for (int c = 0; c < channels; ++c) {
+        float* base = flat + (size_t)c * k * width;
+        memmove(base, base + width, (size_t)(k - 1) * width * sizeof(float));
+        for (int column = 0; column < width; ++column)
+            base[(size_t)(k - 1) * width + column] =
+                standin_frame(hop, tensor, c, column);
+    }
+}
+
+static int test_dfn2_state_evolution(uint64_t* digest)
+{
+    enum {
+        ROWS = DFN2_MODEL_GRU_ROWS, HIDDEN = DFN2_MODEL_GRU_HIDDEN,
+        CH = DFN2_MODEL_ENCODER_CHANNELS, K = DFN2_MODEL_DF_PATHWAY_WINDOW,
+        BINS = DFN2_DF_BINS, HOPS = 14
+    };
+    static DFN2ModelIOState state;
+    static float ref_gru[ROWS * HIDDEN];
+    static float ref_win[CH * K * BINS];
+    static float previous[ROWS][HIDDEN];
+    unsigned int generation;
+    int zeroings = 0;
+
+    dfn2_model_io_init(&state);
+    CHECK(sizeof(state.gru_hidden) == sizeof(ref_gru) &&
+          sizeof(state.df_convp_window) == sizeof(ref_win),
+          "DFN2 state arrays hold exactly the graph tensors");
+    generation = dfn2_model_io_state_generation(&state);
+    for (int hop = 0; hop < HOPS; ++hop) {
+        int expect_refusal = 0;
+        /* The stand-in reads every state input before it writes any output. */
+        memcpy(previous, state.gru_hidden, sizeof(previous));
+        for (int row = 0; row < ROWS; ++row)
+            for (int j = 0; j < HIDDEN; ++j)
+                state.gru_hidden[row][j] =
+                    standin_row(previous[row][j], hop, row, j);
+        for (int c = 0; c < CH; ++c) {
+            for (int t = 0; t + 1 < K; ++t)
+                memcpy(state.df_convp_window[c][t],
+                       state.df_convp_window[c][t + 1],
+                       sizeof(state.df_convp_window[c][t]));
+            for (int b = 0; b < BINS; ++b)
+                state.df_convp_window[c][K - 1][b] =
+                    standin_frame(hop, 0, c, b);
+        }
+        for (int row = 0; row < ROWS; ++row)
+            for (int j = 0; j < HIDDEN; ++j)
+                ref_gru[row * HIDDEN + j] =
+                    standin_row(ref_gru[row * HIDDEN + j], hop, row, j);
+        reference_window(ref_win, CH, K, BINS, hop, 0);
+
+        if (hop == 6) {
+            state.df_convp_window[CH - 1][K - 1][BINS - 1] = (float)NAN;
+            expect_refusal = 1;
+        }
+        if (hop == 9) {
+            state.gru_hidden[DFN2_MODEL_GRU_ROW_DF + 1][HIDDEN - 1] =
+                (float)INFINITY;
+            expect_refusal = 1;
+        }
+        CHECK((dfn2_model_io_validate_state(&state) != 0) == expect_refusal,
+              "DFN2 validate refuses exactly the non-finite hops");
+        if (expect_refusal) {
+            ++zeroings;
+            memset(ref_gru, 0, sizeof(ref_gru));
+            memset(ref_win, 0, sizeof(ref_win));
+        }
+        if (hop == 11) {
+            dfn2_model_io_zero_recurrent(&state);
+            memset(ref_gru, 0, sizeof(ref_gru));
+            memset(ref_win, 0, sizeof(ref_win));
+            ++zeroings;
+        }
+        CHECK(memcmp(&state.gru_hidden[0][0], ref_gru, sizeof(ref_gru)) == 0,
+              "DFN2 h_gru equals the flat reference after the hop");
+        CHECK(memcmp(&state.df_convp_window[0][0][0], ref_win,
+                     sizeof(ref_win)) == 0,
+              "DFN2 pathway window equals the flat reference after the hop");
+        CHECK(dfn2_model_io_state_generation(&state) ==
+                  generation + (unsigned)zeroings,
+              "DFN2 generation counts the zeroings");
+        *digest = hash_bytes(*digest, state.gru_hidden,
+                             sizeof(state.gru_hidden));
+        *digest = hash_bytes(*digest, state.df_convp_window,
+                             sizeof(state.df_convp_window));
+    }
+    /* The row offsets address the rows the exporter slices: encoder GRU at
+     * row 0, the two ERB decoder layers from row 1, the two DF decoder layers
+     * from row 3. */
+    for (int row = 0; row < ROWS; ++row)
+        for (int j = 0; j < HIDDEN; ++j)
+            state.gru_hidden[row][j] = standin_row(0.0f, 0, row, j);
+    CHECK(state.gru_hidden[DFN2_MODEL_GRU_ROW_ENCODER][5] ==
+              standin_row(0.0f, 0, 0, 5) &&
+          state.gru_hidden[DFN2_MODEL_GRU_ROW_ERB][5] ==
+              standin_row(0.0f, 0, 1, 5) &&
+          state.gru_hidden[DFN2_MODEL_GRU_ROW_DF][5] ==
+              standin_row(0.0f, 0, 3, 5),
+          "DFN2 GRU row offsets address rows 0, 1 and 3");
+    return 1;
+}
+
+static int test_gtcrn_state_evolution(uint64_t* digest)
+{
+    enum { HOPS = 14, CH = GTCRN_MODEL_CONV_CHANNELS,
+           F = GTCRN_MODEL_CONV_FREQ };
+    static const int window_of[GTCRN_MODEL_CONV_STATES] = {
+        GTCRN_MODEL_CONV_WINDOW_0, GTCRN_MODEL_CONV_WINDOW_1,
+        GTCRN_MODEL_CONV_WINDOW_2, GTCRN_MODEL_CONV_WINDOW_2,
+        GTCRN_MODEL_CONV_WINDOW_1, GTCRN_MODEL_CONV_WINDOW_0};
+    static GTCRNModelState state;
+    static float ref_conv[GTCRN_MODEL_CONV_STATES][CH * 11 * F];
+    static float ref_tra[GTCRN_MODEL_TRA_GRUS * GTCRN_MODEL_TRA_HIDDEN];
+    static float ref_dp[GTCRN_MODEL_DPGRNN_GRUS * GTCRN_MODEL_DPGRNN_FREQ *
+                        GTCRN_MODEL_DPGRNN_HIDDEN];
+    static float previous_tra[GTCRN_MODEL_TRA_GRUS][1]
+                             [GTCRN_MODEL_TRA_HIDDEN];
+    static float previous_dp[GTCRN_MODEL_DPGRNN_GRUS][GTCRN_MODEL_DPGRNN_FREQ]
+                            [GTCRN_MODEL_DPGRNN_HIDDEN];
+    float* conv[GTCRN_MODEL_CONV_STATES];
+    size_t conv_n[GTCRN_MODEL_CONV_STATES];
+    unsigned int generation;
+    int zeroings = 0;
+
+    gtcrn_model_state_init(&state);
+    conv[0] = &state.conv_enc0[0][0][0];
+    conv[1] = &state.conv_enc1[0][0][0];
+    conv[2] = &state.conv_enc2[0][0][0];
+    conv[3] = &state.conv_dec0[0][0][0];
+    conv[4] = &state.conv_dec1[0][0][0];
+    conv[5] = &state.conv_dec2[0][0][0];
+    conv_n[0] = sizeof(state.conv_enc0);
+    conv_n[1] = sizeof(state.conv_enc1);
+    conv_n[2] = sizeof(state.conv_enc2);
+    conv_n[3] = sizeof(state.conv_dec0);
+    conv_n[4] = sizeof(state.conv_dec1);
+    conv_n[5] = sizeof(state.conv_dec2);
+    for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i)
+        CHECK(conv_n[i] == (size_t)CH * window_of[i] * F * sizeof(float),
+              "GTCRN conv field holds the graph window");
+    CHECK(sizeof(state.h_tra) == sizeof(ref_tra) &&
+          sizeof(state.h_dpgrnn) == sizeof(ref_dp),
+          "GTCRN recurrent fields hold the graph tensors");
+    generation = gtcrn_model_state_generation(&state);
+
+#define GTCRN_STANDIN_WINDOW(field, tensor, hop_, k_)                       \
+    do {                                                                    \
+        for (int c = 0; c < CH; ++c) {                                      \
+            for (int t = 0; t + 1 < (k_); ++t)                              \
+                memcpy(state.field[c][t], state.field[c][t + 1],            \
+                       sizeof(state.field[c][t]));                          \
+            for (int f = 0; f < F; ++f)                                     \
+                state.field[c][(k_) - 1][f] =                               \
+                    standin_frame((hop_), (tensor), c, f);                  \
+        }                                                                   \
+    } while (0)
+
+    for (int hop = 0; hop < HOPS; ++hop) {
+        int expect_refusal = 0;
+        memcpy(previous_tra, state.h_tra, sizeof(previous_tra));
+        memcpy(previous_dp, state.h_dpgrnn, sizeof(previous_dp));
+        GTCRN_STANDIN_WINDOW(conv_enc0, 0, hop, GTCRN_MODEL_CONV_WINDOW_0);
+        GTCRN_STANDIN_WINDOW(conv_enc1, 1, hop, GTCRN_MODEL_CONV_WINDOW_1);
+        GTCRN_STANDIN_WINDOW(conv_enc2, 2, hop, GTCRN_MODEL_CONV_WINDOW_2);
+        GTCRN_STANDIN_WINDOW(conv_dec0, 3, hop, GTCRN_MODEL_CONV_WINDOW_2);
+        GTCRN_STANDIN_WINDOW(conv_dec1, 4, hop, GTCRN_MODEL_CONV_WINDOW_1);
+        GTCRN_STANDIN_WINDOW(conv_dec2, 5, hop, GTCRN_MODEL_CONV_WINDOW_0);
+        for (int row = 0; row < GTCRN_MODEL_TRA_GRUS; ++row)
+            for (int j = 0; j < GTCRN_MODEL_TRA_HIDDEN; ++j)
+                state.h_tra[row][0][j] =
+                    standin_row(previous_tra[row][0][j], hop, row, j);
+        for (int row = 0; row < GTCRN_MODEL_DPGRNN_GRUS; ++row)
+            for (int f = 0; f < GTCRN_MODEL_DPGRNN_FREQ; ++f)
+                for (int j = 0; j < GTCRN_MODEL_DPGRNN_HIDDEN; ++j)
+                    state.h_dpgrnn[row][f][j] = standin_row(
+                        previous_dp[row][f][j], hop, row,
+                        f * GTCRN_MODEL_DPGRNN_HIDDEN + j);
+
+        for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i)
+            reference_window(ref_conv[i], CH, window_of[i], F, hop, i);
+        for (int row = 0; row < GTCRN_MODEL_TRA_GRUS; ++row)
+            for (int j = 0; j < GTCRN_MODEL_TRA_HIDDEN; ++j)
+                ref_tra[row * GTCRN_MODEL_TRA_HIDDEN + j] = standin_row(
+                    ref_tra[row * GTCRN_MODEL_TRA_HIDDEN + j], hop, row, j);
+        for (int row = 0; row < GTCRN_MODEL_DPGRNN_GRUS; ++row)
+            for (int column = 0; column < GTCRN_MODEL_DPGRNN_FREQ *
+                                          GTCRN_MODEL_DPGRNN_HIDDEN;
+                 ++column) {
+                float* cell = &ref_dp[row * GTCRN_MODEL_DPGRNN_FREQ *
+                                          GTCRN_MODEL_DPGRNN_HIDDEN + column];
+                *cell = standin_row(*cell, hop, row, column);
+            }
+
+        if (hop == 5) {
+            state.h_dpgrnn[GTCRN_MODEL_DPGRNN_GRUS - 1][32][7] = (float)NAN;
+            expect_refusal = 1;
+        }
+        if (hop == 9) {
+            state.conv_dec1[CH - 1][GTCRN_MODEL_CONV_WINDOW_1 - 1][F - 1] =
+                (float)INFINITY;
+            expect_refusal = 1;
+        }
+        CHECK((gtcrn_model_state_validate(&state) != 0) == expect_refusal,
+              "GTCRN validate refuses exactly the non-finite hops");
+        if (expect_refusal) {
+            ++zeroings;
+            memset(ref_conv, 0, sizeof(ref_conv));
+            memset(ref_tra, 0, sizeof(ref_tra));
+            memset(ref_dp, 0, sizeof(ref_dp));
+        }
+        if (hop == 11) {
+            gtcrn_model_state_reset(&state);
+            ++zeroings;
+            memset(ref_conv, 0, sizeof(ref_conv));
+            memset(ref_tra, 0, sizeof(ref_tra));
+            memset(ref_dp, 0, sizeof(ref_dp));
+        }
+        for (int i = 0; i < GTCRN_MODEL_CONV_STATES; ++i) {
+            CHECK(memcmp(conv[i], ref_conv[i], conv_n[i]) == 0,
+                  "GTCRN conv window equals the flat reference");
+            *digest = hash_bytes(*digest, conv[i], conv_n[i]);
+        }
+        CHECK(memcmp(&state.h_tra[0][0][0], ref_tra, sizeof(ref_tra)) == 0,
+              "GTCRN h_tra equals the flat reference");
+        CHECK(memcmp(&state.h_dpgrnn[0][0][0], ref_dp, sizeof(ref_dp)) == 0,
+              "GTCRN h_dpgrnn equals the flat reference");
+        CHECK(gtcrn_model_state_generation(&state) ==
+                  generation + (unsigned)zeroings,
+              "GTCRN generation counts the zeroings");
+        *digest = hash_bytes(*digest, state.h_tra, sizeof(state.h_tra));
+        *digest = hash_bytes(*digest, state.h_dpgrnn, sizeof(state.h_dpgrnn));
+    }
+#undef GTCRN_STANDIN_WINDOW
+    return 1;
+}
+
 static int run_all_tests(void)
 {
     uint64_t digest = UINT64_C(1469598103934665603);
     CHECK(test_dfn_erb_spans_exact(),
           "DFN2 ERB nonzero spans are exact");
     CHECK(test_dfn2_model_io(), "DFN2 stateless model I/O");
+    CHECK(test_dfn2_state_evolution(&digest), "DFN2 state evolution");
     CHECK(test_dfn_stream_alignment(), "DFN streaming head alignment");
     CHECK(test_dfn_dual_state_disjoint(),
           "DFN2 estimation/application branches are disjoint");
     CHECK(test_dfn2(&digest), "DFN2 C pre/post");
     CHECK(test_gtcrn_model_state(), "GTCRN stateless model I/O");
+    CHECK(test_gtcrn_state_evolution(&digest), "GTCRN state evolution");
     CHECK(test_gtcrn(&digest), "GTCRN C pre/post");
     printf("backend=%s/%s digest=%016llx\n",
            dfn2_simd_backend(), gtcrn_simd_backend(),
@@ -775,5 +1041,12 @@ int main(int argc, char** argv)
 {
     if (argc == 2 && strcmp(argv[1], "--stream-only") == 0)
         return test_dfn_stream_alignment() ? EXIT_SUCCESS : EXIT_FAILURE;
+    if (argc == 2 && strcmp(argv[1], "--state-only") == 0) {
+        uint64_t digest = UINT64_C(1469598103934665603);
+        return test_dfn2_state_evolution(&digest) &&
+                       test_gtcrn_state_evolution(&digest)
+                   ? EXIT_SUCCESS
+                   : EXIT_FAILURE;
+    }
     return run_all_tests() ? EXIT_SUCCESS : EXIT_FAILURE;
 }
