@@ -280,8 +280,8 @@ def validate_signal_config(n_fft, win_len, hop_len, n_erb, df_bins, df_order,
                           mask_lookahead, df_lookahead):
     """Reject grid/model combinations the port cannot build. Raises ValueError.
 
-    Extracted from ``train()`` so it is reachable from a test: while it lived
-    inline, a test could only re-implement the arithmetic and assert on its own
+    Kept separate from ``train()`` so it is reachable from a test: a test of an
+    inline copy could only re-implement the arithmetic and assert on its own
     copy, which passes whatever the real rule says.
     """
     if not 0 < win_len <= n_fft:

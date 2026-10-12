@@ -14,7 +14,7 @@ DNS4 Dataset + DeepFilterNet v2 風格 augmentation
 
 Standalone note (AINR extraction):
     This module is self-contained on purpose — dataset generation is model-
-    independent. The ERB-band helpers below are retained only for the legacy
+    independent. The ERB-band helpers below serve only the
     DNS4Dataset(..., return_raw=False) feature path. gen_dataset.py always uses
     return_raw=True, so its config needs no FFT, ERB, model, training, or loss
     parameters.
@@ -853,13 +853,10 @@ class DNS4Dataset(Dataset):
                 "[augmentation] p_resample is enabled, but source_sr_values "
                 f"contains no rate below algorithm sr={self.sr}"
             )
-        # Split from the old single p_clipping (applied post-mix only):
         # p_noise_clipping is pre-mix, on the noise chain, aligning with
         # DFN3's actual (config-invisible) RandClipping::default_with_prob(
-        # 0.1) hung on its noise chain (see config.example.ini's comment
-        # for the trace this alignment gap was found under). p_mixture_
-        # clipping keeps the old post-mix p_clipping's exact semantics and
-        # config key meaning, just renamed for symmetry with the new knob.
+        # 0.1) hung on its noise chain (see config.example.ini's comment).
+        # p_mixture_clipping is the post-mix counterpart, named for symmetry.
         self.p_noise_clipping = cfg.getfloat('augmentation', 'p_noise_clipping')
         self.p_mixture_clipping = cfg.getfloat('augmentation', 'p_mixture_clipping')
         for name, value in (
@@ -1204,7 +1201,7 @@ class DNS4Dataset(Dataset):
             speech = self._load_and_crop(self.speech_files[real_idx], target_len)
 
             # Match DeepFilterNet's speech augmentation ordering: RemoveDC,
-            # LFilt, then the independently controlled legacy biquad.
+            # LFilt, then the independently controlled biquad.
             if random.random() < self.p_remove_dc:
                 speech = remove_dc(speech)
                 metadata['remove_dc_applied_speech'] = True

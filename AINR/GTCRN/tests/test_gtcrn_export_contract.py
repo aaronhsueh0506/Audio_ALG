@@ -111,10 +111,9 @@ def test_state_layout_version_is_pinned_to_the_c_header(tmp_path):
 def test_input_schema_shapes_match_the_c_cache_struct(tmp_path):
     """The schema must come from the real tensors, not a typed-in string.
 
-    gtcrn_process.h sizes its state from these extents. While the
-    schema was a hand-written literal, a stream-model cache-shape change would
-    have left the metadata describing the old graph and nothing would have
-    disagreed.
+    gtcrn_process.h sizes its state from these extents. With a hand-written
+    literal, a stream-model cache-shape change would leave the metadata
+    describing the old graph and nothing would disagree.
     """
     metadata = _metadata(tmp_path)
     schema = metadata['input_schema']
@@ -271,8 +270,8 @@ def test_exported_graph_declares_fully_static_io(tmp_path):
     graph = onnx.load(graph_path)
     op_types = [node.op_type for node in graph.graph.node]
     assert 'Gather' not in op_types
-    # Leave optimizer-version headroom while still catching the former
-    # 323-node Unfold/packed-state graph.
+    # Leave optimizer-version headroom while still catching an
+    # Unfold/packed-state graph (323 nodes).
     assert len(op_types) <= 300
     for value in (list(graph.graph.input) + list(graph.graph.output)
                   + list(graph.graph.value_info)):

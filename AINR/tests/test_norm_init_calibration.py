@@ -85,9 +85,8 @@ def test_frequency_flat_jitter_does_not_enter_the_ramp():
 def test_pooled_quantiles_would_have_failed():
     """Guard the reason this test file exists.
 
-    If someone reverts to pooled median/p05 endpoints, this documents by how
-    much they are wrong -- and fails if the old approach ever silently becomes
-    the accepted one.
+    Pooled median/p05 endpoints are wrong by a documented margin; this fails if
+    that approach ever silently becomes the accepted one.
     """
     x = _synthetic_bands()
     pooled_lo = robust_quantile(x, 0.5)

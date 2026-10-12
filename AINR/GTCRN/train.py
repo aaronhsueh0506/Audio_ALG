@@ -58,7 +58,7 @@ from training_common import (  # noqa: E402
 # Checkpoint contract
 # ============================================================
 #
-# Bumped whenever a change makes previously-trained weights invalid or
+# Bump whenever a change makes previously-trained weights invalid or
 # meaningless to resume.  Mirrors the gates in RNNoise-ERB/train.py and
 # DeepFilterNet2/train.py.
 MODEL_VERSION = 'gtcrn_upstream_bitexact_v1'

@@ -12,7 +12,7 @@ that looks like a model or optimizer problem.
 training run; the cost is one pass over the shards.
 
 ⚠ It reports the corpus AS PACKED. Editing generator config comments after the
-fact changes nothing here -- an already-generated dataset carries whatever
+fact changes nothing here -- a generated dataset carries whatever
 augmentation was in force when it was written, so the numbers below are the only
 statement about what the model will actually see.
 

@@ -5,10 +5,9 @@ WHY THIS EXISTS
 ---------------
 The two models are trained on the same packed 16 kHz corpus so that the
 difference between their scores is attributable to the models.  Everything that
-has to be equal for that to hold used to be equal only because two config files
-happened to agree, with a ``⚠`` comment in each asking a human to keep them that
-way.  They had already drifted once: the held-out fraction was 5% on one side
-and 10% on the other, so the two models were trained on different corpora and
+has to be equal for that to hold is pinned here rather than left to two config
+files that happen to agree: a drifted held-out fraction (5% on one side, 10% on
+the other) would mean the two models are trained on different corpora and
 validated on different data.
 
 This is the same guard ``RNNoise-ERB/tests/test_feature_contract.py`` applies to
@@ -100,10 +99,9 @@ def test_unreconciled_schedule_divergences_are_visible():
     reconciles them has to come here and say which way it went.
 
     - warmup start factor (``lr_warmup / lr``): GTCRN warms up from 10% of its
-      base rate, RNNoise-ERB from 1%.  GTCRN took DeepFilterNet2's value when
-      its schedule was introduced; RNNoise-ERB's 0.01 is the explicit form of a
-      start_factor that used to be hard-coded in its train.py.  Neither number
-      was chosen against the other.
+      base rate, RNNoise-ERB from 1%.  GTCRN takes DeepFilterNet2's value;
+      RNNoise-ERB's 0.01 is the explicit form of its start_factor.  Neither
+      number was chosen against the other.
     - ``grad_clip``: 5.0 vs 1.0.  GradNormLog's own docstring argues the clip
       threshold decides what the gradient trace can distinguish, so it belongs
       to the comparison protocol on the same footing as the LR.

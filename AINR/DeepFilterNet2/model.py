@@ -558,10 +558,10 @@ class DFDecoder(nn.Module):
             nn.Tanh(),
         )
         # DFN2 uses this head to decide how much of the deep-filter residual to
-        # trust for each frame.  DFN3 keeps these parameters but no longer uses
+        # trust for each frame.  DFN3 keeps these parameters but does not use
         # the output after switching to a hard low/high-frequency band split.
         self.df_fc_a = nn.Sequential(nn.Linear(df_hidden, 1), nn.Sigmoid())
-        # ⚠ Related do-not-restore: released DeepFilterNet3's config declares
+        # ⚠ Related: released DeepFilterNet3's config declares
         # convt_depthwise = False, but that key is never READ (deepfilternet3.py
         # :34-39) -- DFN3 hardcodes separable=True and the checkpoint's transposed
         # convs are depthwise.  Obeying the shipped key would build dense

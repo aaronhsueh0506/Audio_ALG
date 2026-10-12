@@ -35,7 +35,7 @@ class NonFiniteTraining(RuntimeError):
 def scan_non_finite(module, include_buffers=False):
     """Non-finite (name, n_nan, n_inf, numel) rows, worst first.
 
-    Upstream's ``check_finite_module`` equivalent, used to answer the question a
+    Upstream's ``check_finite_module`` equivalent, which answers the question a
     batch dump alone cannot: is this the FIRST hit, or were the weights already
     poisoned by an earlier step whose clip turned an inf into a NaN?
 
@@ -243,7 +243,7 @@ def dump_batch(dump_dir, noisy, clean, sr, enhanced=None, hazard_mag=None):
     batch was clear of the hazard -- it may only mean the comparison was made in
     the wrong domain.  Fixing it properly means letting each trainer measure its
     own hazard in its own domain (a callable rather than a scalar), which needs
-    a test on this function first; there is none today.
+    a test on this function first; there is none.
     """
     os.makedirs(dump_dir, exist_ok=True)
     payload = {'noisy': noisy.detach().cpu(), 'clean': clean.detach().cpu()}

@@ -1,4 +1,4 @@
-"""Regression tests for dataset generation planning and RIR alignment."""
+"""Tests for dataset generation planning and RIR alignment."""
 
 import configparser
 import math
@@ -780,9 +780,9 @@ class ClipSnrRangeConfigTest(unittest.TestCase):
 
 class ExampleConfigExactValuesTest(unittest.TestCase):
     """Pins the example config's own documented distribution-defining
-    values. Nothing on disk records which config produced a batch any more, so
-    an accidental edit here is no longer detectable after the fact -- which
-    makes pinning them in a test the remaining guard, not a redundant one."""
+    values. Nothing on disk records which config produced a batch, so an
+    accidental edit here is not detectable after the fact -- which makes
+    pinning them in a test the only guard."""
 
     def test_snr_values_exact_list(self):
         cfg = _load_example_config()
@@ -827,7 +827,7 @@ class SpeechOnsetConfigTest(unittest.TestCase):
 
 
 class AtomicSampleWriteTest(unittest.TestCase):
-    """With the sidecar gone, the temp-file rename is the ONLY thing that
+    """With no sidecar, the temp-file rename is the ONLY thing that
     marks a sample finished -- so these are load-bearing, not hygiene."""
 
     def test_save_pair_atomic_leaves_only_the_final_wav(self):
@@ -975,9 +975,9 @@ class CrashDuringGenerationTest(unittest.TestCase):
     """A run killed partway leaves a directory that is still exactly what it
     looks like: N finished samples and nothing else.
 
-    This is the whole safety story now that there is no meta.json to record
-    what a run intended -- so it is checked against a real gen_dataset() run,
-    not a mocked one.
+    This is the whole safety story, since no meta.json records what a run
+    intended -- so it is checked against a real gen_dataset() run, not a mocked
+    one.
     """
 
     def test_crash_on_the_first_sample_leaves_an_empty_but_valid_directory(self):
@@ -1040,13 +1040,12 @@ class CrashDuringGenerationTest(unittest.TestCase):
 
 
 class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
-    """Release blocker: a plain re-run (no --resume) into an --output
-    directory that already has samples used to be silently accepted --
-    validating nothing at all for --start-idx 0, and only warning about a
-    single exact-index collision for --start-idx > 0. Either path let a
-    DIFFERENT config's samples overwrite part of an existing batch and leave
-    the rest behind. gen_dataset() must refuse unconditionally whenever
-    pairs/ already has ANY sample and --resume was not passed."""
+    """A plain re-run (no --resume) into an --output directory that already
+    has samples must not be accepted: validating nothing for --start-idx 0, or
+    only warning about a single exact-index collision for --start-idx > 0,
+    would let a DIFFERENT config's samples overwrite part of an existing batch
+    and leave the rest behind. gen_dataset() must refuse unconditionally
+    whenever pairs/ already has ANY sample and --resume was not passed."""
 
     def test_second_run_without_resume_is_rejected(self):
         from dataset_gen import gen_dataset as gen_dataset_module
@@ -1081,10 +1080,9 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
                     Path(_sample_wav_path(pairs_dir, index)).read_bytes(), blob)
 
     def test_start_idx_does_not_bypass_the_rejection(self):
-        # The exact shape of the release-blocking repro: forgetting
-        # --resume but still passing --start-idx (as config.example.ini's
-        # OLD guidance used to teach for "extending" a batch) must not
-        # quietly succeed by only colliding at one exact index.
+        # Forgetting --resume but still passing --start-idx (as one would to
+        # "extend" a batch) must not quietly succeed by only colliding at one
+        # exact index.
         from dataset_gen import gen_dataset as gen_dataset_module
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -1099,8 +1097,8 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
             original = _list_sample_indices(pairs_dir)
 
             # start_idx set well past the existing batch -- no exact-index
-            # collision at all, which is exactly what the OLD single-index
-            # check would have silently allowed through.
+            # collision at all, which a single-index check would silently
+            # allow through.
             second_args = types.SimpleNamespace(
                 config=config_path, output=output_dir, hours=0.001,
                 workers=0, resume=False, repair_resume=False,
@@ -1136,8 +1134,7 @@ class NonResumeIntoNonEmptyOutputRejectionTest(unittest.TestCase):
 class ResumeShardStartIndexContractTest(unittest.TestCase):
     """A resumed shard keeps the numbering the first invocation gave it.
 
-    The batch start used to come from meta.json's batch_start_idx; the
-    directory's own lowest index carries the same fact, so a shard created
+    The batch start is the directory's own lowest index, so a shard created
     with --start-idx 500 stays anchored at 500 without the caller repeating
     the flag, and a conflicting explicit value is refused rather than
     silently renumbering."""
@@ -1195,9 +1192,9 @@ class ResumeShardStartIndexContractTest(unittest.TestCase):
     def test_a_deleted_leading_sample_moves_the_start(self):
         """The cost of taking the start from the directory instead of a record.
 
-        A shard's declared batch_start_idx used to live in meta.json, so
-        deleting its FIRST sample left a detectable hole. Now the lowest
-        surviving index simply becomes the start: the deletion is absorbed,
+        No record declares the shard's batch start, so deleting its FIRST
+        sample leaves no detectable hole: the lowest surviving index simply
+        becomes the start and the deletion is absorbed,
         silently. The resulting corpus is still contiguous and packable -- it
         is just one sample shorter than the run that made it asked for.
         """
@@ -1250,7 +1247,7 @@ class ResumeInteriorGapTest(unittest.TestCase):
     """Resuming continues from max(index) + 1 and only ever walks forward, so
     a hole below the highest index can never be backfilled. gen_dataset()
     must refuse rather than silently leave it -- and --repair-resume, which
-    now only clears leftover temp files, must not paper over it either."""
+    only clears leftover temp files, must not paper over it either."""
 
     def test_resume_refuses_when_an_interior_sample_is_missing(self):
         from dataset_gen import gen_dataset as gen_dataset_module

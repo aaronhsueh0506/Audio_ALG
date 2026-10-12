@@ -107,7 +107,7 @@ def _stage_payload(clips, levels, sample_indices, temporary, header):
 
 
 def _shard_outputs(output_dir, overwrite):
-    """Prepare an output directory without mixing old and new shard sets."""
+    """Prepare an output directory without mixing existing and new shard sets."""
     os.makedirs(output_dir, exist_ok=True)
     all_pt = sorted(glob.glob(os.path.join(output_dir, '*.pt')))
     existing = sorted(glob.glob(os.path.join(output_dir, 'shard_*.pt')))
@@ -303,7 +303,7 @@ def pack(args):
               f"(quality={args.quality}) while packing")
 
     # Publish only after every source WAV validates and every shard serializes.
-    # With --overwrite, the old usable set remains in place until this point.
+    # With --overwrite, the existing usable set remains in place until this point.
     for path in existing:
         os.remove(path)
     for temporary, final in staged:

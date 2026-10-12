@@ -1,13 +1,13 @@
-"""Regression tests for pack_dataset.py's input contract and
+"""Tests for pack_dataset.py's input contract and
 effective_rms_dbfs recording.
 
-The input contract is now just "a directory of NNNNNN.wav": no meta.json, no
-per-sample sidecar, no contract version. What still has to hold, and is pinned
+The input contract is just "a directory of NNNNNN.wav": no meta.json, no
+per-sample sidecar, no contract version. What has to hold, and is pinned
 here, is everything that can be checked from the audio itself --
 
-  * a `tmp.NNNNNN.wav` left behind by a crashed write is never packed (the
-    original release-blocking bug: a naive recursive glob('*.wav') matched it
-    and silently shipped a crash artifact as a training sample);
+  * a `tmp.NNNNNN.wav` left behind by a crashed write is never packed (a naive
+    recursive glob('*.wav') would match it and silently ship a crash artifact
+    as a training sample);
   * a hole in the numbering is refused unless --allow-index-gaps says the
     subset is deliberate;
   * every file must be 2-channel, the same length, finite, and (without
@@ -176,7 +176,7 @@ class SampleScanTest(unittest.TestCase):
             in_dir = _make_batch(tmp, [(0, noisy, clean, sr)])
             # Reproduce a crash mid-write: a tmp.NNNNNN.wav left behind by
             # _save_pair_atomic's temp-file step, never renamed into place.
-            # With no sidecar to mark completion, the temp NAME is now the
+            # With no sidecar to mark completion, the temp NAME is the
             # only thing keeping this file out of the corpus.
             torchaudio.save(_tmp_path(_sample_wav_path(in_dir, 1)),
                             torch.stack([noisy, clean]), sr, bits_per_sample=16)

@@ -125,8 +125,8 @@ def _scan_wavs(input_dir):
     """Recursively find the same numbered WAV pairs the packer accepts.
 
     In particular, a killed atomic write leaves ``tmp.NNNNNN.wav``.  A broad
-    ``**/*.wav`` scan used to resample that incomplete temp file even though
-    both the generator and packer correctly ignored it.
+    ``**/*.wav`` scan would resample that incomplete temp file even though
+    both the generator and packer ignore it.
     """
     return sorted(
         path for path in glob.glob(

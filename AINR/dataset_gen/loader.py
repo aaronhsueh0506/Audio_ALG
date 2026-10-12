@@ -5,11 +5,11 @@ WHY THESE LIVE HERE
 RNNoise-ERB and GTCRN are trained on the same packed 16 kHz corpus and then
 compared against each other, so *which samples each one gets* is part of the
 comparison protocol, not an implementation detail of either trainer.  When
-these functions were copied into each ``train.py`` they drifted immediately:
-GTCRN held out ``max(2, 5%)`` while RNNoise-ERB held out ``max(1, 10%)``, so
-the two models trained on different corpora and scored on different validation
-sets -- and no amount of seed agreement could have fixed it.  ``PackedDataset``
-was hoisted here for exactly this reason; the split belongs with it.
+these functions are copied into each ``train.py`` they drift: GTCRN holding
+out ``max(2, 5%)`` while RNNoise-ERB holds out ``max(1, 10%)`` puts the two
+models on different corpora and different validation sets, which no amount of
+seed agreement can fix.  ``PackedDataset`` lives here for that reason; the
+split belongs with it.
 
 ``DEFAULT_VAL_FRACTION`` is therefore the single definition of the held-out
 fraction.  A trainer may override it, but then it is opting out of the bake-off

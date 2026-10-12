@@ -123,7 +123,7 @@
  *   sqrt(32) = 5.66x 上游的量級進 DF 分支，而 feat_erb 是上游量級，兩個
  *   encoder 分支相對彼此錯配。
  * ⚠ 只作用在餵進正規化器的那一份。要送去 masking/ISTFT 的頻譜保持原尺度，
- *   否則 round trip 不再是 unity。 */
+ *   否則 round trip 不是 unity。 */
 #define DFN2_ANALYSIS_SCALE   0.03125f       /* = 2*512/1024^2 * sqrt(1024) */
 
 /* ---- 推論後處理: = config.ini [model] ---- */

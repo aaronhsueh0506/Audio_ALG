@@ -110,8 +110,8 @@ def _save_pair_atomic(pairs_dir, index, noisy, clean, sr):
     can never leave a partially-written file visible at the final path
     (os.replace is an atomic rename on POSIX; a tmp file orphaned by a
     crash before the replace sits under a name no `*.wav` glob ever
-    matches, so it can never be mistaken for a real sample). With the JSON
-    sidecar gone this rename is the ONLY completion marker a sample has,
+    matches, so it can never be mistaken for a real sample). With no JSON
+    sidecar this rename is the ONLY completion marker a sample has,
     which is why nothing here may ever write directly to the final path."""
     wav_path = _sample_wav_path(pairs_dir, index)
     tmp_path = _tmp_path(wav_path)
@@ -207,9 +207,8 @@ def gen_dataset(args):
     # config/CLI: a shard created with `--start-idx N` stays anchored at N on
     # every later resume without the caller having to repeat the flag. An
     # explicitly supplied conflicting value is almost certainly the wrong
-    # output directory, so fail closed rather than renumber silently. (This
-    # used to be read back out of meta.json's batch_start_idx; the directory
-    # itself carries the same fact.)
+    # output directory, so fail closed rather than renumber silently. (The
+    # directory itself records the batch start.)
     existing_indices = _list_sample_indices(pairs_dir) if args.resume else []
     if existing_indices:
         recorded_base = existing_indices[0]
@@ -288,7 +287,7 @@ def gen_dataset(args):
         # extended or partially overwritten: forgetting --resume and
         # generating a smaller batch with a DIFFERENT config into an
         # existing directory would overwrite only the low indices and leave
-        # a stale tail from the old config behind, and nothing downstream
+        # a stale tail from the other config behind, and nothing downstream
         # can detect that. --start-idx remains available, but only for a
         # genuinely fresh/empty --output directory (e.g. numbering a new
         # shard so it cannot collide with a DIFFERENT, unrelated batch

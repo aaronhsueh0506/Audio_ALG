@@ -1,4 +1,4 @@
-"""Regression tests for DFN2 feature, FIR, loss, and checkpoint contracts."""
+"""Tests for DFN2 feature, FIR, loss, and checkpoint contracts."""
 
 import configparser
 import json
@@ -257,7 +257,7 @@ def test_erb_fb_matches_banderb_notebook_construction():
         assert len(border) == n_bands
 
     # _build_erb_fb(): erb_inv is an exact partition of unity (no row
-    # normalisation needed, unlike the old construction); erb_fb's two edge
+    # normalisation needed); erb_fb's two edge
     # columns are exactly 2x erb_inv's (mode=0 vs mode=1), interior columns
     # match exactly.
     fb, inv = _build_erb_fb(1024, 48000, 32)
@@ -654,7 +654,7 @@ def test_lookahead_relation_is_enforced_in_the_model_constructor():
     """df_lookahead > mask_lookahead must be rejected at the single source.
 
     Guards against the invariant drifting back out into per-entry-point copies:
-    train.py and inference.py deliberately no longer check it, so if the
+    train.py and inference.py deliberately do not check it, so if the
     constructor stops enforcing it nothing does.
     """
     cfg = load_config()
@@ -696,9 +696,9 @@ def test_enc_concat_true_still_emits_a_single_width_bus():
 def test_n_erb_divisibility_follows_upstreams_stricter_rule():
     """Upstream asserts nb_erb % 8; the two stride-2 stages only need % 4.
 
-    ⚠ Calls the real validator.  The previous version asserted `32 % 8 == 0`
-    locally and never reached train.py -- mutation-proven: reverting the guard to
-    % 4 left it green.
+    ⚠ Calls the real validator.  A test that only asserted `32 % 8 == 0`
+    locally would pass whichever rule train.py enforced; reverting the guard to
+    % 4 fails this one.
     """
     shipped = dict(n_fft=1024, win_len=1024, hop_len=512, n_erb=32, df_bins=96,
                    df_order=5, mask_lookahead=1, df_lookahead=1)
@@ -741,9 +741,9 @@ def test_analysis_scale_fold_is_bit_exact():
 
 def test_calibrator_calls_the_trainers_band_db_step():
     """⚠ The calibrator fits init values FOR the trainer, so it must measure what
-    the trainer produces.  It used to transcribe the four lines and drifted twice
-    -- on the log floor and on the power expression.  It now calls the same
-    function, so this asserts the call rather than the text.
+    the trainer produces.  It calls the same function rather than transcribing the
+    four lines (which can drift on the log floor and on the power expression),
+    so this asserts the call rather than the text.
     """
     source = (ROOT_PATH / 'calibrate_norm_init.py').read_text()
     assert 'erb_band_db(' in source, (
@@ -765,9 +765,9 @@ def test_erb_power_uses_the_direct_form_through_the_real_feature_path():
     """Upstream computes re*re + im*im (lib.rs:291), not abs()**2.
 
     ⚠ Asserts through extract_dfn2_features, not against a local re-implementation.
-    The previous version of this test built both expressions itself and compared
-    them, so it passed whichever form the trainer actually used -- mutation-proven:
-    reverting the trainer to abs().pow(2) left it green.
+    A test that built both expressions itself and compared them would pass
+    whichever form the trainer actually used; reverting the trainer to
+    abs().pow(2) fails this one.
     """
     torch.manual_seed(5)
     cfg = load_config()
