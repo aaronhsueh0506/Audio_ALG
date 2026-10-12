@@ -31,6 +31,12 @@ code,pre{background:#f3f3f3}code{padding:.1rem .25rem}pre{padding:.8rem;overflow
 convolution cache、attention/KV ring 都是明確 input/output，由 CPU 或
 driver 保存；一般 runtime 把 state 輸出寫進自己的 tensor、由 host 的 inherit 複製回 state，能把輸出綁到輸入位址的 runtime 則省掉這個複製（下方「遞迴 state」）。STFT、WOLA、linear AEC 與 output
 composition 留在 graph 外。複數一律以 real/imag pair 表示。</p>
+<p>DFN2 與 GTCRN 的 state 輸入與 <code>*_out</code> 輸出一律 rank 4、shape 相同，綁到同一個位址；兩者沒有複製路徑（沒有 inherit）。
+滑動視窗型的 state（DFN2 <code>df_convp_history</code>、GTCRN 六個 conv window）是完整 window：圖在輸入上以明確整數範圍的 Slice 丟掉最舊一幀，接上新的一幀，並把整個 Concat 結果當輸出；
+GRU 型 state 以 dim 1 的 Slice 取列、一個 Concat 接回。<code>AINR/onnx_streaming_contract.py</code> 的 <code>validate_inplace_state_graph()</code> 在匯出時檢查這些條件，metadata 記 <code>state_binding = in_place_same_address</code>。
+C 端的 reset 與被拒的 commit／validate 只歸零 host 的 state，加速器那份定點 state 看不到，所以兩個模型各有一個 generation 計數器
+（<code>dfn2_prepost_state_generation()</code>／<code>dfn2_model_io_state_generation()</code>、<code>gtcrn_model_state_generation()</code>）：init 後為 1，每次 reset 與每次被拒的 commit／validate 加 1；
+runtime 發現數值與上一幀不同就把自己的 state tensor 填成量化後的零。</p>
 
 <h2>使用者入口</h2>
 
@@ -57,11 +63,11 @@ grid 與 state contract。<code>--format npz</code> 產生 NumPy archive 與
 <tr><th>Model</th><th>Graph input/state</th><th>Graph output</th><th>C 前後處理</th></tr>
 <tr><td>RNNoise-ERB</td><td>3-frame ERB/complex feature + h1/h2/h3</td>
 <td>gain + next h1/h2/h3</td><td><code>RNNoise-ERB/process.c/h</code></td></tr>
-<tr><td>DeepFilterNet2</td><td>3-frame ERB/complex feature + explicit recurrent/DF state</td>
-<td>mask/DF/alpha heads + next state</td><td><code>DeepFilterNet2/dfn2_process.c/h</code> +
+<tr><td>DeepFilterNet2</td><td>3-frame ERB/complex feature + <code>h_gru</code> (1,5,1,256) + 5-frame <code>df_convp_history</code> window</td>
+<td>mask/DF/alpha heads + <code>h_gru_out</code>／<code>df_convp_history_out</code>（同位址就地）</td><td><code>DeepFilterNet2/dfn2_process.c/h</code> +
 <code>dfn2_model_io.c/h</code>，外面包 <b><code>dfn2_prepost.c/h</code> 類別</b></td></tr>
-<tr><td>GTCRN</td><td>mag/real/imag 三個 ERB 域特徵(host ERB 前向) + conv/TRA/inter caches</td>
-<td>ERB 域 complex mask + next caches(host ERB 逆矩陣＋CRM)</td><td><code>GTCRN/gtcrn_process.c/h</code> + <code>erb_fwd/erb_inv.bin</code></td></tr>
+<tr><td>GTCRN</td><td>mag/real/imag 三個 ERB 域特徵(host ERB 前向) + 六個 conv window + <code>h_tra</code> + <code>h_dpgrnn</code></td>
+<td>ERB 域 complex mask + 同形狀的 <code>*_out</code> state（同位址就地；host ERB 逆矩陣＋CRM）</td><td><code>GTCRN/gtcrn_process.c/h</code> + <code>erb_fwd/erb_inv.bin</code></td></tr>
 </table>
 
 <h2>AIAEC</h2>
@@ -101,7 +107,7 @@ framing、特徵前後端、recurrent ring／state buffer。整合者不再自�
 每 hop：
   n = &lt;pfx&gt;_pre_process(p, hop…);      /* 或 _pre_process_freq()：這一 hop 的推論次數 */
       &lt;pfx&gt;_frame_inputs(p, &amp;in, &amp;out); /* pool 內的 view；非 state 輸出預填 NaN */
-      加速器填 out                          /* 一般 runtime：寫自己的 tensor，再 &lt;pfx&gt;_outputs_inherit(out, &amp;runtime_out)（Align-ULCNet 為 ulcnet_model_io_inherit）；就地綁定的 runtime 省略 inherit */
+      加速器填 out                          /* 一般 runtime：寫自己的 tensor，再 &lt;pfx&gt;_outputs_inherit(out, &amp;runtime_out)（Align-ULCNet 為 ulcnet_model_io_inherit）；就地綁定的 runtime 省略 inherit；DFN2／GTCRN 只有就地綁定 */
       &lt;pfx&gt;_frame_commit(p);            /* 或 &lt;pfx&gt;_frame_skip(p) */
   &lt;pfx&gt;_post_process(p, out_hop, &amp;written);   /* 或 _post_process_freq() */
 其餘：_reset / _destroy / _hop_size / _num_bins / _io_mode / _descriptor</pre>
@@ -125,7 +131,7 @@ synthesis 照常前進，commit 本身不複製任何 state。複製發生在 co
 回 −1、state 與原來逐位元相同，呼叫端回報該次推論失敗、取 <code>frame_skip</code>，這一幀被跳過。
 <b>就地路徑</b>：state 已被加速器覆寫、<b>無法回滾</b>，commit 遇到任何一處非有限值時<b>所有遞迴 state 歸零</b>（冷啟動）、
 framing／CCM ring 不前進、幀維持開啟、回 −1
-（Align-ULCNet：key／value／logit 三個 history 與兩個 GRU hidden 共五個 state；DFN2：四個遞迴張量；DeepVQE-S：16 個 state），
+（Align-ULCNet：key／value／logit 三個 history 與兩個 GRU hidden 共五個 state；DFN2：<code>h_gru</code> 與 pathway window 兩個遞迴張量；DeepVQE-S：16 個 state），
 呼叫端再選 <code>frame_skip</code> 或用新的 <code>frame_inputs</code> 從冷 state 重跑加速器。
 <code>frame_skip</code> 取 identity（DeepVQE-S 為靜音）、ring／CCM 不步進，state 維持原樣
 （就地路徑為加速器寫完的樣子；回報失敗的 runtime 視為沒有寫入）。寫一半或混寫只有在出現非有限值時才偵測得到。commit 必須有
@@ -134,9 +140,8 @@ framing／CCM ring 不前進、幀維持開啟、回 −1
 
 <p><b>遞迴 state：一般路徑是複製，就地綁定是選用的省法</b>。每個 state 張量在 caller pool 裡只有一個 buffer、位址在實例壽命內不變，
 沒有交替的 bank、沒有指標交換。一般的板端流程是 ONNX 風格的 runtime，輸出寫進它自己擁有的 tensor；host 呼叫 inherit
-（<code>ulcnet_model_io_inherit</code>、<code>deepvqe_prepost_outputs_inherit</code>、<code>dfn2_prepost_outputs_inherit</code>
-／<code>dfn2_model_io_inherit_state</code>、<code>gtcrn_model_state_inherit</code>、<code>rnnoise_model_state_inherit</code>），
-先檢查再複製。能把每個 <code>*_out</code>／<code>*_next</code> 綁到對應輸入位址的 runtime（例如 NPU）直接就地寫入，
+（<code>ulcnet_model_io_inherit</code>、<code>deepvqe_prepost_outputs_inherit</code>、<code>rnnoise_model_state_inherit</code>），
+先檢查再複製（DFN2 與 GTCRN 已無此呼叫，只剩就地綁定）。能把每個 <code>*_out</code>／<code>*_next</code> 綁到對應輸入位址的 runtime（例如 NPU）直接就地寫入，
 <b>只省掉 inherit 這一個呼叫</b>，其餘（prepare／frame_inputs、commit／validate、adapter、pipeline）兩條路徑共用。
 指標等於目的位址的 tensor 不會被 inherit 複製或檢查，所以同一個呼叫兩種綁定都適用。就地時 runtime 必須<b>先讀完</b>
 某個 state 輸入、<b>才寫</b>同位址的輸出（做不到的 runtime 要自己用暫存區暫存讀取）。
@@ -176,7 +181,7 @@ parity 測試各自只編其中一個。把類別塞進任一邊，就會在另�
 <td><b>mute_fail_closed</b>：靜音（stream 0 是原始 mic，放行＝未消迴聲）</td>
 <td><code>state_layout_version</code> + <code>c_descriptor</code>（<code>AIAEC/_streaming_export.py</code>）</td></tr>
 <tr><td>DeepFilterNet2</td><td><code>AINR/DeepFilterNet2/dfn2_prepost.c/h</code></td>
-<td><code>AINR/tests/test_dfn2_prepost_c.py</code>（21 案例）</td>
+<td><code>AINR/tests/test_dfn2_prepost_c.py</code>（17 案例）</td>
 <td>identity：unit ERB mask + alpha 0</td>
 <td><code>state_layout_version</code>（<code>DeepFilterNet2/export_onnx.py</code>）</td></tr>
 <tr><td>Align-CRUSE</td><td><b>沒有</b>——只有共用的 <code>AIAEC/aiaec_process.c/h</code> helper</td>

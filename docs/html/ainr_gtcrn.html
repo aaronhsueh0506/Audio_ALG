@@ -36,8 +36,8 @@ th{background:#eef1f5}
 <h2>概要</h2>
 <p>超輕量 16 kHz 降噪模型(ShuffleNetV2 conv + SFE + TRA + 2×DPGRNN,
 輸出 complex ratio mask)。model layout v5 起固定前後端全部搬到 host；出貨的
-<b>split layout(state layout version 6、19 個 graph input)</b>把 packed recurrent
-state 拆成每個 block/GRU 各自的 graph I/O:
+<b>state layout version 8(11 個 graph input)</b>:六個 depth-conv 各一個完整 window、兩顆 stacked GRU 狀態
+<code>h_tra</code>／<code>h_dpgrnn</code>,每個 state 的輸入與 <code>*_out</code> 輸出 shape 相同、綁同一個位址:
 C 端 <code>gtcrn_process.c</code> 負責串流 STFT/WOLA 之外,還以
 <code>gtcrn_model_input</code>(magnitude＋ERB 前向矩陣 <code>erb_fwd.bin</code>)
 產生 <code>mag/real/imag</code> 三個 <code>(1,129,1)</code> 獨立輸入(各自量化
@@ -159,14 +159,11 @@ host 前後端邊界(v5 起)只描述部署用的 stream graph。</p>
 graph；cache 尺寸由
 <code>stream_model.initial_inputs(model)</code> 從 module tree 推導（不寫死 grid：
 spectrum 寬度隨 n_fft，cache extent 隨 GT block kernel/dilation 與 encoder stride），
-六個 conv history、六個 TRA hidden 與四個 DPGRNN hidden 都是 graph input/output，
-加速器本身不保存跨次呼叫狀態：<code>GTCRNModelState</code> 就是 state buffer，一般 runtime 把每個 state
-<code>*_out</code> 寫進自己的輸出 tensor，由 <code>gtcrn_model_state_inherit(state, conv_out, h_tra_out, h_dpgrnn_out)</code>
-先檢查再複製進 struct（任何 NaN/Inf 則都不複製、回 -1、state 不變，該幀視為失敗；指標已等於欄位者略過）。
-能把 state input 與對應 <code>*_out</code> 綁到<b>同一個欄位</b>的 runtime（綁定表在 <code>gtcrn_process.h</code>）就地寫入、省略 inherit，
-須先讀完 state 輸入才寫同位址的輸出。v6 把 v5 的 packed
-state 拆成實際的 block／GRU 槽位，總 bytes 不變，graph 不再為了拆裝 state
-而執行 Slice/Gather/Concat（conv history 與新框相接那一個 Concat 屬於運算本身）。
+六個 conv window、<code>h_tra</code> 與 <code>h_dpgrnn</code> 都是 graph input/output，
+加速器本身不保存跨次呼叫狀態：<code>GTCRNModelState</code> 就是 state buffer。<b>只有就地綁定</b>:
+runtime 把每個 state input 與對應 <code>*_out</code> 綁到<b>同一個欄位</b>（綁定表在 <code>gtcrn_process.h</code>），
+更新後的 state 就是下一次呼叫的輸入，沒有複製；須先讀完所有 state 輸入才寫同位址的輸出（目標平台已確認 NPU 的行為）。
+呼叫端在每次 invocation 後用 <code>gtcrn_model_state_validate()</code> 檢查（見下）。
 匯出不再 pin 單一 grid——config 與 checkpoint 不成對時在 strict
 <code>load_state_dict</code>（形狀）或 checkpoint contract（同形語意）就大聲失敗。
 v5 起固定前後端全在 host：<code>gtcrn_model_input</code>（magnitude＋ERB 前向矩陣）
@@ -179,23 +176,23 @@ shape）；<b>C 只吃呼叫端載入的指標</b>，loader 擁有檔案、可�
 129 帶寬。<code>inference.py calib</code> 會在同一 process 同一 model instance
 一併匯出並 parity-check graph（預設 <code>&lt;output&gt;.onnx</code>，<code>--onnx</code> 可改）。</p>
 
-<p><b>State layout</b>(<code>--state-layout</code>,<code>export_onnx.py</code> 與
-<code>inference.py calib</code> 同旗標):
-<b>split = version 6,出貨合約</b>——<code>mag</code>/<code>real</code>/<code>imag</code>
-三個特徵入,加六個 conv history、六個 <code>h_tra_*</code>、四個 <code>h_dpgrnn*</code>,
-共 19 個 input,即上表與 <code>GTCRNModelState</code> 綁定的那組。
-<b>combined = version 7,EXPERIMENTAL、無 C runtime 綁定</b>(號碼在
-<code>gtcrn_process.h</code> 保留,下一次真正 bump 要跳 8)——十六個 state 依形狀併成三個:
-實測 <code>conv_cache (2,16,16,33)</code>、<code>h_tra (6,1,16)</code>、
-<code>h_dpgrnn (4,33,8)</code>,input 只剩 6 個,總 state 值數與 bytes 不變。</p>
-<p class="note">併法:每一組都沿<b>本來就有的軸</b>接,所以沒有 tensor 多長一維(四維天花板守住)。
-六個 conv history 都是 <code>(1,C,pad,F)</code>、C 與 F 相同只差深度,encoder 的 2+4+10 = 16
-與 decoder 的 10+4+2 = 16 各自沿深度軸接起來,再讓 encoder／decoder 兩列沿原本就是 1 的
-batch 軸併成 2。實作是 <code>stream_model.CombinedStateGTCRN</code>,它<b>包住</b>
-<code>StreamGTCRN</code> 而非另寫一份,所以兩種邊界跑的是同一份 compute。
-節點數實測:split 追蹤圖 595 節點(29 Slice、24 Concat),combined 618 節點
-(4 Split、31 Slice、29 Concat);兩者經 exporter 內建 onnxoptimizer ＋ ORT 常數折疊後
-本機量測分別為 267／278 節點(合約測試門檻 ≤ 300)。</p>
+<p><b>State 邊界(layout version 8)</b>:所有 state tensor 都是 rank 4,輸入與 <code>*_out</code> 輸出 shape 完全相同;
+metadata 記 <code>state_binding = in_place_same_address</code>。版本 3–7 已退役(<code>RETIRED_LAYOUT_VERSIONS</code>)。</p>
+<ul>
+<li><code>conv_enc0/1/2</code>、<code>conv_dec0/1/2</code> <code>(1,16,3|5|11,33)</code>:depth-conv 的<b>完整</b>因果 window(= 舊歷史 + 新的一幀)。
+圖在輸入上做一個 Slice(axes=[2]、starts=[1]、ends=[K]、step 1,end 是明確整數)丟掉最舊一幀,接上新的一幀,卷積,
+並把<b>整個</b> K 幀 Concat 結果當作 <code>conv_*_out</code>。輸入只有這一個 consumer,沒有任何 state 輸出由 Slice 產生。
+decoder 的 window 深度與 encoder 反向(11、5、3)。</li>
+<li><code>h_tra (1,6,1,16)</code>:六顆 TRA attention GRU,列順序 encoder 0–2 再 decoder 0–2;<code>h_dpgrnn (1,4,33,8)</code>:四顆 grouped inter GRU
+(<code>h_dpgrnn1_0</code>、<code>h_dpgrnn1_1</code>、<code>h_dpgrnn2_0</code>、<code>h_dpgrnn2_1</code>),hidden batch 是頻率軸。
+每顆 GRU 用輸入上 dim 1 的 Slice 取自己的列再 squeeze,下一個 state 以一個 Concat(dim 1)接回。</li>
+</ul>
+<p class="note">同一份 compute:舊的逐 block／逐 GRU 輸入對照以 ONNX Runtime 重播驗證——240 hops 實音訊與 27 hops 隨機輸入,
+輸出 head 與舊圖逐位元相同(最大差 0),新 window 前 K−1 幀等於舊輸入、後 K−1 幀等於舊輸出,<code>h_tra</code>／<code>h_dpgrnn</code>
+等於舊的六個／四個 hidden 依序串接。匯出圖經 exporter 內建 onnxoptimizer ＋ ORT 常數折疊後本機量測 299 節點(36 個 Slice,皆 step 1;合約測試門檻 ≤ 300)。
+<code>AINR/onnx_streaming_contract.py</code> 的 <code>validate_inplace_state_graph()</code> 在匯出時檢查上述條件,
+<code>AINR/check_state_quantization.py</code> 可對量化後的圖與報告再檢查 state 輸入／輸出的 dtype、scale、zero point、shape 是否一致。
+Slice 沿 axis 2 的起點在 int8 下落在 33 byte 的整數倍(window 一列 33 個元素),不是 16 byte 對齊;對齊處理由量化工具鏈決定,尚未在板上驗證。</p>
 <div class="tbl"><table>
 <tr><th>狀態</th><th>shape</th><th>bytes</th><th>儲存者</th><th>說明</th></tr>
 <tr><td><code>analysis_buf</code></td><td>[512]</td><td>2,048</td><td>C struct <code>GTCRNProcessState</code></td><td>分析滑窗</td></tr>
@@ -204,23 +201,19 @@ batch 軸併成 2。實作是 <code>stream_model.CombinedStateGTCRN</code>,它<b
 <tr><td><code>scratch_time</code></td><td>[512]</td><td>2,048</td><td>C struct</td><td>FFT 時域 scratch，非跨呼叫</td></tr>
 <tr><td><code>scratch_freq</code></td><td>[257] complex</td><td>2,056</td><td>C struct</td><td>FFT 頻域 scratch，非跨呼叫</td></tr>
 <tr><td><code>fft</code></td><td>pointer</td><td>8</td><td>host caller</td><td>借用的 caller-owned <code>FftHandle</code></td></tr>
-<tr><td><code>conv_enc0/1/2</code></td><td>(1,16,2/4/10,33)</td><td>33,792(8,448 f32)</td><td>host caller</td><td>三個 encoder depth-conv 時間快取</td></tr>
-<tr><td><code>conv_dec0/1/2</code></td><td>(1,16,10/4/2,33)</td><td>33,792(8,448 f32)</td><td>host caller</td><td>三個 decoder depth-conv 時間快取</td></tr>
-<tr><td><code>h_tra_enc0</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 0 個)</td></tr>
-<tr><td><code>h_tra_enc1</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 1 個)</td></tr>
-<tr><td><code>h_tra_enc2</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；encoder TRA <code>att_gru</code> hidden(第 2 個)</td></tr>
-<tr><td><code>h_tra_dec0</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；decoder TRA <code>att_gru</code> hidden(第 0 個)</td></tr>
-<tr><td><code>h_tra_dec1</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；decoder TRA <code>att_gru</code> hidden(第 1 個)</td></tr>
-<tr><td><code>h_tra_dec2</code></td><td>(1,1,16)</td><td>64(16 f32)</td><td>host caller</td><td>顯式 graph I/O；decoder TRA <code>att_gru</code> hidden(第 2 個);6 個 <code>h_tra_*</code> 合計 384 bytes(96 f32)</td></tr>
-<tr><td><code>h_dpgrnn1_0/1</code></td><td>各 (1,33,8)</td><td>2,112(528 f32)</td><td>host caller</td><td>第一個 grouped inter-RNN 的兩顆 GRU hidden</td></tr>
-<tr><td><code>h_dpgrnn2_0/1</code></td><td>各 (1,33,8)</td><td>2,112(528 f32)</td><td>host caller</td><td>第二個 grouped inter-RNN 的兩顆 GRU hidden；四個合計 4,224 bytes</td></tr>
+<tr><td><code>conv_enc0/1/2</code></td><td>(1,16,3/5/11,33)</td><td>40,128(10,032 f32)</td><td>host caller</td><td>三個 encoder depth-conv 的完整 window,<code>*_out</code> 與輸入同位址</td></tr>
+<tr><td><code>conv_dec0/1/2</code></td><td>(1,16,11/5/3,33)</td><td>40,128(10,032 f32)</td><td>host caller</td><td>三個 decoder depth-conv 的完整 window,<code>*_out</code> 與輸入同位址</td></tr>
+<tr><td><code>h_tra</code></td><td>(1,6,1,16)</td><td>384(96 f32)</td><td>host caller</td><td>顯式 graph I/O,六顆 TRA <code>att_gru</code> hidden:列 0–2 encoder、列 3–5 decoder;C: <code>h_tra[6][1][16]</code></td></tr>
+<tr><td><code>h_dpgrnn</code></td><td>(1,4,33,8)</td><td>4,224(1,056 f32)</td><td>host caller</td><td>顯式 graph I/O,四顆 grouped inter GRU hidden(<code>h_dpgrnn1_0/1</code>、<code>h_dpgrnn2_0/1</code>);C: <code>h_dpgrnn[4][33][8]</code></td></tr>
 </table></div>
-<p class="note">就地路徑的 <code>gtcrn_model_state_validate(GTCRNModelState*)</code>:每次 invocation 後就地檢查 16 個 state 張量,
-全部有限回 0;任何 NaN/Inf 則整個 state 歸零並回 -1(前一個 state 已被覆寫;寫一半而仍有限者偵測不到;可信 runtime 可不呼叫)。
+<p class="note"><code>gtcrn_model_state_validate(GTCRNModelState*)</code>:每次 invocation 後就地檢查 8 個 state 張量,
+全部有限回 0;任何 NaN/Inf 則整個 state 歸零、state generation 加 1 並回 -1(前一個 state 已被覆寫;寫一半而仍有限者偵測不到;可信 runtime 可不呼叫)。
+<code>gtcrn_model_state_generation()</code> 回傳 generation:<code>gtcrn_model_state_init()</code> 後為 1,每次 <code>gtcrn_model_state_reset()</code> 與每次被拒的 validate 加 1(mod 2^32);
+加速器那份定點 state 看不到這兩件事,runtime 發現數值與上一幀不同就把自己的 state tensor 填成量化後的零。
 <code>sizeof(GTCRNProcessState)</code> = 10,256 bytes(64-bit 本機量測)。
 本目錄 <code>model.py</code> 無 cache 介面;上表 NPU 狀態 shape 逐一取自
 <code>stream_model.initial_inputs()</code> 與匯出 graph schema；
-<code>sizeof(GTCRNModelState)</code> = 72,192 bytes，與 v5 相同。</p>
+<code>sizeof(GTCRNModelState)</code> = 84,868 bytes(84,864 bytes 的八個 state tensor ＋ 4 bytes 的 generation)。</p>
 
 <h2>延遲與 warm-up</h2>
 <ul>
@@ -232,21 +225,22 @@ intra RNN 只在單框的頻率軸上雙向。</li>
 且 C 串流的首框以零填充取代 PyTorch 離線 <code>center=True</code> 的 reflect padding
 (README 明載此差異只影響 clip 起點)。</li>
 <li>時間感受野:encoder/decoder 各 3 個 GTConvBlock 累積 (kT−1)·dilation = 2+4+10 = 16 框過去
-context(cache 大小即由此而來),加上 RNN 無限記憶。</li>
+context(conv window 深度 = 歷史 + 新的一幀,即 3、5、11),加上 RNN 無限記憶。</li>
 </ul>
 
 <h2>相關檔案與測試路徑</h2>
 <ul>
 <li>C 前後處理:<code>AINR/GTCRN/gtcrn_process.c</code> / <code>.h</code>（DSP kernels 內含於本檔——porting 為單一 model，各自攜帶）</li>
 <li>模型 / 訓練 / 推論:<code>AINR/GTCRN/model.py</code>、<code>train.py</code>、<code>inference.py</code>、<code>config.ini</code>、<code>checkpoint_utils.py</code></li>
-<li>串流 / 匯出:<code>AINR/GTCRN/stream_model.py</code>(<code>StreamGTCRN</code>、<code>CombinedStateGTCRN</code>、<code>initial_inputs</code>、<code>pack_state</code>)、<code>export_onnx.py</code>、<code>export_erb_matrix.py</code></li>
+<li>串流 / 匯出:<code>AINR/GTCRN/stream_model.py</code>(<code>StreamGTCRN</code>、<code>initial_inputs</code>)、<code>export_onnx.py</code>、<code>export_erb_matrix.py</code></li>
 <li>文件:<a href="../../AINR/GTCRN/README.md">README.md</a>、<a href="../../AINR/GTCRN/docs/architecture_notes.md">docs/architecture_notes.md</a></li>
 <li>上游 vendored 參考:<code>AINR/gtcrn_github/</code>(offline <code>gtcrn.py</code>、串流 <code>stream/gtcrn_stream.py</code>、論文 PDF)</li>
 <li>C 測試:<code>AINR/tests/test_c_prepost.c</code>(<code>test_gtcrn()</code>:回路穩態 unity,誤差門檻 2e-4)—
 <code>make -C AINR test-simd</code> 驗證 scalar/NEON 路徑</li>
 <li>Python 匯出合約測試:<code>AINR/GTCRN/tests/test_gtcrn_export_contract.py</code>:
-metadata/layout 互鎖(含 combined 號碼不得與出貨版本相撞)、calibration/ONNX shape、
+metadata/layout 互鎖(退役號碼不得被出貨版本使用)、calibration/ONNX shape、
 兩組 grid 的 config↔checkpoint 互鎖、部署 graph 不含 Gather 且維持 operator budget，
-以及 split／combined 兩種邊界逐框輸出與 state 完全相等。</li>
+各列 state 抵達自己的 GRU、window 逐框重疊，以及匯出圖的 state 邊界(Slice 範圍、rank 4、輸入輸出同 shape)；
+<code>AINR/tests/test_onnx_state_contract.py</code> 測邊界驗證器與量化後檢查。</li>
 <li>串流 vs 離線等價:<code>AINR/tests/test_gtcrn_stream_export.py</code>(兩組 grid,誤差 &lt; 2e-5)</li>
 </ul>

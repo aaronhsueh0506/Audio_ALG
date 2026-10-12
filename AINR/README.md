@@ -184,32 +184,42 @@ The active deployment exports are stateless accelerator graphs:
 | Model | New signal context per call | Caller-owned model state |
 |---|---:|---|
 | RNNoise-ERB | 3 feature frames -> 1 gain frame | 3 GRU hidden tensors |
-| DeepFilterNet2 | 3 feature frames -> 1 head frame | 3 GRU tensors + 4-frame DF pathway cache |
-| GTCRN | 1 complex STFT frame | conv/TRA/inter-GRU caches |
+| DeepFilterNet2 | 3 feature frames -> 1 head frame | `h_gru` (1,5,1,256) + 5-frame DF pathway window (1,64,5,96) |
+| GTCRN | 1 complex STFT frame | 6 conv windows (1,16,3\|5\|11,33) + `h_tra` (1,6,1,16) + `h_dpgrnn` (1,4,33,8) |
 
 “Stateless” describes the accelerator, not the algorithm. Each state tensor has
-one host buffer owned by the caller. The ordinary runtime writes the graph's
-`*_out` state tensors into its own output tensors and the host takes them over
-with the model's inherit call (`rnnoise_model_state_inherit()`,
-`gtcrn_model_state_inherit()`, `dfn2_model_io_inherit_state()` /
-`dfn2_prepost_outputs_inherit()`): it finite-checks every tensor it would copy
-and only then copies, so a refused call leaves the state as it was and the
-frame is treated as failed. A runtime that can bind each `*_out` to its input's
-address (an NPU, say) writes the state in place and omits the inherit call;
-everything else is shared. A tensor whose pointer already equals its
-destination is never copied or checked by inherit. In place the runtime must
-finish reading a state input before it writes the output at that address, and
-the `*_validate` helpers (for example `gtcrn_model_state_validate()`,
-`rnnoise_model_state_validate()` and `dfn2_model_io_validate_state()`)
-finite-check the state and zero it on a non-finite value, because the previous
-state no longer exists.
+one host buffer owned by the caller.
+
+DeepFilterNet2 and GTCRN state is rank 4 and has the same shape at the graph
+input and at its `*_out` output; the runtime binds both to the same address, so
+the updated state is the next call's input and nothing is copied. A sliding
+window (DFN2 `df_convp_history`, the six GTCRN conv windows) is the full window:
+the graph drops the oldest frame with a Slice on the input, appends the new
+frame and returns the whole concatenation. Recurrent states are stacked into
+one tensor per model (`h_gru`, `h_tra`, `h_dpgrnn`), cut with Slices on dim 1
+and joined with one Concat. `onnx_streaming_contract.py`
+(`validate_inplace_state_graph`) checks this at export time and
+`check_state_quantization.py` repeats it on an exported graph and on a
+quantization report. The runtime must finish reading every state input before
+it writes the output at that address, and the `*_validate` helpers
+(`gtcrn_model_state_validate()`, `dfn2_model_io_validate_state()`) finite-check
+the state and zero it on a non-finite value, because the previous state no
+longer exists. The accelerator's fixed-point copy of the state is not reached by
+a reset or by that zeroing, so `dfn2_prepost_state_generation()`,
+`dfn2_model_io_state_generation()` and `gtcrn_model_state_generation()` count
+them (1 after init, plus one per event): a runtime that sees a new value refills
+its state tensors with quantized zeros.
+
+RNNoise-ERB still takes the ordinary runtime's own output tensors with
+`rnnoise_model_state_inherit()` (finite-check, then copy), or is bound in place
+and validated with `rnnoise_model_state_validate()`.
 
 DeepFilterNet2 additionally publishes the host-side callback boundary a
 pipeline binds a runtime to -- `DFN2Model` / `dfn2_model_run_frame()` in
 `DeepFilterNet2/dfn2_prepost.h`, with `DFN2ModelIoDescriptor` in
 `dfn2_model_io.h` as the graph contract a runtime must present. There is no
 separate accelerator adapter for DFN2, unlike Align-ULCNet: the feature
-windows and every recurrent cache already live inside the `DFN2Prepost`
+windows and both recurrent state tensors already live inside the `DFN2Prepost`
 pool, so the class itself is the adapter. The FREQ mode also offers
 `dfn2_prepost_pre_process_freq_dual()`, which estimates the heads from one
 spectrum and applies them to another on the same frame clock; the two

@@ -75,19 +75,18 @@ the first hop (the graph needs its right-hand neighbour) and 1 after; the
 spectra at the `DFN2_IO_FREQ` boundary are torch.stft normalized=True on this
 48 kHz/1024 grid, so chaining an AIAEC spectrum in is a 32x scale error (the
 header's warning block); the window is copied rather than borrowed
-because `DFN2State` embeds its table by value; and the four recurrent state
-tensors live in the pool at addresses that never change. The normal path is a
-runtime that writes its own output tensors, handed to the pool with
-`dfn2_prepost_outputs_inherit()` before `frame_commit()`: it validates every
-tensor it would copy and then copies, so a refused inherit (`-1`) leaves the
-pool byte-identical and the caller reports the run as failed and takes
-`frame_skip()`. The optimized path binds the `*_next` outputs to the pointers
-`frame_inputs()` returned and skips inherit; the state input and output are
-then the same address on every frame, the runtime must read all state inputs
-before it writes any state output there, and a commit that finds a non-finite
-head or state value zeroes the four recurrent tensors, because the previous
-state was overwritten and cannot be restored. On a healthy stream both
-bindings give the same output bit for bit. Its gate is
+because `DFN2State` embeds its table by value; and the two recurrent state
+tensors (`h_gru`, `df_convp_history`) live in the pool at addresses that never
+change. The runtime binds each state output (`gru_hidden_next`,
+`df_convp_window_next`) to the same address as its input, so the output of one
+invocation is the input of the next with no copy; it must read all state inputs
+before it writes any state output there. A commit that finds a non-finite head
+or state value zeroes the two recurrent tensors, because the previous state was
+overwritten and cannot be restored. `dfn2_prepost_state_generation()` is 1 after
+init and advances on every `dfn2_prepost_reset()` and every refused commit
+(modulo 2^32): the accelerator's fixed-point copy of the state is not reached
+by either event, so a runtime that sees a different value than at the previous
+frame refills its state tensors with quantized zeros. Its gate is
 `../tests/test_dfn2_prepost_c.py`; `make -C .. lib` ships it in
 `libainr_prepost.a` (`make -C .. print-lib-path` prints the configuration-keyed
 location).
@@ -119,37 +118,31 @@ python3 inference.py calib --model output/dfn2_best.pth \
 
 The graph is stateless from the accelerator's perspective. Each invocation
 receives exactly three feature frames `[t-1,t,t+1]`, emits the heads for frame
-`t`, and returns one hidden tensor per GRU -- `h_encoder` `(1,1,256)`, `h_erb`
-`(2,1,256)` and `h_df` `(2,1,256)` -- plus the four-frame `df_convp` history
-for the next invocation. Each hidden is PyTorch's own stacked
-`(num_layers, 1, hidden)` shape, which is exactly how `DFN2ModelIOState`
-already lays its `[layers][hidden]` arrays out, so a runtime binds one tensor
-to one contiguous field. The extra history is required because the
-input kernel sees three frames while the DF residual path has a causal
-five-frame kernel; omitting it would silently reduce the trained receptive
-field. CPU-side window/state storage is defined by
+`t`, and returns two state tensors: `h_gru_out` `(1,5,1,256)` and
+`df_convp_history_out` `(1,64,5,96)`. Each state input and its output have the
+same shape and are bound to one address. `h_gru` holds the five GRU hidden
+rows in `DFN2ModelIOState` memory order -- encoder (row 0), ERB decoder (rows
+1-2), DF decoder (rows 3-4; `DFN2_MODEL_GRU_ROW_*`). `df_convp_history` is the
+whole causal window of the five-frame DF residual path: the graph drops the
+oldest frame with a Slice on the input, appends the new frame and returns the
+whole concatenation. That window is required because the input kernel sees
+three frames while the DF residual path has a causal five-frame kernel;
+omitting it would silently reduce the trained receptive field. CPU-side
+window/state storage is defined by
 `dfn2_model_io.c/.h`, which also exports the window-slide and state-validate
 helpers so an external dual-input consumer with its own state struct reuses
 this window/validate discipline instead of inlining a second copy of the
-memmove/memcpy pair. The normal path is a runtime that writes its `*_next`
-outputs into its own buffers and the caller takes them over with
-`dfn2_model_io_inherit_state()` / `dfn2_model_io_inherit_arrays()` (the same
-alias-skip and validate-then-copy rule as the class: a refused call returns
-`-1` and leaves the state intact). The optimized path binds each state output
-to the same address as its input, so every recurrent tensor is one buffer, and
-validates it afterwards.
-`dfn2_model_io_validate_state()`, `dfn2_model_io_validate_arrays()` and
-`dfn2_model_io_inherit_arrays()` take
-one array per GRU stack --
-`erb_gru_hidden[DFN2_MODEL_ERB_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN]` and
-`df_gru_hidden[DFN2_MODEL_DF_GRU_LAYERS][DFN2_MODEL_GRU_HIDDEN]` -- matching
-the graph tensors element for element. Validation is a finite check over the
-state itself: a null argument returns `-1`, and a non-finite element zeroes the
-four arrays and returns `-1`. A finite but partial or mixed accelerator write
-is not detectable. The exported metadata carries `state_layout_version`,
-kept numerically equal to `DFN2_MODEL_IO_LAYOUT_VERSION` in that header, so an
-integrator can refuse a graph whose state layout no longer matches the struct
-it allocated. `inference.py calib --frames N` captures `N`
+memmove/memcpy pair. `dfn2_model_io_validate_state()` and
+`dfn2_model_io_validate_arrays()` take `gru_hidden[DFN2_MODEL_GRU_ROWS]
+[DFN2_MODEL_GRU_HIDDEN]` and `df_convp_window[...][DFN2_MODEL_DF_PATHWAY_WINDOW]
+[...]`, matching the graph tensors element for element. Validation is a finite
+check over the state itself: a null argument returns `-1`, and a non-finite
+element zeroes the two arrays and returns `-1` (`dfn2_model_io_validate_state()`
+also advances `dfn2_model_io_state_generation()`). A finite but partial or mixed
+accelerator write is not detectable. The exported metadata carries
+`state_layout_version`, kept numerically equal to `DFN2_MODEL_IO_LAYOUT_VERSION`
+in that header, so an integrator can refuse a graph whose state layout no longer
+matches the struct it allocated. `inference.py calib --frames N` captures `N`
 streaming invocations with real non-zero state. `calibrate_norm_init.py` is a
 different tool: it estimates the feature EMA initialization constants used by
 the C frontend.
@@ -165,56 +158,49 @@ frames packed together.
 ```bash
 python3 inference_batch.py export \
   --model output/dfn2_best.pth --batch-size 4 \
-  --gru-state-layout combined \
   --output output/dfn2_stream_b4.onnx --verify
 
 python3 inference_batch.py calib \
   --model output/dfn2_best.pth --wav-dir /path/to/noisy_wavs \
-  --batch-size 4 --batches 1000 --gru-state-layout combined \
+  --batch-size 4 --batches 1000 \
   --format bin --output calib/dfn2_b4
 ```
 
 Each tensor BIN file is one complete NPU invocation and therefore contains
-all four lanes.  The combined recurrent input is `(B,5,1,256)`; the split
-layout keeps PyTorch's native `(layers,B,256)` hidden tensors.  The generated
+all four lanes.  The recurrent input is `(B,5,1,256)` and the pathway window
+`(B,64,5,96)`.  The generated
 JSON records `fixed_batch_size`, exact tensor shapes, and the number of source
-frame snapshots.  The C model-I/O helper remains the shipped batch-one/split
-contract; fixed batch and combined state are profiling contracts only.
+frame snapshots.  The C model-I/O helper remains the shipped batch-one
+contract; fixed batch is a profiling contract only.
 
-## Recurrent-state layouts
+## State boundary
 
-`--gru-state-layout` selects how the recurrent state is presented at the graph
-boundary, on `export_onnx.py` and on `inference.py calib` alike (calibration
-exports the graph from the same model instance in the same process, so pass
-the flag there rather than exporting twice). The maths is identical either
-way; only the boundary and the published `state_layout_version` differ.
+State layout version 8. Both state tensors are rank 4 with the same shape at
+the input and at the `*_out` output, bound to one address; the metadata records
+`state_binding = in_place_same_address`, `state_handoff` and `state_slicing`.
+Versions 4, 5, 6 and 7 are retired (`RETIRED_LAYOUT_VERSIONS`); the contract
+test asserts `DFN2_MODEL_IO_LAYOUT_VERSION` against them, so a C-side bump onto
+one fails a test rather than a review.
 
-| layout | version | state inputs | status |
-| --- | --- | --- | --- |
-| `split` (default) | 5 | `h_encoder`, `h_erb`, `h_df`, `df_convp_history` | shipped; `dfn2_model_io.h` binds it |
-| `combined` | 7 | `h_gru` `(1,5,1,256)`, `df_convp_history` | experimental; no C runtime binds it |
+| tensor | shape | meaning |
+| --- | --- | --- |
+| `h_gru` | `(1,5,1,256)` | encoder row 0, ERB decoder rows 1-2, DF decoder rows 3-4 |
+| `df_convp_history` | `(1,64,5,96)` | full causal window of the DF residual convolution |
 
-Versions 4 and 6 are retired (`RETIRED_LAYOUT_VERSIONS`); the contract test asserts
-`DFN2_MODEL_IO_LAYOUT_VERSION` against both the retired numbers and the
-combined one, so a C-side bump onto either fails a test rather than a review.
-
-ONNX has no stacked GRU op, so a two-layer stack still becomes two GRU nodes
-fed by per-layer `Slice`s -- five GRU nodes in both layouts. What the split
-layout trades is therefore PTQ scale granularity, per GRU rather than per
-layer: the two layers of `h_erb` share one input tensor and one quantization
-scale, in exchange for the native shape and an exact match to the C struct.
-
-The combined layout exists to measure what a single shared scale costs, which
-`inference.py calib` reports per GRU under `gru_state_slices`:
-
-```bash
-python3 inference.py calib --model output/dfn2_best.pth \
-  --wav-dir /path/to/noisy_wavs --frames 8192 --format bin \
-  --gru-state-layout combined --output calib/dfn2_combined
-```
-
-Adopting it would be a contract change, not a flag flip: `dfn2_model_io.h`,
-its validate API, the I/O tables and the C tests would all have to move with it.
+Each GRU reads its rows through a Slice of the graph input on dim 1 followed by
+a squeeze, and the next `h_gru` is one Concat on dim 1. ONNX has no stacked GRU
+op, so a two-layer stack still becomes two GRU nodes: five GRU nodes in all.
+The three GRUs therefore share one input tensor and one quantization scale;
+`inference.py calib` reports under `gru_state_slices` what that costs each GRU
+(bits lost under a symmetric max-abs int8 scale). The window input has exactly
+one consumer, a Slice of axis 2 with the explicit range `[1:5]` and step 1; no
+state output is produced by a Slice. `../onnx_streaming_contract.py`
+(`validate_inplace_state_graph`) checks this at export time, and
+`../check_state_quantization.py` repeats it on an exported graph and, given a
+quantization report, aborts when a state input and its output differ in dtype,
+scale, zero point or shape. A window row is 96 elements, so on an int8 target
+the axis-2 Slice starts at a multiple of 96 bytes; how the toolchain aligns it
+is not verified on a board.
 
 ## Debugging excessive low-frequency suppression
 

@@ -37,9 +37,8 @@ python3 export_erb_matrix.py --model output/gtcrn_best.pth \
   --output-dir output/erb --format all
 ```
 
-The default `split` state layout takes nineteen inputs: `mag`, `real`, `imag`,
-six block-local `conv_*` histories, six `h_tra_*` tensors and four per-GRU
-`h_dpgrnn*` tensors. The graph returns
+The graph takes eleven inputs: `mag`, `real`, `imag`, six `conv_*` windows,
+`h_tra` and `h_dpgrnn`. It returns
 the ERB-domain complex mask and every updated state tensor on each call.
 Calibration captures real pre-frame state values rather than repeating zero
 state.
@@ -54,66 +53,55 @@ invocation; GTCRN must not be padded to an artificial three-frame input
 because its full temporal context already lives in the explicit state
 tensors.
 
-`GTCRNModelState` is the state buffer itself, and there are two ways to feed it.
+`GTCRNModelState` is the state buffer itself. Bind each state input and its
+`*_out` output to the same field (`&state->conv_enc0` ... `&state->conv_dec2`,
+`&state->h_tra`, `&state->h_dpgrnn`), so the updated state is the next call's
+input and the CPU copies nothing between invocations. The runtime must read
+every state input before it writes any state output at the same address.
+After each invocation `gtcrn_model_state_validate()` finite-checks the whole
+state in place and returns `int`: `0` when every element is finite, `-1` on a
+null argument or on any NaN/Inf, in which case the whole state is zeroed (it
+restarts from zero) because the previous value no longer exists.
 
-- Normal path: the runtime writes each state `*_out` tensor into its own output
-  buffer and `gtcrn_model_state_inherit(state, conv_out, h_tra_out,
-  h_dpgrnn_out)` copies them into the struct (`conv_out[6]`, `h_tra_out[6]`,
-  `h_dpgrnn_out[4]`, each element laid out like the matching field). It
-  finite-checks every tensor it would copy before copying any: on success it
-  returns `0`; on a null argument or any NaN/Inf it returns `-1`, copies
-  nothing and leaves the state intact, so the caller treats the frame as
-  failed. A tensor whose pointer already equals its field is skipped (neither
-  checked nor copied).
-- Optimized path (saves the copy): bind each state input and its `*_out` output
-  to the same field (`&state->conv_enc0` ... `&state->conv_dec2`,
-  `&state->h_tra[i]`, `&state->h_dpgrnn[i]`) so the CPU copies nothing between
-  invocations. The runtime must read every state input before it writes any
-  state output at the same address. `gtcrn_model_state_validate()` is then an
-  optional finite check of the whole state in place and returns `int`: `0` when
-  every element is finite, `-1` on a null argument or on any NaN/Inf, in which
-  case the whole state is zeroed (it restarts from zero) because the previous
-  value no longer exists.
+A partial or mixed write that stays finite is not detectable.
 
-A partial or mixed write that stays finite is not detectable on either path.
+The library zeroes the state on `gtcrn_model_state_reset()` and on a refused
+`gtcrn_model_state_validate()`, but the accelerator keeps its own fixed-point
+copy that neither reaches. `gtcrn_model_state_generation()` returns 1 after
+`gtcrn_model_state_init()` and advances by one on every reset and every refused
+validation (modulo 2^32): a runtime that sees a value different from the one at
+the previous frame refills its state tensors with quantized zeros.
 
-State layout v6 — the `split` layout — keeps the same 72,192 state bytes as v5 but removes the
-graph-side slicing and packing that a shared cache tensor needed. The exported metadata
-carries `state_layout_version`, kept numerically equal to
-`GTCRN_MODEL_LAYOUT_VERSION` in `gtcrn_process.h`, so an integrator can refuse
-a graph whose cache layout no longer matches the struct it allocated.
+## State boundary
 
-## State layouts
+State layout version 8. The exported metadata carries `state_layout_version`,
+kept numerically equal to `GTCRN_MODEL_LAYOUT_VERSION` in `gtcrn_process.h`, so
+an integrator can refuse a graph whose state layout no longer matches the
+struct it allocated. Versions 3 to 7 are retired
+(`RETIRED_LAYOUT_VERSIONS` in `export_onnx.py`). The metadata also records
+`state_binding = in_place_same_address`, `state_handoff` and `state_slicing`.
 
-`--state-layout` selects how the sixteen state tensors are cut at the graph
-boundary, on `export_onnx.py` and on `inference.py calib` alike. Both layouts
-run the same compute — `CombinedStateGTCRN` wraps `StreamGTCRN` rather than
-reimplementing it — and hold the same 72,192 state bytes; only the boundary
-and the published `state_layout_version` differ.
+Every state tensor is rank 4 and has the same shape at its input and at its
+`*_out` output:
 
-| layout | version | inputs | status |
-| --- | --- | --- | --- |
-| `split` (default) | 6 | 19: three features + sixteen per-slot state tensors | shipped; `GTCRNModelState` binds it |
-| `combined` | 7 | 6: three features + `conv_cache`, `h_tra`, `h_dpgrnn` | experimental; no C runtime binds it |
+| tensor | shape | meaning |
+| --- | --- | --- |
+| `conv_enc0`, `conv_enc1`, `conv_enc2` | `(1, 16, 3 / 5 / 11, 33)` | full causal window of each encoder depthwise convolution |
+| `conv_dec0`, `conv_dec1`, `conv_dec2` | `(1, 16, 11 / 5 / 3, 33)` | the same for the decoder, in reverse order |
+| `h_tra` | `(1, 6, 1, 16)` | the six TRA attention GRUs, encoder 0-2 then decoder 0-2 |
+| `h_dpgrnn` | `(1, 4, 33, 8)` | the four grouped inter GRUs, `h_dpgrnn1_0`, `h_dpgrnn1_1`, `h_dpgrnn2_0`, `h_dpgrnn2_1`; the hidden batch is the frequency axis |
 
-Version 7 is reserved in `gtcrn_process.h` so a later C-side bump cannot take
-the same number; the next real bump goes to 8.
+A window input has exactly one consumer, a Slice of axis 2 with an explicit
+integer range `[1:K]` and step 1. It drops the oldest frame; the graph appends
+the new frame and returns the whole concatenation, so no state output is
+produced by a Slice. The stacked GRU tensors are cut with Slices on dim 1 and
+joined by one Concat on dim 1. `onnx_streaming_contract.py`
+(`validate_inplace_state_graph`) checks all of this at export time;
+`check_state_quantization.py` repeats the check on an exported graph and, given
+a quantization report, aborts when a state input and its output differ in
+dtype, scale, zero point or shape.
 
-The combined groups are the ones whose members already share a shape, and each
-is concatenated along an axis it already has, so nothing gains a dimension and
-the four-dimensional ceiling holds. On the shipped grid that measures
-`conv_cache (2, 16, 16, 33)`, `h_tra (6, 1, 16)` and `h_dpgrnn (4, 33, 8)`:
-the six convolution histories are `(1, C, pad, F)` with identical C and F and
-differ only in depth, so the encoder's 2+4+10 = 16 and the decoder's
-10+4+2 = 16 join along the depth axis, and the two rows then join along the
-size-1 batch axis.
-
-```bash
-python3 export_onnx.py --model output/gtcrn_best.pth \
-  --output output/gtcrn_combined.onnx --state-layout combined --verify
-```
-
-Traced node counts: 595 for `split` (29 `Slice`, 24 `Concat`) against 618 for
-`combined` (4 `Split`, 31 `Slice`, 29 `Concat`); after the exporter's own
-onnxoptimizer and constant-folding passes both land well inside the contract
-test's operator budget.
+Total state is 84,864 bytes; `sizeof(GTCRNModelState)` is 84,868 with the
+generation counter. A window row is 33 elements, so on an int8 target the
+axis-2 Slice starts at a multiple of 33 bytes; how the toolchain aligns it is
+not verified on a board.

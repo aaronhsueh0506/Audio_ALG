@@ -502,7 +502,7 @@ ulcnet_prepost_post_process(p, out_hop, &written);
 - `_frame_commit()` 是**純驗證**：heads 與 state 都是有限值就成功（CCM ring／compose／synthesis 照常前進，
   commit 本身不複製 state）。就地路徑遇到任何一處非有限值時 state 已被加速器覆寫、**無法回滾**，
   所以**所有遞迴 state 歸零**（冷啟動），framing／CCM ring 不前進、frame 維持開啟、回 `-1`（Align-ULCNet：key／value／logit 三個
-  history 與兩個 GRU hidden 共五個 state 全歸零；DeepFilterNet2：四個遞迴張量；DeepVQE-S：16 個 state）。
+  history 與兩個 GRU hidden 共五個 state 全歸零；DeepFilterNet2：`h_gru` 與 pathway window 兩個遞迴張量，同時 `dfn2_prepost_state_generation()` 加 1；DeepVQE-S：16 個 state）。
   接著只有兩條路：`_frame_skip()`，或重新 `_frame_inputs()` 再從冷 state 跑一次加速器。
 - **commit 後面一定要有一次 `_frame_inputs()`**（`prepared` 閂鎖，三個類別皆然）：
   沒跑過的加速器不能把沒被碰過的 buffer 當成結果送出。
@@ -511,9 +511,8 @@ ulcnet_prepost_post_process(p, out_hop, &written);
   - **一般路徑（複製）**：板端通常是 ONNX 風格的 runtime，輸出寫進它自己擁有的 tensor；host 呼叫該類別的
     inherit 把它們複製進 state，然後才 commit：Align-ULCNet 用 `ulcnet_model_io_inherit(destination, runtime)`
     （destination 是 `_frame_inputs()` 回的 `UlcnetModelIoOutputs`，runtime 是同型別、裝 runtime 自己的指標與相同元素數），
-    DeepVQE-S 用 `deepvqe_prepost_outputs_inherit()`（taps＋16 個 state 輸出），DFN2 用
-    `dfn2_prepost_outputs_inherit()`（`erb_mask`／`coefs`／`alpha`＋四個 `*_next`；自帶 state struct 的整合者用
-    `dfn2_model_io_inherit_state()`／`dfn2_model_io_inherit_arrays()`）。所有 inherit 都是**先檢查再複製**：
+    DeepVQE-S 用 `deepvqe_prepost_outputs_inherit()`（taps＋16 個 state 輸出）。DFN2 與 GTCRN 沒有複製路徑，
+    只有下面的就地綁定。所有 inherit 都是**先檢查再複製**：
     任何將被複製的 tensor 有非有限值，就一個都不複製、回 `-1`、state 與原來逐位元相同，
     回呼回傳非 0、類別取 `_frame_skip()`，這一幀被跳過。指標等於目的位址的 tensor 視為已就地寫入，
     不複製也不由 inherit 檢查，所以同一個呼叫兩種綁定都適用。
@@ -642,6 +641,7 @@ const DeepVqePrepostDescriptor *deepvqe_prepost_descriptor(const DeepVqePrepost 
 ```c
 int  dfn2_prepost_model_lookahead_frames(const DFN2Prepost *p);  /* = 2 */
 int  dfn2_prepost_layout_version(const DFN2Prepost *p);
+unsigned int dfn2_prepost_state_generation(const DFN2Prepost *p);  /* init 後 1；每次 _reset 與被拒的 commit 加 1 */
 int  dfn2_prepost_set_erb_matrices(DFN2Prepost *p, const float *erb_fwd, const float *erb_inv);
 int  dfn2_prepost_set_atten_lim(DFN2Prepost *p, float atten_lim_db);
 int  dfn2_prepost_post_process(DFN2Prepost *p, float out_hop[DFN2_HOP_LEN], int *written);
@@ -686,7 +686,7 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 | Align-ULCNet 48 kHz | 32 | 503,408 | 460,304 |
 | Align-ULCNet 48 kHz | 64 | 945,776 | 902,672 |
 | DeepVQE-S 16 kHz | 32 | 550,528 | 528,928 |
-| DeepFilterNet2 48 kHz | — | 213,360 | 215,440 |
+| DeepFilterNet2 48 kHz | — | 237,936 | 240,016 |
 
 DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 反而比 TIME 大 2,080 bytes：
 `DFN2State` 把 analysis/window/synthesis 緩衝以值內嵌，FREQ 實例甩不掉它們，卻要多 carve 雙輸入入口的
