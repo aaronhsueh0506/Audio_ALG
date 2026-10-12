@@ -40,6 +40,7 @@ code{font-family:ui-monospace,Menlo,monospace;font-size:.92em}
 <a href="pipeline_ulcnet_mono.html">mono-ULCNet</a> ·
 <a href="pipeline_4ch.html">4ch</a> ·
 <a href="pipeline_ulcnet_4ch.html">4ch-ULCNet</a> ·
+<a href="pipeline_ulcnet_detail.html">ULCNet 細節</a> ·
 <a href="pipeline_dfn_mono.html">mono-DFN2</a> ·
 <a href="pipeline_dfn_4ch.html">4ch-DFN2</a> ·
 <a href="ainr_dfn2.html">DFN2</a> ·
@@ -167,6 +168,8 @@ GSC beamforming + post RES/NR（<code>4aec_nr_res.c</code> 核心）。</td></tr
 <tr><td><a href="pipeline_ulcnet_4ch.html">pipeline_ulcnet_4ch</a></td>
 <td><code>pipelines/4ch_alignulcnet/audio_pipeline_4ch_ulcnet.c</code>：GSC 的 beamformed 誤差<b>頻譜直送</b>
 Align-ULCNet NN post stage（不重建、不再分析）；新增演算法延遲 1 hop = 16 ms（48 k 為 10.67 ms）。</td></tr>
+<tr><td><a href="pipeline_ulcnet_detail.html">pipeline_ulcnet_detail</a></td>
+<td>兩條 ULCNet pipeline 共用的細節：參考 accelerator adapter（state 留在 CPU 端、每幀 prepare → run → commit）與 alignment 邊界的 identity reprime 推導。</td></tr>
 <tr><td><a href="pipeline_dfn_mono.html">pipeline_dfn_mono</a></td>
 <td><code>pipelines/mono_aec_dfn_res/audio_pipeline_dfn.c</code>：<b>內含</b>傳統 mono pipeline（<code>enable_nr=0</code>/<code>enable_res=1</code>，經 <code>audio_pipeline_process_spec()</code>），
 以 DeepFilterNet2 取代 MMSE-LSA——估計用 pre-RES 頻譜 E、套用在 post-RES 頻譜 P。host 跑產品自己的取樣率

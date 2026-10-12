@@ -89,6 +89,7 @@ Audio_ALG 自有 pipelines/AINR/AIAEC）**：
 延遲對照）、`onnx_prepost.html`（ONNX 邊界與前後處理現況/缺口表）、
 `pipeline_mono.html`、`pipeline_4ch.html`、
 `pipeline_ulcnet_mono.html`、`pipeline_ulcnet_4ch.html`、
+`pipeline_ulcnet_detail.html`（兩條 ULCNet pipeline 共用的 adapter 與 reprime 細節）、
 `ainr_dfn2.html`、`ainr_gtcrn.html`、`ainr_rnnoise_erb.html`、
 `aiaec_align_ulcnet.html`、`aiaec_align_cruse.html`、`aiaec_deepvqe_s.html`、
 `aiaec_cagcrn.html`
