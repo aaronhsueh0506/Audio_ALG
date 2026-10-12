@@ -40,7 +40,8 @@ and audio_common live in those repositories' own `docs/html/` and are reached
 through sibling relative links.
 
 Pipeline pages: `pipeline_mono.html`, `pipeline_4ch.html`,
-`pipeline_ulcnet_mono.html`, `pipeline_ulcnet_4ch.html`, plus
+`pipeline_ulcnet_mono.html`, `pipeline_ulcnet_4ch.html` (with the shared
+adapter and identity-reprime detail in `pipeline_ulcnet_detail.html`), plus
 `pipeline_dfn_mono.html` and `pipeline_dfn_4ch.html` for the two DeepFilterNet2
 variants (the host runs at the product rate -- mono 8/16/48 kHz, 4ch 16/48 kHz,
 16 kHz by default -- and only the DFN2 stage runs at 48 kHz / 1024 / 512,
