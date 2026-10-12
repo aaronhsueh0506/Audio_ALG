@@ -35,8 +35,7 @@ Usage:
     python3 pipelines/tools/compare_res_vs_nr.py input.wav --nr-preset balanced
     python3 pipelines/tools/compare_res_vs_nr.py input.wav --cng-ab --dnsmos   # A/B comfort noise on vs off
 
-Note: uses whatever AEC is checked out in lib/aec. To test the v3.24.0 round-robin
-AEC, make sure lib/aec is at the static-memory tip (495566d) / your merged branch.
+Note: uses whatever AEC is checked out in lib/aec.
 """
 import argparse
 import os

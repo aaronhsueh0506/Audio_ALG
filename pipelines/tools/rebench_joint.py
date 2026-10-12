@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """800-case renderer for the production freq pipeline (no offline pre-align):
   AEC(linear) -> echo-aware NR(E), ξ=S²/(N²+R²) -> g_total = min(G_nr, G_res).
-LEGACY_AMIN=1 renders the prior noise-only NR (no R² injection).
+LEGACY_AMIN=1 renders the noise-only NR (no R² injection).
 
 Usage: python3 pipelines/tools/rebench_joint.py <out_dir> [limit]
 Then:  python3 ../AEC/python/bench_aecmos.py <out_dir> <res_dir> [--baseline ...]
@@ -29,7 +29,7 @@ from pipelines.tools.rebench_sep_vs_classic import (            # noqa: E402
 
 # NR_PRESET=<mode> in the environment overrides the imported default.
 NR_PRESET = os.environ.get('NR_PRESET', NR_PRESET)
-# LEGACY_AMIN=1 restores the prior noise-only NR.
+# LEGACY_AMIN=1 selects the noise-only NR.
 _LEGACY = os.environ.get('LEGACY_AMIN', '0') == '1'
 INJECT_ECHO_PSD = (not _LEGACY) and PROD_INJECT_ECHO_PSD
 

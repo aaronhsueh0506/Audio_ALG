@@ -157,7 +157,7 @@ def test_aec_only_time_output_matches_standalone_limiter_path(monkeypatch):
 def test_nr_temporal_constants_preserve_wallclock_duration(
     sample_rate, hop_size, expected_frames
 ):
-    # 32 legacy frames represented 320 ms on the former 10-ms hop.
+    # 32 frames defined on a 10-ms hop represent 320 ms.
     assert retime_frame_count(32, sample_rate, hop_size) == expected_frames
     alpha = retime_ema_alpha(0.95, sample_rate, hop_size)
     updates_per_second = sample_rate / hop_size

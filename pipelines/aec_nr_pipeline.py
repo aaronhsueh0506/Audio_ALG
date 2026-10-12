@@ -5,7 +5,7 @@ AEC + NR + RES Processing Pipeline
 Pipeline: AEC(linear) → echo-aware NR(E) → RES  (freq A_min_pl, production).
 The NR folds the AEC residual-echo PSD R²(f) into its noise floor (ξ=S²/(N²+R²))
 and g_total = min(G_nr, G_res) is applied as computed; pass --legacy-amin for
-the prior noise-only NR. AEC and NR are each selected by their own preset; the
+the noise-only NR. AEC and NR are each selected by their own preset; the
 CLI exposes only presets + switches.
 
 Usage:
@@ -42,9 +42,8 @@ try:                                    # imported as pipelines.aec_nr_pipeline
 except ImportError:                     # run from the pipelines directory
     from se_stage import SeSpecFrame, frame_from_context
 
-# The standalone ResFilter was retired in AEC v3.21; the separated
-# `--pipeline-mode linear` (AEC-linear -> NR -> RES) is now rebuilt on the
-# AEC3 freq-domain seam (AecConfig.return_res_context exposes the linear
+# The separated `--pipeline-mode linear` (AEC-linear -> NR -> RES) is built on
+# the AEC3 freq-domain seam (AecConfig.return_res_context exposes the linear
 # error spectrum + the per-frame AEC3 SuppressionGain), so the post-NR RES is
 # a pure freq multiply — see run_res() + docs/freq_domain_pipeline_design.md.
 
@@ -124,7 +123,7 @@ _NR_L_MINIMA_WINDOW = 94
 # Production recipe on top of A_min_pl's min(G_nr, G_res): the AEC residual-echo
 # PSD R²(f) is folded into the OM-LSA noise floor (ξ = S²/(N²+R²), the
 # Speex/Habets canonical) so the NR also suppresses residual echo, while
-# g_res stays in the min. Set LEGACY_AMIN=1 (env / arg) to restore the prior
+# g_res stays in the min. Set LEGACY_AMIN=1 (env / arg) to select the
 # noise-only NR. There is no near-end floor: g_total is applied as computed.
 PROD_INJECT_ECHO_PSD = True
 # Comfort noise is scaled by the denoiser gain of its bin, never below this

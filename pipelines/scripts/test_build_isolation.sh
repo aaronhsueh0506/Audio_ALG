@@ -1,210 +1,140 @@
 #!/usr/bin/env bash
-# pipelines/scripts/test_build_isolation.sh -- regression/4/5/6/7 review
-# build-isolation regression suite for Audio_ALG/pipelines, the fourth (and
-# last) of four repos to get the CFG_SIG-keyed obj/bin directory design
-# (audio_common, AEC, NR already have their own scripts/test_build_isolation.sh
-# -- see audio_common's for the S1-S5/S7p/S8 single-producer scenarios this
-# one does NOT repeat).
+# pipelines/scripts/test_build_isolation.sh -- build-isolation suite for
+# Audio_ALG/pipelines (the CFG_SIG-keyed obj/bin directory design).
+# audio_common, AEC and NR have their own scripts/test_build_isolation.sh for
+# the single-producer scenarios (S1-S5/S7p/S8), which this script does not
+# repeat.
 #
 # pipelines/Makefile is a THREE-producer consumer (audio_common's
-# libaudio_common.a, lib/aec's libaec.a, lib/nr's libanr.a), each
-# resolved via the two-phase recursive-make dispatch described in that
-# Makefile's own header comment. This script exercises the scenarios specific
-# to that three-producer design plus this repo's own audit-no-stdio/publish
-# gates, the regression RNNoise-ERB table drift-gate hardening, and now the
-# regression review:
+# libaudio_common.a, lib/aec's libaec.a, lib/nr's libanr.a), each resolved via
+# the two-phase recursive-make dispatch described in that Makefile's own header
+# comment. This script exercises the scenarios specific to that design, plus
+# this repo's own audit-no-stdio/publish gates and the RNNoise-ERB table
+# drift-gate.
 #
-#   - P1: OBJ_ROOT=/BIN_ROOT= placement knobs (pipelines' own Makefile, PLUS
-#     the two PRIMARY producer repos AEC/c_impl and NR/c_impl -- see the
-#     "regression submodule caveat" note below), so throwaway/tamper scenarios
-#     drive a scratch-directory build of the real worktree without ever
-#     touching the real obj/ or bin/.
-#   - P2-1: this script's OWN temp management -- fixed SCRATCH_ROOT tree +
-#     one trap, never a CLEANUP_DIRS array mutated from inside a `$(...)`
-#     command substitution (a subshell whose variable changes never make it
-#     back to the parent shell that owns the EXIT trap -- the actual regression
-#     bug class this replaces).
-#   - P2-2: ATTEST is one-event-one-file
-#     (attest-<utc>-<commit>[-dirty]-<seq>.txt, installed via the
-#     atomic_symlink_swap helper's `--excl-install` mode).
-#   - P2-3: `make -n`/`-q`/`-t publish` must have ZERO filesystem side effects.
-#   - P2 (dirty policy): publish FATALs by default on a dirty/no-git-identity
+# Placement, publish and dry-run contract:
+#   - OBJ_ROOT=/BIN_ROOT= placement knobs (pipelines' own Makefile, plus the
+#     two PRIMARY producer repos AEC/c_impl and NR/c_impl -- see the AEC/NR
+#     submodule note below), so throwaway/tamper scenarios drive a
+#     scratch-directory build of the real worktree without ever touching the
+#     real obj/ or bin/.
+#   - ATTEST is one-event-one-file (attest-<utc>-<commit>[-dirty]-<seq>.txt,
+#     installed via the atomic_symlink_swap helper's `--excl-install` mode).
+#   - `make -n`/`-q`/`-t publish`, INCLUDING every combined flag form (-nt/"-n
+#     -t"/-tq/-nq/-nqt -- SP-S14b), have ZERO filesystem side effects: no
+#     DIST_ROOT/OBJ_ROOT/BIN_ROOT is created and a pre-existing artifact's stat
+#     is unchanged.
+#   - Dirty policy: publish FATALs by default on a dirty/no-git-identity
 #     checkout (this repo OR any of the three producers); ALLOW_DIRTY_PUBLISH=1
-#     is the recorded escape hatch.
-#
-# ...and now the regression review (mirrors audio_common's own regression rewrite;
-# see that script for the full rationale on each point -- reused as directly
-# as possible here, generalized from ONE producer to the three this repo
-# resolves plus this repo's own tree):
-#
-#   - Cross-suite mutex: a SUITE_LOCK under `${TMPDIR:-/tmp}/
-#     audio_dsp_isolation_suite.lock` -- the EXACT SAME lock path/name
-#     audio_common's own script uses -- refuses to let two instances of
-#     EITHER suite run concurrently (both assert real-tree invariants a
+#     is the recorded escape hatch. The untracked-file dimension is a SEPARATE
+#     default refusal (ALLOW_UNTRACKED_PUBLISH=1, see the Makefile's own knob
+#     comment), so ALLOW_UNTRACKED_PUBLISH=1 rides alongside
+#     ALLOW_DIRTY_PUBLISH=1 on every publish call in this script, EXCEPT
+#     SP-S17's own deliberate policy-negative calls (which test a knob's
+#     absence on purpose). SP-S11 asserts the four *_git_untracked fields
+#     (git_untracked/audio_common_git_untracked/aec_git_untracked/nr_git_untracked)
+#     + allow_untracked_publish=.
+#   - Cross-suite mutex: a SUITE_LOCK under
+#     `${TMPDIR:-/tmp}/audio_dsp_isolation_suite.lock` -- the EXACT SAME lock
+#     path/name audio_common's own script uses -- refuses to let two instances
+#     of EITHER suite run concurrently (both assert real-tree invariants a
 #     second concurrent run would trample). mkdir-based, holder-pid file,
-#     single TOCTOU-safe stale-reclaim retry, released in cleanup() only by
-#     the process that actually acquired it. Placed AFTER the
-#     ISOL_INTERRUPT_PROBE early-return (a probe child never contends for
-#     its own parent's lock) and BEFORE `export TMPDIR=...` (so it resolves
-#     against the INVOKING environment's TMPDIR, not the scratch-local one
-#     this script is about to export over it).
-#   - Final-guard real-tree snapshot: once this suite's OWN intended
-#     real-tree builds are done (captured right after SP1's kiss+ne10
-#     builds), a per-file path+sha256+fractional-mtime snapshot of every
-#     keyed directory already under the REAL obj/ and bin/ of the FOUR trees
-#     this suite builds in (pipelines itself, lib/aec, lib/nr, audio_common)
-#     is re-verified byte-for-byte identical at the very end. A later-created
-#     directory is allowed (INFO/WARN, never a FAIL) -- should be none, since
-#     the one pre-existing leak (SP-S12's toolchain-shim probe, previously
-#     landing in the REAL tree because its CFG_SIG-participating CXX shim
-#     path is scratch-fresh every run) is fixed below to build under a
-#     scratch OBJ_ROOT/BIN_ROOT too, same as SP-S10/SP-S14 already did.
-#   - SP2 (producer-change propagation) no longer mtime-touches REAL
-#     audio_common/lib/aec/lib/nr sources: it now runs against a disposable
-#     clone EACH of audio_common, the PRIMARY AEC repo, and the PRIMARY NR
-#     repo (via `adopt_worktree_clone()`), built via their own default
-#     (clone-relative, therefore scratch) obj/bin, with the pipeline binary
-#     itself built from the REAL pipelines directory but with
-#     AC_DIR/AEC_DIR/NR_DIR pointed at the clones and an explicit scratch
-#     OBJ_ROOT/BIN_ROOT. SP-S17 (below) REUSES this exact clone set (created
-#     once, while still clean, by SP2) and dirties it further -- one clone
-#     build instead of two separate ones.
-#   - SP-S14 gains a COMBINED dry-run flag matrix (-nt/"-n -t"/-tq/-nq/-nqt)
-#     against a deliberately BACKDATED scratch artifact of the PIPELINES
-#     Makefile (the S15b pattern from audio_common's script) -- every combo
-#     must leave the artifact's stat unchanged and create no
-#     DIST_ROOT/OBJ_ROOT/BIN_ROOT.
-#   - SP-S17 gains the untracked-file dimension at the pipelines level: an
-#     untracked producer probe (ALLOW_DIRTY_PUBLISH=1 alone still refuses,
-#     naming audio_common on the untracked dimension; +
-#     ALLOW_UNTRACKED_PUBLISH=1 succeeds with audio_common_git_untracked=1 +
-#     a 64-hex audio_common_untracked_tree_sha256, while pipelines' OWN
-#     git_untracked stays 0 -- the AINR/GTCRN|gtcrn_github whitelist holding)
-#     and an unknown-producer probe (AEC_DIR pointed at a no-git scratch
-#     copy is refused UNCONDITIONALLY, naming lib/aec, even with BOTH knobs
-#     set).
-#   - ALLOW_UNTRACKED_PUBLISH=1 now rides alongside ALLOW_DIRTY_PUBLISH=1 on
-#     every publish call in this script (the untracked dimension is a
-#     SEPARATE default refusal from the tracked-dirty one -- see the
-#     Makefile's own knob comment), EXCEPT SP-S17's own deliberate
-#     policy-negative calls (which test a knob's absence on purpose).
-#   - SP-S11's attest assertions are extended for the four *_git_untracked
-#     fields (git_untracked/audio_common_git_untracked/aec_git_untracked/
-#     nr_git_untracked) + allow_untracked_publish=.
+#     single TOCTOU-safe stale-reclaim retry (a losing reclaimer never steals
+#     the winner's fresh lock), released in cleanup() only by the process that
+#     actually acquired it. Placed AFTER the ISOL_INTERRUPT_PROBE early-return
+#     (a probe child never contends for its own parent's lock) and BEFORE
+#     `export TMPDIR=...` (so it resolves against the INVOKING environment's
+#     TMPDIR, not the scratch-local one).
 #
-# regression SUBMODULE CAVEAT (read this before touching AEC/NR-facing scenarios):
-#   lib/aec and lib/nr are checked out here as SUBMODULES still pinned at
-#   their regression commit (publish v4, no OBJ_ROOT=/BIN_ROOT=/
-#   ALLOW_DIRTY_PUBLISH=/ATTEST_STAMP=) -- the regression Makefile edits for AEC
-#   and NR live in the PRIMARY repos (../../AEC, ../../NR, siblings of
-#   Audio_ALG) and will be synced into the submodules AFTER this task. Any
-#   scenario that needs regression-ONLY AEC/NR Makefile behavior therefore
-#   targets $AEC_R6_DIR/$NR_R6_DIR (the primary repos' c_impl/, resolved
-#   below) instead of the submodule $AEC_DIR/$NR_DIR -- once the submodule
-#   pin is bumped post-task, $AEC_R6_DIR/$NR_R6_DIR and $AEC_DIR/$NR_DIR
-#   become equivalent and this indirection stops mattering. Scenarios that
-#   only need regression-stable behavior (normal all/lib builds, print-lib-path)
-#   keep using the submodule paths, matching how this script has always
-#   worked.
+# AEC/NR submodule note (read this before touching AEC/NR-facing scenarios):
+# the scenarios that exercise
+# OBJ_ROOT=/BIN_ROOT=/ALLOW_DIRTY_PUBLISH=/ATTEST_STAMP= or the -n/-q/-t
+# dry-run guard on the AEC/NR Makefiles target $AEC_R6_DIR/$NR_R6_DIR (the
+# primary repos' c_impl/, siblings of Audio_ALG, resolved below) instead of the
+# submodule paths $AEC_DIR/$NR_DIR. Scenarios that only need basic behavior
+# (normal all/lib builds, print-lib-path) use the submodule paths. When the
+# submodule pin carries the same Makefile, the two are equivalent.
 #
 # Scenario index:
-#   S6:      audit-no-stdio false-pass regression
+#   S6:      audit-no-stdio false-pass check
 #   S7:      publish v4 -- lock-FIRST driver + concurrent-publish semantics
 #   SP1:     pipeline-level A->B->A (kiss -> ne10 -> kiss)
-#   SP2:     producer-change propagation (audio_common hpf.c / fast_math.h --
-#            regression: against disposable clones, never the real trees; see
-#            the regression bullet list above)
-#   SP-S9:   command-line override rejection (regression P1-1), all three
-#            Makefiles (pipelines/lib-aec/lib-nr, submodule paths -- stable
-#            since regression, no regression-only feature needed)
-#   SP-S9b:  FP-policy allow-list redesign (replicated from audio_common's/
-#            AEC's identical fix): bypass shapes the OLD 9-item deny-list
-#            never caught (bare glob */?/[]/, tilde, real shell redirection
-#            >/<, process substitution <(...)), the exact-token $(filter)
-#            check's own distinct code path, the FP-policy check's OWN
-#            internal variables (FP_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/
-#            FP_CONFLICT_FLAGS/FP_ALLOWED_CHARS_RE -- SHELL_SAFE_ALLOWLIST_RC
-#            also gates LDFLAGS content, see SP-S9c below) command-line/`-e` override rejection,
-#            and the positive control (a plain override-free build succeeds,
-#            including the internal -DAUDIO_PIPELINE_BACKEND_STR define
-#            reaching the compile line)
-#   SP-S9c:  link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage
-#            (this task, replicated from audio_common's identical S25 fix):
-#            SP-S9b's allow-list originally validated FP_INPUT_FLAGS only
-#            (CFLAGS/CXXFLAGS/CPPFLAGS) -- LDFLAGS/EXTRA_LDFLAGS were never
-#            inspected at all, even though LDFLAGS is embedded in every real
-#            link recipe ($(LINK) ... $(LDFLAGS)) the same way CFLAGS is
-#            embedded in every compile recipe; reproduced live via
-#            `make aec_nr_pipeline EXTRA_LDFLAGS=';id'`. Covers the
-#            injection repro, the same glob/tilde/redirect/process-
-#            substitution matrix SP-S9b runs for EXTRA_CFLAGS, a positive
-#            control (a real `-Wl,-rpath,... -L...` link flag still builds
-#            AND runs test_audio_pipeline to ALL PASS), and command-line/`-e`
-#            override rejection of SHELL_SAFE_INPUT_FLAGS/
-#            SHELL_SAFE_ALLOWLIST_RC via an EXTRA_LDFLAGS payload specifically
-#   SP-S10:  lib/aec fresh-archive discipline (regression P1-4) -- regression:
-#            rewritten against the PRIMARY AEC repo ($AEC_R6_DIR) with
-#            scratch OBJ_ROOT/BIN_ROOT (the regression version of this scenario
-#            injected a foreign member directly into the REAL SUBMODULE
-#            libaec.a -- a regression P1 finding this fixes)
-#   SP-S11:  pipelines publish v4 (content-addressed release + ATTEST) --
-#            regression: attest v2 field/naming assertions, no sleep (the
-#            <NNN> suffix disambiguates a same-second republish)
+#   SP2:     producer-change propagation (audio_common hpf.c / fast_math.h),
+#             against disposable clones of audio_common/AEC/NR, never the real
+#             trees
+#   SP-S9:   command-line override rejection, all three Makefiles
+#             (pipelines/lib-aec/lib-nr, submodule paths)
+#   SP-S9b:  FP-policy allow-list: bypass shapes a character deny-list never
+#             caught (bare glob */?/[]/, tilde, real shell redirection >/<,
+#             process substitution <(...)), the exact-token $(filter) check's
+#             own distinct code path, command-line/`-e` override rejection of
+#             the FP-policy check's OWN internal variables
+#             (FP_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC/FP_CONFLICT_FLAGS/FP_ALLOWED_CHARS_RE
+#             -- SHELL_SAFE_ALLOWLIST_RC also gates LDFLAGS content, see
+#             SP-S9c), and the positive control (a plain override-free build
+#             succeeds, including the internal -DAUDIO_PIPELINE_BACKEND_STR
+#             define reaching the compile line)
+#   SP-S9c:  link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety: LDFLAGS is
+#             embedded in every real link recipe ($(LINK) ... $(LDFLAGS)) the
+#             same way CFLAGS is embedded in every compile recipe, so it gets
+#             the same allow-list. Covers the injection repro (`make
+#             aec_nr_pipeline EXTRA_LDFLAGS=';id'`), the same
+#             glob/tilde/redirect/process-substitution matrix SP-S9b runs for
+#             EXTRA_CFLAGS, a positive control (a real `-Wl,-rpath,... -L...`
+#             link flag still builds AND runs test_audio_pipeline to ALL PASS),
+#             and command-line/`-e` override rejection of
+#             SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC via an
+#             EXTRA_LDFLAGS payload specifically
+#   SP-S10:  lib/aec fresh-archive discipline, against the PRIMARY AEC repo
+#             ($AEC_R6_DIR) with scratch OBJ_ROOT/BIN_ROOT; the foreign member
+#             is injected into a scratch archive, never the real submodule
+#             libaec.a
+#   SP-S11:  pipelines publish v4 (content-addressed release + ATTEST): attest
+#             v2 field/naming assertions, no sleep (the <NNN> suffix
+#             disambiguates a same-second republish)
 #   SP-S12:  BACKEND=ne10 CC/CXX toolchain-coherence guard through the dispatch
-#   SP-S13:  RNNoise-ERB table drift-gate hardening (regression P2)
+#   SP-S13:  RNNoise-ERB table drift-gate
 #   SP-S14:  make -n/-q/-t publish zero side effects, THREE Makefiles --
-#            pipelines (in-place), $AEC_R6_DIR, $NR_R6_DIR (regression P2-3);
-#            regression SP-S14b: COMBINED dry-run flags (-nt/"-n -t"/-tq/-nq/
-#            -nqt) against a deliberately backdated scratch artifact of the
-#            PIPELINES Makefile only (the S15b pattern)
+#             pipelines (in-place), $AEC_R6_DIR, $NR_R6_DIR; SP-S14b: COMBINED
+#             dry-run flags (-nt/"-n -t"/-tq/-nq/-nqt) against a deliberately
+#             backdated scratch artifact of the PIPELINES Makefile only (the
+#             S15b pattern)
 #   SP-S15:  ATTEST uniqueness under forced same-second collisions at the
-#            pipelines level (regression P2-2)
-#   SP-S16:  interruption-safety probe -- EXIT/INT/TERM all clean up the
-#            whole scratch tree (regression P2-1 acceptance test)
-#   SP-S17:  dirty-producer provenance -- publish against three DIRTY
-#            producer clones (audio_common/AEC/NR, regression: the SAME clone
-#            set SP2 built while clean), ALLOW_DIRTY_PUBLISH=1 path succeeds
-#            with correct per-producer attest fields, the default (no
-#            override) path FAILS "publish refused" (regression P2); regression
-#            SP-S17a/b: the untracked-file dimension (untracked producer
-#            probe naming audio_common; unknown-producer AEC_DIR refused
-#            unconditionally naming lib/aec)
-#   SP-S18:  `make -e` environment-override bypass rejection (regression coverage,
-#            this task) -- the SP-S9 complement: SP-S9 covers COMMAND-LINE
-#            overrides (`make VAR=...`, origin flips the instant it's
-#            parsed); this covers ENVIRONMENT overrides (`env VAR=... make
-#            -e ...`, origin only flips once the makefile's OWN bare
-#            assignment/append to VAR has been parsed -- a gap when that
-#            assignment sits textually after the rejection foreach, exactly
-#            pipelines/Makefile's pre-fix shape). FP_POLICY=(empty)/
-#            FP_POLICY=-ffp-contract=fast/CPPFLAGS=<poison>/CXXFLAGS=<poison>
-#            against pipelines + BOTH primary producers ($AEC_R6_DIR/
-#            $NR_R6_DIR -- NOT the submodule, which still carries the
-#            pre-fix Makefile), plus LDFLAGS=<poison> against pipelines only
-#            (the one Makefile of the three whose LDFLAGS composition itself
-#            needed relocating). Every case is a true `-n` dry run against
-#            scratch OBJ_ROOT=/BIN_ROOT=, and (P2 fix, this task) the ONLY
-#            passing outcome is parse-time rejection ("cannot be
-#            overridden") with a NONZERO exit -- a prior version of this
-#            scenario also accepted "make succeeded, but the poison string
-#            never reached the printed output" as a PASS, which a review
-#            correctly flagged as false assurance (that absence can mean
-#            nothing more than "this target/backend never prints a
-#            compile line referencing the poisoned variable at all" --
-#            confirmed live for pipelines' own CPPFLAGS/CXXFLAGS, which
-#            are placeholder-only in that Makefile). See
-#            assert_make_e_rejected()'s own comment for the full fix and
-#            the broken-gate rehearsal that verified it (every case here
-#            FAILs against a deliberately-disabled gate, in a scratch
-#            clone, for all three Makefiles, including CXXFLAGS/CPPFLAGS).
-#            The pipelines-specific cases target `libaudio_pipeline.a`
-#            (not `all`) with AC_LIB=/AEC_LIB=/NR_LIB= forced -- a
-#            producer-dispatch-free target, so a PASS can only ever come
-#            from pipelines/Makefile's OWN gate, never from audio_common's
-#            or the lib/aec|lib/nr submodules' gates reached through `all`'s
-#            three-producer dispatch (which a real child `make` process
-#            invoked even under `-n`, and which inherits this scenario's
-#            `env VAR=...` the same way pipelines' own process does).
+#             pipelines level
+#   SP-S16:  interruption-safety probe -- EXIT/INT/TERM all clean up the whole
+#             scratch tree
+#   SP-S17:  dirty-producer provenance -- publish against three DIRTY producer
+#             clones (audio_common/AEC/NR; the SAME clone set SP2 built while
+#             clean): the ALLOW_DIRTY_PUBLISH=1 path succeeds with correct
+#             per-producer attest fields, the default (no override) path FAILS
+#             "publish refused"; SP-S17a/b: the untracked-file dimension
+#             (untracked producer probe naming audio_common; unknown-producer
+#             AEC_DIR refused unconditionally naming lib/aec)
+#   SP-S18:  `make -e` environment-override rejection -- the SP-S9 complement:
+#             SP-S9 covers COMMAND-LINE overrides (`make VAR=...`, origin flips
+#             the instant it is parsed); this covers ENVIRONMENT overrides
+#             (`env VAR=... make -e ...`, origin only flips once the makefile's
+#             OWN bare assignment/append to VAR has been parsed -- a gap when
+#             that assignment sits textually after the rejection foreach).
+#             FP_POLICY=(empty)/FP_POLICY=-ffp-contract=fast/CPPFLAGS=<poison>/CXXFLAGS=<poison>
+#             against pipelines + BOTH primary producers
+#             ($AEC_R6_DIR/$NR_R6_DIR), plus LDFLAGS=<poison> against pipelines
+#             only (the one Makefile of the three whose LDFLAGS composition
+#             needed relocating). Every case is a true `-n` dry run against
+#             scratch OBJ_ROOT=/BIN_ROOT=, and the ONLY passing outcome is
+#             parse-time rejection ("cannot be overridden") with a NONZERO
+#             exit: "make succeeded, but the poison string never reached the
+#             printed output" proves nothing (a target/backend may never print
+#             a compile line referencing the poisoned variable -- pipelines'
+#             own CPPFLAGS/CXXFLAGS are placeholder-only). See
+#             assert_make_e_rejected()'s own comment. The pipelines-specific
+#             cases target `libaudio_pipeline.a` (not `all`) with
+#             AC_LIB=/AEC_LIB=/NR_LIB= forced -- a producer-dispatch-free
+#             target, so a PASS can only come from pipelines/Makefile's OWN
+#             gate, never from audio_common's or the lib/aec|lib/nr gates
+#             reached through `all`'s three-producer dispatch (a real child
+#             `make` process even under `-n`, inheriting this scenario's `env
+#             VAR=...`).
 #
 # Design rules (same as audio_common's script -- do not violate when editing):
 #   - No `make clean` inside any scenario body (except SP-S13's own trailing
@@ -212,104 +142,78 @@
 #     gitignored build/ -- never this repo's bin/obj): distinct configs must
 #     coexist WITHOUT ever needing a clean between them.
 #   - Every path is resolved via `make -s ... print-bin-dir` / `print-obj-dir`
-#     / `print-lib-path`, using the EXACT flag set (INCLUDING OBJ_ROOT=/
-#     BIN_ROOT= when the build under test used them) under test for that
-#     call -- never a hand-reconstructed path guess.
+#     / `print-lib-path`, using the EXACT flag set (INCLUDING
+#     OBJ_ROOT=/BIN_ROOT= when the build under test used them) under test for
+#     that call -- never a hand-reconstructed path guess.
 #   - "Did this get rebuilt?" is an mtime comparison, never a content (sha)
 #     comparison.
 #   - "Is this the SAME delivered artifact as its own keyed object?" IS a sha
 #     comparison, via file_sha() below.
 #
-# Round-7 safety contract (supersedes the regression version of this comment --
-# mirrors audio_common's script, see that script for the full rationale on
-# each point):
-#   - ONE scratch root for the entire run: SCRATCH_ROOT="$(mktemp -d)",
-#     removed by a single EXIT trap; every temp file/dir this script uses is
-#     a FIXED path under "$SCRATCH_ROOT/<scenario>/...", created inline --
-#     never inside a `$(...)` command substitution (registering cleanup
-#     state from inside a subshell silently drops it -- the regression P2-1 bug
-#     class this replaces the old CLEANUP_DIRS array with). TMPDIR is
-#     exported into the scratch tree, with a `mktemp` PATH shim ahead of the
-#     real one (macOS's bare `mktemp -d` resolves via
-#     _CS_DARWIN_USER_TEMP_DIR FIRST, ignoring $TMPDIR, unless given an
-#     explicit -p/template) -- so a child `make`'s own `work="$(mktemp -d)"`
-#     (the publish recipe) lands under scratch too.
-#   - A cross-suite mutex (SUITE_LOCK="${TMPDIR:-/tmp}/
-#     audio_dsp_isolation_suite.lock" -- computed from the INVOKING
-#     environment's TMPDIR, BEFORE this script's own TMPDIR export, and the
-#     EXACT SAME lock path/name audio_common's own script uses) refuses to
-#     let two instances of this suite -- or of the audio_common counterpart
-#     -- run concurrently. mkdir-based, holder-pid file, a single
-#     TOCTOU-safe stale-reclaim retry (a losing reclaimer never steals the
-#     winner's fresh lock), released in cleanup() only by the process that
-#     actually acquired it. Placed AFTER the ISOL_INTERRUPT_PROBE
-#     early-return (below) so a probe CHILD never contends for its own
-#     parent's lock.
-#   - Real obj/ and bin/ (this repo's own, AND the submodule lib/aec's/
-#     lib/nr's, AND audio_common's) only ever see the NORMAL kiss/ne10
-#     configs S6/S7/SP1/SP-S9's real-tree assertions depend on (SP2, regression's
-#     other real-tree normal-config builder, now runs inside scratch clones
-#     instead -- see below). Every throwaway/tamper scenario that needs a
-#     scratch OBJ_ROOT/BIN_ROOT uses one (SP-S10 against $AEC_R6_DIR; SP-S12's
-#     toolchain-shim probes, regression: moved to scratch -- the CXX shim's
-#     scratch-fresh path participates in CFG_SIG, so it used to mint a new
-#     orphan keyed directory in the REAL obj/bin on every single run; SP-S14's
-#     dry runs; SP-S17's producer clones, whose own obj/bin land under
-#     SCRATCH_ROOT by construction, being inside the clone directories under
-#     $SCRATCH_ROOT). A final-guard snapshot (path + sha256 + `stat -f %Fm`
+# Safety contract (mirrors audio_common's script; see that script for the full
+# rationale on each point):
+#   - ONE scratch root for the entire run: SCRATCH_ROOT="$(mktemp -d)", removed
+#     by a single EXIT trap; every temp file/dir this script uses is a FIXED
+#     path under "$SCRATCH_ROOT/<scenario>/...", created inline -- never inside
+#     a `$(...)` command substitution (registering cleanup state from inside a
+#     subshell silently drops it). TMPDIR is exported into the scratch tree,
+#     with a `mktemp` PATH shim ahead of the real one (macOS's bare `mktemp -d`
+#     resolves via _CS_DARWIN_USER_TEMP_DIR FIRST, ignoring $TMPDIR, unless
+#     given an explicit -p/template) -- so a child `make`'s own `work="$(mktemp
+#     -d)"` (the publish recipe) lands under scratch too.
+#   - Real obj/ and bin/ (this repo's own, AND the submodule
+#     lib/aec's/lib/nr's, AND audio_common's) only ever see the NORMAL
+#     kiss/ne10 configs S6/S7/SP1/SP-S9's real-tree assertions depend on. Every
+#     throwaway/tamper scenario that needs a scratch OBJ_ROOT/BIN_ROOT uses one
+#     (SP-S10 against $AEC_R6_DIR; SP-S12's toolchain-shim probes -- the CXX
+#     shim's scratch-fresh path participates in CFG_SIG, so a real-tree build
+#     would mint a new orphan keyed directory on every run; SP-S14's dry runs;
+#     SP2/SP-S17's producer clones, whose own obj/bin land under SCRATCH_ROOT
+#     by construction). A final-guard snapshot (path + sha256 + `stat -f %Fm`
 #     per file, taken once SP1's kiss+ne10 builds finish, of every keyed
-#     directory already under the real obj/+bin/ of the four trees this
-#     suite builds in -- pipelines, lib/aec, lib/nr, audio_common) is
-#     re-verified byte-for-byte identical at the very end; a later-created
-#     directory is allowed (INFO/WARN) -- after the SP-S12 fix there should
-#     be none.
-#   - The real dist/ (pipelines' own, lib/aec's, lib/nr's, audio_common's,
-#     and -- belt-and-braces -- the two PRIMARY AEC/NR repos' own) is never
-#     read, written, or removed: every `make ... publish` passes an explicit
+#     directory already under the real obj/+bin/ of the four trees this suite
+#     builds in -- pipelines, lib/aec, lib/nr, audio_common) is re-verified
+#     byte-for-byte identical at the very end; a later-created directory is
+#     allowed (INFO/WARN), there should be none.
+#   - The real dist/ (pipelines' own, lib/aec's, lib/nr's, audio_common's, and
+#     -- belt-and-braces -- the two PRIMARY AEC/NR repos' own) is never read,
+#     written, or removed: every `make ... publish` passes an explicit
 #     DIST_ROOT= under $SCRATCH_ROOT. A sentinel digest of each real dist/
-#     (absent, or a full manifest of paths + sha256 + mtime) is captured at
-#     the very start and re-checked at the very end.
+#     (absent, or a full manifest of paths + sha256 + mtime) is captured at the
+#     very start and re-checked at the very end.
 #   - No git-tracked file, in $AC_DIR, the submodule lib/aec/lib/nr, the
 #     Audio_ALG toplevel, OR the two PRIMARY AEC/NR repos, is EVER touched --
-#     not its content, not even its mtime (regression removes the regression
-#     allowance for a handful of mtime-only touches on real tracked sources
-#     entirely). Every mtime bump this script performs to force a recompile
-#     probe (hpf.c, fast_math.h) now happens against a SCRATCH CLONE's copy
-#     of that source (SP2, reused and further dirtied by SP-S17), or an
-#     already clone-local file (SP-S17's untracked/unknown-producer probes).
-#     `tree_state_hash()` (status --porcelain + diff --binary HEAD, not
-#     status alone) is captured for the Audio_ALG toplevel, lib/aec, lib/nr,
-#     and $AC_DIR (the four repos the task's own safety contract names) --
-#     plus, belt-and-braces, the two PRIMARY AEC/NR repos this script also
-#     builds directly against -- at the start and re-checked at the end,
-#     asserting exact equality (not just "still dirty") -- any script bug
-#     that touched a real tracked file's content OR mtime-affecting metadata
-#     would still have to leave `git status --porcelain`/`git diff`
-#     themselves unchanged to pass, which a content change cannot do.
-#   - No `sleep` anywhere. SP1's "should NOT relink" checks rely on
-#     mtime()'s BSD `stat -f '%Fm'` fractional-seconds read (two genuinely
-#     different real writes are distinguishable without an artificial
-#     delay); SP2's "should recompile" checks use a deterministic
-#     `touch -r <the artifact that must become stale> -A 01 <source>` bump
-#     (GNU Make 3.81 truncates its own prerequisite-newer-than-target check
-#     to whole seconds, so the +1s bump is load-bearing, not just extra
-#     caution); SP-S11's same-second republish is disambiguated by the
-#     attest v2 <NNN> suffix, not a delay.
+#     not its content, not even its mtime. Every mtime bump this script
+#     performs to force a recompile probe (hpf.c, fast_math.h) happens against
+#     a SCRATCH CLONE's copy of that source (SP2, reused and further dirtied by
+#     SP-S17), or an already clone-local file (SP-S17's
+#     untracked/unknown-producer probes). `tree_state_hash()` (status
+#     --porcelain + diff --binary HEAD, not status alone) is captured for the
+#     Audio_ALG toplevel, lib/aec, lib/nr, and $AC_DIR -- plus,
+#     belt-and-braces, the two PRIMARY AEC/NR repos this script also builds
+#     directly against -- at the start and re-checked at the end, asserting
+#     exact equality (not just "still dirty"): a script bug that touched a real
+#     tracked file's content would have to leave `git status --porcelain`/`git
+#     diff` themselves unchanged to pass, which a content change cannot do.
+#   - No `sleep` anywhere. SP1's "should NOT relink" checks rely on mtime()'s
+#     BSD `stat -f '%Fm'` fractional-seconds read (two genuinely different real
+#     writes are distinguishable without an artificial delay); SP2's "should
+#     recompile" checks use a deterministic `touch -r <the artifact that must
+#     become stale> -A 01 <source>` bump (GNU Make 3.81 truncates its own
+#     prerequisite-newer-than-target check to whole seconds, so the +1s bump is
+#     load-bearing, not just extra caution); SP-S11's same-second republish is
+#     disambiguated by the attest v2 <NNN> suffix, not a delay.
 #   - Interruption-safe by construction: cleanup() is the ONLY EXIT-trap
 #     resident, INT/TERM map to 130/143 (both routed back through the same
 #     cleanup()) -- SP-S16 tests exactly this.
-#   - Zero-write dry-runs: `make -n`/`-q`/`-t publish`, INCLUDING every
-#     combined flag form (-nt/"-n -t"/-tq/-nq/-nqt -- SP-S14b), create no
-#     DIST_ROOT/OBJ_ROOT/BIN_ROOT and leave a pre-existing artifact's stat
-#     unchanged.
 #
 # Usage: ./scripts/test_build_isolation.sh   (run from pipelines/, or
 # anywhere -- paths are resolved relative to this script's own location).
 #
-# ISOL_INTERRUPT_PROBE (internal, used only by SP-S16): when set, this
-# script runs as a child re-invocation of itself in "interruption probe"
-# mode instead of running the suite -- see the block immediately after the
-# SCRATCH_ROOT/trap setup below.
+# ISOL_INTERRUPT_PROBE (internal, used only by SP-S16): when set, this script
+# runs as a child re-invocation of itself in "interruption probe" mode instead
+# of running the suite -- see the block immediately after the SCRATCH_ROOT/trap
+# setup below.
 
 set -euo pipefail
 
@@ -324,26 +228,22 @@ AEC_SUB_ROOT="$(cd "$AEC_DIR/.." && pwd)"
 NR_SUB_ROOT="$(cd "$NR_DIR/.." && pwd)"
 RNN_DIR="$(cd "$PIPE_DIR/../AINR/RNNoise-ERB" && pwd)"
 
-# Round-6 submodule caveat (see header comment above): lib/aec and lib/nr
-# above are still pinned at regression. The regression Makefile edits live in
-# these PRIMARY sibling repos instead; SP-S10/SP-S14/SP-S17 specifically
-# need regression-only features (OBJ_ROOT=/BIN_ROOT=/ALLOW_DIRTY_PUBLISH=/
-# ATTEST_STAMP=/the -n/-q/-t dry-run guard) and so target these instead of
-# $AEC_DIR/$NR_DIR. Once the submodule pin is bumped post-task,
-# $AEC_R6_DIR/$NR_R6_DIR and $AEC_DIR/$NR_DIR become equivalent and this
-# indirection stops mattering.
+# AEC/NR submodule note (see the header): SP-S10/SP-S14/SP-S17 need the
+# OBJ_ROOT=/BIN_ROOT=/ALLOW_DIRTY_PUBLISH=/ATTEST_STAMP=/-n/-q/-t dry-run guard
+# features and so target these PRIMARY sibling repos ($AEC_R6_DIR/$NR_R6_DIR)
+# instead of $AEC_DIR/$NR_DIR.
 AEC_REPO_DIR="$(cd "$PIPE_DIR/../../AEC" && pwd)"
 AEC_R6_DIR="$AEC_REPO_DIR/c_impl"
 NR_REPO_DIR="$(cd "$PIPE_DIR/../../NR" && pwd)"
 NR_R6_DIR="$NR_REPO_DIR/c_impl"
 
-# --- regression review P2-1: single scratch root, single trap ------------------
+# --- single scratch root, single trap -------------------------------------------
 SCRATCH_ROOT="$(mktemp -d)"
 # SUITE_LOCK_HELD must exist (as "0") before ANYTHING that could exit through
 # cleanup() runs -- including the ISOL_INTERRUPT_PROBE early-return branch
 # immediately below, which (being a probe CHILD, not a real suite run) never
-# reaches the regression mutex block that would otherwise set this to "1" --
-# `set -u` would otherwise fault on cleanup()'s own reference to it.
+# reaches the mutex block that would otherwise set this to "1" -- `set -u`
+# would otherwise fault on cleanup()'s own reference to it.
 SUITE_LOCK_HELD=0
 SUITE_LOCK=""
 cleanup() {
@@ -358,12 +258,12 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 # --- SP-S16 interruption probe: MUST be checked early, before any suite logic
-# (regression review P2-1 acceptance test), and BEFORE the mktemp-shim setup
-# below: probe mode's `set +e` (see the comment inside the branch) needs to
-# take effect before ANY further command runs in this process, since a
-# signal can arrive during the shim's own file writes just as easily as
-# during the probe's own fifo dance -- moving the whole shim setup after
-# this check keeps probe mode's error-handling window as small as possible.
+# and BEFORE the mktemp-shim setup below: probe mode's `set +e` (see the
+# comment inside the branch) needs to take effect before ANY further command
+# runs in this process, since a signal can arrive during the shim's own file
+# writes just as easily as during the probe's own fifo dance -- placing the
+# shim setup after this check keeps probe mode's error-handling window as small
+# as possible.
 # When invoked with ISOL_INTERRUPT_PROBE set, this is a CHILD re-invocation
 # of this very script, spawned by the SP-S16 scenario body further down. It
 # signals its own SCRATCH_ROOT back to the parent over a fifo (the write is
@@ -405,7 +305,7 @@ if [ -n "${ISOL_INTERRUPT_PROBE:-}" ]; then
   exit 0
 fi
 
-# --- regression review P2b: cross-suite mutex -----------------------------------
+# --- cross-suite mutex -----------------------------------------------------------
 # Placed immediately after the ISOL_INTERRUPT_PROBE early-return above (so a
 # probe CHILD -- itself a full re-invocation of this script, spawned by
 # SP-S16 -- never reaches this and never contends for the lock its own
@@ -482,32 +382,30 @@ export PATH="$SCRATCH_ROOT/shimbin:$PATH"
 mkscratch() { mkdir -p "$SCRATCH_ROOT/$1"; }
 
 file_sha() { shasum -a 256 "$1" | awk '{print $1}'; }
-# Fractional seconds (regression: replaces whole-second `stat -f %m`) -- two
-# genuinely separate real writes are distinguishable without an artificial
-# delay. GNU fallback loses the fractional part (not exercised on this host).
+# Fractional seconds (not whole-second `stat -f %m`) -- two genuinely separate
+# real writes are distinguishable without an artificial delay. GNU fallback
+# loses the fractional part (not exercised on this host).
 mtime()    { stat -f '%Fm' "$1" 2>/dev/null || stat -c %Y "$1"; }
 
-# Tree-state hash (regression review): status --porcelain ALONE misses a content
-# edit to an already-dirty file, so this also folds in `diff --binary HEAD`.
+# Tree-state hash: status --porcelain ALONE misses a content edit to an
+# already-dirty file, so this also folds in `diff --binary HEAD`.
 tree_state_hash() {
   { git -C "$1" status --porcelain; git -C "$1" diff --binary HEAD; } 2>/dev/null | shasum -a 256 | awk '{print $1}'
 }
 
-# adopt_worktree_clone <src-repo-dir> <clone-dir> (regression review P1b,
-# hoisted here from SP-S17 so SP2 -- which now runs before SP-S17 and shares
-# its clone set -- can use it too; aligned verbatim with audio_common's own
-# shared version of this helper) -- clone <src-repo-dir> (fully read-only on
-# the source -- the explicitly allowed exception to "no mutating git commands
-# against real repos"), then overlay every currently-MODIFIED TRACKED file on
-# top and adopt them as ONE throwaway commit INSIDE THE SCRATCH CLONE ONLY, so
-# the clone gets a genuinely CLEAN git identity that still reflects today's
-# (possibly uncommitted) worktree content. A plain `git clone` alone only
-# reproduces the source's last COMMIT -- it transfers committed objects,
-# never uncommitted working-tree bytes -- so a bare clone would carry the OLD
-# Makefile instead of the regression one under test. The clone is a disposable
-# git repository living entirely under $SCRATCH_ROOT, destroyed by the EXIT
-# trap; its own history never touches the source repo's .git in any way (a
-# distinct clone, never pushed/fetched back).
+# adopt_worktree_clone <src-repo-dir> <clone-dir> -- shared by SP2 and SP-S17,
+# aligned with audio_common's own version of this helper. Clone <src-repo-dir>
+# (fully read-only on the source -- the explicitly allowed exception to "no
+# mutating git commands against real repos"), then overlay every
+# currently-MODIFIED TRACKED file on top and adopt them as ONE throwaway commit
+# INSIDE THE SCRATCH CLONE ONLY, so the clone gets a genuinely CLEAN git
+# identity that still reflects the current (possibly uncommitted) worktree
+# content. A plain `git clone` alone only reproduces the source's last COMMIT
+# -- it transfers committed objects, never uncommitted working-tree bytes -- so
+# a bare clone would not carry the Makefile under test. The clone is a
+# disposable git repository living entirely under $SCRATCH_ROOT, destroyed by
+# the EXIT trap; its own history never touches the source repo's .git in any
+# way (a distinct clone, never pushed/fetched back).
 #
 # The commit is CONDITIONAL -- `git add -A`, then commit only if
 # `git diff --cached --quiet --exit-code` says something is actually staged
@@ -528,16 +426,15 @@ adopt_worktree_clone() {
   fi
 }
 
-# Real-tree final guard (regression review P3): per-file "path sha256 mtime"
-# snapshot of everything under the REAL obj/ and bin/ of the four trees this
-# suite builds in (pipelines itself, lib/aec, lib/nr, audio_common), plus a
-# separate top-level keyed-directory listing -- captured once SP1's own
-# intentional real-tree builds (kiss + ne10) are done, and re-verified at the
-# very end: every snapshotted file must still be sha+mtime identical; a
-# genuinely NEW directory is allowed (INFO/WARN, not FAIL -- but after the
-# SP-S12 fix there should be none), while a new file inside an
-# ALREADY-snapshotted directory is a FAIL. Each line is tagged with a short
-# repo prefix (pipelines/lib_aec/lib_nr/audio_common) joined onto the
+# Real-tree final guard: per-file "path sha256 mtime" snapshot of everything
+# under the REAL obj/ and bin/ of the four trees this suite builds in
+# (pipelines itself, lib/aec, lib/nr, audio_common), plus a separate top-level
+# keyed-directory listing -- captured once SP1's own intentional real-tree
+# builds (kiss + ne10) are done, and re-verified at the very end: every
+# snapshotted file must still be sha+mtime identical; a genuinely NEW directory
+# is allowed (INFO/WARN, not FAIL -- there should be none), while a new file
+# inside an ALREADY-snapshotted directory is a FAIL. Each line is tagged with a
+# short repo prefix (pipelines/lib_aec/lib_nr/audio_common) joined onto the
 # relative path -- the four trees' relative paths (obj/kiss-<sig>/...) would
 # otherwise collide across repos once combined into one snapshot set.
 _fg_snapshot_repo() {  # <tag> <repo-root>
@@ -571,11 +468,11 @@ final_guard_dirs() {
   _fg_dirs_repo audio_common "$AC_DIR"
 }
 
-# Real dist/ sentinel (regression review, standing guard): absent stays absent;
-# otherwise a full path list + per-file sha256 + per-file (name, mtime).
-# <root>/dist is the argument (not a bare repo root), so this works for
-# pipelines' own dist, lib/aec/c_impl's, lib/nr/c_impl's, $AC_DIR's, and
-# (belt-and-braces) the two PRIMARY AEC/NR repos' c_impl dist/ too.
+# Real dist/ sentinel (standing guard): absent stays absent; otherwise a full
+# path list + per-file sha256 + per-file (name, mtime). <root>/dist is the
+# argument (not a bare repo root), so this works for pipelines' own dist,
+# lib/aec/c_impl's, lib/nr/c_impl's, $AC_DIR's, and (belt-and-braces) the two
+# PRIMARY AEC/NR repos' c_impl dist/ too.
 real_dist_sentinel() {
   local root="$1"
   if [ ! -e "$root/dist" ]; then
@@ -602,13 +499,13 @@ release_mtime_snapshot() {
   done | sort
 }
 
-# assert_cmd_fails_with <description> <expected-substring> <cmd...> (regression
-# review scenarios SP-S9/SP-S12/SP-S13) -- runs <cmd...> with stdout+stderr
-# merged; PASS iff it exits non-zero AND the combined output contains
-# <expected-substring>; FAIL (dumping the log) otherwise. Fixed scratch path
-# (a counter-suffixed name under $SCRATCH_ROOT/tmp), not `mktemp` -- no
-# cleanup-state registration involved either way, consistent with the
-# fixed-path style used everywhere else in this rewrite.
+# assert_cmd_fails_with <description> <expected-substring> <cmd...> (used by
+# SP-S9/SP-S12/SP-S13) -- runs <cmd...> with stdout+stderr merged; PASS iff it
+# exits non-zero AND the combined output contains <expected-substring>; FAIL
+# (dumping the log) otherwise. Fixed scratch path (a counter-suffixed name
+# under $SCRATCH_ROOT/tmp), not `mktemp` -- no cleanup-state registration
+# involved either way, consistent with the fixed-path style used everywhere
+# else in this script.
 ACF_COUNTER=0
 assert_cmd_fails_with() {
   local desc="$1" needle="$2" log
@@ -629,9 +526,9 @@ assert_cmd_fails_with() {
 
 # resolve_producers <backend> -- resolves audio_common's/lib-aec's/lib-nr's
 # archive paths for <backend> (default flags otherwise), exactly the way
-# pipelines/Makefile's own phase-1 dispatch recipe does. Submodule AEC_DIR/
-# NR_DIR paths -- this is regression-stable producer resolution, no regression
-# feature needed. Sets globals AC_LIB_/AEC_LIB_/NR_LIB_.
+# pipelines/Makefile's own phase-1 dispatch recipe does. Uses the submodule
+# AEC_DIR/NR_DIR paths (no OBJ_ROOT=/BIN_ROOT= feature needed). Sets globals
+# AC_LIB_/AEC_LIB_/NR_LIB_.
 resolve_producers() {
   local backend="$1"
   AC_LIB_="$(make -s -C "$AC_DIR" BACKEND="$backend" WERROR=0 CC='cc' CXX='c++' EXTRA_CFLAGS='' NO_STDIO=0 print-lib-path)"
@@ -641,8 +538,8 @@ resolve_producers() {
 
 cd "$PIPE_DIR"
 
-# --- BEFORE snapshots (regression review: 4 repos mandated by the safety
-# contract, plus 2 bonus repos this script also builds against directly) ----
+# --- BEFORE snapshots (the four repos named by the safety contract, plus the
+# two PRIMARY AEC/NR repos this script also builds against directly) ----
 AUDIO_ALG_STATE_BEFORE="$(tree_state_hash "$AUDIO_ALG_ROOT")"
 AEC_SUB_STATE_BEFORE="$(tree_state_hash "$AEC_SUB_ROOT")"
 NR_SUB_STATE_BEFORE="$(tree_state_hash "$NR_SUB_ROOT")"
@@ -700,18 +597,16 @@ echo "############################################################"
 mkscratch s7
 S7_DIST_ROOT="$SCRATCH_ROOT/s7/dist"
 resolve_producers kiss
-# regression: ALLOW_DIRTY_PUBLISH=1 on every publish call in this script from
-# here on -- these dev trees are legitimately dirty (this very regression/7
-# rewrite is itself uncommitted, same as audio_common's/AEC's/NR's own
-# regression/7 edits); the dirty-publish POLICY itself is exercised on purpose
-# in SP-S17. regression: ALLOW_UNTRACKED_PUBLISH=1 rides along on every one of
-# those same calls from here on too (EXCEPT SP-S17's own deliberate
+# ALLOW_DIRTY_PUBLISH=1 on every publish call in this script from here on --
+# these dev trees may legitimately be dirty; the dirty-publish POLICY itself is
+# exercised on purpose in SP-S17. ALLOW_UNTRACKED_PUBLISH=1 rides along on
+# every one of those same calls too (EXCEPT SP-S17's own deliberate
 # policy-negative calls, which test a knob's absence on purpose) -- the
-# untracked dimension is a SEPARATE default refusal from the tracked-dirty
-# one (see the Makefile's own ALLOW_UNTRACKED_PUBLISH comment), and a dev
-# tree can legitimately carry untracked files that have nothing to do with
-# what each of these scenarios actually tests. DIST_ROOT stays a throwaway
-# scratch path: the real dist/ is never read, written, or removed.
+# untracked dimension is a SEPARATE default refusal from the tracked-dirty one
+# (see the Makefile's own ALLOW_UNTRACKED_PUBLISH comment), and a dev tree can
+# legitimately carry untracked files that have nothing to do with what each of
+# these scenarios actually tests. DIST_ROOT stays a throwaway scratch path: the
+# real dist/ is never read, written, or removed.
 make -s BACKEND=kiss DIST_ROOT="$S7_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >/dev/null
 
 kiss_current_target="$(readlink "$S7_DIST_ROOT/kiss/current" || true)"
@@ -785,21 +680,21 @@ ac_n="$AC_LIB_"; aec_n="$AEC_LIB_"; nr_n="$NR_LIB_"
 make -s BACKEND=ne10 WERROR=0 all AC_LIB="$ac_n" AEC_LIB="$aec_n" NR_LIB="$nr_n" >/dev/null
 bd_n="$(make -s BACKEND=ne10 WERROR=0 print-bin-dir AC_LIB="$ac_n" AEC_LIB="$aec_n" NR_LIB="$nr_n")"
 
-# regression review P3: final-guard snapshot, taken NOW -- both of the real-tree
-# normal-config builds this suite intends (kiss above, via S6/S7 and this
-# scenario; ne10 just now) are done for all four trees (pipelines itself,
-# lib/aec, lib/nr, audio_common). Every later real-tree `make ... lib`/`all`
-# in this suite re-targets one of these same two already-built configs and
-# must be a pure no-op against them. Re-verified at the very end (see "Final
-# integrity guards").
+# Final-guard snapshot, taken NOW -- both of the real-tree normal-config builds
+# this suite intends (kiss above, via S6/S7 and this scenario; ne10 just now)
+# are done for all four trees (pipelines itself, lib/aec, lib/nr,
+# audio_common). Every later real-tree `make ... lib`/`all` in this suite
+# re-targets one of these same two already-built configs and must be a pure
+# no-op against them. Re-verified at the very end (see "Final integrity
+# guards").
 FINAL_GUARD_DIRS_BEFORE="$(final_guard_dirs)"
 FINAL_GUARD_SNAPSHOT_BEFORE="$(final_guard_snapshot)"
 
-# regression: no sleep -- this is a "should NOT relink" check, so mtime()'s BSD
+# No sleep -- this is a "should NOT relink" check, so mtime()'s BSD
 # fractional-second read (stat -f '%Fm') is what makes a genuine relink here
-# distinguishable from m_k1, regardless of how close in wall-clock time the
-# two kiss builds land (a whole-second mtime comparison could otherwise
-# false-PASS a real, same-second relink).
+# distinguishable from m_k1, regardless of how close in wall-clock time the two
+# kiss builds land (a whole-second mtime comparison could otherwise false-PASS
+# a real, same-second relink).
 make -s BACKEND=kiss WERROR=0 all AC_LIB="$ac_k" AEC_LIB="$aec_k" NR_LIB="$nr_k" >/dev/null
 bd_k2="$(make -s BACKEND=kiss WERROR=0 print-bin-dir AC_LIB="$ac_k" AEC_LIB="$aec_k" NR_LIB="$nr_k")"
 m_k2="$(mtime "$bd_k2/aec_nr_pipeline")"
@@ -819,17 +714,14 @@ nm "$bd_n/aec_nr_pipeline" 2>/dev/null | grep -q 'ne10_fft_r2c_1d_float32_neon' 
 echo "############################################################"
 echo "# SP2: producer-change propagation (regression: scratch clones)"
 echo "############################################################"
-# regression review P2b: this scenario used to `touch` REAL audio_common
-# sources (src/hpf.c, include/fast_math.h) -- regression removes even a
-# mtime-only touch of any real tracked file. Runs against a disposable clone
-# of audio_common + the PRIMARY AEC repo + the PRIMARY NR repo instead. This
-# SAME clone set is created fresh HERE (on the still-clean tip) and REUSED
-# (then further dirtied) by SP-S17 further down -- one clone build instead
-# of two separate ones. The producer objs build INSIDE the clones (their own
-# default, clone-relative obj/bin, which live under scratch by construction);
-# the pipeline binary itself builds from the REAL pipelines directory (never
-# cloned) with AC_DIR/AEC_DIR/NR_DIR pointed at the clones plus an explicit
-# scratch OBJ_ROOT/BIN_ROOT.
+# This scenario runs against a disposable clone of audio_common + the PRIMARY
+# AEC repo + the PRIMARY NR repo; no real tracked file is touched, not even its
+# mtime. This SAME clone set is created fresh HERE (on the still-clean tip) and
+# REUSED (then further dirtied) by SP-S17 further down. The producer objs build
+# INSIDE the clones (their own default, clone-relative obj/bin, which live
+# under scratch by construction); the pipeline binary itself builds from the
+# REAL pipelines directory (never cloned) with AC_DIR/AEC_DIR/NR_DIR pointed at
+# the clones plus an explicit scratch OBJ_ROOT/BIN_ROOT.
 mkscratch pshared
 mkscratch sp2
 PSHARED_AC_CLONE="$SCRATCH_ROOT/pshared/ac_clone"
@@ -850,44 +742,38 @@ ln -s "$PSHARED_AC_CLONE" "$SCRATCH_ROOT/pshared/audio_common"
 SP2_OBJ_ROOT="$SCRATCH_ROOT/sp2/obj"
 SP2_BIN_ROOT="$SCRATCH_ROOT/sp2/bin"
 
-# Resolve + build each producer INSIDE its own clone. CRITICAL: every make
-# into the AEC/NR clones passes AC_DIR=<ac clone abs path> explicitly --
-# their own `$(AC_LIB): FORCE` rule re-invokes `$(MAKE) -C $(AC_DIR) ...
-# lib` using THAT invocation's own AC_DIR, and leaving it to a
-# wildcard/relative default would resolve the wrong (real) tree,
-# reintroducing exactly the real-tree writes this regression change removes.
+# Resolve + build each producer INSIDE its own clone. CRITICAL: every make into
+# the AEC/NR clones passes AC_DIR=<ac clone abs path> explicitly -- their own
+# `$(AC_LIB): FORCE` rule re-invokes `$(MAKE) -C $(AC_DIR) ... lib` using THAT
+# invocation's own AC_DIR, and leaving it to a wildcard/relative default would
+# resolve the real tree and write into it.
 #
-# CC/CXX are pinned EXPLICITLY here (CC='cc' CXX='c++', the SAME literal
-# values resolve_producers() uses throughout this script) rather than left to
-# each Makefile's own bare `?=` default -- found empirically while validating
-# this rewrite: audio_common's own bare default is `CC ?= cc`, but pipelines'
-# own bare default is `CC ?= gcc`; forwarding the wrong one anywhere would key
-# a producer to a different CFG_SIG than the rest of this scenario expects.
+# CC/CXX are pinned EXPLICITLY here (CC='cc' CXX='c++', the SAME literal values
+# resolve_producers() uses throughout this script) rather than left to each
+# Makefile's own bare `?=` default: audio_common's own bare default is `CC ?=
+# cc`, but pipelines' own bare default is `CC ?= gcc`; forwarding the wrong one
+# anywhere would key a producer to a different CFG_SIG than the rest of this
+# scenario expects.
 #
-# OBJ_ROOT/BIN_ROOT (SP2_OBJ_ROOT/SP2_BIN_ROOT) are likewise the SAME
-# EXPLICIT pair on every single make call below -- producer AND pipeline
-# alike -- rather than the producers' own default (clone-relative) obj/bin.
-# This is load-bearing, not stylistic: GNU Make automatically propagates
-# EVERY command-line-origin variable (not just the ones $(FWD) explicitly
-# lists) to every recursive $(MAKE) sub-invocation via MAKEFLAGS ("Communi-
-# cating Variables to a Sub-make" in the GNU Make manual) -- so the
-# PIPELINE's own OBJ_ROOT/BIN_ROOT override (needed so ITS artifacts never
-# land in the real pipelines/obj,bin) is UNAVOIDABLY inherited by the nested
-# `$(AC_LIB): FORCE`/`$(AEC_LIB): FORCE`/`$(NR_LIB): FORCE` sub-makes too,
-# regardless of what $(FWD) lists -- so each producer's OWN build ends up
-# under THIS SAME root either way, never its own clone-relative default.
-# Found empirically while validating this rewrite (via `make -d`): a first
-# attempt resolved `ac_k` with NO OBJ_ROOT/BIN_ROOT override (so it pointed
-# at the clone's own default obj/bin), then separately ran the pipeline
-# build WITH an OBJ_ROOT/BIN_ROOT override -- the nested sub-make's ACTUAL
-# audio_common archive silently landed under the inherited scratch root
-# instead, while `ac_k` kept pointing at a stale, never-rebuilt copy under
-# the clone's own default path (masked because that stale file already
-# existed from an earlier manual pre-build, so the FORCE rule's own
-# `test -f '$@'` assertion still passed) -- every "touch source -> relink"
-# assertion below false-failed as a result. Passing the identical
-# OBJ_ROOT=/BIN_ROOT= explicitly everywhere removes the mismatch outright
-# instead of fighting MAKEFLAGS propagation.
+# OBJ_ROOT/BIN_ROOT (SP2_OBJ_ROOT/SP2_BIN_ROOT) are likewise the SAME EXPLICIT
+# pair on every single make call below -- producer AND pipeline alike -- rather
+# than the producers' own default (clone-relative) obj/bin. This is
+# load-bearing, not stylistic: GNU Make automatically propagates EVERY
+# command-line-origin variable (not just the ones $(FWD) explicitly lists) to
+# every recursive $(MAKE) sub-invocation via MAKEFLAGS ("Communicating
+# Variables to a Sub-make" in the GNU Make manual) -- so the PIPELINE's own
+# OBJ_ROOT/BIN_ROOT override (needed so ITS artifacts never land in the real
+# pipelines/obj,bin) is UNAVOIDABLY inherited by the nested `$(AC_LIB):
+# FORCE`/`$(AEC_LIB): FORCE`/`$(NR_LIB): FORCE` sub-makes too, regardless of
+# what $(FWD) lists -- so each producer's OWN build ends up under THIS SAME
+# root either way, never its own clone-relative default. Resolving `ac_k`
+# WITHOUT the override while the pipeline build uses one would leave `ac_k`
+# pointing at a stale copy under the clone's own default path while the nested
+# sub-make's ACTUAL audio_common archive lands under the inherited scratch root
+# (the FORCE rule's own `test -f '$@'` assertion would still pass on a stale
+# file), and every "touch source -> relink" assertion below would false-fail.
+# Passing the identical OBJ_ROOT=/BIN_ROOT= explicitly everywhere removes the
+# mismatch outright instead of fighting MAKEFLAGS propagation.
 CCX=(CC='cc' CXX='c++' WERROR=0 EXTRA_CFLAGS='' NO_STDIO=0)
 ORX=(OBJ_ROOT="$SP2_OBJ_ROOT" BIN_ROOT="$SP2_BIN_ROOT")
 ac_k="$(make -s -C "$PSHARED_AC_CLONE" BACKEND=kiss "${CCX[@]}" "${ORX[@]}" print-lib-path)"
@@ -904,18 +790,17 @@ sp2_makeargs=(BACKEND=kiss "${CCX[@]}" "${ORX[@]}" \
 make -s "${sp2_makeargs[@]}" all >/dev/null
 bd_k="$(make -s "${sp2_makeargs[@]}" print-bin-dir)"
 
-# "Did it rebuild?" is verified from make's own build LOG (grep for that
-# rule's `@echo` line), never an mtime diff -- exactly audio_common's own S5
-# technique (see that scenario's comment for the full rationale). Found
-# empirically while validating THIS rewrite: comparing two mtime snapshots
-# of the SAME output file, taken moments apart by THIS SCRIPT, can land in
-# the very same whole second when the whole touch-rebuild-relink chain runs
-# fast and back-to-back inside a scratch clone (no human/sleep delay between
-# steps) -- a real false-negative (reproduced directly: a genuinely
-# recompiled hpf.o, and a genuinely rebuilt archive, both landing in the
-# same integer second as their OWN prior build, so GNU Make 3.81's own
-# whole-second-truncated newer-than check declines to re-archive/relink,
-# even though a higher-resolution clock shows a real, later timestamp).
+# "Did it rebuild?" is verified from make's own build LOG (grep for that rule's
+# `@echo` line), never an mtime diff -- exactly audio_common's own S5 technique
+# (see that scenario's comment for the full rationale). Comparing two mtime
+# snapshots of the SAME output file, taken moments apart by THIS SCRIPT, can
+# land in the very same whole second when the whole touch-rebuild-relink chain
+# runs fast and back-to-back inside a scratch clone (no human/sleep delay
+# between steps) -- a false negative: a genuinely recompiled hpf.o, and a
+# genuinely rebuilt archive, can both land in the same integer second as their
+# OWN prior build, so GNU Make 3.81's whole-second-truncated newer-than check
+# declines to re-archive/relink even though a higher-resolution clock shows a
+# real, later timestamp.
 # backdate_sp2(): backdates a CLONE-owned build artifact (an archive or the
 # final binary -- never a real tracked source) by a safe margin (5 minutes)
 # immediately before the rebuild that must supersede it, so that rebuild's
@@ -1010,18 +895,16 @@ echo "# distinct code path, the FP-policy check's OWN internal variables,"
 echo "# and the legitimate positive control"
 echo "############################################################"
 # See the header comment (search "SP-S9b") and pipelines/Makefile's own
-# "REDESIGN" comment for the full writeup -- replicated verbatim from
-# audio_common's/AEC's identical S24-style additions, scoped to this
-# repo's own print-obj-dir gate. Every negative case below is a real, live
-# bypass of the OLD deny-list this repo used to have (single quote, double
-# quote, backslash, backtick, a literal "$(" sequence, semicolon, pipe,
-# ampersand, @-response-file -- none of bare glob characters, tilde, or
-# real shell redirection/process substitution), each now REJECTED by the
-# character-class allow-list. These are all pure parse-time rejections (the
-# FP-policy checks run unconditionally before any recipe, including
-# print-obj-dir's own, ever executes), so -- exactly like SP-S9 above --
-# no scratch OBJ_ROOT/BIN_ROOT is needed: a rejected build never creates a
-# directory at all.
+# "REDESIGN" comment for the full writeup -- same as audio_common's/AEC's,
+# scoped to this repo's own print-obj-dir gate. Every negative case below is a
+# real, live bypass of a character deny-list (single quote, double quote,
+# backslash, backtick, a literal "$(" sequence, semicolon, pipe, ampersand,
+# @-response-file -- and none of bare glob characters, tilde, or real shell
+# redirection/process substitution), each REJECTED by the character-class
+# allow-list. These are all pure parse-time rejections (the FP-policy checks
+# run unconditionally before any recipe, including print-obj-dir's own, ever
+# executes), so -- exactly like SP-S9 above -- no scratch OBJ_ROOT/BIN_ROOT is
+# needed: a rejected build never creates a directory at all.
 sp9b_check_rejected() {
   local label="$1" flag_value="$2" expect_chars="$3" log
   log="$SCRATCH_ROOT/tmp/sp9b_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_').log"
@@ -1043,10 +926,10 @@ sp9b_check_rejected "redirect-out"  '-I>/tmp/evil'    '>'
 sp9b_check_rejected "redirect-in"   '-I</etc/passwd'  '<'
 sp9b_check_rejected "process-subst" '<(echo hi)'      '()<'
 
-# Single-quote -- still caught by the ONE surviving pure-Make $(findstring)
-# check (the allow-list's own $(shell) call needs it excluded first to
-# safely single-quote-embed the rest of the text), so this message still
-# says "single-quote character" verbatim, unlike the allow-list cases above.
+# Single-quote -- caught by the ONE pure-Make $(findstring) check (the
+# allow-list's own $(shell) call needs it excluded first to safely
+# single-quote-embed the rest of the text), so this message says "single-quote
+# character" verbatim, unlike the allow-list cases above.
 SP9B_LOG_SQ="$SCRATCH_ROOT/tmp/sp9b_single_quote.log"
 if env EXTRA_CFLAGS="-O'f'ast" make BACKEND=kiss print-obj-dir >"$SP9B_LOG_SQ" 2>&1; then
   fail "SP-S9b: EXTRA_CFLAGS=\"-O'f'ast\" (quote-split) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
@@ -1146,17 +1029,15 @@ echo "############################################################"
 echo "# SP-S9c: link-flags (LDFLAGS/EXTRA_LDFLAGS) character-safety coverage"
 echo "############################################################"
 # See the header comment (search "SP-S9c") and pipelines/Makefile's own
-# "link-flags character-safety coverage" comment for the full writeup --
-# replicated from audio_common's identical S25 fix. Before this task's fix,
-# SP-S9b's allow-list validated FP_INPUT_FLAGS only (CFLAGS/CXXFLAGS/
-# CPPFLAGS) -- LDFLAGS/EXTRA_LDFLAGS were never inspected at all, even
-# though LDFLAGS is embedded in every real link recipe ($(LINK) ...
-# $(LDFLAGS)) the exact same way CFLAGS is embedded in every compile
-# recipe. Same discipline as SP-S9b: the negative cases below are all pure
-# parse-time rejections (the FP-policy checks run unconditionally before
-# any recipe, including print-obj-dir's own, ever executes), so no scratch
-# OBJ_ROOT/BIN_ROOT is needed there -- a rejected build never creates a
-# directory at all.
+# "link-flags character-safety coverage" comment for the full writeup -- same
+# as audio_common's. SP-S9b's allow-list validates FP_INPUT_FLAGS
+# (CFLAGS/CXXFLAGS/CPPFLAGS); LDFLAGS/EXTRA_LDFLAGS need the same check, since
+# LDFLAGS is embedded in every real link recipe ($(LINK) ... $(LDFLAGS)) the
+# exact same way CFLAGS is embedded in every compile recipe. Same discipline as
+# SP-S9b: the negative cases below are all pure parse-time rejections (the
+# FP-policy checks run unconditionally before any recipe, including
+# print-obj-dir's own, ever executes), so no scratch OBJ_ROOT/BIN_ROOT is
+# needed there -- a rejected build never creates a directory at all.
 sp9c_check_rejected() {
   local label="$1" flag_value="$2" expect_chars="$3" log
   log="$SCRATCH_ROOT/tmp/sp9c_$(printf '%s' "$label" | tr -c 'A-Za-z0-9' '_').log"
@@ -1170,14 +1051,12 @@ sp9c_check_rejected() {
   fi
 }
 
-# The literal reported repro (regression coverage): a semicolon payload via
-# EXTRA_LDFLAGS, dry-run-confirmed (via `make -n`, zero files touched)
-# BEFORE this task's fix to sail through untouched and land live in a real
-# link recipe -- `make aec_nr_pipeline EXTRA_LDFLAGS=';id'` (with AC_LIB/
-# AEC_LIB/NR_LIB pre-resolved so the dispatch lands directly on this repo's
-# OWN link recipe instead of recursing into audio_common's already-fixed
-# sub-make first) showed a real `cc -o ... $(LDFLAGS)` recipe line with the
-# `;id` payload sitting live and unfiltered after the `-lm`.
+# The reported repro: a semicolon payload via EXTRA_LDFLAGS -- `make
+# aec_nr_pipeline EXTRA_LDFLAGS=';id'` (with AC_LIB/AEC_LIB/NR_LIB pre-resolved
+# so the dispatch lands directly on this repo's OWN link recipe instead of
+# recursing into audio_common's sub-make first) -- must be rejected, not land
+# live and unfiltered after the `-lm` of a real `cc -o ... $(LDFLAGS)` recipe
+# line (checked via `make -n`, zero files touched).
 sp9c_check_rejected "injection-semicolon" ';id' ';'
 
 # Same glob/tilde/redirect/process-substitution matrix SP-S9b runs for
@@ -1190,8 +1069,8 @@ sp9c_check_rejected "redirect-out"  '-lm>/tmp/evil'   '>'
 sp9c_check_rejected "redirect-in"   '-lm</etc/passwd' '<'
 sp9c_check_rejected "process-subst" '<(echo hi)'      '()<'
 
-# Single-quote -- still caught by the ONE surviving pure-Make $(findstring)
-# check, same as SP-S9b's own single-quote case.
+# Single-quote -- caught by the ONE pure-Make $(findstring) check, same as
+# SP-S9b's own single-quote case.
 SP9C_LOG_SQ="$SCRATCH_ROOT/tmp/sp9c_single_quote.log"
 if env EXTRA_LDFLAGS="-l'p'thread" make BACKEND=kiss print-obj-dir >"$SP9C_LOG_SQ" 2>&1; then
   fail "SP-S9c: EXTRA_LDFLAGS=\"-l'p'thread\" (quote-split) print-obj-dir unexpectedly SUCCEEDED (must be rejected)"
@@ -1238,11 +1117,11 @@ else
   cat "$SP9C_POS_BUILD_LOG" >&2
 fi
 
-# Command-line/`-e` override-rejection for SHELL_SAFE_INPUT_FLAGS/
-# SHELL_SAFE_ALLOWLIST_RC (SP-S9b already covers both via an EXTRA_CFLAGS
-# payload; this repeats it via EXTRA_LDFLAGS specifically, since that is the
-# exact vector this task's fix exists to close -- an override here must not
-# be able to let an EXTRA_LDFLAGS injection payload back through).
+# Command-line/`-e` override-rejection for
+# SHELL_SAFE_INPUT_FLAGS/SHELL_SAFE_ALLOWLIST_RC (SP-S9b already covers both
+# via an EXTRA_CFLAGS payload; this repeats it via EXTRA_LDFLAGS specifically,
+# since that is the vector SP-S9c covers -- an override here must not be able
+# to let an EXTRA_LDFLAGS injection payload back through).
 sp9c_check_override_rejected() {
   local varname="$1" varvalue="$2" payload="$3" use_dash_e="$4" log
   log="$SCRATCH_ROOT/tmp/sp9c_override_$(printf '%s' "$varname" | tr -c 'A-Za-z0-9' '_')_$use_dash_e.log"
@@ -1284,10 +1163,9 @@ SP10_BIN_ROOT="$SCRATCH_ROOT/sp10/bin"
 # state at all).
 sp10_ac_lib="$(make -s -C "$AC_DIR" BACKEND=kiss print-lib-path)"
 
-# Snapshot the REAL submodule libaec.a -- must stay byte/mtime-untouched
-# across this whole scenario. The regression version of this scenario injected
-# the foreign member directly into THIS file (a regression P1 finding this
-# rewrite fixes by never touching it at all).
+# Snapshot the REAL submodule libaec.a -- must stay byte/mtime-untouched across
+# this whole scenario (the foreign member is injected into a scratch archive
+# instead).
 sp10_submodule_lib="$(make -s -C "$AEC_DIR" BACKEND=kiss print-lib-path)"
 sp10_submodule_existed_before=0
 if [ -f "$sp10_submodule_lib" ]; then
@@ -1403,8 +1281,8 @@ else
   fail "SP-S11: ATTEST file $first_attest event_id= does not match its filename stem"
 fi
 
-# regression attest v2: git_commit= (self) AND all three producer *_git_commit=
-# fields are full 40-hex OIDs (regression used `git rev-parse --short`).
+# attest v2: git_commit= (self) AND all three producer *_git_commit= fields are
+# full 40-hex OIDs (not `git rev-parse --short`).
 sp11_hex_ok=1
 for field in git_commit audio_common_git_commit aec_git_commit nr_git_commit; do
   val="$(grep "^${field}=" "$first_attest" | head -1 | cut -d= -f2)"
@@ -1413,11 +1291,11 @@ done
 [ "$sp11_hex_ok" -eq 1 ] && pass "SP-S11: git_commit= and all three producer *_git_commit= fields are full 40-hex OIDs" \
   || fail "SP-S11: one or more of git_commit=/audio_common_git_commit=/aec_git_commit=/nr_git_commit= is not 40 hex characters"
 
-# regression review P2a/item 7: the *_git_untracked dimension is a SEPARATE
-# default refusal from *_git_dirty (see the Makefile's ALLOW_UNTRACKED_PUBLISH
-# comment) -- assert all four fields + allow_untracked_publish= exist in a
-# normal, successful publish's attest (SP-S17a/b exercise the refusal path
-# itself; this is the field-presence regression for the ordinary path).
+# The *_git_untracked dimension is a SEPARATE default refusal from *_git_dirty
+# (see the Makefile's ALLOW_UNTRACKED_PUBLISH comment) -- assert all four
+# fields + allow_untracked_publish= exist in a normal, successful publish's
+# attest (SP-S17a/b exercise the refusal path itself; this is the
+# field-presence check for the ordinary path).
 sp11_untracked_fields_ok=1
 for field in git_untracked audio_common_git_untracked aec_git_untracked nr_git_untracked allow_untracked_publish; do
   grep -q "^${field}=" "$first_attest" || sp11_untracked_fields_ok=0
@@ -1431,10 +1309,10 @@ grep -q "^git_untracked=0\$" "$first_attest" && pass "SP-S11: pipelines' own git
 release_dir_mtime_before="$(mtime "$rel_dir")"
 snap_before="$(release_mtime_snapshot "$rel_dir")"
 
-# regression: no sleep -- the <NNN> suffix (not a distinct UTC second) is what
-# disambiguates this immediate same-second republish (SP-S15 stress-tests
-# the same-second case directly, forcing 20 publishes into one literal
-# second via ATTEST_STAMP=).
+# No sleep -- the <NNN> suffix (not a distinct UTC second) is what
+# disambiguates this immediate same-second republish (SP-S15 stress-tests the
+# same-second case directly, forcing 20 publishes into one literal second via
+# ATTEST_STAMP=).
 S11_LOG="$SCRATCH_ROOT/sp11/republish.log"
 make -s BACKEND=kiss DIST_ROOT="$SP11_DIST_ROOT" ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish AC_LIB="$AC_LIB_" AEC_LIB="$AEC_LIB_" NR_LIB="$NR_LIB_" >"$S11_LOG" 2>&1
 if grep -q "already published (byte-verified" "$S11_LOG"; then
@@ -1476,13 +1354,12 @@ echo "############################################################"
 echo "# SP-S12: BACKEND=ne10 toolchain guard fires through the dispatch"
 echo "############################################################"
 mkscratch sp12
-# regression review P2b (parity with audio_common's own S12 fix): this shim's
-# path lives under $SCRATCH_ROOT, which is fresh every run -- and CXX
-# participates in this repo's own CFG_SIG payload -- so building
-# libaudio_pipeline.a with it in the REAL (default-rooted) obj/bin used to
-# mint a brand-new orphan keyed directory there on every single run of this
-# suite. Both shim builds now use a scratch OBJ_ROOT/BIN_ROOT instead; the
-# guard under test doesn't care where the objects land.
+# This shim's path lives under $SCRATCH_ROOT, which is fresh every run -- and
+# CXX participates in this repo's own CFG_SIG payload -- so building
+# libaudio_pipeline.a with it in the REAL (default-rooted) obj/bin would mint a
+# brand-new orphan keyed directory there on every run of this suite. Both shim
+# builds use a scratch OBJ_ROOT/BIN_ROOT; the guard under test doesn't care
+# where the objects land.
 SP12_OBJ_ROOT="$SCRATCH_ROOT/sp12/obj"
 SP12_BIN_ROOT="$SCRATCH_ROOT/sp12/bin"
 SP12_SHIM="$SCRATCH_ROOT/sp12/sp12-cxx-shim"
@@ -1565,31 +1442,24 @@ for x in pipe aec nr; do
   rc=0
   "${MAKE_ARGS[@]}" -n BACKEND=kiss DIST_ROOT="$SP14_DIST" OBJ_ROOT="$SP14_OBJ" BIN_ROOT="$SP14_BIN" publish >"$SCRATCH_ROOT/sp14/$x.n.log" 2>&1 || rc=$?
   if [ "$x" = "pipe" ]; then
-    # Discovered while validating this rewrite (regression P2-3, pipelines-
-    # specific, pre-existing -- confirmed by a standalone `make -n publish`
-    # repro outside this script entirely, so it is a genuine Makefile
-    # characteristic, not a bug in this test): pipelines' own THREE-producer
-    # FORCE rules forward $(AC_LIB) into a FURTHER nested
-    # `$(MAKE) ... AC_LIB=$(AC_LIB) lib` sub-make call for lib/aec and
-    # lib/nr. Under `-n`, GNU Make PRINTS (rather than executes)
-    # audio_common's own `print-lib-path` recipe line VERBATIM -- including
-    # its `echo` text -- instead of running it (reproduced directly:
-    # `make -n -s -C audio_common print-lib-path` prints "echo /abs/path"
-    # instead of just "/abs/path"), so the captured "$$ac" becomes the
-    # literal STRING "echo /abs/path/to/lib.a" (containing a space) instead
-    # of just the path. Forwarding THAT corrupted value on as
-    # AC_LIB=$(AC_LIB) into the nested lib/aec or lib/nr sub-make then
-    # splits it into extra bogus command-line words/goals, and that nested
+    # pipelines' own THREE-producer FORCE rules forward $(AC_LIB) into a
+    # FURTHER nested `$(MAKE) ... AC_LIB=$(AC_LIB) lib` sub-make call for
+    # lib/aec and lib/nr. Under `-n`, GNU Make PRINTS (rather than executes)
+    # audio_common's own `print-lib-path` recipe line VERBATIM -- including its
+    # `echo` text -- instead of running it (`make -n -s -C audio_common
+    # print-lib-path` prints "echo /abs/path" instead of just "/abs/path"), so
+    # the captured "$$ac" becomes the literal STRING "echo /abs/path/to/lib.a"
+    # (containing a space) instead of just the path. Forwarding THAT corrupted
+    # value on as AC_LIB=$(AC_LIB) into the nested lib/aec or lib/nr sub-make
+    # then splits it into extra bogus command-line words/goals, and that nested
     # make exits nonzero ("No rule to make target ..."). AEC's and NR's own
-    # single-producer dispatch never re-forwards AC_LIB into a THIRD level
-    # of nesting this way, so they don't hit it (see SP-S14[aec]/
-    # SP-S14[nr] immediately below, both rc=0) -- this is specific to
-    # pipelines' three-producer design. A Makefile fix is out of this
-    # script's remit (only this test script may be modified); the actual
-    # safety property this scenario exists to verify -- ZERO filesystem
-    # side effects -- still holds regardless and is asserted unconditionally
-    # for all three Makefiles right below, so this quirk does not weaken
-    # the guarantee under test.
+    # single-producer dispatch never re-forwards AC_LIB into a THIRD level of
+    # nesting this way, so they don't hit it (see SP-S14[aec]/SP-S14[nr]
+    # immediately below, both rc=0) -- this is specific to pipelines'
+    # three-producer design. The safety property this scenario exists to verify
+    # -- ZERO filesystem side effects -- holds regardless and is asserted
+    # unconditionally for all three Makefiles right below, so this quirk does
+    # not weaken the guarantee under test.
     echo "  INFO: SP-S14[pipe]: make -n publish rc=$rc (KNOWN pre-existing pipelines-specific dry-run quirk, see comment above -- not asserted; the side-effect-free invariant below is the real safety check)"
   else
     [ "$rc" -eq 0 ] && pass "SP-S14[$x]: make -n publish exits rc=0" || fail "SP-S14[$x]: make -n publish exits rc=$rc (expected 0)"
@@ -1640,7 +1510,7 @@ SP14_AFTER_NRR6_BIN="$(snap_dirs "$NR_R6_DIR/bin")"
   || fail "SP-S14: a NEW keyed dir appeared in the PRIMARY NR repo's real obj/bin"
 
 echo "--- SP-S14b: COMBINED dry-run flags stay zero-write (PIPELINES Makefile) --"
-# regression follow-up (the S15b pattern from audio_common's script): a combined
+# Combined dry-run flags (the S15b pattern from audio_common's script): a combined
 # `make -nt publish` could take the -n branch and recurse; the recursed
 # child then sees BOTH flags and GNU make applies REAL touch semantics down
 # the _publish_impl prerequisite chain -- the pipelines Makefile's own
@@ -1791,13 +1661,11 @@ echo "# SP-S17: dirty-producer provenance (regression P2; regression: shared clo
 echo "############################################################"
 mkscratch sp17
 
-# regression review P2b/item 3: SP-S17 no longer clones its OWN three producer
-# checkouts -- it REUSES the exact PSHARED_AC_CLONE/PSHARED_AEC_CLONE/
-# PSHARED_NR_CLONE set SP2 (above) already built while they were still
-# clean, one clone build instead of two separate ones. `adopt_worktree_clone`
-# itself is now defined once, in the shared helpers section near the top of
-# this script (hoisted from here so SP2, which now runs first, can use it
-# too) -- see that definition's own comment for the full rationale.
+# SP-S17 REUSES the exact PSHARED_AC_CLONE/PSHARED_AEC_CLONE/PSHARED_NR_CLONE
+# set SP2 (above) already built while they were still clean.
+# `adopt_worktree_clone` is defined once, in the shared helpers section near
+# the top of this script -- see that definition's own comment for the full
+# rationale.
 SP17_AC_CLONE="$PSHARED_AC_CLONE"
 SP17_AEC_CLONE="$PSHARED_AEC_CLONE"
 SP17_NR_CLONE="$PSHARED_NR_CLONE"
@@ -1819,10 +1687,11 @@ SP17_DIST="$SCRATCH_ROOT/sp17/dist"
 
 # sp17_attest_name_from_log(): the publish recipe's own success line ends
 # "(attested: <name>)" -- extract it directly rather than globbing ATTEST/
-# (this pipelines repo is ALSO dirty right now -- uncommitted regression
-# changes, by this task's own design -- so it publishes its own attest
-# fields too; the log line unambiguously names THIS invocation's own attest
-# file regardless of how many total attest files a release dir holds).
+# sp17_attest_name_from_log(): the publish recipe's own success line ends
+# "(attested: <name>)" -- extract it directly rather than globbing ATTEST/
+# (this pipelines repo may ALSO be dirty, so it publishes its own attest fields
+# too; the log line unambiguously names THIS invocation's own attest file
+# regardless of how many total attest files a release dir holds).
 sp17_attest_name_from_log() {
   local log="$1" name
   name="$(grep -o '(attested: [^)]*)' "$log" | sed -e 's/^(attested: //' -e 's/)$//' | head -1)"
@@ -1831,11 +1700,11 @@ sp17_attest_name_from_log() {
 }
 
 SP17_LOG_OK="$SCRATCH_ROOT/sp17/log_ok"
-# regression item 6: ALLOW_UNTRACKED_PUBLISH=1 rides along here too (this is a
-# success-path call, not one of the deliberate policy-negative sub-cases
-# below) -- inert in practice, since these clones carry no untracked files
-# yet (only tracked-dirty edits above), but uniform with every other publish
-# call in this script from S7 onward.
+# ALLOW_UNTRACKED_PUBLISH=1 rides along here too (this is a success-path call,
+# not one of the deliberate policy-negative sub-cases below) -- inert in
+# practice, since these clones carry no untracked files yet (only tracked-dirty
+# edits above), but uniform with every other publish call in this script from
+# S7 onward.
 if make -s BACKEND=kiss DIST_ROOT="$SP17_DIST" OBJ_ROOT="$SP17_OBJ_ROOT" BIN_ROOT="$SP17_BIN_ROOT" \
      AC_DIR="$SP17_AC_CLONE" AEC_DIR="$SP17_AEC_CLONE/c_impl" NR_DIR="$SP17_NR_CLONE/c_impl" \
      ALLOW_DIRTY_PUBLISH=1 ALLOW_UNTRACKED_PUBLISH=1 publish >"$SP17_LOG_OK" 2>&1; then
@@ -1889,16 +1758,15 @@ else
 fi
 
 echo "--- SP-S17a: untracked producer probe (audio_common) -------------------"
-# regression review P2a/item 5a: the untracked dimension is SEPARATE from the
-# tracked-dirty one already exercised above. An untracked file in the SHARED
-# audio_common clone (already tracked-dirty from the edit above, so
-# ALLOW_DIRTY_PUBLISH=1 alone already admits THAT dimension) must still be
-# refused on the UNTRACKED dimension unless ALLOW_UNTRACKED_PUBLISH=1 is
-# ALSO given -- and once given, the attestation records
-# audio_common_git_untracked=1 + a 64-hex audio_common_untracked_tree_sha256,
-# while pipelines' OWN git_untracked stays 0 (the AINR/GTCRN|gtcrn_github
-# whitelist holding, since this repo's own tree never gained an untracked
-# file from this scenario).
+# The untracked dimension is SEPARATE from the tracked-dirty one already
+# exercised above. An untracked file in the SHARED audio_common clone (already
+# tracked-dirty from the edit above, so ALLOW_DIRTY_PUBLISH=1 alone already
+# admits THAT dimension) must still be refused on the UNTRACKED dimension
+# unless ALLOW_UNTRACKED_PUBLISH=1 is ALSO given -- and once given, the
+# attestation records audio_common_git_untracked=1 + a 64-hex
+# audio_common_untracked_tree_sha256, while pipelines' OWN git_untracked stays
+# 0 (the AINR/GTCRN|gtcrn_github whitelist holding, since this repo's own tree
+# never gained an untracked file from this scenario).
 echo "int sp17a_untracked_probe;" > "$SP17_AC_CLONE/probe.c"
 
 SP17_LOG_A1="$SCRATCH_ROOT/sp17/log_untracked_a1"
@@ -1939,11 +1807,11 @@ else
 fi
 
 echo "--- SP-S17b: unknown producer (AEC_DIR -> a no-git copy) -> unconditional FATAL --"
-# regression review item 5b: point AEC_DIR at a no-git scratch copy of the
-# PRIMARY AEC repo (a plain tar copy, no .git at all) -- a checkout with no
-# git identity is refused UNCONDITIONALLY, naming lib/aec, even with BOTH
-# escape hatches set (neither admits it: without a commit OID neither the
-# tracked diff nor the untracked enumeration can be named for that repo).
+# Point AEC_DIR at a no-git scratch copy of the PRIMARY AEC repo (a plain tar
+# copy, no .git at all) -- a checkout with no git identity is refused
+# UNCONDITIONALLY, naming lib/aec, even with BOTH escape hatches set (neither
+# admits it: without a commit OID neither the tracked diff nor the untracked
+# enumeration can be named for that repo).
 SP17B_NOGIT_AEC="$SCRATCH_ROOT/sp17/aec_nogit"
 mkdir -p "$SP17B_NOGIT_AEC"
 tar -c -C "$AEC_REPO_DIR" --exclude obj --exclude bin --exclude dist --exclude .git . | tar -x -C "$SP17B_NOGIT_AEC"
@@ -1965,37 +1833,27 @@ fi
 echo "############################################################"
 echo "# SP-S18: 'make -e' environment-override bypass rejection, cross-repo"
 echo "############################################################"
-# regression coverage finding (this task): distinct from SP-S9 above. SP-S9 exercises
-# a COMMAND-LINE override (\`make CFLAGS=-O3 ...\`) -- origin flips to
-# "command line" the instant the argument is parsed, so the "Command-line
-# override rejection" foreach has always caught it regardless of where in
+# SP-S18: `make -e` ENVIRONMENT-override rejection, distinct from SP-S9 above.
+# SP-S9 exercises a COMMAND-LINE override (`make CFLAGS=-O3 ...`) -- origin
+# flips to "command line" the instant the argument is parsed, so the
+# "Command-line override rejection" foreach catches it regardless of where in
 # the file the corresponding bare assignment/append sits. This scenario
-# exercises the OTHER origin the SAME foreach is supposed to catch:
-# \`env VAR=... make -e ...\` (ENVIRONMENT-override). \`$(origin VAR)\` only
-# flips from plain "environment" to "environment override" once a makefile
-# assignment/append to VAR has actually been PARSED -- so under \`-e\`, a
-# bare env var whose file-side assignment sits AFTER the foreach (in file
-# order) used to sail straight through unrejected, silently dropping that
-# Makefile's own flag appends (confirmed, pre-fix: \`env
-# FP_POLICY=-ffp-contract=fast make -e -n BACKEND=kiss lib\` against
-# pipelines/Makefile succeeded (rc=0) with -ffp-contract=fast on the
-# audio_pipeline.o dry-run compile line instead of the pinned
-# -ffp-contract=off). The fix -- relocating each bare FP_POLICY/LDFLAGS
-# literal/composition ahead of the foreach, and turning the CXXFLAGS/
-# CPPFLAGS \`?=\` into \`+=\` so the assignment ATTEMPT always happens -- is
-# covered here for all three consumer Makefiles.
+# exercises the OTHER origin the SAME foreach must catch: `env VAR=... make -e
+# ...` (ENVIRONMENT-override). `$(origin VAR)` only flips from plain
+# "environment" to "environment override" once a makefile assignment/append to
+# VAR has actually been PARSED -- so under `-e`, a bare env var whose
+# file-side assignment sits AFTER the foreach (in file order) would sail
+# straight through unrejected, silently dropping that Makefile's own flag
+# appends (e.g. `env FP_POLICY=-ffp-contract=fast make -e -n BACKEND=kiss
+# lib` succeeding with -ffp-contract=fast on the dry-run compile line instead
+# of the pinned -ffp-contract=off). Each Makefile therefore places its bare
+# FP_POLICY/LDFLAGS literal/composition ahead of the foreach and uses `+=`
+# (not `?=`) for CXXFLAGS/CPPFLAGS so the assignment ATTEMPT always happens;
+# this scenario covers all three consumer Makefiles.
 #
-# AEC/NR here are the PRIMARY repos ($AEC_R6_DIR/$NR_R6_DIR), NOT the
-# submodule ($AEC_DIR/$NR_DIR) -- same "regression submodule caveat" this
-# script's header documents for SP-S10/SP-S12/SP-S14 above: the submodule
-# pin still carries the PRE-fix Makefile (confirmed directly: the exact
-# \`env FP_POLICY=-ffp-contract=fast make -e -n BACKEND=kiss lib\` repro still
-# sails through unrejected against $AEC_DIR/$NR_DIR today, rc=0, with
-# -ffp-contract=fast on the dry-run compile line), so a scenario asserting
-# the FIX must target the primary repos, where it landed -- exactly like
-# this script's existing regression-only scenarios already do. pipelines
-# itself is exercised in place ($PIPE_DIR, the real checkout this task's fix
-# landed in directly).
+# AEC/NR here are the PRIMARY repos ($AEC_R6_DIR/$NR_R6_DIR), NOT the submodule
+# ($AEC_DIR/$NR_DIR) -- see the header's AEC/NR submodule note. pipelines
+# itself is exercised in place ($PIPE_DIR).
 #
 # Every case runs as a true `-n` dry run with scratch OBJ_ROOT=/BIN_ROOT=
 # (never the real obj/bin of any of the three trees) -- belt-and-braces:
@@ -2011,79 +1869,64 @@ mkscratch sp18
 # Runs `env <VAR=value>... make -C <dir> -e -n BACKEND=kiss OBJ_ROOT=/
 # BIN_ROOT= (fresh scratch dirs, one pair per case) <target>`.
 #
-# P2 FIX (this task -- tightened from the prior round's version): the ONLY
-# passing condition is make exiting NONZERO with the captured log containing
-# the literal string "cannot be overridden" -- i.e. the origin-override
-# rejection gate itself actually fired. Every other outcome is a FAIL:
+# The ONLY passing condition is make exiting NONZERO with the captured log
+# containing the literal string "cannot be overridden" -- i.e. the
+# origin-override rejection gate itself actually fired. Every other outcome is
+# a FAIL:
 #
-#   - make exits 0 -- ALWAYS a FAIL now, regardless of whether <needle>
-#     happens to appear in the printed dry-run output. The PRIOR version of
-#     this helper treated "make succeeded, but <needle> is absent from the
-#     printed output" as an accepted PASS ("no bypass observed") -- a review
-#     correctly flagged that as a false-assurance mechanism: absence of the
-#     poison string from ONE PARTICULAR dry run's output is not proof the
-#     override was rejected. It can be legitimately absent for a reason that
-#     has NOTHING to do with the origin-rejection gate -- e.g. the
-#     target/backend combination this case dry-runs never prints a compile
-#     recipe line that references the poisoned variable at all. CONFIRMED
-#     live for pipelines specifically: neither CPPFLAGS nor CXXFLAGS is ever
-#     consumed by an actual compile recipe in pipelines/Makefile (CXXFLAGS
-#     because this repo has no C++ TU of its own; CPPFLAGS because every
-#     compile recipe references $(CFLAGS)/$(LIB_CFLAGS) only -- both
-#     variables are folded ONLY into the internal FP_INPUT_FLAGS conflict
-#     check, never appended to a line this Makefile ever prints) -- meaning
-#     a `make -n all` dry run against a Makefile whose origin-rejection gate
-#     had been entirely REMOVED would still never print
-#     "-DSP18_POISON" anywhere for the CXXFLAGS/CPPFLAGS cases, and the prior
-#     mode=absent path would have rubber-stamped a PASS purely from that
-#     absence -- with the gate doing nothing at all. Because the
-#     origin-rejection foreach is a PARSE-TIME check (runs unconditionally
-#     while GNU Make reads the makefile, before any target is even looked
-#     up -- see that foreach's own comment in each Makefile), it fires (or
-#     doesn't) completely independently of whether the poisoned variable
-#     ever reaches a printed recipe line for the target under test. Gating
-#     PASS/FAIL on that parse-time outcome alone, rather than on a
-#     downstream grep, is therefore both necessary AND sufficient: it is
-#     meaningful for EVERY case below, including the CXXFLAGS/CPPFLAGS ones,
-#     purely from this helper's own fix -- no CASE needs to be retargeted at
-#     a TU that actually consumes CXXFLAGS/CPPFLAGS on a compile line.
+#   - make exits 0 -- ALWAYS a FAIL, regardless of whether <needle> appears in
+#     the printed dry-run output. Absence of the poison string from ONE
+#     particular dry run's output is not proof the override was rejected: it
+#     can be absent for a reason that has nothing to do with the
+#     origin-rejection gate -- e.g. the target/backend combination this case
+#     dry-runs never prints a compile recipe line that references the poisoned
+#     variable at all. For pipelines specifically, neither CPPFLAGS nor
+#     CXXFLAGS is ever consumed by an actual compile recipe in
+#     pipelines/Makefile (CXXFLAGS because this repo has no C++ TU of its own;
+#     CPPFLAGS because every compile recipe references $(CFLAGS)/$(LIB_CFLAGS)
+#     only -- both variables are folded ONLY into the internal FP_INPUT_FLAGS
+#     conflict check, never appended to a line this Makefile ever prints), so a
+#     `make -n all` dry run against a Makefile whose origin-rejection gate had
+#     been entirely removed would never print "-DSP18_POISON" for the
+#     CXXFLAGS/CPPFLAGS cases. Because the origin-rejection foreach is a
+#     PARSE-TIME check (runs unconditionally while GNU Make reads the makefile,
+#     before any target is even looked up -- see that foreach's own comment in
+#     each Makefile), it fires (or doesn't) completely independently of whether
+#     the poisoned variable ever reaches a printed recipe line for the target
+#     under test. Gating PASS/FAIL on that parse-time outcome alone, rather
+#     than on a downstream grep, is therefore both necessary AND sufficient: it
+#     is meaningful for EVERY case below, including the CXXFLAGS/CPPFLAGS ones.
 #   - make exits nonzero WITHOUT "cannot be overridden" in the log (e.g. some
-#     other, unrelated fresh error) -- FAIL: the expected rejection message
-#     never appeared, so a nonzero exit alone is not evidence the
-#     origin-rejection gate is what stopped it.
+#     other, unrelated error) -- FAIL: the expected rejection message never
+#     appeared, so a nonzero exit alone is not evidence the origin-rejection
+#     gate is what stopped it.
 #
-# The dry-run grep-for-poison / grep-for-pinned-flag check is KEPT, but ONLY
-# ever as an EXTRA, non-authoritative diagnostic line printed alongside a
-# FAIL -- it can no longer turn a non-rejection into a PASS.
+# The dry-run grep-for-poison / grep-for-pinned-flag check is only an EXTRA,
+# non-authoritative diagnostic line printed alongside a FAIL -- it cannot turn
+# a non-rejection into a PASS.
 #
-# SEPARATE finding from proving the above (broken-gate rehearsal, this task):
-# pipelines' own three-producer dispatch means `target=all` genuinely
-# SHELLS OUT to audio_common + the lib/aec/lib/nr SUBMODULES via a
-# "+@...$(MAKE)..." recipe line that runs for real even under `-n` (by
-# design -- see pipelines/Makefile's own dispatch comment). `env VAR=...`
-# is inherited by every one of those child `make` processes, so if ONLY
-# pipelines' own origin-rejection gate were disabled (audio_common's/the
-# submodules' own gates left intact), a pipelines case run with
-# `target=all` would still print "cannot be overridden" -- from a
-# DIFFERENT Makefile's still-working gate reached via that dispatch, not
-# from pipelines' own (broken) one -- and this helper would report a PASS
-# that is not actually attributable to pipelines/Makefile at all
-# (confirmed empirically against a scratch clone with ONLY pipelines'
-# gate disabled: `target=all` cases kept reporting "cannot be overridden",
-# sourced from audio_common's Makefile, even though pipelines' own gate
-# was doing nothing). AC_LIB=/AEC_LIB=/NR_LIB= below, forced to dummy
-# non-empty values on every call (harmless for the lib/aec (primary)/
-# lib/nr (primary) cases too -- those Makefiles have no AEC_LIB/NR_LIB
-# variables of their own, and their own `lib` target already needs no
-# producer archive), make every SP-S18 case here skip the two-phase
-# producer-resolution dispatch entirely (see pipelines/Makefile's own
-# query-target comment: passing AC_LIB/AEC_LIB/NR_LIB "skips the query
-# sub-makes") -- so no case below ever shells out to a DIFFERENT
-# Makefile, and a PASS can only ever come from the ONE Makefile named by
-# `<dir>`'s own origin-rejection gate. This is also why the pipelines-
-# specific cases further below target `libaudio_pipeline.a` (a real rule
-# that "needs only THIS repo's own object... never shells out to any of
-# the three producers" per that target's own comment) rather than `all`.
+# Dispatch isolation: pipelines' own three-producer dispatch means `target=all`
+# genuinely SHELLS OUT to audio_common + the lib/aec/lib/nr SUBMODULES via a
+# "+@...$(MAKE)..." recipe line that runs for real even under `-n` (by design
+# -- see pipelines/Makefile's own dispatch comment). `env VAR=...` is inherited
+# by every one of those child `make` processes, so if ONLY pipelines' own
+# origin-rejection gate were disabled (audio_common's/the submodules' own gates
+# left intact), a pipelines case run with `target=all` would still print
+# "cannot be overridden" -- from a DIFFERENT Makefile's still-working gate
+# reached via that dispatch, not from pipelines' own -- and this helper would
+# report a PASS that is not attributable to pipelines/Makefile at all.
+# AC_LIB=/AEC_LIB=/NR_LIB= below, forced to dummy non-empty values on every
+# call (harmless for the lib/aec (primary)/lib/nr (primary) cases too -- those
+# Makefiles have no AEC_LIB/NR_LIB variables of their own, and their own `lib`
+# target already needs no producer archive), make every SP-S18 case here skip
+# the two-phase producer-resolution dispatch entirely (see pipelines/Makefile's
+# own query-target comment: passing AC_LIB/AEC_LIB/NR_LIB "skips the query
+# sub-makes") -- so no case below ever shells out to a DIFFERENT Makefile, and
+# a PASS can only ever come from the ONE Makefile named by `<dir>`'s own
+# origin-rejection gate. This is also why the pipelines-specific cases further
+# below target `libaudio_pipeline.a` (a real rule that "needs only THIS repo's
+# own object... never shells out to any of the three producers" per that
+# target's own comment) rather than `all`.
 SP18_COUNTER=0
 assert_make_e_rejected() {
   local desc="$1" dir="$2" target="$3" mode="$4" needle="$5" log
@@ -2211,13 +2054,12 @@ REAL_DIST_NRR6_AFTER="$(real_dist_sentinel "$NR_R6_DIR")"
 [ "$REAL_DIST_NRR6_BEFORE" = "$REAL_DIST_NRR6_AFTER" ] && pass "integrity (bonus): real PRIMARY NR repo dist sentinel unchanged" \
   || fail "integrity (bonus): real PRIMARY NR repo dist sentinel CHANGED during this run"
 
-# regression review P3: final-guard re-check against the snapshot taken in SP1
-# (right after this suite's LAST intentional real-tree build). Every file
-# that existed then, across all FOUR trees (pipelines, lib/aec, lib/nr,
-# audio_common), must still be sha+mtime identical now; a directory created
-# after the snapshot is allowed but reported (WARN/INFO -- after the SP-S12
-# fix there should be none), while a NEW file inside an already-snapshotted
-# directory is a hard FAIL.
+# Final-guard re-check against the snapshot taken in SP1 (right after this
+# suite's LAST intentional real-tree build). Every file that existed then,
+# across all FOUR trees (pipelines, lib/aec, lib/nr, audio_common), must still
+# be sha+mtime identical now; a directory created after the snapshot is allowed
+# but reported (WARN/INFO -- there should be none), while a NEW file inside an
+# already-snapshotted directory is a HARD FAIL.
 FINAL_GUARD_DIRS_AFTER="$(final_guard_dirs)"
 FINAL_GUARD_SNAPSHOT_AFTER="$(final_guard_snapshot)"
 

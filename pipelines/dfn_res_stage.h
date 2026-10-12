@@ -22,7 +22,7 @@
  * deep-filter taps fitted on A apply to B without a phase mismatch. With the
  * fill on, the additive comfort noise perturbs P's phase exactly in the
  * RES-cut bins where it is largest, and the deep filter's estimate/apply
- * consistency no longer holds there (the ERB mask, being real, is far less
+ * consistency does not hold there (the ERB mask, being real, is far less
  * sensitive). Both hosting pipelines therefore keep the fill OFF by default
  * and expose it only as a product A/B switch; when it is on it travels
  * through the model like every other component of P, and atten_lim_db
