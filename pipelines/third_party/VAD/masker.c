@@ -15,10 +15,8 @@
  * k/2 >= k - c, i.e. c >= k - k/2. (⚠ NOT `c > k/2` -- the two agree only
  * for odd k, and k is caller-supplied.)
  *
- * This replaced a qsort() with a function-pointer comparator run once per
- * frequency bin per frame, plus the scratch window it sorted in -- which in
- * turn had been malloc()'d and free()'d per frame. Output is unchanged; the
- * masker digest is identical before and after.
+ * A qsort() with a function-pointer comparator per frequency bin per frame
+ * (plus a scratch window) would give the same output at a much higher cost.
  */
 static void median_filter_1d(const int* in, int* out, int F, int k)
 {
@@ -206,9 +204,8 @@ void masker_step(MaskEstimator* m,
     sk_linear_to_db_f32(m->energy_frame, m->power_frame, m->F);
 
     /* ===== noise-floor tracking =====
-     * Whole-array, where it used to be interleaved with the threshold compare
-     * below. noise_floor[f] depends only on bin f, so hoisting it changes
-     * nothing -- verified by digest against the pre-kernel implementation. */
+     * Whole-array, separate from the threshold compare below: noise_floor[f]
+     * depends only on bin f, so the two passes are independent. */
     if (!m->initialized) {
         memcpy(m->noise_floor, m->energy_frame,
                (size_t)m->F * sizeof(float));

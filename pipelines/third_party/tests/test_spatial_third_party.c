@@ -5,8 +5,8 @@
  * Keeps this arithmetic outside the 4AEC wrapper tests: dispatch must match
  * scalar PHAT, cached SRP must select the scalar golden angle, exported GSC
  * weights must reconstruct the mono spectrum, the VAD's caller-pool path must
- * agree with its heap path bin for bin, and the gain modules must still
- * produce the bytes their pre-kernel formulations did.
+ * agree with its heap path bin for bin, and the gain modules must
+ * produce the bytes of their reference formulations.
  */
 
 #include <math.h>
@@ -283,8 +283,7 @@ static int test_srp_precompute_equivalence(void) {
  * second srp_init() after srp_destroy() releases the first instance (a
  * no-op on the pool path -- srp_destroy() only frees owned_heap). Also
  * exercises srp_get_mem_size()'s config validation directly (M<=1, F<=1,
- * num_angles<=0 -- the union of every check the old srp_create() used to
- * make). */
+ * num_angles<=0 -- the union of the config checks). */
 static int test_srp_init_pool_poison_and_bounds(void) {
     enum { EXTRA = 32 };
     SRP_Config cfg;
@@ -404,12 +403,12 @@ static int test_srp_init_pool_poison_and_bounds(void) {
  * doa_step()'s raw/smoothed DOA output and the per-bin S_theta/bin_best_idx
  * state srp() populates. Also spot-checks a handful of a_array[a][m]
  * entries directly against srp_build_steering()'s own output --
- * srp_build_steering() (steering.c) is still a standalone heap utility, no
- * longer called by either constructor under test here, so this is an
- * independent cross-check of the pool-carve inline fill formula in
- * srp_init() against the original formula, not the carve step checking
- * itself. This is the single highest-risk place for a silent bug now that
- * the steering formula exists in two separately-maintained places. */
+ * srp_build_steering() (steering.c) is a standalone heap utility that
+ * neither constructor under test calls, so this is an independent
+ * cross-check of the pool-carve inline fill formula in srp_init() against
+ * the reference formula, not the carve step checking itself. This is the
+ * single highest-risk place for a silent bug, since the steering formula
+ * exists in two separately-maintained places. */
 static int test_srp_heap_vs_pool_byte_equal(void) {
     enum { M = 4, F = 65, NUM_ANGLES = 72, FRAMES = 40 };
     SRP_Config cfg;
@@ -728,7 +727,7 @@ static int test_gsc_long_run_hermitian_and_finite(void) {
     return 1;
 }
 
-/* Regression test: gsc_create() forces the actual RLS update
+/* Test: gsc_create() forces the actual RLS update
  * cadence (g->adapt_interval) to 1 whenever enable_fix_mode &&
  * fixed_align_notebook, regardless of the caller's requested adapt_interval
  * -- kept for baseline-matching against the reference notebook. Any external
@@ -736,7 +735,7 @@ static int test_gsc_long_run_hermitian_and_finite(void) {
  * retiming lambda for a slower wall-clock update period) MUST derive it via
  * the same gsc_effective_adapt_interval() gsc_create() uses internally
  * instead of re-deriving the forcing rule, so the two can never silently
- * diverge again. This test creates real GSC instances across representative
+ * diverge. This test creates real GSC instances across representative
  * (enable_fix_mode, fixed_align_notebook, adapt_interval) combinations and
  * confirms gsc_create()'s actual resulting cadence always matches what
  * gsc_effective_adapt_interval() predicts for those same inputs. */
@@ -1279,7 +1278,7 @@ static int test_gsc_rls_dispatch_matches_scalar_state(void) {
 
 /* frame_idx must not lose precision or wrap once it exceeds what a 32-bit
  * signed int could hold (~2^31, ~199-265 days at typical hop rates) --
- * poke it to just past that old boundary and confirm one hop increments it
+ * poke it to just past that boundary and confirm one hop increments it
  * exactly by one, not silently truncating/wrapping to something smaller or
  * negative. */
 static int test_gsc_frame_idx_survives_32bit_boundary(void) {
@@ -1324,9 +1323,8 @@ static int test_gsc_frame_idx_survives_32bit_boundary(void) {
     return 1;
 }
 
-/* SRP's frame_counter has the same overflow class of issue GSC's frame_idx
- * had (see test_gsc_frame_idx_survives_32bit_boundary) -- verify the same
- * fix here. */
+/* SRP's frame_counter has the same overflow class as GSC's frame_idx
+ * (see test_gsc_frame_idx_survives_32bit_boundary) -- verify it likewise. */
 static int test_srp_frame_counter_survives_32bit_boundary(void) {
     SRP_Config srp_cfg;
     SRP* srp_handle;
@@ -1602,9 +1600,8 @@ static int test_vad_api_heap_vs_pool_identical(void) {
 
 /* ===================== gain library ===================== */
 
-/* Verbatim transcription of fix_gain_process()'s fused scale-and-clip loop as
- * it stood before the clip moved to sk_clip_f32. The module must still produce
- * these exact bytes. */
+/* Verbatim transcription of a fused scale-and-clip loop, the reference for
+ * fix_gain_process(). The module must produce these exact bytes. */
 static void fix_gain_fused_reference(float* x, int n, float gain,
                                      int do_clip, float lim) {
     int i;
@@ -1865,14 +1862,14 @@ static int test_nr_gain_pool_and_smoother_reference(void) {
     return 1;
 }
 
-/* ---------- post_gain: the pre-kernel formulation, transcribed ----------
+/* ---------- post_gain: the straightforward formulation, transcribed ----------
  *
- * An independent re-implementation of post_gain_apply() as it stood before
- * the per-bin clamps were hoisted and the stage-5 clip/apply moved to
- * sk_clip_f32/sk_capply_gain_f32: per-bin clamp of a frame-constant gain, a
- * copy of the caller's mask even when relaxation is off, and one fused
- * smooth-clamp-apply loop. Byte-equality against this is what makes the
- * restructure a refactor rather than a retune. */
+ * An independent re-implementation of post_gain_apply() without the
+ * hoisted per-bin clamps or the sk_clip_f32/sk_capply_gain_f32 stage-5
+ * clip/apply: per-bin clamp of a frame-constant gain, a copy of the
+ * caller's mask even when relaxation is off, and one fused
+ * smooth-clamp-apply loop. Byte-equality against this shows the module's
+ * restructured form computes the same values. */
 typedef struct {
     int F;
     float* prev_gain;
@@ -1892,11 +1889,11 @@ typedef struct {
 } PgRef;
 
 /* pg_ref_angle_near and pg_ref_angle_to_index are transcribed UNCHANGED from
- * the module: the directional decision was not part of the restructure, so
- * these two are a mirror, not a gate -- a bug in the module's angle maths
- * would be copied here and compare equal. What this reference does gate is
- * every stage that did change: the mask-relaxation branch, the hoisted
- * clamps, the split box filter and the fused smooth-clamp-apply. */
+ * the module, so these two are a mirror, not a gate -- a bug in the
+ * module's angle maths would be copied here and compare equal. What this
+ * reference does gate is every other stage: the mask-relaxation branch,
+ * the hoisted clamps, the split box filter and the fused
+ * smooth-clamp-apply. */
 static int pg_ref_angle_near(int a, int b, int num_angles, int tol) {
     int d;
     if (a < 0 || b < 0) return 0;
@@ -2166,7 +2163,7 @@ static int post_gain_drive_case(int relax, int freq_smooth,
               "shaped spectrum must be byte-identical to the reference");
         CHECK(memcmp(Y_pool, Y_ref, (size_t)F * sizeof(Complex)) == 0,
               "pool instance must be byte-identical to the reference");
-        /* target_gain and freq_gain are internal to the module now; they
+        /* target_gain and freq_gain are internal to the module; they
          * both feed prev_gain, which is public and compared here, and the
          * shaped spectrum above. */
         heap_gain = post_gain_get_gain(heap);

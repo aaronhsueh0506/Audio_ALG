@@ -134,12 +134,12 @@ void fix_gain_process(FixGain* fg, float* x, int n, int ch)
     sk_scale_f32(x, x, fg->gain[ch], n);
 
     /* Separate pass rather than a fused scale-and-clip loop, so both halves
-     * go through the shared kernels. Each sample is still exactly
-     * clip(x[i] * gain), so the values are unchanged from the fused form.
-     * sk_clip_f32 tests the LOW bound first where this module used to test
-     * the high bound; clip_value is normalised to > 0 at construction, so
-     * -clip < +clip always holds and the two orders select the same result
-     * for every input (a NaN fails both compares either way). */
+     * go through the shared kernels. Each sample is exactly
+     * clip(x[i] * gain), the same values a fused loop gives.
+     * sk_clip_f32 tests the LOW bound first; clip_value is normalised to > 0
+     * at construction, so -clip < +clip always holds and testing the high
+     * bound first would select the same result for every input (a NaN fails
+     * both compares either way). */
     if (fg->enable_clip)
         sk_clip_f32(x, -fg->clip_value, fg->clip_value, n);
 }

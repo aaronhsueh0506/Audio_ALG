@@ -13,7 +13,7 @@ extern "C" {
  * The tuning lives in a struct this module owns rather than in an
  * application-wide runtime-config header, so the archive builds standalone
  * exactly like FixGainConfig and PostGainConfig next to it. README.md carries
- * the field-by-field mapping for integrators migrating from the original.
+ * the field-by-field mapping from the application runtime-config header.
  *
  * The config is taken per call, not at construction, so retuning between hops
  * needs no rebuild -- and `nr_enable` is live state rather than tuning, so a

@@ -50,12 +50,11 @@ static void* pool_carve(PoolCursor* cursor, size_t count,
     return out;
 }
 
-/* Config-only validation shared by srp_get_mem_size() and srp_init() --
- * union of every check the old srp_create() made itself (M>1, F>1 -- note
- * strictly greater than 1, not 0 -- num_angles>0, finite/positive sr/NFFT,
- * finite low_freq/high_freq) plus the finite/positive `c` check
- * srp_build_steering() used to make (c is a plain cfg field, so it can be
- * checked here without needing a live ArrayGeometry). */
+/* Config-only validation shared by srp_get_mem_size() and srp_init():
+ * M>1, F>1 (note strictly greater than 1, not 0), num_angles>0,
+ * finite/positive sr/NFFT, finite low_freq/high_freq, and a finite/positive
+ * `c` (a plain cfg field, so it can be checked here without needing a live
+ * ArrayGeometry). */
 static int srp_validate_config(const SRP_Config* cfg) {
     if (!cfg) return 0;
     if (cfg->M <= 1 || cfg->F <= 1 || cfg->num_angles <= 0) return 0;
@@ -66,8 +65,7 @@ static int srp_validate_config(const SRP_Config* cfg) {
     return 1;
 }
 
-/* Geometry cross-check srp_build_steering() used to make (geom->M must
- * match cfg->M, x/y must be non-NULL). Only srp_init() can run this --
+/* Geometry cross-check (geom->M must match cfg->M, x/y must be non-NULL). Only srp_init() can run this --
  * srp_get_mem_size() takes no ArrayGeometry, since the byte total never
  * depends on geometry values, only on cfg's M/F/num_angles. */
 static int srp_validate_geometry(const SRP_Config* cfg,
@@ -91,11 +89,9 @@ size_t srp_get_mem_size(const SRP_Config* cfg) {
     f = (size_t)cfg->F;
 #if SRP_USE_UNIQUE_PAIRS
     /* M is validated >1 above, so num_pairs = M*(M-1)/2 >= 1. Promote to
-     * size_t before multiplying (unlike the original int-typed
-     * `M * (M - 1) / 2` in srp_init_pair_precompute) purely to keep this
-     * arithmetic in the same checked-size domain as everything else below;
-     * M is a microphone count and never large enough in practice for the
-     * two forms to differ. */
+     * size_t before multiplying purely to keep this arithmetic in the same
+     * checked-size domain as everything else below; M is a microphone count
+     * and never large enough in practice for an int product to overflow. */
     num_pairs = ((size_t)cfg->M * (size_t)(cfg->M - 1)) / 2;
 #endif
 
@@ -649,8 +645,6 @@ void srp_destroy(SRP* s)
 
     /* Pool path (owned_heap == NULL): the caller owns the pool, nothing to
      * free. Heap path: one free() releases the whole posix_memalign'd
-     * block srp_create_from_geometry() carved everything out of --
-     * replacing the long nested per-array free loops the heap-owning
-     * srp_create()/srp_build_steering() combination used to require. */
+     * block srp_create_from_geometry() carved everything out of. */
     if (s->owned_heap) free(s->owned_heap);
 }

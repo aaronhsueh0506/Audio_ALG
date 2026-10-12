@@ -90,11 +90,9 @@ static int post_gain_angle_to_index(float doa_rad, int num_angles)
  *
  * Bump allocator carving this module's flat pool into typed sub-blocks.
  * File-private because that is this directory's convention -- masker.c,
- * vad_api.c, gsc.c and srp.c each carry their own copy. Consolidating all of
- * them next to ck_field_size() in audio_common's mem_align.h (which already
- * shares the sizing half of the same lockstep pair) is the right fix, but it
- * is a sweep across every consumer, not something to start from one new
- * module.
+ * vad_api.c, gsc.c and srp.c each carry their own copy; the sizing half of
+ * the same lockstep pair is shared as ck_field_size() in audio_common's
+ * mem_align.h.
  */
 typedef struct PoolCursor {
     uint8_t* ptr;
@@ -381,7 +379,7 @@ void post_gain_apply(PostGainState* st,
      * `&` and not `&&`: both operands are already 0/1, so the result is
      * identical, but the short-circuit form makes angle_vad a per-bin branch
      * and stops the loop vectorising entirely (measured 103.0 -> 18.7
-     * ns/frame at F=257). Do not "fix" this back. */
+     * ns/frame at F=257). Keep `&`. */
     g_match    = clip_f(cfg->gain_match,    cfg->min_gain, cfg->max_gain);
     g_suppress = clip_f(cfg->gain_suppress, cfg->min_gain, cfg->max_gain);
 

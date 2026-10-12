@@ -90,8 +90,8 @@ int gsc_effective_adapt_interval(
 {
     int effective = adapt_interval > 0 ? adapt_interval : 1;
 
-    /* For fixed notebook-alignment experiments, keep the original
-     * frame-by-frame adaptive update behavior for easier baseline matching. */
+    /* In fixed notebook-alignment mode the adaptive update runs frame by
+     * frame, for baseline matching. */
     if (enable_fix_mode && fixed_align_notebook) {
         effective = 1;
     }
@@ -235,8 +235,8 @@ GSC* gsc_init(void* mem, size_t mem_size, int M, int F,
     if (MEM_SIZE_INVALID(fM) || MEM_SIZE_INVALID(mM)) return NULL;
 
     /* P (M, M, F): pointer table -> matrix-element pointer table -> flat
-     * frequency planes. This is the same per-bin identity state as the old
-     * P[F][M][M] layout, with frequency made contiguous for SIMD. */
+     * frequency planes. Per-bin identity state of logical shape
+     * P[F][M][M], stored with frequency contiguous for SIMD. */
     {
         Complex*** p_top = (Complex***)pool_carve(
             &cursor, (size_t)M, sizeof(Complex**));
@@ -261,7 +261,7 @@ GSC* gsc_init(void* mem, size_t mem_size, int M, int F,
     }
 
     /* wa (M, F): pointer table -> flat data. Already zeroed by the memset
-     * above, matching the old calloc's zero-fill. */
+     * above. */
     {
         Complex** wa_top = (Complex**)pool_carve(
             &cursor, (size_t)M, sizeof(Complex*));
@@ -764,14 +764,14 @@ static void gsc_process_with_weights_impl(
 
     /* ---------- DOA logic ---------- */
     /*
-     * Policy after SRP refactor:
+     * Policy:
      *
      * - In auto mode, doa_s is already the final smoothed + held DOA
      *   prepared by SRP/DOA logic.
-     * - GSC no longer performs its own DOA hold policy.
+     * - GSC applies no DOA hold policy of its own.
      * - If doa_s is still NAN, it means no usable DOA exists yet, so
      *   bypass to mic-0 and do not adapt.
-     * - Fixed mode remains inside GSC for baseline experiments.
+     * - Fixed mode is handled inside GSC (baseline experiments).
      * - allow_adapt_in is provided by caller, usually (vad_out == 0),
      *   so RLS adaptation updates only on non-target-speech frames.
      */

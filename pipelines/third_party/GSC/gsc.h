@@ -49,9 +49,9 @@ typedef struct {
     Complex*** a_array;
 
     /* RLS. P is stored as P[M][M][F], so four adjacent frequency bins of
-     * one matrix element are contiguous for the AArch64 NEON update. The
-     * public processing API is unchanged; this is internal state and must
-     * not be persisted or indexed by integrators. */
+     * one matrix element are contiguous for the AArch64 NEON update. This
+     * is internal state and must not be persisted or indexed by
+     * integrators. */
     Complex*** P;   // (M,M,F)
     Complex** wa;   // (M,F)
 
@@ -69,15 +69,15 @@ typedef struct {
     /* state */
     int initialized;
     int first_doa_found;
-    int64_t first_doa_frame;  /* -1 sentinel ("not found yet") preserved --
-                               * int64_t (not uint64_t) so that stays a true
-                               * negative value; still effectively unbounded
-                               * for any real frame_idx snapshot */
+    int64_t first_doa_frame;  /* -1 sentinel ("not found yet"); int64_t
+                               * (not uint64_t) so that is a true negative
+                               * value; effectively unbounded for any real
+                               * frame_idx snapshot */
     float current_doa;
-    uint64_t frame_idx;  /* was int: a per-frame monotonic counter would
-                          * overflow INT_MAX (~199-265 days at typical hop
-                          * rates); uint64_t is effectively unbounded for
-                          * any real run and avoids signed-overflow UB */
+    uint64_t frame_idx;  /* per-frame monotonic counter; a 32-bit int would
+                          * overflow at INT_MAX (~199-265 days at typical
+                          * hop rates); uint64_t is effectively unbounded
+                          * for any real run and avoids signed-overflow UB */
 
     /* log */
     float doa_used;
