@@ -481,7 +481,7 @@ if (n == 1) {
     UlcnetModelIoOutputs out;
     ulcnet_prepost_frame_inputs(p, &in, &out);   /* 指向本實例 pool 的 view */
     /* 每個 out.*_out 綁到 in 的同名位址；先讀完所有 state 輸入、才寫輸出。
-     * （DFN2 的 runtime 寫自己的 tensor，再用 inherit 複製回 state，見下。） */
+     * （DFN2、GTCRN 同樣就地綁定。） */
     if (accelerator_run(&in, &out) != 0 ||
         ulcnet_prepost_frame_commit(p) != 0)
         ulcnet_prepost_frame_skip(p);            /* 保住 framing 節奏 */
@@ -511,15 +511,14 @@ ulcnet_prepost_post_process(p, out_hop, &written);
     （位移在 graph 內），CPU 不搬、不複製。commit／validate 被拒時無法回滾：遞迴 state 從零重來、state generation 加一；
     回報失敗的 runtime 視為沒有寫入。
   - **RNNoise-ERB（複製路徑）**：runtime 把 `h1_out`／`h2_out`／`h3_out` 寫進自己擁有的 tensor，host 呼叫
-    `rnnoise_model_state_inherit()` 複製進 state。inherit 是**先檢查再複製**：
-    任何將被複製的 tensor 有非有限值，就一個都不複製、回 `-1`、state 與原來逐位元相同，
-    回呼回傳非 0、類別取 `_frame_skip()`，這一幀被跳過。指標等於目的位址的 tensor 視為已就地寫入，
-    不複製也不由 inherit 檢查，所以同一個呼叫兩種綁定都適用。
-  - 複製路徑的模型也可就地綁定（把每個 `*_next` 綁到輸入位址、省略 inherit）；做法與上面相同。
+    `rnnoise_model_state_inherit()` 複製進 state。inherit 是**先檢查再複製**：任何一處非有限值就一個都不複製、回 `-1`、
+    state 與原來逐位元相同，這一幀視為失敗。指標等於目的位址的 tensor 視為已就地寫入，不複製也不由 inherit 檢查，
+    所以同一個呼叫兩種綁定都適用。
   非有限值以外的「寫一半／混寫」都偵測不到。
-- **state generation（Align-ULCNet、DeepVQE-S）**：`ulcnet_model_io_state_generation()`、
+- **state generation（Align-ULCNet、DeepVQE-S、DFN2、GTCRN）**：`ulcnet_model_io_state_generation()`、
   `ulcnet_prepost_state_generation()`、`ulcnet_accelerator_adapter_state_generation()`、
-  `deepvqe_prepost_state_generation()` 回傳 C 端把 state 清零的次數：`_reset()` 與被拒絕的 `_frame_commit()` 各加一，
+  `deepvqe_prepost_state_generation()`、`dfn2_prepost_state_generation()`、`dfn2_model_io_state_generation()`、
+  `gtcrn_model_state_generation()` 回傳 C 端把 state 清零的次數：`_reset()` 與被拒絕的 `_frame_commit()` 各加一，
   新建實例為 0，成功的 commit、`_frame_skip()` 與再次呼叫被拒的 commit 都不動它；`NULL` 回 0，數值回繞於 2^32。
   定點 accelerator 的 state 緩衝在 C 清零時不會跟著變，板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。
 - **Align-ULCNet 的四個 state**（`key_history`／`value_history`／`logit_history`／`h_gru`
@@ -541,7 +540,7 @@ ulcnet_prepost_post_process(p, out_hop, &written);
 | `_pre_process` / `_pre_process_freq` | 與實例的 `io_mode` 不符 | `-1` |
 | `_frame_inputs` / `_frame_commit` / `_frame_skip` | 沒有開啟中的 frame | `-1` |
 | `_frame_commit` | 沒有 `_frame_inputs()` 在前面 | `-1`，狀態不動 |
-| `dfn2_*_inherit` 等複製路徑 | 任何將被複製的 tensor 非有限、NULL、缺 tensor 或元素數不符 | `-1`，不複製任何東西，state 逐位元不變 |
+| `rnnoise_model_state_inherit` | 任何將被複製的 tensor 非有限、NULL、缺 tensor 或元素數不符 | `-1`，不複製任何東西，state 逐位元不變 |
 | `dfn2_prepost_set_erb_matrices` / `_set_atten_lim` | frame 開著 | `-1` |
 
 ### 6.3 skip 政策：三個模型不一樣

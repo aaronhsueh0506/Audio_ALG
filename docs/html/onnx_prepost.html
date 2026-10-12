@@ -127,7 +127,7 @@ Align-ULCNet 與 DeepVQE-S <b>從 hop 0 起恆為 1</b>；DFN2 在<b>第一個 h
 （heads：<code>output</code>／<code>taps</code>／<code>erb_mask</code>／<code>coefs</code>／<code>alpha</code>，
 Align-ULCNet 的 <code>output</code>）<b>預填 NaN</b>，
 state 不預填。<code>frame_commit</code> 是<b>純驗證</b>：heads 與 state 都有限才成功，之後 CCM ring／compose／
-synthesis 照常前進，commit 本身不複製任何 state。複製發生在 commit 之前、由 inherit 做（見下一段）。
+synthesis 照常前進，commit 本身不複製任何 state。只有 RNNoise-ERB 還有複製路徑，複製發生在 commit 之前、由 inherit 做（見下一段）。
 兩條綁定路徑的失敗語意不同。<b>複製路徑</b>：inherit 先檢查所有將被複製的 tensor，任何非有限值就一個都不複製、
 回 −1、state 與原來逐位元相同，呼叫端回報該次推論失敗、取 <code>frame_skip</code>，這一幀被跳過。
 <b>就地路徑</b>：state 已被加速器覆寫、<b>無法回滾</b>，commit 遇到任何一處非有限值時<b>所有遞迴 state 歸零</b>（冷啟動）、
@@ -145,7 +145,7 @@ framing／CCM ring 不前進、幀維持開啟、回 −1
 graph 回每個 state 的<b>完整下一個 window</b>，shape 與輸入完全相同：位移在 graph 內，用輸入端的 Slice 切掉一幀、
 再把新一幀 Concat 上去（time-ordered window 取 frame <code>1..N−1</code> 再接在後面；newest-first 的 K/V 與 attention ring 取 slot <code>0..D−2</code> 再接在前面），
 Concat 的結果就是輸出，沒有 state 輸出由 Slice 產生；被丟掉的那一格只讓輸入與輸出 shape 相同。
-匯出時 <code>validate_inplace_state_contract</code> 逐檔檢查這個結構，metadata 帶 <code>state_binding = in_place_same_address</code>。
+匯出時 <code>validate_inplace_state_graph</code>（<code>AINR/onnx_streaming_contract.py</code>，AIAEC 匯出器經 <code>validate_inplace_state_contract</code> 呼叫同一份實作）逐檔檢查這個結構，metadata 帶 <code>state_binding = in_place_same_address</code>。
 host 沒有 ring helper，commit 的有限性檢查只看 graph 這一幀新寫的那一格（K/V／attention ring 的 slot 0、conv／score／logit window 的最後一幀）、
 head 與 <code>h_gru</code> 全部，較舊的格子不重查。</p>
 <p>RNNoise-ERB 仍是複製路徑：runtime 把 <code>h1_out</code>／<code>h2_out</code>／<code>h3_out</code> 寫進自己的 tensor，host 呼叫 <code>rnnoise_model_state_inherit</code>，
@@ -153,7 +153,7 @@ head 與 <code>h_gru</code> 全部，較舊的格子不重查。</p>
 <p><b>state generation</b>：<code>ulcnet_model_io_state_generation()</code>、<code>ulcnet_prepost_state_generation()</code>、
 <code>ulcnet_accelerator_adapter_state_generation()</code>、<code>deepvqe_prepost_state_generation()</code>、
 <code>dfn2_prepost_state_generation()</code>、<code>dfn2_model_io_state_generation()</code>、<code>gtcrn_model_state_generation()</code> 數 C 端把 state 清零的次數
-（<code>reset</code> 與被拒絕的 commit 各加一，新建實例為 0）。定點 accelerator 的 state 緩衝在 C 清零時不會跟著變，
+（<code>reset</code> 與被拒絕的 commit 各加一）。定點 accelerator 的 state 緩衝在 C 清零時不會跟著變，
 板端 sample 比較這個值，變了就用量化後的 0 重填 state 輸入。RNNoise-ERB 的 state 綁定見它自己的頁面。</p>
 
 <p><b>生命週期</b>兩條（<code>audio_common/include/fft_wrapper.h</code>「Static memory support」）：
