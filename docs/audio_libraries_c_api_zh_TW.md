@@ -676,22 +676,22 @@ int  dfn2_prepost_output_frame_index(const DFN2Prepost *p, long long *frame);
 
 ### 6.7 Pool 大小
 
-以現行 build 量得，供規劃用；產品一律以 resolved config 呼叫 `_get_mem_size()`，
+以現行 build 量得（NEON 開關不影響數字），供規劃用；產品一律以 resolved config 呼叫 `_get_mem_size()`，
 **不要把這裡的數字寫死**（§7 規則同樣適用）。單位 bytes。
 
 | 類別 / grid | D | `*_IO_TIME` | `*_IO_FREQ` |
 |---|---:|---:|---:|
-| Align-ULCNet 16 kHz | 4 | 60,528 | 38,928 |
-| Align-ULCNet 16 kHz | 8 | 89,200 | 67,600 |
-| Align-ULCNet 16 kHz | 16 | 146,544 | 124,944 |
-| Align-ULCNet 16 kHz | 32 | 261,232 | 239,632 |
-| Align-ULCNet 16 kHz | 64 | 490,608 | 469,008 |
-| Align-ULCNet 48 kHz | 4 | 116,336 | 73,232 |
-| Align-ULCNet 48 kHz | 8 | 171,632 | 128,528 |
-| Align-ULCNet 48 kHz | 16 | 282,224 | 239,120 |
-| Align-ULCNet 48 kHz | 32 | 503,408 | 460,304 |
-| Align-ULCNet 48 kHz | 64 | 945,776 | 902,672 |
-| DeepVQE-S 16 kHz | 32 | 550,528 | 528,928 |
+| Align-ULCNet 16 kHz | 4 | 67,680 | 46,080 |
+| Align-ULCNet 16 kHz | 8 | 96,864 | 75,264 |
+| Align-ULCNet 16 kHz | 16 | 155,232 | 133,632 |
+| Align-ULCNet 16 kHz | 32 | 271,968 | 250,368 |
+| Align-ULCNet 16 kHz | 64 | 505,440 | 483,840 |
+| Align-ULCNet 48 kHz | 4 | 130,144 | 87,040 |
+| Align-ULCNet 48 kHz | 8 | 185,952 | 142,848 |
+| Align-ULCNet 48 kHz | 16 | 297,568 | 254,464 |
+| Align-ULCNet 48 kHz | 32 | 520,800 | 477,696 |
+| Align-ULCNet 48 kHz | 64 | 967,264 | 924,160 |
+| DeepVQE-S 16 kHz | 32 | 636,896 | 615,296 |
 | DeepFilterNet2 48 kHz | — | 237,936 | 240,016 |
 
 DeepVQE-S 的量體由 16 個 state 張量（每個一份 buffer）主宰。DeepFilterNet2 的 FREQ 反而比 TIME 大 2,080 bytes：
