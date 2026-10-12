@@ -3,6 +3,7 @@
  * expected values are written out by hand, not recomputed with the code under
  * test. */
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -294,12 +295,81 @@ static void test_stage(void) {
     free(pool2);
 }
 
+/* The prior scale is the exact reciprocal multiply of the division, for every
+ * kind of float: random bit patterns, tiny values whose scaled result is
+ * subnormal, zeros, infinities and NaN. The divisor goes through a volatile
+ * so the reference stays a real division. */
+static void test_psd_scale(void) {
+    const int sr = 16000, fft = 256, hop = 128, n = 129;
+    AnrConfig cfg = se_anr_compose_config(sr, fft, hop, ANR_MODE_BALANCED);
+    size_t bytes = se_anr_stage_mem_size(&cfg);
+    void *pool = aligned_pool(bytes);
+    AnrDenoiser *a = pool ? se_anr_stage_init(pool, bytes, &cfg) : NULL;
+    volatile float divisor = SE_PSD_SCALE;
+    Complex spec[129];
+    float r2[129], scratch[129];
+    SeSpecFrame f;
+    uint32_t seed = 987654321u;
+    int frame, k, ok = 1, ok_len = 1;
+    const uint32_t fixed[] = {0x00000000u, 0x80000000u, 0x00000001u, 0x007fffffu,
+                              0x00800000u, 0x3f800000u, 0x4e800000u, 0x7f7fffffu,
+                              0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7fc00001u,
+                              0xffa00000u, 0x30800000u, 0x30800001u, 0x0f800000u};
+
+    memset(&f, 0, sizeof f);
+    f.n_freqs = n;
+    f.e = spec;
+    f.r2 = r2;
+    CHECK(a != NULL, "psd scale: stage init");
+    if (!a) { free(pool); return; }
+    for (k = 0; k < n; ++k) { spec[k].r = 100.0f + (float)k; spec[k].i = -50.0f; }
+    for (frame = 0; frame < 4000 && ok; ++frame) {
+        for (k = 0; k < n; ++k) {
+            uint32_t bits;
+            seed = seed * 1664525u + 1013904223u;
+            bits = seed;
+            seed = seed * 1664525u + 1013904223u;
+            if ((seed >> 28) < 4u) bits = (bits & 0x807fffffu) | (((seed >> 8) % 42u) << 23);
+            else if ((seed >> 28) < 6u) bits = fixed[(seed >> 8) % (sizeof fixed / sizeof fixed[0])];
+            memcpy(&r2[k], &bits, sizeof bits);
+        }
+        f.n_freqs = n;
+        (void)se_anr_stage_gain(a, &f, scratch, 1);
+        for (k = 0; k < n; ++k) {
+            float want = r2[k] / divisor;
+            uint32_t gb, wb;
+            memcpy(&gb, &scratch[k], sizeof gb);
+            memcpy(&wb, &want, sizeof wb);
+            if (gb != wb && !(isnan(scratch[k]) && isnan(want))) ok = 0;
+        }
+        se_anr_stage_reset(a);
+    }
+    CHECK(ok, "psd scale: scratch equals r2 / SE_PSD_SCALE for every float class");
+
+    /* every length around the vector widths */
+    for (k = 0; k < n; ++k) r2[k] = (float)(k + 1) * 3.0e5f;
+    for (frame = 1; frame <= n && ok_len; ++frame) {
+        float guard = 1234.5f;
+        scratch[frame < n ? frame : n - 1] = guard;
+        f.n_freqs = frame;
+        (void)se_anr_stage_gain(a, &f, scratch, 1);
+        for (k = 0; k < frame; ++k)
+            if (scratch[k] != r2[k] / divisor) ok_len = 0;
+        if (frame < n && scratch[frame] != guard) ok_len = 0;
+        se_anr_stage_reset(a);
+    }
+    CHECK(ok_len, "psd scale: every length 1..129 converts exactly and stops at n_freqs");
+    se_anr_stage_destroy(a);
+    free(pool);
+}
+
 int main(void) {
     test_grid();
     test_derive_fields();
     test_derive_rejects();
     test_compose();
     test_stage();
+    test_psd_scale();
     if (g_fail) { printf("%d check(s) FAILED\n", g_fail); return 1; }
     printf("ALL PASS\n");
     return 0;

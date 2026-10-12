@@ -27,6 +27,9 @@ extern "C" {
 /* int16 full scale squared: the power scale AEC's residual-echo estimate shares
  * with the denoiser's input. */
 #define SE_PSD_SCALE (32768.0f * 32768.0f)
+/* Its exact reciprocal (a power of two): x / SE_PSD_SCALE equals
+ * x * SE_PSD_SCALE_INV for every float. */
+#define SE_PSD_SCALE_INV (1.0f / SE_PSD_SCALE)
 
 /* The denoiser configuration of these pipelines on a no-padding 50 % overlap
  * grid: canonical preset for `mode`, L = 150 frames of 10 ms retimed to the
