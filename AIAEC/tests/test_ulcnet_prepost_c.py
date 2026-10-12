@@ -1249,7 +1249,7 @@ def test_pool_identity_moved_with_the_full_window_carve(driver):
         carve = int(re.search(
             r'^#define\s+ULCNET_PREPOST_CARVE_VERSION\s+(\d+)u',
             stream.read(), re.MULTILINE).group(1))
-    assert carve == 5
+    assert carve == 6
     # io_mode FREQ == 0, D == 8, grid 16000 / 512 (this driver's build).
     expected = _fnv1a([16000, 512, layout, carve, 0, 8])
     previous = _fnv1a([16000, 512, 16, 4, 0, 8])

@@ -479,7 +479,7 @@ effective_frames = ceil( auto_vad_hangover_frames * sample_rate / (100 * hop_siz
 | `geometry` 與座標 | 不變 |
 
 `BACKEND=kiss`、`SIMD=1`、`delay_mode=MATCHED` 預設下的 `req.bytes`
-（本次 checkout，`layout_version=13`；最後一欄標明每一列的來源）。本輪
+（本次 checkout，`layout_version=14`；最後一欄標明每一列的來源）。本輪
 `sizeof(Aec)` 由 5832 變 5848 B，每個 AEC 實例的 pool 依 grid 各長一個常數
 （16 kHz/256 +5,664 B、16 kHz/512 +5,120 B、48 kHz +18,464 B），四路即四倍，
 每一列都跟著移動：
@@ -728,7 +728,7 @@ Config：
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `1` |
-| 4 | `layout_version` | `uint32_t` | `12` |
+| 4 | `layout_version` | `uint32_t` | `14` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（直接沿用核心層的值，永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，**已把核心層的 `build_flags_hash` 摺進去** |
 | 16 | `alignment` | `uint32_t` | `16` |

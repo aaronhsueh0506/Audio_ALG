@@ -107,57 +107,14 @@ typedef struct AudioPipeline4Ch AudioPipeline4Ch;
  * ========================================================================== */
 
 #define AUDIO_PIPELINE_4CH_DESCRIPTOR_VERSION 1u
-/* v2 passes the core's borrowed per-channel spectra directly to SRP/GSC.
- * v3 grows the self-resident core config with explicit delay mode, bank size,
- * fixed delay and pre/post selection.
- * v4 grows it again with the core's delay_backward_quarantine_enabled/_s; the
- * carve order is unchanged, but the self-resident config is, so the pool
- * total moves and a descriptor from an older build no longer sizes this one.
- * v5 carries the core's own layout 10 -> 11 (its control block gained the
- * shared-delay change admission and the realign lane counters). Nothing in
- * THIS layer's carve changed, but the core sub-pool it composes grew, so this
- * layer's total moved with it -- and build_flags_hash cannot say so, since it
- * folds in the core's carve-token hash, which a control-block-only change
- * leaves alone.
- * v6 changes GSC's internal covariance storage from P[F][M][M] to
- * P[M][M][F]. The recursive state count is unchanged, but the pointer-table
- * overhead and therefore the composed pool byte count are different.
- * (The exact totals are reported by `make print-mem-size`; they are not
- * restated here, where they would silently rot.)
- * Version 7: sizeof(Aec) grew (the suppressor gained its runtime
- * far-active floor retarget state), so every AEC carved out of this pool
- * moves the total and the offsets after it. Carve order and buffer set are
- * unchanged, so build_flags_hash does not move -- this counter is the only
- * signal.
- * Version 8 carries the core's own layout 12 -> 13 (its control block gained
- * the per-hop stage-timing record). Same shape as v5: nothing in THIS layer's
- * carve changed, the composed core sub-pool simply grew, and build_flags_hash
- * cannot say so -- it folds in the core's carve-TOKEN hash, which a
- * control-block-only change leaves alone. Bumping this counter by hand is the
- * only thing that invalidates a persisted descriptor.
- * Version 9 carries the core's own layout 13 -> 14 (sizeof(Aec) grew: each
- * lane gained its per-hop stage-timing record). Same shape again -- nothing
- * in THIS layer's carve changed, and build_flags_hash cannot see it.
- * Version 10 carries the core's own layout 14 -> 15 (its control block gained
- * the fuse stage's far-end provenance flag and the matched-filter duty-cycle
- * state and census). Same shape once more. It also carries the lib/aec pin
- * that shipped with it: sizeof(Aec) grew 5832 -> 5848 B and the per-instance
- * pool grew by a per-grid constant, so the four lanes inside the composed
- * core sub-pool move this layer's total too. Same release unit, so one bump
- * covers both -- a version-9 descriptor is refused for either reason.
- * Version 11 carries the core's layout 15 -> 16: its embedded config gained
- * enable_nr and its MMSE-LSA region can now be omitted for RES-only products.
- * This wrapper embeds that config and composes the core pool, so both its
- * control-block size and a valid sub-pool shape changed.
- * Version 12 carries the core's layout 16 -> 17: FourAecNrResConfig gained
- * enable_near_end_protect. No carve changed, so the byte count cannot say
- * so; the embedded config grew and the default post output differs, and
- * the counter is the signal.
- * Version 13 carries the core's layout 17 -> 18: FourAecNrResConfig lost
- * enable_near_end_protect and the post path its near-end floor lift. No carve
- * changed; the embedded config shrank (C ABI) and a selectable post path is
- * gone, so the counter is the only signal. The default output is unchanged. */
-#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 13u
+/* Carve layout version of this wrapper. Any change of pool size, carve order
+ * or descriptor content bumps it, including a change of the composed core's
+ * pool or layout version: build_flags_hash folds in the core's carve-token
+ * hash only, so a control-block-only change of the core leaves it unmoved and
+ * this counter is the signal. Query a fresh descriptor for every build; do not
+ * persist or synthesize one from this number. The exact totals come from
+ * `make print-mem-size`. */
+#define AUDIO_PIPELINE_4CH_LAYOUT_VERSION 14u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

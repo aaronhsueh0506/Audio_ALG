@@ -98,7 +98,7 @@ HOP/BINS/TA_BINS 由 N_FFT 導出）、<code>ulcnet_process.h</code>（四個別
 <td>host：mono 8/16/48 k、4ch 16/48 k</td>
 <td>host 自己的格點清單（mono 8k/256、16k/256 預設、16k/512、48k/1024；4ch 無 8 k）</td>
 <td rowspan="3"><b>host 留在產品取樣率，只有 DFN2 stage 在 48 k</b>：48 k host 直接餵 stage，
-其他格點由 <code>pipelines/dfn_rate_bridge.{h,c}</code>（<code>DFN_RATE_BRIDGE_LAYOUT_VERSION = 1</code>）
+其他格點由 <code>pipelines/dfn_rate_bridge.{h,c}</code>（<code>DFN_RATE_BRIDGE_LAYOUT_VERSION = 2</code>）
 做原生 WOLA → 升頻 → 48 k 分析 → stage → 48 k WOLA → 降頻。
 呼叫端<b>不</b>需要在 API 之外先 resample</td>
 <td rowspan="3"><code>pipelines/dfn_res_stage.c</code>（<code>DFN2_SR</code> / <code>DFN2_N_FFT</code>）、

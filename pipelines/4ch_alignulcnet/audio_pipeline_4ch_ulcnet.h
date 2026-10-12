@@ -162,75 +162,12 @@ enum { AUDIO_PIPELINE_4CH_ULCNET_REPRIME_FRAMES = 1 };
  * ULCNet far-analysis/synthesis states, the one-frame err/far staging and
  * the chain's shared sqrt-Hann window table live inside `self`). The one
  * carved `fft` handle serves the ULCNet chain (same compiled size; strictly
- * sequential use within a hop). Bump together with the build-flags-hash
- * token string forever after.
- * v2: self grew the one-hop far-compensation buffer + far_input_mode.
- * v3: the ULCNet chain moved onto the shared carved FftHandle (its structs
- * embed their own FFT scratch) and self grew the shared window table
- * (ulcnet_window) replacing the per-struct window copies.
- * v4 grows the self-resident core config with explicit delay controls and
- * the front-only selector.
- * v5 grows the self-resident UlcnetModel copy by the published model-I/O
- * descriptor pointer. v6 removes the obsolete runtime far-mode field.
- * v7 adds the identity-reprime counter to self.
- * v8: the self-resident core config grew the backward-quarantine delay
- * guard fields (left at their OFF defaults here), moving the self block.
- * v9 carries the core's own layout 10 -> 11 (its control block gained the
- * shared-delay change admission and the realign lane counters). Nothing in
- * THIS layer's carve changed, but the core sub-pool it composes grew, so
- * every offset after `core` and this layer's total moved with it -- and
- * build_flags_hash cannot say so, since it folds in the core's carve-token
- * hash, which a control-block-only change leaves alone.
- * v10 carries GSC's covariance layout from P[F][M][M] to P[M][M][F]. The
- * state count is unchanged, but its pointer tables and pool size moved.
- * Version 11: sizeof(Aec) grew (the suppressor gained its runtime
- * far-active floor retarget state), so every AEC carved out of this pool
- * moves the total and the offsets after it. Carve order and buffer set are
- * unchanged, so build_flags_hash does not move -- this counter is the only
- * signal.
- * Version 12 carries the core's own layout 12 -> 13 (its control block gained
- * the per-hop stage-timing record). Nothing in THIS layer's carve changed;
- * the composed front-only core sub-pool simply grew, and build_flags_hash
- * cannot say so for the same carve-token reason as v9.
- * Version 13 carries the core's own layout 13 -> 14 (sizeof(Aec) grew: each
- * lane gained its per-hop stage-timing record). Same carve-token reason.
- * Version 14 carries the core's own layout 14 -> 15 (its control block gained
- * the fuse stage's far-end provenance flag and the matched-filter duty-cycle
- * state and census). Same carve-token reason. It also carries the lib/aec pin
- * that shipped with it: sizeof(Aec) grew 5832 -> 5848 B and the per-instance
- * pool grew by a per-grid constant, so the four lanes inside the composed
- * front-only core sub-pool move this layer's total too. One release unit, one
- * bump -- a version-13 descriptor is refused for either reason. */
-/* v15: the ULCNet deployment grid became a build parameter, so the
- * build-flags-hash token no longer spells it as a literal -- it folds in
- * the stringified ULCNET_SR/ULCNET_N_FFT instead, and two builds on
- * different grids no longer share a descriptor hash. Bumped with the
- * token string, as this file's rule requires.
- * Version 16 carries the core's own layout 15 -> 16: FourAecNrResConfig
- * gained enable_nr. This wrapper embeds AudioPipeline4ChConfig by value in
- * its control block, so that struct grew 176 -> 180 B and every field after
- * it moved. The composed front-only sub-pool is unchanged -- enable_post = 0
- * already carves no NR state either way -- so the pool byte count alone
- * cannot say this happened, and a version-15 descriptor must be refused on
- * the counter. It is also a C struct-ABI change: a caller compiled against
- * the version-15 header must not be linked against this one.
- * Version 17: the GSC spectrum feeds the model directly. The beam WOLA's four
- * carves (ifft, ola, synth_win, beam_hop) are gone, and inside `self` the
- * error-branch analysis state, the two-frame staging and the one-hop far
- * buffer were replaced by one-frame err/far staging; the carve token moved
- * with it. The C API also lost audio_pipeline_4ch_ulcnet_last_beamformed_
- * error() (there is no reconstructed beam hop any more), and the timing
- * contract went from 2 hops to 1. */
-/* Version 18 carries the core's own layout 16 -> 17: FourAecNrResConfig
- * gained enable_near_end_protect and enable_res, which this wrapper rejects
- * unless 0. The front-only sub-pool is unchanged, but AudioPipeline4ChConfig is
- * embedded by value in the control block and grew, so a version-17 descriptor
- * must be refused on the counter. C struct-ABI change as well. */
-/* Version 19 carries the core's own layout 17 -> 18: FourAecNrResConfig lost
- * enable_near_end_protect. The front-only sub-pool is unchanged; the embedded
- * AudioPipeline4ChConfig shrank, so a version-18 descriptor must be refused on
- * the counter. C struct-ABI change as well. */
-#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 19u
+ * sequential use within a hop).
+ * Carve layout version: any change of pool size, carve order or descriptor
+ * content bumps it, including a change of the composed core's pool or layout
+ * version, which build_flags_hash does not see. The token string in the
+ * build-flags hash moves with a changed carve. */
+#define AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION 20u
 
 /**
  * Fixed-width descriptor for a caller-owned static-memory pool. Same 32-byte

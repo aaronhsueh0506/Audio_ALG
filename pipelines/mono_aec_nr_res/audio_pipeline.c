@@ -81,70 +81,11 @@
 #define PSD_SCALE                 SE_PSD_SCALE  /* int16^2 (Python _PSD_SCALE) */
 
 /* This file's own carve-layout version (see audio_pipeline.h's
- * AudioPipelineMemReq doc for the bump rule). Bumped 1->2: g_aec (a per-hop
- * memcpy'd duplicate of AecResContext.res_gain) was removed from the carve --
- * both call sites that used to read p->g_aec now read ctx.res_gain directly
- * (that pointer is already stable for the whole hop per aec.h's own doc).
- * Bumped 2->3 (2026-08-05): g_nr is gone the same way -- anr_get_gain()
- * already exposes the denoiser's own gain buffer with no copy, so
- * anr_process_gain() is now called with gain_out=NULL and both former
- * p->g_nr readers call anr_get_gain(p->nr, NULL) instead.
- * Bumped 3->4 (2026-08-05): mic_buf/ref_buf/out_buf are gone -- aec_process()
- * already copies mic/ref into its own buffers, so this pipeline's own copy
- * was a redundant second layer; the caller's mic/ref pointers now go
- * straight into aec_process(), and the OLA write lands directly in the
- * caller's `out` instead of an intermediate staging buffer.
- * Bumped 4->5 (2026-08-05): aec_out is gone -- its only reader was the
- * aec_only branch of audio_pipeline_process(), which immediately memcpy'd
- * it straight into the caller's own `out` buffer every hop. aec_process()'s
- * `out` parameter is not optional, and the caller's `out` is already
- * validated non-NULL and hop-sized at function entry, so that branch now
- * passes `out` to aec_process() directly -- one fewer buffer, one fewer
- * copy, same bytes in `out` either way.
- * Bumped 5->6: the self-resident AudioPipelineConfig gained independent
- * filter-length and delay-mode/bank/fixed-delay initialization fields.
- * Bumped 6->7: sizeof(Aec) grew (the suppressor gained its runtime far-active
- * floor retarget state), so the AEC carved out of this pool moves the total
- * and every offset after it. Carve order and buffer set are unchanged, so
- * build_flags_hash does not move -- this counter is the only signal.
- * Bumped 7->8: sizeof(Aec) grew again (each AEC instance gained its per-hop
- * stage-timing record -- aec_get_last_timing(), aec.h), so every AEC
- * carved out of this pool moves the total and the offsets after it. Carve
- * order and buffer set are unchanged, so build_flags_hash does not move --
- * this counter is the only signal.
- * Bumped 8->9: the control block gained the per-hop stage-timing record
- * (AudioPipelineLastTiming, 28 B -- see audio_pipeline_get_last_timing()).
- * The pool total grows by 16 B, not 28: sizeof(AudioPipeline) goes 152->176
- * and ALIGN16 of it goes 160->176, so 12 B of the record lands in slack the
- * struct already had. Measured, not derived -- `--print-mem-size` reports
- * the control block directly. Every per-module column (AEC/FFT/NR/pipeline
- * buffers) is unchanged; only the total moves. The record is present whether
- * or not the timing is compiled in, so a profile build and a release build
- * still carve byte-identical pools. Carve order and buffer set are
- * unchanged, so build_flags_hash does not move -- this counter is the only
- * signal.
- * Bumped 9->10: the lib/aec pin moved to the hop-cost revision. sizeof(Aec)
- * grew 5832 -> 5848 B and the AEC pool grew by a per-grid constant (+5,664 B
- * @16 kHz/256, +5,120 B @16 kHz/512, +18,464 B @48 kHz/1024, +2,560 B @8 kHz
- * /256), so the AEC carved out of this pool moves the total and every offset
- * after it. This layer's OWN control block moves with it, by a further 16 B:
- * AudioPipelineLastTiming embeds AecStageTiming verbatim (audio_pipeline.h
- * says why), that struct went 16 -> 20 B, and ALIGN16(sizeof(AudioPipeline))
- * had no slack left to absorb it -- 176 -> 192 B, measured through
- * `--print-mem-size`, not derived. Carve order and buffer set are unchanged,
- * so build_flags_hash does not move -- this counter is the only signal.
- * Bumped 10->11: AudioPipelineConfig gained enable_near_end_protect. No
- * carve changed, so build_flags_hash did not move; the control block crossed
- * an ALIGN16 boundary (192 -> 208 B), the config struct grew (C ABI) and a
- * second post path became selectable.
- * Bumped 11->12: AudioPipelineConfig lost enable_near_end_protect and the post
- * path its near-end floor lift. The e2 scratch that lift alone read is gone
- * from the carve (528 B at 16 kHz/256) and the control block dropped two
- * ints, which takes ALIGN16(sizeof(AudioPipeline)) from 208 back to 192 B,
- * so the carve token and the pool byte count move in every config, aec_only
- * included. The default output is unchanged (the lift was off by default);
- * the config struct shrank, a C ABI change. */
-#define AUDIO_PIPELINE_LAYOUT_VERSION 12u
+ * AudioPipelineMemReq doc). Any change of pool size, carve order or descriptor
+ * content bumps it, including a change of the composed AEC, NR or FFT pool;
+ * the carve token string in audio_pipeline_build_flags_hash() moves with a
+ * changed buffer set or order. */
+#define AUDIO_PIPELINE_LAYOUT_VERSION 13u
 
 /* Compile-time FFT backend identity. pipelines/Makefile passes
  * -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\" or \"ne10\" to match its own

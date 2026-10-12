@@ -1124,13 +1124,13 @@ static int test_pool_and_descriptor_gate(void) {
      * layout this wrapper descriptor carries. Bump this literal with
      * AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 18u;
+    stale.layout_version = 19u;
     CHECK(audio_pipeline_4ch_ulcnet_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "init_ex rejects a descriptor from the superseded layout even "
           "when its byte count exactly covers the current pool");
     CHECK(req.layout_version == AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION &&
-          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 19u,
+          AUDIO_PIPELINE_4CH_ULCNET_LAYOUT_VERSION == 20u,
           "the queried descriptor publishes the current carve layout");
 
     stat = audio_pipeline_4ch_ulcnet_init_ex(

@@ -706,13 +706,13 @@ static void test_init_ex_descriptor(void) {
     if (p_lv) audio_pipeline_destroy(p_lv);
 
     /* The literal, not a relative tamper: a carve or ABI change that forgets
-     * the bump must fail here. A persisted layout-11 descriptor is refused on
+     * the bump must fail here. A persisted layout-12 descriptor is refused on
      * the counter alone. */
-    CHECK(req.layout_version == 12u, "AudioPipelineMemReq reports layout_version 12");
+    CHECK(req.layout_version == 13u, "AudioPipelineMemReq reports layout_version 13");
     AudioPipelineMemReq stale_lv = req;
-    stale_lv.layout_version = 11u;
+    stale_lv.layout_version = 12u;
     AudioPipeline* p_stale = audio_pipeline_init_ex(pool, (size_t)req.bytes, &cfg, &stale_lv);
-    CHECK(p_stale == NULL, "audio_pipeline_init_ex refuses a persisted layout-11 descriptor");
+    CHECK(p_stale == NULL, "audio_pipeline_init_ex refuses a persisted layout-12 descriptor");
     if (p_stale) audio_pipeline_destroy(p_stale);
 
     /* Tampered backend_id: a plain wrong integer (99), never a string --

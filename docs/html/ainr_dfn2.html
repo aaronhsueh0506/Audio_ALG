@@ -187,9 +187,9 @@ ERB 特徵又是 EMA 正規化的,mask 仍看起來合理,只有輸出電平是�
 <li><b>FREQ 比 TIME 小 26,784 bytes</b>:<code>DFN2State</code> 不內嵌 analysis/window/synthesis 緩衝
 與 scratch,TIME 的 <code>AcStft</code>（16,480 B,含窗表）與 <code>AcIstft</code>（12,384 B,借用窗表）只在 TIME carve;FREQ 多 carve 雙輸入的第二組 staging
 (<code>app_re</code>/<code>app_im</code>)。io_mode 是 pool 的身分,init-time 固定,由 <code>_init_ex</code> 檢查。</li>
-<li><b><code>DFN2_PREPOST_CARVE_VERSION = 6</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
+<li><b><code>DFN2_PREPOST_CARVE_VERSION = 7</code></b>(<code>dfn2_prepost.h</code>):carve 走訪順序的版本,
 摺進 <code>build_flags_hash</code>,所以舊 carve 的 pool 會在 <b>hash</b> 被拒。
-版本 4:遞迴 state 就是 <code>DFN2ModelIOState</code> 自己的陣列,別無其他;版本 5:<code>DFN2State</code> 另帶每個 ERB band 的非零 bin 範圍;<b>版本 6:遞迴 state 是 5 列 <code>h_gru</code> 與 5 幀 pathway window(graph layout 8)</b>。</li>
+版本 4:遞迴 state 就是 <code>DFN2ModelIOState</code> 自己的陣列,別無其他;版本 5:<code>DFN2State</code> 另帶每個 ERB band 的非零 bin 範圍;<b>版本 6:遞迴 state 是 5 列 <code>h_gru</code> 與 5 幀 pathway window(graph layout 8)</b>;<b>版本 7:STFT／ISTFT 物件借用呼叫端的 <code>FftHandle</code> 與視窗表(pool 大小改變)</b>。</li>
 <li><b>遞迴 state:只有就地綁定</b>:兩個 state tensor(<code>h_gru (1,5,1,256)</code> 與 <code>df_convp_history (1,64,5,96)</code>,
 共 32,000 float = 128,000 bytes)各只有一份 buffer、位址固定;每個 state 的輸入與 <code>*_out</code> 輸出 shape 完全相同並綁到<b>同一個位址</b>,
 下一次呼叫的輸入就是這次的輸出,沒有第二份 buffer 也沒有複製。runtime 必須先讀完所有 state 輸入、才寫同位址的輸出

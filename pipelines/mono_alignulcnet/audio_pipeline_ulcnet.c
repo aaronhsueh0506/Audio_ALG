@@ -58,43 +58,11 @@
 #include "simd_kernel_nn.h"    /* skn_fill_f32 */
 
 /* This wrapper's own carve-layout version (see AudioPipelineUlcnetMemReq's
- * doc). History starts at 1 (2026-08: first version); 2 adds the
- * far_input_mode field to the self control block; 3 moves the ULCNet chain
- * onto a pool-carved shared FftHandle (the carve grew a trailing `fft`
- * region), embeds the per-call FFT scratch in the chain structs, and
- * replaces their per-struct window copies with one self-resident shared
- * table (ulcnet_window). Bump TOGETHER with the token string in
- * audio_pipeline_ulcnet_build_flags_hash() below, forever after, whenever
- * the carve structure changes -- including changes to the self-resident
- * Ulcnet state block, which is part of the carve even though it is not a
- * separately-carved pointer. Version 4 grows the self-resident config with
- * independent filter-length and AEC delay controls. Version 5 grows the
- * self-resident UlcnetModel copy by the published model-I/O descriptor
- * pointer. Version 6 removes the obsolete runtime far-mode field, fixed
- * production to the AEC aligned-far seam at that revision, and added
- * delay-transition bookkeeping. The current signal contract is raw far (a
- * behavior-only change). Version 7 adds the identity-reprime counter to the control
- * block. Version 8: sizeof(Aec) grew (the suppressor gained its runtime
- * far-active floor retarget state), so every AEC carved out of this pool
- * moves the total and the offsets after it. Carve order and buffer set are
- * unchanged, so build_flags_hash does not move -- this counter is the only
- * signal.
- * Version 9: sizeof(Aec) grew again (each AEC instance gained its per-hop
- * stage-timing record -- aec_get_last_timing(), aec.h), so every AEC
- * carved out of this pool moves the total and the offsets after it. Carve
- * order and buffer set are unchanged, so build_flags_hash does not move --
- * this counter is the only signal.
- * Version 10: the lib/aec pin moved to the hop-cost revision. sizeof(Aec)
- * grew 5832 -> 5848 B and the AEC pool grew by a per-grid constant (+5,120 B
- * on the then-default 16 kHz/512 grid), so the AEC carved out of this pool
- * moves the total and the offsets after it -- and the per-filter step of
- * 5,728 B for delay_num_filters is unchanged, so every n moves by the same
- * constant. Carve order and buffer set are unchanged, so build_flags_hash
- * does not move -- this counter is the only signal.
- * Version 11: the ULCNet deployment grid became a build parameter. The
- * build-flags hash now includes ULCNET_SR and ULCNET_N_FFT, preventing
- * descriptors from 16 kHz and 48 kHz builds from aliasing. */
-#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 12u
+ * doc). Any change of pool size, carve order or descriptor content bumps it,
+ * including a change of the self-resident Ulcnet state block or of a composed
+ * pool; the token string in audio_pipeline_ulcnet_build_flags_hash() moves
+ * with a changed carve. */
+#define AUDIO_PIPELINE_ULCNET_LAYOUT_VERSION 13u
 
 /* Compile-time FFT backend identity -- same mechanism as audio_pipeline.c:
  * pipelines/Makefile passes -DAUDIO_PIPELINE_BACKEND_STR=\"kiss\"/\"ne10\"

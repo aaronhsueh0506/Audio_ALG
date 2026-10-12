@@ -368,7 +368,7 @@ if (audio_pipeline_get_mem_breakdown(&cfg, &b) == 0) { /* b.aec_bytes, ... */ }
 
 ### 4.5 實測記憶體（僅供量級參考，務必自己重查）
 
-以下是**本次 checkout（layout_version=12）、`BACKEND=kiss`、`pipelines/Makefile`
+以下是**本次 checkout（layout_version=13）、`BACKEND=kiss`、`pipelines/Makefile`
 預設選項**下，直接以 `--print-mem-size` 量到的值。換 backend、換編譯選項、更新
 submodule 都會變。
 
@@ -568,7 +568,7 @@ FFT/NR/pipeline 分項），數字與 `lib/aec` 自己的 `aec_get_mem_size()` �
 | Offset | 欄位 | 型別 | 目前值 |
 |---:|---|---|---|
 | 0 | `descriptor_version` | `uint32_t` | `2` |
-| 4 | `layout_version` | `uint32_t` | `12` |
+| 4 | `layout_version` | `uint32_t` | `13` |
 | 8 | `backend_id` | `uint32_t` | `1` = KISS，`2` = NE10（永遠不會是 0） |
 | 12 | `build_flags_hash` | `uint32_t` | FNV-1a-32，隨 build 變動 |
 | 16 | `alignment` | `uint32_t` | `16` |

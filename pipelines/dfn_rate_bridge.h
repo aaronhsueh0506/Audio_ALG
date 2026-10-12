@@ -61,7 +61,9 @@ extern "C" {
 #endif
 
 #define DFN_RATE_BRIDGE_DESCRIPTOR_VERSION 1u
-#define DFN_RATE_BRIDGE_LAYOUT_VERSION     1u
+/* Carve layout version. Any change of pool size, carve order or descriptor
+ * content bumps it. */
+#define DFN_RATE_BRIDGE_LAYOUT_VERSION     2u
 
 /* GRID CONTRACT. The hop is always fft_size / 2: the hosting pipelines'
  * 50% overlap is part of what this bridge synthesises and analyses, so it is

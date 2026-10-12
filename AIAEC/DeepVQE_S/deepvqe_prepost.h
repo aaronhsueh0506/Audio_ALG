@@ -107,13 +107,10 @@ extern "C" {
  * with any other value, and the Python suite pins the two together. */
 #define DEEPVQE_COMPRESSION_EXP 0.3f
 #define DEEPVQE_PREPOST_ALIGNMENT      16u
-/* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
- * so a pool recorded by the previous carve is refused on the hash, not only
- * on `bytes`. 2: the TIME analyses became two analysis states.
- * 3: one state set, with no second bank.
- * 4: the conv and score regions hold full windows (4 and 5 frames) and h_gru
- *    is rank 4. */
-#define DEEPVQE_PREPOST_CARVE_VERSION  4u
+/* Folded into build_flags_hash. Any change of pool size, carve order or
+ * descriptor content bumps it, so a pool recorded by another carve is refused
+ * on the hash, not only on `bytes`. */
+#define DEEPVQE_PREPOST_CARVE_VERSION  5u
 
 /* Alignment search depth D, the exporter's max_delay_frames. It sizes the
  * attention key/value rings and the score window, so it is a pool-size

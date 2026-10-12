@@ -80,7 +80,9 @@ extern "C" {
 #endif
 
 #define DFN_RES_STAGE_DESCRIPTOR_VERSION 1u
-#define DFN_RES_STAGE_LAYOUT_VERSION     2u
+/* Carve layout version. Any change of pool size, carve order or descriptor
+ * content bumps it, including a change of the composed DFN2 pre/post pool. */
+#define DFN_RES_STAGE_LAYOUT_VERSION     3u
 #define DFN_RES_STAGE_BACKEND_KISS       1u
 #define DFN_RES_STAGE_BACKEND_NE10       2u
 

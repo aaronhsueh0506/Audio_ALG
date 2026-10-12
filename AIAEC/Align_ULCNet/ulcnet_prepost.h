@@ -65,16 +65,11 @@ extern "C" {
 #endif
 
 #define ULCNET_PREPOST_DESCRIPTOR_VERSION 1u
-/* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes
- * (a region added, removed, resized or reordered), so a pool recorded by the
- * previous carve is refused by _init_ex on the hash, not only on `bytes`.
- * 2: the TIME analyses became two analysis states (own scratch each).
- * 3: the model I/O region holds one GRU hidden pair, with no second pair for
- *    the outputs.
- * 4: the model I/O region carries no per-frame K/V/logit staging.
- * 5: the K/V and logit regions hold full windows (D and 5 frames) and the
- *    model I/O region holds one combined GRU hidden. */
-#define ULCNET_PREPOST_CARVE_VERSION 5u
+/* Folded into build_flags_hash. Any change of pool size, carve order or
+ * descriptor content (a region added, removed, resized or reordered) bumps it,
+ * so a pool recorded by another carve is refused by _init_ex on the hash, not
+ * only on `bytes`. */
+#define ULCNET_PREPOST_CARVE_VERSION 6u
 
 /* Which side of the transform the caller works on. FIXED AT INIT because it
  * decides the pool size: ULCNET_IO_TIME additionally carves two analysis

@@ -75,10 +75,10 @@ extern "C" {
  * the fuse buffers) and the shared delay estimator and ring. Per-lane spectra
  * are borrowed from each AEC instance and are valid only until that lane is
  * processed or reset again. The residual-echo, noise-reduction and synthesis
- * stages are carved by the application, not here. Query a fresh descriptor
- * for every build; do not persist or synthesize one from this version
- * number. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 18u
+ * stages are carved by the application, not here. Any change of pool size,
+ * carve order or descriptor content bumps it. Query a fresh descriptor for
+ * every build; do not persist or synthesize one from this version number. */
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 19u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
