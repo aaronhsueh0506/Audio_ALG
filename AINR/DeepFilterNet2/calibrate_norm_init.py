@@ -35,13 +35,13 @@ libDF's rectangular/energy-mean bank and 1/N analysis scale, not for this port's
 triangular/energy-sum bank and ``normalized=True``. That gap is the known scale
 shift, not a corpus problem.
 
-The corpus-fitted pair (-17.35/-57.81, rounded to -15/-60) WAS shipped, in
-37db9df, and was then reverted: training diverged under it and converges under the
-literals, on an identical corpus, both runs from scratch. So this script's output
-is a measurement, not a recommendation to paste. Read UPSTREAM_ALIGNMENT.md
-do-not-touch item 4 before acting on it -- and note that seven candidate
-mechanisms for that divergence were measured and none survived, so the reason the
-better-fitting init trains worse is still open.
+The corpus-fitted pair (-17.35/-57.81, rounded to -15/-60) is not used:
+training diverged under it and converges under the literals, on an identical
+corpus, both runs from scratch. So this script's output is a measurement, not
+a recommendation to paste. Read UPSTREAM_ALIGNMENT.md do-not-touch item 4
+before acting on it. Seven candidate mechanisms for that divergence were
+measured and none survived, so the reason the better-fitting init trains worse
+is open.
 
 USAGE
 -----

@@ -201,8 +201,8 @@ static int pp_layout(DFN2Prepost *p, unsigned char *base, int io_mode,
     }
 
     /* DFN2_IO_FREQ only: the dual entry point's application spectrum.
-     * Appended AFTER every region above so no existing offset moved when it
-     * was added (DFN2_PREPOST_CARVE_VERSION 2). */
+     * Appended AFTER every region above so the offsets of the other regions
+     * do not depend on io_mode. */
     if (io_mode == DFN2_IO_FREQ) {
         if (pp_carve(base, &cursor, (size_t)DFN2_N_BINS * sizeof(float),
                      &ptr) != 0) return -1;

@@ -53,53 +53,41 @@ from training_common import (  # noqa: E402
 )
 
 
-# v3: _build_erb_fb() (model.py) rewritten to the exact triangular
-# construction from this project's own aaronhsueh0506/DeepFilterNet-Keras
-# bandERB.ipynb (ERBBand()/ERB_pro_matrix()) -- same as RNNoise-ERB's
-# train.py -- replacing a different ERB-rate formula (21.4/0.00437 instead
-# of the correct 9.265/24.7), a different band-width enforcement, and a
-# non-doubled forward matrix. erb_fb/erb_inv are registered buffers (part of
-# state_dict), so old checkpoints carry stale values that load_state_dict
-# would silently restore; bump forces a fresh training run instead.
+# MODEL_VERSION names the trained graph. It is the only check that rejects a
+# checkpoint trained for a different one: several of the differences listed
+# here change no parameter count, so neither load_state_dict nor a parameter
+# count can see them.
+#   - ERB filterbank: the exact triangular construction from this project's
+#     own aaronhsueh0506/DeepFilterNet-Keras bandERB.ipynb (ERBBand()/
+#     ERB_pro_matrix()), same as RNNoise-ERB's train.py (ERB rate constants
+#     9.265/24.7, strict minimum band width, doubled forward edge columns).
+#     erb_fb/erb_inv are registered buffers (part of state_dict), so a
+#     checkpoint carries the filterbank values and load_state_dict would
+#     restore them silently.
+#   - Architecture as released DeepFilterNet3 (minus lsnr): ReLU,
+#     GroupedLinearEinsum, the GRU layers in the ERB decoder, the encoder
+#     flattening frequency-major (B,T,F,C) as upstream does (which changes
+#     which elements GroupedLinearEinsum groups together), and the ERB decoder
+#     taking encoder skips through 1x1 pathway convs that are ADDED.
+#     Concatenating instead totals the same 14,210 conv parameters: identical
+#     numbers, different functions.
+#   - Output composition of DFN2: ERB mask over every bin, DF on the masked
+#     low-frequency spectrum, then the learned sigmoid alpha blend against
+#     that masked residual.
 #
-# v4: the architecture was realigned to released DeepFilterNet3 (minus lsnr) --
-# PReLU->ReLU, dense->GroupedLinearEinsum, GRU layers moved from the encoder to
-# the ERB decoder, and the mask/DF cascade replaced by DFN3's parallel band
-# split.  That last change costs ZERO parameters, so neither load_state_dict
-# nor a parameter count can reject a v3 checkpoint; only this string can.
-#
-# v5 completes the realignment with two more parameter-count-invisible fixes:
-# the encoder now flattens frequency-major (B,T,F,C) like upstream instead of
-# channel-major, which changes which elements GroupedLinearEinsum groups
-# together; and the ERB decoder takes encoder skips through 1x1 pathway convs
-# and ADDS them, instead of concatenating.  The concat form and the pathway
-# form both total 14,210 conv parameters here -- identical numbers, different
-# functions, which is precisely why the version string has to carry it.
-#
-# v6 intentionally restores DFN2's output composition while retaining the v5
-# encoder/decoder widths and all training-safety changes: ERB mask over every
-# bin, DF on the masked low-frequency spectrum, then the learned sigmoid alpha
-# blend against that masked residual.  The alpha parameters already existed in
-# v5 but were unused, so old band-split checkpoints are not valid for this graph.
-#
-# ⚠ lookahead stays 1/1 and the ERB filterbank stays triangular/overlapping/sum.
+# ⚠ lookahead is 1/1 and the ERB filterbank is triangular/overlapping/sum.
 # Both are operator decisions, NOT oversights -- see config.ini [model] and
 # UPSTREAM_ALIGNMENT.md.  Everything else in the port is aligned to upstream.
 #
-# FEATURE v5: three changes, all toward upstream.
-#   1. The normaliser inits are back to libDF's literal MEAN_NORM_INIT
-#      (-60/-90 dB) and UNIT_NORM_INIT (0.001/0.0001), reverting the corpus
-#      calibration shipped as ...calibrated_v3 in 37db9df.  That commit was the
-#      only behavioural change between a run that trained fine and a run that
-#      diverged into NaN, on an identical corpus, both from scratch.
-#   2. spec_norm_eps is GONE.  libDF divides by a bare sqrt(state); the eps was
-#      this port's own addition.  See config.ini [feature] for the measurement
-#      showing removal is safe in fp32 and for the one case where it is not.
-#   3. The analysis spectrum now carries libDF's wnorm (see analysis_scale), so
+# FEATURE_VERSION names the feature path:
+#   1. The normaliser inits are libDF's literal MEAN_NORM_INIT (-60/-90 dB)
+#      and UNIT_NORM_INIT (0.001/0.0001).  A corpus-fitted pair diverged in
+#      training; see calibrate_norm_init.py and config.ini [feature].
+#   2. There is no spec_norm_eps.  libDF divides by a bare sqrt(state); see
+#      config.ini [feature] for the measurement showing removal is safe in
+#      fp32 and for the one case where it is not.
+#   3. The analysis spectrum carries libDF's wnorm (see analysis_scale), so
 #      the normalisers see the scale their constants were calibrated against.
-# ⚠ This is NOT a return to '...dual_ema_state_v2': that contract carried
-# spec_norm_eps, so reusing the string would let a v2 checkpoint load into a
-# model whose feature path no longer matches it.
 MODEL_VERSION = 'dfn2_fmajor_pathway_cascade_alpha_no_lsnr_v6'
 FEATURE_VERSION = 'dfn2_libdf_wnorm_upstream_init_no_eps_v5'
 LOSS_VERSION = 'dfn_mrsl_mag_complex_gamma_v2'
@@ -252,10 +240,10 @@ def read_model_config(cfg):
     """Every DeepFilterNet2 constructor argument, defaults overlaid with [model].
 
     Defaults come from ``DeepFilterNet2.__init__``'s own signature rather than
-    from a ``fallback=`` on each read.  They used to be restated in train.py
-    *and* inference.py, so a knob whose fallback was updated in one place built a
-    differently-shaped model in the other -- which surfaces only as a
-    load_state_dict failure at inference time, long after the training run.
+    from a ``fallback=`` on each read, so train.py and inference.py cannot
+    disagree on a default.  A disagreement builds a differently-shaped model,
+    which surfaces only as a load_state_dict failure at inference time, long
+    after the training run.
 
     Unknown ``[model]`` keys raise rather than being silently ignored, and the
     parsed type follows the signature default, so a new constructor argument
@@ -340,19 +328,17 @@ def analysis_scale(n_fft, win_len, hop_len):
 def erb_band_db(spec_BTC, erb_fb, analysis_scale):
     """Band energies in dB, exactly as the model is fed them.
 
-    ⚠ SHARED with calibrate_norm_init.py on purpose.  This used to be four lines
-    hand-copied there, and they drifted twice -- once on the log floor
-    (clamp_min(1e-16) vs +1e-10) and once on the power expression -- each time
-    silently biasing the init values the calibrator recommends.  The sibling
-    project still carries that drift.  One call site each makes it unrepresentable
-    rather than merely tested.
+    ⚠ SHARED with calibrate_norm_init.py on purpose.  A hand-copied version can
+    drift (the log floor, the power expression) and silently bias the init
+    values the calibrator recommends.  One definition makes that
+    unrepresentable rather than merely tested.
 
     ``analysis_scale`` is applied to the POWER as s**2 rather than to the spectrum
     as s: identical result (s is an exact power of two at every supported grid, so
     the exponent shift is lossless -- verified bit-equal by torch.equal), but it
     touches (B, T, n_erb) floats instead of (B, T, n_bins) complex.
 
-    The +1e-10 floor is upstream's literal (lib.rs:209).  ⚠ It was never
+    The +1e-10 floor is upstream's literal (lib.rs:209).  ⚠ It is not
     re-derived for this port's band scale; see config.ini [feature] for the
     measurement and for why raising it is the wrong repair.
     """
@@ -369,8 +355,8 @@ def read_feature_config(cfg, sr, hop_len):
         'spec_norm_init_hi',
     }
     # Reject unknown keys the way read_model_config does.  Silently ignoring them
-    # let a stale `spec_norm_eps = 1e-12` read as though the guard were honoured
-    # while the code divided by a bare sqrt.
+    # would let a stale `spec_norm_eps = 1e-12` read as though the guard were
+    # honoured while the code divides by a bare sqrt.
     for name in cfg.options(section):
         if name not in known:
             raise ValueError(
@@ -472,8 +458,9 @@ def make_checkpoint_contract(
 #: entitled to change on an existing checkpoint -- ⚠ it IS recorded, because DFN3's
 #: form is ungated and therefore does change the training objective, and it IS
 #: still enforced when resuming training; it is only waived on the inference path.
-#: Without this, flipping `mask_pf = true` to try the post-filter made inference.py
-#: refuse to load the checkpoint, i.e. the knob could not be exercised at all.
+#: Without this, flipping `mask_pf = true` to try the post-filter would make
+#: inference.py refuse to load the checkpoint, i.e. the knob could not be
+#: exercised at all.
 RENDER_ONLY_CONTRACT_KEYS = ('mask_pf', 'pf_beta')
 
 
@@ -533,12 +520,12 @@ def causal_ema_db_norm(
     DeepFilterNet band_mean_norm_erb: per-band causal EMA of dB, subtract running mean, /40.
     State init = linspace(mean_norm_init) across bands (NOT first-frame).
 
-    ⚠ The init IS libDF's MEAN_NORM_INIT = -60..-90 dB, restored deliberately.
+    ⚠ The init IS libDF's MEAN_NORM_INIT = -60..-90 dB, used deliberately.
     It is NOT calibrated for this port: the triangular / overlapping / energy-SUM
     bank plus normalized=True puts measured band levels ~+39 dB higher than
     libDF's (composite +32.8..+48.4 dB per band), and the fitted values for this
-    corpus are -17.35/-57.81.  Those were shipped and then reverted, because
-    training diverged under them and converges under these.  config.ini [feature]
+    corpus are -17.35/-57.81, but training diverged under them and converges
+    under libDF's.  config.ini [feature]
     carries the full reasoning and the suspected mechanism (the +1e-10 log floor,
     which these values keep at upstream's -1.00 bound by coincidence).
     erb_db    : (B, T, n_erb)
@@ -576,7 +563,7 @@ def causal_ema_mag_norm(spec_low, norm_state=None, alpha=0.989,
         s = |x|*(1-a) + s*a ;  x = x / sqrt(s)
     State init = linspace(unit_norm_init) across bins (NOT first-frame); the
     default IS libDF's UNIT_NORM_INIT (lib.rs:13).  See config.ini [feature] for
-    why the corpus-fitted pair was shipped and then reverted.
+    why the corpus-fitted pair is not used.
     spec_low  : (B, T, df_bins) complex
     Returns: normed (B, T, df_bins) complex and state (B, 1, df_bins)
     """
@@ -1014,7 +1001,7 @@ def train(args):
                 loss = loss_fn(enhanced_wav, clean)
                 # One device->host sync for the loss, here.  The finiteness check
                 # below reads this float instead of doing `if not
-                # torch.isfinite(loss)`, which was a second sync at the same
+                # torch.isfinite(loss)`, which would be a second sync at the same
                 # point in the stream.
                 loss_value = loss.item()
 
@@ -1123,7 +1110,7 @@ def train(args):
         # states are carried outside autograd), and a finite loss over already-
         # NaN weights would step right past the guard.  Without this check the
         # only good checkpoint gets replaced by a dead one and the run becomes
-        # unrecoverable -- exactly the failure this whole exercise is about.
+        # unrecoverable.
         poisoned = scan_non_finite(model)
         optim_bad = [
             (pid, key)

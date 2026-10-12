@@ -114,17 +114,13 @@ extern "C" {
 #endif
 
 #define DFN2_PREPOST_DESCRIPTOR_VERSION 1u
-/* Folded into build_flags_hash: bump whenever pp_layout's carve walk changes,
- * so a pool recorded by the previous carve is refused on the hash, not only
- * on `bytes`.
- *   1  the original walk
- *   2  DFN2_IO_FREQ carves a second staging pair (apply_re/apply_im) for the
- *      dual-input entry point, appended after every existing region
- *   3  DFN2State carries the ERB matrices' nonzero ranges
- *   4  the recurrent state is DFN2ModelIOState's own arrays and nothing else
- *   5  DFN2State also carries each ERB band's nonzero bin range
- *   6  the recurrent state is the 5-row h_gru and the 5-frame pathway window
- *      of graph layout 8 */
+/* Folded into build_flags_hash: changes whenever pp_layout's carve walk
+ * changes, so a pool recorded by another carve is refused on the hash, not
+ * only on `bytes`. The carve covers DFN2State (including the ERB matrices'
+ * nonzero ranges and each band's nonzero bin range), the recurrent state of
+ * DFN2ModelIOState (h_gru and the pathway window) and, in
+ * DFN2_IO_FREQ, the second staging pair (apply_re/apply_im) of the dual-input
+ * entry point. */
 #define DFN2_PREPOST_CARVE_VERSION      6u
 
 /* One shared alignment for every module (audio_common mem_align.h). */
