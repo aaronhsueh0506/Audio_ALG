@@ -109,6 +109,48 @@ def test_rank_five_attention_pattern_is_lowered_to_rank_four():
     assert b1.verify_identical(original, model) == 0.0
 
 
+def test_lowering_keeps_the_batch_axis_at_one():
+    """[1,C,1,D,W] must lower to [1,C,D,W], not [C,1,D,W]: a broadcast along
+    a batch axis of C is not something the accelerator toolchain can reshape
+    back (it asked for Reshape [1,1,D,W] -> [C,1,D,W])."""
+    nodes = [
+        helper.make_node('Unsqueeze', ['v', 'a2'], ['v5']),    # [1,4,1,6,5]
+        helper.make_node('Unsqueeze', ['w', 'a1'], ['w5']),    # [1,1,1,6,1]
+        helper.make_node('Mul', ['v5', 'w5'], ['m']),
+        helper.make_node('ReduceSum', ['m', 'ax'], ['s'], keepdims=0),
+        helper.make_node('Softmax', ['m'], ['sm'], axis=-1),
+    ]
+    model = _model(
+        nodes, [('v', [1, 4, 6, 5]), ('w', [1, 6, 1])],
+        [('s', [1, 4, 1, 5]), ('sm', [1, 4, 1, 6, 5])],
+        [_const('a2', np.asarray([2], np.int64)),
+         _const('a1', np.asarray([1], np.int64)),
+         _const('ax', np.asarray([3], np.int64))])
+    original, report = _optimise(model)
+    assert report['blocked'] == []
+    shapes = {v.name: [d.dim_value for d in v.type.tensor_type.shape.dim]
+              for v in b1._inferred(model).graph.value_info}
+    lowered = [name for name in shapes if name.startswith('lo_b1')]
+    assert lowered and all(shapes[name][0] == 1 for name in lowered
+                           if len(shapes[name]) == 4), shapes
+    assert b1.verify_identical(original, model) == 0.0
+
+
+def test_lowering_falls_back_to_the_leading_axis_without_a_spare_unit_axis():
+    """[1,4,6,5,3] has no unit axis but axis 0: the batch axis has to go."""
+    nodes = [
+        helper.make_node('Reshape', ['x', 's5'], ['a']),       # [1,4,6,5,3]
+        helper.make_node('Relu', ['a'], ['r']),
+        helper.make_node('Reshape', ['r', 's4'], ['y']),
+    ]
+    model = _model(nodes, [('x', [4, 6, 5, 3])], [('y', [4, 6, 5, 3])],
+                   [_const('s5', np.asarray([1, 4, 6, 5, 3], np.int64)),
+                    _const('s4', np.asarray([4, 6, 5, 3], np.int64))])
+    original, report = _optimise(model)
+    assert report['blocked'] == [] and report['high_rank_left'] == []
+    assert b1.verify_identical(original, model) == 0.0
+
+
 def test_grouped_linear_matmul_drops_its_leading_unit_axes():
     nodes = [
         helper.make_node('Reshape', ['x', 's5'], ['a']),       # [1,1,G,1,K]
