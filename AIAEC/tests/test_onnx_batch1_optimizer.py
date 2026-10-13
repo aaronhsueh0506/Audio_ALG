@@ -251,6 +251,19 @@ def _assert_exact_rank_four(wrapper, inputs, names, outputs, tmp_path):
     assert report['high_rank_left'] == [] and report['blocked'] == []
     assert report['nodes_after'] < report['nodes_before']
     assert b1.verify_identical(original, model) == 0.0
+    # The file the CLI writes must show every internal tensor's shape.
+    folded = tmp_path / 'folded.onnx'
+    onnx.save(original, str(folded))
+    cleaned = tmp_path / 'cleaned.onnx'
+    b1.optimize_file(str(folded), str(cleaned), verify=True)
+    graph = onnx.load(str(cleaned)).graph
+    declared = {v.name for v in graph.value_info}
+    declared |= {v.name for v in graph.output}
+    missing = [name for node in graph.node for name in node.output
+               if name and name not in declared]
+    assert missing == []
+    assert all(d.HasField('dim_value') for v in graph.value_info
+               for d in v.type.tensor_type.shape.dim)
 
 
 def test_deepvqe_graph_is_exactly_preserved_and_rank_four(tmp_path):
