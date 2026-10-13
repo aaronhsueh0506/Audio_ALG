@@ -22,8 +22,9 @@ Passes, in the order ``optimize_batch1`` runs them:
 
 ``lower_rank``
     Tensors above ``target_rank`` (default 4) are brought down by dropping
-    their LEADING size-1 axes: the op is run on the reduced operands and a
-    Reshape restores the original shape for the consumers, so ``merge_views``
+    size-1 axes (the leading ones, unless that would put a longer axis in the
+    batch position and another unit axis can go instead): the op is run on the reduced operands and
+    a Reshape restores the original shape for the consumers, so ``merge_views``
     can then cancel the Reshape pairs. Supported: elementwise ops,
     Transpose, MatMul, ReduceSum/Mean/Max/Min, Softmax. A node it cannot
     lower is left as it is and reported.
@@ -112,6 +113,11 @@ def _attr(node, name, default=None):
         if attribute.name == name:
             return helper.get_attribute_value(attribute)
     return default
+
+
+def _perm(node, rank):
+    """A Transpose's permutation (reversal when the attribute is absent)."""
+    return list(_attr(node, 'perm', list(range(rank))[::-1]))
 
 
 def _set_attr(node, name, value):
@@ -228,7 +234,7 @@ def _is_view(info, node):
         return (len(node.input) == 2 and node.input[1] in info.initializers
                 and math.prod(in_shape) == math.prod(out_shape))
     if node.op_type == 'Transpose':
-        perm = list(_attr(node, 'perm', list(range(len(in_shape)))[::-1]))
+        perm = _perm(node, len(in_shape))
         moved = [axis for axis in perm if in_shape[axis] != 1]
         return moved == sorted(moved)
     if node.op_type == 'Gather':
@@ -320,13 +326,37 @@ def _drop_unused_initializers(model):
 # ------------------------------------------------------------------ lower rank
 
 
-def _leading_drop(shape, target_rank):
-    """Leading axes to drop to reach ``target_rank`` (all must be size 1),
-    or None when they are not."""
-    drop = len(shape) - target_rank
-    if drop <= 0:
-        return 0
-    return drop if all(d == 1 for d in shape[:drop]) else None
+def _drop_axes(shape, target_rank, keep=()):
+    """Size-1 axes (ascending) to remove so ``shape`` reaches ``target_rank``,
+    or None when there are too few. Axes in ``keep`` stay.
+
+    The leading axes go first. But when that would leave a longer axis in the
+    batch position (``[1,32,1,8,26]`` -> ``[32,1,8,26]``) and a later unit
+    axis can go instead, that one goes and axis 0 stays 1 (``[1,32,8,26]``):
+    an accelerator reads axis 0 as the batch, and a broadcast along it is not
+    supported. With no spare unit axis the leading ones go regardless.
+    """
+    need = len(shape) - target_rank
+    if need <= 0:
+        return []
+    ones = [i for i, d in enumerate(shape) if d == 1 and i not in keep]
+    if len(ones) < need:
+        return None
+    drop = ones[:need]
+    first = next(i for i in range(len(shape)) if i not in drop)
+    if shape[first] != 1 and 0 in ones and len(ones) > need:
+        drop = [i for i in ones if i != 0][:need]
+    return drop
+
+
+def _without(shape, axes):
+    """``shape`` with the dimensions at ``axes`` removed."""
+    return tuple(d for i, d in enumerate(shape) if i not in axes)
+
+
+def _renumber(axis, drop):
+    """``axis`` after the axes in ``drop`` are removed."""
+    return axis - sum(1 for d in drop if d < axis)
 
 
 def _reduction_axes(node, info):
@@ -354,16 +384,24 @@ class _Lowering(object):
         self.namer = namer
         self.target = target_rank
 
-    def operand(self, name, nodes):
-        """(name, shape) of an input reduced to the target rank, or None."""
+    def operand(self, name, nodes, drop, rank):
+        """(name, shape) of an input with the node's axes ``drop`` removed,
+        or None. ``rank`` is the rank those axes are numbered in; a shorter
+        operand covers the trailing axes (broadcasting), so only its share
+        of ``drop`` applies."""
         from onnx import numpy_helper
         shape = self.info.shape(name)
-        drop = None if shape is None else _leading_drop(shape, self.target)
-        if drop is None:
+        if shape is None:
             return None
-        if drop == 0:
+        offset = rank - len(shape)
+        local = {a - offset for a in drop if a >= offset}
+        if any(shape[i] != 1 for i in local):
+            return None
+        reduced = _without(shape, local)
+        if len(reduced) > self.target:
+            return None
+        if not local:
             return name, shape
-        reduced = shape[drop:]
         init = self.info.initializers.get(name)
         out = self.namer.new('lo')
         if init is not None:
@@ -376,6 +414,7 @@ class _Lowering(object):
     def build(self, node):
         op = node.op_type
         out_shape = self.info.shape(node.output[0])
+        rank = len(out_shape)
         pre = []
         new = copy.deepcopy(node)
         del new.input[:]
@@ -383,75 +422,79 @@ class _Lowering(object):
         new.output[0] = reduced_out
 
         if op in _ELEMENTWISE:
-            drop = _leading_drop(out_shape, self.target)
+            drop = _drop_axes(out_shape, self.target)
             if drop is None:
                 return None
             for name in node.input:
-                shape = self.info.shape(name) if name else ()
-                if shape is None:
-                    return None
-                if len(shape) == len(out_shape):
-                    reduced = self.operand(name, pre)
-                    if reduced is None:
-                        return None
-                    new.input.append(reduced[0])
-                elif len(shape) <= self.target:
+                if not name:
                     new.input.append(name)
-                else:
+                    continue
+                reduced = self.operand(name, pre, drop, rank)
+                if reduced is None:
                     return None
+                new.input.append(reduced[0])
         elif op == 'Transpose':
-            drop = _leading_drop(out_shape, self.target)
-            perm = list(_attr(node, 'perm', []))
-            if drop is None or perm[:drop] != list(range(drop)):
+            drop = _drop_axes(out_shape, self.target)
+            in_rank = len(self.info.shape(node.input[0]))
+            perm = _perm(node, in_rank)
+            if drop is None:
                 return None
-            reduced = self.operand(node.input[0], pre)
+            gone = sorted(perm[j] for j in drop)
+            reduced = self.operand(node.input[0], pre, gone, in_rank)
             if reduced is None:
                 return None
             new.input.append(reduced[0])
-            _set_attr(new, 'perm', [p - drop for p in perm[drop:]])
+            _set_attr(new, 'perm', [_renumber(p, gone) for j, p in
+                                    enumerate(perm) if j not in drop])
         elif op == 'MatMul':
-            drop = _leading_drop(out_shape, self.target)
-            a = self.operand(node.input[0], pre)
-            b = self.operand(node.input[1], pre)
-            if drop is None or a is None or b is None or min(
-                    len(a[1]), len(b[1])) < 2:
+            drop = _drop_axes(out_shape, self.target,
+                              keep=(rank - 2, rank - 1))
+            if drop is None:
+                return None
+            a = self.operand(node.input[0], pre, drop, rank)
+            b = self.operand(node.input[1], pre, drop, rank)
+            if a is None or b is None or min(len(a[1]), len(b[1])) < 2:
                 return None
             batch = np.broadcast_shapes(a[1][:-2], b[1][:-2])
-            if tuple(batch) + (a[1][-2], b[1][-1]) != out_shape[drop:]:
+            if (tuple(batch) + (a[1][-2], b[1][-1])
+                    != _without(out_shape, drop)):
                 return None
             new.input.extend([a[0], b[0]])
         elif op in _REDUCTIONS:
             shape = self.info.shape(node.input[0])
             axes = _reduction_axes(node, self.info)
-            drop = None if shape is None else _leading_drop(shape,
-                                                            self.target)
-            if axes is None or drop is None:
+            if axes is None:
                 return None
             axes = [a % len(shape) for a in axes]
-            if any(a < drop for a in axes):
+            drop = _drop_axes(shape, self.target, keep=axes)
+            if drop is None:
                 return None
-            reduced = self.operand(node.input[0], pre)
+            reduced = self.operand(node.input[0], pre, drop, len(shape))
+            if reduced is None:
+                return None
             new.input.append(reduced[0])
+            axes = [_renumber(a, drop) for a in axes]
             if len(node.input) > 1 and node.input[1]:
                 from onnx import numpy_helper
                 axes_name = self.namer.new('axes')
                 self.model.graph.initializer.append(numpy_helper.from_array(
-                    np.asarray([a - drop for a in axes], dtype=np.int64),
-                    name=axes_name))
+                    np.asarray(axes, dtype=np.int64), name=axes_name))
                 new.input.append(axes_name)
             else:
-                _set_attr(new, 'axes', [a - drop for a in axes])
+                _set_attr(new, 'axes', axes)
             # The reduced run keeps the reduced axes (rank stays at target);
             # the Reshape below gives the original shape back.
             _set_attr(new, 'keepdims', 1)
         elif op == 'Softmax' and self.opset >= 13:
-            drop = _leading_drop(out_shape, self.target)
-            axis = _attr(node, 'axis', -1) % len(out_shape)
-            reduced = self.operand(node.input[0], pre)
-            if drop is None or axis < drop or reduced is None:
+            axis = _attr(node, 'axis', -1) % rank
+            drop = _drop_axes(out_shape, self.target, keep=(axis,))
+            if drop is None:
+                return None
+            reduced = self.operand(node.input[0], pre, drop, rank)
+            if reduced is None:
                 return None
             new.input.append(reduced[0])
-            _set_attr(new, 'axis', axis - drop)
+            _set_attr(new, 'axis', _renumber(axis, drop))
         else:
             return None
 
@@ -461,8 +504,8 @@ class _Lowering(object):
 
 
 def lower_rank(model, target_rank=4):
-    """Bring every tensor above ``target_rank`` down by dropping leading
-    size-1 axes. Returns ``(lowered, blocked)``: the number of nodes
+    """Bring every tensor above ``target_rank`` down by dropping size-1
+    axes. Returns ``(lowered, blocked)``: the number of nodes
     rewritten and the ``(op_type, name)`` of those that could not be."""
     info = _Graph(model)
     lowering = _Lowering(model, info, _Namer(model), target_rank)
