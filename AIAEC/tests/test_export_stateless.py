@@ -30,6 +30,16 @@ from AIAEC.training_common import DEPLOYED_FAR_INPUT_MODE
 GRID = SignalGrid(16000, 512, 512, 256)
 
 
+def _batch1(path):
+    """The batch-1 cleanup is a separate step run on the exported file."""
+    import onnx
+    import onnx_batch1_optimizer as b1
+
+    graph = onnx.load(path)
+    b1.optimize_batch1(graph, verify=True)
+    onnx.save(graph, path)
+
+
 def test_export_log_power_matches_training_floor_semantics():
     """The exported graph must use the model's clamp, not add an epsilon."""
     complex_spec = torch.tensor(
@@ -134,6 +144,7 @@ def test_deepvqe_graph_ends_in_conv_and_reshapes_only(tmp_path):
                       output_names=outputs, opset_version=17,
                       do_constant_folding=True)
     optimize_graph_file(path)
+    _batch1(path)
     graph = onnx.shape_inference.infer_shapes(onnx.load(path))
     nodes = list(graph.graph.node)
     last_conv = max(i for i, node in enumerate(nodes)
@@ -181,6 +192,7 @@ def test_deepvqe_graph_starts_at_the_first_conv(tmp_path):
                       output_names=outputs, opset_version=17,
                       do_constant_folding=True)
     optimize_graph_file(path)
+    _batch1(path)
     graph = onnx.load(path).graph
     nodes = [node for node in graph.node if node.op_type != 'Constant']
     shapes = {value.name: tuple(d.dim_value for d in value.type.tensor_type.shape.dim)
@@ -208,6 +220,7 @@ def test_deepvqe_frequency_pads_are_conv_attributes_and_replay_exactly(tmp_path)
                       output_names=outputs, opset_version=17,
                       do_constant_folding=True)
     optimize_graph_file(path)
+    _batch1(path)
     graph = onnx.load(path).graph
     assert not [node for node in graph.node if node.op_type == 'Pad']
     padded = [node for node in graph.node if node.op_type == 'Conv' and any(

@@ -230,9 +230,9 @@ code owns every K/V, score-convolution and GRU tensor in caller-provided
 memory.  Align-ULCNet is a postfilter, so microphone PCM first enters the
 linear AEC; the learned graph consumes `linear_error`, not raw microphone.
 
-The exported graph carries each convolution's frequency-axis zero padding in the Conv
-`pads` attribute (`fold_frequency_pad_into_conv` in `onnx_batch1_optimizer.py`), so no separate Pad op feeds a Conv; the
-temporal axis is never padded (its history is a tensor).
+After the separate batch-1 cleanup (`onnx_batch1_optimizer.py`, run last on the exported file), each
+convolution's frequency-axis zero padding sits in the Conv `pads` attribute (`fold_frequency_pad_into_conv`) and
+no separate Pad op feeds a Conv; the temporal axis is never padded (its history is a tensor).
 
 ```mermaid
 flowchart LR

@@ -518,8 +518,8 @@ def test_host_graph_ends_at_the_mask_conv(tmp_path):
 
 
 def test_optimized_graph_has_no_conv_pad_op_and_replays_the_wrapper(tmp_path):
-    """Frequency padding of the convolutions lives in their attributes in the
-    shipped graph, and the optimized file still reproduces the wrapper."""
+    """After the separate batch-1 cleanup the convolutions' frequency padding
+    lives in their attributes, and the cleaned file still reproduces the wrapper."""
     onnx = pytest.importorskip('onnx')
     ort = pytest.importorskip('onnxruntime')
     depth = 4
@@ -530,6 +530,10 @@ def test_optimized_graph_has_no_conv_pad_op_and_replays_the_wrapper(tmp_path):
     path = tmp_path / 'pads.onnx'
     wrapper, initial, _meta = export_graph(
         model, str(checkpoint), str(path))
+    import onnx_batch1_optimizer as b1
+    exported = onnx.load(str(path))
+    b1.optimize_batch1(exported, verify=True)
+    onnx.save(exported, str(path))
 
     graph = onnx.load(str(path)).graph
     # Any Pad left (the reorientation's width fit) feeds no Conv.

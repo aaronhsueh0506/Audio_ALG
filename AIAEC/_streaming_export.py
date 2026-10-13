@@ -63,7 +63,6 @@ from AIAEC._onnx_contract import (
     validate_inplace_state_contract,
     validate_nctf_no_temporal_padding,
 )
-from onnx_batch1_optimizer import format_report, optimize_batch1
 from AIAEC.CAGCRN.model import (
     _stream_cata,
     _stream_decoder_block,
@@ -150,11 +149,7 @@ def optimize_graph_file(path):
     options.log_severity_level = 3
     ort.InferenceSession(path, options, providers=['CPUExecutionProvider'])
     os.replace(folded, path)
-    graph = onnx.load(path)
-    print('[ort-fold] -> %d nodes' % len(graph.graph.node))
-    report = optimize_batch1(graph, verify=True)
-    onnx.save(graph, path)
-    print('[batch1] ' + format_report(report))
+    print('[ort-fold] -> %d nodes' % len(onnx.load(path).graph.node))
 
 
 def _pin_static_output_shapes(graph, output_names, outputs):
