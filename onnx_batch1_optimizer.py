@@ -599,12 +599,24 @@ def format_report(report):
     return '\n'.join(lines)
 
 
+def annotate_static_shapes(model):
+    """Re-declare the shape of every internal tensor (the passes drop the old
+    annotations), keeping only fully static ones. Returns the annotated model."""
+    annotated = _inferred(model)
+    kept = [info for info in annotated.graph.value_info
+            if all(d.HasField('dim_value')
+                   for d in info.type.tensor_type.shape.dim)]
+    del annotated.graph.value_info[:]
+    annotated.graph.value_info.extend(kept)
+    return annotated
+
+
 def optimize_file(path, output=None, target_rank=4, verify=False):
     """Read ``path``, optimise, write ``output`` (default: in place)."""
     import onnx
     model = onnx.load(path)
     report = optimize_batch1(model, target_rank, verify)
-    onnx.save(model, output or path)
+    onnx.save(annotate_static_shapes(model), output or path)
     return report
 
 
