@@ -119,7 +119,7 @@ caller            mics0,far0          mics1,far1          mics2,far2          mi
 C 前端           front_process#0    front_process#1    front_process#2    front_process#p
 (4 AEC lanes      → SRP/GSC           → SRP/GSC           → SRP/GSC           → SRP/GSC
  +SRP+GSC)        gsc_spectrum#0      gsc_spectrum#1      gsc_spectrum#2      gsc_spectrum#p
-                  stft_push far#0     stft_push far#1     stft_push far#2     stft_push far#p 
+                  stft_push far#0     stft_push far#1     stft_push far#2     stft_push far#p
                   ── err 幀與 far 幀恆為同一個 input hop,兩側皆無 delay buffer ──
                   ↓                   ↓                   ↓                   ↓
 NPU (model)       infer ×1            infer ×1            infer ×1            infer ×1
