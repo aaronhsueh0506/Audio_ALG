@@ -1270,9 +1270,9 @@ def test_batch1_cleanup_keeps_the_graph_exact_and_rank_four(tmp_path):
     ort = pytest.importorskip('onnxruntime')
     import copy
 
-    # The cleanup lives at the Audio_ALG root, outside this release unit; the
+    # The cleanup lives in Audio_ALG/PTQ, outside this release unit; the
     # exporter does not call it, so the check skips when AINR is released alone.
-    sys.path.append(os.fspath(pathlib.Path(__file__).resolve().parents[3]))
+    sys.path.append(os.fspath(pathlib.Path(__file__).resolve().parents[3] / 'PTQ'))
     b1 = pytest.importorskip('onnx_batch1_optimizer')
 
     torch.manual_seed(74)

@@ -20,3 +20,6 @@ if _AUDIO_ALG not in sys.path:
 _AINR = os.path.join(_AUDIO_ALG, 'AINR')
 if _AINR not in sys.path:
     sys.path.insert(0, _AINR)
+_PTQ = os.path.join(_AUDIO_ALG, 'PTQ')  # onnx_batch1_optimizer
+if _PTQ not in sys.path:
+    sys.path.insert(0, _PTQ)

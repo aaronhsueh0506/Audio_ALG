@@ -256,7 +256,7 @@ board wiring 混為一談。</p>
 
 <p>串流圖固定 batch 1、單幀，追蹤器因此產生大量只增減大小為 1 的軸的 op，以及 5～6 維的中間
 tensor（目標平台量化工具鏈要求 rank-4）。<code>onnx_batch1_optimizer.py</code>（放在
-Audio_ALG 根目錄，不屬於任何單一模型；測試在
+Audio_ALG/PTQ，不屬於任何單一模型；測試在
 <code>AIAEC/tests/test_onnx_batch1_optimizer.py</code>）<b>不屬於任何匯出器</b>：匯出、契約檢查、
 等價比對與量化一致檢查都在未整理的圖上完成，最後才對匯出的 .onnx 單獨執行下列指令，產出可上板的圖。它可用在任何靜態形狀的 ONNX：</p>
 <pre>python3 onnx_batch1_optimizer.py model.onnx -o model_b1.onnx --verify</pre>

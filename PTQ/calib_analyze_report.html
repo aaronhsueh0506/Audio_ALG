@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Calibration pattern analysis</title>
+<style>
+:root{--bg:#fafaf8;--fg:#1d1d1b;--mut:#6b6b66;--card:#fff;--line:#dcdcd4;--acc:#2a6f97;--bad:#c0392b;--gray:#b9b9b2;--ok:#2e8b57;--warn:#b7791f}
+@media (prefers-color-scheme:dark){:root:not([data-theme=light]){--bg:#161615;--fg:#e8e8e3;--mut:#9a9a92;--card:#1f1f1d;--line:#34342f;--acc:#6bb3dc;--bad:#ef7a6c;--gray:#55554f;--ok:#5fc08a;--warn:#e0b050}}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 -apple-system,system-ui,sans-serif}
+main{max-width:1180px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:0 0 4px}h2{font-size:16px;margin:28px 0 8px}
+.sub{color:var(--mut);font-size:13px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:10px 0}
+.bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center}
+button{font:inherit;padding:5px 11px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg);cursor:pointer}
+button.pri{background:var(--acc);color:#fff;border-color:var(--acc)}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:4px 8px;border-bottom:1px solid var(--line);text-align:right;white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+th{color:var(--mut);font-weight:600;position:sticky;top:0;background:var(--card)}
+.scroll{overflow-x:auto}
+canvas{width:100%;height:120px;display:block;cursor:crosshair}
+canvas.tall{height:220px;cursor:default}
+.tip{min-height:18px;font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}
+.flag{color:var(--warn);font-weight:600}.good{color:var(--ok)}.badc{color:var(--bad)}
+.legend span{margin-right:14px;font-size:12px;color:var(--mut)}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+.segtable{max-height:320px;overflow:auto}
+input[type=range]{width:220px}
+</style>
+</head>
+<body>
+<main>
+<h1>Calibration pattern analysis</h1>
+<div class="sub" id="meta"></div>
+
+<div class="card">
+  <div class="bar">
+    <span>Click unit:</span>
+    <label><input type="radio" name="gran" value="unit" checked> <span id="unitLabel"></span></label>
+    <label id="frameOpt"><input type="radio" name="gran" value="frame"> single frame</label>
+    <span style="flex:1"></span>
+    <label>drop most extreme <b id="kval">0</b> <span id="kunit"></span>
+      <input type="range" id="k" min="0" value="0"></label>
+    <button id="reset">Reset</button>
+    <button id="dl" class="pri">Download keep.json</button>
+  </div>
+  <div class="sub" id="live" style="margin-top:6px"></div>
+</div>
+
+<div id="recSection" class="card" style="display:none">
+  <div class="bar"><b>Recommended selection</b><span class="sub" id="recNote"></span>
+    <span style="flex:1"></span><button id="recBtn" class="pri">Apply recommended</button></div>
+  <div class="scroll"><table id="rtab"></table></div>
+  <div class="sub">Dropped frames are the most extreme ones, while no tensor has more than the clip budget of all recorded values outside the kept range; the rest is thinned by k-means so it still covers the data. “typical” SQNR ignores the clipped values (resolution for the bulk of the data), “all” counts them at full error. Which of the two matters is decided by the quantised model's output, not by this page.</div>
+</div>
+
+<h2>Per-tensor statistics and live range</h2>
+<div class="card scroll"><table id="ttab"></table></div>
+<div class="sub">tail ratio = abs-max ÷ 99.9th-percentile |x|. Large values mean a few elements stretch the range. “Fixed band” flags an outlier that always lands on the same channel/feature index — fix the feature scaling rather than the pattern choice.</div>
+
+<h2>Per-frame abs-max (click to drop / restore)</h2>
+<div class="legend"><span><i class="sw" style="background:var(--acc)"></i>kept</span><span><i class="sw" style="background:var(--bad)"></i>holds the current min or max</span><span><i class="sw" style="background:var(--gray)"></i>dropped</span><label><input type="checkbox" id="log"> log y</label></div>
+<div id="charts"></div>
+
+<h2>Simulated 8-bit error vs. dropped patterns</h2>
+<div class="card">
+  <div class="bar"><label>tensor <select id="ctensor"></select></label>
+  <span class="sub">Grid built from the kept patterns; <b>full</b> scores every recorded value (dropped ones get clipped), <b>kept</b> only what the grid was built from. Dropped = most extreme first, in the order of the sliders above.</span></div>
+  <canvas id="curve" class="tall"></canvas>
+  <div class="legend" id="curveLegend"></div>
+</div>
+
+<div id="segSection">
+<h2>Source segments</h2>
+<div class="sub" id="segnote"></div>
+<div class="card segtable"><table id="stab"></table></div>
+</div>
+</main>
+<script>
+const D = /*__DATA__*/null;
+const N = D.meta.frames, names = Object.keys(D.tensors);
+const segs = D.segments, hasSeg = segs.length > 1;
+const dropped = new Uint8Array(N);
+const segOf = new Int32Array(N);
+segs.forEach((s,i)=>{const e=i+1<segs.length?segs[i+1].start:N;for(let f=s.start;f<e;f++)segOf[f]=i;});
+const fmt = v => (v===null||v===undefined)?'–':(Math.abs(v)>=1e4||(v!==0&&Math.abs(v)<1e-3))?v.toExponential(2):(+v.toPrecision(4)).toString();
+const $ = id => document.getElementById(id);
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n);
+
+$('meta').textContent = `${D.meta.path} · ${D.meta.format} · ${N} frames · model ${D.meta.model_family||'?'} · ${D.meta.scheme} 8-bit sim`
+  + (Object.keys(D.meta.skipped).length?` · skipped (not quantised): ${Object.keys(D.meta.skipped).join(', ')}`:'')
+  + (D.meta.contiguous?' · CONTIGUOUS-STREAM MODEL: pruning is refused by apply':'');
+$('unitLabel').textContent = hasSeg ? 'whole source segment' : 'frame';
+if(!hasSeg) $('frameOpt').style.display='none';
+$('kunit').textContent = D.meta.unit+'s';
+const nUnits = hasSeg ? segs.length : N;
+$('k').max = Math.max(1, Math.floor(nUnits/2));
+
+function unitFrames(u){ if(!hasSeg) return [u,u+1]; return [segs[u].start, u+1<segs.length?segs[u+1].start:N]; }
+function setUnit(u,val){ const [a,b]=unitFrames(u); for(let f=a;f<b;f++) dropped[f]=val; }
+function toggleAt(f){
+  const gran = document.querySelector('input[name=gran]:checked').value;
+  if(hasSeg && gran==='unit'){ const [a,b]=unitFrames(segOf[f]); setUnit(segOf[f], dropped[a]?0:1); }
+  else dropped[f]=dropped[f]?0:1;
+}
+
+// ---- tensor table
+function rangeOf(t){
+  const s=D.tensors[t]; let lo=Infinity,hi=-Infinity,ho=-1,hh=-1;
+  for(let f=0;f<N;f++){ if(dropped[f])continue;
+    if(s.frame_min[f]<lo){lo=s.frame_min[f];ho=f;} if(s.frame_max[f]>hi){hi=s.frame_max[f];hh=f;} }
+  return {lo,hi,ho,hh};
+}
+function concCell(c){
+  if(!c) return '–';
+  const fixed = c.ratio>8;
+  return `<span class="${fixed?'flag':''}">${c.ratio.toFixed(1)}× @${c.argmax}/${c.size}${fixed?' fixed band':''}</span>`;
+}
+function renderTable(){
+  let h='<tr><th>tensor</th><th>shape</th><th>min</th><th>max</th><th>p0.1</th><th>p99.9</th><th>p99.99</th><th>KL thr (±)</th><th>MSE range</th><th>EMA min/max</th><th>scale asym</th><th>zp</th><th>levels for 99.8%</th><th>zero %</th><th>tail ratio</th><th>exc. kurt.</th><th>channel conc.</th><th>feature conc.</th><th>live min</th><th>live max</th><th>range shrink</th></tr>';
+  for(const t of names){ const s=D.tensors[t], g=s.global, r=rangeOf(t);
+    const span0=g.max-g.min, span1=r.hi-r.lo, sh=span0>0?100*(1-span1/span0):0;
+    h+=`<tr><td>${t}</td><td>${s.shape.slice(1).join('×')}</td><td>${fmt(g.min)}</td><td>${fmt(g.max)}</td><td>${fmt(g.p001)}</td><td>${fmt(g.p999)}</td><td>${fmt(g.p9999)}</td><td>${fmt(g.kl_threshold)}</td><td>${fmt(g.mse_lo)}…${fmt(g.mse_hi)} (×${g.mse_alpha.toFixed(2)})</td><td>${fmt(g.ema_min)}/${fmt(g.ema_max)}</td><td>${fmt(g.scale_asym)}</td><td>${g.zero_point_asym}</td><td class="${g.levels_p998<64?'flag':''}">${g.levels_p998.toFixed(0)}/255</td><td>${(100*g.zero_frac).toFixed(1)}</td>`
+     +`<td class="${g.tail_ratio>10?'flag':''}">${g.tail_ratio.toFixed(1)}</td><td>${g.excess_kurtosis.toFixed(1)}</td>`
+     +`<td>${concCell(s.concentration.channel)}</td><td>${concCell(s.concentration.last)}</td>`
+     +`<td>${fmt(r.lo)}</td><td>${fmt(r.hi)}</td><td class="${sh>0.5?'good':''}">${sh.toFixed(1)}%</td></tr>`;
+  }
+  $('ttab').innerHTML=h;
+}
+
+// ---- per-frame charts
+const charts={};
+for(const t of names){
+  const d=document.createElement('div'); d.className='card';
+  d.innerHTML=`<b>${t}</b> <span class="sub">${D.tensors[t].shape.slice(1).join('×')}</span><canvas></canvas><div class="tip"></div>`;
+  $('charts').appendChild(d);
+  const cv=d.querySelector('canvas'), tip=d.querySelector('.tip');
+  charts[t]={cv,tip};
+  const frameAt=e=>{const r=cv.getBoundingClientRect();return Math.min(N-1,Math.max(0,Math.floor((e.clientX-r.left)/r.width*N)));};
+  cv.addEventListener('click',e=>{toggleAt(frameAt(e));refresh();});
+  cv.addEventListener('mousemove',e=>{const f=frameAt(e),s=D.tensors[t];
+    const sg=hasSeg?` · segment ${segOf[f]}${segs[segOf[f]].source?' ('+segs[segOf[f]].source+')':''}`:'';
+    tip.textContent=`frame ${f}${sg} · abs-max ${fmt(s.frame_absmax[f])} · min ${fmt(s.frame_min[f])} · max ${fmt(s.frame_max[f])} · LOO range shrink ${(100*s.frame_shrink[f]).toFixed(2)}%${dropped[f]?' · DROPPED':''}`;});
+}
+function drawChart(t){
+  const {cv}=charts[t], s=D.tensors[t], dpr=window.devicePixelRatio||1;
+  const w=cv.clientWidth, h=cv.clientHeight; cv.width=w*dpr; cv.height=h*dpr;
+  const c=cv.getContext('2d'); c.scale(dpr,dpr); c.clearRect(0,0,w,h);
+  const log=$('log').checked, r=rangeOf(t);
+  let mx=0; for(let f=0;f<N;f++) mx=Math.max(mx,s.frame_absmax[f]); mx=mx||1;
+  const y=v=>log?h-(Math.log10(Math.max(v,mx*1e-6))-Math.log10(mx*1e-6))/(-Math.log10(1e-6))*(h-4)-2:h-2-v/mx*(h-4);
+  const col=new Array(w), val=new Float64Array(w).fill(-1), st=new Uint8Array(w);
+  for(let f=0;f<N;f++){ const x=Math.min(w-1,Math.floor(f/N*w)); const v=s.frame_absmax[f];
+    const k=dropped[f]?1:((f===r.ho||f===r.hh)?3:2);
+    if(k>st[x]||(k===st[x]&&v>val[x])){st[x]=k;val[x]=v;} }
+  if(hasSeg){c.strokeStyle=css('--line');c.lineWidth=1;for(const sg of segs.slice(1)){const x=Math.floor(sg.start/N*w)+.5;c.beginPath();c.moveTo(x,0);c.lineTo(x,h);c.stroke();}}
+  for(let x=0;x<w;x++){ if(!st[x])continue;
+    c.fillStyle=st[x]===3?css('--bad'):st[x]===1?css('--gray'):css('--acc');
+    const top=y(val[x]); c.fillRect(x,top,Math.max(1,w/N),h-2-top); }
+  c.fillStyle=css('--mut');c.font='11px sans-serif';c.fillText(fmt(mx),4,11);
+}
+
+// ---- curve
+const sel=$('ctensor'); names.forEach(t=>sel.add(new Option(t,t)));
+function drawCurve(){
+  const cv=$('curve'), t=sel.value, dpr=window.devicePixelRatio||1, w=cv.clientWidth, h=cv.clientHeight;
+  cv.width=w*dpr;cv.height=h*dpr;const c=cv.getContext('2d');c.scale(dpr,dpr);c.clearRect(0,0,w,h);
+  const ks=D.curves.k, cur=D.curves.tensors[t];
+  const lines=[['minmax','sqnr_full','min/max · full','#2a6f97',0],['minmax','sqnr_kept','min/max · kept','#2a6f97',1],
+               ['pct','sqnr_full','p0.1–99.9 · full','#c77d1a',0],['pct','sqnr_kept','p0.1–99.9 · kept','#c77d1a',1],
+               ['mse','sqnr_full','MSE-clip · full','#2e8b57',0],['mse','sqnr_kept','MSE-clip · kept','#2e8b57',1]];
+  let lo=Infinity,hi=-Infinity;
+  for(const [m,f] of lines) for(const p of cur[m]) if(p){lo=Math.min(lo,p[f]);hi=Math.max(hi,p[f]);}
+  if(!isFinite(lo)){return;} const pad=(hi-lo)*.1||1; lo-=pad;hi+=pad;
+  const L=44,B=22,Tp=8,R=8, X=i=>L+(i/(ks.length-1||1))*(w-L-R), Y=v=>Tp+(1-(v-lo)/(hi-lo))*(h-Tp-B);
+  c.strokeStyle=css('--line');c.fillStyle=css('--mut');c.font='11px sans-serif';c.lineWidth=1;
+  for(let i=0;i<=4;i++){const v=lo+(hi-lo)*i/4,yy=Y(v);c.beginPath();c.moveTo(L,yy);c.lineTo(w-R,yy);c.stroke();c.fillText(v.toFixed(1)+' dB',2,yy+3);}
+  ks.forEach((k,i)=>{if(i%Math.ceil(ks.length/8)===0||i===ks.length-1)c.fillText(k,X(i)-4,h-6);});
+  for(const [m,f,label,color,dash] of lines){ c.strokeStyle=color;c.setLineDash(dash?[4,3]:[]);c.lineWidth=2;c.beginPath();
+    let first=true; cur[m].forEach((p,i)=>{if(!p)return; const xx=X(i),yy=Y(p[f]); first?c.moveTo(xx,yy):c.lineTo(xx,yy);first=false;}); c.stroke(); }
+  c.setLineDash([]);
+  const kcur=+$('k').value, ki=ks.findIndex(k=>k>=kcur);
+  if(ki>=0){c.strokeStyle=css('--bad');c.lineWidth=1;c.beginPath();c.moveTo(X(ki),Tp);c.lineTo(X(ki),h-B);c.stroke();}
+  $('curveLegend').innerHTML=lines.map(l=>`<span><i class="sw" style="background:${l[3]};${l[4]?'opacity:.5':''}"></i>${l[2]}</span>`).join('')
+    +`<span>x = ${D.meta.unit}s dropped (most extreme first)</span>`;
+}
+
+// ---- segments table
+function renderSegs(){
+  if(!hasSeg){$('segSection').style.display='none';return;}
+  $('segnote').textContent=D.meta.segments_note+(D.meta.segments_reliable?'':' — treat source names as unavailable.');
+  const rank=new Int32Array(segs.length); D.unit_order.forEach((u,i)=>rank[u]=i+1);
+  let h='<tr><th>seg</th><th>source</th><th>start</th><th>frames</th><th>extremeness (×median)</th><th>rank</th><th>drop</th></tr>';
+  segs.forEach((s,i)=>{h+=`<tr><td>${i}</td><td>${s.source||'–'}</td><td>${s.start}</td><td>${s.frames}</td><td>${D.unit_score[i].toFixed(2)}</td><td>${rank[i]}</td><td><input type="checkbox" data-seg="${i}"></td></tr>`;});
+  $('stab').innerHTML=h;
+  $('stab').querySelectorAll('input').forEach(cb=>cb.addEventListener('change',()=>{setUnit(+cb.dataset.seg,cb.checked?1:0);refresh(false);}));
+}
+function syncSegChecks(){ if(!hasSeg)return;
+  $('stab').querySelectorAll('input').forEach(cb=>{const [a]=unitFrames(+cb.dataset.seg);cb.checked=!!dropped[a];}); }
+
+function refresh(syncK=true){
+  let kept=0;for(let f=0;f<N;f++)if(!dropped[f])kept++;
+  $('live').textContent=`${kept} of ${N} frames kept (${N-kept} dropped)`;
+  renderTable(); names.forEach(drawChart); drawCurve(); syncSegChecks();
+}
+$('k').addEventListener('input',()=>{const k=+$('k').value;$('kval').textContent=k;dropped.fill(0);
+  for(let i=0;i<k;i++)setUnit(D.unit_order[i],1);refresh();});
+$('reset').onclick=()=>{dropped.fill(0);$('k').value=0;$('kval').textContent=0;refresh();};
+$('log').onchange=refresh; sel.onchange=drawCurve; window.addEventListener('resize',refresh);
+$('dl').onclick=()=>{
+  const keep=[];for(let f=0;f<N;f++)if(!dropped[f])keep.push(f);
+  const blob=new Blob([JSON.stringify({artifact:D.meta.path,keep_frames:keep},null,1)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='keep.json';a.click();};
+function renderRec(){
+  const r=D.recommend; if(!r)return;
+  $('recSection').style.display='';
+  $('recNote').textContent=` ${r.keep_frames.length} of ${N} frames · clip budget ${r.max_clip_pct}%`+(r.notes.length?' · '+r.notes.join('; '):'');
+  let t='<tr><th>subset</th><th>tensor</th><th>range</th><th>clipped %</th><th>SQNR typical (dB)</th><th>SQNR all (dB)</th></tr>';
+  for(const tab of [r.all,r.selected]) tab.rows.forEach((row,i)=>{
+    t+=`<tr><td>${i?'':tab.label+' ('+tab.frames+')'}</td><td>${row.tensor}</td><td>${fmt(row.lo)} … ${fmt(row.hi)}</td><td>${row.clip_pct.toFixed(3)}</td><td>${row.sqnr_typical.toFixed(2)}</td><td>${row.sqnr_all.toFixed(2)}</td></tr>`;});
+  $('rtab').innerHTML=t;
+  $('recBtn').onclick=()=>{dropped.fill(1);for(const f of r.keep_frames)dropped[f]=0;
+    $('k').value=0;$('kval').textContent=0;refresh();};
+}
+renderSegs(); renderRec(); refresh();
+</script>
+</body>
+</html>
