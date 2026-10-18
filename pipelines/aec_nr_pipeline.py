@@ -263,6 +263,15 @@ def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
     NR gain ALSO suppresses residual echo. R²=ctx.r2/psd_scale is already on the
     |E|² scale the denoiser's noise floor uses (β_r=1). Combine downstream with
     ``min(g_nr, g_res)`` — g_res stays load-bearing (dropping it kills echo).
+
+    Injection is additionally gated per hop on ``ctx.usable_linear`` (AEC's own
+    ``AecState.usable_linear_estimate()`` verdict for that hop, already carried
+    on the context): before the linear filter is usable, R² comes from AEC's
+    nonlinear-path fallback, which is a deliberately conservative
+    "assume-unmitigated-echo" estimate, not a trustworthy per-bin noise-floor
+    term. A hop with ``usable_linear`` False or None (no verdict, e.g. a
+    fused multi-lane context) contributes zero extra noise PSD, same as a
+    missing ``r2``.
     """
     if not aec_contexts:
         raise ValueError("aec_contexts must not be empty")
@@ -275,8 +284,9 @@ def run_nr_spectrum(aec_contexts: List[AecResContext], sample_rate: int,
         psd_scale = 32768.0 ** 2   # ctx.r2 is int16²-scaled like comfort_noise
         n_freqs = magnitude.shape[1]
         extra = np.stack([
-            (np.asarray(c.r2, dtype=np.float64) / psd_scale) if c.r2 is not None
-            else np.zeros(n_freqs) for c in aec_contexts])
+            (np.asarray(c.r2, dtype=np.float64) / psd_scale)
+            if (c.r2 is not None and c.usable_linear) else np.zeros(n_freqs)
+            for c in aec_contexts])
     fft_size = 2 * (spectra.shape[1] - 1)
     denoiser = _build_denoiser(
         sample_rate, nr_preset,
