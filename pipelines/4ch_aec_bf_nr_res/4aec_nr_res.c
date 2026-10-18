@@ -36,21 +36,29 @@
 #include "common/se_config.h"     /* se_derive(): grid + AecConfig, shared by every application */
 #include "common/se_anr_stage.h"  /* se_anr_compose_config()                                     */
 
-/* Matched-filter duty cycle. The two WINDOWS are not literals here: they are
+/* Matched-filter duty cycle. The hold WINDOW is not a literal here: it is
  * read from the lane AecConfig this file already builds at init --
- * delay_est_init_s and delay_est_period_s, the very fields lib/aec reads for
- * its own always-on machine -- so the shared estimator decimates on exactly
- * the schedule a lane's own estimator would, and a future retune of either
- * field reaches both implementations instead of silently reaching one. Hold
- * the analysis at full rate until the estimate has been solid and unchanged
- * for delay_est_init_s, then analyse one hop in
+ * delay_est_init_s, the same field lib/aec reads for its own machine -- so
+ * the shared estimator holds for exactly as long as a lane's own estimator
+ * would. The period window, delay_est_period_s, is NOT read through from
+ * that same AecConfig (see derive_dims_and_configs()): it is this core's
+ * cfg.delay_est_period_s instead, this wrapper's own opt-in contract rather
+ * than a silent mirror of whatever lib/aec currently defaults to -- the two
+ * used to be the same field by construction (commit 07a51b1), and that is
+ * exactly what broke when lib/aec's own default moved (AMEND_35,
+ * 2026-10-18) out from under this file's unrelated floor. Hold the analysis
+ * at full rate until the estimate has been solid and unchanged for
+ * delay_est_init_s, then analyse one hop in
  * K = round(delay_est_period_s/hop_s)/DUTY_PERIOD_DIVISOR.
  *
- * The divisor and the two floors -- one hop of hold, and a period of at
- * least 2 so "decimated" always means something -- stay literals for the
- * same reason they are literals in lib/aec: they are the SHAPE of the
- * schedule, not a tuning surface, and neither library exposes them. So does
- * the watchdog's collapse figure: it is a depth in dB and carries no clock.
+ * The divisor and the hold floor of one hop stay literals for the same
+ * reason they are literals in lib/aec: they are the SHAPE of the schedule,
+ * not a tuning surface, and neither library exposes them. The period floor
+ * is 1, not 2 -- "a period of at least 2 so decimated always means
+ * something" was this file's floor before AMEND_35 fixed the identical bug
+ * in lib/aec; keeping it here after would silently re-cap this core's own
+ * delay_est_period_s=0.0 default at 50% engagement. So does the watchdog's
+ * collapse figure: it is a depth in dB and carries no clock.
  *
  * The watchdog's LEAK does carry one, and is the only number here that is not
  * used as written. It is lib/aec's literal, and lib/aec calibrated it on the
@@ -151,7 +159,6 @@ typedef struct FourAecLaneSnapshot {
     float dt_indicator;
     float saturation_level;
     int filter_converged;
-    int usable_linear;
 } FourAecLaneSnapshot;
 
 struct FourAecNrRes {
@@ -352,6 +359,17 @@ static int derive_dims_and_configs(
     if (!isfinite(cfg->delay_backward_quarantine_s) ||
         cfg->delay_backward_quarantine_s < 0.0f ||
         cfg->delay_backward_quarantine_s > 3600.0f) return 0;
+    if (!isfinite(cfg->delay_est_period_s) ||
+        cfg->delay_est_period_s < 0.0f ||
+        cfg->delay_est_period_s > 3600.0f) return 0;
+    /* The wrapper's own duty-cycle contract, not lib/aec's: se_derive() ->
+     * aec_config_from_preset() -> aec_config_defaults() already set
+     * aec_cfg->delay_est_period_s to whatever lib/aec defaults to, but that
+     * value is an implementation detail of a library the lanes here run
+     * with enable_delay_est=0 (they never read it) -- the shared estimator
+     * is the only consumer, and it is this struct's field, authoritatively,
+     * so it overwrites rather than defers to lib/aec's default. */
+    aec_cfg->delay_est_period_s = cfg->delay_est_period_s;
     if (!isfinite(cfg->max_delay_ms) ||
         cfg->max_delay_ms < 0.0f || cfg->max_delay_ms > 4096.0f) return 0;
     *fft_size = grid.fft_size;
@@ -561,6 +579,7 @@ FourAecNrResConfig four_aec_nr_res_default_config(int sample_rate) {
     cfg.capture_proxy_channel = 0;
     cfg.delay_backward_quarantine_enabled = 0;
     cfg.delay_backward_quarantine_s = 1.0f;
+    cfg.delay_est_period_s = 0.0f;   /* full rate; see 4aec_nr_res.h doc */
     cfg.max_delay_ms = 1024.0f;
     cfg.aec_preset = AEC_PRESET_BALANCED;
     cfg.nr_mode = ANR_MODE_BALANCED;
@@ -676,13 +695,23 @@ FourAecNrRes* four_aec_nr_res_init_ex(
          * same resolved grid and with the same floors. Converted once here
          * rather than per hop because this grid cannot change after init; the
          * values are the ones lib/aec's per-hop conversion would produce from
-         * the same seconds. */
+         * the same seconds.
+         *
+         * Floor of 1, not 2: lib/aec's own floor was 2 until AMEND_35
+         * (2026-10-18) found it silently capped delay_est_period_s=0.0 at
+         * 50% engagement instead of true full-rate, changing WHICH delay the
+         * matched filter could ever settle on, not just when -- see aec.c's
+         * duty_period_hops init. This core's cfg.delay_est_period_s is its
+         * own field (derive_dims_and_configs() overwrites whatever lib/aec's
+         * preset defaulted aec_cfg.delay_est_period_s to), defaulting to 0.0
+         * for the same reason, so it must floor the same way or it
+         * reintroduces exactly the bug AMEND_35 fixed, one layer up. */
         {
             int hold = (int)lrintf(aec_cfg.delay_est_init_s / q_hop_s);
             int period = (int)lrintf(aec_cfg.delay_est_period_s / q_hop_s) /
                          DUTY_PERIOD_DIVISOR;
             p->duty_hold_hops = hold < 1 ? 1 : hold;
-            p->duty_period_hops = period < 2 ? 2 : period;
+            p->duty_period_hops = period < 1 ? 1 : period;
             p->duty_erle_leak_db =
                 duty_leak_db_for_grid(hop, cfg_copy.sample_rate);
         }
@@ -903,10 +932,15 @@ static FourAecNrResDelayState update_shared_delay(
      * hop cannot publish a new one -- so a movement mid-stream is SEEN at the
      * next SCHEDULED analysis, not on the hop it happens. Full rate then
      * resumes from the hop that sees it, and the whole exposure is bounded by
-     * one duty period: at most duty_period_hops of extra wait, which is ~96 ms
-     * on every grid this pipeline ships (16 kHz/128 K=12, 16 kHz/256 K=6,
-     * 48 kHz/512 K=9 -- the /5 divisor and the rounding land all three on the
-     * same wall clock). The ERLE watchdog below can shorten that by
+     * one duty period: at most duty_period_hops of extra wait. At the
+     * default cfg.delay_est_period_s=0.0 that period is 1 (full rate, no
+     * wait at all). The K=12/6/9 figures below (~96 ms on every grid this
+     * pipeline ships: 16 kHz/128, 16 kHz/256, 48 kHz/512 -- the /5 divisor
+     * and the rounding land all three on the same wall clock) are what
+     * opting into the throttle at cfg.delay_est_period_s=0.5 reproduces --
+     * the regime this file ran by default before AMEND_35 (2026-10-18)
+     * moved lib/aec's own matching default to full rate. The ERLE watchdog
+     * below can shorten that by
      * disengaging on a cancellation collapse the skipped hops still measure,
      * but it is armed only once a lane's windowed ERLE clears
      * DUTY_ERLE_COLLAPSE_DB: on a path where no lane ever cancels that well,
@@ -1189,7 +1223,6 @@ static int bind_lane_view(FourAecLaneSnapshot* dst,
     dst->dt_indicator = src->dt_indicator;
     dst->saturation_level = src->saturation_level;
     dst->filter_converged = src->filter_converged;
-    dst->usable_linear = src->usable_linear;
     return 1;
 }
 
@@ -1405,7 +1438,6 @@ static int fuse_contexts(FourAecNrRes* p,
                          const Complex* weights,
                          const Complex* trusted_beamformed_error,
                          int* all_converged,
-                         int* usable_linear,
                          float* max_dt,
                          float* max_saturation) {
     int n = p->n_freqs;
@@ -1414,7 +1446,6 @@ static int fuse_contexts(FourAecNrRes* p,
     float base_far_power = p->snapshots[0].far_power;
 
     *all_converged = 1;
-    *usable_linear = 1;
     /* Seeded neutral rather than from lane 0, so lane 0 is subject to the
      * same contributes-to-the-output test as every other lane below. Both
      * quantities are non-negative, so 0 is the identity for the max. At
@@ -1466,8 +1497,6 @@ static int fuse_contexts(FourAecNrRes* p,
         if (lane_contributes) {
             if (!p->snapshots[ch].filter_converged)
                 *all_converged = 0;
-            if (!p->snapshots[ch].usable_linear)
-                *usable_linear = 0;
             if (p->snapshots[ch].dt_indicator > *max_dt)
                 *max_dt = p->snapshots[ch].dt_indicator;
             if (p->snapshots[ch].saturation_level > *max_saturation)
@@ -1511,7 +1540,6 @@ int four_aec_fuse(
     const Complex* beamformed_error,
     SeSpecFrame* frame) {
     int all_converged;
-    int usable_linear;
     float max_dt;
     float max_saturation;
     uint32_t t0;
@@ -1526,7 +1554,7 @@ int four_aec_fuse(
     t0 = four_aec_nr_res_now_us();
     if (!fuse_contexts(
             p, weights, beamformed_error,
-            &all_converged, &usable_linear, &max_dt, &max_saturation)) {
+            &all_converged, &max_dt, &max_saturation)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
@@ -1547,7 +1575,6 @@ int four_aec_fuse(
     frame->max_dt = max_dt;
     frame->max_sat = max_saturation;
     frame->all_converged = all_converged;
-    frame->usable_linear = usable_linear;
     frame->clock_drift = p->cfg.delay_mode == AEC_DELAY_MATCHED
         ? delay_aec3_has_clockdrift(&p->shared_delay) : 0;
     frame->delay_changed = p->last_delay.changed;
@@ -1706,9 +1733,12 @@ int four_aec_nr_res_far_spec_provenance(const FourAecNrRes* p) {
  * decision site: duty_pos advances into the period and immediately wraps, so
  * run_filter is true whether or not the machine ever arms, and the arming,
  * the hold and the watchdog keep running and keep being measurable through
- * the census. init's floor of 2 is the PRODUCTION floor -- a period of 1
- * would make "decimated" mean nothing there -- and this is the one caller
- * for which meaning nothing is the point. */
+ * the census. init's own floor is 1 too now (AMEND_35-mirrored, see the
+ * carve-site comment), so at the default cfg.delay_est_period_s=0.0 this
+ * call is already a no-op -- this setter earns its keep only for a core
+ * built with a non-zero delay_est_period_s (the opt-in throttle), where it
+ * forces the schedule back to full rate for a parity harness without
+ * disturbing anything else the duty machine tracks. */
 void four_aec_nr_res_pin_duty_full_rate(FourAecNrRes* p) {
     if (!p || p->destroyed) return;
     p->duty_period_hops = 1;

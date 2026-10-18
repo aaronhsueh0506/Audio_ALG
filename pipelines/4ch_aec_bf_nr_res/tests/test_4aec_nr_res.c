@@ -744,6 +744,29 @@ static void test_invalid_configs(void) {
     CHECK(four_aec_nr_res_get_mem_requirements(&cfg, &req) == 0,
           "a valid enabled quarantine config is ACCEPTED (so the rows above "
           "are a real check, not an identity)");
+
+    /* Shared-estimator duty-cycle throttle: same range contract as the
+     * quarantine window above, and checked for the same reason -- a config
+     * that would misbehave the moment someone opts into the throttle must
+     * not pass validation today. */
+    cfg = four_aec_nr_res_default_config(16000);
+    CHECK(cfg.delay_est_period_s == 0.0f,
+          "the duty-cycle throttle defaults to OFF (full rate)");
+    cfg.delay_est_period_s = -1.0f;
+    CHECK(four_aec_nr_res_create(&cfg) == NULL,
+          "a negative duty-cycle period is rejected");
+    cfg.delay_est_period_s = 3601.0f;
+    CHECK(four_aec_nr_res_create(&cfg) == NULL,
+          "an out-of-range duty-cycle period is rejected");
+    cfg.delay_est_period_s = (float)NAN;
+    CHECK(four_aec_nr_res_create(&cfg) == NULL,
+          "a NaN duty-cycle period is rejected");
+
+    cfg = four_aec_nr_res_default_config(16000);
+    cfg.delay_est_period_s = 0.5f;
+    CHECK(four_aec_nr_res_get_mem_requirements(&cfg, &req) == 0,
+          "a valid opted-in duty-cycle period is ACCEPTED (so the rows above "
+          "are a real check, not an identity)");
 }
 
 static void run_static_parity(int sample_rate, int fft_size) {
@@ -847,13 +870,13 @@ static void run_static_parity(int sample_rate, int fft_size) {
      * build_flags_hash still matches and this counter is the whole signal.
      * Bump this literal with FOUR_AEC_NR_RES_LAYOUT_VERSION. */
     stale = req;
-    stale.layout_version = 18u;
+    stale.layout_version = 19u;
     CHECK(four_aec_nr_res_init_ex(
               pool, (size_t)req.bytes, &cfg, &stale) == NULL,
           "static init_ex rejects a descriptor from the superseded layout "
           "even when its byte count exactly covers the current pool");
     CHECK(req.layout_version == FOUR_AEC_NR_RES_LAYOUT_VERSION &&
-          FOUR_AEC_NR_RES_LAYOUT_VERSION == 19u,
+          FOUR_AEC_NR_RES_LAYOUT_VERSION == 20u,
           "the queried descriptor publishes the current carve layout");
 
     stat = four_aec_nr_res_init_ex(
@@ -2210,6 +2233,12 @@ static void duty_run(int hops, int delay_a, int delay_b, int shift_at,
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
     cfg.enable_cng = 0;
+    /* The throttle is opt-in since AMEND_35 (2026-10-18; default is full
+     * rate) -- this scene exists specifically to characterize the throttle,
+     * so it asks for the regime explicitly rather than relying on a default
+     * that no longer produces it. 0.5 s is the pre-AMEND_35 default this
+     * scene's numbers were always measured against. */
+    cfg.delay_est_period_s = 0.5f;
     p = four_aec_nr_res_create(&cfg);
     if (!p) return;
 
@@ -2633,15 +2662,19 @@ static void test_duty_watchdog_leak_is_a_rate(void) {
  * it provably never arms, cannot fire, and the 1-in-K analysis schedule is
  * the WHOLE re-lock mechanism. The same scene is driven twice, once with the
  * schedule pinned at full rate through four_aec_nr_res_pin_duty_full_rate()
- * and once as production runs it, and the two re-lock latencies are printed
- * side by side.
+ * and once with the throttle opted into via cfg.delay_est_period_s (the
+ * default since AMEND_35, 2026-10-18, is already full rate -- an embedded
+ * deployment that wants this scene's compute saving back has to ask for the
+ * throttle explicitly, the same way the C port's own cfg.delay_est_period_s
+ * works), and the two re-lock latencies are printed side by side.
  *
  * This is a CHARACTERIZATION: the numbers below are measured, not derived,
  * and they exist so a change that makes the gap WORSE fails here instead of
  * being discovered on a board. K is 6 on this grid because
- * delay_est_period_s is 0.5 s and the hop is 16 ms
- * (round(0.5/0.016)/5 = 6); a retune of that field moves K and is SUPPOSED
- * to land here as a red test that has to be re-measured.
+ * cfg.delay_est_period_s is set to 0.5 s and the hop is 16 ms
+ * (round(0.5/0.016)/5 = 6); a retune of that field, or of low_erle_run()'s
+ * own opt-in value, moves K and is SUPPOSED to land here as a red test that
+ * has to be re-measured.
  *
  * One non-obvious property, spelled out because the assertions below are
  * shaped around it: removing the estimate-moved disengage entirely does NOT
@@ -2710,6 +2743,11 @@ static void low_erle_run(int pin_full_rate, LowErleRun* out) {
 
     cfg.fft_size = 512;             /* the ULCNet grid: hop 256 */
     cfg.enable_cng = 0;
+    /* The throttle is opt-in since AMEND_35 (2026-10-18; default is full
+     * rate) -- this scene exists to compare the throttled duty arm against
+     * a full-rate one, so it asks for the throttled regime explicitly. 0.5 s
+     * is the pre-AMEND_35 default LE_DUTY_K was always measured against. */
+    cfg.delay_est_period_s = 0.5f;
     p = four_aec_nr_res_create(&cfg);
     if (!p) return;
     if (pin_full_rate) four_aec_nr_res_pin_duty_full_rate(p);

@@ -34,7 +34,7 @@ extern "C" {
 #define FOUR_AEC_DFN_RES_DESCRIPTOR_VERSION 1u
 /* Carve layout version. Any change of pool size, carve order or descriptor
  * content bumps it, including a change of the composed core or stage pool. */
-#define FOUR_AEC_DFN_RES_LAYOUT_VERSION 3u
+#define FOUR_AEC_DFN_RES_LAYOUT_VERSION 4u
 
 /* front_end must carry enable_post=1, enable_res=1, enable_nr=0; its
  * enable_cng is the core's own comfort-noise fill, which lands in the

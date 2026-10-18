@@ -78,7 +78,7 @@ extern "C" {
  * stages are carved by the application, not here. Any change of pool size,
  * carve order or descriptor content bumps it. Query a fresh descriptor for
  * every build; do not persist or synthesize one from this version number. */
-#define FOUR_AEC_NR_RES_LAYOUT_VERSION 19u
+#define FOUR_AEC_NR_RES_LAYOUT_VERSION 20u
 #define FOUR_AEC_NR_RES_BACKEND_KISS 1u
 #define FOUR_AEC_NR_RES_BACKEND_NE10 2u
 
@@ -190,6 +190,28 @@ typedef struct FourAecNrResConfig {
      * windowed ERLE. */
     int delay_backward_quarantine_enabled;  /* bool                         */
     float delay_backward_quarantine_s;      /* window, seconds; default 1.0 */
+    /* Shared matched-filter duty-cycle throttle: once the published estimate
+     * has held still for delay_est_init_s (fixed at lib/aec's own 0.3 s; not
+     * exposed here), analyse the matched filter 1-in-round(delay_est_period_s
+     * / hop_s)/5 hops instead of every hop. Same windows, same re-arm
+     * triggers and same ERLE watchdog as lib/aec's own per-lane machine
+     * (update_shared_delay() in 4aec_nr_res.c), but this field is the
+     * WRAPPER's own contract, not a silent read-through of AecConfig's
+     * field of the same name: derive_dims_and_configs() writes it into the
+     * per-lane config it builds, so a future change to lib/aec's own
+     * default cannot silently retime the shared estimator out from under a
+     * caller who never asked for that.
+     *
+     * 0.0 (the default) = full rate, no decimation -- matching lib/aec's own
+     * default since AMEND_35 (2026-10-18; delay_est_period_s defaulting to
+     * 0.5 could make the matched filter settle on a different lag than
+     * Python's always-full-rate reference, not merely settle on it slower).
+     * A positive value opts back into the throttle for an embedded
+     * deployment that wants the compute saving (measured 17.0->4.3 us/hop
+     * for the shared delay stage, see commit 07a51b1) and accepts that
+     * parity cost. Range-checked like delay_backward_quarantine_s (finite,
+     * [0, 3600]), mirroring lib/aec's own AEC_CK_RANGE_F bound. */
+    float delay_est_period_s;
     float max_delay_ms;           /* MATCHED reference delay-line capacity   */
     AecPreset aec_preset;
     AnrMode nr_mode;
