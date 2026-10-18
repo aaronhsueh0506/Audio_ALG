@@ -97,6 +97,15 @@ def load_artifact(path):
         width = max(4, len(str(frames - 1)))
         arrays = {}
         for name, spec in report['binary_tensors'].items():
+            # Same guard AINR/calibration_io.py's writer already applies to
+            # tensor names before using them as path components -- this
+            # reader had no equivalent check on the name it loads FROM a
+            # manifest.json that is itself untrusted input (a shared/vendor
+            # calibration artifact), so an absolute or ".."-containing name
+            # could otherwise make os.path.join() escape this directory.
+            if name != os.path.basename(name) or name in ('.', '..'):
+                raise ValueError('invalid calibration tensor name in '
+                                 'manifest.json: %r' % name)
             dtype = np.dtype(spec['dtype']).newbyteorder('<')
             shape = tuple(spec['frame_shape'])
             out = np.empty((frames,) + shape, dtype=dtype.newbyteorder('='))
