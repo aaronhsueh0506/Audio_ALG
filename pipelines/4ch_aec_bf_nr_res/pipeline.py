@@ -592,6 +592,13 @@ def _fuse_contexts(
         far_spec=far_spec.astype(np.complex64),
         near_spec=near_spec.astype(np.complex64),
         filter_converged=all(c.filter_converged for c in contributors),
+        # Same contributors-only rule as filter_converged just above: a lane
+        # that doesn't steer the beam shouldn't veto readiness either. Left
+        # unset (None, the AecResContext default) this silently reads as
+        # "not usable" wherever a consumer treats None as not-safe (see
+        # aec_nr_pipeline.run_nr_spectrum's usable_linear gate) -- a fused
+        # context must carry a real verdict, not fall back to that default.
+        usable_linear=all(bool(c.usable_linear) for c in contributors),
         erle_factor=float(min(c.erle_factor for c in contexts)),
         dt_indicator=float(max(c.dt_indicator for c in contributors)),
         divergence=float(max(c.divergence for c in contexts)),
