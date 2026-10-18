@@ -106,6 +106,16 @@ function toggleAt(f){
   else dropped[f]=dropped[f]?0:1;
 }
 
+// HTML-escape any string field before interpolating it into an innerHTML
+// template -- tensor names and segment source names both come from the
+// calibration artifact's manifest.json / npz member names, which this tool
+// never validates as a "safe identifier" (unlike AINR/calibration_io.py's
+// writer, which does reject path-unsafe names before ever writing a file).
+// Treat them as untrusted strings here, not as implicitly-safe labels.
+function esc(s){
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
 // ---- tensor table
 function rangeOf(t){
   const s=D.tensors[t]; let lo=Infinity,hi=-Infinity,ho=-1,hh=-1;
@@ -122,7 +132,7 @@ function renderTable(){
   let h='<tr><th>tensor</th><th>shape</th><th>min</th><th>max</th><th>p0.1</th><th>p99.9</th><th>p99.99</th><th>KL thr (±)</th><th>MSE range</th><th>EMA min/max</th><th>scale asym</th><th>zp</th><th>levels for 99.8%</th><th>zero %</th><th>tail ratio</th><th>exc. kurt.</th><th>channel conc.</th><th>feature conc.</th><th>live min</th><th>live max</th><th>range shrink</th></tr>';
   for(const t of names){ const s=D.tensors[t], g=s.global, r=rangeOf(t);
     const span0=g.max-g.min, span1=r.hi-r.lo, sh=span0>0?100*(1-span1/span0):0;
-    h+=`<tr><td>${t}</td><td>${s.shape.slice(1).join('×')}</td><td>${fmt(g.min)}</td><td>${fmt(g.max)}</td><td>${fmt(g.p001)}</td><td>${fmt(g.p999)}</td><td>${fmt(g.p9999)}</td><td>${fmt(g.kl_threshold)}</td><td>${fmt(g.mse_lo)}…${fmt(g.mse_hi)} (×${g.mse_alpha.toFixed(2)})</td><td>${fmt(g.ema_min)}/${fmt(g.ema_max)}</td><td>${fmt(g.scale_asym)}</td><td>${g.zero_point_asym}</td><td class="${g.levels_p998<64?'flag':''}">${g.levels_p998.toFixed(0)}/255</td><td>${(100*g.zero_frac).toFixed(1)}</td>`
+    h+=`<tr><td>${esc(t)}</td><td>${s.shape.slice(1).join('×')}</td><td>${fmt(g.min)}</td><td>${fmt(g.max)}</td><td>${fmt(g.p001)}</td><td>${fmt(g.p999)}</td><td>${fmt(g.p9999)}</td><td>${fmt(g.kl_threshold)}</td><td>${fmt(g.mse_lo)}…${fmt(g.mse_hi)} (×${g.mse_alpha.toFixed(2)})</td><td>${fmt(g.ema_min)}/${fmt(g.ema_max)}</td><td>${fmt(g.scale_asym)}</td><td>${g.zero_point_asym}</td><td class="${g.levels_p998<64?'flag':''}">${g.levels_p998.toFixed(0)}/255</td><td>${(100*g.zero_frac).toFixed(1)}</td>`
      +`<td class="${g.tail_ratio>10?'flag':''}">${g.tail_ratio.toFixed(1)}</td><td>${g.excess_kurtosis.toFixed(1)}</td>`
      +`<td>${concCell(s.concentration.channel)}</td><td>${concCell(s.concentration.last)}</td>`
      +`<td>${fmt(r.lo)}</td><td>${fmt(r.hi)}</td><td class="${sh>0.5?'good':''}">${sh.toFixed(1)}%</td></tr>`;
@@ -134,7 +144,7 @@ function renderTable(){
 const charts={};
 for(const t of names){
   const d=document.createElement('div'); d.className='card';
-  d.innerHTML=`<b>${t}</b> <span class="sub">${D.tensors[t].shape.slice(1).join('×')}</span><canvas></canvas><div class="tip"></div>`;
+  d.innerHTML=`<b>${esc(t)}</b> <span class="sub">${D.tensors[t].shape.slice(1).join('×')}</span><canvas></canvas><div class="tip"></div>`;
   $('charts').appendChild(d);
   const cv=d.querySelector('canvas'), tip=d.querySelector('.tip');
   charts[t]={cv,tip};
@@ -193,7 +203,7 @@ function renderSegs(){
   $('segnote').textContent=D.meta.segments_note+(D.meta.segments_reliable?'':' — treat source names as unavailable.');
   const rank=new Int32Array(segs.length); D.unit_order.forEach((u,i)=>rank[u]=i+1);
   let h='<tr><th>seg</th><th>source</th><th>start</th><th>frames</th><th>extremeness (×median)</th><th>rank</th><th>drop</th></tr>';
-  segs.forEach((s,i)=>{h+=`<tr><td>${i}</td><td>${s.source||'–'}</td><td>${s.start}</td><td>${s.frames}</td><td>${D.unit_score[i].toFixed(2)}</td><td>${rank[i]}</td><td><input type="checkbox" data-seg="${i}"></td></tr>`;});
+  segs.forEach((s,i)=>{h+=`<tr><td>${i}</td><td>${esc(s.source||'–')}</td><td>${s.start}</td><td>${s.frames}</td><td>${D.unit_score[i].toFixed(2)}</td><td>${rank[i]}</td><td><input type="checkbox" data-seg="${i}"></td></tr>`;});
   $('stab').innerHTML=h;
   $('stab').querySelectorAll('input').forEach(cb=>cb.addEventListener('change',()=>{setUnit(+cb.dataset.seg,cb.checked?1:0);refresh(false);}));
 }
@@ -219,7 +229,7 @@ function renderRec(){
   $('recNote').textContent=` ${r.keep_frames.length} of ${N} frames · clip budget ${r.max_clip_pct}%`+(r.notes.length?' · '+r.notes.join('; '):'');
   let t='<tr><th>subset</th><th>tensor</th><th>range</th><th>clipped %</th><th>SQNR typical (dB)</th><th>SQNR all (dB)</th></tr>';
   for(const tab of [r.all,r.selected]) tab.rows.forEach((row,i)=>{
-    t+=`<tr><td>${i?'':tab.label+' ('+tab.frames+')'}</td><td>${row.tensor}</td><td>${fmt(row.lo)} … ${fmt(row.hi)}</td><td>${row.clip_pct.toFixed(3)}</td><td>${row.sqnr_typical.toFixed(2)}</td><td>${row.sqnr_all.toFixed(2)}</td></tr>`;});
+    t+=`<tr><td>${i?'':esc(tab.label)+' ('+tab.frames+')'}</td><td>${esc(row.tensor)}</td><td>${fmt(row.lo)}… ${fmt(row.hi)}</td><td>${row.clip_pct.toFixed(3)}</td><td>${row.sqnr_typical.toFixed(2)}</td><td>${row.sqnr_all.toFixed(2)}</td></tr>`;});
   $('rtab').innerHTML=t;
   $('recBtn').onclick=()=>{dropped.fill(1);for(const f of r.keep_frames)dropped[f]=0;
     $('k').value=0;$('kval').textContent=0;refresh();};
