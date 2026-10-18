@@ -280,11 +280,8 @@ static void test_stage(void) {
      * gain must equal the plain (use_r2 = 0) call, never the r2-folded one.
      * r2 here is sized like the real cold-start fault this gate exists for
      * (on the order of 1e12, matching a field trace of the AEC's conservative
-     * nonlinear estimate during cold start); the mutation guard right below
-     * confirms that, on this same spectrum, actually folding it in (as the
-     * gate must prevent) measurably moves the gain -- so the CHECK above is
-     * not a vacuous comparison that would pass whether or not the gate
-     * exists. */
+     * nonlinear estimate during cold start). The mutation guard below (denoiser
+     * c) proves that comparison isn't vacuous. */
     se_anr_stage_reset(a);
     anr_reset(b);
     anr_reset(c);

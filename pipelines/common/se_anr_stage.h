@@ -49,8 +49,9 @@ AnrDenoiser* se_anr_stage_init(void* mem, size_t bytes, const AnrConfig* cfg);
  * r2 / SE_PSD_SCALE through `scratch` (n_freqs floats); use_r2 = 0, a NULL r2, a
  * NULL scratch or frame->usable_linear = 0 selects plain noise reduction --
  * during cold start r2 is the conservative nonlinear estimate and can reach
- * anomalous magnitudes, so it is excluded from the noise floor until the
- * linear filter has converged. Returns the gain, n_freqs floats owned by the
+ * anomalous magnitudes, so it is excluded from the noise floor until the AEC
+ * itself reports a usable linear estimate (frame->usable_linear; distinct
+ * from all_converged). Returns the gain, n_freqs floats owned by the
  * denoiser and valid until its next call; NULL for a NULL denoiser, frame or
  * spectrum, or a refused hop. */
 const float* se_anr_stage_gain(AnrDenoiser* nr, const SeSpecFrame* frame,
