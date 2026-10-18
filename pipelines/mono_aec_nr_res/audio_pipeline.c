@@ -654,6 +654,7 @@ static void analyse_hop(AudioPipeline* p, const float* mic, const float* ref,
     f->max_dt = ctx.dt_indicator;
     f->max_sat = ctx.saturation_level;
     f->all_converged = ctx.filter_converged;
+    f->usable_linear = ctx.usable_linear;
     f->clock_drift = 0;
     f->delay_changed = lin.delay_state == AEC_LINEAR_DELAY_CHANGED;
     f->delay_locked = lin.delay_state != AEC_LINEAR_DELAY_UNLOCKED;

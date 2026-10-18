@@ -50,6 +50,8 @@ typedef struct SeSpecFrame {
     float max_dt;             /* worst double-talk indicator                      */
     float max_sat;            /* worst saturation level                           */
     int all_converged;        /* every contributing linear filter has converged   */
+    int usable_linear;        /* r2 derives from a usable linear estimate, not the
+                                * conservative nonlinear fallback; 0 fails closed  */
     int clock_drift;
     int delay_changed;        /* this hop starts a new alignment generation       */
     int delay_locked;         /* a usable alignment is in force                   */

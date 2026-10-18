@@ -48,7 +48,7 @@ const float* se_anr_stage_gain(AnrDenoiser* nr, const SeSpecFrame* frame,
                                float* scratch, int use_r2) {
     const float* extra = NULL;
     if (!nr || !frame || !frame->e) return NULL;
-    if (use_r2 && frame->r2 && scratch) {
+    if (use_r2 && frame->r2 && scratch && frame->usable_linear) {
         se_psd_scale(scratch, frame->r2, frame->n_freqs);
         extra = scratch;
     }

@@ -226,8 +226,8 @@ static void test_stage(void) {
     const int sr = 16000, fft = 256, hop = 128, n = 129;
     AnrConfig cfg = se_anr_compose_config(sr, fft, hop, ANR_MODE_BALANCED);
     size_t bytes = se_anr_stage_mem_size(&cfg);
-    void *pool = aligned_pool(bytes), *pool2 = aligned_pool(bytes);
-    AnrDenoiser *a, *b;
+    void *pool = aligned_pool(bytes), *pool2 = aligned_pool(bytes), *pool3 = aligned_pool(bytes);
+    AnrDenoiser *a, *b, *c;
     Complex spec[129];
     float r2[129], scratch[129], extra[129];
     const float *ga, *gb;
@@ -238,12 +238,14 @@ static void test_stage(void) {
     f.n_freqs = n;
     f.e = spec;
     f.r2 = r2;
+    f.usable_linear = 1;
 
-    CHECK(bytes > 0 && pool && pool2, "stage size");
+    CHECK(bytes > 0 && pool && pool2 && pool3, "stage size");
     CHECK(se_anr_stage_mem_size(&(AnrConfig){0}) == 0, "invalid config has no size");
     a = se_anr_stage_init(pool, bytes, &cfg);
     b = se_anr_stage_init(pool2, bytes, &cfg);
-    CHECK(a && b, "stage init");
+    c = se_anr_stage_init(pool3, bytes, &cfg);
+    CHECK(a && b && c, "stage init");
     CHECK(se_anr_stage_init(pool, bytes - 16, &cfg) == NULL, "short pool refused");
 
     /* the canonical setter refuses this instance, the stage's setter does not */
@@ -273,6 +275,51 @@ static void test_stage(void) {
         CHECK(ga && gb && memcmp(ga, gb, (size_t)n * sizeof(float)) == 0, "stage gain equals the direct call");
         CHECK(memcmp(scratch, extra, (size_t)n * sizeof(float)) == 0, "scratch holds r2 / SE_PSD_SCALE");
     }
+    /* usable_linear = 0 fails closed: r2 and scratch are both non-NULL, but the
+     * cold-start-unusable estimate must not fold into the noise floor -- the
+     * gain must equal the plain (use_r2 = 0) call, never the r2-folded one.
+     * r2 here is sized like the real cold-start fault this gate exists for
+     * (on the order of 1e12, matching a field trace of the AEC's conservative
+     * nonlinear estimate during cold start); the mutation guard right below
+     * confirms that, on this same spectrum, actually folding it in (as the
+     * gate must prevent) measurably moves the gain -- so the CHECK above is
+     * not a vacuous comparison that would pass whether or not the gate
+     * exists. */
+    se_anr_stage_reset(a);
+    anr_reset(b);
+    anr_reset(c);
+    f.usable_linear = 0;
+    /* The denoiser bypasses NR for its first num_init_frames (here it takes
+     * ~25 hops for gb's own gain to move off unity), so the mutation guard
+     * below -- folding this r2 must visibly differ from not folding it --
+     * is only checked once that warm-up has passed; the primary ga == gb
+     * gate check runs every hop regardless. */
+    for (frame = 0; frame < 35; ++frame) {
+        for (k = 0; k < n; ++k) {
+            spec[k].r = (float)((frame * 7 + k * 13) % 101) * 31.0f - 1500.0f;
+            spec[k].i = (float)((frame * 5 + k * 3) % 89) * 17.0f - 700.0f;
+            r2[k] = 3.0e12f + (float)k * 1.0e9f;
+            extra[k] = r2[k] / (32768.0f * 32768.0f);
+        }
+        ga = se_anr_stage_gain(a, &f, scratch, 1);
+        CHECK(ga != NULL, "usable_linear=0 stage process");
+        CHECK(anr_process_gain(b, spec, NULL, NULL) == 0, "usable_linear=0 direct process (no prior)");
+        gb = anr_get_gain(b, NULL);
+        CHECK(ga && gb && memcmp(ga, gb, (size_t)n * sizeof(float)) == 0,
+              "usable_linear=0 ignores r2 even though r2 and scratch are both present");
+        /* Mutation guard: on these same inputs, actually folding r2 (as the
+         * gate must prevent) measurably suppresses the gain below the plain
+         * value -- so the CHECK above is not a vacuous no-op comparison. */
+        CHECK(anr_process_gain(c, spec, extra, NULL) == 0, "counterfactual folded process");
+        if (frame >= 25) {
+            const float* gc = anr_get_gain(c, NULL);
+            int differs = 0;
+            for (k = 0; k < n; ++k)
+                if (gc[k] < gb[k] - 1e-6f) { differs = 1; break; }
+            CHECK(differs, "folding this r2 would have suppressed the gain below the gated value");
+        }
+    }
+    f.usable_linear = 1;
     /* without a prior: NULL r2 and NULL scratch both select plain NR */
     se_anr_stage_reset(a);
     anr_reset(b);
@@ -291,8 +338,10 @@ static void test_stage(void) {
 
     se_anr_stage_destroy(a);
     se_anr_stage_destroy(b);
+    se_anr_stage_destroy(c);
     free(pool);
     free(pool2);
+    free(pool3);
 }
 
 /* The prior scale is the exact reciprocal multiply of the division, for every
@@ -320,6 +369,7 @@ static void test_psd_scale(void) {
     f.n_freqs = n;
     f.e = spec;
     f.r2 = r2;
+    f.usable_linear = 1;
     CHECK(a != NULL, "psd scale: stage init");
     if (!a) { free(pool); return; }
     for (k = 0; k < n; ++k) { spec[k].r = 100.0f + (float)k; spec[k].i = -50.0f; }

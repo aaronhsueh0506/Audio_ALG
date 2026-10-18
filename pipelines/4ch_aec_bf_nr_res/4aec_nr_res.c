@@ -151,6 +151,7 @@ typedef struct FourAecLaneSnapshot {
     float dt_indicator;
     float saturation_level;
     int filter_converged;
+    int usable_linear;
 } FourAecLaneSnapshot;
 
 struct FourAecNrRes {
@@ -1188,6 +1189,7 @@ static int bind_lane_view(FourAecLaneSnapshot* dst,
     dst->dt_indicator = src->dt_indicator;
     dst->saturation_level = src->saturation_level;
     dst->filter_converged = src->filter_converged;
+    dst->usable_linear = src->usable_linear;
     return 1;
 }
 
@@ -1403,6 +1405,7 @@ static int fuse_contexts(FourAecNrRes* p,
                          const Complex* weights,
                          const Complex* trusted_beamformed_error,
                          int* all_converged,
+                         int* usable_linear,
                          float* max_dt,
                          float* max_saturation) {
     int n = p->n_freqs;
@@ -1411,6 +1414,7 @@ static int fuse_contexts(FourAecNrRes* p,
     float base_far_power = p->snapshots[0].far_power;
 
     *all_converged = 1;
+    *usable_linear = 1;
     /* Seeded neutral rather than from lane 0, so lane 0 is subject to the
      * same contributes-to-the-output test as every other lane below. Both
      * quantities are non-negative, so 0 is the identity for the max. At
@@ -1462,6 +1466,8 @@ static int fuse_contexts(FourAecNrRes* p,
         if (lane_contributes) {
             if (!p->snapshots[ch].filter_converged)
                 *all_converged = 0;
+            if (!p->snapshots[ch].usable_linear)
+                *usable_linear = 0;
             if (p->snapshots[ch].dt_indicator > *max_dt)
                 *max_dt = p->snapshots[ch].dt_indicator;
             if (p->snapshots[ch].saturation_level > *max_saturation)
@@ -1505,6 +1511,7 @@ int four_aec_fuse(
     const Complex* beamformed_error,
     SeSpecFrame* frame) {
     int all_converged;
+    int usable_linear;
     float max_dt;
     float max_saturation;
     uint32_t t0;
@@ -1519,7 +1526,7 @@ int four_aec_fuse(
     t0 = four_aec_nr_res_now_us();
     if (!fuse_contexts(
             p, weights, beamformed_error,
-            &all_converged, &max_dt, &max_saturation)) {
+            &all_converged, &usable_linear, &max_dt, &max_saturation)) {
         four_aec_nr_res_reset(p);
         return FOUR_AEC_NR_RES_DSP_ERROR;
     }
@@ -1540,6 +1547,7 @@ int four_aec_fuse(
     frame->max_dt = max_dt;
     frame->max_sat = max_saturation;
     frame->all_converged = all_converged;
+    frame->usable_linear = usable_linear;
     frame->clock_drift = p->cfg.delay_mode == AEC_DELAY_MATCHED
         ? delay_aec3_has_clockdrift(&p->shared_delay) : 0;
     frame->delay_changed = p->last_delay.changed;
