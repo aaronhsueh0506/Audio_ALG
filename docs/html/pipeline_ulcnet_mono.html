@@ -122,7 +122,7 @@ process_end(p, out)
 ─────────────── ───────────────── ───────────────────── ─────────────────────
 caller          mic0,ref0 in      mic1,ref1 in          mic_p,ref_p in
 C pre           AEC ctx hop0;     AEC ctx hop1;         AEC ctx hop_p;
-(AEC+STFT)      stft_push → 1幀   stft_push → 1幀       stft_push → 1幀 
+(AEC+STFT)      stft_push → 1幀   stft_push → 1幀       stft_push → 1幀
                 (history 全零)    (frame1)               (frame_p)
 model (NPU)     infer ×1          infer ×1              infer ×1
                 成功且 finite 即套用(step-always,reprime 跨界幀除外)
